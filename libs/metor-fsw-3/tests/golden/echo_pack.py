@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Sequence
 
-from metor_config import OutPort, Pack, Record, Sources, System
+from metor_config import Item, OutPort, Pack, Record, Sources, System
 
 PACK = Pack(
     id="echo",
@@ -65,10 +66,11 @@ class Tap(System):
 
     _pack = PACK
     _ty = "tap"
+    _takes_inputs = True
     _outputs = ("output",)
 
-    def __init__(self) -> None:
-        super().__init__({}, {})
+    def __init__(self, *, items: Sequence[Item] = ()) -> None:
+        super().__init__({}, {}, items=items)
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]

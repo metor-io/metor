@@ -26,6 +26,8 @@ struct Module {
     /// Nested params objects, by name.
     dataclasses: Vec<Class>,
     systems: Vec<Entry>,
+    /// Whether any system takes the ports its config lists.
+    takes_ports: bool,
 }
 
 /// A record's name on the host and the class a target names it by.
@@ -57,6 +59,10 @@ struct Entry {
     name: String,
     ty: String,
     doc: String,
+    /// Whether the type takes an `items` port list.
+    takes_inputs: bool,
+    /// Whether the type takes a `records` list.
+    takes_outputs: bool,
     /// Declared output names, without the framework's.
     outputs: Vec<String>,
     inputs: Vec<Port>,
@@ -90,13 +96,16 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
     for schema in &schemas {
         collect_defs(schema, &mut defs);
     }
-    let systems = def
+    let systems: Vec<Entry> = def
         .systems
         .iter()
         .zip(&schemas)
         .map(|(system, schema)| entry(system, schema, &defs))
         .collect::<Result<_, _>>()?;
     Ok(Module {
+        takes_ports: systems
+            .iter()
+            .any(|entry| entry.takes_inputs || entry.takes_outputs),
         pack_id: pack.id.clone(),
         lib: pack.lib.clone(),
         abi_version,
@@ -227,6 +236,8 @@ fn entry(
         name: pascal(&system.ty),
         ty: system.ty.to_string(),
         doc: system.doc.to_string(),
+        takes_inputs: system.takes_inputs,
+        takes_outputs: system.takes_outputs,
         outputs: declared().map(|p| p.name.to_string()).collect(),
         inputs: system.def.inputs.iter().map(port).collect(),
         params,

@@ -6,14 +6,11 @@ no library and `Target.to_config` leaves it out of the config's pack list.
 
 from __future__ import annotations
 
-from typing import Any, Sequence, TypeAlias, Union
+from typing import Any, Sequence
 
 from ._config import ABI_VERSION, ConfigError
-from ._model import OutPort, Pack, Record, Source, System
-from ._target import SystemHandle, Target
-
-Item: TypeAlias = Union[SystemHandle, OutPort[Any]]
-"""What a `Publish` takes: a system's whole handle, or one of its ports."""
+from ._model import Item, OutPort, Pack, Record, Source, System, _edges, _ports
+from ._target import Target
 
 PACK = Pack(id="fsw", lib="", libs="", abi_version=ABI_VERSION)
 
@@ -33,6 +30,7 @@ class Publish(System):
     _ty = "publish"
     _outputs = ("link_status",)
     _wants_target = True
+    _takes_inputs = True
 
     def __init__(
         self,
@@ -51,10 +49,10 @@ class Publish(System):
                 "link": "",
                 "pending_cap": pending_cap,
             },
+            items=items,
         )
         self._items = list(items)
         self._all = all
-        self._inputs = _edges(_ports(self._items))
 
     def _inputs_for(self, target: Target, index: int) -> dict[str, list[Source[Any]]]:
         if not self._all:
@@ -71,7 +69,9 @@ class Subscribe(System):
 
     _pack = PACK
     _ty = "subscribe"
+    _outputs = ("link_status",)
     _wants_target = True
+    _takes_outputs = True
 
     def __init__(
         self,
@@ -82,10 +82,6 @@ class Subscribe(System):
         pending_cap: int = PENDING_CAP,
         inbound_cap: int = INBOUND_CAP,
     ) -> None:
-        names = [_record_name(record) for record in records]
-        for name in names:
-            if names.count(name) > 1:
-                raise ConfigError(f"a link subscribes to record `{name}` twice")
         super().__init__(
             {},
             {
@@ -95,11 +91,7 @@ class Subscribe(System):
                 "pending_cap": pending_cap,
                 "inbound_cap": inbound_cap,
             },
-            outputs=[{"port": name, "record": name} for name in names],
-        )
-        self._outputs = tuple(names) + ("link_status",)
-        self._record_packs = tuple(
-            record._pack for record in records if record._pack is not None
+            records=records,
         )
 
 
@@ -114,32 +106,3 @@ def _transport(
         return {"connect": {"addr": connect}}
     slots = MAX_CONNECTIONS if max_connections is None else max_connections
     return {"listen": {"addr": listen, "max_connections": slots}}
-
-
-def _record_name(record: type[Record]) -> str:
-    if not isinstance(record, type) or not issubclass(record, Record):
-        raise ConfigError(f"a link subscribes to record classes, got {record!r}")
-    if not record._name:
-        raise ConfigError(f"record class `{record.__name__}` names no record")
-    return record._name
-
-
-def _ports(items: Sequence[Item]) -> list[OutPort[Any]]:
-    """Every port the items name, a handle standing for all of its own."""
-    ports: list[OutPort[Any]] = []
-    for item in items:
-        if isinstance(item, SystemHandle):
-            ports.extend(OutPort(item._name, port) for port in item._outputs)
-        elif isinstance(item, OutPort):
-            ports.append(item)
-        else:
-            raise ConfigError(f"a link publishes handles and ports, got {item!r}")
-    return ports
-
-
-def _edges(ports: Sequence[OutPort[Any]]) -> dict[str, list[Source[Any]]]:
-    """One input per port, named `{producer}.{port}`, first mention winning."""
-    edges: dict[str, list[Source[Any]]] = {}
-    for port in ports:
-        edges.setdefault(f"{port.ref.system}.{port.ref.port}", [port])
-    return edges

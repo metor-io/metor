@@ -7,7 +7,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from metor_config import OutPort, Pack, Record, Sources, System  # noqa: E402
+from typing import Sequence  # noqa: E402
+
+from metor_config import Item, OutPort, Pack, Record, Sources, System  # noqa: E402
 
 PACK = Pack(id="adcs", lib="adcs_systems", libs="/abs/.metor/adcs_pack/_libs", abi_version=1)
 
@@ -97,5 +99,35 @@ class Ctrl(System):
         super().__init__({"est": est, "mode": mode}, {})
 
     motor_cmd: OutPort[MotorCmd]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Tap(System):
+    """A generated type that takes the input ports its config lists."""
+
+    _pack = PACK
+    _ty = "tap"
+    _takes_inputs = True
+    _outputs = ("output",)
+
+    def __init__(self, *, items: Sequence[Item] = (), gain: float = 1.0) -> None:
+        super().__init__({}, {"gain": gain}, items=items)
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Fan(System):
+    """A generated type that takes the output ports its config lists."""
+
+    _pack = PACK
+    _ty = "fan"
+    _takes_outputs = True
+
+    def __init__(self, *, records: Sequence[type[Record]] = ()) -> None:
+        super().__init__({}, {}, records=records)
+
     log: OutPort[LogEvent]
     status: OutPort[SystemStatus]

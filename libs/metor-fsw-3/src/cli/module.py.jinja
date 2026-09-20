@@ -5,8 +5,9 @@ from __future__ import annotations
 
 {% if dataclasses %}from dataclasses import dataclass, field
 {% endif %}from pathlib import Path
-
-from metor_config import OutPort, Pack, Record, Sources, System
+{% if takes_ports %}from typing import Sequence
+{% endif %}
+from metor_config import {% if takes_ports %}Item, {% endif %}OutPort, Pack, Record, Sources, System
 
 PACK = Pack(
     id={{ pack_id | python_string }},
@@ -38,17 +39,21 @@ class {{ system.name }}(System):
 
 {% endif %}    _pack = PACK
     _ty = {{ system.ty | python_string }}
-    _outputs = ({% for name in system.outputs %}{{ name | python_string }}{% if not loop.last %}, {% endif %}{% endfor %}{% if system.outputs|length == 1 %},{% endif %})
+{% if system.takes_inputs %}    _takes_inputs = True
+{% endif %}{% if system.takes_outputs %}    _takes_outputs = True
+{% endif %}    _outputs = ({% for name in system.outputs %}{{ name | python_string }}{% if not loop.last %}, {% endif %}{% endfor %}{% if system.outputs|length == 1 %},{% endif %})
 
     def __init__(self
-        {%- if system.inputs or system.params %}, *{% endif %}
+        {%- if system.inputs or system.params or system.takes_inputs or system.takes_outputs %}, *{% endif %}
+        {%- if system.takes_inputs %}, items: Sequence[Item] = (){% endif %}
+        {%- if system.takes_outputs %}, records: Sequence[type[Record]] = (){% endif %}
         {%- for port in system.inputs %}, {{ port.name }}: Sources[{{ port.record }}] = (){% endfor %}
         {%- for field in system.params %}, {{ field.name }}: {{ field.annotation }}{{ field.default }}{% endfor %}) -> None:
         super().__init__({
             {%- for port in system.inputs %}{{ port.name | python_string }}: {{ port.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
         }, {
             {%- for field in system.params %}{{ field.name | python_string }}: {{ field.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
-        })
+        }{% if system.takes_inputs %}, items=items{% endif %}{% if system.takes_outputs %}, records=records{% endif %})
 
 {% for port in system.ports %}    {{ port.name }}: OutPort[{{ port.record }}]
 {% endfor %}    log: OutPort[LogEvent]

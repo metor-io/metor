@@ -7,7 +7,7 @@ import os
 import tempfile
 import unittest
 
-from adcs_stub import PACK, Ctrl, Mode, MotorCmd, Nav, Ping, Plant
+from adcs_stub import PACK, Ctrl, Fan, Mode, MotorCmd, Nav, Ping, Plant, Tap
 
 import metor_config._target as target_mod
 from metor_config import ConfigError, PortRef, Publish, Subscribe, Target, emit
@@ -216,6 +216,47 @@ class LinkTest(unittest.TestCase):
         )
         # Emission repeats without growing the edge list.
         self.assertEqual(fsw.to_config()["coordinator"]["systems"][1], entry)
+
+    def test_a_generated_type_takes_a_port_list(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        plant = fsw.add("plant", Plant())
+        nav = fsw.add("nav", Nav(imu=plant.imu))
+        fsw.add("tap", Tap(items=[plant, nav.est], gain=2.0))
+        entry = fsw.to_config()["coordinator"]["systems"][2]
+        self.assertEqual(
+            [input["port"] for input in entry["inputs"]],
+            ["plant.imu", "plant.log", "plant.status", "nav.est"],
+        )
+        self.assertEqual(entry["inputs"][3]["from"], [{"system": "nav", "port": "est"}])
+        self.assertEqual(entry["params"], {"gain": 2.0})
+
+    def test_a_generated_type_with_no_items_has_no_edges(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        fsw.add("tap", Tap())
+        entry = fsw.to_config()["coordinator"]["systems"][0]
+        self.assertEqual(entry["inputs"], [])
+        self.assertNotIn("outputs", entry)
+
+    def test_a_generated_port_list_takes_ports_and_handles_only(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "handles and ports"):
+            Tap(items=["plant.imu"])  # type: ignore[list-item]
+
+    def test_a_generated_type_takes_a_record_list(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        fan = fsw.add("fan", Fan(records=[Ping, MotorCmd]))
+        entry = fsw.to_config()["coordinator"]["systems"][0]
+        self.assertEqual(
+            entry["outputs"],
+            [
+                {"port": "ping", "record": "ping"},
+                {"port": "motor_cmd", "record": "motor_cmd"},
+            ],
+        )
+        self.assertEqual(fan.ping.ref, PortRef("fan", "ping"))  # type: ignore[attr-defined]
+        with self.assertRaisesRegex(ConfigError, "twice"):
+            Fan(records=[Ping, Ping])
+        with self.assertRaisesRegex(ConfigError, "record classes"):
+            Fan(records=[Plant])  # type: ignore[list-item]
 
     def test_both_or_neither_transport_raises(self) -> None:
         with self.assertRaisesRegex(ConfigError, "exactly one"):

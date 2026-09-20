@@ -65,6 +65,9 @@ Source: TypeAlias = Union[OutPort[T], Loop[T]]
 Sources: TypeAlias = Union[Source[T], Sequence[Source[T]]]
 """One source or, for fan-in, a sequence of them in edge order."""
 
+Item: TypeAlias = Union["SystemHandle", OutPort[Any]]
+"""What a port list takes: a system's whole handle, or one of its ports."""
+
 
 @dataclass(frozen=True)
 class Pack:
@@ -100,6 +103,9 @@ class System:
 
     `_ty` is the pack's table key, `_outputs` the ports a handle resolves
     (`log` and `status` are outputs of every system and need not be listed).
+
+    A type that takes the ports its config lists sets `_takes_inputs` or
+    `_takes_outputs`, and forwards `items` or `records`.
     """
 
     _pack: Pack
@@ -108,20 +114,73 @@ class System:
     _record_packs: tuple[Pack, ...] = ()
     _wants_target: bool = False
     """Whether `Target.to_config` fills this system's `namespace` and `link` params."""
+    _takes_inputs: bool = False
+    """Whether this type takes an `items` port list of its own."""
+    _takes_outputs: bool = False
+    """Whether this type takes a `records` list, one output port each."""
 
     def __init__(
         self,
         inputs: dict[str, Sources[Any]],
         params: dict[str, Any],
         outputs: list[dict[str, str]] | None = None,
+        items: Sequence[Item] = (),
+        records: Sequence[type[Record]] = (),
     ) -> None:
         self._inputs = {port: _sources(port, src) for port, src in inputs.items()}
+        self._inputs.update(_edges(_ports(items)))
         self._params = {name: _json(value) for name, value in params.items()}
+        names = _record_names(records)
         self._dyn_outputs = list(outputs or [])
+        self._dyn_outputs += [{"port": name, "record": name} for name in names]
+        self._outputs = tuple(names) + type(self)._outputs
+        self._record_packs = tuple(
+            record._pack for record in records if record._pack is not None
+        )
 
     def _inputs_for(self, target: Any, index: int) -> dict[str, list[Source[Any]]]:
         """Resolve inputs for this registration without changing the system."""
         return self._inputs
+
+
+def _ports(items: Sequence[Item]) -> list[OutPort[Any]]:
+    """Every port the items name, a handle standing for all of its own."""
+    from ._target import SystemHandle
+
+    ports: list[OutPort[Any]] = []
+    for item in items:
+        if isinstance(item, SystemHandle):
+            ports.extend(OutPort(item._name, port) for port in item._outputs)
+        elif isinstance(item, OutPort):
+            ports.append(item)
+        else:
+            raise ConfigError(f"a port list takes handles and ports, got {item!r}")
+    return ports
+
+
+def _edges(ports: Sequence[OutPort[Any]]) -> dict[str, list[Source[Any]]]:
+    """One input per port, named `{producer}.{port}`, first mention winning."""
+    edges: dict[str, list[Source[Any]]] = {}
+    for port in ports:
+        edges.setdefault(f"{port.ref.system}.{port.ref.port}", [port])
+    return edges
+
+
+def _record_names(records: Sequence[type[Record]]) -> list[str]:
+    """One port name per record, each named once."""
+    names = [_record_name(record) for record in records]
+    for name in names:
+        if names.count(name) > 1:
+            raise ConfigError(f"a system takes record `{name}` twice")
+    return names
+
+
+def _record_name(record: type[Record]) -> str:
+    if not isinstance(record, type) or not issubclass(record, Record):
+        raise ConfigError(f"a record list takes record classes, got {record!r}")
+    if not record._name:
+        raise ConfigError(f"record class `{record.__name__}` names no record")
+    return record._name
 
 
 def _sources(port: str, sources: Sources[Any]) -> list[Source[Any]]:
