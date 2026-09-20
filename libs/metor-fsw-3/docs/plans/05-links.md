@@ -210,17 +210,24 @@ never reads it. Cross-pack sharing is not a goal.
 `Publish` takes whatever rings the config lists; `Subscribe` emits
 whatever records the config lists. Neither is known to the type.
 
-`SystemDef` gains `dynamic_inputs: bool` and `dynamic_outputs: bool`. For
-a dynamic side, build accepts port names the type does not declare and
-completes each one from the config:
+Every type computes its definition from its instance config, which a
+[later slice](06-def-from-config.md) settled:
+
+```rust
+trait System { fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError>; }
+```
+
+`DefCx` carries the config's input edges with the def of the output
+feeding each, the config's output ports with the record each names, and
+every record the table knows. A static type ignores it. `DynInputs` and
+`DynOutputs` complete themselves in their `Param` impls:
 
 - A dynamic input port takes its `PortDef` from its edge. Exactly one
-  edge per port; a second is a build error, since a published port has
-  one producer identity.
+  producer per port; a second is `DefError::FanIn`, since a published
+  port has one producer identity.
 - A dynamic output port is listed in the system's `outputs` config with
-  a record name. Build resolves the name against every `PortDef` the
-  table knows (the union of all registered systems' ports); unknown or
-  conflicting definitions are build errors.
+  a record name, resolved against every `PortDef` the table knows;
+  unknown or conflicting names are `DefError`s.
 
 Bind then hands the completed definitions along with the handles:
 
@@ -419,7 +426,10 @@ test; an ABI bump touches it too.
 ## Build changes
 
 - `thread` on a cyclic system is an error.
-- Dynamic ports complete as above before `check_ids`.
+- Each system's definition is computed from its config, in config order,
+  before `check_ids`. An undeclared port reading a system configured
+  later has no producer definition to take, which is
+  `BuildError::DynamicFromLater`.
 - Rings for an async system's ports are allocated twice: the real ring
   and the mirror. Reader counting is unchanged; the mirror has one
   reader.
@@ -450,7 +460,7 @@ test; an ABI bump touches it too.
 
 Unit (io-less):
 
-- Dynamic input completion from one edge; error on two edges; dynamic
+- Dynamic input completion from one edge; `FanIn` on two edges; dynamic
   output resolution by record name; unknown and conflicting names.
 - Thread placement: two async systems with no `thread` share one thread
   and a third with `thread = "own"` gets another; `thread` on a cyclic

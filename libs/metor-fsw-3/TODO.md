@@ -42,6 +42,11 @@ fixed by metor-panel and metor-db, so it is reproduced, not designed.
 `metor run` closes the loop from a `Subscribe` through `echo` to a
 `Publish`.
 
+- Definitions from config: a type computes its `SystemDef` from its
+  instance config, dynamic markers and build's completion pass are gone,
+  and ABI 5 adds `metor_fsw_def`. Landed 2026-09-20,
+  `06-def-from-config.md`.
+
 - Shared state: the `&Shared<S>` parameter kind and the one-thread rule
   are designed in `05-links.md` and held until two systems must hold
   one socket (bi-directional commanding on one port).

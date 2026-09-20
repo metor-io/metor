@@ -88,6 +88,13 @@ extern "C" fn metor_fsw_abi_version() -> u32;
 unsafe extern "C" fn metor_fsw_pack_def(
     dst: *mut u8, capacity: usize, written: *mut usize,
 ) -> u32;
+/// Writes the JSON `SystemDef` one type computes for one instance's config
+/// (`cx` is a JSON `DefCxOwned`), or the `DefError` it refused with.
+/// Added in ABI 5.
+unsafe extern "C" fn metor_fsw_def(
+    ty: RawSlice, cx: RawSlice,
+    dst: *mut u8, capacity: usize, written: *mut usize,
+) -> u32;
 unsafe extern "C" fn metor_fsw_create(
     ty: RawSlice, params: RawSlice,
     inputs: RawSlice, outputs: RawSlice,
@@ -97,9 +104,9 @@ unsafe extern "C" fn metor_fsw_execute(instance: *mut c_void, now: i64) -> u32;
 unsafe extern "C" fn metor_fsw_destroy(instance: *mut c_void);
 ```
 
-Five exports with fixed names. The host resolves and calls
+Six exports with fixed names. The host resolves and calls
 `metor_fsw_abi_version` first; a mismatch is `PackError::AbiMismatch`.
-The version guards everything else: the slice types, the four remaining
+The version guards everything else: the slice types, the five remaining
 signatures, the status word, and the descriptor's JSON shape. A bare
 `u32` return assumes no layout, which is why the version is its own
 export. Plain exports are what `nm` and a debugger show, and they map
@@ -108,7 +115,7 @@ one to one onto wasm exports in slice 6.
 Binding happens on the pack side, because only the pack knows
 `Inputs::bind`, so creation and binding are one call that takes rings.
 A `Ctor` is a value, so the pack keeps it in the `SystemTable` it builds
-and `create` looks the type up by name. Three exports per pack serve
+and `create` looks the type up by name. Four exports per pack serve
 every system in it.
 
 ### Instances
@@ -326,7 +333,7 @@ pub enum PackError {
 ```
 
 `open` loads the library, resolves and calls `metor_fsw_abi_version`,
-resolves the other four exports into `PackFns`, calls `metor_fsw_pack_def`,
+resolves the other exports into `PackFns`, calls `metor_fsw_pack_def`,
 decodes owned descriptor data, and frees its buffer. `register_pack` inserts
 one entry per system whose `make` closure holds the `Arc<Library>` and a
 copy of `PackFns`, builds the `RawPort` and `RawRing` arrays from the
