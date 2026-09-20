@@ -9,6 +9,7 @@ use serde_json::value::RawValue;
 
 use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
+use crate::def::{DefCx, DefError};
 use crate::fn_system::{AsyncSystemFn, Ctor, FnAsyncSystem, FnSystem, SystemFn};
 use crate::system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
@@ -63,7 +64,10 @@ impl SystemTable {
         ty: &str,
         make: impl Fn(Params<'_>) -> Result<(S, S::State), ParamError> + 'static,
     ) -> Result<(), BuildError> {
-        self.insert(ty, entry::<S>(make, Cow::Borrowed(""), None))
+        self.insert(
+            ty,
+            entry::<S>(make, Cow::Borrowed(""), None).map_err(def_error(ty))?,
+        )
     }
 
     /// Registers a `#[system]` with `ty`
@@ -73,10 +77,9 @@ impl SystemTable {
         ctor: C,
     ) -> Result<(), BuildError> {
         let make = move |params: Params<'_>| Ok((FnSystem::default(), ctor.make(params)?));
-        self.insert(
-            ty,
-            entry::<FnSystem<S>>(make, Cow::Borrowed(S::DOC), C::schema()),
-        )
+        let entry = entry::<FnSystem<S>>(make, Cow::Borrowed(S::DOC), C::schema())
+            .map_err(def_error(ty))?;
+        self.insert(ty, entry)
     }
 
     /// Registers an `AsyncSystem` under `ty`, constructed on its own thread.
@@ -85,7 +88,8 @@ impl SystemTable {
         ty: &str,
         make: impl Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
     ) -> Result<(), BuildError> {
-        self.insert(ty, async_entry::<A, _>(make, Cow::Borrowed(""), None))
+        let entry = async_entry::<A, _>(make, Cow::Borrowed(""), None).map_err(def_error(ty))?;
+        self.insert(ty, entry)
     }
 
     /// Registers a `#[system]` type with an `async run` under `ty`.
@@ -95,10 +99,9 @@ impl SystemTable {
         ctor: C,
     ) -> Result<(), BuildError> {
         let make = move |params: Params<'_>| Ok((FnAsyncSystem::default(), ctor.make(params)?));
-        self.insert(
-            ty,
-            async_entry::<FnAsyncSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema()),
-        )
+        let entry = async_entry::<FnAsyncSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema())
+            .map_err(def_error(ty))?;
+        self.insert(ty, entry)
     }
 
     /// Adds an entry, replacing a same-named one in place so order is registration order.
@@ -149,6 +152,14 @@ impl SystemTable {
         core::iter::once(&*STATUS)
             .chain(self.entries().flat_map(|(_, entry)| ports(&entry.def)))
             .find(|port| port.record == name)
+    }
+}
+
+/// Names the type whose definition was refused.
+fn def_error(ty: &str) -> impl FnOnce(DefError) -> BuildError + '_ {
+    |source| BuildError::Def {
+        id: ty.to_string(),
+        source,
     }
 }
 
@@ -212,9 +223,9 @@ fn entry<S: System + 'static>(
     make: impl Fn(Params<'_>) -> Result<(S, S::State), ParamError> + 'static,
     doc: Cow<'static, str>,
     schema: Option<Box<RawValue>>,
-) -> TableEntry {
-    TableEntry {
-        def: S::def(),
+) -> Result<TableEntry, DefError> {
+    Ok(TableEntry {
+        def: S::def(&DefCx::empty())?,
         doc,
         schema,
         make: Box::new(move |cx| {
@@ -256,22 +267,26 @@ fn entry<S: System + 'static>(
                 outputs: S::Outputs::bind(writers),
             }))
         }),
-    }
+    })
 }
 
 /// Builds one async entry, whose `make` places the system on its group's thread.
-fn async_entry<A, M>(make: M, doc: Cow<'static, str>, schema: Option<Box<RawValue>>) -> TableEntry
+fn async_entry<A, M>(
+    make: M,
+    doc: Cow<'static, str>,
+    schema: Option<Box<RawValue>>,
+) -> Result<TableEntry, DefError>
 where
     A: AsyncSystem + 'static,
     M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
 {
     let make = std::sync::Arc::new(make);
-    TableEntry {
-        def: A::def(),
+    Ok(TableEntry {
+        def: A::def(&DefCx::empty())?,
         doc,
         schema,
         make: Box::new(move |cx| crate::thread::place::<A, M>(make.clone(), cx)),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -282,6 +297,11 @@ mod tests {
     use crate::tests::utils::{Imu, ImuOffset, ImuSource, NavFilter};
     use crate::{MsgCodec, Output};
     use metor_proto::types::ComponentId;
+
+    /// A type's definition under the empty context.
+    fn static_def<S: System>() -> SystemDef {
+        S::def(&DefCx::empty()).expect("a static definition")
+    }
 
     fn message(name: &'static str, codec: MsgCodec) -> PortDef {
         PortDef {
@@ -296,7 +316,8 @@ mod tests {
     }
 
     fn declared(outputs: Vec<PortDef>) -> TableEntry {
-        let mut entry = entry::<ImuSource>(|_| Ok((ImuSource, 0)), Cow::Borrowed(""), None);
+        let mut entry = entry::<ImuSource>(|_| Ok((ImuSource, 0)), Cow::Borrowed(""), None)
+            .expect("a static definition");
         entry.def.outputs = outputs;
         entry
     }
@@ -565,7 +586,7 @@ mod tests {
             .register_system("shared", |_| Ok((NavFilter, ())))
             .expect("valid records");
         let entry = table.get("shared").expect("registered");
-        assert_eq!(entry.def.name, NavFilter::def().name);
+        assert_eq!(entry.def.name, static_def::<NavFilter>().name);
     }
 
     #[test]
@@ -591,7 +612,7 @@ mod tests {
         assert_eq!(seen, vec!["imu", "nav"]);
         assert_eq!(
             table.get("imu").expect("registered").def.name,
-            ImuOffset::def().name
+            static_def::<ImuOffset>().name
         );
     }
 
@@ -603,8 +624,8 @@ mod tests {
         type Inputs = ();
         type Outputs = ();
 
-        fn def() -> SystemDef {
-            SystemDef::new_async::<(), ()>("idle")
+        fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+            SystemDef::new_async::<(), ()>("idle", cx)
         }
 
         async fn run(&self, _state: &mut (), _in: &mut (), _out: &mut (), stop: Stop) {

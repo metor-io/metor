@@ -2,6 +2,7 @@ use metor_proto::types::{ComponentId, PacketId};
 use thiserror::Error;
 
 use super::params::ParamError;
+use crate::def::DefError;
 
 /// Errors registering system types or building a coordinator.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -92,6 +93,13 @@ pub enum BuildError {
 
     #[error("thread `{thread}` failed to start")]
     ThreadStart { thread: String },
+
+    #[error("definition for `{id}`: {source}")]
+    Def {
+        id: String,
+        #[source]
+        source: DefError,
+    },
 
     #[error("params for `{id}`: {source}")]
     Params {

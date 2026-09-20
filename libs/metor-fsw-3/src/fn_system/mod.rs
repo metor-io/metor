@@ -11,6 +11,7 @@ use metor_proto::types::Timestamp;
 use metor_fsw_3_ring::{NoWake, Notifier};
 
 use crate::async_system::{AsyncSystem, Stop};
+use crate::def::{DefCx, DefError};
 use crate::{
     log,
     system::{System, SystemDef},
@@ -72,8 +73,8 @@ impl<S: AsyncSystemFn> AsyncSystem for FnAsyncSystem<S> {
     type Inputs = InSet<S, Notifier>;
     type Outputs = OutSet<S>;
 
-    fn def() -> SystemDef {
-        SystemDef::new_async::<InSet<S, Notifier>, OutSet<S>>(S::NAME)
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new_async::<InSet<S, Notifier>, OutSet<S>>(S::NAME, cx)
     }
 
     /// Points each poll's log lines at the system's own `log` output, then runs `run`.
@@ -97,8 +98,8 @@ impl<S: SystemFn> System for FnSystem<S> {
     type Inputs = InSet<S>;
     type Outputs = OutSet<S>;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<InSet<S>, OutSet<S>>(S::NAME)
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<InSet<S>, OutSet<S>>(S::NAME, cx)
     }
 
     /// Points this thread's log lines at the system's own `log` output, then runs `execute`.

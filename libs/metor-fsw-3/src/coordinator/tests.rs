@@ -7,6 +7,7 @@ use metor_proto::types::Timestamp;
 use super::run::Runner;
 use super::{Clock, Coordinator, Entry, Step, SystemStatus};
 use crate::Record;
+use crate::def::{DefCx, DefError};
 use crate::port::{Input, Output, ring_capacity};
 use crate::system::{System, SystemDef};
 use crate::tests::utils::Imu;
@@ -35,8 +36,8 @@ impl System for FailingConsumer {
     type Inputs = ConsumerInputs;
     type Outputs = ();
 
-    fn def() -> SystemDef {
-        SystemDef::new::<ConsumerInputs, ()>("failed")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<ConsumerInputs, ()>("failed", cx)
     }
 
     fn execute(&self, _: Timestamp, _: &mut (), inputs: &mut ConsumerInputs, _: &mut ()) {

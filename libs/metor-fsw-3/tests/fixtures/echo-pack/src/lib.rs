@@ -4,8 +4,8 @@ use std::cell::RefCell;
 
 use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::{
-    Input, InputBinding, Output, OutputBinding, PortDef, Record, Stop, System, SystemDef,
-    SystemInputs, SystemOutputs, SystemTable, Timestamp, system,
+    DefCx, DefError, Input, InputBinding, Output, OutputBinding, PortDef, Record, Stop, System,
+    SystemDef, SystemInputs, SystemOutputs, SystemTable, Timestamp, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -108,8 +108,8 @@ thread_local! {
 pub struct RetainedInput;
 
 impl SystemInputs for RetainedInput {
-    fn defs() -> Vec<PortDef> {
-        vec![Input::<Ping>::def("input")]
+    fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(vec![Input::<Ping>::def("input")])
     }
 
     fn bind(mut inputs: Vec<InputBinding>) -> Self {
@@ -123,8 +123,8 @@ impl SystemInputs for RetainedInput {
 pub struct RetainedOutput;
 
 impl SystemOutputs for RetainedOutput {
-    fn defs() -> Vec<PortDef> {
-        vec![Output::<Ping>::def("output")]
+    fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(vec![Output::<Ping>::def("output")])
     }
 
     fn bind(mut outputs: Vec<OutputBinding>) -> Self {
@@ -142,8 +142,8 @@ impl System for Retained {
     type Inputs = RetainedInput;
     type Outputs = RetainedOutput;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<RetainedInput, RetainedOutput>("Retained")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<RetainedInput, RetainedOutput>("Retained", cx)
     }
 
     fn execute(&self, _: Timestamp, _: &mut (), _: &mut RetainedInput, _: &mut RetainedOutput) {}

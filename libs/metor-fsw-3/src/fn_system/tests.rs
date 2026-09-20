@@ -17,8 +17,10 @@ use crate::coordinator::{
 };
 use crate::log::Log;
 use crate::port::{Input, Output, ring_capacity};
-use crate::tests::utils::{Control, Imu, Nav, NoParams};
-use crate::{Frame, Record, SystemInputs, SystemOutputs};
+use crate::tests::utils::{
+    Control, Imu, Nav, NoParams, static_async_def, static_def, static_inputs, static_outputs,
+};
+use crate::{Frame, Record};
 
 /// Doubles the newest sample, stamping it with the cycle time.
 struct Doubler;
@@ -157,24 +159,24 @@ fn the_attribute_names_the_type_and_its_ports() {
     assert_eq!(Gain::NAMES, &["imu"]);
     assert_eq!(<Probe<Imu>>::NAME, "probe");
     assert_eq!(
-        FnSystem::<Gain>::def().outputs,
+        static_def::<FnSystem<Gain>>().outputs,
         vec![Output::<Imu>::def("imu"), Output::<LogEvent>::def("log")]
     );
 }
 
 #[test]
 fn defs_follow_parameter_order_and_skip_timestamp() {
-    let def = FnSystem::<Doubler>::def();
+    let def = static_def::<FnSystem<Doubler>>();
     assert_eq!(def.name, "doubler");
     assert_eq!(def.inputs, vec![Input::<Imu>::def("imu")]);
     assert_eq!(
         def.outputs,
         vec![Output::<Nav>::def("nav"), Output::<LogEvent>::def("log")]
     );
-    assert_eq!(InSet::<Summer>::defs().len(), 2);
-    assert_eq!(OutSet::<Summer>::defs()[0].name, "sum");
-    assert!(InSet::<Counter>::defs().is_empty());
-    assert_eq!(OutSet::<Counter>::defs().len(), 1);
+    assert_eq!(static_inputs::<InSet<Summer>, _>().len(), 2);
+    assert_eq!(static_outputs::<OutSet<Summer>>()[0].name, "sum");
+    assert!(static_inputs::<InSet<Counter>, _>().is_empty());
+    assert_eq!(static_outputs::<OutSet<Counter>>().len(), 1);
 }
 
 fn gain_table() -> SystemTable {
@@ -340,8 +342,8 @@ impl crate::System for Noisy {
     type Inputs = ();
     type Outputs = ();
 
-    fn def() -> crate::SystemDef {
-        crate::SystemDef::new::<(), ()>("noisy")
+    fn def(cx: &crate::DefCx<'_>) -> Result<crate::SystemDef, crate::DefError> {
+        crate::SystemDef::new::<(), ()>("noisy", cx)
     }
 
     fn execute(&self, _now: Timestamp, _state: &mut (), _inputs: &mut (), _outputs: &mut ()) {
@@ -611,8 +613,8 @@ fn an_async_block_declares_the_same_ports_as_its_cyclic_twin() {
     assert_eq!(Relay::NAMES, &["imu", "nav", "log"]);
     assert_eq!(Relay::DOC, "Forwards records as they arrive.");
     let (relay, cyclic) = (
-        FnAsyncSystem::<Relay>::def(),
-        FnSystem::<RelayCyclic>::def(),
+        static_async_def::<FnAsyncSystem<Relay>>(),
+        static_def::<FnSystem<RelayCyclic>>(),
     );
     assert_eq!(relay.inputs, cyclic.inputs);
     assert_eq!(relay.outputs, cyclic.outputs);
@@ -695,13 +697,13 @@ fn a_dynamic_parameter_names_itself_in_the_definition() {
         }
     }
 
-    let def = FnSystem::<Link>::def();
+    let def = static_def::<FnSystem<Link>>();
     assert_eq!(def.dynamic_inputs.as_deref(), Some("taps"));
     assert_eq!(def.dynamic_outputs.as_deref(), Some("sinks"));
 
-    let static_def = FnSystem::<Doubler>::def();
-    assert_eq!(static_def.dynamic_inputs, None);
-    assert_eq!(static_def.dynamic_outputs, None);
+    let plain = static_def::<FnSystem<Doubler>>();
+    assert_eq!(plain.dynamic_inputs, None);
+    assert_eq!(plain.dynamic_outputs, None);
 }
 
 #[test]
@@ -718,5 +720,5 @@ fn two_dynamic_inputs_are_rejected_when_the_definition_is_built() {
         }
     }
 
-    let _ = FnSystem::<Twice>::def();
+    let _ = static_def::<FnSystem<Twice>>();
 }

@@ -5,6 +5,7 @@ use core::marker::PhantomData;
 use core::ops::Deref;
 use std::borrow::Cow;
 
+use crate::def::{DefCx, DefError};
 use crate::record::{Bytes, DecodeError, EncodeError, Record};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
 use metor_fsw_3_ring::{
@@ -252,8 +253,8 @@ impl DynInputs<Notifier> {
 }
 
 impl<W: WakeSink> SystemInputs<W> for DynInputs<W> {
-    fn defs() -> Vec<PortDef> {
-        Vec::new()
+    fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(Vec::new())
     }
 
     fn dynamic() -> Option<Cow<'static, str>> {
@@ -289,8 +290,8 @@ impl<W: WakeSource> DynOutputs<W> {
 }
 
 impl<W: WakeSource> SystemOutputs<W> for DynOutputs<W> {
-    fn defs() -> Vec<PortDef> {
-        Vec::new()
+    fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(Vec::new())
     }
 
     fn dynamic() -> Option<Cow<'static, str>> {

@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use metor_fsw_3_ring::WakeSink;
 use metor_proto::types::Timestamp;
 
+use crate::def::{DefCx, DefError};
 use crate::log::Log;
 use crate::port::{DynInputs, DynOutputs, Input, Output};
 use crate::record::Record;
@@ -63,10 +64,10 @@ pub struct PortDefs {
 
 impl PortDefs {
     /// Every port a system's parameters declare, under the names it gave them.
-    pub fn of<S: crate::fn_system::Ports>() -> Self {
+    pub fn of<S: crate::fn_system::Ports>(cx: &DefCx<'_>) -> Result<Self, DefError> {
         let mut defs = Self::default();
-        S::Params::append_defs(&mut S::NAMES.iter(), &mut defs);
-        defs
+        S::Params::append_defs(&mut S::NAMES.iter(), cx, &mut defs)?;
+        Ok(defs)
     }
 }
 
@@ -112,8 +113,13 @@ pub trait Param {
     where
         Self: 'a;
 
-    /// Appends this parameter's port definition, if it has one, taking its name from `names`.
-    fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs);
+    /// Appends the ports this parameter takes under this config, if it takes
+    /// any, naming them from `names`.
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        cx: &DefCx<'_>,
+        defs: &mut PortDefs,
+    ) -> Result<(), DefError>;
 
     /// Returns this parameter's input (if one exists) by popping a view from `views`.
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W>;
@@ -142,8 +148,13 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
     type Out = ();
     type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Input<T, W>;
 
-    fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs) {
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        defs: &mut PortDefs,
+    ) -> Result<(), DefError> {
         defs.inputs.push(Input::<T>::def(name(names)));
+        Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
@@ -169,8 +180,13 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
     type Out = Output<T>;
     type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Output<T>;
 
-    fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs) {
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        defs: &mut PortDefs,
+    ) -> Result<(), DefError> {
         defs.outputs.push(Output::<T>::def(name(names)));
+        Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
@@ -196,7 +212,11 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
     type Out = ();
     type Item<'a, W: WakeSink + Clone + 'static> = &'a mut DynInputs<W>;
 
-    fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs) {
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        defs: &mut PortDefs,
+    ) -> Result<(), DefError> {
         let taken = defs.dynamic_inputs.replace(name(names).into());
         // PANIC Safety: only a system with two dynamic input parameters
         // reaches this, when its definition is built; the message names the fix.
@@ -204,6 +224,7 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
             taken.is_none(),
             "a system takes `&mut DynInputs` at most once"
         );
+        Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
@@ -226,13 +247,18 @@ impl Param for DynOutputs {
     type Out = DynOutputs;
     type Item<'a, W: WakeSink + Clone + 'static> = &'a mut DynOutputs;
 
-    fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs) {
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        defs: &mut PortDefs,
+    ) -> Result<(), DefError> {
         let taken = defs.dynamic_outputs.replace(name(names).into());
         // PANIC Safety: as for `DynInputs`.
         assert!(
             taken.is_none(),
             "a system takes `&mut DynOutputs` at most once"
         );
+        Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
@@ -255,8 +281,13 @@ impl Param for Timestamp {
     type Out = ();
     type Item<'a, W: WakeSink + Clone + 'static> = Timestamp;
 
-    fn append_defs(names: &mut ParamNames<'_>, _defs: &mut PortDefs) {
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        _defs: &mut PortDefs,
+    ) -> Result<(), DefError> {
         name(names);
+        Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
@@ -277,8 +308,13 @@ impl Param for Log {
     type Out = ();
     type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Log;
 
-    fn append_defs(names: &mut ParamNames<'_>, _defs: &mut PortDefs) {
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        _defs: &mut PortDefs,
+    ) -> Result<(), DefError> {
         name(names);
+        Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
@@ -303,8 +339,9 @@ macro_rules! impl_param_for_tuple {
             type Item<'a, W: WakeSink + Clone + 'static> = ($($P::Item<'a, W>,)*) where Self: 'a;
 
             #[allow(unused_variables)]
-            fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs) {
-                $( $P::append_defs(names, defs); )*
+            fn append_defs(names: &mut ParamNames<'_>, cx: &DefCx<'_>, defs: &mut PortDefs) -> Result<(), DefError> {
+                $( $P::append_defs(names, cx, defs)?; )*
+                Ok(())
             }
 
             #[allow(unused_variables, clippy::unused_unit)]

@@ -50,7 +50,7 @@ fn defs_body(bundle: &Bundle) -> TokenStream2 {
     quote! {
         let mut defs = Vec::new();
         #(#pushes)*
-        defs
+        Ok(defs)
     }
 }
 
@@ -133,7 +133,9 @@ fn expand(parsed: DeriveInput, dir: Dir) -> TokenStream2 {
     };
     quote! {
         impl #impl_generics #fsw::#trait_name for #ident #ty_generics #where_clause {
-            fn defs() -> Vec<#fsw::PortDef> {
+            fn defs(
+                _cx: &#fsw::def::DefCx<'_>,
+            ) -> ::core::result::Result<Vec<#fsw::PortDef>, #fsw::def::DefError> {
                 #defs
             }
             fn bind(#arg: #arg_ty) -> Self {

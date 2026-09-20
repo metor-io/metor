@@ -4,6 +4,7 @@ use metor_proto_wkt::LogEvent;
 
 use metor_fsw_3_ring::{NoWake, WakeSink};
 
+use crate::def::{DefCx, DefError};
 use crate::log::LogPort;
 use crate::port::Output;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
@@ -12,6 +13,12 @@ use std::borrow::Cow;
 
 use super::Ports;
 use super::param::{Bindings, Param, PortDefs};
+
+/// The ports a system's parameters declare whatever its config says.
+fn static_defs<S: Ports>() -> PortDefs {
+    // PANIC Safety: no parameter refuses the empty context.
+    PortDefs::of::<S>(&DefCx::empty()).expect("a static definition")
+}
 
 /// LOG_PORT is the name of the port that receives log events.
 pub const LOG_PORT: &str = "log";
@@ -28,16 +35,16 @@ pub struct OutSet<S: Ports> {
 }
 
 impl<S: Ports, W: WakeSink + Clone + 'static> SystemInputs<W> for InSet<S, W> {
-    fn defs() -> Vec<PortDef> {
-        PortDefs::of::<S>().inputs
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(PortDefs::of::<S>(cx)?.inputs)
     }
 
     fn dynamic() -> Option<Cow<'static, str>> {
-        PortDefs::of::<S>().dynamic_inputs
+        static_defs::<S>().dynamic_inputs
     }
 
     fn bind(inputs: Vec<InputBinding<W>>) -> Self {
-        let declared = <Self as SystemInputs<W>>::defs().len();
+        let declared = static_defs::<S>().inputs.len();
         // PANIC Safety: the coordinator binds the declared ports, then the ones
         // it added to a dynamic bundle.
         assert!(inputs.len() >= declared, "fewer bindings than input params");
@@ -50,18 +57,18 @@ impl<S: Ports, W: WakeSink + Clone + 'static> SystemInputs<W> for InSet<S, W> {
 }
 
 impl<S: Ports> SystemOutputs for OutSet<S> {
-    fn defs() -> Vec<PortDef> {
-        let mut outputs = PortDefs::of::<S>().outputs;
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        let mut outputs = PortDefs::of::<S>(cx)?.outputs;
         outputs.push(Output::<LogEvent>::def(LOG_PORT));
-        outputs
+        Ok(outputs)
     }
 
     fn dynamic() -> Option<Cow<'static, str>> {
-        PortDefs::of::<S>().dynamic_outputs
+        static_defs::<S>().dynamic_outputs
     }
 
     fn bind(outputs: Vec<OutputBinding>) -> Self {
-        let declared = Self::defs().len();
+        let declared = static_defs::<S>().outputs.len() + 1;
         // PANIC Safety: the coordinator binds the declared ports, then the ones
         // it added to a dynamic bundle.
         assert!(

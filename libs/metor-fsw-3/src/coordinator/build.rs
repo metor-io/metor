@@ -562,7 +562,11 @@ mod tests {
         };
         assert_eq!(check_port_names("instance", &def), Ok(()));
         assert_eq!(
-            check_port_names("empty", &crate::SystemDef::new::<(), ()>("empty")),
+            check_port_names(
+                "empty",
+                &crate::SystemDef::new::<(), ()>("empty", &crate::DefCx::empty())
+                    .expect("a static definition")
+            ),
             Ok(())
         );
     }

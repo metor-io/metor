@@ -50,6 +50,7 @@ extern crate self as metor_fsw_3;
 pub mod async_system;
 pub mod cli;
 pub mod coordinator;
+pub mod def;
 pub mod dl;
 pub mod fn_system;
 pub mod frame;
@@ -70,6 +71,7 @@ pub use coordinator::{
     BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, OutputConfig, ParamError,
     Params, PortRef, Step, SystemConfig, SystemStatus, SystemTable,
 };
+pub use def::{DefCx, DefError, Records};
 pub use dl::{DlStep, Pack, PackError, PackFns};
 pub use fn_system::{
     AsyncSystemFn, Ctor, Cycle, FnAsyncSystem, FnSystem, InSet, OutSet, Param, ParamNames, Ports,

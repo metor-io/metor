@@ -44,7 +44,10 @@ fn instance_def(ty: &str) -> Vec<u8> {
     let def = build()
         .get(ty)
         .map(|entry| entry.def.clone())
-        .unwrap_or_else(|| crate::SystemDef::new::<(), ()>("unknown"));
+        .unwrap_or_else(|| {
+            crate::SystemDef::new::<(), ()>("unknown", &crate::DefCx::empty())
+                .expect("a static definition")
+        });
     let instance = crate::pack::def::Instance {
         id: ty.to_string(),
         def,

@@ -5,6 +5,7 @@ use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
+use crate::def::{DefCx, DefError};
 use crate::record::RecordSchema;
 
 /// A `PortDef` names one port of a bundle and the record its ring carries.
@@ -19,6 +20,25 @@ pub struct PortDef {
     pub depth: usize,
     /// What this port announces to the ground.
     pub schema: RecordSchema,
+}
+
+impl PortDef {
+    /// Whether two ports carry the same record under any name.
+    pub fn same_record(&self, other: &PortDef) -> bool {
+        (
+            &self.record,
+            self.id,
+            self.max_len,
+            self.alignment,
+            self.depth,
+        ) == (
+            &other.record,
+            other.id,
+            other.max_len,
+            other.alignment,
+            other.depth,
+        ) && self.schema == other.schema
+    }
 }
 
 /// A system's ports, in bind order.
@@ -38,25 +58,32 @@ pub struct SystemDef {
 }
 
 impl SystemDef {
-    pub fn new<I: SystemInputs, O: SystemOutputs>(name: &'static str) -> Self {
-        Self {
+    /// The definition this instance's config asks the bundles for.
+    pub fn new<I: SystemInputs, O: SystemOutputs>(
+        name: &'static str,
+        cx: &DefCx<'_>,
+    ) -> Result<Self, DefError> {
+        Ok(Self {
             name: name.into(),
-            inputs: I::defs(),
-            outputs: O::defs(),
+            inputs: I::defs(cx)?,
+            outputs: O::defs(cx)?,
             dynamic_inputs: I::dynamic(),
             dynamic_outputs: O::dynamic(),
-        }
+        })
     }
 
     /// The same definition for an async system, whose inputs park on a notifier.
-    pub fn new_async<I: SystemInputs<Notifier>, O: SystemOutputs>(name: &'static str) -> Self {
-        Self {
+    pub fn new_async<I: SystemInputs<Notifier>, O: SystemOutputs>(
+        name: &'static str,
+        cx: &DefCx<'_>,
+    ) -> Result<Self, DefError> {
+        Ok(Self {
             name: name.into(),
-            inputs: I::defs(),
-            outputs: O::defs(),
+            inputs: I::defs(cx)?,
+            outputs: O::defs(cx)?,
             dynamic_inputs: I::dynamic(),
             dynamic_outputs: O::dynamic(),
-        }
+        })
     }
 }
 
@@ -78,7 +105,8 @@ pub trait System {
     type Inputs: SystemInputs;
     type Outputs: SystemOutputs;
 
-    fn def() -> SystemDef;
+    /// This instance's ports, computed from its config.
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError>;
 
     fn execute(
         &self,
@@ -97,7 +125,7 @@ pub trait System {
 /// `W` is the wake endpoint of the ports it binds: [`NoWake`] for a cyclic
 /// system, [`Notifier`](metor_fsw_3_ring::Notifier) for an async one.
 pub trait SystemInputs<W: WakeSink = NoWake> {
-    fn defs() -> Vec<PortDef>;
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError>;
 
     /// The parameter the config's own input ports are bound through, if the
     /// bundle takes them.
@@ -117,7 +145,7 @@ pub trait SystemInputs<W: WakeSink = NoWake> {
 ///
 /// `W` is the wake endpoint of the ports it binds, as for [`SystemInputs`].
 pub trait SystemOutputs<W: WakeSource = NoWake> {
-    fn defs() -> Vec<PortDef>;
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError>;
 
     /// The parameter the config's own output ports are bound through, if the
     /// bundle takes them.
@@ -134,15 +162,15 @@ pub trait SystemOutputs<W: WakeSource = NoWake> {
 }
 
 impl<W: WakeSink> SystemInputs<W> for () {
-    fn defs() -> Vec<PortDef> {
-        Vec::new()
+    fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(Vec::new())
     }
     fn bind(_inputs: Vec<InputBinding<W>>) -> Self {}
 }
 
 impl<W: WakeSource> SystemOutputs<W> for () {
-    fn defs() -> Vec<PortDef> {
-        Vec::new()
+    fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(Vec::new())
     }
     fn bind(_outputs: Vec<OutputBinding<W>>) -> Self {}
 }
@@ -153,8 +181,9 @@ mod tests {
     use metor_proto::types::Timestamp;
 
     use super::*;
+    use crate::def::DefCx;
     use crate::port::{Input, Output, ring_capacity};
-    use crate::tests::utils::{Imu, Nav};
+    use crate::tests::utils::{Imu, Nav, static_inputs, static_outputs};
     use crate::{Frame, Record};
 
     #[derive(crate::SystemInputs)]
@@ -169,8 +198,8 @@ mod tests {
     }
 
     impl SystemInputs for HandIn {
-        fn defs() -> Vec<PortDef> {
-            vec![Input::<Imu>::def("imu"), Input::<Nav>::def("nav")]
+        fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+            Ok(vec![Input::<Imu>::def("imu"), Input::<Nav>::def("nav")])
         }
         fn bind(mut inputs: Vec<InputBinding>) -> Self {
             let nav = inputs.pop().expect("two bindings");
@@ -220,9 +249,12 @@ mod tests {
 
     #[test]
     fn derived_defs_match_hand_written() {
-        assert_eq!(DerivedIn::defs(), HandIn::defs());
         assert_eq!(
-            DerivedOut::defs(),
+            static_inputs::<DerivedIn, _>(),
+            static_inputs::<HandIn, _>()
+        );
+        assert_eq!(
+            static_outputs::<DerivedOut>(),
             vec![PortDef {
                 name: "nav".into(),
                 record: Nav::NAME.into(),
@@ -237,16 +269,17 @@ mod tests {
 
     #[test]
     fn system_def_collects_both_bundles() {
-        let def = SystemDef::new::<DerivedIn, DerivedOut>("nav");
+        let def = SystemDef::new::<DerivedIn, DerivedOut>("nav", &DefCx::empty())
+            .expect("a static definition");
         assert_eq!(def.name, "nav");
-        assert_eq!(def.inputs, DerivedIn::defs());
-        assert_eq!(def.outputs, DerivedOut::defs());
+        assert_eq!(def.inputs, static_inputs::<DerivedIn, _>());
+        assert_eq!(def.outputs, static_outputs::<DerivedOut>());
     }
 
     #[test]
     fn unit_bundles_are_empty() {
-        assert!(<() as SystemInputs>::defs().is_empty());
-        assert!(<() as SystemOutputs>::defs().is_empty());
+        assert!(static_inputs::<(), NoWake>().is_empty());
+        assert!(static_outputs::<()>().is_empty());
         <() as SystemInputs>::bind(Vec::new());
         <() as SystemOutputs>::bind(Vec::new());
     }
@@ -297,7 +330,8 @@ mod tests {
 
     #[test]
     fn a_static_bundle_is_not_dynamic() {
-        let def = SystemDef::new::<DerivedIn, DerivedOut>("nav");
+        let def = SystemDef::new::<DerivedIn, DerivedOut>("nav", &DefCx::empty())
+            .expect("a static definition");
         assert_eq!(def.dynamic_inputs, None);
         assert_eq!(def.dynamic_outputs, None);
     }
@@ -306,7 +340,8 @@ mod tests {
     fn a_dynamic_bundle_declares_no_ports_and_binds_what_it_is_given() {
         use crate::port::{DynInputs, DynOutputs};
 
-        let def = SystemDef::new::<DynInputs, DynOutputs>("link");
+        let def = SystemDef::new::<DynInputs, DynOutputs>("link", &DefCx::empty())
+            .expect("a static definition");
         assert!(def.inputs.is_empty() && def.outputs.is_empty());
         assert_eq!(def.dynamic_inputs.as_deref(), Some("inputs"));
         assert_eq!(def.dynamic_outputs.as_deref(), Some("outputs"));

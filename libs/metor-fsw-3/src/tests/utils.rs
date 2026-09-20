@@ -14,6 +14,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3_ring::Notifier;
 
 use crate::async_system::Stop;
+use crate::def::{DefCx, DefError};
 use crate::port::{DynInputs, DynOutputs, Input, Output};
 use crate::system::{System, SystemDef};
 use crate::{Frame, SystemInputs, SystemOutputs};
@@ -135,8 +136,8 @@ impl System for Reserved {
     type Inputs = ();
     type Outputs = ReservedOut;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<(), ReservedOut>("reserved")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<(), ReservedOut>("reserved", cx)
     }
 
     fn execute(
@@ -161,8 +162,8 @@ impl System for ImuSource {
     type Inputs = ();
     type Outputs = ImuOut;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<(), ImuOut>("imu_source")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<(), ImuOut>("imu_source", cx)
     }
 
     fn execute(&self, _now: Timestamp, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
@@ -182,8 +183,8 @@ impl System for ImuOffset {
     type Inputs = ();
     type Outputs = ImuOut;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<(), ImuOut>("imu_offset")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<(), ImuOut>("imu_offset", cx)
     }
 
     fn execute(&self, _now: Timestamp, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
@@ -203,8 +204,8 @@ impl System for NavFilter {
     type Inputs = NavIn;
     type Outputs = NavOut;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<NavIn, NavOut>("nav_filter")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<NavIn, NavOut>("nav_filter", cx)
     }
 
     fn execute(&self, _now: Timestamp, _state: &mut (), inputs: &mut NavIn, outputs: &mut NavOut) {
@@ -228,8 +229,8 @@ impl System for ControlLaw {
     type Inputs = ControlIn;
     type Outputs = ControlOut;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<ControlIn, ControlOut>("control_law")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<ControlIn, ControlOut>("control_law", cx)
     }
 
     fn execute(
@@ -259,8 +260,8 @@ impl System for StatusWatch {
     type Inputs = StatusIn;
     type Outputs = ();
 
-    fn def() -> SystemDef {
-        SystemDef::new::<StatusIn, ()>("status_watch")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<StatusIn, ()>("status_watch", cx)
     }
 
     fn execute(
@@ -294,6 +295,26 @@ impl Boom {
     }
 }
 
+/// A cyclic type's ports under the empty context.
+pub fn static_def<S: System>() -> SystemDef {
+    S::def(&DefCx::empty()).expect("a static definition")
+}
+
+/// An async type's ports under the empty context.
+pub fn static_async_def<A: crate::AsyncSystem>() -> SystemDef {
+    A::def(&DefCx::empty()).expect("a static definition")
+}
+
+/// An input bundle's ports under the empty context.
+pub fn static_inputs<I: SystemInputs<W>, W: metor_fsw_3_ring::WakeSink>() -> Vec<crate::PortDef> {
+    I::defs(&DefCx::empty()).expect("a static definition")
+}
+
+/// An output bundle's ports under the empty context.
+pub fn static_outputs<O: SystemOutputs>() -> Vec<crate::PortDef> {
+    O::defs(&DefCx::empty()).expect("a static definition")
+}
+
 /// A trait-path system that panics, so it has no `log` port to fault onto.
 pub struct Trap;
 
@@ -302,8 +323,8 @@ impl System for Trap {
     type Inputs = ();
     type Outputs = ();
 
-    fn def() -> SystemDef {
-        SystemDef::new::<(), ()>("trap")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<(), ()>("trap", cx)
     }
 
     fn execute(&self, _now: Timestamp, _state: &mut (), _inputs: &mut (), _outputs: &mut ()) {

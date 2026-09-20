@@ -7,6 +7,7 @@ use std::sync::Arc;
 use metor_fsw_3_ring::Notifier;
 use stellarator::sync::WaitQueue;
 
+use crate::def::{DefCx, DefError};
 use crate::system::{SystemDef, SystemInputs, SystemOutputs};
 
 /// An `AsyncSystem` runs once, paces itself, and returns when `stop` resolves.
@@ -19,7 +20,8 @@ pub trait AsyncSystem {
     type Inputs: SystemInputs<Notifier>;
     type Outputs: SystemOutputs;
 
-    fn def() -> SystemDef;
+    /// This instance's ports, computed from its config.
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError>;
 
     async fn run(
         &self,

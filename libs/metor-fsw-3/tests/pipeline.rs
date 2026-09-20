@@ -8,8 +8,8 @@ use core::task::{Context, Poll};
 use std::rc::Rc;
 
 use metor_fsw_3::{
-    Clock, CoordinatorConfig, Frame, Input, InputConfig, Output, PortRef, System, SystemConfig,
-    SystemDef, SystemInputs, SystemStatus, SystemTable, Timestamp, system,
+    Clock, CoordinatorConfig, DefCx, DefError, Frame, Input, InputConfig, Output, PortRef, System,
+    SystemConfig, SystemDef, SystemInputs, SystemStatus, SystemTable, Timestamp, system,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -113,8 +113,8 @@ impl System for Monitor {
     type Inputs = MonitorIn;
     type Outputs = ();
 
-    fn def() -> SystemDef {
-        SystemDef::new::<MonitorIn, ()>("monitor")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<MonitorIn, ()>("monitor", cx)
     }
 
     fn execute(
