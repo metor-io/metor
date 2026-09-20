@@ -2,10 +2,12 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use metor_fsw_3_ring::{NoWake, RingBuffer};
 use serde_json::value::RawValue;
 
+use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::fn_system::{AsyncSystemFn, Ctor, FnAsyncSystem, FnSystem, SystemFn};
 use crate::system::{
@@ -13,13 +15,14 @@ use crate::system::{
 };
 use crate::thread::{DEFAULT_THREAD, Threads};
 
+use super::BuildError;
 use super::params::{ParamError, Params};
 use super::run::{Runner, Step};
 
-/// Everything one system is built from: its config id, where it is placed, the
-/// definition build settled on, its params, and the rings its ports sit on —
-/// one ring list per input port, in edge order, and one ring per output, both
-/// in `def` order.
+static STATUS: LazyLock<PortDef> =
+    LazyLock::new(|| crate::Output::<super::SystemStatus>::def("status"));
+
+/// Arguments for constructing a system using [`MakeFn`].
 pub struct MakeCx<'a> {
     pub id: &'a str,
     pub thread: &'a str,
@@ -30,7 +33,7 @@ pub struct MakeCx<'a> {
     pub threads: &'a mut Threads,
 }
 
-/// Builds one bound system from a [`MakeCx`].
+/// Builds a system from [`MakeCx`].
 pub(crate) type MakeFn = dyn Fn(MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>;
 
 pub(crate) struct TableEntry {
@@ -42,9 +45,7 @@ pub(crate) struct TableEntry {
     pub make: Box<MakeFn>,
 }
 
-/// A `SystemTable` maps each type name a config may use to its definition and constructor.
-///
-/// Entries keep their registration order, which the pack descriptor projects.
+/// A `SystemTable` maps systems names to their definitions and constructors.
 #[derive(Default)]
 pub struct SystemTable {
     entries: Vec<(String, TableEntry)>,
@@ -56,22 +57,26 @@ impl SystemTable {
         Self::default()
     }
 
-    /// Registers a `System` under `ty`, replacing any type registered under the same name.
+    /// Registers a `System` under `ty`, replacing any system registered under the same name.
     pub fn register_system<S: System + 'static>(
         &mut self,
         ty: &str,
         make: impl Fn(Params<'_>) -> Result<(S, S::State), ParamError> + 'static,
-    ) {
-        self.insert(ty, entry::<S>(make, Cow::Borrowed(""), None));
+    ) -> Result<(), BuildError> {
+        self.insert(ty, entry::<S>(make, Cow::Borrowed(""), None))
     }
 
-    /// Registers a `#[system]` type under `ty`, built by a plain `Fn() -> S` or `Fn(P) -> S`.
-    pub fn register<S: SystemFn, M, C: Ctor<S, M> + 'static>(&mut self, ty: &str, ctor: C) {
+    /// Registers a `#[system]` with `ty`
+    pub fn register<S: SystemFn, M, C: Ctor<S, M> + 'static>(
+        &mut self,
+        ty: &str,
+        ctor: C,
+    ) -> Result<(), BuildError> {
         let make = move |params: Params<'_>| Ok((FnSystem::default(), ctor.make(params)?));
         self.insert(
             ty,
             entry::<FnSystem<S>>(make, Cow::Borrowed(S::DOC), C::schema()),
-        );
+        )
     }
 
     /// Registers an `AsyncSystem` under `ty`, constructed on its own thread.
@@ -79,8 +84,8 @@ impl SystemTable {
         &mut self,
         ty: &str,
         make: impl Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
-    ) {
-        self.insert(ty, async_entry::<A, _>(make, Cow::Borrowed(""), None));
+    ) -> Result<(), BuildError> {
+        self.insert(ty, async_entry::<A, _>(make, Cow::Borrowed(""), None))
     }
 
     /// Registers a `#[system]` type with an `async run` under `ty`.
@@ -88,16 +93,38 @@ impl SystemTable {
         &mut self,
         ty: &str,
         ctor: C,
-    ) {
+    ) -> Result<(), BuildError> {
         let make = move |params: Params<'_>| Ok((FnAsyncSystem::default(), ctor.make(params)?));
         self.insert(
             ty,
             async_entry::<FnAsyncSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema()),
-        );
+        )
     }
 
     /// Adds an entry, replacing a same-named one in place so order is registration order.
-    pub(crate) fn insert(&mut self, ty: &str, entry: TableEntry) {
+    pub(crate) fn insert(&mut self, ty: &str, entry: TableEntry) -> Result<(), BuildError> {
+        check_definition(&entry.def)?;
+        for (name, known) in &self.entries {
+            if name != ty {
+                check_definitions(&known.def, &entry.def)?;
+            }
+        }
+        self.put(ty, entry);
+        Ok(())
+    }
+
+    /// Inserts entries in order, stopping at the first conflict. Earlier insertions remain.
+    pub(crate) fn insert_all(
+        &mut self,
+        entries: Vec<(String, TableEntry)>,
+    ) -> Result<(), BuildError> {
+        for (ty, entry) in entries {
+            self.insert(&ty, entry)?;
+        }
+        Ok(())
+    }
+
+    fn put(&mut self, ty: &str, entry: TableEntry) {
         match self.index.get(ty) {
             Some(&at) => self.entries[at].1 = entry,
             None => {
@@ -117,30 +144,67 @@ impl SystemTable {
         self.entries.iter().map(|(ty, entry)| (ty.as_str(), entry))
     }
 
-    /// Every record a registered port declares, by name. `None` is a name two
-    /// registrations define differently, which no config may resolve.
-    pub(crate) fn records(&self) -> HashMap<&str, Option<&PortDef>> {
-        let ports = self
-            .entries()
-            .flat_map(|(_, entry)| entry.def.inputs.iter().chain(&entry.def.outputs));
-        let mut records: HashMap<&str, Option<&PortDef>> = HashMap::new();
-        for port in ports {
-            records
-                .entry(&port.record)
-                .and_modify(|known| {
-                    if known.is_some_and(|known| !carries_alike(known, port)) {
-                        *known = None;
-                    }
-                })
-                .or_insert(Some(port));
-        }
-        records
+    /// Finds a record among the registered ports and the implicit status port.
+    pub(crate) fn record(&self, name: &str) -> Option<&PortDef> {
+        core::iter::once(&*STATUS)
+            .chain(self.entries().flat_map(|(_, entry)| ports(&entry.def)))
+            .find(|port| port.record == name)
     }
 }
 
-/// Whether two ports agree on everything but their names.
-fn carries_alike(a: &PortDef, b: &PortDef) -> bool {
+fn ports(def: &SystemDef) -> impl Iterator<Item = &PortDef> {
+    def.inputs.iter().chain(&def.outputs)
+}
+
+fn check_definition(def: &SystemDef) -> Result<(), BuildError> {
+    for (at, port) in ports(def).enumerate() {
+        check_record(&STATUS, port)?;
+        for known in ports(def).take(at) {
+            check_record(known, port)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_definitions(known: &SystemDef, incoming: &SystemDef) -> Result<(), BuildError> {
+    for port in ports(incoming) {
+        for known in ports(known) {
+            check_record(known, port)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_record(known: &PortDef, port: &PortDef) -> Result<(), BuildError> {
+    if known.record == port.record && !same_record(known, port) {
+        return Err(BuildError::RecordConflict {
+            record: port.record.to_string(),
+        });
+    }
+    if known.record != port.record && known.id == port.id {
+        return Err(BuildError::RecordIdConflict {
+            id: port.id,
+            first: known.record.to_string(),
+            second: port.record.to_string(),
+        });
+    }
+    if let (RecordSchema::Msg { id: a, .. }, RecordSchema::Msg { id: b, .. }) =
+        (&known.schema, &port.schema)
+        && a == b
+        && known.schema != port.schema
+    {
+        return Err(BuildError::MessageIdConflict {
+            id: *a,
+            first: known.record.to_string(),
+            second: port.record.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn same_record(a: &PortDef, b: &PortDef) -> bool {
     (a.id, a.max_len, a.alignment, a.depth) == (b.id, b.max_len, b.alignment, b.depth)
+        && a.schema == b.schema
 }
 
 /// Builds one entry, binding the system's bundles from the rings' handles.
@@ -216,11 +280,277 @@ mod tests {
     use crate::Record;
     use crate::async_system::Stop;
     use crate::tests::utils::{Imu, ImuOffset, ImuSource, NavFilter};
+    use crate::{MsgCodec, Output};
+    use metor_proto::types::ComponentId;
+
+    fn message(name: &'static str, codec: MsgCodec) -> PortDef {
+        PortDef {
+            name: "out".into(),
+            record: name.into(),
+            id: ComponentId::new(name),
+            max_len: 32,
+            alignment: 1,
+            depth: 1,
+            schema: RecordSchema::msg(name, codec),
+        }
+    }
+
+    fn declared(outputs: Vec<PortDef>) -> TableEntry {
+        let mut entry = entry::<ImuSource>(|_| Ok((ImuSource, 0)), Cow::Borrowed(""), None);
+        entry.def.outputs = outputs;
+        entry
+    }
+
+    #[test]
+    fn record_lookup_includes_implicit_status_and_repeated_ports() {
+        let mut table = SystemTable::new();
+        assert_eq!(table.record("status"), Some(&*STATUS));
+        assert!(table.record("missing").is_none());
+        let first = Output::<Imu>::def("first");
+        let mut second = first.clone();
+        second.name = "second".into();
+        table
+            .insert("one", declared(vec![first.clone(), second]))
+            .expect("same record");
+        table
+            .insert("two", declared(vec![first.clone()]))
+            .expect("same record");
+        assert_eq!(table.record(Imu::NAME), Some(&first));
+    }
+
+    #[test]
+    fn conflicting_codecs_are_rejected_without_adding_the_entry() {
+        let mut table = SystemTable::new();
+        let first = message("command", MsgCodec::Json);
+        table
+            .insert("json", declared(vec![first.clone()]))
+            .expect("first record");
+        assert_eq!(
+            table.insert("bytes", declared(vec![message("command", MsgCodec::Bytes)])),
+            Err(BuildError::RecordConflict {
+                record: "command".into()
+            })
+        );
+        assert!(table.get("bytes").is_none());
+        assert_eq!(table.record("command"), Some(&first));
+    }
+
+    #[test]
+    fn inputs_and_frame_schemas_are_checked_during_registration() {
+        let mut table = SystemTable::new();
+        let first = Output::<Imu>::def("imu");
+        table
+            .insert("source", declared(vec![first.clone()]))
+            .expect("first record");
+        let mut changed = first;
+        let RecordSchema::Frame { metadata, .. } = &mut changed.schema else {
+            panic!("frame")
+        };
+        metadata[0].name = "imu.other".into();
+        let mut input = declared(Vec::new());
+        input.def.inputs.push(changed);
+        assert_eq!(
+            table.insert("sink", input),
+            Err(BuildError::RecordConflict {
+                record: "imu".into()
+            })
+        );
+        assert!(table.get("sink").is_none());
+    }
+
+    #[test]
+    fn conflicts_within_an_entry_leave_no_partial_registration() {
+        let mut table = SystemTable::new();
+        let ports = vec![
+            message("unrelated", MsgCodec::Json),
+            message("command", MsgCodec::Json),
+            message("command", MsgCodec::Bytes),
+        ];
+        assert!(matches!(
+            table.insert("bad", declared(ports)),
+            Err(BuildError::RecordConflict { .. })
+        ));
+        assert_eq!(table.entries().count(), 0);
+        assert!(table.record("unrelated").is_none());
+        assert!(table.record("command").is_none());
+    }
+
+    #[test]
+    fn pack_registration_stops_at_the_first_conflict() {
+        let mut table = SystemTable::new();
+        let original = message("command", MsgCodec::Json);
+        table
+            .insert("existing", declared(vec![original.clone()]))
+            .expect("first");
+        let pack = vec![
+            (
+                "new".into(),
+                declared(vec![message("new", MsgCodec::Bytes)]),
+            ),
+            (
+                "bad".into(),
+                declared(vec![message("command", MsgCodec::Bytes)]),
+            ),
+            (
+                "later".into(),
+                declared(vec![message("later", MsgCodec::Json)]),
+            ),
+        ];
+        assert!(matches!(
+            table.insert_all(pack),
+            Err(BuildError::RecordConflict { .. })
+        ));
+        assert!(table.get("new").is_some());
+        assert!(table.get("bad").is_none());
+        assert!(table.get("later").is_none());
+        assert_eq!(table.record("command"), Some(&original));
+        assert!(table.record("new").is_some());
+    }
+
+    #[test]
+    fn pack_registration_replaces_same_named_entries_in_order() {
+        let mut table = SystemTable::new();
+        let pack = vec![
+            (
+                "same".into(),
+                declared(vec![message("first", MsgCodec::Json)]),
+            ),
+            (
+                "same".into(),
+                declared(vec![message("second", MsgCodec::Bytes)]),
+            ),
+        ];
+        table.insert_all(pack).expect("compatible replacement");
+        assert_eq!(table.entries().count(), 1);
+        assert!(table.record("first").is_none());
+        assert!(table.record("second").is_some());
+    }
+
+    #[test]
+    fn pack_replacements_cannot_conflict_with_existing_records() {
+        let mut table = SystemTable::new();
+        let old = message("command", MsgCodec::Json);
+        for name in ["one", "two"] {
+            table
+                .insert(name, declared(vec![old.clone()]))
+                .expect("initial");
+        }
+        let new = message("command", MsgCodec::Bytes);
+        let pack = ["one", "two"]
+            .into_iter()
+            .map(|name| (name.to_string(), declared(vec![new.clone()])))
+            .collect();
+        assert!(matches!(
+            table.insert_all(pack),
+            Err(BuildError::RecordConflict { .. })
+        ));
+        assert_eq!(table.record("command"), Some(&old));
+        assert_eq!(
+            table.entries().map(|(name, _)| name).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+    }
+
+    #[test]
+    fn distinct_record_names_cannot_share_a_record_id() {
+        let mut table = SystemTable::new();
+        let first = message("first", MsgCodec::Json);
+        let mut second = message("second", MsgCodec::Json);
+        second.id = first.id;
+        table
+            .insert("first", declared(vec![first]))
+            .expect("first record");
+        assert!(matches!(
+            table.insert("second", declared(vec![second])),
+            Err(BuildError::RecordIdConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn incompatible_wire_ids_are_rejected_during_registration() {
+        let mut table = SystemTable::new();
+        let first = message("command_3", MsgCodec::Json);
+        let second = message("command_121", MsgCodec::Bytes);
+        assert_eq!(first.schema.packet_id(), second.schema.packet_id());
+        let id = first.schema.packet_id();
+        table
+            .insert("first", declared(vec![first]))
+            .expect("first record");
+        assert_eq!(
+            table.insert("second", declared(vec![second])),
+            Err(BuildError::MessageIdConflict {
+                id,
+                first: "command_3".into(),
+                second: "command_121".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn the_implicit_status_definition_cannot_be_replaced() {
+        let mut table = SystemTable::new();
+        let mut status = STATUS.clone();
+        status.schema = RecordSchema::msg("status", MsgCodec::Bytes);
+        assert!(matches!(
+            table.insert("bad", declared(vec![status])),
+            Err(BuildError::RecordConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn replacement_removes_obsolete_records_and_keeps_shared_ones() {
+        let mut table = SystemTable::new();
+        let old = message("old", MsgCodec::Bytes);
+        let shared = message("shared", MsgCodec::Json);
+        table
+            .insert("one", declared(vec![old, shared.clone()]))
+            .expect("first");
+        table
+            .insert("two", declared(vec![shared.clone()]))
+            .expect("shared");
+        let new = message("new", MsgCodec::Bytes);
+        table
+            .insert("one", declared(vec![new.clone()]))
+            .expect("replacement");
+        assert!(table.record("old").is_none());
+        assert_eq!(table.record("shared"), Some(&shared));
+        assert_eq!(table.record("new"), Some(&new));
+        assert_eq!(
+            table.entries().map(|(name, _)| name).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+    }
+
+    #[test]
+    fn replacement_checks_the_retained_entries_and_preserves_the_original_on_failure() {
+        let mut table = SystemTable::new();
+        let json = message("command", MsgCodec::Json);
+        let bytes = message("command", MsgCodec::Bytes);
+        table
+            .insert("one", declared(vec![json.clone()]))
+            .expect("first");
+        table
+            .insert("one", declared(vec![bytes.clone()]))
+            .expect("sole definition can change");
+        table
+            .insert("two", declared(vec![bytes.clone()]))
+            .expect("shared definition");
+        assert!(matches!(
+            table.insert("one", declared(vec![json])),
+            Err(BuildError::RecordConflict { .. })
+        ));
+        assert_eq!(
+            table.get("one").expect("original entry").def.outputs,
+            [bytes]
+        );
+    }
 
     #[test]
     fn register_records_the_definition() {
         let mut table = SystemTable::new();
-        table.register_system("imu", |_| Ok((ImuSource, 0)));
+        table
+            .register_system("imu", |_| Ok((ImuSource, 0)))
+            .expect("valid records");
         let entry = table.get("imu").expect("registered");
         assert_eq!(entry.def.outputs[0].id, Imu::ID);
     }
@@ -228,8 +558,12 @@ mod tests {
     #[test]
     fn registering_a_type_twice_replaces_it() {
         let mut table = SystemTable::new();
-        table.register_system("shared", |_| Ok((ImuSource, 0)));
-        table.register_system("shared", |_| Ok((NavFilter, ())));
+        table
+            .register_system("shared", |_| Ok((ImuSource, 0)))
+            .expect("valid records");
+        table
+            .register_system("shared", |_| Ok((NavFilter, ())))
+            .expect("valid records");
         let entry = table.get("shared").expect("registered");
         assert_eq!(entry.def.name, NavFilter::def().name);
     }
@@ -244,9 +578,15 @@ mod tests {
     #[test]
     fn entries_keep_registration_order_across_a_replacement() {
         let mut table = SystemTable::new();
-        table.register_system("imu", |_| Ok((ImuSource, 0)));
-        table.register_system("nav", |_| Ok((NavFilter, ())));
-        table.register_system("imu", |_| Ok((ImuOffset, 0)));
+        table
+            .register_system("imu", |_| Ok((ImuSource, 0)))
+            .expect("valid records");
+        table
+            .register_system("nav", |_| Ok((NavFilter, ())))
+            .expect("valid records");
+        table
+            .register_system("imu", |_| Ok((ImuOffset, 0)))
+            .expect("valid records");
         let seen: Vec<_> = table.entries().map(|(ty, _)| ty).collect();
         assert_eq!(seen, vec!["imu", "nav"]);
         assert_eq!(
@@ -275,7 +615,9 @@ mod tests {
     #[test]
     fn an_async_registration_keeps_its_definition_and_launches_on_its_thread() {
         let mut table = SystemTable::new();
-        table.register_async_system("idle", |_| Ok((Idle, ())));
+        table
+            .register_async_system("idle", |_| Ok((Idle, ())))
+            .expect("valid records");
         let entry = table.get("idle").expect("registered");
         assert_eq!(entry.def.name, "idle");
         assert!(entry.def.inputs.is_empty() && entry.def.outputs.is_empty());
@@ -300,7 +642,9 @@ mod tests {
     #[test]
     fn the_trait_path_registers_no_doc_and_no_schema() {
         let mut table = SystemTable::new();
-        table.register_system("imu", |_| Ok((ImuSource, 0)));
+        table
+            .register_system("imu", |_| Ok((ImuSource, 0)))
+            .expect("valid records");
         let entry = table.get("imu").expect("registered");
         assert_eq!(entry.doc, "");
         assert!(entry.schema.is_none());

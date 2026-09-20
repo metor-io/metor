@@ -14,8 +14,8 @@ use crate::port::{DynOutputs, Output};
 use crate::record::{Bytes, RecordSchema};
 use crate::{Stop, system};
 
-use super::conn::{Connections, Packet};
-use super::transport::{Endpoint, Incoming, Transport, incoming};
+use super::conn::{self, Connections, Event, Packet};
+use super::transport::{Endpoint, Transport, incoming};
 use super::wire;
 use super::{LinkStatus, pending_cap};
 
@@ -101,14 +101,14 @@ impl Subscribe {
         let mut dropped = 0;
         let mut reported = LinkStatus::new(Timestamp(0), Default::default(), 0);
         loop {
-            let event = next(&incoming, &inbox, &conns, &stop).await;
+            let event = conn::next(&incoming, &conns, inbox.stirred(), &stop).await;
             match event {
                 Event::Connected(stream) => {
                     let inbox = inbox.clone();
                     conns.open(stream, seed.clone(), move |packet| inbox.accept(packet));
                 }
-                Event::Inbound => dropped += deliver(&inbox, &mut ports),
-                Event::Closed => {}
+                Event::Ready => dropped += deliver(&inbox, &mut ports),
+                Event::Changed => {}
                 Event::Stop => return,
             }
             conns.prune();
@@ -183,33 +183,6 @@ fn deliver(inbox: &Inbox, ports: &mut [(PacketId, &mut Output<Bytes>)]) -> u64 {
         }
     });
     full
-}
-
-/// What woke the link's loop.
-enum Event {
-    Connected(stellarator::net::TcpStream),
-    Inbound,
-    Closed,
-    Stop,
-}
-
-/// The first of a connection, a packet, a connection ending, and the stop.
-async fn next(incoming: &Incoming, inbox: &Inbox, conns: &Connections, stop: &Stop) -> Event {
-    let connected = async { Event::Connected(incoming.next().await) };
-    let inbound = async {
-        inbox.stirred().await;
-        Event::Inbound
-    };
-    let closed = async {
-        conns.ended().await;
-        Event::Closed
-    };
-    let stopped = async {
-        stop.wait().await;
-        Event::Stop
-    };
-    let first = futures_lite::future::or(connected, inbound);
-    futures_lite::future::or(futures_lite::future::or(first, closed), stopped).await
 }
 
 /// One inbound packet, copied out of a connection's buffer.

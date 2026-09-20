@@ -24,7 +24,11 @@
 //!     /// Copies every fix until stop.
 //!     async fn run(&mut self, gps: &mut Input<Gps, Notifier>, out: &mut Output<Gps>, stop: Stop) {
 //!         while !stop.is_set() {
-//!             let Ok(fix) = gps.next().await else { return };
+//!             let fix = futures_lite::future::or(async { gps.next().await.ok() }, async {
+//!                 stop.wait().await;
+//!                 None
+//!             }).await;
+//!             let Some(fix) = fix else { return };
 //!             let fix = Gps { timestamp: fix.timestamp, pos: fix.pos };
 //!             let _ = out.write(&fix);
 //!         }
@@ -32,7 +36,8 @@
 //! }
 //!
 //! let mut table = SystemTable::new();
-//! table.register_async("relay", || Relay);
+//! table.register_async("relay", || Relay)?;
+//! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
 //!
 //! The built-in [`link`] systems, `Publish` and `Subscribe`, are async
@@ -67,7 +72,7 @@ pub use coordinator::{
 };
 pub use dl::{DlStep, Pack, PackError, PackFns};
 pub use fn_system::{
-    AsyncSystemFn, Ctor, Cycle, FnAsyncSystem, FnSystem, InSet, Names, OutSet, Param, Ports,
+    AsyncSystemFn, Ctor, Cycle, FnAsyncSystem, FnSystem, InSet, OutSet, Param, ParamNames, Ports,
     SystemFn,
 };
 pub use frame::Frame;

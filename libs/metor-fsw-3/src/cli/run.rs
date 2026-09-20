@@ -210,7 +210,7 @@ pub fn load(mut config: TargetConfig, overrides: &Run) -> Result<Coordinator, Ru
     }
 
     let mut table = SystemTable::new();
-    crate::link::register_builtins(&mut table);
+    crate::link::register_builtins(&mut table)?;
     let opened: Vec<Pack> = config
         .packs
         .iter()
@@ -222,7 +222,7 @@ pub fn load(mut config: TargetConfig, overrides: &Run) -> Result<Coordinator, Ru
         })
         .collect::<Result<_, _>>()?;
     for (reference, pack) in config.packs.iter().zip(&opened) {
-        table.register_pack(&reference.id, pack);
+        table.register_pack(&reference.id, pack)?;
     }
     Ok(config.coordinator.build(&table)?)
 }

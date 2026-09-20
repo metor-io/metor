@@ -46,7 +46,9 @@ fn main() {
     assert_eq!(NavState::NAMES, &["now", "gps", "gps_backup", "estimate"]);
     assert_eq!(NavState::NAME, "nav_state");
     let mut table = SystemTable::new();
-    table.register("nav", NavState::default);
+    table
+        .register("nav", NavState::default)
+        .expect("valid records");
     let mut nav = NavState::default();
     nav.execute(
         Timestamp(0),

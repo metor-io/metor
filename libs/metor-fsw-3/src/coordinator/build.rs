@@ -101,7 +101,6 @@ fn resolve<'a>(
     };
 
     let mut index = HashMap::with_capacity(config.systems.len());
-    let records = table.records();
 
     for system in &config.systems {
         if index.contains_key(system.id.as_str()) {
@@ -120,7 +119,7 @@ fn resolve<'a>(
             })?;
 
         let mut def = entry.def.clone();
-        add_dynamic_outputs(system, &mut def, &records)?;
+        add_dynamic_outputs(system, &mut def, table)?;
         check_port_names(&system.id, &def)?;
         if def.outputs.iter().any(|p| p.name == STATUS_PORT) {
             return Err(BuildError::ReservedPort {
@@ -180,12 +179,11 @@ fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildErr
     Ok(())
 }
 
-/// Appends the config's output ports to a system with dynamic outputs,
-/// completing each one from the record it names.
+/// Appends the config's output ports to a system with dynamic outputs
 fn add_dynamic_outputs(
     system: &SystemConfig,
     def: &mut SystemDef,
-    records: &HashMap<&str, Option<&PortDef>>,
+    table: &SystemTable,
 ) -> Result<(), BuildError> {
     for output in &system.outputs {
         if def.dynamic_outputs.is_none() {
@@ -194,17 +192,13 @@ fn add_dynamic_outputs(
                 port: output.port.clone(),
             });
         }
-        let known =
-            records
-                .get(output.record.as_str())
-                .ok_or_else(|| BuildError::UnknownRecord {
-                    system: system.id.clone(),
-                    port: output.port.clone(),
-                    record: output.record.clone(),
-                })?;
-        let known = known.ok_or_else(|| BuildError::RecordConflict {
-            record: output.record.clone(),
-        })?;
+        let known = table
+            .record(&output.record)
+            .ok_or_else(|| BuildError::UnknownRecord {
+                system: system.id.clone(),
+                port: output.port.clone(),
+                record: output.record.clone(),
+            })?;
         def.outputs.push(PortDef {
             name: output.port.clone().into(),
             ..known.clone()
@@ -233,6 +227,18 @@ fn resolve_edges(
 ) -> Result<(), BuildError> {
     for (i, system) in config.systems.iter().enumerate() {
         for input in &system.inputs {
+            if input.from.is_empty()
+                && !plan.systems[i]
+                    .def
+                    .inputs
+                    .iter()
+                    .any(|p| p.name == input.port)
+            {
+                return Err(BuildError::UnknownInput {
+                    system: system.id.clone(),
+                    port: input.port.clone(),
+                });
+            }
             for from in &input.from {
                 let Some(&producer) = index.get(from.system.as_str()) else {
                     return Err(BuildError::UnknownSystem {
@@ -876,15 +882,42 @@ mod tests {
     fn a_record_two_registrations_define_differently_is_rejected() {
         let recorder = Recorder::default();
         let mut table = table(&recorder);
-        table.register("wide", || WideSource);
+        assert_eq!(
+            table.register("wide", || WideSource),
+            Err(BuildError::RecordConflict {
+                record: "imu".into(),
+            })
+        );
         let config = CoordinatorConfig {
             systems: vec![emits("imu")],
             ..Default::default()
         };
+        assert!(config.build(&table).is_ok());
+    }
+
+    #[test]
+    fn conflicting_records_are_rejected_even_without_dynamic_ports() {
+        let mut table = table(&Recorder::default());
         assert_eq!(
-            config.build(&table).err(),
-            Some(BuildError::RecordConflict {
-                record: "imu".into()
+            table.register("wide", || WideSource),
+            Err(BuildError::RecordConflict {
+                record: "imu".into(),
+            })
+        );
+        assert!(CoordinatorConfig::default().build(&table).is_ok());
+    }
+
+    #[test]
+    fn an_empty_input_still_requires_a_declared_port() {
+        let mut config = pipeline_config();
+        config.systems[1].inputs[0].from.clear();
+        assert!(build(config.clone()).is_ok());
+        config.systems[1].inputs[0].port = "typo".into();
+        assert_eq!(
+            build(config).err(),
+            Some(BuildError::UnknownInput {
+                system: "nav".into(),
+                port: "typo".into(),
             })
         );
     }

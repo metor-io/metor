@@ -205,16 +205,34 @@ pub mod json {
         value: &T,
         buf: &'a mut [u8],
     ) -> Result<&'a [u8], EncodeError> {
-        let mut out = std::io::Cursor::new(&mut *buf);
-        serde_json::to_writer(&mut out, value).map_err(|e| match e.is_io() {
-            true => EncodeError::Oversize {
-                len: out.position() as usize,
-                max: out.get_ref().len(),
-            },
-            false => EncodeError::Codec,
-        })?;
-        let len = out.position() as usize;
+        let max = buf.len();
+        let mut out = Buffer { bytes: buf, len: 0 };
+        serde_json::to_writer(&mut out, value).map_err(|_| EncodeError::Codec)?;
+        let len = out.len;
+        if len > max {
+            return Err(EncodeError::Oversize { len, max });
+        }
         Ok(&buf[..len])
+    }
+
+    /// Counts the full encoding while keeping only the prefix that fits.
+    struct Buffer<'a> {
+        bytes: &'a mut [u8],
+        len: usize,
+    }
+
+    impl std::io::Write for Buffer<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let start = self.len.min(self.bytes.len());
+            let copied = bytes.len().min(self.bytes.len() - start);
+            self.bytes[start..start + copied].copy_from_slice(&bytes[..copied]);
+            self.len = self.len.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// Deserializes one value from `bytes`.
@@ -362,11 +380,25 @@ mod tests {
         let note = NoteJson {
             text: "0123456789".into(),
         };
-        assert!(matches!(
+        assert_eq!(
             note.encode(&mut buf),
-            Err(EncodeError::Oversize { max: 8, .. })
-        ));
+            Err(EncodeError::Oversize { len: 21, max: 8 })
+        );
         assert_eq!(NoteJson::decode(b"not json"), Err(DecodeError::Codec));
+    }
+
+    #[test]
+    fn json_counts_escaped_bytes_and_handles_an_empty_buffer() {
+        let text = "\"\n";
+        let mut exact = [0; 6];
+        assert_eq!(
+            json::encode(&text, &mut exact),
+            Ok(b"\"\\\"\\n\"".as_slice())
+        );
+        assert_eq!(
+            json::encode(&text, &mut []),
+            Err(EncodeError::Oversize { len: 6, max: 0 })
+        );
     }
 
     /// A postcard message hashes its schema name; every other codec hashes the

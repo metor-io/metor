@@ -158,3 +158,21 @@ else:
 "#,
     );
 }
+
+#[test]
+fn a_subscription_keeps_the_generated_records_pack_dependency() {
+    execute(
+        json!({}),
+        "probe",
+        r#"
+from generated import PACK, LogEvent
+from metor_config import Subscribe, Target
+
+target = Target(1)
+target.add('logs', Subscribe([LogEvent], listen='127.0.0.1:0'))
+config = target.to_config()
+assert config['packs'] == [PACK.to_json()]
+assert [system['ty'] for system in config['coordinator']['systems']] == ['fsw.subscribe']
+"#,
+    );
+}

@@ -474,28 +474,60 @@ pub struct NoParams {}
 /// Every system type the coordinator tests name, recording into `recorder`.
 pub fn table(recorder: &Recorder) -> SystemTable {
     let mut table = SystemTable::new();
-    table.register_system("imu", |_| Ok((ImuSource, 0)));
-    table.register_system("imu_offset", |_| Ok((ImuOffset, 0)));
-    table.register_system("nav", |p| p.decode::<NoParams>().map(|_| (NavFilter, ())));
+    table
+        .register_system("imu", |_| Ok((ImuSource, 0)))
+        .expect("valid records");
+    table
+        .register_system("imu_offset", |_| Ok((ImuOffset, 0)))
+        .expect("valid records");
+    table
+        .register_system("nav", |p| p.decode::<NoParams>().map(|_| (NavFilter, ())))
+        .expect("valid records");
     let control = recorder.clone();
-    table.register_system("control", move |_| Ok((ControlLaw, control.clone())));
+    table
+        .register_system("control", move |_| Ok((ControlLaw, control.clone())))
+        .expect("valid records");
     let watch = recorder.clone();
-    table.register_system("status_watch", move |_| Ok((StatusWatch, watch.clone())));
-    table.register_system("reserved", |_| Ok((Reserved, ())));
-    table.register("boom", Boom::default);
-    table.register_system("trap", |_| Ok((Trap, ())));
+    table
+        .register_system("status_watch", move |_| Ok((StatusWatch, watch.clone())))
+        .expect("valid records");
+    table
+        .register_system("reserved", |_| Ok((Reserved, ())))
+        .expect("valid records");
+    table
+        .register("boom", Boom::default)
+        .expect("valid records");
+    table
+        .register_system("trap", |_| Ok((Trap, ())))
+        .expect("valid records");
     let logs = recorder.clone();
-    table.register("log_sink", move || LogSink(logs.clone()));
+    table
+        .register("log_sink", move || LogSink(logs.clone()))
+        .expect("valid records");
     let taps = recorder.clone();
-    table.register("tap", move || Tap(taps.clone()));
-    table.register("emit", || Emit(Imu::new(1, 5.0).as_bytes().to_vec()));
-    table.register_async("relay", || Relay);
-    table.register_async("sleeper", || Sleeper);
-    table.register_async("async_boom", || AsyncBoom);
-    table.register_async("ctor_boom", || -> AsyncBoom {
-        panic!("a constructor that panics")
-    });
-    table.register_async("who_am_i", || WhoAmI);
+    table
+        .register("tap", move || Tap(taps.clone()))
+        .expect("valid records");
+    table
+        .register("emit", || Emit(Imu::new(1, 5.0).as_bytes().to_vec()))
+        .expect("valid records");
+    table
+        .register_async("relay", || Relay)
+        .expect("valid records");
+    table
+        .register_async("sleeper", || Sleeper)
+        .expect("valid records");
+    table
+        .register_async("async_boom", || AsyncBoom)
+        .expect("valid records");
+    table
+        .register_async("ctor_boom", || -> AsyncBoom {
+            panic!("a constructor that panics")
+        })
+        .expect("valid records");
+    table
+        .register_async("who_am_i", || WhoAmI)
+        .expect("valid records");
     table
 }
 

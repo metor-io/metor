@@ -16,7 +16,7 @@ use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::Frame;
-use crate::coordinator::SystemTable;
+use crate::coordinator::{BuildError, SystemTable};
 
 pub use publish::{Publish, PublishParams};
 pub use subscribe::{Subscribe, SubscribeParams};
@@ -93,9 +93,9 @@ impl LinkStatus {
 }
 
 /// Registers the link systems every target may name, under `fsw.`.
-pub fn register_builtins(table: &mut SystemTable) {
-    table.register_async::<Publish, _, _>(&format!("{BUILTIN}.publish"), Publish::new);
-    table.register_async::<Subscribe, _, _>(&format!("{BUILTIN}.subscribe"), Subscribe::new);
+pub fn register_builtins(table: &mut SystemTable) -> Result<(), BuildError> {
+    table.register_async::<Publish, _, _>(&format!("{BUILTIN}.publish"), Publish::new)?;
+    table.register_async::<Subscribe, _, _>(&format!("{BUILTIN}.subscribe"), Subscribe::new)
 }
 
 #[cfg(test)]
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn the_builtins_are_named_under_the_fsw_pack() {
         let mut table = SystemTable::new();
-        register_builtins(&mut table);
+        register_builtins(&mut table).expect("valid records");
         assert!(table.entries().all(|(ty, _)| ty.starts_with(BUILTIN)));
     }
 }

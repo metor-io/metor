@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub use ctor::Ctor;
-pub use param::{Cycle, Names, Param, Views, Writers};
+pub use param::{Cycle, Param, ParamNames, Views, Writers};
 pub use set::{InSet, LOG_PORT, OutSet};
 
 /// A `Ports` names one authored system's parameters, which are its ports.

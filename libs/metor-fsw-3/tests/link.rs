@@ -21,7 +21,7 @@ use metor_fsw_3::{Clock, Frame, Input, LinkStatus, Output, Timestamp, system};
 use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::{PacketSink, PacketStream, Peer, identify};
 use metor_proto_wkt::LogEvent;
-use metor_proto_wkt::{SetComponentMetadata, VTableMsg};
+use metor_proto_wkt::{LinkInfo, SetComponentMetadata, VTableMsg};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use stellarator::io::{AsyncWrite, OwnedReader, SplitExt};
@@ -182,16 +182,28 @@ impl Seen {
 /// The systems every test in this file may name, plus the built-in links.
 fn table(seen: &Seen) -> SystemTable {
     let mut table = SystemTable::new();
-    table.register("source", Source::default);
-    table.register("wide", WideSource::default);
-    table.register("pinger", Pinger::default);
+    table
+        .register("source", Source::default)
+        .expect("valid records");
+    table
+        .register("wide", WideSource::default)
+        .expect("valid records");
+    table
+        .register("pinger", Pinger::default)
+        .expect("valid records");
     let statuses = seen.statuses.clone();
-    table.register("status_sink", move || StatusSink(statuses.clone()));
+    table
+        .register("status_sink", move || StatusSink(statuses.clone()))
+        .expect("valid records");
     let pings = seen.pings.clone();
-    table.register("ping_sink", move || PingSink(pings.clone()));
+    table
+        .register("ping_sink", move || PingSink(pings.clone()))
+        .expect("valid records");
     let faults = seen.faults.clone();
-    table.register("log_sink", move || LogSink(faults.clone()));
-    register_builtins(&mut table);
+    table
+        .register("log_sink", move || LogSink(faults.clone()))
+        .expect("valid records");
+    register_builtins(&mut table).expect("valid records");
     table
 }
 
@@ -472,6 +484,47 @@ fn subscribe(transport: serde_json::Value) -> SystemConfig {
         }],
         ..SystemConfig::new("cmds", "fsw.subscribe")
     }
+}
+
+#[stellarator::test]
+async fn an_idle_subscribe_reports_its_completed_identity_write_once() {
+    let addr = free_port();
+    let seen = Seen::default();
+    let _target = spawn(
+        vec![
+            subscribe(json!({ "listen": { "addr": addr.to_string() } })),
+            reading(
+                "status",
+                "status_sink",
+                "link_status",
+                PortRef::new("cmds", "link_status"),
+            ),
+        ],
+        &seen,
+        500.0,
+    );
+
+    let peer = raw_dial(addr).await;
+    let (rx, _tx) = peer.split();
+    let mut rx = PacketStream::new(rx);
+    let packet = next(&mut rx, &mut vec![0u8; 1024]).await;
+    let OwnedPacket::Msg(message) = packet else {
+        panic!("the first packet is the link identity");
+    };
+    let info = message.parse::<LinkInfo>().expect("a link identity");
+    let bytes_out = (&info).into_len_packet().inner.len() as u64;
+    until(
+        "the idle subscriber never reported its identity bytes",
+        || {
+            seen.status()
+                .is_some_and(|status| status.connections == 1 && status.bytes_out == bytes_out)
+        },
+    )
+    .await;
+
+    let reported = seen.status();
+    stellarator::sleep(Duration::from_millis(30)).await;
+    assert_eq!(seen.status(), reported, "idle status is not repeated");
 }
 
 #[stellarator::test]

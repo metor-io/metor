@@ -176,11 +176,17 @@ fn input(port: &str, from: PortRef) -> InputConfig {
 
 fn table(report: &Rc<RefCell<Report>>) -> SystemTable {
     let mut table = SystemTable::new();
-    table.register("gyro", Gyro::default);
-    table.register("nav", || NavFilter);
-    table.register("control", || ControlLaw);
+    table
+        .register("gyro", Gyro::default)
+        .expect("valid records");
+    table.register("nav", || NavFilter).expect("valid records");
+    table
+        .register("control", || ControlLaw)
+        .expect("valid records");
     let report = report.clone();
-    table.register_system("monitor", move |_| Ok((Monitor, report.clone())));
+    table
+        .register_system("monitor", move |_| Ok((Monitor, report.clone())))
+        .expect("valid records");
     table
 }
 

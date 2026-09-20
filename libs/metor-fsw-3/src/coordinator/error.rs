@@ -1,9 +1,9 @@
-use metor_proto::types::ComponentId;
+use metor_proto::types::{ComponentId, PacketId};
 use thiserror::Error;
 
 use super::params::ParamError;
 
-/// Errors associated with [`CoordinatorConfig::build`].
+/// Errors registering system types or building a coordinator.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum BuildError {
     #[error("wall clock rate must be finite and at least 0.001 Hz")]
@@ -69,6 +69,20 @@ pub enum BuildError {
 
     #[error("record `{record}` is declared differently by two registered ports")]
     RecordConflict { record: String },
+
+    #[error("records `{first}` and `{second}` share record id {id:?}")]
+    RecordIdConflict {
+        id: ComponentId,
+        first: String,
+        second: String,
+    },
+
+    #[error("records `{first}` and `{second}` define different schemas for message id {id:?}")]
+    MessageIdConflict {
+        id: PacketId,
+        first: String,
+        second: String,
+    },
 
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
     ReservedPort { ty: String },

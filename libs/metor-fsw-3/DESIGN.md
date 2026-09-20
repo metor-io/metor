@@ -281,6 +281,25 @@ async fn arm_controls(
 
 In the above example the Future returned by the async function will be polled each cycle. When it reaches a sleep it won't continue until the elapsed time exceeds the specified duration. A wait_for will re-call the closure each cycle until it returns true
 
+
+### ABI
+
+metor-fsw uses a minimal ABI format to load packs from shared object libraries, and to execute systems from them. There will be a single public symbol `metor_fsw_pack_def` which will send a serialized `PackDef` struct to the caller. PackDef will rougly be defined as follows:
+```rust
+struct PackDef {
+    systems: Vec<AbiSystemDef>,
+}
+struct AbiSystemDef {
+    /// Includes name, inputs, and outputs
+    system_def: SystemDef, 
+    /// fn pointer to the system's state constructor
+    state_ctor: Option<usize>,
+    /// fn pointer to the system's execution fn
+    execute_fn: usize, 
+}
+```
+
+
 ## Deployments
 
 So far we have discussed how a single target, or an instance of metor-fsw, functions, but in reality you often want to chain together multiple targets to form a large "deployment". A deployment is really just a collection of targets defined in a single config file. You can define one as follows:

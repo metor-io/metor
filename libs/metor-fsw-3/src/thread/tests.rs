@@ -9,6 +9,60 @@ use crate::coordinator::{BuildError, Coordinator, CoordinatorConfig, InputConfig
 use crate::coordinator::{ParamError, SystemConfig};
 use crate::tests::utils::{Recorder, table};
 
+#[test]
+fn a_mirror_copies_only_records_committed_before_the_drain() {
+    use core::cell::RefCell;
+    use metor_fsw_3_ring::{Config, NoWake, RingBuffer, WakeSource, Writer};
+
+    struct Refill(RefCell<Writer<NoWake>>);
+    impl WakeSource for Refill {
+        fn notify(&self) {
+            self.0
+                .borrow_mut()
+                .try_write(b"later")
+                .expect("source has room");
+        }
+    }
+
+    let source = RingBuffer::create_in_memory(Config {
+        capacity: 256,
+        max_readers: 1,
+    });
+    let target = RingBuffer::create_in_memory(Config {
+        capacity: 256,
+        max_readers: 1,
+    });
+    let mut writer = source.writer(NoWake).expect("writer");
+    let mut received = target.view(NoWake).expect("reader");
+    let mut mirror = super::Mirror {
+        port: "out".into(),
+        from: source.view(NoWake).expect("reader"),
+        into: {
+            writer.try_write(b"first").expect("room");
+            writer.try_write(b"second").expect("room");
+            target.writer(Refill(RefCell::new(writer))).expect("writer")
+        },
+        dropped: 0,
+    };
+    mirror.drain();
+    assert_eq!(
+        received
+            .drain()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid"),
+        [b"first".as_slice(), b"second".as_slice()]
+    );
+    assert_eq!(
+        mirror
+            .from
+            .drain()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid"),
+        [b"later".as_slice(), b"later".as_slice()]
+    );
+    assert_eq!(mirror.dropped, 0);
+}
+
 /// A system on a named thread, or the shared one when `thread` is `None`.
 fn placed(id: &str, ty: &str, thread: Option<&str>) -> SystemConfig {
     SystemConfig {

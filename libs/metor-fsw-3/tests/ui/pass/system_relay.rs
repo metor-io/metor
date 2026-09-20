@@ -31,5 +31,7 @@ fn main() {
     assert_eq!(Relay::NAMES, &["gps", "out"]);
     assert_eq!(Relay::NAME, "relay");
     let mut table = SystemTable::new();
-    table.register_async("relay", || Relay);
+    table
+        .register_async("relay", || Relay)
+        .expect("valid records");
 }

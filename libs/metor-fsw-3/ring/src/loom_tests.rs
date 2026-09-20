@@ -30,6 +30,36 @@ fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
 }
 
 #[test]
+fn drain_snapshot_races_a_wrap_publication() {
+    loom::model(|| {
+        let ring = ring(128, 1);
+        let mut writer = ring.writer(NoWake).expect("writer");
+        let mut view = ring.view(NoWake).expect("reader");
+        writer.try_write(&[1; 32]).expect("room");
+        writer.try_write(&[2; 32]).expect("room");
+        drop(view.try_read().expect("valid").expect("first"));
+        let task = thread::spawn(move || writer.try_write(&[3; 32]).expect("wrap fits"));
+        let batch = view.drain();
+        let end = batch.committed;
+        let records = batch
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid snapshot");
+        assert_eq!(records[0], &[2; 32]);
+        assert_eq!(records.len(), if end == 96 { 1 } else { 2 });
+        task.join().expect("writer finished");
+        assert_eq!(records[0], &[2; 32]);
+        if records.len() == 2 {
+            assert_eq!(records[1], &[3; 32]);
+        }
+        let later = view
+            .drain()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid remainder");
+        assert_eq!(later.len(), if end == 96 { 1 } else { 0 });
+    });
+}
+
+#[test]
 fn registration_races_backpressure() {
     loom::model(|| {
         let ring = ring(CAP, 1);

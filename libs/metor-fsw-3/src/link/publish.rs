@@ -12,7 +12,7 @@ use crate::system::PortDef;
 use crate::thread::MIRROR_FACTOR;
 use crate::{Stop, system};
 
-use super::conn::{self, Connections};
+use super::conn::{self, Connections, Event};
 use super::transport::{Endpoint, Transport, incoming};
 use super::wire::{self, Wire};
 use super::{LinkStatus, pending_cap};
@@ -77,7 +77,7 @@ impl Publish {
         let mut batch = Vec::with_capacity(batch_cap(&defs));
         let mut reported = LinkStatus::new(Timestamp(0), Default::default(), 0);
         loop {
-            let event = next(&incoming, inputs, &conns, &stop).await;
+            let event = conn::next(&incoming, &conns, inputs.any_ready(), &stop).await;
             match event {
                 Event::Connected(stream) => {
                     conns.open(stream, blob.clone(), |_| {});
@@ -89,7 +89,7 @@ impl Publish {
                         conns.enqueue(&batch);
                     }
                 }
-                Event::Closed => {}
+                Event::Changed => {}
                 Event::Stop => return,
             }
             conns.prune();
@@ -116,38 +116,6 @@ fn report_collisions(log: &mut Log, defs: &[PortDef], wire: &[Option<Wire>]) {
             ),
         );
     }
-}
-
-/// What woke the link's loop.
-enum Event {
-    Connected(stellarator::net::TcpStream),
-    Ready,
-    Closed,
-    Stop,
-}
-
-/// The first of a connection, a record, a connection ending, and the stop.
-async fn next(
-    incoming: &super::transport::Incoming,
-    inputs: &mut DynInputs<Notifier>,
-    conns: &Connections,
-    stop: &Stop,
-) -> Event {
-    let connected = async { Event::Connected(incoming.next().await) };
-    let ready = async {
-        inputs.any_ready().await;
-        Event::Ready
-    };
-    let closed = async {
-        conns.ended().await;
-        Event::Closed
-    };
-    let stopped = async {
-        stop.wait().await;
-        Event::Stop
-    };
-    let first = futures_lite::future::or(connected, ready);
-    futures_lite::future::or(futures_lite::future::or(first, closed), stopped).await
 }
 
 /// Appends one packet per waiting record, in port order.

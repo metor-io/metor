@@ -18,7 +18,7 @@ pub struct Bindings<B> {
 }
 
 impl<B> Bindings<B> {
-    /// Splits `all` after the declared ports; the tail is the dynamic one's.
+    /// Creates a binding from 'all' with the first `declared` ports reserved for declared ports.
     pub(crate) fn new(mut all: Vec<B>, declared: usize) -> Self {
         let dynamic = all.split_off(declared);
         Self {
@@ -41,24 +41,27 @@ impl<B> Bindings<B> {
     }
 }
 
-/// The input bindings a bundle binds from.
+/// "Views" are bound inputs
 pub type Views<W> = Bindings<InputBinding<W>>;
-/// The output bindings a bundle binds from.
+/// "Writers" are bound outputs
 pub type Writers = Bindings<OutputBinding>;
-/// The parameter names a bundle declares under, one per leaf parameter in order.
-pub type Names<'n> = core::slice::Iter<'n, &'static str>;
+/// A bundles parameter names
+pub type ParamNames<'n> = core::slice::Iter<'n, &'static str>;
 
-/// The ports a system's parameters declare, in parameter order.
+/// The port definitions for a system
 #[derive(Default)]
-pub struct Defs {
+pub struct PortDefs {
+    /// Static inputs
     pub inputs: Vec<PortDef>,
+    /// Static outputs
     pub outputs: Vec<PortDef>,
-    /// The parameter that takes every input the config adds, if there is one.
+    /// The name of the dynamic input parameter
     pub dynamic_inputs: Option<Cow<'static, str>>,
+    /// The name of the dynamic output parameter
     pub dynamic_outputs: Option<Cow<'static, str>>,
 }
 
-impl Defs {
+impl PortDefs {
     /// Every port a system's parameters declare, under the names it gave them.
     pub fn of<S: crate::fn_system::Ports>() -> Self {
         let mut defs = Self::default();
@@ -110,7 +113,7 @@ pub trait Param {
         Self: 'a;
 
     /// Appends this parameter's port definition, if it has one, taking its name from `names`.
-    fn append_defs(names: &mut Names<'_>, defs: &mut Defs);
+    fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs);
 
     /// Returns this parameter's input (if one exists) by popping a view from `views`.
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W>;
@@ -127,7 +130,7 @@ pub trait Param {
 }
 
 /// Takes the next leaf parameter's name.
-fn name(names: &mut Names<'_>) -> &'static str {
+fn name(names: &mut ParamNames<'_>) -> &'static str {
     // PANIC Safety: `#[system]` emits one name per parameter.
     names.next().expect("one name per parameter")
 }
@@ -139,7 +142,7 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
     type Out = ();
     type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Input<T, W>;
 
-    fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
+    fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs) {
         defs.inputs.push(Input::<T>::def(name(names)));
     }
 
@@ -166,7 +169,7 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
     type Out = Output<T>;
     type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Output<T>;
 
-    fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
+    fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs) {
         defs.outputs.push(Output::<T>::def(name(names)));
     }
 
@@ -193,7 +196,7 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
     type Out = ();
     type Item<'a, W: WakeSink + Clone + 'static> = &'a mut DynInputs<W>;
 
-    fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
+    fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs) {
         let taken = defs.dynamic_inputs.replace(name(names).into());
         // PANIC Safety: only a system with two dynamic input parameters
         // reaches this, when its definition is built; the message names the fix.
@@ -223,7 +226,7 @@ impl Param for DynOutputs {
     type Out = DynOutputs;
     type Item<'a, W: WakeSink + Clone + 'static> = &'a mut DynOutputs;
 
-    fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
+    fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs) {
         let taken = defs.dynamic_outputs.replace(name(names).into());
         // PANIC Safety: as for `DynInputs`.
         assert!(
@@ -252,7 +255,7 @@ impl Param for Timestamp {
     type Out = ();
     type Item<'a, W: WakeSink + Clone + 'static> = Timestamp;
 
-    fn append_defs(names: &mut Names<'_>, _defs: &mut Defs) {
+    fn append_defs(names: &mut ParamNames<'_>, _defs: &mut PortDefs) {
         name(names);
     }
 
@@ -274,7 +277,7 @@ impl Param for Log {
     type Out = ();
     type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Log;
 
-    fn append_defs(names: &mut Names<'_>, _defs: &mut Defs) {
+    fn append_defs(names: &mut ParamNames<'_>, _defs: &mut PortDefs) {
         name(names);
     }
 
@@ -300,7 +303,7 @@ macro_rules! impl_param_for_tuple {
             type Item<'a, W: WakeSink + Clone + 'static> = ($($P::Item<'a, W>,)*) where Self: 'a;
 
             #[allow(unused_variables)]
-            fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
+            fn append_defs(names: &mut ParamNames<'_>, defs: &mut PortDefs) {
                 $( $P::append_defs(names, defs); )*
             }
 

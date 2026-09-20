@@ -7,10 +7,11 @@ import os
 import tempfile
 import unittest
 
-from adcs_stub import Ctrl, Mode, MotorCmd, Nav, Ping, Plant
+from adcs_stub import PACK, Ctrl, Mode, MotorCmd, Nav, Ping, Plant
 
 import metor_config._target as target_mod
 from metor_config import ConfigError, PortRef, Publish, Subscribe, Target, emit
+from metor_config._config import ABI_VERSION
 
 GOLDEN = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -173,6 +174,7 @@ class TargetTest(unittest.TestCase):
 class LinkTest(unittest.TestCase):
     def setUp(self) -> None:
         target_mod._targets.clear()
+        os.environ.pop("METOR_FSW_ABI_VERSION", None)
 
     def tearDown(self) -> None:
         target_mod._targets.clear()
@@ -255,8 +257,65 @@ class LinkTest(unittest.TestCase):
 
     def test_the_builtin_pack_is_not_a_config_pack(self) -> None:
         fsw = Target(cycle_rate=100.0)
-        fsw.add("cmds", Subscribe([Ping], listen="0.0.0.0:2241"))
+        fsw.add("cmds", Subscribe([], listen="0.0.0.0:2241"))
         self.assertEqual(fsw.to_config()["packs"], [])
+
+    def test_subscribe_loads_its_record_pack_without_a_pack_system(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        cmds = fsw.add("cmds", Subscribe([Ping, MotorCmd], listen="127.0.0.1:0"))
+        fsw.add("pub", Publish([cmds], listen="127.0.0.1:0"))
+        self.assertEqual(fsw.to_config()["packs"], [PACK.to_json()])
+        fsw.add("plant", Plant())
+        self.assertEqual(fsw.to_config()["packs"], [PACK.to_json()])
+
+    def test_a_record_pack_abi_mismatch_does_not_register_the_link(self) -> None:
+        os.environ["METOR_FSW_ABI_VERSION"] = str(ABI_VERSION)
+        fsw = Target(cycle_rate=100.0)
+        with self.assertRaisesRegex(ConfigError, "pack `adcs`.*ABI 1"):
+            fsw.add("cmds", Subscribe([Ping], listen="127.0.0.1:0"))
+        self.assertEqual(fsw.to_config()["packs"], [])
+        self.assertEqual(fsw.to_config()["coordinator"]["systems"], [])
+        fsw.add("cmds", Subscribe([], listen="127.0.0.1:0"))
+
+    def test_a_reused_publish_resolves_each_registration_independently(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        fsw.add("plant", Plant())
+        publish = Publish(all=True, listen="127.0.0.1:0")
+        fsw.add("pub1", publish)
+        fsw.add("pub2", publish)
+        config = fsw.to_config()
+        first, second = config["coordinator"]["systems"][1:]
+        self.assertEqual(first["params"]["link"], "pub1")
+        self.assertEqual(second["params"]["link"], "pub2")
+        self.assertEqual(
+            [item["port"] for item in first["inputs"]],
+            ["plant.imu", "plant.log", "plant.status"],
+        )
+        self.assertEqual(
+            [item["port"] for item in second["inputs"]],
+            ["plant.imu", "plant.log", "plant.status", "pub1.link_status", "pub1.log", "pub1.status"],
+        )
+        self.assertEqual(fsw.to_config(), config)
+        self.assertEqual(publish._params["link"], "")
+        self.assertEqual(publish._inputs, {})
+
+    def test_reuse_across_targets_and_emission_preserves_previous_configs(self) -> None:
+        subscribe = Subscribe([Ping], listen="127.0.0.1:0")
+        first = Target(cycle_rate=100.0, namespace="first")
+        first.add("a", subscribe)
+        saved = first.to_config()
+        second = Target(cycle_rate=100.0, namespace="second")
+        second.add("b", subscribe)
+        emitted = second.to_config()
+        first_entry = saved["coordinator"]["systems"][0]
+        self.assertEqual(first_entry["params"]["namespace"], "first")
+        self.assertEqual(first_entry["params"]["link"], "a")
+        second_entry = emitted["coordinator"]["systems"][0]
+        self.assertEqual(second_entry["params"]["namespace"], "second")
+        second_entry["params"]["transport"]["listen"]["addr"] = "changed"
+        second_entry["outputs"][0]["port"] = "changed"
+        self.assertEqual(first.to_config(), saved)
+        self.assertEqual(second.to_config()["coordinator"]["systems"][0]["outputs"][0]["port"], "ping")
 
     def test_a_thread_lands_on_the_system(self) -> None:
         fsw = Target(cycle_rate=100.0)

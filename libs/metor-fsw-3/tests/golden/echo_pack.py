@@ -17,14 +17,17 @@ PACK = Pack(
 
 class LogEvent(Record):
     _name = "log"
+    _pack = PACK
 
 
 class Ping(Record):
     _name = "ping"
+    _pack = PACK
 
 
 class SystemStatus(Record):
     _name = "status"
+    _pack = PACK
 
 
 class Echo(System):

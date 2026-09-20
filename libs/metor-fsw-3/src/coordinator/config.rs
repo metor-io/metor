@@ -8,14 +8,13 @@ use super::error::BuildError;
 
 const MIN_WALL_RATE: f64 = 0.001;
 
-/// Records a ring holds per record `depth`, unless a config says otherwise.
+/// Default number of records a ring can hold
 pub const DEFAULT_RING_DEPTH: usize = 8;
 
 /// The configuration for a coordinator
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoordinatorConfig {
     pub clock: Clock,
-    /// The maximum number of frames a ring can hold.
     pub ring_depth: usize,
     pub systems: Vec<SystemConfig>,
 }
@@ -39,10 +38,9 @@ pub struct SystemConfig {
     pub params: serde_json::Value,
     #[serde(default)]
     pub inputs: Vec<InputConfig>,
-    /// Ports a system with dynamic outputs publishes, named by their record.
     #[serde(default)]
     pub outputs: Vec<OutputConfig>,
-    /// The background thread an async system runs on; `None` is the shared one.
+    /// If set chooses a particular background thread for the system to run on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
 }

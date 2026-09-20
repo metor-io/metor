@@ -1222,6 +1222,60 @@ fn concurrent_reclaimers_do_not_free_a_new_owner() {
 }
 
 #[test]
+fn drain_excludes_records_published_after_it_starts() {
+    let ring = ring(256, 1);
+    let mut writer = ring.writer(NoWake).expect("writer");
+    let mut view = ring.view(NoWake).expect("reader");
+    writer.try_write(b"first").expect("room");
+    let mut batch = view.drain();
+    writer.try_write(b"later").expect("room");
+    assert_eq!(batch.next(), Some(Ok(b"first".as_slice())));
+    assert_eq!(batch.next(), None);
+    assert_eq!(view.drain().next(), Some(Ok(b"later".as_slice())));
+}
+
+#[test]
+fn an_empty_drain_does_not_include_a_later_write() {
+    let ring = ring(64, 1);
+    let mut writer = ring.writer(NoWake).expect("writer");
+    let mut view = ring.view(NoWake).expect("reader");
+    let mut batch = view.drain();
+    writer.try_write(b"later").expect("room");
+    assert_eq!(batch.next(), None);
+    assert_eq!(view.drain().next(), Some(Ok(b"later".as_slice())));
+}
+
+#[test]
+fn drain_stops_before_a_wrap_published_after_its_snapshot() {
+    let ring = ring(128, 1);
+    let mut writer = ring.writer(NoWake).expect("writer");
+    let mut view = ring.view(NoWake).expect("reader");
+    writer.try_write(&[1; 32]).expect("room");
+    writer.try_write(&[2; 32]).expect("room");
+    drop(view.try_read().expect("valid").expect("first"));
+    let mut batch = view.drain();
+    writer.try_write(&[3; 32]).expect("room after wrap");
+    assert_eq!(batch.next(), Some(Ok([2; 32].as_slice())));
+    assert_eq!(batch.next(), None);
+    view.settle();
+    assert_eq!(view.cursor(), 96);
+    assert_eq!(view.drain().next(), Some(Ok([3; 32].as_slice())));
+}
+
+#[test]
+fn drain_rejects_a_record_extending_past_its_committed_position() {
+    let ring = ring(64, 1);
+    let mut writer = ring.writer(NoWake).expect("writer");
+    let mut view = ring.view(NoWake).expect("reader");
+    writer.try_write(&[1; 8]).expect("room");
+    // SAFETY: the published header has no concurrent readers or writer.
+    unsafe { ring.inner.data_ptr(0).cast::<u64>().write(32) };
+    let mut batch = view.drain();
+    assert_eq!(batch.next(), Some(Err(ReadError::Corrupt)));
+    assert_eq!(batch.next(), None);
+}
+
+#[test]
 fn drain_yields_every_record_and_consumes_on_the_next_read() {
     let ring = ring(256, 1);
     let mut writer = ring.writer(NoWake).unwrap();

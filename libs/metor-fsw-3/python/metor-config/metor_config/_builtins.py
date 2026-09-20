@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Sequence, TypeAlias, Union
 
 from ._config import ABI_VERSION, ConfigError
-from ._model import OutPort, Pack, Record, System
+from ._model import OutPort, Pack, Record, Source, System
 from ._target import SystemHandle, Target
 
 Item: TypeAlias = Union[SystemHandle, OutPort[Any]]
@@ -56,11 +56,11 @@ class Publish(System):
         self._all = all
         self._inputs = _edges(_ports(self._items))
 
-    def _finalize(self, target: Target, index: int) -> None:
+    def _inputs_for(self, target: Target, index: int) -> dict[str, list[Source[Any]]]:
         if not self._all:
-            return
+            return self._inputs
         earlier = [target._handles[name] for name, _, _ in target._systems[:index]]
-        self._inputs = _edges(_ports(self._items) + _ports(earlier))
+        return _edges(_ports(self._items) + _ports(earlier))
 
 
 class Subscribe(System):
@@ -98,6 +98,9 @@ class Subscribe(System):
             outputs=[{"port": name, "record": name} for name in names],
         )
         self._outputs = tuple(names) + ("link_status",)
+        self._record_packs = tuple(
+            record._pack for record in records if record._pack is not None
+        )
 
 
 def _transport(
@@ -134,9 +137,9 @@ def _ports(items: Sequence[Item]) -> list[OutPort[Any]]:
     return ports
 
 
-def _edges(ports: Sequence[OutPort[Any]]) -> dict[str, list[Any]]:
+def _edges(ports: Sequence[OutPort[Any]]) -> dict[str, list[Source[Any]]]:
     """One input per port, named `{producer}.{port}`, first mention winning."""
-    edges: dict[str, list[Any]] = {}
+    edges: dict[str, list[Source[Any]]] = {}
     for port in ports:
         edges.setdefault(f"{port.ref.system}.{port.ref.port}", [port])
     return edges

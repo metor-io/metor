@@ -12,6 +12,10 @@ use metor_fsw_3_ring::{
 };
 use metor_proto::types::Timestamp;
 
+mod readiness;
+
+use readiness::Waiters;
+
 /// Returns the power-of-two capacity for a ring of `depth` records of `max_len` bytes.
 pub fn ring_capacity(max_len: usize, depth: usize) -> Option<usize> {
     u32::try_from(max_len).ok()?;
@@ -74,8 +78,8 @@ fn bounded(bytes: &[u8], max: usize) -> Result<&[u8], SendError> {
 
 /// An `Output` is the writing half of one ring, publishing records of type `T`.
 ///
-/// `W` is the endpoint notified after each write; a cyclic system's ports use
-/// [`NoWake`] and an async system's mirror ports a [`Notifier`].
+/// `W` is the endpoint notified after each write. System outputs use [`NoWake`];
+/// adapter writers feeding async inputs use [`Notifier`].
 pub struct Output<T: ?Sized, W: WakeSource = NoWake> {
     writer: Writer<W>,
     scratch: Vec<u8>,
@@ -139,28 +143,25 @@ impl<W: WakeSource> Output<Bytes, W> {
 
 /// An `Input` is the reading half of every ring feeding one port of type `T`.
 ///
-/// `W` is the endpoint its views wait on; every view of an async system shares
-/// one [`Notifier`], so waiting on any of them wakes on any record.
+/// `W` is the endpoint each view waits on. Async inputs wait on every producer,
+/// whether their [`Notifier`] handles are shared or independent.
 pub struct Input<T: ?Sized, W: WakeSink = NoWake> {
     views: Vec<View<W>>,
-    /// The endpoint the views share, absent when this port has no producer.
-    wake: Option<W>,
+    waiters: Waiters,
     _t: PhantomData<T>,
 }
 
-impl<T: Record + ?Sized, W: WakeSink + Clone> Input<T, W> {
+impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
     /// Binds one view per producer, rejecting records aligned above the ring guarantee.
     pub fn try_new(views: Vec<View<W>>) -> Result<Self, UnsupportedAlignment> {
         check_alignment::<T>()?;
         Ok(Self {
-            wake: views.first().map(|view| view.wake().clone()),
+            waiters: Waiters::new(&views),
             views,
             _t: PhantomData,
         })
     }
-}
 
-impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
     /// Returns this port's entry in a bundle's `defs()` walk.
     pub fn def(name: &'static str) -> PortDef {
         Output::<T>::def(name)
@@ -208,18 +209,7 @@ impl<T: Record + ?Sized> Input<T, Notifier> {
     ///
     /// Never resolves on a port with no producer.
     pub async fn next(&mut self) -> Result<T::Read<'_>, RecvError> {
-        let at = loop {
-            if let Some(at) = self.ready() {
-                break at;
-            }
-            match &self.wake {
-                Some(wake) => {
-                    wake.wait_until(|| self.views.iter().any(View::has_record))
-                        .await
-                }
-                None => core::future::pending().await,
-            }
-        };
+        let at = readiness::wait(self).await;
         // PANIC Safety: `ready` located a record on this view and nothing
         // consumed it since; the view is this port's alone.
         let bytes = self.views[at]
@@ -257,30 +247,11 @@ impl DynInputs<Notifier> {
     ///
     /// Never resolves while no port has a producer.
     pub async fn any_ready(&mut self) {
-        loop {
-            if self
-                .ports
-                .iter_mut()
-                .any(|(_, input)| input.ready().is_some())
-            {
-                return;
-            }
-            let wake = self.ports.iter().find_map(|(_, input)| input.wake.as_ref());
-            match wake {
-                Some(wake) => wake.wait_until(|| self.any_has_record()).await,
-                None => core::future::pending().await,
-            }
-        }
-    }
-
-    fn any_has_record(&self) -> bool {
-        self.ports
-            .iter()
-            .any(|(_, input)| input.views.iter().any(View::has_record))
+        readiness::wait(self).await;
     }
 }
 
-impl<W: WakeSink + Clone> SystemInputs<W> for DynInputs<W> {
+impl<W: WakeSink> SystemInputs<W> for DynInputs<W> {
     fn defs() -> Vec<PortDef> {
         Vec::new()
     }
@@ -862,12 +833,41 @@ mod tests {
 
 #[cfg(test)]
 mod async_tests {
+    use core::future::Future;
+    use core::task::{Context, Poll};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Wake, Waker};
+
     use futures_lite::future::poll_once;
     use metor_fsw_3_ring::{Config, Notifier, RingBuffer};
 
     use super::*;
     use crate::system::InputBinding;
     use crate::tests::utils::Imu;
+
+    #[derive(Default)]
+    struct Woken(AtomicBool);
+
+    impl Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    type WokenInputs = (
+        [RingBuffer; 2],
+        [Output<Imu, Notifier>; 2],
+        Input<Imu, Notifier>,
+    );
+
+    fn independently_woken() -> WokenInputs {
+        let (left, a, first) = woken(&Notifier::default());
+        let (right, b, second) = woken(&Notifier::default());
+        let views = first.views.into_iter().chain(second.views).collect();
+        let input = Input::try_new(views).expect("supported alignment");
+        ([left, right], [a, b], input)
+    }
 
     /// One ring holding four `Imu` records, woken through `wake`.
     fn woken(wake: &Notifier) -> (RingBuffer, Output<Imu, Notifier>, Input<Imu, Notifier>) {
@@ -898,6 +898,81 @@ mod async_tests {
     async fn next_on_a_port_with_no_producer_never_resolves() {
         let mut input = Input::<Imu, Notifier>::try_new(Vec::new()).expect("supported alignment");
         assert!(poll_once(input.next()).await.is_none());
+    }
+
+    #[test]
+    fn next_wakes_for_each_independent_producer() {
+        let (_rings, mut outputs, mut input) = independently_woken();
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        for at in [1, 0, 1, 0] {
+            let mut next = core::pin::pin!(input.next());
+            assert!(next.as_mut().poll(&mut cx).is_pending());
+            woken.0.store(false, Ordering::SeqCst);
+            outputs[at].write(&Imu::new(1, at as f64)).expect("room");
+            assert!(woken.0.load(Ordering::SeqCst));
+            let Poll::Ready(Ok(record)) = next.as_mut().poll(&mut cx) else {
+                panic!("the notified producer has a record")
+            };
+            assert_eq!(record.sample, at as f64);
+        }
+    }
+
+    #[test]
+    fn cancelling_next_unregisters_every_waiter_and_can_wait_again() {
+        let (_rings, mut outputs, mut input) = independently_woken();
+        let wakes: Vec<_> = input.views.iter().map(|view| view.wake().clone()).collect();
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        {
+            let mut next = core::pin::pin!(input.next());
+            assert!(next.as_mut().poll(&mut cx).is_pending());
+        }
+        for wake in &wakes {
+            wake.notify();
+        }
+        assert!(!woken.0.load(Ordering::SeqCst));
+
+        let mut next = core::pin::pin!(input.next());
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        outputs[1].write(&Imu::new(1, 7.0)).expect("room");
+        assert!(woken.0.load(Ordering::SeqCst));
+        assert!(matches!(next.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+    }
+
+    #[test]
+    fn a_notification_without_data_rearms_the_waiter() {
+        let wake = Notifier::default();
+        let (_ring, mut output, mut input) = woken(&wake);
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut next = core::pin::pin!(input.next());
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        wake.notify();
+        woken.0.store(false, Ordering::SeqCst);
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            woken.0.load(Ordering::SeqCst),
+            "rearming schedules another poll"
+        );
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        woken.0.store(false, Ordering::SeqCst);
+        output.write(&Imu::new(1, 7.0)).expect("room");
+        assert!(woken.0.load(Ordering::SeqCst));
+        assert!(matches!(next.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+    }
+
+    #[stellarator::test]
+    async fn next_consumes_a_record_that_fails_to_decode() {
+        let (_ring, mut output, mut input) = woken(&Notifier::default());
+        output.writer.try_write(&[0]).expect("room");
+        assert!(matches!(input.next().await, Err(RecvError::Decode(_))));
+        output.write(&Imu::new(2, 7.0)).expect("room");
+        assert_eq!(input.next().await.expect("valid record").sample, 7.0);
     }
 
     #[stellarator::test]
@@ -945,5 +1020,86 @@ mod async_tests {
             .map(|(name, bytes)| (name, bytes.expect("bytes").len()))
             .collect();
         assert_eq!(seen, vec![("b.imu".to_string(), Imu::MAX_LEN)]);
+    }
+
+    fn independent_ports() -> (
+        [RingBuffer; 2],
+        [Output<Imu, Notifier>; 2],
+        DynInputs<Notifier>,
+    ) {
+        let (left, a, first) = woken(&Notifier::default());
+        let (right, b, second) = woken(&Notifier::default());
+        let inputs = DynInputs::bind(vec![
+            InputBinding {
+                def: Input::<Imu>::def("a"),
+                views: first.views,
+            },
+            InputBinding {
+                def: Input::<Imu>::def("b"),
+                views: second.views,
+            },
+        ]);
+        ([left, right], [a, b], inputs)
+    }
+
+    #[test]
+    fn any_ready_wakes_for_each_independently_notified_port() {
+        let (_rings, mut outputs, mut inputs) = independent_ports();
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        for at in [1, 0, 1, 0] {
+            {
+                let mut ready = core::pin::pin!(inputs.any_ready());
+                assert!(ready.as_mut().poll(&mut cx).is_pending());
+                woken.0.store(false, Ordering::SeqCst);
+                outputs[at].write(&Imu::new(1, 7.0)).expect("room");
+                assert!(woken.0.load(Ordering::SeqCst));
+                assert!(ready.as_mut().poll(&mut cx).is_ready());
+            }
+            let count = inputs
+                .iter_mut()
+                .flat_map(|(_, input)| input.drain())
+                .count();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn cancelling_any_ready_unregisters_every_port_and_can_wait_again() {
+        let (_rings, mut outputs, mut inputs) = independent_ports();
+        let wakes: Vec<_> = inputs
+            .ports
+            .iter()
+            .flat_map(|(_, input)| input.views.iter().map(|view| view.wake().clone()))
+            .collect();
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        {
+            let mut ready = core::pin::pin!(inputs.any_ready());
+            assert!(ready.as_mut().poll(&mut cx).is_pending());
+        }
+        for wake in &wakes {
+            wake.notify();
+        }
+        assert!(!woken.0.load(Ordering::SeqCst));
+
+        let mut ready = core::pin::pin!(inputs.any_ready());
+        assert!(ready.as_mut().poll(&mut cx).is_pending());
+        outputs[1].write(&Imu::new(1, 7.0)).expect("room");
+        assert!(woken.0.load(Ordering::SeqCst));
+        assert!(ready.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[stellarator::test]
+    async fn any_ready_without_any_producer_never_resolves() {
+        let mut empty = DynInputs::<Notifier>::default();
+        assert!(poll_once(empty.any_ready()).await.is_none());
+        let mut unbound = DynInputs::<Notifier>::bind(vec![InputBinding {
+            def: Input::<Imu>::def("unbound"),
+            views: Vec::new(),
+        }]);
+        assert!(poll_once(unbound.any_ready()).await.is_none());
     }
 }

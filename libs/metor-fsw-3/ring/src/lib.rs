@@ -237,6 +237,12 @@ pub trait WakeSource {
 #[allow(async_fn_in_trait)]
 pub trait WakeSink {
     async fn wait_until<F: FnMut() -> bool>(&self, ready: F);
+
+    /// Prepares an owned notification wait, when this sink supports one.
+    #[cfg(feature = "notify")]
+    fn wait_owned(&self) -> Option<stellarator::sync::wait_queue::WaitOwned> {
+        None
+    }
 }
 
 /// Disables notifications. Async reads on an empty ring spin without yielding.
@@ -267,6 +273,15 @@ impl Default for Notifier {
 }
 
 #[cfg(feature = "notify")]
+impl Notifier {
+    /// Waits for a notification without borrowing this handle or allocating.
+    /// Check readiness after polling the returned future to avoid missed wakes.
+    pub fn wait_owned(&self) -> stellarator::sync::wait_queue::WaitOwned {
+        self.0.wait_owned()
+    }
+}
+
+#[cfg(feature = "notify")]
 impl WakeSource for Notifier {
     fn notify(&self) {
         self.0.wake_all();
@@ -277,6 +292,10 @@ impl WakeSource for Notifier {
 impl WakeSink for Notifier {
     async fn wait_until<F: FnMut() -> bool>(&self, ready: F) {
         let _ = self.0.wait_for(ready).await;
+    }
+
+    fn wait_owned(&self) -> Option<stellarator::sync::wait_queue::WaitOwned> {
+        Some(Notifier::wait_owned(self))
     }
 }
 
@@ -352,23 +371,28 @@ impl Inner {
     }
 
     /// Locate a record, skipping any wrap gap. Also return the position after the skip.
-    fn locate_from(&self, mut r: u64) -> Result<(u64, Option<Located>), ReadError> {
+    fn locate_from(&self, r: u64) -> Result<(u64, Option<Located>), ReadError> {
+        self.locate_before(r, self.control().committed.load(Acquire))
+    }
+
+    fn locate_before(
+        &self,
+        mut r: u64,
+        committed: u64,
+    ) -> Result<(u64, Option<Located>), ReadError> {
         let cap = self.geometry.capacity;
         loop {
-            // Acquire publication before the wrap marker, matching the writer's store order.
-            let c = self.control().committed.load(Acquire);
+            if r >= committed {
+                return Ok((r, None));
+            }
             let hwm = self.control().hwm.load(Acquire);
             if r == hwm {
                 // Skip this gap once; absolute gap positions increase.
                 r = (r & !self.geometry.mask()) + cap;
                 continue;
             }
-            // The marker can become visible before the new committed position.
-            if r >= c {
-                return Ok((r, None));
-            }
             let phys = (r & self.geometry.mask()) as usize;
-            // SAFETY: r is a pinned record start and r < c observes publication.
+            // SAFETY: r is pinned and below an acquired committed position.
             // Alignment and capacity >= 16 leave room for the header.
             let len = unsafe { self.read_len(phys) };
             if !record_fits(len, phys as u64, cap) {
@@ -376,6 +400,9 @@ impl Inner {
             }
             let len = len as usize;
             let rec = frame_len(len);
+            if rec as u64 > committed - r {
+                return Err(ReadError::Corrupt);
+            }
             return Ok((
                 r,
                 Some(Located {
@@ -886,16 +913,18 @@ impl<RD: WakeSink> View<RD> {
         }
     }
 
-    /// Iterate unread records as borrowed slices, which may coexist.
+    /// Iterate records published before this call as borrowed slices, which may coexist.
     /// Consumption is deferred until the next mutable view operation, after all
     /// slices are no longer used. Stopping early consumes only yielded records.
     pub fn drain(&mut self) -> Drain<'_> {
         self.settle();
         let pos = self.cursor();
+        let committed = self.committed();
         let View { inner, pending, .. } = self;
         Drain {
             inner,
             pos,
+            committed,
             pending,
             done: false,
         }
@@ -952,6 +981,7 @@ impl Drop for ReadGrant<'_> {
 pub struct Drain<'a> {
     inner: &'a Inner,
     pos: u64,
+    committed: u64,
     pending: &'a mut Option<u64>,
     done: bool,
 }
@@ -963,7 +993,7 @@ impl<'a> Iterator for Drain<'a> {
         if self.done {
             return None;
         }
-        match self.inner.locate_from(self.pos) {
+        match self.inner.locate_before(self.pos, self.committed) {
             Ok((_, Some(loc))) => {
                 self.pos = loc.end();
                 *self.pending = Some(self.pos);

@@ -14,30 +14,37 @@ PACK = Pack(id="adcs", lib="adcs_systems", libs="/abs/.metor/adcs_pack/_libs", a
 
 class Imu(Record):
     _name = "imu"
+    _pack = PACK
 
 
 class LogEvent(Record):
     _name = "log"
+    _pack = PACK
 
 
 class SystemStatus(Record):
     _name = "status"
+    _pack = PACK
 
 
 class Est(Record):
     _name = "est"
+    _pack = PACK
 
 
 class ModeCmd(Record):
     _name = "mode_cmd"
+    _pack = PACK
 
 
 class MotorCmd(Record):
     _name = "motor_cmd"
+    _pack = PACK
 
 
 class Ping(Record):
     _name = "ping"
+    _pack = PACK
 
 
 class Plant(System):

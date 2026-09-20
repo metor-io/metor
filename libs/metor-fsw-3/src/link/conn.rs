@@ -2,6 +2,7 @@
 //! task serving it.
 
 use core::cell::{Cell, RefCell};
+use core::future::Future;
 use std::rc::Rc;
 
 use core::mem::MaybeUninit;
@@ -14,6 +15,10 @@ use stellarator::buf::{IoBuf, IoBufMut, Slice};
 use stellarator::io::{AsyncWrite, GrowableBuf, OwnedReader, OwnedWriter, SplitExt};
 use stellarator::net::TcpStream;
 use stellarator::sync::WaitQueue;
+
+use crate::Stop;
+
+use super::transport::Incoming;
 
 /// A connection's first receive buffer, and the smallest cap a link may set.
 pub(crate) const RECV_BUF: usize = 1024;
@@ -161,8 +166,7 @@ pub(crate) struct Connections {
     slots: Vec<Option<Open>>,
     cap: usize,
     recv_cap: usize,
-    /// Woken by every connection that ends, so a link notices without traffic.
-    ended: Rc<WaitQueue>,
+    changed: Rc<WaitQueue>,
     /// Bytes written by connections that have since closed.
     bytes_out: u64,
     batches_dropped: u64,
@@ -176,7 +180,7 @@ impl Connections {
             slots: (0..count).map(|_| None).collect(),
             cap,
             recv_cap,
-            ended: Rc::new(WaitQueue::new()),
+            changed: Rc::new(WaitQueue::new()),
             bytes_out: 0,
             batches_dropped: 0,
         }
@@ -187,9 +191,12 @@ impl Connections {
         self.slots.iter().any(Option::is_none)
     }
 
-    /// Resolves once a connection has ended, its slot still waiting to be pruned.
-    pub(crate) async fn ended(&self) {
-        let _ = self.ended.wait_for(|| self.any_closed()).await;
+    /// Waits for a completed write or a connection that needs pruning.
+    async fn changed(&self, observed: Stats) {
+        let _ = self
+            .changed
+            .wait_for(|| self.any_closed() || self.stats() != observed)
+            .await;
     }
 
     fn any_closed(&self) -> bool {
@@ -228,7 +235,7 @@ impl Connections {
         let (rx, tx) = stream.split();
         let serving = serve(
             outbox.clone(),
-            self.ended.clone(),
+            self.changed.clone(),
             rx,
             tx,
             seed,
@@ -263,23 +270,64 @@ impl Connections {
     }
 }
 
+pub(crate) enum Event {
+    Connected(TcpStream),
+    Ready,
+    Changed,
+    Stop,
+}
+
+/// Waits for input, connection activity, or shutdown.
+pub(crate) async fn next(
+    incoming: &Incoming,
+    conns: &Connections,
+    ready: impl Future<Output = ()>,
+    stop: &Stop,
+) -> Event {
+    let observed = conns.stats();
+    let connected = async { Event::Connected(incoming.next().await) };
+    let ready = async {
+        ready.await;
+        Event::Ready
+    };
+    let changed = async {
+        conns.changed(observed).await;
+        Event::Changed
+    };
+    let stopped = async {
+        stop.wait().await;
+        Event::Stop
+    };
+    let first = futures_lite::future::or(connected, ready);
+    futures_lite::future::or(futures_lite::future::or(first, changed), stopped).await
+}
+
 /// One connection's life: the halves race, and either one ending closes it.
 async fn serve(
     outbox: Rc<Outbox>,
-    ended: Rc<WaitQueue>,
+    changed: Rc<WaitQueue>,
     rx: OwnedReader<TcpStream>,
     tx: OwnedWriter<TcpStream>,
     seed: Vec<u8>,
     buf: Capped,
     on_packet: impl FnMut(&Packet),
 ) {
-    futures_lite::future::or(write_half(&outbox, tx, seed), read_half(rx, buf, on_packet)).await;
+    futures_lite::future::or(
+        write_half(&outbox, &changed, tx, seed),
+        read_half(rx, buf, on_packet),
+    )
+    .await;
     outbox.close();
-    ended.wake_all();
+    changed.wake_all();
 }
 
 /// Writes the seed, then every batch the link queues, one buffer at a time.
-async fn write_half(outbox: &Outbox, tx: OwnedWriter<TcpStream>, seed: Vec<u8>) {
+async fn write_half(
+    outbox: &Outbox,
+    changed: &WaitQueue,
+    tx: OwnedWriter<TcpStream>,
+    seed: Vec<u8>,
+) {
     let mut buf = seed;
     loop {
         if !buf.is_empty() {
@@ -291,6 +339,7 @@ async fn write_half(outbox: &Outbox, tx: OwnedWriter<TcpStream>, seed: Vec<u8>) 
                 return;
             }
             outbox.written.set(outbox.written.get() + len);
+            changed.wake_all();
         }
         if outbox.wake.wait_for(|| outbox.ready()).await.is_err() || outbox.closed.get() {
             return;
@@ -376,6 +425,14 @@ mod tests {
         }
         assert_eq!(conns.stats().connections, 1);
         assert!(!conns.has_free());
+    }
+
+    #[test]
+    fn a_notification_without_a_counter_change_keeps_waiting() {
+        let conns = Connections::new(1, 64, RECV_BUF);
+        conns.changed.wake_all();
+        let changed = futures_lite::future::poll_once(conns.changed(conns.stats()));
+        assert!(futures_lite::future::block_on(changed).is_none());
     }
 
     #[stellarator::test]

@@ -7,12 +7,13 @@
 mod build;
 mod config;
 mod error;
-#[cfg(test)]
-mod fault_tests;
 mod params;
 mod run;
 mod status;
 mod table;
+
+#[cfg(test)]
+mod tests;
 
 use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;

@@ -18,7 +18,7 @@ use metor_proto_wkt::{LogEvent, LogLevel};
 use crate::async_system::{AsyncSystem, Running, Stop};
 use crate::coordinator::{MakeCx, ParamError, Params, Step};
 use crate::record::Record;
-use crate::system::{InputBinding, OutputBinding, SystemDef, SystemInputs, SystemOutputs};
+use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef, SystemInputs, SystemOutputs};
 
 use group::{GroupHandle, Member, Panicked};
 
@@ -105,12 +105,14 @@ struct Mirror<W: WakeSource> {
 
 impl<W: WakeSource> Mirror<W> {
     /// Moves every waiting record, counting the ones that found no room.
-    fn drain(&mut self, scratch: &mut Vec<u8>) {
-        while matches!(self.from.try_read_into(scratch), Ok(true)) {
-            if self.into.try_write(scratch).is_err() {
+    fn drain(&mut self) {
+        for record in self.from.drain() {
+            let Ok(bytes) = record else { break };
+            if self.into.try_write(bytes).is_err() {
                 self.dropped += 1;
             }
         }
+        self.from.settle();
     }
 }
 
@@ -126,7 +128,6 @@ pub struct Thread {
     outputs: Vec<Mirror<NoWake>>,
     /// Which output is the system's `log`, where the adapter's lines go too.
     log: Option<usize>,
-    scratch: Vec<u8>,
     line: Vec<u8>,
     /// One field per port, written in place, so a drop report allocates nothing.
     fields: Fields,
@@ -142,10 +143,10 @@ type Fields = Vec<(Cow<'static, str>, Cow<'static, str>)>;
 impl Step for Thread {
     fn execute(&mut self, now: Timestamp) {
         for mirror in self.inputs.iter_mut() {
-            mirror.drain(&mut self.scratch);
+            mirror.drain();
         }
         for mirror in self.outputs.iter_mut() {
-            mirror.drain(&mut self.scratch);
+            mirror.drain();
         }
         self.report_drops(now);
         self.check_panic(now);
@@ -264,6 +265,8 @@ fn drop_fields<'a>(ports: impl Iterator<Item = &'a Cow<'static, str>>) -> Fields
 /// The adapter for the cycle thread and the bindings the system's own thread
 /// reads and writes.
 type Bound = (Thread, Vec<InputBinding<Notifier>>, Vec<OutputBinding>);
+type BoundInputs = (Vec<Mirror<Notifier>>, Vec<InputBinding<Notifier>>);
+type BoundOutputs = (Vec<Mirror<NoWake>>, Vec<OutputBinding>);
 
 /// Mirrors every port of one async system.
 fn bind(
@@ -271,10 +274,34 @@ fn bind(
     inputs: Vec<Vec<&RingBuffer>>,
     outputs: Vec<&RingBuffer>,
 ) -> Result<Bound, ParamError> {
+    let (edges, bound_in) = bind_inputs(&def.inputs, inputs)?;
+    let (copies, bound_out) = bind_outputs(&def.outputs, outputs)?;
+    let ports = edges
+        .iter()
+        .map(|mirror| &mirror.port)
+        .chain(copies.iter().map(|mirror| &mirror.port));
+    let thread = Thread {
+        line: vec![0; LogEvent::MAX_LEN],
+        fields: drop_fields(ports),
+        since_report: 0,
+        log: log_port(def),
+        inputs: edges,
+        outputs: copies,
+        panicked: Panicked::default(),
+        latched: false,
+        group: None,
+    };
+    Ok((thread, bound_in, bound_out))
+}
+
+fn bind_inputs(
+    ports: &[PortDef],
+    inputs: Vec<Vec<&RingBuffer>>,
+) -> Result<BoundInputs, ParamError> {
     let wake = Notifier::default();
     let mut edges = Vec::new();
-    let mut bound_in = Vec::with_capacity(def.inputs.len());
-    for (port, rings) in def.inputs.iter().zip(inputs) {
+    let mut bound_in = Vec::with_capacity(ports.len());
+    for (port, rings) in ports.iter().zip(inputs) {
         let mut views = Vec::with_capacity(rings.len());
         for ring in rings {
             let mirror = mirror(ring)?;
@@ -292,14 +319,17 @@ fn bind(
             views,
         });
     }
+    Ok((edges, bound_in))
+}
 
-    let mut copies = Vec::with_capacity(def.outputs.len());
-    let mut bound_out = Vec::with_capacity(def.outputs.len());
-    for (port, ring) in def.outputs.iter().zip(outputs) {
+fn bind_outputs(ports: &[PortDef], outputs: Vec<&RingBuffer>) -> Result<BoundOutputs, ParamError> {
+    let mut copies = Vec::with_capacity(ports.len());
+    let mut bound_out = Vec::with_capacity(ports.len());
+    for (port, ring) in ports.iter().zip(outputs) {
         let mirror = mirror(ring)?;
         copies.push(Mirror {
             port: port.name.clone(),
-            // PANIC Safety: as above; the real output ring has one writer.
+            // PANIC Safety: the mirror is fresh; build counted one real writer.
             from: mirror.view(NoWake).expect("a fresh mirror"),
             into: ring.writer(NoWake).expect("one writer per output ring"),
             dropped: 0,
@@ -310,23 +340,7 @@ fn bind(
         });
     }
 
-    let ports = edges
-        .iter()
-        .map(|mirror| &mirror.port)
-        .chain(copies.iter().map(|mirror| &mirror.port));
-    let thread = Thread {
-        scratch: Vec::with_capacity(scratch_len(def)),
-        line: vec![0; LogEvent::MAX_LEN],
-        fields: drop_fields(ports),
-        since_report: 0,
-        log: log_port(def),
-        inputs: edges,
-        outputs: copies,
-        panicked: Panicked::default(),
-        latched: false,
-        group: None,
-    };
-    Ok((thread, bound_in, bound_out))
+    Ok((copies, bound_out))
 }
 
 /// A ring of the same records as `real`, several times as deep.
@@ -347,16 +361,6 @@ fn mirror_config(capacity: usize) -> Result<Config, ParamError> {
     };
     metor_fsw_3_ring::checked_region_len(&config).ok_or_else(too_large)?;
     Ok(config)
-}
-
-/// The largest record any of this system's ports carries.
-fn scratch_len(def: &SystemDef) -> usize {
-    def.inputs
-        .iter()
-        .chain(&def.outputs)
-        .map(|port| port.max_len)
-        .max()
-        .unwrap_or(0)
 }
 
 /// The index of the system's `log` output, which is where its lines go.

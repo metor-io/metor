@@ -18,6 +18,7 @@ PACK = Pack(
 
 class {{ record.class }}(Record):
     _name = {{ record.name | python_string }}
+    _pack = PACK
 {% endfor %}
 {%- for class in dataclasses %}
 

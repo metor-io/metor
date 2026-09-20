@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use libloading::Library;
 use metor_proto::types::Timestamp;
 
-use crate::coordinator::{ParamError, Step, SystemTable, TableEntry};
+use crate::coordinator::{BuildError, ParamError, Step, SystemTable, TableEntry};
 use crate::pack::def::{Instance, PackDef, PackSystemDef};
 use crate::pack::raw::{RawPort, RawRing, RawSlice};
 use crate::pack::{ABI_VERSION, DefStatus, Status};
@@ -174,8 +174,10 @@ fn symbol<T: Copy>(lib: &Library, name: &'static str) -> Result<T, PackError> {
 }
 
 impl SystemTable {
-    /// Registers every system in `pack` under `"{id}.{ty}"`.
-    pub fn register_pack(&mut self, id: &str, pack: &Pack) {
+    /// Registers systems in `pack` under `"{id}.{ty}"` in order.
+    /// Stops at the first conflict, leaving earlier registrations in the table.
+    pub fn register_pack(&mut self, id: &str, pack: &Pack) -> Result<(), BuildError> {
+        let mut entries = Vec::new();
         for system in pack.systems() {
             let (lib, fns) = (pack.lib.clone(), pack.fns);
             let ty = system.ty.to_string();
@@ -233,8 +235,9 @@ impl SystemTable {
                     }))
                 }),
             };
-            self.insert(&format!("{id}.{}", system.ty), entry);
+            entries.push((format!("{id}.{}", system.ty), entry));
         }
+        self.insert_all(entries)
     }
 }
 

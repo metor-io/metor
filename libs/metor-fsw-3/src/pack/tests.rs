@@ -165,10 +165,12 @@ fn table_captures_are_owned_once_per_thread_and_released_on_exit() {
     fn captured() -> SystemTable {
         let capture = Capture;
         let mut table = SystemTable::new();
-        table.register_system("imu", move |_| {
-            let _ = &capture;
-            Ok((crate::tests::utils::ImuSource, 0))
-        });
+        table
+            .register_system("imu", move |_| {
+                let _ = &capture;
+                Ok((crate::tests::utils::ImuSource, 0))
+            })
+            .expect("valid records");
         table
     }
     std::thread::spawn(|| {

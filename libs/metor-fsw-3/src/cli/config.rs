@@ -122,11 +122,15 @@ mod tests {
     /// The four `adcs.*` types the golden names, plus the links it adds.
     fn table() -> SystemTable {
         let mut table = SystemTable::new();
-        crate::link::register_builtins(&mut table);
-        table.register("adcs.plant", |_: Altitude| Plant);
-        table.register("adcs.nav", |_: Gain| Nav);
-        table.register("adcs.mode", || Mode);
-        table.register("adcs.ctrl", || Ctrl);
+        crate::link::register_builtins(&mut table).expect("valid records");
+        table
+            .register("adcs.plant", |_: Altitude| Plant)
+            .expect("valid records");
+        table
+            .register("adcs.nav", |_: Gain| Nav)
+            .expect("valid records");
+        table.register("adcs.mode", || Mode).expect("valid records");
+        table.register("adcs.ctrl", || Ctrl).expect("valid records");
         table
     }
 

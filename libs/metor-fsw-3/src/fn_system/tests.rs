@@ -113,7 +113,9 @@ impl<T: Frame + Clone + 'static> Probe<T> {
 fn probe<T: Frame + Clone + 'static>(table: &mut SystemTable, ty: &str) -> Rc<RefCell<Option<T>>> {
     let seen = Rc::new(RefCell::new(None));
     let state = seen.clone();
-    table.register(ty, move || Probe(state.clone()));
+    table
+        .register(ty, move || Probe(state.clone()))
+        .expect("valid records");
     seen
 }
 
@@ -177,10 +179,14 @@ fn defs_follow_parameter_order_and_skip_timestamp() {
 
 fn gain_table() -> SystemTable {
     let mut table = SystemTable::new();
-    table.register("gain", Gain::new);
-    table.register("doubler", || Doubler);
-    table.register("summer", || Summer);
-    table.register("counter", Counter::default);
+    table.register("gain", Gain::new).expect("valid records");
+    table
+        .register("doubler", || Doubler)
+        .expect("valid records");
+    table.register("summer", || Summer).expect("valid records");
+    table
+        .register("counter", Counter::default)
+        .expect("valid records");
     table
 }
 
@@ -277,10 +283,12 @@ fn two_inputs_of_one_record_bind_to_two_rings() {
 #[test]
 fn a_fn_pipeline_matches_the_trait_pipeline() {
     let mut table = gain_table();
-    table.register_system("nav_params", |p| {
-        p.decode::<NoParams>()
-            .map(|_| (FnSystem::<Doubler>::default(), Doubler))
-    });
+    table
+        .register_system("nav_params", |p| {
+            p.decode::<NoParams>()
+                .map(|_| (FnSystem::<Doubler>::default(), Doubler))
+        })
+        .expect("valid records");
     let config = CoordinatorConfig {
         systems: vec![
             SystemConfig {
@@ -355,10 +363,16 @@ impl LogProbe {
 fn log_config(lines: usize) -> (CoordinatorConfig, SystemTable, Rc<RefCell<Vec<LogEvent>>>) {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut table = SystemTable::new();
-    table.register("talker", move || Talker { lines });
-    table.register_system("noisy", |_| Ok((Noisy, ())));
+    table
+        .register("talker", move || Talker { lines })
+        .expect("valid records");
+    table
+        .register_system("noisy", |_| Ok((Noisy, ())))
+        .expect("valid records");
     let sink = seen.clone();
-    table.register("log_probe", move || LogProbe(sink.clone()));
+    table
+        .register("log_probe", move || LogProbe(sink.clone()))
+        .expect("valid records");
     let config = CoordinatorConfig {
         systems: vec![
             SystemConfig::new("talker", "talker"),
@@ -424,11 +438,15 @@ fn pad_config(
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut table = SystemTable::new();
     let (line, sink) = (line.to_string(), seen.clone());
-    table.register("padder", move || Padder {
-        line: line.clone(),
-        lines,
-    });
-    table.register("log_probe", move || LogProbe(sink.clone()));
+    table
+        .register("padder", move || Padder {
+            line: line.clone(),
+            lines,
+        })
+        .expect("valid records");
+    table
+        .register("log_probe", move || LogProbe(sink.clone()))
+        .expect("valid records");
     let config = CoordinatorConfig {
         systems: vec![
             SystemConfig::new("padder", "padder"),
@@ -508,7 +526,9 @@ fn an_explicit_log_output_cannot_hide_the_implicit_output() {
     }
 
     let mut table = SystemTable::new();
-    table.register("log_output", || LogOutput);
+    table
+        .register("log_output", || LogOutput)
+        .expect("valid records");
     let config = CoordinatorConfig {
         systems: vec![SystemConfig::new("logger", "log_output")],
         ..Default::default()
@@ -615,7 +635,9 @@ fn a_registered_async_system_relays_through_its_adapter() {
     }
 
     let mut table = SystemTable::new();
-    table.register_async("relay", || Relay);
+    table
+        .register_async("relay", || Relay)
+        .expect("valid records");
     let entry = table.get("relay").expect("registered");
     assert_eq!(entry.def.inputs, vec![Input::<Imu>::def("imu")]);
 

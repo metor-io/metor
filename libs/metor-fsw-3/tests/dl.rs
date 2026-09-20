@@ -117,10 +117,14 @@ fn pipeline(ty: &str, params: serde_json::Value) -> (CoordinatorConfig, Rc<RefCe
 
 fn table(pack: &Pack, seen: &Rc<RefCell<Vec<u32>>>) -> SystemTable {
     let mut table = SystemTable::new();
-    table.register("source", Source::default);
+    table
+        .register("source", Source::default)
+        .expect("valid records");
     let sink = seen.clone();
-    table.register("sink", move || Sink(sink.clone()));
-    table.register_pack("echo", pack);
+    table
+        .register("sink", move || Sink(sink.clone()))
+        .expect("valid records");
+    table.register_pack("echo", pack).expect("valid records");
     table
 }
 

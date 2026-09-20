@@ -180,12 +180,23 @@ pub fn pack() -> SystemTable {
         panic!("pack builder failed");
     }
     let mut table = SystemTable::new();
-    table.register("echo", Echo::default);
-    table.register_async("relay", Relay::default);
-    table.register("boom", Boom::default);
-    table.register("gain", Gain::new);
-    table.register("fail_input", FailInput::default);
-    table.register_system("retained", |_| Ok((Retained, ())));
+    // PANIC Safety: these static record schemas are compatible.
+    table
+        .register("echo", Echo::default)
+        .expect("valid records");
+    table
+        .register_async("relay", Relay::default)
+        .expect("valid records");
+    table
+        .register("boom", Boom::default)
+        .expect("valid records");
+    table.register("gain", Gain::new).expect("valid records");
+    table
+        .register("fail_input", FailInput::default)
+        .expect("valid records");
+    table
+        .register_system("retained", |_| Ok((Retained, ())))
+        .expect("valid records");
     table
 }
 
