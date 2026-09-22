@@ -45,10 +45,11 @@ fn defs_body(bundle: &Bundle) -> TokenStream2 {
         // PANIC Safety: a named struct's fields all have idents.
         let name = f.ident.as_ref().expect("named field").to_string();
         let ty = &f.ty;
-        quote! { defs.push(<#ty>::def(#name)); }
+        quote! { defs.push(<#ty>::def(cx, #name)); }
     });
     quote! {
         let mut defs = Vec::new();
+        let _ = cx;
         #(#pushes)*
         Ok(defs)
     }
@@ -134,7 +135,7 @@ fn expand(parsed: DeriveInput, dir: Dir) -> TokenStream2 {
     quote! {
         impl #impl_generics #fsw::#trait_name for #ident #ty_generics #where_clause {
             fn defs(
-                _cx: &#fsw::def::DefCx<'_>,
+                cx: &#fsw::def::DefCx<'_>,
             ) -> ::core::result::Result<Vec<#fsw::PortDef>, #fsw::def::DefError> {
                 #defs
             }

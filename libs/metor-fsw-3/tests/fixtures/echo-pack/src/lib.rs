@@ -132,8 +132,8 @@ thread_local! {
 pub struct RetainedInput;
 
 impl SystemInputs for RetainedInput {
-    fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
-        Ok(vec![Input::<Ping>::def("input")])
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(vec![Input::<Ping>::def(cx, "input")])
     }
 
     fn bind(mut inputs: Vec<InputBinding>) -> Self {
@@ -147,8 +147,8 @@ impl SystemInputs for RetainedInput {
 pub struct RetainedOutput;
 
 impl SystemOutputs for RetainedOutput {
-    fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
-        Ok(vec![Output::<Ping>::def("output")])
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(vec![Output::<Ping>::def(cx, "output")])
     }
 
     fn bind(mut outputs: Vec<OutputBinding>) -> Self {

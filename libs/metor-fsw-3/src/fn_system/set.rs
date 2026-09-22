@@ -47,7 +47,7 @@ impl<S: Ports, W: WakeSink + Clone + 'static> SystemInputs<W> for InSet<S, W> {
 impl<S: Ports> SystemOutputs for OutSet<S> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         let mut outputs = Defs::of::<S>(cx)?.outputs;
-        outputs.push(Output::<LogEvent>::def(LOG_PORT));
+        outputs.push(Output::<LogEvent>::def(cx, LOG_PORT));
         Ok(outputs)
     }
 

@@ -203,6 +203,7 @@ mod tests {
     use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
     use metor_proto::types::PacketTy;
 
+    use crate::DefCx;
     use crate::port::ring_capacity;
     use crate::record::Record;
     use crate::system::{OutputBinding, PortDef, SystemOutputs};
@@ -232,8 +233,8 @@ mod tests {
     fn ports(rings: &[RingBuffer; 2]) -> DynOutputs {
         bind(
             [
-                Output::<Fixed>::def("cmds.fixed"),
-                Output::<Note>::def("cmds.note"),
+                Output::<Fixed>::def(&DefCx::empty(), "cmds.fixed"),
+                Output::<Note>::def(&DefCx::empty(), "cmds.note"),
             ],
             rings,
         )
@@ -293,8 +294,8 @@ mod tests {
         let rings = [ring::<Fixed>(), ring::<Fixed>()];
         let mut outputs = bind(
             [
-                Output::<Fixed>::def("cmds.first"),
-                Output::<Fixed>::def("cmds.second"),
+                Output::<Fixed>::def(&DefCx::empty(), "cmds.first"),
+                Output::<Fixed>::def(&DefCx::empty(), "cmds.second"),
             ],
             &rings,
         );
@@ -308,8 +309,8 @@ mod tests {
         let rings = [ring::<Fixed>(), ring::<Imu>()];
         let mut outputs = bind(
             [
-                Output::<Fixed>::def("cmds.fixed"),
-                Output::<Imu>::def("cmds.imu"),
+                Output::<Fixed>::def(&DefCx::empty(), "cmds.fixed"),
+                Output::<Imu>::def(&DefCx::empty(), "cmds.imu"),
             ],
             &rings,
         );

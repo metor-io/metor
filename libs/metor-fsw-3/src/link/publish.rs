@@ -155,6 +155,7 @@ mod tests {
     use metor_proto::types::PacketTy;
     use zerocopy::IntoBytes;
 
+    use crate::DefCx;
     use crate::link::DEFAULT_CONN_CAP;
     use crate::port::{Input, ring_capacity};
     use crate::record::Record;
@@ -179,8 +180,8 @@ mod tests {
     fn ports(rings: &[RingBuffer; 2]) -> DynInputs<Notifier> {
         let wake = Notifier::default();
         let defs = [
-            Input::<Imu>::def("plant.imu"),
-            Input::<Fixed>::def("cmds.fixed"),
+            Input::<Imu>::def(&DefCx::empty(), "plant.imu"),
+            Input::<Fixed>::def(&DefCx::empty(), "cmds.fixed"),
         ];
         DynInputs::bind(
             defs.into_iter()

@@ -37,7 +37,7 @@ impl PortDef {
             other.max_len,
             other.alignment,
             other.depth,
-        ) && self.schema == other.schema
+        ) && self.schema.same_record(&other.schema)
     }
 }
 
@@ -172,8 +172,11 @@ mod tests {
     }
 
     impl SystemInputs for HandIn {
-        fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
-            Ok(vec![Input::<Imu>::def("imu"), Input::<Nav>::def("nav")])
+        fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+            Ok(vec![
+                Input::<Imu>::def(cx, "imu"),
+                Input::<Nav>::def(cx, "nav"),
+            ])
         }
         fn bind(mut inputs: Vec<InputBinding>) -> Self {
             let nav = inputs.pop().expect("two bindings");
@@ -262,8 +265,8 @@ mod tests {
     fn test_bind_field_order() {
         let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
         let mut bound = DerivedIn::bind(bound_in(vec![
-            (Input::<Imu>::def("imu"), vec![&imu]),
-            (Input::<Nav>::def("nav"), vec![&nav]),
+            (Input::<Imu>::def(&DefCx::empty(), "imu"), vec![&imu]),
+            (Input::<Nav>::def(&DefCx::empty(), "nav"), vec![&nav]),
         ]));
         let mut imu_out = Output::<Imu>::try_new(imu.writer(NoWake).expect("free writer"))
             .expect("supported alignment");
@@ -278,10 +281,13 @@ mod tests {
     #[test]
     fn test_manual_bundle_binding() {
         let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
-        let mut out = DerivedOut::bind(bound_out(vec![(Output::<Nav>::def("nav"), &nav)]));
+        let mut out = DerivedOut::bind(bound_out(vec![(
+            Output::<Nav>::def(&DefCx::empty(), "nav"),
+            &nav,
+        )]));
         let mut bound = HandIn::bind(bound_in(vec![
-            (Input::<Imu>::def("imu"), vec![&imu]),
-            (Input::<Nav>::def("nav"), vec![&nav]),
+            (Input::<Imu>::def(&DefCx::empty(), "imu"), vec![&imu]),
+            (Input::<Nav>::def(&DefCx::empty(), "nav"), vec![&nav]),
         ]));
         out.nav
             .write(&Nav {
@@ -299,7 +305,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "DerivedIn::defs()")]
     fn test_bind_wrong_length_panics() {
-        let _ = DerivedIn::bind(bound_in(vec![(Input::<Imu>::def("imu"), Vec::new())]));
+        let _ = DerivedIn::bind(bound_in(vec![(
+            Input::<Imu>::def(&DefCx::empty(), "imu"),
+            Vec::new(),
+        )]));
     }
 
     #[test]
@@ -310,16 +319,23 @@ mod tests {
             .expect("a static definition");
         assert!(def.inputs.is_empty() && def.outputs.is_empty());
 
-        let producer = Output::<Imu>::def("imu");
+        let producer = Output::<Imu>::def(&DefCx::empty(), "imu");
         let edges = [("plant.imu", &producer)];
         let def = SystemDef::new::<DynInputs, DynOutputs>("link", &DefCx::of_inputs(&edges))
             .expect("one config port");
-        assert_eq!(def.inputs, vec![Input::<Imu>::def("plant.imu")]);
+        // The dynamic input carries the producer's def under the config's name.
+        assert_eq!(
+            def.inputs,
+            vec![PortDef {
+                name: "plant.imu".into(),
+                ..producer.clone()
+            }]
+        );
 
         let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
         let mut bound = DynInputs::bind(bound_in(vec![
-            (Input::<Imu>::def("plant.imu"), vec![&imu]),
-            (Input::<Nav>::def("nav.nav"), vec![&nav]),
+            (Input::<Imu>::def(&DefCx::empty(), "plant.imu"), vec![&imu]),
+            (Input::<Nav>::def(&DefCx::empty(), "nav.nav"), vec![&nav]),
         ]));
         let names: Vec<_> = bound
             .iter_mut()

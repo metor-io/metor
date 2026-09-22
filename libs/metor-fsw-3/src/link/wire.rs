@@ -1,12 +1,8 @@
 use std::collections::HashMap;
 
-use metor_proto::types::{
-    ComponentId, IntoLenPacket, PACKET_HEADER_LEN, PacketId, PacketTy, table_id,
-};
-use metor_proto::vtable::{Op, VTable};
+use metor_proto::types::{IntoLenPacket, PACKET_HEADER_LEN, PacketId, PacketTy, table_id};
 use metor_proto_wkt::{
-    ComponentMetadata, LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata, SetComponentMetadata,
-    SetMsgMetadata, VTableMsg,
+    LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata, SetComponentMetadata, SetMsgMetadata, VTableMsg,
 };
 
 use crate::record::{MsgCodec, RecordSchema};
@@ -28,7 +24,13 @@ pub(crate) fn link_info(
     (&info).into_len_packet().inner
 }
 
-/// The message that is sent at the start of a connection
+/// The message that is sent at the start of a connection, and the id each
+/// port's records go out under.
+///
+/// A frame port announces the vtable and components its def carries, which
+/// its type built under the port's root. A port whose table id collides with
+/// an earlier one has no id: two tables under one id are indistinguishable on
+/// the wire.
 pub(crate) fn announce(
     defs: &[PortDef],
     namespace: Option<&str>,
@@ -41,16 +43,19 @@ pub(crate) fn announce(
         let RecordSchema::Frame { vtable, metadata } = &def.schema else {
             continue;
         };
-        let (vtable, metadata) = reroot(vtable, metadata, &root(namespace, &def.name), &def.record);
-        let id = table_id(&vtable);
+        let id = table_id(vtable);
         if tables.contains(&id) {
             continue;
         }
         tables.push(id);
         ids[at] = Some(id);
-        blob.extend_from_slice(&VTableMsg { id, vtable }.into_len_packet().inner);
+        let table = VTableMsg {
+            id,
+            vtable: vtable.clone(),
+        };
+        blob.extend_from_slice(&table.into_len_packet().inner);
         for component in metadata {
-            let packet = (&SetComponentMetadata(component)).into_len_packet();
+            let packet = SetComponentMetadata(component.clone()).into_len_packet();
             blob.extend_from_slice(&packet.inner);
         }
     }
@@ -98,86 +103,6 @@ fn msg_metadata(name: &str, codec: &MsgCodec) -> MsgMetadata {
     }
 }
 
-/// Where a port's components hang: the namespace, then the port's name.
-fn root(namespace: Option<&str>, port: &str) -> String {
-    match namespace {
-        Some(namespace) => format!("{namespace}.{port}"),
-        None => port.to_string(),
-    }
-}
-
-/// Moves a port-relative frame under `root`, so two links announce one
-/// producer's components under one set of ids.
-///
-/// A port's leaves are named `{record}.{field}`; the announced leaf is
-/// `{root}.{field}`. Each leaf id is baked as a standalone eight-byte
-/// `Op::Data` blob, so rewriting those blobs is the whole rehash.
-fn reroot(
-    vtable: &VTable,
-    metadata: &[ComponentMetadata],
-    root: &str,
-    record: &str,
-) -> (VTable, Vec<ComponentMetadata>) {
-    let renamed: Vec<(ComponentMetadata, u64)> = metadata
-        .iter()
-        .map(|component| {
-            let name = rename(&component.name, root, record);
-            let was = ComponentId::new(&component.name).0;
-            (
-                ComponentMetadata {
-                    component_id: ComponentId::new(&name),
-                    name,
-                    metadata: component.metadata.clone(),
-                },
-                was,
-            )
-        })
-        .collect();
-    let ids: HashMap<u64, u64> = renamed
-        .iter()
-        .map(|(component, was)| (*was, component.component_id.0))
-        .collect();
-    let mut vtable = vtable.clone();
-    let rewrites = leaf_ids(&vtable, &ids);
-    if !rewrites.is_empty() {
-        let mut data = vtable.data.to_vec();
-        for (offset, id) in rewrites {
-            data[offset..offset + 8].copy_from_slice(&id.to_le_bytes());
-        }
-        vtable.data = data;
-    }
-    (vtable, renamed.into_iter().map(|(c, _)| c).collect())
-}
-
-/// The leaf name under `root`, with the record's own segment dropped.
-fn rename(name: &str, root: &str, record: &str) -> String {
-    match name
-        .strip_prefix(record)
-        .and_then(|rest| rest.strip_prefix('.'))
-    {
-        Some(field) => format!("{root}.{field}"),
-        None => format!("{root}.{name}"),
-    }
-}
-
-/// Every eight-byte `Op::Data` blob holding a leaf id, and what to write there.
-fn leaf_ids(vtable: &VTable, ids: &HashMap<u64, u64>) -> Vec<(usize, u64)> {
-    let data = vtable.data.as_slice();
-    vtable
-        .ops
-        .iter()
-        .filter_map(|op| {
-            let Op::Data { offset, len } = op else {
-                return None;
-            };
-            let at = offset.to_index();
-            let slot = data.get(at..at.checked_add(*len as usize)?)?;
-            let bytes: [u8; 8] = slot.try_into().ok()?;
-            Some((at, *ids.get(&u64::from_le_bytes(bytes))?))
-        })
-        .collect()
-}
-
 /// The bytes one packet adds beyond its payload: the length prefix and header.
 pub(crate) const PACKET_OVERHEAD: usize = 4 + PACKET_HEADER_LEN;
 
@@ -194,10 +119,10 @@ pub(crate) fn append_packet(batch: &mut Vec<u8>, ty: PacketTy, id: PacketId, pay
 mod tests {
     use metor_proto::types::LenPacket;
 
-    use crate::Record;
     use crate::port::Input;
     use crate::record::MsgCodec;
     use crate::tests::utils::{Fixed, Imu};
+    use crate::{DefCx, Record};
 
     use super::*;
 
@@ -225,8 +150,17 @@ mod tests {
         }
     }
 
+    /// The context of instance `plant` on target `cube_sat`.
+    fn plant() -> DefCx<'static> {
+        DefCx {
+            id: "plant",
+            namespace: Some("cube_sat"),
+            ..DefCx::empty()
+        }
+    }
+
     fn imu_port() -> PortDef {
-        Input::<Imu>::def("plant.imu")
+        Input::<Imu>::def(&plant(), "imu")
     }
 
     fn announced(defs: &[PortDef]) -> (Vec<u8>, Vec<Option<PacketId>>) {
@@ -235,14 +169,17 @@ mod tests {
 
     #[test]
     fn test_announce_frame_and_message() {
-        let defs = vec![imu_port(), Input::<Fixed>::def("cmds.fixed")];
+        let defs = vec![
+            imu_port(),
+            Input::<Fixed>::def(&DefCx::empty(), "cmds.fixed"),
+        ];
         let (blob, wire) = announced(&defs);
 
         let RecordSchema::Frame { vtable, metadata } = &defs[0].schema else {
             panic!("a frame port")
         };
-        let (vtable, metadata) = reroot(vtable, metadata, "cube_sat.plant.imu", Imu::NAME);
-        let id = table_id(&vtable);
+        assert_eq!(metadata[0].name, "cube_sat.plant.imu.sample");
+        let id = table_id(vtable);
         let info = LinkInfo {
             protocol_version: LINK_PROTOCOL_VERSION,
             features: 0,
@@ -251,9 +188,17 @@ mod tests {
             link: "pub".into(),
         };
         let mut expected = (&info).into_len_packet().inner;
-        expected.extend_from_slice(&VTableMsg { id, vtable }.into_len_packet().inner);
+        let table = VTableMsg {
+            id,
+            vtable: vtable.clone(),
+        };
+        expected.extend_from_slice(&table.into_len_packet().inner);
         for component in metadata {
-            expected.extend_from_slice(&(&SetComponentMetadata(component)).into_len_packet().inner);
+            expected.extend_from_slice(
+                &SetComponentMetadata(component.clone())
+                    .into_len_packet()
+                    .inner,
+            );
         }
         let RecordSchema::Msg { id: msg, .. } = &defs[1].schema else {
             panic!("a message port")
@@ -273,22 +218,11 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_leaf_paths() {
-        let def = imu_port();
-        let RecordSchema::Frame { vtable, metadata } = &def.schema else {
-            panic!("a frame port")
-        };
-        let (vtable, metadata) = reroot(vtable, metadata, "cube_sat.plant.imu", Imu::NAME);
-        let leaf = ComponentId::new("cube_sat.plant.imu.sample");
-        assert_eq!(metadata[0].name, "cube_sat.plant.imu.sample");
-        assert_eq!(metadata[0].component_id, leaf);
-        assert!(vtable.data.windows(8).any(|w| w == leaf.0.to_le_bytes()));
-        assert_ne!(table_id(&vtable), def.schema.packet_id());
-    }
-
-    #[test]
     fn test_announce_json_codec() {
-        let defs = vec![Input::<Telecommand>::def("cmds.telecommand")];
+        let defs = vec![Input::<Telecommand>::def(
+            &DefCx::empty(),
+            "cmds.telecommand",
+        )];
         let (blob, wire) = announced(&defs);
         let metadata = msg_metadata("telecommand", &MsgCodec::Json);
         assert_eq!(
@@ -319,8 +253,8 @@ mod tests {
     #[test]
     fn test_shared_message_id_routes_both_ports() {
         let defs = vec![
-            Input::<Fixed>::def("a.fixed"),
-            Input::<Fixed>::def("b.fixed"),
+            Input::<Fixed>::def(&DefCx::empty(), "a.fixed"),
+            Input::<Fixed>::def(&DefCx::empty(), "b.fixed"),
         ];
         let (blob, wire) = announced(&defs);
         assert_eq!(wire[0], wire[1]);

@@ -38,8 +38,14 @@ pub trait Record {
     /// Reads one record from the given bytes.
     fn decode(bytes: &[u8]) -> Result<Self::Read<'_>, DecodeError>;
 
-    /// What a port carrying this record announces to the ground.
+    /// What this record announces to the ground, relative to itself.
     fn schema() -> RecordSchema;
+
+    /// What a port rooted at `root` announces: a frame builds its vtable and
+    /// metadata there, a message has no path.
+    fn schema_at(_root: &str) -> RecordSchema {
+        Self::schema()
+    }
 }
 
 /// What a port announces about the records it carries.
@@ -66,11 +72,11 @@ pub enum MsgCodec {
 }
 
 impl RecordSchema {
-    /// A frame's vtable and its components, both relative to the port.
-    pub fn frame<T: Frame>() -> Self {
+    /// A frame's vtable and its components, each leaf at `{root}.{field}`.
+    pub fn frame<T: Frame>(root: &str) -> Self {
         Self::Frame {
-            vtable: T::as_vtable(),
-            metadata: T::metadata(()).collect(),
+            vtable: metor_proto::vtable::builder::vtable(T::vtable_fields(root.to_string())),
+            metadata: T::metadata(root.to_string()).collect(),
         }
     }
 
@@ -106,6 +112,17 @@ impl RecordSchema {
         match self {
             Self::Frame { .. } => PacketTy::Table,
             Self::Msg { .. } => PacketTy::Msg,
+        }
+    }
+
+    /// Whether two ports announcing these carry one record. Messages must
+    /// agree; a frame's vtable is its port's, so frames are told apart by
+    /// their record elsewhere.
+    pub fn same_record(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Frame { .. }, Self::Frame { .. }) => true,
+            (Self::Msg { .. }, Self::Msg { .. }) => self == other,
+            _ => false,
         }
     }
 }
@@ -332,6 +349,21 @@ mod tests {
             panic!("a frame announces a vtable")
         };
         metadata.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    #[test]
+    fn test_frame_schema_at_root() {
+        let schema = Imu::schema_at("cube_sat.plant.imu");
+        assert_eq!(component_names(&schema), vec!["cube_sat.plant.imu.sample"]);
+        let RecordSchema::Frame { vtable, metadata } = &schema else {
+            panic!("a frame announces a vtable")
+        };
+        let leaf = ComponentId::new("cube_sat.plant.imu.sample");
+        assert_eq!(metadata[0].component_id, leaf);
+        assert!(vtable.data.windows(8).any(|w| w == leaf.0.to_le_bytes()));
+        assert_ne!(schema.packet_id(), Imu::schema().packet_id());
+        assert!(schema.same_record(&Imu::schema()));
+        assert!(!schema.same_record(&Note::schema()));
     }
 
     #[test]

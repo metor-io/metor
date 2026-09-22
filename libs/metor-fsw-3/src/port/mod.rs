@@ -102,8 +102,9 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
         })
     }
 
-    /// Returns this port's entry in a bundle's `defs()` walk.
-    pub fn def(name: &'static str) -> PortDef {
+    /// This port's entry in a bundle's `defs()` walk, announcing its record
+    /// under `cx`'s root for `name`.
+    pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
         PortDef {
             name: name.into(),
             record: T::NAME.into(),
@@ -111,7 +112,7 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
             max_len: T::MAX_LEN,
             alignment: T::ALIGN,
             depth: T::DEPTH,
-            schema: T::schema(),
+            schema: T::schema_at(&cx.root(name)),
         }
     }
 
@@ -163,9 +164,9 @@ impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
         })
     }
 
-    /// Returns this port's entry in a bundle's `defs()` walk.
-    pub fn def(name: &'static str) -> PortDef {
-        Output::<T>::def(name)
+    /// This port's entry in a bundle's `defs()` walk.
+    pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
+        Output::<T>::def(cx, name)
     }
 
     /// Reads every unread record, producer by producer in bind order.
@@ -460,8 +461,14 @@ mod tests {
         );
         assert_eq!(Input::<Overaligned>::try_new(Vec::new()).err(), Some(error));
         assert!(ring.writer(NoWake).is_ok());
-        assert_eq!(Input::<Overaligned>::def("input").alignment, 32);
-        assert_eq!(Output::<Aligned>::def("output").alignment, 16);
+        assert_eq!(
+            Input::<Overaligned>::def(&DefCx::empty(), "input").alignment,
+            32
+        );
+        assert_eq!(
+            Output::<Aligned>::def(&DefCx::empty(), "output").alignment,
+            16
+        );
     }
 
     fn sample(ts: i64, sample: f64) -> Imu {
@@ -1020,11 +1027,11 @@ mod async_tests {
         let (right, _, _) = woken(&wake);
         let mut inputs = DynInputs::<Notifier>::bind(vec![
             InputBinding {
-                def: Input::<Imu>::def("a.imu"),
+                def: Input::<Imu>::def(&DefCx::empty(), "a.imu"),
                 views: Vec::new(),
             },
             InputBinding {
-                def: Input::<Imu>::def("b.imu"),
+                def: Input::<Imu>::def(&DefCx::empty(), "b.imu"),
                 views: vec![right.view(wake.clone()).expect("free slot")],
             },
         ]);
@@ -1053,11 +1060,11 @@ mod async_tests {
         let (right, b, second) = woken(&Notifier::default());
         let inputs = DynInputs::bind(vec![
             InputBinding {
-                def: Input::<Imu>::def("a"),
+                def: Input::<Imu>::def(&DefCx::empty(), "a"),
                 views: first.views,
             },
             InputBinding {
-                def: Input::<Imu>::def("b"),
+                def: Input::<Imu>::def(&DefCx::empty(), "b"),
                 views: second.views,
             },
         ]);
@@ -1119,7 +1126,7 @@ mod async_tests {
         let mut empty = DynInputs::<Notifier>::default();
         assert!(poll_once(empty.any_ready()).await.is_none());
         let mut unbound = DynInputs::<Notifier>::bind(vec![InputBinding {
-            def: Input::<Imu>::def("unbound"),
+            def: Input::<Imu>::def(&DefCx::empty(), "unbound"),
             views: Vec::new(),
         }]);
         assert!(poll_once(unbound.any_ready()).await.is_none());

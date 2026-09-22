@@ -259,6 +259,7 @@ fn spawn_on(systems: Vec<SystemConfig>, seen: &Seen, clock: Clock) -> Target {
     let thread = std::thread::spawn(move || {
         let config = CoordinatorConfig {
             clock,
+            namespace: Some("cube_sat".into()),
             systems,
             ..Default::default()
         };

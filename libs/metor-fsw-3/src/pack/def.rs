@@ -69,7 +69,7 @@ const PROBE: &str = "__probe";
 
 /// Whether a type takes the ports a config lists, by offering it one of each.
 fn probe(entry: &TableEntry) -> (bool, bool) {
-    let record = crate::Output::<crate::SystemStatus>::def(PROBE);
+    let record = crate::Output::<crate::SystemStatus>::def(&DefCx::empty(), PROBE);
     let records = Records::of(core::iter::once(&record));
     let inputs = [(PROBE, &record)];
     let outputs = [OutputConfig {

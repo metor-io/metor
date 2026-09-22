@@ -86,4 +86,6 @@ unqualified ids, which is the mismatch the version check refuses.
    their tests go; `05-links.md` wire names and `TODO.md` updated; the
    link integration tests pass the namespace through the config.
 
-Each task one commit, tests and clippy green, fmt on touched files only.
+Task 1 is one commit. Tasks 2 and 3 land together, since a qualified
+schema and the host's re-rooting cannot share a tree. Tests and clippy
+green, fmt on touched files only.

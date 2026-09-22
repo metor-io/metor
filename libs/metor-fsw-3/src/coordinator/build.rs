@@ -122,7 +122,7 @@ fn resolve<'a>(
         );
         plan.rings.push(RingSpec::new(
             &system.id,
-            &Output::<SystemStatus>::def(STATUS_PORT),
+            &Output::<SystemStatus>::def(&DefCx::empty(), STATUS_PORT),
         ));
         plan.systems.push(PlannedSystem {
             id: &system.id,
@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_reject_duplicate_port_names() {
-        let port = Output::<utils::Imu>::def("sample");
+        let port = Output::<utils::Imu>::def(&DefCx::empty(), "sample");
         for input in [true, false] {
             let def = crate::SystemDef {
                 name: "test".into(),
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_input_output_shared_name() {
-        let port = Output::<utils::Imu>::def("sample");
+        let port = Output::<utils::Imu>::def(&DefCx::empty(), "sample");
         let def = crate::SystemDef {
             name: "test".into(),
             inputs: vec![port.clone()],

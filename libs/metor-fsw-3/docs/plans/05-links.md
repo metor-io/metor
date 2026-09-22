@@ -360,11 +360,11 @@ output. Its `run`:
    `Publish` connection are read and discarded, so a probing client
    never wedges the socket.
 
-Wire names: a frame published from port `plant.imu` announces its leaves
-as `{namespace}.plant.imu.{field}`, re-rooting the port-relative vtable
-under that path before hashing the table id (the record-relative leaf
-`imu.sample` has its record segment stripped first, so the path is not
-`plant.imu.imu.sample`). Two `Publish` instances on two links announce
+Wire names: a frame produced on port `imu` of instance `plant`
+announces its leaves as `{namespace}.plant.imu.{field}`. The type builds
+that vtable and metadata when it computes its def, under the root the
+`DefCx` gives it (`07-qualified-schemas.md`), so `Publish` announces a
+def's schema as it is, and two `Publish` instances on two links announce
 the same names for the same producer. `SetMsgMetadata.name` is the
 postcard schema's type name for postcard records, matching the id's
 hash, and the record name for other codecs.

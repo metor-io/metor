@@ -200,10 +200,10 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
 
     fn append_defs(
         names: &mut ParamNames<'_>,
-        _cx: &DefCx<'_>,
+        cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        defs.push_input(Input::<T>::def(name(names)));
+        defs.push_input(Input::<T>::def(cx, name(names)));
         Ok(())
     }
 
@@ -232,10 +232,10 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
 
     fn append_defs(
         names: &mut ParamNames<'_>,
-        _cx: &DefCx<'_>,
+        cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        defs.push_output(Output::<T>::def(name(names)));
+        defs.push_output(Output::<T>::def(cx, name(names)));
         Ok(())
     }
 

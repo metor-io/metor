@@ -4,6 +4,7 @@ use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto_wkt::{LogEvent, LogLevel};
 
 use super::*;
+use crate::DefCx;
 use crate::port::{Input, ring_capacity};
 use crate::record::Record;
 use crate::tests::utils::{Imu, Nav, Recorder};
@@ -159,7 +160,7 @@ fn system_def_raw(ty: &str, cx: &DefCxOwned, buffer: &mut [u8]) -> (u32, usize) 
 
 #[test]
 fn test_configured_port_export() {
-    let producer = crate::Output::<Imu>::def("imu");
+    let producer = crate::Output::<Imu>::def(&DefCx::empty(), "imu");
     let cx = DefCxOwned {
         inputs: vec![("plant.imu".to_string(), producer)],
         ..DefCxOwned::default()

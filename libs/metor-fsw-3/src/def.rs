@@ -157,15 +157,15 @@ mod tests {
 
     #[test]
     fn test_record_port_lookup() {
-        let records = Records::of([Output::<Imu>::def("imu")].iter());
+        let records = Records::of([Output::<Imu>::def(&DefCx::empty(), "imu")].iter());
         let port = records.port("plant.imu", Imu::NAME).expect("known record");
         assert_eq!(port.name, "plant.imu");
-        assert_eq!(port.id, Output::<Imu>::def("imu").id);
+        assert_eq!(port.id, Output::<Imu>::def(&DefCx::empty(), "imu").id);
     }
 
     #[test]
     fn test_unknown_record_error() {
-        let records = Records::of([Output::<Imu>::def("imu")].iter());
+        let records = Records::of([Output::<Imu>::def(&DefCx::empty(), "imu")].iter());
         assert_eq!(
             records.port("out", Nav::NAME),
             Err(DefError::UnknownRecord {
@@ -177,9 +177,9 @@ mod tests {
 
     #[test]
     fn test_conflicting_record_definitions() {
-        let mut wide = Output::<Imu>::def("imu");
+        let mut wide = Output::<Imu>::def(&DefCx::empty(), "imu");
         wide.max_len += 8;
-        let records = Records::of([Output::<Imu>::def("imu"), wide].iter());
+        let records = Records::of([Output::<Imu>::def(&DefCx::empty(), "imu"), wide].iter());
         assert_eq!(
             records.port("out", Imu::NAME),
             Err(DefError::RecordConflict {

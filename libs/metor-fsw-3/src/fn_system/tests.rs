@@ -160,7 +160,10 @@ fn test_attribute_type_and_ports() {
     assert_eq!(<Probe<Imu>>::NAME, "probe");
     assert_eq!(
         static_def::<FnSystem<Gain>>().outputs,
-        vec![Output::<Imu>::def("imu"), Output::<LogEvent>::def("log")]
+        vec![
+            Output::<Imu>::def(&DefCx::empty(), "imu"),
+            Output::<LogEvent>::def(&DefCx::empty(), "log")
+        ]
     );
 }
 
@@ -168,10 +171,13 @@ fn test_attribute_type_and_ports() {
 fn test_port_parameter_order() {
     let def = static_def::<FnSystem<Doubler>>();
     assert_eq!(def.name, "doubler");
-    assert_eq!(def.inputs, vec![Input::<Imu>::def("imu")]);
+    assert_eq!(def.inputs, vec![Input::<Imu>::def(&DefCx::empty(), "imu")]);
     assert_eq!(
         def.outputs,
-        vec![Output::<Nav>::def("nav"), Output::<LogEvent>::def("log")]
+        vec![
+            Output::<Nav>::def(&DefCx::empty(), "nav"),
+            Output::<LogEvent>::def(&DefCx::empty(), "log")
+        ]
     );
     assert_eq!(static_inputs::<InSet<Summer>, _>().len(), 2);
     assert_eq!(static_outputs::<OutSet<Summer>>()[0].name, "sum");
@@ -316,7 +322,7 @@ fn test_pipeline_matches_trait() {
     coordinator.step(Timestamp(7));
     let nav = seen.borrow().expect("nav published");
     assert_eq!((nav.timestamp, nav.estimate), (Timestamp(7), 3.0));
-    assert_eq!(Nav::ID, Output::<Nav>::def("nav").id);
+    assert_eq!(Nav::ID, Output::<Nav>::def(&DefCx::empty(), "nav").id);
 }
 
 /// Logs one direct line and `lines` traced lines per cycle.
@@ -636,7 +642,10 @@ fn test_async_adapter_relay() {
         .register_async("relay", || Relay)
         .expect("valid records");
     let entry = table.get("relay").expect("registered");
-    assert_eq!(entry.def.inputs, vec![Input::<Imu>::def("imu")]);
+    assert_eq!(
+        entry.def.inputs,
+        vec![Input::<Imu>::def(&DefCx::empty(), "imu")]
+    );
 
     let (imu, nav, log) = (ring::<Imu>(), ring::<Nav>(), ring::<LogEvent>());
     let mut source = Output::<Imu, _>::try_new(imu.writer(NoWake).expect("free writer"))
@@ -694,12 +703,12 @@ fn test_dynamic_parameter_port_order() {
     }
 
     let def = static_def::<FnSystem<Link>>();
-    assert_eq!(def.inputs, vec![Input::<Imu>::def("imu")]);
+    assert_eq!(def.inputs, vec![Input::<Imu>::def(&DefCx::empty(), "imu")]);
 
-    let producer = Output::<Nav>::def("nav");
-    let declared = Output::<Imu>::def("imu");
+    let producer = Output::<Nav>::def(&DefCx::empty(), "nav");
+    let declared = Output::<Imu>::def(&DefCx::empty(), "imu");
     let edges = [("nav.nav", &producer), ("imu", &declared)];
-    let records = Records::of([Output::<Nav>::def("nav")].iter());
+    let records = Records::of([Output::<Nav>::def(&DefCx::empty(), "nav")].iter());
     let outputs = [crate::coordinator::OutputConfig {
         port: "sink".into(),
         record: Nav::NAME.into(),
@@ -732,8 +741,8 @@ fn test_reject_multiple_dynamic_producers() {
         }
     }
 
-    let first = Output::<Imu>::def("imu");
-    let second = Output::<Imu>::def("imu");
+    let first = Output::<Imu>::def(&DefCx::empty(), "imu");
+    let second = Output::<Imu>::def(&DefCx::empty(), "imu");
     let edges = [("plant.imu", &first), ("plant.imu", &second)];
     assert_eq!(
         FnSystem::<Tap>::def(&DefCx::of_inputs(&edges)),

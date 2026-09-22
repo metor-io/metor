@@ -21,7 +21,7 @@ use super::params::{ParamError, Params};
 use super::run::{Runner, Step};
 
 static STATUS: LazyLock<PortDef> =
-    LazyLock::new(|| crate::Output::<super::SystemStatus>::def("status"));
+    LazyLock::new(|| crate::Output::<super::SystemStatus>::def(&DefCx::empty(), "status"));
 
 /// Arguments for constructing a system using [`MakeFn`].
 pub struct MakeCx<'a> {
@@ -228,7 +228,7 @@ fn check_record(known: &PortDef, port: &PortDef) -> Result<(), BuildError> {
 
 fn same_record(a: &PortDef, b: &PortDef) -> bool {
     (a.id, a.max_len, a.alignment, a.depth) == (b.id, b.max_len, b.alignment, b.depth)
-        && a.schema == b.schema
+        && a.schema.same_record(&b.schema)
 }
 
 /// Builds one entry, binding the system's bundles from the rings' handles.
@@ -347,7 +347,7 @@ mod tests {
         let mut table = SystemTable::new();
         assert_eq!(record(&table, "status"), Some(STATUS.clone()));
         assert!(record(&table, "missing").is_none());
-        let first = Output::<Imu>::def("first");
+        let first = Output::<Imu>::def(&DefCx::empty(), "first");
         let mut second = first.clone();
         second.name = "second".into();
         table
@@ -377,17 +377,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_input_schemas() {
+    fn test_reject_record_layout_conflict() {
         let mut table = SystemTable::new();
-        let first = Output::<Imu>::def("imu");
+        let first = Output::<Imu>::def(&DefCx::empty(), "imu");
         table
             .insert("source", declared(vec![first.clone()]))
             .expect("first record");
         let mut changed = first;
-        let RecordSchema::Frame { metadata, .. } = &mut changed.schema else {
-            panic!("frame")
-        };
-        metadata[0].name = "imu.other".into();
+        changed.max_len += 8;
         let mut input = declared(Vec::new());
         input.def.inputs.push(changed);
         assert_eq!(
@@ -397,6 +394,25 @@ mod tests {
             })
         );
         assert!(table.get("sink").is_none());
+    }
+
+    /// A frame's vtable is its port's, so two ports of one frame announce
+    /// different names without disagreeing about the record.
+    #[test]
+    fn test_accept_frame_schema_per_port() {
+        let mut table = SystemTable::new();
+        let first = Output::<Imu>::def(&DefCx::empty(), "imu");
+        table
+            .insert("source", declared(vec![first.clone()]))
+            .expect("first record");
+        let mut input = declared(Vec::new());
+        input
+            .def
+            .inputs
+            .push(crate::Input::<Imu>::def(&DefCx::empty(), "other"));
+        assert_ne!(input.def.inputs[0].schema, first.schema);
+        table.insert("sink", input).expect("one record, two roots");
+        assert!(table.get("sink").is_some());
     }
 
     #[test]

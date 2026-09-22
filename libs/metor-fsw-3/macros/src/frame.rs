@@ -94,7 +94,7 @@ pub fn frame(input: TokenStream) -> TokenStream {
         ident: raw.ident,
         generics: raw.generics,
         fields,
-        parent: Some(frame_name.clone()),
+        parent: None,
         group: None,
     });
     let as_vtable = as_vtable_impl(&input, Some(frame_id), &fsw);
@@ -130,7 +130,10 @@ pub fn frame(input: TokenStream) -> TokenStream {
                 Some(#timestamp_body)
             }
             fn schema() -> #fsw::record::RecordSchema {
-                #fsw::record::RecordSchema::frame::<Self>()
+                #fsw::record::RecordSchema::frame::<Self>(Self::NAME)
+            }
+            fn schema_at(root: &str) -> #fsw::record::RecordSchema {
+                #fsw::record::RecordSchema::frame::<Self>(root)
             }
         }
 
