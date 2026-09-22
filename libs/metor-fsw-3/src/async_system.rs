@@ -91,14 +91,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_fresh_stop_is_unset() {
+    fn test_stop_initial_state() {
         let (handle, stop) = stop_pair();
         assert!(!stop.is_set());
         assert!(!handle.is_set());
     }
 
     #[stellarator::test]
-    async fn stop_resolves_once_set() {
+    async fn test_stop_resolves() {
         let (handle, stop) = stop_pair();
         handle.stop();
         assert!(stop.is_set());
@@ -106,7 +106,7 @@ mod tests {
     }
 
     #[stellarator::test]
-    async fn a_stop_set_from_another_thread_wakes_the_waiter() {
+    async fn test_stop_wakes_across_threads() {
         let (handle, stop) = stop_pair();
         std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(20));

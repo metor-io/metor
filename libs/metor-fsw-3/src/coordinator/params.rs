@@ -64,26 +64,26 @@ mod tests {
     }
 
     #[test]
-    fn null_decodes_as_defaults() {
+    fn test_null_params_use_defaults() {
         let gains: Gains = Params(&Value::Null).decode().expect("all defaulted");
         assert_eq!(gains, Gains { kp: 1.0, ki: 0.0 });
     }
 
     #[test]
-    fn values_override_defaults() {
+    fn test_params_override_defaults() {
         let value = json!({ "ki": 0.5 });
         let gains: Gains = Params(&value).decode().expect("valid");
         assert_eq!(gains, Gains { kp: 1.0, ki: 0.5 });
     }
 
     #[test]
-    fn a_missing_required_field_is_a_decode_error() {
+    fn test_reject_missing_required_field() {
         let err = Params(&Value::Null).decode::<Required>().unwrap_err();
         assert!(matches!(err, ParamError::Decode(ref m) if m.contains("seed")));
     }
 
     #[test]
-    fn an_unknown_key_is_named() {
+    fn test_unknown_key_error() {
         let value = json!({ "seed": 1, "sead": 2 });
         assert_eq!(
             Params(&value).decode::<Required>(),
@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn a_nested_unknown_key_carries_its_path() {
+    fn test_nested_unknown_key_path() {
         #[derive(Deserialize)]
         struct Outer {
             #[allow(dead_code)]

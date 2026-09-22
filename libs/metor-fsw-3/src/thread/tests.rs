@@ -10,7 +10,7 @@ use crate::coordinator::{ParamError, SystemConfig};
 use crate::tests::utils::{Recorder, table};
 
 #[test]
-fn a_mirror_copies_only_records_committed_before_the_drain() {
+fn test_mirror_drain_snapshot() {
     use core::cell::RefCell;
     use metor_fsw_3_ring::{Config, NoWake, RingBuffer, WakeSource, Writer};
 
@@ -95,7 +95,7 @@ fn step_until(coordinator: &mut Coordinator, mut done: impl FnMut() -> bool) -> 
 }
 
 #[test]
-fn an_async_system_relays_every_record_into_the_graph() {
+fn test_async_record_relay() {
     let recorder = Recorder::default();
     let config = CoordinatorConfig {
         systems: vec![
@@ -117,7 +117,7 @@ fn an_async_system_relays_every_record_into_the_graph() {
 }
 
 #[test]
-fn a_system_that_never_reads_drops_into_its_mirror_and_reports_it() {
+fn test_mirror_overflow_report() {
     let recorder = Recorder::default();
     let config = CoordinatorConfig {
         ring_depth: 2,
@@ -146,7 +146,7 @@ fn a_system_that_never_reads_drops_into_its_mirror_and_reports_it() {
 }
 
 #[test]
-fn a_mirror_too_large_for_a_region_is_a_param_error() {
+fn test_reject_oversize_mirror() {
     assert!(super::mirror_config(64).is_ok());
     // Four times a capacity no region can hold, and one that overflows.
     assert!(matches!(
@@ -168,7 +168,7 @@ fn kind(line: &metor_proto_wkt::LogEvent) -> Option<&str> {
 }
 
 #[test]
-fn a_panicked_task_latches_its_system_and_leaves_the_thread_running() {
+fn test_task_panic_isolation() {
     let recorder = Recorder::default();
     let config = CoordinatorConfig {
         systems: vec![
@@ -201,7 +201,7 @@ fn a_panicked_task_latches_its_system_and_leaves_the_thread_running() {
 }
 
 #[test]
-fn a_constructor_that_panics_names_its_system_and_frees_its_thread() {
+fn test_constructor_panic_cleanup() {
     let recorder = Recorder::default();
     let config = CoordinatorConfig {
         systems: vec![
@@ -226,7 +226,7 @@ fn a_constructor_that_panics_names_its_system_and_frees_its_thread() {
 }
 
 #[test]
-fn dropping_the_coordinator_joins_every_thread() {
+fn test_coordinator_drop_joins_threads() {
     let recorder = Recorder::default();
     let config = CoordinatorConfig {
         systems: vec![
@@ -245,7 +245,7 @@ fn dropping_the_coordinator_joins_every_thread() {
 }
 
 #[test]
-fn placement_shares_one_thread_and_honors_a_named_one() {
+fn test_thread_placement() {
     let recorder = Recorder::default();
     let config = CoordinatorConfig {
         systems: vec![
@@ -270,7 +270,7 @@ fn placement_shares_one_thread_and_honors_a_named_one() {
 }
 
 #[test]
-fn a_cyclic_system_cannot_be_placed_on_a_thread() {
+fn test_reject_cyclic_thread_placement() {
     let recorder = Recorder::default();
     let config = CoordinatorConfig {
         systems: vec![placed("imu", "imu", Some("io"))],

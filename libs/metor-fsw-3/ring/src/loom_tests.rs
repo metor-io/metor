@@ -8,9 +8,6 @@ const FRAME: usize = 48;
 
 const _: () = assert!(FRAME == frame_len(PAYLOAD));
 const _: () = assert!(CAP % FRAME != 0, "a gap would never form");
-// Two records do not fit in a lap, so the second one always wraps, and the
-// wrap costs `CAP - FRAME` bytes of gap on top of the record itself.
-const _: () = assert!(FRAME + (CAP - FRAME) <= CAP);
 
 fn payload(n: u8) -> [u8; PAYLOAD] {
     let mut p = [0u8; PAYLOAD];
@@ -30,7 +27,7 @@ fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
 }
 
 #[test]
-fn drain_snapshot_races_a_wrap_publication() {
+fn test_drain_snapshot_races_wrap() {
     loom::model(|| {
         let ring = ring(128, 1);
         let mut writer = ring.writer(NoWake).expect("writer");
@@ -60,7 +57,7 @@ fn drain_snapshot_races_a_wrap_publication() {
 }
 
 #[test]
-fn registration_races_backpressure() {
+fn test_registration_races_backpressure() {
     loom::model(|| {
         let ring = ring(CAP, 1);
         let mut w = ring.writer(NoWake).unwrap();
@@ -114,7 +111,7 @@ fn registration_races_backpressure() {
 }
 
 #[test]
-fn hwm_visible_before_committed() {
+fn test_wrap_marker_precedes_commit() {
     loom::model(|| {
         let ring = ring(CAP, 1);
         let mut w = ring.writer(NoWake).unwrap();
@@ -147,7 +144,7 @@ fn hwm_visible_before_committed() {
 }
 
 #[test]
-fn writer_claim_handoff() {
+fn test_writer_claim_handoff() {
     loom::model(|| {
         let a = ring(CAP, 1);
         let b = a.clone();
@@ -167,7 +164,7 @@ fn writer_claim_handoff() {
 }
 
 #[test]
-fn grant_pins_bytes() {
+fn test_grant_pins_bytes() {
     loom::model(|| {
         let ring = ring(CAP, 1);
         let mut w = ring.writer(NoWake).unwrap();
@@ -189,7 +186,7 @@ fn grant_pins_bytes() {
 }
 
 #[test]
-fn two_readers_slowest() {
+fn test_slowest_reader_backpressure() {
     loom::model(|| {
         let ring = ring(CAP, 2);
         let mut w = ring.writer(NoWake).unwrap();
@@ -229,7 +226,7 @@ fn two_readers_slowest() {
 }
 
 #[test]
-fn cursor_never_exceeds_committed_at_fits() {
+fn test_cursor_within_committed() {
     loom::model(|| {
         let ring = ring(CAP, 1);
         let mut w = ring.writer(NoWake).unwrap();
@@ -254,7 +251,7 @@ fn cursor_never_exceeds_committed_at_fits() {
 }
 
 #[test]
-fn registration_during_padding_publication() {
+fn test_registration_during_padding_publication() {
     loom::model(|| {
         let ring = ring(64, 1);
         let mut writer = ring.writer(NoWake).unwrap();
@@ -275,7 +272,7 @@ fn registration_during_padding_publication() {
 const DEAD_PID: u64 = 999_999_999;
 
 #[test]
-fn latest_races_padding_publication() {
+fn test_latest_races_padding_publication() {
     loom::model(|| {
         let ring = ring(64, 1);
         let mut reader = ring.view(NoWake).unwrap();
@@ -294,7 +291,7 @@ fn latest_races_padding_publication() {
 }
 
 #[test]
-fn reclaim_does_not_free_a_reused_slot() {
+fn test_reclaim_preserves_reused_slot() {
     loom::model(|| {
         let ring = ring(64, 1);
         let reader = ring.view(NoWake).unwrap();
@@ -315,7 +312,7 @@ fn reclaim_does_not_free_a_reused_slot() {
 }
 
 #[test]
-fn concurrent_reclaimers_do_not_free_a_new_owner() {
+fn test_concurrent_reclaim_preserves_new_owner() {
     loom::model(|| {
         let ring = ring(64, 1);
         ring.inner.slot(0).cursor.store(0, Release);

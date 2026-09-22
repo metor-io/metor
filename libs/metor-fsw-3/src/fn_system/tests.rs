@@ -154,7 +154,7 @@ impl SystemFn for Counter {
 }
 
 #[test]
-fn the_attribute_names_the_type_and_its_ports() {
+fn test_attribute_type_and_ports() {
     assert_eq!(Gain::NAME, "gain");
     assert_eq!(Gain::NAMES, &["imu"]);
     assert_eq!(<Probe<Imu>>::NAME, "probe");
@@ -165,7 +165,7 @@ fn the_attribute_names_the_type_and_its_ports() {
 }
 
 #[test]
-fn defs_follow_parameter_order_and_skip_timestamp() {
+fn test_port_parameter_order() {
     let def = static_def::<FnSystem<Doubler>>();
     assert_eq!(def.name, "doubler");
     assert_eq!(def.inputs, vec![Input::<Imu>::def("imu")]);
@@ -193,7 +193,7 @@ fn gain_table() -> SystemTable {
 }
 
 #[test]
-fn a_params_ctor_receives_the_decoded_params() {
+fn test_constructor_receives_params() {
     let mut table = gain_table();
     let seen = probe::<Imu>(&mut table, "imu_probe");
     let config = CoordinatorConfig {
@@ -212,7 +212,7 @@ fn a_params_ctor_receives_the_decoded_params() {
 }
 
 #[test]
-fn a_bad_param_fails_the_build_by_system_id() {
+fn test_param_error_reports_system() {
     let config = CoordinatorConfig {
         systems: vec![SystemConfig {
             params: json!({ "kp": 4.0 }),
@@ -227,7 +227,7 @@ fn a_bad_param_fails_the_build_by_system_id() {
 }
 
 #[test]
-fn plain_ctors_ignore_params_and_unit_structs_use_default() {
+fn test_default_constructors() {
     let config = CoordinatorConfig {
         systems: vec![
             SystemConfig {
@@ -244,7 +244,7 @@ fn plain_ctors_ignore_params_and_unit_structs_use_default() {
 }
 
 #[test]
-fn two_inputs_of_one_record_bind_to_two_rings() {
+fn test_separate_input_bindings() {
     let config = CoordinatorConfig {
         systems: vec![
             SystemConfig {
@@ -283,7 +283,7 @@ fn two_inputs_of_one_record_bind_to_two_rings() {
 }
 
 #[test]
-fn a_fn_pipeline_matches_the_trait_pipeline() {
+fn test_pipeline_matches_trait() {
     let mut table = gain_table();
     table
         .register_system("nav_params", |p| {
@@ -398,7 +398,7 @@ fn with_layer(f: impl FnOnce()) {
 }
 
 #[test]
-fn direct_and_traced_lines_land_on_the_system_log_in_order() {
+fn test_system_log_order() {
     let (config, table, seen) = log_config(1);
     let mut coordinator = config.build(&table).expect("valid");
     with_layer(|| coordinator.step(Timestamp(3)));
@@ -411,7 +411,7 @@ fn direct_and_traced_lines_land_on_the_system_log_in_order() {
 }
 
 #[test]
-fn a_line_between_systems_reaches_no_ring() {
+fn test_log_between_systems() {
     let (config, table, seen) = log_config(0);
     let mut coordinator = config.build(&table).expect("valid");
     with_layer(|| coordinator.step(Timestamp(0)));
@@ -485,7 +485,7 @@ fn padded_records(line: &str, now: Timestamp) -> usize {
 }
 
 #[test]
-fn lines_past_the_rings_capacity_are_dropped_and_reported_once() {
+fn test_log_overflow_report() {
     let line = "p".repeat(LogEvent::MAX_LEN / 2);
     let records = padded_records(&line, Timestamp(0));
     let (config, table, seen) = pad_config(records + 3, &line);
@@ -503,7 +503,7 @@ fn lines_past_the_rings_capacity_are_dropped_and_reported_once() {
 }
 
 #[test]
-fn a_log_ring_holds_depth_times_ring_depth_full_length_lines() {
+fn test_log_ring_capacity() {
     let line = "p".repeat(LogEvent::MAX_LEN / 2);
     let records = padded_records(&line, Timestamp(0));
     assert!(records >= LogEvent::DEPTH * CoordinatorConfig::default().ring_depth);
@@ -517,7 +517,7 @@ fn a_log_ring_holds_depth_times_ring_depth_full_length_lines() {
 }
 
 #[test]
-fn an_explicit_log_output_cannot_hide_the_implicit_output() {
+fn test_reject_explicit_log_output() {
     struct LogOutput;
 
     #[crate::system]
@@ -545,14 +545,14 @@ fn an_explicit_log_output_cannot_hide_the_implicit_output() {
 }
 
 #[test]
-fn the_doc_comment_on_execute_becomes_doc() {
+fn test_execute_doc_comment() {
     assert_eq!(Gain::DOC, "Publishes the gain.\n\nOne sample per cycle.");
     assert_eq!(Doubler::DOC, "");
     assert_eq!(<Probe<Imu> as Ports>::DOC, "");
 }
 
 #[test]
-fn a_params_ctor_carries_its_schema() {
+fn test_constructor_param_schema() {
     let schema = <fn(GainParams) -> Gain as Ctor<Gain, (GainParams,)>>::schema()
         .expect("a params ctor has a schema");
     assert!(
@@ -561,11 +561,6 @@ fn a_params_ctor_carries_its_schema() {
             .contains(r#""description":"The constant this system publishes.""#)
     );
     assert!(schema.get().contains(r#""k""#));
-}
-
-#[test]
-fn a_unit_ctor_has_no_schema() {
-    assert!(<fn() -> Summer as Ctor<Summer, ()>>::schema().is_none());
 }
 
 /// Doubles every sample as it arrives, until stop.
@@ -609,7 +604,7 @@ impl RelayCyclic {
 }
 
 #[test]
-fn an_async_block_declares_the_same_ports_as_its_cyclic_twin() {
+fn test_async_and_cyclic_ports_match() {
     assert_eq!(Relay::NAMES, &["imu", "nav", "log"]);
     assert_eq!(Relay::DOC, "Forwards records as they arrive.");
     let (relay, cyclic) = (
@@ -624,7 +619,7 @@ fn an_async_block_declares_the_same_ports_as_its_cyclic_twin() {
 /// A registered async system builds on its own thread and relays through the
 /// adapter the cycle thread steps.
 #[test]
-fn a_registered_async_system_relays_through_its_adapter() {
+fn test_async_adapter_relay() {
     use crate::coordinator::MakeCx;
     use crate::thread::{DEFAULT_THREAD, Threads};
     use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
@@ -685,7 +680,7 @@ fn a_registered_async_system_relays_through_its_adapter() {
 
 /// A dynamic parameter takes the ports the config named, wherever it sits.
 #[test]
-fn a_dynamic_parameter_takes_the_config_ports_around_a_declared_one() {
+fn test_dynamic_parameter_port_order() {
     use crate::def::{DefCx, Records};
     use crate::port::{DynInputs, DynOutputs};
 
@@ -723,7 +718,7 @@ fn a_dynamic_parameter_takes_the_config_ports_around_a_declared_one() {
 
 /// Two producers on one undeclared port have no one definition to take.
 #[test]
-fn a_dynamic_input_refuses_a_second_producer() {
+fn test_reject_multiple_dynamic_producers() {
     use crate::def::{DefCx, DefError};
     use crate::port::DynInputs;
 

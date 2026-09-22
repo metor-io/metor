@@ -184,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pipeline_flows_within_one_cycle() {
+    fn test_pipeline_single_cycle() {
         let recorder = Recorder::default();
         let mut coordinator = pipeline_config().build(&table(&recorder)).unwrap();
         coordinator.step(Timestamp(10));
@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn a_consumer_before_its_producer_reads_the_previous_cycle() {
+    fn test_consumer_reads_previous_cycle() {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         config.systems.swap(0, 1);
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn fan_in_takes_the_newer_producer() {
+    fn test_fan_in_selects_newest() {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         config.systems[1].inputs[0]
@@ -221,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn status_carries_the_cycle_and_a_rising_offset() {
+    fn test_status_cycle_and_offset() {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         watched(&mut config, &["imu", "nav"]);
@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[stellarator::test]
-    async fn run_stops_on_the_stop_future() {
+    async fn test_run_stop() {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         config.clock = Clock::Wall { rate: 10_000.0 };
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[stellarator::test]
-    async fn an_overrun_cycle_yields_instead_of_sleeping() {
+    async fn test_overrun_yields() {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         // A budget no cycle can meet, so every iteration takes the yield path.
@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[stellarator::test]
-    async fn a_simulated_clock_advances_by_dt() {
+    async fn test_simulated_clock_step() {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         config.clock = Clock::Simulated {
@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_coordinator_still_counts_cycles() {
+    fn test_empty_coordinator_cycles() {
         let mut coordinator = CoordinatorConfig::default()
             .build(&table(&Recorder::default()))
             .unwrap();
@@ -304,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn a_panic_latches_one_system_and_leaves_the_cycle_running() {
+    fn test_system_panic_isolation() {
         let recorder = Recorder::default();
         let mut coordinator = boom_config().build(&table(&recorder)).unwrap();
         coordinator.step(Timestamp(1));
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn a_panic_writes_one_fault_line_on_the_systems_log() {
+    fn test_panic_fault_log() {
         let recorder = Recorder::default();
         let mut coordinator = boom_config().build(&table(&recorder)).unwrap();
         coordinator.step(Timestamp(1));
@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn a_latched_system_keeps_reporting_a_zero_execution_time() {
+    fn test_latched_execution_time() {
         let recorder = Recorder::default();
         let mut coordinator = boom_config().build(&table(&recorder)).unwrap();
         for cycle in 1..=3 {
@@ -350,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn a_trait_path_panic_latches_with_nothing_written() {
+    fn test_trait_panic_without_log() {
         let recorder = Recorder::default();
         let mut config = CoordinatorConfig {
             systems: vec![SystemConfig::new("trap", "trap")],
@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_that_is_no_string_reads_as_panic() {
+    fn test_non_string_panic_payload() {
         struct Odd;
         impl Step for Odd {
             fn execute(&mut self, _now: Timestamp) {
@@ -380,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn catch_step_passes_a_clean_step_through() {
+    fn test_catch_step_success() {
         struct Clean(u64);
         impl Step for Clean {
             fn execute(&mut self, _now: Timestamp) {
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn a_simulated_timestamp_saturates_instead_of_wrapping() {
+    fn test_simulated_timestamp_saturation() {
         let far = simulated_time(Timestamp(i64::MAX), u64::MAX, Duration::from_secs(1));
         assert_eq!(far, Timestamp(i64::MAX));
         assert_eq!(

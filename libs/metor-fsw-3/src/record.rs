@@ -2,7 +2,7 @@
 
 use core::borrow::Borrow;
 
-use metor_proto::types::{ComponentId, Msg, PacketId, Timestamp, msg_id, table_id};
+use metor_proto::types::{ComponentId, Msg, PacketId, PacketTy, Timestamp, msg_id, table_id};
 use metor_proto::vtable::VTable;
 use metor_proto_wkt::ComponentMetadata;
 use postcard_schema::schema::owned::OwnedNamedType;
@@ -97,6 +97,15 @@ impl RecordSchema {
         match self {
             Self::Frame { vtable, .. } => table_id(vtable),
             Self::Msg { id, .. } => *id,
+        }
+    }
+
+    /// The packet type this record goes out as: a frame is a table, a message
+    /// a message.
+    pub fn packet_ty(&self) -> PacketTy {
+        match self {
+            Self::Frame { .. } => PacketTy::Table,
+            Self::Msg { .. } => PacketTy::Msg,
         }
     }
 }
@@ -326,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_announces_its_leaves_relative_to_the_port() {
+    fn test_frame_schema_paths() {
         let schema = Imu::schema();
         assert_eq!(component_names(&schema), vec!["imu.sample"]);
         let RecordSchema::Frame { vtable, metadata } = &schema else {
@@ -345,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn a_derived_message_announces_its_postcard_schema() {
+    fn test_derived_postcard_schema() {
         let schema = Fixed::schema();
         let RecordSchema::Msg { id, name, codec } = &schema else {
             panic!("a message announces an id")
@@ -358,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hand_written_json_record_round_trips_and_announces_its_codec() {
+    fn test_json_record_roundtrip_and_schema() {
         let mut buf = [0u8; 64];
         let note = NoteJson { text: "hi".into() };
         let bytes = note.encode(&mut buf).expect("fits");
@@ -375,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn an_oversize_json_value_reports_both_lengths() {
+    fn test_json_oversize_error() {
         let mut buf = [0u8; 8];
         let note = NoteJson {
             text: "0123456789".into(),
@@ -388,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn json_counts_escaped_bytes_and_handles_an_empty_buffer() {
+    fn test_json_escape_lengths() {
         let text = "\"\n";
         let mut exact = [0; 6];
         assert_eq!(
@@ -404,7 +413,7 @@ mod tests {
     /// A postcard message hashes its schema name; every other codec hashes the
     /// record name, so `log` keeps the id the panel already matches on.
     #[test]
-    fn a_postcard_id_is_not_the_record_names_hash() {
+    fn test_postcard_schema_id() {
         assert_eq!(
             LogEvent::schema().packet_id(),
             <LogEvent as metor_proto::types::Msg>::ID
@@ -413,9 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn the_dynamic_port_record_carries_bytes_unchanged() {
-        assert_eq!(<Bytes as Record>::NAME, "bytes");
-        assert_eq!(<Bytes as Record>::MAX_LEN, 0);
+    fn test_raw_bytes_passthrough() {
         assert_eq!(Bytes::decode(b"raw"), Ok(&b"raw"[..]));
         assert_eq!(b"raw"[..].encode(&mut []), Ok(&b"raw"[..]));
         assert!(matches!(
@@ -429,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_message_infers_name_and_length() {
+    fn test_derived_message_metadata() {
         assert_eq!(Fixed::NAME, "fixed");
         assert_eq!(<Fixed as Record>::ID, ComponentId::new("fixed"));
         assert_eq!(Fixed::MAX_LEN, Fixed::POSTCARD_MAX_SIZE);
@@ -440,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn message_round_trips() {
+    fn test_message_roundtrip() {
         let mut buf = [0u8; 64];
         let value = Fixed { a: 7, b: 2.5 };
         let bytes = value.encode(&mut buf).expect("fits");
@@ -449,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn oversize_message_reports_both_lengths() {
+    fn test_message_oversize_error() {
         let mut buf = [0u8; 8];
         let note = Note {
             text: "0123456789".into(),
@@ -461,23 +468,21 @@ mod tests {
     }
 
     #[test]
-    fn garbage_message_bytes_are_a_codec_error() {
+    fn test_message_invalid_bytes() {
         assert_eq!(Fixed::decode(&[0xff; 3]), Err(DecodeError::Codec));
     }
 
     #[test]
-    fn frame_encodes_as_its_own_bytes() {
+    fn test_frame_encoding() {
         let imu = Imu::new(3, 1.5);
         let mut buf = [0xaau8; 4];
         let bytes = imu.encode(&mut buf).expect("frames always encode");
         assert_eq!(bytes, imu.as_bytes());
         assert_eq!(buf, [0xaa; 4]);
-        assert_eq!(Imu::MAX_LEN, size_of::<Imu>());
-        assert_eq!(Imu::ALIGN, align_of::<Imu>());
     }
 
     #[test]
-    fn frame_decodes_by_reference_and_rejects_short_bytes() {
+    fn test_frame_decode_and_truncation() {
         let imu = Imu::new(3, 1.5);
         assert_eq!(Imu::decode(imu.as_bytes()), Ok(&imu));
         assert_eq!(

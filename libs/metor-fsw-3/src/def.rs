@@ -120,7 +120,7 @@ mod tests {
     use crate::{Output, Record};
 
     #[test]
-    fn a_known_record_is_returned_under_the_port_name() {
+    fn test_record_port_lookup() {
         let records = Records::of([Output::<Imu>::def("imu")].iter());
         let port = records.port("plant.imu", Imu::NAME).expect("known record");
         assert_eq!(port.name, "plant.imu");
@@ -128,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_record_names_the_port_that_wanted_it() {
+    fn test_unknown_record_error() {
         let records = Records::of([Output::<Imu>::def("imu")].iter());
         assert_eq!(
             records.port("out", Nav::NAME),
@@ -140,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn two_declarations_of_one_record_disagreeing_is_a_conflict() {
+    fn test_conflicting_record_definitions() {
         let mut wide = Output::<Imu>::def("imu");
         wide.max_len += 8;
         let records = Records::of([Output::<Imu>::def("imu"), wide].iter());
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn the_empty_context_knows_nothing() {
+    fn test_empty_context() {
         let cx = DefCx::empty();
         assert!(cx.inputs.is_empty() && cx.outputs.is_empty());
         assert!(cx.records.port("out", "imu").is_err());

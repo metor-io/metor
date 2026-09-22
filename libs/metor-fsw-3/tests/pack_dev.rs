@@ -17,7 +17,7 @@ fn root() -> PathBuf {
 const GOLDEN: &str = include_str!("golden/echo_pack.py");
 
 #[test]
-fn the_fixtures_module_is_the_golden() {
+fn test_fixture_matches_golden_module() {
     let built = cargo_build("echo-pack", &root(), false).expect("the fixture builds");
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
     let pack = unsafe { Pack::open(&built) }.expect("it opens");
@@ -35,7 +35,7 @@ fn the_fixtures_module_is_the_golden() {
 }
 
 #[test]
-fn the_golden_module_type_checks() {
+fn test_golden_module_type_checks() {
     let Some(pyright) = pyright() else {
         println!("skipped: neither `pyright` nor `uvx` is on PATH");
         return;
@@ -80,7 +80,7 @@ fn pyright() -> Option<Vec<String>> {
 }
 
 #[test]
-fn pack_dev_lays_out_the_module_and_replaces_the_dylib() {
+fn test_pack_dev_installs_module_and_library() {
     let root = root();
     let config = PackConfig::read(&root).expect("the fixture names its pack");
     assert_eq!(config.id, "echo");
@@ -136,7 +136,7 @@ fn run_pack_dev(root: &Path) {
 }
 
 #[test]
-fn pack_dev_rejects_a_loaded_destination_without_changing_files() {
+fn test_pack_dev_rejects_loaded_destination() {
     let built = cargo_build("echo-pack", &root(), false).expect("fixture builds");
     let temp = tempfile::tempdir().expect("temporary staging root");
     for name in ["pyproject.toml", "Cargo.toml"] {

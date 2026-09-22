@@ -73,12 +73,12 @@ mod tests {
     }
 
     #[test]
-    fn a_fallible_constructor_decodes_then_builds() {
+    fn test_fallible_constructor() {
         assert_eq!(ctor(&json!({ "port": 7 })), Ok(7));
     }
 
     #[test]
-    fn a_refused_build_reports_the_constructors_error() {
+    fn test_constructor_error() {
         assert_eq!(
             ctor(&json!({ "port": 0 })),
             Err(ParamError::Decode("port zero".into()))
@@ -86,7 +86,7 @@ mod tests {
     }
 
     #[test]
-    fn params_that_do_not_decode_never_reach_the_constructor() {
+    fn test_invalid_params_skip_constructor() {
         assert!(matches!(
             ctor(&json!({ "port": "eight" })),
             Err(ParamError::Decode(_))

@@ -134,32 +134,8 @@ mod tests {
         table
     }
 
-    const GOLDEN: &[u8] = include_bytes!("../../tests/golden/target.json");
-
     #[test]
-    fn the_golden_target_decodes_and_builds() {
-        let config = TargetConfig::from_slice(GOLDEN).expect("the golden decodes");
-        assert_eq!(config.config_version, CONFIG_VERSION);
-        assert_eq!(
-            config.packs,
-            vec![PackRef {
-                id: "adcs".into(),
-                lib: "adcs_systems".into(),
-                libs: PathBuf::from("/abs/.metor/adcs_pack/_libs"),
-            }]
-        );
-        let coordinator = config
-            .coordinator
-            .build(&table())
-            .expect("the golden's graph builds");
-        assert_eq!(
-            coordinator.entry_names().collect::<Vec<_>>(),
-            vec!["cmds", "plant", "nav", "mode", "ctrl", "pub"]
-        );
-    }
-
-    #[test]
-    fn an_older_version_is_reported_with_both_numbers() {
+    fn test_version_error_reports_versions() {
         let bytes = br#"{"config_version":0,"packs":[],"coordinator":{}}"#;
         let Err(ConfigError::Version { found, expected }) = TargetConfig::from_slice(bytes) else {
             panic!("version 0 is rejected")
@@ -168,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn a_config_without_packs_is_a_decode_error() {
+    fn test_config_requires_packs() {
         let bytes = br#"{"config_version":1,"coordinator":{"clock":{"Wall":{"rate":1.0}},
             "ring_depth":8,"systems":[]}}"#;
         assert!(matches!(

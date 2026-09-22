@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn a_constructor_that_panics_is_a_param_error_its_group_outlives() {
+    fn test_group_survives_constructor_panic() {
         let group = spawn("ctor").expect("a thread");
         let Err(ParamError::Decode(message)) = group.add(member(Box::new(PanicCtor))) else {
             panic!("a panicking constructor is a param error")
@@ -268,7 +268,7 @@ mod tests {
     /// The wake this slice rests on: a ring write on this thread must wake a
     /// task parked on an executor of its own.
     #[test]
-    fn a_write_here_wakes_a_task_on_a_spawned_executor() {
+    fn test_write_wakes_executor() {
         let wake = Notifier::default();
         let ring = RingBuffer::create_in_memory(Config {
             capacity: ring_capacity(Imu::MAX_LEN, 4).expect("valid capacity"),

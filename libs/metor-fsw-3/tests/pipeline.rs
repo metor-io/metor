@@ -210,7 +210,7 @@ impl Future for AfterCycles {
 }
 
 #[test]
-fn ten_cycles_of_the_pipeline() {
+fn test_pipeline_ten_cycles() {
     let report = Rc::new(RefCell::new(Report::default()));
     let mut coordinator = config().build(&table(&report)).expect("valid config");
     // Three outputs, three fn-system logs, four status rings.

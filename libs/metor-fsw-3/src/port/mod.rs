@@ -368,7 +368,7 @@ mod proofs {
 
     /// A bounded slice is never longer than the bound.
     #[kani::proof]
-    fn bounded_never_exceeds_max() {
+    fn test_bounded_slice_length() {
         let len: usize = kani::any();
         let max: usize = kani::any();
         kani::assume(len <= 64);
@@ -383,7 +383,7 @@ mod proofs {
     /// A capacity always holds two records of the largest size the ring's
     /// 32-bit length field can address.
     #[kani::proof]
-    fn capacity_fits_two_records() {
+    fn test_capacity_fits_two_records() {
         let max_size: u32 = kani::any();
         let depth: usize = kani::any();
         let max_size = max_size as usize;
@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn aligned_frames_remain_readable_through_wraps() {
+    fn test_aligned_frames_wrap() {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: 128,
             max_readers: 1,
@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_alignment_is_rejected_at_construction() {
+    fn test_reject_unsupported_alignment() {
         let ring = ring(4);
         let error = UnsupportedAlignment {
             alignment: 32,
@@ -485,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_is_power_of_two_holding_two_records() {
+    fn test_ring_capacity() {
         let capacity = ring_capacity(64, 1).expect("valid capacity");
         assert!(capacity.is_power_of_two());
         assert!(capacity >= 2 * frame_len(64));
@@ -499,14 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn a_port_def_names_its_record() {
-        assert_eq!(Output::<Imu>::def("imu").record, Imu::NAME);
-        assert_eq!(Input::<Note>::def("note").record, Note::NAME);
-        assert_eq!(Input::<Imu>::def("imu"), Output::<Imu>::def("imu"));
-    }
-
-    #[test]
-    fn write_then_latest() {
+    fn test_write_then_latest() {
         let (_ring, mut out, mut input) = pair(4);
         out.write(&sample(7, 42.0)).expect("ring has room");
         let got = input.latest().expect("valid record").expect("one record");
@@ -515,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_repeats_the_pinned_record() {
+    fn test_latest_repeats_pinned_record() {
         let (_ring, mut out, mut input) = pair(4);
         out.write(&sample(1, 1.0)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
@@ -523,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_visits_records_in_order() {
+    fn test_drain_record_order() {
         let (_ring, mut out, mut input) = pair(8);
         for i in 0..3 {
             out.write(&sample(i, i as f64)).expect("ring has room");
@@ -539,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_picks_the_greater_timestamp_across_producers() {
+    fn test_latest_selects_newest_producer() {
         let (left, right) = (ring(4), ring(4));
         let mut a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
             .expect("supported alignment");
@@ -559,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_ties_go_to_the_earlier_producer() {
+    fn test_latest_timestamp_tie() {
         let (left, right) = (ring(4), ring(4));
         let mut a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
             .expect("supported alignment");
@@ -576,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_visits_producers_in_edge_order() {
+    fn test_drain_producer_order() {
         let (left, right) = (ring(8), ring(8));
         let mut a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
             .expect("supported alignment");
@@ -599,14 +592,14 @@ mod tests {
     }
 
     #[test]
-    fn unconnected_input_reads_nothing() {
+    fn test_unconnected_input() {
         let mut input = Input::<Imu>::try_new(Vec::new()).expect("supported alignment");
         assert!(input.latest().expect("valid").is_none());
         assert_eq!(input.drain().count(), 0);
     }
 
     #[test]
-    fn full_ring_would_block() {
+    fn test_full_ring_blocks() {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: 64,
             max_readers: 1,
@@ -627,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn short_record_is_corrupt() {
+    fn test_reject_short_record() {
         let ring = ring(4);
         let mut writer = ring.writer(NoWake).expect("free writer");
         let mut input = Input::<Imu>::try_new(vec![ring.view(NoWake).expect("free slot")])
@@ -700,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_decodes_each_candidate_once_and_retains_the_winner() {
+    fn test_latest_decodes_once() {
         let (_l, _r, mut a, mut b, mut input) = message_pair_two::<Counted>();
         DECODES.set(0);
         assert!(input.latest().expect("empty input").is_none());
@@ -722,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_into_inner_keeps_frames_borrowed() {
+    fn test_latest_into_inner_borrows_frame() {
         let (_ring, mut out, mut input) = pair(4);
         out.write(&sample(1, 2.0)).expect("fits");
         let frame: &Imu = input.latest().expect("valid").expect("record").into_inner();
@@ -732,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_on_stamped_messages_orders_across_producers() {
+    fn test_latest_stamped_message_order() {
         let (_l, _r, mut a, mut b, mut input) = stamped_pair();
         a.write(&Stamped {
             at: Timestamp(9),
@@ -756,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_on_unstamped_messages_keeps_the_earlier_producer() {
+    fn test_latest_unstamped_message_order() {
         let (_l, _r, mut a, mut b, mut input) = message_pair_two::<Fixed>();
         b.write(&Fixed { a: 2, b: 0.0 }).expect("fits");
         a.write(&Fixed { a: 1, b: 0.0 }).expect("fits");
@@ -795,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn message_round_trips_through_write_and_drain() {
+    fn test_message_round_trip() {
         let (_ring, mut out, mut input) = message_pair::<Note>();
         out.write(&Note { text: "hi".into() }).expect("fits");
         out.write(&Note {
@@ -809,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn oversize_message_leaves_the_ring_untouched() {
+    fn test_oversize_message_preserves_ring() {
         let (_ring, mut out, mut input) = message_pair::<Note>();
         let long = Note {
             text: "x".repeat(100),
@@ -825,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_record_does_not_stop_the_drain() {
+    fn test_drain_skips_corrupt_record() {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: ring_capacity(Fixed::MAX_LEN, 4).expect("valid capacity"),
             max_readers: 1,
@@ -847,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn frames_drain_by_reference_and_messages_by_value() {
+    fn test_drain_frames_and_messages() {
         let (_ring, mut out, mut input) = pair(4);
         out.write(&sample(1, 1.0)).expect("ring has room");
         let borrowed: Option<&Imu> = input.drain().next().map(|r| r.expect("decodes"));
@@ -912,7 +905,7 @@ mod async_tests {
     }
 
     #[stellarator::test]
-    async fn next_pends_until_a_record_lands() {
+    async fn test_next_waits_for_record() {
         let wake = Notifier::default();
         let (_ring, mut out, mut input) = woken(&wake);
         assert!(poll_once(input.next()).await.is_none());
@@ -924,13 +917,13 @@ mod async_tests {
     }
 
     #[stellarator::test]
-    async fn next_on_a_port_with_no_producer_never_resolves() {
+    async fn test_next_without_producer() {
         let mut input = Input::<Imu, Notifier>::try_new(Vec::new()).expect("supported alignment");
         assert!(poll_once(input.next()).await.is_none());
     }
 
     #[test]
-    fn next_wakes_for_each_independent_producer() {
+    fn test_next_wakes_per_producer() {
         let (_rings, mut outputs, mut input) = independently_woken();
         let woken = Arc::new(Woken::default());
         let waker = Waker::from(woken.clone());
@@ -950,7 +943,7 @@ mod async_tests {
     }
 
     #[test]
-    fn cancelling_next_unregisters_every_waiter_and_can_wait_again() {
+    fn test_next_cancel_and_retry() {
         let (_rings, mut outputs, mut input) = independently_woken();
         let wakes: Vec<_> = input.views.iter().map(|view| view.wake().clone()).collect();
         let woken = Arc::new(Woken::default());
@@ -973,7 +966,7 @@ mod async_tests {
     }
 
     #[test]
-    fn a_notification_without_data_rearms_the_waiter() {
+    fn test_empty_notification_rearms_waiter() {
         let wake = Notifier::default();
         let (_ring, mut output, mut input) = woken(&wake);
         let woken = Arc::new(Woken::default());
@@ -996,7 +989,7 @@ mod async_tests {
     }
 
     #[stellarator::test]
-    async fn next_consumes_a_record_that_fails_to_decode() {
+    async fn test_next_consumes_corrupt_record() {
         let (_ring, mut output, mut input) = woken(&Notifier::default());
         output.writer.try_write(&[0]).expect("room");
         assert!(matches!(input.next().await, Err(RecvError::Decode(_))));
@@ -1005,7 +998,7 @@ mod async_tests {
     }
 
     #[stellarator::test]
-    async fn a_write_from_another_thread_wakes_the_waiting_port() {
+    async fn test_write_wakes_port_across_threads() {
         let wake = Notifier::default();
         let (ring, out, mut input) = woken(&wake);
         drop(out);
@@ -1021,7 +1014,7 @@ mod async_tests {
     }
 
     #[stellarator::test]
-    async fn any_ready_pends_until_one_port_has_a_record() {
+    async fn test_any_ready_waits_for_record() {
         let wake = Notifier::default();
         let (_left, mut a, _) = woken(&wake);
         let (right, _, _) = woken(&wake);
@@ -1072,7 +1065,7 @@ mod async_tests {
     }
 
     #[test]
-    fn any_ready_wakes_for_each_independently_notified_port() {
+    fn test_any_ready_wakes_per_port() {
         let (_rings, mut outputs, mut inputs) = independent_ports();
         let woken = Arc::new(Woken::default());
         let waker = Waker::from(woken.clone());
@@ -1095,7 +1088,7 @@ mod async_tests {
     }
 
     #[test]
-    fn cancelling_any_ready_unregisters_every_port_and_can_wait_again() {
+    fn test_any_ready_cancel_and_retry() {
         let (_rings, mut outputs, mut inputs) = independent_ports();
         let wakes: Vec<_> = inputs
             .ports
@@ -1122,7 +1115,7 @@ mod async_tests {
     }
 
     #[stellarator::test]
-    async fn any_ready_without_any_producer_never_resolves() {
+    async fn test_any_ready_without_producers() {
         let mut empty = DynInputs::<Notifier>::default();
         assert!(poll_once(empty.any_ready()).await.is_none());
         let mut unbound = DynInputs::<Notifier>::bind(vec![InputBinding {

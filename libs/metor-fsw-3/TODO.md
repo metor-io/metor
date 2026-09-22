@@ -51,13 +51,35 @@ fixed by metor-panel and metor-db, so it is reproduced, not designed.
   are designed in `05-links.md` and held until two systems must hold
   one socket (bi-directional commanding on one port).
 
-- Link loops: `publish.rs` and `subscribe.rs` repeat the `Event` enum,
-  `next()`, and the prune/re-arm tail, and their params repeat four fields;
-  fold them into one helper in `conn.rs` when a third link arrives.
+- Link loops: `publish.rs` and `subscribe.rs` repeat the readiness race
+  and the status tail, and their params repeat four fields; fold them
+  into one helper in `conn.rs` when a third link arrives.
 
 - Message ids: postcard messages hash the schema name, other codecs the
   record name. Unify in metor-proto-wkt (the panel's matchers depend on
   the current ids), then drop `Msg::ID` from the `Record` derive.
+
+- Qualified frame schemas: a frame port's `schema` is built from the type
+  alone, with leaves `{record}.{field}`, and `Publish` re-roots it on the
+  host by patching the vtable's id blobs (`wire::reroot`), since a
+  `PortDef` crosses the pack ABI as data. Build it qualified at `def`
+  time instead: `DefCx` gains the instance id and the namespace, which
+  moves from a link param to target config, and `RecordSchema::frame`
+  takes a root and builds through `vtable_fields(path)`. Then `reroot`,
+  `rename`, and `leaf_ids` go, frame identity in `same_record` and the
+  `Records` conflict check rests on record name, id, length, alignment,
+  and depth rather than the schema, an input port carries no frame
+  schema of its own, and slice 7 reads a peer's table id off its def.
+  The `def` export's context payload changes shape, so ABI 6.
+
+- Connection buffers: `Connections::open` allocates a connection's three
+  buffers (outbox, in-flight write, receive) because a closed connection
+  ends by cancellation, and a completion-style read or write dropped
+  mid-flight takes its buffer with it. Reuse them so a connection allocates
+  nothing: both halves watch a close flag and return their buffers as the
+  task's output, and `prune` joins the task before the slot is free. A
+  write stuck on a silent peer then holds its slot until TCP gives up,
+  which needs a bound.
 
 ## 5. Sequences and slots
 

@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_defs_match_hand_written() {
+    fn test_derived_port_definitions() {
         assert_eq!(
             static_inputs::<DerivedIn, _>(),
             static_inputs::<HandIn, _>()
@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn system_def_collects_both_bundles() {
+    fn test_system_input_output_definitions() {
         let def = SystemDef::new::<DerivedIn, DerivedOut>("nav", &DefCx::empty())
             .expect("a static definition");
         assert_eq!(def.name, "nav");
@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_bundles_are_empty() {
+    fn test_unit_bundles_empty() {
         assert!(static_inputs::<(), NoWake>().is_empty());
         assert!(static_outputs::<()>().is_empty());
         <() as SystemInputs>::bind(Vec::new());
@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_follows_field_order() {
+    fn test_bind_field_order() {
         let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
         let mut bound = DerivedIn::bind(bound_in(vec![
             (Input::<Imu>::def("imu"), vec![&imu]),
@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn hand_written_bundle_binds_like_the_derive() {
+    fn test_manual_bundle_binding() {
         let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
         let mut out = DerivedOut::bind(bound_out(vec![(Output::<Nav>::def("nav"), &nav)]));
         let mut bound = HandIn::bind(bound_in(vec![
@@ -298,12 +298,12 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "DerivedIn::defs()")]
-    fn bind_with_wrong_length_panics() {
+    fn test_bind_wrong_length_panics() {
         let _ = DerivedIn::bind(bound_in(vec![(Input::<Imu>::def("imu"), Vec::new())]));
     }
 
     #[test]
-    fn a_dynamic_bundle_takes_its_ports_from_the_config_and_binds_them() {
+    fn test_dynamic_bundle_configuration() {
         use crate::port::{DynInputs, DynOutputs};
 
         let def = SystemDef::new::<DynInputs, DynOutputs>("link", &DefCx::empty())

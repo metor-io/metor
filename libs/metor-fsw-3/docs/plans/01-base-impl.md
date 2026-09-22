@@ -69,7 +69,7 @@ Tests: write then latest; latest twice with no new data returns the same
 record; drain order on one producer; fan-in latest picks the greater
 timestamp across two producers; zero producers drains nothing and latest
 is `None`; a full ring returns `WouldBlock`; a truncated record is
-`Corrupt`. Kani harness `capacity_fits_two_records` under `#[cfg(kani)]`.
+`Corrupt`. Kani harness `test_capacity_fits_two_records` under `#[cfg(kani)]`.
 
 ## T4. Systems
 

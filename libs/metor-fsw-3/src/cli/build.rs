@@ -195,7 +195,7 @@ mod tests {
         "filenames":["/t/libecho_pack.dylib"]}"#;
 
     #[test]
-    fn the_cdylib_comes_from_the_artifact_line() {
+    fn test_parse_cdylib_artifact() {
         let stdout = format!(
             "{{\"reason\":\"compiler-message\"}}\n{}\n",
             ARTIFACT.replace('\n', "")
@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn an_rlib_only_artifact_is_no_cdylib() {
+    fn test_skip_rlib_artifact() {
         let line = r#"{"reason":"compiler-artifact",
             "target":{"name":"metor_fsw_3","kind":["lib"]},
             "filenames":["/t/libmetor_fsw_3.rlib"]}"#
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn noise_that_is_no_json_is_skipped() {
+    fn test_skip_non_json_output() {
         assert_eq!(cdylib(b"warning: something\n"), None);
         assert_eq!(cdylib(b""), None);
     }
@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn a_minimal_pyproject_takes_every_default_from_cargo() {
+    fn test_pyproject_defaults_from_cargo() {
         let dir = root(
             "[project]\nname = \"adcs-pack\"\n",
             "[package]\nname = \"adcs-systems\"\n",
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_pyproject_overrides_every_field() {
+    fn test_pyproject_overrides_defaults() {
         let dir = root(
             "[project]\nname = \"adcs-pack\"\n\n[tool.metor.pack]\n\
              id = \"adcs\"\ncrate = \"adcs\"\nlib = \"adcs_dylib\"\nmodule = \"adcs_mod\"\n",
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cargo_lib_name_beats_the_crates_and_a_missing_project_is_an_error() {
+    fn test_cargo_library_override_and_missing_project() {
         let dir = root(
             "[project]\nname = \"adcs-pack\"\n",
             "[package]\nname = \"adcs\"\n\n[lib]\nname = \"adcs_systems\"\n",
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_atomic_replaces_a_file_and_leaves_no_temp_behind() {
+    fn test_copy_atomic_replaces_file() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let (src, dst) = (dir.path().join("src"), dir.path().join("dst"));
         std::fs::write(&src, b"new").expect("writes");
@@ -304,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn the_triple_and_the_cdylib_name_are_this_hosts() {
+    fn test_host_artifact_names() {
         let triple = triple();
         assert!(triple.starts_with(std::env::consts::ARCH), "{triple}");
         assert_eq!(triple.split('-').count(), 3, "{triple}");

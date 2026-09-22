@@ -21,7 +21,7 @@ Their assertions apply only within their stated assumptions and bounds.
 The stack region avoids modeling heap growth; the production ring operations
 still run, including attachment and header validation.
 
-`fits_checked_arithmetic_outside_precondition` checks that invalid cursor order
+`fits_checked_cursor_arithmetic` checks that invalid cursor order
 produces overflow or a failed fit under checked arithmetic. It does **not**
 prove that a release build rejects such inputs: wrapping addition can report a
 successful fit. The protocol must establish the cursor-order precondition.

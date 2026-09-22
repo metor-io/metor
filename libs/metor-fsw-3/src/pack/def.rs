@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn from_table_lists_systems_in_registration_order() {
+    fn test_system_registration_order() {
         let table = table(&Recorder::default());
         let def = decoded(&table);
         let types: Vec<_> = def.systems.iter().map(|s| s.ty.as_str()).collect();
@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn decoded_names_outlive_the_source_buffer() {
+    fn test_decoded_names_are_owned() {
         let def = decoded(&table(&Recorder::default()));
         let system = &def.systems[0];
         assert_eq!(system.ty, "imu");
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn a_doc_with_an_escape_decodes_as_owned() {
+    fn test_escaped_doc_decoding() {
         let bytes: &'static [u8] = br#"{"systems":[{"ty":"nav",
             "def":{"name":"nav","inputs":[],"outputs":[]},
             "doc":"one\ntwo","params":{"type":"object"}}]}"#;
@@ -197,7 +197,7 @@ mod tests {
 
     /// Every port announces, so the ground needs nothing but the descriptor.
     #[test]
-    fn every_port_carries_its_schema_across_the_descriptor() {
+    fn test_descriptor_port_schemas() {
         use crate::Record;
         use crate::record::{MsgCodec, RecordSchema};
         use crate::tests::utils::Imu;
@@ -220,7 +220,7 @@ mod tests {
 
     /// The descriptor says which types take the ports a config lists.
     #[test]
-    fn the_probe_finds_the_types_that_take_config_ports() {
+    fn test_configurable_port_flags() {
         let def = decoded(&table(&Recorder::default()));
         let takes = |ty: &str| {
             let system = def.systems.iter().find(|s| s.ty == ty).expect("registered");
@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_table_has_no_systems() {
+    fn test_empty_table_serialization() {
         let def = PackDef::from_table(&SystemTable::new());
         assert_eq!(
             serde_json::to_vec(&def).expect("encodes"),
@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_bytes_do_not_decode() {
+    fn test_truncated_descriptor() {
         assert!(serde_json::from_slice::<PackDef>(b"{\"systems\":").is_err());
     }
 }

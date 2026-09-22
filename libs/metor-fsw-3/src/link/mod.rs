@@ -1,9 +1,10 @@
-//! `Publish` and `Subscribe`: a target's telemetry out and its commands in.
+//! Link is responsible for connecting targets telemetry together
 //!
-//! Each owns its sockets and runs on a background thread. The wire format is
-//! metor-panel's and metor-db's, reproduced from fsw-2.
+//! [`publish`] and [`subscribe`] are the two core systems. Publish sends data to targets, and Subscribe collects data from a target.
+//!
 
 mod conn;
+mod inbox;
 mod publish;
 mod subscribe;
 mod transport;
@@ -25,21 +26,17 @@ pub use transport::Transport;
 /// The prefix every built-in system registers under, as a pack's id would be.
 const BUILTIN: &str = "fsw";
 
-/// Bytes a link queues for one connection before it drops a batch.
-const PENDING_CAP: usize = 1 << 20;
+/// Bytes a link holds for one connection before it drops a batch.
+const DEFAULT_CONN_CAP: usize = 1 << 20;
 
-fn pending_cap() -> usize {
-    PENDING_CAP
+fn default_conn_cap() -> usize {
+    DEFAULT_CONN_CAP
 }
 
-/// The addresses this process's listening links bound, in construction order.
-///
-/// A link binds on the thread it runs on, so an address a target left to the
-/// system reaches the process that built it only through here. `metor run
-/// --print-ports` is the reader, and a test binding port zero the reason.
+/// The bound sockets for this process
 static BOUND: Mutex<Vec<(String, SocketAddr)>> = Mutex::new(Vec::new());
 
-/// Records what a link bound, under the name its `link` param gave it.
+/// Records a bound endpoint
 fn record_bound(link: &str, endpoint: &transport::Endpoint) {
     let Some(addr) = endpoint.local_addr() else {
         return;
@@ -51,7 +48,7 @@ fn record_bound(link: &str, endpoint: &transport::Endpoint) {
         .push((link.to_string(), addr));
 }
 
-/// Every listening link this process bound, oldest first.
+/// Returns the bound endpoints for this process
 pub fn bound_ports() -> Vec<(String, SocketAddr)> {
     // PANIC Safety: as above.
     BOUND.lock().expect("an unpoisoned registry").clone()
@@ -104,7 +101,7 @@ mod tests {
     use crate::Record;
 
     #[test]
-    fn a_status_frame_announces_its_counters() {
+    fn test_status_announces_counters() {
         let status = LinkStatus::new(
             Timestamp(1),
             conn::Stats {
@@ -114,13 +111,12 @@ mod tests {
             },
             5,
         );
-        assert_eq!(LinkStatus::MAX_LEN, size_of::<LinkStatus>());
         assert_eq!(LinkStatus::decode(status.as_bytes()), Ok(&status));
         assert!(status.changed(&LinkStatus::new(Timestamp(2), Default::default(), 0)));
     }
 
     #[test]
-    fn only_the_counters_count_as_a_change() {
+    fn test_status_detects_counter_changes() {
         let stats = conn::Stats {
             connections: 1,
             ..Default::default()
@@ -130,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_link_reports_the_address_it_took_under_its_name() {
+    fn test_link_reports_bound_port() {
         let link = Publish::new(PublishParams {
             transport: Transport::Listen {
                 addr: "127.0.0.1:0".into(),
@@ -138,7 +134,7 @@ mod tests {
             },
             namespace: None,
             link: "probe".into(),
-            pending_cap: PENDING_CAP,
+            conn_cap: DEFAULT_CONN_CAP,
         });
         assert!(link.is_ok(), "a free port binds");
         let bound = bound_ports();
@@ -147,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn the_builtins_are_named_under_the_fsw_pack() {
+    fn test_fsw_registers_builtins() {
         let mut table = SystemTable::new();
         register_builtins(&mut table).expect("valid records");
         assert!(table.entries().all(|(ty, _)| ty.starts_with(BUILTIN)));

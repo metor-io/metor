@@ -15,7 +15,7 @@ from ._target import Target
 PACK = Pack(id="fsw", lib="", libs="", abi_version=ABI_VERSION)
 
 MAX_CONNECTIONS = 8
-PENDING_CAP = 1 << 20
+CONN_CAP = 1 << 20
 INBOUND_CAP = 256
 
 
@@ -38,7 +38,7 @@ class Publish(System):
         listen: str | None = None,
         connect: str | None = None,
         max_connections: int | None = None,
-        pending_cap: int = PENDING_CAP,
+        conn_cap: int = CONN_CAP,
         all: bool = False,
     ) -> None:
         super().__init__(
@@ -47,7 +47,7 @@ class Publish(System):
                 "transport": _transport(listen, connect, max_connections),
                 "namespace": None,
                 "link": "",
-                "pending_cap": pending_cap,
+                "conn_cap": conn_cap,
             },
             items=items,
         )
@@ -79,7 +79,7 @@ class Subscribe(System):
         listen: str | None = None,
         connect: str | None = None,
         max_connections: int | None = None,
-        pending_cap: int = PENDING_CAP,
+        conn_cap: int = CONN_CAP,
         inbound_cap: int = INBOUND_CAP,
     ) -> None:
         super().__init__(
@@ -88,7 +88,7 @@ class Subscribe(System):
                 "transport": _transport(listen, connect, max_connections),
                 "namespace": None,
                 "link": "",
-                "pending_cap": pending_cap,
+                "conn_cap": conn_cap,
                 "inbound_cap": inbound_cap,
             },
             records=records,
@@ -105,4 +105,6 @@ def _transport(
             raise ConfigError("a dialing link holds one connection, so it takes no `max_connections`")
         return {"connect": {"addr": connect}}
     slots = MAX_CONNECTIONS if max_connections is None else max_connections
+    if slots < 1:
+        raise ConfigError("a listening link takes at least one connection")
     return {"listen": {"addr": listen, "max_connections": slots}}

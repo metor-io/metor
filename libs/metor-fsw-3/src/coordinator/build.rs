@@ -492,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_input_and_output_alignment_is_rejected() {
+    fn test_reject_unsupported_port_alignment() {
         for input in [true, false] {
             let port = crate::PortDef {
                 name: "aligned".into(),
@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_port_names_are_rejected_within_each_direction() {
+    fn test_reject_duplicate_port_names() {
         let port = Output::<utils::Imu>::def("sample");
         for input in [true, false] {
             let def = crate::SystemDef {
@@ -556,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn input_and_output_can_share_a_name() {
+    fn test_input_output_shared_name() {
         let port = Output::<utils::Imu>::def("sample");
         let def = crate::SystemDef {
             name: "test".into(),
@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_wall_rates_are_rejected_before_binding() {
+    fn test_reject_invalid_wall_rates() {
         for rate in [
             f64::NAN,
             f64::INFINITY,
@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn a_two_system_config_builds_one_ring_per_output_and_status() {
+    fn test_build_output_and_status_rings() {
         let mut config = pipeline_config();
         config.systems.truncate(2);
         config.systems[1].inputs[0].from = vec![PortRef::new("imu", "imu")];
@@ -608,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn a_status_output_is_an_ordinary_ring() {
+    fn test_status_ring() {
         let mut config = pipeline_config();
         config.systems.push(SystemConfig {
             inputs: vec![InputConfig {
@@ -621,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_id_is_rejected() {
+    fn test_reject_duplicate_system_id() {
         let config = CoordinatorConfig {
             systems: vec![source("imu"), source("imu")],
             ..Default::default()
@@ -633,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unregistered_type_is_rejected() {
+    fn test_reject_unregistered_type() {
         let config = CoordinatorConfig {
             systems: vec![SystemConfig::new("imu", "gyro")],
             ..Default::default()
@@ -648,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn an_edge_from_an_unknown_system_is_rejected() {
+    fn test_reject_unknown_source_system() {
         let mut config = pipeline_config();
         config.systems[1].inputs[0].from = vec![PortRef::new("gyro", "imu")];
         assert_eq!(
@@ -662,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_consumer_port_is_rejected() {
+    fn test_reject_unknown_consumer_port() {
         let mut config = pipeline_config();
         config.systems[1].inputs[0].port = "gyro".into();
         assert_eq!(
@@ -675,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_producer_port_is_rejected() {
+    fn test_reject_unknown_producer_port() {
         let mut config = pipeline_config();
         config.systems[1].inputs[0].from = vec![PortRef::new("imu", "gyro")];
         assert_eq!(
@@ -688,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn an_edge_between_different_frames_is_rejected() {
+    fn test_reject_frame_mismatch() {
         let mut config = pipeline_config();
         config.systems[2].inputs[0].from = vec![PortRef::new("imu", "imu")];
         assert_eq!(
@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn a_ring_larger_than_the_host_can_address_is_rejected() {
+    fn test_reject_ring_address_overflow() {
         let config = CoordinatorConfig {
             ring_depth: usize::MAX,
             systems: vec![source("imu")],
@@ -723,7 +723,7 @@ mod tests {
 
     #[test]
     #[cfg(target_pointer_width = "64")]
-    fn a_region_past_the_address_space_is_rejected() {
+    fn test_reject_region_address_overflow() {
         // A capacity of 2^63 fits `usize`; the region around it does not.
         let config = CoordinatorConfig {
             ring_depth: 1 << 58,
@@ -741,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn an_output_with_no_edges_still_builds() {
+    fn test_build_unconnected_output() {
         let config = CoordinatorConfig {
             systems: vec![source("imu")],
             ..Default::default()
@@ -750,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_status_output_is_rejected() {
+    fn test_reject_declared_status_output() {
         let config = CoordinatorConfig {
             systems: vec![SystemConfig::new("r", "reserved")],
             ..Default::default()
@@ -764,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn a_params_error_names_the_system() {
+    fn test_param_error_reports_system() {
         let mut config = pipeline_config();
         config.systems[1].params = serde_json::json!({ "gain": 2.0 });
         assert_eq!(
@@ -777,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn every_edge_claims_exactly_one_reader_slot() {
+    fn test_reader_slot_per_edge() {
         let mut config = pipeline_config();
         // A second consumer of `imu.imu`, so that ring carries two edges.
         config.systems.push(SystemConfig {
@@ -797,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dynamic_input_takes_its_name_and_def_from_its_edge() {
+    fn test_dynamic_input_from_edge() {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         config.systems.push(tap(vec![
@@ -823,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dynamic_input_with_two_producers_is_rejected() {
+    fn test_reject_multiple_dynamic_producers() {
         let mut config = pipeline_config();
         config
             .systems
@@ -844,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dynamic_output_is_resolved_by_record_name() {
+    fn test_resolve_dynamic_output_record() {
         let recorder = Recorder::default();
         let config = CoordinatorConfig {
             systems: vec![
@@ -872,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_record_name_is_rejected() {
+    fn test_reject_unknown_record() {
         let config = CoordinatorConfig {
             systems: vec![emits("gyro")],
             ..Default::default()
@@ -890,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_two_registrations_define_differently_is_rejected() {
+    fn test_reject_conflicting_record_definitions() {
         let recorder = Recorder::default();
         let mut table = table(&recorder);
         assert_eq!(
@@ -907,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_records_are_rejected_even_without_dynamic_ports() {
+    fn test_reject_static_record_conflicts() {
         let mut table = table(&Recorder::default());
         assert_eq!(
             table.register("wide", || WideSource),
@@ -919,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_input_still_requires_a_declared_port() {
+    fn test_reject_undeclared_empty_input() {
         let mut config = pipeline_config();
         config.systems[1].inputs[0].from.clear();
         assert!(build(config.clone()).is_ok());
@@ -934,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn an_output_port_on_a_static_system_is_rejected() {
+    fn test_reject_static_output_config() {
         let config = CoordinatorConfig {
             systems: vec![SystemConfig {
                 outputs: vec![OutputConfig {
@@ -956,7 +956,7 @@ mod tests {
 
     /// A `loop()` edge into an undeclared port has no producer definition yet.
     #[test]
-    fn an_undeclared_input_cannot_read_a_later_system() {
+    fn test_reject_dynamic_forward_reference() {
         let mut config = pipeline_config();
         config.systems.push(tap(vec![InputConfig {
             port: "late.nav".into(),
@@ -975,7 +975,7 @@ mod tests {
     /// A declared port takes its definition from the type, so its producer may
     /// come later.
     #[test]
-    fn a_declared_input_may_read_a_later_system() {
+    fn test_static_forward_reference() {
         let config = CoordinatorConfig {
             systems: vec![
                 SystemConfig {
@@ -1000,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unconnected_input_is_legal() {
+    fn test_build_unconnected_input() {
         let mut config = pipeline_config();
         config.systems[1].inputs.clear();
         assert!(build(config).is_ok());

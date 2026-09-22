@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn record_lookup_includes_implicit_status_and_repeated_ports() {
+    fn test_record_lookup() {
         let mut table = SystemTable::new();
         assert_eq!(record(&table, "status"), Some(STATUS.clone()));
         assert!(record(&table, "missing").is_none());
@@ -360,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_codecs_are_rejected_without_adding_the_entry() {
+    fn test_reject_conflicting_codecs() {
         let mut table = SystemTable::new();
         let first = message("command", MsgCodec::Json);
         table
@@ -377,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn inputs_and_frame_schemas_are_checked_during_registration() {
+    fn test_validate_input_schemas() {
         let mut table = SystemTable::new();
         let first = Output::<Imu>::def("imu");
         table
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicts_within_an_entry_leave_no_partial_registration() {
+    fn test_registration_conflict_rollback() {
         let mut table = SystemTable::new();
         let ports = vec![
             message("unrelated", MsgCodec::Json),
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn pack_registration_stops_at_the_first_conflict() {
+    fn test_pack_stops_at_conflict() {
         let mut table = SystemTable::new();
         let original = message("command", MsgCodec::Json);
         table
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn pack_registration_replaces_same_named_entries_in_order() {
+    fn test_pack_replacement_order() {
         let mut table = SystemTable::new();
         let pack = vec![
             (
@@ -468,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn pack_replacements_cannot_conflict_with_existing_records() {
+    fn test_reject_conflicting_pack_replacement() {
         let mut table = SystemTable::new();
         let old = message("command", MsgCodec::Json);
         for name in ["one", "two"] {
@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_record_names_cannot_share_a_record_id() {
+    fn test_reject_duplicate_record_id() {
         let mut table = SystemTable::new();
         let first = message("first", MsgCodec::Json);
         let mut second = message("second", MsgCodec::Json);
@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_wire_ids_are_rejected_during_registration() {
+    fn test_reject_incompatible_wire_ids() {
         let mut table = SystemTable::new();
         let first = message("command_3", MsgCodec::Json);
         let second = message("command_121", MsgCodec::Bytes);
@@ -528,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn the_implicit_status_definition_cannot_be_replaced() {
+    fn test_reject_status_replacement() {
         let mut table = SystemTable::new();
         let mut status = STATUS.clone();
         status.schema = RecordSchema::msg("status", MsgCodec::Bytes);
@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_removes_obsolete_records_and_keeps_shared_ones() {
+    fn test_replacement_record_cleanup() {
         let mut table = SystemTable::new();
         let old = message("old", MsgCodec::Bytes);
         let shared = message("shared", MsgCodec::Json);
@@ -563,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_checks_the_retained_entries_and_preserves_the_original_on_failure() {
+    fn test_replacement_conflict_rollback() {
         let mut table = SystemTable::new();
         let json = message("command", MsgCodec::Json);
         let bytes = message("command", MsgCodec::Bytes);
@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn register_records_the_definition() {
+    fn test_register_definition() {
         let mut table = SystemTable::new();
         table
             .register_system("imu", |_| Ok((ImuSource, 0)))
@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn registering_a_type_twice_replaces_it() {
+    fn test_register_replaces_type() {
         let mut table = SystemTable::new();
         table
             .register_system("shared", |_| Ok((ImuSource, 0)))
@@ -610,14 +610,14 @@ mod tests {
     }
 
     #[test]
-    fn an_unregistered_type_is_absent() {
+    fn test_unregistered_type_lookup() {
         let table = SystemTable::new();
         assert!(table.get("imu").is_none());
         assert_eq!(table.entries().count(), 0);
     }
 
     #[test]
-    fn entries_keep_registration_order_across_a_replacement() {
+    fn test_replacement_preserves_order() {
         let mut table = SystemTable::new();
         table
             .register_system("imu", |_| Ok((ImuSource, 0)))
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn an_async_registration_keeps_its_definition_and_launches_on_its_thread() {
+    fn test_async_registration_and_launch() {
         let mut table = SystemTable::new();
         table
             .register_async_system("idle", |_| Ok((Idle, ())))
@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn the_trait_path_registers_no_doc_and_no_schema() {
+    fn test_trait_registration_metadata() {
         let mut table = SystemTable::new();
         table
             .register_system("imu", |_| Ok((ImuSource, 0)))

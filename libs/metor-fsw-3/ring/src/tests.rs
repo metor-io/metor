@@ -15,7 +15,7 @@ fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
 }
 
 #[test]
-fn alignment_rounding_at_usize_boundary() {
+fn test_alignment_rounding_boundary() {
     assert_eq!(round_up_16(0), 0);
     assert_eq!(round_up_16(1), 16);
     assert_eq!(round_up_16(16), 16);
@@ -26,7 +26,7 @@ fn alignment_rounding_at_usize_boundary() {
 // ----- Basic single-threaded paths -----
 
 #[test]
-fn roundtrip() {
+fn test_read_write_roundtrip() {
     let rb = ring(1024, 4);
     let mut w = rb.writer(NoWake).unwrap();
     let mut v = rb.view(NoWake).unwrap();
@@ -43,7 +43,7 @@ fn roundtrip() {
 }
 
 #[test]
-fn wraparound_aligned() {
+fn test_wraparound_aligned() {
     // A 17-byte payload occupies 48 bytes and leaves a 16-byte wrap gap.
     let rb = ring(64, 1);
     let mut w = rb.writer(NoWake).unwrap();
@@ -61,7 +61,7 @@ fn wraparound_aligned() {
 }
 
 #[test]
-fn multi_reader() {
+fn test_multiple_readers() {
     let rb = ring(1024, 4);
     let mut w = rb.writer(NoWake).unwrap();
     let mut a = rb.view(NoWake).unwrap();
@@ -81,7 +81,7 @@ fn multi_reader() {
 }
 
 #[test]
-fn reader_table_claim_free() {
+fn test_reader_slot_reuse() {
     let rb = ring(256, 2);
 
     let a = rb.view(NoWake).unwrap();
@@ -101,7 +101,7 @@ fn reader_table_claim_free() {
 // ----- Backpressure / borrow semantics -----
 
 #[test]
-fn backpressure() {
+fn test_backpressure() {
     let rb = ring(64, 1);
     let mut w = rb.writer(NoWake).unwrap();
     let mut v = rb.view(NoWake).unwrap();
@@ -125,7 +125,7 @@ fn backpressure() {
 }
 
 #[test]
-fn borrow_read() {
+fn test_borrow_read() {
     let rb = ring(256, 1);
     let mut w = rb.writer(NoWake).unwrap();
     let mut v = rb.view(NoWake).unwrap();
@@ -139,7 +139,7 @@ fn borrow_read() {
 }
 
 #[test]
-fn oversize_message_rejected() {
+fn test_oversize_message_rejected() {
     let rb = ring(64, 1);
     let mut w = rb.writer(NoWake).unwrap();
     // A 64-byte payload makes a 72-byte record, more than the whole region.
@@ -152,7 +152,7 @@ fn oversize_message_rejected() {
 // ----- try_latest -----
 
 #[test]
-fn latest_pins_newest() {
+fn test_latest_pins_newest() {
     let rb = ring(256, 1);
     let mut w = rb.writer(NoWake).unwrap();
     let mut v = rb.view(NoWake).unwrap();
@@ -175,7 +175,7 @@ fn latest_pins_newest() {
 }
 
 #[test]
-fn latest_bytes_remain_pinned_without_a_grant() {
+fn test_latest_pins_without_grant() {
     let rb = ring(64, 1);
     let mut w = rb.writer(NoWake).expect("writer");
     let mut v = rb.view(NoWake).expect("reader");
@@ -191,7 +191,7 @@ fn latest_bytes_remain_pinned_without_a_grant() {
 }
 
 #[test]
-fn latest_pin_backpressures_writer() {
+fn test_latest_pin_backpressures_writer() {
     let rb = ring(64, 1);
     let mut w = rb.writer(NoWake).unwrap();
     let mut v = rb.view(NoWake).unwrap();
@@ -226,7 +226,7 @@ use std::sync::atomic::{AtomicBool, Ordering as O};
 use std::thread;
 
 #[test]
-fn concurrent_full_stream() {
+fn test_concurrent_full_stream() {
     let n: u64 = if cfg!(miri) { 48 } else { 4_000 };
     let rb = ring(128, 1);
     let v = rb.view(NoWake).unwrap();
@@ -268,7 +268,7 @@ fn concurrent_full_stream() {
 }
 
 #[test]
-fn concurrent_reader_churn() {
+fn test_concurrent_reader_churn() {
     let churn = if cfg!(miri) { 3 } else { 8 };
     let rounds = if cfg!(miri) { 4 } else { 200 };
     let rb = ring(128, 16);
@@ -318,7 +318,7 @@ fn concurrent_reader_churn() {
 // ----- attach_raw (non-owning, same-process) -----
 
 #[test]
-fn raw_attach_same_process_roundtrip() {
+fn test_raw_attach_roundtrip() {
     let rb = ring(1024, 4);
     let (base, len) = rb.region();
     let raw = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
@@ -342,7 +342,7 @@ fn raw_attach_same_process_roundtrip() {
 }
 
 #[test]
-fn raw_attach_recovers_geometry() {
+fn test_raw_attach_recovers_geometry() {
     let rb = ring(256, 3);
     // Commit something so the recovered `committed` is non-trivial.
     rb.writer(NoWake).unwrap().try_write(b"x").unwrap();
@@ -365,7 +365,7 @@ fn raw_attach_recovers_geometry() {
 }
 
 #[test]
-fn raw_attach_bad_region_rejected() {
+fn test_raw_attach_bad_region_rejected() {
     // A zeroed but header-sized region has a zero magic word.
     let zeros = Backing::heap(HEADER_SIZE);
     assert_eq!(
@@ -384,7 +384,7 @@ fn raw_attach_bad_region_rejected() {
 // ----- Writer/view re-acquisition over a long-lived region -----
 
 #[test]
-fn swap_writer_and_reader_reacquire() {
+fn test_swap_writer_and_reader_reacquire() {
     // A single slot makes leaks visible:
     // fail the second `view()` and backpressure the new writer forever.
     let rb = ring(256, 1);
@@ -421,7 +421,7 @@ fn swap_writer_and_reader_reacquire() {
 }
 
 #[test]
-fn raw_attach_swap_reacquire() {
+fn test_raw_attach_swap_reacquire() {
     let owner = ring(256, 1); // keeps the region alive across both rounds
     let (base, len) = owner.region();
     let mut buf = Vec::new();
@@ -461,7 +461,7 @@ fn raw_attach_swap_reacquire() {
 
 #[test]
 #[cfg(all(feature = "mmap", not(miri)))]
-fn mmap_roundtrip() {
+fn test_mmap_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ring.bin");
     let cfg = Config {
@@ -486,7 +486,7 @@ fn mmap_roundtrip() {
 // ----- Corrupt length fields -----
 
 #[test]
-fn garbage_length_is_corrupt() {
+fn test_read_rejects_corrupt_length() {
     let rb = ring(64, 1);
     let mut w = rb.writer(NoWake).unwrap();
     let mut v = rb.view(NoWake).unwrap();
@@ -510,7 +510,7 @@ fn garbage_length_is_corrupt() {
 // ----- View registration -----
 
 #[test]
-fn view_starts_stable() {
+fn test_view_starts_stable() {
     let rb = ring(128, 2);
     let v = rb.view(NoWake).unwrap();
     assert_eq!(v.cursor(), rb.committed());
@@ -537,7 +537,7 @@ fn view_starts_stable() {
 // ----- Single-writer claim -----
 
 #[test]
-fn second_writer_rejected() {
+fn test_second_writer_rejected() {
     let rb = ring(256, 1);
     let w1 = rb.writer(NoWake).unwrap();
     assert!(rb.writer(NoWake).is_err());
@@ -547,7 +547,7 @@ fn second_writer_rejected() {
 }
 
 #[test]
-fn writer_claim_freed_on_drop() {
+fn test_writer_claim_freed_on_drop() {
     let rb = ring(256, 2);
     let mut v = rb.view(NoWake).unwrap();
     let mut buf = Vec::new();
@@ -566,7 +566,7 @@ fn writer_claim_freed_on_drop() {
 }
 
 #[test]
-fn writer_claim_shared_across_attach() {
+fn test_writer_claim_shared_across_attach() {
     let rb = ring(256, 1);
     let (base, len) = rb.region();
     let raw = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
@@ -580,7 +580,7 @@ fn writer_claim_shared_across_attach() {
 }
 
 #[test]
-fn concurrent_writer_claim_churn() {
+fn test_concurrent_writer_claim_churn() {
     let threads: u64 = if cfg!(miri) { 3 } else { 8 };
     let rounds = if cfg!(miri) { 8 } else { 400 };
     let rb = ring(128, 1);
@@ -617,7 +617,7 @@ fn concurrent_writer_claim_churn() {
 // ----- Wrap-gap skip -----
 
 #[test]
-fn reader_on_gap_start_reads_through() {
+fn test_reader_skips_wrap_gap() {
     let rb = ring(64, 1);
     let mut w = rb.writer(NoWake).unwrap();
     let mut v = rb.view(NoWake).unwrap();
@@ -645,7 +645,7 @@ fn valid_region() -> (RingBuffer, *mut u8, usize) {
 }
 
 #[test]
-fn attach_rejects_truncated() {
+fn test_attach_rejects_truncated() {
     let (_rb, base, len) = valid_region();
     assert_eq!(
         unsafe { RingBuffer::attach_raw(base, len - 8) }.err(),
@@ -654,7 +654,7 @@ fn attach_rejects_truncated() {
 }
 
 #[test]
-fn attach_rejects_bad_capacity() {
+fn test_attach_rejects_bad_capacity() {
     let (_rb, base, len) = valid_region();
     for bad in [0u64, 48, 4, 8, u64::MAX] {
         // SAFETY: OFF_CAPACITY is inside the live header region.
@@ -672,7 +672,7 @@ fn attach_rejects_bad_capacity() {
 }
 
 #[test]
-fn attach_rejects_oob_offsets() {
+fn test_attach_rejects_oob_offsets() {
     let (_rb, base, len) = valid_region();
     let attach = |base, len| unsafe { RingBuffer::attach_raw(base, len) };
     let data_offset = HEADER_SIZE as u64 + 2 * READER_SLOT_SIZE as u64; // 0xC0
@@ -701,7 +701,7 @@ fn attach_rejects_oob_offsets() {
 }
 
 #[test]
-fn attach_rejects_misaligned() {
+fn test_attach_rejects_misaligned() {
     let (_rb, base, len) = valid_region();
     assert_eq!(
         // SAFETY: base+1 .. base+len is still inside the live region.
@@ -712,7 +712,7 @@ fn attach_rejects_misaligned() {
 
 #[test]
 #[cfg(all(feature = "mmap", not(miri)))]
-fn attach_mmap_rejects_truncated_file() {
+fn test_attach_mmap_rejects_truncated_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ring.bin");
     let cfg = Config {
@@ -755,7 +755,7 @@ fn attach_mmap_rejects_truncated_file() {
 // ----- View churn under a live writer -----
 
 #[test]
-fn concurrent_view_churn() {
+fn test_concurrent_view_churn() {
     let n: u64 = if cfg!(miri) { 32 } else { 2_000 };
     let churn_rounds = if cfg!(miri) { 8 } else { 300 };
     let rb = ring(128, 4);
@@ -830,7 +830,7 @@ fn concurrent_view_churn() {
 // ----- Owner reclamation (dead-process cleanup) -----
 
 #[test]
-fn reclaim_frees_dead_reader() {
+fn test_reclaim_frees_dead_reader() {
     const DEAD_PID: u64 = 4242;
     let rb = ring(64, 2);
     let mut w = rb.writer(NoWake).unwrap();
@@ -859,7 +859,7 @@ fn reclaim_frees_dead_reader() {
 }
 
 #[test]
-fn reclaim_frees_dead_writer_claim() {
+fn test_reclaim_frees_dead_writer_claim() {
     const DEAD_PID: u64 = 4242;
     let rb = ring(256, 2);
     let mut v = rb.view(NoWake).unwrap();
@@ -884,7 +884,7 @@ fn reclaim_frees_dead_writer_claim() {
 }
 
 #[test]
-fn reclaim_skips_other_owners() {
+fn test_reclaim_skips_other_owners() {
     let rb = ring(256, 2);
     let v = rb.view(NoWake).unwrap();
     // Plant a foreign owner on the view's slot (the first free one) and a
@@ -905,7 +905,7 @@ fn reclaim_skips_other_owners() {
 
 #[cfg(all(feature = "notify", not(miri)))]
 #[stellarator::test]
-async fn read_awaits_a_commit_and_the_grant_consumes_it() {
+async fn test_async_read_waits_for_commit() {
     let ring = ring(64, 2);
     let notifier = Notifier::default();
     let mut w = ring.writer(notifier.clone()).unwrap();
@@ -927,7 +927,7 @@ async fn read_awaits_a_commit_and_the_grant_consumes_it() {
 
 #[cfg(all(feature = "notify", not(miri)))]
 #[stellarator::test]
-async fn read_returns_a_ready_record_without_waiting() {
+async fn test_async_read_returns_ready_record() {
     let ring = ring(64, 2);
     let notifier = Notifier::default();
     let mut w = ring.writer(notifier.clone()).unwrap();
@@ -942,7 +942,7 @@ async fn read_returns_a_ready_record_without_waiting() {
 
 #[cfg(all(feature = "notify", not(miri)))]
 #[stellarator::test]
-async fn no_wake_resolves_immediately() {
+async fn test_no_wake_resolves_immediately() {
     let mut polled = false;
     NoWake
         .wait_until(|| {
@@ -954,7 +954,7 @@ async fn no_wake_resolves_immediately() {
 }
 
 #[test]
-fn create_raw_formats_a_caller_owned_region() {
+fn test_create_raw_formats_region() {
     let cfg = Config {
         capacity: 1024,
         max_readers: 4,
@@ -985,7 +985,7 @@ fn create_raw_formats_a_caller_owned_region() {
 }
 
 #[test]
-fn create_raw_rejects_bad_regions() {
+fn test_create_raw_rejects_bad_regions() {
     let cfg = Config {
         capacity: 1024,
         max_readers: 4,
@@ -1006,7 +1006,7 @@ fn create_raw_rejects_bad_regions() {
 }
 
 #[test]
-fn checked_region_size_rejects_unrepresentable_geometry() {
+fn test_region_size_rejects_overflow() {
     for cfg in [
         Config {
             capacity: 8,
@@ -1048,7 +1048,7 @@ fn check_payload_alignment(rb: &RingBuffer) {
 }
 
 #[test]
-fn heap_and_raw_payloads_are_aligned_across_wraps() {
+fn test_heap_raw_alignment_after_wrap() {
     let rb = ring(64, 1);
     check_payload_alignment(&rb);
     let (base, len) = rb.region();
@@ -1060,7 +1060,7 @@ fn heap_and_raw_payloads_are_aligned_across_wraps() {
 
 #[test]
 #[cfg(all(feature = "mmap", not(miri)))]
-fn mmap_payloads_are_aligned_across_wraps() {
+fn test_mmap_alignment_after_wrap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aligned.bin");
     // SAFETY: this test exclusively owns the new file throughout its lifetime.
@@ -1081,7 +1081,7 @@ fn mmap_payloads_are_aligned_across_wraps() {
 }
 
 #[test]
-fn attach_rejects_old_version_and_eight_byte_alignment() {
+fn test_attach_rejects_legacy_layout() {
     let (rb, base, len) = valid_region();
     // SAFETY: this offset stays inside the allocation and fails before reading.
     assert_eq!(
@@ -1113,7 +1113,7 @@ fn attach_rejects_old_version_and_eight_byte_alignment() {
 }
 
 #[test]
-fn empty_ring_wraps_for_a_full_record() {
+fn test_empty_ring_wraps_full_record() {
     let ring = ring(64, 1);
     let mut writer = ring.writer(NoWake).unwrap();
     for _ in 0..2 {
@@ -1129,7 +1129,7 @@ fn empty_ring_wraps_for_a_full_record() {
 }
 
 #[test]
-fn caught_up_reader_skips_padding_before_retry() {
+fn test_reader_skips_padding_before_retry() {
     let ring = ring(64, 1);
     let mut reader = ring.view(NoWake).unwrap();
     let mut writer = ring.writer(NoWake).unwrap();
@@ -1143,7 +1143,7 @@ fn caught_up_reader_skips_padding_before_retry() {
 }
 
 #[test]
-fn padding_preserves_latest_and_held_grants() {
+fn test_padding_preserves_pins() {
     let ring = ring(64, 1);
     let mut reader = ring.view(NoWake).unwrap();
     let mut writer = ring.writer(NoWake).unwrap();
@@ -1161,7 +1161,7 @@ fn padding_preserves_latest_and_held_grants() {
 }
 
 #[test]
-fn registration_during_padding_publication() {
+fn test_registration_during_padding_publication() {
     let ring = ring(64, 1);
     let mut writer = ring.writer(NoWake).unwrap();
     writer.try_write(&[1; 8]).unwrap();
@@ -1180,7 +1180,7 @@ fn registration_during_padding_publication() {
 const DEAD_PID: u64 = 999_999_999;
 
 #[test]
-fn reclaim_does_not_free_a_reused_slot() {
+fn test_reclaim_preserves_reused_slot() {
     let ring = ring(64, 1);
     let reader = ring.view(NoWake).unwrap();
     ring.inner.slot(0).owner.store(DEAD_PID, Release);
@@ -1199,7 +1199,7 @@ fn reclaim_does_not_free_a_reused_slot() {
 }
 
 #[test]
-fn concurrent_reclaimers_do_not_free_a_new_owner() {
+fn test_concurrent_reclaim_preserves_new_owner() {
     let ring = ring(64, 1);
     ring.inner.slot(0).cursor.store(0, Release);
     ring.inner.slot(0).owner.store(DEAD_PID, Release);
@@ -1222,7 +1222,7 @@ fn concurrent_reclaimers_do_not_free_a_new_owner() {
 }
 
 #[test]
-fn drain_excludes_records_published_after_it_starts() {
+fn test_drain_excludes_later_records() {
     let ring = ring(256, 1);
     let mut writer = ring.writer(NoWake).expect("writer");
     let mut view = ring.view(NoWake).expect("reader");
@@ -1235,7 +1235,7 @@ fn drain_excludes_records_published_after_it_starts() {
 }
 
 #[test]
-fn an_empty_drain_does_not_include_a_later_write() {
+fn test_empty_drain_excludes_later_write() {
     let ring = ring(64, 1);
     let mut writer = ring.writer(NoWake).expect("writer");
     let mut view = ring.view(NoWake).expect("reader");
@@ -1246,7 +1246,7 @@ fn an_empty_drain_does_not_include_a_later_write() {
 }
 
 #[test]
-fn drain_stops_before_a_wrap_published_after_its_snapshot() {
+fn test_drain_excludes_later_wrap() {
     let ring = ring(128, 1);
     let mut writer = ring.writer(NoWake).expect("writer");
     let mut view = ring.view(NoWake).expect("reader");
@@ -1263,7 +1263,7 @@ fn drain_stops_before_a_wrap_published_after_its_snapshot() {
 }
 
 #[test]
-fn drain_rejects_a_record_extending_past_its_committed_position() {
+fn test_drain_rejects_uncommitted_record() {
     let ring = ring(64, 1);
     let mut writer = ring.writer(NoWake).expect("writer");
     let mut view = ring.view(NoWake).expect("reader");
@@ -1276,7 +1276,7 @@ fn drain_rejects_a_record_extending_past_its_committed_position() {
 }
 
 #[test]
-fn drain_yields_every_record_and_consumes_on_the_next_read() {
+fn test_drain_defers_consumption() {
     let ring = ring(256, 1);
     let mut writer = ring.writer(NoWake).unwrap();
     let mut view = ring.view(NoWake).unwrap();
@@ -1293,7 +1293,7 @@ fn drain_yields_every_record_and_consumes_on_the_next_read() {
 }
 
 #[test]
-fn drain_break_consumes_only_the_records_yielded() {
+fn test_drain_break_preserves_unread_records() {
     let ring = ring(256, 1);
     let mut writer = ring.writer(NoWake).unwrap();
     let mut view = ring.view(NoWake).unwrap();
@@ -1307,7 +1307,7 @@ fn drain_break_consumes_only_the_records_yielded() {
 }
 
 #[test]
-fn drain_pins_its_records_until_settled() {
+fn test_drain_pins_until_settled() {
     let ring = ring(64, 1);
     let mut writer = ring.writer(NoWake).unwrap();
     let mut view = ring.view(NoWake).unwrap();
@@ -1321,7 +1321,7 @@ fn drain_pins_its_records_until_settled() {
 }
 
 #[test]
-fn drain_reads_through_a_wrap_gap() {
+fn test_drain_reads_across_wrap() {
     let ring = ring(128, 1);
     let mut writer = ring.writer(NoWake).unwrap();
     let mut view = ring.view(NoWake).unwrap();
@@ -1338,7 +1338,7 @@ fn drain_reads_through_a_wrap_gap() {
 }
 
 #[test]
-fn drain_reports_corrupt_once() {
+fn test_drain_reports_corrupt_once() {
     let ring = ring(64, 1);
     let mut writer = ring.writer(NoWake).unwrap();
     let mut view = ring.view(NoWake).unwrap();
@@ -1351,7 +1351,7 @@ fn drain_reports_corrupt_once() {
 }
 
 #[test]
-fn copy_reuses_reserved_storage_and_preserves_it_without_a_record() {
+fn test_copy_reuses_buffer() {
     let ring = ring(64, 1);
     let mut writer = ring.writer(NoWake).unwrap();
     let mut view = ring.view(NoWake).unwrap();
@@ -1381,7 +1381,7 @@ fn copy_reuses_reserved_storage_and_preserves_it_without_a_record() {
 }
 
 #[test]
-fn empty_payload_after_the_final_header() {
+fn test_empty_payload_at_ring_boundary() {
     let ring = ring(64, 1);
     let mut writer = ring.writer(NoWake).unwrap();
     let mut view = ring.view(NoWake).unwrap();
@@ -1401,7 +1401,7 @@ fn empty_payload_after_the_final_header() {
 }
 
 #[test]
-fn config_of_rejects_invalid_regions() {
+fn test_config_of_rejects_invalid_regions() {
     let backing = Backing::heap(HEADER_SIZE);
     // SAFETY: each call stays inside this live backing and creates no handles.
     unsafe {
@@ -1430,7 +1430,7 @@ fn config_of_rejects_invalid_regions() {
 }
 
 #[test]
-fn metadata_and_attach_accept_gaps_and_trailing_storage() {
+fn test_attach_accepts_extra_storage() {
     let cfg = Config {
         capacity: 64,
         max_readers: 2,
@@ -1456,7 +1456,7 @@ fn metadata_and_attach_accept_gaps_and_trailing_storage() {
 }
 
 #[test]
-fn async_read_remains_send_with_a_non_sync_sink() {
+fn test_async_read_send_with_non_sync_sink() {
     use std::cell::Cell;
     use std::future::Future;
 
@@ -1479,7 +1479,7 @@ fn async_read_remains_send_with_a_non_sync_sink() {
 }
 
 #[test]
-fn async_read_rechecks_after_spurious_and_padding_wakes() {
+fn test_async_read_rechecks_after_wake() {
     use std::cell::{Cell, RefCell};
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
@@ -1540,7 +1540,7 @@ fn async_read_rechecks_after_spurious_and_padding_wakes() {
 }
 
 #[test]
-fn checked_frame_length_rejects_unrepresentable_payloads() {
+fn test_frame_length_rejects_overflow() {
     assert_eq!(checked_frame_len(0, 16), Ok(16));
     assert_eq!(checked_frame_len(48, 64), Ok(64));
     assert_eq!(
@@ -1559,7 +1559,7 @@ fn checked_frame_length_rejects_unrepresentable_payloads() {
 
 #[cfg(target_pointer_width = "64")]
 #[test]
-fn checked_frame_length_respects_the_stored_length_width() {
+fn test_frame_length_rejects_excess_length() {
     let capacity = 1u64 << 33;
     assert_eq!(
         checked_frame_len(u32::MAX as usize, capacity),
@@ -1572,7 +1572,7 @@ fn checked_frame_length_respects_the_stored_length_width() {
 }
 
 #[test]
-fn config_reports_the_geometry_it_was_created_with() {
+fn test_config_reports_geometry() {
     let rb = ring(1024, 3);
     let config = rb.config();
     assert_eq!(config.capacity, 1024);
@@ -1580,7 +1580,7 @@ fn config_reports_the_geometry_it_was_created_with() {
 }
 
 #[test]
-fn has_record_tracks_unread_data_across_a_deferred_drain() {
+fn test_has_record_with_deferred_drain() {
     let rb = ring(1024, 1);
     let mut w = rb.writer(NoWake).unwrap();
     let mut v = rb.view(NoWake).unwrap();
@@ -1594,11 +1594,4 @@ fn has_record_tracks_unread_data_across_a_deferred_drain() {
     assert!(!v.has_record());
     v.settle();
     assert!(!v.has_record());
-}
-
-#[test]
-fn a_view_lends_out_the_endpoint_it_waits_on() {
-    let rb = ring(64, 1);
-    let v = rb.view(NoWake).unwrap();
-    let NoWake = *v.wake();
 }

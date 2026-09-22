@@ -6,7 +6,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::io::{BufRead, BufReader};
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -133,13 +133,13 @@ struct LogSink(Arc<Mutex<Vec<String>>>);
 impl LogSink {
     fn execute(&mut self, log: &mut Input<LogEvent>) {
         for event in log.drain().flatten() {
-            for (_, value) in event.fields.iter().filter(|(name, _)| name == "kind") {
-                // PANIC Safety: no test holds this lock across a panic.
-                self.0
-                    .lock()
-                    .expect("an unpoisoned sink")
-                    .push(value.to_string());
-            }
+            let kind = event.fields.iter().find(|(name, _)| name == "kind");
+            let line = match kind {
+                Some((_, kind)) => kind.to_string(),
+                None => format!("line: {}", event.message),
+            };
+            // PANIC Safety: no test holds this lock across a panic.
+            self.0.lock().expect("an unpoisoned sink").push(line);
         }
     }
 }
@@ -207,12 +207,6 @@ fn table(seen: &Seen) -> SystemTable {
     table
 }
 
-/// A port nothing listens on, so a link may take it.
-fn free_port() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
-    listener.local_addr().expect("bound")
-}
-
 /// One system reading one port of another.
 fn reading(id: &str, ty: &str, port: &str, from: PortRef) -> SystemConfig {
     SystemConfig {
@@ -224,14 +218,14 @@ fn reading(id: &str, ty: &str, port: &str, from: PortRef) -> SystemConfig {
     }
 }
 
-/// A `Publish` over `transport`, serving `imu.imu`.
-fn publish(transport: serde_json::Value, pending_cap: usize) -> SystemConfig {
+/// A `Publish` named `link` over `transport`, serving `imu.imu`.
+fn publish(link: &str, transport: serde_json::Value, conn_cap: usize) -> SystemConfig {
     SystemConfig {
         params: json!({
             "transport": transport,
             "namespace": "cube_sat",
-            "link": "pub",
-            "pending_cap": pending_cap,
+            "link": link,
+            "conn_cap": conn_cap,
         }),
         ..reading("pub", "fsw.publish", "imu.imu", PortRef::new("imu", "imu"))
     }
@@ -304,6 +298,24 @@ async fn dial(addr: SocketAddr) -> Peer {
     }
 }
 
+/// The address the link named `link` bound, once its target has built it.
+/// Links bind port zero, so nothing in a test picks a port.
+async fn bound(link: &str) -> SocketAddr {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let found = metor_fsw_3::link::bound_ports()
+            .into_iter()
+            .rev()
+            .find(|(name, _)| name == link)
+            .map(|(_, addr)| addr);
+        if let Some(addr) = found {
+            return addr;
+        }
+        assert!(Instant::now() < deadline, "link `{link}` never bound");
+        stellarator::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 /// Connects until the target's listener is up, without a handshake.
 async fn raw_dial(addr: SocketAddr) -> TcpStream {
     let deadline = Instant::now() + DEADLINE;
@@ -322,7 +334,10 @@ async fn next(
     buf: &mut Vec<u8>,
 ) -> OwnedPacket<stellarator::buf::Slice<Vec<u8>>> {
     let taken = core::mem::take(buf);
-    let packet = rx.next_grow(taken).await.expect("the link stays up");
+    let packet = match rx.next_grow(taken).await {
+        Ok(packet) => packet,
+        Err(error) => panic!("the link stays up: {error:?}"),
+    };
     *buf = vec![0u8; 1024];
     packet
 }
@@ -336,18 +351,37 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// As [`until`], naming the last status and faults the target reported.
+async fn until_seen(what: &str, seen: &Seen, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + DEADLINE;
+    while !done() {
+        assert!(
+            Instant::now() < deadline,
+            "{what}; last status {:?}, faults {:?}, cycles {}",
+            seen.status(),
+            seen.faults.lock().expect("an unpoisoned sink"),
+            seen.cycles()
+        );
+        stellarator::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 #[stellarator::test]
-async fn a_listening_publish_announces_itself_then_streams_its_records() {
-    let addr = free_port();
+async fn test_publish_announces_and_streams() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
             SystemConfig::new("imu", "source"),
-            publish(json!({ "listen": { "addr": addr.to_string() } }), 1 << 20),
+            publish(
+                "pub-announces",
+                json!({ "listen": { "addr": "127.0.0.1:0" } }),
+                1 << 20,
+            ),
         ],
         &seen,
         500.0,
     );
+    let addr = bound("pub-announces").await;
 
     let Peer::Fsw {
         info, mut rx, buf, ..
@@ -359,7 +393,7 @@ async fn a_listening_publish_announces_itself_then_streams_its_records() {
     assert_eq!(info.namespace.as_deref(), Some("cube_sat"));
     assert_eq!(
         (info.link.as_str(), info.command_ids.as_slice()),
-        ("pub", &[][..])
+        ("pub-announces", &[][..])
     );
 
     let mut buf = buf;
@@ -390,22 +424,27 @@ async fn a_listening_publish_announces_itself_then_streams_its_records() {
 }
 
 #[stellarator::test]
-async fn a_dialing_publish_finds_a_listener_that_comes_up_late() {
-    let addr = free_port();
+async fn test_publish_retries_connection() {
+    let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let addr = listener.local_addr().expect("bound");
     let seen = Seen::default();
     let _target = spawn(
         vec![
             SystemConfig::new("imu", "source"),
-            publish(json!({ "connect": { "addr": addr.to_string() } }), 1 << 20),
+            publish(
+                "pub-retries",
+                json!({ "connect": { "addr": addr.to_string() } }),
+                1 << 20,
+            ),
         ],
         &seen,
         500.0,
     );
-    // The link dials while nothing answers, so it backs off and retries.
-    stellarator::sleep(Duration::from_millis(50)).await;
-    let listener = stellarator::net::TcpListener::bind(addr).expect("the port is still free");
+    // The first connection is refused by hanging up, so the link backs off
+    // and dials again; the second carries the announce.
+    drop(listener.accept().await.expect("the link dials"));
 
-    let (rx, _tx) = listener.accept().await.expect("the link dials").split();
+    let (rx, _tx) = listener.accept().await.expect("the link redials").split();
     let mut rx = PacketStream::new(rx);
     let mut buf = vec![0u8; 1024];
     let mut seen = Vec::new();
@@ -428,13 +467,16 @@ async fn a_dialing_publish_finds_a_listener_that_comes_up_late() {
 }
 
 #[stellarator::test]
-async fn a_client_that_never_reads_drops_its_own_batches_only() {
-    let addr = free_port();
+async fn test_slow_client_isolation() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
             SystemConfig::new("imu", "source"),
-            publish(json!({ "listen": { "addr": addr.to_string() } }), 256),
+            publish(
+                "pub-slow",
+                json!({ "listen": { "addr": "127.0.0.1:0" } }),
+                256,
+            ),
             reading(
                 "status",
                 "status_sink",
@@ -445,6 +487,7 @@ async fn a_client_that_never_reads_drops_its_own_batches_only() {
         &seen,
         50_000.0,
     );
+    let addr = bound("pub-slow").await;
 
     let _slow = match dial(addr).await {
         Peer::Fsw { rx, tx, .. } => (rx, tx),
@@ -470,13 +513,13 @@ async fn a_client_that_never_reads_drops_its_own_batches_only() {
     assert_eq!(seen.status().expect("a status").connections, 2);
 }
 
-/// A `Subscribe` over `transport`, publishing what it is sent on `ping`.
-fn subscribe(transport: serde_json::Value) -> SystemConfig {
+/// A `Subscribe` named `link` over `transport`, publishing what it is sent on `ping`.
+fn subscribe(link: &str, transport: serde_json::Value) -> SystemConfig {
     SystemConfig {
         params: json!({
             "transport": transport,
             "namespace": "cube_sat",
-            "link": "cmds",
+            "link": link,
         }),
         outputs: vec![OutputConfig {
             port: "ping".into(),
@@ -487,12 +530,11 @@ fn subscribe(transport: serde_json::Value) -> SystemConfig {
 }
 
 #[stellarator::test]
-async fn an_idle_subscribe_reports_its_completed_identity_write_once() {
-    let addr = free_port();
+async fn test_subscribe_counts_identity_write_once() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe(json!({ "listen": { "addr": addr.to_string() } })),
+            subscribe("cmds-idle", json!({ "listen": { "addr": "127.0.0.1:0" } })),
             reading(
                 "status",
                 "status_sink",
@@ -503,6 +545,7 @@ async fn an_idle_subscribe_reports_its_completed_identity_write_once() {
         &seen,
         500.0,
     );
+    let addr = bound("cmds-idle").await;
 
     let peer = raw_dial(addr).await;
     let (rx, _tx) = peer.split();
@@ -528,12 +571,14 @@ async fn an_idle_subscribe_reports_its_completed_identity_write_once() {
 }
 
 #[stellarator::test]
-async fn a_listening_subscribe_names_its_commands_and_routes_what_it_is_sent() {
-    let addr = free_port();
+async fn test_subscribe_announces_and_routes() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe(json!({ "listen": { "addr": addr.to_string() } })),
+            subscribe(
+                "cmds-routes",
+                json!({ "listen": { "addr": "127.0.0.1:0" } }),
+            ),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
             reading(
                 "status",
@@ -545,12 +590,13 @@ async fn a_listening_subscribe_names_its_commands_and_routes_what_it_is_sent() {
         &seen,
         500.0,
     );
+    let addr = bound("cmds-routes").await;
 
     let Peer::Fsw { info, tx, .. } = dial(addr).await else {
         panic!("a subscribe is an fsw link")
     };
     assert_eq!(info.command_ids, vec![<Ping as Msg>::ID]);
-    assert_eq!(info.link, "cmds");
+    assert_eq!(info.link, "cmds-routes");
 
     tx.send((&Ping { n: 7 }).into_len_packet())
         .await
@@ -561,12 +607,9 @@ async fn a_listening_subscribe_names_its_commands_and_routes_what_it_is_sent() {
     })
     .await;
 
-    // A table is not routed in this slice, and the connection stays up.
+    // A table is the peer's business: not routed, not counted, and the
+    // connection stays up.
     tx.send(LenPacket::table([1, 2], 8)).await.0.expect("up");
-    until("the table was never counted", || {
-        seen.status().is_some_and(|s| s.inbound_dropped > 0)
-    })
-    .await;
     tx.send((&Ping { n: 9 }).into_len_packet())
         .await
         .0
@@ -575,19 +618,19 @@ async fn a_listening_subscribe_names_its_commands_and_routes_what_it_is_sent() {
         seen.pings().contains(&9)
     })
     .await;
+    assert_eq!(seen.status().map(|s| s.inbound_dropped), Some(0));
 }
 
 #[stellarator::test]
-async fn a_dialing_subscribe_receives_the_records_a_publish_serves() {
-    let addr = free_port();
+async fn test_subscribe_receives_records() {
     let (server, client) = (Seen::default(), Seen::default());
     let _server = spawn(
         vec![
             SystemConfig::new("src", "pinger"),
             SystemConfig {
                 params: json!({
-                    "transport": { "listen": { "addr": addr.to_string() } },
-                    "link": "pub",
+                    "transport": { "listen": { "addr": "127.0.0.1:0" } },
+                    "link": "pub-records",
                 }),
                 ..reading(
                     "pub",
@@ -600,9 +643,13 @@ async fn a_dialing_subscribe_receives_the_records_a_publish_serves() {
         &server,
         500.0,
     );
+    let addr = bound("pub-records").await;
     let _client = spawn(
         vec![
-            subscribe(json!({ "connect": { "addr": addr.to_string() } })),
+            subscribe(
+                "cmds-records",
+                json!({ "connect": { "addr": addr.to_string() } }),
+            ),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &client,
@@ -619,8 +666,7 @@ async fn a_dialing_subscribe_receives_the_records_a_publish_serves() {
 }
 
 #[stellarator::test]
-async fn a_dialing_subscribe_reads_past_an_announce_larger_than_its_records() {
-    let addr = free_port();
+async fn test_subscribe_skips_large_announce() {
     let (server, client) = (Seen::default(), Seen::default());
     let mut publish = reading(
         "pub",
@@ -633,8 +679,8 @@ async fn a_dialing_subscribe_reads_past_an_announce_larger_than_its_records() {
         from: vec![PortRef::new("wide", "wide")],
     });
     publish.params = json!({
-        "transport": { "listen": { "addr": addr.to_string() } },
-        "link": "pub",
+        "transport": { "listen": { "addr": "127.0.0.1:0" } },
+        "link": "pub-wide",
     });
     let _server = spawn(
         vec![
@@ -645,9 +691,13 @@ async fn a_dialing_subscribe_reads_past_an_announce_larger_than_its_records() {
         &server,
         500.0,
     );
+    let addr = bound("pub-wide").await;
     let _client = spawn(
         vec![
-            subscribe(json!({ "connect": { "addr": addr.to_string() } })),
+            subscribe(
+                "cmds-wide",
+                json!({ "connect": { "addr": addr.to_string() } }),
+            ),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &client,
@@ -661,26 +711,31 @@ async fn a_dialing_subscribe_reads_past_an_announce_larger_than_its_records() {
 }
 
 #[stellarator::test]
-async fn a_length_prefix_past_the_receive_cap_closes_the_connection() {
-    let addr = free_port();
+async fn test_oversized_packet_closes_connection() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
             SystemConfig::new("imu", "source"),
-            publish(json!({ "listen": { "addr": addr.to_string() } }), 1 << 20),
+            publish(
+                "pub-cap",
+                json!({ "listen": { "addr": "127.0.0.1:0" } }),
+                1 << 20,
+            ),
             reading(
                 "status",
                 "status_sink",
                 "link_status",
                 PortRef::new("pub", "link_status"),
             ),
+            reading("logs", "log_sink", "log", PortRef::new("pub", "log")),
         ],
         &seen,
         500.0,
     );
+    let addr = bound("pub-cap").await;
 
     let peer = raw_dial(addr).await;
-    until("the link never took the connection", || {
+    until_seen("the link never took the connection", &seen, || {
         seen.status().is_some_and(|s| s.connections == 1)
     })
     .await;
@@ -688,24 +743,27 @@ async fn a_length_prefix_past_the_receive_cap_closes_the_connection() {
     // Four gigabytes the link must refuse rather than allocate.
     let (written, _) = peer.write_all(u32::MAX.to_le_bytes().to_vec()).await;
     written.expect("the link takes the prefix");
-    until("the link kept a connection it cannot serve", || {
+    until_seen("the link kept a connection it cannot serve", &seen, || {
         seen.status().is_some_and(|s| s.connections == 0)
     })
     .await;
 }
 
 #[stellarator::test]
-async fn a_peer_that_hangs_up_frees_the_only_slot_for_the_next_one() {
-    let addr = free_port();
+async fn test_disconnect_frees_slot() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe(json!({ "listen": { "addr": addr.to_string(), "max_connections": 1 } })),
+            subscribe(
+                "cmds-slot",
+                json!({ "listen": { "addr": "127.0.0.1:0", "max_connections": 1 } }),
+            ),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &seen,
         500.0,
     );
+    let addr = bound("cmds-slot").await;
 
     // A peer that takes the slot and leaves without ever sending a command.
     let Peer::Fsw { rx, tx, .. } = dial(addr).await else {
@@ -728,13 +786,58 @@ async fn a_peer_that_hangs_up_frees_the_only_slot_for_the_next_one() {
 }
 
 #[stellarator::test]
-async fn a_dialing_subscribe_redials_a_peer_that_comes_back() {
+async fn test_refuse_peer_past_limit() {
+    let seen = Seen::default();
+    let _target = spawn(
+        vec![
+            subscribe(
+                "cmds-full",
+                json!({ "listen": { "addr": "127.0.0.1:0", "max_connections": 1 } }),
+            ),
+            reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
+        ],
+        &seen,
+        500.0,
+    );
+    let addr = bound("cmds-full").await;
+
+    let Peer::Fsw { rx: _rx, tx, .. } = dial(addr).await else {
+        panic!("a subscribe is an fsw link")
+    };
+
+    // A second peer is accepted and closed at once, rather than left waiting.
+    let refused = raw_dial(addr).await;
+    let (read, _) =
+        futures_lite::future::or(async { Some(refused.read(vec![0u8; 16]).await) }, async {
+            stellarator::sleep(DEADLINE).await;
+            None
+        })
+        .await
+        .expect("the link kept the refused peer waiting");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+
+    // The first peer still holds the slot.
+    tx.send((&Ping { n: 4 }).into_len_packet())
+        .await
+        .0
+        .expect("the link takes commands");
+    until("the first peer never reached the consumer", || {
+        seen.pings().contains(&4)
+    })
+    .await;
+}
+
+#[stellarator::test]
+async fn test_subscribe_reconnects() {
     let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
     let addr = listener.local_addr().expect("bound");
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe(json!({ "connect": { "addr": addr.to_string() } })),
+            subscribe(
+                "cmds-redial",
+                json!({ "connect": { "addr": addr.to_string() } }),
+            ),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &seen,
@@ -768,13 +871,17 @@ async fn a_dialing_subscribe_redials_a_peer_that_comes_back() {
 fn dialing_publish(addr: SocketAddr) -> Vec<SystemConfig> {
     vec![
         SystemConfig::new("imu", "source"),
-        publish(json!({ "connect": { "addr": addr.to_string() } }), 1 << 20),
+        publish(
+            "pub-sim",
+            json!({ "connect": { "addr": addr.to_string() } }),
+            1 << 20,
+        ),
         reading("log", "log_sink", "log", PortRef::new("pub", "log")),
     ]
 }
 
 #[stellarator::test]
-async fn a_simulated_clock_outruns_its_link_without_losing_the_peer() {
+async fn test_simulated_clock_preserves_connection() {
     // The peer listens before the target exists, so its connection predates
     // the first cycle.
     let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
@@ -874,7 +981,7 @@ impl Fixture {
 }
 
 #[stellarator::test]
-async fn the_fixture_answers_over_its_links_what_it_was_sent() {
+async fn test_fixture_link_round_trip() {
     let fixture = Fixture::start();
     // The publisher takes the connection first, so the answer cannot precede it.
     let Peer::Fsw { mut rx, buf, .. } = dial(fixture.addr("pub")).await else {

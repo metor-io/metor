@@ -1,5 +1,3 @@
-//! The metor-proto bytes a link speaks.
-
 use std::collections::HashMap;
 
 use metor_proto::types::{
@@ -13,28 +11,6 @@ use metor_proto_wkt::{
 
 use crate::record::{MsgCodec, RecordSchema};
 use crate::system::PortDef;
-
-/// How one port's records are framed on the wire.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Wire {
-    Table { id: PacketId },
-    Msg { id: PacketId },
-}
-
-impl Wire {
-    pub(crate) fn ty(&self) -> PacketTy {
-        match self {
-            Self::Table { .. } => PacketTy::Table,
-            Self::Msg { .. } => PacketTy::Msg,
-        }
-    }
-
-    pub(crate) fn id(&self) -> PacketId {
-        match self {
-            Self::Table { id } | Self::Msg { id } => *id,
-        }
-    }
-}
 
 /// The identity packet a link pushes before anything else.
 pub(crate) fn link_info(
@@ -52,18 +28,14 @@ pub(crate) fn link_info(
     (&info).into_len_packet().inner
 }
 
-/// The identity and schema replay every new connection receives, and how each
-/// port's records are framed.
-///
-/// A port whose table id collides with an earlier one has no [`Wire`]: two
-/// tables under one id are indistinguishable on the wire.
+/// The message that is sent at the start of a connection
 pub(crate) fn announce(
     defs: &[PortDef],
     namespace: Option<&str>,
     link: &str,
-) -> (Vec<u8>, Vec<Option<Wire>>) {
+) -> (Vec<u8>, Vec<Option<PacketId>>) {
     let mut blob = link_info(Vec::new(), namespace, link);
-    let mut wire = vec![None; defs.len()];
+    let mut ids = vec![None; defs.len()];
     let mut tables: Vec<PacketId> = Vec::new();
     for (at, def) in defs.iter().enumerate() {
         let RecordSchema::Frame { vtable, metadata } = &def.schema else {
@@ -75,7 +47,7 @@ pub(crate) fn announce(
             continue;
         }
         tables.push(id);
-        wire[at] = Some(Wire::Table { id });
+        ids[at] = Some(id);
         blob.extend_from_slice(&VTableMsg { id, vtable }.into_len_packet().inner);
         for component in metadata {
             let packet = (&SetComponentMetadata(component)).into_len_packet();
@@ -87,7 +59,7 @@ pub(crate) fn announce(
         let RecordSchema::Msg { id, name, codec } = &def.schema else {
             continue;
         };
-        wire[at] = Some(Wire::Msg { id: *id });
+        ids[at] = Some(*id);
         if msgs.contains(id) {
             continue;
         }
@@ -98,7 +70,7 @@ pub(crate) fn announce(
         };
         blob.extend_from_slice(&announce.into_len_packet().inner);
     }
-    (blob, wire)
+    (blob, ids)
 }
 
 /// A message's schema as the ground decodes it: the type's own for postcard,
@@ -209,7 +181,7 @@ fn leaf_ids(vtable: &VTable, ids: &HashMap<u64, u64>) -> Vec<(usize, u64)> {
 /// The bytes one packet adds beyond its payload: the length prefix and header.
 pub(crate) const PACKET_OVERHEAD: usize = 4 + PACKET_HEADER_LEN;
 
-/// Appends one length-prefixed packet, the framing a `LenPacket` builds.
+/// Appends one length-prefixed packet
 pub(crate) fn append_packet(batch: &mut Vec<u8>, ty: PacketTy, id: PacketId, payload: &[u8]) {
     batch.extend_from_slice(&((PACKET_HEADER_LEN + payload.len()) as u32).to_le_bytes());
     batch.push(ty as u8);
@@ -257,12 +229,12 @@ mod tests {
         Input::<Imu>::def("plant.imu")
     }
 
-    fn announced(defs: &[PortDef]) -> (Vec<u8>, Vec<Option<Wire>>) {
+    fn announced(defs: &[PortDef]) -> (Vec<u8>, Vec<Option<PacketId>>) {
         announce(defs, Some("cube_sat"), "pub")
     }
 
     #[test]
-    fn a_frame_and_a_message_port_announce_the_blob_a_client_replays() {
+    fn test_announce_frame_and_message() {
         let defs = vec![imu_port(), Input::<Fixed>::def("cmds.fixed")];
         let (blob, wire) = announced(&defs);
 
@@ -297,14 +269,11 @@ mod tests {
         expected.extend_from_slice(&announce.into_len_packet().inner);
 
         assert_eq!(blob, expected);
-        assert_eq!(
-            wire,
-            vec![Some(Wire::Table { id }), Some(Wire::Msg { id: *msg })]
-        );
+        assert_eq!(wire, vec![Some(id), Some(*msg)]);
     }
 
     #[test]
-    fn a_frames_leaves_hang_under_the_namespace_and_the_port() {
+    fn test_frame_leaf_paths() {
         let def = imu_port();
         let RecordSchema::Frame { vtable, metadata } = &def.schema else {
             panic!("a frame port")
@@ -318,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn a_json_message_announces_the_codec_the_ground_decodes_it_with() {
+    fn test_announce_json_codec() {
         let defs = vec![Input::<Telecommand>::def("cmds.telecommand")];
         let (blob, wire) = announced(&defs);
         let metadata = msg_metadata("telecommand", &MsgCodec::Json);
@@ -332,14 +301,14 @@ mod tests {
         );
         assert_eq!(metadata.name, "telecommand");
         let announce = SetMsgMetadata {
-            id: wire[0].expect("a wire").id(),
+            id: wire[0].expect("an id"),
             metadata,
         };
         assert!(blob.ends_with(&announce.into_len_packet().inner));
     }
 
     #[test]
-    fn two_ports_over_one_table_announce_once_and_the_second_carries_nothing() {
+    fn test_deduplicate_table_ports() {
         let defs = vec![imu_port(), imu_port()];
         let (blob, wire) = announced(&defs);
         assert!(wire[0].is_some() && wire[1].is_none());
@@ -348,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn one_message_id_on_two_ports_announces_once_and_both_ports_carry_it() {
+    fn test_shared_message_id_routes_both_ports() {
         let defs = vec![
             Input::<Fixed>::def("a.fixed"),
             Input::<Fixed>::def("b.fixed"),
@@ -359,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn a_packet_frames_as_its_len_packet_does() {
+    fn test_packet_framing_matches_len_packet() {
         let mut batch = Vec::new();
         append_packet(&mut batch, PacketTy::Table, [7, 9], b"body");
         let mut expected = LenPacket::table([7, 9], 4);
@@ -368,14 +337,14 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_payload_is_the_header_alone() {
+    fn test_frame_empty_payload() {
         let mut batch = Vec::new();
         append_packet(&mut batch, PacketTy::Msg, [0, 1], b"");
         assert_eq!(batch, vec![4, 0, 0, 0, PacketTy::Msg as u8, 0, 1, 0]);
     }
 
     #[test]
-    fn packets_append_back_to_back() {
+    fn test_append_packets() {
         let mut batch = Vec::new();
         append_packet(&mut batch, PacketTy::Msg, [0, 1], b"a");
         append_packet(&mut batch, PacketTy::Msg, [0, 2], b"bb");

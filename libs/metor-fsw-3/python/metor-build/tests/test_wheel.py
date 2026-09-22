@@ -28,7 +28,7 @@ def built(root: Path, dist: str = "echo-pack", version: str = "0.1.0") -> zipfil
 
 
 class WheelTest(unittest.TestCase):
-    def test_members_and_pth_hold_the_metor_directory(self) -> None:
+    def test_wheel_metadata_and_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with built(root) as wheel:
@@ -48,7 +48,7 @@ class WheelTest(unittest.TestCase):
                 self.assertIn("Requires-Dist: metor-fsw-abi==1", metadata)
                 self.assertIn("Requires-Dist: metor-config", metadata)
 
-    def test_record_digests_match_every_member(self) -> None:
+    def test_wheel_record_digests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with built(Path(tmp)) as wheel:
                 rows = wheel.read("echo_pack-0.1.0.dist-info/RECORD").decode().splitlines()
@@ -66,7 +66,7 @@ class WheelTest(unittest.TestCase):
                     self.assertEqual(size, str(len(raw)))
                 self.assertEqual(len(seen), len(wheel.namelist()))
 
-    def test_a_dotted_distribution_name_is_an_identifier(self) -> None:
+    def test_normalize_distribution_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with built(root, dist="my-adcs-pack", version="2.1") as wheel:

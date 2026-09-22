@@ -1,18 +1,17 @@
 //! Where a link's bytes flow: a socket it accepts on, or one it dials.
 
-use core::cell::{Cell, RefCell};
 use core::time::Duration;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use stellarator::JoinHandleDropGuard;
 use stellarator::net::{TcpListener, TcpStream};
-use stellarator::sync::WaitQueue;
 
 use crate::async_system::Stop;
 use crate::coordinator::ParamError;
+
+use super::conn::Connections;
 
 /// The delay between the first two refused dials, and the longest one.
 const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
@@ -53,11 +52,14 @@ impl Transport {
                 addr,
                 max_connections,
             } => {
+                if *max_connections == 0 {
+                    return Err(ParamError::Decode("`max_connections` is at least 1".into()));
+                }
                 let listener = TcpListener::bind(addr.as_str())
                     .map_err(|e| ParamError::Decode(format!("binding `{addr}`: {e}")))?;
                 Ok(Endpoint::Listen {
                     listener,
-                    slots: (*max_connections).max(1),
+                    slots: *max_connections,
                 })
             }
             Self::Connect { addr } => Ok(Endpoint::Connect {
@@ -74,11 +76,6 @@ impl Endpoint {
             Self::Listen { slots, .. } => *slots,
             Self::Connect { .. } => 1,
         }
-    }
-
-    /// Whether this endpoint accepts peers, rather than dialing one.
-    pub(crate) fn listens(&self) -> bool {
-        matches!(self, Self::Listen { .. })
     }
 
     /// The address a listener bound, for a caller that asked for port zero.
@@ -138,70 +135,39 @@ impl Dialer {
     }
 }
 
-/// The connections a link is handed, one at a time, from a task of its own.
+/// Fills `conns` from `endpoint` until `stop`.
 ///
-/// The source runs apart from the link's loop so a batch to send never cancels
-/// an accept or a half-established dial.
-pub(crate) struct Incoming {
-    stream: RefCell<Option<TcpStream>>,
-    ready: WaitQueue,
-    wanted: WaitQueue,
-    want: Cell<bool>,
-}
-
-impl Incoming {
-    /// Waits for the next connection; never resolves once the source is gone.
-    pub(crate) async fn next(&self) -> TcpStream {
-        loop {
-            if let Some(stream) = self.stream.borrow_mut().take() {
-                return stream;
-            }
-            let _ = self.ready.wait_for(|| self.stream.borrow().is_some()).await;
-        }
-    }
-
-    /// Asks the source for another connection.
-    pub(crate) fn want(&self) {
-        if !self.want.replace(true) {
-            self.wanted.wake_all();
-        }
+/// A listener accepts every peer and closes at once the ones it has no slot
+/// for; a dialer holds one connection and redials when it ends. The task runs
+/// apart from the link's loop so a batch never cancels an accept or a
+/// half-established dial.
+pub(crate) async fn source(endpoint: Endpoint, conns: Rc<Connections>, stop: Stop) {
+    match endpoint {
+        Endpoint::Listen { listener, .. } => listen(listener, conns, stop).await,
+        Endpoint::Connect { dialer } => dial(dialer, conns, stop).await,
     }
 }
 
-/// Starts `endpoint`'s source task, which runs until `stop` or the guard drops.
-pub(crate) fn incoming(endpoint: Endpoint, stop: Stop) -> (Rc<Incoming>, JoinHandleDropGuard<()>) {
-    let shared = Rc::new(Incoming {
-        stream: RefCell::new(None),
-        ready: WaitQueue::new(),
-        wanted: WaitQueue::new(),
-        want: Cell::new(false),
-    });
-    let task = stellarator::spawn(source(shared.clone(), endpoint, stop)).drop_guard();
-    (shared, task)
-}
-
-/// Accepts or dials whenever the link asks for a connection and has nowhere to
-/// put the last one.
-async fn source(incoming: Rc<Incoming>, mut endpoint: Endpoint, stop: Stop) {
-    loop {
-        let _ = incoming
-            .wanted
-            .wait_for(|| incoming.want.get() && incoming.stream.borrow().is_none())
-            .await;
-        if stop.is_set() {
-            return;
-        }
-        let stream = match &mut endpoint {
-            Endpoint::Listen { listener, .. } => accept(listener, &stop).await,
-            Endpoint::Connect { dialer } => dialer.connect(&stop).await,
+async fn listen(listener: TcpListener, conns: Rc<Connections>, stop: Stop) {
+    while !stop.is_set() {
+        let Some(stream) = accept(&listener, &stop).await else {
+            continue;
         };
-        if stop.is_set() {
-            return;
+        let Some(slot) = conns.claim() else {
+            continue;
+        };
+        let (conns, stop) = (conns.clone(), stop.clone());
+        drop(stellarator::spawn(async move {
+            conns.serve(slot, stream, &stop).await;
+        }));
+    }
+}
+
+async fn dial(mut dialer: Dialer, conns: Rc<Connections>, stop: Stop) {
+    while let Some(stream) = dialer.connect(&stop).await {
+        if let Some(slot) = conns.claim() {
+            conns.serve(slot, stream, &stop).await;
         }
-        let Some(stream) = stream else { continue };
-        incoming.want.set(false);
-        *incoming.stream.borrow_mut() = Some(stream);
-        incoming.ready.wake_all();
     }
 }
 
@@ -246,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn a_listen_transport_reads_as_snake_case_with_a_default_slot_count() {
+    fn test_decode_listen_defaults() {
         let parsed: Transport =
             serde_json::from_str(r#"{"listen":{"addr":"127.0.0.1:0"}}"#).expect("decodes");
         let Transport::Listen {
@@ -260,14 +226,14 @@ mod tests {
     }
 
     #[test]
-    fn a_connect_transport_reads_its_address() {
+    fn test_decode_connect_address() {
         let parsed: Transport =
             serde_json::from_str(r#"{"connect":{"addr":"127.0.0.1:2240"}}"#).expect("decodes");
         assert!(matches!(parsed, Transport::Connect { addr } if addr == "127.0.0.1:2240"));
     }
 
     #[test]
-    fn binding_port_zero_reports_the_port_it_took() {
+    fn test_bind_reports_assigned_port() {
         let endpoint = listen("127.0.0.1:0").bind().expect("a free port");
         let addr = endpoint.local_addr().expect("a bound listener");
         assert_ne!(addr.port(), 0);
@@ -275,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn a_taken_address_names_itself_in_the_error() {
+    fn test_bind_error_reports_address() {
         let held = listen("127.0.0.1:0").bind().expect("a free port");
         let addr = held.local_addr().expect("a bound listener");
         // SO_REUSEADDR lets a second bind share the port, so name an address
@@ -288,7 +254,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unresolvable_dial_address_is_an_error() {
+    fn test_reject_zero_connections() {
+        let transport = Transport::Listen {
+            addr: "127.0.0.1:0".into(),
+            max_connections: 0,
+        };
+        let Err(ParamError::Decode(message)) = transport.bind() else {
+            panic!("a listener with no slots is an error")
+        };
+        assert!(message.contains("max_connections"), "{message}");
+    }
+
+    #[test]
+    fn test_reject_invalid_connect_address() {
         let transport = Transport::Connect {
             addr: "not a host".into(),
         };
@@ -299,7 +277,7 @@ mod tests {
     /// force; lowering the process fd limit by hand shows the spin this
     /// backoff replaces. The stop path is what stays covered here.
     #[stellarator::test]
-    async fn a_stopped_link_does_not_wait_out_an_accept_failure() {
+    async fn test_stop_skips_accept_backoff() {
         let (handle, stop) = stop_pair();
         handle.stop();
         let error = std::io::Error::from(std::io::ErrorKind::Other).into();
@@ -313,7 +291,7 @@ mod tests {
     }
 
     #[stellarator::test]
-    async fn a_dialer_gives_up_once_stop_is_set() {
+    async fn test_stop_cancels_dial() {
         let (handle, stop) = stop_pair();
         // A port nothing listens on, so the dial is refused at once.
         let mut dialer = Dialer::new("127.0.0.1:1".parse().expect("an address"));
@@ -322,7 +300,7 @@ mod tests {
     }
 
     #[stellarator::test]
-    async fn a_dialer_reaches_a_listener_and_keeps_its_first_delay() {
+    async fn test_dial_connects_without_backoff() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
         let addr = listener.local_addr().expect("bound");
         let (_handle, stop) = stop_pair();

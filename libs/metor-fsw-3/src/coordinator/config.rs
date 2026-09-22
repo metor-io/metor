@@ -122,7 +122,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn params_default_to_null_and_round_trip() {
+    fn test_params_defaults_and_round_trip() {
         let bare: SystemConfig =
             serde_json::from_str(r#"{"id":"nav","ty":"nav"}"#).expect("params optional");
         assert_eq!(bare, SystemConfig::new("nav", "nav"));
@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn simulated_and_subnanosecond_periods_have_no_budget() {
+    fn test_zero_cycle_budget() {
         assert_eq!(
             Clock::Simulated {
                 dt: Duration::from_millis(5)
@@ -152,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn minimum_wall_rate_has_a_bounded_period() {
+    fn test_minimum_wall_rate_budget() {
         let clock = Clock::Wall {
             rate: MIN_WALL_RATE,
         };

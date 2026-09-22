@@ -191,21 +191,21 @@ fn assert_retirement(fault_panics: bool, drop_panics: bool) {
 }
 
 #[test]
-fn failed_consumer_releases_data_and_status_readers() {
+fn test_failed_consumer_releases_readers() {
     assert_retirement(false, false);
 }
 
 #[test]
-fn fault_hook_panic_still_retires_the_consumer_once() {
+fn test_fault_panic_retires_consumer() {
     assert_retirement(true, false);
 }
 
 #[test]
-fn destructor_panic_still_releases_ports_and_keeps_later_entries_running() {
+fn test_destructor_panic_cleanup() {
     assert_retirement(false, true);
 }
 
 #[test]
-fn fault_and_destructor_panics_are_contained_independently() {
+fn test_fault_and_destructor_panic_isolation() {
     assert_retirement(true, true);
 }

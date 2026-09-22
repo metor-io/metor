@@ -159,7 +159,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn changed_value_returns_immediately() {
+    fn test_changed_value_returns_immediately() {
         let a = AtomicU32::new(1);
         wait(&a, 0); // must not hang
         assert_eq!(
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn timeout_lapses_on_silence() {
+    fn test_wait_times_out() {
         let a = AtomicU32::new(0);
         let start = Instant::now();
         let outcome = wait_timeout(&a, 0, Duration::from_millis(50));
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn wake_one_releases_waiter() {
+    fn test_wake_one_releases_waiter() {
         let a = AtomicU32::new(0);
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_loses_no_wakeups() {
+    fn test_handoff_preserves_wakeups() {
         const ROUNDS: u32 = 10_000;
         let ping = AtomicU32::new(0);
         let pong = AtomicU32::new(0);
@@ -221,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn wake_all_releases_every_waiter() {
+    fn test_wake_all_releases_waiters() {
         let a = AtomicU32::new(0);
         std::thread::scope(|s| {
             for _ in 0..4 {

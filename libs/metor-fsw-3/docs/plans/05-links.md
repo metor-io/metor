@@ -304,35 +304,44 @@ enum Transport {
 ```
 
 `Listen` binds in the constructor, so a taken port is a build error, and
-accepts up to `max_connections` (default 8) into slots pre-allocated
-there; a connection past the limit is closed on accept. `Connect` dials
-in `run`, backing off from 500 ms to 10 s as fsw-2's subscriber did, and
-holds one connection.
+serves up to `max_connections` (default 8, at least 1) peers at once; a
+peer past the limit is accepted and closed at once, so it sees a refusal
+rather than a backlog. `Connect` dials in `run`, backing off from 500 ms
+to 10 s as fsw-2's subscriber did, and holds one connection.
 
 ### Connections
 
-`link/conn.rs` is the module both systems call. A `Connections` holds
-one slot per allowed connection. An open slot is the send side of that
-connection's `Outbox` (a `pending_cap`-byte buffer, default 1 MiB,
-behind a `RefCell` with a wake) and the guard of the task that owns the
-socket halves and every other buffer. `enqueue(batch)` copies a batch
-into every open outbox, dropping it whole for one it does not fit and
-counting the drop. The task's write half swaps the outbox out and
-writes it; its read half frames inbound packets with `PacketStream` and
-hands each to the closure given at `open`. A closed socket frees its
-slot on `prune`, folding its byte count into the link. Counters roll up
-into a `LinkStatus` frame (connections, bytes out, batches dropped,
-inbound dropped) each system writes on change on its own `link_status`
-output.
+`link/conn.rs` is the module both systems call. A `Connections` is what
+a link's loop and its connection task share, behind one `Rc`: one slot
+per allowed connection, the seed every connection is sent first, the
+`Inbox` every connection reads into, and the counters. A filled slot is
+the send side of that connection's `Outbox` (a `conn_cap`-byte buffer,
+default 1 MiB, behind a `RefCell` with a wake). `enqueue(batch)` copies
+a batch into every filled outbox, dropping it whole for one it does not
+fit and counting the drop. Counters roll up into a `LinkStatus` frame
+(connections, bytes out, batches dropped, inbound dropped) each system
+writes on change on its own `link_status` output.
 
-Buffers are allocated per accepted connection, not per slot at
-construction: a cancelled task may still hold the previous occupant's
-outbox, so reusing it would need a reference count check. The per-batch
-path allocates nothing.
+The connection task, `transport::source`, owns the sockets and runs
+until `stop`. A dialer is one loop: connect, serve, and around again,
+so a connection that ends is redialed because the loop came back. A
+listener accepts every peer, claims a slot or closes the socket on the
+spot, and spawns `serve` for the slot. `serve` writes the seed, then
+races the two halves against `stop`: the write half swaps the outbox
+out and writes it, the read half reads packet bodies into a
+`conn_cap`-byte buffer and hands each to the inbox. Either half ending
+frees the slot, folding its byte count into the link. The loop never
+sees a socket: it races its own readiness against a counter change and
+`stop`, fills and enqueues, and writes status.
 
-Connections arrive through `Incoming`, a task of the link's own that
-accepts or dials one at a time, so the link's loop can race a batch
-against a connection without cancelling an in-flight accept.
+`conn_cap` is also the bound on a `Publish` batch: `fill` leaves a
+record that might take the batch past it for the next cycle, which the
+mirror's readiness fires at once, so the batch never regrows.
+
+Buffers are allocated per connection, not per slot at construction: a
+half ended by `stop` or by its peer may still hold a buffer in an
+operation, so reusing it would need a join first (`TODO.md`). The
+per-batch path allocates nothing.
 
 ### `Publish`
 
@@ -373,11 +382,14 @@ the Rust side accepts any name.
 ### `Subscribe`
 
 An async system with dynamic outputs, a `transport`, and a `link_status`
-output. Its connection tasks copy each `Msg` packet whose id is one of
-its outputs' wire ids into a bounded inbox (`inbound_cap` slots, default
-256, each sized to the largest output), and its `run` drains the inbox
-onto the ports, verbatim. A full inbox counts a drop. A `Frame` output
-cannot be refused at construction, since port defs arrive at bind; it
+output. Its connection tasks read length-delimited packet bodies and
+write each one carrying a message whose id is one of its outputs' wire
+ids, verbatim, onto an in-memory ring of at least `inbound_cap` records
+(default 256) of the largest output's length, through one writer they
+share; its `run` drains the ring onto the ports. A full ring counts a
+drop; a table, or a message no output takes, is ignored. A `Frame`
+output cannot be refused at construction, since port defs arrive at
+bind; it
 faults `frame_output` on the log at start and is skipped.
 Unmatched ids are ignored, not logged; the panel probes with node
 protocol messages on connect. When listening it sends a `LinkInfo` with

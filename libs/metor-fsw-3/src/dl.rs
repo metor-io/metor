@@ -363,14 +363,14 @@ mod tests {
     }
 
     #[test]
-    fn reads_a_guest_descriptor_into_owned_storage() {
+    fn test_descriptor_owned_storage() {
         // SAFETY: this callback implements the descriptor ABI.
         let def = unsafe { descriptor(empty_table) }.unwrap();
         assert!(def.systems.is_empty());
     }
 
     #[test]
-    fn rejects_failed_descriptor_exports() {
+    fn test_descriptor_export_errors() {
         // SAFETY: these callbacks touch no storage and return failure statuses.
         assert!(matches!(
             unsafe { descriptor(status::<1>) },
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_lengths_and_json() {
+    fn test_descriptor_invalid_length_and_json() {
         for callback in [oversized_length as PackDefFn, status::<0>] {
             // SAFETY: callbacks write at most the supplied result slot.
             assert!(matches!(

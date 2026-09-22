@@ -105,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn export_and_derived_handles_retain_backing() -> TestResult {
+    fn test_export_and_derived_handles_retain_backing() -> TestResult {
         let host = ring();
         let weak = Arc::downgrade(&host.inner);
         let export = host.export();
@@ -132,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_can_release_the_last_attachment() -> TestResult {
+    fn test_worker_releases_last_attachment() -> TestResult {
         let host = ring();
         let weak = Arc::downgrade(&host.inner);
         let export = host.export();
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn attachments_balance_callbacks_on_success_and_failure() -> TestResult {
+    fn test_attachments_balance_callbacks() -> TestResult {
         let host = ring();
         let export = host.export();
         let (base, len) = export.region();

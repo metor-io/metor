@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn every_param_kind_renders_with_its_default() {
+    fn test_render_param_defaults() {
         let schema = r##"{"type":"object","properties":{
             "rate":{"type":"number","default":0.5},
             "count":{"type":"integer","default":3},
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn a_param_named_like_an_input_is_a_clash() {
+    fn test_reject_param_input_collision() {
         let clash = rendered(vec![system(
             "nav",
             vec![port("gain", "imu")],
@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn a_system_with_no_ports_still_has_the_framework_records() {
+    fn test_empty_system_includes_framework_records() {
         let text = rendered(vec![system("mode", vec![], vec![], None)]).expect("renders");
         assert!(!text.contains("dataclass"));
         assert!(text.contains("class LogEvent(Record):\n    _name = \"log\"\n"));

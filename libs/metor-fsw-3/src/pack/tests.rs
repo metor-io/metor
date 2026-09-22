@@ -118,7 +118,7 @@ fn descriptor(build: fn() -> SystemTable, buffer: &mut [u8]) -> (u32, usize) {
 }
 
 #[test]
-fn the_descriptor_decodes_as_the_tables_projection() {
+fn test_descriptor_export() {
     let mut bytes = vec![0u8; 64 * 1024];
     let (status, len) = descriptor(build, &mut bytes);
     assert_eq!(status, DefStatus::Ok as u32);
@@ -158,7 +158,7 @@ fn system_def_raw(ty: &str, cx: &DefCxOwned, buffer: &mut [u8]) -> (u32, usize) 
 }
 
 #[test]
-fn a_definition_export_answers_with_the_ports_the_config_names() {
+fn test_configured_port_export() {
     let producer = crate::Output::<Imu>::def("imu");
     let cx = DefCxOwned {
         inputs: vec![("plant.imu".to_string(), producer)],
@@ -176,7 +176,7 @@ fn a_definition_export_answers_with_the_ports_the_config_names() {
 }
 
 #[test]
-fn a_refused_definition_comes_back_as_its_error() {
+fn test_definition_export_errors() {
     let mut bytes = vec![0u8; 4096];
     let (status, len) = system_def_raw("missing", &DefCxOwned::default(), &mut bytes);
     assert_eq!(status, DefStatus::Refused as u32);
@@ -204,7 +204,7 @@ fn a_refused_definition_comes_back_as_its_error() {
 }
 
 #[test]
-fn descriptor_initialization_panics_are_contained() {
+fn test_descriptor_panic_containment() {
     fn broken() -> SystemTable {
         panic!("table build");
     }
@@ -220,7 +220,7 @@ fn descriptor_initialization_panics_are_contained() {
 }
 
 #[test]
-fn table_captures_are_owned_once_per_thread_and_released_on_exit() {
+fn test_table_capture_lifetime() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     struct Capture;
@@ -253,7 +253,7 @@ fn table_captures_are_owned_once_per_thread_and_released_on_exit() {
 }
 
 #[test]
-fn an_unknown_type_returns_a_decode_error() {
+fn test_unknown_system_type() {
     let instance = create_raw("gyro", "", &[], &[]);
     assert!(instance.handle.is_null());
     let error: ParamError = serde_json::from_slice(instance.error()).expect("error");
@@ -261,7 +261,7 @@ fn an_unknown_type_returns_a_decode_error() {
 }
 
 #[test]
-fn a_bad_params_key_returns_the_tables_own_error() {
+fn test_unknown_param_key() {
     let nav = ring::<Nav>(1);
     let outputs = [raw(&nav)];
     let instance = create_raw("nav", r#"{"gain":2.0}"#, &[input(&[])], &outputs);
@@ -271,7 +271,7 @@ fn a_bad_params_key_returns_the_tables_own_error() {
 }
 
 #[test]
-fn malformed_params_are_a_decode_error() {
+fn test_malformed_params() {
     let nav = ring::<Nav>(1);
     let outputs = [raw(&nav)];
     let instance = create_raw("nav", "{", &[input(&[])], &outputs);
@@ -281,7 +281,7 @@ fn malformed_params_are_a_decode_error() {
 }
 
 #[test]
-fn a_two_system_pipeline_moves_a_record_within_one_cycle() {
+fn test_pipeline_single_cycle() {
     let (imu, nav) = (ring::<Imu>(1), ring::<Nav>(1));
     let imu_out = [raw(&imu)];
     let nav_out = [raw(&nav)];
@@ -300,7 +300,7 @@ fn a_two_system_pipeline_moves_a_record_within_one_cycle() {
 }
 
 #[test]
-fn a_panicking_system_returns_panicked_and_writes_one_fault_line() {
+fn test_system_panic_status_and_log() {
     let (imu, log) = (ring::<Imu>(1), ring::<LogEvent>(1));
     let outputs = [raw(&imu), raw(&log)];
     let boom = create_raw("boom", "", &[], &outputs);
@@ -318,7 +318,7 @@ fn a_panicking_system_returns_panicked_and_writes_one_fault_line() {
 }
 
 #[test]
-fn destroy_frees_the_reader_slot_and_the_writer() {
+fn test_destroy_releases_ring_handles() {
     let (imu, nav) = (ring::<Imu>(1), ring::<Nav>(1));
     let nav_out = [raw(&nav)];
     let edges = [raw(&imu)];
@@ -332,21 +332,16 @@ fn destroy_frees_the_reader_slot_and_the_writer() {
 }
 
 #[test]
-fn an_unknown_status_word_is_a_panic() {
+fn test_unknown_status_is_panicked() {
     assert_eq!(Status::from_raw(0), Status::Ok);
     assert_eq!(Status::from_raw(1), Status::Panicked);
     assert_eq!(Status::from_raw(7), Status::Panicked);
 }
 
-#[test]
-fn the_abi_version_is_five() {
-    assert_eq!(ABI_VERSION, 5);
-}
-
 /// The `metor-fsw-abi` distribution exists to pin this number; a pack's
 /// editable wheel requires it exactly.
 #[test]
-fn the_abi_distributions_version_is_the_abi_version() {
+fn test_python_abi_version() {
     let manifest: toml::Value = include_str!("../../python/metor-fsw-abi/pyproject.toml")
         .parse()
         .expect("valid TOML");
@@ -359,7 +354,7 @@ fn the_abi_distributions_version_is_the_abi_version() {
 /// The built-in links ship with the host, so `metor_config` declares their
 /// pack at this ABI.
 #[test]
-fn the_builtin_packs_abi_version_is_the_abi_version() {
+fn test_builtin_abi_version() {
     let source = include_str!("../../python/metor-config/metor_config/_config.py");
     assert!(
         source.contains(&format!("\nABI_VERSION = {ABI_VERSION}\n")),

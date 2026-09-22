@@ -49,7 +49,7 @@ class TargetTest(unittest.TestCase):
         # Leave no target behind, or the atexit hook emits one to stdout.
         target_mod._targets.clear()
 
-    def test_the_atexit_hook_emits_once(self) -> None:
+    def test_atexit_emits_once(self) -> None:
         adcs_target()
         with tempfile.TemporaryDirectory() as dir:
             path = os.path.join(dir, "out.json")
@@ -60,7 +60,7 @@ class TargetTest(unittest.TestCase):
             target_mod._emit_at_exit()
             self.assertFalse(os.path.exists(path))
 
-    def test_example_emits_the_golden(self) -> None:
+    def test_example_matches_golden(self) -> None:
         adcs_target()
         with tempfile.TemporaryDirectory() as dir:
             path = os.path.join(dir, "target.json")
@@ -70,7 +70,7 @@ class TargetTest(unittest.TestCase):
         with open(GOLDEN, "rb") as file:
             self.assertEqual(written, file.read())
 
-    def test_emit_writes_to_the_env_path(self) -> None:
+    def test_emit_uses_env_path(self) -> None:
         adcs_target()
         with tempfile.TemporaryDirectory() as dir:
             path = os.path.join(dir, "out.json")
@@ -79,7 +79,7 @@ class TargetTest(unittest.TestCase):
             with open(path, encoding="utf-8") as file:
                 self.assertEqual(json.load(file)["config_version"], 1)
 
-    def test_sim_dt_selects_the_simulated_clock(self) -> None:
+    def test_sim_dt_selects_simulated_clock(self) -> None:
         fsw = Target(cycle_rate=120.0, sim_dt=1 / 120)
         self.assertEqual(
             fsw.to_config()["coordinator"]["clock"],
@@ -121,13 +121,13 @@ class TargetTest(unittest.TestCase):
             ],
         )
 
-    def test_add_twice_under_one_name_raises(self) -> None:
+    def test_reject_duplicate_system_name(self) -> None:
         fsw = Target(cycle_rate=100.0)
         fsw.add("plant", Plant())
         with self.assertRaisesRegex(ConfigError, "already added"):
             fsw.add("plant", Plant())
 
-    def test_abi_mismatch_names_both_versions(self) -> None:
+    def test_abi_error_reports_versions(self) -> None:
         os.environ["METOR_FSW_ABI_VERSION"] = "7"
         fsw = Target(cycle_rate=100.0)
         with self.assertRaises(ConfigError) as caught:
@@ -136,7 +136,7 @@ class TargetTest(unittest.TestCase):
         self.assertIn("ABI 1", message)
         self.assertIn("host ABI is 7", message)
 
-    def test_matching_abi_is_accepted(self) -> None:
+    def test_accept_matching_abi(self) -> None:
         os.environ["METOR_FSW_ABI_VERSION"] = "1"
         fsw = Target(cycle_rate=100.0)
         fsw.add("plant", Plant())
@@ -147,24 +147,24 @@ class TargetTest(unittest.TestCase):
         with self.assertRaisesRegex(AttributeError, "no output port `est`"):
             plant.est  # type: ignore[attr-defined]
 
-    def test_log_and_status_are_always_outputs(self) -> None:
+    def test_outputs_include_log_and_status(self) -> None:
         fsw = Target(cycle_rate=100.0)
         plant = fsw.add("plant", Plant())
         self.assertEqual(plant.log.ref, PortRef("plant", "log"))
         self.assertEqual(plant.status.ref, PortRef("plant", "status"))
 
-    def test_a_system_without_params_emits_null(self) -> None:
+    def test_missing_params_emit_null(self) -> None:
         fsw = Target(cycle_rate=100.0)
         fsw.add("mode", Mode())
         entry = fsw.to_config()["coordinator"]["systems"][0]
         self.assertIsNone(entry["params"])
         self.assertEqual(entry["inputs"], [])
 
-    def test_a_non_source_input_raises(self) -> None:
+    def test_reject_non_source_input(self) -> None:
         with self.assertRaisesRegex(ConfigError, "input `imu`"):
             Nav(imu="plant.imu")  # type: ignore[arg-type]
 
-    def test_emission_needs_exactly_one_target(self) -> None:
+    def test_emit_requires_one_target(self) -> None:
         adcs_target()
         adcs_target()
         with self.assertRaisesRegex(ConfigError, "found 2"):
@@ -179,7 +179,7 @@ class LinkTest(unittest.TestCase):
     def tearDown(self) -> None:
         target_mod._targets.clear()
 
-    def test_a_published_handle_lists_log_and_status(self) -> None:
+    def test_publish_handle_includes_log_and_status(self) -> None:
         fsw = Target(cycle_rate=100.0)
         plant = fsw.add("plant", Plant())
         fsw.add("pub", Publish([plant], listen="0.0.0.0:2240"))
@@ -196,7 +196,7 @@ class LinkTest(unittest.TestCase):
             {"listen": {"addr": "0.0.0.0:2240", "max_connections": 8}},
         )
 
-    def test_a_published_port_stands_alone(self) -> None:
+    def test_publish_single_port(self) -> None:
         fsw = Target(cycle_rate=100.0)
         plant = fsw.add("plant", Plant())
         fsw.add("pub", Publish([plant.imu], connect="127.0.0.1:2240"))
@@ -204,7 +204,7 @@ class LinkTest(unittest.TestCase):
         self.assertEqual([input["port"] for input in entry["inputs"]], ["plant.imu"])
         self.assertEqual(entry["params"]["transport"], {"connect": {"addr": "127.0.0.1:2240"}})
 
-    def test_publishing_everything_lists_only_earlier_systems(self) -> None:
+    def test_publish_all_includes_prior_systems(self) -> None:
         fsw = Target(cycle_rate=100.0)
         fsw.add("plant", Plant())
         fsw.add("pub", Publish(listen="0.0.0.0:2240", all=True))
@@ -217,7 +217,7 @@ class LinkTest(unittest.TestCase):
         # Emission repeats without growing the edge list.
         self.assertEqual(fsw.to_config()["coordinator"]["systems"][1], entry)
 
-    def test_a_generated_type_takes_a_port_list(self) -> None:
+    def test_generated_type_accepts_ports(self) -> None:
         fsw = Target(cycle_rate=100.0)
         plant = fsw.add("plant", Plant())
         nav = fsw.add("nav", Nav(imu=plant.imu))
@@ -230,18 +230,18 @@ class LinkTest(unittest.TestCase):
         self.assertEqual(entry["inputs"][3]["from"], [{"system": "nav", "port": "est"}])
         self.assertEqual(entry["params"], {"gain": 2.0})
 
-    def test_a_generated_type_with_no_items_has_no_edges(self) -> None:
+    def test_empty_generated_type_has_no_edges(self) -> None:
         fsw = Target(cycle_rate=100.0)
         fsw.add("tap", Tap())
         entry = fsw.to_config()["coordinator"]["systems"][0]
         self.assertEqual(entry["inputs"], [])
         self.assertNotIn("outputs", entry)
 
-    def test_a_generated_port_list_takes_ports_and_handles_only(self) -> None:
+    def test_reject_invalid_generated_ports(self) -> None:
         with self.assertRaisesRegex(ConfigError, "handles and ports"):
             Tap(items=["plant.imu"])  # type: ignore[list-item]
 
-    def test_a_generated_type_takes_a_record_list(self) -> None:
+    def test_generated_type_accepts_records(self) -> None:
         fsw = Target(cycle_rate=100.0)
         fan = fsw.add("fan", Fan(records=[Ping, MotorCmd]))
         entry = fsw.to_config()["coordinator"]["systems"][0]
@@ -258,33 +258,37 @@ class LinkTest(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "record classes"):
             Fan(records=[Plant])  # type: ignore[list-item]
 
-    def test_both_or_neither_transport_raises(self) -> None:
+    def test_require_one_transport(self) -> None:
         with self.assertRaisesRegex(ConfigError, "exactly one"):
             Publish([], listen="0.0.0.0:1", connect="0.0.0.0:2")
         with self.assertRaisesRegex(ConfigError, "exactly one"):
             Subscribe([Ping])
 
-    def test_max_connections_on_a_dialing_link_raises(self) -> None:
+    def test_connect_rejects_max_connections(self) -> None:
         with self.assertRaisesRegex(ConfigError, "max_connections"):
             Publish([], connect="127.0.0.1:2240", max_connections=2)
         with self.assertRaisesRegex(ConfigError, "max_connections"):
             Subscribe([Ping], connect="127.0.0.1:2240", max_connections=2)
 
-    def test_subscribing_to_one_record_twice_raises(self) -> None:
+    def test_listen_rejects_zero_connections(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "at least one"):
+            Publish([], listen="0.0.0.0:1", max_connections=0)
+
+    def test_subscribe_rejects_duplicate_record(self) -> None:
         with self.assertRaisesRegex(ConfigError, "twice"):
             Subscribe([Ping, Ping], listen="0.0.0.0:1")
 
-    def test_publishing_something_that_is_no_port_raises(self) -> None:
+    def test_publish_rejects_invalid_port(self) -> None:
         with self.assertRaisesRegex(ConfigError, "handles and ports"):
             Publish(["plant.imu"], listen="0.0.0.0:1")  # type: ignore[list-item]
 
-    def test_subscribing_to_a_non_record_raises(self) -> None:
+    def test_subscribe_rejects_invalid_record(self) -> None:
         with self.assertRaisesRegex(ConfigError, "record classes"):
             Subscribe([Plant], listen="0.0.0.0:1")  # type: ignore[list-item]
         with self.assertRaisesRegex(ConfigError, "record classes"):
             Subscribe(["ping"], listen="0.0.0.0:1")  # type: ignore[list-item]
 
-    def test_a_subscribed_record_is_a_port_the_handle_resolves(self) -> None:
+    def test_subscribe_resolves_record_ports(self) -> None:
         fsw = Target(cycle_rate=100.0, namespace="cube_sat")
         cmds = fsw.add("cmds", Subscribe([Ping], listen="0.0.0.0:2241"))
         self.assertEqual(cmds.ping.ref, PortRef("cmds", "ping"))  # type: ignore[attr-defined]
@@ -296,12 +300,12 @@ class LinkTest(unittest.TestCase):
         self.assertEqual(entry["params"]["namespace"], "cube_sat")
         self.assertEqual(entry["params"]["link"], "cmds")
 
-    def test_the_builtin_pack_is_not_a_config_pack(self) -> None:
+    def test_config_excludes_builtin_pack(self) -> None:
         fsw = Target(cycle_rate=100.0)
         fsw.add("cmds", Subscribe([], listen="0.0.0.0:2241"))
         self.assertEqual(fsw.to_config()["packs"], [])
 
-    def test_subscribe_loads_its_record_pack_without_a_pack_system(self) -> None:
+    def test_subscribe_loads_record_pack(self) -> None:
         fsw = Target(cycle_rate=100.0)
         cmds = fsw.add("cmds", Subscribe([Ping, MotorCmd], listen="127.0.0.1:0"))
         fsw.add("pub", Publish([cmds], listen="127.0.0.1:0"))
@@ -309,7 +313,7 @@ class LinkTest(unittest.TestCase):
         fsw.add("plant", Plant())
         self.assertEqual(fsw.to_config()["packs"], [PACK.to_json()])
 
-    def test_a_record_pack_abi_mismatch_does_not_register_the_link(self) -> None:
+    def test_abi_mismatch_prevents_registration(self) -> None:
         os.environ["METOR_FSW_ABI_VERSION"] = str(ABI_VERSION)
         fsw = Target(cycle_rate=100.0)
         with self.assertRaisesRegex(ConfigError, "pack `adcs`.*ABI 1"):
@@ -318,7 +322,7 @@ class LinkTest(unittest.TestCase):
         self.assertEqual(fsw.to_config()["coordinator"]["systems"], [])
         fsw.add("cmds", Subscribe([], listen="127.0.0.1:0"))
 
-    def test_a_reused_publish_resolves_each_registration_independently(self) -> None:
+    def test_publish_registration_isolation(self) -> None:
         fsw = Target(cycle_rate=100.0)
         fsw.add("plant", Plant())
         publish = Publish(all=True, listen="127.0.0.1:0")
@@ -340,7 +344,7 @@ class LinkTest(unittest.TestCase):
         self.assertEqual(publish._params["link"], "")
         self.assertEqual(publish._inputs, {})
 
-    def test_reuse_across_targets_and_emission_preserves_previous_configs(self) -> None:
+    def test_target_config_isolation(self) -> None:
         subscribe = Subscribe([Ping], listen="127.0.0.1:0")
         first = Target(cycle_rate=100.0, namespace="first")
         first.add("a", subscribe)
@@ -358,7 +362,7 @@ class LinkTest(unittest.TestCase):
         self.assertEqual(first.to_config(), saved)
         self.assertEqual(second.to_config()["coordinator"]["systems"][0]["outputs"][0]["port"], "ping")
 
-    def test_a_thread_lands_on_the_system(self) -> None:
+    def test_system_thread_assignment(self) -> None:
         fsw = Target(cycle_rate=100.0)
         fsw.add("cmds", Subscribe([Ping], listen="0.0.0.0:2241"), thread="io")
         fsw.add("plant", Plant())
