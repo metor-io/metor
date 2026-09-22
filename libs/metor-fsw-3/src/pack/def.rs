@@ -80,6 +80,7 @@ fn probe(entry: &TableEntry) -> (bool, bool) {
         inputs: &inputs,
         outputs: &outputs,
         records: &records,
+        ..DefCx::empty()
     };
     match entry.def_for(&cx) {
         Ok(def) => (took(&def.inputs), took(&def.outputs)),
@@ -94,6 +95,8 @@ fn took(ports: &[PortDef]) -> bool {
 /// A [`DefCx`] as the ABI carries it: the borrowed context, owned.
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct DefCxOwned {
+    pub id: String,
+    pub namespace: Option<String>,
     pub inputs: Vec<(String, PortDef)>,
     pub outputs: Vec<OutputConfig>,
     pub records: Records,
@@ -103,6 +106,8 @@ impl DefCxOwned {
     /// Copies a context for the crossing.
     pub fn of(cx: &DefCx<'_>) -> Self {
         Self {
+            id: cx.id.to_string(),
+            namespace: cx.namespace.map(str::to_string),
             inputs: cx
                 .inputs
                 .iter()
@@ -124,6 +129,8 @@ impl DefCxOwned {
     /// Borrows this context back, over `edges` from [`DefCxOwned::edges`].
     pub fn borrow<'a>(&'a self, edges: &'a [(&'a str, &'a PortDef)]) -> DefCx<'a> {
         DefCx {
+            id: &self.id,
+            namespace: self.namespace.as_deref(),
             inputs: edges,
             outputs: &self.outputs,
             records: &self.records,

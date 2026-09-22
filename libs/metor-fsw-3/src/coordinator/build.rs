@@ -104,7 +104,8 @@ fn resolve<'a>(
                 ty: system.ty.clone(),
             })?;
 
-        let def = instance_def(system, entry, &plan, &index, &records)?;
+        let namespace = config.namespace.as_deref();
+        let def = instance_def(system, entry, &plan, &index, &records, namespace)?;
         check_port_names(&system.id, &def)?;
         if def.outputs.iter().any(|p| p.name == STATUS_PORT) {
             return Err(BuildError::ReservedPort {
@@ -157,10 +158,13 @@ fn instance_def(
     plan: &Plan<'_>,
     index: &HashMap<&str, usize>,
     records: &Records,
+    namespace: Option<&str>,
 ) -> Result<SystemDef, BuildError> {
     let producers = producers(system, entry, plan, index)?;
     let inputs: Vec<(&str, &PortDef)> = producers.iter().map(|(port, def)| (*port, def)).collect();
     let cx = DefCx {
+        id: &system.id,
+        namespace,
         inputs: &inputs,
         outputs: &system.outputs,
         records,

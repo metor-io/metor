@@ -16,6 +16,9 @@ pub const DEFAULT_RING_DEPTH: usize = 8;
 pub struct CoordinatorConfig {
     pub clock: Clock,
     pub ring_depth: usize,
+    /// The prefix every announced name hangs under.
+    #[serde(default)]
+    pub namespace: Option<String>,
     pub systems: Vec<SystemConfig>,
 }
 
@@ -24,6 +27,7 @@ impl Default for CoordinatorConfig {
         Self {
             clock: Clock::Wall { rate: 100.0 },
             ring_depth: DEFAULT_RING_DEPTH,
+            namespace: None,
             systems: Vec::new(),
         }
     }

@@ -708,6 +708,7 @@ fn test_dynamic_parameter_port_order() {
         inputs: &edges,
         outputs: &outputs,
         records: &records,
+        ..DefCx::empty()
     };
     let def = FnSystem::<Link>::def(&cx).expect("a definition");
     let names: Vec<_> = def.inputs.iter().map(|port| port.name.as_ref()).collect();

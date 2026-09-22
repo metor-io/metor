@@ -10,6 +10,10 @@ use crate::system::PortDef;
 
 /// What a type sees of one instance's config when it computes its def.
 pub struct DefCx<'a> {
+    /// The instance this def is for.
+    pub id: &'a str,
+    /// The target's namespace, which announced names hang under.
+    pub namespace: Option<&'a str>,
     /// One entry per config edge: the input port it names and the def of the
     /// output feeding it.
     pub inputs: &'a [(&'a str, &'a PortDef)],
@@ -25,6 +29,8 @@ impl DefCx<'static> {
     /// The context with nothing in it: the def the descriptor carries.
     pub fn empty() -> Self {
         Self {
+            id: "",
+            namespace: None,
             inputs: &[],
             outputs: &[],
             records: &NO_RECORDS,
@@ -36,6 +42,8 @@ impl<'a> DefCx<'a> {
     /// The context of one instance's input edges.
     pub fn of_inputs(inputs: &'a [(&'a str, &'a PortDef)]) -> Self {
         Self {
+            id: "",
+            namespace: None,
             inputs,
             outputs: &[],
             records: &NO_RECORDS,
@@ -45,10 +53,22 @@ impl<'a> DefCx<'a> {
     /// The context of one instance's output ports.
     pub fn of_outputs(outputs: &'a [OutputConfig], records: &'a Records) -> Self {
         Self {
+            id: "",
+            namespace: None,
             inputs: &[],
             outputs,
             records,
         }
+    }
+
+    /// Where port `port`'s components hang: `{namespace}.{id}.{port}`,
+    /// skipping the parts this context lacks.
+    pub fn root(&self, port: &str) -> String {
+        [self.namespace.unwrap_or(""), self.id, port]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(".")
     }
 }
 
@@ -118,6 +138,22 @@ mod tests {
     use super::*;
     use crate::tests::utils::{Imu, Nav};
     use crate::{Output, Record};
+
+    #[test]
+    fn test_root_skips_missing_parts() {
+        assert_eq!(DefCx::empty().root("imu"), "imu");
+        let named = DefCx {
+            id: "plant",
+            ..DefCx::empty()
+        };
+        assert_eq!(named.root("imu"), "plant.imu");
+        let namespaced = DefCx {
+            id: "plant",
+            namespace: Some("cube_sat"),
+            ..DefCx::empty()
+        };
+        assert_eq!(namespaced.root("imu"), "cube_sat.plant.imu");
+    }
 
     #[test]
     fn test_record_port_lookup() {

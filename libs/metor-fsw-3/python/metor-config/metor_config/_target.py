@@ -92,6 +92,7 @@ class Target:
             "coordinator": {
                 "clock": self._clock(),
                 "ring_depth": self.ring_depth,
+                "namespace": self.namespace,
                 "systems": [
                     self._system(index) for index in range(len(self._systems))
                 ],
