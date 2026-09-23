@@ -11,7 +11,7 @@ use std::process::{Command, ExitStatus};
 use tracing_subscriber::layer::SubscriberExt;
 
 use super::build::{cdylib_name, read_toml, string, triple};
-use super::config::{ConfigError, TargetConfig};
+use super::config::{ConfigError, DeploymentConfig, TargetConfig};
 use super::pack_dev::{PackDevError, pack_dev};
 use crate::coordinator::{BuildError, Clock, Coordinator, SystemTable};
 use crate::dl::{Pack, PackError};
@@ -25,6 +25,9 @@ const IN_REPO_CONFIG_PY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/python/met
 pub struct Run {
     /// The target file to evaluate; `./target.py` by default.
     pub target: Option<PathBuf>,
+    /// The deployment member to run, by namespace; needed when there are several.
+    #[arg(long = "target", value_name = "NS")]
+    pub member: Option<String>,
     /// Stop after this many cycles instead of on SIGINT.
     #[arg(long)]
     pub cycles: Option<u64>,
@@ -72,7 +75,8 @@ pub fn run(args: Run) -> Result<(), RunError> {
         pack_dev(pack)?;
     }
     let config = eval_target(&target, &packs)?;
-    let coordinator = load(config, &args)?;
+    let member = config.target(args.member.as_deref())?;
+    let coordinator = load(&config.targets[member], &args)?;
     if args.print_ports {
         print_ports();
     }
@@ -155,8 +159,8 @@ fn is_dev_pack(root: &Path) -> bool {
         })
 }
 
-/// Runs the target file as a script and reads the config it emitted.
-pub fn eval_target(path: &Path, dev_packs: &[PathBuf]) -> Result<TargetConfig, RunError> {
+/// Runs the target file as a script and reads the deployment it emitted.
+pub fn eval_target(path: &Path, dev_packs: &[PathBuf]) -> Result<DeploymentConfig, RunError> {
     let out = std::env::temp_dir().join(format!("metor-config-{}.json", std::process::id()));
     let status = Command::new(interpreter())
         .arg(path)
@@ -169,7 +173,7 @@ pub fn eval_target(path: &Path, dev_packs: &[PathBuf]) -> Result<TargetConfig, R
     }
     let bytes = std::fs::read(&out)?;
     let _ = std::fs::remove_file(&out);
-    Ok(TargetConfig::from_slice(&bytes)?)
+    Ok(DeploymentConfig::from_slice(&bytes)?)
 }
 
 /// `$METOR_PYTHON`, else the active virtualenv's, else `python3`.
@@ -199,8 +203,9 @@ fn python_path(dev_packs: &[PathBuf]) -> OsString {
     path
 }
 
-/// Applies the clock overrides, opens every pack, and builds the graph.
-pub fn load(mut config: TargetConfig, overrides: &Run) -> Result<Coordinator, RunError> {
+/// Applies the clock overrides, opens the target's packs, and builds its graph.
+pub fn load(config: &TargetConfig, overrides: &Run) -> Result<Coordinator, RunError> {
+    let mut config = config.clone();
     if let Some(rate) = overrides.wall {
         config.coordinator.clock = Clock::Wall { rate };
     }
@@ -296,17 +301,13 @@ mod tests {
 
     #[test]
     fn test_reject_negative_sim_dt() {
-        let config = TargetConfig {
-            config_version: super::super::config::CONFIG_VERSION,
-            packs: Vec::new(),
-            coordinator: Default::default(),
-        };
+        let config = TargetConfig::default();
         let overrides = Run {
             sim_dt: Some(-1.0),
             ..Default::default()
         };
         assert!(matches!(
-            load(config, &overrides),
+            load(&config, &overrides),
             Err(RunError::SimDt(dt)) if dt == -1.0
         ));
     }

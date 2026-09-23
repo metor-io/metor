@@ -1,21 +1,16 @@
-"""Record a target's systems and emit its coordinator config."""
+"""Record a target's systems and build its config."""
 
 from __future__ import annotations
 
-import atexit
-import json
-import os
-import sys
 from typing import Any, TypeVar, cast
 
-from ._config import OUT_ENV, CONFIG_VERSION, ConfigError, check_abi, simulated_clock, wall_clock
+from ._config import ConfigError, check_abi, simulated_clock, wall_clock
 from ._model import Loop, OutPort, Pack, Record, Source, System, _json
 
 S = TypeVar("S", bound=System)
 T = TypeVar("T", bound=Record)
 
 _targets: list["Target"] = []
-_emitted = False
 
 ALWAYS_OUTPUTS = ("log", "status")
 
@@ -82,12 +77,11 @@ class Target:
         return cast(S, handle)
 
     def to_config(self) -> dict[str, Any]:
-        """The config file as a dict: this target's packs and its coordinator.
+        """This target's packs and its coordinator, as one member of the envelope.
 
         A pack with no library is built into the host, so it is not listed.
         """
         return {
-            "config_version": CONFIG_VERSION,
             "packs": [pack.to_json() for pack in self._packs.values() if pack.lib],
             "coordinator": {
                 "clock": self._clock(),
@@ -143,32 +137,3 @@ def _resolve(name: str, port: str, source: Source[Any]) -> dict[str, str]:
         return source.producer.ref.to_json()
     return source.ref.to_json()
 
-
-def emit(path: str | None = None) -> None:
-    """Write this file's target config to ``path``, else ``$METOR_CONFIG_OUT``,
-    else stdout."""
-    global _emitted
-    text = json.dumps(_the_target().to_config(), indent=2, sort_keys=False) + "\n"
-    out = path or os.environ.get(OUT_ENV)
-    if out:
-        with open(out, "w", encoding="utf-8") as file:
-            file.write(text)
-    else:
-        sys.stdout.write(text)
-    _emitted = True
-
-
-def _the_target() -> Target:
-    if len(_targets) != 1:
-        raise ConfigError(f"exactly one Target must exist at emission, found {len(_targets)}")
-    return _targets[0]
-
-
-def _emit_at_exit() -> None:
-    # A target file is a script that ends; a file that raised has already
-    # printed its traceback.
-    if not _emitted and len(_targets) == 1:
-        emit()
-
-
-atexit.register(_emit_at_exit)
