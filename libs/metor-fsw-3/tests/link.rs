@@ -813,6 +813,65 @@ async fn test_subscribe_faults_unannounced_table() {
     assert!(client.pings().is_empty(), "nothing routes under a stale id");
 }
 
+/// A port no other target holds, for two targets in a row.
+fn free_port() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    listener.local_addr().expect("its address")
+}
+
+#[stellarator::test]
+async fn test_reconnect_checks_the_new_peer() {
+    let (server, client) = (Seen::default(), Seen::default());
+    let addr = free_port();
+    let first = spawn(
+        vec![
+            SystemConfig::new("imu", "source"),
+            publish(
+                "pub-again",
+                json!({ "listen": { "addr": addr.to_string() } }),
+                1 << 20,
+            ),
+        ],
+        &server,
+        500.0,
+    );
+    let _client = spawn(mirror(addr, published_imu()), &client, 500.0);
+    until_seen("the mirror never received a frame", &client, || {
+        client.pings().len() >= 3
+    })
+    .await;
+    assert!(!client.faulted("peer_schema_mismatch"));
+    drop(first);
+
+    // The same address, rebuilt around a frame the mirror's port never takes.
+    let rebuilt = Seen::default();
+    let _second = spawn(
+        vec![
+            SystemConfig::new("wide", "wide"),
+            SystemConfig {
+                params: json!({
+                    "transport": { "listen": { "addr": addr.to_string() } },
+                    "namespace": "cube_sat",
+                    "link": "pub-rebuilt",
+                    "conn_cap": 1 << 20,
+                }),
+                ..reading(
+                    "pub",
+                    "fsw.publish",
+                    "wide.wide",
+                    PortRef::new("wide", "wide"),
+                )
+            },
+        ],
+        &rebuilt,
+        500.0,
+    );
+    until_seen("the mirror never faulted on the new peer", &client, || {
+        client.faulted("peer_schema_mismatch")
+    })
+    .await;
+}
+
 #[stellarator::test]
 async fn test_subscribe_skips_large_announce() {
     let (server, client) = (Seen::default(), Seen::default());

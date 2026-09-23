@@ -130,8 +130,9 @@ impl Connections {
     }
 
     /// Serves `stream` from `slot` until either half ends or `stop`, then frees
-    /// the slot.
+    /// the slot. Each connection's announce is checked on its own.
     pub(crate) async fn serve(&self, slot: Slot, stream: TcpStream, stop: &Stop) {
+        self.inbox.connected();
         let (rx, tx) = stream.split();
         let halves = future::or(
             write_half(&slot.outbox, &self.changed, tx, self.seed.clone()),

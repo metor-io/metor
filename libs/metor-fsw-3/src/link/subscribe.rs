@@ -148,7 +148,7 @@ impl Subscribe {
 /// Faults each frame port whose table the peer never announced, which is what
 /// a peer rebuilt with a changed frame looks like.
 fn report_unannounced(inbox: &Inbox, tables: &[(PacketId, String)], log: &mut Log) {
-    for id in inbox.unannounced() {
+    for id in inbox.unannounced_iter() {
         let Some((_, port)) = tables.iter().find(|(table, _)| *table == id) else {
             continue;
         };
