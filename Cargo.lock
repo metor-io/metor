@@ -86,6 +86,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "adcs-contracts-3"
+version = "0.14.2"
+dependencies = [
+ "hifitime",
+ "metor-component",
+ "metor-fsw-3",
+ "nox",
+ "nox-frames",
+ "schemars 1.2.1",
+ "serde",
+ "wmm",
+ "zerocopy",
+]
+
+[[package]]
 name = "adcs-fsw2"
 version = "0.14.2"
 dependencies = [
@@ -94,6 +109,10 @@ dependencies = [
  "metor-fsw-2",
  "stellarator",
 ]
+
+[[package]]
+name = "adcs-fsw3"
+version = "0.14.2"
 
 [[package]]
 name = "adcs-sequences"
@@ -5682,6 +5701,7 @@ dependencies = [
  "metor-fsw-3",
  "schemars 1.2.1",
  "serde",
+ "zerocopy",
 ]
 
 [[package]]
@@ -9589,6 +9609,7 @@ dependencies = [
  "libc",
  "libloading",
  "metor-component",
+ "metor-db",
  "metor-fsw-3-macros",
  "metor-fsw-3-ring",
  "metor-proto",
