@@ -12,22 +12,26 @@ T = TypeVar("T", bound=Record)
 
 _targets: list["Target"] = []
 
-ALWAYS_OUTPUTS = ("log", "status")
-
 
 class SystemHandle:
     """A registered system's ports. Attribute access yields the `OutPort` of a
     declared output; `Target.add` types it as the `System` subclass it was
     handed, so a checker resolves each port's record."""
 
-    def __init__(self, name: str, outputs: tuple[str, ...]) -> None:
+    def __init__(self, name: str, target: "Target", system: System) -> None:
         self._name = name
-        self._outputs = tuple(outputs) + ALWAYS_OUTPUTS
+        self._target = target
+        self._system = system
 
     def __getattr__(self, port: str) -> Any:
-        if port not in self._outputs:
+        record = self._system._port_map().get(port)
+        if record is None:
             raise AttributeError(f"system `{self._name}` has no output port `{port}`")
-        return OutPort(self._name, port)
+        return OutPort(self._name, port, record, self._target)
+
+    def port(self, source: OutPort[T]) -> OutPort[T]:
+        """This system's copy of ``source``; see `Subscribe.port`."""
+        return self._system._port(source, self._name, self._target)
 
 
 class Target:
@@ -71,10 +75,19 @@ class Target:
             check_abi(pack.id, pack.abi_version)
         for pack in packs:
             self._packs.setdefault(pack.id, pack)
+        system._name = name
+        system._target = self
         self._systems.append((name, system, thread))
-        handle = SystemHandle(name, system._outputs)
+        handle = SystemHandle(name, self, system)
         self._handles[name] = handle
         return cast(S, handle)
+
+    def index(self, name: str) -> int:
+        """Where the system `name` sits in step order."""
+        for index, (added, _, _) in enumerate(self._systems):
+            if added == name:
+                return index
+        raise ConfigError(f"target `{self.namespace}` has no system `{name}`")
 
     def to_config(self) -> dict[str, Any]:
         """This target's packs and its coordinator, as one member of the envelope.
@@ -95,37 +108,26 @@ class Target:
 
     def _system(self, index: int) -> dict[str, Any]:
         name, system, thread = self._systems[index]
-        inputs = system._inputs_for(self, index)
-        entry = _system(name, system, thread, inputs)
-        if system._wants_target:
-            params = entry["params"] or {}
-            params.update(namespace=self.namespace, link=name)
-            entry["params"] = params
+        entry: dict[str, Any] = {
+            "id": name,
+            "ty": f"{system._pack.id}.{system._ty}",
+            "params": _json(system._params_for(self, index)),
+        }
+        if thread is not None:
+            entry["thread"] = thread
+        entry["inputs"] = [
+            {"port": port, "from": [_resolve(name, port, source) for source in sources]}
+            for port, sources in system._inputs_for(self, index).items()
+        ]
+        outputs = system._outputs_for(self, index)
+        if outputs:
+            entry["outputs"] = _json(outputs)
         return entry
 
     def _clock(self) -> dict[str, Any]:
         if self.sim_dt is not None:
             return simulated_clock(self.sim_dt)
         return wall_clock(self.cycle_rate)
-
-
-def _system(
-    name: str, system: System, thread: str | None, inputs: dict[str, list[Source[Any]]]
-) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "id": name,
-        "ty": f"{system._pack.id}.{system._ty}",
-        "params": _json(system._params) or None,
-    }
-    if thread is not None:
-        entry["thread"] = thread
-    entry["inputs"] = [
-        {"port": port, "from": [_resolve(name, port, source) for source in sources]}
-        for port, sources in inputs.items()
-    ]
-    if system._dyn_outputs:
-        entry["outputs"] = _json(system._dyn_outputs)
-    return entry
 
 
 def _resolve(name: str, port: str, source: Source[Any]) -> dict[str, str]:

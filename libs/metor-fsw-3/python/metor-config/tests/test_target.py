@@ -409,7 +409,7 @@ class LinkTest(unittest.TestCase):
             ["plant.imu", "plant.log", "plant.status", "pub1.link_status", "pub1.log", "pub1.status"],
         )
         self.assertEqual(fsw.to_config(), config)
-        self.assertEqual(publish._params["link"], "")
+        self.assertNotIn("link", publish._params)
         self.assertEqual(publish._inputs, {})
 
     def test_target_config_isolation(self) -> None:

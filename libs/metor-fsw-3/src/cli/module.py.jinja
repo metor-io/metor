@@ -19,6 +19,7 @@ PACK = Pack(
 
 class {{ record.class }}(Record):
     _name = {{ record.name | python_string }}
+    _kind = {{ record.kind | python_string }}
     _pack = PACK
 {% endfor %}
 {%- for class in dataclasses %}
@@ -41,7 +42,7 @@ class {{ system.name }}(System):
     _ty = {{ system.ty | python_string }}
 {% if system.takes_inputs %}    _takes_inputs = True
 {% endif %}{% if system.takes_outputs %}    _takes_outputs = True
-{% endif %}    _outputs = ({% for name in system.outputs %}{{ name | python_string }}{% if not loop.last %}, {% endif %}{% endfor %}{% if system.outputs|length == 1 %},{% endif %})
+{% endif %}    _ports = {{ '{' }}{% for port in system.ports %}{{ port.name | python_string }}: {{ port.record }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
 
     def __init__(self
         {%- if system.inputs or system.params or system.takes_inputs or system.takes_outputs %}, *{% endif %}
@@ -56,6 +57,4 @@ class {{ system.name }}(System):
         }{% if system.takes_inputs %}, items=items{% endif %}{% if system.takes_outputs %}, records=records{% endif %})
 
 {% for port in system.ports %}    {{ port.name }}: OutPort[{{ port.record }}]
-{% endfor %}    log: OutPort[LogEvent]
-    status: OutPort[SystemStatus]
-{% endfor %}
+{% endfor %}{% endfor %}

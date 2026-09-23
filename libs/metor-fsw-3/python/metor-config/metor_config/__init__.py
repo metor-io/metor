@@ -5,13 +5,31 @@ them, adds the systems a pack module supplies, and ends; the config lands in
 `$METOR_CONFIG_OUT` or on stdout.
 """
 
-from ._builtins import Publish, Subscribe
+from ._builtins import Db, DbStatus, LinkStatus, Publish, Subscribe
 from ._config import CONFIG_VERSION, ConfigError
-from ._deployment import Deployment, emit
-from ._model import Item, Loop, OutPort, Pack, PortRef, Record, Source, Sources, System
+from ._deployment import Deployment, emit, gateway
+from ._model import (
+    Item,
+    LogEvent,
+    Loop,
+    OutPort,
+    Pack,
+    PortRef,
+    Record,
+    Source,
+    Sources,
+    System,
+    SystemStatus,
+)
 from ._target import SystemHandle, Target
 
 __all__ = [
+    "gateway",
+    "SystemStatus",
+    "LogEvent",
+    "LinkStatus",
+    "DbStatus",
+    "Db",
     "CONFIG_VERSION",
     "ConfigError",
     "Deployment",

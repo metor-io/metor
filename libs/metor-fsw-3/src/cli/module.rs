@@ -8,12 +8,15 @@ use serde_json::Value;
 use super::config::PackRef;
 use super::pack_dev::PackDevError;
 use crate::pack::def::{PackDef, PackSystemDef};
+use crate::record::RecordSchema;
 use crate::system::PortDef;
 
 const TEMPLATE: &str = include_str!("module.py.jinja");
 
-/// The records every system has whatever it declared, named after their Rust types.
-const BUILTIN_PORTS: [(&str, &str); 2] = [("log", "LogEvent"), ("status", "SystemStatus")];
+/// The records every system has whatever it declared, named after their Rust
+/// types, and whether each is a frame.
+const BUILTIN_PORTS: [(&str, &str, bool); 2] =
+    [("log", "LogEvent", false), ("status", "SystemStatus", true)];
 
 /// What the template renders.
 #[derive(Serialize)]
@@ -30,11 +33,13 @@ struct Module {
     takes_ports: bool,
 }
 
-/// A record's name on the host and the class a target names it by.
+/// A record's name on the host, the class a target names it by, and whether
+/// it is a frame or a message.
 #[derive(Serialize)]
 struct RecordClass {
     name: String,
     class: String,
+    kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -63,11 +68,9 @@ struct Entry {
     takes_inputs: bool,
     /// Whether the type takes a `records` list.
     takes_outputs: bool,
-    /// Declared output names, without the framework's.
-    outputs: Vec<String>,
     inputs: Vec<Port>,
     params: Vec<Field>,
-    /// Declared outputs with their record classes.
+    /// Every output with its record class, the framework's last.
     ports: Vec<Port>,
 }
 
@@ -119,21 +122,29 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
 }
 
 fn records(def: &PackDef) -> Vec<RecordClass> {
-    let mut names: Vec<&str> = BUILTIN_PORTS.iter().map(|(name, _)| *name).collect();
-    for port in def.systems.iter().flat_map(ports) {
-        if !names.contains(&port.record.as_ref()) {
-            names.push(&port.record);
-        }
-    }
-    let mut records: Vec<RecordClass> = names
-        .into_iter()
-        .map(|name| RecordClass {
-            class: class_of(name),
+    let mut records: Vec<RecordClass> = BUILTIN_PORTS
+        .iter()
+        .map(|(name, class, frame)| RecordClass {
             name: name.to_string(),
+            class: class.to_string(),
+            kind: kind(*frame),
         })
         .collect();
+    for port in def.systems.iter().flat_map(ports) {
+        if !records.iter().any(|record| record.name == port.record) {
+            records.push(RecordClass {
+                name: port.record.to_string(),
+                class: class_of(&port.record),
+                kind: kind(matches!(port.schema, RecordSchema::Frame { .. })),
+            });
+        }
+    }
     records.sort_unstable_by(|a, b| a.class.cmp(&b.class));
     records
+}
+
+fn kind(frame: bool) -> &'static str {
+    if frame { "frame" } else { "msg" }
 }
 
 fn ports(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
@@ -141,12 +152,12 @@ fn ports(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
 }
 
 fn is_builtin(port: &str) -> bool {
-    BUILTIN_PORTS.iter().any(|(name, _)| *name == port)
+    BUILTIN_PORTS.iter().any(|(name, ..)| *name == port)
 }
 
 fn class_of(record: &str) -> String {
-    match BUILTIN_PORTS.iter().find(|(name, _)| *name == record) {
-        Some((_, class)) => (*class).to_string(),
+    match BUILTIN_PORTS.iter().find(|(name, ..)| *name == record) {
+        Some((_, class, _)) => (*class).to_string(),
         None => pascal(record),
     }
 }
@@ -231,17 +242,20 @@ fn entry(
         name: port.name.to_string(),
         record: class_of(&port.record),
     };
-    let declared = || system.def.outputs.iter().filter(|p| !is_builtin(&p.name));
+    let declared = system.def.outputs.iter().filter(|p| !is_builtin(&p.name));
+    let builtin = BUILTIN_PORTS.iter().map(|(name, class, _)| Port {
+        name: name.to_string(),
+        record: class.to_string(),
+    });
     Ok(Entry {
         name: pascal(&system.ty),
         ty: system.ty.to_string(),
         doc: system.doc.to_string(),
         takes_inputs: system.takes_inputs,
         takes_outputs: system.takes_outputs,
-        outputs: declared().map(|p| p.name.to_string()).collect(),
         inputs: system.def.inputs.iter().map(port).collect(),
         params,
-        ports: declared().map(port).collect(),
+        ports: declared.map(port).chain(builtin).collect(),
     })
 }
 
@@ -424,7 +438,11 @@ mod tests {
         );
         assert!(text.contains("slack: float | None = None"));
         assert!(text.contains("cmd: OutPort[MotorCmd]"));
-        assert!(text.contains("_outputs = (\"cmd\",)"));
+        assert!(
+            text.contains(
+                "_ports = {\"cmd\": MotorCmd, \"log\": LogEvent, \"status\": SystemStatus}"
+            )
+        );
     }
 
     #[test]
@@ -445,12 +463,16 @@ mod tests {
     fn test_empty_system_includes_framework_records() {
         let text = rendered(vec![system("mode", vec![], vec![], None)]).expect("renders");
         assert!(!text.contains("dataclass"));
-        assert!(text.contains("class LogEvent(Record):\n    _name = \"log\"\n"));
-        assert!(text.contains("class SystemStatus(Record):\n    _name = \"status\"\n"));
+        assert!(
+            text.contains("class LogEvent(Record):\n    _name = \"log\"\n    _kind = \"msg\"\n")
+        );
+        assert!(text.contains(
+            "class SystemStatus(Record):\n    _name = \"status\"\n    _kind = \"frame\"\n"
+        ));
         assert!(
             text.contains("    def __init__(self) -> None:\n        super().__init__({}, {})\n")
         );
-        assert!(text.contains("_outputs = ()"));
+        assert!(text.contains("_ports = {\"log\": LogEvent, \"status\": SystemStatus}"));
         assert!(text.contains("    log: OutPort[LogEvent]\n    status: OutPort[SystemStatus]\n"));
     }
 }
