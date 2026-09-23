@@ -7,9 +7,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_lite::future;
-use metor_db::{DB, Server};
+use metor_db::{DB, Server, TableIngestor};
 use metor_fsw_3_ring::Notifier;
-use metor_proto::types::{PacketId, PacketTy, Timestamp, table_id};
+use metor_proto::types::{PacketId, Timestamp, table_id};
 use metor_proto_wkt::VTableMsg;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -112,7 +112,7 @@ impl Db {
         // PANIC Safety: `run` is called once, and the endpoint is the bind's.
         let endpoint = self.endpoint.take().expect("one run per instance");
         let db = self.db.clone();
-        let ids = announce(&db, inputs, log);
+        let sinks = announce(&db, inputs, log);
         db.set_identity(self.namespace.clone(), self.command_ids.clone());
         let addr = endpoint.local_addr();
         if let Some(addr) = addr {
@@ -140,7 +140,7 @@ impl Db {
             if !future::or(stopped, ready).await {
                 return;
             }
-            ingest(&db, inputs, &ids, &mut status);
+            ingest(&db, inputs, &sinks, &mut status);
             status.timestamp = Timestamp::now();
             if status.changed(&reported) {
                 let _ = db_status.write(&status);
@@ -197,17 +197,21 @@ async fn udp(addr: std::net::SocketAddr, db: Arc<DB>) {
     }
 }
 
+/// Where one port's records go: the components its table lands in, the id its
+/// messages carry, or nothing for a port the store refused.
+enum Sink {
+    Table(TableIngestor),
+    Msg(PacketId),
+    Refused,
+}
+
 /// Registers each port's vtable and metadata, or message metadata, with the
-/// store, and returns the id each port's records are ingested under. A frame
-/// whose table id the store already holds for another vtable gets none.
-fn announce(
-    db: &Arc<DB>,
-    inputs: &mut DynInputs<Notifier>,
-    log: &mut Log,
-) -> Vec<Option<PacketId>> {
-    let mut ids = Vec::new();
+/// store, and prepares the sink its records take. A frame whose table id the
+/// store already holds for another vtable is refused.
+fn announce(db: &Arc<DB>, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sink> {
+    let mut sinks = Vec::new();
     for (def, _) in inputs.iter_mut() {
-        let id = match &def.schema {
+        sinks.push(match &def.schema {
             RecordSchema::Frame { vtable, metadata } => {
                 let id = table_id(vtable);
                 let table = VTableMsg {
@@ -222,7 +226,7 @@ fn announce(
                             def.name
                         ),
                     );
-                    ids.push(None);
+                    sinks.push(Sink::Refused);
                     continue;
                 }
                 for component in metadata {
@@ -236,7 +240,19 @@ fn announce(
                         );
                     }
                 }
-                id
+                match db.table_ingestor(id) {
+                    Ok(ingestor) => Sink::Table(ingestor),
+                    Err(error) => {
+                        log.fault(
+                            "table_ingestor",
+                            format!(
+                                "port `{}` announces a table the store cannot prepare: {error}",
+                                def.name
+                            ),
+                        );
+                        Sink::Refused
+                    }
+                }
             }
             RecordSchema::Msg { id, name, codec } => {
                 let metadata = wire::msg_metadata(name, codec);
@@ -245,33 +261,28 @@ fn announce(
                 if let Err(error) = result {
                     log.fault("msg_metadata", format!("port `{}`: {error}", def.name));
                 }
-                *id
+                Sink::Msg(*id)
             }
-        };
-        ids.push(Some(id));
+        });
     }
-    ids
+    sinks
 }
 
 /// Writes every waiting record into the store, counting what it refused. A
-/// port with no id drains, and its records count as refused.
-fn ingest(
-    db: &DB,
-    inputs: &mut DynInputs<Notifier>,
-    ids: &[Option<PacketId>],
-    status: &mut DbStatus,
-) {
-    for ((def, input), id) in inputs.iter_mut().zip(ids) {
-        let Some(id) = id else {
+/// refused port drains, and its records count as refused.
+fn ingest(db: &DB, inputs: &mut DynInputs<Notifier>, sinks: &[Sink], status: &mut DbStatus) {
+    for ((_, input), sink) in inputs.iter_mut().zip(sinks) {
+        if let Sink::Refused = sink {
             status.refused += input.drain().count() as u64;
             continue;
-        };
-        let ty = def.schema.packet_ty();
+        }
         for record in input.drain() {
             let Ok(bytes) = record else { continue };
-            let result = match ty {
-                PacketTy::Table => db.ingest_table(*id, bytes),
-                _ => db.push_msg(Timestamp::now(), *id, bytes),
+            let now = Timestamp::now();
+            let result = match sink {
+                Sink::Table(ingestor) => ingestor.push(now, bytes),
+                Sink::Msg(id) => db.push_msg(now, *id, bytes),
+                Sink::Refused => continue,
             };
             match result {
                 Ok(()) => status.records += 1,
@@ -363,7 +374,7 @@ mod tests {
         let (_dir, db) = store();
         let rings = [ring::<Imu>(), ring::<Fixed>()];
         let mut inputs = ports(&rings);
-        let ids = announce(&db, &mut inputs, &mut Log);
+        let sinks = announce(&db, &mut inputs, &mut Log);
         let RecordSchema::Frame { metadata, .. } = &Input::<Imu>::def(
             &DefCx {
                 id: "plant",
@@ -376,20 +387,15 @@ mod tests {
         else {
             panic!("a frame")
         };
-        assert_eq!(
-            ids,
-            vec![
-                Some(table_id_of(&mut inputs)),
-                Some(Fixed::schema().packet_id())
-            ]
-        );
+        assert!(matches!(sinks[0], Sink::Table(_)), "a prepared ingestor");
+        assert!(matches!(sinks[1], Sink::Msg(id) if id == Fixed::schema().packet_id()));
         assert_eq!(metadata[0].name, "a.plant.imu.sample");
 
         for n in 1..=3 {
             produce(&rings, n);
         }
         let mut status = status();
-        ingest(&db, &mut inputs, &ids, &mut status);
+        ingest(&db, &mut inputs, &sinks, &mut status);
         assert_eq!((status.records, status.refused), (6, 0));
 
         // Pushes land in each store's write-ahead log; what is synchronous is
@@ -434,15 +440,15 @@ mod tests {
         };
         db.insert_vtable(VTableMsg { id, vtable })
             .expect("the first vtable under an id is taken");
-        let ids = announce(&db, &mut inputs, &mut Log);
-        assert_eq!(
-            ids[0], None,
+        let sinks = announce(&db, &mut inputs, &mut Log);
+        assert!(
+            matches!(sinks[0], Sink::Refused),
             "a different vtable under a held id is refused"
         );
-        assert!(ids[1].is_some());
+        assert!(matches!(sinks[1], Sink::Msg(_)));
         produce(&rings, 1);
         let mut status = status();
-        ingest(&db, &mut inputs, &ids, &mut status);
+        ingest(&db, &mut inputs, &sinks, &mut status);
         assert_eq!((status.records, status.refused), (1, 1));
     }
 

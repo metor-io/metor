@@ -438,6 +438,39 @@ impl DB {
         Ok(())
     }
 
+    /// The components a registered table's fields land in, in field order, so
+    /// a caller pushes samples without the state lock.
+    ///
+    /// A dynamic table creates its components on first sample, so it keeps
+    /// [`ingest_table`](Self::ingest_table).
+    pub fn table_ingestor(self: &Arc<Self>, id: PacketId) -> Result<TableIngestor, Error> {
+        let vtable = self
+            .with_state(|state| state.vtable_registry.get(&id).cloned())
+            .ok_or(Error::Impeller(metor_proto::error::Error::VTableNotFound))?;
+        if vtable.is_dynamic() {
+            return Err(Error::SchemaMismatch);
+        }
+        let mut fields = Vec::new();
+        let mut missing = None;
+        self.with_state(|state| {
+            vtable.for_each_field(None, &mut |rf| {
+                match state.get_component(rf.component_id) {
+                    Some(component) => fields.push(component.clone()),
+                    None => missing = Some(rf.component_id),
+                }
+                Ok(())
+            })
+        })?;
+        if let Some(component_id) = missing {
+            return Err(Error::ComponentNotFound(component_id));
+        }
+        Ok(TableIngestor {
+            db: self.clone(),
+            vtable,
+            fields,
+        })
+    }
+
     /// Builds one streamed `Table` packet for a dynamic vtable subscription from
     /// the cached latest table bytes (see [`State::latest_dynamic_tables`]),
     /// re-headed with the subscriber's stream `id`. Returns `None` when no table
@@ -829,6 +862,56 @@ pub(crate) fn max_node_age_override() -> Option<Duration> {
                 .and_then(|v| v.parse().ok())
         })
         .map(Duration::from_secs)
+}
+
+/// A static table's prepared sink: its vtable and the component each realized
+/// field pushes into, in field order.
+pub struct TableIngestor {
+    db: Arc<DB>,
+    vtable: VTable,
+    fields: Vec<Component>,
+}
+
+impl TableIngestor {
+    /// Pushes one table's fields into their components, stamping a field whose
+    /// vtable names no timestamp with `received`.
+    pub fn push(&self, received: Timestamp, buf: &[u8]) -> Result<(), Error> {
+        let mut max_ts = Timestamp(i64::MIN);
+        let mut new_series = false;
+        let mut at = 0;
+        let mut db_err = None;
+        let res = self.vtable.for_each_field(Some(buf), &mut |rf| {
+            let mut sink = || -> Result<(), Error> {
+                let component = self
+                    .fields
+                    .get(at)
+                    .ok_or(Error::ComponentNotFound(rf.component_id))?;
+                at += 1;
+                // PANIC Safety: the table is `Some`, so every field realizes a view.
+                let view = rf.view.expect("table provided to for_each_field");
+                let ts = rf.timestamp.unwrap_or(received);
+                new_series |= component.time_series.is_empty();
+                component.push_buf(ts, view.as_bytes())?;
+                max_ts = max_ts.max(ts);
+                Ok(())
+            };
+            sink().map_err(|err| {
+                db_err = Some(err);
+                metor_proto::error::Error::InvalidOp
+            })
+        });
+        if let Some(err) = db_err {
+            return Err(err);
+        }
+        res?;
+        if new_series {
+            self.db.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
+        }
+        if max_ts > Timestamp(i64::MIN) {
+            self.db.last_updated.update_max(max_ts);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -2977,5 +3060,112 @@ mod vtable_id_tests {
             }
         }
         assert_eq!(ids[0], ids[1]);
+    }
+}
+
+#[cfg(test)]
+mod table_ingestor_tests {
+    use super::*;
+    use metor_proto::vtable::builder::{
+        component, list, path_component, raw_field, raw_table, schema, timestamp, vtable,
+    };
+
+    const ID: PacketId = [9, 1];
+
+    /// Two `f64` fields sharing the table's leading timestamp.
+    fn two_fields() -> VTable {
+        vtable([
+            raw_field(
+                8,
+                8,
+                timestamp(raw_table(0, 8), schema(PrimType::F64, &[1], component("a"))),
+            ),
+            raw_field(
+                16,
+                8,
+                timestamp(raw_table(0, 8), schema(PrimType::F64, &[1], component("b"))),
+            ),
+        ])
+    }
+
+    /// A `processes` list, whose members only exist once a sample names them.
+    fn dynamic() -> VTable {
+        vtable([raw_field(
+            8,
+            8,
+            timestamp(
+                raw_table(0, 8),
+                list(
+                    "processes",
+                    vec![raw_field(
+                        0,
+                        8,
+                        schema(PrimType::U64, &[], path_component("pid")),
+                    )],
+                    8,
+                ),
+            ),
+        )])
+    }
+
+    fn sample(timestamp: i64, a: f64, b: f64) -> Vec<u8> {
+        let mut buf = timestamp.to_le_bytes().to_vec();
+        buf.extend_from_slice(&a.to_le_bytes());
+        buf.extend_from_slice(&b.to_le_bytes());
+        buf
+    }
+
+    fn store(vtable: VTable) -> (tempfile::TempDir, Arc<DB>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(dir.path().to_path_buf()).unwrap());
+        db.insert_vtable(VTableMsg { id: ID, vtable }).unwrap();
+        (dir, db)
+    }
+
+    fn latest(db: &DB, name: &str) -> Timestamp {
+        db.with_state(|state| {
+            state
+                .get_component(ComponentId::new(name))
+                .unwrap()
+                .last_timestamp
+                .latest()
+        })
+    }
+
+    /// The prepared sink lands where `ingest_table` does.
+    #[stellarator::test]
+    async fn ingestor_pushes_where_ingest_table_does() {
+        let (_prepared_dir, prepared) = store(two_fields());
+        let (_direct_dir, direct) = store(two_fields());
+        let buf = sample(5, 1.5, 2.5);
+        prepared
+            .table_ingestor(ID)
+            .unwrap()
+            .push(Timestamp(0), &buf)
+            .unwrap();
+        direct.ingest_table(ID, &buf).unwrap();
+        for name in ["a", "b"] {
+            assert_eq!(latest(&prepared, name), Timestamp(5));
+            assert_eq!(latest(&prepared, name), latest(&direct, name));
+        }
+        assert_eq!(prepared.last_updated.latest(), direct.last_updated.latest());
+    }
+
+    /// A dynamic table creates its components on first sample, so it keeps
+    /// `ingest_table`.
+    #[stellarator::test]
+    async fn dynamic_table_has_no_ingestor() {
+        let (_dir, db) = store(dynamic());
+        let Err(err) = db.table_ingestor(ID) else {
+            panic!("a dynamic table is refused")
+        };
+        assert!(matches!(err, Error::SchemaMismatch), "{err:?}");
+    }
+
+    /// An unregistered id has nothing to prepare.
+    #[stellarator::test]
+    async fn unknown_table_has_no_ingestor() {
+        let (_dir, db) = store(two_fields());
+        assert!(db.table_ingestor([0, 0]).is_err());
     }
 }
