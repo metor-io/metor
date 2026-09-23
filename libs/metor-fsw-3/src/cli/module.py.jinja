@@ -31,7 +31,8 @@ class {{ class.name }}:
 {%- if not class.fields %}    pass
 {% endif %}
 {%- for field in class.fields %}    {{ field.name }}: {{ field.annotation }}{{ field.default }}
-{% endfor %}
+{% if field.doc %}    {{ field.doc | docstring(4) }}
+{% endif %}{% endfor %}
 {%- endfor %}
 {%- for system in systems %}
 
@@ -50,7 +51,8 @@ class {{ system.name }}(System):
         {%- if system.takes_outputs %}, records: Sequence[type[Record]] = (){% endif %}
         {%- for port in system.inputs %}, {{ port.name }}: Sources[{{ port.record }}] = (){% endfor %}
         {%- for field in system.params %}, {{ field.name }}: {{ field.annotation }}{{ field.default }}{% endfor %}) -> None:
-        super().__init__({
+{% if system.args_doc %}        {{ system.args_doc | docstring(8) }}
+{% endif %}        super().__init__({
             {%- for port in system.inputs %}{{ port.name | python_string }}: {{ port.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
         }, {
             {%- for field in system.params %}{{ field.name | python_string }}: {{ field.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
