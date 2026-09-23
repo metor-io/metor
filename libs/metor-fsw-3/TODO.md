@@ -13,7 +13,7 @@ in list order. `01-base.md`, `02-ring-review.md`.
 ## 2. Authoring surface, in progress
 
 `Record` with the codec on the type, one `write` and `latest` and `drain`
-for frames and messages, `#[system]` impl blocks, JSON params, and the
+for frames and messages, `#[system]` fns, JSON params, and the
 `log` output with the `tracing` bridge. T1 to T6 landed and reviewed.
 T7's ADCS example landed under `examples/adcs-fsw3` on 2026-09-22
 (`09-adcs-example.md`); T8 (docs, and folding shipped deviations back

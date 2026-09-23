@@ -130,6 +130,8 @@ serve both without specialization.
 
 ## Builder
 
+Superseded by `11-fn-systems.md`.
+
 ```rust
 pub struct NavState { .. }
 impl NavState { pub fn new(p: NavParams) -> Self { .. } }

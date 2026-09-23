@@ -1,13 +1,14 @@
 //! metor-fsw is a flight software framework.
 //!
 //! Systems are functions over typed ring ports, stepped in order by the
-//! [`Coordinator`]. A system authored as `async fn run` instead runs on a
-//! background thread behind the [`thread`] adapter, which mirrors its ports:
+//! [`Coordinator`]. `#[system]` on a free fn makes one: each parameter is a
+//! port named by its identifier, and one `#[state]` parameter, `&mut S`, is
+//! the state the registered constructor builds. The fn's name is the
+//! system's name, and its doc comment is the system's doc.
 //!
 //! ```
-//! use metor_fsw_3::ring::Notifier;
 //! use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-//! use metor_fsw_3::{Frame, Input, Output, Stop, SystemTable, Timestamp, system};
+//! use metor_fsw_3::{Frame, Input, Output, SystemTable, Timestamp, system};
 //!
 //! #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 //! #[repr(C)]
@@ -16,6 +17,53 @@
 //!     timestamp: Timestamp,
 //!     pos: [f64; 3],
 //! }
+//!
+//! #[derive(Default)]
+//! struct NavState {
+//!     fixes: u64,
+//! }
+//!
+//! /// Counts fixes and forwards the newest.
+//! #[system]
+//! fn nav(#[state] s: &mut NavState, gps: &mut Input<Gps>, out: &mut Output<Gps>) {
+//!     if let Ok(Some(fix)) = gps.latest() {
+//!         s.fixes += 1;
+//!         let _ = out.write(&Gps { timestamp: fix.timestamp, pos: fix.pos });
+//!     }
+//! }
+//!
+//! /// Publishes the origin each cycle.
+//! #[system]
+//! fn origin(now: Timestamp, out: &mut Output<Gps>) {
+//!     let _ = out.write(&Gps { timestamp: now, pos: [0.0; 3] });
+//! }
+//!
+//! let mut table = SystemTable::new();
+//! table.register("nav", nav(), NavState::default)?;
+//! table.register("origin", origin(), Default::default)?;
+//! # Ok::<(), metor_fsw_3::BuildError>(())
+//! ```
+//!
+//! A fn without `#[state]` is stateless and registers with
+//! `Default::default`. `nav()` derefs to a fn pointer, so a test calls the
+//! system directly: `nav()(&mut state, &mut gps, &mut out)`.
+//!
+//! An `async fn` ending in `stop: Stop` instead runs on a background thread
+//! behind the [`thread`] adapter, which mirrors its ports. It has no direct
+//! call; a test drives it through [`AsyncSystemFn::call`].
+//!
+//! ```
+//! # use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+//! # use metor_fsw_3::{Frame, Timestamp};
+//! # #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+//! # #[repr(C)]
+//! # struct Gps {
+//! #     #[frame(timestamp)]
+//! #     timestamp: Timestamp,
+//! #     pos: [f64; 3],
+//! # }
+//! use metor_fsw_3::ring::Notifier;
+//! use metor_fsw_3::{Input, Output, Stop, SystemTable, system};
 //!
 //! /// Copies every fix until stop.
 //! #[system]

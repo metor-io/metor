@@ -25,7 +25,10 @@ pub fn record_derive(input: TokenStream) -> TokenStream {
 }
 
 /// Rewrites a free fn into a fn returning its system. Each parameter is a port,
-/// named by its identifier; one `#[state] s: &mut S` parameter is the state.
+/// named by its identifier; one `#[state] s: &mut S` parameter is the state,
+/// and without one the state is `()`. The returned value derefs to a fn
+/// pointer for direct calls. An `async fn` ending in `stop: Stop` becomes an
+/// async system, with no fn pointer.
 ///
 /// ```ignore
 /// #[system]
