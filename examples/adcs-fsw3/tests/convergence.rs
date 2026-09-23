@@ -23,8 +23,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use zerocopy::IntoBytes;
 
 /// Cycles each run steps: 20 s of simulated time at 120 Hz. The error crosses
-/// the bound at cycle 574 (~4.8 s), so the horizon carries four times the
-/// margin the loop needs.
+/// the bound at cycle 942 (~7.9 s), so the horizon carries twice the margin
+/// the loop needs.
 const CYCLES: u64 = 2400;
 
 /// The commanded law the controller flies, which `mode` holds for the run.

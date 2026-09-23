@@ -5,7 +5,7 @@
 //! The pack is built against this crate; the host never links it, validating
 //! frames from their serialized schema and params from the exported JSON Schema.
 
-use hifitime::{Duration, Epoch};
+use hifitime::Duration;
 use metor_fsw_3::Timestamp;
 use nox::{ArrayRepr, Matrix6, Quaternion, Vector, tensor};
 use nox_frames::earth::{ecef_to_eci, eci_to_ecef, ned_to_ecef};
@@ -13,6 +13,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use wmm::GeodeticCoords;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+/// The instant the environment models are evaluated at — re-exported so a system names it
+/// without a direct `hifitime` dependency.
+pub use hifitime::Epoch;
 
 /// The WMM magnetic model handle — re-exported so the plant (true field) and nav (reference
 /// field) can each own one without a direct `wmm` dependency. Holds C-library state and is
@@ -517,19 +521,32 @@ pub struct TorqueCmd {
 // Pointing laws — the controller target as a function of the orbit state
 // ---------------------------------------------------------------------------
 
+/// The body `-Y` axis, which both pointing laws aim.
+const POINTING_AXIS: [f64; 3] = [0.0, -1.0, 0.0];
+
+/// `1 + dot` this close to zero is the antiparallel case, where the shortest arc is
+/// undefined and the cross product vanishes with it.
+const ANTIPARALLEL: f64 = 1e-9;
+
 /// The shortest-arc body←ECI quaternion that rotates the spacecraft's `-Y` body axis onto the
 /// inertial direction `dir_eci` (cube-sat `FSW::nadir_point` / `hil_point`).
+///
+/// A `dir_eci` opposite the body axis takes the 180° rotation about body `X`, which is one
+/// of the arcs the shortest-arc form cannot name.
 fn point_minus_y_at(dir_eci: V3) -> Quat {
     let r = dir_eci.normalize();
-    let body_axis: V3 = tensor![0.0, -1.0, 0.0];
+    let body_axis: V3 = V3::from_buf(POINTING_AXIS);
     let [x, y, z] = body_axis.cross(&r).into_buf();
     let w = 1.0 + body_axis.dot(&r).into_buf();
+    if w.abs() < ANTIPARALLEL {
+        return Quat::new(0.0, 1.0, 0.0, 0.0);
+    }
     Quat::new(w, x, y, z).normalize()
 }
 
-/// Nadir-pointing target: point at the (negated) position vector — i.e. down at Earth.
+/// Nadir-pointing target: aim the body `-Y` axis down the position vector, at Earth.
 pub fn nadir_point(pos_eci: &V3) -> Quat {
-    point_minus_y_at(pos_eci.normalize())
+    point_minus_y_at(pos_eci.normalize() * -1.0)
 }
 
 /// Velocity-vector ("HIL") pointing target: point along the orbital velocity.
@@ -843,6 +860,68 @@ mod tests {
         // Degenerate field guard.
         let zero: f64 = desat_dipole(0.1, &parallel, &V3::zeros()).norm().into_buf();
         assert_eq!(zero, 0.0);
+    }
+
+    /// Each pointing law lands the body `-Y` axis on the direction it names: nadir at
+    /// `-pos`, HIL along `+vel`, including the antiparallel case the shortest arc cannot
+    /// name.
+    #[test]
+    fn pointing_laws_aim_the_body_axis() {
+        let axis: V3 = V3::from_buf(POINTING_AXIS);
+        let radius = EARTH_RADIUS + ALTITUDE;
+        for (pos, vel) in [
+            (
+                tensor![radius, 0.0, 0.0] as V3,
+                tensor![0.0, 7.6e3, 0.0] as V3,
+            ),
+            (
+                tensor![0.0, radius, 0.0] as V3,
+                tensor![0.0, 0.0, 7.6e3] as V3,
+            ),
+            (
+                (tensor![1.0, 1.0, 1.0] as V3).normalize() * radius,
+                tensor![0.0, -7.6e3, 0.0] as V3,
+            ),
+        ] {
+            let aimed = nadir_point(&pos) * axis;
+            let want = pos.normalize() * -1.0;
+            let err: f64 = (aimed - want).norm().into_buf();
+            assert!(
+                err < 1e-12,
+                "nadir aims {:?}, want {:?}",
+                aimed.into_buf(),
+                want.into_buf()
+            );
+
+            let aimed = hil_point(&vel) * axis;
+            let want = vel.normalize();
+            let err: f64 = (aimed - want).norm().into_buf();
+            assert!(
+                err < 1e-12,
+                "hil aims {:?}, want {:?}",
+                aimed.into_buf(),
+                want.into_buf()
+            );
+        }
+    }
+
+    /// The direction opposite the body axis: the shortest-arc form degenerates there, so the
+    /// law returns the 180° rotation rather than a zero quaternion that normalizes to NaN.
+    #[test]
+    fn antiparallel_target_is_a_finite_half_turn() {
+        let axis: V3 = V3::from_buf(POINTING_AXIS);
+        // A position along `-Y` asks for `+Y`, opposite the body axis.
+        let q = nadir_point(&(tensor![0.0, -7.0e6, 0.0] as V3));
+        assert!(
+            q.0.into_buf().iter().all(|f| f.is_finite()),
+            "a degenerate target must stay finite"
+        );
+        let norm: f64 = q.0.norm().into_buf();
+        assert!((norm - 1.0).abs() < 1e-12, "not a unit quaternion: {norm}");
+        let aimed = q * axis;
+        let want: V3 = tensor![0.0, 1.0, 0.0];
+        let err: f64 = (aimed - want).norm().into_buf();
+        assert!(err < 1e-12, "half turn aims {:?}", aimed.into_buf());
     }
 
     /// `ecef_to_geodetic` recovers the altitude of a known orbit radius (on the equator, the

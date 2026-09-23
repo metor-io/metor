@@ -43,9 +43,18 @@ prints the resolved envelope without running anything.
 `cargo test -p adcs-fsw3` runs both gates. `tests/convergence.rs` builds
 `sim.py`'s loop twice — once with the pack linked as an rlib, once
 through the cdylib `pack dev` staged — and checks that each converges
-onto its nadir target and that the two command the same torques.
+onto its nadir target — the body `-Y` axis aimed at Earth — and that the
+two command the same torques.
 `tests/deploy.rs` runs `target.py` under `metor run` and asks the
 gateway's db what it holds.
+
+## Known allocation
+
+Both the plant and the filter call `MagneticModel::calculate_field` every
+cycle, and the vendored WMM C library allocates its Legendre and
+spherical-harmonic workspaces inside that call. Reusing them takes a patch
+to `libs/wmm`, so until then this example allocates once per cycle per
+caller.
 
 ## Not ported
 
