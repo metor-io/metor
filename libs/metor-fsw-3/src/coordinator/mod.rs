@@ -21,7 +21,8 @@ use metor_proto::types::Timestamp;
 use crate::port::Output;
 
 pub use config::{
-    Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig, OutputConfig, PortRef, SystemConfig,
+    Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig, OutputConfig, OutputSource,
+    PeerLink, PeerPort, PortRef, SystemConfig,
 };
 pub use error::BuildError;
 pub use params::{ParamError, Params};

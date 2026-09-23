@@ -5,6 +5,7 @@ use core::marker::PhantomData;
 use core::ops::Deref;
 use std::borrow::Cow;
 
+use crate::coordinator::OutputSource;
 use crate::def::{DefCx, DefError};
 use crate::record::{Bytes, DecodeError, EncodeError, Record};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
@@ -247,7 +248,8 @@ pub fn dyn_input_defs(
     Ok(ports)
 }
 
-/// One port per config output no declared port took, defined by the record it names.
+/// One port per config output no declared port took, defined by the record it
+/// names or the definition `metor build` resolved for it.
 pub fn dyn_output_defs(
     cx: &DefCx<'_>,
     declared: &[Cow<'static, str>],
@@ -255,7 +257,16 @@ pub fn dyn_output_defs(
     cx.outputs
         .iter()
         .filter(|output| !declared.iter().any(|taken| *taken == output.port))
-        .map(|output| cx.records.port(&output.port, &output.record))
+        .map(|output| match &output.source {
+            OutputSource::Record(record) => cx.records.port(&output.port, record),
+            OutputSource::Def(def) => Ok(PortDef {
+                name: output.port.clone().into(),
+                ..def.clone()
+            }),
+            OutputSource::Peer(_) => Err(DefError::Unresolved {
+                port: output.port.clone(),
+            }),
+        })
         .collect()
 }
 

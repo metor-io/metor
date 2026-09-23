@@ -5,8 +5,8 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::coordinator::OutputConfig;
-use crate::system::PortDef;
+use crate::coordinator::{BuildError, OutputConfig, PortRef, SystemConfig, TableEntry};
+use crate::system::{PortDef, SystemDef};
 
 /// What a type sees of one instance's config when it computes its def.
 pub struct DefCx<'a> {
@@ -86,6 +86,48 @@ pub enum DefError {
 
     #[error("the pack refused the definition: {message}")]
     Pack { message: String },
+
+    #[error("output `{port}` names a peer's port that is not resolved; run `metor build`")]
+    Unresolved { port: String },
+}
+
+/// The definition `entry`'s type computes for `system`, over the producers
+/// `producer` finds. A producer it returns `None` for is not resolved yet,
+/// which only a port the type declares may read.
+pub(crate) fn instance_def(
+    system: &SystemConfig,
+    entry: &TableEntry,
+    namespace: Option<&str>,
+    records: &Records,
+    producer: impl Fn(&PortRef) -> Result<Option<PortDef>, BuildError>,
+) -> Result<SystemDef, BuildError> {
+    let mut edges: Vec<(&str, PortDef)> = Vec::new();
+    for input in &system.inputs {
+        for from in &input.from {
+            match producer(from)? {
+                Some(def) => edges.push((input.port.as_str(), def)),
+                None if entry.def.inputs.iter().any(|p| p.name == input.port) => {}
+                None => {
+                    return Err(BuildError::DynamicFromLater {
+                        system: system.id.clone(),
+                        port: input.port.clone(),
+                    });
+                }
+            }
+        }
+    }
+    let inputs: Vec<(&str, &PortDef)> = edges.iter().map(|(port, def)| (*port, def)).collect();
+    let cx = DefCx {
+        id: &system.id,
+        namespace,
+        inputs: &inputs,
+        outputs: &system.outputs,
+        records,
+    };
+    entry.def_for(&cx).map_err(|source| BuildError::Def {
+        id: system.id.clone(),
+        source,
+    })
 }
 
 /// Every record a table knows, by name.

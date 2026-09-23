@@ -2,9 +2,11 @@
 
 use core::time::Duration;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::error::BuildError;
+use crate::system::PortDef;
 
 const MIN_WALL_RATE: f64 = 0.001;
 
@@ -63,11 +65,47 @@ impl SystemConfig {
     }
 }
 
-/// One port of a system with dynamic outputs, and the record it carries.
+/// One port of a system with dynamic outputs, and where its definition comes from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputConfig {
     pub port: String,
-    pub record: String,
+    #[serde(flatten)]
+    pub source: OutputSource,
+}
+
+impl OutputConfig {
+    /// A port carrying the record `record` names.
+    pub fn record(port: impl Into<String>, record: impl Into<String>) -> Self {
+        Self {
+            port: port.into(),
+            source: OutputSource::Record(record.into()),
+        }
+    }
+}
+
+/// What defines a dynamic output: a record name looked up in the table, a
+/// peer's port `metor build` has yet to resolve, or the definition it resolved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputSource {
+    Record(String),
+    Peer(PeerPort),
+    Def(PortDef),
+}
+
+/// A port of a link on some target of the deployment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PeerPort {
+    pub target: String,
+    pub link: String,
+    pub port: String,
+}
+
+/// A link on some target of the deployment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PeerLink {
+    pub target: String,
+    pub link: String,
 }
 
 /// The producers of one input port
@@ -139,6 +177,21 @@ mod tests {
             serde_json::from_str::<SystemConfig>(&text).expect("round trips"),
             full
         );
+    }
+
+    #[test]
+    fn test_output_source_forms() {
+        let record: OutputConfig =
+            serde_json::from_str(r#"{"port":"ping","record":"ping"}"#).expect("record form");
+        assert_eq!(record, OutputConfig::record("ping", "ping"));
+        let peer: OutputConfig = serde_json::from_str(
+            r#"{"port":"est.est","peer":{"target":"a","link":"pub","port":"est.est"}}"#,
+        )
+        .expect("peer form");
+        assert!(matches!(peer.source, OutputSource::Peer(ref p) if p.link == "pub"));
+        let text = serde_json::to_string(&peer).expect("encodes");
+        assert!(text.starts_with(r#"{"port":"est.est","peer":{"#), "{text}");
+        assert!(serde_json::from_str::<OutputConfig>(r#"{"port":"x"}"#).is_err());
     }
 
     #[test]

@@ -522,10 +522,7 @@ fn subscribe(link: &str, transport: serde_json::Value) -> SystemConfig {
             "namespace": "cube_sat",
             "link": link,
         }),
-        outputs: vec![OutputConfig {
-            port: "ping".into(),
-            record: "ping".into(),
-        }],
+        outputs: vec![OutputConfig::record("ping", "ping")],
         ..SystemConfig::new("cmds", "fsw.subscribe")
     }
 }

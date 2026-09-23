@@ -84,10 +84,7 @@ fn output_counts<S: Ports>(bindings: &[OutputBinding]) -> Vec<usize> {
     let declared = &bindings[..bindings.len().saturating_sub(1)];
     let outputs: Vec<OutputConfig> = declared
         .iter()
-        .map(|binding| OutputConfig {
-            port: binding.def.name.to_string(),
-            record: binding.def.record.to_string(),
-        })
+        .map(|binding| OutputConfig::record(binding.def.name.as_ref(), binding.def.record.as_ref()))
         .collect();
     let records = Records::of(declared.iter().map(|binding| &binding.def));
     // PANIC Safety: as for `input_counts`.
