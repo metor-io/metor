@@ -10,7 +10,17 @@ use crate::system::{PortDef, SystemDef};
 use super::error::DeployError;
 
 /// Where a system sits: its target's index and its own.
-pub(crate) type At = (usize, usize);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(crate) struct At {
+    pub(crate) target: usize,
+    pub(crate) system: usize,
+}
+
+impl At {
+    pub(crate) fn new(target: usize, system: usize) -> Self {
+        Self { target, system }
+    }
+}
 
 /// A `DefIndex` computes a system's definition when a reference needs it,
 /// once per system, chasing edges to producers and peer references to other
@@ -55,16 +65,16 @@ impl<'a> DefIndex<'a> {
                 target: target.to_string(),
                 link: link.to_string(),
             })?;
-        Ok((t, s))
+        Ok(At::new(t, s))
     }
 
     /// The name a reference is reported by: `{namespace}.{id}`.
     pub(crate) fn name(&self, at: At) -> String {
-        let target = &self.envelope.targets[at.0];
+        let target = &self.envelope.targets[at.target];
         format!(
             "{}.{}",
             target.namespace(),
-            target.coordinator.systems[at.1].id
+            target.coordinator.systems[at.system].id
         )
     }
 
@@ -115,10 +125,9 @@ impl<'a> DefIndex<'a> {
     }
 
     fn compute(&mut self, at: At) -> Result<SystemDef, DeployError> {
-        let (t, s) = at;
-        let target = &self.envelope.targets[t];
-        let system = &target.coordinator.systems[s];
-        let entry = self.tables[t]
+        let target = &self.envelope.targets[at.target];
+        let system = &target.coordinator.systems[at.system];
+        let entry = self.tables[at.target]
             .get(&system.ty)
             .ok_or_else(|| DeployError::Build {
                 target: target.namespace().to_string(),
@@ -133,7 +142,7 @@ impl<'a> DefIndex<'a> {
             &system,
             entry,
             target.coordinator.namespace.as_deref(),
-            &self.records[t],
+            &self.records[at.target],
             |from| Ok(producers.get(from).cloned().flatten()),
         )
         .map_err(|source| DeployError::Build {
@@ -181,7 +190,7 @@ impl<'a> DefIndex<'a> {
 
     /// The definition of an output port of a system on the same target.
     fn output(&mut self, at: At, from: &PortRef) -> Result<PortDef, DeployError> {
-        let target = &self.envelope.targets[at.0];
+        let target = &self.envelope.targets[at.target];
         let namespace = target.namespace().to_string();
         let Some(s) = target
             .coordinator
@@ -192,7 +201,7 @@ impl<'a> DefIndex<'a> {
             return Err(self.build_error(
                 at,
                 crate::BuildError::UnknownSystem {
-                    id: target.coordinator.systems[at.1].id.clone(),
+                    id: target.coordinator.systems[at.system].id.clone(),
                     port: from.port.clone(),
                     from: from.system.clone(),
                 },
@@ -204,7 +213,7 @@ impl<'a> DefIndex<'a> {
                 target.coordinator.namespace.as_deref(),
             ));
         }
-        let def = self.def((at.0, s))?;
+        let def = self.def(At::new(at.target, s))?;
         def.outputs
             .iter()
             .find(|port| port.name == from.port)
@@ -220,7 +229,7 @@ impl<'a> DefIndex<'a> {
 
     fn build_error(&self, at: At, source: crate::BuildError) -> DeployError {
         DeployError::Build {
-            target: self.envelope.targets[at.0].namespace().to_string(),
+            target: self.envelope.targets[at.target].namespace().to_string(),
             source,
         }
     }

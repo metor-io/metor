@@ -17,7 +17,7 @@ use crate::record::RecordSchema;
 pub use error::DeployError;
 use index::{At, DefIndex};
 
-/// Where a peer is dialed when the deployment places its target nowhere.
+/// Default peer host, for a target the deployment places nowhere.
 pub const LOOPBACK: &str = "127.0.0.1";
 
 /// The type a gateway's database registers as.
@@ -70,7 +70,7 @@ fn plan(envelope: &DeploymentConfig, tables: &[SystemTable]) -> Result<Plan, Dep
     let mut commands: HashMap<At, Vec<PacketId>> = HashMap::new();
     for (t, target) in envelope.targets.iter().enumerate() {
         for (s, system) in target.coordinator.systems.iter().enumerate() {
-            let at = (t, s);
+            let at = At::new(t, s);
             for (o, output) in system.outputs.iter().enumerate() {
                 if let OutputSource::Peer(peer) = &output.source {
                     plan.outputs
@@ -82,17 +82,16 @@ fn plan(envelope: &DeploymentConfig, tables: &[SystemTable]) -> Result<Plan, Dep
             };
             let from = index.name(at);
             let peer_at = index.locate(&from, &peer.target, &peer.link)?;
-            let port =
-                listen_port(&envelope.targets[peer_at.0].coordinator.systems[peer_at.1].params)
-                    .filter(|&port| port != 0)
-                    .ok_or_else(|| DeployError::NotAListener {
-                        from: from.clone(),
-                        target: peer.target.clone(),
-                        link: peer.link.clone(),
-                    })?;
+            let port = listen_port(&peer_system(envelope, peer_at).params)
+                .filter(|&port| port != 0)
+                .ok_or_else(|| DeployError::NotAListener {
+                    from: from.clone(),
+                    target: peer.target.clone(),
+                    link: peer.link.clone(),
+                })?;
             plan.transports
                 .push((at, address(host(envelope, &peer.target), port)));
-            if envelope.targets[peer_at.0].coordinator.systems[peer_at.1].ty == DB_TYPE {
+            if peer_system(envelope, peer_at).ty == DB_TYPE {
                 let ids = commands.entry(peer_at).or_default();
                 for port in &index.def(at)?.outputs {
                     if let RecordSchema::Msg { id, .. } = &port.schema
@@ -136,8 +135,13 @@ fn check_ports(envelope: &DeploymentConfig) -> Result<(), DeployError> {
     Ok(())
 }
 
+/// The link a peer reference resolved to.
+fn peer_system(envelope: &DeploymentConfig, at: At) -> &crate::SystemConfig {
+    &envelope.targets[at.target].coordinator.systems[at.system]
+}
+
 fn system(envelope: &mut DeploymentConfig, at: At) -> &mut crate::SystemConfig {
-    &mut envelope.targets[at.0].coordinator.systems[at.1]
+    &mut envelope.targets[at.target].coordinator.systems[at.system]
 }
 
 fn host<'a>(envelope: &'a DeploymentConfig, target: &str) -> &'a str {
@@ -153,7 +157,7 @@ fn address(host: &str, port: u16) -> String {
     }
 }
 
-/// The peer a `transport` param names, if it names one.
+/// Parses a peer transport.
 fn peer_link(transport: Option<&Value>) -> Option<PeerLink> {
     serde_json::from_value(transport?.get("peer")?.clone()).ok()
 }
