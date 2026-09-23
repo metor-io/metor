@@ -192,7 +192,7 @@
                 }
               },
               {
-                "port": "log",
+                "port": "plant.log",
                 "peer": {
                   "target": "a",
                   "link": "pub",
@@ -273,11 +273,11 @@
                 ]
               },
               {
-                "port": "mirror.log",
+                "port": "mirror.plant.log",
                 "from": [
                   {
                     "system": "mirror",
-                    "port": "log"
+                    "port": "plant.log"
                   }
                 ]
               },
@@ -305,6 +305,15 @@
                   {
                     "system": "mirror",
                     "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.log",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "log"
                   }
                 ]
               },
@@ -413,7 +422,7 @@
                 }
               },
               {
-                "port": "log",
+                "port": "plant.log",
                 "peer": {
                   "target": "a",
                   "link": "pub",
@@ -472,11 +481,11 @@
                 }
               },
               {
-                "port": "log",
+                "port": "mirror.plant.log",
                 "peer": {
                   "target": "b",
                   "link": "pub",
-                  "port": "mirror.log"
+                  "port": "mirror.plant.log"
                 }
               },
               {
@@ -512,7 +521,7 @@
                 }
               },
               {
-                "port": "mode_cmd",
+                "port": "mode.cmd",
                 "peer": {
                   "target": "b",
                   "link": "pub",
@@ -572,11 +581,11 @@
                 ]
               },
               {
-                "port": "a.log",
+                "port": "a.plant.log",
                 "from": [
                   {
                     "system": "a",
-                    "port": "log"
+                    "port": "plant.log"
                   }
                 ]
               },
@@ -617,6 +626,15 @@
                 ]
               },
               {
+                "port": "a.log",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
                 "port": "a.status",
                 "from": [
                   {
@@ -635,11 +653,11 @@
                 ]
               },
               {
-                "port": "b.log",
+                "port": "b.mirror.plant.log",
                 "from": [
                   {
                     "system": "b",
-                    "port": "log"
+                    "port": "mirror.plant.log"
                   }
                 ]
               },
@@ -680,11 +698,11 @@
                 ]
               },
               {
-                "port": "b.mode_cmd",
+                "port": "b.mode.cmd",
                 "from": [
                   {
                     "system": "b",
-                    "port": "mode_cmd"
+                    "port": "mode.cmd"
                   }
                 ]
               },
@@ -721,6 +739,15 @@
                   {
                     "system": "b",
                     "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "b.log",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "log"
                   }
                 ]
               },

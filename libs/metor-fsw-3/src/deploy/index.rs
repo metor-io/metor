@@ -6,7 +6,6 @@ use crate::cli::config::DeploymentConfig;
 use crate::coordinator::{OutputSource, PeerPort, PortRef, SystemConfig, SystemTable};
 use crate::def::{Records, instance_def};
 use crate::system::{PortDef, SystemDef};
-use crate::{DefCx, Output, SystemStatus};
 
 use super::error::DeployError;
 
@@ -200,7 +199,10 @@ impl<'a> DefIndex<'a> {
             ));
         };
         if from.port == "status" {
-            return Ok(Output::<SystemStatus>::def(&DefCx::empty(), "status"));
+            return Ok(crate::coordinator::status_def(
+                &from.system,
+                target.coordinator.namespace.as_deref(),
+            ));
         }
         let def = self.def((at.0, s))?;
         def.outputs

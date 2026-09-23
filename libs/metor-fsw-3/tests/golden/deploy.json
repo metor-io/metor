@@ -1,0 +1,2608 @@
+{
+  "config_version": 2,
+  "hosts": {},
+  "targets": [
+    {
+      "packs": [
+        {
+          "id": "echo",
+          "lib": "echo_pack",
+          "libs": "<libs>"
+        }
+      ],
+      "coordinator": {
+        "clock": {
+          "Wall": {
+            "rate": 1000.0
+          }
+        },
+        "ring_depth": 8,
+        "namespace": "a",
+        "systems": [
+          {
+            "id": "sampler",
+            "ty": "echo.sampler",
+            "params": null,
+            "inputs": [],
+            "outputs": []
+          },
+          {
+            "id": "pub",
+            "ty": "fsw.publish",
+            "params": {
+              "conn_cap": 1048576,
+              "link": "pub",
+              "namespace": "a",
+              "transport": {
+                "listen": {
+                  "addr": "127.0.0.1:2240",
+                  "max_connections": 8
+                }
+              }
+            },
+            "inputs": [
+              {
+                "port": "sampler.sample",
+                "from": [
+                  {
+                    "system": "sampler",
+                    "port": "sample"
+                  }
+                ]
+              },
+              {
+                "port": "sampler.log",
+                "from": [
+                  {
+                    "system": "sampler",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "sampler.status",
+                "from": [
+                  {
+                    "system": "sampler",
+                    "port": "status"
+                  }
+                ]
+              }
+            ],
+            "outputs": []
+          }
+        ]
+      }
+    },
+    {
+      "packs": [
+        {
+          "id": "echo",
+          "lib": "echo_pack",
+          "libs": "<libs>"
+        }
+      ],
+      "coordinator": {
+        "clock": {
+          "Wall": {
+            "rate": 1000.0
+          }
+        },
+        "ring_depth": 8,
+        "namespace": "b",
+        "systems": [
+          {
+            "id": "mirror",
+            "ty": "fsw.subscribe",
+            "params": {
+              "conn_cap": 1048576,
+              "inbound_cap": 256,
+              "link": "mirror",
+              "namespace": "b",
+              "transport": {
+                "connect": {
+                  "addr": "127.0.0.1:2240"
+                }
+              }
+            },
+            "inputs": [],
+            "outputs": [
+              {
+                "port": "sampler.sample",
+                "def": {
+                  "name": "sampler.sample",
+                  "record": "sample",
+                  "id": 8347425201332135111,
+                  "max_len": 16,
+                  "alignment": 8,
+                  "depth": 1,
+                  "schema": {
+                    "Frame": {
+                      "vtable": {
+                        "ops": [
+                          {
+                            "Data": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Table": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 8,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 4
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 2,
+                              "dim": 3,
+                              "arg": 5
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 6
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 0,
+                              "arg": 7
+                            }
+                          }
+                        ],
+                        "fields": [
+                          {
+                            "offset": 8,
+                            "len": 8,
+                            "arg": 8
+                          }
+                        ],
+                        "data": [
+                          199,
+                          164,
+                          139,
+                          122,
+                          254,
+                          2,
+                          216,
+                          115,
+                          10,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          161,
+                          132,
+                          11,
+                          101,
+                          34,
+                          233,
+                          126,
+                          4
+                        ]
+                      },
+                      "metadata": [
+                        {
+                          "component_id": 323952557150667937,
+                          "name": "a.sampler.sample.value",
+                          "metadata": {}
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "port": "sampler.log",
+                "def": {
+                  "name": "sampler.log",
+                  "record": "log",
+                  "id": 1319681242528961585,
+                  "max_len": 4096,
+                  "alignment": 1,
+                  "depth": 8,
+                  "schema": {
+                    "Msg": {
+                      "id": [
+                        7,
+                        209
+                      ],
+                      "name": "log",
+                      "codec": {
+                        "Postcard": {
+                          "name": "LogEvent",
+                          "ty": {
+                            "Struct": [
+                              {
+                                "name": "timestamp",
+                                "ty": {
+                                  "name": "Timestamp",
+                                  "ty": {
+                                    "NewtypeStruct": {
+                                      "name": "i64",
+                                      "ty": "I64"
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "level",
+                                "ty": {
+                                  "name": "LogLevel",
+                                  "ty": {
+                                    "Enum": [
+                                      {
+                                        "name": "Trace",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Debug",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Info",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Warn",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Error",
+                                        "ty": "UnitVariant"
+                                      }
+                                    ]
+                                  }
+                                }
+                              },
+                              {
+                                "name": "source",
+                                "ty": {
+                                  "name": "str",
+                                  "ty": "String"
+                                }
+                              },
+                              {
+                                "name": "target",
+                                "ty": {
+                                  "name": "str",
+                                  "ty": "String"
+                                }
+                              },
+                              {
+                                "name": "message",
+                                "ty": {
+                                  "name": "str",
+                                  "ty": "String"
+                                }
+                              },
+                              {
+                                "name": "span",
+                                "ty": {
+                                  "name": "Option<T>",
+                                  "ty": {
+                                    "Option": {
+                                      "name": "str",
+                                      "ty": "String"
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "fields",
+                                "ty": {
+                                  "name": "Vec<T>",
+                                  "ty": {
+                                    "Seq": {
+                                      "name": "(A, B,)",
+                                      "ty": {
+                                        "Tuple": [
+                                          {
+                                            "name": "str",
+                                            "ty": "String"
+                                          },
+                                          {
+                                            "name": "str",
+                                            "ty": "String"
+                                          }
+                                        ]
+                                      }
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "file",
+                                "ty": {
+                                  "name": "Option<T>",
+                                  "ty": {
+                                    "Option": {
+                                      "name": "str",
+                                      "ty": "String"
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "line",
+                                "ty": {
+                                  "name": "Option<T>",
+                                  "ty": {
+                                    "Option": {
+                                      "name": "u32",
+                                      "ty": "U32"
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "port": "sampler.status",
+                "def": {
+                  "name": "sampler.status",
+                  "record": "status",
+                  "id": 4959986483315420207,
+                  "max_len": 24,
+                  "alignment": 8,
+                  "depth": 1,
+                  "schema": {
+                    "Frame": {
+                      "vtable": {
+                        "ops": [
+                          {
+                            "Data": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Table": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 8,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 4
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 2,
+                              "dim": 3,
+                              "arg": 5
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 6
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 0,
+                              "arg": 7
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 24,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 32,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 12
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 10,
+                              "dim": 11,
+                              "arg": 13
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 14
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 9,
+                              "arg": 15
+                            }
+                          }
+                        ],
+                        "fields": [
+                          {
+                            "offset": 8,
+                            "len": 8,
+                            "arg": 8
+                          },
+                          {
+                            "offset": 16,
+                            "len": 8,
+                            "arg": 16
+                          }
+                        ],
+                        "data": [
+                          47,
+                          44,
+                          193,
+                          108,
+                          109,
+                          105,
+                          213,
+                          68,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          167,
+                          16,
+                          184,
+                          11,
+                          153,
+                          47,
+                          59,
+                          104,
+                          47,
+                          44,
+                          193,
+                          108,
+                          109,
+                          105,
+                          213,
+                          68,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          169,
+                          181,
+                          198,
+                          47,
+                          116,
+                          154,
+                          225,
+                          35
+                        ]
+                      },
+                      "metadata": [
+                        {
+                          "component_id": 7510649137943548071,
+                          "name": "a.sampler.status.exec_time_ns",
+                          "metadata": {}
+                        },
+                        {
+                          "component_id": 2585517484895810985,
+                          "name": "a.sampler.status.exec_offset_ns",
+                          "metadata": {}
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "id": "meter",
+            "ty": "echo.meter",
+            "params": null,
+            "inputs": [
+              {
+                "port": "sample",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "sampler.sample"
+                  }
+                ]
+              }
+            ],
+            "outputs": []
+          },
+          {
+            "id": "pub",
+            "ty": "fsw.publish",
+            "params": {
+              "conn_cap": 1048576,
+              "link": "pub",
+              "namespace": "b",
+              "transport": {
+                "listen": {
+                  "addr": "127.0.0.1:2241",
+                  "max_connections": 8
+                }
+              }
+            },
+            "inputs": [
+              {
+                "port": "mirror.sampler.sample",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "sampler.sample"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.sampler.log",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "sampler.log"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.sampler.status",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "sampler.status"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.link_status",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.log",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.status",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "status"
+                  }
+                ]
+              },
+              {
+                "port": "meter.output",
+                "from": [
+                  {
+                    "system": "meter",
+                    "port": "output"
+                  }
+                ]
+              },
+              {
+                "port": "meter.log",
+                "from": [
+                  {
+                    "system": "meter",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "meter.status",
+                "from": [
+                  {
+                    "system": "meter",
+                    "port": "status"
+                  }
+                ]
+              }
+            ],
+            "outputs": []
+          }
+        ]
+      }
+    },
+    {
+      "packs": [],
+      "coordinator": {
+        "clock": {
+          "Wall": {
+            "rate": 1000.0
+          }
+        },
+        "ring_depth": 8,
+        "namespace": "gw",
+        "systems": [
+          {
+            "id": "a",
+            "ty": "fsw.subscribe",
+            "params": {
+              "conn_cap": 1048576,
+              "inbound_cap": 256,
+              "link": "a",
+              "namespace": "gw",
+              "transport": {
+                "connect": {
+                  "addr": "127.0.0.1:2240"
+                }
+              }
+            },
+            "inputs": [],
+            "outputs": [
+              {
+                "port": "sampler.sample",
+                "def": {
+                  "name": "sampler.sample",
+                  "record": "sample",
+                  "id": 8347425201332135111,
+                  "max_len": 16,
+                  "alignment": 8,
+                  "depth": 1,
+                  "schema": {
+                    "Frame": {
+                      "vtable": {
+                        "ops": [
+                          {
+                            "Data": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Table": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 8,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 4
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 2,
+                              "dim": 3,
+                              "arg": 5
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 6
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 0,
+                              "arg": 7
+                            }
+                          }
+                        ],
+                        "fields": [
+                          {
+                            "offset": 8,
+                            "len": 8,
+                            "arg": 8
+                          }
+                        ],
+                        "data": [
+                          199,
+                          164,
+                          139,
+                          122,
+                          254,
+                          2,
+                          216,
+                          115,
+                          10,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          161,
+                          132,
+                          11,
+                          101,
+                          34,
+                          233,
+                          126,
+                          4
+                        ]
+                      },
+                      "metadata": [
+                        {
+                          "component_id": 323952557150667937,
+                          "name": "a.sampler.sample.value",
+                          "metadata": {}
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "port": "sampler.log",
+                "def": {
+                  "name": "sampler.log",
+                  "record": "log",
+                  "id": 1319681242528961585,
+                  "max_len": 4096,
+                  "alignment": 1,
+                  "depth": 8,
+                  "schema": {
+                    "Msg": {
+                      "id": [
+                        7,
+                        209
+                      ],
+                      "name": "log",
+                      "codec": {
+                        "Postcard": {
+                          "name": "LogEvent",
+                          "ty": {
+                            "Struct": [
+                              {
+                                "name": "timestamp",
+                                "ty": {
+                                  "name": "Timestamp",
+                                  "ty": {
+                                    "NewtypeStruct": {
+                                      "name": "i64",
+                                      "ty": "I64"
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "level",
+                                "ty": {
+                                  "name": "LogLevel",
+                                  "ty": {
+                                    "Enum": [
+                                      {
+                                        "name": "Trace",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Debug",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Info",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Warn",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Error",
+                                        "ty": "UnitVariant"
+                                      }
+                                    ]
+                                  }
+                                }
+                              },
+                              {
+                                "name": "source",
+                                "ty": {
+                                  "name": "str",
+                                  "ty": "String"
+                                }
+                              },
+                              {
+                                "name": "target",
+                                "ty": {
+                                  "name": "str",
+                                  "ty": "String"
+                                }
+                              },
+                              {
+                                "name": "message",
+                                "ty": {
+                                  "name": "str",
+                                  "ty": "String"
+                                }
+                              },
+                              {
+                                "name": "span",
+                                "ty": {
+                                  "name": "Option<T>",
+                                  "ty": {
+                                    "Option": {
+                                      "name": "str",
+                                      "ty": "String"
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "fields",
+                                "ty": {
+                                  "name": "Vec<T>",
+                                  "ty": {
+                                    "Seq": {
+                                      "name": "(A, B,)",
+                                      "ty": {
+                                        "Tuple": [
+                                          {
+                                            "name": "str",
+                                            "ty": "String"
+                                          },
+                                          {
+                                            "name": "str",
+                                            "ty": "String"
+                                          }
+                                        ]
+                                      }
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "file",
+                                "ty": {
+                                  "name": "Option<T>",
+                                  "ty": {
+                                    "Option": {
+                                      "name": "str",
+                                      "ty": "String"
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "line",
+                                "ty": {
+                                  "name": "Option<T>",
+                                  "ty": {
+                                    "Option": {
+                                      "name": "u32",
+                                      "ty": "U32"
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "port": "sampler.status",
+                "def": {
+                  "name": "sampler.status",
+                  "record": "status",
+                  "id": 4959986483315420207,
+                  "max_len": 24,
+                  "alignment": 8,
+                  "depth": 1,
+                  "schema": {
+                    "Frame": {
+                      "vtable": {
+                        "ops": [
+                          {
+                            "Data": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Table": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 8,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 4
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 2,
+                              "dim": 3,
+                              "arg": 5
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 6
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 0,
+                              "arg": 7
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 24,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 32,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 12
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 10,
+                              "dim": 11,
+                              "arg": 13
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 14
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 9,
+                              "arg": 15
+                            }
+                          }
+                        ],
+                        "fields": [
+                          {
+                            "offset": 8,
+                            "len": 8,
+                            "arg": 8
+                          },
+                          {
+                            "offset": 16,
+                            "len": 8,
+                            "arg": 16
+                          }
+                        ],
+                        "data": [
+                          47,
+                          44,
+                          193,
+                          108,
+                          109,
+                          105,
+                          213,
+                          68,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          167,
+                          16,
+                          184,
+                          11,
+                          153,
+                          47,
+                          59,
+                          104,
+                          47,
+                          44,
+                          193,
+                          108,
+                          109,
+                          105,
+                          213,
+                          68,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          169,
+                          181,
+                          198,
+                          47,
+                          116,
+                          154,
+                          225,
+                          35
+                        ]
+                      },
+                      "metadata": [
+                        {
+                          "component_id": 7510649137943548071,
+                          "name": "a.sampler.status.exec_time_ns",
+                          "metadata": {}
+                        },
+                        {
+                          "component_id": 2585517484895810985,
+                          "name": "a.sampler.status.exec_offset_ns",
+                          "metadata": {}
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "id": "b",
+            "ty": "fsw.subscribe",
+            "params": {
+              "conn_cap": 1048576,
+              "inbound_cap": 256,
+              "link": "b",
+              "namespace": "gw",
+              "transport": {
+                "connect": {
+                  "addr": "127.0.0.1:2241"
+                }
+              }
+            },
+            "inputs": [],
+            "outputs": [
+              {
+                "port": "mirror.sampler.sample",
+                "def": {
+                  "name": "mirror.sampler.sample",
+                  "record": "sample",
+                  "id": 8347425201332135111,
+                  "max_len": 16,
+                  "alignment": 8,
+                  "depth": 1,
+                  "schema": {
+                    "Frame": {
+                      "vtable": {
+                        "ops": [
+                          {
+                            "Data": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Table": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 8,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 4
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 2,
+                              "dim": 3,
+                              "arg": 5
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 6
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 0,
+                              "arg": 7
+                            }
+                          }
+                        ],
+                        "fields": [
+                          {
+                            "offset": 8,
+                            "len": 8,
+                            "arg": 8
+                          }
+                        ],
+                        "data": [
+                          199,
+                          164,
+                          139,
+                          122,
+                          254,
+                          2,
+                          216,
+                          115,
+                          10,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          161,
+                          132,
+                          11,
+                          101,
+                          34,
+                          233,
+                          126,
+                          4
+                        ]
+                      },
+                      "metadata": [
+                        {
+                          "component_id": 323952557150667937,
+                          "name": "a.sampler.sample.value",
+                          "metadata": {}
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "port": "mirror.sampler.log",
+                "def": {
+                  "name": "mirror.sampler.log",
+                  "record": "log",
+                  "id": 1319681242528961585,
+                  "max_len": 4096,
+                  "alignment": 1,
+                  "depth": 8,
+                  "schema": {
+                    "Msg": {
+                      "id": [
+                        7,
+                        209
+                      ],
+                      "name": "log",
+                      "codec": {
+                        "Postcard": {
+                          "name": "LogEvent",
+                          "ty": {
+                            "Struct": [
+                              {
+                                "name": "timestamp",
+                                "ty": {
+                                  "name": "Timestamp",
+                                  "ty": {
+                                    "NewtypeStruct": {
+                                      "name": "i64",
+                                      "ty": "I64"
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "level",
+                                "ty": {
+                                  "name": "LogLevel",
+                                  "ty": {
+                                    "Enum": [
+                                      {
+                                        "name": "Trace",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Debug",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Info",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Warn",
+                                        "ty": "UnitVariant"
+                                      },
+                                      {
+                                        "name": "Error",
+                                        "ty": "UnitVariant"
+                                      }
+                                    ]
+                                  }
+                                }
+                              },
+                              {
+                                "name": "source",
+                                "ty": {
+                                  "name": "str",
+                                  "ty": "String"
+                                }
+                              },
+                              {
+                                "name": "target",
+                                "ty": {
+                                  "name": "str",
+                                  "ty": "String"
+                                }
+                              },
+                              {
+                                "name": "message",
+                                "ty": {
+                                  "name": "str",
+                                  "ty": "String"
+                                }
+                              },
+                              {
+                                "name": "span",
+                                "ty": {
+                                  "name": "Option<T>",
+                                  "ty": {
+                                    "Option": {
+                                      "name": "str",
+                                      "ty": "String"
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "fields",
+                                "ty": {
+                                  "name": "Vec<T>",
+                                  "ty": {
+                                    "Seq": {
+                                      "name": "(A, B,)",
+                                      "ty": {
+                                        "Tuple": [
+                                          {
+                                            "name": "str",
+                                            "ty": "String"
+                                          },
+                                          {
+                                            "name": "str",
+                                            "ty": "String"
+                                          }
+                                        ]
+                                      }
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "file",
+                                "ty": {
+                                  "name": "Option<T>",
+                                  "ty": {
+                                    "Option": {
+                                      "name": "str",
+                                      "ty": "String"
+                                    }
+                                  }
+                                }
+                              },
+                              {
+                                "name": "line",
+                                "ty": {
+                                  "name": "Option<T>",
+                                  "ty": {
+                                    "Option": {
+                                      "name": "u32",
+                                      "ty": "U32"
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "port": "mirror.sampler.status",
+                "def": {
+                  "name": "mirror.sampler.status",
+                  "record": "status",
+                  "id": 4959986483315420207,
+                  "max_len": 24,
+                  "alignment": 8,
+                  "depth": 1,
+                  "schema": {
+                    "Frame": {
+                      "vtable": {
+                        "ops": [
+                          {
+                            "Data": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Table": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 8,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 4
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 2,
+                              "dim": 3,
+                              "arg": 5
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 6
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 0,
+                              "arg": 7
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 24,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 32,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 12
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 10,
+                              "dim": 11,
+                              "arg": 13
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 14
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 9,
+                              "arg": 15
+                            }
+                          }
+                        ],
+                        "fields": [
+                          {
+                            "offset": 8,
+                            "len": 8,
+                            "arg": 8
+                          },
+                          {
+                            "offset": 16,
+                            "len": 8,
+                            "arg": 16
+                          }
+                        ],
+                        "data": [
+                          47,
+                          44,
+                          193,
+                          108,
+                          109,
+                          105,
+                          213,
+                          68,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          167,
+                          16,
+                          184,
+                          11,
+                          153,
+                          47,
+                          59,
+                          104,
+                          47,
+                          44,
+                          193,
+                          108,
+                          109,
+                          105,
+                          213,
+                          68,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          169,
+                          181,
+                          198,
+                          47,
+                          116,
+                          154,
+                          225,
+                          35
+                        ]
+                      },
+                      "metadata": [
+                        {
+                          "component_id": 7510649137943548071,
+                          "name": "a.sampler.status.exec_time_ns",
+                          "metadata": {}
+                        },
+                        {
+                          "component_id": 2585517484895810985,
+                          "name": "a.sampler.status.exec_offset_ns",
+                          "metadata": {}
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "port": "mirror.link_status",
+                "def": {
+                  "name": "mirror.link_status",
+                  "record": "link_status",
+                  "id": 4586542639847765356,
+                  "max_len": 40,
+                  "alignment": 8,
+                  "depth": 1,
+                  "schema": {
+                    "Frame": {
+                      "vtable": {
+                        "ops": [
+                          {
+                            "Data": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Table": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 8,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 4
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 2,
+                              "dim": 3,
+                              "arg": 5
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 6
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 0,
+                              "arg": 7
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 24,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 32,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 12
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 10,
+                              "dim": 11,
+                              "arg": 13
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 14
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 9,
+                              "arg": 15
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 48,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 56,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 64,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 64,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 20
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 18,
+                              "dim": 19,
+                              "arg": 21
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 22
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 17,
+                              "arg": 23
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 72,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 80,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 88,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 88,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 28
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 26,
+                              "dim": 27,
+                              "arg": 29
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 30
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 25,
+                              "arg": 31
+                            }
+                          }
+                        ],
+                        "fields": [
+                          {
+                            "offset": 8,
+                            "len": 4,
+                            "arg": 8
+                          },
+                          {
+                            "offset": 16,
+                            "len": 8,
+                            "arg": 16
+                          },
+                          {
+                            "offset": 24,
+                            "len": 8,
+                            "arg": 24
+                          },
+                          {
+                            "offset": 32,
+                            "len": 8,
+                            "arg": 32
+                          }
+                        ],
+                        "data": [
+                          108,
+                          245,
+                          78,
+                          251,
+                          58,
+                          172,
+                          166,
+                          63,
+                          2,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          40,
+                          209,
+                          12,
+                          142,
+                          9,
+                          28,
+                          24,
+                          68,
+                          108,
+                          245,
+                          78,
+                          251,
+                          58,
+                          172,
+                          166,
+                          63,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          149,
+                          27,
+                          253,
+                          87,
+                          242,
+                          242,
+                          80,
+                          8,
+                          108,
+                          245,
+                          78,
+                          251,
+                          58,
+                          172,
+                          166,
+                          63,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          84,
+                          92,
+                          59,
+                          47,
+                          130,
+                          134,
+                          181,
+                          17,
+                          108,
+                          245,
+                          78,
+                          251,
+                          58,
+                          172,
+                          166,
+                          63,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          109,
+                          132,
+                          251,
+                          83,
+                          22,
+                          175,
+                          228,
+                          44
+                        ]
+                      },
+                      "metadata": [
+                        {
+                          "component_id": 4906702621383643432,
+                          "name": "b.mirror.link_status.connections",
+                          "metadata": {}
+                        },
+                        {
+                          "component_id": 599245873112488853,
+                          "name": "b.mirror.link_status.bytes_out",
+                          "metadata": {}
+                        },
+                        {
+                          "component_id": 1276073963125693524,
+                          "name": "b.mirror.link_status.batches_dropped",
+                          "metadata": {}
+                        },
+                        {
+                          "component_id": 3234902942791992429,
+                          "name": "b.mirror.link_status.inbound_dropped",
+                          "metadata": {}
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "port": "mirror.status",
+                "def": {
+                  "name": "mirror.status",
+                  "record": "status",
+                  "id": 4959986483315420207,
+                  "max_len": 24,
+                  "alignment": 8,
+                  "depth": 1,
+                  "schema": {
+                    "Frame": {
+                      "vtable": {
+                        "ops": [
+                          {
+                            "Data": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Table": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 8,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 4
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 2,
+                              "dim": 3,
+                              "arg": 5
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 6
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 0,
+                              "arg": 7
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 24,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 32,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 12
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 10,
+                              "dim": 11,
+                              "arg": 13
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 14
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 9,
+                              "arg": 15
+                            }
+                          }
+                        ],
+                        "fields": [
+                          {
+                            "offset": 8,
+                            "len": 8,
+                            "arg": 8
+                          },
+                          {
+                            "offset": 16,
+                            "len": 8,
+                            "arg": 16
+                          }
+                        ],
+                        "data": [
+                          47,
+                          44,
+                          193,
+                          108,
+                          109,
+                          105,
+                          213,
+                          68,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          219,
+                          90,
+                          105,
+                          233,
+                          12,
+                          177,
+                          245,
+                          126,
+                          47,
+                          44,
+                          193,
+                          108,
+                          109,
+                          105,
+                          213,
+                          68,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          93,
+                          180,
+                          176,
+                          84,
+                          112,
+                          95,
+                          91,
+                          60
+                        ]
+                      },
+                      "metadata": [
+                        {
+                          "component_id": 9148412887086750427,
+                          "name": "b.mirror.status.exec_time_ns",
+                          "metadata": {}
+                        },
+                        {
+                          "component_id": 4349174801218188381,
+                          "name": "b.mirror.status.exec_offset_ns",
+                          "metadata": {}
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "port": "meter.output",
+                "def": {
+                  "name": "meter.output",
+                  "record": "ping",
+                  "id": 4553385573019223977,
+                  "max_len": 8,
+                  "alignment": 1,
+                  "depth": 1,
+                  "schema": {
+                    "Msg": {
+                      "id": [
+                        30,
+                        143
+                      ],
+                      "name": "ping",
+                      "codec": {
+                        "Postcard": {
+                          "name": "Ping",
+                          "ty": {
+                            "Struct": [
+                              {
+                                "name": "n",
+                                "ty": {
+                                  "name": "u32",
+                                  "ty": "U32"
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "port": "meter.status",
+                "def": {
+                  "name": "meter.status",
+                  "record": "status",
+                  "id": 4959986483315420207,
+                  "max_len": 24,
+                  "alignment": 8,
+                  "depth": 1,
+                  "schema": {
+                    "Frame": {
+                      "vtable": {
+                        "ops": [
+                          {
+                            "Data": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Table": {
+                              "offset": 0,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 8,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 16,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 4
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 2,
+                              "dim": 3,
+                              "arg": 5
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 6
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 0,
+                              "arg": 7
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 24,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 32,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 0
+                            }
+                          },
+                          {
+                            "Data": {
+                              "offset": 40,
+                              "len": 8
+                            }
+                          },
+                          {
+                            "Component": {
+                              "component_id": 12
+                            }
+                          },
+                          {
+                            "Schema": {
+                              "ty": 10,
+                              "dim": 11,
+                              "arg": 13
+                            }
+                          },
+                          {
+                            "Timestamp": {
+                              "source": 1,
+                              "arg": 14
+                            }
+                          },
+                          {
+                            "Frame": {
+                              "component_id": 9,
+                              "arg": 15
+                            }
+                          }
+                        ],
+                        "fields": [
+                          {
+                            "offset": 8,
+                            "len": 8,
+                            "arg": 8
+                          },
+                          {
+                            "offset": 16,
+                            "len": 8,
+                            "arg": 16
+                          }
+                        ],
+                        "data": [
+                          47,
+                          44,
+                          193,
+                          108,
+                          109,
+                          105,
+                          213,
+                          68,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          131,
+                          139,
+                          78,
+                          109,
+                          61,
+                          193,
+                          167,
+                          97,
+                          47,
+                          44,
+                          193,
+                          108,
+                          109,
+                          105,
+                          213,
+                          68,
+                          3,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          213,
+                          30,
+                          26,
+                          238,
+                          49,
+                          22,
+                          199,
+                          88
+                        ]
+                      },
+                      "metadata": [
+                        {
+                          "component_id": 7036805412360719235,
+                          "name": "b.meter.status.exec_time_ns",
+                          "metadata": {}
+                        },
+                        {
+                          "component_id": 6397106199406976725,
+                          "name": "b.meter.status.exec_offset_ns",
+                          "metadata": {}
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "id": "db",
+            "ty": "fsw.db",
+            "params": {
+              "command_ids": [],
+              "link": "db",
+              "namespace": "gw",
+              "path": null,
+              "transport": {
+                "listen": {
+                  "addr": "127.0.0.1:2250",
+                  "max_connections": 8
+                }
+              }
+            },
+            "inputs": [
+              {
+                "port": "a.sampler.sample",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "sampler.sample"
+                  }
+                ]
+              },
+              {
+                "port": "a.sampler.log",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "sampler.log"
+                  }
+                ]
+              },
+              {
+                "port": "a.sampler.status",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "sampler.status"
+                  }
+                ]
+              },
+              {
+                "port": "a.link_status",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "a.log",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "a.status",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "status"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.sampler.sample",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.sampler.sample"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.sampler.log",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.sampler.log"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.sampler.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.sampler.status"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.link_status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.link_status"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.status"
+                  }
+                ]
+              },
+              {
+                "port": "b.meter.output",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "meter.output"
+                  }
+                ]
+              },
+              {
+                "port": "b.meter.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "meter.status"
+                  }
+                ]
+              },
+              {
+                "port": "b.link_status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "b.log",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "b.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "status"
+                  }
+                ]
+              }
+            ],
+            "outputs": [],
+            "thread": "db"
+          }
+        ]
+      }
+    }
+  ]
+}

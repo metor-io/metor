@@ -59,7 +59,7 @@ class DeploymentTest(unittest.TestCase):
             mirror["outputs"],
             [
                 {"port": "plant.imu", "peer": {"target": "a", "link": "pub", "port": "plant.imu"}},
-                {"port": "log", "peer": {"target": "a", "link": "pub", "port": "plant.log"}},
+                {"port": "plant.log", "peer": {"target": "a", "link": "pub", "port": "plant.log"}},
                 {
                     "port": "plant.status",
                     "peer": {"target": "a", "link": "pub", "port": "plant.status"},
@@ -78,7 +78,7 @@ class DeploymentTest(unittest.TestCase):
         b.add("mirror", Subscribe(peer=a_pub))
         config = Deployment(targets=[a, b]).to_config()
         outputs = config["targets"][1]["coordinator"]["systems"][0]["outputs"]
-        self.assertEqual([o["port"] for o in outputs], ["plant.imu", "log"])
+        self.assertEqual([o["port"] for o in outputs], ["plant.imu", "plant.log"])
 
     def test_records_alone_copy_nothing(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
@@ -99,7 +99,7 @@ class DeploymentTest(unittest.TestCase):
         imu = mirror.port(plant.imu)
         self.assertEqual((imu.ref.system, imu.ref.port, imu.record, imu.target), ("mirror", "plant.imu", Imu, b))
         log = mirror.port(plant.log)
-        self.assertEqual((log.ref.port, log.record), ("log", LogEvent))
+        self.assertEqual((log.ref.port, log.record), ("plant.log", LogEvent))
         other = b.add("plant", Plant())
         with self.assertRaisesRegex(ConfigError, "does not copy `plant.imu`"):
             mirror.port(other.imu)
@@ -202,7 +202,7 @@ class DeploymentTest(unittest.TestCase):
         self.assertEqual([s["id"] for s in systems], ["a", "db"])
         self.assertEqual(
             [i["port"] for i in systems[1]["inputs"]],
-            ["a.plant.imu", "a.log", "a.plant.status", "a.link_status", "a.status"],
+            ["a.plant.imu", "a.plant.log", "a.plant.status", "a.link_status", "a.log", "a.status"],
         )
         self.assertEqual(db.db_status.record.__name__, "DbStatus")
 
@@ -222,3 +222,19 @@ class DeploymentTest(unittest.TestCase):
 
     def test_est_record_is_a_frame(self) -> None:
         self.assertEqual(Est._kind, "frame")
+
+    def test_message_arrives_on_one_port(self) -> None:
+        a = Target(cycle_rate=100.0, namespace="a")
+        plant = a.add("plant", Plant())
+        nav = a.add("nav", Nav(imu=plant.imu))
+        a_pub = a.add("pub", Publish([plant, nav], listen="0.0.0.0:2240"))
+        b = Target(cycle_rate=100.0, namespace="b")
+        mirror = b.add("mirror", Subscribe(peer=a_pub))
+        config = Deployment(targets=[a, b]).to_config()
+        outputs = config["targets"][1]["coordinator"]["systems"][0]["outputs"]
+        self.assertEqual(
+            [o["port"] for o in outputs],
+            ["plant.imu", "plant.log", "plant.status", "nav.est", "nav.status"],
+        )
+        self.assertEqual(mirror.port(nav.log).ref.port, "plant.log")
+        self.assertEqual(mirror.port(nav.status).ref.port, "nav.status")

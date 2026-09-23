@@ -5,12 +5,15 @@ use core::mem::size_of;
 
 use metor_fsw_3_ring::{Config, Notifier, RingBuffer, View, WakeSource, Writer};
 use metor_proto::types::{Msg, PACKET_HEADER_LEN, PacketHeader, PacketId, PacketTy, Timestamp};
-use metor_proto_wkt::VTableMsg;
+use metor_proto_wkt::{LinkInfo, SetComponentMetadata, SetMsgMetadata, VTableMsg};
 use zerocopy::TryFromBytes;
 
 use crate::port::ring_capacity;
 
 const PER_RECORD_OVERHEAD: usize = PACKET_HEADER_LEN + size_of::<Timestamp>();
+
+/// What a peer sends about itself before its data; none of it is data.
+const ANNOUNCE: [PacketId; 3] = [LinkInfo::ID, SetComponentMetadata::ID, SetMsgMetadata::ID];
 
 /// Shared inbox for connections
 ///
@@ -101,6 +104,7 @@ impl Inbox {
         };
         let routed = match ty {
             PacketTy::Msg if id == VTableMsg::ID => return self.announce(bytes),
+            PacketTy::Msg if ANNOUNCE.contains(&id) => return,
             PacketTy::Table => self.tables.contains(&id),
             PacketTy::Msg | PacketTy::MsgWithTimestamp => self.msgs.contains(&id),
             PacketTy::TimeSeries => return,
@@ -279,7 +283,11 @@ mod tests {
     #[test]
     fn test_announce_is_never_routed() {
         let (inbox, mut view) = inbox(4);
+        inbox.watch();
         inbox.accept(&vtable(TABLE));
+        inbox.accept(&msg(LinkInfo::ID, b"identity"));
+        inbox.accept(&msg(SetComponentMetadata::ID, b"component"));
+        inbox.accept(&msg(SetMsgMetadata::ID, b"message"));
         assert!(drain(&mut view).is_empty());
         assert!(!inbox.check_due(), "an announce is not data");
     }

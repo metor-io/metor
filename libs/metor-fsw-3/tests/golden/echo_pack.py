@@ -28,10 +28,46 @@ class Ping(Record):
     _pack = PACK
 
 
+class Sample(Record):
+    _name = "sample"
+    _kind = "frame"
+    _pack = PACK
+
+
 class SystemStatus(Record):
     _name = "status"
     _kind = "frame"
     _pack = PACK
+
+
+class Sampler(System):
+    "Counts up, one sample per cycle."
+
+    _pack = PACK
+    _ty = "sampler"
+    _ports = {"sample": Sample, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self) -> None:
+        super().__init__({}, {})
+
+    sample: OutPort[Sample]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Meter(System):
+    "Pings the newest sample's value."
+
+    _pack = PACK
+    _ty = "meter"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, sample: Sources[Sample] = ()) -> None:
+        super().__init__({"sample": sample}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
 
 
 class Echo(System):

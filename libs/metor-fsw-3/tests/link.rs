@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use metor_fsw_3::coordinator::{
-    CoordinatorConfig, InputConfig, OutputConfig, PortRef, SystemConfig, SystemTable,
+    CoordinatorConfig, InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig, SystemTable,
 };
 use metor_fsw_3::link::register_builtins;
-use metor_fsw_3::{Clock, Frame, Input, LinkStatus, Output, Timestamp, system};
+use metor_fsw_3::{Clock, DefCx, Frame, Input, LinkStatus, Output, Timestamp, system};
 use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::{PacketSink, PacketStream, Peer, identify};
 use metor_proto_wkt::LogEvent;
@@ -113,6 +113,22 @@ impl Pinger {
     }
 }
 
+/// Records every frame's sample it is wired to, as a whole number, beside the pings.
+struct ImuSink(Arc<Mutex<Vec<u32>>>);
+
+#[system]
+impl ImuSink {
+    fn execute(&mut self, imu: &mut Input<Imu>) {
+        for imu in imu.drain().flatten() {
+            // PANIC Safety: no test holds this lock across a panic.
+            self.0
+                .lock()
+                .expect("an unpoisoned sink")
+                .push(imu.sample as u32);
+        }
+    }
+}
+
 /// Records every ping it is wired to.
 struct PingSink(Arc<Mutex<Vec<u32>>>);
 
@@ -198,6 +214,10 @@ fn table(seen: &Seen) -> SystemTable {
     let pings = seen.pings.clone();
     table
         .register("ping_sink", move || PingSink(pings.clone()))
+        .expect("valid records");
+    let samples = seen.pings.clone();
+    table
+        .register("imu_sink", move || ImuSink(samples.clone()))
         .expect("valid records");
     let faults = seen.faults.clone();
     table
@@ -661,6 +681,136 @@ async fn test_subscribe_receives_records() {
     let pings = client.pings();
     let steps: Vec<u32> = pings.windows(2).map(|w| w[1] - w[0]).collect();
     assert!(steps.iter().all(|step| *step == 1), "{pings:?}");
+}
+
+/// A `Subscribe` dialing `addr` whose `imu` output was built against `def`,
+/// as `metor build` bakes a peer's port, with a log sink on its faults.
+fn mirror(addr: SocketAddr, def: metor_fsw_3::PortDef) -> Vec<SystemConfig> {
+    vec![
+        SystemConfig {
+            params: json!({
+                "transport": { "connect": { "addr": addr.to_string() } },
+                "link": "mirror",
+            }),
+            outputs: vec![OutputConfig {
+                port: "imu".into(),
+                source: OutputSource::Def(def),
+            }],
+            ..SystemConfig::new("cmds", "fsw.subscribe")
+        },
+        reading("sink", "imu_sink", "imu", PortRef::new("cmds", "imu")),
+        reading("faults", "log_sink", "log", PortRef::new("cmds", "log")),
+    ]
+}
+
+/// The def `imu.imu` announces on a `cube_sat` target, under a mirror's name.
+fn published_imu() -> metor_fsw_3::PortDef {
+    let cx = DefCx {
+        id: "imu",
+        namespace: Some("cube_sat"),
+        ..DefCx::empty()
+    };
+    metor_fsw_3::PortDef {
+        name: "imu".into(),
+        ..Output::<Imu>::def(&cx, "imu")
+    }
+}
+
+#[stellarator::test]
+async fn test_subscribe_mirrors_frames() {
+    let (server, client) = (Seen::default(), Seen::default());
+    let _server = spawn(
+        vec![
+            SystemConfig::new("imu", "source"),
+            publish(
+                "pub-frames",
+                json!({ "listen": { "addr": "127.0.0.1:0" } }),
+                1 << 20,
+            ),
+        ],
+        &server,
+        500.0,
+    );
+    let addr = bound("pub-frames").await;
+    let _client = spawn(mirror(addr, published_imu()), &client, 500.0);
+    until("the mirror never received a frame", || {
+        client.pings().len() >= 3
+    })
+    .await;
+    let samples = client.pings();
+    assert!(samples.windows(2).all(|w| w[1] == w[0] + 1), "{samples:?}");
+    assert!(!client.faulted("peer_schema_mismatch"));
+}
+
+/// A target that dials a peer and listens for the ground on one thread.
+#[stellarator::test]
+async fn test_dialing_beside_a_listener() {
+    let (server, client) = (Seen::default(), Seen::default());
+    let _server = spawn(
+        vec![
+            SystemConfig::new("imu", "source"),
+            publish(
+                "pub-beside",
+                json!({ "listen": { "addr": "127.0.0.1:0" } }),
+                1 << 20,
+            ),
+        ],
+        &server,
+        500.0,
+    );
+    let addr = bound("pub-beside").await;
+    let mut systems = mirror(addr, published_imu());
+    systems.push(SystemConfig {
+        params: json!({
+            "transport": { "listen": { "addr": "127.0.0.1:0" } },
+            "link": "ground-beside",
+        }),
+        ..reading(
+            "ground",
+            "fsw.publish",
+            "cmds.imu",
+            PortRef::new("cmds", "imu"),
+        )
+    });
+    let _client = spawn(systems, &client, 500.0);
+    until_seen("the mirror never received a frame", &client, || {
+        client.pings().len() >= 3
+    })
+    .await;
+}
+
+#[stellarator::test]
+async fn test_subscribe_faults_unannounced_table() {
+    let (server, client) = (Seen::default(), Seen::default());
+    let _server = spawn(
+        vec![
+            SystemConfig::new("imu", "source"),
+            publish(
+                "pub-other",
+                json!({ "listen": { "addr": "127.0.0.1:0" } }),
+                1 << 20,
+            ),
+        ],
+        &server,
+        500.0,
+    );
+    let addr = bound("pub-other").await;
+    // Built against the same frame on another target: another table id.
+    let elsewhere = DefCx {
+        id: "imu",
+        namespace: Some("other"),
+        ..DefCx::empty()
+    };
+    let stale = metor_fsw_3::PortDef {
+        name: "imu".into(),
+        ..Output::<Imu>::def(&elsewhere, "imu")
+    };
+    let _client = spawn(mirror(addr, stale), &client, 500.0);
+    until_seen("the mirror never faulted", &client, || {
+        client.faulted("peer_schema_mismatch")
+    })
+    .await;
+    assert!(client.pings().is_empty(), "nothing routes under a stale id");
 }
 
 #[stellarator::test]

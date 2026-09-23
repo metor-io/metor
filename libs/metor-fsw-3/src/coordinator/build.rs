@@ -122,7 +122,7 @@ fn resolve<'a>(
         );
         plan.rings.push(RingSpec::new(
             &system.id,
-            &Output::<SystemStatus>::def(&DefCx::empty(), STATUS_PORT),
+            &status_def(&system.id, namespace),
         ));
         plan.systems.push(PlannedSystem {
             id: &system.id,
@@ -136,6 +136,16 @@ fn resolve<'a>(
     }
     resolve_edges(config, &mut plan, &index)?;
     Ok(plan)
+}
+
+/// The coordinator's status port for instance `id`, rooted like any other port.
+pub(crate) fn status_def(id: &str, namespace: Option<&str>) -> PortDef {
+    let cx = DefCx {
+        id,
+        namespace,
+        ..DefCx::empty()
+    };
+    Output::<SystemStatus>::def(&cx, STATUS_PORT)
 }
 
 /// Each system's position in the config, by id.

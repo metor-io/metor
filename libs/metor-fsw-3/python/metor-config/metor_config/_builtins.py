@@ -169,10 +169,10 @@ class Subscribe(Link):
 
     `records` lists message classes, one port each named after the record,
     resolved against this target's packs. With a `peer`, `items` lists the
-    peer's published ports to copy: a frame port keeps its `{system}.{port}`
-    name, a message port is named after its record, once per record. No
-    `items` and no `records` copies everything the peer publishes. `port()`
-    returns this system's copy of a published port.
+    peer's published ports to copy, each keeping its `{system}.{port}` name;
+    a message record arrives on one port however many the peer publishes it
+    on, the first listed. No `items` and no `records` copies everything the
+    peer publishes. `port()` returns this system's copy of a published port.
     """
 
     _ty = "subscribe"
@@ -219,7 +219,11 @@ class Subscribe(Link):
 
     def _port(self, source: OutPort[T], name: str, target: Any) -> OutPort[T]:
         for copy in self._peer_copies():
-            if copy.source == source.name and copy.target is source.target:
+            if copy.target is not source.target:
+                continue
+            same_port = copy.source == source.name
+            same_msg = source.kind == "msg" and copy.record is source.record
+            if same_port or same_msg:
                 return OutPort(name, copy.port, copy.record, target)
         raise ConfigError(f"`{name}` does not copy `{source.name}`")
 
@@ -256,9 +260,12 @@ def _copies(peer: SystemHandle, items: Sequence[Item], records: Sequence[type[Re
         record = port.record
         if record is None:
             raise ConfigError(f"`{port.name}` carries no record class")
-        name = port.name if record._kind == "frame" else record._name
-        if not any(copy.port == name for copy in copies):
-            copies.append(Copy(name, record, port.name, port.target))
+        taken = any(
+            copy.port == port.name or (record._kind == "msg" and copy.record._name == record._name)
+            for copy in copies
+        )
+        if not taken:
+            copies.append(Copy(port.name, record, port.name, port.target))
     return copies
 
 
