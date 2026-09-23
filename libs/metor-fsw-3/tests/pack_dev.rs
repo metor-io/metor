@@ -4,7 +4,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use metor_fsw_3::cli::build::{PackConfig, cargo_build, cdylib_name, triple};
+use metor_fsw_3::cli::cargo::{PackConfig, cargo_build, cdylib_name, triple};
 use metor_fsw_3::cli::config::PackRef;
 use metor_fsw_3::cli::module::render;
 use metor_fsw_3::cli::pack_dev::{PackDevError, pack_dev};

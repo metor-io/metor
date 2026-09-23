@@ -51,6 +51,7 @@ pub mod async_system;
 pub mod cli;
 pub mod coordinator;
 pub mod def;
+pub mod deploy;
 pub mod dl;
 pub mod fn_system;
 pub mod frame;

@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use super::build::write_atomic as write_bytes;
-use super::build::{BuildError, PackConfig, cargo_build, cdylib_name, copy_atomic, triple};
+use super::cargo::write_atomic as write_bytes;
+use super::cargo::{CargoError, PackConfig, cargo_build, cdylib_name, copy_atomic, triple};
 use super::config::PackRef;
 use super::module::render;
 use crate::dl::{Pack, PackError};
@@ -42,7 +42,7 @@ pub enum PackDevError {
     #[error("rendering the module: {0}")]
     Template(#[from] minijinja::Error),
     #[error(transparent)]
-    Build(#[from] BuildError),
+    Cargo(#[from] CargoError),
     #[error(transparent)]
     Pack(#[from] PackError),
     #[error("{0} is already loaded; restart the process before rebuilding this pack")]

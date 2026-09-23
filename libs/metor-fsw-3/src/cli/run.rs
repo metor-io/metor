@@ -1,4 +1,5 @@
-//! `metor run`: evaluate a target file, load its packs, and cycle the graph.
+//! `metor run`: evaluate a target file, resolve its deployment, load a
+//! target's packs, and cycle its graph.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
@@ -10,10 +11,11 @@ use std::process::{Command, ExitStatus};
 
 use tracing_subscriber::layer::SubscriberExt;
 
-use super::build::{cdylib_name, read_toml, string, triple};
+use super::cargo::{cdylib_name, read_toml, string, triple};
 use super::config::{ConfigError, DeploymentConfig, TargetConfig};
 use super::pack_dev::{PackDevError, pack_dev};
 use crate::coordinator::{BuildError, Clock, Coordinator, SystemTable};
+use crate::deploy::{self, DeployError};
 use crate::dl::{Pack, PackError};
 use crate::pack::ABI_VERSION;
 
@@ -57,6 +59,8 @@ pub enum RunError {
     Pack(#[from] PackError),
     #[error(transparent)]
     Build(#[from] BuildError),
+    #[error(transparent)]
+    Deploy(#[from] DeployError),
     #[error("--sim-dt must be a positive number of seconds, got {0}")]
     SimDt(f64),
     #[error("these systems latched off: {0}")]
@@ -66,15 +70,7 @@ pub enum RunError {
 /// Refreshes every dev pack, evaluates the target, and cycles until stopped.
 pub fn run(args: Run) -> Result<(), RunError> {
     install_logging();
-    let target = args
-        .target
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("target.py"));
-    let packs = dev_packs(target.parent().unwrap_or(Path::new(".")));
-    for pack in &packs {
-        pack_dev(pack)?;
-    }
-    let config = eval_target(&target, &packs)?;
+    let config = prepare(args.target.as_deref())?;
     let member = config.target(args.member.as_deref())?;
     let coordinator = load(&config.targets[member], &args)?;
     if args.print_ports {
@@ -120,6 +116,31 @@ fn install_logging() {
         .with(crate::log::layer());
     // A host that already installed a subscriber keeps it.
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// Refreshes every dev pack beside `target`, evaluates it (or reads it, for a
+/// `.json`), and resolves every peer reference, which needs every target's
+/// packs only while a reference remains.
+pub fn prepare(target: Option<&Path>) -> Result<DeploymentConfig, RunError> {
+    let target = target.unwrap_or(Path::new("target.py"));
+    let packs = dev_packs(target.parent().unwrap_or(Path::new(".")));
+    for pack in &packs {
+        pack_dev(pack)?;
+    }
+    let mut config = if target.extension().is_some_and(|ext| ext == "json") {
+        DeploymentConfig::from_slice(&std::fs::read(target)?)?
+    } else {
+        eval_target(target, &packs)?
+    };
+    if deploy::unresolved(&config) {
+        let tables: Vec<SystemTable> = config
+            .targets
+            .iter()
+            .map(table_for)
+            .collect::<Result<_, _>>()?;
+        deploy::resolve(&mut config, &tables)?;
+    }
+    Ok(config)
 }
 
 /// The dev packs a target depends on: `[tool.uv.sources]` paths that are both a
@@ -214,6 +235,12 @@ pub fn load(config: &TargetConfig, overrides: &Run) -> Result<Coordinator, RunEr
         config.coordinator.clock = Clock::Simulated { dt };
     }
 
+    let table = table_for(&config)?;
+    Ok(config.coordinator.build(&table)?)
+}
+
+/// The built-ins plus every pack `config` names, opened.
+fn table_for(config: &TargetConfig) -> Result<SystemTable, RunError> {
     let mut table = SystemTable::new();
     crate::link::register_builtins(&mut table)?;
     let opened: Vec<Pack> = config
@@ -229,7 +256,7 @@ pub fn load(config: &TargetConfig, overrides: &Run) -> Result<Coordinator, RunEr
     for (reference, pack) in config.packs.iter().zip(&opened) {
         table.register_pack(&reference.id, pack)?;
     }
-    Ok(config.coordinator.build(&table)?)
+    Ok(table)
 }
 
 /// Set once SIGINT arrived; the run's stop future reads it each cycle.
