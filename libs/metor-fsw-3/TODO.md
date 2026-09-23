@@ -15,10 +15,9 @@ in list order. `01-base.md`, `02-ring-review.md`.
 `Record` with the codec on the type, one `write` and `latest` and `drain`
 for frames and messages, `#[system]` impl blocks, JSON params, and the
 `log` output with the `tracing` bridge. T1 to T6 landed and reviewed.
-T7 (the ADCS control loop as an example and convergence test) and T8
-(docs, and folding shipped deviations back into `03-authoring.md`) are
-deferred to slice 3, since the example has to be rewritten for packs
-anyway.
+T7's ADCS example landed under `examples/adcs-fsw3` on 2026-09-22
+(`09-adcs-example.md`); T8 (docs, and folding shipped deviations back
+into `03-authoring.md`) is still open.
 
 - Restore `#[derive(Record)]` support for serde-compatible enums. Timestamp
   field parsing currently restricts the derive to structs; enum messages
