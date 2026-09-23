@@ -32,6 +32,17 @@ pub struct Imu {
     pub sample: f64,
 }
 
+/// Another frame named `imu`, sampling two floats where [`Imu`] samples one
+/// double: the same bytes under a different layout.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
+#[frame(name = "imu")]
+#[repr(C)]
+pub struct ImuPair {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub sample: [f32; 2],
+}
+
 impl Imu {
     pub fn new(timestamp: i64, sample: f64) -> Self {
         Self {

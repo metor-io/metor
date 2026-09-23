@@ -372,6 +372,7 @@ mod tests {
             max_len: 8,
             alignment: 4,
             depth: 8,
+            layout: 0,
             schema: <crate::Bytes as crate::Record>::schema(),
         }
     }
