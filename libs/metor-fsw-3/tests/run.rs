@@ -185,3 +185,47 @@ fn test_select_target_runs_in_process() {
         "no prefix for an in-process target: {stderr}"
     );
 }
+
+/// Waits for `child` up to two seconds, killing it if it outlasts that.
+fn wait_bounded(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("the child is ours") {
+            return Some(status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    None
+}
+
+#[test]
+fn test_sigint_ends_every_child() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let target = two_targets(dir.path(), "");
+    let mut parent = metor()
+        .args([
+            "run",
+            &target.display().to_string(),
+            "--cycles",
+            "100000000",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("metor runs");
+
+    // The parent evaluates the target file before it watches for SIGINT.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    // SAFETY: `kill` takes a pid and a signal number and touches no memory.
+    unsafe { libc::kill(parent.id() as i32, libc::SIGINT) };
+
+    let status = wait_bounded(&mut parent).expect("the deployment ends on SIGINT");
+    let output = parent.wait_with_output().expect("its output is ours");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(
+        !stderr.contains("did not exit cleanly"),
+        "an interrupted child is not a failed one: {stderr}"
+    );
+}

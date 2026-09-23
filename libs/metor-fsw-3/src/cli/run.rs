@@ -67,6 +67,8 @@ pub enum RunError {
     Latched(String),
     #[error("these targets did not exit cleanly: {0}")]
     Children(String),
+    #[error("interrupted")]
+    Interrupted,
     #[error("--print-ports names one target's links; pick one with --target")]
     PrintPortsNeedsTarget,
 }
@@ -111,16 +113,20 @@ fn run_children(config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
         serde_json::to_vec(config).map_err(ConfigError::Decode)?,
     )?;
     watch_sigint();
-    let spawned: std::io::Result<Vec<_>> = config
-        .namespaces()
-        .into_iter()
-        .map(|namespace| super::children::spawn(&path, namespace, args))
-        .collect();
-    let result = spawned.map_err(RunError::Spawn).and_then(|children| {
-        super::children::wait_all(children).map_err(|failed| RunError::Children(failed.join(", ")))
-    });
+    let result = supervise(&path, config, args);
     let _ = std::fs::remove_file(&path);
     result
+}
+
+/// Runs every target of `config` from `envelope` until all have exited, or
+/// until SIGINT ends them.
+fn supervise(envelope: &Path, config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
+    let children = super::children::spawn_all(envelope, &config.namespaces(), args)?;
+    super::children::wait_all(children).map_err(|failed| RunError::Children(failed.join(", ")))?;
+    if interrupted() {
+        return Err(RunError::Interrupted);
+    }
+    Ok(())
 }
 
 /// Writes every bound link address to stdout, for a caller that asked a link to
@@ -297,6 +303,11 @@ extern "C" fn interrupt(_signal: core::ffi::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
 
+/// Whether SIGINT has arrived.
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed)
+}
+
 /// Makes SIGINT flip [`INTERRUPTED`] instead of killing the process.
 fn watch_sigint() {
     // SAFETY: the handler only stores to an `AtomicBool`, which is
@@ -310,7 +321,7 @@ fn stop(cycles: Option<u64>) -> impl Future<Output = ()> {
     let mut polls = 0;
     poll_fn(move |_| {
         polls += 1;
-        let done = INTERRUPTED.load(Ordering::Relaxed) || cycles.is_some_and(|n| polls >= n);
+        let done = interrupted() || cycles.is_some_and(|n| polls >= n);
         if done { Poll::Ready(()) } else { Poll::Pending }
     })
 }
