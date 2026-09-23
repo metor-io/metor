@@ -8,3 +8,18 @@ description = "The adcs-fsw3 example: one pack, a simulation target, and a three
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+adcs-contracts = { package = "adcs-contracts-3", path = "contracts" }
+adcs-systems = { package = "adcs-systems-3", path = "systems/adcs", default-features = false }
+metor-fsw-3 = { path = "../../libs/metor-fsw-3" }
+metor-proto = { path = "../../libs/metor-proto", features = ["std"] }
+metor-proto-stellar = { path = "../../libs/metor-proto/stellar" }
+metor-proto-wkt = { path = "../../libs/metor-proto/wkt", features = ["std"] }
+nox = { workspace = true }
+serde_json = "1"
+stellarator = { path = "../../libs/stellarator" }
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
+zerocopy = { version = "0.8.2", features = ["derive"] }

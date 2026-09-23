@@ -113,6 +113,21 @@ dependencies = [
 [[package]]
 name = "adcs-fsw3"
 version = "0.14.2"
+dependencies = [
+ "adcs-contracts-3",
+ "adcs-systems-3",
+ "metor-fsw-3",
+ "metor-proto",
+ "metor-proto-stellar",
+ "metor-proto-wkt",
+ "nox",
+ "serde_json",
+ "stellarator",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "zerocopy",
+]
 
 [[package]]
 name = "adcs-sequences"
