@@ -137,6 +137,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "adcs-systems-3"
+version = "0.14.2"
+dependencies = [
+ "adcs-contracts-3",
+ "metor-adcs",
+ "metor-fsw-3",
+ "nox",
+ "rand 0.9.5",
+ "rand_distr 0.5.1",
+ "schemars 1.2.1",
+ "serde",
+ "tracing",
+ "zerocopy",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

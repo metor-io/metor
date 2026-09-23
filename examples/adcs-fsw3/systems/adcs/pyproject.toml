@@ -1,0 +1,33 @@
+# The adcs pack as a Python distribution: `uv sync` runs the backend, which
+# lays out `.metor/adcs_pack/` (the typed module plus the host-triple library)
+# and exposes it to the venv.
+
+[project]
+name = "adcs-pack"
+version = "0.1.0"
+description = "The plant, nav, ctrl, and mode systems of the adcs-fsw3 example"
+requires-python = ">=3.11"
+
+# While the pack lives in this repo the backend resolves from the checkout
+# (uv >= 0.11 applies `[tool.uv.sources]` to `build-system.requires`); a
+# published pack declares `metor-fsw` here instead and drops the sources entry.
+[build-system]
+requires = ["metor-build"]
+build-backend = "metor_build"
+
+[tool.metor.pack]
+id = "adcs"
+
+[tool.uv.sources]
+metor-build = { path = "../../../../libs/metor-fsw-3/python/metor-build" }
+
+# Rebuild when the pack or the contracts it is built against change. The `../`
+# globs need uv >= 0.11.
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "../../contracts/src/**/*.rs" },
+    { file = "../../contracts/Cargo.toml" },
+]

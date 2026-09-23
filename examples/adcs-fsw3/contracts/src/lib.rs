@@ -430,10 +430,8 @@ pub struct MtqCmd {
     pub dipole_b: V3,
 }
 
-/// The target-mode command a slot sequence emits each transition (sequences-slots.md §4):
-/// the discrete ADCS phase plus the active **pointing law**. Produced by the `mode` slot's
-/// occupant (`adcs-sequences`' `commissioning` / `safe_mode`) and consumed by the controller, which
-/// selects its target attitude from `law`. `_pad` keeps the `#[repr(C)]` layout padding-free
+/// The commanded ADCS phase plus the active **pointing law**: the controller selects
+/// its target attitude from `law`. `_pad` keeps the `#[repr(C)]` layout padding-free
 /// (zerocopy `IntoBytes` requires it).
 #[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[repr(C)]
@@ -449,7 +447,7 @@ pub struct ModeCmd {
 }
 
 impl ModeCmd {
-    /// The target-phase byte values, mirrored by the example test's assertions.
+    /// The target-phase byte values.
     pub const IDLE: u8 = 0;
     pub const SETTLING: u8 = 1;
     pub const POINTING: u8 = 2;
@@ -462,13 +460,12 @@ impl ModeCmd {
     pub const LAW_NADIR: u8 = 0;
     pub const LAW_HIL: u8 = 1;
     /// Magnetorquer-only rate damping (B-cross): the wheels idle while the torquers bleed the
-    /// body rate. Selectable but not yet commanded by any sequence.
+    /// body rate.
     pub const LAW_DETUMBLE: u8 = 2;
 
-    /// A `ModeCmd` for `mode` + `law`, with a zero timestamp (the sequence has no per-cycle
-    /// `now` handle; the field is telemetry ordering only — the slot's `SequenceStatus`
-    /// carries the authoritative run state).
-    const fn at(mode: u8, law: u8) -> Self {
+    /// A `ModeCmd` for `mode` + `law`, with a zero timestamp — [`stamped`](Self::stamped)
+    /// fills in the cycle time.
+    pub const fn new(mode: u8, law: u8) -> Self {
         Self {
             timestamp: Timestamp(0),
             mode,
@@ -479,27 +476,26 @@ impl ModeCmd {
 
     /// Idle — no active pointing (holds nadir).
     pub const fn idle() -> Self {
-        Self::at(Self::IDLE, Self::LAW_NADIR)
+        Self::new(Self::IDLE, Self::LAW_NADIR)
     }
     /// Settling — reaction wheels enabled, slewing toward the velocity-vector target.
     pub const fn settling() -> Self {
-        Self::at(Self::SETTLING, Self::LAW_HIL)
+        Self::new(Self::SETTLING, Self::LAW_HIL)
     }
     /// Pointing — converged, holding the velocity-vector (HIL) target.
     pub const fn pointing() -> Self {
-        Self::at(Self::POINTING, Self::LAW_HIL)
+        Self::new(Self::POINTING, Self::LAW_HIL)
     }
     /// Safe — the safing branch (entered on abort): nadir-pointing.
     pub const fn safe() -> Self {
-        Self::at(Self::SAFE, Self::LAW_NADIR)
+        Self::new(Self::SAFE, Self::LAW_NADIR)
     }
     /// Detumble — magnetorquer-only rate damping (the wheels idle under `LAW_DETUMBLE`).
     pub const fn detumble() -> Self {
-        Self::at(Self::DETUMBLE, Self::LAW_DETUMBLE)
+        Self::new(Self::DETUMBLE, Self::LAW_DETUMBLE)
     }
 
-    /// The same command stamped with the sequence's cycle time (`sequence::now()`,
-    /// review E7) instead of the constructors' zero placeholder.
+    /// The same command stamped with the cycle time.
     pub const fn stamped(mut self, now: Timestamp) -> Self {
         self.timestamp = now;
         self
