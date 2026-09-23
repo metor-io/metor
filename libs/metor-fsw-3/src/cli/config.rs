@@ -118,45 +118,24 @@ mod tests {
         gain: f64,
     }
 
-    struct Plant;
-
     #[system]
-    impl Plant {
-        fn execute(&mut self, motor_cmd: &mut Input<Ping>, imu: &mut Output<Ping>) {
-            let _ = (motor_cmd, imu);
-        }
+    fn plant(motor_cmd: &mut Input<Ping>, imu: &mut Output<Ping>) {
+        let _ = (motor_cmd, imu);
     }
 
-    struct Nav;
-
     #[system]
-    impl Nav {
-        fn execute(&mut self, imu: &mut Input<Ping>, est: &mut Output<Ping>) {
-            let _ = (imu, est);
-        }
+    fn nav(imu: &mut Input<Ping>, est: &mut Output<Ping>) {
+        let _ = (imu, est);
     }
 
-    struct Mode;
-
     #[system]
-    impl Mode {
-        fn execute(&mut self, cmd: &mut Output<Ping>) {
-            let _ = cmd;
-        }
+    fn mode(cmd: &mut Output<Ping>) {
+        let _ = cmd;
     }
 
-    struct Ctrl;
-
     #[system]
-    impl Ctrl {
-        fn execute(
-            &mut self,
-            est: &mut Input<Ping>,
-            mode: &mut Input<Ping>,
-            motor_cmd: &mut Output<Ping>,
-        ) {
-            let _ = (est, mode, motor_cmd);
-        }
+    fn ctrl(est: &mut Input<Ping>, mode: &mut Input<Ping>, motor_cmd: &mut Output<Ping>) {
+        let _ = (est, mode, motor_cmd);
     }
 
     /// The four `adcs.*` types the golden names, plus the links it adds.
@@ -164,13 +143,17 @@ mod tests {
         let mut table = SystemTable::new();
         crate::link::register_builtins(&mut table).expect("valid records");
         table
-            .register("adcs.plant", |_: Altitude| Plant)
+            .register("adcs.plant", plant(), |_: Altitude| ())
             .expect("valid records");
         table
-            .register("adcs.nav", |_: Gain| Nav)
+            .register("adcs.nav", nav(), |_: Gain| ())
             .expect("valid records");
-        table.register("adcs.mode", || Mode).expect("valid records");
-        table.register("adcs.ctrl", || Ctrl).expect("valid records");
+        table
+            .register("adcs.mode", mode(), Default::default)
+            .expect("valid records");
+        table
+            .register("adcs.ctrl", ctrl(), Default::default)
+            .expect("valid records");
         table
     }
 

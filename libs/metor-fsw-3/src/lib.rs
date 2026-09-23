@@ -17,26 +17,22 @@
 //!     pos: [f64; 3],
 //! }
 //!
-//! struct Relay;
-//!
+//! /// Copies every fix until stop.
 //! #[system]
-//! impl Relay {
-//!     /// Copies every fix until stop.
-//!     async fn run(&mut self, gps: &mut Input<Gps, Notifier>, out: &mut Output<Gps>, stop: Stop) {
-//!         while !stop.is_set() {
-//!             let fix = futures_lite::future::or(async { gps.next().await.ok() }, async {
-//!                 stop.wait().await;
-//!                 None
-//!             }).await;
-//!             let Some(fix) = fix else { return };
-//!             let fix = Gps { timestamp: fix.timestamp, pos: fix.pos };
-//!             let _ = out.write(&fix);
-//!         }
+//! async fn relay(gps: &mut Input<Gps, Notifier>, out: &mut Output<Gps>, stop: Stop) {
+//!     while !stop.is_set() {
+//!         let fix = futures_lite::future::or(async { gps.next().await.ok() }, async {
+//!             stop.wait().await;
+//!             None
+//!         }).await;
+//!         let Some(fix) = fix else { return };
+//!         let fix = Gps { timestamp: fix.timestamp, pos: fix.pos };
+//!         let _ = out.write(&fix);
 //!     }
 //! }
 //!
 //! let mut table = SystemTable::new();
-//! table.register_async("relay", || Relay)?;
+//! table.register_async("relay", relay(), Default::default)?;
 //! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
 //!

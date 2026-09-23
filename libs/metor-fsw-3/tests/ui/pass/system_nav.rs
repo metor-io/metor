@@ -22,35 +22,40 @@ struct NavState {
     fixes: u64,
 }
 
+/// One filter cycle.
 #[system]
-impl NavState {
-    /// One filter cycle.
-    fn execute(
-        &mut self,
-        now: Timestamp,
-        gps: &mut Input<Gps>,
-        gps_backup: &mut Input<Gps>,
-        estimate: &mut Output<AttitudeEstimate>,
-    ) {
-        if gps.latest().ok().flatten().is_some() || gps_backup.latest().ok().flatten().is_some() {
-            self.fixes += 1;
-        }
-        let _ = estimate.write(&AttitudeEstimate {
-            timestamp: now,
-            q: [0.0, 0.0, 0.0, 1.0],
-        });
+fn nav(
+    #[state] s: &mut NavState,
+    now: Timestamp,
+    gps: &mut Input<Gps>,
+    gps_backup: &mut Input<Gps>,
+    estimate: &mut Output<AttitudeEstimate>,
+) {
+    if gps.latest().ok().flatten().is_some() || gps_backup.latest().ok().flatten().is_some() {
+        s.fixes += 1;
     }
+    let _ = estimate.write(&AttitudeEstimate {
+        timestamp: now,
+        q: [0.0, 0.0, 0.0, 1.0],
+    });
+}
+
+fn names<P: Ports>(_: &P) -> (&'static str, &'static [&'static str]) {
+    (P::NAME, P::NAMES)
 }
 
 fn main() {
-    assert_eq!(NavState::NAMES, &["now", "gps", "gps_backup", "estimate"]);
-    assert_eq!(NavState::NAME, "nav_state");
+    assert_eq!(
+        names(&nav()),
+        ("nav", &["now", "gps", "gps_backup", "estimate"][..])
+    );
     let mut table = SystemTable::new();
     table
-        .register("nav", NavState::default)
+        .register("nav", nav(), NavState::default)
         .expect("valid records");
-    let mut nav = NavState::default();
-    nav.execute(
+    let mut state = NavState::default();
+    nav()(
+        &mut state,
         Timestamp(0),
         &mut Input::try_new(Vec::new()).unwrap(),
         &mut Input::try_new(Vec::new()).unwrap(),

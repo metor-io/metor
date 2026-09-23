@@ -26,23 +26,19 @@ struct Ping {
 struct Source(u32);
 
 #[system]
-impl Source {
-    fn execute(&mut self, output: &mut Output<Ping>) {
-        self.0 += 1;
-        let _ = output.write(&Ping { n: self.0 });
-    }
+fn source(#[state] s: &mut Source, output: &mut Output<Ping>) {
+    s.0 += 1;
+    let _ = output.write(&Ping { n: s.0 });
 }
 
 /// Records every ping it is wired to.
 struct Sink(Rc<RefCell<Vec<u32>>>);
 
 #[system]
-impl Sink {
-    fn execute(&mut self, input: &mut Input<Ping>) {
-        for ping in input.drain() {
-            let Ok(ping) = ping else { continue };
-            self.0.borrow_mut().push(ping.n);
-        }
+fn sink(#[state] s: &mut Sink, input: &mut Input<Ping>) {
+    for ping in input.drain() {
+        let Ok(ping) = ping else { continue };
+        s.0.borrow_mut().push(ping.n);
     }
 }
 
@@ -118,11 +114,11 @@ fn pipeline(ty: &str, params: serde_json::Value) -> (CoordinatorConfig, Rc<RefCe
 fn table(pack: &Pack, seen: &Rc<RefCell<Vec<u32>>>) -> SystemTable {
     let mut table = SystemTable::new();
     table
-        .register("source", Source::default)
+        .register("source", source(), Source::default)
         .expect("valid records");
-    let sink = seen.clone();
+    let seen = seen.clone();
     table
-        .register("sink", move || Sink(sink.clone()))
+        .register("sink", sink(), move || Sink(seen.clone()))
         .expect("valid records");
     table.register_pack("echo", pack).expect("valid records");
     table

@@ -448,13 +448,9 @@ mod tests {
         extra: f64,
     }
 
-    struct WideSource;
-
     #[system]
-    impl WideSource {
-        fn execute(&mut self, imu: &mut Output<WideImu>) {
-            let _ = imu;
-        }
+    fn wide_source(imu: &mut Output<WideImu>) {
+        let _ = imu;
     }
 
     fn tap(inputs: Vec<InputConfig>) -> SystemConfig {
@@ -959,7 +955,7 @@ mod tests {
         let recorder = Recorder::default();
         let mut table = table(&recorder);
         assert_eq!(
-            table.register("wide", || WideSource),
+            table.register("wide", wide_source(), Default::default),
             Err(BuildError::RecordConflict {
                 record: "imu".into(),
             })
@@ -975,7 +971,7 @@ mod tests {
     fn test_reject_static_record_conflicts() {
         let mut table = table(&Recorder::default());
         assert_eq!(
-            table.register("wide", || WideSource),
+            table.register("wide", wide_source(), Default::default),
             Err(BuildError::RecordConflict {
                 record: "imu".into(),
             })

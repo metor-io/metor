@@ -57,57 +57,49 @@ impl Publish {
     }
 }
 
+/// Announces its ports to each new connection, then batches their records.
 #[system]
-impl Publish {
-    /// Announces its ports to each new connection, then batches their records.
-    async fn run(
-        &mut self,
-        inputs: &mut DynInputs<Notifier>,
-        link_status: &mut Output<LinkStatus>,
-        log: &mut Log,
-        stop: Stop,
-    ) {
-        let defs: Vec<PortDef> = inputs.iter_mut().map(|(def, _)| def.clone()).collect();
-        let (blob, ids) = wire::announce(&defs, self.namespace.as_deref(), &self.link);
-        report_collisions(log, &defs, &ids);
-        // PANIC Safety: `run` is called once, and the endpoint is the bind's.
-        let endpoint = self.endpoint.take().expect("one run per instance");
-        if let Some(addr) = endpoint.local_addr() {
-            log.info(format!("listening on {addr}"));
-        }
-        let inbox = Rc::new(Inbox::blackhole());
-        let conns = Rc::new(Connections::new(
-            endpoint.slots(),
-            self.conn_cap,
-            blob,
-            inbox,
-        ));
-        let _source =
-            stellarator::spawn(source(endpoint, conns.clone(), stop.clone())).drop_guard();
-        let mut batch = Vec::with_capacity(self.conn_cap);
-        let mut reported = LinkStatus::new(Timestamp(0), Default::default(), 0);
-        loop {
-            let input_ready = async {
-                inputs.any_ready().await;
-                Event::Ready
-            };
-            let event = future::or(conn::next(&conns, &stop), input_ready).await;
-            match event {
-                Event::Ready => {
-                    batch.clear();
-                    fill(&mut batch, inputs, &ids, self.conn_cap);
-                    if !batch.is_empty() {
-                        conns.enqueue(&batch);
-                    }
+pub async fn publish(
+    #[state] s: &mut Publish,
+    inputs: &mut DynInputs<Notifier>,
+    link_status: &mut Output<LinkStatus>,
+    log: &mut Log,
+    stop: Stop,
+) {
+    let defs: Vec<PortDef> = inputs.iter_mut().map(|(def, _)| def.clone()).collect();
+    let (blob, ids) = wire::announce(&defs, s.namespace.as_deref(), &s.link);
+    report_collisions(log, &defs, &ids);
+    // PANIC Safety: a system runs once, and the endpoint is the bind's.
+    let endpoint = s.endpoint.take().expect("one run per instance");
+    if let Some(addr) = endpoint.local_addr() {
+        log.info(format!("listening on {addr}"));
+    }
+    let inbox = Rc::new(Inbox::blackhole());
+    let conns = Rc::new(Connections::new(endpoint.slots(), s.conn_cap, blob, inbox));
+    let _source = stellarator::spawn(source(endpoint, conns.clone(), stop.clone())).drop_guard();
+    let mut batch = Vec::with_capacity(s.conn_cap);
+    let mut reported = LinkStatus::new(Timestamp(0), Default::default(), 0);
+    loop {
+        let input_ready = async {
+            inputs.any_ready().await;
+            Event::Ready
+        };
+        let event = future::or(conn::next(&conns, &stop), input_ready).await;
+        match event {
+            Event::Ready => {
+                batch.clear();
+                fill(&mut batch, inputs, &ids, s.conn_cap);
+                if !batch.is_empty() {
+                    conns.enqueue(&batch);
                 }
-                Event::Changed => {}
-                Event::Stop => return,
             }
-            let status = LinkStatus::new(Timestamp::now(), conns.stats(), 0);
-            if status.changed(&reported) {
-                let _ = link_status.write(&status);
-                reported = status;
-            }
+            Event::Changed => {}
+            Event::Stop => return,
+        }
+        let status = LinkStatus::new(Timestamp::now(), conns.stats(), 0);
+        if status.changed(&reported) {
+            let _ = link_status.write(&status);
+            reported = status;
         }
     }
 }

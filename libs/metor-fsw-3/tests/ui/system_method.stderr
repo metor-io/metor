@@ -1,0 +1,5 @@
+error: `#[system]` goes on a free fn
+ --> tests/ui/system_method.rs:7:16
+  |
+7 |     fn execute(&mut self, now: Timestamp) {
+  |                ^^^^^^^^^

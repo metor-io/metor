@@ -1,27 +1,18 @@
 //! `#[system]` on a free fn: rewrites `fn nav(..)` into `fn nav() -> impl
 //! SystemFn`, or `impl AsyncSystemFn` for an `async fn` ending in `stop: Stop`.
-//! On an impl block, emits `SystemFn` from an `execute` method, or
-//! `AsyncSystemFn` from an `async run(.., stop: Stop)` method.
 //!
 //! The attribute reads parameter identifiers and doc comments. It never
 //! classifies a type; each parameter type's `Param` impl does that.
 
-use convert_case::{Case, Casing};
 use proc_macro::TokenStream;
-use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro2::TokenStream as TokenStream2;
 use quote::{ToTokens, format_ident, quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{
-    Attribute, Expr, ExprLit, FnArg, Generics, Ident, ImplItem, ImplItemFn, Item, ItemFn, ItemImpl,
-    Lifetime, Lit, Meta, Pat, ReturnType, Signature, Type, TypeImplTrait,
+    Attribute, Expr, ExprLit, FnArg, Generics, Ident, Item, ItemFn, Lifetime, Lit, Meta, Pat,
+    ReturnType, Signature, Type, TypeImplTrait, TypeParamBound,
 };
-
-/// One `execute` parameter after the receiver.
-struct Param {
-    ident: Ident,
-    key: Type,
-}
 
 /// Expands `#[system]`.
 pub fn system(item: TokenStream) -> TokenStream {
@@ -31,19 +22,25 @@ pub fn system(item: TokenStream) -> TokenStream {
 fn expand(item: TokenStream2, fsw: &TokenStream2) -> TokenStream2 {
     match syn::parse2::<Item>(item) {
         Ok(Item::Fn(f)) => expand_fn(f, fsw),
-        Ok(Item::Impl(block)) => match expand_impl(&block, fsw) {
-            Ok(system_fn) => quote! { #block #system_fn },
-            Err(e) => {
-                let err = e.to_compile_error();
-                quote! { #block #err }
-            }
-        },
+        Ok(Item::Impl(block)) => {
+            let err = syn::Error::new_spanned(
+                &block.self_ty,
+                "`#[system]` goes on a free fn; see docs/plans/11-fn-systems.md",
+            );
+            with_error(block, err)
+        }
         Ok(other) => {
-            let err = syn::Error::new(other.span(), "`#[system]` goes on a fn").to_compile_error();
-            quote! { #other #err }
+            let err = syn::Error::new_spanned(&other, "`#[system]` goes on a fn");
+            with_error(other, err)
         }
         Err(e) => e.to_compile_error(),
     }
+}
+
+/// Emits `item` unchanged plus `err`, so the IDE keeps its types.
+fn with_error(item: impl ToTokens, err: syn::Error) -> TokenStream2 {
+    let err = err.to_compile_error();
+    quote! { #item #err }
 }
 
 /// One parameter of a `#[system]` fn.
@@ -62,7 +59,7 @@ struct Sig {
 }
 
 impl Sig {
-    fn parse(sig: &Signature, states: &[(usize, Span)]) -> syn::Result<Self> {
+    fn parse(sig: &Signature, states: &[(usize, Attribute)]) -> syn::Result<Self> {
         check_generics(&sig.generics)?;
         check_output(&sig.output)?;
         let args = sig
@@ -73,8 +70,8 @@ impl Sig {
         let state = state(&args, states)?;
         let stop = sig.asyncness.is_some();
         if stop && !ends_in_stop(&args, state) {
-            return Err(syn::Error::new(
-                sig.span(),
+            return Err(syn::Error::new_spanned(
+                sig,
                 "an async `#[system]` fn takes `stop: Stop` as its last parameter",
             ));
         }
@@ -100,15 +97,15 @@ impl Sig {
     }
 }
 
-/// Removes every `#[state]` attribute, returning each one's parameter index and span.
-fn take_states(sig: &mut Signature) -> Vec<(usize, Span)> {
+/// Removes every `#[state]` attribute, returning each with its parameter index.
+fn take_states(sig: &mut Signature) -> Vec<(usize, Attribute)> {
     let mut states = Vec::new();
     for (i, input) in sig.inputs.iter_mut().enumerate() {
         let FnArg::Typed(typed) = input else { continue };
         typed.attrs.retain(|attr| {
             let is_state = attr.path().is_ident("state");
             if is_state {
-                states.push((i, attr.span()));
+                states.push((i, attr.clone()));
             }
             !is_state
         });
@@ -118,20 +115,20 @@ fn take_states(sig: &mut Signature) -> Vec<(usize, Span)> {
 
 fn arg(input: &FnArg) -> syn::Result<Arg> {
     let FnArg::Typed(typed) = input else {
-        return Err(syn::Error::new(
-            input.span(),
+        return Err(syn::Error::new_spanned(
+            input,
             "`#[system]` goes on a free fn",
         ));
     };
     let Pat::Ident(pat) = &*typed.pat else {
-        return Err(syn::Error::new(
-            typed.pat.span(),
+        return Err(syn::Error::new_spanned(
+            &typed.pat,
             "#[system] parameters need a plain name",
         ));
     };
     if pat.subpat.is_some() || pat.by_ref.is_some() {
-        return Err(syn::Error::new(
-            pat.span(),
+        return Err(syn::Error::new_spanned(
+            pat,
             "#[system] parameters need a plain name",
         ));
     }
@@ -143,15 +140,15 @@ fn arg(input: &FnArg) -> syn::Result<Arg> {
 }
 
 /// Finds the one `#[state]` parameter and checks it is `&mut S`.
-fn state(args: &[Arg], states: &[(usize, Span)]) -> syn::Result<Option<usize>> {
+fn state(args: &[Arg], states: &[(usize, Attribute)]) -> syn::Result<Option<usize>> {
     match states {
         [] => Ok(None),
         [(i, _)] => match &args[*i].ty {
             Type::Reference(r) if r.mutability.is_some() => Ok(Some(*i)),
-            other => Err(syn::Error::new(other.span(), "`#[state]` takes `&mut S`")),
+            other => Err(syn::Error::new_spanned(other, "`#[state]` takes `&mut S`")),
         },
-        [_, (_, second), ..] => Err(syn::Error::new(
-            *second,
+        [_, (_, second), ..] => Err(syn::Error::new_spanned(
+            second,
             "a `#[system]` fn takes one `#[state]` parameter at most",
         )),
     }
@@ -168,7 +165,7 @@ fn ends_in_stop(args: &[Arg], state: Option<usize>) -> bool {
 
 fn check_generics(generics: &Generics) -> syn::Result<()> {
     match generics.lifetimes().next() {
-        Some(lt) => Err(syn::Error::new(lt.span(), NAMED_LIFETIME)),
+        Some(lt) => Err(syn::Error::new_spanned(lt, NAMED_LIFETIME)),
         None => Ok(()),
     }
 }
@@ -176,7 +173,7 @@ fn check_generics(generics: &Generics) -> syn::Result<()> {
 fn check_output(output: &ReturnType) -> syn::Result<()> {
     match output {
         ReturnType::Type(_, ty) if !matches!(&**ty, Type::Tuple(t) if t.elems.is_empty()) => {
-            Err(syn::Error::new(ty.span(), "a `#[system]` fn returns `()`"))
+            Err(syn::Error::new_spanned(ty, "a `#[system]` fn returns `()`"))
         }
         _ => Ok(()),
     }
@@ -197,14 +194,14 @@ struct TypeCheck(Option<syn::Error>);
 impl<'ast> Visit<'ast> for TypeCheck {
     fn visit_lifetime(&mut self, lt: &'ast Lifetime) {
         if lt.ident != "_" && self.0.is_none() {
-            self.0 = Some(syn::Error::new(lt.span(), NAMED_LIFETIME));
+            self.0 = Some(syn::Error::new_spanned(lt, NAMED_LIFETIME));
         }
     }
 
     fn visit_type_impl_trait(&mut self, ty: &'ast TypeImplTrait) {
         if self.0.is_none() {
-            self.0 = Some(syn::Error::new(
-                ty.span(),
+            self.0 = Some(syn::Error::new_spanned(
+                ty,
                 "`#[system]` parameters take no `impl Trait`",
             ));
         }
@@ -216,10 +213,7 @@ fn expand_fn(mut f: ItemFn, fsw: &TokenStream2) -> TokenStream2 {
     let states = take_states(&mut f.sig);
     match Sig::parse(&f.sig, &states) {
         Ok(sig) => emit(f, &sig, fsw),
-        Err(e) => {
-            let err = e.to_compile_error();
-            quote! { #f #err }
-        }
+        Err(e) => with_error(f, e),
     }
 }
 
@@ -233,10 +227,11 @@ fn is_outer(attr: &Attribute) -> bool {
 /// Adds `T: 'static` for every type parameter, which `Ports: 'static` needs.
 fn static_generics(generics: &Generics) -> Generics {
     let mut generics = generics.clone();
-    let params: Vec<Ident> = generics.type_params().map(|p| p.ident.clone()).collect();
-    let clause = generics.make_where_clause();
-    for param in params {
-        clause.predicates.push(syn::parse_quote!(#param: 'static));
+    let bound: TypeParamBound = syn::parse_quote!('static);
+    for param in generics.type_params_mut() {
+        if !param.bounds.iter().any(|b| *b == bound) {
+            param.bounds.push(bound.clone());
+        }
     }
     generics
 }
@@ -250,15 +245,16 @@ fn emit(f: ItemFn, sig: &Sig, fsw: &TokenStream2) -> TokenStream2 {
     let type_params = f.sig.generics.type_params().map(|p| &p.ident);
     let state_ty = sig.state_ty();
     let fn_ptr = fn_ptr(sig);
-    let (bound, call) = match sig.stop {
-        true => (
+    let (bound, call) = if sig.stop {
+        (
             quote!(#fsw::AsyncSystemFn<State = #state_ty>),
             async_call(sig, &generics, fsw),
-        ),
-        false => (
+        )
+    } else {
+        (
             quote!(#fsw::SystemFn<State = #state_ty> + ::core::ops::Deref<Target = #fn_ptr>),
             sync_call(sig, &generics, fsw),
-        ),
+        )
     };
     let ports = ports_impl(sig, &name.to_string(), &doc, &generics, fsw);
     let body = ItemFn {
@@ -333,8 +329,8 @@ fn call_parts(sig: &Sig, generics: &Generics, fsw: &TokenStream2) -> CallParts {
         quote_spanned! { arg.ty.span() => #fsw::fn_system::assert_param::<#key>(); }
     });
     let args = sig.args.iter().map(|arg| &arg.ident);
-    let turbofish = generics.split_for_impl().1;
-    let turbofish = turbofish.as_turbofish();
+    let (_, ty_generics, _) = generics.split_for_impl();
+    let turbofish = ty_generics.as_turbofish();
     CallParts {
         state,
         items: quote!((#(#idents,)*)),
@@ -398,93 +394,6 @@ fn async_call(sig: &Sig, generics: &Generics, fsw: &TokenStream2) -> TokenStream
     }
 }
 
-fn expand_impl(block: &ItemImpl, fsw: &TokenStream2) -> syn::Result<TokenStream2> {
-    let name = type_name(&block.self_ty)?;
-    let method = method(block)?;
-    let is_async = method.sig.asyncness.is_some();
-    let mut params = params(method)?;
-    let stop = if is_async {
-        Some(take_stop(method, &mut params)?)
-    } else {
-        None
-    };
-    let doc = doc(&method.attrs);
-    let idents = params.iter().map(|p| &p.ident).collect::<Vec<_>>();
-    let keys = params.iter().map(|p| &p.key);
-    let names = params.iter().map(|p| p.ident.to_string());
-    let self_ty = &block.self_ty;
-    let (impl_generics, _, where_clause) = block.generics.split_for_impl();
-    // Spanned at each parameter type, so a type that is no `Param` errors there.
-    let asserts = params.iter().map(|p| {
-        let key = &p.key;
-        quote_spanned! { key.span() => #fsw::fn_system::assert_param::<#key>(); }
-    });
-    let call = match stop {
-        Some(stop) => quote! {
-            impl #impl_generics #fsw::AsyncSystemFn for #self_ty #where_clause {
-                async fn call(
-                    &mut self,
-                    (#(#idents,)*): <Self::Params as #fsw::Param>::Item<'_, #fsw::ring::Notifier>,
-                    #stop: #fsw::Stop,
-                ) {
-                    #(#asserts)*
-                    self.run(#(#idents,)* #stop).await
-                }
-            }
-        },
-        None => quote! {
-            impl #impl_generics #fsw::SystemFn for #self_ty #where_clause {
-                fn call(
-                    &mut self,
-                    (#(#idents,)*): <Self::Params as #fsw::Param>::Item<'_, #fsw::ring::NoWake>,
-                ) {
-                    #(#asserts)*
-                    self.execute(#(#idents),*)
-                }
-            }
-        },
-    };
-    Ok(quote! {
-        impl #impl_generics #fsw::Ports for #self_ty #where_clause {
-            type Params = (#(#keys,)*);
-            const NAME: &'static str = #name;
-            const NAMES: &'static [&'static str] = &[#(#names),*];
-            const DOC: &'static str = #doc;
-        }
-        #call
-    })
-}
-
-/// Removes the trailing `stop: Stop` parameter, which is no port.
-fn take_stop(method: &ImplItemFn, params: &mut Vec<Param>) -> syn::Result<Ident> {
-    let is_stop = params.last().is_some_and(|p| {
-        matches!(&p.key, Type::Path(path) if path.path.segments.last().is_some_and(|s| s.ident == "Stop"))
-    });
-    if !is_stop {
-        return Err(syn::Error::new(
-            method.sig.span(),
-            "`run` takes `stop: Stop` as its last parameter",
-        ));
-    }
-    // PANIC Safety: the check above found the parameter.
-    Ok(params.pop().expect("a last parameter").ident)
-}
-
-/// Returns the snake-cased last path segment of the impl's type.
-fn type_name(ty: &Type) -> syn::Result<String> {
-    match ty {
-        Type::Path(path) if path.path.segments.last().is_some() => {
-            // PANIC Safety: the guard checked the segment exists.
-            let ident = &path.path.segments.last().expect("non-empty path").ident;
-            Ok(ident.to_string().to_case(Case::Snake))
-        }
-        other => Err(syn::Error::new(
-            other.span(),
-            "#[system] needs an impl block for a named type",
-        )),
-    }
-}
-
 /// Joins the doc comment lines, each without its leading space.
 fn doc(attrs: &[Attribute]) -> String {
     attrs
@@ -503,74 +412,6 @@ fn doc(attrs: &[Attribute]) -> String {
         .map(|line| line.strip_prefix(' ').unwrap_or(&line).to_string())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Finds the one `execute` or `async run` method and checks it takes `&mut self`.
-fn method(block: &ItemImpl) -> syn::Result<&ImplItemFn> {
-    let named = |name: &str| {
-        block.items.iter().find_map(move |item| match item {
-            ImplItem::Fn(f) if f.sig.ident == name => Some(f),
-            _ => None,
-        })
-    };
-    let method = match (named("execute"), named("run")) {
-        (Some(_), Some(run)) => {
-            return Err(syn::Error::new(
-                run.sig.span(),
-                "#[system] takes either `execute` or `run`, not both",
-            ));
-        }
-        (Some(execute), None) => execute,
-        (None, Some(run)) if run.sig.asyncness.is_some() => run,
-        (None, Some(run)) => {
-            return Err(syn::Error::new(run.sig.span(), "`run` must be `async`"));
-        }
-        (None, None) => {
-            return Err(syn::Error::new(
-                block.self_ty.span(),
-                "#[system] needs an `execute` or `run` method in this impl block",
-            ));
-        }
-    };
-    let what = &method.sig.ident;
-    match method.sig.inputs.first() {
-        Some(FnArg::Receiver(recv)) if recv.reference.is_some() && recv.mutability.is_some() => {
-            Ok(method)
-        }
-        Some(arg) => Err(syn::Error::new(
-            arg.span(),
-            format!("`{what}` takes `&mut self`"),
-        )),
-        None => Err(syn::Error::new(
-            method.sig.span(),
-            format!("`{what}` takes `&mut self`"),
-        )),
-    }
-}
-
-/// Collects each parameter's name and its `Param` key, the type without its outer `&mut`.
-fn params(method: &ImplItemFn) -> syn::Result<Vec<Param>> {
-    method
-        .sig
-        .inputs
-        .iter()
-        .skip(1)
-        .map(|arg| {
-            let FnArg::Typed(typed) = arg else {
-                return Err(syn::Error::new(arg.span(), "one receiver only"));
-            };
-            let Pat::Ident(pat) = &*typed.pat else {
-                return Err(syn::Error::new(
-                    typed.pat.span(),
-                    "#[system] parameters need a plain name",
-                ));
-            };
-            Ok(Param {
-                ident: pat.ident.clone(),
-                key: key_type(&typed.ty),
-            })
-        })
-        .collect()
 }
 
 /// Strips one outer `&mut`, so `&mut Input<T>` and `Input<T>` share a key.

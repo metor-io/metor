@@ -239,17 +239,15 @@ struct Imu {
 struct Source(i64, Arc<AtomicBool>);
 
 #[system]
-impl Source {
-    fn execute(&mut self, imu: &mut Output<Imu>) {
-        if !self.1.load(Ordering::Acquire) {
-            return;
-        }
-        self.0 += 1;
-        let _ = imu.write(&Imu {
-            timestamp: Timestamp(self.0),
-            sample: self.0 as f64,
-        });
+fn source(#[state] s: &mut Source, imu: &mut Output<Imu>) {
+    if !s.1.load(Ordering::Acquire) {
+        return;
     }
+    s.0 += 1;
+    let _ = imu.write(&Imu {
+        timestamp: Timestamp(s.0),
+        sample: s.0 as f64,
+    });
 }
 
 /// An in-process target on its own thread, stopped and joined when dropped;
@@ -291,7 +289,7 @@ fn impostor(port: u16) -> Impostor {
     let thread = std::thread::spawn(move || {
         let mut table = SystemTable::new();
         table
-            .register("source", move || Source(0, open.clone()))
+            .register("source", source(), move || Source(0, open.clone()))
             .expect("valid records");
         register_builtins(&mut table).expect("valid records");
         let config = CoordinatorConfig {

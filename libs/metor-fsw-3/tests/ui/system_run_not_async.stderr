@@ -1,5 +1,0 @@
-error: `run` must be `async`
- --> tests/ui/system_run_not_async.rs:7:5
-  |
-7 |     fn run(&mut self, stop: Stop) {
-  |     ^^

@@ -10,28 +10,27 @@ struct Gps {
     pos: [f64; 3],
 }
 
-struct Relay;
-
+/// Copies every fix until stop.
 #[system]
-impl Relay {
-    /// Copies every fix until stop.
-    async fn run(&mut self, gps: &mut Input<Gps, Notifier>, out: &mut Output<Gps>, stop: Stop) {
-        while !stop.is_set() {
-            let Ok(fix) = gps.next().await else { return };
-            let fix = Gps {
-                timestamp: fix.timestamp,
-                pos: fix.pos,
-            };
-            let _ = out.write(&fix);
-        }
+async fn relay(gps: &mut Input<Gps, Notifier>, out: &mut Output<Gps>, stop: Stop) {
+    while !stop.is_set() {
+        let Ok(fix) = gps.next().await else { return };
+        let fix = Gps {
+            timestamp: fix.timestamp,
+            pos: fix.pos,
+        };
+        let _ = out.write(&fix);
     }
 }
 
+fn names<P: Ports>(_: &P) -> (&'static str, &'static [&'static str]) {
+    (P::NAME, P::NAMES)
+}
+
 fn main() {
-    assert_eq!(Relay::NAMES, &["gps", "out"]);
-    assert_eq!(Relay::NAME, "relay");
+    assert_eq!(names(&relay()), ("relay", &["gps", "out"][..]));
     let mut table = SystemTable::new();
     table
-        .register_async("relay", || Relay)
+        .register_async("relay", relay(), Default::default)
         .expect("valid records");
 }
