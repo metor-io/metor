@@ -211,5 +211,7 @@ pub(crate) async fn wait_for_component(db: &DB, component_id: ComponentId) -> Co
 /// that lands while the caller looks then still wakes it, where a bare
 /// `vtable_gen.wait()` would sleep through it.
 pub(crate) async fn vtable_changed(db: &DB, seen: u64) {
-    db.vtable_gen.wait_for(|generation| generation != seen).await;
+    db.vtable_gen
+        .wait_for(|generation| generation != seen)
+        .await;
 }

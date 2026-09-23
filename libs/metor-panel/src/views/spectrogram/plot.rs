@@ -679,9 +679,11 @@ impl SpectrogramPlot {
     /// Rebuild the grid for the visible window and hand it to the GPU.
     fn submit_frame(&mut self, bounds: Bounds<Pixels>, scale_factor: f32, cx: &mut Context<Self>) {
         let Some(view) = self.effective_view(cx) else {
+            self.gpu_state.clear_frame();
             return;
         };
         let Some((trace, tracking)) = self.active(cx) else {
+            self.gpu_state.clear_frame();
             return;
         };
         let cfg = trace.read(cx);
@@ -689,6 +691,7 @@ impl SpectrogramPlot {
         let lod = tracking.selected_lod().cloned();
         let over_budget = tracking.over_budget;
         let Some(component) = tracking.component.clone() else {
+            self.gpu_state.clear_frame();
             return;
         };
         // Over budget with no published level yet: bucketing the raw window
@@ -707,6 +710,7 @@ impl SpectrogramPlot {
             None => grid::build_grid(&component, len, range, cols, scale, &mut self.grid),
         };
         if !built {
+            self.gpu_state.clear_frame();
             return;
         }
 

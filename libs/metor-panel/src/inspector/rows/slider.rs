@@ -26,8 +26,8 @@ impl Render for SliderDrag {
 
 /// Inspector row for a bounded numeric field, rendered as a draggable slider.
 ///
-/// Values are rounded to two decimal places on each drag tick to keep
-/// callbacks debounced and the displayed value stable.
+/// `on_change` runs on every drag tick, with the value rounded to two decimal
+/// places so the readout stays stable.
 pub struct SliderRow {
     pub label: SharedString,
     pub read_value: Arc<dyn Fn(&App) -> f64>,
@@ -67,6 +67,7 @@ impl InspectorRow for SliderRow {
         let handle_color = theme.text_primary;
 
         let on_change_drag = self.on_change.clone();
+        let owner = self.on_change.clone();
 
         let slider = div()
             .id(("slider", row_ix))
@@ -91,6 +92,11 @@ impl InspectorRow for SliderRow {
                     )
                     .on_drag_move(move |event: &DragMoveEvent<SliderDrag>, window, cx| {
                         let drag = event.drag(cx);
+                        // Every visible slider hears every slider drag, and
+                        // each measures against its own track.
+                        if !Arc::ptr_eq(&drag.on_change, &owner) {
+                            return;
+                        }
                         let bounds = event.bounds;
                         let rel_x = f32::from(event.event.position.x - bounds.origin.x);
                         let width = f32::from(bounds.size.width);

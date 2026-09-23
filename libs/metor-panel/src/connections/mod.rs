@@ -613,6 +613,9 @@ impl ConnectionsStore {
         value: OptionValue,
         cx: &mut Context<Self>,
     ) {
+        if self.state.options_for(target).get(key) == Some(&value) {
+            return;
+        }
         self.state.set_option(&target.id, key, value);
         if let Err(err) = persist::save_index(&self.state.index()) {
             tracing::error!(%err, "save connections index failed");

@@ -814,6 +814,7 @@ impl PlotRenderState {
         let height = ((f32::from(bounds.size.height) * scale).round() as u32).max(1);
         if traces.is_empty() && field.is_none() {
             self.degraded = false;
+            self.clear_frame();
             return None;
         }
 
@@ -845,6 +846,7 @@ impl PlotRenderState {
             };
             self.heatmap = heatmap;
             if !drew {
+                self.clear_frame();
                 return None;
             }
             let target = self.target.as_ref()?;

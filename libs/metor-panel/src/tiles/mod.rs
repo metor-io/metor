@@ -470,11 +470,14 @@ fn render_resize_handle(
         .on_drag_move({
             let tg = tg.clone();
             move |event: &DragMoveEvent<ResizeDrag>, _window, cx| {
+                // Every handle hears every resize drag; only the grabbed one
+                // answers.
                 let drag = event.drag(cx);
-                let path = drag.path.clone();
-                let handle_ix = drag.handle_ix;
+                if drag.path != path || drag.handle_ix != handle_ix {
+                    return;
+                }
                 let position = event.event.position;
-
+                let path = path.clone();
                 tg.update(cx, |this, cx| {
                     this.handle_resize(path, handle_ix, position, cx);
                 });
