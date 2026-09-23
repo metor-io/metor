@@ -222,7 +222,11 @@ class Subscribe(Link):
             if copy.target is not source.target:
                 continue
             same_port = copy.source == source.name
-            same_msg = source.kind == "msg" and copy.record is source.record
+            same_msg = (
+                source.kind == "msg"
+                and source.record is not None
+                and copy.record._name == source.record._name
+            )
             if same_port or same_msg:
                 return OutPort(name, copy.port, copy.record, target)
         raise ConfigError(f"`{name}` does not copy `{source.name}`")

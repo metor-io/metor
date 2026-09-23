@@ -104,6 +104,34 @@ class DeploymentTest(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "does not copy `plant.imu`"):
             mirror.port(other.imu)
 
+    def test_builtin_log_finds_the_pack_copy(self) -> None:
+        a = Target(cycle_rate=100.0, namespace="a")
+        plant = a.add("plant", Plant())
+        cmds = a.add("cmds", Subscribe(listen="0.0.0.0:2241"))
+        a_pub = a.add("pub", Publish([plant, cmds], listen="0.0.0.0:2240"))
+        b = Target(cycle_rate=100.0, namespace="b")
+        mirror = b.add("mirror", Subscribe(peer=a_pub))
+        self.assertIsNot(cmds.log.record, plant.log.record)
+        self.assertEqual(mirror.port(cmds.log).ref.port, "plant.log")
+
+    def test_foreign_source_raises(self) -> None:
+        a = Target(cycle_rate=100.0, namespace="a")
+        plant = a.add("plant", Plant())
+        b = Target(cycle_rate=100.0, namespace="b")
+        b.add("nav", Nav(imu=plant.imu))
+        with self.assertRaisesRegex(ConfigError, "`nav.imu` reads `plant.imu` on another"):
+            Deployment(targets=[a, b]).to_config()
+
+    def test_foreign_loop_producer_raises(self) -> None:
+        a = Target(cycle_rate=100.0, namespace="a")
+        plant = a.add("plant", Plant())
+        b = Target(cycle_rate=100.0, namespace="b")
+        loop = b.loop(Imu)
+        b.add("nav", Nav(imu=loop))
+        loop.connect(plant.imu)
+        with self.assertRaisesRegex(ConfigError, "on another target"):
+            Deployment(targets=[a, b]).to_config()
+
     def test_port_on_plain_system_raises(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
         plant = a.add("plant", Plant())

@@ -116,7 +116,10 @@ class Target:
         if thread is not None:
             entry["thread"] = thread
         entry["inputs"] = [
-            {"port": port, "from": [_resolve(name, port, source) for source in sources]}
+            {
+                "port": port,
+                "from": [_resolve(self, name, port, source) for source in sources],
+            }
             for port, sources in system._inputs_for(self, index).items()
         ]
         outputs = system._outputs_for(self, index)
@@ -130,12 +133,22 @@ class Target:
         return wall_clock(self.cycle_rate)
 
 
-def _resolve(name: str, port: str, source: Source[Any]) -> dict[str, str]:
+def _resolve(target: Target, name: str, port: str, source: Source[Any]) -> dict[str, str]:
     if isinstance(source, Loop):
         if source.producer is None:
             raise ConfigError(
                 f"the loop into `{name}.{port}` has no producer; call `connect` on it"
             )
-        return source.producer.ref.to_json()
+        return _local(target, name, port, source.producer)
+    return _local(target, name, port, source)
+
+
+def _local(target: Target, name: str, port: str, source: OutPort[Any]) -> dict[str, str]:
+    """``source``'s reference, which only names a port of ``target`` itself."""
+    if source.target is not None and source.target is not target:
+        raise ConfigError(
+            f"`{name}.{port}` reads `{source.name}` on another target; subscribe to "
+            "that link and pass the subscriber's `port()` instead"
+        )
     return source.ref.to_json()
 
