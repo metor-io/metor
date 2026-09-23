@@ -147,19 +147,20 @@ other, which is the shape the wire has anyway.
 A `Subscribe` with a `peer` takes `items` (frame ports and system
 handles, as `Publish` does) and `records` (message classes, as today).
 No `items` and no `records` means everything the peer publishes, which
-is what a gateway wants. Each frame item is one output named
-`{system}.{port}`; each message record is one output named by the
-record, as `records=` already names it. A handle in `items` contributes
-its frame ports to the first and its message records to the second, so
-`items=[imu]` on a peer with `log` on every system yields one `log`
-port, not one per system. The generated module carries what that needs:
-each system class maps its output ports to record classes, and a record
-class says whether it is a frame or a message.
+is what a gateway wants. Every copied port keeps its `{system}.{port}`
+name. A message record arrives on one port however many ports the peer
+publishes it on, since the wire carries only its id: the first listed
+wins, and `items=[imu, nav]` on a peer with `log` on both yields one
+`imu.log`, on which `nav`'s lines also arrive. (A copy named after the
+record alone would collide with the subscriber's own `log`.) The
+generated module carries what that needs: each system class maps its
+output ports to record classes, and a record class says whether it is a
+frame or a message.
 
 ```json
 "outputs": [
   { "port": "est.est", "peer": { "target": "a", "link": "pub", "port": "est.est" } },
-  { "port": "log", "peer": { "target": "a", "link": "pub", "port": "imu.log" } },
+  { "port": "imu.log", "peer": { "target": "a", "link": "pub", "port": "imu.log" } },
   { "port": "arm", "record": "arm" }
 ]
 ```
@@ -172,7 +173,8 @@ a subscription to a `Db` takes, since a db publishes no ports.
 `SystemHandle.port(source: OutPort[T]) -> OutPort[T]` on a `Subscribe`
 handle returns this subscriber's copy of a port it was given, typed by
 the source, so pyright checks `Ctrl(est=mirror.port(est.est))` with no
-generated code for the subscriber. A source that is not among the
+generated code for the subscriber. For a message source it returns the
+one port that record arrives on. A source that is not among the
 subscriber's items is a `ConfigError`. Attribute access stays for the
 subscriber's own ports (`link_status`, `log`).
 
@@ -373,6 +375,25 @@ Integration:
 The fixture pack gains a frame record (`Sample`, a timestamp and one
 `f64`) and a system producing one per cycle, so a frame can cross
 targets; the deployment file is `tests/fixtures/echo-pack/deploy.py`.
+
+## Shipped deviations
+
+- Copied message ports keep their `{system}.{port}` name rather than the
+  record's, as above; the first port of a record wins and the rest of
+  that record's ports are not copied.
+- The coordinator's `status` port was rooted at plain `status`, so every
+  system's status table shared one id and a gateway could hold one. It
+  now roots at `{namespace}.{id}.status` like every other port.
+- A mirrored frame keeps its origin's names when re-published, so a
+  gateway subscribing to both a producer and a mirror of it holds one
+  table, fed twice; the second feed's out-of-order stamps are refused
+  and counted.
+- Test fixtures build against `metor-fsw-3` with `default-features =
+  false`, so a pack never links the db.
+- The announce watch counts only records as data: a peer's `LinkInfo`,
+  vtable, and metadata messages end no announce. The first version
+  counted the identity, so the check ran the instant a mirror connected
+  and reported nothing when a peer announced first and sent later.
 
 ## Open decisions
 

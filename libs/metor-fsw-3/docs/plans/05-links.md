@@ -286,9 +286,9 @@ ignores the key shows the payload raw, as it does today for a failed
 decode; a panel that reads it renders JSON as JSON. No packet format
 changes.
 
-`Subscribe` never decodes: an inbound `Msg` is routed by id and written
-verbatim, and the consumer's `Record` decodes it with whichever codec it
-declares.
+`Subscribe` never decodes: an inbound `Msg` is routed by record id, an
+inbound `Table` by table id, and each is written verbatim; the
+consumer's `Record` decodes it with whichever codec it declares.
 
 ## The link
 
@@ -383,23 +383,21 @@ the Rust side accepts any name.
 
 An async system with dynamic outputs, a `transport`, and a `link_status`
 output. Its connection tasks read length-delimited packet bodies and
-write each one carrying a message whose id is one of its outputs' wire
+write each one carrying a message whose id is one of its message
+outputs' ids, or a table whose id is one of its frame outputs' table
 ids, verbatim, onto an in-memory ring of at least `inbound_cap` records
 (default 256) of the largest output's length, through one writer they
 share; its `run` drains the ring onto the ports. A full ring counts a
-drop; a table, or a message no output takes, is ignored. A `Frame`
-output cannot be refused at construction, since port defs arrive at
-bind; it
-faults `frame_output` on the log at start and is skipped.
-Unmatched ids are ignored, not logged; the panel probes with node
-protocol messages on connect. When listening it sends a `LinkInfo` with
-`command_ids` = its outputs' ids and no announces, so a panel knows what
-it may send. When connecting to a `Publish` or a db it takes the peer's
-announce as data and ignores it; a db peer additionally needs a
-`MsgStream` request per id, which slice 7 adds with address resolution.
-
-`Table` packets are dropped and counted in this slice; slice 7 routes
-them for frame mirroring.
+drop; a packet no output takes is ignored. A frame output's table id is
+that of the vtable its definition carries, which `metor build` bakes
+from the peer (`08-deployments.md`). Unmatched ids are ignored, not
+logged; the panel probes with node protocol messages on connect. When
+listening it sends a `LinkInfo` with `command_ids` = its message
+outputs' ids and no announces, so a panel knows what it may send. When
+dialing it sends one `MsgStream` request per message output, which a db
+answers with that log and a `Publish` discards, and watches the peer's
+announce until its first data packet: a frame output whose table was
+not announced is faulted `peer_schema_mismatch` once.
 
 ## Python
 

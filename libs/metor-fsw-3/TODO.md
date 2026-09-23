@@ -79,11 +79,25 @@ only; `SequenceCommand` arrives as an ordinary message.
 The control block and mmap ring files for worker processes; wasmi with
 the guest-allocates-rings protocol and per-call fuel
 
-## 7. Deployments and gateway
+## 7. Deployments and gateway, done
 
-`Deployment` of several targets, `Publish` and `Subscribe` mirrors, and
-the gateway target with the embedded db. Frame subscription lands here:
-`Subscribe([publish.nav.est])` references a peer's `Publish` port, the
-output takes that port's name and record, and routing binds the
-announced table id (`05-links.md`, decision 7). A dialed `Subscribe`
-toward a db peer needs a `MsgStream` request per id.
+`Deployment` of several targets in one envelope, `metor build` resolving
+peer references into addresses and baked definitions, frame
+subscription routed by table id with a connect-time announce check, the
+`Db` built-in behind the `db` feature, and `metor run` spawning every
+target. Landed 2026-09-22, `08-deployments.md`, `08-deployments-impl.md`.
+
+- `--host NS=ADDR` on `run` and `build`, overriding the envelope's host
+  map for a run away from where it was built.
+- A `loop()`-style forward link reference, so a target can name a peer
+  link added later in the file.
+- Per-port message identity: a message record from a peer arrives on
+  one port however many ports publish it, because a `Msg` packet
+  carries only its record id (`05-links.md`, decision 5 is where the id
+  rule lives).
+- The NixOS renderer over the resolved envelope, once packs ship as
+  built wheels the renderer can map to store paths.
+- `PacketStream::next_grow` from a 1 KiB buffer failed a read with
+  `EINVAL` on a publish whose announce runs to tens of kilobytes;
+  reading from a 64 KiB buffer, as `identify` does, did not. The gate
+  reads that way; the growth path in stellarator wants a look.
