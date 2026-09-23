@@ -1,9 +1,11 @@
 //! Link is responsible for connecting targets telemetry together
 //!
 //! [`publish`] and [`subscribe`] are the two core systems. Publish sends data to targets, and Subscribe collects data from a target.
-//!
+//! [`db`], behind the `db` feature, is the embedded database a gateway records into.
 
 mod conn;
+#[cfg(feature = "db")]
+mod db;
 mod inbox;
 mod publish;
 mod subscribe;
@@ -19,6 +21,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::Frame;
 use crate::coordinator::{BuildError, SystemTable};
 
+#[cfg(feature = "db")]
+pub use db::{Db, DbParams, DbStatus};
 pub use publish::{Publish, PublishParams};
 pub use subscribe::{Subscribe, SubscribeParams};
 pub use transport::Transport;
@@ -92,7 +96,10 @@ impl LinkStatus {
 /// Registers the link systems every target may name, under `fsw.`.
 pub fn register_builtins(table: &mut SystemTable) -> Result<(), BuildError> {
     table.register_async::<Publish, _, _>(&format!("{BUILTIN}.publish"), Publish::new)?;
-    table.register_async::<Subscribe, _, _>(&format!("{BUILTIN}.subscribe"), Subscribe::new)
+    table.register_async::<Subscribe, _, _>(&format!("{BUILTIN}.subscribe"), Subscribe::new)?;
+    #[cfg(feature = "db")]
+    table.register_async::<Db, _, _>(crate::deploy::DB_TYPE, Db::new)?;
+    Ok(())
 }
 
 #[cfg(test)]

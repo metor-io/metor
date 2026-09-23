@@ -9,6 +9,7 @@ metor-fsw-3-macros = { path = "macros" }
 metor-fsw-3-ring = { path = "ring" }
 
 metor-component = { workspace = true }
+metor-db = { path = "../db", optional = true }
 metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-stellar = { path = "../metor-proto/stellar" }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
@@ -30,6 +31,11 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
 zerocopy = { version = "0.8.2", features = ["derive"] }
+
+[features]
+default = ["db"]
+# The embedded database as a built-in system; off for a pack build.
+db = ["dep:metor-db"]
 
 [dev-dependencies]
 tempfile = "3"

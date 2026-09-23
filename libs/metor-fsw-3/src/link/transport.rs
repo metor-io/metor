@@ -84,6 +84,14 @@ impl Endpoint {
         }
     }
 
+    /// The bound listener, for a system that serves it itself.
+    pub(crate) fn into_listener(self) -> Option<TcpListener> {
+        match self {
+            Self::Listen { listener, .. } => Some(listener),
+            Self::Connect { .. } => None,
+        }
+    }
+
     /// The address a listener bound, for a caller that asked for port zero.
     pub(crate) fn local_addr(&self) -> Option<SocketAddr> {
         match self {

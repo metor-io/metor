@@ -91,7 +91,7 @@ pub(crate) fn announce(
 
 /// A message's schema as the ground decodes it: the type's own for postcard,
 /// an opaque payload plus the codec's name for anything else.
-fn msg_metadata(name: &str, codec: &MsgCodec) -> MsgMetadata {
+pub(crate) fn msg_metadata(name: &str, codec: &MsgCodec) -> MsgMetadata {
     let (name, schema) = match codec {
         MsgCodec::Postcard(schema) => (schema.name.to_string(), schema.clone()),
         _ => (
