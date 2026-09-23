@@ -85,6 +85,7 @@ impl Endpoint {
     }
 
     /// The bound listener, for a system that serves it itself.
+    #[cfg(feature = "db")]
     pub(crate) fn into_listener(self) -> Option<TcpListener> {
         match self {
             Self::Listen { listener, .. } => Some(listener),
