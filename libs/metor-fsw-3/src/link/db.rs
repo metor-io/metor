@@ -1,7 +1,9 @@
 //! `Db`: the embedded database, recording every record its config wires into
 //! it and serving the store to whoever connects.
 
+use core::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_lite::future;
@@ -19,7 +21,7 @@ use crate::port::{DynInputs, Output};
 use crate::record::RecordSchema;
 use crate::{Frame, Stop, system};
 
-use super::transport::Transport;
+use super::transport::{Endpoint, Transport};
 use super::wire;
 
 /// What a `Db` is configured with.
@@ -60,7 +62,8 @@ impl DbStatus {
 
 /// Records every record its config wires into it into an embedded metor-db.
 pub struct Db {
-    server: Option<Server>,
+    endpoint: Option<Endpoint>,
+    db: Arc<DB>,
     namespace: Option<String>,
     command_ids: Vec<PacketId>,
 }
@@ -71,19 +74,25 @@ impl Db {
     pub fn new(params: DbParams) -> Result<Self, ParamError> {
         let endpoint = params.transport.bind()?;
         super::record_bound(&params.link, &endpoint);
-        let Some(listener) = endpoint.into_listener() else {
+        if endpoint.listener().is_none() {
             return Err(ParamError::Decode(
                 "a db listens; it takes no `connect`".into(),
             ));
-        };
+        }
         let path = params.path.unwrap_or_else(|| {
             std::env::temp_dir().join(format!("metor-db-{}-{}", params.link, std::process::id()))
         });
-        let server = Server::from_listener(listener, &path).map_err(|error| {
+        let store = if path.exists() {
+            DB::open(path.clone())
+        } else {
+            DB::create(path.clone())
+        };
+        let db = store.map_err(|error| {
             ParamError::Decode(format!("opening the db at `{}`: {error}", path.display()))
         })?;
         Ok(Self {
-            server: Some(server),
+            endpoint: Some(endpoint),
+            db: Arc::new(db),
             namespace: params.namespace,
             command_ids: params.command_ids,
         })
@@ -100,20 +109,17 @@ impl Db {
         log: &mut Log,
         stop: Stop,
     ) {
-        // PANIC Safety: `run` is called once, and the server is the bind's.
-        let server = self.server.take().expect("one run per instance");
-        let db = server.db.clone();
+        // PANIC Safety: `run` is called once, and the endpoint is the bind's.
+        let endpoint = self.endpoint.take().expect("one run per instance");
+        let db = self.db.clone();
         let ids = announce(&db, inputs, log);
         db.set_identity(self.namespace.clone(), self.command_ids.clone());
-        if let Ok(addr) = server.listener.local_addr() {
+        let addr = endpoint.local_addr();
+        if let Some(addr) = addr {
             log.info(format!("serving {} on {addr}", db.path.display()));
         }
-        let _server = stellarator::spawn(async move {
-            if let Err(error) = server.run().await {
-                tracing::warn!(%error, "db server ended");
-            }
-        })
-        .drop_guard();
+        let _udp = addr.map(|addr| stellarator::spawn(udp(addr, db.clone())).drop_guard());
+        let _serve = stellarator::spawn(serve(endpoint, db.clone(), stop.clone())).drop_guard();
         metor_db::lod::spawn(db.clone());
 
         let mut status = DbStatus {
@@ -141,6 +147,53 @@ impl Db {
                 reported = status;
             }
         }
+    }
+}
+
+/// One connection served from the store: the task, cancelled with its slot,
+/// and the flag it frees the slot with.
+struct Conn {
+    open: Rc<Cell<bool>>,
+    _task: stellarator::JoinHandleDropGuard<()>,
+}
+
+/// Accepts peers into a fixed set of slots, one connection each; a peer past
+/// the last free slot is closed at once. Every connection ends with this
+/// future.
+async fn serve(endpoint: Endpoint, db: Arc<DB>, stop: Stop) {
+    let Some(listener) = endpoint.listener() else {
+        return;
+    };
+    let mut slots: Vec<Option<Conn>> = (0..endpoint.slots()).map(|_| None).collect();
+    while !stop.is_set() {
+        let Some(stream) = super::transport::accept(listener, &stop).await else {
+            continue;
+        };
+        let Some(slot) = slots.iter_mut().find(|slot| !occupied(slot)) else {
+            continue;
+        };
+        let open = Rc::new(Cell::new(true));
+        let (conn_db, conn_open) = (db.clone(), open.clone());
+        let task = stellarator::spawn(async move {
+            metor_db::handle_conn(stream, conn_db).await;
+            conn_open.set(false);
+        });
+        *slot = Some(Conn {
+            open,
+            _task: task.drop_guard(),
+        });
+    }
+}
+
+/// Whether a slot holds a connection that is still up.
+fn occupied(slot: &Option<Conn>) -> bool {
+    slot.as_ref().is_some_and(|conn| conn.open.get())
+}
+
+/// Serves the store's datagram protocol on the listener's address.
+async fn udp(addr: std::net::SocketAddr, db: Arc<DB>) {
+    if let Err(error) = Server::handle_udp(addr, db).await {
+        tracing::warn!(%error, "db udp ended");
     }
 }
 
@@ -233,7 +286,10 @@ mod tests {
     use metor_fsw_3_ring::{Config, RingBuffer};
     use metor_proto::types::PacketId;
 
+    use stellarator::net::TcpStream;
+
     use crate::DefCx;
+    use crate::async_system::stop_pair;
     use crate::port::{Input, ring_capacity};
     use crate::record::Record;
     use crate::system::{InputBinding, SystemInputs};
@@ -388,6 +444,48 @@ mod tests {
         let mut status = status();
         ingest(&db, &mut inputs, &ids, &mut status);
         assert_eq!((status.records, status.refused), (1, 1));
+    }
+
+    /// A listening endpoint on a free port, with the address it bound.
+    fn endpoint(slots: usize) -> (Endpoint, std::net::SocketAddr) {
+        let endpoint = Transport::Listen {
+            addr: "127.0.0.1:0".into(),
+            max_connections: slots,
+        }
+        .bind()
+        .expect("a free port");
+        let addr = endpoint.local_addr().expect("a listener binds");
+        (endpoint, addr)
+    }
+
+    /// The peer's next byte, or the error its socket closed with.
+    async fn read_byte(stream: &TcpStream) -> Result<usize, stellarator::Error> {
+        stream.read(vec![0u8; 1]).await.0
+    }
+
+    #[stellarator::test]
+    async fn test_one_slot_refuses_a_second_client() {
+        let (_dir, db) = store();
+        let (endpoint, addr) = endpoint(1);
+        let (_handle, stop) = stop_pair();
+        let served = stellarator::spawn(serve(endpoint, db, stop)).drop_guard();
+
+        let first = TcpStream::connect(addr).await.expect("the db accepts");
+        let second = TcpStream::connect(addr)
+            .await
+            .expect("the listener accepts");
+        assert_eq!(
+            read_byte(&second).await.ok(),
+            Some(0),
+            "a peer past the slots is closed at once"
+        );
+
+        drop(served);
+        assert_eq!(
+            read_byte(&first).await.ok(),
+            Some(0),
+            "dropping the coordinator's guard closes what it served"
+        );
     }
 
     #[test]
