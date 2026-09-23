@@ -116,6 +116,7 @@
                   "max_len": 16,
                   "alignment": 8,
                   "depth": 1,
+                  "layout": 1331917042678224988,
                   "schema": {
                     "Frame": {
                       "vtable": {
@@ -229,6 +230,7 @@
                   "max_len": 4096,
                   "alignment": 1,
                   "depth": 8,
+                  "layout": 0,
                   "schema": {
                     "Msg": {
                       "id": [
@@ -380,6 +382,7 @@
                   "max_len": 24,
                   "alignment": 8,
                   "depth": 1,
+                  "layout": 11510398653186501065,
                   "schema": {
                     "Frame": {
                       "vtable": {
@@ -723,6 +726,7 @@
                   "max_len": 16,
                   "alignment": 8,
                   "depth": 1,
+                  "layout": 1331917042678224988,
                   "schema": {
                     "Frame": {
                       "vtable": {
@@ -836,6 +840,7 @@
                   "max_len": 4096,
                   "alignment": 1,
                   "depth": 8,
+                  "layout": 0,
                   "schema": {
                     "Msg": {
                       "id": [
@@ -987,6 +992,7 @@
                   "max_len": 24,
                   "alignment": 8,
                   "depth": 1,
+                  "layout": 11510398653186501065,
                   "schema": {
                     "Frame": {
                       "vtable": {
@@ -1200,6 +1206,7 @@
                   "max_len": 16,
                   "alignment": 8,
                   "depth": 1,
+                  "layout": 1331917042678224988,
                   "schema": {
                     "Frame": {
                       "vtable": {
@@ -1313,6 +1320,7 @@
                   "max_len": 4096,
                   "alignment": 1,
                   "depth": 8,
+                  "layout": 0,
                   "schema": {
                     "Msg": {
                       "id": [
@@ -1464,6 +1472,7 @@
                   "max_len": 24,
                   "alignment": 8,
                   "depth": 1,
+                  "layout": 11510398653186501065,
                   "schema": {
                     "Frame": {
                       "vtable": {
@@ -1659,6 +1668,7 @@
                   "max_len": 40,
                   "alignment": 8,
                   "depth": 1,
+                  "layout": 17738471677735398083,
                   "schema": {
                     "Frame": {
                       "vtable": {
@@ -2018,6 +2028,7 @@
                   "max_len": 24,
                   "alignment": 8,
                   "depth": 1,
+                  "layout": 11510398653186501065,
                   "schema": {
                     "Frame": {
                       "vtable": {
@@ -2213,6 +2224,7 @@
                   "max_len": 8,
                   "alignment": 1,
                   "depth": 1,
+                  "layout": 0,
                   "schema": {
                     "Msg": {
                       "id": [
@@ -2249,6 +2261,7 @@
                   "max_len": 24,
                   "alignment": 8,
                   "depth": 1,
+                  "layout": 11510398653186501065,
                   "schema": {
                     "Frame": {
                       "vtable": {

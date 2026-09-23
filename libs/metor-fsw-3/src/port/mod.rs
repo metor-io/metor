@@ -113,6 +113,7 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
             max_len: T::MAX_LEN,
             alignment: T::ALIGN,
             depth: T::DEPTH,
+            layout: T::schema().layout(),
             schema: T::schema_at(&cx.root(name)),
         }
     }

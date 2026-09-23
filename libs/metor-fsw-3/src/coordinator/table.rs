@@ -227,7 +227,8 @@ fn check_record(known: &PortDef, port: &PortDef) -> Result<(), BuildError> {
 }
 
 fn same_record(a: &PortDef, b: &PortDef) -> bool {
-    (a.id, a.max_len, a.alignment, a.depth) == (b.id, b.max_len, b.alignment, b.depth)
+    (a.id, a.max_len, a.alignment, a.depth, a.layout)
+        == (b.id, b.max_len, b.alignment, b.depth, b.layout)
         && a.schema.same_record(&b.schema)
 }
 
@@ -309,7 +310,7 @@ mod tests {
     use super::*;
     use crate::Record;
     use crate::async_system::Stop;
-    use crate::tests::utils::{Imu, ImuOffset, ImuSource, NavFilter};
+    use crate::tests::utils::{Imu, ImuOffset, ImuPair, ImuSource, NavFilter};
     use crate::{MsgCodec, Output};
     use metor_proto::types::ComponentId;
 
@@ -331,6 +332,7 @@ mod tests {
             max_len: 32,
             alignment: 1,
             depth: 1,
+            layout: 0,
             schema: RecordSchema::msg(name, codec),
         }
     }
@@ -387,6 +389,31 @@ mod tests {
         changed.max_len += 8;
         let mut input = declared(Vec::new());
         input.def.inputs.push(changed);
+        assert_eq!(
+            table.insert("sink", input),
+            Err(BuildError::RecordConflict {
+                record: "imu".into()
+            })
+        );
+        assert!(table.get("sink").is_none());
+    }
+
+    /// Two frames of one name whose fields differ are not one record, whatever
+    /// port they sit on.
+    #[test]
+    fn test_reject_conflicting_frame_layout() {
+        let mut table = SystemTable::new();
+        table
+            .insert(
+                "source",
+                declared(vec![Output::<Imu>::def(&DefCx::empty(), "imu")]),
+            )
+            .expect("first record");
+        let mut input = declared(Vec::new());
+        input
+            .def
+            .inputs
+            .push(crate::Input::<ImuPair>::def(&DefCx::empty(), "other"));
         assert_eq!(
             table.insert("sink", input),
             Err(BuildError::RecordConflict {

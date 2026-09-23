@@ -489,6 +489,7 @@ mod tests {
                 max_len: 32,
                 alignment: 32,
                 depth: 1,
+                layout: utils::Imu::schema().layout(),
                 schema: utils::Imu::schema(),
             };
             let def = crate::SystemDef {

@@ -1,13 +1,15 @@
 //! `Db`: the embedded database, recording every record its config wires into
 //! it and serving the store to whoever connects.
 
+use core::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_lite::future;
-use metor_db::{DB, Server};
+use metor_db::{DB, Server, TableIngestor};
 use metor_fsw_3_ring::Notifier;
-use metor_proto::types::{PacketId, PacketTy, Timestamp, table_id};
+use metor_proto::types::{PacketId, Timestamp, table_id};
 use metor_proto_wkt::VTableMsg;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -19,7 +21,7 @@ use crate::port::{DynInputs, Output};
 use crate::record::RecordSchema;
 use crate::{Frame, Stop, system};
 
-use super::transport::Transport;
+use super::transport::{Endpoint, Transport};
 use super::wire;
 
 /// What a `Db` is configured with.
@@ -60,7 +62,8 @@ impl DbStatus {
 
 /// Records every record its config wires into it into an embedded metor-db.
 pub struct Db {
-    server: Option<Server>,
+    endpoint: Option<Endpoint>,
+    db: Arc<DB>,
     namespace: Option<String>,
     command_ids: Vec<PacketId>,
 }
@@ -71,19 +74,25 @@ impl Db {
     pub fn new(params: DbParams) -> Result<Self, ParamError> {
         let endpoint = params.transport.bind()?;
         super::record_bound(&params.link, &endpoint);
-        let Some(listener) = endpoint.into_listener() else {
+        if endpoint.listener().is_none() {
             return Err(ParamError::Decode(
                 "a db listens; it takes no `connect`".into(),
             ));
-        };
+        }
         let path = params.path.unwrap_or_else(|| {
             std::env::temp_dir().join(format!("metor-db-{}-{}", params.link, std::process::id()))
         });
-        let server = Server::from_listener(listener, &path).map_err(|error| {
+        let store = if path.exists() {
+            DB::open(path.clone())
+        } else {
+            DB::create(path.clone())
+        };
+        let db = store.map_err(|error| {
             ParamError::Decode(format!("opening the db at `{}`: {error}", path.display()))
         })?;
         Ok(Self {
-            server: Some(server),
+            endpoint: Some(endpoint),
+            db: Arc::new(db),
             namespace: params.namespace,
             command_ids: params.command_ids,
         })
@@ -100,20 +109,17 @@ impl Db {
         log: &mut Log,
         stop: Stop,
     ) {
-        // PANIC Safety: `run` is called once, and the server is the bind's.
-        let server = self.server.take().expect("one run per instance");
-        let db = server.db.clone();
-        let ids = announce(&db, inputs, log);
+        // PANIC Safety: `run` is called once, and the endpoint is the bind's.
+        let endpoint = self.endpoint.take().expect("one run per instance");
+        let db = self.db.clone();
+        let sinks = announce(&db, inputs, log);
         db.set_identity(self.namespace.clone(), self.command_ids.clone());
-        if let Ok(addr) = server.listener.local_addr() {
+        let addr = endpoint.local_addr();
+        if let Some(addr) = addr {
             log.info(format!("serving {} on {addr}", db.path.display()));
         }
-        let _server = stellarator::spawn(async move {
-            if let Err(error) = server.run().await {
-                tracing::warn!(%error, "db server ended");
-            }
-        })
-        .drop_guard();
+        let _udp = addr.map(|addr| stellarator::spawn(udp(addr, db.clone())).drop_guard());
+        let _serve = stellarator::spawn(serve(endpoint, db.clone(), stop.clone())).drop_guard();
         metor_db::lod::spawn(db.clone());
 
         let mut status = DbStatus {
@@ -134,7 +140,7 @@ impl Db {
             if !future::or(stopped, ready).await {
                 return;
             }
-            ingest(&db, inputs, &ids, &mut status);
+            ingest(&db, inputs, &sinks, &mut status);
             status.timestamp = Timestamp::now();
             if status.changed(&reported) {
                 let _ = db_status.write(&status);
@@ -144,17 +150,68 @@ impl Db {
     }
 }
 
+/// One connection served from the store: the task, cancelled with its slot,
+/// and the flag it frees the slot with.
+struct Conn {
+    open: Rc<Cell<bool>>,
+    _task: stellarator::JoinHandleDropGuard<()>,
+}
+
+/// Accepts peers into a fixed set of slots, one connection each; a peer past
+/// the last free slot is closed at once. Every connection ends with this
+/// future.
+async fn serve(endpoint: Endpoint, db: Arc<DB>, stop: Stop) {
+    let Some(listener) = endpoint.listener() else {
+        return;
+    };
+    let mut slots: Vec<Option<Conn>> = (0..endpoint.slots()).map(|_| None).collect();
+    while !stop.is_set() {
+        let Some(stream) = super::transport::accept(listener, &stop).await else {
+            continue;
+        };
+        let Some(slot) = slots.iter_mut().find(|slot| !occupied(slot)) else {
+            continue;
+        };
+        let open = Rc::new(Cell::new(true));
+        let (conn_db, conn_open) = (db.clone(), open.clone());
+        let task = stellarator::spawn(async move {
+            metor_db::handle_conn(stream, conn_db).await;
+            conn_open.set(false);
+        });
+        *slot = Some(Conn {
+            open,
+            _task: task.drop_guard(),
+        });
+    }
+}
+
+/// Whether a slot holds a connection that is still up.
+fn occupied(slot: &Option<Conn>) -> bool {
+    slot.as_ref().is_some_and(|conn| conn.open.get())
+}
+
+/// Serves the store's datagram protocol on the listener's address.
+async fn udp(addr: std::net::SocketAddr, db: Arc<DB>) {
+    if let Err(error) = Server::handle_udp(addr, db).await {
+        tracing::warn!(%error, "db udp ended");
+    }
+}
+
+/// Where one port's records go: the components its table lands in, the id its
+/// messages carry, or nothing for a port the store refused.
+enum Sink {
+    Table(TableIngestor),
+    Msg(PacketId),
+    Refused,
+}
+
 /// Registers each port's vtable and metadata, or message metadata, with the
-/// store, and returns the id each port's records are ingested under. A frame
-/// whose table id the store already holds for another vtable gets none.
-fn announce(
-    db: &Arc<DB>,
-    inputs: &mut DynInputs<Notifier>,
-    log: &mut Log,
-) -> Vec<Option<PacketId>> {
-    let mut ids = Vec::new();
+/// store, and prepares the sink its records take. A frame whose table id the
+/// store already holds for another vtable is refused.
+fn announce(db: &Arc<DB>, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sink> {
+    let mut sinks = Vec::new();
     for (def, _) in inputs.iter_mut() {
-        let id = match &def.schema {
+        sinks.push(match &def.schema {
             RecordSchema::Frame { vtable, metadata } => {
                 let id = table_id(vtable);
                 let table = VTableMsg {
@@ -169,7 +226,7 @@ fn announce(
                             def.name
                         ),
                     );
-                    ids.push(None);
+                    sinks.push(Sink::Refused);
                     continue;
                 }
                 for component in metadata {
@@ -183,7 +240,19 @@ fn announce(
                         );
                     }
                 }
-                id
+                match db.table_ingestor(id) {
+                    Ok(ingestor) => Sink::Table(ingestor),
+                    Err(error) => {
+                        log.fault(
+                            "table_ingestor",
+                            format!(
+                                "port `{}` announces a table the store cannot prepare: {error}",
+                                def.name
+                            ),
+                        );
+                        Sink::Refused
+                    }
+                }
             }
             RecordSchema::Msg { id, name, codec } => {
                 let metadata = wire::msg_metadata(name, codec);
@@ -192,33 +261,28 @@ fn announce(
                 if let Err(error) = result {
                     log.fault("msg_metadata", format!("port `{}`: {error}", def.name));
                 }
-                *id
+                Sink::Msg(*id)
             }
-        };
-        ids.push(Some(id));
+        });
     }
-    ids
+    sinks
 }
 
 /// Writes every waiting record into the store, counting what it refused. A
-/// port with no id drains, and its records count as refused.
-fn ingest(
-    db: &DB,
-    inputs: &mut DynInputs<Notifier>,
-    ids: &[Option<PacketId>],
-    status: &mut DbStatus,
-) {
-    for ((def, input), id) in inputs.iter_mut().zip(ids) {
-        let Some(id) = id else {
+/// refused port drains, and its records count as refused.
+fn ingest(db: &DB, inputs: &mut DynInputs<Notifier>, sinks: &[Sink], status: &mut DbStatus) {
+    for ((_, input), sink) in inputs.iter_mut().zip(sinks) {
+        if let Sink::Refused = sink {
             status.refused += input.drain().count() as u64;
             continue;
-        };
-        let ty = def.schema.packet_ty();
+        }
         for record in input.drain() {
             let Ok(bytes) = record else { continue };
-            let result = match ty {
-                PacketTy::Table => db.ingest_table(*id, bytes),
-                _ => db.push_msg(Timestamp::now(), *id, bytes),
+            let now = Timestamp::now();
+            let result = match sink {
+                Sink::Table(ingestor) => ingestor.push(now, bytes),
+                Sink::Msg(id) => db.push_msg(now, *id, bytes),
+                Sink::Refused => continue,
             };
             match result {
                 Ok(()) => status.records += 1,
@@ -233,7 +297,10 @@ mod tests {
     use metor_fsw_3_ring::{Config, RingBuffer};
     use metor_proto::types::PacketId;
 
+    use stellarator::net::TcpStream;
+
     use crate::DefCx;
+    use crate::async_system::stop_pair;
     use crate::port::{Input, ring_capacity};
     use crate::record::Record;
     use crate::system::{InputBinding, SystemInputs};
@@ -307,7 +374,7 @@ mod tests {
         let (_dir, db) = store();
         let rings = [ring::<Imu>(), ring::<Fixed>()];
         let mut inputs = ports(&rings);
-        let ids = announce(&db, &mut inputs, &mut Log);
+        let sinks = announce(&db, &mut inputs, &mut Log);
         let RecordSchema::Frame { metadata, .. } = &Input::<Imu>::def(
             &DefCx {
                 id: "plant",
@@ -320,20 +387,15 @@ mod tests {
         else {
             panic!("a frame")
         };
-        assert_eq!(
-            ids,
-            vec![
-                Some(table_id_of(&mut inputs)),
-                Some(Fixed::schema().packet_id())
-            ]
-        );
+        assert!(matches!(sinks[0], Sink::Table(_)), "a prepared ingestor");
+        assert!(matches!(sinks[1], Sink::Msg(id) if id == Fixed::schema().packet_id()));
         assert_eq!(metadata[0].name, "a.plant.imu.sample");
 
         for n in 1..=3 {
             produce(&rings, n);
         }
         let mut status = status();
-        ingest(&db, &mut inputs, &ids, &mut status);
+        ingest(&db, &mut inputs, &sinks, &mut status);
         assert_eq!((status.records, status.refused), (6, 0));
 
         // Pushes land in each store's write-ahead log; what is synchronous is
@@ -378,16 +440,58 @@ mod tests {
         };
         db.insert_vtable(VTableMsg { id, vtable })
             .expect("the first vtable under an id is taken");
-        let ids = announce(&db, &mut inputs, &mut Log);
-        assert_eq!(
-            ids[0], None,
+        let sinks = announce(&db, &mut inputs, &mut Log);
+        assert!(
+            matches!(sinks[0], Sink::Refused),
             "a different vtable under a held id is refused"
         );
-        assert!(ids[1].is_some());
+        assert!(matches!(sinks[1], Sink::Msg(_)));
         produce(&rings, 1);
         let mut status = status();
-        ingest(&db, &mut inputs, &ids, &mut status);
+        ingest(&db, &mut inputs, &sinks, &mut status);
         assert_eq!((status.records, status.refused), (1, 1));
+    }
+
+    /// A listening endpoint on a free port, with the address it bound.
+    fn endpoint(slots: usize) -> (Endpoint, std::net::SocketAddr) {
+        let endpoint = Transport::Listen {
+            addr: "127.0.0.1:0".into(),
+            max_connections: slots,
+        }
+        .bind()
+        .expect("a free port");
+        let addr = endpoint.local_addr().expect("a listener binds");
+        (endpoint, addr)
+    }
+
+    /// The peer's next byte, or the error its socket closed with.
+    async fn read_byte(stream: &TcpStream) -> Result<usize, stellarator::Error> {
+        stream.read(vec![0u8; 1]).await.0
+    }
+
+    #[stellarator::test]
+    async fn test_one_slot_refuses_a_second_client() {
+        let (_dir, db) = store();
+        let (endpoint, addr) = endpoint(1);
+        let (_handle, stop) = stop_pair();
+        let served = stellarator::spawn(serve(endpoint, db, stop)).drop_guard();
+
+        let first = TcpStream::connect(addr).await.expect("the db accepts");
+        let second = TcpStream::connect(addr)
+            .await
+            .expect("the listener accepts");
+        assert_eq!(
+            read_byte(&second).await.ok(),
+            Some(0),
+            "a peer past the slots is closed at once"
+        );
+
+        drop(served);
+        assert_eq!(
+            read_byte(&first).await.ok(),
+            Some(0),
+            "dropping the coordinator's guard closes what it served"
+        );
     }
 
     #[test]

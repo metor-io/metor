@@ -2,8 +2,8 @@
 //! [`metor_adcs::mekf::State`] (a multiplicative EKF), reconstructing the sun
 //! observation from the six raw CSS head readings ([`sun_from_css`]) and modeling the
 //! inertial **references** itself (cube-sat's `Nav::from_sensors`): the sun direction from
-//! the Vallado ephemeris at its own sim-time epoch, and the magnetic field from the NOAA
-//! WMM evaluated at the **GPS** position. When every CSS head is dark (eclipse) the filter
+//! the Vallado ephemeris at the epoch the sample was stamped with, and the magnetic field
+//! from the NOAA WMM evaluated at the **GPS** position. When every CSS head is dark (eclipse) the filter
 //! runs magnetometer-only — the about-B̂ attitude is instantaneously unobservable and rides
 //! the gyro until the sun returns. It knows only what the flight software knows — the raw
 //! readings and the noisy GPS measurement — never the plant's truth.
@@ -39,10 +39,12 @@ pub struct NavState {
     sigma: f64,
     /// The NOAA WMM handle for the reference magnetic field (built once — holds C-library state).
     mag_model: MagneticModel,
-    /// Seconds of simulated FSW time — a deterministic per-cycle counter kept in lockstep
-    /// with the plant's (both start at 0 and advance by `DT` each cycle), so nav evaluates its
-    /// sun/field references at the same epoch the plant generated the measurement at.
-    t_sim: f64,
+    /// The stamp of the first sensor sample, which the reference epoch counts from, so nav
+    /// evaluates its sun/field references at the epoch the measurement was taken at however
+    /// the processes are scheduled.
+    first: Option<Timestamp>,
+    /// The stamp of the last sample observed, so the retained latest is not filtered twice.
+    last: Option<Timestamp>,
     /// Whether the CSS saw the sun last cycle (`None` before the first sample), so the
     /// lost/reacquired transitions log once per edge instead of per cycle.
     sun_visible: Option<bool>,
@@ -58,10 +60,22 @@ impl NavState {
             mekf,
             sigma: p.meas_sigma,
             mag_model: MagneticModel::default(),
-            t_sim: 0.0,
+            first: None,
+            last: None,
             sun_visible: None,
             had_fix: false,
         }
+    }
+
+    /// Seconds from the first sample to `stamp`, or `None` when `stamp` is the sample the
+    /// filter last observed — the retained latest, not a new measurement.
+    fn elapsed(&mut self, stamp: Timestamp) -> Option<f64> {
+        if self.last == Some(stamp) {
+            return None;
+        }
+        self.last = Some(stamp);
+        let first = *self.first.get_or_insert(stamp);
+        Some((stamp - first).as_secs_f64())
     }
 }
 
@@ -75,12 +89,6 @@ impl NavState {
         gps: &mut Input<Gps>,
         attitude_estimate: &mut Output<AttitudeEstimate>,
     ) {
-        // Advance the deterministic FSW clock in lockstep with the plant (every cycle,
-        // regardless of whether a sample is ready), so the reference epoch matches the epoch the
-        // plant stamped this cycle's measurement at.
-        let epoch = epoch_at(self.t_sim);
-        self.t_sim += DT;
-
         let Ok(Some(s)) = sensors.latest() else {
             return; // no sensor sample yet
         };
@@ -88,10 +96,16 @@ impl NavState {
         let Ok(Some(g)) = gps.latest() else {
             return; // no GPS fix yet
         };
+        // The references are evaluated at the epoch the sample was taken at, so a skewed or
+        // slower nav process still models what the sensors saw.
+        let Some(t_sim) = self.elapsed(s.timestamp) else {
+            return; // the retained latest, already observed
+        };
+        let epoch = epoch_at(t_sim);
         let gps_pos: V3 = g.pos_eci;
         if !self.had_fix {
             self.had_fix = true;
-            tracing::info!(t_sim = self.t_sim, "first GPS fix; filter references live");
+            tracing::info!(t_sim, "first GPS fix; filter references live");
         }
 
         // The inertial (ECI) references nav models itself from what the flight software knows:
@@ -110,9 +124,9 @@ impl NavState {
         // magnetometer-only (the about-B̂ attitude rides the gyro until it returns).
         match (self.sun_visible, sun_b.is_some()) {
             (Some(true), false) => {
-                tracing::warn!(t_sim = self.t_sim, "sun lost; running magnetometer-only")
+                tracing::warn!(t_sim, "sun lost; running magnetometer-only")
             }
-            (Some(false), true) => tracing::info!(t_sim = self.t_sim, "sun reacquired"),
+            (Some(false), true) => tracing::info!(t_sim, "sun reacquired"),
             _ => {}
         }
         self.sun_visible = Some(sun_b.is_some());
@@ -176,6 +190,30 @@ mod tests {
                 sun.into_buf()
             );
         }
+    }
+
+    /// A cycle finding the same sample it last filtered observes nothing: the port retains
+    /// its latest record, and a measurement is one observation.
+    #[test]
+    fn repeated_sample_is_not_reobserved() {
+        let mut nav = NavState::new(NavParams { meas_sigma: 0.01 });
+        assert_eq!(nav.elapsed(Timestamp(1_000)), Some(0.0));
+        assert_eq!(nav.elapsed(Timestamp(1_000)), None);
+        assert_eq!(nav.elapsed(Timestamp(1_000)), None);
+    }
+
+    /// The reference epoch follows the samples' own stamps, so a gap in them is a gap in
+    /// modeled time rather than a drift against the plant.
+    #[test]
+    fn epoch_follows_the_samples_stamps() {
+        let mut nav = NavState::new(NavParams { meas_sigma: 0.01 });
+        let step = (DT * 1e6) as i64;
+        assert_eq!(nav.elapsed(Timestamp(7 * step)), Some(0.0));
+        let one = nav.elapsed(Timestamp(8 * step)).expect("a new sample");
+        assert!((one - DT).abs() < 1e-6, "{one}");
+        // Five cycles arrive as one: the epoch jumps with them.
+        let skipped = nav.elapsed(Timestamp(13 * step)).expect("a new sample");
+        assert!((skipped - 6.0 * DT).abs() < 1e-5, "{skipped}");
     }
 
     /// All-dark heads (eclipse: noise floor only) declare the sun lost rather than

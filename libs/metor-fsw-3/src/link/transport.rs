@@ -84,9 +84,9 @@ impl Endpoint {
         }
     }
 
-    /// The bound listener, for a system that serves it itself.
+    /// The bound listener, for a system that accepts on it itself.
     #[cfg(feature = "db")]
-    pub(crate) fn into_listener(self) -> Option<TcpListener> {
+    pub(crate) fn listener(&self) -> Option<&TcpListener> {
         match self {
             Self::Listen { listener, .. } => Some(listener),
             Self::Connect { .. } => None,
@@ -190,7 +190,7 @@ async fn dial(mut dialer: Dialer, conns: Rc<Connections>, stop: Stop) {
 ///
 /// A failure is the host's, not the peer's, so it is waited out rather than
 /// retried at once.
-async fn accept(listener: &TcpListener, stop: &Stop) -> Option<TcpStream> {
+pub(crate) async fn accept(listener: &TcpListener, stop: &Stop) -> Option<TcpStream> {
     let accepted = futures_lite::future::or(async { Some(listener.accept().await) }, async {
         stop.wait().await;
         None

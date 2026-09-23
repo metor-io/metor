@@ -178,7 +178,7 @@ impl Records {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::utils::{Imu, Nav};
+    use crate::tests::utils::{Imu, ImuPair, Nav};
     use crate::{Output, Record};
 
     #[test]
@@ -222,6 +222,25 @@ mod tests {
         let mut wide = Output::<Imu>::def(&DefCx::empty(), "imu");
         wide.max_len += 8;
         let records = Records::of([Output::<Imu>::def(&DefCx::empty(), "imu"), wide].iter());
+        assert_eq!(
+            records.port("out", Imu::NAME),
+            Err(DefError::RecordConflict {
+                record: Imu::NAME.into(),
+            })
+        );
+    }
+
+    /// Two frames of one name whose fields differ dispute the record.
+    #[test]
+    fn test_conflicting_frame_layouts() {
+        let cx = DefCx::empty();
+        let records = Records::of(
+            [
+                Output::<Imu>::def(&cx, "imu"),
+                Output::<ImuPair>::def(&cx, "imu"),
+            ]
+            .iter(),
+        );
         assert_eq!(
             records.port("out", Imu::NAME),
             Err(DefError::RecordConflict {

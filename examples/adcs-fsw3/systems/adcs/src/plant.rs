@@ -20,10 +20,10 @@
 //! signature is the port set.
 
 use adcs_contracts::{
-    BodyState, DT, Disturbances, EARTH_RADIUS, Gps, MASS, MU, MagneticModel, MtqCmd, PlantParams,
-    Quat, RW_MOMENTUM_MAX, RW_TORQUE_MAX, ReactionWheel, Sensors, TorqueCmd, V3, Wheels, World,
-    clamp_dipole, eci_to_geodetic, epoch_at, in_earth_shadow, inertia_diag, mag_field_eci,
-    orbit_pos_vel, raan_for_ltan, sun_dir_eci, target_epoch,
+    BodyState, DT, Disturbances, EARTH_RADIUS, Epoch, Gps, MASS, MU, MagneticModel, MtqCmd,
+    PlantParams, Quat, RW_MOMENTUM_MAX, RW_TORQUE_MAX, ReactionWheel, Sensors, TorqueCmd, V3,
+    Wheels, World, clamp_dipole, eci_to_geodetic, epoch_at, in_earth_shadow, inertia_diag,
+    mag_field_eci, orbit_pos_vel, raan_for_ltan, sun_dir_eci, target_epoch,
 };
 use metor_fsw_3::{Input, Output, Timestamp, system};
 use nox::{
@@ -246,20 +246,46 @@ pub struct PlantState {
     /// Whether the spacecraft was illuminated last cycle (`None` before the first), so the
     /// shadow entry/exit transitions log once per edge.
     was_illuminated: Option<bool>,
+    /// The zero-mean unit normal every sensor model draws from, built once.
+    unit_normal: Normal<f64>,
+}
+
+/// The ports one cycle's telemetry is written to.
+struct Ports<'a> {
+    sensors: &'a mut Output<Sensors>,
+    gps: &'a mut Output<Gps>,
+    wheels: &'a mut Output<Wheels>,
+    body: &'a mut Output<BodyState>,
+    world: &'a mut Output<World>,
+    disturb: &'a mut Output<Disturbances>,
+}
+
+/// One cycle's pre-step truth and what the sensors made of it.
+struct Sample {
+    q_b_eci: Quat,
+    omega_b_true: V3,
+    pos_eci: V3,
+    vel_eci: V3,
+    sun_eci: V3,
+    /// The true field in ECI (Tesla), un-normalized.
+    mag_eci: V3,
+    /// The same field in the body frame, which the magnetorquers act against.
+    mag_b_true: V3,
+    illuminated: bool,
+    sensors: Sensors,
+    gps: Gps,
 }
 
 impl PlantState {
     fn noise(&mut self, sigma: f64) -> V3 {
-        let d = Normal::new(0.0, sigma).unwrap();
-        tensor![
-            d.sample(&mut self.rng),
-            d.sample(&mut self.rng),
-            d.sample(&mut self.rng)
-        ]
+        let (x, y, z) = (self.noise1(sigma), self.noise1(sigma), self.noise1(sigma));
+        tensor![x, y, z]
     }
 
+    /// One zero-mean draw at `sigma`, which is the unit normal scaled — what a `Normal` of
+    /// that sigma samples, without building one per draw.
     fn noise1(&mut self, sigma: f64) -> f64 {
-        Normal::new(0.0, sigma).unwrap().sample(&mut self.rng)
+        sigma * self.unit_normal.sample(&mut self.rng)
     }
 }
 
@@ -333,6 +359,8 @@ impl PlantState {
             gps_pos_err: V3::zeros(),
             params: p,
             was_illuminated: None,
+            // PANIC Safety: a unit standard deviation is a valid normal.
+            unit_normal: Normal::new(0.0, 1.0).expect("a unit normal"),
         }
     }
 }
@@ -353,10 +381,31 @@ impl PlantState {
         world: &mut Output<World>,
         disturb: &mut Output<Disturbances>,
     ) {
-        // Latest commanded body torque / magnetorquer dipole (zero on the first cycle / if
-        // none has arrived). Project the torque onto each wheel's axis to form that wheel's
-        // set point, then step them; the wheel `torque` fields come back as the reaction
-        // delivered to the body.
+        let (rw_torque_b, h_w_b, dipole_b) = self.actuate(torque_cmd, mtq_cmd);
+        let sample = self.sense(now);
+        let (d, mtq_torque_b) = self.environment(&sample, dipole_b);
+        let ports = Ports {
+            sensors,
+            gps,
+            wheels,
+            body,
+            world,
+            disturb,
+        };
+        self.telemeter(now, &sample, &d, mtq_torque_b, ports);
+        self.integrate(rw_torque_b, h_w_b, &d, mtq_torque_b);
+    }
+}
+
+impl PlantState {
+    /// Steps the wheels under the commanded body torque, returning their reaction torque and
+    /// stored momentum together with the commanded magnetorquer dipole. Either command is
+    /// zero until one arrives.
+    fn actuate(
+        &mut self,
+        torque_cmd: &mut Input<TorqueCmd>,
+        mtq_cmd: &mut Input<MtqCmd>,
+    ) -> (V3, V3, V3) {
         let torque_b: V3 = match torque_cmd.latest() {
             Ok(Some(cmd)) => cmd.torque_b,
             _ => V3::zeros(),
@@ -365,105 +414,164 @@ impl PlantState {
             Ok(Some(cmd)) => cmd.dipole_b,
             _ => V3::zeros(),
         };
+        // Project the commanded torque onto each wheel's axis to form its set point; the
+        // `torque` fields come back as the reaction delivered to the body.
         for wheel in &mut self.wheels {
             wheel.torque_set_point = wheel.axis.dot(&torque_b) * wheel.axis;
             wheel.update();
         }
-        let rw_torque_b: V3 = self
+        let rw_torque_b = self
             .wheels
             .iter()
             .fold(V3::zeros(), |acc, w| acc + w.torque);
-        let h_w_b: V3 = self
+        let h_w_b = self
             .wheels
             .iter()
             .fold(V3::zeros(), |acc, w| acc + w.ang_momentum);
+        (rw_torque_b, h_w_b, dipole_b)
+    }
 
-        // Sample the sensors off the CURRENT body (cube-sat samples before integrating).
+    /// Samples the sensor suite off the CURRENT body (cube-sat samples before integrating):
+    /// the gyro with its bias walk, the six FOV-clamped CSS heads, the Tesla-valued
+    /// magnetometer, and the GPS measurement under its error model.
+    fn sense(&mut self, now: Timestamp) -> Sample {
         let q_b_eci = self.body.pos.angular();
         let q_eci_b = q_b_eci.inverse();
-        // Gyro: ECI rate brought into the body frame, plus a slow bias walk.
         let omega_b_true = q_eci_b * self.body.vel.angular();
-        let meas_sigma = self.params.meas_sigma;
-        self.bias = self.bias + self.noise(meas_sigma * 1e-2);
-        let gyro_b = omega_b_true + self.bias + self.noise(meas_sigma);
-        // The true ECI environment at this epoch/position: the real sun direction (nox-frames
-        // Vallado model) and the NOAA WMM magnetic field, both at the deterministic target epoch.
+        let gyro_b = self.gyro(omega_b_true);
+
+        // The true ECI environment at this epoch/position: the real sun direction
+        // (nox-frames Vallado model) and the NOAA WMM field.
         let epoch = epoch_at(self.t_sim);
         let pos_eci = self.body.pos.linear();
         let vel_eci = self.body.vel.linear();
         let sun_eci = sun_dir_eci(epoch);
         let mag_eci = mag_field_eci(&mut self.mag_model, epoch, &pos_eci);
-        let illuminated = !in_earth_shadow(&pos_eci, &sun_eci);
-        // Log the eclipse edges only: entering shadow darkens the CSS heads and drops SRP.
+        let illuminated = self.log_shadow_edges(!in_earth_shadow(&pos_eci, &sun_eci));
+
+        // The magnetometer reads the physical field (Tesla) — real magnetometers measure
+        // magnitude, and the desat law downstream needs |B|.
+        let css = self.css((q_eci_b * sun_eci).normalize(), illuminated);
+        let mag_b_true = q_eci_b * mag_eci;
+        let mag_b = mag_b_true + self.noise(MAG_SENSOR_SIGMA);
+
+        Sample {
+            q_b_eci,
+            omega_b_true,
+            pos_eci,
+            vel_eci,
+            sun_eci,
+            mag_eci,
+            mag_b_true,
+            illuminated,
+            sensors: Sensors {
+                timestamp: now,
+                gyro_b,
+                css,
+                mag_b,
+            },
+            gps: self.gps_fix(now, epoch, &pos_eci, &vel_eci),
+        }
+    }
+
+    /// The gyro reading: the true body rate under a slow bias walk and white noise.
+    fn gyro(&mut self, omega_b_true: V3) -> V3 {
+        let sigma = self.params.meas_sigma;
+        self.bias = self.bias + self.noise(sigma * 1e-2);
+        omega_b_true + self.bias + self.noise(sigma)
+    }
+
+    /// The six CSS head readings, each with its own noise floor on top of the head's
+    /// FOV-clamped cosine response.
+    fn css(&mut self, sun_b_true: V3, illuminated: bool) -> [f64; 6] {
+        let sigma = self.params.meas_sigma;
+        let mut css = css_readings(&sun_b_true, illuminated);
+        for reading in &mut css {
+            *reading += self.noise1(sigma);
+        }
+        css
+    }
+
+    /// The GPS measurement: the true orbit state corrupted by the receiver's error model —
+    /// a first-order Gauss-Markov position error and white velocity noise. Its RNG draws
+    /// come AFTER the sensor draws so the sensor noise stays byte-identical regardless of
+    /// this model.
+    fn gps_fix(&mut self, now: Timestamp, epoch: Epoch, pos_eci: &V3, vel_eci: &V3) -> Gps {
+        let phi = (-DT / GPS_TAU).exp();
+        let drive_sigma = GPS_POS_SIGMA * (1.0 - phi * phi).sqrt();
+        self.gps_pos_err = phi * self.gps_pos_err + self.noise(drive_sigma);
+        let pos = *pos_eci + self.gps_pos_err;
+        let vel = *vel_eci + self.noise(GPS_VEL_SIGMA);
+        // The receiver's geodetic fix, from the noisy position it measured. Deterministic —
+        // no RNG draws, so the sensor noise stream is untouched.
+        let (lat, lon, alt) = eci_to_geodetic(epoch, &pos);
+        Gps {
+            timestamp: now,
+            pos_eci: pos,
+            vel_eci: vel,
+            lla: V3::from_buf([lat.to_degrees(), lon.to_degrees(), alt]),
+        }
+    }
+
+    /// Logs the eclipse edges only: entering shadow darkens the CSS heads and drops SRP.
+    fn log_shadow_edges(&mut self, illuminated: bool) -> bool {
         match (self.was_illuminated, illuminated) {
             (Some(true), false) => tracing::info!(t_sim = self.t_sim, "entering Earth shadow"),
             (Some(false), true) => tracing::info!(t_sim = self.t_sim, "leaving Earth shadow"),
             _ => {}
         }
         self.was_illuminated = Some(illuminated);
-        // The six CSS heads (cosine response, FOV-clamped, dark in eclipse) each read their
-        // noise floor on top; the magnetometer reads the physical field (Tesla) — real
-        // magnetometers measure magnitude, and the desat law downstream needs |B|.
-        let sun_b_true = (q_eci_b * sun_eci).normalize();
-        let mut css = css_readings(&sun_b_true, illuminated);
-        for reading in &mut css {
-            *reading += self.noise1(meas_sigma);
-        }
-        let mag_b_true = q_eci_b * mag_eci;
-        let mag_b = mag_b_true + self.noise(MAG_SENSOR_SIGMA);
+        illuminated
+    }
 
-        // The GPS measurement: the true orbit state corrupted by the GPS error model. Position
-        // error is a first-order Gauss-Markov process (exponentially correlated); velocity error
-        // is white. These RNG draws come AFTER the sensor draws above so the sensor noise stays
-        // byte-identical regardless of the GPS model.
-        let gps_phi = (-DT / GPS_TAU).exp();
-        let gps_drive_sigma = GPS_POS_SIGMA * (1.0 - gps_phi * gps_phi).sqrt();
-        self.gps_pos_err = gps_phi * self.gps_pos_err + self.noise(gps_drive_sigma);
-        let gps_pos_eci = pos_eci + self.gps_pos_err;
-        let gps_vel_eci = vel_eci + self.noise(GPS_VEL_SIGMA);
-        // The receiver's geodetic fix, from the noisy position it actually measured.
-        // Deterministic — no RNG draws, so the sensor noise stream is untouched.
-        let (gps_lat, gps_lon, gps_alt) = eci_to_geodetic(epoch, &gps_pos_eci);
-
-        // The disturbance environment at the pre-step true state, and the magnetorquer
-        // torque (the commanded dipole clamped to the torquer's authority, crossed with the
-        // true field). All deterministic — no RNG draws.
+    /// The disturbance environment at the pre-step true state, and the magnetorquer torque
+    /// (the commanded dipole clamped to the torquer's authority, crossed with the true
+    /// field). All deterministic — no RNG draws.
+    fn environment(&self, s: &Sample, dipole_b: V3) -> (DisturbanceTorques, V3) {
         let d = disturbance_torques(
             &self.params,
-            &q_b_eci,
-            &pos_eci,
-            &vel_eci,
-            &sun_eci,
-            &mag_eci,
-            illuminated,
+            &s.q_b_eci,
+            &s.pos_eci,
+            &s.vel_eci,
+            &s.sun_eci,
+            &s.mag_eci,
+            s.illuminated,
         );
-        let mtq_torque_b = clamp_dipole(dipole_b, self.params.mtq_max_dipole).cross(&mag_b_true);
+        let mtq_torque_b = clamp_dipole(dipole_b, self.params.mtq_max_dipole).cross(&s.mag_b_true);
+        (d, mtq_torque_b)
+    }
 
-        let _ = sensors.write(&Sensors {
-            timestamp: now,
-            gyro_b,
-            css,
-            mag_b,
-        });
-        let _ = gps.write(&Gps {
-            timestamp: now,
-            pos_eci: gps_pos_eci,
-            vel_eci: gps_vel_eci,
-            lla: V3::from_buf([gps_lat.to_degrees(), gps_lon.to_degrees(), gps_alt]),
-        });
-        let _ = world.write(&World::new(now, sun_eci, mag_eci, illuminated));
-        // Per-wheel telemetry — the wheels themselves, the same structs the plant integrates.
+    /// Writes the measurements, the environment, the wheels, the truth frame and the
+    /// disturbance breakdown.
+    fn telemeter(
+        &self,
+        now: Timestamp,
+        s: &Sample,
+        d: &DisturbanceTorques,
+        mtq_torque_b: V3,
+        ports: Ports<'_>,
+    ) {
+        let Ports {
+            sensors,
+            gps,
+            wheels,
+            body,
+            world,
+            disturb,
+        } = ports;
+        let _ = sensors.write(&s.sensors);
+        let _ = gps.write(&s.gps);
+        let _ = world.write(&World::new(now, s.sun_eci, s.mag_eci, s.illuminated));
         let _ = wheels.write(&Wheels {
             timestamp: now,
             wheels: self.wheels,
         });
-        // The ground-truth body state: attitude + rate (truth) and the orbit (GPS) together.
         let _ = body.write(&BodyState {
             timestamp: now,
-            q_b_eci,
-            omega_b: omega_b_true,
-            pos_eci,
-            vel_eci,
+            q_b_eci: s.q_b_eci,
+            omega_b: s.omega_b_true,
+            pos_eci: s.pos_eci,
+            vel_eci: s.vel_eci,
         });
         let _ = disturb.write(&Disturbances {
             timestamp: now,
@@ -474,9 +582,11 @@ impl PlantState {
             mtq_b: mtq_torque_b,
             total_b: d.total_b(),
         });
+    }
 
-        // Integrate the body forward one step under everything applied this cycle. The
-        // coupling momentum is centered on the step midpoint (see `propagate`).
+    /// Integrates the body one step under everything applied this cycle. The coupling
+    /// momentum is centered on the step midpoint (see `propagate`).
+    fn integrate(&mut self, rw_torque_b: V3, h_w_b: V3, d: &DisturbanceTorques, mtq_torque_b: V3) {
         let tau_body = rw_torque_b + d.total_b() + mtq_torque_b;
         let h_w_mid = h_w_b + rw_torque_b * (DT / 2.0);
         self.body = propagate(self.body.clone(), tau_body, h_w_mid, d.aero_force_eci);
