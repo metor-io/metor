@@ -59,3 +59,129 @@ fn test_missing_target_returns_error() {
         "{message}"
     );
 }
+
+/// A deployment of two empty targets, written into a temp dir.
+fn two_targets(dir: &Path, body: &str) -> std::path::PathBuf {
+    let target = dir.join("deploy.py");
+    std::fs::write(
+        &target,
+        format!(
+            "from metor_config import Deployment, Target\n\
+             a = Target(cycle_rate=1000.0, namespace=\"a\")\n\
+             b = Target(cycle_rate=1000.0, namespace=\"b\")\n\
+             {body}\n\
+             Deployment(targets=[a, b])\n"
+        ),
+    )
+    .expect("writes");
+    target
+}
+
+#[test]
+fn test_deployment_runs_every_target_as_a_child() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let target = two_targets(dir.path(), "");
+    let output = metor()
+        .args(["run", &target.display().to_string(), "--cycles", "3"])
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.is_empty(), "a clean target prints nothing: {stderr}");
+}
+
+/// A system's log lines stay on its log port; what a child prints is its
+/// own CLI's last word, which the parent prefixes with the child's name.
+#[test]
+fn test_every_child_is_prefixed() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack");
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let target = two_targets(
+        dir.path(),
+        "from echo_pack import Boom\na.add(\"boom\", Boom())\nb.add(\"boom\", Boom())",
+    );
+    let output = metor()
+        .args(["run", &target.display().to_string(), "--cycles", "5"])
+        .env("PYTHONPATH", fixture.join(".metor"))
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let failed = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("metor: these targets did not exit cleanly: "))
+        .unwrap_or_default();
+    assert!(failed.contains('a') && failed.contains('b'), "{stderr}");
+    assert!(
+        stderr.contains("a │ metor: these systems latched off: boom")
+            || stderr.contains("b │ metor: these systems latched off: boom"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_latched_child_fails_the_deployment() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack");
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let target = two_targets(
+        dir.path(),
+        "from echo_pack import Boom\nb.add(\"boom\", Boom())",
+    );
+    let output = metor()
+        .args(["run", &target.display().to_string(), "--cycles", "5"])
+        .env("PYTHONPATH", fixture.join(".metor"))
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("did not exit cleanly: b"), "{stderr}");
+    assert!(
+        stderr.contains("b │ metor: these systems latched off: boom"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_print_ports_needs_one_target() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let target = two_targets(dir.path(), "");
+    let output = metor()
+        .args([
+            "run",
+            &target.display().to_string(),
+            "--cycles",
+            "1",
+            "--print-ports",
+        ])
+        .output()
+        .expect("metor runs");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--print-ports") && stderr.contains("--target"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_select_target_runs_in_process() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let target = two_targets(dir.path(), "");
+    let output = metor()
+        .args([
+            "run",
+            &target.display().to_string(),
+            "--cycles",
+            "2",
+            "--target",
+            "b",
+        ])
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("│"),
+        "no prefix for an in-process target: {stderr}"
+    );
+}

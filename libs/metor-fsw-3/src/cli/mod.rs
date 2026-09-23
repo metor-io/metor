@@ -3,6 +3,7 @@
 
 pub mod build;
 pub mod cargo;
+pub mod children;
 pub mod config;
 pub mod module;
 pub mod pack_dev;

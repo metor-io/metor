@@ -65,12 +65,22 @@ pub enum RunError {
     SimDt(f64),
     #[error("these systems latched off: {0}")]
     Latched(String),
+    #[error("these targets did not exit cleanly: {0}")]
+    Children(String),
+    #[error("--print-ports names one target's links; pick one with --target")]
+    PrintPortsNeedsTarget,
 }
 
 /// Refreshes every dev pack, evaluates the target, and cycles until stopped.
 pub fn run(args: Run) -> Result<(), RunError> {
     install_logging();
     let config = prepare(args.target.as_deref())?;
+    if config.targets.len() > 1 && args.member.is_none() {
+        if args.print_ports {
+            return Err(RunError::PrintPortsNeedsTarget);
+        }
+        return run_children(&config, &args);
+    }
     let member = config.target(args.member.as_deref())?;
     let coordinator = load(&config.targets[member], &args)?;
     if args.print_ports {
@@ -90,6 +100,27 @@ pub fn run(args: Run) -> Result<(), RunError> {
         return Ok(());
     }
     Err(RunError::Latched(latched.join(", ")))
+}
+
+/// Writes the resolved envelope to a temp file and runs every target from it
+/// as a child, until all have exited.
+fn run_children(config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
+    let path = std::env::temp_dir().join(format!("metor-deploy-{}.json", std::process::id()));
+    std::fs::write(
+        &path,
+        serde_json::to_vec(config).map_err(ConfigError::Decode)?,
+    )?;
+    watch_sigint();
+    let spawned: std::io::Result<Vec<_>> = config
+        .namespaces()
+        .into_iter()
+        .map(|namespace| super::children::spawn(&path, namespace, args))
+        .collect();
+    let result = spawned.map_err(RunError::Spawn).and_then(|children| {
+        super::children::wait_all(children).map_err(|failed| RunError::Children(failed.join(", ")))
+    });
+    let _ = std::fs::remove_file(&path);
+    result
 }
 
 /// Writes every bound link address to stdout, for a caller that asked a link to
