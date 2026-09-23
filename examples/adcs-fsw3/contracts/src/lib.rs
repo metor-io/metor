@@ -364,9 +364,9 @@ pub struct Wheels {
 
 /// The true **world** (inertial/ECI) environment at the spacecraft each cycle: the sun
 /// direction and the magnetic field the attitude sensors observe. Produced by the plant (which
-/// knows the true epoch + position). Truth telemetry only — nav no longer consumes it (it
-/// models its own references from the GPS position), so this is what makes the real ECI
-/// sun/field visible in the panel next to nav's noisy estimate.
+/// knows the true epoch + position). Truth telemetry only: nav models its own references
+/// from the GPS position, so this is what shows the real ECI sun/field in the panel next to
+/// nav's estimate.
 #[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[repr(C)]
 #[frame(name = "world")]

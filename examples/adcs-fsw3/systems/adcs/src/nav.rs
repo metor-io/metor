@@ -23,8 +23,7 @@ use nox::tensor;
 /// body axis j is `reading(+j) − reading(−j)` (at most one of the pair is lit, the other is
 /// FOV-clamped and its noise floor cancels in expectation). `None` when no head clears
 /// [`CSS_THRESHOLD`] — the sun is lost (eclipse), which is the FSW's own call from its
-/// sensor, not modeled shadow. This is the reconstruction cube-sat's FSW skipped
-/// (`sun_vec: sun_pos_b // TODO: do this more legit` — this is the legit version).
+/// sensor, not modeled shadow.
 pub fn sun_from_css(css: &[f64; 6]) -> Option<V3> {
     if css.iter().all(|r| *r < CSS_THRESHOLD) {
         return None;
