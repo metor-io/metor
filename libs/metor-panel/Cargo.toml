@@ -15,6 +15,7 @@ regex = "1"
 metor-db.path = "../db"
 metor-proto.path = "../metor-proto"
 metor-proto.features = ["std", "facet"]
+const-fnv1a-hash = "1.1.0"
 metor-proto-wkt.path = "../metor-proto/wkt"
 metor-proto-wkt.features = ["nox"]
 # mDNS/DNS-SD browsing: discover fsw links on the local network by name.

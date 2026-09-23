@@ -864,7 +864,11 @@ impl TileGroup {
             let flex_before_pair: f32 = axis.flexes[..left].iter().sum();
             let flex_sum: f32 = axis.flexes.iter().sum();
 
-            let target_left = (ratio * flex_sum - flex_before_pair).clamp(0.05, pair_flex - 0.05);
+            // Saved layouts can hold a pair thinner than two minimum panes;
+            // split what there is rather than let the bounds cross.
+            let min_flex = 0.05f32.min(pair_flex / 2.0);
+            let target_left =
+                (ratio * flex_sum - flex_before_pair).clamp(min_flex, pair_flex - min_flex);
             let target_right = pair_flex - target_left;
 
             axis.flexes[left] = target_left;

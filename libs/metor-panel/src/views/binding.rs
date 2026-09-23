@@ -148,14 +148,9 @@ where
     F: Fn(&mut E, ComponentMeta, &mut Context<E>) + Send + 'static,
 {
     cx.spawn(async move |this, cx| {
-        loop {
-            if db.with_state(|state| state.get_component(component_id).is_some()) {
-                let meta = component_meta(&db, component_id);
-                let _ = this.update(cx, |view, cx| apply(view, meta, cx));
-                break;
-            }
-            db.vtable_gen.wait().await;
-        }
+        crate::wait_for_component(&db, component_id).await;
+        let meta = component_meta(&db, component_id);
+        let _ = this.update(cx, |view, cx| apply(view, meta, cx));
     })
 }
 

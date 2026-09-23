@@ -9708,6 +9708,7 @@ dependencies = [
  "bevy 0.19.0-dev",
  "bytemuck",
  "cocoa 0.26.1",
+ "const-fnv1a-hash",
  "crossbeam-channel",
  "dirs 5.0.1",
  "facet",

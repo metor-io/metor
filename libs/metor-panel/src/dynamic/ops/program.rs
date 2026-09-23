@@ -62,10 +62,10 @@ impl Compiled {
         let system = &self.manifest.systems[index];
         hash_id(op_tag::EXPR_SYSTEM, ports, |h| {
             use std::hash::Hash;
-            self.hash_declaration(system.source, system.layout.span, h);
+            self.hash_declaration(system.source, Some(system.layout.span), h);
             for &dependency in &system.dependencies {
                 let function = &self.manifest.functions[dependency];
-                self.hash_declaration(function.source, Default::default(), h);
+                self.hash_declaration(function.source, None, h);
             }
             let mut descriptor = system.clone();
             descriptor.source = Default::default();
@@ -80,23 +80,23 @@ impl Compiled {
     fn hash_declaration(
         &self,
         source: metor_expr::Span,
-        ignored: metor_expr::Span,
+        ignored: Option<metor_expr::Span>,
         h: &mut impl std::hash::Hasher,
     ) {
         use std::hash::Hash;
-        let start = source.start as usize;
-        let end = source.end as usize;
-        let ignored_start = ignored.start as usize;
-        let ignored_end = ignored.end as usize;
+        let (start, end) = (source.start as usize, source.end as usize);
         let Some(region) = self.source.get(start..end) else {
             self.source.hash(h);
             return;
         };
-        if start <= ignored_start && ignored_start <= ignored_end && ignored_end <= end {
-            self.source[start..ignored_start].hash(h);
-            self.source[ignored_end..end].hash(h);
-        } else {
-            region.hash(h);
+        match ignored.map(|span| (span.start as usize, span.end as usize)) {
+            Some((skip_start, skip_end))
+                if start <= skip_start && skip_start <= skip_end && skip_end <= end =>
+            {
+                self.source[start..skip_start].hash(h);
+                self.source[skip_end..end].hash(h);
+            }
+            _ => region.hash(h),
         }
     }
 }

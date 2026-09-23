@@ -89,7 +89,9 @@ pub fn save_preset(name: &str, json: &str) -> io::Result<PathBuf> {
         .chars()
         .map(|c| if matches!(c, '/' | '\\') { '_' } else { c })
         .collect();
-    let already_has_ext = safe.len() >= 5 && safe[safe.len() - 5..].eq_ignore_ascii_case(".json");
+    let already_has_ext = Path::new(&safe)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
     let file_name = if already_has_ext {
         safe
     } else {

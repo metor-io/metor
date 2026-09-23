@@ -543,6 +543,7 @@ impl OutlineDelegate {
     fn spawn_watcher(db: Arc<DB>, cx: &mut Context<Table<Self>>) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
+                let seen = db.vtable_gen.latest();
                 let tree = build_tree(&db);
                 let result = this.update(cx, |table, cx| {
                     let delegate = table.delegate_mut();
@@ -552,7 +553,7 @@ impl OutlineDelegate {
                 if result.is_err() {
                     break;
                 }
-                db.vtable_gen.wait().await;
+                crate::vtable_changed(&db, seen).await;
                 cx.background_executor().timer(VTABLE_DEBOUNCE).await;
             }
         })

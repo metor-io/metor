@@ -113,21 +113,14 @@ impl Monitor {
             let db = db.clone();
             let sparkline = sparkline.clone();
             async move |_this, cx| {
-                loop {
-                    let comp = db.with_state(|state| state.get_component(component_id).cloned());
-                    if let Some(comp) = comp {
-                        let element_count: usize = comp.schema.dim.iter().product::<usize>().max(1);
-                        let _ = sparkline.update(cx, |sp, cx| {
-                            if element_count != sp.trace_count() {
-                                let traces =
-                                    build_traces(component_id, element_count, &line_colors);
-                                sp.bind_traces(traces, cx);
-                            }
-                        });
-                        break;
+                let comp = crate::wait_for_component(&db, component_id).await;
+                let element_count: usize = comp.schema.dim.iter().product::<usize>().max(1);
+                let _ = sparkline.update(cx, |sp, cx| {
+                    if element_count != sp.trace_count() {
+                        let traces = build_traces(component_id, element_count, &line_colors);
+                        sp.bind_traces(traces, cx);
                     }
-                    db.vtable_gen.wait().await;
-                }
+                });
             }
         });
 
