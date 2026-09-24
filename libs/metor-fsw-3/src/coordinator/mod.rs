@@ -30,9 +30,9 @@ pub use error::BuildError;
 pub use params::{ParamError, Params};
 pub(crate) use run::{Stepped, catch_step, message_of as panic_message};
 pub use status::SystemStatus;
-pub use step::{End, LoadError, Step};
-pub(crate) use table::TableEntry;
+pub use step::{End, LoadError, Occupant, Step};
 pub use table::{MakeCx, SystemTable};
+pub(crate) use table::{MakeFn, TableEntry};
 
 /// One bound system and the status port the coordinator owns for it.
 struct Entry {

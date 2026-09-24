@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use metor_fsw_3_ring::{NoWake, RingBuffer};
 use serde_json::value::RawValue;
@@ -60,7 +60,7 @@ pub(crate) struct TableEntry {
     pub doc: Cow<'static, str>,
     /// The JSON Schema of the type's params, `None` when it takes none.
     pub schema: Option<Box<RawValue>>,
-    pub make: Box<MakeFn>,
+    pub make: Arc<MakeFn>,
 }
 
 impl TableEntry {
@@ -257,7 +257,7 @@ fn entry<S: System + 'static>(
         def_fn: Box::new(S::def),
         doc,
         schema,
-        make: Box::new(move |cx| {
+        make: Arc::new(move |cx| {
             if let Some(Adapter::Thread(thread)) = cx.adapter {
                 return Err(ParamError::Thread {
                     thread: thread.clone(),
@@ -309,13 +309,13 @@ where
     A: AsyncSystem + 'static,
     M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
 {
-    let make = std::sync::Arc::new(make);
+    let make = Arc::new(make);
     Ok(TableEntry {
         def: A::def(&DefCx::empty())?,
         def_fn: Box::new(A::def),
         doc,
         schema,
-        make: Box::new(move |cx| crate::thread::place::<A, M>(make.clone(), cx)),
+        make: Arc::new(move |cx| crate::thread::place::<A, M>(make.clone(), cx)),
     })
 }
 

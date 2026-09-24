@@ -232,7 +232,7 @@ impl SystemTable {
                 }),
                 doc: system.doc.clone(),
                 schema: system.params.clone(),
-                make: Box::new(move |cx| {
+                make: std::sync::Arc::new(move |cx| {
                     let params = serde_json::to_vec(cx.params.0)
                         .map_err(|e| ParamError::Decode(e.to_string()))?;
                     // The instance def, so the pack binds the ports the host

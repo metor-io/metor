@@ -406,7 +406,7 @@ fn bind_rings(
             .iter()
             .map(|edges| edges.iter().map(|&ring| &rings[ring]).collect())
             .collect();
-        let step = (system.entry.make)(MakeCx {
+        let cx = MakeCx {
             id: system.id,
             adapter: system.adapter,
             def: &system.def,
@@ -414,7 +414,11 @@ fn bind_rings(
             inputs,
             outputs,
             threads,
-        })
+        };
+        let step = match system.adapter {
+            Some(Adapter::Channel(_)) => crate::channel::make(&system.entry.make, cx),
+            _ => (system.entry.make)(cx),
+        }
         .map_err(|source| build_error(system.id, source))?;
         entries.push(Entry {
             name: system.id.to_string(),

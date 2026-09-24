@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 
+use metor_component::{FrameBytes, FrameStr};
 use metor_proto::types::Timestamp;
 
 use super::params::ParamError;
@@ -22,6 +23,22 @@ pub trait Step {
     fn load(&mut self, _name: &str) -> Result<(), LoadError> {
         Err(LoadError::NotLoadable)
     }
+
+    /// What this step has loaded, if it loads anything.
+    fn occupant(&self) -> Option<&Occupant> {
+        None
+    }
+}
+
+/// One loaded system, as a channel's status reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Occupant {
+    /// Its index among the names the step can load.
+    pub index: u32,
+    /// Its library's file name.
+    pub artifact: FrameStr<64>,
+    /// The blake3 of its library.
+    pub hash: FrameBytes<32>,
 }
 
 /// How a step ended.

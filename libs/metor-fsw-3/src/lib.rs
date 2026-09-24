@@ -116,8 +116,8 @@ pub use async_system::{AsyncSystem, Stop};
 pub use channel::{Abort, AbortRequest, ChannelState, ChannelStatus};
 pub use coordinator::{
     Adapter, BuildError, ChannelConfig, Clock, Coordinator, CoordinatorConfig, End, InputConfig,
-    LoadError, OutputConfig, OutputSource, ParamError, Params, PeerLink, PeerPort, PortRef,
-    RunState, Step, SystemConfig, SystemStatus, SystemTable,
+    LoadError, Occupant, OutputConfig, OutputSource, ParamError, Params, PeerLink, PeerPort,
+    PortRef, RunState, Step, SystemConfig, SystemStatus, SystemTable,
 };
 pub use def::{DefCx, DefError, Records};
 pub use dl::{DlStep, Pack, PackError, PackFns};

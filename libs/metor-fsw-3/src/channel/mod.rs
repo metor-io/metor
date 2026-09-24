@@ -4,6 +4,8 @@
 //! how a system hears an abort, and [`ChannelStatus`] is the state a channel
 //! reports each cycle.
 
+mod adapter;
+mod apply;
 mod records;
 
 use metor_fsw_3_ring::{NoWake, WakeSink};
@@ -20,6 +22,16 @@ pub struct AbortRequest {}
 
 /// The port an abort arrives on, whatever the parameter is called.
 pub const ABORT_PORT: &str = "abort";
+/// The input a channel reads its commands from.
+pub const COMMANDS_PORT: &str = "commands";
+/// The output a channel reports each accepted or refused command on.
+pub const EVENTS_PORT: &str = "events";
+/// The output a channel writes its [`ChannelStatus`] to each cycle.
+pub const STATUS_PORT: &str = "channel_status";
+
+pub use adapter::Channel;
+pub(crate) use adapter::{def, make};
+pub use apply::{Command, Refusal, State, apply};
 
 /// Whether an abort has been asked for, read from the system's `abort` input.
 pub struct Abort<W: WakeSink = NoWake> {

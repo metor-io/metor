@@ -93,6 +93,9 @@ pub enum BuildError {
     #[error("channel `{name}` is named by two systems")]
     DuplicateChannel { name: String },
 
+    #[error("port `{id}.{port}` is reserved for the channel adapter")]
+    ReservedChannelPort { id: String, port: String },
+
     #[error("thread `{thread}` failed to start")]
     ThreadStart { thread: String },
 
