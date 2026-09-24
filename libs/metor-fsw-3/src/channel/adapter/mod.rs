@@ -15,7 +15,7 @@ use crate::coordinator::{
 use crate::def::DefCx;
 use crate::port::{Input, Output, ring_capacity};
 use crate::record::Record;
-use crate::system::SystemDef;
+use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
 use crate::{FrameBytes, FrameStr};
 
@@ -48,6 +48,16 @@ pub(crate) fn def(mut inner: SystemDef, cx: &DefCx<'_>) -> Result<SystemDef, Str
         .outputs
         .push(Output::<ChannelStatus>::def(cx, STATUS_PORT));
     Ok(inner)
+}
+
+/// The ports every channel adds, under the empty context.
+pub(crate) fn ports() -> [PortDef; 3] {
+    let cx = DefCx::empty();
+    [
+        Input::<SequenceCommand>::def(&cx, COMMANDS_PORT),
+        Output::<SequenceChannelEvent>::def(&cx, EVENTS_PORT),
+        Output::<ChannelStatus>::def(&cx, STATUS_PORT),
+    ]
 }
 
 /// Makes the system `make` builds, wrapped in its channel.

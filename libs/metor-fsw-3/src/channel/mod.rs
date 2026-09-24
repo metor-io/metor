@@ -31,7 +31,7 @@ pub const EVENTS_PORT: &str = "events";
 pub const STATUS_PORT: &str = "channel_status";
 
 pub use adapter::Channel;
-pub(crate) use adapter::{def, make};
+pub(crate) use adapter::{def, make, ports};
 pub use apply::{Command, Refusal, State, apply};
 pub use registry::{ChannelSpec, Registry, RegistryParams, channel_registry};
 

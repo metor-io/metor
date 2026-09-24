@@ -26,6 +26,9 @@ use super::step::Step;
 static STATUS: LazyLock<PortDef> =
     LazyLock::new(|| crate::Output::<super::SystemStatus>::def(&DefCx::empty(), "status"));
 
+/// The ports a channel adds to whatever system it wraps.
+static CHANNEL: LazyLock<[PortDef; 3]> = LazyLock::new(crate::channel::ports);
+
 /// Arguments for constructing a system using [`MakeFn`].
 pub struct MakeCx<'a> {
     pub id: &'a str,
@@ -185,10 +188,11 @@ impl SystemTable {
         self.entries.iter().map(|(ty, entry)| (ty.as_str(), entry))
     }
 
-    /// Every record the registered ports and the implicit status port declare.
+    /// Every record the registered ports and the implicit status and channel ports declare.
     pub(crate) fn records(&self) -> Records {
         Records::of(
             core::iter::once(&*STATUS)
+                .chain(CHANNEL.iter())
                 .chain(self.entries().flat_map(|(_, entry)| ports(&entry.def))),
         )
     }
@@ -389,6 +393,9 @@ mod tests {
         let mut table = SystemTable::new();
         assert_eq!(record(&table, "status"), Some(STATUS.clone()));
         assert!(record(&table, "missing").is_none());
+        for port in CHANNEL.iter() {
+            assert_eq!(record(&table, &port.record), Some(port.clone()));
+        }
         let first = Output::<Imu>::def(&DefCx::empty(), "first");
         let mut second = first.clone();
         second.name = "second".into();
