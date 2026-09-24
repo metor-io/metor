@@ -84,6 +84,42 @@
 //! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
 //!
+//! An `async fn` under `#[sequence]` is polled once per cycle instead, and
+//! returns when its steps are done. Its [`Seq`] handle reads the cycle's
+//! time and waits in cycle time; an abort ends any wait with
+//! [`SeqError::Aborted`].
+//!
+//! ```
+//! # use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+//! # use metor_fsw_3::{Frame, Timestamp};
+//! # #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+//! # #[repr(C)]
+//! # struct Gps {
+//! #     #[frame(timestamp)]
+//! #     timestamp: Timestamp,
+//! #     pos: [f64; 3],
+//! # }
+//! use core::time::Duration;
+//! use metor_fsw_3::{Input, Output, Seq, SeqError, SystemTable, sequence};
+//!
+//! /// Waits for a fix, then publishes the origin for one second.
+//! #[sequence]
+//! async fn hold(seq: &Seq, gps: &mut Input<Gps>, out: &mut Output<Gps>) -> Result<(), SeqError> {
+//!     seq.wait_for(Duration::from_secs(5), || gps.latest().is_ok_and(|f| f.is_some()))
+//!         .await?;
+//!     let _ = out.write(&Gps { timestamp: seq.now(), pos: [0.0; 3] });
+//!     seq.sleep(Duration::from_secs(1)).await
+//! }
+//!
+//! let mut table = SystemTable::new();
+//! table.register_sequence("hold", hold(), Default::default)?;
+//! # Ok::<(), metor_fsw_3::BuildError>(())
+//! ```
+//!
+//! `channel=` in a system's config wraps it in the [`channel`] adapter, which
+//! starts, stops, resets, aborts, and loads it on `SequenceCommand`s; a
+//! [`dl`] slot loads pack systems into one place in the schedule.
+//!
 //! The built-in [`link`] systems, `Publish` and `Subscribe`, are async
 //! systems with config-listed ports; they carry a target's records over
 //! metor-proto to whoever connects, and its commands back.

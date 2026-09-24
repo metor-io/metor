@@ -652,6 +652,88 @@ Integration, in `tests/`:
 - A `SequenceCommand` sent over `Subscribe` from a test client stops and
   resets a channel end to end under `metor run`.
 
+## Shipped deviations
+
+Config and ABI:
+
+- serde's `flatten` over an `Option<Adapter>` took one key silently when a
+  config named both, so a small `adapter_keys` serializer spells the two
+  keys and refuses a config with both.
+- `Coordinator::latched()` stays, as the panicked subset of `ended()`.
+  `metor run` fails on it, so a sequence that completes does not fail a
+  run.
+- An ended step is kept, not dropped; only an unwind drops it. A `DlStep`
+  or `Thread` whose system panicked lives until the coordinator drops.
+- `End::Unloaded` has no status word; `Status::of_end` sends it as
+  `Failed`. Only the host-side slot reports it.
+
+Records:
+
+- Record names are snake_case (`sequence_command`,
+  `sequence_channel_event`, `sequence_registry`), following `log`. The
+  packet ids come from the schema name and match the wkt ids.
+- `MAX_LEN` is a constant, so the registry's is a fixed 16 KiB, and
+  `ChannelRegistry` refuses params that encode past it.
+- `ChannelStatus::hash` is a `FrameBytes<32>`: one `U8` component of shape
+  `[32]`. A plain `[u8; 32]` becomes 32 components.
+- The table's known records include the three a channel adds, beside
+  `status`, so a `Subscribe` of `SequenceCommand` resolves.
+
+Channel adapter:
+
+- `abort` stays an input on the outer definition, and config edges into
+  it are refused. The adapter then rebuilds the inner port list by
+  popping what it appended.
+- `apply` returns `Result<(), Refusal>`; an accepted transition is the
+  command itself, so there is no `Transition` enum.
+- An accepted `Abort` emits `Progress { detail: "abort requested" }`,
+  because the wire has no abort-requested event and a cyclic system may
+  never end.
+- `Reset` emits `Loaded { name }`, with the last loaded name or the
+  instance id. Every `LoadError` emits `Refused`. A failed re-make emits
+  `Failed` once.
+- `Channel::ended()` is always `None`: the coordinator skips ended steps,
+  and a channel must read its commands after its system ends.
+
+Sequences:
+
+- `#[sequence]` refuses an `Abort` parameter; the step already declares
+  `abort`, and `seq.aborted()` and the waits cover it.
+- The return check is a path ending in `Result`; another error type
+  fails at the generated `call`.
+- `next_cycle` counts polls, not timestamps.
+- A failed sequence writes a `kind=failed` fault line, which is how a
+  pack's host sees the reason behind status word 4.
+
+Slots and the store:
+
+- `DlSlot::load` recomputes a candidate's ports under the slot's id and
+  params only, and compares them by name and record. A candidate whose
+  ports come from dynamic config inputs is refused at load; `metor
+  build` checks with the full context.
+- The slot pass opens each candidate from its pack directory, so the
+  build process maps the library there as well as from the store.
+- A candidate is resolved when it has `path`, `hash`, and `def` and no
+  `pack`, which makes the pass idempotent.
+- Generated pack modules hide every `abort` input, a cyclic `Abort`
+  parameter's too, since only a channel feeds it.
+
+Python and tests:
+
+- A `DlSlot` names each candidate by its type, and takes its inputs as
+  keywords of the first candidate's; a candidate with inputs of its own
+  is refused.
+- `start` is emitted even when it is `running`.
+- `ChannelRegistry` writes every `round(cycle_rate)` cycles, once a
+  second under a wall clock.
+- The end-to-end test is `tests/sequences.rs`, over
+  `tests/fixtures/echo-pack/slot.py`. It checks `channel_status` through
+  its announced metadata (the artifact is a string), not by decoding the
+  table. A `Publish` does not replay the registry to a late client; the
+  test reads the next rewrite.
+- `Target.add` returns the system's own type, so a type checker does not
+  see a channel's `events` and `channel_status` on the handle.
+
 ## Decisions
 
 Settled 2026-09-23.

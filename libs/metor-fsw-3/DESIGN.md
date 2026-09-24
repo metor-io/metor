@@ -235,12 +235,33 @@ Thus far we've been dancing around what a system actually is. Broadly there are 
 
 Each of these types of systems has a different adapter that allows it to be run by metor-fsw. Each of these adapters features a stable ABI. Broadly each of these ABIs are very similar, though may be subtetly differnet to account for the specifics of the binary type
 
+### Channels
+
+A channel is a name that addresses one system from outside the target, the name a `SequenceCommand` carries. `fsw.add(.., channel="mode")` wraps a cyclic system in the channel adapter, a step that reads the system's commands and applies them:
+
+- `Stop` stops executing the system, and `Start` resumes it where it stopped.
+- `Reset` drops the system and makes it again from its config, over the same rings.
+- `Abort` asks the system to finish. It arrives as a record on the system's `abort` input, which only the adapter feeds, so it crosses a pack boundary like any other ring.
+- `Load` replaces what the system runs, for a system that can load (a slot, below).
+
+The adapter adds three ports to the system: a `commands` input, an `events` output that reports each accepted or refused command and how the system ended, and a `channel_status` frame written every cycle. `fsw.commands(..)` wires one source of commands into every channel, and a `ChannelRegistry` publishes every channel of the target. Async systems take no channel.
+
+```python
+cmds = fsw.add("cmds", Subscribe([SequenceCommand], listen="0.0.0.0:2241"))
+fsw.commands(cmds.sequence_command)
+nav = fsw.add("nav", Nav(imu=plant.imu), channel="nav")
+registry = fsw.add("channels", ChannelRegistry())
+```
+
 ### Slots
 
-Occasionally we might want to swap what system is running at runtime. That is what slots are for. Slots allow you to swap what system is running at runtime. This is primarily used for "sequence" style systems.
+Occasionally we might want to swap what system is running at runtime. That is what slots are for. A `DlSlot` is one place in the schedule that loads one of the pack systems it allows when its channel receives `Load`. Every allowed system has the first one's ports; `metor build` checks that, copies each library into a store under the hash of its bytes, and writes the stored path and hash into the slot's config. A `Load` hashes the library again, opens it, checks its ports, and creates it over the slot's rings. A rebuilt pack is a new hash and a new path, so it never replaces a library a running process has mapped.
 
+```python
+mode = fsw.add("mode", DlSlot(allow=[Commissioning(), SafeMode()], attitude=nav.est), channel="mode")
+```
 
-Slots can also be aborted and stopped at runtime. An abort is a form of graceful shutdown where the system is notified that it needs to shutdown, and it has a chance to gracefully exit. Stop simply no longer executes the system.
+The slot's `channel_status` names what it has loaded: its index in the registry, its library's file name, and the library's hash.
 
 ### Sequences
 
@@ -263,24 +284,20 @@ One way to think of this sequence is a state machine that moves through the, pow
 ```rust
 #[sequence]
 async fn arm_controls(
-    motor_power_en: &[Output<MotorEn>],
-    motor_arm: &[Output<MotorArm>],
-    motor_health: &[Input<MotorHealth>]
-    control_arm: Output<ControlArm>) {
-    for motor in motors_arm {
-        motor.publish(true);
-    }
-    wait_for(|| motor_health.all(|motor| motor.latest() == true), 1.0).await;
-    for motor in motors_arm {
-        motor.publish(true);
-    }
-    sleep(Duration::from_millis(500)).await;
-    control.publish(true);
+    seq: &Seq,
+    motor_en: &mut Output<MotorEn>,
+    motor_health: &mut Input<MotorHealth>,
+    control_arm: &mut Output<ControlArm>,
+) -> Result<(), SeqError> {
+    let _ = motor_en.write(&MotorEn { timestamp: seq.now(), on: true });
+    seq.wait_for(Duration::from_secs(1), || healthy(motor_health)).await?;
+    seq.sleep(Duration::from_millis(500)).await?;
+    let _ = control_arm.write(&ControlArm { timestamp: seq.now(), armed: true });
+    Ok(())
 }
 ```
 
-In the above example the Future returned by the async function will be polled each cycle. When it reaches a sleep it won't continue until the elapsed time exceeds the specified duration. A wait_for will re-call the closure each cycle until it returns true
-
+The future the function returns is polled once per cycle. `seq` is the sequence's handle: `now()` is the cycle's time, `sleep` resolves once that much cycle time has passed, and `wait_for` checks its predicate every cycle until it holds or times out. An abort makes `sleep` and `wait_for` return `SeqError::Aborted`, so `?` ends the sequence. Every sequence has an `abort` input, and a sequence given a channel can be started, stopped, reset, and aborted like any other system, or loaded into a slot from a pack.
 
 ### ABI
 
