@@ -4,6 +4,7 @@
 
 mod error;
 mod index;
+mod slot;
 
 use std::collections::HashMap;
 
@@ -16,6 +17,7 @@ use crate::record::RecordSchema;
 
 pub use error::DeployError;
 use index::{At, DefIndex};
+pub use slot::resolve_slots;
 
 /// Default peer host, for a target the deployment places nowhere.
 pub const LOOPBACK: &str = "127.0.0.1";
@@ -41,17 +43,19 @@ pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Resul
     check_ports(envelope)
 }
 
-/// Whether anything in `envelope` still refers to a peer.
+/// Whether anything in `envelope` still refers to a peer or a slot
+/// candidate's pack.
 pub fn unresolved(envelope: &DeploymentConfig) -> bool {
-    envelope.targets.iter().any(|target| {
-        target.coordinator.systems.iter().any(|system| {
-            peer_link(system.params.get("transport")).is_some()
-                || system
-                    .outputs
-                    .iter()
-                    .any(|output| matches!(output.source, OutputSource::Peer(_)))
+    slot::unresolved(envelope)
+        || envelope.targets.iter().any(|target| {
+            target.coordinator.systems.iter().any(|system| {
+                peer_link(system.params.get("transport")).is_some()
+                    || system
+                        .outputs
+                        .iter()
+                        .any(|output| matches!(output.source, OutputSource::Peer(_)))
+            })
         })
-    })
 }
 
 struct Plan {

@@ -3,7 +3,35 @@
 
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Where a library landed in the store, and the hash that named it.
+pub struct Stored {
+    pub path: PathBuf,
+    pub hash: blake3::Hash,
+}
+
+/// The store beside a target file's directory.
+pub fn dir(target_dir: &Path) -> PathBuf {
+    target_dir.join(".metor").join("store")
+}
+
+/// Copies `artifact` into `store` under its hash, unless those bytes are
+/// already there. A stored file is never rewritten, so a library another
+/// process has mapped keeps its inode.
+pub fn put(store: &Path, artifact: &Path) -> io::Result<Stored> {
+    let hash = hash(artifact)?;
+    let name = artifact
+        .file_name()
+        .ok_or_else(|| io::Error::other(format!("`{}` names no file", artifact.display())))?;
+    let dir = store.join(hash.to_hex().as_str());
+    let path = dir.join(name);
+    if !path.exists() {
+        std::fs::create_dir_all(&dir)?;
+        crate::cli::cargo::copy_atomic(artifact, &path)?;
+    }
+    Ok(Stored { path, hash })
+}
 
 /// The blake3 of the file at `path`.
 pub fn hash(path: &Path) -> io::Result<blake3::Hash> {
@@ -40,6 +68,48 @@ mod tests {
     fn test_hash_missing_file_errors() {
         let dir = tempfile::tempdir().expect("a temp dir");
         assert!(hash(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn test_put_same_bytes_once() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = dir.path().join("store");
+        let artifact = dir.path().join("libup.so");
+        std::fs::write(&artifact, b"one").expect("writes");
+        let first = put(&store, &artifact).expect("stores");
+        assert_eq!(first.hash, blake3::hash(b"one"));
+        assert!(
+            first
+                .path
+                .starts_with(store.join(first.hash.to_hex().as_str()))
+        );
+        assert_eq!(std::fs::read(&first.path).expect("reads"), b"one");
+        let modified = std::fs::metadata(&first.path).and_then(|m| m.modified());
+
+        let again = put(&store, &artifact).expect("stores");
+        assert_eq!(again.path, first.path);
+        let unchanged = std::fs::metadata(&again.path).and_then(|m| m.modified());
+        assert_eq!(unchanged.ok(), modified.ok());
+    }
+
+    #[test]
+    fn test_put_new_bytes_new_path() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = dir.path().join("store");
+        let artifact = dir.path().join("libup.so");
+        std::fs::write(&artifact, b"one").expect("writes");
+        let first = put(&store, &artifact).expect("stores");
+        std::fs::write(&artifact, b"two").expect("writes");
+        let second = put(&store, &artifact).expect("stores");
+        assert_ne!(first.path, second.path);
+        assert_eq!(std::fs::read(&first.path).expect("reads"), b"one");
+        assert!(contains(&store, &second.path));
+    }
+
+    #[test]
+    fn test_put_missing_artifact_errors() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        assert!(put(&dir.path().join("store"), &dir.path().join("missing")).is_err());
     }
 
     #[test]

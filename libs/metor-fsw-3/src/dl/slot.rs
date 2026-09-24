@@ -264,7 +264,7 @@ impl Step for DlSlot {
 
 /// Whether two definitions have the same ports in the same order, carrying
 /// the same records, wherever their names are rooted.
-fn same_ports(a: &SystemDef, b: &SystemDef) -> bool {
+pub(crate) fn same_ports(a: &SystemDef, b: &SystemDef) -> bool {
     same_list(&a.inputs, &b.inputs) && same_list(&a.outputs, &b.outputs)
 }
 

@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use metor_fsw_3::cli::cargo::cargo_build;
+use metor_fsw_3::cli::cargo::{cargo_build, cdylib_name, triple};
+use metor_fsw_3::cli::config::{CONFIG_VERSION, DeploymentConfig, TargetConfig};
+use metor_fsw_3::deploy::{self, DeployError};
 use metor_fsw_3::dl::store;
 use metor_fsw_3::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
@@ -357,4 +359,125 @@ fn test_unresolved_slot_refused() {
         panic!("an unresolved slot is refused")
     };
     assert!(error.to_string().contains("metor build"), "{error}");
+}
+
+/// A pack reference whose libs directory holds a copy of the fixture.
+fn pack_ref(libs: &Path) -> Value {
+    let dir = libs.join(triple());
+    std::fs::create_dir_all(&dir).expect("creates");
+    std::fs::copy(fixture(), dir.join(cdylib_name("echo_pack"))).expect("copies");
+    json!({ "id": "echo", "lib": "echo_pack", "libs": libs })
+}
+
+/// A candidate as Python emits it: a pack reference, no path, hash, or ports.
+fn unresolved(name: &str, ty: &str, libs: &Path) -> Value {
+    json!({ "name": name, "ty": ty, "pack": pack_ref(libs) })
+}
+
+fn envelope(allow: Vec<Value>) -> DeploymentConfig {
+    DeploymentConfig {
+        config_version: CONFIG_VERSION,
+        hosts: Default::default(),
+        targets: vec![TargetConfig {
+            packs: Vec::new(),
+            coordinator: config(json!({ "allow": allow }), channel()),
+        }],
+    }
+}
+
+fn slot(envelope: &DeploymentConfig) -> &Value {
+    &envelope.targets[0].coordinator.systems[2].params
+}
+
+#[test]
+fn test_build_resolves_into_store() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    let seen = Shared::default();
+    let allow = vec![
+        unresolved("up", "count_up", &libs),
+        unresolved("down", "count_down", &libs),
+    ];
+    let mut envelope = envelope(allow);
+    assert!(deploy::unresolved(&envelope));
+    deploy::resolve_slots(&mut envelope, &[table(&seen)], &store).expect("resolves");
+    assert!(!deploy::unresolved(&envelope));
+
+    let params = slot(&envelope);
+    assert_eq!(params["store"], json!(store));
+    let hash = store::hash(fixture()).expect("reads");
+    for candidate in params["allow"].as_array().expect("a list") {
+        assert!(candidate.get("pack").is_none());
+        assert_eq!(candidate["hash"], json!(hash.to_hex().as_str()));
+        let path = PathBuf::from(candidate["path"].as_str().expect("a path"));
+        assert!(store::contains(&store, &path), "{}", path.display());
+        assert!(candidate["def"].is_object());
+    }
+
+    // Resolving again changes nothing.
+    let before = params.clone();
+    deploy::resolve_slots(&mut envelope, &[table(&seen)], &store).expect("resolves");
+    assert_eq!(*slot(&envelope), before);
+
+    let mut coordinator = envelope.targets[0]
+        .coordinator
+        .clone()
+        .build(&table(&seen))
+        .expect("the resolved slot builds");
+    send(&seen, &mut coordinator, [load("up")]);
+    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
+    let events = run(&seen, &mut coordinator, 4);
+    assert_eq!(events, [SequenceEventKind::Completed]);
+}
+
+#[test]
+fn test_build_refuses_disagreeing_candidates() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let libs = dir.path().join("libs");
+    let mut gain = unresolved("gain", "gain", &libs);
+    gain["params"] = json!({ "gain": 2.0 });
+    let mut envelope = envelope(vec![unresolved("up", "count_up", &libs), gain]);
+    let result = deploy::resolve_slots(&mut envelope, &[table(&Shared::default())], dir.path());
+    let Err(DeployError::SlotContract {
+        first, candidate, ..
+    }) = result
+    else {
+        panic!("gain's ports differ from count_up's: {result:?}")
+    };
+    assert_eq!((first.as_str(), candidate.as_str()), ("up", "gain"));
+}
+
+#[test]
+fn test_build_refuses_missing_pack() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut missing = unresolved("up", "count_up", &dir.path().join("libs"));
+    missing["pack"]["libs"] = json!(dir.path().join("nowhere"));
+    let mut missing = envelope(vec![missing]);
+    let result = deploy::resolve_slots(&mut missing, &[table(&Shared::default())], dir.path());
+    assert!(
+        matches!(result, Err(DeployError::Slot { .. })),
+        "{result:?}"
+    );
+    let mut bare = envelope(vec![json!({ "name": "up", "ty": "count_up" })]);
+    let result = deploy::resolve_slots(&mut bare, &[table(&Shared::default())], dir.path());
+    assert!(
+        matches!(result, Err(DeployError::Slot { .. })),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_build_refuses_long_library_name() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut long = unresolved("up", "count_up", &dir.path().join("libs"));
+    long["pack"]["lib"] = json!("l".repeat(64));
+    let result = deploy::resolve_slots(
+        &mut envelope(vec![long]),
+        &[table(&Shared::default())],
+        dir.path(),
+    );
+    assert!(
+        matches!(result, Err(DeployError::ArtifactName { cap: 63, .. })),
+        "{result:?}"
+    );
 }
