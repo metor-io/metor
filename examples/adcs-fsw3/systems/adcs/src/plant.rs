@@ -1,23 +1,13 @@
-//! The rigid-body **plant** of the `adcs-fsw3` target. It propagates a real orbit — a
-//! 400 km sun-synchronous one by default, gravity + drag — and the full Euler attitude
-//! dynamics — including the gyroscopic coupling
-//! of the stored reaction-wheel momentum — under the environmental disturbance torques a
-//! small spacecraft actually lives on (gravity gradient, aero drag about the CP–CG offset,
-//! residual magnetic dipole, SRP), driven by two actuators: three reaction wheels (bearing
-//! friction + momentum-saturation foldback, both inside the dynamics) and three
-//! magnetorquers (`τ = m × B`, the desat / detumble authority).
+//! The simulated spacecraft.
 //!
-//! Each cycle it steps the wheels under the commanded control torque, samples the simulated
-//! sensor suite (gyro, six coarse-sun-sensor heads — dark in Earth shadow — and a
-//! Tesla-valued magnetometer reading the NOAA WMM field), emits the noisy `gps` measurement
-//! the flight software flies on (a Gauss-Markov position error + white velocity noise), the
-//! wheel and disturbance telemetry, the true `world` environment (including the
-//! illumination truth flag), and the `body` truth frame the host taps to measure
-//! convergence — then integrates the body one step (`six_dof_rk4`, body-fixed torques
-//! rotated per substep, the wheel-momentum coupling `−ω_b × h_w` evaluated per substep).
+//! Each cycle the plant steps the wheels under the last torque command, samples
+//! its sensors from the state at the start of the cycle, writes telemetry, and
+//! integrates the body one step. All noise comes from one seeded RNG, so a seed
+//! reproduces a run exactly.
 //!
-//! [`PlantState::new`] takes the params; the `#[system]` block's `execute`
-//! signature is the port set.
+//! The GPS position error follows a first-order Gauss-Markov process because
+//! ionospheric and ephemeris errors vary slowly. Velocity error from Doppler
+//! tracking is nearly uncorrelated, so it is white.
 
 use adcs_contracts::{
     BodyState, DT, Disturbances, EARTH_RADIUS, Epoch, Gps, MASS, MU, MagneticModel, MtqCmd,
@@ -30,37 +20,24 @@ use nox::{
     Body, Quaternion, SpatialForce, SpatialInertia, SpatialMotion, SpatialTransform, six_dof_rk4,
     tensor,
 };
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
 
-// --- The plant's own physics --------------------------------------------------
-// Simulation math and its tuning live here, with the system that integrates them; the
-// contract carries only the wire shapes and the actuator envelope both sides agree on
-// (RW_TORQUE_MAX / RW_MOMENTUM_MAX / MTQ_MAX_DIPOLE).
-
-// GPS error model (first-order Gauss-Markov position, white velocity): the "good" basic GPS
-// model (Brown & Hwang) — position error is dominated by slowly-varying iono/ephemeris terms,
-// so it is exponentially correlated rather than white; velocity from Doppler/carrier is far
-// less correlated, so it is white. Spaceborne single-frequency SPS figures.
-
-/// GPS position error 1-sigma per axis (m) — the Gauss-Markov steady-state.
+/// Steady-state GPS position error 1σ per axis (m).
 pub const GPS_POS_SIGMA: f64 = 5.0;
-/// GPS position-error correlation time (s) — the Gauss-Markov time constant.
+/// GPS position error correlation time (s).
 pub const GPS_TAU: f64 = 100.0;
-/// GPS velocity error 1-sigma per axis (m/s), modeled as white noise.
+/// GPS velocity error 1σ per axis (m/s).
 pub const GPS_VEL_SIGMA: f64 = 0.05;
 
-/// Magnetometer noise 1-sigma per axis (Tesla) — the sensor reads the physical field, so its
-/// noise is physical too (~150 nT against a ~25–45 µT field at 400 km).
+/// Magnetometer noise 1σ per axis (T), against a field of 25 to 45 µT at 400 km.
 pub const MAG_SENSOR_SIGMA: f64 = 150e-9;
 
 /// Solar radiation pressure at 1 AU (N/m²).
 pub const P_SRP: f64 = 4.56e-6;
 
-/// The six CSS head normals, one photodiode per body face in the frame's documented order
-/// `[+X, +Y, +Z, −X, −Y, −Z]` (cube-sat's arrangement). Six orthogonal 90° cones cover the
-/// full sphere, so sun availability reduces to illumination.
+/// Sun sensor head normals, in [`Sensors::css`] order. Six orthogonal 90° cones
+/// cover the sphere, so some head sees the sun whenever the spacecraft is lit.
 const CSS_NORMALS: [[f64; 3]; 6] = [
     [1.0, 0.0, 0.0],
     [0.0, 1.0, 0.0],
@@ -70,9 +47,7 @@ const CSS_NORMALS: [[f64; 3]; 6] = [
     [0.0, 0.0, -1.0],
 ];
 
-/// The noiseless CSS head readings for a true body-frame sun direction: per head the cosine
-/// response `n̂·ŝ_b`, clamped at zero (the 90° half-angle FOV) and gated by illumination —
-/// an eclipsed head reads nothing. The plant adds each head's noise floor on top.
+/// Returns the noiseless sun sensor readings for a body-frame sun direction.
 pub fn css_readings(sun_b: &V3, illuminated: bool) -> [f64; 6] {
     let lit = if illuminated { 1.0 } else { 0.0 };
     CSS_NORMALS.map(|n| {
@@ -81,31 +56,28 @@ pub fn css_readings(sun_b: &V3, illuminated: bool) -> [f64; 6] {
     })
 }
 
-/// Wheel rotor moment of inertia (kg·m²): a 185 g disc of 5 cm diameter.
+/// Wheel rotor inertia (kg·m²), a 185 g disc 5 cm across.
 pub const RW_MOI: f64 = 0.185 * (0.05 / 2.0) * (0.05 / 2.0) / 2.0;
-/// Coulomb bearing friction (N·m). The cube-sat's 5e-4 was telemetry-only; fed into the
-/// dynamics it (with its viscous partner) would cap the wheel near 40 rad/s — 17× below the
-/// ~692 rad/s saturation speed — so both coefficients are retuned to bearing-realistic values.
+/// Coulomb bearing friction (N·m).
 pub const RW_COULOMB: f64 = 1.0e-5;
 /// Viscous bearing friction (N·m·s/rad).
 pub const RW_VISCOUS: f64 = 1.0e-7;
-/// Stiction deadband (rad/s): below this speed friction holds the wheel at rest instead of
-/// chattering across zero (`signum(0)` would otherwise apply a phantom torque at rest).
+/// Speed (rad/s) below which friction holds the wheel still instead of chattering
+/// across zero.
 pub const RW_STICTION_OMEGA: f64 = 1e-3;
 
-/// The wheel dynamics over the shared [`ReactionWheel`] telemetry struct (the struct is the
-/// wire contract and lives in `adcs-contracts`; how it evolves is this plant's physics).
+/// Reaction wheel physics.
 pub trait WheelDynamics {
-    /// The same wheel preloaded with `h` N·m·s of stored momentum along its axis — how the
-    /// desaturation tests/demos start with something to dump.
+    /// Returns the wheel preloaded with `h` N·m·s along its axis.
     fn with_momentum(self, h: f64) -> Self;
 
-    /// Advance the wheel one step. The motor drives against the commanded body torque
-    /// (`τm = −u`, clamped to ±[`RW_TORQUE_MAX`], zero when disarmed); bearing friction
-    /// opposes the spin (Coulomb + viscous, a stiction deadband at rest, and it may stop the
-    /// wheel within a step but never reverse it); the momentum-saturation foldback pins
-    /// `|s| ≤ RW_MOMENTUM_MAX` exactly while always letting unloading torque flow. The
-    /// reaction `−ḣ·axis` is what the body receives.
+    /// Advances the wheel one step.
+    ///
+    /// The motor torque is the negated set point, clamped to [`RW_TORQUE_MAX`] and
+    /// zero when disarmed. Friction can stop the wheel within a step but never
+    /// reverse it. Near [`RW_MOMENTUM_MAX`] the motor torque folds back so the
+    /// momentum lands exactly on the limit, while torque that unloads the wheel
+    /// always passes.
     fn update(&mut self);
 }
 
@@ -131,7 +103,7 @@ impl WheelDynamics for ReactionWheel {
             0.0
         } else {
             let f = -RW_COULOMB * omega.signum() - RW_VISCOUS * omega;
-            // Friction may stop the wheel within the step, never push it through zero.
+            // Stop at zero rather than reversing.
             if omega > 0.0 {
                 f.max(-s / DT)
             } else {
@@ -155,36 +127,33 @@ impl WheelDynamics for ReactionWheel {
     }
 }
 
-/// The disturbance torques at one true state, plus the drag force (which also perturbs the
-/// orbit). All torques in the body frame (N·m); the force in ECI (N).
+/// The disturbance torques at one state, with the drag force that also slows the orbit.
 pub struct DisturbanceTorques {
-    /// Gravity-gradient torque.
+    /// Gravity-gradient torque (N·m).
     pub gg_b: V3,
-    /// Aerodynamic drag torque about the CP–CG offset.
+    /// Drag torque (N·m).
     pub aero_b: V3,
-    /// Residual-magnetic-dipole torque `m_res × B`.
+    /// Residual dipole torque `m_res × B` (N·m).
     pub mag_b: V3,
-    /// Solar-radiation-pressure torque about the CP–CG offset.
+    /// Solar radiation pressure torque (N·m).
     pub srp_b: V3,
-    /// The drag force in ECI — fed into the translational dynamics.
+    /// Drag force (N).
     pub aero_force_eci: V3,
 }
 
 impl DisturbanceTorques {
-    /// The summed disturbance torque (excludes actuation — the MTQ torque is control).
+    /// Returns the sum of the torques.
     pub fn total_b(&self) -> V3 {
         self.gg_b + self.aero_b + self.mag_b + self.srp_b
     }
 }
 
-/// Evaluate the disturbance environment at a true state: attitude `q_b_eci`, ECI
-/// position/velocity, the sun direction, the **un-normalized** magnetic field (Tesla), and
-/// whether the spacecraft is illuminated. All deterministic — no RNG.
+/// Evaluates the disturbance torques at a true state, given the unnormalized field `mag_eci` (T).
 ///
 /// - Gravity gradient: `τ = (3μ/|r|³) · r̂_b × (I ∘ r̂_b)`.
-/// - Aero: `F = −½ρ·Cd·A·|v|·v` (co-rotating atmosphere ignored), `τ = r_cp × F_b`.
+/// - Drag: `F = −½ρ·Cd·A·|v|·v` against a still atmosphere, `τ = r_cp × F_b`.
 /// - Residual dipole: `τ = m_res × B_b`.
-/// - SRP: `F = −P·A·Cr·ŝ_b`, `τ = r_cp × F_b` — zero in Earth shadow.
+/// - Solar radiation pressure: `F = −P·A·Cr·ŝ_b`, `τ = r_cp × F_b`, zero in shadow.
 pub fn disturbance_torques(
     p: &PlantParams,
     q_b_eci: &Quat,
@@ -223,34 +192,26 @@ pub fn disturbance_torques(
     }
 }
 
-/// The rigid-body plant's state: an orbiting spacecraft whose attitude is driven by three
-/// reaction wheels and three magnetorquers against the disturbance environment, emitting a
-/// noisy sensor suite. The wheels are the shared [`ReactionWheel`] contract type — the same
-/// struct the `wheels` telemetry frame carries.
+/// The simulated spacecraft, its wheels, and its sensor models.
 pub struct PlantState {
     body: Body,
     wheels: [ReactionWheel; 3],
+    /// Gyro bias, a random walk.
     bias: V3,
     rng: StdRng,
-    /// Seconds of simulated FSW time (a deterministic per-cycle counter, not wall time)
-    /// — drives the epoch the real sun direction + WMM field are evaluated at.
+    /// Simulated seconds since boot, advanced one [`DT`] per cycle.
     t_sim: f64,
-    /// The NOAA WMM handle for the true magnetic field (built once — holds C-library state).
     mag_model: MagneticModel,
-    /// The GPS position error: a first-order Gauss-Markov (exponentially-correlated) state,
-    /// stepped each cycle and added to the true position to form the [`Gps`] measurement.
+    /// GPS position error, stepped each cycle.
     gps_pos_err: V3,
-    /// The full plant config — the sensor sigmas and the disturbance/actuator environment
-    /// ([`disturbance_torques`] reads it every cycle).
     params: PlantParams,
-    /// Whether the spacecraft was illuminated last cycle (`None` before the first), so the
-    /// shadow entry/exit transitions log once per edge.
+    /// Illumination last cycle, so each shadow edge logs once.
     was_illuminated: Option<bool>,
-    /// The zero-mean unit normal every sensor model draws from, built once.
+    /// The unit normal that every noise draw scales.
     unit_normal: Normal<f64>,
 }
 
-/// The ports one cycle's telemetry is written to.
+/// The ports one cycle's telemetry goes to.
 struct Ports<'a> {
     sensors: &'a mut Output<Sensors>,
     gps: &'a mut Output<Gps>,
@@ -260,16 +221,16 @@ struct Ports<'a> {
     disturb: &'a mut Output<Disturbances>,
 }
 
-/// One cycle's pre-step truth and what the sensors made of it.
+/// The true state at the start of a cycle and what the sensors measured.
 struct Sample {
     q_b_eci: Quat,
     omega_b_true: V3,
     pos_eci: V3,
     vel_eci: V3,
     sun_eci: V3,
-    /// The true field in ECI (Tesla), un-normalized.
+    /// True field (T), unnormalized.
     mag_eci: V3,
-    /// The same field in the body frame, which the magnetorquers act against.
+    /// True field in the body frame, which the magnetorquers act against.
     mag_b_true: V3,
     illuminated: bool,
     sensors: Sensors,
@@ -282,31 +243,27 @@ impl PlantState {
         tensor![x, y, z]
     }
 
-    /// One zero-mean draw at `sigma`, which is the unit normal scaled — what a `Normal` of
-    /// that sigma samples, without building one per draw.
+    /// Draws zero-mean noise with deviation `sigma`.
     fn noise1(&mut self, sigma: f64) -> f64 {
         sigma * self.unit_normal.sample(&mut self.rng)
     }
 }
 
-/// Point-mass Earth gravity force on `body`: `-MU·m / |r|³ · r`.
+/// Returns point-mass gravity on `body`, `-MU·m / |r|³ · r`.
 fn gravity(body: &Body) -> V3 {
     let r = body.pos.linear();
     let r_mag = r.norm().into_buf();
     r * (-MU * MASS / r_mag.powi(3))
 }
 
-/// Advance `body` one `DT` step: per-substep point-mass gravity plus a constant drag force
-/// on the orbit, and the body-fixed torque `tau_body_const` (wheel reaction + disturbances +
-/// MTQ — computed once at the pre-step state, but *rotated per RK4 substep* since it rides
-/// the body) with the wheel-momentum gyroscopic coupling `−ω_b × h_w_b` evaluated per
-/// substep. The body's own `ω × Iω` Euler term lives inside `six_dof_rk4`.
+/// Advances `body` one step under the body torque `tau_body_const`, gravity, and drag.
 ///
-/// `h_w_b` must be the wheel momentum at the **step midpoint** (the wheels update before the
-/// body steps, so that is `h_post + rw_torque_b·DT/2`): the wheels' momentum changes linearly
-/// across the step while the coupling holds it constant, and centering it cancels the
-/// first-order error — one-sided bookkeeping loses total angular momentum secularly.
-/// Free-standing so the plant's physics tests can drive it without the port harness.
+/// The torque rides with the body, so each RK4 substep rotates it by that
+/// substep's attitude and adds the wheel coupling `−ω_b × h_w_b`.
+///
+/// Pass `h_w_b` at the step midpoint. Wheel momentum changes linearly across the
+/// step while the coupling holds it constant, and centering it cancels the
+/// first-order error that would otherwise leak total angular momentum.
 pub fn propagate(body: Body, tau_body_const: V3, h_w_b: V3, f_drag_eci: V3) -> Body {
     six_dof_rk4(DT, body, move |b| {
         let q = b.pos.angular();
@@ -317,12 +274,7 @@ pub fn propagate(body: Body, tau_body_const: V3, h_w_b: V3, f_drag_eci: V3) -> B
 }
 
 impl PlantState {
-    /// Build the plant's state from its params: a circular orbit at `altitude`, in the
-    /// plane `inclination` and `ltan_hours` pick (sun-synchronous by default), booted
-    /// `init_orbit_phase` radians past the ascending node — phase zero is sunlit at the
-    /// default LTAN, and the eclipse tests crank the phase to start in Earth shadow — with
-    /// the body rotated `init_angle` about [1,1,1] from the (identity) reference and a
-    /// small initial tumble about the same axis.
+    /// Builds the plant from its params.
     pub fn new(p: PlantParams) -> PlantState {
         let radius = EARTH_RADIUS + p.altitude;
         let raan = raan_for_ltan(target_epoch(), p.ltan_hours);
@@ -366,41 +318,38 @@ impl PlantState {
 }
 
 #[system]
-impl PlantState {
-    /// One plant cycle: step the wheels, sample the sensors, write the telemetry, integrate.
-    #[allow(clippy::too_many_arguments)]
-    fn execute(
-        &mut self,
-        now: Timestamp,
-        torque_cmd: &mut Input<TorqueCmd>,
-        mtq_cmd: &mut Input<MtqCmd>,
-        sensors: &mut Output<Sensors>,
-        gps: &mut Output<Gps>,
-        wheels: &mut Output<Wheels>,
-        body: &mut Output<BodyState>,
-        world: &mut Output<World>,
-        disturb: &mut Output<Disturbances>,
-    ) {
-        let (rw_torque_b, h_w_b, dipole_b) = self.actuate(torque_cmd, mtq_cmd);
-        let sample = self.sense(now);
-        let (d, mtq_torque_b) = self.environment(&sample, dipole_b);
-        let ports = Ports {
-            sensors,
-            gps,
-            wheels,
-            body,
-            world,
-            disturb,
-        };
-        self.telemeter(now, &sample, &d, mtq_torque_b, ports);
-        self.integrate(rw_torque_b, h_w_b, &d, mtq_torque_b);
-    }
+/// Steps the wheels, samples the sensors, writes telemetry, and integrates the body.
+#[allow(clippy::too_many_arguments)]
+pub fn plant(
+    #[state] state: &mut PlantState,
+    now: Timestamp,
+    torque_cmd: &mut Input<TorqueCmd>,
+    mtq_cmd: &mut Input<MtqCmd>,
+    sensors: &mut Output<Sensors>,
+    gps: &mut Output<Gps>,
+    wheels: &mut Output<Wheels>,
+    body: &mut Output<BodyState>,
+    world: &mut Output<World>,
+    disturb: &mut Output<Disturbances>,
+) {
+    let (rw_torque_b, h_w_b, dipole_b) = state.actuate(torque_cmd, mtq_cmd);
+    let sample = state.sense(now);
+    let (d, mtq_torque_b) = state.environment(&sample, dipole_b);
+    let ports = Ports {
+        sensors,
+        gps,
+        wheels,
+        body,
+        world,
+        disturb,
+    };
+    state.telemeter(now, &sample, &d, mtq_torque_b, ports);
+    state.integrate(rw_torque_b, h_w_b, &d, mtq_torque_b);
 }
 
 impl PlantState {
-    /// Steps the wheels under the commanded body torque, returning their reaction torque and
-    /// stored momentum together with the commanded magnetorquer dipole. Either command is
-    /// zero until one arrives.
+    /// Steps the wheels under the torque command, returning their reaction torque,
+    /// their momentum, and the commanded dipole. A missing command counts as zero.
     fn actuate(
         &mut self,
         torque_cmd: &mut Input<TorqueCmd>,
@@ -414,8 +363,7 @@ impl PlantState {
             Ok(Some(cmd)) => cmd.dipole_b,
             _ => V3::zeros(),
         };
-        // Project the commanded torque onto each wheel's axis to form its set point; the
-        // `torque` fields come back as the reaction delivered to the body.
+        // Each wheel takes the command's component along its axis.
         for wheel in &mut self.wheels {
             wheel.torque_set_point = wheel.axis.dot(&torque_b) * wheel.axis;
             wheel.update();
@@ -431,17 +379,13 @@ impl PlantState {
         (rw_torque_b, h_w_b, dipole_b)
     }
 
-    /// Samples the sensor suite off the CURRENT body (cube-sat samples before integrating):
-    /// the gyro with its bias walk, the six FOV-clamped CSS heads, the Tesla-valued
-    /// magnetometer, and the GPS measurement under its error model.
+    /// Samples the sensors and the GPS receiver from the state at the start of the step.
     fn sense(&mut self, now: Timestamp) -> Sample {
         let q_b_eci = self.body.pos.angular();
         let q_eci_b = q_b_eci.inverse();
         let omega_b_true = q_eci_b * self.body.vel.angular();
         let gyro_b = self.gyro(omega_b_true);
 
-        // The true ECI environment at this epoch/position: the real sun direction
-        // (nox-frames Vallado model) and the NOAA WMM field.
         let epoch = epoch_at(self.t_sim);
         let pos_eci = self.body.pos.linear();
         let vel_eci = self.body.vel.linear();
@@ -449,9 +393,8 @@ impl PlantState {
         let mag_eci = mag_field_eci(&mut self.mag_model, epoch, &pos_eci);
         let illuminated = self.log_shadow_edges(!in_earth_shadow(&pos_eci, &sun_eci));
 
-        // The magnetometer reads the physical field (Tesla) — real magnetometers measure
-        // magnitude, and the desat law downstream needs |B|.
         let css = self.css((q_eci_b * sun_eci).normalize(), illuminated);
+        // Unnormalized, since the unloading law needs |B|.
         let mag_b_true = q_eci_b * mag_eci;
         let mag_b = mag_b_true + self.noise(MAG_SENSOR_SIGMA);
 
@@ -474,15 +417,14 @@ impl PlantState {
         }
     }
 
-    /// The gyro reading: the true body rate under a slow bias walk and white noise.
+    /// Returns the true body rate plus the bias and white noise.
     fn gyro(&mut self, omega_b_true: V3) -> V3 {
         let sigma = self.params.meas_sigma;
         self.bias = self.bias + self.noise(sigma * 1e-2);
         omega_b_true + self.bias + self.noise(sigma)
     }
 
-    /// The six CSS head readings, each with its own noise floor on top of the head's
-    /// FOV-clamped cosine response.
+    /// Returns the sun sensor readings with each head's noise added.
     fn css(&mut self, sun_b_true: V3, illuminated: bool) -> [f64; 6] {
         let sigma = self.params.meas_sigma;
         let mut css = css_readings(&sun_b_true, illuminated);
@@ -492,18 +434,13 @@ impl PlantState {
         css
     }
 
-    /// The GPS measurement: the true orbit state corrupted by the receiver's error model —
-    /// a first-order Gauss-Markov position error and white velocity noise. Its RNG draws
-    /// come AFTER the sensor draws so the sensor noise stays byte-identical regardless of
-    /// this model.
+    /// Returns a GPS fix of the true orbit state.
     fn gps_fix(&mut self, now: Timestamp, epoch: Epoch, pos_eci: &V3, vel_eci: &V3) -> Gps {
         let phi = (-DT / GPS_TAU).exp();
         let drive_sigma = GPS_POS_SIGMA * (1.0 - phi * phi).sqrt();
         self.gps_pos_err = phi * self.gps_pos_err + self.noise(drive_sigma);
         let pos = *pos_eci + self.gps_pos_err;
         let vel = *vel_eci + self.noise(GPS_VEL_SIGMA);
-        // The receiver's geodetic fix, from the noisy position it measured. Deterministic —
-        // no RNG draws, so the sensor noise stream is untouched.
         let (lat, lon, alt) = eci_to_geodetic(epoch, &pos);
         Gps {
             timestamp: now,
@@ -513,7 +450,7 @@ impl PlantState {
         }
     }
 
-    /// Logs the eclipse edges only: entering shadow darkens the CSS heads and drops SRP.
+    /// Logs each entry into and exit from Earth shadow, passing `illuminated` through.
     fn log_shadow_edges(&mut self, illuminated: bool) -> bool {
         match (self.was_illuminated, illuminated) {
             (Some(true), false) => tracing::info!(t_sim = self.t_sim, "entering Earth shadow"),
@@ -524,9 +461,7 @@ impl PlantState {
         illuminated
     }
 
-    /// The disturbance environment at the pre-step true state, and the magnetorquer torque
-    /// (the commanded dipole clamped to the torquer's authority, crossed with the true
-    /// field). All deterministic — no RNG draws.
+    /// Returns the disturbance torques and the magnetorquer torque at the start of the step.
     fn environment(&self, s: &Sample, dipole_b: V3) -> (DisturbanceTorques, V3) {
         let d = disturbance_torques(
             &self.params,
@@ -541,8 +476,7 @@ impl PlantState {
         (d, mtq_torque_b)
     }
 
-    /// Writes the measurements, the environment, the wheels, the truth frame and the
-    /// disturbance breakdown.
+    /// Writes the cycle's measurements and truth telemetry.
     fn telemeter(
         &self,
         now: Timestamp,
@@ -584,13 +518,11 @@ impl PlantState {
         });
     }
 
-    /// Integrates the body one step under everything applied this cycle. The coupling
-    /// momentum is centered on the step midpoint (see `propagate`).
+    /// Integrates the body one step under every applied torque.
     fn integrate(&mut self, rw_torque_b: V3, h_w_b: V3, d: &DisturbanceTorques, mtq_torque_b: V3) {
         let tau_body = rw_torque_b + d.total_b() + mtq_torque_b;
         let h_w_mid = h_w_b + rw_torque_b * (DT / 2.0);
         self.body = propagate(self.body.clone(), tau_body, h_w_mid, d.aero_force_eci);
-        // Advance the deterministic FSW clock (drives the sun epoch — never wall time).
         self.t_sim += DT;
     }
 }
@@ -617,11 +549,9 @@ mod tests {
         }
     }
 
-    /// The spin angular momentum `L_eci = q ⊛ (I∘ω_b + h_w)` with the wheels actively
-    /// slewing but disturbances/MTQ off: gravity is central (torque-free about the CoM), and
-    /// motor/friction torques are internal, so `L_eci` must be conserved. The drift bound is
-    /// set by the integrator (first-order quaternion update inside RK4) and by holding the
-    /// wheel exchange constant over each step — not by the dynamics.
+    /// Total angular momentum `q ⊛ (I∘ω_b + h_w)` holds while the wheels trade
+    /// momentum with the body. Gravity is central and wheel torques are internal, so
+    /// only integrator error moves it.
     #[test]
     fn total_angular_momentum_conserved_without_external_torque() {
         let mut body = orbit_body(0.0, tensor![0.05, -0.08, 0.06]);
@@ -642,7 +572,7 @@ mod tests {
         for k in 0..5000 {
             let t = k as f64 * DT;
             for (i, w) in wheels.iter_mut().enumerate() {
-                // Sinusoidal set points, out of phase per wheel — constant momentum exchange.
+                // Out-of-phase sinusoids keep every wheel trading momentum.
                 let u = RW_TORQUE_MAX * (0.5 * t + i as f64).sin();
                 w.torque_set_point = w.axis * u;
                 w.update();
@@ -657,19 +587,17 @@ mod tests {
         let l = l_eci(&body, &wheels);
         let drift: f64 = (l - l0).norm().into_buf();
         let l_mag: f64 = l0.norm().into_buf();
-        // Measured integrator truncation is ~1e-5 relative over this run (an equivalent
-        // parasitic torque of ~4e-10 N·m, three orders below the modeled disturbances); the
-        // bookkeeping errors this test guards against show up at percent level.
+        // Truncation drifts about 1e-5 relative over this run, like a 4e-10 N·m
+        // parasitic torque. Bookkeeping mistakes drift at the percent level.
         assert!(drift / l_mag < 5e-5, "L_eci drifted: {}", drift / l_mag);
     }
 
-    /// Driven at the full set point, the wheel pins **exactly** at `RW_MOMENTUM_MAX` (the
-    /// foldback lands on the limit rather than snapping torque to zero early), never exceeds
-    /// it, and an unloading command flows immediately from the pinned state.
+    /// A wheel driven at full torque pins exactly at the momentum limit, and
+    /// unloads on the next step once the command reverses.
     #[test]
     fn rw_saturation_clamps_at_limit_and_allows_unloading() {
         let mut w = ReactionWheel::new(tensor![1.0, 0.0, 0.0], true);
-        // A constant −X body-torque command spins the wheel up along +X.
+        // A −X body torque spins the wheel up along +X.
         w.torque_set_point = tensor![-RW_TORQUE_MAX, 0.0, 0.0];
         let mut pinned = 0;
         for _ in 0..5000 {
@@ -686,7 +614,6 @@ mod tests {
         assert!(pinned > 0, "wheel never reached the momentum limit");
         let t: f64 = w.torque.into_buf()[0];
         assert!(t.abs() < 1e-12, "pinned wheel still delivered torque: {t}");
-        // Reverse the command: unloading torque must flow on the very next step.
         w.torque_set_point = tensor![RW_TORQUE_MAX, 0.0, 0.0];
         w.update();
         let t: f64 = w.torque.into_buf()[0];
@@ -698,10 +625,8 @@ mod tests {
         assert!(s < RW_MOMENTUM_MAX, "momentum did not unload");
     }
 
-    /// With no motor command, bearing friction decays a preloaded wheel monotonically, stops
-    /// it without ever pushing it through zero into counter-rotation, and holds it frozen
-    /// inside the stiction deadband (regression for the unsigned-speed `signum` friction and
-    /// the phantom torque at rest).
+    /// Friction alone slows a spinning wheel to a stop without reversing it, then
+    /// holds it inside the stiction deadband.
     #[test]
     fn rw_friction_decays_signed_speed() {
         let mut w = ReactionWheel::new(tensor![0.0, 1.0, 0.0], true).with_momentum(0.001);
@@ -730,12 +655,10 @@ mod tests {
         );
     }
 
-    /// The disturbance model lands each source in its expected order-of-magnitude band at a
-    /// 400 km state with honest params — a units guard (ρ, Tesla, P_SRP, torque arms), like
-    /// contracts' WMM band test.
+    /// Each disturbance at 400 km falls in its expected order of magnitude, which
+    /// catches unit mistakes.
     #[test]
     fn disturbance_torques_sane_at_400km() {
-        // The target's honest environment.
         let p = PlantParams {
             init_angle: 0.0,
             init_rate: 0.0,
@@ -760,7 +683,7 @@ mod tests {
         let pos: V3 = tensor![radius, 0.0, 0.0];
         let v_orbit = (MU / radius).sqrt();
         let vel: V3 = tensor![0.0, v_orbit, 0.0];
-        // A generic attitude so nothing sits on a principal axis or parallel to the field.
+        // Off every principal axis and not parallel to the field.
         let q = Quat::from_axis_angle(tensor![1.0, 1.0, 1.0], 0.5);
         let epoch = adcs_contracts::target_epoch();
         let mut model = MagneticModel::default();
@@ -788,13 +711,12 @@ mod tests {
             (1e-11..1e-7).contains(&srp),
             "SRP torque out of band: {srp}"
         );
-        // Drag opposes the velocity.
         let drag_along_v: f64 = d.aero_force_eci.dot(&vel).into_buf();
         assert!(drag_along_v < 0.0, "drag force does not oppose velocity");
         let sum = d.gg_b + d.aero_b + d.mag_b + d.srp_b;
         assert!(mag_of(&(d.total_b() - sum)) == 0.0);
 
-        // In Earth shadow only SRP switches off; everything else is identical.
+        // Shadow switches off solar radiation pressure and nothing else.
         let dark = disturbance_torques(&p, &q, &pos, &vel, &sun_dir_eci(epoch), &mag, false);
         assert!(mag_of(&dark.srp_b) == 0.0, "SRP must vanish in shadow");
         assert!(mag_of(&(dark.gg_b - d.gg_b)) == 0.0);
@@ -802,12 +724,10 @@ mod tests {
         assert!(mag_of(&(dark.mag_b - d.mag_b)) == 0.0);
     }
 
-    /// The CSS head model: a face square to the sun reads ~1, the opposed face reads zero
-    /// (FOV clamp), an oblique sun spreads its cosine across the facing heads, and eclipse
-    /// darkens all six.
+    /// A head square to the sun reads 1, heads facing away read 0, an oblique sun
+    /// reads its direction cosines, and eclipse darkens every head.
     #[test]
     fn css_heads_read_cosine_fov_and_eclipse() {
-        // Sun along +X: head 0 (+X) reads 1, head 3 (−X) is FOV-clamped to 0.
         let sun_x: V3 = tensor![1.0, 0.0, 0.0];
         let r = css_readings(&sun_x, true);
         assert!(
@@ -822,7 +742,6 @@ mod tests {
             "perpendicular heads read zero"
         );
 
-        // An oblique sun: the three facing heads read its direction cosines.
         let sun: V3 = (tensor![1.0, 1.0, 1.0] as V3).normalize();
         let r = css_readings(&sun, true);
         let c = 1.0 / 3f64.sqrt();
@@ -831,21 +750,20 @@ mod tests {
         }
         assert_eq!([r[3], r[4], r[5]], [0.0; 3]);
 
-        // Eclipse: every head is dark regardless of geometry.
         assert_eq!(css_readings(&sun, false), [0.0; 6]);
     }
 
-    /// The B-cross detumble law closed on the true dynamics damps the field-perpendicular
-    /// rate component. Gain and torquer authority are cranked well above the target values
-    /// so the decay fits a test budget — the asserted property is the law's, not the gain's.
-    /// (The field-parallel component is untouchable per instant; an inclined orbit rotates
-    /// B̂ too slowly to matter over this window, so only ω_⊥ is asserted.)
+    /// The detumble law damps the body rate perpendicular to the field.
+    ///
+    /// The gain and dipole limit are ten times the defaults to keep the test short.
+    /// The orbit turns the field too slowly to reach the parallel component within
+    /// this window, so the test checks only the perpendicular one.
     #[test]
     fn detumble_law_damps_tumble() {
         let omega0: V3 = (tensor![1.0, 1.0, 1.0] as V3).normalize() * 0.1;
         let mut body = orbit_body(0.9, omega0);
         let mut mag_model = MagneticModel::default();
-        let k_detumble = 5e-4; // target default ×10
+        let k_detumble = 5e-4; // ten times the default
         let mtq_max = 10.0 * MTQ_MAX_DIPOLE;
         let mut t_sim = 0.0;
         let omega_perp = |body: &Body, mag_b: &V3| -> f64 {
@@ -857,8 +775,7 @@ mod tests {
         };
         let mut perp0 = None;
         let mut perp = f64::MAX;
-        // The WMM field varies on the orbit timescale, so re-evaluating it every cycle only
-        // slows the test — refresh it once per 100-step block (0.83 s of sim time).
+        // The field changes on the orbit timescale, so evaluate it every 100 steps.
         let mut mag_eci = V3::zeros();
         for k in 0..15_000 {
             let q = body.pos.angular();

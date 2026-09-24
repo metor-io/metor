@@ -7,9 +7,7 @@ publish = false
 description = "Shared frames, params, and physics for the adcs-fsw3 example"
 
 [dependencies]
-# `#[derive(Frame)]` expands to `metor_fsw_3::…`; the contracts never touch the host runtime.
 metor-fsw-3 = { path = "../../../libs/metor-fsw-3", default-features = false }
-# The standalone component derives on `ReactionWheel`, which is nested rather than a frame.
 metor-component = { workspace = true }
 nox = { workspace = true }
 nox-frames = { path = "../../../libs/nox-frames", features = ["earth"] }

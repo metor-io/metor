@@ -1,11 +1,8 @@
-//! The fixed **mode command** of the `adcs-fsw3` target: the phase and pointing
-//! law the controller flies, held for the whole run.
-
 use adcs_contracts::ModeCmd;
 use metor_fsw_3::{JsonSchema, Output, Timestamp, system};
 use serde::Deserialize;
 
-/// The commanded phase and law, both as their [`ModeCmd`] byte values.
+/// Configuration for the mode system, as [`ModeCmd`] byte values.
 #[derive(Deserialize, JsonSchema, Clone, Debug, PartialEq)]
 pub struct ModeParams {
     /// Target phase: `0` idle, `1` settling, `2` pointing, `3` safe, `4` detumble.
@@ -24,7 +21,7 @@ fn default_law() -> u8 {
     ModeCmd::LAW_NADIR
 }
 
-/// The commanded mode, written every cycle.
+/// The command the mode system writes every cycle.
 pub struct Mode(ModeCmd);
 
 impl Mode {
@@ -34,9 +31,7 @@ impl Mode {
 }
 
 #[system]
-impl Mode {
-    /// Writes the configured command, stamped with this cycle.
-    fn execute(&mut self, now: Timestamp, mode_cmd: &mut Output<ModeCmd>) {
-        let _ = mode_cmd.write(&self.0.stamped(now));
-    }
+/// Writes the configured command stamped `now`.
+pub fn mode(#[state] state: &mut Mode, now: Timestamp, mode_cmd: &mut Output<ModeCmd>) {
+    let _ = mode_cmd.write(&state.0.stamped(now));
 }

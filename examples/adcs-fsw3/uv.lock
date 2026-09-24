@@ -1,0 +1,28 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[[package]]
+name = "adcs-fsw3"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "adcs-pack" },
+    { name = "metor-config" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "adcs-pack", editable = "systems/adcs" },
+    { name = "metor-config", editable = "../../libs/metor-fsw-3/python/metor-config" },
+]
+
+[[package]]
+name = "adcs-pack"
+version = "0.1.0"
+source = { editable = "systems/adcs" }
+
+[[package]]
+name = "metor-config"
+version = "0.1.0"
+source = { editable = "../../libs/metor-fsw-3/python/metor-config" }

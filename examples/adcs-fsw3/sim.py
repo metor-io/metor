@@ -1,5 +1,5 @@
-"""The whole ADCS loop in one process: the plant, the filter, a fixed mode, and
-the controller, with the commands fed back through one-cycle loops."""
+"""Runs the whole ADCS loop in one process, feeding the controller's commands
+back to the plant one cycle late."""
 
 import math
 
@@ -30,8 +30,8 @@ plant = fsw.add(
         cr=1.5,
         mtq_max_dipole=0.2,
         init_wheel_h=0.0,
-        # A 400 km sun-synchronous orbit, ascending node at ~10:30 local solar
-        # time, so the boot is sunlit.
+        # A 400 km sun-synchronous orbit with the ascending node at 10:30 local
+        # solar time, which starts the run in sunlight.
         altitude=400e3,
         inclination=math.radians(97.03),
         ltan_hours=10.5,

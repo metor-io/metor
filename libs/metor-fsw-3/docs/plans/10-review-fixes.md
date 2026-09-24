@@ -111,31 +111,19 @@ within a bound.
 
 Files: `../db/src/lib.rs`, `src/link/db.rs`.
 
-metor-db gains a prepared ingestor:
+`DB::ingest_table` sinks a static table under the read lock, borrowing
+its vtable from the registry instead of cloning it, so the steady state
+allocates nothing. A dynamic table, which realizes members on first
+sample, keeps the write lock and the clone. Both walk the vtable through
+one `for_each_realized` and push each field through `Pushed::push`, so
+the network path and fsw-3 share one ingest. `Db::announce` keeps each
+frame port's table id; `ingest` calls `ingest_table` with it. Messages
+keep `push_msg`.
 
-```rust
-impl DB {
-    /// The components a registered table's fields land in, in field
-    /// order, so a caller pushes samples without the state lock.
-    pub fn table_ingestor(&self, id: PacketId) -> Result<TableIngestor, Error>;
-}
-pub struct TableIngestor { vtable: VTable, fields: Vec<Component> }
-impl TableIngestor {
-    pub fn push(&self, received: Timestamp, buf: &[u8]) -> Result<(), Error>;
-}
-```
-
-`push` walks the vtable's realized fields as `ingest_table` does, but
-each `push_buf` goes to the cloned `Component` (an `Arc`-backed handle)
-and `last_updated` is bumped through the `DB` handle the ingestor keeps.
-Dynamic tables, which create components on first sample, are refused
-by `table_ingestor` and keep `ingest_table`. `Db::announce` builds one
-ingestor per static frame port after `insert_vtable`; `ingest` pushes
-through it. Messages keep `push_msg`.
-
-Tests: in metor-db, an ingestor over a two-field table pushes into the
-same components `ingest_table` would and refuses a dynamic table; in
-fsw-3, the existing `Db` unit test passes through the ingestor.
+Tests: in metor-db, a static table lands in its components, bumps
+`vtable_gen` on first sample, and refuses an unknown id or a short
+buffer; in fsw-3, the existing `Db` unit test passes through
+`ingest_table`.
 
 ## T7. The ADCS example (findings 12, 13, 14, unwraps, plant split)
 

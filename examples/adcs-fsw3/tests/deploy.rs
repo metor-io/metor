@@ -1,5 +1,5 @@
-//! The deployment under `metor run`: the vehicle on `plant`, the flight
-//! software on `fsw`, and the gateway's db holding both.
+//! Runs `target.py` under `metor run` and checks that the gateway's db records
+//! both the plant and the flight software.
 
 use core::time::Duration;
 use std::net::{SocketAddr, TcpListener};
@@ -11,11 +11,11 @@ use std::time::Instant;
 use metor_proto_stellar::Client;
 use metor_proto_wkt::DumpMetadata;
 
-/// How long the test waits for the deployment before it fails.
+/// How long the test waits for the deployment.
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// Cycles each target runs before it exits on its own, which outlives this
-/// test and bounds what a killed run's children live on for.
+/// Cycles each target runs before exiting on its own. This outlasts the test
+/// and bounds how long the children of a killed test live.
 const CYCLES: &str = "200000";
 
 const PORTS_ENV: &str = "METOR_DEPLOY_PORTS";
@@ -24,8 +24,8 @@ fn target() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("target.py")
 }
 
-/// The `metor` binary beside this test, built on first use: the example holds
-/// no binary of its own, so cargo hands it no path.
+/// Returns a command for the `metor` binary, building it on first use. The
+/// example has no binary of its own, so cargo gives the test no path to it.
 fn metor() -> Command {
     static BUILT: OnceLock<PathBuf> = OnceLock::new();
     Command::new(BUILT.get_or_init(|| {
@@ -42,7 +42,7 @@ fn metor() -> Command {
     }))
 }
 
-/// Three ports nothing holds at the moment they are read.
+/// Returns three ports that were free when checked.
 fn free_ports() -> [u16; 3] {
     let held: Vec<TcpListener> = (0..3)
         .map(|_| TcpListener::bind("127.0.0.1:0").expect("a free port"))
@@ -54,7 +54,7 @@ fn free_ports() -> [u16; 3] {
     [ports[0], ports[1], ports[2]]
 }
 
-/// A `metor run` of the deployment, killed and reaped when it drops.
+/// A `metor run` of the deployment, killed and reaped on drop.
 struct Running(Child);
 
 impl Drop for Running {
@@ -88,8 +88,8 @@ async fn connect(addr: SocketAddr) -> Client {
     }
 }
 
-/// The gateway records both members: the vehicle's own gyro and the estimate
-/// the flight software derives from it, each under its producer's names.
+/// The gateway records the plant's gyro and the flight software's estimate,
+/// each under its own target's namespace.
 #[stellarator::test]
 async fn test_gateway_records_both_members() {
     let ports = free_ports();

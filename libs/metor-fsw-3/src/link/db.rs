@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_lite::future;
-use metor_db::{DB, Server, TableIngestor};
+use metor_db::{DB, Server};
 use metor_fsw_3_ring::Notifier;
 use metor_proto::types::{PacketId, Timestamp, table_id};
 use metor_proto_wkt::VTableMsg;
@@ -27,7 +27,7 @@ use super::wire;
 /// What a `Db` is configured with.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DbParams {
-    /// Where the store is served; a db listens, so `connect` is refused.
+    /// Where the db listens
     pub transport: Transport,
     /// The store's directory; unset, a fresh one under the temp dir.
     #[serde(default)]
@@ -195,18 +195,18 @@ async fn udp(addr: std::net::SocketAddr, db: Arc<DB>) {
     }
 }
 
-/// Where one port's records go: the components its table lands in, the id its
-/// messages carry, or nothing for a port the store refused.
+/// Where one port's records go: the table id its frames land under, the id
+/// its messages carry, or nothing for a port the store refused.
 enum Sink {
-    Table(TableIngestor),
+    Table(PacketId),
     Msg(PacketId),
     Refused,
 }
 
 /// Registers each port's vtable and metadata, or message metadata, with the
-/// store, and prepares the sink its records take. A frame whose table id the
+/// store, and picks the sink its records take. A frame whose table id the
 /// store already holds for another vtable is refused.
-fn announce(db: &Arc<DB>, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sink> {
+fn announce(db: &DB, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sink> {
     let mut sinks = Vec::new();
     for (def, _) in inputs.iter_mut() {
         sinks.push(match &def.schema {
@@ -238,19 +238,7 @@ fn announce(db: &Arc<DB>, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Ve
                         );
                     }
                 }
-                match db.table_ingestor(id) {
-                    Ok(ingestor) => Sink::Table(ingestor),
-                    Err(error) => {
-                        log.fault(
-                            "table_ingestor",
-                            format!(
-                                "port `{}` announces a table the store cannot prepare: {error}",
-                                def.name
-                            ),
-                        );
-                        Sink::Refused
-                    }
-                }
+                Sink::Table(id)
             }
             RecordSchema::Msg { id, name, codec } => {
                 let metadata = wire::msg_metadata(name, codec);
@@ -276,10 +264,9 @@ fn ingest(db: &DB, inputs: &mut DynInputs<Notifier>, sinks: &[Sink], status: &mu
         }
         for record in input.drain() {
             let Ok(bytes) = record else { continue };
-            let now = Timestamp::now();
             let result = match sink {
-                Sink::Table(ingestor) => ingestor.push(now, bytes),
-                Sink::Msg(id) => db.push_msg(now, *id, bytes),
+                Sink::Table(id) => db.ingest_table(*id, bytes),
+                Sink::Msg(id) => db.push_msg(Timestamp::now(), *id, bytes),
                 Sink::Refused => continue,
             };
             match result {
@@ -385,7 +372,7 @@ mod tests {
         else {
             panic!("a frame")
         };
-        assert!(matches!(sinks[0], Sink::Table(_)), "a prepared ingestor");
+        assert!(matches!(sinks[0], Sink::Table(_)), "a table sink");
         assert!(matches!(sinks[1], Sink::Msg(id) if id == Fixed::schema().packet_id()));
         assert_eq!(metadata[0].name, "a.plant.imu.sample");
 

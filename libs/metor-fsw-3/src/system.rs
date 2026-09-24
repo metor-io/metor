@@ -28,21 +28,13 @@ pub struct PortDef {
 impl PortDef {
     /// Whether two ports carry the same record under any name.
     pub fn same_record(&self, other: &PortDef) -> bool {
-        (
-            &self.record,
-            self.id,
-            self.max_len,
-            self.alignment,
-            self.depth,
-            self.layout,
-        ) == (
-            &other.record,
-            other.id,
-            other.max_len,
-            other.alignment,
-            other.depth,
-            other.layout,
-        ) && self.schema.same_record(&other.schema)
+        self.record == other.record
+            && self.id == other.id
+            && self.max_len == other.max_len
+            && self.alignment == other.alignment
+            && self.depth == other.depth
+            && self.layout == other.layout
+            && self.schema.same_record(&other.schema)
     }
 }
 

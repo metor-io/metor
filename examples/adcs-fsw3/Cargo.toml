@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 publish = false
-description = "The adcs-fsw3 example: one pack, a simulation target, and a three-target deployment"
+description = "Cube-sat attitude control example: one pack, a simulation, and a three-target deployment"
 
 [lints]
 workspace = true

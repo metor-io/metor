@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 publish = false
-description = "The adcs pack: the plant, nav, ctrl, and mode systems of the adcs-fsw3 example"
+description = "The adcs pack: plant, nav, ctrl, and mode systems for the adcs-fsw3 example"
 
-# The cdylib the host loads, plus an rlib so a test can register the same `pack()`
-# statically. `export` gates the C-ABI surface, so the rlib carries none.
+# The host loads the cdylib, and tests link the rlib to register `pack()` directly.
+# The `export` feature adds the C ABI, so tests turn it off.
 [lib]
 crate-type = ["cdylib", "rlib"]
 

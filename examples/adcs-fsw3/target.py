@@ -1,9 +1,9 @@
-"""The deployment: the vehicle on `plant`, the flight software on `fsw`, and a
-gateway whose db records both.
+"""Runs the plant, the flight software, and a gateway as three targets.
 
-`METOR_DEPLOY_PORTS` names the three listen ports, so tests do not collide.
+`plant` simulates the spacecraft, `fsw` runs nav, mode, and ctrl on its
+measurements, and the gateway's db records both. `METOR_DEPLOY_PORTS` sets the
+three listen ports so tests can pick free ones.
 """
-
 import math
 import os
 
@@ -36,8 +36,8 @@ sim = plant.add(
         cr=1.5,
         mtq_max_dipole=0.2,
         init_wheel_h=0.0,
-        # A 400 km sun-synchronous orbit, ascending node at ~10:30 local solar
-        # time, so the boot is sunlit.
+        # A 400 km sun-synchronous orbit with the ascending node at 10:30 local
+        # solar time, which starts the run in sunlight.
         altitude=400e3,
         inclination=math.radians(97.03),
         ltan_hours=10.5,
@@ -48,13 +48,14 @@ plant_pub = plant.add("pub", Publish(listen=f"127.0.0.1:{p_plant}", items=[sim])
 
 fsw = Target(cycle_rate=120.0, namespace="fsw")
 
-# The mirror is named `plant`, so every component path a dashboard already uses
-# reads the same on this member.
+# Naming the mirror `plant` gives its components the same paths they have on
+# the plant target.
 mirror = fsw.add("plant", Subscribe(peer=plant_pub, items=[sim]))
 nav = fsw.add(
     "nav",
     Nav(sensors=mirror.port(sim.sensors), gps=mirror.port(sim.gps), meas_sigma=0.02),
 )
+
 mode = fsw.add("mode", Mode())
 ctrl = fsw.add(
     "ctrl",
@@ -72,8 +73,7 @@ ctrl = fsw.add(
 )
 fsw_pub = fsw.add("pub", Publish(listen=f"127.0.0.1:{p_fsw}", all=True))
 
-# The commands come back the other way: the plant actuates on what the
-# controller sent, one cycle late.
+# The plant applies the controller's commands one cycle late.
 cmds = plant.add("ctrl", Subscribe(peer=fsw_pub, items=[ctrl.torque_cmd, ctrl.mtq_cmd]))
 torque.connect(cmds.port(ctrl.torque_cmd))
 mtq.connect(cmds.port(ctrl.mtq_cmd))
