@@ -3,13 +3,14 @@ pub mod raw;
 
 use core::cell::OnceCell;
 use core::ffi::c_void;
+use std::borrow::Cow;
 use std::cell::RefCell;
 
 use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 use tracing_subscriber::layer::SubscriberExt;
 
-use crate::coordinator::{MakeCx, ParamError, Params, Step, SystemTable, catch_step};
+use crate::coordinator::{End, MakeCx, ParamError, Params, Step, Stepped, SystemTable, catch_step};
 use crate::def::DefError;
 use crate::system::SystemDef;
 use crate::thread::Threads;
@@ -25,6 +26,10 @@ pub const ABI_VERSION: u32 = 9;
 pub enum Status {
     Ok = 0,
     Panicked = 1,
+    Completed = 2,
+    Aborted = 3,
+    /// The reason is a fault line on the system's `log`.
+    Failed = 4,
 }
 
 impl Status {
@@ -32,7 +37,32 @@ impl Status {
     pub fn from_raw(word: u32) -> Status {
         match word {
             0 => Status::Ok,
+            2 => Status::Completed,
+            3 => Status::Aborted,
+            4 => Status::Failed,
             _ => Status::Panicked,
+        }
+    }
+
+    /// The word a step that ended as `end` returns.
+    pub fn of_end(end: Option<&End>) -> Status {
+        match end {
+            None => Status::Ok,
+            Some(End::Completed) => Status::Completed,
+            Some(End::Aborted) => Status::Aborted,
+            Some(End::Failed(_) | End::Unloaded) => Status::Failed,
+            Some(End::Panicked) => Status::Panicked,
+        }
+    }
+
+    /// The end this word reports, `None` for a step still running.
+    pub fn end(self) -> Option<End> {
+        match self {
+            Status::Ok => None,
+            Status::Panicked => Some(End::Panicked),
+            Status::Completed => Some(End::Completed),
+            Status::Aborted => Some(End::Aborted),
+            Status::Failed => Some(End::Failed(Cow::Borrowed("see the system's log"))),
         }
     }
 }
@@ -283,10 +313,9 @@ pub unsafe fn execute(instance: *mut c_void, now: i64) -> u32 {
     crate::panic::catch(|| {
         // SAFETY: `create` allocated this slot, and it is still live on this thread.
         let slot = unsafe { &mut *instance.cast::<Option<Box<dyn Step>>>() };
-        if catch_step(slot, Timestamp(now)) {
-            Status::Ok
-        } else {
-            Status::Panicked
+        match catch_step(slot, Timestamp(now)) {
+            Stepped::Unwound => Status::Panicked,
+            Stepped::Ran | Stepped::Ended => Status::of_end(slot.as_ref().and_then(|s| s.ended())),
         }
     })
     .unwrap_or(Status::Panicked) as u32

@@ -209,3 +209,50 @@ fn test_destructor_panic_cleanup() {
 fn test_fault_and_destructor_panic_isolation() {
     assert_retirement(true, true);
 }
+
+/// Counts its cycles and completes after the second.
+struct Twice(Rc<Cell<u64>>, Option<super::End>);
+
+impl Step for Twice {
+    fn execute(&mut self, _now: Timestamp) {
+        self.0.set(self.0.get() + 1);
+        if self.0.get() == 2 {
+            self.1 = Some(super::End::Completed);
+        }
+    }
+
+    fn ended(&self) -> Option<&super::End> {
+        self.1.as_ref()
+    }
+}
+
+#[test]
+fn test_ended_step_stays_and_is_skipped() {
+    let status_ring = ring::<SystemStatus>(1);
+    let mut status = input::<SystemStatus>(&status_ring);
+    let runs = Rc::new(Cell::new(0));
+    let mut coordinator = Coordinator {
+        entries: vec![entry("twice", Twice(runs.clone(), None), &status_ring)],
+        clock: Clock::Simulated {
+            dt: std::time::Duration::from_millis(1),
+        },
+        epoch: Timestamp(0),
+        cycle: 0,
+        threads: crate::thread::Threads::new(),
+        rings: vec![status_ring.clone()],
+    };
+    for cycle in 1..=4 {
+        coordinator.step(Timestamp(cycle));
+        let seen = status.latest().expect("valid status").expect("new status");
+        assert_eq!(seen.timestamp, Timestamp(cycle));
+        if cycle > 2 {
+            assert_eq!(seen.exec_time_ns, 0);
+        }
+    }
+    assert_eq!(runs.get(), 2);
+    assert_eq!(
+        coordinator.ended().collect::<Vec<_>>(),
+        [("twice", &super::End::Completed)]
+    );
+    assert_eq!(coordinator.latched().count(), 0);
+}

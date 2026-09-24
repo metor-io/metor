@@ -9,7 +9,7 @@ use metor_proto::types::Timestamp;
 
 use crate::system::SystemDef;
 
-use crate::coordinator::{BuildError, ParamError, Step, SystemTable, TableEntry};
+use crate::coordinator::{BuildError, End, ParamError, Step, SystemTable, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::pack::def::{DefCxOwned, Instance, PackDef, PackSystemDef};
 use crate::pack::raw::{RawPort, RawRing, RawSlice};
@@ -278,7 +278,7 @@ impl SystemTable {
                         instance,
                         fns,
                         lib: lib.clone(),
-                        latched: false,
+                        end: None,
                     }))
                 }),
             };
@@ -312,25 +312,25 @@ pub struct DlStep {
     fns: PackFns,
     /// Keeps the library loaded for as long as the instance lives.
     lib: Arc<Library>,
-    latched: bool,
+    end: Option<End>,
 }
 
 impl Step for DlStep {
     fn execute(&mut self, now: Timestamp) {
-        if self.latched {
+        if self.end.is_some() {
             return;
         }
         // SAFETY: the instance came from `create` on this thread and has not
         // been destroyed.
         let status = Status::from_raw(unsafe { (self.fns.execute)(self.instance, now.0) });
-        self.latched |= status == Status::Panicked;
+        self.end = status.end();
     }
 
     /// Nothing: the pack has already written the fault line.
     fn fault(&mut self, _now: Timestamp, _message: &str) {}
 
-    fn latched(&self) -> bool {
-        self.latched
+    fn ended(&self) -> Option<&End> {
+        self.end.as_ref()
     }
 }
 

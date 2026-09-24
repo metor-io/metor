@@ -16,7 +16,7 @@ use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 
 use crate::async_system::{AsyncSystem, Running, Stop};
-use crate::coordinator::{Adapter, MakeCx, ParamError, Params, Step};
+use crate::coordinator::{Adapter, End, MakeCx, ParamError, Params, Step};
 use crate::record::Record;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef, SystemInputs, SystemOutputs};
 
@@ -139,7 +139,7 @@ pub struct Thread {
     fields: Fields,
     since_report: u64,
     panicked: Panicked,
-    latched: bool,
+    end: Option<End>,
     group: Option<Arc<GroupHandle>>,
 }
 
@@ -162,8 +162,8 @@ impl Step for Thread {
         self.write_line(now, LogLevel::Error, "panic", message);
     }
 
-    fn latched(&self) -> bool {
-        self.latched
+    fn ended(&self) -> Option<&End> {
+        self.end.as_ref()
     }
 }
 
@@ -217,11 +217,11 @@ impl Thread {
 
     /// Latches the system off once its task has panicked, reporting it once.
     fn check_panic(&mut self, now: Timestamp) {
-        if self.latched {
+        if self.end.is_some() {
             return;
         }
         if let Some(message) = self.panicked.take() {
-            self.latched = true;
+            self.end = Some(End::Panicked);
             self.write_line(now, LogLevel::Error, "panic", &message);
         }
     }
@@ -294,7 +294,7 @@ fn bind(
         inputs: edges,
         outputs: copies,
         panicked: Panicked::default(),
-        latched: false,
+        end: None,
         group: None,
     };
     Ok((thread, bound_in, bound_out))

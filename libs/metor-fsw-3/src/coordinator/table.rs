@@ -19,7 +19,8 @@ use crate::thread::{DEFAULT_THREAD, Threads};
 use super::BuildError;
 use super::config::Adapter;
 use super::params::{ParamError, Params};
-use super::run::{Runner, Step};
+use super::run::Runner;
+use super::step::Step;
 
 static STATUS: LazyLock<PortDef> =
     LazyLock::new(|| crate::Output::<super::SystemStatus>::def(&DefCx::empty(), "status"));
