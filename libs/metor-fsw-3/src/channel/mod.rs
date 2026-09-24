@@ -12,7 +12,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::coordinator::{End, RunState};
 use crate::port::Input;
-use crate::{Frame, FrameStr, MaxSize, Record, Schema, Timestamp};
+use crate::{Frame, FrameBytes, FrameStr, MaxSize, Record, Schema, Timestamp};
 
 /// Asks a system to finish what it is doing and stop.
 #[derive(Record, MaxSize, Schema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,7 +57,7 @@ pub struct ChannelStatus {
     /// The occupant's library file name; empty when there is none.
     pub artifact: FrameStr<64>,
     /// The blake3 of the occupant's library; zeros when there is none.
-    pub hash: [u8; 32],
+    pub hash: FrameBytes<32>,
 }
 
 /// What [`ChannelStatus::state`] reports.

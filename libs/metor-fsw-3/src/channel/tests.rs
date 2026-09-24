@@ -124,6 +124,8 @@ fn test_channel_status_layout() {
         .find(|m| m.name.ends_with("artifact"))
         .expect("an artifact component");
     assert!(artifact.is_string());
+    let hashes = metadata.iter().filter(|m| m.name.contains("hash")).count();
+    assert_eq!(hashes, 1);
     let port: PortDef = Output::<ChannelStatus>::def(&DefCx::empty(), "channel_status");
     assert_eq!(port.max_len, size_of::<ChannelStatus>());
 }

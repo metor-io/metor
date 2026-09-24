@@ -25,6 +25,7 @@
 //!
 //! [`ComponentMetadata`]: metor_proto_wkt::ComponentMetadata
 
+pub use bytes::FrameBytes;
 pub use metadata::Metadatatize;
 pub use metor_component_macros::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_proto::com_de::{Componentize, Decomponentize};
@@ -32,6 +33,7 @@ pub use str::{FrameStr, FrameStrError};
 pub use vtable::AsVTable;
 pub use {metor_proto, metor_proto_wkt, zerocopy};
 
+mod bytes;
 pub mod metadata;
 mod nox;
 pub mod path;

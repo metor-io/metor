@@ -143,7 +143,7 @@ pub use metor_proto::types::Timestamp;
 
 pub use metor_component::path;
 pub use metor_component::{
-    AsVTable, Componentize, Decomponentize, FrameStr, FrameStrError, Metadatatize,
+    AsVTable, Componentize, Decomponentize, FrameBytes, FrameStr, FrameStrError, Metadatatize,
 };
 pub use metor_proto;
 pub use metor_proto_wkt;
