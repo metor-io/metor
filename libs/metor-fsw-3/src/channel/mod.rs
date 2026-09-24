@@ -7,6 +7,7 @@
 mod adapter;
 mod apply;
 mod records;
+mod registry;
 
 use metor_fsw_3_ring::{NoWake, WakeSink};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,7 @@ pub const STATUS_PORT: &str = "channel_status";
 pub use adapter::Channel;
 pub(crate) use adapter::{def, make};
 pub use apply::{Command, Refusal, State, apply};
+pub use registry::{ChannelSpec, Registry, RegistryParams, channel_registry};
 
 /// Whether an abort has been asked for, read from the system's `abort` input.
 pub struct Abort<W: WakeSink = NoWake> {
