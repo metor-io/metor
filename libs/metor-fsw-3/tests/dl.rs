@@ -150,7 +150,8 @@ fn test_pack_reports_system_metadata() {
             "fail_input",
             "retained",
             "count_up",
-            "count_down"
+            "count_down",
+            "count_by"
         ]
     );
 

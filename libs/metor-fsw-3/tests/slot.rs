@@ -85,11 +85,6 @@ fn fixture() -> &'static Path {
     })
 }
 
-/// The fixture's directory, which stands in for a store here.
-fn store_dir() -> &'static Path {
-    fixture().parent().expect("a build directory")
-}
-
 /// `ty`'s ports as `metor build` would bake them for instance `mode`.
 fn baked(ty: &str) -> Value {
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
@@ -113,8 +108,15 @@ fn candidate(name: &str, ty: &str) -> Value {
     })
 }
 
-fn slot_params(allow: Vec<Value>, store: &Path) -> Value {
-    json!({ "allow": allow, "store": store })
+/// `count_by` with a stride, whose constructor refuses zero.
+fn stride(name: &str, by: u32) -> Value {
+    let mut candidate = candidate(name, "count_by");
+    candidate["params"] = json!({ "by": by });
+    candidate
+}
+
+fn slot_params(allow: Vec<Value>) -> Value {
+    json!({ "allow": allow })
 }
 
 fn input(port: &str, system: &str, from: &str) -> InputConfig {
@@ -226,7 +228,7 @@ fn refused(events: &[SequenceEventKind], text: &str) -> bool {
 
 #[test]
 fn test_load_start_complete() {
-    let (seen, mut coordinator) = build(slot_params(both(), store_dir()));
+    let (seen, mut coordinator) = build(slot_params(both()));
     run(&seen, &mut coordinator, 1);
     assert_eq!(status(&seen).state, ChannelState::Unloaded.code());
     assert_eq!(status(&seen).loaded, u32::MAX);
@@ -252,7 +254,7 @@ fn test_load_start_complete() {
 
 #[test]
 fn test_load_other_then_abort() {
-    let (seen, mut coordinator) = build(slot_params(both(), store_dir()));
+    let (seen, mut coordinator) = build(slot_params(both()));
     send(&seen, &mut coordinator, [load("down")]);
     assert_eq!(status(&seen).loaded, 1);
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
@@ -270,7 +272,7 @@ fn test_load_other_then_abort() {
 
 #[test]
 fn test_reset_restarts_loaded() {
-    let (seen, mut coordinator) = build(slot_params(both(), store_dir()));
+    let (seen, mut coordinator) = build(slot_params(both()));
     send(&seen, &mut coordinator, [load("up")]);
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
     run(&seen, &mut coordinator, 1);
@@ -285,50 +287,78 @@ fn test_reset_restarts_loaded() {
 
 #[test]
 fn test_unknown_load_keeps_occupant() {
-    let (seen, mut coordinator) = build(slot_params(both(), store_dir()));
+    let (seen, mut coordinator) = build(slot_params(both()));
     send(&seen, &mut coordinator, [load("up")]);
     let events = send(&seen, &mut coordinator, [load("sideways")]);
     assert!(refused(&events, "sideways"), "{events:?}");
     assert_eq!(status(&seen).loaded, 0);
 }
 
+/// A library whose bytes are not the ones build hashed is refused before
+/// it is mapped, and the occupant stays.
 #[test]
 fn test_changed_bytes_refused() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let copy = dir.path().join("libecho_copy.so");
+    std::fs::copy(fixture(), &copy).expect("copies");
     let mut stale = candidate("down", "count_down");
+    stale["path"] = json!(copy);
     stale["hash"] = json!(blake3::hash(b"another build").to_hex().as_str());
     let allow = vec![candidate("up", "count_up"), stale];
-    let (seen, mut coordinator) = build(slot_params(allow, store_dir()));
+    let (seen, mut coordinator) = build(slot_params(allow));
     send(&seen, &mut coordinator, [load("up")]);
     let events = send(&seen, &mut coordinator, [load("down")]);
     assert!(refused(&events, "not the library"), "{events:?}");
     assert_eq!(status(&seen).loaded, 0);
 }
 
+/// A candidate of a type whose ports differ from the slot's is refused, and
+/// the occupant stays.
 #[test]
-fn test_stale_ports_refused() {
-    let mut stale = candidate("gain", "gain");
-    stale["params"] = json!({ "gain": 2.0 });
-    let allow = vec![candidate("up", "count_up"), stale];
-    let (seen, mut coordinator) = build(slot_params(allow, store_dir()));
+fn test_other_type_refused() {
+    let mut other = candidate("gain", "gain");
+    other["params"] = json!({ "gain": 2.0 });
+    let allow = vec![candidate("up", "count_up"), other];
+    let (seen, mut coordinator) = build(slot_params(allow));
     send(&seen, &mut coordinator, [load("up")]);
     let events = send(&seen, &mut coordinator, [load("gain")]);
     assert!(refused(&events, "no longer matches"), "{events:?}");
     assert_eq!(status(&seen).loaded, 0);
 }
 
+/// A slot whose baked ports no longer match the library refuses the load.
 #[test]
-fn test_outside_store_refused() {
-    let elsewhere = tempfile::tempdir().expect("a temp dir");
-    let (seen, mut coordinator) = build(slot_params(both(), elsewhere.path()));
+fn test_stale_baked_ports_refused() {
+    let mut stale = candidate("up", "count_up");
+    stale["def"] = baked("gain");
+    let (seen, mut coordinator) = build(slot_params(vec![stale]));
     run(&seen, &mut coordinator, 1);
     let events = send(&seen, &mut coordinator, [load("up")]);
-    assert!(refused(&events, "outside the store"), "{events:?}");
+    assert!(refused(&events, "no longer matches"), "{events:?}");
     assert_eq!(status(&seen).state, ChannelState::Unloaded.code());
+}
+
+/// A candidate whose constructor refuses is refused, and the occupant is
+/// put back over the rings it released.
+#[test]
+fn test_refused_constructor_keeps_occupant() {
+    let allow = vec![candidate("up", "count_up"), stride("zero", 0)];
+    let (seen, mut coordinator) = build(slot_params(allow));
+    send(&seen, &mut coordinator, [load("up")]);
+    let events = send(&seen, &mut coordinator, [load("zero")]);
+    assert!(refused(&events, "`by` is zero"), "{events:?}");
+    assert_eq!(status(&seen).loaded, 0);
+    assert_eq!(status(&seen).state, ChannelState::Stopped.code());
+
+    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
+    let events = run(&seen, &mut coordinator, 4);
+    assert_eq!(events, [SequenceEventKind::Completed]);
+    assert_eq!(pings(&seen), [1, 2, 3]);
 }
 
 #[test]
 fn test_initial_loads_at_build() {
-    let mut params = slot_params(both(), store_dir());
+    let mut params = slot_params(both());
     params["initial"] = json!("down");
     let (seen, mut coordinator) = build(params);
     run(&seen, &mut coordinator, 1);
@@ -336,10 +366,47 @@ fn test_initial_loads_at_build() {
     assert_eq!(status(&seen).state, ChannelState::Stopped.code());
 }
 
+/// A bad `initial` reports why the slot is empty, and blocks nothing else.
+#[test]
+fn test_bad_initial_fails_the_slot_only() {
+    let mut params = slot_params(vec![candidate("up", "count_up"), stride("zero", 0)]);
+    params["initial"] = json!("zero");
+    let (seen, mut coordinator) = build(params);
+    let events = run(&seen, &mut coordinator, 1);
+    assert!(
+        matches!(events.as_slice(), [SequenceEventKind::Failed { reason }] if reason.contains("zero")),
+        "{events:?}"
+    );
+    assert_eq!(status(&seen).state, ChannelState::Failed.code());
+
+    let events = send(&seen, &mut coordinator, [load("up")]);
+    assert_eq!(events, [SequenceEventKind::Loaded { name: "up".into() }]);
+    assert_eq!(status(&seen).state, ChannelState::Stopped.code());
+}
+
+/// A reset restarts the last load without going through `initial`.
+#[test]
+fn test_reset_skips_initial() {
+    let mut params = slot_params(vec![candidate("up", "count_up"), stride("two", 2)]);
+    params["initial"] = json!("up");
+    let (seen, mut coordinator) = build(params);
+    send(&seen, &mut coordinator, [load("two")]);
+    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
+    run(&seen, &mut coordinator, 1);
+    assert_eq!(pings(&seen), [2, 4]);
+
+    let reset = [SequenceCommandKind::Stop, SequenceCommandKind::Reset];
+    let events = send(&seen, &mut coordinator, reset);
+    assert_eq!(events[1], SequenceEventKind::Loaded { name: "two".into() });
+    assert_eq!(status(&seen).loaded, 1);
+    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
+    assert_eq!(pings(&seen), [2]);
+}
+
 #[test]
 fn test_slot_needs_channel() {
     let seen = Shared::default();
-    let mut config = config(slot_params(both(), store_dir()), None);
+    let mut config = config(slot_params(both()), None);
     // Without a channel there are no events or status to watch.
     config.systems.pop();
     let Err(error) = config.build(&table(&seen)) else {
@@ -404,13 +471,12 @@ fn test_build_resolves_into_store() {
     assert!(!deploy::unresolved(&envelope));
 
     let params = slot(&envelope);
-    assert_eq!(params["store"], json!(store));
     let hash = store::hash(fixture()).expect("reads");
     for candidate in params["allow"].as_array().expect("a list") {
         assert!(candidate.get("pack").is_none());
         assert_eq!(candidate["hash"], json!(hash.to_hex().as_str()));
         let path = PathBuf::from(candidate["path"].as_str().expect("a path"));
-        assert!(store::contains(&store, &path), "{}", path.display());
+        assert!(path.starts_with(&store), "{}", path.display());
         assert!(candidate["def"].is_object());
     }
 
@@ -428,6 +494,51 @@ fn test_build_resolves_into_store() {
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
     let events = run(&seen, &mut coordinator, 4);
     assert_eq!(events, [SequenceEventKind::Completed]);
+}
+
+/// Slot `next`, reading slot `mode`'s output.
+fn next_slot(libs: &Path) -> SystemConfig {
+    SystemConfig {
+        params: json!({ "allow": [unresolved("down", "count_down", libs)] }),
+        adapter: Some(Adapter::Channel(ChannelConfig {
+            name: "next".into(),
+            start: RunState::Stopped,
+        })),
+        inputs: vec![input("input", "mode", "output")],
+        ..SystemConfig::new("next", "fsw.dl_slot")
+    }
+}
+
+/// A slot reading another slot's output resolves against that slot's baked ports.
+#[test]
+fn test_build_resolves_chained_slots() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    let mut envelope = envelope(vec![unresolved("up", "count_up", &libs)]);
+    envelope.targets[0]
+        .coordinator
+        .systems
+        .push(next_slot(&libs));
+    deploy::resolve_slots(&mut envelope, &[table(&Shared::default())], &store).expect("resolves");
+    assert!(!deploy::unresolved(&envelope));
+    let next = &envelope.targets[0].coordinator.systems[4].params;
+    assert!(next["allow"][0]["def"].is_object());
+}
+
+/// A slot reading a slot later in step order is refused.
+#[test]
+fn test_build_refuses_slot_reading_later_slot() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    let mut envelope = envelope(vec![unresolved("up", "count_up", &libs)]);
+    let systems = &mut envelope.targets[0].coordinator.systems;
+    let mode = systems.iter().position(|s| s.id == "mode").expect("a slot");
+    systems.insert(mode, next_slot(&libs));
+    let resolved = deploy::resolve_slots(&mut envelope, &[table(&Shared::default())], &store);
+    let Err(error) = resolved else {
+        panic!("a slot reading a later slot resolved")
+    };
+    assert!(error.to_string().contains("mode"), "{error}");
 }
 
 #[test]

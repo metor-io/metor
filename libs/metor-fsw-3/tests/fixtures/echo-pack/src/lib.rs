@@ -227,6 +227,42 @@ async fn count_down(
     seq.sleep(core::time::Duration::from_secs(3600)).await
 }
 
+/// `count_by`'s params.
+#[derive(Deserialize, JsonSchema)]
+pub struct StrideParams {
+    /// The step between pings; zero is refused.
+    pub by: u32,
+}
+
+/// Counts in strides of `by`.
+pub struct Stride(u32);
+
+impl Stride {
+    fn new(params: StrideParams) -> Result<Self, metor_fsw_3::ParamError> {
+        if params.by == 0 {
+            return Err(metor_fsw_3::ParamError::Decode("`by` is zero".into()));
+        }
+        Ok(Self(params.by))
+    }
+}
+
+/// Pings three strides on successive cycles, then completes; `count_up`'s
+/// ports, with a constructor that can refuse.
+#[sequence]
+async fn count_by(
+    #[state] s: &mut Stride,
+    seq: &Seq,
+    input: &mut Input<Ping>,
+    output: &mut Output<Ping>,
+) -> Result<(), SeqError> {
+    let _ = input;
+    for n in 1..=3 {
+        let _ = output.write(&Ping { n: n * s.0 });
+        seq.next_cycle().await;
+    }
+    Ok(())
+}
+
 /// The table this pack exports.
 pub fn pack() -> SystemTable {
     if std::env::var_os("METOR_TEST_PACK_BUILDER_PANIC").is_some() {
@@ -267,6 +303,9 @@ pub fn pack() -> SystemTable {
         .expect("valid records");
     table
         .register_sequence("count_down", count_down(), Default::default)
+        .expect("valid records");
+    table
+        .register_sequence("count_by", count_by(), Stride::new)
         .expect("valid records");
     table
 }

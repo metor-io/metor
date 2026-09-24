@@ -253,10 +253,14 @@ fn test_build_stores_candidates() {
         assert_eq!(dir.to_str(), Some(hash));
         assert!(candidate["def"].is_object());
     }
-    let store = Path::new(slot["params"]["store"].as_str().expect("a store"));
+    let store = target()
+        .parent()
+        .expect("a directory")
+        .join(".metor")
+        .join("store");
     assert!(
         allow[0]["path"]
             .as_str()
-            .is_some_and(|p| Path::new(p).starts_with(store))
+            .is_some_and(|p| Path::new(p).starts_with(&store))
     );
 }

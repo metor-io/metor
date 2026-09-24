@@ -21,46 +21,56 @@ const ARTIFACT_CAP: usize = FrameStr::<64>::CAPACITY;
 
 /// Whether any slot in `envelope` has a candidate `metor build` has not resolved.
 pub(crate) fn unresolved(envelope: &DeploymentConfig) -> bool {
-    envelope
-        .targets
-        .iter()
-        .flat_map(|target| &target.coordinator.systems)
-        .any(unresolved_slot)
+    first_unresolved(envelope).is_some()
 }
 
 fn unresolved_slot(system: &SystemConfig) -> bool {
     system.ty == SLOT_TYPE && candidates(&system.params).any(|c| !resolved(c))
 }
 
+/// The first slot in step order with a candidate still to resolve.
+fn first_unresolved(envelope: &DeploymentConfig) -> Option<At> {
+    envelope.targets.iter().enumerate().find_map(|(t, target)| {
+        let systems = &target.coordinator.systems;
+        let s = systems.iter().position(unresolved_slot)?;
+        Some(At::new(t, s))
+    })
+}
+
 /// Resolves every slot in `envelope`, putting candidate libraries in `store`.
+///
+/// Slots resolve in step order, one at a time, so a slot reading another
+/// slot's output sees that slot's baked ports.
 pub fn resolve_slots(
     envelope: &mut DeploymentConfig,
     tables: &[SystemTable],
     store: &Path,
 ) -> Result<(), DeployError> {
-    let mut index = DefIndex::new(envelope, tables);
-    let mut resolved = Vec::new();
-    for (t, target) in envelope.targets.iter().enumerate() {
-        for (s, system) in target.coordinator.systems.iter().enumerate() {
-            if !unresolved_slot(system) {
-                continue;
-            }
-            let at = At::new(t, s);
-            let cx = SlotCx {
-                slot: index.name(at),
-                id: &system.id,
-                namespace: target.coordinator.namespace.as_deref(),
-                edges: index.edges(at)?,
-                outputs: &system.outputs,
-                records: index.records(t).clone(),
-            };
-            resolved.push((at, cx.params(&system.params, store)?));
-        }
-    }
-    for (at, params) in resolved {
+    while let Some(at) = first_unresolved(envelope) {
+        let params = resolve_slot(envelope, tables, at, store)?;
         envelope.targets[at.target].coordinator.systems[at.system].params = params;
     }
     Ok(())
+}
+
+fn resolve_slot(
+    envelope: &DeploymentConfig,
+    tables: &[SystemTable],
+    at: At,
+    store: &Path,
+) -> Result<Value, DeployError> {
+    let mut index = DefIndex::new(envelope, tables);
+    let target = &envelope.targets[at.target];
+    let system = &target.coordinator.systems[at.system];
+    let cx = SlotCx {
+        slot: index.name(at),
+        id: &system.id,
+        namespace: target.coordinator.namespace.as_deref(),
+        edges: index.edges(at)?,
+        outputs: &system.outputs,
+        records: index.records(at.target).clone(),
+    };
+    cx.params(&system.params, store)
 }
 
 /// Whether build has written a candidate's path, hash, and ports.
@@ -97,7 +107,7 @@ impl SlotCx<'_> {
         }
     }
 
-    /// The slot's params with every candidate resolved and the store named.
+    /// The slot's params with every candidate resolved.
     fn params(&self, params: &Value, store: &Path) -> Result<Value, DeployError> {
         let mut params = params.clone();
         let allow = params
@@ -122,7 +132,6 @@ impl SlotCx<'_> {
                 None => first = Some((name, def)),
             }
         }
-        params["store"] = json!(store);
         Ok(params)
     }
 

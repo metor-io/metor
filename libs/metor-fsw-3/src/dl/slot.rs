@@ -28,8 +28,6 @@ struct SlotParams {
     allow: Vec<Candidate>,
     #[serde(default)]
     initial: Option<String>,
-    #[serde(default)]
-    store: Option<PathBuf>,
 }
 
 /// One system the slot may load, as the config lists it.
@@ -97,9 +95,6 @@ fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
         return Err(ParamError::SlotChannel);
     };
     let params: SlotParams = cx.params.decode()?;
-    let store = params
-        .store
-        .ok_or_else(|| ParamError::Decode("the slot has no store; run `metor build`".into()))?;
     let candidates = params
         .allow
         .into_iter()
@@ -118,13 +113,14 @@ fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
             .map(|rings| rings.into_iter().cloned().collect())
             .collect(),
         outputs: cx.outputs.into_iter().cloned().collect(),
-        store,
         candidates,
         current: None,
+        end: None,
     };
-    if let Some(name) = params.initial {
-        slot.load(&name)
-            .map_err(|e| ParamError::Decode(e.to_string()))?;
+    if let Some(name) = params.initial
+        && let Err(error) = slot.load(&name)
+    {
+        slot.end = Some(End::Failed(error.to_string().into()));
     }
     Ok(Box::new(slot))
 }
@@ -167,28 +163,46 @@ pub struct DlSlot {
     instance: Instance,
     inputs: Vec<Vec<RingBuffer>>,
     outputs: Vec<RingBuffer>,
-    store: PathBuf,
     candidates: Vec<Resolved>,
-    current: Option<(usize, DlStep)>,
+    current: Option<Loaded>,
+    /// Why the slot is empty when a load left it so.
+    end: Option<End>,
+}
+
+/// The occupant and the pack it was created from.
+struct Loaded {
+    at: usize,
+    pack: Pack,
+    step: DlStep,
 }
 
 impl DlSlot {
     /// Opens a candidate's library once its bytes and ports check out.
+    ///
+    /// A resident library is the bytes checked when it was first opened, so
+    /// only a first open hashes the file, and re-checks that the file it
+    /// hashed is the one it opened.
     fn open(&self, candidate: &Resolved) -> Result<Pack, LoadError> {
-        if !store::contains(&self.store, &candidate.path) {
-            return Err(LoadError::Open(format!(
-                "`{}` is outside the store",
-                candidate.path.display()
-            )));
+        let open_error = |e: super::PackError| LoadError::Open(e.to_string());
+        let io_error = |e: std::io::Error| LoadError::Open(e.to_string());
+        if super::is_loaded(&candidate.path) {
+            // SAFETY: the library is already mapped in this process.
+            return unsafe { Pack::open(&candidate.path) }.map_err(open_error);
         }
-        let found = store::hash(&candidate.path).map_err(|e| LoadError::Open(e.to_string()))?;
-        if found != candidate.hash {
+        let hashed = store::Hashed::of(&candidate.path).map_err(io_error)?;
+        if hashed.hash != candidate.hash {
             return Err(LoadError::Hash(candidate.name.clone()));
         }
         // SAFETY: the library is in the store `metor build` wrote, and its
         // bytes are the ones build hashed; `open` checks the ABI first.
-        let pack =
-            unsafe { Pack::open(&candidate.path) }.map_err(|e| LoadError::Open(e.to_string()))?;
+        let pack = unsafe { Pack::open(&candidate.path) }.map_err(open_error)?;
+        if !hashed.still_at(&candidate.path).map_err(io_error)? {
+            return Err(LoadError::Hash(candidate.name.clone()));
+        }
+        Ok(pack)
+    }
+
+    fn check_ports(&self, pack: &Pack, candidate: &Resolved) -> Result<(), LoadError> {
         let cx = DefCx {
             id: &self.instance.id,
             params: &candidate.params,
@@ -200,7 +214,7 @@ impl DlSlot {
         if !same_ports(&def, &self.instance.def) {
             return Err(LoadError::Mismatch(candidate.name.clone()));
         }
-        Ok(pack)
+        Ok(())
     }
 
     fn create(&self, pack: &Pack, candidate: &Resolved) -> Result<DlStep, LoadError> {
@@ -221,12 +235,20 @@ impl DlSlot {
         )
         .map_err(LoadError::Create)
     }
+
+    /// Creates candidate `at` over the slot's rings, which must be free.
+    fn place(&mut self, at: usize, pack: Pack) -> Result<(), LoadError> {
+        let step = self.create(&pack, &self.candidates[at])?;
+        self.current = Some(Loaded { at, pack, step });
+        self.end = None;
+        Ok(())
+    }
 }
 
 impl Step for DlSlot {
     fn execute(&mut self, now: Timestamp) {
-        if let Some((_, step)) = self.current.as_mut() {
-            step.execute(now);
+        if let Some(loaded) = self.current.as_mut() {
+            loaded.step.execute(now);
         }
     }
 
@@ -235,13 +257,13 @@ impl Step for DlSlot {
 
     fn ended(&self) -> Option<&End> {
         match &self.current {
-            Some((_, step)) => step.ended(),
-            None => Some(&End::Unloaded),
+            Some(loaded) => loaded.step.ended(),
+            None => self.end.as_ref().or(Some(&End::Unloaded)),
         }
     }
 
-    /// Drops the occupant only once the new one's library checks out, so a
-    /// refused load keeps it.
+    /// Keeps the occupant when the new one's library or ports are refused,
+    /// and puts it back when the new one's constructor refuses.
     fn load(&mut self, name: &str) -> Result<(), LoadError> {
         let at = self
             .candidates
@@ -249,16 +271,20 @@ impl Step for DlSlot {
             .position(|candidate| candidate.name == name)
             .ok_or_else(|| LoadError::Unknown(name.to_string()))?;
         let pack = self.open(&self.candidates[at])?;
+        self.check_ports(&pack, &self.candidates[at])?;
         // The old occupant releases its views and writers before the new one claims them.
-        self.current = None;
-        let step = self.create(&pack, &self.candidates[at])?;
-        self.current = Some((at, step));
-        Ok(())
+        let previous = self.current.take().map(|loaded| (loaded.at, loaded.pack));
+        let placed = self.place(at, pack);
+        if let (Err(_), Some((at, pack))) = (&placed, previous) {
+            // Its library is resident and its rings are free again.
+            let _ = self.place(at, pack);
+        }
+        placed
     }
 
     fn occupant(&self) -> Option<&Occupant> {
-        let (at, _) = self.current.as_ref()?;
-        Some(&self.candidates[*at].occupant)
+        let loaded = self.current.as_ref()?;
+        Some(&self.candidates[loaded.at].occupant)
     }
 }
 

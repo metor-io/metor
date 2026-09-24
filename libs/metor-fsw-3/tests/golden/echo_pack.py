@@ -203,3 +203,22 @@ class CountDown(System):
     output: OutPort[Ping]
     log: OutPort[LogEvent]
     status: OutPort[SystemStatus]
+
+
+class CountBy(System):
+    "Pings three strides on successive cycles, then completes; `count_up`'s\nports, with a constructor that can refuse."
+
+    _pack = PACK
+    _ty = "count_by"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, input: Sources[Ping] = (), by: int) -> None:
+        """
+        Args:
+            by: The step between pings; zero is refused.
+        """
+        super().__init__({"input": input}, {"by": by})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
