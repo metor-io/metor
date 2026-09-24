@@ -255,7 +255,7 @@ registry = fsw.add("channels", ChannelRegistry())
 
 ### Slots
 
-Occasionally we might want to swap what system is running at runtime. That is what slots are for. A `DlSlot` is one place in the schedule that loads one of the pack systems it allows when its channel receives `Load`. Every allowed system has the first one's ports; `metor build` checks that, copies each library into a store under the hash of its bytes, and writes the stored path and hash into the slot's config. A `Load` hashes the library again, opens it, checks its ports, and creates it over the slot's rings. A rebuilt pack is a new hash and a new path, so it never replaces a library a running process has mapped.
+Occasionally we might want to swap what system is running at runtime. That is what slots are for. A `DlSlot` is one place in the schedule that loads one of the pack systems it allows when its channel receives `Load`. Every allowed system has the first one's ports; `metor build` checks that, copies each library into a store under the hash of its bytes, and writes the stored path and hash into the slot's config. A `Load` hashes the library on its first open, opens it, checks its ports, and creates it over the slot's rings; a load that fails keeps the system the slot had. A rebuilt pack is a new hash and a new path, so it never replaces a library a running process has mapped.
 
 ```python
 mode = fsw.add("mode", DlSlot(allow=[Commissioning(), SafeMode()], attitude=nav.est), channel="mode")

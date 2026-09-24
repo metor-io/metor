@@ -183,19 +183,27 @@ view of shape `[N]`).
 
 ```rust
 pub struct Channel {
+    commands: Input<SequenceCommand>,
+    core: Core,
+}
+
+/// Everything but the command input, so a drained command can borrow
+/// `commands` while it changes `core`.
+struct Core {
     name: String,
     run: RunState,
     inner: Option<Box<dyn Step>>,
-    recipe: Recipe,
-    /// The last name `Load` accepted, re-applied after a reset.
-    loaded: Option<String>,
-    /// Latched when the adapter itself ended the inner step.
+    /// An end the adapter set: a failed make, or an unwound step.
     end: Option<End>,
-    /// Whether the current end has been reported.
-    reported: bool,
-    commands: Input<SequenceCommand>,
-    events: Output<SequenceChannelEvent>,
+    /// The end last reported on `events`.
+    reported: Option<End>,
+    /// The last name `Load` accepted, reloaded by a reset.
+    loaded: Option<String>,
+    recipe: Recipe,
+    threads: Threads,
     abort: Option<Output<AbortRequest>>,
+    events: Output<SequenceChannelEvent>,
+    status: Output<ChannelStatus>,
 }
 
 struct Recipe {
@@ -220,8 +228,9 @@ Each `execute`:
    and emit one event per command.
 2. If running and not ended, run the inner step through `catch_step`.
    The adapter catches an inner panic, and survives to take a `Reset`.
-3. When the inner step first reports an end, emit `Completed`,
-   `Aborted`, `Failed`, or `Stopped` for a panic.
+3. When the inner step's end differs from the one last reported, emit
+   `Completed`, `Aborted`, `Failed`, `Failed { "panicked" }` for a
+   panic, or `Unloaded`.
 4. Write `channel_status`.
 
 The coordinator steps the adapter every cycle, whatever the channel's
@@ -231,8 +240,11 @@ paused.
 
 ### Commands
 
-The rules are one pure function, `apply(run, ended, kind) ->
-Result<Transition, Refusal>`, tested on its own and proven with Kani.
+The rules are one pure function, `apply(state, command) -> Result<(),
+Refusal>`, which decides only whether a command is accepted. It never
+sets `run`; `Core::transition` does, and tests cover it. The Kani
+harness proves that an accepted command is `Stop` or `Abort` exactly
+when the channel is live (running and not ended).
 
 | Command | Accepted from | Effect |
 |---|---|---|
@@ -474,11 +486,15 @@ occupant is loaded.
 The slot keeps a `RingBuffer` handle for each of its ports, and the
 current occupant as a `DlStep`.
 
-- `load(name)` looks the name up in `allow` and hashes the file at its
-  path. A hash that differs from the baked one refuses the load before
-  anything is mapped. It opens the pack with `Pack::open` and checks the
-  pack's definition against the baked one. It drops the current
-  occupant, then creates the new one over the slot's rings.
+- `load(name)` looks the name up in `allow`. On a library's first open
+  it hashes the file through one handle and refuses a hash that differs
+  from the baked one before anything is mapped. After `Pack::open` it
+  checks that the path still names the file it hashed (device and
+  inode). A library already mapped skips both, since its bytes were
+  checked when it was first opened. It checks the pack's ports against
+  the slot's, drops the current occupant, and creates the new one over
+  the slot's rings. If that create fails, it re-creates the previous
+  occupant and returns the error.
 - `occupant()` is the current candidate's `Occupant`. The slot builds
   one per candidate at make, from the baked hash and the path's file
   name, so reporting it allocates nothing.
@@ -486,10 +502,10 @@ current occupant as a `DlStep`.
 - `ended()` is `Unloaded` while the slot is empty, and the occupant's
   end otherwise.
 
-`initial` is created at build. An async candidate is refused by the
-pack's `place` when it is created, so an async `initial` fails build and
-an async candidate fails its `Load`. With no `initial`, the slot starts
-empty.
+`initial` is created at build. If it fails, for example an async
+candidate that the pack's `place` refuses, the slot starts empty with
+`End::Failed` and its reason, and a later `Load` can fill it. With no
+`initial`, the slot starts empty.
 
 ### Residency
 
@@ -522,13 +538,12 @@ the stored path and the hash into the slot's params:
   process killed on `dlopen`.
 - A rebuilt pack is a new hash and a new path, so `LIBRARIES` opens it
   fresh and the old build stays mapped for any instance still using it.
-- `DlSlot` opens only paths inside the store it was built with. The
-  path in the params is data the build wrote, and not a name a command
-  can supply.
-- `load` re-hashes the file before opening it. blake3 runs at gigabytes
-  per second, so a pack of a few megabytes costs a few milliseconds.
-  That is small next to the dlopen in the same cycle, and it catches a
-  store file that was changed or corrupted after build.
+- The path in the params is data the build wrote, not a name a command
+  can supply, so the slot does not check it against a store root.
+- A first load hashes the file before opening it. blake3 runs at
+  gigabytes per second, so a pack of a few megabytes costs a few
+  milliseconds. That is small next to the dlopen in the same cycle, and
+  it catches a store file that was changed or corrupted after build.
 - blake3 is already in the workspace.
 
 The store holds candidates only. Target packs keep their paths for
@@ -607,8 +622,8 @@ Unit, next to the code:
 
 - `apply`, table-driven: every command from every state; each refusal
   names the state.
-- Kani over `apply`: a running channel leaves `Running` only by `Stop`,
-  and `Reset` and `Load` never run while running.
+- Kani over `apply`: an accepted command is `Stop` or `Abort` exactly
+  when the channel is live.
 - `Adapter` serde: `thread` and `channel` round-trip, a config with
   neither parses, and one with both is refused.
 - Make refusals: `Thread` on a cyclic system, `Channel` on an async
@@ -692,6 +707,14 @@ Channel adapter:
 - `Reset` emits `Loaded { name }`, with the last loaded name or the
   instance id. Every `LoadError` emits `Refused`. A failed re-make emits
   `Failed` once.
+- `Reset` reloads the last load in place on the existing step, and makes
+  the system again only when the step is gone or nothing was loaded. A
+  `Load` with no step is refused and changes nothing.
+- A panic reports `Failed { reason: "panicked" }`. The wire's `Stopped`
+  is kept for an operator `Stop`, which the panel shows as stopped.
+- An `Abort` the full ring cannot take emits `Refused`, and event
+  reasons are cut to 512 bytes so every refusal fits its record.
+- `SequenceChannelEvent::MAX_LEN` is 1024, not the plan's 256.
 - `Channel::ended()` is always `None`: the coordinator skips ended steps,
   and a channel must read its commands after its system ends.
 
@@ -707,10 +730,16 @@ Sequences:
 
 Slots and the store:
 
+- A bad `initial` ends the slot as failed at build instead of failing
+  the build.
+- There is no `store` param and no containment check; the hash gate
+  is the one check a load makes on the file.
 - `DlSlot::load` recomputes a candidate's ports under the slot's id and
   params only, and compares them by name and record. A candidate whose
   ports come from dynamic config inputs is refused at load; `metor
   build` checks with the full context.
+- The slot pass resolves one slot at a time, in step order, writing each
+  back before the next, so a slot can read another slot's output.
 - The slot pass opens each candidate from its pack directory, so the
   build process maps the library there as well as from the store.
 - A candidate is resolved when it has `path`, `hash`, and `def` and no

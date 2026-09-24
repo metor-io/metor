@@ -124,3 +124,21 @@ Files: `docs/plans/12-sequences.md`, `TODO.md`,
 - `ChannelRegistry` writes the bytes it encoded at make if `Output` has
   a raw write. If not, drop the make-time encode and check the size by
   encoding once into a scratch buffer. Either way, one encode path.
+
+## Shipped deviations
+
+- No `MakeCx.load`. `Reset` reloads the last load in place on the
+  existing step and re-makes only when the step is gone or nothing was
+  loaded. A bad `initial` no longer fails the make, so a re-make cannot
+  wedge on it.
+- Findings 5 and 6 are fixed rather than deferred: the `store` param and
+  containment check are removed, a first open hashes through one handle
+  and rechecks device and inode after `dlopen`, and a resident library
+  skips the hash.
+- The long-reason test is a unit test of the clip, since a command
+  carrying a 2 KiB name does not fit its 256-byte record.
+- `ChannelRegistry` keeps its make-time size check and writes the typed
+  record: `Output<T>` has no raw write, and the write encodes into the
+  output's scratch buffer without allocating.
+- The stale-def test bakes another type's ports as the slot's, since a
+  non-first candidate's baked `def` is only read at build.
