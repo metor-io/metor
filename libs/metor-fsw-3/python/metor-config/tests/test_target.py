@@ -496,6 +496,8 @@ class ChannelTest(unittest.TestCase):
 
     def test_channel_exposes_its_ports(self) -> None:
         fsw = Target(cycle_rate=50.0)
+        cmds = fsw.add("cmds", Subscribe([SequenceCommand], listen="127.0.0.1:0"))
+        fsw.commands(cmds.sequence_command)
         nav = fsw.add("nav", Nav(), channel="nav")
         self.assertEqual(nav.events.ref, PortRef("nav", "events"))
         self.assertEqual(nav.channel_status.ref, PortRef("nav", "channel_status"))
@@ -503,7 +505,7 @@ class ChannelTest(unittest.TestCase):
         with self.assertRaisesRegex(AttributeError, "channel_status"):
             plain.channel_status  # type: ignore[attr-defined]
         pub = fsw.add("pub", Publish([nav], listen="127.0.0.1:0"))
-        ports = [i["port"] for i in fsw.to_config()["coordinator"]["systems"][2]["inputs"]]
+        ports = [i["port"] for i in fsw.to_config()["coordinator"]["systems"][3]["inputs"]]
         self.assertIn("nav.channel_status", ports)
         self.assertIsNotNone(pub)
 
@@ -550,6 +552,27 @@ class ChannelTest(unittest.TestCase):
             DlSlot(allow=[Safe(est=nav.est)])
         with self.assertRaisesRegex(ConfigError, "pack systems"):
             DlSlot(allow=[Publish(listen="127.0.0.1:0")])
+
+    def test_channel_without_commands_refused(self) -> None:
+        fsw = Target(cycle_rate=50.0)
+        fsw.add("nav", Nav(), channel="nav")
+        fsw.add("mode", DlSlot(allow=[Safe()]), channel="mode")
+        with self.assertRaisesRegex(ConfigError, "channel `nav` has no command source"):
+            fsw.to_config()
+
+    def test_plain_target_needs_no_commands(self) -> None:
+        fsw = Target(cycle_rate=50.0)
+        fsw.add("nav", Nav())
+        self.assertEqual(len(fsw.to_config()["coordinator"]["systems"]), 1)
+
+    def test_slot_without_initial_emits_null(self) -> None:
+        fsw = Target(cycle_rate=50.0)
+        cmds = fsw.add("cmds", Subscribe([SequenceCommand], listen="127.0.0.1:0"))
+        fsw.commands(cmds.sequence_command)
+        fsw.add("mode", DlSlot(allow=[Safe(), Hold()]), channel="mode")
+        mode = fsw.to_config()["coordinator"]["systems"][1]
+        self.assertIn("initial", mode["params"])
+        self.assertIsNone(mode["params"]["initial"])
 
     def test_registry_lists_channels(self) -> None:
         _, systems = slotted()

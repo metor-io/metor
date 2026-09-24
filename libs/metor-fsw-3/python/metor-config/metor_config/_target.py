@@ -133,6 +133,7 @@ class Target:
 
         A pack with no library is built into the host, so it is not listed.
         """
+        self._check_commands()
         return {
             "packs": [pack.to_json() for pack in self._packs.values() if pack.lib],
             "coordinator": {
@@ -144,6 +145,14 @@ class Target:
                 ],
             },
         }
+
+    def _check_commands(self) -> None:
+        """A channel no command reaches cannot be commanded, so it is refused."""
+        channels = self._channels()
+        if channels and not self._commands:
+            raise ConfigError(
+                f"channel `{channels[0][0]}` has no command source; call `commands(..)`"
+            )
 
     def _system(self, index: int) -> dict[str, Any]:
         name, system, adapter = self._systems[index]
