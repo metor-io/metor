@@ -687,8 +687,9 @@ Records:
 - Record names are snake_case (`sequence_command`,
   `sequence_channel_event`, `sequence_registry`), following `log`. The
   packet ids come from the schema name and match the wkt ids.
-- `MAX_LEN` is a constant, so the registry's is a fixed 16 KiB, and
-  `ChannelRegistry` refuses params that encode past it.
+- `MAX_LEN` is a constant, so the registry's is a fixed 16 KiB. A
+  registry past it fails its write; `ChannelRegistry` does not check the
+  size at make.
 - `ChannelStatus::hash` is a `FrameBytes<32>`: one `U8` component of shape
   `[32]`. A plain `[u8; 32]` becomes 32 components.
 - The table's known records include the three a channel adds, beside

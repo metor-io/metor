@@ -6,7 +6,6 @@ use serde::Deserialize;
 
 use crate::coordinator::ParamError;
 use crate::port::Output;
-use crate::record::Record;
 
 /// Cycles between two writes when the params name no period.
 const DEFAULT_PERIOD: u64 = 100;
@@ -42,7 +41,7 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Refuses a zero period, and a registry that encodes past its record's bound.
+    /// Refuses a zero period.
     pub fn new(params: RegistryParams) -> Result<Self, ParamError> {
         if params.period == 0 {
             return Err(ParamError::Decode(
@@ -59,13 +58,6 @@ impl Registry {
                 })
                 .collect(),
         };
-        let mut buf = vec![0; SequenceRegistry::MAX_LEN];
-        registry.encode(&mut buf).map_err(|_| {
-            ParamError::Decode(format!(
-                "the registry encodes past {} bytes",
-                SequenceRegistry::MAX_LEN
-            ))
-        })?;
         Ok(Self {
             registry,
             period: params.period,
@@ -93,6 +85,7 @@ mod tests {
     use crate::coordinator::Params;
     use crate::fn_system::Ctor;
     use crate::port::{Input, ring_capacity};
+    use crate::record::Record;
 
     fn make(params: serde_json::Value) -> Result<Registry, ParamError> {
         Ctor::<Registry, (RegistryParams, ParamError)>::make(&Registry::new, Params(&params))
@@ -136,13 +129,6 @@ mod tests {
         assert_eq!(registry.channels.len(), 1);
         assert_eq!(registry.channels[0].name, "mode");
         assert_eq!(registry.channels[0].available, ["a"]);
-    }
-
-    #[test]
-    fn test_refuses_oversized_registry() {
-        let names: Vec<String> = (0..2000).map(|i| format!("sequence_{i:04}")).collect();
-        let result = make(json!({ "channels": [{ "name": "mode", "available": names }] }));
-        assert!(matches!(result, Err(ParamError::Decode(message)) if message.contains("bytes")));
     }
 
     #[test]

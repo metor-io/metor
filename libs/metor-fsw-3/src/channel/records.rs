@@ -46,7 +46,7 @@ impl Record for SequenceChannelEvent {
 
 impl Record for SequenceRegistry {
     const NAME: &'static str = "sequence_registry";
-    /// A registry that encodes past this is refused where it is built.
+    /// A registry that encodes past this fails its write.
     const MAX_LEN: usize = 16 * 1024;
     type Read<'a> = SequenceRegistry;
 
