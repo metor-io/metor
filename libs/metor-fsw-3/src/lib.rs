@@ -92,6 +92,7 @@
 extern crate self as metor_fsw_3;
 
 pub mod async_system;
+pub mod channel;
 pub mod cli;
 pub mod coordinator;
 pub mod def;
@@ -112,6 +113,7 @@ pub mod thread;
 mod tests;
 
 pub use async_system::{AsyncSystem, Stop};
+pub use channel::{Abort, AbortRequest, ChannelState, ChannelStatus};
 pub use coordinator::{
     Adapter, BuildError, ChannelConfig, Clock, Coordinator, CoordinatorConfig, End, InputConfig,
     LoadError, OutputConfig, OutputSource, ParamError, Params, PeerLink, PeerPort, PortRef,
@@ -140,7 +142,9 @@ pub use metor_fsw_3_ring as ring;
 pub use metor_proto::types::Timestamp;
 
 pub use metor_component::path;
-pub use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
+pub use metor_component::{
+    AsVTable, Componentize, Decomponentize, FrameStr, FrameStrError, Metadatatize,
+};
 pub use metor_proto;
 pub use metor_proto_wkt;
 pub use postcard;

@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use metor_fsw_3_ring::WakeSink;
 use metor_proto::types::Timestamp;
 
+use crate::channel::{ABORT_PORT, Abort, AbortRequest};
 use crate::def::{DefCx, DefError};
 use crate::log::Log;
 use crate::port::{DynInputs, DynOutputs, Input, Output};
@@ -343,6 +344,37 @@ impl Param for Timestamp {
         cx: &mut Cycle<'a>,
     ) -> Timestamp {
         cx.now
+    }
+}
+
+/// An [`Abort`] reads the `abort` input, whatever the parameter is called.
+impl<D: WakeSink + 'static> Param for Abort<D> {
+    type In<W: WakeSink + Clone + 'static> = Abort<W>;
+    type Out = ();
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Abort<W>;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        cx: &DefCx<'_>,
+        defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        name(names);
+        defs.push_input(Input::<AbortRequest>::def(cx, ABORT_PORT));
+        Ok(())
+    }
+
+    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
+        Abort::new(<Input<AbortRequest> as Param>::bind_in(views))
+    }
+
+    fn bind_out(_writers: &mut Writers) {}
+
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        input: &'a mut Self::In<W>,
+        _output: &'a mut (),
+        _cx: &mut Cycle<'a>,
+    ) -> Self::Item<'a, W> {
+        input
     }
 }
 
