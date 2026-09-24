@@ -68,25 +68,16 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
     let Some(Adapter::Channel(channel)) = cx.adapter else {
         return make(cx);
     };
-    let (mut inputs, mut outputs) = (cx.inputs, cx.outputs);
-    // PANIC Safety: `def` appended one input and two outputs.
-    let commands = inputs.pop().expect("the commands input");
-    let status = outputs.pop().expect("the channel_status output");
-    let events = outputs.pop().expect("the events output");
+    let outer = Outer::split(cx.inputs, cx.outputs);
     let mut def = cx.def.clone();
     def.inputs.pop();
-    def.outputs.truncate(outputs.len());
-
-    let mut inputs: Vec<Vec<RingBuffer>> = inputs
+    def.outputs.truncate(outer.outputs.len());
+    let mut inputs: Vec<Vec<RingBuffer>> = outer
+        .inputs
         .into_iter()
         .map(|rings| rings.into_iter().cloned().collect())
         .collect();
-    let abort_at = def.inputs.iter().position(|p| p.name == ABORT_PORT);
-    let abort = abort_at.map(|at| {
-        let ring = abort_ring();
-        inputs[at] = vec![ring.clone()];
-        writer::<AbortRequest>(&ring)
-    });
+    let abort = private_abort(&def, &mut inputs);
     let recipe = Recipe {
         make: make.clone(),
         id: cx.id.to_string(),
@@ -94,34 +85,71 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
         def,
         params: cx.params.0.clone(),
         inputs,
-        outputs: outputs.into_iter().cloned().collect(),
+        outputs: outer.outputs.into_iter().cloned().collect(),
     };
     let mut threads = Threads::new();
     let inner = recipe.make(&mut threads)?;
     Ok(Box::new(Channel {
-        // PANIC Safety: the build pass counts one reader slot per edge, and
-        // commands are a message record, which any alignment carries.
-        commands: Input::try_new(
-            commands
-                .into_iter()
-                .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
-                .collect(),
-        )
-        .expect("message alignment"),
+        commands: command_input(outer.commands),
         core: Core {
             name: channel.name.clone(),
             run: channel.start,
             inner: Some(inner),
             end: None,
-            reported: false,
+            reported: None,
             loaded: None,
             recipe,
             threads,
             abort,
-            events: writer(events),
-            status: writer(status),
+            events: writer(outer.events),
+            status: writer(outer.status),
         },
     }))
+}
+
+/// The outer rings, with the ports `def` appended taken off the end.
+struct Outer<'a> {
+    inputs: Vec<Vec<&'a RingBuffer>>,
+    outputs: Vec<&'a RingBuffer>,
+    commands: Vec<&'a RingBuffer>,
+    events: &'a RingBuffer,
+    status: &'a RingBuffer,
+}
+
+impl<'a> Outer<'a> {
+    fn split(mut inputs: Vec<Vec<&'a RingBuffer>>, mut outputs: Vec<&'a RingBuffer>) -> Self {
+        // PANIC Safety: `def` appended one input and two outputs.
+        let commands = inputs.pop().expect("the commands input");
+        let status = outputs.pop().expect("the channel_status output");
+        let events = outputs.pop().expect("the events output");
+        Self {
+            inputs,
+            outputs,
+            commands,
+            events,
+            status,
+        }
+    }
+}
+
+/// Binds the system's `abort` input, if it has one, to a ring the adapter writes.
+fn private_abort(def: &SystemDef, inputs: &mut [Vec<RingBuffer>]) -> Option<Output<AbortRequest>> {
+    let at = def.inputs.iter().position(|p| p.name == ABORT_PORT)?;
+    let ring = abort_ring();
+    inputs[at] = vec![ring.clone()];
+    Some(writer::<AbortRequest>(&ring))
+}
+
+fn command_input(rings: Vec<&RingBuffer>) -> Input<SequenceCommand> {
+    // PANIC Safety: the build pass counts one reader slot per edge, and
+    // commands are a message record, which any alignment carries.
+    Input::try_new(
+        rings
+            .into_iter()
+            .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
+            .collect(),
+    )
+    .expect("message alignment")
 }
 
 /// A ring the adapter alone writes and the system alone reads.
@@ -181,8 +209,8 @@ struct Core {
     inner: Option<Box<dyn Step>>,
     /// An end the adapter set: a failed make, or an unwound step.
     end: Option<End>,
-    /// Whether the current end has been reported.
-    reported: bool,
+    /// The end last reported on `events`.
+    reported: Option<End>,
     /// The last name a `Load` accepted, re-applied after a reset.
     loaded: Option<String>,
     recipe: Recipe,
@@ -192,6 +220,9 @@ struct Core {
     events: Output<SequenceChannelEvent>,
     status: Output<ChannelStatus>,
 }
+
+/// The most of a reason an event carries, so every refusal fits its record.
+const REASON_CAP: usize = 512;
 
 impl Step for Channel {
     fn execute(&mut self, now: Timestamp) {
@@ -210,9 +241,7 @@ impl Core {
     fn command(&mut self, kind: SequenceCommandKind) {
         let event = match apply(self.state(), Command::of(&kind)) {
             Ok(()) => self.transition(kind),
-            Err(refusal) => SequenceEventKind::Refused {
-                reason: refusal.to_string(),
-            },
+            Err(refusal) => refused(refusal.to_string()),
         };
         self.emit(event);
     }
@@ -235,22 +264,28 @@ impl Core {
                 self.run = RunState::Stopped;
                 SequenceEventKind::Stopped
             }
-            SequenceCommandKind::Abort => {
-                if let Some(abort) = self.abort.as_mut() {
-                    let _ = abort.write(&AbortRequest {});
-                }
-                SequenceEventKind::Progress {
-                    detail: "abort requested".into(),
-                }
-            }
+            SequenceCommandKind::Abort => self.abort(),
             SequenceCommandKind::Reset => self.reset(),
             SequenceCommandKind::Load { name } => self.load(name),
         }
     }
 
+    fn abort(&mut self) -> SequenceEventKind {
+        let written = self
+            .abort
+            .as_mut()
+            .is_some_and(|abort| abort.write(&AbortRequest {}).is_ok());
+        if !written {
+            return refused("the abort ring is full".into());
+        }
+        SequenceEventKind::Progress {
+            detail: "abort requested".into(),
+        }
+    }
+
     fn reset(&mut self) -> SequenceEventKind {
         self.run = RunState::Stopped;
-        match self.remake() {
+        match self.restart() {
             Ok(()) => SequenceEventKind::Loaded {
                 name: self.loaded_name(),
             },
@@ -258,26 +293,30 @@ impl Core {
         }
     }
 
-    fn load(&mut self, name: String) -> SequenceEventKind {
-        if self.inner.is_none()
-            && let Err(reason) = self.remake()
-        {
-            return self.fail(reason);
+    /// Reloads the last load in place, making the system first when it is
+    /// gone or loads nothing.
+    fn restart(&mut self) -> Result<(), String> {
+        if self.inner.is_none() || self.loaded.is_none() {
+            self.remake()?;
         }
+        match (self.inner.as_mut(), &self.loaded) {
+            (Some(inner), Some(name)) => reload(inner, name),
+            _ => Ok(()),
+        }
+    }
+
+    fn load(&mut self, name: String) -> SequenceEventKind {
         let Some(inner) = self.inner.as_mut() else {
-            return self.fail("no system to load into".into());
+            return refused("the system is gone; reset it first".into());
         };
         match crate::panic::catch(|| inner.load(&name)) {
             Some(Ok(())) => {
                 self.run = RunState::Stopped;
                 self.end = None;
-                self.reported = false;
                 self.loaded = Some(name.clone());
                 SequenceEventKind::Loaded { name }
             }
-            Some(Err(error)) => SequenceEventKind::Refused {
-                reason: error.to_string(),
-            },
+            Some(Err(error)) => refused(error.to_string()),
             None => {
                 self.inner = None;
                 self.fail("the load panicked".into())
@@ -285,24 +324,21 @@ impl Core {
         }
     }
 
-    /// Drops the system, then makes it again and re-applies the last load.
+    /// Drops the system, then makes it again over the same rings.
     fn remake(&mut self) -> Result<(), String> {
         self.inner = None;
         self.end = None;
-        self.reported = false;
         let made = crate::panic::catch(|| self.recipe.make(&mut self.threads))
             .ok_or_else(|| "the system's constructor panicked".to_string())?;
-        let inner = self.inner.insert(made.map_err(|e| e.to_string())?);
-        if let Some(name) = &self.loaded {
-            inner.load(name).map_err(|e| e.to_string())?;
-        }
+        self.inner = Some(made.map_err(|e| e.to_string())?);
         Ok(())
     }
 
     /// Ends the channel as failed, reporting it now rather than next cycle.
     fn fail(&mut self, reason: String) -> SequenceEventKind {
+        let reason = clipped(reason);
         self.end = Some(End::Failed(reason.clone().into()));
-        self.reported = true;
+        self.reported = self.end.clone();
         SequenceEventKind::Failed { reason }
     }
 
@@ -329,18 +365,16 @@ impl Core {
             .or_else(|| self.inner.as_ref().and_then(|inner| inner.ended()))
     }
 
-    /// Emits the event for an end the first cycle it is seen.
+    /// Emits the event for an end the first cycle it differs from the last reported.
     fn report_end(&mut self) {
-        let event = match self.ended() {
-            None => {
-                self.reported = false;
-                return;
-            }
-            Some(_) if self.reported => return,
-            Some(end) => end_event(end),
-        };
-        self.reported = true;
-        self.emit(event);
+        let end = self.ended().cloned();
+        if end == self.reported {
+            return;
+        }
+        if let Some(end) = &end {
+            self.emit(end_event(end));
+        }
+        self.reported = end;
     }
 
     fn write_status(&mut self, now: Timestamp) {
@@ -364,14 +398,39 @@ impl Core {
     }
 }
 
+/// Loads `name` again, which drops the occupant and creates it afresh.
+fn reload(inner: &mut Box<dyn Step>, name: &str) -> Result<(), String> {
+    crate::panic::catch(|| inner.load(name))
+        .ok_or_else(|| "the load panicked".to_string())?
+        .map_err(|e| e.to_string())
+}
+
+fn refused(reason: String) -> SequenceEventKind {
+    SequenceEventKind::Refused {
+        reason: clipped(reason),
+    }
+}
+
+/// `text` cut to `REASON_CAP` bytes on a char boundary.
+fn clipped(mut text: String) -> String {
+    let mut end = REASON_CAP.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
 fn end_event(end: &End) -> SequenceEventKind {
     match end {
         End::Completed => SequenceEventKind::Completed,
         End::Aborted => SequenceEventKind::Aborted,
         End::Failed(reason) => SequenceEventKind::Failed {
-            reason: reason.to_string(),
+            reason: clipped(reason.to_string()),
         },
-        End::Panicked => SequenceEventKind::Stopped,
+        End::Panicked => SequenceEventKind::Failed {
+            reason: "panicked".into(),
+        },
         End::Unloaded => SequenceEventKind::Unloaded,
     }
 }

@@ -29,6 +29,10 @@ struct Seen {
     aborts: u64,
     /// The count a counter panics on.
     panic_at: Option<u64>,
+    /// Whether the next `Counter::new` refuses.
+    make_fails: bool,
+    /// The end the fake slot's occupant reports.
+    slot_end: Option<End>,
     events: Vec<SequenceChannelEvent>,
     states: Vec<u32>,
     status: Option<ChannelStatus>,
@@ -79,6 +83,15 @@ impl Counter {
         Self { shared, count: 0 }
     }
 
+    fn try_new(shared: Shared, _: NoParams) -> Result<Self, crate::coordinator::ParamError> {
+        if shared.0.borrow().make_fails {
+            return Err(crate::coordinator::ParamError::Decode(
+                "no counter today".into(),
+            ));
+        }
+        Ok(Self::new(shared))
+    }
+
     fn tick(&mut self) {
         self.count += 1;
         let mut seen = self.shared.0.borrow_mut();
@@ -102,6 +115,15 @@ fn counter(#[state] c: &mut Counter, imu: &mut Input<Imu>, abort: &mut Abort) {
 /// Counts cycles, with no abort port.
 #[system]
 fn plain(#[state] c: &mut Counter) {
+    c.tick();
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct NoParams {}
+
+/// Counts cycles and never reads its abort.
+#[system]
+fn deaf(#[state] c: &mut Counter, _abort: &mut Abort) {
     c.tick();
 }
 
@@ -133,19 +155,30 @@ fn watch(
     }
 }
 
-/// A step that loads `a` or `b` and reports which.
+/// A step that loads `a` or `b` and reports which; `none` empties it.
 struct Slot {
+    shared: Shared,
     occupant: Option<Occupant>,
+    end: Option<End>,
 }
 
 impl Step for Slot {
-    fn execute(&mut self, _now: Timestamp) {}
+    fn execute(&mut self, _now: Timestamp) {
+        self.end = self.shared.0.borrow().slot_end.clone();
+    }
 
     fn ended(&self) -> Option<&End> {
-        self.occupant.is_none().then_some(&End::Unloaded)
+        match self.occupant {
+            None => Some(&End::Unloaded),
+            Some(_) => self.end.as_ref(),
+        }
     }
 
     fn load(&mut self, name: &str) -> Result<(), LoadError> {
+        if name == "none" {
+            self.occupant = None;
+            return Ok(());
+        }
         let index = ["a", "b"]
             .iter()
             .position(|known| *known == name)
@@ -163,7 +196,9 @@ impl Step for Slot {
     }
 }
 
-fn slot_entry() -> TableEntry {
+#[allow(clippy::arc_with_non_send_sync)]
+fn slot_entry(shared: &Shared) -> TableEntry {
+    let shared = shared.clone();
     let def = SystemDef {
         name: "slot".into(),
         inputs: Vec::new(),
@@ -174,7 +209,13 @@ fn slot_entry() -> TableEntry {
         def_fn: Box::new(move |_| Ok(def.clone())),
         doc: "".into(),
         schema: None,
-        make: Arc::new(|_| Ok(Box::new(Slot { occupant: None }))),
+        make: Arc::new(move |_| {
+            Ok(Box::new(Slot {
+                shared: shared.clone(),
+                occupant: None,
+                end: None,
+            }))
+        }),
     }
 }
 
@@ -194,6 +235,10 @@ fn table(shared: &Shared) -> SystemTable {
         .expect("valid");
     let s = shared.clone();
     table
+        .register("deaf", deaf(), move |p| Counter::try_new(s.clone(), p))
+        .expect("valid");
+    let s = shared.clone();
+    table
         .register("watch", watch(), move || Watch(s.clone()))
         .expect("valid");
     table
@@ -203,7 +248,7 @@ fn table(shared: &Shared) -> SystemTable {
     table
         .register_sequence("ticker", ticker(), move || Counter::new(s.clone()))
         .expect("valid");
-    table.insert("slot", slot_entry()).expect("valid");
+    table.insert("slot", slot_entry(shared)).expect("valid");
     table
 }
 
@@ -315,7 +360,10 @@ fn test_inner_panic_keeps_channel() {
     coordinator.step(Timestamp(2));
     coordinator.step(Timestamp(3));
     assert_eq!(coordinator.latched().count(), 0);
-    assert_eq!(shared.events(), [SequenceEventKind::Stopped]);
+    let panicked = SequenceEventKind::Failed {
+        reason: "panicked".into(),
+    };
+    assert_eq!(shared.events(), [panicked]);
     assert_eq!(shared.state(), ChannelState::Panicked.code());
     assert_eq!(shared.counts(), [1, 2]);
 
@@ -509,4 +557,102 @@ fn test_abort_ends_sequence_channel() {
         shared.events().as_slice(),
         [SequenceEventKind::Refused { .. }]
     ));
+}
+
+/// A `Load` on a channel whose step is gone is refused and changes nothing.
+#[test]
+fn test_load_on_gone_step_changes_nothing() {
+    let (shared, mut coordinator) = build("counter", RunState::Running);
+    shared.0.borrow_mut().panic_at = Some(1);
+    coordinator.step(Timestamp(1));
+    shared.events();
+    shared.send("ctr", SequenceCommandKind::Load { name: "a".into() });
+    coordinator.step(Timestamp(2));
+    let events = shared.events();
+    assert!(
+        matches!(&events[..], [SequenceEventKind::Refused { reason }] if reason.contains("reset"))
+    );
+    assert_eq!(shared.state(), ChannelState::Panicked.code());
+    assert_eq!(shared.0.borrow().makes, 1);
+}
+
+/// A `Reset` whose make fails ends the channel as failed; the next one works.
+#[test]
+fn test_failed_remake_can_be_retried() {
+    let (shared, mut coordinator) = build("deaf", RunState::Stopped);
+    shared.0.borrow_mut().make_fails = true;
+    shared.send("ctr", SequenceCommandKind::Reset);
+    coordinator.step(Timestamp(1));
+    let events = shared.events();
+    assert!(
+        matches!(&events[..], [SequenceEventKind::Failed { reason }] if reason.contains("no counter"))
+    );
+    assert_eq!(shared.state(), ChannelState::Failed.code());
+    coordinator.step(Timestamp(2));
+    assert!(shared.events().is_empty(), "an end is reported once");
+
+    shared.0.borrow_mut().make_fails = false;
+    shared.send("ctr", SequenceCommandKind::Reset);
+    shared.send("ctr", SequenceCommandKind::Start);
+    coordinator.step(Timestamp(3));
+    assert_eq!(shared.state(), ChannelState::Running.code());
+    assert_eq!(shared.counts(), [1]);
+}
+
+/// An abort the ring cannot take is refused, not reported as requested.
+#[test]
+fn test_abort_ring_full_refused() {
+    let (shared, mut coordinator) = build("deaf", RunState::Running);
+    for cycle in 1..=4 {
+        shared.send("ctr", SequenceCommandKind::Abort);
+        coordinator.step(Timestamp(cycle));
+        assert!(matches!(
+            shared.events()[..],
+            [SequenceEventKind::Progress { .. }]
+        ));
+    }
+    shared.send("ctr", SequenceCommandKind::Abort);
+    coordinator.step(Timestamp(5));
+    let events = shared.events();
+    assert!(
+        matches!(&events[..], [SequenceEventKind::Refused { reason }] if reason.contains("full"))
+    );
+}
+
+/// A reason longer than the cap is cut on a char boundary.
+#[test]
+fn test_long_reason_is_clipped() {
+    assert_eq!(super::clipped("short".into()), "short");
+    let long = "é".repeat(400);
+    let cut = super::clipped(long);
+    assert!(cut.len() <= super::REASON_CAP && cut.len() > super::REASON_CAP - 2);
+    assert!(cut.chars().all(|c| c == 'é'));
+}
+
+/// An occupant that completes and is then unloaded reports both ends.
+#[test]
+fn test_completed_then_unloaded_reported() {
+    let (shared, mut coordinator) = build("slot", RunState::Stopped);
+    shared.send("ctr", SequenceCommandKind::Load { name: "a".into() });
+    coordinator.step(Timestamp(1));
+    shared.0.borrow_mut().slot_end = Some(End::Completed);
+    shared.send("ctr", SequenceCommandKind::Start);
+    coordinator.step(Timestamp(2));
+    let events = shared.events();
+    assert_eq!(events[events.len() - 1], SequenceEventKind::Completed);
+
+    shared.0.borrow_mut().slot_end = None;
+    shared.send(
+        "ctr",
+        SequenceCommandKind::Load {
+            name: "none".into(),
+        },
+    );
+    coordinator.step(Timestamp(3));
+    let events = shared.events();
+    assert_eq!(
+        events.last(),
+        Some(&SequenceEventKind::Unloaded),
+        "{events:?}"
+    );
 }

@@ -76,25 +76,33 @@ mod adapter_keys {
 
     use super::{Adapter, ChannelConfig};
 
-    #[derive(Default, Serialize, Deserialize)]
+    #[derive(Default, Deserialize)]
     struct Keys {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         thread: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         channel: Option<ChannelConfig>,
     }
 
+    #[derive(Default, Serialize)]
+    struct KeysRef<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel: Option<&'a ChannelConfig>,
+    }
+
     pub fn serialize<S: Serializer>(adapter: &Option<Adapter>, s: S) -> Result<S::Ok, S::Error> {
-        let keys = match adapter.clone() {
-            Some(Adapter::Thread(thread)) => Keys {
+        let keys = match adapter {
+            Some(Adapter::Thread(thread)) => KeysRef {
                 thread: Some(thread),
-                ..Keys::default()
+                ..KeysRef::default()
             },
-            Some(Adapter::Channel(channel)) => Keys {
+            Some(Adapter::Channel(channel)) => KeysRef {
                 channel: Some(channel),
-                ..Keys::default()
+                ..KeysRef::default()
             },
-            None => Keys::default(),
+            None => KeysRef::default(),
         };
         keys.serialize(s)
     }
