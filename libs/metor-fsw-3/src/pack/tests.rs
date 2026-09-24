@@ -52,7 +52,7 @@ fn instance_def(ty: &str) -> Vec<u8> {
     let instance = crate::pack::def::Instance {
         id: ty.to_string(),
         def,
-        thread: crate::thread::DEFAULT_THREAD.to_string(),
+        adapter: None,
     };
     serde_json::to_vec(&instance).expect("encodes")
 }

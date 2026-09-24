@@ -5,17 +5,17 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::coordinator::{OutputConfig, SystemTable, TableEntry};
+use crate::coordinator::{Adapter, OutputConfig, SystemTable, TableEntry};
 use crate::def::{DefCx, Records};
 use crate::system::{PortDef, SystemDef};
 
 /// An `Instance` is what the host hands `create`: the definition build settled
-/// on, including the ports a config added, and where the system is placed.
+/// on, including the ports a config added, and the adapter it runs behind.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Instance {
     pub id: String,
     pub def: SystemDef,
-    pub thread: String,
+    pub adapter: Option<Adapter>,
 }
 
 /// A `PackDef` is every system a pack exports, in registration order.
@@ -97,6 +97,8 @@ pub struct DefCxOwned {
     pub inputs: Vec<(String, PortDef)>,
     pub outputs: Vec<OutputConfig>,
     pub records: Records,
+    #[serde(default)]
+    pub params: serde_json::Value,
 }
 
 impl DefCxOwned {
@@ -112,6 +114,7 @@ impl DefCxOwned {
                 .collect(),
             outputs: cx.outputs.to_vec(),
             records: cx.records.clone(),
+            params: cx.params.clone(),
         }
     }
 
@@ -131,6 +134,7 @@ impl DefCxOwned {
             inputs: edges,
             outputs: &self.outputs,
             records: &self.records,
+            params: &self.params,
         }
     }
 }
@@ -183,6 +187,25 @@ mod tests {
         assert!(matches!(system.def.name, Cow::Owned(_)));
         assert!(matches!(system.def.outputs[0].record, Cow::Owned(_)));
         assert!(system.params.is_none());
+    }
+
+    #[test]
+    fn test_owned_context_carries_params() {
+        let params = serde_json::json!({ "allow": ["a"] });
+        let cx = DefCx {
+            id: "slot",
+            params: &params,
+            ..DefCx::empty()
+        };
+        let bytes = serde_json::to_vec(&DefCxOwned::of(&cx)).expect("encodes");
+        let owned: DefCxOwned = serde_json::from_slice(&bytes).expect("decodes");
+        let edges = owned.edges();
+        assert_eq!(owned.borrow(&edges).params, &params);
+        let bare: DefCxOwned = serde_json::from_str(
+            r#"{"id":"","namespace":null,"inputs":[],"outputs":[],"records":{}}"#,
+        )
+        .expect("params default");
+        assert!(bare.params.is_null());
     }
 
     #[test]

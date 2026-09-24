@@ -37,6 +37,8 @@ pub enum ParamError {
     Decode(String),
     #[error("`{thread}`: a cyclic system runs on the cycle thread")]
     Thread { thread: String },
+    #[error("`{channel}`: an async system takes no channel")]
+    Channel { channel: String },
 }
 
 #[cfg(test)]

@@ -22,8 +22,8 @@ use crate::port::Output;
 
 pub(crate) use build::status_def;
 pub use config::{
-    Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig, OutputConfig, OutputSource,
-    PeerLink, PeerPort, PortRef, SystemConfig,
+    Adapter, ChannelConfig, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig,
+    OutputConfig, OutputSource, PeerLink, PeerPort, PortRef, RunState, SystemConfig,
 };
 pub use error::BuildError;
 pub use params::{ParamError, Params};

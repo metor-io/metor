@@ -84,6 +84,15 @@ pub enum BuildError {
     #[error("cyclic system `{id}` cannot be placed on thread `{thread}`")]
     ThreadOnCyclic { id: String, thread: String },
 
+    #[error("async system `{id}` cannot take channel `{channel}`")]
+    ChannelOnAsync { id: String, channel: String },
+
+    #[error("channel `{name}` is longer than {cap} bytes")]
+    ChannelName { name: String, cap: usize },
+
+    #[error("channel `{name}` is named by two systems")]
+    DuplicateChannel { name: String },
+
     #[error("thread `{thread}` failed to start")]
     ThreadStart { thread: String },
 

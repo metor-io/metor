@@ -241,7 +241,7 @@ impl SystemTable {
                     let instance = Instance {
                         id: cx.id.to_string(),
                         def: cx.def.clone(),
-                        thread: cx.thread.to_string(),
+                        adapter: cx.adapter.cloned(),
                     };
                     let def = serde_json::to_vec(&instance)
                         .map_err(|e| ParamError::Decode(e.to_string()))?;

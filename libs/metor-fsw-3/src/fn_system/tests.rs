@@ -707,7 +707,7 @@ fn test_async_and_cyclic_ports_match() {
 #[test]
 fn test_async_adapter_relay() {
     use crate::coordinator::MakeCx;
-    use crate::thread::{DEFAULT_THREAD, Threads};
+    use crate::thread::Threads;
 
     let mut table = SystemTable::new();
     table
@@ -731,7 +731,7 @@ fn test_async_adapter_relay() {
     let def = entry.def.clone();
     let mut step = (entry.make)(MakeCx {
         id: "relay",
-        thread: DEFAULT_THREAD,
+        adapter: None,
         def: &def,
         params: crate::coordinator::Params(&json!(null)),
         inputs: vec![vec![&imu]],

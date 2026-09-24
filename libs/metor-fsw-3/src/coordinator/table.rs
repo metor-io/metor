@@ -17,6 +17,7 @@ use crate::system::{
 use crate::thread::{DEFAULT_THREAD, Threads};
 
 use super::BuildError;
+use super::config::Adapter;
 use super::params::{ParamError, Params};
 use super::run::{Runner, Step};
 
@@ -26,12 +27,22 @@ static STATUS: LazyLock<PortDef> =
 /// Arguments for constructing a system using [`MakeFn`].
 pub struct MakeCx<'a> {
     pub id: &'a str,
-    pub thread: &'a str,
+    pub adapter: Option<&'a Adapter>,
     pub def: &'a SystemDef,
     pub params: Params<'a>,
     pub inputs: Vec<Vec<&'a RingBuffer>>,
     pub outputs: Vec<&'a RingBuffer>,
     pub threads: &'a mut Threads,
+}
+
+impl MakeCx<'_> {
+    /// The thread the adapter names, or the default one.
+    pub fn thread(&self) -> &str {
+        match self.adapter {
+            Some(Adapter::Thread(thread)) => thread,
+            _ => DEFAULT_THREAD,
+        }
+    }
 }
 
 /// Builds a system from [`MakeCx`].
@@ -246,9 +257,9 @@ fn entry<S: System + 'static>(
         doc,
         schema,
         make: Box::new(move |cx| {
-            if cx.thread != DEFAULT_THREAD {
+            if let Some(Adapter::Thread(thread)) = cx.adapter {
                 return Err(ParamError::Thread {
-                    thread: cx.thread.to_string(),
+                    thread: thread.clone(),
                 });
             }
             let (system, state) = make(cx.params)?;
@@ -711,7 +722,7 @@ mod tests {
         let def = entry.def.clone();
         let step = (entry.make)(MakeCx {
             id: "idle",
-            thread: DEFAULT_THREAD,
+            adapter: None,
             def: &def,
             params: Params(&serde_json::Value::Null),
             inputs: Vec::new(),

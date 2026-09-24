@@ -17,7 +17,7 @@ use def::{DefCxOwned, Instance, PackDef};
 use raw::{RawPort, RawRing, RawSlice};
 
 /// The ABI the exports in this module are built against.
-pub const ABI_VERSION: u32 = 8;
+pub const ABI_VERSION: u32 = 9;
 
 /// What [`execute`] returns: an unknown word is a panic.
 #[repr(u32)]
@@ -239,7 +239,7 @@ unsafe fn make(
         THREADS.with_borrow_mut(|threads| {
             (entry.make)(MakeCx {
                 id: &instance.id,
-                thread: &instance.thread,
+                adapter: instance.adapter.as_ref(),
                 def: &instance.def,
                 params: Params(&value),
                 inputs: views,

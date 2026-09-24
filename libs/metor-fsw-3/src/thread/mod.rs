@@ -16,7 +16,7 @@ use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 
 use crate::async_system::{AsyncSystem, Running, Stop};
-use crate::coordinator::{MakeCx, ParamError, Params, Step};
+use crate::coordinator::{Adapter, MakeCx, ParamError, Params, Step};
 use crate::record::Record;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef, SystemInputs, SystemOutputs};
 
@@ -66,6 +66,12 @@ where
     A: AsyncSystem + 'static,
     M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
 {
+    if let Some(Adapter::Channel(channel)) = cx.adapter {
+        return Err(ParamError::Channel {
+            channel: channel.name.clone(),
+        });
+    }
+    let thread_name = cx.thread().to_string();
     let (mut thread, bound_in, bound_out) = bind(cx.def, cx.inputs, cx.outputs)?;
     let member = Member {
         launch: Box::new(AsyncLaunch::<A, M> {
@@ -79,7 +85,7 @@ where
     };
     let group = cx
         .threads
-        .get_or_spawn(cx.thread)
+        .get_or_spawn(&thread_name)
         .map_err(|e| ParamError::Decode(e.to_string()))?;
     group.add(member)?;
     thread.group = Some(group);

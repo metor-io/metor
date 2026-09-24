@@ -21,9 +21,12 @@ pub struct DefCx<'a> {
     pub outputs: &'a [OutputConfig],
     /// Every record the table knows.
     pub records: &'a Records,
+    /// The instance's params.
+    pub params: &'a serde_json::Value,
 }
 
 static NO_RECORDS: LazyLock<Records> = LazyLock::new(Records::default);
+static NO_PARAMS: serde_json::Value = serde_json::Value::Null;
 
 impl DefCx<'static> {
     /// The context with nothing in it: the def the descriptor carries.
@@ -34,6 +37,7 @@ impl DefCx<'static> {
             inputs: &[],
             outputs: &[],
             records: &NO_RECORDS,
+            params: &NO_PARAMS,
         }
     }
 }
@@ -47,6 +51,7 @@ impl<'a> DefCx<'a> {
             inputs,
             outputs: &[],
             records: &NO_RECORDS,
+            params: &NO_PARAMS,
         }
     }
 
@@ -58,6 +63,7 @@ impl<'a> DefCx<'a> {
             inputs: &[],
             outputs,
             records,
+            params: &NO_PARAMS,
         }
     }
 
@@ -123,6 +129,7 @@ pub(crate) fn instance_def(
         inputs: &inputs,
         outputs: &system.outputs,
         records,
+        params: &system.params,
     };
     entry.def_for(&cx).map_err(|source| BuildError::Def {
         id: system.id.clone(),

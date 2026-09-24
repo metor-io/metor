@@ -113,8 +113,9 @@ mod tests;
 
 pub use async_system::{AsyncSystem, Stop};
 pub use coordinator::{
-    BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, OutputConfig, OutputSource,
-    ParamError, Params, PeerLink, PeerPort, PortRef, Step, SystemConfig, SystemStatus, SystemTable,
+    Adapter, BuildError, ChannelConfig, Clock, Coordinator, CoordinatorConfig, InputConfig,
+    OutputConfig, OutputSource, ParamError, Params, PeerLink, PeerPort, PortRef, RunState, Step,
+    SystemConfig, SystemStatus, SystemTable,
 };
 pub use def::{DefCx, DefError, Records};
 pub use dl::{DlStep, Pack, PackError, PackFns};
