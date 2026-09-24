@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::config::PackRef;
 use super::pack_dev::PackDevError;
+use crate::channel::ABORT_PORT;
 use crate::pack::def::{PackDef, PackSystemDef};
 use crate::record::RecordSchema;
 use crate::system::PortDef;
@@ -152,8 +153,17 @@ fn kind(frame: bool) -> &'static str {
     if frame { "frame" } else { "msg" }
 }
 
+/// The ports a target can wire: every one but `abort`, which only a channel feeds.
 fn ports(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
-    system.def.inputs.iter().chain(&system.def.outputs)
+    wired_inputs(system).chain(&system.def.outputs)
+}
+
+fn wired_inputs(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
+    system
+        .def
+        .inputs
+        .iter()
+        .filter(|port| port.name != ABORT_PORT)
 }
 
 fn is_builtin(port: &str) -> bool {
@@ -256,7 +266,7 @@ fn entry(
         args_doc: args_doc(&params),
         takes_inputs: system.takes_inputs,
         takes_outputs: system.takes_outputs,
-        inputs: system.def.inputs.iter().map(port).collect(),
+        inputs: wired_inputs(system).map(port).collect(),
         params,
         ports: declared.map(port).chain(builtin).collect(),
     })
@@ -528,5 +538,21 @@ mod tests {
         );
         assert!(text.contains("_ports = {\"log\": LogEvent, \"status\": SystemStatus}"));
         assert!(text.contains("    log: OutPort[LogEvent]\n    status: OutPort[SystemStatus]\n"));
+    }
+
+    #[test]
+    fn test_abort_input_not_wired() {
+        let text = rendered(vec![system(
+            "arm",
+            vec![port("abort", "abort_request"), port("est", "est")],
+            vec![],
+            None,
+        )])
+        .expect("renders");
+        assert!(
+            text.contains("def __init__(self, *, est: Sources[Est] = ()) -> None:"),
+            "{text}"
+        );
+        assert!(!text.contains("AbortRequest"), "{text}");
     }
 }

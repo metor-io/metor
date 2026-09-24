@@ -1,27 +1,31 @@
-"""The systems every target may add: `Publish` out, `Subscribe` in, and `Db`,
-the embedded database a gateway records into.
+"""The systems every target may add: `Publish` out, `Subscribe` in, `Db`,
+the embedded database a gateway records into, and `DlSlot` and
+`ChannelRegistry` for channels.
 
-All three are built into the host rather than supplied by a pack, so their
-pack has no library and `Target.to_config` leaves it out of the config's pack
-list. Each owns one transport: a `listen` address, a `connect` address, or a
-`peer` link of the deployment that `metor build` turns into an address.
+All are built into the host rather than supplied by a pack, so their pack has
+no library and `Target.to_config` leaves it out of the config's pack list. Each
+link owns one transport: a `listen` address, a `connect` address, or a `peer`
+link of the deployment that `metor build` turns into an address.
 """
 
 from __future__ import annotations
 
 from typing import Any, Sequence, TypeVar
 
-from ._config import ABI_VERSION, ConfigError
+from ._config import ABI_VERSION, ConfigError, check_abi
 from ._model import (
     FRAMEWORK_PORTS,
     Item,
     OutPort,
     Pack,
     Record,
+    SequenceRegistry,
     Source,
+    Sources,
     System,
     _edges,
     _item_ports,
+    _json,
 )
 from ._target import SystemHandle, Target
 
@@ -314,3 +318,77 @@ def _transport(
     if slots < 1:
         raise ConfigError("a listening link takes at least one connection")
     return {"listen": {"addr": listen, "max_connections": slots}}
+
+
+class DlSlot(System):
+    """One place in the schedule that loads a pack system on its channel's `Load`.
+
+    ``allow`` lists the pack systems it may load, each named by its type; every
+    one takes the first's ports. ``initial`` names the one loaded at boot.
+    Inputs are wired on the slot, as keywords of the first system's inputs.
+    The slot needs ``channel=`` on `Target.add`.
+    """
+
+    _ty = "dl_slot"
+    _pack = PACK
+
+    def __init__(
+        self, allow: Sequence[System], initial: str | None = None, **inputs: Sources[Any]
+    ) -> None:
+        names = _candidate_names(allow)
+        if initial is not None and initial not in names:
+            raise ConfigError(f"`initial` names `{initial}`, which `allow` does not list")
+        declared = allow[0]._inputs
+        for port in inputs:
+            if port not in declared:
+                raise ConfigError(f"`{names[0]}` has no input `{port}`")
+        candidates = [_candidate(system) for system in allow]
+        super().__init__(inputs, {"allow": candidates, "initial": initial})
+        self._ports = dict(type(allow[0])._ports)
+        self._names = names
+
+
+def _candidate_names(allow: Sequence[System]) -> list[str]:
+    if not allow:
+        raise ConfigError("a slot allows at least one system")
+    names = [system._ty for system in allow]
+    for name in names:
+        if names.count(name) > 1:
+            raise ConfigError(f"a slot allows `{name}` twice")
+    return names
+
+
+def _candidate(system: System) -> dict[str, Any]:
+    """One `allow` entry: the system's type, params, and the pack `metor build` opens."""
+    if not isinstance(system, System) or isinstance(system, (Link, DlSlot)):
+        raise ConfigError(f"a slot allows pack systems, got {system!r}")
+    check_abi(system._pack.id, system._pack.abi_version)
+    if any(system._inputs.values()):
+        raise ConfigError(f"`{system._ty}` in a slot takes its inputs on the slot")
+    return {
+        "name": system._ty,
+        "ty": system._ty,
+        "params": _json(system._params) or None,
+        "pack": system._pack.to_json(),
+    }
+
+
+class ChannelRegistry(System):
+    """Publishes every channel of its target, with the names each slot may
+    load, on its first cycle and then once a second."""
+
+    _ty = "channel_registry"
+    _pack = PACK
+    _ports = {"registry": SequenceRegistry, **FRAMEWORK_PORTS}
+
+    def __init__(self) -> None:
+        super().__init__({}, {})
+
+    def _params_for(self, target: Any, index: int) -> Any:
+        channels = [
+            {"name": name, "available": system._names if isinstance(system, DlSlot) else []}
+            for name, system in target._channels()
+        ]
+        return {"channels": channels, "period": max(1, round(target.cycle_rate))}
+
+    registry: OutPort[SequenceRegistry]

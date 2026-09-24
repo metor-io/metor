@@ -5,10 +5,11 @@ them, adds the systems a pack module supplies, and ends; the config lands in
 `$METOR_CONFIG_OUT` or on stdout.
 """
 
-from ._builtins import Db, DbStatus, LinkStatus, Publish, Subscribe
+from ._builtins import ChannelRegistry, Db, DbStatus, DlSlot, LinkStatus, Publish, Subscribe
 from ._config import CONFIG_VERSION, ConfigError
 from ._deployment import Deployment, emit, gateway
 from ._model import (
+    ChannelStatus,
     Item,
     LogEvent,
     Loop,
@@ -16,6 +17,9 @@ from ._model import (
     Pack,
     PortRef,
     Record,
+    SequenceChannelEvent,
+    SequenceCommand,
+    SequenceRegistry,
     Source,
     Sources,
     System,
@@ -24,6 +28,12 @@ from ._model import (
 from ._target import SystemHandle, Target
 
 __all__ = [
+    "ChannelRegistry",
+    "ChannelStatus",
+    "DlSlot",
+    "SequenceChannelEvent",
+    "SequenceCommand",
+    "SequenceRegistry",
     "gateway",
     "SystemStatus",
     "LogEvent",

@@ -7,11 +7,22 @@ import os
 import tempfile
 import unittest
 
-from adcs_stub import PACK, Ctrl, Fan, Mode, MotorCmd, Nav, Ping, Plant, Tap
+from adcs_stub import PACK, Ctrl, Fan, Hold, Mode, MotorCmd, Nav, Ping, Plant, Safe, Tap
 
 import metor_config._deployment as deploy_mod
 import metor_config._target as target_mod
-from metor_config import ConfigError, Deployment, PortRef, Publish, Subscribe, Target, emit
+from metor_config import (
+    ChannelRegistry,
+    ConfigError,
+    Deployment,
+    DlSlot,
+    PortRef,
+    Publish,
+    SequenceCommand,
+    Subscribe,
+    Target,
+    emit,
+)
 from metor_config._config import ABI_VERSION
 
 GOLDEN = os.path.join(
@@ -441,3 +452,111 @@ class LinkTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def slotted() -> tuple[Target, dict[str, dict]]:
+    """Commands, a plain channel, a slot, and a registry, by system id."""
+    fsw = Target(cycle_rate=50.0)
+    cmds = fsw.add("cmds", Subscribe([SequenceCommand], listen="127.0.0.1:0"))
+    fsw.commands(cmds.sequence_command)
+    nav = fsw.add("nav", Nav(), channel="nav")
+    fsw.add("mode", DlSlot(allow=[Safe(hold=2.0), Hold()], initial="hold", est=nav.est),
+            channel="mode", start="stopped")
+    fsw.add("channels", ChannelRegistry())
+    systems = fsw.to_config()["coordinator"]["systems"]
+    return fsw, {system["id"]: system for system in systems}
+
+
+class ChannelTest(unittest.TestCase):
+    def setUp(self) -> None:
+        reset()
+        os.environ.pop("METOR_FSW_ABI_VERSION", None)
+
+    def tearDown(self) -> None:
+        reset()
+
+    def test_channel_emits_adapter_and_commands(self) -> None:
+        _, systems = slotted()
+        nav = systems["nav"]
+        self.assertEqual(nav["channel"], {"name": "nav", "start": "running"})
+        self.assertNotIn("thread", nav)
+        commands = {"port": "commands", "from": [{"system": "cmds", "port": "sequence_command"}]}
+        self.assertIn(commands, nav["inputs"])
+        self.assertEqual(systems["mode"]["channel"], {"name": "mode", "start": "stopped"})
+
+    def test_commands_reach_later_channels(self) -> None:
+        fsw = Target(cycle_rate=50.0)
+        fsw.add("early", Nav(), channel="early")
+        cmds = fsw.add("cmds", Subscribe([SequenceCommand], listen="127.0.0.1:0"))
+        fsw.commands(cmds.sequence_command)
+        fsw.add("late", Nav(), channel="late")
+        systems = fsw.to_config()["coordinator"]["systems"]
+        for system in (systems[0], systems[2]):
+            self.assertEqual(system["inputs"][-1]["port"], "commands")
+
+    def test_channel_exposes_its_ports(self) -> None:
+        fsw = Target(cycle_rate=50.0)
+        nav = fsw.add("nav", Nav(), channel="nav")
+        self.assertEqual(nav.events.ref, PortRef("nav", "events"))
+        self.assertEqual(nav.channel_status.ref, PortRef("nav", "channel_status"))
+        plain = fsw.add("plain", Nav())
+        with self.assertRaisesRegex(AttributeError, "channel_status"):
+            plain.channel_status  # type: ignore[attr-defined]
+        pub = fsw.add("pub", Publish([nav], listen="127.0.0.1:0"))
+        ports = [i["port"] for i in fsw.to_config()["coordinator"]["systems"][2]["inputs"]]
+        self.assertIn("nav.channel_status", ports)
+        self.assertIsNotNone(pub)
+
+    def test_thread_and_channel_refused(self) -> None:
+        fsw = Target(cycle_rate=50.0)
+        with self.assertRaisesRegex(ConfigError, "not both"):
+            fsw.add("nav", Nav(), thread="io", channel="nav")
+        with self.assertRaisesRegex(ConfigError, "needs `channel`"):
+            fsw.add("nav", Nav(), start="stopped")
+        with self.assertRaisesRegex(ConfigError, "`running` or `stopped`"):
+            fsw.add("nav", Nav(), channel="nav", start="paused")
+
+    def test_slot_lists_candidates_outside_packs(self) -> None:
+        fsw, systems = slotted()
+        mode = systems["mode"]
+        self.assertEqual(mode["ty"], "fsw.dl_slot")
+        allow = mode["params"]["allow"]
+        self.assertEqual([c["name"] for c in allow], ["safe", "hold"])
+        self.assertEqual(allow[0]["params"], {"hold": 2.0})
+        self.assertIsNone(allow[1]["params"])
+        self.assertEqual(allow[0]["pack"], PACK.to_json())
+        self.assertEqual(mode["params"]["initial"], "hold")
+        self.assertEqual(mode["inputs"][0], {"port": "est", "from": [{"system": "nav", "port": "est"}]})
+        self.assertEqual(fsw.to_config()["packs"], [PACK.to_json()])
+
+    def test_slot_takes_first_candidate_ports(self) -> None:
+        fsw = Target(cycle_rate=50.0)
+        mode = fsw.add("mode", DlSlot(allow=[Safe(), Hold()]), channel="mode")
+        self.assertEqual(mode.cmd.ref, PortRef("mode", "cmd"))
+        self.assertEqual(mode.events.ref, PortRef("mode", "events"))
+
+    def test_slot_refusals(self) -> None:
+        fsw = Target(cycle_rate=50.0)
+        nav = fsw.add("nav", Nav())
+        with self.assertRaisesRegex(ConfigError, "at least one"):
+            DlSlot(allow=[])
+        with self.assertRaisesRegex(ConfigError, "twice"):
+            DlSlot(allow=[Safe(), Safe()])
+        with self.assertRaisesRegex(ConfigError, "does not list"):
+            DlSlot(allow=[Safe()], initial="hold")
+        with self.assertRaisesRegex(ConfigError, "no input `imu`"):
+            DlSlot(allow=[Safe()], imu=nav.est)
+        with self.assertRaisesRegex(ConfigError, "on the slot"):
+            DlSlot(allow=[Safe(est=nav.est)])
+        with self.assertRaisesRegex(ConfigError, "pack systems"):
+            DlSlot(allow=[Publish(listen="127.0.0.1:0")])
+
+    def test_registry_lists_channels(self) -> None:
+        _, systems = slotted()
+        params = systems["channels"]["params"]
+        self.assertEqual(
+            params["channels"],
+            [{"name": "nav", "available": []}, {"name": "mode", "available": ["safe", "hold"]}],
+        )
+        self.assertEqual(params["period"], 50)
+        self.assertEqual(systems["channels"]["ty"], "fsw.channel_registry")

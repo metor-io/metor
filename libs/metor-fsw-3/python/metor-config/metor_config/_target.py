@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, TypeVar, cast
 
 from ._config import ConfigError, check_abi, simulated_clock, wall_clock
-from ._model import Loop, OutPort, Pack, Record, Source, System, _json
+from ._model import CHANNEL_PORTS, Loop, OutPort, Pack, Record, Source, System, _json, _sources
 
 S = TypeVar("S", bound=System)
 T = TypeVar("T", bound=Record)
@@ -24,10 +24,17 @@ class SystemHandle:
         self._system = system
 
     def __getattr__(self, port: str) -> Any:
-        record = self._system._port_map().get(port)
+        record = self._port_map().get(port)
         if record is None:
             raise AttributeError(f"system `{self._name}` has no output port `{port}`")
         return OutPort(self._name, port, record, self._target)
+
+    def _port_map(self) -> dict[str, type[Record]]:
+        """Every output this system has, with a channel's own when it has one."""
+        ports = self._system._port_map()
+        if self._target._channel(self._name) is None:
+            return ports
+        return {**ports, **CHANNEL_PORTS}
 
     def port(self, source: OutPort[T]) -> OutPort[T]:
         """This system's copy of ``source``; see `Subscribe.port`."""
@@ -53,8 +60,9 @@ class Target:
         self.sim_dt = sim_dt
         self.ring_depth = ring_depth
         self.namespace = namespace
-        self._systems: list[tuple[str, System, str | None]] = []
+        self._systems: list[tuple[str, System, dict[str, Any] | None]] = []
         self._handles: dict[str, SystemHandle] = {}
+        self._commands: list[Source[Any]] = []
         self._packs: dict[str, Pack] = {}
         _targets.append(self)
 
@@ -63,11 +71,23 @@ class Target:
         its producer. Connect it once the producer exists."""
         return Loop(record)
 
-    def add(self, name: str, system: S, thread: str | None = None) -> S:
+    def add(
+        self,
+        name: str,
+        system: S,
+        thread: str | None = None,
+        channel: str | None = None,
+        start: str | None = None,
+    ) -> S:
         """Register ``system`` as ``name``; the returned handle carries its output
         ports. Add order is step order, so a system only names ports of systems
         already added. ``thread`` places an async system on a thread of that name.
+
+        ``channel`` makes a cyclic system commandable under that name, adding
+        its ``events`` and ``channel_status`` outputs; ``start`` is
+        ``"running"`` or ``"stopped"``, its state at boot.
         """
+        adapter = _adapter(thread, channel, start)
         if name in self._handles:
             raise ConfigError(f"system `{name}` is already added")
         packs = (system._pack, *system._record_packs)
@@ -77,10 +97,29 @@ class Target:
             self._packs.setdefault(pack.id, pack)
         system._name = name
         system._target = self
-        self._systems.append((name, system, thread))
+        self._systems.append((name, system, adapter))
         handle = SystemHandle(name, self, system)
         self._handles[name] = handle
         return cast(S, handle)
+
+    def commands(self, *sources: Source[Any]) -> None:
+        """Feed every channel, added before or after this call, the
+        `SequenceCommand`s these ports carry."""
+        self._commands.extend(_sources("commands", sources))
+
+    def _channels(self) -> list[tuple[str, System]]:
+        """Each channel's name and its system, in step order."""
+        return [
+            (adapter["channel"]["name"], system)
+            for _, system, adapter in self._systems
+            if adapter is not None and "channel" in adapter
+        ]
+
+    def _channel(self, name: str) -> dict[str, Any] | None:
+        for added, _, adapter in self._systems:
+            if added == name:
+                return adapter.get("channel") if adapter is not None else None
+        return None
 
     def index(self, name: str) -> int:
         """Where the system `name` sits in step order."""
@@ -107,20 +146,23 @@ class Target:
         }
 
     def _system(self, index: int) -> dict[str, Any]:
-        name, system, thread = self._systems[index]
+        name, system, adapter = self._systems[index]
         entry: dict[str, Any] = {
             "id": name,
             "ty": f"{system._pack.id}.{system._ty}",
             "params": _json(system._params_for(self, index)),
         }
-        if thread is not None:
-            entry["thread"] = thread
+        if adapter is not None:
+            entry.update(adapter)
+        inputs = dict(system._inputs_for(self, index))
+        if adapter is not None and "channel" in adapter and self._commands:
+            inputs["commands"] = self._commands
         entry["inputs"] = [
             {
                 "port": port,
                 "from": [_resolve(self, name, port, source) for source in sources],
             }
-            for port, sources in system._inputs_for(self, index).items()
+            for port, sources in inputs.items()
         ]
         outputs = system._outputs_for(self, index)
         if outputs:
@@ -131,6 +173,23 @@ class Target:
         if self.sim_dt is not None:
             return simulated_clock(self.sim_dt)
         return wall_clock(self.cycle_rate)
+
+
+def _adapter(
+    thread: str | None, channel: str | None, start: str | None
+) -> dict[str, Any] | None:
+    """The adapter key a system's config entry carries, if any."""
+    if thread is not None and channel is not None:
+        raise ConfigError("a system takes `thread` or `channel`, not both")
+    if start is not None and channel is None:
+        raise ConfigError("`start` sets a channel's state at boot, so it needs `channel`")
+    if start not in (None, "running", "stopped"):
+        raise ConfigError(f"`start` is `running` or `stopped`, got {start!r}")
+    if thread is not None:
+        return {"thread": thread}
+    if channel is None:
+        return None
+    return {"channel": {"name": channel, "start": start or "running"}}
 
 
 def _resolve(target: Target, name: str, port: str, source: Source[Any]) -> dict[str, str]:
