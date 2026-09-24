@@ -41,6 +41,22 @@ pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
     system_attr::system(item)
 }
 
+/// Rewrites an `async fn` into a fn returning its sequence, polled once per
+/// cycle until it returns. Parameters are ports as on `#[system]`, plus a
+/// `seq: &Seq` for the time, waits, and abort. It returns
+/// `Result<(), SeqError>`.
+///
+/// ```ignore
+/// #[sequence]
+/// async fn arm(seq: &Seq, cmd: &mut Output<Arm>) -> Result<(), SeqError> { .. }
+///
+/// table.register_sequence("arm", arm(), Default::default)?;
+/// ```
+#[proc_macro_attribute]
+pub fn sequence(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    system_attr::sequence(item)
+}
+
 /// Derives `SystemInputs` for a struct of `Input<F>` fields.
 #[proc_macro_derive(SystemInputs)]
 pub fn system_inputs(input: TokenStream) -> TokenStream {

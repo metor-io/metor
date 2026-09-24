@@ -1,10 +1,10 @@
 use quote::{ToTokens, quote};
 use syn::{ImplItem, Item, ItemFn, Stmt};
 
-use super::expand;
+use super::{Kind, expand};
 
 fn expand_fn(item: proc_macro2::TokenStream) -> ItemFn {
-    let out = expand(item, &quote!(::fsw));
+    let out = expand(item, &quote!(::fsw), Kind::System);
     syn::parse2(out).expect("one rewritten fn")
 }
 
@@ -118,6 +118,7 @@ fn test_error_keeps_fn() {
     let out = expand(
         quote! { fn two(#[state] a: &mut A, #[state] b: &mut B) {} },
         &quote!(::fsw),
+        Kind::System,
     )
     .to_string();
     assert!(out.contains("fn two"));
@@ -138,7 +139,63 @@ fn test_rejects_bad_signatures() {
         quote! { async fn a(x: &mut Input<T>) {} },
     ];
     for case in cases {
-        let out = expand(case.clone(), &quote!(::fsw)).to_string();
+        let out = expand(case.clone(), &quote!(::fsw), Kind::System).to_string();
         assert!(out.contains("compile_error"), "{case} expanded to {out}");
     }
+}
+
+#[test]
+fn test_sequence_fn() {
+    let out = expand(
+        quote! {
+            /// Arms the motors.
+            async fn arm(
+                #[state] s: &mut Arm,
+                seq: &Seq,
+                cmd: &mut Output<Cmd>,
+            ) -> Result<(), SeqError> {
+                Ok(())
+            }
+        },
+        &quote!(::fsw),
+        Kind::Sequence,
+    );
+    let f: ItemFn = syn::parse2(out).expect("one rewritten fn");
+    assert_eq!(
+        impl_item(&f, "Ports", "NAMES"),
+        tokens(quote!(&["seq", "cmd"]))
+    );
+    assert_eq!(
+        impl_item(&f, "Ports", "Params"),
+        tokens(quote!((Seq, Output<Cmd>,)))
+    );
+    assert_eq!(impl_item(&f, "Ports", "State"), tokens(quote!(Arm)));
+    assert_eq!(
+        impl_item(&f, "Ports", "DOC"),
+        tokens(quote!("Arms the motors."))
+    );
+    assert!(has_impl(&f, "SequenceFn"));
+    assert!(!has_impl(&f, "Deref") && !has_impl(&f, "SystemFn"));
+}
+
+#[test]
+fn test_rejects_bad_sequences() {
+    let cases = [
+        quote! { fn a(seq: &Seq) -> Result<(), SeqError> { Ok(()) } },
+        quote! { async fn a(seq: &Seq, stop: Stop) -> Result<(), SeqError> { Ok(()) } },
+        quote! { async fn a(seq: &Seq) {} },
+        quote! { async fn a(seq: &Seq) -> u32 { 0 } },
+        quote! { async fn a(seq: &Seq, now: Timestamp) -> Result<(), SeqError> { Ok(()) } },
+        quote! { async fn a(abort: &mut Abort) -> Result<(), SeqError> { Ok(()) } },
+    ];
+    for case in cases {
+        let out = expand(case.clone(), &quote!(::fsw), Kind::Sequence).to_string();
+        assert!(out.contains("compile_error"), "{case} expanded to {out}");
+    }
+}
+
+#[test]
+fn test_system_rejects_seq() {
+    let out = expand(quote! { fn a(seq: &Seq) {} }, &quote!(::fsw), Kind::System).to_string();
+    assert!(out.contains("compile_error"), "{out}");
 }

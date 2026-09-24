@@ -11,6 +11,7 @@ use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{AsyncSystemFn, Ctor, FnAsyncSystem, FnSystem, SystemFn};
+use crate::sequence::SequenceFn;
 use crate::system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
 };
@@ -104,6 +105,17 @@ impl SystemTable {
         let make = move |params: Params<'_>| Ok((FnSystem::default(), ctor.make(params)?));
         let entry = entry::<FnSystem<S>>(make, Cow::Borrowed(S::DOC), C::schema())
             .map_err(def_error(ty))?;
+        self.insert(ty, entry)
+    }
+
+    /// Registers a `#[sequence]` fn under `ty`, its state built by `ctor`.
+    pub fn register_sequence<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
+        &mut self,
+        ty: &str,
+        _sequence: S,
+        ctor: C,
+    ) -> Result<(), BuildError> {
+        let entry = crate::sequence::entry::<S, M, C>(ctor).map_err(def_error(ty))?;
         self.insert(ty, entry)
     }
 
@@ -258,37 +270,9 @@ fn entry<S: System + 'static>(
         doc,
         schema,
         make: Arc::new(move |cx| {
-            if let Some(Adapter::Thread(thread)) = cx.adapter {
-                return Err(ParamError::Thread {
-                    thread: thread.clone(),
-                });
-            }
+            refuse_thread(cx.adapter)?;
             let (system, state) = make(cx.params)?;
-            let views = cx
-                .def
-                .inputs
-                .iter()
-                .zip(cx.inputs)
-                .map(|(def, rings)| InputBinding {
-                    def: def.clone(),
-                    views: rings
-                        .into_iter()
-                        // PANIC Safety: the build pass counts one reader slot per edge.
-                        .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
-                        .collect(),
-                })
-                .collect();
-            let writers = cx
-                .def
-                .outputs
-                .iter()
-                .zip(cx.outputs)
-                .map(|(def, ring)| OutputBinding {
-                    def: def.clone(),
-                    // PANIC Safety: one ring is allocated per output port.
-                    writer: ring.writer(NoWake).expect("one writer per output ring"),
-                })
-                .collect();
+            let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
             Ok(Box::new(Runner {
                 system,
                 state,
@@ -297,6 +281,48 @@ fn entry<S: System + 'static>(
             }))
         }),
     })
+}
+
+/// Refuses a thread, which only an async system runs on.
+pub(crate) fn refuse_thread(adapter: Option<&Adapter>) -> Result<(), ParamError> {
+    match adapter {
+        Some(Adapter::Thread(thread)) => Err(ParamError::Thread {
+            thread: thread.clone(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// One view per input edge and one writer per output, for a cyclic system.
+pub(crate) fn bindings(
+    def: &SystemDef,
+    inputs: Vec<Vec<&RingBuffer>>,
+    outputs: Vec<&RingBuffer>,
+) -> (Vec<InputBinding>, Vec<OutputBinding>) {
+    let views = def
+        .inputs
+        .iter()
+        .zip(inputs)
+        .map(|(def, rings)| InputBinding {
+            def: def.clone(),
+            views: rings
+                .into_iter()
+                // PANIC Safety: the build pass counts one reader slot per edge.
+                .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
+                .collect(),
+        })
+        .collect();
+    let writers = def
+        .outputs
+        .iter()
+        .zip(outputs)
+        .map(|(def, ring)| OutputBinding {
+            def: def.clone(),
+            // PANIC Safety: one ring is allocated per output port.
+            writer: ring.writer(NoWake).expect("one writer per output ring"),
+        })
+        .collect();
+    (views, writers)
 }
 
 /// Builds one async entry, whose `make` places the system on its group's thread.

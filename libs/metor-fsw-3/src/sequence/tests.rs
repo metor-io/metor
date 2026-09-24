@@ -1,0 +1,309 @@
+//! Sequence steps, driven by hand and by a coordinator.
+
+use core::cell::Cell;
+use core::time::Duration;
+use std::rc::Rc;
+
+use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+use metor_proto::types::Timestamp;
+use metor_proto_wkt::LogLevel;
+
+use super::*;
+use crate::channel::AbortRequest;
+use crate::coordinator::{
+    Adapter, BuildError, CoordinatorConfig, End, InputConfig, PortRef, Step, SystemConfig,
+    SystemTable,
+};
+use crate::log::Log;
+use crate::port::{Output, ring_capacity};
+use crate::system::{InputBinding, OutputBinding};
+use crate::tests::utils::{self, Imu, Recorder};
+
+/// The phase a sequence has reached, shared with the test.
+#[derive(Clone, Default)]
+struct Phase(Rc<Cell<u32>>);
+
+impl Phase {
+    fn get(&self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// Marks three phases, one cycle apart.
+#[crate::sequence]
+async fn phases(#[state] phase: &mut Phase, seq: &Seq) -> Result<(), SeqError> {
+    for at in 1..=3 {
+        phase.0.set(at);
+        if at < 3 {
+            seq.next_cycle().await;
+        }
+    }
+    Ok(())
+}
+
+/// Sleeps 10 ms, then marks its phase.
+#[crate::sequence]
+async fn napper(#[state] phase: &mut Phase, seq: &Seq) -> Result<(), SeqError> {
+    seq.sleep(Duration::from_millis(10)).await?;
+    phase.0.set(1);
+    Ok(())
+}
+
+/// Fails once the second cycle comes.
+#[crate::sequence]
+async fn no_fix(seq: &Seq, log: &mut Log) -> Result<(), SeqError> {
+    log.info("waiting for a fix");
+    seq.next_cycle().await;
+    Err(SeqError::Failed("no fix".into()))
+}
+
+/// Waits an hour, which only an abort cuts short.
+#[crate::sequence]
+async fn patient(seq: &Seq) -> Result<(), SeqError> {
+    seq.sleep(Duration::from_secs(3600)).await
+}
+
+/// Panics on its second poll.
+#[crate::sequence]
+async fn doomed(seq: &Seq) -> Result<(), SeqError> {
+    seq.next_cycle().await;
+    panic!("doomed on its second poll")
+}
+
+/// Writes one sample, then ends.
+#[crate::sequence]
+async fn one_sample(seq: &Seq, imu: &mut Output<Imu>) -> Result<(), SeqError> {
+    let _ = imu.write(&Imu {
+        timestamp: seq.now(),
+        sample: 1.0,
+    });
+    Ok(())
+}
+
+/// Asks for an abort from its second cycle on.
+#[crate::system]
+fn aborter(#[state] cycles: &mut u64, abort: &mut Output<AbortRequest>) {
+    *cycles += 1;
+    if *cycles >= 2 {
+        let _ = abort.write(&AbortRequest {});
+    }
+}
+
+fn ms(ms: i64) -> Timestamp {
+    Timestamp(ms * 1_000)
+}
+
+/// A sequence's definition under the empty context.
+fn def_of<S: SequenceFn>(_sequence: S) -> crate::system::SystemDef {
+    def::<S>(&crate::def::DefCx::empty()).expect("a static definition")
+}
+
+/// One step of `S` over fresh rings, with nothing feeding its inputs.
+fn step_of<S: SequenceFn>(_sequence: S, state: S::State) -> (SequenceStep, Vec<RingBuffer>) {
+    let def = def::<S>(&crate::def::DefCx::empty()).expect("a static definition");
+    let inputs = def
+        .inputs
+        .iter()
+        .map(|def| InputBinding {
+            def: def.clone(),
+            views: Vec::new(),
+        })
+        .collect();
+    let rings: Vec<RingBuffer> = def
+        .outputs
+        .iter()
+        .map(|port| {
+            RingBuffer::create_in_memory(Config {
+                capacity: ring_capacity(port.max_len, 8).expect("valid capacity"),
+                max_readers: 1,
+            })
+        })
+        .collect();
+    let outputs = def
+        .outputs
+        .iter()
+        .zip(&rings)
+        .map(|(def, ring)| OutputBinding {
+            def: def.clone(),
+            writer: ring.writer(NoWake).expect("a free writer"),
+        })
+        .collect();
+    (SequenceStep::new::<S>(state, inputs, outputs), rings)
+}
+
+fn table(recorder: &Recorder) -> SystemTable {
+    let mut table = utils::table(recorder);
+    table
+        .register_sequence("no_fix", no_fix(), Default::default)
+        .expect("valid records");
+    table
+        .register_sequence("patient", patient(), Default::default)
+        .expect("valid records");
+    table
+        .register_sequence("doomed", doomed(), Default::default)
+        .expect("valid records");
+    table
+        .register_sequence("phases", phases(), Phase::default)
+        .expect("valid records");
+    table
+        .register("aborter", aborter(), u64::default)
+        .expect("valid records");
+    table
+}
+
+/// `id`, of type `ty`, with its log drained into the recorder after it.
+fn logged(id: &str, ty: &str) -> CoordinatorConfig {
+    CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new(id, ty),
+            SystemConfig {
+                inputs: vec![InputConfig {
+                    port: "lines".into(),
+                    from: vec![PortRef::new(id, "log")],
+                }],
+                ..SystemConfig::new("logs", "log_sink")
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_def_reads_abort_first() {
+    let def = def_of(one_sample());
+    let inputs: Vec<_> = def.inputs.iter().map(|p| p.name.as_ref()).collect();
+    let outputs: Vec<_> = def.outputs.iter().map(|p| p.name.as_ref()).collect();
+    assert_eq!(inputs, ["abort"]);
+    assert_eq!(outputs, ["imu", "log"]);
+    assert_eq!(def.name, "one_sample");
+}
+
+#[test]
+fn test_sequence_completes() {
+    let phase = Phase::default();
+    let (mut step, _rings) = step_of(phases(), phase.clone());
+    step.execute(ms(0));
+    assert_eq!((phase.get(), step.ended()), (1, None));
+    step.execute(ms(1));
+    assert_eq!((phase.get(), step.ended()), (2, None));
+    step.execute(ms(2));
+    assert_eq!((phase.get(), step.ended()), (3, Some(&End::Completed)));
+}
+
+#[test]
+fn test_paused_step_resumes_at_its_await() {
+    let phase = Phase::default();
+    let (mut step, _rings) = step_of(phases(), phase.clone());
+    step.execute(ms(0));
+    step.execute(ms(1));
+    // Cycles 2 to 9 pass with the step not executed, as a stopped channel's.
+    step.execute(ms(10));
+    assert_eq!((phase.get(), step.ended()), (3, Some(&End::Completed)));
+}
+
+#[test]
+fn test_sleep_counts_paused_time() {
+    let phase = Phase::default();
+    let (mut step, _rings) = step_of(napper(), phase.clone());
+    step.execute(ms(0));
+    step.execute(ms(5));
+    assert_eq!(phase.get(), 0);
+    step.execute(ms(40));
+    assert_eq!((phase.get(), step.ended()), (1, Some(&End::Completed)));
+}
+
+#[test]
+fn test_ended_step_polls_nothing() {
+    let phase = Phase::default();
+    let (mut step, _rings) = step_of(napper(), phase.clone());
+    step.execute(ms(0));
+    step.execute(ms(10));
+    phase.0.set(7);
+    step.execute(ms(20));
+    assert_eq!((phase.get(), step.ended()), (7, Some(&End::Completed)));
+}
+
+#[test]
+fn test_failure_ends_with_its_text() {
+    let recorder = Recorder::default();
+    let mut coordinator = logged("fix", "no_fix").build(&table(&recorder)).unwrap();
+    coordinator.step(ms(1));
+    coordinator.step(ms(2));
+    let ended: Vec<_> = coordinator.ended().collect();
+    assert_eq!(ended, [("fix", &End::Failed("no fix".into()))]);
+    assert_eq!(coordinator.latched().count(), 0);
+
+    let lines = recorder.take_logs();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(
+        (lines[0].level, lines[0].message.as_ref()),
+        (LogLevel::Info, "waiting for a fix")
+    );
+    assert_eq!(lines[0].timestamp, ms(1));
+    assert_eq!(
+        (lines[1].level, lines[1].message.as_ref()),
+        (LogLevel::Error, "no fix")
+    );
+    assert_eq!(lines[1].fields, vec![("kind".into(), "failed".into())]);
+}
+
+#[test]
+fn test_abort_ends_the_sequence() {
+    let recorder = Recorder::default();
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("aborter", "aborter"),
+            SystemConfig {
+                inputs: vec![InputConfig {
+                    port: "abort".into(),
+                    from: vec![PortRef::new("aborter", "abort")],
+                }],
+                ..SystemConfig::new("wait", "patient")
+            },
+        ],
+        ..Default::default()
+    };
+    let mut coordinator = config.build(&table(&recorder)).unwrap();
+    coordinator.step(ms(1));
+    assert_eq!(coordinator.ended().count(), 0);
+    coordinator.step(ms(2));
+    let ended: Vec<_> = coordinator.ended().collect();
+    assert_eq!(ended, [("wait", &End::Aborted)]);
+}
+
+#[test]
+fn test_panic_unwinds_to_the_coordinator() {
+    let recorder = Recorder::default();
+    let mut coordinator = logged("doom", "doomed").build(&table(&recorder)).unwrap();
+    coordinator.step(ms(1));
+    assert_eq!(coordinator.latched().count(), 0);
+    coordinator.step(ms(2));
+    assert_eq!(coordinator.latched().collect::<Vec<_>>(), ["doom"]);
+    let lines = recorder.take_logs();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].message, "doomed on its second poll");
+    assert_eq!(lines[0].fields, vec![("kind".into(), "panic".into())]);
+}
+
+#[test]
+fn test_sequence_refuses_a_thread() {
+    let config = CoordinatorConfig {
+        systems: vec![SystemConfig {
+            adapter: Some(Adapter::Thread("gps".into())),
+            ..SystemConfig::new("p", "phases")
+        }],
+        ..Default::default()
+    };
+    assert!(matches!(
+        config.build(&table(&Recorder::default())),
+        Err(BuildError::ThreadOnCyclic { .. })
+    ));
+}
+
+#[test]
+fn test_sequence_registers_its_doc() {
+    let table = table(&Recorder::default());
+    let entry = table.get("phases").expect("registered");
+    assert_eq!(entry.doc, "Marks three phases, one cycle apart.");
+    assert_eq!(entry.def.inputs[0].name, "abort");
+}

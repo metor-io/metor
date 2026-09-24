@@ -15,6 +15,7 @@ use crate::coordinator::{
 };
 use crate::def::DefCx;
 use crate::port::{Input, Output};
+use crate::sequence::{Seq, SeqError};
 use crate::system::SystemDef;
 use crate::tests::utils::{Imu, ImuSource};
 use crate::{FrameBytes, FrameStr, system};
@@ -104,6 +105,18 @@ fn plain(#[state] c: &mut Counter) {
     c.tick();
 }
 
+/// Ticks once a cycle until aborted.
+#[crate::sequence]
+async fn ticker(#[state] c: &mut Counter, seq: &Seq) -> Result<(), SeqError> {
+    loop {
+        c.tick();
+        seq.next_cycle().await;
+        if seq.aborted() {
+            return Err(SeqError::Aborted);
+        }
+    }
+}
+
 struct Watch(Shared);
 
 #[system]
@@ -185,6 +198,10 @@ fn table(shared: &Shared) -> SystemTable {
         .expect("valid");
     table
         .register_system("imu", |_| Ok((ImuSource, 0)))
+        .expect("valid");
+    let s = shared.clone();
+    table
+        .register_sequence("ticker", ticker(), move || Counter::new(s.clone()))
         .expect("valid");
     table.insert("slot", slot_entry()).expect("valid");
     table
@@ -446,4 +463,50 @@ fn test_channel_def_appends_ports() {
     let outputs: Vec<_> = def.outputs.iter().map(|p| p.name.as_ref()).collect();
     assert_eq!(inputs, ["imu", "commands"]);
     assert_eq!(outputs, ["events", "channel_status"]);
+}
+
+#[test]
+fn test_sequence_resumes_at_its_await() {
+    let (shared, mut coordinator) = build("ticker", RunState::Running);
+    coordinator.step(Timestamp(1));
+    coordinator.step(Timestamp(2));
+    assert_eq!(shared.counts(), [1, 2]);
+
+    shared.send("ctr", SequenceCommandKind::Stop);
+    coordinator.step(Timestamp(3));
+    coordinator.step(Timestamp(4));
+    assert!(shared.counts().is_empty());
+
+    shared.send("ctr", SequenceCommandKind::Start);
+    coordinator.step(Timestamp(5));
+    assert_eq!(shared.counts(), [3]);
+    assert_eq!(shared.0.borrow().makes, 1);
+}
+
+#[test]
+fn test_abort_ends_sequence_channel() {
+    let (shared, mut coordinator) = build("ticker", RunState::Running);
+    coordinator.step(Timestamp(1));
+    shared.send("ctr", SequenceCommandKind::Abort);
+    coordinator.step(Timestamp(2));
+    coordinator.step(Timestamp(3));
+    let events = shared.events();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                SequenceEventKind::Progress { .. },
+                SequenceEventKind::Aborted
+            ]
+        ),
+        "{events:?}"
+    );
+    assert_eq!(shared.state(), ChannelState::Aborted.code());
+
+    shared.send("ctr", SequenceCommandKind::Start);
+    coordinator.step(Timestamp(4));
+    assert!(matches!(
+        shared.events().as_slice(),
+        [SequenceEventKind::Refused { .. }]
+    ));
 }

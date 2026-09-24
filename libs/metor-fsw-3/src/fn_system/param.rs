@@ -10,6 +10,7 @@ use crate::def::{DefCx, DefError};
 use crate::log::Log;
 use crate::port::{DynInputs, DynOutputs, Input, Output};
 use crate::record::Record;
+use crate::sequence::Seq;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
 
 /// The bindings a bundle binds from, in parameter order: each parameter takes
@@ -126,6 +127,7 @@ fn names(ports: &[PortDef]) -> Vec<Cow<'static, str>> {
 pub struct Cycle<'a> {
     pub now: Timestamp,
     log: Option<&'a mut Log>,
+    seq: Option<&'a Seq>,
 }
 
 impl<'a> Cycle<'a> {
@@ -133,7 +135,25 @@ impl<'a> Cycle<'a> {
         Self {
             now,
             log: Some(log),
+            seq: None,
         }
+    }
+
+    /// A sequence's cycle, which hands its [`Seq`] to the parameter taking it.
+    pub(crate) fn with_seq(now: Timestamp, log: &'a mut Log, seq: &'a Seq) -> Self {
+        Self {
+            now,
+            log: Some(log),
+            seq: Some(seq),
+        }
+    }
+
+    /// The sequence's handle.
+    pub fn seq(&self) -> &'a Seq {
+        // PANIC Safety: `#[system]` rejects a `Seq` parameter, so only a
+        // sequence, whose step builds its cycle `with_seq`, reaches this.
+        self.seq
+            .expect("a `Seq` parameter only on a `#[sequence]` fn")
     }
 
     /// Hands the log to the one `&mut Log` parameter.
@@ -375,6 +395,33 @@ impl<D: WakeSink + 'static> Param for Abort<D> {
         _cx: &mut Cycle<'a>,
     ) -> Self::Item<'a, W> {
         input
+    }
+}
+
+impl Param for Seq {
+    type In<W: WakeSink + Clone + 'static> = ();
+    type Out = ();
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a Seq;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        _defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        name(names);
+        Ok(())
+    }
+
+    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+
+    fn bind_out(_writers: &mut Writers) {}
+
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        _input: &'a mut (),
+        _output: &'a mut (),
+        cx: &mut Cycle<'a>,
+    ) -> &'a Seq {
+        cx.seq()
     }
 }
 
