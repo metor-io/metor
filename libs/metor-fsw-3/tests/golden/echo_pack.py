@@ -16,6 +16,12 @@ PACK = Pack(
 )
 
 
+class AbortRequest(Record):
+    _name = "abort_request"
+    _kind = "msg"
+    _pack = PACK
+
+
 class LogEvent(Record):
     _name = "log"
     _kind = "msg"
@@ -169,6 +175,36 @@ class Retained(System):
 
     def __init__(self, *, input: Sources[Ping] = ()) -> None:
         super().__init__({"input": input}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class CountUp(System):
+    "Pings one, two, and three on successive cycles, then completes."
+
+    _pack = PACK
+    _ty = "count_up"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, abort: Sources[AbortRequest] = (), input: Sources[Ping] = ()) -> None:
+        super().__init__({"abort": abort, "input": input}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class CountDown(System):
+    "Pings zero, then waits until aborted."
+
+    _pack = PACK
+    _ty = "count_down"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, abort: Sources[AbortRequest] = (), input: Sources[Ping] = ()) -> None:
+        super().__init__({"abort": abort, "input": input}, {})
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]

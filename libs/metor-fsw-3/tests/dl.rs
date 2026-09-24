@@ -148,7 +148,9 @@ fn test_pack_reports_system_metadata() {
             "boom",
             "gain",
             "fail_input",
-            "retained"
+            "retained",
+            "count_up",
+            "count_down"
         ]
     );
 

@@ -6,7 +6,8 @@ use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
     DefCx, DefError, DynInputs, Frame, Input, InputBinding, Output, OutputBinding, PortDef, Record,
-    Stop, System, SystemDef, SystemInputs, SystemOutputs, SystemTable, Timestamp, system,
+    Seq, SeqError, Stop, System, SystemDef, SystemInputs, SystemOutputs, SystemTable, Timestamp,
+    sequence, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -199,6 +200,33 @@ fn gain(#[state] s: &mut Gain, input: &mut Input<Ping>, output: &mut Output<Ping
     }
 }
 
+/// Pings one, two, and three on successive cycles, then completes.
+#[sequence]
+async fn count_up(
+    seq: &Seq,
+    input: &mut Input<Ping>,
+    output: &mut Output<Ping>,
+) -> Result<(), SeqError> {
+    let _ = input;
+    for n in 1..=3 {
+        let _ = output.write(&Ping { n });
+        seq.next_cycle().await;
+    }
+    Ok(())
+}
+
+/// Pings zero, then waits until aborted.
+#[sequence]
+async fn count_down(
+    seq: &Seq,
+    input: &mut Input<Ping>,
+    output: &mut Output<Ping>,
+) -> Result<(), SeqError> {
+    let _ = input;
+    let _ = output.write(&Ping { n: 0 });
+    seq.sleep(core::time::Duration::from_secs(3600)).await
+}
+
 /// The table this pack exports.
 pub fn pack() -> SystemTable {
     if std::env::var_os("METOR_TEST_PACK_BUILDER_PANIC").is_some() {
@@ -233,6 +261,12 @@ pub fn pack() -> SystemTable {
         .expect("valid records");
     table
         .register_system("retained", |_| Ok((Retained, ())))
+        .expect("valid records");
+    table
+        .register_sequence("count_up", count_up(), Default::default)
+        .expect("valid records");
+    table
+        .register_sequence("count_down", count_down(), Default::default)
         .expect("valid records");
     table
 }

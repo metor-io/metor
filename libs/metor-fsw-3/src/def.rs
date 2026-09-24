@@ -96,6 +96,9 @@ pub enum DefError {
 
     #[error("output `{port}` names a peer's port that is not resolved; run `metor build`")]
     Unresolved { port: String },
+
+    #[error("slot: {message}")]
+    Slot { message: String },
 }
 
 /// The definition `entry`'s type computes for `system`, over the producers

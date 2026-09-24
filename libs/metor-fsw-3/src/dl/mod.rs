@@ -1,10 +1,14 @@
 //! Dynamic library pack loading
 
+pub mod slot;
+pub mod store;
+
 use core::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use libloading::Library;
+use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
 use crate::system::SystemDef;
@@ -45,6 +49,9 @@ pub enum PackError {
     #[error("pack descriptor export failed with status {0}")]
     DescriptorStatus(u32),
 }
+
+/// The type a `DlSlot` registers as.
+pub const SLOT_TYPE: &str = "fsw.dl_slot";
 
 const DESCRIPTOR_CAPACITY: usize = 1024 * 1024;
 
@@ -232,60 +239,78 @@ impl SystemTable {
                 }),
                 doc: system.doc.clone(),
                 schema: system.params.clone(),
-                make: std::sync::Arc::new(move |cx| {
-                    let params = serde_json::to_vec(cx.params.0)
-                        .map_err(|e| ParamError::Decode(e.to_string()))?;
-                    // The instance def, so the pack binds the ports the host
-                    // resolved, including any the config added, and places the
-                    // system on the thread the config named.
+                make: Arc::new(move |cx| {
                     let instance = Instance {
                         id: cx.id.to_string(),
                         def: cx.def.clone(),
                         adapter: cx.adapter.cloned(),
                     };
-                    let def = serde_json::to_vec(&instance)
-                        .map_err(|e| ParamError::Decode(e.to_string()))?;
-                    let input_owners: Vec<Vec<_>> = cx
-                        .inputs
-                        .iter()
-                        .map(|rings| rings.iter().map(|ring| ring.export()).collect())
-                        .collect();
-                    let output_owners: Vec<_> =
-                        cx.outputs.iter().map(|ring| ring.export()).collect();
-                    let edges: Vec<Vec<RawRing>> = input_owners
-                        .iter()
-                        .map(|rings| rings.iter().map(RawRing::of).collect())
-                        .collect();
-                    let ports: Vec<RawPort> = edges.iter().map(|rings| port(rings)).collect();
-                    let outs: Vec<RawRing> = output_owners.iter().map(RawRing::of).collect();
-                    let mut error = RawSlice::EMPTY;
-                    // SAFETY: arrays and export owners outlive the call. Guest
-                    // attachments retain their backing through host callbacks.
-                    let instance = unsafe {
-                        (fns.create)(
-                            RawSlice::of(ty.as_bytes()),
-                            RawSlice::of(&params),
-                            RawSlice::of(&def),
-                            RawSlice::of(&ports),
-                            RawSlice::of(&outs),
-                            &raw mut error,
-                        )
-                    };
-                    if instance.is_null() {
-                        return Err(create_error(&error));
-                    }
-                    Ok(Box::new(DlStep {
-                        instance,
+                    let step = create(
+                        &lib,
                         fns,
-                        lib: lib.clone(),
-                        end: None,
-                    }))
+                        &ty,
+                        cx.params.0,
+                        &instance,
+                        &cx.inputs,
+                        &cx.outputs,
+                    )?;
+                    Ok(Box::new(step))
                 }),
             };
             entries.push((format!("{id}.{}", system.ty), entry));
         }
         self.insert_all(entries)
     }
+}
+
+/// Creates one instance of `ty` over the host's rings.
+///
+/// `instance` carries the definition the host resolved, including any ports
+/// the config added, and the adapter the config named.
+pub(crate) fn create(
+    lib: &Arc<Library>,
+    fns: PackFns,
+    ty: &str,
+    params: &serde_json::Value,
+    instance: &Instance,
+    inputs: &[Vec<&RingBuffer>],
+    outputs: &[&RingBuffer],
+) -> Result<DlStep, ParamError> {
+    let params = serde_json::to_vec(params).map_err(|e| ParamError::Decode(e.to_string()))?;
+    let def = serde_json::to_vec(instance).map_err(|e| ParamError::Decode(e.to_string()))?;
+    let input_owners: Vec<Vec<_>> = inputs
+        .iter()
+        .map(|rings| rings.iter().map(|ring| ring.export()).collect())
+        .collect();
+    let output_owners: Vec<_> = outputs.iter().map(|ring| ring.export()).collect();
+    let edges: Vec<Vec<RawRing>> = input_owners
+        .iter()
+        .map(|rings| rings.iter().map(RawRing::of).collect())
+        .collect();
+    let ports: Vec<RawPort> = edges.iter().map(|rings| port(rings)).collect();
+    let outs: Vec<RawRing> = output_owners.iter().map(RawRing::of).collect();
+    let mut error = RawSlice::EMPTY;
+    // SAFETY: arrays and export owners outlive the call. Guest attachments
+    // retain their backing through host callbacks.
+    let instance = unsafe {
+        (fns.create)(
+            RawSlice::of(ty.as_bytes()),
+            RawSlice::of(&params),
+            RawSlice::of(&def),
+            RawSlice::of(&ports),
+            RawSlice::of(&outs),
+            &raw mut error,
+        )
+    };
+    if instance.is_null() {
+        return Err(create_error(&error));
+    }
+    Ok(DlStep {
+        instance,
+        fns,
+        lib: lib.clone(),
+        end: None,
+    })
 }
 
 /// One input port over the rings of its producers.

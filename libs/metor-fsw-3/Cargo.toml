@@ -14,6 +14,7 @@ metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-stellar = { path = "../metor-proto/stellar" }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
+blake3 = "1.8"
 clap = { version = "4", features = ["derive"] }
 futures-lite = "2"
 libc = "0.2"

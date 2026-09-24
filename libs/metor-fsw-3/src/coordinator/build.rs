@@ -445,6 +445,7 @@ fn build_error(id: &str, source: ParamError) -> BuildError {
             id: id.to_string(),
             channel,
         },
+        ParamError::SlotChannel => BuildError::SlotWithoutChannel { id: id.to_string() },
         source => BuildError::Params {
             id: id.to_string(),
             source,

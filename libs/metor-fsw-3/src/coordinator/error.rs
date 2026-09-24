@@ -87,6 +87,9 @@ pub enum BuildError {
     #[error("async system `{id}` cannot take channel `{channel}`")]
     ChannelOnAsync { id: String, channel: String },
 
+    #[error("slot `{id}` needs a channel, which is how it is loaded")]
+    SlotWithoutChannel { id: String },
+
     #[error("channel `{name}` is longer than {cap} bytes")]
     ChannelName { name: String, cap: usize },
 

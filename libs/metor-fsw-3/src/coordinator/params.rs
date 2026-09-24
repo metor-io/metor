@@ -39,6 +39,8 @@ pub enum ParamError {
     Thread { thread: String },
     #[error("`{channel}`: an async system takes no channel")]
     Channel { channel: String },
+    #[error("a slot is loaded through its channel, and has none")]
+    SlotChannel,
 }
 
 #[cfg(test)]

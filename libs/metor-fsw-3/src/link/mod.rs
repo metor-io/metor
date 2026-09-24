@@ -110,6 +110,7 @@ pub fn register_builtins(table: &mut SystemTable) -> Result<(), BuildError> {
         crate::channel::channel_registry(),
         crate::channel::Registry::new,
     )?;
+    table.insert(crate::dl::SLOT_TYPE, crate::dl::slot::entry())?;
     #[cfg(feature = "db")]
     table.register_async(crate::deploy::DB_TYPE, db::db(), Db::new)?;
     Ok(())
