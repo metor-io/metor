@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn test_reject_short_record() {
         let ring = ring(4);
-        let mut writer = ring.writer(NoWake).expect("free writer");
+        let writer = ring.writer(NoWake).expect("free writer");
         let mut input = Input::<Imu>::try_new(vec![ring.view(NoWake).expect("free slot")])
             .expect("supported alignment");
         writer.try_write(&[0u8; 4]).expect("ring has room");
@@ -842,7 +842,7 @@ mod tests {
             capacity: ring_capacity(Fixed::MAX_LEN, 4).expect("valid capacity"),
             max_readers: 1,
         });
-        let mut writer = ring.writer(NoWake).expect("free writer");
+        let writer = ring.writer(NoWake).expect("free writer");
         let mut input = Input::<Fixed>::try_new(vec![ring.view(NoWake).expect("free slot")])
             .expect("supported alignment");
         let mut buf = [0u8; 16];

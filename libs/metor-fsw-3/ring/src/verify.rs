@@ -313,7 +313,7 @@ impl Region {
 fn write_read_roundtrip() {
     let mut region = Region::new();
     let ring = region.attach();
-    let mut w = ring.writer(NoWake).unwrap();
+    let w = ring.writer(NoWake).unwrap();
     let mut v = ring.view(NoWake).unwrap();
 
     let bytes: [u8; 8] = kani::any();
@@ -336,7 +336,7 @@ fn write_read_roundtrip() {
 fn backpressure_at_capacity() {
     let mut region = Region::new();
     let ring = region.attach();
-    let mut w = ring.writer(NoWake).unwrap();
+    let w = ring.writer(NoWake).unwrap();
     let v = ring.view(NoWake).unwrap();
 
     let a: usize = kani::any();
@@ -379,7 +379,7 @@ fn backpressure_at_capacity() {
 fn read_skips_wrap_gap() {
     let mut region = Region::new();
     let ring = region.attach();
-    let mut w = ring.writer(NoWake).unwrap();
+    let w = ring.writer(NoWake).unwrap();
     let mut v = ring.view(NoWake).unwrap();
 
     // A first record of symbolic size, consumed, so the cursor sits mid-lap.
@@ -421,7 +421,7 @@ fn read_skips_wrap_gap() {
 fn try_latest_pins() {
     let mut region = Region::new();
     let ring = region.attach();
-    let mut w = ring.writer(NoWake).unwrap();
+    let w = ring.writer(NoWake).unwrap();
     let mut v = ring.view(NoWake).unwrap();
 
     let x: u8 = kani::any();

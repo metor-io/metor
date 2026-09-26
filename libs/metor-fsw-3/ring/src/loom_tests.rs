@@ -30,7 +30,7 @@ fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
 fn test_drain_snapshot_races_wrap() {
     loom::model(|| {
         let ring = ring(128, 1);
-        let mut writer = ring.writer(NoWake).expect("writer");
+        let writer = ring.writer(NoWake).expect("writer");
         let mut view = ring.view(NoWake).expect("reader");
         writer.try_write(&[1; 32]).expect("room");
         writer.try_write(&[2; 32]).expect("room");
@@ -60,7 +60,7 @@ fn test_drain_snapshot_races_wrap() {
 fn test_registration_races_backpressure() {
     loom::model(|| {
         let ring = ring(CAP, 1);
-        let mut w = ring.writer(NoWake).unwrap();
+        let w = ring.writer(NoWake).unwrap();
         // One record already committed, so a view registering below sits at a
         // nonzero cursor and the writer's next write has to wrap around it.
         w.try_write(&payload(1))
@@ -114,7 +114,7 @@ fn test_registration_races_backpressure() {
 fn test_wrap_marker_precedes_commit() {
     loom::model(|| {
         let ring = ring(CAP, 1);
-        let mut w = ring.writer(NoWake).unwrap();
+        let w = ring.writer(NoWake).unwrap();
         let mut v = ring.view(NoWake).unwrap();
 
         // Park the reader exactly where the gap will be published: one record
@@ -149,13 +149,8 @@ fn test_writer_claim_handoff() {
         let a = ring(CAP, 1);
         let b = a.clone();
 
-        let t = thread::spawn(move || {
-            b.writer(NoWake)
-                .map(|mut w| w.try_write(&payload(2)).is_ok())
-        });
-        let mine = a
-            .writer(NoWake)
-            .map(|mut w| w.try_write(&payload(1)).is_ok());
+        let t = thread::spawn(move || b.writer(NoWake).map(|w| w.try_write(&payload(2)).is_ok()));
+        let mine = a.writer(NoWake).map(|w| w.try_write(&payload(1)).is_ok());
         let theirs = t.join().unwrap();
 
         // Both may succeed if the first claim is dropped before the second.
@@ -167,7 +162,7 @@ fn test_writer_claim_handoff() {
 fn test_grant_pins_bytes() {
     loom::model(|| {
         let ring = ring(CAP, 1);
-        let mut w = ring.writer(NoWake).unwrap();
+        let w = ring.writer(NoWake).unwrap();
         let mut v = ring.view(NoWake).unwrap();
         w.try_write(&payload(1)).unwrap();
 
@@ -189,7 +184,7 @@ fn test_grant_pins_bytes() {
 fn test_slowest_reader_backpressure() {
     loom::model(|| {
         let ring = ring(CAP, 2);
-        let mut w = ring.writer(NoWake).unwrap();
+        let w = ring.writer(NoWake).unwrap();
         let mut fast = ring.view(NoWake).unwrap();
         let slow = ring.view(NoWake).unwrap();
         w.try_write(&payload(1)).unwrap();
@@ -229,7 +224,7 @@ fn test_slowest_reader_backpressure() {
 fn test_cursor_within_committed() {
     loom::model(|| {
         let ring = ring(CAP, 1);
-        let mut w = ring.writer(NoWake).unwrap();
+        let w = ring.writer(NoWake).unwrap();
         let mut v = ring.view(NoWake).unwrap();
         w.try_write(&payload(1)).unwrap();
         let mut buf = Vec::new();
@@ -254,7 +249,7 @@ fn test_cursor_within_committed() {
 fn test_registration_during_padding_publication() {
     loom::model(|| {
         let ring = ring(64, 1);
-        let mut writer = ring.writer(NoWake).unwrap();
+        let writer = ring.writer(NoWake).unwrap();
         writer.try_write(&[1; 8]).unwrap();
         let consumer = ring.clone();
         let task = thread::spawn(move || {
@@ -276,7 +271,7 @@ fn test_latest_races_padding_publication() {
     loom::model(|| {
         let ring = ring(64, 1);
         let mut reader = ring.view(NoWake).unwrap();
-        let mut writer = ring.writer(NoWake).unwrap();
+        let writer = ring.writer(NoWake).unwrap();
         writer.try_write(&[1; 8]).unwrap();
         let task = thread::spawn(move || {
             assert_eq!(writer.try_write(&[2; 48]), Err(WriteError::WouldBlock));

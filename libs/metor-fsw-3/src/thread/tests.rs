@@ -32,7 +32,7 @@ fn test_mirror_drain_snapshot() {
         capacity: 256,
         max_readers: 1,
     });
-    let mut writer = source.writer(NoWake).expect("writer");
+    let writer = source.writer(NoWake).expect("writer");
     let mut received = target.view(NoWake).expect("reader");
     let mut mirror = super::Mirror {
         port: "out".into(),

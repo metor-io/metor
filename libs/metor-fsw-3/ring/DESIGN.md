@@ -61,7 +61,8 @@ still in use.
 ## Ownership and reclamation
 
 The writer claim is a CAS on a shared owner tag. Dropping the writer releases
-that claim. Dropping a view clears its owner tag before freeing its cursor.
+that claim. `Writer` is `!Sync`, so writes never overlap; that, not `&mut`,
+keeps one writer. Dropping a view clears its owner tag before freeing its cursor.
 Reclamation is unsafe: the caller must establish that the owner has stopped,
 all its handles are unusable, and its tag has not been reused. A reclaimer uses
 an owner CAS before releasing a slot so competing reclaimers cannot free a new
