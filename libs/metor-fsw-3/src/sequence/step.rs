@@ -135,6 +135,7 @@ impl Step for SequenceStep {
         let polled = log::with_log_port(log, now, || advance(seq, samplers, run));
         if let Poll::Ready(result) = polled {
             self.run = None;
+            self.samplers = Samplers::default();
             self.finish(now, result);
         }
     }

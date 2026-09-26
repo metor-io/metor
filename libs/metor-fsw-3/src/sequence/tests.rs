@@ -102,7 +102,7 @@ fn def_of<S: SequenceFn>(_sequence: S) -> crate::system::SystemDef {
 }
 
 /// One step of `S` over fresh rings, with nothing feeding its inputs.
-fn step_of<S: SequenceFn>(_sequence: S, state: S::State) -> (SequenceStep, Vec<RingBuffer>) {
+fn step_of<S: SequenceFn>(sequence: S, state: S::State) -> (SequenceStep, Vec<RingBuffer>) {
     let def = def::<S>(&crate::def::DefCx::empty()).expect("a static definition");
     let inputs = def
         .inputs
@@ -112,6 +112,16 @@ fn step_of<S: SequenceFn>(_sequence: S, state: S::State) -> (SequenceStep, Vec<R
             views: Vec::new(),
         })
         .collect();
+    step_over(sequence, state, inputs)
+}
+
+/// One step of `S` reading `inputs`, writing to fresh rings.
+fn step_over<S: SequenceFn>(
+    _sequence: S,
+    state: S::State,
+    inputs: Vec<InputBinding>,
+) -> (SequenceStep, Vec<RingBuffer>) {
+    let def = def::<S>(&crate::def::DefCx::empty()).expect("a static definition");
     let rings: Vec<RingBuffer> = def
         .outputs
         .iter()
@@ -835,4 +845,41 @@ fn test_redline_and_body_read_one_sample() {
         .chain(twice(3.0))
         .collect();
     assert_eq!(*seen.0.borrow(), expected);
+}
+
+/// Glances at its sample once, then ends.
+#[crate::sequence]
+async fn glance(imu: &Sample<Imu>) -> Result<(), SeqError> {
+    let _ = imu.get();
+    Ok(())
+}
+
+#[test]
+fn test_ended_sequence_releases_its_samples() {
+    let def = def_of(glance());
+    let ring = RingBuffer::create_in_memory(Config {
+        capacity: ring_capacity(def.inputs[1].max_len, 2).expect("valid capacity"),
+        max_readers: 1,
+    });
+    let inputs = vec![
+        InputBinding {
+            def: def.inputs[0].clone(),
+            views: Vec::new(),
+        },
+        InputBinding {
+            def: def.inputs[1].clone(),
+            views: vec![ring.view(NoWake).expect("a free slot")],
+        },
+    ];
+    let (mut step, _rings) = step_over(glance(), (), inputs);
+    step.execute(ms(0));
+    assert_eq!(step.ended(), Some(&EndReason::Completed));
+    let imu = Output::<Imu>::try_new(ring.writer(NoWake).expect("a free writer")).expect("aligned");
+    for at in 0..16 {
+        let sample = Imu {
+            timestamp: ms(at),
+            sample: 1.0,
+        };
+        assert!(imu.write(&sample).is_ok(), "write {at} blocked");
+    }
 }
