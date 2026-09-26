@@ -7,8 +7,9 @@ use metor_proto::types::Timestamp;
 
 use crate::channel::{ABORT_PORT, Abort, AbortRequest};
 use crate::def::{DefCx, DefError};
+use crate::frame::Frame;
 use crate::log::Log;
-use crate::port::{DynInputs, DynOutputs, Input, Output};
+use crate::port::{DynInputs, DynOutputs, Input, Output, Sample, Sampler, Samplers};
 use crate::record::Record;
 use crate::sequence::Seq;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
@@ -46,8 +47,44 @@ impl<B> Bindings<B> {
     }
 }
 
-/// "Views" are bound inputs
-pub type Views<W> = Bindings<InputBinding<W>>;
+/// "Views" are bound inputs, plus the samplers [`Sample`] parameters push.
+pub struct Views<W: WakeSink> {
+    bindings: Bindings<InputBinding<W>>,
+    samplers: Samplers,
+}
+
+impl<W: WakeSink> Views<W> {
+    pub(crate) fn new(bindings: Bindings<InputBinding<W>>) -> Self {
+        Self {
+            bindings,
+            samplers: Samplers::default(),
+        }
+    }
+
+    /// The one binding the next parameter takes.
+    pub(crate) fn next(&mut self) -> Option<InputBinding<W>> {
+        self.bindings.next()
+    }
+
+    /// Every binding the next parameter takes.
+    pub(crate) fn take(&mut self) -> Vec<InputBinding<W>> {
+        self.bindings.take()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+
+    /// Adds a sampler the step takes each cycle.
+    pub(crate) fn sample(&mut self, sampler: Box<dyn Sampler>) {
+        self.samplers.push(sampler);
+    }
+
+    pub(crate) fn into_samplers(self) -> Samplers {
+        self.samplers
+    }
+}
+
 /// "Writers" are bound outputs
 pub type Writers = Bindings<OutputBinding>;
 /// A bundles parameter names
@@ -65,6 +102,8 @@ pub struct Defs {
     pub(crate) output_counts: Vec<usize>,
     declared_inputs: Vec<Cow<'static, str>>,
     declared_outputs: Vec<Cow<'static, str>>,
+    /// Whether a parameter is a [`Sample`], which only a stepped system takes.
+    pub(crate) sampled: bool,
 }
 
 impl Defs {
@@ -233,6 +272,40 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
         // validates alignment at build; a mismatch is a coordinator bug.
         let binding = views.next().expect("one binding per input param");
         Input::try_new(binding.views).expect("alignment checked at build")
+    }
+
+    fn bind_out(_writers: &mut Writers) {}
+
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        input: &'a mut Self::In<W>,
+        _output: &'a mut (),
+        _cx: &mut Cycle<'a>,
+    ) -> Self::Item<'a, W> {
+        input
+    }
+}
+
+/// A `Sample` reads the port an `Input` would, taking it once per cycle.
+impl<T: Frame + Copy + 'static> Param for Sample<T> {
+    type In<W: WakeSink + Clone + 'static> = Sample<T>;
+    type Out = ();
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a Sample<T>;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        cx: &DefCx<'_>,
+        defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        defs.push_input(Input::<T>::def(cx, name(names)));
+        defs.sampled = true;
+        Ok(())
+    }
+
+    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
+        let input = <Input<T> as Param>::bind_in(views);
+        let (sample, sampler) = Sample::bind(input);
+        views.sample(sampler);
+        sample
     }
 
     fn bind_out(_writers: &mut Writers) {}

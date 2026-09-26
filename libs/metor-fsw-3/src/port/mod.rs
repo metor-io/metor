@@ -16,8 +16,11 @@ use metor_fsw_3_ring::{
 use metor_proto::types::Timestamp;
 
 mod readiness;
+mod sample;
 
 use readiness::Waiters;
+pub use sample::Sample;
+pub(crate) use sample::{Sampler, Samplers};
 
 /// Returns the power-of-two capacity for a ring of `depth` records of `max_len` bytes.
 pub fn ring_capacity(max_len: usize, depth: usize) -> Option<usize> {

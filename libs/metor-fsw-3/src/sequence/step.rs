@@ -12,7 +12,7 @@ use crate::channel::Abort;
 use crate::coordinator::{EndReason, Step};
 use crate::fn_system::{Cycle, InSet, OutSet, Param};
 use crate::log::{self, Log, LogPort};
-use crate::port::Input;
+use crate::port::{Input, Samplers};
 use crate::system::{InputBinding, OutputBinding, SystemInputs, SystemOutputs};
 
 use super::{Seq, SeqError, SequenceFn};
@@ -24,6 +24,7 @@ type Run = Pin<Box<dyn Future<Output = Result<(), SeqError>>>>;
 pub(crate) struct SequenceStep {
     seq: Rc<Seq>,
     abort: Abort,
+    samplers: Samplers,
     log: LogPort,
     run: Option<Run>,
     end: Option<EndReason>,
@@ -44,11 +45,12 @@ impl SequenceStep {
         // per declared input; `AbortRequest` needs no alignment.
         let abort = inputs.next().expect("the abort binding");
         let abort = Input::try_new(abort.views).expect("byte alignment");
-        let ins = InSet::<S>::bind(inputs.collect());
+        let InSet { ins, samplers } = InSet::<S>::bind(inputs.collect());
         let OutSet { outs, log } = OutSet::<S>::bind(outputs);
         let seq = Rc::new(Seq::default());
         Self {
             run: Some(Box::pin(run::<S>(state, ins, outs, seq.clone()))),
+            samplers,
             seq,
             abort: Abort::new(abort),
             log,
@@ -74,13 +76,13 @@ impl SequenceStep {
 /// Hands the sequence its parameters and runs it, all inside one future.
 async fn run<S: SequenceFn>(
     mut state: S::State,
-    mut ins: InSet<S>,
+    mut ins: <S::Params as Param>::In<NoWake>,
     mut outs: <S::Params as Param>::Out,
     seq: Rc<Seq>,
 ) -> Result<(), SeqError> {
     let mut log = Log;
     let mut cx = Cycle::with_seq(seq.now(), &mut log, &seq);
-    let items = S::Params::get::<NoWake>(&mut ins.0, &mut outs, &mut cx);
+    let items = S::Params::get::<NoWake>(&mut ins, &mut outs, &mut cx);
     S::call(&mut state, items).await
 }
 
@@ -92,6 +94,7 @@ impl Step for SequenceStep {
             return;
         };
         let polled = log::with_log_port(&mut self.log, now, || {
+            self.samplers.take_all();
             run.as_mut().poll(&mut Context::from_waker(Waker::noop()))
         });
         if let Poll::Ready(result) = polled {

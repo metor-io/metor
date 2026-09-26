@@ -169,7 +169,9 @@ pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs, sequenc
 pub use metor_fsw_3_ring::{ReadError, WriteError};
 pub use pack::def::{PackDef, PackSystemDef};
 pub use pack::{ABI_VERSION, Status};
-pub use port::{DynInputs, DynOutputs, Input, Latest, Output, RecvError, SendError, ring_capacity};
+pub use port::{
+    DynInputs, DynOutputs, Input, Latest, Output, RecvError, Sample, SendError, ring_capacity,
+};
 pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Record, RecordSchema};
 pub use sequence::{Seq, SeqError, SequenceFn};
 pub use system::{

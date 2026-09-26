@@ -1,6 +1,6 @@
 //! Sequence steps, driven by hand and by a coordinator.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::time::Duration;
 use std::rc::Rc;
 
@@ -15,7 +15,7 @@ use crate::coordinator::{
     SystemTable,
 };
 use crate::log::Log;
-use crate::port::{Output, ring_capacity};
+use crate::port::{Output, Sample, ring_capacity};
 use crate::system::{InputBinding, OutputBinding};
 use crate::tests::utils::{self, Imu, Recorder};
 
@@ -310,6 +310,48 @@ fn test_sequence_refuses_a_thread() {
         config.build(&table(&Recorder::default())),
         Err(BuildError::ThreadOnCyclic { .. })
     ));
+}
+
+/// The samples a sequence saw, shared with the test.
+#[derive(Clone, Default)]
+struct Seen(Rc<RefCell<Vec<Option<f64>>>>);
+
+/// Keeps the sample it holds across each of three cycles.
+#[crate::sequence]
+async fn watcher(#[state] seen: &mut Seen, seq: &Seq, imu: &Sample<Imu>) -> Result<(), SeqError> {
+    for _ in 0..3 {
+        seen.0.borrow_mut().push(imu.get().map(|imu| imu.sample));
+        seq.next_cycle().await;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sample_held_across_cycles() {
+    let seen = Seen::default();
+    let mut table = table(&Recorder::default());
+    let state = seen.clone();
+    table
+        .register_sequence("watcher", watcher(), move || state.clone())
+        .expect("valid records");
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("imu", "imu"),
+            SystemConfig {
+                inputs: vec![InputConfig {
+                    port: "imu".into(),
+                    from: vec![PortRef::new("imu", "imu")],
+                }],
+                ..SystemConfig::new("watch", "watcher")
+            },
+        ],
+        ..Default::default()
+    };
+    let mut coordinator = config.build(&table).expect("valid");
+    for at in 1..=3 {
+        coordinator.step(ms(at));
+    }
+    assert_eq!(*seen.0.borrow(), [Some(1.0), Some(2.0), Some(3.0)]);
 }
 
 #[test]

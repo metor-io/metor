@@ -99,6 +99,9 @@ pub enum DefError {
 
     #[error("slot: {message}")]
     Slot { message: String },
+
+    #[error("async system `{system}` takes a `Sample`, which only a stepped system takes")]
+    SampleOnAsync { system: String },
 }
 
 /// The definition `entry`'s type computes for `system`, over the producers
