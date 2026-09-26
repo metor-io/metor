@@ -13,7 +13,7 @@ use metor_proto::types::Timestamp;
 
 use crate::system::SystemDef;
 
-use crate::coordinator::{BuildError, End, ParamError, Step, SystemTable, TableEntry};
+use crate::coordinator::{BuildError, EndReason, ParamError, Step, SystemTable, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::pack::def::{DefCxOwned, Instance, PackDef, PackSystemDef};
 use crate::pack::raw::{RawPort, RawRing, RawSlice};
@@ -337,7 +337,7 @@ pub struct DlStep {
     fns: PackFns,
     /// Keeps the library loaded for as long as the instance lives.
     lib: Arc<Library>,
-    end: Option<End>,
+    end: Option<EndReason>,
 }
 
 impl Step for DlStep {
@@ -354,7 +354,7 @@ impl Step for DlStep {
     /// Nothing: the pack has already written the fault line.
     fn fault(&mut self, _now: Timestamp, _message: &str) {}
 
-    fn ended(&self) -> Option<&End> {
+    fn ended(&self) -> Option<&EndReason> {
         self.end.as_ref()
     }
 }

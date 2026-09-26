@@ -10,7 +10,9 @@ use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 use tracing_subscriber::layer::SubscriberExt;
 
-use crate::coordinator::{End, MakeCx, ParamError, Params, Step, Stepped, SystemTable, catch_step};
+use crate::coordinator::{
+    EndReason, MakeCx, ParamError, Params, Step, Stepped, SystemTable, catch_step,
+};
 use crate::def::DefError;
 use crate::system::SystemDef;
 use crate::thread::Threads;
@@ -45,24 +47,24 @@ impl Status {
     }
 
     /// The word a step that ended as `end` returns.
-    pub fn of_end(end: Option<&End>) -> Status {
+    pub fn of_end(end: Option<&EndReason>) -> Status {
         match end {
             None => Status::Ok,
-            Some(End::Completed) => Status::Completed,
-            Some(End::Aborted) => Status::Aborted,
-            Some(End::Failed(_) | End::Unloaded) => Status::Failed,
-            Some(End::Panicked) => Status::Panicked,
+            Some(EndReason::Completed) => Status::Completed,
+            Some(EndReason::Aborted) => Status::Aborted,
+            Some(EndReason::Failed(_) | EndReason::Unloaded) => Status::Failed,
+            Some(EndReason::Panicked) => Status::Panicked,
         }
     }
 
     /// The end this word reports, `None` for a step still running.
-    pub fn end(self) -> Option<End> {
+    pub fn end(self) -> Option<EndReason> {
         match self {
             Status::Ok => None,
-            Status::Panicked => Some(End::Panicked),
-            Status::Completed => Some(End::Completed),
-            Status::Aborted => Some(End::Aborted),
-            Status::Failed => Some(End::Failed(Cow::Borrowed("see the system's log"))),
+            Status::Panicked => Some(EndReason::Panicked),
+            Status::Completed => Some(EndReason::Completed),
+            Status::Aborted => Some(EndReason::Aborted),
+            Status::Failed => Some(EndReason::Failed(Cow::Borrowed("see the system's log"))),
         }
     }
 }

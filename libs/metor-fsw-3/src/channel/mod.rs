@@ -13,7 +13,7 @@ use metor_fsw_3_ring::{NoWake, WakeSink};
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::coordinator::{End, RunState};
+use crate::coordinator::{EndReason, RunState};
 use crate::port::Input;
 use crate::{Frame, FrameBytes, FrameStr, MaxSize, Record, Schema, Timestamp};
 
@@ -88,13 +88,13 @@ pub enum ChannelState {
 
 impl ChannelState {
     /// A channel's state: its end if it has one, otherwise its run state.
-    pub fn of(run: RunState, end: Option<&End>) -> Self {
+    pub fn of(run: RunState, end: Option<&EndReason>) -> Self {
         match (end, run) {
-            (Some(End::Completed), _) => Self::Completed,
-            (Some(End::Aborted), _) => Self::Aborted,
-            (Some(End::Failed(_)), _) => Self::Failed,
-            (Some(End::Panicked), _) => Self::Panicked,
-            (Some(End::Unloaded), _) => Self::Unloaded,
+            (Some(EndReason::Completed), _) => Self::Completed,
+            (Some(EndReason::Aborted), _) => Self::Aborted,
+            (Some(EndReason::Failed(_)), _) => Self::Failed,
+            (Some(EndReason::Panicked), _) => Self::Panicked,
+            (Some(EndReason::Unloaded), _) => Self::Unloaded,
             (None, RunState::Running) => Self::Running,
             (None, RunState::Stopped) => Self::Stopped,
         }

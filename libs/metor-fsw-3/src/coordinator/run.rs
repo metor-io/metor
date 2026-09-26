@@ -14,7 +14,7 @@ use crate::system::System;
 use super::Coordinator;
 use super::config::Clock;
 use super::status::SystemStatus;
-use super::step::{End, Step};
+use super::step::{EndReason, Step};
 
 /// What one [`catch_step`] call did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,7 +27,7 @@ pub(crate) enum Stepped {
 }
 
 /// The end an entry whose step unwound reports.
-const UNWOUND: &End = &End::Panicked;
+const UNWOUND: &EndReason = &EndReason::Panicked;
 
 pub(crate) struct Runner<S: System> {
     pub system: S,
@@ -134,7 +134,7 @@ impl Coordinator {
 
 impl super::Entry {
     /// How this entry's step ended, including by unwinding out of it.
-    pub(super) fn ended(&self) -> Option<&End> {
+    pub(super) fn ended(&self) -> Option<&EndReason> {
         match &self.step {
             Some(step) => step.ended(),
             None => Some(UNWOUND),
@@ -396,17 +396,17 @@ mod tests {
     }
 
     /// Counts its cycles and ends after the second.
-    struct Twice(std::rc::Rc<core::cell::Cell<u64>>, Option<End>);
+    struct Twice(std::rc::Rc<core::cell::Cell<u64>>, Option<EndReason>);
 
     impl Step for Twice {
         fn execute(&mut self, _now: Timestamp) {
             self.0.set(self.0.get() + 1);
             if self.0.get() == 2 {
-                self.1 = Some(End::Completed);
+                self.1 = Some(EndReason::Completed);
             }
         }
 
-        fn ended(&self) -> Option<&End> {
+        fn ended(&self) -> Option<&EndReason> {
             self.1.as_ref()
         }
     }

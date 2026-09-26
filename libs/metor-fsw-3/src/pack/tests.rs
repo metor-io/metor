@@ -338,13 +338,13 @@ fn test_unknown_status_is_panicked() {
 
 #[test]
 fn test_end_status_words() {
-    use crate::End;
+    use crate::EndReason;
     for (end, word) in [
         (None, 0),
-        (Some(End::Panicked), 1),
-        (Some(End::Completed), 2),
-        (Some(End::Aborted), 3),
-        (Some(End::Failed("reason".into())), 4),
+        (Some(EndReason::Panicked), 1),
+        (Some(EndReason::Completed), 2),
+        (Some(EndReason::Aborted), 3),
+        (Some(EndReason::Failed("reason".into())), 4),
     ] {
         let status = Status::of_end(end.as_ref());
         assert_eq!(status as u32, word);
@@ -355,8 +355,8 @@ fn test_end_status_words() {
         );
     }
     // A slot's own state has no word; a pack reporting it has failed.
-    assert_eq!(Status::of_end(Some(&End::Unloaded)), Status::Failed);
-    assert_eq!(Status::from_raw(5).end(), Some(End::Panicked));
+    assert_eq!(Status::of_end(Some(&EndReason::Unloaded)), Status::Failed);
+    assert_eq!(Status::from_raw(5).end(), Some(EndReason::Panicked));
 }
 
 /// The `metor-fsw-abi` distribution exists to pin this number; a pack's

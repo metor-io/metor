@@ -211,17 +211,17 @@ fn test_fault_and_destructor_panic_isolation() {
 }
 
 /// Counts its cycles and completes after the second.
-struct Twice(Rc<Cell<u64>>, Option<super::End>);
+struct Twice(Rc<Cell<u64>>, Option<super::EndReason>);
 
 impl Step for Twice {
     fn execute(&mut self, _now: Timestamp) {
         self.0.set(self.0.get() + 1);
         if self.0.get() == 2 {
-            self.1 = Some(super::End::Completed);
+            self.1 = Some(super::EndReason::Completed);
         }
     }
 
-    fn ended(&self) -> Option<&super::End> {
+    fn ended(&self) -> Option<&super::EndReason> {
         self.1.as_ref()
     }
 }
@@ -252,7 +252,7 @@ fn test_ended_step_stays_and_is_skipped() {
     assert_eq!(runs.get(), 2);
     assert_eq!(
         coordinator.ended().collect::<Vec<_>>(),
-        [("twice", &super::End::Completed)]
+        [("twice", &super::EndReason::Completed)]
     );
     assert_eq!(coordinator.latched().count(), 0);
 }

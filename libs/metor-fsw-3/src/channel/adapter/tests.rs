@@ -10,7 +10,7 @@ use metor_proto_wkt::{
 
 use crate::channel::{Abort, ChannelState, ChannelStatus};
 use crate::coordinator::{
-    Adapter, BuildError, ChannelConfig, Coordinator, CoordinatorConfig, End, InputConfig,
+    Adapter, BuildError, ChannelConfig, Coordinator, CoordinatorConfig, EndReason, InputConfig,
     LoadError, Occupant, PortRef, RunState, Step, SystemConfig, SystemTable, TableEntry,
 };
 use crate::def::DefCx;
@@ -32,7 +32,7 @@ struct Seen {
     /// Whether the next `Counter::new` refuses.
     make_fails: bool,
     /// The end the fake slot's occupant reports.
-    slot_end: Option<End>,
+    slot_end: Option<EndReason>,
     events: Vec<SequenceChannelEvent>,
     states: Vec<u32>,
     status: Option<ChannelStatus>,
@@ -159,7 +159,7 @@ fn watch(
 struct Slot {
     shared: Shared,
     occupant: Option<Occupant>,
-    end: Option<End>,
+    end: Option<EndReason>,
 }
 
 impl Step for Slot {
@@ -167,9 +167,9 @@ impl Step for Slot {
         self.end = self.shared.0.borrow().slot_end.clone();
     }
 
-    fn ended(&self) -> Option<&End> {
+    fn ended(&self) -> Option<&EndReason> {
         match self.occupant {
-            None => Some(&End::Unloaded),
+            None => Some(&EndReason::Unloaded),
             Some(_) => self.end.as_ref(),
         }
     }
@@ -635,7 +635,7 @@ fn test_completed_then_unloaded_reported() {
     let (shared, mut coordinator) = build("slot", RunState::Stopped);
     shared.send("ctr", SequenceCommandKind::Load { name: "a".into() });
     coordinator.step(Timestamp(1));
-    shared.0.borrow_mut().slot_end = Some(End::Completed);
+    shared.0.borrow_mut().slot_end = Some(EndReason::Completed);
     shared.send("ctr", SequenceCommandKind::Start);
     coordinator.step(Timestamp(2));
     let events = shared.events();

@@ -15,7 +15,7 @@ pub trait Step {
     fn fault(&mut self, _now: Timestamp, _message: &str) {}
 
     /// How the step ended, once it has. An ended step is not executed again.
-    fn ended(&self) -> Option<&End> {
+    fn ended(&self) -> Option<&EndReason> {
         None
     }
 
@@ -43,7 +43,7 @@ pub struct Occupant {
 
 /// How a step ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum End {
+pub enum EndReason {
     Completed,
     Aborted,
     Failed(Cow<'static, str>),

@@ -10,7 +10,7 @@ use metor_proto_wkt::{
 };
 
 use crate::coordinator::{
-    Adapter, End, MakeCx, MakeFn, ParamError, Params, RunState, Step, Stepped, catch_step,
+    Adapter, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, Stepped, catch_step,
 };
 use crate::def::DefCx;
 use crate::port::{Input, Output, ring_capacity};
@@ -78,7 +78,7 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
         .map(|rings| rings.into_iter().cloned().collect())
         .collect();
     let abort = private_abort(&def, &mut inputs);
-    let recipe = Recipe {
+    let recipe = SystemRecipe {
         make: make.clone(),
         id: cx.id.to_string(),
         adapter: Adapter::Channel(channel.clone()),
@@ -95,8 +95,8 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
             name: channel.name.clone(),
             run: channel.start,
             inner: Some(inner),
-            end: None,
-            reported: None,
+            end_reason: None,
+            reported_end_reason: None,
             loaded: None,
             recipe,
             threads,
@@ -169,7 +169,7 @@ fn writer<T: Record>(ring: &RingBuffer) -> Output<T> {
 }
 
 /// Everything needed to make the system again, over the same rings.
-struct Recipe {
+struct SystemRecipe {
     make: Arc<MakeFn>,
     id: String,
     adapter: Adapter,
@@ -179,7 +179,7 @@ struct Recipe {
     outputs: Vec<RingBuffer>,
 }
 
-impl Recipe {
+impl SystemRecipe {
     fn make(&self, threads: &mut Threads) -> Result<Box<dyn Step>, ParamError> {
         (self.make)(MakeCx {
             id: &self.id,
@@ -208,13 +208,12 @@ struct Core {
     run: RunState,
     inner: Option<Box<dyn Step>>,
     /// An end the adapter set: a failed make, or an unwound step.
-    end: Option<End>,
+    end_reason: Option<EndReason>,
     /// The end last reported on `events`.
-    reported: Option<End>,
+    reported_end_reason: Option<EndReason>,
     /// The last name a `Load` accepted, re-applied after a reset.
     loaded: Option<String>,
-    recipe: Recipe,
-    /// Empty: a cyclic make places nothing on a thread.
+    recipe: SystemRecipe,
     threads: Threads,
     abort: Option<Output<AbortRequest>>,
     events: Output<SequenceChannelEvent>,
@@ -312,7 +311,7 @@ impl Core {
         match crate::panic::catch(|| inner.load(&name)) {
             Some(Ok(())) => {
                 self.run = RunState::Stopped;
-                self.end = None;
+                self.end_reason = None;
                 self.loaded = Some(name.clone());
                 SequenceEventKind::Loaded { name }
             }
@@ -327,7 +326,7 @@ impl Core {
     /// Drops the system, then makes it again over the same rings.
     fn remake(&mut self) -> Result<(), String> {
         self.inner = None;
-        self.end = None;
+        self.end_reason = None;
         let made = crate::panic::catch(|| self.recipe.make(&mut self.threads))
             .ok_or_else(|| "the system's constructor panicked".to_string())?;
         self.inner = Some(made.map_err(|e| e.to_string())?);
@@ -337,8 +336,8 @@ impl Core {
     /// Ends the channel as failed, reporting it now rather than next cycle.
     fn fail(&mut self, reason: String) -> SequenceEventKind {
         let reason = clipped(reason);
-        self.end = Some(End::Failed(reason.clone().into()));
-        self.reported = self.end.clone();
+        self.end_reason = Some(EndReason::Failed(reason.clone().into()));
+        self.reported_end_reason = self.end_reason.clone();
         SequenceEventKind::Failed { reason }
     }
 
@@ -350,17 +349,17 @@ impl Core {
 
     fn step(&mut self, now: Timestamp) {
         if self.run == RunState::Running
-            && self.end.is_none()
+            && self.end_reason.is_none()
             && catch_step(&mut self.inner, now) == Stepped::Unwound
         {
-            self.end = Some(End::Panicked);
+            self.end_reason = Some(EndReason::Panicked);
         }
         self.report_end();
         self.write_status(now);
     }
 
-    fn ended(&self) -> Option<&End> {
-        self.end
+    fn ended(&self) -> Option<&EndReason> {
+        self.end_reason
             .as_ref()
             .or_else(|| self.inner.as_ref().and_then(|inner| inner.ended()))
     }
@@ -368,13 +367,13 @@ impl Core {
     /// Emits the event for an end the first cycle it differs from the last reported.
     fn report_end(&mut self) {
         let end = self.ended().cloned();
-        if end == self.reported {
+        if end == self.reported_end_reason {
             return;
         }
         if let Some(end) = &end {
             self.emit(end_event(end));
         }
-        self.reported = end;
+        self.reported_end_reason = end;
     }
 
     fn write_status(&mut self, now: Timestamp) {
@@ -421,17 +420,17 @@ fn clipped(mut text: String) -> String {
     text
 }
 
-fn end_event(end: &End) -> SequenceEventKind {
+fn end_event(end: &EndReason) -> SequenceEventKind {
     match end {
-        End::Completed => SequenceEventKind::Completed,
-        End::Aborted => SequenceEventKind::Aborted,
-        End::Failed(reason) => SequenceEventKind::Failed {
+        EndReason::Completed => SequenceEventKind::Completed,
+        EndReason::Aborted => SequenceEventKind::Aborted,
+        EndReason::Failed(reason) => SequenceEventKind::Failed {
             reason: clipped(reason.to_string()),
         },
-        End::Panicked => SequenceEventKind::Failed {
+        EndReason::Panicked => SequenceEventKind::Failed {
             reason: "panicked".into(),
         },
-        End::Unloaded => SequenceEventKind::Unloaded,
+        EndReason::Unloaded => SequenceEventKind::Unloaded,
     }
 }
 

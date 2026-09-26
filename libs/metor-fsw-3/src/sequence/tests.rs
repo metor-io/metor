@@ -11,7 +11,7 @@ use metor_proto_wkt::LogLevel;
 use super::*;
 use crate::channel::AbortRequest;
 use crate::coordinator::{
-    Adapter, BuildError, CoordinatorConfig, End, InputConfig, PortRef, Step, SystemConfig,
+    Adapter, BuildError, CoordinatorConfig, EndReason, InputConfig, PortRef, Step, SystemConfig,
     SystemTable,
 };
 use crate::log::Log;
@@ -187,7 +187,10 @@ fn test_sequence_completes() {
     step.execute(ms(1));
     assert_eq!((phase.get(), step.ended()), (2, None));
     step.execute(ms(2));
-    assert_eq!((phase.get(), step.ended()), (3, Some(&End::Completed)));
+    assert_eq!(
+        (phase.get(), step.ended()),
+        (3, Some(&EndReason::Completed))
+    );
 }
 
 #[test]
@@ -198,7 +201,10 @@ fn test_paused_step_resumes_at_its_await() {
     step.execute(ms(1));
     // Cycles 2 to 9 pass with the step not executed, as a stopped channel's.
     step.execute(ms(10));
-    assert_eq!((phase.get(), step.ended()), (3, Some(&End::Completed)));
+    assert_eq!(
+        (phase.get(), step.ended()),
+        (3, Some(&EndReason::Completed))
+    );
 }
 
 #[test]
@@ -209,7 +215,10 @@ fn test_sleep_counts_paused_time() {
     step.execute(ms(5));
     assert_eq!(phase.get(), 0);
     step.execute(ms(40));
-    assert_eq!((phase.get(), step.ended()), (1, Some(&End::Completed)));
+    assert_eq!(
+        (phase.get(), step.ended()),
+        (1, Some(&EndReason::Completed))
+    );
 }
 
 #[test]
@@ -220,7 +229,10 @@ fn test_ended_step_polls_nothing() {
     step.execute(ms(10));
     phase.0.set(7);
     step.execute(ms(20));
-    assert_eq!((phase.get(), step.ended()), (7, Some(&End::Completed)));
+    assert_eq!(
+        (phase.get(), step.ended()),
+        (7, Some(&EndReason::Completed))
+    );
 }
 
 #[test]
@@ -230,7 +242,7 @@ fn test_failure_ends_with_its_text() {
     coordinator.step(ms(1));
     coordinator.step(ms(2));
     let ended: Vec<_> = coordinator.ended().collect();
-    assert_eq!(ended, [("fix", &End::Failed("no fix".into()))]);
+    assert_eq!(ended, [("fix", &EndReason::Failed("no fix".into()))]);
     assert_eq!(coordinator.latched().count(), 0);
 
     let lines = recorder.take_logs();
@@ -268,7 +280,7 @@ fn test_abort_ends_the_sequence() {
     assert_eq!(coordinator.ended().count(), 0);
     coordinator.step(ms(2));
     let ended: Vec<_> = coordinator.ended().collect();
-    assert_eq!(ended, [("wait", &End::Aborted)]);
+    assert_eq!(ended, [("wait", &EndReason::Aborted)]);
 }
 
 #[test]

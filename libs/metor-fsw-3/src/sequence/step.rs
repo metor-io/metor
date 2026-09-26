@@ -9,7 +9,7 @@ use metor_fsw_3_ring::NoWake;
 use metor_proto::types::Timestamp;
 
 use crate::channel::Abort;
-use crate::coordinator::{End, Step};
+use crate::coordinator::{EndReason, Step};
 use crate::fn_system::{Cycle, InSet, OutSet, Param};
 use crate::log::{self, Log, LogPort};
 use crate::port::Input;
@@ -26,7 +26,7 @@ pub(crate) struct SequenceStep {
     abort: Abort,
     log: LogPort,
     run: Option<Run>,
-    end: Option<End>,
+    end: Option<EndReason>,
 }
 
 impl SequenceStep {
@@ -59,12 +59,12 @@ impl SequenceStep {
     /// Keeps the end, logging a failure's reason, which is all a pack's host sees.
     fn finish(&mut self, now: Timestamp, result: Result<(), SeqError>) {
         let end = match result {
-            Ok(()) => End::Completed,
-            Err(SeqError::Aborted) => End::Aborted,
-            Err(SeqError::TimedOut) => End::Failed("timed out".into()),
-            Err(SeqError::Failed(reason)) => End::Failed(reason),
+            Ok(()) => EndReason::Completed,
+            Err(SeqError::Aborted) => EndReason::Aborted,
+            Err(SeqError::TimedOut) => EndReason::Failed("timed out".into()),
+            Err(SeqError::Failed(reason)) => EndReason::Failed(reason),
         };
-        if let End::Failed(reason) = &end {
+        if let EndReason::Failed(reason) = &end {
             self.log.fault(now, "failed", reason.clone());
         }
         self.end = Some(end);
@@ -104,7 +104,7 @@ impl Step for SequenceStep {
         self.log.fault(now, "panic", message.to_string());
     }
 
-    fn ended(&self) -> Option<&End> {
+    fn ended(&self) -> Option<&EndReason> {
         self.end.as_ref()
     }
 }

@@ -16,7 +16,7 @@ use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 
 use crate::async_system::{AsyncSystem, Running, Stop};
-use crate::coordinator::{Adapter, End, MakeCx, ParamError, Params, Step};
+use crate::coordinator::{Adapter, EndReason, MakeCx, ParamError, Params, Step};
 use crate::record::Record;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef, SystemInputs, SystemOutputs};
 
@@ -139,7 +139,7 @@ pub struct Thread {
     fields: Fields,
     since_report: u64,
     panicked: Panicked,
-    end: Option<End>,
+    end: Option<EndReason>,
     group: Option<Arc<GroupHandle>>,
 }
 
@@ -162,7 +162,7 @@ impl Step for Thread {
         self.write_line(now, LogLevel::Error, "panic", message);
     }
 
-    fn ended(&self) -> Option<&End> {
+    fn ended(&self) -> Option<&EndReason> {
         self.end.as_ref()
     }
 }
@@ -221,7 +221,7 @@ impl Thread {
             return;
         }
         if let Some(message) = self.panicked.take() {
-            self.end = Some(End::Panicked);
+            self.end = Some(EndReason::Panicked);
             self.write_line(now, LogLevel::Error, "panic", &message);
         }
     }

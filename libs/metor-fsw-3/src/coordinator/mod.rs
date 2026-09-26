@@ -30,7 +30,7 @@ pub use error::BuildError;
 pub use params::{ParamError, Params};
 pub(crate) use run::{Stepped, catch_step, message_of as panic_message};
 pub use status::SystemStatus;
-pub use step::{End, LoadError, Occupant, Step};
+pub use step::{EndReason, LoadError, Occupant, Step};
 pub use table::{MakeCx, SystemTable};
 pub(crate) use table::{MakeFn, TableEntry, bindings, refuse_thread};
 
@@ -69,7 +69,7 @@ impl Coordinator {
     }
 
     /// The ids of the systems that ended and how, in step order.
-    pub fn ended(&self) -> impl Iterator<Item = (&str, &End)> {
+    pub fn ended(&self) -> impl Iterator<Item = (&str, &EndReason)> {
         self.entries
             .iter()
             .filter_map(|entry| Some((entry.name.as_str(), entry.ended()?)))
@@ -78,7 +78,7 @@ impl Coordinator {
     /// The ids of the systems a panic latched off, in step order.
     pub fn latched(&self) -> impl Iterator<Item = &str> {
         self.ended()
-            .filter(|(_, end)| **end == End::Panicked)
+            .filter(|(_, end)| **end == EndReason::Panicked)
             .map(|(id, _)| id)
     }
 }

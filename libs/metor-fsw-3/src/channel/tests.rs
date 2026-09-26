@@ -100,15 +100,15 @@ fn test_channel_state_codes() {
     assert_eq!(ChannelState::of(RunState::Running, None).code(), 0);
     assert_eq!(ChannelState::of(RunState::Stopped, None).code(), 1);
     assert_eq!(
-        ChannelState::of(RunState::Running, Some(&End::Completed)),
+        ChannelState::of(RunState::Running, Some(&EndReason::Completed)),
         ChannelState::Completed
     );
     assert_eq!(
-        ChannelState::of(RunState::Stopped, Some(&End::Failed("x".into()))),
+        ChannelState::of(RunState::Stopped, Some(&EndReason::Failed("x".into()))),
         ChannelState::Failed
     );
     assert_eq!(
-        ChannelState::of(RunState::Stopped, Some(&End::Unloaded)).code(),
+        ChannelState::of(RunState::Stopped, Some(&EndReason::Unloaded)).code(),
         6
     );
 }

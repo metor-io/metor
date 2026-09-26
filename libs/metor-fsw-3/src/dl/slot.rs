@@ -12,7 +12,9 @@ use metor_proto::types::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::coordinator::{Adapter, End, LoadError, MakeCx, Occupant, ParamError, Step, TableEntry};
+use crate::coordinator::{
+    Adapter, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, TableEntry,
+};
 use crate::def::{DefCx, DefError};
 use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
@@ -120,7 +122,7 @@ fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     if let Some(name) = params.initial
         && let Err(error) = slot.load(&name)
     {
-        slot.end = Some(End::Failed(error.to_string().into()));
+        slot.end = Some(EndReason::Failed(error.to_string().into()));
     }
     Ok(Box::new(slot))
 }
@@ -166,7 +168,7 @@ pub struct DlSlot {
     candidates: Vec<Resolved>,
     current: Option<Loaded>,
     /// Why the slot is empty when a load left it so.
-    end: Option<End>,
+    end: Option<EndReason>,
 }
 
 /// The occupant and the pack it was created from.
@@ -255,10 +257,10 @@ impl Step for DlSlot {
     /// Nothing: the pack has already written the fault line.
     fn fault(&mut self, _now: Timestamp, _message: &str) {}
 
-    fn ended(&self) -> Option<&End> {
+    fn ended(&self) -> Option<&EndReason> {
         match &self.current {
             Some(loaded) => loaded.step.ended(),
-            None => self.end.as_ref().or(Some(&End::Unloaded)),
+            None => self.end.as_ref().or(Some(&EndReason::Unloaded)),
         }
     }
 
