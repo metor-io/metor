@@ -34,8 +34,12 @@
 //! ```
 //!
 //! Every sequence reads an `abort` input first among its ports. An abort
-//! record makes [`Seq::sleep`] and [`Seq::wait_for`] return
-//! [`SeqError::Aborted`], so `?` ends the sequence.
+//! record, or a body calling [`Seq::abort`], raises the abort flag, which
+//! never comes down. At the next cycle's start the step drops the body
+//! without polling it and ends [`SeqError::Aborted`]. Dropping the body runs
+//! each armed [`Seq::on_abort`] handler, innermost first. A panic in the body
+//! runs them too. A failure, a timeout, or a body dropped unfinished
+//! (`Reset`, `Load`, shutdown) runs none.
 
 mod seq;
 mod step;
@@ -53,7 +57,7 @@ use crate::fn_system::{Ctor, InSet, OutSet, Param, Ports};
 use crate::port::Input;
 use crate::system::{SystemDef, SystemInputs, SystemOutputs};
 
-pub use seq::{NextCycle, Seq, SeqError, Sleep, WaitFor};
+pub use seq::{NextCycle, OnAbort, Seq, SeqError, Sleep, WaitFor};
 pub(crate) use step::SequenceStep;
 
 /// A `SequenceFn` is a sequence whose parameters are its ports and its [`Seq`].

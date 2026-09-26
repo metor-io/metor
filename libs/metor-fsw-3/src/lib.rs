@@ -173,7 +173,7 @@ pub use port::{
     DynInputs, DynOutputs, Input, Latest, Output, RecvError, Sample, SendError, ring_capacity,
 };
 pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Record, RecordSchema};
-pub use sequence::{Seq, SeqError, SequenceFn};
+pub use sequence::{OnAbort, Seq, SeqError, SequenceFn};
 pub use system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
 };

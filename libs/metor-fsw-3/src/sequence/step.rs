@@ -86,17 +86,41 @@ async fn run<S: SequenceFn>(
     S::call(&mut state, items).await
 }
 
+/// Polls the body once, or drops it, running its handlers, if the sequence is aborted.
+fn advance(
+    seq: &Seq,
+    samplers: &mut Samplers,
+    run: &mut Option<Run>,
+) -> Poll<Result<(), SeqError>> {
+    if seq.aborted() {
+        *run = None;
+        return Poll::Ready(Err(SeqError::Aborted));
+    }
+    samplers.take_all();
+    let Some(body) = run.as_mut() else {
+        return Poll::Pending;
+    };
+    let _polling = seq.polling();
+    body.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+}
+
 impl Step for SequenceStep {
     fn execute(&mut self, now: Timestamp) {
         self.seq.set_now(now);
-        self.seq.set_aborted(self.abort.requested());
-        let Some(run) = self.run.as_mut() else {
+        if self.abort.requested() {
+            let _ = self.seq.abort();
+        }
+        if self.run.is_none() {
             return;
-        };
-        let polled = log::with_log_port(&mut self.log, now, || {
-            self.samplers.take_all();
-            run.as_mut().poll(&mut Context::from_waker(Waker::noop()))
-        });
+        }
+        let Self {
+            seq,
+            samplers,
+            log,
+            run,
+            ..
+        } = self;
+        let polled = log::with_log_port(log, now, || advance(seq, samplers, run));
         if let Poll::Ready(result) = polled {
             self.run = None;
             self.finish(now, result);
@@ -105,6 +129,9 @@ impl Step for SequenceStep {
 
     fn fault(&mut self, now: Timestamp, message: &str) {
         self.log.fault(now, "panic", message.to_string());
+        let _ = self.seq.abort();
+        let run = &mut self.run;
+        log::with_log_port(&mut self.log, now, || drop(run.take()));
     }
 
     fn ended(&self) -> Option<&EndReason> {

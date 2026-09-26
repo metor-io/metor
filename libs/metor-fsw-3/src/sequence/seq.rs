@@ -1,4 +1,4 @@
-//! The [`Seq`] handle and the waits it hands out.
+//! The [`Seq`] handle, the waits it hands out, and its abort handlers.
 
 use core::cell::Cell;
 use core::future::Future;
@@ -6,14 +6,19 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::borrow::Cow;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use metor_proto::types::Timestamp;
+
+use crate::coordinator::panic_message;
+use crate::log::Log;
 
 /// A `Seq` is a sequence's view of its cycle: the time and whether it was aborted.
 #[derive(Default)]
 pub struct Seq {
     now: Cell<Timestamp>,
     aborted: Cell<bool>,
+    polling: Cell<bool>,
 }
 
 /// Why a sequence ended without completing.
@@ -33,9 +38,23 @@ impl Seq {
         self.now.get()
     }
 
-    /// Whether an abort has arrived; once true it stays true.
+    /// Whether the sequence was aborted; once true it stays true.
     pub fn aborted(&self) -> bool {
         self.aborted.get()
+    }
+
+    /// Aborts the sequence: sets the abort flag and returns the error to end it with.
+    pub fn abort(&self) -> SeqError {
+        self.aborted.set(true);
+        SeqError::Aborted
+    }
+
+    /// Runs `f` if the sequence aborts while the guard lives.
+    pub fn on_abort<F: FnOnce(&Seq)>(&self, f: F) -> OnAbort<'_, F> {
+        OnAbort {
+            seq: self,
+            f: Some(f),
+        }
     }
 
     /// Resolves once `dur` of cycle time has passed since its first poll.
@@ -74,13 +93,61 @@ impl Seq {
         self.now.set(now);
     }
 
-    pub(crate) fn set_aborted(&self, aborted: bool) {
-        self.aborted.set(aborted);
+    /// Marks the body as being polled until the guard drops.
+    pub(crate) fn polling(&self) -> Raised<'_> {
+        Raised::new(&self.polling)
     }
 
     /// The deadline `dur` after this cycle, armed once and kept.
     fn arm(&self, deadline: &mut Option<Timestamp>, dur: Duration) -> Timestamp {
         *deadline.get_or_insert_with(|| after(self.now(), dur))
+    }
+}
+
+/// Holds a flag up until dropped, unwinding included.
+pub(crate) struct Raised<'a>(&'a Cell<bool>);
+
+impl<'a> Raised<'a> {
+    pub(crate) fn new(flag: &'a Cell<bool>) -> Self {
+        flag.set(true);
+        Self(flag)
+    }
+}
+
+impl Drop for Raised<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+/// The guard [`Seq::on_abort`] returns. Its handler runs if it drops with the
+/// sequence aborted, or while a panic unwinds the polled body.
+#[must_use = "a handler is disarmed when its guard drops; bind it with `let _name`"]
+pub struct OnAbort<'a, F: FnOnce(&Seq)> {
+    seq: &'a Seq,
+    f: Option<F>,
+}
+
+impl<F: FnOnce(&Seq)> Drop for OnAbort<'_, F> {
+    fn drop(&mut self) {
+        if std::thread::panicking() && self.seq.polling.get() {
+            self.seq.aborted.set(true);
+        }
+        if self.seq.aborted()
+            && let Some(f) = self.f.take()
+        {
+            run_handler(self.seq, f);
+        }
+    }
+}
+
+/// Runs one handler, logging its panic as a `handler` fault.
+fn run_handler(seq: &Seq, f: impl FnOnce(&Seq)) {
+    // PANIC Safety: caught so the handlers after it still run, and so a
+    // panic during an unwind never escapes.
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| f(seq))) {
+        Log.fault("handler", panic_message(&*payload).to_string());
+        crate::panic::discard(payload);
     }
 }
 
@@ -244,7 +311,7 @@ mod tests {
         let mut wait = pin!(seq.wait_for(10 * MS, || true));
         assert_eq!(poll(sleep.as_mut()), Poll::Pending);
         at(&seq, 10);
-        seq.set_aborted(true);
+        let _ = seq.abort();
         assert_eq!(poll(sleep.as_mut()), Poll::Ready(Err(SeqError::Aborted)));
         assert_eq!(poll(wait.as_mut()), Poll::Ready(Err(SeqError::Aborted)));
     }
@@ -252,7 +319,7 @@ mod tests {
     #[test]
     fn test_next_cycle_ignores_abort() {
         let seq = Seq::default();
-        seq.set_aborted(true);
+        let _ = seq.abort();
         let mut next = pin!(seq.next_cycle());
         assert_eq!(poll(next.as_mut()), Poll::Pending);
         at(&seq, 7);
@@ -265,5 +332,78 @@ mod tests {
         let mut next = pin!(seq.next_cycle());
         assert_eq!(poll(next.as_mut()), Poll::Pending);
         assert_eq!(poll(next.as_mut()), Poll::Ready(Timestamp(0)));
+    }
+
+    /// Handlers' names, in the order they ran.
+    #[derive(Default)]
+    struct Ran(core::cell::RefCell<Vec<&'static str>>);
+
+    impl Ran {
+        fn push(&self, name: &'static str) {
+            self.0.borrow_mut().push(name);
+        }
+
+        fn take(&self) -> Vec<&'static str> {
+            self.0.take()
+        }
+    }
+
+    #[test]
+    fn test_handler_runs_only_on_abort() {
+        let seq = Seq::default();
+        let ran = Ran::default();
+        drop(seq.on_abort(|_| ran.push("calm")));
+        assert!(ran.take().is_empty());
+        let guard = seq.on_abort(|seq| {
+            assert!(seq.aborted());
+            ran.push("aborted");
+        });
+        assert_eq!(seq.abort(), SeqError::Aborted);
+        drop(guard);
+        assert_eq!(ran.take(), ["aborted"]);
+    }
+
+    #[test]
+    fn test_handlers_run_innermost_first() {
+        let seq = Seq::default();
+        let ran = Ran::default();
+        {
+            let _first = seq.on_abort(|_| ran.push("first"));
+            let _second = seq.on_abort(|_| ran.push("second"));
+            let _third = seq.on_abort(|_| ran.push("third"));
+            let _ = seq.abort();
+        }
+        assert_eq!(ran.take(), ["third", "second", "first"]);
+    }
+
+    #[test]
+    fn test_panicking_handler_logs_and_the_next_runs() {
+        use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+        use metor_proto_wkt::LogEvent;
+
+        use crate::log::{LogPort, with_log_port};
+        use crate::port::{Input, Output, ring_capacity};
+        use crate::record::Record;
+
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: ring_capacity(LogEvent::MAX_LEN, 4).expect("valid"),
+            max_readers: 1,
+        });
+        let mut port =
+            LogPort::new(Output::try_new(ring.writer(NoWake).expect("writer")).expect("aligned"));
+        let mut lines =
+            Input::<LogEvent>::try_new(vec![ring.view(NoWake).expect("slot")]).expect("aligned");
+        let seq = Seq::default();
+        let ran = Ran::default();
+        with_log_port(&mut port, Timestamp(3), || {
+            let _outer = seq.on_abort(|_| ran.push("outer"));
+            let _inner = seq.on_abort(|_| panic!("valve stuck"));
+            let _ = seq.abort();
+        });
+        assert_eq!(ran.take(), ["outer"]);
+        let lines: Vec<_> = lines.drain().map(|l| l.expect("decodes")).collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].message, "valve stuck");
+        assert_eq!(lines[0].fields, vec![("kind".into(), "handler".into())]);
     }
 }
