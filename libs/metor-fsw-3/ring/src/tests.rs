@@ -262,6 +262,61 @@ fn test_latest_reader_never_blocks_writer() {
     }
 }
 
+/// A wake source that drains its reader and writes once more from `notify`.
+#[derive(Clone, Default)]
+struct Reenter(std::rc::Rc<ReenterState>);
+
+#[derive(Default)]
+struct ReenterState {
+    writer: std::cell::OnceCell<std::rc::Weak<Writer<Reenter>>>,
+    view: std::cell::RefCell<Option<View<NoWake>>>,
+    armed: Cell<bool>,
+    nested: Cell<Option<Result<(), WriteError>>>,
+    read: std::cell::RefCell<Vec<Vec<u8>>>,
+}
+
+impl WakeSource for Reenter {
+    fn notify(&self) {
+        if !self.0.armed.replace(false) {
+            return;
+        }
+        if let Some(view) = self.0.view.borrow_mut().as_mut() {
+            while let Some(record) = view.try_read().unwrap() {
+                self.0.read.borrow_mut().push(record.to_vec());
+            }
+        }
+        let writer = self.0.writer.get().and_then(std::rc::Weak::upgrade);
+        self.0.nested.set(writer.map(|w| w.try_write(&[9u8; 8])));
+    }
+}
+
+#[test]
+fn test_notify_may_write_again() {
+    let rb = ring(64, 1);
+    let wake = Reenter::default();
+    let writer = std::rc::Rc::new(rb.writer(wake.clone()).unwrap());
+    let _ = wake.0.writer.set(std::rc::Rc::downgrade(&writer));
+    let mut view = rb.view(NoWake).unwrap();
+    writer.try_write(&[1u8; 8]).unwrap();
+    assert_eq!(&view.try_read().unwrap().expect("first")[..], &[1u8; 8]);
+    *wake.0.view.borrow_mut() = Some(view);
+
+    wake.0.armed.set(true);
+    let outer = writer.try_write(&[2u8; 48]);
+    let nested = wake.0.nested.take().expect("notify ran");
+
+    // The outer write publishes wrap padding and blocks behind the reader;
+    // the reader passes the padding in `notify`, making room for the nested one.
+    assert_eq!((outer, nested), (Err(WriteError::WouldBlock), Ok(())));
+    let written = vec![vec![9u8; 8]];
+    let mut view = wake.0.view.borrow_mut().take().unwrap();
+    let mut read = wake.0.read.take();
+    while let Some(record) = view.try_read().unwrap() {
+        read.push(record.to_vec());
+    }
+    assert_eq!(read, written, "every accepted write reads back, in order");
+}
+
 #[test]
 fn test_writer_is_send() {
     fn assert_send<T: Send>() {}

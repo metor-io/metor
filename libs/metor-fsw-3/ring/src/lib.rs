@@ -228,6 +228,8 @@ impl core::fmt::Display for AttachError {
 impl std::error::Error for AttachError {}
 
 /// Notifies readers after data or wrap padding is published.
+///
+/// A write notifies last, once its state is final, so `notify` may write again.
 pub trait WakeSource {
     fn notify(&self);
 }
@@ -741,10 +743,10 @@ impl<WD: WakeSource> Writer<WD> {
             }
             self.inner.control().hwm.store(c, Release);
             self.inner.control().committed.store(start_abs, Release);
-            self.data.notify();
             c = start_abs;
             gap = 0;
             if !self.fits(c, rec) {
+                self.data.notify();
                 return Err(WriteError::WouldBlock);
             }
         }
