@@ -81,6 +81,9 @@ channels. Landed 2026-09-24, `12-sequences.md`, `12-sequences-impl.md`.
   group, and a `Threads` handle the recipe can re-place with.
 - `Target.add` returns the system's own type, so a checker does not see
   a channel's `events` and `channel_status` handles.
+- Postcard samples: `Sample<T>` holds only `Frame + Copy` records. A
+  postcard record needs its decoded value held across the cycle without
+  allocating after make (`13-abort-handlers-redlines.md`, decision 4).
 
 ## 6. Process and wasm adapters
 

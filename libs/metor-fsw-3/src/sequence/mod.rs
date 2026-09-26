@@ -9,22 +9,41 @@
 //! ```
 //! # use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 //! # use metor_fsw_3::{Frame, Timestamp};
-//! # #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+//! # #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
 //! # #[repr(C)]
 //! # struct Arm {
 //! #     #[frame(timestamp)]
 //! #     timestamp: Timestamp,
 //! #     on: u64,
 //! # }
+//! # #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
+//! # #[repr(C)]
+//! # struct Bus {
+//! #     #[frame(timestamp)]
+//! #     timestamp: Timestamp,
+//! #     volts: f64,
+//! # }
 //! use core::time::Duration;
-//! use metor_fsw_3::{Input, Output, Seq, SeqError, SystemTable, sequence};
+//! use metor_fsw_3::{Input, Output, Sample, Seq, SeqError, SystemTable, redline, sequence};
 //!
 //! /// Arms once the other side reports armed, then holds for half a second.
+//! /// Disarms if aborted, and aborts if the bus sags.
 //! #[sequence]
-//! async fn arm(seq: &Seq, report: &mut Input<Arm>, cmd: &mut Output<Arm>) -> Result<(), SeqError> {
+//! async fn arm(
+//!     seq: &Seq,
+//!     report: &mut Input<Arm>,
+//!     bus: &Sample<Bus>,
+//!     cmd: &mut Output<Arm>,
+//! ) -> Result<(), SeqError> {
+//!     let _disarm = seq.on_abort(|seq| {
+//!         let _ = cmd.write(&Arm { timestamp: seq.now(), on: 0 });
+//!     });
+//!     redline!(seq, "bus voltage", || bus.get().is_some_and(|b| b.volts < 24.0));
 //!     let _ = cmd.write(&Arm { timestamp: seq.now(), on: 1 });
 //!     let armed = || report.latest().ok().flatten().is_some_and(|r| r.on == 1);
-//!     seq.wait_for(Duration::from_secs(1), armed).await?;
+//!     seq.wait_for(Duration::from_secs(1), armed)
+//!         .await
+//!         .map_err(|_| seq.abort())?;
 //!     seq.sleep(Duration::from_millis(500)).await
 //! }
 //!
@@ -40,6 +59,13 @@
 //! each armed [`Seq::on_abort`] handler, innermost first. A panic in the body
 //! runs them too. A failure, a timeout, or a body dropped unfinished
 //! (`Reset`, `Load`, shutdown) runs none.
+//!
+//! A [`redline!`](crate::redline) covers the rest of its block. Each cycle,
+//! after the samples are taken and before the body is polled, the step
+//! checks the linked redlines in order; the first that holds logs a
+//! `redline` fault with its name and aborts the sequence. A stopped channel
+//! does not execute its step, so it takes no samples, checks no redlines,
+//! and runs no handlers.
 
 mod redline;
 mod seq;

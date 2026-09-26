@@ -396,3 +396,32 @@ it.
    handlers.
 3. Redlines are not checked while stopped.
 4. `Sample` is for frames. Postcard samples are deferred.
+
+## Shipped deviations
+
+- A body that panics mid-poll drops its locals as the panic unwinds, before
+  the step's `fault` runs, so the flag `fault` raises comes too late for
+  them. `Seq` has a `polling` flag the step holds up around each poll, and
+  an `OnAbort` that drops while `thread::panicking()` and `polling` raises
+  the abort flag first. Those handlers run inside the log scope, before the
+  `panic` line. `fault` still raises the flag and drops the body, which
+  covers a panicking redline condition.
+- A handler's panic is logged as a `("handler", message)` fault.
+- A linked redline dropped during a walk aborts the process. A condition
+  can reach one through interior mutability (a `RefCell` holding a
+  `Pin<Box<Redline>>`, even its own), and the walk still borrows that
+  node's memory, so there is no sound way to go on.
+- Linking a redline that is already linked, to this `Seq` or another, does
+  nothing.
+- `Seq` is no longer `Default`; only the crate builds one, and it never
+  moves once a redline links, so a node's `seq` pointer stays valid. `Seq`
+  releases its nodes when it drops, so a node that outlives it (a leaked
+  frame) never names a freed `Seq`.
+- The unlink lives in `Node`'s `Drop`, not `Redline`'s. `node` is the first
+  field, so it unlinks before `cond` drops.
+- The walk uses cordyceps' `iter_raw`, whose pointers keep the whole
+  redline's provenance; `iter` hands out `&Node`, which does not cover
+  `cond`.
+- `redline!(seq, || cond)`, with no name, names the redline `"redline"`.
+- The Miri run over `sequence::` needs `-Zmiri-disable-isolation`: the
+  coordinator reads the realtime clock.

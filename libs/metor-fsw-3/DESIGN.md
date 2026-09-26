@@ -297,7 +297,33 @@ async fn arm_controls(
 }
 ```
 
-The future the function returns is polled once per cycle. `seq` is the sequence's handle: `now()` is the cycle's time, `sleep` resolves once that much cycle time has passed, and `wait_for` checks its predicate every cycle until it holds or times out. An abort makes `sleep` and `wait_for` return `SeqError::Aborted`, so `?` ends the sequence. Every sequence has an `abort` input, and a sequence given a channel can be started, stopped, reset, and aborted like any other system, or loaded into a slot from a pack.
+The future the function returns is polled once per cycle. `seq` is the sequence's handle: `now()` is the cycle's time, `sleep` resolves once that much cycle time has passed, and `wait_for` checks its predicate every cycle until it holds or times out. Every sequence has an `abort` input, and a sequence given a channel can be started, stopped, reset, and aborted like any other system, or loaded into a slot from a pack.
+
+#### Aborts, handlers, and redlines
+
+An abort record, a tripped redline, or the body calling `seq.abort()` raises the sequence's abort flag, which never comes down. At the next cycle's start the step does not poll the body: it drops it and ends `Aborted`. A failure or timeout does not abort on its own; the body calls `seq.abort()` when it should.
+
+An abort handler safes hardware. `seq.on_abort(|seq| ..)` returns a guard in the sequence's frame; when the guard drops with the flag up, its handler runs. Handlers cover the block that binds them and run innermost first, each under `catch_unwind`, so a panicking handler logs a `handler` fault and the rest still run. A panic in the body runs them too.
+
+A redline is a condition checked every cycle. `redline!(seq, "name", || cond)` pins it in the caller's block and links it into the `Seq`; it unlinks when the block ends. After the samples are taken and before the body is polled, the step checks the linked redlines in order. The first that holds logs a `redline` fault with its name and aborts the sequence.
+
+```rust
+#[sequence]
+async fn burn(seq: &Seq, valve: &mut Output<Valve>, pc: &Sample<Chamber>) -> Result<(), SeqError> {
+    let _closed = seq.on_abort(|seq| {
+        let _ = valve.write(&Valve::closed(seq.now()));
+    });
+    redline!(seq, "chamber pressure", || pc.get().is_some_and(|c| c.pressure > MAX_PC));
+    let _ = valve.write(&Valve::open(seq.now()));
+    seq.sleep(BURN).await?;
+    let _ = valve.write(&Valve::closed(seq.now()));
+    Ok(())
+}
+```
+
+Handlers and the body write the same port because `Output::write` takes `&self`. Conditions read a `Sample<T>`: the newest frame on an input as of this cycle, taken once at the cycle's start and held, so the body and every redline see one value.
+
+A stopped channel is inert: its step is not executed, so samples are not taken, redlines are not checked, and handlers do not run. `Reset`, `Load`, or shutdown drop an unfinished body with the flag down, so no handlers run. An operator who wants to safe a stopped sequence starts it and aborts it.
 
 ### ABI
 
