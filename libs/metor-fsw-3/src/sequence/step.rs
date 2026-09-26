@@ -22,7 +22,7 @@ type Run = Pin<Box<dyn Future<Output = Result<(), SeqError>>>>;
 
 /// A `SequenceStep` polls one sequence each cycle until it ends.
 pub(crate) struct SequenceStep {
-    seq: Rc<Seq>,
+    seq: Rc<Seq<'static>>,
     abort: Abort,
     samplers: Samplers,
     log: LogPort,
@@ -78,7 +78,7 @@ async fn run<S: SequenceFn>(
     mut state: S::State,
     mut ins: <S::Params as Param>::In<NoWake>,
     mut outs: <S::Params as Param>::Out,
-    seq: Rc<Seq>,
+    seq: Rc<Seq<'static>>,
 ) -> Result<(), SeqError> {
     let mut log = Log;
     let mut cx = Cycle::with_seq(seq.now(), &mut log, &seq);
@@ -88,11 +88,17 @@ async fn run<S: SequenceFn>(
 
 /// Polls the body once, or drops it, running its handlers, if the sequence
 /// is aborted or a redline trips.
+///
+/// The redlines are checked only behind a live body, which holds all their
+/// conditions borrow.
 fn advance(
-    seq: &Seq,
+    seq: &Seq<'_>,
     samplers: &mut Samplers,
     run: &mut Option<Run>,
 ) -> Poll<Result<(), SeqError>> {
+    let Some(body) = run.as_mut() else {
+        return Poll::Pending;
+    };
     if !seq.aborted() {
         samplers.take_all();
         trip(seq);
@@ -101,15 +107,12 @@ fn advance(
         *run = None;
         return Poll::Ready(Err(SeqError::Aborted));
     }
-    let Some(body) = run.as_mut() else {
-        return Poll::Pending;
-    };
     let _polling = seq.polling();
     body.as_mut().poll(&mut Context::from_waker(Waker::noop()))
 }
 
 /// Aborts the sequence if a redline holds, logging a fault that names it.
-fn trip(seq: &Seq) {
+fn trip(seq: &Seq<'_>) {
     if let Some(name) = seq.tripped() {
         Log.fault("redline", name);
         let _ = seq.abort();

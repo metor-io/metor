@@ -4,16 +4,18 @@
 //!
 //! The attribute reads parameter identifiers and doc comments. It classifies
 //! no type beyond refusing the few that belong to the other kind of fn; each
-//! parameter type's `Param` impl does the rest.
+//! parameter type's `Param` impl does the rest. A sequence's `Seq` and its
+//! parameters' elided lifetimes are named `'__seq`, the brand's lifetime.
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{ToTokens, format_ident, quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
+use syn::visit_mut::{self, VisitMut};
 use syn::{
-    Attribute, Expr, ExprLit, FnArg, Generics, Ident, Item, ItemFn, Lifetime, Lit, Meta, Pat,
-    ReturnType, Signature, Type, TypeImplTrait, TypeParamBound,
+    Attribute, Expr, ExprLit, FnArg, GenericArgument, Generics, Ident, Item, ItemFn, Lifetime, Lit,
+    Meta, Pat, PathArguments, ReturnType, Signature, Type, TypeImplTrait, TypeParamBound, TypePath,
 };
 
 /// Which attribute is expanding.
@@ -306,7 +308,13 @@ fn expand_fn(mut f: ItemFn, fsw: &TokenStream2, kind: Kind) -> TokenStream2 {
     let states = take_states(&mut f.sig);
     match Sig::parse(&f.sig, &states, kind) {
         Ok(sig) => emit(f, &sig, fsw),
-        Err(e) => with_error(f, e),
+        Err(e) => {
+            // An `async fn` cannot elide `Seq`'s lifetime.
+            if kind == Kind::Sequence {
+                brand(&mut f.sig);
+            }
+            with_error(f, e)
+        }
     }
 }
 
@@ -355,13 +363,17 @@ fn emit(f: ItemFn, sig: &Sig, fsw: &TokenStream2) -> TokenStream2 {
         )
     };
     let ports = ports_impl(sig, &name.to_string(), &doc, &generics, fsw);
+    let mut body_sig = Signature {
+        ident: format_ident!("__metor_body"),
+        ..f.sig.clone()
+    };
+    if sig.kind == Kind::Sequence {
+        brand(&mut body_sig);
+    }
     let body = ItemFn {
         attrs: inner,
         vis: syn::Visibility::Inherited,
-        sig: Signature {
-            ident: format_ident!("__metor_body"),
-            ..f.sig.clone()
-        },
+        sig: body_sig,
         block: f.block,
     };
     quote! {
@@ -501,11 +513,12 @@ fn sequence_call(sig: &Sig, generics: &Generics, fsw: &TokenStream2) -> TokenStr
         body,
     } = call_parts(sig, generics, fsw);
     let state_ty = sig.state_ty();
+    let brand = brand_lifetime();
     quote! {
         impl #impl_generics #fsw::SequenceFn for __MetorSystem #ty_generics #where_clause {
-            async fn call(
-                #state: &mut #state_ty,
-                #items: <Self::Params as #fsw::Param>::Item<'_, #fsw::ring::NoWake>,
+            async fn call<#brand>(
+                #state: &#brand mut #state_ty,
+                #items: <Self::Params as #fsw::Param>::Item<#brand, #fsw::ring::NoWake>,
             ) -> ::core::result::Result<(), #fsw::SeqError> {
                 #asserts
                 #body.await
@@ -535,11 +548,88 @@ fn doc(attrs: &[Attribute]) -> String {
 }
 
 /// Strips one outer reference, so `&mut Input<T>`, `&Seq`, and `Input<T>`
-/// name their `Param` alike.
+/// name their `Param` alike. A `Seq` keys as `Seq<'static>`.
 fn key_type(ty: &Type) -> Type {
-    match ty {
+    let key = match ty {
         Type::Reference(r) => (*r.elem).clone(),
         other => other.clone(),
+    };
+    match &key {
+        Type::Path(path) if is_seq(path) => {
+            let mut path = path.clone();
+            set_seq_lifetime(&mut path, &Lifetime::new("'static", Span::call_site()));
+            Type::Path(path)
+        }
+        _ => key,
+    }
+}
+
+/// The lifetime a sequence body's elided lifetimes and its `Seq` share.
+fn brand_lifetime() -> Lifetime {
+    Lifetime::new("'__seq", Span::call_site())
+}
+
+/// Names every elided lifetime in a sequence body's parameters, and its
+/// `Seq`'s, `'__seq`, so a redline's condition may borrow any parameter.
+fn brand(sig: &mut Signature) {
+    let lifetime = brand_lifetime();
+    sig.generics.params.insert(
+        0,
+        syn::GenericParam::Lifetime(syn::LifetimeParam::new(lifetime.clone())),
+    );
+    let mut brander = Brander(lifetime);
+    for input in &mut sig.inputs {
+        if let FnArg::Typed(typed) = input {
+            brander.visit_type_mut(&mut typed.ty);
+        }
+    }
+}
+
+struct Brander(Lifetime);
+
+impl VisitMut for Brander {
+    fn visit_type_reference_mut(&mut self, r: &mut syn::TypeReference) {
+        if r.lifetime.is_none() {
+            r.lifetime = Some(self.0.clone());
+        }
+        visit_mut::visit_type_reference_mut(self, r);
+    }
+
+    fn visit_lifetime_mut(&mut self, lt: &mut Lifetime) {
+        if lt.ident == "_" {
+            *lt = self.0.clone();
+        }
+    }
+
+    fn visit_type_path_mut(&mut self, path: &mut TypePath) {
+        if is_seq(path) {
+            set_seq_lifetime(path, &self.0);
+        }
+        visit_mut::visit_type_path_mut(self, path);
+    }
+}
+
+/// Whether `path` is `Seq` or `Seq<'_>`, whose lifetime the macro names.
+fn is_seq(path: &TypePath) -> bool {
+    let Some(last) = path.path.segments.last() else {
+        return false;
+    };
+    if path.qself.is_some() || last.ident != "Seq" {
+        return false;
+    }
+    match &last.arguments {
+        PathArguments::None => true,
+        PathArguments::AngleBracketed(args) => {
+            args.args.len() == 1
+                && matches!(args.args.first(), Some(GenericArgument::Lifetime(lt)) if lt.ident == "_")
+        }
+        PathArguments::Parenthesized(_) => false,
+    }
+}
+
+fn set_seq_lifetime(path: &mut TypePath, lifetime: &Lifetime) {
+    if let Some(last) = path.path.segments.last_mut() {
+        last.arguments = PathArguments::AngleBracketed(syn::parse_quote!(<#lifetime>));
     }
 }
 

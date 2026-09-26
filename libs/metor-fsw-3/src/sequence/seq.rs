@@ -2,6 +2,7 @@
 
 use core::cell::{Cell, UnsafeCell};
 use core::future::Future;
+use core::marker::PhantomData;
 use core::pin::Pin;
 use core::ptr::NonNull;
 use core::task::{Context, Poll};
@@ -19,13 +20,20 @@ use crate::log::Log;
 /// A `Seq` is a sequence's view of its cycle: the time, whether it was
 /// aborted, and the redlines its body has linked.
 ///
-/// Only this crate builds one, and it never moves once a redline is linked.
-pub struct Seq {
-    now: Cell<Timestamp>,
-    aborted: Cell<bool>,
+/// A redline's condition outlives `'a`, which is invariant. Only this crate
+/// builds one, and it never moves once a redline is linked.
+pub struct Seq<'a> {
+    clock: Clock,
     polling: Cell<bool>,
     redlines: UnsafeCell<List<Node>>,
     walking: Cell<bool>,
+    _brand: PhantomData<fn(&'a ()) -> &'a ()>,
+}
+
+/// The cycle time and abort flag the waits read.
+pub(crate) struct Clock {
+    now: Cell<Timestamp>,
+    aborted: Cell<bool>,
 }
 
 /// Why a sequence ended without completing.
@@ -39,35 +47,53 @@ pub enum SeqError {
     Failed(Cow<'static, str>),
 }
 
-impl Seq {
+impl Clock {
+    fn now(&self) -> Timestamp {
+        self.now.get()
+    }
+
+    fn aborted(&self) -> bool {
+        self.aborted.get()
+    }
+
+    /// The deadline `dur` after this cycle, armed once and kept.
+    fn arm(&self, deadline: &mut Option<Timestamp>, dur: Duration) -> Timestamp {
+        *deadline.get_or_insert_with(|| after(self.now(), dur))
+    }
+}
+
+impl<'a> Seq<'a> {
     pub(crate) fn new() -> Self {
         Self {
-            now: Cell::new(Timestamp(0)),
-            aborted: Cell::new(false),
+            clock: Clock {
+                now: Cell::new(Timestamp(0)),
+                aborted: Cell::new(false),
+            },
             polling: Cell::new(false),
             redlines: UnsafeCell::new(List::new()),
             walking: Cell::new(false),
+            _brand: PhantomData,
         }
     }
 
     /// This cycle's time.
     pub fn now(&self) -> Timestamp {
-        self.now.get()
+        self.clock.now()
     }
 
     /// Whether the sequence was aborted; once true it stays true.
     pub fn aborted(&self) -> bool {
-        self.aborted.get()
+        self.clock.aborted()
     }
 
     /// Aborts the sequence: sets the abort flag and returns the error to end it with.
     pub fn abort(&self) -> SeqError {
-        self.aborted.set(true);
+        self.clock.aborted.set(true);
         SeqError::Aborted
     }
 
     /// Runs `f` if the sequence aborts while the guard lives.
-    pub fn on_abort<F: FnOnce(&Seq)>(&self, f: F) -> OnAbort<'_, F> {
+    pub fn on_abort<F: FnOnce(&Seq<'a>)>(&self, f: F) -> OnAbort<'_, 'a, F> {
         OnAbort {
             seq: self,
             f: Some(f),
@@ -77,7 +103,7 @@ impl Seq {
     /// Resolves once `dur` of cycle time has passed since its first poll.
     pub fn sleep(&self, dur: Duration) -> Sleep<'_> {
         Sleep {
-            seq: self,
+            clock: &self.clock,
             dur,
             deadline: None,
         }
@@ -91,7 +117,7 @@ impl Seq {
         pred: F,
     ) -> WaitFor<'_, F> {
         WaitFor {
-            seq: self,
+            clock: &self.clock,
             timeout,
             pred,
             deadline: None,
@@ -101,13 +127,13 @@ impl Seq {
     /// Resolves on the next poll with that poll's time.
     pub fn next_cycle(&self) -> NextCycle<'_> {
         NextCycle {
-            seq: self,
+            clock: &self.clock,
             polled: false,
         }
     }
 
     pub(crate) fn set_now(&self, now: Timestamp) {
-        self.now.set(now);
+        self.clock.now.set(now);
     }
 
     /// Marks the body as being polled until the guard drops.
@@ -120,7 +146,50 @@ impl Seq {
     /// Use [`redline!`](crate::redline), which pins it for the rest of the
     /// block. A redline linked while the redlines are checked, or linked
     /// already, stays as it was.
-    pub fn redline<C: Fn() -> bool>(&self, redline: Pin<&Redline<C>>) {
+    ///
+    /// A condition outlives the sequence's parameters, so it cannot borrow
+    /// a body local, even through a leaked redline:
+    ///
+    /// ```compile_fail,E0373
+    /// use metor_fsw_3::{Redline, Seq, SeqError, sequence};
+    ///
+    /// #[sequence]
+    /// async fn dangle(seq: &Seq) -> Result<(), SeqError> {
+    ///     let value = Box::new(42u32);
+    ///     let redline = Box::pin(Redline::new("dangling", || *value == 42));
+    ///     seq.redline(redline.as_ref());
+    ///     core::mem::forget(redline);
+    ///     drop(value);
+    ///     seq.next_cycle().await;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// Nor through a leaked future that linked one:
+    ///
+    /// ```compile_fail,E0373
+    /// use core::future::{Future, poll_fn};
+    /// use core::task::Poll;
+    /// use metor_fsw_3::{Seq, SeqError, redline, sequence};
+    ///
+    /// #[sequence]
+    /// async fn dangle(seq: &Seq<'_>) -> Result<(), SeqError> {
+    ///     let mut nested = Box::pin(async {
+    ///         let value = Box::new(42u32);
+    ///         redline!(seq, "dangling", || *value == 42);
+    ///         seq.next_cycle().await;
+    ///     });
+    ///     poll_fn(|cx| {
+    ///         let _ = nested.as_mut().poll(cx);
+    ///         Poll::Ready(())
+    ///     })
+    ///     .await;
+    ///     core::mem::forget(nested);
+    ///     seq.next_cycle().await;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn redline<C: Fn() -> bool + 'a>(&self, redline: Pin<&Redline<C>>) {
         if self.walking.get() || !redline.node().claim(self) {
             return;
         }
@@ -145,6 +214,8 @@ impl Seq {
     }
 
     /// The name of the first redline, in link order, whose condition holds.
+    ///
+    /// The caller keeps alive all a condition borrows for `'a`.
     pub(crate) fn tripped(&self) -> Option<&'static str> {
         let _walking = Raised::new(&self.walking);
         // SAFETY: while walking, `redline` refuses to link and `unlink`
@@ -152,8 +223,9 @@ impl Seq {
         // thread reaches it, since `Seq` is `!Sync`.
         let list = unsafe { &mut *self.redlines.get() };
         list.iter_raw()
-            // SAFETY: a linked node is live and was made from its whole
-            // redline. The body is suspended, and a condition takes only
+            // SAFETY: a linked node's memory is live and was made from its
+            // whole redline, and the caller keeps its condition's borrows
+            // alive. The body is suspended, and a condition takes only
             // shared borrows; the body's own `&mut` to its `!Unpin` frame
             // does not claim exclusive access, as for any `async fn` that
             // borrows a local across an `.await`.
@@ -161,18 +233,14 @@ impl Seq {
             // SAFETY: as above, a linked node is live.
             .map(|node| unsafe { node.as_ref() }.name())
     }
-
-    /// The deadline `dur` after this cycle, armed once and kept.
-    fn arm(&self, deadline: &mut Option<Timestamp>, dur: Duration) -> Timestamp {
-        *deadline.get_or_insert_with(|| after(self.now(), dur))
-    }
 }
 
-impl Drop for Seq {
+impl Drop for Seq<'_> {
     fn drop(&mut self) {
         let list = self.redlines.get_mut();
         while let Some(node) = list.pop_front() {
-            // SAFETY: a linked node is live until its `Drop` unlinks it.
+            // SAFETY: a linked node's memory is live until its `Drop` unlinks
+            // it. Only the node is read; its condition is never called.
             unsafe { node.as_ref() }.release();
         }
     }
@@ -197,15 +265,15 @@ impl Drop for Raised<'_> {
 /// The guard [`Seq::on_abort`] returns. Its handler runs if it drops with the
 /// sequence aborted, or while a panic unwinds the polled body.
 #[must_use = "a handler is disarmed when its guard drops; bind it with `let _name`"]
-pub struct OnAbort<'a, F: FnOnce(&Seq)> {
-    seq: &'a Seq,
+pub struct OnAbort<'s, 'a, F: FnOnce(&Seq<'a>)> {
+    seq: &'s Seq<'a>,
     f: Option<F>,
 }
 
-impl<F: FnOnce(&Seq)> Drop for OnAbort<'_, F> {
+impl<'a, F: FnOnce(&Seq<'a>)> Drop for OnAbort<'_, 'a, F> {
     fn drop(&mut self) {
         if std::thread::panicking() && self.seq.polling.get() {
-            self.seq.aborted.set(true);
+            let _ = self.seq.abort();
         }
         if self.seq.aborted()
             && let Some(f) = self.f.take()
@@ -216,7 +284,7 @@ impl<F: FnOnce(&Seq)> Drop for OnAbort<'_, F> {
 }
 
 /// Runs one handler, logging its panic as a `handler` fault.
-fn run_handler(seq: &Seq, f: impl FnOnce(&Seq)) {
+fn run_handler<'a>(seq: &Seq<'a>, f: impl FnOnce(&Seq<'a>)) {
     // PANIC Safety: caught so the handlers after it still run, and so a
     // panic during an unwind never escapes.
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| f(seq))) {
@@ -234,7 +302,7 @@ fn after(now: Timestamp, dur: Duration) -> Timestamp {
 /// The future [`Seq::sleep`] returns.
 #[must_use = "a sleep does nothing unless awaited"]
 pub struct Sleep<'a> {
-    seq: &'a Seq,
+    clock: &'a Clock,
     dur: Duration,
     deadline: Option<Timestamp>,
 }
@@ -244,11 +312,11 @@ impl Future for Sleep<'_> {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if this.seq.aborted() {
+        if this.clock.aborted() {
             return Poll::Ready(Err(SeqError::Aborted));
         }
-        let deadline = this.seq.arm(&mut this.deadline, this.dur);
-        if this.seq.now() >= deadline {
+        let deadline = this.clock.arm(&mut this.deadline, this.dur);
+        if this.clock.now() >= deadline {
             return Poll::Ready(Ok(()));
         }
         Poll::Pending
@@ -258,7 +326,7 @@ impl Future for Sleep<'_> {
 /// The future [`Seq::wait_for`] returns.
 #[must_use = "a wait does nothing unless awaited"]
 pub struct WaitFor<'a, F> {
-    seq: &'a Seq,
+    clock: &'a Clock,
     timeout: Duration,
     pred: F,
     deadline: Option<Timestamp>,
@@ -269,14 +337,14 @@ impl<F: FnMut() -> bool + Unpin> Future for WaitFor<'_, F> {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if this.seq.aborted() {
+        if this.clock.aborted() {
             return Poll::Ready(Err(SeqError::Aborted));
         }
         if (this.pred)() {
             return Poll::Ready(Ok(()));
         }
-        let deadline = this.seq.arm(&mut this.deadline, this.timeout);
-        if this.seq.now() >= deadline {
+        let deadline = this.clock.arm(&mut this.deadline, this.timeout);
+        if this.clock.now() >= deadline {
             return Poll::Ready(Err(SeqError::TimedOut));
         }
         Poll::Pending
@@ -286,7 +354,7 @@ impl<F: FnMut() -> bool + Unpin> Future for WaitFor<'_, F> {
 /// The future [`Seq::next_cycle`] returns.
 #[must_use = "a cycle wait does nothing unless awaited"]
 pub struct NextCycle<'a> {
-    seq: &'a Seq,
+    clock: &'a Clock,
     polled: bool,
 }
 
@@ -296,7 +364,7 @@ impl Future for NextCycle<'_> {
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Timestamp> {
         let this = self.get_mut();
         if core::mem::replace(&mut this.polled, true) {
-            return Poll::Ready(this.seq.now());
+            return Poll::Ready(this.clock.now());
         }
         Poll::Pending
     }

@@ -166,7 +166,7 @@ fn names(ports: &[PortDef]) -> Vec<Cow<'static, str>> {
 pub struct Cycle<'a> {
     pub now: Timestamp,
     log: Option<&'a mut Log>,
-    seq: Option<&'a Seq>,
+    seq: Option<&'a Seq<'static>>,
 }
 
 impl<'a> Cycle<'a> {
@@ -179,7 +179,10 @@ impl<'a> Cycle<'a> {
     }
 
     /// A sequence's cycle, which hands its [`Seq`] to the parameter taking it.
-    pub(crate) fn with_seq(now: Timestamp, log: &'a mut Log, seq: &'a Seq) -> Self {
+    ///
+    /// `'a` borrows the locals of the body future the step polls, so it
+    /// ends no later than that body.
+    pub(crate) fn with_seq(now: Timestamp, log: &'a mut Log, seq: &'a Seq<'static>) -> Self {
         Self {
             now,
             log: Some(log),
@@ -187,12 +190,21 @@ impl<'a> Cycle<'a> {
         }
     }
 
-    /// The sequence's handle.
-    pub fn seq(&self) -> &'a Seq {
+    /// The sequence's handle, branded with this cycle's lifetime.
+    pub fn seq(&self) -> &'a Seq<'a> {
         // PANIC Safety: `#[system]` rejects a `Seq` parameter, so only a
         // sequence, whose step builds its cycle `with_seq`, reaches this.
-        self.seq
-            .expect("a `Seq` parameter only on a `#[sequence]` fn")
+        let seq = self
+            .seq
+            .expect("a `Seq` parameter only on a `#[sequence]` fn");
+        // SAFETY: the brand is phantom, so the layout is unchanged. Through
+        // the result, a condition links only if it outlives `'a`, which ends
+        // no later than the body (`with_seq`). The step checks redlines only
+        // while it holds that body: `advance` walks behind `run.as_mut()`,
+        // and `run` is `None` from the body's drop on, in `execute` and in
+        // `fault` alike. `Seq`'s `Drop` clears the back-pointers of nodes
+        // still linked without calling a condition.
+        unsafe { &*core::ptr::from_ref(seq).cast::<Seq<'a>>() }
     }
 
     /// Hands the log to the one `&mut Log` parameter.
@@ -471,10 +483,10 @@ impl<D: WakeSink + 'static> Param for Abort<D> {
     }
 }
 
-impl Param for Seq {
+impl Param for Seq<'static> {
     type In<W: WakeSink + Clone + 'static> = ();
     type Out = ();
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a Seq;
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a Seq<'a>;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -493,7 +505,7 @@ impl Param for Seq {
         _input: &'a mut (),
         _output: &'a mut (),
         cx: &mut Cycle<'a>,
-    ) -> &'a Seq {
+    ) -> &'a Seq<'a> {
         cx.seq()
     }
 }

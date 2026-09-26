@@ -167,7 +167,7 @@ fn test_sequence_fn() {
     );
     assert_eq!(
         impl_item(&f, "Ports", "Params"),
-        tokens(quote!((Seq, Output<Cmd>,)))
+        tokens(quote!((Seq<'static>, Output<Cmd>,)))
     );
     assert_eq!(impl_item(&f, "Ports", "State"), tokens(quote!(Arm)));
     assert_eq!(
@@ -176,6 +176,51 @@ fn test_sequence_fn() {
     );
     assert!(has_impl(&f, "SequenceFn"));
     assert!(!has_impl(&f, "Deref") && !has_impl(&f, "SystemFn"));
+}
+
+/// The rewritten fn's `__metor_body` signature.
+fn body_sig(f: &ItemFn) -> String {
+    f.block
+        .stmts
+        .iter()
+        .find_map(|stmt| match stmt {
+            Stmt::Item(Item::Fn(body)) if body.sig.ident == "__metor_body" => Some(body),
+            _ => None,
+        })
+        .expect("the body")
+        .sig
+        .to_token_stream()
+        .to_string()
+}
+
+#[test]
+fn test_sequence_body_shares_the_brand() {
+    let out = expand(
+        quote! {
+            async fn arm(
+                #[state] s: &mut Arm,
+                seq: &Seq<'_>,
+                pc: &Sample<Chamber>,
+            ) -> Result<(), SeqError> {
+                Ok(())
+            }
+        },
+        &quote!(::fsw),
+        Kind::Sequence,
+    );
+    let f: ItemFn = syn::parse2(out).expect("one rewritten fn");
+    assert_eq!(
+        impl_item(&f, "Ports", "Params"),
+        tokens(quote!((Seq<'static>, Sample<Chamber>,)))
+    );
+    let expected = quote! {
+        async fn __metor_body<'__seq>(
+            s: &'__seq mut Arm,
+            seq: &'__seq Seq<'__seq>,
+            pc: &'__seq Sample<Chamber>,
+        ) -> Result<(), SeqError>
+    };
+    assert_eq!(body_sig(&f), tokens(expected));
 }
 
 #[test]

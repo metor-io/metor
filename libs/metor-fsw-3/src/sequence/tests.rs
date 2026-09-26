@@ -854,9 +854,11 @@ async fn glance(imu: &Sample<Imu>) -> Result<(), SeqError> {
     Ok(())
 }
 
-#[test]
-fn test_ended_sequence_releases_its_samples() {
-    let def = def_of(glance());
+/// One step of `S`, whose one port `imu` reads the returned output.
+fn step_on_imu<S: SequenceFn<State = ()>>(
+    sequence: fn() -> S,
+) -> (SequenceStep, Output<Imu>, Vec<RingBuffer>) {
+    let def = def_of(sequence());
     let ring = RingBuffer::create_in_memory(Config {
         capacity: ring_capacity(def.inputs[1].max_len, 2).expect("valid capacity"),
         max_readers: 1,
@@ -871,15 +873,102 @@ fn test_ended_sequence_releases_its_samples() {
             views: vec![ring.view(NoWake).expect("a free slot")],
         },
     ];
-    let (mut step, _rings) = step_over(glance(), (), inputs);
+    let (step, mut rings) = step_over(sequence(), (), inputs);
+    let imu = Output::try_new(ring.writer(NoWake).expect("a free writer")).expect("aligned");
+    rings.push(ring);
+    (step, imu, rings)
+}
+
+fn imu_at(at: i64, sample: f64) -> Imu {
+    Imu {
+        timestamp: ms(at),
+        sample,
+    }
+}
+
+#[test]
+fn test_ended_sequence_releases_its_samples() {
+    let (mut step, imu, _rings) = step_on_imu(glance);
     step.execute(ms(0));
     assert_eq!(step.ended(), Some(&EndReason::Completed));
-    let imu = Output::<Imu>::try_new(ring.writer(NoWake).expect("a free writer")).expect("aligned");
     for at in 0..16 {
-        let sample = Imu {
-            timestamp: ms(at),
-            sample: 1.0,
-        };
-        assert!(imu.write(&sample).is_ok(), "write {at} blocked");
+        assert!(imu.write(&imu_at(at, 1.0)).is_ok(), "write {at} blocked");
     }
+}
+
+/// An allocation leaked on purpose.
+struct Leaked {
+    _ptr: *mut u8,
+}
+
+// SAFETY: never read through; it only keeps its allocation reachable.
+unsafe impl Send for Leaked {}
+
+static LEAKED: std::sync::Mutex<Vec<Leaked>> = std::sync::Mutex::new(Vec::new());
+
+/// Leaks `boxed` as `mem::forget` does, keeping it reachable so Miri's leak
+/// check passes.
+fn leak<T: ?Sized>(boxed: core::pin::Pin<Box<T>>) {
+    // SAFETY: the box is never moved out of or freed.
+    let raw = Box::into_raw(unsafe { core::pin::Pin::into_inner_unchecked(boxed) });
+    let mut leaked = LEAKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    leaked.push(Leaked { _ptr: raw.cast() });
+}
+
+/// Links a redline over its imu inside a future it polls once and leaks,
+/// then ends two cycles later.
+#[crate::sequence]
+async fn leaks_a_future(seq: &Seq, imu: &Sample<Imu>) -> Result<(), SeqError> {
+    let mut nested = Box::pin(async {
+        crate::redline!(seq, "imu high", || imu
+            .get()
+            .is_some_and(|i| i.sample >= 2.0));
+        seq.next_cycle().await;
+    });
+    core::future::poll_fn(|cx| {
+        let _ = nested.as_mut().poll(cx);
+        core::task::Poll::Ready(())
+    })
+    .await;
+    leak(nested);
+    seq.next_cycle().await;
+    seq.next_cycle().await;
+    Ok(())
+}
+
+/// Links a boxed redline over its imu and leaks it, then ends two cycles later.
+#[crate::sequence]
+async fn leaks_a_redline(seq: &Seq<'_>, imu: &Sample<Imu>) -> Result<(), SeqError> {
+    let redline = Box::pin(Redline::new("imu high", || {
+        imu.get().is_some_and(|i| i.sample >= 2.0)
+    }));
+    seq.redline(redline.as_ref());
+    leak(redline);
+    seq.next_cycle().await;
+    seq.next_cycle().await;
+    Ok(())
+}
+
+/// Runs `S` reading `sample` each cycle, past its end, then drops it.
+fn run_past_its_end<S: SequenceFn<State = ()>>(sequence: fn() -> S, sample: f64) -> EndReason {
+    let (mut step, imu, _rings) = step_on_imu(sequence);
+    for at in 0..6 {
+        let _ = imu.write(&imu_at(at, sample));
+        step.execute(ms(at));
+    }
+    step.ended().cloned().expect("an ended sequence")
+}
+
+#[test]
+fn test_redline_leaked_in_a_future_is_checked_until_the_end() {
+    assert_eq!(run_past_its_end(leaks_a_future, 1.0), EndReason::Completed);
+    assert_eq!(run_past_its_end(leaks_a_future, 2.0), EndReason::Aborted);
+}
+
+#[test]
+fn test_leaked_redline_is_checked_until_the_end() {
+    assert_eq!(run_past_its_end(leaks_a_redline, 1.0), EndReason::Completed);
+    assert_eq!(run_past_its_end(leaks_a_redline, 2.0), EndReason::Aborted);
 }

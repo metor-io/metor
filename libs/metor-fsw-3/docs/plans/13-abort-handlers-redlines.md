@@ -413,6 +413,17 @@ it.
   node's memory, so there is no sound way to go on.
 - Linking a redline that is already linked, to this `Seq` or another, does
   nothing.
+- `Seq<'a>` carries an invariant brand, and `Seq::redline` takes
+  `C: Fn() -> bool + 'a`. The body gets `&'a Seq<'a>`, `'a` being the
+  lifetime of its parameters, so a condition borrows parameters or owns
+  its captures, never a body local; a leaked redline (a forgotten
+  `Pin<Box<Redline>>` or nested future) cannot outlive what it reads. The
+  step owns `Rc<Seq<'static>>`, and `Cycle::seq` casts the brand; the step
+  walks redlines only while it holds the body. The waits borrow a `Clock`,
+  not the `Seq`. `#[sequence]` names every elided lifetime in the body's
+  parameters `'__seq`, so `seq: &Seq` and `seq: &Seq<'_>` both work, and
+  keys `Seq` as `Seq<'static>`; state and items share that lifetime in
+  `SequenceFn::call`.
 - `Seq` is no longer `Default`; only the crate builds one, and it never
   moves once a redline links, so a node's `seq` pointer stays valid. `Seq`
   releases its nodes when it drops, so a node that outlives it (a leaked

@@ -26,8 +26,9 @@ pub(crate) struct Node {
     name: &'static str,
     /// Calls the `cond` of the `Redline` this node heads.
     check: unsafe fn(NonNull<Node>) -> bool,
-    /// The `Seq` it is linked into, if any, to unlink from on drop.
-    seq: Cell<Option<NonNull<Seq>>>,
+    /// The `Seq` it is linked into, if any, to unlink from on drop. Its
+    /// brand is erased; unlinking calls no condition.
+    seq: Cell<Option<NonNull<Seq<'static>>>>,
     _pin: PhantomPinned,
 }
 
@@ -69,11 +70,11 @@ impl Node {
     }
 
     /// Links this node into `seq`, unless it is linked already.
-    pub(crate) fn claim(&self, seq: &Seq) -> bool {
+    pub(crate) fn claim(&self, seq: &Seq<'_>) -> bool {
         if self.seq.get().is_some() {
             return false;
         }
-        self.seq.set(Some(NonNull::from(seq)));
+        self.seq.set(Some(NonNull::from(seq).cast()));
         true
     }
 
@@ -138,8 +139,8 @@ mod tests {
 
     #[test]
     fn test_redline_unlinks_when_its_block_ends() {
-        let seq = Seq::new();
         let hot = Cell::new(false);
+        let seq = Seq::new();
         {
             crate::redline!(seq, "hot", || hot.get());
             assert_eq!(seq.tripped(), None);
@@ -153,12 +154,12 @@ mod tests {
 
     #[test]
     fn test_first_holding_redline_in_link_order_trips() {
-        let seq = Seq::new();
         let checked = Cell::new(0);
         let check = |holds: bool| {
             checked.set(checked.get() + 1);
             holds
         };
+        let seq = Seq::new();
         crate::redline!(seq, "a", || check(false));
         crate::redline!(seq, "b", || check(true));
         crate::redline!(seq, "c", || check(true));
@@ -175,11 +176,13 @@ mod tests {
 
     #[test]
     fn test_link_during_walk_is_refused() {
-        let seq = Seq::new();
         let late = pin!(Redline::new("late", || true));
         let late = late.as_ref();
-        crate::redline!(seq, "linker", || {
-            seq.redline(late);
+        let seq = Seq::new();
+        let handle = &raw const seq;
+        crate::redline!(seq, "linker", move || {
+            // SAFETY: `seq` outlives this redline, which is declared after it.
+            unsafe { &*handle }.redline(late);
             false
         });
         assert_eq!(seq.tripped(), None);
@@ -213,8 +216,8 @@ mod tests {
 
     #[test]
     fn test_redline_in_a_suspended_body() {
-        let seq = Seq::new();
         let hot = Cell::new(false);
+        let seq = Seq::new();
         let mut body = Box::pin(async {
             crate::redline!(seq, "hot", || hot.get());
             seq.next_cycle().await;

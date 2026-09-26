@@ -63,7 +63,8 @@
 //! A [`redline!`](crate::redline) covers the rest of its block. Each cycle,
 //! after the samples are taken and before the body is polled, the step
 //! checks the linked redlines in order; the first that holds logs a
-//! `redline` fault with its name and aborts the sequence. A stopped channel
+//! `redline` fault with its name and aborts the sequence. A condition may
+//! borrow the sequence's parameters, not a body local. A stopped channel
 //! does not execute its step, so it takes no samples, checks no redlines,
 //! and runs no handlers.
 
@@ -105,10 +106,11 @@ macro_rules! redline {
 /// A `SequenceFn` is a sequence whose parameters are its ports and its [`Seq`].
 #[allow(async_fn_in_trait)]
 pub trait SequenceFn: Ports {
-    /// Runs the sequence to its end.
-    async fn call(
-        state: &mut Self::State,
-        items: <Self::Params as Param>::Item<'_, NoWake>,
+    /// Runs the sequence to its end. State and items share `'a`, which
+    /// brands the `Seq` item, so a redline's condition may borrow either.
+    async fn call<'a>(
+        state: &'a mut Self::State,
+        items: <Self::Params as Param>::Item<'a, NoWake>,
     ) -> Result<(), SeqError>;
 }
 

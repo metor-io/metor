@@ -305,7 +305,7 @@ An abort record, a tripped redline, or the body calling `seq.abort()` raises the
 
 An abort handler safes hardware. `seq.on_abort(|seq| ..)` returns a guard in the sequence's frame; when the guard drops with the flag up, its handler runs. Handlers cover the block that binds them and run innermost first, each under `catch_unwind`, so a panicking handler logs a `handler` fault and the rest still run. A panic in the body runs them too.
 
-A redline is a condition checked every cycle. `redline!(seq, "name", || cond)` pins it in the caller's block and links it into the `Seq`; it unlinks when the block ends. After the samples are taken and before the body is polled, the step checks the linked redlines in order. The first that holds logs a `redline` fault with its name and aborts the sequence.
+A redline is a condition checked every cycle. `redline!(seq, "name", || cond)` pins it in the caller's block and links it into the `Seq`; it unlinks when the block ends. After the samples are taken and before the body is polled, the step checks the linked redlines in order. The first that holds logs a `redline` fault with its name and aborts the sequence. A condition may borrow the sequence's parameters, or own what it moves in, but not a body local, since a leaked redline would outlive it.
 
 ```rust
 #[sequence]
