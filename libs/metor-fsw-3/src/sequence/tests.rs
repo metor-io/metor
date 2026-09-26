@@ -11,6 +11,7 @@ use metor_proto_wkt::LogLevel;
 use super::*;
 use crate::channel::AbortRequest;
 use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
+use zerocopy::FromBytes;
 
 use crate::coordinator::{
     Adapter, BuildError, ChannelConfig, Coordinator, CoordinatorConfig, EndReason, InputConfig,
@@ -597,4 +598,241 @@ fn test_reset_of_stopped_sequence_runs_no_handlers() {
     commands.send(SequenceCommandKind::Abort);
     coordinator.step(ms(4));
     assert!(trace.take().is_empty());
+}
+
+/// A valve position, written as an [`Imu`] sample.
+fn valve(seq: &Seq, open: f64) -> Imu {
+    Imu {
+        timestamp: seq.now(),
+        sample: open,
+    }
+}
+
+/// Opens its valve until the imu reads 2 or more, closing it on abort.
+#[crate::sequence]
+async fn guarded(
+    #[state] trace: &mut Trace,
+    seq: &Seq,
+    imu: &Sample<Imu>,
+    valve_cmd: &mut Output<Imu>,
+) -> Result<(), SeqError> {
+    let _closed = seq.on_abort(|seq| {
+        trace.push("closed");
+        let _ = valve_cmd.write(&valve(seq, 0.0));
+    });
+    crate::redline!(seq, "imu high", || imu
+        .get()
+        .is_some_and(|i| i.sample >= 2.0));
+    let _ = valve_cmd.write(&valve(seq, 1.0));
+    loop {
+        seq.next_cycle().await;
+    }
+}
+
+/// An unnamed redline that holds once the imu reads 2 or more.
+#[crate::sequence]
+async fn unnamed(#[state] trace: &mut Trace, seq: &Seq, imu: &Sample<Imu>) -> Result<(), SeqError> {
+    let _closed = seq.on_abort(|_| trace.push("closed"));
+    crate::redline!(seq, || imu.get().is_some_and(|i| i.sample >= 2.0));
+    seq.sleep(Duration::from_secs(3600)).await
+}
+
+/// Guards only its first cycle against an imu reading of 3 or more.
+#[crate::sequence]
+async fn block_guard(
+    #[state] trace: &mut Trace,
+    seq: &Seq,
+    imu: &Sample<Imu>,
+) -> Result<(), SeqError> {
+    let _closed = seq.on_abort(|_| trace.push("closed"));
+    {
+        crate::redline!(seq, "early", || imu.get().is_some_and(|i| i.sample >= 3.0));
+        seq.next_cycle().await;
+    }
+    seq.sleep(Duration::from_secs(3600)).await
+}
+
+/// Links a redline that already holds, then waits a cycle.
+#[crate::sequence]
+async fn late_line(#[state] trace: &mut Trace, seq: &Seq) -> Result<(), SeqError> {
+    let _closed = seq.on_abort(|_| trace.push("closed"));
+    crate::redline!(seq, "at once", || true);
+    trace.push("linked");
+    seq.next_cycle().await;
+    trace.push("resumed");
+    Ok(())
+}
+
+/// Records what its redline and its body read, every cycle.
+#[crate::sequence]
+async fn twin_reads(
+    #[state] seen: &mut Seen,
+    seq: &Seq,
+    imu: &Sample<Imu>,
+) -> Result<(), SeqError> {
+    crate::redline!(seq, "never", || {
+        seen.0.borrow_mut().push(imu.get().map(|i| i.sample));
+        false
+    });
+    loop {
+        seen.0.borrow_mut().push(imu.get().map(|i| i.sample));
+        seq.next_cycle().await;
+    }
+}
+
+/// `imu -> t` as channel `seq`, its log drained.
+fn sampled() -> CoordinatorConfig {
+    let mut config = channeled(RunState::Running);
+    config.systems.insert(0, SystemConfig::new("imu", "imu"));
+    config.systems[2].inputs.push(InputConfig {
+        port: "imu".into(),
+        from: vec![PortRef::new("imu", "imu")],
+    });
+    config.systems.push(SystemConfig {
+        inputs: vec![InputConfig {
+            port: "lines".into(),
+            from: vec![PortRef::new("t", "log")],
+        }],
+        ..SystemConfig::new("logs", "log_sink")
+    });
+    config
+}
+
+/// [`sampled`], with `t`'s valve tapped.
+fn tapped() -> CoordinatorConfig {
+    let mut config = sampled();
+    config.systems.push(SystemConfig {
+        inputs: vec![InputConfig {
+            port: "valve".into(),
+            from: vec![PortRef::new("t", "valve_cmd")],
+        }],
+        ..SystemConfig::new("taps", "tap")
+    });
+    config
+}
+
+/// The valve positions `taps` recorded.
+fn valve_positions(recorder: &Recorder) -> Vec<f64> {
+    recorder
+        .take_taps()
+        .iter()
+        .map(|(_, bytes)| Imu::read_from_bytes(bytes).expect("an imu frame").sample)
+        .collect()
+}
+
+#[test]
+fn test_redline_trips_and_safes() {
+    let (trace, _, recorder, mut coordinator) = run(guarded(), tapped());
+    coordinator.step(ms(1));
+    assert!(trace.take().is_empty());
+    assert_eq!(valve_positions(&recorder), [1.0]);
+    coordinator.step(ms(2));
+    assert_eq!(trace.take(), ["closed"]);
+    assert_eq!(valve_positions(&recorder), [0.0]);
+    let lines = recorder.take_logs();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].message, "imu high");
+    assert_eq!(lines[0].fields, vec![("kind".into(), "redline".into())]);
+}
+
+#[test]
+fn test_unnamed_redline_fault() {
+    let (trace, _, recorder, mut coordinator) = run(unnamed(), sampled());
+    coordinator.step(ms(1));
+    coordinator.step(ms(2));
+    assert_eq!(trace.take(), ["closed"]);
+    let lines = recorder.take_logs();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].message, "redline");
+}
+
+#[test]
+fn test_block_redline_ends_with_its_block() {
+    let (trace, _, recorder, mut coordinator) = run(block_guard(), sampled());
+    for at in 1..=4 {
+        coordinator.step(ms(at));
+    }
+    assert!(trace.take().is_empty());
+    assert!(recorder.take_logs().is_empty());
+}
+
+#[test]
+fn test_stopped_sequence_does_not_trip() {
+    let (trace, commands, recorder, mut coordinator) = run(guarded(), tapped());
+    coordinator.step(ms(1));
+    commands.send(SequenceCommandKind::Stop);
+    coordinator.step(ms(2));
+    coordinator.step(ms(3));
+    assert!(trace.take().is_empty());
+    assert!(recorder.take_logs().is_empty());
+    commands.send(SequenceCommandKind::Start);
+    coordinator.step(ms(4));
+    assert_eq!(trace.take(), ["closed"]);
+}
+
+#[test]
+fn test_redline_is_checked_before_the_next_poll() {
+    let (trace, _, recorder, mut coordinator) = run(late_line(), logged("t", "traced"));
+    coordinator.step(ms(1));
+    assert_eq!(trace.take(), ["linked"]);
+    coordinator.step(ms(2));
+    assert_eq!(trace.take(), ["closed"]);
+    let ended: Vec<_> = coordinator.ended().collect();
+    assert_eq!(ended, [("t", &EndReason::Aborted)]);
+    assert_eq!(recorder.take_logs()[0].message, "at once");
+}
+
+/// A redline whose condition panics when first checked.
+#[crate::sequence]
+async fn cut_wire(#[state] trace: &mut Trace, seq: &Seq) -> Result<(), SeqError> {
+    let _closed = seq.on_abort(|_| trace.push("closed"));
+    crate::redline!(seq, "wire", || panic!("sensor wire cut"));
+    seq.sleep(Duration::from_secs(3600)).await
+}
+
+#[test]
+fn test_panicking_condition_runs_handlers() {
+    let (trace, _, recorder, mut coordinator) = run(cut_wire(), logged("t", "traced"));
+    coordinator.step(ms(1));
+    coordinator.step(ms(2));
+    assert_eq!(trace.take(), ["closed"]);
+    assert_eq!(coordinator.latched().collect::<Vec<_>>(), ["t"]);
+    let lines = recorder.take_logs();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].message, "sensor wire cut");
+    assert_eq!(lines[0].fields, vec![("kind".into(), "panic".into())]);
+}
+
+#[test]
+fn test_redline_and_body_read_one_sample() {
+    let seen = Seen::default();
+    let mut table = table(&Recorder::default());
+    let state = seen.clone();
+    table
+        .register_sequence("twin", twin_reads(), move || state.clone())
+        .expect("valid records");
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("imu", "imu"),
+            SystemConfig {
+                inputs: vec![InputConfig {
+                    port: "imu".into(),
+                    from: vec![PortRef::new("imu", "imu")],
+                }],
+                ..SystemConfig::new("t", "twin")
+            },
+        ],
+        ..Default::default()
+    };
+    let mut coordinator = config.build(&table).expect("valid");
+    for at in 1..=3 {
+        coordinator.step(ms(at));
+    }
+    let twice = |v| [Some(v), Some(v)];
+    let expected: Vec<_> = [Some(1.0)]
+        .into_iter()
+        .chain(twice(2.0))
+        .chain(twice(3.0))
+        .collect();
+    assert_eq!(*seen.0.borrow(), expected);
 }

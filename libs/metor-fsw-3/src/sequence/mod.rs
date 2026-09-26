@@ -41,6 +41,7 @@
 //! runs them too. A failure, a timeout, or a body dropped unfinished
 //! (`Reset`, `Load`, shutdown) runs none.
 
+mod redline;
 mod seq;
 mod step;
 #[cfg(test)]
@@ -57,8 +58,23 @@ use crate::fn_system::{Ctor, InSet, OutSet, Param, Ports};
 use crate::port::Input;
 use crate::system::{SystemDef, SystemInputs, SystemOutputs};
 
+pub use redline::Redline;
 pub use seq::{NextCycle, OnAbort, Seq, SeqError, Sleep, WaitFor};
 pub(crate) use step::SequenceStep;
+
+/// Links a redline to `seq` for the rest of the enclosing block. The first
+/// cycle its condition holds, the sequence aborts, logging a `redline` fault
+/// with its name, or `"redline"` when it has none.
+#[macro_export]
+macro_rules! redline {
+    ($seq:expr, $cond:expr $(,)?) => {
+        $crate::redline!($seq, "redline", $cond)
+    };
+    ($seq:expr, $name:expr, $cond:expr $(,)?) => {
+        let __redline = ::core::pin::pin!($crate::Redline::new($name, $cond));
+        $seq.redline(__redline.as_ref());
+    };
+}
 
 /// A `SequenceFn` is a sequence whose parameters are its ports and its [`Seq`].
 #[allow(async_fn_in_trait)]

@@ -9637,6 +9637,7 @@ version = "0.14.2"
 dependencies = [
  "blake3",
  "clap 4.6.3",
+ "cordyceps",
  "futures-lite 2.6.1",
  "libc",
  "libloading",

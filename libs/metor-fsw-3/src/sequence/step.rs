@@ -47,7 +47,7 @@ impl SequenceStep {
         let abort = Input::try_new(abort.views).expect("byte alignment");
         let InSet { ins, samplers } = InSet::<S>::bind(inputs.collect());
         let OutSet { outs, log } = OutSet::<S>::bind(outputs);
-        let seq = Rc::new(Seq::default());
+        let seq = Rc::new(Seq::new());
         Self {
             run: Some(Box::pin(run::<S>(state, ins, outs, seq.clone()))),
             samplers,
@@ -86,22 +86,34 @@ async fn run<S: SequenceFn>(
     S::call(&mut state, items).await
 }
 
-/// Polls the body once, or drops it, running its handlers, if the sequence is aborted.
+/// Polls the body once, or drops it, running its handlers, if the sequence
+/// is aborted or a redline trips.
 fn advance(
     seq: &Seq,
     samplers: &mut Samplers,
     run: &mut Option<Run>,
 ) -> Poll<Result<(), SeqError>> {
+    if !seq.aborted() {
+        samplers.take_all();
+        trip(seq);
+    }
     if seq.aborted() {
         *run = None;
         return Poll::Ready(Err(SeqError::Aborted));
     }
-    samplers.take_all();
     let Some(body) = run.as_mut() else {
         return Poll::Pending;
     };
     let _polling = seq.polling();
     body.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+}
+
+/// Aborts the sequence if a redline holds, logging a fault that names it.
+fn trip(seq: &Seq) {
+    if let Some(name) = seq.tripped() {
+        Log.fault("redline", name);
+        let _ = seq.abort();
+    }
 }
 
 impl Step for SequenceStep {

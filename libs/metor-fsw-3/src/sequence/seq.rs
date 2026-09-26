@@ -1,24 +1,31 @@
 //! The [`Seq`] handle, the waits it hands out, and its abort handlers.
 
-use core::cell::Cell;
+use core::cell::{Cell, UnsafeCell};
 use core::future::Future;
 use core::pin::Pin;
+use core::ptr::NonNull;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use cordyceps::List;
 use metor_proto::types::Timestamp;
 
+use super::redline::{Node, Redline};
 use crate::coordinator::panic_message;
 use crate::log::Log;
 
-/// A `Seq` is a sequence's view of its cycle: the time and whether it was aborted.
-#[derive(Default)]
+/// A `Seq` is a sequence's view of its cycle: the time, whether it was
+/// aborted, and the redlines its body has linked.
+///
+/// Only this crate builds one, and it never moves once a redline is linked.
 pub struct Seq {
     now: Cell<Timestamp>,
     aborted: Cell<bool>,
     polling: Cell<bool>,
+    redlines: UnsafeCell<List<Node>>,
+    walking: Cell<bool>,
 }
 
 /// Why a sequence ended without completing.
@@ -33,6 +40,16 @@ pub enum SeqError {
 }
 
 impl Seq {
+    pub(crate) fn new() -> Self {
+        Self {
+            now: Cell::new(Timestamp(0)),
+            aborted: Cell::new(false),
+            polling: Cell::new(false),
+            redlines: UnsafeCell::new(List::new()),
+            walking: Cell::new(false),
+        }
+    }
+
     /// This cycle's time.
     pub fn now(&self) -> Timestamp {
         self.now.get()
@@ -98,9 +115,66 @@ impl Seq {
         Raised::new(&self.polling)
     }
 
+    /// Links a pinned redline; it unlinks when dropped.
+    ///
+    /// Use [`redline!`](crate::redline), which pins it for the rest of the
+    /// block. A redline linked while the redlines are checked, or linked
+    /// already, stays as it was.
+    pub fn redline<C: Fn() -> bool>(&self, redline: Pin<&Redline<C>>) {
+        if self.walking.get() || !redline.node().claim(self) {
+            return;
+        }
+        let node = NonNull::from(redline.get_ref()).cast::<Node>();
+        // SAFETY: `Seq` is `!Sync`, so only this thread reaches the list, and
+        // outside a walk no reference to it is live. The node is pinned, so
+        // its memory lasts until its `Drop`, which unlinks it. The pointer
+        // is made from the whole redline, which `check` casts back to.
+        unsafe { (*self.redlines.get()).push_back(node) };
+    }
+
+    /// Unlinks a dropping node.
+    pub(crate) fn unlink(&self, node: NonNull<Node>) {
+        if self.walking.get() {
+            // A condition dropped a linked redline, possibly its own, whose
+            // memory the walk still borrows. Nothing can make that sound.
+            std::process::abort();
+        }
+        // SAFETY: as in `redline`, this thread alone reaches the list and no
+        // reference to it is live outside a walk; `node` is linked into it.
+        unsafe { (*self.redlines.get()).remove(node) };
+    }
+
+    /// The name of the first redline, in link order, whose condition holds.
+    pub(crate) fn tripped(&self) -> Option<&'static str> {
+        let _walking = Raised::new(&self.walking);
+        // SAFETY: while walking, `redline` refuses to link and `unlink`
+        // aborts, so this is the only reference to the list. Only this
+        // thread reaches it, since `Seq` is `!Sync`.
+        let list = unsafe { &mut *self.redlines.get() };
+        list.iter_raw()
+            // SAFETY: a linked node is live and was made from its whole
+            // redline. The body is suspended, and a condition takes only
+            // shared borrows; the body's own `&mut` to its `!Unpin` frame
+            // does not claim exclusive access, as for any `async fn` that
+            // borrows a local across an `.await`.
+            .find(|&node| unsafe { Node::holds(node) })
+            // SAFETY: as above, a linked node is live.
+            .map(|node| unsafe { node.as_ref() }.name())
+    }
+
     /// The deadline `dur` after this cycle, armed once and kept.
     fn arm(&self, deadline: &mut Option<Timestamp>, dur: Duration) -> Timestamp {
         *deadline.get_or_insert_with(|| after(self.now(), dur))
+    }
+}
+
+impl Drop for Seq {
+    fn drop(&mut self) {
+        let list = self.redlines.get_mut();
+        while let Some(node) = list.pop_front() {
+            // SAFETY: a linked node is live until its `Drop` unlinks it.
+            unsafe { node.as_ref() }.release();
+        }
     }
 }
 
@@ -248,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_sleep_arms_on_first_poll() {
-        let seq = Seq::default();
+        let seq = Seq::new();
         at(&seq, 0);
         let mut sleep = pin!(seq.sleep(10 * MS));
         at(&seq, 5);
@@ -261,13 +335,13 @@ mod tests {
 
     #[test]
     fn test_zero_sleep_resolves_at_once() {
-        let seq = Seq::default();
+        let seq = Seq::new();
         assert_eq!(poll(pin!(seq.sleep(Duration::ZERO))), Poll::Ready(Ok(())));
     }
 
     #[test]
     fn test_sleep_saturates() {
-        let seq = Seq::default();
+        let seq = Seq::new();
         seq.set_now(Timestamp(i64::MAX - 1));
         let mut sleep = pin!(seq.sleep(Duration::MAX));
         assert_eq!(poll(sleep.as_mut()), Poll::Pending);
@@ -277,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_wait_for_resolves_on_its_poll() {
-        let seq = Seq::default();
+        let seq = Seq::new();
         let ready = Cell::new(false);
         let mut wait = pin!(seq.wait_for(10 * MS, || ready.get()));
         assert_eq!(poll(wait.as_mut()), Poll::Pending);
@@ -288,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_wait_for_times_out() {
-        let seq = Seq::default();
+        let seq = Seq::new();
         let mut wait = pin!(seq.wait_for(10 * MS, || false));
         assert_eq!(poll(wait.as_mut()), Poll::Pending);
         at(&seq, 9);
@@ -299,14 +373,14 @@ mod tests {
 
     #[test]
     fn test_predicate_wins_on_deadline_poll() {
-        let seq = Seq::default();
+        let seq = Seq::new();
         let mut wait = pin!(seq.wait_for(Duration::ZERO, || true));
         assert_eq!(poll(wait.as_mut()), Poll::Ready(Ok(())));
     }
 
     #[test]
     fn test_abort_beats_deadline() {
-        let seq = Seq::default();
+        let seq = Seq::new();
         let mut sleep = pin!(seq.sleep(10 * MS));
         let mut wait = pin!(seq.wait_for(10 * MS, || true));
         assert_eq!(poll(sleep.as_mut()), Poll::Pending);
@@ -318,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_next_cycle_ignores_abort() {
-        let seq = Seq::default();
+        let seq = Seq::new();
         let _ = seq.abort();
         let mut next = pin!(seq.next_cycle());
         assert_eq!(poll(next.as_mut()), Poll::Pending);
@@ -328,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_next_cycle_on_a_repeated_time() {
-        let seq = Seq::default();
+        let seq = Seq::new();
         let mut next = pin!(seq.next_cycle());
         assert_eq!(poll(next.as_mut()), Poll::Pending);
         assert_eq!(poll(next.as_mut()), Poll::Ready(Timestamp(0)));
@@ -350,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_handler_runs_only_on_abort() {
-        let seq = Seq::default();
+        let seq = Seq::new();
         let ran = Ran::default();
         drop(seq.on_abort(|_| ran.push("calm")));
         assert!(ran.take().is_empty());
@@ -365,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_handlers_run_innermost_first() {
-        let seq = Seq::default();
+        let seq = Seq::new();
         let ran = Ran::default();
         {
             let _first = seq.on_abort(|_| ran.push("first"));
@@ -393,7 +467,7 @@ mod tests {
             LogPort::new(Output::try_new(ring.writer(NoWake).expect("writer")).expect("aligned"));
         let mut lines =
             Input::<LogEvent>::try_new(vec![ring.view(NoWake).expect("slot")]).expect("aligned");
-        let seq = Seq::default();
+        let seq = Seq::new();
         let ran = Ran::default();
         with_log_port(&mut port, Timestamp(3), || {
             let _outer = seq.on_abort(|_| ran.push("outer"));
