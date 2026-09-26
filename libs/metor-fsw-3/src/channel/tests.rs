@@ -61,7 +61,7 @@ fn test_abort_requested_latches() {
     let ring = ring::<AbortRequest>();
     let mut abort =
         Abort::new(Input::try_new(vec![ring.view(NoWake).expect("slot")]).expect("aligned"));
-    let mut out =
+    let out =
         Output::<AbortRequest>::try_new(ring.writer(NoWake).expect("writer")).expect("aligned");
     assert!(!abort.requested());
     out.write(&AbortRequest {}).expect("room");

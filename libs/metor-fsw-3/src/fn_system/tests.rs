@@ -720,7 +720,7 @@ fn test_async_adapter_relay() {
     );
 
     let (imu, nav, log) = (ring::<Imu>(), ring::<Nav>(), ring::<LogEvent>());
-    let mut source = Output::<Imu, _>::try_new(imu.writer(NoWake).expect("free writer"))
+    let source = Output::<Imu, _>::try_new(imu.writer(NoWake).expect("free writer"))
         .expect("supported alignment");
     let mut estimates = Input::<Nav>::try_new(vec![nav.view(NoWake).expect("free slot")])
         .expect("supported alignment");

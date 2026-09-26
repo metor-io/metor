@@ -284,7 +284,7 @@ mod tests {
             })
         });
         std::thread::sleep(core::time::Duration::from_millis(50));
-        let mut out =
+        let out =
             Output::<Imu, _>::try_new(ring.writer(wake).expect("free writer")).expect("aligned");
         out.write(&Imu::new(1, 42.0)).expect("ring has room");
         assert_eq!(

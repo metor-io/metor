@@ -388,7 +388,7 @@ impl Core {
         let _ = self.status.write(&status);
     }
 
-    fn emit(&mut self, kind: SequenceEventKind) {
+    fn emit(&self, kind: SequenceEventKind) {
         let event = SequenceChannelEvent {
             channel: self.name.clone(),
             kind,
