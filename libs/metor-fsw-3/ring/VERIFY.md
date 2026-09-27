@@ -42,8 +42,7 @@ cover cross-process mapping or wake behavior.
 
 ## Loom
 
-Run the models in a separate build directory, in a debug build so the `fits`
-precondition assertion stays on:
+Run the models in a separate build directory:
 
 ```sh
 RUSTFLAGS="--cfg ring_loom" CARGO_TARGET_DIR=target/loom \
@@ -60,8 +59,8 @@ activating other dependencies' Loom configurations.
 The models cover reader registration, wrap-marker ordering, writer claim
 handoff, held grants, the slowest of two readers, padding publication, latest
 pins, and owner reclamation during slot reuse, on small rings with few
-operations. The cursor-order model exercises the assertion `fits` requires; it
-does not prove that violating the precondition is harmless.
+operations. The cursor-order model checks that no schedule makes a write report
+`Corrupt`.
 
 Loom atomics carry tracking state, so the models use heap construction and a
 separate in-memory layout. They do not exercise raw attachment or mmap.
@@ -84,6 +83,8 @@ The harnesses check:
 - Header validation, slot bounds, data pointers, and creation/attachment agreement.
 - Read/write roundtrips, wrap skipping, and latest-record pinning.
 - Bounded corrupt data and control words passed to borrowing reads.
+- Arbitrary control words and reader cursors, written by a peer before and after
+  a writer claim or view registration, never panic or leave the data region.
 
 Arithmetic harnesses bound symbolic capacity at `2^20`. Geometry validation
 uses symbolic header fields and region length. Operational and corruption
@@ -91,10 +92,8 @@ harnesses use a 64-byte, single-reader stack region and an unwind bound of 12;
 the production ring operations still run on it, including attachment and header
 validation. Assertions hold only within these assumptions and bounds.
 
-`fits_checked_cursor_arithmetic` checks that invalid cursor order produces
-overflow or a failed fit under checked arithmetic. It does **not** prove that a
-release build rejects such inputs: wrapping addition can report a successful
-fit. The protocol must establish the cursor-order precondition.
+`fits_hostile_cursor` checks `fits` for every input: a cursor ahead of
+`committed` or an overflowing sum is `Corrupt`, and any other result is exact.
 
 Kani does not verify thread ordering, OS mappings, notifications, or allocation
 provenance. An unwinding assertion failure means a loop exceeded the bound and

@@ -36,7 +36,6 @@ use region::*;
 use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use crate::sync::{Arc, AtomicU64, fence};
 use core::cell::Cell;
-use core::marker::PhantomData;
 
 /// Alignment of every record payload, in bytes.
 pub const PAYLOAD_ALIGNMENT: usize = 16;
@@ -80,10 +79,22 @@ const fn reserve(committed: u64, rec: u64, capacity: u64) -> (u64, u64) {
 }
 
 /// Test whether a write preserves unread bytes.
-/// Requires `slowest <= committed` and a representable used-byte count plus `need`.
+/// A cursor ahead of `committed` or an unrepresentable sum is `Corrupt`.
 #[inline]
-const fn fits(committed: u64, slowest: u64, need: u64, capacity: u64) -> bool {
-    committed.wrapping_sub(slowest) + need <= capacity
+const fn fits(committed: u64, slowest: u64, need: u64, capacity: u64) -> Result<bool, WriteError> {
+    if slowest > committed {
+        return Err(WriteError::Corrupt);
+    }
+    match (committed - slowest).checked_add(need) {
+        Some(used) => Ok(used <= capacity),
+        None => Err(WriteError::Corrupt),
+    }
+}
+
+/// Whether the writer can reserve from `committed` without overflow or misalignment.
+#[inline]
+const fn writable_from(committed: u64, capacity: u64) -> bool {
+    committed.is_multiple_of(PAYLOAD_ALIGNMENT as u64) && committed <= u64::MAX - 2 * capacity
 }
 
 /// Check a raw payload length before converting it to `usize`.
@@ -116,9 +127,11 @@ pub enum WriteError {
     InsufficientCapacity,
     #[error("ring is full: writing would overwrite unread or borrowed data")]
     WouldBlock,
+    #[error("ring region violates a structural invariant")]
+    Corrupt,
 }
 
-/// A record length extends beyond the data region.
+/// Why a read was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ReadError {
     #[error("ring region violates a structural invariant")]
@@ -302,6 +315,7 @@ impl Inner {
     }
 
     /// Locate a record, skipping any wrap gap. Also return the position after the skip.
+    /// A cursor more than a lap behind `committed` or off the record grid is `Corrupt`.
     fn locate_before(
         &self,
         mut r: u64,
@@ -312,10 +326,13 @@ impl Inner {
             if r >= committed {
                 return Ok((r, None));
             }
+            if committed - r > cap || !r.is_multiple_of(PAYLOAD_ALIGNMENT as u64) {
+                return Err(ReadError::Corrupt);
+            }
             let hwm = self.control().hwm.load(Acquire);
             if r == hwm {
                 // Skip this gap once; absolute gap positions increase.
-                r = (r & !self.geometry.mask()) + cap;
+                r = self.next_lap(r).ok_or(ReadError::Corrupt)?;
                 continue;
             }
             let phys = (r & self.geometry.mask()) as usize;
@@ -340,6 +357,12 @@ impl Inner {
                 }),
             ));
         }
+    }
+
+    /// Start of the lap after the one containing `pos`, or `None` on overflow.
+    #[inline]
+    fn next_lap(&self, pos: u64) -> Option<u64> {
+        (pos & !self.geometry.mask()).checked_add(self.geometry.capacity)
     }
 
     /// # Safety
@@ -530,9 +553,9 @@ impl RingBuffer {
             .compare_exchange(0, owner_tag(), Acquire, Relaxed)
             .map_err(|_| WriterClaimed)?;
         Ok(Writer {
+            committed: Cell::new(self.inner.control().committed.load(Relaxed)),
             inner: self.inner.clone(),
             data,
-            _unsync: PhantomData,
         })
     }
 
@@ -587,6 +610,7 @@ impl RingBuffer {
                     self.inner.slot(slot).cursor.store(start, Release);
                 }
                 return Ok(View {
+                    cursor: Cell::new(start),
                     inner: self.inner.clone(),
                     slot,
                     data,
@@ -620,26 +644,32 @@ pub fn checked_region_len(cfg: &Config) -> Option<usize> {
 pub struct Writer<WD: WakeSource> {
     inner: Arc<Inner>,
     data: WD,
-    _unsync: PhantomData<Cell<()>>,
+    /// The writer's position; the region copy is published for readers only.
+    committed: Cell<u64>,
 }
 
 impl<WD: WakeSource> Writer<WD> {
     /// Publish one record without blocking.
     /// Returns [`WriteError::WouldBlock`] if readers pin the required space.
     /// A blocked write may publish wrap padding, but never a payload.
+    /// Returns [`WriteError::Corrupt`] if a reader cursor is ahead of this writer.
     pub fn try_write(&self, bytes: &[u8]) -> Result<(), WriteError> {
-        let rec = checked_frame_len(bytes.len(), self.inner.geometry.capacity)?;
-        let mut c = self.inner.control().committed.load(Relaxed); // sole writer
-        let (start_abs, mut gap) = reserve(c, rec, self.inner.geometry.capacity);
-        if !self.fits(c, gap + rec) {
-            if gap == 0 || !self.fits(c, gap) {
+        let cap = self.inner.geometry.capacity;
+        let rec = checked_frame_len(bytes.len(), cap)?;
+        let mut c = self.committed.get();
+        if !writable_from(c, cap) {
+            return Err(WriteError::Corrupt);
+        }
+        let (start_abs, mut gap) = reserve(c, rec, cap);
+        if !self.fits(c, gap + rec)? {
+            if gap == 0 || !self.fits(c, gap)? {
                 return Err(WriteError::WouldBlock);
             }
             self.inner.control().hwm.store(c, Release);
-            self.inner.control().committed.store(start_abs, Release);
+            self.publish(start_abs);
             c = start_abs;
             gap = 0;
-            if !self.fits(c, rec) {
+            if !self.fits(c, rec)? {
                 self.data.notify();
                 return Err(WriteError::WouldBlock);
             }
@@ -651,16 +681,16 @@ impl<WD: WakeSource> Writer<WD> {
     }
 
     #[inline]
-    fn fits(&self, committed: u64, need: u64) -> bool {
+    fn fits(&self, committed: u64, need: u64) -> Result<bool, WriteError> {
         let slowest = self.inner.slowest_active_cursor().unwrap_or(committed);
-        // PANIC Safety: the protocol must keep the scanned cursor <= committed.
-        // Checked by tests and Loom; unchecked overflow is not a safe fallback.
-        #[cfg(any(test, ring_loom))]
-        debug_assert!(
-            slowest <= committed,
-            "cursor {slowest} is ahead of committed {committed}"
-        );
         fits(committed, slowest, need, self.inner.geometry.capacity)
+    }
+
+    /// Store a new position locally and, with Release, to the region.
+    #[inline]
+    fn publish(&self, committed: u64) {
+        self.committed.set(committed);
+        self.inner.control().committed.store(committed, Release);
     }
 
     /// # Safety
@@ -675,7 +705,7 @@ impl<WD: WakeSource> Writer<WD> {
             self.inner.control().hwm.store(committed, Release);
         }
         // Release publishes record bytes to acquiring readers.
-        self.inner.control().committed.store(end_abs, Release);
+        self.publish(end_abs);
         self.data.notify();
     }
 }
@@ -707,6 +737,8 @@ impl Located {
 pub struct View<RD: WakeSink> {
     inner: Arc<Inner>,
     slot: u32,
+    /// The view's position; its slot holds a published copy for the writer.
+    cursor: Cell<u64>,
     data: RD,
     /// Drain progress applied once its borrowed slices can no longer be used.
     pending: Option<u64>,
@@ -715,7 +747,7 @@ pub struct View<RD: WakeSink> {
 impl<RD: WakeSink> View<RD> {
     /// Absolute read position. Pending drain consumption is not yet included.
     pub fn cursor(&self) -> u64 {
-        self.inner.slot(self.slot).cursor.load(Acquire)
+        self.cursor.get()
     }
 
     /// Absolute published position in bytes, including wrap padding.
@@ -770,7 +802,7 @@ impl<RD: WakeSink> View<RD> {
     }
 
     fn locate(&self) -> Result<Option<Located>, ReadError> {
-        let r = self.inner.slot(self.slot).cursor.load(Acquire);
+        let r = self.cursor.get();
         let (skipped, loc) = self.inner.locate_before(r, self.committed())?;
         if skipped != r {
             self.advance(skipped);
@@ -782,7 +814,8 @@ impl<RD: WakeSink> View<RD> {
         // SAFETY: lookup validated the record; this exclusive view borrow keeps it pinned.
         let slice = unsafe { self.inner.payload(&loc) };
         ReadGrant {
-            cursor: &self.inner.slot(self.slot).cursor,
+            cursor: &self.cursor,
+            slot: &self.inner.slot(self.slot).cursor,
             end: loc.end(),
             slice,
         }
@@ -809,9 +842,7 @@ impl<RD: WakeSink> View<RD> {
     fn data_end(&self) -> u64 {
         let committed = self.inner.control().committed.load(Acquire);
         let hwm = self.inner.control().hwm.load(Acquire);
-        if hwm < committed
-            && hwm + self.inner.geometry.capacity - (hwm & self.inner.geometry.mask()) == committed
-        {
+        if hwm < committed && self.inner.next_lap(hwm) == Some(committed) {
             hwm
         } else {
             committed
@@ -820,7 +851,7 @@ impl<RD: WakeSink> View<RD> {
 
     #[inline]
     fn advance(&self, end_abs: u64) {
-        self.inner.slot(self.slot).cursor.store(end_abs, Release);
+        store_cursor(&self.cursor, &self.inner.slot(self.slot).cursor, end_abs);
     }
 }
 
@@ -831,9 +862,17 @@ impl<RD: WakeSink> Drop for View<RD> {
     }
 }
 
+/// Store a view position locally and release it to the view's slot.
+#[inline]
+fn store_cursor(local: &Cell<u64>, slot: &AtomicU64, pos: u64) {
+    local.set(pos);
+    slot.store(pos, Release);
+}
+
 /// A borrowed record, dereferencing to its payload. Dropping it consumes the record.
 pub struct ReadGrant<'a> {
-    cursor: &'a AtomicU64,
+    cursor: &'a Cell<u64>,
+    slot: &'a AtomicU64,
     end: u64,
     slice: &'a [u8],
 }
@@ -847,7 +886,7 @@ impl std::ops::Deref for ReadGrant<'_> {
 
 impl Drop for ReadGrant<'_> {
     fn drop(&mut self) {
-        self.cursor.store(self.end, Release);
+        store_cursor(self.cursor, self.slot, self.end);
     }
 }
 

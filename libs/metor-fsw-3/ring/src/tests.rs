@@ -1070,3 +1070,114 @@ fn test_has_record_with_deferred_drain() {
     v.settle();
     assert!(!v.has_record());
 }
+
+const fn assert_send<T: Send>() {}
+const _: () = assert_send::<Writer<NoWake>>();
+const _: () = assert_send::<View<NoWake>>();
+
+fn peer_committed(rb: &RingBuffer, pos: u64) {
+    rb.inner.control().committed.store(pos, Release);
+}
+
+fn peer_cursor(rb: &RingBuffer, slot: u32, pos: u64) {
+    rb.inner.slot(slot).cursor.store(pos, Release);
+}
+
+#[test]
+fn test_near_max_reader_cursor_is_corrupt() {
+    let rb = ring(64, 1);
+    let w = rb.writer(NoWake).unwrap();
+    peer_cursor(&rb, 0, u64::MAX - 1);
+    assert_eq!(w.try_write(&[1; 8]), Err(WriteError::Corrupt));
+    assert_eq!(rb.committed(), 0, "nothing published");
+}
+
+#[test]
+fn test_reader_cursor_ahead_of_writer_is_corrupt() {
+    let rb = ring(64, 1);
+    let w = rb.writer(NoWake).unwrap();
+    let _v = rb.view(NoWake).unwrap();
+    w.try_write(&[1; 8]).unwrap();
+    peer_cursor(&rb, 0, 64);
+    assert_eq!(w.try_write(&[2; 8]), Err(WriteError::Corrupt));
+
+    peer_cursor(&rb, 0, 32);
+    assert_eq!(w.try_write(&[2; 8]), Ok(()), "a cursor at committed fits");
+}
+
+#[test]
+fn test_writer_ignores_peer_committed() {
+    let rb = ring(64, 1);
+    let w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
+    w.try_write(&[1; 8]).unwrap();
+    peer_committed(&rb, u64::MAX);
+    assert_eq!(v.try_read().err(), Some(ReadError::Corrupt));
+
+    w.try_write(&[2; 8]).unwrap();
+    assert_eq!(
+        rb.committed(),
+        64,
+        "the writer published from its own position"
+    );
+    assert_eq!(read(&mut v).as_deref(), Some(&[1; 8][..]));
+    assert_eq!(read(&mut v).as_deref(), Some(&[2; 8][..]));
+}
+
+#[test]
+fn test_misaligned_claim_is_corrupt() {
+    let rb = ring(64, 1);
+    peer_committed(&rb, 8);
+    let w = rb.writer(NoWake).unwrap();
+    assert_eq!(w.try_write(&[1; 8]), Err(WriteError::Corrupt));
+
+    let mut v = rb.view(NoWake).unwrap();
+    peer_committed(&rb, 40);
+    assert_eq!(v.try_read().err(), Some(ReadError::Corrupt));
+}
+
+#[test]
+fn test_peer_cursor_does_not_move_view() {
+    let rb = ring(128, 1);
+    let w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
+    w.try_write(&[1; 8]).unwrap();
+    w.try_write(&[2; 8]).unwrap();
+    assert_eq!(read(&mut v).as_deref(), Some(&[1; 8][..]));
+
+    peer_cursor(&rb, 0, 0);
+    assert_eq!(v.cursor(), 32);
+    assert_eq!(read(&mut v).as_deref(), Some(&[2; 8][..]));
+    assert_eq!(
+        rb.inner.slot(0).cursor.load(Acquire),
+        64,
+        "the view republished"
+    );
+}
+
+#[test]
+fn test_max_committed_never_panics() {
+    let rb = ring(64, 1);
+    let w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
+    w.try_write(&[1; 8]).unwrap();
+    for hwm in [HWM_NONE, u64::MAX - 1, 0] {
+        peer_committed(&rb, u64::MAX);
+        rb.inner.control().hwm.store(hwm, Release);
+        assert!(!v.has_record());
+        assert_eq!(v.try_read().err(), Some(ReadError::Corrupt));
+        assert_eq!(v.try_latest(), Err(ReadError::Corrupt));
+        assert_eq!(v.drain().collect::<Vec<_>>(), [Err(ReadError::Corrupt)]);
+        v.settle();
+        assert_eq!(v.cursor(), 0);
+    }
+}
+
+#[test]
+fn test_data_end_overflow_is_no_gap() {
+    let rb = ring(64, 1);
+    let v = rb.view(NoWake).unwrap();
+    peer_committed(&rb, u64::MAX);
+    rb.inner.control().hwm.store(u64::MAX - 16, Release);
+    assert_eq!(v.data_end(), u64::MAX);
+}

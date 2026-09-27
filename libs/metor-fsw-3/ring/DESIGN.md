@@ -58,6 +58,17 @@ cursor pinned and records progress locally. The next mutable operation on the
 view applies that progress; its borrow prevents this while any yielded slice is
 still in use.
 
+## Hostile control words
+
+The writer and each view keep their own positions and only publish them to the
+region. The writer reads `committed` once, when it claims the ring; a view sets
+its cursor at registration. A peer that writes the control block can make a read
+or write fail with `Corrupt`, but cannot move either handle outside the region.
+The writer reports `Corrupt` for a reader cursor ahead of its position or a used
+byte count that overflows. A view reports it for a cursor more than a lap behind
+`committed`, off the 16-byte grid, or whose gap skip overflows. That lap bound
+also limits every read loop to one lap of records.
+
 ## Ownership and reclamation
 
 The writer claim is a CAS on a shared owner tag. Dropping the writer releases
@@ -84,7 +95,5 @@ reader claims. Exporting caller-owned raw storage does not extend its lifetime.
 ## Verification limits
 
 [VERIFY.md](VERIFY.md) describes the Miri, Kani, and Loom checks and their bounds.
-None establishes every possible execution. In particular, `fits` requires an
-ordered cursor snapshot; arithmetic outside its preconditions can wrap in a
-release build. Payload lengths occupy the low 32 bits of the header word; the
+None establishes every possible execution. Payload lengths occupy the low 32 bits of the header word; the
 writer rejects lengths above `u32::MAX` before computing a frame size.
