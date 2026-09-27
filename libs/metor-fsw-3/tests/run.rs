@@ -1,15 +1,14 @@
 //! The `metor` binary against the fixture's own target file.
 
-use std::path::Path;
-use std::process::Command;
+mod common;
 
-fn metor() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_metor"))
-}
+use std::path::Path;
+
+use common::{fixture_dir, metor};
 
 #[test]
 fn test_target_exits_after_fixed_cycles() {
-    let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack/target.py");
+    let target = fixture_dir().join("target.py");
     let output = metor()
         .args([
             "run",
@@ -94,7 +93,7 @@ fn test_deployment_runs_every_target_as_a_child() {
 /// own CLI's last word, which the parent prefixes with the child's name.
 #[test]
 fn test_every_child_is_prefixed() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack");
+    let fixture = fixture_dir();
     let dir = tempfile::tempdir().expect("a temp dir");
     let target = two_targets(
         dir.path(),
@@ -121,7 +120,7 @@ fn test_every_child_is_prefixed() {
 
 #[test]
 fn test_latched_child_fails_the_deployment() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack");
+    let fixture = fixture_dir();
     let dir = tempfile::tempdir().expect("a temp dir");
     let target = two_targets(
         dir.path(),

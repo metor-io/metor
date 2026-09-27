@@ -1,12 +1,14 @@
 //! A `DlSlot` over the echo pack's two sequences, driven by channel commands.
 
+mod common;
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::OnceLock;
 
-use metor_fsw_3::cli::cargo::{cargo_build, cdylib_name, triple};
+use common::{Ping, fixture_lib};
+use metor_fsw_3::cli::cargo::{cdylib_name, triple};
 use metor_fsw_3::cli::config::{CONFIG_VERSION, DeploymentConfig, TargetConfig};
 use metor_fsw_3::deploy::{self, DeployError};
 use metor_fsw_3::dl::store;
@@ -15,19 +17,10 @@ use metor_fsw_3::metor_proto_wkt::{
 };
 use metor_fsw_3::{
     Adapter, BuildError, ChannelConfig, ChannelState, ChannelStatus, Coordinator,
-    CoordinatorConfig, DefCx, Input, InputConfig, Output, Pack, Record, RunState, SystemConfig,
+    CoordinatorConfig, DefCx, Input, InputConfig, Output, Pack, RunState, SystemConfig,
     SystemTable, Timestamp, system,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-/// The pack's record, redeclared here: the component id is the name's hash.
-#[derive(Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug)]
-#[postcard(crate = metor_fsw_3::postcard_schema)]
-#[record(max_len = 8)]
-struct Ping {
-    n: u32,
-}
 
 /// What the test systems saw, and the commands still to send.
 #[derive(Default)]
@@ -76,19 +69,10 @@ fn watch(
     }
 }
 
-/// Builds the fixture once per test binary and returns its cdylib.
-fn fixture() -> &'static Path {
-    static BUILT: OnceLock<PathBuf> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        cargo_build("echo-pack", root, false).expect("the fixture builds")
-    })
-}
-
 /// `ty`'s ports as `metor build` would bake them for instance `mode`.
 fn baked(ty: &str) -> Value {
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
-    let pack = unsafe { Pack::open(fixture()) }.expect("the fixture opens");
+    let pack = unsafe { Pack::open(fixture_lib()) }.expect("the fixture opens");
     let cx = DefCx {
         id: "mode",
         ..DefCx::empty()
@@ -98,11 +82,11 @@ fn baked(ty: &str) -> Value {
 
 /// A resolved candidate: the fixture's path and hash, and `ty`'s ports.
 fn candidate(name: &str, ty: &str) -> Value {
-    let hash = store::hash(fixture()).expect("the fixture reads");
+    let hash = store::hash(fixture_lib()).expect("the fixture reads");
     json!({
         "name": name,
         "ty": ty,
-        "path": fixture(),
+        "path": fixture_lib(),
         "hash": hash.to_hex().as_str(),
         "def": baked(ty),
     })
@@ -230,12 +214,12 @@ fn test_load_start_complete() {
     assert_eq!(events, [SequenceEventKind::Loaded { name: "up".into() }]);
     let loaded = status(&seen);
     assert_eq!(loaded.loaded, 0);
-    let file = fixture()
+    let file = fixture_lib()
         .file_name()
         .and_then(|n| n.to_str())
         .expect("a name");
     assert_eq!(loaded.artifact.to_str(), Ok(file));
-    let hash = store::hash(fixture()).expect("reads");
+    let hash = store::hash(fixture_lib()).expect("reads");
     assert_eq!(loaded.hash.0, *hash.as_bytes());
 
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
@@ -293,7 +277,7 @@ fn test_unknown_load_keeps_occupant() {
 fn test_changed_bytes_refused() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let copy = dir.path().join("libecho_copy.so");
-    std::fs::copy(fixture(), &copy).expect("copies");
+    std::fs::copy(fixture_lib(), &copy).expect("copies");
     let mut stale = candidate("down", "count_down");
     stale["path"] = json!(copy);
     stale["hash"] = json!(blake3::hash(b"another build").to_hex().as_str());
@@ -425,7 +409,7 @@ fn test_unresolved_slot_refused() {
 fn pack_ref(libs: &Path) -> Value {
     let dir = libs.join(triple());
     std::fs::create_dir_all(&dir).expect("creates");
-    std::fs::copy(fixture(), dir.join(cdylib_name("echo_pack"))).expect("copies");
+    std::fs::copy(fixture_lib(), dir.join(cdylib_name("echo_pack"))).expect("copies");
     json!({ "id": "echo", "lib": "echo_pack", "libs": libs })
 }
 
@@ -464,7 +448,7 @@ fn test_build_resolves_into_store() {
     assert!(!deploy::unresolved(&envelope));
 
     let params = slot(&envelope);
-    let hash = store::hash(fixture()).expect("reads");
+    let hash = store::hash(fixture_lib()).expect("reads");
     for candidate in params["allow"].as_array().expect("a list") {
         assert!(candidate.get("pack").is_none());
         assert_eq!(candidate["hash"], json!(hash.to_hex().as_str()));

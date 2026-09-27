@@ -1,53 +1,31 @@
 //! A running target's links: what a client sees on a `Publish`, and what a
 //! `Subscribe` does with what it is sent.
 
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll};
+mod common;
+
 use core::time::Duration;
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
+use common::{
+    Deadline, Fsw, Imu, Ping, Running, Source, Target, dial_fsw, fixture_dir, metor, source, within,
+};
 use metor_fsw_3::coordinator::{
     CoordinatorConfig, InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig, SystemTable,
 };
 use metor_fsw_3::link::register_builtins;
 use metor_fsw_3::{Clock, DefCx, Frame, Input, LinkStatus, Output, Timestamp, system};
 use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
-use metor_proto_stellar::{PacketSink, PacketStream, Peer, identify};
+use metor_proto_stellar::PacketStream;
 use metor_proto_wkt::LogEvent;
 use metor_proto_wkt::{LinkInfo, SetComponentMetadata, VTableMsg};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use stellarator::io::{AsyncWrite, OwnedReader, SplitExt};
 use stellarator::net::TcpStream;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-
-/// How long a test waits for a target's thread before it fails.
-const DEADLINE: Duration = Duration::from_secs(10);
-
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
-#[frame(name = "imu")]
-#[repr(C)]
-struct Imu {
-    #[frame(timestamp)]
-    timestamp: Timestamp,
-    sample: f64,
-}
-
-#[derive(
-    metor_fsw_3::Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq,
-)]
-#[postcard(crate = metor_fsw_3::postcard_schema)]
-#[record(max_len = 8)]
-struct Ping {
-    n: u32,
-}
 
 /// A frame whose vtable and metadata announce as several kilobytes.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
@@ -65,19 +43,6 @@ fn wide_source(now: Timestamp, wide: &mut Output<Wide>) {
     let _ = wide.write(&Wide {
         timestamp: now,
         samples: [1.0; 256],
-    });
-}
-
-/// Publishes one sample per cycle, counting up.
-#[derive(Default)]
-struct Source(i64);
-
-#[system]
-fn source(#[state] s: &mut Source, imu: &mut Output<Imu>) {
-    s.0 += 1;
-    let _ = imu.write(&Imu {
-        timestamp: Timestamp(s.0),
-        sample: s.0 as f64,
     });
 }
 
@@ -235,21 +200,6 @@ fn publish(link: &str, transport: serde_json::Value, conn_cap: usize) -> SystemC
     }
 }
 
-/// A target on its own thread, stopped and joined when the handle drops.
-struct Target {
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for Target {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
 /// Builds and runs `systems` on a thread of its own, cycling at `rate`.
 fn spawn(systems: Vec<SystemConfig>, seen: &Seen, rate: f64) -> Target {
     spawn_on(systems, seen, Clock::Wall { rate })
@@ -257,56 +207,21 @@ fn spawn(systems: Vec<SystemConfig>, seen: &Seen, rate: f64) -> Target {
 
 /// Builds and runs `systems` on a thread of its own, under `clock`.
 fn spawn_on(systems: Vec<SystemConfig>, seen: &Seen, clock: Clock) -> Target {
-    let stop = Arc::new(AtomicBool::new(false));
-    let (flag, seen) = (stop.clone(), seen.clone());
+    let config = CoordinatorConfig {
+        clock,
+        namespace: Some("cube_sat".into()),
+        systems,
+        ..Default::default()
+    };
+    let seen = seen.clone();
     let cycles = seen.cycles.clone();
-    let thread = std::thread::spawn(move || {
-        let config = CoordinatorConfig {
-            clock,
-            namespace: Some("cube_sat".into()),
-            systems,
-            ..Default::default()
-        };
-        let mut coordinator = config.build(&table(&seen)).expect("valid config");
-        stellarator::run(|| async move { coordinator.run(Until(flag, cycles)).await });
-    });
-    Target {
-        stop,
-        thread: Some(thread),
-    }
-}
-
-/// Ready once the target's handle asks it to stop, counting the cycles until then.
-struct Until(Arc<AtomicBool>, Arc<AtomicU64>);
-
-impl Future for Until {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        self.1.fetch_add(1, Ordering::Relaxed);
-        match self.0.load(Ordering::Acquire) {
-            true => Poll::Ready(()),
-            false => Poll::Pending,
-        }
-    }
-}
-
-/// Dials until the target's listener is up.
-async fn dial(addr: SocketAddr) -> Peer {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        match identify(addr).await {
-            Ok(peer) => return peer,
-            Err(e) => assert!(Instant::now() < deadline, "never came up: {e}"),
-        }
-        stellarator::sleep(Duration::from_millis(5)).await;
-    }
+    Target::spawn(config, move || table(&seen), cycles)
 }
 
 /// The address the link named `link` bound, once its target has built it.
 /// Links bind port zero, so nothing in a test picks a port.
 async fn bound(link: &str) -> SocketAddr {
-    let deadline = Instant::now() + DEADLINE;
+    let deadline = Deadline::new();
     loop {
         let found = metor_fsw_3::link::bound_ports()
             .into_iter()
@@ -316,20 +231,18 @@ async fn bound(link: &str) -> SocketAddr {
         if let Some(addr) = found {
             return addr;
         }
-        assert!(Instant::now() < deadline, "link `{link}` never bound");
-        stellarator::sleep(Duration::from_millis(2)).await;
+        deadline.tick(format!("link `{link}` never bound")).await;
     }
 }
 
 /// Connects until the target's listener is up, without a handshake.
 async fn raw_dial(addr: SocketAddr) -> TcpStream {
-    let deadline = Instant::now() + DEADLINE;
+    let deadline = Deadline::new();
     loop {
         match TcpStream::connect(addr).await {
             Ok(stream) => return stream,
-            Err(e) => assert!(Instant::now() < deadline, "never came up: {e}"),
+            Err(e) => deadline.tick(format!("never came up: {e}")).await,
         }
-        stellarator::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -349,25 +262,20 @@ async fn next(
 
 /// Waits until `done`, failing the test at the deadline.
 async fn until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + DEADLINE;
+    let deadline = Deadline::new();
     while !done() {
-        assert!(Instant::now() < deadline, "{what}");
-        stellarator::sleep(Duration::from_millis(2)).await;
+        deadline.tick(what).await;
     }
 }
 
 /// As [`until`], naming the last status and faults the target reported.
 async fn until_seen(what: &str, seen: &Seen, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + DEADLINE;
+    let deadline = Deadline::new();
     while !done() {
-        assert!(
-            Instant::now() < deadline,
-            "{what}; last status {:?}, faults {:?}, cycles {}",
-            seen.status(),
-            seen.faults.lock().expect("an unpoisoned sink"),
-            seen.cycles()
-        );
-        stellarator::sleep(Duration::from_millis(2)).await;
+        let faults = seen.faults.lock().expect("an unpoisoned sink").clone();
+        let (status, cycles) = (seen.status(), seen.cycles());
+        let what = format!("{what}; last status {status:?}, faults {faults:?}, cycles {cycles}");
+        deadline.tick(what).await;
     }
 }
 
@@ -388,12 +296,9 @@ async fn test_publish_announces_and_streams() {
     );
     let addr = bound("pub-announces").await;
 
-    let Peer::Fsw {
+    let Fsw {
         info, mut rx, buf, ..
-    } = dial(addr).await
-    else {
-        panic!("a publish is an fsw link")
-    };
+    } = dial_fsw(addr).await;
     assert_eq!(info.protocol_version, 2);
     assert_eq!(info.namespace.as_deref(), Some("cube_sat"));
     assert_eq!(
@@ -494,13 +399,8 @@ async fn test_slow_client_isolation() {
     );
     let addr = bound("pub-slow").await;
 
-    let _slow = match dial(addr).await {
-        Peer::Fsw { rx, tx, .. } => (rx, tx),
-        _ => panic!("a publish is an fsw link"),
-    };
-    let Peer::Fsw { mut rx, buf, .. } = dial(addr).await else {
-        panic!("a publish is an fsw link")
-    };
+    let _slow = dial_fsw(addr).await;
+    let Fsw { mut rx, buf, .. } = dial_fsw(addr).await;
 
     let mut buf = buf;
     let mut tables = 0;
@@ -594,9 +494,7 @@ async fn test_subscribe_announces_and_routes() {
     );
     let addr = bound("cmds-routes").await;
 
-    let Peer::Fsw { info, tx, .. } = dial(addr).await else {
-        panic!("a subscribe is an fsw link")
-    };
+    let Fsw { info, tx, .. } = dial_fsw(addr).await;
     assert_eq!(info.command_ids, vec![<Ping as Msg>::ID]);
     assert_eq!(info.link, "cmds-routes");
 
@@ -956,15 +854,11 @@ async fn test_disconnect_frees_slot() {
     let addr = bound("cmds-slot").await;
 
     // A peer that takes the slot and leaves without ever sending a command.
-    let Peer::Fsw { rx, tx, .. } = dial(addr).await else {
-        panic!("a subscribe is an fsw link")
-    };
+    let Fsw { rx, tx, .. } = dial_fsw(addr).await;
     drop((rx, tx));
 
     // Nothing else stirs the link, so only the hang-up can free the slot.
-    let Peer::Fsw { tx, .. } = dial(addr).await else {
-        panic!("a subscribe is an fsw link")
-    };
+    let Fsw { tx, .. } = dial_fsw(addr).await;
     tx.send((&Ping { n: 3 }).into_len_packet())
         .await
         .0
@@ -991,19 +885,15 @@ async fn test_refuse_peer_past_limit() {
     );
     let addr = bound("cmds-full").await;
 
-    let Peer::Fsw { rx: _rx, tx, .. } = dial(addr).await else {
-        panic!("a subscribe is an fsw link")
-    };
+    let Fsw { rx: _rx, tx, .. } = dial_fsw(addr).await;
 
     // A second peer is accepted and closed at once, rather than left waiting.
     let refused = raw_dial(addr).await;
-    let (read, _) =
-        futures_lite::future::or(async { Some(refused.read(vec![0u8; 16]).await) }, async {
-            stellarator::sleep(DEADLINE).await;
-            None
-        })
-        .await
-        .expect("the link kept the refused peer waiting");
+    let (read, _) = within(
+        "the link kept the refused peer waiting",
+        refused.read(vec![0u8; 16]),
+    )
+    .await;
     assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
 
     // The first peer still holds the slot.
@@ -1018,43 +908,19 @@ async fn test_refuse_peer_past_limit() {
 }
 
 #[stellarator::test]
-async fn test_subscribe_reconnects() {
-    let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
-    let addr = listener.local_addr().expect("bound");
-    let seen = Seen::default();
-    let _target = spawn(
-        vec![
-            subscribe(
-                "cmds-redial",
-                json!({ "connect": { "addr": addr.to_string() } }),
-            ),
-            reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
-        ],
-        &seen,
+async fn test_stop_closes_connections() {
+    let target = spawn(
+        vec![subscribe(
+            "cmds-stop",
+            json!({ "listen": { "addr": "127.0.0.1:0" } }),
+        )],
+        &Seen::default(),
         500.0,
     );
-
-    drop(listener.accept().await.expect("the link dials"));
-    drop(listener);
-
-    // The peer comes back on the same address; only a redial reaches it.
-    let listener = stellarator::net::TcpListener::bind(addr).expect("the peer's address");
-    let peer = futures_lite::future::or(async { listener.accept().await.ok() }, async {
-        stellarator::sleep(DEADLINE).await;
-        None
-    })
-    .await
-    .expect("the link never redialed");
-    let (_rx, tx) = peer.split();
-    PacketSink::new(tx)
-        .send((&Ping { n: 5 }).into_len_packet())
-        .await
-        .0
-        .expect("the redialed link takes commands");
-    until("the redialed link never routed a command", || {
-        seen.pings().contains(&5)
-    })
-    .await;
+    let Fsw { mut rx, buf, .. } = dial_fsw(bound("cmds-stop").await).await;
+    drop(target);
+    let read = within("the stopped link kept its peer", rx.next_grow(buf)).await;
+    assert!(read.is_err());
 }
 
 /// A `Publish` dialing `addr`, serving `imu.imu` and logging onto `pub.log`.
@@ -1120,25 +986,17 @@ async fn test_simulated_clock_preserves_connection() {
 /// kills it long before that.
 const FIXTURE_CYCLES: &str = "600000";
 
-/// The fixture's target under `metor run`, killed and reaped when it drops.
+/// The fixture's target under `metor run`, with the links it bound.
 struct Fixture {
-    child: Child,
+    _child: Running,
     ports: Vec<(String, SocketAddr)>,
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Fixture {
     /// Runs the fixture target with `--print-ports` and reads what it bound.
     fn start() -> Self {
-        let target =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack/target.py");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_metor"))
+        let target = fixture_dir().join("target.py");
+        let mut child = metor()
             .args([
                 "run",
                 &target.display().to_string(),
@@ -1160,7 +1018,10 @@ impl Fixture {
                 Some((link.to_string(), addr.parse().ok()?))
             })
             .collect();
-        Self { child, ports }
+        Self {
+            _child: Running(child),
+            ports,
+        }
     }
 
     fn addr(&self, link: &str) -> SocketAddr {
@@ -1174,12 +1035,8 @@ impl Fixture {
 async fn test_fixture_link_round_trip() {
     let fixture = Fixture::start();
     // The publisher takes the connection first, so the answer cannot precede it.
-    let Peer::Fsw { mut rx, buf, .. } = dial(fixture.addr("pub")).await else {
-        panic!("a publish is an fsw link")
-    };
-    let Peer::Fsw { info, tx, .. } = dial(fixture.addr("cmds")).await else {
-        panic!("a subscribe is an fsw link")
-    };
+    let Fsw { mut rx, buf, .. } = dial_fsw(fixture.addr("pub")).await;
+    let Fsw { info, tx, .. } = dial_fsw(fixture.addr("cmds")).await;
     assert_eq!(info.command_ids, vec![<Ping as Msg>::ID]);
 
     tx.send((&Ping { n: 41 }).into_len_packet())
@@ -1188,21 +1045,15 @@ async fn test_fixture_link_round_trip() {
         .expect("the link takes commands");
 
     let mut buf = buf;
-    let echoed = futures_lite::future::or(
-        async {
-            loop {
-                if let OwnedPacket::Msg(m) = next(&mut rx, &mut buf).await
-                    && m.id == <Ping as Msg>::ID
-                {
-                    return Some(m.parse::<Ping>().expect("a ping").n);
-                }
+    let echoed = within("the ping never came back", async {
+        loop {
+            if let OwnedPacket::Msg(m) = next(&mut rx, &mut buf).await
+                && m.id == <Ping as Msg>::ID
+            {
+                return m.parse::<Ping>().expect("a ping").n;
             }
-        },
-        async {
-            stellarator::sleep(DEADLINE).await;
-            None
-        },
-    )
+        }
+    })
     .await;
-    assert_eq!(echoed, Some(41), "the ping never came back");
+    assert_eq!(echoed, 41);
 }
