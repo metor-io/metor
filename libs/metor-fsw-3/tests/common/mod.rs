@@ -73,7 +73,7 @@ pub fn fixture_lib() -> &'static Path {
     static BUILT: OnceLock<PathBuf> = OnceLock::new();
     BUILT.get_or_init(|| {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        cargo_build("echo-pack", root, false).expect("the fixture builds")
+        cargo_build("echo-pack", root).expect("the fixture builds")
     })
 }
 

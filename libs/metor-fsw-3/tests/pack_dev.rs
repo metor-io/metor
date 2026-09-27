@@ -17,7 +17,7 @@ const GOLDEN: &str = include_str!("golden/echo_pack.py");
 
 #[test]
 fn test_fixture_matches_golden_module() {
-    let built = cargo_build("echo-pack", &fixture_dir(), false).expect("the fixture builds");
+    let built = cargo_build("echo-pack", &fixture_dir()).expect("the fixture builds");
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
     let pack = unsafe { Pack::open(&built) }.expect("it opens");
     let reference = PackRef {
@@ -136,7 +136,7 @@ fn run_pack_dev(root: &Path) {
 
 #[test]
 fn test_pack_dev_rejects_loaded_destination() {
-    let built = cargo_build("echo-pack", &fixture_dir(), false).expect("fixture builds");
+    let built = cargo_build("echo-pack", &fixture_dir()).expect("fixture builds");
     let temp = tempfile::tempdir().expect("temporary staging root");
     for name in ["pyproject.toml", "Cargo.toml"] {
         std::fs::copy(fixture_dir().join(name), temp.path().join(name)).expect("copy config");

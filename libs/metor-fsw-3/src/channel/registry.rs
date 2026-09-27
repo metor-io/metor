@@ -7,9 +7,6 @@ use serde::Deserialize;
 use crate::coordinator::ParamError;
 use crate::port::Output;
 
-/// Cycles between two writes when the params name no period.
-const DEFAULT_PERIOD: u64 = 100;
-
 /// The registry a target publishes, as its config lists it.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -29,8 +26,9 @@ pub struct ChannelSpec {
     pub available: Vec<String>,
 }
 
+/// Cycles between two writes when the params name no period.
 fn default_period() -> u64 {
-    DEFAULT_PERIOD
+    100
 }
 
 /// A `Registry` holds the registry it writes and when it next writes it.

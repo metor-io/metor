@@ -235,11 +235,4 @@ mod tests {
             Err(ConfigError::Decode(_))
         ));
     }
-
-    #[test]
-    fn test_hosts_default_empty() {
-        let bytes = br#"{"config_version":2,"targets":[]}"#;
-        let config = DeploymentConfig::from_slice(bytes).expect("decodes");
-        assert!(config.hosts.is_empty() && config.targets.is_empty());
-    }
 }

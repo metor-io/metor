@@ -53,16 +53,12 @@ pub fn main() {
     }
 }
 
-fn run(cli: Cli) -> Result<(), String> {
+fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
-        Command::Pack(PackCommand::Dev { root }) => {
-            pack_dev::pack_dev(&root).map_err(|error| error.to_string())
-        }
-        Command::AbiVersion => {
-            println!("{ABI_VERSION}");
-            Ok(())
-        }
-        Command::Run(args) => run::run(args).map_err(|error| error.to_string()),
-        Command::Build(args) => build::build(args).map_err(|error| error.to_string()),
+        Command::Pack(PackCommand::Dev { root }) => pack_dev::pack_dev(&root)?,
+        Command::AbiVersion => println!("{ABI_VERSION}"),
+        Command::Run(args) => run::run(args)?,
+        Command::Build(args) => build::build(args)?,
     }
+    Ok(())
 }

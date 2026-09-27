@@ -11,7 +11,7 @@ use std::process::{Command, ExitStatus};
 
 use tracing_subscriber::layer::SubscriberExt;
 
-use super::cargo::{read_toml, string};
+use super::cargo::{lookup, read_toml, string};
 use super::config::{ConfigError, DeploymentConfig, TargetConfig};
 use super::pack_dev::{PackDevError, pack_dev};
 use crate::coordinator::{BuildError, Clock, Coordinator, SystemTable};
@@ -106,7 +106,7 @@ pub fn run(args: Run) -> Result<(), RunError> {
 }
 
 /// Writes the resolved envelope to a temp file and runs every target from it
-/// as a child, until all have exited.
+/// as a child, until all have exited or SIGINT ends them.
 fn run_children(config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
     let path = std::env::temp_dir().join(format!("metor-deploy-{}.json", std::process::id()));
     std::fs::write(
@@ -114,16 +114,10 @@ fn run_children(config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
         serde_json::to_vec(config).map_err(ConfigError::Decode)?,
     )?;
     watch_sigint();
-    let result = supervise(&path, config, args);
+    let waited = super::children::spawn_all(&path, &config.namespaces(), args)
+        .map(super::children::wait_all);
     let _ = std::fs::remove_file(&path);
-    result
-}
-
-/// Runs every target of `config` from `envelope` until all have exited, or
-/// until SIGINT ends them.
-fn supervise(envelope: &Path, config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
-    let children = super::children::spawn_all(envelope, &config.namespaces(), args)?;
-    super::children::wait_all(children).map_err(|failed| RunError::Children(failed.join(", ")))?;
+    waited?.map_err(|failed| RunError::Children(failed.join(", ")))?;
     if interrupted() {
         return Err(RunError::Interrupted);
     }
@@ -190,11 +184,8 @@ pub fn dev_packs(target_dir: &Path) -> Vec<PathBuf> {
     let Ok(pyproject) = read_toml(&target_dir.join("pyproject.toml")) else {
         return Vec::new();
     };
-    let Some(sources) = pyproject
-        .get("tool")
-        .and_then(|tool| tool.get("uv"))
-        .and_then(|uv| uv.get("sources"))
-        .and_then(toml::Value::as_table)
+    let Some(sources) =
+        lookup(&pyproject, &["tool", "uv", "sources"]).and_then(toml::Value::as_table)
     else {
         return Vec::new();
     };
@@ -212,13 +203,8 @@ pub fn dev_packs(target_dir: &Path) -> Vec<PathBuf> {
 
 fn is_dev_pack(root: &Path) -> bool {
     root.join("Cargo.toml").is_file()
-        && read_toml(&root.join("pyproject.toml")).is_ok_and(|pyproject| {
-            pyproject
-                .get("tool")
-                .and_then(|tool| tool.get("metor"))
-                .and_then(|metor| metor.get("pack"))
-                .is_some()
-        })
+        && read_toml(&root.join("pyproject.toml"))
+            .is_ok_and(|pyproject| lookup(&pyproject, &["tool", "metor", "pack"]).is_some())
 }
 
 /// Runs the target file as a script and reads the deployment it emitted.
