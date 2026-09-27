@@ -27,7 +27,7 @@ static STATUS: LazyLock<PortDef> =
     LazyLock::new(|| crate::Output::<super::SystemStatus>::def(&DefCx::empty(), "status"));
 
 /// The ports a channel adds to whatever system it wraps.
-static CHANNEL: LazyLock<[PortDef; 3]> = LazyLock::new(crate::channel::ports);
+static CHANNEL: LazyLock<[PortDef; 3]> = LazyLock::new(|| crate::channel::ports(&DefCx::empty()));
 
 /// Arguments for constructing a system using [`MakeFn`].
 pub struct MakeCx<'a> {

@@ -31,32 +31,23 @@ const ABORT_DEPTH: usize = 4;
 /// of a system port that takes one of theirs.
 pub(crate) fn def(mut inner: SystemDef, cx: &DefCx<'_>) -> Result<SystemDef, String> {
     let reserved = [COMMANDS_PORT, EVENTS_PORT, STATUS_PORT];
-    let ports = inner.inputs.iter().chain(&inner.outputs);
-    if let Some(port) = ports
-        .into_iter()
-        .find(|p| reserved.contains(&p.name.as_ref()))
-    {
+    let mut taken = inner.inputs.iter().chain(&inner.outputs);
+    if let Some(port) = taken.find(|p| reserved.contains(&p.name.as_ref())) {
         return Err(port.name.to_string());
     }
-    inner
-        .inputs
-        .push(Input::<SequenceCommand>::def(cx, COMMANDS_PORT));
-    inner
-        .outputs
-        .push(Output::<SequenceChannelEvent>::def(cx, EVENTS_PORT));
-    inner
-        .outputs
-        .push(Output::<ChannelStatus>::def(cx, STATUS_PORT));
+    let [commands, events, status] = ports(cx);
+    inner.inputs.push(commands);
+    inner.outputs.extend([events, status]);
     Ok(inner)
 }
 
-/// The ports every channel adds, under the empty context.
-pub(crate) fn ports() -> [PortDef; 3] {
-    let cx = DefCx::empty();
+/// The ports every channel adds: its commands input, then its events and
+/// status outputs.
+pub(crate) fn ports(cx: &DefCx<'_>) -> [PortDef; 3] {
     [
-        Input::<SequenceCommand>::def(&cx, COMMANDS_PORT),
-        Output::<SequenceChannelEvent>::def(&cx, EVENTS_PORT),
-        Output::<ChannelStatus>::def(&cx, STATUS_PORT),
+        Input::<SequenceCommand>::def(cx, COMMANDS_PORT),
+        Output::<SequenceChannelEvent>::def(cx, EVENTS_PORT),
+        Output::<ChannelStatus>::def(cx, STATUS_PORT),
     ]
 }
 
@@ -68,12 +59,15 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
     let Some(Adapter::Channel(channel)) = cx.adapter else {
         return make(cx);
     };
-    let outer = Outer::split(cx.inputs, cx.outputs);
+    let (mut inputs, mut outputs) = (cx.inputs, cx.outputs);
+    // PANIC Safety: `def` appended one input and two outputs.
+    let commands = inputs.pop().expect("the commands input");
+    let status = outputs.pop().expect("the channel_status output");
+    let events = outputs.pop().expect("the events output");
     let mut def = cx.def.clone();
     def.inputs.pop();
-    def.outputs.truncate(outer.outputs.len());
-    let mut inputs: Vec<Vec<RingBuffer>> = outer
-        .inputs
+    def.outputs.truncate(outputs.len());
+    let mut inputs: Vec<Vec<RingBuffer>> = inputs
         .into_iter()
         .map(|rings| rings.into_iter().cloned().collect())
         .collect();
@@ -85,12 +79,12 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
         def,
         params: cx.params.0.clone(),
         inputs,
-        outputs: outer.outputs.into_iter().cloned().collect(),
+        outputs: outputs.into_iter().cloned().collect(),
     };
     let mut threads = Threads::new();
     let inner = recipe.make(&mut threads)?;
     Ok(Box::new(Channel {
-        commands: command_input(outer.commands),
+        commands: command_input(commands),
         core: Core {
             name: channel.name.clone(),
             run: channel.start,
@@ -101,35 +95,10 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
             recipe,
             threads,
             abort,
-            events: writer(outer.events),
-            status: writer(outer.status),
+            events: writer(events),
+            status: writer(status),
         },
     }))
-}
-
-/// The outer rings, with the ports `def` appended taken off the end.
-struct Outer<'a> {
-    inputs: Vec<Vec<&'a RingBuffer>>,
-    outputs: Vec<&'a RingBuffer>,
-    commands: Vec<&'a RingBuffer>,
-    events: &'a RingBuffer,
-    status: &'a RingBuffer,
-}
-
-impl<'a> Outer<'a> {
-    fn split(mut inputs: Vec<Vec<&'a RingBuffer>>, mut outputs: Vec<&'a RingBuffer>) -> Self {
-        // PANIC Safety: `def` appended one input and two outputs.
-        let commands = inputs.pop().expect("the commands input");
-        let status = outputs.pop().expect("the channel_status output");
-        let events = outputs.pop().expect("the events output");
-        Self {
-            inputs,
-            outputs,
-            commands,
-            events,
-            status,
-        }
-    }
 }
 
 /// Binds the system's `abort` input, if it has one, to a ring the adapter writes.
