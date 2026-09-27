@@ -120,112 +120,49 @@ pub struct Config {
 }
 
 /// Why a write was rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WriteError {
-    /// The record exceeds the ring capacity or the format's payload limit.
+    #[error("record exceeds the ring capacity or the payload length limit")]
     InsufficientCapacity,
-    /// Writing would overwrite unread or borrowed data.
+    #[error("ring is full: writing would overwrite unread or borrowed data")]
     WouldBlock,
 }
 
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            WriteError::InsufficientCapacity => {
-                write!(
-                    f,
-                    "record exceeds ring capacity or the payload length limit"
-                )
-            }
-            WriteError::WouldBlock => write!(
-                f,
-                "ring is full: writing now would overwrite the slowest active reader"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for WriteError {}
-
-/// Why a read failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A record length extends beyond the data region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ReadError {
-    /// A record length extends beyond the data region.
+    #[error("ring region violates a structural invariant")]
     Corrupt,
 }
 
-impl core::fmt::Display for ReadError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("ring region violates a structural invariant (possible external corruption)")
-    }
-}
-
-impl std::error::Error for ReadError {}
-
 /// All reader slots are claimed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the ring's reader table is full")]
 pub struct FullReaderTable;
 
-impl core::fmt::Display for FullReaderTable {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("the ring's reader table is full; no free slot for another view")
-    }
-}
-
-impl std::error::Error for FullReaderTable {}
-
 /// The writer role is already claimed. Dead owners require explicit reclamation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a writer already holds this ring's claim")]
 pub struct WriterClaimed;
 
-impl core::fmt::Display for WriterClaimed {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("a writer already exists for this ring (or a crashed process leaked its claim)")
-    }
-}
-
-impl std::error::Error for WriterClaimed {}
-
 /// Why a region could not be attached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AttachError {
+    #[error("region header has the wrong magic")]
     BadMagic,
+    #[error("region was written by an incompatible ring version")]
     BadVersion,
-    /// The region has an incompatible endianness tag.
+    #[error("region has an incompatible endianness tag")]
     ArchMismatch,
-    /// The region is too short for its header or requested configuration.
+    #[error("region is shorter than its header or configuration")]
     TooSmall,
-    /// The base address is not 16-byte aligned.
+    #[error("region base is not 16-byte aligned")]
     Misaligned,
-    /// Sizes or offsets are invalid, overlapping, misaligned, or unrepresentable.
+    #[error("region sizes or offsets are invalid, overlapping, or unrepresentable")]
     BadGeometry,
-    /// The declared region size exceeds the backing length.
+    #[error("region header's total size exceeds the backing length")]
     RegionTruncated,
 }
-
-impl core::fmt::Display for AttachError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            AttachError::BadMagic => f.write_str("region header has the wrong magic"),
-            AttachError::BadVersion => {
-                f.write_str("region was written by an incompatible ring version")
-            }
-            AttachError::ArchMismatch => {
-                f.write_str("region was written with an incompatible endianness tag")
-            }
-            AttachError::TooSmall => f.write_str("region is shorter than the fixed header"),
-            AttachError::Misaligned => f.write_str("region base pointer is not 16-byte aligned"),
-            AttachError::BadGeometry => {
-                f.write_str("region header fields are internally inconsistent")
-            }
-            AttachError::RegionTruncated => f.write_str(
-                "region header's total_size exceeds the backing region (truncated file?)",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AttachError {}
 
 /// Notifies readers after data or wrap padding is published.
 ///

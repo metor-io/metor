@@ -840,7 +840,7 @@ fn test_attach_mmap_rejects_truncated_file() {
         .err()
         .expect("truncated file must be rejected");
     assert!(
-        format!("{err}").contains("exceeds the backing region"),
+        format!("{err}").contains("exceeds the backing length"),
         "{err}"
     );
 
@@ -850,7 +850,7 @@ fn test_attach_mmap_rejects_truncated_file() {
         .err()
         .expect("truncated file must be rejected");
     assert!(
-        format!("{err}").contains("shorter than the fixed header"),
+        format!("{err}").contains("shorter than its header"),
         "{err}"
     );
 }

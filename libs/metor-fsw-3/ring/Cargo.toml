@@ -26,6 +26,7 @@ notify = ["dep:stellarator"]
 [dependencies]
 memmap2 = { version = "0.9", optional = true }
 stellarator = { path = "../../stellarator", optional = true }
+thiserror = "2.0"
 zerocopy = { version = "0.8.2", features = ["derive"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
