@@ -531,10 +531,8 @@ mod tests {
             capacity: ring_capacity(LogEvent::MAX_LEN, 4).expect("valid"),
             max_readers: 1,
         });
-        let mut port =
-            LogPort::new(Output::try_new(ring.writer(NoWake).expect("writer")).expect("aligned"));
-        let mut lines =
-            Input::<LogEvent>::try_new(vec![ring.view(NoWake).expect("slot")]).expect("aligned");
+        let mut port = LogPort::new(Output::new(ring.writer(NoWake).expect("writer")));
+        let mut lines = Input::<LogEvent>::new(vec![ring.view(NoWake).expect("slot")]);
         let seq = Seq::new();
         let ran = Ran::default();
         with_log_port(&mut port, Timestamp(3), || {

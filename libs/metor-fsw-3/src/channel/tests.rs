@@ -59,10 +59,8 @@ fn test_oversized_event_refused() {
 #[test]
 fn test_abort_requested_latches() {
     let ring = ring::<AbortRequest>();
-    let mut abort =
-        Abort::new(Input::try_new(vec![ring.view(NoWake).expect("slot")]).expect("aligned"));
-    let out =
-        Output::<AbortRequest>::try_new(ring.writer(NoWake).expect("writer")).expect("aligned");
+    let mut abort = Abort::new(Input::new(vec![ring.view(NoWake).expect("slot")]));
+    let out = Output::<AbortRequest>::new(ring.writer(NoWake).expect("writer"));
     assert!(!abort.requested());
     out.write(&AbortRequest {}).expect("room");
     assert!(abort.requested());
@@ -71,7 +69,7 @@ fn test_abort_requested_latches() {
 
 #[test]
 fn test_abort_without_producer() {
-    let mut abort = Abort::<NoWake>::new(Input::try_new(Vec::new()).expect("no views"));
+    let mut abort = Abort::<NoWake>::new(Input::new(Vec::new()));
     assert!(!abort.requested());
 }
 

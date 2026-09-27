@@ -96,8 +96,8 @@ mod tests {
             capacity: ring_capacity(SequenceRegistry::MAX_LEN, 4).expect("valid"),
             max_readers: 1,
         });
-        let input = Input::try_new(vec![ring.view(NoWake).expect("slot")]).expect("aligned");
-        let output = Output::try_new(ring.writer(NoWake).expect("writer")).expect("aligned");
+        let input = Input::new(vec![ring.view(NoWake).expect("slot")]);
+        let output = Output::new(ring.writer(NoWake).expect("writer"));
         (output, input)
     }
 

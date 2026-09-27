@@ -874,7 +874,7 @@ fn step_on_imu<S: SequenceFn<State = ()>>(
         },
     ];
     let (step, mut rings) = step_over(sequence(), (), inputs);
-    let imu = Output::try_new(ring.writer(NoWake).expect("a free writer")).expect("aligned");
+    let imu = Output::new(ring.writer(NoWake).expect("a free writer"));
     rings.push(ring);
     (step, imu, rings)
 }

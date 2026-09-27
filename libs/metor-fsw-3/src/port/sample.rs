@@ -92,8 +92,7 @@ mod tests {
     /// A writer onto `ring` and the sample its one view fills.
     fn sampled(ring: &RingBuffer) -> (Writer<NoWake>, Sample<Imu>, Box<dyn Sampler>) {
         let writer = ring.writer(NoWake).expect("free writer");
-        let input = Input::<Imu>::try_new(vec![ring.view(NoWake).expect("free slot")])
-            .expect("supported alignment");
+        let input = Input::<Imu>::new(vec![ring.view(NoWake).expect("free slot")]);
         let (sample, sampler) = Sample::bind(input);
         (writer, sample, sampler)
     }
@@ -152,10 +151,8 @@ mod tests {
             capacity: ring_capacity(LogEvent::MAX_LEN, 4).expect("valid capacity"),
             max_readers: 1,
         });
-        let output = Output::try_new(log_ring.writer(NoWake).expect("free writer"));
-        let mut port = LogPort::new(output.expect("byte alignment"));
-        let mut lines = Input::<LogEvent>::try_new(vec![log_ring.view(NoWake).expect("free slot")])
-            .expect("byte alignment");
+        let mut port = LogPort::new(Output::new(log_ring.writer(NoWake).expect("free writer")));
+        let mut lines = Input::<LogEvent>::new(vec![log_ring.view(NoWake).expect("free slot")]);
 
         let ring = ring(8);
         let (mut writer, sample, mut sampler) = sampled(&ring);

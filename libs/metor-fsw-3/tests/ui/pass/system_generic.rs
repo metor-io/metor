@@ -41,5 +41,5 @@ fn main() {
         .register("gps_probe", probe::<Gps>(), Seen::default)
         .expect("valid records");
     let mut seen = Seen::default();
-    probe::<Imu>()(&mut seen, &mut Input::try_new(Vec::new()).unwrap());
+    probe::<Imu>()(&mut seen, &mut Input::new(Vec::new()));
 }

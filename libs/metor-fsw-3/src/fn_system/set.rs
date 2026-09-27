@@ -60,10 +60,9 @@ impl<S: Ports> SystemOutputs for OutSet<S> {
         let counts = output_counts::<S>(&outputs);
         let mut writers = Bindings::new(outputs, counts);
         let outs = S::Params::bind_out(&mut writers);
-        // PANIC Safety: the log is the last port of every `defs`, and
-        // LogEvent needs no alignment.
+        // PANIC Safety: the log is the last port of every `defs`.
         let log = writers.next().expect("one writer for the log output");
-        let log = LogPort::new(Output::try_new(log.writer).expect("byte alignment"));
+        let log = LogPort::new(Output::new(log.writer));
         assert!(writers.is_empty(), "more bindings than output params");
         Self { outs, log }
     }

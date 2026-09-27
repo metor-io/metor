@@ -287,8 +287,7 @@ fn test_pipeline_single_cycle() {
     let source = create_raw("imu", "", &[], &imu_out);
     let filter = create_raw("nav", "", &[input(&edges)], &nav_out);
     assert!(!source.handle.is_null() && !filter.handle.is_null());
-    let mut sink = Input::<Nav>::try_new(vec![nav.view(NoWake).expect("free slot")])
-        .expect("supported alignment");
+    let mut sink = Input::<Nav>::new(vec![nav.view(NoWake).expect("free slot")]);
 
     assert_eq!(source.step(1), Status::Ok);
     assert_eq!(filter.step(1), Status::Ok);
@@ -302,8 +301,7 @@ fn test_system_panic_status_and_log() {
     let (imu, log) = (ring::<Imu>(1), ring::<LogEvent>(1));
     let outputs = [raw(&imu), raw(&log)];
     let boom = create_raw("boom", "", &[], &outputs);
-    let mut lines = Input::<LogEvent>::try_new(vec![log.view(NoWake).expect("free slot")])
-        .expect("supported alignment");
+    let mut lines = Input::<LogEvent>::new(vec![log.view(NoWake).expect("free slot")]);
     assert_eq!(boom.step(1), Status::Ok);
     assert_eq!(boom.step(2), Status::Panicked);
     assert_eq!(boom.step(3), Status::Panicked);

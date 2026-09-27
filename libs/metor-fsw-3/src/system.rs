@@ -179,8 +179,8 @@ mod tests {
             let nav = inputs.pop().expect("two bindings");
             let imu = inputs.pop().expect("two bindings");
             Self {
-                imu: Input::try_new(imu.views).expect("supported alignment"),
-                nav: Input::try_new(nav.views).expect("supported alignment"),
+                imu: Input::new(imu.views),
+                nav: Input::new(nav.views),
             }
         }
     }
@@ -294,8 +294,7 @@ mod tests {
             (Input::<Imu>::def(&DefCx::empty(), "imu"), vec![&imu]),
             (Input::<Nav>::def(&DefCx::empty(), "nav"), vec![&nav]),
         ]));
-        let imu_out = Output::<Imu>::try_new(imu.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
+        let imu_out = Output::<Imu>::new(imu.writer(NoWake).expect("free writer"));
         imu_out.write(&Imu::new(1, 5.0)).expect("ring has room");
         assert_eq!(
             bound.imu.latest().expect("valid").expect("record").sample,

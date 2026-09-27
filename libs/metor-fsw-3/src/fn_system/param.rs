@@ -280,10 +280,10 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
-        // PANIC Safety: the coordinator binds one list per declared input and
-        // validates alignment at build; a mismatch is a coordinator bug.
+        // PANIC Safety: the coordinator binds one list per declared input;
+        // a mismatch is a coordinator bug.
         let binding = views.next().expect("one binding per input param");
-        Input::try_new(binding.views).expect("alignment checked at build")
+        Input::new(binding.views)
     }
 
     fn bind_out(_writers: &mut Writers) {}
@@ -348,10 +348,10 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
     fn bind_out(writers: &mut Writers) -> Self::Out {
-        // PANIC Safety: the coordinator binds one writer per declared output and
-        // validates alignment at build; a mismatch is a coordinator bug.
+        // PANIC Safety: the coordinator binds one writer per declared output;
+        // a mismatch is a coordinator bug.
         let binding = writers.next().expect("one binding per output param");
-        Output::try_new(binding.writer).expect("alignment checked at build")
+        Output::new(binding.writer)
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(

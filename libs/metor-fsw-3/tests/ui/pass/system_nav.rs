@@ -57,16 +57,15 @@ fn main() {
     nav()(
         &mut state,
         Timestamp(0),
-        &mut Input::try_new(Vec::new()).unwrap(),
-        &mut Input::try_new(Vec::new()).unwrap(),
-        &mut Output::try_new(
+        &mut Input::new(Vec::new()),
+        &mut Input::new(Vec::new()),
+        &mut Output::new(
             metor_fsw_3::ring::RingBuffer::create_in_memory(metor_fsw_3::ring::Config {
                 capacity: 256,
                 max_readers: 1,
             })
             .writer(metor_fsw_3::ring::NoWake)
             .unwrap(),
-        )
-        .unwrap(),
+        ),
     );
 }

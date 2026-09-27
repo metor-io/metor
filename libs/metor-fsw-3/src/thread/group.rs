@@ -278,14 +278,13 @@ mod tests {
         let (tx, rx) = channel();
         let thread = std::thread::spawn(move || {
             stellarator::run(move || async move {
-                let mut input = Input::<Imu, Notifier>::try_new(vec![view]).expect("aligned");
+                let mut input = Input::<Imu, Notifier>::new(vec![view]);
                 let sample = input.next().await.expect("record").sample;
                 tx.send(sample).expect("the test is listening");
             })
         });
         std::thread::sleep(core::time::Duration::from_millis(50));
-        let out =
-            Output::<Imu, _>::try_new(ring.writer(wake).expect("free writer")).expect("aligned");
+        let out = Output::<Imu, _>::new(ring.writer(wake).expect("free writer"));
         out.write(&Imu::new(1, 42.0)).expect("ring has room");
         assert_eq!(
             rx.recv_timeout(core::time::Duration::from_secs(5)),

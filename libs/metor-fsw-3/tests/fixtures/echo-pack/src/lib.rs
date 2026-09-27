@@ -143,7 +143,7 @@ impl SystemInputs for RetainedInput {
 
     fn bind(mut inputs: Vec<InputBinding>) -> Self {
         if let Some(binding) = inputs.pop() {
-            RETAINED_INPUT.with(|slot| *slot.borrow_mut() = Input::try_new(binding.views).ok());
+            RETAINED_INPUT.with(|slot| *slot.borrow_mut() = Some(Input::new(binding.views)));
         }
         Self
     }
@@ -158,7 +158,7 @@ impl SystemOutputs for RetainedOutput {
 
     fn bind(mut outputs: Vec<OutputBinding>) -> Self {
         if let Some(binding) = outputs.pop() {
-            RETAINED_OUTPUT.with(|slot| *slot.borrow_mut() = Output::try_new(binding.writer).ok());
+            RETAINED_OUTPUT.with(|slot| *slot.borrow_mut() = Some(Output::new(binding.writer)));
         }
         Self
     }

@@ -298,9 +298,8 @@ mod tests {
             capacity: ring_capacity(LogEvent::MAX_LEN, records).expect("valid"),
             max_readers: 1,
         });
-        let port =
-            LogPort::new(Output::try_new(ring.writer(NoWake).expect("writer")).expect("aligned"));
-        let input = Input::try_new(vec![ring.view(NoWake).expect("slot")]).expect("aligned");
+        let port = LogPort::new(Output::new(ring.writer(NoWake).expect("writer")));
+        let input = Input::new(vec![ring.view(NoWake).expect("slot")]);
         (ring, port, input)
     }
 

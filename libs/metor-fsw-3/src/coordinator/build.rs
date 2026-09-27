@@ -423,12 +423,11 @@ fn bind_rings(
         entries.push(Entry {
             name: system.id.to_string(),
             step: Some(step),
-            // PANIC Safety: SystemStatus requires only eight-byte alignment.
-            status: Output::try_new({
+            // PANIC Safety: build allocates one ring per output.
+            status: Output::new({
                 let ring: &RingBuffer = &rings[system.status_ring()];
                 ring.writer(NoWake).expect("one writer per output ring")
-            })
-            .expect("supported status alignment"),
+            }),
         });
     }
     Ok(entries)

@@ -111,11 +111,11 @@ fn ring<T: Record>(readers: usize) -> RingBuffer {
 }
 
 fn input<T: Record>(ring: &RingBuffer) -> Input<T> {
-    Input::try_new(vec![ring.view(NoWake).expect("available reader")]).expect("aligned")
+    Input::new(vec![ring.view(NoWake).expect("available reader")])
 }
 
 fn output<T: Record>(ring: &RingBuffer) -> Output<T> {
-    Output::try_new(ring.writer(NoWake).expect("available writer")).expect("aligned")
+    Output::new(ring.writer(NoWake).expect("available writer"))
 }
 
 fn entry(name: &str, step: impl Step + 'static, status: &RingBuffer) -> Entry {

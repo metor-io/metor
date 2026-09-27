@@ -11,7 +11,8 @@ use crate::def::{DefCx, DefError};
 use crate::record::{Bytes, DecodeError, EncodeError, Record};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
 use metor_fsw_3_ring::{
-    NoWake, Notifier, ReadError, View, WakeSink, WakeSource, WriteError, Writer, frame_len,
+    NoWake, Notifier, PAYLOAD_ALIGNMENT, ReadError, View, WakeSink, WakeSource, WriteError, Writer,
+    frame_len,
 };
 use metor_proto::types::Timestamp;
 
@@ -25,30 +26,10 @@ pub(crate) use sample::{Sampler, Samplers};
 /// Returns the power-of-two capacity for a ring of `depth` records of `max_len` bytes.
 pub fn ring_capacity(max_len: usize, depth: usize) -> Option<usize> {
     u32::try_from(max_len).ok()?;
-    max_len.checked_add(2 * metor_fsw_3_ring::PAYLOAD_ALIGNMENT - 1)?;
+    max_len.checked_add(2 * PAYLOAD_ALIGNMENT - 1)?;
     frame_len(max_len)
         .checked_mul(depth.max(2))?
         .checked_next_power_of_two()
-}
-
-/// An `UnsupportedAlignment` is a record aligned above what ring payloads provide.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("frame alignment {alignment} exceeds ring payload alignment {supported}")]
-pub struct UnsupportedAlignment {
-    pub alignment: usize,
-    pub supported: usize,
-}
-
-fn check_alignment<T: Record + ?Sized>() -> Result<(), UnsupportedAlignment> {
-    let alignment = T::ALIGN;
-    let supported = metor_fsw_3_ring::PAYLOAD_ALIGNMENT;
-    if alignment > supported {
-        return Err(UnsupportedAlignment {
-            alignment,
-            supported,
-        });
-    }
-    Ok(())
 }
 
 /// A `SendError` is why a write published no record.
@@ -118,15 +99,25 @@ pub struct Output<T: ?Sized, W: WakeSource = NoWake> {
 }
 
 impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
-    /// Binds a writer, rejecting records aligned above the ring guarantee.
-    pub fn try_new(writer: Writer<W>) -> Result<Self, UnsupportedAlignment> {
-        check_alignment::<T>()?;
-        Ok(Self {
+    /// Binds a writer. A record aligned above the ring guarantee fails the build.
+    pub fn new(writer: Writer<W>) -> Self {
+        const {
+            assert!(
+                T::ALIGN <= PAYLOAD_ALIGNMENT,
+                "record aligned above ring payloads"
+            )
+        };
+        Self {
             writer,
             scratch: Cell::new(Some(vec![0; T::MAX_LEN].into_boxed_slice())),
             max_len: T::MAX_LEN,
             _t: PhantomData,
-        })
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn try_new(writer: Writer<W>) -> Result<Self, core::convert::Infallible> {
+        Ok(Self::new(writer))
     }
 
     /// This port's entry in a bundle's `defs()` walk, announcing its record
@@ -184,14 +175,25 @@ pub struct Input<T: ?Sized, W: WakeSink = NoWake> {
 }
 
 impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
-    /// Binds one view per producer, rejecting records aligned above the ring guarantee.
-    pub fn try_new(views: Vec<View<W>>) -> Result<Self, UnsupportedAlignment> {
-        check_alignment::<T>()?;
-        Ok(Self {
+    /// Binds one view per producer. A record aligned above the ring guarantee
+    /// fails the build.
+    pub fn new(views: Vec<View<W>>) -> Self {
+        const {
+            assert!(
+                T::ALIGN <= PAYLOAD_ALIGNMENT,
+                "record aligned above ring payloads"
+            )
+        };
+        Self {
             waiters: Waiters::new(&views),
             views,
             _t: PhantomData,
-        })
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn try_new(views: Vec<View<W>>) -> Result<Self, core::convert::Infallible> {
+        Ok(Self::new(views))
     }
 
     /// This port's entry in a bundle's `defs()` walk.
@@ -337,8 +339,7 @@ impl<W: WakeSink> SystemInputs<W> for DynInputs<W> {
     fn bind(inputs: Vec<InputBinding<W>>) -> Self {
         let ports = inputs
             .into_iter()
-            // PANIC Safety: bytes need no alignment.
-            .map(|b| (b.def, Input::try_new(b.views).expect("byte alignment")))
+            .map(|b| (b.def, Input::new(b.views)))
             .collect();
         Self { ports }
     }
@@ -454,24 +455,14 @@ mod tests {
         value: u64,
     }
 
-    #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Debug)]
-    #[repr(C, align(32))]
-    struct Overaligned {
-        #[frame(timestamp)]
-        timestamp: Timestamp,
-        value: [u64; 3],
-    }
-
     #[test]
     fn test_aligned_frames_wrap() {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: 128,
             max_readers: 1,
         });
-        let output = Output::<Aligned>::try_new(ring.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
-        let mut input = Input::<Aligned>::try_new(vec![ring.view(NoWake).expect("free slot")])
-            .expect("supported alignment");
+        let output = Output::<Aligned>::new(ring.writer(NoWake).expect("free writer"));
+        let mut input = Input::<Aligned>::new(vec![ring.view(NoWake).expect("free slot")]);
         for value in 0..20 {
             output
                 .write(&Aligned {
@@ -482,33 +473,6 @@ mod tests {
             let frame = input.latest().expect("aligned record").expect("record");
             assert_eq!(frame.value, value);
         }
-    }
-
-    #[test]
-    fn test_reject_unsupported_alignment() {
-        let ring = ring(4);
-        let error = UnsupportedAlignment {
-            alignment: 32,
-            supported: 16,
-        };
-        assert_eq!(
-            Output::<Overaligned>::try_new(ring.writer(NoWake).expect("free writer")).err(),
-            Some(error)
-        );
-        assert_eq!(
-            Input::<Overaligned>::try_new(vec![ring.view(NoWake).expect("free slot")]).err(),
-            Some(error)
-        );
-        assert_eq!(Input::<Overaligned>::try_new(Vec::new()).err(), Some(error));
-        assert!(ring.writer(NoWake).is_ok());
-        assert_eq!(
-            Input::<Overaligned>::def(&DefCx::empty(), "input").alignment,
-            32
-        );
-        assert_eq!(
-            Output::<Aligned>::def(&DefCx::empty(), "output").alignment,
-            16
-        );
     }
 
     fn sample(ts: i64, sample: f64) -> Imu {
@@ -524,10 +488,8 @@ mod tests {
 
     fn pair(depth: usize) -> (RingBuffer, Output<Imu>, Input<Imu>) {
         let ring = ring(depth);
-        let out = Output::try_new(ring.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
-        let input = Input::try_new(vec![ring.view(NoWake).expect("free slot")])
-            .expect("supported alignment");
+        let out = Output::new(ring.writer(NoWake).expect("free writer"));
+        let input = Input::new(vec![ring.view(NoWake).expect("free slot")]);
         (ring, out, input)
     }
 
@@ -581,15 +543,12 @@ mod tests {
     #[test]
     fn test_latest_selects_newest_producer() {
         let (left, right) = (ring(4), ring(4));
-        let a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
-        let b = Output::<Imu>::try_new(right.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
-        let mut input = Input::<Imu>::try_new(vec![
+        let a = Output::<Imu>::new(left.writer(NoWake).expect("free writer"));
+        let b = Output::<Imu>::new(right.writer(NoWake).expect("free writer"));
+        let mut input = Input::<Imu>::new(vec![
             left.view(NoWake).expect("free slot"),
             right.view(NoWake).expect("free slot"),
-        ])
-        .expect("supported alignment");
+        ]);
         a.write(&sample(9, 1.0)).expect("ring has room");
         b.write(&sample(3, 2.0)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
@@ -601,15 +560,12 @@ mod tests {
     #[test]
     fn test_latest_timestamp_tie() {
         let (left, right) = (ring(4), ring(4));
-        let a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
-        let b = Output::<Imu>::try_new(right.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
-        let mut input = Input::<Imu>::try_new(vec![
+        let a = Output::<Imu>::new(left.writer(NoWake).expect("free writer"));
+        let b = Output::<Imu>::new(right.writer(NoWake).expect("free writer"));
+        let mut input = Input::<Imu>::new(vec![
             left.view(NoWake).expect("free slot"),
             right.view(NoWake).expect("free slot"),
-        ])
-        .expect("supported alignment");
+        ]);
         a.write(&sample(5, 1.0)).expect("ring has room");
         b.write(&sample(5, 2.0)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
@@ -618,15 +574,12 @@ mod tests {
     #[test]
     fn test_drain_producer_order() {
         let (left, right) = (ring(8), ring(8));
-        let a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
-        let b = Output::<Imu>::try_new(right.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
-        let mut input = Input::<Imu>::try_new(vec![
+        let a = Output::<Imu>::new(left.writer(NoWake).expect("free writer"));
+        let b = Output::<Imu>::new(right.writer(NoWake).expect("free writer"));
+        let mut input = Input::<Imu>::new(vec![
             left.view(NoWake).expect("free slot"),
             right.view(NoWake).expect("free slot"),
-        ])
-        .expect("supported alignment");
+        ]);
         b.write(&sample(0, 10.0)).expect("ring has room");
         a.write(&sample(1, 1.0)).expect("ring has room");
         a.write(&sample(2, 2.0)).expect("ring has room");
@@ -640,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_unconnected_input() {
-        let mut input = Input::<Imu>::try_new(Vec::new()).expect("supported alignment");
+        let mut input = Input::<Imu>::new(Vec::new());
         assert!(input.latest().expect("valid").is_none());
         assert_eq!(input.drain().count(), 0);
     }
@@ -651,10 +604,8 @@ mod tests {
             capacity: 64,
             max_readers: 1,
         });
-        let out = Output::try_new(ring.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
-        let mut input = Input::<Imu>::try_new(vec![ring.view(NoWake).expect("free slot")])
-            .expect("supported alignment");
+        let out = Output::new(ring.writer(NoWake).expect("free writer"));
+        let mut input = Input::<Imu>::new(vec![ring.view(NoWake).expect("free slot")]);
         out.write(&sample(0, 0.0)).expect("ring has room");
         let pinned = input.latest().expect("valid").expect("record");
         assert_eq!(pinned.sample, 0.0);
@@ -670,8 +621,7 @@ mod tests {
     fn test_reject_short_record() {
         let ring = ring(4);
         let writer = ring.writer(NoWake).expect("free writer");
-        let mut input = Input::<Imu>::try_new(vec![ring.view(NoWake).expect("free slot")])
-            .expect("supported alignment");
+        let mut input = Input::<Imu>::new(vec![ring.view(NoWake).expect("free slot")]);
         writer.try_write(&[0u8; 4]).expect("ring has room");
         assert_eq!(
             input.latest().err(),
@@ -700,13 +650,12 @@ mod tests {
                 max_readers: 1,
             }),
         );
-        let a = Output::try_new(left.writer(NoWake).expect("writer")).expect("aligned");
-        let b = Output::try_new(right.writer(NoWake).expect("writer")).expect("aligned");
-        let input = Input::try_new(vec![
+        let a = Output::new(left.writer(NoWake).expect("writer"));
+        let b = Output::new(right.writer(NoWake).expect("writer"));
+        let input = Input::new(vec![
             left.view(NoWake).expect("slot"),
             right.view(NoWake).expect("slot"),
-        ])
-        .expect("aligned");
+        ]);
         (left, right, a, b, input)
     }
 
@@ -812,13 +761,12 @@ mod tests {
             })
         };
         let (left, right) = (ring(), ring());
-        let a = Output::try_new(left.writer(NoWake).expect("writer")).expect("aligned");
-        let b = Output::try_new(right.writer(NoWake).expect("writer")).expect("aligned");
-        let input = Input::try_new(vec![
+        let a = Output::new(left.writer(NoWake).expect("writer"));
+        let b = Output::new(right.writer(NoWake).expect("writer"));
+        let input = Input::new(vec![
             left.view(NoWake).expect("slot"),
             right.view(NoWake).expect("slot"),
-        ])
-        .expect("aligned");
+        ]);
         (left, right, a, b, input)
     }
 
@@ -827,10 +775,8 @@ mod tests {
             capacity: ring_capacity(T::MAX_LEN, 4).expect("valid capacity"),
             max_readers: 1,
         });
-        let out = Output::try_new(ring.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
-        let input = Input::try_new(vec![ring.view(NoWake).expect("free slot")])
-            .expect("supported alignment");
+        let out = Output::new(ring.writer(NoWake).expect("free writer"));
+        let input = Input::new(vec![ring.view(NoWake).expect("free slot")]);
         (ring, out, input)
     }
 
@@ -871,8 +817,7 @@ mod tests {
             max_readers: 1,
         });
         let writer = ring.writer(NoWake).expect("free writer");
-        let mut input = Input::<Fixed>::try_new(vec![ring.view(NoWake).expect("free slot")])
-            .expect("supported alignment");
+        let mut input = Input::<Fixed>::new(vec![ring.view(NoWake).expect("free slot")]);
         let mut buf = [0u8; 16];
         let good = Fixed { a: 1, b: 2.0 };
         writer.try_write(&[0xff; 3]).expect("ring has room");
@@ -1053,7 +998,7 @@ mod async_tests {
         let (left, a, first) = woken(&Notifier::default());
         let (right, b, second) = woken(&Notifier::default());
         let views = first.views.into_iter().chain(second.views).collect();
-        let input = Input::try_new(views).expect("supported alignment");
+        let input = Input::new(views);
         ([left, right], [a, b], input)
     }
 
@@ -1063,10 +1008,8 @@ mod async_tests {
             capacity: ring_capacity(Imu::MAX_LEN, 4).expect("valid capacity"),
             max_readers: 1,
         });
-        let out = Output::try_new(ring.writer(wake.clone()).expect("free writer"))
-            .expect("supported alignment");
-        let input = Input::try_new(vec![ring.view(wake.clone()).expect("free slot")])
-            .expect("supported alignment");
+        let out = Output::new(ring.writer(wake.clone()).expect("free writer"));
+        let input = Input::new(vec![ring.view(wake.clone()).expect("free slot")]);
         (ring, out, input)
     }
 
@@ -1084,7 +1027,7 @@ mod async_tests {
 
     #[stellarator::test]
     async fn test_next_without_producer() {
-        let mut input = Input::<Imu, Notifier>::try_new(Vec::new()).expect("supported alignment");
+        let mut input = Input::<Imu, Notifier>::new(Vec::new());
         assert!(poll_once(input.next()).await.is_none());
     }
 
@@ -1170,8 +1113,7 @@ mod async_tests {
         drop(out);
         let writer = std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(20));
-            let out = Output::<Imu, _>::try_new(ring.writer(wake).expect("free writer"))
-                .expect("supported alignment");
+            let out = Output::<Imu, _>::new(ring.writer(wake).expect("free writer"));
             out.write(&Imu::new(7, 7.0)).expect("ring has room");
             ring
         });
@@ -1198,8 +1140,7 @@ mod async_tests {
         a.write(&Imu::new(1, 1.0)).expect("ring has room");
         // The record landed on a ring no port reads, so nothing is ready.
         assert!(poll_once(inputs.any_ready()).await.is_none());
-        let out = Output::<Imu, _>::try_new(right.writer(wake).expect("free writer"))
-            .expect("supported alignment");
+        let out = Output::<Imu, _>::new(right.writer(wake).expect("free writer"));
         out.write(&Imu::new(2, 2.0)).expect("ring has room");
         inputs.any_ready().await;
         let seen: Vec<_> = inputs

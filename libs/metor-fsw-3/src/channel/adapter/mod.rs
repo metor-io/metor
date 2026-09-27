@@ -141,15 +141,13 @@ fn private_abort(def: &SystemDef, inputs: &mut [Vec<RingBuffer>]) -> Option<Outp
 }
 
 fn command_input(rings: Vec<&RingBuffer>) -> Input<SequenceCommand> {
-    // PANIC Safety: the build pass counts one reader slot per edge, and
-    // commands are a message record, which any alignment carries.
-    Input::try_new(
+    // PANIC Safety: the build pass counts one reader slot per edge.
+    Input::new(
         rings
             .into_iter()
             .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
             .collect(),
     )
-    .expect("message alignment")
 }
 
 /// A ring the adapter alone writes and the system alone reads.
@@ -162,10 +160,8 @@ fn abort_ring() -> RingBuffer {
 }
 
 fn writer<T: Record>(ring: &RingBuffer) -> Output<T> {
-    // PANIC Safety: one ring is allocated per output, and the channel's
-    // records need no more than the ring's alignment.
-    Output::try_new(ring.writer(NoWake).expect("one writer per output ring"))
-        .expect("supported alignment")
+    // PANIC Safety: one ring is allocated per output.
+    Output::new(ring.writer(NoWake).expect("one writer per output ring"))
 }
 
 /// Everything needed to make the system again, over the same rings.

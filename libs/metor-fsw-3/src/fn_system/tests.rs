@@ -609,10 +609,8 @@ fn test_stateless_default_registration() {
 #[test]
 fn test_direct_call_writes_output() {
     let imu = ring::<Imu>();
-    let mut output = Output::<Imu>::try_new(imu.writer(NoWake).expect("free writer"))
-        .expect("supported alignment");
-    let mut input = Input::<Imu>::try_new(vec![imu.view(NoWake).expect("free slot")])
-        .expect("supported alignment");
+    let mut output = Output::<Imu>::new(imu.writer(NoWake).expect("free writer"));
+    let mut input = Input::<Imu>::new(vec![imu.view(NoWake).expect("free slot")]);
     gain()(&mut Gain(3.0), &mut output);
     let sample = input.latest().expect("valid").map(|f| f.sample);
     assert_eq!(sample, Some(3.0));
@@ -720,12 +718,9 @@ fn test_async_adapter_relay() {
     );
 
     let (imu, nav, log) = (ring::<Imu>(), ring::<Nav>(), ring::<LogEvent>());
-    let source = Output::<Imu, _>::try_new(imu.writer(NoWake).expect("free writer"))
-        .expect("supported alignment");
-    let mut estimates = Input::<Nav>::try_new(vec![nav.view(NoWake).expect("free slot")])
-        .expect("supported alignment");
-    let mut lines = Input::<LogEvent>::try_new(vec![log.view(NoWake).expect("free slot")])
-        .expect("supported alignment");
+    let source = Output::<Imu, _>::new(imu.writer(NoWake).expect("free writer"));
+    let mut estimates = Input::<Nav>::new(vec![nav.view(NoWake).expect("free slot")]);
+    let mut lines = Input::<LogEvent>::new(vec![log.view(NoWake).expect("free slot")]);
 
     let mut threads = Threads::new();
     let def = entry.def.clone();
