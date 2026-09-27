@@ -172,7 +172,7 @@ impl System for Retained {
     type Outputs = RetainedOutput;
 
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<RetainedInput, RetainedOutput>("Retained", cx)
+        SystemDef::new::<RetainedInput, RetainedOutput, _>("Retained", cx)
     }
 
     fn execute(&self, _: Timestamp, _: &mut (), _: &mut RetainedInput, _: &mut RetainedOutput) {}

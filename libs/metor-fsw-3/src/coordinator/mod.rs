@@ -63,11 +63,6 @@ impl Coordinator {
         self.rings.len()
     }
 
-    /// The systems' config ids, in step order.
-    pub fn entry_names(&self) -> impl Iterator<Item = &str> {
-        self.entries.iter().map(|entry| entry.name.as_str())
-    }
-
     /// The ids of the systems that ended and how, in step order.
     pub fn ended(&self) -> impl Iterator<Item = (&str, &EndReason)> {
         self.entries

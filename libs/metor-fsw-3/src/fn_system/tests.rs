@@ -17,10 +17,7 @@ use crate::coordinator::{
 };
 use crate::log::Log;
 use crate::port::{Input, Output, Sample, ring_capacity};
-use crate::tests::utils::{
-    Control, Imu, Nav, NoParams, input, output, pair, ring, static_async_def, static_def,
-    static_inputs, static_outputs,
-};
+use crate::tests::utils::{Control, Imu, Nav, NoParams, input, output, pair, ring};
 use crate::{Frame, Record};
 
 /// Doubles the newest sample, stamping it with the cycle time.
@@ -156,33 +153,14 @@ impl SystemFn for Counter {
     }
 }
 
-/// A system's `Ports` consts, read through its value.
-fn ports<P: Ports>(_: &P) -> (&'static str, &'static [&'static str], &'static str) {
-    (P::NAME, P::NAMES, P::DOC)
+/// A `#[system]` fn's ports under `cx`.
+fn def_in<S: SystemFn>(_: S, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+    <FnSystem<S> as System>::def(cx)
 }
 
 /// A `#[system]` fn's ports under the empty context.
-fn def_of<S: SystemFn>(_: S) -> SystemDef {
-    static_def::<FnSystem<S>>()
-}
-
-/// A `#[system]` fn's ports under `cx`.
-fn def_in<S: SystemFn>(_: S, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-    FnSystem::<S>::def(cx)
-}
-
-#[test]
-fn test_attribute_type_and_ports() {
-    assert_eq!(ports(&gain()).0, "gain");
-    assert_eq!(ports(&gain()).1, &["imu"]);
-    assert_eq!(ports(&probe::<Imu>()).0, "probe");
-    assert_eq!(
-        def_of(gain()).outputs,
-        vec![
-            Output::<Imu>::def(&DefCx::empty(), "imu"),
-            Output::<LogEvent>::def(&DefCx::empty(), "log")
-        ]
-    );
+fn def_of<S: SystemFn>(system: S) -> SystemDef {
+    def_in(system, &DefCx::empty()).expect("a static definition")
 }
 
 #[test]
@@ -197,10 +175,12 @@ fn test_port_parameter_order() {
             Output::<LogEvent>::def(&DefCx::empty(), "log")
         ]
     );
-    assert_eq!(static_inputs::<InSet<Summer>, _>().len(), 2);
-    assert_eq!(static_outputs::<OutSet<Summer>>()[0].name, "sum");
-    assert!(static_inputs::<InSet<Counter>, _>().is_empty());
-    assert_eq!(static_outputs::<OutSet<Counter>>().len(), 1);
+    let summer = def_of(Summer);
+    assert_eq!(summer.inputs.len(), 2);
+    assert_eq!(summer.outputs[0].name, "sum");
+    let counter = def_of(Counter::default());
+    assert!(counter.inputs.is_empty());
+    assert_eq!(counter.outputs.len(), 1);
 }
 
 fn gain_table() -> SystemTable {
@@ -233,38 +213,6 @@ fn test_constructor_receives_params() {
     let mut coordinator = config.build(&table).expect("valid");
     coordinator.step(Timestamp(0));
     assert_eq!(seen.borrow().as_ref().map(|f| f.sample), Some(4.0));
-}
-
-#[test]
-fn test_param_error_reports_system() {
-    let config = CoordinatorConfig {
-        systems: vec![SystemConfig {
-            params: json!({ "kp": 4.0 }),
-            ..SystemConfig::new("g", "gain")
-        }],
-        ..Default::default()
-    };
-    assert!(matches!(
-        config.build(&gain_table()).err(),
-        Some(crate::BuildError::Params { id, .. }) if id == "g"
-    ));
-}
-
-#[test]
-fn test_default_constructors() {
-    let config = CoordinatorConfig {
-        systems: vec![
-            SystemConfig {
-                params: json!(null),
-                ..SystemConfig::new("d", "doubler")
-            },
-            SystemConfig::new("c", "counter"),
-        ],
-        ..Default::default()
-    };
-    let mut coordinator = config.build(&gain_table()).expect("valid");
-    coordinator.step(Timestamp(0));
-    assert_eq!(coordinator.cycle(), 1);
 }
 
 #[test]
@@ -331,7 +279,6 @@ fn test_pipeline_matches_trait() {
     coordinator.step(Timestamp(7));
     let nav = seen.borrow().expect("nav published");
     assert_eq!((nav.timestamp, nav.estimate), (Timestamp(7), 3.0));
-    assert_eq!(Nav::ID, Output::<Nav>::def(&DefCx::empty(), "nav").id);
 }
 
 /// Logs one direct line and `lines` traced lines per cycle.
@@ -356,7 +303,7 @@ impl crate::System for Noisy {
     type Outputs = ();
 
     fn def(cx: &crate::DefCx<'_>) -> Result<crate::SystemDef, crate::DefError> {
-        crate::SystemDef::new::<(), ()>("noisy", cx)
+        crate::SystemDef::new::<(), (), NoWake>("noisy", cx)
     }
 
     fn execute(&self, _now: Timestamp, _state: &mut (), _inputs: &mut (), _outputs: &mut ()) {
@@ -536,26 +483,6 @@ fn test_reject_explicit_log_output() {
     );
 }
 
-/// The name of a system's state type.
-fn state_of<P: Ports>(_: &P) -> &'static str {
-    core::any::type_name::<P::State>()
-}
-
-#[test]
-fn test_ports_consts() {
-    assert_eq!(ports(&gain()), ("gain", &["imu"][..], ports(&gain()).2));
-    assert_eq!(state_of(&gain()), core::any::type_name::<Gain>());
-    assert_eq!(ports(&relay()).0, "relay");
-    assert_eq!(state_of(&relay()), "()");
-    assert_eq!(ports(&probe::<Nav>()), ("probe", &["input"][..], ""));
-    assert_eq!(
-        state_of(&probe::<Nav>()),
-        core::any::type_name::<Probe<Nav>>()
-    );
-    assert_eq!(ports(&relay_cyclic()).1, &["imu", "nav", "log"]);
-    assert_eq!(state_of(&relay_cyclic()), "()");
-}
-
 /// Publishes one fixed sample per cycle, with no state.
 #[crate::system]
 fn unit(imu: &mut Output<Imu>) {
@@ -587,32 +514,6 @@ fn test_direct_call_writes_output() {
     gain()(&mut Gain(3.0), &mut output);
     let sample = input.latest().expect("valid").map(|f| f.sample);
     assert_eq!(sample, Some(3.0));
-}
-
-#[test]
-fn test_generic_system_two_records() {
-    let mut table = SystemTable::new();
-    let _imu = register_probe::<Imu>(&mut table, "imu_probe");
-    let _nav = register_probe::<Nav>(&mut table, "nav_probe");
-    let inputs = |ty| table.get(ty).expect("registered").def.inputs.clone();
-    assert_eq!(
-        inputs("imu_probe"),
-        vec![Input::<Imu>::def(&DefCx::empty(), "input")]
-    );
-    assert_eq!(
-        inputs("nav_probe"),
-        vec![Input::<Nav>::def(&DefCx::empty(), "input")]
-    );
-}
-
-#[test]
-fn test_execute_doc_comment() {
-    assert_eq!(
-        ports(&gain()).2,
-        "Publishes the gain.\n\nOne sample per cycle."
-    );
-    assert_eq!(Doubler::DOC, "");
-    assert_eq!(ports(&probe::<Imu>()).2, "");
 }
 
 #[test]
@@ -650,17 +551,15 @@ fn relay_cyclic(imu: &mut Input<Imu>, nav: &mut Output<Nav>, log: &mut Log) {
     let _ = (imu, nav, log);
 }
 
-/// An async `#[system]` fn's ports under the empty context.
-fn async_def_of<S: AsyncSystemFn>(_: S) -> SystemDef {
-    static_async_def::<FnAsyncSystem<S>>()
+/// An async `#[system]` fn's definition under `cx`.
+fn async_def_in<S: AsyncSystemFn>(_: S, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+    <FnSystem<S> as AsyncSystem>::def(cx)
 }
 
 #[test]
 fn test_async_and_cyclic_ports_match() {
-    let (_, names, doc) = ports(&relay());
-    assert_eq!(names, &["imu", "nav", "log"]);
-    assert_eq!(doc, "Forwards records as they arrive.");
-    let (relay, cyclic) = (async_def_of(relay()), def_of(relay_cyclic()));
+    let relay = async_def_in(relay(), &DefCx::empty()).expect("a static definition");
+    let cyclic = def_of(relay_cyclic());
     assert_eq!(relay.inputs, cyclic.inputs);
     assert_eq!(relay.outputs, cyclic.outputs);
     assert_eq!(relay.name, "relay");
@@ -723,7 +622,7 @@ fn test_async_adapter_relay() {
 /// A dynamic parameter takes the ports the config named, wherever it sits.
 #[test]
 fn test_dynamic_parameter_port_order() {
-    use crate::def::{DefCx, Records};
+    use crate::def::Records;
     use crate::port::{DynInputs, DynOutputs};
 
     #[crate::system]
@@ -750,28 +649,6 @@ fn test_dynamic_parameter_port_order() {
     assert_eq!(names, vec!["nav.nav", "imu"]);
     let names: Vec<_> = def.outputs.iter().map(|port| port.name.as_ref()).collect();
     assert_eq!(names, vec!["sink", "log"]);
-}
-
-/// Two producers on one undeclared port have no one definition to take.
-#[test]
-fn test_reject_multiple_dynamic_producers() {
-    use crate::def::{DefCx, DefError};
-    use crate::port::DynInputs;
-
-    #[crate::system]
-    fn tap(taps: &mut DynInputs) {
-        let _ = taps;
-    }
-
-    let first = Output::<Imu>::def(&DefCx::empty(), "imu");
-    let second = Output::<Imu>::def(&DefCx::empty(), "imu");
-    let edges = [("plant.imu", &first), ("plant.imu", &second)];
-    assert_eq!(
-        def_in(tap(), &DefCx::of_inputs(&edges)),
-        Err(DefError::FanIn {
-            port: "plant.imu".into()
-        })
-    );
 }
 
 /// Publishes the cycle count as a sample.
@@ -826,11 +703,6 @@ fn test_sample_sees_this_cycle() {
 async fn sampling_async(imu: &Sample<Imu>, stop: Stop) {
     let _ = imu;
     stop.wait().await;
-}
-
-/// An async `#[system]` fn's definition under `cx`.
-fn async_def_in<S: AsyncSystemFn>(_: S, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-    FnAsyncSystem::<S>::def(cx)
 }
 
 #[test]

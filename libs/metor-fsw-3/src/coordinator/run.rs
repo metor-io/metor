@@ -173,6 +173,7 @@ mod tests {
     use super::*;
     use crate::coordinator::CoordinatorConfig;
     use crate::coordinator::config::{InputConfig, PortRef, SystemConfig};
+    use crate::coordinator::tests::Twice;
     use crate::tests::utils::{self, Recorder, pipeline_config, table};
 
     fn watched(config: &mut CoordinatorConfig, from: &[&str]) {
@@ -390,22 +391,6 @@ mod tests {
         let mut step: Option<Box<dyn Step>> = Some(Box::new(Clean(0)));
         assert_eq!(catch_step(&mut step, Timestamp(0)), Stepped::Ran);
         assert!(step.is_some());
-    }
-
-    /// Counts its cycles and ends after the second.
-    struct Twice(std::rc::Rc<core::cell::Cell<u64>>, Option<EndReason>);
-
-    impl Step for Twice {
-        fn execute(&mut self, _now: Timestamp) {
-            self.0.set(self.0.get() + 1);
-            if self.0.get() == 2 {
-                self.1 = Some(EndReason::Completed);
-            }
-        }
-
-        fn ended(&self) -> Option<&EndReason> {
-            self.1.as_ref()
-        }
     }
 
     #[test]

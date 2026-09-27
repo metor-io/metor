@@ -8,7 +8,6 @@ use syn::Ident;
 
 mod frame;
 mod record;
-mod system;
 mod system_attr;
 
 /// Derives the four component sub-traits and `Frame`. Configured with
@@ -55,18 +54,6 @@ pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn sequence(_attr: TokenStream, item: TokenStream) -> TokenStream {
     system_attr::sequence(item)
-}
-
-/// Derives `SystemInputs` for a struct of `Input<F>` fields.
-#[proc_macro_derive(SystemInputs)]
-pub fn system_inputs(input: TokenStream) -> TokenStream {
-    system::system_inputs(input)
-}
-
-/// Derives `SystemOutputs` for a struct of `Output<F>` fields.
-#[proc_macro_derive(SystemOutputs)]
-pub fn system_outputs(input: TokenStream) -> TokenStream {
-    system::system_outputs(input)
 }
 
 /// The path generated code uses to reach `metor-fsw-3`.

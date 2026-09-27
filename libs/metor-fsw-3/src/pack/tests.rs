@@ -38,7 +38,7 @@ fn instance_def(ty: &str) -> Vec<u8> {
         .get(ty)
         .map(|entry| entry.def.clone())
         .unwrap_or_else(|| {
-            crate::SystemDef::new::<(), ()>("unknown", &crate::DefCx::empty())
+            crate::SystemDef::new::<(), (), crate::ring::NoWake>("unknown", &crate::DefCx::empty())
                 .expect("a static definition")
         });
     let instance = crate::pack::def::Instance {
@@ -216,9 +216,9 @@ fn test_table_capture_lifetime() {
         let capture = Capture;
         let mut table = SystemTable::new();
         table
-            .register_system("imu", move |_| {
+            .register("imu", crate::tests::utils::imu_source(), move || {
                 let _ = &capture;
-                Ok((crate::tests::utils::ImuSource, 0))
+                0
             })
             .expect("valid records");
         table
@@ -261,9 +261,15 @@ fn test_bad_params_refused() {
 #[test]
 fn test_pipeline_single_cycle() {
     let (imu, nav) = (ring::<Imu>(1), ring::<Nav>(1));
+    let (imu_log, nav_log) = (ring::<LogEvent>(1), ring::<LogEvent>(1));
     let edges = [imu.raw()];
-    let source = create_raw("imu", "", &[], &[imu.raw()]);
-    let filter = create_raw("nav", "", &[RawSlice::of(&edges)], &[nav.raw()]);
+    let source = create_raw("imu", "", &[], &[imu.raw(), imu_log.raw()]);
+    let filter = create_raw(
+        "nav",
+        "",
+        &[RawSlice::of(&edges)],
+        &[nav.raw(), nav_log.raw()],
+    );
     assert!(!source.handle.is_null() && !filter.handle.is_null());
     let mut sink = utils::input::<Nav>(&nav.ring);
 
@@ -292,9 +298,9 @@ fn test_system_panic_status_and_log() {
 
 #[test]
 fn test_destroy_releases_ring_handles() {
-    let (imu, nav) = (ring::<Imu>(1), ring::<Nav>(1));
+    let (imu, nav, log) = (ring::<Imu>(1), ring::<Nav>(1), ring::<LogEvent>(1));
     let edges = [imu.raw()];
-    let filter = create_raw("nav", "", &[RawSlice::of(&edges)], &[nav.raw()]);
+    let filter = create_raw("nav", "", &[RawSlice::of(&edges)], &[nav.raw(), log.raw()]);
     assert!(imu.ring.view(NoWake).is_err());
     assert!(nav.ring.writer(NoWake).is_err());
 

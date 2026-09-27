@@ -166,7 +166,7 @@ fn resolve_def(table: &SystemTable, ty: &[u8], cx: &[u8]) -> Result<SystemDef, D
         .get(ty)
         .ok_or_else(|| refused(format!("unknown system type `{ty}`")))?;
     let edges = owned.edges();
-    entry.def_for(&owned.borrow(&edges))
+    (entry.def_fn)(&owned.borrow(&edges))
 }
 
 /// The caller's output region, as a cursor a writer fills.

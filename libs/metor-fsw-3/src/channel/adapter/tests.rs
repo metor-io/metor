@@ -17,7 +17,7 @@ use crate::def::DefCx;
 use crate::port::{Input, Output};
 use crate::sequence::{Seq, SeqError};
 use crate::system::SystemDef;
-use crate::tests::utils::{Imu, ImuSource};
+use crate::tests::utils::{Imu, NoParams, imu_source};
 use crate::{FrameBytes, FrameStr, system};
 
 /// What the test systems saw, shared with the test.
@@ -117,9 +117,6 @@ fn counter(#[state] c: &mut Counter, imu: &mut Input<Imu>, abort: &mut Abort) {
 fn plain(#[state] c: &mut Counter) {
     c.tick();
 }
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-struct NoParams {}
 
 /// Counts cycles and never reads its abort.
 #[system]
@@ -232,7 +229,7 @@ fn table(shared: &Shared) -> SystemTable {
         table.register("deaf", deaf(), move |p| Counter::try_new(s.clone(), p))?;
         let s = shared.clone();
         table.register("watch", watch(), move || Watch(s.clone()))?;
-        table.register_system("imu", |_| Ok((ImuSource, 0)))?;
+        table.register("imu", imu_source(), i64::default)?;
         let s = shared.clone();
         table.register_sequence("ticker", ticker(), move || Counter::new(s.clone()))?;
         table.insert("slot", slot_entry(shared))?;

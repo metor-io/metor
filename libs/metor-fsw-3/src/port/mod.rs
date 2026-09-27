@@ -115,11 +115,6 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
         }
     }
 
-    #[doc(hidden)]
-    pub fn try_new(writer: Writer<W>) -> Result<Self, core::convert::Infallible> {
-        Ok(Self::new(writer))
-    }
-
     /// This port's entry in a bundle's `defs()` walk, announcing its record
     /// under `cx`'s root for `name`.
     pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
@@ -189,11 +184,6 @@ impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
             views,
             _t: PhantomData,
         }
-    }
-
-    #[doc(hidden)]
-    pub fn try_new(views: Vec<View<W>>) -> Result<Self, core::convert::Infallible> {
-        Ok(Self::new(views))
     }
 
     /// This port's entry in a bundle's `defs()` walk.

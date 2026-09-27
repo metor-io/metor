@@ -4,11 +4,8 @@ use std::rc::Rc;
 use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
-use super::run::Runner;
-use super::{Clock, Coordinator, Entry, Step, SystemStatus};
-use crate::def::{DefCx, DefError};
+use super::{Clock, Coordinator, EndReason, Entry, Step, SystemStatus};
 use crate::port::{Input, Output};
-use crate::system::{System, SystemDef};
 use crate::tests::utils::{Imu, input, output, ring};
 
 #[derive(Default)]
@@ -18,36 +15,28 @@ struct Calls {
     drop: Cell<usize>,
 }
 
-#[derive(crate::SystemInputs)]
 struct ConsumerInputs {
     data: Input<Imu>,
     status: Input<SystemStatus>,
 }
 
 struct FailingConsumer {
+    inputs: ConsumerInputs,
     calls: Rc<Calls>,
     fault_panics: bool,
     drop_panics: bool,
 }
 
-impl System for FailingConsumer {
-    type State = ();
-    type Inputs = ConsumerInputs;
-    type Outputs = ();
-
-    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<ConsumerInputs, ()>("failed", cx)
-    }
-
-    fn execute(&self, _: Timestamp, _: &mut (), inputs: &mut ConsumerInputs, _: &mut ()) {
+impl Step for FailingConsumer {
+    fn execute(&mut self, _: Timestamp) {
         self.calls.execute.set(self.calls.execute.get() + 1);
-        assert!(inputs.data.latest().expect("valid data").is_some());
-        assert!(inputs.status.latest().expect("valid status").is_some());
+        assert!(self.inputs.data.latest().expect("valid data").is_some());
+        assert!(self.inputs.status.latest().expect("valid status").is_some());
         // PANIC Safety: the coordinator catches the failed cycle.
         panic!("consumer failed");
     }
 
-    fn fault(&self, _: Timestamp, _: &mut (), message: &str) {
+    fn fault(&mut self, _: Timestamp, message: &str) {
         self.calls.fault.set(self.calls.fault.get() + 1);
         assert_eq!(message, "consumer failed");
         if self.fault_panics {
@@ -110,6 +99,19 @@ fn entry(name: &str, step: impl Step + 'static, status: &RingBuffer) -> Entry {
     }
 }
 
+fn coordinator(entries: Vec<Entry>, rings: Vec<RingBuffer>) -> Coordinator {
+    Coordinator {
+        entries,
+        clock: Clock::Simulated {
+            dt: std::time::Duration::from_millis(1),
+        },
+        epoch: Timestamp(0),
+        cycle: 0,
+        threads: crate::thread::Threads::new(),
+        rings,
+    }
+}
+
 fn assert_retirement(fault_panics: bool, drop_panics: bool) {
     let data = ring::<Imu>(2, 2);
     let producer_status = ring::<SystemStatus>(2, 2);
@@ -117,18 +119,14 @@ fn assert_retirement(fault_panics: bool, drop_panics: bool) {
     let healthy_status = ring::<SystemStatus>(2, 1);
     let calls = Rc::new(Calls::default());
     let seen = Rc::new(RefCell::new(Vec::with_capacity(32)));
-    let failed = Runner {
-        system: FailingConsumer {
-            calls: calls.clone(),
-            fault_panics,
-            drop_panics,
-        },
-        state: (),
+    let failed = FailingConsumer {
         inputs: ConsumerInputs {
             data: input(&data),
             status: input(&producer_status),
         },
-        outputs: (),
+        calls: calls.clone(),
+        fault_panics,
+        drop_panics,
     };
     let healthy = HealthyConsumer {
         inputs: ConsumerInputs {
@@ -138,20 +136,14 @@ fn assert_retirement(fault_panics: bool, drop_panics: bool) {
         seen: seen.clone(),
     };
     let mut status = input::<SystemStatus>(&failed_status);
-    let mut coordinator = Coordinator {
-        entries: vec![
+    let mut coordinator = coordinator(
+        vec![
             entry("producer", Producer(output(&data)), &producer_status),
             entry("failed", failed, &failed_status),
             entry("healthy", healthy, &healthy_status),
         ],
-        clock: Clock::Simulated {
-            dt: std::time::Duration::from_millis(1),
-        },
-        epoch: Timestamp(0),
-        cycle: 0,
-        threads: crate::thread::Threads::new(),
-        rings: vec![data, producer_status, failed_status, healthy_status],
-    };
+        vec![data, producer_status, failed_status, healthy_status],
+    );
 
     for cycle in 1..=32 {
         coordinator.step(Timestamp(cycle));
@@ -195,17 +187,17 @@ fn test_fault_and_destructor_panic_isolation() {
 }
 
 /// Counts its cycles and completes after the second.
-struct Twice(Rc<Cell<u64>>, Option<super::EndReason>);
+pub(super) struct Twice(pub Rc<Cell<u64>>, pub Option<EndReason>);
 
 impl Step for Twice {
     fn execute(&mut self, _now: Timestamp) {
         self.0.set(self.0.get() + 1);
         if self.0.get() == 2 {
-            self.1 = Some(super::EndReason::Completed);
+            self.1 = Some(EndReason::Completed);
         }
     }
 
-    fn ended(&self) -> Option<&super::EndReason> {
+    fn ended(&self) -> Option<&EndReason> {
         self.1.as_ref()
     }
 }
@@ -215,16 +207,10 @@ fn test_ended_step_stays_and_is_skipped() {
     let status_ring = ring::<SystemStatus>(2, 1);
     let mut status = input::<SystemStatus>(&status_ring);
     let runs = Rc::new(Cell::new(0));
-    let mut coordinator = Coordinator {
-        entries: vec![entry("twice", Twice(runs.clone(), None), &status_ring)],
-        clock: Clock::Simulated {
-            dt: std::time::Duration::from_millis(1),
-        },
-        epoch: Timestamp(0),
-        cycle: 0,
-        threads: crate::thread::Threads::new(),
-        rings: vec![status_ring.clone()],
-    };
+    let mut coordinator = coordinator(
+        vec![entry("twice", Twice(runs.clone(), None), &status_ring)],
+        vec![status_ring.clone()],
+    );
     for cycle in 1..=4 {
         coordinator.step(Timestamp(cycle));
         let seen = status.latest().expect("valid status").expect("new status");
@@ -236,7 +222,7 @@ fn test_ended_step_stays_and_is_skipped() {
     assert_eq!(runs.get(), 2);
     assert_eq!(
         coordinator.ended().collect::<Vec<_>>(),
-        [("twice", &super::EndReason::Completed)]
+        [("twice", &EndReason::Completed)]
     );
     assert_eq!(coordinator.latched().count(), 0);
 }

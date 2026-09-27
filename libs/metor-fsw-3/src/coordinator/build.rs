@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(
             check_port_names(
                 "empty",
-                &crate::SystemDef::new::<(), ()>("empty", &crate::DefCx::empty())
+                &crate::SystemDef::new::<(), (), NoWake>("empty", &crate::DefCx::empty())
                     .expect("a static definition")
             ),
             Ok(())
@@ -620,12 +620,8 @@ mod tests {
         config.systems.truncate(2);
         config.systems[1].inputs[0].from = vec![PortRef::new("imu", "imu")];
         let coordinator = build(config).expect("valid config");
-        // imu + nav outputs, plus one status ring each.
-        assert_eq!(coordinator.rings(), 4);
-        assert_eq!(
-            coordinator.entry_names().collect::<Vec<_>>(),
-            vec!["imu", "nav"]
-        );
+        // imu + nav outputs and logs, plus one status ring each.
+        assert_eq!(coordinator.rings(), 6);
     }
 
     #[test]

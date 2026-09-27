@@ -57,7 +57,8 @@ pub trait AsyncSystemFn: Ports {
 #[inline(always)]
 pub fn assert_param<P: Param>() {}
 
-/// A `FnSystem` is the [`System`] a [`SystemFn`] registers as.
+/// A `FnSystem` is the [`System`] a [`SystemFn`] registers as, or the
+/// [`AsyncSystem`] an [`AsyncSystemFn`] does.
 pub struct FnSystem<S>(PhantomData<S>);
 
 impl<S> Default for FnSystem<S> {
@@ -66,16 +67,7 @@ impl<S> Default for FnSystem<S> {
     }
 }
 
-/// A `FnAsyncSystem` is the [`AsyncSystem`] an [`AsyncSystemFn`] registers as.
-pub struct FnAsyncSystem<S>(PhantomData<S>);
-
-impl<S> Default for FnAsyncSystem<S> {
-    fn default() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<S: AsyncSystemFn> AsyncSystem for FnAsyncSystem<S> {
+impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
     type State = S::State;
     type Inputs = InSet<S, Notifier>;
     type Outputs = OutSet<S>;
@@ -87,7 +79,7 @@ impl<S: AsyncSystemFn> AsyncSystem for FnAsyncSystem<S> {
                 system: S::NAME.into(),
             });
         }
-        SystemDef::new_async::<InSet<S, Notifier>, OutSet<S>>(S::NAME, cx)
+        SystemDef::new::<InSet<S, Notifier>, OutSet<S>, _>(S::NAME, cx)
     }
 
     /// Points each poll's log lines at the system's own `log` output, then runs the system.
@@ -112,7 +104,7 @@ impl<S: SystemFn> System for FnSystem<S> {
     type Outputs = OutSet<S>;
 
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<InSet<S>, OutSet<S>>(S::NAME, cx)
+        SystemDef::new::<InSet<S>, OutSet<S>, _>(S::NAME, cx)
     }
 
     /// Points this thread's log lines at the system's own `log` output, then runs one cycle.

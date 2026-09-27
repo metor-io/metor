@@ -79,7 +79,7 @@ fn probe(entry: &TableEntry) -> (bool, bool) {
         records: &records,
         ..DefCx::empty()
     };
-    match entry.def_for(&cx) {
+    match (entry.def_fn)(&cx) {
         Ok(def) => (took(&def.inputs), took(&def.outputs)),
         Err(_) => (false, false),
     }

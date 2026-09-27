@@ -5,14 +5,14 @@ use super::*;
 use crate::cli::config::{CONFIG_VERSION, TargetConfig};
 use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig, PeerPort, SystemConfig};
 use crate::record::Record;
-use crate::tests::utils::{ImuSource, Recorder, table};
+use crate::tests::utils::{Recorder, imu_source, table};
 
 fn tables(count: usize) -> Vec<SystemTable> {
     (0..count)
         .map(|_| {
             let mut table = table(&Recorder::default());
             table
-                .register_system(DB_TYPE, |_| Ok((ImuSource, 0)))
+                .register(DB_TYPE, imu_source(), i64::default)
                 .expect("valid records");
             table
         })

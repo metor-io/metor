@@ -146,7 +146,7 @@ pub(crate) fn instance_def(
         records,
         params: &system.params,
     };
-    let def = entry.def_for(&cx).map_err(|source| BuildError::Def {
+    let def = (entry.def_fn)(&cx).map_err(|source| BuildError::Def {
         id: system.id.clone(),
         source,
     })?;
@@ -183,11 +183,6 @@ impl Records {
             }
         }
         Self(records)
-    }
-
-    /// The port declaring `record`, absent when it is unknown or disputed.
-    pub fn get(&self, record: &str) -> Option<&PortDef> {
-        self.0.get(record)?.as_ref()
     }
 
     /// The record `record` names, as a port called `port`.
