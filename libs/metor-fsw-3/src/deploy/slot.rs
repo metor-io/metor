@@ -8,10 +8,11 @@ use serde_json::{Map, Value, json};
 
 use crate::FrameStr;
 use crate::cli::config::{DeploymentConfig, PackRef};
-use crate::coordinator::{OutputConfig, SystemConfig, SystemTable};
-use crate::def::{DefCx, DefError, Records};
+use crate::coordinator::{SystemConfig, SystemTable};
+use crate::def::{DefCx, DefError};
 use crate::dl::{Pack, SLOT_TYPE, slot::same_ports, store};
-use crate::system::{PortDef, SystemDef};
+use crate::pack::def::DefCxOwned;
+use crate::system::SystemDef;
 
 use super::error::DeployError;
 use super::index::{At, DefIndex};
@@ -48,7 +49,7 @@ pub fn resolve_slots(
 ) -> Result<(), DeployError> {
     while let Some(at) = first_unresolved(envelope) {
         let params = resolve_slot(envelope, tables, at, store)?;
-        envelope.targets[at.target].coordinator.systems[at.system].params = params;
+        at.get_mut(envelope).params = params;
     }
     Ok(())
 }
@@ -60,15 +61,17 @@ fn resolve_slot(
     store: &Path,
 ) -> Result<Value, DeployError> {
     let mut index = DefIndex::new(envelope, tables);
-    let target = &envelope.targets[at.target];
-    let system = &target.coordinator.systems[at.system];
+    let system = at.get(envelope);
     let cx = SlotCx {
         slot: index.name(at),
-        id: &system.id,
-        namespace: target.coordinator.namespace.as_deref(),
-        edges: index.edges(at)?,
-        outputs: &system.outputs,
-        records: index.records(at.target).clone(),
+        cx: DefCxOwned {
+            id: system.id.clone(),
+            namespace: envelope.targets[at.target].coordinator.namespace.clone(),
+            inputs: index.edges(at)?,
+            outputs: system.outputs.clone(),
+            records: index.records(at.target).clone(),
+            params: Value::Null,
+        },
     };
     cx.params(&system.params, store)
 }
@@ -90,16 +93,12 @@ fn candidates(params: &Value) -> impl Iterator<Item = &Value> {
 }
 
 /// What a slot's candidates compute their ports under: the slot's own config.
-struct SlotCx<'a> {
+struct SlotCx {
     slot: String,
-    id: &'a str,
-    namespace: Option<&'a str>,
-    edges: Vec<(String, PortDef)>,
-    outputs: &'a [OutputConfig],
-    records: Records,
+    cx: DefCxOwned,
 }
 
-impl SlotCx<'_> {
+impl SlotCx {
     fn fail(&self, message: String) -> DeployError {
         DeployError::Slot {
             slot: self.slot.clone(),
@@ -165,22 +164,12 @@ impl SlotCx<'_> {
     }
 
     fn def(&self, pack: &Pack, ty: &str, params: &Value) -> Result<SystemDef, DefError> {
-        let inputs: Vec<(&str, &PortDef)> = self
-            .edges
-            .iter()
-            .map(|(port, def)| (port.as_str(), def))
-            .collect();
-        pack.def(
-            ty,
-            &DefCx {
-                id: self.id,
-                namespace: self.namespace,
-                inputs: &inputs,
-                outputs: self.outputs,
-                records: &self.records,
-                params,
-            },
-        )
+        let edges = self.cx.edges();
+        let cx = DefCx {
+            params,
+            ..self.cx.borrow(&edges)
+        };
+        pack.def(ty, &cx)
     }
 
     fn text(&self, candidate: &Map<String, Value>, key: &str) -> Result<String, DeployError> {

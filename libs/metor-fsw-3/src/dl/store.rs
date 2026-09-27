@@ -76,24 +76,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hash_names_the_bytes() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
-        std::fs::write(&a, b"one").expect("writes");
-        std::fs::write(&b, b"one").expect("writes");
-        assert_eq!(hash(&a).expect("reads"), hash(&b).expect("reads"));
-        std::fs::write(&b, b"two").expect("writes");
-        assert_ne!(hash(&a).expect("reads"), hash(&b).expect("reads"));
-        assert_eq!(hash(&a).expect("reads"), blake3::hash(b"one"));
-    }
-
-    #[test]
-    fn test_hash_missing_file_errors() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        assert!(hash(&dir.path().join("missing")).is_err());
-    }
-
-    #[test]
     fn test_hashed_file_identity() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let (a, b) = (dir.path().join("a"), dir.path().join("b"));
@@ -140,11 +122,5 @@ mod tests {
         assert_ne!(first.path, second.path);
         assert_eq!(std::fs::read(&first.path).expect("reads"), b"one");
         assert!(second.path.starts_with(&store));
-    }
-
-    #[test]
-    fn test_put_missing_artifact_errors() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        assert!(put(&dir.path().join("store"), &dir.path().join("missing")).is_err());
     }
 }

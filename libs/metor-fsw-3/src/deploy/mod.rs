@@ -32,13 +32,13 @@ pub const DB_TYPE: &str = "fsw.db";
 pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Result<(), DeployError> {
     let plan = plan(envelope, tables)?;
     for (at, addr) in plan.transports {
-        system(envelope, at).params["transport"] = json!({ "connect": { "addr": addr } });
+        at.get_mut(envelope).params["transport"] = json!({ "connect": { "addr": addr } });
     }
     for ((at, output), def) in plan.outputs {
-        system(envelope, at).outputs[output].source = OutputSource::Def(def);
+        at.get_mut(envelope).outputs[output].source = OutputSource::Def(def);
     }
     for (at, ids) in plan.commands {
-        system(envelope, at).params["command_ids"] = json!(ids);
+        at.get_mut(envelope).params["command_ids"] = json!(ids);
     }
     check_ports(envelope)
 }
@@ -86,7 +86,7 @@ fn plan(envelope: &DeploymentConfig, tables: &[SystemTable]) -> Result<Plan, Dep
             };
             let from = index.name(at);
             let peer_at = index.locate(&from, &peer.target, &peer.link)?;
-            let port = listen_port(&peer_system(envelope, peer_at).params)
+            let port = listen_port(&peer_at.get(envelope).params)
                 .filter(|&port| port != 0)
                 .ok_or_else(|| DeployError::NotAListener {
                     from: from.clone(),
@@ -95,7 +95,7 @@ fn plan(envelope: &DeploymentConfig, tables: &[SystemTable]) -> Result<Plan, Dep
                 })?;
             plan.transports
                 .push((at, address(host(envelope, &peer.target), port)));
-            if peer_system(envelope, peer_at).ty == DB_TYPE {
+            if peer_at.get(envelope).ty == DB_TYPE {
                 let ids = commands.entry(peer_at).or_default();
                 for port in &index.def(at)?.outputs {
                     if let RecordSchema::Msg { id, .. } = &port.schema
@@ -137,15 +137,6 @@ fn check_ports(envelope: &DeploymentConfig) -> Result<(), DeployError> {
         }
     }
     Ok(())
-}
-
-/// The link a peer reference resolved to.
-fn peer_system(envelope: &DeploymentConfig, at: At) -> &crate::SystemConfig {
-    &envelope.targets[at.target].coordinator.systems[at.system]
-}
-
-fn system(envelope: &mut DeploymentConfig, at: At) -> &mut crate::SystemConfig {
-    &mut envelope.targets[at.target].coordinator.systems[at.system]
 }
 
 fn host<'a>(envelope: &'a DeploymentConfig, target: &str) -> &'a str {

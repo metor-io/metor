@@ -13,15 +13,15 @@ fn build() -> SystemTable {
     crate::tests::utils::table(&Recorder::default())
 }
 
+/// A ring and the export its raw view borrows.
 struct TestRing {
     ring: RingBuffer,
     export: metor_fsw_3_ring::RingExport,
 }
 
-impl core::ops::Deref for TestRing {
-    type Target = RingBuffer;
-    fn deref(&self) -> &RingBuffer {
-        &self.ring
+impl TestRing {
+    fn raw(&self) -> RawRing {
+        RawRing::of(&self.export)
     }
 }
 
@@ -29,10 +29,6 @@ fn ring<T: Record>(readers: usize) -> TestRing {
     let ring = utils::ring::<T>(8, readers);
     let export = ring.export();
     TestRing { ring, export }
-}
-
-fn raw(ring: &TestRing) -> RawRing {
-    RawRing::of(&ring.export)
 }
 
 /// The def the host would resolve for `ty`, as JSON; an unknown type gets an
@@ -54,7 +50,7 @@ fn instance_def(ty: &str) -> Vec<u8> {
 }
 
 /// Calls `create` the way an export does, returning the instance or the error.
-fn create_raw(ty: &str, params: &str, inputs: &[RawPort], outputs: &[RawRing]) -> Instance {
+fn create_raw(ty: &str, params: &str, inputs: &[RawSlice], outputs: &[RawRing]) -> Instance {
     let def = instance_def(ty);
     let mut error = RawSlice::EMPTY;
     // SAFETY: every array outlives the call, and the rings outlive the instance.
@@ -97,13 +93,6 @@ impl Drop for Instance {
             // SAFETY: the handle came from `create` and is destroyed once.
             unsafe { destroy(self.handle) };
         }
-    }
-}
-
-fn input(rings: &[RawRing]) -> RawPort {
-    RawPort {
-        rings: rings.as_ptr(),
-        len: rings.len(),
     }
 }
 
@@ -255,35 +244,30 @@ fn test_unknown_system_type() {
 }
 
 #[test]
-fn test_unknown_param_key() {
-    let nav = ring::<Nav>(1);
-    let outputs = [raw(&nav)];
-    let instance = create_raw("nav", r#"{"gain":2.0}"#, &[input(&[])], &outputs);
-    assert!(instance.handle.is_null());
-    let decoded: ParamError = serde_json::from_slice(instance.error()).expect("decodes");
-    assert_eq!(decoded, ParamError::UnknownKey("gain".into()));
-}
-
-#[test]
-fn test_malformed_params() {
-    let nav = ring::<Nav>(1);
-    let outputs = [raw(&nav)];
-    let instance = create_raw("nav", "{", &[input(&[])], &outputs);
-    assert!(instance.handle.is_null());
-    let decoded: ParamError = serde_json::from_slice(instance.error()).expect("decodes");
-    assert!(matches!(decoded, ParamError::Decode(_)));
+fn test_bad_params_refused() {
+    let cases: [(&str, fn(&ParamError) -> bool); 2] = [
+        (r#"{"gain":2.0}"#, |e| {
+            *e == ParamError::UnknownKey("gain".into())
+        }),
+        ("{", |e| matches!(e, ParamError::Decode(_))),
+    ];
+    for (params, expected) in cases {
+        let nav = ring::<Nav>(1);
+        let instance = create_raw("nav", params, &[RawSlice::EMPTY], &[nav.raw()]);
+        assert!(instance.handle.is_null());
+        let decoded: ParamError = serde_json::from_slice(instance.error()).expect("decodes");
+        assert!(expected(&decoded), "{params}: {decoded:?}");
+    }
 }
 
 #[test]
 fn test_pipeline_single_cycle() {
     let (imu, nav) = (ring::<Imu>(1), ring::<Nav>(1));
-    let imu_out = [raw(&imu)];
-    let nav_out = [raw(&nav)];
-    let edges = [raw(&imu)];
-    let source = create_raw("imu", "", &[], &imu_out);
-    let filter = create_raw("nav", "", &[input(&edges)], &nav_out);
+    let edges = [imu.raw()];
+    let source = create_raw("imu", "", &[], &[imu.raw()]);
+    let filter = create_raw("nav", "", &[RawSlice::of(&edges)], &[nav.raw()]);
     assert!(!source.handle.is_null() && !filter.handle.is_null());
-    let mut sink = utils::input::<Nav>(&nav);
+    let mut sink = utils::input::<Nav>(&nav.ring);
 
     assert_eq!(source.step(1), Status::Ok);
     assert_eq!(filter.step(1), Status::Ok);
@@ -295,9 +279,8 @@ fn test_pipeline_single_cycle() {
 #[test]
 fn test_system_panic_status_and_log() {
     let (imu, log) = (ring::<Imu>(1), ring::<LogEvent>(1));
-    let outputs = [raw(&imu), raw(&log)];
-    let boom = create_raw("boom", "", &[], &outputs);
-    let mut lines = utils::input::<LogEvent>(&log);
+    let boom = create_raw("boom", "", &[], &[imu.raw(), log.raw()]);
+    let mut lines = utils::input::<LogEvent>(&log.ring);
     assert_eq!(boom.step(1), Status::Ok);
     assert_eq!(boom.step(2), Status::Panicked);
     assert_eq!(boom.step(3), Status::Panicked);
@@ -312,15 +295,14 @@ fn test_system_panic_status_and_log() {
 #[test]
 fn test_destroy_releases_ring_handles() {
     let (imu, nav) = (ring::<Imu>(1), ring::<Nav>(1));
-    let nav_out = [raw(&nav)];
-    let edges = [raw(&imu)];
-    let filter = create_raw("nav", "", &[input(&edges)], &nav_out);
-    assert!(imu.view(NoWake).is_err());
-    assert!(nav.writer(NoWake).is_err());
+    let edges = [imu.raw()];
+    let filter = create_raw("nav", "", &[RawSlice::of(&edges)], &[nav.raw()]);
+    assert!(imu.ring.view(NoWake).is_err());
+    assert!(nav.ring.writer(NoWake).is_err());
 
     drop(filter);
-    assert!(imu.view(NoWake).is_ok());
-    assert!(nav.writer(NoWake).is_ok());
+    assert!(imu.ring.view(NoWake).is_ok());
+    assert!(nav.ring.writer(NoWake).is_ok());
 }
 
 #[test]

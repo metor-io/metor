@@ -157,7 +157,7 @@ pub use coordinator::{
     PeerPort, PortRef, RunState, Step, SystemConfig, SystemStatus, SystemTable,
 };
 pub use def::{DefCx, DefError, Records};
-pub use dl::{DlStep, Pack, PackError, PackFns};
+pub use dl::{DlStep, Pack, PackError};
 pub use fn_system::{
     AsyncSystemFn, Ctor, Cycle, FnAsyncSystem, FnSystem, InSet, OutSet, Param, ParamNames, Ports,
     SystemFn,

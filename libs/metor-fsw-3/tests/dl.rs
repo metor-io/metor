@@ -114,7 +114,12 @@ fn built(ty: &str, params: serde_json::Value) -> (Coordinator, Rc<RefCell<Vec<u3
 #[test]
 fn test_pack_reports_system_metadata() {
     let pack = open();
-    let types: Vec<_> = pack.systems().map(|s| s.ty.as_str()).collect();
+    let types: Vec<_> = pack
+        .descriptor()
+        .systems
+        .iter()
+        .map(|s| s.ty.as_str())
+        .collect();
     assert_eq!(
         types,
         vec![
@@ -133,11 +138,21 @@ fn test_pack_reports_system_metadata() {
         ]
     );
 
-    let tap = pack.systems().find(|s| s.ty == "tap").expect("tap");
+    let tap = pack
+        .descriptor()
+        .systems
+        .iter()
+        .find(|s| s.ty == "tap")
+        .expect("tap");
     assert!(tap.takes_inputs && !tap.takes_outputs);
     assert!(tap.def.inputs.is_empty());
 
-    let echo = pack.systems().find(|s| s.ty == "echo").expect("echo");
+    let echo = pack
+        .descriptor()
+        .systems
+        .iter()
+        .find(|s| s.ty == "echo")
+        .expect("echo");
     assert_eq!(echo.def.inputs[0].name, "input");
     assert_eq!(echo.def.inputs[0].record, Ping::NAME);
     assert_eq!(echo.def.inputs[0].id, Ping::ID);
@@ -146,7 +161,12 @@ fn test_pack_reports_system_metadata() {
     assert_eq!(outputs, vec!["output", "log"]);
     assert_eq!(echo.doc, "Copies the newest ping.");
 
-    let gain = pack.systems().find(|s| s.ty == "gain").expect("gain");
+    let gain = pack
+        .descriptor()
+        .systems
+        .iter()
+        .find(|s| s.ty == "gain")
+        .expect("gain");
     let schema = gain.params.as_deref().expect("gain takes params").get();
     assert!(schema.contains(r#""description":"Scales every ping.""#));
     assert!(echo.params.is_none());
