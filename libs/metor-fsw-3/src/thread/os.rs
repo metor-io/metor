@@ -5,20 +5,17 @@ mod group;
 #[cfg(test)]
 mod tests;
 
-use core::fmt::Write;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Weak};
 
-use metor_fsw_3_ring::{Config, NoWake, Notifier, RingBuffer, View, WakeSource, Writer};
+use metor_fsw_3_ring::{Config, NoWake, Notifier, RingBuffer};
 use metor_proto::types::Timestamp;
-use metor_proto_wkt::{LogEvent, LogLevel};
+use metor_proto_wkt::LogLevel;
 
 use crate::async_system::{AsyncSystem, Running, Stop};
 use crate::coordinator::{Adapter, EndReason, MakeCx, ParamError, Params, Step};
-use crate::fn_system::LOG_PORT;
-use crate::record::Record;
+use crate::mirror::{Mirror, Mirrors};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef, SystemInputs, SystemOutputs};
 
 use group::{GroupHandle, Member, Panicked};
@@ -111,30 +108,6 @@ where
 /// How much deeper a mirror ring is than the ring it mirrors.
 pub(crate) const MIRROR_FACTOR: usize = 4;
 
-/// Cycles between two drop reports; the counts accumulate between them.
-const DROP_REPORT_CYCLES: u64 = 100;
-
-/// One ring copied into another, and the records the destination refused.
-struct Mirror<W: WakeSource> {
-    port: Cow<'static, str>,
-    from: View<NoWake>,
-    into: Writer<W>,
-    dropped: u64,
-}
-
-impl<W: WakeSource> Mirror<W> {
-    /// Moves every waiting record, counting the ones that found no room.
-    fn drain(&mut self) {
-        for record in self.from.drain() {
-            let Ok(bytes) = record else { break };
-            if self.into.try_write(bytes).is_err() {
-                self.dropped += 1;
-            }
-        }
-        self.from.settle();
-    }
-}
-
 /// A `Thread` is the step an async system is bound as.
 ///
 /// Each cycle it drains the real input rings into the system's mirrors and the
@@ -143,36 +116,23 @@ impl<W: WakeSource> Mirror<W> {
 pub struct Thread {
     /// The real input rings into the mirrors the system reads, whose writers
     /// wake it, and the system's output mirrors into the real rings.
-    inputs: Vec<Mirror<Notifier>>,
-    outputs: Vec<Mirror<NoWake>>,
-    /// Which output is the system's `log`, where the adapter's lines go too.
-    log: Option<usize>,
-    line: Vec<u8>,
-    /// One field per port, written in place, so a drop report allocates nothing.
-    fields: Fields,
-    since_report: u64,
+    mirrors: Mirrors<Notifier>,
     panicked: Panicked,
     end: Option<EndReason>,
     group: Option<Arc<GroupHandle>>,
 }
 
-/// A log line's fields, as the adapter keeps them between cycles.
-type Fields = Vec<(Cow<'static, str>, Cow<'static, str>)>;
-
 impl Step for Thread {
     fn execute(&mut self, now: Timestamp) {
-        for mirror in self.inputs.iter_mut() {
-            mirror.drain();
-        }
-        for mirror in self.outputs.iter_mut() {
-            mirror.drain();
-        }
-        self.report_drops(now);
+        let _ = self.mirrors.drain_inputs();
+        let _ = self.mirrors.drain_outputs();
+        self.mirrors.report_drops(now);
         self.check_panic(now);
     }
 
     fn fault(&mut self, now: Timestamp, message: &str) {
-        self.write_line(now, LogLevel::Error, "panic", message);
+        self.mirrors
+            .write_line(now, LogLevel::Error, "panic", message);
     }
 
     fn ended(&self) -> Option<&EndReason> {
@@ -181,47 +141,6 @@ impl Step for Thread {
 }
 
 impl Thread {
-    /// One line per [`DROP_REPORT_CYCLES`], counting what every port dropped
-    /// since the last one.
-    fn report_drops(&mut self, now: Timestamp) {
-        self.since_report += 1;
-        if self.since_report < DROP_REPORT_CYCLES {
-            return;
-        }
-        self.since_report = 0;
-        if !self.take_drops() {
-            return;
-        }
-        let fields = core::mem::take(&mut self.fields);
-        let event = crate::log::line(
-            now,
-            LogLevel::Error,
-            "records dropped into a full mirror",
-            fields,
-        );
-        self.emit(&event);
-        self.fields = event.fields;
-    }
-
-    /// Writes each port's count into its own field, clearing the counts, and
-    /// reports whether any port dropped a record.
-    fn take_drops(&mut self) -> bool {
-        let inputs = self
-            .inputs
-            .iter_mut()
-            .map(|m| core::mem::take(&mut m.dropped));
-        let outputs = self
-            .outputs
-            .iter_mut()
-            .map(|m| core::mem::take(&mut m.dropped));
-        let mut dropped = false;
-        for ((_, field), count) in self.fields[1..].iter_mut().zip(inputs.chain(outputs)) {
-            dropped |= count > 0;
-            set_count(field, count);
-        }
-        dropped
-    }
-
     /// Latches the system off once its task has panicked, reporting it once.
     fn check_panic(&mut self, now: Timestamp) {
         if self.end.is_some() {
@@ -229,41 +148,10 @@ impl Thread {
         }
         if let Some(message) = self.panicked.take() {
             self.end = Some(EndReason::Panicked);
-            self.write_line(now, LogLevel::Error, "panic", &message);
+            self.mirrors
+                .write_line(now, LogLevel::Error, "panic", &message);
         }
     }
-
-    fn write_line(&mut self, now: Timestamp, level: LogLevel, kind: &'static str, message: &str) {
-        let fields = vec![(Cow::Borrowed("kind"), Cow::Borrowed(kind))];
-        self.emit(&crate::log::line(now, level, message.to_string(), fields));
-    }
-
-    /// Publishes one line on the system's own `log`, if it declares one.
-    fn emit(&mut self, event: &LogEvent) {
-        let Some(log) = self.log else { return };
-        let Ok(bytes) = event.encode(&mut self.line) else {
-            return;
-        };
-        let _ = self.outputs[log].into.try_write(bytes);
-    }
-}
-
-/// Writes `count` into a field's own buffer, which allocates nothing.
-fn set_count(value: &mut Cow<'static, str>, count: u64) {
-    let Cow::Owned(text) = value else { return };
-    text.clear();
-    // PANIC Safety: writing into a `String` cannot fail.
-    let _ = write!(text, "{count}");
-}
-
-/// One field per port, holding the count it dropped, in bind order.
-fn drop_fields<'a>(ports: impl Iterator<Item = &'a Cow<'static, str>>) -> Fields {
-    let kind = (Cow::Borrowed("kind"), Cow::Borrowed("mirror_dropped"));
-    let counts = ports.map(|port| {
-        let count = Cow::Owned(String::with_capacity(20));
-        (port.clone(), count)
-    });
-    core::iter::once(kind).chain(counts).collect()
 }
 
 /// The adapter for the cycle thread and the bindings the system's own thread
@@ -280,24 +168,14 @@ fn bind(
 ) -> Result<Bound, ParamError> {
     let (edges, bound_in) = bind_inputs(&def.inputs, inputs)?;
     let (copies, bound_out) = bind_outputs(&def.outputs, outputs)?;
-    let ports = edges
-        .iter()
-        .map(|mirror| &mirror.port)
-        .chain(copies.iter().map(|mirror| &mirror.port));
     let thread = Thread {
-        line: vec![0; LogEvent::MAX_LEN],
-        fields: drop_fields(ports),
-        since_report: 0,
-        log: log_port(def),
-        inputs: edges,
-        outputs: copies,
+        mirrors: Mirrors::new(def, edges, copies),
         panicked: Panicked::default(),
         end: None,
         group: None,
     };
     Ok((thread, bound_in, bound_out))
 }
-
 fn bind_inputs(
     ports: &[PortDef],
     inputs: Vec<Vec<&RingBuffer>>,
@@ -356,20 +234,5 @@ fn mirror(real: &RingBuffer) -> Result<RingBuffer, ParamError> {
 
 /// The geometry of a mirror of a ring of `capacity` bytes.
 fn mirror_config(capacity: usize) -> Result<Config, ParamError> {
-    let too_large = ParamError::MirrorTooLarge { capacity };
-    let config = Config {
-        capacity: capacity
-            .checked_mul(MIRROR_FACTOR)
-            .ok_or(too_large.clone())?,
-        max_readers: 1,
-    };
-    metor_fsw_3_ring::checked_region_len(&config).ok_or(too_large)?;
-    Ok(config)
-}
-
-/// The index of the system's `log` output, which is where its lines go.
-fn log_port(def: &SystemDef) -> Option<usize> {
-    def.outputs
-        .iter()
-        .position(|port| port.name == LOG_PORT && port.id == LogEvent::ID)
+    crate::mirror::mirror_config(capacity, MIRROR_FACTOR)
 }

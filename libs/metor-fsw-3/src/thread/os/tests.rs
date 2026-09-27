@@ -44,7 +44,7 @@ fn test_mirror_drain_snapshot() {
         },
         dropped: 0,
     };
-    mirror.drain();
+    mirror.drain().expect("whole records");
     assert_eq!(
         received
             .drain()

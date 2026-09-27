@@ -145,6 +145,8 @@ pub mod frame;
 #[cfg(feature = "host")]
 pub mod link;
 pub mod log;
+#[cfg(all(feature = "threads", not(target_family = "wasm")))]
+mod mirror;
 pub mod pack;
 mod panic;
 pub mod port;
