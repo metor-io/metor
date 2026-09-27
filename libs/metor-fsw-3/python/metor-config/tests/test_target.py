@@ -450,9 +450,6 @@ class LinkTest(unittest.TestCase):
         self.assertNotIn("thread", systems[1])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 def slotted() -> tuple[Target, dict[str, dict]]:
     """Commands, a plain channel, a slot, and a registry, by system id."""
@@ -583,3 +580,7 @@ class ChannelTest(unittest.TestCase):
         )
         self.assertEqual(params["period"], 50)
         self.assertEqual(systems["channels"]["ty"], "fsw.channel_registry")
+
+
+if __name__ == "__main__":
+    unittest.main()

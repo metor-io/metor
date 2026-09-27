@@ -1,4 +1,4 @@
-error: `#[system]` goes on a free fn; see docs/plans/11-fn-systems.md
+error: `#[system]` goes on a free fn
  --> tests/ui/system_on_impl.rs:6:6
   |
 6 | impl Counter {

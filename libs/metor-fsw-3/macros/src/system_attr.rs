@@ -41,7 +41,7 @@ fn expand(item: TokenStream2, fsw: &TokenStream2, kind: Kind) -> TokenStream2 {
         Ok(Item::Impl(block)) => {
             let err = syn::Error::new_spanned(
                 &block.self_ty,
-                "`#[system]` goes on a free fn; see docs/plans/11-fn-systems.md",
+                "`#[system]` goes on a free fn",
             );
             with_error(block, err)
         }

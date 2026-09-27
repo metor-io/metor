@@ -1,4 +1,4 @@
-# The target-config recorder for metor-fsw-3 (docs/plans/04-packs.md).
+# The target-config recorder for metor-fsw-3.
 #
 # A target file builds a `Target`, and `emit()` writes the coordinator config
 # `metor run` reads. Stdlib only.
