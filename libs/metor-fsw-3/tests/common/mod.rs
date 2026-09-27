@@ -77,6 +77,40 @@ pub fn fixture_lib() -> &'static Path {
     })
 }
 
+/// Builds the fixture as a module once per test binary and returns its bytes.
+pub fn fixture_wasm() -> &'static [u8] {
+    static BUILT: OnceLock<Vec<u8>> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let path = wasm_build("echo-pack");
+        std::fs::read(&path).expect("the module was written")
+    })
+}
+
+/// Builds `package` for wasm32, importing its memory, and returns the module.
+fn wasm_build(package: &str) -> PathBuf {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["rustc", "-p", package, "--target", "wasm32-unknown-unknown"])
+        .args(["--release", "--message-format=json", "--"])
+        .args(["-C", "link-arg=--import-memory"])
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("cargo runs");
+    assert!(output.status.success(), "the module builds");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let module = stdout.lines().rev().find_map(|line| {
+        let message: serde_json::Value = serde_json::from_str(line).ok()?;
+        let names = message["filenames"].as_array()?;
+        let name = names
+            .iter()
+            .filter_map(|name| name.as_str())
+            .find(|name| name.ends_with(".wasm"))?;
+        Some(PathBuf::from(name))
+    });
+    module.expect("cargo reported a module")
+}
+
 pub fn metor() -> Command {
     Command::new(env!("CARGO_BIN_EXE_metor"))
 }

@@ -50,6 +50,10 @@ pub enum WasmError {
     OutOfBounds { offset: u32, len: usize },
     #[error("guest offset {0} is not 16-byte aligned")]
     Misaligned(u32),
+    #[error("the guest allocator refused {0} bytes")]
+    Alloc(u32),
+    #[error("{0} bytes do not fit the guest")]
+    TooLarge(usize),
 }
 
 /// Why a call stopped short.
@@ -166,13 +170,17 @@ pub struct Guest {
 
 impl Guest {
     /// Instantiates `module` over a fresh memory of at most `ceiling` bytes,
-    /// rounded up to whole pages.
-    pub fn new(module: &Module, ceiling: usize) -> Result<Guest, WasmError> {
+    /// rounded up to whole pages. Instantiation copies the module's data in
+    /// under a grant of `fuel`.
+    pub fn new(module: &Module, ceiling: usize, fuel: u64) -> Result<Guest, WasmError> {
         let ty = module.memory_import()?;
         let arena = Arena::new(ceiling)?;
         let ty = bounded(ty, &arena)?;
         let mut store = Store::new(module.0.engine(), limits());
         store.limiter(|limits| limits);
+        store
+            .set_fuel(fuel)
+            .map_err(|e| WasmError::Instantiate(e.to_string()))?;
         // SAFETY: the store is the only user of these bytes from here, and it
         // is dropped before `arena` frees them: on an error below by
         // declaration order, and in `Guest`'s `Drop` after that.

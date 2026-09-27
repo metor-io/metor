@@ -1,4 +1,8 @@
+use super::abi::raw_slice;
 use super::*;
+use crate::ABI_VERSION;
+use crate::dl::PackError;
+use crate::dl::codec::DESCRIPTOR_CAPACITY;
 
 /// A module exporting every ABI function over `memory`, with `extra` beside
 /// them and `execute` as `metor_fsw_execute`'s body.
@@ -23,7 +27,7 @@ fn compile(text: &str) -> Module {
 }
 
 fn guest(memory: &str, extra: &str, execute: &str, ceiling: usize) -> Guest {
-    Guest::new(&compile(&wat(memory, extra, execute)), ceiling).expect("instantiates")
+    Guest::new(&compile(&wat(memory, extra, execute)), ceiling, 10_000).expect("instantiates")
 }
 
 #[test]
@@ -51,7 +55,7 @@ fn test_store_past_memory_traps_and_spares_the_arena() {
 fn test_minimum_over_ceiling_is_refused() {
     let module = compile(&wat("17", "", "i32.const 0"));
     assert!(matches!(
-        Guest::new(&module, 16 * PAGE),
+        Guest::new(&module, 16 * PAGE, 10_000),
         Err(WasmError::MemoryTooSmall { .. })
     ));
 }
@@ -83,7 +87,7 @@ fn test_missing_export_is_named() {
         "",
     );
     assert!(matches!(
-        Guest::new(&compile(&text), PAGE),
+        Guest::new(&compile(&text), PAGE, 10_000),
         Err(WasmError::MissingExport("metor_fsw_alloc"))
     ));
 }
@@ -95,7 +99,7 @@ fn test_wrong_signature_is_named() {
         r#"(func (export "metor_fsw_free") (param i32))"#,
     );
     assert!(matches!(
-        Guest::new(&compile(&text), PAGE),
+        Guest::new(&compile(&text), PAGE, 10_000),
         Err(WasmError::Signature("metor_fsw_free"))
     ));
 }
@@ -105,7 +109,7 @@ fn test_memory_import_required() {
     let text =
         wat("1", "", "i32.const 0").replace(r#"(import "env" "memory" (memory 1))"#, "(memory 1)");
     assert!(matches!(
-        Guest::new(&compile(&text), PAGE),
+        Guest::new(&compile(&text), PAGE, 10_000),
         Err(WasmError::MemoryImport)
     ));
 }
@@ -114,7 +118,7 @@ fn test_memory_import_required() {
 fn test_bad_ceiling() {
     let module = compile(&wat("0", "", "i32.const 0"));
     assert!(matches!(
-        Guest::new(&module, 0),
+        Guest::new(&module, 0, 10_000),
         Err(WasmError::BadCeiling(0))
     ));
 }
@@ -158,4 +162,52 @@ fn test_calls_reach_each_export() {
     };
     assert_eq!(guest.pack_def(out, 1_000), Ok(0));
     assert_eq!(guest.def(0, 0, out, 1_000), Ok(0));
+}
+
+const FUEL: Fuel = Fuel {
+    step: 10_000,
+    setup: 10_000,
+};
+
+fn open(text: &str) -> Result<WasmPack, PackError> {
+    WasmPack::open(&wat::parse_str(text).expect("valid wat"), PAGE, FUEL)
+}
+
+#[test]
+fn test_wrong_abi_is_mismatch() {
+    let text = wat("1", "", "i32.const 0")
+        .replace("(result i32) i32.const 9)", "(result i32) i32.const 1)");
+    assert!(matches!(
+        open(&text),
+        Err(PackError::AbiMismatch {
+            found: 1,
+            expected: ABI_VERSION
+        })
+    ));
+}
+
+#[test]
+fn test_missing_export_is_missing_symbol() {
+    let text = wat("1", "", "i32.const 0").replace(
+        r#"(func (export "metor_fsw_pack_def") (param i32 i32 i32) (result i32) i32.const 0)"#,
+        "",
+    );
+    assert!(matches!(
+        open(&text),
+        Err(PackError::MissingSymbol("metor_fsw_pack_def"))
+    ));
+}
+
+#[test]
+fn test_refused_allocation_fails_open() {
+    let capacity = DESCRIPTOR_CAPACITY as u32;
+    assert!(matches!(
+        open(&wat("1", "", "i32.const 0")),
+        Err(PackError::Wasm(WasmError::Alloc(len))) if len == capacity
+    ));
+}
+
+#[test]
+fn test_raw_slice_layout() {
+    assert_eq!(raw_slice(0x0403_0201, 5), [1, 2, 3, 4, 5, 0, 0, 0]);
 }

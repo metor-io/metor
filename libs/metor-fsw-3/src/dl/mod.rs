@@ -1,6 +1,6 @@
 //! Loading packs: the systems a pack exports, registered into a table.
 
-mod codec;
+pub(crate) mod codec;
 mod pack;
 pub mod slot;
 pub mod store;
@@ -13,6 +13,7 @@ use crate::coordinator::{BuildError, ParamError, Step, SystemTable, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::pack::def::{Instance, PackDef, PackSystemDef};
 use crate::system::SystemDef;
+use crate::wasm::{Trap, WasmError};
 
 pub(crate) use pack::is_loaded;
 pub use pack::{DlPack, DlStep};
@@ -32,6 +33,19 @@ pub enum PackError {
     DescriptorTooLarge { capacity: usize },
     #[error("pack descriptor export failed with status {0}")]
     DescriptorStatus(u32),
+    #[error("the module: {0}")]
+    Wasm(WasmError),
+    #[error("the module trapped: {0}")]
+    Trap(#[from] Trap),
+}
+
+impl From<WasmError> for PackError {
+    fn from(error: WasmError) -> Self {
+        match error {
+            WasmError::MissingExport(name) => PackError::MissingSymbol(name),
+            error => PackError::Wasm(error),
+        }
+    }
 }
 
 /// The type a `DlSlot` registers as.
