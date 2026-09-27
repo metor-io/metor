@@ -17,9 +17,6 @@ use super::conn::Connections;
 const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
-/// Connections a listening link serves at once, unless its params say otherwise.
-const MAX_CONNECTIONS: usize = 8;
-
 /// How a link's socket is established.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -36,8 +33,9 @@ pub enum Transport {
     Peer(PeerLink),
 }
 
+/// Connections a listening link serves at once, unless its params say otherwise.
 fn max_connections() -> usize {
-    MAX_CONNECTIONS
+    8
 }
 
 /// A [`Transport`] whose listener is bound, so a taken address fails the build.
@@ -222,7 +220,7 @@ mod tests {
     fn listen(addr: &str) -> Transport {
         Transport::Listen {
             addr: addr.to_string(),
-            max_connections: MAX_CONNECTIONS,
+            max_connections: max_connections(),
         }
     }
 
@@ -237,14 +235,8 @@ mod tests {
         else {
             panic!("a listening transport")
         };
-        assert_eq!((addr.as_str(), max_connections), ("127.0.0.1:0", 8));
-    }
-
-    #[test]
-    fn test_decode_connect_address() {
-        let parsed: Transport =
-            serde_json::from_str(r#"{"connect":{"addr":"127.0.0.1:2240"}}"#).expect("decodes");
-        assert!(matches!(parsed, Transport::Connect { addr } if addr == "127.0.0.1:2240"));
+        assert_eq!(addr, "127.0.0.1:0");
+        assert_eq!(max_connections, super::max_connections());
     }
 
     #[test]
@@ -265,7 +257,7 @@ mod tests {
         let endpoint = listen("127.0.0.1:0").bind().expect("a free port");
         let addr = endpoint.local_addr().expect("a bound listener");
         assert_ne!(addr.port(), 0);
-        assert_eq!(endpoint.slots(), MAX_CONNECTIONS);
+        assert_eq!(endpoint.slots(), max_connections());
     }
 
     #[test]

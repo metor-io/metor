@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use futures_lite::future;
 use metor_fsw_3_ring::Notifier;
-use metor_proto::types::{PacketId, Timestamp};
+use metor_proto::types::PacketId;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -18,7 +18,7 @@ use super::conn::{self, Connections, Event};
 use super::inbox::Inbox;
 use super::transport::{Endpoint, Transport, source};
 use super::wire;
-use super::{LinkStatus, default_conn_cap};
+use super::{LinkStatus, default_conn_cap, report};
 
 /// What a `Publish` is configured with.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -38,9 +38,7 @@ pub struct PublishParams {
 /// Serves every record its config wires into it over metor-proto.
 pub struct Publish {
     endpoint: Option<Endpoint>,
-    namespace: Option<String>,
-    link: String,
-    conn_cap: usize,
+    params: PublishParams,
 }
 
 impl Publish {
@@ -50,9 +48,7 @@ impl Publish {
         super::record_bound(&params.link, &endpoint);
         Ok(Self {
             endpoint: Some(endpoint),
-            namespace: params.namespace,
-            link: params.link,
-            conn_cap: params.conn_cap,
+            params,
         })
     }
 }
@@ -67,7 +63,13 @@ pub async fn publish(
     stop: Stop,
 ) {
     let defs: Vec<PortDef> = inputs.iter_mut().map(|(def, _)| def.clone()).collect();
-    let (blob, ids) = wire::announce(&defs, s.namespace.as_deref(), &s.link);
+    let PublishParams {
+        namespace,
+        link,
+        conn_cap,
+        ..
+    } = &s.params;
+    let (blob, ids) = wire::announce(&defs, namespace.as_deref(), link);
     report_collisions(log, &defs, &ids);
     // PANIC Safety: a system runs once, and the endpoint is the bind's.
     let endpoint = s.endpoint.take().expect("one run per instance");
@@ -75,10 +77,10 @@ pub async fn publish(
         log.info(format!("listening on {addr}"));
     }
     let inbox = Rc::new(Inbox::blackhole());
-    let conns = Rc::new(Connections::new(endpoint.slots(), s.conn_cap, blob, inbox));
+    let conns = Rc::new(Connections::new(endpoint.slots(), *conn_cap, blob, inbox));
     let _source = stellarator::spawn(source(endpoint, conns.clone(), stop.clone())).drop_guard();
-    let mut batch = Vec::with_capacity(s.conn_cap);
-    let mut reported = LinkStatus::new(Timestamp(0), Default::default(), 0);
+    let mut batch = Vec::with_capacity(*conn_cap);
+    let mut reported = LinkStatus::default();
     loop {
         let input_ready = async {
             inputs.any_ready().await;
@@ -88,7 +90,7 @@ pub async fn publish(
         match event {
             Event::Ready => {
                 batch.clear();
-                fill(&mut batch, inputs, &ids, s.conn_cap);
+                fill(&mut batch, inputs, &ids, *conn_cap);
                 if !batch.is_empty() {
                     conns.enqueue(&batch);
                 }
@@ -96,11 +98,8 @@ pub async fn publish(
             Event::Changed => {}
             Event::Stop => return,
         }
-        let status = LinkStatus::new(Timestamp::now(), conns.stats(), 0);
-        if status.changed(&reported) {
-            let _ = link_status.write(&status);
-            reported = status;
-        }
+        let status = LinkStatus::new(conns.stats(), 0);
+        report(&status, &mut reported, link_status, log);
     }
 }
 
@@ -148,7 +147,6 @@ mod tests {
     use zerocopy::IntoBytes;
 
     use crate::DefCx;
-    use crate::link::DEFAULT_CONN_CAP;
     use crate::port::Input;
     use crate::record::Record;
     use crate::system::{InputBinding, SystemInputs};
@@ -206,7 +204,7 @@ mod tests {
         produce(&rings, 4.0);
 
         let mut batch = Vec::new();
-        fill(&mut batch, &mut inputs, &ids, DEFAULT_CONN_CAP);
+        fill(&mut batch, &mut inputs, &ids, default_conn_cap());
         let (table, msg) = (ids[0].expect("a table id"), ids[1].expect("a message id"));
         assert_eq!(batch.len(), IMU_LEN + FIXED_LEN);
         assert_eq!(&batch[4..5], &[PacketTy::Table as u8]);
@@ -221,10 +219,10 @@ mod tests {
         let mut inputs = ports(&rings);
         produce(&rings, 1.0);
         let mut batch = Vec::new();
-        fill(&mut batch, &mut inputs, &[None, None], DEFAULT_CONN_CAP);
+        fill(&mut batch, &mut inputs, &[None, None], default_conn_cap());
         assert!(batch.is_empty());
         produce(&rings, 2.0);
-        fill(&mut batch, &mut inputs, &[None, None], DEFAULT_CONN_CAP);
+        fill(&mut batch, &mut inputs, &[None, None], default_conn_cap());
         assert!(batch.is_empty());
     }
 

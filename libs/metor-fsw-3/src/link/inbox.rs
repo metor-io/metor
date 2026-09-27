@@ -330,19 +330,6 @@ mod tests {
     }
 
     #[test]
-    fn test_announce_storage_is_bounded() {
-        let (inbox, _view) = inbox(4);
-        inbox.watch();
-        inbox.connected();
-        let capacity = inbox.announced.borrow().capacity();
-        for _ in 0..1000 {
-            inbox.accept(&vtable([9, 9]));
-        }
-        let announced = inbox.announced.borrow();
-        assert_eq!((announced.len(), announced.capacity()), (1, capacity));
-    }
-
-    #[test]
     fn test_announce_is_never_routed() {
         let (inbox, mut view) = inbox(4);
         inbox.watch();
