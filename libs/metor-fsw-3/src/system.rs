@@ -148,14 +148,14 @@ impl<W: WakeSource> SystemOutputs<W> for () {
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, RingBuffer};
+    use metor_fsw_3_ring::RingBuffer;
     use metor_proto::types::Timestamp;
 
     use super::*;
+    use crate::Record;
     use crate::def::DefCx;
-    use crate::port::{Input, Output, ring_capacity};
-    use crate::tests::utils::{Imu, ImuPair, Nav, static_inputs, static_outputs};
-    use crate::{Frame, Record};
+    use crate::port::{Input, Output};
+    use crate::tests::utils::{Imu, ImuPair, Nav, output, ring, static_inputs, static_outputs};
 
     #[derive(crate::SystemInputs)]
     struct DerivedIn {
@@ -212,13 +212,6 @@ mod tests {
     #[derive(crate::SystemOutputs)]
     struct DerivedOut {
         nav: Output<Nav>,
-    }
-
-    fn ring<F: Frame>() -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(F::MAX_LEN, 4).expect("valid capacity"),
-            max_readers: 2,
-        })
     }
 
     #[test]
@@ -289,12 +282,12 @@ mod tests {
 
     #[test]
     fn test_bind_field_order() {
-        let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
+        let (imu, nav) = (ring::<Imu>(4, 2), ring::<Nav>(4, 2));
         let mut bound = DerivedIn::bind(bound_in(vec![
             (Input::<Imu>::def(&DefCx::empty(), "imu"), vec![&imu]),
             (Input::<Nav>::def(&DefCx::empty(), "nav"), vec![&nav]),
         ]));
-        let imu_out = Output::<Imu>::new(imu.writer(NoWake).expect("free writer"));
+        let imu_out = output::<Imu>(&imu);
         imu_out.write(&Imu::new(1, 5.0)).expect("ring has room");
         assert_eq!(
             bound.imu.latest().expect("valid").expect("record").sample,
@@ -305,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_manual_bundle_binding() {
-        let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
+        let (imu, nav) = (ring::<Imu>(4, 2), ring::<Nav>(4, 2));
         let out = DerivedOut::bind(bound_out(vec![(
             Output::<Nav>::def(&DefCx::empty(), "nav"),
             &nav,
@@ -357,7 +350,7 @@ mod tests {
             }]
         );
 
-        let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
+        let (imu, nav) = (ring::<Imu>(4, 2), ring::<Nav>(4, 2));
         let mut bound = DynInputs::bind(bound_in(vec![
             (Input::<Imu>::def(&DefCx::empty(), "plant.imu"), vec![&imu]),
             (Input::<Nav>::def(&DefCx::empty(), "nav.nav"), vec![&nav]),

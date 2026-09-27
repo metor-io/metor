@@ -865,10 +865,9 @@ async fn test_subscribe_skips_large_announce() {
         "src.ping",
         PortRef::new("src", "ping"),
     );
-    publish.inputs.push(InputConfig {
-        port: "wide.wide".into(),
-        from: vec![PortRef::new("wide", "wide")],
-    });
+    publish
+        .inputs
+        .push(InputConfig::new("wide.wide", "wide", "wide"));
     publish.params = json!({
         "transport": { "listen": { "addr": "127.0.0.1:0" } },
         "link": "pub-wide",

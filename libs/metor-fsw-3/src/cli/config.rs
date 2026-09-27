@@ -103,7 +103,7 @@ mod tests {
     use serde::Deserialize;
 
     use super::*;
-    use crate::coordinator::SystemTable;
+    use crate::coordinator::{BuildError, SystemTable};
     use crate::{Input, JsonSchema, Output, Record, system};
 
     /// One record for every port here: the build only compares ids across an
@@ -149,19 +149,15 @@ mod tests {
     /// The four `adcs.*` types the golden names, plus the links it adds.
     fn table() -> SystemTable {
         let mut table = SystemTable::new();
-        crate::link::register_builtins(&mut table).expect("valid records");
-        table
-            .register("adcs.plant", plant(), |_: Altitude| ())
-            .expect("valid records");
-        table
-            .register("adcs.nav", nav(), |_: Gain| ())
-            .expect("valid records");
-        table
-            .register("adcs.mode", mode(), Default::default)
-            .expect("valid records");
-        table
-            .register("adcs.ctrl", ctrl(), Default::default)
-            .expect("valid records");
+        let mut register = || -> Result<(), BuildError> {
+            crate::link::register_builtins(&mut table)?;
+            table.register("adcs.plant", plant(), |_: Altitude| ())?;
+            table.register("adcs.nav", nav(), |_: Gain| ())?;
+            table.register("adcs.mode", mode(), Default::default)?;
+            table.register("adcs.ctrl", ctrl(), Default::default)?;
+            Ok(())
+        };
+        register().expect("valid records");
         table
     }
 

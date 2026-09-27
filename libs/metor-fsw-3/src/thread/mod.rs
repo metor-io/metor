@@ -180,17 +180,12 @@ impl Thread {
             return;
         }
         let fields = core::mem::take(&mut self.fields);
-        let event = LogEvent {
-            timestamp: now,
-            level: LogLevel::Error,
-            source: Cow::Borrowed(""),
-            target: Cow::Borrowed(""),
-            message: Cow::Borrowed("records dropped into a full mirror"),
-            span: None,
+        let event = crate::log::line(
+            now,
+            LogLevel::Error,
+            "records dropped into a full mirror",
             fields,
-            file: None,
-            line: None,
-        };
+        );
         self.emit(&event);
         self.fields = event.fields;
     }
@@ -227,17 +222,8 @@ impl Thread {
     }
 
     fn write_line(&mut self, now: Timestamp, level: LogLevel, kind: &'static str, message: &str) {
-        self.emit(&LogEvent {
-            timestamp: now,
-            level,
-            source: Cow::Borrowed(""),
-            target: Cow::Borrowed(""),
-            message: message.to_string().into(),
-            span: None,
-            fields: vec![(Cow::Borrowed("kind"), Cow::Borrowed(kind))],
-            file: None,
-            line: None,
-        });
+        let fields = vec![(Cow::Borrowed("kind"), Cow::Borrowed(kind))];
+        self.emit(&crate::log::line(now, level, message.to_string(), fields));
     }
 
     /// Publishes one line on the system's own `log`, if it declares one.

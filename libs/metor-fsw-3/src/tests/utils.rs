@@ -11,16 +11,17 @@ use metor_proto_wkt::LogEvent;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use metor_fsw_3_ring::Notifier;
+use metor_fsw_3_ring::{Config, NoWake, Notifier, RingBuffer};
 
 use crate::async_system::Stop;
 use crate::def::{DefCx, DefError};
-use crate::port::{DynInputs, DynOutputs, Input, Output};
+use crate::port::{DynInputs, DynOutputs, Input, Output, ring_capacity};
+use crate::record::Record;
 use crate::system::{System, SystemDef};
 use crate::{Frame, SystemInputs, SystemOutputs};
 
 use crate::coordinator::{
-    CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemStatus, SystemTable,
+    BuildError, CoordinatorConfig, InputConfig, SystemConfig, SystemStatus, SystemTable,
 };
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
@@ -305,6 +306,34 @@ fn boom(#[state] s: &mut Boom, imu: &mut Output<Imu>, now: Timestamp) {
 }
 
 /// A cyclic type's ports under the empty context.
+/// A ring of `depth` records of `max_len` bytes with `readers` reader slots.
+pub fn ring_of(max_len: usize, depth: usize, readers: usize) -> RingBuffer {
+    RingBuffer::create_in_memory(Config {
+        capacity: ring_capacity(max_len, depth).expect("valid capacity"),
+        max_readers: readers,
+    })
+}
+
+/// A ring of `depth` `T` records with `readers` reader slots.
+pub fn ring<T: Record + ?Sized>(depth: usize, readers: usize) -> RingBuffer {
+    ring_of(T::MAX_LEN, depth, readers)
+}
+
+pub fn input<T: Record + ?Sized>(ring: &RingBuffer) -> Input<T> {
+    Input::new(vec![ring.view(NoWake).expect("free slot")])
+}
+
+pub fn output<T: Record + ?Sized>(ring: &RingBuffer) -> Output<T> {
+    Output::new(ring.writer(NoWake).expect("free writer"))
+}
+
+/// A one-reader ring of `depth` `T` records and both its ports.
+pub fn pair<T: Record + ?Sized>(depth: usize) -> (RingBuffer, Output<T>, Input<T>) {
+    let ring = ring::<T>(depth, 1);
+    let (output, input) = (output(&ring), input(&ring));
+    (ring, output, input)
+}
+
 pub fn static_def<S: System>() -> SystemDef {
     S::def(&DefCx::empty()).expect("a static definition")
 }
@@ -481,62 +510,34 @@ pub struct NoParams {}
 /// Every system type the coordinator tests name, recording into `recorder`.
 pub fn table(recorder: &Recorder) -> SystemTable {
     let mut table = SystemTable::new();
-    table
-        .register_system("imu", |_| Ok((ImuSource, 0)))
-        .expect("valid records");
-    table
-        .register_system("imu_offset", |_| Ok((ImuOffset, 0)))
-        .expect("valid records");
-    table
-        .register_system("nav", |p| p.decode::<NoParams>().map(|_| (NavFilter, ())))
-        .expect("valid records");
-    let control = recorder.clone();
-    table
-        .register_system("control", move |_| Ok((ControlLaw, control.clone())))
-        .expect("valid records");
-    let watch = recorder.clone();
-    table
-        .register_system("status_watch", move |_| Ok((StatusWatch, watch.clone())))
-        .expect("valid records");
-    table
-        .register_system("reserved", |_| Ok((Reserved, ())))
-        .expect("valid records");
-    table
-        .register("boom", boom(), Boom::default)
-        .expect("valid records");
-    table
-        .register_system("trap", |_| Ok((Trap, ())))
-        .expect("valid records");
-    let logs = recorder.clone();
-    table
-        .register("log_sink", log_sink(), move || LogSink(logs.clone()))
-        .expect("valid records");
-    let taps = recorder.clone();
-    table
-        .register("tap", tap(), move || Tap(taps.clone()))
-        .expect("valid records");
-    table
-        .register("emit", emit(), || {
+    let mut register = || -> Result<(), BuildError> {
+        table.register_system("imu", |_| Ok((ImuSource, 0)))?;
+        table.register_system("imu_offset", |_| Ok((ImuOffset, 0)))?;
+        table.register_system("nav", |p| p.decode::<NoParams>().map(|_| (NavFilter, ())))?;
+        let control = recorder.clone();
+        table.register_system("control", move |_| Ok((ControlLaw, control.clone())))?;
+        let watch = recorder.clone();
+        table.register_system("status_watch", move |_| Ok((StatusWatch, watch.clone())))?;
+        table.register_system("reserved", |_| Ok((Reserved, ())))?;
+        table.register("boom", boom(), Boom::default)?;
+        table.register_system("trap", |_| Ok((Trap, ())))?;
+        let logs = recorder.clone();
+        table.register("log_sink", log_sink(), move || LogSink(logs.clone()))?;
+        let taps = recorder.clone();
+        table.register("tap", tap(), move || Tap(taps.clone()))?;
+        table.register("emit", emit(), || {
             Emit(Imu::new(1, 5.0).as_bytes().to_vec())
-        })
-        .expect("valid records");
-    table
-        .register_async("relay", relay(), Default::default)
-        .expect("valid records");
-    table
-        .register_async("sleeper", sleeper(), Default::default)
-        .expect("valid records");
-    table
-        .register_async("async_boom", async_boom(), Default::default)
-        .expect("valid records");
-    table
-        .register_async("ctor_boom", async_boom(), || -> () {
+        })?;
+        table.register_async("relay", relay(), Default::default)?;
+        table.register_async("sleeper", sleeper(), Default::default)?;
+        table.register_async("async_boom", async_boom(), Default::default)?;
+        table.register_async("ctor_boom", async_boom(), || -> () {
             panic!("a constructor that panics")
-        })
-        .expect("valid records");
-    table
-        .register_async("who_am_i", who_am_i(), Default::default)
-        .expect("valid records");
+        })?;
+        table.register_async("who_am_i", who_am_i(), Default::default)?;
+        Ok(())
+    };
+    register().expect("valid records");
     table
 }
 
@@ -546,17 +547,11 @@ pub fn pipeline_config() -> CoordinatorConfig {
         systems: vec![
             SystemConfig::new("imu", "imu"),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "imu".into(),
-                    from: vec![PortRef::new("imu", "imu")],
-                }],
+                inputs: vec![InputConfig::new("imu", "imu", "imu")],
                 ..SystemConfig::new("nav", "nav")
             },
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "nav".into(),
-                    from: vec![PortRef::new("nav", "nav")],
-                }],
+                inputs: vec![InputConfig::new("nav", "nav", "nav")],
                 ..SystemConfig::new("control", "control")
             },
         ],

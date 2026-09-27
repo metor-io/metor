@@ -143,16 +143,16 @@ fn fill(
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, RingBuffer};
+    use metor_fsw_3_ring::RingBuffer;
     use metor_proto::types::PacketTy;
     use zerocopy::IntoBytes;
 
     use crate::DefCx;
     use crate::link::DEFAULT_CONN_CAP;
-    use crate::port::{Input, ring_capacity};
+    use crate::port::Input;
     use crate::record::Record;
     use crate::system::{InputBinding, SystemInputs};
-    use crate::tests::utils::{Fixed, Imu};
+    use crate::tests::utils::{Fixed, Imu, ring};
 
     use super::*;
 
@@ -160,13 +160,6 @@ mod tests {
     const IMU_LEN: usize = wire::PACKET_OVERHEAD + Imu::MAX_LEN;
     // Postcard's varint for `a` plus eight bytes of `b`.
     const FIXED_LEN: usize = wire::PACKET_OVERHEAD + 9;
-
-    fn ring<R: Record>() -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(R::MAX_LEN, 8).expect("valid capacity"),
-            max_readers: 2,
-        })
-    }
 
     /// Two ports, an `Imu` frame and a `Fixed` message, over their own rings.
     fn ports(rings: &[RingBuffer; 2]) -> DynInputs<Notifier> {
@@ -206,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_batch_encodes_records() {
-        let rings = [ring::<Imu>(), ring::<Fixed>()];
+        let rings = [ring::<Imu>(8, 2), ring::<Fixed>(8, 2)];
         let mut inputs = ports(&rings);
         let defs: Vec<PortDef> = inputs.iter_mut().map(|(def, _)| def.clone()).collect();
         let (_, ids) = wire::announce(&defs, Some("cube_sat"), "pub");
@@ -224,7 +217,7 @@ mod tests {
 
     #[test]
     fn test_drain_colliding_port() {
-        let rings = [ring::<Imu>(), ring::<Fixed>()];
+        let rings = [ring::<Imu>(8, 2), ring::<Fixed>(8, 2)];
         let mut inputs = ports(&rings);
         produce(&rings, 1.0);
         let mut batch = Vec::new();
@@ -237,7 +230,7 @@ mod tests {
 
     #[test]
     fn test_stalled_mirror_fills_to_cap_over_several_batches() {
-        let rings = [ring::<Imu>(), ring::<Fixed>()];
+        let rings = [ring::<Imu>(8, 2), ring::<Fixed>(8, 2)];
         let mut inputs = ports(&rings);
         let defs: Vec<PortDef> = inputs.iter_mut().map(|(def, _)| def.clone()).collect();
         let (_, ids) = wire::announce(&defs, None, "pub");
@@ -264,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_steady_batch_preserves_capacity() {
-        let rings = [ring::<Imu>(), ring::<Fixed>()];
+        let rings = [ring::<Imu>(8, 2), ring::<Fixed>(8, 2)];
         let mut inputs = ports(&rings);
         let defs: Vec<PortDef> = inputs.iter_mut().map(|(def, _)| def.clone()).collect();
         let (_, ids) = wire::announce(&defs, None, "pub");

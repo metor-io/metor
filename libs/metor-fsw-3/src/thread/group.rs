@@ -208,13 +208,13 @@ impl Drop for GroupHandle {
 mod tests {
     use std::sync::mpsc::{channel, sync_channel};
 
-    use metor_fsw_3_ring::{Config, Notifier, RingBuffer};
+    use metor_fsw_3_ring::Notifier;
 
     use super::*;
     use crate::async_system::Running;
-    use crate::port::{Input, Output, ring_capacity};
-    use crate::record::Record;
-    use crate::tests::utils::Imu;
+    use crate::port::{Input, Output};
+
+    use crate::tests::utils::{Imu, ring};
 
     /// A launch that panics where a user's constructor would.
     struct PanicCtor;
@@ -270,10 +270,7 @@ mod tests {
     #[test]
     fn test_write_wakes_executor() {
         let wake = Notifier::default();
-        let ring = RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(Imu::MAX_LEN, 4).expect("valid capacity"),
-            max_readers: 1,
-        });
+        let ring = ring::<Imu>(4, 1);
         let view = ring.view(wake.clone()).expect("free slot");
         let (tx, rx) = channel();
         let thread = std::thread::spawn(move || {

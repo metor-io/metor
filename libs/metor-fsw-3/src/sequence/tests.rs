@@ -4,7 +4,7 @@ use core::cell::{Cell, RefCell};
 use core::time::Duration;
 use std::rc::Rc;
 
-use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+use metor_fsw_3_ring::{NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogLevel;
 
@@ -15,10 +15,10 @@ use zerocopy::FromBytes;
 
 use crate::coordinator::{
     Adapter, BuildError, ChannelConfig, Coordinator, CoordinatorConfig, EndReason, InputConfig,
-    PortRef, RunState, Step, SystemConfig, SystemTable,
+    RunState, Step, SystemConfig, SystemTable,
 };
 use crate::log::Log;
-use crate::port::{Output, Sample, ring_capacity};
+use crate::port::{Output, Sample};
 use crate::system::{InputBinding, OutputBinding};
 use crate::tests::utils::{self, Imu, Recorder};
 
@@ -125,12 +125,7 @@ fn step_over<S: SequenceFn>(
     let rings: Vec<RingBuffer> = def
         .outputs
         .iter()
-        .map(|port| {
-            RingBuffer::create_in_memory(Config {
-                capacity: ring_capacity(port.max_len, 8).expect("valid capacity"),
-                max_readers: 1,
-            })
-        })
+        .map(|port| utils::ring_of(port.max_len, 8, 1))
         .collect();
     let outputs = def
         .outputs
@@ -146,21 +141,15 @@ fn step_over<S: SequenceFn>(
 
 fn table(recorder: &Recorder) -> SystemTable {
     let mut table = utils::table(recorder);
-    table
-        .register_sequence("no_fix", no_fix(), Default::default)
-        .expect("valid records");
-    table
-        .register_sequence("patient", patient(), Default::default)
-        .expect("valid records");
-    table
-        .register_sequence("doomed", doomed(), Default::default)
-        .expect("valid records");
-    table
-        .register_sequence("phases", phases(), Phase::default)
-        .expect("valid records");
-    table
-        .register("aborter", aborter(), u64::default)
-        .expect("valid records");
+    let mut register = || -> Result<(), BuildError> {
+        table.register_sequence("no_fix", no_fix(), Default::default)?;
+        table.register_sequence("patient", patient(), Default::default)?;
+        table.register_sequence("doomed", doomed(), Default::default)?;
+        table.register_sequence("phases", phases(), Phase::default)?;
+        table.register("aborter", aborter(), u64::default)?;
+        Ok(())
+    };
+    register().expect("valid records");
     table
 }
 
@@ -170,10 +159,7 @@ fn logged(id: &str, ty: &str) -> CoordinatorConfig {
         systems: vec![
             SystemConfig::new(id, ty),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "lines".into(),
-                    from: vec![PortRef::new(id, "log")],
-                }],
+                inputs: vec![InputConfig::new("lines", id, "log")],
                 ..SystemConfig::new("logs", "log_sink")
             },
         ],
@@ -279,10 +265,7 @@ fn test_abort_ends_the_sequence() {
         systems: vec![
             SystemConfig::new("aborter", "aborter"),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "abort".into(),
-                    from: vec![PortRef::new("aborter", "abort")],
-                }],
+                inputs: vec![InputConfig::new("abort", "aborter", "abort")],
                 ..SystemConfig::new("wait", "patient")
             },
         ],
@@ -351,10 +334,7 @@ fn test_sample_held_across_cycles() {
         systems: vec![
             SystemConfig::new("imu", "imu"),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "imu".into(),
-                    from: vec![PortRef::new("imu", "imu")],
-                }],
+                inputs: vec![InputConfig::new("imu", "imu", "imu")],
                 ..SystemConfig::new("watch", "watcher")
             },
         ],
@@ -474,24 +454,23 @@ fn traced<S: SequenceFn<State = Trace>>(
     commands: &Commands,
 ) -> SystemTable {
     let mut table = table(recorder);
-    let state = trace.clone();
-    table
-        .register_sequence("traced", sequence, move || state.clone())
-        .expect("valid records");
-    let queue = commands.clone();
-    table
-        .register("commander", commander(), move || queue.clone())
-        .expect("valid records");
+    let register = || -> Result<(), BuildError> {
+        let state = trace.clone();
+        table.register_sequence("traced", sequence, move || state.clone())?;
+        let queue = commands.clone();
+        table.register("commander", commander(), move || queue.clone())?;
+        Ok(())
+    };
+    register().expect("valid records");
     table
 }
 
 /// `traced` as `t`, its log drained, aborted by `aborter` from the second cycle.
 fn aborted() -> CoordinatorConfig {
     let mut config = logged("t", "traced");
-    config.systems[0].inputs.push(InputConfig {
-        port: "abort".into(),
-        from: vec![PortRef::new("aborter", "abort")],
-    });
+    config.systems[0]
+        .inputs
+        .push(InputConfig::new("abort", "aborter", "abort"));
     config
         .systems
         .insert(0, SystemConfig::new("aborter", "aborter"));
@@ -504,10 +483,7 @@ fn channeled(start: RunState) -> CoordinatorConfig {
         systems: vec![
             SystemConfig::new("cmds", "commander"),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "commands".into(),
-                    from: vec![PortRef::new("cmds", "commands")],
-                }],
+                inputs: vec![InputConfig::new("commands", "cmds", "commands")],
                 adapter: Some(Adapter::Channel(ChannelConfig {
                     name: "seq".into(),
                     start,
@@ -694,15 +670,11 @@ async fn twin_reads(
 fn sampled() -> CoordinatorConfig {
     let mut config = channeled(RunState::Running);
     config.systems.insert(0, SystemConfig::new("imu", "imu"));
-    config.systems[2].inputs.push(InputConfig {
-        port: "imu".into(),
-        from: vec![PortRef::new("imu", "imu")],
-    });
+    config.systems[2]
+        .inputs
+        .push(InputConfig::new("imu", "imu", "imu"));
     config.systems.push(SystemConfig {
-        inputs: vec![InputConfig {
-            port: "lines".into(),
-            from: vec![PortRef::new("t", "log")],
-        }],
+        inputs: vec![InputConfig::new("lines", "t", "log")],
         ..SystemConfig::new("logs", "log_sink")
     });
     config
@@ -712,10 +684,7 @@ fn sampled() -> CoordinatorConfig {
 fn tapped() -> CoordinatorConfig {
     let mut config = sampled();
     config.systems.push(SystemConfig {
-        inputs: vec![InputConfig {
-            port: "valve".into(),
-            from: vec![PortRef::new("t", "valve_cmd")],
-        }],
+        inputs: vec![InputConfig::new("valve", "t", "valve_cmd")],
         ..SystemConfig::new("taps", "tap")
     });
     config
@@ -825,10 +794,7 @@ fn test_redline_and_body_read_one_sample() {
         systems: vec![
             SystemConfig::new("imu", "imu"),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "imu".into(),
-                    from: vec![PortRef::new("imu", "imu")],
-                }],
+                inputs: vec![InputConfig::new("imu", "imu", "imu")],
                 ..SystemConfig::new("t", "twin")
             },
         ],
@@ -859,10 +825,7 @@ fn step_on_imu<S: SequenceFn<State = ()>>(
     sequence: fn() -> S,
 ) -> (SequenceStep, Output<Imu>, Vec<RingBuffer>) {
     let def = def_of(sequence());
-    let ring = RingBuffer::create_in_memory(Config {
-        capacity: ring_capacity(def.inputs[1].max_len, 2).expect("valid capacity"),
-        max_readers: 1,
-    });
+    let ring = utils::ring_of(def.inputs[1].max_len, 2, 1);
     let inputs = vec![
         InputBinding {
             def: def.inputs[0].clone(),
@@ -874,7 +837,7 @@ fn step_on_imu<S: SequenceFn<State = ()>>(
         },
     ];
     let (step, mut rings) = step_over(sequence(), (), inputs);
-    let imu = Output::new(ring.writer(NoWake).expect("a free writer"));
+    let imu = utils::output(&ring);
     rings.push(ring);
     (step, imu, rings)
 }

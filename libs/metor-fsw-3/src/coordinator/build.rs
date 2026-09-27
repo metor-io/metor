@@ -632,10 +632,7 @@ mod tests {
     fn test_status_ring() {
         let mut config = pipeline_config();
         config.systems.push(SystemConfig {
-            inputs: vec![InputConfig {
-                port: "status".into(),
-                from: vec![PortRef::new("nav", "status")],
-            }],
+            inputs: vec![InputConfig::new("status", "nav", "status")],
             ..SystemConfig::new("watch", "status_watch")
         });
         assert!(build(config).is_ok());
@@ -802,10 +799,7 @@ mod tests {
         let mut config = pipeline_config();
         // A second consumer of `imu.imu`, so that ring carries two edges.
         config.systems.push(SystemConfig {
-            inputs: vec![InputConfig {
-                port: "imu".into(),
-                from: vec![PortRef::new("imu", "imu")],
-            }],
+            inputs: vec![InputConfig::new("imu", "imu", "imu")],
             ..SystemConfig::new("nav_two", "nav")
         });
         let coordinator = build(config).expect("valid config");
@@ -822,14 +816,8 @@ mod tests {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         config.systems.push(tap(vec![
-            InputConfig {
-                port: "imu.imu".into(),
-                from: vec![PortRef::new("imu", "imu")],
-            },
-            InputConfig {
-                port: "nav.nav".into(),
-                from: vec![PortRef::new("nav", "nav")],
-            },
+            InputConfig::new("imu.imu", "imu", "imu"),
+            InputConfig::new("nav.nav", "nav", "nav"),
         ]));
         let mut coordinator = config.build(&table(&recorder)).expect("valid config");
         coordinator.step(Timestamp(1));
@@ -871,17 +859,11 @@ mod tests {
             systems: vec![
                 emits("imu"),
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "imu".into(),
-                        from: vec![PortRef::new("emit", "imu")],
-                    }],
+                    inputs: vec![InputConfig::new("imu", "emit", "imu")],
                     ..SystemConfig::new("nav", "nav")
                 },
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "nav".into(),
-                        from: vec![PortRef::new("nav", "nav")],
-                    }],
+                    inputs: vec![InputConfig::new("nav", "nav", "nav")],
                     ..SystemConfig::new("control", "control")
                 },
             ],
@@ -915,17 +897,11 @@ mod tests {
                     ..SystemConfig::new("emit", "emit")
                 },
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "imu".into(),
-                        from: vec![PortRef::new("emit", "imu")],
-                    }],
+                    inputs: vec![InputConfig::new("imu", "emit", "imu")],
                     ..SystemConfig::new("nav", "nav")
                 },
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "nav".into(),
-                        from: vec![PortRef::new("nav", "nav")],
-                    }],
+                    inputs: vec![InputConfig::new("nav", "nav", "nav")],
                     ..SystemConfig::new("control", "control")
                 },
             ],
@@ -1052,10 +1028,9 @@ mod tests {
     #[test]
     fn test_reject_dynamic_forward_reference() {
         let mut config = pipeline_config();
-        config.systems.push(tap(vec![InputConfig {
-            port: "late.nav".into(),
-            from: vec![PortRef::new("late", "nav")],
-        }]));
+        config
+            .systems
+            .push(tap(vec![InputConfig::new("late.nav", "late", "nav")]));
         config.systems.push(SystemConfig::new("late", "nav"));
         assert_eq!(
             build(config).err(),
@@ -1073,18 +1048,12 @@ mod tests {
         let config = CoordinatorConfig {
             systems: vec![
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "nav".into(),
-                        from: vec![PortRef::new("nav", "nav")],
-                    }],
+                    inputs: vec![InputConfig::new("nav", "nav", "nav")],
                     ..SystemConfig::new("control", "control")
                 },
                 SystemConfig::new("imu", "imu"),
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "imu".into(),
-                        from: vec![PortRef::new("imu", "imu")],
-                    }],
+                    inputs: vec![InputConfig::new("imu", "imu", "imu")],
                     ..SystemConfig::new("nav", "nav")
                 },
             ],

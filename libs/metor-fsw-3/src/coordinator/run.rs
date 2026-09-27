@@ -295,10 +295,7 @@ mod tests {
         config.systems[0] = SystemConfig::new("boom", "boom");
         config.systems[1].inputs[0].from = vec![PortRef::new("boom", "imu")];
         config.systems.push(SystemConfig {
-            inputs: vec![InputConfig {
-                port: "lines".into(),
-                from: vec![PortRef::new("boom", "log")],
-            }],
+            inputs: vec![InputConfig::new("lines", "boom", "log")],
             ..SystemConfig::new("logs", "log_sink")
         });
         watched(&mut config, &["boom"]);

@@ -236,6 +236,20 @@ impl Clock {
     }
 }
 
+impl InputConfig {
+    /// An input port fed by one producer's output.
+    pub fn new(
+        port: impl Into<String>,
+        system: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Self {
+        Self {
+            port: port.into(),
+            from: vec![PortRef::new(system, output)],
+        }
+    }
+}
+
 impl PortRef {
     pub fn new(system: impl Into<String>, port: impl Into<String>) -> Self {
         Self {

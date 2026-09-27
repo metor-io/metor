@@ -249,14 +249,14 @@ fn deliver(
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+    use metor_fsw_3_ring::{NoWake, RingBuffer};
     use zerocopy::IntoBytes;
 
     use crate::DefCx;
-    use crate::port::ring_capacity;
+
     use crate::record::Record;
     use crate::system::{OutputBinding, PortDef, SystemOutputs};
-    use crate::tests::utils::{Fixed, Imu, Note};
+    use crate::tests::utils::{Fixed, Imu, Note, ring};
 
     use super::*;
 
@@ -273,13 +273,6 @@ mod tests {
 
     fn id_of<R: Record>() -> PacketId {
         R::schema().packet_id()
-    }
-
-    fn ring<R: Record>() -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(R::MAX_LEN, 2).expect("valid capacity"),
-            max_readers: 1,
-        })
     }
 
     /// One `Fixed` port and one `Note` port, as the config would list them.
@@ -328,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_route_packet_by_record_id() {
-        let rings = [ring::<Fixed>(), ring::<Note>()];
+        let rings = [ring::<Fixed>(2, 1), ring::<Note>(2, 1)];
         let mut outputs = ports(&rings);
         let mut log = Log;
         let Routes {
@@ -349,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_route_table_by_table_id() {
-        let rings = [ring::<Fixed>(), ring::<Imu>()];
+        let rings = [ring::<Fixed>(2, 1), ring::<Imu>(2, 1)];
         let mut outputs = mixed(&rings);
         let mut log = Log;
         let Routes {
@@ -386,7 +379,7 @@ mod tests {
     fn test_port_rejects_oversized_record() {
         // Both rings hold the longest record, so only a port's own bound can
         // refuse one routed to the shorter port.
-        let rings = [ring::<Note>(), ring::<Note>()];
+        let rings = [ring::<Note>(2, 1), ring::<Note>(2, 1)];
         let mut outputs = ports(&rings);
         let Routes {
             mut ports, max_len, ..
@@ -402,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_reject_duplicate_record_route() {
-        let rings = [ring::<Fixed>(), ring::<Fixed>()];
+        let rings = [ring::<Fixed>(2, 1), ring::<Fixed>(2, 1)];
         let mut outputs = bind(
             [
                 Output::<Fixed>::def(&DefCx::empty(), "cmds.first"),
@@ -419,7 +412,7 @@ mod tests {
     /// carrying one announced table are one route.
     #[test]
     fn test_reject_duplicate_table_route() {
-        let rings = [ring::<Imu>(), ring::<Imu>()];
+        let rings = [ring::<Imu>(2, 1), ring::<Imu>(2, 1)];
         let mut distinct = bind(
             [
                 Output::<Imu>::def(&DefCx::empty(), "a.imu"),
@@ -430,7 +423,7 @@ mod tests {
         assert_eq!(routes(&mut distinct, &mut Log).tables.len(), 2);
 
         let def = Output::<Imu>::def(&DefCx::empty(), "a.imu");
-        let rings = [ring::<Imu>(), ring::<Imu>()];
+        let rings = [ring::<Imu>(2, 1), ring::<Imu>(2, 1)];
         let mut same = bind(
             [
                 def.clone(),
@@ -448,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_ring_overflow_counts_drops() {
-        let rings = [ring::<Fixed>(), ring::<Note>()];
+        let rings = [ring::<Fixed>(2, 1), ring::<Note>(2, 1)];
         let mut outputs = ports(&rings);
         let mut log = Log;
         let Routes { mut ports, .. } = routes(&mut outputs, &mut log);

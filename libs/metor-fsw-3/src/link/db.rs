@@ -279,26 +279,19 @@ fn ingest(db: &DB, inputs: &mut DynInputs<Notifier>, sinks: &[Sink], status: &mu
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, RingBuffer};
+    use metor_fsw_3_ring::RingBuffer;
     use metor_proto::types::PacketId;
 
     use stellarator::net::TcpStream;
 
     use crate::DefCx;
     use crate::async_system::stop_pair;
-    use crate::port::{Input, ring_capacity};
+    use crate::port::Input;
     use crate::record::Record;
     use crate::system::{InputBinding, SystemInputs};
-    use crate::tests::utils::{Fixed, Imu};
+    use crate::tests::utils::{Fixed, Imu, ring};
 
     use super::*;
-
-    fn ring<R: Record>() -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(R::MAX_LEN, 8).expect("valid capacity"),
-            max_readers: 2,
-        })
-    }
 
     /// An `Imu` frame port of instance `plant` on target `a`, and a `Fixed`
     /// message port.
@@ -357,7 +350,7 @@ mod tests {
     #[test]
     fn test_ingest_frames_and_messages() {
         let (_dir, db) = store();
-        let rings = [ring::<Imu>(), ring::<Fixed>()];
+        let rings = [ring::<Imu>(8, 2), ring::<Fixed>(8, 2)];
         let mut inputs = ports(&rings);
         let sinks = announce(&db, &mut inputs, &mut Log);
         let RecordSchema::Frame { metadata, .. } = &Input::<Imu>::def(
@@ -416,7 +409,7 @@ mod tests {
     #[test]
     fn test_colliding_table_is_refused() {
         let (_dir, db) = store();
-        let rings = [ring::<Imu>(), ring::<Fixed>()];
+        let rings = [ring::<Imu>(8, 2), ring::<Fixed>(8, 2)];
         let mut inputs = ports(&rings);
         let id = table_id_of(&mut inputs);
         let RecordSchema::Frame { vtable, .. } = Input::<Imu>::def(&DefCx::empty(), "other").schema

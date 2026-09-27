@@ -444,7 +444,7 @@ mod tests {
 
     use super::*;
     use crate::record::{DecodeError, EncodeError};
-    use crate::tests::utils::{Fixed, Imu, Note, Stamped};
+    use crate::tests::utils::{Fixed, Imu, Note, Stamped, input, output, pair, ring};
     use crate::{Frame, Record};
 
     #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Debug)]
@@ -461,8 +461,8 @@ mod tests {
             capacity: 128,
             max_readers: 1,
         });
-        let output = Output::<Aligned>::new(ring.writer(NoWake).expect("free writer"));
-        let mut input = Input::<Aligned>::new(vec![ring.view(NoWake).expect("free slot")]);
+        let output = output::<Aligned>(&ring);
+        let mut input = input::<Aligned>(&ring);
         for value in 0..20 {
             output
                 .write(&Aligned {
@@ -479,18 +479,18 @@ mod tests {
         Imu::new(ts, sample)
     }
 
-    fn ring(depth: usize) -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(Imu::MAX_LEN, depth).expect("valid capacity"),
-            max_readers: 4,
-        })
-    }
-
-    fn pair(depth: usize) -> (RingBuffer, Output<Imu>, Input<Imu>) {
-        let ring = ring(depth);
-        let out = Output::new(ring.writer(NoWake).expect("free writer"));
-        let input = Input::new(vec![ring.view(NoWake).expect("free slot")]);
-        (ring, out, input)
+    /// Two one-reader rings of `depth` `T` records feeding one input.
+    fn fan_in<T: Record + ?Sized>(
+        depth: usize,
+    ) -> (RingBuffer, RingBuffer, Output<T>, Output<T>, Input<T>) {
+        let (left, right) = (ring::<T>(depth, 1), ring::<T>(depth, 1));
+        let a = Output::new(left.writer(NoWake).expect("free writer"));
+        let b = Output::new(right.writer(NoWake).expect("free writer"));
+        let input = Input::new(vec![
+            left.view(NoWake).expect("free slot"),
+            right.view(NoWake).expect("free slot"),
+        ]);
+        (left, right, a, b, input)
     }
 
     #[test]
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_write_then_latest() {
-        let (_ring, out, mut input) = pair(4);
+        let (_ring, out, mut input) = pair::<Imu>(4);
         out.write(&sample(7, 42.0)).expect("ring has room");
         let got = input.latest().expect("valid record").expect("one record");
         assert_eq!(got.sample, 42.0);
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_latest_repeats_pinned_record() {
-        let (_ring, out, mut input) = pair(4);
+        let (_ring, out, mut input) = pair::<Imu>(4);
         out.write(&sample(1, 1.0)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_drain_record_order() {
-        let (_ring, out, mut input) = pair(8);
+        let (_ring, out, mut input) = pair::<Imu>(8);
         for i in 0..3 {
             out.write(&sample(i, i as f64)).expect("ring has room");
         }
@@ -542,13 +542,7 @@ mod tests {
 
     #[test]
     fn test_latest_selects_newest_producer() {
-        let (left, right) = (ring(4), ring(4));
-        let a = Output::<Imu>::new(left.writer(NoWake).expect("free writer"));
-        let b = Output::<Imu>::new(right.writer(NoWake).expect("free writer"));
-        let mut input = Input::<Imu>::new(vec![
-            left.view(NoWake).expect("free slot"),
-            right.view(NoWake).expect("free slot"),
-        ]);
+        let (_l, _r, a, b, mut input) = fan_in::<Imu>(4);
         a.write(&sample(9, 1.0)).expect("ring has room");
         b.write(&sample(3, 2.0)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
@@ -559,13 +553,7 @@ mod tests {
 
     #[test]
     fn test_latest_timestamp_tie() {
-        let (left, right) = (ring(4), ring(4));
-        let a = Output::<Imu>::new(left.writer(NoWake).expect("free writer"));
-        let b = Output::<Imu>::new(right.writer(NoWake).expect("free writer"));
-        let mut input = Input::<Imu>::new(vec![
-            left.view(NoWake).expect("free slot"),
-            right.view(NoWake).expect("free slot"),
-        ]);
+        let (_l, _r, a, b, mut input) = fan_in::<Imu>(4);
         a.write(&sample(5, 1.0)).expect("ring has room");
         b.write(&sample(5, 2.0)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
@@ -573,13 +561,7 @@ mod tests {
 
     #[test]
     fn test_drain_producer_order() {
-        let (left, right) = (ring(8), ring(8));
-        let a = Output::<Imu>::new(left.writer(NoWake).expect("free writer"));
-        let b = Output::<Imu>::new(right.writer(NoWake).expect("free writer"));
-        let mut input = Input::<Imu>::new(vec![
-            left.view(NoWake).expect("free slot"),
-            right.view(NoWake).expect("free slot"),
-        ]);
+        let (_l, _r, a, b, mut input) = fan_in::<Imu>(8);
         b.write(&sample(0, 10.0)).expect("ring has room");
         a.write(&sample(1, 1.0)).expect("ring has room");
         a.write(&sample(2, 2.0)).expect("ring has room");
@@ -604,8 +586,8 @@ mod tests {
             capacity: 64,
             max_readers: 1,
         });
-        let out = Output::new(ring.writer(NoWake).expect("free writer"));
-        let mut input = Input::<Imu>::new(vec![ring.view(NoWake).expect("free slot")]);
+        let out = output(&ring);
+        let mut input = input::<Imu>(&ring);
         out.write(&sample(0, 0.0)).expect("ring has room");
         let pinned = input.latest().expect("valid").expect("record");
         assert_eq!(pinned.sample, 0.0);
@@ -619,9 +601,9 @@ mod tests {
 
     #[test]
     fn test_reject_short_record() {
-        let ring = ring(4);
+        let ring = ring::<Imu>(4, 1);
         let writer = ring.writer(NoWake).expect("free writer");
-        let mut input = Input::<Imu>::new(vec![ring.view(NoWake).expect("free slot")]);
+        let mut input = input::<Imu>(&ring);
         writer.try_write(&[0u8; 4]).expect("ring has room");
         assert_eq!(
             input.latest().err(),
@@ -631,32 +613,6 @@ mod tests {
             input.drain().next().unwrap().err(),
             Some(RecvError::Decode(DecodeError::Truncated))
         );
-    }
-
-    fn stamped_pair() -> (
-        RingBuffer,
-        RingBuffer,
-        Output<Stamped>,
-        Output<Stamped>,
-        Input<Stamped>,
-    ) {
-        let (left, right) = (
-            RingBuffer::create_in_memory(Config {
-                capacity: ring_capacity(Stamped::MAX_LEN, 4).expect("valid"),
-                max_readers: 1,
-            }),
-            RingBuffer::create_in_memory(Config {
-                capacity: ring_capacity(Stamped::MAX_LEN, 4).expect("valid"),
-                max_readers: 1,
-            }),
-        );
-        let a = Output::new(left.writer(NoWake).expect("writer"));
-        let b = Output::new(right.writer(NoWake).expect("writer"));
-        let input = Input::new(vec![
-            left.view(NoWake).expect("slot"),
-            right.view(NoWake).expect("slot"),
-        ]);
-        (left, right, a, b, input)
     }
 
     thread_local! {
@@ -690,7 +646,7 @@ mod tests {
 
     #[test]
     fn test_latest_decodes_once() {
-        let (_l, _r, mut a, mut b, mut input) = message_pair_two::<Counted>();
+        let (_l, _r, mut a, mut b, mut input) = fan_in::<Counted>(4);
         DECODES.set(0);
         assert!(input.latest().expect("empty input").is_none());
         assert_eq!(DECODES.get(), 0);
@@ -712,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_latest_into_inner_borrows_frame() {
-        let (_ring, out, mut input) = pair(4);
+        let (_ring, out, mut input) = pair::<Imu>(4);
         out.write(&sample(1, 2.0)).expect("fits");
         let frame: &Imu = input.latest().expect("valid").expect("record").into_inner();
         assert_eq!(frame.sample, 2.0);
@@ -722,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_latest_stamped_message_order() {
-        let (_l, _r, a, b, mut input) = stamped_pair();
+        let (_l, _r, a, b, mut input) = fan_in::<Stamped>(4);
         a.write(&Stamped {
             at: Timestamp(9),
             text: "a".into(),
@@ -746,43 +702,16 @@ mod tests {
 
     #[test]
     fn test_latest_unstamped_message_order() {
-        let (_l, _r, a, b, mut input) = message_pair_two::<Fixed>();
+        let (_l, _r, a, b, mut input) = fan_in::<Fixed>(4);
         b.write(&Fixed { a: 2, b: 0.0 }).expect("fits");
         a.write(&Fixed { a: 1, b: 0.0 }).expect("fits");
         assert_eq!(input.latest().unwrap().unwrap().read().a, 1);
         assert_eq!(Fixed { a: 1, b: 0.0 }.timestamp(), None);
     }
 
-    fn message_pair_two<T: Record>() -> (RingBuffer, RingBuffer, Output<T>, Output<T>, Input<T>) {
-        let ring = || {
-            RingBuffer::create_in_memory(Config {
-                capacity: ring_capacity(T::MAX_LEN, 4).expect("valid"),
-                max_readers: 1,
-            })
-        };
-        let (left, right) = (ring(), ring());
-        let a = Output::new(left.writer(NoWake).expect("writer"));
-        let b = Output::new(right.writer(NoWake).expect("writer"));
-        let input = Input::new(vec![
-            left.view(NoWake).expect("slot"),
-            right.view(NoWake).expect("slot"),
-        ]);
-        (left, right, a, b, input)
-    }
-
-    fn message_pair<T: Record>() -> (RingBuffer, Output<T>, Input<T>) {
-        let ring = RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(T::MAX_LEN, 4).expect("valid capacity"),
-            max_readers: 1,
-        });
-        let out = Output::new(ring.writer(NoWake).expect("free writer"));
-        let input = Input::new(vec![ring.view(NoWake).expect("free slot")]);
-        (ring, out, input)
-    }
-
     #[test]
     fn test_message_round_trip() {
-        let (_ring, out, mut input) = message_pair::<Note>();
+        let (_ring, out, mut input) = pair::<Note>(4);
         out.write(&Note { text: "hi".into() }).expect("fits");
         out.write(&Note {
             text: "there".into(),
@@ -796,7 +725,7 @@ mod tests {
 
     #[test]
     fn test_oversize_message_preserves_ring() {
-        let (_ring, out, mut input) = message_pair::<Note>();
+        let (_ring, out, mut input) = pair::<Note>(4);
         let long = Note {
             text: "x".repeat(100),
         };
@@ -812,12 +741,9 @@ mod tests {
 
     #[test]
     fn test_drain_skips_corrupt_record() {
-        let ring = RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(Fixed::MAX_LEN, 4).expect("valid capacity"),
-            max_readers: 1,
-        });
+        let ring = ring::<Fixed>(4, 1);
         let writer = ring.writer(NoWake).expect("free writer");
-        let mut input = Input::<Fixed>::new(vec![ring.view(NoWake).expect("free slot")]);
+        let mut input = input::<Fixed>(&ring);
         let mut buf = [0u8; 16];
         let good = Fixed { a: 1, b: 2.0 };
         writer.try_write(&[0xff; 3]).expect("ring has room");
@@ -833,12 +759,12 @@ mod tests {
 
     #[test]
     fn test_drain_frames_and_messages() {
-        let (_ring, out, mut input) = pair(4);
+        let (_ring, out, mut input) = pair::<Imu>(4);
         out.write(&sample(1, 1.0)).expect("ring has room");
         let borrowed: Option<&Imu> = input.drain().next().map(|r| r.expect("decodes"));
         assert_eq!(borrowed.map(|f| f.sample), Some(1.0));
 
-        let (_ring, out, mut input) = message_pair::<Fixed>();
+        let (_ring, out, mut input) = pair::<Fixed>(4);
         out.write(&Fixed { a: 3, b: 0.5 }).expect("fits");
         let owned: Option<Fixed> = input.drain().next().map(|r| r.expect("decodes"));
         assert_eq!(owned, Some(Fixed { a: 3, b: 0.5 }));
@@ -846,13 +772,13 @@ mod tests {
 
     #[test]
     fn test_shared_write_round_trips() {
-        let (_ring, frames, mut frame_in) = pair(4);
+        let (_ring, frames, mut frame_in) = pair::<Imu>(4);
         let shared: &Output<Imu> = &frames;
         shared.write(&sample(1, 4.0)).expect("ring has room");
         let frame = frame_in.latest().expect("valid").expect("record");
         assert_eq!(frame.sample, 4.0);
 
-        let (_ring, notes, mut note_in) = message_pair::<Note>();
+        let (_ring, notes, mut note_in) = pair::<Note>(4);
         let shared: &Output<Note> = &notes;
         shared.write(&Note { text: "hi".into() }).expect("fits");
         let seen: Vec<Note> = note_in.drain().map(|r| r.expect("decodes")).collect();
@@ -861,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_failed_encode_returns_scratch() {
-        let (_ring, out, mut input) = message_pair::<Note>();
+        let (_ring, out, mut input) = pair::<Note>(4);
         let long = Note {
             text: "x".repeat(100),
         };
@@ -873,7 +799,7 @@ mod tests {
 
     #[test]
     fn test_closure_and_caller_write_in_order() {
-        let (_ring, out, mut input) = pair(8);
+        let (_ring, out, mut input) = pair::<Imu>(8);
         let send = |ts: i64| out.write(&sample(ts, ts as f64));
         send(1).expect("ring has room");
         out.write(&sample(2, 2.0)).expect("ring has room");
@@ -939,7 +865,7 @@ mod tests {
 
     #[test]
     fn test_reentrant_write_is_busy() {
-        let (_ring, out, mut input) = message_pair::<Hostile<'_>>();
+        let (_ring, out, mut input) = pair::<Hostile<'_>>(4);
         let outer = Hostile {
             act: Act::Reenter(&out),
             ..Hostile::new("outer")
@@ -952,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_panicking_encode_returns_scratch() {
-        let (_ring, out, mut input) = message_pair::<Hostile<'_>>();
+        let (_ring, out, mut input) = pair::<Hostile<'_>>(4);
         let bad = Hostile {
             act: Act::Panic,
             ..Hostile::new("bad")
@@ -973,11 +899,11 @@ mod async_tests {
     use std::task::{Wake, Waker};
 
     use futures_lite::future::poll_once;
-    use metor_fsw_3_ring::{Config, Notifier, RingBuffer};
+    use metor_fsw_3_ring::{Notifier, RingBuffer};
 
     use super::*;
     use crate::system::InputBinding;
-    use crate::tests::utils::Imu;
+    use crate::tests::utils::{Imu, ring};
 
     #[derive(Default)]
     struct Woken(AtomicBool);
@@ -1004,10 +930,7 @@ mod async_tests {
 
     /// One ring holding four `Imu` records, woken through `wake`.
     fn woken(wake: &Notifier) -> (RingBuffer, Output<Imu, Notifier>, Input<Imu, Notifier>) {
-        let ring = RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(Imu::MAX_LEN, 4).expect("valid capacity"),
-            max_readers: 1,
-        });
+        let ring = ring::<Imu>(4, 1);
         let out = Output::new(ring.writer(wake.clone()).expect("free writer"));
         let input = Input::new(vec![ring.view(wake.clone()).expect("free slot")]);
         (ring, out, input)

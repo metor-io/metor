@@ -92,17 +92,11 @@ fn pipeline(ty: &str, params: serde_json::Value) -> (CoordinatorConfig, Rc<RefCe
             SystemConfig::new("source", "source"),
             SystemConfig {
                 params,
-                inputs: vec![InputConfig {
-                    port: "input".into(),
-                    from: vec![PortRef::new("source", "output")],
-                }],
+                inputs: vec![InputConfig::new("input", "source", "output")],
                 ..SystemConfig::new("middle", format!("echo.{ty}"))
             },
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "input".into(),
-                    from: vec![PortRef::new("middle", "output")],
-                }],
+                inputs: vec![InputConfig::new("input", "middle", "output")],
                 ..SystemConfig::new("sink", "sink")
             },
         ],
@@ -193,10 +187,7 @@ fn test_pack_configures_inputs() {
                 ..SystemConfig::new("tap", "echo.tap")
             },
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "input".into(),
-                    from: vec![PortRef::new("tap", "output")],
-                }],
+                inputs: vec![InputConfig::new("input", "tap", "output")],
                 ..SystemConfig::new("sink", "sink")
             },
         ],

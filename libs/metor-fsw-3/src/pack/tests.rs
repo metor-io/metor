@@ -1,13 +1,12 @@
 //! The exports, driven in process against the shared test table.
 
-use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+use metor_fsw_3_ring::{NoWake, RingBuffer};
 use metor_proto_wkt::{LogEvent, LogLevel};
 
 use super::*;
 use crate::DefCx;
-use crate::port::{Input, ring_capacity};
 use crate::record::Record;
-use crate::tests::utils::{Imu, Nav, Recorder};
+use crate::tests::utils::{self, Imu, Nav, Recorder};
 
 /// The one table these tests export; a thread builds it once.
 fn build() -> SystemTable {
@@ -27,10 +26,7 @@ impl core::ops::Deref for TestRing {
 }
 
 fn ring<T: Record>(readers: usize) -> TestRing {
-    let ring = RingBuffer::create_in_memory(Config {
-        capacity: ring_capacity(T::MAX_LEN, 8).expect("valid capacity"),
-        max_readers: readers,
-    });
+    let ring = utils::ring::<T>(8, readers);
     let export = ring.export();
     TestRing { ring, export }
 }
@@ -287,7 +283,7 @@ fn test_pipeline_single_cycle() {
     let source = create_raw("imu", "", &[], &imu_out);
     let filter = create_raw("nav", "", &[input(&edges)], &nav_out);
     assert!(!source.handle.is_null() && !filter.handle.is_null());
-    let mut sink = Input::<Nav>::new(vec![nav.view(NoWake).expect("free slot")]);
+    let mut sink = utils::input::<Nav>(&nav);
 
     assert_eq!(source.step(1), Status::Ok);
     assert_eq!(filter.step(1), Status::Ok);
@@ -301,7 +297,7 @@ fn test_system_panic_status_and_log() {
     let (imu, log) = (ring::<Imu>(1), ring::<LogEvent>(1));
     let outputs = [raw(&imu), raw(&log)];
     let boom = create_raw("boom", "", &[], &outputs);
-    let mut lines = Input::<LogEvent>::new(vec![log.view(NoWake).expect("free slot")]);
+    let mut lines = utils::input::<LogEvent>(&log);
     assert_eq!(boom.step(1), Status::Ok);
     assert_eq!(boom.step(2), Status::Panicked);
     assert_eq!(boom.step(3), Status::Panicked);

@@ -520,19 +520,13 @@ mod tests {
 
     #[test]
     fn test_panicking_handler_logs_and_the_next_runs() {
-        use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
         use metor_proto_wkt::LogEvent;
 
         use crate::log::{LogPort, with_log_port};
-        use crate::port::{Input, Output, ring_capacity};
-        use crate::record::Record;
+        use crate::tests::utils::pair;
 
-        let ring = RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(LogEvent::MAX_LEN, 4).expect("valid"),
-            max_readers: 1,
-        });
-        let mut port = LogPort::new(Output::new(ring.writer(NoWake).expect("writer")));
-        let mut lines = Input::<LogEvent>::new(vec![ring.view(NoWake).expect("slot")]);
+        let (_ring, output, mut lines) = pair::<LogEvent>(4);
+        let mut port = LogPort::new(output);
         let seq = Seq::new();
         let ran = Ran::default();
         with_log_port(&mut port, Timestamp(3), || {

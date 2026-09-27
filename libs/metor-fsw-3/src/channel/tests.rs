@@ -1,20 +1,14 @@
-use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+use metor_fsw_3_ring::NoWake;
 use metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
 };
 
 use super::*;
 use crate::def::DefCx;
-use crate::port::{Output, ring_capacity};
+use crate::port::Output;
 use crate::record::RecordSchema;
 use crate::system::PortDef;
-
-fn ring<T: Record>() -> RingBuffer {
-    RingBuffer::create_in_memory(Config {
-        capacity: ring_capacity(T::MAX_LEN, 4).expect("valid capacity"),
-        max_readers: 1,
-    })
-}
+use crate::tests::utils::pair;
 
 #[test]
 fn test_wkt_records_keep_panel_ids() {
@@ -58,9 +52,8 @@ fn test_oversized_event_refused() {
 
 #[test]
 fn test_abort_requested_latches() {
-    let ring = ring::<AbortRequest>();
-    let mut abort = Abort::new(Input::new(vec![ring.view(NoWake).expect("slot")]));
-    let out = Output::<AbortRequest>::new(ring.writer(NoWake).expect("writer"));
+    let (_ring, out, input) = pair::<AbortRequest>(4);
+    let mut abort = Abort::new(input);
     assert!(!abort.requested());
     out.write(&AbortRequest {}).expect("room");
     assert!(abort.requested());

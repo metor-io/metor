@@ -12,6 +12,26 @@ use tracing_subscriber::layer::Context;
 use crate::port::Output;
 use crate::record::{DecodeError, EncodeError, Record};
 
+/// A line from no module or source file, stamped `now`.
+pub(crate) fn line(
+    now: Timestamp,
+    level: LogLevel,
+    message: impl Into<Cow<'static, str>>,
+    fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+) -> LogEvent {
+    LogEvent {
+        timestamp: now,
+        level,
+        source: Cow::Borrowed(""),
+        target: Cow::Borrowed(""),
+        message: message.into(),
+        span: None,
+        fields,
+        file: None,
+        line: None,
+    }
+}
+
 impl Record for LogEvent {
     const NAME: &'static str = "log";
     const MAX_LEN: usize = 4096;
@@ -58,17 +78,7 @@ impl LogPort {
         message: Cow<'static, str>,
         fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     ) {
-        self.emit(LogEvent {
-            timestamp: self.now,
-            level,
-            source: Cow::Borrowed(""),
-            target: Cow::Borrowed(""),
-            message,
-            span: None,
-            fields,
-            file: None,
-            line: None,
-        });
+        self.emit(line(self.now, level, message, fields));
     }
 
     /// Writes an error line whose first field is `kind`, the fault's identity for the ground.
@@ -96,17 +106,12 @@ impl LogPort {
         if self.dropped == 0 {
             return;
         }
-        let event = LogEvent {
-            timestamp: self.now,
-            level: LogLevel::Warn,
-            source: Cow::Borrowed(""),
-            target: Cow::Borrowed(""),
-            message: Cow::Borrowed("log lines dropped"),
-            span: None,
-            fields: vec![(Cow::Borrowed("dropped"), self.dropped.to_string().into())],
-            file: None,
-            line: None,
-        };
+        let event = line(
+            self.now,
+            LogLevel::Warn,
+            "log lines dropped",
+            vec![(Cow::Borrowed("dropped"), self.dropped.to_string().into())],
+        );
         if self.output.write(&event).is_ok() {
             self.dropped = 0;
         }
@@ -286,21 +291,17 @@ impl Visit for Fields {
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, NoWake, RingBuffer, frame_len};
+    use metor_fsw_3_ring::{RingBuffer, frame_len};
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
     use crate::port::{Input, ring_capacity};
+    use crate::tests::utils::pair;
 
     /// A port whose ring holds `records` lines of `MAX_LEN`.
     fn log_pair(records: usize) -> (RingBuffer, LogPort, Input<LogEvent>) {
-        let ring = RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(LogEvent::MAX_LEN, records).expect("valid"),
-            max_readers: 1,
-        });
-        let port = LogPort::new(Output::new(ring.writer(NoWake).expect("writer")));
-        let input = Input::new(vec![ring.view(NoWake).expect("slot")]);
-        (ring, port, input)
+        let (ring, output, input) = pair(records);
+        (ring, LogPort::new(output), input)
     }
 
     fn lines(input: &mut Input<LogEvent>) -> Vec<LogEvent> {
@@ -522,17 +523,7 @@ mod tests {
 
     /// The encoded length of the line `Log::info(message)` writes.
     fn encoded_len(message: &str, now: Timestamp) -> usize {
-        let event = LogEvent {
-            timestamp: now,
-            level: LogLevel::Info,
-            source: Cow::Borrowed(""),
-            target: Cow::Borrowed(""),
-            message: message.to_string().into(),
-            span: None,
-            fields: Vec::new(),
-            file: None,
-            line: None,
-        };
+        let event = line(now, LogLevel::Info, message.to_string(), Vec::new());
         let mut buf = vec![0u8; LogEvent::MAX_LEN];
         event.encode(&mut buf).expect("encodes").len()
     }

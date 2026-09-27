@@ -15,8 +15,8 @@ use metor_fsw_3::metor_proto_wkt::{
 };
 use metor_fsw_3::{
     Adapter, BuildError, ChannelConfig, ChannelState, ChannelStatus, Coordinator,
-    CoordinatorConfig, DefCx, Input, InputConfig, Output, Pack, PortRef, Record, RunState,
-    SystemConfig, SystemTable, Timestamp, system,
+    CoordinatorConfig, DefCx, Input, InputConfig, Output, Pack, Record, RunState, SystemConfig,
+    SystemTable, Timestamp, system,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -119,18 +119,11 @@ fn slot_params(allow: Vec<Value>) -> Value {
     json!({ "allow": allow })
 }
 
-fn input(port: &str, system: &str, from: &str) -> InputConfig {
-    InputConfig {
-        port: port.into(),
-        from: vec![PortRef::new(system, from)],
-    }
-}
-
 /// `cmds -> idle -> mode (the slot) -> watch`.
 fn config(params: Value, adapter: Option<Adapter>) -> CoordinatorConfig {
-    let mut inputs = vec![input("input", "idle", "output")];
+    let mut inputs = vec![InputConfig::new("input", "idle", "output")];
     if adapter.is_some() {
-        inputs.push(input("commands", "cmds", "commands"));
+        inputs.push(InputConfig::new("commands", "cmds", "commands"));
     }
     CoordinatorConfig {
         systems: vec![
@@ -144,9 +137,9 @@ fn config(params: Value, adapter: Option<Adapter>) -> CoordinatorConfig {
             },
             SystemConfig {
                 inputs: vec![
-                    input("events", "mode", "events"),
-                    input("status", "mode", "channel_status"),
-                    input("pings", "mode", "output"),
+                    InputConfig::new("events", "mode", "events"),
+                    InputConfig::new("status", "mode", "channel_status"),
+                    InputConfig::new("pings", "mode", "output"),
                 ],
                 ..SystemConfig::new("watch", "watch")
             },
@@ -504,7 +497,7 @@ fn next_slot(libs: &Path) -> SystemConfig {
             name: "next".into(),
             start: RunState::Stopped,
         })),
-        inputs: vec![input("input", "mode", "output")],
+        inputs: vec![InputConfig::new("input", "mode", "output")],
         ..SystemConfig::new("next", "fsw.dl_slot")
     }
 }

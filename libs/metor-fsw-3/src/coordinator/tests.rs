@@ -1,16 +1,15 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
 use super::run::Runner;
 use super::{Clock, Coordinator, Entry, Step, SystemStatus};
-use crate::Record;
 use crate::def::{DefCx, DefError};
-use crate::port::{Input, Output, ring_capacity};
+use crate::port::{Input, Output};
 use crate::system::{System, SystemDef};
-use crate::tests::utils::Imu;
+use crate::tests::utils::{Imu, input, output, ring};
 
 #[derive(Default)]
 struct Calls {
@@ -103,21 +102,6 @@ impl Step for HealthyConsumer {
     }
 }
 
-fn ring<T: Record>(readers: usize) -> RingBuffer {
-    RingBuffer::create_in_memory(Config {
-        capacity: ring_capacity(T::MAX_LEN, 2).expect("two records fit"),
-        max_readers: readers,
-    })
-}
-
-fn input<T: Record>(ring: &RingBuffer) -> Input<T> {
-    Input::new(vec![ring.view(NoWake).expect("available reader")])
-}
-
-fn output<T: Record>(ring: &RingBuffer) -> Output<T> {
-    Output::new(ring.writer(NoWake).expect("available writer"))
-}
-
 fn entry(name: &str, step: impl Step + 'static, status: &RingBuffer) -> Entry {
     Entry {
         name: name.into(),
@@ -127,10 +111,10 @@ fn entry(name: &str, step: impl Step + 'static, status: &RingBuffer) -> Entry {
 }
 
 fn assert_retirement(fault_panics: bool, drop_panics: bool) {
-    let data = ring::<Imu>(2);
-    let producer_status = ring::<SystemStatus>(2);
-    let failed_status = ring::<SystemStatus>(1);
-    let healthy_status = ring::<SystemStatus>(1);
+    let data = ring::<Imu>(2, 2);
+    let producer_status = ring::<SystemStatus>(2, 2);
+    let failed_status = ring::<SystemStatus>(2, 1);
+    let healthy_status = ring::<SystemStatus>(2, 1);
     let calls = Rc::new(Calls::default());
     let seen = Rc::new(RefCell::new(Vec::with_capacity(32)));
     let failed = Runner {
@@ -228,7 +212,7 @@ impl Step for Twice {
 
 #[test]
 fn test_ended_step_stays_and_is_skipped() {
-    let status_ring = ring::<SystemStatus>(1);
+    let status_ring = ring::<SystemStatus>(2, 1);
     let mut status = input::<SystemStatus>(&status_ring);
     let runs = Rc::new(Cell::new(0));
     let mut coordinator = Coordinator {

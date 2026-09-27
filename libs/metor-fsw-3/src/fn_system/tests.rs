@@ -3,7 +3,7 @@
 use core::cell::RefCell;
 use std::rc::Rc;
 
-use metor_fsw_3_ring::{Config, NoWake, Notifier, RingBuffer, frame_len};
+use metor_fsw_3_ring::{NoWake, Notifier, frame_len};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 use serde::Deserialize;
@@ -18,7 +18,8 @@ use crate::coordinator::{
 use crate::log::Log;
 use crate::port::{Input, Output, Sample, ring_capacity};
 use crate::tests::utils::{
-    Control, Imu, Nav, NoParams, static_async_def, static_def, static_inputs, static_outputs,
+    Control, Imu, Nav, NoParams, input, output, pair, ring, static_async_def, static_def,
+    static_inputs, static_outputs,
 };
 use crate::{Frame, Record};
 
@@ -204,18 +205,14 @@ fn test_port_parameter_order() {
 
 fn gain_table() -> SystemTable {
     let mut table = SystemTable::new();
-    table
-        .register("gain", gain(), Gain::new)
-        .expect("valid records");
-    table
-        .register("doubler", Doubler, || Doubler)
-        .expect("valid records");
-    table
-        .register("summer", Summer, || Summer)
-        .expect("valid records");
-    table
-        .register("counter", Counter::default(), Counter::default)
-        .expect("valid records");
+    let mut register = || -> Result<(), BuildError> {
+        table.register("gain", gain(), Gain::new)?;
+        table.register("doubler", Doubler, || Doubler)?;
+        table.register("summer", Summer, || Summer)?;
+        table.register("counter", Counter::default(), Counter::default)?;
+        Ok(())
+    };
+    register().expect("valid records");
     table
 }
 
@@ -284,14 +281,8 @@ fn test_separate_input_bindings() {
             },
             SystemConfig {
                 inputs: vec![
-                    InputConfig {
-                        port: "a".into(),
-                        from: vec![PortRef::new("one", "imu")],
-                    },
-                    InputConfig {
-                        port: "b".into(),
-                        from: vec![PortRef::new("ten", "imu")],
-                    },
+                    InputConfig::new("a", "one", "imu"),
+                    InputConfig::new("b", "ten", "imu"),
                 ],
                 ..SystemConfig::new("sum", "summer")
             },
@@ -325,10 +316,7 @@ fn test_pipeline_matches_trait() {
                 ..SystemConfig::new("imu", "gain")
             },
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "imu".into(),
-                    from: vec![PortRef::new("imu", "imu")],
-                }],
+                inputs: vec![InputConfig::new("imu", "imu", "imu")],
                 ..SystemConfig::new("nav", "doubler")
             },
         ],
@@ -474,10 +462,7 @@ fn pad_config(
         systems: vec![
             SystemConfig::new("padder", "padder"),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "log".into(),
-                    from: vec![PortRef::new("padder", "log")],
-                }],
+                inputs: vec![InputConfig::new("log", "padder", "log")],
                 ..SystemConfig::new("probe", "log_probe")
             },
         ],
@@ -488,17 +473,7 @@ fn pad_config(
 
 /// Lines of `line` one `log` ring holds at the default ring depth.
 fn padded_records(line: &str, now: Timestamp) -> usize {
-    let event = LogEvent {
-        timestamp: now,
-        level: LogLevel::Info,
-        source: "".into(),
-        target: "".into(),
-        message: line.to_string().into(),
-        span: None,
-        fields: Vec::new(),
-        file: None,
-        line: None,
-    };
+    let event = crate::log::line(now, LogLevel::Info, line.to_string(), Vec::new());
     let mut buf = vec![0u8; LogEvent::MAX_LEN];
     let len = event.encode(&mut buf).expect("encodes").len();
     let depth = LogEvent::DEPTH * CoordinatorConfig::default().ring_depth;
@@ -608,9 +583,7 @@ fn test_stateless_default_registration() {
 
 #[test]
 fn test_direct_call_writes_output() {
-    let imu = ring::<Imu>();
-    let mut output = Output::<Imu>::new(imu.writer(NoWake).expect("free writer"));
-    let mut input = Input::<Imu>::new(vec![imu.view(NoWake).expect("free slot")]);
+    let (_imu, mut output, mut input) = pair::<Imu>(8);
     gain()(&mut Gain(3.0), &mut output);
     let sample = input.latest().expect("valid").map(|f| f.sample);
     assert_eq!(sample, Some(3.0));
@@ -652,13 +625,6 @@ fn test_constructor_param_schema() {
             .contains(r#""description":"The constant this system publishes.""#)
     );
     assert!(schema.get().contains(r#""k""#));
-}
-
-fn ring<R: Record + ?Sized>() -> RingBuffer {
-    RingBuffer::create_in_memory(Config {
-        capacity: ring_capacity(R::MAX_LEN, 8).expect("valid capacity"),
-        max_readers: 2,
-    })
 }
 
 /// Forwards records as they arrive.
@@ -717,10 +683,10 @@ fn test_async_adapter_relay() {
         vec![Input::<Imu>::def(&DefCx::empty(), "imu")]
     );
 
-    let (imu, nav, log) = (ring::<Imu>(), ring::<Nav>(), ring::<LogEvent>());
-    let source = Output::<Imu, _>::new(imu.writer(NoWake).expect("free writer"));
-    let mut estimates = Input::<Nav>::new(vec![nav.view(NoWake).expect("free slot")]);
-    let mut lines = Input::<LogEvent>::new(vec![log.view(NoWake).expect("free slot")]);
+    let (imu, nav, log) = (ring::<Imu>(8, 1), ring::<Nav>(8, 1), ring::<LogEvent>(8, 1));
+    let source = output::<Imu>(&imu);
+    let mut estimates = input::<Nav>(&nav);
+    let mut lines = input::<LogEvent>(&log);
 
     let mut threads = Threads::new();
     let def = entry.def.clone();
@@ -839,10 +805,7 @@ fn test_sample_sees_this_cycle() {
         systems: vec![
             SystemConfig::new("count", "counting"),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "imu".into(),
-                    from: vec![PortRef::new("count", "imu")],
-                }],
+                inputs: vec![InputConfig::new("imu", "count", "imu")],
                 ..SystemConfig::new("sample", "sampling")
             },
         ],

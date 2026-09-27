@@ -11,9 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use metor_fsw_3::coordinator::{
-    CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable,
-};
+use metor_fsw_3::coordinator::{CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
 use metor_fsw_3::link::register_builtins;
 use metor_fsw_3::{Clock, Frame, LinkStatus, Output, Timestamp, system};
 use metor_proto::types::{ComponentId, Msg, OwnedPacket};
@@ -303,10 +301,7 @@ fn impostor(port: u16) -> Impostor {
                         "namespace": "a",
                         "link": "pub",
                     }),
-                    inputs: vec![InputConfig {
-                        port: "imu.imu".into(),
-                        from: vec![PortRef::new("imu", "imu")],
-                    }],
+                    inputs: vec![InputConfig::new("imu.imu", "imu", "imu")],
                     ..SystemConfig::new("pub", "fsw.publish")
                 },
             ],
