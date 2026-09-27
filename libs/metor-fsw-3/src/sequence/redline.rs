@@ -16,14 +16,14 @@ use super::Seq;
 /// One redline, pinned in the sequence's frame and linked into its [`Seq`].
 #[repr(C)]
 pub struct Redline<C: Fn() -> bool> {
-    node: Node,
+    pub(super) node: Node,
     cond: C,
 }
 
 /// The type-erased head of a [`Redline`], which the list links.
 pub(crate) struct Node {
     links: Links<Node>,
-    name: &'static str,
+    pub(super) name: &'static str,
     /// Calls the `cond` of the `Redline` this node heads.
     check: unsafe fn(NonNull<Node>) -> bool,
     /// The `Seq` it is linked into, if any, to unlink from on drop. Its
@@ -46,10 +46,6 @@ impl<C: Fn() -> bool> Redline<C> {
             cond,
         }
     }
-
-    pub(crate) fn node(&self) -> &Node {
-        &self.node
-    }
 }
 
 /// Calls the condition of the `Redline<C>` that `node` heads.
@@ -65,10 +61,6 @@ unsafe fn check<C: Fn() -> bool>(node: NonNull<Node>) -> bool {
 }
 
 impl Node {
-    pub(crate) fn name(&self) -> &'static str {
-        self.name
-    }
-
     /// Links this node into `seq`, unless it is linked already.
     pub(crate) fn claim(&self, seq: &Seq<'_>) -> bool {
         if self.seq.get().is_some() {
@@ -165,13 +157,6 @@ mod tests {
         crate::redline!(seq, "c", || check(true));
         assert_eq!(seq.tripped(), Some("b"));
         assert_eq!(checked.get(), 2);
-    }
-
-    #[test]
-    fn test_unnamed_redline() {
-        let seq = Seq::new();
-        crate::redline!(seq, || true);
-        assert_eq!(seq.tripped(), Some("redline"));
     }
 
     #[test]

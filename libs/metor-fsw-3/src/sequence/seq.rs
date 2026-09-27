@@ -48,17 +48,9 @@ pub enum SeqError {
 }
 
 impl Clock {
-    fn now(&self) -> Timestamp {
-        self.now.get()
-    }
-
-    fn aborted(&self) -> bool {
-        self.aborted.get()
-    }
-
     /// The deadline `dur` after this cycle, armed once and kept.
     fn arm(&self, deadline: &mut Option<Timestamp>, dur: Duration) -> Timestamp {
-        *deadline.get_or_insert_with(|| after(self.now(), dur))
+        *deadline.get_or_insert_with(|| after(self.now.get(), dur))
     }
 }
 
@@ -78,12 +70,12 @@ impl<'a> Seq<'a> {
 
     /// This cycle's time.
     pub fn now(&self) -> Timestamp {
-        self.clock.now()
+        self.clock.now.get()
     }
 
     /// Whether the sequence was aborted; once true it stays true.
     pub fn aborted(&self) -> bool {
-        self.clock.aborted()
+        self.clock.aborted.get()
     }
 
     /// Aborts the sequence: sets the abort flag and returns the error to end it with.
@@ -102,11 +94,7 @@ impl<'a> Seq<'a> {
 
     /// Resolves once `dur` of cycle time has passed since its first poll.
     pub fn sleep(&self, dur: Duration) -> Sleep<'_> {
-        Sleep {
-            clock: &self.clock,
-            dur,
-            deadline: None,
-        }
+        Sleep(self.wait_for(dur, || false))
     }
 
     /// Resolves once `pred` holds, checked on every poll from the first,
@@ -190,7 +178,7 @@ impl<'a> Seq<'a> {
     /// }
     /// ```
     pub fn redline<C: Fn() -> bool + 'a>(&self, redline: Pin<&Redline<C>>) {
-        if self.walking.get() || !redline.node().claim(self) {
+        if self.walking.get() || !redline.node.claim(self) {
             return;
         }
         let node = NonNull::from(redline.get_ref()).cast::<Node>();
@@ -231,7 +219,7 @@ impl<'a> Seq<'a> {
             // borrows a local across an `.await`.
             .find(|&node| unsafe { Node::holds(node) })
             // SAFETY: as above, a linked node is live.
-            .map(|node| unsafe { node.as_ref() }.name())
+            .map(|node| unsafe { node.as_ref() }.name)
     }
 }
 
@@ -299,27 +287,19 @@ fn after(now: Timestamp, dur: Duration) -> Timestamp {
     Timestamp(now.0.saturating_add(micros))
 }
 
-/// The future [`Seq::sleep`] returns.
+/// The future [`Seq::sleep`] returns: a wait that never holds, whose
+/// timeout is its end.
 #[must_use = "a sleep does nothing unless awaited"]
-pub struct Sleep<'a> {
-    clock: &'a Clock,
-    dur: Duration,
-    deadline: Option<Timestamp>,
-}
+pub struct Sleep<'a>(WaitFor<'a, fn() -> bool>);
 
 impl Future for Sleep<'_> {
     type Output = Result<(), SeqError>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        if this.clock.aborted() {
-            return Poll::Ready(Err(SeqError::Aborted));
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.get_mut().0).poll(cx) {
+            Poll::Ready(Err(SeqError::TimedOut)) => Poll::Ready(Ok(())),
+            polled => polled,
         }
-        let deadline = this.clock.arm(&mut this.deadline, this.dur);
-        if this.clock.now() >= deadline {
-            return Poll::Ready(Ok(()));
-        }
-        Poll::Pending
     }
 }
 
@@ -337,14 +317,14 @@ impl<F: FnMut() -> bool + Unpin> Future for WaitFor<'_, F> {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if this.clock.aborted() {
+        if this.clock.aborted.get() {
             return Poll::Ready(Err(SeqError::Aborted));
         }
         if (this.pred)() {
             return Poll::Ready(Ok(()));
         }
         let deadline = this.clock.arm(&mut this.deadline, this.timeout);
-        if this.clock.now() >= deadline {
+        if this.clock.now.get() >= deadline {
             return Poll::Ready(Err(SeqError::TimedOut));
         }
         Poll::Pending
@@ -364,7 +344,7 @@ impl Future for NextCycle<'_> {
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Timestamp> {
         let this = self.get_mut();
         if core::mem::replace(&mut this.polled, true) {
-            return Poll::Ready(this.clock.now());
+            return Poll::Ready(this.clock.now.get());
         }
         Poll::Pending
     }
@@ -376,6 +356,7 @@ mod tests {
     use core::task::Waker;
 
     use super::*;
+    use crate::sequence::tests::{Trace, ms};
 
     const MS: Duration = Duration::from_millis(1);
 
@@ -383,21 +364,16 @@ mod tests {
         future.poll(&mut Context::from_waker(Waker::noop()))
     }
 
-    /// Sets the handle to `now` in milliseconds.
-    fn at(seq: &Seq, ms: i64) {
-        seq.set_now(Timestamp(ms * 1_000));
-    }
-
     #[test]
     fn test_sleep_arms_on_first_poll() {
         let seq = Seq::new();
-        at(&seq, 0);
+        seq.set_now(ms(0));
         let mut sleep = pin!(seq.sleep(10 * MS));
-        at(&seq, 5);
+        seq.set_now(ms(5));
         assert_eq!(poll(sleep.as_mut()), Poll::Pending);
-        at(&seq, 14);
+        seq.set_now(ms(14));
         assert_eq!(poll(sleep.as_mut()), Poll::Pending);
-        at(&seq, 15);
+        seq.set_now(ms(15));
         assert_eq!(poll(sleep.as_mut()), Poll::Ready(Ok(())));
     }
 
@@ -423,7 +399,7 @@ mod tests {
         let ready = Cell::new(false);
         let mut wait = pin!(seq.wait_for(10 * MS, || ready.get()));
         assert_eq!(poll(wait.as_mut()), Poll::Pending);
-        at(&seq, 3);
+        seq.set_now(ms(3));
         ready.set(true);
         assert_eq!(poll(wait.as_mut()), Poll::Ready(Ok(())));
     }
@@ -433,9 +409,9 @@ mod tests {
         let seq = Seq::new();
         let mut wait = pin!(seq.wait_for(10 * MS, || false));
         assert_eq!(poll(wait.as_mut()), Poll::Pending);
-        at(&seq, 9);
+        seq.set_now(ms(9));
         assert_eq!(poll(wait.as_mut()), Poll::Pending);
-        at(&seq, 10);
+        seq.set_now(ms(10));
         assert_eq!(poll(wait.as_mut()), Poll::Ready(Err(SeqError::TimedOut)));
     }
 
@@ -452,7 +428,7 @@ mod tests {
         let mut sleep = pin!(seq.sleep(10 * MS));
         let mut wait = pin!(seq.wait_for(10 * MS, || true));
         assert_eq!(poll(sleep.as_mut()), Poll::Pending);
-        at(&seq, 10);
+        seq.set_now(ms(10));
         let _ = seq.abort();
         assert_eq!(poll(sleep.as_mut()), Poll::Ready(Err(SeqError::Aborted)));
         assert_eq!(poll(wait.as_mut()), Poll::Ready(Err(SeqError::Aborted)));
@@ -464,7 +440,7 @@ mod tests {
         let _ = seq.abort();
         let mut next = pin!(seq.next_cycle());
         assert_eq!(poll(next.as_mut()), Poll::Pending);
-        at(&seq, 7);
+        seq.set_now(ms(7));
         assert_eq!(poll(next.as_mut()), Poll::Ready(Timestamp(7_000)));
     }
 
@@ -476,24 +452,10 @@ mod tests {
         assert_eq!(poll(next.as_mut()), Poll::Ready(Timestamp(0)));
     }
 
-    /// Handlers' names, in the order they ran.
-    #[derive(Default)]
-    struct Ran(core::cell::RefCell<Vec<&'static str>>);
-
-    impl Ran {
-        fn push(&self, name: &'static str) {
-            self.0.borrow_mut().push(name);
-        }
-
-        fn take(&self) -> Vec<&'static str> {
-            self.0.take()
-        }
-    }
-
     #[test]
     fn test_handler_runs_only_on_abort() {
         let seq = Seq::new();
-        let ran = Ran::default();
+        let ran = Trace::default();
         drop(seq.on_abort(|_| ran.push("calm")));
         assert!(ran.take().is_empty());
         let guard = seq.on_abort(|seq| {
@@ -508,7 +470,7 @@ mod tests {
     #[test]
     fn test_handlers_run_innermost_first() {
         let seq = Seq::new();
-        let ran = Ran::default();
+        let ran = Trace::default();
         {
             let _first = seq.on_abort(|_| ran.push("first"));
             let _second = seq.on_abort(|_| ran.push("second"));
@@ -528,7 +490,7 @@ mod tests {
         let (_ring, output, mut lines) = pair::<LogEvent>(4);
         let mut port = LogPort::new(output);
         let seq = Seq::new();
-        let ran = Ran::default();
+        let ran = Trace::default();
         with_log_port(&mut port, Timestamp(3), || {
             let _outer = seq.on_abort(|_| ran.push("outer"));
             let _inner = seq.on_abort(|_| panic!("valve stuck"));
