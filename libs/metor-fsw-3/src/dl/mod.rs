@@ -33,6 +33,8 @@ pub enum PackError {
     DescriptorTooLarge { capacity: usize },
     #[error("pack descriptor export failed with status {0}")]
     DescriptorStatus(u32),
+    #[error("reading the module: {0}")]
+    Read(std::io::Error),
     #[error("the module: {0}")]
     Wasm(WasmError),
     #[error("the module trapped: {0}")]

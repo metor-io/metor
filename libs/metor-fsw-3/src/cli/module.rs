@@ -458,11 +458,7 @@ mod tests {
     }
 
     fn rendered(systems: Vec<PackSystemDef>) -> Result<String, PackDevError> {
-        let reference = PackRef {
-            id: "test".into(),
-            lib: "test_pack".into(),
-            libs: "unused".into(),
-        };
+        let reference = PackRef::dylib("test".into(), "test_pack".into(), "unused".into());
         render(&reference, 1, &PackDef { systems })
     }
 

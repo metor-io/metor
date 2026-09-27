@@ -69,11 +69,7 @@ pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
     let _build = BUILD.lock().unwrap_or_else(|e| e.into_inner());
     let config = PackConfig::read(root)?;
     let module = root.join(".metor").join(&config.module);
-    let reference = PackRef {
-        id: config.id.clone(),
-        lib: config.lib.clone(),
-        libs: module.join("_libs"),
-    };
+    let reference = PackRef::dylib(config.id.clone(), config.lib.clone(), module.join("_libs"));
     let libs = reference.libs.join(triple());
     let dylib = libs.join(cdylib_name(&config.lib));
     if crate::dl::is_loaded(&dylib) {

@@ -13,12 +13,12 @@ use std::sync::Arc;
 use tracing_subscriber::layer::SubscriberExt;
 
 use super::cargo::{lookup, read_toml, string};
-use super::config::{ConfigError, DeploymentConfig, TargetConfig};
+use super::config::{ConfigError, DeploymentConfig, PackRef, TargetConfig};
 use super::pack_dev::{PackDevError, pack_dev};
 use crate::coordinator::{BuildError, Clock, Coordinator, SystemTable};
 use crate::deploy::{self, DeployError};
 use crate::dl::store;
-use crate::dl::{DlPack, Pack, PackError};
+use crate::dl::{Pack, PackError};
 use crate::pack::ABI_VERSION;
 
 /// The metor-config package in this checkout, for an in-repo run.
@@ -274,12 +274,7 @@ fn table_for(config: &TargetConfig) -> Result<SystemTable, RunError> {
     let opened: Vec<Pack> = config
         .packs
         .iter()
-        .map(|pack| {
-            let path = pack.artifact();
-            // SAFETY: the path names a pack `pack dev` built against this ABI;
-            // `open` checks the version before calling anything else.
-            unsafe { DlPack::open(&path) }.map(Pack::Dl)
-        })
+        .map(PackRef::open)
         .collect::<Result<_, _>>()?;
     for (reference, pack) in config.packs.iter().zip(opened) {
         table.register_pack(&reference.id, Arc::new(pack))?;

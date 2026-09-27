@@ -15,11 +15,7 @@ fn execute(schema: Value, text: &str, script: &str) {
         "def": {"name": "probe", "inputs": [], "outputs": []}
     }]}))
     .expect("descriptor");
-    let reference = PackRef {
-        id: text.into(),
-        lib: text.into(),
-        libs: "unused".into(),
-    };
+    let reference = PackRef::dylib(text.into(), text.into(), "unused".into());
     let module = render(&reference, ABI_VERSION, &descriptor).expect("renders");
     let dir = tempfile::tempdir().expect("temporary directory");
     std::fs::write(dir.path().join("generated.py"), module).expect("module");

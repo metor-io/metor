@@ -155,6 +155,14 @@ pub fn cdylib_name(stem: &str) -> String {
     )
 }
 
+/// The target a pack is built for as a module.
+pub const WASM_TRIPLE: &str = "wasm32-unknown-unknown";
+
+/// The file name a module of `stem` has.
+pub fn wasm_name(stem: &str) -> String {
+    format!("{stem}.wasm")
+}
+
 /// Copies `src` over `dst` through a temp file beside it, then renames.
 ///
 /// macOS kill-caches a code signature by inode, so a dylib written in place
