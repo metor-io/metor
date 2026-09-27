@@ -1,5 +1,7 @@
 error: `#[system]` goes on a free fn
- --> tests/ui/system_on_impl.rs:6:6
+ --> tests/ui/system_on_impl.rs:5:1
   |
-6 | impl Counter {
-  |      ^^^^^^^
+5 | #[system]
+  | ^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)

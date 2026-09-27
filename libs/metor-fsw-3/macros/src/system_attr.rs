@@ -38,15 +38,8 @@ pub fn sequence(item: TokenStream) -> TokenStream {
 fn expand(item: TokenStream2, fsw: &TokenStream2, kind: Kind) -> TokenStream2 {
     match syn::parse2::<Item>(item) {
         Ok(Item::Fn(f)) => expand_fn(f, fsw, kind),
-        Ok(Item::Impl(block)) => {
-            let err = syn::Error::new_spanned(
-                &block.self_ty,
-                "`#[system]` goes on a free fn",
-            );
-            with_error(block, err)
-        }
         Ok(other) => {
-            let err = syn::Error::new_spanned(&other, "`#[system]` goes on a fn");
+            let err = syn::Error::new(Span::call_site(), "`#[system]` goes on a free fn");
             with_error(other, err)
         }
         Err(e) => e.to_compile_error(),
@@ -345,24 +338,8 @@ fn emit(f: ItemFn, sig: &Sig, fsw: &TokenStream2) -> TokenStream2 {
     let (vis, name) = (&f.vis, &f.sig.ident);
     let type_params = f.sig.generics.type_params().map(|p| &p.ident);
     let state_ty = sig.state_ty();
-    let fn_ptr = fn_ptr(sig);
-    let (bound, call) = if sig.kind == Kind::Sequence {
-        (
-            quote!(#fsw::SequenceFn<State = #state_ty>),
-            sequence_call(sig, &generics, fsw),
-        )
-    } else if sig.stop {
-        (
-            quote!(#fsw::AsyncSystemFn<State = #state_ty>),
-            async_call(sig, &generics, fsw),
-        )
-    } else {
-        (
-            quote!(#fsw::SystemFn<State = #state_ty> + ::core::ops::Deref<Target = #fn_ptr>),
-            sync_call(sig, &generics, fsw),
-        )
-    };
-    let ports = ports_impl(sig, &name.to_string(), &doc, &generics, fsw);
+    let (bound, call) = call_impl(sig, &state_ty, &generics, fsw);
+    let ports = ports_impl(sig, &name.to_string(), &doc, &state_ty, &generics, fsw);
     let mut body_sig = Signature {
         ident: format_ident!("__metor_body"),
         ..f.sig.clone()
@@ -390,23 +367,17 @@ fn emit(f: ItemFn, sig: &Sig, fsw: &TokenStream2) -> TokenStream2 {
     }
 }
 
-/// `fn(..)` over every parameter type, as the user wrote them.
-fn fn_ptr(sig: &Sig) -> TokenStream2 {
-    let tys = sig.args.iter().map(|arg| &arg.ty);
-    quote!(fn(#(#tys),*))
-}
-
 fn ports_impl(
     sig: &Sig,
     name: &str,
     doc: &str,
+    state_ty: &Type,
     generics: &Generics,
     fsw: &TokenStream2,
 ) -> TokenStream2 {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let keys = sig.ports().map(|arg| key_type(&arg.ty));
     let names = sig.ports().map(|arg| arg.ident.to_string());
-    let state_ty = sig.state_ty();
     quote! {
         impl #impl_generics #fsw::Ports for __MetorSystem #ty_generics #where_clause {
             type State = #state_ty;
@@ -418,111 +389,92 @@ fn ports_impl(
     }
 }
 
-/// The pieces every `call` shares: the state pattern, the items pattern, the
-/// `Param` asserts, and the call into the body.
-struct CallParts {
-    state: TokenStream2,
-    items: TokenStream2,
-    asserts: TokenStream2,
-    body: TokenStream2,
-}
-
-fn call_parts(sig: &Sig, generics: &Generics, fsw: &TokenStream2) -> CallParts {
+/// The bound the rewritten fn returns, and the impls behind it. Each `call`
+/// unpacks the state and ports, asserts each port is a `Param`, and calls the body.
+fn call_impl(
+    sig: &Sig,
+    state_ty: &Type,
+    generics: &Generics,
+    fsw: &TokenStream2,
+) -> (TokenStream2, TokenStream2) {
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let turbofish = ty_generics.as_turbofish();
     let state = match sig.state {
         Some(i) => sig.args[i].ident.to_token_stream(),
         None => quote!(_),
     };
     let idents = sig.ports().map(|arg| &arg.ident);
+    let items = quote!((#(#idents,)*): <Self::Params as #fsw::Param>::Item);
     // Spanned at each parameter type, so a type that is no `Param` errors there.
     let asserts = sig.ports().map(|arg| {
         let key = key_type(&arg.ty);
         quote_spanned! { arg.ty.span() => #fsw::fn_system::assert_param::<#key>(); }
     });
     let args = sig.args.iter().map(|arg| &arg.ident);
-    let (_, ty_generics, _) = generics.split_for_impl();
-    let turbofish = ty_generics.as_turbofish();
-    CallParts {
-        state,
-        items: quote!((#(#idents,)*)),
-        asserts: quote!(#(#asserts)*),
-        body: quote!(__metor_body #turbofish (#(#args),*)),
-    }
-}
-
-fn sync_call(sig: &Sig, generics: &Generics, fsw: &TokenStream2) -> TokenStream2 {
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let CallParts {
-        state,
-        items,
-        asserts,
-        body,
-    } = call_parts(sig, generics, fsw);
-    let state_ty = sig.state_ty();
-    let fn_ptr = fn_ptr(sig);
-    let turbofish = ty_generics.as_turbofish();
-    quote! {
-        impl #impl_generics #fsw::SystemFn for __MetorSystem #ty_generics #where_clause {
-            fn call(
-                #state: &mut #state_ty,
-                #items: <Self::Params as #fsw::Param>::Item<'_, #fsw::ring::NoWake>,
-            ) {
-                #asserts
-                #body
+    let body = quote!(#(#asserts)* __metor_body #turbofish (#(#args),*));
+    let impl_for = |trait_: TokenStream2, call: TokenStream2| {
+        quote! {
+            impl #impl_generics #fsw::#trait_ for __MetorSystem #ty_generics #where_clause {
+                #call
             }
         }
-        impl #impl_generics ::core::ops::Deref for __MetorSystem #ty_generics #where_clause {
-            type Target = #fn_ptr;
-            fn deref(&self) -> &Self::Target {
-                &(__metor_body #turbofish as #fn_ptr)
-            }
+    };
+    match (sig.kind, sig.args.last().filter(|_| sig.stop)) {
+        (Kind::Sequence, _) => {
+            let brand = brand_lifetime();
+            let call = quote! {
+                async fn call<#brand>(
+                    #state: &#brand mut #state_ty,
+                    #items<#brand, #fsw::ring::NoWake>,
+                ) -> ::core::result::Result<(), #fsw::SeqError> {
+                    #body.await
+                }
+            };
+            (
+                quote!(#fsw::SequenceFn<State = #state_ty>),
+                impl_for(quote!(SequenceFn), call),
+            )
         }
-    }
-}
-
-fn async_call(sig: &Sig, generics: &Generics, fsw: &TokenStream2) -> TokenStream2 {
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let CallParts {
-        state,
-        items,
-        asserts,
-        body,
-    } = call_parts(sig, generics, fsw);
-    let state_ty = sig.state_ty();
-    // PANIC Safety: `Sig::parse` checked an async fn ends in `stop`.
-    let stop = &sig.args.last().expect("a stop parameter").ident;
-    quote! {
-        impl #impl_generics #fsw::AsyncSystemFn for __MetorSystem #ty_generics #where_clause {
-            async fn call(
-                #state: &mut #state_ty,
-                #items: <Self::Params as #fsw::Param>::Item<'_, #fsw::ring::Notifier>,
-                #stop: #fsw::Stop,
-            ) {
-                #asserts
-                #body.await
-            }
+        (Kind::System, Some(stop)) => {
+            let stop = &stop.ident;
+            let call = quote! {
+                async fn call(
+                    #state: &mut #state_ty,
+                    #items<'_, #fsw::ring::Notifier>,
+                    #stop: #fsw::Stop,
+                ) {
+                    #body.await
+                }
+            };
+            (
+                quote!(#fsw::AsyncSystemFn<State = #state_ty>),
+                impl_for(quote!(AsyncSystemFn), call),
+            )
         }
-    }
-}
-
-fn sequence_call(sig: &Sig, generics: &Generics, fsw: &TokenStream2) -> TokenStream2 {
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let CallParts {
-        state,
-        items,
-        asserts,
-        body,
-    } = call_parts(sig, generics, fsw);
-    let state_ty = sig.state_ty();
-    let brand = brand_lifetime();
-    quote! {
-        impl #impl_generics #fsw::SequenceFn for __MetorSystem #ty_generics #where_clause {
-            async fn call<#brand>(
-                #state: &#brand mut #state_ty,
-                #items: <Self::Params as #fsw::Param>::Item<#brand, #fsw::ring::NoWake>,
-            ) -> ::core::result::Result<(), #fsw::SeqError> {
-                #asserts
-                #body.await
-            }
+        (Kind::System, None) => {
+            let tys = sig.args.iter().map(|arg| &arg.ty);
+            let fn_ptr = quote!(fn(#(#tys),*));
+            let call = impl_for(
+                quote!(SystemFn),
+                quote! {
+                    fn call(#state: &mut #state_ty, #items<'_, #fsw::ring::NoWake>) {
+                        #body
+                    }
+                },
+            );
+            let impls = quote! {
+                #call
+                impl #impl_generics ::core::ops::Deref for __MetorSystem #ty_generics #where_clause {
+                    type Target = #fn_ptr;
+                    fn deref(&self) -> &Self::Target {
+                        &(__metor_body #turbofish as #fn_ptr)
+                    }
+                }
+            };
+            (
+                quote!(#fsw::SystemFn<State = #state_ty> + ::core::ops::Deref<Target = #fn_ptr>),
+                impls,
+            )
         }
     }
 }
