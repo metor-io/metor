@@ -4,7 +4,7 @@
 use core::fmt::Write;
 use std::borrow::Cow;
 
-use metor_fsw_3_ring::{Config, NoWake, ReadError, View, WakeSource, Writer};
+use metor_fsw_3_ring::{Config, NoWake, ReadError, View, WakeSource, WriteError, Writer};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 
@@ -19,6 +19,16 @@ const DROP_REPORT_CYCLES: u64 = 100;
 /// A log line's fields, as the mirrors keep them between cycles.
 type Fields = Vec<(Cow<'static, str>, Cow<'static, str>)>;
 
+/// A ring on either side of a mirror broke a structural invariant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Corrupt;
+
+impl From<ReadError> for Corrupt {
+    fn from(ReadError::Corrupt: ReadError) -> Self {
+        Corrupt
+    }
+}
+
 /// One ring copied into another, and the records the destination refused.
 pub(crate) struct Mirror<W: WakeSource> {
     pub(crate) port: Cow<'static, str>,
@@ -29,14 +39,20 @@ pub(crate) struct Mirror<W: WakeSource> {
 
 impl<W: WakeSource> Mirror<W> {
     /// Moves every waiting record, counting the ones that found no room.
-    /// Stops at the first corrupt record, keeping the ones before it moved.
-    pub(crate) fn drain(&mut self) -> Result<(), ReadError> {
-        let moved = self.from.drain().try_for_each(|record| {
-            if self.into.try_write(record?).is_err() {
-                self.dropped += 1;
-            }
-            Ok(())
-        });
+    /// Stops at the first corrupt record or destination, keeping the records
+    /// before it moved.
+    pub(crate) fn drain(&mut self) -> Result<(), Corrupt> {
+        let moved = self
+            .from
+            .drain()
+            .try_for_each(|record| match self.into.try_write(record?) {
+                Ok(()) => Ok(()),
+                Err(WriteError::Corrupt) => Err(Corrupt),
+                Err(WriteError::WouldBlock | WriteError::InsufficientCapacity) => {
+                    self.dropped += 1;
+                    Ok(())
+                }
+            });
         self.from.settle();
         moved
     }
@@ -76,16 +92,16 @@ impl<W: WakeSource> Mirrors<W> {
         }
     }
 
-    /// Drains every input mirror, returning the first corrupt record's error.
-    pub(crate) fn drain_inputs(&mut self) -> Result<(), ReadError> {
+    /// Drains every input mirror, returning the first corruption.
+    pub(crate) fn drain_inputs(&mut self) -> Result<(), Corrupt> {
         self.inputs
             .iter_mut()
             .map(Mirror::drain)
             .fold(Ok(()), Result::and)
     }
 
-    /// Drains every output mirror, returning the first corrupt record's error.
-    pub(crate) fn drain_outputs(&mut self) -> Result<(), ReadError> {
+    /// Drains every output mirror, returning the first corruption.
+    pub(crate) fn drain_outputs(&mut self) -> Result<(), Corrupt> {
         self.outputs
             .iter_mut()
             .map(Mirror::drain)
@@ -202,7 +218,7 @@ fn log_port(def: &SystemDef) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use metor_fsw_3_ring::RingBuffer;
 
     use super::*;
@@ -221,6 +237,23 @@ mod tests {
             into: into.writer(NoWake).expect("a free writer"),
             dropped: 0,
         }
+    }
+
+    pub(crate) fn region_bytes(ring: &RingBuffer) -> Vec<u8> {
+        let (base, len) = ring.region();
+        // SAFETY: the region is live, and no handle writes it during the copy.
+        unsafe { core::slice::from_raw_parts(base, len) }.to_vec()
+    }
+
+    /// Where reader slot 0's cursor sits in a region of `config`: the first
+    /// byte that claiming the slot changes.
+    pub(crate) fn slot_cursor(config: Config) -> usize {
+        let ring = RingBuffer::create_in_memory(config);
+        let free = region_bytes(&ring);
+        let _view = ring.view(NoWake).expect("a free reader slot");
+        let claimed = region_bytes(&ring);
+        let changed = free.iter().zip(&claimed).position(|(a, b)| a != b);
+        changed.expect("claiming a slot writes its cursor")
     }
 
     fn records(view: &mut View<NoWake>) -> Vec<Vec<u8>> {
@@ -243,8 +276,24 @@ mod tests {
         // SAFETY: the header is inside the region, and nothing reads it concurrently.
         unsafe { base.add(second).cast::<u64>().write(u64::from(u32::MAX)) };
 
-        assert_eq!(copy.drain(), Err(ReadError::Corrupt));
+        assert_eq!(copy.drain(), Err(Corrupt));
         assert_eq!(records(&mut received), [b"first".to_vec()]);
+        assert_eq!(copy.dropped, 0);
+    }
+
+    #[test]
+    fn test_drain_stops_at_corrupt_destination() {
+        let (source, target) = (ring(256), ring(256));
+        let mut copy = mirror(&source, &target);
+        let writer = source.writer(NoWake).expect("a free writer");
+        writer.try_write(b"first").expect("room");
+        writer.try_write(b"second").expect("room");
+        let (base, _) = target.region();
+        let cursor = slot_cursor(target.config());
+        // SAFETY: the slot is inside the region, and nothing reads it concurrently.
+        unsafe { base.add(cursor).cast::<u64>().write(u64::MAX - 1) };
+
+        assert_eq!(copy.drain(), Err(Corrupt));
         assert_eq!(copy.dropped, 0);
     }
 

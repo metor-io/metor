@@ -3,12 +3,12 @@
 
 use std::borrow::Cow;
 
-use metor_fsw_3_ring::{NoWake, ReadError};
+use metor_fsw_3_ring::NoWake;
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogLevel;
 
 use crate::coordinator::{EndReason, Step};
-use crate::mirror::Mirrors;
+use crate::mirror::{Corrupt, Mirrors};
 use crate::pack::Status;
 
 use super::guest::{Guest, Trap};
@@ -83,7 +83,7 @@ impl End {
 }
 
 /// The end one cycle's copies and call add up to, `None` while it runs.
-pub(super) fn end_of(copied: Result<(), ReadError>, result: Result<u32, Trap>) -> Option<End> {
+pub(super) fn end_of(copied: Result<(), Corrupt>, result: Result<u32, Trap>) -> Option<End> {
     if copied.is_err() {
         let reason = EndReason::Failed(Cow::Borrowed("corrupt ring"));
         return Some(End::host(reason, "corrupt", "a guest ring is corrupt"));

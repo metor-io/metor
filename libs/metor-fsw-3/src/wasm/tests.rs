@@ -11,6 +11,7 @@ use crate::coordinator::{EndReason, Step};
 use crate::def::DefCx;
 use crate::dl::PackError;
 use crate::dl::codec::DESCRIPTOR_CAPACITY;
+use crate::mirror::tests::{region_bytes, slot_cursor};
 use crate::mirror::{Mirror, Mirrors, mirror_config};
 use crate::pack::def::Instance;
 use crate::system::SystemDef;
@@ -236,12 +237,14 @@ fn test_raw_ring_layout() {
 }
 
 /// A guest that describes an empty pack, bump-allocates, keeps its first
-/// output ring's base in `$out` at `create`, and runs `execute` as its step.
+/// input and output rings' bases in `$in` and `$out` at `create`, and runs
+/// `execute` as its step.
 fn step_wat(execute: &str) -> String {
     format!(
         r#"(module
             (import "env" "memory" (memory 32))
             (global $heap (mut i32) (i32.const 1024))
+            (global $in (mut i32) (i32.const 0))
             (global $out (mut i32) (i32.const 0))
             (data (i32.const 16) "{json}")
             (func (export "metor_fsw_abi_version") (result i32) i32.const 9)
@@ -252,6 +255,8 @@ fn step_wat(execute: &str) -> String {
                 i32.const 0)
             (func (export "metor_fsw_def") (param i32 i32 i32 i32 i32) (result i32) i32.const 2)
             (func (export "metor_fsw_create") (param i32 i32 i32 i32 i32 i32) (result i32)
+                (if (i32.load offset=4 (local.get 3))
+                    (then (global.set $in (i32.load (i32.load (i32.load (local.get 3)))))))
                 (if (i32.load offset=4 (local.get 4))
                     (then (global.set $out (i32.load (i32.load (local.get 4))))))
                 i32.const 1)
@@ -295,12 +300,6 @@ fn record_stores(record: &[u8], corrupt: bool) -> String {
             format!("(i32.store8 (i32.add (global.get $out) (i32.const {at})) (i32.const {byte}))")
         })
         .collect()
-}
-
-fn region_bytes(ring: &RingBuffer) -> Vec<u8> {
-    let (base, len) = ring.region();
-    // SAFETY: the region is live, and no handle writes it during the copy.
-    unsafe { core::slice::from_raw_parts(base, len) }.to_vec()
 }
 
 /// A `WasmStep` over a `step_wat` guest, and the host ends of its rings.
@@ -410,6 +409,20 @@ fn test_each_end() {
         assert_eq!(rig.step.ended(), end.as_ref(), "{execute}");
         assert_eq!(rig.kinds(), kinds, "{execute}");
     }
+}
+
+#[test]
+fn test_corrupt_input_ring_ends_the_step() {
+    let cursor = slot_cursor(mirror_config(RING, 2).expect("fits"));
+    let at = format!("(i32.add (global.get $in) (i32.const {cursor}))");
+    let mut rig = rig(&format!("(i64.store {at} (i64.const -2)) i32.const 0"));
+    rig.execute();
+    assert_eq!(rig.step.ended(), None);
+    rig.feed.try_write(b"fed").expect("room");
+    rig.execute();
+    let corrupt = EndReason::Failed(Cow::Borrowed("corrupt ring"));
+    assert_eq!(rig.step.ended(), Some(&corrupt));
+    assert_eq!(rig.kinds(), ["corrupt"]);
 }
 
 #[test]
