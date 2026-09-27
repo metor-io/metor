@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import json
 import os
-import unittest
 
-from adcs_stub import Ctrl, Est, Imu, LogEvent, Mode, Nav, Ping, Plant
-from test_target import reset
+from adcs_stub import Ctrl, Imu, LogEvent, Mode, Nav, Ping, Plant
+from test_target import ConfigTest, adcs_target, reset
 
+import metor_config._deployment as deploy_mod
 from metor_config import ConfigError, Db, Deployment, Publish, Subscribe, Target, gateway
-from metor_config._deployment import to_config
 
 GOLDEN = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "tests", "golden", "deployment.json"
@@ -35,17 +34,71 @@ def design_example() -> Deployment:
     return Deployment(targets=[a, b, gw], hosts={"a": "10.0.0.2"})
 
 
-class DeploymentTest(unittest.TestCase):
-    def setUp(self) -> None:
-        reset()
-        os.environ.pop("METOR_FSW_ABI_VERSION", None)
+def plant_and_peer() -> tuple[Target, Plant, Target]:
+    """Target `a` with a plant, and an empty target `b`."""
+    a = Target(cycle_rate=100.0, namespace="a")
+    return a, a.add("plant", Plant()), Target(cycle_rate=100.0, namespace="b")
 
-    def tearDown(self) -> None:
-        reset()
 
+def member(namespace: str | None) -> Target:
+    fsw = Target(cycle_rate=100.0, namespace=namespace)
+    fsw.add("plant", Plant())
+    return fsw
+
+
+class EnvelopeTest(ConfigTest):
+    def test_bare_target_is_deployment_of_one(self) -> None:
+        bare = adcs_target().to_config()
+        reset()
+        wrapped = Deployment(targets=[adcs_target()]).to_config()
+        self.assertEqual(deploy_mod.to_config(), wrapped)
+        self.assertEqual(wrapped, {"config_version": 2, "hosts": {}, "targets": [bare]})
+
+    def test_envelope_lists_members_in_order(self) -> None:
+        a, b = member("a"), member("b")
+        config = Deployment(targets=[b, a], hosts={"a": "10.0.0.2"}).to_config()
+        self.assertEqual(
+            [t["coordinator"]["namespace"] for t in config["targets"]], ["b", "a"]
+        )
+        self.assertEqual(config["hosts"], {"a": "10.0.0.2"})
+
+    def test_deployment_of_one_needs_no_namespace(self) -> None:
+        config = Deployment(targets=[member(None)]).to_config()
+        self.assertIsNone(config["targets"][0]["coordinator"]["namespace"])
+
+    def test_members_need_distinct_namespaces(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "names a namespace"):
+            Deployment(targets=[member("a"), member(None)]).to_config()
+        with self.assertRaisesRegex(ConfigError, "namespaced `a`"):
+            Deployment(targets=[member("a"), member("a")]).to_config()
+
+    def test_hosts_name_members(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "hosts names `c`"):
+            Deployment(targets=[member("a"), member("b")], hosts={"c": "h"}).to_config()
+
+    def test_two_bare_targets_raise(self) -> None:
+        member("a")
+        member("b")
+        with self.assertRaisesRegex(ConfigError, "found 2"):
+            deploy_mod.to_config()
+
+    def test_two_deployments_raise(self) -> None:
+        Deployment(targets=[member("a")])
+        Deployment(targets=[member("b")])
+        with self.assertRaisesRegex(ConfigError, "at most one Deployment"):
+            deploy_mod.to_config()
+
+    def test_deployment_must_include_every_target(self) -> None:
+        member("a")
+        Deployment(targets=[member("b")])
+        with self.assertRaisesRegex(ConfigError, "leaves out 1 target"):
+            deploy_mod.to_config()
+
+
+class DeploymentTest(ConfigTest):
     def test_example_matches_golden(self) -> None:
         design_example()
-        written = json.dumps(to_config(), indent=2) + "\n"
+        written = json.dumps(deploy_mod.to_config(), indent=2) + "\n"
         with open(GOLDEN, encoding="utf-8") as file:
             self.assertEqual(written, file.read())
 
@@ -71,30 +124,24 @@ class DeploymentTest(unittest.TestCase):
         self.assertEqual(ctrl["inputs"][0]["from"], [{"system": "mirror", "port": "nav.est"}])
 
     def test_no_items_copies_everything(self) -> None:
-        a = Target(cycle_rate=100.0, namespace="a")
-        plant = a.add("plant", Plant())
+        a, plant, b = plant_and_peer()
         a_pub = a.add("pub", Publish([plant.imu, plant.log], listen="0.0.0.0:2240"))
-        b = Target(cycle_rate=100.0, namespace="b")
         b.add("mirror", Subscribe(peer=a_pub))
         config = Deployment(targets=[a, b]).to_config()
         outputs = config["targets"][1]["coordinator"]["systems"][0]["outputs"]
         self.assertEqual([o["port"] for o in outputs], ["plant.imu", "plant.log"])
 
     def test_records_alone_copy_nothing(self) -> None:
-        a = Target(cycle_rate=100.0, namespace="a")
-        plant = a.add("plant", Plant())
+        a, plant, b = plant_and_peer()
         a_pub = a.add("pub", Publish([plant], listen="0.0.0.0:2240"))
-        b = Target(cycle_rate=100.0, namespace="b")
         b.add("cmds", Subscribe(peer=a_pub, records=[Ping]))
         config = Deployment(targets=[a, b]).to_config()
         outputs = config["targets"][1]["coordinator"]["systems"][0]["outputs"]
         self.assertEqual(outputs, [{"port": "ping", "record": "ping"}])
 
     def test_port_returns_copy(self) -> None:
-        a = Target(cycle_rate=100.0, namespace="a")
-        plant = a.add("plant", Plant())
+        a, plant, b = plant_and_peer()
         a_pub = a.add("pub", Publish([plant], listen="0.0.0.0:2240"))
-        b = Target(cycle_rate=100.0, namespace="b")
         mirror = b.add("mirror", Subscribe(peer=a_pub, items=[plant]))
         imu = mirror.port(plant.imu)
         self.assertEqual((imu.ref.system, imu.ref.port, imu.record, imu.target), ("mirror", "plant.imu", Imu, b))
@@ -105,27 +152,21 @@ class DeploymentTest(unittest.TestCase):
             mirror.port(other.imu)
 
     def test_builtin_log_finds_the_pack_copy(self) -> None:
-        a = Target(cycle_rate=100.0, namespace="a")
-        plant = a.add("plant", Plant())
+        a, plant, b = plant_and_peer()
         cmds = a.add("cmds", Subscribe(listen="0.0.0.0:2241"))
         a_pub = a.add("pub", Publish([plant, cmds], listen="0.0.0.0:2240"))
-        b = Target(cycle_rate=100.0, namespace="b")
         mirror = b.add("mirror", Subscribe(peer=a_pub))
         self.assertIsNot(cmds.log.record, plant.log.record)
         self.assertEqual(mirror.port(cmds.log).ref.port, "plant.log")
 
     def test_foreign_source_raises(self) -> None:
-        a = Target(cycle_rate=100.0, namespace="a")
-        plant = a.add("plant", Plant())
-        b = Target(cycle_rate=100.0, namespace="b")
+        a, plant, b = plant_and_peer()
         b.add("nav", Nav(imu=plant.imu))
         with self.assertRaisesRegex(ConfigError, "`nav.imu` reads `plant.imu` on another"):
             Deployment(targets=[a, b]).to_config()
 
     def test_foreign_loop_producer_raises(self) -> None:
-        a = Target(cycle_rate=100.0, namespace="a")
-        plant = a.add("plant", Plant())
-        b = Target(cycle_rate=100.0, namespace="b")
+        a, plant, b = plant_and_peer()
         loop = b.loop(Imu)
         b.add("nav", Nav(imu=loop))
         loop.connect(plant.imu)
@@ -145,11 +186,9 @@ class DeploymentTest(unittest.TestCase):
             Subscribe(items=[plant], listen="0.0.0.0:1")
 
     def test_unpublished_item_raises(self) -> None:
-        a = Target(cycle_rate=100.0, namespace="a")
-        plant = a.add("plant", Plant())
+        a, plant, b = plant_and_peer()
         nav = a.add("nav", Nav(imu=plant.imu))
         a_pub = a.add("pub", Publish([plant.imu], listen="0.0.0.0:2240"))
-        b = Target(cycle_rate=100.0, namespace="b")
         b.add("mirror", Subscribe(peer=a_pub, items=[nav.est]))
         with self.assertRaisesRegex(ConfigError, "does not publish `nav.est`"):
             Deployment(targets=[a, b]).to_config()
@@ -235,10 +274,8 @@ class DeploymentTest(unittest.TestCase):
         self.assertEqual(db.db_status.record.__name__, "DbStatus")
 
     def test_subscribe_copies_are_publishable(self) -> None:
-        a = Target(cycle_rate=100.0, namespace="a")
-        plant = a.add("plant", Plant())
+        a, plant, b = plant_and_peer()
         a_pub = a.add("pub", Publish([plant.imu], listen="0.0.0.0:2240"))
-        b = Target(cycle_rate=100.0, namespace="b")
         mirror = b.add("mirror", Subscribe(peer=a_pub))
         b.add("pub", Publish([mirror], listen="0.0.0.0:2241"))
         config = Deployment(targets=[a, b]).to_config()
@@ -248,15 +285,10 @@ class DeploymentTest(unittest.TestCase):
             ["mirror.plant.imu", "mirror.link_status", "mirror.log", "mirror.status"],
         )
 
-    def test_est_record_is_a_frame(self) -> None:
-        self.assertEqual(Est._kind, "frame")
-
     def test_message_arrives_on_one_port(self) -> None:
-        a = Target(cycle_rate=100.0, namespace="a")
-        plant = a.add("plant", Plant())
+        a, plant, b = plant_and_peer()
         nav = a.add("nav", Nav(imu=plant.imu))
         a_pub = a.add("pub", Publish([plant, nav], listen="0.0.0.0:2240"))
-        b = Target(cycle_rate=100.0, namespace="b")
         mirror = b.add("mirror", Subscribe(peer=a_pub))
         config = Deployment(targets=[a, b]).to_config()
         outputs = config["targets"][1]["coordinator"]["systems"][0]["outputs"]

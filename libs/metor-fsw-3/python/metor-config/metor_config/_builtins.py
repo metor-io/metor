@@ -10,6 +10,7 @@ link of the deployment that `metor build` turns into an address.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Sequence, TypeVar
 
 from ._config import ABI_VERSION, ConfigError, check_abi
@@ -26,6 +27,7 @@ from ._model import (
     _edges,
     _item_ports,
     _json,
+    _unique,
 )
 from ._target import SystemHandle, Target
 
@@ -242,15 +244,15 @@ class Subscribe(Link):
         return self._copies
 
 
+@dataclass(frozen=True)
 class Copy:
     """One output copied from a peer: its name here, its record, and the
     published port it comes from."""
 
-    def __init__(self, port: str, record: type[Record], source: str, target: Any) -> None:
-        self.port = port
-        self.record = record
-        self.source = source
-        self.target = target
+    port: str
+    record: type[Record]
+    source: str
+    target: Any
 
 
 def _copies(peer: SystemHandle, items: Sequence[Item], records: Sequence[type[Record]]) -> list[Copy]:
@@ -335,7 +337,9 @@ class DlSlot(System):
     def __init__(
         self, allow: Sequence[System], initial: str | None = None, **inputs: Sources[Any]
     ) -> None:
-        names = _candidate_names(allow)
+        if not allow:
+            raise ConfigError("a slot allows at least one system")
+        names = _unique([system._ty for system in allow], "a slot allows")
         if initial is not None and initial not in names:
             raise ConfigError(f"`initial` names `{initial}`, which `allow` does not list")
         declared = allow[0]._inputs
@@ -346,16 +350,6 @@ class DlSlot(System):
         super().__init__(inputs, {"allow": candidates, "initial": initial})
         self._ports = dict(type(allow[0])._ports)
         self._names = names
-
-
-def _candidate_names(allow: Sequence[System]) -> list[str]:
-    if not allow:
-        raise ConfigError("a slot allows at least one system")
-    names = [system._ty for system in allow]
-    for name in names:
-        if names.count(name) > 1:
-            raise ConfigError(f"a slot allows `{name}` twice")
-    return names
 
 
 def _candidate(system: System) -> dict[str, Any]:

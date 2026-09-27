@@ -14,7 +14,6 @@ import metor_config._target as target_mod
 from metor_config import (
     ChannelRegistry,
     ConfigError,
-    Deployment,
     DlSlot,
     PortRef,
     Publish,
@@ -50,7 +49,16 @@ def adcs_target() -> Target:
     return fsw
 
 
-class TargetTest(unittest.TestCase):
+def reset() -> None:
+    """Leave no target or deployment behind, or the atexit hook emits to stdout."""
+    target_mod._targets.clear()
+    deploy_mod._deployments.clear()
+    deploy_mod._emitted = False
+
+
+class ConfigTest(unittest.TestCase):
+    """Starts and ends each test with no target, deployment, or env override."""
+
     def setUp(self) -> None:
         reset()
         os.environ.pop("METOR_FSW_ABI_VERSION", None)
@@ -59,6 +67,8 @@ class TargetTest(unittest.TestCase):
     def tearDown(self) -> None:
         reset()
 
+
+class TargetTest(ConfigTest):
     def test_atexit_emits_once(self) -> None:
         adcs_target()
         with tempfile.TemporaryDirectory() as dir:
@@ -181,83 +191,7 @@ class TargetTest(unittest.TestCase):
             emit()
 
 
-def reset() -> None:
-    """Leave no target or deployment behind, or the atexit hook emits to stdout."""
-    target_mod._targets.clear()
-    deploy_mod._deployments.clear()
-    deploy_mod._emitted = False
-
-
-def member(namespace: str | None) -> Target:
-    fsw = Target(cycle_rate=100.0, namespace=namespace)
-    fsw.add("plant", Plant())
-    return fsw
-
-
-class DeploymentTest(unittest.TestCase):
-    def setUp(self) -> None:
-        reset()
-        os.environ.pop("METOR_FSW_ABI_VERSION", None)
-
-    def tearDown(self) -> None:
-        reset()
-
-    def test_bare_target_is_deployment_of_one(self) -> None:
-        bare = adcs_target().to_config()
-        reset()
-        wrapped = Deployment(targets=[adcs_target()]).to_config()
-        self.assertEqual(deploy_mod.to_config(), wrapped)
-        self.assertEqual(wrapped, {"config_version": 2, "hosts": {}, "targets": [bare]})
-
-    def test_envelope_lists_members_in_order(self) -> None:
-        a, b = member("a"), member("b")
-        config = Deployment(targets=[b, a], hosts={"a": "10.0.0.2"}).to_config()
-        self.assertEqual(
-            [t["coordinator"]["namespace"] for t in config["targets"]], ["b", "a"]
-        )
-        self.assertEqual(config["hosts"], {"a": "10.0.0.2"})
-
-    def test_deployment_of_one_needs_no_namespace(self) -> None:
-        config = Deployment(targets=[member(None)]).to_config()
-        self.assertIsNone(config["targets"][0]["coordinator"]["namespace"])
-
-    def test_members_need_distinct_namespaces(self) -> None:
-        with self.assertRaisesRegex(ConfigError, "names a namespace"):
-            Deployment(targets=[member("a"), member(None)]).to_config()
-        with self.assertRaisesRegex(ConfigError, "namespaced `a`"):
-            Deployment(targets=[member("a"), member("a")]).to_config()
-
-    def test_hosts_name_members(self) -> None:
-        with self.assertRaisesRegex(ConfigError, "hosts names `c`"):
-            Deployment(targets=[member("a"), member("b")], hosts={"c": "h"}).to_config()
-
-    def test_two_bare_targets_raise(self) -> None:
-        member("a")
-        member("b")
-        with self.assertRaisesRegex(ConfigError, "found 2"):
-            deploy_mod.to_config()
-
-    def test_two_deployments_raise(self) -> None:
-        Deployment(targets=[member("a")])
-        Deployment(targets=[member("b")])
-        with self.assertRaisesRegex(ConfigError, "at most one Deployment"):
-            deploy_mod.to_config()
-
-    def test_deployment_must_include_every_target(self) -> None:
-        member("a")
-        Deployment(targets=[member("b")])
-        with self.assertRaisesRegex(ConfigError, "leaves out 1 target"):
-            deploy_mod.to_config()
-
-
-class LinkTest(unittest.TestCase):
-    def setUp(self) -> None:
-        reset()
-        os.environ.pop("METOR_FSW_ABI_VERSION", None)
-
-    def tearDown(self) -> None:
-        reset()
-
+class LinkTest(ConfigTest):
     def test_publish_handle_includes_log_and_status(self) -> None:
         fsw = Target(cycle_rate=100.0)
         plant = fsw.add("plant", Plant())
@@ -464,14 +398,7 @@ def slotted() -> tuple[Target, dict[str, dict]]:
     return fsw, {system["id"]: system for system in systems}
 
 
-class ChannelTest(unittest.TestCase):
-    def setUp(self) -> None:
-        reset()
-        os.environ.pop("METOR_FSW_ABI_VERSION", None)
-
-    def tearDown(self) -> None:
-        reset()
-
+class ChannelTest(ConfigTest):
     def test_channel_emits_adapter_and_commands(self) -> None:
         _, systems = slotted()
         nav = systems["nav"]
