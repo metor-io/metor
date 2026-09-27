@@ -154,6 +154,8 @@ pub mod record;
 pub mod sequence;
 pub mod system;
 pub mod thread;
+#[cfg(feature = "host")]
+pub mod wasm;
 
 #[cfg(test)]
 mod tests;
