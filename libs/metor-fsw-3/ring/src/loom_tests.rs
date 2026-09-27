@@ -1,5 +1,6 @@
-//! Bounded concurrency models; see `LOOM.md` for limits.
+//! Bounded concurrency models; see `VERIFY.md` for limits.
 use super::*;
+use crate::models::{self, read, ring};
 use crate::sync::thread;
 
 const CAP: usize = 64;
@@ -10,20 +11,7 @@ const _: () = assert!(FRAME == frame_len(PAYLOAD));
 const _: () = assert!(CAP % FRAME != 0, "a gap would never form");
 
 fn payload(n: u8) -> [u8; PAYLOAD] {
-    let mut p = [0u8; PAYLOAD];
-    let mut i = 0;
-    while i < PAYLOAD {
-        p[i] = n.wrapping_mul(0x11).wrapping_add(i as u8);
-        i += 1;
-    }
-    p
-}
-
-fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
-    RingBuffer::create_in_memory(Config {
-        capacity,
-        max_readers,
-    })
+    core::array::from_fn(|i| n.wrapping_mul(0x11).wrapping_add(i as u8))
 }
 
 #[test]
@@ -61,8 +49,7 @@ fn test_registration_races_backpressure() {
     loom::model(|| {
         let ring = ring(CAP, 1);
         let w = ring.writer(NoWake).unwrap();
-        // One record already committed, so a view registering below sits at a
-        // nonzero cursor and the writer's next write has to wrap around it.
+        // The registering view sits at a nonzero cursor, so the next write wraps around it.
         w.try_write(&payload(1))
             .expect("empty ring fits one record");
 
@@ -70,27 +57,23 @@ fn test_registration_races_backpressure() {
         let t = thread::spawn(move || {
             let mut v = reader.view(NoWake).unwrap();
             let start = v.cursor();
-            let mut buf = Vec::new();
             let mut seen = Vec::new();
             let mut cursor = start;
-            while v.try_read_into(&mut buf).expect("never corrupt") {
-                seen.push(buf.clone());
-                // Cursors only move forward.
+            while let Some(record) = read(&mut v) {
+                seen.push(record);
                 assert!(v.cursor() > cursor);
                 cursor = v.cursor();
             }
             (start, seen)
         });
 
-        // These race the registration above. The first wraps, which needs the
-        // whole lap; the second needs the reader to have consumed the first.
+        // The first wraps and needs the whole lap; the second needs the first consumed.
         let _ = w.try_write(&payload(2));
         let _ = w.try_write(&payload(3));
 
         let (start, seen) = t.join().unwrap();
 
-        // Registration can observe either a record end or separately
-        // published wrap padding. Padding leaves the next record unread.
+        // Registration observes a record end or published wrap padding.
         let ahead: &[u8] = if start == FRAME as u64 || start == CAP as u64 {
             &[2, 3]
         } else if start == (CAP + FRAME) as u64 || start == (2 * CAP) as u64 {
@@ -101,8 +84,6 @@ fn test_registration_races_backpressure() {
             panic!("view registered at {start}, not on a published boundary");
         };
 
-        // It may not have drained everything the writer went on to commit, but
-        // what it did read must be those records, in order, byte for byte.
         assert!(seen.len() <= ahead.len());
         for (got, &n) in seen.iter().zip(ahead) {
             assert_eq!(&got[..], &payload(n)[..], "record {n} came back wrong");
@@ -117,27 +98,22 @@ fn test_wrap_marker_precedes_commit() {
         let w = ring.writer(NoWake).unwrap();
         let mut v = ring.view(NoWake).unwrap();
 
-        // Park the reader exactly where the gap will be published: one record
-        // in, with too little room left in the lap for another.
+        // Park the reader where the gap will be published.
         w.try_write(&payload(1)).unwrap();
-        let mut buf = Vec::new();
-        assert!(v.try_read_into(&mut buf).unwrap());
-        assert_eq!(&buf[..], &payload(1)[..]);
+        assert_eq!(read(&mut v).as_deref(), Some(&payload(1)[..]));
         assert_eq!(v.cursor(), FRAME as u64);
 
         let t = thread::spawn(move || {
             w.try_write(&payload(2)).expect("the next lap is free");
         });
 
-        let mut buf = Vec::new();
-        loop {
-            match v.try_read_into(&mut buf) {
-                Ok(true) => break,
-                Ok(false) => loom::thread::yield_now(), // not published yet
-                Err(e) => panic!("gap bytes misread as a record: {e}"),
+        let record = loop {
+            match read(&mut v) {
+                Some(record) => break record,
+                None => loom::thread::yield_now(),
             }
-        }
-        assert_eq!(&buf[..], &payload(2)[..]);
+        };
+        assert_eq!(&record[..], &payload(2)[..]);
         assert_eq!(v.cursor(), (CAP + FRAME) as u64);
         t.join().unwrap();
     });
@@ -171,10 +147,8 @@ fn test_grant_pins_bytes() {
         let grant = v.try_read().expect("never corrupt").expect("committed");
         assert_eq!(&grant[..], &payload(1)[..]);
         let wrote = t.join().unwrap();
-        // Bytes must remain stable until the grant is dropped.
         assert_eq!(&grant[..], &payload(1)[..]);
-        // The grant pins the cursor at 0, and a second record needs the gap
-        // plus its own frame, which is the entire lap.
+        // The grant pins the cursor at 0; a second record needs the gap plus its frame.
         assert!(!wrote, "writer reused bytes a grant had borrowed");
         drop(grant);
     });
@@ -191,27 +165,19 @@ fn test_slowest_reader_backpressure() {
 
         let handle = ring.clone();
         let t = thread::spawn(move || {
-            // Drains as fast as it can, which frees space only up to its own
-            // cursor; the parked view still holds the floor.
-            let mut buf = Vec::new();
-            let mut n = 0;
-            while fast.try_read_into(&mut buf).expect("never corrupt") {
-                n += 1;
-            }
-            (n, handle.committed())
+            while read(&mut fast).is_some() {}
+            handle.committed()
         });
 
         let mut wrote = 1;
         while w.try_write(&payload(2)).is_ok() {
             wrote += 1;
             if wrote == 4 {
-                break; // the model only needs to reach the bound
+                break;
             }
         }
-        let (_, committed) = t.join().unwrap();
+        let committed = t.join().unwrap();
 
-        // `slow` never advanced, so nothing may be written past one lap from
-        // its cursor, no matter how far `fast` got.
         assert_eq!(slow.cursor(), 0);
         assert!(
             committed <= CAP as u64,
@@ -227,18 +193,15 @@ fn test_cursor_within_committed() {
         let w = ring.writer(NoWake).unwrap();
         let mut v = ring.view(NoWake).unwrap();
         w.try_write(&payload(1)).unwrap();
-        let mut buf = Vec::new();
-        assert!(v.try_read_into(&mut buf).unwrap());
+        assert!(read(&mut v).is_some());
 
+        // Skipping the gap parks the cursor at the lap boundary between the writer's stores.
         let reader = thread::spawn(move || {
-            // Sits on the gap and skips it, which parks the cursor at the lap
-            // boundary while the writer is between its two stores.
-            let mut buf = Vec::new();
-            let _ = v.try_read_into(&mut buf);
-            let _ = v.try_read_into(&mut buf);
+            let _ = v.try_read().map(drop);
+            let _ = v.try_read().map(drop);
         });
 
-        // Each of these calls `fits`, and so the precondition assert.
+        // Each write calls `fits`, and so its precondition assert.
         let _ = w.try_write(&payload(2));
         let _ = w.try_write(&payload(3));
         reader.join().unwrap();
@@ -247,24 +210,8 @@ fn test_cursor_within_committed() {
 
 #[test]
 fn test_registration_during_padding_publication() {
-    loom::model(|| {
-        let ring = ring(64, 1);
-        let writer = ring.writer(NoWake).unwrap();
-        writer.try_write(&[1; 8]).unwrap();
-        let consumer = ring.clone();
-        let task = thread::spawn(move || {
-            let mut reader = consumer.view(NoWake).unwrap();
-            if let Some(grant) = reader.try_read().unwrap() {
-                assert_eq!(&*grant, &[2; 48]);
-            }
-        });
-        let result = writer.try_write(&[2; 48]);
-        assert!(result.is_ok() || result == Err(WriteError::WouldBlock));
-        task.join().unwrap();
-    });
+    loom::model(models::registration_during_padding_publication);
 }
-
-const DEAD_PID: u64 = 999_999_999;
 
 #[test]
 fn test_latest_races_padding_publication() {
@@ -276,57 +223,20 @@ fn test_latest_races_padding_publication() {
         let task = thread::spawn(move || {
             assert_eq!(writer.try_write(&[2; 48]), Err(WriteError::WouldBlock));
         });
-        let grant = reader.try_latest().unwrap().unwrap();
-        assert_eq!(&*grant, &[1; 8]);
+        let latest = reader.try_latest().unwrap().unwrap();
+        assert_eq!(latest, &[1; 8]);
         task.join().unwrap();
-        assert_eq!(&*grant, &[1; 8]);
-        drop(grant);
-        assert_eq!(&*reader.try_latest().unwrap().unwrap(), &[1; 8]);
+        assert_eq!(latest, &[1; 8]);
+        assert_eq!(reader.try_latest().unwrap(), Some(&[1; 8][..]));
     });
 }
 
 #[test]
 fn test_reclaim_preserves_reused_slot() {
-    loom::model(|| {
-        let ring = ring(64, 1);
-        let reader = ring.view(NoWake).unwrap();
-        ring.inner.slot(0).owner.store(DEAD_PID, Release);
-        drop(reader);
-        assert_eq!(ring.inner.slot(0).owner.load(Acquire), 0);
-        let consumer = ring.clone();
-        let task = thread::spawn(move || {
-            let reader = consumer.view(NoWake).unwrap();
-            assert_ne!(consumer.inner.slot(0).cursor.load(Acquire), FREE_SLOT);
-            assert_eq!(consumer.inner.slot(0).owner.load(Acquire), owner_tag());
-            drop(reader);
-        });
-        // SAFETY: the synthetic owner has no live handles.
-        unsafe { ring.reclaim_owner(DEAD_PID) };
-        task.join().unwrap();
-    });
+    loom::model(models::reclaim_preserves_reused_slot);
 }
 
 #[test]
 fn test_concurrent_reclaim_preserves_new_owner() {
-    loom::model(|| {
-        let ring = ring(64, 1);
-        ring.inner.slot(0).cursor.store(0, Release);
-        ring.inner.slot(0).owner.store(DEAD_PID, Release);
-        let reclaimer = ring.clone();
-        let task = thread::spawn(move || {
-            // SAFETY: the synthetic owner has no live handles.
-            unsafe { reclaimer.reclaim_owner(DEAD_PID) };
-        });
-        // SAFETY: the synthetic owner has no live handles.
-        unsafe { ring.reclaim_owner(DEAD_PID) };
-        if let Ok(reader) = ring.view(NoWake) {
-            assert_ne!(ring.inner.slot(0).cursor.load(Acquire), FREE_SLOT);
-            assert_eq!(ring.inner.slot(0).owner.load(Acquire), owner_tag());
-            task.join().unwrap();
-            assert_ne!(ring.inner.slot(0).cursor.load(Acquire), FREE_SLOT);
-            drop(reader);
-        } else {
-            task.join().unwrap();
-        }
-    });
+    loom::model(models::concurrent_reclaim_preserves_new_owner);
 }

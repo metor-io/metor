@@ -50,8 +50,8 @@ pub struct RingExport {
 
 impl RingExport {
     pub(super) fn new(inner: Arc<Inner>) -> Self {
-        let base = inner.backing.base();
-        let len = inner.backing.len();
+        let base = inner.backing.base;
+        let len = inner.backing.len;
         let owner = RawOwner {
             context: Arc::into_raw(inner).cast(),
             retain,
@@ -92,16 +92,14 @@ unsafe extern "C" fn release(context: *const c_void) {
 #[cfg(all(test, not(ring_loom)))]
 mod tests {
     use super::*;
-    use crate::{AttachError, Config, NoWake, RingBuffer};
+    use crate::models;
+    use crate::{AttachError, NoWake, RingBuffer};
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     fn ring() -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: 64,
-            max_readers: 2,
-        })
+        models::ring(64, 2)
     }
 
     #[test]

@@ -10,8 +10,8 @@ pub(super) struct Word(pub(super) UnsafeCell<[u64; 2]>);
 
 /// An owned or borrowed byte region with a stable base address.
 pub(super) struct Backing {
-    base: *mut u8,
-    len: usize,
+    pub(super) base: *mut u8,
+    pub(super) len: usize,
     _owner: BackingOwner,
 }
 
@@ -81,16 +81,6 @@ impl Backing {
             len,
             _owner: BackingOwner::Mmap { _map: map },
         }
-    }
-
-    #[inline]
-    pub(super) fn base(&self) -> *mut u8 {
-        self.base
-    }
-
-    #[inline]
-    pub(super) fn len(&self) -> usize {
-        self.len
     }
 }
 

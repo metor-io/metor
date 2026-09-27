@@ -429,14 +429,9 @@ fn try_latest_pins() {
     w.try_write(&[x]).unwrap();
     w.try_write(&[y]).unwrap();
 
-    let g = v.try_latest().unwrap().expect("two records committed");
-    assert_eq!(&g[..], &[y]);
-    let pinned = g.release_at;
-    drop(g);
-    assert_eq!(v.cursor(), pinned);
-
-    let again = v.try_latest().unwrap().expect("still the newest");
-    assert_eq!(&again[..], &[y]);
+    assert_eq!(v.try_latest(), Ok(Some(&[y][..])));
+    assert_eq!(v.cursor(), frame_len(1) as u64);
+    assert_eq!(v.try_latest(), Ok(Some(&[y][..])), "still the newest");
 }
 
 // ---------------------------------------------------------------------------

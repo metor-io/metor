@@ -217,7 +217,7 @@ impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
     pub fn latest(&mut self) -> Result<Option<Latest<'_, T>>, RecvError> {
         let mut best: Option<(Option<Timestamp>, T::Read<'_>)> = None;
         for view in self.views.iter_mut() {
-            let Some(bytes) = view.try_latest_bytes().map_err(RecvError::Ring)? else {
+            let Some(bytes) = view.try_latest().map_err(RecvError::Ring)? else {
                 continue;
             };
             let value = T::decode(bytes).map_err(RecvError::Decode)?;
