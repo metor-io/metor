@@ -395,5 +395,5 @@ macro_rules! export_pack {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests;

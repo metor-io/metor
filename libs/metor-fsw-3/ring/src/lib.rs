@@ -171,7 +171,7 @@ pub trait WakeSink {
 
     /// Prepares an owned notification wait, when this sink supports one.
     #[cfg(feature = "notify")]
-    fn wait_owned(&self) -> Option<stellarator::sync::wait_queue::WaitOwned> {
+    fn wait_owned(&self) -> Option<maitake_sync::wait_queue::WaitOwned> {
         None
     }
 }
@@ -194,12 +194,12 @@ impl WakeSink for NoWake {
 /// Wakes all tasks waiting on clones of this notifier within one process.
 #[cfg(feature = "notify")]
 #[derive(Clone)]
-pub struct Notifier(Arc<stellarator::sync::WaitQueue>);
+pub struct Notifier(Arc<maitake_sync::WaitQueue>);
 
 #[cfg(feature = "notify")]
 impl Default for Notifier {
     fn default() -> Self {
-        Self(Arc::new(stellarator::sync::WaitQueue::new()))
+        Self(Arc::new(maitake_sync::WaitQueue::new()))
     }
 }
 
@@ -207,7 +207,7 @@ impl Default for Notifier {
 impl Notifier {
     /// Waits for a notification without borrowing this handle or allocating.
     /// Check readiness after polling the returned future to avoid missed wakes.
-    pub fn wait_owned(&self) -> stellarator::sync::wait_queue::WaitOwned {
+    pub fn wait_owned(&self) -> maitake_sync::wait_queue::WaitOwned {
         self.0.wait_owned()
     }
 }
@@ -225,7 +225,7 @@ impl WakeSink for Notifier {
         let _ = self.0.wait_for(ready).await;
     }
 
-    fn wait_owned(&self) -> Option<stellarator::sync::wait_queue::WaitOwned> {
+    fn wait_owned(&self) -> Option<maitake_sync::wait_queue::WaitOwned> {
         Some(Notifier::wait_owned(self))
     }
 }

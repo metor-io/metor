@@ -20,7 +20,7 @@ use crate::thread::{DEFAULT_THREAD, Threads};
 use super::BuildError;
 use super::config::Adapter;
 use super::params::{ParamError, Params};
-use super::run::Runner;
+use super::step::Runner;
 use super::step::Step;
 
 static STATUS: LazyLock<PortDef> =
@@ -713,6 +713,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "threads", not(target_family = "wasm")))]
     #[test]
     fn test_async_registration_and_launch() {
         let mut table = SystemTable::new();

@@ -15,9 +15,9 @@ use crate::thread::Threads;
 use super::config::{Adapter, CoordinatorConfig, PortRef, SystemConfig};
 use super::error::BuildError;
 use super::params::Params;
+use super::run::{Coordinator, Entry};
 use super::status::SystemStatus;
 use super::table::{MakeCx, SystemTable, TableEntry};
-use super::{Coordinator, Entry};
 
 const STATUS_PORT: &str = "status";
 

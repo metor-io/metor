@@ -1,72 +1,59 @@
-//! The erased runner and the cycle loop.
+//! The built graph and the cycle loop that steps it.
 
 use core::future::Future;
 use core::pin::pin;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
 use futures_lite::future::poll_once;
+use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
-use crate::system::System;
+use crate::port::Output;
 
-use super::Coordinator;
 use super::config::Clock;
 use super::status::SystemStatus;
-use super::step::{EndReason, Step};
-
-/// What one [`catch_step`] call did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Stepped {
-    Ran,
-    /// The step reports an end, before or after this call's execute.
-    Ended,
-    /// The step panicked and was dropped, now or on an earlier call.
-    Unwound,
-}
+use super::step::{EndReason, Step, Stepped, catch_step};
 
 /// The end an entry whose step unwound reports.
 const UNWOUND: &EndReason = &EndReason::Panicked;
 
-pub(crate) struct Runner<S: System> {
-    pub system: S,
-    pub state: S::State,
-    pub inputs: S::Inputs,
-    pub outputs: S::Outputs,
+/// One bound system and the status port the coordinator owns for it.
+pub(super) struct Entry {
+    pub(super) name: String,
+    pub(super) step: Option<Box<dyn Step>>,
+    pub(super) status: Output<SystemStatus>,
 }
 
-impl<S: System> Step for Runner<S> {
-    fn execute(&mut self, now: Timestamp) {
-        self.system
-            .execute(now, &mut self.state, &mut self.inputs, &mut self.outputs);
-    }
-
-    fn fault(&mut self, now: Timestamp, message: &str) {
-        self.system.fault(now, &mut self.outputs, message);
-    }
+/// A built graph: the systems in step order, the clock that stamps each cycle,
+/// and the rings holding them together.
+pub struct Coordinator {
+    pub(super) entries: Vec<Entry>,
+    pub(super) clock: Clock,
+    /// Start of the simulated timeline, taken at build.
+    pub(super) epoch: Timestamp,
+    pub(super) cycle: u64,
+    /// Retained handles share ownership of these regions.
+    pub(super) rings: Vec<RingBuffer>,
 }
 
-/// Executes a step that has not ended, faulting and dropping it if it panics.
-pub(crate) fn catch_step(slot: &mut Option<Box<dyn Step>>, now: Timestamp) -> Stepped {
-    let Some(step) = slot.as_mut() else {
-        return Stepped::Unwound;
-    };
-    // PANIC Safety: a panicking step is faulted once and removed before returning.
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if step.ended().is_none() {
-            step.execute(now);
-        }
-        step.ended().is_some()
-    }));
-    match result {
-        Ok(false) => Stepped::Ran,
-        Ok(true) => Stepped::Ended,
-        Err(payload) => {
-            crate::panic::catch(|| step.fault(now, crate::panic::message(&*payload)));
-            crate::panic::discard(payload);
-            crate::panic::catch(|| drop(slot.take()));
-            Stepped::Unwound
-        }
+impl Coordinator {
+    /// Rings allocated: one per output port plus one status ring per system.
+    pub fn rings(&self) -> usize {
+        self.rings.len()
+    }
+
+    /// The ids of the systems that ended and how, in step order.
+    pub fn ended(&self) -> impl Iterator<Item = (&str, &EndReason)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| Some((entry.name.as_str(), entry.ended()?)))
+    }
+
+    /// The ids of the systems a panic latched off, in step order.
+    pub fn latched(&self) -> impl Iterator<Item = &str> {
+        self.ended()
+            .filter(|(_, end)| **end == EndReason::Panicked)
+            .map(|(id, _)| id)
     }
 }
 
@@ -121,7 +108,7 @@ impl Coordinator {
     }
 }
 
-impl super::Entry {
+impl Entry {
     /// How this entry's step ended, including by unwinding out of it.
     pub(super) fn ended(&self) -> Option<&EndReason> {
         match &self.step {

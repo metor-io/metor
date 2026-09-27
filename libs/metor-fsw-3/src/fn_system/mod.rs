@@ -132,5 +132,5 @@ impl<S: SystemFn> System for FnSystem<S> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests;

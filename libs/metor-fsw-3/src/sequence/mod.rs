@@ -71,7 +71,7 @@
 mod redline;
 mod seq;
 mod step;
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests;
 
 use std::borrow::Cow;

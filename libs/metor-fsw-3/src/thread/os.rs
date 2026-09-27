@@ -1,0 +1,375 @@
+//! Async systems on OS threads: the registry of thread groups and the
+//! adapter that copies a system's ports across each cycle.
+
+mod group;
+#[cfg(test)]
+mod tests;
+
+use core::fmt::Write;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::sync::{Arc, Weak};
+
+use metor_fsw_3_ring::{Config, NoWake, Notifier, RingBuffer, View, WakeSource, Writer};
+use metor_proto::types::Timestamp;
+use metor_proto_wkt::{LogEvent, LogLevel};
+
+use crate::async_system::{AsyncSystem, Running, Stop};
+use crate::coordinator::{Adapter, EndReason, MakeCx, ParamError, Params, Step};
+use crate::fn_system::LOG_PORT;
+use crate::record::Record;
+use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef, SystemInputs, SystemOutputs};
+
+use group::{GroupHandle, Member, Panicked};
+
+/// A `Threads` hands out one group per thread name, held only weakly: the
+/// systems placed on a group own it, and a name whose group is gone respawns.
+#[derive(Default)]
+pub struct Threads {
+    groups: HashMap<String, Weak<GroupHandle>>,
+}
+
+impl Threads {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The group named `name`, started if it is not already running.
+    fn get_or_spawn(&mut self, name: &str) -> Result<Arc<GroupHandle>, ParamError> {
+        if let Some(group) = self.groups.get(name).and_then(Weak::upgrade) {
+            return Ok(group);
+        }
+        let group = group::spawn(name)?;
+        self.groups.insert(name.to_string(), Arc::downgrade(&group));
+        Ok(group)
+    }
+}
+
+/// A `Launch` constructs one async system on the thread that will run it.
+pub(crate) trait Launch: Send {
+    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError>;
+}
+
+/// One async system's ingredients, owned until its thread constructs it.
+struct AsyncLaunch<A: AsyncSystem, M> {
+    make: Arc<M>,
+    params: serde_json::Value,
+    inputs: Vec<InputBinding<Notifier>>,
+    outputs: Vec<OutputBinding>,
+    _a: PhantomData<fn() -> A>,
+}
+
+impl<A, M> Launch for AsyncLaunch<A, M>
+where
+    A: AsyncSystem + 'static,
+    M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+{
+    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError> {
+        let (system, mut state) = (self.make)(Params(&self.params))?;
+        let mut inputs = A::Inputs::bind(self.inputs);
+        let mut outputs = A::Outputs::bind(self.outputs);
+        Ok(Box::pin(async move {
+            system
+                .run(&mut state, &mut inputs, &mut outputs, stop)
+                .await;
+        }))
+    }
+}
+
+/// Places one async system on the group `cx` names: mirrors for its ports, the
+/// system built and running on that group's thread, and the adapter that
+/// copies between them each cycle.
+pub(crate) fn place<A, M>(make: Arc<M>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>
+where
+    A: AsyncSystem + 'static,
+    M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+{
+    if let Some(Adapter::Channel(channel)) = cx.adapter {
+        return Err(ParamError::Channel {
+            channel: channel.name.clone(),
+        });
+    }
+    let thread_name = cx.thread().to_string();
+    let (mut thread, bound_in, bound_out) = bind(cx.def, cx.inputs, cx.outputs)?;
+    let member = Member {
+        launch: Box::new(AsyncLaunch::<A, M> {
+            make,
+            params: cx.params.0.clone(),
+            inputs: bound_in,
+            outputs: bound_out,
+            _a: PhantomData,
+        }),
+        panicked: thread.panicked.clone(),
+    };
+    let group = cx.threads.get_or_spawn(&thread_name)?;
+    group.add(member)?;
+    thread.group = Some(group);
+    Ok(Box::new(thread))
+}
+
+/// How much deeper a mirror ring is than the ring it mirrors.
+pub(crate) const MIRROR_FACTOR: usize = 4;
+
+/// Cycles between two drop reports; the counts accumulate between them.
+const DROP_REPORT_CYCLES: u64 = 100;
+
+/// One ring copied into another, and the records the destination refused.
+struct Mirror<W: WakeSource> {
+    port: Cow<'static, str>,
+    from: View<NoWake>,
+    into: Writer<W>,
+    dropped: u64,
+}
+
+impl<W: WakeSource> Mirror<W> {
+    /// Moves every waiting record, counting the ones that found no room.
+    fn drain(&mut self) {
+        for record in self.from.drain() {
+            let Ok(bytes) = record else { break };
+            if self.into.try_write(bytes).is_err() {
+                self.dropped += 1;
+            }
+        }
+        self.from.settle();
+    }
+}
+
+/// A `Thread` is the step an async system is bound as.
+///
+/// Each cycle it drains the real input rings into the system's mirrors and the
+/// system's output mirrors into the real rings. Both are byte copies; a mirror
+/// with no room drops the record for this system alone.
+pub struct Thread {
+    /// The real input rings into the mirrors the system reads, whose writers
+    /// wake it, and the system's output mirrors into the real rings.
+    inputs: Vec<Mirror<Notifier>>,
+    outputs: Vec<Mirror<NoWake>>,
+    /// Which output is the system's `log`, where the adapter's lines go too.
+    log: Option<usize>,
+    line: Vec<u8>,
+    /// One field per port, written in place, so a drop report allocates nothing.
+    fields: Fields,
+    since_report: u64,
+    panicked: Panicked,
+    end: Option<EndReason>,
+    group: Option<Arc<GroupHandle>>,
+}
+
+/// A log line's fields, as the adapter keeps them between cycles.
+type Fields = Vec<(Cow<'static, str>, Cow<'static, str>)>;
+
+impl Step for Thread {
+    fn execute(&mut self, now: Timestamp) {
+        for mirror in self.inputs.iter_mut() {
+            mirror.drain();
+        }
+        for mirror in self.outputs.iter_mut() {
+            mirror.drain();
+        }
+        self.report_drops(now);
+        self.check_panic(now);
+    }
+
+    fn fault(&mut self, now: Timestamp, message: &str) {
+        self.write_line(now, LogLevel::Error, "panic", message);
+    }
+
+    fn ended(&self) -> Option<&EndReason> {
+        self.end.as_ref()
+    }
+}
+
+impl Thread {
+    /// One line per [`DROP_REPORT_CYCLES`], counting what every port dropped
+    /// since the last one.
+    fn report_drops(&mut self, now: Timestamp) {
+        self.since_report += 1;
+        if self.since_report < DROP_REPORT_CYCLES {
+            return;
+        }
+        self.since_report = 0;
+        if !self.take_drops() {
+            return;
+        }
+        let fields = core::mem::take(&mut self.fields);
+        let event = crate::log::line(
+            now,
+            LogLevel::Error,
+            "records dropped into a full mirror",
+            fields,
+        );
+        self.emit(&event);
+        self.fields = event.fields;
+    }
+
+    /// Writes each port's count into its own field, clearing the counts, and
+    /// reports whether any port dropped a record.
+    fn take_drops(&mut self) -> bool {
+        let inputs = self
+            .inputs
+            .iter_mut()
+            .map(|m| core::mem::take(&mut m.dropped));
+        let outputs = self
+            .outputs
+            .iter_mut()
+            .map(|m| core::mem::take(&mut m.dropped));
+        let mut dropped = false;
+        for ((_, field), count) in self.fields[1..].iter_mut().zip(inputs.chain(outputs)) {
+            dropped |= count > 0;
+            set_count(field, count);
+        }
+        dropped
+    }
+
+    /// Latches the system off once its task has panicked, reporting it once.
+    fn check_panic(&mut self, now: Timestamp) {
+        if self.end.is_some() {
+            return;
+        }
+        if let Some(message) = self.panicked.take() {
+            self.end = Some(EndReason::Panicked);
+            self.write_line(now, LogLevel::Error, "panic", &message);
+        }
+    }
+
+    fn write_line(&mut self, now: Timestamp, level: LogLevel, kind: &'static str, message: &str) {
+        let fields = vec![(Cow::Borrowed("kind"), Cow::Borrowed(kind))];
+        self.emit(&crate::log::line(now, level, message.to_string(), fields));
+    }
+
+    /// Publishes one line on the system's own `log`, if it declares one.
+    fn emit(&mut self, event: &LogEvent) {
+        let Some(log) = self.log else { return };
+        let Ok(bytes) = event.encode(&mut self.line) else {
+            return;
+        };
+        let _ = self.outputs[log].into.try_write(bytes);
+    }
+}
+
+/// Writes `count` into a field's own buffer, which allocates nothing.
+fn set_count(value: &mut Cow<'static, str>, count: u64) {
+    let Cow::Owned(text) = value else { return };
+    text.clear();
+    // PANIC Safety: writing into a `String` cannot fail.
+    let _ = write!(text, "{count}");
+}
+
+/// One field per port, holding the count it dropped, in bind order.
+fn drop_fields<'a>(ports: impl Iterator<Item = &'a Cow<'static, str>>) -> Fields {
+    let kind = (Cow::Borrowed("kind"), Cow::Borrowed("mirror_dropped"));
+    let counts = ports.map(|port| {
+        let count = Cow::Owned(String::with_capacity(20));
+        (port.clone(), count)
+    });
+    core::iter::once(kind).chain(counts).collect()
+}
+
+/// The adapter for the cycle thread and the bindings the system's own thread
+/// reads and writes.
+type Bound = (Thread, Vec<InputBinding<Notifier>>, Vec<OutputBinding>);
+type BoundInputs = (Vec<Mirror<Notifier>>, Vec<InputBinding<Notifier>>);
+type BoundOutputs = (Vec<Mirror<NoWake>>, Vec<OutputBinding>);
+
+/// Mirrors every port of one async system.
+fn bind(
+    def: &SystemDef,
+    inputs: Vec<Vec<&RingBuffer>>,
+    outputs: Vec<&RingBuffer>,
+) -> Result<Bound, ParamError> {
+    let (edges, bound_in) = bind_inputs(&def.inputs, inputs)?;
+    let (copies, bound_out) = bind_outputs(&def.outputs, outputs)?;
+    let ports = edges
+        .iter()
+        .map(|mirror| &mirror.port)
+        .chain(copies.iter().map(|mirror| &mirror.port));
+    let thread = Thread {
+        line: vec![0; LogEvent::MAX_LEN],
+        fields: drop_fields(ports),
+        since_report: 0,
+        log: log_port(def),
+        inputs: edges,
+        outputs: copies,
+        panicked: Panicked::default(),
+        end: None,
+        group: None,
+    };
+    Ok((thread, bound_in, bound_out))
+}
+
+fn bind_inputs(
+    ports: &[PortDef],
+    inputs: Vec<Vec<&RingBuffer>>,
+) -> Result<BoundInputs, ParamError> {
+    let wake = Notifier::default();
+    let mut edges = Vec::new();
+    let mut bound_in = Vec::with_capacity(ports.len());
+    for (port, rings) in ports.iter().zip(inputs) {
+        let mut views = Vec::with_capacity(rings.len());
+        for ring in rings {
+            let mirror = mirror(ring)?;
+            // PANIC Safety: a fresh mirror has its writer and one reader slot free.
+            edges.push(Mirror {
+                port: port.name.clone(),
+                from: ring.view(NoWake).expect("a counted reader slot"),
+                into: mirror.writer(wake.clone()).expect("a fresh mirror"),
+                dropped: 0,
+            });
+            views.push(mirror.view(wake.clone()).expect("a fresh mirror"));
+        }
+        bound_in.push(InputBinding {
+            def: port.clone(),
+            views,
+        });
+    }
+    Ok((edges, bound_in))
+}
+
+fn bind_outputs(ports: &[PortDef], outputs: Vec<&RingBuffer>) -> Result<BoundOutputs, ParamError> {
+    let mut copies = Vec::with_capacity(ports.len());
+    let mut bound_out = Vec::with_capacity(ports.len());
+    for (port, ring) in ports.iter().zip(outputs) {
+        let mirror = mirror(ring)?;
+        copies.push(Mirror {
+            port: port.name.clone(),
+            // PANIC Safety: the mirror is fresh; build counted one real writer.
+            from: mirror.view(NoWake).expect("a fresh mirror"),
+            into: ring.writer(NoWake).expect("one writer per output ring"),
+            dropped: 0,
+        });
+        bound_out.push(OutputBinding {
+            def: port.clone(),
+            writer: mirror.writer(NoWake).expect("a fresh mirror"),
+        });
+    }
+
+    Ok((copies, bound_out))
+}
+
+/// A ring of the same records as `real`, several times as deep.
+fn mirror(real: &RingBuffer) -> Result<RingBuffer, ParamError> {
+    Ok(RingBuffer::create_in_memory(mirror_config(
+        real.config().capacity,
+    )?))
+}
+
+/// The geometry of a mirror of a ring of `capacity` bytes.
+fn mirror_config(capacity: usize) -> Result<Config, ParamError> {
+    let too_large = ParamError::MirrorTooLarge { capacity };
+    let config = Config {
+        capacity: capacity
+            .checked_mul(MIRROR_FACTOR)
+            .ok_or(too_large.clone())?,
+        max_readers: 1,
+    };
+    metor_fsw_3_ring::checked_region_len(&config).ok_or(too_large)?;
+    Ok(config)
+}
+
+/// The index of the system's `log` output, which is where its lines go.
+fn log_port(def: &SystemDef) -> Option<usize> {
+    def.outputs
+        .iter()
+        .position(|port| port.name == LOG_PORT && port.id == LogEvent::ID)
+}

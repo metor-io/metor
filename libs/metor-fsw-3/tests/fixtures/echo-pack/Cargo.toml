@@ -11,7 +11,7 @@ description = "A pack the metor-fsw-3 dl tests load: an echo, a panicking system
 crate-type = ["cdylib"]
 
 [dependencies]
-metor-fsw-3 = { path = "../../..", default-features = false }
+metor-fsw-3 = { path = "../../..", default-features = false, features = ["threads"] }
 futures-lite = "2"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }

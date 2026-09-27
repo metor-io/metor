@@ -9641,6 +9641,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "libc",
  "libloading",
+ "maitake-sync 0.1.2",
  "metor-component",
  "metor-db",
  "metor-fsw-3-macros",
@@ -9684,6 +9685,7 @@ version = "0.14.2"
 dependencies = [
  "libc",
  "loom",
+ "maitake-sync 0.1.2",
  "memmap2",
  "stellarator",
  "tempfile",
