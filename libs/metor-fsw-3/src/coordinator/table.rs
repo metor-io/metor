@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use metor_fsw_3_ring::{NoWake, RingBuffer};
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::RecordSchema;
@@ -56,7 +57,21 @@ pub(crate) type MakeFn = dyn Fn(MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>
 /// Computes one instance's definition from its config.
 pub(crate) type DefFn = dyn Fn(&DefCx<'_>) -> Result<SystemDef, DefError>;
 
+/// How a registered type runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemKind {
+    /// Stepped once per cycle.
+    #[default]
+    Cyclic,
+    /// A `#[sequence]`, polled once per cycle until it returns.
+    Sequence,
+    /// An async system on its own thread.
+    Async,
+}
+
 pub(crate) struct TableEntry {
+    pub kind: SystemKind,
     /// The ports the type declares whatever a config says.
     pub def: SystemDef,
     pub def_fn: Box<DefFn>,
@@ -256,6 +271,7 @@ fn entry<S: System + 'static>(
     schema: Option<Box<RawValue>>,
 ) -> Result<TableEntry, DefError> {
     Ok(TableEntry {
+        kind: SystemKind::Cyclic,
         def: S::def(&DefCx::empty())?,
         def_fn: Box::new(S::def),
         doc,
@@ -328,6 +344,7 @@ where
 {
     let make = Arc::new(make);
     Ok(TableEntry {
+        kind: SystemKind::Async,
         def: A::def(&DefCx::empty())?,
         def_fn: Box::new(A::def),
         doc,

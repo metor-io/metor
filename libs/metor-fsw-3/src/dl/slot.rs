@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::coordinator::{
-    Adapter, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, TableEntry,
+    Adapter, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, SystemKind, TableEntry,
 };
 use crate::def::{DefCx, DefError};
 use crate::pack::def::Instance;
@@ -60,6 +60,7 @@ struct Resolved {
 /// The table entry `fsw.dl_slot` registers as.
 pub(crate) fn entry() -> TableEntry {
     TableEntry {
+        kind: SystemKind::Cyclic,
         def: SystemDef {
             name: SLOT_NAME.into(),
             inputs: Vec::new(),

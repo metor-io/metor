@@ -163,7 +163,7 @@ pub use coordinator::Coordinator;
 pub use coordinator::{
     Adapter, BuildError, ChannelConfig, Clock, CoordinatorConfig, EndReason, InputConfig,
     LoadError, Occupant, OutputConfig, OutputSource, ParamError, Params, PeerLink, PeerPort,
-    PortRef, RunState, Step, SystemConfig, SystemStatus, SystemTable,
+    PortRef, RunState, Step, SystemConfig, SystemKind, SystemStatus, SystemTable,
 };
 pub use def::{DefCx, DefError, Records};
 #[cfg(feature = "host")]

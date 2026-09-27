@@ -1,6 +1,7 @@
 pub mod def;
 pub mod raw;
 
+use core::alloc::Layout;
 use core::cell::OnceCell;
 use core::ffi::c_void;
 use std::borrow::Cow;
@@ -35,15 +36,21 @@ pub enum Status {
 }
 
 impl Status {
-    /// Reads a returned status word.
-    pub fn from_raw(word: u32) -> Status {
+    /// Reads a returned status word, `None` for a word no status has.
+    pub fn try_from_raw(word: u32) -> Option<Status> {
         match word {
-            0 => Status::Ok,
-            2 => Status::Completed,
-            3 => Status::Aborted,
-            4 => Status::Failed,
-            _ => Status::Panicked,
+            0 => Some(Status::Ok),
+            1 => Some(Status::Panicked),
+            2 => Some(Status::Completed),
+            3 => Some(Status::Aborted),
+            4 => Some(Status::Failed),
+            _ => None,
         }
+    }
+
+    /// Reads a returned status word; an unknown word is a panic.
+    pub fn from_raw(word: u32) -> Status {
+        Status::try_from_raw(word).unwrap_or(Status::Panicked)
     }
 
     /// The word a step that ended as `end` returns.
@@ -93,6 +100,7 @@ fn with_table<R>(build: fn() -> SystemTable, f: impl FnOnce(&SystemTable) -> R) 
         f(cell.get_or_init(|| {
             let subscriber = tracing_subscriber::registry().with(crate::log::LogLayer);
             let _ = tracing::subscriber::set_global_default(subscriber);
+            crate::panic::log_panics();
             build()
         }))
     })
@@ -297,9 +305,14 @@ fn decode_params(bytes: &[u8]) -> Result<serde_json::Value, ParamError> {
 
 /// Attaches to one ring region the host allocated.
 fn attach(ring: &RawRing) -> Result<RingBuffer, ParamError> {
-    // SAFETY: `create` requires live, thread-safe ownership callbacks.
-    unsafe { RingBuffer::attach_owned(ring.base, ring.len, ring.owner) }
-        .map_err(|e| ParamError::Decode(e.to_string()))
+    let attached = match ring.owner {
+        // SAFETY: `create` requires live, thread-safe ownership callbacks.
+        Some(owner) => unsafe { RingBuffer::attach_owned(ring.base, ring.len, owner) },
+        // SAFETY: an unowned ring lives in this module's own memory, which
+        // outlives every handle in it.
+        None => unsafe { RingBuffer::attach_raw(ring.base, ring.len) },
+    };
+    attached.map_err(|e| ParamError::Decode(e.to_string()))
 }
 
 /// Serializes `source` into this thread's error buffer.
@@ -339,7 +352,39 @@ pub unsafe fn destroy(instance: *mut c_void) {
     });
 }
 
-/// Exports `$build`'s table under the six ABI names.
+/// Allocates `len` zeroed bytes aligned to `align` for the host to write
+/// into. Null on a zero length, an invalid layout, or no memory.
+pub fn alloc(len: usize, align: usize) -> *mut u8 {
+    match layout(len, align) {
+        // SAFETY: `layout` refuses a zero size.
+        Some(layout) => unsafe { std::alloc::alloc_zeroed(layout) },
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// Frees what [`alloc`] returned. A null `ptr` or an invalid layout is ignored.
+///
+/// # Safety
+/// A non-null `ptr` came from [`alloc`] with the same `len` and `align`,
+/// and is freed once.
+pub unsafe fn free(ptr: *mut u8, len: usize, align: usize) {
+    if let Some(layout) = layout(len, align)
+        && !ptr.is_null()
+    {
+        // SAFETY: the caller's contract.
+        unsafe { std::alloc::dealloc(ptr, layout) };
+    }
+}
+
+/// The layout [`alloc`] and [`free`] agree on, `None` for a zero length.
+fn layout(len: usize, align: usize) -> Option<Layout> {
+    if len == 0 {
+        return None;
+    }
+    Layout::from_size_align(len, align).ok()
+}
+
+/// Exports `$build`'s table under the eight ABI names.
 #[macro_export]
 macro_rules! export_pack {
     ($build:path) => {
@@ -391,6 +436,16 @@ macro_rules! export_pack {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn metor_fsw_destroy(instance: *mut ::core::ffi::c_void) {
             unsafe { $crate::pack::destroy(instance) }
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn metor_fsw_alloc(len: usize, align: usize) -> *mut u8 {
+            $crate::pack::alloc(len, align)
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn metor_fsw_free(ptr: *mut u8, len: usize, align: usize) {
+            unsafe { $crate::pack::free(ptr, len, align) }
         }
     };
 }

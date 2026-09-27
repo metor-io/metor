@@ -232,6 +232,7 @@ impl SystemTable {
             let ty = system.ty.to_string();
             let (def_lib, def_ty) = (pack.lib.clone(), system.ty.to_string());
             let entry = TableEntry {
+                kind: system.kind,
                 def: system.def.clone(),
                 def_fn: Box::new(move |cx| {
                     let _ = &def_lib;

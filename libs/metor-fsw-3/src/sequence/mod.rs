@@ -79,7 +79,7 @@ use std::borrow::Cow;
 use metor_fsw_3_ring::NoWake;
 
 use crate::channel::{ABORT_PORT, AbortRequest};
-use crate::coordinator::{TableEntry, bindings, refuse_thread};
+use crate::coordinator::{SystemKind, TableEntry, bindings, refuse_thread};
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Ctor, InSet, OutSet, Param, Ports};
 use crate::port::Input;
@@ -131,6 +131,7 @@ pub(crate) fn entry<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
     ctor: C,
 ) -> Result<TableEntry, DefError> {
     Ok(TableEntry {
+        kind: SystemKind::Sequence,
         def: def::<S>(&DefCx::empty())?,
         def_fn: Box::new(def::<S>),
         doc: Cow::Borrowed(S::DOC),

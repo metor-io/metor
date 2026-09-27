@@ -11,7 +11,7 @@ use metor_proto_wkt::{
 use crate::channel::{Abort, ChannelState, ChannelStatus};
 use crate::coordinator::{
     Adapter, BuildError, ChannelConfig, Coordinator, CoordinatorConfig, EndReason, InputConfig,
-    LoadError, Occupant, RunState, Step, SystemConfig, SystemTable, TableEntry,
+    LoadError, Occupant, RunState, Step, SystemConfig, SystemKind, SystemTable, TableEntry,
 };
 use crate::def::DefCx;
 use crate::port::{Input, Output};
@@ -202,6 +202,7 @@ fn slot_entry(shared: &Shared) -> TableEntry {
         outputs: Vec::new(),
     };
     TableEntry {
+        kind: SystemKind::Cyclic,
         def: def.clone(),
         def_fn: Box::new(move |_| Ok(def.clone())),
         doc: "".into(),

@@ -31,5 +31,5 @@ pub use step::{EndReason, LoadError, Occupant, Step};
 pub(crate) use step::{Stepped, catch_step};
 #[cfg(feature = "host")]
 pub(crate) use table::MakeFn;
-pub use table::{MakeCx, SystemTable};
+pub use table::{MakeCx, SystemKind, SystemTable};
 pub(crate) use table::{TableEntry, bindings, refuse_thread};

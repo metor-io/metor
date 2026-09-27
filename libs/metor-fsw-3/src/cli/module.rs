@@ -420,6 +420,7 @@ mod tests {
     use serde_json::value::RawValue;
 
     use super::*;
+    use crate::SystemKind;
     use crate::system::SystemDef;
 
     fn port(name: &'static str, record: &'static str) -> PortDef {
@@ -443,6 +444,7 @@ mod tests {
     ) -> PackSystemDef {
         PackSystemDef {
             ty: ty.into(),
+            kind: SystemKind::Cyclic,
             takes_inputs: false,
             takes_outputs: false,
             def: SystemDef {

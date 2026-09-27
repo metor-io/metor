@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::coordinator::{Adapter, OutputConfig, SystemTable, TableEntry};
+use crate::coordinator::{Adapter, OutputConfig, SystemKind, SystemTable, TableEntry};
 use crate::def::{DefCx, Records};
 use crate::system::{PortDef, SystemDef};
 
@@ -29,6 +29,8 @@ pub struct PackDef {
 pub struct PackSystemDef {
     /// The table key: `register("nav", ..)`.
     pub ty: String,
+    #[serde(default)]
+    pub kind: SystemKind,
     /// The ports the type declares whatever a config says.
     pub def: SystemDef,
     /// Whether the type takes the input ports a config lists.
@@ -52,6 +54,7 @@ impl PackDef {
                 let (takes_inputs, takes_outputs) = probe(entry);
                 PackSystemDef {
                     ty: ty.to_string(),
+                    kind: entry.kind,
                     def: entry.def.clone(),
                     takes_inputs,
                     takes_outputs,
