@@ -294,7 +294,10 @@ fn test_sequence_refuses_a_thread() {
     };
     assert!(matches!(
         config.build(&table(&Recorder::default())),
-        Err(BuildError::ThreadOnCyclic { .. })
+        Err(BuildError::Params {
+            source: crate::ParamError::Thread { .. },
+            ..
+        })
     ));
 }
 

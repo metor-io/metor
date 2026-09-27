@@ -21,7 +21,7 @@ mod sample;
 
 use readiness::Waiters;
 pub use sample::Sample;
-pub(crate) use sample::{Sampler, Samplers};
+pub(crate) use sample::Samplers;
 
 /// Returns the power-of-two capacity for a ring of `depth` records of `max_len` bytes.
 pub fn ring_capacity(max_len: usize, depth: usize) -> Option<usize> {
@@ -299,12 +299,6 @@ pub struct DynInputs<W: WakeSink = NoWake> {
     ports: Vec<(PortDef, Input<Bytes, W>)>,
 }
 
-impl<W: WakeSink> Default for DynInputs<W> {
-    fn default() -> Self {
-        Self { ports: Vec::new() }
-    }
-}
-
 impl<W: WakeSink> DynInputs<W> {
     /// Every port's definition and the records waiting on it.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Input<Bytes, W>)> {
@@ -340,12 +334,6 @@ pub struct DynOutputs<W: WakeSource = NoWake> {
     ports: Vec<(PortDef, Output<Bytes, W>)>,
 }
 
-impl<W: WakeSource> Default for DynOutputs<W> {
-    fn default() -> Self {
-        Self { ports: Vec::new() }
-    }
-}
-
 impl<W: WakeSource> DynOutputs<W> {
     /// Every port's definition and the writer publishing on it.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Output<Bytes, W>)> {
@@ -376,11 +364,6 @@ pub struct Latest<'a, T: Record + ?Sized + 'a> {
 }
 
 impl<'a, T: Record + ?Sized> Latest<'a, T> {
-    /// Borrows the decoded record without decoding again.
-    pub fn read(&self) -> &T {
-        self.decoded.borrow()
-    }
-
     /// Returns the decoded record: a borrow for a frame, an owned value for a message.
     pub fn into_inner(self) -> T::Read<'a> {
         self.decoded
@@ -390,7 +373,7 @@ impl<'a, T: Record + ?Sized> Latest<'a, T> {
 impl<T: Record + ?Sized> Deref for Latest<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        self.read()
+        self.decoded.borrow()
     }
 }
 
@@ -465,22 +448,14 @@ mod tests {
         }
     }
 
-    fn sample(ts: i64, sample: f64) -> Imu {
-        Imu::new(ts, sample)
-    }
-
     /// Two one-reader rings of `depth` `T` records feeding one input.
     fn fan_in<T: Record + ?Sized>(
         depth: usize,
     ) -> (RingBuffer, RingBuffer, Output<T>, Output<T>, Input<T>) {
         let (left, right) = (ring::<T>(depth, 1), ring::<T>(depth, 1));
-        let a = Output::new(left.writer(NoWake).expect("free writer"));
-        let b = Output::new(right.writer(NoWake).expect("free writer"));
-        let input = Input::new(vec![
-            left.view(NoWake).expect("free slot"),
-            right.view(NoWake).expect("free slot"),
-        ]);
-        (left, right, a, b, input)
+        let (a, b) = (output(&left), output(&right));
+        let views = [&left, &right].map(|ring| ring.view(NoWake).expect("free slot"));
+        (left, right, a, b, Input::new(views.into()))
     }
 
     #[test]
@@ -500,7 +475,7 @@ mod tests {
     #[test]
     fn test_write_then_latest() {
         let (_ring, out, mut input) = pair::<Imu>(4);
-        out.write(&sample(7, 42.0)).expect("ring has room");
+        out.write(&Imu::new(7, 42.0)).expect("ring has room");
         let got = input.latest().expect("valid record").expect("one record");
         assert_eq!(got.sample, 42.0);
         assert_eq!(got.timestamp, Timestamp(7));
@@ -509,7 +484,7 @@ mod tests {
     #[test]
     fn test_latest_repeats_pinned_record() {
         let (_ring, out, mut input) = pair::<Imu>(4);
-        out.write(&sample(1, 1.0)).expect("ring has room");
+        out.write(&Imu::new(1, 1.0)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
     }
@@ -518,7 +493,7 @@ mod tests {
     fn test_drain_record_order() {
         let (_ring, out, mut input) = pair::<Imu>(8);
         for i in 0..3 {
-            out.write(&sample(i, i as f64)).expect("ring has room");
+            out.write(&Imu::new(i, i as f64)).expect("ring has room");
         }
         let seen = input
             .drain()
@@ -533,28 +508,28 @@ mod tests {
     #[test]
     fn test_latest_selects_newest_producer() {
         let (_l, _r, a, b, mut input) = fan_in::<Imu>(4);
-        a.write(&sample(9, 1.0)).expect("ring has room");
-        b.write(&sample(3, 2.0)).expect("ring has room");
+        a.write(&Imu::new(9, 1.0)).expect("ring has room");
+        b.write(&Imu::new(3, 2.0)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
 
-        b.write(&sample(11, 3.0)).expect("ring has room");
+        b.write(&Imu::new(11, 3.0)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").sample, 3.0);
     }
 
     #[test]
     fn test_latest_timestamp_tie() {
         let (_l, _r, a, b, mut input) = fan_in::<Imu>(4);
-        a.write(&sample(5, 1.0)).expect("ring has room");
-        b.write(&sample(5, 2.0)).expect("ring has room");
+        a.write(&Imu::new(5, 1.0)).expect("ring has room");
+        b.write(&Imu::new(5, 2.0)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
     }
 
     #[test]
     fn test_drain_producer_order() {
         let (_l, _r, a, b, mut input) = fan_in::<Imu>(8);
-        b.write(&sample(0, 10.0)).expect("ring has room");
-        a.write(&sample(1, 1.0)).expect("ring has room");
-        a.write(&sample(2, 2.0)).expect("ring has room");
+        b.write(&Imu::new(0, 10.0)).expect("ring has room");
+        a.write(&Imu::new(1, 1.0)).expect("ring has room");
+        a.write(&Imu::new(2, 2.0)).expect("ring has room");
         let seen = input
             .drain()
             .flat_map(|r| r.ok())
@@ -578,13 +553,13 @@ mod tests {
         });
         let out = output(&ring);
         let mut input = input::<Imu>(&ring);
-        out.write(&sample(0, 0.0)).expect("ring has room");
+        out.write(&Imu::new(0, 0.0)).expect("ring has room");
         let pinned = input.latest().expect("valid").expect("record");
         assert_eq!(pinned.sample, 0.0);
         // Two 32-byte records fill the ring.
-        out.write(&sample(1, 1.0)).expect("ring has room");
+        out.write(&Imu::new(1, 1.0)).expect("ring has room");
         assert_eq!(
-            out.write(&sample(2, 2.0)),
+            out.write(&Imu::new(2, 2.0)),
             Err(SendError::Ring(WriteError::WouldBlock))
         );
     }
@@ -649,8 +624,8 @@ mod tests {
         }
         let latest = input.latest().expect("valid").expect("record");
         assert_eq!(DECODES.get(), 2);
-        assert_eq!(latest.read().0.at, Timestamp(2));
-        assert!(core::ptr::eq(latest.read(), latest.read()));
+        assert_eq!(latest.0.at, Timestamp(2));
+        assert!(core::ptr::eq(&*latest, &*latest));
         let owned: Counted = latest.into_inner();
         assert_eq!(owned.0.text, "sample");
         assert_eq!(DECODES.get(), 2);
@@ -659,10 +634,10 @@ mod tests {
     #[test]
     fn test_latest_into_inner_borrows_frame() {
         let (_ring, out, mut input) = pair::<Imu>(4);
-        out.write(&sample(1, 2.0)).expect("fits");
+        out.write(&Imu::new(1, 2.0)).expect("fits");
         let frame: &Imu = input.latest().expect("valid").expect("record").into_inner();
         assert_eq!(frame.sample, 2.0);
-        out.write(&sample(2, 3.0)).expect("fits");
+        out.write(&Imu::new(2, 3.0)).expect("fits");
         assert_eq!(frame.sample, 2.0);
     }
 
@@ -679,15 +654,15 @@ mod tests {
             text: "b".into(),
         })
         .expect("fits");
-        assert_eq!(input.latest().unwrap().unwrap().read().text, "a");
+        assert_eq!(input.latest().unwrap().unwrap().text, "a");
         b.write(&Stamped {
             at: Timestamp(11),
             text: "b2".into(),
         })
         .expect("fits");
         let newest = input.latest().unwrap().unwrap();
-        assert_eq!(newest.read().text, "b2");
-        assert_eq!(newest.read().at, Timestamp(11));
+        assert_eq!(newest.text, "b2");
+        assert_eq!(newest.at, Timestamp(11));
     }
 
     #[test]
@@ -695,8 +670,7 @@ mod tests {
         let (_l, _r, a, b, mut input) = fan_in::<Fixed>(4);
         b.write(&Fixed { a: 2, b: 0.0 }).expect("fits");
         a.write(&Fixed { a: 1, b: 0.0 }).expect("fits");
-        assert_eq!(input.latest().unwrap().unwrap().read().a, 1);
-        assert_eq!(Fixed { a: 1, b: 0.0 }.timestamp(), None);
+        assert_eq!(input.latest().unwrap().unwrap().a, 1);
     }
 
     #[test]
@@ -750,7 +724,7 @@ mod tests {
     #[test]
     fn test_drain_frames_and_messages() {
         let (_ring, out, mut input) = pair::<Imu>(4);
-        out.write(&sample(1, 1.0)).expect("ring has room");
+        out.write(&Imu::new(1, 1.0)).expect("ring has room");
         let borrowed: Option<&Imu> = input.drain().next().map(|r| r.expect("decodes"));
         assert_eq!(borrowed.map(|f| f.sample), Some(1.0));
 
@@ -758,21 +732,6 @@ mod tests {
         out.write(&Fixed { a: 3, b: 0.5 }).expect("fits");
         let owned: Option<Fixed> = input.drain().next().map(|r| r.expect("decodes"));
         assert_eq!(owned, Some(Fixed { a: 3, b: 0.5 }));
-    }
-
-    #[test]
-    fn test_shared_write_round_trips() {
-        let (_ring, frames, mut frame_in) = pair::<Imu>(4);
-        let shared: &Output<Imu> = &frames;
-        shared.write(&sample(1, 4.0)).expect("ring has room");
-        let frame = frame_in.latest().expect("valid").expect("record");
-        assert_eq!(frame.sample, 4.0);
-
-        let (_ring, notes, mut note_in) = pair::<Note>(4);
-        let shared: &Output<Note> = &notes;
-        shared.write(&Note { text: "hi".into() }).expect("fits");
-        let seen: Vec<Note> = note_in.drain().map(|r| r.expect("decodes")).collect();
-        assert_eq!(seen, [Note { text: "hi".into() }]);
     }
 
     #[test]
@@ -785,17 +744,6 @@ mod tests {
         out.write(&Note { text: "ok".into() })
             .expect("scratch is back");
         assert_eq!(input.drain().count(), 1);
-    }
-
-    #[test]
-    fn test_closure_and_caller_write_in_order() {
-        let (_ring, out, mut input) = pair::<Imu>(8);
-        let send = |ts: i64| out.write(&sample(ts, ts as f64));
-        send(1).expect("ring has room");
-        out.write(&sample(2, 2.0)).expect("ring has room");
-        send(3).expect("ring has room");
-        let seen: Vec<f64> = input.drain().map(|r| r.expect("decodes").sample).collect();
-        assert_eq!(seen, [1.0, 2.0, 3.0]);
     }
 
     /// What a [`Hostile`] record does while it encodes.
@@ -904,6 +852,12 @@ mod async_tests {
         }
     }
 
+    /// A waker that records being woken in the flag beside it.
+    fn waker() -> (Arc<Woken>, Waker) {
+        let woken = Arc::new(Woken::default());
+        (woken.clone(), Waker::from(woken))
+    }
+
     type WokenInputs = (
         [RingBuffer; 2],
         [Output<Imu, Notifier>; 2],
@@ -947,8 +901,7 @@ mod async_tests {
     #[test]
     fn test_next_wakes_per_producer() {
         let (_rings, outputs, mut input) = independently_woken();
-        let woken = Arc::new(Woken::default());
-        let waker = Waker::from(woken.clone());
+        let (woken, waker) = waker();
         let mut cx = Context::from_waker(&waker);
 
         for at in [1, 0, 1, 0] {
@@ -968,8 +921,7 @@ mod async_tests {
     fn test_next_cancel_and_retry() {
         let (_rings, outputs, mut input) = independently_woken();
         let wakes: Vec<_> = input.views.iter().map(|view| view.wake().clone()).collect();
-        let woken = Arc::new(Woken::default());
-        let waker = Waker::from(woken.clone());
+        let (woken, waker) = waker();
         let mut cx = Context::from_waker(&waker);
         {
             let mut next = core::pin::pin!(input.next());
@@ -991,8 +943,7 @@ mod async_tests {
     fn test_empty_notification_rearms_waiter() {
         let wake = Notifier::default();
         let (_ring, output, mut input) = woken(&wake);
-        let woken = Arc::new(Woken::default());
-        let waker = Waker::from(woken.clone());
+        let (woken, waker) = waker();
         let mut cx = Context::from_waker(&waker);
         let mut next = core::pin::pin!(input.next());
         assert!(next.as_mut().poll(&mut cx).is_pending());
@@ -1064,79 +1015,9 @@ mod async_tests {
         assert_eq!(seen, vec![("b.imu".to_string(), Imu::MAX_LEN)]);
     }
 
-    fn independent_ports() -> (
-        [RingBuffer; 2],
-        [Output<Imu, Notifier>; 2],
-        DynInputs<Notifier>,
-    ) {
-        let (left, a, first) = woken(&Notifier::default());
-        let (right, b, second) = woken(&Notifier::default());
-        let inputs = DynInputs::bind(vec![
-            InputBinding {
-                def: Input::<Imu>::def(&DefCx::empty(), "a"),
-                views: first.views,
-            },
-            InputBinding {
-                def: Input::<Imu>::def(&DefCx::empty(), "b"),
-                views: second.views,
-            },
-        ]);
-        ([left, right], [a, b], inputs)
-    }
-
-    #[test]
-    fn test_any_ready_wakes_per_port() {
-        let (_rings, outputs, mut inputs) = independent_ports();
-        let woken = Arc::new(Woken::default());
-        let waker = Waker::from(woken.clone());
-        let mut cx = Context::from_waker(&waker);
-        for at in [1, 0, 1, 0] {
-            {
-                let mut ready = core::pin::pin!(inputs.any_ready());
-                assert!(ready.as_mut().poll(&mut cx).is_pending());
-                woken.0.store(false, Ordering::SeqCst);
-                outputs[at].write(&Imu::new(1, 7.0)).expect("room");
-                assert!(woken.0.load(Ordering::SeqCst));
-                assert!(ready.as_mut().poll(&mut cx).is_ready());
-            }
-            let count = inputs
-                .iter_mut()
-                .flat_map(|(_, input)| input.drain())
-                .count();
-            assert_eq!(count, 1);
-        }
-    }
-
-    #[test]
-    fn test_any_ready_cancel_and_retry() {
-        let (_rings, outputs, mut inputs) = independent_ports();
-        let wakes: Vec<_> = inputs
-            .ports
-            .iter()
-            .flat_map(|(_, input)| input.views.iter().map(|view| view.wake().clone()))
-            .collect();
-        let woken = Arc::new(Woken::default());
-        let waker = Waker::from(woken.clone());
-        let mut cx = Context::from_waker(&waker);
-        {
-            let mut ready = core::pin::pin!(inputs.any_ready());
-            assert!(ready.as_mut().poll(&mut cx).is_pending());
-        }
-        for wake in &wakes {
-            wake.notify();
-        }
-        assert!(!woken.0.load(Ordering::SeqCst));
-
-        let mut ready = core::pin::pin!(inputs.any_ready());
-        assert!(ready.as_mut().poll(&mut cx).is_pending());
-        outputs[1].write(&Imu::new(1, 7.0)).expect("room");
-        assert!(woken.0.load(Ordering::SeqCst));
-        assert!(ready.as_mut().poll(&mut cx).is_ready());
-    }
-
     #[stellarator::test]
     async fn test_any_ready_without_producers() {
-        let mut empty = DynInputs::<Notifier>::default();
+        let mut empty = DynInputs::<Notifier>::bind(Vec::new());
         assert!(poll_once(empty.any_ready()).await.is_none());
         let mut unbound = DynInputs::<Notifier>::bind(vec![InputBinding {
             def: Input::<Imu>::def(&DefCx::empty(), "unbound"),

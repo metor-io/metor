@@ -1,8 +1,6 @@
-//! The coordinator is the core part of metor-fsw, it is responsible for executing systems in order, and plumbing together ring buffers
+//! The coordinator steps systems in order over the rings that connect them.
 //!
-//! The meat and potatoes of coordinator is in [`build`] which is responsible for passing through the configuration, and connecting
-//! all of the ring buffers together. Beyond that the coordinator is very simple, it just executes systems in order.
-//!  [`run`] contains that code.
+//! [`build`] resolves a config into systems and rings; [`run`] steps them.
 
 mod build;
 mod config;
@@ -28,7 +26,7 @@ pub use config::{
 };
 pub use error::BuildError;
 pub use params::{ParamError, Params};
-pub(crate) use run::{Stepped, catch_step, message_of as panic_message};
+pub(crate) use run::{Stepped, catch_step};
 pub use status::SystemStatus;
 pub use step::{EndReason, LoadError, Occupant, Step};
 pub use table::{MakeCx, SystemTable};
@@ -45,10 +43,6 @@ struct Entry {
 /// and the rings holding them together.
 pub struct Coordinator {
     entries: Vec<Entry>,
-    /// The named groups build placed async systems on, held weakly: each
-    /// adapter owns its group, so a thread stops when its systems drop.
-    #[allow(dead_code)]
-    threads: crate::thread::Threads,
     clock: Clock,
     /// Start of the simulated timeline, taken at build.
     epoch: Timestamp,

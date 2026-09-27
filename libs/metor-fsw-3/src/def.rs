@@ -43,31 +43,7 @@ impl DefCx<'static> {
     }
 }
 
-impl<'a> DefCx<'a> {
-    /// The context of one instance's input edges.
-    pub fn of_inputs(inputs: &'a [(&'a str, &'a PortDef)]) -> Self {
-        Self {
-            id: "",
-            namespace: None,
-            inputs,
-            outputs: &[],
-            records: &NO_RECORDS,
-            params: &NO_PARAMS,
-        }
-    }
-
-    /// The context of one instance's output ports.
-    pub fn of_outputs(outputs: &'a [OutputConfig], records: &'a Records) -> Self {
-        Self {
-            id: "",
-            namespace: None,
-            inputs: &[],
-            outputs,
-            records,
-            params: &NO_PARAMS,
-        }
-    }
-
+impl DefCx<'_> {
     /// Where port `port`'s components hang: `{namespace}.{id}.{port}`,
     /// skipping the parts this context lacks.
     pub fn root(&self, port: &str) -> String {
@@ -112,7 +88,7 @@ pub(crate) fn instance_def(
     entry: &TableEntry,
     namespace: Option<&str>,
     records: &Records,
-    producer: impl Fn(&PortRef) -> Result<Option<PortDef>, BuildError>,
+    producer: impl Fn(&str, &PortRef) -> Result<Option<PortDef>, BuildError>,
 ) -> Result<SystemDef, BuildError> {
     let channel = matches!(system.adapter, Some(Adapter::Channel(_)));
     let mut edges: Vec<(&str, PortDef)> = Vec::new();
@@ -125,7 +101,7 @@ pub(crate) fn instance_def(
             continue;
         }
         for from in &input.from {
-            match producer(from)? {
+            match producer(&input.port, from)? {
                 Some(def) => edges.push((input.port.as_str(), def)),
                 None if entry.def.inputs.iter().any(|p| p.name == input.port) => {}
                 None => {

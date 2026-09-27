@@ -149,14 +149,12 @@ fn test_mirror_overflow_report() {
 fn test_reject_oversize_mirror() {
     assert!(super::mirror_config(64).is_ok());
     // Four times a capacity no region can hold, and one that overflows.
-    assert!(matches!(
-        super::mirror_config(3),
-        Err(ParamError::Decode(_))
-    ));
-    assert!(matches!(
-        super::mirror_config(usize::MAX / 2),
-        Err(ParamError::Decode(_))
-    ));
+    for capacity in [3, usize::MAX / 2] {
+        assert_eq!(
+            super::mirror_config(capacity).err(),
+            Some(ParamError::MirrorTooLarge { capacity })
+        );
+    }
 }
 
 /// The `kind` field a fault line carries.
@@ -278,9 +276,11 @@ fn test_reject_cyclic_thread_placement() {
     };
     assert_eq!(
         config.build(&table(&recorder)).err(),
-        Some(BuildError::ThreadOnCyclic {
+        Some(BuildError::Params {
             id: "imu".into(),
-            thread: "io".into(),
+            source: ParamError::Thread {
+                thread: "io".into()
+            },
         })
     );
 }
@@ -303,9 +303,11 @@ fn test_reject_channel_on_async() {
     };
     assert_eq!(
         config.build(&table(&Recorder::default())).err(),
-        Some(BuildError::ChannelOnAsync {
+        Some(BuildError::Params {
             id: "sleeper".into(),
-            channel: "mode".into(),
+            source: ParamError::Channel {
+                channel: "mode".into()
+            },
         })
     );
 }

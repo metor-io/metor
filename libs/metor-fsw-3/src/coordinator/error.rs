@@ -81,15 +81,6 @@ pub enum BuildError {
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
     ReservedPort { ty: String },
 
-    #[error("cyclic system `{id}` cannot be placed on thread `{thread}`")]
-    ThreadOnCyclic { id: String, thread: String },
-
-    #[error("async system `{id}` cannot take channel `{channel}`")]
-    ChannelOnAsync { id: String, channel: String },
-
-    #[error("slot `{id}` needs a channel, which is how it is loaded")]
-    SlotWithoutChannel { id: String },
-
     #[error("channel `{name}` is longer than {cap} bytes")]
     ChannelName { name: String, cap: usize },
 
@@ -98,9 +89,6 @@ pub enum BuildError {
 
     #[error("port `{id}.{port}` is reserved for the channel adapter")]
     ReservedChannelPort { id: String, port: String },
-
-    #[error("thread `{thread}` failed to start")]
-    ThreadStart { thread: String },
 
     #[error("definition for `{id}`: {source}")]
     Def {

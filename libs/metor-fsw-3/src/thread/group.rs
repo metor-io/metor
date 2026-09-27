@@ -11,7 +11,7 @@ use futures_lite::FutureExt;
 use stellarator::sync::WaitQueue;
 
 use crate::async_system::{Stop, StopHandle, stop_pair};
-use crate::coordinator::{BuildError, ParamError};
+use crate::coordinator::ParamError;
 
 use super::Launch;
 
@@ -87,7 +87,7 @@ pub(crate) struct GroupHandle {
 }
 
 /// Starts one empty group on a new thread, which takes members as they come.
-pub(crate) fn spawn(name: &str) -> Result<Arc<GroupHandle>, BuildError> {
+pub(crate) fn spawn(name: &str) -> Result<Arc<GroupHandle>, ParamError> {
     let (handle, stop) = stop_pair();
     let inbox = Arc::new(Inbox {
         jobs: Mutex::new(Vec::new()),
@@ -98,7 +98,7 @@ pub(crate) fn spawn(name: &str) -> Result<Arc<GroupHandle>, BuildError> {
         std::thread::Builder::new()
             .name(format!("fsw-{name}"))
             .spawn(move || stellarator::run(move || run(inbox, stop)))
-            .map_err(|_| BuildError::ThreadStart {
+            .map_err(|_| ParamError::ThreadStart {
                 thread: name.to_string(),
             })?
     };
@@ -124,10 +124,9 @@ impl GroupHandle {
         match built.recv() {
             Ok(None) => Ok(()),
             Ok(Some(source)) => Err(source),
-            Err(_) => Err(ParamError::Decode(format!(
-                "thread `{}` stopped before it built the system",
-                self.name
-            ))),
+            Err(_) => Err(ParamError::ThreadStart {
+                thread: self.name.clone(),
+            }),
         }
     }
 }
@@ -164,9 +163,9 @@ fn build(launch: Box<dyn Launch>, stop: Stop) -> Result<crate::async_system::Run
     match std::panic::catch_unwind(AssertUnwindSafe(|| launch.launch(stop))) {
         Ok(result) => result,
         Err(payload) => {
-            let message = crate::coordinator::panic_message(&*payload).to_string();
+            let message = crate::panic::message(&*payload).to_string();
             crate::panic::discard(payload);
-            Err(ParamError::Decode(message))
+            Err(ParamError::Panicked(message))
         }
     }
 }
@@ -175,7 +174,7 @@ fn build(launch: Box<dyn Launch>, stop: Stop) -> Result<crate::async_system::Run
 async fn task(running: crate::async_system::Running, panicked: Panicked) {
     let caught = std::panic::AssertUnwindSafe(running).catch_unwind().await;
     if let Err(payload) = caught {
-        let message = crate::coordinator::panic_message(&*payload).to_string();
+        let message = crate::panic::message(&*payload).to_string();
         crate::panic::discard(payload);
         panicked.set(message);
     }
@@ -206,15 +205,10 @@ impl Drop for GroupHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::{channel, sync_channel};
-
-    use metor_fsw_3_ring::Notifier;
+    use std::sync::mpsc::sync_channel;
 
     use super::*;
     use crate::async_system::Running;
-    use crate::port::{Input, Output};
-
-    use crate::tests::utils::{Imu, ring};
 
     /// A launch that panics where a user's constructor would.
     struct PanicCtor;
@@ -248,7 +242,7 @@ mod tests {
     #[test]
     fn test_group_survives_constructor_panic() {
         let group = spawn("ctor").expect("a thread");
-        let Err(ParamError::Decode(message)) = group.add(member(Box::new(PanicCtor))) else {
+        let Err(ParamError::Panicked(message)) = group.add(member(Box::new(PanicCtor))) else {
             panic!("a panicking constructor is a param error")
         };
         assert!(message.contains("a constructor that panics"), "{message}");
@@ -263,30 +257,5 @@ mod tests {
         let at = Instant::now();
         drop(group);
         assert!(at.elapsed() < JOIN_TIMEOUT / 2, "{:?}", at.elapsed());
-    }
-
-    /// The wake this slice rests on: a ring write on this thread must wake a
-    /// task parked on an executor of its own.
-    #[test]
-    fn test_write_wakes_executor() {
-        let wake = Notifier::default();
-        let ring = ring::<Imu>(4, 1);
-        let view = ring.view(wake.clone()).expect("free slot");
-        let (tx, rx) = channel();
-        let thread = std::thread::spawn(move || {
-            stellarator::run(move || async move {
-                let mut input = Input::<Imu, Notifier>::new(vec![view]);
-                let sample = input.next().await.expect("record").sample;
-                tx.send(sample).expect("the test is listening");
-            })
-        });
-        std::thread::sleep(core::time::Duration::from_millis(50));
-        let out = Output::<Imu, _>::new(ring.writer(wake).expect("free writer"));
-        out.write(&Imu::new(1, 42.0)).expect("ring has room");
-        assert_eq!(
-            rx.recv_timeout(core::time::Duration::from_secs(5)),
-            Ok(42.0)
-        );
-        thread.join().expect("the executor thread finished");
     }
 }

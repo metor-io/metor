@@ -107,7 +107,6 @@ fn coordinator(entries: Vec<Entry>, rings: Vec<RingBuffer>) -> Coordinator {
         },
         epoch: Timestamp(0),
         cycle: 0,
-        threads: crate::thread::Threads::new(),
         rings,
     }
 }

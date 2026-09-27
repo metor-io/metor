@@ -76,11 +76,6 @@ impl StopHandle {
         self.0.set.store(true, Ordering::Release);
         self.0.woken.wake_all();
     }
-
-    /// Whether the stop has been set.
-    pub fn is_set(&self) -> bool {
-        self.0.set.load(Ordering::Acquire)
-    }
 }
 
 /// The future an async system's launch produces, owning its state and ports.
@@ -90,16 +85,10 @@ pub type Running = core::pin::Pin<Box<dyn Future<Output = ()>>>;
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_stop_initial_state() {
-        let (handle, stop) = stop_pair();
-        assert!(!stop.is_set());
-        assert!(!handle.is_set());
-    }
-
     #[stellarator::test]
     async fn test_stop_resolves() {
         let (handle, stop) = stop_pair();
+        assert!(!stop.is_set());
         handle.stop();
         assert!(stop.is_set());
         stop.wait().await;

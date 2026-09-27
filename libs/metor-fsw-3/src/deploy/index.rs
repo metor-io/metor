@@ -147,7 +147,7 @@ impl<'a> DefIndex<'a> {
             entry,
             target.coordinator.namespace.as_deref(),
             &self.records[at.target],
-            |from| Ok(producers.get(from).cloned().flatten()),
+            |_, from| Ok(producers.get(from).cloned().flatten()),
         )
         .map_err(|source| self.build_error(at, source))
     }

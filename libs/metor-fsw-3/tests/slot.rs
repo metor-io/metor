@@ -363,7 +363,10 @@ fn test_slot_needs_channel() {
         panic!("a slot without a channel is refused")
     };
     assert!(
-        matches!(error, BuildError::SlotWithoutChannel { ref id } if id == "mode"),
+        matches!(
+            error,
+            BuildError::Params { ref id, source: metor_fsw_3::ParamError::SlotChannel } if id == "mode"
+        ),
         "{error:?}"
     );
 }

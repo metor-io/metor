@@ -14,7 +14,6 @@ use cordyceps::List;
 use metor_proto::types::Timestamp;
 
 use super::redline::{Node, Redline};
-use crate::coordinator::panic_message;
 use crate::log::Log;
 
 /// A `Seq` is a sequence's view of its cycle: the time, whether it was
@@ -276,7 +275,7 @@ fn run_handler<'a>(seq: &Seq<'a>, f: impl FnOnce(&Seq<'a>)) {
     // PANIC Safety: caught so the handlers after it still run, and so a
     // panic during an unwind never escapes.
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| f(seq))) {
-        Log.fault("handler", panic_message(&*payload).to_string());
+        Log.fault("handler", crate::panic::message(&*payload).to_string());
         crate::panic::discard(payload);
     }
 }

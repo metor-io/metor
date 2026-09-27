@@ -1,6 +1,5 @@
 //! The erased runner and the cycle loop.
 
-use core::any::Any;
 use core::future::Future;
 use core::pin::pin;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -63,22 +62,12 @@ pub(crate) fn catch_step(slot: &mut Option<Box<dyn Step>>, now: Timestamp) -> St
         Ok(false) => Stepped::Ran,
         Ok(true) => Stepped::Ended,
         Err(payload) => {
-            crate::panic::catch(|| step.fault(now, message_of(&*payload)));
+            crate::panic::catch(|| step.fault(now, crate::panic::message(&*payload)));
             crate::panic::discard(payload);
             crate::panic::catch(|| drop(slot.take()));
             Stepped::Unwound
         }
     }
-}
-
-pub(crate) fn message_of(payload: &(dyn Any + Send)) -> &str {
-    if let Some(text) = payload.downcast_ref::<&str>() {
-        return text;
-    }
-    if let Some(text) = payload.downcast_ref::<String>() {
-        return text;
-    }
-    "panic"
 }
 
 impl Coordinator {
@@ -373,7 +362,7 @@ mod tests {
                 std::panic::panic_any(7u8);
             }
         }
-        assert_eq!(message_of(&7u8), "panic");
+        assert_eq!(crate::panic::message(&7u8), "panic");
         let mut step: Option<Box<dyn Step>> = Some(Box::new(Odd));
         assert_eq!(catch_step(&mut step, Timestamp(0)), Stepped::Unwound);
         assert!(step.is_none());

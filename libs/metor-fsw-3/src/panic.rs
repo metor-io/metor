@@ -16,6 +16,17 @@ pub(crate) fn catch<T>(f: impl FnOnce() -> T) -> Option<T> {
     }
 }
 
+/// The text a panic payload carries, or `"panic"` for any other payload.
+pub(crate) fn message(payload: &(dyn Any + Send)) -> &str {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        return text;
+    }
+    if let Some(text) = payload.downcast_ref::<String>() {
+        return text;
+    }
+    "panic"
+}
+
 pub(crate) fn discard(payload: Payload) {
     // PANIC Safety: a payload's destructor is user code too.
     if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
