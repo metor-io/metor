@@ -245,19 +245,17 @@ fn test_unknown_system_type() {
 
 #[test]
 fn test_bad_params_refused() {
-    let cases: [(&str, fn(&ParamError) -> bool); 2] = [
-        (r#"{"gain":2.0}"#, |e| {
-            *e == ParamError::UnknownKey("gain".into())
-        }),
-        ("{", |e| matches!(e, ParamError::Decode(_))),
-    ];
-    for (params, expected) in cases {
+    let refused = |params: &str| {
         let nav = ring::<Nav>(1);
         let instance = create_raw("nav", params, &[RawSlice::EMPTY], &[nav.raw()]);
         assert!(instance.handle.is_null());
-        let decoded: ParamError = serde_json::from_slice(instance.error()).expect("decodes");
-        assert!(expected(&decoded), "{params}: {decoded:?}");
-    }
+        serde_json::from_slice::<ParamError>(instance.error()).expect("decodes")
+    };
+    assert_eq!(
+        refused(r#"{"gain":2.0}"#),
+        ParamError::UnknownKey("gain".into())
+    );
+    assert!(matches!(refused("{"), ParamError::Decode(_)));
 }
 
 #[test]

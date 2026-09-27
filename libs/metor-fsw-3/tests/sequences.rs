@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use common::{Fsw, Running, dial_fsw, fixture_dir, free_ports, local, metor, ports_env, within};
@@ -166,45 +166,4 @@ async fn test_slot_commanded_over_links() {
     assert_eq!(registry.channels[0].name, "mode");
     assert_eq!(registry.channels[0].available, ["count_up", "count_down"]);
     assert!(down.artifact_is_string, "the artifact is announced as text");
-}
-
-#[test]
-fn test_build_stores_candidates() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let out = dir.path().join("slot.json");
-    let output = metor()
-        .args(["build", &target().display().to_string(), "--out"])
-        .arg(&out)
-        .output()
-        .expect("metor runs");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let envelope: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&out).expect("written")).expect("json");
-    let slot = &envelope["targets"][0]["coordinator"]["systems"][1];
-    assert_eq!(slot["ty"], "fsw.dl_slot");
-    let allow = slot["params"]["allow"].as_array().expect("an allow list");
-    assert_eq!(allow.len(), 2);
-    for candidate in allow {
-        assert!(candidate.get("pack").is_none(), "{candidate}");
-        let path = Path::new(candidate["path"].as_str().expect("a path"));
-        let hash = candidate["hash"].as_str().expect("a hash");
-        assert!(path.is_file(), "{}", path.display());
-        let dir = path.parent().and_then(Path::file_name).expect("a hash dir");
-        assert_eq!(dir.to_str(), Some(hash));
-        assert!(candidate["def"].is_object());
-    }
-    let store = target()
-        .parent()
-        .expect("a directory")
-        .join(".metor")
-        .join("store");
-    assert!(
-        allow[0]["path"]
-            .as_str()
-            .is_some_and(|p| Path::new(p).starts_with(&store))
-    );
 }

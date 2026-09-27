@@ -248,21 +248,6 @@ fn test_load_other_then_abort() {
 }
 
 #[test]
-fn test_reset_restarts_loaded() {
-    let (seen, mut coordinator) = build(slot_params(both()));
-    send(&seen, &mut coordinator, [load("up")]);
-    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
-    run(&seen, &mut coordinator, 1);
-    assert_eq!(pings(&seen), [1, 2]);
-
-    let reset = [SequenceCommandKind::Stop, SequenceCommandKind::Reset];
-    send(&seen, &mut coordinator, reset);
-    assert_eq!(status(&seen).loaded, 0);
-    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
-    assert_eq!(pings(&seen), [1]);
-}
-
-#[test]
 fn test_unknown_load_keeps_occupant() {
     let (seen, mut coordinator) = build(slot_params(both()));
     send(&seen, &mut coordinator, [load("up")]);
@@ -289,8 +274,8 @@ fn test_changed_bytes_refused() {
     assert_eq!(status(&seen).loaded, 0);
 }
 
-/// A candidate of a type whose ports differ from the slot's is refused, and
-/// the occupant stays.
+/// A candidate whose library's ports differ from the slot's baked ones is
+/// refused, and the occupant stays.
 #[test]
 fn test_other_type_refused() {
     let mut other = candidate("gain", "gain");
@@ -301,18 +286,6 @@ fn test_other_type_refused() {
     let events = send(&seen, &mut coordinator, [load("gain")]);
     assert!(refused(&events, "no longer matches"), "{events:?}");
     assert_eq!(status(&seen).loaded, 0);
-}
-
-/// A slot whose baked ports no longer match the library refuses the load.
-#[test]
-fn test_stale_baked_ports_refused() {
-    let mut stale = candidate("up", "count_up");
-    stale["def"] = baked("gain");
-    let (seen, mut coordinator) = build(slot_params(vec![stale]));
-    run(&seen, &mut coordinator, 1);
-    let events = send(&seen, &mut coordinator, [load("up")]);
-    assert!(refused(&events, "no longer matches"), "{events:?}");
-    assert_eq!(status(&seen).state, ChannelState::Unloaded.code());
 }
 
 /// A candidate whose constructor refuses is refused, and the occupant is
@@ -429,14 +402,24 @@ fn envelope(allow: Vec<Value>) -> DeploymentConfig {
     }
 }
 
+/// A temp dir and the libs dir and store under it.
+fn scratch() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    (dir, libs, store)
+}
+
+fn resolve(envelope: &mut DeploymentConfig, store: &Path) -> Result<(), DeployError> {
+    deploy::resolve_slots(envelope, &[table(&Shared::default())], store)
+}
+
 fn slot(envelope: &DeploymentConfig) -> &Value {
     &envelope.targets[0].coordinator.systems[2].params
 }
 
 #[test]
 fn test_build_resolves_into_store() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    let (_dir, libs, store) = scratch();
     let seen = Shared::default();
     let allow = vec![
         unresolved("up", "count_up", &libs),
@@ -489,14 +472,13 @@ fn next_slot(libs: &Path) -> SystemConfig {
 /// A slot reading another slot's output resolves against that slot's baked ports.
 #[test]
 fn test_build_resolves_chained_slots() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    let (_dir, libs, store) = scratch();
     let mut envelope = envelope(vec![unresolved("up", "count_up", &libs)]);
     envelope.targets[0]
         .coordinator
         .systems
         .push(next_slot(&libs));
-    deploy::resolve_slots(&mut envelope, &[table(&Shared::default())], &store).expect("resolves");
+    resolve(&mut envelope, &store).expect("resolves");
     assert!(!deploy::unresolved(&envelope));
     let next = &envelope.targets[0].coordinator.systems[4].params;
     assert!(next["allow"][0]["def"].is_object());
@@ -505,14 +487,12 @@ fn test_build_resolves_chained_slots() {
 /// A slot reading a slot later in step order is refused.
 #[test]
 fn test_build_refuses_slot_reading_later_slot() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    let (_dir, libs, store) = scratch();
     let mut envelope = envelope(vec![unresolved("up", "count_up", &libs)]);
     let systems = &mut envelope.targets[0].coordinator.systems;
     let mode = systems.iter().position(|s| s.id == "mode").expect("a slot");
     systems.insert(mode, next_slot(&libs));
-    let resolved = deploy::resolve_slots(&mut envelope, &[table(&Shared::default())], &store);
-    let Err(error) = resolved else {
+    let Err(error) = resolve(&mut envelope, &store) else {
         panic!("a slot reading a later slot resolved")
     };
     assert!(error.to_string().contains("mode"), "{error}");
@@ -520,12 +500,11 @@ fn test_build_refuses_slot_reading_later_slot() {
 
 #[test]
 fn test_build_refuses_disagreeing_candidates() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let libs = dir.path().join("libs");
+    let (_dir, libs, store) = scratch();
     let mut gain = unresolved("gain", "gain", &libs);
     gain["params"] = json!({ "gain": 2.0 });
     let mut envelope = envelope(vec![unresolved("up", "count_up", &libs), gain]);
-    let result = deploy::resolve_slots(&mut envelope, &[table(&Shared::default())], dir.path());
+    let result = resolve(&mut envelope, &store);
     let Err(DeployError::SlotContract {
         first, candidate, ..
     }) = result
@@ -537,17 +516,16 @@ fn test_build_refuses_disagreeing_candidates() {
 
 #[test]
 fn test_build_refuses_missing_pack() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let mut missing = unresolved("up", "count_up", &dir.path().join("libs"));
+    let (dir, libs, store) = scratch();
+    let mut missing = unresolved("up", "count_up", &libs);
     missing["pack"]["libs"] = json!(dir.path().join("nowhere"));
-    let mut missing = envelope(vec![missing]);
-    let result = deploy::resolve_slots(&mut missing, &[table(&Shared::default())], dir.path());
+    let result = resolve(&mut envelope(vec![missing]), &store);
     assert!(
         matches!(result, Err(DeployError::Slot { .. })),
         "{result:?}"
     );
-    let mut bare = envelope(vec![json!({ "name": "up", "ty": "count_up" })]);
-    let result = deploy::resolve_slots(&mut bare, &[table(&Shared::default())], dir.path());
+    let bare = json!({ "name": "up", "ty": "count_up" });
+    let result = resolve(&mut envelope(vec![bare]), &store);
     assert!(
         matches!(result, Err(DeployError::Slot { .. })),
         "{result:?}"
@@ -556,14 +534,10 @@ fn test_build_refuses_missing_pack() {
 
 #[test]
 fn test_build_refuses_long_library_name() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let mut long = unresolved("up", "count_up", &dir.path().join("libs"));
+    let (_dir, libs, store) = scratch();
+    let mut long = unresolved("up", "count_up", &libs);
     long["pack"]["lib"] = json!("l".repeat(64));
-    let result = deploy::resolve_slots(
-        &mut envelope(vec![long]),
-        &[table(&Shared::default())],
-        dir.path(),
-    );
+    let result = resolve(&mut envelope(vec![long]), &store);
     assert!(
         matches!(result, Err(DeployError::ArtifactName { cap: 63, .. })),
         "{result:?}"

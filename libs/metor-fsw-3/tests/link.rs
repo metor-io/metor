@@ -200,6 +200,29 @@ fn publish(link: &str, transport: serde_json::Value, conn_cap: usize) -> SystemC
     }
 }
 
+/// A listening transport on a port the OS picks.
+fn listen_any() -> serde_json::Value {
+    json!({ "listen": { "addr": "127.0.0.1:0" } })
+}
+
+/// `imu` and a `Publish` named `link` serving it on a port the OS picks.
+fn imu_publisher(link: &str) -> Vec<SystemConfig> {
+    vec![
+        SystemConfig::new("imu", "source"),
+        publish(link, listen_any(), 1 << 20),
+    ]
+}
+
+/// A status sink on the link system `link`.
+fn status_reader(link: &str) -> SystemConfig {
+    reading(
+        "status",
+        "status_sink",
+        "link_status",
+        PortRef::new(link, "link_status"),
+    )
+}
+
 /// Builds and runs `systems` on a thread of its own, cycling at `rate`.
 fn spawn(systems: Vec<SystemConfig>, seen: &Seen, rate: f64) -> Target {
     spawn_on(systems, seen, Clock::Wall { rate })
@@ -282,18 +305,7 @@ async fn until_seen(what: &str, seen: &Seen, mut done: impl FnMut() -> bool) {
 #[stellarator::test]
 async fn test_publish_announces_and_streams() {
     let seen = Seen::default();
-    let _target = spawn(
-        vec![
-            SystemConfig::new("imu", "source"),
-            publish(
-                "pub-announces",
-                json!({ "listen": { "addr": "127.0.0.1:0" } }),
-                1 << 20,
-            ),
-        ],
-        &seen,
-        500.0,
-    );
+    let _target = spawn(imu_publisher("pub-announces"), &seen, 500.0);
     let addr = bound("pub-announces").await;
 
     let Fsw {
@@ -382,17 +394,8 @@ async fn test_slow_client_isolation() {
     let _target = spawn(
         vec![
             SystemConfig::new("imu", "source"),
-            publish(
-                "pub-slow",
-                json!({ "listen": { "addr": "127.0.0.1:0" } }),
-                256,
-            ),
-            reading(
-                "status",
-                "status_sink",
-                "link_status",
-                PortRef::new("pub", "link_status"),
-            ),
+            publish("pub-slow", listen_any(), 256),
+            status_reader("pub"),
         ],
         &seen,
         50_000.0,
@@ -435,15 +438,7 @@ fn subscribe(link: &str, transport: serde_json::Value) -> SystemConfig {
 async fn test_subscribe_counts_identity_write_once() {
     let seen = Seen::default();
     let _target = spawn(
-        vec![
-            subscribe("cmds-idle", json!({ "listen": { "addr": "127.0.0.1:0" } })),
-            reading(
-                "status",
-                "status_sink",
-                "link_status",
-                PortRef::new("cmds", "link_status"),
-            ),
-        ],
+        vec![subscribe("cmds-idle", listen_any()), status_reader("cmds")],
         &seen,
         500.0,
     );
@@ -477,17 +472,9 @@ async fn test_subscribe_announces_and_routes() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe(
-                "cmds-routes",
-                json!({ "listen": { "addr": "127.0.0.1:0" } }),
-            ),
+            subscribe("cmds-routes", listen_any()),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
-            reading(
-                "status",
-                "status_sink",
-                "link_status",
-                PortRef::new("cmds", "link_status"),
-            ),
+            status_reader("cmds"),
         ],
         &seen,
         500.0,
@@ -529,7 +516,7 @@ async fn test_subscribe_receives_records() {
             SystemConfig::new("src", "pinger"),
             SystemConfig {
                 params: json!({
-                    "transport": { "listen": { "addr": "127.0.0.1:0" } },
+                    "transport": listen_any(),
                     "link": "pub-records",
                 }),
                 ..reading(
@@ -601,18 +588,7 @@ fn published_imu() -> metor_fsw_3::PortDef {
 #[stellarator::test]
 async fn test_subscribe_mirrors_frames() {
     let (server, client) = (Seen::default(), Seen::default());
-    let _server = spawn(
-        vec![
-            SystemConfig::new("imu", "source"),
-            publish(
-                "pub-frames",
-                json!({ "listen": { "addr": "127.0.0.1:0" } }),
-                1 << 20,
-            ),
-        ],
-        &server,
-        500.0,
-    );
+    let _server = spawn(imu_publisher("pub-frames"), &server, 500.0);
     let addr = bound("pub-frames").await;
     let _client = spawn(mirror(addr, published_imu()), &client, 500.0);
     until("the mirror never received a frame", || {
@@ -628,23 +604,12 @@ async fn test_subscribe_mirrors_frames() {
 #[stellarator::test]
 async fn test_dialing_beside_a_listener() {
     let (server, client) = (Seen::default(), Seen::default());
-    let _server = spawn(
-        vec![
-            SystemConfig::new("imu", "source"),
-            publish(
-                "pub-beside",
-                json!({ "listen": { "addr": "127.0.0.1:0" } }),
-                1 << 20,
-            ),
-        ],
-        &server,
-        500.0,
-    );
+    let _server = spawn(imu_publisher("pub-beside"), &server, 500.0);
     let addr = bound("pub-beside").await;
     let mut systems = mirror(addr, published_imu());
     systems.push(SystemConfig {
         params: json!({
-            "transport": { "listen": { "addr": "127.0.0.1:0" } },
+            "transport": listen_any(),
             "link": "ground-beside",
         }),
         ..reading(
@@ -664,18 +629,7 @@ async fn test_dialing_beside_a_listener() {
 #[stellarator::test]
 async fn test_subscribe_faults_unannounced_table() {
     let (server, client) = (Seen::default(), Seen::default());
-    let _server = spawn(
-        vec![
-            SystemConfig::new("imu", "source"),
-            publish(
-                "pub-other",
-                json!({ "listen": { "addr": "127.0.0.1:0" } }),
-                1 << 20,
-            ),
-        ],
-        &server,
-        500.0,
-    );
+    let _server = spawn(imu_publisher("pub-other"), &server, 500.0);
     let addr = bound("pub-other").await;
     // Built against the same frame on another target: another table id.
     let elsewhere = DefCx {
@@ -767,7 +721,7 @@ async fn test_subscribe_skips_large_announce() {
         .inputs
         .push(InputConfig::new("wide.wide", "wide", "wide"));
     publish.params = json!({
-        "transport": { "listen": { "addr": "127.0.0.1:0" } },
+        "transport": listen_any(),
         "link": "pub-wide",
     });
     let _server = spawn(
@@ -801,25 +755,12 @@ async fn test_subscribe_skips_large_announce() {
 #[stellarator::test]
 async fn test_oversized_packet_closes_connection() {
     let seen = Seen::default();
-    let _target = spawn(
-        vec![
-            SystemConfig::new("imu", "source"),
-            publish(
-                "pub-cap",
-                json!({ "listen": { "addr": "127.0.0.1:0" } }),
-                1 << 20,
-            ),
-            reading(
-                "status",
-                "status_sink",
-                "link_status",
-                PortRef::new("pub", "link_status"),
-            ),
-            reading("logs", "log_sink", "log", PortRef::new("pub", "log")),
-        ],
-        &seen,
-        500.0,
-    );
+    let mut systems = imu_publisher("pub-cap");
+    systems.extend([
+        status_reader("pub"),
+        reading("logs", "log_sink", "log", PortRef::new("pub", "log")),
+    ]);
+    let _target = spawn(systems, &seen, 500.0);
     let addr = bound("pub-cap").await;
 
     let peer = raw_dial(addr).await;
@@ -910,10 +851,7 @@ async fn test_refuse_peer_past_limit() {
 #[stellarator::test]
 async fn test_stop_closes_connections() {
     let target = spawn(
-        vec![subscribe(
-            "cmds-stop",
-            json!({ "listen": { "addr": "127.0.0.1:0" } }),
-        )],
+        vec![subscribe("cmds-stop", listen_any())],
         &Seen::default(),
         500.0,
     );

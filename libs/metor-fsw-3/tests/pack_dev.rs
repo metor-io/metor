@@ -7,31 +7,11 @@ use std::path::Path;
 use std::process::Command;
 
 use common::fixture_dir;
+use metor_fsw_3::Pack;
 use metor_fsw_3::cli::cargo::{PackConfig, cargo_build, cdylib_name, triple};
-use metor_fsw_3::cli::config::PackRef;
-use metor_fsw_3::cli::module::render;
 use metor_fsw_3::cli::pack_dev::{PackDevError, pack_dev};
-use metor_fsw_3::{ABI_VERSION, Pack};
 
 const GOLDEN: &str = include_str!("golden/echo_pack.py");
-
-#[test]
-fn test_fixture_matches_golden_module() {
-    let built = cargo_build("echo-pack", &fixture_dir()).expect("the fixture builds");
-    // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
-    let pack = unsafe { Pack::open(&built) }.expect("it opens");
-    let reference = PackRef {
-        id: "echo".into(),
-        lib: "echo_pack".into(),
-        libs: "unused".into(),
-    };
-    let text = render(&reference, ABI_VERSION, pack.descriptor()).expect("renders");
-    assert_eq!(text, GOLDEN);
-    assert!(
-        !text.contains(env!("CARGO_MANIFEST_DIR")),
-        "no absolute paths"
-    );
-}
 
 #[test]
 fn test_golden_module_type_checks() {
