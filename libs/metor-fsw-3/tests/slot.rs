@@ -17,7 +17,7 @@ use metor_fsw_3::metor_proto_wkt::{
 };
 use metor_fsw_3::{
     Adapter, BuildError, ChannelConfig, ChannelState, ChannelStatus, Coordinator,
-    CoordinatorConfig, DefCx, Input, InputConfig, Output, Pack, RunState, SystemConfig,
+    CoordinatorConfig, DefCx, DlPack, Input, InputConfig, Output, RunState, SystemConfig,
     SystemTable, Timestamp, system,
 };
 use serde_json::{Value, json};
@@ -72,7 +72,7 @@ fn watch(
 /// `ty`'s ports as `metor build` would bake them for instance `mode`.
 fn baked(ty: &str) -> Value {
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
-    let pack = unsafe { Pack::open(fixture_lib()) }.expect("the fixture opens");
+    let pack = unsafe { DlPack::open(fixture_lib()) }.expect("the fixture opens");
     let cx = DefCx {
         id: "mode",
         ..DefCx::empty()

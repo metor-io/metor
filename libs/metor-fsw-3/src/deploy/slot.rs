@@ -10,7 +10,7 @@ use crate::FrameStr;
 use crate::cli::config::{DeploymentConfig, PackRef};
 use crate::coordinator::{SystemConfig, SystemTable};
 use crate::def::{DefCx, DefError};
-use crate::dl::{Pack, SLOT_TYPE, slot::same_ports, store};
+use crate::dl::{DlPack, Pack, SLOT_TYPE, slot::same_ports, store};
 use crate::pack::def::DefCxOwned;
 use crate::system::SystemDef;
 
@@ -150,7 +150,8 @@ impl SlotCx {
         let within = |e: String| self.fail(format!("`{name}`: {e}"));
         // SAFETY: a pack reference names a library `pack dev` built against
         // this ABI; `open` checks the version before calling anything else.
-        let opened = unsafe { Pack::open(&artifact) }.map_err(|e| within(e.to_string()))?;
+        let opened = unsafe { DlPack::open(&artifact) }.map_err(|e| within(e.to_string()))?;
+        let opened = Pack::Dl(opened);
         let params = candidate.get("params").unwrap_or(&Value::Null);
         let def = self
             .def(&opened, &ty, params)

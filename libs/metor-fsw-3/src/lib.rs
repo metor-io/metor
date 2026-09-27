@@ -167,7 +167,7 @@ pub use coordinator::{
 };
 pub use def::{DefCx, DefError, Records};
 #[cfg(feature = "host")]
-pub use dl::{DlStep, Pack, PackError};
+pub use dl::{DlPack, DlStep, Pack, PackError};
 pub use fn_system::{
     AsyncSystemFn, Ctor, Cycle, FnSystem, InSet, OutSet, Param, ParamNames, Ports, SystemFn,
 };

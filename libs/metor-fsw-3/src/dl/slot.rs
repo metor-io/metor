@@ -20,7 +20,7 @@ use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
 use crate::{FrameBytes, FrameStr};
 
-use super::{DlStep, Pack, create, store};
+use super::{DlPack, Pack, PackError, is_loaded, store};
 
 /// The name the slot's definition carries.
 const SLOT_NAME: &str = "dl_slot";
@@ -175,8 +175,8 @@ pub struct DlSlot {
 /// The occupant and the pack it was created from.
 struct Loaded {
     at: usize,
-    pack: Pack,
-    step: DlStep,
+    pack: Arc<Pack>,
+    step: Box<dyn Step>,
 }
 
 impl DlSlot {
@@ -186,11 +186,12 @@ impl DlSlot {
     /// only a first open hashes the file, and re-checks that the file it
     /// hashed is the one it opened.
     fn open(&self, candidate: &Resolved) -> Result<Pack, LoadError> {
-        let open_error = |e: super::PackError| LoadError::Open(e.to_string());
+        let open_error = |e: PackError| LoadError::Open(e.to_string());
         let io_error = |e: std::io::Error| LoadError::Open(e.to_string());
-        if super::is_loaded(&candidate.path) {
+        if is_loaded(&candidate.path) {
             // SAFETY: the library is already mapped in this process.
-            return unsafe { Pack::open(&candidate.path) }.map_err(open_error);
+            let pack = unsafe { DlPack::open(&candidate.path) }.map_err(open_error)?;
+            return Ok(Pack::Dl(pack));
         }
         let hashed = store::Hashed::of(&candidate.path).map_err(io_error)?;
         if hashed.hash != candidate.hash {
@@ -198,11 +199,11 @@ impl DlSlot {
         }
         // SAFETY: the library is in the store `metor build` wrote, and its
         // bytes are the ones build hashed; `open` checks the ABI first.
-        let pack = unsafe { Pack::open(&candidate.path) }.map_err(open_error)?;
+        let pack = unsafe { DlPack::open(&candidate.path) }.map_err(open_error)?;
         if !hashed.still_at(&candidate.path).map_err(io_error)? {
             return Err(LoadError::Hash(candidate.name.clone()));
         }
-        Ok(pack)
+        Ok(Pack::Dl(pack))
     }
 
     fn check_ports(&self, pack: &Pack, candidate: &Resolved) -> Result<(), LoadError> {
@@ -220,16 +221,14 @@ impl DlSlot {
         Ok(())
     }
 
-    fn create(&self, pack: &Pack, candidate: &Resolved) -> Result<DlStep, LoadError> {
+    fn create(&self, pack: &Pack, candidate: &Resolved) -> Result<Box<dyn Step>, LoadError> {
         let inputs: Vec<Vec<&RingBuffer>> = self
             .inputs
             .iter()
             .map(|rings| rings.iter().collect())
             .collect();
         let outputs: Vec<&RingBuffer> = self.outputs.iter().collect();
-        create(
-            &pack.lib,
-            pack.fns,
+        pack.create(
             &candidate.ty,
             &candidate.params,
             &self.instance,
@@ -240,7 +239,7 @@ impl DlSlot {
     }
 
     /// Creates candidate `at` over the slot's rings, which must be free.
-    fn place(&mut self, at: usize, pack: Pack) -> Result<(), LoadError> {
+    fn place(&mut self, at: usize, pack: Arc<Pack>) -> Result<(), LoadError> {
         let step = self.create(&pack, &self.candidates[at])?;
         self.current = Some(Loaded { at, pack, step });
         self.end = None;
@@ -273,7 +272,7 @@ impl Step for DlSlot {
             .iter()
             .position(|candidate| candidate.name == name)
             .ok_or_else(|| LoadError::Unknown(name.to_string()))?;
-        let pack = self.open(&self.candidates[at])?;
+        let pack = Arc::new(self.open(&self.candidates[at])?);
         self.check_ports(&pack, &self.candidates[at])?;
         // The old occupant releases its views and writers before the new one claims them.
         let previous = self.current.take().map(|loaded| (loaded.at, loaded.pack));

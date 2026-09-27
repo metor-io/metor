@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Command;
 
 use common::fixture_dir;
-use metor_fsw_3::Pack;
+use metor_fsw_3::DlPack;
 use metor_fsw_3::cli::cargo::{PackConfig, cargo_build, cdylib_name, triple};
 use metor_fsw_3::cli::pack_dev::{PackDevError, pack_dev};
 
@@ -131,7 +131,7 @@ fn test_pack_dev_rejects_loaded_destination() {
     std::fs::write(&init, "existing module\n").expect("write sentinel module");
     let before = dylib.metadata().expect("library metadata");
     // SAFETY: this is a copy of the fixture built against this workspace's ABI.
-    drop(unsafe { Pack::open(&dylib) }.expect("load staged fixture"));
+    drop(unsafe { DlPack::open(&dylib) }.expect("load staged fixture"));
 
     assert!(matches!(
         pack_dev(temp.path()),

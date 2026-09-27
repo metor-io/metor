@@ -12,7 +12,7 @@ use metor_fsw_3::coordinator::{
     BuildError, Coordinator, CoordinatorConfig, InputConfig, ParamError, PortRef, SystemConfig,
     SystemTable,
 };
-use metor_fsw_3::{ABI_VERSION, Input, Output, Pack, PackError, Record, Timestamp, system};
+use metor_fsw_3::{ABI_VERSION, DlPack, Input, Output, Pack, PackError, Record, Timestamp, system};
 
 /// Counts up and publishes the count.
 #[derive(Default)]
@@ -36,9 +36,17 @@ fn sink(#[state] s: &mut Sink, input: &mut Input<Ping>) {
 }
 
 /// Opens the fixture, which is a pack built against this ABI.
-fn open() -> Pack {
+fn open() -> Arc<Pack> {
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
-    unsafe { Pack::open(fixture_lib()) }.expect("the fixture opens")
+    let pack = unsafe { DlPack::open(fixture_lib()) }.expect("the fixture opens");
+    Arc::new(Pack::Dl(pack))
+}
+
+/// The fixture's library, which only a dylib pack has.
+fn library(pack: &Pack) -> &Arc<libloading::Library> {
+    match pack {
+        Pack::Dl(pack) => pack.library(),
+    }
 }
 
 #[test]
@@ -47,7 +55,7 @@ fn test_pack_builder_panic_returns_error() {
     if std::env::var_os(CHILD).is_some() {
         // SAFETY: the fixture uses this workspace's ABI, including panic containment.
         assert!(matches!(
-            unsafe { Pack::open(fixture_lib()) },
+            unsafe { DlPack::open(fixture_lib()) },
             Err(PackError::DescriptorStatus(3))
         ));
         return;
@@ -89,7 +97,7 @@ fn pipeline(ty: &str, params: serde_json::Value) -> (CoordinatorConfig, Rc<RefCe
     (config, seen)
 }
 
-fn table(pack: &Pack, seen: &Rc<RefCell<Vec<u32>>>) -> SystemTable {
+fn table(pack: &Arc<Pack>, seen: &Rc<RefCell<Vec<u32>>>) -> SystemTable {
     let mut table = SystemTable::new();
     table
         .register("source", source(), Source::default)
@@ -98,11 +106,13 @@ fn table(pack: &Pack, seen: &Rc<RefCell<Vec<u32>>>) -> SystemTable {
     table
         .register("sink", sink(), move || Sink(seen.clone()))
         .expect("valid records");
-    table.register_pack("echo", pack).expect("valid records");
+    table
+        .register_pack("echo", pack.clone())
+        .expect("valid records");
     table
 }
 
-fn built(ty: &str, params: serde_json::Value) -> (Coordinator, Rc<RefCell<Vec<u32>>>, Pack) {
+fn built(ty: &str, params: serde_json::Value) -> (Coordinator, Rc<RefCell<Vec<u32>>>, Arc<Pack>) {
     let pack = open();
     let (config, seen) = pipeline(ty, params);
     let coordinator = config
@@ -212,7 +222,7 @@ fn test_missing_export_error() {
     #[cfg(not(target_os = "macos"))]
     let path = Path::new("libc.so.6");
     // SAFETY: a system library, loaded to check that it exports nothing of ours.
-    let Err(error) = (unsafe { Pack::open(path) }) else {
+    let Err(error) = (unsafe { DlPack::open(path) }) else {
         panic!("a system library is no pack")
     };
     assert!(matches!(
@@ -224,7 +234,7 @@ fn test_missing_export_error() {
 #[test]
 fn test_abi_error_reports_versions() {
     // SAFETY: the fixture is a pack; only the expected version is wrong.
-    let Err(error) = (unsafe { Pack::open_with(fixture_lib(), ABI_VERSION + 1) }) else {
+    let Err(error) = (unsafe { DlPack::open_with(fixture_lib(), ABI_VERSION + 1) }) else {
         panic!("the versions differ")
     };
     assert!(matches!(
@@ -304,13 +314,13 @@ fn test_pack_panic_preserves_cycle() {
 #[test]
 fn test_library_survives_instance_drop() {
     let (coordinator, _seen, pack) = built("echo", serde_json::Value::Null);
-    let weak = Arc::downgrade(pack.library());
+    let weak = Arc::downgrade(library(&pack));
     drop(pack);
     assert!(weak.upgrade().is_some(), "an instance still holds it");
     drop(coordinator);
     assert!(weak.upgrade().is_some(), "guest code remains resident");
     let reopened = open();
-    assert!(weak.ptr_eq(&Arc::downgrade(reopened.library())));
+    assert!(weak.ptr_eq(&Arc::downgrade(library(&reopened))));
 }
 
 #[test]
@@ -333,8 +343,7 @@ fn test_guest_ports_survive_pack_drop() {
     let (mut coordinator, _, pack) = built("retained", serde_json::Value::Null);
     // SAFETY: the fixture exports this exact function and its code stays resident.
     let release = unsafe {
-        *pack
-            .library()
+        *library(&pack)
             .get::<unsafe extern "C" fn() -> u32>(b"echo_pack_release_retained")
             .expect("fixture export")
     };

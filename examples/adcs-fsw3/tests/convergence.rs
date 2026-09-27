@@ -8,7 +8,7 @@ use core::task::Poll;
 use core::time::Duration;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use adcs_contracts::{AttitudeEstimate, BodyState, DT, ModeCmd, TorqueCmd, tracking_sample};
 use metor_fsw_3::cli::cargo::{cdylib_name, triple};
@@ -17,7 +17,7 @@ use metor_fsw_3::coordinator::{
     Clock, Coordinator, CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable,
 };
 use metor_fsw_3::link::register_builtins;
-use metor_fsw_3::{Input, Pack, system};
+use metor_fsw_3::{DlPack, Input, Pack, system};
 use metor_proto_wkt::LogEvent;
 use tracing_subscriber::layer::SubscriberExt;
 use zerocopy::IntoBytes;
@@ -165,9 +165,11 @@ fn linked(config: &CoordinatorConfig, shared: &Shared) -> Coordinator {
 }
 
 /// Builds the loop with the pack loaded from the staged cdylib.
-fn loaded(config: &CoordinatorConfig, shared: &Shared, pack: &Pack) -> Coordinator {
+fn loaded(config: &CoordinatorConfig, shared: &Shared, pack: &Arc<Pack>) -> Coordinator {
     let mut table = with_sinks(SystemTable::new(), shared);
-    table.register_pack("adcs", pack).expect("valid records");
+    table
+        .register_pack("adcs", pack.clone())
+        .expect("valid records");
     config
         .clone()
         .build(&table)
@@ -247,7 +249,8 @@ fn test_loop_converges_linked_and_loaded() {
     let config = config();
     // SAFETY: `prepare` just built this pack from this workspace against this
     // ABI, and `open` checks the version before calling into it.
-    let pack = unsafe { Pack::open(&staged()) }.expect("the staged pack opens");
+    let pack = unsafe { DlPack::open(&staged()) }.expect("the staged pack opens");
+    let pack = Arc::new(Pack::Dl(pack));
     let (linked_run, loaded_run) = (Shared::default(), Shared::default());
     drive(
         vec![

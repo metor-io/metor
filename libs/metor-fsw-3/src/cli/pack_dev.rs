@@ -8,7 +8,7 @@ use super::cargo::{
 };
 use super::config::PackRef;
 use super::module::render;
-use crate::dl::{Pack, PackError};
+use crate::dl::{DlPack, Pack, PackError};
 use crate::pack::ABI_VERSION;
 
 static BUILD: Mutex<()> = Mutex::new(());
@@ -83,7 +83,7 @@ pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
     std::fs::create_dir_all(&libs).map_err(PackDevError::write(&libs))?;
     copy_atomic(&built, &dylib).map_err(PackDevError::write(&dylib))?;
     // SAFETY: this staged copy was just built against the pack ABI.
-    let pack = unsafe { Pack::open(&dylib) }?;
+    let pack = Pack::Dl(unsafe { DlPack::open(&dylib) }?);
     let text = render(&reference, ABI_VERSION, pack.descriptor())?;
     let init = module.join("__init__.py");
     write_atomic(&init, text.as_bytes()).map_err(PackDevError::write(&init))?;
