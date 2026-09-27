@@ -116,6 +116,36 @@ class Tap(System):
     status: OutPort[SystemStatus]
 
 
+class Spin(System):
+    "Never returns: loops until `now` is before the epoch, which it never is."
+
+    _pack = PACK
+    _ty = "spin"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, input: Sources[Ping] = ()) -> None:
+        super().__init__({"input": input}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Tick(System):
+    "Logs each cycle's time, and pings it."
+
+    _pack = PACK
+    _ty = "tick"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self) -> None:
+        super().__init__({}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
 class Boom(System):
     "Fails on its second cycle."
 

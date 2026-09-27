@@ -93,7 +93,6 @@ impl<W: WakeSource> Mirrors<W> {
     }
 
     /// Drops the input mirrors, freeing their reader slots on the real rings.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the wasm adapter calls it"))]
     pub(crate) fn release_inputs(&mut self) {
         self.fields.drain(1..=self.inputs.len());
         self.inputs.clear();

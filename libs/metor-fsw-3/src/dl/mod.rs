@@ -13,7 +13,7 @@ use crate::coordinator::{BuildError, ParamError, Step, SystemTable, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::pack::def::{Instance, PackDef, PackSystemDef};
 use crate::system::SystemDef;
-use crate::wasm::{Trap, WasmError};
+use crate::wasm::{Trap, WasmError, WasmPack};
 
 pub(crate) use pack::is_loaded;
 pub use pack::{DlPack, DlStep};
@@ -54,6 +54,7 @@ pub const SLOT_TYPE: &str = "fsw.dl_slot";
 /// A `Pack` is an opened pack of any kind and the descriptor it exported.
 pub enum Pack {
     Dl(DlPack),
+    Wasm(WasmPack),
 }
 
 impl Pack {
@@ -61,6 +62,7 @@ impl Pack {
     pub fn descriptor(&self) -> &PackDef {
         match self {
             Pack::Dl(pack) => pack.descriptor(),
+            Pack::Wasm(pack) => pack.descriptor(),
         }
     }
 
@@ -68,6 +70,7 @@ impl Pack {
     pub fn def(&self, ty: &str, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         match self {
             Pack::Dl(pack) => pack.def(ty, cx),
+            Pack::Wasm(pack) => pack.def(ty, cx),
         }
     }
 
@@ -82,6 +85,9 @@ impl Pack {
     ) -> Result<Box<dyn Step>, ParamError> {
         match self {
             Pack::Dl(pack) => Ok(Box::new(
+                pack.create(ty, params, instance, inputs, outputs)?,
+            )),
+            Pack::Wasm(pack) => Ok(Box::new(
                 pack.create(ty, params, instance, inputs, outputs)?,
             )),
         }

@@ -46,6 +46,7 @@ fn open() -> Arc<Pack> {
 fn library(pack: &Pack) -> &Arc<libloading::Library> {
     match pack {
         Pack::Dl(pack) => pack.library(),
+        Pack::Wasm(_) => panic!("a module has no library"),
     }
 }
 
@@ -138,6 +139,8 @@ fn test_pack_reports_system_metadata() {
             "echo",
             "relay",
             "tap",
+            "spin",
+            "tick",
             "boom",
             "gain",
             "fail_input",

@@ -2,12 +2,19 @@
 
 use crate::dl::PackError;
 use crate::dl::codec::DESCRIPTOR_CAPACITY;
-use crate::pack::raw::WASM32_RAW_SLICE;
+use crate::pack::raw::{WASM32_RAW_RING, WASM32_RAW_SLICE};
 
 use super::guest::{Guest, Out, WasmError};
 
 /// A `usize`'s size and alignment in a wasm32 guest.
 const WASM32_USIZE: u32 = 4;
+
+/// One ring region in a guest's memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct GuestRing {
+    pub(super) offset: u32,
+    pub(super) len: u32,
+}
 
 /// `Args` places one call's arguments in a guest's memory through its
 /// allocator, and frees them all when dropped.
@@ -67,6 +74,26 @@ impl<'g> Args<'g> {
         self.slice(ptr, len(bytes.len())?)
     }
 
+    /// An array of unowned `RawRing`s, returning its offset and length.
+    pub(super) fn rings(&mut self, rings: &[GuestRing]) -> Result<(u32, u32), PackError> {
+        let encoded: Vec<u8> = rings.iter().flat_map(|ring| raw_ring(*ring)).collect();
+        let ptr = self.alloc(len(encoded.len())?, WASM32_USIZE)?;
+        self.guest.write(ptr, &encoded)?;
+        Ok((ptr, len(rings.len())?))
+    }
+
+    /// An array of `RawSlice`s, one per `(ptr, len)` pair, returning the
+    /// offset of a `RawSlice` over it.
+    pub(super) fn ports(&mut self, ports: &[(u32, u32)]) -> Result<u32, PackError> {
+        let encoded: Vec<u8> = ports
+            .iter()
+            .flat_map(|&(ptr, len)| raw_slice(ptr, len))
+            .collect();
+        let ptr = self.alloc(len(encoded.len())?, WASM32_USIZE)?;
+        self.guest.write(ptr, &encoded)?;
+        self.slice(ptr, len(ports.len())?)
+    }
+
     /// A [`DESCRIPTOR_CAPACITY`] buffer and the slot its length goes in.
     pub(super) fn out(&mut self) -> Result<Out, PackError> {
         let capacity = len(DESCRIPTOR_CAPACITY)?;
@@ -87,6 +114,18 @@ impl<'g> Args<'g> {
         let mut bytes = vec![0; written as usize];
         self.guest.read(out.dst, &mut bytes)?;
         Ok(Some(bytes))
+    }
+
+    /// The bytes of the `RawSlice` at `offset`, at most [`DESCRIPTOR_CAPACITY`].
+    pub(super) fn slice_bytes(&self, offset: u32) -> Result<Vec<u8>, PackError> {
+        let ptr = read_u32(self.guest, offset)?;
+        let len = read_u32(self.guest, offset.saturating_add(WASM32_USIZE))? as usize;
+        if len > DESCRIPTOR_CAPACITY {
+            return Err(WasmError::TooLarge(len).into());
+        }
+        let mut bytes = vec![0; len];
+        self.guest.read(ptr, &mut bytes)?;
+        Ok(bytes)
     }
 }
 
@@ -116,5 +155,12 @@ pub(super) fn raw_slice(ptr: u32, len: u32) -> [u8; WASM32_RAW_SLICE] {
     let mut bytes = [0; WASM32_RAW_SLICE];
     bytes[..4].copy_from_slice(&ptr.to_le_bytes());
     bytes[4..].copy_from_slice(&len.to_le_bytes());
+    bytes
+}
+
+/// A `RawRing` in wasm32 layout: `base`, `len`, then a `None` owner.
+pub(super) fn raw_ring(ring: GuestRing) -> [u8; WASM32_RAW_RING] {
+    let mut bytes = [0; WASM32_RAW_RING];
+    bytes[..WASM32_RAW_SLICE].copy_from_slice(&raw_slice(ring.offset, ring.len));
     bytes
 }

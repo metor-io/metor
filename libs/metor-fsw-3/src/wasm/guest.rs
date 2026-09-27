@@ -19,7 +19,7 @@ const MAX_PAGES: usize = 1 << 16;
 
 /// Value-stack slots the interpreter reserves for a call, 512 KiB of
 /// 8-byte slots. A pack step runs far below this, so the stack never grows,
-/// and so never allocates, mid-cycle.
+/// and so never allocates, mid-cycle; `tests/wasm_alloc.rs` checks it.
 const STACK: usize = 64 * 1024;
 
 /// Elements a guest's table may hold. rustc's table has one per function
@@ -184,7 +184,7 @@ impl Guest {
         // SAFETY: the store is the only user of these bytes from here, and it
         // is dropped before `arena` frees them: on an error below by
         // declaration order, and in `Guest`'s `Drop` after that.
-        let bytes = unsafe { core::slice::from_raw_parts_mut(arena.ptr.as_ptr(), arena.len) };
+        let bytes = unsafe { arena.bytes() };
         let memory = Memory::new_static(&mut store, ty, bytes)
             .map_err(|e| WasmError::Instantiate(e.to_string()))?;
         let mut linker = Linker::new(module.0.engine());
@@ -389,6 +389,17 @@ impl Arena {
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr).ok_or(WasmError::OutOfMemory(len))?;
         Ok(Arena { ptr, len })
+    }
+
+    /// The arena as one slice, for the one user of its bytes.
+    ///
+    /// # Safety
+    /// Nothing else accesses the bytes while the slice or anything derived
+    /// from it is live, and none of those is used after the arena drops.
+    pub(super) unsafe fn bytes(&self) -> &'static mut [u8] {
+        // SAFETY: `new` allocated `len` bytes at `ptr`; the caller's contract
+        // covers aliasing and lifetime.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
     fn layout(len: usize) -> Option<Layout> {
