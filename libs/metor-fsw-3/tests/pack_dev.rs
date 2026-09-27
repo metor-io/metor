@@ -8,7 +8,9 @@ use std::process::Command;
 
 use common::fixture_dir;
 use metor_fsw_3::DlPack;
-use metor_fsw_3::cli::cargo::{PackConfig, cargo_build, cdylib_name, triple};
+use metor_fsw_3::cli::cargo::{
+    PackConfig, WASM_TRIPLE, cargo_build, cdylib_name, triple, wasm_name,
+};
 use metor_fsw_3::cli::pack_dev::{PackDevError, pack_dev};
 
 const GOLDEN: &str = include_str!("golden/echo_pack.py");
@@ -149,4 +151,86 @@ fn test_pack_dev_rejects_loaded_destination() {
         "existing module\n"
     );
     assert!(!module.join("py.typed").exists());
+}
+
+/// A pack spelled out so no `Cargo.toml` is read, with `wasm`.
+fn wasm_pyproject(krate: &str) -> String {
+    let lib = krate.replace('-', "_");
+    format!(
+        "[project]\nname = \"{krate}\"\n\n[tool.metor.pack]\n\
+         id = \"echo\"\ncrate = \"{krate}\"\nlib = \"{lib}\"\nwasm = true\n"
+    )
+}
+
+/// A pack root under the target dir, where cargo finds this workspace and
+/// its config.
+fn root_in_target() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("a temp dir")
+}
+
+#[test]
+fn test_wasm_pack_dev_refuses_async() {
+    let root = root_in_target();
+    let pyproject = wasm_pyproject("echo-pack");
+    std::fs::write(root.path().join("pyproject.toml"), pyproject).expect("writes");
+    let refused = pack_dev(root.path());
+    assert!(
+        matches!(&refused, Err(PackDevError::AsyncInWasm { system }) if system == "relay"),
+        "{refused:?}"
+    );
+    let module = root.path().join(".metor/echo_pack");
+    assert!(!module.join("__init__.py").exists());
+    assert!(!module.join("_libs").join(WASM_TRIPLE).exists());
+}
+
+/// The fixture without `relay`, renamed `sync-pack` so its artifacts land
+/// beside the fixture's, as a workspace of its own that builds into this
+/// workspace's target dir.
+fn sync_copy() -> tempfile::TempDir {
+    let root = root_in_target();
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = fixture_dir();
+    let manifest = std::fs::read_to_string(fixture.join("Cargo.toml")).expect("reads");
+    let manifest = manifest
+        .replace("name = \"echo-pack\"", "name = \"sync-pack\"")
+        .replace("version.workspace = true", "version = \"0.0.0\"")
+        .replace("edition.workspace = true", "edition = \"2024\"")
+        .replace("repository.workspace = true\n", "")
+        .replace("[lints]\nworkspace = true\n", "")
+        .replace(
+            "path = \"../../..\"",
+            &format!("path = {:?}", env!("CARGO_MANIFEST_DIR")),
+        );
+    std::fs::write(root.path().join("Cargo.toml"), manifest + "\n[workspace]\n").expect("writes");
+    let relay = "    table\n        .register_async(\"relay\", relay(), Default::default)\n        \
+                 .expect(\"valid records\");\n";
+    let lib = std::fs::read_to_string(fixture.join("src/lib.rs")).expect("reads");
+    assert!(lib.contains(relay), "the fixture registers `relay`");
+    std::fs::create_dir(root.path().join("src")).expect("creates");
+    std::fs::write(root.path().join("src/lib.rs"), lib.replace(relay, "")).expect("writes");
+    std::fs::copy(workspace.join("Cargo.lock"), root.path().join("Cargo.lock")).expect("copies");
+    let config = root.path().join(".cargo");
+    std::fs::create_dir(&config).expect("creates");
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .expect("the target dir");
+    let build = format!("[build]\ntarget-dir = {:?}\n", target.display().to_string());
+    std::fs::write(config.join("config.toml"), build).expect("writes");
+    let pyproject = wasm_pyproject("sync-pack");
+    std::fs::write(root.path().join("pyproject.toml"), pyproject).expect("writes");
+    root
+}
+
+#[test]
+fn test_wasm_pack_dev_stages_module() {
+    let root = sync_copy();
+    pack_dev(root.path()).expect("pack dev lays out both");
+    let module = root.path().join(".metor/sync_pack");
+    let staged = module
+        .join("_libs")
+        .join(WASM_TRIPLE)
+        .join(wasm_name("sync_pack"));
+    assert!(staged.is_file(), "{} is missing", staged.display());
+    let init = std::fs::read_to_string(module.join("__init__.py")).expect("reads");
+    assert!(init.contains("    wasm=True,\n)"), "{init}");
 }

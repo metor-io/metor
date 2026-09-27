@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 
 from adcs_stub import PACK, Ctrl, Fan, Hold, Mode, MotorCmd, Nav, Ping, Plant, Safe, Tap
 
@@ -189,6 +190,28 @@ class TargetTest(ConfigTest):
         adcs_target()
         with self.assertRaisesRegex(ConfigError, "found 2"):
             emit()
+
+
+class WasmTest(ConfigTest):
+    def test_wasm_writes_kind_fuel_and_memory(self) -> None:
+        fsw = adcs_target()
+        fsw.wasm(replace(PACK, wasm=True), fuel=10_000_000, memory=16 << 20)
+        wasm = {"kind": "wasm", "fuel": 10_000_000, "memory": 16 << 20}
+        self.assertEqual(fsw.to_config()["packs"], [{**PACK.to_json(), **wasm}])
+
+    def test_pack_without_module_raises(self) -> None:
+        fsw = adcs_target()
+        with self.assertRaisesRegex(ConfigError, "`adcs` has no module"):
+            fsw.wasm(PACK)
+
+    def test_second_wasm_replaces_first(self) -> None:
+        fsw = adcs_target()
+        fsw.wasm(replace(PACK, wasm=True), fuel=1, memory=2)
+        fsw.wasm(replace(PACK, wasm=True))
+        self.assertEqual(fsw.to_config()["packs"], [{**PACK.to_json(), "kind": "wasm"}])
+
+    def test_config_without_wasm_is_unchanged(self) -> None:
+        self.assertEqual(adcs_target().to_config()["packs"], [PACK.to_json()])
 
 
 class LinkTest(ConfigTest):

@@ -64,6 +64,7 @@ class Target:
         self._handles: dict[str, SystemHandle] = {}
         self._commands: list[Source[Any]] = []
         self._packs: dict[str, Pack] = {}
+        self._wasm: dict[str, dict[str, Any]] = {}
         _targets.append(self)
 
     def loop(self, record: type[T]) -> Loop[T]:
@@ -102,6 +103,18 @@ class Target:
         self._handles[name] = handle
         return cast(S, handle)
 
+    def wasm(self, pack: Pack, *, fuel: int | None = None, memory: int | None = None) -> None:
+        """Load ``pack`` as a WebAssembly module on this target, each system in
+        a guest of its own. ``fuel`` is each step's grant and ``memory`` each
+        guest's ceiling in bytes; unset, the host's defaults apply."""
+        if not pack.wasm:
+            raise ConfigError(
+                f"pack `{pack.id}` has no module; set `wasm = true` under "
+                "`[tool.metor.pack]` and rebuild it"
+            )
+        choice = {"kind": "wasm", "fuel": fuel, "memory": memory}
+        self._wasm[pack.id] = {key: value for key, value in choice.items() if value is not None}
+
     def commands(self, *sources: Source[Any]) -> None:
         """Feed every channel, added before or after this call, the
         `SequenceCommand`s these ports carry."""
@@ -135,7 +148,11 @@ class Target:
         """
         self._check_commands()
         return {
-            "packs": [pack.to_json() for pack in self._packs.values() if pack.lib],
+            "packs": [
+                {**pack.to_json(), **self._wasm.get(pack.id, {})}
+                for pack in self._packs.values()
+                if pack.lib
+            ],
             "coordinator": {
                 "clock": self._clock(),
                 "ring_depth": self.ring_depth,

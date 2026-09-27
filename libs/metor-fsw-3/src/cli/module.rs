@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::config::PackRef;
+use super::config::{PackKind, PackRef};
 use super::pack_dev::PackDevError;
 use crate::channel::ABORT_PORT;
 use crate::pack::def::{PackDef, PackSystemDef};
@@ -25,6 +25,8 @@ struct Module {
     pack_id: String,
     lib: String,
     abi_version: u32,
+    /// Whether the pack also ships as a module.
+    wasm: bool,
     /// One class per record the pack carries, sorted by class name.
     records: Vec<RecordClass>,
     /// Nested params objects, by name.
@@ -118,6 +120,7 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
         pack_id: pack.id.clone(),
         lib: pack.lib.clone(),
         abi_version,
+        wasm: pack.kind == PackKind::Wasm,
         records: records(def),
         dataclasses: defs
             .iter()
@@ -503,6 +506,22 @@ mod tests {
             text.contains(
                 "_ports = {\"cmd\": MotorCmd, \"log\": LogEvent, \"status\": SystemStatus}"
             )
+        );
+    }
+
+    #[test]
+    fn test_render_wasm_flag() {
+        let mut reference = PackRef::dylib("test".into(), "test_pack".into(), "unused".into());
+        let def = PackDef {
+            systems: Vec::new(),
+        };
+        let dylib = render(&reference, 1, &def).expect("renders");
+        assert!(!dylib.contains("wasm"), "{dylib}");
+        reference.kind = PackKind::Wasm;
+        let wasm = render(&reference, 1, &def).expect("renders");
+        assert!(
+            wasm.contains("    abi_version=1,\n    wasm=True,\n)"),
+            "{wasm}"
         );
     }
 
