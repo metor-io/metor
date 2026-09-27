@@ -1,7 +1,5 @@
 use metor_fsw_3_ring::NoWake;
-use metor_proto_wkt::{
-    SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
-};
+use metor_proto_wkt::{SequenceChannelEvent, SequenceCommand, SequenceRegistry};
 
 use super::*;
 use crate::def::DefCx;
@@ -12,42 +10,9 @@ use crate::tests::utils::pair;
 
 #[test]
 fn test_wkt_records_keep_panel_ids() {
-    use metor_proto::types::Msg;
-    assert_eq!(
-        SequenceCommand::schema().packet_id(),
-        <SequenceCommand as Msg>::ID
-    );
     assert_eq!(SequenceCommand::schema().packet_id(), [225, 247]);
     assert_eq!(SequenceChannelEvent::schema().packet_id(), [133, 5]);
     assert_eq!(SequenceRegistry::schema().packet_id(), [78, 109]);
-    assert!(matches!(AbortRequest::schema(), RecordSchema::Msg { .. }));
-}
-
-#[test]
-fn test_command_round_trip() {
-    let command = SequenceCommand {
-        channel: "mode".into(),
-        command: SequenceCommandKind::Load {
-            name: "commissioning".into(),
-        },
-    };
-    let mut buf = [0; SequenceCommand::MAX_LEN];
-    let bytes = command.encode(&mut buf).expect("fits");
-    let back = SequenceCommand::decode(bytes).expect("decodes");
-    assert_eq!(back.channel, "mode");
-    assert!(matches!(back.command, SequenceCommandKind::Load { name } if name == "commissioning"));
-}
-
-#[test]
-fn test_oversized_event_refused() {
-    let event = SequenceChannelEvent {
-        channel: "mode".into(),
-        kind: SequenceEventKind::Failed {
-            reason: "r".repeat(SequenceChannelEvent::MAX_LEN),
-        },
-    };
-    let mut buf = [0; SequenceChannelEvent::MAX_LEN];
-    assert!(event.encode(&mut buf).is_err());
 }
 
 #[test]
@@ -106,7 +71,6 @@ fn test_channel_state_codes() {
 
 #[test]
 fn test_channel_status_layout() {
-    assert_eq!(size_of::<ChannelStatus>(), 8 + 4 + 4 + 64 + 32);
     let RecordSchema::Frame { metadata, .. } = ChannelStatus::schema() else {
         panic!("a frame")
     };

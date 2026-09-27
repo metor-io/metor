@@ -10,7 +10,6 @@ use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Context;
 
 use crate::port::Output;
-use crate::record::{DecodeError, EncodeError, Record};
 
 /// A line from no module or source file, stamped `now`.
 pub(crate) fn line(
@@ -32,26 +31,13 @@ pub(crate) fn line(
     }
 }
 
-impl Record for LogEvent {
+impl crate::record::PostcardRecord for LogEvent {
     const NAME: &'static str = "log";
     const MAX_LEN: usize = 4096;
     const DEPTH: usize = 8;
-    type Read<'a> = LogEvent;
-
-    fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
-        crate::record::postcard::encode(self, buf)
-    }
-
-    fn decode(bytes: &[u8]) -> Result<LogEvent, DecodeError> {
-        crate::record::postcard::decode(bytes)
-    }
 
     fn timestamp(&self) -> Option<Timestamp> {
         Some(self.timestamp)
-    }
-
-    fn schema() -> crate::record::RecordSchema {
-        crate::record::RecordSchema::postcard::<LogEvent>(Self::NAME)
     }
 }
 
@@ -71,16 +57,6 @@ impl LogPort {
         }
     }
 
-    /// Writes one line with the given level and fields, stamped with the cycle time.
-    fn write(
-        &mut self,
-        level: LogLevel,
-        message: Cow<'static, str>,
-        fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
-    ) {
-        self.emit(line(self.now, level, message, fields));
-    }
-
     /// Writes an error line whose first field is `kind`, the fault's identity for the ground.
     pub(crate) fn fault(
         &mut self,
@@ -88,14 +64,11 @@ impl LogPort {
         kind: impl Into<Cow<'static, str>>,
         message: impl Into<Cow<'static, str>>,
     ) {
-        self.now = now;
-        let fields = vec![(Cow::Borrowed("kind"), kind.into())];
-        self.write(LogLevel::Error, message.into(), fields);
+        with_log_port(self, now, || Log.fault(kind, message));
     }
 
-    /// Stamps and publishes one event; a ring with no room counts as a drop.
-    fn emit(&mut self, mut event: LogEvent) {
-        event.timestamp = self.now;
+    /// Publishes one event; a ring with no room counts as a drop.
+    fn emit(&mut self, event: LogEvent) {
         if self.output.write(&event).is_err() {
             self.dropped = self.dropped.saturating_add(1);
         }
@@ -150,7 +123,7 @@ impl Log {
         fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     ) {
         let message = message.into();
-        with_port(|port| port.write(level, message, fields));
+        with_port(|port| port.emit(line(port.now, level, message, fields)));
     }
 }
 
@@ -196,11 +169,9 @@ impl<F: core::future::Future + Unpin> core::future::Future for LogScope<'_, F> {
         cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<F::Output> {
         let this = self.get_mut();
-        this.port.now = Timestamp::now();
-        let _restore = RestoreSlot(SLOT.replace(Some(NonNull::from(&mut *this.port))));
-        let polled = core::pin::Pin::new(&mut this.inner).poll(cx);
-        with_port(LogPort::report_dropped);
-        polled
+        with_log_port(this.port, Timestamp::now(), || {
+            core::pin::Pin::new(&mut this.inner).poll(cx)
+        })
     }
 }
 
@@ -223,11 +194,6 @@ fn with_port(f: impl FnOnce(&mut LogPort)) {
     f(unsafe { port.as_mut() });
 }
 
-/// Returns the layer that writes `tracing` events to the entered [`LogPort`].
-pub fn layer() -> LogLayer {
-    LogLayer
-}
-
 /// A `LogLayer` writes each `tracing` event as a [`LogEvent`] on this thread's port.
 pub struct LogLayer;
 
@@ -238,7 +204,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogLayer {
             let mut visitor = Fields::default();
             event.record(&mut visitor);
             port.emit(LogEvent {
-                timestamp: Timestamp(0),
+                timestamp: port.now,
                 level: level_of(meta.level()),
                 source: Cow::Borrowed(meta.target()),
                 target: Cow::Borrowed(meta.target()),
@@ -296,6 +262,7 @@ mod tests {
 
     use super::*;
     use crate::port::{Input, ring_capacity};
+    use crate::record::Record;
     use crate::tests::utils::pair;
 
     /// A port whose ring holds `records` lines of `MAX_LEN`.
@@ -332,7 +299,7 @@ mod tests {
     #[test]
     fn test_trace_fields_and_location() {
         let (_ring, mut port, mut input) = log_pair(8);
-        let subscriber = tracing_subscriber::registry().with(layer());
+        let subscriber = tracing_subscriber::registry().with(LogLayer);
         with_log_port(&mut port, Timestamp(9), || {
             tracing::subscriber::with_default(subscriber, || {
                 tracing::warn!(slot = "nav", attempts = 3, "occupant failed");
@@ -354,7 +321,7 @@ mod tests {
     #[test]
     fn test_log_without_port() {
         let (_ring, mut port, mut input) = log_pair(8);
-        let subscriber = tracing_subscriber::registry().with(layer());
+        let subscriber = tracing_subscriber::registry().with(LogLayer);
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("between systems");
         });
@@ -447,7 +414,7 @@ mod tests {
         }
 
         let (_ring, mut port, mut input) = log_pair(8);
-        let subscriber = tracing_subscriber::registry().with(layer());
+        let subscriber = tracing_subscriber::registry().with(LogLayer);
         with_log_port(&mut port, Timestamp(3), || {
             tracing::subscriber::with_default(subscriber, || {
                 tracing::info!(value = ?Recursive, "outer");
@@ -475,7 +442,7 @@ mod tests {
         }
 
         let (_ring, mut port, mut input) = log_pair(8);
-        let subscriber = tracing_subscriber::registry().with(layer());
+        let subscriber = tracing_subscriber::registry().with(LogLayer);
         with_log_port(&mut port, Timestamp(4), || {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 tracing::subscriber::with_default(subscriber, || {

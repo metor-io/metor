@@ -151,7 +151,7 @@ fn install_logging() {
     let subscriber = tracing_subscriber::registry()
         .with(level)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .with(crate::log::layer());
+        .with(crate::log::LogLayer);
     // A host that already installed a subscriber keeps it.
     let _ = tracing::subscriber::set_global_default(subscriber);
 }

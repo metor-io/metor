@@ -404,7 +404,7 @@ fn log_config(lines: usize) -> (CoordinatorConfig, SystemTable, Rc<RefCell<Vec<L
 }
 
 fn with_layer(f: impl FnOnce()) {
-    let subscriber = tracing_subscriber::registry().with(crate::log::layer());
+    let subscriber = tracing_subscriber::registry().with(crate::log::LogLayer);
     tracing::subscriber::with_default(subscriber, f);
 }
 

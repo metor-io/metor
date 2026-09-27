@@ -91,7 +91,7 @@ thread_local! {
 fn with_table<R>(build: fn() -> SystemTable, f: impl FnOnce(&SystemTable) -> R) -> R {
     TABLE.with(|cell| {
         f(cell.get_or_init(|| {
-            let subscriber = tracing_subscriber::registry().with(crate::log::layer());
+            let subscriber = tracing_subscriber::registry().with(crate::log::LogLayer);
             let _ = tracing::subscriber::set_global_default(subscriber);
             build()
         }))

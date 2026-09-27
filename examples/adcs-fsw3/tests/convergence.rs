@@ -202,7 +202,7 @@ fn stop(cycles: u64) -> impl Future<Output = ()> {
 fn install_logging() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let subscriber = tracing_subscriber::registry().with(metor_fsw_3::log::layer());
+        let subscriber = tracing_subscriber::registry().with(metor_fsw_3::LogLayer);
         let _ = tracing::subscriber::set_global_default(subscriber);
     });
 }
