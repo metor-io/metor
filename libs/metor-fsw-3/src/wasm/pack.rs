@@ -32,6 +32,17 @@ pub struct Fuel {
     pub setup: u64,
 }
 
+impl Fuel {
+    /// A step grant of `step`, the default when unset, and the default setup
+    /// grant.
+    pub fn with_step(step: Option<u64>) -> Fuel {
+        Fuel {
+            step: step.unwrap_or(super::DEFAULT_FUEL),
+            setup: super::DEFAULT_SETUP_FUEL,
+        }
+    }
+}
+
 /// A `WasmPack` is a compiled pack module and the descriptor it exported.
 pub struct WasmPack {
     module: Module,

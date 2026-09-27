@@ -134,7 +134,8 @@ impl SlotCx {
         Ok(params)
     }
 
-    /// Stores one candidate's library and writes its path, hash, and ports.
+    /// Stores one candidate's library or module and writes its path, hash,
+    /// ports, and the pack's `memory` and `fuel`.
     fn candidate(
         &self,
         candidate: &mut Map<String, Value>,
@@ -158,6 +159,12 @@ impl SlotCx {
         candidate.insert("path".into(), json!(stored.path));
         candidate.insert("hash".into(), json!(stored.hash.to_hex().as_str()));
         candidate.insert("def".into(), json!(def));
+        if let Some(memory) = pack.memory {
+            candidate.insert("memory".into(), json!(memory));
+        }
+        if let Some(fuel) = pack.fuel {
+            candidate.insert("fuel".into(), json!(fuel));
+        }
         Ok((name, def))
     }
 

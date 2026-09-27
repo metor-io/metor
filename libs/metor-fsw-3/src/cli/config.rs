@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::coordinator::CoordinatorConfig;
 use crate::dl::{DlPack, Pack, PackError};
-use crate::wasm::{DEFAULT_FUEL, DEFAULT_MEMORY, DEFAULT_SETUP_FUEL, Fuel, WasmPack};
+use crate::wasm::{DEFAULT_MEMORY, Fuel, WasmPack};
 
 /// The file format this host reads.
 pub const CONFIG_VERSION: u32 = 2;
@@ -89,10 +89,7 @@ impl PackRef {
 
     /// The grants a wasm pack's calls run under, the defaults when unset.
     pub fn fuel(&self) -> Fuel {
-        Fuel {
-            step: self.fuel.unwrap_or(DEFAULT_FUEL),
-            setup: DEFAULT_SETUP_FUEL,
-        }
+        Fuel::with_step(self.fuel)
     }
 
     /// Opens the artifact as its kind says.

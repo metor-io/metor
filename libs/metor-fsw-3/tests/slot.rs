@@ -7,14 +7,15 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use common::{Ping, fixture_lib};
-use metor_fsw_3::cli::cargo::{cdylib_name, triple};
+use common::{Ping, fixture_lib, fixture_wasm};
+use metor_fsw_3::cli::cargo::{WASM_TRIPLE, cdylib_name, triple, wasm_name};
 use metor_fsw_3::cli::config::{CONFIG_VERSION, DeploymentConfig, TargetConfig};
 use metor_fsw_3::deploy::{self, DeployError};
 use metor_fsw_3::dl::store;
 use metor_fsw_3::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
+use metor_fsw_3::wasm::PAGE;
 use metor_fsw_3::{
     Adapter, BuildError, ChannelConfig, ChannelState, ChannelStatus, Coordinator,
     CoordinatorConfig, DefCx, DlPack, Input, InputConfig, Output, RunState, SystemConfig,
@@ -88,6 +89,19 @@ fn candidate(name: &str, ty: &str) -> Value {
         "ty": ty,
         "path": fixture_lib(),
         "hash": hash.to_hex().as_str(),
+        "def": baked(ty),
+    })
+}
+
+/// A resolved candidate over the fixture's module, copied into `dir`.
+fn wasm_candidate(name: &str, ty: &str, dir: &Path) -> Value {
+    let path = dir.join(wasm_name("echo_pack"));
+    std::fs::write(&path, fixture_wasm()).expect("writes");
+    json!({
+        "name": name,
+        "ty": ty,
+        "path": path,
+        "hash": blake3::hash(fixture_wasm()).to_hex().as_str(),
         "def": baked(ty),
     })
 }
@@ -274,6 +288,74 @@ fn test_changed_bytes_refused() {
     assert_eq!(status(&seen).loaded, 0);
 }
 
+/// A module and a library take turns in one slot.
+#[test]
+fn test_wasm_and_dylib_swap() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let allow = vec![
+        wasm_candidate("up", "count_up", dir.path()),
+        candidate("down", "count_down"),
+    ];
+    let (seen, mut coordinator) = build(slot_params(allow));
+    let events = send(&seen, &mut coordinator, [load("up")]);
+    assert_eq!(events, [SequenceEventKind::Loaded { name: "up".into() }]);
+    assert_eq!(status(&seen).artifact.to_str(), Ok("echo_pack.wasm"));
+
+    send(&seen, &mut coordinator, [load("down")]);
+    assert_eq!(status(&seen).loaded, 1);
+    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
+    run(&seen, &mut coordinator, 2);
+    assert_eq!(pings(&seen), [0]);
+    send(&seen, &mut coordinator, [SequenceCommandKind::Abort]);
+
+    send(&seen, &mut coordinator, [load("up")]);
+    assert_eq!(status(&seen).loaded, 0);
+    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
+    let events = run(&seen, &mut coordinator, 4);
+    assert_eq!(events, [SequenceEventKind::Completed]);
+    assert_eq!(pings(&seen), [1, 2, 3]);
+}
+
+/// A module whose stored bytes changed after build hashed them is refused,
+/// and the occupant stays.
+#[test]
+fn test_changed_module_refused() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let stale = wasm_candidate("down", "count_down", dir.path());
+    let path = PathBuf::from(stale["path"].as_str().expect("a path"));
+    let mut bytes = fixture_wasm().to_vec();
+    bytes.push(0);
+    std::fs::write(&path, bytes).expect("writes");
+    let allow = vec![candidate("up", "count_up"), stale];
+    let (seen, mut coordinator) = build(slot_params(allow));
+    send(&seen, &mut coordinator, [load("up")]);
+    let events = send(&seen, &mut coordinator, [load("down")]);
+    assert!(refused(&events, "not the library"), "{events:?}");
+    assert_eq!(status(&seen).loaded, 0);
+}
+
+/// A candidate's `fuel` and `memory` reach its guest: `spin` under a small
+/// grant fails on its first step, and a one-page ceiling is refused.
+#[test]
+fn test_candidate_grants_reach_the_guest() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut spin = wasm_candidate("spin", "spin", dir.path());
+    spin["fuel"] = json!(1_000);
+    let mut small = wasm_candidate("small", "spin", dir.path());
+    small["memory"] = json!(PAGE);
+    let (seen, mut coordinator) = build(slot_params(vec![spin, small]));
+    run(&seen, &mut coordinator, 1);
+
+    let events = send(&seen, &mut coordinator, [load("small")]);
+    assert!(refused(&events, "ceiling"), "{events:?}");
+    send(&seen, &mut coordinator, [load("spin")]);
+    let events = send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
+    let failed = SequenceEventKind::Failed {
+        reason: "out of fuel".into(),
+    };
+    assert!(events.contains(&failed), "{events:?}");
+}
+
 /// A candidate whose library's ports differ from the slot's baked ones is
 /// refused, and the occupant stays.
 #[test]
@@ -448,6 +530,43 @@ fn test_build_resolves_into_store() {
     deploy::resolve_slots(&mut envelope, &[table(&seen)], &store).expect("resolves");
     assert_eq!(*slot(&envelope), before);
 
+    let mut coordinator = envelope.targets[0]
+        .coordinator
+        .clone()
+        .build(&table(&seen))
+        .expect("the resolved slot builds");
+    send(&seen, &mut coordinator, [load("up")]);
+    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
+    let events = run(&seen, &mut coordinator, 4);
+    assert_eq!(events, [SequenceEventKind::Completed]);
+}
+
+/// A wasm pack reference resolves to its stored module, with its grants.
+#[test]
+fn test_build_resolves_wasm_candidate() {
+    let (_dir, libs, store) = scratch();
+    let modules = libs.join(WASM_TRIPLE);
+    std::fs::create_dir_all(&modules).expect("creates");
+    std::fs::write(modules.join(wasm_name("echo_pack")), fixture_wasm()).expect("writes");
+    let pack = json!({
+        "id": "echo", "lib": "echo_pack", "libs": libs,
+        "kind": "wasm", "memory": 32 << 20, "fuel": 1_000_000,
+    });
+    let mut envelope = envelope(vec![
+        json!({ "name": "up", "ty": "count_up", "pack": pack }),
+    ]);
+    resolve(&mut envelope, &store).expect("resolves");
+
+    let candidate = &slot(&envelope)["allow"][0];
+    let path = PathBuf::from(candidate["path"].as_str().expect("a path"));
+    assert!(path.starts_with(&store), "{}", path.display());
+    assert!(path.ends_with(wasm_name("echo_pack")), "{}", path.display());
+    let hash = blake3::hash(fixture_wasm());
+    assert_eq!(candidate["hash"], json!(hash.to_hex().as_str()));
+    assert_eq!(candidate["memory"], json!(32 << 20));
+    assert_eq!(candidate["fuel"], json!(1_000_000));
+
+    let seen = Shared::default();
     let mut coordinator = envelope.targets[0]
         .coordinator
         .clone()
