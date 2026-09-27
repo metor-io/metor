@@ -144,6 +144,16 @@ fn test_build_matches_golden() {
             assert_eq!(pack["libs"], json!(libs.display().to_string()));
             pack["libs"] = json!("<libs>");
         }
+        // Baked peer schemas are pinned by `deploy`'s unit tests.
+        for system in target["coordinator"]["systems"]
+            .as_array_mut()
+            .expect("systems")
+        {
+            for output in system["outputs"].as_array_mut().expect("outputs") {
+                let def = output.as_object_mut().and_then(|o| o.remove("def"));
+                assert!(def.is_some_and(|def| def.is_object()), "{output}");
+            }
+        }
     }
     let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/deploy.json");
     let expected: serde_json::Value =
