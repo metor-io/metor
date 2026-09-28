@@ -42,6 +42,7 @@ members = [
     "examples/adcs-fsw3",
     "examples/adcs-fsw3/contracts",
     "examples/adcs-fsw3/systems/adcs",
+    "examples/adcs-fsw3/systems/seqs",
     "libs/metor-fsw-3",
     "libs/metor-fsw-3/ring",
     "libs/metor-fsw-3/macros",

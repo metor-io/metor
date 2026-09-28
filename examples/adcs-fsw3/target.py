@@ -1,14 +1,17 @@
 """Runs the plant, the flight software, and a gateway as three targets.
 
-`plant` simulates the spacecraft, `fsw` runs nav, mode, and ctrl on its
-measurements, and the gateway's db records both. `METOR_DEPLOY_PORTS` sets the
-three listen ports so tests can pick free ones.
+`plant` simulates the spacecraft, `fsw` runs nav, ctrl, and the `commission`
+sequence on its measurements, and the gateway's db records both. `commission`
+runs as a wasm module and takes its commands through the gateway.
+`METOR_DEPLOY_PORTS` sets the three listen ports so tests can pick free ones.
 """
 import math
 import os
 
-from adcs_pack import Ctrl, Mode, MtqCmd, Nav, Plant, TorqueCmd
-from metor_config import Deployment, Publish, Subscribe, Target, gateway
+import adcs_seqs
+from adcs_pack import Ctrl, MtqCmd, Nav, Plant, TorqueCmd
+from adcs_seqs import Commission
+from metor_config import Deployment, Publish, SequenceCommand, Subscribe, Target, gateway
 
 p_plant, p_fsw, p_db = os.environ.get("METOR_DEPLOY_PORTS", "2240,2241,2250").split(",")
 
@@ -56,13 +59,19 @@ nav = fsw.add(
     Nav(sensors=mirror.port(sim.sensors), gps=mirror.port(sim.gps), meas_sigma=0.02),
 )
 
-mode = fsw.add("mode", Mode())
+fsw.wasm(adcs_seqs.PACK)
+# Detumbles, then points at nadir.
+commission = fsw.add(
+    "commission",
+    Commission(estimate=nav.attitude_estimate, rate=0.02, detumble_timeout_s=1800.0),
+    channel="commission",
+)
 ctrl = fsw.add(
     "ctrl",
     Ctrl(
         estimate=nav.attitude_estimate,
         gps=mirror.port(sim.gps),
-        mode=mode.mode_cmd,
+        mode=commission.mode_cmd,
         sensors=mirror.port(sim.sensors),
         wheels=mirror.port(sim.wheels),
         q_weight=5.0,
@@ -78,6 +87,10 @@ cmds = plant.add("ctrl", Subscribe(peer=fsw_pub, items=[ctrl.torque_cmd, ctrl.mt
 torque.connect(cmds.port(ctrl.torque_cmd))
 mtq.connect(cmds.port(ctrl.mtq_cmd))
 
-gw, _db = gateway("gw", peers=[plant_pub, fsw_pub], listen=f"127.0.0.1:{p_db}", cycle_rate=120.0)
+gw, db = gateway("gw", peers=[plant_pub, fsw_pub], listen=f"127.0.0.1:{p_db}", cycle_rate=120.0)
+
+# The ground commands `commission` through the gateway's db.
+cmds = fsw.add("cmds", Subscribe([SequenceCommand], peer=db))
+fsw.commands(cmds.sequence_command)
 
 Deployment(targets=[plant, fsw, gw])

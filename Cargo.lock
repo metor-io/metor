@@ -130,6 +130,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "adcs-seqs-3"
+version = "0.14.2"
+dependencies = [
+ "adcs-contracts-3",
+ "metor-fsw-3",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "adcs-sequences"
 version = "0.14.2"
 dependencies = [
