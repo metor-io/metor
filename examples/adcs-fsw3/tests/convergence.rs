@@ -1,24 +1,32 @@
 //! Checks that `sim.py`'s loop points the spacecraft at nadir, and that the run
 //! with the pack linked in commands the same torques as the run with the pack
 //! loaded from the cdylib `pack dev` staged.
+//!
+//! Two more runs swap `mode` for the `commission` sequence, once linked and
+//! once loaded from the wasm module `pack dev` staged, and must command the
+//! same torques as each other.
 
 use core::cell::RefCell;
 use core::future::{Future, poll_fn};
 use core::task::Poll;
 use core::time::Duration;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 
 use adcs_contracts::{AttitudeEstimate, BodyState, DT, ModeCmd, TorqueCmd, tracking_sample};
+use adcs_seqs::Commission;
 use metor_fsw_3::cli::cargo::{cdylib_name, triple};
+use metor_fsw_3::cli::config::{PackKind, PackRef};
 use metor_fsw_3::cli::run::prepare;
 use metor_fsw_3::coordinator::{
-    Clock, Coordinator, CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable,
+    Clock, Coordinator, CoordinatorConfig, EndReason, InputConfig, PortRef, SystemConfig,
+    SystemTable,
 };
 use metor_fsw_3::link::register_builtins;
 use metor_fsw_3::{DlPack, Input, Pack, system};
 use metor_proto_wkt::LogEvent;
+use serde_json::json;
 use tracing_subscriber::layer::SubscriberExt;
 use zerocopy::IntoBytes;
 
@@ -26,7 +34,20 @@ use zerocopy::IntoBytes;
 /// cycle 940, so each run lasts over twice as long as the loop needs.
 const CYCLES: u64 = 2400;
 
-/// The pointing law `mode` commands for the whole run.
+/// Cycles per sequenced run, 40 s at 120 Hz. `commission` commands nadir near
+/// cycle 1460 and the error first drops under the bound near cycle 2380, so
+/// each run lasts about twice as long as the loop needs.
+const SEQUENCED_CYCLES: u64 = 4800;
+
+/// The estimated rate (rad/s) under which `commission` ends its detumble. The
+/// magnetorquers damp the boot rate of 0.15 rad/s over minutes, so this sits
+/// just under it.
+const SETTLED_RATE: f64 = 0.14;
+
+/// The longest detumble (s) `commission` waits out, well past its settling.
+const DETUMBLE_TIMEOUT_S: f64 = 60.0;
+
+/// The pointing law `mode` commands for the whole run, and `commission` ends on.
 const LAW: u8 = ModeCmd::LAW_NADIR;
 
 /// Pointing error bound (rad), about 6°.
@@ -44,8 +65,10 @@ struct Record {
     /// Every commanded torque as raw bytes, without the stamp, which differs
     /// between coordinators.
     torque: Vec<Vec<u8>>,
-    /// Every line the filter logged.
+    /// Every line the filter and the controller logged.
     logs: Vec<String>,
+    /// The law each of the controller's "pointing law changed" lines names.
+    laws: Vec<String>,
 }
 
 type Shared = Rc<RefCell<Record>>;
@@ -70,7 +93,8 @@ fn watch(
     }
 }
 
-/// Records the controller's torque commands and the filter's log lines.
+/// Records the controller's torque commands, and the filter's and the
+/// controller's log lines.
 struct Tap(Shared);
 
 #[system]
@@ -80,8 +104,18 @@ fn tap(#[state] state: &mut Tap, torque_cmd: &mut Input<TorqueCmd>, log: &mut In
         record.torque.push(torque.torque_b.as_bytes().to_vec());
     }
     for line in log.drain().flatten() {
+        record.laws.extend(law_change(&line));
         record.logs.push(line.message.into_owned());
     }
+}
+
+/// The law a "pointing law changed" line names.
+fn law_change(line: &LogEvent) -> Option<String> {
+    if line.message != "pointing law changed" {
+        return None;
+    }
+    let (_, to) = line.fields.iter().find(|(key, _)| key == "to")?;
+    Some(to.trim_matches('"').to_string())
 }
 
 fn manifest() -> &'static Path {
@@ -89,10 +123,15 @@ fn manifest() -> &'static Path {
 }
 
 /// Returns `sim.py`'s coordinator on a simulated clock, with the recorders added
-/// and the publish link removed so the two runs don't contend for its port.
+/// and the publish link removed so the runs don't contend for its port.
 ///
-/// `prepare` stages the pack and holds it open, so call this once per process.
-fn config() -> CoordinatorConfig {
+/// `prepare` stages the packs and holds them open, so it runs once per process.
+fn config() -> &'static CoordinatorConfig {
+    static CONFIG: OnceLock<CoordinatorConfig> = OnceLock::new();
+    CONFIG.get_or_init(evaluate)
+}
+
+fn evaluate() -> CoordinatorConfig {
     let deployment = prepare(Some(&manifest().join("sim.py"))).expect("sim.py evaluates");
     assert_eq!(deployment.targets.len(), 1, "sim.py is one target");
     let mut config = deployment
@@ -115,10 +154,32 @@ fn config() -> CoordinatorConfig {
     config.systems.push(SystemConfig {
         inputs: vec![
             input("torque_cmd", PortRef::new("ctrl", "torque_cmd")),
-            input("log", PortRef::new("nav", "log")),
+            InputConfig {
+                port: "log".into(),
+                from: vec![PortRef::new("nav", "log"), PortRef::new("ctrl", "log")],
+            },
         ],
         ..SystemConfig::new("tap", "tap")
     });
+    config
+}
+
+/// Returns `config` with `mode` swapped for `commission`, which feeds `ctrl` in its place.
+fn sequenced(config: &CoordinatorConfig) -> CoordinatorConfig {
+    let mut config = config.clone();
+    for system in &mut config.systems {
+        if system.id == "mode" {
+            *system = SystemConfig {
+                params: json!({ "rate": SETTLED_RATE, "detumble_timeout_s": DETUMBLE_TIMEOUT_S }),
+                inputs: vec![input("estimate", PortRef::new("nav", "attitude_estimate"))],
+                ..SystemConfig::new("commission", "seqs.commission")
+            };
+        }
+        let sources = system.inputs.iter_mut().flat_map(|input| &mut input.from);
+        for from in sources.filter(|from| from.system == "mode") {
+            from.system = "commission".into();
+        }
+    }
     config
 }
 
@@ -143,33 +204,63 @@ fn with_sinks(mut table: SystemTable, shared: &Shared) -> SystemTable {
     table
 }
 
-/// Returns the path of the cdylib `pack dev` staged beside the pack's crate.
-fn staged() -> PathBuf {
-    manifest()
+/// Opens the `adcs` cdylib `pack dev` staged beside the pack's crate.
+fn staged_library() -> Arc<Pack> {
+    let path = manifest()
         .join("systems/adcs/.metor/adcs_pack/_libs")
         .join(triple())
-        .join(cdylib_name("adcs_systems_3"))
+        .join(cdylib_name("adcs_systems_3"));
+    // SAFETY: `prepare` just built this pack from this workspace against this
+    // ABI, and `open` checks the version before calling into it.
+    let pack = unsafe { DlPack::open(&path) }.expect("the staged pack opens");
+    Arc::new(Pack::Dl(pack))
 }
 
-/// Builds the loop with the pack linked into the test binary.
+/// Opens the `seqs` module `pack dev` staged beside the pack's crate.
+fn staged_module() -> Arc<Pack> {
+    let reference = PackRef {
+        kind: PackKind::Wasm,
+        ..PackRef::dylib(
+            "seqs".into(),
+            "adcs_seqs_3".into(),
+            manifest().join("systems/seqs/.metor/adcs_seqs/_libs"),
+        )
+    };
+    Arc::new(reference.open().expect("the staged module opens"))
+}
+
+/// Builds the loop with both packs linked into the test binary.
 fn linked(config: &CoordinatorConfig, shared: &Shared) -> Coordinator {
     let mut config = config.clone();
     for system in &mut config.systems {
-        if let Some(ty) = system.ty.strip_prefix("adcs.") {
+        let pack_ty = ["adcs.", "seqs."]
+            .iter()
+            .find_map(|prefix| system.ty.strip_prefix(prefix));
+        if let Some(ty) = pack_ty {
             system.ty = ty.into();
         }
     }
+    let mut table = adcs_systems::pack();
+    table
+        .register_sequence("commission", adcs_seqs::commission(), Commission::new)
+        .expect("valid records");
     config
-        .build(&with_sinks(adcs_systems::pack(), shared))
+        .build(&with_sinks(table, shared))
         .expect("the static config builds")
 }
 
-/// Builds the loop with the pack loaded from the staged cdylib.
-fn loaded(config: &CoordinatorConfig, shared: &Shared, pack: &Arc<Pack>) -> Coordinator {
+/// Builds the loop with `packs` loaded, each under its id.
+fn loaded(
+    config: &CoordinatorConfig,
+    shared: &Shared,
+    packs: &[(&str, &Arc<Pack>)],
+) -> Coordinator {
     let mut table = with_sinks(SystemTable::new(), shared);
-    table
-        .register_pack("adcs", pack.clone())
-        .expect("valid records");
+    for (id, pack) in packs {
+        table
+            .register_pack(id, (*pack).clone())
+            .expect("valid records");
+    }
     config
         .clone()
         .build(&table)
@@ -177,15 +268,19 @@ fn loaded(config: &CoordinatorConfig, shared: &Shared, pack: &Arc<Pack>) -> Coor
 }
 
 /// Runs each coordinator for `cycles` simulated cycles, one after another on a
-/// single executor.
-fn drive(coordinators: Vec<Coordinator>, cycles: u64) {
+/// single executor, and returns the steps each one saw end.
+fn drive(coordinators: Vec<Coordinator>, cycles: u64) -> Vec<Vec<(String, EndReason)>> {
     stellarator::run(move || async move {
+        let mut ended = Vec::new();
         for mut coordinator in coordinators {
             coordinator.run(stop(cycles)).await;
             let latched: Vec<&str> = coordinator.latched().collect();
             assert!(latched.is_empty(), "latched off: {latched:?}");
+            let steps = coordinator.ended();
+            ended.push(steps.map(|(id, why)| (id.into(), why.clone())).collect());
         }
-    });
+        ended
+    })
 }
 
 /// Returns a future that resolves on its `cycles`th poll.
@@ -242,20 +337,27 @@ fn assert_converged(label: &str, record: &Record) {
     );
 }
 
+/// Asserts two runs commanded the same torques.
+fn assert_same_torques(a: &Record, b: &Record) {
+    assert_eq!(
+        a.torque.len(),
+        b.torque.len(),
+        "the runs commanded the same number of torques"
+    );
+    assert!(a.torque == b.torque, "the two command streams differ");
+}
+
 #[test]
 fn test_loop_converges_linked_and_loaded() {
     install_logging();
 
     let config = config();
-    // SAFETY: `prepare` just built this pack from this workspace against this
-    // ABI, and `open` checks the version before calling into it.
-    let pack = unsafe { DlPack::open(&staged()) }.expect("the staged pack opens");
-    let pack = Arc::new(Pack::Dl(pack));
+    let adcs = staged_library();
     let (linked_run, loaded_run) = (Shared::default(), Shared::default());
     drive(
         vec![
-            linked(&config, &linked_run),
-            loaded(&config, &loaded_run, &pack),
+            linked(config, &linked_run),
+            loaded(config, &loaded_run, &[("adcs", &adcs)]),
         ],
         CYCLES,
     );
@@ -264,14 +366,35 @@ fn test_loop_converges_linked_and_loaded() {
     let loaded = loaded_run.take();
     assert_converged("linked", &linked);
     assert_converged("loaded", &loaded);
+    assert_same_torques(&linked, &loaded);
+}
 
-    assert_eq!(
-        linked.torque.len(),
-        loaded.torque.len(),
-        "the runs commanded the same number of torques"
+#[test]
+fn test_sequenced_loop_converges_linked_and_module() {
+    install_logging();
+
+    let config = sequenced(config());
+    let (adcs, seqs) = (staged_library(), staged_module());
+    let (linked_run, module_run) = (Shared::default(), Shared::default());
+    let ended = drive(
+        vec![
+            linked(&config, &linked_run),
+            loaded(&config, &module_run, &[("adcs", &adcs), ("seqs", &seqs)]),
+        ],
+        SEQUENCED_CYCLES,
     );
-    assert!(
-        linked.torque == loaded.torque,
-        "the two command streams differ"
+
+    let linked = linked_run.take();
+    let module = module_run.take();
+    assert_converged("sequenced (linked)", &linked);
+    assert_converged("sequenced (module)", &module);
+    assert_same_torques(&linked, &module);
+
+    let completed = ("commission".to_string(), EndReason::Completed);
+    assert_eq!(ended[1], [completed], "commission completed in the module");
+    assert_eq!(
+        module.laws,
+        ["detumble", "nadir"],
+        "ctrl detumbled, then pointed"
     );
 }

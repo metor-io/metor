@@ -465,6 +465,8 @@ Tests:
 
 ## T12. The ADCS gate
 
+Superseded by `16-adcs-sequences-pack.md`.
+
 Files: `examples/adcs-fsw3/systems/adcs/pyproject.toml`,
 `examples/adcs-fsw3/tests/convergence.rs`.
 

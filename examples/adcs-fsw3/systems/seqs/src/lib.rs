@@ -42,7 +42,7 @@ impl Commission {
 /// Detumbles on the magnetorquers until the estimated rate settles, then
 /// holds nadir. Commands safe if aborted.
 #[sequence]
-async fn commission(
+pub async fn commission(
     #[state] params: &mut Commission,
     seq: &Seq,
     estimate: &Sample<AttitudeEstimate>,

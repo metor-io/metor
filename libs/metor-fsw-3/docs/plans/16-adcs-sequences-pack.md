@@ -134,3 +134,26 @@ and one commit.
   generated module reuse a record class another installed pack declares.
 - **`nox` on wasm32.** Frames use `nox` tensors. If `nox` without default
   features does not build for wasm32, S1 finds out first.
+
+## As shipped
+
+- **Contracts.** `orbit` stays in every build, since the params'
+  defaults read its altitude and inclination. It takes the Earth
+  constants from `environment`, and `raan_for_ltan`, which needs the sun
+  model, moves to `environment`. The feature gates `environment` alone.
+- **`commission`.** Its state is `Commission`, built from
+  `CommissionParams` by a constructor that refuses a negative or
+  non-finite rate or timeout. It sums the rate's norm in scalar order,
+  since `V3::norm` goes through `faer`, whose wasm build carries SIMD
+  that wasmi refuses.
+- **`target.py`.** A channel needs a command source, so `fsw` subscribes
+  to `SequenceCommand` from the gateway's db, which forwards what the
+  ground sends it.
+- **Convergence.** The magnetorquers damp the boot rate of 0.15 rad/s
+  over minutes, so the sequenced runs settle at 0.14 rad/s. `commission`
+  commands nadir near cycle 1460, the error first drops under the bound
+  near cycle 2380, and the runs last 4800 cycles. The two sequenced runs
+  command bit-identical torques. `tap` reads `ctrl`'s log beside `nav`'s.
+- **Python.** Pyright refuses the cross-pack edges `nav` to `commission`
+  and `commission` to `ctrl`, as the risk above expected. The runtime
+  accepts them.

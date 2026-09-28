@@ -681,3 +681,65 @@ module's `libm` is not the host's.
   `system_status`, to help tune grants.
 - Reusing a guest's arena across `Reset` and `Load`, so a commanded
   remake allocates nothing.
+
+## Shipped deviations
+
+What landed differs from the plan above as follows, by task in
+`14-wasm-impl.md`.
+
+- **T1.** The writer and the view also check their cursors' alignment
+  and that no reader is lapped. `ReadGrant` is no longer `Send`.
+- **T2.** The threads gate is
+  `all(feature = "threads", not(target_family = "wasm"))`. `thread/os/`
+  has child modules. `catch_step` and `Runner` moved to
+  `coordinator/step.rs`. Without `host` the crate allows `dead_code`, and
+  test modules that need the host are gated on it. The ring takes
+  stellarator as a dev-dependency.
+- **T3.** The panic hook is `panic::log_panics`.
+- **T4.** The codec takes `Option<&[u8]>`.
+- **T5.** Each `drain_*` drains everything and returns the first error.
+  `Mirror::drain` returns `mirror::Corrupt` for corruption on either
+  the read or the write side.
+- **T6.** The engine lives in `Module`. `Guest::new` takes the setup
+  grant. `StoreLimits` allows two memories, since instantiation counts
+  the host's memory again as the import. A mistyped export is
+  `WasmError::Signature`.
+- **T8.** Guest errors in params are `ParamError::Wasm(String)`, and a
+  trap in `create` is `ParamError::Panicked`. The fan-in test uses
+  `meter`, since `Input::drain` reads producer by producer. `STACK` is
+  64 Ki slots and `TABLE_ELEMENTS` 16 Ki. echo-pack gained `tick` and
+  `spin`.
+- **T9.** A dylib reference omits `kind`. `PackError::Read` covers an
+  unreadable module, `PackRef::dylib` builds a dylib reference, and
+  `cli::cargo` has `WASM_TRIPLE` and `wasm_name`. echo-pack's measured
+  fuel: setup, the descriptor about 11.0M, a `def` at most 5.5M, and a
+  `create` at most 4.5M; a step 0.7k to 9k.
+- **T10.** `Fuel::with_step` fills the setup grant. A reference writes
+  `memory` and `fuel` only when set.
+- **T11.** The generated module renders `wasm=True` only for a wasm
+  pack. `pack dev` checks for async systems before it builds the module.
+  The `sync-pack` fixture is a copy of echo-pack without async systems.
+- **T12.** Superseded by `16-adcs-sequences-pack.md`. The `adcs` pack
+  cannot build for wasm32: its contracts link C (WMM, and SOFA through
+  `nox-frames`) and `hifitime` pulls `wasm-bindgen`. Instead, a new
+  `seqs` pack runs the `commission` sequence as a module in the ADCS
+  loop, beside the native `adcs` pack, and the gate compares its run
+  with the linked pack's. The torque streams match bit for bit.
+  - A guest cannot call `nox`'s `dot` or `norm`. They go through `faer`,
+    whose `pulp` dependency compiles `simd128` functions into every
+    wasm32 build, and wasmi without its `simd` feature refuses the
+    module. `commission` sums its norm in scalar order.
+  - `commission`'s measured fuel: the descriptor 4.5M, `def` 8.5M,
+    `create` 3.7M, and a step 0.9k to 3.2k. The defaults stay.
+- **Phase 2.** The ADCS pack does not build for wasm32; see T12.
+
+### Follow-ups
+
+- A slot candidate's Python `"pack"` reference does not carry `kind`,
+  `fuel`, or `memory`.
+- `LoadError::Hash` says "library" for a module.
+- A panicked async `Thread` keeps its input reader slots.
+- Two packs that carry one record each generate a class for it, so a
+  static checker refuses an edge between them (`AttitudeEstimate` and
+  `ModeCmd` in the ADCS `target.py`). The host matches by record id, so
+  the config is right.
