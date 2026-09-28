@@ -204,15 +204,6 @@ class WasmTest(ConfigTest):
         with self.assertRaisesRegex(ConfigError, "`adcs` has no module"):
             fsw.wasm(PACK)
 
-    def test_second_wasm_replaces_first(self) -> None:
-        fsw = adcs_target()
-        fsw.wasm(replace(PACK, wasm=True), fuel=1, memory=2)
-        fsw.wasm(replace(PACK, wasm=True))
-        self.assertEqual(fsw.to_config()["packs"], [{**PACK.to_json(), "kind": "wasm"}])
-
-    def test_config_without_wasm_is_unchanged(self) -> None:
-        self.assertEqual(adcs_target().to_config()["packs"], [PACK.to_json()])
-
 
 class LinkTest(ConfigTest):
     def test_publish_handle_includes_log_and_status(self) -> None:

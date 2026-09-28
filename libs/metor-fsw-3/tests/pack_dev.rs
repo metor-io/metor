@@ -183,49 +183,11 @@ fn test_wasm_pack_dev_refuses_async() {
     assert!(!module.join("_libs").join(WASM_TRIPLE).exists());
 }
 
-/// The fixture without `relay`, renamed `sync-pack` so its artifacts land
-/// beside the fixture's, as a workspace of its own that builds into this
-/// workspace's target dir.
-fn sync_copy() -> tempfile::TempDir {
-    let root = root_in_target();
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let fixture = fixture_dir();
-    let manifest = std::fs::read_to_string(fixture.join("Cargo.toml")).expect("reads");
-    let manifest = manifest
-        .replace("name = \"echo-pack\"", "name = \"sync-pack\"")
-        .replace("version.workspace = true", "version = \"0.0.0\"")
-        .replace("edition.workspace = true", "edition = \"2024\"")
-        .replace("repository.workspace = true\n", "")
-        .replace("[lints]\nworkspace = true\n", "")
-        .replace(
-            "path = \"../../..\"",
-            &format!("path = {:?}", env!("CARGO_MANIFEST_DIR")),
-        );
-    std::fs::write(root.path().join("Cargo.toml"), manifest + "\n[workspace]\n").expect("writes");
-    let relay = "    table\n        .register_async(\"relay\", relay(), Default::default)\n        \
-                 .expect(\"valid records\");\n";
-    let lib = std::fs::read_to_string(fixture.join("src/lib.rs")).expect("reads");
-    assert!(lib.contains(relay), "the fixture registers `relay`");
-    std::fs::create_dir(root.path().join("src")).expect("creates");
-    std::fs::write(root.path().join("src/lib.rs"), lib.replace(relay, "")).expect("writes");
-    std::fs::copy(workspace.join("Cargo.lock"), root.path().join("Cargo.lock")).expect("copies");
-    let config = root.path().join(".cargo");
-    std::fs::create_dir(&config).expect("creates");
-    let target = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .parent()
-        .expect("the target dir");
-    let build = format!("[build]\ntarget-dir = {:?}\n", target.display().to_string());
-    std::fs::write(config.join("config.toml"), build).expect("writes");
-    let pyproject = wasm_pyproject("sync-pack");
-    std::fs::write(root.path().join("pyproject.toml"), pyproject).expect("writes");
-    root
-}
-
 #[test]
 fn test_wasm_pack_dev_stages_module() {
-    let root = sync_copy();
-    pack_dev(root.path()).expect("pack dev lays out both");
-    let module = root.path().join(".metor/sync_pack");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sync-pack");
+    pack_dev(&root).expect("pack dev lays out both");
+    let module = root.join(".metor/sync_pack");
     let staged = module
         .join("_libs")
         .join(WASM_TRIPLE)

@@ -350,13 +350,16 @@ impl Rig {
         self.step.execute(Timestamp(1));
     }
 
-    /// The `kind` of every line on the log.
-    fn kinds(&mut self) -> Vec<String> {
+    /// Every line on the log as `kind: message`.
+    fn lines(&mut self) -> Vec<String> {
         let lines: Vec<LogEvent> = self.log.drain().flatten().collect();
-        let kinds = lines.iter().flat_map(|line| &line.fields);
-        kinds
-            .filter(|(name, _)| name == "kind")
-            .map(|(_, value)| value.to_string())
+        lines
+            .iter()
+            .map(|line| {
+                let kind = line.fields.iter().find(|(name, _)| name == "kind");
+                let kind = kind.map_or("", |(_, value)| value.as_ref());
+                format!("{kind}: {}", line.message)
+            })
             .collect()
     }
 }
@@ -374,26 +377,30 @@ fn test_each_end() {
         (
             "i32.const 9".into(),
             Some(EndReason::Panicked),
-            &["bad_status"],
+            &["bad_status: the guest returned no known status"],
         ),
-        ("unreachable".into(), Some(EndReason::Panicked), &["trap"]),
+        (
+            "unreachable".into(),
+            Some(EndReason::Panicked),
+            &["trap: unreachable"],
+        ),
         (
             "(loop (br 0)) i32.const 0".into(),
             failed("out of fuel"),
-            &["fuel"],
+            &["fuel: the guest ran out of fuel"],
         ),
         (
             format!("{corrupt} i32.const 0"),
             failed("corrupt ring"),
-            &["corrupt"],
+            &["corrupt: a guest ring is corrupt"],
         ),
         (format!("{stores} i32.const 0"), None, &[]),
     ];
-    for (execute, end, kinds) in rows {
+    for (execute, end, lines) in rows {
         let mut rig = rig(&execute);
         rig.execute();
         assert_eq!(rig.step.ended(), end.as_ref(), "{execute}");
-        assert_eq!(rig.kinds(), kinds, "{execute}");
+        assert_eq!(rig.lines(), lines, "{execute}");
     }
 }
 
@@ -408,15 +415,7 @@ fn test_corrupt_input_ring_ends_the_step() {
     rig.execute();
     let corrupt = EndReason::Failed(Cow::Borrowed("corrupt ring"));
     assert_eq!(rig.step.ended(), Some(&corrupt));
-    assert_eq!(rig.kinds(), ["corrupt"]);
-}
-
-#[test]
-fn test_trap_line_names_the_trap() {
-    let mut rig = rig("unreachable");
-    rig.execute();
-    let lines: Vec<LogEvent> = rig.log.drain().flatten().collect();
-    assert_eq!(lines[0].message, "unreachable");
+    assert_eq!(rig.lines(), ["corrupt: a guest ring is corrupt"]);
 }
 
 #[test]
@@ -440,5 +439,5 @@ fn test_end_frees_input_reader_slot() {
     rig.execute();
     assert!(rig.input.view(NoWake).is_ok());
     rig.execute();
-    assert_eq!(rig.kinds(), ["trap"]);
+    assert_eq!(rig.lines(), ["trap: unreachable"]);
 }

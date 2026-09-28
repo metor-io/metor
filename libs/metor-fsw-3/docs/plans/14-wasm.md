@@ -725,7 +725,7 @@ What landed differs from the plan above as follows, by task in
   `DlSlot` opens a candidate by its `kind`.
 - **T11.** The generated module renders `wasm=True` only for a wasm
   pack. `pack dev` checks for async systems before it builds the module.
-  The `sync-pack` fixture is a copy of echo-pack without async systems.
+  The `sync-pack` fixture is a one-system pack with no async systems.
 - **T12.** Superseded by `16-adcs-sequences-pack.md`. The `adcs` pack
   cannot build for wasm32: its contracts link C (WMM, and SOFA through
   `nox-frames`) and `hifitime` pulls `wasm-bindgen`. Instead, a new

@@ -14208,6 +14208,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sync-pack"
+version = "0.14.2"
+dependencies = [
+ "metor-fsw-3",
+ "serde",
+]
+
+[[package]]
 name = "sync_wrapper"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

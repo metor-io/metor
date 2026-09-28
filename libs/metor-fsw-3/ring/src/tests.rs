@@ -1084,22 +1084,16 @@ fn peer_cursor(rb: &RingBuffer, slot: u32, pos: u64) {
 }
 
 #[test]
-fn test_near_max_reader_cursor_is_corrupt() {
-    let rb = ring(64, 1);
-    let w = rb.writer(NoWake).unwrap();
-    peer_cursor(&rb, 0, u64::MAX - 1);
-    assert_eq!(w.try_write(&[1; 8]), Err(WriteError::Corrupt));
-    assert_eq!(rb.committed(), 0, "nothing published");
-}
-
-#[test]
 fn test_reader_cursor_ahead_of_writer_is_corrupt() {
     let rb = ring(64, 1);
     let w = rb.writer(NoWake).unwrap();
     let _v = rb.view(NoWake).unwrap();
     w.try_write(&[1; 8]).unwrap();
-    peer_cursor(&rb, 0, 64);
-    assert_eq!(w.try_write(&[2; 8]), Err(WriteError::Corrupt));
+    for cursor in [64, u64::MAX - 1] {
+        peer_cursor(&rb, 0, cursor);
+        assert_eq!(w.try_write(&[2; 8]), Err(WriteError::Corrupt));
+    }
+    assert_eq!(rb.committed(), 32, "nothing more published");
 
     peer_cursor(&rb, 0, 32);
     assert_eq!(w.try_write(&[2; 8]), Ok(()), "a cursor at committed fits");

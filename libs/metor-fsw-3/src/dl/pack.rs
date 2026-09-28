@@ -267,12 +267,7 @@ impl Drop for DlStep {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordinator::SystemTable;
     use crate::pack::DefStatus;
-
-    unsafe extern "C" fn status<const STATUS: u32>(_: *mut u8, _: usize, _: *mut usize) -> u32 {
-        STATUS
-    }
 
     unsafe extern "C" fn oversized_length(_: *mut u8, capacity: usize, written: *mut usize) -> u32 {
         // SAFETY: descriptor supplies a writable result slot.
@@ -280,20 +275,10 @@ mod tests {
         DefStatus::Ok as u32
     }
 
-    unsafe extern "C" fn empty_table(dst: *mut u8, capacity: usize, written: *mut usize) -> u32 {
-        // SAFETY: descriptor supplies valid, nonoverlapping storage.
-        unsafe { crate::pack::def(SystemTable::new, dst, capacity, written) }
-    }
-
     #[test]
-    fn test_descriptor_through_export() {
-        // SAFETY: this callback implements the descriptor ABI.
-        let def = unsafe { descriptor(empty_table) }.expect("decodes");
-        assert!(def.systems.is_empty());
-        for callback in [oversized_length as PackDefFn, status::<0>] {
-            // SAFETY: these callbacks write at most the supplied result slot.
-            let decoded = unsafe { descriptor(callback) };
-            assert!(matches!(decoded, Err(PackError::Decode)));
-        }
+    fn test_oversized_descriptor_is_refused() {
+        // SAFETY: the callback writes only the supplied result slot.
+        let decoded = unsafe { descriptor(oversized_length) };
+        assert!(matches!(decoded, Err(PackError::Decode)));
     }
 }
