@@ -36,18 +36,9 @@ pub enum PackError {
     #[error("reading the module: {0}")]
     Read(std::io::Error),
     #[error("the module: {0}")]
-    Wasm(WasmError),
+    Wasm(#[from] WasmError),
     #[error("the module trapped: {0}")]
     Trap(#[from] Trap),
-}
-
-impl From<WasmError> for PackError {
-    fn from(error: WasmError) -> Self {
-        match error {
-            WasmError::MissingExport(name) => PackError::MissingSymbol(name),
-            error => PackError::Wasm(error),
-        }
-    }
 }
 
 /// The type a `DlSlot` registers as.
@@ -85,14 +76,10 @@ impl Pack {
         inputs: &[Vec<&RingBuffer>],
         outputs: &[&RingBuffer],
     ) -> Result<Box<dyn Step>, ParamError> {
-        match self {
-            Pack::Dl(pack) => Ok(Box::new(
-                pack.create(ty, params, instance, inputs, outputs)?,
-            )),
-            Pack::Wasm(pack) => Ok(Box::new(
-                pack.create(ty, params, instance, inputs, outputs)?,
-            )),
-        }
+        Ok(match self {
+            Pack::Dl(pack) => Box::new(pack.create(ty, params, instance, inputs, outputs)?),
+            Pack::Wasm(pack) => Box::new(pack.create(ty, params, instance, inputs, outputs)?),
+        })
     }
 }
 

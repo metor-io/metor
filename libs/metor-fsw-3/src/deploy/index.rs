@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 
 use crate::cli::config::DeploymentConfig;
+use crate::coordinator::instance_def;
 use crate::coordinator::{OutputSource, PeerPort, PortRef, SystemConfig, SystemTable};
-use crate::def::{Records, instance_def};
+use crate::def::Records;
 use crate::system::{PortDef, SystemDef};
 
 use super::error::DeployError;

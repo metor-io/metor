@@ -11,14 +11,11 @@ mod records;
 mod registry;
 
 use metor_fsw_3_ring::{NoWake, WakeSink};
-use metor_proto_wkt::{SequenceChannelEvent, SequenceCommand};
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::coordinator::{EndReason, RunState};
-use crate::def::DefCx;
-use crate::port::{Input, Output};
-use crate::system::{PortDef, SystemDef};
+use crate::port::Input;
 use crate::{Frame, FrameBytes, FrameStr, MaxSize, Record, Schema, Timestamp};
 
 /// Asks a system to finish what it is doing and stop.
@@ -37,33 +34,9 @@ pub const STATUS_PORT: &str = "channel_status";
 #[cfg(feature = "host")]
 pub use adapter::Channel;
 #[cfg(feature = "host")]
-pub(crate) use adapter::make;
+pub(crate) use adapter::{def, make, ports};
 pub use apply::{Command, Refusal, State, apply};
 pub use registry::{ChannelSpec, Registry, RegistryParams, channel_registry};
-
-/// The system's definition with the channel's ports appended, or the name
-/// of a system port that takes one of theirs.
-pub(crate) fn def(mut inner: SystemDef, cx: &DefCx<'_>) -> Result<SystemDef, String> {
-    let reserved = [COMMANDS_PORT, EVENTS_PORT, STATUS_PORT];
-    let mut taken = inner.inputs.iter().chain(&inner.outputs);
-    if let Some(port) = taken.find(|p| reserved.contains(&p.name.as_ref())) {
-        return Err(port.name.to_string());
-    }
-    let [commands, events, status] = ports(cx);
-    inner.inputs.push(commands);
-    inner.outputs.extend([events, status]);
-    Ok(inner)
-}
-
-/// The ports every channel adds: its commands input, then its events and
-/// status outputs.
-pub(crate) fn ports(cx: &DefCx<'_>) -> [PortDef; 3] {
-    [
-        Input::<SequenceCommand>::def(cx, COMMANDS_PORT),
-        Output::<SequenceChannelEvent>::def(cx, EVENTS_PORT),
-        Output::<ChannelStatus>::def(cx, STATUS_PORT),
-    ]
-}
 
 /// Whether an abort has been asked for, read from the system's `abort` input.
 pub struct Abort<W: WakeSink = NoWake> {

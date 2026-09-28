@@ -31,13 +31,23 @@ impl From<ReadError> for Corrupt {
 
 /// One ring copied into another, and the records the destination refused.
 pub(crate) struct Mirror<W: WakeSource> {
-    pub(crate) port: Cow<'static, str>,
-    pub(crate) from: View<NoWake>,
-    pub(crate) into: Writer<W>,
-    pub(crate) dropped: u64,
+    port: Cow<'static, str>,
+    from: View<NoWake>,
+    into: Writer<W>,
+    dropped: u64,
 }
 
 impl<W: WakeSource> Mirror<W> {
+    /// `from` copied into `into`, reported as `port`.
+    pub(crate) fn new(port: Cow<'static, str>, from: View<NoWake>, into: Writer<W>) -> Self {
+        Self {
+            port,
+            from,
+            into,
+            dropped: 0,
+        }
+    }
+
     /// Moves every waiting record, counting the ones that found no room.
     /// Stops at the first corrupt record or destination, keeping the records
     /// before it moved.
@@ -94,24 +104,12 @@ impl<W: WakeSource> Mirrors<W> {
 
     /// Drains every input mirror, returning the first corruption.
     pub(crate) fn drain_inputs(&mut self) -> Result<(), Corrupt> {
-        self.inputs
-            .iter_mut()
-            .map(Mirror::drain)
-            .fold(Ok(()), Result::and)
+        drain(&mut self.inputs)
     }
 
     /// Drains every output mirror, returning the first corruption.
     pub(crate) fn drain_outputs(&mut self) -> Result<(), Corrupt> {
-        self.outputs
-            .iter_mut()
-            .map(Mirror::drain)
-            .fold(Ok(()), Result::and)
-    }
-
-    /// Drops the input mirrors, freeing their reader slots on the real rings.
-    pub(crate) fn release_inputs(&mut self) {
-        self.fields.drain(1..=self.inputs.len());
-        self.inputs.clear();
+        drain(&mut self.outputs)
     }
 
     /// One line per [`DROP_REPORT_CYCLES`], counting what every port dropped
@@ -170,6 +168,23 @@ impl<W: WakeSource> Mirrors<W> {
     }
 }
 
+#[cfg(feature = "host")]
+impl<W: WakeSource> Mirrors<W> {
+    /// Drops the input mirrors, freeing their reader slots on the real rings.
+    pub(crate) fn release_inputs(&mut self) {
+        self.fields.drain(1..=self.inputs.len());
+        self.inputs.clear();
+    }
+}
+
+/// Drains every mirror, returning the first corruption.
+fn drain<W: WakeSource>(mirrors: &mut [Mirror<W>]) -> Result<(), Corrupt> {
+    mirrors
+        .iter_mut()
+        .map(Mirror::drain)
+        .fold(Ok(()), Result::and)
+}
+
 /// Each mirror's drop count, inputs then outputs, cleared as it is read.
 fn counts<'a, W: WakeSource>(
     inputs: &'a mut [Mirror<W>],
@@ -184,7 +199,6 @@ fn counts<'a, W: WakeSource>(
 fn set_count(value: &mut Cow<'static, str>, count: u64) {
     let Cow::Owned(text) = value else { return };
     text.clear();
-    // PANIC Safety: writing into a `String` cannot fail.
     let _ = write!(text, "{count}");
 }
 
@@ -199,15 +213,15 @@ fn drop_fields<'a>(ports: impl Iterator<Item = &'a Cow<'static, str>>) -> Fields
 }
 
 /// The geometry of a mirror `factor` times as deep as a ring of `capacity`
-/// bytes, with one reader.
-pub(crate) fn mirror_config(capacity: usize, factor: usize) -> Result<Config, ParamError> {
+/// bytes, with one reader, and the length of its region.
+pub(crate) fn mirror_config(capacity: usize, factor: usize) -> Result<(Config, usize), ParamError> {
     let too_large = ParamError::MirrorTooLarge { capacity };
     let config = Config {
         capacity: capacity.checked_mul(factor).ok_or(too_large.clone())?,
         max_readers: 1,
     };
-    metor_fsw_3_ring::checked_region_len(&config).ok_or(too_large)?;
-    Ok(config)
+    let len = metor_fsw_3_ring::checked_region_len(&config).ok_or(too_large)?;
+    Ok((config, len))
 }
 
 /// The index of the system's `log` output, which is where its lines go.
@@ -231,12 +245,11 @@ pub(crate) mod tests {
     }
 
     fn mirror(from: &RingBuffer, into: &RingBuffer) -> Mirror<NoWake> {
-        Mirror {
-            port: "imu".into(),
-            from: from.view(NoWake).expect("a free reader slot"),
-            into: into.writer(NoWake).expect("a free writer"),
-            dropped: 0,
-        }
+        Mirror::new(
+            "imu".into(),
+            from.view(NoWake).expect("a free reader slot"),
+            into.writer(NoWake).expect("a free writer"),
+        )
     }
 
     pub(crate) fn region_bytes(ring: &RingBuffer) -> Vec<u8> {
@@ -311,6 +324,7 @@ pub(crate) mod tests {
         assert_eq!(copy.dropped, 4);
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn test_release_inputs_frees_reader_slot() {
         let (real, copy) = (ring(256), ring(256));
@@ -325,5 +339,65 @@ pub(crate) mod tests {
         assert!(real.view(NoWake).is_ok());
         assert_eq!(mirrors.fields.len(), 1);
         assert_eq!(mirrors.drain_inputs(), Ok(()));
+    }
+
+    #[test]
+    fn test_reject_oversize_mirror() {
+        assert!(mirror_config(64, 4).is_ok());
+        // Four times a capacity no region can hold, and one that overflows.
+        for capacity in [3, usize::MAX / 2] {
+            assert_eq!(
+                mirror_config(capacity, 4).err(),
+                Some(ParamError::MirrorTooLarge { capacity })
+            );
+        }
+    }
+
+    #[test]
+    fn test_mirror_drain_snapshot() {
+        use core::cell::RefCell;
+
+        struct Refill(RefCell<Writer<NoWake>>);
+        impl WakeSource for Refill {
+            fn notify(&self) {
+                self.0
+                    .borrow_mut()
+                    .try_write(b"later")
+                    .expect("source has room");
+            }
+        }
+
+        let source = RingBuffer::create_in_memory(Config {
+            capacity: 256,
+            max_readers: 1,
+        });
+        let target = RingBuffer::create_in_memory(Config {
+            capacity: 256,
+            max_readers: 1,
+        });
+        let writer = source.writer(NoWake).expect("writer");
+        let mut received = target.view(NoWake).expect("reader");
+        let from = source.view(NoWake).expect("reader");
+        writer.try_write(b"first").expect("room");
+        writer.try_write(b"second").expect("room");
+        let into = target.writer(Refill(RefCell::new(writer))).expect("writer");
+        let mut mirror = Mirror::new("out".into(), from, into);
+        mirror.drain().expect("whole records");
+        assert_eq!(
+            received
+                .drain()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("valid"),
+            [b"first".as_slice(), b"second".as_slice()]
+        );
+        assert_eq!(
+            mirror
+                .from
+                .drain()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("valid"),
+            [b"later".as_slice(), b"later".as_slice()]
+        );
+        assert_eq!(mirror.dropped, 0);
     }
 }

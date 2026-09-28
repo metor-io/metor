@@ -17,7 +17,7 @@ mod table;
 mod tests;
 
 #[cfg(feature = "host")]
-pub(crate) use build::status_def;
+pub(crate) use build::{instance_def, status_def};
 pub use config::{
     Adapter, ChannelConfig, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig,
     OutputConfig, OutputSource, PeerLink, PeerPort, PortRef, RunState, SystemConfig,

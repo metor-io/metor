@@ -4,6 +4,7 @@ use crate::dl::PackError;
 use crate::dl::codec::DESCRIPTOR_CAPACITY;
 use crate::pack::raw::{WASM32_RAW_RING, WASM32_RAW_SLICE};
 
+use super::DEFAULT_SETUP_FUEL;
 use super::guest::{Guest, Out, WasmError};
 
 /// A `usize`'s size and alignment in a wasm32 guest.
@@ -17,20 +18,17 @@ pub(super) struct GuestRing {
 }
 
 /// `Args` places one call's arguments in a guest's memory through its
-/// allocator, and frees them all when dropped.
+/// allocator, under the setup grant, and frees them all when dropped.
 pub(super) struct Args<'g> {
     guest: &'g mut Guest,
-    fuel: u64,
     /// Each allocation as `(offset, len, align)`.
     held: Vec<(u32, u32, u32)>,
 }
 
 impl<'g> Args<'g> {
-    /// Calls into `guest` for its allocator under a grant of `fuel` each.
-    pub(super) fn new(guest: &'g mut Guest, fuel: u64) -> Self {
+    pub(super) fn new(guest: &'g mut Guest) -> Self {
         Self {
             guest,
-            fuel,
             held: Vec::new(),
         }
     }
@@ -42,21 +40,18 @@ impl<'g> Args<'g> {
 
     /// `len` zeroed bytes aligned to `align`, held until drop. No bytes is
     /// the null offset.
-    pub(super) fn alloc(&mut self, len: u32, align: u32) -> Result<u32, PackError> {
+    fn alloc(&mut self, len: u32, align: u32) -> Result<u32, PackError> {
         if len == 0 {
             return Ok(0);
         }
-        let offset = self.guest.alloc(len, align, self.fuel)?;
-        if offset == 0 {
-            return Err(WasmError::Alloc(len).into());
-        }
+        let offset = allocated(self.guest, len, align)?;
         self.held.push((offset, len, align));
         Ok(offset)
     }
 
-    /// A copy of `bytes`, returning its offset.
-    pub(super) fn bytes(&mut self, bytes: &[u8]) -> Result<u32, PackError> {
-        let offset = self.alloc(len(bytes.len())?, 1)?;
+    /// A copy of `bytes` aligned to `align`, returning its offset.
+    fn copy(&mut self, bytes: &[u8], align: u32) -> Result<u32, PackError> {
+        let offset = self.alloc(len(bytes.len())?, align)?;
         self.guest.write(offset, bytes)?;
         Ok(offset)
     }
@@ -70,15 +65,14 @@ impl<'g> Args<'g> {
 
     /// A `RawSlice` over a copy of `bytes`, returning the slice's offset.
     pub(super) fn byte_slice(&mut self, bytes: &[u8]) -> Result<u32, PackError> {
-        let ptr = self.bytes(bytes)?;
+        let ptr = self.copy(bytes, 1)?;
         self.slice(ptr, len(bytes.len())?)
     }
 
     /// An array of unowned `RawRing`s, returning its offset and length.
     pub(super) fn rings(&mut self, rings: &[GuestRing]) -> Result<(u32, u32), PackError> {
         let encoded: Vec<u8> = rings.iter().flat_map(|ring| raw_ring(*ring)).collect();
-        let ptr = self.alloc(len(encoded.len())?, WASM32_USIZE)?;
-        self.guest.write(ptr, &encoded)?;
+        let ptr = self.copy(&encoded, WASM32_USIZE)?;
         Ok((ptr, len(rings.len())?))
     }
 
@@ -89,8 +83,7 @@ impl<'g> Args<'g> {
             .iter()
             .flat_map(|&(ptr, len)| raw_slice(ptr, len))
             .collect();
-        let ptr = self.alloc(len(encoded.len())?, WASM32_USIZE)?;
-        self.guest.write(ptr, &encoded)?;
+        let ptr = self.copy(&encoded, WASM32_USIZE)?;
         self.slice(ptr, len(ports.len())?)
     }
 
@@ -133,8 +126,17 @@ impl Drop for Args<'_> {
     fn drop(&mut self) {
         for &(offset, len, align) in &self.held {
             // A guest that traps here is already dead to the caller.
-            let _ = self.guest.free(offset, len, align, self.fuel);
+            let _ = self.guest.free(offset, len, align, DEFAULT_SETUP_FUEL);
         }
+    }
+}
+
+/// `len` bytes from the guest's allocator under the setup grant, refused
+/// when it returns the null offset.
+pub(super) fn allocated(guest: &mut Guest, len: u32, align: u32) -> Result<u32, PackError> {
+    match guest.alloc(len, align, DEFAULT_SETUP_FUEL)? {
+        0 => Err(WasmError::Alloc(len).into()),
+        offset => Ok(offset),
     }
 }
 

@@ -124,9 +124,6 @@
 //! systems with config-listed ports; they carry a target's records over
 //! metor-proto to whoever connects, and its commands back.
 
-// A pack build compiles the definitions the host's build shares, unused.
-#![cfg_attr(not(feature = "host"), allow(dead_code))]
-
 // The derives name this crate by its package name, in doctests as well as here.
 extern crate self as metor_fsw_3;
 

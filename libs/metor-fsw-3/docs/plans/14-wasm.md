@@ -692,8 +692,9 @@ What landed differs from the plan above as follows, by task in
 - **T2.** The threads gate is
   `all(feature = "threads", not(target_family = "wasm"))`. `thread/os/`
   has child modules. `catch_step` and `Runner` moved to
-  `coordinator/step.rs`. Without `host` the crate allows `dead_code`, and
-  test modules that need the host are gated on it. The ring takes
+  `coordinator/step.rs`. Items only the host uses sit in host-gated
+  modules or impl blocks, and test modules that need the host are gated
+  on it. The ring takes
   stellarator as a dev-dependency.
 - **T3.** The panic hook is `panic::log_panics`.
 - **T4.** The codec takes `Option<&[u8]>`.
@@ -703,7 +704,10 @@ What landed differs from the plan above as follows, by task in
 - **T6.** The engine lives in `Module`. `Guest::new` takes the setup
   grant. `StoreLimits` allows two memories, since instantiation counts
   the host's memory again as the import. A mistyped export is
-  `WasmError::Signature`.
+  `WasmError::Signature`, and a missing one stays
+  `PackError::Wasm(WasmError::MissingExport)`. The interpreter's own
+  errors are one `WasmError::Load`. `Guest::create` takes the export's
+  argument tuple. The store drops before the arena by field order.
 - **T8.** Guest errors in params are `ParamError::Wasm(String)`, and a
   trap in `create` is `ParamError::Panicked`. The fan-in test uses
   `meter`, since `Input::drain` reads producer by producer. `STACK` is
@@ -714,8 +718,11 @@ What landed differs from the plan above as follows, by task in
   `cli::cargo` has `WASM_TRIPLE` and `wasm_name`. echo-pack's measured
   fuel: setup, the descriptor about 11.0M, a `def` at most 5.5M, and a
   `create` at most 4.5M; a step 0.7k to 9k.
-- **T10.** `Fuel::with_step` fills the setup grant. A reference writes
-  `memory` and `fuel` only when set.
+- **T10.** `Limits { memory, fuel }` flattens into a reference and a
+  slot candidate, and writes each only when set. `WasmPack::open` fills
+  the defaults, and setup always runs under `DEFAULT_SETUP_FUEL`.
+  `metor build` bakes a candidate's `kind` and limits into the slot, and
+  `DlSlot` opens a candidate by its `kind`.
 - **T11.** The generated module renders `wasm=True` only for a wasm
   pack. `pack dev` checks for async systems before it builds the module.
   The `sync-pack` fixture is a copy of echo-pack without async systems.

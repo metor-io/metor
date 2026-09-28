@@ -1,6 +1,7 @@
 //! A pack built as a WebAssembly module.
 
-use metor_fsw_3_ring::{NoWake, PAYLOAD_ALIGNMENT, RingBuffer, checked_region_len};
+use metor_fsw_3_ring::{NoWake, PAYLOAD_ALIGNMENT, RingBuffer};
+use serde::{Deserialize, Serialize};
 
 use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
@@ -13,34 +14,25 @@ use crate::pack::ABI_VERSION;
 use crate::pack::def::{Instance, PackDef};
 use crate::system::{PortDef, SystemDef};
 
-use super::abi::{Args, GuestRing};
-use super::guest::{CreateArgs, Guest, Module, WasmError};
+use super::abi::{Args, GuestRing, allocated};
+use super::guest::{Guest, Module, WasmError};
 use super::step::WasmStep;
+use super::{DEFAULT_FUEL, DEFAULT_MEMORY, DEFAULT_SETUP_FUEL};
 
 /// How much deeper a guest's copy of a ring is than the ring. The copy's
 /// wrap falls elsewhere, so a full ring's records can need more than one
 /// capacity of room.
 const COPY_FACTOR: usize = 2;
 
-/// The fuel grants a module's calls run under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Fuel {
-    /// One `execute`.
-    pub step: u64,
-    /// Each instantiation and each call made while loading and creating:
-    /// the descriptor, `def`, `create`, and the allocator calls around them.
-    pub setup: u64,
-}
-
-impl Fuel {
-    /// A step grant of `step`, the default when unset, and the default setup
-    /// grant.
-    pub fn with_step(step: Option<u64>) -> Fuel {
-        Fuel {
-            step: step.unwrap_or(super::DEFAULT_FUEL),
-            setup: super::DEFAULT_SETUP_FUEL,
-        }
-    }
+/// What each guest of a module may use, the defaults where unset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    /// Each guest's memory ceiling in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<usize>,
+    /// Each step's fuel grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<u64>,
 }
 
 /// A `WasmPack` is a compiled pack module and the descriptor it exported.
@@ -48,22 +40,24 @@ pub struct WasmPack {
     module: Module,
     /// Each guest's memory ceiling, in bytes.
     memory: usize,
-    fuel: Fuel,
+    /// Each step's fuel grant.
+    fuel: u64,
     def: PackDef,
 }
 
 impl WasmPack {
     /// Compiles a module and reads its descriptor from a scratch guest,
-    /// checking its ABI version first.
-    pub fn open(bytes: &[u8], memory: usize, fuel: Fuel) -> Result<WasmPack, PackError> {
+    /// checking its ABI version first. Setup runs under [`DEFAULT_SETUP_FUEL`].
+    pub fn open(bytes: &[u8], limits: &Limits) -> Result<WasmPack, PackError> {
         let module = Module::compile(bytes)?;
-        let mut guest = Guest::new(&module, memory, fuel.setup)?;
-        check_version(&mut guest, fuel.setup)?;
-        let def = descriptor(&mut guest, fuel.setup)?;
+        let memory = limits.memory.unwrap_or(DEFAULT_MEMORY);
+        let mut guest = Guest::new(&module, memory, DEFAULT_SETUP_FUEL)?;
+        check_version(&mut guest)?;
+        let def = descriptor(&mut guest)?;
         Ok(WasmPack {
             module,
             memory,
-            fuel,
+            fuel: limits.fuel.unwrap_or(DEFAULT_FUEL),
             def,
         })
     }
@@ -94,10 +88,9 @@ impl WasmPack {
         outputs: &[&RingBuffer],
     ) -> Result<WasmStep, ParamError> {
         let (params, def) = encode_instance(params, instance)?;
-        let fuel = self.fuel.setup;
-        let mut guest = Guest::new(&self.module, self.memory, fuel).map_err(PackError::from)?;
-        let (edges, in_rings) = copy_inputs(&mut guest, &instance.def.inputs, inputs, fuel)?;
-        let (copies, out_rings) = copy_outputs(&mut guest, &instance.def.outputs, outputs, fuel)?;
+        let mut guest = self.guest().map_err(PackError::from)?;
+        let (edges, in_rings) = copy_inputs(&mut guest, &instance.def.inputs, inputs)?;
+        let (copies, out_rings) = copy_outputs(&mut guest, &instance.def.outputs, outputs)?;
         let mirrors = Mirrors::new(&instance.def, edges, copies);
         let call = Create {
             ty: ty.as_bytes(),
@@ -106,25 +99,30 @@ impl WasmPack {
             inputs: &in_rings,
             outputs: &out_rings,
         };
-        let handle = call_create(&mut guest, call, fuel)?;
-        Ok(WasmStep::new(mirrors, guest, handle, self.fuel.step))
+        let handle = call_create(&mut guest, call)?;
+        Ok(WasmStep::new(mirrors, guest, handle, self.fuel))
+    }
+
+    /// A fresh guest, instantiated under the setup grant.
+    fn guest(&self) -> Result<Guest, WasmError> {
+        Guest::new(&self.module, self.memory, DEFAULT_SETUP_FUEL)
     }
 
     /// Calls `metor_fsw_def` in a fresh guest, returning its status and
     /// what it wrote.
     fn call_def(&self, ty: &str, cx: &[u8]) -> Result<(u32, Option<Vec<u8>>), PackError> {
-        let mut guest = Guest::new(&self.module, self.memory, self.fuel.setup)?;
-        let mut args = Args::new(&mut guest, self.fuel.setup);
+        let mut guest = self.guest()?;
+        let mut args = Args::new(&mut guest);
         let ty = args.byte_slice(ty.as_bytes())?;
         let cx = args.byte_slice(cx)?;
         let out = args.out()?;
-        let status = args.guest().def(ty, cx, out, self.fuel.setup)?;
+        let status = args.guest().def(ty, cx, out, DEFAULT_SETUP_FUEL)?;
         Ok((status, args.written(out)?))
     }
 }
 
-fn check_version(guest: &mut Guest, fuel: u64) -> Result<(), PackError> {
-    let found = guest.abi_version(fuel)?;
+fn check_version(guest: &mut Guest) -> Result<(), PackError> {
+    let found = guest.abi_version(DEFAULT_SETUP_FUEL)?;
     if found != ABI_VERSION {
         return Err(PackError::AbiMismatch {
             found,
@@ -134,10 +132,10 @@ fn check_version(guest: &mut Guest, fuel: u64) -> Result<(), PackError> {
     Ok(())
 }
 
-fn descriptor(guest: &mut Guest, fuel: u64) -> Result<PackDef, PackError> {
-    let mut args = Args::new(guest, fuel);
+fn descriptor(guest: &mut Guest) -> Result<PackDef, PackError> {
+    let mut args = Args::new(guest);
     let out = args.out()?;
-    let status = args.guest().pack_def(out, fuel)?;
+    let status = args.guest().pack_def(out, DEFAULT_SETUP_FUEL)?;
     decode_descriptor(status, args.written(out)?.as_deref())
 }
 
@@ -162,8 +160,8 @@ struct Create<'a> {
 
 /// Places `call` in guest memory and calls `metor_fsw_create`, returning the
 /// instance or the error the guest wrote.
-fn call_create(guest: &mut Guest, call: Create<'_>, fuel: u64) -> Result<u32, ParamError> {
-    let mut args = Args::new(guest, fuel);
+fn call_create(guest: &mut Guest, call: Create<'_>) -> Result<u32, ParamError> {
+    let mut args = Args::new(guest);
     let ty = args.byte_slice(call.ty)?;
     let params = args.byte_slice(call.params)?;
     let def = args.byte_slice(call.def)?;
@@ -176,15 +174,11 @@ fn call_create(guest: &mut Guest, call: Create<'_>, fuel: u64) -> Result<u32, Pa
     let (outs, len) = args.rings(call.outputs)?;
     let outputs = args.slice(outs, len)?;
     let error = args.slice(0, 0)?;
-    let create = CreateArgs {
-        ty,
-        params,
-        def,
-        inputs,
-        outputs,
-        error,
-    };
-    let handle = args.guest().create(create, fuel).map_err(PackError::from)?;
+    let create = (ty, params, def, inputs, outputs, error);
+    let handle = args
+        .guest()
+        .create(create, DEFAULT_SETUP_FUEL)
+        .map_err(PackError::from)?;
     if handle == 0 {
         return Err(decode_create_error(&args.slice_bytes(error)?));
     }
@@ -199,21 +193,19 @@ fn copy_inputs(
     guest: &mut Guest,
     ports: &[PortDef],
     inputs: &[Vec<&RingBuffer>],
-    fuel: u64,
 ) -> Result<Copies, ParamError> {
     let mut mirrors = Vec::new();
     let mut rings = Vec::with_capacity(ports.len());
     for (port, reals) in ports.iter().zip(inputs) {
         let mut edge = Vec::with_capacity(reals.len());
         for real in reals {
-            let (at, copy) = guest_ring(guest, real.config().capacity, fuel)?;
+            let (at, copy) = guest_ring(guest, real.config().capacity)?;
             // PANIC Safety: build counted this reader, and the copy is fresh.
-            mirrors.push(Mirror {
-                port: port.name.clone(),
-                from: real.view(NoWake).expect("a counted reader slot"),
-                into: copy.writer(NoWake).expect("a fresh ring"),
-                dropped: 0,
-            });
+            mirrors.push(Mirror::new(
+                port.name.clone(),
+                real.view(NoWake).expect("a counted reader slot"),
+                copy.writer(NoWake).expect("a fresh ring"),
+            ));
             edge.push(at);
         }
         rings.push(edge);
@@ -227,19 +219,17 @@ fn copy_outputs(
     guest: &mut Guest,
     ports: &[PortDef],
     outputs: &[&RingBuffer],
-    fuel: u64,
 ) -> Result<(Vec<Mirror<NoWake>>, Vec<GuestRing>), ParamError> {
     let mut mirrors = Vec::with_capacity(ports.len());
     let mut rings = Vec::with_capacity(ports.len());
     for (port, real) in ports.iter().zip(outputs) {
-        let (at, copy) = guest_ring(guest, real.config().capacity, fuel)?;
+        let (at, copy) = guest_ring(guest, real.config().capacity)?;
         // PANIC Safety: the copy is fresh, and build counted one writer per output.
-        mirrors.push(Mirror {
-            port: port.name.clone(),
-            from: copy.view(NoWake).expect("a fresh ring"),
-            into: real.writer(NoWake).expect("one writer per output ring"),
-            dropped: 0,
-        });
+        mirrors.push(Mirror::new(
+            port.name.clone(),
+            copy.view(NoWake).expect("a fresh ring"),
+            real.writer(NoWake).expect("one writer per output ring"),
+        ));
         rings.push(at);
     }
     Ok((mirrors, rings))
@@ -247,21 +237,10 @@ fn copy_outputs(
 
 /// A ring [`COPY_FACTOR`] times as deep as `real`, allocated in guest memory
 /// and formatted by the host.
-fn guest_ring(
-    guest: &mut Guest,
-    capacity: usize,
-    fuel: u64,
-) -> Result<(GuestRing, RingBuffer), ParamError> {
-    let config = mirror_config(capacity, COPY_FACTOR)?;
-    let len = checked_region_len(&config)
-        .and_then(|len| u32::try_from(len).ok())
-        .ok_or(ParamError::MirrorTooLarge { capacity })?;
-    let offset = guest
-        .alloc(len, PAYLOAD_ALIGNMENT as u32, fuel)
-        .map_err(PackError::from)?;
-    if offset == 0 {
-        return Err(PackError::from(WasmError::Alloc(len)).into());
-    }
+fn guest_ring(guest: &mut Guest, capacity: usize) -> Result<(GuestRing, RingBuffer), ParamError> {
+    let (config, len) = mirror_config(capacity, COPY_FACTOR)?;
+    let len = u32::try_from(len).map_err(|_| ParamError::MirrorTooLarge { capacity })?;
+    let offset = allocated(guest, len, PAYLOAD_ALIGNMENT as u32)?;
     let base = guest
         .region(offset, len as usize)
         .map_err(PackError::from)?;

@@ -7,30 +7,17 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use common::{Ping, fixture_lib, fixture_wasm};
+use common::{Ping, fixture_lib, fixture_wasm, open_wasm};
 use metor_fsw_3::coordinator::{BuildError, Coordinator, CoordinatorConfig, ParamError};
 use metor_fsw_3::metor_proto_wkt::{
     LogEvent, SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
-use metor_fsw_3::wasm::{Fuel, WasmPack};
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
     Adapter, ChannelConfig, DefCx, DlPack, Frame, Input, InputConfig, Output, Pack, PortRef,
     RunState, SystemConfig, SystemTable, Timestamp, system,
 };
 use serde_json::{Value, json};
-
-/// Each guest's memory ceiling.
-const MEMORY: usize = 16 << 20;
-
-const FUEL: Fuel = Fuel {
-    step: 10_000_000,
-    setup: 1_000_000_000,
-};
-
-fn open_wasm() -> WasmPack {
-    WasmPack::open(fixture_wasm(), MEMORY, FUEL).expect("the module opens")
-}
 
 fn open_dylib() -> DlPack {
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.

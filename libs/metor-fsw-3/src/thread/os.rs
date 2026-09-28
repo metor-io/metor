@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Weak};
 
-use metor_fsw_3_ring::{Config, NoWake, Notifier, RingBuffer};
+use metor_fsw_3_ring::{NoWake, Notifier, RingBuffer};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogLevel;
 
 use crate::async_system::{AsyncSystem, Running, Stop};
 use crate::coordinator::{Adapter, EndReason, MakeCx, ParamError, Params, Step};
-use crate::mirror::{Mirror, Mirrors};
+use crate::mirror::{Mirror, Mirrors, mirror_config};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef, SystemInputs, SystemOutputs};
 
 use group::{GroupHandle, Member, Panicked};
@@ -106,7 +106,7 @@ where
 }
 
 /// How much deeper a mirror ring is than the ring it mirrors.
-pub(crate) const MIRROR_FACTOR: usize = 4;
+const MIRROR_FACTOR: usize = 4;
 
 /// A `Thread` is the step an async system is bound as.
 ///
@@ -188,12 +188,11 @@ fn bind_inputs(
         for ring in rings {
             let mirror = mirror(ring)?;
             // PANIC Safety: a fresh mirror has its writer and one reader slot free.
-            edges.push(Mirror {
-                port: port.name.clone(),
-                from: ring.view(NoWake).expect("a counted reader slot"),
-                into: mirror.writer(wake.clone()).expect("a fresh mirror"),
-                dropped: 0,
-            });
+            edges.push(Mirror::new(
+                port.name.clone(),
+                ring.view(NoWake).expect("a counted reader slot"),
+                mirror.writer(wake.clone()).expect("a fresh mirror"),
+            ));
             views.push(mirror.view(wake.clone()).expect("a fresh mirror"));
         }
         bound_in.push(InputBinding {
@@ -209,13 +208,12 @@ fn bind_outputs(ports: &[PortDef], outputs: Vec<&RingBuffer>) -> Result<BoundOut
     let mut bound_out = Vec::with_capacity(ports.len());
     for (port, ring) in ports.iter().zip(outputs) {
         let mirror = mirror(ring)?;
-        copies.push(Mirror {
-            port: port.name.clone(),
-            // PANIC Safety: the mirror is fresh; build counted one real writer.
-            from: mirror.view(NoWake).expect("a fresh mirror"),
-            into: ring.writer(NoWake).expect("one writer per output ring"),
-            dropped: 0,
-        });
+        // PANIC Safety: the mirror is fresh; build counted one real writer.
+        copies.push(Mirror::new(
+            port.name.clone(),
+            mirror.view(NoWake).expect("a fresh mirror"),
+            ring.writer(NoWake).expect("one writer per output ring"),
+        ));
         bound_out.push(OutputBinding {
             def: port.clone(),
             writer: mirror.writer(NoWake).expect("a fresh mirror"),
@@ -227,12 +225,6 @@ fn bind_outputs(ports: &[PortDef], outputs: Vec<&RingBuffer>) -> Result<BoundOut
 
 /// A ring of the same records as `real`, several times as deep.
 fn mirror(real: &RingBuffer) -> Result<RingBuffer, ParamError> {
-    Ok(RingBuffer::create_in_memory(mirror_config(
-        real.config().capacity,
-    )?))
-}
-
-/// The geometry of a mirror of a ring of `capacity` bytes.
-fn mirror_config(capacity: usize) -> Result<Config, ParamError> {
-    crate::mirror::mirror_config(capacity, MIRROR_FACTOR)
+    let (config, _) = mirror_config(real.config().capacity, MIRROR_FACTOR)?;
+    Ok(RingBuffer::create_in_memory(config))
 }

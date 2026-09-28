@@ -10,7 +10,7 @@ use serde_json::value::RawValue;
 
 use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
-use crate::def::{DefCx, DefError, Records};
+use crate::def::{DefCx, DefError};
 use crate::fn_system::{AsyncSystemFn, Ctor, FnSystem, SystemFn};
 use crate::sequence::SequenceFn;
 use crate::system::{
@@ -26,9 +26,6 @@ use super::step::Step;
 
 static STATUS: LazyLock<PortDef> =
     LazyLock::new(|| crate::Output::<super::SystemStatus>::def(&DefCx::empty(), "status"));
-
-/// The ports a channel adds to whatever system it wraps.
-static CHANNEL: LazyLock<[PortDef; 3]> = LazyLock::new(|| crate::channel::ports(&DefCx::empty()));
 
 /// Arguments for constructing a system using [`MakeFn`].
 pub struct MakeCx<'a> {
@@ -165,17 +162,6 @@ impl SystemTable {
         Ok(())
     }
 
-    /// Inserts entries in order, stopping at the first conflict. Earlier insertions remain.
-    pub(crate) fn insert_all(
-        &mut self,
-        entries: Vec<(String, TableEntry)>,
-    ) -> Result<(), BuildError> {
-        for (ty, entry) in entries {
-            self.insert(&ty, entry)?;
-        }
-        Ok(())
-    }
-
     fn put(&mut self, ty: &str, entry: TableEntry) {
         match self.index.get(ty) {
             Some(&at) => self.entries[at].1 = entry,
@@ -195,12 +181,26 @@ impl SystemTable {
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, &TableEntry)> {
         self.entries.iter().map(|(ty, entry)| (ty.as_str(), entry))
     }
+}
+
+#[cfg(feature = "host")]
+impl SystemTable {
+    /// Inserts entries in order, stopping at the first conflict. Earlier insertions remain.
+    pub(crate) fn insert_all(
+        &mut self,
+        entries: Vec<(String, TableEntry)>,
+    ) -> Result<(), BuildError> {
+        for (ty, entry) in entries {
+            self.insert(&ty, entry)?;
+        }
+        Ok(())
+    }
 
     /// Every record the registered ports and the implicit status and channel ports declare.
-    pub(crate) fn records(&self) -> Records {
-        Records::of(
+    pub(crate) fn records(&self) -> crate::def::Records {
+        crate::def::Records::of(
             core::iter::once(&*STATUS)
-                .chain(CHANNEL.iter())
+                .chain(&crate::channel::ports(&DefCx::empty()))
                 .chain(self.entries().flat_map(|(_, entry)| ports(&entry.def))),
         )
     }
@@ -353,7 +353,7 @@ where
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
     use crate::Record;
@@ -399,7 +399,7 @@ mod tests {
         let mut table = SystemTable::new();
         assert_eq!(record(&table, "status"), Some(out(&STATUS)));
         assert!(record(&table, "missing").is_none());
-        for port in CHANNEL.iter() {
+        for port in &crate::channel::ports(&DefCx::empty()) {
             assert_eq!(record(&table, &port.record), Some(out(port)));
         }
         let first = Output::<Imu>::def(&DefCx::empty(), "first");

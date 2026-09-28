@@ -1,7 +1,6 @@
 //! One instantiated module over a host-placed memory. This is the only file
 //! that names the interpreter.
 
-use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 use std::alloc::Layout;
 
@@ -19,7 +18,7 @@ const MAX_PAGES: usize = 1 << 16;
 
 /// Value-stack slots the interpreter reserves for a call, 512 KiB of
 /// 8-byte slots. A pack step runs far below this, so the stack never grows,
-/// and so never allocates, mid-cycle; `tests/wasm_alloc.rs` checks it.
+/// and so never allocates, mid-cycle.
 const STACK: usize = 64 * 1024;
 
 /// Elements a guest's table may hold. rustc's table has one per function
@@ -30,10 +29,8 @@ pub const TABLE_ELEMENTS: usize = 16 * 1024;
 /// refused an access to its memory.
 #[derive(Debug, thiserror::Error)]
 pub enum WasmError {
-    #[error("the module did not compile: {0}")]
-    Compile(String),
-    #[error("the module did not instantiate: {0}")]
-    Instantiate(String),
+    #[error("the module did not load: {0}")]
+    Load(#[from] wasmi::Error),
     #[error("the module imports no 32-bit `env.memory`")]
     MemoryImport,
     #[error("the module needs {needed} bytes of memory, over the {ceiling}-byte ceiling")]
@@ -57,21 +54,24 @@ pub enum WasmError {
 }
 
 /// Why a call stopped short.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trap {
-    #[error("out of fuel")]
     OutOfFuel,
     /// `unreachable`, which is what a guest panic compiles to.
-    #[error("unreachable")]
     Unreachable,
-    #[error("memory out of bounds")]
     MemoryOutOfBounds,
-    #[error("stack overflow")]
     StackOverflow,
     /// Any other trap: a bad indirect call, integer overflow, and so on.
-    #[error("trap")]
     Other,
 }
+
+impl core::fmt::Display for Trap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for Trap {}
 
 impl Trap {
     /// The text a fault line carries.
@@ -108,9 +108,7 @@ impl Module {
             .consume_fuel(true)
             .set_min_stack_height(STACK);
         let engine = Engine::new(&config);
-        let module =
-            wasmi::Module::new(&engine, bytes).map_err(|e| WasmError::Compile(e.to_string()))?;
-        Ok(Module(module))
+        Ok(Module(wasmi::Module::new(&engine, bytes)?))
     }
 
     /// The memory the module imports as `env.memory`.
@@ -135,18 +133,6 @@ pub struct Out {
     pub written: u32,
 }
 
-/// `metor_fsw_create`'s arguments: a `RawSlice` address each, and the
-/// address of the `RawSlice` it writes an error through.
-#[derive(Clone, Copy, Debug)]
-pub struct CreateArgs {
-    pub ty: u32,
-    pub params: u32,
-    pub def: u32,
-    pub inputs: u32,
-    pub outputs: u32,
-    pub error: u32,
-}
-
 /// The exports the ABI fixes, resolved to typed functions once.
 struct Exports {
     abi_version: TypedFunc<(), u32>,
@@ -161,11 +147,11 @@ struct Exports {
 /// A `Guest` is one instantiated module: its store, its memory, and the
 /// ABI's exports.
 pub struct Guest {
-    /// Dropped first, in `Drop`, while `arena` still backs its memory.
-    store: ManuallyDrop<Store<StoreLimits>>,
+    /// Declared before `_arena`, so it drops while the arena backs its memory.
+    store: Store<StoreLimits>,
     memory: Memory,
     exports: Exports,
-    arena: Arena,
+    _arena: Arena,
 }
 
 impl Guest {
@@ -178,28 +164,23 @@ impl Guest {
         let ty = bounded(ty, &arena)?;
         let mut store = Store::new(module.0.engine(), limits());
         store.limiter(|limits| limits);
-        store
-            .set_fuel(fuel)
-            .map_err(|e| WasmError::Instantiate(e.to_string()))?;
-        // SAFETY: the store is the only user of these bytes from here, and it
-        // is dropped before `arena` frees them: on an error below by
-        // declaration order, and in `Guest`'s `Drop` after that.
+        store.set_fuel(fuel)?;
+        // SAFETY: the store is the only user of these bytes from here. It is
+        // declared after `arena` here and before it in `Guest`, so it drops
+        // first either way.
         let bytes = unsafe { arena.bytes() };
-        let memory = Memory::new_static(&mut store, ty, bytes)
-            .map_err(|e| WasmError::Instantiate(e.to_string()))?;
+        let memory = Memory::new_static(&mut store, ty, bytes)?;
         let mut linker = Linker::new(module.0.engine());
         linker
             .define("env", "memory", memory)
-            .map_err(|e| WasmError::Instantiate(e.to_string()))?;
-        let instance = linker
-            .instantiate_and_start(&mut store, &module.0)
-            .map_err(|e| WasmError::Instantiate(e.to_string()))?;
+            .map_err(wasmi::Error::from)?;
+        let instance = linker.instantiate_and_start(&mut store, &module.0)?;
         let exports = Exports::resolve(&instance, &store)?;
         Ok(Guest {
-            store: ManuallyDrop::new(store),
+            store,
             memory,
             exports,
-            arena,
+            _arena: arena,
         })
     }
 
@@ -220,17 +201,9 @@ impl Guest {
         call(&mut self.store, self.exports.def, args, fuel)
     }
 
-    /// `metor_fsw_create`, returning the instance, zero on a refusal.
-    pub fn create(&mut self, args: CreateArgs, fuel: u64) -> Result<u32, Trap> {
-        let CreateArgs {
-            ty,
-            params,
-            def,
-            inputs,
-            outputs,
-            error,
-        } = args;
-        let args = (ty, params, def, inputs, outputs, error);
+    /// `metor_fsw_create` over `(ty, params, def, inputs, outputs, error)`,
+    /// a `RawSlice` address each, returning the instance, zero on a refusal.
+    pub fn create(&mut self, args: (u32, u32, u32, u32, u32, u32), fuel: u64) -> Result<u32, Trap> {
         call(&mut self.store, self.exports.create, args, fuel)
     }
 
@@ -280,25 +253,14 @@ impl Guest {
     /// memory's current size. The arena is page aligned, so an offset's
     /// alignment is its address's.
     fn at(&self, offset: u32, len: usize) -> Result<*mut u8, WasmError> {
-        let size = self.memory.data_size(&*self.store);
+        let size = self.memory.data_size(&self.store);
         let start = offset as usize;
         match start.checked_add(len) {
             // SAFETY: `start` is within the memory, so the offset stays in
             // the one allocation `data_ptr` points into.
-            Some(end) if end <= size => {
-                Ok(unsafe { self.memory.data_ptr(&*self.store).add(start) })
-            }
+            Some(end) if end <= size => Ok(unsafe { self.memory.data_ptr(&self.store).add(start) }),
             _ => Err(WasmError::OutOfBounds { offset, len }),
         }
-    }
-}
-
-impl Drop for Guest {
-    fn drop(&mut self) {
-        // SAFETY: the store is dropped once, here, and never used again.
-        unsafe { ManuallyDrop::drop(&mut self.store) };
-        // The arena drops after this body, so the store never outlives its memory.
-        let _ = &self.arena;
     }
 }
 
@@ -354,41 +316,44 @@ fn limits() -> StoreLimits {
 
 /// The import's type, with its maximum capped at the arena's pages.
 fn bounded(ty: MemoryType, arena: &Arena) -> Result<MemoryType, WasmError> {
-    let pages = (arena.len / PAGE) as u64;
+    let pages = (arena.len() / PAGE) as u64;
     if ty.minimum() > pages {
         return Err(WasmError::MemoryTooSmall {
             needed: ty.minimum().saturating_mul(PAGE as u64),
-            ceiling: arena.len,
+            ceiling: arena.len(),
         });
     }
     let mut builder = MemoryType::builder();
     builder
         .min(ty.minimum())
         .max(Some(ty.maximum().map_or(pages, |max| max.min(pages))));
-    builder
-        .build()
-        .map_err(|e| WasmError::Instantiate(e.to_string()))
+    builder.build().map_err(|e| wasmi::Error::from(e).into())
 }
 
 /// An `Arena` is the page-aligned, zeroed allocation a guest's memory lives in.
-pub(super) struct Arena {
+struct Arena {
     ptr: NonNull<u8>,
-    len: usize,
+    layout: Layout,
 }
 
 impl Arena {
     /// Whole pages covering `ceiling` bytes.
-    pub(super) fn new(ceiling: usize) -> Result<Arena, WasmError> {
+    fn new(ceiling: usize) -> Result<Arena, WasmError> {
         let pages = ceiling.div_ceil(PAGE);
         if pages == 0 || pages > MAX_PAGES {
             return Err(WasmError::BadCeiling(ceiling));
         }
         let len = pages * PAGE;
-        let layout = Arena::layout(len).ok_or(WasmError::BadCeiling(ceiling))?;
+        let layout =
+            Layout::from_size_align(len, PAGE).map_err(|_| WasmError::BadCeiling(ceiling))?;
         // SAFETY: `len` is nonzero.
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr).ok_or(WasmError::OutOfMemory(len))?;
-        Ok(Arena { ptr, len })
+        Ok(Arena { ptr, layout })
+    }
+
+    fn len(&self) -> usize {
+        self.layout.size()
     }
 
     /// The arena as one slice, for the one user of its bytes.
@@ -396,22 +361,16 @@ impl Arena {
     /// # Safety
     /// Nothing else accesses the bytes while the slice or anything derived
     /// from it is live, and none of those is used after the arena drops.
-    pub(super) unsafe fn bytes(&self) -> &'static mut [u8] {
+    unsafe fn bytes(&self) -> &'static mut [u8] {
         // SAFETY: `new` allocated `len` bytes at `ptr`; the caller's contract
         // covers aliasing and lifetime.
-        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    }
-
-    fn layout(len: usize) -> Option<Layout> {
-        Layout::from_size_align(len, PAGE).ok()
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len()) }
     }
 }
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        if let Some(layout) = Arena::layout(self.len) {
-            // SAFETY: `new` allocated `ptr` with this layout, and it is freed once.
-            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
-        }
+        // SAFETY: `new` allocated `ptr` with this layout, and it is freed once.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
     }
 }

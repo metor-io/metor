@@ -13,7 +13,6 @@ use crate::coordinator::SystemKind;
 use crate::dl::{DlPack, Pack, PackError};
 use crate::pack::ABI_VERSION;
 use crate::pack::def::PackDef;
-use crate::wasm::WasmPack;
 
 static BUILD: Mutex<()> = Mutex::new(());
 
@@ -130,11 +129,7 @@ fn stage_module(
         std::fs::create_dir_all(dir).map_err(PackDevError::write(dir))?;
     }
     copy_atomic(&built, &staged).map_err(PackDevError::write(&staged))?;
-    let bytes = std::fs::read(&staged).map_err(|source| PackDevError::Read {
-        path: staged.clone(),
-        source,
-    })?;
-    let pack = WasmPack::open(&bytes, reference.memory(), reference.fuel())?;
+    let pack = reference.open()?;
     if !same_descriptor(pack.descriptor(), library) {
         return Err(PackDevError::DescriptorMismatch);
     }

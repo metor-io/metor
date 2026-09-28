@@ -13,10 +13,8 @@ pub enum CargoError {
     Spawn(#[from] std::io::Error),
     #[error("cargo build failed: {0}")]
     Cargo(ExitStatus),
-    #[error("cargo built no cdylib for `{0}`")]
-    NoCdylib(String),
-    #[error("cargo built no module for `{0}`")]
-    NoModule(String),
+    #[error("cargo built no {0} for `{1}`")]
+    NoArtifact(&'static str, String),
 }
 
 /// Builds `package` from `manifest_dir` and returns the cdylib cargo wrote.
@@ -25,7 +23,7 @@ pub enum CargoError {
 pub fn cargo_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoError> {
     let args = ["build", "-p", package, "--message-format=json"];
     let stdout = cargo(manifest_dir, &args)?;
-    cdylib(&stdout).ok_or_else(|| CargoError::NoCdylib(package.to_string()))
+    cdylib(&stdout).ok_or_else(|| CargoError::NoArtifact("cdylib", package.to_string()))
 }
 
 /// Builds `package` from `manifest_dir` for wasm32, importing its memory, and
@@ -47,7 +45,7 @@ pub fn wasm_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoEr
         "link-arg=--import-memory",
     ];
     let stdout = cargo(manifest_dir, &args)?;
-    module(&stdout).ok_or_else(|| CargoError::NoModule(package.to_string()))
+    module(&stdout).ok_or_else(|| CargoError::NoArtifact("module", package.to_string()))
 }
 
 /// Runs cargo with `args` in `dir`, returning its stdout. Cargo's stderr is

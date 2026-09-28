@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use metor_fsw_3::cli::cargo::{cargo_build, wasm_build};
 use metor_fsw_3::coordinator::{CoordinatorConfig, SystemTable};
+use metor_fsw_3::wasm::{Limits, WasmPack};
 use metor_fsw_3::{Frame, Output, Record, Timestamp, system};
 use metor_proto_stellar::{PacketSink, PacketStream, Peer, identify};
 use metor_proto_wkt::LinkInfo;
@@ -85,6 +86,11 @@ pub fn fixture_wasm() -> &'static [u8] {
         let path = wasm_build("echo-pack", root).expect("the module builds");
         std::fs::read(&path).expect("the module was written")
     })
+}
+
+/// The fixture's module, opened under the default limits.
+pub fn open_wasm() -> WasmPack {
+    WasmPack::open(fixture_wasm(), &Limits::default()).expect("the module opens")
 }
 
 pub fn metor() -> Command {

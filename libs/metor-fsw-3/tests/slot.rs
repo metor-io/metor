@@ -103,6 +103,7 @@ fn wasm_candidate(name: &str, ty: &str, dir: &Path) -> Value {
         "path": path,
         "hash": blake3::hash(fixture_wasm()).to_hex().as_str(),
         "def": baked(ty),
+        "kind": "wasm",
     })
 }
 
@@ -563,6 +564,7 @@ fn test_build_resolves_wasm_candidate() {
     assert!(path.ends_with(wasm_name("echo_pack")), "{}", path.display());
     let hash = blake3::hash(fixture_wasm());
     assert_eq!(candidate["hash"], json!(hash.to_hex().as_str()));
+    assert_eq!(candidate["kind"], json!("wasm"));
     assert_eq!(candidate["memory"], json!(32 << 20));
     assert_eq!(candidate["fuel"], json!(1_000_000));
 

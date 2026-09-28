@@ -12,17 +12,44 @@ use metor_proto_wkt::{
 use crate::coordinator::{
     Adapter, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, Stepped, catch_step,
 };
+use crate::def::DefCx;
 use crate::port::{Input, Output, ring_capacity};
 use crate::record::Record;
-use crate::system::SystemDef;
+use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
 use crate::{FrameBytes, FrameStr};
 
 use super::apply::{Command, State, apply};
-use super::{ABORT_PORT, AbortRequest, ChannelState, ChannelStatus};
+use super::{
+    ABORT_PORT, AbortRequest, COMMANDS_PORT, ChannelState, ChannelStatus, EVENTS_PORT, STATUS_PORT,
+};
 
 /// Records the private abort ring holds.
 const ABORT_DEPTH: usize = 4;
+
+/// The system's definition with the channel's ports appended, or the name
+/// of a system port that takes one of theirs.
+pub(crate) fn def(mut inner: SystemDef, cx: &DefCx<'_>) -> Result<SystemDef, String> {
+    let reserved = [COMMANDS_PORT, EVENTS_PORT, STATUS_PORT];
+    let mut taken = inner.inputs.iter().chain(&inner.outputs);
+    if let Some(port) = taken.find(|p| reserved.contains(&p.name.as_ref())) {
+        return Err(port.name.to_string());
+    }
+    let [commands, events, status] = ports(cx);
+    inner.inputs.push(commands);
+    inner.outputs.extend([events, status]);
+    Ok(inner)
+}
+
+/// The ports every channel adds: its commands input, then its events and
+/// status outputs.
+pub(crate) fn ports(cx: &DefCx<'_>) -> [PortDef; 3] {
+    [
+        Input::<SequenceCommand>::def(cx, COMMANDS_PORT),
+        Output::<SequenceChannelEvent>::def(cx, EVENTS_PORT),
+        Output::<ChannelStatus>::def(cx, STATUS_PORT),
+    ]
+}
 
 /// Makes the system `make` builds, wrapped in its channel.
 ///

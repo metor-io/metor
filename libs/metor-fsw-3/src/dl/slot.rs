@@ -1,9 +1,9 @@
 //! `DlSlot`: one place in the schedule a pack system is loaded into.
 //!
 //! The slot's ports are its first candidate's, baked into its params by
-//! `metor build`. A `Load` hashes the candidate's library or module, opens
-//! it, checks its ports against the slot's, and creates it over the slot's
-//! rings. A candidate whose path ends in `.wasm` loads as a module.
+//! `metor build`, along with each candidate's pack kind and limits. A `Load`
+//! hashes the candidate's library or module, opens it, checks its ports
+//! against the slot's, and creates it over the slot's rings.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,13 +13,14 @@ use metor_proto::types::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::cli::config::PackKind;
 use crate::coordinator::{
     Adapter, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, SystemKind, TableEntry,
 };
 use crate::def::{DefCx, DefError};
 use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
-use crate::wasm::{DEFAULT_MEMORY, Fuel, WasmPack};
+use crate::wasm::{Limits, WasmPack};
 use crate::{FrameBytes, FrameStr};
 
 use super::{DlPack, Pack, PackError, is_loaded, store};
@@ -47,12 +48,10 @@ struct Candidate {
     hash: Option<String>,
     #[serde(default)]
     def: Option<SystemDef>,
-    /// A module's memory ceiling in bytes.
     #[serde(default)]
-    memory: Option<usize>,
-    /// A module's fuel grant per step.
-    #[serde(default)]
-    fuel: Option<u64>,
+    kind: PackKind,
+    #[serde(flatten)]
+    limits: Limits,
 }
 
 /// A candidate `metor build` resolved: where its library is and what it is.
@@ -62,8 +61,8 @@ struct Resolved {
     params: Value,
     path: PathBuf,
     hash: blake3::Hash,
-    memory: Option<usize>,
-    fuel: Option<u64>,
+    kind: PackKind,
+    limits: Limits,
     occupant: Occupant,
 }
 
@@ -166,8 +165,8 @@ impl Resolved {
             params: candidate.params,
             path,
             hash,
-            memory: candidate.memory,
-            fuel: candidate.fuel,
+            kind: candidate.kind,
+            limits: candidate.limits,
         })
     }
 }
@@ -278,10 +277,10 @@ impl Step for DlSlot {
 
 /// Opens a candidate's library or module once its bytes check out.
 fn open(candidate: &Resolved) -> Result<Pack, LoadError> {
-    if candidate.path.extension().is_some_and(|ext| ext == "wasm") {
-        return open_wasm(candidate);
+    match candidate.kind {
+        PackKind::Dylib => open_dylib(candidate),
+        PackKind::Wasm => open_wasm(candidate),
     }
-    open_dylib(candidate)
 }
 
 /// Opens a candidate's library.
@@ -315,9 +314,7 @@ fn open_wasm(candidate: &Resolved) -> Result<Pack, LoadError> {
     if blake3::hash(&bytes) != candidate.hash {
         return Err(LoadError::Hash(candidate.name.clone()));
     }
-    let memory = candidate.memory.unwrap_or(DEFAULT_MEMORY);
-    let pack =
-        WasmPack::open(&bytes, memory, Fuel::with_step(candidate.fuel)).map_err(open_error)?;
+    let pack = WasmPack::open(&bytes, &candidate.limits).map_err(open_error)?;
     Ok(Pack::Wasm(pack))
 }
 

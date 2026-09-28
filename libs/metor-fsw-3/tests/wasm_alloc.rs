@@ -7,9 +7,8 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::{Ping, fixture_wasm};
+use common::{Ping, open_wasm};
 use metor_fsw_3::coordinator::{Coordinator, CoordinatorConfig};
-use metor_fsw_3::wasm::{Fuel, WasmPack};
 use metor_fsw_3::{InputConfig, Output, Pack, SystemConfig, SystemTable, Timestamp, system};
 
 /// Counts the allocations made on a thread that armed it.
@@ -76,11 +75,7 @@ fn source(#[state] s: &mut Source, output: &mut Output<Ping>) {
 
 /// `source -> middle (echo.<ty>)`, with nothing reading the middle.
 fn built(ty: &str) -> Coordinator {
-    let fuel = Fuel {
-        step: 10_000_000,
-        setup: 1_000_000_000,
-    };
-    let pack = WasmPack::open(fixture_wasm(), 16 << 20, fuel).expect("the module opens");
+    let pack = open_wasm();
     let mut table = SystemTable::new();
     table
         .register("source", source(), Source::default)

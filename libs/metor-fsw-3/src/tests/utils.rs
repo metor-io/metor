@@ -1,5 +1,8 @@
 //! Frames, systems, and configs the unit tests share.
 
+// Most of the tests that use these need the host.
+#![cfg_attr(not(feature = "host"), allow(dead_code))]
+
 use core::cell::RefCell;
 use core::future::Future;
 use core::task::Poll;

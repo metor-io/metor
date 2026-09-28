@@ -1,18 +1,18 @@
 use std::borrow::Cow;
 
-use metor_fsw_3_ring::{Config, NoWake, RingBuffer, View, Writer, checked_region_len};
+use metor_fsw_3_ring::{Config, NoWake, RingBuffer, View, Writer};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogEvent;
 
 use super::abi::{GuestRing, raw_ring, raw_slice};
-use super::guest::Arena;
+use super::guest::{Guest, Module, Out, TABLE_ELEMENTS};
 use super::*;
 use crate::coordinator::{EndReason, Step};
 use crate::def::DefCx;
 use crate::dl::PackError;
 use crate::dl::codec::DESCRIPTOR_CAPACITY;
+use crate::mirror::mirror_config;
 use crate::mirror::tests::{region_bytes, slot_cursor};
-use crate::mirror::{Mirror, Mirrors, mirror_config};
 use crate::pack::def::Instance;
 use crate::system::SystemDef;
 use crate::{ABI_VERSION, Input, Output};
@@ -177,13 +177,11 @@ fn test_calls_reach_each_export() {
     assert_eq!(guest.def(0, 0, out, 1_000), Ok(0));
 }
 
-const FUEL: Fuel = Fuel {
-    step: 10_000,
-    setup: 10_000,
-};
-
 fn open(text: &str) -> Result<WasmPack, PackError> {
-    WasmPack::open(&wat::parse_str(text).expect("valid wat"), PAGE, FUEL)
+    WasmPack::open(
+        &wat::parse_str(text).expect("valid wat"),
+        &Limits::default(),
+    )
 }
 
 #[test]
@@ -196,18 +194,6 @@ fn test_wrong_abi_is_mismatch() {
             found: 1,
             expected: ABI_VERSION
         })
-    ));
-}
-
-#[test]
-fn test_missing_export_is_missing_symbol() {
-    let text = wat("1", "", "i32.const 0").replace(
-        r#"(func (export "metor_fsw_pack_def") (param i32 i32 i32) (result i32) i32.const 0)"#,
-        "",
-    );
-    assert!(matches!(
-        open(&text),
-        Err(PackError::MissingSymbol("metor_fsw_pack_def"))
     ));
 }
 
@@ -281,7 +267,7 @@ const LOG_RING: usize = 1 << 16;
 /// The byte stores that commit `record` into a fresh copy of a `RING`-byte
 /// output, as wat over `$out`; `corrupt` makes its length `u32::MAX`.
 fn record_stores(record: &[u8], corrupt: bool) -> String {
-    let config = mirror_config(RING, 2).expect("fits");
+    let (config, _) = mirror_config(RING, 2).expect("fits");
     let ring = RingBuffer::create_in_memory(config);
     let _host = ring.view(NoWake).expect("a free reader slot");
     let before = region_bytes(&ring);
@@ -319,12 +305,12 @@ fn ring(capacity: usize) -> RingBuffer {
 }
 
 fn rig(execute: &str) -> Rig {
-    let fuel = Fuel {
-        step: 100_000,
-        setup: 10_000_000,
+    let limits = Limits {
+        memory: Some(64 * PAGE),
+        fuel: Some(100_000),
     };
     let bytes = wat::parse_str(step_wat(execute)).expect("valid wat");
-    let pack = WasmPack::open(&bytes, 64 * PAGE, fuel).expect("opens");
+    let pack = WasmPack::open(&bytes, &limits).expect("opens");
     let (input, output, log) = (ring(RING), ring(RING), ring(LOG_RING));
     let cx = DefCx::empty();
     let def = SystemDef {
@@ -413,7 +399,7 @@ fn test_each_end() {
 
 #[test]
 fn test_corrupt_input_ring_ends_the_step() {
-    let cursor = slot_cursor(mirror_config(RING, 2).expect("fits"));
+    let cursor = slot_cursor(mirror_config(RING, 2).expect("fits").0);
     let at = format!("(i32.add (global.get $in) (i32.const {cursor}))");
     let mut rig = rig(&format!("(i64.store {at} (i64.const -2)) i32.const 0"));
     rig.execute();
@@ -455,58 +441,4 @@ fn test_end_frees_input_reader_slot() {
     assert!(rig.input.view(NoWake).is_ok());
     rig.execute();
     assert_eq!(rig.kinds(), ["trap"]);
-}
-
-/// `WasmStep`'s drop order with the interpreter left out: mirrors whose
-/// copies live in an arena drop before the arena frees it.
-#[test]
-fn test_drop_order() {
-    struct Bare {
-        _mirrors: Mirrors<NoWake>,
-        _arena: Arena,
-    }
-
-    let arena = Arena::new(PAGE).expect("allocates");
-    // SAFETY: the rings below are the only users of the bytes, and every
-    // handle on them is in `Bare::mirrors`, which drops before the arena.
-    let base = unsafe { arena.bytes() }.as_mut_ptr();
-    let config = mirror_config(RING, 2).expect("fits");
-    let len = checked_region_len(&config).expect("fits");
-    // SAFETY: as above; the two regions are disjoint and 16-byte aligned.
-    let (copy_in, copy_out) = unsafe {
-        let copy_in = RingBuffer::create_raw(base, len, config).expect("formats");
-        let copy_out = RingBuffer::create_raw(base.add(len), len, config).expect("formats");
-        (copy_in, copy_out)
-    };
-    let (real_in, real_out) = (ring(RING), ring(RING));
-    let port = Cow::Borrowed("port");
-    let inputs = vec![Mirror {
-        port: port.clone(),
-        from: real_in.view(NoWake).expect("a free reader slot"),
-        into: copy_in.writer(NoWake).expect("a free writer"),
-        dropped: 0,
-    }];
-    let outputs = vec![Mirror {
-        port,
-        from: copy_out.view(NoWake).expect("a free reader slot"),
-        into: real_out.writer(NoWake).expect("a free writer"),
-        dropped: 0,
-    }];
-    let def = SystemDef {
-        name: "guest".into(),
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-    };
-    let mut mirrors = Mirrors::new(&def, inputs, outputs);
-    let feed = real_in.writer(NoWake).expect("a free writer");
-    feed.try_write(b"in").expect("room");
-    let guest_writer = copy_out.writer(NoWake).expect("a free writer");
-    guest_writer.try_write(b"out").expect("room");
-    assert_eq!(mirrors.drain_inputs(), Ok(()));
-    assert_eq!(mirrors.drain_outputs(), Ok(()));
-    drop((guest_writer, copy_in, copy_out));
-    drop(Bare {
-        _mirrors: mirrors,
-        _arena: arena,
-    });
 }

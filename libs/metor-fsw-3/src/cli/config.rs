@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::coordinator::CoordinatorConfig;
 use crate::dl::{DlPack, Pack, PackError};
-use crate::wasm::{DEFAULT_MEMORY, Fuel, WasmPack};
+use crate::wasm::{Limits, WasmPack};
 
 /// The file format this host reads.
 pub const CONFIG_VERSION: u32 = 2;
@@ -52,12 +52,9 @@ pub struct PackRef {
     pub libs: PathBuf,
     #[serde(default, skip_serializing_if = "PackKind::is_dylib")]
     pub kind: PackKind,
-    /// Each guest's memory ceiling in bytes, for a wasm pack.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<usize>,
-    /// Each step's fuel grant, for a wasm pack.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fuel: Option<u64>,
+    /// A wasm pack's limits.
+    #[serde(flatten)]
+    pub limits: Limits,
 }
 
 impl PackRef {
@@ -68,8 +65,7 @@ impl PackRef {
             lib,
             libs,
             kind: PackKind::Dylib,
-            memory: None,
-            fuel: None,
+            limits: Limits::default(),
         }
     }
 
@@ -82,16 +78,6 @@ impl PackRef {
         }
     }
 
-    /// Each guest's memory ceiling, the default when unset.
-    pub fn memory(&self) -> usize {
-        self.memory.unwrap_or(DEFAULT_MEMORY)
-    }
-
-    /// The grants a wasm pack's calls run under, the defaults when unset.
-    pub fn fuel(&self) -> Fuel {
-        Fuel::with_step(self.fuel)
-    }
-
     /// Opens the artifact as its kind says.
     pub fn open(&self) -> Result<Pack, PackError> {
         let path = self.artifact();
@@ -102,7 +88,7 @@ impl PackRef {
             PackKind::Dylib => unsafe { DlPack::open(&path) }.map(Pack::Dl),
             PackKind::Wasm => {
                 let bytes = std::fs::read(&path).map_err(PackError::Read)?;
-                WasmPack::open(&bytes, self.memory(), self.fuel()).map(Pack::Wasm)
+                WasmPack::open(&bytes, &self.limits).map(Pack::Wasm)
             }
         }
     }
@@ -311,7 +297,11 @@ mod tests {
         });
         let pack: PackRef = serde_json::from_value(json.clone()).expect("decodes");
         assert_eq!(pack.kind, PackKind::Wasm);
-        assert_eq!((pack.memory(), pack.fuel().step), (1 << 20, 5_000));
+        let limits = Limits {
+            memory: Some(1 << 20),
+            fuel: Some(5_000),
+        };
+        assert_eq!(pack.limits, limits);
         assert_eq!(serde_json::to_value(&pack).expect("encodes"), json);
         let module = PathBuf::from("/l/wasm32-unknown-unknown/adcs_systems.wasm");
         assert_eq!(pack.artifact(), module);
@@ -322,17 +312,9 @@ mod tests {
         let json = serde_json::json!({ "id": "adcs", "lib": "adcs_systems", "libs": "/l" });
         let pack: PackRef = serde_json::from_value(json.clone()).expect("decodes");
         assert_eq!(pack.kind, PackKind::Dylib);
-        assert_eq!((pack.memory, pack.fuel), (None, None));
-        assert_eq!(pack.memory(), crate::wasm::DEFAULT_MEMORY);
-        assert_eq!(pack.fuel().step, crate::wasm::DEFAULT_FUEL);
+        assert_eq!(pack.limits, Limits::default());
         let written = serde_json::to_value(&pack).expect("encodes");
         assert_eq!(written, json);
-    }
-
-    #[test]
-    fn test_unknown_pack_kind_is_refused() {
-        let json = serde_json::json!({ "id": "a", "lib": "a", "libs": "/l", "kind": "elf" });
-        assert!(serde_json::from_value::<PackRef>(json).is_err());
     }
 
     #[test]

@@ -1,18 +1,20 @@
 //! Build turns a config into a coordinator: it resolves each system's ports
 //! and edges, then allocates one ring per output with a reader slot per edge.
 
+use core::time::Duration;
 use std::collections::HashMap;
 
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer, checked_region_len};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 
+use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
 
-use super::config::{Adapter, CoordinatorConfig, PortRef, SystemConfig};
+use super::config::{Adapter, Clock, CoordinatorConfig, PortRef, SystemConfig};
 use super::error::BuildError;
 use super::params::Params;
 use super::run::{Coordinator, Entry};
@@ -20,6 +22,8 @@ use super::status::SystemStatus;
 use super::table::{MakeCx, SystemTable, TableEntry};
 
 const STATUS_PORT: &str = "status";
+
+const MIN_WALL_RATE: f64 = 0.001;
 
 struct RingSpec {
     system: String,
@@ -108,7 +112,7 @@ fn resolve<'a>(
             })?;
 
         let namespace = config.namespace.as_deref();
-        let def = instance_def(system, entry, &plan, &index, &records, namespace)?;
+        let def = planned_def(system, entry, &plan, &index, &records, namespace)?;
         check_port_names(&system.id, &def)?;
         if def.outputs.iter().any(|p| p.name == STATUS_PORT) {
             return Err(BuildError::ReservedPort {
@@ -190,7 +194,7 @@ fn index(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, BuildError>
 
 /// The definition the type computes from this instance's config, over the
 /// producers this pass has resolved so far.
-fn instance_def(
+fn planned_def(
     system: &SystemConfig,
     entry: &TableEntry,
     plan: &Plan<'_>,
@@ -198,10 +202,69 @@ fn instance_def(
     records: &Records,
     namespace: Option<&str>,
 ) -> Result<SystemDef, BuildError> {
-    crate::def::instance_def(system, entry, namespace, records, |port, from| {
+    instance_def(system, entry, namespace, records, |port, from| {
         let ring = producer_ring(plan, index, &system.id, port, from)?;
         Ok(ring.map(|ring| plan.rings[ring].port.clone()))
     })
+}
+
+/// The definition `entry`'s type computes for `system`, over the producers
+/// `producer` finds. A producer it returns `None` for is not resolved yet,
+/// which only a port the type declares may read.
+pub(crate) fn instance_def(
+    system: &SystemConfig,
+    entry: &TableEntry,
+    namespace: Option<&str>,
+    records: &Records,
+    producer: impl Fn(&str, &PortRef) -> Result<Option<PortDef>, BuildError>,
+) -> Result<SystemDef, BuildError> {
+    let channel = matches!(system.adapter, Some(Adapter::Channel(_)));
+    let mut edges: Vec<(&str, PortDef)> = Vec::new();
+    for input in &system.inputs {
+        if channel && input.port == ABORT_PORT {
+            return Err(reserved(system, ABORT_PORT));
+        }
+        // The channel reads its commands; the system never sees them.
+        if channel && input.port == COMMANDS_PORT {
+            continue;
+        }
+        for from in &input.from {
+            match producer(&input.port, from)? {
+                Some(def) => edges.push((input.port.as_str(), def)),
+                None if entry.def.inputs.iter().any(|p| p.name == input.port) => {}
+                None => {
+                    return Err(BuildError::DynamicFromLater {
+                        system: system.id.clone(),
+                        port: input.port.clone(),
+                    });
+                }
+            }
+        }
+    }
+    let inputs: Vec<(&str, &PortDef)> = edges.iter().map(|(port, def)| (*port, def)).collect();
+    let cx = DefCx {
+        id: &system.id,
+        namespace,
+        inputs: &inputs,
+        outputs: &system.outputs,
+        records,
+        params: &system.params,
+    };
+    let def = (entry.def_fn)(&cx).map_err(|source| BuildError::Def {
+        id: system.id.clone(),
+        source,
+    })?;
+    if !channel {
+        return Ok(def);
+    }
+    crate::channel::def(def, &cx).map_err(|port| reserved(system, &port))
+}
+
+fn reserved(system: &SystemConfig, port: &str) -> BuildError {
+    BuildError::ReservedChannelPort {
+        id: system.id.clone(),
+        port: port.to_string(),
+    }
 }
 
 /// The ring `from` names for input `port` of system `id`, or `None` while its
@@ -410,6 +473,27 @@ fn bind_rings(
         });
     }
     Ok(entries)
+}
+
+impl Clock {
+    pub(crate) fn validate(&self) -> Result<(), BuildError> {
+        if let Self::Wall { rate } = self
+            && (!rate.is_finite() || *rate < MIN_WALL_RATE)
+        {
+            return Err(BuildError::InvalidClockRate);
+        }
+        Ok(())
+    }
+
+    /// The wall budget for one cycle; zero under a simulated clock.
+    pub(crate) fn cycle_budget(&self) -> Duration {
+        match self {
+            Clock::Wall { rate } if *rate > 0.0 => {
+                Duration::try_from_secs_f64(1.0 / rate).unwrap_or(Duration::MAX)
+            }
+            _ => Duration::ZERO,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1013,5 +1097,28 @@ mod tests {
         let mut config = pipeline_config();
         config.systems[1].inputs.clear();
         assert!(build(config).is_ok());
+    }
+
+    #[test]
+    fn test_zero_cycle_budget() {
+        assert_eq!(
+            Clock::Simulated {
+                dt: Duration::from_millis(5)
+            }
+            .cycle_budget(),
+            Duration::ZERO
+        );
+        let clock = Clock::Wall { rate: f64::MAX };
+        assert_eq!(clock.validate(), Ok(()));
+        assert_eq!(clock.cycle_budget(), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_minimum_wall_rate_budget() {
+        let clock = Clock::Wall {
+            rate: MIN_WALL_RATE,
+        };
+        assert_eq!(clock.validate(), Ok(()));
+        assert_eq!(clock.cycle_budget(), Duration::from_secs(1_000));
     }
 }
