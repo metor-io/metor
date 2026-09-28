@@ -1,20 +1,22 @@
-//! The circular orbit the plant boots onto.
+//! Earth's constants and the circular orbit the plant boots onto.
 
 use nox::tensor;
 
-use crate::{Epoch, MU, V3, sun_dir_eci};
+use crate::V3;
+
+/// Gravitational constant (m³·kg⁻¹·s⁻²).
+pub const G: f64 = 6.6743e-11;
+/// Mass of Earth (kg).
+pub const M: f64 = 5.972e24;
+/// Earth's gravitational parameter `G·M` (m³·s⁻²).
+pub const MU: f64 = G * M;
+/// Earth radius (m).
+pub const EARTH_RADIUS: f64 = 6378.1e3;
 
 /// Default orbit altitude (m).
 pub const ALTITUDE: f64 = 400.0e3;
 /// Default orbit inclination (rad), sun-synchronous at 400 km.
 pub const SSO_INCLINATION: f64 = 97.03 * core::f64::consts::PI / 180.0;
-
-/// Returns the RAAN (rad) that puts the ascending node at local mean solar time
-/// `ltan_hours` at `epoch`.
-pub fn raan_for_ltan(epoch: Epoch, ltan_hours: f64) -> f64 {
-    let [x, y, _] = sun_dir_eci(epoch).into_buf();
-    y.atan2(x) + (ltan_hours - 12.0) / 24.0 * core::f64::consts::TAU
-}
 
 /// Returns the ECI position and velocity of a circular orbit at phase `theta`
 /// (rad) past its ascending node.
