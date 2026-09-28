@@ -206,7 +206,7 @@ fn copy_inputs(
     for (port, reals) in ports.iter().zip(inputs) {
         let mut edge = Vec::with_capacity(reals.len());
         for real in reals {
-            let (at, copy) = guest_ring(guest, real, fuel)?;
+            let (at, copy) = guest_ring(guest, real.config().capacity, fuel)?;
             // PANIC Safety: build counted this reader, and the copy is fresh.
             mirrors.push(Mirror {
                 port: port.name.clone(),
@@ -232,7 +232,7 @@ fn copy_outputs(
     let mut mirrors = Vec::with_capacity(ports.len());
     let mut rings = Vec::with_capacity(ports.len());
     for (port, real) in ports.iter().zip(outputs) {
-        let (at, copy) = guest_ring(guest, real, fuel)?;
+        let (at, copy) = guest_ring(guest, real.config().capacity, fuel)?;
         // PANIC Safety: the copy is fresh, and build counted one writer per output.
         mirrors.push(Mirror {
             port: port.name.clone(),
@@ -249,10 +249,9 @@ fn copy_outputs(
 /// and formatted by the host.
 fn guest_ring(
     guest: &mut Guest,
-    real: &RingBuffer,
+    capacity: usize,
     fuel: u64,
 ) -> Result<(GuestRing, RingBuffer), ParamError> {
-    let capacity = real.config().capacity;
     let config = mirror_config(capacity, COPY_FACTOR)?;
     let len = checked_region_len(&config)
         .and_then(|len| u32::try_from(len).ok())
