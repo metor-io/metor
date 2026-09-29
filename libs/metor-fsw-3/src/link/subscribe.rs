@@ -16,9 +16,9 @@ use crate::{Stop, system};
 
 use super::conn::{self, Connections, Event};
 use super::inbox::{self, Inbox};
-use super::transport::{Endpoint, Transport, source};
+use super::transport::{Endpoint, source};
 use super::wire;
-use super::{LinkStatus, default_conn_cap, report};
+use super::{LinkParams, LinkStatus, default_conn_cap, report};
 
 /// Records a link holds for its ports, at least, before it drops one.
 fn default_inbound_cap() -> usize {
@@ -28,13 +28,8 @@ fn default_inbound_cap() -> usize {
 /// What a `Subscribe` is configured with.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SubscribeParams {
-    pub transport: Transport,
-    /// The target's telemetry namespace, which its identity carries.
-    #[serde(default)]
-    pub namespace: Option<String>,
-    /// This link's name, so a peer can tell one of a target's links from another.
-    #[serde(default)]
-    pub link: String,
+    #[serde(flatten)]
+    pub link: LinkParams,
     /// The size of the per-connection pending write buffer.
     #[serde(default = "default_conn_cap")]
     pub conn_cap: usize,
@@ -51,8 +46,8 @@ pub struct Subscribe {
 impl Subscribe {
     /// Binds the transport, so a taken address fails the build.
     pub fn new(params: SubscribeParams) -> Result<Self, ParamError> {
-        let endpoint = params.transport.bind()?;
-        super::record_bound(&params.link, &endpoint);
+        let endpoint = params.link.transport.bind()?;
+        super::record_bound(&params.link.link, &endpoint);
         Ok(Self {
             endpoint: Some(endpoint),
             params,
@@ -78,11 +73,11 @@ pub async fn subscribe(
     let msgs: Vec<PacketId> = ids(&ports, PacketTy::Msg);
     let table_ids: Vec<PacketId> = tables.iter().map(|(id, _)| *id).collect();
     let SubscribeParams {
-        namespace,
-        link,
+        link: LinkParams {
+            namespace, link, ..
+        },
         conn_cap,
         inbound_cap,
-        ..
     } = &s.params;
 
     // PANIC Safety: a system runs once, and the endpoint is the bind's.

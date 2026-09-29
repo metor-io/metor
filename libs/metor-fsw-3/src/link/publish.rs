@@ -16,20 +16,15 @@ use crate::{Stop, system};
 
 use super::conn::{self, Connections, Event};
 use super::inbox::Inbox;
-use super::transport::{Endpoint, Transport, source};
+use super::transport::{Endpoint, source};
 use super::wire;
-use super::{LinkStatus, default_conn_cap, report};
+use super::{LinkParams, LinkStatus, default_conn_cap, report};
 
 /// What a `Publish` is configured with.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PublishParams {
-    pub transport: Transport,
-    /// The target's telemetry namespace, which every leaf hangs under.
-    #[serde(default)]
-    pub namespace: Option<String>,
-    /// This link's name, so a subscriber can tell one of a target's links from another.
-    #[serde(default)]
-    pub link: String,
+    #[serde(flatten)]
+    pub link: LinkParams,
     /// The size of the per-connection pending write buffer, and of a batch.
     #[serde(default = "default_conn_cap")]
     pub conn_cap: usize,
@@ -44,8 +39,8 @@ pub struct Publish {
 impl Publish {
     /// Binds the transport, so a taken address fails the build.
     pub fn new(params: PublishParams) -> Result<Self, ParamError> {
-        let endpoint = params.transport.bind()?;
-        super::record_bound(&params.link, &endpoint);
+        let endpoint = params.link.transport.bind()?;
+        super::record_bound(&params.link.link, &endpoint);
         Ok(Self {
             endpoint: Some(endpoint),
             params,
@@ -64,10 +59,10 @@ pub async fn publish(
 ) {
     let defs: Vec<PortDef> = inputs.iter_mut().map(|(def, _)| def.clone()).collect();
     let PublishParams {
-        namespace,
-        link,
+        link: LinkParams {
+            namespace, link, ..
+        },
         conn_cap,
-        ..
     } = &s.params;
     let (blob, ids) = wire::announce(&defs, namespace.as_deref(), link);
     report_collisions(log, &defs, &ids);

@@ -227,10 +227,10 @@ impl System for Trap {
 }
 
 /// Records the port name and bytes of every dynamic input, each cycle.
-pub struct Tap(Recorder);
+pub struct Tap(pub Recorder);
 
 #[crate::system]
-fn tap(#[state] s: &mut Tap, inputs: &mut DynInputs) {
+pub fn tap(#[state] s: &mut Tap, inputs: &mut DynInputs) {
     for (def, input) in inputs.iter_mut() {
         for record in input.drain() {
             let Ok(bytes) = record else { continue };
@@ -243,10 +243,10 @@ fn tap(#[state] s: &mut Tap, inputs: &mut DynInputs) {
 }
 
 /// Writes one fixed record onto every port the config gave it.
-pub struct Emit(Vec<u8>);
+pub struct Emit(pub Vec<u8>);
 
 #[crate::system]
-fn emit(#[state] s: &mut Emit, outputs: &mut DynOutputs) {
+pub fn emit(#[state] s: &mut Emit, outputs: &mut DynOutputs) {
     for (_, output) in outputs.iter_mut() {
         let _ = output.write_bytes(&s.0);
     }

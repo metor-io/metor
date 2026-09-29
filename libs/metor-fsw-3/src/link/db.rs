@@ -2,7 +2,6 @@
 //! it and serving the store to whoever connects.
 
 use core::cell::Cell;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -11,8 +10,6 @@ use metor_db::{DB, Server};
 use metor_fsw_3_ring::Notifier;
 use metor_proto::types::{PacketId, Timestamp, table_id};
 use metor_proto_wkt::VTableMsg;
-use schemars::JsonSchema;
-use serde::Deserialize;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::coordinator::ParamError;
@@ -21,27 +18,9 @@ use crate::port::{DynInputs, Output};
 use crate::record::RecordSchema;
 use crate::{Frame, Stop, system};
 
-use super::transport::{Endpoint, Transport};
+use super::DbParams;
+use super::transport::Endpoint;
 use super::wire;
-
-/// What a `Db` is configured with.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct DbParams {
-    /// Where the db listens
-    pub transport: Transport,
-    /// The store's directory; unset, a fresh one under the temp dir.
-    #[serde(default)]
-    pub path: Option<PathBuf>,
-    /// The target's telemetry namespace, which the store identifies as.
-    #[serde(default)]
-    pub namespace: Option<String>,
-    /// This system's name.
-    #[serde(default)]
-    pub link: String,
-    /// The messages subscribers take through this db, which `metor build` fills.
-    #[serde(default)]
-    pub command_ids: Vec<PacketId>,
-}
 
 /// What a `Db` reports about what it ingested, each cycle its counters change.
 #[derive(
@@ -76,15 +55,19 @@ impl Db {
     /// Binds the listener and opens or creates the store, so a taken address
     /// or an unwritable path fails the build.
     pub fn new(params: DbParams) -> Result<Self, ParamError> {
-        let endpoint = params.transport.bind()?;
-        super::record_bound(&params.link, &endpoint);
+        let endpoint = params.link.transport.bind()?;
+        super::record_bound(&params.link.link, &endpoint);
         if endpoint.listener().is_none() {
             return Err(ParamError::Decode(
                 "a db listens; it takes no `connect`".into(),
             ));
         }
         let path = params.path.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("metor-db-{}-{}", params.link, std::process::id()))
+            std::env::temp_dir().join(format!(
+                "metor-db-{}-{}",
+                params.link.link,
+                std::process::id()
+            ))
         });
         let store = if path.exists() {
             DB::open(path.clone())
@@ -115,7 +98,10 @@ pub async fn db(
     let endpoint = s.endpoint.take().expect("one run per instance");
     let db = s.db.clone();
     let sinks = announce(&db, inputs, log);
-    db.set_identity(s.params.namespace.clone(), s.params.command_ids.clone());
+    db.set_identity(
+        s.params.link.namespace.clone(),
+        s.params.command_ids.clone(),
+    );
     let addr = endpoint.local_addr();
     if let Some(addr) = addr {
         log.info(format!("serving {} on {addr}", db.path.display()));
@@ -279,6 +265,7 @@ mod tests {
 
     use crate::DefCx;
     use crate::async_system::stop_pair;
+    use crate::link::{LinkParams, Transport};
     use crate::port::Input;
     use crate::record::Record;
     use crate::system::{InputBinding, SystemInputs};
@@ -452,12 +439,14 @@ mod tests {
     #[test]
     fn test_reject_connect_transport() {
         let params = DbParams {
-            transport: Transport::Connect {
-                addr: "127.0.0.1:1".into(),
+            link: LinkParams {
+                transport: Transport::Connect {
+                    addr: "127.0.0.1:1".into(),
+                },
+                namespace: None,
+                link: "db".into(),
             },
             path: None,
-            namespace: None,
-            link: "db".into(),
             command_ids: Vec::new(),
         };
         let Err(ParamError::Decode(message)) = Db::new(params) else {
@@ -470,13 +459,15 @@ mod tests {
     fn test_open_store_at_path() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let params = DbParams {
-            transport: Transport::Listen {
-                addr: "127.0.0.1:0".into(),
-                max_connections: 1,
+            link: LinkParams {
+                transport: Transport::Listen {
+                    addr: "127.0.0.1:0".into(),
+                    max_connections: 1,
+                },
+                namespace: Some("gw".into()),
+                link: "db".into(),
             },
             path: Some(dir.path().join("store")),
-            namespace: Some("gw".into()),
-            link: "db".into(),
             command_ids: vec![[1, 2]],
         };
         let db = Db::new(params).expect("a free port and a writable dir");
