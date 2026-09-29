@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use common::{Ping, fixture_lib, fixture_wasm};
-use metor_fsw_3::cli::cargo::{WASM_TRIPLE, cdylib_name, triple, wasm_name};
-use metor_fsw_3::cli::config::{CONFIG_VERSION, DeploymentConfig, TargetConfig};
 use metor_fsw_3::deploy::{self, DeployError};
+use metor_fsw_3::deploy::{CONFIG_VERSION, DeploymentConfig, TargetConfig};
 use metor_fsw_3::dl::store;
+use metor_fsw_3::dl::{WASM_TRIPLE, cdylib_name, triple, wasm_name};
 use metor_fsw_3::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };

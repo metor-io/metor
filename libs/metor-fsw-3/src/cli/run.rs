@@ -13,12 +13,11 @@ use std::sync::Arc;
 use tracing_subscriber::layer::SubscriberExt;
 
 use super::cargo::{lookup, read_toml, string};
-use super::config::{ConfigError, DeploymentConfig, PackRef, TargetConfig};
 use super::pack_dev::{PackDevError, pack_dev};
 use crate::coordinator::{BuildError, Clock, Coordinator, SystemTable};
-use crate::deploy::{self, DeployError};
+use crate::deploy::{self, ConfigError, DeployError, DeploymentConfig, TargetConfig};
 use crate::dl::store;
-use crate::dl::{Pack, PackError};
+use crate::dl::{Pack, PackError, PackRef};
 use crate::pack::ABI_VERSION;
 
 /// The metor-config package in this checkout, for an in-repo run.

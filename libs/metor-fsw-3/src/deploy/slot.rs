@@ -6,10 +6,11 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use super::DeploymentConfig;
 use crate::FrameStr;
-use crate::cli::config::{DeploymentConfig, PackRef};
 use crate::coordinator::{SystemConfig, SystemTable};
 use crate::def::{DefCx, DefError};
+use crate::dl::PackRef;
 use crate::dl::{Pack, SLOT_TYPE, slot::same_ports, store};
 use crate::pack::def::DefCxOwned;
 use crate::system::SystemDef;

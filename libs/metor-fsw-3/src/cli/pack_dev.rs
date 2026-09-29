@@ -4,13 +4,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use super::cargo::{
-    CargoError, PackConfig, cargo_build, cdylib_name, copy_atomic, triple, wasm_build, write_atomic,
-};
-use super::config::{PackKind, PackRef};
+use super::cargo::{CargoError, PackConfig, cargo_build, wasm_build};
 use super::module::render;
 use crate::coordinator::SystemKind;
-use crate::dl::{DlPack, Pack, PackError};
+use crate::dl::store::{copy_atomic, write_atomic};
+use crate::dl::{DlPack, Pack, PackError, PackKind, PackRef, cdylib_name, triple};
 use crate::pack::ABI_VERSION;
 use crate::pack::def::PackDef;
 

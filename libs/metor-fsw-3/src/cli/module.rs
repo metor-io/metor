@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::config::{PackKind, PackRef};
 use super::pack_dev::PackDevError;
 use crate::channel::ABORT_PORT;
+use crate::dl::{PackKind, PackRef};
 use crate::pack::def::{PackDef, PackSystemDef};
 use crate::record::RecordSchema;
 use crate::system::PortDef;

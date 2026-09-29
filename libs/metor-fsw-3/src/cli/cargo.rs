@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 use super::pack_dev::PackDevError;
+use crate::dl::WASM_TRIPLE;
 
 /// A `CargoError` is why a pack's cdylib or module did not appear.
 #[derive(Debug, thiserror::Error)]
@@ -182,59 +183,6 @@ fn identifier(name: &str) -> String {
     name.replace('-', "_")
 }
 
-/// The host target triple, as cargo prints it.
-pub fn triple() -> String {
-    let arch = std::env::consts::ARCH;
-    #[cfg(target_os = "macos")]
-    let rest = "apple-darwin";
-    #[cfg(all(target_os = "linux", target_env = "musl"))]
-    let rest = "unknown-linux-musl";
-    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-    let rest = "unknown-linux-gnu";
-    format!("{arch}-{rest}")
-}
-
-/// The file name a cdylib of `stem` has on this host.
-pub fn cdylib_name(stem: &str) -> String {
-    format!(
-        "{}{stem}{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
-/// The target a pack is built for as a module.
-pub const WASM_TRIPLE: &str = "wasm32-unknown-unknown";
-
-/// The file name a module of `stem` has.
-pub fn wasm_name(stem: &str) -> String {
-    format!("{stem}.wasm")
-}
-
-/// Copies `src` over `dst` through a temp file beside it, then renames.
-///
-/// macOS kill-caches a code signature by inode, so a dylib written in place
-/// kills the next process to `dlopen` it.
-pub fn copy_atomic(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
-    let tmp = temp_beside(dst);
-    std::fs::copy(src, &tmp)?;
-    std::fs::rename(&tmp, dst)
-}
-
-/// Writes `bytes` to `dst` the way [`copy_atomic`] copies onto it.
-pub fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
-    let tmp = temp_beside(dst);
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, dst)
-}
-
-/// A name for the temp file a replacement is renamed from, unique per process.
-fn temp_beside(dst: &Path) -> PathBuf {
-    let mut name = dst.as_os_str().to_owned();
-    name.push(format!(".tmp{}", std::process::id()));
-    PathBuf::from(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,21 +296,5 @@ mod tests {
             PackConfig::read(dir.path()),
             Err(PackDevError::MissingField("[project] name"))
         ));
-    }
-
-    #[test]
-    fn test_copy_atomic_replaces_file() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let (src, dst) = (dir.path().join("src"), dir.path().join("dst"));
-        std::fs::write(&src, b"new").expect("writes");
-        std::fs::write(&dst, b"old").expect("writes");
-        copy_atomic(&src, &dst).expect("copies");
-        assert_eq!(std::fs::read(&dst).expect("reads"), b"new");
-
-        let names: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("lists")
-            .map(|entry| entry.expect("an entry").file_name())
-            .collect();
-        assert_eq!(names.len(), 2, "no temp file is left: {names:?}");
     }
 }

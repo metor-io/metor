@@ -16,13 +16,12 @@ use std::sync::{Arc, Once, OnceLock};
 
 use adcs_contracts::{AttitudeEstimate, BodyState, DT, ModeCmd, TorqueCmd, tracking_sample};
 use adcs_seqs::Commission;
-use metor_fsw_3::cli::cargo::{cdylib_name, triple};
-use metor_fsw_3::cli::config::{PackKind, PackRef};
 use metor_fsw_3::cli::run::prepare;
 use metor_fsw_3::coordinator::{
     Clock, Coordinator, CoordinatorConfig, EndReason, InputConfig, PortRef, SystemConfig,
     SystemTable,
 };
+use metor_fsw_3::dl::{PackKind, PackRef, cdylib_name, triple};
 use metor_fsw_3::link::register_builtins;
 use metor_fsw_3::{DlPack, Input, Pack, system};
 use metor_proto_wkt::LogEvent;

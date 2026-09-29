@@ -8,10 +8,9 @@ use std::process::Command;
 
 use common::fixture_dir;
 use metor_fsw_3::DlPack;
-use metor_fsw_3::cli::cargo::{
-    PackConfig, WASM_TRIPLE, cargo_build, cdylib_name, triple, wasm_name,
-};
+use metor_fsw_3::cli::cargo::{PackConfig, cargo_build};
 use metor_fsw_3::cli::pack_dev::{PackDevError, pack_dev};
+use metor_fsw_3::dl::{WASM_TRIPLE, cdylib_name, triple, wasm_name};
 
 const GOLDEN: &str = include_str!("golden/echo_pack.py");
 

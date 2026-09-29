@@ -13,11 +13,11 @@ use metor_proto::types::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::cli::config::PackKind;
 use crate::coordinator::{
     Adapter, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, SystemKind, TableEntry,
 };
 use crate::def::{DefCx, DefError};
+use crate::dl::PackKind;
 use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
 use crate::wasm::{Limits, WasmPack};

@@ -5,10 +5,10 @@ mod common;
 use std::path::Path;
 
 use common::{fixture_dir, fixture_wasm, metor};
-use metor_fsw_3::cli::cargo::{WASM_TRIPLE, wasm_name};
-use metor_fsw_3::cli::config::{PackKind, PackRef, TargetConfig};
 use metor_fsw_3::cli::run::{Run, load};
 use metor_fsw_3::coordinator::CoordinatorConfig;
+use metor_fsw_3::deploy::TargetConfig;
+use metor_fsw_3::dl::{PackKind, PackRef, WASM_TRIPLE, wasm_name};
 use metor_fsw_3::{InputConfig, SystemConfig, Timestamp};
 
 #[test]

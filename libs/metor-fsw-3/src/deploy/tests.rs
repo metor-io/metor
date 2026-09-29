@@ -2,7 +2,7 @@ use metor_proto_wkt::LogEvent;
 use serde_json::json;
 
 use super::*;
-use crate::cli::config::{CONFIG_VERSION, TargetConfig};
+use super::{CONFIG_VERSION, TargetConfig};
 use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig, PeerPort, SystemConfig};
 use crate::record::Record;
 use crate::tests::utils::{Recorder, imu_source, table};

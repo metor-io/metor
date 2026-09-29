@@ -2,6 +2,7 @@
 //! address or the definition it stands for, so a target then builds from its
 //! own packs alone.
 
+mod config;
 mod error;
 mod index;
 mod slot;
@@ -11,10 +12,10 @@ use std::collections::HashMap;
 use metor_proto::types::PacketId;
 use serde_json::{Value, json};
 
-use crate::cli::config::DeploymentConfig;
 use crate::coordinator::{OutputSource, PeerLink, SystemTable};
 use crate::record::RecordSchema;
 
+pub use config::{CONFIG_VERSION, ConfigError, DeploymentConfig, TargetConfig};
 pub use error::DeployError;
 use index::{At, DefIndex};
 pub use slot::resolve_slots;

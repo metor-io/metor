@@ -28,7 +28,7 @@ pub fn put(store: &Path, artifact: &Path) -> io::Result<Stored> {
     let path = dir.join(name);
     if !path.exists() {
         std::fs::create_dir_all(&dir)?;
-        crate::cli::cargo::copy_atomic(artifact, &path)?;
+        copy_atomic(artifact, &path)?;
     }
     Ok(Stored { path, hash })
 }
@@ -69,6 +69,30 @@ impl Hashed {
             Ok(true)
         }
     }
+}
+
+/// Copies `src` over `dst` through a temp file beside it, then renames.
+///
+/// macOS kill-caches a code signature by inode, so a dylib written in place
+/// kills the next process to `dlopen` it.
+pub fn copy_atomic(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+    let tmp = temp_beside(dst);
+    std::fs::copy(src, &tmp)?;
+    std::fs::rename(&tmp, dst)
+}
+
+/// Writes `bytes` to `dst` the way [`copy_atomic`] copies onto it.
+pub fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    let tmp = temp_beside(dst);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, dst)
+}
+
+/// A name for the temp file a replacement is renamed from, unique per process.
+fn temp_beside(dst: &Path) -> PathBuf {
+    let mut name = dst.as_os_str().to_owned();
+    name.push(format!(".tmp{}", std::process::id()));
+    PathBuf::from(name)
 }
 
 #[cfg(test)]
@@ -122,5 +146,21 @@ mod tests {
         assert_ne!(first.path, second.path);
         assert_eq!(std::fs::read(&first.path).expect("reads"), b"one");
         assert!(second.path.starts_with(&store));
+    }
+
+    #[test]
+    fn test_copy_atomic_replaces_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (src, dst) = (dir.path().join("src"), dir.path().join("dst"));
+        std::fs::write(&src, b"new").expect("writes");
+        std::fs::write(&dst, b"old").expect("writes");
+        copy_atomic(&src, &dst).expect("copies");
+        assert_eq!(std::fs::read(&dst).expect("reads"), b"new");
+
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("lists")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "no temp file is left: {names:?}");
     }
 }

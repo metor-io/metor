@@ -2,6 +2,7 @@
 
 pub(crate) mod codec;
 mod pack;
+mod pack_ref;
 pub mod slot;
 pub mod store;
 
@@ -17,6 +18,7 @@ use crate::wasm::{Trap, WasmError, WasmPack};
 
 pub(crate) use pack::is_loaded;
 pub use pack::{DlPack, DlStep};
+pub use pack_ref::{PackKind, PackRef, WASM_TRIPLE, cdylib_name, triple, wasm_name};
 
 /// A `PackError` is why an artifact is no usable pack.
 #[derive(Debug, thiserror::Error)]
