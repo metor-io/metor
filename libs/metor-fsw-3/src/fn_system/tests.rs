@@ -723,3 +723,121 @@ fn test_async_sample_refused() {
         })
     ));
 }
+
+/// Writes `a` samples on `a` and `b` on `b` each cycle.
+struct Flood {
+    a: usize,
+    b: usize,
+}
+
+#[crate::system]
+fn flood(#[state] s: &mut Flood, a: &mut Output<Imu>, b: &mut Output<Imu>) {
+    for _ in 0..s.a {
+        let _ = a.write(&Imu::new(0, 0.0));
+    }
+    for _ in 0..s.b {
+        let _ = b.write(&Imu::new(0, 0.0));
+    }
+}
+
+/// A ring two `Imu` records fill, which nothing drains.
+fn two_record_ring() -> metor_fsw_3_ring::RingBuffer {
+    metor_fsw_3_ring::RingBuffer::create_in_memory(metor_fsw_3_ring::Config {
+        capacity: 64,
+        max_readers: 1,
+    })
+}
+
+/// The log lines `flood` writes over `cycles` cycles into two-record rings.
+fn flooded(a: usize, b: usize, cycles: i64) -> Vec<LogEvent> {
+    use crate::coordinator::MakeCx;
+    use crate::thread::Threads;
+
+    let mut table = SystemTable::new();
+    table
+        .register("flood", flood(), move || Flood { a, b })
+        .expect("valid records");
+    let entry = table.get("flood").expect("registered");
+    let (ring_a, ring_b, log) = (two_record_ring(), two_record_ring(), ring::<LogEvent>(8, 1));
+    let _readers = (input::<Imu>(&ring_a), input::<Imu>(&ring_b));
+    let mut lines = input::<LogEvent>(&log);
+    let mut threads = Threads::new();
+    let mut step = (entry.make)(MakeCx {
+        id: "flood",
+        adapter: None,
+        def: &entry.def.clone(),
+        params: crate::coordinator::Params(&json!(null)),
+        inputs: Vec::new(),
+        outputs: vec![&ring_a, &ring_b, &log],
+        threads: &mut threads,
+    })
+    .expect("no params");
+    let mut seen = Vec::new();
+    for cycle in 1..=cycles {
+        step.execute(Timestamp(cycle));
+        seen.extend(lines.drain().map(|line| line.expect("decodes")));
+    }
+    seen
+}
+
+fn is_publish_dropped(line: &LogEvent) -> bool {
+    line.level == LogLevel::Error && line.fields == [("kind".into(), "publish_dropped".into())]
+}
+
+#[test]
+fn test_full_ring_faults_each_cycle() {
+    let lines = flooded(3, 0, 2);
+    assert!(lines.iter().all(is_publish_dropped), "{lines:?}");
+    let seen: Vec<_> = lines
+        .iter()
+        .map(|line| (line.timestamp, line.message.as_ref()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (Timestamp(1), "1 writes dropped"),
+            (Timestamp(2), "3 writes dropped")
+        ]
+    );
+}
+
+#[test]
+fn test_no_failed_write_logs_nothing() {
+    assert!(flooded(1, 1, 2).is_empty());
+}
+
+#[test]
+fn test_failed_writes_sum_across_outputs() {
+    let lines = flooded(3, 4, 1);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(is_publish_dropped(&lines[0]));
+    assert_eq!(lines[0].message, "3 writes dropped");
+}
+
+/// Two declared outputs, for binding by hand.
+struct TwoOutputs;
+
+impl Ports for TwoOutputs {
+    type State = ();
+    type Params = (Output<Imu>, Output<Imu>);
+    const NAME: &'static str = "two_outputs";
+    const NAMES: &'static [&'static str] = &["a", "b"];
+}
+
+#[test]
+fn test_outputs_share_one_counter() {
+    use crate::system::{OutputBinding, SystemOutputs};
+
+    let rings = [ring::<Imu>(8, 1), ring::<Imu>(8, 1), ring::<LogEvent>(8, 1)];
+    let defs = OutSet::<TwoOutputs>::defs(&DefCx::empty()).expect("static ports");
+    let bindings = defs
+        .into_iter()
+        .zip(&rings)
+        .map(|(def, ring)| OutputBinding {
+            def,
+            writer: ring.writer(NoWake).expect("free writer"),
+        })
+        .collect();
+    let set = OutSet::<TwoOutputs>::bind(bindings);
+    assert_eq!(std::sync::Arc::strong_count(&set.dropped), 3);
+}

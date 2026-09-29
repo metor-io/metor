@@ -74,6 +74,15 @@ async fn one_sample(seq: &Seq, imu: &mut Output<Imu>) -> Result<(), SeqError> {
     Ok(())
 }
 
+/// Writes more samples in one poll than its ring holds, then ends.
+#[crate::sequence]
+async fn flood(seq: &Seq, imu: &mut Output<Imu>) -> Result<(), SeqError> {
+    for _ in 0..64 {
+        let _ = imu.write(&Imu::new(seq.now().0, 1.0));
+    }
+    Ok(())
+}
+
 /// Asks for an abort from its second cycle on.
 #[crate::system]
 fn aborter(#[state] cycles: &mut u64, abort: &mut Output<AbortRequest>) {
@@ -165,6 +174,24 @@ fn test_def_reads_abort_first() {
     assert_eq!(inputs, ["abort"]);
     assert_eq!(outputs, ["imu", "log"]);
     assert_eq!(def.name, "one_sample");
+}
+
+#[test]
+fn test_failed_writes_fault_after_the_poll() {
+    let (mut step, rings) = step_of(flood(), ());
+    let mut samples = utils::input::<Imu>(&rings[0]);
+    let mut lines = utils::input::<metor_proto_wkt::LogEvent>(&rings[1]);
+    step.execute(ms(1));
+    assert_eq!(step.ended(), Some(&EndReason::Completed));
+    let landed = samples.drain().count();
+    let lines: Vec<_> = lines.drain().map(|line| line.expect("decodes")).collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].level, LogLevel::Error);
+    assert_eq!(
+        lines[0].fields,
+        vec![("kind".into(), "publish_dropped".into())]
+    );
+    assert_eq!(lines[0].message, format!("{} writes dropped", 64 - landed));
 }
 
 #[test]

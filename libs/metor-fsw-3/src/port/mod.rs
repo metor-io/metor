@@ -4,7 +4,9 @@ use core::borrow::Borrow;
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::ops::Deref;
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::coordinator::OutputSource;
 use crate::def::{DefCx, DefError};
@@ -95,12 +97,31 @@ pub struct Output<T: ?Sized, W: WakeSource = NoWake> {
     /// The longest record this port takes: the type's bound, or the binding's
     /// for a dynamic port, whose record the type does not know.
     max_len: usize,
+    /// Failed writes, shared with every output bound beside this one.
+    dropped: Arc<AtomicU32>,
     _t: PhantomData<T>,
+}
+
+impl<T: ?Sized, W: WakeSource> Output<T, W> {
+    /// Counts a failed write, saturating, and passes the result on.
+    fn counted(&self, result: Result<(), SendError>) -> Result<(), SendError> {
+        if result.is_err() {
+            let _ = self
+                .dropped
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1));
+        }
+        result
+    }
 }
 
 impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
     /// Binds a writer. A record aligned above the ring guarantee fails the build.
     pub fn new(writer: Writer<W>) -> Self {
+        Self::counting(writer, Arc::default())
+    }
+
+    /// Binds a writer whose failed writes count into `dropped`.
+    pub fn counting(writer: Writer<W>, dropped: Arc<AtomicU32>) -> Self {
         const {
             assert!(
                 T::ALIGN <= PAYLOAD_ALIGNMENT,
@@ -111,6 +132,7 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
             writer,
             scratch: Cell::new(Some(vec![0; T::MAX_LEN].into_boxed_slice())),
             max_len: T::MAX_LEN,
+            dropped,
             _t: PhantomData,
         }
     }
@@ -130,9 +152,13 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
         }
     }
 
-    /// Publishes one value as one record.
+    /// Publishes one value as one record, counting a failure.
     /// An `encode` that writes to this same port gets [`SendError::Busy`].
     pub fn write(&self, value: &T) -> Result<(), SendError> {
+        self.counted(self.encode_write(value))
+    }
+
+    fn encode_write(&self, value: &T) -> Result<(), SendError> {
         let mut scratch = Lent::take(&self.scratch)?;
         let bytes = value.encode(&mut scratch.buf).map_err(SendError::Encode)?;
         let bytes = bounded(bytes, self.max_len)?;
@@ -144,18 +170,26 @@ impl<W: WakeSource> Output<Bytes, W> {
     /// Binds a dynamic port's writer, bounding it by the record `max_len` its
     /// binding named.
     pub fn bytes(writer: Writer<W>, max_len: usize) -> Self {
+        Self::bytes_counting(writer, max_len, Arc::default())
+    }
+
+    /// Binds a dynamic port's writer whose failed writes count into `dropped`.
+    pub fn bytes_counting(writer: Writer<W>, max_len: usize, dropped: Arc<AtomicU32>) -> Self {
         Self {
             writer,
             scratch: Cell::new(Some(Box::default())),
             max_len,
+            dropped,
             _t: PhantomData,
         }
     }
 
-    /// Publishes a record's bytes as they arrived, without encoding.
+    /// Publishes a record's bytes as they arrived, without encoding, counting
+    /// a failure.
     pub fn write_bytes(&self, bytes: &[u8]) -> Result<(), SendError> {
-        let bytes = bounded(bytes, self.max_len)?;
-        self.writer.try_write(bytes).map_err(SendError::Ring)
+        let written = bounded(bytes, self.max_len)
+            .and_then(|bytes| self.writer.try_write(bytes).map_err(SendError::Ring));
+        self.counted(written)
     }
 }
 
@@ -335,6 +369,18 @@ pub struct DynOutputs<W: WakeSource = NoWake> {
 }
 
 impl<W: WakeSource> DynOutputs<W> {
+    /// Binds every port, their failed writes counting into `dropped`.
+    pub fn counting(outputs: Vec<OutputBinding<W>>, dropped: &Arc<AtomicU32>) -> Self {
+        let ports = outputs
+            .into_iter()
+            .map(|b| {
+                let output = Output::bytes_counting(b.writer, b.def.max_len, dropped.clone());
+                (b.def, output)
+            })
+            .collect();
+        Self { ports }
+    }
+
     /// Every port's definition and the writer publishing on it.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Output<Bytes, W>)> {
         self.ports.iter_mut().map(|(def, output)| (&*def, output))
@@ -347,14 +393,7 @@ impl<W: WakeSource> SystemOutputs<W> for DynOutputs<W> {
     }
 
     fn bind(outputs: Vec<OutputBinding<W>>) -> Self {
-        let ports = outputs
-            .into_iter()
-            .map(|b| {
-                let output = Output::bytes(b.writer, b.def.max_len);
-                (b.def, output)
-            })
-            .collect();
-        Self { ports }
+        Self::counting(outputs, &Arc::default())
     }
 }
 
@@ -562,6 +601,44 @@ mod tests {
             out.write(&Imu::new(2, 2.0)),
             Err(SendError::Ring(WriteError::WouldBlock))
         );
+    }
+
+    #[test]
+    fn test_full_ring_write_counts() {
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: 64,
+            max_readers: 1,
+        });
+        let dropped = Arc::new(AtomicU32::new(0));
+        let writer = ring.writer(NoWake).expect("free writer");
+        let out = Output::<Imu>::counting(writer, dropped.clone());
+        let _input = input::<Imu>(&ring);
+        out.write(&Imu::new(0, 0.0)).expect("ring has room");
+        out.write(&Imu::new(1, 1.0)).expect("ring has room");
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            out.write(&Imu::new(2, 2.0)),
+            Err(SendError::Ring(WriteError::WouldBlock))
+        );
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        dropped.store(u32::MAX, Ordering::Relaxed);
+        assert!(out.write(&Imu::new(3, 3.0)).is_err());
+        assert_eq!(dropped.load(Ordering::Relaxed), u32::MAX, "saturates");
+    }
+
+    #[test]
+    fn test_oversize_write_counts() {
+        let ring = ring::<Imu>(8, 1);
+        let dropped = Arc::new(AtomicU32::new(0));
+        let writer = ring.writer(NoWake).expect("free writer");
+        let out = Output::bytes_counting(writer, 4, dropped.clone());
+        assert_eq!(
+            out.write_bytes(&[0; 5]),
+            Err(SendError::Oversize { len: 5, max: 4 })
+        );
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        out.write_bytes(&[0; 4]).expect("fits");
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 
     #[test]

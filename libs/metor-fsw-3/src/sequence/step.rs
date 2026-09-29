@@ -2,15 +2,17 @@
 
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::AtomicU32;
 use core::task::{Context, Poll, Waker};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use metor_fsw_3_ring::NoWake;
 use metor_proto::types::Timestamp;
 
 use crate::channel::Abort;
 use crate::coordinator::{EndReason, Step};
-use crate::fn_system::{Cycle, InSet, OutSet, Param};
+use crate::fn_system::{Cycle, InSet, OutSet, Param, report_dropped};
 use crate::log::{self, Log, LogPort};
 use crate::port::{Input, Samplers};
 use crate::system::{InputBinding, OutputBinding, SystemInputs, SystemOutputs};
@@ -26,6 +28,8 @@ pub(crate) struct SequenceStep {
     abort: Abort,
     samplers: Samplers,
     log: LogPort,
+    /// The failed writes of the outputs the future owns.
+    dropped: Arc<AtomicU32>,
     run: Option<Run>,
     end: Option<EndReason>,
 }
@@ -46,7 +50,7 @@ impl SequenceStep {
         let abort = inputs.next().expect("the abort binding");
         let abort = Input::new(abort.views);
         let InSet { ins, samplers } = InSet::<S>::bind(inputs.collect());
-        let OutSet { outs, log } = OutSet::<S>::bind(outputs);
+        let OutSet { outs, log, dropped } = OutSet::<S>::bind(outputs);
         let seq = Rc::new(Seq::new());
         Self {
             run: Some(Box::pin(run::<S>(state, ins, outs, seq.clone()))),
@@ -54,6 +58,7 @@ impl SequenceStep {
             seq,
             abort: Abort::new(abort),
             log,
+            dropped,
             end: None,
         }
     }
@@ -136,6 +141,7 @@ impl Step for SequenceStep {
             ..
         } = self;
         let polled = log::with_log_port(log, now, || advance(seq, samplers, run));
+        report_dropped(log, &self.dropped, now);
         if let Poll::Ready(result) = polled {
             self.run = None;
             self.samplers = Samplers::default();
@@ -148,6 +154,7 @@ impl Step for SequenceStep {
         let _ = self.seq.abort();
         let run = &mut self.run;
         log::with_log_port(&mut self.log, now, || drop(run.take()));
+        report_dropped(&mut self.log, &self.dropped, now);
     }
 
     fn ended(&self) -> Option<&EndReason> {

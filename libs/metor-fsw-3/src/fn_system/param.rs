@@ -1,6 +1,8 @@
 //! The [`Param`] trait, one per system fn parameter type, and its tuple impls.
 
+use core::sync::atomic::AtomicU32;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use metor_fsw_3_ring::WakeSink;
 use metor_proto::types::Timestamp;
@@ -12,7 +14,7 @@ use crate::log::Log;
 use crate::port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers};
 use crate::record::Record;
 use crate::sequence::Seq;
-use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
+use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs};
 
 /// The bindings a bundle binds from, in parameter order: each declared
 /// parameter takes one, and the one dynamic parameter that bound any takes
@@ -53,8 +55,11 @@ pub struct Views<W: WakeSink> {
     pub(crate) samplers: Samplers,
 }
 
-/// "Writers" are bound outputs
-pub type Writers = Bindings<OutputBinding>;
+/// "Writers" are bound outputs, plus the counter their failed writes share.
+pub struct Writers {
+    pub(crate) bindings: Bindings<OutputBinding>,
+    pub(crate) dropped: Arc<AtomicU32>,
+}
 /// A bundles parameter names
 pub type ParamNames<'n> = core::slice::Iter<'n, &'static str>;
 
@@ -289,8 +294,11 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
     fn bind_out(writers: &mut Writers) -> Self::Out {
         // PANIC Safety: the coordinator binds one writer per declared output;
         // a mismatch is a coordinator bug.
-        let binding = writers.next().expect("one binding per output param");
-        Output::new(binding.writer)
+        let binding = writers
+            .bindings
+            .next()
+            .expect("one binding per output param");
+        Output::counting(binding.writer, writers.dropped.clone())
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
@@ -352,7 +360,7 @@ impl Param for DynOutputs {
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
     fn bind_out(writers: &mut Writers) -> Self::Out {
-        SystemOutputs::bind(writers.take())
+        DynOutputs::counting(writers.bindings.take(), &writers.dropped)
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(

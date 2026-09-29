@@ -20,6 +20,7 @@ use crate::{
 pub use ctor::Ctor;
 use param::Defs;
 pub use param::{Cycle, Param, ParamNames, Views, Writers};
+pub(crate) use set::report_dropped;
 pub use set::{InSet, LOG_PORT, OutSet};
 
 /// A `Ports` names one authored system's parameters, which are its ports.
@@ -124,6 +125,7 @@ impl<S: SystemFn> System for FnSystem<S> {
                 S::Params::get(&mut inputs.ins, &mut outputs.outs, &mut cx),
             );
         });
+        outputs.report_dropped(now);
     }
 
     /// Writes the panic as a fault line on the system's own `log` output.

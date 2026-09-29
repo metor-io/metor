@@ -44,6 +44,9 @@
 //! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
 //!
+//! A write that fails, into a full ring say, returns its error and counts
+//! toward one `publish_dropped` fault on the system's `log` after the cycle.
+//!
 //! A fn without `#[state]` is stateless and registers with
 //! `Default::default`. `nav()` derefs to a fn pointer, so a test calls the
 //! system directly: `nav()(&mut state, &mut gps, &mut out)`.
