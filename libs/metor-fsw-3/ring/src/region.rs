@@ -1,4 +1,6 @@
-//! Shared layout and validation. Field order is part of the region format.
+//! The region's memory layout and header validation.
+//!
+//! Field order is part of the on-disk and shared-memory format.
 
 use crate::backing::Backing;
 use crate::sync::AtomicU64;
@@ -7,12 +9,14 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub(super) const MAGIC: u32 = u32::from_ne_bytes(*b"MFR1");
 
-/// Shared-memory format version. Change it when the layout becomes incompatible.
+/// The region format version. Bump it whenever the layout changes incompatibly.
 pub(super) const VERSION: u16 = 6;
 
 pub(super) const RECORD_HEADER_SIZE: usize = PAYLOAD_ALIGNMENT;
 
-/// Immutable region metadata. `IntoBytes` checks that the layout has no padding.
+/// Region metadata that never changes after initialization.
+///
+/// Deriving `IntoBytes` checks that the struct has no padding.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C, align(8))]
 pub(super) struct RegionHeader {
@@ -27,7 +31,7 @@ pub(super) struct RegionHeader {
     pub(super) arch_tag: u64,
 }
 
-/// Shared writer state. All fields remain atomic after initialization.
+/// The writer's shared state. Every field is atomic.
 #[repr(C)]
 pub(super) struct Control {
     pub(super) committed: AtomicU64,
@@ -36,7 +40,9 @@ pub(super) struct Control {
     pub(super) writer: AtomicU64,
 }
 
-/// One reader cursor and owner, with immutable padding to avoid false sharing.
+/// One reader's entry in the reader table.
+///
+/// The padding fills a cache line so readers do not contend with each other.
 #[repr(C)]
 pub(super) struct ReaderSlot {
     pub(super) cursor: AtomicU64,
@@ -44,7 +50,7 @@ pub(super) struct ReaderSlot {
     pub(super) _pad: [u8; READER_SLOT_PAD],
 }
 
-/// Loom atomics have a larger layout and need no cache-line padding.
+/// Loom atomics are larger, and Loom tests don't need cache-line padding.
 #[cfg(not(ring_loom))]
 pub(super) const READER_SLOT_PAD: usize = 48;
 #[cfg(ring_loom)]
@@ -52,7 +58,7 @@ pub(super) const READER_SLOT_PAD: usize = 0;
 
 pub(super) const OFF_CONTROL: usize = 0x40;
 
-/// Start of the reader table. Loom requires extra space for its atomics.
+/// The start of the reader table. Loom needs extra space for its atomics.
 #[cfg(not(ring_loom))]
 pub(super) const HEADER_SIZE: usize = 0x80;
 #[cfg(ring_loom)]
@@ -68,12 +74,17 @@ const _: () = {
 };
 pub(super) const READER_SLOT_SIZE: usize = size_of::<ReaderSlot>();
 
-/// A free slot. Aligned record positions never equal this value.
+/// The cursor value of a free slot.
+///
+/// No aligned record position equals it.
 pub(super) const FREE_SLOT: u64 = u64::MAX;
-/// No wrap gap has been published.
+/// The `hwm` value before any wrap gap has been published.
 pub(super) const HWM_NONE: u64 = u64::MAX;
 
-/// Identifies native endianness. The fixed-width format is shared across pointer widths.
+/// Returns a tag that identifies native endianness.
+///
+/// The format uses fixed-width fields, so 32-bit and 64-bit processes can share
+/// a region.
 pub(super) const fn arch_tag() -> u64 {
     (0x0102_0304u32 as u64) << 32
 }
@@ -110,8 +121,8 @@ pub(super) fn checked_layout(cfg: &Config) -> Option<Geometry> {
 }
 
 /// # Safety
-/// The backing is aligned, exclusively writable, and large enough for geometry
-/// whose sizes and offsets are valid. No other handle may observe initialization.
+/// The backing is aligned, writable only through this call, and large enough for
+/// a valid `geometry`. No other handle may observe initialization.
 pub(super) unsafe fn init_region(backing: &Backing, geometry: &Geometry) {
     let base = backing.base;
     // SAFETY: checked geometry fits the exclusive, aligned backing.
@@ -144,7 +155,7 @@ pub(super) unsafe fn init_region(backing: &Backing, geometry: &Geometry) {
     }
 }
 
-/// Validated process-local sizes and offsets.
+/// Validated sizes and offsets, in this process's native integer types.
 pub(super) struct Geometry {
     pub(super) total_size: usize,
     pub(super) capacity: u64,
@@ -160,8 +171,8 @@ impl Geometry {
 }
 
 /// # Safety
-/// `base` covers one readable allocation of `region_len` bytes. Header bytes
-/// are initialized and remain immutable during the call.
+/// `base` points to one readable allocation of `region_len` bytes. The header
+/// bytes are initialized and do not change during the call.
 pub(super) unsafe fn read_header(
     base: *mut u8,
     region_len: usize,
@@ -181,7 +192,9 @@ pub(super) unsafe fn read_header(
     validate_header(&hdr, region_len)
 }
 
-/// Validate metadata before forming references into the region.
+/// Checks the header and returns the region's geometry.
+///
+/// Call it before forming any reference into the region.
 pub(super) fn validate_header(
     hdr: &RegionHeader,
     region_len: usize,

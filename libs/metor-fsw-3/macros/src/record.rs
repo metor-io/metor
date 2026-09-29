@@ -1,4 +1,4 @@
-//! `#[derive(Record)]` for messages carried as postcard.
+//! `#[derive(Record)]` for messages encoded with postcard.
 
 use convert_case::{Case, Casing};
 use darling::ast;
@@ -16,7 +16,7 @@ struct RecordField {
     timestamp: bool,
 }
 
-/// The struct being derived plus its `#[record(..)]` attribute.
+/// The type being derived, with its `#[record(..)]` options.
 #[derive(FromDeriveInput)]
 #[darling(attributes(record), supports(struct_any))]
 struct RecordInput {

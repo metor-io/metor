@@ -1,4 +1,4 @@
-"""The few lines of zip a `.pth`-only editable wheel needs."""
+"""Writes an editable wheel that contains only a `.pth` file."""
 
 from __future__ import annotations
 
@@ -17,9 +17,10 @@ def write_editable(
     abi_version: str,
     path: Path,
 ) -> str:
-    """Write `<dist>-<version>-py3-none-any.whl` holding one `.pth` line for `path`.
+    """Writes `<dist>-<version>-py3-none-any.whl` with one `.pth` line for
+    `path`.
 
-    Returns the wheel's file name, as PEP 660 asks of `build_editable`.
+    Returns the wheel's file name, as PEP 660 requires of `build_editable`.
     """
     name = dist.replace("-", "_")
     info = f"{name}-{version}.dist-info"
@@ -59,7 +60,8 @@ def _wheel() -> str:
 
 
 def _record_line(member: str, text: str) -> str:
-    """One RECORD row: the member, its urlsafe base64 sha256, and its size."""
+    """Returns one RECORD row: the member, its urlsafe base64 sha256, and its
+    size."""
     raw = text.encode("utf-8")
     digest = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).rstrip(b"=").decode("ascii")
     return f"{member},sha256={digest},{len(raw)}\n"

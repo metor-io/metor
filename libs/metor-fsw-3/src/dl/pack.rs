@@ -1,4 +1,4 @@
-//! A pack built as a shared library, loaded into this process.
+//! Loads packs that are built as shared libraries into this process.
 
 use core::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -35,7 +35,8 @@ type CreateFn = unsafe extern "C" fn(
 type ExecuteFn = unsafe extern "C" fn(*mut c_void, i64) -> u32;
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
 
-// Resident code may still be used by guest threads and TLS destructors.
+// Libraries are never unloaded, because guest threads and TLS destructors may
+// still run their code.
 static LIBRARIES: Mutex<Vec<(PathBuf, Arc<Library>)>> = Mutex::new(Vec::new());
 
 fn library_key(path: &Path) -> PathBuf {
@@ -75,8 +76,10 @@ unsafe fn descriptor(def_fn: PackDefFn) -> Result<PackDef, PackError> {
     decode_descriptor(status, bytes.as_deref())
 }
 
-/// Calls an export that writes into a host buffer, returning its status and
-/// the bytes it reports writing, or `None` when that is past the buffer.
+/// Calls an export that writes into a host buffer.
+///
+/// Returns the export's status and the bytes it wrote. The bytes are `None` if
+/// the export reported writing more than the buffer holds.
 fn call_export(export: impl FnOnce(*mut u8, usize, *mut usize) -> u32) -> (u32, Option<Vec<u8>>) {
     let mut bytes = vec![0u8; DESCRIPTOR_CAPACITY];
     let mut written = 0;
@@ -86,8 +89,9 @@ fn call_export(export: impl FnOnce(*mut u8, usize, *mut usize) -> u32) -> (u32, 
     (status, fits.then_some(bytes))
 }
 
-/// The exports after the version check, as bare pointers valid while the
-/// library is loaded.
+/// The pack's exported functions, resolved after the version check.
+///
+/// The pointers are valid as long as the library stays loaded.
 #[derive(Clone, Copy)]
 struct PackFns {
     def: DefFn,
@@ -96,7 +100,7 @@ struct PackFns {
     destroy: DestroyFn,
 }
 
-/// A `DlPack` is a loaded pack library and the descriptor it exported.
+/// A pack loaded from a shared library.
 pub struct DlPack {
     lib: Arc<Library>,
     fns: PackFns,
@@ -104,28 +108,31 @@ pub struct DlPack {
 }
 
 impl DlPack {
-    /// Loads a pack, checking its ABI version before anything else.
+    /// Loads the pack at `path`.
+    ///
+    /// The ABI version is checked before any other export is called.
     ///
     /// # Safety
-    /// `path` names a metor-fsw-3 pack built against this ABI; loading a
-    /// library runs the code in its initializers. The artifact must not be
-    /// removed or replaced while this process runs, including during this call.
+    /// `path` must be a metor-fsw-3 pack built against this ABI. Loading a
+    /// library runs its initializers. The file must not be removed or replaced
+    /// while this process runs, including during this call.
     pub unsafe fn open(path: &Path) -> Result<DlPack, PackError> {
         // SAFETY: the caller's contract.
         unsafe { Self::open_with(path, ABI_VERSION) }
     }
 
-    /// As [`open`](DlPack::open), against an ABI version the caller chooses.
-    /// Only a test passes anything but [`ABI_VERSION`].
+    /// Like [`open`](DlPack::open), but expects ABI version `expected`.
+    ///
+    /// Only tests pass something other than [`ABI_VERSION`].
     ///
     /// # Safety
-    /// As [`open`](DlPack::open).
+    /// The same as for [`open`](DlPack::open).
     #[doc(hidden)]
     pub unsafe fn open_with(path: &Path, expected: u32) -> Result<DlPack, PackError> {
         // SAFETY: the caller's contract.
         let lib = unsafe { resident_library(path) }?;
-        // SAFETY: the version export takes nothing and returns a `u32` in
-        // every ABI, which is why it is resolved and called first.
+        // SAFETY: the version export takes no arguments and returns a `u32` in
+        // every ABI version. That is why it is resolved and called first.
         let found = unsafe { symbol::<VersionFn>(&lib, "metor_fsw_abi_version")?() };
         if found != expected {
             return Err(PackError::AbiMismatch { found, expected });
@@ -142,7 +149,7 @@ impl DlPack {
         Ok(DlPack { lib, fns, def })
     }
 
-    /// One exported type's definition under an instance's config.
+    /// Returns the definition of type `ty` for one instance's config.
     pub fn def(&self, ty: &str, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         let cx = encode_def_cx(cx)?;
         // SAFETY: the matched ABI writes only inside this buffer and result slot,
@@ -159,20 +166,22 @@ impl DlPack {
         decode_def(status, bytes.as_deref())
     }
 
-    /// The descriptor this pack exported.
+    /// Returns the descriptor this pack exported.
     pub fn descriptor(&self) -> &PackDef {
         &self.def
     }
 
-    /// The loaded library, shared with every instance created from it.
+    /// Returns the loaded library.
+    ///
+    /// Every instance created from this pack keeps the library loaded.
     pub fn library(&self) -> &Arc<Library> {
         &self.lib
     }
 
-    /// Creates one instance of `ty` over the host's rings.
+    /// Creates one instance of type `ty` on the given rings.
     ///
-    /// `instance` carries the definition the host resolved, including any ports
-    /// the config added, and the adapter the config named.
+    /// `instance` has the definition the host resolved, including any ports the
+    /// config added, and the instance's adapter.
     pub fn create(
         &self,
         ty: &str,
@@ -194,8 +203,9 @@ impl DlPack {
         let ports: Vec<RawSlice> = edges.iter().map(|rings| RawSlice::of(rings)).collect();
         let outs: Vec<RawRing> = output_owners.iter().map(RawRing::of).collect();
         let mut error = RawSlice::EMPTY;
-        // SAFETY: arrays and export owners outlive the call. Guest attachments
-        // retain their backing through host callbacks.
+        // SAFETY: the arrays and the exported ring handles outlive the call. The
+        // pack keeps its own references to the ring memory through host
+        // callbacks.
         let instance = unsafe {
             (self.fns.create)(
                 RawSlice::of(ty.as_bytes()),
@@ -219,15 +229,17 @@ impl DlPack {
     }
 }
 
-/// Resolves one export, naming it when it is missing.
+/// Looks up one exported symbol.
+///
+/// If the symbol is missing, the error includes its name.
 fn symbol<T: Copy>(lib: &Library, name: &'static str) -> Result<T, PackError> {
-    // SAFETY: the name is one of the five the ABI fixes, and `T` is the
-    // signature that version guarantees for it.
+    // SAFETY: the name is one of the exports the ABI defines, and `T` is the
+    // signature this ABI version gives it.
     let symbol = unsafe { lib.get::<T>(name.as_bytes()) };
     Ok(*symbol.map_err(|_| PackError::MissingSymbol(name))?)
 }
 
-/// A `DlStep` is one instance living inside a pack library.
+/// A system instance running inside a pack library.
 pub struct DlStep {
     instance: *mut c_void,
     fns: PackFns,
@@ -247,7 +259,7 @@ impl Step for DlStep {
         self.end = status.end();
     }
 
-    /// Nothing: the pack has already written the fault line.
+    /// Does nothing, because the pack has already logged the fault.
     fn fault(&mut self, _now: Timestamp, _message: &str) {}
 
     fn ended(&self) -> Option<&EndReason> {

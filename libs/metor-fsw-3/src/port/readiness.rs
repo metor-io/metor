@@ -1,4 +1,8 @@
-//! Reusable notification waits, cleared when a readiness future ends.
+//! Waits for an async input to have a record.
+//!
+//! Each input allocates its wait slots when it is created and reuses them, so
+//! waiting does not allocate. The slots are cleared whenever a wait ends or is
+//! dropped.
 
 use core::future::Future;
 use core::pin::Pin;

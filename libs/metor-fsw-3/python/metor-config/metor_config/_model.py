@@ -1,4 +1,4 @@
-"""Records, ports, and the `System` base a generated pack module subclasses."""
+"""Records, ports, and the `System` base class that pack modules build on."""
 
 from __future__ import annotations
 
@@ -12,10 +12,12 @@ T = TypeVar("T", bound="Record")
 
 
 class Record:
-    """Marker base of a record type; a pack module declares one class per record name.
+    """Base class for record types.
 
-    ``_name`` names the record on the host, ``_kind`` says whether it is a
-    ``"frame"`` or a ``"msg"``, and ``_pack`` supplies its descriptor.
+    A record is a type of data that flows between systems. Each pack module
+    declares one `Record` subclass per record it uses. ``_name`` is the
+    record's name on the host, ``_kind`` is ``"frame"`` or ``"msg"``, and
+    ``_pack`` is the pack that defines it.
     """
 
     _name: str = ""
@@ -24,46 +26,46 @@ class Record:
 
 
 class LogEvent(Record):
-    """The log every system writes."""
+    """The log lines every system writes to its ``log`` output."""
 
     _name = "log"
     _kind = "msg"
 
 
 class SystemStatus(Record):
-    """The status the coordinator writes for every system."""
+    """The status frame the coordinator writes for every system."""
 
     _name = "status"
     _kind = "frame"
 
 
 FRAMEWORK_PORTS: dict[str, type[Record]] = {"log": LogEvent, "status": SystemStatus}
-"""The outputs every system has whatever it declared."""
+"""The outputs every system has, whether or not it declares them."""
 
 
 class SequenceCommand(Record):
-    """A command addressed to a channel by name."""
+    """A command sent to a channel. It carries the name of the channel it is for."""
 
     _name = "sequence_command"
     _kind = "msg"
 
 
 class SequenceChannelEvent(Record):
-    """What a channel did with a command, or how its system ended."""
+    """Reports what a channel did with a command, or how its system ended."""
 
     _name = "sequence_channel_event"
     _kind = "msg"
 
 
 class ChannelStatus(Record):
-    """A channel's state, written every cycle."""
+    """A channel's current state. Each channel writes one every cycle."""
 
     _name = "channel_status"
     _kind = "frame"
 
 
 class SequenceRegistry(Record):
-    """Every channel of a target and the names a `Load` on each may name."""
+    """Lists every channel on a target, and the candidates each one can load."""
 
     _name = "sequence_registry"
     _kind = "msg"
@@ -73,12 +75,12 @@ CHANNEL_PORTS: dict[str, type[Record]] = {
     "events": SequenceChannelEvent,
     "channel_status": ChannelStatus,
 }
-"""The outputs a channel adds to the system it wraps."""
+"""The extra outputs a system gets when it runs behind a channel."""
 
 
 @dataclass(frozen=True)
 class PortRef:
-    """One end of an edge: an output port of a named system."""
+    """A reference to one output port of a system, by name."""
 
     system: str
     port: str
@@ -88,10 +90,12 @@ class PortRef:
 
 
 class OutPort(Generic[T]):
-    """An output port carrying record ``T``, read off a handle returned by `Target.add`.
+    """An output port that carries record ``T``.
 
-    ``record`` is the port's record class and ``target`` the `Target` it is on,
-    which a deployment needs to tell two targets' `plant.imu` apart.
+    Get one as an attribute of the handle `Target.add` returns, then pass it
+    to another system's input. ``record`` is the port's record class.
+    ``target`` is the `Target` the port belongs to, so that a deployment can
+    tell ``plant.imu`` on one target from ``plant.imu`` on another.
     """
 
     def __init__(
@@ -107,15 +111,16 @@ class OutPort(Generic[T]):
 
     @property
     def name(self) -> str:
-        """`{system}.{port}`, the name a port list gives this port."""
+        """The port's name in a port list: `{system}.{port}`."""
         return f"{self.ref.system}.{self.ref.port}"
 
 
 class Loop(Generic[T]):
-    """A one-cycle delayed edge carrying record ``T``.
+    """A feedback edge that carries record ``T`` with a one-cycle delay.
 
-    `Target.loop` creates it before its producer exists; `connect` names the
-    producer once.
+    A loop lets a system read from a producer that is added after it. Create
+    one with `Target.loop`, pass it as an input, and call `connect` once the
+    producer exists.
     """
 
     def __init__(self, record: type[T]) -> None:
@@ -132,20 +137,25 @@ class Loop(Generic[T]):
 
 
 Source: TypeAlias = Union[OutPort[T], Loop[T]]
-"""What an input keyword takes: a producer's port or a loop."""
+"""A single input source: an output port, or a loop."""
 
 Sources: TypeAlias = Union[Source[T], Sequence[Source[T]]]
-"""One source or, for fan-in, a sequence of them in edge order."""
+"""One source, or a sequence of sources for fan-in, in edge order."""
 
 Item: TypeAlias = Union["SystemHandle", OutPort[Any]]
-"""What a port list takes: a system's whole handle, or one of its ports."""
+"""An entry in a port list: a system handle, which stands for all of its
+ports, or a single port."""
 
 
 @dataclass(frozen=True)
 class Pack:
-    """A pack as its generated module declares it: the id prefixing every `ty`,
-    the cdylib stem, the per-triple library directory the module locates, and
-    whether `metor pack dev` also staged it as a WebAssembly module."""
+    """A pack, as declared by its generated module.
+
+    ``id`` is the prefix of every system type in the pack. ``lib`` is the
+    cdylib's file stem, and ``libs`` is the directory holding one library per
+    platform triple. ``wasm`` says whether `metor pack dev` also built the
+    pack as a WebAssembly module.
+    """
 
     id: str
     lib: str
@@ -158,10 +168,10 @@ class Pack:
 
 
 class System:
-    """Base of a generated pack-entry class.
+    """Base class for the system classes in a generated pack module.
 
-    A generated module sets three class attributes and forwards its keywords,
-    inputs first, params second::
+    Each subclass sets three class attributes and passes its keyword
+    arguments to ``super().__init__``, inputs first, then params::
 
         class Nav(System):
             _pack = PACK
@@ -175,10 +185,12 @@ class System:
             log: OutPort[LogEvent]
             status: OutPort[SystemStatus]
 
-    `_ty` is the pack's table key, `_ports` every output with its record.
+    `_ty` is the system's type name within the pack, and `_ports` maps every
+    output to its record.
 
-    A type that takes the ports its config lists sets `_takes_inputs` or
-    `_takes_outputs`, and forwards `items` or `records`.
+    Some system types take a list of ports from their config instead of
+    declaring them. Those set `_takes_inputs` or `_takes_outputs`, and pass
+    `items` or `records` through.
     """
 
     _pack: Pack
@@ -186,11 +198,12 @@ class System:
     _ports: dict[str, type[Record]] = {}
     _record_packs: tuple[Pack, ...] = ()
     _takes_inputs: bool = False
-    """Whether this type takes an `items` port list of its own."""
+    """Whether this type takes an `items` list of input ports."""
     _takes_outputs: bool = False
-    """Whether this type takes a `records` list, one output port each."""
+    """Whether this type takes a `records` list, with one output port per
+    record."""
     _name: str = ""
-    """The instance name `Target.add` registered this system under."""
+    """The name this system was given in `Target.add`."""
     _target: Any = None
     """The `Target` this system was added to."""
 
@@ -214,23 +227,28 @@ class System:
         )
 
     def _port_map(self) -> dict[str, type[Record]]:
-        """Every output this instance has, with its record."""
+        """Returns every output of this instance, mapped to its record."""
         return self._ports
 
     def _inputs_for(self, target: Any, index: int) -> dict[str, list[Source[Any]]]:
-        """Resolve inputs for this registration without changing the system."""
+        """Returns the inputs for this registration, without changing the
+        system."""
         return self._inputs
 
     def _outputs_for(self, target: Any, index: int) -> list[dict[str, Any]]:
-        """The `outputs` config entries for this registration."""
+        """Returns the `outputs` config entries for this registration."""
         return self._dyn_outputs
 
     def _params_for(self, target: Any, index: int) -> Any:
-        """The `params` config entry for this registration."""
+        """Returns the `params` config entry for this registration."""
         return self._params or None
 
     def port(self, source: OutPort[T]) -> OutPort[T]:
-        """This system's copy of ``source``, on a system that copies ports."""
+        """Returns this system's copy of ``source``.
+
+        Only systems that copy ports from a peer, like `Subscribe`, support
+        this. Others raise `ConfigError`.
+        """
         return self._port(source, self._name, self._target)
 
     def _port(self, source: OutPort[T], name: str, target: Any) -> OutPort[T]:
@@ -238,7 +256,8 @@ class System:
 
 
 def _item_ports(items: Sequence[Item]) -> list[OutPort[Any]]:
-    """Every port the items name, a handle standing for all of its own."""
+    """Expands port list items into ports. A handle expands to all of its
+    ports."""
     from ._target import SystemHandle
 
     ports: list[OutPort[Any]] = []
@@ -253,7 +272,8 @@ def _item_ports(items: Sequence[Item]) -> list[OutPort[Any]]:
 
 
 def _edges(ports: Sequence[OutPort[Any]]) -> dict[str, list[Source[Any]]]:
-    """One input per port, named `{producer}.{port}`, first mention winning."""
+    """Makes one input per port, named `{producer}.{port}`. If a port appears
+    twice, the first one wins."""
     edges: dict[str, list[Source[Any]]] = {}
     for port in ports:
         edges.setdefault(port.name, [port])
@@ -261,7 +281,7 @@ def _edges(ports: Sequence[OutPort[Any]]) -> dict[str, list[Source[Any]]]:
 
 
 def _unique(names: list[str], what: str) -> list[str]:
-    """`names`, refusing any that repeats."""
+    """Returns `names`, raising `ConfigError` if any name repeats."""
     for name in names:
         if names.count(name) > 1:
             raise ConfigError(f"{what} `{name}` twice")
@@ -287,7 +307,10 @@ def _sources(port: str, sources: Sources[Any]) -> list[Source[Any]]:
 
 
 def _json(value: Any) -> Any:
-    """Params as JSON: nested param dataclasses become objects, sequences arrays."""
+    """Converts params to JSON values.
+
+    Nested param dataclasses become objects, and sequences become arrays.
+    """
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return {f.name: _json(getattr(value, f.name)) for f in dataclasses.fields(value)}
     if isinstance(value, dict):

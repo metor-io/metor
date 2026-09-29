@@ -1,5 +1,8 @@
-//! `metor run`: evaluate a target file, resolve its deployment, load a
-//! target's packs, and cycle its graph.
+//! `metor run` runs a target file.
+//!
+//! It evaluates the file, resolves the deployment it describes, loads the
+//! target's packs, and cycles its systems until stopped. A deployment with
+//! several targets runs each one as a child process.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
@@ -20,15 +23,17 @@ use crate::dl::store;
 use crate::dl::{Pack, PackError, PackRef};
 use crate::pack::ABI_VERSION;
 
-/// The metor-config package in this checkout, for an in-repo run.
+/// The metor-config package in this checkout. Runs inside the repo use it
+/// when it exists.
 const IN_REPO_CONFIG_PY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/python/metor-config");
 
-/// `metor run`'s arguments.
+/// The arguments to `metor run`.
 #[derive(clap::Args, Debug, Default)]
 pub struct Run {
-    /// The target file to evaluate; `./target.py` by default.
+    /// The target file to evaluate. Defaults to `./target.py`.
     pub target: Option<PathBuf>,
-    /// The deployment member to run, by namespace; needed when there are several.
+    /// The namespace of the target to run. Without it, a deployment with
+    /// several targets runs all of them.
     #[arg(long = "target", value_name = "NS")]
     pub member: Option<String>,
     /// Stop after this many cycles instead of on SIGINT.
@@ -45,7 +50,7 @@ pub struct Run {
     pub print_ports: bool,
 }
 
-/// A `RunError` is why a target did not run.
+/// An error running a target.
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
     #[error("running the target file: {0}")]
@@ -74,7 +79,10 @@ pub enum RunError {
     PrintPortsNeedsTarget,
 }
 
-/// Refreshes every dev pack, evaluates the target, and cycles until stopped.
+/// Runs `metor run`.
+///
+/// Rebuilds every dev pack, evaluates the target file, and cycles the target
+/// until it is stopped.
 pub fn run(args: Run) -> Result<(), RunError> {
     install_logging();
     let config = prepare(args.target.as_deref())?;
@@ -105,8 +113,10 @@ pub fn run(args: Run) -> Result<(), RunError> {
     Err(RunError::Latched(latched.join(", ")))
 }
 
-/// Writes the resolved envelope to a temp file and runs every target from it
-/// as a child, until all have exited or SIGINT ends them.
+/// Runs every target in `config` as a child process.
+///
+/// The resolved config is written to a temp file for the children to read.
+/// Returns once every child has exited.
 fn run_children(config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
     let path = std::env::temp_dir().join(format!("metor-deploy-{}.json", std::process::id()));
     std::fs::write(
@@ -124,8 +134,10 @@ fn run_children(config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Writes every bound link address to stdout, for a caller that asked a link to
-/// take any free port.
+/// Prints the address of every bound link to stdout.
+///
+/// A caller that asked a link to bind port zero uses this to learn the real
+/// port.
 fn print_ports() {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
@@ -135,8 +147,9 @@ fn print_ports() {
     let _ = out.flush();
 }
 
-/// Installs the console layer beside the one that queues lines for `log` ports,
-/// both at `$RUST_LOG`'s level or `INFO`.
+/// Sets up tracing to print to stderr and to forward lines to `log` ports.
+///
+/// The level comes from `$RUST_LOG`, and defaults to `INFO`.
 fn install_logging() {
     let level = std::env::var("RUST_LOG")
         .ok()
@@ -146,13 +159,15 @@ fn install_logging() {
         .with(level)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(crate::log::LogLayer);
-    // A host that already installed a subscriber keeps it.
+    // If the host already installed a subscriber, keep it.
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-/// Refreshes every dev pack beside `target`, evaluates it (or reads it, for a
-/// `.json`), and resolves every peer reference, which needs every target's
-/// packs only while a reference remains.
+/// Loads a target file and returns its resolved deployment.
+///
+/// Rebuilds every dev pack next to `target` first. A `.py` file is evaluated,
+/// and a `.json` file is read as is. If the config still has peer references,
+/// every target's packs are opened to resolve them.
 pub fn prepare(target: Option<&Path>) -> Result<DeploymentConfig, RunError> {
     let target = target.unwrap_or(Path::new("target.py"));
     let packs = dev_packs(target.parent().unwrap_or(Path::new(".")));
@@ -178,8 +193,10 @@ pub fn prepare(target: Option<&Path>) -> Result<DeploymentConfig, RunError> {
     Ok(config)
 }
 
-/// The dev packs a target depends on: `[tool.uv.sources]` paths that are both a
-/// cargo crate and a pack.
+/// Returns the dev packs a target depends on.
+///
+/// A dev pack is a `[tool.uv.sources]` path that is both a cargo crate and a
+/// metor pack.
 pub fn dev_packs(target_dir: &Path) -> Vec<PathBuf> {
     let Ok(pyproject) = read_toml(&target_dir.join("pyproject.toml")) else {
         return Vec::new();
@@ -224,7 +241,8 @@ pub fn eval_target(path: &Path, dev_packs: &[PathBuf]) -> Result<DeploymentConfi
     Ok(DeploymentConfig::from_slice(&bytes)?)
 }
 
-/// `$METOR_PYTHON`, else the active virtualenv's, else `python3`.
+/// Returns the Python interpreter to use: `$METOR_PYTHON`, then the active
+/// virtualenv's, then `python3`.
 fn interpreter() -> OsString {
     if let Some(python) = std::env::var_os("METOR_PYTHON") {
         return python;
@@ -235,7 +253,10 @@ fn interpreter() -> OsString {
     }
 }
 
-/// `metor-config` plus every dev pack's generated module, ahead of the inherited path.
+/// Builds the `PYTHONPATH` for a target file.
+///
+/// It lists `metor-config` and every dev pack's generated module, followed
+/// by the inherited `PYTHONPATH`.
 fn python_path(dev_packs: &[PathBuf]) -> OsString {
     let mut entries: Vec<PathBuf> = match std::env::var_os("METOR_CONFIG_PY") {
         Some(config_py) => vec![config_py.into()],
@@ -251,7 +272,10 @@ fn python_path(dev_packs: &[PathBuf]) -> OsString {
     path
 }
 
-/// Applies the clock overrides, opens the target's packs, and builds its graph.
+/// Builds a target's coordinator.
+///
+/// Applies the clock overrides from the command line, then opens the target's
+/// packs.
 pub fn load(config: &TargetConfig, overrides: &Run) -> Result<Coordinator, RunError> {
     let mut config = config.clone();
     if let Some(rate) = overrides.wall {
@@ -266,7 +290,8 @@ pub fn load(config: &TargetConfig, overrides: &Run) -> Result<Coordinator, RunEr
     Ok(config.coordinator.build(&table)?)
 }
 
-/// The built-ins plus every pack `config` names, opened.
+/// Builds the system table for a target: the built-ins plus every pack the
+/// target lists.
 fn table_for(config: &TargetConfig) -> Result<SystemTable, RunError> {
     let mut table = SystemTable::new();
     crate::link::register_builtins(&mut table)?;
@@ -281,14 +306,14 @@ fn table_for(config: &TargetConfig) -> Result<SystemTable, RunError> {
     Ok(table)
 }
 
-/// Set once SIGINT arrived; the run's stop future reads it each cycle.
+/// Set when SIGINT arrives. The run's stop future checks it every cycle.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn interrupt(_signal: core::ffi::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
 
-/// Whether SIGINT has arrived.
+/// Returns true once SIGINT has arrived.
 pub fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
 }
@@ -296,12 +321,13 @@ pub fn interrupted() -> bool {
 /// Makes SIGINT flip [`INTERRUPTED`] instead of killing the process.
 fn watch_sigint() {
     // SAFETY: the handler only stores to an `AtomicBool`, which is
-    // async-signal-safe; no other code path installs a SIGINT handler.
+    // async-signal-safe, and no other code installs a SIGINT handler.
     unsafe { libc::signal(libc::SIGINT, interrupt as *const () as libc::sighandler_t) };
 }
 
-/// Ready on SIGINT, or once `cycles` cycles have run. `Coordinator::run` polls
-/// it once per cycle.
+/// Returns a future that completes on SIGINT, or after `cycles` cycles.
+///
+/// `Coordinator::run` polls it once per cycle, so each poll counts one cycle.
 fn stop(cycles: Option<u64>) -> impl Future<Output = ()> {
     let mut polls = 0;
     poll_fn(move |_| {

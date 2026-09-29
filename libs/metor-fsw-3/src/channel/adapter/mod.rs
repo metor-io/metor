@@ -1,5 +1,8 @@
-//! The channel adapter: a step that wraps one cyclic system and applies the
-//! commands addressed to its channel.
+//! The channel adapter, which puts a cyclic system behind a channel.
+//!
+//! The adapter wraps the system's step. Each cycle it applies the commands
+//! sent to its channel, steps the system if it is running, and reports the
+//! channel's events and status.
 
 use std::sync::Arc;
 
@@ -24,11 +27,14 @@ use super::{
     ABORT_PORT, AbortRequest, COMMANDS_PORT, ChannelState, ChannelStatus, EVENTS_PORT, STATUS_PORT,
 };
 
-/// Records the private abort ring holds.
+/// The number of records the private abort ring holds.
 const ABORT_DEPTH: usize = 4;
 
-/// The system's definition with the channel's ports appended, or the name
-/// of a system port that takes one of theirs.
+/// Appends the channel's ports to a system's definition.
+///
+/// # Errors
+/// Returns the name of a system port that already uses one of the channel's
+/// port names.
 pub(crate) fn def(mut inner: SystemDef, cx: &DefCx<'_>) -> Result<SystemDef, String> {
     let reserved = [COMMANDS_PORT, EVENTS_PORT, STATUS_PORT];
     let mut taken = inner.inputs.iter().chain(&inner.outputs);
@@ -41,8 +47,9 @@ pub(crate) fn def(mut inner: SystemDef, cx: &DefCx<'_>) -> Result<SystemDef, Str
     Ok(inner)
 }
 
-/// The ports every channel adds: its commands input, then its events and
-/// status outputs.
+/// Returns the ports every channel adds.
+///
+/// These are the commands input, then the events and status outputs.
 pub(crate) fn ports(cx: &DefCx<'_>) -> [PortDef; 3] {
     [
         Input::<SequenceCommand>::def(cx, COMMANDS_PORT),
@@ -51,10 +58,11 @@ pub(crate) fn ports(cx: &DefCx<'_>) -> [PortDef; 3] {
     ]
 }
 
-/// Makes the system `make` builds, wrapped in its channel.
+/// Builds a system with `make` and wraps it in a channel.
 ///
-/// `cx.def` is the definition [`def`] returned, so the channel's ports are
-/// the last input and the last two outputs.
+/// Without a channel adapter in `cx`, returns the system unwrapped. `cx.def`
+/// must be the definition [`def`] returned, so the channel's ports are the
+/// last input and the last two outputs.
 pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     let Some(Adapter::Channel(channel)) = cx.adapter else {
         return make(cx);
@@ -101,7 +109,10 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
     }))
 }
 
-/// Binds the system's `abort` input, if it has one, to a ring the adapter writes.
+/// Rebinds the system's `abort` input to a private ring.
+///
+/// Returns the writer the adapter uses to send aborts, or `None` if the
+/// system has no `abort` input.
 fn private_abort(def: &SystemDef, inputs: &mut [Vec<RingBuffer>]) -> Option<Output<AbortRequest>> {
     let at = def.inputs.iter().position(|p| p.name == ABORT_PORT)?;
     let ring = abort_ring();
@@ -119,7 +130,7 @@ fn command_input(rings: Vec<&RingBuffer>) -> Input<SequenceCommand> {
     )
 }
 
-/// A ring the adapter alone writes and the system alone reads.
+/// Creates a ring that only the adapter writes and only the system reads.
 fn abort_ring() -> RingBuffer {
     RingBuffer::create_in_memory(Config {
         // PANIC Safety: a small message record at a small depth fits any host.
@@ -133,7 +144,7 @@ fn writer<T: Record>(ring: &RingBuffer) -> Output<T> {
     Output::new(ring.writer(NoWake).expect("one writer per output ring"))
 }
 
-/// Everything needed to make the system again, over the same rings.
+/// Everything needed to build the system again over the same rings.
 struct SystemRecipe {
     make: Arc<MakeFn>,
     id: String,
@@ -162,7 +173,10 @@ impl SystemRecipe {
     }
 }
 
-/// A `Channel` is the step a system with a channel is bound as.
+/// The step for a system behind a channel.
+///
+/// It applies the commands sent to the channel, then steps the system if it
+/// is running.
 pub struct Channel {
     commands: Input<SequenceCommand>,
     core: Core,
@@ -172,11 +186,12 @@ struct Core {
     name: String,
     run: RunState,
     inner: Option<Box<dyn Step>>,
-    /// An end the adapter set: a failed make, or an unwound step.
+    /// An end the adapter set itself: a failed make, or a step that
+    /// panicked.
     end_reason: Option<EndReason>,
     /// The end last reported on `events`.
     reported_end_reason: Option<EndReason>,
-    /// The last name a `Load` accepted, re-applied after a reset.
+    /// The last name a `Load` accepted. A reset loads it again.
     loaded: Option<String>,
     recipe: SystemRecipe,
     threads: Threads,
@@ -185,7 +200,9 @@ struct Core {
     status: Output<ChannelStatus>,
 }
 
-/// The most of a reason an event carries, so every refusal fits its record.
+/// The longest reason, in bytes, that an event carries.
+///
+/// This keeps every refusal small enough to fit in its record.
 const REASON_CAP: usize = 512;
 
 impl Step for Channel {
@@ -257,8 +274,9 @@ impl Core {
         }
     }
 
-    /// Reloads the last load in place, making the system first when it is
-    /// gone or loads nothing.
+    /// Loads the last loaded name again.
+    ///
+    /// If the system is gone or has nothing loaded, builds it again first.
     fn restart(&mut self) -> Result<(), String> {
         if self.inner.is_none() || self.loaded.is_none() {
             self.remake()?;
@@ -288,7 +306,7 @@ impl Core {
         }
     }
 
-    /// Drops the system, then makes it again over the same rings.
+    /// Drops the system, then builds it again over the same rings.
     fn remake(&mut self) -> Result<(), String> {
         self.inner = None;
         self.end_reason = None;
@@ -298,7 +316,10 @@ impl Core {
         Ok(())
     }
 
-    /// Ends the channel as failed, reporting it now rather than next cycle.
+    /// Ends the channel as failed and returns the `Failed` event.
+    ///
+    /// The end is marked as already reported, so the next cycle does not
+    /// report it again.
     fn fail(&mut self, reason: String) -> SequenceEventKind {
         let reason = clipped(reason);
         self.end_reason = Some(EndReason::Failed(reason.clone().into()));
@@ -329,7 +350,10 @@ impl Core {
             .or_else(|| self.inner.as_ref().and_then(|inner| inner.ended()))
     }
 
-    /// Emits the event for an end the first cycle it differs from the last reported.
+    /// Reports how the system ended, once per change.
+    ///
+    /// Emits an event the first cycle the end differs from the last one
+    /// reported.
     fn report_end(&mut self) {
         let end = self.ended().cloned();
         if end == self.reported_end_reason {
@@ -362,7 +386,9 @@ impl Core {
     }
 }
 
-/// Loads `name` again, which drops the occupant and creates it afresh.
+/// Loads `name` again.
+///
+/// This drops the current occupant and creates a new one.
 fn reload(inner: &mut Box<dyn Step>, name: &str) -> Result<(), String> {
     crate::panic::catch(|| inner.load(name))
         .ok_or_else(|| "the load panicked".to_string())?
@@ -375,7 +401,7 @@ fn refused(reason: String) -> SequenceEventKind {
     }
 }
 
-/// `text` cut to `REASON_CAP` bytes on a char boundary.
+/// Cuts `text` to at most `REASON_CAP` bytes, on a char boundary.
 fn clipped(mut text: String) -> String {
     let mut end = REASON_CAP.min(text.len());
     while !text.is_char_boundary(end) {

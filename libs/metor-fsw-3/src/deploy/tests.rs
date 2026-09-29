@@ -51,8 +51,9 @@ fn member(namespace: &str, systems: Vec<SystemConfig>) -> TargetConfig {
     }
 }
 
-/// `a` publishes its `imu` frame and log through `pub`; `b` mirrors both and
-/// runs a db; `a.cmds` subscribes to that db for log messages.
+/// Builds a two-target deployment. `a` publishes its `imu` frame and log
+/// through `pub`. `b` subscribes to both and runs a db. `a.cmds` subscribes
+/// to that db for log messages.
 fn envelope() -> DeploymentConfig {
     let a = member(
         "a",

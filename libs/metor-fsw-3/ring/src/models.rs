@@ -12,7 +12,7 @@ pub(crate) fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
     })
 }
 
-/// Copy and consume the next record.
+/// Copies and consumes the next record.
 pub(crate) fn read(view: &mut View<NoWake>) -> Option<Vec<u8>> {
     view.try_read().expect("never corrupt").map(|r| r.to_vec())
 }

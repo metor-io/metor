@@ -1,5 +1,9 @@
-//! The slot pass: each `fsw.dl_slot` candidate's library copied into the
-//! store, and its path, hash, and ports written into the slot's params.
+//! Resolves the candidates of every `fsw.dl_slot` in a deployment.
+//!
+//! A slot lists candidate systems from packs. For each candidate, `metor
+//! build` copies the pack's library into the store and writes its path, hash,
+//! and ports into the slot's params, so the target can load it without the
+//! pack at run time.
 
 use std::path::Path;
 
@@ -18,16 +22,20 @@ use crate::system::SystemDef;
 use super::error::DeployError;
 use super::index::{At, DefIndex};
 
-/// The longest library file name a channel's status can carry.
+/// The longest library file name that fits in a channel's status frame.
 const ARTIFACT_CAP: usize = FrameStr::<64>::CAPACITY;
 
-/// Whether any slot in `envelope` has a candidate `metor build` has not resolved.
+/// Returns true if any slot in `envelope` has a candidate that is not yet
+/// resolved.
 pub(crate) fn unresolved(envelope: &DeploymentConfig) -> bool {
     first_unresolved(envelope).is_some()
 }
 
-/// Whether `system` is a slot with a candidate from a pack, or one whose
-/// params do not decode, which `resolve_slots` then reports.
+/// Returns true if `system` is a slot with a candidate that still points at a
+/// pack.
+///
+/// Also returns true if the slot's params do not decode, so that
+/// `resolve_slots` runs and reports the error.
 fn unresolved_slot(system: &SystemConfig) -> bool {
     if system.ty != SLOT_TYPE {
         return false;
@@ -41,7 +49,8 @@ fn unresolved_slot(system: &SystemConfig) -> bool {
     }
 }
 
-/// The first slot in step order with a candidate still to resolve.
+/// Returns the first slot, in step order, that still has a candidate to
+/// resolve.
 fn first_unresolved(envelope: &DeploymentConfig) -> Option<At> {
     envelope.targets.iter().enumerate().find_map(|(t, target)| {
         let systems = &target.coordinator.systems;
@@ -50,10 +59,11 @@ fn first_unresolved(envelope: &DeploymentConfig) -> Option<At> {
     })
 }
 
-/// Resolves every slot in `envelope`, putting candidate libraries in `store`.
+/// Resolves every slot in `envelope`, copying candidate libraries into
+/// `store`.
 ///
-/// Slots resolve in step order, one at a time, so a slot reading another
-/// slot's output sees that slot's baked ports.
+/// Slots are resolved one at a time, in step order. That way, when a slot
+/// reads another slot's output, the other slot's ports are already known.
 pub fn resolve_slots(
     envelope: &mut DeploymentConfig,
     tables: &[SystemTable],
@@ -88,7 +98,8 @@ fn resolve_slot(
     cx.params(&system.params, store)
 }
 
-/// What a slot's candidates compute their ports under: the slot's own config.
+/// The context a slot's candidates compute their ports in. It comes from the
+/// slot's own config, so every candidate sees the same edges.
 struct SlotCx {
     slot: String,
     cx: DefCxOwned,
@@ -102,7 +113,9 @@ impl SlotCx {
         }
     }
 
-    /// The slot's params with every candidate resolved.
+    /// Returns the slot's params with every candidate resolved.
+    ///
+    /// Every candidate must have the same ports as the first one.
     fn params(&self, params: &Value, store: &Path) -> Result<Value, DeployError> {
         let mut params = SlotParams::deserialize(params).map_err(|e| self.fail(e.to_string()))?;
         let mut first: Option<(String, SystemDef)> = None;
@@ -123,8 +136,8 @@ impl SlotCx {
         serde_json::to_value(&params).map_err(|e| self.fail(e.to_string()))
     }
 
-    /// Stores a pack candidate's library and makes it the candidate's source.
-    /// Returns the candidate's ports.
+    /// Copies a pack candidate's library into the store and points the
+    /// candidate at the stored copy. Returns the candidate's ports.
     fn resolve(&self, candidate: &mut Candidate, store: &Path) -> Result<SystemDef, DeployError> {
         let stored = match &candidate.source {
             Source::Stored(stored) => return Ok(stored.def.clone()),
@@ -135,8 +148,10 @@ impl SlotCx {
         Ok(def)
     }
 
-    /// Copies a candidate's library or module into the store, with its ports
-    /// and the pack's kind and limits.
+    /// Copies a candidate's library or module into the store.
+    ///
+    /// Returns the stored entry, which records the candidate's ports and the
+    /// pack's kind and limits.
     fn store(
         &self,
         candidate: &Candidate,
@@ -169,7 +184,8 @@ impl SlotCx {
         pack.def(ty, &cx)
     }
 
-    /// Refuses a library whose file name the channel's status cannot carry.
+    /// Returns an error if a library's file name is too long for the
+    /// channel's status frame.
     fn check_name(&self, artifact: &Path) -> Result<(), DeployError> {
         let name = artifact
             .file_name()

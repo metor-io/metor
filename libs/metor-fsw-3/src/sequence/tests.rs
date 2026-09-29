@@ -152,7 +152,8 @@ fn table(recorder: &Recorder) -> SystemTable {
     table
 }
 
-/// `id`, of type `ty`, with its log drained into the recorder after it.
+/// A config with system `id` of type `ty`, followed by a `log_sink` that
+/// drains its log into the recorder.
 fn logged(id: &str, ty: &str) -> CoordinatorConfig {
     CoordinatorConfig {
         systems: vec![
@@ -471,7 +472,8 @@ fn commander(#[state] queue: &mut Commands, commands: &mut Output<SequenceComman
     }
 }
 
-/// The test table plus `sequence` as `traced` over `trace`, and a commander.
+/// The test table, plus `sequence` registered as `traced` with `trace` as
+/// its state, and a `commander` that sends `commands`.
 fn traced<S: SequenceFn<State = Trace>>(
     recorder: &Recorder,
     sequence: S,
@@ -490,7 +492,8 @@ fn traced<S: SequenceFn<State = Trace>>(
     table
 }
 
-/// `traced` as `t`, its log drained, aborted by `aborter` from the second cycle.
+/// Runs `traced` as `t` with its log drained. An `aborter` sends it an
+/// abort from the second cycle on.
 fn aborted() -> CoordinatorConfig {
     let mut config = logged("t", "traced");
     config.systems[0]
@@ -502,7 +505,8 @@ fn aborted() -> CoordinatorConfig {
     config
 }
 
-/// `traced` as channel `seq`, driven by `commander`.
+/// Runs `traced` as `t` behind a channel called `seq`, which `commander`
+/// sends commands to.
 fn channeled(start: RunState) -> CoordinatorConfig {
     CoordinatorConfig {
         systems: vec![
@@ -520,7 +524,8 @@ fn channeled(start: RunState) -> CoordinatorConfig {
     }
 }
 
-/// Builds `config` over `sequence`, returning what its handlers ran into.
+/// Builds `config` with `sequence` and runs it, returning the trace its
+/// handlers wrote.
 fn run<S: SequenceFn<State = Trace>>(
     sequence: S,
     config: CoordinatorConfig,
@@ -683,7 +688,7 @@ async fn twin_reads(
     }
 }
 
-/// `imu -> t` as channel `seq`, its log drained.
+/// [`channeled`] with an `imu` feeding `t`, and `t`'s log drained.
 fn sampled() -> CoordinatorConfig {
     let mut config = channeled(RunState::Running);
     config.systems.insert(0, SystemConfig::new("imu", "imu"));
@@ -697,7 +702,7 @@ fn sampled() -> CoordinatorConfig {
     config
 }
 
-/// [`sampled`], with `t`'s valve tapped.
+/// [`sampled`], plus a `tap` that records `t`'s valve commands.
 fn tapped() -> CoordinatorConfig {
     let mut config = sampled();
     config.systems.push(SystemConfig {

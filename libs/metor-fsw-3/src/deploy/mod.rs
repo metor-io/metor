@@ -1,6 +1,10 @@
-//! The build pass over a deployment: every reference to a peer becomes the
-//! address or the definition it stands for, so a target then builds from its
-//! own packs alone.
+//! Resolves the references between targets in a deployment.
+//!
+//! A target's config can refer to its peers: a link can dial another
+//! target's link by name, and an output port can take its definition from a
+//! peer's port. `metor build` replaces each of these references with the
+//! concrete address or port definition it stands for. After that, each target
+//! can be built from its own packs, without knowing about the others.
 
 mod config;
 mod error;
@@ -22,13 +26,15 @@ use index::{At, DefIndex};
 use part::Part;
 pub use slot::resolve_slots;
 
-/// Default peer host, for a target the deployment places nowhere.
+/// The host a peer is dialed on when the deployment gives it no host.
 pub const LOOPBACK: &str = "127.0.0.1";
 
-/// Resolves every peer reference in `envelope` against `tables`, one per
-/// target: peer transports become addresses, peer outputs become
-/// definitions, and each database learns the commands its subscribers take.
-/// An envelope with nothing to resolve is left as it is.
+/// Resolves every peer reference in `envelope`.
+///
+/// `tables` holds one system table per target. Peer transports become
+/// addresses, and peer outputs become port definitions. Each database is also
+/// told which command messages its subscribers receive through it. An
+/// envelope with nothing to resolve is left unchanged.
 pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Result<(), DeployError> {
     let plan = plan(envelope, tables)?;
     for (at, addr) in plan.transports {
@@ -49,8 +55,8 @@ pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Resul
     check_ports(envelope)
 }
 
-/// Whether anything in `envelope` still refers to a peer or a slot
-/// candidate's pack.
+/// Returns true if `envelope` still has a peer reference or a slot candidate
+/// that points at a pack.
 pub fn unresolved(envelope: &DeploymentConfig) -> bool {
     slot::unresolved(envelope)
         || envelope.targets.iter().any(|target| {
@@ -64,8 +70,10 @@ pub fn unresolved(envelope: &DeploymentConfig) -> bool {
         })
 }
 
-/// Whether `system` is a link that dials a peer, or one whose params do not
-/// decode, which `resolve` then reports.
+/// Returns true if `system` is a link that dials a peer.
+///
+/// Also returns true if the link's params do not decode, so that `resolve`
+/// runs and reports the error.
 fn dials_peer(system: &SystemConfig) -> bool {
     match link(system) {
         Ok(params) => params.is_some_and(|params| peer_link(&params.part).is_some()),
@@ -133,7 +141,7 @@ fn plan(envelope: &DeploymentConfig, tables: &[SystemTable]) -> Result<Plan, Dep
     Ok(plan)
 }
 
-/// No two listeners on one host bind one port.
+/// Checks that no two listeners on the same host bind the same port.
 fn check_ports(envelope: &DeploymentConfig) -> Result<(), DeployError> {
     let mut bound: HashMap<(String, u16), String> = HashMap::new();
     for target in &envelope.targets {
@@ -160,7 +168,7 @@ fn host<'a>(envelope: &'a DeploymentConfig, target: &str) -> &'a str {
     envelope.hosts.get(target).map_or(LOOPBACK, String::as_str)
 }
 
-/// `host:port`, bracketing an IPv6 host.
+/// Formats `host:port`, wrapping an IPv6 host in brackets.
 fn address(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
@@ -169,7 +177,7 @@ fn address(host: &str, port: u16) -> String {
     }
 }
 
-/// A link's params, or `None` for a system of any other type.
+/// Reads a link's params. Returns `None` if `system` is not a link.
 fn link(system: &SystemConfig) -> Result<Option<Part<LinkParams>>, DeployError> {
     if !LINK_TYPES.contains(&system.ty.as_str()) {
         return Ok(None);
@@ -177,7 +185,7 @@ fn link(system: &SystemConfig) -> Result<Option<Part<LinkParams>>, DeployError> 
     Part::read(system).map(Some)
 }
 
-/// The peer a link dials.
+/// Returns the peer a link dials, if its transport is a peer reference.
 fn peer_link(params: &LinkParams) -> Option<&PeerLink> {
     match &params.transport {
         Transport::Peer(peer) => Some(peer),
@@ -185,13 +193,13 @@ fn peer_link(params: &LinkParams) -> Option<&PeerLink> {
     }
 }
 
-/// The nonzero port a link listens on.
+/// Returns the port a link listens on, unless it is zero.
 fn fixed_port(system: &SystemConfig) -> Result<Option<u16>, DeployError> {
     let port = link(system)?.and_then(|params| listen_port(&params.part));
     Ok(port.filter(|&port| port != 0))
 }
 
-/// The port a link's transport listens on.
+/// Returns the port a link's transport listens on.
 fn listen_port(params: &LinkParams) -> Option<u16> {
     let Transport::Listen { addr, .. } = &params.transport else {
         return None;

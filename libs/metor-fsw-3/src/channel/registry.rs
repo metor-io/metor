@@ -1,4 +1,7 @@
-//! `ChannelRegistry`: publishes the target's channels as one `SequenceRegistry`.
+//! The channel registry, which tells operators what channels a target has.
+//!
+//! [`channel_registry`] publishes every channel, and the names each one may
+//! load, as one `SequenceRegistry` message.
 
 use metor_proto_wkt::{SequenceChannelSpec, SequenceRegistry};
 use schemars::JsonSchema;
@@ -7,17 +10,17 @@ use serde::Deserialize;
 use crate::coordinator::ParamError;
 use crate::port::Output;
 
-/// The registry a target publishes, as its config lists it.
+/// The config for [`channel_registry`].
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RegistryParams {
     pub channels: Vec<ChannelSpec>,
-    /// Cycles between two writes.
+    /// The number of cycles between writes.
     #[serde(default = "default_period")]
     pub period: u64,
 }
 
-/// One channel and the names a `Load` on it may name.
+/// One channel, and the names a `Load` command on it may use.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelSpec {
@@ -26,12 +29,12 @@ pub struct ChannelSpec {
     pub available: Vec<String>,
 }
 
-/// Cycles between two writes when the params name no period.
+/// The period used when the config does not set one.
 fn default_period() -> u64 {
     100
 }
 
-/// A `Registry` holds the registry it writes and when it next writes it.
+/// The state of [`channel_registry`].
 pub struct Registry {
     registry: SequenceRegistry,
     period: u64,
@@ -39,7 +42,10 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Refuses a zero period.
+    /// Creates the state from its config.
+    ///
+    /// # Errors
+    /// Returns an error if `period` is zero.
     pub fn new(params: RegistryParams) -> Result<Self, ParamError> {
         if params.period == 0 {
             return Err(ParamError::Decode(
@@ -64,7 +70,9 @@ impl Registry {
     }
 }
 
-/// Writes the registry on the first cycle and once a period after.
+/// Publishes the target's channels.
+///
+/// Writes the registry on the first cycle, then once every `period` cycles.
 #[crate::system]
 pub fn channel_registry(#[state] s: &mut Registry, registry: &mut Output<SequenceRegistry>) {
     if s.until == 0 {

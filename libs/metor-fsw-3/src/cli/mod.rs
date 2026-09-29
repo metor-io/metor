@@ -1,5 +1,7 @@
-//! The `metor` binary: build a pack's editable module, resolve a deployment,
-//! or run a target.
+//! The `metor` command line.
+//!
+//! It builds a pack's editable Python module, resolves a deployment, and runs
+//! targets.
 
 pub mod build;
 pub mod cargo;
@@ -23,28 +25,30 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Pack authoring.
+    /// Commands for pack authors.
     #[command(subcommand)]
     Pack(PackCommand),
-    /// Prints the ABI version this host speaks.
+    /// Prints the pack ABI version this binary supports.
     AbiVersion,
-    /// Evaluates a target file and runs the graph it describes.
+    /// Evaluates a target file and runs its targets.
     Run(run::Run),
-    /// Evaluates a target file and writes its resolved deployment.
+    /// Evaluates a target file and writes out the resolved deployment.
     Build(build::Build),
 }
 
 #[derive(Subcommand)]
 pub enum PackCommand {
-    /// Builds a pack and lays out its editable Python module under `.metor`.
+    /// Builds a pack and writes its editable Python module under `.metor`.
     Dev {
-        /// The pack's directory, holding its `pyproject.toml` and `Cargo.toml`.
+        /// The pack's directory, which contains its `pyproject.toml` and
+        /// `Cargo.toml`.
         #[arg(default_value = ".")]
         root: PathBuf,
     },
 }
 
-/// Runs the command line, reporting a failure on stderr with a nonzero status.
+/// Runs the command line. On failure, prints the error to stderr and exits
+/// with status 1.
 pub fn main() {
     if let Err(message) = run(Cli::parse()) {
         eprintln!("metor: {message}");

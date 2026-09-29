@@ -1,4 +1,5 @@
-//! A `DlSlot` over the echo pack's two sequences, driven by channel commands.
+//! Tests a `DlSlot` that swaps between the echo pack's sequences, driven by
+//! channel commands.
 
 mod common;
 
@@ -23,7 +24,7 @@ use metor_fsw_3::{
 };
 use serde_json::{Value, json};
 
-/// What the test systems saw, and the commands still to send.
+/// What the test systems have seen, plus the commands still to send.
 #[derive(Default)]
 struct Seen {
     queue: VecDeque<SequenceCommandKind>,
@@ -70,7 +71,8 @@ fn watch(
     }
 }
 
-/// `ty`'s ports as `metor build` would bake them for instance `mode`.
+/// Returns `ty`'s ports as `metor build` would resolve them for instance
+/// `mode`.
 fn baked(ty: &str) -> Value {
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
     let pack = unsafe { DlPack::open(fixture_lib()) }.expect("the fixture opens");
@@ -81,7 +83,8 @@ fn baked(ty: &str) -> Value {
     serde_json::to_value(pack.def(ty, &cx).expect("a definition")).expect("encodes")
 }
 
-/// A resolved candidate: the fixture's path and hash, and `ty`'s ports.
+/// Returns a resolved candidate that points at the fixture library, with its
+/// hash and `ty`'s ports.
 fn candidate(name: &str, ty: &str) -> Value {
     let hash = store::hash(fixture_lib()).expect("the fixture reads");
     json!({
@@ -95,7 +98,8 @@ fn candidate(name: &str, ty: &str) -> Value {
     })
 }
 
-/// A resolved candidate over the fixture's module, copied into `dir`.
+/// Returns a resolved candidate for the fixture's wasm module, after copying
+/// the module into `dir`.
 fn wasm_candidate(name: &str, ty: &str, dir: &Path) -> Value {
     let path = dir.join(wasm_name("echo_pack"));
     std::fs::write(&path, fixture_wasm()).expect("writes");
@@ -111,7 +115,8 @@ fn wasm_candidate(name: &str, ty: &str, dir: &Path) -> Value {
     })
 }
 
-/// `count_by` with a stride, whose constructor refuses zero.
+/// Returns a `count_by` candidate with stride `by`. Its constructor rejects
+/// zero.
 fn stride(name: &str, by: u32) -> Value {
     let mut candidate = candidate(name, "count_by");
     candidate["params"] = json!({ "by": by });
@@ -122,7 +127,7 @@ fn slot_params(allow: Vec<Value>) -> Value {
     json!({ "allow": allow })
 }
 
-/// `cmds -> idle -> mode (the slot) -> watch`.
+/// Builds `cmds -> idle -> mode (the slot) -> watch`.
 fn config(params: Value, adapter: Option<Adapter>) -> CoordinatorConfig {
     let mut inputs = vec![InputConfig::new("input", "idle", "output")];
     if adapter.is_some() {
@@ -187,7 +192,7 @@ fn build(params: Value) -> (Shared, Coordinator) {
     (seen, coordinator)
 }
 
-/// Sends `commands` and runs one cycle, returning the events it produced.
+/// Sends `commands` and runs one cycle. Returns the events it produced.
 fn send(
     seen: &Shared,
     coordinator: &mut Coordinator,
@@ -197,7 +202,7 @@ fn send(
     run(seen, coordinator, 1)
 }
 
-/// Runs `cycles` cycles, returning the events they produced.
+/// Runs `cycles` cycles. Returns the events they produced.
 fn run(seen: &Shared, coordinator: &mut Coordinator, cycles: usize) -> Vec<SequenceEventKind> {
     for _ in 0..cycles {
         let next = Timestamp(coordinator.cycle() as i64 + 1);
@@ -257,7 +262,8 @@ fn test_load_other_then_abort() {
     run(&seen, &mut coordinator, 2);
     assert_eq!(pings(&seen), [0]);
 
-    // The sequence sees the abort on the cycle it is sent, and ends there.
+    // The sequence sees the abort on the same cycle it is sent, and ends on
+    // that cycle.
     let events = send(&seen, &mut coordinator, [SequenceCommandKind::Abort]);
     let requested = SequenceEventKind::Progress {
         detail: "abort requested".into(),
@@ -275,8 +281,8 @@ fn test_unknown_load_keeps_occupant() {
     assert_eq!(status(&seen).loaded, 0);
 }
 
-/// A library whose bytes are not the ones build hashed is refused before
-/// it is mapped, and the occupant stays.
+/// A library whose bytes differ from the ones `metor build` hashed is
+/// rejected before it is loaded, and the current occupant keeps running.
 #[test]
 fn test_changed_bytes_refused() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -293,7 +299,7 @@ fn test_changed_bytes_refused() {
     assert_eq!(status(&seen).loaded, 0);
 }
 
-/// A module and a library take turns in one slot.
+/// A wasm module and a native library can take turns in one slot.
 #[test]
 fn test_wasm_and_dylib_swap() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -321,8 +327,8 @@ fn test_wasm_and_dylib_swap() {
     assert_eq!(pings(&seen), [1, 2, 3]);
 }
 
-/// A module whose stored bytes changed after build hashed them is refused,
-/// and the occupant stays.
+/// A wasm module whose bytes changed after `metor build` hashed them is
+/// rejected, and the current occupant keeps running.
 #[test]
 fn test_changed_module_refused() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -339,8 +345,10 @@ fn test_changed_module_refused() {
     assert_eq!(status(&seen).loaded, 0);
 }
 
-/// A candidate's `fuel` and `memory` reach its guest: `spin` under a small
-/// grant fails on its first step, and a one-page ceiling is refused.
+/// A candidate's `fuel` and `memory` limits apply to its guest.
+///
+/// `spin` with little fuel fails on its first step, and a one-page memory
+/// limit is rejected.
 #[test]
 fn test_candidate_grants_reach_the_guest() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -361,8 +369,8 @@ fn test_candidate_grants_reach_the_guest() {
     assert!(events.contains(&failed), "{events:?}");
 }
 
-/// A candidate whose library's ports differ from the slot's baked ones is
-/// refused, and the occupant stays.
+/// A candidate whose ports differ from the slot's is rejected, and the
+/// current occupant keeps running.
 #[test]
 fn test_other_type_refused() {
     let mut other = candidate("gain", "gain");
@@ -375,8 +383,8 @@ fn test_other_type_refused() {
     assert_eq!(status(&seen).loaded, 0);
 }
 
-/// A candidate whose constructor refuses is refused, and the occupant is
-/// put back over the rings it released.
+/// A candidate whose constructor fails is rejected. The previous occupant is
+/// restored on the rings it gave up.
 #[test]
 fn test_refused_constructor_keeps_occupant() {
     let allow = vec![candidate("up", "count_up"), stride("zero", 0)];
@@ -403,7 +411,8 @@ fn test_initial_loads_at_build() {
     assert_eq!(status(&seen).state, ChannelState::Stopped.code());
 }
 
-/// A bad `initial` reports why the slot is empty, and blocks nothing else.
+/// A bad `initial` candidate leaves the slot empty and reports why. The rest
+/// of the target keeps running.
 #[test]
 fn test_bad_initial_fails_the_slot_only() {
     let mut params = slot_params(vec![candidate("up", "count_up"), stride("zero", 0)]);
@@ -421,7 +430,7 @@ fn test_bad_initial_fails_the_slot_only() {
     assert_eq!(status(&seen).state, ChannelState::Stopped.code());
 }
 
-/// A reset restarts the last load without going through `initial`.
+/// A reset restarts the last loaded candidate, not `initial`.
 #[test]
 fn test_reset_skips_initial() {
     let mut params = slot_params(vec![candidate("up", "count_up"), stride("two", 2)]);
@@ -444,7 +453,7 @@ fn test_reset_skips_initial() {
 fn test_slot_needs_channel() {
     let seen = Shared::default();
     let mut config = config(slot_params(both()), None);
-    // Without a channel there are no events or status to watch.
+    // Without a channel there are no events or status, so drop the watcher.
     config.systems.pop();
     let Err(error) = config.build(&table(&seen)) else {
         panic!("a slot without a channel is refused")
@@ -469,7 +478,7 @@ fn test_unresolved_slot_refused() {
     assert!(error.to_string().contains("metor build"), "{error}");
 }
 
-/// A pack reference whose libs directory holds a copy of the fixture.
+/// Copies the fixture library into `libs` and returns a pack reference to it.
 fn pack_ref(libs: &Path) -> Value {
     let dir = libs.join(triple());
     std::fs::create_dir_all(&dir).expect("creates");
@@ -477,7 +486,8 @@ fn pack_ref(libs: &Path) -> Value {
     json!({ "id": "echo", "lib": "echo_pack", "libs": libs })
 }
 
-/// A candidate as Python emits it: a pack reference, no path, hash, or ports.
+/// Returns a candidate the way Python emits it: a pack reference, with no
+/// path, hash, or ports yet.
 fn unresolved(name: &str, ty: &str, libs: &Path) -> Value {
     json!({ "name": name, "ty": ty, "source": { "pack": pack_ref(libs) } })
 }
@@ -493,7 +503,7 @@ fn envelope(allow: Vec<Value>) -> DeploymentConfig {
     }
 }
 
-/// A temp dir and the libs dir and store under it.
+/// Returns a temp dir, plus paths for a libs dir and a store inside it.
 fn scratch() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
@@ -548,7 +558,8 @@ fn test_build_resolves_into_store() {
     assert_eq!(events, [SequenceEventKind::Completed]);
 }
 
-/// A wasm pack reference resolves to its stored module, with its grants.
+/// A wasm pack reference resolves to its stored module, keeping its fuel and
+/// memory limits.
 #[test]
 fn test_build_resolves_wasm_candidate() {
     let (_dir, libs, store) = scratch();
@@ -586,7 +597,7 @@ fn test_build_resolves_wasm_candidate() {
     assert_eq!(events, [SequenceEventKind::Completed]);
 }
 
-/// Slot `next`, reading slot `mode`'s output.
+/// Returns the config for slot `next`, which reads slot `mode`'s output.
 fn next_slot(libs: &Path) -> SystemConfig {
     SystemConfig {
         params: json!({ "allow": [unresolved("down", "count_down", libs)] }),
@@ -599,7 +610,8 @@ fn next_slot(libs: &Path) -> SystemConfig {
     }
 }
 
-/// A slot reading another slot's output resolves against that slot's baked ports.
+/// A slot that reads another slot's output resolves against that slot's
+/// resolved ports.
 #[test]
 fn test_build_resolves_chained_slots() {
     let (_dir, libs, store) = scratch();
@@ -614,7 +626,7 @@ fn test_build_resolves_chained_slots() {
     assert!(next["allow"][0]["source"]["stored"]["def"].is_object());
 }
 
-/// A slot reading a slot later in step order is refused.
+/// A slot that reads from a slot later in step order is rejected.
 #[test]
 fn test_build_refuses_slot_reading_later_slot() {
     let (_dir, libs, store) = scratch();

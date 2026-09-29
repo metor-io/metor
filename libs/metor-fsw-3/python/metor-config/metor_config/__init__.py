@@ -1,8 +1,9 @@
-"""Build metor-fsw-3 targets and emit the config `metor run` reads.
+"""Describe metor-fsw-3 targets in Python.
 
-A target file constructs one `Target`, or several and one `Deployment` of
-them, adds the systems a pack module supplies, and ends; the config lands in
-`$METOR_CONFIG_OUT` or on stdout.
+A target file creates a `Target` and adds systems to it from pack modules.
+For several targets that talk to each other, it creates one `Target` for
+each and groups them in a `Deployment`. When the file finishes, the config
+is written to `$METOR_CONFIG_OUT`, or to stdout, for `metor run` to read.
 """
 
 from ._builtins import ChannelRegistry, Db, DbStatus, DlSlot, LinkStatus, Publish, Subscribe

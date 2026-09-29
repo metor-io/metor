@@ -1,24 +1,29 @@
-//! The content-addressed store slot candidates load from: every library at
-//! `<store>/<blake3 of its bytes>/<file name>`.
+//! A content-addressed store for pack libraries.
+//!
+//! Slots load their candidates from the store.
+//! Each library is stored at `<store>/<blake3 of its bytes>/<file name>`, so a
+//! path in the store always refers to the same bytes.
 
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Where a library landed in the store, and the hash that named it.
+/// A library that [`put`] copied into the store.
 pub struct Stored {
     pub path: PathBuf,
     pub hash: blake3::Hash,
 }
 
-/// The store beside a target file's directory.
+/// Returns the store directory for the target in `target_dir`.
 pub fn dir(target_dir: &Path) -> PathBuf {
     target_dir.join(".metor").join("store")
 }
 
-/// Copies `artifact` into `store` under its hash, unless those bytes are
-/// already there. A stored file is never rewritten, so a library another
-/// process has mapped keeps its inode.
+/// Copies `artifact` into `store` under its hash, unless the same bytes are
+/// already stored.
+///
+/// A stored file is never rewritten. That way, a library another process has
+/// mapped keeps its inode.
 pub fn put(store: &Path, artifact: &Path) -> io::Result<Stored> {
     let hash = hash(artifact)?;
     let name = artifact
@@ -33,12 +38,15 @@ pub fn put(store: &Path, artifact: &Path) -> io::Result<Stored> {
     Ok(Stored { path, hash })
 }
 
-/// The blake3 of the file at `path`.
+/// Returns the blake3 hash of the file at `path`.
 pub fn hash(path: &Path) -> io::Result<blake3::Hash> {
     Hashed::of(path).map(|hashed| hashed.hash)
 }
 
-/// A file hashed through one open handle, so a later check names those bytes.
+/// A file hash that can later be checked against a path.
+///
+/// [`Hashed::still_at`] tells you whether a path still refers to the file that
+/// was hashed, so the bytes you load are the bytes you checked.
 pub struct Hashed {
     pub hash: blake3::Hash,
     file: File,
@@ -55,7 +63,9 @@ impl Hashed {
         })
     }
 
-    /// Whether `path` still names the file that was hashed.
+    /// Returns whether `path` still refers to the file that was hashed.
+    ///
+    /// Always returns `true` on non-unix hosts.
     pub fn still_at(&self, path: &Path) -> io::Result<bool> {
         #[cfg(unix)]
         {
@@ -71,24 +81,24 @@ impl Hashed {
     }
 }
 
-/// Copies `src` over `dst` through a temp file beside it, then renames.
+/// Copies `src` to a temp file next to `dst`, then renames it over `dst`.
 ///
-/// macOS kill-caches a code signature by inode, so a dylib written in place
-/// kills the next process to `dlopen` it.
+/// macOS caches a library's code signature by inode. If a dylib is overwritten
+/// in place, the next process that `dlopen`s it is killed.
 pub fn copy_atomic(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
     let tmp = temp_beside(dst);
     std::fs::copy(src, &tmp)?;
     std::fs::rename(&tmp, dst)
 }
 
-/// Writes `bytes` to `dst` the way [`copy_atomic`] copies onto it.
+/// Writes `bytes` to `dst` through a temp file, like [`copy_atomic`].
 pub fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     let tmp = temp_beside(dst);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, dst)
 }
 
-/// A name for the temp file a replacement is renamed from, unique per process.
+/// Returns a temp path next to `dst`, unique to this process.
 fn temp_beside(dst: &Path) -> PathBuf {
     let mut name = dst.as_os_str().to_owned();
     name.push(format!(".tmp{}", std::process::id()));

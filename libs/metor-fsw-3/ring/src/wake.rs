@@ -1,41 +1,42 @@
 //! Wait and wake on a shared atomic word across processes.
 //!
-//! Linux uses shared futexes; macOS requires the shared wait-on-address API
-//! available since 14.4. Both processes must map the same underlying memory.
-//! Waits can return spuriously or race a timeout. Always recheck the predicate.
-//! Waking without a waiter has no effect.
+//! Linux uses shared futexes. macOS uses the shared wait-on-address API, which
+//! needs macOS 14.4 or later. Both processes must map the same underlying
+//! memory. A wait can return spuriously or race a timeout, so always recheck
+//! the condition after it returns. Waking a word nobody waits on does nothing.
 
 use core::sync::atomic::AtomicU32;
 use std::time::Duration;
 
-/// Why a timed wait returned. Recheck the predicate in either case.
+/// Why a timed wait returned. Recheck the condition in either case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
-    /// A wake, value change, interruption, or spurious return.
+    /// The wait ended early: a wake, a value change, an interruption, or a
+    /// spurious return.
     Woken,
-    /// The timeout expired; a concurrent wake may still have occurred.
+    /// The timeout expired. A wake may still have happened at the same time.
     TimedOut,
 }
 
-/// Wait while the word equals `expected`. May return spuriously.
+/// Blocks while `a` holds `expected`. May return spuriously.
 #[inline]
 pub fn wait(a: &AtomicU32, expected: u32) {
     let _ = platform::wait(a, expected, None);
 }
 
-/// Wait while the word equals `expected`, for at most `timeout`. May return early.
+/// Blocks while `a` holds `expected`, for at most `timeout`. May return early.
 #[inline]
 pub fn wait_timeout(a: &AtomicU32, expected: u32, timeout: Duration) -> WaitOutcome {
     platform::wait(a, expected, Some(timeout))
 }
 
-/// Wake one waiter on this word, including in another process.
+/// Wakes one thread waiting on `a`, which may be in another process.
 #[inline]
 pub fn wake_one(a: &AtomicU32) {
     platform::wake(a, false);
 }
 
-/// Wake all waiters on this word, including in other processes.
+/// Wakes every thread waiting on `a`, including those in other processes.
 #[inline]
 pub fn wake_all(a: &AtomicU32) {
     platform::wake(a, true);

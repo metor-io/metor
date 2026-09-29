@@ -1,4 +1,8 @@
-//! The [`System`] trait and the port bundles that feed it.
+//! The [`System`] trait, and the traits for binding a system's ports.
+//!
+//! A system declares its ports as definitions first. The coordinator matches
+//! those definitions against the config, creates the rings, and then binds
+//! each port to its ring handles.
 
 use metor_fsw_3_ring::{NoWake, View, WakeSink, WakeSource, Writer};
 use metor_proto::types::{ComponentId, Timestamp};
@@ -8,25 +12,33 @@ use std::borrow::Cow;
 use crate::def::{DefCx, DefError};
 use crate::record::RecordSchema;
 
-/// A `PortDef` names one port of a bundle and the record its ring carries.
+/// Describes one port: its name and the record it carries.
+///
+/// The coordinator uses definitions to check that connected ports agree, and
+/// to size each port's ring.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortDef {
     pub name: Cow<'static, str>,
-    /// The record's [`NAME`](crate::Record::NAME), the type a config spells.
+    /// The record's [`NAME`](crate::Record::NAME).
+    ///
+    /// A config refers to the record type by this name.
     pub record: Cow<'static, str>,
     pub id: ComponentId,
     pub max_len: usize,
     pub alignment: usize,
     pub depth: usize,
-    /// A frame's field layout, taken at the record's own name; zero for a
-    /// message.
+    /// A fingerprint of a frame's field layout, or zero for a message.
+    ///
+    /// See [`RecordSchema::layout`].
     pub layout: u64,
-    /// What this port announces to the ground.
+    /// The schema this port announces to the ground.
     pub schema: RecordSchema,
 }
 
 impl PortDef {
-    /// Whether two ports carry the same record under any name.
+    /// Returns whether two ports carry the same record.
+    ///
+    /// The ports' own names are ignored.
     pub fn same_record(&self, other: &PortDef) -> bool {
         self.record == other.record
             && self.id == other.id
@@ -38,7 +50,9 @@ impl PortDef {
     }
 }
 
-/// One instance's ports, in bind order.
+/// Describes one system instance's ports.
+///
+/// Ports are listed in the order they are bound.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemDef {
     pub name: Cow<'static, str>,
@@ -47,8 +61,10 @@ pub struct SystemDef {
 }
 
 impl SystemDef {
-    /// The definition this instance's config asks the bundles for, whose
-    /// inputs wake `W`.
+    /// Builds the definition for an instance from its config.
+    ///
+    /// `I` and `O` compute the input and output ports from `cx`. The inputs
+    /// wait on `W`.
     pub fn new<I: SystemInputs<W>, O: SystemOutputs, W: WakeSink>(
         name: &'static str,
         cx: &DefCx<'_>,
@@ -61,25 +77,30 @@ impl SystemDef {
     }
 }
 
-/// One input port: the definition build settled on and one view per producer.
+/// A resolved input port, ready to bind.
+///
+/// It holds one view per producer.
 pub struct InputBinding<W: WakeSink = NoWake> {
     pub def: PortDef,
     pub views: Vec<View<W>>,
 }
 
-/// One output port: the definition build settled on and its writer.
+/// A resolved output port, ready to bind.
 pub struct OutputBinding<W: WakeSource = NoWake> {
     pub def: PortDef,
     pub writer: Writer<W>,
 }
 
-/// A `System` runs once per cycle over its state and bound ports.
+/// A unit of work that runs once per cycle.
+///
+/// Each cycle, [`System::execute`] reads its inputs, updates its state, and
+/// writes its outputs.
 pub trait System {
     type State;
     type Inputs: SystemInputs;
     type Outputs: SystemOutputs;
 
-    /// This instance's ports, computed from its config.
+    /// Returns this instance's ports, computed from its config.
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError>;
 
     fn execute(
@@ -90,34 +111,43 @@ pub trait System {
         outputs: &mut Self::Outputs,
     );
 
-    /// Called once after `execute` panicked, before the runner is destroyed.
+    /// Called once after `execute` panics, before the system is removed from
+    /// the schedule.
     fn fault(&self, _now: Timestamp, _outputs: &mut Self::Outputs, _message: &str) {}
 }
 
-/// A system's input ports, bound in [`defs`](SystemInputs::defs) order.
+/// A system's input ports.
 ///
-/// `W` is the wake endpoint of the ports it binds: [`NoWake`] for a cyclic
-/// system, [`Notifier`](metor_fsw_3_ring::Notifier) for an async one.
+/// Ports are bound in the order [`defs`](SystemInputs::defs) lists them. `W`
+/// is what the ports wait on: [`NoWake`] for a cyclic system, and
+/// [`Notifier`](metor_fsw_3_ring::Notifier) for an async one.
 pub trait SystemInputs<W: WakeSink = NoWake> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError>;
 
-    /// One binding per [`defs`](SystemInputs::defs) entry, in order.
+    /// Binds the ports.
+    ///
+    /// `inputs` has one binding per [`defs`](SystemInputs::defs) entry, in the
+    /// same order.
     ///
     /// # Panics
-    /// May panic on a list that does not match `defs`.
+    /// May panic if `inputs` does not match `defs`.
     fn bind(inputs: Vec<InputBinding<W>>) -> Self;
 }
 
-/// A system's output ports, bound in [`defs`](SystemOutputs::defs) order.
+/// A system's output ports.
 ///
-/// `W` is the wake endpoint of the ports it binds, as for [`SystemInputs`].
+/// Ports are bound in the order [`defs`](SystemOutputs::defs) lists them. `W`
+/// is what the ports notify, as with [`SystemInputs`].
 pub trait SystemOutputs<W: WakeSource = NoWake> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError>;
 
-    /// One binding per [`defs`](SystemOutputs::defs) entry, in order.
+    /// Binds the ports.
+    ///
+    /// `outputs` has one binding per [`defs`](SystemOutputs::defs) entry, in
+    /// the same order.
     ///
     /// # Panics
-    /// May panic on a list that does not match `defs`.
+    /// May panic if `outputs` does not match `defs`.
     fn bind(outputs: Vec<OutputBinding<W>>) -> Self;
 }
 

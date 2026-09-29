@@ -1,5 +1,6 @@
-//! One instantiated module over a host-placed memory. This is the only file
-//! that names the interpreter.
+//! Runs one instantiated module in memory the host allocates.
+//!
+//! This is the only file that uses the interpreter directly.
 
 use core::ptr::NonNull;
 use std::alloc::Layout;
@@ -10,23 +11,25 @@ use wasmi::{
     StoreLimitsBuilder, TrapCode, TypedFunc, WasmParams, WasmResults,
 };
 
-/// Bytes in one wasm page.
+/// The number of bytes in one wasm page.
 pub const PAGE: usize = 64 * 1024;
 
-/// Pages a 32-bit memory can address.
+/// The number of pages a 32-bit memory can address.
 const MAX_PAGES: usize = 1 << 16;
 
-/// Value-stack slots the interpreter reserves for a call, 512 KiB of
-/// 8-byte slots. A pack step runs far below this, so the stack never grows,
-/// and so never allocates, mid-cycle.
+/// The number of value-stack slots the interpreter reserves for each call.
+///
+/// That is 512 KiB of 8-byte slots. A pack step uses far less, so the stack
+/// never grows mid-cycle, and so never allocates.
 const STACK: usize = 64 * 1024;
 
-/// Elements a guest's table may hold. rustc's table has one per function
-/// whose address is taken, which is a few hundred for a pack.
+/// The maximum number of elements in a guest's table.
+///
+/// rustc adds one table entry for each function whose address is taken. A
+/// pack has a few hundred.
 pub const TABLE_ELEMENTS: usize = 16 * 1024;
 
-/// A `WasmError` is why a module cannot run as a guest, or why the host
-/// refused an access to its memory.
+/// An error from running a module as a guest, or from accessing guest memory.
 #[derive(Debug, thiserror::Error)]
 pub enum WasmError {
     #[error("the module did not load: {0}")]
@@ -53,15 +56,15 @@ pub enum WasmError {
     TooLarge(usize),
 }
 
-/// Why a call stopped short.
+/// Why a guest call stopped before returning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trap {
     OutOfFuel,
-    /// `unreachable`, which is what a guest panic compiles to.
+    /// The guest hit `unreachable`, which is what a guest panic compiles to.
     Unreachable,
     MemoryOutOfBounds,
     StackOverflow,
-    /// Any other trap: a bad indirect call, integer overflow, and so on.
+    /// Any other trap, such as a bad indirect call or integer overflow.
     Other,
 }
 
@@ -74,7 +77,7 @@ impl core::fmt::Display for Trap {
 impl std::error::Error for Trap {}
 
 impl Trap {
-    /// The text a fault line carries.
+    /// Returns the text used in the fault log line.
     pub fn as_str(self) -> &'static str {
         match self {
             Trap::OutOfFuel => "out of fuel",
@@ -96,11 +99,14 @@ impl Trap {
     }
 }
 
-/// A `Module` is a compiled pack module and the engine it runs on.
+/// A compiled pack module.
 pub struct Module(wasmi::Module);
 
 impl Module {
-    /// Compiles every function now, so no call translates code mid-cycle.
+    /// Compiles `bytes` into a module.
+    ///
+    /// Every function is compiled up front, so no call has to translate code
+    /// mid-cycle.
     pub fn compile(bytes: &[u8]) -> Result<Module, WasmError> {
         let mut config = Config::default();
         config
@@ -111,7 +117,7 @@ impl Module {
         Ok(Module(wasmi::Module::new(&engine, bytes)?))
     }
 
-    /// The memory the module imports as `env.memory`.
+    /// Returns the type of the memory the module imports as `env.memory`.
     fn memory_import(&self) -> Result<MemoryType, WasmError> {
         let import = self
             .0
@@ -124,8 +130,10 @@ impl Module {
     }
 }
 
-/// Where an export writes a descriptor: `capacity` bytes at `dst`, and the
-/// `usize` slot at `written` it stores the length in.
+/// Where an export writes its output.
+///
+/// The export writes up to `capacity` bytes at `dst`, and stores the length it
+/// wrote in the `usize` at `written`.
 #[derive(Clone, Copy, Debug)]
 pub struct Out {
     pub dst: u32,
@@ -133,7 +141,7 @@ pub struct Out {
     pub written: u32,
 }
 
-/// The exports the ABI fixes, resolved to typed functions once.
+/// The ABI's exports, resolved to typed functions once.
 struct Exports {
     abi_version: TypedFunc<(), u32>,
     pack_def: TypedFunc<(u32, u32, u32), u32>,
@@ -144,10 +152,13 @@ struct Exports {
     free: TypedFunc<(u32, u32, u32), ()>,
 }
 
-/// A `Guest` is one instantiated module: its store, its memory, and the
-/// ABI's exports.
+/// One running instance of a pack module.
+///
+/// The host allocates the guest's memory, up to a fixed ceiling. Every call
+/// into the guest runs with a fuel budget.
 pub struct Guest {
-    /// Declared before `_arena`, so it drops while the arena backs its memory.
+    /// Must be declared before `_arena`, so the store drops while its memory
+    /// is still allocated.
     store: Store<StoreLimits>,
     memory: Memory,
     exports: Exports,
@@ -155,9 +166,10 @@ pub struct Guest {
 }
 
 impl Guest {
-    /// Instantiates `module` over a fresh memory of at most `ceiling` bytes,
-    /// rounded up to whole pages. Instantiation copies the module's data in
-    /// under a grant of `fuel`.
+    /// Instantiates `module` in a new memory of at most `ceiling` bytes.
+    ///
+    /// The ceiling is rounded up to whole pages. Instantiation copies the
+    /// module's data into memory and may use up to `fuel`.
     pub fn new(module: &Module, ceiling: usize, fuel: u64) -> Result<Guest, WasmError> {
         let ty = module.memory_import()?;
         let arena = Arena::new(ceiling)?;
@@ -184,45 +196,50 @@ impl Guest {
         })
     }
 
-    /// `metor_fsw_abi_version`.
+    /// Calls `metor_fsw_abi_version`.
     pub fn abi_version(&mut self, fuel: u64) -> Result<u32, Trap> {
         call(&mut self.store, self.exports.abi_version, (), fuel)
     }
 
-    /// `metor_fsw_pack_def`, writing the descriptor into `out`.
+    /// Calls `metor_fsw_pack_def`, which writes the descriptor into `out`.
     pub fn pack_def(&mut self, out: Out, fuel: u64) -> Result<u32, Trap> {
         let args = (out.dst, out.capacity, out.written);
         call(&mut self.store, self.exports.pack_def, args, fuel)
     }
 
-    /// `metor_fsw_def` for the `RawSlice`s at `ty` and `cx`, into `out`.
+    /// Calls `metor_fsw_def` with the `RawSlice`s at `ty` and `cx`, writing
+    /// into `out`.
     pub fn def(&mut self, ty: u32, cx: u32, out: Out, fuel: u64) -> Result<u32, Trap> {
         let args = (ty, cx, out.dst, out.capacity, out.written);
         call(&mut self.store, self.exports.def, args, fuel)
     }
 
-    /// `metor_fsw_create` over `(ty, params, def, inputs, outputs, error)`,
-    /// a `RawSlice` address each, returning the instance, zero on a refusal.
+    /// Calls `metor_fsw_create`.
+    ///
+    /// `args` holds the guest addresses of the `RawSlice`s for
+    /// `(ty, params, def, inputs, outputs, error)`. Returns the instance, or
+    /// zero if creation failed.
     pub fn create(&mut self, args: (u32, u32, u32, u32, u32, u32), fuel: u64) -> Result<u32, Trap> {
         call(&mut self.store, self.exports.create, args, fuel)
     }
 
-    /// `metor_fsw_execute`, returning the status word.
+    /// Calls `metor_fsw_execute` and returns the status word.
     pub fn execute(&mut self, instance: u32, now: i64, fuel: u64) -> Result<u32, Trap> {
         call(&mut self.store, self.exports.execute, (instance, now), fuel)
     }
 
-    /// `metor_fsw_alloc`, returning the offset, zero when it refused.
+    /// Calls `metor_fsw_alloc` and returns the offset, or zero if allocation
+    /// failed.
     pub fn alloc(&mut self, len: u32, align: u32, fuel: u64) -> Result<u32, Trap> {
         call(&mut self.store, self.exports.alloc, (len, align), fuel)
     }
 
-    /// `metor_fsw_free`.
+    /// Calls `metor_fsw_free`.
     pub fn free(&mut self, ptr: u32, len: u32, align: u32, fuel: u64) -> Result<(), Trap> {
         call(&mut self.store, self.exports.free, (ptr, len, align), fuel)
     }
 
-    /// Copies `dst.len()` bytes at `offset` out of guest memory.
+    /// Copies `dst.len()` bytes from guest memory at `offset` into `dst`.
     pub fn read(&self, offset: u32, dst: &mut [u8]) -> Result<(), WasmError> {
         let src = self.at(offset, dst.len())?;
         // SAFETY: `at` checked the range lies in the memory, and no guest call
@@ -234,13 +251,15 @@ impl Guest {
     /// Copies `src` into guest memory at `offset`.
     pub fn write(&mut self, offset: u32, src: &[u8]) -> Result<(), WasmError> {
         let dst = self.at(offset, src.len())?;
-        // SAFETY: as in `read`; `src` is host memory, so the two do not overlap.
+        // SAFETY: as in `read`. `src` is host memory, so the ranges do not overlap.
         unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
         Ok(())
     }
 
-    /// The host address of `len` bytes at `offset`, 16-byte aligned, for
-    /// formatting a ring there.
+    /// Returns the host address of `len` bytes at `offset`, for setting up a
+    /// ring there.
+    ///
+    /// Fails unless `offset` is 16-byte aligned.
     pub fn region(&self, offset: u32, len: usize) -> Result<NonNull<u8>, WasmError> {
         if !(offset as usize).is_multiple_of(PAYLOAD_ALIGNMENT) {
             return Err(WasmError::Misaligned(offset));
@@ -249,9 +268,10 @@ impl Guest {
         NonNull::new(ptr).ok_or(WasmError::OutOfBounds { offset, len })
     }
 
-    /// The host address of `len` bytes at `offset`, checked against the
-    /// memory's current size. The arena is page aligned, so an offset's
-    /// alignment is its address's.
+    /// Returns the host address of `len` bytes at `offset`.
+    ///
+    /// Fails if the range is outside the memory's current size. The arena is
+    /// page aligned, so an offset has the same alignment as its host address.
     fn at(&self, offset: u32, len: usize) -> Result<*mut u8, WasmError> {
         let size = self.memory.data_size(&self.store);
         let start = offset as usize;
@@ -278,8 +298,9 @@ impl Exports {
     }
 }
 
-/// One export as a typed function, naming it when it is missing or its
-/// signature differs.
+/// Looks up one export as a typed function.
+///
+/// The error names the export if it is missing or has the wrong signature.
 fn typed<P: WasmParams, R: WasmResults>(
     instance: &wasmi::Instance,
     store: &Store<StoreLimits>,
@@ -291,20 +312,23 @@ fn typed<P: WasmParams, R: WasmResults>(
     func.typed(store).map_err(|_| WasmError::Signature(name))
 }
 
-/// Calls `func` under a fresh grant of `fuel`.
+/// Calls `func` with a fresh fuel budget of `fuel`.
 fn call<P: WasmParams, R: WasmResults>(
     store: &mut Store<StoreLimits>,
     func: TypedFunc<P, R>,
     params: P,
     fuel: u64,
 ) -> Result<R, Trap> {
-    // Every engine `Module::compile` builds meters fuel, so this cannot fail.
+    // `Module::compile` always enables fuel metering, so this cannot fail.
     store.set_fuel(fuel).map_err(|_| Trap::Other)?;
     func.call(store, params).map_err(|e| Trap::of(&e))
 }
 
-/// What a store may hold: one instance, one table, and the host's memory,
-/// which instantiation counts again as the module's import.
+/// Returns the limits for a guest's store.
+///
+/// A store may hold one instance, one table, and the host's memory. That
+/// memory counts twice, because instantiation counts it again as the module's
+/// import.
 fn limits() -> StoreLimits {
     StoreLimitsBuilder::new()
         .memories(2)
@@ -314,7 +338,7 @@ fn limits() -> StoreLimits {
         .build()
 }
 
-/// The import's type, with its maximum capped at the arena's pages.
+/// Returns the imported memory type with its maximum capped at the arena's size.
 fn bounded(ty: MemoryType, arena: &Arena) -> Result<MemoryType, WasmError> {
     let pages = (arena.len() / PAGE) as u64;
     if ty.minimum() > pages {
@@ -330,14 +354,14 @@ fn bounded(ty: MemoryType, arena: &Arena) -> Result<MemoryType, WasmError> {
     builder.build().map_err(|e| wasmi::Error::from(e).into())
 }
 
-/// An `Arena` is the page-aligned, zeroed allocation a guest's memory lives in.
+/// The page-aligned, zeroed allocation that backs a guest's memory.
 struct Arena {
     ptr: NonNull<u8>,
     layout: Layout,
 }
 
 impl Arena {
-    /// Whole pages covering `ceiling` bytes.
+    /// Allocates enough whole pages to cover `ceiling` bytes.
     fn new(ceiling: usize) -> Result<Arena, WasmError> {
         let pages = ceiling.div_ceil(PAGE);
         if pages == 0 || pages > MAX_PAGES {
@@ -356,13 +380,13 @@ impl Arena {
         self.layout.size()
     }
 
-    /// The arena as one slice, for the one user of its bytes.
+    /// Returns the whole arena as one mutable slice.
     ///
     /// # Safety
-    /// Nothing else accesses the bytes while the slice or anything derived
-    /// from it is live, and none of those is used after the arena drops.
+    /// Nothing else may access the bytes while the slice, or anything derived
+    /// from it, is alive. None of them may be used after the arena drops.
     unsafe fn bytes(&self) -> &'static mut [u8] {
-        // SAFETY: `new` allocated `len` bytes at `ptr`; the caller's contract
+        // SAFETY: `new` allocated `len` bytes at `ptr`. The caller's contract
         // covers aliasing and lifetime.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len()) }
     }

@@ -9,8 +9,10 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 
-/// One field of the frame struct. Mirrors the shared derive-impl field so the
-/// four component derives can be driven from `#[frame(..)]` attributes.
+/// One field of the frame struct, read from `#[frame(..)]` attributes.
+///
+/// It converts into the shared derive-impl `Field`, which drives the four
+/// component derives.
 #[derive(FromField)]
 #[darling(attributes(frame))]
 struct FrameField {
@@ -39,7 +41,7 @@ impl From<FrameField> for Field {
     }
 }
 
-/// The struct being derived: `#[frame(name = "..")]` plus its fields.
+/// The struct being derived, with its fields and `#[frame(name = "..")]`.
 #[derive(FromDeriveInput)]
 #[darling(attributes(frame), supports(struct_named))]
 struct FrameInput {
@@ -49,7 +51,9 @@ struct FrameInput {
     name: Option<String>,
 }
 
-/// Expands `#[derive(Frame)]`: the four component sub-derives plus `Frame`.
+/// Expands `#[derive(Frame)]`.
+///
+/// The output implements the four component traits, `Record`, and `Frame`.
 pub fn frame(input: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(input as DeriveInput);
     let raw = match FrameInput::from_derive_input(&parsed) {

@@ -1,4 +1,4 @@
-//! Definitions computed on demand across a deployment's targets.
+//! Computes system definitions on demand across a deployment's targets.
 
 use std::collections::HashMap;
 
@@ -10,7 +10,8 @@ use crate::system::{PortDef, SystemDef};
 
 use super::error::DeployError;
 
-/// Where a system sits: its target's index and its own.
+/// The location of a system: the index of its target, and its index within
+/// that target.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(crate) struct At {
     pub(crate) target: usize,
@@ -31,9 +32,13 @@ impl At {
     }
 }
 
-/// A `DefIndex` computes a system's definition when a reference needs it,
-/// once per system, chasing edges to producers and peer references to other
-/// targets. A reference that comes back to a system being computed is a cycle.
+/// Computes and caches system definitions across a deployment.
+///
+/// A system's definition can depend on the systems that feed it, including
+/// systems on other targets. The index computes each definition the first
+/// time something asks for it, following those references as needed. If a
+/// reference leads back to a system that is still being computed, that is
+/// reported as a cycle.
 pub(crate) struct DefIndex<'a> {
     envelope: &'a DeploymentConfig,
     tables: &'a [SystemTable],
@@ -53,7 +58,8 @@ impl<'a> DefIndex<'a> {
         }
     }
 
-    /// The system `link` of the target named `target`, for a reference made by `from`.
+    /// Finds the system `link` on the target named `target`. `from` is the
+    /// system making the reference, used in error messages.
     pub(crate) fn locate(&self, from: &str, target: &str, link: &str) -> Result<At, DeployError> {
         let t = self
             .envelope
@@ -77,14 +83,14 @@ impl<'a> DefIndex<'a> {
         Ok(At::new(t, s))
     }
 
-    /// The name a reference is reported by: `{namespace}.{id}`.
+    /// Returns the name used for a system in errors: `{namespace}.{id}`.
     pub(crate) fn name(&self, at: At) -> String {
         let namespace = self.envelope.targets[at.target].namespace();
         format!("{namespace}.{}", at.get(self.envelope).id)
     }
 
-    /// The definition of the input port a peer reference names, as the port
-    /// `port` of the system at `from`.
+    /// Returns the definition of the peer input port that `peer` refers to,
+    /// renamed to `port` on the system at `from`.
     pub(crate) fn peer_port(
         &mut self,
         from: At,
@@ -109,7 +115,8 @@ impl<'a> DefIndex<'a> {
             })
     }
 
-    /// The definition of the system at `at`, computed once.
+    /// Returns the definition of the system at `at`, computing it on the first
+    /// call.
     pub(crate) fn def(&mut self, at: At) -> Result<SystemDef, DeployError> {
         if let Some(def) = self.memo.get(&at) {
             return Ok(def.clone());
@@ -153,13 +160,13 @@ impl<'a> DefIndex<'a> {
         .map_err(|source| self.build_error(at, source))
     }
 
-    /// The records target `target`'s table knows.
+    /// Returns the records known to the system table of target `target`.
     pub(crate) fn records(&self, target: usize) -> &Records {
         &self.records[target]
     }
 
-    /// Each config edge into the system at `at` and the definition feeding
-    /// it, less the channel's own `commands`.
+    /// Returns every edge into the system at `at`, with the definition of the
+    /// output that feeds it. A channel's `commands` input is skipped.
     pub(crate) fn edges(&mut self, at: At) -> Result<Vec<(String, PortDef)>, DeployError> {
         let system = at.get(self.envelope);
         let mut edges = Vec::new();
@@ -174,7 +181,8 @@ impl<'a> DefIndex<'a> {
         Ok(edges)
     }
 
-    /// The system's config with every peer output replaced by its definition.
+    /// Returns a copy of the system's config with every peer output replaced
+    /// by its definition.
     fn resolved_outputs(
         &mut self,
         at: At,
@@ -189,8 +197,11 @@ impl<'a> DefIndex<'a> {
         Ok(system)
     }
 
-    /// The definition feeding each edge whose port the type does not declare;
-    /// a declared port needs none, which keeps a `loop()` edge from cycling.
+    /// Returns the definition feeding each input edge.
+    ///
+    /// Only ports the system type does not declare need their producer's
+    /// definition. Skipping declared ports keeps a `loop()` edge from being
+    /// reported as a cycle.
     fn producers(
         &mut self,
         at: At,
@@ -211,7 +222,8 @@ impl<'a> DefIndex<'a> {
         Ok(producers)
     }
 
-    /// The definition of an output port of a system on the same target.
+    /// Returns the definition of an output port on another system in the same
+    /// target.
     fn output(&mut self, at: At, from: &PortRef) -> Result<PortDef, DeployError> {
         let target = &self.envelope.targets[at.target];
         let Some(s) = target

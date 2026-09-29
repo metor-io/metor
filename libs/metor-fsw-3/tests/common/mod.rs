@@ -1,4 +1,4 @@
-//! Frames, fixtures, and waits the integration tests share.
+//! Records, fixtures, and wait helpers shared by the integration tests.
 
 #![allow(dead_code)]
 
@@ -28,7 +28,10 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 /// How long a test waits on a target before it fails.
 pub const DEADLINE: Duration = Duration::from_secs(20);
 
-/// The pack's record, redeclared here: the component id is the name's hash.
+/// The fixture pack's `Ping` record, declared again here.
+///
+/// The host matches records by a hash of the name, so this copy is the same
+/// record as the pack's.
 #[derive(Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[postcard(crate = metor_fsw_3::postcard_schema)]
 #[record(max_len = 8)]
@@ -45,7 +48,9 @@ pub struct Imu {
     pub sample: f64,
 }
 
-/// Publishes one sample per cycle, counting up, once its gate (if any) is set.
+/// Publishes one sample per cycle, counting up.
+///
+/// If it has a gate, it publishes nothing until the gate is set.
 #[derive(Default)]
 pub struct Source(pub i64, pub Option<Arc<AtomicBool>>);
 
@@ -64,7 +69,7 @@ pub fn source(#[state] s: &mut Source, imu: &mut Output<Imu>) {
     });
 }
 
-/// The `echo-pack` fixture's crate directory.
+/// Returns the `echo-pack` fixture's crate directory.
 pub fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack")
 }
@@ -78,7 +83,8 @@ pub fn fixture_lib() -> &'static Path {
     })
 }
 
-/// Builds the fixture as a module once per test binary and returns its bytes.
+/// Builds the fixture as a wasm module once per test binary and returns its
+/// bytes.
 pub fn fixture_wasm() -> &'static [u8] {
     static BUILT: OnceLock<Vec<u8>> = OnceLock::new();
     BUILT.get_or_init(|| {
@@ -88,7 +94,7 @@ pub fn fixture_wasm() -> &'static [u8] {
     })
 }
 
-/// The fixture's module, opened under the default limits.
+/// Opens the fixture's wasm module with the default limits.
 pub fn open_wasm() -> WasmPack {
     WasmPack::open(fixture_wasm(), &Limits::default()).expect("the module opens")
 }
@@ -97,7 +103,7 @@ pub fn metor() -> Command {
     Command::new(env!("CARGO_BIN_EXE_metor"))
 }
 
-/// A `metor` child, killed and reaped when it drops.
+/// A running `metor` child process. Dropping it kills the process.
 pub struct Running(pub Child);
 
 impl Drop for Running {
@@ -107,14 +113,15 @@ impl Drop for Running {
     }
 }
 
-/// `N` ports nothing holds at the moment they are read.
+/// Returns `N` ports that were free when this was called.
 pub fn free_ports<const N: usize>() -> [u16; N] {
     let held: [TcpListener; N] =
         core::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").expect("a free port"));
     held.map(|listener| listener.local_addr().expect("bound").port())
 }
 
-/// `ports` as the comma list a fixture's ports variable takes.
+/// Joins `ports` into the comma-separated list a fixture's ports variable
+/// expects.
 pub fn ports_env(ports: &[u16]) -> String {
     ports
         .iter()
@@ -127,7 +134,7 @@ pub fn local(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-/// A point [`DEADLINE`] from now that a polling loop waits against.
+/// A deadline [`DEADLINE`] from now, for polling loops.
 pub struct Deadline(Instant);
 
 impl Deadline {
@@ -135,14 +142,16 @@ impl Deadline {
         Self(Instant::now() + DEADLINE)
     }
 
-    /// Fails the test with `what` once past, else sleeps a tick.
+    /// Sleeps for a short tick. Fails the test with `what` if the deadline has
+    /// passed.
     pub async fn tick(&self, what: impl Display) {
         assert!(Instant::now() < self.0, "{what}");
         stellarator::sleep(Duration::from_millis(5)).await;
     }
 }
 
-/// `fut`'s output, failing the test with `what` past [`DEADLINE`].
+/// Awaits `fut`, failing the test with `what` if it takes longer than
+/// [`DEADLINE`].
 pub async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
     let late = async {
         stellarator::sleep(DEADLINE).await;
@@ -151,7 +160,7 @@ pub async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
     futures_lite::future::or(fut, late).await
 }
 
-/// An fsw link's connection, past its identity.
+/// A connection to an fsw link, after its `LinkInfo` has been read.
 pub struct Fsw {
     pub info: LinkInfo,
     pub rx: PacketStream<OwnedReader<TcpStream>>,
@@ -159,7 +168,7 @@ pub struct Fsw {
     pub buf: Vec<u8>,
 }
 
-/// Dials `addr` until an fsw link answers.
+/// Dials `addr` until an fsw link answers, and returns the connection.
 pub async fn dial_fsw(addr: SocketAddr) -> Fsw {
     let deadline = Deadline::new();
     loop {
@@ -171,15 +180,18 @@ pub async fn dial_fsw(addr: SocketAddr) -> Fsw {
     }
 }
 
-/// A target on its own thread, stopped and joined when the handle drops.
+/// A target running on its own thread. Dropping it stops and joins the
+/// thread.
 pub struct Target {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Target {
-    /// Builds `config` against the table `table` makes and runs it on a
-    /// thread of its own, counting its cycles into `cycles`.
+    /// Builds `config` and runs it on a new thread.
+    ///
+    /// `table` is called on that thread to make the system table. Each cycle
+    /// increments `cycles`.
     pub fn spawn(
         config: CoordinatorConfig,
         table: impl FnOnce() -> SystemTable + Send + 'static,
@@ -207,7 +219,8 @@ impl Drop for Target {
     }
 }
 
-/// Ready once the target's handle asks it to stop, counting the cycles until then.
+/// A stop future that completes once the `Target` handle is dropped. Each
+/// poll counts one cycle.
 struct Until(Arc<AtomicBool>, Arc<AtomicU64>);
 
 impl Future for Until {

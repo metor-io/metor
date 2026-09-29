@@ -186,7 +186,7 @@ fn test_fault_and_destructor_panic_isolation() {
     assert_retirement(true, true);
 }
 
-/// Counts its cycles and completes after the second.
+/// A step that counts its cycles and completes on the second one.
 pub(super) struct Twice(pub Rc<Cell<u64>>, pub Option<EndReason>);
 
 impl Step for Twice {

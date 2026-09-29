@@ -4,7 +4,7 @@ use thiserror::Error;
 use super::params::ParamError;
 use crate::def::DefError;
 
-/// Errors registering system types or building a coordinator.
+/// Errors from registering system types or building a coordinator.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum BuildError {
     #[error("wall clock rate must be finite and at least 0.001 Hz")]

@@ -17,8 +17,10 @@ use crate::pack::def::Instance;
 use crate::system::SystemDef;
 use crate::{ABI_VERSION, Input, Output};
 
-/// A module exporting every ABI function over `memory`, with `extra` beside
-/// them and `execute` as `metor_fsw_execute`'s body.
+/// Returns a module that exports every ABI function.
+///
+/// `memory` is the imported memory's limits, `extra` is spliced in next to the
+/// exports, and `execute` is the body of `metor_fsw_execute`.
 fn wat(memory: &str, extra: &str, execute: &str) -> String {
     format!(
         r#"(module
@@ -57,7 +59,7 @@ fn test_store_past_memory_traps_and_spares_the_arena() {
     // SAFETY: the arena is two pages and the memory one, so the canary is in
     // the arena and outside anything the guest can address.
     let canary = unsafe { base.as_ptr().add(PAGE) };
-    // SAFETY: as above; no guest call is running.
+    // SAFETY: as above, and no guest call is running.
     unsafe { canary.write(0xa5) };
     assert_eq!(guest.execute(0, 0, 10_000), Err(Trap::MemoryOutOfBounds));
     // SAFETY: as above.
@@ -222,9 +224,11 @@ fn test_raw_ring_layout() {
     assert_eq!(raw_ring(ring), golden);
 }
 
-/// A guest that describes an empty pack, bump-allocates, keeps its first
-/// input and output rings' bases in `$in` and `$out` at `create`, and runs
-/// `execute` as its step.
+/// Returns a guest module for step tests.
+///
+/// The guest describes an empty pack and uses a bump allocator. At `create`, it
+/// saves the bases of its first input and output rings in `$in` and `$out`.
+/// `execute` is its step body.
 fn step_wat(execute: &str) -> String {
     format!(
         r#"(module
@@ -264,8 +268,10 @@ fn step_wat(execute: &str) -> String {
 const RING: usize = 256;
 const LOG_RING: usize = 1 << 16;
 
-/// The byte stores that commit `record` into a fresh copy of a `RING`-byte
-/// output, as wat over `$out`; `corrupt` makes its length `u32::MAX`.
+/// Returns wat stores that write `record` into a fresh copy of a `RING`-byte
+/// output at `$out`.
+///
+/// If `corrupt` is set, the record's length is written as `u32::MAX`.
 fn record_stores(record: &[u8], corrupt: bool) -> String {
     let (config, _) = mirror_config(RING, 2).expect("fits");
     let ring = RingBuffer::create_in_memory(config);
@@ -288,7 +294,7 @@ fn record_stores(record: &[u8], corrupt: bool) -> String {
         .collect()
 }
 
-/// A `WasmStep` over a `step_wat` guest, and the host ends of its rings.
+/// A `WasmStep` running a `step_wat` guest, plus the host ends of its rings.
 struct Rig {
     step: WasmStep,
     input: RingBuffer,
@@ -350,7 +356,7 @@ impl Rig {
         self.step.execute(Timestamp(1));
     }
 
-    /// Every line on the log as `kind: message`.
+    /// Returns every log line as `kind: message`.
     fn lines(&mut self) -> Vec<String> {
         let lines: Vec<LogEvent> = self.log.drain().flatten().collect();
         lines

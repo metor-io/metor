@@ -1,4 +1,4 @@
-"""Target recording, to_config(), and emission."""
+"""Tests for building targets, `to_config()`, and emitting the config."""
 
 from __future__ import annotations
 
@@ -51,7 +51,8 @@ def adcs_target() -> Target:
 
 
 def reset() -> None:
-    """Leave no target or deployment behind, or the atexit hook emits to stdout."""
+    """Clears every target and deployment, so the atexit hook has nothing to
+    emit to stdout."""
     target_mod._targets.clear()
     deploy_mod._deployments.clear()
     deploy_mod._emitted = False

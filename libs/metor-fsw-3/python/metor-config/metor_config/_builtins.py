@@ -1,11 +1,15 @@
-"""The systems every target may add: `Publish` out, `Subscribe` in, `Db`,
-the embedded database a gateway records into, and `DlSlot` and
-`ChannelRegistry` for channels.
+"""Built-in systems that any target can add.
 
-All are built into the host rather than supplied by a pack, so their pack has
-no library and `Target.to_config` leaves it out of the config's pack list. Each
-link owns one transport: a `listen` address, a `connect` address, or a `peer`
-link of the deployment that `metor build` turns into an address.
+`Publish` sends records to other targets, and `Subscribe` receives them. `Db`
+is an embedded database, which is how a gateway records telemetry. `DlSlot`
+and `ChannelRegistry` support channels.
+
+These systems are built into the host rather than supplied by a pack, so
+their pack has no library and is left out of the config's pack list.
+
+The three link systems (`Publish`, `Subscribe`, and `Db`) each take exactly
+one transport: a `listen` address, a `connect` address, or a `peer` link in
+the same deployment, which `metor build` turns into an address.
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ INBOUND_CAP = 256
 
 
 class LinkStatus(Record):
-    """What a link reports about its sockets."""
+    """Socket statistics that a link writes when they change."""
 
     _name = "link_status"
     _kind = "frame"
@@ -49,7 +53,7 @@ class LinkStatus(Record):
 
 
 class DbStatus(Record):
-    """What a `Db` reports about what it ingested."""
+    """Ingest counters that a `Db` writes when they change."""
 
     _name = "db_status"
     _kind = "frame"
@@ -57,8 +61,11 @@ class DbStatus(Record):
 
 
 class Link(System):
-    """A system that owns one transport and is named on the wire by its
-    target's namespace and its own instance name."""
+    """Base class for systems that send or receive records over a network
+    connection.
+
+    Peers identify a link by its target's namespace and its own name.
+    """
 
     _pack = PACK
 
@@ -91,7 +98,7 @@ class Link(System):
         return {"peer": {"target": _namespace(self._peer), "link": self._peer._name}}
 
     def listen_port(self) -> int | None:
-        """The port this link binds, or `None` for one that dials."""
+        """Returns the port this link listens on, or `None` if it dials."""
         listen = self._transport.get("listen") if self._peer is None else None
         if listen is None:
             return None
@@ -99,8 +106,10 @@ class Link(System):
 
 
 class Sink(Link):
-    """A link fed by the ports `items` name; `all` feeds it every system added
-    before it."""
+    """A link that reads the ports listed in `items`.
+
+    With `all`, it also reads every port of every system added before it.
+    """
 
     _takes_inputs = True
 
@@ -126,10 +135,11 @@ class Sink(Link):
 
 
 class Publish(Sink):
-    """Serves the records `items` name to whoever connects.
+    """Sends records to every connected peer.
 
-    An item is a system handle, which publishes every port that handle knows,
-    or one port. `all` publishes every system added before this one.
+    `items` lists what to publish. An item is either a system handle, which
+    publishes all of that system's ports, or a single port. With `all`, it
+    publishes every system added before this one.
     """
 
     _ty = "publish"
@@ -149,9 +159,12 @@ class Publish(Sink):
 
 
 class Db(Sink):
-    """The embedded database: records every port `items` name and serves the
-    result on `listen`. `path` is the store's directory; unset, a fresh
-    temporary one. `all` records every system added before this one.
+    """An embedded database that records telemetry.
+
+    It stores every record from the ports in `items`, and serves the database
+    to clients on `listen`. `path` is the database directory. When unset, a
+    fresh temporary directory is used. With `all`, it records every system
+    added before this one.
     """
 
     _ty = "db"
@@ -171,14 +184,17 @@ class Db(Sink):
 
 
 class Subscribe(Link):
-    """Writes the records it is sent onto ports of its own.
+    """Receives records from peers and writes them to its own output ports.
 
-    `records` lists message classes, one port each named after the record,
-    resolved against this target's packs. With a `peer`, `items` lists the
-    peer's published ports to copy, each keeping its `{system}.{port}` name;
-    a message record arrives on one port however many the peer publishes it
-    on, the first listed. No `items` and no `records` copies everything the
-    peer publishes. `port()` returns this system's copy of a published port.
+    `records` lists message classes to accept. Each one gets an output port
+    named after the record.
+
+    With a `peer`, the subscriber copies ports that the peer `Publish`
+    serves. `items` lists which of the peer's ports to copy, and each copy
+    keeps its `{system}.{port}` name. A message record gets only one port,
+    even if the peer publishes it on several; the first one listed wins.
+    With neither `items` nor `records`, it copies everything the peer
+    publishes. Use `port()` to get this subscriber's copy of a peer's port.
     """
 
     _ty = "subscribe"
@@ -238,7 +254,8 @@ class Subscribe(Link):
         raise ConfigError(f"`{name}` does not copy `{source.name}`")
 
     def _peer_copies(self) -> list[Copy]:
-        """One copy per published port this subscriber takes."""
+        """Returns one copy for each of the peer's ports this subscriber
+        takes."""
         if self._copies is None:
             self._copies = _copies(self._peer, self._items, self._records) if self._peer else []
         return self._copies
@@ -246,8 +263,11 @@ class Subscribe(Link):
 
 @dataclass(frozen=True)
 class Copy:
-    """One output copied from a peer: its name here, its record, and the
-    published port it comes from."""
+    """An output port that copies one of a peer's published ports.
+
+    ``port`` is the name on this subscriber, ``record`` is its record class,
+    and ``source`` is the name of the peer's port it copies.
+    """
 
     port: str
     record: type[Record]
@@ -280,7 +300,8 @@ def _copies(peer: SystemHandle, items: Sequence[Item], records: Sequence[type[Re
 
 
 def _published(peer: SystemHandle) -> list[OutPort[Any]]:
-    """Every port the peer link publishes, after `all` expansion."""
+    """Returns every port the peer link publishes, including those added by
+    `all`."""
     system = peer._system
     if not isinstance(system, Publish):
         return []
@@ -323,12 +344,14 @@ def _transport(
 
 
 class DlSlot(System):
-    """One place in the schedule that loads a pack system on its channel's `Load`.
+    """A slot in the schedule that can swap which pack system runs in it.
 
-    ``allow`` lists the pack systems it may load, each named by its type; every
-    one takes the first's ports. ``initial`` names the one loaded at boot.
-    Inputs are wired on the slot, as keywords of the first system's inputs.
-    The slot needs ``channel=`` on `Target.add`.
+    A `Load` command on the slot's channel picks the system to run.
+    ``allow`` lists the pack systems it can load; each is named by its type,
+    and all must have the same ports as the first. ``initial`` names the
+    system loaded at boot. Inputs are wired on the slot itself, using the
+    first system's input names as keywords. The slot must be added with
+    ``channel=`` on `Target.add`.
     """
 
     _ty = "dl_slot"
@@ -353,7 +376,8 @@ class DlSlot(System):
 
 
 def _candidate(system: System) -> dict[str, Any]:
-    """One `allow` entry: the system's type, params, and the pack `metor build` opens."""
+    """Returns one `allow` entry: the system's type and params, and the pack
+    that `metor build` opens to resolve it."""
     if not isinstance(system, System) or isinstance(system, (Link, DlSlot)):
         raise ConfigError(f"a slot allows pack systems, got {system!r}")
     check_abi(system._pack.id, system._pack.abi_version)
@@ -368,8 +392,11 @@ def _candidate(system: System) -> dict[str, Any]:
 
 
 class ChannelRegistry(System):
-    """Publishes every channel of its target, with the names each slot may
-    load, on its first cycle and then once a second."""
+    """Publishes a list of the target's channels.
+
+    The list includes the candidates each slot can load. It is written on
+    the first cycle and then once a second.
+    """
 
     _ty = "channel_registry"
     _pack = PACK

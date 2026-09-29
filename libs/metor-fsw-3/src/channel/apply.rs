@@ -1,10 +1,10 @@
-//! Which commands a channel accepts, and in which state.
+//! The rules for which commands a channel accepts in each state.
 
 use metor_proto_wkt::SequenceCommandKind;
 
 use crate::coordinator::RunState;
 
-/// What [`apply`] reads of a channel.
+/// The parts of a channel's state that [`apply`] checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct State {
     pub run: RunState,
@@ -13,7 +13,7 @@ pub struct State {
     pub abortable: bool,
 }
 
-/// A command with its payload set aside.
+/// A channel command, without its payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Load,
@@ -35,7 +35,7 @@ impl Command {
     }
 }
 
-/// Why a channel refused a command.
+/// The reason a channel refused a command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
     #[error("the channel is running")]
@@ -48,7 +48,10 @@ pub enum Refusal {
     NotAbortable,
 }
 
-/// Whether `state` accepts `command`, or why it refuses it.
+/// Checks whether a channel in `state` accepts `command`.
+///
+/// # Errors
+/// Returns the reason the channel refuses the command.
 pub fn apply(state: State, command: Command) -> Result<(), Refusal> {
     let live = state.run == RunState::Running && !state.ended;
     match command {
@@ -162,8 +165,9 @@ mod proofs {
         }
     }
 
-    /// A live channel accepts only `Stop` and `Abort`, and only a live one
-    /// accepts them, so `Reset` and `Load` never apply to a running system.
+    /// A live channel accepts only `Stop` and `Abort`, and a channel that is
+    /// not live never accepts them. So `Reset` and `Load` never apply to a
+    /// running system.
     #[kani::proof]
     fn test_live_channel_transitions() {
         let state = any_state();

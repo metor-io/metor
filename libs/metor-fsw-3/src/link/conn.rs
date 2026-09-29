@@ -1,5 +1,8 @@
-//! The connection slots both links share: an outbox per connection and the
-//! task serving it.
+//! Connection handling shared by `Publish` and `Subscribe`.
+//!
+//! A link serves up to a fixed number of connections at once. Every batch the
+//! link queues is sent to each open connection, and every packet a connection
+//! reads goes to the link's [`Inbox`].
 
 use core::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -13,9 +16,11 @@ use crate::Stop;
 
 use super::inbox::Inbox;
 
-/// An `Outbox` is the queue between the link and one connection's writer:
-/// the link fills it, the writer swaps it out. Both run on one executor, so
-/// a `RefCell` and a wake are the whole channel.
+/// The queue of bytes between a link and one connection's writer.
+///
+/// The link appends batches, and the writer swaps the whole buffer out. Both
+/// run on the same executor, so a `RefCell` and a wait queue are enough; no
+/// lock is needed.
 struct Outbox {
     pending: RefCell<Vec<u8>>,
     written: Cell<u64>,
@@ -33,7 +38,7 @@ impl Outbox {
         }
     }
 
-    /// Queues a whole batch, or none of it.
+    /// Queues all of `batch`, or none of it. Returns false if it does not fit.
     fn enqueue(&self, batch: &[u8]) -> bool {
         {
             let mut pending = self.pending.borrow_mut();
@@ -46,7 +51,8 @@ impl Outbox {
         true
     }
 
-    /// Hands the queued bytes to the writer, keeping the queue's capacity.
+    /// Swaps the queued bytes into `buf` and leaves the queue empty with its
+    /// full capacity reserved.
     fn swap(&self, buf: &mut Vec<u8>) {
         let mut pending = self.pending.borrow_mut();
         core::mem::swap(&mut *pending, buf);
@@ -54,13 +60,13 @@ impl Outbox {
         pending.reserve_exact(self.cap);
     }
 
-    /// Whether the writer has something to do.
+    /// Returns true if there are bytes waiting to be written.
     fn ready(&self) -> bool {
         !self.pending.borrow().is_empty()
     }
 }
 
-/// What a link reports about its sockets.
+/// Socket counters for a link.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Stats {
     pub connections: u32,
@@ -68,15 +74,16 @@ pub(crate) struct Stats {
     pub batches_dropped: u64,
 }
 
-/// A slot claimed for a connection about to be served.
+/// A claimed slot, reserved for a connection that is about to be served.
 pub(crate) struct Slot {
     at: usize,
     outbox: Rc<Outbox>,
 }
 
-/// What a link's loop and its connection task share: one slot per allowed
-/// connection, what every connection is sent first, where every connection's
-/// reads go, and the counters.
+/// The set of connections a link is serving.
+///
+/// The link's loop queues batches through it, and each connection task
+/// serves one slot. A new connection is sent the seed bytes before any batch.
 pub(crate) struct Connections {
     slots: RefCell<Vec<Option<Rc<Outbox>>>>,
     cap: usize,
@@ -89,8 +96,10 @@ pub(crate) struct Connections {
 }
 
 impl Connections {
-    /// `count` slots, each connection with a `cap`-byte outbox and a `cap`-byte
-    /// receive buffer, sent `seed` first and handing every packet it reads to
+    /// Creates `count` empty slots.
+    ///
+    /// Each connection gets a `cap`-byte outbox and a `cap`-byte receive
+    /// buffer. It is sent `seed` first, and every packet it reads goes to
     /// `inbox`.
     pub(crate) fn new(count: usize, cap: usize, seed: Vec<u8>, inbox: Rc<Inbox>) -> Self {
         Self {
@@ -104,15 +113,16 @@ impl Connections {
         }
     }
 
-    /// Waits for a counter to move past `observed`.
+    /// Waits until the counters differ from `observed`.
     async fn changed(&self, observed: Stats) {
         let _ = self.changed.wait_for(|| self.stats() != observed).await;
     }
 
-    /// Claims a free slot, or `None` when every slot is taken.
+    /// Claims a free slot, or returns `None` when every slot is taken.
     ///
-    /// Allocates the connection's outbox; a half ended by `stop` or its peer
-    /// may still hold the previous occupant's buffer in an operation.
+    /// This allocates a fresh outbox rather than reusing the old one, because
+    /// the previous connection's writer may still hold its buffer in an
+    /// in-flight write.
     pub(crate) fn claim(&self) -> Option<Slot> {
         let mut slots = self.slots.borrow_mut();
         let at = slots.iter().position(Option::is_none)?;
@@ -121,7 +131,8 @@ impl Connections {
         Some(Slot { at, outbox })
     }
 
-    /// Frees a slot whose connection ended, keeping its byte count.
+    /// Frees the slot of a closed connection. Its written bytes are added to
+    /// the link's running total.
     fn free(&self, slot: Slot) {
         self.slots.borrow_mut()[slot.at] = None;
         self.bytes_out
@@ -129,8 +140,11 @@ impl Connections {
         self.changed.wake_all();
     }
 
-    /// Serves `stream` from `slot` until either half ends or `stop`, then frees
-    /// the slot. Each connection's announce is checked on its own.
+    /// Serves `stream` from `slot` until the read or write side ends or `stop`
+    /// is set, then frees the slot.
+    ///
+    /// Each connection resets the inbox's announce watch, so every peer's
+    /// announce is checked separately.
     pub(crate) async fn serve(&self, slot: Slot, stream: TcpStream, stop: &Stop) {
         self.inbox.connected();
         let (rx, tx) = stream.split();
@@ -142,8 +156,8 @@ impl Connections {
         self.free(slot);
     }
 
-    /// Queues one batch for every open connection, counting the ones it does
-    /// not fit.
+    /// Queues `batch` on every open connection. Each connection whose outbox
+    /// has no room counts as one dropped batch.
     pub(crate) fn enqueue(&self, batch: &[u8]) {
         for outbox in self.slots.borrow().iter().flatten() {
             if !outbox.enqueue(batch) {
@@ -164,13 +178,13 @@ impl Connections {
 }
 
 pub(crate) enum Event {
-    /// The link's own input has something, raised by the link's loop.
+    /// The link's own input has data. The link's loop raises this itself.
     Ready,
     Changed,
     Stop,
 }
 
-/// Waits for a counter change or shutdown.
+/// Waits until a counter changes or `stop` is set.
 pub(crate) async fn next(conns: &Connections, stop: &Stop) -> Event {
     let observed = conns.stats();
     let changed = async {
@@ -184,7 +198,8 @@ pub(crate) async fn next(conns: &Connections, stop: &Stop) -> Event {
     future::or(changed, stopped).await
 }
 
-/// Writes the seed, then every batch the link queues, one buffer at a time.
+/// Writes the seed, then every batch the link queues. Each write sends the
+/// whole outbox at once.
 async fn write_half(
     outbox: &Outbox,
     changed: &WaitQueue,
@@ -211,10 +226,11 @@ async fn write_half(
     }
 }
 
-/// Reads packet bodies into `inbox` until the peer errors or hangs up,
-/// reusing one buffer.
+/// Reads packet bodies into `inbox` until the peer errors or hangs up. One
+/// buffer is reused for every read.
 ///
-/// A packet past the buffer is a read error, so it ends the connection.
+/// A packet larger than the buffer is a read error, so it closes the
+/// connection.
 async fn read_half(rx: OwnedReader<TcpStream>, buf: Vec<u8>, inbox: &Inbox) {
     let mut reader = LengthDelReader::<_, u32>::new(rx);
     let mut buf = buf;

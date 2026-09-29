@@ -1,4 +1,4 @@
-"""Record a target's systems and build its config."""
+"""`Target`, which collects a target's systems and builds its config."""
 
 from __future__ import annotations
 
@@ -14,9 +14,12 @@ _targets: list["Target"] = []
 
 
 class SystemHandle:
-    """A registered system's ports. Attribute access yields the `OutPort` of a
-    declared output; `Target.add` types it as the `System` subclass it was
-    handed, so a checker resolves each port's record."""
+    """A handle to a system added to a target.
+
+    Reading an attribute returns the `OutPort` for that output. `Target.add`
+    returns the handle typed as the `System` subclass it was given, so a type
+    checker knows each port's record.
+    """
 
     def __init__(self, name: str, target: "Target", system: System) -> None:
         self._name = name
@@ -30,23 +33,26 @@ class SystemHandle:
         return OutPort(self._name, port, record, self._target)
 
     def _port_map(self) -> dict[str, type[Record]]:
-        """Every output this system has, with a channel's own when it has one."""
+        """Returns every output of this system, including a channel's outputs
+        when it has one."""
         ports = self._system._port_map()
         if self._target._channel(self._name) is None:
             return ports
         return {**ports, **CHANNEL_PORTS}
 
     def port(self, source: OutPort[T]) -> OutPort[T]:
-        """This system's copy of ``source``; see `Subscribe.port`."""
+        """Returns this system's copy of ``source``. See `Subscribe.port`."""
         return self._system._port(source, self._name, self._target)
 
 
 class Target:
-    """A target under construction: its clock, its rings' depth, and its systems
-    in step order.
+    """A target: a set of systems that run together, in a fixed order.
 
-    ``sim_dt`` (seconds) selects the simulated clock; without it the loop paces a
-    wall clock at ``cycle_rate``. ``namespace`` prefixes announced names.
+    Add systems with `add`. They run in the order they were added, once per
+    cycle. With ``sim_dt`` (in seconds), the target runs on a simulated clock
+    that advances that much each cycle. Without it, the target runs in real
+    time at ``cycle_rate`` Hz. ``namespace`` is prefixed to the names the
+    target announces to its peers.
     """
 
     def __init__(
@@ -68,8 +74,11 @@ class Target:
         _targets.append(self)
 
     def loop(self, record: type[T]) -> Loop[T]:
-        """A one-cycle delayed edge of ``record``, read by a system added before
-        its producer. Connect it once the producer exists."""
+        """Creates a feedback edge for ``record`` with a one-cycle delay.
+
+        Pass the loop to a system that needs to read from a producer added
+        later. Call `Loop.connect` once the producer exists.
+        """
         return Loop(record)
 
     def add(
@@ -80,13 +89,17 @@ class Target:
         channel: str | None = None,
         start: str | None = None,
     ) -> S:
-        """Register ``system`` as ``name``; the returned handle carries its output
-        ports. Add order is step order, so a system only names ports of systems
-        already added. ``thread`` places an async system on a thread of that name.
+        """Adds ``system`` to the target under ``name``.
 
-        ``channel`` makes a cyclic system commandable under that name, adding
-        its ``events`` and ``channel_status`` outputs; ``start`` is
-        ``"running"`` or ``"stopped"``, its state at boot.
+        Returns a handle whose attributes are the system's output ports.
+        Systems run in the order they are added, so a system can only read
+        ports of systems added before it. Use `loop` to read from a later one.
+
+        ``thread`` runs an async system on the named thread. ``channel`` puts
+        a cyclic system behind a channel with that name, so it can be started,
+        stopped, and loaded by commands. This adds ``events`` and
+        ``channel_status`` outputs. ``start`` sets the channel's state at boot:
+        ``"running"`` (the default) or ``"stopped"``.
         """
         adapter = _adapter(thread, channel, start)
         if name in self._handles:
@@ -104,9 +117,12 @@ class Target:
         return cast(S, handle)
 
     def wasm(self, pack: Pack, *, fuel: int | None = None, memory: int | None = None) -> None:
-        """Load ``pack`` as a WebAssembly module on this target, each system in
-        a guest of its own. ``fuel`` is each step's grant and ``memory`` each
-        guest's ceiling in bytes; unset, the host's defaults apply."""
+        """Runs ``pack`` as a WebAssembly module on this target.
+
+        Each of the pack's systems runs in its own sandboxed guest. ``fuel``
+        limits how much work each step may do, and ``memory`` limits each
+        guest's memory in bytes. When unset, the host's defaults apply.
+        """
         if not pack.wasm:
             raise ConfigError(
                 f"pack `{pack.id}` has no module; set `wasm = true` under "
@@ -116,12 +132,15 @@ class Target:
         self._wasm[pack.id] = {key: value for key, value in choice.items() if value is not None}
 
     def commands(self, *sources: Source[Any]) -> None:
-        """Feed every channel, added before or after this call, the
-        `SequenceCommand`s these ports carry."""
+        """Sends the `SequenceCommand`s from these ports to every channel.
+
+        This applies to every channel on the target, whether it was added
+        before or after this call.
+        """
         self._commands.extend(_sources("commands", sources))
 
     def _channels(self) -> list[tuple[str, System]]:
-        """Each channel's name and its system, in step order."""
+        """Returns each channel's name and system, in step order."""
         return [
             (adapter["channel"]["name"], system)
             for _, system, adapter in self._systems
@@ -135,16 +154,17 @@ class Target:
         return None
 
     def index(self, name: str) -> int:
-        """Where the system `name` sits in step order."""
+        """Returns the position of the system `name` in step order."""
         for index, (added, _, _) in enumerate(self._systems):
             if added == name:
                 return index
         raise ConfigError(f"target `{self.namespace}` has no system `{name}`")
 
     def to_config(self) -> dict[str, Any]:
-        """This target's packs and its coordinator, as one member of the envelope.
+        """Returns this target's entry in the deployment config.
 
-        A pack with no library is built into the host, so it is not listed.
+        The entry lists the target's packs and its coordinator config. A pack
+        with no library is built into the host, so it is not listed.
         """
         self._check_commands()
         return {
@@ -164,7 +184,8 @@ class Target:
         }
 
     def _check_commands(self) -> None:
-        """A channel no command reaches cannot be commanded, so it is refused."""
+        """Raises `ConfigError` if the target has channels but no command
+        source, since those channels could never be commanded."""
         channels = self._channels()
         if channels and not self._commands:
             raise ConfigError(
@@ -204,7 +225,7 @@ class Target:
 def _adapter(
     thread: str | None, channel: str | None, start: str | None
 ) -> dict[str, Any] | None:
-    """The adapter key a system's config entry carries, if any."""
+    """Returns the adapter entry for a system's config, if it has one."""
     if thread is not None and channel is not None:
         raise ConfigError("a system takes `thread` or `channel`, not both")
     if start is not None and channel is None:
@@ -229,7 +250,11 @@ def _resolve(target: Target, name: str, port: str, source: Source[Any]) -> dict[
 
 
 def _local(target: Target, name: str, port: str, source: OutPort[Any]) -> dict[str, str]:
-    """``source``'s reference, which only names a port of ``target`` itself."""
+    """Returns the reference to ``source``.
+
+    Raises `ConfigError` if ``source`` belongs to another target, since a
+    system can only read ports on its own target.
+    """
     if source.target is not None and source.target is not target:
         raise ConfigError(
             f"`{name}.{port}` reads `{source.name}` on another target; subscribe to "

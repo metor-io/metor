@@ -1,4 +1,4 @@
-//! The shared inbox for connections
+//! The inbox where a link's connections put the packets they read.
 
 use core::cell::{Cell, RefCell};
 use core::mem::size_of;
@@ -12,15 +12,20 @@ use crate::port::ring_capacity;
 
 const PER_RECORD_OVERHEAD: usize = PACKET_HEADER_LEN + size_of::<Timestamp>();
 
-/// What a peer sends about itself before its data; none of it is data.
+/// Messages a peer sends to describe itself before it sends data. None of
+/// them are routed to a port.
 const ANNOUNCE: [PacketId; 3] = [LinkInfo::ID, SetComponentMetadata::ID, SetMsgMetadata::ID];
 
-/// Shared inbox for connections
+/// The queue of inbound packets shared by all of a link's connections.
 ///
-/// Internally this is a wrapper around [`RingBuffer`]. With the announce
-/// watch on, it also records which of its tables the peer announced before
-/// its first data packet, so the link can fault a port whose table never
-/// came. Every connection starts that record over.
+/// Connections push the packets they read, and the link drains them onto its
+/// ports. Packets no port wants never enter the queue.
+///
+/// An inbox can also watch each peer's announce. The announce is the set of
+/// vtable messages a peer sends before its first data packet. While watching,
+/// the inbox records which of its tables the peer announced, so the link can
+/// log a fault for any table that never arrived. That record resets on every
+/// new connection.
 pub(crate) struct Inbox {
     writer: RefCell<Writer<Notifier>>,
     wake: Notifier,
@@ -30,7 +35,8 @@ pub(crate) struct Inbox {
     dropped: Cell<u64>,
     watching: Cell<bool>,
     pending: Cell<bool>,
-    /// One flag per entry of `tables`, set by this connection's announce.
+    /// One flag per entry of `tables`, set when the current peer announces
+    /// that table.
     announced: RefCell<Vec<bool>>,
     seen_data: Cell<bool>,
 }
@@ -48,7 +54,8 @@ impl Inbox {
             max_readers: 1,
         });
         let wake = Notifier::default();
-        // PANIC Safety: the ring is new, so its writer and reader slot are free.
+        // PANIC Safety: the ring is new, so its writer and its one reader slot
+        // are both free.
         let writer = ring.writer(wake.clone()).expect("a new ring's writer");
         let view = ring.view(wake.clone()).expect("a new ring's reader slot");
         let inbox = Self {
@@ -66,21 +73,22 @@ impl Inbox {
         Some((inbox, view))
     }
 
-    /// A blackhole inbox that can accept nothing
+    /// Creates an inbox that routes no packets anywhere.
     pub(crate) fn blackhole() -> Self {
-        // PANIC Safety: one empty record always fits a ring.
+        // PANIC Safety: a ring with room for one empty record always builds.
         Self::new(Vec::new(), Vec::new(), 1, 0)
             .expect("a one-record ring")
             .0
     }
 
-    /// Watches every connection's announce, each until its first data packet.
+    /// Turns on the announce watch. From then on, each connection's announce
+    /// is tracked until that connection's first data packet.
     pub(crate) fn watch(&self) {
         self.watching.set(true);
     }
 
-    /// Starts one connection: what the last peer announced is forgotten and
-    /// the watch, if this inbox has one, is armed again.
+    /// Marks the start of a new connection. If the announce watch is on, this
+    /// forgets what the previous peer announced and arms the watch again.
     pub(crate) fn connected(&self) {
         if !self.watching.get() {
             return;
@@ -90,13 +98,18 @@ impl Inbox {
         self.pending.set(true);
     }
 
-    /// Whether the watch has what it needs and the link has not read it.
+    /// Returns true once the current peer has sent data and the link has not
+    /// yet checked its announce.
     pub(crate) fn check_due(&self) -> bool {
         self.pending.get() && self.seen_data.get()
     }
 
-    /// The tables this peer never announced, once its data started; ends this
-    /// connection's watch. Empty before then, and after.
+    /// Returns the tables the current peer did not announce before its first
+    /// data packet.
+    ///
+    /// The first call after [`check_due`](Self::check_due) turns true yields
+    /// them and ends the watch for this connection. Every other call yields
+    /// nothing.
     pub(crate) fn unannounced_iter(&self) -> impl Iterator<Item = PacketId> + '_ {
         let due = self.check_due();
         if due {
@@ -109,9 +122,11 @@ impl Inbox {
             .map(|at| self.tables[at])
     }
 
-    /// Writes one packet body carrying a message or a table a port asked for;
-    /// one longer than any port takes, or one the ring has no room for, is a
-    /// drop. Every other packet is the peer's business.
+    /// Queues one packet body for the link's ports.
+    ///
+    /// Packets that no port takes are ignored. A packet whose payload is longer
+    /// than any port accepts, or that does not fit in the queue, is counted as
+    /// dropped.
     pub(crate) fn accept(&self, body: &[u8]) {
         let Some((ty, id, bytes)) = packet(body) else {
             return;
@@ -135,9 +150,10 @@ impl Inbox {
         }
     }
 
-    /// Notes an announced table: postcard lays a `VTableMsg` out with its id's
-    /// two bytes first. A table no port of this inbox takes is the peer's
-    /// business.
+    /// Records that the peer announced a table.
+    ///
+    /// Postcard encodes a `VTableMsg` with the table id's two bytes first, so
+    /// only those are read. Tables no port takes are ignored.
     fn announce(&self, bytes: &[u8]) {
         if !self.pending.get() {
             return;
@@ -150,15 +166,15 @@ impl Inbox {
         }
     }
 
-    /// The first data packet ends the announce, which the watching link is
-    /// woken to read.
+    /// Notes that the peer sent data, which ends its announce. On the first
+    /// data packet, this wakes the link so it can check the announce.
     fn data_seen(&self) {
         if self.pending.get() && !self.seen_data.replace(true) {
             self.wake.notify();
         }
     }
 
-    /// Counts one packet no port will see.
+    /// Counts one packet that no port will receive.
     fn drop_one(&self) {
         self.dropped.set(self.dropped.get() + 1);
     }
@@ -168,8 +184,8 @@ impl Inbox {
     }
 }
 
-/// The type, id, and payload of the record a packet body carries; `None` for
-/// a time series, or a body too short for its header.
+/// Parses a packet body into its type, id, and payload. Returns `None` for a
+/// time series packet, or a body too short for its header.
 pub(crate) fn packet(body: &[u8]) -> Option<(PacketTy, PacketId, &[u8])> {
     let (header, rest) = PacketHeader::try_ref_from_prefix(body).ok()?;
     let bytes = match header.packet_ty {
@@ -374,7 +390,7 @@ mod tests {
         assert!(ones.len() >= 2 && inbox.dropped() >= 1);
         assert_eq!(ones.len() as u64 + inbox.dropped(), offered);
         assert!(ones.iter().all(|(_, bytes)| bytes == b"one"));
-        // The drained space takes the next record.
+        // Draining freed room in the ring for the next record.
         let dropped = inbox.dropped();
         inbox.accept(&msg(id_of::<Fixed>(), b"two"));
         assert_eq!(drain(&mut view), vec![(id_of::<Fixed>(), b"two".to_vec())]);

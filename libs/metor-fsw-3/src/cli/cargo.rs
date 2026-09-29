@@ -1,5 +1,6 @@
-//! Building a pack's cdylib or module with cargo, finding what it wrote, and
-//! the `pyproject.toml` fields that name it.
+//! Builds packs with cargo and reads their `pyproject.toml` settings.
+//!
+//! A pack builds as a native cdylib, and optionally as a wasm module too.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -7,7 +8,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use super::pack_dev::PackDevError;
 use crate::dl::WASM_TRIPLE;
 
-/// A `CargoError` is why a pack's cdylib or module did not appear.
+/// An error building a pack's cdylib or wasm module.
 #[derive(Debug, thiserror::Error)]
 pub enum CargoError {
     #[error("running cargo: {0}")]
@@ -18,19 +19,19 @@ pub enum CargoError {
     NoArtifact(&'static str, String),
 }
 
-/// Builds `package` from `manifest_dir` and returns the cdylib cargo wrote.
+/// Builds `package` from `manifest_dir` and returns the path of its cdylib.
 ///
-/// Cargo's stderr is inherited, so its progress is the caller's progress.
+/// Cargo's stderr is passed through, so the user sees its progress.
 pub fn cargo_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoError> {
     let args = ["build", "-p", package, "--message-format=json"];
     let stdout = cargo(manifest_dir, &args)?;
     cdylib(&stdout).ok_or_else(|| CargoError::NoArtifact("cdylib", package.to_string()))
 }
 
-/// Builds `package` from `manifest_dir` for wasm32, importing its memory, and
-/// returns the module cargo wrote.
+/// Builds `package` from `manifest_dir` as a wasm module and returns its path.
 ///
-/// `cargo rustc` passes the link flag to the pack crate alone, so its
+/// The module imports its memory from the host. This uses `cargo rustc` so
+/// the `--import-memory` link flag applies only to the pack crate, and its
 /// dependencies stay cached.
 pub fn wasm_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoError> {
     let args = [
@@ -49,8 +50,9 @@ pub fn wasm_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoEr
     module(&stdout).ok_or_else(|| CargoError::NoArtifact("module", package.to_string()))
 }
 
-/// Runs cargo with `args` in `dir`, returning its stdout. Cargo's stderr is
-/// inherited, so its progress is the caller's progress.
+/// Runs cargo with `args` in `dir` and returns its stdout.
+///
+/// Cargo's stderr is passed through, so the user sees its progress.
 fn cargo(dir: &Path, args: &[&str]) -> Result<Vec<u8>, CargoError> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
@@ -65,19 +67,20 @@ fn cargo(dir: &Path, args: &[&str]) -> Result<Vec<u8>, CargoError> {
     Ok(output.stdout)
 }
 
-/// Reads the last cdylib's library out of cargo's `compiler-artifact` lines.
+/// Finds the native library of the last cdylib in cargo's JSON output.
 fn cdylib(stdout: &[u8]) -> Option<PathBuf> {
     cdylib_file(stdout, |name| {
         !name.ends_with(".rlib") && !name.ends_with(".rmeta")
     })
 }
 
-/// Reads the last cdylib's module out of cargo's `compiler-artifact` lines.
+/// Finds the wasm module of the last cdylib in cargo's JSON output.
 fn module(stdout: &[u8]) -> Option<PathBuf> {
     cdylib_file(stdout, |name| name.ends_with(".wasm"))
 }
 
-/// The first file `pick` takes from the last cdylib artifact cargo reported.
+/// Returns the first file matching `pick` from the last cdylib artifact in
+/// cargo's JSON output.
 fn cdylib_file(stdout: &[u8], pick: impl Fn(&str) -> bool) -> Option<PathBuf> {
     stdout.split(|&byte| byte == b'\n').rev().find_map(|line| {
         let message: serde_json::Value = serde_json::from_slice(line).ok()?;
@@ -97,25 +100,27 @@ fn cdylib_file(stdout: &[u8], pick: impl Fn(&str) -> bool) -> Option<PathBuf> {
     })
 }
 
-/// A pack's identity as its `pyproject.toml` spells it.
+/// A pack's names and build settings, read from its `pyproject.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackConfig {
-    /// The distribution name, `[project] name`.
+    /// The distribution name, from `[project] name`.
     pub dist: String,
-    /// The pack id, the prefix every `ty` carries.
+    /// The pack id. Every system type in the pack starts with it.
     pub id: String,
     /// The cargo package to build.
     pub krate: String,
     /// The cdylib stem, without the platform's prefix and extension.
     pub lib: String,
-    /// The Python module the generated code lands in.
+    /// The Python module the generated code is written to.
     pub module: String,
-    /// Whether the pack is also built as a module, `[tool.metor.pack] wasm`.
+    /// Whether the pack is also built as a wasm module, from
+    /// `[tool.metor.pack] wasm`.
     pub wasm: bool,
 }
 
 impl PackConfig {
-    /// Reads `<root>/pyproject.toml`, filling every field cargo can supply.
+    /// Reads `<root>/pyproject.toml`. Fields it leaves out are filled in from
+    /// `Cargo.toml` where possible.
     pub fn read(root: &Path) -> Result<PackConfig, PackDevError> {
         let pyproject = read_toml(&root.join("pyproject.toml"))?;
         let dist = string(&pyproject, &["project", "name"])
@@ -140,8 +145,11 @@ impl PackConfig {
     }
 }
 
-/// The cargo package and cdylib stem, each filled from `<root>/Cargo.toml`
-/// when not given: `[package] name`, then `[lib] name` or the package's.
+/// Returns the cargo package name and cdylib stem.
+///
+/// Any that are not given come from `<root>/Cargo.toml`: the package from
+/// `[package] name`, and the stem from `[lib] name`, falling back to the
+/// package name.
 fn cargo_names(
     root: &Path,
     krate: Option<String>,
@@ -168,17 +176,17 @@ pub(super) fn read_toml(path: &Path) -> Result<toml::Value, PackDevError> {
     })
 }
 
-/// The value at `path`, absent when any step of it is.
+/// Returns the value at `path`, or `None` if any key along it is missing.
 pub(super) fn lookup<'a>(table: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
     path.iter().try_fold(table, |value, key| value.get(key))
 }
 
-/// The string at `path`, absent when any step of it is.
+/// Returns the string at `path`, or `None` if any key along it is missing.
 pub(super) fn string(table: &toml::Value, path: &[&str]) -> Option<String> {
     lookup(table, path)?.as_str().map(str::to_string)
 }
 
-/// A distribution or crate name as a Python or Rust identifier.
+/// Turns a distribution or crate name into a Python or Rust identifier.
 fn identifier(name: &str) -> String {
     name.replace('-', "_")
 }
@@ -229,7 +237,8 @@ mod tests {
         assert_eq!(cdylib(b""), None);
     }
 
-    /// A pack directory holding the two manifests `PackConfig::read` looks at.
+    /// Creates a pack directory with the two manifests `PackConfig::read`
+    /// reads.
     fn root(pyproject: &str, cargo: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("a temp dir");
         std::fs::write(dir.path().join("pyproject.toml"), pyproject).expect("writes");

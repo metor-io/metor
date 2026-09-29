@@ -247,7 +247,8 @@ fn channel(name: &str, start: RunState) -> Option<Adapter> {
     }))
 }
 
-/// `cmds -> imu -> {ty} as channel "ctr" -> watch`.
+/// A config where `cmds` commands a `ty` system behind channel `ctr`, and
+/// `watch` records the channel's events and status.
 fn config(ty: &str, start: RunState) -> CoordinatorConfig {
     let mut inputs = vec![InputConfig::new("commands", "cmds", "commands")];
     if ty == "counter" {

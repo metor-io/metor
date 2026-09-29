@@ -1,4 +1,4 @@
-//! Systems exercising the fsw-3 pack ABI.
+//! A test pack whose systems exercise the fsw-3 pack ABI.
 
 use std::cell::RefCell;
 
@@ -12,7 +12,8 @@ use metor_fsw_3::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// The record every system here carries. The host names it `ping` too.
+/// The record most systems here read and write. The integration tests
+/// declare the same record on the host side.
 #[derive(Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug)]
 #[postcard(crate = metor_fsw_3::postcard_schema)]
 #[record(max_len = 8)]
@@ -20,7 +21,7 @@ pub struct Ping {
     pub n: u32,
 }
 
-/// The frame this pack carries, so one can cross targets.
+/// A frame type, so tests can send a frame from one target to another.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[frame(name = "sample")]
 #[repr(C)]
@@ -122,7 +123,7 @@ fn boom(#[state] s: &mut Boom, output: &mut Output<Ping>) {
     let _ = output.write(&Ping { n: s.0 });
 }
 
-/// `gain`'s params.
+/// The params for `gain`.
 #[derive(Deserialize, JsonSchema)]
 pub struct GainParams {
     /// Scales every ping.
@@ -141,7 +142,7 @@ impl Gain {
 #[system]
 fn fail_input(input: &mut Input<Ping>) {
     let _ = input;
-    // PANIC Safety: tests guest failure isolation.
+    // PANIC Safety: this tests that a failing guest system is isolated.
     panic!("consumer failed");
 }
 
@@ -243,10 +244,10 @@ async fn count_down(
     seq.sleep(core::time::Duration::from_secs(3600)).await
 }
 
-/// `count_by`'s params.
+/// The params for `count_by`.
 #[derive(Deserialize, JsonSchema)]
 pub struct StrideParams {
-    /// The step between pings; zero is refused.
+    /// The step between pings. Zero is rejected.
     pub by: u32,
 }
 
@@ -262,8 +263,8 @@ impl Stride {
     }
 }
 
-/// Pings three strides on successive cycles, then completes; `count_up`'s
-/// ports, with a constructor that can refuse.
+/// Pings three multiples of `by` on successive cycles, then completes.
+/// It has `count_up`'s ports, but its constructor can fail.
 #[sequence]
 async fn count_by(
     #[state] s: &mut Stride,
@@ -282,11 +283,13 @@ async fn count_by(
 /// The table this pack exports.
 pub fn pack() -> SystemTable {
     if std::env::var_os("METOR_TEST_PACK_BUILDER_PANIC").is_some() {
-        // PANIC Safety: exercises containment at the exported C boundary.
+        // PANIC Safety: this tests that the exported C boundary contains the
+        // panic.
         panic!("pack builder failed");
     }
     let mut table = SystemTable::new();
-    // PANIC Safety: these static record schemas are compatible.
+    // PANIC Safety: every system here uses compatible record schemas, so
+    // registration cannot fail.
     table
         .register("sampler", sampler(), Sampler::default)
         .expect("valid records");

@@ -5,12 +5,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-/// `Params` is one system's config value, decoded once at build.
+/// One system's raw config value.
+///
+/// A system decodes it once, at build time, with [`decode`](Params::decode).
 #[derive(Clone, Copy, Debug)]
 pub struct Params<'a>(pub &'a Value);
 
 impl Params<'_> {
-    /// Decodes the value as `P`, reading null as an empty object and rejecting unknown keys.
+    /// Decodes the value as `P`.
+    ///
+    /// A null value is treated as an empty object. Keys that `P` does not know
+    /// about are an error.
     pub fn decode<P: DeserializeOwned>(self) -> Result<P, ParamError> {
         let empty = Value::Object(serde_json::Map::new());
         let value = if self.0.is_null() { &empty } else { self.0 };
@@ -26,9 +31,9 @@ impl Params<'_> {
     }
 }
 
-/// A `ParamError` is why a config value did not decode as the system's params.
+/// An error from creating a system.
 ///
-/// It crosses the pack boundary as JSON, so it derives serde.
+/// Packs send this error back to the host as JSON, so it derives serde.
 #[derive(Clone, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
 pub enum ParamError {
     #[error("unknown key `{0}`")]

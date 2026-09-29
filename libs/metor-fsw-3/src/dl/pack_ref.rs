@@ -1,4 +1,4 @@
-//! A reference to a pack's built artifact, and the names cargo gives it.
+//! Locates a pack's build output, using the file names cargo gives it.
 
 use std::path::PathBuf;
 
@@ -14,7 +14,7 @@ pub enum PackKind {
     /// A shared library for this host.
     #[default]
     Dylib,
-    /// A WebAssembly module, each system instance in a guest of its own.
+    /// A WebAssembly module. Each system instance runs in its own guest.
     Wasm,
 }
 
@@ -24,22 +24,24 @@ impl PackKind {
     }
 }
 
-/// One pack the config's types come from: its id prefix, its artifact stem,
-/// the per-triple directory its generated module located, and its kind.
+/// Locates one pack whose system types a config uses.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackRef {
+    /// The prefix the pack's types are registered under.
     pub id: String,
+    /// The file stem of the pack's build output.
     pub lib: String,
+    /// The directory with one subdirectory per target triple.
     pub libs: PathBuf,
     #[serde(default, skip_serializing_if = "PackKind::is_dylib")]
     pub kind: PackKind,
-    /// A wasm pack's limits.
+    /// Resource limits for a wasm pack. Ignored for dylibs.
     #[serde(flatten)]
     pub limits: Limits,
 }
 
 impl PackRef {
-    /// A dylib pack's reference.
+    /// Creates a reference to a dylib pack.
     pub fn dylib(id: String, lib: String, libs: PathBuf) -> Self {
         Self {
             id,
@@ -50,7 +52,9 @@ impl PackRef {
         }
     }
 
-    /// The pack's library for this host, or its module.
+    /// Returns the path of the pack's build output.
+    ///
+    /// That is the library for this host, or the wasm module.
     pub fn artifact(&self) -> PathBuf {
         match self.kind {
             PackKind::Dylib => self.libs.join(triple()).join(cdylib_name(&self.lib)),
@@ -58,12 +62,12 @@ impl PackRef {
         }
     }
 
-    /// Opens the artifact as its kind says.
+    /// Opens the pack's build output as the kind of pack it is.
     pub fn open(&self) -> Result<Pack, PackError> {
         let path = self.artifact();
         match self.kind {
-            // SAFETY: a pack reference names a library `pack dev` built
-            // against this ABI; `open` checks the version before calling
+            // SAFETY: a pack reference points at a library that `pack dev`
+            // built against this ABI. `open` checks the version before calling
             // anything else.
             PackKind::Dylib => unsafe { DlPack::open(&path) }.map(Pack::Dl),
             PackKind::Wasm => {
@@ -74,7 +78,7 @@ impl PackRef {
     }
 }
 
-/// The host target triple, as cargo prints it.
+/// Returns the host's target triple, spelled the way cargo spells it.
 pub fn triple() -> String {
     let arch = std::env::consts::ARCH;
     #[cfg(target_os = "macos")]
@@ -86,7 +90,7 @@ pub fn triple() -> String {
     format!("{arch}-{rest}")
 }
 
-/// The file name a cdylib of `stem` has on this host.
+/// Returns the file name cargo gives a cdylib called `stem` on this host.
 pub fn cdylib_name(stem: &str) -> String {
     format!(
         "{}{stem}{}",
@@ -95,10 +99,10 @@ pub fn cdylib_name(stem: &str) -> String {
     )
 }
 
-/// The target a pack is built for as a module.
+/// The target triple a wasm pack is built for.
 pub const WASM_TRIPLE: &str = "wasm32-unknown-unknown";
 
-/// The file name a module of `stem` has.
+/// Returns the file name of a wasm module called `stem`.
 pub fn wasm_name(stem: &str) -> String {
     format!("{stem}.wasm")
 }

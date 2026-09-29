@@ -1,4 +1,5 @@
-//! The [`Param`] trait, one per system fn parameter type, and its tuple impls.
+//! The [`Param`] trait, which defines what a system fn can take as a
+//! parameter.
 
 use core::sync::atomic::AtomicU32;
 use std::borrow::Cow;
@@ -16,16 +17,18 @@ use crate::record::Record;
 use crate::sequence::Seq;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs};
 
-/// The bindings a bundle binds from, in parameter order: each declared
-/// parameter takes one, and the one dynamic parameter that bound any takes
-/// the rest.
+/// Hands out port bindings to parameters, in parameter order.
+///
+/// Each declared parameter takes one binding. A dynamic parameter
+/// ([`DynInputs`] or [`DynOutputs`]) takes all the bindings beyond the
+/// declared ones.
 pub struct Bindings<B> {
     items: std::vec::IntoIter<B>,
     spare: usize,
 }
 
 impl<B> Bindings<B> {
-    /// Hands out `items`, of which `declared` belong to declared parameters.
+    /// Wraps `items`, of which `declared` belong to declared parameters.
     pub(crate) fn new(items: Vec<B>, declared: usize) -> Self {
         Self {
             spare: items.len().saturating_sub(declared),
@@ -33,12 +36,14 @@ impl<B> Bindings<B> {
         }
     }
 
-    /// The one binding the next declared parameter takes.
+    /// Returns the binding for the next declared parameter.
     pub(crate) fn next(&mut self) -> Option<B> {
         self.items.next()
     }
 
-    /// Every binding the next dynamic parameter takes.
+    /// Returns the bindings for a dynamic parameter.
+    ///
+    /// Only the first call returns any.
     pub(crate) fn take(&mut self) -> Vec<B> {
         let spare = core::mem::take(&mut self.spare);
         self.items.by_ref().take(spare).collect()
@@ -49,18 +54,22 @@ impl<B> Bindings<B> {
     }
 }
 
-/// "Views" are bound inputs, plus the samplers [`Sample`] parameters push.
+/// Bound inputs, waiting to be handed to parameters.
+///
+/// [`Sample`] parameters also register their samplers here.
 pub struct Views<W: WakeSink> {
     pub(crate) bindings: Bindings<InputBinding<W>>,
     pub(crate) samplers: Samplers,
 }
 
-/// "Writers" are bound outputs, plus the counter their failed writes share.
+/// Bound outputs, waiting to be handed to parameters.
+///
+/// Every output built from these shares one counter of failed writes.
 pub struct Writers {
     pub(crate) bindings: Bindings<OutputBinding>,
     pub(crate) dropped: Arc<AtomicU32>,
 }
-/// A bundles parameter names
+/// The parameter names that [`Param::append_defs`] reads from.
 pub type ParamNames<'n> = core::slice::Iter<'n, &'static str>;
 
 /// The ports a system's parameters take under one instance's config.
@@ -68,15 +77,16 @@ pub type ParamNames<'n> = core::slice::Iter<'n, &'static str>;
 pub struct Defs {
     pub(crate) inputs: Vec<PortDef>,
     pub(crate) outputs: Vec<PortDef>,
-    /// The ports the type declares whatever its config.
+    /// The names of the ports the system declares regardless of config.
     pub(crate) declared_inputs: Vec<Cow<'static, str>>,
     pub(crate) declared_outputs: Vec<Cow<'static, str>>,
-    /// Whether a parameter is a [`Sample`], which only a stepped system takes.
+    /// Whether any parameter is a [`Sample`]. Only a stepped system can take
+    /// one.
     pub(crate) sampled: bool,
 }
 
 impl Defs {
-    /// Every port a system's parameters take under `cx`, under the names it gave them.
+    /// Returns every port `S`'s parameters take under the config in `cx`.
     pub(crate) fn of<S: crate::fn_system::Ports>(cx: &DefCx<'_>) -> Result<Self, DefError> {
         let declared = Self::declared::<S>();
         Self::walk::<S>(
@@ -89,10 +99,10 @@ impl Defs {
         )
     }
 
-    /// The ports a system's parameters take whatever its config.
+    /// Returns the ports `S`'s parameters take regardless of config.
     pub(crate) fn declared<S: crate::fn_system::Ports>() -> Self {
-        // PANIC Safety: a dynamic parameter refuses only config ports, and
-        // the empty context has none.
+        // PANIC Safety: a dynamic parameter only fails on ports named in the
+        // config, and the empty context names none.
         Self::walk::<S>(&DefCx::empty(), Self::default()).expect("no config ports")
     }
 
@@ -106,7 +116,9 @@ fn names(ports: &[PortDef]) -> Vec<Cow<'static, str>> {
     ports.iter().map(|port| port.name.clone()).collect()
 }
 
-/// `Cycle` is what a system fn's parameters read beyond their ports.
+/// The per-cycle values a system fn's parameters can read besides ports.
+///
+/// These are the cycle time, the log, and, for a sequence, its [`Seq`].
 pub struct Cycle<'a> {
     pub now: Timestamp,
     log: Option<&'a mut Log>,
@@ -122,10 +134,10 @@ impl<'a> Cycle<'a> {
         }
     }
 
-    /// A sequence's cycle, which hands its [`Seq`] to the parameter taking it.
+    /// Creates a cycle for a sequence.
     ///
-    /// `'a` borrows the locals of the body future the step polls, so it
-    /// ends no later than that body.
+    /// The parameter that takes a [`Seq`] receives `seq`. `'a` borrows locals
+    /// of the body future the step polls, so it ends no later than that body.
     pub(crate) fn with_seq(now: Timestamp, log: &'a mut Log, seq: &'a Seq<'static>) -> Self {
         Self {
             now,
@@ -134,66 +146,74 @@ impl<'a> Cycle<'a> {
         }
     }
 
-    /// The sequence's handle, branded with this cycle's lifetime.
+    /// Returns the sequence's handle as a `Seq<'a>`.
+    ///
+    /// Redlines linked through it may only borrow what outlives `'a`.
     pub fn seq(&self) -> &'a Seq<'a> {
         // PANIC Safety: `#[system]` rejects a `Seq` parameter, so only a
         // sequence, whose step builds its cycle `with_seq`, reaches this.
         let seq = self
             .seq
             .expect("a `Seq` parameter only on a `#[sequence]` fn");
-        // SAFETY: the brand is phantom, so the layout is unchanged. Through
-        // the result, a condition links only if it outlives `'a`, which ends
-        // no later than the body (`with_seq`). The step checks redlines only
-        // while it holds that body: `advance` walks behind `run.as_mut()`,
-        // and `run` is `None` from the body's drop on, in `execute` and in
-        // `fault` alike. `Seq`'s `Drop` clears the back-pointers of nodes
-        // still linked without calling a condition.
+        // SAFETY: the lifetime parameter is phantom, so the layout does not
+        // change. Through the result, a condition can only be linked if it
+        // outlives `'a`, which ends no later than the body (see `with_seq`).
+        // The step checks redlines only while it holds that body: `advance`
+        // walks them behind `run.as_mut()`, and `run` is `None` from the
+        // moment the body is dropped, in both `execute` and `fault`. `Seq`'s
+        // `Drop` clears the back-pointers of nodes that are still linked,
+        // without calling any condition.
         unsafe { &*core::ptr::from_ref(seq).cast::<Seq<'a>>() }
     }
 
-    /// Hands the log to the one `&mut Log` parameter.
+    /// Hands out the log to the one `&mut Log` parameter.
     pub fn take_log(&mut self) -> &'a mut Log {
         // PANIC Safety: only a system with two `&mut Log` parameters reaches
-        // this, on its first cycle; the message names the fix.
+        // this, on its first cycle. The message tells the author the fix.
         self.log
             .take()
             .expect("a system takes `&mut Log` at most once")
     }
 }
 
-/// Param is implemented for parameter types for system fns, and for tuples of them.
+/// A type that a system fn can take as a parameter.
 ///
-/// `W` is the wake an input carries: `NoWake` on the cycle thread, `Notifier`
-/// on a background thread. Outputs never wake anyone, since the cycle thread
-/// drains an async system's outputs itself.
+/// A system fn declares what it needs through its parameter types. Each
+/// parameter declares the ports it uses, binds to them, and produces the
+/// value the fn receives each cycle. For example, [`Input`] declares one
+/// input port and hands the fn a `&mut Input`. Tuples of `Param`s are also
+/// `Param`s.
 ///
-/// For instance [`Input`] implements `Param` to bind an input port.
-/// The goal is to let system fns define what parameters they need from the type system.
+/// `W` is the wake sink an input uses: `NoWake` on the cycle thread,
+/// `Notifier` on a background thread. Outputs never wake anyone, because the
+/// cycle thread drains an async system's outputs itself.
 pub trait Param {
-    /// The bound input, or `()`.
+    /// The bound input, or `()` if the parameter has none.
     type In<W: WakeSink + Clone + 'static>;
-    /// The bound writer, or `()`.
+    /// The bound output, or `()` if the parameter has none.
     type Out;
-    /// The value the system fn receives.
+    /// The value the system fn receives each cycle.
     type Item<'a, W: WakeSink + Clone + 'static>
     where
         Self: 'a;
 
-    /// Appends the ports this parameter takes under this config, if it takes
-    /// any, naming them from `names`.
+    /// Declares the ports this parameter takes under the config in `cx`.
+    ///
+    /// Takes the parameter's name from `names` and appends any ports to
+    /// `defs`.
     fn append_defs(
         names: &mut ParamNames<'_>,
         cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError>;
 
-    /// Returns this parameter's input (if one exists) by popping a view from `views`.
+    /// Binds this parameter's input, if it has one, from `views`.
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W>;
 
-    /// Returns this parameter's output (if one exists) by popping a writer from `writers`.
+    /// Binds this parameter's output, if it has one, from `writers`.
     fn bind_out(writers: &mut Writers) -> Self::Out;
 
-    /// Returns the value passed to the system fn.
+    /// Returns the value passed to the system fn this cycle.
     fn get<'a, W: WakeSink + Clone + 'static>(
         input: &'a mut Self::In<W>,
         output: &'a mut Self::Out,
@@ -201,14 +221,15 @@ pub trait Param {
     ) -> Self::Item<'a, W>;
 }
 
-/// Takes the next leaf parameter's name.
+/// Takes the name of the next non-tuple parameter.
 fn name(names: &mut ParamNames<'_>) -> &'static str {
     // PANIC Safety: `#[system]` emits one name per parameter.
     names.next().expect("one name per parameter")
 }
 
-/// Both `Input<T>` and `Input<T, Notifier>` name the same port; the wiring
-/// picks which one a system is handed.
+/// `Input<T>` and `Input<T, Notifier>` declare the same port.
+///
+/// The fn receives the wake sink that matches the thread it runs on.
 impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> {
     type In<W: WakeSink + Clone + 'static> = Input<T, W>;
     type Out = ();
@@ -241,7 +262,10 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
     }
 }
 
-/// A `Sample` reads the port an `Input` would, taking it once per cycle.
+/// A `Sample` declares the same port an `Input` would.
+///
+/// Instead of the input itself, the fn gets the newest record as of this
+/// cycle. The sample is updated once per cycle, before the fn runs.
 impl<T: Frame + Copy + 'static> Param for Sample<T> {
     type In<W: WakeSink + Clone + 'static> = Sample<T>;
     type Out = ();
@@ -484,7 +508,10 @@ impl Param for Log {
     }
 }
 
-/// A tuple of `Param`s is a `Param`: each half is the tuple of the elements' halves.
+/// Implements `Param` for a tuple of `Param`s.
+///
+/// Each associated type is the tuple of the elements' types, and each method
+/// calls the elements in order.
 macro_rules! impl_param_for_tuple {
     ($($P:ident $i:tt),*) => {
         impl<$($P: Param),*> Param for ($($P,)*) {

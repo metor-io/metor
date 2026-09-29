@@ -9,7 +9,9 @@ use metor_proto_wkt::{
 use crate::record::{MsgCodec, RecordSchema};
 use crate::system::PortDef;
 
-/// The identity packet a link pushes before anything else.
+/// Encodes a `LinkInfo` packet.
+///
+/// A link sends this first on every connection to identify itself.
 pub(crate) fn link_info(
     command_ids: Vec<PacketId>,
     namespace: Option<&str>,
@@ -25,8 +27,11 @@ pub(crate) fn link_info(
     (&info).into_len_packet().inner
 }
 
-/// What a dialer sends first: one stream request per message it takes, so a
-/// db peer forwards those logs. A `Publish` peer discards them.
+/// Encodes one `MsgStream` request per message id in `ids`.
+///
+/// A dialing `Subscribe` sends these first.
+/// A db peer answers by forwarding those message logs. A `Publish` peer
+/// ignores the requests.
 pub(crate) fn msg_streams(ids: &[PacketId]) -> Vec<u8> {
     let mut blob = Vec::new();
     for &msg_id in ids {
@@ -35,13 +40,13 @@ pub(crate) fn msg_streams(ids: &[PacketId]) -> Vec<u8> {
     blob
 }
 
-/// The message that is sent at the start of a connection, and the id each
-/// port's records go out under.
+/// Encodes the announce a `Publish` sends on every new connection.
 ///
-/// A frame port announces the vtable and components its def carries, which
-/// its type built under the port's root. A port whose table id collides with
-/// an earlier one has no id: two tables under one id are indistinguishable on
-/// the wire.
+/// Also returns the packet id each port's records are sent under. The
+/// announce is a `LinkInfo`, then each frame port's vtable and component
+/// metadata, then each message port's metadata. A frame port whose table id
+/// collides with an earlier port's gets `None` as its id, because the peer
+/// could not tell the two tables apart.
 pub(crate) fn announce(
     defs: &[PortDef],
     namespace: Option<&str>,
@@ -89,8 +94,10 @@ pub(crate) fn announce(
     (blob, ids)
 }
 
-/// A message's schema as the ground decodes it: the type's own for postcard,
-/// an opaque payload plus the codec's name for anything else.
+/// Builds the metadata the ground uses to decode a message.
+///
+/// A postcard message uses the type's own schema. Any other codec is
+/// described as an opaque byte payload, tagged with the codec's name.
 pub(crate) fn msg_metadata(name: &str, codec: &MsgCodec) -> MsgMetadata {
     let (name, schema) = match codec {
         MsgCodec::Postcard(schema) => (schema.name.to_string(), schema.clone()),
@@ -114,10 +121,11 @@ pub(crate) fn msg_metadata(name: &str, codec: &MsgCodec) -> MsgMetadata {
     }
 }
 
-/// The bytes one packet adds beyond its payload: the length prefix and header.
+/// The bytes a packet adds on top of its payload: the length prefix and the
+/// header.
 pub(crate) const PACKET_OVERHEAD: usize = 4 + PACKET_HEADER_LEN;
 
-/// Appends one length-prefixed packet
+/// Appends one length-prefixed packet to `batch`.
 pub(crate) fn append_packet(batch: &mut Vec<u8>, ty: PacketTy, id: PacketId, payload: &[u8]) {
     batch.extend_from_slice(&((PACKET_HEADER_LEN + payload.len()) as u32).to_le_bytes());
     batch.push(ty as u8);
@@ -137,7 +145,7 @@ mod tests {
 
     use super::*;
 
-    /// A record whose payload is JSON, so it announces a codec.
+    /// A record encoded as JSON, so its metadata names a codec.
     #[derive(serde::Serialize, serde::Deserialize)]
     struct Telecommand {
         arm: bool,
@@ -161,7 +169,7 @@ mod tests {
         }
     }
 
-    /// The context of instance `plant` on target `cube_sat`.
+    /// Returns the context for instance `plant` on target `cube_sat`.
     fn plant() -> DefCx<'static> {
         DefCx {
             id: "plant",

@@ -7,7 +7,7 @@ fn expand_fn(item: proc_macro2::TokenStream, kind: Kind) -> ItemFn {
     syn::parse2(expand(item, &quote!(::fsw), kind)).expect("one rewritten fn")
 }
 
-/// The item of the impl for `name` inside the rewritten fn's body.
+/// Returns `item` from the `name` impl inside the rewritten fn's body.
 fn impl_item(f: &ItemFn, name: &str, item: &str) -> String {
     f.block
         .stmts
@@ -181,7 +181,7 @@ fn test_sequence_fn() {
     assert!(!has_impl(&f, "Deref") && !has_impl(&f, "SystemFn"));
 }
 
-/// The rewritten fn's `__metor_body` signature.
+/// Returns the signature of the rewritten fn's `__metor_body`.
 fn body_sig(f: &ItemFn) -> String {
     f.block
         .stmts

@@ -1,4 +1,5 @@
-//! The adapter on a live coordinator: delivery, drops, panics, and placement.
+//! Tests the thread adapter on a live coordinator: delivery, drops, panics,
+//! and placement.
 
 use core::time::Duration;
 use std::time::Instant;
@@ -9,7 +10,8 @@ use crate::coordinator::{BuildError, Coordinator, CoordinatorConfig, InputConfig
 use crate::coordinator::{ParamError, SystemConfig};
 use crate::tests::utils::{Recorder, table};
 
-/// A system on a named thread, or the shared one when `thread` is `None`.
+/// Returns the config for a system on the named thread, or on the default
+/// thread when `thread` is `None`.
 fn placed(id: &str, ty: &str, thread: Option<&str>) -> SystemConfig {
     SystemConfig {
         adapter: thread.map(|thread| crate::Adapter::Thread(thread.to_string())),
@@ -27,7 +29,8 @@ fn reading(id: &str, ty: &str, port: &str, from: PortRef) -> SystemConfig {
     }
 }
 
-/// Steps until `done`, giving the background thread a moment each cycle.
+/// Steps the coordinator until `done` returns true, pausing briefly each
+/// cycle so the background thread can run.
 fn step_until(coordinator: &mut Coordinator, mut done: impl FnMut() -> bool) -> u64 {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut cycle = 0;
@@ -57,7 +60,7 @@ fn test_async_record_relay() {
         seen.extend(recorder.take());
         seen.len() >= 4
     });
-    // Each command is one estimate plus one, over samples counting up.
+    // The samples count up, and each command is its estimate plus one.
     let commands: Vec<f64> = seen.iter().map(|(_, command)| *command).collect();
     assert_eq!(&commands[..4], &[3.0, 5.0, 7.0, 9.0]);
 }
@@ -87,11 +90,12 @@ fn test_mirror_overflow_report() {
         .filter(|line| kind(line) == Some("mirror_dropped"))
         .collect();
     assert!(reports[0].fields.iter().any(|(name, _)| name == "imu"));
-    // The producer keeps its own ring; only the mirror refuses records.
+    // No system is latched off: the producer's ring is fine, and only the
+    // mirror drops records.
     assert!(coordinator.latched().next().is_none());
 }
 
-/// The `kind` field a fault line carries.
+/// Returns the `kind` field of a fault log line.
 fn kind(line: &metor_proto_wkt::LogEvent) -> Option<&str> {
     line.fields
         .iter()
@@ -153,7 +157,8 @@ fn test_constructor_panic_cleanup() {
         source.to_string().contains("a constructor that panics"),
         "{source}"
     );
-    // A thread taken down by the panic would be detached at the join timeout.
+    // If the panic had killed the thread, the drop would wait for the join
+    // timeout.
     assert!(started.elapsed() < Duration::from_millis(500));
 }
 
@@ -172,7 +177,7 @@ fn test_coordinator_drop_joins_threads() {
     coordinator.step(Timestamp(1));
     let started = Instant::now();
     drop(coordinator);
-    // A detached thread would take the whole join timeout.
+    // Detaching a thread would take the whole join timeout.
     assert!(started.elapsed() < Duration::from_millis(500));
 }
 

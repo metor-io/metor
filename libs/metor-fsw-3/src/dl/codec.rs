@@ -1,4 +1,6 @@
-//! The JSON every pack kind sends across the ABI and reads back.
+//! Encodes and decodes the JSON sent across the pack ABI.
+//!
+//! The host and packs of both kinds use the same encoding.
 
 use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
@@ -8,11 +10,13 @@ use crate::system::SystemDef;
 
 use super::PackError;
 
-/// The bytes the host lends an export to write a descriptor or definition into.
+/// The size of the buffer an export writes a descriptor or definition into.
 pub(crate) const DESCRIPTOR_CAPACITY: usize = 1024 * 1024;
 
-/// The descriptor an export wrote, `None` when it reported writing past the
-/// buffer.
+/// Decodes the descriptor an export wrote.
+///
+/// `bytes` is `None` when the export reported writing more than the buffer
+/// holds.
 pub(crate) fn decode_descriptor(status: u32, bytes: Option<&[u8]>) -> Result<PackDef, PackError> {
     if status == DefStatus::TooSmall as u32 {
         return Err(PackError::DescriptorTooLarge {
@@ -25,7 +29,7 @@ pub(crate) fn decode_descriptor(status: u32, bytes: Option<&[u8]>) -> Result<Pac
     serde_json::from_slice(bytes.ok_or(PackError::Decode)?).map_err(|_| PackError::Decode)
 }
 
-/// One type's definition, or the refusal, an export wrote.
+/// Decodes the definition an export wrote, or the error it wrote in its place.
 pub(crate) fn decode_def(status: u32, bytes: Option<&[u8]>) -> Result<SystemDef, DefError> {
     let bytes = bytes.ok_or_else(|| refused("the pack reported more than it wrote".into()))?;
     if status == DefStatus::Refused as u32 {
@@ -39,7 +43,9 @@ pub(crate) fn decode_def(status: u32, bytes: Option<&[u8]>) -> Result<SystemDef,
     serde_json::from_slice(bytes).map_err(|e| refused(e.to_string()))
 }
 
-/// The error a failed `create` wrote, or names the failure it could not.
+/// Decodes the error a failed `create` wrote.
+///
+/// Returns a generic error if it wrote nothing.
 pub(crate) fn decode_create_error(bytes: &[u8]) -> ParamError {
     if bytes.is_empty() {
         return ParamError::Decode("pack create failed".to_string());
@@ -47,12 +53,12 @@ pub(crate) fn decode_create_error(bytes: &[u8]) -> ParamError {
     serde_json::from_slice(bytes).unwrap_or_else(|e| ParamError::Decode(e.to_string()))
 }
 
-/// A definition context, owned for the crossing.
+/// Encodes a definition context to send to a pack.
 pub(crate) fn encode_def_cx(cx: &DefCx<'_>) -> Result<Vec<u8>, DefError> {
     serde_json::to_vec(&DefCxOwned::of(cx)).map_err(|e| refused(e.to_string()))
 }
 
-/// The params and instance `create` takes.
+/// Encodes the params and instance that a pack's `create` takes.
 pub(crate) fn encode_instance(
     params: &serde_json::Value,
     instance: &Instance,
@@ -72,11 +78,12 @@ mod tests {
     use super::*;
     use crate::coordinator::SystemTable;
 
-    /// An empty table's descriptor, as the export writes it.
+    /// Returns the descriptor the export writes for an empty table.
     fn empty_table() -> Vec<u8> {
         let mut bytes = vec![0; 4096];
         let mut written = 0;
-        // SAFETY: the buffer and length slot are writable, separate, and live for the call.
+        // SAFETY: the buffer and the length slot are writable, do not overlap, and
+        // live for the whole call.
         let status = unsafe {
             crate::pack::def(
                 SystemTable::new,

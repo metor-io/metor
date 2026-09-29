@@ -1,14 +1,14 @@
-//! Storage ownership for heap, mapped, and caller-owned regions.
+//! Storage for ring regions: heap, memory-mapped, or owned by the caller.
 
 use std::cell::UnsafeCell;
 
 use crate::owner::{Lease, RawOwner};
 
-/// A 16-byte aligned, interior-mutable storage unit.
+/// A 16-byte aligned unit of storage that allows interior mutation.
 #[repr(C, align(16))]
 pub(super) struct Word(pub(super) UnsafeCell<[u64; 2]>);
 
-/// An owned or borrowed byte region with a stable base address.
+/// A byte region, owned or borrowed, whose base address never moves.
 pub(super) struct Backing {
     pub(super) base: *mut u8,
     pub(super) len: usize,
@@ -16,7 +16,8 @@ pub(super) struct Backing {
 }
 
 enum BackingOwner {
-    /// Raw ownership preserves pointers derived from the allocation across moves.
+    /// Held as a raw pointer rather than a `Box`, so pointers derived from the
+    /// allocation stay valid when the `Backing` moves.
     Heap {
         words: *mut [Word],
     },
@@ -31,7 +32,7 @@ enum BackingOwner {
 }
 
 impl Backing {
-    /// Allocate zeroed, 16-byte aligned storage.
+    /// Allocates zeroed, 16-byte aligned storage.
     pub(super) fn heap(size: usize) -> Self {
         let count = size.div_ceil(size_of::<Word>());
         let buf: Box<[Word]> = (0..count)
@@ -47,11 +48,12 @@ impl Backing {
         }
     }
 
-    /// Borrow storage without taking ownership.
+    /// Borrows storage without taking ownership.
     ///
     /// # Safety
-    /// The single, interior-mutable allocation must remain live for every handle
-    /// and borrow using it. Its owner must allow access from other threads.
+    /// The storage is one allocation that allows interior mutation. It must stay
+    /// live for every handle and borrow that uses it, and its owner must allow
+    /// access from other threads.
     pub(super) unsafe fn raw(base: *mut u8, len: usize) -> Self {
         Self {
             base,
@@ -61,7 +63,7 @@ impl Backing {
     }
 
     /// # Safety
-    /// The owner satisfies `RawOwner`'s contract and retains this entire region.
+    /// `owner` meets `RawOwner`'s contract and keeps the entire region alive.
     pub(super) unsafe fn owned(base: *mut u8, len: usize, owner: RawOwner) -> Self {
         // SAFETY: the caller guarantees a live, thread-safe owner.
         let lease = unsafe { Lease::acquire(owner) };
@@ -72,7 +74,9 @@ impl Backing {
         }
     }
 
-    /// Own a shared mapping until the last ring handle is dropped.
+    /// Takes ownership of a shared mapping.
+    ///
+    /// The mapping lives until the last ring handle is dropped.
     #[cfg(feature = "mmap")]
     pub(super) fn mmap(map: memmap2::MmapMut) -> Self {
         let (base, len) = (map.as_ptr() as *mut u8, map.len());

@@ -1,4 +1,4 @@
-//! The registry of system types a config may name.
+//! The [`SystemTable`], a registry of the system types a config can use.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ use super::step::Step;
 static STATUS: LazyLock<PortDef> =
     LazyLock::new(|| crate::Output::<super::SystemStatus>::def(&DefCx::empty(), "status"));
 
-/// Arguments for constructing a system using [`MakeFn`].
+/// The arguments a system type's constructor receives.
 pub struct MakeCx<'a> {
     pub id: &'a str,
     pub adapter: Option<&'a Adapter>,
@@ -39,7 +39,9 @@ pub struct MakeCx<'a> {
 }
 
 impl MakeCx<'_> {
-    /// The thread the adapter names, or the default one.
+    /// Returns the thread the system runs on.
+    ///
+    /// This is the thread named by the adapter, or the default thread.
     pub fn thread(&self) -> &str {
         match self.adapter {
             Some(Adapter::Thread(thread)) => thread,
@@ -48,38 +50,42 @@ impl MakeCx<'_> {
     }
 }
 
-/// Builds a system from [`MakeCx`].
+/// Creates a system from a [`MakeCx`].
 pub(crate) type MakeFn = dyn Fn(MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>;
 
-/// Computes one instance's definition from its config.
+/// Computes the definition of one system instance from its config.
 pub(crate) type DefFn = dyn Fn(&DefCx<'_>) -> Result<SystemDef, DefError>;
 
-/// How a registered type runs.
+/// How the coordinator runs a registered system type.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SystemKind {
-    /// Stepped once per cycle.
+    /// Executed once per cycle.
     #[default]
     Cyclic,
-    /// A `#[sequence]`, polled once per cycle until it returns.
+    /// A `#[sequence]` fn, polled once per cycle until it returns.
     Sequence,
-    /// An async system on its own thread.
+    /// An async system that runs on its own thread.
     Async,
 }
 
 pub(crate) struct TableEntry {
     pub kind: SystemKind,
-    /// The ports the type declares whatever a config says.
+    /// The ports the type always has, whatever the config says.
     pub def: SystemDef,
     pub def_fn: Box<DefFn>,
-    /// The doc comment on the type's `execute`, empty for the trait path.
+    /// The doc comment on the type's `execute`.
+    ///
+    /// Empty for types registered through the `System` or `AsyncSystem` traits.
     pub doc: Cow<'static, str>,
-    /// The JSON Schema of the type's params, `None` when it takes none.
+    /// The JSON Schema of the type's params, or `None` if it takes no params.
     pub schema: Option<Box<RawValue>>,
     pub make: Arc<MakeFn>,
 }
 
-/// A `SystemTable` maps systems names to their definitions and constructors.
+/// A registry of the system types a config can use.
+///
+/// A config refers to each type by the name it was registered under.
 #[derive(Default)]
 pub struct SystemTable {
     entries: Vec<(String, TableEntry)>,
@@ -91,7 +97,9 @@ impl SystemTable {
         Self::default()
     }
 
-    /// Registers a `System` under `ty`, replacing any system registered under the same name.
+    /// Registers a `System` under the name `ty`.
+    ///
+    /// Replaces any type already registered under that name.
     pub fn register_system<S: System + 'static>(
         &mut self,
         ty: &str,
@@ -103,7 +111,9 @@ impl SystemTable {
         )
     }
 
-    /// Registers a `#[system]` fn under `ty`, its state built by `ctor`.
+    /// Registers a `#[system]` fn under the name `ty`.
+    ///
+    /// `ctor` builds its state.
     pub fn register<S: SystemFn, M, C: Ctor<S::State, M> + 'static>(
         &mut self,
         ty: &str,
@@ -116,7 +126,9 @@ impl SystemTable {
         self.insert(ty, entry)
     }
 
-    /// Registers a `#[sequence]` fn under `ty`, its state built by `ctor`.
+    /// Registers a `#[sequence]` fn under the name `ty`.
+    ///
+    /// `ctor` builds its state.
     pub fn register_sequence<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
         &mut self,
         ty: &str,
@@ -127,7 +139,9 @@ impl SystemTable {
         self.insert(ty, entry)
     }
 
-    /// Registers an `AsyncSystem` under `ty`, constructed on its own thread.
+    /// Registers an `AsyncSystem` under the name `ty`.
+    ///
+    /// The system is constructed on the thread it runs on.
     pub fn register_async_system<A: AsyncSystem + 'static>(
         &mut self,
         ty: &str,
@@ -137,7 +151,9 @@ impl SystemTable {
         self.insert(ty, entry)
     }
 
-    /// Registers an async `#[system]` fn under `ty`, its state built by `ctor`.
+    /// Registers an async `#[system]` fn under the name `ty`.
+    ///
+    /// `ctor` builds its state.
     pub fn register_async<S: AsyncSystemFn, M, C: Ctor<S::State, M> + Send + Sync + 'static>(
         &mut self,
         ty: &str,
@@ -150,7 +166,10 @@ impl SystemTable {
         self.insert(ty, entry)
     }
 
-    /// Adds an entry, replacing a same-named one in place so order is registration order.
+    /// Adds an entry if its records agree with every other entry.
+    ///
+    /// An entry with the same name is replaced in place, so iteration order
+    /// stays the order types were first registered.
     pub(crate) fn insert(&mut self, ty: &str, entry: TableEntry) -> Result<(), BuildError> {
         check_definition(&entry.def)?;
         for (name, known) in &self.entries {
@@ -177,7 +196,7 @@ impl SystemTable {
         Some(&self.entries[at].1)
     }
 
-    /// Every registered type and its entry, in registration order.
+    /// Iterates over every registered type and its entry, in registration order.
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, &TableEntry)> {
         self.entries.iter().map(|(ty, entry)| (ty.as_str(), entry))
     }
@@ -185,7 +204,9 @@ impl SystemTable {
 
 #[cfg(feature = "host")]
 impl SystemTable {
-    /// Inserts entries in order, stopping at the first conflict. Earlier insertions remain.
+    /// Inserts entries in order, stopping at the first conflict.
+    ///
+    /// Entries inserted before the conflict stay in the table.
     pub(crate) fn insert_all(
         &mut self,
         entries: Vec<(String, TableEntry)>,
@@ -196,7 +217,9 @@ impl SystemTable {
         Ok(())
     }
 
-    /// Every record the registered ports and the implicit status and channel ports declare.
+    /// Collects every record the table's ports use.
+    ///
+    /// This includes the `status` and channel ports the coordinator adds.
     pub(crate) fn records(&self) -> crate::def::Records {
         crate::def::Records::of(
             core::iter::once(&*STATUS)
@@ -206,7 +229,7 @@ impl SystemTable {
     }
 }
 
-/// Names the type whose definition was refused.
+/// Wraps a [`DefError`] with the name of the type whose definition failed.
 fn def_error(ty: &str) -> impl FnOnce(DefError) -> BuildError + '_ {
     |source| BuildError::Def {
         id: ty.to_string(),
@@ -264,7 +287,10 @@ fn check_record(known: &PortDef, port: &PortDef) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// Builds one entry, binding the system's bundles from the rings' handles.
+/// Builds the table entry for a cyclic `System`.
+///
+/// The entry's `make` binds the system's inputs and outputs to the rings it is
+/// given.
 fn entry<S: System + 'static>(
     make: impl Fn(Params<'_>) -> Result<(S, S::State), ParamError> + 'static,
     doc: Cow<'static, str>,
@@ -290,7 +316,9 @@ fn entry<S: System + 'static>(
     })
 }
 
-/// Refuses a thread, which only an async system runs on.
+/// Returns an error if the adapter is a thread.
+///
+/// Only async systems can run on their own thread.
 pub(crate) fn refuse_thread(adapter: Option<&Adapter>) -> Result<(), ParamError> {
     match adapter {
         Some(Adapter::Thread(thread)) => Err(ParamError::Thread {
@@ -300,7 +328,9 @@ pub(crate) fn refuse_thread(adapter: Option<&Adapter>) -> Result<(), ParamError>
     }
 }
 
-/// One view per input edge and one writer per output, for a cyclic system.
+/// Opens the ring handles a cyclic system needs.
+///
+/// That is one reader per input edge and one writer per output.
 pub(crate) fn bindings(
     def: &SystemDef,
     inputs: Vec<Vec<&RingBuffer>>,
@@ -332,7 +362,10 @@ pub(crate) fn bindings(
     (views, writers)
 }
 
-/// Builds one async entry, whose `make` places the system on its group's thread.
+/// Builds the table entry for an async system.
+///
+/// The entry's `make` places the system on the thread its adapter asks for, or on
+/// the default thread.
 fn async_entry<A, M>(
     make: M,
     doc: Cow<'static, str>,
@@ -362,7 +395,7 @@ mod tests {
     use crate::{MsgCodec, Output};
     use metor_proto::types::ComponentId;
 
-    /// The record `name`, as the table sees it, on a port named `out`.
+    /// Looks up the record `name` in the table and returns it on a port named `out`.
     fn record(table: &SystemTable, name: &str) -> Option<PortDef> {
         table.records().port("out", name).ok()
     }
@@ -451,8 +484,9 @@ mod tests {
         assert!(table.get("sink").is_none());
     }
 
-    /// Two frames of one name whose fields differ are not one record, whatever
-    /// port they sit on.
+    /// Two frames with the same name but different fields conflict.
+    ///
+    /// This holds whichever ports they are on.
     #[test]
     fn test_reject_conflicting_frame_layout() {
         let mut table = SystemTable::new();
@@ -476,8 +510,9 @@ mod tests {
         assert!(table.get("sink").is_none());
     }
 
-    /// A frame's vtable is its port's, so two ports of one frame announce
-    /// different names without disagreeing about the record.
+    /// Two ports carrying the same frame agree on the record.
+    ///
+    /// Each port gets its own vtable, so they announce different names.
     #[test]
     fn test_accept_frame_schema_per_port() {
         let mut table = SystemTable::new();
@@ -713,7 +748,7 @@ mod tests {
         assert_eq!(table.get("imu").expect("registered").def.name, "imu_offset");
     }
 
-    /// An async system with no ports, which returns when its stop is set.
+    /// An async system with no ports. It returns once it is told to stop.
     struct Idle;
 
     impl AsyncSystem for Idle {
@@ -754,7 +789,8 @@ mod tests {
         .expect("no params");
         let started = std::time::Instant::now();
         drop(step);
-        // A group the adapter still owned would take the whole join timeout.
+        // If the adapter still owned the thread group, the drop would wait out
+        // the whole join timeout.
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 

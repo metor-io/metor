@@ -1,10 +1,12 @@
-//! Sequences: async fns the coordinator polls once per cycle.
+//! Sequences: async fns that run across many cycles.
 //!
-//! A `#[sequence]` fn takes its ports as a `#[system]` fn does, plus a
-//! [`Seq`] handle for the cycle's time, its waits, and whether it was
-//! aborted. Its step owns the future and polls it with a waker that does
-//! nothing: a wait resolves on the first poll that satisfies it, never on a
-//! wake.
+//! The coordinator polls each sequence once per cycle until it finishes. A
+//! `#[sequence]` fn takes its ports as parameters, just like a `#[system]`
+//! fn. It can also take a [`Seq`] handle, which tells the body the current
+//! cycle time and whether it has been aborted, and lets it wait. The
+//! sequence's step owns the body's future and polls it with a waker that
+//! does nothing. Nothing ever wakes a sequence: a wait resolves on the first
+//! poll where its condition is met.
 //!
 //! ```
 //! # use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -52,21 +54,28 @@
 //! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
 //!
-//! Every sequence reads an `abort` input first among its ports. An abort
-//! record, or a body calling [`Seq::abort`], raises the abort flag, which
-//! never comes down. At the next cycle's start the step drops the body
-//! without polling it and ends [`SeqError::Aborted`]. Dropping the body runs
-//! each armed [`Seq::on_abort`] handler, innermost first. A panic in the body
-//! runs them too. A failure, a timeout, or a body dropped unfinished
-//! (`Reset`, `Load`, shutdown) runs none.
+//! Every sequence has an `abort` input, which comes before its other
+//! inputs. The sequence is aborted when a record arrives on that input or
+//! when the body calls [`Seq::abort`]. Once aborted, it stays aborted. At
+//! the start of the next cycle the step drops the body without polling it,
+//! and the sequence ends with [`SeqError::Aborted`].
 //!
-//! A [`redline!`](crate::redline) covers the rest of its block. Each cycle,
-//! after the samples are taken and before the body is polled, the step
-//! checks the linked redlines in order; the first that holds logs a
-//! `redline` fault with its name and aborts the sequence. A condition may
-//! borrow the sequence's parameters, not a body local. A stopped channel
-//! does not execute its step, so it takes no samples, checks no redlines,
-//! and runs no handlers.
+//! A body registers cleanup with [`Seq::on_abort`]. If the sequence has
+//! been aborted, each handler still registered runs when the body is
+//! dropped, innermost first. The handlers also run if the body panics. They
+//! do not run when the body fails, times out, or is dropped before it
+//! finishes for another reason (a `Reset`, a `Load`, or shutdown).
+//!
+//! A redline is a condition that aborts the sequence when it becomes true.
+//! [`redline!`](crate::redline) adds one that stays active until the end of
+//! the enclosing block. Each cycle, the step takes the input samples, then
+//! checks the active redlines in the order they were added, then polls the
+//! body. The first redline whose condition is true logs a `redline` fault
+//! with its name and aborts the sequence. A condition may borrow the
+//! sequence's parameters, but not the body's locals.
+//!
+//! A stopped channel does not execute its step at all, so it takes no
+//! samples, checks no redlines, and runs no handlers.
 
 mod redline;
 mod seq;
@@ -89,9 +98,16 @@ pub use redline::Redline;
 pub use seq::{NextCycle, OnAbort, Seq, SeqError, Sleep, WaitFor};
 pub(crate) use step::SequenceStep;
 
-/// Links a redline to `seq` for the rest of the enclosing block. The first
-/// cycle its condition holds, the sequence aborts, logging a `redline` fault
-/// with its name, or `"redline"` when it has none.
+/// Adds a redline to `seq` for the rest of the enclosing block.
+///
+/// A redline is a condition that aborts the sequence when it is true. Each
+/// cycle, before the body is polled, the step calls the condition. The first
+/// time it returns true, the step logs a `redline` fault with `name` (or
+/// `"redline"` if no name is given) and aborts the sequence.
+///
+/// The macro pins a [`Redline`] on the stack and links it
+/// into `seq`. When the block ends, the `Redline` is dropped and unlinks
+/// itself, so its condition is no longer checked.
 #[macro_export]
 macro_rules! redline {
     ($seq:expr, $cond:expr $(,)?) => {
@@ -103,19 +119,27 @@ macro_rules! redline {
     };
 }
 
-/// A `SequenceFn` is a sequence whose parameters are its ports and its [`Seq`].
+/// A sequence written as an async fn.
+///
+/// `#[sequence]` implements this trait. The fn's parameters are its ports
+/// and, optionally, its [`Seq`].
 #[allow(async_fn_in_trait)]
 pub trait SequenceFn: Ports {
-    /// Runs the sequence to its end. State and items share `'a`, which
-    /// brands the `Seq` item, so a redline's condition may borrow either.
+    /// Runs the sequence to its end.
+    ///
+    /// `state` and `items` share the lifetime `'a`, and the [`Seq`] in
+    /// `items` is a `Seq<'a>`. A redline's condition only has to outlive
+    /// `'a`, so it may borrow from `state` or from the other items.
     async fn call<'a>(
         state: &'a mut Self::State,
         items: <Self::Params as Param>::Item<'a, NoWake>,
     ) -> Result<(), SeqError>;
 }
 
-/// A sequence's ports: `abort`, then its parameters' inputs; its
-/// parameters' outputs, then `log`.
+/// Returns the port definitions for sequence `S`.
+///
+/// The inputs are `abort` followed by the parameters' inputs. The outputs
+/// are the parameters' outputs followed by `log`.
 pub fn def<S: SequenceFn>(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
     let mut inputs = vec![Input::<AbortRequest>::def(cx, ABORT_PORT)];
     inputs.extend(InSet::<S>::defs(cx)?);
@@ -126,7 +150,9 @@ pub fn def<S: SequenceFn>(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
     })
 }
 
-/// The table entry a `#[sequence]` fn registers as.
+/// Builds the system table entry for a `#[sequence]` fn.
+///
+/// `ctor` creates the sequence's state each time the sequence is made.
 pub(crate) fn entry<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
     ctor: C,
 ) -> Result<TableEntry, DefError> {

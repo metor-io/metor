@@ -1,4 +1,7 @@
-//! The [`Record`] trait, which names a ring record and encodes it.
+//! The [`Record`] trait: a value that can travel through a ring.
+//!
+//! A record is either a frame, stored as its raw bytes, or a message, stored
+//! in an encoding such as postcard or JSON.
 
 use core::borrow::Borrow;
 
@@ -12,45 +15,63 @@ use thiserror::Error;
 
 use crate::frame::Frame;
 
-/// A `Record` is an entry on a ring buffer between systems.
+/// A value that systems pass to each other through a ring.
 ///
-/// Records have unique names and IDs, and provide a way to convert themselves to and from bytes
+/// Each record type has a unique name and ID, and knows how to convert itself
+/// to and from bytes.
 pub trait Record {
     const NAME: &'static str;
     const ID: ComponentId = ComponentId::new(Self::NAME);
-    /// Largest record this type writes.
+    /// The largest encoded size of this record, in bytes.
     const MAX_LEN: usize;
     const ALIGN: usize = 1;
-    /// Writes per cycle this record expects; a ring holds `DEPTH * ring_depth` records.
+    /// How many records a producer expects to write per cycle.
+    ///
+    /// A ring holds `DEPTH * ring_depth` records.
     const DEPTH: usize = 1;
-    /// What a read yields: a borrow for a fixed record, an owned value otherwise.
+    /// The type a read returns.
+    ///
+    /// A frame is borrowed straight from the ring. Other records are decoded
+    /// into an owned value.
     type Read<'a>: Borrow<Self>
     where
         Self: 'a;
 
-    /// Returns the stamp fan-in orders by; `None` leaves producer order.
+    /// Returns the record's timestamp, if it has one.
+    ///
+    /// When several producers feed one input, [`Input::latest`] uses the
+    /// timestamp to pick the newest record. Without one, producer order decides.
+    ///
+    /// [`Input::latest`]: crate::Input::latest
     fn timestamp(&self) -> Option<Timestamp> {
         None
     }
 
-    /// Encodes this value into buf, returns a slice of the encoded bytes.
+    /// Encodes this value into `buf`.
+    ///
+    /// Returns the encoded bytes, which may borrow from `buf` or from `self`.
     fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError>;
 
-    /// Reads one record from the given bytes.
+    /// Decodes one record from `bytes`.
     fn decode(bytes: &[u8]) -> Result<Self::Read<'_>, DecodeError>;
 
-    /// What this record announces to the ground, relative to itself.
+    /// Returns the schema this record announces to the ground.
+    ///
+    /// Frame fields are named relative to the record itself.
     fn schema() -> RecordSchema;
 
-    /// What a port rooted at `root` announces: a frame builds its vtable and
-    /// metadata there, a message has no path.
+    /// Returns the schema a port rooted at `root` announces.
+    ///
+    /// A frame names its fields under `root`. A message has no field paths, so
+    /// it announces the same schema as [`Record::schema`].
     fn schema_at(_root: &str) -> RecordSchema {
         Self::schema()
     }
 }
 
-/// A `PostcardRecord` is a [`Record`] carried as postcard, announced under its
-/// schema's id.
+/// A shortcut for implementing [`Record`] on a type encoded with postcard.
+///
+/// The record announces itself under an ID derived from its postcard schema.
 pub trait PostcardRecord: Serialize + DeserializeOwned + postcard_schema::Schema {
     const NAME: &'static str;
     const MAX_LEN: usize;
@@ -87,7 +108,7 @@ impl<T: PostcardRecord> Record for T {
     }
 }
 
-/// What a port announces about the records it carries.
+/// Describes a record to the ground, so it can decode what a port sends.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RecordSchema {
     Frame {
@@ -101,7 +122,9 @@ pub enum RecordSchema {
     },
 }
 
-/// How a message record's bytes are encoded, so the ground can decode them.
+/// How a message record is encoded.
+///
+/// The ground uses it to decode the message's bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MsgCodec {
     Postcard(OwnedNamedType),
@@ -111,7 +134,9 @@ pub enum MsgCodec {
 }
 
 impl RecordSchema {
-    /// A frame's vtable and its components, each leaf at `{root}.{field}`.
+    /// Creates the schema for frame `T`.
+    ///
+    /// Each field is announced at `{root}.{field}`.
     pub fn frame<T: Frame>(root: &str) -> Self {
         Self::Frame {
             vtable: metor_proto::vtable::builder::vtable(T::vtable_fields(root.to_string())),
@@ -119,7 +144,9 @@ impl RecordSchema {
         }
     }
 
-    /// A postcard message, whose id is the hash of its schema name.
+    /// Creates the schema for a postcard message.
+    ///
+    /// The message ID is the hash of its postcard schema name.
     pub fn postcard<T: Serialize + postcard_schema::Schema>(name: &str) -> Self {
         Self::Msg {
             id: <T as Msg>::ID,
@@ -128,7 +155,9 @@ impl RecordSchema {
         }
     }
 
-    /// A message under any other codec, whose id is the hash of its record name.
+    /// Creates the schema for a message in any other encoding.
+    ///
+    /// The message ID is the hash of `name`.
     pub fn msg(name: &str, codec: MsgCodec) -> Self {
         Self::Msg {
             id: msg_id(name),
@@ -137,7 +166,7 @@ impl RecordSchema {
         }
     }
 
-    /// The packet id the ground matches this record on.
+    /// Returns the packet ID the ground uses to recognize this record.
     pub fn packet_id(&self) -> PacketId {
         match self {
             Self::Frame { vtable, .. } => table_id(vtable),
@@ -145,8 +174,9 @@ impl RecordSchema {
         }
     }
 
-    /// The packet type this record goes out as: a frame is a table, a message
-    /// a message.
+    /// Returns the packet type this record is sent as.
+    ///
+    /// A frame is sent as a table, and a message as a message.
     pub fn packet_ty(&self) -> PacketTy {
         match self {
             Self::Frame { .. } => PacketTy::Table,
@@ -154,8 +184,11 @@ impl RecordSchema {
         }
     }
 
-    /// A frame's layout fingerprint, taken at the record's own name so it does
-    /// not move with the port's root; a message has none.
+    /// Returns a fingerprint of a frame's layout.
+    ///
+    /// Take it from [`Record::schema`], which names fields relative to the
+    /// record, so the fingerprint does not depend on the port. A message
+    /// returns 0.
     pub fn layout(&self) -> u64 {
         match self {
             Self::Frame { vtable, .. } => fnv1a(&vtable_bytes(vtable)),
@@ -163,9 +196,11 @@ impl RecordSchema {
         }
     }
 
-    /// Whether two ports announcing these carry one record. Messages must
-    /// agree; a frame's vtable is its port's, so frames are told apart by
-    /// [`PortDef::layout`](crate::PortDef::layout).
+    /// Returns whether two ports carry the same record.
+    ///
+    /// Messages must match exactly. A frame's vtable depends on its port's
+    /// path, so any two frames match here. Use
+    /// [`PortDef::layout`](crate::PortDef::layout) to tell frames apart.
     pub fn same_record(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Msg { .. }, Self::Msg { .. }) => self == other,
@@ -174,14 +209,14 @@ impl RecordSchema {
     }
 }
 
-/// FNV-1a over bytes.
+/// Hashes `bytes` with FNV-1a.
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
 
-/// Frames compare by their announced bytes, which is what the ground sees.
+/// Frames are compared by their encoded vtables, which is what the ground sees.
 impl PartialEq for RecordSchema {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -207,12 +242,14 @@ impl PartialEq for RecordSchema {
 
 impl Eq for RecordSchema {}
 
-/// A vtable's postcard bytes; an owned vtable always encodes.
+/// Encodes a vtable with postcard.
+///
+/// An owned vtable always encodes, so the empty fallback is never used.
 fn vtable_bytes(vtable: &VTable) -> Vec<u8> {
     ::postcard::to_allocvec(vtable).unwrap_or_default()
 }
 
-/// An error that occured while encoding
+/// An error from encoding a record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum EncodeError {
     #[error("value encodes to {len} bytes, more than the record's {max}")]
@@ -221,7 +258,7 @@ pub enum EncodeError {
     Codec,
 }
 
-/// An error that occured while decoding
+/// An error from decoding a record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum DecodeError {
     #[error("record is shorter than the type")]
@@ -230,13 +267,15 @@ pub enum DecodeError {
     Codec,
 }
 
-/// Decoding for fixed records whose bytes are the value itself.
+/// Decoding for frames, whose bytes are the value itself.
 pub mod fixed {
     use zerocopy::{FromBytes, Immutable, KnownLayout};
 
     use super::DecodeError;
 
-    /// Reads the fixed prefix of a record as `T`.
+    /// Borrows the start of `bytes` as a `T`.
+    ///
+    /// Extra trailing bytes are ignored.
     pub fn decode<T: FromBytes + KnownLayout + Immutable>(bytes: &[u8]) -> Result<&T, DecodeError> {
         T::ref_from_prefix(bytes)
             .map(|(value, _)| value)
@@ -244,14 +283,14 @@ pub mod fixed {
     }
 }
 
-/// Encoding for records carried as postcard.
+/// Encoding for records stored as postcard.
 pub mod postcard {
     use serde::Serialize;
     use serde::de::DeserializeOwned;
 
     use super::{DecodeError, EncodeError};
 
-    /// Serializes `value` into `buf` and returns the bytes it filled.
+    /// Serializes `value` into `buf` and returns the bytes it wrote.
     pub fn encode<'a, T: Serialize + ?Sized>(
         value: &T,
         buf: &'a mut [u8],
@@ -273,14 +312,14 @@ pub mod postcard {
     }
 }
 
-/// Encoding for records carried as serde JSON.
+/// Encoding for records stored as JSON.
 pub mod json {
     use serde::Serialize;
     use serde::de::DeserializeOwned;
 
     use super::{DecodeError, EncodeError};
 
-    /// Serializes `value` into `buf` and returns the bytes it filled.
+    /// Serializes `value` into `buf` and returns the bytes it wrote.
     pub fn encode<'a, T: Serialize + ?Sized>(
         value: &T,
         buf: &'a mut [u8],
@@ -295,7 +334,7 @@ pub mod json {
         Ok(&buf[..len])
     }
 
-    /// Counts the full encoding while keeping only the prefix that fits.
+    /// A writer that measures the full encoding but keeps only what fits.
     struct Buffer<'a> {
         bytes: &'a mut [u8],
         len: usize,
@@ -321,9 +360,10 @@ pub mod json {
     }
 }
 
-/// `Bytes` is the record of a dynamic port: a payload copied without decoding.
+/// The record type of a dynamic port: raw bytes, passed through undecoded.
 ///
-/// It is never announced; a dynamic port announces the schema of its edge.
+/// It is never announced. A dynamic port announces the schema of whatever
+/// record the config connects to it.
 pub type Bytes = [u8];
 
 impl Record for Bytes {

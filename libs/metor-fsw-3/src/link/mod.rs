@@ -1,7 +1,12 @@
-//! Link is responsible for connecting targets telemetry together
+//! Links carry telemetry between targets over the network.
 //!
-//! [`publish`] and [`subscribe`] are the two core systems. Publish sends data to targets, and Subscribe collects data from a target.
-//! [`db`], behind the `db` feature, is the embedded database a gateway records into.
+//! A link is a built-in system that moves records over TCP, either by
+//! listening for peers or by dialing one. There are two core links:
+//! [`Publish`] sends the records wired into it to every connected peer, and
+//! [`Subscribe`] receives records from connected peers and writes them onto
+//! its output ports. `Db`, behind the `db` feature, is a third link that
+//! records everything wired into it in an embedded metor-db, which is how a
+//! gateway stores telemetry.
 
 mod conn;
 #[cfg(feature = "db")]
@@ -32,70 +37,77 @@ pub use publish::{Publish, PublishParams};
 pub use subscribe::{Subscribe, SubscribeParams};
 pub use transport::Transport;
 
-/// The prefix every built-in system registers under, as a pack's id would be.
+/// The prefix for every built-in system's type name. It plays the same role a
+/// pack's id does for the systems in a pack.
 const BUILTIN: &str = "fsw";
 
-/// The type a `Publish` registers as.
+/// The system type name for [`Publish`].
 pub const PUBLISH_TYPE: &str = "fsw.publish";
-/// The type a `Subscribe` registers as.
+/// The system type name for [`Subscribe`].
 pub const SUBSCRIBE_TYPE: &str = "fsw.subscribe";
-/// The type a gateway's database registers as.
+/// The system type name for a gateway's embedded database.
 pub const DB_TYPE: &str = "fsw.db";
-/// Every link type, each configured with [`LinkParams`].
+/// Every link system type. Each one's params include [`LinkParams`].
 pub const LINK_TYPES: [&str; 3] = [PUBLISH_TYPE, SUBSCRIBE_TYPE, DB_TYPE];
 
-/// What every link is configured with.
+/// The configuration shared by every link.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct LinkParams {
     pub transport: Transport,
     /// The target's telemetry namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
-    /// This link's name, which tells one of a target's links from another.
+    /// The link's name. It tells apart the links of a single target.
     #[serde(default)]
     pub link: String,
 }
 
-/// What a `Db` is configured with.
+/// The configuration for a `Db`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct DbParams {
     #[serde(flatten)]
     pub link: LinkParams,
-    /// The store's directory; unset, a fresh one under the temp dir.
+    /// The directory the database is stored in. When unset, the database
+    /// uses a fresh directory under the system temp dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    /// The messages subscribers take through this db, which `metor build` fills.
+    /// The ids of messages that subscribers receive through this database.
+    /// `metor build` fills this in.
     #[serde(default)]
     pub command_ids: Vec<PacketId>,
 }
 
-/// Bytes a link holds for one connection before it drops a batch.
+/// The default number of bytes a link queues for one connection. A batch that
+/// would go past this is dropped.
 fn default_conn_cap() -> usize {
     1 << 20
 }
 
-/// The bound sockets for this process
+/// Every socket address bound by a link in this process, keyed by link name.
 static BOUND: Mutex<Vec<(String, SocketAddr)>> = Mutex::new(Vec::new());
 
-/// Records a bound endpoint
+/// Adds `endpoint`'s local address to [`BOUND`], if it has one.
 fn record_bound(link: &str, endpoint: &transport::Endpoint) {
     let Some(addr) = endpoint.local_addr() else {
         return;
     };
-    // PANIC Safety: nothing panics while it holds this lock.
+    // PANIC Safety: no code panics while holding this lock, so it is never
+    // poisoned.
     BOUND
         .lock()
         .expect("an unpoisoned registry")
         .push((link.to_string(), addr));
 }
 
-/// Returns the bound endpoints for this process
+/// Returns every address a link in this process has bound, with the link's
+/// name.
 pub fn bound_ports() -> Vec<(String, SocketAddr)> {
     // PANIC Safety: as above.
     BOUND.lock().expect("an unpoisoned registry").clone()
 }
 
-/// What a link reports about its sockets, each cycle its counters change.
+/// Socket statistics for a link. A link writes one on every cycle where a
+/// counter changed.
 #[derive(
     Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, Default, PartialEq,
 )]
@@ -124,7 +136,7 @@ impl LinkStatus {
         }
     }
 
-    /// Whether anything but the stamp differs, which is what a link reports on.
+    /// Returns true if any field other than the timestamp differs.
     fn changed(&self, other: &Self) -> bool {
         Self {
             timestamp: other.timestamp,
@@ -133,7 +145,10 @@ impl LinkStatus {
     }
 }
 
-/// Writes the status when its counters moved, faulting the packets no port saw.
+/// Writes `status` to `link_status` if any counter changed since `reported`.
+///
+/// If more inbound packets were dropped since the last report, this also logs
+/// a fault with the count.
 fn report(
     status: &LinkStatus,
     reported: &mut LinkStatus,
@@ -150,7 +165,8 @@ fn report(
     }
 }
 
-/// Registers the link systems every target may name, under `fsw.`.
+/// Registers the built-in systems, all under the `fsw.` prefix, so any target
+/// can use them.
 pub fn register_builtins(table: &mut SystemTable) -> Result<(), BuildError> {
     table.register_async(PUBLISH_TYPE, publish::publish(), Publish::new)?;
     table.register_async(SUBSCRIBE_TYPE, subscribe::subscribe(), Subscribe::new)?;

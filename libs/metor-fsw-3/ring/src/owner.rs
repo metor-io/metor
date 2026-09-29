@@ -1,15 +1,19 @@
-//! Process-local ownership across independently compiled libraries.
+//! Shares ownership of a ring between separately compiled libraries in one
+//! process.
 
 use std::ffi::c_void;
 
 use crate::{Inner, sync::Arc};
 
-/// Borrowed ownership callbacks. Copying this descriptor does not retain it.
+/// Keeps a ring's storage alive across a C ABI boundary.
 ///
-/// The context must remain live through `retain`. Each retain acquires one
-/// reference, balanced by one release. Callbacks must be thread-safe,
-/// non-panicking, and remain callable through the final release. Only the
-/// originating library interprets the context; its code must remain loaded.
+/// It is a reference count exposed as a context pointer plus `retain` and
+/// `release` callbacks. Copying the descriptor does not take a reference. The
+/// context must still be live when `retain` is called. Every `retain` takes
+/// one reference, and exactly one `release` gives it back. The callbacks must be
+/// thread-safe, must not panic, and must stay callable until the final
+/// `release`. Only the library that created the context knows what it points to,
+/// so that library's code must stay loaded.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawOwner {
@@ -22,7 +26,7 @@ pub(super) struct Lease(RawOwner);
 
 impl Lease {
     /// # Safety
-    /// `owner` satisfies `RawOwner`'s contract and is live for this call.
+    /// `owner` meets `RawOwner`'s contract and is live for this call.
     pub(super) unsafe fn acquire(owner: RawOwner) -> Self {
         // SAFETY: the caller guarantees a live owner and valid callbacks.
         unsafe { (owner.retain)(owner.context) };
@@ -41,7 +45,12 @@ impl Drop for Lease {
 unsafe impl Send for Lease {}
 unsafe impl Sync for Lease {}
 
-/// Keeps an exported ring alive until the receiver acquires its own reference.
+/// A ring prepared for passing to another library.
+///
+/// It keeps the ring alive until the receiver takes its own reference with
+/// [`RingBuffer::attach_owned`].
+///
+/// [`RingBuffer::attach_owned`]: crate::RingBuffer::attach_owned
 pub struct RingExport {
     base: *mut u8,
     len: usize,
@@ -64,12 +73,16 @@ impl RingExport {
         }
     }
 
-    /// Region address and size, valid while this export is alive.
+    /// Returns the region's address and size.
+    ///
+    /// They stay valid while this export is alive.
     pub fn region(&self) -> (*mut u8, usize) {
         (self.base, self.len)
     }
 
-    /// Borrowed owner descriptor, valid while this export is alive.
+    /// Returns the owner descriptor to pass to the receiver.
+    ///
+    /// It stays valid while this export is alive.
     pub fn owner(&self) -> RawOwner {
         self.lease.0
     }

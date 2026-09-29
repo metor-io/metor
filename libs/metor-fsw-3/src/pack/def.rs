@@ -1,4 +1,7 @@
-//! The descriptor a pack exports: a projection of its [`SystemTable`].
+//! The descriptor a pack exports so the host knows what systems it has.
+//!
+//! The descriptor is built from the pack's [`SystemTable`] and sent to the host
+//! as JSON.
 
 use std::borrow::Cow;
 
@@ -9,8 +12,10 @@ use crate::coordinator::{Adapter, OutputConfig, SystemKind, SystemTable, TableEn
 use crate::def::{DefCx, Records};
 use crate::system::{PortDef, SystemDef};
 
-/// An `Instance` is what the host hands `create`: the definition build settled
-/// on, including the ports a config added, and the adapter it runs behind.
+/// Describes the instance the host asks a pack's `create` to build.
+///
+/// `def` is the definition the host resolved, including any ports the config
+/// added.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Instance {
     pub id: String,
@@ -18,35 +23,35 @@ pub struct Instance {
     pub adapter: Option<Adapter>,
 }
 
-/// A `PackDef` is every system a pack exports, in registration order.
+/// Lists the systems a pack exports, in registration order.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PackDef {
     pub systems: Vec<PackSystemDef>,
 }
 
-/// One exported system: its table key, its ports, its doc, and its params schema.
+/// Describes one system type a pack exports.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PackSystemDef {
-    /// The table key: `register("nav", ..)`.
+    /// The name the type was registered under, as in `register("nav", ..)`.
     pub ty: String,
     #[serde(default)]
     pub kind: SystemKind,
-    /// The ports the type declares whatever a config says.
+    /// The ports the type always has, whatever the config says.
     pub def: SystemDef,
-    /// Whether the type takes the input ports a config lists.
+    /// Whether the type accepts extra input ports listed in a config.
     #[serde(default)]
     pub takes_inputs: bool,
-    /// Whether the type takes the output ports a config lists.
+    /// Whether the type accepts extra output ports listed in a config.
     #[serde(default)]
     pub takes_outputs: bool,
-    /// The doc comment on `execute`, or empty.
+    /// The doc comment on `execute`, or an empty string.
     pub doc: Cow<'static, str>,
-    /// JSON Schema of the params struct; `None` for a `Fn() -> S` ctor.
+    /// The JSON Schema of the params struct, or `None` for a `Fn() -> S` ctor.
     pub params: Option<Box<RawValue>>,
 }
 
 impl PackDef {
-    /// Projects the registered entries into an owned descriptor.
+    /// Builds a descriptor from the types registered in `table`.
     pub fn from_table(table: &SystemTable) -> Self {
         let systems = table
             .entries()
@@ -67,10 +72,13 @@ impl PackDef {
     }
 }
 
-/// The port name a probe offers a type, which no config would spell.
+/// The port name [`probe`] offers a type. No real config uses this name.
 const PROBE: &str = "__probe";
 
-/// Whether a type takes the ports a config lists, by offering it one of each.
+/// Returns whether a type accepts config-listed input and output ports.
+///
+/// It offers the type one extra port of each kind and checks which ones the
+/// type's definition keeps.
 fn probe(entry: &TableEntry) -> (bool, bool) {
     let record = crate::Output::<crate::SystemStatus>::def(&DefCx::empty(), PROBE);
     let records = Records::of(core::iter::once(&record));
@@ -92,7 +100,7 @@ fn took(ports: &[PortDef]) -> bool {
     ports.iter().any(|port| port.name == PROBE)
 }
 
-/// A [`DefCx`] as the ABI carries it: the borrowed context, owned.
+/// An owned copy of a [`DefCx`], used to send it across the ABI.
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct DefCxOwned {
     pub id: String,
@@ -105,7 +113,7 @@ pub struct DefCxOwned {
 }
 
 impl DefCxOwned {
-    /// Copies a context for the crossing.
+    /// Copies `cx` into an owned value.
     pub fn of(cx: &DefCx<'_>) -> Self {
         Self {
             id: cx.id.to_string(),
@@ -121,7 +129,7 @@ impl DefCxOwned {
         }
     }
 
-    /// The edges this context carries, in the shape [`DefCx`] borrows.
+    /// Returns this context's input edges in the form [`DefCx`] borrows.
     pub fn edges(&self) -> Vec<(&str, &PortDef)> {
         self.inputs
             .iter()
@@ -129,7 +137,7 @@ impl DefCxOwned {
             .collect()
     }
 
-    /// Borrows this context back, over `edges` from [`DefCxOwned::edges`].
+    /// Returns a borrowed [`DefCx`] that uses `edges` from [`DefCxOwned::edges`].
     pub fn borrow<'a>(&'a self, edges: &'a [(&'a str, &'a PortDef)]) -> DefCx<'a> {
         DefCx {
             id: &self.id,
@@ -205,7 +213,9 @@ mod tests {
         );
     }
 
-    /// Every port announces, so the ground needs nothing but the descriptor.
+    /// Every port in the descriptor carries its full schema.
+    ///
+    /// The ground station needs nothing but the descriptor to decode them.
     #[test]
     fn test_descriptor_port_schemas() {
         use crate::Record;
@@ -228,7 +238,7 @@ mod tests {
         }
     }
 
-    /// The descriptor says which types take the ports a config lists.
+    /// The descriptor records which types accept config-listed ports.
     #[test]
     fn test_configurable_port_flags() {
         let def = decoded(&table(&Recorder::default()));

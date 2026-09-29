@@ -1,4 +1,4 @@
-"""The editable wheel's members, digests, and `.pth` line."""
+"""Tests the editable wheel's members, digests, and `.pth` line."""
 
 from __future__ import annotations
 

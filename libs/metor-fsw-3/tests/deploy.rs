@@ -1,5 +1,7 @@
-//! The fixture deployment under `metor run`: `a` samples, `b` mirrors and
-//! pings, and the gateway's db holds both.
+//! Runs the fixture deployment with `metor run`.
+//!
+//! Target `a` publishes samples, `b` subscribes to them and sends pings, and
+//! the gateway's db records both.
 
 mod common;
 
@@ -22,8 +24,10 @@ use metor_proto_wkt::{DumpMetadata, DumpMetadataResp, GetTimeSeries, LogEvent};
 use serde_json::json;
 use zerocopy::FromBytes;
 
-/// Cycles a target runs before it exits on its own, which outlives any test
-/// here and bounds what a killed run's children live on for.
+/// How many cycles a target runs before it exits on its own.
+///
+/// This is longer than any test here needs. It also bounds how long a
+/// child can outlive a killed run.
 const CYCLES: &str = "20000";
 
 const PORTS_ENV: &str = "METOR_DEPLOY_PORTS";
@@ -65,8 +69,9 @@ async fn test_gateway_records_every_target() {
     );
     let mut client = connect(local(ports[2])).await;
 
-    // A mirrored frame keeps its origin's names, so `b`'s copy of the sample
-    // lands in the same table as `a`'s own; `b`'s link status is `b`'s.
+    // A subscribed frame keeps its original names, so `b`'s copy of the
+    // sample lands in the same table as `a`'s. `b`'s link status is named
+    // under `b`.
     let deadline = Deadline::new();
     let wanted = ["a.sampler.sample.value", "b.mirror.link_status.connections"];
     loop {
@@ -84,8 +89,8 @@ async fn test_gateway_records_every_target() {
         deadline.tick(format!("announced only {names:?}")).await;
     }
 
-    // Samples reach a series once the db's persistence drains its log, so a
-    // query is refused until then.
+    // Samples only show up in a time series once the db has flushed its log,
+    // so queries fail until then.
     let component_id = ComponentId::new(wanted[0]);
     loop {
         let series = client
@@ -96,8 +101,8 @@ async fn test_gateway_records_every_target() {
                 limit: Some(64),
             })
             .await;
-        // The table is fed by `a` and again through `b`'s mirror, so a stamp
-        // may repeat; it never goes backwards.
+        // The table gets each sample from `a` and again through `b`, so a
+        // timestamp may repeat, but it never goes backwards.
         if let Ok(series) = &series
             && let Ok(stamps) = series.timestamps()
             && stamps.len() >= 2
@@ -112,7 +117,8 @@ async fn test_gateway_records_every_target() {
     }
 }
 
-/// `metor build` writes the resolved envelope, with the pack path as given.
+/// Runs `metor build` on the fixture deployment and returns the resolved
+/// config it wrote.
 fn build(ports: Option<&[u16; 3]>, out: &Path) -> serde_json::Value {
     let mut command = metor();
     command
@@ -144,7 +150,8 @@ fn test_build_matches_golden() {
             assert_eq!(pack["libs"], json!(libs.display().to_string()));
             pack["libs"] = json!("<libs>");
         }
-        // Baked peer schemas are pinned by `deploy`'s unit tests.
+        // The unit tests in `deploy` pin the resolved peer port definitions,
+        // so they are dropped here.
         for system in target["coordinator"]["systems"]
             .as_array_mut()
             .expect("systems")
@@ -161,7 +168,7 @@ fn test_build_matches_golden() {
     assert_eq!(built, expected);
 }
 
-/// A target run from a resolved envelope opens no pack but its own.
+/// A target run from a resolved config only opens its own packs.
 #[test]
 fn test_resolved_target_opens_only_its_packs() {
     let ports = free_ports();
@@ -194,15 +201,16 @@ fn test_resolved_target_opens_only_its_packs() {
     );
 }
 
-/// An in-process target serving a frame the fixture does not know in `a`'s
-/// place; it announces at once and sends data once `gate` is set.
+/// An in-process target that stands in for `a`, but serves a different frame.
+///
+/// It announces right away, and starts sending data once `gate` is set.
 struct Impostor {
     _target: Target,
     gate: Arc<AtomicBool>,
 }
 
-/// Serves `imu.imu` as target `a`'s `pub` on `port`, which is not the table
-/// `b` was built against.
+/// Starts an impostor that serves `imu.imu` as target `a`'s `pub` link on
+/// `port`. Its table differs from the one `b` was built against.
 fn impostor(port: u16) -> Impostor {
     let gate = Arc::new(AtomicBool::new(false));
     let open = gate.clone();
@@ -253,8 +261,8 @@ async fn test_peer_announcing_another_table_is_faulted() {
     let Fsw { info, .. } = dial_fsw(local(ports[0])).await;
     assert_eq!(info.link, "pub");
     let _running = run(&out, &ports, &["--target", "b", "--cycles", CYCLES]);
-    // The fault is logged once, on the peer's first data packet, so the
-    // observer attaches before the impostor sends any.
+    // The fault is logged only once, on the peer's first data packet, so the
+    // observer connects before the impostor sends any.
     let Fsw { mut rx, buf, .. } = dial_fsw(local(ports[1])).await;
     impostor.gate.store(true, Ordering::Release);
     let mut buf = buf;

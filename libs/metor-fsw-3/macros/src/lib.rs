@@ -1,4 +1,4 @@
-//! Derive macros for metor-fsw-3.
+//! Derive and attribute macros for metor-fsw-3.
 
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
@@ -10,24 +10,39 @@ mod frame;
 mod record;
 mod system_attr;
 
-/// Derives the four component sub-traits and `Frame`. Configured with
-/// `#[frame(name = "..")]` and one `#[frame(timestamp)]` field.
+/// Derives `Frame` for a struct sent as its raw bytes.
+///
+/// The derive also implements `Record` and the four metor component traits.
+/// Mark one field `#[frame(timestamp)]`.
+/// `#[frame(name = "..")]` sets the record name, which defaults to the struct
+/// name in snake_case.
 #[proc_macro_derive(Frame, attributes(frame))]
 pub fn frame_derive(input: TokenStream) -> TokenStream {
     frame::frame(input)
 }
 
-/// Derives `Record` over postcard, configured with `#[record(name, max_len, depth)]`.
+/// Derives `Record` for a type encoded with postcard.
+///
+/// `#[record(name = "..")]` sets the record name, which defaults to the type
+/// name in snake_case. `max_len` sets the largest encoded size, which defaults
+/// to the type's `MaxSize` bound. `depth` sets `Record::DEPTH`. A field marked
+/// `#[record(timestamp)]` becomes the record's timestamp.
 #[proc_macro_derive(Record, attributes(record))]
 pub fn record_derive(input: TokenStream) -> TokenStream {
     record::record(input)
 }
 
-/// Rewrites a free fn into a fn returning its system. Each parameter is a port,
-/// named by its identifier; one `#[state] s: &mut S` parameter is the state,
-/// and without one the state is `()`. The returned value derefs to a fn
-/// pointer for direct calls. An `async fn` ending in `stop: Stop` becomes an
-/// async system, with no fn pointer.
+/// Turns a free fn into a system.
+///
+/// `#[system] fn nav(..)` becomes `fn nav() -> impl SystemFn`, which you
+/// register with a table. Each parameter is a port, named after the parameter.
+/// Mark one `&mut S` parameter `#[state]` to give the system state. Without
+/// one, the state is `()`. The value `nav()` returns derefs to a fn pointer to
+/// the original body, so tests can call it directly. The fn's doc comment
+/// becomes the system's documentation.
+///
+/// An `async fn` whose last parameter is `stop: Stop` becomes an async system
+/// instead. It has no fn pointer.
 ///
 /// ```ignore
 /// #[system]
@@ -40,9 +55,12 @@ pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
     system_attr::system(item)
 }
 
-/// Rewrites an `async fn` into a fn returning its sequence, polled once per
-/// cycle until it returns. Parameters are ports as on `#[system]`, plus a
-/// `seq: &Seq` for the time, waits, and abort. It returns
+/// Turns an `async fn` into a sequence.
+///
+/// A sequence is an async fn that the runtime polls once per cycle until it
+/// returns. `#[sequence] async fn arm(..)` becomes `fn arm() -> impl SequenceFn`.
+/// Parameters are ports, as with `#[system]`. A `seq: &Seq` parameter gives the
+/// sequence the current time, waits, and aborts. The fn must return
 /// `Result<(), SeqError>`.
 ///
 /// ```ignore
@@ -56,10 +74,10 @@ pub fn sequence(_attr: TokenStream, item: TokenStream) -> TokenStream {
     system_attr::sequence(item)
 }
 
-/// The path generated code uses to reach `metor-fsw-3`.
+/// Returns the path generated code uses to reach `metor-fsw-3`.
 ///
 /// # Panics
-/// A consumer without the crate in `[dependencies]` cannot use these macros.
+/// Panics if the calling crate does not list `metor-fsw-3` in `[dependencies]`.
 pub(crate) fn fsw_crate() -> proc_macro2::TokenStream {
     match crate_name("metor-fsw-3") {
         Ok(FoundCrate::Itself) => quote!(::metor_fsw_3),

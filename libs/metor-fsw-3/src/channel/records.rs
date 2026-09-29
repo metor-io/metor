@@ -1,6 +1,6 @@
-//! The metor-proto-wkt sequence messages as records.
+//! Record impls for the sequence messages from metor-proto-wkt.
 //!
-//! Each is postcard, so its packet id is the one the panel matches on.
+//! They are postcard records, so each gets the packet id the panel expects.
 
 use metor_proto_wkt::{SequenceChannelEvent, SequenceCommand, SequenceRegistry};
 
@@ -20,6 +20,6 @@ impl PostcardRecord for SequenceChannelEvent {
 
 impl PostcardRecord for SequenceRegistry {
     const NAME: &'static str = "sequence_registry";
-    /// A registry that encodes past this fails its write.
+    /// A registry whose encoding is longer than this fails to write.
     const MAX_LEN: usize = 16 * 1024;
 }

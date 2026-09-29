@@ -1,5 +1,7 @@
-//! The config file a deployment's `emit()` writes and `metor run` reads: one
-//! envelope holding every target.
+//! The deployment config file.
+//!
+//! A deployment's Python `emit()` writes this file and `metor run` reads it.
+//! One file describes every target in the deployment.
 
 use std::collections::BTreeMap;
 
@@ -8,10 +10,10 @@ use serde::{Deserialize, Serialize};
 use crate::coordinator::CoordinatorConfig;
 use crate::dl::PackRef;
 
-/// The file format this host reads.
+/// The config file format version this build reads.
 pub const CONFIG_VERSION: u32 = 2;
 
-/// A `ConfigError` is why a config file is not this host's, or names no target.
+/// An error reading a config file or picking a target from it.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("the config is version {found}, this host reads {expected}")]
@@ -24,7 +26,10 @@ pub enum ConfigError {
     NoSuchTarget(String),
 }
 
-/// A whole target: the packs that supply the types and the graph over them.
+/// The config for one target.
+///
+/// `packs` lists the packs that provide the target's system types, and
+/// `coordinator` describes the systems and how they connect.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TargetConfig {
     pub packs: Vec<PackRef>,
@@ -32,24 +37,28 @@ pub struct TargetConfig {
 }
 
 impl TargetConfig {
-    /// The name a deployment selects this target by.
+    /// Returns the target's namespace, which is the name used to select it.
     pub fn namespace(&self) -> &str {
         self.coordinator.namespace.as_deref().unwrap_or("")
     }
 }
 
-/// Every target of a deployment, and the host each is dialed at.
+/// A deployment: every target, and the host each one runs on.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeploymentConfig {
     pub config_version: u32,
-    /// A target's namespace to the address its peers dial; absent is loopback.
+    /// Maps a target's namespace to the host its peers dial. A target that is
+    /// not listed is dialed on loopback.
     #[serde(default)]
     pub hosts: BTreeMap<String, String>,
     pub targets: Vec<TargetConfig>,
 }
 
 impl DeploymentConfig {
-    /// Reads a config file, checking its version before the rest of the shape.
+    /// Parses a config file.
+    ///
+    /// The version is checked first, so an old or new file reports a version
+    /// mismatch rather than a confusing decode error.
     pub fn from_slice(bytes: &[u8]) -> Result<DeploymentConfig, ConfigError> {
         let value: serde_json::Value = serde_json::from_slice(bytes)?;
         let found = value["config_version"].as_u64().unwrap_or(0) as u32;
@@ -62,7 +71,10 @@ impl DeploymentConfig {
         Ok(serde_json::from_value(value)?)
     }
 
-    /// The index of the target `namespace` names, or of the only target.
+    /// Returns the index of the target named `namespace`.
+    ///
+    /// With no namespace, this returns the only target, or an error if there
+    /// are several.
     pub fn target(&self, namespace: Option<&str>) -> Result<usize, ConfigError> {
         match namespace {
             Some(name) => self
@@ -75,7 +87,7 @@ impl DeploymentConfig {
         }
     }
 
-    /// Every target's namespace, in file order.
+    /// Returns every target's namespace, in file order.
     pub fn namespaces(&self) -> Vec<&str> {
         self.targets.iter().map(TargetConfig::namespace).collect()
     }
@@ -89,8 +101,8 @@ mod tests {
     use crate::coordinator::{BuildError, SystemTable};
     use crate::{Input, JsonSchema, Output, Record, system};
 
-    /// One record for every port here: the build only compares ids across an
-    /// edge, and every edge in the golden joins ports of one record.
+    /// The record type for every port in these tests. The build only checks
+    /// that the ids on each edge match, so one record type is enough.
     #[derive(Record, crate::Schema, serde::Serialize, Deserialize, Clone, Copy, Debug)]
     #[record(max_len = 8)]
     struct Ping {
@@ -129,7 +141,8 @@ mod tests {
         let _ = (est, mode, motor_cmd);
     }
 
-    /// The four `adcs.*` types the golden names, plus the links it adds.
+    /// Registers the four `adcs.*` types the golden file uses, plus the
+    /// built-in links.
     fn table() -> SystemTable {
         let mut table = SystemTable::new();
         let mut register = || -> Result<(), BuildError> {
@@ -144,7 +157,8 @@ mod tests {
         table
     }
 
-    /// The Python golden: the design doc's target, emitted as a deployment of one.
+    /// Loads the golden file: the design doc's target, emitted by Python as a
+    /// one-target deployment.
     fn golden() -> DeploymentConfig {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/target.json");
         let bytes = std::fs::read(path).expect("the golden exists");

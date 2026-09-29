@@ -1,4 +1,9 @@
-//! Loading packs: the systems a pack exports, registered into a table.
+//! Loads packs and registers their systems into a [`SystemTable`].
+//!
+//! A pack is a separately built library of system types. It lets a target use
+//! systems that are not compiled into the host binary. A pack is either a
+//! shared library loaded into this process ([`DlPack`]) or a WebAssembly
+//! module ([`WasmPack`]). Both export a descriptor listing their systems.
 
 pub(crate) mod codec;
 mod pack;
@@ -20,7 +25,7 @@ pub(crate) use pack::is_loaded;
 pub use pack::{DlPack, DlStep};
 pub use pack_ref::{PackKind, PackRef, WASM_TRIPLE, cdylib_name, triple, wasm_name};
 
-/// A `PackError` is why an artifact is no usable pack.
+/// An error from opening a pack.
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {
     #[error("loading the pack: {0}")]
@@ -43,17 +48,17 @@ pub enum PackError {
     Trap(#[from] Trap),
 }
 
-/// The type a `DlSlot` registers as.
+/// The system type name that [`DlSlot`](slot::DlSlot) is registered under.
 pub const SLOT_TYPE: &str = "fsw.dl_slot";
 
-/// A `Pack` is an opened pack of any kind and the descriptor it exported.
+/// An opened pack of either kind.
 pub enum Pack {
     Dl(DlPack),
     Wasm(WasmPack),
 }
 
 impl Pack {
-    /// The descriptor this pack exported.
+    /// Returns the descriptor this pack exported.
     pub fn descriptor(&self) -> &PackDef {
         match self {
             Pack::Dl(pack) => pack.descriptor(),
@@ -61,7 +66,7 @@ impl Pack {
         }
     }
 
-    /// One exported type's definition under an instance's config.
+    /// Returns the definition of type `ty` for one instance's config.
     pub fn def(&self, ty: &str, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         match self {
             Pack::Dl(pack) => pack.def(ty, cx),
@@ -69,7 +74,7 @@ impl Pack {
         }
     }
 
-    /// Creates one instance of `ty` over the host's rings.
+    /// Creates one instance of type `ty` on the given rings.
     pub fn create(
         &self,
         ty: &str,
@@ -86,8 +91,10 @@ impl Pack {
 }
 
 impl SystemTable {
-    /// Registers systems in `pack` under `"{id}.{ty}"` in order.
-    /// Stops at the first conflict, leaving earlier registrations in the table.
+    /// Registers every system in `pack` under the name `"{id}.{ty}"`, in order.
+    ///
+    /// Stops at the first conflict. Systems registered before the conflict stay
+    /// in the table.
     pub fn register_pack(&mut self, id: &str, pack: Arc<Pack>) -> Result<(), BuildError> {
         let entries = pack
             .descriptor()
@@ -99,7 +106,9 @@ impl SystemTable {
     }
 }
 
-/// The table entry for one exported system, whose closures share `pack`.
+/// Builds the table entry for one exported system.
+///
+/// The entry keeps `pack` open for as long as it exists.
 fn entry(pack: &Arc<Pack>, system: &PackSystemDef) -> TableEntry {
     let (def_pack, def_ty) = (pack.clone(), system.ty.clone());
     let (make_pack, make_ty) = (pack.clone(), system.ty.clone());

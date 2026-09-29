@@ -1,5 +1,8 @@
-//! Async systems on OS threads: the registry of thread groups and the
-//! adapter that copies a system's ports across each cycle.
+//! Runs async systems on OS threads.
+//!
+//! Systems are grouped by thread name, and each group runs one executor on
+//! its own thread. The coordinator steps a [`Thread`] adapter for each system,
+//! which copies records between the real rings and the system's mirrors.
 
 mod group;
 #[cfg(test)]
@@ -20,8 +23,11 @@ use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef, SystemInput
 
 use group::{GroupHandle, Member, Panicked};
 
-/// A `Threads` hands out one group per thread name, held only weakly: the
-/// systems placed on a group own it, and a name whose group is gone respawns.
+/// The registry of running thread groups, one per thread name.
+///
+/// A group lives as long as the systems placed on it. Once they are all
+/// dropped, the thread stops, and the next system to name that thread starts
+/// a new one.
 #[derive(Default)]
 pub struct Threads {
     groups: HashMap<String, Weak<GroupHandle>>,
@@ -32,7 +38,7 @@ impl Threads {
         Self::default()
     }
 
-    /// The group named `name`, started if it is not already running.
+    /// Returns the group named `name`, starting it if it is not running.
     fn get_or_spawn(&mut self, name: &str) -> Result<Arc<GroupHandle>, ParamError> {
         if let Some(group) = self.groups.get(name).and_then(Weak::upgrade) {
             return Ok(group);
@@ -43,12 +49,12 @@ impl Threads {
     }
 }
 
-/// A `Launch` constructs one async system on the thread that will run it.
+/// Builds an async system on the thread that will run it.
 pub(crate) trait Launch: Send {
     fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError>;
 }
 
-/// One async system's ingredients, owned until its thread constructs it.
+/// Everything needed to build one async system, sent to its thread.
 struct AsyncLaunch<A: AsyncSystem, M> {
     make: Arc<M>,
     params: serde_json::Value,
@@ -74,9 +80,11 @@ where
     }
 }
 
-/// Places one async system on the group `cx` names: mirrors for its ports, the
-/// system built and running on that group's thread, and the adapter that
-/// copies between them each cycle.
+/// Starts an async system on the thread `cx` names.
+///
+/// The system is built and run on that thread, reading and writing mirror
+/// rings. The returned [`Thread`] step copies between the mirrors and the
+/// real rings each cycle. A system with a channel adapter is refused.
 pub(crate) fn place<A, M>(make: Arc<M>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>
 where
     A: AsyncSystem + 'static,
@@ -105,17 +113,18 @@ where
     Ok(Box::new(thread))
 }
 
-/// How much deeper a mirror ring is than the ring it mirrors.
+/// How many times larger a mirror ring is than the ring it mirrors.
 const MIRROR_FACTOR: usize = 4;
 
-/// A `Thread` is the step an async system is bound as.
+/// The coordinator's step for an async system that runs on another thread.
 ///
-/// Each cycle it drains the real input rings into the system's mirrors and the
-/// system's output mirrors into the real rings. Both are byte copies; a mirror
-/// with no room drops the record for this system alone.
+/// Each cycle it copies the real input rings into the system's mirrors, and
+/// the system's output mirrors into the real rings. When a mirror is full,
+/// the record is dropped for this system only; other readers of the real
+/// ring still see it.
 pub struct Thread {
-    /// The real input rings into the mirrors the system reads, whose writers
-    /// wake it, and the system's output mirrors into the real rings.
+    /// Copies records in both directions. Writing to an input mirror wakes
+    /// the system.
     mirrors: Mirrors<Notifier>,
     panicked: Panicked,
     end: Option<EndReason>,
@@ -141,7 +150,8 @@ impl Step for Thread {
 }
 
 impl Thread {
-    /// Latches the system off once its task has panicked, reporting it once.
+    /// Checks whether the system's task panicked. On the first panic, marks
+    /// the system as ended and logs the panic message.
     fn check_panic(&mut self, now: Timestamp) {
         if self.end.is_some() {
             return;
@@ -154,13 +164,13 @@ impl Thread {
     }
 }
 
-/// The adapter for the cycle thread and the bindings the system's own thread
-/// reads and writes.
+/// The adapter step, plus the port bindings the system uses on its own
+/// thread.
 type Bound = (Thread, Vec<InputBinding<Notifier>>, Vec<OutputBinding>);
 type BoundInputs = (Vec<Mirror<Notifier>>, Vec<InputBinding<Notifier>>);
 type BoundOutputs = (Vec<Mirror<NoWake>>, Vec<OutputBinding>);
 
-/// Mirrors every port of one async system.
+/// Creates a mirror ring for every port of one async system.
 fn bind(
     def: &SystemDef,
     inputs: Vec<Vec<&RingBuffer>>,
@@ -187,7 +197,8 @@ fn bind_inputs(
         let mut views = Vec::with_capacity(rings.len());
         for ring in rings {
             let mirror = mirror(ring)?;
-            // PANIC Safety: a fresh mirror has its writer and one reader slot free.
+            // PANIC Safety: a fresh mirror has its writer and its one reader
+            // slot free, and the build reserved a reader slot on `ring`.
             edges.push(Mirror::new(
                 port.name.clone(),
                 ring.view(NoWake).expect("a counted reader slot"),
@@ -208,7 +219,8 @@ fn bind_outputs(ports: &[PortDef], outputs: Vec<&RingBuffer>) -> Result<BoundOut
     let mut bound_out = Vec::with_capacity(ports.len());
     for (port, ring) in ports.iter().zip(outputs) {
         let mirror = mirror(ring)?;
-        // PANIC Safety: the mirror is fresh; build counted one real writer.
+        // PANIC Safety: the mirror is fresh, and the build gives each output
+        // ring exactly one writer.
         copies.push(Mirror::new(
             port.name.clone(),
             mirror.view(NoWake).expect("a fresh mirror"),
@@ -223,7 +235,7 @@ fn bind_outputs(ports: &[PortDef], outputs: Vec<&RingBuffer>) -> Result<BoundOut
     Ok((copies, bound_out))
 }
 
-/// A ring of the same records as `real`, several times as deep.
+/// Creates a mirror ring for `real`, [`MIRROR_FACTOR`] times its capacity.
 fn mirror(real: &RingBuffer) -> Result<RingBuffer, ParamError> {
     let (config, _) = mirror_config(real.config().capacity, MIRROR_FACTOR)?;
     Ok(RingBuffer::create_in_memory(config))

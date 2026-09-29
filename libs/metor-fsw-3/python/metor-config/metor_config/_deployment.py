@@ -1,4 +1,4 @@
-"""Several targets in one file, emitted as one envelope."""
+"""`Deployment`, which groups several targets into one config file."""
 
 from __future__ import annotations
 
@@ -19,11 +19,12 @@ _emitted = False
 
 
 class Deployment:
-    """The targets one file deploys together, and where peers dial each.
+    """A group of targets that are deployed together and talk to each other.
 
-    ``hosts`` maps a target's namespace to its address; a target absent from
-    it is at loopback. A target is a member by identity, and every target the
-    file built must be one.
+    ``hosts`` maps a target's namespace to the address its peers dial. A
+    target that is not listed is dialed on loopback. Every `Target` the file
+    creates must be in the deployment. Each target in a deployment of more
+    than one needs its own namespace.
     """
 
     def __init__(self, targets: Sequence[Target], hosts: Mapping[str, str] | None = None) -> None:
@@ -32,7 +33,7 @@ class Deployment:
         _deployments.append(self)
 
     def to_config(self) -> dict[str, Any]:
-        """The envelope: every member's config under its namespace."""
+        """Returns the deployment config, with one entry per target."""
         names = _namespaces(self.targets)
         for host in self.hosts:
             if host not in names:
@@ -41,7 +42,11 @@ class Deployment:
 
 
 def _namespaces(targets: Sequence[Target]) -> list[str]:
-    """Every member's namespace; several members each need one of their own."""
+    """Returns every target's namespace.
+
+    A lone target may have no namespace. When there are several, each needs a
+    unique one.
+    """
     if len(targets) == 1:
         return [targets[0].namespace or ""]
     names: list[str] = []
@@ -74,7 +79,8 @@ def _links(targets: Sequence[Target]) -> list[tuple[Target, Link]]:
 
 
 def _check_peers(targets: Sequence[Target]) -> None:
-    """Every peer is a member's link that listens on a fixed port."""
+    """Checks that every peer a link dials is in the deployment and listens
+    on a fixed port."""
     for target, link in _links(targets):
         peer = link._peer
         if peer is None:
@@ -90,7 +96,7 @@ def _check_peers(targets: Sequence[Target]) -> None:
 
 
 def _check_ports(targets: Sequence[Target], hosts: Mapping[str, str]) -> None:
-    """No two listeners on one host bind one port."""
+    """Checks that no two listeners on the same host bind the same port."""
     bound: dict[tuple[str, int], str] = {}
     for target, link in _links(targets):
         port = link.listen_port()
@@ -110,8 +116,12 @@ def gateway(
     cycle_rate: float = 10.0,
     path: str | None = None,
 ) -> tuple[Target, SystemHandle]:
-    """A target that subscribes to every peer link and records it all into a
-    `Db` served on ``listen``; returns the target and the db's handle."""
+    """Creates a gateway target that records telemetry from other targets.
+
+    The gateway subscribes to each link in ``peers`` and records everything
+    it receives in a `Db`, which clients reach on ``listen``. Returns the
+    gateway target and the db's handle.
+    """
     gw = Target(cycle_rate=cycle_rate, namespace=namespace)
     for peer in peers:
         gw.add(_namespace(peer), Subscribe(peer=peer))
@@ -120,8 +130,11 @@ def gateway(
 
 
 def to_config() -> dict[str, Any]:
-    """What this file emits: its one `Deployment`, else its one `Target` as a
-    deployment of one."""
+    """Returns the config this file emits.
+
+    That is the file's `Deployment` if it has one. Otherwise, the file must
+    create exactly one `Target`, which is emitted as a deployment of one.
+    """
     if len(_deployments) > 1:
         raise ConfigError(f"a file builds at most one Deployment, found {len(_deployments)}")
     if _deployments:
@@ -138,8 +151,11 @@ def to_config() -> dict[str, Any]:
 
 
 def emit(path: str | None = None) -> None:
-    """Write this file's config to ``path``, else ``$METOR_CONFIG_OUT``, else
-    stdout."""
+    """Writes this file's config.
+
+    The config goes to ``path`` if given, otherwise to ``$METOR_CONFIG_OUT``,
+    otherwise to stdout. A target file that does not call this emits at exit.
+    """
     global _emitted
     text = json.dumps(to_config(), indent=2, sort_keys=False) + "\n"
     out = path or os.environ.get(OUT_ENV)
@@ -152,8 +168,8 @@ def emit(path: str | None = None) -> None:
 
 
 def _emit_at_exit() -> None:
-    # A target file is a script that ends; a file that raised has already
-    # printed its traceback.
+    # A target file is a script that runs to the end, so emit when it exits.
+    # A file that raised has already printed its traceback.
     if not _emitted and (_targets or _deployments):
         emit()
 

@@ -1,4 +1,4 @@
-//! The bundles a fn system binds its parameters through.
+//! [`InSet`] and [`OutSet`], the bound ports of a fn system.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -16,18 +16,19 @@ use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOu
 use super::Ports;
 use super::param::{Bindings, Defs, Param, Views, Writers};
 
-/// LOG_PORT is the name of the port that receives log events.
+/// The output that every fn system writes its log events to.
 pub const LOG_PORT: &str = "log";
 
-/// An `InSet` is the bound inputs of a fn system's parameters, and the
-/// samplers its step takes each cycle.
+/// The bound inputs of a fn system's parameters.
 pub struct InSet<S: Ports, W: WakeSink + Clone + 'static = NoWake> {
     pub(crate) ins: <S::Params as Param>::In<W>,
     pub(crate) samplers: Samplers,
 }
 
-/// An `OutSet` is the bound outputs of a fn system's parameters, plus its
-/// `log` and the counter those outputs' failed writes share.
+/// The bound outputs of a fn system's parameters, plus its `log` output.
+///
+/// Failed writes on any of the outputs are counted and reported together on
+/// `log`.
 pub struct OutSet<S: Ports> {
     pub(crate) outs: <S::Params as Param>::Out,
     pub(crate) log: LogPort,
@@ -35,14 +36,17 @@ pub struct OutSet<S: Ports> {
 }
 
 impl<S: Ports> OutSet<S> {
-    /// Faults once on `log` for the writes that failed since the last report.
+    /// Reports the writes that failed since the last report.
+    ///
+    /// Writes at most one fault on `log`.
     pub(crate) fn report_dropped(&mut self, now: Timestamp) {
         report_dropped(&mut self.log, &self.dropped, now);
     }
 }
 
-/// Takes the count in `dropped`, and when it is nonzero writes one
-/// `publish_dropped` fault on `log`.
+/// Reports and resets the count in `dropped`.
+///
+/// If the count was nonzero, writes one `publish_dropped` fault on `log`.
 pub(crate) fn report_dropped(log: &mut LogPort, dropped: &AtomicU32, now: Timestamp) {
     let count = dropped.swap(0, Ordering::Relaxed);
     if count != 0 {
@@ -62,8 +66,8 @@ impl<S: Ports, W: WakeSink + Clone + 'static> SystemInputs<W> for InSet<S, W> {
             samplers: Samplers::default(),
         };
         let ins = S::Params::bind_in::<W>(&mut views);
-        // PANIC Safety: the coordinator binds one list per port of a
-        // definition these parameters computed.
+        // PANIC Safety: the coordinator binds one list per port of the
+        // definition these parameters produced.
         assert!(views.bindings.is_empty(), "more bindings than input params");
         Self {
             ins,
@@ -86,7 +90,7 @@ impl<S: Ports> SystemOutputs for OutSet<S> {
             dropped: Arc::default(),
         };
         let outs = S::Params::bind_out(&mut writers);
-        // PANIC Safety: the log is the last port of every `defs`.
+        // PANIC Safety: `defs` always appends the log as the last output.
         let log = writers
             .bindings
             .next()

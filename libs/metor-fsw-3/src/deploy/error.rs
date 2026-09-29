@@ -1,8 +1,9 @@
-//! Why a deployment did not resolve.
+//! Errors from resolving a deployment.
 
 use crate::coordinator::BuildError;
 
-/// A `DeployError` names the reference that did not resolve.
+/// An error resolving a deployment. Each variant says which reference
+/// failed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DeployError {
     #[error("`{from}` names target `{target}`, which the deployment has no member of")]

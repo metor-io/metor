@@ -1,4 +1,4 @@
-//! Where a link's bytes flow: a socket it accepts on, or one it dials.
+//! How a link gets its connections: by listening for peers, or by dialing one.
 
 use core::time::Duration;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -13,7 +13,8 @@ use crate::coordinator::{ParamError, PeerLink};
 
 use super::conn::Connections;
 
-/// The delay between the first two refused dials, and the longest one.
+/// The delay after the first refused dial. Each later refusal doubles it, up
+/// to [`BACKOFF_MAX`].
 const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
@@ -21,31 +22,36 @@ const BACKOFF_MAX: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
-    /// Accept up to `max_connections` peers on `addr`.
+    /// Listen on `addr` and accept up to `max_connections` peers at once.
     Listen {
         addr: String,
         #[serde(default = "max_connections")]
         max_connections: usize,
     },
-    /// Dial `addr`, holding one connection.
+    /// Dial `addr` and keep a single connection open.
     Connect { addr: String },
-    /// Dial a link of the deployment; `metor build` turns it into `Connect`.
+    /// Dial another link in the same deployment. `metor build` replaces this
+    /// with a `Connect` to that link's address.
     Peer(PeerLink),
 }
 
-/// Connections a listening link serves at once, unless its params say otherwise.
+/// The default number of connections a listening link serves at once.
 fn max_connections() -> usize {
     8
 }
 
-/// A [`Transport`] whose listener is bound, so a taken address fails the build.
+/// A [`Transport`] that is ready to connect.
+///
+/// Links bind at build time, so a taken address fails the build instead of
+/// the run.
 pub(crate) enum Endpoint {
     Listen { listener: TcpListener, slots: usize },
     Connect { dialer: Dialer },
 }
 
 impl Transport {
-    /// Binds a listening transport, or resolves a dialed one.
+    /// Binds the listener for `Listen`, or resolves the address for `Connect`.
+    /// A `Peer` that `metor build` has not resolved is an error.
     pub(crate) fn bind(&self) -> Result<Endpoint, ParamError> {
         match self {
             Self::Listen {
@@ -74,7 +80,7 @@ impl Transport {
 }
 
 impl Endpoint {
-    /// How many connections this endpoint serves at once.
+    /// Returns how many connections this endpoint serves at once.
     pub(crate) fn slots(&self) -> usize {
         match self {
             Self::Listen { slots, .. } => *slots,
@@ -82,7 +88,7 @@ impl Endpoint {
         }
     }
 
-    /// The bound listener, for a system that accepts on it itself.
+    /// Returns the bound listener, for a system that runs its own accept loop.
     #[cfg(feature = "db")]
     pub(crate) fn listener(&self) -> Option<&TcpListener> {
         match self {
@@ -91,7 +97,8 @@ impl Endpoint {
         }
     }
 
-    /// The address a listener bound, for a caller that asked for port zero.
+    /// Returns the address the listener bound. This is how a caller that asked
+    /// for port zero learns the real port.
     pub(crate) fn local_addr(&self) -> Option<SocketAddr> {
         match self {
             Self::Listen { listener, .. } => listener.local_addr().ok(),
@@ -107,7 +114,7 @@ fn resolve(addr: &str) -> Result<SocketAddr, ParamError> {
         .ok_or_else(|| ParamError::Decode(format!("`{addr}` resolves to no address")))
 }
 
-/// Dials one address, backing off between refused attempts.
+/// Dials one address, waiting longer after each refused attempt.
 pub(crate) struct Dialer {
     addr: SocketAddr,
     delay: Duration,
@@ -121,7 +128,7 @@ impl Dialer {
         }
     }
 
-    /// The next connection, or `None` once `stop` resolves.
+    /// Dials until a connection succeeds, or returns `None` once `stop` is set.
     pub(crate) async fn connect(&mut self, stop: &Stop) -> Option<TcpStream> {
         loop {
             if stop.is_set() {
@@ -148,12 +155,12 @@ impl Dialer {
     }
 }
 
-/// Fills `conns` from `endpoint` until `stop`.
+/// Opens and serves connections until `stop` is set.
 ///
-/// A listener accepts every peer and closes at once the ones it has no slot
-/// for; a dialer holds one connection and redials when it ends. The task runs
-/// apart from the link's loop so a batch never cancels an accept or a
-/// half-established dial.
+/// A listener accepts every peer, and closes a peer right away when every slot
+/// is taken. A dialer keeps one connection open and redials when it closes.
+/// This runs as its own task, separate from the link's loop, so sending a
+/// batch never cancels an accept or a dial that is halfway through.
 pub(crate) async fn source(endpoint: Endpoint, conns: Rc<Connections>, stop: Stop) {
     match endpoint {
         Endpoint::Listen { listener, .. } => listen(listener, conns, stop).await,
@@ -184,10 +191,13 @@ async fn dial(mut dialer: Dialer, conns: Rc<Connections>, stop: Stop) {
     }
 }
 
-/// The next peer, or `None` once `stop` is set or an accept failed.
+/// Accepts the next peer.
 ///
-/// A failure is the host's, not the peer's, so it is waited out rather than
-/// retried at once.
+/// Returns `None` once `stop` is set, or after an accept fails.
+///
+/// An accept failure comes from the host (for example, running out of file
+/// descriptors), not from the peer, so this pauses before returning instead
+/// of letting the caller retry at once.
 pub(crate) async fn accept(listener: &TcpListener, stop: &Stop) -> Option<TcpStream> {
     let accepted = futures_lite::future::or(async { Some(listener.accept().await) }, async {
         stop.wait().await;
@@ -204,7 +214,7 @@ pub(crate) async fn accept(listener: &TcpListener, stop: &Stop) -> Option<TcpStr
     }
 }
 
-/// One accept failure: a line and a pause, cut short by `stop`.
+/// Logs an accept failure and pauses. `stop` cuts the pause short.
 async fn accept_failed(error: &stellarator::Error, stop: &Stop) {
     tracing::warn!(%error, "accept failed, backing off");
     futures_lite::future::or(stellarator::sleep(BACKOFF_INITIAL), stop.wait()).await;
@@ -293,9 +303,9 @@ mod tests {
         assert!(matches!(transport.bind(), Err(ParamError::Decode(_))));
     }
 
-    /// An accept that fails takes `EMFILE` or `ENFILE`, which a test cannot
-    /// force; lowering the process fd limit by hand shows the spin this
-    /// backoff replaces. The stop path is what stays covered here.
+    /// An accept only fails with `EMFILE` or `ENFILE`, which a test cannot
+    /// force. Lowering the process fd limit by hand shows the busy loop the
+    /// backoff prevents. This test covers only the stop path.
     #[stellarator::test]
     async fn test_stop_skips_accept_backoff() {
         let (handle, stop) = stop_pair();

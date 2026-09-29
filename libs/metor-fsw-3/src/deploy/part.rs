@@ -1,4 +1,4 @@
-//! A typed view of some of a system's params.
+//! Typed access to part of a system's params.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -7,18 +7,20 @@ use serde_json::{Map, Value};
 use super::DeployError;
 use crate::coordinator::SystemConfig;
 
-/// The fields of `T` in a system's params, and the rest untouched.
+/// A system's params, decoded as `T`, with every other key kept as is.
 ///
-/// `rest` holds every key as read, and `write` lays `part` over it. A derived
-/// `#[serde(flatten)]` pair would hand `rest` the fields of a `T` that itself
-/// flattens, and write their stale values back.
+/// This lets a pass edit a few typed fields and write them back without
+/// dropping keys `T` does not know about. It does not use a
+/// `#[serde(flatten)]` pair, because when `T` itself flattens, serde would put
+/// `T`'s fields in the leftover map too, and writing it back would restore
+/// their old values.
 pub(crate) struct Part<T> {
     pub(crate) part: T,
     rest: Map<String, Value>,
 }
 
 impl<T: Serialize + DeserializeOwned> Part<T> {
-    /// Decodes `T` out of `system`'s params.
+    /// Decodes `T` from `system`'s params.
     pub(crate) fn read(system: &SystemConfig) -> Result<Self, DeployError> {
         let Value::Object(rest) = &system.params else {
             return Err(params_error(system, "params are not an object"));
@@ -30,7 +32,8 @@ impl<T: Serialize + DeserializeOwned> Part<T> {
         })
     }
 
-    /// Writes `part`'s fields into `system`'s params, keeping every other key.
+    /// Writes `part`'s fields back into `system`'s params. Every other key is
+    /// kept.
     pub(crate) fn write(self, system: &mut SystemConfig) -> Result<(), DeployError> {
         let Value::Object(fields) =
             serde_json::to_value(&self.part).map_err(|e| params_error(system, e))?

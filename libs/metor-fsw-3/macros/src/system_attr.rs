@@ -1,11 +1,16 @@
-//! `#[system]` on a free fn: rewrites `fn nav(..)` into `fn nav() -> impl
-//! SystemFn`, or `impl AsyncSystemFn` for an `async fn` ending in `stop: Stop`.
-//! `#[sequence]` on an `async fn` rewrites it into `impl SequenceFn`.
+//! Expands `#[system]` and `#[sequence]`.
 //!
-//! The attribute reads parameter identifiers and doc comments. It classifies
-//! no type beyond refusing the few that belong to the other kind of fn; each
-//! parameter type's `Param` impl does the rest. A sequence's `Seq` and its
-//! parameters' elided lifetimes are named `'__seq`, the brand's lifetime.
+//! `#[system]` rewrites `fn nav(..)` into `fn nav() -> impl SystemFn`. For an
+//! `async fn` whose last parameter is `stop: Stop`, it returns
+//! `impl AsyncSystemFn` instead. `#[sequence]` rewrites an `async fn` into a fn
+//! returning `impl SequenceFn`.
+//!
+//! The macro reads only parameter names and doc comments. It does not classify
+//! parameter types, apart from rejecting a few that belong to the other kind of
+//! fn. Each parameter type's `Param` impl handles the rest. In a sequence, the
+//! `Seq` parameter and every elided lifetime in the parameters share one
+//! lifetime, `'__seq`. That shared lifetime lets a redline's condition borrow
+//! any parameter.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -46,7 +51,9 @@ fn expand(item: TokenStream2, fsw: &TokenStream2, kind: Kind) -> TokenStream2 {
     }
 }
 
-/// Emits `item` unchanged plus `err`, so the IDE keeps its types.
+/// Emits `item` unchanged, followed by `err`.
+///
+/// Keeping the item lets IDEs still resolve its types.
 fn with_error(item: impl ToTokens, err: syn::Error) -> TokenStream2 {
     let err = err.to_compile_error();
     quote! { #item #err }
@@ -94,7 +101,7 @@ impl Sig {
         })
     }
 
-    /// The parameters that are ports, in order.
+    /// Returns the parameters that are ports, in order.
     fn ports(&self) -> impl Iterator<Item = &Arg> {
         let end = self.args.len() - usize::from(self.stop);
         self.args[..end]
@@ -104,7 +111,9 @@ impl Sig {
             .map(|(_, arg)| arg)
     }
 
-    /// The state type, `S` from `&mut S`, or `()` without a state parameter.
+    /// Returns the state type.
+    ///
+    /// That is `S` from the `#[state] &mut S` parameter, or `()` without one.
     fn state_ty(&self) -> Type {
         match self.state {
             Some(i) => key_type(&self.args[i].ty),
@@ -113,7 +122,9 @@ impl Sig {
     }
 }
 
-/// Removes every `#[state]` attribute, returning each with its parameter index.
+/// Removes every `#[state]` attribute.
+///
+/// Returns each removed attribute with its parameter index.
 fn take_states(sig: &mut Signature) -> Vec<(usize, Attribute)> {
     let mut states = Vec::new();
     for (i, input) in sig.inputs.iter_mut().enumerate() {
@@ -170,7 +181,9 @@ fn state(args: &[Arg], states: &[(usize, Attribute)]) -> syn::Result<Option<usiz
     }
 }
 
-/// Whether an async `#[system]` fn ends in `stop`, which it must.
+/// Returns whether a `#[system]` fn is async.
+///
+/// An async `#[system]` fn must take `stop: Stop` as its last parameter.
 fn system_stop(sig: &Signature, args: &[Arg], state: Option<usize>) -> syn::Result<bool> {
     let stop = sig.asyncness.is_some();
     if stop && !ends_in_stop(args, state) {
@@ -182,7 +195,10 @@ fn system_stop(sig: &Signature, args: &[Arg], state: Option<usize>) -> syn::Resu
     Ok(stop)
 }
 
-/// A `#[sequence]` fn is async and hears abort through its `Seq`, not `stop`.
+/// Checks that a `#[sequence]` fn is async and takes no `stop`.
+///
+/// A sequence learns about an abort through its `Seq`, so this returns
+/// `Ok(false)` on success.
 fn sequence_stop(sig: &Signature, args: &[Arg], state: Option<usize>) -> syn::Result<bool> {
     if sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
@@ -199,7 +215,7 @@ fn sequence_stop(sig: &Signature, args: &[Arg], state: Option<usize>) -> syn::Re
     Ok(false)
 }
 
-/// Refuses the parameter types that belong to the other kind of fn.
+/// Rejects parameter types that belong to the other kind of fn.
 fn check_kinds(args: &[Arg], kind: Kind) -> syn::Result<()> {
     let refused: &[(&str, &str)] = match kind {
         Kind::System => &[("Seq", "a `Seq` parameter belongs on a `#[sequence]` fn")],
@@ -222,7 +238,7 @@ fn check_kinds(args: &[Arg], kind: Kind) -> syn::Result<()> {
     Ok(())
 }
 
-/// Whether `ty`, behind any references, is a path ending in `name`.
+/// Returns whether `ty` is a path ending in `name`, ignoring references.
 fn names(ty: &Type, name: &str) -> bool {
     match ty {
         Type::Reference(r) => names(&r.elem, name),
@@ -256,7 +272,9 @@ fn check_output(output: &ReturnType) -> syn::Result<()> {
     }
 }
 
-/// A `#[sequence]` fn returns `Result<(), SeqError>`.
+/// Checks that a `#[sequence]` fn returns a `Result`.
+///
+/// The expected type is `Result<(), SeqError>`.
 fn check_sequence_output(sig: &Signature) -> syn::Result<()> {
     match &sig.output {
         ReturnType::Type(_, ty) if names(ty, "Result") => Ok(()),
@@ -269,8 +287,9 @@ const SEQUENCE_OUTPUT: &str = "a `#[sequence]` fn returns `Result<(), SeqError>`
 
 const NAMED_LIFETIME: &str = "`#[system]` parameters take no named lifetimes";
 
-/// Rejects named lifetimes and `impl Trait`, which the fn pointer and the
-/// `Params` tuple cannot spell.
+/// Rejects named lifetimes and `impl Trait` in a parameter type.
+///
+/// Neither can be written in the fn pointer type or the `Params` tuple.
 fn check_type(ty: &Type) -> syn::Result<()> {
     let mut check = TypeCheck(None);
     check.visit_type(ty);
@@ -296,7 +315,10 @@ impl<'ast> Visit<'ast> for TypeCheck {
     }
 }
 
-/// Rewrites a fn, or emits it without its `#[state]` attributes plus the error.
+/// Rewrites a fn.
+///
+/// On error, emits the fn without its `#[state]` attributes, followed by the
+/// error.
 fn expand_fn(mut f: ItemFn, fsw: &TokenStream2, kind: Kind) -> TokenStream2 {
     let states = take_states(&mut f.sig);
     match Sig::parse(&f.sig, &states, kind) {
@@ -311,14 +333,16 @@ fn expand_fn(mut f: ItemFn, fsw: &TokenStream2, kind: Kind) -> TokenStream2 {
     }
 }
 
-/// Whether an attribute belongs on the outer fn rather than the body.
+/// Returns whether an attribute stays on the outer fn instead of the body.
 fn is_outer(attr: &Attribute) -> bool {
     ["doc", "cfg", "deprecated", "must_use"]
         .iter()
         .any(|name| attr.path().is_ident(name))
 }
 
-/// Adds `T: 'static` for every type parameter, which `Ports: 'static` needs.
+/// Adds a `'static` bound to every type parameter.
+///
+/// `Ports` requires `'static`.
 fn static_generics(generics: &Generics) -> Generics {
     let mut generics = generics.clone();
     let bound: TypeParamBound = syn::parse_quote!('static);
@@ -389,8 +413,10 @@ fn ports_impl(
     }
 }
 
-/// The bound the rewritten fn returns, and the impls behind it. Each `call`
-/// unpacks the state and ports, asserts each port is a `Param`, and calls the body.
+/// Returns the trait bound the rewritten fn returns, plus the impls behind it.
+///
+/// Each generated `call` unpacks the state and ports, asserts that each port
+/// type implements `Param`, and calls the original body.
 fn call_impl(
     sig: &Sig,
     state_ty: &Type,
@@ -479,7 +505,7 @@ fn call_impl(
     }
 }
 
-/// Joins the doc comment lines, each without its leading space.
+/// Joins the doc comment lines, stripping one leading space from each.
 fn doc(attrs: &[Attribute]) -> String {
     attrs
         .iter()
@@ -499,8 +525,10 @@ fn doc(attrs: &[Attribute]) -> String {
         .join("\n")
 }
 
-/// Strips one outer reference, so `&mut Input<T>`, `&Seq`, and `Input<T>`
-/// name their `Param` alike. A `Seq` keys as `Seq<'static>`.
+/// Returns the type used to look up a parameter's `Param` impl.
+///
+/// One outer reference is stripped, so `&mut Input<T>` and `Input<T>` get the
+/// same key. `Seq` is keyed as `Seq<'static>`.
 fn key_type(ty: &Type) -> Type {
     let key = match ty {
         Type::Reference(r) => (*r.elem).clone(),
@@ -516,13 +544,15 @@ fn key_type(ty: &Type) -> Type {
     }
 }
 
-/// The lifetime a sequence body's elided lifetimes and its `Seq` share.
+/// Returns `'__seq`, the lifetime shared by a sequence's parameters.
 fn brand_lifetime() -> Lifetime {
     Lifetime::new("'__seq", Span::call_site())
 }
 
-/// Names every elided lifetime in a sequence body's parameters, and its
-/// `Seq`'s, `'__seq`, so a redline's condition may borrow any parameter.
+/// Names every elided lifetime in a sequence's parameters `'__seq`.
+///
+/// This includes the `Seq`'s lifetime. With one shared lifetime, a redline's
+/// condition can borrow any parameter.
 fn brand(sig: &mut Signature) {
     let lifetime = brand_lifetime();
     sig.generics.params.insert(
@@ -561,7 +591,9 @@ impl VisitMut for Brander {
     }
 }
 
-/// Whether `path` is `Seq` or `Seq<'_>`, whose lifetime the macro names.
+/// Returns whether `path` is `Seq` or `Seq<'_>`.
+///
+/// The macro fills in the lifetime of those two forms.
 fn is_seq(path: &TypePath) -> bool {
     let Some(last) = path.path.segments.last() else {
         return false;

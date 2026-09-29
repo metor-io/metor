@@ -1,4 +1,4 @@
-//! A pack built as a WebAssembly module.
+//! Loads packs built as WebAssembly modules.
 
 use metor_fsw_3_ring::{NoWake, PAYLOAD_ALIGNMENT, RingBuffer};
 use serde::{Deserialize, Serialize};
@@ -19,35 +19,42 @@ use super::guest::{Guest, Module, WasmError};
 use super::step::WasmStep;
 use super::{DEFAULT_FUEL, DEFAULT_MEMORY, DEFAULT_SETUP_FUEL};
 
-/// How much deeper a guest's copy of a ring is than the ring. The copy's
-/// wrap falls elsewhere, so a full ring's records can need more than one
-/// capacity of room.
+/// How many times larger a guest's copy of a ring is than the real ring.
+///
+/// The copy wraps at a different point than the real ring, so the records from
+/// a full ring can need more than one ring's worth of space.
 const COPY_FACTOR: usize = 2;
 
-/// What each guest of a module may use, the defaults where unset.
+/// Resource limits for each guest of a module.
+///
+/// Unset fields use the defaults.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
-    /// Each guest's memory ceiling in bytes.
+    /// The memory ceiling for each guest, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<usize>,
-    /// Each step's fuel grant.
+    /// The fuel each step gets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuel: Option<u64>,
 }
 
-/// A `WasmPack` is a compiled pack module and the descriptor it exported.
+/// A pack compiled from a WebAssembly module.
+///
+/// Each instance it creates runs in its own guest.
 pub struct WasmPack {
     module: Module,
-    /// Each guest's memory ceiling, in bytes.
+    /// The memory ceiling for each guest, in bytes.
     memory: usize,
-    /// Each step's fuel grant.
+    /// The fuel each step gets.
     fuel: u64,
     def: PackDef,
 }
 
 impl WasmPack {
-    /// Compiles a module and reads its descriptor from a scratch guest,
-    /// checking its ABI version first. Setup runs under [`DEFAULT_SETUP_FUEL`].
+    /// Compiles a module and reads its descriptor.
+    ///
+    /// The ABI version is checked first, in a scratch guest that then reads the
+    /// descriptor. Setup runs with `DEFAULT_SETUP_FUEL`.
     pub fn open(bytes: &[u8], limits: &Limits) -> Result<WasmPack, PackError> {
         let module = Module::compile(bytes)?;
         let memory = limits.memory.unwrap_or(DEFAULT_MEMORY);
@@ -62,13 +69,14 @@ impl WasmPack {
         })
     }
 
-    /// The descriptor this pack exported.
+    /// Returns the descriptor this pack exported.
     pub fn descriptor(&self) -> &PackDef {
         &self.def
     }
 
-    /// One exported type's definition under an instance's config, from a
-    /// scratch guest.
+    /// Returns the definition of type `ty` for one instance's config.
+    ///
+    /// Each call runs in a scratch guest.
     pub fn def(&self, ty: &str, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         let cx = encode_def_cx(cx)?;
         let (status, bytes) = self.call_def(ty, &cx).map_err(|e| DefError::Pack {
@@ -77,8 +85,9 @@ impl WasmPack {
         decode_def(status, bytes.as_deref())
     }
 
-    /// Creates one instance of `ty` in a fresh guest, over copies of the
-    /// host's rings in its memory.
+    /// Creates one instance of type `ty` in a new guest.
+    ///
+    /// The guest works on copies of the host's rings, placed in its own memory.
     pub fn create(
         &self,
         ty: &str,
@@ -103,13 +112,14 @@ impl WasmPack {
         Ok(WasmStep::new(mirrors, guest, handle, self.fuel))
     }
 
-    /// A fresh guest, instantiated under the setup grant.
+    /// Instantiates a new guest using setup fuel.
     fn guest(&self) -> Result<Guest, WasmError> {
         Guest::new(&self.module, self.memory, DEFAULT_SETUP_FUEL)
     }
 
-    /// Calls `metor_fsw_def` in a fresh guest, returning its status and
-    /// what it wrote.
+    /// Calls `metor_fsw_def` in a new guest.
+    ///
+    /// Returns the status and the bytes the export wrote.
     fn call_def(&self, ty: &str, cx: &[u8]) -> Result<(u32, Option<Vec<u8>>), PackError> {
         let mut guest = self.guest()?;
         let mut args = Args::new(&mut guest);
@@ -140,7 +150,7 @@ fn descriptor(guest: &mut Guest) -> Result<PackDef, PackError> {
 }
 
 impl From<PackError> for ParamError {
-    /// A guest that trapped panicked; any other failure is the host's.
+    /// A trap means the guest panicked. Any other failure is the host's.
     fn from(error: PackError) -> Self {
         match error {
             PackError::Trap(trap) => ParamError::Panicked(trap.to_string()),
@@ -149,7 +159,7 @@ impl From<PackError> for ParamError {
     }
 }
 
-/// `create`'s arguments, as the host holds them.
+/// The arguments to `create`, before they are copied into the guest.
 struct Create<'a> {
     ty: &'a [u8],
     params: &'a [u8],
@@ -158,8 +168,9 @@ struct Create<'a> {
     outputs: &'a [GuestRing],
 }
 
-/// Places `call` in guest memory and calls `metor_fsw_create`, returning the
-/// instance or the error the guest wrote.
+/// Copies `call` into guest memory and calls `metor_fsw_create`.
+///
+/// Returns the instance, or the error the guest wrote.
 fn call_create(guest: &mut Guest, call: Create<'_>) -> Result<u32, ParamError> {
     let mut args = Args::new(guest);
     let ty = args.byte_slice(call.ty)?;
@@ -187,8 +198,10 @@ fn call_create(guest: &mut Guest, call: Create<'_>) -> Result<u32, ParamError> {
 
 type Copies = (Vec<Mirror<NoWake>>, Vec<Vec<GuestRing>>);
 
-/// Each input edge's copy in guest memory, and the mirror that fills it
-/// from the real ring.
+/// Creates a guest copy of each input edge's ring.
+///
+/// Returns the mirrors that fill each copy from its real ring, and where each
+/// copy is in guest memory.
 fn copy_inputs(
     guest: &mut Guest,
     ports: &[PortDef],
@@ -213,8 +226,10 @@ fn copy_inputs(
     Ok((mirrors, rings))
 }
 
-/// Each output's copy in guest memory, and the mirror that drains it into
-/// the real ring.
+/// Creates a guest copy of each output ring.
+///
+/// Returns the mirrors that drain each copy into its real ring, and where each
+/// copy is in guest memory.
 fn copy_outputs(
     guest: &mut Guest,
     ports: &[PortDef],
@@ -235,8 +250,10 @@ fn copy_outputs(
     Ok((mirrors, rings))
 }
 
-/// A ring [`COPY_FACTOR`] times as deep as `real`, allocated in guest memory
-/// and formatted by the host.
+/// Creates a ring in guest memory to mirror a real ring of `capacity` bytes.
+///
+/// The copy is [`COPY_FACTOR`] times as large. The host formats it before the
+/// guest sees it.
 fn guest_ring(guest: &mut Guest, capacity: usize) -> Result<(GuestRing, RingBuffer), ParamError> {
     let (config, len) = mirror_config(capacity, COPY_FACTOR)?;
     let len = u32::try_from(len).map_err(|_| ParamError::MirrorTooLarge { capacity })?;
@@ -244,11 +261,11 @@ fn guest_ring(guest: &mut Guest, capacity: usize) -> Result<(GuestRing, RingBuff
     let base = guest
         .region(offset, len as usize)
         .map_err(PackError::from)?;
-    // SAFETY: the region is `len` bytes in the guest's arena, which the guest
-    // has not seen yet. Every handle on it ends up in `WasmStep::mirrors`,
-    // declared before `guest`, or drops before `guest` on an error, so the
-    // arena outlives them all. The guest and host then both follow the ring
-    // protocol over it.
+    // SAFETY: the region is `len` bytes in the guest's arena, and the guest has
+    // not seen it yet. Every handle on the ring either ends up in
+    // `WasmStep::mirrors`, which is declared before `guest`, or is dropped
+    // before `guest` on an error. So the arena outlives all of them. From then
+    // on, the guest and host both follow the ring protocol.
     let ring = unsafe { RingBuffer::create_raw(base.as_ptr(), len as usize, config) }
         .map_err(|e| ParamError::Wasm(e.to_string()))?;
     Ok((GuestRing { offset, len }, ring))

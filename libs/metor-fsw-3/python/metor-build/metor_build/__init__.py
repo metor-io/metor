@@ -1,8 +1,8 @@
-"""Build a pack as an editable install.
+"""A PEP 517 build backend that installs a pack in editable mode.
 
-`build_editable` runs `metor pack dev` over the pack's directory and writes a
-wheel whose one `.pth` line puts the generated `<root>/.metor` on the path.
-A packed wheel is a later slice.
+`build_editable` runs `metor pack dev` on the pack's directory, then writes a
+wheel with a single `.pth` line that adds the generated `<root>/.metor` to
+the Python path. Building a regular wheel is not supported yet.
 """
 
 from __future__ import annotations
@@ -34,7 +34,8 @@ def build_editable(
     config_settings: dict[str, Any] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
-    """Run `metor pack dev` over this directory and write the `.pth` wheel."""
+    """Runs `metor pack dev` on the current directory and writes the `.pth`
+    wheel."""
     root = Path.cwd().resolve()
     _run_metor(["pack", "dev", str(root)])
     abi_version = _run_metor(["abi-version"], capture=True).strip()
@@ -67,7 +68,11 @@ def _project(root: Path) -> dict[str, str]:
 
 
 def _run_metor(args: list[str], capture: bool = False) -> str:
-    """Run the `metor` binary: `$METOR_BIN`, else `PATH`, else `cargo run`."""
+    """Runs the `metor` binary and returns its stdout if ``capture`` is set.
+
+    The binary is `$METOR_BIN` if set, then `metor` on `PATH`, then
+    `cargo run` as a fallback.
+    """
     command = _binary() + args
     result = subprocess.run(
         command,
@@ -92,7 +97,8 @@ def _binary() -> list[str]:
 
 
 def _cargo_root() -> Path:
-    """The workspace root, for the `cargo run` fallback in an in-repo checkout."""
+    """Returns the cargo workspace root, for the `cargo run` fallback inside
+    the repo."""
     for directory in [Path.cwd().resolve(), *Path.cwd().resolve().parents]:
         manifest = directory / "Cargo.toml"
         if manifest.is_file() and "[workspace]" in manifest.read_text(encoding="utf-8"):

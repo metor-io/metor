@@ -1,4 +1,5 @@
-//! Execute generated modules with the supported configuration interpreter.
+//! Runs generated pack modules under the Python interpreter that target files
+//! use.
 
 use std::path::Path;
 use std::process::Command;
