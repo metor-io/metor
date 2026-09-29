@@ -10,14 +10,14 @@ use std::sync::Arc;
 
 use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::coordinator::{
     Adapter, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, SystemKind, TableEntry,
 };
 use crate::def::{DefCx, DefError};
-use crate::dl::PackKind;
+use crate::dl::{PackKind, PackRef};
 use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
 use crate::wasm::{Limits, WasmPack};
@@ -28,30 +28,44 @@ use super::{DlPack, Pack, PackError, is_loaded, store};
 /// The name the slot's definition carries.
 const SLOT_NAME: &str = "dl_slot";
 
-#[derive(Deserialize)]
-struct SlotParams {
-    allow: Vec<Candidate>,
+/// What a slot is configured with.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SlotParams {
+    pub(crate) allow: Vec<Candidate>,
     #[serde(default)]
-    initial: Option<String>,
+    pub(crate) initial: Option<String>,
 }
 
 /// One system the slot may load, as the config lists it.
-#[derive(Deserialize)]
-struct Candidate {
-    name: String,
-    ty: String,
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Candidate {
+    pub(crate) name: String,
+    pub(crate) ty: String,
     #[serde(default)]
-    params: Value,
+    pub(crate) params: Value,
+    pub(crate) source: Source,
+}
+
+/// Where a candidate's library comes from.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Source {
+    /// A pack `metor build` has yet to open and store.
+    Pack(PackRef),
+    /// The store copy `metor build` wrote.
+    Stored(Stored),
+}
+
+/// A candidate's library in the store, the hash that named it, and its ports.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Stored {
+    pub(crate) path: PathBuf,
+    pub(crate) hash: String,
+    pub(crate) def: SystemDef,
     #[serde(default)]
-    path: Option<PathBuf>,
-    #[serde(default)]
-    hash: Option<String>,
-    #[serde(default)]
-    def: Option<SystemDef>,
-    #[serde(default)]
-    kind: PackKind,
+    pub(crate) kind: PackKind,
     #[serde(flatten)]
-    limits: Limits,
+    pub(crate) limits: Limits,
 }
 
 /// A candidate `metor build` resolved: where its library is and what it is.
@@ -86,19 +100,20 @@ pub(crate) fn entry() -> TableEntry {
 fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
     let refused = |message: String| DefError::Slot { message };
     let params = SlotParams::deserialize(cx.params).map_err(|e| refused(e.to_string()))?;
-    let first = params
+    let mut stored = params
         .allow
-        .first()
-        .ok_or_else(|| refused("the slot allows nothing".into()))?;
-    let def = first.def.clone().ok_or_else(|| {
-        refused(format!(
-            "`{}` is not resolved; run `metor build`",
-            first.name
-        ))
-    })?;
+        .iter()
+        .map(|candidate| match &candidate.source {
+            Source::Stored(stored) => Ok(stored),
+            Source::Pack(_) => Err(refused(not_resolved(&candidate.name))),
+        });
+    let first = stored
+        .next()
+        .ok_or_else(|| refused("the slot allows nothing".into()))??;
+    stored.try_for_each(|candidate| candidate.map(drop))?;
     Ok(SystemDef {
         name: SLOT_NAME.into(),
-        ..def
+        ..first.def.clone()
     })
 }
 
@@ -139,14 +154,16 @@ fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
 
 impl Resolved {
     fn of(index: usize, candidate: Candidate) -> Result<Self, ParamError> {
-        let unresolved = || {
-            ParamError::Decode(format!(
-                "`{}` is not resolved; run `metor build`",
-                candidate.name
-            ))
+        let Source::Stored(Stored {
+            path,
+            hash,
+            kind,
+            limits,
+            ..
+        }) = candidate.source
+        else {
+            return Err(ParamError::Decode(not_resolved(&candidate.name)));
         };
-        let path = candidate.path.clone().ok_or_else(unresolved)?;
-        let hash = candidate.hash.as_deref().ok_or_else(unresolved)?;
         let hash = blake3::Hash::from_hex(hash).map_err(|e| ParamError::Decode(e.to_string()))?;
         let file = path
             .file_name()
@@ -165,10 +182,14 @@ impl Resolved {
             params: candidate.params,
             path,
             hash,
-            kind: candidate.kind,
-            limits: candidate.limits,
+            kind,
+            limits,
         })
     }
+}
+
+fn not_resolved(name: &str) -> String {
+    format!("`{name}` is not resolved; run `metor build`")
 }
 
 /// A `DlSlot` holds at most one pack system, over rings it keeps.

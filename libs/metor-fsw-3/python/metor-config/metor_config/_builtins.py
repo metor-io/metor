@@ -363,7 +363,7 @@ def _candidate(system: System) -> dict[str, Any]:
         "name": system._ty,
         "ty": system._ty,
         "params": _json(system._params) or None,
-        "pack": system._pack.to_json(),
+        "source": {"pack": system._pack.to_json()},
     }
 
 

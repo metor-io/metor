@@ -87,9 +87,11 @@ fn candidate(name: &str, ty: &str) -> Value {
     json!({
         "name": name,
         "ty": ty,
-        "path": fixture_lib(),
-        "hash": hash.to_hex().as_str(),
-        "def": baked(ty),
+        "source": { "stored": {
+            "path": fixture_lib(),
+            "hash": hash.to_hex().as_str(),
+            "def": baked(ty),
+        }},
     })
 }
 
@@ -100,10 +102,12 @@ fn wasm_candidate(name: &str, ty: &str, dir: &Path) -> Value {
     json!({
         "name": name,
         "ty": ty,
-        "path": path,
-        "hash": blake3::hash(fixture_wasm()).to_hex().as_str(),
-        "def": baked(ty),
-        "kind": "wasm",
+        "source": { "stored": {
+            "path": path,
+            "hash": blake3::hash(fixture_wasm()).to_hex().as_str(),
+            "def": baked(ty),
+            "kind": "wasm",
+        }},
     })
 }
 
@@ -279,8 +283,8 @@ fn test_changed_bytes_refused() {
     let copy = dir.path().join("libecho_copy.so");
     std::fs::copy(fixture_lib(), &copy).expect("copies");
     let mut stale = candidate("down", "count_down");
-    stale["path"] = json!(copy);
-    stale["hash"] = json!(blake3::hash(b"another build").to_hex().as_str());
+    stale["source"]["stored"]["path"] = json!(copy);
+    stale["source"]["stored"]["hash"] = json!(blake3::hash(b"another build").to_hex().as_str());
     let allow = vec![candidate("up", "count_up"), stale];
     let (seen, mut coordinator) = build(slot_params(allow));
     send(&seen, &mut coordinator, [load("up")]);
@@ -323,7 +327,7 @@ fn test_wasm_and_dylib_swap() {
 fn test_changed_module_refused() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let stale = wasm_candidate("down", "count_down", dir.path());
-    let path = PathBuf::from(stale["path"].as_str().expect("a path"));
+    let path = PathBuf::from(stale["source"]["stored"]["path"].as_str().expect("a path"));
     let mut bytes = fixture_wasm().to_vec();
     bytes.push(0);
     std::fs::write(&path, bytes).expect("writes");
@@ -341,9 +345,9 @@ fn test_changed_module_refused() {
 fn test_candidate_grants_reach_the_guest() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut spin = wasm_candidate("spin", "spin", dir.path());
-    spin["fuel"] = json!(1_000);
+    spin["source"]["stored"]["fuel"] = json!(1_000);
     let mut small = wasm_candidate("small", "spin", dir.path());
-    small["memory"] = json!(PAGE);
+    small["source"]["stored"]["memory"] = json!(PAGE);
     let (seen, mut coordinator) = build(slot_params(vec![spin, small]));
     run(&seen, &mut coordinator, 1);
 
@@ -457,7 +461,8 @@ fn test_slot_needs_channel() {
 #[test]
 fn test_unresolved_slot_refused() {
     let seen = Shared::default();
-    let params = json!({ "allow": [{ "name": "up", "ty": "count_up" }] });
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let params = json!({ "allow": [unresolved("up", "count_up", dir.path())] });
     let Err(error) = config(params, channel()).build(&table(&seen)) else {
         panic!("an unresolved slot is refused")
     };
@@ -474,7 +479,7 @@ fn pack_ref(libs: &Path) -> Value {
 
 /// A candidate as Python emits it: a pack reference, no path, hash, or ports.
 fn unresolved(name: &str, ty: &str, libs: &Path) -> Value {
-    json!({ "name": name, "ty": ty, "pack": pack_ref(libs) })
+    json!({ "name": name, "ty": ty, "source": { "pack": pack_ref(libs) } })
 }
 
 fn envelope(allow: Vec<Value>) -> DeploymentConfig {
@@ -519,11 +524,12 @@ fn test_build_resolves_into_store() {
     let params = slot(&envelope);
     let hash = store::hash(fixture_lib()).expect("reads");
     for candidate in params["allow"].as_array().expect("a list") {
-        assert!(candidate.get("pack").is_none());
-        assert_eq!(candidate["hash"], json!(hash.to_hex().as_str()));
-        let path = PathBuf::from(candidate["path"].as_str().expect("a path"));
+        assert!(candidate["source"].get("pack").is_none());
+        let stored = &candidate["source"]["stored"];
+        assert_eq!(stored["hash"], json!(hash.to_hex().as_str()));
+        let path = PathBuf::from(stored["path"].as_str().expect("a path"));
         assert!(path.starts_with(&store), "{}", path.display());
-        assert!(candidate["def"].is_object());
+        assert!(stored["def"].is_object());
     }
 
     // Resolving again changes nothing.
@@ -554,11 +560,11 @@ fn test_build_resolves_wasm_candidate() {
         "kind": "wasm", "memory": 32 << 20, "fuel": 1_000_000,
     });
     let mut envelope = envelope(vec![
-        json!({ "name": "up", "ty": "count_up", "pack": pack }),
+        json!({ "name": "up", "ty": "count_up", "source": { "pack": pack } }),
     ]);
     resolve(&mut envelope, &store).expect("resolves");
 
-    let candidate = &slot(&envelope)["allow"][0];
+    let candidate = &slot(&envelope)["allow"][0]["source"]["stored"];
     let path = PathBuf::from(candidate["path"].as_str().expect("a path"));
     assert!(path.starts_with(&store), "{}", path.display());
     assert!(path.ends_with(wasm_name("echo_pack")), "{}", path.display());
@@ -605,7 +611,7 @@ fn test_build_resolves_chained_slots() {
     resolve(&mut envelope, &store).expect("resolves");
     assert!(!deploy::unresolved(&envelope));
     let next = &envelope.targets[0].coordinator.systems[4].params;
-    assert!(next["allow"][0]["def"].is_object());
+    assert!(next["allow"][0]["source"]["stored"]["def"].is_object());
 }
 
 /// A slot reading a slot later in step order is refused.
@@ -642,7 +648,7 @@ fn test_build_refuses_disagreeing_candidates() {
 fn test_build_refuses_missing_pack() {
     let (dir, libs, store) = scratch();
     let mut missing = unresolved("up", "count_up", &libs);
-    missing["pack"]["libs"] = json!(dir.path().join("nowhere"));
+    missing["source"]["pack"]["libs"] = json!(dir.path().join("nowhere"));
     let result = resolve(&mut envelope(vec![missing]), &store);
     assert!(
         matches!(result, Err(DeployError::Slot { .. })),
@@ -660,7 +666,7 @@ fn test_build_refuses_missing_pack() {
 fn test_build_refuses_long_library_name() {
     let (_dir, libs, store) = scratch();
     let mut long = unresolved("up", "count_up", &libs);
-    long["pack"]["lib"] = json!("l".repeat(64));
+    long["source"]["pack"]["lib"] = json!("l".repeat(64));
     let result = resolve(&mut envelope(vec![long]), &store);
     assert!(
         matches!(result, Err(DeployError::ArtifactName { cap: 63, .. })),

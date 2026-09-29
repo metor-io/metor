@@ -332,3 +332,22 @@ fn test_resolve_keeps_other_params() {
     assert_eq!(db.params["path"], "/db");
     assert_eq!(db.params["transport"]["listen"]["max_connections"], 1);
 }
+
+#[test]
+fn test_stored_slots_resolve_to_themselves() {
+    let def = json!({ "name": "up", "inputs": [], "outputs": [] });
+    let stored = json!({ "path": "/store/x/libup.so", "hash": "00", "def": def, "kind": "dylib" });
+    let slot = SystemConfig {
+        params: json!({ "allow": [{ "name": "up", "ty": "up", "params": null,
+            "source": { "stored": stored } }], "initial": null }),
+        ..SystemConfig::new("mode", crate::dl::SLOT_TYPE)
+    };
+    let mut envelope = envelope();
+    envelope.targets[0].coordinator.systems.push(slot);
+    let before = envelope.clone();
+    resolve_slots(&mut envelope, &tables(2), std::path::Path::new("/no/store")).expect("resolves");
+    assert_eq!(envelope, before);
+    let mut stored = envelope.clone();
+    resolve(&mut stored, &tables(2)).expect("resolves");
+    assert!(!unresolved(&stored));
+}
