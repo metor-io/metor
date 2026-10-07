@@ -197,7 +197,7 @@ pub(crate) fn gpio(_fd: BorrowedFd, _op: &GpioOp) -> Result<Out, IoError> {
 }
 
 /// Converts `OpenFlags` to `open(2)` flags and a mode.
-pub(crate) fn open_flags(f: OpenFlags) -> (i32, libc::mode_t) {
+pub(crate) fn open_flags(f: OpenFlags) -> (i32, u32) {
     let rw = (f.contains(OpenFlags::READ), f.contains(OpenFlags::WRITE));
     let mut flags = libc::O_CLOEXEC
         | match rw {
@@ -221,7 +221,7 @@ pub(crate) fn open_flags(f: OpenFlags) -> (i32, libc::mode_t) {
     }
     let mode = match f.mode() {
         0 => 0o644,
-        m => m as libc::mode_t,
+        m => m,
     };
     (flags, mode)
 }

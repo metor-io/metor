@@ -142,6 +142,7 @@ impl<R: Reactor> Executor<R> {
         let _installed = Installed::new(self);
         let future = func();
         let main_task = self.scheduler.spawn(future);
+        self.track(main_task.task_ref());
         let mut main_task = pin!(main_task);
         let waker = self.reactor.borrow_mut().waker();
         let mut cx = Context::from_waker(&waker);
@@ -179,7 +180,10 @@ impl<R: Reactor> Executor<R> {
     /// Records a task for `Drop` to cancel, and prunes finished ones.
     fn track(&self, task: TaskRef) {
         let mut tasks = self.tasks.borrow_mut();
-        tasks.retain(|t| !t.is_complete());
+        // Pruning only when full keeps `track` amortized O(1).
+        if tasks.len() == tasks.capacity() {
+            tasks.retain(|t| !t.is_complete());
+        }
         tasks.push(task);
     }
 }
@@ -304,7 +308,15 @@ impl Executor<DefaultReactor> {
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) fn try_with_reactor(f: impl for<'a> FnOnce(&'a mut DefaultReactor)) {
         let exec = EXEC.try_with(Cell::get).unwrap_or(std::ptr::null());
-        // SAFETY: as in `with`.
+        let own = OWN
+            .try_with(|o| o.try_borrow().ok().and_then(|o| o.clone()))
+            .ok()
+            .flatten();
+        let exec = match own {
+            Some(ref own) if exec.is_null() => Rc::as_ptr(own),
+            _ => exec,
+        };
+        // SAFETY: as in `with`; `own` keeps the default executor alive.
         if let Some(exec) = unsafe { exec.as_ref() }
             && let Ok(mut reactor) = exec.reactor.try_borrow_mut()
         {

@@ -23,6 +23,8 @@ pub struct Limits {
 struct Entry {
     src: SourceId,
     token: Token,
+    /// `cancel_all` already sent a cancel for this op.
+    canceling: bool,
 }
 
 /// Allocates reactor tokens. System ops draw from one slab and the reactor's
@@ -47,7 +49,12 @@ impl Tokens {
 
     fn map(&mut self, src: SourceId, token: Token) -> Option<Token> {
         let rt = self.free.pop()?;
-        self.ops[rt as usize] = Some(Entry { src, token });
+        let canceling = false;
+        self.ops[rt as usize] = Some(Entry {
+            src,
+            token,
+            canceling,
+        });
         Some(Token::new(rt))
     }
 
@@ -58,12 +65,20 @@ impl Tokens {
     }
 
     fn find(&self, src: SourceId, token: Token) -> Option<u32> {
-        let want = Some(Entry { src, token });
-        self.ops.iter().position(|e| *e == want).map(|i| i as u32)
+        let hit = |e: &Option<Entry>| e.is_some_and(|e| e.src == src && e.token == token);
+        self.ops.iter().position(hit).map(|i| i as u32)
     }
 
-    fn owner(&self, rt: u32) -> Option<SourceId> {
-        self.ops.get(rt as usize)?.map(|e| e.src)
+    /// Marks `src`'s op `rt` as canceling. False if it is not `src`'s or
+    /// already canceling.
+    fn mark_canceling(&mut self, src: SourceId, rt: u32) -> bool {
+        match self.ops.get_mut(rt as usize) {
+            Some(Some(e)) if e.src == src && !e.canceling => {
+                e.canceling = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn live(&self, src: SourceId) -> usize {
@@ -171,11 +186,11 @@ impl Reactor {
         }
     }
 
-    /// Cancels every op `src` has in flight. `reap` still returns their
-    /// completions.
+    /// Cancels every op `src` has in flight, once each. `reap` still returns
+    /// their completions.
     pub fn cancel_all(&mut self, src: SourceId) {
         for rt in 0..self.tokens.ops.len() as u32 {
-            if self.tokens.owner(rt) == Some(src) {
+            if self.tokens.mark_canceling(src, rt) {
                 self.push_own(Sqe::new(
                     Token::new(0),
                     RawHandle::new(0, 0),

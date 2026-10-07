@@ -105,6 +105,8 @@ impl IoStatus {
 
     pub fn err(e: IoError) -> Self {
         let code = match e {
+            // Errno 0 would read as success.
+            IoError::Os(Errno(0)) => u32::from(Errno::EIO.0),
             IoError::Os(errno) => u32::from(errno.0),
             IoError::QueueFull => FRAMEWORK,
             IoError::Stale => FRAMEWORK + 1,

@@ -274,6 +274,19 @@ pub fn cancel_parked_read(b: Backend) {
     assert_eq!(rig.reactor.in_flight(SRC), 0);
 }
 
+pub fn close_runs_after_queued_write(b: Backend) {
+    let file = tempfile::tempfile().unwrap();
+    let mut rig = Rig::new(b, &[], vec![(owned(file), FdClass::File)], &[b"abc"]);
+    let h = rig.handles[0];
+    let (w, c) = (Token::new(100), Token::new(101));
+    rig.reactor
+        .push(SRC, Sqe::new(w, h, Op::write(BufRef::new(0), Some(0))));
+    rig.reactor.push(SRC, Sqe::new(c, h, Op::CLOSE));
+    rig.reactor.submit();
+    assert_eq!(ok(rig.wait(w)).as_len(), Some(3));
+    assert_eq!(ok(rig.wait(c)), Out::UNIT);
+}
+
 pub fn unissued_handle_is_stale(b: Backend) {
     let mut rig = Rig::new(b, &[], vec![], &[b""]);
     let c = rig.run(RawHandle::new(5, 0), Op::read(BufRef::new(0), None));
@@ -328,7 +341,11 @@ pub fn gpio_on_pty_fails(b: Backend) {
 pub type Case = (&'static str, fn(Backend));
 
 /// Every case with its name.
-pub const ALL: [Case; 15] = [
+pub const ALL: [Case; 16] = [
+    (
+        "close_runs_after_queued_write",
+        close_runs_after_queued_write,
+    ),
     ("datagram_send_and_recv", datagram_send_and_recv),
     ("file_write_read_at_offsets", file_write_read_at_offsets),
     ("tty_configure", tty_configure),

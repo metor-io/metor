@@ -178,6 +178,7 @@ impl PollOs {
         let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
         let r = match op {
             Op::Read { buf, .. } => self.read(fd, buf, op.offset()),
+            Op::Write { buf, .. } if class.socket() => self.send(fd, buf, None),
             Op::Write { buf, .. } => self.write(fd, buf, op.offset()),
             Op::Recv { buf, .. } if class.socket() => self.recv(fd, buf),
             Op::Recv { buf, .. } => self.read(fd, buf, None),
@@ -273,7 +274,7 @@ impl PollOs {
         cpath[..path.len()].copy_from_slice(path);
         let (oflags, mode) = open_flags(flags);
         // SAFETY: `cpath` is NUL-terminated.
-        let fd = cvt(unsafe { libc::openat(dir, cpath.as_ptr().cast(), oflags, mode as u32) })?;
+        let fd = cvt(unsafe { libc::openat(dir, cpath.as_ptr().cast(), oflags, mode) })?;
         // SAFETY: `openat` returned a new descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let dir = flags.contains(super::OpenFlags::DIRECTORY);
@@ -325,7 +326,11 @@ impl PollOs {
         let (level, name) = (libc::SOL_SOCKET, libc::SO_ERROR);
         let p = (&raw mut err).cast();
         // SAFETY: `err` is a `c_int` of `len` bytes.
-        cvt(unsafe { libc::getsockopt(fd.as_raw_fd(), level, name, p, &mut len) })?;
+        let r = cvt(unsafe { libc::getsockopt(fd.as_raw_fd(), level, name, p, &mut len) });
+        if let Err(e) = r {
+            self.release(i);
+            return Err(e);
+        }
         if err == 0 {
             return Ok(Out::handle(RawHandle::new(i, slot.generation)));
         }

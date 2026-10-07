@@ -339,3 +339,20 @@ fn steady_cycle_does_not_allocate() {
     cycle(&mut rig);
     assert_eq!(allocations(|| cycle(&mut rig)), 0);
 }
+
+#[test]
+fn repeated_cancel_all_cancels_each_op_once() {
+    let mut rig = Rig::new(2, 1);
+    rig.push(0, 1, Op::CLOSE);
+    rig.push(0, 2, Op::CLOSE);
+    for _ in 0..4 {
+        rig.reactor.cancel_all(SourceId(0));
+    }
+    rig.reactor.submit();
+    let cancels = rig
+        .pushed()
+        .iter()
+        .filter(|s| s.op.kind() == OpKind::Cancel)
+        .count();
+    assert_eq!(cancels, 2);
+}

@@ -237,12 +237,20 @@ impl UringOs {
                 (e, Then::Opened(FdClass::Stream))
             }
             Op::Fsync { .. } => (with_fd(opcode::Fsync::new(Fd(0)).build(), fd), Then::Unit),
+            // Synchronous ops run after every op queued before them.
             Op::Close { .. } => {
+                self.flush();
                 self.release(i);
                 return Ok(Some(Out::UNIT));
             }
-            Op::Tty { op, .. } => return quick(fd, |b| os::tty(b, &op)),
-            Op::Gpio { op, .. } => return quick(fd, |b| os::gpio(b, &op)),
+            Op::Tty { op, .. } => {
+                self.flush();
+                return quick(fd, |b| os::tty(b, &op));
+            }
+            Op::Gpio { op, .. } => {
+                self.flush();
+                return quick(fd, |b| os::gpio(b, &op));
+            }
             Op::Resolve { .. } | Op::Connect { .. } | Op::Cancel { .. } => {
                 return Err(IoError::Unsupported);
             }
@@ -332,8 +340,9 @@ impl UringOs {
         if path.contains(&0) {
             return Err(IoError::Os(Errno::EINVAL));
         }
-        if self.paths_used == PATHS {
-            // The kernel copies each path during submit, which frees the pool.
+        // The kernel copies each path during submit, which frees the pool.
+        // Flushing first also keeps `queue` from flushing past this path.
+        if self.paths_used == PATHS || self.sq_free() == 0 {
             self.flush();
         }
         let cpath = &mut self.paths[self.paths_used];
