@@ -359,6 +359,14 @@ impl Tables {
         id
     }
 
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+
     pub fn get(&self, id: TableId) -> Option<Rc<BufTable>> {
         self.0.borrow().get(usize::from(id.0)).cloned()
     }

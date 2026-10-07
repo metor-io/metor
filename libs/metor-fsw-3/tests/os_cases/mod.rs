@@ -16,7 +16,7 @@ const LIMITS: Limits = Limits {
     ops: 32,
     sources: 1,
 };
-const SRC: SourceId = SourceId(0);
+pub const SRC: SourceId = SourceId(0);
 
 /// A reactor with one source over `bufs`: an empty entry is a 256-byte slot.
 pub struct Rig {
@@ -34,6 +34,16 @@ impl Rig {
         fds: Vec<(OwnedFd, FdClass)>,
         bufs: &[&[u8]],
     ) -> Self {
+        Self::with_limits(backend, LIMITS, dials, fds, bufs)
+    }
+
+    pub fn with_limits(
+        backend: Backend,
+        limits: Limits,
+        dials: &[SocketAddr],
+        fds: Vec<(OwnedFd, FdClass)>,
+        bufs: &[&[u8]],
+    ) -> Self {
         let tables = Tables::new();
         let table = Rc::new(BufTable::new(16));
         tables.add(&table);
@@ -45,9 +55,9 @@ impl Rig {
         }
         table.freeze();
         let dials: Vec<RawAddr> = dials.iter().map(|a| RawAddr::from(*a)).collect();
-        let mut os = backend(&LIMITS, tables, &dials).unwrap();
+        let mut os = backend(&limits, tables, &dials).unwrap();
         let handles = fds.into_iter().map(|(fd, c)| os.register(fd, c)).collect();
-        let mut reactor = Reactor::new(os, LIMITS);
+        let mut reactor = Reactor::new(os, limits);
         reactor.source(table.clone());
         Self {
             reactor,
@@ -97,16 +107,16 @@ impl Rig {
     }
 }
 
-fn ok(c: Cqe) -> Out {
+pub fn ok(c: Cqe) -> Out {
     c.status.result().unwrap();
     c.out
 }
 
-fn err(c: Cqe) -> IoError {
+pub fn err(c: Cqe) -> IoError {
     c.status.result().unwrap_err()
 }
 
-fn owned<T: Into<OwnedFd>>(t: T) -> OwnedFd {
+pub fn owned<T: Into<OwnedFd>>(t: T) -> OwnedFd {
     t.into()
 }
 

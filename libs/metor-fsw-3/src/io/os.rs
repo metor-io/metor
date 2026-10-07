@@ -1,7 +1,11 @@
 use core::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
-use super::poll::{PollOs, last_error};
+#[cfg(not(target_os = "linux"))]
+use super::poll::PollOs;
+use super::poll::last_error;
+#[cfg(target_os = "linux")]
+use super::uring::UringOs;
 use super::{
     Cqe, Errno, GpioOp, IoError, Limits, OpenFlags, Out, RawAddr, RawHandle, Sqe, Tables,
     TtyConfig, TtyOp,
@@ -63,8 +67,7 @@ pub fn host(limits: &Limits, tables: Tables, dials: &[RawAddr]) -> Result<Box<dy
 /// The host backend: `UringOs` on Linux, `PollOs` on other Unix hosts.
 #[cfg(target_os = "linux")]
 pub fn host(limits: &Limits, tables: Tables, dials: &[RawAddr]) -> Result<Box<dyn Os>, OsError> {
-    let _ = (limits, tables, dials);
-    Err(OsError::Unsupported("no host backend"))
+    Ok(Box::new(UringOs::new(limits, tables, dials)?))
 }
 
 /// Returns `r`, or the last host error when it is negative.

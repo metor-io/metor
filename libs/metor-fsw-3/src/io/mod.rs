@@ -14,6 +14,8 @@ mod out;
 mod poll;
 #[cfg(all(feature = "host", unix))]
 mod reactor;
+#[cfg(all(feature = "host", target_os = "linux"))]
+mod uring;
 
 #[cfg(any(test, kani))]
 mod tests;
@@ -29,3 +31,5 @@ pub use out::{Cqe, Errno, IoError, IoStatus, Out};
 pub use poll::PollOs;
 #[cfg(all(feature = "host", unix))]
 pub use reactor::{Limits, Reactor, SourceId};
+#[cfg(all(feature = "host", target_os = "linux"))]
+pub use uring::UringOs;
