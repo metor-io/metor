@@ -88,6 +88,15 @@ impl TcpListener {
         Ok(TcpListener { socket })
     }
 
+    /// Takes a listener that is already bound and listening.
+    pub fn adopt(listener: std::net::TcpListener) -> io::Result<TcpListener> {
+        let socket = socket2::Socket::from(listener);
+        #[cfg(not(target_os = "windows"))]
+        socket.set_cloexec(true)?;
+        socket.set_nonblocking(!cfg!(target_os = "linux"))?;
+        Ok(TcpListener { socket })
+    }
+
     pub async fn accept(&self) -> Result<TcpStream, Error> {
         let op = ops::Accept::new(&self.socket, Box::new(SockAddrRaw::zeroed()));
         let socket = Completion::run(op).await.0?;
@@ -126,6 +135,40 @@ mod tests {
         let n = rent!(stream.read(buf).await, buf).unwrap();
         assert_eq!(&buf[..n], b"foo");
         handle.await.unwrap();
+    }
+
+    #[test]
+    async fn adopted_listener_accepts() {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = TcpListener::adopt(std_listener).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = crate::spawn(async move { listener.accept().await.map(|_| ()) });
+        let _stream = TcpStream::connect(addr).await.unwrap();
+        accept.await.unwrap().unwrap();
+    }
+
+    #[test]
+    async fn adopted_listener_accepts_queued_client() {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let _queued = std::net::TcpStream::connect(addr).unwrap();
+        let listener = TcpListener::adopt(std_listener).unwrap();
+        listener.accept().await.unwrap();
+    }
+
+    #[test]
+    async fn adopted_listener_that_is_not_listening_fails_accept() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let domain = socket2::Domain::for_address(addr);
+        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None).unwrap();
+        socket.bind(&addr.into()).unwrap();
+        let listener = TcpListener::adopt(socket.into()).unwrap();
+        let timeout = async {
+            crate::sleep(Duration::from_secs(2)).await;
+            panic!("accept on a socket that is not listening never returned");
+        };
+        let accept = async { listener.accept().await.map(|_| ()) };
+        assert!(futures_lite::future::race(accept, timeout).await.is_err());
     }
 
     /// A write parked on a full socket must still complete after a read on
