@@ -148,11 +148,22 @@ fn test_pack_reports_system_metadata() {
             "gain",
             "fail_input",
             "retained",
+            "gps",
             "count_up",
             "count_down",
             "count_by"
         ]
     );
+
+    let gps = pack
+        .descriptor()
+        .systems
+        .iter()
+        .find(|s| s.ty == "gps")
+        .expect("gps");
+    let grant = &gps.def.grants[..];
+    assert_eq!(grant.len(), 1);
+    assert_eq!((&*grant[0].param, &*grant[0].interface), ("uart", "uart"));
 
     let tap = pack
         .descriptor()

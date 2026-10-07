@@ -1,5 +1,7 @@
 //! A test pack whose systems exercise the fsw-3 pack ABI.
 
+mod gps;
+
 use std::cell::RefCell;
 
 use metor_fsw_3::ring::Notifier;
@@ -322,6 +324,9 @@ pub fn pack() -> SystemTable {
         .expect("valid records");
     table
         .register_system("retained", |_| Ok((Retained, ())))
+        .expect("valid records");
+    table
+        .register("gps", gps::gps(), gps::GpsState::new)
         .expect("valid records");
     table
         .register_sequence("count_up", count_up(), Default::default)

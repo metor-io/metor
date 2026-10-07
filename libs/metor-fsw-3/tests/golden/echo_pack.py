@@ -16,6 +16,24 @@ PACK = Pack(
 )
 
 
+class GpsFix(Record):
+    _name = "gps_fix"
+    _kind = "msg"
+    _pack = PACK
+
+
+class IoCqe(Record):
+    _name = "io_cqe"
+    _kind = "msg"
+    _pack = PACK
+
+
+class IoSqe(Record):
+    _name = "io_sqe"
+    _kind = "msg"
+    _pack = PACK
+
+
 class LogEvent(Record):
     _name = "log"
     _kind = "msg"
@@ -201,6 +219,22 @@ class Retained(System):
         super().__init__({"input": input}, {})
 
     output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Gps(System):
+    "Sets the receiver to 10 Hz, then publishes each fix it reports."
+
+    _pack = PACK
+    _ty = "gps"
+    _ports = {"fix": GpsFix, "io_sq": IoSqe, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, io_cq: Sources[IoCqe] = ()) -> None:
+        super().__init__({"io_cq": io_cq}, {})
+
+    fix: OutPort[GpsFix]
+    io_sq: OutPort[IoSqe]
     log: OutPort[LogEvent]
     status: OutPort[SystemStatus]
 
