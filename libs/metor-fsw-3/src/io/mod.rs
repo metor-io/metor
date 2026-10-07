@@ -11,6 +11,8 @@ mod op;
 mod os;
 mod out;
 #[cfg(all(feature = "host", unix))]
+mod poll;
+#[cfg(all(feature = "host", unix))]
 mod reactor;
 
 #[cfg(any(test, kani))]
@@ -23,5 +25,7 @@ pub use op::{GpioOp, Op, OpKind, OpenFlags, Sqe, TtyConfig, TtyOp};
 #[cfg(all(feature = "host", unix))]
 pub use os::{FdClass, Os, OsError, host};
 pub use out::{Cqe, Errno, IoError, IoStatus, Out};
+#[cfg(all(feature = "host", unix))]
+pub use poll::PollOs;
 #[cfg(all(feature = "host", unix))]
 pub use reactor::{Limits, Reactor, SourceId};
