@@ -14,6 +14,7 @@ mod buf;
 mod cap;
 pub(crate) mod device;
 mod handle;
+mod model;
 mod op;
 #[cfg(all(feature = "host", unix))]
 mod os;
@@ -27,6 +28,7 @@ pub(crate) mod queue;
 mod reactor;
 mod record;
 mod slot;
+pub mod test;
 #[cfg(all(feature = "host", target_os = "linux"))]
 mod uring;
 
@@ -41,6 +43,7 @@ pub use cap::{
 };
 pub use device::DeviceSide;
 pub use handle::{RawHandle, Token};
+pub use model::{Reply, UartModel, fills, serve_uart};
 pub use op::{GpioOp, Op, OpKind, OpenFlags, Sqe, TtyConfig, TtyOp};
 #[cfg(all(feature = "host", unix))]
 pub use os::{FdClass, Os, OsError, host};

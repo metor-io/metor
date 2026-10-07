@@ -16,6 +16,15 @@ pub struct Cqe {
 }
 
 impl Cqe {
+    pub fn new(token: Token, status: IoStatus, out: Out) -> Self {
+        Self {
+            token,
+            status,
+            out,
+            _p: [0; 3],
+        }
+    }
+
     pub fn ok(token: Token, out: Out) -> Self {
         Self {
             token,

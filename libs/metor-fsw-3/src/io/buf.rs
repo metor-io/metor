@@ -47,7 +47,6 @@ impl BufRef {
         TableId(self.table.get())
     }
 
-    #[cfg_attr(not(all(feature = "host", unix)), allow(dead_code))]
     pub(crate) fn stamp(&mut self, table: TableId) {
         self.table = U16::new(table.0);
     }
