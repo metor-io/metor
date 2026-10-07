@@ -49,7 +49,21 @@ thread_local! {
     static EXEC: Cell<*const Executor> = const { Cell::new(std::ptr::null()) };
     /// The thread's default executor. `with` creates it on first use and `run`
     /// drops it.
-    static OWN: RefCell<Option<Rc<Executor>>> = const { RefCell::new(None) };
+    static OWN: Own = const { Own(RefCell::new(None)) };
+    /// Set once this thread's thread-locals are being destroyed.
+    static EXITING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Holds the thread's default executor.
+struct Own(RefCell<Option<Rc<Executor>>>);
+
+impl Drop for Own {
+    /// Marks the thread as exiting first, so the executor's `Drop` runs no
+    /// task code once other thread-locals, such as tracing's, may be gone.
+    fn drop(&mut self) {
+        EXITING.set(true);
+        drop(self.0.take());
+    }
 }
 
 /// Installs an executor in `EXEC` and restores the previous one on drop.
@@ -191,7 +205,11 @@ impl<R: Reactor> Executor<R> {
 impl<R: Reactor> Drop for Executor<R> {
     /// Cancels every task and ticks once, so each task drops its future and any
     /// `Sleep` on this timer before the timer drops. Then cancels pending IO.
+    /// Skips all of it while the thread exits.
     fn drop(&mut self) {
+        if EXITING.try_with(Cell::get).unwrap_or(true) {
+            return;
+        }
         let this = &*self;
         let _installed = Installed::new(this);
         for task in this.tasks.borrow().iter() {
@@ -233,7 +251,7 @@ where
 {
     let exec = Executor::own();
     let out = exec.run(func).unwrap();
-    OWN.with(|o| o.borrow_mut().take());
+    OWN.with(|o| o.0.borrow_mut().take());
     out
 }
 
@@ -275,7 +293,7 @@ impl Executor<DefaultReactor> {
     /// Returns the thread's default executor, creating it if needed.
     fn own() -> Rc<Self> {
         OWN.with(|o| {
-            o.borrow_mut()
+            o.0.borrow_mut()
                 .get_or_insert_with(|| Rc::new(Self::default()))
                 .clone()
         })
@@ -309,7 +327,7 @@ impl Executor<DefaultReactor> {
     pub(crate) fn try_with_reactor(f: impl for<'a> FnOnce(&'a mut DefaultReactor)) {
         let exec = EXEC.try_with(Cell::get).unwrap_or(std::ptr::null());
         let own = OWN
-            .try_with(|o| o.try_borrow().ok().and_then(|o| o.clone()))
+            .try_with(|o| o.0.try_borrow().ok().and_then(|o| o.clone()))
             .ok()
             .flatten();
         let exec = match own {
