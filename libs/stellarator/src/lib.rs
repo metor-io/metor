@@ -170,7 +170,8 @@ impl<R: Reactor> Executor<R> {
             }
         };
         self.scheduler.cancel_all();
-        self.reactor.borrow_mut().drain_io().cancel();
+        let mut io = self.reactor.borrow_mut().drain_io();
+        io.cancel();
         Ok(out)
     }
 
@@ -194,7 +195,8 @@ impl<R: Reactor> Drop for Executor<R> {
         this.scheduler.tick();
         this.scheduler.cancel_all();
         this.tasks.borrow_mut().clear();
-        this.reactor.borrow_mut().drain_io().cancel();
+        let mut io = this.reactor.borrow_mut().drain_io();
+        io.cancel();
     }
 }
 
