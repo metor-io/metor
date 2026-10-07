@@ -79,3 +79,19 @@ fn unused_init_finishes_clean() {
     let rig = Rig::new();
     assert_eq!(IoInit::new(&rig.io).finish(), Ok(()));
 }
+
+#[test]
+fn finished_init_freezes_the_table() {
+    let rig = Rig::new();
+    let first = IoInit::new(&rig.io);
+    let buf = first.alloc_from(b"one");
+    drop(first);
+    assert!(rig.io.table().bufs.arena().is_some());
+    let again = IoInit::new(&rig.io);
+    assert_eq!(again.alloc(1).capacity(), 0);
+    assert!(matches!(
+        again.finish(),
+        Err(ParamError::IoMemory { need: 1, .. })
+    ));
+    assert_eq!(&buf[..], b"one");
+}

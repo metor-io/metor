@@ -63,6 +63,10 @@ impl Table {
     }
 }
 
+/// The token of an op whose completion no slot waits for. Its slot index is
+/// past every slot, so the completion is skipped.
+const UNTRACKED: Token = Token::new(u32::MAX);
+
 /// Encodes a slot and its generation as a token.
 fn token(slot: usize, generation: u16) -> Token {
     Token::new(u32::from(generation) << 16 | slot as u32)
@@ -142,16 +146,18 @@ impl<B> Slots<B> {
     }
 
     /// Records a completion. Skips one for a free slot or an old generation.
-    pub(crate) fn land(&mut self, cqe: &Cqe) {
-        let Some(op) = self.entry(cqe.token) else {
-            return;
+    ///
+    /// Returns the handle an orphaned op opened, which no one will close.
+    pub(crate) fn land(&mut self, cqe: &Cqe) -> Option<RawHandle> {
+        let op = self.entry(cqe.token)?;
+        let (next, opened) = match core::mem::replace(op, OpSlot::Free) {
+            OpSlot::Waiting(b) => (OpSlot::Done(cqe.status, cqe.out, b), None),
+            OpSlot::Orphan(_) => (OpSlot::Free, opened(cqe)),
+            done @ OpSlot::Done(..) => (done, None),
+            OpSlot::Free => (OpSlot::Free, None),
         };
-        *op = match core::mem::replace(op, OpSlot::Free) {
-            OpSlot::Waiting(b) => OpSlot::Done(cqe.status, cqe.out, b),
-            OpSlot::Orphan(_) => OpSlot::Free,
-            done @ OpSlot::Done(..) => done,
-            OpSlot::Free => OpSlot::Free,
-        };
+        *op = next;
+        opened
     }
 
     /// Takes a finished op's result, freeing its slot.
@@ -185,6 +191,11 @@ impl<B> Slots<B> {
     }
 }
 
+/// The handle a successful completion carries, if any.
+fn opened(cqe: &Cqe) -> Option<RawHandle> {
+    cqe.status.result().ok().and(cqe.out.as_handle())
+}
+
 struct State {
     cq: Input<Cqe>,
     slots: Slots<Option<Buf>>,
@@ -192,10 +203,13 @@ struct State {
 }
 
 impl State {
-    /// Records every completion on `cq`. Skips records that do not decode.
-    fn pump(&mut self) {
+    /// Records every completion on `cq`, and closes any handle an orphaned
+    /// op opened. Skips records that do not decode.
+    fn pump(&mut self, sq: &Output<Sqe>) {
         for cqe in self.cq.drain().flatten() {
-            self.slots.land(&cqe);
+            if let Some(raw) = self.slots.land(&cqe) {
+                let _ = sq.write(&Sqe::new(UNTRACKED, raw, Op::CLOSE));
+            }
         }
     }
 }
@@ -274,10 +288,13 @@ impl Io {
     /// with `QueueFull` on the spot, handing `buf` back.
     pub(crate) fn submit(&self, raw: RawHandle, op: Op, buf: Option<Buf>) -> Inner {
         let full = |buf| Inner::Local(IoStatus::err(IoError::QueueFull), buf);
+        let Some(op) = lent(op, buf.as_ref()) else {
+            return Inner::Local(IoStatus::err(IoError::BadBuf), buf);
+        };
         let Some(mut state) = self.lend() else {
             return full(buf);
         };
-        state.pump();
+        state.pump(&self.0.sq);
         let token = match state.slots.claim(buf) {
             Ok(token) => token,
             Err(buf) => return full(buf),
@@ -291,8 +308,14 @@ impl Io {
     /// Takes a finished op's result.
     pub(crate) fn take(&self, token: Token) -> Option<(IoStatus, Out, Option<Buf>)> {
         let mut state = self.lend()?;
-        state.pump();
+        state.pump(&self.0.sq);
         state.slots.take(token)
+    }
+
+    /// Writes an op whose result no one takes, such as a cancel. It needs no
+    /// slot, so it goes out even when every slot is in use.
+    pub(crate) fn untracked(&self, raw: RawHandle, op: Op) {
+        let _ = self.0.sq.write(&Sqe::new(UNTRACKED, raw, op));
     }
 
     pub(crate) fn orphan(&self, token: Token) {
@@ -310,7 +333,8 @@ impl Io {
         RawHandle::new(state.next_grant - 1, 0)
     }
 
-    /// Submits any op on any handle. Most systems use a `Handle` instead.
+    /// Submits any op on any handle, lending it `buf`. Most systems use a
+    /// `Handle` instead.
     pub fn submit_raw(&self, raw: RawHandle, op: Op, buf: Option<Buf>) -> Pending<Raw> {
         Pending::new(self, raw, op, buf)
     }
@@ -318,8 +342,19 @@ impl Io {
     /// Ops that have not been taken or orphaned and freed.
     pub fn in_flight(&self) -> usize {
         self.lend().map_or(0, |mut state| {
-            state.pump();
+            state.pump(&self.0.sq);
             state.slots.live()
         })
     }
+}
+
+/// `op` naming the buffer it lends. An op that takes a buffer and lends none
+/// is refused.
+fn lent(mut op: Op, buf: Option<&Buf>) -> Option<Op> {
+    match (op.buf_mut(), buf) {
+        (Some(slot), Some(buf)) => *slot = buf.buf_ref(),
+        (Some(_), None) => return None,
+        (None, _) => {}
+    }
+    Some(op)
 }

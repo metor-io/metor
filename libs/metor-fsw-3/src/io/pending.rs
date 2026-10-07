@@ -80,11 +80,12 @@ impl<O: IoOp> Pending<O> {
     }
 
     /// Cancels the op. Its completion still arrives, usually `Canceled`.
+    ///
+    /// The cancel needs no slot of its own, so it goes out even when every
+    /// slot is in use.
     pub fn cancel(&self) {
-        if let Inner::Queued(token) = self.inner
-            && let Inner::Queued(cancel) = self.io.submit(self.raw, Op::cancel(token), None)
-        {
-            self.io.orphan(cancel);
+        if let Inner::Queued(token) = self.inner {
+            self.io.untracked(self.raw, Op::cancel(token));
         }
     }
 }

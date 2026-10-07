@@ -298,9 +298,15 @@ fn entry<S: System + 'static>(
     doc: Cow<'static, str>,
     schema: Option<Box<RawValue>>,
 ) -> Result<TableEntry, DefError> {
+    let def = S::def(&DefCx::empty())?;
+    // Binding IO ports takes `fn_system::bind`, which this path skips.
+    if !def.grants.is_empty() {
+        let system = def.name.to_string();
+        return Err(DefError::IoOnTraitPath { system });
+    }
     Ok(TableEntry {
         kind: SystemKind::Cyclic,
-        def: S::def(&DefCx::empty())?,
+        def,
         def_fn: Box::new(S::def),
         doc,
         schema,

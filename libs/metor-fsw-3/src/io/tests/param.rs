@@ -391,3 +391,53 @@ fn reset_remakes_an_io_system_over_its_rings() {
     assert!(!seen.is_empty(), "the remade system submits");
     assert_eq!(made.0.borrow().slots.len(), 2);
 }
+
+/// Registers `S` through the `System` trait path.
+fn via_trait<S: SystemFn>(_: S) -> Result<(), BuildError>
+where
+    S::State: Default,
+{
+    let mut table = SystemTable::new();
+    table.register_system::<FnSystem<S>>("io", |_| Ok((FnSystem::default(), Default::default())))
+}
+
+#[test]
+fn io_system_through_register_system_is_refused() {
+    let refused = via_trait(closer()).unwrap_err();
+    assert!(matches!(
+        refused,
+        BuildError::Def {
+            source: DefError::IoOnTraitPath { .. },
+            ..
+        }
+    ));
+    assert!(via_trait(sq_probe()).is_ok());
+}
+
+#[test]
+fn failed_make_frees_its_ring_slots() {
+    use crate::coordinator::{MakeCx, Params};
+    use crate::tests::utils::ring_of;
+
+    let (made, seen) = (Made::default(), Rc::default());
+    let table = greeter_table(&made, &seen);
+    let entry = table.get("greeter").expect("registered");
+    let def = &entry.def;
+    let ring = |p: &PortDef| ring_of(p.max_len, p.depth, 1);
+    let inputs: Vec<_> = def.inputs.iter().map(ring).collect();
+    let outputs: Vec<_> = def.outputs.iter().map(ring).collect();
+    let make = || {
+        (entry.make)(MakeCx {
+            id: "gps",
+            adapter: None,
+            def,
+            params: Params(&serde_json::Value::Null),
+            inputs: inputs.iter().map(|r| vec![r]).collect(),
+            outputs: outputs.iter().collect(),
+            threads: &mut crate::thread::Threads::new(),
+        })
+    };
+    made.0.borrow_mut().fail_next = true;
+    assert!(make().is_err());
+    assert!(make().is_ok(), "the failed make left its ring slots free");
+}

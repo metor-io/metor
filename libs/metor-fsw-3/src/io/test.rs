@@ -311,6 +311,7 @@ pub struct ScriptedUart {
     script: VecDeque<Vec<u8>>,
     written: Vec<Vec<u8>>,
     fail_write: Option<Errno>,
+    short_write: Option<usize>,
     config: Option<TtyConfig>,
 }
 
@@ -331,6 +332,12 @@ impl ScriptedUart {
     /// Fails the next write with `errno`.
     pub fn fail_write(mut self, errno: Errno) -> Self {
         self.fail_write = Some(errno);
+        self
+    }
+
+    /// Accepts only the first `n` bytes of the next write.
+    pub fn short_write(mut self, n: usize) -> Self {
+        self.short_write = Some(n);
         self
     }
 
@@ -366,8 +373,12 @@ impl UartModel for ScriptedUart {
         if let Some(errno) = self.fail_write.take() {
             return Err(IoError::Os(errno));
         }
-        self.written.push(bytes.to_vec());
-        Ok(bytes.len())
+        let n = self
+            .short_write
+            .take()
+            .map_or(bytes.len(), |n| n.min(bytes.len()));
+        self.written.push(bytes[..n].to_vec());
+        Ok(n)
     }
 
     fn configure(&mut self, _now: Timestamp, cfg: &TtyConfig) -> Result<(), IoError> {

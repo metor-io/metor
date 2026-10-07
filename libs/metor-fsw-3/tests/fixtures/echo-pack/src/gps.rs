@@ -151,7 +151,7 @@ impl GpsState {
 #[system]
 pub fn gps(#[state] s: &mut GpsState, uart: &Cap<Uart>, fix: &mut Output<Gps>, log: &mut Log) {
     match s.tx.poll() {
-        Some(Ok(_)) => s.configured = true,
+        Some(Ok(n)) => s.configured = n == PMTK_RATE_10HZ.len(),
         Some(Err(e)) => log.fault("gps_config", e),
         None => {}
     }
@@ -281,6 +281,16 @@ mod tests {
             rig.cycle();
         }
         assert!(rig.fixes().is_empty());
+    }
+
+    #[test]
+    fn short_config_write_is_retried() {
+        let mut rig = Rig::new(ScriptedUart::silent().short_write(4));
+        for _ in 0..4 {
+            rig.cycle();
+        }
+        let full = PMTK_RATE_10HZ.to_vec();
+        assert_eq!(rig.io.model().written(), [full[..4].to_vec(), full]);
     }
 
     #[test]

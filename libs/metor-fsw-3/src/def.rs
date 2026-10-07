@@ -94,6 +94,11 @@ pub enum DefError {
         "async system `{system}` takes a `Cap` or `DeviceSide`, which only a stepped system takes"
     )]
     IoOnAsync { system: String },
+
+    #[error(
+        "`{system}` takes a `Cap` or `DeviceSide`; register it with `register` or `register_sequence`"
+    )]
+    IoOnTraitPath { system: String },
 }
 
 /// Every record a system table knows about, looked up by name.

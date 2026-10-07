@@ -180,6 +180,70 @@ mod unit {
 
     /// Also run under Miri.
     #[test]
+    fn two_shared_slices_of_one_buf() {
+        let rig = Rig::new();
+        let buf = rig.buf(b"abcd");
+        let (head, tail) = (&buf[..2], &buf[2..]);
+        assert_eq!(head, b"ab");
+        assert_eq!(tail, b"cd");
+        assert_eq!(head, b"ab");
+    }
+
+    #[test]
+    fn dropped_open_closes_what_it_opened() {
+        let mut rig = Rig::new();
+        let path = rig.buf(b"log");
+        let op = Op::open(path.buf_ref(), OpenFlags::READ);
+        drop(Pending::<Open>::new(
+            &rig.io,
+            RawHandle::new(0, 0),
+            op,
+            Some(path),
+        ));
+        let token = rig.sent()[0].token;
+        let opened = RawHandle::new(7, 2);
+        rig.reply(Cqe::ok(token, Out::handle(opened)));
+        assert_eq!(rig.io.in_flight(), 0);
+        let close = rig.sent();
+        assert_eq!(close.len(), 1);
+        assert_eq!((close[0].handle, close[0].op), (opened, Op::CLOSE));
+    }
+
+    #[test]
+    fn cancel_goes_out_with_every_slot_in_use() {
+        let mut rig = Rig::with_sq_depth(2 * MAX_OPS);
+        let held: Vec<_> = (0..MAX_OPS).map(|_| read(&rig, rig.empty_buf(1))).collect();
+        held[0].cancel();
+        let sent = rig.sent();
+        assert_eq!(sent.len(), MAX_OPS + 1);
+        assert_eq!(sent[MAX_OPS].op, Op::cancel(sent[0].token));
+        assert_eq!(rig.io.in_flight(), MAX_OPS);
+        drop(held);
+    }
+
+    #[test]
+    fn op_names_the_buffer_it_lends() {
+        let mut rig = Rig::new();
+        let buf = rig.buf(b"x");
+        let slot = buf.buf_ref();
+        let stray = Op::write(BufRef::new(42), None);
+        let _p = rig.io.submit_raw(RawHandle::new(0, 0), stray, Some(buf));
+        assert_eq!(rig.sent()[0].op.buf(), Some(slot));
+    }
+
+    #[test]
+    fn op_that_lends_no_buffer_is_bad_buf() {
+        let mut rig = Rig::new();
+        let stray = Op::write(BufRef::new(0), None);
+        let mut p = rig.io.submit_raw(RawHandle::new(0, 0), stray, None);
+        let (status, _, buf) = p.poll().unwrap();
+        assert_eq!(status.result(), Err(IoError::BadBuf));
+        assert!(buf.is_none());
+        assert!(rig.sent().is_empty());
+    }
+
+    /// Also run under Miri.
+    #[test]
     fn io_drops_with_orphans_and_live_bufs() {
         let rig = Rig::new();
         let live = rig.buf(b"keep");

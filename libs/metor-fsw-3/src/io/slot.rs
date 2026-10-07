@@ -29,7 +29,7 @@ impl Buf {
         }
     }
 
-    fn new(table: &Rc<Table>, slot: Option<u16>) -> Self {
+    pub(crate) fn new(table: &Rc<Table>, slot: Option<u16>) -> Self {
         match slot {
             Some(slot) => Self {
                 table: Some(table.clone()),
@@ -220,8 +220,10 @@ impl<'a> IoInit<'a> {
 }
 
 impl Drop for IoInit<'_> {
+    /// Freezes the table, so its arena never moves while a `Buf` is read.
     fn drop(&mut self) {
         if let Some(table) = self.table {
+            table.bufs.freeze();
             table.making.set(false);
         }
     }

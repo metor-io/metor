@@ -285,16 +285,19 @@ impl BufTable {
     /// The caller owns the slot and has no op in flight on it. Before `freeze`,
     /// the caller must not call `alloc` while the slice is alive.
     pub unsafe fn filled(&self, slot: u16) -> &[u8] {
-        // SAFETY: the caller upholds the contract.
-        unsafe { self.filled_mut(slot) }
+        let (ptr, len) = self.span(slot, |e| e.len.get());
+        // SAFETY: the caller upholds the contract; a shared slice forms no
+        // unique borrow, so two at once are fine.
+        unsafe { core::slice::from_raw_parts(ptr, len) }
     }
 
     /// # Safety
     /// Same as [`BufTable::filled`].
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn filled_mut(&self, slot: u16) -> &mut [u8] {
+        let (ptr, len) = self.span(slot, |e| e.len.get());
         // SAFETY: the caller upholds the contract.
-        unsafe { self.span(slot, |e| e.len.get()) }
+        unsafe { core::slice::from_raw_parts_mut(ptr, len) }
     }
 
     /// The slot's full capacity, filled or not.
@@ -303,22 +306,20 @@ impl BufTable {
     /// Same as [`BufTable::filled`].
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn whole_mut(&self, slot: u16) -> &mut [u8] {
+        let (ptr, len) = self.span(slot, |e| e.cap.get());
         // SAFETY: the caller upholds the contract.
-        unsafe { self.span(slot, |e| e.cap.get()) }
+        unsafe { core::slice::from_raw_parts_mut(ptr, len) }
     }
 
-    /// # Safety
-    /// Same as [`BufTable::filled`].
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn span(&self, slot: u16, len: impl Fn(&Entry) -> u32) -> &mut [u8] {
+    /// A held slot's start and `len(entry)`, or an empty span for a free slot.
+    fn span(&self, slot: u16, len: impl Fn(&Entry) -> u32) -> (*mut u8, usize) {
         let mut arena = self.arena.borrow_mut();
         let Some(e) = arena.dir(self.slots).held(slot) else {
-            return &mut [];
+            return (NonNull::dangling().as_ptr(), 0);
         };
         let (offset, len) = (e.offset.get() as usize, len(e) as usize);
-        let base = arena.base();
-        // SAFETY: a held entry lies inside the allocation, and the caller owns the slot.
-        unsafe { core::slice::from_raw_parts_mut(base.as_ptr().add(offset), len) }
+        // SAFETY: a held entry lies inside the allocation.
+        (unsafe { arena.base().as_ptr().add(offset) }, len)
     }
 }
 

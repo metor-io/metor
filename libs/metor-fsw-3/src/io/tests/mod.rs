@@ -24,7 +24,7 @@ mod rig {
     use zerocopy::IntoBytes;
 
     use crate::io::queue::{Io, Table};
-    use crate::io::{Buf, Cqe, IoInit, MAX_OPS, Sqe};
+    use crate::io::{Buf, Cqe, MAX_OPS, Sqe};
     use crate::port::{Input, Output, ring_capacity};
     use crate::record::{Bytes, Record};
 
@@ -65,12 +65,16 @@ mod rig {
             }
         }
 
+        /// Allocates without an `IoInit`, so the table stays unfrozen and
+        /// tests can keep allocating. Tests hold no slice across an alloc.
         pub fn buf(&self, bytes: &[u8]) -> Buf {
-            IoInit::new(&self.io).alloc_from(bytes)
+            let table = self.io.table();
+            Buf::new(table, table.alloc_from(bytes))
         }
 
         pub fn empty_buf(&self, cap: usize) -> Buf {
-            IoInit::new(&self.io).alloc(cap)
+            let table = self.io.table();
+            Buf::new(table, table.alloc(cap))
         }
 
         /// Every op submitted since the last call.
