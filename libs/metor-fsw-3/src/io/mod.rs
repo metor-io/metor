@@ -31,7 +31,7 @@ mod slot;
 mod uring;
 
 #[cfg(any(test, kani))]
-mod tests;
+pub(crate) mod tests;
 
 pub use addr::RawAddr;
 pub use buf::{BufError, BufRef, BufTable, RawBuf, TableId, Tables};

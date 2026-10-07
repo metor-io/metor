@@ -225,3 +225,169 @@ fn io_errors_log_by_name() {
     let line = input.drain().next().expect("a line").expect("decodes");
     assert_eq!(&*line.message, "stale handle");
 }
+
+/// Writes its greeting whenever its buffer is idle.
+struct Greeter {
+    tx: Slot<Write>,
+}
+
+#[system]
+fn greeter(#[state] s: &mut Greeter, uart: &Cap<Uart>) {
+    let _ = s.tx.poll();
+    if let Some(buf) = s.tx.take_idle() {
+        s.tx = Slot::Busy(uart.write(buf));
+    }
+}
+
+/// The slot each constructor allocated, and whether the next one fails.
+#[derive(Default)]
+struct Makes {
+    slots: Vec<u16>,
+    fail_next: bool,
+}
+
+#[derive(Clone, Default)]
+struct Made(Rc<RefCell<Makes>>);
+
+impl Made {
+    fn ctor(
+        &self,
+    ) -> impl Fn(
+        crate::tests::utils::NoParams,
+        &IoInit<'_>,
+    ) -> Result<Greeter, crate::coordinator::ParamError>
+    + use<> {
+        let made = self.clone();
+        move |_, io| {
+            if core::mem::take(&mut made.0.borrow_mut().fail_next) {
+                return Err(crate::coordinator::ParamError::Decode("not today".into()));
+            }
+            let buf = io.alloc_from(b"hi");
+            made.0.borrow_mut().slots.push(buf.buf_ref().slot());
+            Ok(Greeter {
+                tx: Slot::Idle(buf),
+            })
+        }
+    }
+}
+
+fn greeter_table(made: &Made, seen: &Rc<RefCell<Vec<Sqe>>>) -> SystemTable {
+    let mut table = SystemTable::new();
+    table.register("greeter", greeter(), made.ctor()).unwrap();
+    let seen = seen.clone();
+    table
+        .register("sq_probe", sq_probe(), move || seen.clone())
+        .unwrap();
+    table
+}
+
+fn greeter_config(adapter: Option<crate::coordinator::Adapter>, cmds: bool) -> CoordinatorConfig {
+    let mut systems = vec![];
+    let mut inputs = vec![];
+    if cmds {
+        systems.push(SystemConfig::new("cmds", "cmd_source"));
+        inputs.push(InputConfig::new("commands", "cmds", "commands"));
+    }
+    systems.push(SystemConfig {
+        inputs,
+        adapter,
+        grants: vec![grant("uart")],
+        ..SystemConfig::new("gps", "greeter")
+    });
+    systems.push(SystemConfig {
+        inputs: vec![InputConfig::new("sq", "gps", IO_SQ)],
+        ..SystemConfig::new("probe", "sq_probe")
+    });
+    CoordinatorConfig {
+        systems,
+        ..CoordinatorConfig::default()
+    }
+}
+
+#[test]
+fn constructor_buffer_goes_out_on_its_own_queue() {
+    let (made, seen) = (Made::default(), Rc::default());
+    let mut coordinator = greeter_config(None, false)
+        .build(&greeter_table(&made, &seen))
+        .unwrap();
+    coordinator.step(Timestamp(0));
+    let slot = made.0.borrow().slots[0];
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].op, Op::write(BufRef::new(slot), None));
+}
+
+#[system]
+fn hoarder(#[state] s: &mut Option<Buf>, imu: &mut Output<Imu>) {
+    let _ = (s, imu);
+}
+
+#[test]
+fn allocating_without_a_cap_fails_the_make() {
+    let mut table = SystemTable::new();
+    table
+        .register("hoarder", hoarder(), |io: &IoInit<'_>| Some(io.alloc(4)))
+        .unwrap();
+    let config = CoordinatorConfig {
+        systems: vec![SystemConfig::new("stash", "hoarder")],
+        ..CoordinatorConfig::default()
+    };
+    let Err(BuildError::Params { id, source }) = config.build(&table) else {
+        panic!("expected a params error");
+    };
+    assert_eq!(id, "stash");
+    let crate::coordinator::ParamError::IoMemory { need, reason } = source else {
+        panic!("expected IoMemory");
+    };
+    assert_eq!(need, 4);
+    assert!(reason.contains("`stash`"), "{reason}");
+}
+
+#[system]
+fn cmd_source(
+    #[state] queue: &mut Rc<RefCell<Vec<metor_proto_wkt::SequenceCommand>>>,
+    commands: &mut Output<metor_proto_wkt::SequenceCommand>,
+) {
+    for command in queue.borrow_mut().drain(..) {
+        let _ = commands.write(&command);
+    }
+}
+
+#[test]
+fn reset_remakes_an_io_system_over_its_rings() {
+    use crate::coordinator::{Adapter, ChannelConfig, RunState};
+    use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
+
+    let (made, seen) = (Made::default(), Rc::<RefCell<Vec<Sqe>>>::default());
+    let queue = Rc::<RefCell<Vec<SequenceCommand>>>::default();
+    let mut table = greeter_table(&made, &seen);
+    let q = queue.clone();
+    table
+        .register("cmd_source", cmd_source(), move || q.clone())
+        .unwrap();
+    let channel = Adapter::Channel(ChannelConfig {
+        name: "gps".into(),
+        start: RunState::Running,
+    });
+    let mut coordinator = greeter_config(Some(channel), true).build(&table).unwrap();
+    let command = |command| SequenceCommand {
+        channel: "gps".into(),
+        command,
+    };
+    coordinator.step(Timestamp(0));
+    assert_eq!(seen.borrow_mut().drain(..).count(), 1);
+
+    // A failed make must release the rings, or the second make cannot bind.
+    made.0.borrow_mut().fail_next = true;
+    queue.borrow_mut().push(command(SequenceCommandKind::Stop));
+    queue.borrow_mut().push(command(SequenceCommandKind::Reset));
+    coordinator.step(Timestamp(1));
+    queue.borrow_mut().push(command(SequenceCommandKind::Reset));
+    queue.borrow_mut().push(command(SequenceCommandKind::Start));
+    coordinator.step(Timestamp(2));
+    coordinator.step(Timestamp(3));
+    let seen = seen.borrow();
+    assert!(seen.iter().all(|s| s.op.kind() == OpKind::Write));
+    assert!(!seen.is_empty(), "the remade system submits");
+    assert_eq!(made.0.borrow().slots.len(), 2);
+}

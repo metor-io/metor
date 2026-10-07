@@ -15,7 +15,7 @@ mod uring;
 #[cfg(test)]
 pub(super) use counting::allocations;
 #[cfg(test)]
-pub(super) use rig::Rig;
+pub(crate) use rig::Rig;
 
 #[cfg(test)]
 mod rig {

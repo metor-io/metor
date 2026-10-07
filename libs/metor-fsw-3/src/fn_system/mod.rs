@@ -21,7 +21,8 @@ use crate::{
     system::{System, SystemDef},
 };
 
-pub use ctor::Ctor;
+pub(crate) use ctor::make_state;
+pub use ctor::{Ctor, WithIo};
 pub use param::{Cycle, Param, ParamNames, Views, Writers};
 pub(crate) use param::{Defs, param_name};
 pub use set::{InSet, LOG_PORT, OutSet};

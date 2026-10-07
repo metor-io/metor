@@ -159,7 +159,10 @@ impl SystemTable {
         _system: S,
         ctor: C,
     ) -> Result<(), BuildError> {
-        let make = move |params: Params<'_>| Ok((FnSystem::default(), ctor.make(params)?));
+        let make = move |params: Params<'_>| {
+            let state = ctor.make(params, &crate::io::IoInit::empty())?;
+            Ok((FnSystem::default(), state))
+        };
         let entry = async_entry::<FnSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema())
             .map_err(def_error(ty))?;
         self.insert(ty, entry)
@@ -331,8 +334,8 @@ fn fn_entry<S: SystemFn, M, C: Ctor<S::State, M> + 'static>(
         make: Arc::new(move |cx| {
             refuse_thread(cx.adapter)?;
             let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
-            let (inputs, outputs, _io) = fn_system::bind::<S>(views, writers, &Tables::new());
-            let state = ctor.make(cx.params)?;
+            let (inputs, outputs, io) = fn_system::bind::<S>(views, writers, &Tables::new());
+            let state = fn_system::make_state(&ctor, cx.id, cx.params, io.as_ref())?;
             Ok(Box::new(Runner {
                 system: FnSystem::default(),
                 state,
