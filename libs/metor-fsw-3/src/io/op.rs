@@ -191,7 +191,7 @@ impl Op {
         }
     }
 
-    #[cfg_attr(not(feature = "host"), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "host", unix)), allow(dead_code))]
     pub(crate) fn buf_mut(&mut self) -> Option<&mut BufRef> {
         match self {
             Self::Read { buf, .. }

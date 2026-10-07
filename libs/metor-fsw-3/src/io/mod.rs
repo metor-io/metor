@@ -7,7 +7,11 @@ mod addr;
 mod buf;
 mod handle;
 mod op;
+#[cfg(all(feature = "host", unix))]
+mod os;
 mod out;
+#[cfg(all(feature = "host", unix))]
+mod reactor;
 
 #[cfg(any(test, kani))]
 mod tests;
@@ -16,4 +20,8 @@ pub use addr::RawAddr;
 pub use buf::{BufError, BufRef, BufTable, RawBuf, TableId, Tables};
 pub use handle::{RawHandle, Token};
 pub use op::{GpioOp, Op, OpKind, OpenFlags, Sqe, TtyConfig, TtyOp};
+#[cfg(all(feature = "host", unix))]
+pub use os::{FdClass, Os, OsError, host};
 pub use out::{Cqe, Errno, IoError, IoStatus, Out};
+#[cfg(all(feature = "host", unix))]
+pub use reactor::{Limits, Reactor, SourceId};
