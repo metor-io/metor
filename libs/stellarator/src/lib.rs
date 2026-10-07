@@ -1,7 +1,8 @@
 use std::{
-    cell::{RefCell, UnsafeCell},
+    cell::{Cell, RefCell},
     future::Future,
     pin::pin,
+    rc::Rc,
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -24,11 +25,12 @@ pub mod os;
 #[cfg(not(target_os = "windows"))]
 pub mod serial;
 pub mod struc_con;
+pub mod time;
 pub mod util;
 
 mod noop_waker;
 
-use maitake::{scheduler::ExternalWaker, time::Timer};
+use maitake::{scheduler::ExternalWaker, task::TaskRef, time::Timer};
 use pin_project::pin_project;
 #[cfg(not(target_os = "linux"))]
 pub(crate) use poll as reactor;
@@ -42,7 +44,38 @@ pub use maitake::sync;
 pub use stellarator_macros::*;
 
 thread_local! {
-    static EXEC: UnsafeCell<Option<Executor>> = UnsafeCell::new(Some(Executor::default()));
+    /// The executor `spawn`, `sleep`, and IO use on this thread. Whoever
+    /// installs it keeps it alive until it is swapped back out.
+    static EXEC: Cell<*const Executor> = const { Cell::new(std::ptr::null()) };
+    /// The thread's own executor, made on first use and dropped by `run`.
+    static OWN: RefCell<Option<Rc<Executor>>> = const { RefCell::new(None) };
+}
+
+/// Installs an executor in `EXEC` and restores the previous one on drop.
+struct Installed(*const Executor);
+
+impl Installed {
+    /// Every `Executor` has the default reactor: its fields are private and
+    /// only the default reactor's constructors build one.
+    fn new<R: Reactor>(exec: &Executor<R>) -> Self {
+        let exec = (exec as *const Executor<R>).cast::<Executor>();
+        Self(EXEC.try_with(|e| e.replace(exec)).unwrap_or(exec))
+    }
+}
+
+impl Drop for Installed {
+    fn drop(&mut self) {
+        let _ = EXEC.try_with(|e| e.set(self.0));
+    }
+}
+
+/// What one [`Executor::turn`] left behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Turned {
+    /// A task is ready to run on the next turn.
+    pub runnable: bool,
+    /// How long until the timer's next deadline, by the executor's clock.
+    pub next_deadline: Option<Duration>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,6 +128,7 @@ pub type BufResult<T, B> = (Result<T, Error>, B);
 pub struct Executor<R: Reactor = DefaultReactor> {
     reactor: RefCell<R>,
     scheduler: maitake::scheduler::LocalScheduler,
+    tasks: RefCell<Vec<TaskRef>>,
     timer: maitake::time::Timer,
 }
 
@@ -104,6 +138,7 @@ impl<R: Reactor> Executor<R> {
         F: Future<Output = O> + 'static,
         O: 'static,
     {
+        let _installed = Installed::new(self);
         let future = func();
         let main_task = self.scheduler.spawn(future);
         let mut main_task = pin!(main_task);
@@ -134,16 +169,32 @@ impl<R: Reactor> Executor<R> {
                     .wait_for_io(turn.and_then(|turn| turn.time_to_next_deadline()))?;
             }
         };
-        unsafe {
-            self.scheduler.cancel_all();
-            let mut io_states = self.reactor.borrow_mut().drain_io();
-            io_states.cancel();
-            EXEC.with(|exec| {
-                let exec = &mut *exec.get();
-                drop(exec.take().expect("missing reactor"));
-            })
-        }
+        self.scheduler.cancel_all();
+        self.reactor.borrow_mut().drain_io().cancel();
         Ok(out)
+    }
+
+    /// Records a task so `Drop` can cancel it, forgetting finished ones.
+    fn track(&self, task: TaskRef) {
+        let mut tasks = self.tasks.borrow_mut();
+        tasks.retain(|t| !t.is_complete());
+        tasks.push(task);
+    }
+}
+
+impl<R: Reactor> Drop for Executor<R> {
+    /// Cancels every task and ticks once, so each drops its future, and any
+    /// `Sleep` on this timer, before the timer drops. Then cancels the IO.
+    fn drop(&mut self) {
+        let this = &*self;
+        let _installed = Installed::new(this);
+        for task in this.tasks.borrow().iter() {
+            task.cancel();
+        }
+        this.scheduler.tick();
+        this.scheduler.cancel_all();
+        this.tasks.borrow_mut().clear();
+        this.reactor.borrow_mut().drain_io().cancel();
     }
 }
 
@@ -166,22 +217,73 @@ impl IoStates for () {
     fn cancel(&mut self) {}
 }
 
+/// Runs `func`'s future to completion on this thread's own executor, then
+/// drops that executor. The next `run` makes a new one.
 pub fn run<R, F>(func: impl FnOnce() -> F) -> R
 where
     F: Future<Output = R> + 'static,
     R: 'static,
 {
-    Executor::with(|e| e.run(func).unwrap())
+    let exec = Executor::own();
+    let out = exec.run(func).unwrap();
+    OWN.with(|o| o.borrow_mut().take());
+    out
 }
 
 impl Executor<DefaultReactor> {
-    pub(crate) fn with<R>(f: impl for<'a> FnOnce(&'a Self) -> R) -> R {
-        EXEC.with(|exec| {
-            // safety: We only ever gain mutable access to the executor when `run` is complete,
-            // and we are removing the executor so this is safe
-            let exec = unsafe { &*exec.get() };
-            f(exec.as_ref().expect("missing executor"))
+    /// An executor with its own reactor and the given clock.
+    pub fn new(clock: time::Clock) -> Result<Self, Error> {
+        let mut exec = Self::try_new()?;
+        exec.timer = Timer::new(clock.maitake());
+        Ok(exec)
+    }
+
+    /// One pass: timer, IO, one scheduler tick. Never blocks and never moves
+    /// the clock. Installs `self` as this thread's executor for the pass.
+    pub fn turn(self: &Rc<Self>) -> Turned {
+        let _installed = Installed::new(&**self);
+        self.timer.try_turn();
+        let _ = self.reactor.borrow_mut().process_io();
+        let tick = self.scheduler.tick();
+        let turn = self.timer.try_turn();
+        let woke = turn.as_ref().is_some_and(|t| t.expired > 0);
+        Turned {
+            runnable: tick.has_remaining || woke,
+            next_deadline: turn.and_then(|t| t.time_to_next_deadline()),
+        }
+    }
+
+    /// Spawns onto this executor, installed as for [`Executor::turn`].
+    ///
+    /// Every task and `JoinHandle` spawned here must drop before the executor.
+    pub fn spawn<F>(self: &Rc<Self>, f: F) -> JoinHandle<F::Output>
+    where
+        F: Future + 'static,
+        F::Output: Send + 'static,
+    {
+        let _installed = Installed::new(&**self);
+        spawn(f)
+    }
+
+    /// This thread's own executor, made if there is none.
+    fn own() -> Rc<Self> {
+        OWN.with(|o| {
+            o.borrow_mut()
+                .get_or_insert_with(|| Rc::new(Self::default()))
+                .clone()
         })
+    }
+
+    pub(crate) fn with<R>(f: impl for<'a> FnOnce(&'a Self) -> R) -> R {
+        let mut exec = EXEC.with(Cell::get);
+        let mut own = None;
+        if exec.is_null() {
+            let rc = own.insert(Self::own());
+            exec = Rc::as_ptr(rc);
+        }
+        // SAFETY: an installed executor is kept alive by whoever installed
+        // it, and `own` keeps the thread's own executor alive for the call.
+        f(unsafe { &*exec })
     }
 
     pub(crate) fn with_reactor<R>(f: impl for<'a> FnOnce(&'a mut DefaultReactor) -> R) -> R {
@@ -198,14 +300,13 @@ impl Executor<DefaultReactor> {
     /// the reactor is busy — for drop paths that may run during teardown.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) fn try_with_reactor(f: impl for<'a> FnOnce(&'a mut DefaultReactor)) {
-        EXEC.with(|exec| {
-            let exec = unsafe { &*exec.get() };
-            if let Some(exec) = exec.as_ref()
-                && let Ok(mut reactor) = exec.reactor.try_borrow_mut()
-            {
-                f(&mut reactor);
-            }
-        })
+        let exec = EXEC.try_with(Cell::get).unwrap_or(std::ptr::null());
+        // SAFETY: as in `with`.
+        if let Some(exec) = unsafe { exec.as_ref() }
+            && let Ok(mut reactor) = exec.reactor.try_borrow_mut()
+        {
+            f(&mut reactor);
+        }
     }
 }
 
@@ -214,7 +315,11 @@ where
     F: Future + 'static,
     F::Output: Send + 'static,
 {
-    JoinHandle(Executor::with(|exec| exec.scheduler.spawn(f)))
+    JoinHandle(Executor::with(|exec| {
+        let handle = exec.scheduler.spawn(f);
+        exec.track(handle.task_ref());
+        handle
+    }))
 }
 
 pub fn sleep(duration: Duration) -> maitake::time::Sleep<'static> {
