@@ -4,6 +4,11 @@
 //! Ops are plain bytes. They refer to buffers by slot and to handles by index,
 //! so they can be logged, compared, and copied across the guest ABI.
 
+use std::borrow::Cow;
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 mod addr;
 mod buf;
 mod handle;
@@ -15,6 +20,7 @@ mod out;
 mod poll;
 #[cfg(all(feature = "host", unix))]
 mod reactor;
+mod record;
 #[cfg(all(feature = "host", target_os = "linux"))]
 mod uring;
 
@@ -34,3 +40,40 @@ pub use poll::PollOs;
 pub use reactor::{Limits, Reactor, SourceId};
 #[cfg(all(feature = "host", target_os = "linux"))]
 pub use uring::UringOs;
+
+/// The output a system submits ops on.
+pub const IO_SQ: &str = "io_sq";
+/// The input a system reads completions from.
+pub const IO_CQ: &str = "io_cq";
+/// The most ops one system may have in flight, and the ring depth of `Sqe`
+/// and `Cqe`.
+#[cfg(not(kani))]
+pub const MAX_OPS: usize = 16;
+#[cfg(kani)]
+pub const MAX_OPS: usize = 4;
+
+/// A config entry that gives a system's `Cap<K>` parameter a resource.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Grant {
+    pub param: String,
+    pub resource: String,
+}
+
+/// A `Cap<K>` or `DeviceSide<K>` parameter in a system's definition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantDef {
+    pub param: Cow<'static, str>,
+    /// The interface's name, such as `"uart"`.
+    pub interface: Cow<'static, str>,
+    pub end: End,
+}
+
+/// Which end of a resource a parameter holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum End {
+    /// A `Cap<K>`: the end a driver submits ops on.
+    Host,
+    /// A `DeviceSide<K>`: the end a model system serves.
+    Device,
+}
