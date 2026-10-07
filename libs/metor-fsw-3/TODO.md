@@ -121,3 +121,35 @@ target. Landed 2026-09-22.
   `EINVAL` on a publish whose announce runs to tens of kilobytes;
   reading from a 64 KiB buffer, as `identify` does, did not. The gate
   reads that way; the growth path in stellarator wants a look.
+
+## 8. IO as a queue, planned
+
+Design `docs/plans/18-io.md`, plan `18-io-plan.md`, chunk plans
+`18a`–`18g` (chunk D removed).
+
+- Quiesce timeout. A channel `Reset` waits until the system has no ops
+  in flight. A cancel the OS never answers keeps it waiting for good. That
+  happens with file IO stuck in the kernel on a hung storage device. Add
+  a deadline per resetting system. Past it, remake anyway, keep the stuck
+  ops' buffer slots marked in flight so they are never reused, and log a
+  `quiesce_timeout` fault.
+- Layers from config. Target files install layers (fault injection over
+  real hardware for HIL, transport faults in sims) through metor-expr or
+  WASM rather than a built-in rule language. The layer mechanism itself
+  (the stack, its verdicts, and a counting layer) returns with this work.
+  Until then faults are injected through models.
+- stellarator on the one op type. Its executor, ops, and backends move
+  onto `Op`, `Sqe`, and the `Os` trait, and its public types keep their
+  API.
+- Group reactors, and async systems taking `Cap<K>` as reactor
+  capabilities. Each thread group gets its own reactor; link systems then
+  hold capabilities, and a capability can be adopted into a stellarator
+  type.
+- Deterministic async IO, through a proxy `Os` that carries a group's sim
+  ops to the coordinator's device ends.
+- The `sim` resolver and links over simulated resources (`SimListen`,
+  `SimDial`). Needs async systems on the reactor.
+- Targets that mix real and sim resources. Build refuses them today.
+- More sim kinds (`SimCan`, `SimUdp`, `SimDir`, `SimListen`, `SimDial`),
+  each with its driver.
+- Windows in the `Os`. `PollOs` is Unix-only.
