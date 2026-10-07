@@ -161,6 +161,12 @@ pub enum IoError {
     BadAddr,
 }
 
+impl From<IoError> for std::borrow::Cow<'static, str> {
+    fn from(e: IoError) -> Self {
+        e.to_string().into()
+    }
+}
+
 /// A Linux error number.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Errno(pub(crate) u16);

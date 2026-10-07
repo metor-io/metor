@@ -12,15 +12,17 @@ use serde::{Deserialize, Serialize};
 mod addr;
 mod buf;
 mod cap;
+pub(crate) mod device;
 mod handle;
 mod op;
 #[cfg(all(feature = "host", unix))]
 mod os;
 mod out;
+mod param;
 mod pending;
 #[cfg(all(feature = "host", unix))]
 mod poll;
-mod queue;
+pub(crate) mod queue;
 #[cfg(all(feature = "host", unix))]
 mod reactor;
 mod record;
@@ -37,6 +39,7 @@ pub use cap::{
     Can, Cap, Dial, Dir, File, GpioLine, Handle, Interface, Listen, Messages, Stream, TtyQueue,
     Uart, Udp,
 };
+pub use device::DeviceSide;
 pub use handle::{RawHandle, Token};
 pub use op::{GpioOp, Op, OpKind, OpenFlags, Sqe, TtyConfig, TtyOp};
 #[cfg(all(feature = "host", unix))]

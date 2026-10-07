@@ -89,6 +89,11 @@ pub enum DefError {
 
     #[error("async system `{system}` takes a `Sample`, which only a stepped system takes")]
     SampleOnAsync { system: String },
+
+    #[error(
+        "async system `{system}` takes a `Cap` or `DeviceSide`, which only a stepped system takes"
+    )]
+    IoOnAsync { system: String },
 }
 
 /// Every record a system table knows about, looked up by name.

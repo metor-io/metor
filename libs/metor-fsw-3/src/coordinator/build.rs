@@ -14,6 +14,7 @@ use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 
 use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
+use crate::io::End;
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
@@ -117,6 +118,7 @@ fn resolve<'a>(
         let namespace = config.namespace.as_deref();
         let def = planned_def(system, entry, &plan, &index, &records, namespace)?;
         check_port_names(&system.id, &def)?;
+        check_grants(system, &def)?;
         if def.outputs.iter().any(|p| p.name == STATUS_PORT) {
             return Err(BuildError::ReservedPort {
                 ty: system.ty.clone(),
@@ -314,6 +316,38 @@ fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildErr
     }
     if let Some((system, port)) = duplicate(&def.outputs).map(port) {
         return Err(BuildError::DuplicateOutput { system, port });
+    }
+    Ok(())
+}
+
+/// Checks that each `Cap` parameter has exactly one grant, and that every
+/// grant names one.
+fn check_grants(system: &SystemConfig, def: &SystemDef) -> Result<(), BuildError> {
+    let error = |param: &str| (system.id.clone(), param.to_string());
+    let caps = || def.grants.iter().filter(|g| g.end == End::Host);
+    for grant in &system.grants {
+        if !caps().any(|cap| cap.param == grant.param) {
+            let (system, param) = error(&grant.param);
+            return Err(BuildError::UnknownGrant { system, param });
+        }
+    }
+    for cap in caps() {
+        match system
+            .grants
+            .iter()
+            .filter(|g| g.param == cap.param)
+            .count()
+        {
+            1 => {}
+            0 => {
+                let (system, param) = error(&cap.param);
+                return Err(BuildError::Ungranted { system, param });
+            }
+            _ => {
+                let (system, param) = error(&cap.param);
+                return Err(BuildError::DuplicateGrant { system, param });
+            }
+        }
     }
     Ok(())
 }
@@ -584,6 +618,7 @@ mod tests {
                     Vec::new()
                 },
                 outputs: if input { Vec::new() } else { vec![port] },
+                grants: Vec::new(),
             };
             assert_eq!(
                 check_alignment("test", &def),
@@ -612,6 +647,7 @@ mod tests {
                 } else {
                     vec![port.clone(), port.clone()]
                 },
+                grants: Vec::new(),
             };
             let expected = if input {
                 BuildError::DuplicateInput {
@@ -635,6 +671,7 @@ mod tests {
             name: "test".into(),
             inputs: vec![port.clone()],
             outputs: vec![port],
+            grants: Vec::new(),
         };
         assert_eq!(check_port_names("instance", &def), Ok(()));
         assert_eq!(

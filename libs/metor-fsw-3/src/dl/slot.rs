@@ -93,6 +93,7 @@ pub(crate) fn entry() -> TableEntry {
             name: SLOT_NAME.into(),
             inputs: Vec::new(),
             outputs: Vec::new(),
+            grants: Vec::new(),
         },
         def_fn: Box::new(def),
         doc: "Loads one of the pack systems it allows on its channel's `Load`.".into(),

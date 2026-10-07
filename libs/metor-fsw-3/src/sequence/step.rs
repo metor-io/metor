@@ -10,12 +10,11 @@ use std::sync::Arc;
 use metor_fsw_3_ring::NoWake;
 use metor_proto::types::Timestamp;
 
-use crate::channel::Abort;
+use crate::channel::{Abort, AbortRequest};
 use crate::coordinator::{EndReason, Step};
 use crate::fn_system::{Cycle, InSet, OutSet, Param, report_dropped};
 use crate::log::{self, Log, LogPort};
 use crate::port::{Input, Samplers};
-use crate::system::{InputBinding, OutputBinding, SystemInputs, SystemOutputs};
 
 use super::{Seq, SeqError, SequenceFn};
 
@@ -35,25 +34,17 @@ pub(crate) struct SequenceStep {
 }
 
 impl SequenceStep {
-    /// Binds the sequence's ports and creates its body.
+    /// Creates the sequence's body over its bound ports.
     ///
     /// The body does not start running until it is first polled.
-    ///
-    /// # Panics
-    /// Panics if `inputs` does not start with the `abort` binding, which
-    /// [`super::def`] always declares first.
     pub(crate) fn new<S: SequenceFn>(
         state: S::State,
-        inputs: Vec<InputBinding>,
-        outputs: Vec<OutputBinding>,
+        abort: Input<AbortRequest>,
+        inputs: InSet<S>,
+        outputs: OutSet<S>,
     ) -> Self {
-        let mut inputs = inputs.into_iter();
-        // PANIC Safety: `def` declares `abort` first, and build binds one list
-        // per declared input.
-        let abort = inputs.next().expect("the abort binding");
-        let abort = Input::new(abort.views);
-        let InSet { ins, samplers } = InSet::<S>::bind(inputs.collect());
-        let OutSet { outs, log, dropped } = OutSet::<S>::bind(outputs);
+        let InSet { ins, samplers } = inputs;
+        let OutSet { outs, log, dropped } = outputs;
         let seq = Rc::new(Seq::new());
         Self {
             run: Some(Box::pin(run::<S>(state, ins, outs, seq.clone()))),

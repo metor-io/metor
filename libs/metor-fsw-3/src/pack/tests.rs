@@ -250,8 +250,8 @@ fn test_unknown_system_type() {
 #[test]
 fn test_bad_params_refused() {
     let refused = |params: &str| {
-        let nav = ring::<Nav>(1);
-        let instance = create_raw("nav", params, &[RawSlice::EMPTY], &[nav.raw()]);
+        let (nav, log) = (ring::<Nav>(1), ring::<LogEvent>(1));
+        let instance = create_raw("nav", params, &[RawSlice::EMPTY], &[nav.raw(), log.raw()]);
         assert!(instance.handle.is_null());
         serde_json::from_slice::<ParamError>(instance.error()).expect("decodes")
     };

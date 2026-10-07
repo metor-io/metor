@@ -185,7 +185,7 @@ pub use fn_system::{
     AsyncSystemFn, Ctor, Cycle, FnSystem, InSet, OutSet, Param, ParamNames, Ports, SystemFn,
 };
 pub use frame::Frame;
-pub use io::{Buf, Cap, Handle, Io, IoInit, Pending, Slot};
+pub use io::{Buf, Cap, DeviceSide, Handle, Io, IoInit, Pending, Slot};
 #[cfg(feature = "host")]
 pub use link::{LinkStatus, Transport};
 pub use log::{Log, LogLayer};

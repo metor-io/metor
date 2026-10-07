@@ -90,6 +90,15 @@ pub enum BuildError {
     #[error("port `{id}.{port}` is reserved for the channel adapter")]
     ReservedChannelPort { id: String, port: String },
 
+    #[error("`{system}` has no grant for its `Cap` parameter `{param}`")]
+    Ungranted { system: String, param: String },
+
+    #[error("`{system}` grants its parameter `{param}` twice")]
+    DuplicateGrant { system: String, param: String },
+
+    #[error("`{system}` grants `{param}`, which is not a `Cap` parameter")]
+    UnknownGrant { system: String, param: String },
+
     #[error("definition for `{id}`: {source}")]
     Def {
         id: String,

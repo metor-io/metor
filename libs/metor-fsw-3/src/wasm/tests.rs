@@ -326,6 +326,7 @@ fn rig(execute: &str) -> Rig {
             Output::<LogEvent>::def(&cx, "output"),
             Output::<LogEvent>::def(&cx, "log"),
         ],
+        grants: Vec::new(),
     };
     let instance = Instance {
         id: "guest".into(),

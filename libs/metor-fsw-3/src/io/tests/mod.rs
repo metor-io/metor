@@ -1,6 +1,8 @@
 mod buf;
 mod cap;
 mod op;
+#[cfg(all(test, feature = "host"))]
+mod param;
 #[cfg(all(test, feature = "host", unix))]
 mod poll;
 mod queue;

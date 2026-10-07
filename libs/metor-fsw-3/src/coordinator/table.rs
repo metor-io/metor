@@ -11,7 +11,8 @@ use serde_json::value::RawValue;
 use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError};
-use crate::fn_system::{AsyncSystemFn, Ctor, FnSystem, SystemFn};
+use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, SystemFn};
+use crate::io::Tables;
 use crate::sequence::SequenceFn;
 use crate::system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
@@ -120,9 +121,7 @@ impl SystemTable {
         _system: S,
         ctor: C,
     ) -> Result<(), BuildError> {
-        let make = move |params: Params<'_>| Ok((FnSystem::default(), ctor.make(params)?));
-        let entry = entry::<FnSystem<S>>(make, Cow::Borrowed(S::DOC), C::schema())
-            .map_err(def_error(ty))?;
+        let entry = fn_entry::<S, M, C>(ctor).map_err(def_error(ty))?;
         self.insert(ty, entry)
     }
 
@@ -311,6 +310,34 @@ fn entry<S: System + 'static>(
                 state,
                 inputs: S::Inputs::bind(views),
                 outputs: S::Outputs::bind(writers),
+            }))
+        }),
+    })
+}
+
+/// Builds the table entry for a `#[system]` fn.
+///
+/// The entry's `make` binds the system's ports, including its queue pair,
+/// before `ctor` builds its state.
+fn fn_entry<S: SystemFn, M, C: Ctor<S::State, M> + 'static>(
+    ctor: C,
+) -> Result<TableEntry, DefError> {
+    Ok(TableEntry {
+        kind: SystemKind::Cyclic,
+        def: FnSystem::<S>::def(&DefCx::empty())?,
+        def_fn: Box::new(FnSystem::<S>::def),
+        doc: Cow::Borrowed(S::DOC),
+        schema: C::schema(),
+        make: Arc::new(move |cx| {
+            refuse_thread(cx.adapter)?;
+            let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
+            let (inputs, outputs, _io) = fn_system::bind::<S>(views, writers, &Tables::new());
+            let state = ctor.make(cx.params)?;
+            Ok(Box::new(Runner {
+                system: FnSystem::default(),
+                state,
+                inputs,
+                outputs,
             }))
         }),
     })

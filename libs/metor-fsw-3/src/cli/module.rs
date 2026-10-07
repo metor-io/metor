@@ -475,6 +475,7 @@ mod tests {
                 name: ty.into(),
                 inputs,
                 outputs,
+                grants: Vec::new(),
             },
             doc: "".into(),
             params: params.map(|text| RawValue::from_string(text.into()).expect("json")),
