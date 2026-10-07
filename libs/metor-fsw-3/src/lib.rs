@@ -150,6 +150,7 @@ pub mod deploy;
 pub mod dl;
 pub mod fn_system;
 pub mod frame;
+pub mod io;
 #[cfg(feature = "host")]
 pub mod link;
 pub mod log;
