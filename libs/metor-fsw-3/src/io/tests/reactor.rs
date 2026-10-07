@@ -1,51 +1,9 @@
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 
+use super::allocations;
 use crate::io::*;
-
-/// Counts allocations on threads that enable counting.
-struct Counting;
-
-thread_local! {
-    static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
-}
-
-fn count() {
-    let _ = COUNT.try_with(|c| c.set(c.get().map(|n| n + 1)));
-}
-
-// SAFETY: every method forwards to `System` with the caller's arguments.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        count();
-        unsafe { System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        count();
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
-
-fn allocations(f: impl FnOnce()) -> usize {
-    COUNT.with(|c| c.set(Some(0)));
-    f();
-    COUNT.with(|c| c.take()).unwrap_or(0)
-}
 
 /// The ops a `ScriptOs` received and the completions it returns next.
 #[derive(Default)]

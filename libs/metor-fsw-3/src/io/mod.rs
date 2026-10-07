@@ -11,16 +11,20 @@ use serde::{Deserialize, Serialize};
 
 mod addr;
 mod buf;
+mod cap;
 mod handle;
 mod op;
 #[cfg(all(feature = "host", unix))]
 mod os;
 mod out;
+mod pending;
 #[cfg(all(feature = "host", unix))]
 mod poll;
+mod queue;
 #[cfg(all(feature = "host", unix))]
 mod reactor;
 mod record;
+mod slot;
 #[cfg(all(feature = "host", target_os = "linux"))]
 mod uring;
 
@@ -29,15 +33,24 @@ mod tests;
 
 pub use addr::RawAddr;
 pub use buf::{BufError, BufRef, BufTable, RawBuf, TableId, Tables};
+pub use cap::{
+    Can, Cap, Dial, Dir, File, GpioLine, Handle, Interface, Listen, Messages, Stream, TtyQueue,
+    Uart, Udp,
+};
 pub use handle::{RawHandle, Token};
 pub use op::{GpioOp, Op, OpKind, OpenFlags, Sqe, TtyConfig, TtyOp};
 #[cfg(all(feature = "host", unix))]
 pub use os::{FdClass, Os, OsError, host};
 pub use out::{Cqe, Errno, IoError, IoStatus, Out};
+pub use pending::{
+    Accept, BufOp, Close, Fsync, Gpio, IoOp, Open, Pending, Raw, Read, Recv, Send, Tty, Write,
+};
 #[cfg(all(feature = "host", unix))]
 pub use poll::PollOs;
+pub use queue::Io;
 #[cfg(all(feature = "host", unix))]
 pub use reactor::{Limits, Reactor, SourceId};
+pub use slot::{Buf, IoInit, Slot};
 #[cfg(all(feature = "host", target_os = "linux"))]
 pub use uring::UringOs;
 

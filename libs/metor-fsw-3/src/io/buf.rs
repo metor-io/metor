@@ -123,7 +123,7 @@ enum Arena {
 impl Arena {
     fn base(&mut self) -> NonNull<u8> {
         match self {
-            Self::Making(v) => NonNull::from(v.as_mut_slice()).cast(),
+            Self::Making(v) => NonNull::new(v.as_mut_ptr()).unwrap_or(NonNull::dangling()),
             Self::Frozen(p) => p.cast(),
         }
     }
@@ -138,12 +138,12 @@ impl Arena {
     /// Borrows the directory without touching buffer data.
     fn dir(&mut self, slots: u16) -> &mut Dir {
         let n = dir_len(slots);
-        let bytes = match self {
-            Self::Making(v) => &mut v[..n],
-            // SAFETY: the first `n` bytes hold the directory, and no `RawBuf`
-            // or accessor overlaps them.
-            Self::Frozen(p) => unsafe { core::slice::from_raw_parts_mut(p.cast().as_ptr(), n) },
-        };
+        // `base` forms no reference to the data, so borrows of buffers
+        // elsewhere in the arena stay valid.
+        let base = self.base();
+        // SAFETY: the first `n` bytes hold the directory, and no `RawBuf` or
+        // accessor overlaps them.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(base.as_ptr(), n) };
         // PANIC Safety: `bytes` holds exactly a header and `slots` entries.
         Dir::mut_from_bytes(bytes).expect("directory layout")
     }
@@ -258,6 +258,13 @@ impl BufTable {
             cap: e.cap.get(),
             len: e.len.get(),
         })
+    }
+
+    /// The slot's capacity, or 0 for a free slot.
+    pub fn capacity(&self, slot: u16) -> u32 {
+        let mut arena = self.arena.borrow_mut();
+        let dir = arena.dir(self.slots);
+        dir.held(slot).map_or(0, |e| e.cap.get())
     }
 
     pub fn set_len(&self, slot: u16, len: u32) -> Result<(), BufError> {

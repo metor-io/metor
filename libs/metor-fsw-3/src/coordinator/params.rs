@@ -56,6 +56,8 @@ pub enum ParamError {
     ThreadsUnsupported { system: String },
     #[error("the wasm guest: {0}")]
     Wasm(String),
+    #[error("IO memory: {reason}")]
+    IoMemory { need: usize, reason: String },
 }
 
 #[cfg(test)]
