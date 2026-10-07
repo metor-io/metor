@@ -1,8 +1,9 @@
-//! `UringOs`: ops as io_uring requests on a ring of its own.
+//! An `Os` built on its own io_uring instance.
 //!
-//! Each frozen table's arena is one fixed buffer. Dialed sockets live in a
-//! sparse fixed-file table: `Connect` is a `Socket` linked to a `Connect` on
-//! the new slot. Tty and GPIO ioctls and `Close` run inline.
+//! `UringOs::new` registers each frozen table as one fixed buffer. Dialed
+//! sockets are direct descriptors in a sparse fixed-file table: `Connect`
+//! submits a `Socket` op linked to a `Connect` op on the new slot. Tty and GPIO
+//! ioctls and `Close` run synchronously.
 
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
@@ -17,11 +18,11 @@ use super::{
 };
 
 const OWN: u32 = 0x8000_0000;
-/// Marks a dial's `Socket` half in `user_data`.
+/// Set in the `user_data` of a dial's `Socket` op.
 const SOCKET: u64 = 1 << 32;
-/// The longest path `Open` takes, with its NUL.
+/// The longest `Open` path, including the NUL.
 const PATH_MAX: usize = 4096;
-/// Paths queued between submits.
+/// The most `Open` paths held between submits.
 const PATHS: usize = 4;
 
 #[derive(Clone, Copy)]
@@ -42,7 +43,7 @@ struct Slot {
     res: Res,
 }
 
-/// How a completion's `res` becomes an `Out`.
+/// How to turn a completion's `res` into an `Out`.
 #[derive(Clone, Copy)]
 enum Then {
     Unit,
@@ -52,7 +53,7 @@ enum Then {
     Connected { file: u32, failed: i32 },
 }
 
-/// The memory the kernel reads after submit, one per reactor token.
+/// Per-token memory that the kernel reads after submit.
 struct Mem {
     then: Option<Then>,
     addr: libc::sockaddr_storage,
@@ -60,7 +61,7 @@ struct Mem {
     iov: libc::iovec,
 }
 
-/// The io_uring backend.
+/// The `Os` for Linux targets.
 pub struct UringOs {
     ring: IoUring,
     mem: Box<[Mem]>,
@@ -77,8 +78,9 @@ pub struct UringOs {
 }
 
 impl UringOs {
-    /// Dial target `i` gets the handle `RawHandle::new(i, 0)`. Every table in
-    /// `tables` that is frozen now gets a fixed buffer.
+    /// Creates the backend. Dial target `i` gets the handle
+    /// `RawHandle::new(i, 0)`. Each table in `tables` that is already frozen gets
+    /// a fixed buffer.
     pub fn new(limits: &Limits, tables: Tables, dials: &[RawAddr]) -> Result<Self, OsError> {
         let ops = limits.ops.max(1) as u32;
         let ring = IoUring::new((3 * ops).next_power_of_two())?;
@@ -331,7 +333,7 @@ impl UringOs {
             return Err(IoError::Os(Errno::EINVAL));
         }
         if self.paths_used == PATHS {
-            // The kernel copies a path when it takes the request.
+            // The kernel copies each path during submit, which frees the pool.
             self.flush();
         }
         let cpath = &mut self.paths[self.paths_used];
@@ -347,14 +349,15 @@ impl UringOs {
         self.queue(m, token, Then::Opened(class), &[e.build()])
     }
 
-    /// A `Socket` into a free fixed-file slot, linked to a `Connect` on it.
+    /// Submits a `Socket` op into a free fixed-file slot, linked to a `Connect`
+    /// on that slot.
     fn connect(&mut self, m: usize, token: Token, addr: RawAddr) -> Result<(), IoError> {
         let (ss, len) = sockaddr(addr)?;
         let file = self.files.pop().ok_or(IoError::QueueFull)?;
         // PANIC Safety: `file` is below the sparse table's size, which fits `u32`.
         let dest = DestinationSlot::try_from_slot_target(file).expect("slot in range");
         let family = i32::from(ss.ss_family);
-        // A direct descriptor takes no `SOCK_CLOEXEC`; it is never inherited.
+        // Direct descriptors reject `SOCK_CLOEXEC`, and exec never inherits them.
         let socket = opcode::Socket::new(family, libc::SOCK_STREAM, 0)
             .file_index(Some(dest))
             .build();
@@ -372,7 +375,7 @@ impl UringOs {
         r
     }
 
-    /// Pushes linked `entries` for one op; the last carries `token`.
+    /// Pushes the linked `entries` of one op. The last entry carries `token`.
     fn queue(
         &mut self,
         m: usize,
@@ -395,8 +398,8 @@ impl UringOs {
             } else {
                 e.clone()
             };
-            // SAFETY: every pointer in `e` is into a frozen arena, `self.mem`,
-            // or `self.paths`, which outlive the request.
+            // SAFETY: every pointer in `e` points into a frozen table,
+            // `self.mem`, or `self.paths`, all of which outlive the request.
             let _ = unsafe { sq.push(&e) };
         }
         Ok(())
@@ -517,7 +520,7 @@ fn with_fd(e: Entry, fd: Target) -> Entry {
     }
 }
 
-/// Rewrites an entry's descriptor.
+/// Sets an entry's descriptor field.
 fn set_fd(e: Entry, fd: RawFd) -> Entry {
     // SAFETY: `Entry` is `repr(C)` over `io_uring_sqe`, whose `fd` is the
     // `i32` at byte 4.
@@ -557,7 +560,8 @@ fn probe(ring: &IoUring) -> Result<(), OsError> {
     }
 }
 
-/// Registers each frozen table's arena as one fixed buffer.
+/// Registers each frozen table as one fixed buffer and returns each table's
+/// buffer index.
 fn register_tables(ring: &IoUring, tables: &Tables) -> Result<Vec<Option<u16>>, OsError> {
     let mut iovs = Vec::new();
     let fixed = (0..tables.len())
@@ -571,7 +575,7 @@ fn register_tables(ring: &IoUring, tables: &Tables) -> Result<Vec<Option<u16>>, 
         })
         .collect();
     if !iovs.is_empty() {
-        // SAFETY: each arena is frozen and outlives the ring; the reactor
+        // SAFETY: each table is frozen and outlives the ring. The reactor
         // leaks any table with ops in flight.
         unsafe { ring.submitter().register_buffers(&iovs)? };
     }

@@ -3,7 +3,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unali
 
 use super::{RawAddr, RawHandle, Token};
 
-/// One completion, as a system reads it.
+/// An entry on the completion queue.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, IntoBytes, TryFromBytes, KnownLayout, Immutable, Unaligned,
 )]
@@ -35,7 +35,7 @@ impl Cqe {
     }
 }
 
-/// What a successful op gives back. Every variant is 28 bytes.
+/// The result of a successful op. Each variant is padded to 28 bytes.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, IntoBytes, TryFromBytes, KnownLayout, Immutable, Unaligned,
 )]
@@ -92,7 +92,8 @@ impl Out {
 
 const FRAMEWORK: u32 = 0x1_0000;
 
-/// 0 is success, `1..=0xFFFF` a Linux errno, and `0x1_0000..` a framework code.
+/// An op's status: 0 for success, `1..=0xFFFF` for a Linux errno, and
+/// `0x1_0000..` for a framework error.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, IntoBytes, FromBytes, KnownLayout, Immutable, Unaligned,
 )]
@@ -117,7 +118,7 @@ impl IoStatus {
         Self(U32::new(code))
     }
 
-    /// An unknown framework code reads as `Refused`.
+    /// Decodes the status. An unknown framework code decodes as `Refused`.
     pub fn result(self) -> Result<(), IoError> {
         let code = self.0.get();
         let e = match code.checked_sub(FRAMEWORK) {
@@ -158,7 +159,7 @@ pub enum IoError {
     BadAddr,
 }
 
-/// An error number, in Linux numbering.
+/// A Linux error number.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Errno(pub(crate) u16);
 

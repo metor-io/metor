@@ -44,10 +44,11 @@ pub use maitake::sync;
 pub use stellarator_macros::*;
 
 thread_local! {
-    /// The executor `spawn`, `sleep`, and IO use on this thread. Whoever
-    /// installs it keeps it alive until it is swapped back out.
+    /// The current executor, which `spawn`, `sleep`, and IO use. The code that
+    /// installs it keeps it alive until it restores the previous one.
     static EXEC: Cell<*const Executor> = const { Cell::new(std::ptr::null()) };
-    /// The thread's own executor, made on first use and dropped by `run`.
+    /// The thread's default executor. `with` creates it on first use and `run`
+    /// drops it.
     static OWN: RefCell<Option<Rc<Executor>>> = const { RefCell::new(None) };
 }
 
@@ -55,8 +56,8 @@ thread_local! {
 struct Installed(*const Executor);
 
 impl Installed {
-    /// Every `Executor` has the default reactor: its fields are private and
-    /// only the default reactor's constructors build one.
+    /// Casts to `Executor<DefaultReactor>`. This is sound because only the
+    /// default reactor's constructors can build an `Executor`.
     fn new<R: Reactor>(exec: &Executor<R>) -> Self {
         let exec = (exec as *const Executor<R>).cast::<Executor>();
         Self(EXEC.try_with(|e| e.replace(exec)).unwrap_or(exec))
@@ -69,12 +70,12 @@ impl Drop for Installed {
     }
 }
 
-/// What one [`Executor::turn`] left behind.
+/// The executor's state after one [`Executor::turn`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Turned {
-    /// A task is ready to run on the next turn.
+    /// Whether a task is ready to run on the next turn.
     pub runnable: bool,
-    /// How long until the timer's next deadline, by the executor's clock.
+    /// Time until the timer's next deadline, on the executor's clock.
     pub next_deadline: Option<Duration>,
 }
 
@@ -175,7 +176,7 @@ impl<R: Reactor> Executor<R> {
         Ok(out)
     }
 
-    /// Records a task so `Drop` can cancel it, forgetting finished ones.
+    /// Records a task for `Drop` to cancel, and prunes finished ones.
     fn track(&self, task: TaskRef) {
         let mut tasks = self.tasks.borrow_mut();
         tasks.retain(|t| !t.is_complete());
@@ -184,8 +185,8 @@ impl<R: Reactor> Executor<R> {
 }
 
 impl<R: Reactor> Drop for Executor<R> {
-    /// Cancels every task and ticks once, so each drops its future, and any
-    /// `Sleep` on this timer, before the timer drops. Then cancels the IO.
+    /// Cancels every task and ticks once, so each task drops its future and any
+    /// `Sleep` on this timer before the timer drops. Then cancels pending IO.
     fn drop(&mut self) {
         let this = &*self;
         let _installed = Installed::new(this);
@@ -219,8 +220,8 @@ impl IoStates for () {
     fn cancel(&mut self) {}
 }
 
-/// Runs `func`'s future to completion on this thread's own executor, then
-/// drops that executor. The next `run` makes a new one.
+/// Runs `func`'s future to completion on the thread's default executor, then
+/// drops that executor. The next `run` creates a new one.
 pub fn run<R, F>(func: impl FnOnce() -> F) -> R
 where
     F: Future<Output = R> + 'static,
@@ -233,15 +234,15 @@ where
 }
 
 impl Executor<DefaultReactor> {
-    /// An executor with its own reactor and the given clock.
+    /// Creates an executor with its own reactor and the given clock.
     pub fn new(clock: time::Clock) -> Result<Self, Error> {
         let mut exec = Self::try_new()?;
         exec.timer = Timer::new(clock.maitake());
         Ok(exec)
     }
 
-    /// One pass: timer, IO, one scheduler tick. Never blocks and never moves
-    /// the clock. Installs `self` as this thread's executor for the pass.
+    /// Advances the timer, processes IO, and ticks the scheduler once, with
+    /// `self` as the current executor. Never blocks and never moves the clock.
     pub fn turn(self: &Rc<Self>) -> Turned {
         let _installed = Installed::new(&**self);
         self.timer.try_turn();
@@ -255,9 +256,9 @@ impl Executor<DefaultReactor> {
         }
     }
 
-    /// Spawns onto this executor, installed as for [`Executor::turn`].
+    /// Spawns a task on this executor.
     ///
-    /// Every task and `JoinHandle` spawned here must drop before the executor.
+    /// Drop every `JoinHandle` from this executor before the executor itself.
     pub fn spawn<F>(self: &Rc<Self>, f: F) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
@@ -267,7 +268,7 @@ impl Executor<DefaultReactor> {
         spawn(f)
     }
 
-    /// This thread's own executor, made if there is none.
+    /// Returns the thread's default executor, creating it if needed.
     fn own() -> Rc<Self> {
         OWN.with(|o| {
             o.borrow_mut()
@@ -283,8 +284,8 @@ impl Executor<DefaultReactor> {
             let rc = own.insert(Self::own());
             exec = Rc::as_ptr(rc);
         }
-        // SAFETY: an installed executor is kept alive by whoever installed
-        // it, and `own` keeps the thread's own executor alive for the call.
+        // SAFETY: the code that installed `exec` keeps it alive, and `own`
+        // keeps the default executor alive for this call.
         f(unsafe { &*exec })
     }
 

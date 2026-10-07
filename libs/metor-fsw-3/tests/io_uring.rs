@@ -1,4 +1,4 @@
-//! `UringOs` against real descriptors.
+//! Runs the shared `Os` cases on `UringOs` with real descriptors.
 #![cfg(target_os = "linux")]
 
 mod os_cases;

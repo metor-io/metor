@@ -8,7 +8,7 @@ use super::IoError;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 
-/// A socket address of fixed size. The family uses Linux numbers.
+/// A fixed-size socket address with a Linux address family.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, IntoBytes, FromBytes, KnownLayout, Immutable, Unaligned,
 )]

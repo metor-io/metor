@@ -5,7 +5,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unali
 
 use super::{BufRef, RawAddr, RawHandle, Token};
 
-/// One op, as a system submits it.
+/// An entry on the submission queue.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, IntoBytes, TryFromBytes, KnownLayout, Immutable, Unaligned,
 )]
@@ -28,13 +28,13 @@ impl Sqe {
     }
 }
 
-/// What an op does. Every variant is 32 bytes, padded by hand.
+/// An IO operation. Each variant is padded to 32 bytes.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, IntoBytes, TryFromBytes, KnownLayout, Immutable, Unaligned,
 )]
 #[repr(u8)]
 pub enum Op {
-    /// An offset of `u64::MAX` reads at the current position.
+    /// An offset of `u64::MAX` uses the current file position.
     Read {
         buf: BufRef,
         _p: [u8; 4],
@@ -100,7 +100,7 @@ impl Op {
     pub const CLOSE: Self = Self::Close { _p: [0; 32] };
     pub const FSYNC: Self = Self::Fsync { _p: [0; 32] };
 
-    /// `None` reads at the current position.
+    /// `None` uses the current file position.
     pub fn read(buf: BufRef, offset: Option<u64>) -> Self {
         Self::Read {
             buf,
@@ -110,7 +110,7 @@ impl Op {
         }
     }
 
-    /// `None` writes at the current position.
+    /// `None` uses the current file position.
     pub fn write(buf: BufRef, offset: Option<u64>) -> Self {
         Self::Write {
             buf,
@@ -178,7 +178,7 @@ impl Op {
         }
     }
 
-    /// The buffer the op reads or fills, if any.
+    /// The buffer the op reads from or writes into.
     pub fn buf(&self) -> Option<BufRef> {
         match *self {
             Self::Read { buf, .. }
@@ -204,7 +204,7 @@ impl Op {
         }
     }
 
-    /// The file offset of a `Read` or `Write`; `None` is the current position.
+    /// The file offset of a `Read` or `Write`. `None` means the current position.
     pub fn offset(&self) -> Option<u64> {
         match self {
             Self::Read { offset, .. } | Self::Write { offset, .. } => {
@@ -252,7 +252,7 @@ impl OpKind {
         Self::Cancel,
     ];
 
-    /// The snake-case name Python uses.
+    /// The snake-case name used in Python.
     pub fn name(self) -> &'static str {
         match self {
             Self::Read => "read",
@@ -277,7 +277,7 @@ impl OpKind {
     }
 }
 
-/// Portable open flags; each `Os` translates them.
+/// Platform-independent flags for `Open`. Each `Os` maps them to its own.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, IntoBytes, FromBytes, KnownLayout, Immutable, Unaligned,
 )]
@@ -307,7 +307,7 @@ impl OpenFlags {
         }
     }
 
-    /// The permission bits a created file gets.
+    /// Sets the permission bits of a created file. The default is `0o644`.
     pub fn with_mode(mut self, mode: u32) -> Self {
         self.mode = U32::new(mode);
         self
@@ -334,7 +334,7 @@ impl BitOr for OpenFlags {
     }
 }
 
-/// A serial-port setting, applied with `tcsetattr`.
+/// Serial port settings, applied with `tcsetattr`.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, IntoBytes, FromBytes, KnownLayout, Immutable, Unaligned,
 )]
@@ -353,7 +353,7 @@ pub struct TtyConfig {
 }
 
 impl TtyConfig {
-    /// 8 data bits, no parity, one stop bit, no flow control.
+    /// Creates an 8N1 config with no flow control.
     pub const fn new(baud: u32) -> Self {
         Self {
             baud: U32::new(baud),

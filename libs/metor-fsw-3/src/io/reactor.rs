@@ -2,19 +2,19 @@ use std::rc::Rc;
 
 use super::{BufTable, Cqe, Errno, IoError, Op, Os, RawHandle, Sqe, Token};
 
-/// Marks a reactor-own token.
+/// The high bit set on the reactor's own tokens.
 const OWN: u32 = 0x8000_0000;
-/// Submit and reap rounds `Drop` runs before it leaks what is left.
+/// How many submit and reap rounds `Drop` runs before it leaks the rest.
 const TEARDOWN_ROUNDS: usize = 3;
 
-/// A submitter: one system. Issued in order from 0.
+/// A system that submits ops. Ids count up from 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SourceId(pub u16);
 
 /// Fixed sizes for a reactor's tables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// Systems' ops in flight, across every source.
+    /// The most system ops in flight across all sources.
     pub ops: usize,
     pub sources: usize,
 }
@@ -25,8 +25,8 @@ struct Entry {
     token: Token,
 }
 
-/// Reactor tokens: a slab for systems' ops and one twice as long for the
-/// reactor's own.
+/// Allocates reactor tokens. System ops draw from one slab and the reactor's
+/// own ops from a second slab twice as long.
 struct Tokens {
     ops: Vec<Option<Entry>>,
     free: Vec<u32>,
@@ -91,10 +91,10 @@ impl Tokens {
     }
 }
 
-/// Takes systems' ops to an `Os` and brings their completions back.
+/// Multiplexes the ops of many systems onto one `Os`.
 ///
-/// Each source's tokens map to reactor tokens on the way down and back on the
-/// way up, and each source's `BufRef`s are stamped with its table.
+/// The reactor swaps each op's token for a reactor-wide one on submit and
+/// swaps it back on completion. It also fills in each `BufRef`'s table.
 pub struct Reactor {
     os: Box<dyn Os>,
     tokens: Tokens,
@@ -117,7 +117,7 @@ impl Reactor {
         }
     }
 
-    /// Adds a submitter whose `BufRef`s name `table`. Init only.
+    /// Adds a source whose buffers live in `table`. Call only at init.
     pub fn source(&mut self, table: Rc<BufTable>) -> SourceId {
         // PANIC Safety: sources are bounded by a target's systems, far below 65536.
         let id = SourceId(u16::try_from(self.sources.len()).expect("source count fits u16"));
@@ -125,8 +125,7 @@ impl Reactor {
         id
     }
 
-    /// Maps the op's token, stamps its table, and queues it. A refused op
-    /// completes on the next `reap`.
+    /// Queues an op. A refused op completes with an error on the next `reap`.
     pub fn push(&mut self, src: SourceId, sqe: Sqe) {
         match self.lower(src, sqe) {
             Ok(sqe) => self.queued.push(sqe),
@@ -153,7 +152,7 @@ impl Reactor {
         Ok(sqe)
     }
 
-    /// Hands the queued ops to the `Os`.
+    /// Submits the queued ops to the `Os`.
     pub fn submit(&mut self) {
         for sqe in self.queued.drain(..) {
             self.os.push(sqe);
@@ -161,7 +160,7 @@ impl Reactor {
         self.os.submit();
     }
 
-    /// Collects what landed and maps each token back to its source's.
+    /// Moves finished completions into `done` and restores each source's token.
     pub fn reap(&mut self, done: &mut Vec<(SourceId, Cqe)>) {
         done.append(&mut self.refused);
         self.os.reap(&mut self.raw);
@@ -172,8 +171,8 @@ impl Reactor {
         }
     }
 
-    /// Cancels every op `src` has in flight. Their completions still come back
-    /// from `reap`.
+    /// Cancels every op `src` has in flight. `reap` still returns their
+    /// completions.
     pub fn cancel_all(&mut self, src: SourceId) {
         for rt in 0..self.tokens.ops.len() as u32 {
             if self.tokens.owner(rt) == Some(src) {
@@ -186,7 +185,7 @@ impl Reactor {
         }
     }
 
-    /// Queues an op under a reactor-own token. `reap` drops its completion.
+    /// Queues an op on the reactor's own behalf. `reap` discards its completion.
     pub fn push_own(&mut self, mut sqe: Sqe) {
         let Some(token) = self.tokens.take_own() else {
             tracing::error!(op = ?sqe.op.kind(), "reactor-own tokens exhausted");
@@ -196,13 +195,13 @@ impl Reactor {
         self.queued.push(sqe);
     }
 
-    /// Ops of `src` not yet returned by `reap`.
+    /// The number of `src`'s ops that `reap` has not returned yet.
     pub fn in_flight(&self, src: SourceId) -> usize {
         self.tokens.live(src)
     }
 }
 
-/// Maps a completion back to its source, freeing its token.
+/// Restores a completion's source token and frees the reactor token.
 fn raise(tokens: &mut Tokens, mut cqe: Cqe) -> Option<(SourceId, Cqe)> {
     let rt = cqe.token.get();
     if rt & OWN != 0 {
@@ -215,7 +214,7 @@ fn raise(tokens: &mut Tokens, mut cqe: Cqe) -> Option<(SourceId, Cqe)> {
 }
 
 impl Drop for Reactor {
-    /// Cancels every op, reaps for a few rounds, and leaks the table of any
+    /// Cancels every op and reaps for a few rounds. Then leaks the table of any
     /// source with ops still in flight, so the kernel never writes freed memory.
     fn drop(&mut self) {
         for sqe in core::mem::take(&mut self.queued) {

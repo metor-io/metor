@@ -1,11 +1,12 @@
-//! A system's IO memory: one arena of bytes with its directory at the start.
+//! A slot-based allocator for IO buffers, backed by a single allocation.
 //!
-//! The directory is a header `{ slots, used, top }` and `slots` entries
-//! `{ offset, cap, len, held }`, each a little-endian `u32`. Data follows. While
-//! the system is made, the arena is a `Vec` that `alloc` grows. `freeze` fixes
-//! its size and address; only then are pointers handed out. No `&mut` to frozen
-//! memory is formed outside the directory and the unsafe accessors, so pointers
-//! held by the kernel stay valid.
+//! The allocation starts with a directory: a header `{ slots, used, top }`
+//! followed by `slots` entries `{ offset, cap, len, held }`, each a
+//! little-endian `u32`. Buffer data follows the directory. Before `freeze`,
+//! the allocation is a `Vec` that `alloc` grows. `freeze` fixes its size and
+//! address, and only then does `raw` return pointers. After `freeze`, the only
+//! `&mut` into the allocation covers the directory or comes from the unsafe
+//! accessors, so pointers held by the kernel stay valid.
 
 use core::cell::{Cell, RefCell};
 use core::ptr::NonNull;
@@ -14,13 +15,13 @@ use std::rc::Rc;
 use zerocopy::little_endian::{U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-/// The id `Tables::add` gives a buffer table.
+/// The index of a `BufTable` in its `Tables`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TableId(pub(crate) u16);
 
-/// A slot in a buffer table.
+/// A reference to a buffer slot.
 ///
-/// A system names only the slot; the reactor stamps the table.
+/// Systems set only the slot. The reactor fills in the table.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, IntoBytes, FromBytes, KnownLayout, Immutable, Unaligned,
 )]
@@ -52,7 +53,7 @@ impl BufRef {
     }
 }
 
-/// One slot's memory, as a backend sees it.
+/// A pointer to a slot's memory, with its capacity and filled length.
 #[derive(Clone, Copy, Debug)]
 pub struct RawBuf {
     pub ptr: NonNull<u8>,
@@ -134,21 +135,21 @@ impl Arena {
         }
     }
 
-    /// The directory's bytes, and none of the data.
+    /// Borrows the directory without touching buffer data.
     fn dir(&mut self, slots: u16) -> &mut Dir {
         let n = dir_len(slots);
         let bytes = match self {
             Self::Making(v) => &mut v[..n],
-            // SAFETY: the arena starts with `n` directory bytes, which no
-            // `RawBuf` or accessor covers.
+            // SAFETY: the first `n` bytes hold the directory, and no `RawBuf`
+            // or accessor overlaps them.
             Self::Frozen(p) => unsafe { core::slice::from_raw_parts_mut(p.cast().as_ptr(), n) },
         };
-        // PANIC Safety: `bytes` is exactly a header plus `slots` entries.
+        // PANIC Safety: `bytes` holds exactly a header and `slots` entries.
         Dir::mut_from_bytes(bytes).expect("directory layout")
     }
 }
 
-/// One system's IO memory. Shared by `Rc`; every method takes `&self`.
+/// A system's IO buffers. Shared through `Rc`, so every method takes `&self`.
 pub struct BufTable {
     arena: RefCell<Arena>,
     slots: u16,
@@ -156,7 +157,7 @@ pub struct BufTable {
 }
 
 impl BufTable {
-    /// A table with room for `slots` directory entries, at most `u16::MAX`.
+    /// Creates a table with `slots` directory entries, capped at `u16::MAX`.
     pub fn new(slots: usize) -> Self {
         let slots = u16::try_from(slots).unwrap_or(u16::MAX);
         let mut arena = Arena::Making(vec![0; dir_len(slots)]);
@@ -170,13 +171,13 @@ impl BufTable {
         }
     }
 
-    /// The id `Tables::add` gave it.
+    /// The table's index in its `Tables`, once added.
     pub fn id(&self) -> Option<TableId> {
         self.id.get()
     }
 
-    /// Appends `cap` zeroed bytes. Before `freeze` the arena grows; after it,
-    /// the bytes must fit the arena's capacity.
+    /// Allocates a zeroed buffer of `cap` bytes. Before `freeze` the allocation
+    /// grows to fit. After `freeze` the buffer must fit in the remaining space.
     pub fn alloc(&self, cap: usize) -> Result<u16, BufError> {
         let cap32 = u32::try_from(cap).map_err(|_| BufError::TooLarge)?;
         let mut arena = self.arena.borrow_mut();
@@ -197,11 +198,11 @@ impl BufTable {
         };
         dir.header.top = U32::new((top + cap) as u32);
         dir.header.used = U32::new(dir.header.used.get() + 1);
-        // PANIC Safety: `slot` indexes `entries`, which has at most `u16::MAX` items.
+        // PANIC Safety: `entries` holds at most `u16::MAX` items.
         Ok(u16::try_from(slot).expect("slot fits u16"))
     }
 
-    /// Allocates a buffer holding `bytes`.
+    /// Allocates a buffer filled with `bytes`.
     pub fn alloc_from(&self, bytes: &[u8]) -> Result<u16, BufError> {
         let slot = self.alloc(bytes.len())?;
         let mut arena = self.arena.borrow_mut();
@@ -216,7 +217,7 @@ impl BufTable {
         Ok(slot)
     }
 
-    /// Fixes the arena's size and address. Idempotent.
+    /// Fixes the allocation's size and address. Later calls do nothing.
     pub fn freeze(&self) {
         let mut arena = self.arena.borrow_mut();
         if let Arena::Making(v) = &mut *arena {
@@ -225,7 +226,7 @@ impl BufTable {
         }
     }
 
-    /// The whole arena once frozen.
+    /// The whole allocation, once frozen.
     pub fn arena(&self) -> Option<NonNull<[u8]>> {
         match *self.arena.borrow() {
             Arena::Frozen(p) => Some(p),
@@ -233,7 +234,7 @@ impl BufTable {
         }
     }
 
-    /// Frees a slot. Its bytes are not reused before a rewind.
+    /// Frees a slot. Its bytes stay unused until a rewind.
     pub fn release(&self, slot: u16) {
         let mut arena = self.arena.borrow_mut();
         let dir = arena.dir(self.slots);
@@ -243,14 +244,14 @@ impl BufTable {
         }
     }
 
-    /// The slot's memory. `None` before `freeze`.
+    /// A pointer to the slot's memory, or `None` before `freeze`.
     pub fn raw(&self, slot: u16) -> Option<RawBuf> {
         let mut arena = self.arena.borrow_mut();
         let Arena::Frozen(base) = *arena else {
             return None;
         };
         let e = arena.dir(self.slots).held(slot)?;
-        // SAFETY: a held entry lies inside the arena.
+        // SAFETY: a held entry lies inside the allocation.
         let ptr = unsafe { base.cast::<u8>().add(e.offset.get() as usize) };
         Some(RawBuf {
             ptr,
@@ -272,36 +273,36 @@ impl BufTable {
         Ok(())
     }
 
-    /// The slot's filled bytes; empty for a slot that is not held.
+    /// The slot's filled bytes, or an empty slice for a free slot.
     ///
     /// # Safety
-    /// The caller holds the slot, and no op using it is in flight. Before
-    /// `freeze`, no `alloc` runs while the slice lives.
+    /// The caller owns the slot and has no op in flight on it. Before `freeze`,
+    /// the caller must not call `alloc` while the slice is alive.
     pub unsafe fn filled(&self, slot: u16) -> &[u8] {
-        // SAFETY: forwarded to the caller.
+        // SAFETY: the caller upholds the contract.
         unsafe { self.filled_mut(slot) }
     }
 
     /// # Safety
-    /// As [`BufTable::filled`].
+    /// Same as [`BufTable::filled`].
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn filled_mut(&self, slot: u16) -> &mut [u8] {
-        // SAFETY: forwarded to the caller.
+        // SAFETY: the caller upholds the contract.
         unsafe { self.span(slot, |e| e.len.get()) }
     }
 
-    /// The slot's whole capacity.
+    /// The slot's full capacity, filled or not.
     ///
     /// # Safety
-    /// As [`BufTable::filled`].
+    /// Same as [`BufTable::filled`].
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn whole_mut(&self, slot: u16) -> &mut [u8] {
-        // SAFETY: forwarded to the caller.
+        // SAFETY: the caller upholds the contract.
         unsafe { self.span(slot, |e| e.cap.get()) }
     }
 
     /// # Safety
-    /// As [`BufTable::filled`].
+    /// Same as [`BufTable::filled`].
     #[allow(clippy::mut_from_ref)]
     unsafe fn span(&self, slot: u16, len: impl Fn(&Entry) -> u32) -> &mut [u8] {
         let mut arena = self.arena.borrow_mut();
@@ -310,7 +311,7 @@ impl BufTable {
         };
         let (offset, len) = (e.offset.get() as usize, len(e) as usize);
         let base = arena.base();
-        // SAFETY: a held entry lies inside the arena; the caller owns the slot.
+        // SAFETY: a held entry lies inside the allocation, and the caller owns the slot.
         unsafe { core::slice::from_raw_parts_mut(base.as_ptr().add(offset), len) }
     }
 }
@@ -324,7 +325,7 @@ fn grow(arena: &mut Arena, top: usize, cap: usize) -> Result<(), BufError> {
     match arena {
         Arena::Making(v) => v.resize(top + cap, 0),
         Arena::Frozen(_) if cap > free => return Err(BufError::NoSpace { need: cap, free }),
-        // SAFETY: `top..top + cap` is inside the arena and past every held slot.
+        // SAFETY: `top..top + cap` lies inside the allocation, past every held slot.
         Arena::Frozen(p) => unsafe { p.cast::<u8>().add(top).write_bytes(0, cap) },
     }
     Ok(())
@@ -339,7 +340,8 @@ impl Drop for BufTable {
     }
 }
 
-/// Every table a backend resolves against. Filled at init.
+/// The buffer tables of every system on a target. Backends resolve `BufRef`s
+/// through it.
 #[derive(Clone, Default)]
 pub struct Tables(Rc<RefCell<Vec<Rc<BufTable>>>>);
 
@@ -348,7 +350,7 @@ impl Tables {
         Self::default()
     }
 
-    /// Adds a table and sets its id. A table belongs to one `Tables`.
+    /// Adds a table and sets its id. Add each table to only one `Tables`.
     pub fn add(&self, table: &Rc<BufTable>) -> TableId {
         debug_assert!(table.id().is_none(), "table already added");
         let mut tables = self.0.borrow_mut();

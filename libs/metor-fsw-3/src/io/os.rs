@@ -11,7 +11,7 @@ use super::{
     TtyConfig, TtyOp,
 };
 
-/// What a registered descriptor is. It picks the path each op takes.
+/// The kind of a registered descriptor, which decides how its ops run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FdClass {
     Stream,
@@ -25,7 +25,7 @@ pub enum FdClass {
 }
 
 impl FdClass {
-    /// Ops on these wait for readiness instead of blocking.
+    /// Whether ops wait for readiness instead of blocking.
     pub(crate) fn polled(self) -> bool {
         matches!(
             self,
@@ -38,15 +38,15 @@ impl FdClass {
     }
 }
 
-/// Executes ops against the host. Nothing here blocks.
+/// Executes ops against the host OS. No method blocks.
 pub trait Os {
-    /// Queues an op. A full queue comes back from `reap` as `QueueFull`.
+    /// Queues an op. If the queue is full, `reap` returns the op with `QueueFull`.
     fn push(&mut self, sqe: Sqe);
-    /// Hands queued ops to the kernel.
+    /// Submits queued ops to the kernel.
     fn submit(&mut self);
-    /// Takes every completion that has landed.
+    /// Moves every finished completion into `done`.
     fn reap(&mut self, done: &mut Vec<Cqe>);
-    /// Takes ownership of an opened resource; ops name the handle it returns.
+    /// Takes ownership of an open descriptor and returns its handle.
     fn register(&mut self, fd: OwnedFd, class: FdClass) -> RawHandle;
 }
 
@@ -58,13 +58,13 @@ pub enum OsError {
     Io(#[from] std::io::Error),
 }
 
-/// The host backend: `UringOs` on Linux, `PollOs` on other Unix hosts.
+/// Creates the host backend: `UringOs` on Linux, `PollOs` on other Unix hosts.
 #[cfg(not(target_os = "linux"))]
 pub fn host(limits: &Limits, tables: Tables, dials: &[RawAddr]) -> Result<Box<dyn Os>, OsError> {
     Ok(Box::new(PollOs::new(limits, tables, dials)?))
 }
 
-/// The host backend: `UringOs` on Linux, `PollOs` on other Unix hosts.
+/// Creates the host backend: `UringOs` on Linux, `PollOs` on other Unix hosts.
 #[cfg(target_os = "linux")]
 pub fn host(limits: &Limits, tables: Tables, dials: &[RawAddr]) -> Result<Box<dyn Os>, OsError> {
     Ok(Box::new(UringOs::new(limits, tables, dials)?))
@@ -79,7 +79,7 @@ pub(crate) fn cvt<T: Copy + PartialOrd + Default>(r: T) -> Result<T, IoError> {
     }
 }
 
-/// Runs a `Tty` op inline.
+/// Runs a `Tty` op synchronously.
 pub(crate) fn tty(fd: BorrowedFd, op: &TtyOp) -> Result<Out, IoError> {
     let fd = fd.as_raw_fd();
     match op {
@@ -101,7 +101,7 @@ fn configure(fd: i32, cfg: &TtyConfig) -> Result<(), IoError> {
     let mut t = MaybeUninit::<libc::termios>::uninit();
     // SAFETY: `tcgetattr` fills `t` when it succeeds.
     cvt(unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) })?;
-    // SAFETY: filled above.
+    // SAFETY: `tcgetattr` succeeded, so `t` is filled.
     let mut t = unsafe { t.assume_init() };
     let speed = speed(cfg.baud()).ok_or(IoError::Os(Errno::EINVAL))?;
     // SAFETY: `t` is a valid termios.
@@ -168,7 +168,7 @@ pub(crate) fn speed(baud: u32) -> Option<libc::speed_t> {
     SPEEDS.iter().find(|(b, _)| *b == baud).map(|(_, s)| *s)
 }
 
-/// Runs a `Gpio` op inline, with the Linux GPIO v2 line ioctls.
+/// Runs a `Gpio` op synchronously with the Linux GPIO v2 line ioctls.
 #[cfg(target_os = "linux")]
 pub(crate) fn gpio(fd: BorrowedFd, op: &GpioOp) -> Result<Out, IoError> {
     #[repr(C)]
@@ -196,7 +196,7 @@ pub(crate) fn gpio(_fd: BorrowedFd, _op: &GpioOp) -> Result<Out, IoError> {
     Err(IoError::Unsupported)
 }
 
-/// `open(2)` flags and mode for portable `OpenFlags`.
+/// Converts `OpenFlags` to `open(2)` flags and a mode.
 pub(crate) fn open_flags(f: OpenFlags) -> (i32, libc::mode_t) {
     let rw = (f.contains(OpenFlags::READ), f.contains(OpenFlags::WRITE));
     let mut flags = libc::O_CLOEXEC
@@ -226,7 +226,7 @@ pub(crate) fn open_flags(f: OpenFlags) -> (i32, libc::mode_t) {
     (flags, mode)
 }
 
-/// A host socket address for `addr`.
+/// Converts `addr` to a host `sockaddr_storage` and its length.
 pub(crate) fn sockaddr(
     addr: RawAddr,
 ) -> Result<(libc::sockaddr_storage, libc::socklen_t), IoError> {

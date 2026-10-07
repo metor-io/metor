@@ -1,9 +1,9 @@
-//! `PollOs`: ops as nonblocking syscalls, with `polling` for readiness.
+//! An `Os` built on nonblocking syscalls and `polling`.
 //!
-//! An op on a polled descriptor is tried at once; `EAGAIN` parks it until its
-//! descriptor is ready. Each descriptor's interest is the union of its parked
-//! ops'. File, directory, tty-ioctl, and GPIO ops run inline and blocking.
-//! Results wait for `reap`.
+//! Ops on sockets, ttys, and CAN run at once. An op that returns `EAGAIN`
+//! waits until its descriptor is ready, then runs again. Each descriptor polls
+//! for the union of its waiting ops' interests. File, directory, tty ioctl,
+//! and GPIO ops block. `reap` returns every result.
 
 use core::num::NonZeroUsize;
 use core::time::Duration;
@@ -14,7 +14,7 @@ use polling::{Event, Events, Poller};
 use super::os::{self, FdClass, Os, OsError, cvt, open_flags, sockaddr};
 use super::{BufRef, Cqe, Errno, IoError, Limits, Op, Out, RawAddr, RawHandle, Sqe, Tables, Token};
 
-/// The longest path `Open` takes, with its NUL.
+/// The longest `Open` path, including the NUL.
 const PATH_MAX: usize = 4096;
 
 enum Res {
@@ -50,7 +50,7 @@ enum Step {
     Park(u32, Need),
 }
 
-/// The readiness backend for Unix development hosts.
+/// The `Os` for Unix development hosts.
 pub struct PollOs {
     poller: Poller,
     events: Events,
@@ -64,7 +64,7 @@ pub struct PollOs {
 }
 
 impl PollOs {
-    /// Dial target `i` gets the handle `RawHandle::new(i, 0)`.
+    /// Creates the backend. Dial target `i` gets the handle `RawHandle::new(i, 0)`.
     pub fn new(limits: &Limits, tables: Tables, dials: &[RawAddr]) -> Result<Self, OsError> {
         let ops = 3 * limits.ops.max(1);
         let mut slots = Vec::with_capacity(dials.len() + 2 * ops);
@@ -103,7 +103,7 @@ impl PollOs {
         RawHandle::new(self.slots.len() as u32 - 1, 0)
     }
 
-    /// Closes a descriptor and cancels the ops parked on it.
+    /// Closes a descriptor and cancels its waiting ops.
     fn release(&mut self, i: u32) {
         let slot = &mut self.slots[i as usize];
         if let Res::Fd {
@@ -174,7 +174,7 @@ impl PollOs {
     }
 
     fn fd_op(&mut self, i: u32, fd: RawFd, class: FdClass, op: Op) -> Step {
-        // SAFETY: `fd` stays open for the call; only `Close` drops it, after use.
+        // SAFETY: `fd` stays open for this call. `Close` drops it after the last use.
         let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
         let r = match op {
             Op::Read { buf, .. } => self.read(fd, buf, op.offset()),
@@ -207,7 +207,7 @@ impl PollOs {
     fn read(&self, fd: RawFd, buf: BufRef, offset: Option<u64>) -> Result<Out, IoError> {
         let raw = self.tables.raw(buf).ok_or(IoError::BadBuf)?;
         let (ptr, cap) = (raw.ptr.as_ptr().cast(), raw.cap as usize);
-        // SAFETY: the slot's `cap` bytes are the system's and no other op uses them.
+        // SAFETY: the slot has `cap` writable bytes, and no other op uses it.
         let n = cvt(unsafe {
             match offset {
                 Some(o) => libc::pread(fd, ptr, cap, o as libc::off_t),
@@ -294,7 +294,7 @@ impl PollOs {
             Ok(s) => s,
             Err(e) => return Step::Done(Err(e)),
         };
-        // SAFETY: plain socket creation.
+        // SAFETY: `socket` takes no pointers.
         let fd = match cvt(unsafe { libc::socket(ss.ss_family.into(), libc::SOCK_STREAM, 0) }) {
             // SAFETY: `socket` returned a new descriptor.
             Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) },
@@ -314,7 +314,7 @@ impl PollOs {
         }
     }
 
-    /// Ends a parked connect: `SO_ERROR` gives its result.
+    /// Finishes a waiting connect by reading `SO_ERROR`.
     fn connected(&mut self, i: u32) -> Result<Out, IoError> {
         let slot = &self.slots[i as usize];
         let Res::Fd { fd, .. } = &slot.res else {
@@ -352,7 +352,7 @@ impl PollOs {
         Ok(Out::UNIT)
     }
 
-    /// Sets a descriptor's interest to the union of its parked ops'.
+    /// Polls a descriptor for the union of its waiting ops' interests.
     fn arm(&mut self, i: u32) {
         let parked = self.parked.iter().filter(|p| p.fd == i);
         let (mut r, mut w) = (false, false);
@@ -382,7 +382,7 @@ impl PollOs {
         }
     }
 
-    /// Retries every op parked on descriptor `i`.
+    /// Runs every op waiting on descriptor `i` again.
     fn retry(&mut self, i: u32) {
         let mut at = 0;
         while at < self.parked.len() {
@@ -449,7 +449,8 @@ const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
 #[cfg(not(target_os = "linux"))]
 const SEND_FLAGS: libc::c_int = 0;
 
-/// Close-on-exec, nonblocking when polled, and no `SIGPIPE` on sockets.
+/// Sets close-on-exec, makes polled classes nonblocking, and disables
+/// `SIGPIPE` on sockets.
 fn prepare(fd: &OwnedFd, class: FdClass) {
     let fd = fd.as_raw_fd();
     // SAFETY: `fcntl` and `setsockopt` on an open descriptor.
@@ -469,7 +470,7 @@ fn prepare(fd: &OwnedFd, class: FdClass) {
     }
 }
 
-/// Host errno numbers paired with Linux's.
+/// Pairs of Linux and host errno numbers.
 pub(crate) const HOST_ERRNOS: [(Errno, i32); 48] = [
     (Errno::EPERM, libc::EPERM),
     (Errno::ENOENT, libc::ENOENT),
@@ -521,7 +522,7 @@ pub(crate) const HOST_ERRNOS: [(Errno, i32); 48] = [
     (Errno::ECANCELED, libc::ECANCELED),
 ];
 
-/// The Linux number for a host errno; `EIO` when it has none.
+/// Converts a host errno to Linux numbering. An unknown errno becomes `EIO`.
 pub(crate) fn errno(host: i32) -> Errno {
     let found = HOST_ERRNOS.iter().find(|(_, h)| *h == host);
     found.map_or(Errno::EIO, |(e, _)| *e)

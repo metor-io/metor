@@ -1,7 +1,8 @@
-//! The op types systems submit and the completions they read back.
+//! IO ops, their completions, the buffers they use, and the backends that run
+//! them.
 //!
-//! An op is plain bytes: it names buffers by slot and handles by index, never
-//! by pointer, so it can be logged, compared, and copied across the guest ABI.
+//! Ops are plain bytes. They refer to buffers by slot and to handles by index,
+//! so they can be logged, compared, and copied across the guest ABI.
 
 mod addr;
 mod buf;

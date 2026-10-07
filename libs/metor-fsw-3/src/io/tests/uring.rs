@@ -10,8 +10,8 @@ fn table(tables: &Tables) -> Rc<BufTable> {
     t
 }
 
-/// Run on Linux: a table frozen at construction is a fixed buffer, and one
-/// added later is not; reads into both land.
+/// A table frozen before `UringOs::new` gets a fixed buffer and a later one
+/// does not. Writes from both succeed.
 #[test]
 fn fixed_buffers_only_for_tables_at_construction() {
     let tables = Tables::new();

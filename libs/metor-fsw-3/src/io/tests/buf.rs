@@ -149,7 +149,7 @@ fn unknown_table_is_none() {
     assert_eq!(tables.set_len(buf, 0), Err(BufError::BadSlot));
 }
 
-/// Run under Miri, with and without `-Zmiri-tree-borrows`.
+/// Also run under Miri, with and without `-Zmiri-tree-borrows`.
 #[test]
 fn raw_pointer_survives_allocs_and_reads() {
     let t = BufTable::new(8);

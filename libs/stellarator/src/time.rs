@@ -3,12 +3,12 @@
 use std::cell::Cell;
 use std::time::Duration;
 
-/// The clock an executor's timer reads.
+/// The clock behind an executor's timer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Clock {
     /// The host's monotonic clock.
     Os,
-    /// This thread's simulated time, which only [`sim_set`] moves.
+    /// This thread's simulated time. Only [`sim_set`] advances it.
     Sim,
 }
 
@@ -16,11 +16,12 @@ thread_local! {
     static SIM_NOW: Cell<u64> = const { Cell::new(0) };
 }
 
-/// The simulated time on this thread, in microseconds.
+/// Returns this thread's simulated time in microseconds.
 pub fn sim_now() -> u64 {
     SIM_NOW.with(Cell::get)
 }
 
+/// Sets this thread's simulated time in microseconds.
 pub fn sim_set(micros: u64) {
     SIM_NOW.with(|t| t.set(micros));
 }
@@ -80,7 +81,6 @@ mod tests {
         drop(task);
     }
 
-    /// Run under Miri: the `EXEC` swap across two executors.
     #[test]
     fn alternating_executors_keep_their_tasks() {
         let (a, b) = (sim(), sim());
@@ -124,7 +124,7 @@ mod tests {
         let task = exec.spawn(async { crate::sleep(Duration::from_millis(3)).await });
         let t = exec.turn();
         assert_eq!(sim_now(), 500);
-        // The wheel reports its slot's deadline, at or before the sleep's.
+        // maitake reports the wheel slot's deadline, which can precede the sleep's.
         let d = t.next_deadline.unwrap();
         assert!(d > Duration::from_millis(2) && d <= Duration::from_millis(3));
         drop(task);
@@ -165,7 +165,6 @@ mod tests {
         drop(task);
     }
 
-    /// Run under Miri: no `Sleep` outlives its timer.
     #[test]
     fn drop_cancels_sleeping_task() {
         let exec = sim();

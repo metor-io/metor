@@ -1,4 +1,4 @@
-//! `PollOs` against real descriptors.
+//! Runs the shared `Os` cases on `PollOs` with real descriptors.
 
 mod os_cases;
 

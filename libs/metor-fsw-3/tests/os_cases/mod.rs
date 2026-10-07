@@ -1,4 +1,4 @@
-//! Cases every `Os` backend passes, driven through a `Reactor`.
+//! Test cases every `Os` backend must pass, run through a `Reactor`.
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
@@ -18,7 +18,8 @@ const LIMITS: Limits = Limits {
 };
 pub const SRC: SourceId = SourceId(0);
 
-/// A reactor with one source over `bufs`: an empty entry is a 256-byte slot.
+/// A reactor with one source whose table holds `bufs`. An empty entry
+/// allocates a 256-byte buffer.
 pub struct Rig {
     pub reactor: Reactor,
     pub table: Rc<BufTable>,
@@ -88,7 +89,7 @@ impl Rig {
         panic!("op {token:?} never completed");
     }
 
-    /// One reap; `token`'s completion if it landed.
+    /// Reaps once and returns `token`'s completion if it finished.
     pub fn poll(&mut self, token: Token) -> Option<Cqe> {
         let mut fresh = Vec::new();
         self.reactor.reap(&mut fresh);
@@ -326,7 +327,7 @@ pub fn gpio_on_pty_fails(b: Backend) {
 
 pub type Case = (&'static str, fn(Backend));
 
-/// Every case, by name.
+/// Every case with its name.
 pub const ALL: [Case; 15] = [
     ("datagram_send_and_recv", datagram_send_and_recv),
     ("file_write_read_at_offsets", file_write_read_at_offsets),
@@ -354,7 +355,7 @@ pub const ALL: [Case; 15] = [
     ("gpio_on_pty_fails", gpio_on_pty_fails),
 ];
 
-/// Runs every case on `backend`, naming each as it starts.
+/// Runs every case on `backend`, printing each name first.
 pub fn run_all(backend: Backend) {
     for (name, case) in ALL {
         println!("case {name}");

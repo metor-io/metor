@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::io::*;
 
-/// Counts allocations on threads that armed it.
+/// Counts allocations on threads that enable counting.
 struct Counting;
 
 thread_local! {
@@ -47,7 +47,7 @@ fn allocations(f: impl FnOnce()) -> usize {
     COUNT.with(|c| c.take()).unwrap_or(0)
 }
 
-/// What a `ScriptOs` saw, and what it answers next.
+/// The ops a `ScriptOs` received and the completions it returns next.
 #[derive(Default)]
 struct Script {
     pushed: Vec<Sqe>,
@@ -56,7 +56,7 @@ struct Script {
     registered: u32,
 }
 
-/// An `Os` that records ops and posts the completions a test queues.
+/// A fake `Os` that records ops and returns the completions a test queues.
 struct ScriptOs(Rc<RefCell<Script>>);
 
 impl Os for ScriptOs {
@@ -118,7 +118,7 @@ impl Rig {
         self.script.borrow().pushed.clone()
     }
 
-    /// Answers the `i`th op the `Os` saw.
+    /// Queues a completion for the `i`th op the `Os` received.
     fn answer(&self, i: usize, out: Out) {
         let mut s = self.script.borrow_mut();
         let token = s.pushed[i].token;
@@ -299,7 +299,7 @@ fn unknown_token_from_os_is_dropped() {
     assert!(rig.reap().is_empty());
 }
 
-/// Run under Miri: the leaked table must never be freed.
+/// Also run under Miri, which checks that the leaked table is never freed.
 #[test]
 fn drop_ends_and_leaks_busy_table() {
     let mut rig = Rig::new(4, 2);
@@ -314,7 +314,7 @@ fn drop_ends_and_leaks_busy_table() {
     assert_eq!(s.pushed.len(), 2);
     assert!(idle.upgrade().is_none());
     let table = busy.upgrade().expect("busy table leaked");
-    // SAFETY: undoes the reactor's leak, so the test ends with no leak.
+    // SAFETY: releases the reactor's leaked reference, so Miri sees no leak.
     unsafe { Rc::decrement_strong_count(Rc::as_ptr(&table)) };
 }
 

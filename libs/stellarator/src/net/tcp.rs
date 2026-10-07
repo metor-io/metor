@@ -88,7 +88,7 @@ impl TcpListener {
         Ok(TcpListener { socket })
     }
 
-    /// Takes a listener that is already bound and listening.
+    /// Wraps a `std` listener that is already bound and listening.
     pub fn adopt(listener: std::net::TcpListener) -> io::Result<TcpListener> {
         let socket = socket2::Socket::from(listener);
         #[cfg(not(target_os = "windows"))]

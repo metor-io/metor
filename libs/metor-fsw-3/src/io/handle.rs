@@ -1,7 +1,7 @@
 use zerocopy::little_endian::U32;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-/// Names one op in a queue; its completion carries the same token.
+/// Identifies an op. Its completion carries the same token.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, IntoBytes, FromBytes, KnownLayout, Immutable, Unaligned,
 )]
@@ -18,7 +18,7 @@ impl Token {
     }
 }
 
-/// An index into a handle table, plus the generation that issued it.
+/// A handle table index plus a generation, which detects stale handles.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, IntoBytes, FromBytes, KnownLayout, Immutable, Unaligned,
 )]
@@ -29,7 +29,7 @@ pub struct RawHandle {
 }
 
 impl RawHandle {
-    /// `openat`'s current directory.
+    /// The process's current directory, for `Open`.
     pub const CWD: Self = Self::new(u32::MAX, 0);
 
     pub const fn new(index: u32, generation: u32) -> Self {
