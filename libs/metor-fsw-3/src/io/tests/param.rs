@@ -129,6 +129,17 @@ fn granted(grants: Vec<Grant>) -> SystemConfig {
     }
 }
 
+/// The serial port every test grant names.
+fn gps1() -> ResourceConfig {
+    ResourceConfig {
+        id: "gps1".into(),
+        backing: Backing::Real(RealKind::Tty {
+            path: "/dev/null".into(),
+            baud: 9600,
+        }),
+    }
+}
+
 fn grant(param: &str) -> Grant {
     Grant {
         param: param.into(),
@@ -151,6 +162,7 @@ fn build(
         .unwrap();
     let config = CoordinatorConfig {
         systems,
+        resources: vec![gps1()],
         ..CoordinatorConfig::default()
     };
     config.build(&table)
@@ -301,6 +313,7 @@ fn greeter_config(adapter: Option<crate::coordinator::Adapter>, cmds: bool) -> C
     });
     CoordinatorConfig {
         systems,
+        resources: vec![gps1()],
         ..CoordinatorConfig::default()
     }
 }
@@ -515,4 +528,118 @@ fn two_makes_share_one_member() {
     assert_eq!(io.borrow().members.len(), 1);
     let (_, other, _c) = bound(closer(), &io, "other");
     assert!(!Rc::ptr_eq(first.table(), other.unwrap().table()));
+}
+
+#[system]
+fn stream_user(link: &Cap<Stream>) {
+    let _ = link;
+}
+
+fn checked(
+    resources: Vec<ResourceConfig>,
+    ty: &str,
+    param: &str,
+    resource: &str,
+) -> Option<BuildError> {
+    let mut table = SystemTable::new();
+    table.register("closer", closer(), || None).unwrap();
+    table
+        .register("stream_user", stream_user(), Default::default)
+        .unwrap();
+    let config = CoordinatorConfig {
+        systems: vec![SystemConfig {
+            grants: vec![Grant {
+                param: param.into(),
+                resource: resource.into(),
+            }],
+            ..SystemConfig::new("sys", ty)
+        }],
+        resources,
+        ..CoordinatorConfig::default()
+    };
+    config.build(&table).err()
+}
+
+fn real(id: &str, kind: RealKind) -> ResourceConfig {
+    ResourceConfig {
+        id: id.into(),
+        backing: Backing::Real(kind),
+    }
+}
+
+#[test]
+fn granted_resource_must_provide_the_interface() {
+    let dir = real(
+        "logs",
+        RealKind::Dir {
+            path: "/tmp".into(),
+        },
+    );
+    assert_eq!(
+        checked(vec![dir], "closer", "uart", "logs"),
+        Some(BuildError::Interface {
+            cap: "sys.uart".into(),
+            resource: "logs".into(),
+            expected: "uart".into(),
+            found: "dir".into(),
+        })
+    );
+}
+
+#[test]
+fn no_kind_provides_a_stream() {
+    let listen = real(
+        "srv",
+        RealKind::TcpListen {
+            addr: "127.0.0.1:0".into(),
+        },
+    );
+    let err = checked(vec![listen], "stream_user", "link", "srv");
+    assert!(matches!(
+        err,
+        Some(BuildError::Interface { ref cap, ref expected, .. }) if cap == "sys.link" && expected == "stream"
+    ));
+}
+
+#[test]
+fn unknown_and_duplicate_resources_fail() {
+    assert_eq!(
+        checked(vec![gps1()], "closer", "uart", "gps9"),
+        Some(BuildError::UnknownResource {
+            system: "sys".into(),
+            param: "uart".into(),
+            resource: "gps9".into(),
+        })
+    );
+    assert_eq!(
+        checked(vec![gps1(), gps1()], "closer", "uart", "gps1"),
+        Some(BuildError::DuplicateResource { id: "gps1".into() })
+    );
+}
+
+#[test]
+fn peer_backing_is_refused() {
+    let peer = ResourceConfig {
+        id: "down".into(),
+        backing: Backing::Peer("plant.down".into()),
+    };
+    assert_eq!(
+        checked(vec![peer], "closer", "uart", "down"),
+        Some(BuildError::Backing {
+            resource: "down".into(),
+            backing: "peer".into(),
+        })
+    );
+}
+
+#[test]
+fn config_without_resources_decodes() {
+    let text = r#"{"clock":{"Wall":{"rate":10.0}},"ring_depth":8,"systems":[]}"#;
+    let config: CoordinatorConfig = serde_json::from_str(text).unwrap();
+    assert!(config.resources.is_empty());
+    assert!(
+        !serde_json::to_string(&config)
+            .unwrap()
+            .contains("resources")
+    );
 }

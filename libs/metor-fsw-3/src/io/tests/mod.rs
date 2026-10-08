@@ -1,6 +1,7 @@
 mod buf;
 mod cap;
 mod harness;
+mod kind;
 mod op;
 #[cfg(all(test, feature = "host"))]
 mod param;

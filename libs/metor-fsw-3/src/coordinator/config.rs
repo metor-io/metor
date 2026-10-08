@@ -8,7 +8,7 @@ use core::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::io::Grant;
+use crate::io::{Grant, ResourceConfig};
 use crate::system::PortDef;
 
 /// The default [`CoordinatorConfig::ring_depth`].
@@ -26,6 +26,9 @@ pub struct CoordinatorConfig {
     #[serde(default)]
     pub namespace: Option<String>,
     pub systems: Vec<SystemConfig>,
+    /// The resources systems are granted, by id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceConfig>,
 }
 
 impl Default for CoordinatorConfig {
@@ -35,6 +38,7 @@ impl Default for CoordinatorConfig {
             ring_depth: DEFAULT_RING_DEPTH,
             namespace: None,
             systems: Vec::new(),
+            resources: Vec::new(),
         }
     }
 }

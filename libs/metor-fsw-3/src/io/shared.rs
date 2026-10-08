@@ -17,6 +17,8 @@ pub struct IoShared {
     pub(crate) tables: Tables,
     /// Every system with a `Cap`, in make order.
     pub(crate) members: Vec<Rc<Member>>,
+    /// The target's resources, in config order.
+    pub(crate) resources: Vec<super::ResourceConfig>,
     /// The reactor and what the io steps keep, once `io_submit` is made.
     #[cfg(all(feature = "host", unix))]
     pub(crate) host: Option<IoHost>,

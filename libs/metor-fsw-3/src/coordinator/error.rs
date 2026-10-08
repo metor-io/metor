@@ -99,6 +99,28 @@ pub enum BuildError {
     #[error("`{system}` grants `{param}`, which is not a `Cap` parameter")]
     UnknownGrant { system: String, param: String },
 
+    #[error("resource `{id}` is created twice")]
+    DuplicateResource { id: String },
+
+    #[error("`{system}` grants `{param}` resource `{resource}`, which the target does not create")]
+    UnknownResource {
+        system: String,
+        param: String,
+        resource: String,
+    },
+
+    /// `cap` is `{system}.{param}`.
+    #[error("`{cap}` takes a `{expected}`, but resource `{resource}` provides `{found}`")]
+    Interface {
+        cap: String,
+        resource: String,
+        expected: String,
+        found: String,
+    },
+
+    #[error("resource `{resource}` has a `{backing}` backing, which this build does not run")]
+    Backing { resource: String, backing: String },
+
     #[error("definition for `{id}`: {source}")]
     Def {
         id: String,

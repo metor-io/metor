@@ -14,8 +14,7 @@ use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 
 use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
-use crate::io::End;
-use crate::io::SharedIo;
+use crate::io::{Backing, End, ResourceConfig, SharedIo};
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
@@ -76,6 +75,7 @@ impl CoordinatorConfig {
     pub fn build(self, table: &SystemTable) -> Result<Coordinator, BuildError> {
         self.clock.validate()?;
         check_channels(&self)?;
+        check_resources(&self.resources)?;
         let mut plan = resolve(&self, table)?;
         check_ids(&plan)?;
         count_readers(&plan.systems, &mut plan.rings);
@@ -86,6 +86,7 @@ impl CoordinatorConfig {
             .collect::<Result<Vec<_>, _>>()?;
         let mut threads = Threads::new();
         let io = SharedIo::default();
+        io.borrow_mut().resources = self.resources.clone();
         let entries = bind_rings(&plan, &rings, &mut threads, &io)?;
 
         Ok(Coordinator {
@@ -121,6 +122,7 @@ fn resolve<'a>(
         let def = planned_def(system, entry, &plan, &index, &records, namespace)?;
         check_port_names(&system.id, &def)?;
         check_grants(system, &def)?;
+        check_interfaces(system, &def, &config.resources)?;
         if def.outputs.iter().any(|p| p.name == STATUS_PORT) {
             return Err(BuildError::ReservedPort {
                 ty: system.ty.clone(),
@@ -349,6 +351,62 @@ fn check_grants(system: &SystemConfig, def: &SystemDef) -> Result<(), BuildError
                 let (system, param) = error(&cap.param);
                 return Err(BuildError::DuplicateGrant { system, param });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Checks that resource ids are unique and that each backing is one this
+/// build runs.
+fn check_resources(resources: &[ResourceConfig]) -> Result<(), BuildError> {
+    for (at, resource) in resources.iter().enumerate() {
+        if resources[..at].iter().any(|r| r.id == resource.id) {
+            let id = resource.id.clone();
+            return Err(BuildError::DuplicateResource { id });
+        }
+        if !matches!(resource.backing, Backing::Real(_)) {
+            return Err(BuildError::Backing {
+                resource: resource.id.clone(),
+                backing: resource.backing.name().into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Checks that each grant names a resource that provides its `Cap`'s
+/// interface.
+fn check_interfaces(
+    system: &SystemConfig,
+    def: &SystemDef,
+    resources: &[ResourceConfig],
+) -> Result<(), BuildError> {
+    for grant in &system.grants {
+        let resource = resources.iter().find(|r| r.id == grant.resource);
+        let Some(resource) = resource else {
+            return Err(BuildError::UnknownResource {
+                system: system.id.clone(),
+                param: grant.param.clone(),
+                resource: grant.resource.clone(),
+            });
+        };
+        let found = match &resource.backing {
+            Backing::Real(kind) => kind.interface(),
+            Backing::Sim(_) | Backing::Peer(_) => continue,
+        };
+        // PANIC Safety: `check_grants` ran first, so every grant names a cap.
+        let cap = def
+            .grants
+            .iter()
+            .find(|g| g.param == grant.param)
+            .expect("a checked grant");
+        if cap.interface != found {
+            return Err(BuildError::Interface {
+                cap: format!("{}.{}", system.id, grant.param),
+                resource: resource.id.clone(),
+                expected: cap.interface.to_string(),
+                found: found.into(),
+            });
         }
     }
     Ok(())

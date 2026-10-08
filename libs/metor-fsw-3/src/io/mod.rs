@@ -14,6 +14,7 @@ mod buf;
 mod cap;
 pub(crate) mod device;
 mod handle;
+mod kind;
 mod model;
 mod op;
 #[cfg(all(feature = "host", unix))]
@@ -44,6 +45,7 @@ pub use cap::{
 };
 pub use device::DeviceSide;
 pub use handle::{RawHandle, Token};
+pub use kind::{Access, Backing, CanFilter, GpioDirection, RealKind, ResourceConfig, SimKind};
 pub use model::{Reply, UartModel, fills, serve_uart};
 pub use op::{GpioOp, Op, OpKind, OpenFlags, Sqe, TtyConfig, TtyOp};
 #[cfg(all(feature = "host", unix))]
