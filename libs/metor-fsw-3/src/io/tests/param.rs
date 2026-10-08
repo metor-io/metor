@@ -379,14 +379,18 @@ fn reset_remakes_an_io_system_over_its_rings() {
     assert_eq!(seen.borrow_mut().drain(..).count(), 1);
 
     // A failed make must release the rings, or the second make cannot bind.
+    // An IO system's reset takes effect on a later cycle, once it is idle.
     made.0.borrow_mut().fail_next = true;
     queue.borrow_mut().push(command(SequenceCommandKind::Stop));
     queue.borrow_mut().push(command(SequenceCommandKind::Reset));
     coordinator.step(Timestamp(1));
-    queue.borrow_mut().push(command(SequenceCommandKind::Reset));
-    queue.borrow_mut().push(command(SequenceCommandKind::Start));
     coordinator.step(Timestamp(2));
+    queue.borrow_mut().push(command(SequenceCommandKind::Reset));
     coordinator.step(Timestamp(3));
+    coordinator.step(Timestamp(4));
+    queue.borrow_mut().push(command(SequenceCommandKind::Start));
+    coordinator.step(Timestamp(5));
+    coordinator.step(Timestamp(6));
     let seen = seen.borrow();
     assert!(seen.iter().all(|s| s.op.kind() == OpKind::Write));
     assert!(!seen.is_empty(), "the remade system submits");

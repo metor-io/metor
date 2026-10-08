@@ -1,5 +1,6 @@
 //! What the io steps and the IO systems of one build share.
 
+use core::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -16,6 +17,25 @@ pub struct IoShared {
     pub(crate) tables: Tables,
     /// Every system with a `Cap`, in make order.
     pub(crate) members: Vec<Rc<Member>>,
+    /// The reactor and what the io steps keep, once `io_submit` is made.
+    #[cfg(all(feature = "host", unix))]
+    pub(crate) host: Option<IoHost>,
+}
+
+/// The io steps' state: the reactor every member's ops go through.
+#[cfg(all(feature = "host", unix))]
+pub(crate) struct IoHost {
+    pub(crate) reactor: super::Reactor,
+}
+
+/// Whether a member is waiting for its old ops to finish before a remake.
+#[derive(Default)]
+pub(crate) struct Quiesce {
+    pub(crate) active: Cell<bool>,
+    /// The member's reactor source, once `io_submit` is made.
+    pub(crate) src: Cell<Option<u16>>,
+    /// `io_submit` has drained the member's SQ since `begin`.
+    pub(crate) drained: Cell<bool>,
 }
 
 /// `IoShared`, shared by the build, the channel adapter, and the io steps.
@@ -25,6 +45,7 @@ pub type SharedIo = Rc<RefCell<IoShared>>;
 pub(crate) struct Member {
     pub(crate) id: String,
     pub(crate) table: Rc<Table>,
+    pub(crate) quiesce: Quiesce,
 }
 
 impl IoShared {
@@ -42,8 +63,43 @@ impl IoShared {
         let member = Rc::new(Member {
             id: id.to_string(),
             table,
+            quiesce: Quiesce::default(),
         });
         self.members.push(member.clone());
         Ok(member)
+    }
+}
+
+impl IoShared {
+    pub(crate) fn find(&self, id: &str) -> Option<Rc<Member>> {
+        self.members.iter().find(|m| m.id == id).cloned()
+    }
+
+    /// Starts quiescing `m`: cancels its ops in flight.
+    pub(crate) fn begin(&mut self, m: &Member) {
+        m.quiesce.active.set(true);
+        m.quiesce.drained.set(false);
+        #[cfg(all(feature = "host", unix))]
+        if let (Some(host), Some(src)) = (&mut self.host, m.quiesce.src.get()) {
+            host.reactor.cancel_all(super::SourceId(src));
+        }
+    }
+
+    /// Whether `m` has nothing left in flight: always, before `io_submit`
+    /// is made; after, once its SQ is drained and the reactor holds none of
+    /// its ops.
+    pub(crate) fn idle(&self, m: &Member) -> bool {
+        #[cfg(all(feature = "host", unix))]
+        if let (Some(host), Some(src)) = (&self.host, m.quiesce.src.get()) {
+            let none = host.reactor.in_flight(super::SourceId(src)) == 0;
+            return m.quiesce.drained.get() && none;
+        }
+        let _ = m;
+        true
+    }
+
+    pub(crate) fn end(&self, m: &Member) {
+        m.quiesce.active.set(false);
+        m.quiesce.drained.set(false);
     }
 }

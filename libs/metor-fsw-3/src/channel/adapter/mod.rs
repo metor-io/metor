@@ -102,6 +102,7 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
             end_reason: None,
             reported_end_reason: None,
             loaded: None,
+            deferred: None,
             recipe,
             threads,
             abort,
@@ -197,11 +198,19 @@ struct Core {
     reported_end_reason: Option<EndReason>,
     /// The last name a `Load` accepted. A reset loads it again.
     loaded: Option<String>,
+    /// A reset or load waiting for the system's ops in flight to finish.
+    deferred: Option<Deferred>,
     recipe: SystemRecipe,
     threads: Threads,
     abort: Option<Output<AbortRequest>>,
     events: Output<SequenceChannelEvent>,
     status: Output<ChannelStatus>,
+}
+
+/// What a quiescing channel does once its system has nothing in flight.
+enum Deferred {
+    Restart,
+    Load(String),
 }
 
 /// The longest reason, in bytes, that an event carries.
@@ -236,6 +245,7 @@ impl Core {
             run: self.run,
             ended: self.ended().is_some(),
             abortable: self.abort.is_some(),
+            quiescing: self.deferred.is_some(),
         }
     }
 
@@ -251,7 +261,7 @@ impl Core {
             }
             SequenceCommandKind::Abort => self.abort(),
             SequenceCommandKind::Reset => self.reset(),
-            SequenceCommandKind::Load { name } => self.load(name),
+            SequenceCommandKind::Load { name } => self.defer_load(name),
         }
     }
 
@@ -268,8 +278,21 @@ impl Core {
         }
     }
 
+    /// Resets the system. An IO system is dropped now and made again once its
+    /// ops in flight finish.
     fn reset(&mut self) -> SequenceEventKind {
         self.run = RunState::Stopped;
+        let Some(member) = self.member() else {
+            return self.restarted();
+        };
+        self.inner = None;
+        self.end_reason = None;
+        self.recipe.io.borrow_mut().begin(&member);
+        self.deferred = Some(Deferred::Restart);
+        quiescing()
+    }
+
+    fn restarted(&mut self) -> SequenceEventKind {
         match self.restart() {
             Ok(()) => SequenceEventKind::Loaded {
                 name: self.loaded_name(),
@@ -289,6 +312,37 @@ impl Core {
             (Some(inner), Some(name)) => reload(inner, name),
             _ => Ok(()),
         }
+    }
+
+    /// Loads `name`. On an IO system, the load waits for its ops in flight.
+    fn defer_load(&mut self, name: String) -> SequenceEventKind {
+        let (Some(member), Some(_)) = (self.member(), &self.inner) else {
+            return self.load(name);
+        };
+        self.recipe.io.borrow_mut().begin(&member);
+        self.deferred = Some(Deferred::Load(name));
+        quiescing()
+    }
+
+    /// The system's IO member, if it has one.
+    fn member(&self) -> Option<std::rc::Rc<crate::io::shared::Member>> {
+        self.recipe.io.borrow().find(&self.recipe.id)
+    }
+
+    /// Runs the deferred reset or load once the system is idle.
+    fn settle(&mut self) {
+        if let Some(member) = self.member() {
+            if !self.recipe.io.borrow().idle(&member) {
+                return;
+            }
+            self.recipe.io.borrow().end(&member);
+        }
+        let event = match self.deferred.take() {
+            Some(Deferred::Restart) => self.restarted(),
+            Some(Deferred::Load(name)) => self.load(name),
+            None => return,
+        };
+        self.emit(event);
     }
 
     fn load(&mut self, name: String) -> SequenceEventKind {
@@ -338,7 +392,9 @@ impl Core {
     }
 
     fn step(&mut self, now: Timestamp) {
-        if self.run == RunState::Running
+        if self.deferred.is_some() {
+            self.settle();
+        } else if self.run == RunState::Running
             && self.end_reason.is_none()
             && catch_step(&mut self.inner, now) == Stepped::Unwound
         {
@@ -373,12 +429,19 @@ impl Core {
         let occupant = self.inner.as_ref().and_then(|inner| inner.occupant());
         let status = ChannelStatus {
             timestamp: now,
-            state: ChannelState::of(self.run, self.ended()).code(),
+            state: self.channel_state().code(),
             loaded: occupant.map_or(u32::MAX, |o| o.index),
             artifact: occupant.map_or(FrameStr::EMPTY, |o| o.artifact),
             hash: occupant.map_or(FrameBytes::ZERO, |o| o.hash),
         };
         let _ = self.status.write(&status);
+    }
+
+    fn channel_state(&self) -> ChannelState {
+        match self.deferred {
+            Some(_) => ChannelState::Quiescing,
+            None => ChannelState::of(self.run, self.ended()),
+        }
     }
 
     fn emit(&self, kind: SequenceEventKind) {
@@ -397,6 +460,12 @@ fn reload(inner: &mut Box<dyn Step>, name: &str) -> Result<(), String> {
     crate::panic::catch(|| inner.load(name))
         .ok_or_else(|| "the load panicked".to_string())?
         .map_err(|e| e.to_string())
+}
+
+fn quiescing() -> SequenceEventKind {
+    SequenceEventKind::Progress {
+        detail: "quiescing".into(),
+    }
 }
 
 fn refused(reason: String) -> SequenceEventKind {

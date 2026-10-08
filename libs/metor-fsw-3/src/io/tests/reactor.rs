@@ -314,3 +314,78 @@ fn repeated_cancel_all_cancels_each_op_once() {
         .count();
     assert_eq!(cancels, 2);
 }
+
+/// An `IoShared` whose reactor runs over a `ScriptOs`, with one member.
+fn quiesce_rig() -> (
+    crate::io::IoShared,
+    Rc<crate::io::shared::Member>,
+    Rc<RefCell<Script>>,
+) {
+    let mut shared = crate::io::IoShared::default();
+    let member = shared.member("gps").unwrap();
+    member.table.bufs.freeze();
+    let script = Rc::new(RefCell::new(Script::default()));
+    let os = Box::new(ScriptOs(script.clone()));
+    let mut reactor = Reactor::new(os, Limits { ops: 8, sources: 1 });
+    let src = reactor.source(member.table.bufs.clone());
+    member.quiesce.src.set(Some(src.0));
+    shared.host = Some(crate::io::shared::IoHost { reactor });
+    (shared, member, script)
+}
+
+fn host(s: &mut crate::io::IoShared) -> &mut Reactor {
+    &mut s.host.as_mut().unwrap().reactor
+}
+
+#[test]
+fn quiesce_waits_for_the_drain_and_the_cancels() {
+    let (mut shared, member, script) = quiesce_rig();
+    host(&mut shared).push(
+        SourceId(0),
+        Sqe::new(Token::new(1), RawHandle::new(0, 0), Op::CLOSE),
+    );
+    host(&mut shared).submit();
+    shared.begin(&member);
+    assert!(member.quiesce.active.get());
+    host(&mut shared).submit();
+    let pushed = script.borrow().pushed.clone();
+    assert_eq!(pushed[1].op, Op::cancel(pushed[0].token));
+    assert!(!shared.idle(&member), "not drained yet");
+    member.quiesce.drained.set(true);
+    assert!(!shared.idle(&member), "the op is still in flight");
+    for sqe in &pushed {
+        script
+            .borrow_mut()
+            .answers
+            .push(Cqe::err(sqe.token, IoError::Canceled));
+    }
+    host(&mut shared).reap(&mut Vec::new());
+    assert!(shared.idle(&member));
+    shared.end(&member);
+    assert!(!member.quiesce.active.get() && !member.quiesce.drained.get());
+}
+
+#[test]
+fn quiesce_with_no_reactor_is_idle_at_once() {
+    let mut shared = crate::io::IoShared::default();
+    let member = shared.member("gps").unwrap();
+    shared.begin(&member);
+    assert!(shared.idle(&member));
+}
+
+#[test]
+fn unanswered_cancel_keeps_the_member_busy() {
+    let (mut shared, member, _script) = quiesce_rig();
+    let reactor = &mut shared.host.as_mut().unwrap().reactor;
+    reactor.push(
+        SourceId(0),
+        Sqe::new(Token::new(1), RawHandle::new(0, 0), Op::CLOSE),
+    );
+    reactor.submit();
+    shared.begin(&member);
+    member.quiesce.drained.set(true);
+    for _ in 0..10 {
+        shared.host.as_mut().unwrap().reactor.reap(&mut Vec::new());
+        assert!(!shared.idle(&member));
+    }
+}

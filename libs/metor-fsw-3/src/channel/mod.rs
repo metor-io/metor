@@ -98,6 +98,9 @@ pub enum ChannelState {
     Failed,
     Panicked,
     Unloaded,
+    /// Waiting for the system's ops in flight to finish before a reset or
+    /// load takes effect.
+    Quiescing,
 }
 
 impl ChannelState {
