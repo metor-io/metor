@@ -70,6 +70,8 @@ pub enum BufError {
     BadSlot,
     #[error("needs {need} bytes, {free} free")]
     NoSpace { need: usize, free: usize },
+    #[error("a slot is still held")]
+    Busy,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -231,6 +233,21 @@ impl BufTable {
             Arena::Frozen(p) => Some(p),
             Arena::Making(_) => None,
         }
+    }
+
+    /// Clears the directory, so the next allocations start again at the first
+    /// data byte. The arena keeps its address and capacity. Fails with
+    /// `Busy` while any slot is held.
+    pub fn rewind(&self) -> Result<(), BufError> {
+        let mut arena = self.arena.borrow_mut();
+        let dir = arena.dir(self.slots);
+        if dir.entries.iter().any(|e| e.held.get() != 0) {
+            return Err(BufError::Busy);
+        }
+        dir.entries.iter_mut().for_each(|e| e.held = U32::ZERO);
+        dir.header.used = U32::ZERO;
+        dir.header.top = U32::new(dir_len(self.slots) as u32);
+        Ok(())
     }
 
     /// Frees a slot. Its bytes stay unused until a rewind.

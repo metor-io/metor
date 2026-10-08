@@ -597,6 +597,7 @@ fn test_async_adapter_relay() {
         inputs: vec![vec![&imu]],
         outputs: vec![&nav, &log],
         threads: &mut threads,
+        io: &crate::io::SharedIo::default(),
     })
     .expect("no params");
 
@@ -770,6 +771,7 @@ fn flooded(a: usize, b: usize, cycles: i64) -> Vec<LogEvent> {
         inputs: Vec::new(),
         outputs: vec![&ring_a, &ring_b, &log],
         threads: &mut threads,
+        io: &crate::io::SharedIo::default(),
     })
     .expect("no params");
     let mut seen = Vec::new();

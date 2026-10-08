@@ -9,13 +9,15 @@ use metor_proto_wkt::LogEvent;
 
 use metor_fsw_3_ring::{NoWake, WakeSink};
 
+use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::io::device::DeviceSide;
 use crate::io::queue::{Io, Table};
-use crate::io::{Cqe, Sqe, Tables};
+use crate::io::{Cqe, SharedIo, Sqe, Tables};
 use crate::log::LogPort;
 use crate::port::{Input, Output, Samplers};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
+use std::rc::Rc;
 
 use super::Ports;
 use super::param::{Bindings, Defs, Param, Views, Writers};
@@ -96,16 +98,24 @@ impl<S: Ports> SystemOutputs for OutSet<S> {
     }
 }
 
+/// A fn system's bound ports, and its queue if it has one.
+pub(crate) type Bound<S> = (InSet<S>, OutSet<S>, Option<Io>);
+
 /// Binds a fn system's ports, including its queue pair and device ends.
 ///
 /// The IO ports come after the parameters' own (see `Defs::append_io`).
-/// `tables` is what each `DeviceSide` resolves drivers' buffers through.
+/// A system with a `Cap` takes its member's table from `io`, and each
+/// `DeviceSide` resolves drivers' buffers through `io`'s tables.
 pub(crate) fn bind<S: Ports>(
     mut inputs: Vec<InputBinding>,
     mut outputs: Vec<OutputBinding>,
-    tables: &Tables,
-) -> (InSet<S>, OutSet<S>, Option<Io>) {
+    io: &SharedIo,
+    id: &str,
+) -> Result<Bound<S>, ParamError> {
     let defs = Defs::declared::<S>();
+    let member = defs.io.then(|| io.borrow_mut().member(id)).transpose()?;
+    let table = member.map(|m| m.table.clone());
+    let tables = io.borrow().tables.clone();
     let io_ports = defs.io_ports();
     // PANIC Safety: build binds one entry per port of the definition these
     // `Defs` describe, with `log` last among the outputs.
@@ -114,28 +124,28 @@ pub(crate) fn bind<S: Ports>(
     let io_out = outputs.split_off(outputs.len() - io_ports);
     outputs.push(log);
     let dropped = Arc::<AtomicU32>::default();
-    let (io, devices) = io_ends(defs.io, io_in, io_out, tables, &dropped);
+    let (io, devices) = io_ends(table, io_in, io_out, &tables, &dropped);
     let ins = bind_inputs::<S, NoWake>(inputs, defs.inputs.len() - io_ports);
     let mut writers = writers(outputs, defs.outputs.len() - io_ports + 1, dropped);
     writers.io = io.clone();
     writers.devices = devices;
-    (ins, bind_outputs::<S>(writers), io)
+    Ok((ins, bind_outputs::<S>(writers), io))
 }
 
 /// Builds the queue pair, if any, then one device end per remaining pair of
 /// IO ports.
 fn io_ends(
-    has_queue: bool,
+    table: Option<Rc<Table>>,
     inputs: Vec<InputBinding>,
     outputs: Vec<OutputBinding>,
     tables: &Tables,
     dropped: &Arc<AtomicU32>,
 ) -> (Option<Io>, VecDeque<DeviceSide<crate::io::device::Erased>>) {
     let mut ports = inputs.into_iter().zip(outputs);
-    let io = has_queue
-        .then(|| ports.next())
-        .flatten()
-        .map(|(cq, sq)| Io::new(Output::new(sq.writer), Input::new(cq.views), Table::new()));
+    let io = table.and_then(|table| {
+        let (cq, sq) = ports.next()?;
+        Some(Io::new(Output::new(sq.writer), Input::new(cq.views), table))
+    });
     let devices = ports
         .map(|(req, rep)| {
             let replies = Output::<Cqe>::counting(rep.writer, dropped.clone());

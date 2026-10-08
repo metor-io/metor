@@ -12,7 +12,7 @@ use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, SystemFn};
-use crate::io::Tables;
+use crate::io::SharedIo;
 use crate::sequence::SequenceFn;
 use crate::system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
@@ -37,6 +37,8 @@ pub struct MakeCx<'a> {
     pub inputs: Vec<Vec<&'a RingBuffer>>,
     pub outputs: Vec<&'a RingBuffer>,
     pub threads: &'a mut Threads,
+    /// What the build's IO systems and io steps share.
+    pub io: &'a SharedIo,
 }
 
 impl MakeCx<'_> {
@@ -340,7 +342,7 @@ fn fn_entry<S: SystemFn, M, C: Ctor<S::State, M> + 'static>(
         make: Arc::new(move |cx| {
             refuse_thread(cx.adapter)?;
             let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
-            let (inputs, outputs, io) = fn_system::bind::<S>(views, writers, &Tables::new());
+            let (inputs, outputs, io) = fn_system::bind::<S>(views, writers, cx.io, cx.id)?;
             let state = fn_system::make_state(&ctor, cx.id, cx.params, io.as_ref())?;
             Ok(Box::new(Runner {
                 system: FnSystem::default(),
@@ -821,6 +823,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             threads: &mut threads,
+            io: &crate::io::SharedIo::default(),
         })
         .expect("no params");
         let started = std::time::Instant::now();

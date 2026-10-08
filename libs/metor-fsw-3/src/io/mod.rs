@@ -27,6 +27,7 @@ pub(crate) mod queue;
 #[cfg(all(feature = "host", unix))]
 mod reactor;
 mod record;
+pub(crate) mod shared;
 mod slot;
 pub mod test;
 #[cfg(all(feature = "host", target_os = "linux"))]
@@ -56,6 +57,7 @@ pub use poll::PollOs;
 pub use queue::Io;
 #[cfg(all(feature = "host", unix))]
 pub use reactor::{Limits, Reactor, SourceId};
+pub use shared::{IoShared, SharedIo};
 pub use slot::{Buf, IoInit, Slot};
 #[cfg(all(feature = "host", target_os = "linux"))]
 pub use uring::UringOs;

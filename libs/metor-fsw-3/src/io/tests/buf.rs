@@ -177,3 +177,44 @@ fn drop_with_held_slots_frees_once() {
     unfrozen.alloc(4).unwrap();
     drop(unfrozen);
 }
+
+#[test]
+fn rewind_gives_the_same_slots_and_addresses() {
+    let t = BufTable::new(4);
+    let (a, b) = (t.alloc(8).unwrap(), t.alloc_from(b"xyz").unwrap());
+    t.freeze();
+    let (pa, pb) = (t.raw(a).unwrap().ptr, t.raw(b).unwrap().ptr);
+    t.release(a);
+    t.release(b);
+    t.rewind().unwrap();
+    assert_eq!((t.alloc(8).unwrap(), t.alloc(3).unwrap()), (a, b));
+    assert_eq!((t.raw(a).unwrap().ptr, t.raw(b).unwrap().ptr), (pa, pb));
+}
+
+#[test]
+fn smaller_round_fits_after_rewind() {
+    let t = BufTable::new(4);
+    let a = t.alloc(16).unwrap();
+    t.freeze();
+    t.release(a);
+    t.rewind().unwrap();
+    t.alloc(4).unwrap();
+    t.alloc(12).unwrap();
+}
+
+#[test]
+fn rewind_with_a_held_slot_is_busy() {
+    let t = BufTable::new(2);
+    t.alloc(4).unwrap();
+    assert_eq!(t.rewind(), Err(BufError::Busy));
+}
+
+#[test]
+fn past_capacity_after_rewind_is_no_space() {
+    let t = BufTable::new(2);
+    let a = t.alloc(16).unwrap();
+    t.freeze();
+    t.release(a);
+    t.rewind().unwrap();
+    assert_eq!(t.alloc(20), Err(BufError::NoSpace { need: 20, free: 16 }));
+}

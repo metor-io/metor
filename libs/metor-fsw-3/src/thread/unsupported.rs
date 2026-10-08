@@ -50,6 +50,7 @@ mod tests {
             inputs: vec![vec![&imu]],
             outputs: vec![&nav, &log],
             threads: &mut Threads::new(),
+            io: &crate::io::SharedIo::default(),
         });
         assert_eq!(
             refused.err(),

@@ -97,6 +97,8 @@ thread_local! {
     static TABLE: OnceCell<SystemTable> = const { OnceCell::new() };
     /// The threads this pack runs its own async systems on.
     static THREADS: RefCell<Threads> = RefCell::new(Threads::new());
+    /// What the pack's own IO systems share.
+    static IO: crate::io::SharedIo = crate::io::SharedIo::default();
     static ERROR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -295,6 +297,7 @@ unsafe fn make(
         // A pack's async systems run on threads inside the pack. The host's
         // config picks which thread.
         THREADS.with_borrow_mut(|threads| {
+            let io = IO.with(Clone::clone);
             (entry.make)(MakeCx {
                 id: &instance.id,
                 adapter: instance.adapter.as_ref(),
@@ -303,6 +306,7 @@ unsafe fn make(
                 inputs: views,
                 outputs: writers,
                 threads,
+                io: &io,
             })
         })
     })

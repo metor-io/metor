@@ -8,6 +8,7 @@ use crate::async_system::Stop;
 use crate::coordinator::{BuildError, CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{AsyncSystemFn, FnSystem, SystemFn};
+use crate::io::SharedIo;
 use crate::io::*;
 use crate::port::{DynInputs, Input, Output};
 use crate::system::{PortDef, System, SystemDef};
@@ -435,9 +436,79 @@ fn failed_make_frees_its_ring_slots() {
             inputs: inputs.iter().map(|r| vec![r]).collect(),
             outputs: outputs.iter().collect(),
             threads: &mut crate::thread::Threads::new(),
+            io: &crate::io::SharedIo::default(),
         })
     };
     made.0.borrow_mut().fail_next = true;
     assert!(make().is_err());
     assert!(make().is_ok(), "the failed make left its ring slots free");
+}
+
+/// Binds `S` over fresh rings through `io`, as system `id`.
+fn bound<S: SystemFn>(
+    _: S,
+    io: &SharedIo,
+    id: &str,
+) -> (
+    crate::fn_system::OutSet<S>,
+    Option<Io>,
+    Vec<metor_fsw_3_ring::RingBuffer>,
+) {
+    use crate::tests::utils::ring_of;
+    let def = def_of_fn::<S>();
+    let ring = |p: &PortDef| ring_of(p.max_len, p.depth, 1);
+    let rings: Vec<_> = def.inputs.iter().chain(&def.outputs).map(ring).collect();
+    let (ins, outs) = rings.split_at(def.inputs.len());
+    let inputs = ins.iter().map(|r| vec![r]).collect();
+    let (views, writers) = crate::coordinator::bindings(&def, inputs, outs.iter().collect());
+    let (_ins, outs, io) = crate::fn_system::bind::<S>(views, writers, io, id).unwrap();
+    (outs, io, rings)
+}
+
+fn def_of_fn<S: SystemFn>() -> SystemDef {
+    <FnSystem<S> as System>::def(&DefCx::empty()).expect("a definition")
+}
+
+/// A model with one `DeviceSide`, with a nameable parameter tuple.
+struct Serve;
+
+impl crate::fn_system::Ports for Serve {
+    type State = ();
+    type Params = (DeviceSide<Uart>,);
+    const NAME: &'static str = "serve";
+    const NAMES: &'static [&'static str] = &["dev"];
+}
+
+impl SystemFn for Serve {
+    fn call(
+        _: &mut (),
+        _: <Self::Params as crate::fn_system::Param>::Item<'_, metor_fsw_3_ring::NoWake>,
+    ) {
+    }
+}
+
+#[test]
+fn device_side_resolves_tables_added_later_once_frozen() {
+    let io = SharedIo::default();
+    let (mut outs, _, _rings) = bound(Serve, &io, "dev");
+    let member = io.borrow_mut().member("drv").unwrap();
+    let slot = member.table.alloc_from(b"abc").unwrap();
+    let mut buf = BufRef::new(slot);
+    buf.stamp(member.table.bufs.id().unwrap());
+    let dev = &mut outs.outs.0;
+    assert_eq!(dev.bytes(buf), Err(IoError::BadBuf));
+    member.table.bufs.freeze();
+    assert_eq!(dev.bytes(buf).unwrap(), b"abc");
+}
+
+#[test]
+fn two_makes_share_one_member() {
+    let io = SharedIo::default();
+    let (_, first, _a) = bound(closer(), &io, "closer");
+    let (_, second, _b) = bound(closer(), &io, "closer");
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert!(Rc::ptr_eq(first.table(), second.table()));
+    assert_eq!(io.borrow().members.len(), 1);
+    let (_, other, _c) = bound(closer(), &io, "other");
+    assert!(!Rc::ptr_eq(first.table(), other.unwrap().table()));
 }

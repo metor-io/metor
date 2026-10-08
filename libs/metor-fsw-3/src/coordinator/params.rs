@@ -58,6 +58,8 @@ pub enum ParamError {
     Wasm(String),
     #[error("IO memory: {reason}")]
     IoMemory { need: usize, reason: String },
+    #[error("`{system}`: its old IO buffers are still held")]
+    IoBusy { system: String },
 }
 
 #[cfg(test)]

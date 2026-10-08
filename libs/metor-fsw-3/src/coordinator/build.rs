@@ -15,6 +15,7 @@ use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
 use crate::io::End;
+use crate::io::SharedIo;
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
@@ -84,7 +85,8 @@ impl CoordinatorConfig {
             .map(|spec| allocate_ring(spec, self.ring_depth))
             .collect::<Result<Vec<_>, _>>()?;
         let mut threads = Threads::new();
-        let entries = bind_rings(&plan, &rings, &mut threads)?;
+        let io = SharedIo::default();
+        let entries = bind_rings(&plan, &rings, &mut threads, &io)?;
 
         Ok(Coordinator {
             entries,
@@ -484,6 +486,7 @@ fn bind_rings(
     plan: &Plan<'_>,
     rings: &[RingBuffer],
     threads: &mut Threads,
+    io: &SharedIo,
 ) -> Result<Vec<Entry>, BuildError> {
     let mut entries = Vec::with_capacity(plan.systems.len());
     for system in &plan.systems {
@@ -503,6 +506,7 @@ fn bind_rings(
             inputs,
             outputs,
             threads,
+            io,
         };
         let step = match system.adapter {
             Some(Adapter::Channel(_)) => crate::channel::make(&system.entry.make, cx),

@@ -16,6 +16,7 @@ use crate::coordinator::{
     Adapter, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, Stepped, catch_step,
 };
 use crate::def::DefCx;
+use crate::io::SharedIo;
 use crate::port::{Input, Output, ring_capacity};
 use crate::record::Record;
 use crate::system::{PortDef, SystemDef};
@@ -88,6 +89,7 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
         params: cx.params.0.clone(),
         inputs,
         outputs: outputs.into_iter().cloned().collect(),
+        io: cx.io.clone(),
     };
     let mut threads = Threads::new();
     let inner = recipe.make(&mut threads)?;
@@ -153,6 +155,7 @@ struct SystemRecipe {
     params: serde_json::Value,
     inputs: Vec<Vec<RingBuffer>>,
     outputs: Vec<RingBuffer>,
+    io: SharedIo,
 }
 
 impl SystemRecipe {
@@ -169,6 +172,7 @@ impl SystemRecipe {
                 .collect(),
             outputs: self.outputs.iter().collect(),
             threads,
+            io: &self.io,
         })
     }
 }
