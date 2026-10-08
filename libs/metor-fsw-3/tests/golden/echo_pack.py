@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
-from metor_config import Item, OutPort, Pack, Record, Sources, System
+from metor_config import Item, OutPort, Pack, Record, ResourceHandle, Sources, System
 
 PACK = Pack(
     id="echo",
@@ -18,18 +18,6 @@ PACK = Pack(
 
 class GpsFix(Record):
     _name = "gps_fix"
-    _kind = "msg"
-    _pack = PACK
-
-
-class IoCqe(Record):
-    _name = "io_cqe"
-    _kind = "msg"
-    _pack = PACK
-
-
-class IoSqe(Record):
-    _name = "io_sqe"
     _kind = "msg"
     _pack = PACK
 
@@ -228,13 +216,13 @@ class Gps(System):
 
     _pack = PACK
     _ty = "gps"
-    _ports = {"fix": GpsFix, "io_sq": IoSqe, "log": LogEvent, "status": SystemStatus}
+    _ports = {"fix": GpsFix, "log": LogEvent, "status": SystemStatus}
+    _caps = {"uart": "uart"}
 
-    def __init__(self, *, io_cq: Sources[IoCqe] = ()) -> None:
-        super().__init__({"io_cq": io_cq}, {})
+    def __init__(self, *, uart: ResourceHandle) -> None:
+        super().__init__({}, {}, grants={"uart": uart})
 
     fix: OutPort[GpsFix]
-    io_sq: OutPort[IoSqe]
     log: OutPort[LogEvent]
     status: OutPort[SystemStatus]
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 {% endif %}from pathlib import Path
 {% if takes_ports %}from typing import Sequence
 {% endif %}
-from metor_config import {% if takes_ports %}Item, {% endif %}OutPort, Pack, Record, Sources, System
+from metor_config import {% if takes_ports %}Item, {% endif %}OutPort, Pack, Record, {% if takes_caps %}ResourceHandle, {% endif %}Sources, System
 
 PACK = Pack(
     id={{ pack_id | python_string }},
@@ -45,19 +45,24 @@ class {{ system.name }}(System):
 {% if system.takes_inputs %}    _takes_inputs = True
 {% endif %}{% if system.takes_outputs %}    _takes_outputs = True
 {% endif %}    _ports = {{ '{' }}{% for port in system.ports %}{{ port.name | python_string }}: {{ port.record }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
-
+{% if system.caps %}    _caps = {{ '{' }}{% for cap in system.caps %}{{ cap.name | python_string }}: {{ cap.interface | python_string }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
+{% endif %}
     def __init__(self
-        {%- if system.inputs or system.params or system.takes_inputs or system.takes_outputs %}, *{% endif %}
+        {%- if system.inputs or system.params or system.caps or system.takes_inputs or system.takes_outputs %}, *{% endif %}
         {%- if system.takes_inputs %}, items: Sequence[Item] = (){% endif %}
         {%- if system.takes_outputs %}, records: Sequence[type[Record]] = (){% endif %}
         {%- for port in system.inputs %}, {{ port.name }}: Sources[{{ port.record }}] = (){% endfor %}
+        {%- for cap in system.caps %}, {{ cap.name }}: ResourceHandle{% endfor %}
         {%- for field in system.params %}, {{ field.name }}: {{ field.annotation }}{{ field.default }}{% endfor %}) -> None:
 {% if system.args_doc %}        {{ system.args_doc | docstring(8) }}
 {% endif %}        super().__init__({
             {%- for port in system.inputs %}{{ port.name | python_string }}: {{ port.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
         }, {
             {%- for field in system.params %}{{ field.name | python_string }}: {{ field.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
-        }{% if system.takes_inputs %}, items=items{% endif %}{% if system.takes_outputs %}, records=records{% endif %})
+        }{% if system.takes_inputs %}, items=items{% endif %}{% if system.takes_outputs %}, records=records{% endif %}
+        {%- if system.caps %}, grants={
+            {%- for cap in system.caps %}{{ cap.name | python_string }}: {{ cap.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
+        }{% endif %})
 
 {% for port in system.ports %}    {{ port.name }}: OutPort[{{ port.record }}]
 {% endfor %}{% endfor %}
