@@ -227,6 +227,24 @@ class Gps(System):
     status: OutPort[SystemStatus]
 
 
+class UntilFix(System):
+    "Completes on the first fix, or fails after `timeout_s` of cycle time."
+
+    _pack = PACK
+    _ty = "until_fix"
+    _ports = {"log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, fix: Sources[GpsFix] = (), timeout_s: float) -> None:
+        """
+        Args:
+            timeout_s: How long to wait for a fix, in seconds of cycle time.
+        """
+        super().__init__({"fix": fix}, {"timeout_s": timeout_s})
+
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
 class CountUp(System):
     "Pings one, two, and three on successive cycles, then completes."
 

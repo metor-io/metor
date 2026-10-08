@@ -329,6 +329,9 @@ pub fn pack() -> SystemTable {
         .register("gps", gps::gps(), gps::GpsState::new)
         .expect("valid records");
     table
+        .register_sequence("until_fix", gps::until_fix(), gps::UntilFix::new)
+        .expect("valid records");
+    table
         .register_sequence("count_up", count_up(), Default::default)
         .expect("valid records");
     table
