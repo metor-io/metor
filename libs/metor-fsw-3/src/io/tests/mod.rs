@@ -10,6 +10,8 @@ mod poll;
 mod queue;
 #[cfg(all(test, feature = "host", unix))]
 mod reactor;
+#[cfg(all(test, feature = "host", unix))]
+mod sim;
 mod slot;
 #[cfg(all(test, feature = "host", unix))]
 pub(crate) mod system;

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, TypeVar, cast
 
 from ._config import ConfigError, check_abi, simulated_clock, wall_clock
-from ._io import Kind, ResourceHandle, ResourceStatus
+from ._io import Kind, ResourceHandle, ResourceStatus, SimKind
 from ._model import CHANNEL_PORTS, Loop, OutPort, Pack, Record, Source, System, _json, _sources
 
 IO_SUBMIT = "io_submit"
@@ -159,6 +159,11 @@ class Target:
                 raise ConfigError(f"`{name}` has no `Cap` or `DeviceSide` parameter `{param}`")
             if not isinstance(grant, ResourceHandle) or grant.target is not self:
                 raise ConfigError(f"`{name}.{param}` takes a resource of this target, got {grant!r}")
+            if param in type(system)._devices and not isinstance(grant.kind, SimKind):
+                raise ConfigError(
+                    f"`{name}.{param}` serves a device end, so it takes a sim resource, "
+                    f"but `{grant.name}` is real"
+                )
             if grant.kind.interface != caps[param]:
                 raise ConfigError(
                     f"`{name}.{param}` takes a `{caps[param]}`, but `{grant.name}` "
@@ -219,6 +224,7 @@ class Target:
         with no library is built into the host, so it is not listed.
         """
         self._check_commands()
+        self._check_sims()
         coordinator: dict[str, Any] = {
             "clock": self._clock(),
             "ring_depth": self.ring_depth,
@@ -260,6 +266,34 @@ class Target:
             "outputs": [{"port": name, "record": "io_cqe"} for name in granted],
         }
         return [submit, complete]
+
+    def _check_sims(self) -> None:
+        """Raises `ConfigError` unless each sim resource has one model and no
+        two drivers use a real and a sim resource."""
+        grants = [
+            (name, param, grant, param in type(system)._devices)
+            for name, system, _ in self._systems
+            for param, grant in system._grants.items()
+        ]
+        for resource in self._resources.values():
+            if not isinstance(resource.kind, SimKind):
+                continue
+            models = [n for n, _, g, device in grants if device and g is resource]
+            if not models:
+                raise ConfigError(f"sim resource `{resource.name}` has no model")
+            if len(models) > 1:
+                raise ConfigError(
+                    f"sim resource `{resource.name}` has two models, "
+                    f"`{models[0]}` and `{models[1]}`"
+                )
+        drivers = [g for _, _, g, device in grants if not device]
+        real = next((g for g in drivers if not isinstance(g.kind, SimKind)), None)
+        sim = next((g for g in drivers if isinstance(g.kind, SimKind)), None)
+        if real is not None and sim is not None:
+            raise ConfigError(
+                f"drivers use real resource `{real.name}` and sim resource "
+                f"`{sim.name}`; a target uses one kind"
+            )
 
     def _check_commands(self) -> None:
         """Raises `ConfigError` if the target has channels but no command

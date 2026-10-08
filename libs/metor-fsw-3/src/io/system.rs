@@ -301,7 +301,13 @@ fn host_member(
         .iter()
         .map(|cap| {
             let res = resource_of(shared, &member.id, cap)?;
-            let os = handles[res as usize].ok_or_else(|| no_member(&member.id))?;
+            let sim = matches!(shared.resources[res as usize].backing, Backing::Sim(_));
+            let os = match sim {
+                // A model reads requests by resource and never this handle.
+                true => Some(RawHandle::new(u32::from(res), 0)),
+                false => handles[res as usize],
+            };
+            let os = os.ok_or_else(|| no_member(&member.id))?;
             Ok((os, res))
         })
         .collect::<Result<Vec<_>, ParamError>>()?;

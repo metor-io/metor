@@ -143,6 +143,29 @@ class TcpConnect(Kind):
         return {"addr": self.addr}
 
 
+class SimKind(Kind):
+    """A simulated resource. One model system serves its device end."""
+
+    def to_json(self) -> dict[str, Any]:
+        return {"sim": self._key}
+
+
+@dataclass(frozen=True)
+class SimUart(SimKind):
+    """A simulated serial port."""
+
+    interface = "uart"
+    _key = "uart"
+
+
+@dataclass(frozen=True)
+class SimGpioLine(SimKind):
+    """A simulated GPIO line."""
+
+    interface = "gpio_line"
+    _key = "gpio_line"
+
+
 @dataclass(frozen=True, eq=False)
 class ResourceHandle:
     """A resource created with `Target.resource`. Grant it to a system's

@@ -84,9 +84,23 @@ pub enum Access {
     ReadWrite,
 }
 
-/// A simulated resource.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SimKind {}
+/// A simulated resource. A model system serves its device end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimKind {
+    Uart,
+    GpioLine,
+}
+
+impl SimKind {
+    /// The interface both ends of the resource take.
+    pub fn interface(&self) -> &'static str {
+        match self {
+            Self::Uart => "uart",
+            Self::GpioLine => "gpio_line",
+        }
+    }
+}
 
 impl RealKind {
     /// The interface the resource provides, as a `Cap`'s interface names it.
@@ -105,6 +119,15 @@ impl RealKind {
 }
 
 impl Backing {
+    /// The interface the resource provides. A peer's is not known here.
+    pub fn interface(&self) -> Option<&'static str> {
+        match self {
+            Self::Real(kind) => Some(kind.interface()),
+            Self::Sim(kind) => Some(kind.interface()),
+            Self::Peer(_) => None,
+        }
+    }
+
     /// The backing's kind, as its config names it.
     pub fn name(&self) -> &'static str {
         match self {

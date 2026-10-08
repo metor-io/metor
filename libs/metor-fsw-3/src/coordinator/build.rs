@@ -80,6 +80,7 @@ impl CoordinatorConfig {
         check_resources(&self.resources)?;
         let mut plan = resolve(&self, table)?;
         check_ids(&plan)?;
+        check_device_ends(&plan, &self)?;
         count_readers(&plan.systems, &mut plan.rings);
         let rings = plan
             .rings
@@ -417,36 +418,100 @@ fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildErr
     Ok(())
 }
 
-/// Checks that each `Cap` parameter has exactly one grant, and that every
-/// grant names one.
+/// Checks that each `Cap` and `DeviceSide` parameter has exactly one grant,
+/// and that every grant names one.
 fn check_grants(system: &SystemConfig, def: &SystemDef) -> Result<(), BuildError> {
     let error = |param: &str| (system.id.clone(), param.to_string());
-    let caps = || def.grants.iter().filter(|g| g.end == End::Host);
     for grant in &system.grants {
-        if !caps().any(|cap| cap.param == grant.param) {
+        if !def.grants.iter().any(|g| g.param == grant.param) {
             let (system, param) = error(&grant.param);
             return Err(BuildError::UnknownGrant { system, param });
         }
     }
-    for cap in caps() {
-        match system
-            .grants
-            .iter()
-            .filter(|g| g.param == cap.param)
-            .count()
-        {
+    for param in def.grants.iter().map(|g| &g.param) {
+        match system.grants.iter().filter(|g| g.param == *param).count() {
             1 => {}
             0 => {
-                let (system, param) = error(&cap.param);
+                let (system, param) = error(param);
                 return Err(BuildError::Ungranted { system, param });
             }
             _ => {
-                let (system, param) = error(&cap.param);
+                let (system, param) = error(param);
                 return Err(BuildError::DuplicateGrant { system, param });
             }
         }
     }
     Ok(())
+}
+
+/// One grant, with the end of the resource it holds.
+struct Ended<'a> {
+    system: &'a str,
+    resource: &'a ResourceConfig,
+    end: End,
+}
+
+/// Checks that each sim resource has one model, that only sim resources have
+/// models, and that drivers do not mix real and sim resources.
+fn check_device_ends(plan: &Plan<'_>, config: &CoordinatorConfig) -> Result<(), BuildError> {
+    let ended = ended(plan, config);
+    let sim = |r: &ResourceConfig| matches!(r.backing, Backing::Sim(_));
+    if let Some(e) = ended
+        .iter()
+        .find(|e| e.end == End::Device && !sim(e.resource))
+    {
+        return Err(BuildError::DeviceEndOnReal {
+            system: e.system.into(),
+            resource: e.resource.id.clone(),
+        });
+    }
+    for resource in config.resources.iter().filter(|r| sim(r)) {
+        let models = ended
+            .iter()
+            .filter(|e| e.end == End::Device && e.resource.id == resource.id);
+        let mut models = models.map(|e| e.system.to_string());
+        let resource = resource.id.clone();
+        match (models.next(), models.next()) {
+            (Some(_), None) => {}
+            (None, _) => return Err(BuildError::NoDeviceEnd { resource }),
+            (Some(first), Some(second)) => {
+                return Err(BuildError::TwoDeviceEnds {
+                    resource,
+                    first,
+                    second,
+                });
+            }
+        }
+    }
+    let hosts = || ended.iter().filter(|e| e.end == End::Host);
+    let real = hosts().find(|e| matches!(e.resource.backing, Backing::Real(_)));
+    if let (Some(real), Some(sim)) = (real, hosts().find(|e| sim(e.resource))) {
+        return Err(BuildError::MixedBackings {
+            real: real.resource.id.clone(),
+            sim: sim.resource.id.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Every grant in the config, with its end. `check_interfaces` ran first, so
+/// each names a resource and a parameter.
+fn ended<'a>(plan: &'a Plan<'_>, config: &'a CoordinatorConfig) -> Vec<Ended<'a>> {
+    let mut ended = Vec::new();
+    for (system, planned) in config.systems.iter().zip(&plan.systems) {
+        for grant in &system.grants {
+            let resource = config.resources.iter().find(|r| r.id == grant.resource);
+            let def = planned.def.grants.iter().find(|g| g.param == grant.param);
+            if let (Some(resource), Some(def)) = (resource, def) {
+                ended.push(Ended {
+                    system: &system.id,
+                    resource,
+                    end: def.end,
+                });
+            }
+        }
+    }
+    ended
 }
 
 /// Each system's grants, for `io_submit`'s make.
@@ -463,7 +528,7 @@ fn check_resources(resources: &[ResourceConfig]) -> Result<(), BuildError> {
             let id = resource.id.clone();
             return Err(BuildError::DuplicateResource { id });
         }
-        if !matches!(resource.backing, Backing::Real(_)) {
+        if matches!(resource.backing, Backing::Peer(_)) {
             return Err(BuildError::Backing {
                 resource: resource.id.clone(),
                 backing: resource.backing.name().into(),
@@ -473,7 +538,7 @@ fn check_resources(resources: &[ResourceConfig]) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// Checks that each grant names a resource that provides its `Cap`'s
+/// Checks that each grant names a resource that provides its parameter's
 /// interface.
 fn check_interfaces(
     system: &SystemConfig,
@@ -489,9 +554,8 @@ fn check_interfaces(
                 resource: grant.resource.clone(),
             });
         };
-        let found = match &resource.backing {
-            Backing::Real(kind) => kind.interface(),
-            Backing::Sim(_) | Backing::Peer(_) => continue,
+        let Some(found) = resource.backing.interface() else {
+            continue;
         };
         // PANIC Safety: `check_grants` ran first, so every grant names a cap.
         let cap = def

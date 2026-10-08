@@ -16,6 +16,8 @@ from metor_config import (
     Record,
     ResourceHandle,
     ResourceStatus,
+    SimGpioLine,
+    SimUart,
     System,
     Target,
     Tty,
@@ -56,6 +58,18 @@ class Leaky(System):
     _ty = "leaky"
     _ports = {"io_sq": IoSqe, "fix": Fix}
     _caps = {"uart": "uart"}
+
+    def __init__(self, *, uart: ResourceHandle) -> None:
+        super().__init__({}, {}, grants={"uart": uart})
+
+
+class UartModel(System):
+    """A model with one `DeviceSide<Uart>`, as a pack module renders it."""
+
+    _pack = PACK
+    _ty = "uart_model"
+    _ports = {}
+    _devices = {"uart": "uart"}
 
     def __init__(self, *, uart: ResourceHandle) -> None:
         super().__init__({}, {}, grants={"uart": uart})
@@ -167,6 +181,57 @@ class ResourceTests(unittest.TestCase):
         gps1 = fsw.resource("gps1", Tty("/dev/ttyTHS0"))
         with self.assertRaisesRegex(ConfigError, "io step"):
             fsw.add("io_submit", Gps(uart=gps1))
+
+
+class SimTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        target_mod._targets.clear()
+
+    def test_sim_kinds_emit_their_backing(self) -> None:
+        self.assertEqual(SimUart().to_json(), {"sim": "uart"})
+        self.assertEqual(SimGpioLine().to_json(), {"sim": "gpio_line"})
+
+    def test_model_gets_its_grant_but_no_queue(self) -> None:
+        fsw = Target(cycle_rate=10.0)
+        gps1 = fsw.resource("gps1", SimUart())
+        fsw.add("gps", Gps(uart=gps1))
+        fsw.add("model", UartModel(uart=gps1))
+        config = coordinator(fsw)
+        model = config["systems"][1]
+        self.assertEqual(model["grants"], [{"param": "uart", "resource": "gps1"}])
+        self.assertNotIn("io_cq", [i["port"] for i in model["inputs"]])
+        submit = config["systems"][2]
+        self.assertEqual([i["port"] for i in submit["inputs"]], ["gps"])
+
+    def test_sim_resource_without_a_model_is_refused(self) -> None:
+        fsw = Target(cycle_rate=10.0)
+        fsw.add("gps", Gps(uart=fsw.resource("gps1", SimUart())))
+        with self.assertRaisesRegex(ConfigError, "`gps1` has no model"):
+            fsw.to_config()
+
+    def test_two_models_are_refused(self) -> None:
+        fsw = Target(cycle_rate=10.0)
+        gps1 = fsw.resource("gps1", SimUart())
+        fsw.add("gps", Gps(uart=gps1))
+        fsw.add("a", UartModel(uart=gps1))
+        fsw.add("b", UartModel(uart=gps1))
+        with self.assertRaisesRegex(ConfigError, "two models, `a` and `b`"):
+            fsw.to_config()
+
+    def test_drivers_mixing_real_and_sim_are_refused(self) -> None:
+        fsw = Target(cycle_rate=10.0)
+        sim = fsw.resource("sim", SimUart())
+        fsw.add("a", Gps(uart=fsw.resource("port", Tty("/dev/ttyS0"))))
+        fsw.add("b", Gps(uart=sim))
+        fsw.add("model", UartModel(uart=sim))
+        with self.assertRaisesRegex(ConfigError, "real resource `port` and sim resource `sim`"):
+            fsw.to_config()
+
+    def test_model_of_a_real_resource_is_refused(self) -> None:
+        fsw = Target(cycle_rate=10.0)
+        port = fsw.resource("port", Tty("/dev/ttyS0"))
+        with self.assertRaisesRegex(ConfigError, "model.uart"):
+            fsw.add("model", UartModel(uart=port))
 
 
 if __name__ == "__main__":

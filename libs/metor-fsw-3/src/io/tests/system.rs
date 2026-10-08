@@ -74,13 +74,18 @@ pub(crate) fn io_steps(table: &mut SystemTable) {
 }
 
 /// `systems` with the io steps appended, wired to every system with grants.
-pub(crate) fn with_io(mut systems: Vec<SystemConfig>) -> Vec<SystemConfig> {
+pub(crate) fn with_io(systems: Vec<SystemConfig>) -> Vec<SystemConfig> {
     let granted: Vec<String> = systems
         .iter()
         .filter(|s| !s.grants.is_empty())
         .map(|s| s.id.clone())
         .collect();
-    for system in systems.iter_mut().filter(|s| !s.grants.is_empty()) {
+    with_io_for(systems, &granted)
+}
+
+/// `systems` with the io steps appended, wired to the drivers `granted`.
+pub(crate) fn with_io_for(mut systems: Vec<SystemConfig>, granted: &[String]) -> Vec<SystemConfig> {
+    for system in systems.iter_mut().filter(|s| granted.contains(&s.id)) {
         let cq = InputConfig::new(IO_CQ, "io_complete", system.id.as_str());
         system.inputs.push(cq);
     }

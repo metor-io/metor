@@ -124,6 +124,22 @@ pub enum BuildError {
         found: String,
     },
 
+    #[error("sim resource `{resource}` has no model; grant it to a `DeviceSide`")]
+    NoDeviceEnd { resource: String },
+
+    #[error("sim resource `{resource}` has two models, `{first}` and `{second}`")]
+    TwoDeviceEnds {
+        resource: String,
+        first: String,
+        second: String,
+    },
+
+    #[error("`{system}` serves resource `{resource}`, which is not simulated")]
+    DeviceEndOnReal { system: String, resource: String },
+
+    #[error("drivers use real resource `{real}` and sim resource `{sim}`; a target uses one kind")]
+    MixedBackings { real: String, sim: String },
+
     #[error("resource `{resource}` has a `{backing}` backing, which this build does not run")]
     Backing { resource: String, backing: String },
 
