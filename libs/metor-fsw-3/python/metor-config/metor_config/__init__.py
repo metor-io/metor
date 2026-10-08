@@ -9,6 +9,19 @@ is written to `$METOR_CONFIG_OUT`, or to stdout, for `metor run` to read.
 from ._builtins import ChannelRegistry, Db, DbStatus, DlSlot, LinkStatus, Publish, Subscribe
 from ._config import CONFIG_VERSION, ConfigError
 from ._deployment import Deployment, emit, gateway
+from ._io import (
+    Can,
+    Dir,
+    File,
+    GpioLine,
+    Kind,
+    ResourceHandle,
+    ResourceStatus,
+    TcpConnect,
+    TcpListen,
+    Tty,
+    Udp,
+)
 from ._model import (
     ChannelStatus,
     Item,
@@ -29,6 +42,17 @@ from ._model import (
 from ._target import SystemHandle, Target
 
 __all__ = [
+    "Can",
+    "Dir",
+    "File",
+    "GpioLine",
+    "Kind",
+    "ResourceHandle",
+    "ResourceStatus",
+    "TcpConnect",
+    "TcpListen",
+    "Tty",
+    "Udp",
     "ChannelRegistry",
     "ChannelStatus",
     "DlSlot",

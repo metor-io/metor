@@ -186,7 +186,8 @@ class System:
             status: OutPort[SystemStatus]
 
     `_ty` is the system's type name within the pack, and `_ports` maps every
-    output to its record.
+    output to its record. `_caps` maps each `Cap` parameter to the interface
+    it takes; the subclass passes the granted resources as ``grants``.
 
     Some system types take a list of ports from their config instead of
     declaring them. Those set `_takes_inputs` or `_takes_outputs`, and pass
@@ -196,6 +197,8 @@ class System:
     _pack: Pack
     _ty: str
     _ports: dict[str, type[Record]] = {}
+    _caps: dict[str, str] = {}
+    """Each `Cap` parameter, mapped to the interface it takes."""
     _record_packs: tuple[Pack, ...] = ()
     _takes_inputs: bool = False
     """Whether this type takes an `items` list of input ports."""
@@ -214,7 +217,9 @@ class System:
         outputs: list[dict[str, Any]] | None = None,
         items: Sequence[Item] = (),
         records: Sequence[type[Record]] = (),
+        grants: dict[str, Any] | None = None,
     ) -> None:
+        self._grants = dict(grants or {})
         self._inputs = {port: _sources(port, src) for port, src in inputs.items()}
         self._inputs.update(_edges(_item_ports(items)))
         self._params = {name: _json(value) for name, value in params.items()}

@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any, TypeVar, cast
 
 from ._config import ConfigError, check_abi, simulated_clock, wall_clock
+from ._io import Kind, ResourceHandle
 from ._model import CHANNEL_PORTS, Loop, OutPort, Pack, Record, Source, System, _json, _sources
+
+IO_SUBMIT = "io_submit"
+IO_COMPLETE = "io_complete"
 
 S = TypeVar("S", bound=System)
 T = TypeVar("T", bound=Record)
@@ -71,7 +75,24 @@ class Target:
         self._commands: list[Source[Any]] = []
         self._packs: dict[str, Pack] = {}
         self._wasm: dict[str, dict[str, Any]] = {}
+        self._resources: dict[str, ResourceHandle] = {}
         _targets.append(self)
+
+    def resource(self, name: str, kind: Kind) -> ResourceHandle:
+        """Creates a resource called ``name``, such as ``Tty("/dev/ttyS0")``.
+
+        Grant it to a system by passing the returned handle as one of the
+        system's `Cap` keywords. Several systems may share one resource.
+        """
+        if not name.isidentifier():
+            raise ConfigError(f"a resource name is an identifier, got {name!r}")
+        if name in self._resources:
+            raise ConfigError(f"resource `{name}` is already created")
+        if not isinstance(kind, Kind):
+            raise ConfigError(f"resource `{name}` takes a kind such as `Tty`, got {kind!r}")
+        handle = ResourceHandle(name, kind, self)
+        self._resources[name] = handle
+        return handle
 
     def loop(self, record: type[T]) -> Loop[T]:
         """Creates a feedback edge for ``record`` with a one-cycle delay.
@@ -102,8 +123,11 @@ class Target:
         ``"running"`` (the default) or ``"stopped"``.
         """
         adapter = _adapter(thread, channel, start)
+        if name in (IO_SUBMIT, IO_COMPLETE):
+            raise ConfigError(f"`{name}` is the name of an io step")
         if name in self._handles:
             raise ConfigError(f"system `{name}` is already added")
+        self._check_grants(name, system)
         packs = (system._pack, *system._record_packs)
         for pack in packs:
             check_abi(pack.id, pack.abi_version)
@@ -115,6 +139,24 @@ class Target:
         handle = SystemHandle(name, self, system)
         self._handles[name] = handle
         return cast(S, handle)
+
+    def _check_grants(self, name: str, system: System) -> None:
+        """Raises `ConfigError` unless every `Cap` of ``system`` is granted a
+        resource of this target that provides its interface."""
+        caps = type(system)._caps
+        for param, grant in system._grants.items():
+            if param not in caps:
+                raise ConfigError(f"`{name}` has no `Cap` parameter `{param}`")
+            if not isinstance(grant, ResourceHandle) or grant.target is not self:
+                raise ConfigError(f"`{name}.{param}` takes a resource of this target, got {grant!r}")
+            if grant.kind.interface != caps[param]:
+                raise ConfigError(
+                    f"`{name}.{param}` takes a `{caps[param]}`, but `{grant.name}` "
+                    f"provides `{grant.kind.interface}`"
+                )
+        for param in caps:
+            if param not in system._grants:
+                raise ConfigError(f"`{name}.{param}` is not granted a resource")
 
     def wasm(self, pack: Pack, *, fuel: int | None = None, memory: int | None = None) -> None:
         """Runs ``pack`` as a WebAssembly module on this target.
@@ -167,21 +209,47 @@ class Target:
         with no library is built into the host, so it is not listed.
         """
         self._check_commands()
+        coordinator: dict[str, Any] = {
+            "clock": self._clock(),
+            "ring_depth": self.ring_depth,
+            "namespace": self.namespace,
+            "systems": [self._system(index) for index in range(len(self._systems))]
+            + self._io_steps(),
+        }
+        if self._resources:
+            coordinator["resources"] = [r.to_json() for r in self._resources.values()]
         return {
             "packs": [
                 {**pack.to_json(), **self._wasm.get(pack.id, {})}
                 for pack in self._packs.values()
                 if pack.lib
             ],
-            "coordinator": {
-                "clock": self._clock(),
-                "ring_depth": self.ring_depth,
-                "namespace": self.namespace,
-                "systems": [
-                    self._system(index) for index in range(len(self._systems))
-                ],
-            },
+            "coordinator": coordinator,
         }
+
+    def _granted(self) -> list[str]:
+        """Returns each system with grants, in step order."""
+        return [name for name, system, _ in self._systems if system._grants]
+
+    def _io_steps(self) -> list[dict[str, Any]]:
+        """Returns `io_submit` and `io_complete`, wired to every system with
+        grants, or nothing when no system has any."""
+        granted = self._granted()
+        if not granted:
+            return []
+        submit = {
+            "id": IO_SUBMIT,
+            "ty": "fsw.io_submit",
+            "inputs": [
+                {"port": name, "from": [{"system": name, "port": "io_sq"}]} for name in granted
+            ],
+        }
+        complete = {
+            "id": IO_COMPLETE,
+            "ty": "fsw.io_complete",
+            "outputs": [{"port": name, "record": "io_cqe"} for name in granted],
+        }
+        return [submit, complete]
 
     def _check_commands(self) -> None:
         """Raises `ConfigError` if the target has channels but no command
@@ -211,6 +279,13 @@ class Target:
             }
             for port, sources in inputs.items()
         ]
+        if system._grants:
+            entry["grants"] = [
+                {"param": param, "resource": grant.name} for param, grant in system._grants.items()
+            ]
+            entry["inputs"].append(
+                {"port": "io_cq", "from": [{"system": IO_COMPLETE, "port": name}]}
+            )
         outputs = system._outputs_for(self, index)
         if outputs:
             entry["outputs"] = _json(outputs)
