@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, TypeVar, cast
 
 from ._config import ConfigError, check_abi, simulated_clock, wall_clock
-from ._io import Kind, ResourceHandle
+from ._io import Kind, ResourceHandle, ResourceStatus
 from ._model import CHANNEL_PORTS, Loop, OutPort, Pack, Record, Source, System, _json, _sources
 
 IO_SUBMIT = "io_submit"
@@ -139,6 +139,16 @@ class Target:
         handle = SystemHandle(name, self, system)
         self._handles[name] = handle
         return cast(S, handle)
+
+    @property
+    def io_status(self) -> OutPort[ResourceStatus]:
+        """`io_complete`'s output of each resource's op counts.
+
+        Only a target with grants has io steps to write it.
+        """
+        if not self._granted():
+            raise ConfigError("no system holds a resource, so there is no io_status")
+        return OutPort(IO_COMPLETE, "io_status", ResourceStatus, self)
 
     def _check_grants(self, name: str, system: System) -> None:
         """Raises `ConfigError` unless every `Cap` of ``system`` is granted a

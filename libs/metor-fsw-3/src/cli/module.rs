@@ -177,6 +177,9 @@ fn kind(frame: bool) -> &'static str {
     if frame { "frame" } else { "msg" }
 }
 
+/// The `__init__` keywords a generated class passes on itself.
+const RESERVED_KEYWORDS: [&str; 3] = ["items", "records", "grants"];
+
 /// Returns the ports a target can wire.
 ///
 /// This is every port except `abort`, which only a channel writes to, and
@@ -306,10 +309,8 @@ fn entry(
     let input = |name: &str| wired_inputs(system).any(|port| port.name == name);
     let param = |name: &str| params.iter().any(|field| field.name == name);
     let clash = params.iter().map(|f| &f.name).find(|name| input(name));
-    let clash = clash.or(caps
-        .iter()
-        .map(|c| &c.name)
-        .find(|name| input(name) || param(name)));
+    let taken = |name: &str| input(name) || param(name) || RESERVED_KEYWORDS.contains(&name);
+    let clash = clash.or(caps.iter().map(|c| &c.name).find(|name| taken(name)));
     if let Some(name) = clash {
         return Err(PackDevError::NameClash {
             system: system.ty.to_string(),
@@ -696,6 +697,8 @@ mod tests {
         };
         assert_eq!(name, "uart");
         let clash = rendered(vec![capped(None, &["est"])]);
+        assert!(matches!(clash, Err(PackDevError::NameClash { .. })));
+        let clash = rendered(vec![capped(None, &["grants"])]);
         assert!(matches!(clash, Err(PackDevError::NameClash { .. })));
     }
 }

@@ -83,6 +83,13 @@ impl Handles {
         Some(RawHandle::new(at as u32, slot.generation))
     }
 
+    /// Makes every grant live again, for a remade system.
+    pub(crate) fn revive_grants(&mut self) {
+        self.slots[..self.grants]
+            .iter_mut()
+            .for_each(|s| s.live = true);
+    }
+
     /// Ends every derived handle, handing each `Os` handle to `close`.
     pub(crate) fn drop_derived(&mut self, mut close: impl FnMut(RawHandle)) {
         for slot in self.slots[self.grants..].iter_mut().filter(|s| s.live) {

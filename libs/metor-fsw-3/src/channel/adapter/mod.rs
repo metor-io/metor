@@ -314,9 +314,14 @@ impl Core {
         }
     }
 
-    /// Loads `name`. On an IO system, the load waits for its ops in flight.
+    /// Loads `name`. On an IO system whose step loads occupants, the load
+    /// waits for its ops in flight. Any other step loads, or refuses, at once.
     fn defer_load(&mut self, name: String) -> SequenceEventKind {
-        let (Some(member), Some(_)) = (self.member(), &self.inner) else {
+        let loads = self
+            .inner
+            .as_ref()
+            .is_some_and(|inner| inner.occupant().is_some());
+        let Some(member) = self.member().filter(|_| loads) else {
             return self.load(name);
         };
         self.recipe.io.borrow_mut().begin(&member);

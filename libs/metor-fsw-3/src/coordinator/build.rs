@@ -14,7 +14,9 @@ use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 
 use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
-use crate::io::{Backing, End, IO_COMPLETE_TYPE, IO_SUBMIT_TYPE, ResourceConfig, SharedIo};
+use crate::io::{
+    Backing, End, IO_COMPLETE_TYPE, IO_CQ, IO_SQ, IO_SUBMIT_TYPE, ResourceConfig, SharedIo,
+};
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
@@ -207,6 +209,20 @@ fn check_io_steps(config: &CoordinatorConfig, plan: &Plan<'_>) -> Result<(), Bui
         return error(format!(
             "io_submit and io_complete must list {ids:?}, in that order"
         ));
+    }
+    let complete_id = config.systems[complete].id.as_str();
+    for (input, id) in config.systems[submit].inputs.iter().zip(&ids) {
+        if input.from != [PortRef::new(*id, IO_SQ)] {
+            return error(format!("io_submit's input `{id}` must read `{id}.{IO_SQ}`"));
+        }
+    }
+    for &at in &granted {
+        let system = &config.systems[at];
+        let cq = system.inputs.iter().find(|i| i.port == IO_CQ);
+        if cq.is_none_or(|cq| cq.from != [PortRef::new(complete_id, system.id.as_str())]) {
+            let id = &system.id;
+            return error(format!("`{id}.{IO_CQ}` must read `{complete_id}.{id}`"));
+        }
     }
     Ok(())
 }

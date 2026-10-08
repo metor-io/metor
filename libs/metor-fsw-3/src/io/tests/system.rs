@@ -121,14 +121,20 @@ mod cases {
 
     type Results = Rc<RefCell<Vec<(Timestamp, Result<usize, IoError>)>>>;
 
-    /// Sends `abc` whenever its buffer is idle, recording each result.
+    /// Sends `abc` whenever its buffer is idle, recording each result. With
+    /// `quit`, it closes its cap first.
     struct Sender {
         tx: Slot<Send>,
         results: Results,
+        quit: bool,
+        closing: Option<Pending<Close>>,
     }
 
     #[system]
     fn sender(#[state] s: &mut Sender, now: Timestamp, udp: &Cap<Udp>) {
+        if core::mem::take(&mut s.quit) {
+            s.closing = Some(udp.close());
+        }
         if let Some(result) = s.tx.poll() {
             s.results.borrow_mut().push((now, result));
         }
@@ -210,6 +216,29 @@ mod cases {
     }
 
     #[system]
+    fn channel_probe(
+        #[state] seen: &mut Rc<RefCell<Vec<u32>>>,
+        st: &mut Input<crate::channel::ChannelStatus>,
+    ) {
+        seen.borrow_mut()
+            .extend(st.drain().flatten().map(|s| s.state));
+    }
+
+    /// Starts a recv and cancels it at once.
+    struct Canceller {
+        rx: Slot<Recv>,
+    }
+
+    #[system]
+    fn canceller(#[state] s: &mut Canceller, udp: &Cap<Udp>) {
+        if let Some(buf) = s.rx.take_idle() {
+            let rx = udp.recv(buf);
+            rx.cancel();
+            s.rx = Slot::Busy(rx);
+        }
+    }
+
+    #[system]
     fn cmds(
         #[state] queue: &mut Rc<RefCell<Vec<SequenceCommand>>>,
         commands: &mut Output<SequenceCommand>,
@@ -256,14 +285,28 @@ mod cases {
         accepted: Accepted,
         status: Rc<RefCell<Vec<ResourceStatus>>>,
         queue: Rc<RefCell<Vec<SequenceCommand>>>,
+        states: Rc<RefCell<Vec<u32>>>,
+        /// The next sender asks for this many bytes, or `abc` when zero.
+        ctor_len: Rc<core::cell::Cell<usize>>,
+        /// The next sender closes its cap first.
+        quit: Rc<core::cell::Cell<bool>>,
     }
 
     fn table(seen: &Seen, close: bool) -> SystemTable {
         let mut table = SystemTable::new();
-        let results = seen.results.clone();
+        let (results, len, quit) = (
+            seen.results.clone(),
+            seen.ctor_len.clone(),
+            seen.quit.clone(),
+        );
         let make_sender = move |io: &IoInit<'_>| Sender {
-            tx: Slot::Idle(io.alloc_from(b"abc")),
+            tx: Slot::Idle(match len.get() {
+                0 => io.alloc_from(b"abc"),
+                n => io.alloc(n),
+            }),
             results: results.clone(),
+            quit: quit.get(),
+            closing: None,
         };
         table.register("sender", sender(), make_sender).unwrap();
         let make_echo = |io: &IoInit<'_>| Echo {
@@ -294,6 +337,16 @@ mod cases {
         let queue = seen.queue.clone();
         table
             .register("cmds", cmds(), move || queue.clone())
+            .unwrap();
+        let states = seen.states.clone();
+        table
+            .register("channel_probe", channel_probe(), move || states.clone())
+            .unwrap();
+        let make_canceller = |io: &IoInit<'_>| Canceller {
+            rx: Slot::Idle(io.alloc(8)),
+        };
+        table
+            .register("canceller", canceller(), make_canceller)
             .unwrap();
         io_steps(&mut table);
         table
@@ -540,8 +593,23 @@ mod cases {
                 })),
                 ..granted("tx", "sender", &[("udp", "u")])
             },
+            SystemConfig {
+                inputs: vec![InputConfig::new("st", "tx", "channel_status")],
+                ..SystemConfig::new("states", "channel_probe")
+            },
         ];
         build(seen, systems, vec![udp("u")]).unwrap()
+    }
+
+    const QUIESCING: u32 = crate::channel::ChannelState::Quiescing as u32;
+    const FAILED: u32 = crate::channel::ChannelState::Failed as u32;
+
+    fn push(seen: &Seen, kind: SequenceCommandKind) {
+        seen.queue.borrow_mut().push(command(kind));
+    }
+
+    fn last_state(seen: &Seen) -> u32 {
+        *seen.states.borrow().last().unwrap()
     }
 
     #[test]
@@ -692,5 +760,193 @@ mod cases {
         seen.status.borrow_mut().reserve(4096);
         let count = super::super::allocations(|| steps(&mut c, 10, 1010));
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn quiescing_refuses_start_and_reports_its_state() {
+        let os = script();
+        let seen = Seen::default();
+        let mut c = channeled(&seen);
+        c.step(Timestamp(1));
+        push(&seen, SequenceCommandKind::Stop);
+        push(&seen, SequenceCommandKind::Reset);
+        steps(&mut c, 2, 4);
+        assert_eq!(last_state(&seen), QUIESCING);
+        push(&seen, SequenceCommandKind::Start);
+        steps(&mut c, 4, 30);
+        let states = seen.states.borrow();
+        assert!(
+            states[states.len() - 26..].iter().all(|&s| s == QUIESCING),
+            "{states:?}"
+        );
+        assert_eq!(
+            pushed(&os)
+                .iter()
+                .filter(|s| s.op.kind() == OpKind::Send)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn load_on_a_system_that_loads_nothing_acts_at_once() {
+        let os = script();
+        let seen = Seen::default();
+        let mut c = channeled(&seen);
+        c.step(Timestamp(1));
+        let send = pushed(&os)[0];
+        push(&seen, SequenceCommandKind::Stop);
+        push(
+            &seen,
+            SequenceCommandKind::Load {
+                name: "other".into(),
+            },
+        );
+        steps(&mut c, 2, 4);
+        assert!(
+            pushed(&os).iter().all(|s| s.op.kind() != OpKind::Cancel),
+            "no quiesce"
+        );
+        assert_ne!(last_state(&seen), QUIESCING);
+        os.borrow_mut()
+            .landed
+            .push(Cqe::ok(send.token, Out::len(3)));
+        push(&seen, SequenceCommandKind::Start);
+        steps(&mut c, 4, 7);
+        assert_eq!(
+            seen.results.borrow().first().map(|r| r.1),
+            Some(Ok(3)),
+            "its op still lands"
+        );
+    }
+
+    #[test]
+    fn closed_grant_lives_again_after_a_reset() {
+        let os = script();
+        answer(&os, |sqe| Some(Cqe::ok(sqe.token, Out::len(3))));
+        let seen = Seen::default();
+        seen.quit.set(true);
+        let mut c = channeled(&seen);
+        steps(&mut c, 1, 3);
+        assert_eq!(
+            seen.results.borrow()[0].1,
+            Err(IoError::Stale),
+            "closed, then sent"
+        );
+        assert!(
+            pushed(&os).is_empty(),
+            "a grant's close never reaches the Os"
+        );
+        seen.quit.set(false);
+        push(&seen, SequenceCommandKind::Stop);
+        push(&seen, SequenceCommandKind::Reset);
+        steps(&mut c, 3, 6);
+        push(&seen, SequenceCommandKind::Start);
+        steps(&mut c, 6, 9);
+        let sends: Vec<_> = pushed(&os)
+            .into_iter()
+            .filter(|s| s.op.kind() == OpKind::Send)
+            .collect();
+        assert!(!sends.is_empty(), "the remade system's grant is live");
+        assert_eq!(sends[0].handle, RawHandle::new(0, 0));
+    }
+
+    #[test]
+    fn handle_opened_while_quiescing_is_closed() {
+        let os = script();
+        let seen = Seen::default();
+        let systems = vec![
+            SystemConfig::new("cmds", "cmds"),
+            SystemConfig {
+                inputs: vec![InputConfig::new("commands", "cmds", "commands")],
+                adapter: Some(Adapter::Channel(ChannelConfig {
+                    name: "tx".into(),
+                    start: RunState::Running,
+                })),
+                ..granted("tx", "acceptor", &[("listen", "l")])
+            },
+        ];
+        let mut c = build(&seen, systems, vec![listen("l")]).unwrap();
+        c.step(Timestamp(1));
+        let accept = pushed(&os)[0];
+        push(&seen, SequenceCommandKind::Stop);
+        push(&seen, SequenceCommandKind::Reset);
+        steps(&mut c, 2, 4);
+        let opened = RawHandle::new(88, 0);
+        os.borrow_mut()
+            .landed
+            .push(Cqe::ok(accept.token, Out::handle(opened)));
+        steps(&mut c, 4, 6);
+        let close = pushed(&os).into_iter().find(|s| s.op == Op::CLOSE);
+        assert_eq!(close.map(|s| s.handle), Some(opened));
+    }
+
+    #[test]
+    fn remake_larger_than_the_arena_fails() {
+        let os = script();
+        answer(&os, |sqe| Some(Cqe::ok(sqe.token, Out::len(3))));
+        let seen = Seen::default();
+        let mut c = channeled(&seen);
+        c.step(Timestamp(1));
+        seen.ctor_len.set(4096);
+        push(&seen, SequenceCommandKind::Stop);
+        push(&seen, SequenceCommandKind::Reset);
+        steps(&mut c, 2, 6);
+        assert_eq!(last_state(&seen), FAILED);
+    }
+
+    #[test]
+    fn wiring_checks_sources_not_just_names() {
+        let seen = Seen::default();
+        let fails = |systems: Vec<SystemConfig>| {
+            let config = CoordinatorConfig {
+                systems,
+                resources: vec![udp("u"), udp("v")],
+                ..CoordinatorConfig::default()
+            };
+            matches!(
+                config.build(&table(&seen, false)),
+                Err(BuildError::IoSystems { .. })
+            )
+        };
+        let one = || granted("one", "sender", &[("udp", "u")]);
+        let two = || granted("two", "sender", &[("udp", "v")]);
+        let mut crossed = with_io(vec![one(), two()]);
+        let submit = crossed.iter_mut().find(|s| s.id == "io_submit").unwrap();
+        submit.inputs[0].from[0].system = "two".into();
+        assert!(fails(crossed), "io_submit's `one` reads `two.io_sq`");
+        let mut deaf = with_io(vec![one()]);
+        deaf[0].inputs.clear();
+        assert!(fails(deaf), "no io_cq edge");
+    }
+
+    #[test]
+    fn untracked_cancels_are_not_counted() {
+        let os = script();
+        let seen = Seen::default();
+        let systems = vec![granted("c", "canceller", &[("udp", "u")])];
+        let mut c = build(&seen, systems, vec![udp("u")]).unwrap();
+        steps(&mut c, 1, 3);
+        assert_eq!(pushed(&os).len(), 2, "the recv and its cancel");
+        let last = *seen.status.borrow().last().unwrap();
+        assert_eq!((last.submitted, last.completed), (1, 0));
+    }
+
+    #[test]
+    fn bytes_out_counts_what_was_written() {
+        let os = script();
+        answer(&os, |sqe| match sqe.op {
+            Op::Send { .. } => Some(Cqe::ok(sqe.token, Out::len(2))),
+            _ => None,
+        });
+        let seen = Seen::default();
+        let systems = vec![granted("e", "echo", &[("udp", "u")])];
+        let mut c = build(&seen, systems, vec![udp("u")]).unwrap();
+        steps(&mut c, 1, 3);
+        assert_eq!(
+            seen.status.borrow().last().unwrap().bytes_out,
+            2,
+            "a short write"
+        );
     }
 }

@@ -24,6 +24,7 @@ use crate::log::LogPort;
 use crate::port::{Input, Output, dyn_input_defs, dyn_output_defs};
 use crate::system::{OutputBinding, SystemDef};
 
+use super::Token;
 use super::handles::Handles;
 use super::shared::{Member, SharedIo};
 use super::status::{Counters, ResourceStatus, resource_name};
@@ -153,7 +154,8 @@ fn make_complete(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     let dropped = Arc::<AtomicU32>::default();
     let cq = |b: OutputBinding| Output::counting(b.writer, dropped.clone());
     let cqs = writers.map(cq).collect::<Vec<_>>();
-    let done = Vec::with_capacity(2 * cqs.len() * MAX_OPS);
+    // The reactor returns at most every token it holds, three per tracked op.
+    let done = Vec::with_capacity(6 * cqs.len().max(1) * MAX_OPS);
     Ok(Box::new(CompleteStep {
         io: cx.io.clone(),
         cqs,
@@ -367,86 +369,103 @@ impl IoHost {
             return;
         };
         if let Op::Close { .. } = sqe.op {
+            // A grant ends only this capability, and the resource stays open.
+            // A derived handle closes under a reactor-own token, which the
+            // reactor never refuses.
             member.handles.close(sqe.handle);
-            if !mapped.derived {
-                // A grant ends only this capability; the resource stays open.
-                self.early.push((at, Cqe::ok(sqe.token, Out::UNIT)));
-                return;
+            if mapped.derived {
+                close(&mut self.reactor, mapped.os);
             }
+            self.early.push((at, Cqe::ok(sqe.token, Out::UNIT)));
+            return;
         }
-        let kind = sqe.op.kind();
         if let Some(slot) = tracked(sqe.token) {
             member.ops[slot] = Some(InFlight {
                 res: mapped.res,
-                kind,
+                kind: sqe.op.kind(),
             });
-        }
-        let counters = &mut self.counters[mapped.res as usize];
-        counters.submitted += 1;
-        if matches!(kind, OpKind::Write | OpKind::Send | OpKind::SendTo) {
-            let len = sqe
-                .op
-                .buf()
-                .and_then(|b| member.member.table.bufs.raw(b.slot()));
-            counters.bytes_out += len.map_or(0, |raw| u64::from(raw.len));
+            self.counters[mapped.res as usize].submitted += 1;
         }
         sqe.handle = mapped.os;
         self.reactor.push(member.src, sqe);
     }
 
-    /// Notes that a quiescing member's SQ is drained, closing its derived
-    /// handles the first time.
+    /// Notes that a quiescing member's SQ is drained. The first time, closes
+    /// its derived handles and revives its grants for the next make.
     fn drained(&mut self, at: usize) {
         let member = &mut self.members[at];
         if member.member.quiesce.drained.replace(true) {
             return;
         }
         let reactor = &mut self.reactor;
-        member.handles.drop_derived(|os| {
-            reactor.push_own(Sqe::new(super::Token::new(0), os, Op::CLOSE));
-        });
+        member.handles.drop_derived(|os| close(reactor, os));
+        member.handles.revive_grants();
         member.ops.iter_mut().for_each(|op| *op = None);
     }
 
     /// Counts one completion, maps any handle it opened, and returns it, or
-    /// `None` when its member is quiescing.
-    fn land(&mut self, at: usize, mut cqe: Cqe) -> Option<Cqe> {
+    /// `None` when no system waits for it.
+    fn land(&mut self, at: usize, cqe: Cqe) -> Option<Cqe> {
         let member = &mut self.members[at];
+        let opened = cqe.status.result().ok().and(cqe.out.as_handle());
         if member.member.quiesce.active.get() {
+            // The system that asked is gone, so nothing will close it.
+            if let Some(os) = opened {
+                close(&mut self.reactor, os);
+            }
             return None;
         }
         let op = tracked(cqe.token).and_then(|slot| member.ops[slot].take())?;
-        let ok = cqe.status.result().is_ok();
-        let counters = &mut self.counters[op.res as usize];
-        counters.completed += 1;
-        counters.failed += u64::from(!ok);
-        if ok && matches!(op.kind, OpKind::Read | OpKind::Recv) {
-            counters.bytes_in += u64::from(cqe.out.as_len().unwrap_or(0));
+        count(&mut self.counters[op.res as usize], op.kind, &cqe);
+        let Some(os) = opened else {
+            return Some(cqe);
+        };
+        match member.handles.derive(os, op.res) {
+            Some(raw) => Some(Cqe::ok(cqe.token, Out::handle(raw))),
+            None => {
+                close(&mut self.reactor, os);
+                Some(Cqe::err(cqe.token, IoError::Refused))
+            }
         }
-        if let (true, Some(os)) = (ok, cqe.out.as_handle()) {
-            cqe = match member.handles.derive(os, op.res) {
-                Some(raw) => Cqe::ok(cqe.token, Out::handle(raw)),
-                None => {
-                    self.reactor
-                        .push_own(Sqe::new(super::Token::new(0), os, Op::CLOSE));
-                    Cqe::err(cqe.token, IoError::Refused)
-                }
-            };
-        }
-        Some(cqe)
     }
 
     /// Writes up to `STATUS_PER_CYCLE` changed resources, starting after the
-    /// last one written.
+    /// last one written. A record the ring refuses is written again later.
     fn report(&mut self, now: Timestamp, out: &Output<ResourceStatus>) {
         let mut picked = [0; STATUS_PER_CYCLE];
         let due = due(&self.counters, &self.reported, self.next_status);
         let n = due.zip(&mut picked).map(|(at, slot)| *slot = at).count();
         for &at in &picked[..n] {
-            let _ = out.write(&self.counters[at].status(now, self.names[at]));
+            if out
+                .write(&self.counters[at].status(now, self.names[at]))
+                .is_err()
+            {
+                return;
+            }
             self.reported[at] = self.counters[at];
             self.next_status = (at + 1) % self.counters.len();
         }
+    }
+}
+
+/// Closes an `Os` handle under a reactor-own token.
+fn close(reactor: &mut Reactor, os: RawHandle) {
+    reactor.push_own(Sqe::new(Token::new(0), os, Op::CLOSE));
+}
+
+/// Counts one finished op: its result, and the bytes it moved.
+fn count(counters: &mut Counters, kind: OpKind, cqe: &Cqe) {
+    let ok = cqe.status.result().is_ok();
+    counters.completed += 1;
+    counters.failed += u64::from(!ok);
+    let moved = match ok {
+        true => u64::from(cqe.out.as_len().unwrap_or(0)),
+        false => 0,
+    };
+    match kind {
+        OpKind::Read | OpKind::Recv => counters.bytes_in += moved,
+        OpKind::Write | OpKind::Send | OpKind::SendTo => counters.bytes_out += moved,
+        _ => {}
     }
 }
 
@@ -483,12 +502,14 @@ impl Step for CompleteStep {
         host.reactor.reap(&mut self.done);
         for (src, cqe) in self.done.drain(..) {
             let at = usize::from(src.0);
-            if let Some(cqe) = host.land(at, cqe) {
-                let _ = self.cqs[at].write(&cqe);
+            if let (Some(cqe), Some(cq)) = (host.land(at, cqe), self.cqs.get(at)) {
+                let _ = cq.write(&cqe);
             }
         }
         for (at, cqe) in host.early.drain(..) {
-            let _ = self.cqs[at].write(&cqe);
+            if let Some(cq) = self.cqs.get(at) {
+                let _ = cq.write(&cqe);
+            }
         }
         host.report(now, &self.status);
         report_dropped(&mut self.log, &self.dropped, now);

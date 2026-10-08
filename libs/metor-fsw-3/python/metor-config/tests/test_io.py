@@ -153,6 +153,15 @@ class ResourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "identifier"):
             fsw.resource("not a name", Udp("127.0.0.1:0"))
 
+    def test_io_status_reads_io_complete(self) -> None:
+        fsw = Target(cycle_rate=10.0)
+        with self.assertRaisesRegex(ConfigError, "io_status"):
+            fsw.io_status
+        fsw.add("gps", Gps(uart=fsw.resource("gps1", Tty("/dev/ttyTHS0"))))
+        port = fsw.io_status
+        self.assertEqual((port.ref.system, port.ref.port), ("io_complete", "io_status"))
+        self.assertIs(port.record, ResourceStatus)
+
     def test_io_step_names_are_reserved(self) -> None:
         fsw = Target(cycle_rate=10.0)
         gps1 = fsw.resource("gps1", Tty("/dev/ttyTHS0"))
