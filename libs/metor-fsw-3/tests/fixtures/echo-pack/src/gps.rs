@@ -3,8 +3,11 @@
 
 use core::time::Duration;
 
-use metor_fsw_3::io::{Cap, Read, Uart, Write};
-use metor_fsw_3::{Input, IoInit, Log, Output, Record, Seq, SeqError, Slot, sequence, system};
+use metor_fsw_3::io::test::ScriptedUart;
+use metor_fsw_3::io::{Cap, DeviceSide, Read, Uart, Write};
+use metor_fsw_3::{
+    Input, IoInit, Log, Output, Record, Seq, SeqError, Slot, Timestamp, sequence, system,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -176,6 +179,28 @@ pub fn gps(#[state] s: &mut GpsState, uart: &Cap<Uart>, fix: &mut Output<Gps>, l
     }
 }
 
+/// The params for `uart_script`.
+#[derive(Deserialize, JsonSchema)]
+pub struct UartScriptParams {
+    /// What the device sends, one entry per read.
+    pub script: Vec<String>,
+}
+
+pub struct UartScript(ScriptedUart);
+
+impl UartScript {
+    pub fn new(params: UartScriptParams) -> Self {
+        let chunks = params.script.into_iter().map(String::into_bytes);
+        Self(ScriptedUart::scripted(chunks))
+    }
+}
+
+/// A serial device that answers reads from a script.
+#[system]
+pub fn uart_script(#[state] s: &mut UartScript, now: Timestamp, uart: &mut DeviceSide<Uart>) {
+    uart.serve(now, &mut s.0);
+}
+
 /// The params for `until_fix`.
 #[derive(Deserialize, JsonSchema)]
 pub struct UntilFixParams {
@@ -278,6 +303,25 @@ mod tests {
                 .flat_map(|l| l.fields.into_iter().map(|(_, v)| v.to_string()))
                 .collect()
         }
+    }
+
+    #[test]
+    fn uart_script_answers_a_read_per_line() {
+        use metor_fsw_3::io::test::device;
+        use metor_fsw_3::io::{BufRef, Op};
+
+        let (mut dev, mut driver) = device::<Uart>();
+        let params = UartScriptParams {
+            script: vec!["one".into(), "two".into()],
+        };
+        let mut state = UartScript::new(params);
+        let reads: Vec<_> = (0..3)
+            .map(|_| driver.request(Op::read(BufRef::new(0), None), b"").unwrap())
+            .collect();
+        uart_script()(&mut state, Timestamp(0), &mut dev);
+        assert_eq!(driver.replies().len(), 2);
+        assert_eq!(driver.driver_bytes(reads[0]), b"one");
+        assert_eq!(driver.driver_bytes(reads[1]), b"two");
     }
 
     #[test]

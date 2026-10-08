@@ -227,6 +227,25 @@ class Gps(System):
     status: OutPort[SystemStatus]
 
 
+class UartScript(System):
+    "A serial device that answers reads from a script."
+
+    _pack = PACK
+    _ty = "uart_script"
+    _ports = {"log": LogEvent, "status": SystemStatus}
+    _devices = {"uart": "uart"}
+
+    def __init__(self, *, uart: ResourceHandle, script: list[str]) -> None:
+        """
+        Args:
+            script: What the device sends, one entry per read.
+        """
+        super().__init__({}, {"script": script}, grants={"uart": uart})
+
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
 class UntilFix(System):
     "Completes on the first fix, or fails after `timeout_s` of cycle time."
 

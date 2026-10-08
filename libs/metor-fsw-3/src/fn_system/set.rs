@@ -13,7 +13,7 @@ use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::io::device::DeviceSide;
 use crate::io::queue::{Io, Table};
-use crate::io::{Cqe, End, SharedIo, Sqe, Tables};
+use crate::io::{End, SharedIo, Sqe, Tables};
 use crate::log::LogPort;
 use crate::port::{Input, Output, Samplers};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
@@ -133,7 +133,12 @@ pub(crate) fn bind<S: Ports>(
     let io_out = outputs.split_off(outputs.len() - io_ports);
     outputs.push(log);
     let dropped = Arc::<AtomicU32>::default();
-    let (io, devices) = io_ends(table, io_in, io_out, &tables, &dropped);
+    let held: Vec<usize> = {
+        let shared = io.borrow();
+        let devices = defs.grants.iter().filter(|g| g.end == End::Device);
+        devices.map(|g| shared.held_cap(id, &g.param)).collect()
+    };
+    let (io, devices) = io_ends(table, io_in, io_out, &tables, &held);
     let ins = bind_inputs::<S, NoWake>(inputs, defs.inputs.len() - io_ports);
     let mut writers = writers(outputs, defs.outputs.len() - io_ports + 1, dropped);
     writers.io = io.clone();
@@ -148,7 +153,7 @@ fn io_ends(
     inputs: Vec<InputBinding>,
     outputs: Vec<OutputBinding>,
     tables: &Tables,
-    dropped: &Arc<AtomicU32>,
+    held: &[usize],
 ) -> (Option<Io>, VecDeque<DeviceSide<crate::io::device::Erased>>) {
     let mut ports = inputs.into_iter().zip(outputs);
     let io = table.and_then(|table| {
@@ -156,9 +161,10 @@ fn io_ends(
         Some(Io::new(Output::new(sq.writer), Input::new(cq.views), table))
     });
     let devices = ports
-        .map(|(req, rep)| {
-            let replies = Output::<Cqe>::counting(rep.writer, dropped.clone());
-            DeviceSide::new(Input::<Sqe>::new(req.views), replies, tables.clone())
+        .zip(held)
+        .map(|((req, rep), &held)| {
+            let (requests, replies) = (Input::<Sqe>::new(req.views), Output::new(rep.writer));
+            DeviceSide::new(requests, replies, tables.clone(), held)
         })
         .collect();
     (io, devices)

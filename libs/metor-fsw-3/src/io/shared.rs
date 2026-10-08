@@ -79,6 +79,32 @@ impl IoShared {
 }
 
 impl IoShared {
+    /// How many grants name `resource` in the config.
+    #[cfg(all(feature = "host", unix))]
+    pub(crate) fn grants_on(&self, resource: &str) -> usize {
+        let grants = self.grants.iter().flat_map(|(_, g)| g);
+        grants.filter(|g| g.resource == resource).count()
+    }
+
+    /// How many ops the device end on system `id`'s parameter `param` holds:
+    /// `MAX_OPS` for each host grant on its resource, at least one.
+    pub(crate) fn held_cap(&self, id: &str, param: &str) -> usize {
+        #[cfg(all(feature = "host", unix))]
+        let hosts = self
+            .grants
+            .iter()
+            .filter(|(system, _)| system == id)
+            .flat_map(|(_, g)| g)
+            .find(|g| g.param == param)
+            .map_or(1, |g| self.grants_on(&g.resource).saturating_sub(1));
+        #[cfg(not(all(feature = "host", unix)))]
+        let hosts = {
+            let _ = (id, param);
+            1
+        };
+        super::MAX_OPS * hosts.max(1)
+    }
+
     pub(crate) fn find(&self, id: &str) -> Option<Rc<Member>> {
         self.members.iter().find(|m| m.id == id).cloned()
     }

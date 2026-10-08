@@ -1,9 +1,9 @@
-//! Simulated peripherals: traits a model implements, and the functions that
-//! answer one op with them.
+//! The traits a model implements, and the functions that answer one op with
+//! them.
 
 use metor_proto::types::Timestamp;
 
-use super::{IoError, IoStatus, Op, Out, Sqe, TtyConfig, TtyOp};
+use super::super::{GpioOp, IoError, IoStatus, Op, OpKind, Out, Sqe, TtyConfig, TtyOp};
 
 /// A simulated serial device.
 pub trait UartModel {
@@ -13,6 +13,25 @@ pub trait UartModel {
     fn tx(&mut self, now: Timestamp, bytes: &[u8]) -> Result<usize, IoError>;
     fn configure(&mut self, now: Timestamp, cfg: &TtyConfig) -> Result<(), IoError>;
     fn tick(&mut self, now: Timestamp);
+
+    /// How many serves an op of `kind` waits before the model sees it.
+    fn latency(&self, kind: OpKind) -> u32 {
+        let _ = kind;
+        0
+    }
+}
+
+/// A simulated GPIO line.
+pub trait GpioModel {
+    fn get(&mut self, now: Timestamp) -> Result<bool, IoError>;
+    fn set(&mut self, now: Timestamp, level: bool) -> Result<(), IoError>;
+    fn tick(&mut self, now: Timestamp);
+
+    /// How many serves an op of `kind` waits before the model sees it.
+    fn latency(&self, kind: OpKind) -> u32 {
+        let _ = kind;
+        0
+    }
 }
 
 /// A model's answer to one op.
@@ -61,6 +80,22 @@ pub fn serve_uart(
             ..
         }
         | Op::Close { .. } => Reply::of(Ok(Out::UNIT)),
+        _ => Reply::of(Err(IoError::Unsupported)),
+    }
+}
+
+/// Answers one op on a GPIO line. A get answers the level as `Out::Len`.
+pub fn serve_gpio(model: &mut impl GpioModel, now: Timestamp, sqe: &Sqe) -> Reply {
+    match &sqe.op {
+        Op::Gpio {
+            op: GpioOp::Get { .. },
+            ..
+        } => Reply::of(model.get(now).map(|level| Out::len(u32::from(level)))),
+        Op::Gpio {
+            op: GpioOp::Set { value, .. },
+            ..
+        } => Reply::of(model.set(now, *value != 0).map(|()| Out::UNIT)),
+        Op::Close { .. } => Reply::of(Ok(Out::UNIT)),
         _ => Reply::of(Err(IoError::Unsupported)),
     }
 }

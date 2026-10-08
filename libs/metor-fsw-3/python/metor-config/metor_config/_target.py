@@ -153,10 +153,10 @@ class Target:
     def _check_grants(self, name: str, system: System) -> None:
         """Raises `ConfigError` unless every `Cap` of ``system`` is granted a
         resource of this target that provides its interface."""
-        caps = type(system)._caps
+        caps = type(system)._caps | type(system)._devices
         for param, grant in system._grants.items():
             if param not in caps:
-                raise ConfigError(f"`{name}` has no `Cap` parameter `{param}`")
+                raise ConfigError(f"`{name}` has no `Cap` or `DeviceSide` parameter `{param}`")
             if not isinstance(grant, ResourceHandle) or grant.target is not self:
                 raise ConfigError(f"`{name}.{param}` takes a resource of this target, got {grant!r}")
             if grant.kind.interface != caps[param]:
@@ -238,12 +238,12 @@ class Target:
         }
 
     def _granted(self) -> list[str]:
-        """Returns each system with grants, in step order."""
-        return [name for name, system, _ in self._systems if system._grants]
+        """Returns each system with a `Cap`, in step order."""
+        return [name for name, system, _ in self._systems if type(system)._caps]
 
     def _io_steps(self) -> list[dict[str, Any]]:
-        """Returns `io_submit` and `io_complete`, wired to every system with
-        grants, or nothing when no system has any."""
+        """Returns `io_submit` and `io_complete`, wired to every system with a
+        `Cap`, or nothing when no system has one."""
         granted = self._granted()
         if not granted:
             return []
@@ -293,6 +293,7 @@ class Target:
             entry["grants"] = [
                 {"param": param, "resource": grant.name} for param, grant in system._grants.items()
             ]
+        if type(system)._caps:
             entry["inputs"].append(
                 {"port": "io_cq", "from": [{"system": IO_COMPLETE, "port": name}]}
             )

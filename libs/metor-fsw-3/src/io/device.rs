@@ -6,14 +6,18 @@ use core::marker::PhantomData;
 use crate::port::{Input, Output, SendError};
 
 use super::cap::Interface;
+use super::sim::Held;
 use super::{BufRef, Cqe, IoError, Sqe, Tables};
 
 /// The device end of a simulated resource: requests from drivers come in,
 /// and the model writes their replies.
 pub struct DeviceSide<K: Interface> {
-    requests: Input<Sqe>,
-    replies: Output<Cqe>,
+    pub(super) requests: Input<Sqe>,
+    pub(super) replies: Output<Cqe>,
     tables: Tables,
+    pub(super) held: Held,
+    /// How many times `serve` has run.
+    pub(super) serves: u64,
     _k: PhantomData<K>,
 }
 
@@ -25,11 +29,19 @@ impl Interface for Erased {
 }
 
 impl DeviceSide<Erased> {
-    pub(crate) fn new(requests: Input<Sqe>, replies: Output<Cqe>, tables: Tables) -> Self {
+    /// A device end whose `serve` holds at most `held` ops.
+    pub(crate) fn new(
+        requests: Input<Sqe>,
+        replies: Output<Cqe>,
+        tables: Tables,
+        held: usize,
+    ) -> Self {
         Self {
             requests,
             replies,
             tables,
+            held: Held::new(held),
+            serves: 0,
             _k: PhantomData,
         }
     }
@@ -39,6 +51,8 @@ impl DeviceSide<Erased> {
             requests: self.requests,
             replies: self.replies,
             tables: self.tables,
+            held: self.held,
+            serves: self.serves,
             _k: PhantomData,
         }
     }

@@ -17,7 +17,6 @@ mod handle;
 #[cfg(all(feature = "host", unix))]
 mod handles;
 mod kind;
-mod model;
 mod op;
 #[cfg(all(feature = "host", unix))]
 mod open;
@@ -33,6 +32,7 @@ pub(crate) mod queue;
 mod reactor;
 mod record;
 pub(crate) mod shared;
+mod sim;
 mod slot;
 mod status;
 #[cfg(all(feature = "host", unix))]
@@ -53,7 +53,6 @@ pub use cap::{
 pub use device::DeviceSide;
 pub use handle::{RawHandle, Token};
 pub use kind::{Access, Backing, CanFilter, GpioDirection, RealKind, ResourceConfig, SimKind};
-pub use model::{Reply, UartModel, fills, serve_uart};
 pub use op::{GpioOp, Op, OpKind, OpenFlags, Sqe, TtyConfig, TtyOp};
 #[cfg(all(feature = "host", unix))]
 pub use open::{OpenError, Opened, open};
@@ -69,6 +68,7 @@ pub use queue::Io;
 #[cfg(all(feature = "host", unix))]
 pub use reactor::{Limits, Reactor, SourceId};
 pub use shared::{IoShared, SharedIo};
+pub use sim::{GpioModel, Model, Reply, UartModel, fills, serve_gpio, serve_uart};
 pub use slot::{Buf, IoInit, Slot};
 pub use status::ResourceStatus;
 #[cfg(all(feature = "host", unix))]

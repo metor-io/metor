@@ -45,7 +45,8 @@ class {{ system.name }}(System):
 {% if system.takes_inputs %}    _takes_inputs = True
 {% endif %}{% if system.takes_outputs %}    _takes_outputs = True
 {% endif %}    _ports = {{ '{' }}{% for port in system.ports %}{{ port.name | python_string }}: {{ port.record }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
-{% if system.caps %}    _caps = {{ '{' }}{% for cap in system.caps %}{{ cap.name | python_string }}: {{ cap.interface | python_string }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
+{% if system.host_caps %}    _caps = {{ '{' }}{% for cap in system.host_caps %}{{ cap.name | python_string }}: {{ cap.interface | python_string }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
+{% endif %}{% if system.devices %}    _devices = {{ '{' }}{% for cap in system.devices %}{{ cap.name | python_string }}: {{ cap.interface | python_string }}{% if not loop.last %}, {% endif %}{% endfor %}{{ '}' }}
 {% endif %}
     def __init__(self
         {%- if system.inputs or system.params or system.caps or system.takes_inputs or system.takes_outputs %}, *{% endif %}

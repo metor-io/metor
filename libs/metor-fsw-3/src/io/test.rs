@@ -16,8 +16,8 @@ use crate::record::Record;
 
 use super::cap::{Cap, Handle, Interface, Uart};
 use super::device::DeviceSide;
-use super::model::{Reply, UartModel, fills, serve_uart};
 use super::queue::{Io, Table};
+use super::sim::{Model, Reply, UartModel, fills};
 use super::{
     BufError, BufTable, Cqe, Errno, IoError, IoInit, IoStatus, MAX_OPS, Op, Out, Sqe, Tables,
     Token, TtyConfig,
@@ -33,23 +33,6 @@ fn ring<T: Record>(depth: usize) -> RingBuffer {
         capacity: ring_capacity(T::MAX_LEN, depth).expect("a small ring"),
         max_readers: 1,
     })
-}
-
-/// A model that answers ops on interface `K`.
-pub trait Model<K: Interface> {
-    /// Answers one op. `bytes` is the op's buffer, as [`serve_uart`] takes it.
-    fn serve(&mut self, now: Timestamp, sqe: &Sqe, bytes: &mut [u8]) -> Reply;
-    fn tick(&mut self, now: Timestamp);
-}
-
-impl<M: UartModel> Model<Uart> for M {
-    fn serve(&mut self, now: Timestamp, sqe: &Sqe, bytes: &mut [u8]) -> Reply {
-        serve_uart(self, now, sqe, bytes)
-    }
-
-    fn tick(&mut self, now: Timestamp) {
-        UartModel::tick(self, now);
-    }
 }
 
 /// The reactor side of a [`cap`]: it answers the cap's ops with model `M`.
@@ -129,7 +112,7 @@ impl<M: Model<K>, K: Interface> TestIo<M, K> {
             Some(buf) => unsafe { bufs.filled_mut(buf.slot()) },
             None => &mut [],
         };
-        match self.model.serve(self.now, &sqe, bytes) {
+        match self.model.answer(self.now, &sqe, bytes) {
             Reply::Ready(status, out) => self.post(Cqe::new(sqe.token, status, out)),
             Reply::Later => self.held.push(sqe),
         }
@@ -192,6 +175,12 @@ pub struct TestDevice {
 /// A `DeviceSide<K>` whose requests the test writes through the returned
 /// [`TestDevice`].
 pub fn device<K: Interface>() -> (DeviceSide<K>, TestDevice) {
+    device_shared::<K>(1)
+}
+
+/// A [`device`] on a resource with `hosts` host grants, so it holds
+/// `hosts * MAX_OPS` ops.
+pub fn device_shared<K: Interface>(hosts: usize) -> (DeviceSide<K>, TestDevice) {
     let (req_ring, rep_ring) = (ring::<Sqe>(MAX_OPS * 4), ring::<Cqe>(MAX_OPS * 4));
     // PANIC Safety: each fresh ring has one writer and one reader slot.
     let writer = |r: &RingBuffer| r.writer(NoWake).expect("a fresh writer");
@@ -203,6 +192,7 @@ pub fn device<K: Interface>() -> (DeviceSide<K>, TestDevice) {
         Input::new(vec![view(&req_ring)]),
         Output::new(writer(&rep_ring)),
         tables,
+        MAX_OPS * hosts,
     );
     let test = TestDevice {
         table,

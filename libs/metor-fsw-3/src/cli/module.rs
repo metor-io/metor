@@ -89,13 +89,17 @@ struct Entry {
     takes_outputs: bool,
     inputs: Vec<Port>,
     params: Vec<Field>,
-    /// Each `Cap` parameter, with the interface it takes.
+    /// Each `Cap` and `DeviceSide` parameter, with the interface it takes.
     caps: Vec<CapKw>,
+    /// The `Cap` parameters among `caps`.
+    host_caps: Vec<CapKw>,
+    /// The `DeviceSide` parameters among `caps`.
+    devices: Vec<CapKw>,
     /// Every output port with its record class. The built-in ports come last.
     ports: Vec<Port>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct CapKw {
     name: String,
     interface: String,
@@ -296,16 +300,13 @@ fn entry(
     defs: &BTreeMap<String, Value>,
 ) -> Result<Entry, PackDevError> {
     let params = fields(schema, defs, false);
-    let caps: Vec<CapKw> = system
-        .def
-        .grants
-        .iter()
-        .filter(|g| g.end == End::Host)
-        .map(|g| CapKw {
-            name: g.param.to_string(),
-            interface: g.interface.to_string(),
-        })
-        .collect();
+    let kw = |g: &GrantDef| CapKw {
+        name: g.param.to_string(),
+        interface: g.interface.to_string(),
+    };
+    let grants = &system.def.grants;
+    let caps: Vec<CapKw> = grants.iter().map(kw).collect();
+    let end = |end: End| grants.iter().filter(move |g| g.end == end).map(kw);
     let input = |name: &str| wired_inputs(system).any(|port| port.name == name);
     let param = |name: &str| params.iter().any(|field| field.name == name);
     let clash = params.iter().map(|f| &f.name).find(|name| input(name));
@@ -336,6 +337,8 @@ fn entry(
         inputs: wired_inputs(system).map(port).collect(),
         params,
         caps,
+        host_caps: end(End::Host).collect(),
+        devices: end(End::Device).collect(),
         ports: declared.map(port).chain(builtin).collect(),
     })
 }
@@ -676,6 +679,29 @@ mod tests {
         );
         assert!(
             text.contains("grants={\"main\": main, \"aux\": aux})"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_device_sides_render_apart_from_caps() {
+        let mut def = capped(None, &["host"]);
+        def.def.grants.push(GrantDef {
+            param: "dev".into(),
+            interface: "gpio_line".into(),
+            end: End::Device,
+        });
+        let text = rendered(vec![def]).expect("renders");
+        assert!(
+            text.contains("    _caps = {\"host\": \"uart\"}\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    _devices = {\"dev\": \"gpio_line\"}\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("grants={\"host\": host, \"dev\": dev})"),
             "{text}"
         );
     }
