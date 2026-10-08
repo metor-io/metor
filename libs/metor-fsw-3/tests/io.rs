@@ -182,3 +182,130 @@ fn can_opens_on_vcan0() {
         FdClass::Can
     );
 }
+
+mod through_the_io_steps {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use metor_fsw_3::coordinator::{
+        CoordinatorConfig, InputConfig, OutputConfig, SystemConfig, SystemTable,
+    };
+    use metor_fsw_3::io::{
+        Backing, Cap, Grant, IO_COMPLETE_TYPE, IO_CQ, IO_SQ, IO_STATUS_PORT, IO_SUBMIT_TYPE,
+        RealKind, Recv, ResourceConfig, Send, Udp,
+    };
+    use metor_fsw_3::{Input, IoInit, ResourceStatus, Slot, Timestamp, system};
+
+    type Got = Rc<RefCell<Vec<Vec<u8>>>>;
+
+    /// Sends `ping` once, and receives whatever arrives.
+    struct Pinger {
+        tx: Slot<Send>,
+        rx: Slot<Recv>,
+        sent: bool,
+        got: Got,
+    }
+
+    #[system]
+    fn pinger(#[state] s: &mut Pinger, udp: &Cap<Udp>) {
+        let _ = s.tx.poll();
+        if let Some(Ok(_)) = s.rx.poll() {
+            s.got.borrow_mut().push(s.rx.bytes().to_vec());
+        }
+        if !s.sent
+            && let Some(buf) = s.tx.take_idle()
+        {
+            s.sent = true;
+            s.tx = Slot::Busy(udp.send(buf));
+        }
+        if let Some(buf) = s.rx.take_idle() {
+            s.rx = Slot::Busy(udp.recv(buf));
+        }
+    }
+
+    #[system]
+    fn status_probe(
+        #[state] seen: &mut Rc<RefCell<Vec<ResourceStatus>>>,
+        st: &mut Input<ResourceStatus>,
+    ) {
+        seen.borrow_mut().extend(st.drain().flatten().copied());
+    }
+
+    /// A free local UDP port.
+    fn free_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn datagram_to_itself_completes_a_recv() {
+        let (got, status) = (
+            Got::default(),
+            Rc::<RefCell<Vec<ResourceStatus>>>::default(),
+        );
+        let mut table = SystemTable::new();
+        metor_fsw_3::link::register_builtins(&mut table).unwrap();
+        let g = got.clone();
+        let make = move |io: &IoInit<'_>| Pinger {
+            tx: Slot::Idle(io.alloc_from(b"ping")),
+            rx: Slot::Idle(io.alloc(64)),
+            sent: false,
+            got: g.clone(),
+        };
+        table.register("pinger", pinger(), make).unwrap();
+        let st = status.clone();
+        table
+            .register("status_probe", status_probe(), move || st.clone())
+            .unwrap();
+
+        let addr = format!("127.0.0.1:{}", free_port());
+        let config = CoordinatorConfig {
+            resources: vec![ResourceConfig {
+                id: "loop".into(),
+                backing: Backing::Real(RealKind::Udp {
+                    bind: addr.clone(),
+                    connect: Some(addr),
+                }),
+            }],
+            systems: vec![
+                SystemConfig {
+                    grants: vec![Grant {
+                        param: "udp".into(),
+                        resource: "loop".into(),
+                    }],
+                    inputs: vec![InputConfig::new(IO_CQ, "io_complete", "p")],
+                    ..SystemConfig::new("p", "pinger")
+                },
+                SystemConfig {
+                    inputs: vec![InputConfig::new("p", "p", IO_SQ)],
+                    ..SystemConfig::new("io_submit", IO_SUBMIT_TYPE)
+                },
+                SystemConfig {
+                    outputs: vec![OutputConfig::record("p", "io_cqe")],
+                    ..SystemConfig::new("io_complete", IO_COMPLETE_TYPE)
+                },
+                SystemConfig {
+                    inputs: vec![InputConfig::new("st", "io_complete", IO_STATUS_PORT)],
+                    ..SystemConfig::new("probe", "status_probe")
+                },
+            ],
+            ..CoordinatorConfig::default()
+        };
+        let mut coordinator = config.build(&table).unwrap();
+        for t in 0..500 {
+            coordinator.step(Timestamp(t));
+            if !got.borrow().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(got.borrow().as_slice(), [b"ping".to_vec()]);
+        let last = *status.borrow().last().expect("an io_status record");
+        assert_eq!(last.resource.to_str().unwrap(), "loop");
+        assert_eq!((last.bytes_out, last.bytes_in), (4, 4));
+    }
+}

@@ -14,7 +14,7 @@ use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 
 use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
-use crate::io::{Backing, End, ResourceConfig, SharedIo};
+use crate::io::{Backing, End, IO_COMPLETE_TYPE, IO_SUBMIT_TYPE, ResourceConfig, SharedIo};
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
@@ -87,6 +87,7 @@ impl CoordinatorConfig {
         let mut threads = Threads::new();
         let io = SharedIo::default();
         io.borrow_mut().resources = self.resources.clone();
+        io.borrow_mut().grants = granted(&self.systems);
         let entries = bind_rings(&plan, &rings, &mut threads, &io)?;
 
         Ok(Coordinator {
@@ -148,8 +149,84 @@ fn resolve<'a>(
             base_ring_idx,
         });
     }
+    check_io_steps(config, &plan)?;
     resolve_edges(config, &mut plan, &index)?;
     Ok(plan)
+}
+
+/// Checks the io steps' place and wiring.
+///
+/// A config whose systems hold a `Cap` needs one `io_submit`, after every
+/// such system, and one `io_complete` after it, each listing exactly those
+/// systems in step order. Neither io step takes a channel.
+fn check_io_steps(config: &CoordinatorConfig, plan: &Plan<'_>) -> Result<(), BuildError> {
+    let io_types = [IO_SUBMIT_TYPE, IO_COMPLETE_TYPE];
+    for system in &config.systems {
+        if io_types.contains(&system.ty.as_str())
+            && matches!(system.adapter, Some(Adapter::Channel(_)))
+        {
+            let id = system.id.clone();
+            return Err(BuildError::IoAdapter { id });
+        }
+    }
+    let granted: Vec<usize> = plan
+        .systems
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.def.grants.iter().any(|g| g.end == End::Host))
+        .map(|(at, _)| at)
+        .collect();
+    if granted.is_empty() {
+        return Ok(());
+    }
+    let submit = only(config, IO_SUBMIT_TYPE)?;
+    let complete = only(config, IO_COMPLETE_TYPE)?;
+    let error = |message: String| Err(BuildError::IoSystems { message });
+    if complete < submit {
+        return error("io_complete comes before io_submit".into());
+    }
+    if let Some(&late) = granted.iter().find(|&&at| at > submit) {
+        let id = &config.systems[late].id;
+        return error(format!("`{id}` holds a `Cap` but comes after io_submit"));
+    }
+    let ids: Vec<&str> = granted
+        .iter()
+        .map(|&at| config.systems[at].id.as_str())
+        .collect();
+    let sqs: Vec<&str> = config.systems[submit]
+        .inputs
+        .iter()
+        .map(|i| i.port.as_str())
+        .collect();
+    let cqs: Vec<&str> = config.systems[complete]
+        .outputs
+        .iter()
+        .map(|o| o.port.as_str())
+        .collect();
+    if sqs != ids || cqs != ids {
+        return error(format!(
+            "io_submit and io_complete must list {ids:?}, in that order"
+        ));
+    }
+    Ok(())
+}
+
+/// The index of the one system of type `ty`.
+fn only(config: &CoordinatorConfig, ty: &str) -> Result<usize, BuildError> {
+    let mut found = config
+        .systems
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.ty == ty);
+    match (found.next(), found.next()) {
+        (Some((at, _)), None) => Ok(at),
+        (None, _) => Err(BuildError::IoSystems {
+            message: format!("systems hold a `Cap`, so the config needs one {ty}"),
+        }),
+        (Some(_), Some(_)) => Err(BuildError::IoSystems {
+            message: format!("the config has more than one {ty}"),
+        }),
+    }
 }
 
 /// Returns the definition of system `id`'s `status` output.
@@ -354,6 +431,12 @@ fn check_grants(system: &SystemConfig, def: &SystemDef) -> Result<(), BuildError
         }
     }
     Ok(())
+}
+
+/// Each system's grants, for `io_submit`'s make.
+fn granted(systems: &[SystemConfig]) -> Vec<(String, Vec<crate::io::Grant>)> {
+    let granted = systems.iter().filter(|s| !s.grants.is_empty());
+    granted.map(|s| (s.id.clone(), s.grants.clone())).collect()
 }
 
 /// Checks that resource ids are unique and that each backing is one this

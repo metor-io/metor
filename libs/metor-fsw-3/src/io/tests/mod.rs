@@ -11,6 +11,8 @@ mod queue;
 #[cfg(all(test, feature = "host", unix))]
 mod reactor;
 mod slot;
+#[cfg(all(test, feature = "host", unix))]
+pub(crate) mod system;
 #[cfg(all(test, feature = "host", target_os = "linux"))]
 mod uring;
 

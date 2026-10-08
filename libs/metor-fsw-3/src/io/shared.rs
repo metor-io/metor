@@ -1,4 +1,7 @@
 //! What the io steps and the IO systems of one build share.
+//!
+//! The io steps and the channel adapter that read most of it need `host`.
+#![cfg_attr(not(all(feature = "host", unix)), allow(dead_code))]
 
 use core::cell::Cell;
 use std::cell::RefCell;
@@ -18,16 +21,14 @@ pub struct IoShared {
     /// Every system with a `Cap`, in make order.
     pub(crate) members: Vec<Rc<Member>>,
     /// The target's resources, in config order.
+    #[cfg(all(feature = "host", unix))]
     pub(crate) resources: Vec<super::ResourceConfig>,
+    /// Each system's grants from the config, by system id.
+    #[cfg(all(feature = "host", unix))]
+    pub(crate) grants: Vec<(String, Vec<super::Grant>)>,
     /// The reactor and what the io steps keep, once `io_submit` is made.
     #[cfg(all(feature = "host", unix))]
-    pub(crate) host: Option<IoHost>,
-}
-
-/// The io steps' state: the reactor every member's ops go through.
-#[cfg(all(feature = "host", unix))]
-pub(crate) struct IoHost {
-    pub(crate) reactor: super::Reactor,
+    pub(crate) host: Option<super::system::IoHost>,
 }
 
 /// Whether a member is waiting for its old ops to finish before a remake.
@@ -47,13 +48,17 @@ pub type SharedIo = Rc<RefCell<IoShared>>;
 pub(crate) struct Member {
     pub(crate) id: String,
     pub(crate) table: Rc<Table>,
+    /// The system's `Cap` parameters, in definition order. Grant `n` is
+    /// `caps[n]`.
+    pub(crate) caps: Vec<String>,
     pub(crate) quiesce: Quiesce,
 }
 
 impl IoShared {
-    /// The member for system `id`, made on its first make. A later make
-    /// rewinds its table, which fails while the old system holds a slot.
-    pub(crate) fn member(&mut self, id: &str) -> Result<Rc<Member>, ParamError> {
+    /// The member for system `id`, whose `Cap` parameters are `caps`, made on
+    /// its first make. A later make rewinds its table, which fails while the
+    /// old system holds a slot.
+    pub(crate) fn member(&mut self, id: &str, caps: Vec<String>) -> Result<Rc<Member>, ParamError> {
         if let Some(member) = self.members.iter().find(|m| m.id == id) {
             member.table.bufs.rewind().map_err(|_| ParamError::IoBusy {
                 system: id.to_string(),
@@ -65,6 +70,7 @@ impl IoShared {
         let member = Rc::new(Member {
             id: id.to_string(),
             table,
+            caps,
             quiesce: Quiesce::default(),
         });
         self.members.push(member.clone());

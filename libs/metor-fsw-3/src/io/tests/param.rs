@@ -9,6 +9,7 @@ use crate::coordinator::{BuildError, CoordinatorConfig, InputConfig, SystemConfi
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{AsyncSystemFn, FnSystem, SystemFn};
 use crate::io::SharedIo;
+use crate::io::tests::system::{io_steps, script, with_io};
 use crate::io::*;
 use crate::port::{DynInputs, Input, Output};
 use crate::system::{PortDef, System, SystemDef};
@@ -109,11 +110,11 @@ fn async_systems_refuse_io() {
     assert_eq!(async_def(async_device()), refused("async_device"));
 }
 
-/// Closes its uart once, on the first cycle.
+/// Closes its socket once, on the first cycle.
 #[system]
-fn closer(#[state] closing: &mut Option<Pending<Close>>, uart: &Cap<Uart>) {
+fn closer(#[state] closing: &mut Option<Pending<Close>>, udp: &Cap<Udp>) {
     if closing.is_none() {
-        *closing = Some(uart.close());
+        *closing = Some(udp.close());
     }
 }
 
@@ -129,13 +130,13 @@ fn granted(grants: Vec<Grant>) -> SystemConfig {
     }
 }
 
-/// The serial port every test grant names.
+/// The socket every test grant names.
 fn gps1() -> ResourceConfig {
     ResourceConfig {
         id: "gps1".into(),
-        backing: Backing::Real(RealKind::Tty {
-            path: "/dev/null".into(),
-            baud: 9600,
+        backing: Backing::Real(RealKind::Udp {
+            bind: "127.0.0.1:0".into(),
+            connect: None,
         }),
     }
 }
@@ -160,8 +161,9 @@ fn build(
     table
         .register("two_uarts", two_uarts(), Default::default)
         .unwrap();
+    io_steps(&mut table);
     let config = CoordinatorConfig {
-        systems,
+        systems: with_io(systems),
         resources: vec![gps1()],
         ..CoordinatorConfig::default()
     };
@@ -175,7 +177,7 @@ fn granted_cap_writes_its_queue() {
         inputs: vec![InputConfig::new("sq", "closer", IO_SQ)],
         ..SystemConfig::new("probe", "sq_probe")
     };
-    let mut coordinator = build(vec![granted(vec![grant("uart")]), probe], &seen).unwrap();
+    let mut coordinator = build(vec![granted(vec![grant("udp")]), probe], &seen).unwrap();
     coordinator.step(Timestamp(0));
     let seen = seen.borrow();
     assert_eq!(seen.len(), 1);
@@ -188,22 +190,22 @@ fn grants_are_checked_at_build() {
     let seen = Rc::default();
     let err = |grants| build(vec![granted(grants)], &seen).err();
     let error = |param: &str| ("closer".to_string(), param.to_string());
-    let (system, param) = error("uart");
+    let (system, param) = error("udp");
     assert_eq!(err(vec![]), Some(BuildError::Ungranted { system, param }));
-    let (system, param) = error("uart");
-    let twice = vec![grant("uart"), grant("uart")];
+    let (system, param) = error("udp");
+    let twice = vec![grant("udp"), grant("udp")];
     assert_eq!(
         err(twice),
         Some(BuildError::DuplicateGrant { system, param })
     );
     let (system, param) = error("gps");
-    let stray = vec![grant("uart"), grant("gps")];
+    let stray = vec![grant("udp"), grant("gps")];
     assert_eq!(err(stray), Some(BuildError::UnknownGrant { system, param }));
 }
 
 #[system]
-fn sq_clash(io_sq: &mut Output<Imu>, uart: &Cap<Uart>) {
-    let _ = (io_sq, uart);
+fn sq_clash(io_sq: &mut Output<Imu>, udp: &Cap<Udp>) {
+    let _ = (io_sq, udp);
 }
 
 #[test]
@@ -214,7 +216,7 @@ fn port_named_io_sq_clashes_with_a_cap() {
         .unwrap();
     let config = CoordinatorConfig {
         systems: vec![SystemConfig {
-            grants: vec![grant("uart")],
+            grants: vec![grant("udp")],
             ..SystemConfig::new("clash", "sq_clash")
         }],
         ..CoordinatorConfig::default()
@@ -241,14 +243,14 @@ fn io_errors_log_by_name() {
 
 /// Writes its greeting whenever its buffer is idle.
 struct Greeter {
-    tx: Slot<Write>,
+    tx: Slot<Send>,
 }
 
 #[system]
-fn greeter(#[state] s: &mut Greeter, uart: &Cap<Uart>) {
+fn greeter(#[state] s: &mut Greeter, udp: &Cap<Udp>) {
     let _ = s.tx.poll();
     if let Some(buf) = s.tx.take_idle() {
-        s.tx = Slot::Busy(uart.write(buf));
+        s.tx = Slot::Busy(udp.send(buf));
     }
 }
 
@@ -291,6 +293,7 @@ fn greeter_table(made: &Made, seen: &Rc<RefCell<Vec<Sqe>>>) -> SystemTable {
     table
         .register("sq_probe", sq_probe(), move || seen.clone())
         .unwrap();
+    io_steps(&mut table);
     table
 }
 
@@ -304,7 +307,7 @@ fn greeter_config(adapter: Option<crate::coordinator::Adapter>, cmds: bool) -> C
     systems.push(SystemConfig {
         inputs,
         adapter,
-        grants: vec![grant("uart")],
+        grants: vec![grant("udp")],
         ..SystemConfig::new("gps", "greeter")
     });
     systems.push(SystemConfig {
@@ -312,7 +315,7 @@ fn greeter_config(adapter: Option<crate::coordinator::Adapter>, cmds: bool) -> C
         ..SystemConfig::new("probe", "sq_probe")
     });
     CoordinatorConfig {
-        systems,
+        systems: with_io(systems),
         resources: vec![gps1()],
         ..CoordinatorConfig::default()
     }
@@ -328,7 +331,7 @@ fn constructor_buffer_goes_out_on_its_own_queue() {
     let slot = made.0.borrow().slots[0];
     let seen = seen.borrow();
     assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].op, Op::write(BufRef::new(slot), None));
+    assert_eq!(seen[0].op, Op::send(BufRef::new(slot)));
 }
 
 #[system]
@@ -374,6 +377,8 @@ fn reset_remakes_an_io_system_over_its_rings() {
 
     let (made, seen) = (Made::default(), Rc::<RefCell<Vec<Sqe>>>::default());
     let queue = Rc::<RefCell<Vec<SequenceCommand>>>::default();
+    // The old system's ops must finish before the remake, so the Os answers.
+    script().borrow_mut().answer = Some(Box::new(|sqe| Some(Cqe::ok(sqe.token, Out::UNIT))));
     let mut table = greeter_table(&made, &seen);
     let q = queue.clone();
     table
@@ -405,7 +410,7 @@ fn reset_remakes_an_io_system_over_its_rings() {
     coordinator.step(Timestamp(5));
     coordinator.step(Timestamp(6));
     let seen = seen.borrow();
-    assert!(seen.iter().all(|s| s.op.kind() == OpKind::Write));
+    assert!(seen.iter().all(|s| s.op.kind() == OpKind::Send));
     assert!(!seen.is_empty(), "the remade system submits");
     assert_eq!(made.0.borrow().slots.len(), 2);
 }
@@ -508,7 +513,7 @@ impl SystemFn for Serve {
 fn device_side_resolves_tables_added_later_once_frozen() {
     let io = SharedIo::default();
     let (mut outs, _, _rings) = bound(Serve, &io, "dev");
-    let member = io.borrow_mut().member("drv").unwrap();
+    let member = io.borrow_mut().member("drv", vec!["uart".into()]).unwrap();
     let slot = member.table.alloc_from(b"abc").unwrap();
     let mut buf = BufRef::new(slot);
     buf.stamp(member.table.bufs.id().unwrap());
@@ -576,11 +581,11 @@ fn granted_resource_must_provide_the_interface() {
         },
     );
     assert_eq!(
-        checked(vec![dir], "closer", "uart", "logs"),
+        checked(vec![dir], "closer", "udp", "logs"),
         Some(BuildError::Interface {
-            cap: "sys.uart".into(),
+            cap: "sys.udp".into(),
             resource: "logs".into(),
-            expected: "uart".into(),
+            expected: "udp".into(),
             found: "dir".into(),
         })
     );
@@ -604,15 +609,15 @@ fn no_kind_provides_a_stream() {
 #[test]
 fn unknown_and_duplicate_resources_fail() {
     assert_eq!(
-        checked(vec![gps1()], "closer", "uart", "gps9"),
+        checked(vec![gps1()], "closer", "udp", "gps9"),
         Some(BuildError::UnknownResource {
             system: "sys".into(),
-            param: "uart".into(),
+            param: "udp".into(),
             resource: "gps9".into(),
         })
     );
     assert_eq!(
-        checked(vec![gps1(), gps1()], "closer", "uart", "gps1"),
+        checked(vec![gps1(), gps1()], "closer", "udp", "gps1"),
         Some(BuildError::DuplicateResource { id: "gps1".into() })
     );
 }
@@ -624,7 +629,7 @@ fn peer_backing_is_refused() {
         backing: Backing::Peer("plant.down".into()),
     };
     assert_eq!(
-        checked(vec![peer], "closer", "uart", "down"),
+        checked(vec![peer], "closer", "udp", "down"),
         Some(BuildError::Backing {
             resource: "down".into(),
             backing: "peer".into(),

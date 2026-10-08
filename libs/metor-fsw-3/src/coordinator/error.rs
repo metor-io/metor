@@ -99,6 +99,12 @@ pub enum BuildError {
     #[error("`{system}` grants `{param}`, which is not a `Cap` parameter")]
     UnknownGrant { system: String, param: String },
 
+    #[error("`{id}`: the io steps take no channel")]
+    IoAdapter { id: String },
+
+    #[error("io steps: {message}")]
+    IoSystems { message: String },
+
     #[error("resource `{id}` is created twice")]
     DuplicateResource { id: String },
 

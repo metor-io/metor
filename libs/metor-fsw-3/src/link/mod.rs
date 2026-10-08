@@ -176,6 +176,14 @@ pub fn register_builtins(table: &mut SystemTable) -> Result<(), BuildError> {
         crate::channel::Registry::new,
     )?;
     table.insert(crate::dl::SLOT_TYPE, crate::dl::slot::entry())?;
+    #[cfg(unix)]
+    {
+        table.insert(crate::io::IO_SUBMIT_TYPE, crate::io::system::submit_entry())?;
+        table.insert(
+            crate::io::IO_COMPLETE_TYPE,
+            crate::io::system::complete_entry(),
+        )?;
+    }
     #[cfg(feature = "db")]
     table.register_async(DB_TYPE, db::db(), Db::new)?;
     Ok(())

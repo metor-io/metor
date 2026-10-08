@@ -15,7 +15,7 @@ mod system_attr;
 /// The derive also implements `Record` and the four metor component traits.
 /// Mark one field `#[frame(timestamp)]`.
 /// `#[frame(name = "..")]` sets the record name, which defaults to the struct
-/// name in snake_case.
+/// name in snake_case. `#[frame(depth = N)]` sets `Record::DEPTH`.
 #[proc_macro_derive(Frame, attributes(frame))]
 pub fn frame_derive(input: TokenStream) -> TokenStream {
     frame::frame(input)

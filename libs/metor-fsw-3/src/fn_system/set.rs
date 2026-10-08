@@ -13,7 +13,7 @@ use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::io::device::DeviceSide;
 use crate::io::queue::{Io, Table};
-use crate::io::{Cqe, SharedIo, Sqe, Tables};
+use crate::io::{Cqe, End, SharedIo, Sqe, Tables};
 use crate::log::LogPort;
 use crate::port::{Input, Output, Samplers};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
@@ -113,7 +113,16 @@ pub(crate) fn bind<S: Ports>(
     id: &str,
 ) -> Result<Bound<S>, ParamError> {
     let defs = Defs::declared::<S>();
-    let member = defs.io.then(|| io.borrow_mut().member(id)).transpose()?;
+    let caps = || {
+        defs.grants
+            .iter()
+            .filter(|g| g.end == End::Host)
+            .map(|g| g.param.to_string())
+    };
+    let member = defs
+        .io
+        .then(|| io.borrow_mut().member(id, caps().collect()))
+        .transpose()?;
     let table = member.map(|m| m.table.clone());
     let tables = io.borrow().tables.clone();
     let io_ports = defs.io_ports();

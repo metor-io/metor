@@ -14,6 +14,8 @@ mod buf;
 mod cap;
 pub(crate) mod device;
 mod handle;
+#[cfg(all(feature = "host", unix))]
+mod handles;
 mod kind;
 mod model;
 mod op;
@@ -32,6 +34,9 @@ mod reactor;
 mod record;
 pub(crate) mod shared;
 mod slot;
+mod status;
+#[cfg(all(feature = "host", unix))]
+pub(crate) mod system;
 pub mod test;
 #[cfg(all(feature = "host", target_os = "linux"))]
 mod uring;
@@ -65,6 +70,9 @@ pub use queue::Io;
 pub use reactor::{Limits, Reactor, SourceId};
 pub use shared::{IoShared, SharedIo};
 pub use slot::{Buf, IoInit, Slot};
+pub use status::ResourceStatus;
+#[cfg(all(feature = "host", unix))]
+pub use system::{IO_COMPLETE_TYPE, IO_STATUS_PORT, IO_SUBMIT_TYPE};
 #[cfg(all(feature = "host", target_os = "linux"))]
 pub use uring::UringOs;
 
