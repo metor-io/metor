@@ -66,8 +66,6 @@ pub enum ParamError {
     Resource { id: String, message: String },
     #[error("`{system}` feeds io_submit but holds no `Cap` made in this process")]
     NoIoMember { system: String },
-    #[error("io_complete needs an io_submit before it")]
-    NoIoSubmit,
 }
 
 #[cfg(test)]

@@ -1,6 +1,5 @@
 use std::fs::File;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::rc::Rc;
 
 use metor_proto::types::Timestamp;
 
@@ -8,7 +7,7 @@ use super::allocations;
 use crate::io::arena::Arena;
 use crate::io::host::dispatch::Resource;
 use crate::io::host::{Backed, Class, Dispatch, OpId, OsDone, OsOp, Out, Route};
-use crate::io::status::{ResourceStatus, resource_name};
+use crate::io::status::ResourceStatus;
 use crate::io::*;
 use crate::record::Record;
 use crate::tests::utils::pair;
@@ -21,26 +20,28 @@ fn null() -> OwnedFd {
 /// resource 0.
 struct Rig {
     d: Dispatch,
+    arenas: [Arena; 2],
     fd: i32,
 }
 
 fn rig() -> Rig {
-    let arena = || Rc::new(Arena::owning(vec![0; 64].into()));
     let fd = null();
     let raw = fd.as_raw_fd();
     let resources = vec![
         Resource {
-            name: resource_name("tty"),
+            id: "tty".into(),
+            sim: false,
             backed: Backed::Fd(fd, Class::Tty),
         },
         Resource {
-            name: resource_name("sim"),
+            id: "sim".into(),
+            sim: true,
             backed: Backed::Sim(4),
         },
     ];
-    let members = vec![(arena(), vec![0, 1]), (arena(), vec![0])];
     Rig {
-        d: Dispatch::new(members, resources).unwrap(),
+        d: Dispatch::new(vec![vec![0, 1], vec![0]], resources).unwrap(),
+        arenas: [super::arena(64), super::arena(64)],
         fd: raw,
     }
 }
@@ -57,6 +58,10 @@ fn read(slot: u16, handle: RawHandle) -> Sqe {
 }
 
 impl Rig {
+    fn lower(&mut self, m: usize, sqe: Sqe) {
+        self.d.lower(m, sqe, &self.arenas[m]);
+    }
+
     fn routes(&mut self) -> Vec<Route> {
         self.d.drain_routes().collect()
     }
@@ -81,7 +86,7 @@ impl Rig {
 #[test]
 fn real_op_resolves_its_descriptor_buffer_and_index() {
     let mut r = rig();
-    r.d.lower(1, read(3, TTY));
+    r.lower(1, read(3, TTY));
     let op = r.only_os();
     assert_eq!((op.fd, op.class), (r.fd, Class::Tty));
     assert_eq!(op.id, OpId::new((MAX_OPS + 3) as u16, 7));
@@ -94,7 +99,7 @@ fn real_op_resolves_its_descriptor_buffer_and_index() {
 #[test]
 fn sim_op_goes_to_its_port_under_its_op_id() {
     let mut r = rig();
-    r.d.lower(0, read(2, SIM));
+    r.lower(0, read(2, SIM));
     let [Route::Sim(4, req)] = r.routes()[..] else {
         panic!()
     };
@@ -126,12 +131,12 @@ fn refusals_reply_without_running() {
         ),
     ];
     for (sqe, e) in cases {
-        r.d.lower(0, sqe);
+        r.lower(0, sqe);
         assert_eq!(r.replies(), [(0, Cqe::err(sqe.token, e))]);
     }
     let mut bad = sqe(0, TTY, Op::Fsync, Span::default());
     bad.opcode = 0xEE;
-    r.d.lower(0, bad);
+    r.lower(0, bad);
     assert_eq!(
         r.replies(),
         [(0, Cqe::err(bad.token, IoError::Unsupported))]
@@ -142,8 +147,8 @@ fn refusals_reply_without_running() {
 #[test]
 fn a_live_slot_is_not_reused() {
     let mut r = rig();
-    r.d.lower(0, read(1, TTY));
-    r.d.lower(0, read(1, TTY));
+    r.lower(0, read(1, TTY));
+    r.lower(0, read(1, TTY));
     assert_eq!(r.routes().len(), 1);
     assert_eq!(
         r.replies(),
@@ -154,22 +159,22 @@ fn a_live_slot_is_not_reused() {
 #[test]
 fn closed_grant_is_stale_until_a_remake() {
     let mut r = rig();
-    r.d.lower(0, sqe(0, TTY, Op::Close, Span::default()));
+    r.lower(0, sqe(0, TTY, Op::Close, Span::default()));
     assert_eq!(r.replies(), [(0, Cqe::ok(Token::new(0, 7), 0))]);
     assert!(r.routes().is_empty(), "the resource stays open");
-    r.d.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
+    r.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
     assert_eq!(r.replies()[0].1.result(), Err(IoError::Stale));
     r.d.quiesce_member(0);
     r.d.member_drained(0);
     r.d.end_queiscing_member(0);
-    r.d.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
+    r.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
     assert_eq!(r.routes().len(), 1);
 }
 
 #[test]
 fn accepted_stream_is_a_derived_handle() {
     let mut r = rig();
-    r.d.lower(0, sqe(0, TTY, Op::Accept, Span::default()));
+    r.lower(0, sqe(0, TTY, Op::Accept, Span::default()));
     let op = r.only_os();
     let (_, cqe) = r
         .done(op.id, Ok(Out::Opened(null(), Class::Stream)))
@@ -180,11 +185,11 @@ fn accepted_stream_is_a_derived_handle() {
         RawHandle::new(2, 1),
         "past the grants, first generation"
     );
-    r.d.lower(0, sqe(1, stream, Op::Recv, Span::new(0, 4)));
+    r.lower(0, sqe(1, stream, Op::Recv, Span::new(0, 4)));
     assert_eq!(r.only_os().class, Class::Stream);
-    r.d.lower(0, sqe(2, stream, Op::Close, Span::default()));
+    r.lower(0, sqe(2, stream, Op::Close, Span::default()));
     assert!(matches!(r.routes()[..], [Route::Close(_)]));
-    r.d.lower(0, sqe(3, stream, Op::Fsync, Span::default()));
+    r.lower(0, sqe(3, stream, Op::Fsync, Span::default()));
     assert_eq!(r.replies().last().unwrap().1.result(), Err(IoError::Stale));
 }
 
@@ -192,7 +197,7 @@ fn accepted_stream_is_a_derived_handle() {
 fn full_derived_table_closes_and_refuses() {
     let mut r = rig();
     let accept = |r: &mut Rig, slot: usize| {
-        r.d.lower(0, sqe(slot as u16, TTY, Op::Accept, Span::default()));
+        r.lower(0, sqe(slot as u16, TTY, Op::Accept, Span::default()));
         let op = r.only_os();
         r.done(op.id, Ok(Out::Opened(null(), Class::Stream)))
             .unwrap()
@@ -208,12 +213,12 @@ fn full_derived_table_closes_and_refuses() {
 #[test]
 fn cancel_goes_out_once() {
     let mut r = rig();
-    r.d.lower(0, read(0, TTY));
-    r.d.lower(0, read(1, SIM));
+    r.lower(0, read(0, TTY));
+    r.lower(0, read(1, SIM));
     let _ = r.routes();
     let cancel = |slot| sqe(slot, TTY, Op::Cancel, Span::default());
     for slot in [0, 0, 1, 5] {
-        r.d.lower(0, cancel(slot));
+        r.lower(0, cancel(slot));
     }
     let routes = r.routes();
     assert!(matches!(routes[0], Route::Cancel(id) if id == OpId::new(0, 7)));
@@ -228,8 +233,8 @@ fn cancel_goes_out_once() {
 #[test]
 fn quiesce_cancels_drops_and_waits() {
     let mut r = rig();
-    r.d.lower(0, read(0, TTY));
-    r.d.lower(0, sqe(1, TTY, Op::Accept, Span::default()));
+    r.lower(0, read(0, TTY));
+    r.lower(0, sqe(1, TTY, Op::Accept, Span::default()));
     let ids: Vec<OpId> = r
         .routes()
         .into_iter()
@@ -242,7 +247,7 @@ fn quiesce_cancels_drops_and_waits() {
     assert_eq!(r.routes().len(), 2, "one cancel per op");
     r.d.quiesce_member(0);
     assert!(r.routes().is_empty(), "never twice");
-    r.d.lower(0, read(2, TTY));
+    r.lower(0, read(2, TTY));
     assert!(
         r.routes().is_empty() && r.replies().is_empty(),
         "new ops are dropped"
@@ -263,7 +268,7 @@ fn quiesce_cancels_drops_and_waits() {
 #[test]
 fn drain_closes_derived_handles() {
     let mut r = rig();
-    r.d.lower(0, sqe(0, TTY, Op::Accept, Span::default()));
+    r.lower(0, sqe(0, TTY, Op::Accept, Span::default()));
     let op = r.only_os();
     r.done(op.id, Ok(Out::Opened(null(), Class::Stream)));
     r.d.quiesce_member(0);
@@ -275,7 +280,7 @@ fn drain_closes_derived_handles() {
 #[test]
 fn report_writes_changed_resources() {
     let mut r = rig();
-    r.d.lower(0, read(0, TTY));
+    r.lower(0, read(0, TTY));
     let op = r.only_os();
     r.done(op.id, Ok(Out::Len(4)));
     let (_ring, out, mut inp) = pair::<ResourceStatus>(ResourceStatus::DEPTH);
@@ -296,7 +301,7 @@ fn lowering_and_raising_allocate_nothing() {
     let mut ids = Vec::with_capacity(4);
     let n = allocations(|| {
         for _ in 0..8 {
-            r.d.lower(0, read(0, TTY));
+            r.lower(0, read(0, TTY));
             ids.extend(r.d.drain_routes().map(|route| match route {
                 Route::Os(op) => op.id,
                 _ => OpId::new(0, 0),

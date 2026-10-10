@@ -118,7 +118,7 @@ mod tests {
     fn rig() -> Rig {
         let mut guest: Box<[u8]> = vec![0; 11].into();
         guest[..3].copy_from_slice(b"cmd");
-        let mirror = Rc::new(Arena::owning(vec![0; 11].into()));
+        let mirror = Rc::new(crate::io::tests::arena(11));
         let (sq_ring, sq, sq_in) = pair::<Sqe>(16);
         let (cq_ring, cq, cq_in) = pair::<Cqe>(16);
         let region = (NonNull::from(&mut guest[..]).cast(), guest.len());
@@ -145,7 +145,7 @@ mod tests {
 
         fn mirror(&self, span: Span) -> Vec<u8> {
             // SAFETY: nothing else touches the mirror during the test.
-            unsafe { self.mirror.span(span).unwrap().as_ref() }.to_vec()
+            unsafe { self.mirror.get_slice(span).unwrap().as_ref() }.to_vec()
         }
     }
 
@@ -163,7 +163,7 @@ mod tests {
         let token = rig.submit(3, Op::Recv, Span::new(3, 8));
         rig.copy.submissions().unwrap();
         // SAFETY: nothing else touches the mirror during the test.
-        unsafe { rig.mirror.span(Span::new(3, 2)).unwrap().as_mut() }.copy_from_slice(b"ok");
+        unsafe { rig.mirror.get_slice(Span::new(3, 2)).unwrap().as_mut() }.copy_from_slice(b"ok");
         rig.cq.write(&Cqe::ok(token, 2)).unwrap();
         rig.copy.completions().unwrap();
         assert_eq!(&rig.guest[3..6], b"ok\0");
@@ -173,7 +173,7 @@ mod tests {
     fn empty_or_failed_read_copies_nothing() {
         let mut rig = rig();
         // SAFETY: nothing else touches the mirror during the test.
-        unsafe { rig.mirror.span(Span::new(3, 2)).unwrap().as_mut() }.copy_from_slice(b"ok");
+        unsafe { rig.mirror.get_slice(Span::new(3, 2)).unwrap().as_mut() }.copy_from_slice(b"ok");
         for (slot, ok) in [(4, true), (5, false)] {
             let token = rig.submit(slot, Op::Recv, Span::new(3, 8));
             rig.copy.submissions().unwrap();

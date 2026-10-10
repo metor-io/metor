@@ -4,7 +4,9 @@
 use core::ptr::NonNull;
 use std::os::fd::{OwnedFd, RawFd};
 
-use super::Token;
+use super::{Backing, IoShared, MAX_OPS, ResourceConfig, Token};
+use crate::coordinator::BuildError;
+use dispatch::Resource;
 
 pub(crate) mod dispatch;
 mod open;
@@ -17,7 +19,7 @@ mod uring;
 pub(crate) use dispatch::{Backed, Dispatch, Route};
 pub use open::{OpenError, open};
 pub use poll::PollOs;
-pub use steps::{IO_COMPLETE_TYPE, IO_STATUS_PORT, IO_SUBMIT_TYPE, MakeOs};
+pub use steps::{IO_COMPLETE_TYPE, IO_STATUS_PORT, IO_SUBMIT_TYPE};
 pub(crate) use steps::{complete_entry, submit_entry};
 #[cfg(target_os = "linux")]
 pub use uring::UringOs;
@@ -130,7 +132,7 @@ pub fn host(ops: usize) -> std::io::Result<Box<dyn Os>> {
     return Ok(Box::new(PollOs::new(ops)?));
 }
 
-/// How many submit and reap rounds teardown runs before it leaks the arenas.
+/// How many submit and reap rounds teardown runs before it gives up.
 const TEARDOWN_ROUNDS: usize = 10;
 
 /// The dispatch and the backend its ops run on.
@@ -139,10 +141,10 @@ pub(crate) struct Host {
     pub(crate) os: Box<dyn Os>,
 }
 
-impl Drop for Host {
-    /// Cancels every op and reaps for a few rounds. Then leaks the arenas if
-    /// any op is still in flight, so the kernel never writes freed memory.
-    fn drop(&mut self) {
+impl Host {
+    /// Cancels every op and reaps for a few rounds. False if any op is still
+    /// in flight.
+    pub(crate) fn teardown(&mut self) -> bool {
         let Self { dispatch, os } = self;
         dispatch.quiesce_all();
         let mut done = Vec::new();
@@ -160,10 +162,63 @@ impl Drop for Host {
                 let _ = dispatch.raise(d);
             }
             if !dispatch.live() {
-                return;
+                return true;
             }
             std::thread::sleep(core::time::Duration::from_millis(1));
         }
-        dispatch.leak();
+        false
     }
+}
+
+/// A target's IO: one member per system with a `Cap`, given as its id and
+/// the resource index of each grant, in config order. Opens every real
+/// resource a member holds, and the backend.
+pub(crate) fn build(
+    resources: &[ResourceConfig],
+    members: Vec<(String, Vec<u16>)>,
+) -> Result<IoShared, BuildError> {
+    let mut io = IoShared::default();
+    if members.is_empty() {
+        return Ok(io);
+    }
+    let held = |at: usize| {
+        members
+            .iter()
+            .flat_map(|(_, g)| g)
+            .any(|&r| usize::from(r) == at)
+    };
+    let resources = (0..resources.len())
+        .map(|at| resource(&resources[at], at, held(at)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ops = members.len() * MAX_OPS;
+    let grants = members.iter().map(|(_, g)| g.clone()).collect();
+    let dispatch = Dispatch::new(grants, resources)?;
+    let os = host(ops).map_err(|e| BuildError::IoSystems {
+        message: format!("the IO backend: {e}"),
+    })?;
+    for (id, _) in &members {
+        io.member(id);
+    }
+    io.host = Some(Host { dispatch, os });
+    Ok(io)
+}
+
+/// Resource `at`, opened if it is real and `held`.
+fn resource(config: &ResourceConfig, at: usize, held: bool) -> Result<Resource, BuildError> {
+    let backed = match &config.backing {
+        Backing::Sim(_) if held => Backed::Sim(at as u16),
+        Backing::Real(kind) if held => {
+            let (fd, class) = open(kind).map_err(|e| BuildError::Open {
+                resource: config.id.clone(),
+                message: e.to_string(),
+            })?;
+            Backed::Fd(fd, class)
+        }
+        _ => Backed::Unused,
+    };
+    Ok(Resource {
+        id: config.id.clone(),
+        sim: matches!(config.backing, Backing::Sim(_)),
+        backed,
+    })
 }

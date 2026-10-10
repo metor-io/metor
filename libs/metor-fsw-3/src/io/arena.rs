@@ -1,13 +1,14 @@
 //! `Arena`, one system's IO memory; `Buf`, a span of it; and `IoInit`, which
 //! allocates spans while the system is made.
 //!
-//! An arena is a bump allocator. It grows while its system's first make runs,
-//! then freezes, and its address never changes again, so the kernel and other
-//! parties may hold pointers into it. A remake rewinds it to the start and
-//! must fit. Each rewind starts a new epoch, and a `Buf` from an older epoch
+//! An arena's memory is set once and never moves, so the kernel and other
+//! parties may hold pointers into it. A system's first make sizes it: `IoInit`
+//! stages the allocations, then hands the arena the bytes. A guest's arena is
+//! set over the region it laid out. A remake starts a new epoch and allocates
+//! from the start again, within the same memory; a `Buf` from an older epoch
 //! reads as empty.
 
-use core::cell::{Cell, UnsafeCell};
+use core::cell::{Cell, OnceCell, RefCell};
 use core::ffi::c_void;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
@@ -19,22 +20,19 @@ use metor_fsw_3_ring::{Lease, RawOwner};
 use super::{Op, Span};
 use crate::coordinator::ParamError;
 
+#[derive(Default)]
 pub(crate) struct Arena {
-    mem: UnsafeCell<Mem>,
-    top: Cell<u32>,
+    mem: OnceCell<Mem>,
     epoch: Cell<u32>,
 }
 
-enum Mem {
-    Growing(Vec<u8>),
-    Fixed {
-        base: NonNull<u8>,
-        len: usize,
-        keep: Keep,
-    },
+struct Mem {
+    base: NonNull<u8>,
+    len: usize,
+    keep: Keep,
 }
 
-/// What keeps a frozen arena's memory alive.
+/// What keeps an arena's memory alive.
 pub(crate) enum Keep {
     Owned(Arc<Owned>),
     Lease(Lease),
@@ -43,105 +41,38 @@ pub(crate) enum Keep {
 }
 
 impl Arena {
+    /// An arena whose memory is not set yet.
     pub(crate) fn new() -> Self {
-        Self::with(Mem::Growing(Vec::new()))
+        Self::default()
     }
 
-    /// A frozen arena over `len` bytes at `base`.
+    /// Sets the memory to `len` bytes at `base`. False if it was already set.
     ///
     /// # Safety
     /// The bytes stay alive and unmoved while `keep` lives, or for the
     /// arena's whole life when `keep` is `Unowned`.
-    pub(crate) unsafe fn over(base: NonNull<u8>, len: usize, keep: Keep) -> Self {
-        Self::with(Mem::Fixed { base, len, keep })
+    pub(crate) unsafe fn set(&self, base: NonNull<u8>, len: usize, keep: Keep) -> bool {
+        self.mem.set(Mem { base, len, keep }).is_ok()
     }
 
-    /// A frozen arena that owns `bytes`.
-    pub(crate) fn owning(bytes: Box<[u8]>) -> Self {
+    /// Sets the memory to `bytes`. False if it was already set.
+    pub(crate) fn set_owned(&self, bytes: Box<[u8]>) -> bool {
         let owned = Arc::new(Owned(NonNull::from(Box::leak(bytes))));
         let (base, len) = (owned.0.cast(), owned.0.len());
         // SAFETY: `owned` holds the bytes and lives in the arena.
-        unsafe { Self::over(base, len, Keep::Owned(owned)) }
+        unsafe { self.set(base, len, Keep::Owned(owned)) }
     }
 
-    fn with(mem: Mem) -> Self {
-        Self {
-            mem: UnsafeCell::new(mem),
-            top: Cell::new(0),
-            epoch: Cell::new(0),
-        }
-    }
-
-    fn mem(&self) -> &Mem {
-        // SAFETY: `mem_mut` borrows end within the methods that take them.
-        unsafe { &*self.mem.get() }
-    }
-
-    #[allow(clippy::mut_from_ref)]
-    fn mem_mut(&self) -> &mut Mem {
-        // SAFETY: the arena is not shared across threads, and no method
-        // holds a borrow of `mem` while calling another.
-        unsafe { &mut *self.mem.get() }
-    }
-
-    /// The frozen memory, or `None` while the first make may still grow it.
+    /// The memory, once set.
     pub(crate) fn region(&self) -> Option<(NonNull<u8>, usize)> {
-        match self.mem() {
-            Mem::Growing(_) => None,
-            Mem::Fixed { base, len, .. } => Some((*base, *len)),
-        }
+        self.mem.get().map(|m| (m.base, m.len))
     }
 
     pub(crate) fn epoch(&self) -> u32 {
         self.epoch.get()
     }
 
-    /// Allocates `cap` zeroed bytes.
-    fn alloc(&self, cap: u32) -> Option<Span> {
-        let off = self.top.get();
-        let end = off.checked_add(cap)?;
-        match self.mem_mut() {
-            Mem::Growing(v) => v.resize(end as usize, 0),
-            Mem::Fixed { base, len, .. } => {
-                if end as usize > *len {
-                    return None;
-                }
-                // SAFETY: `off..end` lies in the arena, past every live span.
-                unsafe { base.add(off as usize).write_bytes(0, cap as usize) };
-            }
-        }
-        self.top.set(end);
-        Some(Span::new(off, cap))
-    }
-
-    /// Copies `bytes` to the start of a span just allocated.
-    fn write(&self, span: Span, bytes: &[u8]) {
-        let base = match self.mem_mut() {
-            Mem::Growing(v) => v.as_mut_ptr(),
-            Mem::Fixed { base, .. } => base.as_ptr(),
-        };
-        // SAFETY: `alloc` made room for `span`, and `bytes` fits in it.
-        unsafe {
-            let dst = base.add(span.off() as usize);
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
-        }
-    }
-
-    /// Fixes the arena's size and address. A frozen arena stays as it is.
-    fn freeze(&self) {
-        if let Mem::Growing(v) = self.mem_mut() {
-            let bytes = core::mem::take(v).into_boxed_slice();
-            *self.mem_mut() = Self::owning(bytes).mem.into_inner();
-        }
-    }
-
-    /// Starts the next make at the arena's first byte.
-    fn next_epoch(&self) {
-        self.top.set(0);
-        self.epoch.set(self.epoch.get().wrapping_add(1));
-    }
-
-    /// The memory `span` names, if the arena is frozen and holds all of it.
+    /// The memory `span` names, if the arena is set and holds all of it.
     pub(crate) fn get_slice(&self, span: Span) -> Option<NonNull<[u8]>> {
         let (base, len) = self.region()?;
         let end = span.end()? as usize;
@@ -153,13 +84,10 @@ impl Arena {
         Some(NonNull::slice_from_raw_parts(start, span.len() as usize))
     }
 
-    /// An owner that keeps the frozen memory alive, to share it across the
-    /// pack ABI. A lease passes on its own owner.
+    /// An owner that keeps the memory alive, to share it across the pack
+    /// ABI. A lease passes on its own owner.
     pub(crate) fn owner(&self) -> Option<RawOwner> {
-        let Mem::Fixed { keep, .. } = self.mem() else {
-            return None;
-        };
-        match keep {
+        match &self.mem.get()?.keep {
             Keep::Owned(owned) => Some(RawOwner {
                 context: Arc::as_ptr(owned).cast(),
                 retain: retain_owned,
@@ -254,7 +182,8 @@ impl Buf {
         self.len = n.min(self.capacity()) as u32;
     }
 
-    /// Whether the buffer is in a frozen arena and from its current make.
+    /// Whether the buffer's arena is set and the buffer is from its current
+    /// make.
     pub(crate) fn live(&self) -> bool {
         self.whole().is_some()
     }
@@ -279,11 +208,11 @@ impl Buf {
 impl Deref for Buf {
     type Target = [u8];
 
-    /// The filled bytes. Empty while the arena is made, or after a remake.
+    /// The filled bytes. Empty until the arena is set, and after a remake.
     fn deref(&self) -> &[u8] {
         match self.whole() {
             // SAFETY: spans never overlap, an op in flight holds its `Buf`,
-            // and a frozen arena never moves.
+            // and an arena's memory never moves.
             Some(whole) => unsafe {
                 core::slice::from_raw_parts(whole.cast().as_ptr(), self.len as usize)
             },
@@ -316,6 +245,9 @@ impl core::fmt::Debug for Buf {
 /// Allocates a system's buffers while its constructor runs.
 pub struct IoInit<'a> {
     arena: Option<&'a Rc<Arena>>,
+    /// The first make's bytes, before the arena's memory is set.
+    staged: RefCell<Vec<u8>>,
+    top: Cell<u32>,
     /// Bytes asked for and not given.
     short: Cell<usize>,
 }
@@ -323,9 +255,11 @@ pub struct IoInit<'a> {
 impl<'a> IoInit<'a> {
     /// Starts a make on `arena`, from its first byte.
     pub(crate) fn new(arena: &'a Rc<Arena>) -> Self {
-        arena.next_epoch();
+        arena.epoch.set(arena.epoch().wrapping_add(1));
         Self {
             arena: Some(arena),
+            staged: RefCell::new(Vec::new()),
+            top: Cell::new(0),
             short: Cell::new(0),
         }
     }
@@ -335,6 +269,8 @@ impl<'a> IoInit<'a> {
     pub(crate) fn empty() -> Self {
         Self {
             arena: None,
+            staged: RefCell::new(Vec::new()),
+            top: Cell::new(0),
             short: Cell::new(0),
         }
     }
@@ -342,28 +278,53 @@ impl<'a> IoInit<'a> {
     /// Allocates `len` zeroed bytes. If the arena cannot, returns an empty
     /// buffer and the make fails afterward.
     pub fn alloc(&self, len: usize) -> Buf {
-        self.take(len)
-            .map_or_else(Buf::empty, |(arena, span)| Buf::new(arena, span, 0))
+        self.take(len, &[])
     }
 
     /// Allocates a buffer filled with `bytes`.
     pub fn alloc_from(&self, bytes: &[u8]) -> Buf {
-        let Some((arena, span)) = self.take(bytes.len()) else {
-            return Buf::empty();
-        };
-        arena.write(span, bytes);
-        Buf::new(arena, span, span.len())
+        self.take(bytes.len(), bytes)
     }
 
-    fn take(&self, len: usize) -> Option<(&'a Rc<Arena>, Span)> {
-        let given = self.arena.and_then(|arena| {
-            let span = arena.alloc(u32::try_from(len).ok()?)?;
-            Some((arena, span))
-        });
-        if given.is_none() {
+    /// Allocates `len` bytes starting with `fill`, zeroing the rest.
+    fn take(&self, len: usize, fill: &[u8]) -> Buf {
+        let span = self.arena.zip(self.bump(len));
+        let Some((arena, span)) = span else {
             self.short.set(self.short.get().saturating_add(len));
+            return Buf::empty();
+        };
+        let (off, end) = (span.off() as usize, span.off() as usize + len);
+        match arena.region() {
+            // SAFETY: `bump` kept `off..end` inside the memory and past every
+            // span this make handed out.
+            Some((base, _)) => unsafe {
+                let dst = core::slice::from_raw_parts_mut(base.as_ptr().add(off), len);
+                dst.fill(0);
+                dst[..fill.len()].copy_from_slice(fill);
+            },
+            None => {
+                let mut staged = self.staged.borrow_mut();
+                staged.resize(end, 0);
+                staged[off..off + fill.len()].copy_from_slice(fill);
+            }
         }
-        given
+        Buf::new(arena, span, fill.len() as u32)
+    }
+
+    /// The next `len` bytes, if they fit: past the end of a set arena's
+    /// memory fails, and staged memory grows.
+    fn bump(&self, len: usize) -> Option<Span> {
+        let cap = u32::try_from(len).ok()?;
+        let off = self.top.get();
+        let end = off.checked_add(cap)?;
+        let fits = self
+            .arena?
+            .region()
+            .is_none_or(|(_, size)| end as usize <= size);
+        fits.then(|| {
+            self.top.set(end);
+            Span::new(off, cap)
+        })
     }
 
     /// Fails with `IoMemory` if any allocation was refused.
@@ -381,9 +342,10 @@ impl<'a> IoInit<'a> {
 }
 
 impl Drop for IoInit<'_> {
+    /// Gives a first make's arena its memory.
     fn drop(&mut self) {
-        if let Some(arena) = self.arena {
-            arena.freeze();
+        if let Some(arena) = self.arena.filter(|a| a.region().is_none()) {
+            arena.set_owned(self.staged.take().into_boxed_slice());
         }
     }
 }
@@ -392,13 +354,14 @@ impl Drop for IoInit<'_> {
 mod proofs {
     use super::*;
 
-    /// For any span, `span` returns memory inside the arena or nothing.
+    /// For any span, `get_slice` returns memory inside the arena or nothing.
     #[kani::proof]
     fn span_stays_in_the_arena() {
-        let arena = Arena::owning(Box::new([0u8; 8]));
-        let (base, len) = arena.region().expect("frozen");
+        let arena = Arena::new();
+        arena.set_owned(Box::new([0u8; 8]));
+        let (base, len) = arena.region().expect("set");
         let span = Span::new(kani::any(), kani::any());
-        if let Some(got) = arena.span(span) {
+        if let Some(got) = arena.get_slice(span) {
             let start = got.cast::<u8>().as_ptr() as usize - base.as_ptr() as usize;
             assert!(start + got.len() <= len);
         }

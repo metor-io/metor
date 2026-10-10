@@ -149,6 +149,9 @@ pub enum BuildError {
     #[error("drivers use real resource `{real}` and sim resource `{sim}`; a target uses one kind")]
     MixedBackings { real: String, sim: String },
 
+    #[error("resource `{resource}` did not open: {message}")]
+    Open { resource: String, message: String },
+
     #[error("resource `{resource}` has a `{backing}` backing, which this build does not run")]
     Backing { resource: String, backing: String },
 

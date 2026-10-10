@@ -5,15 +5,13 @@
 //! driver's arena. Its driver is member `index / MAX_OPS`, so the model reads
 //! and fills the driver's bytes in place.
 
-use core::cell::RefCell;
 use core::marker::PhantomData;
-use std::rc::Rc;
+use core::ptr::NonNull;
 
 use metor_proto::types::Timestamp;
 
-use super::arena::Arena;
 use super::cap::{GpioLine, Interface, Uart};
-use super::{Cqe, IoError, MAX_OPS, Op, OpKind, Sqe, TtyConfig};
+use super::{Cqe, IoError, MAX_OPS, Op, OpKind, SharedIo, Sqe, TtyConfig};
 use crate::port::{Input, Output};
 
 /// A simulated serial device.
@@ -104,20 +102,12 @@ impl<M: GpioModel> Model<GpioLine> for M {
     }
 }
 
-/// Every driver's arena, by member index. Filled as drivers bind.
-#[derive(Default)]
-pub(crate) struct Arenas(RefCell<Vec<Rc<Arena>>>);
-
-impl Arenas {
-    pub(crate) fn push(&self, arena: Rc<Arena>) {
-        self.0.borrow_mut().push(arena);
-    }
-
-    /// The bytes request `sqe` lends, in its driver's arena.
-    fn bytes(&self, sqe: &Sqe) -> Option<core::ptr::NonNull<[u8]>> {
-        let member = usize::from(sqe.token.slot()) / MAX_OPS;
-        self.0.try_borrow().ok()?.get(member)?.get_slice(sqe.buf)
-    }
+/// The bytes request `sqe` lends in its driver's arena. The driver is member
+/// `index / MAX_OPS` of the op table index its token carries.
+fn bytes(io: &SharedIo, sqe: &Sqe) -> Option<NonNull<[u8]>> {
+    let member = usize::from(sqe.token.slot()) / MAX_OPS;
+    let io = io.try_borrow().ok()?;
+    io.members.get(member)?.1.get_slice(sqe.buf)
 }
 
 #[derive(Clone, Copy)]
@@ -132,7 +122,7 @@ struct Held {
 pub(crate) struct Device {
     requests: Input<Sqe>,
     replies: Output<Cqe>,
-    arenas: Rc<Arenas>,
+    io: SharedIo,
     held: Vec<Held>,
     /// Replies the reply port has not taken yet, oldest first.
     outbox: Vec<Cqe>,
@@ -144,13 +134,13 @@ impl Device {
     pub(crate) fn new(
         requests: Input<Sqe>,
         replies: Output<Cqe>,
-        arenas: Rc<Arenas>,
+        io: SharedIo,
         held: usize,
     ) -> Self {
         Self {
             requests,
             replies,
-            arenas,
+            io,
             held: Vec::with_capacity(held),
             // Each held op gives one reply, and each refused one another.
             outbox: Vec::with_capacity(2 * held),
@@ -250,7 +240,7 @@ impl Device {
         if !held.op.fills() && !held.op.drains() {
             return model.answer(now, &held.op, &mut []);
         }
-        match self.arenas.bytes(&held.sqe) {
+        match bytes(&self.io, &held.sqe) {
             // SAFETY: the driver lent this span to the request until its
             // reply is written, and models run on the coordinator thread.
             Some(bytes) => model.answer(now, &held.op, unsafe { &mut *bytes.as_ptr() }),

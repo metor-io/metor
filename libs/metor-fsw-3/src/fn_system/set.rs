@@ -12,7 +12,7 @@ use metor_fsw_3_ring::{NoWake, WakeSink};
 use crate::Rng;
 use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
-use crate::io::{Arena, Arenas, Device, End, Io, SharedIo, Sqe};
+use crate::io::{Arena, Device, Io, MAX_OPS, SharedIo, Sqe};
 use crate::log::LogPort;
 use crate::port::{Input, Output, Samplers};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
@@ -135,7 +135,7 @@ impl<'a> Instance<'a> {
 ///
 /// The IO ports come after the parameters' own (see `Defs::append_io`).
 /// A system with a `Cap` takes its member's arena from `io`, and each
-/// `DeviceSide` resolves drivers' buffers through `io`'s arenas.
+/// `DeviceSide` resolves drivers' buffers through `io`'s members.
 pub(crate) fn bind<S: Ports>(
     mut inputs: Vec<InputBinding>,
     mut outputs: Vec<OutputBinding>,
@@ -144,16 +144,7 @@ pub(crate) fn bind<S: Ports>(
     let Instance { io, id, .. } = instance;
     let defs = Defs::declared::<S>();
     let rng = defs.rng.then(|| instance.rng()).transpose()?;
-    let caps = || {
-        defs.grants
-            .iter()
-            .filter(|g| g.end == End::Host)
-            .map(|g| g.param.to_string())
-    };
-    let arena = defs
-        .io
-        .then(|| io.borrow_mut().member(id, caps().collect()));
-    let arenas = io.borrow().arenas.clone();
+    let arena = defs.io.then(|| io.borrow_mut().member(id));
     let io_ports = defs.io_ports();
     // PANIC Safety: build binds one entry per port of the definition these
     // `Defs` describe, with `log` last among the outputs.
@@ -162,12 +153,9 @@ pub(crate) fn bind<S: Ports>(
     let io_out = outputs.split_off(outputs.len() - io_ports);
     outputs.push(log);
     let dropped = Arc::<AtomicU32>::default();
-    let held: Vec<usize> = {
-        let shared = io.borrow();
-        let devices = defs.grants.iter().filter(|g| g.end == End::Device);
-        devices.map(|g| shared.held_cap(id, &g.param)).collect()
-    };
-    let (io, devices) = io_ends(arena, io_in, io_out, &arenas, &held);
+    // A device end holds every op its drivers can have in flight.
+    let held = MAX_OPS * io.borrow().members.len().max(1);
+    let (io, devices) = io_ends(arena, io_in, io_out, io, held);
     let ins = bind_inputs::<S, NoWake>(inputs, defs.inputs.len() - io_ports);
     let mut writers = writers(outputs, defs.outputs.len() - io_ports + 1, dropped);
     writers.io = io.clone();
@@ -182,8 +170,8 @@ fn io_ends(
     arena: Option<Rc<Arena>>,
     inputs: Vec<InputBinding>,
     outputs: Vec<OutputBinding>,
-    arenas: &Rc<Arenas>,
-    held: &[usize],
+    shared: &SharedIo,
+    held: usize,
 ) -> (Option<Io>, VecDeque<Device>) {
     let mut ports = inputs.into_iter().zip(outputs);
     let io = arena.and_then(|arena| {
@@ -191,10 +179,9 @@ fn io_ends(
         Some(Io::new(Output::new(sq.writer), Input::new(cq.views), arena))
     });
     let devices = ports
-        .zip(held)
-        .map(|((req, rep), &held)| {
+        .map(|(req, rep)| {
             let (requests, replies) = (Input::<Sqe>::new(req.views), Output::new(rep.writer));
-            Device::new(requests, replies, arenas.clone(), held)
+            Device::new(requests, replies, shared.clone(), held)
         })
         .collect();
     (io, devices)

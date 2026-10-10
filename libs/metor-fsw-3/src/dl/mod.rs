@@ -106,32 +106,15 @@ impl Pack {
             }
             Pack::Wasm(pack) => Box::new(pack.create(ty, params, instance, ports, io)?),
         };
-        if arena.is_none() {
-            // SAFETY: a pack writes back a live region with an owner that
-            // meets `RawOwner`'s contract, or an empty one.
-            unsafe { adopt(io, instance, table) };
-        }
+        // SAFETY: a pack writes back a live region with an owner that meets
+        // `RawOwner`'s contract, or an empty one.
+        unsafe { crate::pack::adopt(io, instance, table) };
         Ok(step)
     }
 }
 
 /// An instance's input and output rings.
 pub type Ports<'a> = (&'a [Vec<&'a RingBuffer>], &'a [&'a RingBuffer]);
-
-/// Makes system `instance`'s member over the region its pack returned.
-///
-/// # Safety
-/// A non-empty `table` is live, and its owner meets `RawOwner`'s contract.
-unsafe fn adopt(io: &SharedIo, instance: &Instance, table: RawRing) {
-    let caps: Vec<String> = crate::pack::host_caps(&instance.def).collect();
-    if caps.is_empty() || table.owner.is_none() {
-        return;
-    }
-    // SAFETY: the caller's contract.
-    if let Some(arena) = unsafe { crate::pack::arena_over(table) } {
-        io.borrow_mut().join(&instance.id, caps, arena);
-    }
-}
 
 impl SystemTable {
     /// Registers every system in `pack` under the name `"{id}.{ty}"`, in order.

@@ -12,8 +12,10 @@ use metor_proto::types::Timestamp;
 
 use super::arena::Arena;
 use super::cap::{Cap, Handle, Interface};
-use super::device::{Arenas, Device, DeviceSide, Model, UartModel};
-use super::{Cqe, Errno, Io, IoError, IoInit, MAX_OPS, Op, RawHandle, Span, Sqe, Token, TtyConfig};
+use super::device::{Device, DeviceSide, Model, UartModel};
+use super::{
+    Cqe, Errno, Io, IoError, IoInit, MAX_OPS, Op, RawHandle, SharedIo, Span, Sqe, Token, TtyConfig,
+};
 use crate::port::{Input, Output, ring_capacity};
 use crate::record::Record;
 
@@ -53,11 +55,10 @@ pub struct TestIo<M, K: Interface = super::Uart> {
 /// [`TestIo::turn`].
 pub fn cap<K: Interface, M: Model<K>>(model: M) -> (Cap<K>, TestIo<M, K>) {
     let (sq_ring, cq_ring) = (ring::<Sqe>(2), ring::<Cqe>(1));
-    let arena = Rc::new(Arena::new());
-    let arenas = Rc::new(Arenas::default());
-    arenas.push(arena.clone());
+    let shared = SharedIo::default();
+    let arena = shared.borrow_mut().member("test");
     let io = Io::new(writer(&sq_ring), reader(&cq_ring), arena);
-    let device = Device::new(reader(&sq_ring), writer(&cq_ring), arenas, MAX_OPS);
+    let device = Device::new(reader(&sq_ring), writer(&cq_ring), shared, MAX_OPS);
     let cap = Cap::new(Handle::new(io.next_grant(), io.clone()));
     let test = TestIo {
         sq: reader(&sq_ring),
@@ -126,15 +127,11 @@ pub fn device<K: Interface>() -> (DeviceSide<K>, TestDevice) {
 /// `hosts * MAX_OPS` ops.
 pub fn device_shared<K: Interface>(hosts: usize) -> (DeviceSide<K>, TestDevice) {
     let (req_ring, rep_ring) = (ring::<Sqe>(1), ring::<Cqe>(1));
-    let arena = Rc::new(Arena::owning(vec![0; MAX_OPS * DRIVER_BUF_LEN].into()));
-    let arenas = Rc::new(Arenas::default());
-    arenas.push(arena.clone());
-    let device = Device::new(
-        reader(&req_ring),
-        writer(&rep_ring),
-        arenas,
-        MAX_OPS * hosts,
-    );
+    let shared = SharedIo::default();
+    let arena = shared.borrow_mut().member("driver");
+    arena.set_owned(vec![0; MAX_OPS * DRIVER_BUF_LEN].into());
+    let held = MAX_OPS * hosts;
+    let device = Device::new(reader(&req_ring), writer(&rep_ring), shared, held);
     let test = TestDevice {
         arena,
         requests: writer(&req_ring),

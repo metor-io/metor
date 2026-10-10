@@ -17,6 +17,13 @@ use crate::tests::utils::pair;
 
 pub(crate) use counting::allocations;
 
+/// An arena that owns `len` zeroed bytes.
+pub(crate) fn arena(len: usize) -> Arena {
+    let arena = Arena::new();
+    arena.set_owned(vec![0; len].into());
+    arena
+}
+
 /// A system's queue whose other end the test plays by hand.
 pub(crate) struct Loopback {
     pub io: Io,

@@ -7,15 +7,14 @@
 //! finished op back into a `Cqe`. Nothing here does IO.
 
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::rc::Rc;
 
 use metor_component::FrameStr;
 use metor_proto::types::Timestamp;
 
 use super::{Class, OpId, OsDone, OsOp, Out};
-use crate::coordinator::ParamError;
+use crate::coordinator::BuildError;
 use crate::io::arena::Arena;
-use crate::io::status::{Counters, ResourceStatus};
+use crate::io::status::{Counters, ResourceStatus, resource_name};
 use crate::io::{Cqe, IoError, MAX_OPS, Op, OpKind, RawHandle, Span, Sqe, Token};
 use crate::port::Output;
 
@@ -32,7 +31,9 @@ pub(crate) enum Backed {
 }
 
 pub(crate) struct Resource {
-    pub(crate) name: FrameStr<64>,
+    pub(crate) id: String,
+    /// Whether the config makes it a sim resource, held or not.
+    pub(crate) sim: bool,
     pub(crate) backed: Backed,
 }
 
@@ -59,7 +60,6 @@ struct Handle {
 }
 
 struct Member {
-    arena: Rc<Arena>,
     handles: Box<[Handle]>,
     grants: usize,
     quiescing: bool,
@@ -67,7 +67,7 @@ struct Member {
 }
 
 impl Member {
-    pub fn new(arena: Rc<Arena>, grants: Vec<u16>) -> Member {
+    fn new(grants: Vec<u16>) -> Member {
         let grant = |&res: &u16| Handle {
             generation: 0,
             res,
@@ -79,7 +79,6 @@ impl Member {
             open: Open::Closed,
         });
         Member {
-            arena,
             handles: grants.iter().map(grant).chain(free).collect(),
             grants: grants.len(),
             quiescing: false,
@@ -107,6 +106,7 @@ pub(crate) struct Dispatch {
     members: Box<[Member]>,
     ops: Box<[Entry]>,
     resources: Box<[Resource]>,
+    names: Box<[FrameStr<64>]>,
     counters: Box<[Counters]>,
     reported: Box<[Counters]>,
     next_status: usize,
@@ -115,18 +115,16 @@ pub(crate) struct Dispatch {
 }
 
 impl Dispatch {
-    /// One member per system with a `Cap`: its arena and the resource of each
+    /// One member per system with a `Cap`, given as the resource of each
     /// grant, in order.
     pub(crate) fn new(
-        members: Vec<(Rc<Arena>, Vec<u16>)>,
+        members: Vec<Vec<u16>>,
         resources: Vec<Resource>,
-    ) -> Result<Self, ParamError> {
+    ) -> Result<Self, BuildError> {
         let ops = members.len() * MAX_OPS;
         if ops > usize::from(u16::MAX) + 1 {
-            return Err(ParamError::Resource {
-                id: "io".into(),
-                message: format!("{} systems hold a `Cap`, past the limit", members.len()),
-            });
+            let message = format!("{} systems hold a `Cap`, past the limit", members.len());
+            return Err(BuildError::IoSystems { message });
         }
         let idle = Entry {
             generation: 0,
@@ -137,11 +135,9 @@ impl Dispatch {
         };
         let count = resources.len();
         Ok(Self {
-            members: members
-                .into_iter()
-                .map(|(arena, grants)| Member::new(arena, grants))
-                .collect(),
+            members: members.into_iter().map(Member::new).collect(),
             ops: vec![idle; ops].into(),
+            names: resources.iter().map(|r| resource_name(&r.id)).collect(),
             resources: resources.into(),
             counters: vec![Counters::default(); count].into(),
             reported: vec![Counters::default(); count].into(),
@@ -151,17 +147,17 @@ impl Dispatch {
         })
     }
 
-    /// Lowers one op from member `m`'s queue.
-    pub(crate) fn lower(&mut self, m: usize, sqe: Sqe) {
+    /// Lowers one op from member `m`'s queue, whose buffers lie in `arena`.
+    pub(crate) fn lower(&mut self, m: usize, sqe: Sqe, arena: &Arena) {
         if self.members[m].quiescing {
             return;
         }
-        if let Err(e) = self.try_lower(m, sqe) {
+        if let Err(e) = self.try_lower(m, sqe, arena) {
             self.replies.push((m, Cqe::err(sqe.token, e)));
         }
     }
 
-    fn try_lower(&mut self, m: usize, sqe: Sqe) -> Result<(), IoError> {
+    fn try_lower(&mut self, m: usize, sqe: Sqe, arena: &Arena) -> Result<(), IoError> {
         let op = sqe.op()?;
         if op == Op::Cancel {
             self.cancel(m, sqe.token);
@@ -174,12 +170,7 @@ impl Dispatch {
             return Ok(());
         }
         let buf = match op.fills() || op.drains() {
-            true => Some(
-                self.members[m]
-                    .arena
-                    .get_slice(sqe.buf)
-                    .ok_or(IoError::BadBuf)?,
-            ),
+            true => Some(arena.get_slice(sqe.buf).ok_or(IoError::BadBuf)?),
             false => None,
         };
         let index = index(m, sqe.token.slot()).ok_or(IoError::Refused)?;
@@ -393,12 +384,8 @@ impl Dispatch {
         self.ops.iter().any(|e| e.live)
     }
 
-    /// Leaks every arena, so memory an op still in flight names is never
-    /// freed.
-    pub(crate) fn leak(&self) {
-        self.members
-            .iter()
-            .for_each(|m| core::mem::forget(m.arena.clone()));
+    pub(crate) fn resources(&self) -> &[Resource] {
+        &self.resources
     }
 
     /// Queues a route again, such as a sim cancel its port refused.
@@ -421,7 +408,7 @@ impl Dispatch {
             if self.counters[at] == self.reported[at] {
                 continue;
             }
-            let status = self.counters[at].status(now, self.resources[at].name);
+            let status = self.counters[at].status(now, self.names[at]);
             if written == STATUS_PER_CYCLE || out.write(&status).is_err() {
                 self.next_status = at;
                 return;

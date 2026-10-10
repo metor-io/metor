@@ -15,15 +15,14 @@ use std::sync::Arc;
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogEvent;
 
-use super::dispatch::Resource;
-use super::{Backed, Dispatch, Host, Os, OsDone, Route, open};
+use super::{Backed, Host, OsDone, Route};
 use crate::coordinator::{
     MakeCx, ParamError, Step, SystemKind, TableEntry, bindings, refuse_thread,
 };
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{LOG_PORT, report_dropped};
-use crate::io::status::{ResourceStatus, resource_name};
-use crate::io::{Backing, Cqe, IoBuild, IoError, MAX_OPS, Op, SharedIo, Sqe};
+use crate::io::status::ResourceStatus;
+use crate::io::{Cqe, IoError, IoShared, MAX_OPS, Op, SharedIo, Sqe};
 use crate::log::LogPort;
 use crate::port::{Input, Output, dyn_input_defs, dyn_output_defs};
 use crate::system::{OutputBinding, SystemDef};
@@ -33,15 +32,7 @@ pub const IO_COMPLETE_TYPE: &str = "fsw.io_complete";
 /// The output `io_complete` writes resource counts to.
 pub const IO_STATUS_PORT: &str = "io_status";
 
-/// Builds a backend for at most this many ops in flight.
-pub type MakeOs = fn(usize) -> std::io::Result<Box<dyn Os>>;
-
 pub(crate) fn submit_entry() -> TableEntry {
-    submit_entry_with(super::host)
-}
-
-/// `io_submit`'s entry, over the backend `make_os` builds.
-fn submit_entry_with(make_os: MakeOs) -> TableEntry {
     TableEntry {
         kind: SystemKind::Cyclic,
         // PANIC Safety: the empty context names no ports, which cannot fail.
@@ -49,14 +40,14 @@ fn submit_entry_with(make_os: MakeOs) -> TableEntry {
         def_fn: Box::new(submit_def),
         doc: "Carries every IO system's ops to the backend.".into(),
         schema: None,
-        make: Arc::new(move |cx| make_submit(cx, make_os)),
+        make: Arc::new(make_submit),
     }
 }
 
 pub(crate) fn complete_entry() -> TableEntry {
     TableEntry {
         kind: SystemKind::Cyclic,
-        // PANIC Safety: as in `submit_entry_with`.
+        // PANIC Safety: as in `submit_entry`.
         def: complete_def(&DefCx::empty()).expect("a static definition"),
         def_fn: Box::new(complete_def),
         doc: "Carries every IO system's completions back, and writes io_status.".into(),
@@ -95,19 +86,15 @@ fn complete_def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
     })
 }
 
-fn make_submit(cx: MakeCx<'_>, make_os: MakeOs) -> Result<Box<dyn Step>, ParamError> {
+fn make_submit(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     refuse_thread(cx.adapter)?;
     let (views, mut writers) = bindings(cx.def, cx.inputs, cx.outputs);
-    let mut io = cx.io.borrow_mut();
+    let io = cx.io.borrow();
     let names = cx.def.inputs.iter().map(|p| p.name.as_ref());
     let members: Vec<usize> = names.map(|n| member(&io, n)).collect::<Result<_, _>>()?;
     let reqs = writers.split_off(1);
-    let reqs = by_resource(
-        &io,
-        reqs.into_iter().map(|b| (b.def.name.clone(), b)),
-        ".req",
-    )?;
-    io.host = Some(host(&io, make_os)?);
+    let reqs = reqs.into_iter().map(|b| (b.def.name.clone(), b));
+    let reqs = by_resource(&io, reqs, ".req")?;
     Ok(Box::new(SubmitStep {
         io: cx.io.clone(),
         sqs: members
@@ -127,15 +114,9 @@ fn make_submit(cx: MakeCx<'_>, make_os: MakeOs) -> Result<Box<dyn Step>, ParamEr
 fn make_complete(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     refuse_thread(cx.adapter)?;
     let io = cx.io.borrow();
-    if io.host.is_none() {
-        return Err(ParamError::NoIoSubmit);
-    }
     let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
-    let reps = by_resource(
-        &io,
-        views.into_iter().map(|b| (b.def.name.clone(), b)),
-        ".rep",
-    )?;
+    let reps = views.into_iter().map(|b| (b.def.name.clone(), b));
+    let reps = by_resource(&io, reps, ".rep")?;
     let mut writers = writers.into_iter();
     let log = log_port(writers.by_ref().take(1).collect());
     // PANIC Safety: `complete_def` declares `io_status` second.
@@ -161,10 +142,9 @@ fn make_complete(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     }))
 }
 
-fn member(io: &IoBuild, id: &str) -> Result<usize, ParamError> {
-    io.index(id).ok_or_else(|| ParamError::NoIoMember {
-        system: id.to_string(),
-    })
+fn member(io: &IoShared, id: &str) -> Result<usize, ParamError> {
+    let system = id.to_string();
+    io.index(id).ok_or(ParamError::NoIoMember { system })
 }
 
 /// The `log` output, the only writer in `writers`.
@@ -175,18 +155,18 @@ fn log_port(writers: Vec<OutputBinding>) -> LogPort {
 }
 
 /// Ports named `{resource}{suffix}`, by resource index. Each must name a sim
-/// resource, and each sim resource some driver holds must have one.
+/// resource, and each sim resource a driver holds must have one.
 fn by_resource<P>(
-    io: &IoBuild,
+    io: &IoShared,
     ports: impl Iterator<Item = (Cow<'static, str>, P)>,
     suffix: &str,
 ) -> Result<Vec<Option<P>>, ParamError> {
-    let sim = |at: usize| matches!(io.resources[at].backing, Backing::Sim(_));
-    let mut found: Vec<Option<P>> = io.resources.iter().map(|_| None).collect();
+    let resources = io.host.as_ref().map_or(&[][..], |h| h.dispatch.resources());
+    let mut found: Vec<Option<P>> = resources.iter().map(|_| None).collect();
     for (name, port) in ports {
         let id = name.strip_suffix(suffix);
-        let at = id.and_then(|id| io.resources.iter().position(|r| r.id == id));
-        let Some(at) = at.filter(|&at| sim(at)) else {
+        let at = id.and_then(|id| resources.iter().position(|r| r.sim && r.id == id));
+        let Some(at) = at else {
             let message = "names no sim resource".into();
             return Err(ParamError::Resource {
                 id: name.into(),
@@ -195,69 +175,14 @@ fn by_resource<P>(
         };
         found[at] = Some(port);
     }
-    let used = |at: usize| sim(at) && io.grants_on(&io.resources[at].id) > 1;
-    if let Some(at) = (0..found.len()).find(|&at| used(at) && found[at].is_none()) {
+    let held = |at: usize| matches!(resources[at].backed, Backed::Sim(_));
+    if let Some(at) = (0..found.len()).find(|&at| held(at) && found[at].is_none()) {
         return Err(ParamError::Resource {
-            id: format!("{}{suffix}", io.resources[at].id),
+            id: format!("{}{suffix}", resources[at].id),
             message: "a sim resource's model has no edge to the io steps".into(),
         });
     }
     Ok(found)
-}
-
-/// Opens the resources members hold, and builds the dispatch and backend.
-fn host(io: &IoBuild, make_os: MakeOs) -> Result<Host, ParamError> {
-    let mut grants = Vec::with_capacity(io.members.len());
-    for m in &io.members {
-        let res = m.caps.iter().map(|cap| resource_of(io, &m.id, cap));
-        grants.push(res.collect::<Result<Vec<u16>, _>>()?);
-    }
-    let held = |at: usize| grants.iter().flatten().any(|&r| usize::from(r) == at);
-    let resources = (0..io.resources.len())
-        .map(|at| resource(io, at, held(at)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let members = io
-        .members
-        .iter()
-        .zip(grants)
-        .map(|(m, g)| (m.arena.clone(), g));
-    let dispatch = Dispatch::new(members.collect(), resources)?;
-    let os = make_os(io.members.len() * MAX_OPS).map_err(|e| ParamError::Resource {
-        id: "io".into(),
-        message: e.to_string(),
-    })?;
-    Ok(Host { dispatch, os })
-}
-
-/// The index of the resource system `id` granted its parameter `cap`.
-fn resource_of(io: &IoBuild, id: &str, cap: &str) -> Result<u16, ParamError> {
-    let grants = io.grants.iter().find(|(s, _)| s == id).map(|(_, g)| g);
-    let grant = grants.and_then(|g| g.iter().find(|g| g.param == cap));
-    let at = grant.and_then(|g| io.resources.iter().position(|r| r.id == g.resource));
-    at.map(|at| at as u16).ok_or_else(|| ParamError::Resource {
-        id: format!("{id}.{cap}"),
-        message: "no grant".into(),
-    })
-}
-
-/// Resource `at`, opened if it is real and `held`.
-fn resource(io: &IoBuild, at: usize, held: bool) -> Result<Resource, ParamError> {
-    let config = &io.resources[at];
-    let backed = match &config.backing {
-        Backing::Sim(_) => Backed::Sim(at as u16),
-        Backing::Real(kind) if held => {
-            let (fd, class) = open(kind).map_err(|e| ParamError::Resource {
-                id: config.id.clone(),
-                message: e.to_string(),
-            })?;
-            Backed::Fd(fd, class)
-        }
-        _ => Backed::Unused,
-    };
-    Ok(Resource {
-        name: resource_name(&config.id),
-        backed,
-    })
 }
 
 /// Carries every member's ops to the backend, or to a sim resource's model.
@@ -275,14 +200,15 @@ struct SubmitStep {
 impl Step for SubmitStep {
     fn execute(&mut self, now: Timestamp) {
         let mut io = self.io.borrow_mut();
-        let Some(Host { dispatch, os }) = io.host.as_mut() else {
+        let IoShared { members, host } = &mut *io;
+        let Some(Host { dispatch, os }) = host.as_mut() else {
             return;
         };
         let mut corrupt = false;
         for (m, sq) in &mut self.sqs {
             for sqe in sq.drain() {
                 match sqe {
-                    Ok(sqe) => dispatch.lower(*m, sqe),
+                    Ok(sqe) => dispatch.lower(*m, sqe, &members[*m].1),
                     Err(_) => corrupt = true,
                 }
             }

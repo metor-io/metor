@@ -111,8 +111,8 @@ impl WasmPack {
         let outs = copy_outputs(&mut guest, &instance.def.outputs, outputs, io_port)?;
         let mirrors = Mirrors::new(&instance.def, ins.mirrors, outs.mirrors);
         let mirror = io.borrow().arena(&instance.id);
-        let given = match &mirror {
-            Some(mirror) => Some(give(&mut guest, mirror)?),
+        let given = match mirror.filter(|m| m.region().is_some()) {
+            Some(mirror) => Some(give(&mut guest, &mirror)?),
             None => None,
         };
         let call = Create {
@@ -215,16 +215,13 @@ fn attach(
     (sq, cq): (Input<Sqe>, Input<Cqe>),
 ) -> Result<IoCopy, ParamError> {
     let len = region.len as usize;
-    let known = io.borrow().arena(&instance.id);
-    let mirror = match known {
-        Some(mirror) if mirror.region().is_some_and(|(_, l)| l == len) => mirror,
-        Some(_) => return Err(ParamError::Wasm("a remade guest moved its IO arena".into())),
-        None => {
-            let caps = host_caps(&instance.def).collect();
-            let arena = Arena::owning(vec![0; len].into());
-            io.borrow_mut().join(&instance.id, caps, arena)
-        }
-    };
+    let mirror = io.borrow_mut().member(&instance.id);
+    if mirror.region().is_none() {
+        mirror.set_owned(vec![0; len].into());
+    }
+    if mirror.region().is_none_or(|(_, l)| l != len) {
+        return Err(ParamError::Wasm("a remade guest moved its IO arena".into()));
+    }
     let base = guest.span(region.offset, len).map_err(PackError::from)?;
     // SAFETY: the guest's memory never moves, and `WasmStep` drops the copy
     // before the guest.

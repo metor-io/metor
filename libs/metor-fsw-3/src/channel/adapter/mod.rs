@@ -293,7 +293,7 @@ impl Core {
         }
         self.inner = None;
         self.end_reason = None;
-        self.recipe.io.borrow_mut().begin(&self.recipe.id);
+        self.recipe.io.borrow_mut().quiesce_system(&self.recipe.id);
         self.deferred = Some(Deferred::Restart);
         quiescing()
     }
@@ -330,7 +330,7 @@ impl Core {
         if !loads || !self.has_io() {
             return self.load(name);
         }
-        self.recipe.io.borrow_mut().begin(&self.recipe.id);
+        self.recipe.io.borrow_mut().quiesce_system(&self.recipe.id);
         self.deferred = Some(Deferred::Load(name));
         quiescing()
     }
@@ -343,10 +343,10 @@ impl Core {
     /// Runs the deferred reset or load once the system is idle.
     fn settle(&mut self) {
         let id = &self.recipe.id;
-        if !self.recipe.io.borrow().idle(id) {
+        if !self.recipe.io.borrow().is_system_idle(id) {
             return;
         }
-        self.recipe.io.borrow_mut().end(id);
+        self.recipe.io.borrow_mut().end_queiscing_system(id);
         let event = match self.deferred.take() {
             Some(Deferred::Restart) => self.restarted(),
             Some(Deferred::Load(name)) => self.load(name),

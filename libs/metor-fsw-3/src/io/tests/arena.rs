@@ -76,27 +76,38 @@ fn no_arena_fails_any_allocation() {
 
 #[test]
 fn span_checks_bounds() {
-    let arena = Arena::owning(vec![0; 16].into());
+    let arena = super::arena(16);
     assert!(arena.get_slice(Span::new(0, 16)).is_some());
     assert!(arena.get_slice(Span::new(8, 9)).is_none());
     assert!(arena.get_slice(Span::new(u32::MAX, 2)).is_none());
-    assert!(
-        Arena::new().get_slice(Span::new(0, 0)).is_none(),
-        "not frozen"
-    );
+    assert!(Arena::new().get_slice(Span::new(0, 0)).is_none(), "not set");
 }
 
 #[test]
 fn owner_keeps_the_memory_alive() {
-    let arena = Arena::owning(vec![7; 4].into());
+    let arena = Arena::new();
+    arena.set_owned(vec![7; 4].into());
     let (base, len) = arena.region().unwrap();
     let owner = arena.owner().unwrap();
     // SAFETY: the owner is live, and the lease meets its contract.
     let lease = unsafe { metor_fsw_3_ring::Lease::acquire(owner) };
     drop(arena);
     // SAFETY: the lease keeps the bytes alive.
-    let other = unsafe { Arena::over(base, len, crate::io::arena::Keep::Lease(lease)) };
+    let other = Arena::new();
+    // SAFETY: the lease keeps the bytes alive.
+    unsafe { other.set(base, len, crate::io::arena::Keep::Lease(lease)) };
     // SAFETY: the region is live and unshared.
     let bytes = unsafe { other.get_slice(Span::new(0, 4)).unwrap().as_ref() };
     assert_eq!(bytes, [7; 4]);
+}
+
+#[test]
+fn memory_is_set_once() {
+    let arena = Rc::new(Arena::new());
+    assert!(arena.region().is_none());
+    drop(IoInit::new(&arena));
+    let (base, len) = arena.region().expect("an empty first make sets the memory");
+    assert_eq!(len, 0);
+    assert!(!arena.set_owned(vec![0; 8].into()), "set only once");
+    assert_eq!(arena.region(), Some((base, 0)));
 }

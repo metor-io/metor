@@ -11,7 +11,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod arena;
-mod build;
 mod cap;
 mod config;
 mod device;
@@ -20,6 +19,7 @@ mod error;
 pub mod host;
 mod param;
 mod queue;
+mod shared;
 mod status;
 pub mod test;
 mod wire;
@@ -29,12 +29,11 @@ pub(crate) mod tests;
 
 pub(crate) use arena::{Arena, Keep};
 pub use arena::{Buf, IoInit};
-pub use build::{IoBuild, SharedIo};
 pub use cap::{
     Can, Cap, Dir, File, GpioLine, Handle, Interface, Listen, Messages, Stream, Uart, Udp,
 };
 pub use config::{Access, Backing, CanFilter, GpioDirection, RealKind, ResourceConfig, SimKind};
-pub(crate) use device::{Arenas, Device};
+pub(crate) use device::Device;
 pub use device::{DeviceSide, GpioModel, Model, Reply, UartModel};
 pub use error::{Errno, IoError, IoStatus};
 #[cfg(all(feature = "host", unix))]
@@ -43,6 +42,7 @@ pub use queue::{
     Accept, BufOp, Close, Fsync, Gpio, Io, IoOp, Open, Pending, Raw, Read, Recv, Send, Slot, Tty,
     Write,
 };
+pub use shared::{IoShared, SharedIo};
 pub use status::ResourceStatus;
 pub use wire::{
     Cqe, Op, OpKind, OpenFlags, RawAddr, RawHandle, Span, Sqe, Token, TtyConfig, TtyQueue,

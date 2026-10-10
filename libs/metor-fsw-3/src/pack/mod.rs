@@ -334,42 +334,33 @@ unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn S
     Ok(step)
 }
 
-/// Makes the system's member over the host's region `given`, unless this
-/// pack already has one. An empty region leaves the first make to lay out
-/// its own.
+/// Sets system `instance`'s arena to the region `ring` names, unless the
+/// system has no `Cap`, its arena is already set, or the region is empty.
 ///
 /// # Safety
-/// A non-empty `given` is live, and its owner meets `RawOwner`'s contract.
-unsafe fn adopt(io: &SharedIo, instance: &Instance, given: RawRing) {
-    let caps: Vec<String> = host_caps(&instance.def).collect();
-    if caps.is_empty() || io.borrow().index(&instance.id).is_some() {
+/// A non-empty `ring` is live, and its owner meets `RawOwner`'s contract.
+/// A region with no owner outlives the arena, such as memory a wasm host
+/// wrote into its guest.
+pub(crate) unsafe fn adopt(io: &SharedIo, instance: &Instance, ring: RawRing) {
+    if host_caps(&instance.def).next().is_none() {
         return;
     }
-    // SAFETY: the caller's contract. A region with no owner is in this
-    // module's own memory, which a wasm host wrote and never frees.
-    if let Some(arena) = unsafe { arena_over(given) } {
-        io.borrow_mut().join(&instance.id, caps, arena);
-    }
-}
-
-/// A frozen arena over `ring`, kept alive by its owner if it has one.
-///
-/// # Safety
-/// A non-empty `ring` is live, and its owner meets `RawOwner`'s contract;
-/// without one, its memory outlives the arena.
-pub(crate) unsafe fn arena_over(ring: RawRing) -> Option<Arena> {
-    let base = core::ptr::NonNull::new(ring.base).filter(|_| ring.len > 0)?;
+    let arena = io.borrow_mut().member(&instance.id);
+    let base = core::ptr::NonNull::new(ring.base).filter(|_| ring.len > 0);
+    let Some(base) = base.filter(|_| arena.region().is_none()) else {
+        return;
+    };
     // SAFETY: the caller's contract.
     let keep = match ring.owner {
         Some(owner) => Keep::Lease(unsafe { metor_fsw_3_ring::Lease::acquire(owner) }),
         None => Keep::Unowned,
     };
     // SAFETY: the caller's contract, and `keep` holds the owner's reference.
-    Some(unsafe { Arena::over(base, ring.len, keep) })
+    unsafe { arena.set(base, ring.len, keep) };
 }
 
 /// An arena's region, with an owner that keeps it alive, to pass across the
-/// pack ABI. Empty before the arena is frozen.
+/// pack ABI. Empty before the arena is set.
 pub(crate) fn ring_of(arena: &Arena) -> RawRing {
     arena
         .region()

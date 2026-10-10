@@ -104,9 +104,8 @@ impl CoordinatorConfig {
             true => Threads::deterministic(),
             false => Threads::new(),
         };
-        let io = SharedIo::default();
-        io.borrow_mut().resources = self.resources.clone();
-        io.borrow_mut().grants = granted(&self.systems);
+        let members = io_members(&plan, &self);
+        let io = SharedIo::new(crate::io::host::build(&self.resources, members)?.into());
         let target = Target {
             seed: Some(self.seed),
             namespace: self.namespace.as_deref().unwrap_or_default(),
@@ -534,10 +533,29 @@ fn ended<'a>(plan: &'a Plan<'_>, config: &'a CoordinatorConfig) -> Vec<Ended<'a>
     ended
 }
 
-/// Each system's grants, for `io_submit`'s make.
-fn granted(systems: &[SystemConfig]) -> Vec<(String, Vec<crate::io::Grant>)> {
-    let granted = systems.iter().filter(|s| !s.grants.is_empty());
-    granted.map(|s| (s.id.clone(), s.grants.clone())).collect()
+/// Each system with a `Cap`, in config order: its id and the resource index
+/// of each `Cap` parameter, in definition order.
+fn io_members(plan: &Plan<'_>, config: &CoordinatorConfig) -> Vec<(String, Vec<u16>)> {
+    let resource = |system: &SystemConfig, param: &str| {
+        let grant = system.grants.iter().find(|g| g.param == param);
+        let at = grant.and_then(|g| config.resources.iter().position(|r| r.id == g.resource));
+        // PANIC Safety: `check_grants` and `check_interfaces` gave every
+        // `Cap` one grant of a resource the config creates.
+        at.expect("a checked grant") as u16
+    };
+    let systems = config.systems.iter().zip(&plan.systems);
+    let caps = |planned: &PlannedSystem<'_>| {
+        let host = planned.def.grants.iter().filter(|g| g.end == End::Host);
+        host.map(|g| g.param.to_string()).collect::<Vec<_>>()
+    };
+    systems
+        .map(|(system, planned)| (system, caps(planned)))
+        .filter(|(_, caps)| !caps.is_empty())
+        .map(|(system, caps)| {
+            let grants = caps.iter().map(|c| resource(system, c)).collect();
+            (system.id.clone(), grants)
+        })
+        .collect()
 }
 
 /// Checks that resource ids are unique and that each backing is one this
