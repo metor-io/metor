@@ -38,7 +38,7 @@ pub(crate) fn make_state<S, M, C: Ctor<S, M>>(
     params: Params<'_>,
     io: Option<&Io>,
 ) -> Result<S, ParamError> {
-    let init = io.map_or_else(IoInit::empty, IoInit::new);
+    let init = io.map_or_else(IoInit::empty, |io| IoInit::new(io.arena()));
     let state = ctor.make(params, &init)?;
     init.finish().map_err(|e| match e {
         ParamError::IoMemory { need, reason } => ParamError::IoMemory {
@@ -186,8 +186,8 @@ mod tests {
         ctor: C,
         params: &serde_json::Value,
     ) -> Result<Vec<usize>, ParamError> {
-        let rig = crate::io::tests::Rig::new();
-        let init = IoInit::new(&rig.io);
+        let arena = std::rc::Rc::new(crate::io::Arena::new());
+        let init = IoInit::new(&arena);
         let bufs = ctor.make(Params(params), &init)?;
         init.finish()?;
         Ok(bufs.0.iter().map(|b| b.capacity()).collect())
@@ -204,8 +204,8 @@ mod tests {
 
     #[test]
     fn test_plain_forms_ignore_io() {
-        let rig = crate::io::tests::Rig::new();
-        let init = IoInit::new(&rig.io);
+        let arena = std::rc::Rc::new(crate::io::Arena::new());
+        let init = IoInit::new(&arena);
         assert_eq!(
             Ctor::<u16, ()>::make(&|| 5u16, Params(&json!(null)), &init),
             Ok(5)

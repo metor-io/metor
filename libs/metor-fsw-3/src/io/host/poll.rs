@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use polling::{Event, Events, Poller};
 
 use super::{OpId, Os, OsDone, OsOp, sys};
-use crate::io2::{Errno, IoError, Op};
+use crate::io::{Errno, IoError, Op};
 
 /// The `Os` for Unix development hosts.
 pub struct PollOs {

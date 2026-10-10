@@ -62,15 +62,9 @@ pub enum ParamError {
     GuestRng { system: String },
     #[error("`{system}` serves a `DeviceSide`, which a guest cannot")]
     GuestDeviceSide { system: String },
-    #[error("`{system}`: its IO buffer table is corrupt")]
-    CorruptTable { system: String },
-    #[error("`{system}`: its old IO buffers are still held")]
-    IoBusy { system: String },
     #[error("resource `{id}`: {message}")]
     Resource { id: String, message: String },
-    #[error(
-        "`{system}` feeds io_submit but holds no `Cap` made in this process; pack systems take caps from chunk G"
-    )]
+    #[error("`{system}` feeds io_submit but holds no `Cap` made in this process")]
     NoIoMember { system: String },
     #[error("io_complete needs an io_submit before it")]
     NoIoSubmit,

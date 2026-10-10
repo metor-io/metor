@@ -3,10 +3,11 @@
 use core::marker::PhantomData;
 use core::ops::Deref;
 
-use super::pending::{Accept, Close, Fsync, Gpio, Open, Pending, Read, Recv, Send, Tty, Write};
-use super::queue::Io;
-use super::slot::Buf;
-use super::{GpioOp, Op, OpenFlags, RawHandle, TtyConfig, TtyOp};
+use super::arena::Buf;
+use super::queue::{
+    Accept, Close, Fsync, Gpio, Io, IoOp, Open, Pending, Read, Recv, Send, Tty, Write,
+};
+use super::{Op, OpenFlags, RawHandle, TtyConfig, TtyQueue};
 
 /// What a resource lets a handle do. Build and stubgen compare interfaces by
 /// `NAME`.
@@ -26,11 +27,9 @@ pub struct Dir;
 pub struct File;
 /// A TCP listener.
 pub struct Listen;
-/// A TCP address to dial.
-pub struct Dial;
 /// A GPIO line.
 pub struct GpioLine;
-/// A connected stream, from `Listen::accept` or `Dial::connect`.
+/// A connected stream, from `Listen::accept`.
 pub struct Stream;
 
 impl Interface for Uart {
@@ -51,22 +50,11 @@ impl Interface for File {
 impl Interface for Listen {
     const NAME: &'static str = "listen";
 }
-impl Interface for Dial {
-    const NAME: &'static str = "dial";
-}
 impl Interface for GpioLine {
     const NAME: &'static str = "gpio_line";
 }
 impl Interface for Stream {
     const NAME: &'static str = "stream";
-}
-
-/// Which of a serial port's queues `flush` discards.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TtyQueue {
-    Input,
-    Output,
-    Both,
 }
 
 /// A handle to a resource. Its methods submit ops on its system's queue.
@@ -95,46 +83,32 @@ impl<K> Handle<K> {
         self.raw
     }
 
-    fn submit<O: super::pending::IoOp>(&self, op: Op, buf: Option<Buf>) -> Pending<O> {
-        Pending::new(&self.io, self.raw, op, buf)
-    }
-
-    fn with_buf<O: super::pending::IoOp>(
-        &self,
-        op: fn(super::BufRef) -> Op,
-        buf: Buf,
-    ) -> Pending<O> {
-        let op = op(buf.buf_ref());
-        self.submit(op, Some(buf))
+    fn submit<O: IoOp>(&self, op: Op, buf: Option<Buf>) -> Pending<O> {
+        self.io.submit(self.raw, op, buf)
     }
 
     /// Ends this capability. Later ops on it fail with `Stale`.
     pub fn close(&self) -> Pending<Close> {
-        self.submit(Op::CLOSE, None)
+        self.submit(Op::Close, None)
     }
 }
 
 impl Handle<Uart> {
     /// Reads whatever bytes have arrived, up to the buffer's capacity.
     pub fn read(&self, buf: Buf) -> Pending<Read> {
-        self.with_buf(|b| Op::read(b, None), buf)
+        self.submit(Op::Read { offset: None }, Some(buf))
     }
 
     pub fn write(&self, buf: Buf) -> Pending<Write> {
-        self.with_buf(|b| Op::write(b, None), buf)
+        self.submit(Op::Write { offset: None }, Some(buf))
     }
 
     pub fn configure(&self, config: TtyConfig) -> Pending<Tty> {
-        self.submit(Op::tty(TtyOp::Configure(config)), None)
+        self.submit(Op::TtyConfigure(config), None)
     }
 
     pub fn flush(&self, queue: TtyQueue) -> Pending<Tty> {
-        let queue = match queue {
-            TtyQueue::Input => 0,
-            TtyQueue::Output => 1,
-            TtyQueue::Both => 2,
-        };
-        self.submit(Op::tty(TtyOp::flush(queue)), None)
+        self.submit(Op::TtyFlush(queue), None)
     }
 }
 
@@ -146,52 +120,51 @@ impl Messages for Stream {}
 
 impl<K: Messages> Handle<K> {
     pub fn recv(&self, buf: Buf) -> Pending<Recv> {
-        self.with_buf(Op::recv, buf)
+        self.submit(Op::Recv, Some(buf))
     }
 
     pub fn send(&self, buf: Buf) -> Pending<Send> {
-        self.with_buf(Op::send, buf)
+        self.submit(Op::Send, Some(buf))
     }
 }
 
 impl Handle<File> {
     pub fn read(&self, buf: Buf, offset: u64) -> Pending<Read> {
-        let op = Op::read(buf.buf_ref(), Some(offset));
-        self.submit(op, Some(buf))
+        let offset = Some(offset);
+        self.submit(Op::Read { offset }, Some(buf))
     }
 
     pub fn write(&self, buf: Buf, offset: u64) -> Pending<Write> {
-        let op = Op::write(buf.buf_ref(), Some(offset));
-        self.submit(op, Some(buf))
+        let offset = Some(offset);
+        self.submit(Op::Write { offset }, Some(buf))
     }
 
     pub fn fsync(&self) -> Pending<Fsync> {
-        self.submit(Op::FSYNC, None)
+        self.submit(Op::Fsync, None)
     }
 }
 
 impl Handle<Dir> {
     /// Opens the file at the path in `path`, relative to this directory.
     pub fn open(&self, path: Buf, flags: OpenFlags) -> Pending<Open> {
-        let op = Op::open(path.buf_ref(), flags);
-        self.submit(op, Some(path))
+        self.submit(Op::Open(flags), Some(path))
     }
 }
 
 impl Handle<Listen> {
     pub fn accept(&self) -> Pending<Accept> {
-        self.submit(Op::ACCEPT, None)
+        self.submit(Op::Accept, None)
     }
 }
 
 impl Handle<GpioLine> {
     pub fn get(&self) -> Pending<Gpio> {
-        self.submit(Op::gpio(GpioOp::GET), None)
+        self.submit(Op::GpioGet, None)
     }
 
     /// Drives the line high for any nonzero `value`.
     pub fn set(&self, value: u32) -> Pending<Gpio> {
-        self.submit(Op::gpio(GpioOp::set(u8::from(value != 0))), None)
+        self.submit(Op::GpioSet(value != 0), None)
     }
 }
 

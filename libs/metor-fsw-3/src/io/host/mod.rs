@@ -9,6 +9,7 @@ use super::Token;
 pub(crate) mod dispatch;
 mod open;
 mod poll;
+mod steps;
 mod sys;
 #[cfg(target_os = "linux")]
 mod uring;
@@ -16,6 +17,8 @@ mod uring;
 pub(crate) use dispatch::{Backed, Dispatch, Route};
 pub use open::{OpenError, open};
 pub use poll::PollOs;
+pub use steps::{IO_COMPLETE_TYPE, IO_STATUS_PORT, IO_SUBMIT_TYPE, MakeOs};
+pub(crate) use steps::{complete_entry, submit_entry};
 #[cfg(target_os = "linux")]
 pub use uring::UringOs;
 
@@ -125,4 +128,42 @@ pub fn host(ops: usize) -> std::io::Result<Box<dyn Os>> {
     return Ok(Box::new(UringOs::new(ops)?));
     #[cfg(not(target_os = "linux"))]
     return Ok(Box::new(PollOs::new(ops)?));
+}
+
+/// How many submit and reap rounds teardown runs before it leaks the arenas.
+const TEARDOWN_ROUNDS: usize = 10;
+
+/// The dispatch and the backend its ops run on.
+pub(crate) struct Host {
+    pub(crate) dispatch: Dispatch,
+    pub(crate) os: Box<dyn Os>,
+}
+
+impl Drop for Host {
+    /// Cancels every op and reaps for a few rounds. Then leaks the arenas if
+    /// any op is still in flight, so the kernel never writes freed memory.
+    fn drop(&mut self) {
+        let Self { dispatch, os } = self;
+        dispatch.begin_all();
+        let mut done = Vec::new();
+        for _ in 0..TEARDOWN_ROUNDS {
+            for route in dispatch.routes() {
+                match route {
+                    Route::Cancel(id) => os.cancel(id),
+                    Route::Close(fd) => os.close(fd),
+                    Route::Os(_) | Route::Sim(..) => {}
+                }
+            }
+            os.submit();
+            os.reap(&mut done);
+            for d in done.drain(..) {
+                let _ = dispatch.raise(d);
+            }
+            if !dispatch.live() {
+                return;
+            }
+            std::thread::sleep(core::time::Duration::from_millis(1));
+        }
+        dispatch.leak();
+    }
 }

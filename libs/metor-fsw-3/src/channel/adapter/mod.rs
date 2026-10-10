@@ -288,12 +288,12 @@ impl Core {
     /// ops in flight finish.
     fn reset(&mut self) -> SequenceEventKind {
         self.run = RunState::Stopped;
-        let Some(member) = self.member() else {
+        if !self.has_io() {
             return self.restarted();
-        };
+        }
         self.inner = None;
         self.end_reason = None;
-        self.recipe.io.borrow_mut().begin(&member);
+        self.recipe.io.borrow_mut().begin(&self.recipe.id);
         self.deferred = Some(Deferred::Restart);
         quiescing()
     }
@@ -327,27 +327,26 @@ impl Core {
             .inner
             .as_ref()
             .is_some_and(|inner| inner.occupant().is_some());
-        let Some(member) = self.member().filter(|_| loads) else {
+        if !loads || !self.has_io() {
             return self.load(name);
-        };
-        self.recipe.io.borrow_mut().begin(&member);
+        }
+        self.recipe.io.borrow_mut().begin(&self.recipe.id);
         self.deferred = Some(Deferred::Load(name));
         quiescing()
     }
 
-    /// The system's IO member, if it has one.
-    fn member(&self) -> Option<std::rc::Rc<crate::io::shared::Member>> {
-        self.recipe.io.borrow().find(&self.recipe.id)
+    /// Whether the system does IO.
+    fn has_io(&self) -> bool {
+        self.recipe.io.borrow().index(&self.recipe.id).is_some()
     }
 
     /// Runs the deferred reset or load once the system is idle.
     fn settle(&mut self) {
-        if let Some(member) = self.member() {
-            if !self.recipe.io.borrow().idle(&member) {
-                return;
-            }
-            self.recipe.io.borrow().end(&member);
+        let id = &self.recipe.id;
+        if !self.recipe.io.borrow().idle(id) {
+            return;
         }
+        self.recipe.io.borrow_mut().end(id);
         let event = match self.deferred.take() {
             Some(Deferred::Restart) => self.restarted(),
             Some(Deferred::Load(name)) => self.load(name),

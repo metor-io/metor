@@ -15,7 +15,8 @@ use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
 use crate::io::{
-    Backing, End, IO_COMPLETE_TYPE, IO_CQ, IO_SQ, IO_SUBMIT_TYPE, ResourceConfig, SharedIo,
+    Backing, End, IO_COMPLETE_TYPE, IO_CQ, IO_SQ, IO_SUBMIT_TYPE, RealKind, ResourceConfig,
+    SharedIo,
 };
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
@@ -547,12 +548,15 @@ fn check_resources(resources: &[ResourceConfig]) -> Result<(), BuildError> {
             let id = resource.id.clone();
             return Err(BuildError::DuplicateResource { id });
         }
-        if matches!(resource.backing, Backing::Peer(_)) {
-            return Err(BuildError::Backing {
-                resource: resource.id.clone(),
-                backing: resource.backing.name().into(),
-            });
-        }
+        let backing = match &resource.backing {
+            Backing::Peer(_) => resource.backing.name(),
+            Backing::Real(RealKind::TcpConnect { .. }) => "tcp_connect",
+            _ => continue,
+        };
+        return Err(BuildError::Backing {
+            resource: resource.id.clone(),
+            backing: backing.into(),
+        });
     }
     Ok(())
 }

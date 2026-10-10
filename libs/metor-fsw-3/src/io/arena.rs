@@ -96,10 +96,6 @@ impl Arena {
         }
     }
 
-    pub(crate) fn frozen(&self) -> bool {
-        self.region().is_some()
-    }
-
     pub(crate) fn epoch(&self) -> u32 {
         self.epoch.get()
     }

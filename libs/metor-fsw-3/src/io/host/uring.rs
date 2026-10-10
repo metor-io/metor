@@ -11,7 +11,7 @@ use io_uring::types::{CancelBuilder, Fd};
 use io_uring::{IoUring, opcode};
 
 use super::{Class, OpId, Os, OsDone, OsOp, Out, sys};
-use crate::io2::{Errno, IoError, Op};
+use crate::io::{Errno, IoError, Op};
 
 /// Set in the `user_data` of a cancel, whose completion is dropped.
 const CANCEL: u64 = 1 << 40;

@@ -307,8 +307,8 @@ mod tests {
 
     #[test]
     fn uart_script_answers_a_read_per_line() {
+        use metor_fsw_3::io::Op;
         use metor_fsw_3::io::test::device;
-        use metor_fsw_3::io::{BufRef, Op};
 
         let (mut dev, mut driver) = device::<Uart>();
         let params = UartScriptParams {
@@ -316,7 +316,7 @@ mod tests {
         };
         let mut state = UartScript::new(params);
         let reads: Vec<_> = (0..3)
-            .map(|_| driver.request(Op::read(BufRef::new(0), None), b"").unwrap())
+            .map(|_| driver.request(Op::Read { offset: None }, b""))
             .collect();
         uart_script()(&mut state, Timestamp(0), &mut dev);
         assert_eq!(driver.replies().len(), 2);

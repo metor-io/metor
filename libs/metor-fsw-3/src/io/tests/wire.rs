@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use zerocopy::IntoBytes;
 
-use crate::io2::*;
+use crate::io::*;
 use crate::record::{DecodeError, Record};
 
 fn ops() -> Vec<Op> {

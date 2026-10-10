@@ -15,8 +15,7 @@ use crate::coordinator::{
     EndReason, MakeCx, ParamError, Params, Step, Stepped, SystemTable, catch_step,
 };
 use crate::def::DefError;
-use crate::io::region::Region;
-use crate::io::{End, SharedIo};
+use crate::io::{Arena, End, Keep, SharedIo};
 use crate::system::SystemDef;
 use crate::thread::Threads;
 use def::{DefCxOwned, Instance, PackDef};
@@ -25,7 +24,7 @@ use raw::{RawRing, RawSlice};
 /// The ABI version of the exports in this module.
 ///
 /// The host refuses to load a pack whose version does not match its own.
-pub const ABI_VERSION: u32 = 10;
+pub const ABI_VERSION: u32 = 11;
 
 /// The status word [`execute`] returns.
 ///
@@ -308,7 +307,7 @@ unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn S
     // SAFETY: the caller's contract.
     let given = unsafe { table.read() };
     // SAFETY: as above; the region and its owner are live.
-    unsafe { adopt(&io, &instance, given) }?;
+    unsafe { adopt(&io, &instance, given) };
     let step = with_table(build, |table| {
         let entry = table
             .get(ty)
@@ -341,41 +340,51 @@ unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn S
 ///
 /// # Safety
 /// A non-empty `given` is live, and its owner meets `RawOwner`'s contract.
-unsafe fn adopt(io: &SharedIo, instance: &Instance, given: RawRing) -> Result<(), ParamError> {
-    let id = &instance.id;
+unsafe fn adopt(io: &SharedIo, instance: &Instance, given: RawRing) {
     let caps: Vec<String> = host_caps(&instance.def).collect();
-    let known = io.borrow().find(id).is_some();
-    let Some(base) = core::ptr::NonNull::new(given.base) else {
-        return Ok(());
-    };
-    if known || caps.is_empty() || given.len == 0 {
-        return Ok(());
+    if caps.is_empty() || io.borrow().index(&instance.id).is_some() {
+        return;
     }
     // SAFETY: the caller's contract. A region with no owner is in this
     // module's own memory, which a wasm host wrote and never frees.
-    let region = unsafe {
-        match given.owner {
-            Some(owner) => Region::shared(base, given.len, owner),
-            None => Region::unowned(base, given.len),
-        }
-    };
-    let corrupt = |_| ParamError::CorruptTable { system: id.clone() };
-    io.borrow_mut()
-        .adopt_region(id, caps, region)
-        .map_err(corrupt)?;
-    Ok(())
+    if let Some(arena) = unsafe { arena_over(given) } {
+        io.borrow_mut().join(&instance.id, caps, arena);
+    }
 }
 
-/// The region of system `id`'s member, with an owner that keeps it alive, or
-/// an empty one when it has no IO.
+/// A frozen arena over `ring`, kept alive by its owner if it has one.
+///
+/// # Safety
+/// A non-empty `ring` is live, and its owner meets `RawOwner`'s contract;
+/// without one, its memory outlives the arena.
+pub(crate) unsafe fn arena_over(ring: RawRing) -> Option<Arena> {
+    let base = core::ptr::NonNull::new(ring.base).filter(|_| ring.len > 0)?;
+    // SAFETY: the caller's contract.
+    let keep = match ring.owner {
+        Some(owner) => Keep::Lease(unsafe { metor_fsw_3_ring::Lease::acquire(owner) }),
+        None => Keep::Unowned,
+    };
+    // SAFETY: the caller's contract, and `keep` holds the owner's reference.
+    Some(unsafe { Arena::over(base, ring.len, keep) })
+}
+
+/// An arena's region, with an owner that keeps it alive, to pass across the
+/// pack ABI. Empty before the arena is frozen.
+pub(crate) fn ring_of(arena: &Arena) -> RawRing {
+    arena
+        .region()
+        .map_or(RawRing::EMPTY, |(base, len)| RawRing {
+            base: base.as_ptr(),
+            len,
+            owner: arena.owner(),
+        })
+}
+
+/// The region of system `id`'s member, or an empty one when it has no IO.
 fn region_of(io: &SharedIo, id: &str) -> RawRing {
-    let member = io.borrow().find(id);
-    let export = member.and_then(|m| m.table.bufs.export());
-    export.map_or(RawRing::EMPTY, |(span, owner)| RawRing {
-        base: span.cast().as_ptr(),
-        len: span.len(),
-        owner,
-    })
+    io.borrow()
+        .arena(id)
+        .map_or(RawRing::EMPTY, |arena| ring_of(&arena))
 }
 
 /// The names of the `Cap` parameters in `def`.

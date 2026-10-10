@@ -14,9 +14,9 @@ use metor_proto::types::Timestamp;
 
 use super::{Class, OpId, OsDone, OsOp, Out};
 use crate::coordinator::ParamError;
-use crate::io2::arena::Arena;
-use crate::io2::status::{Counters, ResourceStatus};
-use crate::io2::{Cqe, IoError, MAX_OPS, Op, OpKind, RawHandle, Span, Sqe, Token};
+use crate::io::arena::Arena;
+use crate::io::status::{Counters, ResourceStatus};
+use crate::io::{Cqe, IoError, MAX_OPS, Op, OpKind, RawHandle, Span, Sqe, Token};
 use crate::port::Output;
 
 /// The most `io_status` records written in one cycle.
@@ -342,6 +342,33 @@ impl Dispatch {
     /// The routes queued since the last call.
     pub(crate) fn routes(&mut self) -> std::vec::Drain<'_, Route> {
         self.routes.drain(..)
+    }
+
+    /// Fails sim op `token`, which never reached its model.
+    pub(crate) fn refuse(&mut self, token: Token, e: IoError) {
+        let id = OpId::new(token.slot(), token.generation());
+        let result = Err(e);
+        if let Some(reply) = self.raise(OsDone { id, result }) {
+            self.replies.push(reply);
+        }
+    }
+
+    /// Starts quiescing every member, for teardown.
+    pub(crate) fn begin_all(&mut self) {
+        (0..self.members.len()).for_each(|m| self.begin(m));
+    }
+
+    /// Whether any op is in flight.
+    pub(crate) fn live(&self) -> bool {
+        self.ops.iter().any(|e| e.live)
+    }
+
+    /// Leaks every arena, so memory an op still in flight names is never
+    /// freed.
+    pub(crate) fn leak(&self) {
+        self.members
+            .iter()
+            .for_each(|m| core::mem::forget(m.arena.clone()));
     }
 
     /// Queues a route again, such as a sim cancel its port refused.

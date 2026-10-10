@@ -862,12 +862,12 @@ struct Drawer {
 
 /// Records one draw a cycle, under its tag.
 #[crate::system]
-fn drawer(#[state] s: &mut Drawer, rng: &mut crate::io::Rng) {
+fn drawer(#[state] s: &mut Drawer, rng: &mut crate::Rng) {
     s.seen.borrow_mut().push((s.tag.clone(), rng.next_u64()));
 }
 
 #[crate::system]
-async fn async_drawer(rng: &mut crate::io::Rng, stop: Stop) {
+async fn async_drawer(rng: &mut crate::Rng, stop: Stop) {
     let _ = (rng.next_u64(), stop);
 }
 
@@ -907,12 +907,12 @@ fn first(draws: &[(String, u64)], tag: &str) -> Vec<u64> {
 #[test]
 fn test_rng_draws_from_the_target_seed_and_name() {
     let draws = drawers(7, None, &["a"], 2);
-    let mut want = crate::io::Rng::seeded(7, "a");
+    let mut want = crate::Rng::seeded(7, "a");
     assert_eq!(first(&draws, "a"), [want.next_u64(), want.next_u64()]);
     let named = drawers(7, Some("t"), &["a"], 1);
     assert_eq!(
         first(&named, "a"),
-        [crate::io::Rng::seeded(7, "t.a").next_u64()]
+        [crate::Rng::seeded(7, "t.a").next_u64()]
     );
     assert_eq!(drawers(7, None, &["a"], 3), drawers(7, None, &["a"], 3));
 }

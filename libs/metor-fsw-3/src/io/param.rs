@@ -2,12 +2,11 @@
 
 use metor_fsw_3_ring::WakeSink;
 
-use crate::def::{DefCx, DefError};
-use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers, param_name};
-
 use super::cap::{Cap, Handle, Interface};
 use super::device::DeviceSide;
 use super::{End, GrantDef};
+use crate::def::{DefCx, DefError};
+use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers, param_name};
 
 fn grant<K: Interface>(param: &'static str, end: End) -> GrantDef {
     GrantDef {

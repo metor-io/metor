@@ -7,7 +7,7 @@ use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use super::{Class, OsOp, Out};
-use crate::io2::{Errno, IoError, Op, OpenFlags, TtyConfig, TtyQueue};
+use crate::io::{Errno, IoError, Op, OpenFlags, TtyConfig, TtyQueue};
 
 /// `send` never raises `SIGPIPE`.
 #[cfg(target_os = "linux")]

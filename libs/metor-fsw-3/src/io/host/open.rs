@@ -8,7 +8,7 @@ use std::path::Path;
 
 use super::Class;
 use super::sys::{configure, speed};
-use crate::io2::{Access, CanFilter, GpioDirection, IoError, RealKind, TtyConfig};
+use crate::io::{Access, CanFilter, GpioDirection, IoError, RealKind, TtyConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {

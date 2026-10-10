@@ -1,90 +1,58 @@
-//! IO ops, their completions, the buffers they use, and the backends that run
-//! them.
+//! IO as a queue: a system puts ops on its own submission queue and takes
+//! results from its own completion queue.
 //!
-//! Ops are plain bytes. They refer to buffers by slot and to handles by index,
-//! so they can be logged, compared, and copied across the guest ABI.
+//! Every index is arithmetic over tables sized at build. A buffer is a
+//! [`Span`] of its system's arena, so ops are plain bytes that can be logged,
+//! compared, and copied across the guest ABI.
 
 use std::borrow::Cow;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-mod addr;
-mod buf;
+mod arena;
+mod build;
 mod cap;
-pub(crate) mod device;
-mod handle;
+mod config;
+mod device;
+mod error;
 #[cfg(all(feature = "host", unix))]
-mod handles;
-mod kind;
-mod op;
-#[cfg(all(feature = "host", unix))]
-mod open;
-#[cfg(all(feature = "host", unix))]
-mod os;
-mod out;
+pub mod host;
 mod param;
-mod pending;
-#[cfg(all(feature = "host", unix))]
-mod poll;
-pub(crate) mod queue;
-#[cfg(all(feature = "host", unix))]
-mod reactor;
-mod record;
-pub(crate) mod region;
-mod rng;
-pub(crate) mod shared;
-mod sim;
-mod slot;
+mod queue;
 mod status;
-#[cfg(all(feature = "host", unix))]
-pub(crate) mod system;
 pub mod test;
-#[cfg(all(feature = "host", target_os = "linux"))]
-mod uring;
+mod wire;
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub(crate) mod tests;
 
-pub use addr::RawAddr;
-pub use buf::{BufError, BufRef, BufTable, Corrupt, RawBuf, TableId, Tables};
+pub(crate) use arena::{Arena, Keep};
+pub use arena::{Buf, IoInit};
+pub use build::{IoBuild, SharedIo};
 pub use cap::{
-    Can, Cap, Dial, Dir, File, GpioLine, Handle, Interface, Listen, Messages, Stream, TtyQueue,
-    Uart, Udp,
+    Can, Cap, Dir, File, GpioLine, Handle, Interface, Listen, Messages, Stream, Uart, Udp,
 };
-pub use device::DeviceSide;
-pub use handle::{RawHandle, Token};
-pub use kind::{Access, Backing, CanFilter, GpioDirection, RealKind, ResourceConfig, SimKind};
-pub use op::{GpioOp, Op, OpKind, OpenFlags, Sqe, TtyConfig, TtyOp};
+pub use config::{Access, Backing, CanFilter, GpioDirection, RealKind, ResourceConfig, SimKind};
+pub(crate) use device::{Arenas, Device};
+pub use device::{DeviceSide, GpioModel, Model, Reply, UartModel};
+pub use error::{Errno, IoError, IoStatus};
 #[cfg(all(feature = "host", unix))]
-pub use open::{OpenError, Opened, open};
-#[cfg(all(feature = "host", unix))]
-pub use os::{FdClass, Os, OsError, host};
-pub use out::{Cqe, Errno, IoError, IoStatus, Out};
-pub use pending::{
-    Accept, BufOp, Close, Fsync, Gpio, IoOp, Open, Pending, Raw, Read, Recv, Send, Tty, Write,
+pub use host::{IO_COMPLETE_TYPE, IO_STATUS_PORT, IO_SUBMIT_TYPE};
+pub use queue::{
+    Accept, BufOp, Close, Fsync, Gpio, Io, IoOp, Open, Pending, Raw, Read, Recv, Send, Slot, Tty,
+    Write,
 };
-#[cfg(all(feature = "host", unix))]
-pub use poll::PollOs;
-pub use queue::Io;
-#[cfg(all(feature = "host", unix))]
-pub use reactor::{Limits, Reactor, SourceId};
-pub use rng::Rng;
-pub use shared::{IoShared, SharedIo};
-pub use sim::{GpioModel, Model, Reply, UartModel, fills, serve_gpio, serve_uart};
-pub use slot::{Buf, IoInit, Slot};
 pub use status::ResourceStatus;
-#[cfg(all(feature = "host", unix))]
-pub use system::{IO_COMPLETE_TYPE, IO_STATUS_PORT, IO_SUBMIT_TYPE};
-#[cfg(all(feature = "host", target_os = "linux"))]
-pub use uring::UringOs;
+pub use wire::{
+    Cqe, Op, OpKind, OpenFlags, RawAddr, RawHandle, Span, Sqe, Token, TtyConfig, TtyQueue,
+};
 
 /// The output a system submits ops on.
 pub const IO_SQ: &str = "io_sq";
 /// The input a system reads completions from.
 pub const IO_CQ: &str = "io_cq";
-/// The most ops one system may have in flight, and the ring depth of `Sqe`
-/// and `Cqe`.
+/// The most ops one system may have in flight.
 #[cfg(not(kani))]
 pub const MAX_OPS: usize = 16;
 #[cfg(kani)]

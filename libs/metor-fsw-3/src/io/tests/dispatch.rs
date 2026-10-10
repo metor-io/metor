@@ -5,11 +5,11 @@ use std::rc::Rc;
 use metor_proto::types::Timestamp;
 
 use super::allocations;
-use crate::io2::arena::Arena;
-use crate::io2::host::dispatch::Resource;
-use crate::io2::host::{Backed, Class, Dispatch, OpId, OsDone, OsOp, Out, Route};
-use crate::io2::status::{ResourceStatus, resource_name};
-use crate::io2::*;
+use crate::io::arena::Arena;
+use crate::io::host::dispatch::Resource;
+use crate::io::host::{Backed, Class, Dispatch, OpId, OsDone, OsOp, Out, Route};
+use crate::io::status::{ResourceStatus, resource_name};
+use crate::io::*;
 use crate::record::Record;
 use crate::tests::utils::pair;
 

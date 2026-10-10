@@ -9,11 +9,11 @@ use std::sync::Arc;
 use metor_fsw_3_ring::WakeSink;
 use metor_proto::types::Timestamp;
 
+use crate::Rng;
 use crate::channel::{ABORT_PORT, Abort, AbortRequest};
 use crate::def::{DefCx, DefError};
 use crate::frame::Frame;
-use crate::io::device::{DeviceSide, Erased};
-use crate::io::{Cqe, End, GrantDef, IO_CQ, IO_SQ, Io, Rng, Sqe};
+use crate::io::{Cqe, Device, End, GrantDef, IO_CQ, IO_SQ, Io, Sqe};
 use crate::log::Log;
 use crate::port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers};
 use crate::record::Record;
@@ -74,7 +74,7 @@ pub struct Writers {
     pub(crate) bindings: Bindings<OutputBinding>,
     pub(crate) dropped: Arc<AtomicU32>,
     pub(crate) io: Option<Io>,
-    pub(crate) devices: VecDeque<DeviceSide<Erased>>,
+    pub(crate) devices: VecDeque<Device>,
     /// The instance's stream, for an `Rng` parameter.
     pub(crate) rng: Option<Rng>,
 }

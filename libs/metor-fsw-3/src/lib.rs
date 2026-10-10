@@ -151,10 +151,6 @@ pub mod dl;
 pub mod fn_system;
 pub mod frame;
 pub mod io;
-mod io2;
-#[cfg(all(feature = "host", unix))]
-#[doc(hidden)]
-pub use io2::host as io2_host;
 #[cfg(feature = "host")]
 pub mod link;
 pub mod log;
@@ -164,6 +160,7 @@ pub mod pack;
 mod panic;
 pub mod port;
 pub mod record;
+mod rng;
 pub mod sequence;
 pub mod system;
 pub mod thread;
@@ -201,6 +198,7 @@ pub use port::{
     DynInputs, DynOutputs, Input, Latest, Output, RecvError, Sample, SendError, ring_capacity,
 };
 pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Record, RecordSchema};
+pub use rng::Rng;
 pub use sequence::{OnAbort, Redline, Seq, SeqError, SequenceFn};
 pub use system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,

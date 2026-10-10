@@ -1,8 +1,8 @@
 use metor_proto::types::Timestamp;
 
 use super::allocations;
-use crate::io2::test::{ScriptedUart, TestDevice, cap, device, device_shared};
-use crate::io2::*;
+use crate::io::test::{ScriptedUart, TestDevice, cap, device, device_shared};
+use crate::io::*;
 
 const NOW: Timestamp = Timestamp(0);
 

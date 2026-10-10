@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use crate::coordinator::ParamError;
-use crate::io2::arena::Arena;
-use crate::io2::{IoInit, Span};
+use crate::io::arena::Arena;
+use crate::io::{IoInit, Span};
 
 #[test]
 fn bufs_read_empty_until_the_make_ends() {
@@ -92,7 +92,7 @@ fn owner_keeps_the_memory_alive() {
     let lease = unsafe { metor_fsw_3_ring::Lease::acquire(owner) };
     drop(arena);
     // SAFETY: the lease keeps the bytes alive.
-    let other = unsafe { Arena::over(base, len, crate::io2::arena::Keep::Lease(lease)) };
+    let other = unsafe { Arena::over(base, len, crate::io::arena::Keep::Lease(lease)) };
     // SAFETY: the region is live and unshared.
     let bytes = unsafe { other.span(Span::new(0, 4)).unwrap().as_ref() };
     assert_eq!(bytes, [7; 4]);

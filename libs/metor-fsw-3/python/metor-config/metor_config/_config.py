@@ -7,7 +7,7 @@ from typing import Any
 
 CONFIG_VERSION = 2
 
-ABI_VERSION = 10
+ABI_VERSION = 11
 """The host ABI version the built-in systems are compiled against.
 
 A Rust test keeps this in sync with the host.

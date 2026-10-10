@@ -1,121 +1,55 @@
-mod buf;
-mod cap;
-mod harness;
-mod kind;
-mod op;
-#[cfg(all(test, feature = "host"))]
-mod param;
-#[cfg(all(test, feature = "host", unix))]
-mod poll;
+mod arena;
+mod device;
+#[cfg(all(feature = "host", unix))]
+mod dispatch;
 mod queue;
-#[cfg(all(test, feature = "host", unix))]
-mod reactor;
-mod region;
-#[cfg(all(test, feature = "host", unix))]
-mod sim;
-mod slot;
-#[cfg(all(test, feature = "host", unix))]
-pub(crate) mod system;
-#[cfg(all(test, feature = "host", target_os = "linux"))]
-mod uring;
+mod wire;
 
-#[cfg(test)]
+use std::rc::Rc;
+
+use metor_fsw_3_ring::RingBuffer;
+
+use super::arena::Arena;
+use super::{Cqe, Io, IoInit, Sqe};
+use crate::port::{Input, Output};
+use crate::record::Record;
+use crate::tests::utils::pair;
+
 pub(crate) use counting::allocations;
-#[cfg(test)]
-pub(crate) use rig::Rig;
 
-#[cfg(test)]
-mod rig {
-    use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
-    use zerocopy::IntoBytes;
+/// A system's queue whose other end the test plays by hand.
+pub(crate) struct Loopback {
+    pub io: Io,
+    pub sq: Input<Sqe>,
+    pub cq: Output<Cqe>,
+    _rings: [RingBuffer; 2],
+}
 
-    use crate::io::queue::{Io, Table};
-    use crate::io::{Buf, Cqe, MAX_OPS, Sqe};
-    use crate::port::{Input, Output, ring_capacity};
-    use crate::record::{Bytes, Record};
-
-    fn ring(max_len: usize, depth: usize) -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(max_len, depth).expect("valid capacity"),
-            max_readers: 1,
-        })
+impl Loopback {
+    pub fn new() -> Self {
+        let (sq_ring, sq_out, sq) = pair::<Sqe>(Sqe::DEPTH);
+        let (cq_ring, cq, cq_in) = pair::<Cqe>(Cqe::DEPTH);
+        Self {
+            io: Io::new(sq_out, cq_in, Rc::new(Arena::new())),
+            sq,
+            cq,
+            _rings: [sq_ring, cq_ring],
+        }
     }
 
-    /// An `Io` over in-memory rings, with the test playing the reactor.
-    pub struct Rig {
-        pub io: Io,
-        sq: Input<Sqe>,
-        cq: Output<Bytes>,
-        _rings: [RingBuffer; 2],
+    pub fn init(&self) -> IoInit<'_> {
+        IoInit::new(self.io.arena())
     }
 
-    impl Rig {
-        pub fn new() -> Self {
-            Self::with_sq_depth(MAX_OPS)
-        }
+    pub fn submitted(&mut self) -> Vec<Sqe> {
+        self.sq.drain().map(Result::unwrap).collect()
+    }
 
-        /// A rig whose SQ ring holds `depth` ops.
-        pub fn with_sq_depth(depth: usize) -> Self {
-            let sq_ring = ring(Sqe::MAX_LEN, depth);
-            let cq_ring = ring(Cqe::MAX_LEN, MAX_OPS);
-            let sq_out = Output::new(sq_ring.writer(NoWake).expect("writer"));
-            let cq_in = Input::new(vec![cq_ring.view(NoWake).expect("view")]);
-            let io = Io::new(sq_out, cq_in, Table::new());
-            let sq = Input::new(vec![sq_ring.view(NoWake).expect("view")]);
-            let cq = Output::bytes(cq_ring.writer(NoWake).expect("writer"), Cqe::MAX_LEN);
-            Self {
-                io,
-                sq,
-                cq,
-                _rings: [sq_ring, cq_ring],
-            }
-        }
-
-        /// Allocates without an `IoInit`, so the table stays unfrozen and
-        /// tests can keep allocating. Tests hold no slice across an alloc.
-        pub fn buf(&self, bytes: &[u8]) -> Buf {
-            let table = self.io.table();
-            Buf::new(table, table.alloc_from(bytes))
-        }
-
-        pub fn empty_buf(&self, cap: usize) -> Buf {
-            let table = self.io.table();
-            Buf::new(table, table.alloc(cap))
-        }
-
-        /// Every op submitted since the last call.
-        pub fn sent(&mut self) -> Vec<Sqe> {
-            self.sq.drain().map(|s| s.expect("an sqe")).collect()
-        }
-
-        /// The token of the one op submitted since the last call. Does not
-        /// allocate.
-        pub fn sent_token(&mut self) -> crate::io::Token {
-            let mut ops = self.sq.drain().map(|s| s.expect("an sqe").token);
-            let token = ops.next().expect("one op");
-            assert!(ops.next().is_none(), "one op");
-            token
-        }
-
-        pub fn reply(&self, cqe: Cqe) {
-            self.cq.write_bytes(cqe.as_bytes()).expect("cq room");
-        }
-
-        pub fn garbage(&self) {
-            self.cq.write_bytes(&[0xFF; 40]).expect("cq room");
-        }
-
-        /// Fills slot `slot` of the table as the kernel would.
-        pub fn kernel_fill(&self, slot: u16, bytes: &[u8]) {
-            // SAFETY: the op holding this slot is in flight, so no `Buf`
-            // reaches it, and the test plays the kernel.
-            let whole = unsafe { self.io.table().bufs.whole_mut(slot) };
-            whole[..bytes.len()].copy_from_slice(bytes);
-        }
+    pub fn complete(&self, cqe: Cqe) {
+        self.cq.write(&cqe).unwrap();
     }
 }
 
-#[cfg(test)]
 mod counting {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
@@ -156,6 +90,7 @@ mod counting {
     #[global_allocator]
     static GLOBAL: Counting = Counting;
 
+    /// The allocations `f` makes on this thread.
     pub fn allocations(f: impl FnOnce()) -> usize {
         COUNT.with(|c| c.set(Some(0)));
         f();

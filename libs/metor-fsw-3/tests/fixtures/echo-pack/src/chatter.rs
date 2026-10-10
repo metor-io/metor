@@ -1,6 +1,7 @@
 //! A serial device that sends random bytes, and a driver that reads them.
 
-use metor_fsw_3::io::{Cap, DeviceSide, IoError, Read, Rng, TtyConfig, Uart, UartModel};
+use metor_fsw_3::Rng;
+use metor_fsw_3::io::{Cap, DeviceSide, IoError, Read, TtyConfig, Uart, UartModel};
 use metor_fsw_3::{IoInit, Output, Slot, Timestamp, system};
 
 use super::Ping;

@@ -9,11 +9,10 @@ use metor_proto_wkt::LogEvent;
 
 use metor_fsw_3_ring::{NoWake, WakeSink};
 
+use crate::Rng;
 use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
-use crate::io::device::DeviceSide;
-use crate::io::queue::{Io, Table};
-use crate::io::{End, Rng, SharedIo, Sqe, Tables};
+use crate::io::{Arena, Arenas, Device, End, Io, SharedIo, Sqe};
 use crate::log::LogPort;
 use crate::port::{Input, Output, Samplers};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
@@ -135,8 +134,8 @@ impl<'a> Instance<'a> {
 /// Binds a fn system's ports, including its queue pair and device ends.
 ///
 /// The IO ports come after the parameters' own (see `Defs::append_io`).
-/// A system with a `Cap` takes its member's table from `io`, and each
-/// `DeviceSide` resolves drivers' buffers through `io`'s tables.
+/// A system with a `Cap` takes its member's arena from `io`, and each
+/// `DeviceSide` resolves drivers' buffers through `io`'s arenas.
 pub(crate) fn bind<S: Ports>(
     mut inputs: Vec<InputBinding>,
     mut outputs: Vec<OutputBinding>,
@@ -151,12 +150,10 @@ pub(crate) fn bind<S: Ports>(
             .filter(|g| g.end == End::Host)
             .map(|g| g.param.to_string())
     };
-    let member = defs
+    let arena = defs
         .io
-        .then(|| io.borrow_mut().member(id, caps().collect()))
-        .transpose()?;
-    let table = member.map(|m| m.table.clone());
-    let tables = io.borrow().tables.clone();
+        .then(|| io.borrow_mut().member(id, caps().collect()));
+    let arenas = io.borrow().arenas.clone();
     let io_ports = defs.io_ports();
     // PANIC Safety: build binds one entry per port of the definition these
     // `Defs` describe, with `log` last among the outputs.
@@ -170,7 +167,7 @@ pub(crate) fn bind<S: Ports>(
         let devices = defs.grants.iter().filter(|g| g.end == End::Device);
         devices.map(|g| shared.held_cap(id, &g.param)).collect()
     };
-    let (io, devices) = io_ends(table, io_in, io_out, &tables, &held);
+    let (io, devices) = io_ends(arena, io_in, io_out, &arenas, &held);
     let ins = bind_inputs::<S, NoWake>(inputs, defs.inputs.len() - io_ports);
     let mut writers = writers(outputs, defs.outputs.len() - io_ports + 1, dropped);
     writers.io = io.clone();
@@ -182,22 +179,22 @@ pub(crate) fn bind<S: Ports>(
 /// Builds the queue pair, if any, then one device end per remaining pair of
 /// IO ports.
 fn io_ends(
-    table: Option<Rc<Table>>,
+    arena: Option<Rc<Arena>>,
     inputs: Vec<InputBinding>,
     outputs: Vec<OutputBinding>,
-    tables: &Tables,
+    arenas: &Rc<Arenas>,
     held: &[usize],
-) -> (Option<Io>, VecDeque<DeviceSide<crate::io::device::Erased>>) {
+) -> (Option<Io>, VecDeque<Device>) {
     let mut ports = inputs.into_iter().zip(outputs);
-    let io = table.and_then(|table| {
+    let io = arena.and_then(|arena| {
         let (cq, sq) = ports.next()?;
-        Some(Io::new(Output::new(sq.writer), Input::new(cq.views), table))
+        Some(Io::new(Output::new(sq.writer), Input::new(cq.views), arena))
     });
     let devices = ports
         .zip(held)
         .map(|((req, rep), &held)| {
             let (requests, replies) = (Input::<Sqe>::new(req.views), Output::new(rep.writer));
-            DeviceSide::new(requests, replies, tables.clone(), held)
+            Device::new(requests, replies, arenas.clone(), held)
         })
         .collect();
     (io, devices)

@@ -1,381 +1,309 @@
-//! Test cases every `Os` backend must pass, run through a `Reactor`.
+//! Cases every `Os` backend must pass, with real descriptors.
 #![allow(dead_code)]
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::rc::Rc;
-use std::time::Duration;
+use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
-use metor_fsw_3::io::*;
+use metor_fsw_3::io::host::*;
 
-pub type Backend = fn(&Limits, Tables, &[RawAddr]) -> Result<Box<dyn Os>, OsError>;
+pub type Backend = fn(usize) -> std::io::Result<Box<dyn Os>>;
 
-const LIMITS: Limits = Limits {
-    ops: 32,
-    sources: 1,
-};
-pub const SRC: SourceId = SourceId(0);
-
-/// A reactor with one source whose table holds `bufs`. An empty entry
-/// allocates a 256-byte buffer.
+/// A backend and the buffers its ops use.
 pub struct Rig {
-    pub reactor: Reactor,
-    pub table: Rc<BufTable>,
-    pub handles: Vec<RawHandle>,
-    done: Vec<(SourceId, Cqe)>,
-    next: u32,
+    pub os: Box<dyn Os>,
+    bufs: Vec<Box<[u8]>>,
+    done: Vec<OsDone>,
+    next: u16,
 }
 
 impl Rig {
-    pub fn new(
-        backend: Backend,
-        dials: &[SocketAddr],
-        fds: Vec<(OwnedFd, FdClass)>,
-        bufs: &[&[u8]],
-    ) -> Self {
-        Self::with_limits(backend, LIMITS, dials, fds, bufs)
-    }
-
-    pub fn with_limits(
-        backend: Backend,
-        limits: Limits,
-        dials: &[SocketAddr],
-        fds: Vec<(OwnedFd, FdClass)>,
-        bufs: &[&[u8]],
-    ) -> Self {
-        let tables = Tables::new();
-        let table = Rc::new(BufTable::new(16));
-        tables.add(&table);
-        for b in bufs {
-            match b {
-                [] => table.alloc(256).unwrap(),
-                b => table.alloc_from(b).unwrap(),
-            };
-        }
-        table.freeze();
-        let dials: Vec<RawAddr> = dials.iter().map(|a| RawAddr::from(*a)).collect();
-        let mut os = backend(&limits, tables, &dials).unwrap();
-        let handles = fds.into_iter().map(|(fd, c)| os.register(fd, c)).collect();
-        let mut reactor = Reactor::new(os, limits);
-        reactor.source(table.clone());
+    pub fn new(backend: Backend) -> Self {
         Self {
-            reactor,
-            table,
-            handles,
+            os: backend(32).unwrap(),
+            bufs: Vec::new(),
             done: Vec::new(),
             next: 0,
         }
     }
 
-    /// Submits an op and returns its token.
-    pub fn start(&mut self, handle: RawHandle, op: Op) -> Token {
-        self.next += 1;
-        let token = Token::new(self.next);
-        self.reactor.push(SRC, Sqe::new(token, handle, op));
-        self.reactor.submit();
-        token
+    /// A buffer holding `bytes`, or `len` zeroes for an empty `bytes`.
+    pub fn buf(&mut self, bytes: &[u8], len: usize) -> usize {
+        let mut buf = vec![0; len.max(bytes.len())].into_boxed_slice();
+        buf[..bytes.len()].copy_from_slice(bytes);
+        self.bufs.push(buf);
+        self.bufs.len() - 1
     }
 
-    /// Reaps until `token` completes.
-    pub fn wait(&mut self, token: Token) -> Cqe {
-        for _ in 0..2000 {
-            if let Some(c) = self.poll(token) {
-                return c;
+    pub fn bytes(&self, buf: usize, n: usize) -> &[u8] {
+        &self.bufs[buf][..n]
+    }
+
+    pub fn start(&mut self, fd: RawFd, class: Class, op: Op, buf: Option<usize>) -> OpId {
+        let id = OpId::new(self.next, 1);
+        self.next += 1;
+        let buf = buf.map(|b| NonNull::from(&mut self.bufs[b][..]));
+        self.os.push(OsOp {
+            id,
+            fd,
+            class,
+            op,
+            buf,
+        });
+        self.os.submit();
+        id
+    }
+
+    /// One submit and reap round.
+    pub fn poll(&mut self, id: OpId) -> Option<Result<Out, IoError>> {
+        self.os.submit();
+        self.os.reap(&mut self.done);
+        let at = self.done.iter().position(|d| d.id == id)?;
+        Some(self.done.remove(at).result)
+    }
+
+    pub fn wait(&mut self, id: OpId) -> Result<Out, IoError> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = self.poll(id) {
+                return result;
             }
+            assert!(Instant::now() < deadline, "op {id:?} never completed");
             std::thread::sleep(Duration::from_millis(1));
         }
-        panic!("op {token:?} never completed");
     }
 
-    /// Reaps once and returns `token`'s completion if it finished.
-    pub fn poll(&mut self, token: Token) -> Option<Cqe> {
-        let mut fresh = Vec::new();
-        self.reactor.reap(&mut fresh);
-        self.done.extend(fresh);
-        let at = self.done.iter().position(|(_, c)| c.token == token)?;
-        Some(self.done.remove(at).1)
-    }
-
-    pub fn run(&mut self, handle: RawHandle, op: Op) -> Cqe {
-        let token = self.start(handle, op);
-        self.wait(token)
-    }
-
-    pub fn bytes(&self, slot: u16) -> Vec<u8> {
-        unsafe { self.table.filled(slot) }.to_vec()
+    pub fn run(
+        &mut self,
+        fd: RawFd,
+        class: Class,
+        op: Op,
+        buf: Option<usize>,
+    ) -> Result<Out, IoError> {
+        let id = self.start(fd, class, op, buf);
+        self.wait(id)
     }
 }
 
-pub fn ok(c: Cqe) -> Out {
-    c.status.result().unwrap();
-    c.out
+pub fn len(r: Result<Out, IoError>) -> usize {
+    match r {
+        Ok(Out::Len(n)) => n as usize,
+        other => panic!("{other:?}"),
+    }
 }
 
-pub fn err(c: Cqe) -> IoError {
-    c.status.result().unwrap_err()
+fn opened(r: Result<Out, IoError>) -> (OwnedFd, Class) {
+    match r {
+        Ok(Out::Opened(fd, class)) => (fd, class),
+        other => panic!("{other:?}"),
+    }
 }
 
-pub fn owned<T: Into<OwnedFd>>(t: T) -> OwnedFd {
-    t.into()
-}
-
-fn pty() -> (OwnedFd, OwnedFd) {
+pub fn pty() -> (OwnedFd, OwnedFd) {
     let (mut master, mut slave) = (0, 0);
     let null = std::ptr::null_mut();
+    // SAFETY: plain `openpty` with no name, termios, or winsize.
     let r = unsafe { libc::openpty(&mut master, &mut slave, null, null as _, null as _) };
     assert_eq!(r, 0);
+    // SAFETY: `openpty` returned two new descriptors.
     unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
 }
 
-fn local_udp() -> UdpSocket {
-    UdpSocket::bind("127.0.0.1:0").unwrap()
+fn pair() -> (UnixStream, UnixStream) {
+    let (a, z) = UnixStream::pair().unwrap();
+    a.set_nonblocking(true).unwrap();
+    (a, z)
 }
 
 pub fn datagram_send_and_recv(b: Backend) {
-    let (a, z) = (local_udp(), local_udp());
-    let to = RawAddr::from(z.local_addr().unwrap());
-    let fds = vec![(owned(a), FdClass::Datagram), (owned(z), FdClass::Datagram)];
-    let mut rig = Rig::new(b, &[], fds, &[b"ping", b""]);
-    let (ha, hz) = (rig.handles[0], rig.handles[1]);
-    let rx = rig.start(hz, Op::recv(BufRef::new(1)));
-    assert_eq!(
-        ok(rig.run(ha, Op::send_to(BufRef::new(0), to))).as_len(),
-        Some(4)
+    let mut rig = Rig::new(b);
+    let (a, z) = (
+        UdpSocket::bind("127.0.0.1:0").unwrap(),
+        UdpSocket::bind("127.0.0.1:0").unwrap(),
     );
-    assert_eq!(ok(rig.wait(rx)).as_len(), Some(4));
-    assert_eq!(rig.bytes(1), b"ping");
+    a.set_nonblocking(true).unwrap();
+    z.set_nonblocking(true).unwrap();
+    let (ping, rx) = (rig.buf(b"ping", 0), rig.buf(b"", 16));
+    let to = z.local_addr().unwrap();
+    assert_eq!(
+        len(rig.run(a.as_raw_fd(), Class::Datagram, Op::SendTo(to), Some(ping))),
+        4
+    );
+    assert_eq!(
+        len(rig.run(z.as_raw_fd(), Class::Datagram, Op::Recv, Some(rx))),
+        4
+    );
+    assert_eq!(rig.bytes(rx, 4), b"ping");
 }
 
 pub fn file_write_read_at_offsets(b: Backend) {
+    let mut rig = Rig::new(b);
     let file = tempfile::tempfile().unwrap();
-    let mut rig = Rig::new(b, &[], vec![(owned(file), FdClass::File)], &[b"abc", b""]);
-    let h = rig.handles[0];
-    assert_eq!(
-        ok(rig.run(h, Op::write(BufRef::new(0), Some(4)))).as_len(),
-        Some(3)
-    );
-    assert_eq!(
-        ok(rig.run(h, Op::read(BufRef::new(1), Some(4)))).as_len(),
-        Some(3)
-    );
-    assert_eq!(rig.bytes(1), b"abc");
-    assert_eq!(
-        ok(rig.run(h, Op::read(BufRef::new(1), Some(0)))).as_len(),
-        Some(7)
-    );
-    assert_eq!(rig.bytes(1), b"\0\0\0\0abc");
-    ok(rig.run(h, Op::FSYNC));
-}
-
-pub fn tty_configure(b: Backend) {
-    let (_master, slave) = pty();
-    let probe = slave.try_clone().unwrap();
-    let mut rig = Rig::new(b, &[], vec![(slave, FdClass::Tty)], &[]);
-    let cfg = TtyConfig::new(9600);
-    ok(rig.run(rig.handles[0], Op::tty(TtyOp::Configure(cfg))));
-    let mut t = unsafe { std::mem::zeroed::<libc::termios>() };
-    assert_eq!(unsafe { libc::tcgetattr(probe.as_raw_fd(), &mut t) }, 0);
-    assert_eq!(unsafe { libc::cfgetospeed(&t) }, libc::B9600);
-    ok(rig.run(rig.handles[0], Op::tty(TtyOp::flush(2))));
-}
-
-pub fn resolve_on_dial(b: Backend) {
-    let addr: SocketAddr = "10.1.2.3:4500".parse().unwrap();
-    let mut rig = Rig::new(b, &[addr], vec![], &[]);
-    let out = ok(rig.run(RawHandle::new(0, 0), Op::RESOLVE));
-    assert_eq!(out.as_addr(), Some(RawAddr::from(addr)));
-}
-
-pub fn connect_and_send(b: Backend) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let mut rig = Rig::new(b, &[addr], vec![], &[b"hello"]);
-    let dial = RawHandle::new(0, 0);
-    let stream = ok(rig.run(dial, Op::connect(addr.into())))
-        .as_handle()
+    let fd = file.as_raw_fd();
+    let (hello, world, rx) = (rig.buf(b"hello", 0), rig.buf(b"world", 0), rig.buf(b"", 4));
+    rig.run(fd, Class::File, Op::Write { offset: Some(0) }, Some(hello))
         .unwrap();
-    let (mut peer, _) = listener.accept().unwrap();
+    rig.run(fd, Class::File, Op::Write { offset: Some(5) }, Some(world))
+        .unwrap();
     assert_eq!(
-        ok(rig.run(stream, Op::send(BufRef::new(0)))).as_len(),
-        Some(5)
+        len(rig.run(fd, Class::File, Op::Read { offset: Some(3) }, Some(rx))),
+        4
     );
-    let mut got = [0; 5];
-    peer.read_exact(&mut got).unwrap();
-    assert_eq!(&got, b"hello");
-    ok(rig.run(stream, Op::CLOSE));
+    assert_eq!(rig.bytes(rx, 4), b"lowo");
+    rig.run(fd, Class::File, Op::Fsync, None).unwrap();
+}
+
+pub fn tty_configure_and_gpio_on_a_tty(b: Backend) {
+    let mut rig = Rig::new(b);
+    let (_master, slave) = pty();
+    let fd = slave.as_raw_fd();
+    let cfg = TtyConfig::new(115_200);
+    rig.run(fd, Class::Tty, Op::TtyConfigure(cfg), None)
+        .unwrap();
+    rig.run(fd, Class::Tty, Op::TtyFlush(TtyQueue::Both), None)
+        .unwrap();
+    let bad = TtyConfig::new(12_345);
+    let refused = rig.run(fd, Class::Tty, Op::TtyConfigure(bad), None);
+    assert_eq!(refused.unwrap_err(), IoError::Os(Errno::EINVAL));
+    assert!(rig.run(fd, Class::Gpio, Op::GpioGet, None).is_err());
 }
 
 pub fn recv_parks_until_data(b: Backend) {
-    let (ours, mut theirs) = UnixStream::pair().unwrap();
-    let mut rig = Rig::new(b, &[], vec![(owned(ours), FdClass::Stream)], &[b""]);
-    let rx = rig.start(rig.handles[0], Op::recv(BufRef::new(0)));
-    for _ in 0..5 {
-        assert!(rig.poll(rx).is_none());
+    let mut rig = Rig::new(b);
+    let (a, mut z) = pair();
+    let rx = rig.buf(b"", 8);
+    let id = rig.start(a.as_raw_fd(), Class::Stream, Op::Recv, Some(rx));
+    for _ in 0..3 {
+        assert!(rig.poll(id).is_none());
     }
-    theirs.write_all(b"late").unwrap();
-    assert_eq!(ok(rig.wait(rx)).as_len(), Some(4));
-    assert_eq!(rig.bytes(0), b"late");
+    z.write_all(b"late").unwrap();
+    assert_eq!(len(rig.wait(id)), 4);
+    assert_eq!(rig.bytes(rx, 4), b"late");
 }
 
-pub fn two_parked_ops_keep_both_interests(b: Backend) {
-    let (ours, mut theirs) = UnixStream::pair().unwrap();
-    ours.set_nonblocking(true).unwrap();
-    let fill = vec![0u8; 4096];
-    while (&ours).write(&fill).is_ok() {}
-    let big = vec![1u8; 200];
-    let mut rig = Rig::new(b, &[], vec![(owned(ours), FdClass::Stream)], &[b"", &big]);
-    let h = rig.handles[0];
-    let rx = rig.start(h, Op::recv(BufRef::new(0)));
-    let tx = rig.start(h, Op::send(BufRef::new(1)));
-    assert!(rig.poll(rx).is_none() && rig.poll(tx).is_none());
-    theirs.write_all(b"x").unwrap();
-    assert_eq!(ok(rig.wait(rx)).as_len(), Some(1));
-    theirs.set_nonblocking(true).unwrap();
-    let mut sink = vec![0u8; 1 << 16];
-    let mut sent = None;
-    for _ in 0..2000 {
-        let _ = theirs.read(&mut sink);
-        sent = rig.poll(tx);
-        if sent.is_some() {
+/// Fills `a`'s send buffer, so a send on it waits.
+fn fill(a: &UnixStream) {
+    let chunk = [0u8; 4096];
+    loop {
+        match (&*a).write(&chunk) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return,
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+pub fn read_and_write_wait_on_one_descriptor(b: Backend) {
+    let mut rig = Rig::new(b);
+    let (a, mut z) = pair();
+    fill(&a);
+    let (tx, rx) = (rig.buf(b"x", 0), rig.buf(b"", 8));
+    let send = rig.start(a.as_raw_fd(), Class::Stream, Op::Send, Some(tx));
+    let recv = rig.start(a.as_raw_fd(), Class::Stream, Op::Recv, Some(rx));
+    assert!(rig.poll(send).is_none() && rig.poll(recv).is_none());
+    z.write_all(b"hi").unwrap();
+    assert_eq!(len(rig.wait(recv)), 2);
+    z.set_nonblocking(true).unwrap();
+    let mut sink = vec![0; 1 << 16];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = z.read(&mut sink);
+        if let Some(r) = rig.poll(send) {
+            assert_eq!(len(r), 1);
             break;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        assert!(Instant::now() < deadline, "the send never ran");
     }
-    assert!(ok(sent.expect("send never completed")).as_len().unwrap() > 0);
 }
 
-pub fn two_connects_give_two_streams(b: Backend) {
+pub fn cancel_waiting_recv(b: Backend) {
+    let mut rig = Rig::new(b);
+    let (a, _z) = pair();
+    let rx = rig.buf(b"", 8);
+    let id = rig.start(a.as_raw_fd(), Class::Stream, Op::Recv, Some(rx));
+    assert!(rig.poll(id).is_none());
+    rig.os.cancel(id);
+    assert_eq!(rig.wait(id).unwrap_err(), IoError::Canceled);
+}
+
+pub fn close_cancels_waiting_ops(b: Backend) {
+    let mut rig = Rig::new(b);
+    let (a, _z) = pair();
+    let rx = rig.buf(b"", 8);
+    let id = rig.start(a.as_raw_fd(), Class::Stream, Op::Recv, Some(rx));
+    assert!(rig.poll(id).is_none());
+    rig.os.close(a.into());
+    assert_eq!(rig.wait(id).unwrap_err(), IoError::Canceled);
+}
+
+pub fn accept_gives_a_stream(b: Backend) {
+    let mut rig = Rig::new(b);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let mut rig = Rig::new(b, &[addr], vec![], &[]);
-    let dial = RawHandle::new(0, 0);
-    let s1 = ok(rig.run(dial, Op::connect(addr.into())))
-        .as_handle()
-        .unwrap();
-    let s2 = ok(rig.run(dial, Op::connect(addr.into())))
-        .as_handle()
-        .unwrap();
-    assert_ne!(s1, s2);
-    listener.accept().unwrap();
-    listener.accept().unwrap();
-}
-
-pub fn cancel_parked_read(b: Backend) {
-    let (ours, _theirs) = UnixStream::pair().unwrap();
-    let mut rig = Rig::new(b, &[], vec![(owned(ours), FdClass::Stream)], &[b""]);
-    let h = rig.handles[0];
-    let rx = rig.start(h, Op::recv(BufRef::new(0)));
-    assert!(rig.poll(rx).is_none());
-    let cancel = rig.start(h, Op::cancel(rx));
-    assert_eq!(err(rig.wait(rx)), IoError::Canceled);
-    assert_eq!(ok(rig.wait(cancel)), Out::UNIT);
-    assert_eq!(rig.reactor.in_flight(SRC), 0);
-}
-
-pub fn close_runs_after_queued_write(b: Backend) {
-    let file = tempfile::tempfile().unwrap();
-    let mut rig = Rig::new(b, &[], vec![(owned(file), FdClass::File)], &[b"abc"]);
-    let h = rig.handles[0];
-    let (w, c) = (Token::new(100), Token::new(101));
-    rig.reactor
-        .push(SRC, Sqe::new(w, h, Op::write(BufRef::new(0), Some(0))));
-    rig.reactor.push(SRC, Sqe::new(c, h, Op::CLOSE));
-    rig.reactor.submit();
-    assert_eq!(ok(rig.wait(w)).as_len(), Some(3));
-    assert_eq!(ok(rig.wait(c)), Out::UNIT);
-}
-
-pub fn unissued_handle_is_stale(b: Backend) {
-    let mut rig = Rig::new(b, &[], vec![], &[b""]);
-    let c = rig.run(RawHandle::new(5, 0), Op::read(BufRef::new(0), None));
-    assert_eq!(err(c), IoError::Stale);
-}
-
-pub fn closed_handle_is_stale(b: Backend) {
-    let (ours, _theirs) = UnixStream::pair().unwrap();
-    let mut rig = Rig::new(b, &[], vec![(owned(ours), FdClass::Stream)], &[b""]);
-    let h = rig.handles[0];
-    ok(rig.run(h, Op::CLOSE));
-    assert_eq!(err(rig.run(h, Op::recv(BufRef::new(0)))), IoError::Stale);
-}
-
-pub fn connect_refused(b: Backend) {
-    let addr = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    let mut rig = Rig::new(b, &[addr], vec![], &[]);
-    let c = rig.run(RawHandle::new(0, 0), Op::connect(addr.into()));
-    assert_eq!(err(c), IoError::Os(Errno::ECONNREFUSED));
-}
-
-pub fn read_on_dial_unsupported(b: Backend) {
-    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    let mut rig = Rig::new(b, &[addr], vec![], &[b""]);
-    let c = rig.run(RawHandle::new(0, 0), Op::read(BufRef::new(0), None));
-    assert_eq!(err(c), IoError::Unsupported);
-}
-
-pub fn resolve_on_stream_unsupported(b: Backend) {
-    let (ours, _theirs) = UnixStream::pair().unwrap();
-    let mut rig = Rig::new(b, &[], vec![(owned(ours), FdClass::Stream)], &[]);
+    listener.set_nonblocking(true).unwrap();
+    let id = rig.start(listener.as_raw_fd(), Class::Listener, Op::Accept, None);
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, class) = opened(rig.wait(id));
+    assert_eq!(class, Class::Stream);
+    client.write_all(b"hey").unwrap();
+    let rx = rig.buf(b"", 8);
     assert_eq!(
-        err(rig.run(rig.handles[0], Op::RESOLVE)),
-        IoError::Unsupported
+        len(rig.run(stream.as_raw_fd(), class, Op::Recv, Some(rx))),
+        3
+    );
+    rig.os.close(stream);
+}
+
+pub fn open_under_a_dir(b: Backend) {
+    let mut rig = Rig::new(b);
+    let dir = tempfile::tempdir().unwrap();
+    let dir_fd = std::fs::File::open(dir.path()).unwrap();
+    let path = rig.buf(b"made.txt", 0);
+    let flags = OpenFlags::WRITE | OpenFlags::CREATE;
+    let (file, class) =
+        opened(rig.run(dir_fd.as_raw_fd(), Class::Dir, Op::Open(flags), Some(path)));
+    assert_eq!(class, Class::File);
+    let body = rig.buf(b"abc", 0);
+    rig.run(
+        file.as_raw_fd(),
+        Class::File,
+        Op::Write { offset: None },
+        Some(body),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(dir.path().join("made.txt")).unwrap(), b"abc");
+    let missing = rig.buf(b"nope.txt", 0);
+    let read = rig.run(
+        dir_fd.as_raw_fd(),
+        Class::Dir,
+        Op::Open(OpenFlags::READ),
+        Some(missing),
+    );
+    assert_eq!(read.unwrap_err(), IoError::Os(Errno::ENOENT));
+}
+
+pub fn closed_peer_reads_zero(b: Backend) {
+    let mut rig = Rig::new(b);
+    let (a, z) = pair();
+    drop(z);
+    let rx = rig.buf(b"", 8);
+    assert_eq!(
+        len(rig.run(a.as_raw_fd(), Class::Stream, Op::Recv, Some(rx))),
+        0
     );
 }
 
-pub fn gpio_on_pty_fails(b: Backend) {
-    let (_master, slave) = pty();
-    let mut rig = Rig::new(b, &[], vec![(slave, FdClass::Gpio)], &[]);
-    let e = err(rig.run(rig.handles[0], Op::gpio(GpioOp::GET)));
-    if cfg!(target_os = "linux") {
-        assert_eq!(e, IoError::Os(Errno::ENOTTY));
-    } else {
-        assert_eq!(e, IoError::Unsupported);
-    }
-}
-
-pub type Case = (&'static str, fn(Backend));
-
-/// Every case with its name.
-pub const ALL: [Case; 16] = [
-    (
-        "close_runs_after_queued_write",
-        close_runs_after_queued_write,
-    ),
-    ("datagram_send_and_recv", datagram_send_and_recv),
-    ("file_write_read_at_offsets", file_write_read_at_offsets),
-    ("tty_configure", tty_configure),
-    ("resolve_on_dial", resolve_on_dial),
-    ("connect_and_send", connect_and_send),
-    ("recv_parks_until_data", recv_parks_until_data),
-    (
-        "two_parked_ops_keep_both_interests",
-        two_parked_ops_keep_both_interests,
-    ),
-    (
-        "two_connects_give_two_streams",
-        two_connects_give_two_streams,
-    ),
-    ("cancel_parked_read", cancel_parked_read),
-    ("unissued_handle_is_stale", unissued_handle_is_stale),
-    ("closed_handle_is_stale", closed_handle_is_stale),
-    ("connect_refused", connect_refused),
-    ("read_on_dial_unsupported", read_on_dial_unsupported),
-    (
-        "resolve_on_stream_unsupported",
-        resolve_on_stream_unsupported,
-    ),
-    ("gpio_on_pty_fails", gpio_on_pty_fails),
-];
-
-/// Runs every case on `backend`, printing each name first.
-pub fn run_all(backend: Backend) {
-    for (name, case) in ALL {
-        println!("case {name}");
-        case(backend);
-    }
+pub fn run_all(b: Backend) {
+    datagram_send_and_recv(b);
+    file_write_read_at_offsets(b);
+    tty_configure_and_gpio_on_a_tty(b);
+    recv_parks_until_data(b);
+    read_and_write_wait_on_one_descriptor(b);
+    cancel_waiting_recv(b);
+    close_cancels_waiting_ops(b);
+    accept_gives_a_stream(b);
+    open_under_a_dir(b);
+    closed_peer_reads_zero(b);
 }

@@ -1,303 +1,174 @@
+use super::{Loopback, allocations};
+use crate::io::cap::{Cap, Handle};
 use crate::io::*;
 
-#[cfg(test)]
-mod unit {
-    use super::super::{Rig, allocations};
-    use super::*;
-
-    fn read(rig: &Rig, buf: Buf) -> Pending<Read> {
-        let op = Op::read(buf.buf_ref(), None);
-        Pending::new(&rig.io, RawHandle::new(0, 0), op, Some(buf))
-    }
-
-    fn write(rig: &Rig, buf: Buf) -> Pending<Write> {
-        let op = Op::write(buf.buf_ref(), None);
-        Pending::new(&rig.io, RawHandle::new(0, 0), op, Some(buf))
-    }
-
-    #[test]
-    fn read_completes_with_the_bytes() {
-        let mut rig = Rig::new();
-        let buf = rig.empty_buf(8);
-        let slot = buf.buf_ref();
-        let mut pending = read(&rig, buf);
-        let sent = rig.sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].op.buf(), Some(slot));
-        assert!(pending.poll().is_none());
-        rig.kernel_fill(slot.slot(), b"abc");
-        rig.reply(Cqe::ok(sent[0].token, Out::len(3)));
-        let (result, buf) = pending.poll().unwrap();
-        assert_eq!(result, Ok(3));
-        assert_eq!(&buf[..], b"abc");
-        assert!(pending.poll().is_none());
-    }
-
-    #[test]
-    fn write_hands_the_buffer_back_unchanged() {
-        let mut rig = Rig::new();
-        let mut pending = write(&rig, rig.buf(b"hello"));
-        let token = rig.sent()[0].token;
-        rig.reply(Cqe::ok(token, Out::len(5)));
-        let (result, buf) = pending.poll().unwrap();
-        assert_eq!(result, Ok(5));
-        assert_eq!(&buf[..], b"hello");
-    }
-
-    #[test]
-    fn slot_goes_idle_busy_idle() {
-        let mut rig = Rig::new();
-        let mut slot: Slot<Write> = Slot::Idle(rig.buf(b"x"));
-        let buf = slot.take_idle().unwrap();
-        assert!(slot.take_idle().is_none());
-        slot = Slot::Busy(write(&rig, buf));
-        assert!(slot.poll().is_none());
-        assert!(slot.bytes().is_empty());
-        let token = rig.sent()[0].token;
-        rig.reply(Cqe::ok(token, Out::len(1)));
-        assert_eq!(slot.poll(), Some(Ok(1)));
-        assert_eq!(slot.bytes(), b"x");
-    }
-
-    #[test]
-    fn one_op_past_max_is_queue_full() {
-        let mut rig = Rig::new();
-        let held: Vec<_> = (0..MAX_OPS).map(|_| write(&rig, rig.buf(b"a"))).collect();
-        let mut extra = write(&rig, rig.buf(b"late"));
-        let (result, buf) = extra.poll().unwrap();
-        assert_eq!(result, Err(IoError::QueueFull));
-        assert_eq!(&buf[..], b"late");
-        assert_eq!(rig.sent().len(), MAX_OPS);
-        drop(held);
-    }
-
-    #[test]
-    fn dropped_op_frees_its_slot_when_it_lands() {
-        let mut rig = Rig::new();
-        drop(write(&rig, rig.buf(b"a")));
-        assert_eq!(rig.io.in_flight(), 1);
-        let token = rig.sent()[0].token;
-        rig.reply(Cqe::ok(token, Out::len(1)));
-        assert_eq!(rig.io.in_flight(), 0);
-    }
-
-    #[test]
-    fn stale_and_duplicate_completions_are_skipped() {
-        let mut rig = Rig::new();
-        let mut first = write(&rig, rig.buf(b"a"));
-        let token = rig.sent()[0].token;
-        rig.reply(Cqe::ok(token, Out::len(1)));
-        assert!(first.poll().is_some());
-        let mut second = write(&rig, rig.buf(b"b"));
-        let next = rig.sent()[0].token;
-        assert_ne!(next, token);
-        rig.reply(Cqe::ok(token, Out::len(9)));
-        assert!(second.poll().is_none());
-        rig.reply(Cqe::ok(next, Out::len(1)));
-        rig.reply(Cqe::ok(next, Out::len(7)));
-        assert_eq!(second.poll().map(|(r, _)| r), Some(Ok(1)));
-        assert_eq!(rig.io.in_flight(), 0);
-    }
-
-    #[test]
-    fn cancel_names_the_token() {
-        let mut rig = Rig::new();
-        let pending = read(&rig, rig.empty_buf(4));
-        pending.cancel();
-        let sent = rig.sent();
-        assert_eq!(sent[1].op, Op::cancel(sent[0].token));
-        assert_eq!(sent[1].handle, sent[0].handle);
-    }
-
-    #[test]
-    fn completion_never_lands_during_submit() {
-        let mut rig = Rig::new();
-        let guess = Token::new(1 << 16);
-        rig.reply(Cqe::ok(guess, Out::len(1)));
-        let mut pending = write(&rig, rig.buf(b"a"));
-        assert_eq!(rig.sent()[0].token, guess);
-        assert!(pending.poll().is_none());
-    }
-
-    #[test]
-    fn full_sq_ring_is_queue_full() {
-        let mut rig = Rig::with_sq_depth(2);
-        let held: Vec<_> = (0..2).map(|_| write(&rig, rig.buf(b"a"))).collect();
-        let mut extra = write(&rig, rig.buf(b"b"));
-        assert_eq!(extra.poll().map(|(r, _)| r), Some(Err(IoError::QueueFull)));
-        assert_eq!(rig.io.in_flight(), 2);
-        assert_eq!(rig.sent().len(), 2);
-        drop(held);
-    }
-
-    #[test]
-    fn garbage_completion_is_skipped() {
-        let mut rig = Rig::new();
-        let mut pending = write(&rig, rig.buf(b"a"));
-        rig.garbage();
-        let token = rig.sent()[0].token;
-        rig.reply(Cqe::ok(token, Out::len(1)));
-        assert_eq!(pending.poll().map(|(r, _)| r), Some(Ok(1)));
-    }
-
-    #[test]
-    fn mismatched_out_is_device() {
-        let mut rig = Rig::new();
-        let mut pending = read(&rig, rig.empty_buf(4));
-        let out = Out::handle(RawHandle::new(3, 0));
-        let token = rig.sent()[0].token;
-        rig.reply(Cqe::ok(token, out));
-        assert_eq!(pending.poll().map(|(r, _)| r), Some(Err(IoError::Device)));
-    }
-
-    #[test]
-    fn steady_rounds_do_not_allocate() {
-        let mut rig = Rig::new();
-        let mut slot: Slot<Write> = Slot::Idle(rig.buf(b"x"));
-        let mut round = |rig: &mut Rig| {
-            let buf = slot.take_idle().unwrap();
-            slot = Slot::Busy(write(rig, buf));
-            let token = rig.sent_token();
-            rig.reply(Cqe::ok(token, Out::len(1)));
-            assert_eq!(slot.poll(), Some(Ok(1)));
-        };
-        round(&mut rig);
-        assert_eq!(allocations(|| (0..1000).for_each(|_| round(&mut rig))), 0);
-    }
-
-    /// Also run under Miri.
-    #[test]
-    fn deref_while_another_buf_is_written() {
-        let rig = Rig::new();
-        let a = rig.buf(b"left");
-        let mut b = rig.buf(b"right");
-        let view = &a[..];
-        b.fill(b"other");
-        b[0] = b'O';
-        assert_eq!(view, b"left");
-        assert_eq!(&b[..], b"Other");
-    }
-
-    /// Also run under Miri.
-    #[test]
-    fn two_shared_slices_of_one_buf() {
-        let rig = Rig::new();
-        let buf = rig.buf(b"abcd");
-        let (head, tail) = (&buf[..2], &buf[2..]);
-        assert_eq!(head, b"ab");
-        assert_eq!(tail, b"cd");
-        assert_eq!(head, b"ab");
-    }
-
-    #[test]
-    fn dropped_open_closes_what_it_opened() {
-        let mut rig = Rig::new();
-        let path = rig.buf(b"log");
-        let op = Op::open(path.buf_ref(), OpenFlags::READ);
-        drop(Pending::<Open>::new(
-            &rig.io,
-            RawHandle::new(0, 0),
-            op,
-            Some(path),
-        ));
-        let token = rig.sent()[0].token;
-        let opened = RawHandle::new(7, 2);
-        rig.reply(Cqe::ok(token, Out::handle(opened)));
-        assert_eq!(rig.io.in_flight(), 0);
-        let close = rig.sent();
-        assert_eq!(close.len(), 1);
-        assert_eq!((close[0].handle, close[0].op), (opened, Op::CLOSE));
-    }
-
-    #[test]
-    fn cancel_goes_out_with_every_slot_in_use() {
-        let mut rig = Rig::with_sq_depth(2 * MAX_OPS);
-        let held: Vec<_> = (0..MAX_OPS).map(|_| read(&rig, rig.empty_buf(1))).collect();
-        held[0].cancel();
-        let sent = rig.sent();
-        assert_eq!(sent.len(), MAX_OPS + 1);
-        assert_eq!(sent[MAX_OPS].op, Op::cancel(sent[0].token));
-        assert_eq!(rig.io.in_flight(), MAX_OPS);
-        drop(held);
-    }
-
-    #[test]
-    fn op_names_the_buffer_it_lends() {
-        let mut rig = Rig::new();
-        let buf = rig.buf(b"x");
-        let slot = buf.buf_ref();
-        let stray = Op::write(BufRef::new(42), None);
-        let _p = rig.io.submit_raw(RawHandle::new(0, 0), stray, Some(buf));
-        assert_eq!(rig.sent()[0].op.buf(), Some(slot));
-    }
-
-    #[test]
-    fn op_that_lends_no_buffer_is_bad_buf() {
-        let mut rig = Rig::new();
-        let stray = Op::write(BufRef::new(0), None);
-        let mut p = rig.io.submit_raw(RawHandle::new(0, 0), stray, None);
-        let (status, _, buf) = p.poll().unwrap();
-        assert_eq!(status.result(), Err(IoError::BadBuf));
-        assert!(buf.is_none());
-        assert!(rig.sent().is_empty());
-    }
-
-    /// Also run under Miri.
-    #[test]
-    fn io_drops_with_orphans_and_live_bufs() {
-        let rig = Rig::new();
-        let live = rig.buf(b"keep");
-        drop(read(&rig, rig.empty_buf(4)));
-        let pending = write(&rig, rig.buf(b"w"));
-        drop(rig);
-        assert_eq!(&live[..], b"keep");
-        drop(pending);
-    }
+fn uart(lb: &Loopback) -> Cap<Uart> {
+    Cap::new(Handle::new(lb.io.next_grant(), lb.io.clone()))
 }
 
-#[cfg(kani)]
-mod proofs {
-    use super::*;
-    use crate::io::queue::Slots;
+#[test]
+fn read_completes_with_its_buffer_and_length() {
+    let mut lb = Loopback::new();
+    let buf = lb.init().alloc(8);
+    let uart = uart(&lb);
+    let mut rx = Slot::Busy(uart.read(buf));
+    let [sqe] = lb.submitted()[..] else { panic!() };
+    assert_eq!(sqe.op(), Ok(Op::Read { offset: None }));
+    assert_eq!(sqe.buf, Span::new(0, 8), "a read names its whole capacity");
+    assert_eq!(sqe.handle, RawHandle::new(0, 0));
+    assert!(rx.poll().is_none());
+    lb.complete(Cqe::ok(sqe.token, 3));
+    assert_eq!(rx.poll(), Some(Ok(3)));
+    assert_eq!(rx.bytes().len(), 3);
+    assert_eq!(lb.io.in_flight(), 0);
+}
 
-    /// No sequence of claims, completions, orphans, and takes holds more than
-    /// `MAX_OPS` slots or hands one token to two live ops.
-    #[kani::proof]
-    #[kani::unwind(6)]
-    fn token_slots_bounded() {
-        let mut slots: Slots<()> = Slots::new();
-        let mut live: [Option<Token>; MAX_OPS + 1] = [None; MAX_OPS + 1];
-        for _ in 0..4 {
-            let pick: usize = kani::any();
-            kani::assume(pick < live.len());
-            match kani::any::<u8>() % 4 {
-                0 => {
-                    if let Ok(token) = slots.claim(()) {
-                        assert!(live.iter().flatten().all(|t| *t != token));
-                        if let Some(free) = live.iter_mut().find(|t| t.is_none()) {
-                            *free = Some(token);
-                        }
-                    }
-                }
-                1 => {
-                    if let Some(token) = live[pick] {
-                        slots.land(&Cqe::ok(token, Out::UNIT));
-                    }
-                }
-                2 => {
-                    if let Some(token) = live[pick].take() {
-                        slots.orphan(token);
-                    }
-                }
-                _ => {
-                    if let Some(token) = live[pick] {
-                        if slots.take(token).is_some() {
-                            live[pick] = None;
-                        }
-                    }
-                }
-            }
-            assert!(slots.live() <= MAX_OPS);
+#[test]
+fn write_names_its_filled_bytes() {
+    let mut lb = Loopback::new();
+    let mut buf = lb.init().alloc(8);
+    buf.fill(b"hi");
+    let _w = uart(&lb).write(buf);
+    let [sqe] = lb.submitted()[..] else { panic!() };
+    assert_eq!(sqe.buf, Span::new(0, 2));
+}
+
+#[test]
+fn full_table_completes_queue_full_with_the_buffer_back() {
+    let mut lb = Loopback::new();
+    let init = lb.init();
+    let bufs: Vec<_> = (0..=MAX_OPS).map(|_| init.alloc(1)).collect();
+    drop(init);
+    let uart = uart(&lb);
+    let mut ops: Vec<_> = bufs.into_iter().map(|b| uart.read(b)).collect();
+    let (result, buf) = ops.pop().unwrap().poll().unwrap();
+    assert_eq!(result, Err(IoError::QueueFull));
+    assert_eq!(buf.capacity(), 1);
+    assert_eq!(lb.submitted().len(), MAX_OPS);
+}
+
+#[test]
+fn buffer_op_without_a_live_buffer_is_bad_buf() {
+    let lb = Loopback::new();
+    let old = lb.init().alloc(4);
+    drop(lb.init());
+    let (result, _) = uart(&lb).read(old).poll().unwrap();
+    assert_eq!(result, Err(IoError::BadBuf), "a buffer from an older make");
+}
+
+#[test]
+fn dropped_pending_frees_its_slot_when_it_lands() {
+    let mut lb = Loopback::new();
+    drop(lb.init());
+    let uart = uart(&lb);
+    drop(uart.configure(TtyConfig::new(9600)));
+    assert_eq!(lb.io.in_flight(), 1);
+    let [sqe] = lb.submitted()[..] else { panic!() };
+    lb.complete(Cqe::ok(sqe.token, 0));
+    assert_eq!(lb.io.in_flight(), 0);
+}
+
+#[test]
+fn orphaned_accept_closes_its_handle_under_its_own_token() {
+    let mut lb = Loopback::new();
+    drop(lb.init());
+    let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    drop(listen.accept());
+    let [accept] = lb.submitted()[..] else {
+        panic!()
+    };
+    let stream = RawHandle::new(5, 1);
+    lb.complete(Cqe::ok(accept.token, stream.get()));
+    assert_eq!(lb.io.in_flight(), 1, "the close holds the slot");
+    let [close] = lb.submitted()[..] else {
+        panic!()
+    };
+    assert_eq!(
+        (close.op(), close.token, close.handle),
+        (Ok(Op::Close), accept.token, stream)
+    );
+    lb.complete(Cqe::ok(close.token, 0));
+    assert_eq!(lb.io.in_flight(), 0);
+}
+
+#[test]
+fn finished_accept_dropped_untaken_closes_too() {
+    let mut lb = Loopback::new();
+    drop(lb.init());
+    let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    let accept = listen.accept();
+    let [sqe] = lb.submitted()[..] else { panic!() };
+    lb.complete(Cqe::ok(sqe.token, RawHandle::new(5, 1).get()));
+    assert_eq!(lb.io.in_flight(), 1);
+    drop(accept);
+    let [close] = lb.submitted()[..] else {
+        panic!()
+    };
+    assert_eq!(close.op(), Ok(Op::Close));
+}
+
+#[test]
+fn accept_resolves_to_a_handle_on_the_same_queue() {
+    let mut lb = Loopback::new();
+    drop(lb.init());
+    let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    let mut accept = listen.accept();
+    let [sqe] = lb.submitted()[..] else { panic!() };
+    lb.complete(Cqe::ok(sqe.token, RawHandle::new(5, 1).get()));
+    let stream = accept.poll().unwrap().unwrap();
+    assert_eq!(stream.raw(), RawHandle::new(5, 1));
+    drop(stream.close());
+    let [close] = lb.submitted()[..] else {
+        panic!()
+    };
+    assert_eq!(close.handle, RawHandle::new(5, 1));
+}
+
+#[test]
+fn cancel_names_its_target_and_takes_no_slot() {
+    let mut lb = Loopback::new();
+    drop(lb.init());
+    let uart = uart(&lb);
+    let flush = uart.flush(TtyQueue::Input);
+    flush.cancel();
+    let [op, cancel] = lb.submitted()[..] else {
+        panic!()
+    };
+    assert_eq!((cancel.op(), cancel.token), (Ok(Op::Cancel), op.token));
+    assert_eq!(lb.io.in_flight(), 1);
+}
+
+#[test]
+fn stale_generation_is_ignored() {
+    let mut lb = Loopback::new();
+    drop(lb.init());
+    let uart = uart(&lb);
+    let mut first = uart.flush(TtyQueue::Input);
+    let [sqe] = lb.submitted()[..] else { panic!() };
+    let stale = Token::new(sqe.token.slot(), sqe.token.generation().wrapping_sub(1));
+    lb.complete(Cqe::ok(stale, 0));
+    assert!(first.poll().is_none());
+    lb.complete(Cqe::err(sqe.token, IoError::Os(Errno::EIO)));
+    assert_eq!(first.poll(), Some(Err(IoError::Os(Errno::EIO))));
+    assert!(first.poll().is_none(), "taken once");
+}
+
+#[test]
+fn steady_state_allocates_nothing() {
+    let mut lb = Loopback::new();
+    let buf = lb.init().alloc(4);
+    let uart = uart(&lb);
+    let mut rx: Slot<Read> = Slot::Idle(buf);
+    let mut sqes = Vec::with_capacity(4);
+    let n = allocations(|| {
+        for _ in 0..8 {
+            let buf = rx.take_idle().unwrap();
+            rx = Slot::Busy(uart.read(buf));
+            sqes.extend(lb.sq.drain().map(Result::unwrap));
+            let sqe = sqes.pop().unwrap();
+            lb.complete(Cqe::ok(sqe.token, 1));
+            assert_eq!(rx.poll(), Some(Ok(1)));
         }
-    }
+    });
+    assert_eq!(n, 0);
 }

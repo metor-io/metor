@@ -178,10 +178,10 @@ pub fn register_builtins(table: &mut SystemTable) -> Result<(), BuildError> {
     table.insert(crate::dl::SLOT_TYPE, crate::dl::slot::entry())?;
     #[cfg(unix)]
     {
-        table.insert(crate::io::IO_SUBMIT_TYPE, crate::io::system::submit_entry())?;
+        table.insert(crate::io::IO_SUBMIT_TYPE, crate::io::host::submit_entry())?;
         table.insert(
             crate::io::IO_COMPLETE_TYPE,
-            crate::io::system::complete_entry(),
+            crate::io::host::complete_entry(),
         )?;
     }
     #[cfg(feature = "db")]

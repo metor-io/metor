@@ -1,11 +1,11 @@
-//! Runs the shared `Os` cases on `PollOs` with real descriptors.
+//! Runs the shared `Os` cases on `PollOs`.
 
 mod os_cases;
 
-use metor_fsw_3::io::{Limits, Os, OsError, PollOs, RawAddr, Tables};
+use metor_fsw_3::io::host::{Os, PollOs};
 
-fn poll(limits: &Limits, tables: Tables, dials: &[RawAddr]) -> Result<Box<dyn Os>, OsError> {
-    Ok(Box::new(PollOs::new(limits, tables, dials)?))
+fn poll(ops: usize) -> std::io::Result<Box<dyn Os>> {
+    Ok(Box::new(PollOs::new(ops)?))
 }
 
 #[test]

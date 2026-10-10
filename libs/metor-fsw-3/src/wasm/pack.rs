@@ -10,8 +10,7 @@ use crate::dl::Ports;
 use crate::dl::codec::{
     decode_create_error, decode_def, decode_descriptor, encode_def_cx, encode_instance,
 };
-use crate::io::region::Region;
-use crate::io::{BufTable, Cqe, IO_CQ, IO_SQ, SharedIo, Sqe};
+use crate::io::{Arena, Cqe, IO_CQ, IO_SQ, SharedIo, Sqe};
 use crate::mirror::{Mirror, Mirrors, mirror_config};
 use crate::pack::def::{Instance, PackDef};
 use crate::pack::{ABI_VERSION, host_caps};
@@ -111,9 +110,9 @@ impl WasmPack {
         let ins = copy_inputs(&mut guest, &instance.def.inputs, inputs, io_port)?;
         let outs = copy_outputs(&mut guest, &instance.def.outputs, outputs, io_port)?;
         let mirrors = Mirrors::new(&instance.def, ins.mirrors, outs.mirrors);
-        let member = io.borrow().find(&instance.id);
-        let given = match &member {
-            Some(member) => Some(give(&mut guest, &member.table.bufs)?),
+        let mirror = io.borrow().arena(&instance.id);
+        let given = match &mirror {
+            Some(mirror) => Some(give(&mut guest, mirror)?),
             None => None,
         };
         let call = Create {
@@ -189,28 +188,20 @@ struct Create<'a> {
     def: &'a [u8],
     inputs: &'a [Vec<GuestRing>],
     outputs: &'a [GuestRing],
-    /// A copy of the system's IO arena, on a remake.
+    /// Room for the system's IO arena, on a remake.
     table: Option<GuestRing>,
 }
 
-/// Copies the host's mirror of an IO arena into new guest memory, which the
-/// guest keeps for its life. The old guest is gone, so every slot in the
-/// copy is free.
-fn give(guest: &mut Guest, mirror: &BufTable) -> Result<GuestRing, ParamError> {
-    let unusable = || ParamError::Wasm("the IO mirror is unfrozen or corrupt".into());
-    let span = mirror.region().ok_or_else(unusable)?;
-    // SAFETY: the mirror's region is live, and only this step touches it.
-    let copy = Region::mirror(unsafe { span.as_ref() }.into());
-    let copy = BufTable::from_region(copy).map_err(|_| unusable())?;
-    copy.release_all();
-    let span = copy.region().ok_or_else(unusable)?;
-    let len = u32::try_from(span.len())
-        .map_err(|_| WasmError::TooLarge(span.len()))
+/// A zeroed region in the guest the length of its mirror, for a remade
+/// guest's constructor to lay out its arena in.
+fn give(guest: &mut Guest, mirror: &Arena) -> Result<GuestRing, ParamError> {
+    let len = mirror.region().map_or(0, |(_, len)| len);
+    let len = u32::try_from(len)
+        .map_err(|_| WasmError::TooLarge(len))
         .map_err(PackError::from)?;
     let offset = allocated(guest, len, 8)?;
-    // SAFETY: `copy` owns the region and is alive.
-    let bytes = unsafe { span.as_ref() };
-    guest.write(offset, bytes).map_err(PackError::from)?;
+    let zeroes = vec![0; len as usize];
+    guest.write(offset, &zeroes).map_err(PackError::from)?;
     Ok(GuestRing { offset, len })
 }
 
@@ -223,34 +214,21 @@ fn attach(
     region: GuestRing,
     (sq, cq): (Input<Sqe>, Input<Cqe>),
 ) -> Result<IoCopy, ParamError> {
-    let system = instance.id.clone();
-    let corrupt = |_| ParamError::CorruptTable {
-        system: system.clone(),
-    };
     let len = region.len as usize;
-    let mut bytes = vec![0; len];
-    guest
-        .read(region.offset, &mut bytes)
-        .map_err(PackError::from)?;
-    let member = io.borrow().find(&instance.id);
-    let member = match member {
-        Some(member) => {
-            member.table.bufs.refill(&bytes).map_err(corrupt)?;
-            member
-        }
+    let known = io.borrow().arena(&instance.id);
+    let mirror = match known {
+        Some(mirror) if mirror.region().is_some_and(|(_, l)| l == len) => mirror,
+        Some(_) => return Err(ParamError::Wasm("a remade guest moved its IO arena".into())),
         None => {
             let caps = host_caps(&instance.def).collect();
-            let mirror = Region::mirror(bytes.into());
-            io.borrow_mut()
-                .adopt_region(&system, caps, mirror)
-                .map_err(corrupt)?
+            let arena = Arena::owning(vec![0; len].into());
+            io.borrow_mut().join(&instance.id, caps, arena)
         }
     };
     let base = guest.span(region.offset, len).map_err(PackError::from)?;
     // SAFETY: the guest's memory never moves, and `WasmStep` drops the copy
     // before the guest.
-    let view = BufTable::from_region(unsafe { Region::unowned(base, len) }).map_err(corrupt)?;
-    Ok(IoCopy::new(view, member.table.bufs.clone(), sq, cq))
+    Ok(unsafe { IoCopy::new((base, len), mirror, sq, cq) })
 }
 
 /// Copies `call` into guest memory and calls `metor_fsw_create`.

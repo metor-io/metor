@@ -1,372 +1,516 @@
-//! `Io`, a system's queue pair: ops go out on `io_sq` and completions come
-//! back on `io_cq`.
+//! `Io`, a system's queue pair; `Pending<O>`, an op in flight; and `Slot<O>`,
+//! which keeps a buffer at home in state.
 
-use core::cell::Cell;
-use core::ops::{Deref, DerefMut};
+use core::cell::{Cell, RefCell};
+use core::future::Future;
+use core::marker::PhantomData;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use std::rc::Rc;
 
+use super::arena::{Arena, Buf};
+use super::cap::{File, Handle, Stream};
+use super::{Cqe, IoError, IoStatus, MAX_OPS, Op, RawHandle, Span, Sqe, Token};
 use crate::port::{Input, Output};
 
-use super::pending::{Inner, Pending, Raw};
-use super::region::Region;
-use super::slot::Buf;
-use super::{
-    BufError, BufTable, Corrupt, Cqe, IoError, IoStatus, MAX_OPS, Op, Out, RawHandle, Sqe, Token,
-};
-
-/// The buffer slots one system's table holds.
-pub(crate) const BUF_SLOTS: usize = 64;
-
-/// A system's buffer table, and the bytes its constructor asked for and did
-/// not get.
-pub(crate) struct Table {
-    pub(crate) bufs: Rc<BufTable>,
-    /// Set while a constructor runs, when `alloc` may move the arena.
-    pub(crate) making: Cell<bool>,
-    shortfall: Cell<usize>,
-    refusal: Cell<Option<BufError>>,
-}
-
-impl Table {
-    pub(crate) fn new() -> Rc<Self> {
-        Self::over(BufTable::new(BUF_SLOTS))
-    }
-
-    /// A table over a region laid out elsewhere.
-    pub(crate) fn attach(region: Region) -> Result<Rc<Self>, Corrupt> {
-        BufTable::from_region(region).map(Self::over)
-    }
-
-    fn over(bufs: BufTable) -> Rc<Self> {
-        Rc::new(Self {
-            bufs: Rc::new(bufs),
-            making: Cell::new(false),
-            shortfall: Cell::new(0),
-            refusal: Cell::new(None),
-        })
-    }
-
-    /// Allocates `len` bytes, or records the shortfall.
-    pub(crate) fn alloc(&self, len: usize) -> Option<u16> {
-        self.bufs
-            .alloc(len)
-            .inspect_err(|e| self.refuse(len, *e))
-            .ok()
-    }
-
-    pub(crate) fn alloc_from(&self, bytes: &[u8]) -> Option<u16> {
-        self.bufs
-            .alloc_from(bytes)
-            .inspect_err(|e| self.refuse(bytes.len(), *e))
-            .ok()
-    }
-
-    fn refuse(&self, len: usize, e: BufError) {
-        self.shortfall.set(self.shortfall.get() + len);
-        if self.refusal.get().is_none() {
-            self.refusal.set(Some(e));
-        }
-    }
-
-    /// The bytes refused since the last call, and the first reason.
-    pub(crate) fn take_shortfall(&self) -> Option<(usize, BufError)> {
-        let need = self.shortfall.take();
-        self.refusal.take().map(|e| (need, e))
-    }
-}
-
-/// The token of an op whose completion no slot waits for. Its slot index is
-/// past every slot, so the completion is skipped.
-const UNTRACKED: Token = Token::new(u32::MAX);
-
-/// Encodes a slot and its generation as a token.
-fn token(slot: usize, generation: u16) -> Token {
-    Token::new(u32::from(generation) << 16 | slot as u32)
-}
-
-fn split(token: Token) -> (usize, u16) {
-    let t = token.get();
-    ((t & 0xFFFF) as usize, (t >> 16) as u16)
-}
-
-enum OpSlot<B> {
+#[derive(Clone, Copy)]
+enum State {
     Free,
-    Waiting(B),
-    /// Its `Pending` was dropped; the completion frees it.
-    Orphan(B),
-    Done(IoStatus, Out, B),
+    Waiting {
+        opens: bool,
+    },
+    /// Its `Pending` was dropped. The completion frees it, closing any handle
+    /// the op opened first.
+    Orphan {
+        opens: bool,
+    },
+    Done {
+        status: IoStatus,
+        value: u32,
+        opens: bool,
+    },
 }
 
-struct Entry<B> {
+#[derive(Clone, Copy)]
+struct OpSlot {
     generation: u16,
-    op: OpSlot<B>,
-}
-
-/// The ops a system has in flight, each holding a payload `B` until it
-/// completes.
-pub(crate) struct Slots<B> {
-    entries: Box<[Entry<B>]>,
-    generation: u16,
-}
-
-impl<B> Slots<B> {
-    pub(crate) fn new() -> Self {
-        let free = || Entry {
-            generation: 0,
-            op: OpSlot::Free,
-        };
-        Self {
-            entries: (0..MAX_OPS).map(|_| free()).collect(),
-            generation: 0,
-        }
-    }
-
-    /// Takes a free slot for an op holding `payload`. Hands the payload back
-    /// when every slot is taken.
-    pub(crate) fn claim(&mut self, payload: B) -> Result<Token, B> {
-        let Some(slot) = self
-            .entries
-            .iter()
-            .position(|e| matches!(e.op, OpSlot::Free))
-        else {
-            return Err(payload);
-        };
-        self.generation = self.generation.wrapping_add(1);
-        self.entries[slot] = Entry {
-            generation: self.generation,
-            op: OpSlot::Waiting(payload),
-        };
-        Ok(token(slot, self.generation))
-    }
-
-    fn entry(&mut self, token: Token) -> Option<&mut OpSlot<B>> {
-        let (slot, generation) = split(token);
-        let entry = self.entries.get_mut(slot)?;
-        (entry.generation == generation).then_some(&mut entry.op)
-    }
-
-    /// Frees a claimed slot whose op never went out, and returns its payload.
-    pub(crate) fn unclaim(&mut self, token: Token) -> Option<B> {
-        let op = self.entry(token)?;
-        if !matches!(op, OpSlot::Waiting(_)) {
-            return None;
-        }
-        match core::mem::replace(op, OpSlot::Free) {
-            OpSlot::Waiting(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// Records a completion. Skips one for a free slot or an old generation.
-    ///
-    /// Returns the handle an orphaned op opened, which no one will close.
-    pub(crate) fn land(&mut self, cqe: &Cqe) -> Option<RawHandle> {
-        let op = self.entry(cqe.token)?;
-        let (next, opened) = match core::mem::replace(op, OpSlot::Free) {
-            OpSlot::Waiting(b) => (OpSlot::Done(cqe.status, cqe.out, b), None),
-            OpSlot::Orphan(_) => (OpSlot::Free, opened(cqe)),
-            done @ OpSlot::Done(..) => (done, None),
-            OpSlot::Free => (OpSlot::Free, None),
-        };
-        *op = next;
-        opened
-    }
-
-    /// Takes a finished op's result, freeing its slot.
-    pub(crate) fn take(&mut self, token: Token) -> Option<(IoStatus, Out, B)> {
-        let op = self.entry(token)?;
-        if !matches!(op, OpSlot::Done(..)) {
-            return None;
-        }
-        match core::mem::replace(op, OpSlot::Free) {
-            OpSlot::Done(status, out, b) => Some((status, out, b)),
-            _ => None,
-        }
-    }
-
-    /// Drops interest in an op. A finished op is freed now, and a waiting one
-    /// when its completion lands.
-    pub(crate) fn orphan(&mut self, token: Token) {
-        let Some(op) = self.entry(token) else {
-            return;
-        };
-        *op = match core::mem::replace(op, OpSlot::Free) {
-            OpSlot::Waiting(b) => OpSlot::Orphan(b),
-            _ => OpSlot::Free,
-        };
-    }
-
-    /// The slots in use.
-    pub(crate) fn live(&self) -> usize {
-        let used = |e: &&Entry<B>| !matches!(e.op, OpSlot::Free);
-        self.entries.iter().filter(used).count()
-    }
-}
-
-/// The handle a successful completion carries, if any.
-fn opened(cqe: &Cqe) -> Option<RawHandle> {
-    cqe.status.result().ok().and(cqe.out.as_handle())
-}
-
-struct State {
-    cq: Input<Cqe>,
-    slots: Slots<Option<Buf>>,
-    next_grant: u32,
-}
-
-impl State {
-    /// Records every completion on `cq`, and closes any handle an orphaned
-    /// op opened. Skips records that do not decode.
-    fn pump(&mut self, sq: &Output<Sqe>) {
-        for cqe in self.cq.drain().flatten() {
-            if let Some(raw) = self.slots.land(&cqe) {
-                let _ = sq.write(&Sqe::new(UNTRACKED, raw, Op::CLOSE));
-            }
-        }
-    }
+    state: State,
 }
 
 struct Queue {
     sq: Output<Sqe>,
-    state: Cell<Option<Box<State>>>,
-    table: Rc<Table>,
+    cq: RefCell<Input<Cqe>>,
+    ops: [Cell<OpSlot>; MAX_OPS],
+    generation: Cell<u16>,
+    arena: Rc<Arena>,
+    next_grant: Cell<u16>,
 }
 
-/// A system's queue pair and buffer table, shared by `Rc`.
+/// A system's queue pair and arena, shared by `Rc`.
 ///
-/// Handles, pending ops, and buffers each hold one.
+/// Handles and pending ops each hold one.
 #[derive(Clone)]
 pub struct Io(Rc<Queue>);
 
-/// The queue's state, borrowed for one call and put back on drop.
-struct Lent<'a> {
-    cell: &'a Cell<Option<Box<State>>>,
-    state: Option<Box<State>>,
-}
-
-impl Deref for Lent<'_> {
-    type Target = State;
-
-    fn deref(&self) -> &State {
-        // PANIC Safety: `state` is `Some` until `drop`.
-        self.state.as_deref().expect("lent state")
-    }
-}
-
-impl DerefMut for Lent<'_> {
-    fn deref_mut(&mut self) -> &mut State {
-        // PANIC Safety: `state` is `Some` until `drop`.
-        self.state.as_deref_mut().expect("lent state")
-    }
-}
-
-impl Drop for Lent<'_> {
-    fn drop(&mut self) {
-        self.cell.set(self.state.take());
-    }
-}
-
 impl Io {
-    /// A queue that writes ops to `sq` and reads completions from `cq`.
-    ///
-    /// A full `sq` fails the op with `QueueFull` and counts no dropped write.
-    pub(crate) fn new(sq: Output<Sqe>, cq: Input<Cqe>, table: Rc<Table>) -> Self {
-        let state = State {
-            cq,
-            slots: Slots::new(),
-            next_grant: 0,
+    pub(crate) fn new(sq: Output<Sqe>, cq: Input<Cqe>, arena: Rc<Arena>) -> Self {
+        let free = OpSlot {
+            generation: 0,
+            state: State::Free,
         };
         Self(Rc::new(Queue {
             sq,
-            state: Cell::new(Some(Box::new(state))),
-            table,
+            cq: RefCell::new(cq),
+            ops: core::array::from_fn(|_| Cell::new(free)),
+            generation: Cell::new(0),
+            arena,
+            next_grant: Cell::new(0),
         }))
     }
 
-    pub(crate) fn table(&self) -> &Rc<Table> {
-        &self.0.table
+    pub(crate) fn arena(&self) -> &Rc<Arena> {
+        &self.0.arena
     }
 
-    /// `None` while another call holds the state.
-    fn lend(&self) -> Option<Lent<'_>> {
-        let state = self.0.state.take()?;
-        Some(Lent {
-            cell: &self.0.state,
-            state: Some(state),
-        })
-    }
-
-    /// Writes an op and claims a slot for it. A full queue completes the op
-    /// with `QueueFull` on the spot, handing `buf` back.
-    pub(crate) fn submit(&self, raw: RawHandle, op: Op, buf: Option<Buf>) -> Inner {
-        let full = |buf| Inner::Local(IoStatus::err(IoError::QueueFull), buf);
-        let Some(op) = lent(op, buf.as_ref()) else {
-            return Inner::Local(IoStatus::err(IoError::BadBuf), buf);
-        };
-        let Some(mut state) = self.lend() else {
-            return full(buf);
-        };
-        state.pump(&self.0.sq);
-        let token = match state.slots.claim(buf) {
-            Ok(token) => token,
-            Err(buf) => return full(buf),
-        };
-        if self.0.sq.write(&Sqe::new(token, raw, op)).is_err() {
-            return full(state.slots.unclaim(token).flatten());
-        }
-        Inner::Queued(token)
-    }
-
-    /// Takes a finished op's result.
-    pub(crate) fn take(&self, token: Token) -> Option<(IoStatus, Out, Option<Buf>)> {
-        let mut state = self.lend()?;
-        state.pump(&self.0.sq);
-        state.slots.take(token)
-    }
-
-    /// Writes an op whose result no one takes, such as a cancel. It needs no
-    /// slot, so it goes out even when every slot is in use.
-    pub(crate) fn untracked(&self, raw: RawHandle, op: Op) {
-        let _ = self.0.sq.write(&Sqe::new(UNTRACKED, raw, op));
-    }
-
-    pub(crate) fn orphan(&self, token: Token) {
-        if let Some(mut state) = self.lend() {
-            state.slots.orphan(token);
-        }
-    }
-
-    /// The handle of the next `Cap` this queue binds: grant `n` is index `n`.
+    /// The handle of the next `Cap` bound to this queue: grant `n` is index `n`.
     pub(crate) fn next_grant(&self) -> RawHandle {
-        let Some(mut state) = self.lend() else {
-            return RawHandle::new(u32::MAX, 0);
+        let n = self.0.next_grant.get();
+        self.0.next_grant.set(n.wrapping_add(1));
+        RawHandle::new(n, 0)
+    }
+
+    /// Submits `op` on `handle`, lending it `buf`.
+    pub(crate) fn submit<O: IoOp>(
+        &self,
+        handle: RawHandle,
+        op: Op,
+        buf: Option<Buf>,
+    ) -> Pending<O> {
+        Pending {
+            state: self.start(handle, &op, buf.as_ref()),
+            io: self.clone(),
+            buf,
+            _o: PhantomData,
+        }
+    }
+
+    /// Submits any op on any handle. Most systems use a `Handle` instead.
+    pub fn submit_raw(&self, handle: RawHandle, op: Op, buf: Option<Buf>) -> Pending<Raw> {
+        self.submit(handle, op, buf)
+    }
+
+    fn start(&self, handle: RawHandle, op: &Op, buf: Option<&Buf>) -> Stage {
+        let local = |e| Stage::Local(IoStatus::err(e));
+        let span = match buf {
+            Some(buf) if buf.live() => buf.span_for(op),
+            Some(_) => return local(IoError::BadBuf),
+            None if op.fills() || op.drains() => return local(IoError::BadBuf),
+            None => Span::default(),
         };
-        state.next_grant += 1;
-        RawHandle::new(state.next_grant - 1, 0)
+        self.pump();
+        let Some(slot) = self
+            .0
+            .ops
+            .iter()
+            .position(|s| matches!(s.get().state, State::Free))
+        else {
+            return local(IoError::QueueFull);
+        };
+        let generation = self.0.generation.get().wrapping_add(1);
+        self.0.generation.set(generation);
+        let token = Token::new(slot as u16, generation);
+        if self.0.sq.write(&Sqe::new(token, handle, op, span)).is_err() {
+            return local(IoError::QueueFull);
+        }
+        let opens = op.opens();
+        self.0.ops[slot].set(OpSlot {
+            generation,
+            state: State::Waiting { opens },
+        });
+        Stage::Queued(token)
     }
 
-    /// Submits any op on any handle, lending it `buf`. Most systems use a
-    /// `Handle` instead.
-    pub fn submit_raw(&self, raw: RawHandle, op: Op, buf: Option<Buf>) -> Pending<Raw> {
-        Pending::new(self, raw, op, buf)
+    /// Records every completion on the CQ.
+    fn pump(&self) {
+        let Ok(mut cq) = self.0.cq.try_borrow_mut() else {
+            return;
+        };
+        for cqe in cq.drain().flatten() {
+            self.land(cqe);
+        }
     }
 
-    /// Ops that have not been taken or orphaned and freed.
+    fn land(&self, cqe: Cqe) {
+        let Some(cell) = self.0.ops.get(usize::from(cqe.token.slot())) else {
+            return;
+        };
+        let mut slot = cell.get();
+        if slot.generation != cqe.token.generation() {
+            return;
+        }
+        slot.state = match slot.state {
+            State::Waiting { opens } => State::Done {
+                status: cqe.status,
+                value: cqe.value.get(),
+                opens,
+            },
+            State::Orphan { opens: true } => self.close_orphan(cqe.token, cqe.result()),
+            done @ State::Done { .. } => done,
+            State::Orphan { .. } | State::Free => State::Free,
+        };
+        cell.set(slot);
+    }
+
+    /// Closes the handle an orphaned op opened, under the op's own token.
+    fn close_orphan(&self, token: Token, opened: Result<u32, IoError>) -> State {
+        let Ok(raw) = opened else {
+            return State::Free;
+        };
+        let close = Sqe::new(token, RawHandle::from_raw(raw), &Op::Close, Span::default());
+        match self.0.sq.write(&close) {
+            Ok(()) => State::Orphan { opens: false },
+            Err(_) => State::Free,
+        }
+    }
+
+    /// Takes a finished op's result, freeing its slot.
+    fn take(&self, token: Token) -> Option<(IoStatus, u32)> {
+        self.pump();
+        let cell = self.0.ops.get(usize::from(token.slot()))?;
+        let slot = cell.get();
+        let State::Done { status, value, .. } = slot.state else {
+            return None;
+        };
+        if slot.generation != token.generation() {
+            return None;
+        }
+        cell.set(OpSlot {
+            state: State::Free,
+            ..slot
+        });
+        Some((status, value))
+    }
+
+    /// Drops interest in an op.
+    fn orphan(&self, token: Token) {
+        let Some(cell) = self.0.ops.get(usize::from(token.slot())) else {
+            return;
+        };
+        let mut slot = cell.get();
+        if slot.generation != token.generation() {
+            return;
+        }
+        slot.state = match slot.state {
+            State::Waiting { opens } => State::Orphan { opens },
+            State::Done {
+                status,
+                value,
+                opens: true,
+            } => self.close_orphan(token, status.result().map(|()| value)),
+            _ => State::Free,
+        };
+        cell.set(slot);
+    }
+
+    fn cancel(&self, token: Token) {
+        let cancel = Sqe::new(token, RawHandle::new(0, 0), &Op::Cancel, Span::default());
+        let _ = self.0.sq.write(&cancel);
+    }
+
+    /// Ops not yet taken, or orphaned and not yet landed.
     pub fn in_flight(&self) -> usize {
-        self.lend().map_or(0, |mut state| {
-            state.pump(&self.0.sq);
-            state.slots.live()
-        })
+        self.pump();
+        let used = |s: &&Cell<OpSlot>| !matches!(s.get().state, State::Free);
+        self.0.ops.iter().filter(used).count()
     }
 }
 
-/// `op` naming the buffer it lends. An op that takes a buffer and lends none
-/// is refused.
-fn lent(mut op: Op, buf: Option<&Buf>) -> Option<Op> {
-    match (op.buf_mut(), buf) {
-        (Some(slot), Some(buf)) => *slot = buf.buf_ref(),
-        (Some(_), None) => return None,
-        (None, _) => {}
+enum Stage {
+    Queued(Token),
+    /// Finished without reaching the queue, such as a `QueueFull`.
+    Local(IoStatus),
+    Taken,
+}
+
+/// An op in flight.
+///
+/// Poll it once per cycle, or await it in a sequence. Dropping it leaves the
+/// op running and discards its result; [`Pending::cancel`] cancels it.
+#[must_use]
+pub struct Pending<O: IoOp> {
+    io: Io,
+    state: Stage,
+    buf: Option<Buf>,
+    _o: PhantomData<fn() -> O>,
+}
+
+impl<O: IoOp> Pending<O> {
+    /// The result once the op has completed. `None` before that, and after
+    /// the result was taken.
+    pub fn poll(&mut self) -> Option<O::Output> {
+        let (status, value) = match self.state {
+            Stage::Queued(token) => self.io.take(token)?,
+            Stage::Local(status) => (status, 0),
+            Stage::Taken => return None,
+        };
+        self.state = Stage::Taken;
+        Some(O::finish(&self.io, status, value, self.buf.take()))
     }
-    Some(op)
+
+    /// The result if the op has completed, or the op back.
+    pub fn try_take(mut self) -> Result<O::Output, Self> {
+        self.poll().ok_or(self)
+    }
+
+    /// Cancels the op. Its completion still arrives, usually `Canceled`. The
+    /// cancel takes no slot of its own.
+    pub fn cancel(&self) {
+        if let Stage::Queued(token) = self.state {
+            self.io.cancel(token);
+        }
+    }
+}
+
+/// Resolves once the op has completed. Registers no waker: a sequence's step
+/// polls it every cycle.
+impl<O: IoOp> Future for Pending<O> {
+    type Output = O::Output;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<O::Output> {
+        match Pending::poll(self.get_mut()) {
+            Some(out) => Poll::Ready(out),
+            None => Poll::Pending,
+        }
+    }
+}
+
+impl<O: IoOp> Drop for Pending<O> {
+    fn drop(&mut self) {
+        if let Stage::Queued(token) = self.state {
+            self.io.orphan(token);
+        }
+    }
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// How an op's completion becomes the value its `Pending` resolves to.
+pub trait IoOp: sealed::Sealed {
+    type Output;
+
+    #[doc(hidden)]
+    fn finish(io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output;
+}
+
+/// An op that lends a buffer and hands it back with its result.
+pub trait BufOp: IoOp<Output = (Result<Self::Ok, IoError>, Buf)> {
+    type Ok;
+}
+
+/// Fills a buffer; resolves to the bytes read.
+pub struct Read;
+/// Sends a buffer's bytes; resolves to the bytes written.
+pub struct Write;
+/// Receives one message into a buffer.
+pub struct Recv;
+/// Sends one message from a buffer.
+pub struct Send;
+/// Opens a file under a directory.
+pub struct Open;
+/// Accepts a connection on a listener.
+pub struct Accept;
+/// Closes a handle.
+pub struct Close;
+/// Flushes a file to storage.
+pub struct Fsync;
+/// Configures or flushes a serial port.
+pub struct Tty;
+/// Reads or sets a GPIO line; resolves to the line's level.
+pub struct Gpio;
+/// Any op, with its raw result.
+pub struct Raw;
+
+/// The buffer back, with the length the op reports. A fill sets the
+/// buffer's length to it.
+fn moved(
+    status: IoStatus,
+    value: u32,
+    buf: Option<Buf>,
+    fill: bool,
+) -> (Result<usize, IoError>, Buf) {
+    let mut buf = buf.unwrap_or_else(Buf::empty);
+    let result = status.result().map(|()| value as usize);
+    if let (Ok(n), true) = (result, fill) {
+        buf.set_len(n);
+    }
+    (result, buf)
+}
+
+fn opened<K>(io: &Io, status: IoStatus, value: u32) -> Result<Handle<K>, IoError> {
+    status.result()?;
+    Ok(Handle::new(RawHandle::from_raw(value), io.clone()))
+}
+
+impl sealed::Sealed for Read {}
+
+impl IoOp for Read {
+    type Output = (Result<usize, IoError>, Buf);
+
+    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
+        moved(status, value, buf, true)
+    }
+}
+
+impl sealed::Sealed for Recv {}
+
+impl IoOp for Recv {
+    type Output = (Result<usize, IoError>, Buf);
+
+    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
+        moved(status, value, buf, true)
+    }
+}
+
+impl sealed::Sealed for Write {}
+
+impl IoOp for Write {
+    type Output = (Result<usize, IoError>, Buf);
+
+    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
+        moved(status, value, buf, false)
+    }
+}
+
+impl sealed::Sealed for Send {}
+
+impl IoOp for Send {
+    type Output = (Result<usize, IoError>, Buf);
+
+    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
+        moved(status, value, buf, false)
+    }
+}
+
+impl sealed::Sealed for Open {}
+
+impl IoOp for Open {
+    type Output = Result<Handle<File>, IoError>;
+
+    fn finish(io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
+        opened(io, status, value)
+    }
+}
+
+impl sealed::Sealed for Accept {}
+
+impl IoOp for Accept {
+    type Output = Result<Handle<Stream>, IoError>;
+
+    fn finish(io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
+        opened(io, status, value)
+    }
+}
+
+impl sealed::Sealed for Close {}
+
+impl IoOp for Close {
+    type Output = Result<(), IoError>;
+
+    fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
+        status.result()
+    }
+}
+
+impl sealed::Sealed for Fsync {}
+
+impl IoOp for Fsync {
+    type Output = Result<(), IoError>;
+
+    fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
+        status.result()
+    }
+}
+
+impl sealed::Sealed for Tty {}
+
+impl IoOp for Tty {
+    type Output = Result<(), IoError>;
+
+    fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
+        status.result()
+    }
+}
+
+impl sealed::Sealed for Gpio {}
+
+impl IoOp for Gpio {
+    type Output = Result<u32, IoError>;
+
+    fn finish(_io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
+        status.result().map(|()| value)
+    }
+}
+
+impl sealed::Sealed for Raw {}
+
+impl IoOp for Raw {
+    type Output = (Result<u32, IoError>, Option<Buf>);
+
+    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
+        (status.result().map(|()| value), buf)
+    }
+}
+
+impl BufOp for Read {
+    type Ok = usize;
+}
+impl BufOp for Recv {
+    type Ok = usize;
+}
+impl BufOp for Write {
+    type Ok = usize;
+}
+impl BufOp for Send {
+    type Ok = usize;
+}
+
+/// A buffer kept in state, either idle or lent to an op.
+pub enum Slot<O: BufOp> {
+    Idle(Buf),
+    Busy(Pending<O>),
+    /// Between `take_idle` and storing the op that took the buffer.
+    Empty,
+}
+
+impl<O: BufOp> Slot<O> {
+    /// Takes the idle buffer to start an op.
+    pub fn take_idle(&mut self) -> Option<Buf> {
+        match core::mem::replace(self, Self::Empty) {
+            Self::Idle(buf) => Some(buf),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    /// The op's result once it lands. Puts the buffer back as idle.
+    pub fn poll(&mut self) -> Option<Result<O::Ok, IoError>> {
+        let Self::Busy(pending) = self else {
+            return None;
+        };
+        let (result, buf) = pending.poll()?;
+        *self = Self::Idle(buf);
+        Some(result)
+    }
+
+    /// The idle buffer's bytes, or none.
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Idle(buf) => buf,
+            _ => &[],
+        }
+    }
 }

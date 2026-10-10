@@ -1,32 +1,39 @@
 //! Copies IO buffer bytes between a wasm guest's arena and the host's mirror
 //! of it.
 //!
-//! The guest and the mirror have the same directory: the mirror is a copy of
-//! the arena the guest laid out. The reactor and the kernel use the mirror. A
-//! write's bytes, and its length, go to the mirror before its op reaches the
-//! real ring; a read's bytes come back before the guest polls it.
+//! The mirror has the guest arena's length, and every op names a span of
+//! both. The dispatch and the kernel use the mirror. A write's bytes go to
+//! the mirror before its op reaches the real ring; a read's bytes come back
+//! before the guest polls it.
 
+use core::ptr::NonNull;
 use std::rc::Rc;
 
-use crate::io::{BufRef, BufTable, Corrupt, Cqe, MAX_OPS, Sqe, Token, fills};
+use crate::io::{Arena, Cqe, MAX_OPS, Span, Sqe, Token};
+use crate::mirror::Corrupt;
 use crate::port::Input;
+
+/// A region's base and length.
+type Region = (NonNull<u8>, usize);
 
 pub(super) struct IoCopy {
     /// The guest's arena, seen from the host.
-    guest: BufTable,
-    mirror: Rc<BufTable>,
+    guest: Region,
+    mirror: Rc<Arena>,
     /// A second reader on the guest's copy of `io_sq`.
     sq: Input<Sqe>,
     /// A second reader on the guest's copy of `io_cq`.
     cq: Input<Cqe>,
     /// Each read in flight, by its token's slot.
-    reads: Box<[Option<(Token, BufRef)>]>,
+    reads: [Option<(Token, Span)>; MAX_OPS],
 }
 
 impl IoCopy {
-    pub(super) fn new(
-        guest: BufTable,
-        mirror: Rc<BufTable>,
+    /// # Safety
+    /// `guest` stays live and unmoved while the copy lives.
+    pub(super) unsafe fn new(
+        guest: Region,
+        mirror: Rc<Arena>,
         sq: Input<Sqe>,
         cq: Input<Cqe>,
     ) -> Self {
@@ -35,227 +42,166 @@ impl IoCopy {
             mirror,
             sq,
             cq,
-            reads: vec![None; MAX_OPS].into(),
+            reads: [None; MAX_OPS],
         }
     }
 
     /// Copies each finished read's bytes from the mirror into the guest.
     pub(super) fn completions(&mut self) -> Result<(), Corrupt> {
-        let Self {
-            cq,
-            reads,
-            guest,
-            mirror,
-            ..
-        } = self;
-        for cqe in cq.drain() {
+        for cqe in self.cq.drain() {
             let cqe = cqe.map_err(|_| Corrupt)?;
-            let Some(read) = slot(cqe.token).and_then(|at| reads.get_mut(at)) else {
+            let read = self.reads.get_mut(usize::from(cqe.token.slot()));
+            let Some((_, span)) = read.and_then(|r| r.take_if(|(t, _)| *t == cqe.token)) else {
                 continue;
             };
-            let Some((_, buf)) = read.take_if(|(token, _)| *token == cqe.token) else {
-                continue;
-            };
-            let n = cqe.status.result().ok().and(cqe.out.as_len()).unwrap_or(0);
-            copy(mirror, guest, buf.slot(), n)?;
-        }
-        Ok(())
-    }
-
-    /// Notes each new read, and copies each new write's length and bytes from
-    /// the guest into the mirror.
-    pub(super) fn submissions(&mut self) -> Result<(), Corrupt> {
-        let Self {
-            sq,
-            reads,
-            guest,
-            mirror,
-            ..
-        } = self;
-        for sqe in sq.drain() {
-            let sqe = sqe.map_err(|_| Corrupt)?;
-            let Some(buf) = sqe.op.buf() else { continue };
-            if fills(&sqe.op) {
-                if let Some(read) = slot(sqe.token).and_then(|at| reads.get_mut(at)) {
-                    *read = Some((sqe.token, buf));
-                }
-                continue;
+            let n = cqe.result().unwrap_or(0).min(span.len());
+            if let Some(mirror) = self.mirror.region() {
+                copy(mirror, self.guest, Span::new(span.off(), n));
             }
-            let Some((_, _, len)) = guest.entry(buf.slot()) else {
-                continue;
-            };
-            mirror.set_len(buf.slot(), len).map_err(|_| Corrupt)?;
-            copy(guest, mirror, buf.slot(), len)?;
+        }
+        Ok(())
+    }
+
+    /// Notes each new read, and copies each new write's bytes from the guest
+    /// into the mirror.
+    pub(super) fn submissions(&mut self) -> Result<(), Corrupt> {
+        for sqe in self.sq.drain() {
+            let sqe = sqe.map_err(|_| Corrupt)?;
+            let Ok(op) = sqe.op() else { continue };
+            if op.fills()
+                && let Some(read) = self.reads.get_mut(usize::from(sqe.token.slot()))
+            {
+                *read = Some((sqe.token, sqe.buf));
+            }
+            if let (true, Some(mirror)) = (op.drains(), self.mirror.region()) {
+                copy(self.guest, mirror, sqe.buf);
+            }
         }
         Ok(())
     }
 }
 
-/// The slot an op's token names, if its system tracks it.
-fn slot(token: Token) -> Option<usize> {
-    let at = (token.get() & 0xFFFF) as usize;
-    (at < MAX_OPS).then_some(at)
-}
-
-/// Copies `n` bytes of `slot` from `from` to `to`. Both tables must hold the
-/// slot with the same capacity, of at least `n` bytes; a slot neither holds
-/// is left for the reactor to refuse.
-fn copy(from: &BufTable, to: &BufTable, slot: u16, n: u32) -> Result<(), Corrupt> {
-    match (from.entry(slot), to.entry(slot)) {
-        (None, None) => Ok(()),
-        (Some((_, a, _)), Some((_, b, _))) if a == b && n <= a => {
-            let (Some(src), Some(dst)) = (from.raw(slot), to.raw(slot)) else {
-                return Err(Corrupt);
-            };
-            // SAFETY: both spans hold at least `n` bytes, lie in different
-            // arenas, and only this step touches them between guest calls.
-            unsafe {
-                core::ptr::copy_nonoverlapping(src.ptr.as_ptr(), dst.ptr.as_ptr(), n as usize)
-            };
-            Ok(())
-        }
-        _ => Err(Corrupt),
+/// Copies `span` from `from` to `to`. A span outside either is left for the
+/// dispatch to refuse.
+fn copy(from: Region, to: Region, span: Span) {
+    let Some(end) = span.end() else { return };
+    if end as usize > from.1 || end as usize > to.1 {
+        return;
+    }
+    let off = span.off() as usize;
+    // SAFETY: the span lies in both regions, which are distinct, and only
+    // this step touches them between guest calls.
+    unsafe {
+        let (src, dst) = (from.0.add(off), to.0.add(off));
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_ptr(), span.len() as usize);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
-
     use super::*;
-    use crate::io::region::Region;
-    use crate::io::{BufRef, IoError, Op, Out, RawHandle};
-    use crate::port::{Output, ring_capacity};
-    use crate::record::Record;
+    use crate::io::{Cqe, IoError, Op, RawHandle};
+    use crate::port::Output;
+    use crate::tests::utils::pair;
 
-    /// A guest's arena and the host's mirror of it, with the guest's IO
-    /// rings, which the test writes as the guest and the host.
+    /// A guest arena holding `cmd` then 8 free bytes, the host's mirror of
+    /// it, and the guest's IO rings, which the test writes as both sides.
     struct Rig {
         copy: IoCopy,
-        guest: Rc<BufTable>,
+        guest: Box<[u8]>,
+        mirror: Rc<Arena>,
         sq: Output<Sqe>,
         cq: Output<Cqe>,
-        _rings: [RingBuffer; 2],
+        _rings: [metor_fsw_3_ring::RingBuffer; 2],
     }
 
-    fn ring<T: Record>() -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(T::MAX_LEN, 16).unwrap(),
-            max_readers: 1,
-        })
-    }
-
-    /// Two slots: a 3-byte write buffer holding `cmd`, and an 8-byte read
-    /// buffer.
     fn rig() -> Rig {
-        let made = BufTable::new(4);
-        made.alloc_from(b"cmd").unwrap();
-        made.alloc(8).unwrap();
-        made.freeze();
-        let bytes: Box<[u8]> = unsafe { made.region().unwrap().as_ref() }.into();
-        let guest = Rc::new(BufTable::from_region(Region::mirror(bytes.clone())).unwrap());
-        let mirror = Rc::new(BufTable::from_region(Region::mirror(bytes)).unwrap());
-        mirror.set_len(0, 0).unwrap();
-        let view = {
-            let span = guest.region().unwrap();
-            unsafe { Region::unowned(span.cast(), span.len()) }
-        };
-        let view = BufTable::from_region(view).unwrap();
-        let (sq_ring, cq_ring) = (ring::<Sqe>(), ring::<Cqe>());
-        let sq = Input::new(vec![sq_ring.view(NoWake).unwrap()]);
-        let cq = Input::new(vec![cq_ring.view(NoWake).unwrap()]);
+        let mut guest: Box<[u8]> = vec![0; 11].into();
+        guest[..3].copy_from_slice(b"cmd");
+        let mirror = Rc::new(Arena::owning(vec![0; 11].into()));
+        let (sq_ring, sq, sq_in) = pair::<Sqe>(16);
+        let (cq_ring, cq, cq_in) = pair::<Cqe>(16);
+        let region = (NonNull::from(&mut guest[..]).cast(), guest.len());
+        // SAFETY: the boxed guest bytes never move and outlive the copy.
+        let copy = unsafe { IoCopy::new(region, mirror.clone(), sq_in, cq_in) };
         Rig {
-            copy: IoCopy::new(view, mirror, sq, cq),
+            copy,
             guest,
-            sq: Output::new(sq_ring.writer(NoWake).unwrap()),
-            cq: Output::new(cq_ring.writer(NoWake).unwrap()),
+            mirror,
+            sq,
+            cq,
             _rings: [sq_ring, cq_ring],
         }
     }
 
     impl Rig {
-        fn submit(&self, token: u32, op: Op) {
+        fn submit(&self, slot: u16, op: Op, span: Span) -> Token {
+            let token = Token::new(slot, 1);
             self.sq
-                .write(&Sqe::new(Token::new(token), RawHandle::new(0, 0), op))
+                .write(&Sqe::new(token, RawHandle::new(0, 0), &op, span))
                 .unwrap();
+            token
         }
 
-        fn complete(&self, cqe: Cqe) {
-            self.cq.write(&cqe).unwrap();
-        }
-
-        fn mirror(&self, slot: u16) -> Vec<u8> {
-            unsafe { self.copy.mirror.filled(slot) }.to_vec()
+        fn mirror(&self, span: Span) -> Vec<u8> {
+            // SAFETY: nothing else touches the mirror during the test.
+            unsafe { self.mirror.span(span).unwrap().as_ref() }.to_vec()
         }
     }
 
     #[test]
-    fn write_bytes_and_length_reach_the_mirror() {
+    fn write_bytes_reach_the_mirror() {
         let mut rig = rig();
-        rig.submit(0, Op::write(BufRef::new(0), None));
+        rig.submit(0, Op::Write { offset: None }, Span::new(0, 3));
         rig.copy.submissions().unwrap();
-        assert_eq!(rig.mirror(0), b"cmd");
-        rig.guest.set_len(0, 1).unwrap();
-        rig.submit(1, Op::write(BufRef::new(0), None));
-        rig.copy.submissions().unwrap();
-        assert_eq!(rig.mirror(0), b"c", "a shorter write sends its new length");
+        assert_eq!(rig.mirror(Span::new(0, 3)), b"cmd");
     }
 
     #[test]
     fn read_bytes_reach_the_guest_on_completion() {
         let mut rig = rig();
-        rig.submit(3, Op::read(BufRef::new(1), None));
+        let token = rig.submit(3, Op::Recv, Span::new(3, 8));
         rig.copy.submissions().unwrap();
-        let space = unsafe { rig.copy.mirror.whole_mut(1) };
-        space[..2].copy_from_slice(b"ok");
-        rig.complete(Cqe::ok(Token::new(3), Out::len(2)));
+        // SAFETY: nothing else touches the mirror during the test.
+        unsafe { rig.mirror.span(Span::new(3, 2)).unwrap().as_mut() }.copy_from_slice(b"ok");
+        rig.cq.write(&Cqe::ok(token, 2)).unwrap();
         rig.copy.completions().unwrap();
-        assert_eq!(&unsafe { rig.guest.whole_mut(1) }[..2], b"ok");
+        assert_eq!(&rig.guest[3..6], b"ok\0");
     }
 
     #[test]
     fn empty_or_failed_read_copies_nothing() {
         let mut rig = rig();
-        let space = unsafe { rig.copy.mirror.whole_mut(1) };
-        space[..2].copy_from_slice(b"ok");
-        for (token, cqe) in [
-            (4, Cqe::ok(Token::new(4), Out::len(0))),
-            (5, Cqe::err(Token::new(5), IoError::Canceled)),
-        ] {
-            rig.submit(token, Op::read(BufRef::new(1), None));
+        // SAFETY: nothing else touches the mirror during the test.
+        unsafe { rig.mirror.span(Span::new(3, 2)).unwrap().as_mut() }.copy_from_slice(b"ok");
+        for (slot, ok) in [(4, true), (5, false)] {
+            let token = rig.submit(slot, Op::Recv, Span::new(3, 8));
             rig.copy.submissions().unwrap();
-            rig.complete(cqe);
+            let cqe = match ok {
+                true => Cqe::ok(token, 0),
+                false => Cqe::err(token, IoError::Canceled),
+            };
+            rig.cq.write(&cqe).unwrap();
             rig.copy.completions().unwrap();
         }
-        assert_eq!(&unsafe { rig.guest.whole_mut(1) }[..2], [0, 0]);
+        assert_eq!(&rig.guest[3..5], [0, 0]);
     }
 
     #[test]
-    fn ref_neither_holds_is_left_for_the_reactor() {
+    fn span_outside_the_arena_is_left_for_the_dispatch() {
         let mut rig = rig();
-        rig.submit(0, Op::write(BufRef::new(3), None));
+        rig.submit(0, Op::Write { offset: None }, Span::new(9, 8));
         assert_eq!(rig.copy.submissions(), Ok(()));
-    }
-
-    #[test]
-    fn guest_directory_unlike_the_mirror_is_corrupt() {
-        let mut rig = rig();
-        rig.guest.release(0);
-        rig.guest.release(1);
-        rig.guest.rewind().unwrap();
-        rig.guest.alloc(2).unwrap();
-        rig.submit(0, Op::write(BufRef::new(0), None));
-        assert_eq!(rig.copy.submissions(), Err(Corrupt));
     }
 
     #[test]
     fn copying_allocates_nothing() {
         let mut rig = rig();
         let n = crate::io::tests::allocations(|| {
-            for t in 0..8 {
-                rig.submit(t, Op::read(BufRef::new(1), None));
+            for slot in 0..8 {
+                let token = rig.submit(slot, Op::Recv, Span::new(3, 8));
                 rig.copy.submissions().unwrap();
-                rig.complete(Cqe::ok(Token::new(t), Out::len(1)));
+                rig.cq.write(&Cqe::ok(token, 1)).unwrap();
                 rig.copy.completions().unwrap();
             }
         });
@@ -266,24 +212,14 @@ mod tests {
 #[cfg(kani)]
 mod proofs {
     use super::*;
-    use crate::io::region::Region;
 
-    /// A header, two entries, and 16 data bytes.
-    const LEN: usize = 12 + 2 * 16 + 16;
-
-    fn table() -> Option<BufTable> {
-        let bytes: [u8; LEN] = kani::any();
-        BufTable::from_region(Region::mirror(Box::new(bytes))).ok()
-    }
-
-    /// For any two directories, slot, and length, `copy` reads and writes
-    /// inside both arenas; Kani checks every pointer it uses.
+    /// For any span, `copy` reads and writes only inside both regions.
     #[kani::proof]
-    #[kani::unwind(4)]
     fn copy_stays_in_bounds() {
-        let (Some(from), Some(to)) = (table(), table()) else {
-            return;
-        };
-        let _ = copy(&from, &to, kani::any::<u16>() % 3, kani::any());
+        let mut a = [0u8; 8];
+        let mut b = [0u8; 6];
+        let from = (NonNull::from(&mut a[..]).cast(), a.len());
+        let to = (NonNull::from(&mut b[..]).cast(), b.len());
+        copy(from, to, Span::new(kani::any(), kani::any()));
     }
 }
