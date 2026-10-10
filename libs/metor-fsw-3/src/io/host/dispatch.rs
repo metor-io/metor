@@ -20,6 +20,13 @@ use crate::port::Output;
 
 /// The most `io_status` records written in one cycle.
 const STATUS_PER_CYCLE: usize = 16;
+/// The most routes one op slot queues between drains: its SQ share of two
+/// lowered records, a quiesce cancel, a deferred sim cancel, a close for the
+/// handle its completion opened, and a close when its member drains.
+pub(crate) const ROUTES_PER_SLOT: usize = 6;
+/// The most replies one op slot queues between drains: its SQ share of two
+/// refused records, and a sim op its model's port refused.
+const REPLIES_PER_SLOT: usize = 3;
 
 /// What backs a resource.
 pub(crate) enum Backed {
@@ -96,6 +103,24 @@ struct Entry {
     canceled: bool,
 }
 
+/// Why an op did not run.
+enum Refusal {
+    /// Answered with this error.
+    Reply(IoError),
+    /// Not answered: a reply would carry another op's token.
+    Drop,
+}
+
+impl From<IoError> for Refusal {
+    fn from(e: IoError) -> Self {
+        Self::Reply(e)
+    }
+}
+
+/// An SQ record `lower` dropped unanswered.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Rejected;
+
 /// The descriptor or sim port an op on a handle goes to.
 enum Target {
     Fd(i32, Class),
@@ -142,27 +167,38 @@ impl Dispatch {
             counters: vec![Counters::default(); count].into(),
             reported: vec![Counters::default(); count].into(),
             next_status: 0,
-            routes: Vec::with_capacity(3 * ops),
-            replies: Vec::with_capacity(2 * ops),
+            routes: Vec::with_capacity(ROUTES_PER_SLOT * ops),
+            replies: Vec::with_capacity(REPLIES_PER_SLOT * ops),
         })
     }
 
     /// Lowers one op from member `m`'s queue, whose buffers lie in `arena`.
-    pub(crate) fn lower(&mut self, m: usize, sqe: Sqe, arena: &Arena) {
+    /// An op that names no slot of `m`'s, or a slot still in flight, is
+    /// dropped unanswered, since its reply would answer another op: `Err`.
+    pub(crate) fn lower(&mut self, m: usize, sqe: Sqe, arena: &Arena) -> Result<(), Rejected> {
         if self.members[m].quiescing {
-            return;
+            return Ok(());
         }
-        if let Err(e) = self.try_lower(m, sqe, arena) {
-            self.replies.push((m, Cqe::err(sqe.token, e)));
+        match self.try_lower(m, sqe, arena) {
+            Ok(()) => Ok(()),
+            Err(Refusal::Drop) => Err(Rejected),
+            Err(Refusal::Reply(e)) => {
+                self.replies.push((m, Cqe::err(sqe.token, e)));
+                Ok(())
+            }
         }
     }
 
-    fn try_lower(&mut self, m: usize, sqe: Sqe, arena: &Arena) -> Result<(), IoError> {
-        let op = sqe.op()?;
-        if op == Op::Cancel {
+    fn try_lower(&mut self, m: usize, sqe: Sqe, arena: &Arena) -> Result<(), Refusal> {
+        if sqe.opcode == OpKind::Cancel as u8 {
             self.cancel(m, sqe.token);
             return Ok(());
         }
+        let index = index(m, sqe.token.slot()).ok_or(Refusal::Drop)?;
+        if self.ops[index].live {
+            return Err(Refusal::Drop);
+        }
+        let op = sqe.op()?;
         let (res, target) = self.target(m, sqe.handle).ok_or(IoError::Stale)?;
         if op == Op::Close {
             self.close(m, sqe.handle);
@@ -173,12 +209,7 @@ impl Dispatch {
             true => Some(arena.get_slice(sqe.buf).ok_or(IoError::BadBuf)?),
             false => None,
         };
-        let index = index(m, sqe.token.slot()).ok_or(IoError::Refused)?;
-        let entry = &mut self.ops[index];
-        if entry.live {
-            return Err(IoError::Refused);
-        }
-        *entry = Entry {
+        self.ops[index] = Entry {
             generation: sqe.token.generation(),
             res,
             kind: op.kind(),
@@ -379,9 +410,11 @@ impl Dispatch {
         (0..self.members.len()).for_each(|m| self.quiesce_member(m));
     }
 
-    /// Whether any op is in flight.
+    /// Whether any op is in flight on a descriptor. An op a model holds
+    /// names no memory the kernel writes.
     pub(crate) fn live(&self) -> bool {
-        self.ops.iter().any(|e| e.live)
+        let real = |e: &Entry| !matches!(self.resources[usize::from(e.res)].backed, Backed::Sim(_));
+        self.ops.iter().any(|e| e.live && real(e))
     }
 
     pub(crate) fn resources(&self) -> &[Resource] {

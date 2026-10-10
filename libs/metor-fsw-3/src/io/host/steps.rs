@@ -15,6 +15,7 @@ use std::sync::Arc;
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogEvent;
 
+use super::dispatch::ROUTES_PER_SLOT;
 use super::{Backed, Host, OsDone, Route};
 use crate::coordinator::{
     MakeCx, ParamError, Step, SystemKind, TableEntry, bindings, refuse_thread,
@@ -106,7 +107,7 @@ fn make_submit(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
             .into_iter()
             .map(|p| p.map(|b| Output::new(b.writer)))
             .collect(),
-        refused: Vec::with_capacity(io.members.len() * MAX_OPS),
+        refused: Vec::with_capacity(ROUTES_PER_SLOT * io.members.len() * MAX_OPS),
         log: log_port(writers),
     }))
 }
@@ -204,11 +205,11 @@ impl Step for SubmitStep {
         let Some(Host { dispatch, os }) = host.as_mut() else {
             return;
         };
-        let mut corrupt = false;
+        let (mut corrupt, mut rejected) = (false, false);
         for (m, sq) in &mut self.sqs {
             for sqe in sq.drain() {
                 match sqe {
-                    Ok(sqe) => dispatch.lower(*m, sqe, &members[*m].1),
+                    Ok(sqe) => rejected |= dispatch.lower(*m, sqe, &members[*m].1).is_err(),
                     Err(_) => corrupt = true,
                 }
             }
@@ -236,6 +237,10 @@ impl Step for SubmitStep {
             }
         }
         os.submit();
+        if rejected {
+            let message = "an SQ record named a slot that is not free";
+            self.log.fault(now, "io_rejected", message);
+        }
         if corrupt {
             self.log
                 .fault(now, "io_corrupt", "an SQ record did not decode");

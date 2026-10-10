@@ -124,7 +124,10 @@ pub(crate) struct Device {
     replies: Output<Cqe>,
     io: SharedIo,
     held: Vec<Held>,
-    /// Replies the reply port has not taken yet, oldest first.
+    /// The most ops `held` holds.
+    cap: usize,
+    /// Replies the reply port has not taken yet, oldest first. It holds at
+    /// most `2 * cap`.
     outbox: Vec<Cqe>,
     serves: u64,
 }
@@ -142,6 +145,7 @@ impl Device {
             replies,
             io,
             held: Vec::with_capacity(held),
+            cap: held,
             // Each held op gives one reply, and each refused one another.
             outbox: Vec::with_capacity(2 * held),
             serves: 0,
@@ -185,24 +189,26 @@ impl Device {
         let Self {
             requests,
             held,
+            cap,
             outbox,
             serves,
             ..
         } = self;
+        let cap = *cap;
         for sqe in requests.drain().flatten() {
             let op = match sqe.op() {
                 Ok(Op::Cancel) => {
-                    cancel(held, outbox, sqe.token);
+                    cancel(held, outbox, cap, sqe.token);
                     continue;
                 }
                 Ok(op) => op,
                 Err(e) => {
-                    post(outbox, Cqe::err(sqe.token, e));
+                    post(outbox, cap, Cqe::err(sqe.token, e));
                     continue;
                 }
             };
-            if held.len() == held.capacity() {
-                post(outbox, Cqe::err(sqe.token, IoError::QueueFull));
+            if held.len() == cap {
+                post(outbox, cap, Cqe::err(sqe.token, IoError::QueueFull));
                 continue;
             }
             let ready_at = *serves + u64::from(latency(op.kind()));
@@ -221,10 +227,8 @@ impl Device {
                 Reply::Ready(result) => {
                     self.held.remove(at);
                     let token = held.sqe.token;
-                    post(
-                        &mut self.outbox,
-                        result.map_or_else(|e| Cqe::err(token, e), |n| Cqe::ok(token, n)),
-                    );
+                    let cqe = result.map_or_else(|e| Cqe::err(token, e), |n| Cqe::ok(token, n));
+                    post(&mut self.outbox, self.cap, cqe);
                 }
                 Reply::Later => at += 1,
             }
@@ -242,7 +246,9 @@ impl Device {
         }
         match bytes(&self.io, &held.sqe) {
             // SAFETY: the driver lent this span to the request until its
-            // reply is written, and models run on the coordinator thread.
+            // reply is written, and models run on the coordinator thread. A
+            // host driver lends each span to one op at a time; a guest that
+            // lends one span twice races only on its own bytes.
             Some(bytes) => model.answer(now, &held.op, unsafe { &mut *bytes.as_ptr() }),
             None => Reply::Ready(Err(IoError::BadBuf)),
         }
@@ -261,16 +267,16 @@ impl Device {
 }
 
 /// Completes the held op `token` `Canceled`, if it is held.
-fn cancel(held: &mut Vec<Held>, outbox: &mut Vec<Cqe>, token: super::Token) {
+fn cancel(held: &mut Vec<Held>, outbox: &mut Vec<Cqe>, cap: usize, token: super::Token) {
     if let Some(at) = held.iter().position(|h| h.sqe.token == token) {
         let held = held.remove(at);
-        post(outbox, Cqe::err(held.sqe.token, IoError::Canceled));
+        post(outbox, cap, Cqe::err(held.sqe.token, IoError::Canceled));
     }
 }
 
 /// Queues a reply. The outbox holds every reply its held ops can give.
-fn post(outbox: &mut Vec<Cqe>, cqe: Cqe) {
-    if outbox.len() < outbox.capacity() {
+fn post(outbox: &mut Vec<Cqe>, cap: usize, cqe: Cqe) {
+    if outbox.len() < 2 * cap {
         outbox.push(cqe);
     }
 }

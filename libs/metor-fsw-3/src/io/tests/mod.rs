@@ -34,7 +34,12 @@ pub(crate) struct Loopback {
 
 impl Loopback {
     pub fn new() -> Self {
-        let (sq_ring, sq_out, sq) = pair::<Sqe>(Sqe::DEPTH);
+        Self::with_sq_depth(Sqe::DEPTH)
+    }
+
+    /// A loopback whose SQ holds `depth` records.
+    pub fn with_sq_depth(depth: usize) -> Self {
+        let (sq_ring, sq_out, sq) = pair::<Sqe>(depth);
         let (cq_ring, cq, cq_in) = pair::<Cqe>(Cqe::DEPTH);
         Self {
             io: Io::new(sq_out, cq_in, Rc::new(Arena::new())),
@@ -48,8 +53,12 @@ impl Loopback {
         IoInit::new(self.io.arena())
     }
 
+    /// The records on the SQ, whose room the ring gives back on its next
+    /// read.
     pub fn submitted(&mut self) -> Vec<Sqe> {
-        self.sq.drain().map(Result::unwrap).collect()
+        let sqes = self.sq.drain().map(Result::unwrap).collect();
+        assert_eq!(self.sq.drain().count(), 0);
+        sqes
     }
 
     pub fn complete(&self, cqe: Cqe) {

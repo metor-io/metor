@@ -24,6 +24,13 @@ enum State {
     Orphan {
         opens: bool,
     },
+    /// Closing the handle an orphaned op opened, under the op's own token.
+    /// The close's completion frees it. A close the SQ refused is `sent`
+    /// on a later pump.
+    Closing {
+        handle: RawHandle,
+        sent: bool,
+    },
     Done {
         status: IoStatus,
         value: u32,
@@ -35,6 +42,8 @@ enum State {
 struct OpSlot {
     generation: u16,
     state: State,
+    /// A cancel the SQ refused, written again on a later pump.
+    cancel: bool,
 }
 
 struct Queue {
@@ -57,6 +66,7 @@ impl Io {
         let free = OpSlot {
             generation: 0,
             state: State::Free,
+            cancel: false,
         };
         Self(Rc::new(Queue {
             sq,
@@ -126,18 +136,49 @@ impl Io {
         self.0.ops[slot].set(OpSlot {
             generation,
             state: State::Waiting { opens },
+            cancel: false,
         });
         Stage::Queued(token)
     }
 
-    /// Records every completion on the CQ.
+    /// Writes again what the SQ refused, then records every completion on
+    /// the CQ.
     fn pump(&self) {
+        for (at, cell) in self.0.ops.iter().enumerate() {
+            let slot = cell.get();
+            let token = Token::new(at as u16, slot.generation);
+            cell.set(self.resend(token, slot));
+        }
         let Ok(mut cq) = self.0.cq.try_borrow_mut() else {
             return;
         };
         for cqe in cq.drain().flatten() {
             self.land(cqe);
         }
+    }
+
+    /// `slot` after writing its refused cancel or close, if the SQ takes it.
+    fn resend(&self, token: Token, mut slot: OpSlot) -> OpSlot {
+        let in_flight = matches!(slot.state, State::Waiting { .. } | State::Orphan { .. });
+        slot.cancel =
+            slot.cancel && in_flight && !self.write(token, RawHandle::new(0, 0), &Op::Cancel);
+        if let State::Closing {
+            handle,
+            sent: false,
+        } = slot.state
+        {
+            let sent = self.write(token, handle, &Op::Close);
+            slot.state = State::Closing { handle, sent };
+        }
+        slot
+    }
+
+    /// Writes an op that takes no buffer. False if the SQ is full.
+    fn write(&self, token: Token, handle: RawHandle, op: &Op) -> bool {
+        self.0
+            .sq
+            .write(&Sqe::new(token, handle, op, Span::default()))
+            .is_ok()
     }
 
     fn land(&self, cqe: Cqe) {
@@ -156,7 +197,7 @@ impl Io {
             },
             State::Orphan { opens: true } => self.close_orphan(cqe.token, cqe.result()),
             done @ State::Done { .. } => done,
-            State::Orphan { .. } | State::Free => State::Free,
+            State::Orphan { .. } | State::Closing { .. } | State::Free => State::Free,
         };
         cell.set(slot);
     }
@@ -166,11 +207,9 @@ impl Io {
         let Ok(raw) = opened else {
             return State::Free;
         };
-        let close = Sqe::new(token, RawHandle::from_raw(raw), &Op::Close, Span::default());
-        match self.0.sq.write(&close) {
-            Ok(()) => State::Orphan { opens: false },
-            Err(_) => State::Free,
-        }
+        let handle = RawHandle::from_raw(raw);
+        let sent = self.write(token, handle, &Op::Close);
+        State::Closing { handle, sent }
     }
 
     /// Takes a finished op's result, freeing its slot.
@@ -212,9 +251,17 @@ impl Io {
         cell.set(slot);
     }
 
+    /// Cancels an op in flight. A cancel the SQ refuses is written again on
+    /// a later pump.
     fn cancel(&self, token: Token) {
-        let cancel = Sqe::new(token, RawHandle::new(0, 0), &Op::Cancel, Span::default());
-        let _ = self.0.sq.write(&cancel);
+        let Some(cell) = self.0.ops.get(usize::from(token.slot())) else {
+            return;
+        };
+        let mut slot = cell.get();
+        if slot.generation == token.generation() {
+            slot.cancel = true;
+            cell.set(self.resend(token, slot));
+        }
     }
 
     /// Ops not yet taken, or orphaned and not yet landed.

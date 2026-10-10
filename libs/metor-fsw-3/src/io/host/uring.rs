@@ -15,8 +15,6 @@ use crate::io::{Errno, IoError, Op};
 
 /// Set in the `user_data` of a cancel, whose completion is dropped.
 const CANCEL: u64 = 1 << 40;
-/// Set in the `user_data` of an accept, whose result is a descriptor.
-const ACCEPT: u64 = 1 << 41;
 
 /// What the kernel reads for a `SendTo` after `push` returns.
 struct Msg {
@@ -30,6 +28,10 @@ pub struct UringOs {
     ring: IoUring,
     /// One per op table entry, for `SendTo`.
     msgs: Box<[Msg]>,
+    /// Whether each op table entry is an accept, whose result is a
+    /// descriptor. A cancel names the op by its id alone, so the kind is
+    /// kept here rather than in `user_data`.
+    accepts: Box<[bool]>,
     done: Vec<OsDone>,
 }
 
@@ -45,6 +47,7 @@ impl UringOs {
         Ok(Self {
             ring: IoUring::new(entries)?,
             msgs: (0..ops).map(|_| zeroed()).collect(),
+            accepts: vec![false; ops].into(),
             done: Vec::with_capacity(2 * ops),
         })
     }
@@ -54,7 +57,8 @@ impl UringOs {
         let buf = op.bytes();
         let (ptr, len) = (buf.cast::<u8>().as_ptr(), buf.len() as u32);
         let at = |offset: Option<u64>| offset.unwrap_or(u64::MAX);
-        let mut user_data = u64::from(op.id.get());
+        let accept = self.accepts.get_mut(usize::from(op.id.index()))?;
+        *accept = op.op == Op::Accept;
         let entry = match op.op {
             Op::Read { offset } => opcode::Read::new(fd, ptr, len).offset(at(offset)).build(),
             Op::Write { offset } => opcode::Write::new(fd, ptr, len).offset(at(offset)).build(),
@@ -79,7 +83,6 @@ impl UringOs {
                     .build()
             }
             Op::Accept => {
-                user_data |= ACCEPT;
                 let flags = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
                 let (addr, len) = (core::ptr::null_mut(), core::ptr::null_mut());
                 opcode::Accept::new(fd, addr, len).flags(flags).build()
@@ -87,7 +90,7 @@ impl UringOs {
             Op::Fsync => opcode::Fsync::new(fd).build(),
             _ => return None,
         };
-        Some(entry.user_data(user_data))
+        Some(entry.user_data(u64::from(op.id.get())))
     }
 
     /// Queues `entry`, submitting first if the queue is full. False if the
@@ -135,21 +138,20 @@ impl Os for UringOs {
             if data & CANCEL != 0 {
                 continue;
             }
+            let id = OpId::from_raw(data as u32);
+            let accept = self.accepts.get(usize::from(id.index())) == Some(&true);
             let res = cqe.result();
             let result = match res {
                 ..0 if res == -libc::ECANCELED => Err(IoError::Canceled),
                 ..0 => Err(IoError::Os(Errno::new(-res as u16))),
                 // SAFETY: an accept's result is a new descriptor, now owned here.
-                _ if data & ACCEPT != 0 => Ok(Out::Opened(
+                _ if accept => Ok(Out::Opened(
                     unsafe { OwnedFd::from_raw_fd(res) },
                     Class::Stream,
                 )),
                 _ => Ok(Out::Len(res as u32)),
             };
-            done.push(OsDone {
-                id: OpId::from_raw(data as u32),
-                result,
-            });
+            done.push(OsDone { id, result });
         }
     }
 

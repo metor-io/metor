@@ -229,6 +229,16 @@ pub fn cancel_waiting_recv(b: Backend) {
     assert_eq!(rig.wait(id).unwrap_err(), IoError::Canceled);
 }
 
+pub fn cancel_waiting_accept(b: Backend) {
+    let mut rig = Rig::new(b);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let id = rig.start(listener.as_raw_fd(), Class::Listener, Op::Accept, None);
+    assert!(rig.poll(id).is_none());
+    rig.os.cancel(id);
+    assert_eq!(rig.wait(id).unwrap_err(), IoError::Canceled);
+}
+
 pub fn close_cancels_waiting_ops(b: Backend) {
     let mut rig = Rig::new(b);
     let (a, _z) = pair();
@@ -302,6 +312,7 @@ pub fn run_all(b: Backend) {
     recv_parks_until_data(b);
     read_and_write_wait_on_one_descriptor(b);
     cancel_waiting_recv(b);
+    cancel_waiting_accept(b);
     close_cancels_waiting_ops(b);
     accept_gives_a_stream(b);
     open_under_a_dir(b);

@@ -5,6 +5,7 @@ use metor_proto::types::Timestamp;
 
 use super::allocations;
 use crate::io::arena::Arena;
+use crate::io::host::dispatch::Rejected;
 use crate::io::host::dispatch::Resource;
 use crate::io::host::{Backed, Class, Dispatch, OpId, OsDone, OsOp, Out, Route};
 use crate::io::status::ResourceStatus;
@@ -59,7 +60,7 @@ fn read(slot: u16, handle: RawHandle) -> Sqe {
 
 impl Rig {
     fn lower(&mut self, m: usize, sqe: Sqe) {
-        self.d.lower(m, sqe, &self.arenas[m]);
+        assert_eq!(self.d.lower(m, sqe, &self.arenas[m]), Ok(()));
     }
 
     fn routes(&mut self) -> Vec<Route> {
@@ -125,10 +126,6 @@ fn refusals_reply_without_running() {
             IoError::Stale,
         ),
         (sqe(0, TTY, Op::Recv, Span::new(60, 8)), IoError::BadBuf),
-        (
-            sqe(MAX_OPS as u16, TTY, Op::Fsync, Span::default()),
-            IoError::Refused,
-        ),
     ];
     for (sqe, e) in cases {
         r.lower(0, sqe);
@@ -145,15 +142,26 @@ fn refusals_reply_without_running() {
 }
 
 #[test]
-fn a_live_slot_is_not_reused() {
+fn a_token_that_is_not_a_free_slot_is_dropped_unanswered() {
     let mut r = rig();
     r.lower(0, read(1, TTY));
+    let _ = r.routes();
+    let reused = sqe(1, RawHandle::new(9, 0), Op::Fsync, Span::default());
+    let past = sqe(MAX_OPS as u16, TTY, Op::Fsync, Span::default());
+    for bad in [read(1, TTY), reused, past] {
+        assert_eq!(r.d.lower(0, bad, &r.arenas[0]), Err(Rejected));
+    }
+    assert!(r.routes().is_empty() && r.replies().is_empty());
+}
+
+#[test]
+fn teardown_waits_only_for_ops_on_descriptors() {
+    let mut r = rig();
+    r.lower(0, read(0, SIM));
+    let _ = r.routes();
+    assert!(!r.d.live(), "a model holds the op");
     r.lower(0, read(1, TTY));
-    assert_eq!(r.routes().len(), 1);
-    assert_eq!(
-        r.replies(),
-        [(0, Cqe::err(Token::new(1, 7), IoError::Refused))]
-    );
+    assert!(r.d.live());
 }
 
 #[test]

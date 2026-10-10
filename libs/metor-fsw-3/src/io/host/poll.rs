@@ -18,7 +18,8 @@ pub struct PollOs {
     poller: Poller,
     events: Events,
     parked: Vec<OsOp>,
-    /// Descriptors added to the poller.
+    /// Descriptors added to the poller: those with parked ops, so at most
+    /// one per op in flight.
     added: Vec<RawFd>,
     fired: Vec<RawFd>,
     done: Vec<OsDone>,
@@ -69,7 +70,19 @@ impl PollOs {
         if armed.is_err() {
             let e = sys::errno();
             self.finish_where(|p| p.fd == fd, e);
+            self.prune(fd);
         }
+    }
+
+    /// Takes `fd` out of the poller once no op is parked on it.
+    fn prune(&mut self, fd: RawFd) {
+        let parked = self.parked.iter().any(|p| p.fd == fd);
+        let Some(at) = self.added.iter().position(|&a| a == fd).filter(|_| !parked) else {
+            return;
+        };
+        self.added.swap_remove(at);
+        // SAFETY: as in `arm`.
+        let _ = self.poller.delete(unsafe { BorrowedFd::borrow_raw(fd) });
     }
 
     /// Completes every parked op `hit` picks with `e`.
@@ -92,6 +105,7 @@ impl PollOs {
                 self.attempt(op);
             }
         }
+        self.prune(fd);
     }
 }
 
@@ -105,7 +119,11 @@ impl Os for PollOs {
     }
 
     fn cancel(&mut self, id: OpId) {
+        let Some(fd) = self.parked.iter().find(|p| p.id == id).map(|p| p.fd) else {
+            return;
+        };
         self.finish_where(|p| p.id == id, IoError::Canceled);
+        self.prune(fd);
     }
 
     fn submit(&mut self) {
@@ -135,9 +153,6 @@ impl Os for PollOs {
     fn close(&mut self, fd: OwnedFd) {
         let raw = fd.as_raw_fd();
         self.finish_where(|p| p.fd == raw, IoError::Canceled);
-        if let Some(at) = self.added.iter().position(|&a| a == raw) {
-            self.added.swap_remove(at);
-            let _ = self.poller.delete(&fd);
-        }
+        self.prune(raw);
     }
 }

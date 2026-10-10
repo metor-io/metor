@@ -172,3 +172,58 @@ fn steady_state_allocates_nothing() {
     });
     assert_eq!(n, 0);
 }
+
+/// Submits flushes until the SQ refuses one.
+fn fill(uart: &Cap<Uart>) -> Vec<Pending<Tty>> {
+    let mut held = Vec::new();
+    loop {
+        let mut flush = uart.flush(TtyQueue::Both);
+        if flush.poll() == Some(Err(IoError::QueueFull)) {
+            return held;
+        }
+        held.push(flush);
+    }
+}
+
+#[test]
+fn cancel_the_full_sq_refuses_goes_out_later() {
+    let mut lb = Loopback::with_sq_depth(2);
+    drop(lb.init());
+    let uart = uart(&lb);
+    let first = uart.flush(TtyQueue::Input);
+    let _held = fill(&uart);
+    first.cancel();
+    let sent = lb.submitted();
+    assert!(
+        sent.iter().all(|s| s.op() != Ok(Op::Cancel)),
+        "the SQ was full"
+    );
+    lb.io.in_flight();
+    let [cancel] = lb.submitted()[..] else {
+        panic!()
+    };
+    assert_eq!((cancel.op(), cancel.token), (Ok(Op::Cancel), sent[0].token));
+    lb.io.in_flight();
+    assert!(lb.submitted().is_empty(), "sent once");
+}
+
+#[test]
+fn orphan_close_the_full_sq_refuses_goes_out_later() {
+    let mut lb = Loopback::with_sq_depth(2);
+    drop(lb.init());
+    let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    drop(listen.accept());
+    let accept = lb.submitted()[0];
+    let uart = uart(&lb);
+    let held = fill(&uart);
+    lb.complete(Cqe::ok(accept.token, RawHandle::new(5, 1).get()));
+    lb.io.in_flight();
+    assert_eq!(lb.submitted().len(), held.len(), "the close waits for room");
+    lb.io.in_flight();
+    let [close] = lb.submitted()[..] else {
+        panic!()
+    };
+    assert_eq!((close.op(), close.token), (Ok(Op::Close), accept.token));
+    lb.complete(Cqe::ok(close.token, 0));
+    assert_eq!(lb.io.in_flight(), held.len());
+}
