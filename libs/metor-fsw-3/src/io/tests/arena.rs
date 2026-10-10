@@ -77,10 +77,13 @@ fn no_arena_fails_any_allocation() {
 #[test]
 fn span_checks_bounds() {
     let arena = Arena::owning(vec![0; 16].into());
-    assert!(arena.span(Span::new(0, 16)).is_some());
-    assert!(arena.span(Span::new(8, 9)).is_none());
-    assert!(arena.span(Span::new(u32::MAX, 2)).is_none());
-    assert!(Arena::new().span(Span::new(0, 0)).is_none(), "not frozen");
+    assert!(arena.get_slice(Span::new(0, 16)).is_some());
+    assert!(arena.get_slice(Span::new(8, 9)).is_none());
+    assert!(arena.get_slice(Span::new(u32::MAX, 2)).is_none());
+    assert!(
+        Arena::new().get_slice(Span::new(0, 0)).is_none(),
+        "not frozen"
+    );
 }
 
 #[test]
@@ -94,6 +97,6 @@ fn owner_keeps_the_memory_alive() {
     // SAFETY: the lease keeps the bytes alive.
     let other = unsafe { Arena::over(base, len, crate::io::arena::Keep::Lease(lease)) };
     // SAFETY: the region is live and unshared.
-    let bytes = unsafe { other.span(Span::new(0, 4)).unwrap().as_ref() };
+    let bytes = unsafe { other.get_slice(Span::new(0, 4)).unwrap().as_ref() };
     assert_eq!(bytes, [7; 4]);
 }

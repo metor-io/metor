@@ -286,11 +286,11 @@ impl Step for SubmitStep {
                     Err(_) => corrupt = true,
                 }
             }
-            if dispatch.quiescing(*m) {
-                dispatch.drained(*m);
+            if dispatch.is_member_queisicing(*m) {
+                dispatch.member_drained(*m);
             }
         }
-        for route in dispatch.routes() {
+        for route in dispatch.drain_routes() {
             match route {
                 Route::Os(op) => os.push(op),
                 Route::Cancel(id) => os.cancel(id),
@@ -304,7 +304,7 @@ impl Step for SubmitStep {
         for route in self.refused.drain(..) {
             match route {
                 Route::Sim(_, sqe) if !matches!(sqe.op(), Ok(Op::Cancel)) => {
-                    dispatch.refuse(sqe.token, IoError::QueueFull);
+                    dispatch.refuse_sim_op(sqe.token, IoError::QueueFull);
                 }
                 cancel => dispatch.defer(cancel),
             }

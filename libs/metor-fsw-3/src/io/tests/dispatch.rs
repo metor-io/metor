@@ -58,7 +58,7 @@ fn read(slot: u16, handle: RawHandle) -> Sqe {
 
 impl Rig {
     fn routes(&mut self) -> Vec<Route> {
-        self.d.routes().collect()
+        self.d.drain_routes().collect()
     }
 
     fn replies(&mut self) -> Vec<(usize, Cqe)> {
@@ -159,9 +159,9 @@ fn closed_grant_is_stale_until_a_remake() {
     assert!(r.routes().is_empty(), "the resource stays open");
     r.d.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
     assert_eq!(r.replies()[0].1.result(), Err(IoError::Stale));
-    r.d.begin(0);
-    r.d.drained(0);
-    r.d.end(0);
+    r.d.quiesce_member(0);
+    r.d.member_drained(0);
+    r.d.end_queiscing_member(0);
     r.d.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
     assert_eq!(r.routes().len(), 1);
 }
@@ -238,26 +238,26 @@ fn quiesce_cancels_drops_and_waits() {
             other => panic!("{other:?}"),
         })
         .collect();
-    r.d.begin(0);
+    r.d.quiesce_member(0);
     assert_eq!(r.routes().len(), 2, "one cancel per op");
-    r.d.begin(0);
+    r.d.quiesce_member(0);
     assert!(r.routes().is_empty(), "never twice");
     r.d.lower(0, read(2, TTY));
     assert!(
         r.routes().is_empty() && r.replies().is_empty(),
         "new ops are dropped"
     );
-    assert!(!r.d.idle(0));
-    r.d.drained(0);
+    assert!(!r.d.member_idle(0));
+    r.d.member_drained(0);
     assert_eq!(r.done(ids[0], Err(IoError::Canceled)), None);
-    assert!(!r.d.idle(0));
+    assert!(!r.d.member_idle(0));
     assert_eq!(r.done(ids[1], Ok(Out::Opened(null(), Class::Stream))), None);
     assert!(
         matches!(r.routes()[..], [Route::Close(_)]),
         "nothing will close it"
     );
-    assert!(r.d.idle(0));
-    assert!(r.d.idle(1), "a member not quiescing is idle");
+    assert!(r.d.member_idle(0));
+    assert!(r.d.member_idle(1), "a member not quiescing is idle");
 }
 
 #[test]
@@ -266,9 +266,9 @@ fn drain_closes_derived_handles() {
     r.d.lower(0, sqe(0, TTY, Op::Accept, Span::default()));
     let op = r.only_os();
     r.done(op.id, Ok(Out::Opened(null(), Class::Stream)));
-    r.d.begin(0);
-    r.d.drained(0);
-    r.d.drained(0);
+    r.d.quiesce_member(0);
+    r.d.member_drained(0);
+    r.d.member_drained(0);
     assert!(matches!(r.routes()[..], [Route::Close(_)]));
 }
 
@@ -297,7 +297,7 @@ fn lowering_and_raising_allocate_nothing() {
     let n = allocations(|| {
         for _ in 0..8 {
             r.d.lower(0, read(0, TTY));
-            ids.extend(r.d.routes().map(|route| match route {
+            ids.extend(r.d.drain_routes().map(|route| match route {
                 Route::Os(op) => op.id,
                 _ => OpId::new(0, 0),
             }));

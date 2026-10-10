@@ -30,7 +30,7 @@ enum Mem {
     Fixed {
         base: NonNull<u8>,
         len: usize,
-        _keep: Keep,
+        keep: Keep,
     },
 }
 
@@ -53,11 +53,7 @@ impl Arena {
     /// The bytes stay alive and unmoved while `keep` lives, or for the
     /// arena's whole life when `keep` is `Unowned`.
     pub(crate) unsafe fn over(base: NonNull<u8>, len: usize, keep: Keep) -> Self {
-        Self::with(Mem::Fixed {
-            base,
-            len,
-            _keep: keep,
-        })
+        Self::with(Mem::Fixed { base, len, keep })
     }
 
     /// A frozen arena that owns `bytes`.
@@ -140,13 +136,13 @@ impl Arena {
     }
 
     /// Starts the next make at the arena's first byte.
-    fn rewind(&self) {
+    fn next_epoch(&self) {
         self.top.set(0);
         self.epoch.set(self.epoch.get().wrapping_add(1));
     }
 
     /// The memory `span` names, if the arena is frozen and holds all of it.
-    pub(crate) fn span(&self, span: Span) -> Option<NonNull<[u8]>> {
+    pub(crate) fn get_slice(&self, span: Span) -> Option<NonNull<[u8]>> {
         let (base, len) = self.region()?;
         let end = span.end()? as usize;
         if end > len {
@@ -160,7 +156,7 @@ impl Arena {
     /// An owner that keeps the frozen memory alive, to share it across the
     /// pack ABI. A lease passes on its own owner.
     pub(crate) fn owner(&self) -> Option<RawOwner> {
-        let Mem::Fixed { _keep: keep, .. } = self.mem() else {
+        let Mem::Fixed { keep, .. } = self.mem() else {
             return None;
         };
         match keep {
@@ -275,7 +271,7 @@ impl Buf {
     fn whole(&self) -> Option<NonNull<[u8]>> {
         let arena = self.arena.as_ref()?;
         (arena.epoch() == self.epoch)
-            .then(|| arena.span(self.span))
+            .then(|| arena.get_slice(self.span))
             .flatten()
     }
 }
@@ -327,7 +323,7 @@ pub struct IoInit<'a> {
 impl<'a> IoInit<'a> {
     /// Starts a make on `arena`, from its first byte.
     pub(crate) fn new(arena: &'a Rc<Arena>) -> Self {
-        arena.rewind();
+        arena.next_epoch();
         Self {
             arena: Some(arena),
             short: Cell::new(0),

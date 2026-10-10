@@ -144,10 +144,10 @@ impl Drop for Host {
     /// any op is still in flight, so the kernel never writes freed memory.
     fn drop(&mut self) {
         let Self { dispatch, os } = self;
-        dispatch.begin_all();
+        dispatch.quiesce_all();
         let mut done = Vec::new();
         for _ in 0..TEARDOWN_ROUNDS {
-            for route in dispatch.routes() {
+            for route in dispatch.drain_routes() {
                 match route {
                     Route::Cancel(id) => os.cancel(id),
                     Route::Close(fd) => os.close(fd),

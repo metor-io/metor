@@ -195,7 +195,7 @@ impl TestDevice {
             DRIVER_BUF_LEN as u32,
         );
         // PANIC Safety: the arena holds `MAX_OPS` buffers and `slot` is below that.
-        let bytes = self.arena.span(span).expect("a slot's buffer");
+        let bytes = self.arena.get_slice(span).expect("a slot's buffer");
         // SAFETY: the test holds `&mut self`, and a model only touches a
         // buffer while `serve` runs.
         unsafe { &mut *bytes.as_ptr() }

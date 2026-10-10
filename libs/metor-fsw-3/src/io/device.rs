@@ -116,7 +116,7 @@ impl Arenas {
     /// The bytes request `sqe` lends, in its driver's arena.
     fn bytes(&self, sqe: &Sqe) -> Option<core::ptr::NonNull<[u8]>> {
         let member = usize::from(sqe.token.slot()) / MAX_OPS;
-        self.0.try_borrow().ok()?.get(member)?.span(sqe.buf)
+        self.0.try_borrow().ok()?.get(member)?.get_slice(sqe.buf)
     }
 }
 

@@ -66,6 +66,28 @@ struct Member {
     drained: bool,
 }
 
+impl Member {
+    pub fn new(arena: Rc<Arena>, grants: Vec<u16>) -> Member {
+        let grant = |&res: &u16| Handle {
+            generation: 0,
+            res,
+            open: Open::Grant,
+        };
+        let free = (0..MAX_OPS).map(|_| Handle {
+            generation: 0,
+            res: 0,
+            open: Open::Closed,
+        });
+        Member {
+            arena,
+            handles: grants.iter().map(grant).chain(free).collect(),
+            grants: grants.len(),
+            quiescing: false,
+            drained: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Entry {
     generation: u16,
@@ -115,7 +137,10 @@ impl Dispatch {
         };
         let count = resources.len();
         Ok(Self {
-            members: members.into_iter().map(member).collect(),
+            members: members
+                .into_iter()
+                .map(|(arena, grants)| Member::new(arena, grants))
+                .collect(),
             ops: vec![idle; ops].into(),
             resources: resources.into(),
             counters: vec![Counters::default(); count].into(),
@@ -149,7 +174,12 @@ impl Dispatch {
             return Ok(());
         }
         let buf = match op.fills() || op.drains() {
-            true => Some(self.members[m].arena.span(sqe.buf).ok_or(IoError::BadBuf)?),
+            true => Some(
+                self.members[m]
+                    .arena
+                    .get_slice(sqe.buf)
+                    .ok_or(IoError::BadBuf)?,
+            ),
             false => None,
         };
         let index = index(m, sqe.token.slot()).ok_or(IoError::Refused)?;
@@ -254,7 +284,7 @@ impl Dispatch {
         if self.members[m].quiescing {
             return None;
         }
-        count(
+        count_cqe(
             &mut self.counters[usize::from(entry.res)],
             entry.kind,
             &result,
@@ -295,7 +325,7 @@ impl Dispatch {
 
     /// Starts quiescing member `m`: drops its new ops and cancels those in
     /// flight.
-    pub(crate) fn begin(&mut self, m: usize) {
+    pub(crate) fn quiesce_member(&mut self, m: usize) {
         let member = &mut self.members[m];
         member.quiescing = true;
         member.drained = false;
@@ -307,7 +337,7 @@ impl Dispatch {
 
     /// Notes that a quiescing member's queue is drained. The first time,
     /// closes its derived handles and revives its grants for the next make.
-    pub(crate) fn drained(&mut self, m: usize) {
+    pub(crate) fn member_drained(&mut self, m: usize) {
         let member = &mut self.members[m];
         if !member.quiescing || core::mem::replace(&mut member.drained, true) {
             return;
@@ -324,28 +354,28 @@ impl Dispatch {
         }
     }
 
-    pub(crate) fn quiescing(&self, m: usize) -> bool {
+    pub(crate) fn is_member_queisicing(&self, m: usize) -> bool {
         self.members[m].quiescing
     }
 
     /// Whether member `m` has nothing left in flight since `begin`.
-    pub(crate) fn idle(&self, m: usize) -> bool {
+    pub(crate) fn member_idle(&self, m: usize) -> bool {
         let member = &self.members[m];
         let ops = &self.ops[m * MAX_OPS..(m + 1) * MAX_OPS];
         !member.quiescing || (member.drained && ops.iter().all(|e| !e.live))
     }
 
-    pub(crate) fn end(&mut self, m: usize) {
+    pub(crate) fn end_queiscing_member(&mut self, m: usize) {
         self.members[m].quiescing = false;
     }
 
     /// The routes queued since the last call.
-    pub(crate) fn routes(&mut self) -> std::vec::Drain<'_, Route> {
+    pub(crate) fn drain_routes(&mut self) -> std::vec::Drain<'_, Route> {
         self.routes.drain(..)
     }
 
     /// Fails sim op `token`, which never reached its model.
-    pub(crate) fn refuse(&mut self, token: Token, e: IoError) {
+    pub(crate) fn refuse_sim_op(&mut self, token: Token, e: IoError) {
         let id = OpId::new(token.slot(), token.generation());
         let result = Err(e);
         if let Some(reply) = self.raise(OsDone { id, result }) {
@@ -354,8 +384,8 @@ impl Dispatch {
     }
 
     /// Starts quiescing every member, for teardown.
-    pub(crate) fn begin_all(&mut self) {
-        (0..self.members.len()).for_each(|m| self.begin(m));
+    pub(crate) fn quiesce_all(&mut self) {
+        (0..self.members.len()).for_each(|m| self.quiesce_member(m));
     }
 
     /// Whether any op is in flight.
@@ -408,30 +438,10 @@ fn index(m: usize, slot: u16) -> Option<usize> {
     (slot < MAX_OPS).then_some(m * MAX_OPS + slot)
 }
 
-fn member((arena, grants): (Rc<Arena>, Vec<u16>)) -> Member {
-    let grant = |&res: &u16| Handle {
-        generation: 0,
-        res,
-        open: Open::Grant,
-    };
-    let free = (0..MAX_OPS).map(|_| Handle {
-        generation: 0,
-        res: 0,
-        open: Open::Closed,
-    });
-    Member {
-        arena,
-        handles: grants.iter().map(grant).chain(free).collect(),
-        grants: grants.len(),
-        quiescing: false,
-        drained: false,
-    }
-}
-
 /// Counts one finished op: its result, and the bytes it moved.
-fn count(counters: &mut Counters, kind: OpKind, result: &Result<u32, IoError>) {
+fn count_cqe(counters: &mut Counters, kind: OpKind, result: &Result<u32, IoError>) {
     counters.completed += 1;
-    let moved = match result {
+    let byte_count = match result {
         Ok(n) => u64::from(*n),
         Err(_) => {
             counters.failed += 1;
@@ -439,8 +449,8 @@ fn count(counters: &mut Counters, kind: OpKind, result: &Result<u32, IoError>) {
         }
     };
     match kind {
-        OpKind::Read | OpKind::Recv => counters.bytes_in += moved,
-        OpKind::Write | OpKind::Send | OpKind::SendTo => counters.bytes_out += moved,
+        OpKind::Read | OpKind::Recv => counters.bytes_in += byte_count,
+        OpKind::Write | OpKind::Send | OpKind::SendTo => counters.bytes_out += byte_count,
         _ => {}
     }
 }

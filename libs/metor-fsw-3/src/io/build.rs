@@ -82,13 +82,13 @@ impl IoBuild {
 
     /// Starts quiescing system `id`: cancels its ops in flight. False if it
     /// has no IO.
-    pub(crate) fn begin(&mut self, id: &str) -> bool {
+    pub(crate) fn quiesce_system(&mut self, id: &str) -> bool {
         let Some(m) = self.index(id) else {
             return false;
         };
         #[cfg(all(feature = "host", unix))]
         if let Some(host) = &mut self.host {
-            host.dispatch.begin(m);
+            host.dispatch.quiesce_member(m);
         }
         let _ = m;
         true
@@ -96,19 +96,19 @@ impl IoBuild {
 
     /// Whether system `id` has nothing left in flight. Always true before
     /// `io_submit` is made.
-    pub(crate) fn idle(&self, id: &str) -> bool {
+    pub(crate) fn is_system_idle(&self, id: &str) -> bool {
         #[cfg(all(feature = "host", unix))]
         if let (Some(host), Some(m)) = (&self.host, self.index(id)) {
-            return host.dispatch.idle(m);
+            return host.dispatch.member_idle(m);
         }
         let _ = id;
         true
     }
 
-    pub(crate) fn end(&mut self, id: &str) {
+    pub(crate) fn end_queiscing_system(&mut self, id: &str) {
         #[cfg(all(feature = "host", unix))]
         if let (Some(m), Some(host)) = (self.index(id), &mut self.host) {
-            host.dispatch.end(m);
+            host.dispatch.end_queiscing_member(m);
         }
         let _ = id;
     }
