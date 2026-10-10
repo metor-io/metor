@@ -90,6 +90,8 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
         inputs,
         outputs: outputs.into_iter().cloned().collect(),
         io: cx.io.clone(),
+        seed: cx.seed,
+        namespace: cx.namespace.to_string(),
     };
     let mut threads = Threads::new();
     let inner = recipe.make(&mut threads)?;
@@ -157,6 +159,8 @@ struct SystemRecipe {
     inputs: Vec<Vec<RingBuffer>>,
     outputs: Vec<RingBuffer>,
     io: SharedIo,
+    seed: Option<u64>,
+    namespace: String,
 }
 
 impl SystemRecipe {
@@ -174,6 +178,8 @@ impl SystemRecipe {
             outputs: self.outputs.iter().collect(),
             threads,
             io: &self.io,
+            seed: self.seed,
+            namespace: &self.namespace,
         })
     }
 }

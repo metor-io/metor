@@ -51,6 +51,8 @@ mod tests {
             outputs: vec![&nav, &log],
             threads: &mut Threads::new(),
             io: &crate::io::SharedIo::default(),
+            seed: Some(0),
+            namespace: "",
         });
         assert_eq!(
             refused.err(),

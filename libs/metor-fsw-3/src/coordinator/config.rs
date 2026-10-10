@@ -29,6 +29,13 @@ pub struct CoordinatorConfig {
     /// The resources systems are granted, by id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<ResourceConfig>,
+    /// The seed every `Rng` parameter draws from.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seed: u64,
+}
+
+fn is_zero(seed: &u64) -> bool {
+    *seed == 0
 }
 
 impl Default for CoordinatorConfig {
@@ -39,6 +46,7 @@ impl Default for CoordinatorConfig {
             namespace: None,
             systems: Vec::new(),
             resources: Vec::new(),
+            seed: 0,
         }
     }
 }

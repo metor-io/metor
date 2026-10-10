@@ -13,7 +13,7 @@ use crate::channel::{ABORT_PORT, Abort, AbortRequest};
 use crate::def::{DefCx, DefError};
 use crate::frame::Frame;
 use crate::io::device::{DeviceSide, Erased};
-use crate::io::{Cqe, End, GrantDef, IO_CQ, IO_SQ, Io, Sqe};
+use crate::io::{Cqe, End, GrantDef, IO_CQ, IO_SQ, Io, Rng, Sqe};
 use crate::log::Log;
 use crate::port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers};
 use crate::record::Record;
@@ -75,6 +75,8 @@ pub struct Writers {
     pub(crate) dropped: Arc<AtomicU32>,
     pub(crate) io: Option<Io>,
     pub(crate) devices: VecDeque<DeviceSide<Erased>>,
+    /// The instance's stream, for an `Rng` parameter.
+    pub(crate) rng: Option<Rng>,
 }
 /// The parameter names that [`Param::append_defs`] reads from.
 pub type ParamNames<'n> = core::slice::Iter<'n, &'static str>;
@@ -94,6 +96,8 @@ pub struct Defs {
     pub(crate) io: bool,
     /// The `Cap` and `DeviceSide` parameters, in order.
     pub(crate) grants: Vec<GrantDef>,
+    /// Whether any parameter is an `Rng`.
+    pub(crate) rng: bool,
 }
 
 impl Defs {
@@ -341,6 +345,40 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
         _cx: &mut Cycle<'a>,
     ) -> Self::Item<'a, W> {
         input
+    }
+}
+
+/// An `Rng` draws from the target seed and the instance name. It takes no
+/// port.
+impl Param for Rng {
+    type In<W: WakeSink + Clone + 'static> = ();
+    type Out = Rng;
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Rng;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        param_name(names);
+        defs.rng = true;
+        Ok(())
+    }
+
+    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+
+    fn bind_out(writers: &mut Writers) -> Rng {
+        // PANIC Safety: `fn_system::bind` refuses a set with an `Rng` and no
+        // seed, and every other bind path refuses an `Rng` at its definition.
+        writers.rng.clone().expect("a seeded stream")
+    }
+
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        _input: &'a mut (),
+        output: &'a mut Rng,
+        _cx: &mut Cycle<'a>,
+    ) -> &'a mut Rng {
+        output
     }
 }
 

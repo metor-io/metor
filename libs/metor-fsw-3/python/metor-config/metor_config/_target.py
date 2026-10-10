@@ -56,7 +56,8 @@ class Target:
     cycle. With ``sim_dt`` (in seconds), the target runs on a simulated clock
     that advances that much each cycle. Without it, the target runs in real
     time at ``cycle_rate`` Hz. ``namespace`` is prefixed to the names the
-    target announces to its peers.
+    target announces to its peers. ``seed`` is the seed every `Rng` parameter
+    draws from.
     """
 
     def __init__(
@@ -65,7 +66,11 @@ class Target:
         sim_dt: float | None = None,
         ring_depth: int = 8,
         namespace: str | None = None,
+        seed: int = 0,
     ) -> None:
+        if not 0 <= seed < 2**64:
+            raise ConfigError(f"`seed` is an unsigned 64-bit integer, got {seed}")
+        self.seed = seed
         self.cycle_rate = float(cycle_rate)
         self.sim_dt = sim_dt
         self.ring_depth = ring_depth
@@ -248,6 +253,8 @@ class Target:
             "namespace": self.namespace,
             "systems": self._steps(),
         }
+        if self.seed:
+            coordinator["seed"] = self.seed
         if self._resources:
             coordinator["resources"] = [r.to_json() for r in self._resources.values()]
         return {

@@ -31,6 +31,7 @@ pub(crate) mod queue;
 #[cfg(all(feature = "host", unix))]
 mod reactor;
 mod record;
+mod rng;
 pub(crate) mod shared;
 mod sim;
 mod slot;
@@ -67,6 +68,7 @@ pub use poll::PollOs;
 pub use queue::Io;
 #[cfg(all(feature = "host", unix))]
 pub use reactor::{Limits, Reactor, SourceId};
+pub use rng::Rng;
 pub use shared::{IoShared, SharedIo};
 pub use sim::{GpioModel, Model, Reply, UartModel, fills, serve_gpio, serve_uart};
 pub use slot::{Buf, IoInit, Slot};

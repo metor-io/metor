@@ -39,6 +39,10 @@ pub struct MakeCx<'a> {
     pub threads: &'a mut Threads,
     /// What the build's IO systems and io steps share.
     pub io: &'a SharedIo,
+    /// The target seed. A guest's make has none.
+    pub seed: Option<u64>,
+    /// The target's namespace, or empty.
+    pub namespace: &'a str,
 }
 
 impl MakeCx<'_> {
@@ -341,8 +345,9 @@ fn fn_entry<S: SystemFn, M, C: Ctor<S::State, M> + 'static>(
         schema: C::schema(),
         make: Arc::new(move |cx| {
             refuse_thread(cx.adapter)?;
+            let instance = fn_system::Instance::of(&cx);
             let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
-            let (inputs, outputs, io) = fn_system::bind::<S>(views, writers, cx.io, cx.id)?;
+            let (inputs, outputs, io) = fn_system::bind::<S>(views, writers, instance)?;
             let state = fn_system::make_state(&ctor, cx.id, cx.params, io.as_ref())?;
             Ok(Box::new(Runner {
                 system: FnSystem::default(),
@@ -824,6 +829,8 @@ mod tests {
             outputs: Vec::new(),
             threads: &mut threads,
             io: &crate::io::SharedIo::default(),
+            seed: Some(0),
+            namespace: "",
         })
         .expect("no params");
         let started = std::time::Instant::now();

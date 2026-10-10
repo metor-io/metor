@@ -459,6 +459,8 @@ fn failed_make_frees_its_ring_slots() {
             outputs: outputs.iter().collect(),
             threads: &mut crate::thread::Threads::new(),
             io: &crate::io::SharedIo::default(),
+            seed: Some(0),
+            namespace: "",
         })
     };
     made.0.borrow_mut().fail_next = true;
@@ -483,7 +485,13 @@ fn bound<S: SystemFn>(
     let (ins, outs) = rings.split_at(def.inputs.len());
     let inputs = ins.iter().map(|r| vec![r]).collect();
     let (views, writers) = crate::coordinator::bindings(&def, inputs, outs.iter().collect());
-    let (_ins, outs, io) = crate::fn_system::bind::<S>(views, writers, io, id).unwrap();
+    let instance = crate::fn_system::Instance {
+        io,
+        id,
+        namespace: "",
+        seed: Some(0),
+    };
+    let (_ins, outs, io) = crate::fn_system::bind::<S>(views, writers, instance).unwrap();
     (outs, io, rings)
 }
 

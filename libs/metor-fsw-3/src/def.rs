@@ -95,6 +95,9 @@ pub enum DefError {
     )]
     IoOnAsync { system: String },
 
+    #[error("async system `{system}` takes an `Rng`, which only a stepped system takes")]
+    RngOnAsync { system: String },
+
     #[error(
         "`{system}` takes a `Cap` or `DeviceSide`; register it with `register` or `register_sequence`"
     )]

@@ -13,7 +13,7 @@ use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::io::device::DeviceSide;
 use crate::io::queue::{Io, Table};
-use crate::io::{End, SharedIo, Sqe, Tables};
+use crate::io::{End, Rng, SharedIo, Sqe, Tables};
 use crate::log::LogPort;
 use crate::port::{Input, Output, Samplers};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
@@ -101,6 +101,37 @@ impl<S: Ports> SystemOutputs for OutSet<S> {
 /// A fn system's bound ports, and its queue if it has one.
 pub(crate) type Bound<S> = (InSet<S>, OutSet<S>, Option<Io>);
 
+/// The system instance a fn system binds for.
+#[derive(Clone, Copy)]
+pub(crate) struct Instance<'a> {
+    pub(crate) io: &'a SharedIo,
+    pub(crate) id: &'a str,
+    pub(crate) namespace: &'a str,
+    /// The target seed. A guest's make has none.
+    pub(crate) seed: Option<u64>,
+}
+
+impl<'a> Instance<'a> {
+    pub(crate) fn of(cx: &crate::coordinator::MakeCx<'a>) -> Self {
+        Self {
+            io: cx.io,
+            id: cx.id,
+            namespace: cx.namespace,
+            seed: cx.seed,
+        }
+    }
+
+    /// The stream an `Rng` parameter draws, named `{namespace}.{id}`.
+    fn rng(&self) -> Result<Rng, ParamError> {
+        let system = self.id.to_string();
+        let seed = self.seed.ok_or(ParamError::GuestRng { system })?;
+        Ok(match self.namespace {
+            "" => Rng::seeded(seed, self.id),
+            ns => Rng::seeded(seed, &format!("{ns}.{}", self.id)),
+        })
+    }
+}
+
 /// Binds a fn system's ports, including its queue pair and device ends.
 ///
 /// The IO ports come after the parameters' own (see `Defs::append_io`).
@@ -109,10 +140,11 @@ pub(crate) type Bound<S> = (InSet<S>, OutSet<S>, Option<Io>);
 pub(crate) fn bind<S: Ports>(
     mut inputs: Vec<InputBinding>,
     mut outputs: Vec<OutputBinding>,
-    io: &SharedIo,
-    id: &str,
+    instance: Instance<'_>,
 ) -> Result<Bound<S>, ParamError> {
+    let Instance { io, id, .. } = instance;
     let defs = Defs::declared::<S>();
+    let rng = defs.rng.then(|| instance.rng()).transpose()?;
     let caps = || {
         defs.grants
             .iter()
@@ -143,6 +175,7 @@ pub(crate) fn bind<S: Ports>(
     let mut writers = writers(outputs, defs.outputs.len() - io_ports + 1, dropped);
     writers.io = io.clone();
     writers.devices = devices;
+    writers.rng = rng;
     Ok((ins, bind_outputs::<S>(writers), io))
 }
 
@@ -176,6 +209,7 @@ fn writers(outputs: Vec<OutputBinding>, declared: usize, dropped: Arc<AtomicU32>
         dropped,
         io: None,
         devices: VecDeque::new(),
+        rng: None,
     }
 }
 

@@ -26,7 +26,7 @@ pub use ctor::{Ctor, WithIo};
 pub use param::{Cycle, Param, ParamNames, Views, Writers};
 pub(crate) use param::{Defs, param_name};
 pub use set::{InSet, LOG_PORT, OutSet};
-pub(crate) use set::{bind, report_dropped};
+pub(crate) use set::{Instance, bind, report_dropped};
 
 /// Describes the parameters of a system written as a fn.
 pub trait Ports: Sized + 'static {
@@ -99,6 +99,9 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
         }
         if !defs.grants.is_empty() {
             return Err(DefError::IoOnAsync { system });
+        }
+        if defs.rng {
+            return Err(DefError::RngOnAsync { system });
         }
         SystemDef::new::<InSet<S, Notifier>, OutSet<S>, _>(S::NAME, cx)
     }

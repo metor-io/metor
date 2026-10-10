@@ -165,13 +165,13 @@ pub(crate) fn entry<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
         schema: C::schema(),
         make: std::sync::Arc::new(move |cx| {
             refuse_thread(cx.adapter)?;
+            let instance = crate::fn_system::Instance::of(&cx);
             let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
             let mut views = views.into_iter();
             // PANIC Safety: `def` declares `abort` first, and build binds one
             // list per declared input.
             let abort = Input::new(views.next().expect("the abort binding").views);
-            let (ins, outs, io) =
-                crate::fn_system::bind::<S>(views.collect(), writers, cx.io, cx.id)?;
+            let (ins, outs, io) = crate::fn_system::bind::<S>(views.collect(), writers, instance)?;
             let state = crate::fn_system::make_state(&ctor, cx.id, cx.params, io.as_ref())?;
             Ok(Box::new(SequenceStep::new::<S>(state, abort, ins, outs)))
         }),

@@ -91,7 +91,11 @@ impl CoordinatorConfig {
         let io = SharedIo::default();
         io.borrow_mut().resources = self.resources.clone();
         io.borrow_mut().grants = granted(&self.systems);
-        let entries = bind_rings(&plan, &rings, &mut threads, &io)?;
+        let target = Target {
+            seed: Some(self.seed),
+            namespace: self.namespace.as_deref().unwrap_or_default(),
+        };
+        let entries = bind_rings(&plan, &rings, &mut threads, &io, target)?;
 
         Ok(Coordinator {
             entries,
@@ -703,11 +707,19 @@ fn allocate_ring(spec: &RingSpec, ring_depth: usize) -> Result<RingBuffer, Build
     Ok(RingBuffer::create_in_memory(config))
 }
 
+/// What every system of one target shares at make.
+#[derive(Clone, Copy)]
+struct Target<'a> {
+    seed: Option<u64>,
+    namespace: &'a str,
+}
+
 fn bind_rings(
     plan: &Plan<'_>,
     rings: &[RingBuffer],
     threads: &mut Threads,
     io: &SharedIo,
+    target: Target<'_>,
 ) -> Result<Vec<Entry>, BuildError> {
     let mut entries = Vec::with_capacity(plan.systems.len());
     for system in &plan.systems {
@@ -728,6 +740,8 @@ fn bind_rings(
             outputs,
             threads,
             io,
+            seed: target.seed,
+            namespace: target.namespace,
         };
         let step = match system.adapter {
             Some(Adapter::Channel(_)) => crate::channel::make(&system.entry.make, cx),

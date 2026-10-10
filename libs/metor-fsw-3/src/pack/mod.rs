@@ -307,6 +307,8 @@ unsafe fn make(
                 outputs: writers,
                 threads,
                 io: &io,
+                seed: None,
+                namespace: "",
             })
         })
     })
