@@ -25,6 +25,8 @@ struct Entry {
     token: Token,
     /// `cancel_all` already sent a cancel for this op.
     canceling: bool,
+    /// The resource whose model answers the op, for a sim op.
+    route: Option<u16>,
 }
 
 /// Allocates reactor tokens. System ops draw from one slab and the reactor's
@@ -49,11 +51,11 @@ impl Tokens {
 
     fn map(&mut self, src: SourceId, token: Token) -> Option<Token> {
         let rt = self.free.pop()?;
-        let canceling = false;
         self.ops[rt as usize] = Some(Entry {
             src,
             token,
-            canceling,
+            canceling: false,
+            route: None,
         });
         Some(Token::new(rt))
     }
@@ -69,20 +71,32 @@ impl Tokens {
         self.ops.iter().position(hit).map(|i| i as u32)
     }
 
-    /// Marks `src`'s op `rt` as canceling. False if it is not `src`'s or
-    /// already canceling.
-    fn mark_canceling(&mut self, src: SourceId, rt: u32) -> bool {
+    fn route(&mut self, rt: u32, route: u16) {
+        if let Some(Some(e)) = self.ops.get_mut(rt as usize) {
+            e.route = Some(route);
+        }
+    }
+
+    /// Marks `src`'s op `rt` as canceling, returning its entry. `None` if it
+    /// is not `src`'s or already canceling.
+    fn mark_canceling(&mut self, src: SourceId, rt: u32) -> Option<Entry> {
         match self.ops.get_mut(rt as usize) {
             Some(Some(e)) if e.src == src && !e.canceling => {
                 e.canceling = true;
-                true
+                Some(*e)
             }
-            _ => false,
+            _ => None,
         }
     }
 
     fn live(&self, src: SourceId) -> usize {
         self.ops.iter().flatten().filter(|e| e.src == src).count()
+    }
+
+    /// `src`'s ops in flight in the `Os`, not with a model.
+    fn live_real(&self, src: SourceId) -> usize {
+        let real = |e: &&Entry| e.src == src && e.route.is_none();
+        self.ops.iter().flatten().filter(real).count()
     }
 
     fn take_own(&mut self) -> Option<Token> {
@@ -110,6 +124,10 @@ impl Tokens {
 ///
 /// The reactor swaps each op's token for a reactor-wide one on submit and
 /// swaps it back on completion. It also fills in each `BufRef`'s table.
+///
+/// A sim op takes a token the same way but goes to a model instead of the
+/// `Os`: the caller writes it to the model's device end and passes the reply
+/// back through `raise`.
 pub struct Reactor {
     os: Box<dyn Os>,
     tokens: Tokens,
@@ -117,6 +135,8 @@ pub struct Reactor {
     queued: Vec<Sqe>,
     refused: Vec<(SourceId, Cqe)>,
     raw: Vec<Cqe>,
+    /// Cancels for sim ops, with the resource whose model takes each.
+    sim_cancels: Vec<(u16, Sqe)>,
 }
 
 impl Reactor {
@@ -129,6 +149,7 @@ impl Reactor {
             queued: Vec::with_capacity(all),
             refused: Vec::with_capacity(limits.ops),
             raw: Vec::with_capacity(all),
+            sim_cancels: Vec::with_capacity(2 * limits.ops),
         }
     }
 
@@ -167,6 +188,45 @@ impl Reactor {
         Ok(sqe)
     }
 
+    /// Lowers a sim op for the model of resource `route`. A refused op
+    /// completes with an error on the next `reap`.
+    pub fn lower_routed(&mut self, src: SourceId, route: u16, sqe: Sqe) -> Option<Sqe> {
+        match self.lower(src, sqe) {
+            Ok(lowered) => {
+                self.tokens.route(lowered.token.get(), route);
+                Some(lowered)
+            }
+            Err(e) => {
+                self.refused.push((src, Cqe::err(sqe.token, e)));
+                None
+            }
+        }
+    }
+
+    /// Fails a lowered sim op that never reached its model. It completes with
+    /// `e` on the next `reap`.
+    pub fn unroute(&mut self, sqe: Sqe, e: IoError) {
+        if let Some(done) = raise(&mut self.tokens, Cqe::err(sqe.token, e)) {
+            self.refused.push(done);
+        }
+    }
+
+    /// Restores a model reply's source token. `None` for an unknown or
+    /// reactor-own token.
+    pub fn raise(&mut self, cqe: Cqe) -> Option<(SourceId, Cqe)> {
+        raise(&mut self.tokens, cqe)
+    }
+
+    /// Moves the cancels `cancel_all` queued for sim ops into `out`.
+    pub fn sim_cancels(&mut self, out: &mut Vec<(u16, Sqe)>) {
+        out.append(&mut self.sim_cancels);
+    }
+
+    /// Queues a sim cancel again, after its model's port refused it.
+    pub fn requeue_sim_cancel(&mut self, route: u16, sqe: Sqe) {
+        self.sim_cancels.push((route, sqe));
+    }
+
     /// Submits the queued ops to the `Os`.
     pub fn submit(&mut self) {
         for sqe in self.queued.drain(..) {
@@ -187,27 +247,45 @@ impl Reactor {
     }
 
     /// Cancels every op `src` has in flight, once each. `reap` still returns
-    /// their completions.
+    /// their completions. A sim op's cancel goes to `sim_cancels`, and its
+    /// model's reply returns the completion.
     pub fn cancel_all(&mut self, src: SourceId) {
         for rt in 0..self.tokens.ops.len() as u32 {
-            if self.tokens.mark_canceling(src, rt) {
-                self.push_own(Sqe::new(
-                    Token::new(0),
-                    RawHandle::new(0, 0),
-                    Op::cancel(Token::new(rt)),
-                ));
+            let Some(entry) = self.tokens.mark_canceling(src, rt) else {
+                continue;
+            };
+            let cancel = Sqe::new(
+                Token::new(0),
+                RawHandle::new(0, 0),
+                Op::cancel(Token::new(rt)),
+            );
+            match entry.route {
+                Some(route) => self.push_own_sim(route, cancel),
+                None => self.push_own(cancel),
             }
         }
     }
 
     /// Queues an op on the reactor's own behalf. `reap` discards its completion.
     pub fn push_own(&mut self, mut sqe: Sqe) {
+        if self.own_token(&mut sqe) {
+            self.queued.push(sqe);
+        }
+    }
+
+    fn push_own_sim(&mut self, route: u16, mut sqe: Sqe) {
+        if self.own_token(&mut sqe) {
+            self.sim_cancels.push((route, sqe));
+        }
+    }
+
+    fn own_token(&mut self, sqe: &mut Sqe) -> bool {
         let Some(token) = self.tokens.take_own() else {
             tracing::error!(op = ?sqe.op.kind(), "reactor-own tokens exhausted");
-            return;
+            return false;
         };
         sqe.token = token;
-        self.queued.push(sqe);
+        true
     }
 
     /// The number of `src`'s ops that `reap` has not returned yet.
@@ -248,7 +326,7 @@ impl Drop for Reactor {
             done.clear();
         }
         for (i, table) in self.sources.iter().enumerate() {
-            if self.tokens.live(SourceId(i as u16)) > 0 {
+            if self.tokens.live_real(SourceId(i as u16)) > 0 {
                 core::mem::forget(table.clone());
             }
         }

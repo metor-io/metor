@@ -6,6 +6,10 @@
 //! the kernel. `io_complete` runs later in the cycle: it reaps what has
 //! landed and writes each completion to its member's CQ, which the system
 //! reads through a loop edge on the next cycle. It also writes `io_status`.
+//!
+//! An op on a sim resource skips the `Os`. `io_submit` writes it to the
+//! resource's `{resource}.req` output, which its model reads, and
+//! `io_complete` reads the model's replies on `{resource}.rep`.
 
 use core::sync::atomic::AtomicU32;
 use std::borrow::Cow;
@@ -22,7 +26,7 @@ use crate::def::{DefCx, DefError};
 use crate::fn_system::{LOG_PORT, report_dropped};
 use crate::log::LogPort;
 use crate::port::{Input, Output, dyn_input_defs, dyn_output_defs};
-use crate::system::{OutputBinding, SystemDef};
+use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef};
 
 use super::Token;
 use super::handles::Handles;
@@ -63,6 +67,8 @@ pub(crate) struct HostMember {
 pub(crate) struct IoHost {
     pub(crate) reactor: Reactor,
     members: Box<[HostMember]>,
+    /// Whether each resource is simulated.
+    sim: Box<[bool]>,
     counters: Box<[Counters]>,
     reported: Box<[Counters]>,
     names: Box<[metor_component::FrameStr<64>]>,
@@ -100,17 +106,21 @@ pub(crate) fn complete_entry() -> TableEntry {
     }
 }
 
-/// One input per member, named after it, then `log`.
+/// One input per member, named after it; `log`, then one `{resource}.req`
+/// output per sim resource.
 fn submit_def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+    let mut outputs = vec![Output::<LogEvent>::def(cx, LOG_PORT)];
+    outputs.extend(dyn_output_defs(cx, &[Cow::Borrowed(LOG_PORT)])?);
     Ok(SystemDef {
         name: "io_submit".into(),
         inputs: dyn_input_defs(cx, &[])?,
-        outputs: vec![Output::<LogEvent>::def(cx, LOG_PORT)],
+        outputs,
         grants: Vec::new(),
     })
 }
 
-/// `log`, `io_status`, then one CQ per member, named after it.
+/// One `{resource}.rep` input per sim resource; `log`, `io_status`, then
+/// one CQ per member, named after it.
 fn complete_def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
     let fixed = [Cow::Borrowed(LOG_PORT), Cow::Borrowed(IO_STATUS_PORT)];
     let mut outputs = vec![
@@ -120,7 +130,7 @@ fn complete_def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
     outputs.extend(dyn_output_defs(cx, &fixed)?);
     Ok(SystemDef {
         name: "io_complete".into(),
-        inputs: Vec::new(),
+        inputs: dyn_input_defs(cx, &[])?,
         outputs,
         grants: Vec::new(),
     })
@@ -129,16 +139,62 @@ fn complete_def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
 /// `io_submit`'s make, over the `Os` that `make_os` builds.
 fn make_submit(cx: MakeCx<'_>, make_os: MakeOs) -> Result<Box<dyn Step>, ParamError> {
     refuse_thread(cx.adapter)?;
-    let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
+    let (views, mut writers) = bindings(cx.def, cx.inputs, cx.outputs);
     let names: Vec<&str> = cx.def.inputs.iter().map(|p| p.name.as_ref()).collect();
     let host = IoHost::new(&cx.io.borrow(), &names, make_os)?;
+    let reqs = sim_ports(&cx.io.borrow(), writers.split_off(1), out_def, ".req")?;
+    let cancels = Vec::with_capacity(4 * MAX_OPS * names.len().max(1));
     cx.io.borrow_mut().host = Some(host);
     let sqs = views.into_iter().map(|b| Input::new(b.views)).collect();
     Ok(Box::new(SubmitStep {
         io: cx.io.clone(),
         sqs,
+        reqs: reqs
+            .into_iter()
+            .map(|p| p.map(|b| Output::new(b.writer)))
+            .collect(),
+        cancels,
         log: log_port(writers),
     }))
+}
+
+/// A port per resource, from ports named `{resource}{suffix}`. Each must name
+/// a sim resource, and each sim resource some driver holds must have one.
+fn sim_ports<P>(
+    shared: &super::IoShared,
+    ports: Vec<P>,
+    name: fn(&P) -> &PortDef,
+    suffix: &str,
+) -> Result<Vec<Option<P>>, ParamError> {
+    let resources = &shared.resources;
+    let mut by_resource: Vec<Option<P>> = resources.iter().map(|_| None).collect();
+    for port in ports {
+        let name = name(&port).name.to_string();
+        let sim = |r: &&super::ResourceConfig| matches!(r.backing, Backing::Sim(_));
+        let at = name
+            .strip_suffix(suffix)
+            .and_then(|id| resources.iter().position(|r| r.id == id))
+            .filter(|&at| sim(&&resources[at]));
+        let Some(at) = at else {
+            return Err(ParamError::Resource {
+                id: name,
+                message: "names no sim resource".into(),
+            });
+        };
+        by_resource[at] = Some(port);
+    }
+    let used = |at: usize| shared.grants_on(&resources[at].id) > 1;
+    let sims = resources.iter().enumerate();
+    let missing = sims
+        .filter(|(at, r)| matches!(r.backing, Backing::Sim(_)) && used(*at))
+        .find(|(at, _)| by_resource[*at].is_none());
+    if let Some((_, r)) = missing {
+        return Err(ParamError::Resource {
+            id: format!("{}{suffix}", r.id),
+            message: "a sim resource's model has no edge to the io steps".into(),
+        });
+    }
+    Ok(by_resource)
 }
 
 fn make_complete(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
@@ -146,7 +202,9 @@ fn make_complete(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     if cx.io.borrow().host.is_none() {
         return Err(ParamError::NoIoSubmit);
     }
-    let (_, writers) = bindings(cx.def, cx.inputs, cx.outputs);
+    let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
+    let reps = sim_ports(&cx.io.borrow(), views, in_def, ".rep")?;
+    let reps = reps.into_iter().flatten().map(|b| Input::new(b.views));
     let mut writers = writers.into_iter();
     let log = log_port(writers.by_ref().take(1).collect());
     // PANIC Safety: `complete_def` declares `io_status` second.
@@ -158,12 +216,21 @@ fn make_complete(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     let done = Vec::with_capacity(6 * cqs.len().max(1) * MAX_OPS);
     Ok(Box::new(CompleteStep {
         io: cx.io.clone(),
+        reps: reps.collect(),
         cqs,
         status,
         log,
         dropped,
         done,
     }))
+}
+
+fn out_def(b: &OutputBinding) -> &PortDef {
+    &b.def
+}
+
+fn in_def(b: &InputBinding) -> &PortDef {
+    &b.def
 }
 
 /// The `log` output, the only writer in `writers`.
@@ -199,9 +266,11 @@ impl IoHost {
             .map(|member| host_member(shared, &mut reactor, member, &handles))
             .collect::<Result<_, _>>()?;
         let count = shared.resources.len();
+        let sim = shared.resources.iter();
         Ok(Self {
             reactor,
             members,
+            sim: sim.map(|r| matches!(r.backing, Backing::Sim(_))).collect(),
             counters: vec![Counters::default(); count].into(),
             reported: vec![Counters::default(); count].into(),
             names: shared
@@ -327,10 +396,13 @@ fn tracked(token: super::Token) -> Option<usize> {
     (slot < MAX_OPS).then_some(slot)
 }
 
-/// Carries every member's ops to the reactor.
+/// Carries every member's ops to the reactor, or to a sim resource's model.
 struct SubmitStep {
     io: SharedIo,
     sqs: Vec<Input<Sqe>>,
+    /// Each resource's model requests, for a sim resource.
+    reqs: Vec<Option<Output<Sqe>>>,
+    cancels: Vec<(u16, Sqe)>,
     log: LogPort,
 }
 
@@ -346,12 +418,24 @@ impl Step for SubmitStep {
             for sqe in sq.drain() {
                 match sqe {
                     Ok(_) if quiescing => {}
-                    Ok(sqe) => host.route(at, sqe),
+                    Ok(sqe) => {
+                        if let Some((res, sqe)) = host.route(at, sqe)
+                            && !write(&self.reqs, res, &sqe)
+                        {
+                            host.reactor.unroute(sqe, IoError::QueueFull);
+                        }
+                    }
                     Err(_) => corrupt = true,
                 }
             }
             if quiescing {
                 host.drained(at);
+            }
+        }
+        host.reactor.sim_cancels(&mut self.cancels);
+        for (res, sqe) in self.cancels.drain(..) {
+            if !write(&self.reqs, res, &sqe) {
+                host.reactor.requeue_sim_cancel(res, sqe);
             }
         }
         host.reactor.submit();
@@ -366,13 +450,20 @@ impl Step for SubmitStep {
     }
 }
 
+/// Writes a sim op to resource `res`'s model. False if no port took it.
+fn write(reqs: &[Option<Output<Sqe>>], res: u16, sqe: &Sqe) -> bool {
+    let req = reqs.get(usize::from(res)).and_then(Option::as_ref);
+    req.is_some_and(|req| req.write(sqe).is_ok())
+}
+
 impl IoHost {
-    /// Maps one op's handle and pushes it, or answers it here.
-    fn route(&mut self, at: usize, mut sqe: Sqe) {
+    /// Maps one op's handle and pushes it, or answers it here. Returns a
+    /// lowered sim op, with its resource, for the caller to write.
+    fn route(&mut self, at: usize, mut sqe: Sqe) -> Option<(u16, Sqe)> {
         let member = &mut self.members[at];
         let Some(mapped) = member.handles.get(sqe.handle) else {
             self.early.push((at, Cqe::err(sqe.token, IoError::Stale)));
-            return;
+            return None;
         };
         if let Op::Close { .. } = sqe.op {
             // A grant ends only this capability, and the resource stays open.
@@ -383,7 +474,7 @@ impl IoHost {
                 close(&mut self.reactor, mapped.os);
             }
             self.early.push((at, Cqe::ok(sqe.token, Out::UNIT)));
-            return;
+            return None;
         }
         if let Some(slot) = tracked(sqe.token) {
             member.ops[slot] = Some(InFlight {
@@ -393,7 +484,12 @@ impl IoHost {
             self.counters[mapped.res as usize].submitted += 1;
         }
         sqe.handle = mapped.os;
+        if self.sim[usize::from(mapped.res)] {
+            let lowered = self.reactor.lower_routed(member.src, mapped.res, sqe);
+            return lowered.map(|sqe| (mapped.res, sqe));
+        }
         self.reactor.push(member.src, sqe);
+        None
     }
 
     /// Notes that a quiescing member's SQ is drained. The first time, closes
@@ -492,6 +588,8 @@ pub(crate) fn due<'a>(
 /// Carries every member's completions back to its CQ.
 struct CompleteStep {
     io: SharedIo,
+    /// The models' replies, one input per sim resource.
+    reps: Vec<Input<Cqe>>,
     cqs: Vec<Output<Cqe>>,
     status: Output<ResourceStatus>,
     log: LogPort,
@@ -505,6 +603,10 @@ impl Step for CompleteStep {
         let Some(host) = io.host.as_mut() else {
             return;
         };
+        for rep in &mut self.reps {
+            let raised = rep.drain().flatten().filter_map(|c| host.reactor.raise(c));
+            self.done.extend(raised);
+        }
         host.reactor.reap(&mut self.done);
         for (src, cqe) in self.done.drain(..) {
             let at = usize::from(src.0);

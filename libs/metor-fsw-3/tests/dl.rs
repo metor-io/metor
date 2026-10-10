@@ -149,6 +149,7 @@ fn test_pack_reports_system_metadata() {
             "fail_input",
             "retained",
             "gps",
+            "uart_script",
             "until_fix",
             "count_up",
             "count_down",

@@ -1,0 +1,114 @@
+{
+  "clock": {
+    "Simulated": {
+      "dt": {
+        "secs": 0,
+        "nanos": 10000000
+      }
+    }
+  },
+  "ring_depth": 8,
+  "namespace": null,
+  "systems": [
+    {
+      "id": "gps",
+      "ty": "echo.gps",
+      "params": null,
+      "inputs": [
+        {
+          "port": "io_cq",
+          "from": [
+            {
+              "system": "io_complete",
+              "port": "gps"
+            }
+          ]
+        }
+      ],
+      "grants": [
+        {
+          "param": "uart",
+          "resource": "gps1"
+        }
+      ]
+    },
+    {
+      "id": "io_submit",
+      "ty": "fsw.io_submit",
+      "inputs": [
+        {
+          "port": "gps",
+          "from": [
+            {
+              "system": "gps",
+              "port": "io_sq"
+            }
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "port": "gps1.req",
+          "record": "io_sqe"
+        }
+      ]
+    },
+    {
+      "id": "receiver",
+      "ty": "echo.uart_script",
+      "params": {
+        "script": [
+          "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n",
+          "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n",
+          "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n"
+        ]
+      },
+      "inputs": [
+        {
+          "port": "uart.req",
+          "from": [
+            {
+              "system": "io_submit",
+              "port": "gps1.req"
+            }
+          ]
+        }
+      ],
+      "grants": [
+        {
+          "param": "uart",
+          "resource": "gps1"
+        }
+      ]
+    },
+    {
+      "id": "io_complete",
+      "ty": "fsw.io_complete",
+      "outputs": [
+        {
+          "port": "gps",
+          "record": "io_cqe"
+        }
+      ],
+      "inputs": [
+        {
+          "port": "gps1.rep",
+          "from": [
+            {
+              "system": "receiver",
+              "port": "uart.rep"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "id": "gps1",
+      "backing": {
+        "sim": "uart"
+      }
+    }
+  ]
+}

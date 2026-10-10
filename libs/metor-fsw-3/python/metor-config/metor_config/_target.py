@@ -71,6 +71,7 @@ class Target:
         self.ring_depth = ring_depth
         self.namespace = namespace
         self._systems: list[tuple[str, System, dict[str, Any] | None]] = []
+        self._sims: list[tuple[str, System, dict[str, Any] | None]] = []
         self._handles: dict[str, SystemHandle] = {}
         self._commands: list[Source[Any]] = []
         self._packs: dict[str, Pack] = {}
@@ -122,7 +123,23 @@ class Target:
         ``channel_status`` outputs. ``start`` sets the channel's state at boot:
         ``"running"`` (the default) or ``"stopped"``.
         """
-        adapter = _adapter(thread, channel, start)
+        return self._add(self._systems, name, system, _adapter(thread, channel, start))
+
+    def sim(self, name: str, system: S) -> S:
+        """Adds ``system`` as a model that serves sim resources.
+
+        Models run after `io_submit` and before `io_complete`, so a driver's
+        op submitted in one cycle completes in the next.
+        """
+        return self._add(self._sims, name, system, None)
+
+    def _add(
+        self,
+        systems: list[tuple[str, System, dict[str, Any] | None]],
+        name: str,
+        system: S,
+        adapter: dict[str, Any] | None,
+    ) -> S:
         if name in (IO_SUBMIT, IO_COMPLETE):
             raise ConfigError(f"`{name}` is the name of an io step")
         if name in self._handles:
@@ -135,7 +152,7 @@ class Target:
             self._packs.setdefault(pack.id, pack)
         system._name = name
         system._target = self
-        self._systems.append((name, system, adapter))
+        systems.append((name, system, adapter))
         handle = SystemHandle(name, self, system)
         self._handles[name] = handle
         return cast(S, handle)
@@ -229,8 +246,7 @@ class Target:
             "clock": self._clock(),
             "ring_depth": self.ring_depth,
             "namespace": self.namespace,
-            "systems": [self._system(index) for index in range(len(self._systems))]
-            + self._io_steps(),
+            "systems": self._steps(),
         }
         if self._resources:
             coordinator["resources"] = [r.to_json() for r in self._resources.values()]
@@ -247,32 +263,62 @@ class Target:
         """Returns each system with a `Cap`, in step order."""
         return [name for name, system, _ in self._systems if type(system)._caps]
 
-    def _io_steps(self) -> list[dict[str, Any]]:
-        """Returns `io_submit` and `io_complete`, wired to every system with a
-        `Cap`, or nothing when no system has one."""
-        granted = self._granted()
-        if not granted:
-            return []
-        submit = {
+    def _steps(self) -> list[dict[str, Any]]:
+        """Returns every system's entry: the flight systems, `io_submit`, the
+        models added with `sim`, then `io_complete`."""
+        flight = [self._system(self._systems, index) for index in range(len(self._systems))]
+        sims = [self._system(self._sims, index) for index in range(len(self._sims))]
+        if not self._granted():
+            return flight + sims
+        return flight + [self._io_submit(), *sims, self._io_complete()]
+
+    def _devices(self) -> list[tuple[str, str, str]]:
+        """Returns each model's ``(system, param, resource)``, in step order."""
+        return [
+            (name, param, grant.name)
+            for name, system, _ in self._systems + self._sims
+            for param, grant in system._grants.items()
+            if param in type(system)._devices
+        ]
+
+    def _io_submit(self) -> dict[str, Any]:
+        """`io_submit`, reading every driver's SQ and writing each model's
+        requests."""
+        submit: dict[str, Any] = {
             "id": IO_SUBMIT,
             "ty": "fsw.io_submit",
             "inputs": [
-                {"port": name, "from": [{"system": name, "port": "io_sq"}]} for name in granted
+                {"port": name, "from": [{"system": name, "port": "io_sq"}]}
+                for name in self._granted()
             ],
         }
-        complete = {
+        reqs = [{"port": f"{r}.req", "record": "io_sqe"} for _, _, r in self._devices()]
+        if reqs:
+            submit["outputs"] = reqs
+        return submit
+
+    def _io_complete(self) -> dict[str, Any]:
+        """`io_complete`, reading each model's replies and writing every
+        driver's CQ."""
+        complete: dict[str, Any] = {
             "id": IO_COMPLETE,
             "ty": "fsw.io_complete",
-            "outputs": [{"port": name, "record": "io_cqe"} for name in granted],
+            "outputs": [{"port": name, "record": "io_cqe"} for name in self._granted()],
         }
-        return [submit, complete]
+        reps = [
+            {"port": f"{r}.rep", "from": [{"system": name, "port": f"{param}.rep"}]}
+            for name, param, r in self._devices()
+        ]
+        if reps:
+            complete["inputs"] = reps
+        return complete
 
     def _check_sims(self) -> None:
         """Raises `ConfigError` unless each sim resource has one model and no
         two drivers use a real and a sim resource."""
         grants = [
             (name, param, grant, param in type(system)._devices)
-            for name, system, _ in self._systems
+            for name, system, _ in self._systems + self._sims
             for param, grant in system._grants.items()
         ]
         for resource in self._resources.values():
@@ -304,8 +350,10 @@ class Target:
                 f"channel `{channels[0][0]}` has no command source; call `commands(..)`"
             )
 
-    def _system(self, index: int) -> dict[str, Any]:
-        name, system, adapter = self._systems[index]
+    def _system(
+        self, systems: list[tuple[str, System, dict[str, Any] | None]], index: int
+    ) -> dict[str, Any]:
+        name, system, adapter = systems[index]
         entry: dict[str, Any] = {
             "id": name,
             "ty": f"{system._pack.id}.{system._ty}",
@@ -331,6 +379,11 @@ class Target:
             entry["inputs"].append(
                 {"port": "io_cq", "from": [{"system": IO_COMPLETE, "port": name}]}
             )
+        if self._granted():
+            for param in type(system)._devices:
+                resource = system._grants[param].name
+                req = {"system": IO_SUBMIT, "port": f"{resource}.req"}
+                entry["inputs"].append({"port": f"{param}.req", "from": [req]})
         outputs = system._outputs_for(self, index)
         if outputs:
             entry["outputs"] = _json(outputs)

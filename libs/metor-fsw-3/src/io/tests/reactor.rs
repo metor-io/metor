@@ -314,3 +314,88 @@ fn repeated_cancel_all_cancels_each_op_once() {
         .count();
     assert_eq!(cancels, 2);
 }
+
+fn lower(rig: &mut Rig, src: u16, token: u32, route: u16, op: Op) -> Option<Sqe> {
+    let sqe = Sqe::new(Token::new(token), RawHandle::new(u32::from(route), 0), op);
+    rig.reactor.lower_routed(SourceId(src), route, sqe)
+}
+
+#[test]
+fn routed_op_reply_raises_to_its_source() {
+    let mut rig = Rig::new(8, 2);
+    let lowered = lower(&mut rig, 1, 77, 3, Op::recv(BufRef::new(0))).unwrap();
+    assert_ne!(lowered.token, Token::new(77));
+    assert_eq!(
+        lowered.op.buf().unwrap().table(),
+        rig.tables[1].id().unwrap()
+    );
+    rig.reactor.submit();
+    assert!(rig.pushed().is_empty(), "a routed op skips the `Os`");
+    let raised = rig.reactor.raise(Cqe::ok(lowered.token, Out::len(4)));
+    assert_eq!(
+        raised,
+        Some((SourceId(1), Cqe::ok(Token::new(77), Out::len(4))))
+    );
+    assert_eq!(rig.reactor.in_flight(SourceId(1)), 0);
+}
+
+#[test]
+fn cancel_all_splits_real_and_routed_cancels() {
+    let mut rig = Rig::new(2, 1);
+    rig.push(0, 1, Op::CLOSE);
+    let routed = lower(&mut rig, 0, 2, 5, Op::recv(BufRef::new(0))).unwrap();
+    rig.reactor.cancel_all(SourceId(0));
+    rig.reactor.submit();
+    let pushed = rig.pushed();
+    assert_eq!(pushed.len(), 2);
+    assert_eq!(pushed[1].op, Op::cancel(pushed[0].token));
+    let mut cancels = Vec::new();
+    rig.reactor.sim_cancels(&mut cancels);
+    assert_eq!(cancels.len(), 1);
+    let (route, cancel) = cancels[0];
+    assert_eq!((route, cancel.op), (5, Op::cancel(routed.token)));
+    assert_ne!(cancel.token.get() & 0x8000_0000, 0, "a reactor-own token");
+    assert_eq!(rig.reactor.raise(Cqe::ok(cancel.token, Out::UNIT)), None);
+}
+
+#[test]
+fn requeued_sim_cancel_comes_back() {
+    let mut rig = Rig::new(2, 1);
+    lower(&mut rig, 0, 1, 0, Op::recv(BufRef::new(0))).unwrap();
+    rig.reactor.cancel_all(SourceId(0));
+    let mut cancels = Vec::new();
+    rig.reactor.sim_cancels(&mut cancels);
+    let (route, cancel) = cancels.pop().unwrap();
+    rig.reactor.requeue_sim_cancel(route, cancel);
+    rig.reactor.sim_cancels(&mut cancels);
+    assert_eq!(cancels, [(route, cancel)]);
+}
+
+#[test]
+fn raise_of_an_unknown_token_is_none() {
+    let mut rig = Rig::new(2, 1);
+    assert_eq!(rig.reactor.raise(Cqe::ok(Token::new(1), Out::UNIT)), None);
+    assert_eq!(rig.reactor.raise(Cqe::ok(Token::new(99), Out::UNIT)), None);
+}
+
+#[test]
+fn refused_and_undelivered_routed_ops_complete_on_reap() {
+    let mut rig = Rig::new(1, 1);
+    let first = lower(&mut rig, 0, 1, 0, Op::recv(BufRef::new(0))).unwrap();
+    assert!(lower(&mut rig, 0, 2, 0, Op::recv(BufRef::new(0))).is_none());
+    rig.reactor.unroute(first, IoError::QueueFull);
+    let done = rig.reap();
+    let full = |t| (SourceId(0), Cqe::err(Token::new(t), IoError::QueueFull));
+    assert_eq!(done, [full(2), full(1)]);
+    assert_eq!(rig.reactor.in_flight(SourceId(0)), 0);
+}
+
+/// A routed op never reaches the kernel, so its table is not leaked.
+#[test]
+fn drop_frees_a_table_with_only_routed_ops() {
+    let mut rig = Rig::new(4, 1);
+    lower(&mut rig, 0, 1, 0, Op::recv(BufRef::new(0))).unwrap();
+    let table = Rc::downgrade(&rig.tables[0]);
+    drop(rig);
+    assert!(table.upgrade().is_none());
+}

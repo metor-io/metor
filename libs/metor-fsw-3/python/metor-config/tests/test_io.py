@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+import runpy
+import sys
 import unittest
 from typing import Any
 
@@ -232,6 +236,40 @@ class SimTests(unittest.TestCase):
         port = fsw.resource("port", Tty("/dev/ttyS0"))
         with self.assertRaisesRegex(ConfigError, "model.uart"):
             fsw.add("model", UartModel(uart=port))
+
+    def test_models_run_between_the_io_steps(self) -> None:
+        fsw = Target(cycle_rate=10.0)
+        gps1 = fsw.resource("gps1", SimUart())
+        fsw.add("gps", Gps(uart=gps1))
+        fsw.sim("model", UartModel(uart=gps1))
+        fsw.add("late", Gps(uart=fsw.resource("gps2", SimUart())))
+        fsw.sim("model2", UartModel(uart=fsw._resources["gps2"]))
+        order = [s["id"] for s in coordinator(fsw)["systems"]]
+        self.assertEqual(order, ["gps", "late", "io_submit", "model", "model2", "io_complete"])
+
+    def test_model_added_in_place_reads_io_submit_through_a_loop(self) -> None:
+        fsw = Target(cycle_rate=10.0)
+        gps1 = fsw.resource("gps1", SimUart())
+        fsw.add("gps", Gps(uart=gps1))
+        fsw.add("model", UartModel(uart=gps1))
+        systems = coordinator(fsw)["systems"]
+        self.assertEqual([s["id"] for s in systems], ["gps", "model", "io_submit", "io_complete"])
+        req = {"port": "uart.req", "from": [{"system": "io_submit", "port": "gps1.req"}]}
+        self.assertEqual(systems[1]["inputs"], [req])
+        self.assertEqual(systems[2]["outputs"], [{"port": "gps1.req", "record": "io_sqe"}])
+        rep = {"port": "gps1.rep", "from": [{"system": "model", "port": "uart.rep"}]}
+        self.assertEqual(systems[3]["inputs"], [rep])
+
+    def test_sim_golden_matches(self) -> None:
+        golden = os.path.join(os.path.dirname(__file__), "..", "..", "..", "tests", "golden")
+        sys.path.insert(0, golden)
+        try:
+            runpy.run_path(os.path.join(golden, "sim.py"))
+        finally:
+            sys.path.remove(golden)
+        written = target_mod._targets[-1].to_config()["coordinator"]
+        with open(os.path.join(golden, "sim.json")) as file:
+            self.assertEqual(written, json.load(file))
 
 
 if __name__ == "__main__":

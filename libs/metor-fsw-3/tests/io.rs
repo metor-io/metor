@@ -311,6 +311,7 @@ mod through_the_io_steps {
 }
 
 #[path = "fixtures/echo-pack/src/gps.rs"]
+#[allow(dead_code)]
 mod gps;
 
 mod gps_on_a_pty {
