@@ -173,7 +173,6 @@ impl Dispatch {
                 class,
                 op,
                 buf,
-                arena: m as u16,
             }),
             Target::Sim(port) => {
                 let mut req = sqe;

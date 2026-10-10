@@ -4,10 +4,22 @@
 use core::ptr::NonNull;
 use std::os::fd::{OwnedFd, RawFd};
 
-use super::{IoError, Op, Token};
+use super::Token;
 
 pub(crate) mod dispatch;
+mod open;
+mod poll;
+mod sys;
+#[cfg(target_os = "linux")]
+mod uring;
+
 pub(crate) use dispatch::{Backed, Dispatch, Route};
+pub use open::{OpenError, open};
+pub use poll::PollOs;
+#[cfg(target_os = "linux")]
+pub use uring::UringOs;
+
+pub use super::{Access, Errno, IoError, Op, OpKind, OpenFlags, RealKind, TtyConfig, TtyQueue};
 
 /// How a descriptor's ops run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,8 +82,14 @@ pub struct OsOp {
     pub class: Class,
     pub op: Op,
     pub buf: Option<NonNull<[u8]>>,
-    /// The arena `buf` lies in, for a backend that registers arenas.
-    pub arena: u16,
+}
+
+impl OsOp {
+    /// The op's buffer, or an empty one.
+    pub(crate) fn bytes(&self) -> NonNull<[u8]> {
+        let empty = NonNull::slice_from_raw_parts(NonNull::dangling(), 0);
+        self.buf.unwrap_or(empty)
+    }
 }
 
 #[derive(Debug)]
@@ -98,4 +116,13 @@ pub trait Os {
     fn reap(&mut self, done: &mut Vec<OsDone>);
     /// Closes a descriptor an op opened, canceling its ops in flight.
     fn close(&mut self, fd: OwnedFd);
+}
+
+/// The host's backend for at most `ops` ops in flight: `UringOs` on Linux,
+/// `PollOs` elsewhere.
+pub fn host(ops: usize) -> std::io::Result<Box<dyn Os>> {
+    #[cfg(target_os = "linux")]
+    return Ok(Box::new(UringOs::new(ops)?));
+    #[cfg(not(target_os = "linux"))]
+    return Ok(Box::new(PollOs::new(ops)?));
 }

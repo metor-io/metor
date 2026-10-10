@@ -83,7 +83,7 @@ fn real_op_resolves_its_descriptor_buffer_and_index() {
     let mut r = rig();
     r.d.lower(1, read(3, TTY));
     let op = r.only_os();
-    assert_eq!((op.fd, op.class, op.arena), (r.fd, Class::Tty, 1));
+    assert_eq!((op.fd, op.class), (r.fd, Class::Tty));
     assert_eq!(op.id, OpId::new((MAX_OPS + 3) as u16, 7));
     assert_eq!(op.buf.unwrap().len(), 16);
     let done = r.done(op.id, Ok(Out::Len(5)));

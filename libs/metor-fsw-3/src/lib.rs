@@ -152,6 +152,9 @@ pub mod fn_system;
 pub mod frame;
 pub mod io;
 mod io2;
+#[cfg(all(feature = "host", unix))]
+#[doc(hidden)]
+pub use io2::host as io2_host;
 #[cfg(feature = "host")]
 pub mod link;
 pub mod log;
