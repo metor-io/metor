@@ -105,6 +105,19 @@ mod tests {
     }
 
     #[test]
+    fn enter_spawns_onto_the_entered_executor() {
+        let (a, b) = (sim(), sim());
+        let hit = flag();
+        let h = hit.clone();
+        let task = a.enter(|| crate::spawn(async move { h.set(true) }));
+        b.turn();
+        assert!(!hit.get());
+        a.turn();
+        assert!(hit.get());
+        drop(task);
+    }
+
+    #[test]
     fn empty_turn_is_idle() {
         let exec = sim();
         let t = exec.turn();

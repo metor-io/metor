@@ -162,7 +162,7 @@ mod unit {
         let mut uart = ScriptedUart::silent();
         let flush = Op::tty(TtyOp::flush(2));
         let mut sent = Vec::new();
-        while dev.held.len() == 0 {
+        while dev.outbox.is_empty() {
             for _ in 0..MAX_OPS {
                 let token = Token::new(sent.len() as u32);
                 driver.send(Sqe::new(token, RawHandle::new(0, 0), flush));
@@ -177,6 +177,40 @@ mod unit {
         }
         answered.extend(driver.replies().iter().map(|c| c.token));
         assert_eq!(answered, sent);
+    }
+
+    /// Cancels and refusals wait for room like any reply.
+    #[test]
+    fn full_reply_port_keeps_cancels_and_refusals() {
+        let (mut dev, mut driver) = device::<Uart>();
+        let mut uart = ScriptedUart::silent();
+        let flush = Op::tty(TtyOp::flush(2));
+        // Clear of the tokens `request` hands out.
+        let mut next = 10_000;
+        let mut send = |driver: &mut TestDevice, op: Op| {
+            next += 1;
+            driver.send(Sqe::new(Token::new(next), RawHandle::new(0, 0), op));
+            Token::new(next)
+        };
+        while dev.outbox.is_empty() {
+            (0..MAX_OPS).for_each(|_| {
+                send(&mut driver, flush);
+            });
+            dev.serve(NOW, &mut uart);
+        }
+        let held: Vec<Token> = (0..MAX_OPS).map(|_| read(&mut driver)).collect();
+        let refused = read(&mut driver);
+        let cancel = send(&mut driver, Op::cancel(held[0]));
+        dev.serve(NOW, &mut uart);
+        let mut replies = Vec::new();
+        for _ in 0..8 {
+            replies.extend(results(&mut driver));
+            dev.serve(NOW, &mut uart);
+        }
+        let find = |t: Token| replies.iter().find(|r| r.0 == t).map(|r| r.1);
+        assert_eq!(find(refused), Some(Err(IoError::QueueFull)));
+        assert_eq!(find(held[0]), Some(Err(IoError::Canceled)));
+        assert_eq!(find(cancel), Some(Ok(())));
     }
 
     #[test]

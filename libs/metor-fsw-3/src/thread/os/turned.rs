@@ -44,10 +44,12 @@ impl TurnedGroup {
         }))
     }
 
-    /// Builds `member` on this thread and spawns its task.
+    /// Builds `member` on this thread, inside the executor's scope, and
+    /// spawns its task.
     pub(crate) fn add(&self, member: Member) -> Result<(), ParamError> {
         let Member { launch, panicked } = member;
-        let running = build(launch, self.stop_rx.clone())?;
+        let stop = self.stop_rx.clone();
+        let running = self.executor.enter(|| build(launch, stop))?;
         let handle = self.executor.spawn(task(running, panicked));
         self.tasks.borrow_mut().push(handle);
         Ok(())

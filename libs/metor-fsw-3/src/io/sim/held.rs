@@ -1,6 +1,6 @@
 //! The ops a model has not answered yet.
 
-use super::super::{Cqe, IoError, Sqe, Token};
+use super::super::{IoError, Sqe, Token};
 
 /// An op waiting for its model, and when it may be answered.
 #[derive(Clone, Copy, Debug)]
@@ -8,8 +8,6 @@ pub(crate) struct Entry {
     pub(crate) sqe: Sqe,
     /// The serve count at which the model first sees the op.
     pub(crate) ready_at: u64,
-    /// The model's answer, kept while the reply port is full.
-    pub(crate) reply: Option<Cqe>,
 }
 
 /// A fixed-capacity queue of held ops, in arrival order. It never grows past
@@ -32,25 +30,18 @@ impl Held {
         if self.entries.len() == self.cap {
             return Err(IoError::QueueFull);
         }
-        self.entries.push(Entry {
-            sqe,
-            ready_at,
-            reply: None,
-        });
+        self.entries.push(Entry { sqe, ready_at });
         Ok(())
     }
 
     /// Takes the unanswered op with `token`, if held.
     pub(crate) fn remove(&mut self, token: Token) -> Option<Sqe> {
-        let at = self
-            .entries
-            .iter()
-            .position(|e| e.sqe.token == token && e.reply.is_none())?;
+        let at = self.entries.iter().position(|e| e.sqe.token == token)?;
         Some(self.entries.remove(at).sqe)
     }
 
-    pub(crate) fn get_mut(&mut self, at: usize) -> Option<&mut Entry> {
-        self.entries.get_mut(at)
+    pub(crate) fn get(&self, at: usize) -> Option<Entry> {
+        self.entries.get(at).copied()
     }
 
     pub(crate) fn remove_at(&mut self, at: usize) {

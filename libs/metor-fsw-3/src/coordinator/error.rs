@@ -13,8 +13,11 @@ pub enum BuildError {
     #[error("a deterministic build needs a simulated clock")]
     DeterministicWall,
 
-    #[error("a deterministic build needs a simulated clock with a nonzero dt")]
+    #[error("a deterministic build needs a dt of at least 1 µs")]
     DeterministicZeroDt,
+
+    #[error("a deterministic build needs a simulated clock with an epoch of 0 or later")]
+    DeterministicEpoch,
 
     #[error("system id `{id}` is used twice")]
     DuplicateId { id: String },

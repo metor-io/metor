@@ -789,10 +789,18 @@ impl Clock {
         Ok(())
     }
 
+    /// Checks that cycle times are fixed and strictly increasing: a turned
+    /// group keys its turns on them, and its clock counts whole microseconds
+    /// from zero.
     fn check_deterministic(&self) -> Result<(), BuildError> {
-        match self {
+        match *self {
             Self::Wall { .. } => Err(BuildError::DeterministicWall),
-            Self::Simulated { dt, .. } if dt.is_zero() => Err(BuildError::DeterministicZeroDt),
+            Self::Simulated { dt, .. } if dt < Duration::from_micros(1) => {
+                Err(BuildError::DeterministicZeroDt)
+            }
+            Self::Simulated { epoch, .. } if epoch.is_none_or(|e| e.0 < 0) => {
+                Err(BuildError::DeterministicEpoch)
+            }
             Self::Simulated { .. } => Ok(()),
         }
     }

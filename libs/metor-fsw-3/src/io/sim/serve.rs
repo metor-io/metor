@@ -4,8 +4,6 @@ use metor_proto::types::Timestamp;
 
 use super::super::cap::{GpioLine, Interface, Uart};
 use super::super::device::DeviceSide;
-use crate::port::Output;
-
 use super::super::{Cqe, Errno, IoError, Op, OpKind, Out, Sqe, Token};
 use super::held::Held;
 use super::model::{GpioModel, Reply, UartModel, fills, serve_gpio, serve_uart};
@@ -50,54 +48,58 @@ impl<M: GpioModel> Model<GpioLine> for M {
 
 impl<K: Interface> DeviceSide<K> {
     /// Ticks `model` to `now`, takes new requests, then answers each held
-    /// request that is due and that the model can answer.
+    /// request that is due and that the model can answer. Replies the full
+    /// reply port refuses wait in order for a later serve.
     pub fn serve(&mut self, now: Timestamp, model: &mut impl Model<K>) {
         self.serves += 1;
         model.tick(now);
+        self.flush();
         self.take_requests(model);
         self.answer_due(now, model);
+        self.flush();
     }
 
     /// Holds each new request. A cancel is answered at once.
     fn take_requests(&mut self, model: &impl Model<K>) {
         let Self {
             requests,
-            replies,
+            outbox,
             held,
             serves,
             ..
         } = self;
         for sqe in requests.drain().flatten() {
             if let Op::Cancel { target, .. } = sqe.op {
-                cancel(held, replies, sqe.token, target);
+                cancel(held, outbox, sqe.token, target);
                 continue;
             }
             let ready_at = *serves + u64::from(model.latency(sqe.op.kind()));
             if let Err(e) = held.push(sqe, ready_at) {
-                post(replies, Cqe::err(sqe.token, e));
+                post(outbox, Cqe::err(sqe.token, e));
             }
         }
     }
 
     fn answer_due(&mut self, now: Timestamp, model: &mut impl Model<K>) {
         let mut at = 0;
-        while let Some(entry) = self.held.get_mut(at).map(|e| *e) {
-            let reply = match entry.reply {
-                Some(cqe) => Some(cqe),
-                None if entry.ready_at <= self.serves => self.answer(now, model, &entry.sqe),
-                None => None,
-            };
-            match reply {
-                Some(cqe) if self.replies.write(&cqe).is_ok() => self.held.remove_at(at),
+        while let Some(entry) = self.held.get(at) {
+            let due = entry.ready_at <= self.serves;
+            match due.then(|| self.answer(now, model, &entry.sqe)).flatten() {
                 Some(cqe) => {
-                    if let Some(e) = self.held.get_mut(at) {
-                        e.reply = Some(cqe);
-                    }
-                    at += 1;
+                    self.held.remove_at(at);
+                    post(&mut self.outbox, cqe);
                 }
                 None => at += 1,
             }
         }
+    }
+
+    /// Writes waiting replies, oldest first, until the port is full.
+    fn flush(&mut self) {
+        let replies = &self.replies;
+        let sent = self.outbox.iter().take_while(|c| replies.write(c).is_ok());
+        let sent = sent.count();
+        self.outbox.drain(..sent);
     }
 
     /// The model's answer to `sqe`, or `None` while it has none.
@@ -120,16 +122,19 @@ impl<K: Interface> DeviceSide<K> {
 
 /// Completes the held op `target` `Canceled`. A target not held fails the
 /// cancel with `ENOENT`.
-fn cancel(held: &mut Held, replies: &Output<Cqe>, token: Token, target: Token) {
+fn cancel(held: &mut Held, outbox: &mut Vec<Cqe>, token: Token, target: Token) {
     let Some(op) = held.remove(target) else {
-        post(replies, Cqe::err(token, IoError::Os(Errno::ENOENT)));
+        post(outbox, Cqe::err(token, IoError::Os(Errno::ENOENT)));
         return;
     };
-    post(replies, Cqe::err(op.token, IoError::Canceled));
-    post(replies, Cqe::ok(token, Out::UNIT));
+    post(outbox, Cqe::err(op.token, IoError::Canceled));
+    post(outbox, Cqe::ok(token, Out::UNIT));
 }
 
-/// Writes a reply. One the full port refuses is lost.
-fn post(replies: &Output<Cqe>, cqe: Cqe) {
-    let _ = replies.write(&cqe);
+/// Queues a reply. The outbox holds every reply its ops can give, so it is
+/// never full.
+fn post(outbox: &mut Vec<Cqe>, cqe: Cqe) {
+    if outbox.len() < outbox.capacity() {
+        outbox.push(cqe);
+    }
 }

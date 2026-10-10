@@ -278,6 +278,13 @@ impl Executor<DefaultReactor> {
         }
     }
 
+    /// Runs `f` with `self` as the current executor, so `spawn` and `sleep`
+    /// inside it reach `self`.
+    pub fn enter<T>(self: &Rc<Self>, f: impl FnOnce() -> T) -> T {
+        let _installed = Installed::new(&**self);
+        f()
+    }
+
     /// Spawns a task on this executor.
     ///
     /// Drop every `JoinHandle` from this executor before the executor itself.

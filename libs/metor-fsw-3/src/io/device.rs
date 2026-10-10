@@ -16,6 +16,8 @@ pub struct DeviceSide<K: Interface> {
     pub(super) replies: Output<Cqe>,
     tables: Tables,
     pub(super) held: Held,
+    /// Replies the reply port has not taken yet, oldest first. Fixed at bind.
+    pub(super) outbox: Vec<Cqe>,
     /// How many times `serve` has run.
     pub(super) serves: u64,
     _k: PhantomData<K>,
@@ -41,6 +43,9 @@ impl DeviceSide<Erased> {
             replies,
             tables,
             held: Held::new(held),
+            // Each held op gives one reply, and each cancel of it one more;
+            // refused ops add at most another `held`.
+            outbox: Vec::with_capacity(4 * held),
             serves: 0,
             _k: PhantomData,
         }
@@ -52,6 +57,7 @@ impl DeviceSide<Erased> {
             replies: self.replies,
             tables: self.tables,
             held: self.held,
+            outbox: self.outbox,
             serves: self.serves,
             _k: PhantomData,
         }

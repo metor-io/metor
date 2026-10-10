@@ -50,7 +50,7 @@ pub struct Run {
     #[arg(long)]
     pub epoch: Option<i64>,
     /// Turn every thread group on the coordinator thread, so a sim run gives
-    /// the same results every time. Needs a simulated clock.
+    /// the same results every time. Needs a simulated clock with an epoch.
     #[arg(long)]
     pub deterministic: bool,
     /// Print `<link> <addr>` for every listening link once the graph is built.

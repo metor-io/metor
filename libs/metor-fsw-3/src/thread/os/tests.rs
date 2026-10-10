@@ -358,6 +358,28 @@ mod turned {
         stop.wait().await;
     }
 
+    #[test]
+    fn constructor_spawns_onto_the_group() {
+        let recorder = Recorder::default();
+        let seen = Seen::default();
+        let mut table = turned_table(&recorder, &seen);
+        let flag = seen.flag.clone();
+        let make = move || {
+            let flag = flag.clone();
+            drop(stellarator::spawn(async move {
+                flag.store(true, Ordering::Relaxed)
+            }));
+        };
+        table.register_async("eager", napper(), make).unwrap();
+        let config = CoordinatorConfig {
+            systems: vec![placed("e", "eager", None)],
+            ..Default::default()
+        };
+        let mut c = build(config, &table, true).unwrap();
+        cycles(&mut c, 0, 1);
+        assert!(seen.flag.load(Ordering::Relaxed), "the group polled it");
+    }
+
     /// Sets its flag when its future drops.
     struct Dropped(Arc<AtomicBool>);
 
@@ -538,5 +560,16 @@ mod turned {
         };
         let zero = zero.build_with(&table, options);
         assert_eq!(zero.err(), Some(BuildError::DeterministicZeroDt));
+        let clock = |dt, epoch| CoordinatorConfig {
+            clock: Clock::Simulated { dt, epoch },
+            ..Default::default()
+        };
+        let sub_micro = clock(Duration::from_nanos(500), Some(Timestamp(0)));
+        let sub_micro = sub_micro.build_with(&table, options);
+        assert_eq!(sub_micro.err(), Some(BuildError::DeterministicZeroDt));
+        for epoch in [None, Some(Timestamp(-1))] {
+            let unfixed = clock(DT, epoch).build_with(&table, options);
+            assert_eq!(unfixed.err(), Some(BuildError::DeterministicEpoch));
+        }
     }
 }
