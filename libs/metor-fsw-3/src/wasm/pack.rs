@@ -1,21 +1,26 @@
 //! Loads packs built as WebAssembly modules.
 
-use metor_fsw_3_ring::{NoWake, PAYLOAD_ALIGNMENT, RingBuffer};
+use metor_fsw_3_ring::{NoWake, PAYLOAD_ALIGNMENT, RingBuffer, View};
 use serde::{Deserialize, Serialize};
 
 use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::dl::PackError;
+use crate::dl::Ports;
 use crate::dl::codec::{
     decode_create_error, decode_def, decode_descriptor, encode_def_cx, encode_instance,
 };
+use crate::io::region::Region;
+use crate::io::{BufTable, Cqe, IO_CQ, IO_SQ, SharedIo, Sqe};
 use crate::mirror::{Mirror, Mirrors, mirror_config};
-use crate::pack::ABI_VERSION;
 use crate::pack::def::{Instance, PackDef};
+use crate::pack::{ABI_VERSION, host_caps};
+use crate::port::Input;
 use crate::system::{PortDef, SystemDef};
 
 use super::abi::{Args, GuestRing, allocated};
 use super::guest::{Guest, Module, WasmError};
+use super::io::IoCopy;
 use super::step::WasmStep;
 use super::{DEFAULT_FUEL, DEFAULT_MEMORY, DEFAULT_SETUP_FUEL};
 
@@ -88,28 +93,46 @@ impl WasmPack {
     /// Creates one instance of type `ty` in a new guest.
     ///
     /// The guest works on copies of the host's rings, placed in its own memory.
+    /// A system with a `Cap` lays out its IO arena in the guest, and the host
+    /// keeps a mirror of it as the system's member. A remade guest is given a
+    /// copy of the mirror, rewinds it, and runs its constructor in it.
     pub fn create(
         &self,
         ty: &str,
         params: &serde_json::Value,
         instance: &Instance,
-        inputs: &[Vec<&RingBuffer>],
-        outputs: &[&RingBuffer],
+        (inputs, outputs): Ports<'_>,
+        io: &SharedIo,
     ) -> Result<WasmStep, ParamError> {
         let (params, def) = encode_instance(params, instance)?;
         let mut guest = self.guest().map_err(PackError::from)?;
-        let (edges, in_rings) = copy_inputs(&mut guest, &instance.def.inputs, inputs)?;
-        let (copies, out_rings) = copy_outputs(&mut guest, &instance.def.outputs, outputs)?;
-        let mirrors = Mirrors::new(&instance.def, edges, copies);
+        let capped = host_caps(&instance.def).next().is_some();
+        let io_port = |name: &str| capped && (name == IO_SQ || name == IO_CQ);
+        let ins = copy_inputs(&mut guest, &instance.def.inputs, inputs, io_port)?;
+        let outs = copy_outputs(&mut guest, &instance.def.outputs, outputs, io_port)?;
+        let mirrors = Mirrors::new(&instance.def, ins.mirrors, outs.mirrors);
+        let member = io.borrow().find(&instance.id);
+        let given = match &member {
+            Some(member) => Some(give(&mut guest, &member.table.bufs)?),
+            None => None,
+        };
         let call = Create {
             ty: ty.as_bytes(),
             params: &params,
             def: &def,
-            inputs: &in_rings,
-            outputs: &out_rings,
+            inputs: &ins.rings,
+            outputs: &outs.rings,
+            table: given,
         };
-        let handle = call_create(&mut guest, call)?;
-        Ok(WasmStep::new(mirrors, guest, handle, self.fuel))
+        let (handle, region) = call_create(&mut guest, call)?;
+        let copy = match (ins.io, outs.io) {
+            (Some(cq), Some(sq)) if region.len > 0 => {
+                let views = (Input::new(vec![sq]), Input::new(vec![cq]));
+                Some(attach(&guest, io, instance, region, views)?)
+            }
+            _ => None,
+        };
+        Ok(WasmStep::new(mirrors, copy, guest, handle, self.fuel))
     }
 
     /// Instantiates a new guest using setup fuel.
@@ -166,12 +189,70 @@ struct Create<'a> {
     def: &'a [u8],
     inputs: &'a [Vec<GuestRing>],
     outputs: &'a [GuestRing],
+    /// A copy of the system's IO arena, on a remake.
+    table: Option<GuestRing>,
+}
+
+/// Copies the host's mirror of an IO arena into new guest memory, which the
+/// guest keeps for its life.
+fn give(guest: &mut Guest, mirror: &BufTable) -> Result<GuestRing, ParamError> {
+    let span = mirror
+        .region()
+        .ok_or(ParamError::Wasm("an unfrozen mirror".into()))?;
+    let len = u32::try_from(span.len())
+        .map_err(|_| WasmError::TooLarge(span.len()))
+        .map_err(PackError::from)?;
+    let offset = allocated(guest, len, 8)?;
+    // SAFETY: the mirror's region is live, and only this step touches it.
+    let bytes = unsafe { span.as_ref() };
+    guest.write(offset, bytes).map_err(PackError::from)?;
+    Ok(GuestRing { offset, len })
+}
+
+/// Makes the host's mirror of the IO arena the guest laid out at `region`,
+/// and the copy that keeps the two in step.
+fn attach(
+    guest: &Guest,
+    io: &SharedIo,
+    instance: &Instance,
+    region: GuestRing,
+    (sq, cq): (Input<Sqe>, Input<Cqe>),
+) -> Result<IoCopy, ParamError> {
+    let system = instance.id.clone();
+    let corrupt = |_| ParamError::CorruptTable {
+        system: system.clone(),
+    };
+    let len = region.len as usize;
+    let mut bytes = vec![0; len];
+    guest
+        .read(region.offset, &mut bytes)
+        .map_err(PackError::from)?;
+    let member = io.borrow().find(&instance.id);
+    let member = match member {
+        Some(member) => {
+            member.table.bufs.refill(&bytes).map_err(corrupt)?;
+            member
+        }
+        None => {
+            let caps = host_caps(&instance.def).collect();
+            let mirror = Region::mirror(bytes.into());
+            io.borrow_mut()
+                .adopt_region(&system, caps, mirror)
+                .map_err(corrupt)?
+        }
+    };
+    let base = guest.span(region.offset, len).map_err(PackError::from)?;
+    // SAFETY: the guest's memory never moves, and `WasmStep` drops the copy
+    // before the guest.
+    let view = BufTable::from_region(unsafe { Region::unowned(base, len) }).map_err(corrupt)?;
+    Ok(IoCopy::new(view, member.table.bufs.clone(), sq, cq))
 }
 
 /// Copies `call` into guest memory and calls `metor_fsw_create`.
 ///
-/// Returns the instance, or the error the guest wrote.
-fn call_create(guest: &mut Guest, call: Create<'_>) -> Result<u32, ParamError> {
+/// Returns the instance and the IO region the guest wrote back, or the error
+/// the guest wrote.
+fn call_create(guest: &mut Guest, call: Create<'_>) -> Result<(u32, GuestRing), ParamError> {
     let mut args = Args::new(guest);
     let ty = args.byte_slice(call.ty)?;
     let params = args.byte_slice(call.params)?;
@@ -184,7 +265,7 @@ fn call_create(guest: &mut Guest, call: Create<'_>) -> Result<u32, ParamError> {
     let inputs = args.ports(&edges)?;
     let (outs, len) = args.rings(call.outputs)?;
     let outputs = args.slice(outs, len)?;
-    let table = args.table()?;
+    let table = args.table(call.table)?;
     let error = args.slice(0, 0)?;
     let create = (ty, params, def, inputs, outputs, table, error);
     let handle = args
@@ -194,69 +275,95 @@ fn call_create(guest: &mut Guest, call: Create<'_>) -> Result<u32, ParamError> {
     if handle == 0 {
         return Err(decode_create_error(&args.slice_bytes(error)?));
     }
-    Ok(handle)
+    Ok((handle, args.ring(table)?))
 }
 
-type Copies = (Vec<Mirror<NoWake>>, Vec<Vec<GuestRing>>);
+/// The guest copies of a system's rings.
+struct Copies<R> {
+    /// The mirrors between each copy and its real ring.
+    mirrors: Vec<Mirror<NoWake>>,
+    /// Where each copy is in guest memory.
+    rings: Vec<R>,
+    /// A second reader on the copy of the IO port, for `IoCopy`.
+    io: Option<View<NoWake>>,
+}
 
-/// Creates a guest copy of each input edge's ring.
-///
-/// Returns the mirrors that fill each copy from its real ring, and where each
-/// copy is in guest memory.
+/// Creates a guest copy of each input edge's ring, and mirrors that fill each
+/// copy from its real ring. An IO port's copy takes a second reader.
 fn copy_inputs(
     guest: &mut Guest,
     ports: &[PortDef],
     inputs: &[Vec<&RingBuffer>],
-) -> Result<Copies, ParamError> {
-    let mut mirrors = Vec::new();
-    let mut rings = Vec::with_capacity(ports.len());
+    io_port: impl Fn(&str) -> bool,
+) -> Result<Copies<Vec<GuestRing>>, ParamError> {
+    let mut copies = Copies {
+        mirrors: Vec::new(),
+        rings: Vec::with_capacity(ports.len()),
+        io: None,
+    };
     for (port, reals) in ports.iter().zip(inputs) {
         let mut edge = Vec::with_capacity(reals.len());
+        let readers = 1 + usize::from(io_port(&port.name));
         for real in reals {
-            let (at, copy) = guest_ring(guest, real.config().capacity)?;
+            let (at, copy) = guest_ring(guest, real.config().capacity, readers)?;
             // PANIC Safety: build counted this reader, and the copy is fresh.
-            mirrors.push(Mirror::new(
+            copies.mirrors.push(Mirror::new(
                 port.name.clone(),
                 real.view(NoWake).expect("a counted reader slot"),
                 copy.writer(NoWake).expect("a fresh ring"),
             ));
+            if readers > 1 {
+                // PANIC Safety: the copy was made with a second reader slot.
+                copies.io = Some(copy.view(NoWake).expect("a second reader"));
+            }
             edge.push(at);
         }
-        rings.push(edge);
+        copies.rings.push(edge);
     }
-    Ok((mirrors, rings))
+    Ok(copies)
 }
 
-/// Creates a guest copy of each output ring.
-///
-/// Returns the mirrors that drain each copy into its real ring, and where each
-/// copy is in guest memory.
+/// Creates a guest copy of each output ring, and mirrors that drain each copy
+/// into its real ring. An IO port's copy takes a second reader.
 fn copy_outputs(
     guest: &mut Guest,
     ports: &[PortDef],
     outputs: &[&RingBuffer],
-) -> Result<(Vec<Mirror<NoWake>>, Vec<GuestRing>), ParamError> {
-    let mut mirrors = Vec::with_capacity(ports.len());
-    let mut rings = Vec::with_capacity(ports.len());
+    io_port: impl Fn(&str) -> bool,
+) -> Result<Copies<GuestRing>, ParamError> {
+    let mut copies = Copies {
+        mirrors: Vec::with_capacity(ports.len()),
+        rings: Vec::with_capacity(ports.len()),
+        io: None,
+    };
     for (port, real) in ports.iter().zip(outputs) {
-        let (at, copy) = guest_ring(guest, real.config().capacity)?;
+        let readers = 1 + usize::from(io_port(&port.name));
+        let (at, copy) = guest_ring(guest, real.config().capacity, readers)?;
         // PANIC Safety: the copy is fresh, and build counted one writer per output.
-        mirrors.push(Mirror::new(
+        copies.mirrors.push(Mirror::new(
             port.name.clone(),
             copy.view(NoWake).expect("a fresh ring"),
             real.writer(NoWake).expect("one writer per output ring"),
         ));
-        rings.push(at);
+        if readers > 1 {
+            // PANIC Safety: the copy was made with a second reader slot.
+            copies.io = Some(copy.view(NoWake).expect("a second reader"));
+        }
+        copies.rings.push(at);
     }
-    Ok((mirrors, rings))
+    Ok(copies)
 }
 
 /// Creates a ring in guest memory to mirror a real ring of `capacity` bytes.
 ///
 /// The copy is [`COPY_FACTOR`] times as large. The host formats it before the
 /// guest sees it.
-fn guest_ring(guest: &mut Guest, capacity: usize) -> Result<(GuestRing, RingBuffer), ParamError> {
-    let (config, len) = mirror_config(capacity, COPY_FACTOR)?;
+fn guest_ring(
+    guest: &mut Guest,
+    capacity: usize,
+    readers: usize,
+) -> Result<(GuestRing, RingBuffer), ParamError> {
+    let (config, len) = mirror_config(capacity, COPY_FACTOR, readers)?;
     let len = u32::try_from(len).map_err(|_| ParamError::MirrorTooLarge { capacity })?;
     let offset = allocated(guest, len, PAYLOAD_ALIGNMENT as u32)?;
     let base = guest

@@ -20,7 +20,7 @@ pub(crate) mod system;
 mod uring;
 
 #[cfg(test)]
-pub(super) use counting::allocations;
+pub(crate) use counting::allocations;
 #[cfg(test)]
 pub(crate) use rig::Rig;
 

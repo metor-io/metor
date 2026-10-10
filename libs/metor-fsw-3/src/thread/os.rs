@@ -284,6 +284,6 @@ fn bind_outputs(ports: &[PortDef], outputs: Vec<&RingBuffer>) -> Result<BoundOut
 
 /// Creates a mirror ring for `real`, [`MIRROR_FACTOR`] times its capacity.
 fn mirror(real: &RingBuffer) -> Result<RingBuffer, ParamError> {
-    let (config, _) = mirror_config(real.config().capacity, MIRROR_FACTOR)?;
+    let (config, _) = mirror_config(real.config().capacity, MIRROR_FACTOR, 1)?;
     Ok(RingBuffer::create_in_memory(config))
 }

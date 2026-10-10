@@ -440,6 +440,19 @@ mod io {
     }
 
     #[test]
+    fn wasm_driver_reads_through_the_mirror() {
+        let pack = Arc::new(Pack::Wasm(common::open_wasm()));
+        let seen = Fixes::default();
+        let mut c = sim_target().build(&io_table(&pack, &seen)).unwrap();
+        for t in 1..6 {
+            c.step(Timestamp(t));
+        }
+        let ended: Vec<_> = c.ended().collect();
+        assert!(ended.is_empty(), "{ended:?}");
+        assert!(*seen.borrow() > 0, "the guest's read bytes reached it");
+    }
+
+    #[test]
     fn guest_device_side_is_refused() {
         let pack = open();
         let config = CoordinatorConfig {

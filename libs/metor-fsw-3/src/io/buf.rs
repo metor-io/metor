@@ -312,24 +312,42 @@ impl BufTable {
         self.arena.borrow_mut().fixed()
     }
 
-    /// The fixed arena and an owner that keeps it alive, to share with
-    /// another party. `None` before `freeze`, and for a mirror, which is this
-    /// side's copy.
+    /// The fixed arena, and an owner that keeps it alive if it has one, to
+    /// share with another party. `None` before `freeze`.
     ///
     /// The owner's context stays live while this table does.
-    pub fn export(&self) -> Option<(NonNull<[u8]>, RawOwner)> {
+    pub fn export(&self) -> Option<(NonNull<[u8]>, Option<RawOwner>)> {
         let mut arena = self.arena.borrow_mut();
         let span = arena.fixed()?;
         let owner = match &*arena {
-            Arena::Frozen(mem) => RawOwner {
+            Arena::Frozen(mem) => Some(RawOwner {
                 context: Arc::as_ptr(mem).cast(),
                 retain: retain_mem,
                 release: release_mem,
-            },
-            Arena::Region(region) => region.owner()?,
-            Arena::Making(_) => return None,
+            }),
+            Arena::Region(region) => region.owner(),
+            Arena::Making(_) => None,
         };
         Some((span, owner))
+    }
+
+    /// Copies `bytes` over a mirror's region, which keeps its address. Fails
+    /// for any other table, for a length other than the region's, or for a
+    /// directory that does not fit; then the table is left as it was.
+    pub(crate) fn refill(&self, bytes: &[u8]) -> Result<(), Corrupt> {
+        let mut arena = self.arena.borrow_mut();
+        let Arena::Region(Region::Mirror { bytes: mine }) = &mut *arena else {
+            return Err(Corrupt);
+        };
+        if mine.len() != bytes.len() {
+            return Err(Corrupt);
+        }
+        let fresh = BufTable::from_region(Region::mirror(bytes.into()))?;
+        if fresh.slots != self.slots {
+            return Err(Corrupt);
+        }
+        mine.copy_from_slice(bytes);
+        Ok(())
     }
 
     /// Clears the directory, so the next allocations start again at the first
@@ -370,6 +388,14 @@ impl BufTable {
             cap: e.cap.get(),
             len: e.len.get(),
         })
+    }
+
+    /// A held slot's `(offset, cap, len)`, if it lies inside the arena.
+    pub(crate) fn entry(&self, slot: u16) -> Option<(u32, u32, u32)> {
+        let mut arena = self.arena.borrow_mut();
+        let limit = arena.len();
+        let e = arena.dir(self.slots).held(slot, limit)?;
+        Some((e.offset.get(), e.cap.get(), e.len.get()))
     }
 
     /// The slot's capacity, or 0 for a free slot.

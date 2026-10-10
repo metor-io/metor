@@ -7,17 +7,13 @@ use metor_fsw_3_ring::RawOwner;
 /// A buffer table's memory when it is not the table's own allocation.
 pub(crate) enum Region {
     /// Memory another party owns, such as a dylib's arena. The lease keeps
-    /// it alive.
+    /// it alive; without one, the memory lives as long as this side does.
     Shared {
         base: NonNull<u8>,
         len: usize,
-        lease: Lease,
+        lease: Option<Lease>,
     },
     /// Memory this side owns, mirroring a wasm guest's arena.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the wasm host mirrors a guest's region")
-    )]
     Mirror { bytes: Box<[u8]> },
 }
 
@@ -29,14 +25,24 @@ impl Region {
     /// alive and unmoved until its last release.
     pub(crate) unsafe fn shared(base: NonNull<u8>, len: usize, owner: RawOwner) -> Self {
         // SAFETY: the caller's contract.
-        let lease = unsafe { Lease::acquire(owner) };
+        let lease = Some(unsafe { Lease::acquire(owner) });
         Self::Shared { base, len, lease }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the wasm host mirrors a guest's region")
-    )]
+    /// The region at `base..base + len`, with no owner.
+    ///
+    /// # Safety
+    /// The `len` bytes at `base` stay alive and unmoved for as long as the
+    /// region does, such as memory a wasm host wrote into its own guest, or a
+    /// guest's memory seen by its host.
+    pub(crate) unsafe fn unowned(base: NonNull<u8>, len: usize) -> Self {
+        Self::Shared {
+            base,
+            len,
+            lease: None,
+        }
+    }
+
     pub(crate) fn mirror(bytes: Box<[u8]>) -> Self {
         Self::Mirror { bytes }
     }
@@ -51,7 +57,7 @@ impl Region {
     /// The owner a `Shared` region was given. A mirror has none.
     pub(crate) fn owner(&self) -> Option<RawOwner> {
         match self {
-            Self::Shared { lease, .. } => Some(lease.0),
+            Self::Shared { lease, .. } => lease.as_ref().map(|l| l.0),
             Self::Mirror { .. } => None,
         }
     }

@@ -102,14 +102,14 @@ impl Pack {
         let mut table = exported.map_or(RawRing::EMPTY, |(span, owner)| RawRing {
             base: span.cast().as_ptr(),
             len: span.len(),
-            owner: Some(owner),
+            owner,
         });
         let (inputs, outputs) = ports;
         let step: Box<dyn Step> = match self {
             Pack::Dl(pack) => {
                 Box::new(pack.create(ty, params, instance, inputs, outputs, &mut table)?)
             }
-            Pack::Wasm(pack) => Box::new(pack.create(ty, params, instance, inputs, outputs)?),
+            Pack::Wasm(pack) => Box::new(pack.create(ty, params, instance, ports, io)?),
         };
         if member.is_none() {
             // SAFETY: a pack writes back a live region with an owner that

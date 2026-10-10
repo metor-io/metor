@@ -7,6 +7,7 @@
 
 mod abi;
 mod guest;
+mod io;
 mod pack;
 mod step;
 #[cfg(test)]

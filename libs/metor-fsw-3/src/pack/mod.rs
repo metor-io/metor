@@ -345,14 +345,20 @@ unsafe fn adopt(io: &SharedIo, instance: &Instance, given: RawRing) -> Result<()
     let id = &instance.id;
     let caps: Vec<String> = host_caps(&instance.def).collect();
     let known = io.borrow().find(id).is_some();
-    let (Some(base), Some(owner)) = (core::ptr::NonNull::new(given.base), given.owner) else {
+    let Some(base) = core::ptr::NonNull::new(given.base) else {
         return Ok(());
     };
     if known || caps.is_empty() || given.len == 0 {
         return Ok(());
     }
-    // SAFETY: the caller's contract.
-    let region = unsafe { Region::shared(base, given.len, owner) };
+    // SAFETY: the caller's contract. A region with no owner is in this
+    // module's own memory, which a wasm host wrote and never frees.
+    let region = unsafe {
+        match given.owner {
+            Some(owner) => Region::shared(base, given.len, owner),
+            None => Region::unowned(base, given.len),
+        }
+    };
     let corrupt = |_| ParamError::CorruptTable { system: id.clone() };
     io.borrow_mut()
         .adopt_region(id, caps, region)
@@ -368,7 +374,7 @@ fn region_of(io: &SharedIo, id: &str) -> RawRing {
     export.map_or(RawRing::EMPTY, |(span, owner)| RawRing {
         base: span.cast().as_ptr(),
         len: span.len(),
-        owner: Some(owner),
+        owner,
     })
 }
 

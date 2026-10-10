@@ -82,10 +82,22 @@ impl<'g> Args<'g> {
         Ok((ptr, len(rings.len())?))
     }
 
-    /// Writes an empty `RawRing` and returns its offset, for an export to
-    /// write a region into.
-    pub(super) fn table(&mut self) -> Result<u32, PackError> {
-        self.alloc(WASM32_RAW_RING as u32, WASM32_USIZE)
+    /// Writes a `RawRing` over `region`, or an empty one, and returns its
+    /// offset, for an export to write a region back into.
+    pub(super) fn table(&mut self, region: Option<GuestRing>) -> Result<u32, PackError> {
+        let offset = self.alloc(WASM32_RAW_RING as u32, WASM32_USIZE)?;
+        if let Some(region) = region {
+            self.guest.write(offset, &raw_ring(region))?;
+        }
+        Ok(offset)
+    }
+
+    /// Reads the region of the `RawRing` at `offset`.
+    pub(super) fn ring(&self, offset: u32) -> Result<GuestRing, PackError> {
+        Ok(GuestRing {
+            offset: read_u32(self.guest, offset)?,
+            len: read_u32(self.guest, offset.saturating_add(WASM32_USIZE))?,
+        })
     }
 
     /// Writes an array of `RawSlice`s, one per `(ptr, len)` pair.

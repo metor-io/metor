@@ -271,6 +271,12 @@ impl Guest {
         NonNull::new(ptr).ok_or(WasmError::OutOfBounds { offset, len })
     }
 
+    /// Returns the host address of `len` bytes at `offset`, at any alignment.
+    pub fn span(&self, offset: u32, len: usize) -> Result<NonNull<u8>, WasmError> {
+        let ptr = self.at(offset, len)?;
+        NonNull::new(ptr).ok_or(WasmError::OutOfBounds { offset, len })
+    }
+
     /// Returns the host address of `len` bytes at `offset`.
     ///
     /// Fails if the range is outside the memory's current size. The arena is
