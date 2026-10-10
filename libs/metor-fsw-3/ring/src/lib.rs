@@ -34,7 +34,7 @@ mod region;
 mod sync;
 
 use backing::Backing;
-pub use owner::{RawOwner, RingExport};
+pub use owner::{Lease, RawOwner, RingExport};
 use region::*;
 
 use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
