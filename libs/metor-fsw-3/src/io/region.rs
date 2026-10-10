@@ -11,9 +11,13 @@ pub(crate) enum Region {
     Shared {
         base: NonNull<u8>,
         len: usize,
-        _lease: Lease,
+        lease: Lease,
     },
     /// Memory this side owns, mirroring a wasm guest's arena.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the wasm host mirrors a guest's region")
+    )]
     Mirror { bytes: Box<[u8]> },
 }
 
@@ -25,10 +29,14 @@ impl Region {
     /// alive and unmoved until its last release.
     pub(crate) unsafe fn shared(base: NonNull<u8>, len: usize, owner: RawOwner) -> Self {
         // SAFETY: the caller's contract.
-        let _lease = unsafe { Lease::acquire(owner) };
-        Self::Shared { base, len, _lease }
+        let lease = unsafe { Lease::acquire(owner) };
+        Self::Shared { base, len, lease }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the wasm host mirrors a guest's region")
+    )]
     pub(crate) fn mirror(bytes: Box<[u8]>) -> Self {
         Self::Mirror { bytes }
     }
@@ -37,6 +45,14 @@ impl Region {
         match self {
             Self::Shared { base, .. } => *base,
             Self::Mirror { bytes } => NonNull::from(&mut bytes[..]).cast(),
+        }
+    }
+
+    /// The owner a `Shared` region was given. A mirror has none.
+    pub(crate) fn owner(&self) -> Option<RawOwner> {
+        match self {
+            Self::Shared { lease, .. } => Some(lease.0),
+            Self::Mirror { .. } => None,
         }
     }
 

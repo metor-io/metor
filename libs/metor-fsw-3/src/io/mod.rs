@@ -31,8 +31,7 @@ pub(crate) mod queue;
 #[cfg(all(feature = "host", unix))]
 mod reactor;
 mod record;
-#[cfg_attr(not(test), expect(dead_code, reason = "the pack ABI attaches regions"))]
-mod region;
+pub(crate) mod region;
 mod rng;
 pub(crate) mod shared;
 mod sim;

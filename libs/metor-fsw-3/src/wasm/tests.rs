@@ -26,10 +26,10 @@ fn wat(memory: &str, extra: &str, execute: &str) -> String {
         r#"(module
             (import "env" "memory" (memory {memory}))
             {extra}
-            (func (export "metor_fsw_abi_version") (result i32) i32.const 9)
+            (func (export "metor_fsw_abi_version") (result i32) i32.const 10)
             (func (export "metor_fsw_pack_def") (param i32 i32 i32) (result i32) i32.const 0)
             (func (export "metor_fsw_def") (param i32 i32 i32 i32 i32) (result i32) i32.const 0)
-            (func (export "metor_fsw_create") (param i32 i32 i32 i32 i32 i32) (result i32)
+            (func (export "metor_fsw_create") (param i32 i32 i32 i32 i32 i32 i32) (result i32)
                 i32.const 0)
             (func (export "metor_fsw_execute") (param i32 i64) (result i32) {execute})
             (func (export "metor_fsw_alloc") (param i32 i32) (result i32) i32.const 0)
@@ -166,7 +166,7 @@ fn test_accesses_stay_in_memory() {
 #[test]
 fn test_calls_reach_each_export() {
     let mut guest = guest("1", "", "i32.const 4", PAGE);
-    assert_eq!(guest.abi_version(1_000), Ok(9));
+    assert_eq!(guest.abi_version(1_000), Ok(10));
     assert_eq!(guest.execute(0, 0, 1_000), Ok(4));
     assert_eq!(guest.alloc(16, 16, 1_000), Ok(0));
     assert_eq!(guest.free(0, 16, 16, 1_000), Ok(()));
@@ -189,7 +189,7 @@ fn open(text: &str) -> Result<WasmPack, PackError> {
 #[test]
 fn test_wrong_abi_is_mismatch() {
     let text = wat("1", "", "i32.const 0")
-        .replace("(result i32) i32.const 9)", "(result i32) i32.const 1)");
+        .replace("(result i32) i32.const 10)", "(result i32) i32.const 1)");
     assert!(matches!(
         open(&text),
         Err(PackError::AbiMismatch {
@@ -237,14 +237,14 @@ fn step_wat(execute: &str) -> String {
             (global $in (mut i32) (i32.const 0))
             (global $out (mut i32) (i32.const 0))
             (data (i32.const 16) "{json}")
-            (func (export "metor_fsw_abi_version") (result i32) i32.const 9)
+            (func (export "metor_fsw_abi_version") (result i32) i32.const 10)
             (func (export "metor_fsw_pack_def") (param $dst i32) (param i32) (param $written i32)
                 (result i32)
                 (memory.copy (local.get $dst) (i32.const 16) (i32.const {len}))
                 (i32.store (local.get $written) (i32.const {len}))
                 i32.const 0)
             (func (export "metor_fsw_def") (param i32 i32 i32 i32 i32) (result i32) i32.const 2)
-            (func (export "metor_fsw_create") (param i32 i32 i32 i32 i32 i32) (result i32)
+            (func (export "metor_fsw_create") (param i32 i32 i32 i32 i32 i32 i32) (result i32)
                 (if (i32.load offset=4 (local.get 3))
                     (then (global.set $in (i32.load (i32.load (i32.load (local.get 3)))))))
                 (if (i32.load offset=4 (local.get 4))

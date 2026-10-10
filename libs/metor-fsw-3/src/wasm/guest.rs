@@ -11,6 +11,9 @@ use wasmi::{
     StoreLimitsBuilder, TrapCode, TypedFunc, WasmParams, WasmResults,
 };
 
+/// The guest addresses `metor_fsw_create` takes.
+pub type CreateArgs = (u32, u32, u32, u32, u32, u32, u32);
+
 /// The number of bytes in one wasm page.
 pub const PAGE: usize = 64 * 1024;
 
@@ -146,7 +149,7 @@ struct Exports {
     abi_version: TypedFunc<(), u32>,
     pack_def: TypedFunc<(u32, u32, u32), u32>,
     def: TypedFunc<(u32, u32, u32, u32, u32), u32>,
-    create: TypedFunc<(u32, u32, u32, u32, u32, u32), u32>,
+    create: TypedFunc<CreateArgs, u32>,
     execute: TypedFunc<(u32, i64), u32>,
     alloc: TypedFunc<(u32, u32), u32>,
     free: TypedFunc<(u32, u32, u32), ()>,
@@ -217,9 +220,9 @@ impl Guest {
     /// Calls `metor_fsw_create`.
     ///
     /// `args` holds the guest addresses of the `RawSlice`s for
-    /// `(ty, params, def, inputs, outputs, error)`. Returns the instance, or
-    /// zero if creation failed.
-    pub fn create(&mut self, args: (u32, u32, u32, u32, u32, u32), fuel: u64) -> Result<u32, Trap> {
+    /// `(ty, params, def, inputs, outputs)`, then of the `RawRing` table and
+    /// the error `RawSlice`. Returns the instance, or zero if creation failed.
+    pub fn create(&mut self, args: CreateArgs, fuel: u64) -> Result<u32, Trap> {
         call(&mut self.store, self.exports.create, args, fuel)
     }
 

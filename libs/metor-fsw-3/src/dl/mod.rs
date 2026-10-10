@@ -11,13 +11,17 @@ mod pack_ref;
 pub mod slot;
 pub mod store;
 
+use core::ptr::NonNull;
 use std::sync::Arc;
 
 use metor_fsw_3_ring::RingBuffer;
 
 use crate::coordinator::{BuildError, ParamError, Step, SystemTable, TableEntry};
 use crate::def::{DefCx, DefError};
+use crate::io::region::Region;
+use crate::io::{End, SharedIo};
 use crate::pack::def::{Instance, PackDef, PackSystemDef};
+use crate::pack::raw::RawRing;
 use crate::system::SystemDef;
 use crate::wasm::{Trap, WasmError, WasmPack};
 
@@ -75,19 +79,70 @@ impl Pack {
     }
 
     /// Creates one instance of type `ty` on the given rings.
+    ///
+    /// A system with a `Cap` shares its IO region with the host: on its first
+    /// make the pack lays one out and the host's member adopts it; a remake
+    /// is given the member's region. The host never rewinds it. A
+    /// `DeviceSide` is refused, since a guest cannot reach the target's
+    /// tables.
     pub fn create(
         &self,
         ty: &str,
         params: &serde_json::Value,
         instance: &Instance,
-        inputs: &[Vec<&RingBuffer>],
-        outputs: &[&RingBuffer],
+        ports: Ports<'_>,
+        io: &SharedIo,
     ) -> Result<Box<dyn Step>, ParamError> {
-        Ok(match self {
-            Pack::Dl(pack) => Box::new(pack.create(ty, params, instance, inputs, outputs)?),
+        let id = &instance.id;
+        if instance.def.grants.iter().any(|g| g.end == End::Device) {
+            return Err(ParamError::GuestDeviceSide { system: id.clone() });
+        }
+        let member = io.borrow().find(id);
+        let exported = member.as_ref().and_then(|m| m.table.bufs.export());
+        let mut table = exported.map_or(RawRing::EMPTY, |(span, owner)| RawRing {
+            base: span.cast().as_ptr(),
+            len: span.len(),
+            owner: Some(owner),
+        });
+        let (inputs, outputs) = ports;
+        let step: Box<dyn Step> = match self {
+            Pack::Dl(pack) => {
+                Box::new(pack.create(ty, params, instance, inputs, outputs, &mut table)?)
+            }
             Pack::Wasm(pack) => Box::new(pack.create(ty, params, instance, inputs, outputs)?),
-        })
+        };
+        if member.is_none() {
+            // SAFETY: a pack writes back a live region with an owner that
+            // meets `RawOwner`'s contract, or an empty one.
+            unsafe { adopt(io, instance, table) }?;
+        }
+        Ok(step)
     }
+}
+
+/// An instance's input and output rings.
+pub type Ports<'a> = (&'a [Vec<&'a RingBuffer>], &'a [&'a RingBuffer]);
+
+/// Makes system `instance`'s member over the region its pack returned.
+///
+/// # Safety
+/// A non-empty `table` is live, and its owner meets `RawOwner`'s contract.
+unsafe fn adopt(io: &SharedIo, instance: &Instance, table: RawRing) -> Result<(), ParamError> {
+    let (Some(base), Some(owner)) = (NonNull::new(table.base), table.owner) else {
+        return Ok(());
+    };
+    let caps: Vec<String> = crate::pack::host_caps(&instance.def).collect();
+    if caps.is_empty() || table.len == 0 {
+        return Ok(());
+    }
+    // SAFETY: the caller's contract.
+    let region = unsafe { Region::shared(base, table.len, owner) };
+    let system = instance.id.clone();
+    let mut io = io.borrow_mut();
+    let member = io.adopt_region(&system, caps, region);
+    member
+        .map(drop)
+        .map_err(|_| ParamError::CorruptTable { system })
 }
 
 impl SystemTable {
@@ -124,7 +179,8 @@ fn entry(pack: &Arc<Pack>, system: &PackSystemDef) -> TableEntry {
                 def: cx.def.clone(),
                 adapter: cx.adapter.cloned(),
             };
-            make_pack.create(&make_ty, cx.params.0, &instance, &cx.inputs, &cx.outputs)
+            let ports = (&cx.inputs[..], &cx.outputs[..]);
+            make_pack.create(&make_ty, cx.params.0, &instance, ports, cx.io)
         }),
     }
 }

@@ -82,6 +82,12 @@ impl<'g> Args<'g> {
         Ok((ptr, len(rings.len())?))
     }
 
+    /// Writes an empty `RawRing` and returns its offset, for an export to
+    /// write a region into.
+    pub(super) fn table(&mut self) -> Result<u32, PackError> {
+        self.alloc(WASM32_RAW_RING as u32, WASM32_USIZE)
+    }
+
     /// Writes an array of `RawSlice`s, one per `(ptr, len)` pair.
     ///
     /// Returns the offset of a `RawSlice` over that array.

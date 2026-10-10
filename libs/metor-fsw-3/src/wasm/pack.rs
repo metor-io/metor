@@ -184,8 +184,9 @@ fn call_create(guest: &mut Guest, call: Create<'_>) -> Result<u32, ParamError> {
     let inputs = args.ports(&edges)?;
     let (outs, len) = args.rings(call.outputs)?;
     let outputs = args.slice(outs, len)?;
+    let table = args.table()?;
     let error = args.slice(0, 0)?;
-    let create = (ty, params, def, inputs, outputs, error);
+    let create = (ty, params, def, inputs, outputs, table, error);
     let handle = args
         .guest()
         .create(create, DEFAULT_SETUP_FUEL)

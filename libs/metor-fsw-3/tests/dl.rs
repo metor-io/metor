@@ -3,6 +3,10 @@
 
 mod common;
 
+#[path = "fixtures/echo-pack/src/gps.rs"]
+#[allow(dead_code)]
+mod gps;
+
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -380,4 +384,83 @@ fn test_guest_ports_survive_pack_drop() {
     // SAFETY: as above. A second call checks that both TLS handles were
     // released.
     assert_eq!(unsafe { release() }, 0);
+}
+
+mod io {
+    use metor_fsw_3::coordinator::{BuildError, CoordinatorConfig, ParamError, SystemConfig};
+    use metor_fsw_3::io::{Backing, Grant, ResourceConfig, SimKind};
+
+    use super::*;
+    use crate::gps;
+
+    type Fixes = Rc<RefCell<usize>>;
+
+    #[system]
+    fn fixes(#[state] seen: &mut Fixes, fix: &mut Input<gps::Gps>) {
+        *seen.borrow_mut() += fix.drain().count();
+    }
+
+    fn io_table(pack: &Arc<Pack>, fixes_seen: &Fixes) -> SystemTable {
+        let mut table = SystemTable::new();
+        metor_fsw_3::link::register_builtins(&mut table).unwrap();
+        table.register_pack("echo", pack.clone()).unwrap();
+        table
+            .register("uart_script", gps::uart_script(), gps::UartScript::new)
+            .unwrap();
+        let seen = fixes_seen.clone();
+        table
+            .register("fixes", fixes(), move || seen.clone())
+            .unwrap();
+        table
+    }
+
+    /// `tests/golden/sim.py`'s target: echo-pack's `gps` driver on a sim
+    /// serial port, served by a host model.
+    fn sim_target() -> CoordinatorConfig {
+        let mut config: CoordinatorConfig =
+            serde_json::from_str(include_str!("golden/sim.json")).unwrap();
+        config.systems[2].ty = "uart_script".into();
+        config.systems.push(SystemConfig {
+            inputs: vec![InputConfig::new("fix", "gps", "fix")],
+            ..SystemConfig::new("fixes", "fixes")
+        });
+        config
+    }
+
+    #[test]
+    fn dylib_driver_shares_its_region_with_the_host() {
+        let pack = open();
+        let seen = Fixes::default();
+        let mut c = sim_target().build(&io_table(&pack, &seen)).unwrap();
+        for t in 1..6 {
+            c.step(Timestamp(t));
+        }
+        assert_eq!(c.latched().count(), 0);
+        assert!(*seen.borrow() > 0, "the dylib driver read a fix");
+    }
+
+    #[test]
+    fn guest_device_side_is_refused() {
+        let pack = open();
+        let config = CoordinatorConfig {
+            systems: vec![SystemConfig {
+                grants: vec![Grant {
+                    param: "uart".into(),
+                    resource: "line".into(),
+                }],
+                ..SystemConfig::new("model", "echo.uart_script")
+            }],
+            resources: vec![ResourceConfig {
+                id: "line".into(),
+                backing: Backing::Sim(SimKind::Uart),
+            }],
+            ..CoordinatorConfig::default()
+        };
+        let err = config.build(&io_table(&pack, &Fixes::default())).err();
+        let refused = |e: &BuildError| {
+            matches!(e, BuildError::Params { source: ParamError::GuestDeviceSide { system }, .. }
+                if system == "model")
+        };
+        assert!(err.as_ref().is_some_and(refused), "{err:?}");
+    }
 }

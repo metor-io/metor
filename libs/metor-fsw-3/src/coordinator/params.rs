@@ -60,6 +60,10 @@ pub enum ParamError {
     IoMemory { need: usize, reason: String },
     #[error("`{system}` takes an `Rng`, but a guest's make has no target seed")]
     GuestRng { system: String },
+    #[error("`{system}` serves a `DeviceSide`, which a guest cannot")]
+    GuestDeviceSide { system: String },
+    #[error("`{system}`: its IO buffer table is corrupt")]
+    CorruptTable { system: String },
     #[error("`{system}`: its old IO buffers are still held")]
     IoBusy { system: String },
     #[error("resource `{id}`: {message}")]

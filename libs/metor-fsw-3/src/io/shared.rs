@@ -71,7 +71,6 @@ impl IoShared {
 
     /// Makes system `id`'s member over `region`, an arena laid out
     /// elsewhere. Its later makes rewind it through `member`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the pack ABI attaches regions"))]
     pub(crate) fn adopt_region(
         &mut self,
         id: &str,

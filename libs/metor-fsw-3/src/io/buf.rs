@@ -13,8 +13,12 @@
 //! checked against the region each time it is read.
 
 use core::cell::{Cell, RefCell};
+use core::ffi::c_void;
 use core::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::Arc;
+
+use metor_fsw_3_ring::RawOwner;
 
 use zerocopy::little_endian::{U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -143,9 +147,8 @@ fn dir_len(slots: u16) -> usize {
 
 enum Arena {
     Making(Vec<u8>),
-    Frozen(NonNull<[u8]>),
+    Frozen(Arc<Mem>),
     /// Memory another party owns or this side mirrors. Its size is fixed.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the pack ABI attaches regions"))]
     Region(Region),
 }
 
@@ -153,7 +156,7 @@ impl Arena {
     fn base(&mut self) -> NonNull<u8> {
         match self {
             Self::Making(v) => NonNull::new(v.as_mut_ptr()).unwrap_or(NonNull::dangling()),
-            Self::Frozen(p) => p.cast(),
+            Self::Frozen(m) => m.0.cast(),
             Self::Region(r) => r.base(),
         }
     }
@@ -161,7 +164,7 @@ impl Arena {
     fn len(&self) -> usize {
         match self {
             Self::Making(v) => v.len(),
-            Self::Frozen(p) => p.len(),
+            Self::Frozen(m) => m.0.len(),
             Self::Region(r) => r.len(),
         }
     }
@@ -170,7 +173,7 @@ impl Arena {
     fn fixed(&mut self) -> Option<NonNull<[u8]>> {
         match self {
             Self::Making(_) => None,
-            Self::Frozen(p) => Some(*p),
+            Self::Frozen(m) => Some(m.0),
             Self::Region(r) => Some(NonNull::slice_from_raw_parts(r.base(), r.len())),
         }
     }
@@ -214,7 +217,6 @@ impl BufTable {
     /// A table over a region laid out elsewhere. It is frozen: its size never
     /// changes. A directory that does not fit the region, or a held entry
     /// outside it, is `Corrupt`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the pack ABI attaches regions"))]
     pub(crate) fn from_region(mut region: Region) -> Result<Self, Corrupt> {
         let len = region.len();
         let header_len = size_of::<Header>();
@@ -300,7 +302,7 @@ impl BufTable {
         let mut arena = self.arena.borrow_mut();
         if let Arena::Making(v) = &mut *arena {
             let boxed = core::mem::take(v).into_boxed_slice();
-            *arena = Arena::Frozen(NonNull::from(Box::leak(boxed)));
+            *arena = Arena::Frozen(Arc::new(Mem(NonNull::from(Box::leak(boxed)))));
         }
     }
 
@@ -308,6 +310,26 @@ impl BufTable {
     /// region.
     pub fn region(&self) -> Option<NonNull<[u8]>> {
         self.arena.borrow_mut().fixed()
+    }
+
+    /// The fixed arena and an owner that keeps it alive, to share with
+    /// another party. `None` before `freeze`, and for a mirror, which is this
+    /// side's copy.
+    ///
+    /// The owner's context stays live while this table does.
+    pub fn export(&self) -> Option<(NonNull<[u8]>, RawOwner)> {
+        let mut arena = self.arena.borrow_mut();
+        let span = arena.fixed()?;
+        let owner = match &*arena {
+            Arena::Frozen(mem) => RawOwner {
+                context: Arc::as_ptr(mem).cast(),
+                retain: retain_mem,
+                release: release_mem,
+            },
+            Arena::Region(region) => region.owner()?,
+            Arena::Making(_) => return None,
+        };
+        Some((span, owner))
     }
 
     /// Clears the directory, so the next allocations start again at the first
@@ -436,13 +458,31 @@ fn grow(arena: &mut Arena, top: usize, cap: usize) -> Result<(), BufError> {
     Ok(())
 }
 
-impl Drop for BufTable {
+/// A frozen arena's memory. Counted by `Arc`, so a party it is shared with
+/// keeps it alive through a `RawOwner`.
+struct Mem(NonNull<[u8]>);
+
+// SAFETY: `Mem` only frees its memory. Access to the bytes goes through
+// `BufTable`, where each slot belongs to one side at a time.
+unsafe impl Send for Mem {}
+unsafe impl Sync for Mem {}
+
+impl Drop for Mem {
     fn drop(&mut self) {
-        if let Arena::Frozen(p) = *self.arena.get_mut() {
-            // SAFETY: `p` came from `Box::leak` in `freeze` and is freed once.
-            drop(unsafe { Box::from_raw(p.as_ptr()) });
-        }
+        // SAFETY: `self.0` came from `Box::leak` in `freeze`, and the last
+        // `Arc` frees it once.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
     }
+}
+
+unsafe extern "C" fn retain_mem(context: *const c_void) {
+    // SAFETY: `export` made `context` from a live `Arc<Mem>`.
+    unsafe { Arc::increment_strong_count(context.cast::<Mem>()) };
+}
+
+unsafe extern "C" fn release_mem(context: *const c_void) {
+    // SAFETY: each release gives back one reference `retain_mem` took.
+    unsafe { Arc::decrement_strong_count(context.cast::<Mem>()) };
 }
 
 /// The buffer tables of every system on a target. Backends resolve `BufRef`s

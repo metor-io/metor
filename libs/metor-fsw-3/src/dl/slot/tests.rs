@@ -132,4 +132,13 @@ fn test_same_ports() {
         ..a.clone()
     };
     assert!(same_ports(&a, &rooted));
+    let capped = SystemDef {
+        grants: vec![crate::io::GrantDef {
+            param: "uart".into(),
+            interface: "uart".into(),
+            end: crate::io::End::Host,
+        }],
+        ..a.clone()
+    };
+    assert!(!same_ports(&a, &capped), "candidates take the same caps");
 }

@@ -37,6 +37,10 @@ fn ring<T: Record>(readers: usize) -> TestRing {
 /// An unknown type gets an empty definition, since `create` fails before it
 /// binds any ports.
 fn instance_def(ty: &str) -> Vec<u8> {
+    instance_named(ty, ty)
+}
+
+fn instance_named(ty: &str, id: &str) -> Vec<u8> {
     let def = build()
         .get(ty)
         .map(|entry| entry.def.clone())
@@ -45,7 +49,7 @@ fn instance_def(ty: &str) -> Vec<u8> {
                 .expect("a static definition")
         });
     let instance = crate::pack::def::Instance {
-        id: ty.to_string(),
+        id: id.to_string(),
         def,
         adapter: None,
     };
@@ -55,26 +59,44 @@ fn instance_def(ty: &str) -> Vec<u8> {
 /// Calls `create` the way the host does and returns the result.
 fn create_raw(ty: &str, params: &str, inputs: &[RawSlice], outputs: &[RawRing]) -> Instance {
     let def = instance_def(ty);
+    create_with(ty, &def, params, (inputs, outputs), RawRing::EMPTY)
+}
+
+/// Calls `create` with instance JSON `def` and IO region `table`.
+fn create_with(
+    ty: &str,
+    def: &[u8],
+    params: &str,
+    (inputs, outputs): (&[RawSlice], &[RawRing]),
+    mut table: RawRing,
+) -> Instance {
     let mut error = RawSlice::EMPTY;
-    // SAFETY: every array outlives the call, and the rings outlive the instance.
+    // SAFETY: every array outlives the call, the rings outlive the instance,
+    // and a given region's owner is live.
     let handle = unsafe {
-        create(
-            build,
-            RawSlice::of(ty.as_bytes()),
-            RawSlice::of(params.as_bytes()),
-            RawSlice::of(&def),
-            RawSlice::of(inputs),
-            RawSlice::of(outputs),
-            &raw mut error,
-        )
+        let args = CreateArgs {
+            ty: RawSlice::of(ty.as_bytes()),
+            params: RawSlice::of(params.as_bytes()),
+            def: RawSlice::of(def),
+            inputs: RawSlice::of(inputs),
+            outputs: RawSlice::of(outputs),
+            table: &raw mut table,
+        };
+        create(build, args, &raw mut error)
     };
-    Instance { handle, error }
+    Instance {
+        handle,
+        error,
+        table,
+    }
 }
 
 /// One `create` result. It is destroyed when the test drops it.
 struct Instance {
     handle: *mut c_void,
     error: RawSlice,
+    /// The IO region `create` wrote back.
+    table: RawRing,
 }
 
 impl Instance {
@@ -444,4 +466,82 @@ fn test_builtin_abi_version() {
         source.contains(&format!("\nABI_VERSION = {ABI_VERSION}\n")),
         "metor_config declares another ABI"
     );
+}
+
+mod region {
+    use super::*;
+    use crate::io::{Cqe, Sqe};
+
+    /// `uplink`'s rings: its CQ in, its SQ and log out.
+    struct Rings {
+        cq: TestRing,
+        sq: TestRing,
+        log: TestRing,
+    }
+
+    fn rings() -> Rings {
+        Rings {
+            cq: ring::<Cqe>(1),
+            sq: ring::<Sqe>(1),
+            log: ring::<LogEvent>(1),
+        }
+    }
+
+    fn uplink(id: &str, rings: &Rings, table: RawRing) -> Instance {
+        let def = instance_named("uplink", id);
+        let edge = [rings.cq.raw()];
+        let inputs = [RawSlice::of(&edge)];
+        let outputs = [rings.sq.raw(), rings.log.raw()];
+        create_with("uplink", &def, "", (&inputs, &outputs), table)
+    }
+
+    fn bytes(table: &RawRing) -> &[u8] {
+        // SAFETY: the pack keeps the region alive while its member lives.
+        unsafe { core::slice::from_raw_parts(table.base, table.len) }
+    }
+
+    #[test]
+    fn first_create_returns_the_ctors_region() {
+        let rings = rings();
+        let made = uplink("first", &rings, RawRing::EMPTY);
+        assert!(
+            !made.handle.is_null(),
+            "{:?}",
+            String::from_utf8_lossy(made.error())
+        );
+        assert!(made.table.len > 0 && made.table.owner.is_some());
+        let region = bytes(&made.table);
+        assert!(region.windows(3).any(|w| w == b"cmd"), "the ctor's buffer");
+    }
+
+    #[test]
+    fn later_create_allocates_into_the_given_region() {
+        let rings = rings();
+        let first = uplink("a", &rings, RawRing::EMPTY);
+        let table = first.table;
+        drop(first);
+        let second = uplink("b", &rings, table);
+        assert!(
+            !second.handle.is_null(),
+            "{:?}",
+            String::from_utf8_lossy(second.error())
+        );
+        assert_eq!(
+            (second.table.base, second.table.len),
+            (table.base, table.len),
+            "the same region, adopted"
+        );
+    }
+
+    #[test]
+    fn system_without_io_returns_no_region() {
+        let made = create_raw(
+            "imu",
+            "",
+            &[],
+            &[ring::<Imu>(1).raw(), ring::<LogEvent>(1).raw()],
+        );
+        assert!(!made.handle.is_null());
+        assert_eq!(made.table.len, 0);
+    }
 }

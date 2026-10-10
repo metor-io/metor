@@ -33,7 +33,6 @@ impl Table {
     }
 
     /// A table over a region laid out elsewhere.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the pack ABI attaches regions"))]
     pub(crate) fn attach(region: Region) -> Result<Rc<Self>, Corrupt> {
         BufTable::from_region(region).map(Self::over)
     }
