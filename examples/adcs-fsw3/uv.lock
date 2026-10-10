@@ -31,5 +31,5 @@ source = { editable = "systems/seqs" }
 
 [[package]]
 name = "metor-config"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "../../libs/metor-fsw-3/python/metor-config" }

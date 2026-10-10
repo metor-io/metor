@@ -150,6 +150,8 @@ fn test_pack_reports_system_metadata() {
             "retained",
             "gps",
             "uart_script",
+            "chatter",
+            "reader",
             "until_fix",
             "count_up",
             "count_down",

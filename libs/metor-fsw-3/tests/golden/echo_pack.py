@@ -246,6 +246,37 @@ class UartScript(System):
     status: OutPort[SystemStatus]
 
 
+class Chatter(System):
+    "A serial device that sends random bytes, drawn from the target seed."
+
+    _pack = PACK
+    _ty = "chatter"
+    _ports = {"log": LogEvent, "status": SystemStatus}
+    _devices = {"uart": "uart"}
+
+    def __init__(self, *, uart: ResourceHandle) -> None:
+        super().__init__({}, {}, grants={"uart": uart})
+
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Reader(System):
+    "Reads continuously, and pings the sum of each read's bytes."
+
+    _pack = PACK
+    _ty = "reader"
+    _ports = {"sums": Ping, "log": LogEvent, "status": SystemStatus}
+    _caps = {"uart": "uart"}
+
+    def __init__(self, *, uart: ResourceHandle) -> None:
+        super().__init__({}, {}, grants={"uart": uart})
+
+    sums: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
 class UntilFix(System):
     "Completes on the first fix, or fails after `timeout_s` of cycle time."
 

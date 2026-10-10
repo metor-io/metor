@@ -1,5 +1,6 @@
 //! A test pack whose systems exercise the fsw-3 pack ABI.
 
+mod chatter;
 mod gps;
 
 use std::cell::RefCell;
@@ -330,6 +331,12 @@ pub fn pack() -> SystemTable {
         .expect("valid records");
     table
         .register("uart_script", gps::uart_script(), gps::UartScript::new)
+        .expect("valid records");
+    table
+        .register("chatter", chatter::chatter(), Default::default)
+        .expect("valid records");
+    table
+        .register("reader", chatter::reader(), chatter::Reader::new)
         .expect("valid records");
     table
         .register_sequence("until_fix", gps::until_fix(), gps::UntilFix::new)
