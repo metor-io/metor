@@ -1,4 +1,5 @@
 mod arena;
+mod device;
 #[cfg(all(feature = "host", unix))]
 mod dispatch;
 mod queue;

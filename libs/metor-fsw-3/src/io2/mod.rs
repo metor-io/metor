@@ -14,11 +14,13 @@ use serde::{Deserialize, Serialize};
 mod arena;
 mod cap;
 mod config;
+mod device;
 mod error;
 #[cfg(all(feature = "host", unix))]
 pub mod host;
 mod queue;
 mod status;
+pub mod test;
 mod wire;
 
 #[cfg(test)]
@@ -29,6 +31,7 @@ pub use cap::{
     Can, Cap, Dir, File, GpioLine, Handle, Interface, Listen, Messages, Stream, Uart, Udp,
 };
 pub use config::{Access, Backing, CanFilter, GpioDirection, RealKind, ResourceConfig, SimKind};
+pub use device::{DeviceSide, GpioModel, Model, Reply, UartModel};
 pub use error::{Errno, IoError, IoStatus};
 pub use queue::{
     Accept, BufOp, Close, Fsync, Gpio, Io, IoOp, Open, Pending, Raw, Read, Recv, Send, Slot, Tty,
