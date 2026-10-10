@@ -1,4 +1,6 @@
 mod arena;
+#[cfg(all(feature = "host", unix))]
+mod dispatch;
 mod queue;
 mod wire;
 

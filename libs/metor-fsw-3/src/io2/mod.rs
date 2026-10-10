@@ -15,6 +15,8 @@ mod arena;
 mod cap;
 mod config;
 mod error;
+#[cfg(all(feature = "host", unix))]
+mod host;
 mod queue;
 mod status;
 mod wire;

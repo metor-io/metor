@@ -117,7 +117,7 @@ fn accept_resolves_to_a_handle_on_the_same_queue() {
     lb.complete(Cqe::ok(sqe.token, RawHandle::new(5, 1).get()));
     let stream = accept.poll().unwrap().unwrap();
     assert_eq!(stream.raw(), RawHandle::new(5, 1));
-    let _ = stream.close();
+    drop(stream.close());
     let [close] = lb.submitted()[..] else {
         panic!()
     };
