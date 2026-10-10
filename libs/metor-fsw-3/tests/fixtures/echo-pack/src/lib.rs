@@ -339,6 +339,9 @@ pub fn pack() -> SystemTable {
         .register("reader", chatter::reader(), chatter::Reader::new)
         .expect("valid records");
     table
+        .register("grower", chatter::grower(), chatter::Grower::new)
+        .expect("valid records");
+    table
         .register_sequence("until_fix", gps::until_fix(), gps::UntilFix::new)
         .expect("valid records");
     table

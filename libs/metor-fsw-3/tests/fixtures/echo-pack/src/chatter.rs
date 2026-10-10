@@ -36,6 +36,30 @@ pub fn chatter(now: Timestamp, rng: &mut Rng, uart: &mut DeviceSide<Uart>) {
     uart.serve(now, &mut Chat(rng));
 }
 
+/// How many `Grower`s this process has made.
+static GROWN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Asks for 16 more bytes on each make, so a remake outgrows the region the
+/// first make laid out.
+pub struct Grower {
+    _buf: metor_fsw_3::Buf,
+}
+
+impl Grower {
+    pub fn new(io: &IoInit) -> Self {
+        let made = GROWN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Self {
+            _buf: io.alloc(16 * (made + 1)),
+        }
+    }
+}
+
+/// Holds a buffer and a serial port, and does nothing with them.
+#[system]
+pub fn grower(#[state] s: &mut Grower, uart: &Cap<Uart>) {
+    let _ = (s, uart);
+}
+
 pub struct Reader {
     rx: Slot<Read>,
 }

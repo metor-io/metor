@@ -5,6 +5,7 @@
 mod common;
 
 #[path = "fixtures/echo-pack/src/chatter.rs"]
+#[allow(dead_code)]
 mod chatter;
 
 use std::cell::RefCell;

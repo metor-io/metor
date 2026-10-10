@@ -277,6 +277,21 @@ class Reader(System):
     status: OutPort[SystemStatus]
 
 
+class Grower(System):
+    "Holds a buffer and a serial port, and does nothing with them."
+
+    _pack = PACK
+    _ty = "grower"
+    _ports = {"log": LogEvent, "status": SystemStatus}
+    _caps = {"uart": "uart"}
+
+    def __init__(self, *, uart: ResourceHandle) -> None:
+        super().__init__({}, {}, grants={"uart": uart})
+
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
 class UntilFix(System):
     "Completes on the first fix, or fails after `timeout_s` of cycle time."
 

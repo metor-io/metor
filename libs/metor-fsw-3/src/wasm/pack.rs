@@ -194,16 +194,21 @@ struct Create<'a> {
 }
 
 /// Copies the host's mirror of an IO arena into new guest memory, which the
-/// guest keeps for its life.
+/// guest keeps for its life. The old guest is gone, so every slot in the
+/// copy is free.
 fn give(guest: &mut Guest, mirror: &BufTable) -> Result<GuestRing, ParamError> {
-    let span = mirror
-        .region()
-        .ok_or(ParamError::Wasm("an unfrozen mirror".into()))?;
+    let unusable = || ParamError::Wasm("the IO mirror is unfrozen or corrupt".into());
+    let span = mirror.region().ok_or_else(unusable)?;
+    // SAFETY: the mirror's region is live, and only this step touches it.
+    let copy = Region::mirror(unsafe { span.as_ref() }.into());
+    let copy = BufTable::from_region(copy).map_err(|_| unusable())?;
+    copy.release_all();
+    let span = copy.region().ok_or_else(unusable)?;
     let len = u32::try_from(span.len())
         .map_err(|_| WasmError::TooLarge(span.len()))
         .map_err(PackError::from)?;
     let offset = allocated(guest, len, 8)?;
-    // SAFETY: the mirror's region is live, and only this step touches it.
+    // SAFETY: `copy` owns the region and is alive.
     let bytes = unsafe { span.as_ref() };
     guest.write(offset, bytes).map_err(PackError::from)?;
     Ok(GuestRing { offset, len })

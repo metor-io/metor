@@ -365,6 +365,14 @@ impl BufTable {
         Ok(())
     }
 
+    /// Frees every slot, for a copy of an arena whose old owner is gone.
+    pub(crate) fn release_all(&self) {
+        let mut arena = self.arena.borrow_mut();
+        let dir = arena.dir(self.slots);
+        dir.entries.iter_mut().for_each(|e| e.held = U32::ZERO);
+        dir.header.used = U32::ZERO;
+    }
+
     /// Frees a slot. Its bytes stay unused until a rewind.
     pub fn release(&self, slot: u16) {
         let mut arena = self.arena.borrow_mut();
