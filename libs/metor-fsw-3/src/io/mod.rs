@@ -31,6 +31,8 @@ pub(crate) mod queue;
 #[cfg(all(feature = "host", unix))]
 mod reactor;
 mod record;
+#[cfg_attr(not(test), expect(dead_code, reason = "the pack ABI attaches regions"))]
+mod region;
 mod rng;
 pub(crate) mod shared;
 mod sim;
@@ -46,7 +48,7 @@ mod uring;
 pub(crate) mod tests;
 
 pub use addr::RawAddr;
-pub use buf::{BufError, BufRef, BufTable, RawBuf, TableId, Tables};
+pub use buf::{BufError, BufRef, BufTable, Corrupt, RawBuf, TableId, Tables};
 pub use cap::{
     Can, Cap, Dial, Dir, File, GpioLine, Handle, Interface, Listen, Messages, Stream, TtyQueue,
     Uart, Udp,

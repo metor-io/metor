@@ -10,6 +10,7 @@ mod poll;
 mod queue;
 #[cfg(all(test, feature = "host", unix))]
 mod reactor;
+mod region;
 #[cfg(all(test, feature = "host", unix))]
 mod sim;
 mod slot;

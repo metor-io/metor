@@ -86,7 +86,7 @@ fn finished_init_freezes_the_table() {
     let first = IoInit::new(&rig.io);
     let buf = first.alloc_from(b"one");
     drop(first);
-    assert!(rig.io.table().bufs.arena().is_some());
+    assert!(rig.io.table().bufs.region().is_some());
     let again = IoInit::new(&rig.io);
     assert_eq!(again.alloc(1).capacity(), 0);
     assert!(matches!(

@@ -9,8 +9,9 @@ use std::rc::Rc;
 
 use crate::coordinator::ParamError;
 
-use super::Tables;
 use super::queue::Table;
+use super::region::Region;
+use super::{Corrupt, Tables};
 
 /// The state one build's IO systems share, behind `MakeCx::io`.
 #[derive(Default)]
@@ -65,7 +66,22 @@ impl IoShared {
             })?;
             return Ok(member.clone());
         }
-        let table = Table::new();
+        Ok(self.join(id, caps, Table::new()))
+    }
+
+    /// Makes system `id`'s member over `region`, an arena laid out
+    /// elsewhere. Its later makes rewind it through `member`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the pack ABI attaches regions"))]
+    pub(crate) fn adopt_region(
+        &mut self,
+        id: &str,
+        caps: Vec<String>,
+        region: Region,
+    ) -> Result<Rc<Member>, Corrupt> {
+        Ok(self.join(id, caps, Table::attach(region)?))
+    }
+
+    fn join(&mut self, id: &str, caps: Vec<String>, table: Rc<Table>) -> Rc<Member> {
         self.tables.add(&table.bufs);
         let member = Rc::new(Member {
             id: id.to_string(),
@@ -74,7 +90,7 @@ impl IoShared {
             quiesce: Quiesce::default(),
         });
         self.members.push(member.clone());
-        Ok(member)
+        member
     }
 }
 

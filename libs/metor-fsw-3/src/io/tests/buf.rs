@@ -78,13 +78,13 @@ fn frozen_pointers_stay_inside_and_still() {
     let a = t.alloc_from(b"a").unwrap();
     t.freeze();
     t.freeze();
-    let arena = t.arena().unwrap();
+    let arena = t.region().unwrap();
     let before = t.raw(a).unwrap();
     let z = t.alloc(0).unwrap();
     assert!(contains(arena, before));
     assert!(contains(arena, t.raw(z).unwrap()));
     assert_eq!(t.raw(a).unwrap().ptr, before.ptr);
-    assert_eq!(t.arena().unwrap(), arena);
+    assert_eq!(t.region().unwrap(), arena);
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn raw_is_none_unless_frozen_and_held() {
     let t = BufTable::new(2);
     let s = t.alloc(4).unwrap();
     assert!(t.raw(s).is_none());
-    assert!(t.arena().is_none());
+    assert!(t.region().is_none());
     t.freeze();
     assert!(t.raw(s).is_some());
     t.release(s);
@@ -217,4 +217,130 @@ fn past_capacity_after_rewind_is_no_space() {
     t.release(a);
     t.rewind().unwrap();
     assert_eq!(t.alloc(20), Err(BufError::NoSpace { need: 20, free: 16 }));
+}
+
+mod region {
+    use core::ffi::c_void;
+
+    use metor_fsw_3_ring::RawOwner;
+
+    use super::*;
+    use crate::io::region::Region;
+
+    unsafe extern "C" fn retain(context: *const c_void) {
+        unsafe { Rc::increment_strong_count(context.cast::<BufTable>()) };
+    }
+
+    unsafe extern "C" fn release(context: *const c_void) {
+        unsafe { Rc::decrement_strong_count(context.cast::<BufTable>()) };
+    }
+
+    /// A frozen table, as a pack's constructor leaves it.
+    fn made(caps: &[&[u8]]) -> Rc<BufTable> {
+        let t = Rc::new(BufTable::new(4));
+        for bytes in caps {
+            t.alloc_from(bytes).unwrap();
+        }
+        t.freeze();
+        t
+    }
+
+    /// `owner`'s arena, shared the way a dylib hands it over. The region
+    /// holds its own reference on `owner`.
+    fn shared(owner: &Rc<BufTable>) -> Region {
+        let span = owner.region().unwrap();
+        let raw = RawOwner {
+            context: Rc::as_ptr(owner).cast(),
+            retain,
+            release,
+        };
+        unsafe { Region::shared(span.cast(), span.len(), raw) }
+    }
+
+    fn mirrored(owner: &BufTable) -> Region {
+        let span = owner.region().unwrap();
+        Region::mirror(unsafe { span.as_ref() }.into())
+    }
+
+    #[test]
+    fn attached_table_sees_the_owners_entries_and_writes() {
+        let owner = made(&[b"cmd", b"fix"]);
+        let host = BufTable::from_region(shared(&owner)).unwrap();
+        assert_eq!(unsafe { host.filled(1) }, b"fix");
+        owner.set_len(0, 1).unwrap();
+        assert_eq!(
+            unsafe { host.filled(0) },
+            b"c",
+            "nothing caches the directory"
+        );
+        host.set_len(1, 2).unwrap();
+        assert_eq!(unsafe { owner.filled(1) }, b"fi");
+        assert_eq!(
+            host.region().map(|r| r.len()),
+            owner.region().map(|r| r.len())
+        );
+    }
+
+    #[test]
+    fn mirror_holds_a_copy() {
+        let owner = made(&[b"abc"]);
+        let mirror = BufTable::from_region(mirrored(&owner)).unwrap();
+        assert_eq!(unsafe { mirror.filled(0) }, b"abc");
+        owner.set_len(0, 1).unwrap();
+        assert_eq!(unsafe { mirror.filled(0) }, b"abc", "a copy, not a view");
+    }
+
+    #[test]
+    fn adopted_region_rewinds_and_refuses_overflow() {
+        let owner = made(&[b"12345678"]);
+        let mut io = IoShared::default();
+        let member = io
+            .adopt_region("gps", Vec::new(), mirrored(&owner))
+            .unwrap();
+        let bufs = &member.table.bufs;
+        bufs.release(0);
+        let again = io.member("gps", Vec::new()).unwrap();
+        assert!(
+            Rc::ptr_eq(&again, &member),
+            "a later make reuses the region"
+        );
+        assert_eq!(bufs.alloc_from(b"abcdefgh"), Ok(0), "the same entry again");
+        let full = Err(BufError::NoSpace { need: 1, free: 0 });
+        assert_eq!(bufs.alloc(1), full, "the region does not grow");
+    }
+
+    #[test]
+    fn entry_past_the_region_is_corrupt() {
+        let owner = made(&[b"abc"]);
+        let span = owner.region().unwrap();
+        let mut bytes: Box<[u8]> = unsafe { span.as_ref() }.into();
+        // The first entry's `cap`, past the header.
+        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let bad = BufTable::from_region(Region::mirror(bytes));
+        assert_eq!(bad.err(), Some(Corrupt));
+        let short = BufTable::from_region(Region::mirror(vec![0; 4].into()));
+        assert_eq!(short.err(), Some(Corrupt));
+    }
+
+    #[test]
+    fn checked_refuses_a_ref_to_no_entry() {
+        let owner = made(&[b"abc"]);
+        let host = BufTable::from_region(shared(&owner)).unwrap();
+        let held = host.checked(BufRef::new(0)).unwrap();
+        assert_eq!(held.len(), 3);
+        assert!(host.checked(BufRef::new(1)).is_none());
+        assert!(host.checked(BufRef::new(900)).is_none());
+    }
+
+    /// Also run under Miri: the arena outlives whichever handle drops last.
+    #[test]
+    fn region_outlives_either_handle() {
+        let owner = made(&[b"abc"]);
+        let host = BufTable::from_region(shared(&owner)).unwrap();
+        drop(host);
+        assert_eq!(unsafe { owner.filled(0) }, b"abc");
+        let host = BufTable::from_region(shared(&owner)).unwrap();
+        drop(owner);
+        assert_eq!(unsafe { host.filled(0) }, b"abc");
+    }
 }

@@ -7,6 +7,10 @@
 //! address, and only then does `raw` return pointers. After `freeze`, the only
 //! `&mut` into the allocation covers the directory or comes from the unsafe
 //! accessors, so pointers held by the kernel stay valid.
+//!
+//! A table can also sit over a region another party laid out, such as a
+//! guest's arena. Either side may change the directory, so every entry is
+//! checked against the region each time it is read.
 
 use core::cell::{Cell, RefCell};
 use core::ptr::NonNull;
@@ -14,6 +18,8 @@ use std::rc::Rc;
 
 use zerocopy::little_endian::{U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+
+use super::region::Region;
 
 /// The index of a `BufTable` in its `Tables`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -98,19 +104,38 @@ struct Dir {
     entries: [Entry],
 }
 
-impl Dir {
-    fn held(&self, slot: u16) -> Option<&Entry> {
-        self.entries
-            .get(usize::from(slot))
-            .filter(|e| e.held.get() != 0)
-    }
-
-    fn held_mut(&mut self, slot: u16) -> Option<&mut Entry> {
-        self.entries
-            .get_mut(usize::from(slot))
-            .filter(|e| e.held.get() != 0)
+impl Entry {
+    /// Whether the entry is held and lies inside an arena of `limit` bytes,
+    /// past a directory of `dir` bytes.
+    fn valid(&self, dir: usize, limit: usize) -> bool {
+        let (offset, cap) = (self.offset.get() as usize, self.cap.get() as usize);
+        self.held.get() != 0
+            && offset >= dir
+            && offset.checked_add(cap).is_some_and(|end| end <= limit)
+            && self.len.get() <= self.cap.get()
     }
 }
+
+impl Dir {
+    /// The held entry for `slot`, if it is valid in an arena of `limit`
+    /// bytes.
+    fn held(&self, slot: u16, limit: usize) -> Option<&Entry> {
+        let dir = dir_len(self.entries.len() as u16);
+        let entry = self.entries.get(usize::from(slot))?;
+        entry.valid(dir, limit).then_some(entry)
+    }
+
+    fn held_mut(&mut self, slot: u16, limit: usize) -> Option<&mut Entry> {
+        let dir = dir_len(self.entries.len() as u16);
+        let entry = self.entries.get_mut(usize::from(slot))?;
+        entry.valid(dir, limit).then_some(entry)
+    }
+}
+
+/// A region whose directory does not fit or names memory outside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a buffer table's directory is corrupt")]
+pub struct Corrupt;
 
 fn dir_len(slots: u16) -> usize {
     size_of::<Header>() + usize::from(slots) * size_of::<Entry>()
@@ -119,6 +144,9 @@ fn dir_len(slots: u16) -> usize {
 enum Arena {
     Making(Vec<u8>),
     Frozen(NonNull<[u8]>),
+    /// Memory another party owns or this side mirrors. Its size is fixed.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the pack ABI attaches regions"))]
+    Region(Region),
 }
 
 impl Arena {
@@ -126,6 +154,7 @@ impl Arena {
         match self {
             Self::Making(v) => NonNull::new(v.as_mut_ptr()).unwrap_or(NonNull::dangling()),
             Self::Frozen(p) => p.cast(),
+            Self::Region(r) => r.base(),
         }
     }
 
@@ -133,6 +162,16 @@ impl Arena {
         match self {
             Self::Making(v) => v.len(),
             Self::Frozen(p) => p.len(),
+            Self::Region(r) => r.len(),
+        }
+    }
+
+    /// The fixed memory, or `None` while a constructor may still grow it.
+    fn fixed(&mut self) -> Option<NonNull<[u8]>> {
+        match self {
+            Self::Making(_) => None,
+            Self::Frozen(p) => Some(*p),
+            Self::Region(r) => Some(NonNull::slice_from_raw_parts(r.base(), r.len())),
         }
     }
 
@@ -172,6 +211,44 @@ impl BufTable {
         }
     }
 
+    /// A table over a region laid out elsewhere. It is frozen: its size never
+    /// changes. A directory that does not fit the region, or a held entry
+    /// outside it, is `Corrupt`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the pack ABI attaches regions"))]
+    pub(crate) fn from_region(mut region: Region) -> Result<Self, Corrupt> {
+        let len = region.len();
+        let header_len = size_of::<Header>();
+        if len < header_len {
+            return Err(Corrupt);
+        }
+        // SAFETY: the region holds at least a header, and nothing else
+        // borrows it yet.
+        let head = unsafe { core::slice::from_raw_parts(region.base().as_ptr(), header_len) };
+        let header = Header::ref_from_bytes(head).map_err(|_| Corrupt)?;
+        let slots = u16::try_from(header.slots.get()).map_err(|_| Corrupt)?;
+        if dir_len(slots) > len {
+            return Err(Corrupt);
+        }
+        let mut arena = Arena::Region(region);
+        let dir = arena.dir(slots);
+        let bad = |e: &Entry| e.held.get() != 0 && !e.valid(dir_len(slots), len);
+        if dir.entries.iter().any(bad) {
+            return Err(Corrupt);
+        }
+        Ok(Self {
+            arena: RefCell::new(arena),
+            slots,
+            id: Cell::new(None),
+        })
+    }
+
+    /// The memory of the held slot `at` names, if it lies inside the arena.
+    /// For a `BufRef` read from an untrusted op.
+    pub fn checked(&self, at: BufRef) -> Option<NonNull<[u8]>> {
+        let raw = self.raw(at.slot())?;
+        Some(NonNull::slice_from_raw_parts(raw.ptr, raw.cap as usize))
+    }
+
     /// The table's index in its `Tables`, once added.
     pub fn id(&self) -> Option<TableId> {
         self.id.get()
@@ -188,7 +265,7 @@ impl BufTable {
             .iter()
             .position(|e| e.held.get() == 0)
             .ok_or(BufError::Full)?;
-        let top = dir.header.top.get() as usize;
+        let top = (dir.header.top.get() as usize).max(dir_len(self.slots));
         grow(&mut arena, top, cap)?;
         let dir = arena.dir(self.slots);
         dir.entries[slot] = Entry {
@@ -227,12 +304,10 @@ impl BufTable {
         }
     }
 
-    /// The whole allocation, once frozen.
-    pub fn arena(&self) -> Option<NonNull<[u8]>> {
-        match *self.arena.borrow() {
-            Arena::Frozen(p) => Some(p),
-            Arena::Making(_) => None,
-        }
+    /// The whole allocation, once frozen. It crosses the pack ABI as one
+    /// region.
+    pub fn region(&self) -> Option<NonNull<[u8]>> {
+        self.arena.borrow_mut().fixed()
     }
 
     /// Clears the directory, so the next allocations start again at the first
@@ -254,7 +329,8 @@ impl BufTable {
     pub fn release(&self, slot: u16) {
         let mut arena = self.arena.borrow_mut();
         let dir = arena.dir(self.slots);
-        if let Some(e) = dir.held_mut(slot) {
+        let held = dir.entries.get_mut(usize::from(slot));
+        if let Some(e) = held.filter(|e| e.held.get() != 0) {
             e.held = U32::ZERO;
             dir.header.used = U32::new(dir.header.used.get() - 1);
         }
@@ -263,10 +339,8 @@ impl BufTable {
     /// A pointer to the slot's memory, or `None` before `freeze`.
     pub fn raw(&self, slot: u16) -> Option<RawBuf> {
         let mut arena = self.arena.borrow_mut();
-        let Arena::Frozen(base) = *arena else {
-            return None;
-        };
-        let e = arena.dir(self.slots).held(slot)?;
+        let base = arena.fixed()?;
+        let e = arena.dir(self.slots).held(slot, base.len())?;
         // SAFETY: a held entry lies inside the allocation.
         let ptr = unsafe { base.cast::<u8>().add(e.offset.get() as usize) };
         Some(RawBuf {
@@ -279,15 +353,17 @@ impl BufTable {
     /// The slot's capacity, or 0 for a free slot.
     pub fn capacity(&self, slot: u16) -> u32 {
         let mut arena = self.arena.borrow_mut();
+        let limit = arena.len();
         let dir = arena.dir(self.slots);
-        dir.held(slot).map_or(0, |e| e.cap.get())
+        dir.held(slot, limit).map_or(0, |e| e.cap.get())
     }
 
     pub fn set_len(&self, slot: u16, len: u32) -> Result<(), BufError> {
         let mut arena = self.arena.borrow_mut();
+        let limit = arena.len();
         let e = arena
             .dir(self.slots)
-            .held_mut(slot)
+            .held_mut(slot, limit)
             .ok_or(BufError::BadSlot)?;
         if len > e.cap.get() {
             return Err(BufError::TooLarge);
@@ -331,7 +407,8 @@ impl BufTable {
     /// A held slot's start and `len(entry)`, or an empty span for a free slot.
     fn span(&self, slot: u16, len: impl Fn(&Entry) -> u32) -> (*mut u8, usize) {
         let mut arena = self.arena.borrow_mut();
-        let Some(e) = arena.dir(self.slots).held(slot) else {
+        let limit = arena.len();
+        let Some(e) = arena.dir(self.slots).held(slot, limit) else {
             return (NonNull::dangling().as_ptr(), 0);
         };
         let (offset, len) = (e.offset.get() as usize, len(e) as usize);
@@ -342,16 +419,20 @@ impl BufTable {
 
 /// Makes room for `cap` bytes at `top`.
 fn grow(arena: &mut Arena, top: usize, cap: usize) -> Result<(), BufError> {
-    let free = arena.len() - top;
+    let free = arena.len().saturating_sub(top);
     if top + cap > u32::MAX as usize {
         return Err(BufError::TooLarge);
     }
-    match arena {
-        Arena::Making(v) => v.resize(top + cap, 0),
-        Arena::Frozen(_) if cap > free => return Err(BufError::NoSpace { need: cap, free }),
-        // SAFETY: `top..top + cap` lies inside the allocation, past every held slot.
-        Arena::Frozen(p) => unsafe { p.cast::<u8>().add(top).write_bytes(0, cap) },
+    if let Arena::Making(v) = arena {
+        v.resize(top + cap, 0);
+        return Ok(());
     }
+    if cap > free {
+        return Err(BufError::NoSpace { need: cap, free });
+    }
+    // SAFETY: `top..top + cap` lies inside the fixed arena, past every held
+    // slot.
+    unsafe { arena.base().as_ptr().add(top).write_bytes(0, cap) };
     Ok(())
 }
 

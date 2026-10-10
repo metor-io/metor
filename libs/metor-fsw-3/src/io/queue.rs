@@ -8,8 +8,11 @@ use std::rc::Rc;
 use crate::port::{Input, Output};
 
 use super::pending::{Inner, Pending, Raw};
+use super::region::Region;
 use super::slot::Buf;
-use super::{BufError, BufTable, Cqe, IoError, IoStatus, MAX_OPS, Op, Out, RawHandle, Sqe, Token};
+use super::{
+    BufError, BufTable, Corrupt, Cqe, IoError, IoStatus, MAX_OPS, Op, Out, RawHandle, Sqe, Token,
+};
 
 /// The buffer slots one system's table holds.
 pub(crate) const BUF_SLOTS: usize = 64;
@@ -26,8 +29,18 @@ pub(crate) struct Table {
 
 impl Table {
     pub(crate) fn new() -> Rc<Self> {
+        Self::over(BufTable::new(BUF_SLOTS))
+    }
+
+    /// A table over a region laid out elsewhere.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the pack ABI attaches regions"))]
+    pub(crate) fn attach(region: Region) -> Result<Rc<Self>, Corrupt> {
+        BufTable::from_region(region).map(Self::over)
+    }
+
+    fn over(bufs: BufTable) -> Rc<Self> {
         Rc::new(Self {
-            bufs: Rc::new(BufTable::new(BUF_SLOTS)),
+            bufs: Rc::new(bufs),
             making: Cell::new(false),
             shortfall: Cell::new(0),
             refusal: Cell::new(None),

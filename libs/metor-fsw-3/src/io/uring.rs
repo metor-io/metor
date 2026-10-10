@@ -575,7 +575,7 @@ fn register_tables(ring: &IoUring, tables: &Tables) -> Result<Vec<Option<u16>>, 
     let mut iovs = Vec::new();
     let fixed = (0..tables.len())
         .map(|i| {
-            let arena = tables.get(TableId(i as u16))?.arena()?;
+            let arena = tables.get(TableId(i as u16))?.region()?;
             iovs.push(libc::iovec {
                 iov_base: arena.cast().as_ptr(),
                 iov_len: arena.len(),

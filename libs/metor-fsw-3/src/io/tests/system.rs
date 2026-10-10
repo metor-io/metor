@@ -469,7 +469,7 @@ mod cases {
         let systems = vec![granted("srv", "acceptor", &[("listen", "l")])];
         let mut c = build(&seen, systems, vec![listen("l")]).unwrap();
         let tables = os.borrow().tables.clone().unwrap();
-        assert!(tables.get(TableId(0)).unwrap().arena().is_some());
+        assert!(tables.get(TableId(0)).unwrap().region().is_some());
         c.step(Timestamp(1));
         assert_eq!(pushed(&os).len(), 1, "only the accept");
         assert!(seen.status.borrow().is_empty() || seen.status.borrow()[0].completed == 0);
