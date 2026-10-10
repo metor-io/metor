@@ -15,6 +15,10 @@ impl Threads {
     pub fn new() -> Self {
         Self
     }
+
+    pub fn deterministic() -> Self {
+        Self
+    }
 }
 
 /// Returns an error naming the system, since async systems need threads.

@@ -141,6 +141,7 @@ fn evaluate() -> CoordinatorConfig {
         .coordinator;
     config.clock = Clock::Simulated {
         dt: Duration::from_secs_f64(DT),
+        epoch: None,
     };
     config.systems.retain(|system| system.ty != "fsw.publish");
     config.systems.push(SystemConfig {

@@ -21,7 +21,7 @@ use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
 
-use super::config::{Adapter, Clock, CoordinatorConfig, PortRef, SystemConfig};
+use super::config::{Adapter, BuildOptions, Clock, CoordinatorConfig, PortRef, SystemConfig};
 use super::error::BuildError;
 use super::params::Params;
 use super::run::{Coordinator, Entry};
@@ -75,7 +75,19 @@ impl PlannedSystem<'_> {
 impl CoordinatorConfig {
     /// Builds a [`Coordinator`] from this config, creating systems from `table`.
     pub fn build(self, table: &SystemTable) -> Result<Coordinator, BuildError> {
+        self.build_with(table, BuildOptions::default())
+    }
+
+    /// Builds a [`Coordinator`] with `options`.
+    pub fn build_with(
+        self,
+        table: &SystemTable,
+        options: BuildOptions,
+    ) -> Result<Coordinator, BuildError> {
         self.clock.validate()?;
+        if options.deterministic {
+            self.clock.check_deterministic()?;
+        }
         check_channels(&self)?;
         check_resources(&self.resources)?;
         let mut plan = resolve(&self, table)?;
@@ -87,7 +99,10 @@ impl CoordinatorConfig {
             .iter()
             .map(|spec| allocate_ring(spec, self.ring_depth))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut threads = Threads::new();
+        let mut threads = match options.deterministic {
+            true => Threads::deterministic(),
+            false => Threads::new(),
+        };
         let io = SharedIo::default();
         io.borrow_mut().resources = self.resources.clone();
         io.borrow_mut().grants = granted(&self.systems);
@@ -100,7 +115,7 @@ impl CoordinatorConfig {
         Ok(Coordinator {
             entries,
             clock: self.clock,
-            epoch: Timestamp::now(),
+            epoch: self.clock.epoch().unwrap_or_else(Timestamp::now),
             cycle: 0,
             rings,
         })
@@ -774,6 +789,22 @@ impl Clock {
         Ok(())
     }
 
+    fn check_deterministic(&self) -> Result<(), BuildError> {
+        match self {
+            Self::Wall { .. } => Err(BuildError::DeterministicWall),
+            Self::Simulated { dt, .. } if dt.is_zero() => Err(BuildError::DeterministicZeroDt),
+            Self::Simulated { .. } => Ok(()),
+        }
+    }
+
+    /// The fixed start of a simulated clock, if it has one.
+    pub(crate) fn epoch(&self) -> Option<Timestamp> {
+        match self {
+            Self::Simulated { epoch, .. } => *epoch,
+            Self::Wall { .. } => None,
+        }
+    }
+
     /// Returns the wall-clock time budget for one cycle.
     ///
     /// Returns zero for a simulated clock.
@@ -1401,7 +1432,8 @@ mod tests {
     fn test_zero_cycle_budget() {
         assert_eq!(
             Clock::Simulated {
-                dt: Duration::from_millis(5)
+                dt: Duration::from_millis(5),
+                epoch: None,
             }
             .cycle_budget(),
             Duration::ZERO

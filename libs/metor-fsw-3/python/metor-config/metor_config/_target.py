@@ -57,7 +57,8 @@ class Target:
     that advances that much each cycle. Without it, the target runs in real
     time at ``cycle_rate`` Hz. ``namespace`` is prefixed to the names the
     target announces to its peers. ``seed`` is the seed every `Rng` parameter
-    draws from.
+    draws from. ``epoch`` fixes the start of a simulated clock, in
+    microseconds since the Unix epoch.
     """
 
     def __init__(
@@ -67,9 +68,13 @@ class Target:
         ring_depth: int = 8,
         namespace: str | None = None,
         seed: int = 0,
+        epoch: int | None = None,
     ) -> None:
         if not 0 <= seed < 2**64:
             raise ConfigError(f"`seed` is an unsigned 64-bit integer, got {seed}")
+        if epoch is not None and sim_dt is None:
+            raise ConfigError("`epoch` fixes a simulated clock's start, so it needs `sim_dt`")
+        self.epoch = epoch
         self.seed = seed
         self.cycle_rate = float(cycle_rate)
         self.sim_dt = sim_dt
@@ -398,7 +403,7 @@ class Target:
 
     def _clock(self) -> dict[str, Any]:
         if self.sim_dt is not None:
-            return simulated_clock(self.sim_dt)
+            return simulated_clock(self.sim_dt, self.epoch)
         return wall_clock(self.cycle_rate)
 
 

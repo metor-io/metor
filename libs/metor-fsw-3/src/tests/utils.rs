@@ -298,7 +298,7 @@ async fn next(imu: &mut Input<Imu, Notifier>, stop: &Stop) -> Option<Imu> {
 }
 
 /// Returns this thread's ID, hashed into a number a frame can carry.
-fn thread_id() -> u64 {
+pub fn thread_id() -> u64 {
     use core::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::thread::current().id().hash(&mut hasher);

@@ -112,7 +112,7 @@ impl Coordinator {
     fn now(&self) -> Timestamp {
         match self.clock {
             Clock::Wall { .. } => Timestamp::now(),
-            Clock::Simulated { dt } => simulated_time(self.epoch, self.cycle, dt),
+            Clock::Simulated { dt, .. } => simulated_time(self.epoch, self.cycle, dt),
         }
     }
 }
@@ -254,6 +254,7 @@ mod tests {
         let mut config = pipeline_config();
         config.clock = Clock::Simulated {
             dt: Duration::from_millis(20),
+            epoch: None,
         };
         watched(&mut config, &["imu"]);
         let mut coordinator = config.build(&table(&recorder)).unwrap();
@@ -266,6 +267,39 @@ mod tests {
             .map(|status| status.timestamp.0 - epoch)
             .collect();
         assert_eq!(stamps, vec![0, 20_000, 40_000]);
+    }
+
+    #[stellarator::test]
+    async fn test_epoch_fixes_the_first_cycle() {
+        let recorder = Recorder::default();
+        let mut config = pipeline_config();
+        config.clock = Clock::Simulated {
+            dt: Duration::from_millis(20),
+            epoch: Some(Timestamp(1_000)),
+        };
+        watched(&mut config, &["imu"]);
+        let mut coordinator = config.build(&table(&recorder)).unwrap();
+        coordinator.run(utils::after_cycles(2)).await;
+        let stamps: Vec<_> = recorder
+            .take_status()
+            .into_iter()
+            .map(|status| status.timestamp.0)
+            .collect();
+        assert_eq!(stamps, vec![1_000, 21_000]);
+    }
+
+    #[test]
+    fn test_clock_without_epoch_round_trips_unchanged() {
+        let json = r#"{"Simulated":{"dt":{"secs":0,"nanos":10000000}}}"#;
+        let clock: Clock = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            clock,
+            Clock::Simulated {
+                dt: Duration::from_millis(10),
+                epoch: None
+            }
+        );
+        assert_eq!(serde_json::to_string(&clock).unwrap(), json);
     }
 
     #[test]

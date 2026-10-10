@@ -5,6 +5,7 @@
 
 use core::time::Duration;
 
+use metor_proto::types::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -241,11 +242,25 @@ pub struct PortRef {
 /// The clock that paces the coordinator's cycles.
 ///
 /// `Wall` runs `rate` cycles per second of real time. `Simulated` advances time
-/// by `dt` each cycle, as fast as the systems run.
+/// by `dt` each cycle, as fast as the systems run, starting at `epoch`, or at
+/// the time of the build without one.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Clock {
-    Wall { rate: f64 },
-    Simulated { dt: Duration },
+    Wall {
+        rate: f64,
+    },
+    Simulated {
+        dt: Duration,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<Timestamp>,
+    },
+}
+
+/// Choices one build makes that the target's config does not.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BuildOptions {
+    /// Turn every thread group on the coordinator thread, in step order.
+    pub deterministic: bool,
 }
 
 impl InputConfig {

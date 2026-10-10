@@ -10,6 +10,12 @@ pub enum BuildError {
     #[error("wall clock rate must be finite and at least 0.001 Hz")]
     InvalidClockRate,
 
+    #[error("a deterministic build needs a simulated clock")]
+    DeterministicWall,
+
+    #[error("a deterministic build needs a simulated clock with a nonzero dt")]
+    DeterministicZeroDt,
+
     #[error("system id `{id}` is used twice")]
     DuplicateId { id: String },
 

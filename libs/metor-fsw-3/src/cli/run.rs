@@ -17,7 +17,7 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use super::cargo::{lookup, read_toml, string};
 use super::pack_dev::{PackDevError, pack_dev};
-use crate::coordinator::{BuildError, Clock, Coordinator, SystemTable};
+use crate::coordinator::{BuildError, BuildOptions, Clock, Coordinator, SystemTable};
 use crate::deploy::{self, ConfigError, DeployError, DeploymentConfig, TargetConfig};
 use crate::dl::store;
 use crate::dl::{Pack, PackError, PackRef};
@@ -45,6 +45,14 @@ pub struct Run {
     /// Step a simulated clock by this many seconds per cycle.
     #[arg(long)]
     pub sim_dt: Option<f64>,
+    /// Start the simulated clock at this time, in microseconds since the Unix
+    /// epoch.
+    #[arg(long)]
+    pub epoch: Option<i64>,
+    /// Turn every thread group on the coordinator thread, so a sim run gives
+    /// the same results every time. Needs a simulated clock.
+    #[arg(long)]
+    pub deterministic: bool,
     /// Print `<link> <addr>` for every listening link once the graph is built.
     #[arg(long)]
     pub print_ports: bool,
@@ -69,6 +77,8 @@ pub enum RunError {
     Deploy(#[from] DeployError),
     #[error("--sim-dt must be a positive number of seconds, got {0}")]
     SimDt(f64),
+    #[error("--epoch sets a simulated clock's start; pass --sim-dt or use a simulated target")]
+    EpochWall,
     #[error("these systems latched off: {0}")]
     Latched(String),
     #[error("these targets did not exit cleanly: {0}")]
@@ -277,17 +287,32 @@ fn python_path(dev_packs: &[PathBuf]) -> OsString {
 /// Applies the clock overrides from the command line, then opens the target's
 /// packs.
 pub fn load(config: &TargetConfig, overrides: &Run) -> Result<Coordinator, RunError> {
+    let config = apply_overrides(config, overrides)?;
+    let table = table_for(&config)?;
+    let options = BuildOptions {
+        deterministic: overrides.deterministic,
+    };
+    Ok(config.coordinator.build_with(&table, options)?)
+}
+
+/// `config` with the clock overrides from the command line applied.
+fn apply_overrides(config: &TargetConfig, overrides: &Run) -> Result<TargetConfig, RunError> {
     let mut config = config.clone();
     if let Some(rate) = overrides.wall {
         config.coordinator.clock = Clock::Wall { rate };
     }
     if let Some(dt) = overrides.sim_dt {
         let dt = Duration::try_from_secs_f64(dt).map_err(|_| RunError::SimDt(dt))?;
-        config.coordinator.clock = Clock::Simulated { dt };
+        let epoch = config.coordinator.clock.epoch();
+        config.coordinator.clock = Clock::Simulated { dt, epoch };
     }
-
-    let table = table_for(&config)?;
-    Ok(config.coordinator.build(&table)?)
+    if let Some(at) = overrides.epoch {
+        let Clock::Simulated { epoch, .. } = &mut config.coordinator.clock else {
+            return Err(RunError::EpochWall);
+        };
+        *epoch = Some(metor_proto::types::Timestamp(at));
+    }
+    Ok(config)
 }
 
 /// Builds the system table for a target: the built-ins plus every pack the
@@ -377,6 +402,52 @@ mod tests {
             panic!("a raising target is an error")
         };
         assert_eq!(status.code(), Some(3));
+    }
+
+    #[test]
+    fn test_epoch_overrides_the_target_and_survives_sim_dt() {
+        let mut config = TargetConfig::default();
+        config.coordinator.clock = Clock::Simulated {
+            dt: Duration::from_millis(10),
+            epoch: Some(metor_proto::types::Timestamp(1)),
+        };
+        let kept = Run {
+            sim_dt: Some(0.02),
+            ..Default::default()
+        };
+        let clock = apply_overrides(&config, &kept).unwrap().coordinator.clock;
+        assert_eq!(clock.epoch(), Some(metor_proto::types::Timestamp(1)));
+        let moved = Run {
+            epoch: Some(5),
+            ..Default::default()
+        };
+        let clock = apply_overrides(&config, &moved).unwrap().coordinator.clock;
+        assert_eq!(clock.epoch(), Some(metor_proto::types::Timestamp(5)));
+    }
+
+    #[test]
+    fn test_epoch_and_deterministic_need_a_simulated_clock() {
+        let config = TargetConfig::default();
+        let epoch = Run {
+            epoch: Some(0),
+            ..Default::default()
+        };
+        assert!(matches!(load(&config, &epoch), Err(RunError::EpochWall)));
+        let deterministic = Run {
+            deterministic: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            load(&config, &deterministic),
+            Err(RunError::Build(BuildError::DeterministicWall))
+        ));
+        let simulated = Run {
+            deterministic: true,
+            sim_dt: Some(0.01),
+            epoch: Some(0),
+            ..Default::default()
+        };
+        assert!(load(&config, &simulated).is_ok());
     }
 
     #[test]
