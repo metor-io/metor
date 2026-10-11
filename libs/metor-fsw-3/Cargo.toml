@@ -12,6 +12,7 @@ metor-component = { workspace = true }
 metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
+cordyceps = { version = "0.3.4", default-features = false }
 futures-lite = "2"
 libc = { version = "0.2", optional = true }
 maitake-sync = { path = "../stellarator/maitake/sync" }

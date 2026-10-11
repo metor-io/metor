@@ -42,6 +42,8 @@ pub enum ParamError {
     Decode(String),
     #[error("`{thread}`: a cyclic system runs on the cycle thread")]
     Thread { thread: String },
+    #[error("`{channel}`: an async system takes no channel")]
+    Channel { channel: String },
     #[error("thread `{thread}` is not running")]
     ThreadStart { thread: String },
     #[error("the constructor panicked: {0}")]

@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
+use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 
+use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
 use crate::io::{
     Backing, Cqe, IO_CQ, IO_SQ, IO_TYPE, RealKind, ResourceConfig, ResourceEnd, SharedIo,
@@ -88,6 +90,7 @@ impl CoordinatorConfig {
         if options.deterministic {
             self.clock.check_deterministic()?;
         }
+        check_channels(&self)?;
         check_resources(&self.resources)?;
         let members = member_positions(&self)?;
         wire_io(&mut self.systems, &members)?;
@@ -303,6 +306,11 @@ impl IoPoints {
         let at: Vec<usize> = (0..systems.len())
             .filter(|&at| systems[at].ty == IO_TYPE)
             .collect();
+        let channel = |&&p: &&usize| matches!(systems[p].adapter, Some(Adapter::Channel(_)));
+        if let Some(&p) = at.iter().find(channel) {
+            let id = systems[p].id.clone();
+            return Err(BuildError::IoAdapter { id });
+        }
         Ok(at.last().copied().map(|last| Self { at, last }))
     }
 
@@ -333,6 +341,35 @@ pub(crate) fn status_def(id: &str, namespace: Option<&str>) -> PortDef {
         ..DefCx::empty()
     };
     Output::<SystemStatus>::def(&cx, STATUS_PORT)
+}
+
+/// Checks that channel names are short enough and unique.
+///
+/// A name must fit the wire format's length cap, and no two systems may use
+/// the same one.
+fn check_channels(config: &CoordinatorConfig) -> Result<(), BuildError> {
+    let names = config
+        .systems
+        .iter()
+        .filter_map(|system| match &system.adapter {
+            Some(Adapter::Channel(channel)) => Some(channel.name.as_str()),
+            _ => None,
+        });
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if name.len() > SEQUENCE_CHANNEL_NAME_CAP {
+            return Err(BuildError::ChannelName {
+                name: name.to_string(),
+                cap: SEQUENCE_CHANNEL_NAME_CAP,
+            });
+        }
+        if !seen.insert(name) {
+            return Err(BuildError::DuplicateChannel {
+                name: name.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Maps each system id to its position in the config, rejecting duplicate ids.
@@ -383,8 +420,16 @@ impl SystemDef {
         records: &Records,
         producer: impl Fn(&str, &PortRef) -> Result<Option<PortDef>, BuildError>,
     ) -> Result<Self, BuildError> {
+        let channel = matches!(system.adapter, Some(Adapter::Channel(_)));
         let mut edges: Vec<(&str, PortDef)> = Vec::new();
         for input in &system.inputs {
+            if channel && input.port == ABORT_PORT {
+                return Err(reserved(system, ABORT_PORT));
+            }
+            // The channel reads its commands; the system never sees them.
+            if channel && input.port == COMMANDS_PORT {
+                continue;
+            }
             for from in &input.from {
                 match producer(&input.port, from)? {
                     Some(def) => edges.push((input.port.as_str(), def)),
@@ -407,10 +452,14 @@ impl SystemDef {
             records,
             params: &system.params,
         };
-        (entry.def_fn)(&cx).map_err(|source| BuildError::Def {
+        let def = (entry.def_fn)(&cx).map_err(|source| BuildError::Def {
             id: system.id.clone(),
             source,
-        })
+        })?;
+        if !channel {
+            return Ok(def);
+        }
+        crate::channel::def(def, &cx).map_err(|port| reserved(system, &port))
     }
 
     /// Checks that no two inputs and no two outputs share a name, and that no
@@ -457,6 +506,13 @@ impl SystemDef {
             }
         }
         Ok(())
+    }
+}
+
+fn reserved(system: &SystemConfig, port: &str) -> BuildError {
+    BuildError::ReservedChannelPort {
+        id: system.id.clone(),
+        port: port.to_string(),
     }
 }
 
@@ -707,7 +763,11 @@ fn make_systems(
             namespace: args.namespace,
             records: args.records,
         };
-        let step = (system.entry.make)(cx).map_err(|source| BuildError::Params {
+        let step = match system.adapter {
+            Some(Adapter::Channel(_)) => crate::channel::make(&system.entry.make, cx),
+            _ => (system.entry.make)(cx),
+        }
+        .map_err(|source| BuildError::Params {
             id: system.id.to_string(),
             source,
         })?;
@@ -764,7 +824,7 @@ mod tests {
 
     use super::*;
     use crate::coordinator::{
-        InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig, WallRate,
+        ChannelConfig, InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig, WallRate,
     };
     use crate::def::DefError;
     use crate::tests::utils::{self, Recorder, pipeline_config, table};
@@ -1490,6 +1550,20 @@ mod tests {
         fn test_io_member_without_an_instance_is_refused() {
             let config = config(vec![member("a"), member("b")], "a", "b");
             assert!(io_message(config).contains("needs an fsw.io"));
+        }
+
+        #[test]
+        fn test_io_on_a_channel_is_refused() {
+            let mut config = config(nominal(), "a", "b");
+            config.systems[3].adapter = Some(Adapter::Channel(ChannelConfig {
+                name: "io".into(),
+                start: Default::default(),
+            }));
+            let e = error(config);
+            assert!(
+                matches!(&e, BuildError::IoAdapter { id } if id == "io_complete"),
+                "{e}"
+            );
         }
 
         #[test]

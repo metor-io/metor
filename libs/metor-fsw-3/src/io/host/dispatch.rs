@@ -387,6 +387,17 @@ impl Dispatch {
         }
     }
 
+    /// Whether member `m` has nothing left in flight since `begin`.
+    pub(crate) fn member_idle(&self, m: usize) -> bool {
+        let member = &self.members[m];
+        let ops = &self.ops[m * MAX_OPS..(m + 1) * MAX_OPS];
+        !member.quiescing || (member.drained && ops.iter().all(|e| !e.live))
+    }
+
+    pub(crate) fn end_queiscing_member(&mut self, m: usize) {
+        self.members[m].quiescing = false;
+    }
+
     /// The routes queued since the last call.
     pub(crate) fn drain_routes(&mut self) -> std::vec::Drain<'_, Route> {
         self.routes.drain(..)

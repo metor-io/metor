@@ -26,7 +26,7 @@ pub use ctor::{Ctor, WithIo};
 pub use param::{Cycle, Param, ParamNames, Views, Writers};
 pub(crate) use param::{Defs, param_name};
 pub use set::{InSet, LOG_PORT, OutSet};
-pub(crate) use set::{Instance, bind};
+pub(crate) use set::{Instance, bind, report_dropped};
 
 /// Describes the parameters of a system written as a fn.
 pub trait FnSignature: Sized + 'static {
