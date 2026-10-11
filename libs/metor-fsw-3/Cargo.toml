@@ -15,6 +15,7 @@ metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 const-fnv1a-hash = "1.1.0"
 futures-lite = "2"
 indexmap = "2"
+libc = { version = "0.2", optional = true }
 maitake-sync = { path = "../stellarator/maitake/sync" }
 postcard = { version = "1.1", features = ["alloc", "experimental-derive"] }
 postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
@@ -31,15 +32,25 @@ zerocopy = { version = "0.8.2", features = ["derive"] }
 stellarator = { path = "../stellarator", optional = true }
 thingbuf = { version = "0.1.6", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+polling = { version = "3.7", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7.1", optional = true }
+
 [features]
 default = ["host"]
 host = [
     "threads",
+    "dep:libc",
+    "dep:polling",
+    "dep:io-uring",
 ]
 
 threads = ["dep:stellarator", "dep:thingbuf"]
 
 [dev-dependencies]
+tempfile = "3"
 trybuild = "1"
 
 [lints]

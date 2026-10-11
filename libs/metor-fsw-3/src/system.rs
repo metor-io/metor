@@ -9,7 +9,8 @@ use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-use crate::def::{DefCx, DefError};
+use crate::def::{DefCx, DefError, Records};
+use crate::io::GrantDef;
 use crate::record::RecordSchema;
 
 /// Describes one port: its name and the record it carries.
@@ -65,6 +66,9 @@ pub struct SystemDef {
     /// The index in `outputs` of the `log` output, if the system has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<usize>,
+    /// The `Cap` parameters, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<GrantDef>,
 }
 
 impl SystemDef {
@@ -81,6 +85,7 @@ impl SystemDef {
             inputs: I::defs(cx)?,
             outputs: O::defs(cx)?,
             log: None,
+            grants: Vec::new(),
         })
     }
 }

@@ -9,6 +9,7 @@ use core::time::Duration;
 use metor_proto::types::Timestamp;
 use serde::{Deserialize, Serialize};
 
+use crate::io::{Grant, ResourceConfig};
 use crate::system::PortDef;
 
 /// The default [`CoordinatorConfig::ring_depth`].
@@ -26,6 +27,9 @@ pub struct CoordinatorConfig {
     #[serde(default)]
     pub namespace: Option<String>,
     pub systems: Vec<SystemConfig>,
+    /// The resources systems are granted, by id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceConfig>,
     /// The seed every `Rng` parameter draws from.
     #[serde(default)]
     pub seed: u64,
@@ -40,6 +44,7 @@ impl Default for CoordinatorConfig {
             ring_depth: DEFAULT_RING_DEPTH,
             namespace: None,
             systems: Vec::new(),
+            resources: Vec::new(),
             seed: 0,
         }
     }
@@ -56,6 +61,9 @@ pub struct SystemConfig {
     pub inputs: Vec<InputConfig>,
     #[serde(default)]
     pub outputs: Vec<OutputConfig>,
+    /// Gives each `Cap<K>` parameter a resource.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<Grant>,
     /// The adapter the system runs behind, if any. See [`Adapter`].
     #[serde(flatten, with = "adapter_keys")]
     pub adapter: Option<Adapter>,
@@ -108,6 +116,12 @@ impl Default for Adapters {
 
 #[cfg(feature = "host")]
 impl Adapters {
+    /// Running behind no adapter only.
+    pub const BARE: Self = Self {
+        bare: true,
+        thread: false,
+    };
+
     /// Whether the type runs behind `adapter`, or behind none for `None`.
     pub fn accepts(self, adapter: Option<&Adapter>) -> bool {
         match adapter {
@@ -164,6 +178,7 @@ impl SystemConfig {
             params: serde_json::Value::Null,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            grants: Vec::new(),
             adapter: None,
             location: None,
         }
@@ -350,6 +365,32 @@ mod tests {
             ..bare
         };
         assert!(!none.accepts(None));
+    }
+
+    #[test]
+    fn test_grants_default_and_round_trip() {
+        let bare = SystemConfig::new("gps", "gps");
+        let text = serde_json::to_string(&bare).expect("serializable");
+        assert!(!text.contains("grants"));
+        let granted = SystemConfig {
+            grants: vec![Grant {
+                end: Default::default(),
+                param: "uart".into(),
+                resource: "gps1".into(),
+            }],
+            ..bare
+        };
+        let text = serde_json::to_string(&granted).expect("serializable");
+        assert_eq!(
+            serde_json::from_str::<SystemConfig>(&text).expect("round trips"),
+            granted
+        );
+    }
+
+    #[test]
+    fn test_grant_needs_a_resource() {
+        let text = r#"{"id":"gps","ty":"gps","grants":[{"param":"uart"}]}"#;
+        assert!(serde_json::from_str::<SystemConfig>(text).is_err());
     }
 
     fn adapter_of(text: &str) -> Result<Option<Adapter>, serde_json::Error> {

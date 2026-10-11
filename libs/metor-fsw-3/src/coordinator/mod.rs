@@ -30,3 +30,5 @@ pub use run::Coordinator;
 pub use status::SystemStatus;
 pub use step::{EndReason, LoadError, Occupant, Step};
 pub use table::{MakeCx, SystemKind, SystemTable};
+pub(crate) use config::Adapters;
+pub(crate) use table::TableEntry;
