@@ -1,14 +1,17 @@
-"""Tests for building targets and `to_config()`."""
+"""Tests for building targets, `to_config()`, and emitting the config."""
 
 from __future__ import annotations
 
 import contextlib
 import inspect
+import json
 import os
+import tempfile
 import unittest
 
 from adcs_stub import PACK, Ctrl, Fan, Hold, Mode, MotorCmd, Nav, Ping, Plant, Safe, Tap
 
+import metor_config._deployment as deploy_mod
 import metor_config._target as target_mod
 from metor_config import (
     ChannelRegistry,
@@ -19,7 +22,19 @@ from metor_config import (
     SequenceCommand,
     Subscribe,
     Target,
+    emit,
 )
+
+GOLDEN = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "..",
+    "..",
+    "tests",
+    "golden",
+    "target.json",
+)
+
 
 def adcs_target() -> Target:
     """The design doc's example target."""
@@ -36,21 +51,55 @@ def adcs_target() -> Target:
 
 
 def reset() -> None:
-    """Clears every target."""
+    """Clears every target and deployment, so the atexit hook has nothing to
+    emit to stdout."""
     target_mod._targets.clear()
+    deploy_mod._deployments.clear()
+    deploy_mod._emitted = False
 
 
 class ConfigTest(unittest.TestCase):
-    """Starts and ends each test with no target."""
+    """Starts and ends each test with no target, deployment, or env override."""
 
     def setUp(self) -> None:
         reset()
+        os.environ.pop("METOR_CONFIG_OUT", None)
 
     def tearDown(self) -> None:
         reset()
 
 
 class TargetTest(ConfigTest):
+    def test_atexit_emits_once(self) -> None:
+        adcs_target()
+        with tempfile.TemporaryDirectory() as dir:
+            path = os.path.join(dir, "out.json")
+            os.environ["METOR_CONFIG_OUT"] = path
+            deploy_mod._emit_at_exit()
+            self.assertTrue(os.path.exists(path))
+            os.remove(path)
+            deploy_mod._emit_at_exit()
+            self.assertFalse(os.path.exists(path))
+
+    def test_example_matches_golden(self) -> None:
+        adcs_target()
+        with tempfile.TemporaryDirectory() as dir:
+            path = os.path.join(dir, "target.json")
+            emit(path)
+            with open(path, "rb") as file:
+                written = file.read()
+        with open(GOLDEN, "rb") as file:
+            self.assertEqual(written, file.read())
+
+    def test_emit_uses_env_path(self) -> None:
+        adcs_target()
+        with tempfile.TemporaryDirectory() as dir:
+            path = os.path.join(dir, "out.json")
+            os.environ["METOR_CONFIG_OUT"] = path
+            emit()
+            with open(path, encoding="utf-8") as file:
+                self.assertEqual(json.load(file)["config_version"], 2)
+
     def test_seed_is_emitted_when_set(self) -> None:
         self.assertEqual(Target(cycle_rate=1.0, seed=7).to_config()["coordinator"]["seed"], 7)
         self.assertNotIn("seed", Target(cycle_rate=1.0).to_config()["coordinator"])
@@ -133,6 +182,12 @@ class TargetTest(ConfigTest):
     def test_reject_non_source_input(self) -> None:
         with self.assertRaisesRegex(ConfigError, "input `imu`"):
             Nav(imu="plant.imu")  # type: ignore[arg-type]
+
+    def test_emit_requires_one_target(self) -> None:
+        adcs_target()
+        adcs_target()
+        with self.assertRaisesRegex(ConfigError, "found 2"):
+            emit()
 
 
 class LocationTest(ConfigTest):
@@ -338,6 +393,7 @@ class LinkTest(ConfigTest):
         systems = fsw.to_config()["coordinator"]["systems"]
         self.assertEqual(systems[0]["thread"], "io")
         self.assertNotIn("thread", systems[1])
+
 
 
 def slotted() -> tuple[Target, dict[str, dict]]:

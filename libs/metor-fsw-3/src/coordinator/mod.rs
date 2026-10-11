@@ -21,10 +21,12 @@ mod tests;
 
 #[cfg(feature = "host")]
 pub(crate) use config::Adapters;
+#[cfg(feature = "host")]
+pub(crate) use build::{instance_def, status_def};
 pub use config::{
     Adapter, BuildOptions, ChannelConfig, ChannelName, ChannelNameTooLong, Clock,
     CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig, InvalidWallRate, Location, OutputConfig,
-    OutputSource, PortRef, RunState, SystemConfig, WallRate,
+    OutputSource, PeerLink, PeerPort, PortRef, RunState, SystemConfig, WallRate,
 };
 pub use error::BuildError;
 pub use params::{MakeError, ParamError, Params};

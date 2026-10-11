@@ -101,6 +101,9 @@ impl DefCx<'_> {
                     name: output.port.clone().into(),
                     ..def.clone()
                 }),
+                OutputSource::Peer(_) => Err(DefError::Unresolved {
+                    port: output.port.clone(),
+                }),
             })
             .collect()
     }
@@ -126,6 +129,9 @@ pub enum DefError {
 
     #[error("the pack refused the definition: {message}")]
     Pack { message: String },
+
+    #[error("output `{port}` names a peer's port that is not resolved; run `metor build`")]
+    Unresolved { port: String },
 
     #[error("slot: {message}")]
     Slot { message: String },

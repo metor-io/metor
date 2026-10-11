@@ -198,6 +198,17 @@ class System:
         """Returns the `params` config entry for this registration."""
         return self._params or None
 
+    def port(self, source: OutPort[T]) -> OutPort[T]:
+        """Returns this system's copy of ``source``.
+
+        Only systems that copy ports from a peer, like `Subscribe`, support
+        this. Others raise `ConfigError`.
+        """
+        return self._port(source, self._name, self._target)
+
+    def _port(self, source: OutPort[T], name: str, target: Any) -> OutPort[T]:
+        raise ConfigError(f"`{name}` copies no ports; only a Subscribe with a peer does")
+
 
 _PACKAGE = os.path.dirname(os.path.abspath(__file__))
 

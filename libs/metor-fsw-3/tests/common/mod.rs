@@ -6,8 +6,9 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::fmt::Display;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
@@ -79,6 +80,41 @@ pub fn fixture_lib() -> &'static Path {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         cargo_build("echo-pack", root).expect("the fixture builds")
     })
+}
+
+pub fn metor() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_metor"))
+}
+
+/// A running `metor` child process. Dropping it kills the process.
+pub struct Running(pub Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Returns `N` ports that were free when this was called.
+pub fn free_ports<const N: usize>() -> [u16; N] {
+    let held: [TcpListener; N] =
+        core::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").expect("a free port"));
+    held.map(|listener| listener.local_addr().expect("bound").port())
+}
+
+/// Joins `ports` into the comma-separated list a fixture's ports variable
+/// expects.
+pub fn ports_env(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub fn local(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
 }
 
 /// A deadline [`DEADLINE`] from now, for polling loops.

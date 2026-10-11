@@ -1406,6 +1406,31 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_unresolved_peer_output() {
+        let config = CoordinatorConfig {
+            systems: vec![SystemConfig {
+                outputs: vec![OutputConfig {
+                    port: "imu".into(),
+                    source: OutputSource::Peer(super::super::PeerPort {
+                        target: "a".into(),
+                        link: "pub".into(),
+                        port: "plant.imu".into(),
+                    }),
+                }],
+                ..SystemConfig::new("emit", "emit")
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            build(config).err(),
+            Some(BuildError::Def {
+                id: "emit".into(),
+                source: DefError::Unresolved { port: "imu".into() },
+            })
+        );
+    }
+
+    #[test]
     fn test_reject_unknown_record() {
         let config = CoordinatorConfig {
             systems: vec![emits("gyro")],
