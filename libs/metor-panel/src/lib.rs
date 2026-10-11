@@ -197,9 +197,21 @@ impl ComponentStream for WalComponentStream {
 
 pub(crate) async fn wait_for_component(db: &DB, component_id: ComponentId) -> Component {
     loop {
+        let seen = db.vtable_gen.latest();
         if let Some(component) = db.with_state(|state| state.get_component(component_id).cloned()) {
             return component;
         }
-        db.vtable_gen.wait().await;
+        vtable_changed(db, seen).await;
     }
+}
+
+/// Wait for the vtable to move past generation `seen`.
+///
+/// Read `seen` before looking at the components it guards: a registration
+/// that lands while the caller looks then still wakes it, where a bare
+/// `vtable_gen.wait()` would sleep through it.
+pub(crate) async fn vtable_changed(db: &DB, seen: u64) {
+    db.vtable_gen
+        .wait_for(|generation| generation != seen)
+        .await;
 }

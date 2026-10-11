@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use super::binding::{self, ElementRef, component_meta, spawn_meta_resolver, spawn_scalar_stream};
 use super::format_number;
-use super::meter::fill_span;
+use super::meter::{fill_span, scale_position};
 use crate::theme::theme;
 
 /// How the value is shown along the dial.
@@ -376,6 +376,7 @@ impl Render for Gauge {
         let hub_color = theme.text_primary;
         let tint = binding::alarm_tint(at, cx);
         let span = self.value.map(|v| fill_span(v, min, max));
+        let needle = self.value.and_then(|v| scale_position(v, min, max));
         let marks: Vec<(f32, Hsla)> = if self.show_limits {
             binding::limit_marks(at, cx)
                 .into_iter()
@@ -398,16 +399,14 @@ impl Render for Gauge {
                 let arc_r = dial.radius - ARC_WIDTH / 2.0;
                 dial.paint_arc(arc_r, 0.0, 1.0, px(ARC_WIDTH), track_color, window);
 
-                if let Some((start, end)) = span {
-                    match style {
-                        GaugeStyle::Arc => {
-                            dial.paint_arc(arc_r, start, end, px(ARC_WIDTH), color, window)
+                match style {
+                    GaugeStyle::Arc => {
+                        if let Some((start, end)) = span {
+                            dial.paint_arc(arc_r, start, end, px(ARC_WIDTH), color, window);
                         }
-                        GaugeStyle::Needle => {
-                            // The needle points at the value, which for a
-                            // bipolar scale is whichever end of the span
-                            // isn't the zero origin.
-                            let t = if start > 0.0 { start } else { end };
+                    }
+                    GaugeStyle::Needle => {
+                        if let Some(t) = needle {
                             dial.paint_spoke(t, 0.0, arc_r - ARC_WIDTH, px(2.0), color, window);
                         }
                     }

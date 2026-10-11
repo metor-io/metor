@@ -421,7 +421,8 @@ pub(crate) fn watch_registrations<E: 'static>(
 ) -> gpui::Task<()> {
     cx.spawn(async move |this, cx| {
         loop {
-            db.vtable_gen.wait().await;
+            let seen = db.vtable_gen.latest();
+            crate::vtable_changed(&db, seen).await;
             if this.update(cx, |_, cx| cx.notify()).is_err() {
                 break;
             }

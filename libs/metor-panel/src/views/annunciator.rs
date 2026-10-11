@@ -745,11 +745,12 @@ fn compile_pattern(pattern: &str) -> Option<Regex> {
 fn spawn_watcher(db: Arc<DB>, cx: &mut Context<Annunciator>) -> gpui::Task<()> {
     cx.spawn(async move |this, cx| {
         loop {
+            let seen = db.vtable_gen.latest();
             let result = this.update(cx, |grid, cx| grid.reconcile_tiles(cx));
             if result.is_err() {
                 break;
             }
-            db.vtable_gen.wait().await;
+            crate::vtable_changed(&db, seen).await;
             // vtable_gen bumps once per registered component, so a startup
             // burst would run the O(components) regex reconcile N times.
             // Debounce so a burst collapses into one pass (reconcile reads

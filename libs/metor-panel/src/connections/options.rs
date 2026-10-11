@@ -22,7 +22,7 @@ use gpui::{App, Entity, SharedString, Window};
 use smallvec::SmallVec;
 
 use super::{ConnectionTarget, ConnectionsStore};
-use crate::inspector::rows::{BoolRow, EnumRow, InspectorRow, ScalarRow, SliderRow, TextRow};
+use crate::inspector::rows::{BoolRow, EnumRow, InspectorRow, ScalarRow, TextRow};
 
 /// Values for one target, sized for the handful of knobs a connection
 /// realistically has.
@@ -324,33 +324,20 @@ pub(crate) fn option_rows(
                         }),
                     ))
                 }
-                (OptionKind::Number { min, max, .. }, value) => {
+                // Typed, not a slider: every change restarts a live
+                // connection, so the value lands once, on commit.
+                (&OptionKind::Number { min, max, .. }, value) => {
                     let number = match value {
                         OptionValue::Number(v) => v,
                         _ => 0.0,
                     };
-                    let on_change = Arc::new(move |v: f64, _window: &mut Window, cx: &mut App| {
-                        set(OptionValue::Number(v), cx)
-                    });
-                    if min.is_finite() && max.is_finite() {
-                        let (store, target, read_key) =
-                            (store.clone(), target.clone(), key.clone());
-                        Box::new(SliderRow {
-                            label,
-                            read_value: Arc::new(move |cx: &App| {
-                                store
-                                    .read(cx)
-                                    .state()
-                                    .options_for(&target)
-                                    .number(&read_key)
-                            }),
-                            min: *min,
-                            max: *max,
-                            on_change,
-                        }) as Box<dyn InspectorRow>
-                    } else {
-                        Box::new(ScalarRow::new(label, number, on_change))
-                    }
+                    Box::new(ScalarRow::new(
+                        label,
+                        number,
+                        Arc::new(move |v: f64, _window: &mut Window, cx: &mut App| {
+                            set(OptionValue::Number(v.max(min).min(max)), cx)
+                        }),
+                    ))
                 }
             }
         })

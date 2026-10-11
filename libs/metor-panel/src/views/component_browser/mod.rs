@@ -129,6 +129,7 @@ impl ComponentBrowserDelegate {
     fn spawn_watcher(db: Arc<DB>, cx: &mut Context<ComponentBrowser>) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
+                let seen = db.vtable_gen.latest();
                 let tree = build_tree(&db);
                 let result = this.update(cx, |browser, cx| {
                     let delegate = browser.delegate_mut();
@@ -143,7 +144,7 @@ impl ComponentBrowserDelegate {
                 if result.is_err() {
                     break;
                 }
-                db.vtable_gen.wait().await;
+                crate::vtable_changed(&db, seen).await;
                 // vtable_gen bumps once per registered component, so a startup
                 // burst would rebuild the whole tree N times. Debounce so a
                 // burst collapses into one rebuild (build_tree reads the latest

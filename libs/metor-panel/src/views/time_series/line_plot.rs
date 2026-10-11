@@ -996,10 +996,9 @@ impl Render for LinePlot {
                             // X data + a 0..1 Y placeholder; each trace's Y is
                             // normalized per axis in the materializer.
                             let gpu_view = view.x_bounds();
-                            if !draws.is_empty()
-                                && let Some(handle) =
-                                    lp.gpu_state
-                                        .render(cx, bounds, scale_factor, gpu_view, &draws)
+                            if let Some(handle) =
+                                lp.gpu_state
+                                    .render(cx, bounds, scale_factor, gpu_view, &draws)
                             {
                                 handle.spawn_and_set(cx, line_plot_gpu_state);
                             }

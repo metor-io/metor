@@ -26,7 +26,7 @@ pub fn from_db_id(component_id: ComponentId) -> NodeId {
 /// Mirror `component_id` from the DB into a node. The component must be
 /// registered before this is called — its schema is read upfront so the
 /// node has a stable [`ValueType`]. To wait for a component that may not
-/// be registered yet, await `db.vtable_gen.wait()` first.
+/// be registered yet, await [`crate::wait_for_component`] first.
 pub fn from_db(db: &DB, component_id: ComponentId) -> Result<Arc<dyn DynamicNode>, BuildError> {
     let component = db
         .with_state(|s| s.get_component(component_id).cloned())

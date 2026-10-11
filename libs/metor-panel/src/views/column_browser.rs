@@ -2,8 +2,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, Empty, Entity, FocusHandle, Focusable,
-    Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render,
+    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, Empty, Entity, EntityId, FocusHandle,
+    Focusable, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render,
     ScrollHandle, SharedString, UniformListScrollHandle, Window, actions, div, prelude::*, px,
     uniform_list,
 };
@@ -216,8 +216,13 @@ pub struct ColumnBrowser<D: ColumnBrowserDelegate> {
     filter_visible: bool,
 }
 
+/// A column divider in flight. gpui hands drag moves to every listener of
+/// the payload type, so the drag names the browser it belongs to.
 #[derive(Clone)]
-struct ResizeDrag(usize);
+struct ResizeDrag {
+    browser: EntityId,
+    column_ix: usize,
+}
 
 impl Render for ResizeDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -466,18 +471,25 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             .h_full()
             .ml(px(-RESIZE_HANDLE_WIDTH / 2.0))
             .cursor_col_resize()
-            .on_drag(ResizeDrag(column_ix), |drag, _, _, cx| {
-                cx.new(|_| drag.clone())
-            })
+            .on_drag(
+                ResizeDrag {
+                    browser: cx.entity_id(),
+                    column_ix,
+                },
+                |drag, _, _, cx| cx.new(|_| drag.clone()),
+            )
             .on_drag_move(
                 cx.listener(move |this, e: &DragMoveEvent<ResizeDrag>, _window, cx| {
-                    let ix = e.drag(cx).0;
-                    let Some(left) = this.column_bounds.get(ix).map(|b| b.left()) else {
+                    let drag = e.drag(cx);
+                    if drag.browser != cx.entity_id() || drag.column_ix != column_ix {
+                        return;
+                    }
+                    let Some(left) = this.column_bounds.get(column_ix).map(|b| b.left()) else {
                         return;
                     };
                     let new_width =
                         (e.event.position.x - left).clamp(px(MIN_COL_WIDTH), px(MAX_COL_WIDTH));
-                    if let Some(slot) = this.column_widths.get_mut(ix)
+                    if let Some(slot) = this.column_widths.get_mut(column_ix)
                         && *slot != new_width
                     {
                         *slot = new_width;

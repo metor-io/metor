@@ -308,20 +308,34 @@ pub fn default_ring_bytes(value_bytes: usize) -> usize {
     msg.saturating_mul(1024).max(8 * 1024)
 }
 
-/// Convenience: build a `NodeId` by hashing tag + parents + extra args. The
-/// `args` callback should fold every argument into the hasher in a stable
-/// order. We use `std::hash::DefaultHasher` (SipHash) — same family the rest
-/// of the panel uses; the absolute value is opaque, only equality matters.
-pub fn hash_id(
-    tag: &[u8],
-    parents: &[NodeId],
-    args: impl FnOnce(&mut std::collections::hash_map::DefaultHasher),
-) -> NodeId {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+/// Build a `NodeId` by hashing tag + parents + extra args. The `args`
+/// callback folds every argument into the hasher in a stable order, using
+/// fixed-width integers so the bytes don't depend on the platform.
+pub fn hash_id(tag: &[u8], parents: &[NodeId], args: impl FnOnce(&mut StableHasher)) -> NodeId {
+    let mut hasher = StableHasher::default();
     tag.hash(&mut hasher);
     for parent in parents {
         parent.0.hash(&mut hasher);
     }
     args(&mut hasher);
     NodeId(hasher.finish())
+}
+
+/// The hasher behind every [`NodeId`].
+///
+/// Node ids name on-disk components, so they must survive a toolchain
+/// upgrade, which std's `DefaultHasher` does not promise. This runs the bytes
+/// through the same FNV-1a as [`ComponentId::new`], high bit masked the same
+/// way, so an id converts to a `ComponentId` as-is.
+#[derive(Default)]
+pub struct StableHasher(Vec<u8>);
+
+impl Hasher for StableHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        const_fnv1a_hash::fnv1a_hash_64(&self.0, None) & !(1 << 63)
+    }
 }
