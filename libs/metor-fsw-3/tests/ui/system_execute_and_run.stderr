@@ -1,0 +1,5 @@
+error: #[system] takes either `execute` or `run`, not both
+  --> tests/ui/system_execute_and_run.rs:11:5
+   |
+11 |     async fn run(&mut self, now: Timestamp, stop: Stop) {
+   |     ^^^^^

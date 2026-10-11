@@ -29,7 +29,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catches_a_payload_whose_destructor_panics() {
+    fn test_catch_panicking_payload_drop() {
         struct BadDrop;
         impl Drop for BadDrop {
             fn drop(&mut self) {

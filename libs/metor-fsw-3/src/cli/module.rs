@@ -21,11 +21,20 @@ struct Module {
     pack_id: String,
     lib: String,
     abi_version: u32,
-    /// Record class names, sorted.
-    records: Vec<String>,
+    /// One class per record the pack carries, sorted by class name.
+    records: Vec<RecordClass>,
     /// Nested params objects, by name.
     dataclasses: Vec<Class>,
     systems: Vec<Entry>,
+    /// Whether any system takes the ports its config lists.
+    takes_ports: bool,
+}
+
+/// A record's name on the host and the class a target names it by.
+#[derive(Serialize)]
+struct RecordClass {
+    name: String,
+    class: String,
 }
 
 #[derive(Serialize)]
@@ -50,6 +59,10 @@ struct Entry {
     name: String,
     ty: String,
     doc: String,
+    /// Whether the type takes an `items` port list.
+    takes_inputs: bool,
+    /// Whether the type takes a `records` list.
+    takes_outputs: bool,
     /// Declared output names, without the framework's.
     outputs: Vec<String>,
     inputs: Vec<Port>,
@@ -83,13 +96,16 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
     for schema in &schemas {
         collect_defs(schema, &mut defs);
     }
-    let systems = def
+    let systems: Vec<Entry> = def
         .systems
         .iter()
         .zip(&schemas)
         .map(|(system, schema)| entry(system, schema, &defs))
         .collect::<Result<_, _>>()?;
     Ok(Module {
+        takes_ports: systems
+            .iter()
+            .any(|entry| entry.takes_inputs || entry.takes_outputs),
         pack_id: pack.id.clone(),
         lib: pack.lib.clone(),
         abi_version,
@@ -102,16 +118,22 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
     })
 }
 
-fn records(def: &PackDef) -> Vec<String> {
+fn records(def: &PackDef) -> Vec<RecordClass> {
     let mut names: Vec<&str> = BUILTIN_PORTS.iter().map(|(name, _)| *name).collect();
     for port in def.systems.iter().flat_map(ports) {
         if !names.contains(&port.record.as_ref()) {
             names.push(&port.record);
         }
     }
-    let mut classes: Vec<String> = names.into_iter().map(class_of).collect();
-    classes.sort_unstable();
-    classes
+    let mut records: Vec<RecordClass> = names
+        .into_iter()
+        .map(|name| RecordClass {
+            class: class_of(name),
+            name: name.to_string(),
+        })
+        .collect();
+    records.sort_unstable_by(|a, b| a.class.cmp(&b.class));
+    records
 }
 
 fn ports(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
@@ -214,6 +236,8 @@ fn entry(
         name: pascal(&system.ty),
         ty: system.ty.to_string(),
         doc: system.doc.to_string(),
+        takes_inputs: system.takes_inputs,
+        takes_outputs: system.takes_outputs,
         outputs: declared().map(|p| p.name.to_string()).collect(),
         inputs: system.def.inputs.iter().map(port).collect(),
         params,
@@ -334,6 +358,7 @@ mod tests {
             max_len: 8,
             alignment: 4,
             depth: 8,
+            schema: <crate::Bytes as crate::Record>::schema(),
         }
     }
 
@@ -345,6 +370,8 @@ mod tests {
     ) -> PackSystemDef {
         PackSystemDef {
             ty: ty.into(),
+            takes_inputs: false,
+            takes_outputs: false,
             def: SystemDef {
                 name: ty.into(),
                 inputs,
@@ -365,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn every_param_kind_renders_with_its_default() {
+    fn test_render_param_defaults() {
         let schema = r##"{"type":"object","properties":{
             "rate":{"type":"number","default":0.5},
             "count":{"type":"integer","default":3},
@@ -401,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn a_param_named_like_an_input_is_a_clash() {
+    fn test_reject_param_input_collision() {
         let clash = rendered(vec![system(
             "nav",
             vec![port("gain", "imu")],
@@ -415,11 +442,11 @@ mod tests {
     }
 
     #[test]
-    fn a_system_with_no_ports_still_has_the_framework_records() {
+    fn test_empty_system_includes_framework_records() {
         let text = rendered(vec![system("mode", vec![], vec![], None)]).expect("renders");
         assert!(!text.contains("dataclass"));
-        assert!(text.contains("class LogEvent(Record): ..."));
-        assert!(text.contains("class SystemStatus(Record): ..."));
+        assert!(text.contains("class LogEvent(Record):\n    _name = \"log\"\n"));
+        assert!(text.contains("class SystemStatus(Record):\n    _name = \"status\"\n"));
         assert!(
             text.contains("    def __init__(self) -> None:\n        super().__init__({}, {})\n")
         );

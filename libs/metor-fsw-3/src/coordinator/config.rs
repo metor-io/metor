@@ -8,12 +8,17 @@ use super::error::BuildError;
 
 const MIN_WALL_RATE: f64 = 0.001;
 
+/// Default number of records a ring can hold
+pub const DEFAULT_RING_DEPTH: usize = 8;
+
 /// The configuration for a coordinator
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoordinatorConfig {
     pub clock: Clock,
-    /// The maximum number of frames a ring can hold.
     pub ring_depth: usize,
+    /// The prefix every announced name hangs under.
+    #[serde(default)]
+    pub namespace: Option<String>,
     pub systems: Vec<SystemConfig>,
 }
 
@@ -21,7 +26,8 @@ impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
             clock: Clock::Wall { rate: 100.0 },
-            ring_depth: 8,
+            ring_depth: DEFAULT_RING_DEPTH,
+            namespace: None,
             systems: Vec::new(),
         }
     }
@@ -36,6 +42,11 @@ pub struct SystemConfig {
     pub params: serde_json::Value,
     #[serde(default)]
     pub inputs: Vec<InputConfig>,
+    #[serde(default)]
+    pub outputs: Vec<OutputConfig>,
+    /// If set chooses a particular background thread for the system to run on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
 }
 
 impl SystemConfig {
@@ -46,8 +57,17 @@ impl SystemConfig {
             ty: ty.into(),
             params: serde_json::Value::Null,
             inputs: Vec::new(),
+            outputs: Vec::new(),
+            thread: None,
         }
     }
+}
+
+/// One port of a system with dynamic outputs, and the record it carries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputConfig {
+    pub port: String,
+    pub record: String,
 }
 
 /// The producers of one input port
@@ -106,7 +126,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn params_default_to_null_and_round_trip() {
+    fn test_params_defaults_and_round_trip() {
         let bare: SystemConfig =
             serde_json::from_str(r#"{"id":"nav","ty":"nav"}"#).expect("params optional");
         assert_eq!(bare, SystemConfig::new("nav", "nav"));
@@ -122,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn simulated_and_subnanosecond_periods_have_no_budget() {
+    fn test_zero_cycle_budget() {
         assert_eq!(
             Clock::Simulated {
                 dt: Duration::from_millis(5)
@@ -136,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn minimum_wall_rate_has_a_bounded_period() {
+    fn test_minimum_wall_rate_budget() {
         let clock = Clock::Wall {
             rate: MIN_WALL_RATE,
         };

@@ -20,3 +20,31 @@ help: the trait `MaxSize` is not implemented for `Unbounded`
             (A, B, C, D, E, F)
           and $N others
   = note: this error originates in the derive macro `Record` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `Unbounded: metor_fsw_3::Schema` is not satisfied
+ --> tests/ui/message_without_max_len.rs:4:10
+  |
+4 | #[derive(Record, Serialize, Deserialize)]
+  |          ^^^^^^ unsatisfied trait bound
+  |
+help: the trait `metor_fsw_3::Schema` is not implemented for `Unbounded`
+ --> tests/ui/message_without_max_len.rs:5:1
+  |
+5 | struct Unbounded {
+  | ^^^^^^^^^^^^^^^^
+  = help: the following other types implement trait `metor_fsw_3::Schema`:
+            &T
+            ()
+            (A, B)
+            (A, B, C)
+            (A, B, C, D)
+            (A, B, C, D, E)
+            (A, B, C, D, E, F)
+            (A,)
+          and $N others
+note: required by a bound in `RecordSchema::postcard`
+ --> src/record.rs
+  |
+  |     pub fn postcard<T: Serialize + postcard_schema::Schema>(name: &str) -> Self {
+  |                                    ^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `RecordSchema::postcard`
+  = note: this error originates in the derive macro `Record` (in Nightly builds, run with -Z macro-backtrace for more info)

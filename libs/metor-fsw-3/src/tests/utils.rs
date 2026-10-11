@@ -11,7 +11,11 @@ use metor_proto_wkt::LogEvent;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::port::{Input, Output};
+use metor_fsw_3_ring::Notifier;
+
+use crate::async_system::Stop;
+use crate::def::{DefCx, DefError};
+use crate::port::{DynInputs, DynOutputs, Input, Output};
 use crate::system::{System, SystemDef};
 use crate::{Frame, SystemInputs, SystemOutputs};
 
@@ -47,21 +51,23 @@ pub struct BareName {
 }
 
 /// A message with a static postcard bound, so it states no length.
-#[derive(crate::Record, crate::MaxSize, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(
+    crate::Record, crate::MaxSize, crate::Schema, Serialize, Deserialize, Debug, PartialEq,
+)]
 pub struct Fixed {
     pub a: u32,
     pub b: f64,
 }
 
 /// A message with a string, so it states its length.
-#[derive(crate::Record, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(crate::Record, crate::Schema, Serialize, Deserialize, Debug, PartialEq)]
 #[record(max_len = 64, depth = 4)]
 pub struct Note {
     pub text: String,
 }
 
 /// A message with a timestamp, so fan-in orders it like a frame.
-#[derive(crate::Record, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(crate::Record, crate::Schema, Serialize, Deserialize, Debug, PartialEq)]
 #[record(max_len = 64)]
 pub struct Stamped {
     #[record(timestamp)]
@@ -130,8 +136,8 @@ impl System for Reserved {
     type Inputs = ();
     type Outputs = ReservedOut;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<(), ReservedOut>("reserved")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<(), ReservedOut>("reserved", cx)
     }
 
     fn execute(
@@ -156,8 +162,8 @@ impl System for ImuSource {
     type Inputs = ();
     type Outputs = ImuOut;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<(), ImuOut>("imu_source")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<(), ImuOut>("imu_source", cx)
     }
 
     fn execute(&self, _now: Timestamp, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
@@ -177,8 +183,8 @@ impl System for ImuOffset {
     type Inputs = ();
     type Outputs = ImuOut;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<(), ImuOut>("imu_offset")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<(), ImuOut>("imu_offset", cx)
     }
 
     fn execute(&self, _now: Timestamp, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
@@ -198,8 +204,8 @@ impl System for NavFilter {
     type Inputs = NavIn;
     type Outputs = NavOut;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<NavIn, NavOut>("nav_filter")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<NavIn, NavOut>("nav_filter", cx)
     }
 
     fn execute(&self, _now: Timestamp, _state: &mut (), inputs: &mut NavIn, outputs: &mut NavOut) {
@@ -223,8 +229,8 @@ impl System for ControlLaw {
     type Inputs = ControlIn;
     type Outputs = ControlOut;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<ControlIn, ControlOut>("control_law")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<ControlIn, ControlOut>("control_law", cx)
     }
 
     fn execute(
@@ -254,8 +260,8 @@ impl System for StatusWatch {
     type Inputs = StatusIn;
     type Outputs = ();
 
-    fn def() -> SystemDef {
-        SystemDef::new::<StatusIn, ()>("status_watch")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<StatusIn, ()>("status_watch", cx)
     }
 
     fn execute(
@@ -289,6 +295,26 @@ impl Boom {
     }
 }
 
+/// A cyclic type's ports under the empty context.
+pub fn static_def<S: System>() -> SystemDef {
+    S::def(&DefCx::empty()).expect("a static definition")
+}
+
+/// An async type's ports under the empty context.
+pub fn static_async_def<A: crate::AsyncSystem>() -> SystemDef {
+    A::def(&DefCx::empty()).expect("a static definition")
+}
+
+/// An input bundle's ports under the empty context.
+pub fn static_inputs<I: SystemInputs<W>, W: metor_fsw_3_ring::WakeSink>() -> Vec<crate::PortDef> {
+    I::defs(&DefCx::empty()).expect("a static definition")
+}
+
+/// An output bundle's ports under the empty context.
+pub fn static_outputs<O: SystemOutputs>() -> Vec<crate::PortDef> {
+    O::defs(&DefCx::empty()).expect("a static definition")
+}
+
 /// A trait-path system that panics, so it has no `log` port to fault onto.
 pub struct Trap;
 
@@ -297,13 +323,110 @@ impl System for Trap {
     type Inputs = ();
     type Outputs = ();
 
-    fn def() -> SystemDef {
-        SystemDef::new::<(), ()>("trap")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<(), ()>("trap", cx)
     }
 
     fn execute(&self, _now: Timestamp, _state: &mut (), _inputs: &mut (), _outputs: &mut ()) {
         panic!("trap")
     }
+}
+
+/// Records the port name and bytes of every dynamic input, each cycle.
+pub struct Tap(Recorder);
+
+#[crate::system]
+impl Tap {
+    fn execute(&mut self, inputs: &mut DynInputs) {
+        for (def, input) in inputs.iter_mut() {
+            for record in input.drain() {
+                let Ok(bytes) = record else { continue };
+                self.0.push_tap(def.name.to_string(), bytes.to_vec());
+            }
+        }
+    }
+}
+
+/// Writes one fixed record onto every port the config gave it.
+pub struct Emit(Vec<u8>);
+
+#[crate::system]
+impl Emit {
+    fn execute(&mut self, outputs: &mut DynOutputs) {
+        for (_, output) in outputs.iter_mut() {
+            let _ = output.write_bytes(&self.0);
+        }
+    }
+}
+
+/// Doubles every sample as it arrives, on a background thread.
+pub struct Relay;
+
+#[crate::system]
+impl Relay {
+    /// Publishes one estimate per sample.
+    async fn run(&mut self, imu: &mut Input<Imu, Notifier>, nav: &mut Output<Nav>, stop: Stop) {
+        while let Some(sample) = next(imu, &stop).await {
+            let _ = nav.write(&Nav {
+                timestamp: sample.timestamp,
+                estimate: sample.sample * 2.0,
+            });
+        }
+    }
+}
+
+/// Reads nothing, so its input mirror fills and drops.
+pub struct Sleeper;
+
+#[crate::system]
+impl Sleeper {
+    async fn run(&mut self, imu: &mut Input<Imu, Notifier>, stop: Stop) {
+        let _ = imu;
+        stop.wait().await;
+    }
+}
+
+/// Panics once it has read one record.
+pub struct AsyncBoom;
+
+#[crate::system]
+impl AsyncBoom {
+    async fn run(&mut self, imu: &mut Input<Imu, Notifier>, stop: Stop) {
+        if next(imu, &stop).await.is_some() {
+            panic!("boom on the background thread");
+        }
+    }
+}
+
+/// Publishes the hash of its thread's id once, then waits for stop.
+pub struct WhoAmI;
+
+#[crate::system]
+impl WhoAmI {
+    async fn run(&mut self, nav: &mut Output<Nav>, stop: Stop) {
+        let _ = nav.write(&Nav {
+            timestamp: Timestamp(0),
+            estimate: thread_id() as f64,
+        });
+        stop.wait().await;
+    }
+}
+
+/// The next sample, or `None` once stop resolves.
+async fn next(imu: &mut Input<Imu, Notifier>, stop: &Stop) -> Option<Imu> {
+    futures_lite::future::or(async { imu.next().await.ok().copied() }, async {
+        stop.wait().await;
+        None
+    })
+    .await
+}
+
+/// This thread's id, hashed into a number a frame can carry.
+fn thread_id() -> u64 {
+    use core::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut hasher);
+    hasher.finish() % (1 << 40)
 }
 
 /// Records every log line it is wired to.
@@ -328,6 +451,7 @@ struct Recorded {
     commands: Vec<(Timestamp, f64)>,
     statuses: Vec<SystemStatus>,
     logs: Vec<LogEvent>,
+    taps: Vec<(String, Vec<u8>)>,
 }
 
 impl Recorder {
@@ -343,6 +467,10 @@ impl Recorder {
         self.0.borrow_mut().logs.push(line);
     }
 
+    fn push_tap(&self, port: String, bytes: Vec<u8>) {
+        self.0.borrow_mut().taps.push((port, bytes));
+    }
+
     pub fn take(&self) -> Vec<(Timestamp, f64)> {
         core::mem::take(&mut self.0.borrow_mut().commands)
     }
@@ -354,6 +482,10 @@ impl Recorder {
     pub fn take_logs(&self) -> Vec<LogEvent> {
         core::mem::take(&mut self.0.borrow_mut().logs)
     }
+
+    pub fn take_taps(&self) -> Vec<(String, Vec<u8>)> {
+        core::mem::take(&mut self.0.borrow_mut().taps)
+    }
 }
 
 /// A params struct with no fields, so any key is unknown.
@@ -363,18 +495,60 @@ pub struct NoParams {}
 /// Every system type the coordinator tests name, recording into `recorder`.
 pub fn table(recorder: &Recorder) -> SystemTable {
     let mut table = SystemTable::new();
-    table.register_system("imu", |_| Ok((ImuSource, 0)));
-    table.register_system("imu_offset", |_| Ok((ImuOffset, 0)));
-    table.register_system("nav", |p| p.decode::<NoParams>().map(|_| (NavFilter, ())));
+    table
+        .register_system("imu", |_| Ok((ImuSource, 0)))
+        .expect("valid records");
+    table
+        .register_system("imu_offset", |_| Ok((ImuOffset, 0)))
+        .expect("valid records");
+    table
+        .register_system("nav", |p| p.decode::<NoParams>().map(|_| (NavFilter, ())))
+        .expect("valid records");
     let control = recorder.clone();
-    table.register_system("control", move |_| Ok((ControlLaw, control.clone())));
+    table
+        .register_system("control", move |_| Ok((ControlLaw, control.clone())))
+        .expect("valid records");
     let watch = recorder.clone();
-    table.register_system("status_watch", move |_| Ok((StatusWatch, watch.clone())));
-    table.register_system("reserved", |_| Ok((Reserved, ())));
-    table.register("boom", Boom::default);
-    table.register_system("trap", |_| Ok((Trap, ())));
+    table
+        .register_system("status_watch", move |_| Ok((StatusWatch, watch.clone())))
+        .expect("valid records");
+    table
+        .register_system("reserved", |_| Ok((Reserved, ())))
+        .expect("valid records");
+    table
+        .register("boom", Boom::default)
+        .expect("valid records");
+    table
+        .register_system("trap", |_| Ok((Trap, ())))
+        .expect("valid records");
     let logs = recorder.clone();
-    table.register("log_sink", move || LogSink(logs.clone()));
+    table
+        .register("log_sink", move || LogSink(logs.clone()))
+        .expect("valid records");
+    let taps = recorder.clone();
+    table
+        .register("tap", move || Tap(taps.clone()))
+        .expect("valid records");
+    table
+        .register("emit", || Emit(Imu::new(1, 5.0).as_bytes().to_vec()))
+        .expect("valid records");
+    table
+        .register_async("relay", || Relay)
+        .expect("valid records");
+    table
+        .register_async("sleeper", || Sleeper)
+        .expect("valid records");
+    table
+        .register_async("async_boom", || AsyncBoom)
+        .expect("valid records");
+    table
+        .register_async("ctor_boom", || -> AsyncBoom {
+            panic!("a constructor that panics")
+        })
+        .expect("valid records");
+    table
+        .register_async("who_am_i", || WhoAmI)
+        .expect("valid records");
     table
 }
 

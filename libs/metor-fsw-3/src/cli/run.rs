@@ -34,6 +34,9 @@ pub struct Run {
     /// Step a simulated clock by this many seconds per cycle.
     #[arg(long)]
     pub sim_dt: Option<f64>,
+    /// Print `<link> <addr>` for every listening link once the graph is built.
+    #[arg(long)]
+    pub print_ports: bool,
 }
 
 /// A `RunError` is why a target did not run.
@@ -70,6 +73,9 @@ pub fn run(args: Run) -> Result<(), RunError> {
     }
     let config = eval_target(&target, &packs)?;
     let coordinator = load(config, &args)?;
+    if args.print_ports {
+        print_ports();
+    }
 
     watch_sigint();
     let cycles = args.cycles;
@@ -84,6 +90,17 @@ pub fn run(args: Run) -> Result<(), RunError> {
         return Ok(());
     }
     Err(RunError::Latched(latched.join(", ")))
+}
+
+/// Writes every bound link address to stdout, for a caller that asked a link to
+/// take any free port.
+fn print_ports() {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    for (link, addr) in crate::link::bound_ports() {
+        let _ = writeln!(out, "{link} {addr}");
+    }
+    let _ = out.flush();
 }
 
 /// Installs the console layer beside the one that queues lines for `log` ports,
@@ -193,6 +210,7 @@ pub fn load(mut config: TargetConfig, overrides: &Run) -> Result<Coordinator, Ru
     }
 
     let mut table = SystemTable::new();
+    crate::link::register_builtins(&mut table)?;
     let opened: Vec<Pack> = config
         .packs
         .iter()
@@ -204,7 +222,7 @@ pub fn load(mut config: TargetConfig, overrides: &Run) -> Result<Coordinator, Ru
         })
         .collect::<Result<_, _>>()?;
     for (reference, pack) in config.packs.iter().zip(&opened) {
-        table.register_pack(&reference.id, pack);
+        table.register_pack(&reference.id, pack)?;
     }
     Ok(config.coordinator.build(&table)?)
 }
@@ -243,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn dev_packs_finds_the_pack_a_target_sources() {
+    fn test_dev_packs_finds_source_pack() {
         let found = dev_packs(&fixture());
         assert_eq!(found.len(), 1);
         assert_eq!(
@@ -253,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_that_is_no_pack_is_no_dev_pack() {
+    fn test_dev_packs_skips_non_pack() {
         let dir = tempfile::tempdir().expect("a temp dir");
         assert!(dev_packs(dir.path()).is_empty(), "no pyproject at all");
 
@@ -266,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn a_target_that_raises_reports_its_status() {
+    fn test_target_error_reports_status() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let target = dir.path().join("target.py");
         std::fs::write(&target, "raise SystemExit(3)\n").expect("writes");
@@ -277,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn a_negative_sim_dt_is_rejected_before_any_pack_is_opened() {
+    fn test_reject_negative_sim_dt() {
         let config = TargetConfig {
             config_version: super::super::config::CONFIG_VERSION,
             packs: Vec::new(),
@@ -294,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn the_stop_future_is_ready_on_the_last_cycle() {
+    fn test_stop_after_last_cycle() {
         let mut stop = Box::pin(stop(Some(2)));
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);

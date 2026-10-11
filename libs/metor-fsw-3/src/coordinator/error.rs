@@ -1,9 +1,10 @@
-use metor_proto::types::ComponentId;
+use metor_proto::types::{ComponentId, PacketId};
 use thiserror::Error;
 
 use super::params::ParamError;
+use crate::def::DefError;
 
-/// Errors associated with [`CoordinatorConfig::build`].
+/// Errors registering system types or building a coordinator.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum BuildError {
     #[error("wall clock rate must be finite and at least 0.001 Hz")]
@@ -57,8 +58,41 @@ pub enum BuildError {
         max_len: usize,
     },
 
+    #[error("undeclared input `{system}.{port}` reads a system configured after it")]
+    DynamicFromLater { system: String, port: String },
+
+    #[error("record `{record}` is declared differently by two registered ports")]
+    RecordConflict { record: String },
+
+    #[error("records `{first}` and `{second}` share record id {id:?}")]
+    RecordIdConflict {
+        id: ComponentId,
+        first: String,
+        second: String,
+    },
+
+    #[error("records `{first}` and `{second}` define different schemas for message id {id:?}")]
+    MessageIdConflict {
+        id: PacketId,
+        first: String,
+        second: String,
+    },
+
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
     ReservedPort { ty: String },
+
+    #[error("cyclic system `{id}` cannot be placed on thread `{thread}`")]
+    ThreadOnCyclic { id: String, thread: String },
+
+    #[error("thread `{thread}` failed to start")]
+    ThreadStart { thread: String },
+
+    #[error("definition for `{id}`: {source}")]
+    Def {
+        id: String,
+        #[source]
+        source: DefError,
+    },
 
     #[error("params for `{id}`: {source}")]
     Params {

@@ -8,8 +8,8 @@ use core::task::{Context, Poll};
 use std::rc::Rc;
 
 use metor_fsw_3::{
-    Clock, CoordinatorConfig, Frame, Input, InputConfig, Output, PortRef, System, SystemConfig,
-    SystemDef, SystemInputs, SystemStatus, SystemTable, Timestamp, system,
+    Clock, CoordinatorConfig, DefCx, DefError, Frame, Input, InputConfig, Output, PortRef, System,
+    SystemConfig, SystemDef, SystemInputs, SystemStatus, SystemTable, Timestamp, system,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -113,8 +113,8 @@ impl System for Monitor {
     type Inputs = MonitorIn;
     type Outputs = ();
 
-    fn def() -> SystemDef {
-        SystemDef::new::<MonitorIn, ()>("monitor")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<MonitorIn, ()>("monitor", cx)
     }
 
     fn execute(
@@ -176,11 +176,17 @@ fn input(port: &str, from: PortRef) -> InputConfig {
 
 fn table(report: &Rc<RefCell<Report>>) -> SystemTable {
     let mut table = SystemTable::new();
-    table.register("gyro", Gyro::default);
-    table.register("nav", || NavFilter);
-    table.register("control", || ControlLaw);
+    table
+        .register("gyro", Gyro::default)
+        .expect("valid records");
+    table.register("nav", || NavFilter).expect("valid records");
+    table
+        .register("control", || ControlLaw)
+        .expect("valid records");
     let report = report.clone();
-    table.register_system("monitor", move |_| Ok((Monitor, report.clone())));
+    table
+        .register_system("monitor", move |_| Ok((Monitor, report.clone())))
+        .expect("valid records");
     table
 }
 
@@ -204,7 +210,7 @@ impl Future for AfterCycles {
 }
 
 #[test]
-fn ten_cycles_of_the_pipeline() {
+fn test_pipeline_ten_cycles() {
     let report = Rc::new(RefCell::new(Report::default()));
     let mut coordinator = config().build(&table(&report)).expect("valid config");
     // Three outputs, three fn-system logs, four status rings.

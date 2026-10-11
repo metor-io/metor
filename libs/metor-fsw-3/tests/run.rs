@@ -8,10 +8,16 @@ fn metor() -> Command {
 }
 
 #[test]
-fn a_fixed_cycle_count_runs_the_fixtures_target_and_exits_zero() {
+fn test_target_exits_after_fixed_cycles() {
     let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack/target.py");
     let output = metor()
-        .args(["run", &target.display().to_string(), "--cycles", "3"])
+        .args([
+            "run",
+            &target.display().to_string(),
+            "--cycles",
+            "3",
+            "--print-ports",
+        ])
         .output()
         .expect("metor runs");
     assert!(
@@ -19,10 +25,17 @@ fn a_fixed_cycle_count_runs_the_fixtures_target_and_exits_zero() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let ports = String::from_utf8_lossy(&output.stdout);
+    let links: Vec<&str> = ports
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(link, _)| link)
+        .collect();
+    assert_eq!(links, vec!["cmds", "pub"], "{ports}");
 }
 
 #[test]
-fn a_wall_rate_and_a_simulated_step_together_are_a_usage_error() {
+fn test_reject_conflicting_clock_options() {
     let output = metor()
         .args(["run", "target.py", "--wall", "10", "--sim-dt", "0.1"])
         .output()
@@ -33,7 +46,7 @@ fn a_wall_rate_and_a_simulated_step_together_are_a_usage_error() {
 }
 
 #[test]
-fn a_missing_target_file_fails_without_a_panic() {
+fn test_missing_target_returns_error() {
     let output = metor()
         .args(["run", "no-such-target.py", "--cycles", "1"])
         .output()

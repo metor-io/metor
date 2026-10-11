@@ -101,7 +101,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_slice_round_trips_through_a_raw_slice() {
+    fn test_raw_slice_roundtrip() {
         let bytes = b"metor".to_vec();
         let raw = RawSlice::of(&bytes);
         assert_eq!(raw.len, 5);
@@ -115,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_array_reads_back_without_dereferencing() {
+    fn test_empty_null_slices() {
         // SAFETY: a zero length never reads the pointer.
         assert!(unsafe { RawSlice::EMPTY.as_bytes() }.is_empty());
         let port = RawPort {
@@ -127,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_slice_is_an_empty_array() {
+    fn test_empty_raw_slice() {
         let raw = RawSlice::of::<u8>(&[]);
         assert_eq!(raw.len, 0);
         // SAFETY: a zero length never reads the pointer.

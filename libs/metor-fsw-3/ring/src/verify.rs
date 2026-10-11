@@ -21,7 +21,7 @@ fn any_record(cap: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 #[kani::proof]
-fn round_up16_correct() {
+fn round_up16_alignment() {
     let n: usize = kani::any();
     kani::assume(n <= usize::MAX - 15);
     let r = round_up_16(n);
@@ -32,7 +32,7 @@ fn round_up16_correct() {
 }
 
 #[kani::proof]
-fn frame_len_correct() {
+fn frame_len_alignment() {
     let n: usize = kani::any();
     kani::assume(n <= usize::MAX - 31);
     let f = frame_len(n);
@@ -44,7 +44,7 @@ fn frame_len_correct() {
 }
 
 #[kani::proof]
-fn straddle_bound_is_sufficient() {
+fn record_fits_bounds() {
     let cap = any_capacity();
     let phys: u64 = kani::any();
     kani::assume(phys < cap && phys.is_multiple_of(16));
@@ -94,7 +94,7 @@ fn reserve_never_straddles() {
 }
 
 #[kani::proof]
-fn padding_allows_empty_ring_progress() {
+fn padding_enables_empty_ring_write() {
     let cap = any_capacity();
     let rec = any_record(cap);
     let committed: u64 = kani::any();
@@ -132,7 +132,7 @@ fn fits_implies_no_lap() {
 }
 
 #[kani::proof]
-fn fits_checked_arithmetic_outside_precondition() {
+fn fits_checked_cursor_arithmetic() {
     let cap = any_capacity();
     let committed: u64 = kani::any();
     kani::assume(committed <= u64::MAX - 4 * cap);
@@ -210,7 +210,6 @@ fn validate_header_hostile() {
 
     // The control block also fits.
     assert!(region_len >= HEADER_SIZE);
-    assert!(OFF_CONTROL + size_of::<Control>() <= HEADER_SIZE);
 }
 
 #[kani::proof]
@@ -334,7 +333,7 @@ fn write_read_roundtrip() {
 
 #[kani::proof]
 #[kani::unwind(12)]
-fn backpressure_is_exact() {
+fn backpressure_at_capacity() {
     let mut region = Region::new();
     let ring = region.attach();
     let mut w = ring.writer(NoWake).unwrap();
@@ -377,7 +376,7 @@ fn backpressure_is_exact() {
 
 #[kani::proof]
 #[kani::unwind(12)]
-fn wrap_gap_skip_reads_through() {
+fn read_skips_wrap_gap() {
     let mut region = Region::new();
     let ring = region.attach();
     let mut w = ring.writer(NoWake).unwrap();

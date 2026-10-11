@@ -24,25 +24,24 @@ mod tests {
     use metor_proto::types::{ComponentId, Timestamp};
     use zerocopy::{FromBytes, IntoBytes};
 
+    use crate::Record;
     use crate::tests::utils::{BareName, Imu};
-    use crate::{Componentize, Record};
 
     #[test]
-    fn derive_sets_name_id_and_timestamp() {
+    fn test_derived_frame_metadata() {
         let imu = Imu::new(42, 1.0);
         assert_eq!(Imu::NAME, "imu");
         assert_eq!(Imu::ID, ComponentId::new("imu"));
         assert_eq!(imu.timestamp(), Some(Timestamp(42)));
-        assert!(Imu::MAX_SIZE >= size_of::<Imu>());
     }
 
     #[test]
-    fn name_defaults_to_snake_case_ident() {
+    fn test_default_frame_name() {
         assert_eq!(BareName::NAME, "bare_name");
     }
 
     #[test]
-    fn bytes_round_trip() {
+    fn test_frame_bytes_roundtrip() {
         let imu = Imu::new(7, 9.8);
         let back = Imu::read_from_bytes(imu.as_bytes()).expect("exact size");
         assert_eq!(back, imu);

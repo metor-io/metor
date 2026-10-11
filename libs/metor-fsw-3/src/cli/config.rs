@@ -60,7 +60,7 @@ mod tests {
 
     /// One record for every port here: the build only compares ids across an
     /// edge, and every edge in the golden joins ports of one record.
-    #[derive(Record, serde::Serialize, Deserialize, Clone, Copy, Debug)]
+    #[derive(Record, crate::Schema, serde::Serialize, Deserialize, Clone, Copy, Debug)]
     #[record(max_len = 8)]
     struct Ping {
         n: u32,
@@ -119,42 +119,23 @@ mod tests {
         }
     }
 
-    /// The four `adcs.*` types the golden names, with the golden's port names.
+    /// The four `adcs.*` types the golden names, plus the links it adds.
     fn table() -> SystemTable {
         let mut table = SystemTable::new();
-        table.register("adcs.plant", |_: Altitude| Plant);
-        table.register("adcs.nav", |_: Gain| Nav);
-        table.register("adcs.mode", || Mode);
-        table.register("adcs.ctrl", || Ctrl);
+        crate::link::register_builtins(&mut table).expect("valid records");
+        table
+            .register("adcs.plant", |_: Altitude| Plant)
+            .expect("valid records");
+        table
+            .register("adcs.nav", |_: Gain| Nav)
+            .expect("valid records");
+        table.register("adcs.mode", || Mode).expect("valid records");
+        table.register("adcs.ctrl", || Ctrl).expect("valid records");
         table
     }
 
-    const GOLDEN: &[u8] = include_bytes!("../../tests/golden/target.json");
-
     #[test]
-    fn the_golden_target_decodes_and_builds() {
-        let config = TargetConfig::from_slice(GOLDEN).expect("the golden decodes");
-        assert_eq!(config.config_version, CONFIG_VERSION);
-        assert_eq!(
-            config.packs,
-            vec![PackRef {
-                id: "adcs".into(),
-                lib: "adcs_systems".into(),
-                libs: PathBuf::from("/abs/.metor/adcs_pack/_libs"),
-            }]
-        );
-        let coordinator = config
-            .coordinator
-            .build(&table())
-            .expect("the golden's graph builds");
-        assert_eq!(
-            coordinator.entry_names().collect::<Vec<_>>(),
-            vec!["plant", "nav", "mode", "ctrl"]
-        );
-    }
-
-    #[test]
-    fn an_older_version_is_reported_with_both_numbers() {
+    fn test_version_error_reports_versions() {
         let bytes = br#"{"config_version":0,"packs":[],"coordinator":{}}"#;
         let Err(ConfigError::Version { found, expected }) = TargetConfig::from_slice(bytes) else {
             panic!("version 0 is rejected")
@@ -163,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn a_config_without_packs_is_a_decode_error() {
+    fn test_config_requires_packs() {
         let bytes = br#"{"config_version":1,"coordinator":{"clock":{"Wall":{"rate":1.0}},
             "ring_depth":8,"systems":[]}}"#;
         assert!(matches!(

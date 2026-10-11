@@ -2,16 +2,17 @@
 
 use std::cell::RefCell;
 
-use metor_fsw_3::ring::{NoWake, View, Writer};
+use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::{
-    Input, Output, PortDef, Record, System, SystemDef, SystemInputs, SystemOutputs, SystemTable,
-    Timestamp, system,
+    DefCx, DefError, DynInputs, Input, InputBinding, Output, OutputBinding, PortDef, Record, Stop,
+    System, SystemDef, SystemInputs, SystemOutputs, SystemTable, Timestamp, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The record every system here carries. The host names it `ping` too.
-#[derive(Record, Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug)]
+#[postcard(crate = metor_fsw_3::postcard_schema)]
 #[record(max_len = 8)]
 pub struct Ping {
     pub n: u32,
@@ -27,6 +28,55 @@ impl Echo {
     fn execute(&mut self, input: &mut Input<Ping>, output: &mut Output<Ping>) {
         if let Ok(Some(ping)) = input.latest() {
             let n = ping.n;
+            let _ = output.write(&Ping { n });
+        }
+    }
+}
+
+/// Copies every ping as it arrives, on a thread inside the pack.
+#[derive(Default)]
+pub struct Relay;
+
+#[system]
+impl Relay {
+    /// Copies every ping.
+    async fn run(
+        &mut self,
+        input: &mut Input<Ping, Notifier>,
+        output: &mut Output<Ping>,
+        stop: Stop,
+    ) {
+        while !stop.is_set() {
+            let ping = futures_lite::future::or(async { input.next().await.ok() }, async {
+                stop.wait().await;
+                None
+            })
+            .await;
+            let Some(ping) = ping else { return };
+            let _ = output.write(&Ping { n: ping.n });
+        }
+    }
+}
+
+/// Sums the pings on every port its config gave it.
+#[derive(Default)]
+pub struct Tap;
+
+#[system]
+impl Tap {
+    /// Adds up what every configured port carries.
+    fn execute(&mut self, taps: &mut DynInputs, output: &mut Output<Ping>) {
+        let mut n = 0;
+        for (_, input) in taps.iter_mut() {
+            for record in input.drain() {
+                let Ok(bytes) = record else { continue };
+                let Ok(ping) = Ping::decode(bytes) else {
+                    continue;
+                };
+                n += ping.n;
+            }
+        }
+        if n > 0 {
             let _ = output.write(&Ping { n });
         }
     }
@@ -82,13 +132,13 @@ thread_local! {
 pub struct RetainedInput;
 
 impl SystemInputs for RetainedInput {
-    fn defs() -> Vec<PortDef> {
-        vec![Input::<Ping>::def("input")]
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(vec![Input::<Ping>::def(cx, "input")])
     }
 
-    fn bind(mut views: Vec<Vec<View<NoWake>>>) -> Self {
-        if let Some(views) = views.pop() {
-            RETAINED_INPUT.with(|slot| *slot.borrow_mut() = Input::try_new(views).ok());
+    fn bind(mut inputs: Vec<InputBinding>) -> Self {
+        if let Some(binding) = inputs.pop() {
+            RETAINED_INPUT.with(|slot| *slot.borrow_mut() = Input::try_new(binding.views).ok());
         }
         Self
     }
@@ -97,13 +147,13 @@ impl SystemInputs for RetainedInput {
 pub struct RetainedOutput;
 
 impl SystemOutputs for RetainedOutput {
-    fn defs() -> Vec<PortDef> {
-        vec![Output::<Ping>::def("output")]
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(vec![Output::<Ping>::def(cx, "output")])
     }
 
-    fn bind(mut writers: Vec<Writer<NoWake>>) -> Self {
-        if let Some(writer) = writers.pop() {
-            RETAINED_OUTPUT.with(|slot| *slot.borrow_mut() = Output::try_new(writer).ok());
+    fn bind(mut outputs: Vec<OutputBinding>) -> Self {
+        if let Some(binding) = outputs.pop() {
+            RETAINED_OUTPUT.with(|slot| *slot.borrow_mut() = Output::try_new(binding.writer).ok());
         }
         Self
     }
@@ -116,8 +166,8 @@ impl System for Retained {
     type Inputs = RetainedInput;
     type Outputs = RetainedOutput;
 
-    fn def() -> SystemDef {
-        SystemDef::new::<RetainedInput, RetainedOutput>("Retained")
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        SystemDef::new::<RetainedInput, RetainedOutput>("Retained", cx)
     }
 
     fn execute(&self, _: Timestamp, _: &mut (), _: &mut RetainedInput, _: &mut RetainedOutput) {}
@@ -154,11 +204,24 @@ pub fn pack() -> SystemTable {
         panic!("pack builder failed");
     }
     let mut table = SystemTable::new();
-    table.register("echo", Echo::default);
-    table.register("boom", Boom::default);
-    table.register("gain", Gain::new);
-    table.register("fail_input", FailInput::default);
-    table.register_system("retained", |_| Ok((Retained, ())));
+    // PANIC Safety: these static record schemas are compatible.
+    table
+        .register("echo", Echo::default)
+        .expect("valid records");
+    table
+        .register_async("relay", Relay::default)
+        .expect("valid records");
+    table.register("tap", Tap::default).expect("valid records");
+    table
+        .register("boom", Boom::default)
+        .expect("valid records");
+    table.register("gain", Gain::new).expect("valid records");
+    table
+        .register("fail_input", FailInput::default)
+        .expect("valid records");
+    table
+        .register_system("retained", |_| Ok((Retained, ())))
+        .expect("valid records");
     table
 }
 

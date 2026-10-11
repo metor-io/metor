@@ -9,7 +9,7 @@ import sys
 from typing import Any, TypeVar, cast
 
 from ._config import OUT_ENV, CONFIG_VERSION, ConfigError, check_abi, simulated_clock, wall_clock
-from ._model import Loop, OutPort, Pack, Record, Source, System
+from ._model import Loop, OutPort, Pack, Record, Source, System, _json
 
 S = TypeVar("S", bound=System)
 T = TypeVar("T", bound=Record)
@@ -40,8 +40,7 @@ class Target:
     in step order.
 
     ``sim_dt`` (seconds) selects the simulated clock; without it the loop paces a
-    wall clock at ``cycle_rate``. ``namespace`` is recorded for the later slices
-    that prefix announced names with it.
+    wall clock at ``cycle_rate``. ``namespace`` prefixes announced names.
     """
 
     def __init__(
@@ -55,7 +54,7 @@ class Target:
         self.sim_dt = sim_dt
         self.ring_depth = ring_depth
         self.namespace = namespace
-        self._systems: list[tuple[str, System]] = []
+        self._systems: list[tuple[str, System, str | None]] = []
         self._handles: dict[str, SystemHandle] = {}
         self._packs: dict[str, Pack] = {}
         _targets.append(self)
@@ -65,31 +64,50 @@ class Target:
         its producer. Connect it once the producer exists."""
         return Loop(record)
 
-    def add(self, name: str, system: S) -> S:
+    def add(self, name: str, system: S, thread: str | None = None) -> S:
         """Register ``system`` as ``name``; the returned handle carries its output
         ports. Add order is step order, so a system only names ports of systems
-        already added."""
+        already added. ``thread`` places an async system on a thread of that name.
+        """
         if name in self._handles:
             raise ConfigError(f"system `{name}` is already added")
-        pack = system._pack
-        check_abi(pack.id, pack.abi_version)
-        self._packs.setdefault(pack.id, pack)
-        self._systems.append((name, system))
+        packs = (system._pack, *system._record_packs)
+        for pack in packs:
+            check_abi(pack.id, pack.abi_version)
+        for pack in packs:
+            self._packs.setdefault(pack.id, pack)
+        self._systems.append((name, system, thread))
         handle = SystemHandle(name, system._outputs)
         self._handles[name] = handle
         return cast(S, handle)
 
     def to_config(self) -> dict[str, Any]:
-        """The config file as a dict: this target's packs and its coordinator."""
+        """The config file as a dict: this target's packs and its coordinator.
+
+        A pack with no library is built into the host, so it is not listed.
+        """
         return {
             "config_version": CONFIG_VERSION,
-            "packs": [pack.to_json() for pack in self._packs.values()],
+            "packs": [pack.to_json() for pack in self._packs.values() if pack.lib],
             "coordinator": {
                 "clock": self._clock(),
                 "ring_depth": self.ring_depth,
-                "systems": [_system(name, system) for name, system in self._systems],
+                "namespace": self.namespace,
+                "systems": [
+                    self._system(index) for index in range(len(self._systems))
+                ],
             },
         }
+
+    def _system(self, index: int) -> dict[str, Any]:
+        name, system, thread = self._systems[index]
+        inputs = system._inputs_for(self, index)
+        entry = _system(name, system, thread, inputs)
+        if system._wants_target:
+            params = entry["params"] or {}
+            params.update(namespace=self.namespace, link=name)
+            entry["params"] = params
+        return entry
 
     def _clock(self) -> dict[str, Any]:
         if self.sim_dt is not None:
@@ -97,16 +115,23 @@ class Target:
         return wall_clock(self.cycle_rate)
 
 
-def _system(name: str, system: System) -> dict[str, Any]:
-    return {
+def _system(
+    name: str, system: System, thread: str | None, inputs: dict[str, list[Source[Any]]]
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
         "id": name,
         "ty": f"{system._pack.id}.{system._ty}",
-        "params": system._params or None,
-        "inputs": [
-            {"port": port, "from": [_resolve(name, port, source) for source in sources]}
-            for port, sources in system._inputs.items()
-        ],
+        "params": _json(system._params) or None,
     }
+    if thread is not None:
+        entry["thread"] = thread
+    entry["inputs"] = [
+        {"port": port, "from": [_resolve(name, port, source) for source in sources]}
+        for port, sources in inputs.items()
+    ]
+    if system._dyn_outputs:
+        entry["outputs"] = _json(system._dyn_outputs)
+    return entry
 
 
 def _resolve(name: str, port: str, source: Source[Any]) -> dict[str, str]:

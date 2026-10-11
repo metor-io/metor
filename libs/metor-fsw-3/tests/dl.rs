@@ -14,7 +14,8 @@ use metor_fsw_3::{ABI_VERSION, Input, Output, Pack, PackError, Record, Timestamp
 use serde::{Deserialize, Serialize};
 
 /// The pack's record, redeclared here: the component id is the name's hash.
-#[derive(Record, Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug)]
+#[postcard(crate = metor_fsw_3::postcard_schema)]
 #[record(max_len = 8)]
 struct Ping {
     n: u32,
@@ -61,7 +62,7 @@ fn open() -> Pack {
 }
 
 #[test]
-fn a_pack_builder_panic_returns_an_error_without_aborting() {
+fn test_pack_builder_panic_returns_error() {
     const CHILD: &str = "METOR_TEST_PACK_BUILDER_PANIC";
     if std::env::var_os(CHILD).is_some() {
         // SAFETY: the fixture uses this workspace's ABI, including panic containment.
@@ -74,7 +75,7 @@ fn a_pack_builder_panic_returns_an_error_without_aborting() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "a_pack_builder_panic_returns_an_error_without_aborting",
+            "test_pack_builder_panic_returns_error",
             "--nocapture",
         ])
         .env(CHILD, "1")
@@ -116,10 +117,14 @@ fn pipeline(ty: &str, params: serde_json::Value) -> (CoordinatorConfig, Rc<RefCe
 
 fn table(pack: &Pack, seen: &Rc<RefCell<Vec<u32>>>) -> SystemTable {
     let mut table = SystemTable::new();
-    table.register("source", Source::default);
+    table
+        .register("source", Source::default)
+        .expect("valid records");
     let sink = seen.clone();
-    table.register("sink", move || Sink(sink.clone()));
-    table.register_pack("echo", pack);
+    table
+        .register("sink", move || Sink(sink.clone()))
+        .expect("valid records");
+    table.register_pack("echo", pack).expect("valid records");
     table
 }
 
@@ -133,13 +138,25 @@ fn built(ty: &str, params: serde_json::Value) -> (Coordinator, Rc<RefCell<Vec<u3
 }
 
 #[test]
-fn a_pack_reports_its_systems_with_their_ports_and_schemas() {
+fn test_pack_reports_system_metadata() {
     let pack = open();
     let types: Vec<_> = pack.systems().map(|s| s.ty.as_str()).collect();
     assert_eq!(
         types,
-        vec!["echo", "boom", "gain", "fail_input", "retained"]
+        vec![
+            "echo",
+            "relay",
+            "tap",
+            "boom",
+            "gain",
+            "fail_input",
+            "retained"
+        ]
     );
+
+    let tap = pack.systems().find(|s| s.ty == "tap").expect("tap");
+    assert!(tap.takes_inputs && !tap.takes_outputs);
+    assert!(tap.def.inputs.is_empty());
 
     let echo = pack.systems().next().expect("one system");
     assert_eq!(echo.def.inputs[0].name, "input");
@@ -156,8 +173,44 @@ fn a_pack_reports_its_systems_with_their_ports_and_schemas() {
     assert!(pack.systems().next().expect("echo").params.is_none());
 }
 
+/// The host wires two of the fixture's outputs into one pack system, which
+/// declares neither: the ports come back with the definition the pack computed.
 #[test]
-fn a_library_that_is_no_pack_names_the_missing_export() {
+fn test_pack_configures_inputs() {
+    let pack = open();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let taps = ["source", "other"].map(|id| InputConfig {
+        port: format!("{id}.output"),
+        from: vec![PortRef::new(id, "output")],
+    });
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("source", "source"),
+            SystemConfig::new("other", "source"),
+            SystemConfig {
+                inputs: taps.to_vec(),
+                ..SystemConfig::new("tap", "echo.tap")
+            },
+            SystemConfig {
+                inputs: vec![InputConfig {
+                    port: "input".into(),
+                    from: vec![PortRef::new("tap", "output")],
+                }],
+                ..SystemConfig::new("sink", "sink")
+            },
+        ],
+        ..Default::default()
+    };
+    let mut coordinator = config
+        .build(&table(&pack, &seen))
+        .expect("the config builds");
+    coordinator.step(Timestamp(1));
+    // One ping from each source, summed on the pack's side.
+    assert_eq!(*seen.borrow(), vec![2]);
+}
+
+#[test]
+fn test_missing_export_error() {
     #[cfg(target_os = "macos")]
     let path = Path::new("/usr/lib/libSystem.B.dylib");
     #[cfg(not(target_os = "macos"))]
@@ -173,7 +226,7 @@ fn a_library_that_is_no_pack_names_the_missing_export() {
 }
 
 #[test]
-fn a_version_mismatch_is_reported_with_both_numbers() {
+fn test_abi_error_reports_versions() {
     // SAFETY: the fixture is a pack; only the expected version is wrong.
     let Err(error) = (unsafe { Pack::open_with(fixture(), ABI_VERSION + 1) }) else {
         panic!("the versions differ")
@@ -186,7 +239,7 @@ fn a_version_mismatch_is_reported_with_both_numbers() {
 }
 
 #[test]
-fn a_pack_system_moves_a_record_within_one_cycle() {
+fn test_pack_transfers_record() {
     let (mut coordinator, seen, _pack) = built("echo", serde_json::Value::Null);
     coordinator.step(Timestamp(1));
     assert_eq!(*seen.borrow(), vec![1]);
@@ -196,14 +249,32 @@ fn a_pack_system_moves_a_record_within_one_cycle() {
 }
 
 #[test]
-fn a_pack_systems_params_reach_it() {
+fn test_async_pack_transfers_record() {
+    let (mut coordinator, seen, _pack) = built("relay", serde_json::Value::Null);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut cycle = 0;
+    while seen.borrow().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pack never relayed"
+        );
+        cycle += 1;
+        coordinator.step(Timestamp(cycle));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(&seen.borrow()[..2], &[1, 2]);
+}
+
+#[test]
+fn test_pack_receives_params() {
     let (mut coordinator, seen, _pack) = built("gain", serde_json::json!({ "gain": 3.0 }));
     coordinator.step(Timestamp(1));
     assert_eq!(*seen.borrow(), vec![3]);
 }
 
 #[test]
-fn a_bad_params_key_names_the_system() {
+fn test_param_error_identifies_system() {
     let pack = open();
     let (config, seen) = pipeline("gain", serde_json::json!({ "gain": 1.0, "gian": 2.0 }));
     let Err(error) = config.build(&table(&pack, &seen)) else {
@@ -217,7 +288,7 @@ fn a_bad_params_key_names_the_system() {
 }
 
 #[test]
-fn a_panicking_pack_system_latches_and_the_cycle_goes_on() {
+fn test_pack_panic_preserves_cycle() {
     let pack = open();
     let (mut config, seen) = pipeline("boom", serde_json::Value::Null);
     // `boom` writes on its own, so it takes no input.
@@ -235,7 +306,7 @@ fn a_panicking_pack_system_latches_and_the_cycle_goes_on() {
 }
 
 #[test]
-fn the_library_remains_resident_after_the_last_instance() {
+fn test_library_survives_instance_drop() {
     let (coordinator, _seen, pack) = built("echo", serde_json::Value::Null);
     let weak = Arc::downgrade(pack.library());
     drop(pack);
@@ -247,7 +318,7 @@ fn the_library_remains_resident_after_the_last_instance() {
 }
 
 #[test]
-fn a_failed_pack_consumer_does_not_block_a_healthy_consumer() {
+fn test_failed_consumer_isolation() {
     let pack = open();
     let (mut config, seen) = pipeline("fail_input", serde_json::Value::Null);
     config.ring_depth = 2;
@@ -262,7 +333,7 @@ fn a_failed_pack_consumer_does_not_block_a_healthy_consumer() {
 }
 
 #[test]
-fn guest_ports_remain_usable_after_the_coordinator_and_pack_drop() {
+fn test_guest_ports_survive_pack_drop() {
     let (mut coordinator, _, pack) = built("retained", serde_json::Value::Null);
     // SAFETY: the fixture exports this exact function and its code stays resident.
     let release = unsafe {

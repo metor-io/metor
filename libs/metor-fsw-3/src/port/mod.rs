@@ -3,11 +3,19 @@
 use core::borrow::Borrow;
 use core::marker::PhantomData;
 use core::ops::Deref;
+use std::borrow::Cow;
 
-use crate::record::{DecodeError, EncodeError, Record};
-use crate::system::PortDef;
-use metor_fsw_3_ring::{NoWake, ReadError, View, WriteError, Writer, frame_len};
+use crate::def::{DefCx, DefError};
+use crate::record::{Bytes, DecodeError, EncodeError, Record};
+use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
+use metor_fsw_3_ring::{
+    NoWake, Notifier, ReadError, View, WakeSink, WakeSource, WriteError, Writer, frame_len,
+};
 use metor_proto::types::Timestamp;
+
+mod readiness;
+
+use readiness::Waiters;
 
 /// Returns the power-of-two capacity for a ring of `depth` records of `max_len` bytes.
 pub fn ring_capacity(max_len: usize, depth: usize) -> Option<usize> {
@@ -26,7 +34,7 @@ pub struct UnsupportedAlignment {
     pub supported: usize,
 }
 
-fn check_alignment<T: Record>() -> Result<(), UnsupportedAlignment> {
+fn check_alignment<T: Record + ?Sized>() -> Result<(), UnsupportedAlignment> {
     let alignment = T::ALIGN;
     let supported = metor_fsw_3_ring::PAYLOAD_ALIGNMENT;
     if alignment > supported {
@@ -70,25 +78,33 @@ fn bounded(bytes: &[u8], max: usize) -> Result<&[u8], SendError> {
 }
 
 /// An `Output` is the writing half of one ring, publishing records of type `T`.
-pub struct Output<T> {
-    writer: Writer<NoWake>,
+///
+/// `W` is the endpoint notified after each write. System outputs use [`NoWake`];
+/// adapter writers feeding async inputs use [`Notifier`].
+pub struct Output<T: ?Sized, W: WakeSource = NoWake> {
+    writer: Writer<W>,
     scratch: Vec<u8>,
+    /// The longest record this port takes: the type's bound, or the binding's
+    /// for a dynamic port, whose record the type does not know.
+    max_len: usize,
     _t: PhantomData<T>,
 }
 
-impl<T: Record> Output<T> {
+impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
     /// Binds a writer, rejecting records aligned above the ring guarantee.
-    pub fn try_new(writer: Writer<NoWake>) -> Result<Self, UnsupportedAlignment> {
+    pub fn try_new(writer: Writer<W>) -> Result<Self, UnsupportedAlignment> {
         check_alignment::<T>()?;
         Ok(Self {
             writer,
             scratch: vec![0; T::MAX_LEN],
+            max_len: T::MAX_LEN,
             _t: PhantomData,
         })
     }
 
-    /// Returns this port's entry in a bundle's `defs()` walk.
-    pub fn def(name: &'static str) -> PortDef {
+    /// This port's entry in a bundle's `defs()` walk, announcing its record
+    /// under `cx`'s root for `name`.
+    pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
         PortDef {
             name: name.into(),
             record: T::NAME.into(),
@@ -96,36 +112,61 @@ impl<T: Record> Output<T> {
             max_len: T::MAX_LEN,
             alignment: T::ALIGN,
             depth: T::DEPTH,
+            schema: T::schema_at(&cx.root(name)),
         }
     }
 
     /// Publishes one value as one record.
     pub fn write(&mut self, value: &T) -> Result<(), SendError> {
         let bytes = value.encode(&mut self.scratch).map_err(SendError::Encode)?;
-        let bytes = bounded(bytes, T::MAX_LEN)?;
+        let bytes = bounded(bytes, self.max_len)?;
+        self.writer.try_write(bytes).map_err(SendError::Ring)
+    }
+}
+
+impl<W: WakeSource> Output<Bytes, W> {
+    /// Binds a dynamic port's writer, bounding it by the record `max_len` its
+    /// binding named.
+    pub fn bytes(writer: Writer<W>, max_len: usize) -> Self {
+        Self {
+            writer,
+            scratch: Vec::new(),
+            max_len,
+            _t: PhantomData,
+        }
+    }
+
+    /// Publishes a record's bytes as they arrived, without encoding.
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SendError> {
+        let bytes = bounded(bytes, self.max_len)?;
         self.writer.try_write(bytes).map_err(SendError::Ring)
     }
 }
 
 /// An `Input` is the reading half of every ring feeding one port of type `T`.
-pub struct Input<T> {
-    views: Vec<View<NoWake>>,
+///
+/// `W` is the endpoint each view waits on. Async inputs wait on every producer,
+/// whether their [`Notifier`] handles are shared or independent.
+pub struct Input<T: ?Sized, W: WakeSink = NoWake> {
+    views: Vec<View<W>>,
+    waiters: Waiters,
     _t: PhantomData<T>,
 }
 
-impl<T: Record> Input<T> {
+impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
     /// Binds one view per producer, rejecting records aligned above the ring guarantee.
-    pub fn try_new(views: Vec<View<NoWake>>) -> Result<Self, UnsupportedAlignment> {
+    pub fn try_new(views: Vec<View<W>>) -> Result<Self, UnsupportedAlignment> {
         check_alignment::<T>()?;
         Ok(Self {
+            waiters: Waiters::new(&views),
             views,
             _t: PhantomData,
         })
     }
 
-    /// Returns this port's entry in a bundle's `defs()` walk.
-    pub fn def(name: &'static str) -> PortDef {
-        Output::<T>::def(name)
+    /// This port's entry in a bundle's `defs()` walk.
+    pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
+        Output::<T>::def(cx, name)
     }
 
     /// Reads every unread record, producer by producer in bind order.
@@ -137,9 +178,7 @@ impl<T: Record> Input<T> {
             })
         })
     }
-}
 
-impl<T: Record> Input<T> {
     /// Returns the newest record across producers
     ///
     /// Records without timestamps are produced in order of the producers
@@ -157,14 +196,155 @@ impl<T: Record> Input<T> {
         }
         Ok(best.map(|(_, decoded)| Latest { decoded }))
     }
+
+    /// Applies deferred drain consumption, then reports the first producer with a record.
+    fn ready(&mut self) -> Option<usize> {
+        self.views.iter_mut().position(|view| {
+            view.settle();
+            view.has_record()
+        })
+    }
+}
+
+impl<T: Record + ?Sized> Input<T, Notifier> {
+    /// Waits for the next record, then reads it from the first producer holding one.
+    ///
+    /// Never resolves on a port with no producer.
+    pub async fn next(&mut self) -> Result<T::Read<'_>, RecvError> {
+        let at = readiness::wait(self).await;
+        // PANIC Safety: `ready` located a record on this view and nothing
+        // consumed it since; the view is this port's alone.
+        let bytes = self.views[at]
+            .drain()
+            .next()
+            .expect("a located record")
+            .map_err(RecvError::Ring)?;
+        T::decode(bytes).map_err(RecvError::Decode)
+    }
+}
+
+/// One port per config edge no declared port took, under the config's name
+/// and its producer's definition.
+pub fn dyn_input_defs(
+    cx: &DefCx<'_>,
+    declared: &[Cow<'static, str>],
+) -> Result<Vec<PortDef>, DefError> {
+    let mut ports: Vec<PortDef> = Vec::new();
+    for (name, producer) in cx.inputs {
+        if declared.iter().any(|taken| taken == name) {
+            continue;
+        }
+        if ports.iter().any(|port| port.name == *name) {
+            return Err(DefError::FanIn {
+                port: name.to_string(),
+            });
+        }
+        ports.push(PortDef {
+            name: name.to_string().into(),
+            ..(*producer).clone()
+        });
+    }
+    Ok(ports)
+}
+
+/// One port per config output no declared port took, defined by the record it names.
+pub fn dyn_output_defs(
+    cx: &DefCx<'_>,
+    declared: &[Cow<'static, str>],
+) -> Result<Vec<PortDef>, DefError> {
+    cx.outputs
+        .iter()
+        .filter(|output| !declared.iter().any(|taken| *taken == output.port))
+        .map(|output| cx.records.port(&output.port, &output.record))
+        .collect()
+}
+
+/// A `DynInputs` is the input side of a system whose ports the config lists.
+///
+/// Each port carries the definition it computed from the config and the bytes
+/// its producer wrote, undecoded.
+pub struct DynInputs<W: WakeSink = NoWake> {
+    ports: Vec<(PortDef, Input<Bytes, W>)>,
+}
+
+impl<W: WakeSink> Default for DynInputs<W> {
+    fn default() -> Self {
+        Self { ports: Vec::new() }
+    }
+}
+
+impl<W: WakeSink> DynInputs<W> {
+    /// Every port's definition and the records waiting on it.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Input<Bytes, W>)> {
+        self.ports.iter_mut().map(|(def, input)| (&*def, input))
+    }
+}
+
+impl DynInputs<Notifier> {
+    /// Waits until any port has a record.
+    ///
+    /// Never resolves while no port has a producer.
+    pub async fn any_ready(&mut self) {
+        readiness::wait(self).await;
+    }
+}
+
+impl<W: WakeSink> SystemInputs<W> for DynInputs<W> {
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        dyn_input_defs(cx, &[])
+    }
+
+    fn bind(inputs: Vec<InputBinding<W>>) -> Self {
+        let ports = inputs
+            .into_iter()
+            // PANIC Safety: bytes need no alignment.
+            .map(|b| (b.def, Input::try_new(b.views).expect("byte alignment")))
+            .collect();
+        Self { ports }
+    }
+}
+
+/// A `DynOutputs` is the output side of a system whose ports the config lists.
+pub struct DynOutputs<W: WakeSource = NoWake> {
+    ports: Vec<(PortDef, Output<Bytes, W>)>,
+}
+
+impl<W: WakeSource> Default for DynOutputs<W> {
+    fn default() -> Self {
+        Self { ports: Vec::new() }
+    }
+}
+
+impl<W: WakeSource> DynOutputs<W> {
+    /// Every port's definition and the writer publishing on it.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Output<Bytes, W>)> {
+        self.ports.iter_mut().map(|(def, output)| (&*def, output))
+    }
+}
+
+impl<W: WakeSource> SystemOutputs<W> for DynOutputs<W> {
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        dyn_output_defs(cx, &[])
+    }
+
+    fn bind(outputs: Vec<OutputBinding<W>>) -> Self {
+        let ports = outputs
+            .into_iter()
+            .map(|b| {
+                let output = Output::bytes(b.writer, b.def.max_len);
+                (b.def, output)
+            })
+            .collect();
+        Self { ports }
+    }
 }
 
 /// A `Latest` holds a decoded record, borrowed from the input or owned.
-pub struct Latest<'a, T: Record + 'a> {
+pub struct Latest<'a, T: Record + ?Sized + 'a> {
     decoded: T::Read<'a>,
 }
 
-impl<'a, T: Record> Latest<'a, T> {
+impl<'a, T: Record + ?Sized> Latest<'a, T> {
     /// Borrows the decoded record without decoding again.
     pub fn read(&self) -> &T {
         self.decoded.borrow()
@@ -176,7 +356,7 @@ impl<'a, T: Record> Latest<'a, T> {
     }
 }
 
-impl<T: Record> Deref for Latest<'_, T> {
+impl<T: Record + ?Sized> Deref for Latest<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         self.read()
@@ -189,7 +369,7 @@ mod proofs {
 
     /// A bounded slice is never longer than the bound.
     #[kani::proof]
-    fn bounded_never_exceeds_max() {
+    fn test_bounded_slice_length() {
         let len: usize = kani::any();
         let max: usize = kani::any();
         kani::assume(len <= 64);
@@ -204,7 +384,7 @@ mod proofs {
     /// A capacity always holds two records of the largest size the ring's
     /// 32-bit length field can address.
     #[kani::proof]
-    fn capacity_fits_two_records() {
+    fn test_capacity_fits_two_records() {
         let max_size: u32 = kani::any();
         let depth: usize = kani::any();
         let max_size = max_size as usize;
@@ -243,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn aligned_frames_remain_readable_through_wraps() {
+    fn test_aligned_frames_wrap() {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: 128,
             max_readers: 1,
@@ -265,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_alignment_is_rejected_at_construction() {
+    fn test_reject_unsupported_alignment() {
         let ring = ring(4);
         let error = UnsupportedAlignment {
             alignment: 32,
@@ -281,8 +461,14 @@ mod tests {
         );
         assert_eq!(Input::<Overaligned>::try_new(Vec::new()).err(), Some(error));
         assert!(ring.writer(NoWake).is_ok());
-        assert_eq!(Input::<Overaligned>::def("input").alignment, 32);
-        assert_eq!(Output::<Aligned>::def("output").alignment, 16);
+        assert_eq!(
+            Input::<Overaligned>::def(&DefCx::empty(), "input").alignment,
+            32
+        );
+        assert_eq!(
+            Output::<Aligned>::def(&DefCx::empty(), "output").alignment,
+            16
+        );
     }
 
     fn sample(ts: i64, sample: f64) -> Imu {
@@ -306,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_is_power_of_two_holding_two_records() {
+    fn test_ring_capacity() {
         let capacity = ring_capacity(64, 1).expect("valid capacity");
         assert!(capacity.is_power_of_two());
         assert!(capacity >= 2 * frame_len(64));
@@ -320,14 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn a_port_def_names_its_record() {
-        assert_eq!(Output::<Imu>::def("imu").record, Imu::NAME);
-        assert_eq!(Input::<Note>::def("note").record, Note::NAME);
-        assert_eq!(Input::<Imu>::def("imu"), Output::<Imu>::def("imu"));
-    }
-
-    #[test]
-    fn write_then_latest() {
+    fn test_write_then_latest() {
         let (_ring, mut out, mut input) = pair(4);
         out.write(&sample(7, 42.0)).expect("ring has room");
         let got = input.latest().expect("valid record").expect("one record");
@@ -336,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_repeats_the_pinned_record() {
+    fn test_latest_repeats_pinned_record() {
         let (_ring, mut out, mut input) = pair(4);
         out.write(&sample(1, 1.0)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
@@ -344,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_visits_records_in_order() {
+    fn test_drain_record_order() {
         let (_ring, mut out, mut input) = pair(8);
         for i in 0..3 {
             out.write(&sample(i, i as f64)).expect("ring has room");
@@ -360,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_picks_the_greater_timestamp_across_producers() {
+    fn test_latest_selects_newest_producer() {
         let (left, right) = (ring(4), ring(4));
         let mut a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
             .expect("supported alignment");
@@ -380,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_ties_go_to_the_earlier_producer() {
+    fn test_latest_timestamp_tie() {
         let (left, right) = (ring(4), ring(4));
         let mut a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
             .expect("supported alignment");
@@ -397,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_visits_producers_in_edge_order() {
+    fn test_drain_producer_order() {
         let (left, right) = (ring(8), ring(8));
         let mut a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
             .expect("supported alignment");
@@ -420,14 +599,14 @@ mod tests {
     }
 
     #[test]
-    fn unconnected_input_reads_nothing() {
+    fn test_unconnected_input() {
         let mut input = Input::<Imu>::try_new(Vec::new()).expect("supported alignment");
         assert!(input.latest().expect("valid").is_none());
         assert_eq!(input.drain().count(), 0);
     }
 
     #[test]
-    fn full_ring_would_block() {
+    fn test_full_ring_blocks() {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: 64,
             max_readers: 1,
@@ -448,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn short_record_is_corrupt() {
+    fn test_reject_short_record() {
         let ring = ring(4);
         let mut writer = ring.writer(NoWake).expect("free writer");
         let mut input = Input::<Imu>::try_new(vec![ring.view(NoWake).expect("free slot")])
@@ -514,10 +693,14 @@ mod tests {
         fn timestamp(&self) -> Option<Timestamp> {
             self.0.timestamp()
         }
+
+        fn schema() -> crate::record::RecordSchema {
+            Stamped::schema()
+        }
     }
 
     #[test]
-    fn latest_decodes_each_candidate_once_and_retains_the_winner() {
+    fn test_latest_decodes_once() {
         let (_l, _r, mut a, mut b, mut input) = message_pair_two::<Counted>();
         DECODES.set(0);
         assert!(input.latest().expect("empty input").is_none());
@@ -539,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_into_inner_keeps_frames_borrowed() {
+    fn test_latest_into_inner_borrows_frame() {
         let (_ring, mut out, mut input) = pair(4);
         out.write(&sample(1, 2.0)).expect("fits");
         let frame: &Imu = input.latest().expect("valid").expect("record").into_inner();
@@ -549,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_on_stamped_messages_orders_across_producers() {
+    fn test_latest_stamped_message_order() {
         let (_l, _r, mut a, mut b, mut input) = stamped_pair();
         a.write(&Stamped {
             at: Timestamp(9),
@@ -573,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_on_unstamped_messages_keeps_the_earlier_producer() {
+    fn test_latest_unstamped_message_order() {
         let (_l, _r, mut a, mut b, mut input) = message_pair_two::<Fixed>();
         b.write(&Fixed { a: 2, b: 0.0 }).expect("fits");
         a.write(&Fixed { a: 1, b: 0.0 }).expect("fits");
@@ -612,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn message_round_trips_through_write_and_drain() {
+    fn test_message_round_trip() {
         let (_ring, mut out, mut input) = message_pair::<Note>();
         out.write(&Note { text: "hi".into() }).expect("fits");
         out.write(&Note {
@@ -626,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn oversize_message_leaves_the_ring_untouched() {
+    fn test_oversize_message_preserves_ring() {
         let (_ring, mut out, mut input) = message_pair::<Note>();
         let long = Note {
             text: "x".repeat(100),
@@ -642,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_record_does_not_stop_the_drain() {
+    fn test_drain_skips_corrupt_record() {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: ring_capacity(Fixed::MAX_LEN, 4).expect("valid capacity"),
             max_readers: 1,
@@ -664,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn frames_drain_by_reference_and_messages_by_value() {
+    fn test_drain_frames_and_messages() {
         let (_ring, mut out, mut input) = pair(4);
         out.write(&sample(1, 1.0)).expect("ring has room");
         let borrowed: Option<&Imu> = input.drain().next().map(|r| r.expect("decodes"));
@@ -674,5 +857,278 @@ mod tests {
         out.write(&Fixed { a: 3, b: 0.5 }).expect("fits");
         let owned: Option<Fixed> = input.drain().next().map(|r| r.expect("decodes"));
         assert_eq!(owned, Some(Fixed { a: 3, b: 0.5 }));
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use core::future::Future;
+    use core::task::{Context, Poll};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Wake, Waker};
+
+    use futures_lite::future::poll_once;
+    use metor_fsw_3_ring::{Config, Notifier, RingBuffer};
+
+    use super::*;
+    use crate::system::InputBinding;
+    use crate::tests::utils::Imu;
+
+    #[derive(Default)]
+    struct Woken(AtomicBool);
+
+    impl Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    type WokenInputs = (
+        [RingBuffer; 2],
+        [Output<Imu, Notifier>; 2],
+        Input<Imu, Notifier>,
+    );
+
+    fn independently_woken() -> WokenInputs {
+        let (left, a, first) = woken(&Notifier::default());
+        let (right, b, second) = woken(&Notifier::default());
+        let views = first.views.into_iter().chain(second.views).collect();
+        let input = Input::try_new(views).expect("supported alignment");
+        ([left, right], [a, b], input)
+    }
+
+    /// One ring holding four `Imu` records, woken through `wake`.
+    fn woken(wake: &Notifier) -> (RingBuffer, Output<Imu, Notifier>, Input<Imu, Notifier>) {
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: ring_capacity(Imu::MAX_LEN, 4).expect("valid capacity"),
+            max_readers: 1,
+        });
+        let out = Output::try_new(ring.writer(wake.clone()).expect("free writer"))
+            .expect("supported alignment");
+        let input = Input::try_new(vec![ring.view(wake.clone()).expect("free slot")])
+            .expect("supported alignment");
+        (ring, out, input)
+    }
+
+    #[stellarator::test]
+    async fn test_next_waits_for_record() {
+        let wake = Notifier::default();
+        let (_ring, mut out, mut input) = woken(&wake);
+        assert!(poll_once(input.next()).await.is_none());
+        out.write(&Imu::new(1, 1.0)).expect("ring has room");
+        out.write(&Imu::new(2, 2.0)).expect("ring has room");
+        assert_eq!(input.next().await.expect("record").sample, 1.0);
+        assert_eq!(input.next().await.expect("record").sample, 2.0);
+        assert!(poll_once(input.next()).await.is_none());
+    }
+
+    #[stellarator::test]
+    async fn test_next_without_producer() {
+        let mut input = Input::<Imu, Notifier>::try_new(Vec::new()).expect("supported alignment");
+        assert!(poll_once(input.next()).await.is_none());
+    }
+
+    #[test]
+    fn test_next_wakes_per_producer() {
+        let (_rings, mut outputs, mut input) = independently_woken();
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        for at in [1, 0, 1, 0] {
+            let mut next = core::pin::pin!(input.next());
+            assert!(next.as_mut().poll(&mut cx).is_pending());
+            woken.0.store(false, Ordering::SeqCst);
+            outputs[at].write(&Imu::new(1, at as f64)).expect("room");
+            assert!(woken.0.load(Ordering::SeqCst));
+            let Poll::Ready(Ok(record)) = next.as_mut().poll(&mut cx) else {
+                panic!("the notified producer has a record")
+            };
+            assert_eq!(record.sample, at as f64);
+        }
+    }
+
+    #[test]
+    fn test_next_cancel_and_retry() {
+        let (_rings, mut outputs, mut input) = independently_woken();
+        let wakes: Vec<_> = input.views.iter().map(|view| view.wake().clone()).collect();
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        {
+            let mut next = core::pin::pin!(input.next());
+            assert!(next.as_mut().poll(&mut cx).is_pending());
+        }
+        for wake in &wakes {
+            wake.notify();
+        }
+        assert!(!woken.0.load(Ordering::SeqCst));
+
+        let mut next = core::pin::pin!(input.next());
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        outputs[1].write(&Imu::new(1, 7.0)).expect("room");
+        assert!(woken.0.load(Ordering::SeqCst));
+        assert!(matches!(next.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+    }
+
+    #[test]
+    fn test_empty_notification_rearms_waiter() {
+        let wake = Notifier::default();
+        let (_ring, mut output, mut input) = woken(&wake);
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut next = core::pin::pin!(input.next());
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        wake.notify();
+        woken.0.store(false, Ordering::SeqCst);
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            woken.0.load(Ordering::SeqCst),
+            "rearming schedules another poll"
+        );
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        woken.0.store(false, Ordering::SeqCst);
+        output.write(&Imu::new(1, 7.0)).expect("room");
+        assert!(woken.0.load(Ordering::SeqCst));
+        assert!(matches!(next.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+    }
+
+    #[stellarator::test]
+    async fn test_next_consumes_corrupt_record() {
+        let (_ring, mut output, mut input) = woken(&Notifier::default());
+        output.writer.try_write(&[0]).expect("room");
+        assert!(matches!(input.next().await, Err(RecvError::Decode(_))));
+        output.write(&Imu::new(2, 7.0)).expect("room");
+        assert_eq!(input.next().await.expect("valid record").sample, 7.0);
+    }
+
+    #[stellarator::test]
+    async fn test_write_wakes_port_across_threads() {
+        let wake = Notifier::default();
+        let (ring, out, mut input) = woken(&wake);
+        drop(out);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(core::time::Duration::from_millis(20));
+            let mut out = Output::<Imu, _>::try_new(ring.writer(wake).expect("free writer"))
+                .expect("supported alignment");
+            out.write(&Imu::new(7, 7.0)).expect("ring has room");
+            ring
+        });
+        assert_eq!(input.next().await.expect("record").sample, 7.0);
+        let _ring = writer.join().expect("the writer thread finished");
+    }
+
+    #[stellarator::test]
+    async fn test_any_ready_waits_for_record() {
+        let wake = Notifier::default();
+        let (_left, mut a, _) = woken(&wake);
+        let (right, _, _) = woken(&wake);
+        let mut inputs = DynInputs::<Notifier>::bind(vec![
+            InputBinding {
+                def: Input::<Imu>::def(&DefCx::empty(), "a.imu"),
+                views: Vec::new(),
+            },
+            InputBinding {
+                def: Input::<Imu>::def(&DefCx::empty(), "b.imu"),
+                views: vec![right.view(wake.clone()).expect("free slot")],
+            },
+        ]);
+        assert!(poll_once(inputs.any_ready()).await.is_none());
+        a.write(&Imu::new(1, 1.0)).expect("ring has room");
+        // The record landed on a ring no port reads, so nothing is ready.
+        assert!(poll_once(inputs.any_ready()).await.is_none());
+        let mut out = Output::<Imu, _>::try_new(right.writer(wake).expect("free writer"))
+            .expect("supported alignment");
+        out.write(&Imu::new(2, 2.0)).expect("ring has room");
+        inputs.any_ready().await;
+        let seen: Vec<_> = inputs
+            .iter_mut()
+            .flat_map(|(def, input)| input.drain().map(move |r| (def.name.to_string(), r)))
+            .map(|(name, bytes)| (name, bytes.expect("bytes").len()))
+            .collect();
+        assert_eq!(seen, vec![("b.imu".to_string(), Imu::MAX_LEN)]);
+    }
+
+    fn independent_ports() -> (
+        [RingBuffer; 2],
+        [Output<Imu, Notifier>; 2],
+        DynInputs<Notifier>,
+    ) {
+        let (left, a, first) = woken(&Notifier::default());
+        let (right, b, second) = woken(&Notifier::default());
+        let inputs = DynInputs::bind(vec![
+            InputBinding {
+                def: Input::<Imu>::def(&DefCx::empty(), "a"),
+                views: first.views,
+            },
+            InputBinding {
+                def: Input::<Imu>::def(&DefCx::empty(), "b"),
+                views: second.views,
+            },
+        ]);
+        ([left, right], [a, b], inputs)
+    }
+
+    #[test]
+    fn test_any_ready_wakes_per_port() {
+        let (_rings, mut outputs, mut inputs) = independent_ports();
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        for at in [1, 0, 1, 0] {
+            {
+                let mut ready = core::pin::pin!(inputs.any_ready());
+                assert!(ready.as_mut().poll(&mut cx).is_pending());
+                woken.0.store(false, Ordering::SeqCst);
+                outputs[at].write(&Imu::new(1, 7.0)).expect("room");
+                assert!(woken.0.load(Ordering::SeqCst));
+                assert!(ready.as_mut().poll(&mut cx).is_ready());
+            }
+            let count = inputs
+                .iter_mut()
+                .flat_map(|(_, input)| input.drain())
+                .count();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn test_any_ready_cancel_and_retry() {
+        let (_rings, mut outputs, mut inputs) = independent_ports();
+        let wakes: Vec<_> = inputs
+            .ports
+            .iter()
+            .flat_map(|(_, input)| input.views.iter().map(|view| view.wake().clone()))
+            .collect();
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        {
+            let mut ready = core::pin::pin!(inputs.any_ready());
+            assert!(ready.as_mut().poll(&mut cx).is_pending());
+        }
+        for wake in &wakes {
+            wake.notify();
+        }
+        assert!(!woken.0.load(Ordering::SeqCst));
+
+        let mut ready = core::pin::pin!(inputs.any_ready());
+        assert!(ready.as_mut().poll(&mut cx).is_pending());
+        outputs[1].write(&Imu::new(1, 7.0)).expect("room");
+        assert!(woken.0.load(Ordering::SeqCst));
+        assert!(ready.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[stellarator::test]
+    async fn test_any_ready_without_producers() {
+        let mut empty = DynInputs::<Notifier>::default();
+        assert!(poll_once(empty.any_ready()).await.is_none());
+        let mut unbound = DynInputs::<Notifier>::bind(vec![InputBinding {
+            def: Input::<Imu>::def(&DefCx::empty(), "unbound"),
+            views: Vec::new(),
+        }]);
+        assert!(poll_once(unbound.any_ready()).await.is_none());
     }
 }

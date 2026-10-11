@@ -7,26 +7,29 @@
 mod build;
 mod config;
 mod error;
-#[cfg(test)]
-mod fault_tests;
 mod params;
 mod run;
 mod status;
 mod table;
+
+#[cfg(test)]
+mod tests;
 
 use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
 use crate::port::Output;
 
-pub use config::{Clock, CoordinatorConfig, InputConfig, PortRef, SystemConfig};
+pub use config::{
+    Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig, OutputConfig, PortRef, SystemConfig,
+};
 pub use error::BuildError;
 pub use params::{ParamError, Params};
 pub use run::Step;
-pub(crate) use run::catch_step;
+pub(crate) use run::{catch_step, message_of as panic_message};
 pub use status::SystemStatus;
-pub use table::SystemTable;
 pub(crate) use table::TableEntry;
+pub use table::{MakeCx, SystemTable};
 
 /// One bound system and the status port the coordinator owns for it.
 struct Entry {
@@ -39,6 +42,10 @@ struct Entry {
 /// and the rings holding them together.
 pub struct Coordinator {
     entries: Vec<Entry>,
+    /// The named groups build placed async systems on, held weakly: each
+    /// adapter owns its group, so a thread stops when its systems drop.
+    #[allow(dead_code)]
+    threads: crate::thread::Threads,
     clock: Clock,
     /// Start of the simulated timeline, taken at build.
     epoch: Timestamp,

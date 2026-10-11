@@ -32,11 +32,41 @@ new `to_config()`, and `metor run`. Written fresh: fsw-2 is read for its
 lessons, nothing is copied. Takes over the ADCS example and the slice-2
 docs pass from T7 and T8. `04-packs.md`.
 
-## 4. Links
+## 4. Links, done
 
-Shared state, `TcpServer`, `Downlink`, `Uplink`. Needs an "every output
-ring with its vtable" surface first. The wire format is fixed by
-metor-panel and metor-db, so it is reproduced, not designed.
+`Publish` and `Subscribe`, each over a listen or connect transport, the
+`Thread` adapter and named thread placement for async systems, and
+dynamic ports with a schema on every `PortDef`. The wire format is
+fixed by metor-panel and metor-db, so it is reproduced, not designed.
+`05-links.md`, `05-links-impl.md`. Landed 2026-09-18; the fixture's
+`metor run` closes the loop from a `Subscribe` through `echo` to a
+`Publish`.
+
+- Definitions from config: a type computes its `SystemDef` from its
+  instance config, dynamic markers and build's completion pass are gone,
+  and ABI 5 adds `metor_fsw_def`. Landed 2026-09-20,
+  `06-def-from-config.md`.
+
+- Shared state: the `&Shared<S>` parameter kind and the one-thread rule
+  are designed in `05-links.md` and held until two systems must hold
+  one socket (bi-directional commanding on one port).
+
+- Link loops: `publish.rs` and `subscribe.rs` repeat the readiness race
+  and the status tail, and their params repeat four fields; fold them
+  into one helper in `conn.rs` when a third link arrives.
+
+- Message ids: postcard messages hash the schema name, other codecs the
+  record name. Unify in metor-proto-wkt (the panel's matchers depend on
+  the current ids), then drop `Msg::ID` from the `Record` derive.
+
+- Connection buffers: `Connections::open` allocates a connection's three
+  buffers (outbox, in-flight write, receive) because a closed connection
+  ends by cancellation, and a completion-style read or write dropped
+  mid-flight takes its buffer with it. Reuse them so a connection allocates
+  nothing: both halves watch a close flag and return their buffers as the
+  task's output, and `prune` joins the task before the slot is free. A
+  write stuck on a silent peer then holds its slot until TCP gives up,
+  which needs a bound.
 
 ## 5. Sequences and slots
 
@@ -47,10 +77,13 @@ only; `SequenceCommand` arrives as an ordinary message.
 ## 6. Process and wasm adapters
 
 The control block and mmap ring files for worker processes; wasmi with
-the guest-allocates-rings protocol and per-call fuel. Both port from
-fsw-2 largely as-is once the ABI from slice 3 is settled.
+the guest-allocates-rings protocol and per-call fuel
 
 ## 7. Deployments and gateway
 
 `Deployment` of several targets, `Publish` and `Subscribe` mirrors, and
-the gateway target with the embedded db.
+the gateway target with the embedded db. Frame subscription lands here:
+`Subscribe([publish.nav.est])` references a peer's `Publish` port, the
+output takes that port's name and record, and routing binds the
+announced table id (`05-links.md`, decision 7). A dialed `Subscribe`
+toward a db peer needs a `MsgStream` request per id.

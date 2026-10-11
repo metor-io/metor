@@ -4,24 +4,31 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Sequence
 
-from metor_config import OutPort, Pack, Record, Sources, System
+from metor_config import Item, OutPort, Pack, Record, Sources, System
 
 PACK = Pack(
     id="echo",
     lib="echo_pack",
     libs=str(Path(__file__).resolve().parent / "_libs"),
-    abi_version=2,
+    abi_version=6,
 )
 
 
-class LogEvent(Record): ...
+class LogEvent(Record):
+    _name = "log"
+    _pack = PACK
 
 
-class Ping(Record): ...
+class Ping(Record):
+    _name = "ping"
+    _pack = PACK
 
 
-class SystemStatus(Record): ...
+class SystemStatus(Record):
+    _name = "status"
+    _pack = PACK
 
 
 class Echo(System):
@@ -33,6 +40,37 @@ class Echo(System):
 
     def __init__(self, *, input: Sources[Ping] = ()) -> None:
         super().__init__({"input": input}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Relay(System):
+    "Copies every ping."
+
+    _pack = PACK
+    _ty = "relay"
+    _outputs = ("output",)
+
+    def __init__(self, *, input: Sources[Ping] = ()) -> None:
+        super().__init__({"input": input}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Tap(System):
+    "Adds up what every configured port carries."
+
+    _pack = PACK
+    _ty = "tap"
+    _takes_inputs = True
+    _outputs = ("output",)
+
+    def __init__(self, *, items: Sequence[Item] = ()) -> None:
+        super().__init__({}, {}, items=items)
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]

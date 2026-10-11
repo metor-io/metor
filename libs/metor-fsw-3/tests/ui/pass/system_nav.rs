@@ -1,5 +1,5 @@
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-use metor_fsw_3::{Frame, Input, Output, SystemFn, SystemTable, Timestamp, system};
+use metor_fsw_3::{Frame, Input, Output, Ports, SystemTable, Timestamp, system};
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
@@ -46,7 +46,9 @@ fn main() {
     assert_eq!(NavState::NAMES, &["now", "gps", "gps_backup", "estimate"]);
     assert_eq!(NavState::NAME, "nav_state");
     let mut table = SystemTable::new();
-    table.register("nav", NavState::default);
+    table
+        .register("nav", NavState::default)
+        .expect("valid records");
     let mut nav = NavState::default();
     nav.execute(
         Timestamp(0),

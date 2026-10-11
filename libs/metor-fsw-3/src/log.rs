@@ -29,6 +29,10 @@ impl Record for LogEvent {
     fn timestamp(&self) -> Option<Timestamp> {
         Some(self.timestamp)
     }
+
+    fn schema() -> crate::record::RecordSchema {
+        crate::record::RecordSchema::postcard::<LogEvent>(Self::NAME)
+    }
 }
 
 /// A `LogPort` writes one system's log lines, stamped with the cycle time.
@@ -167,6 +171,34 @@ pub fn with_log_port<R>(port: &mut LogPort, now: Timestamp, f: impl FnOnce() -> 
     result
 }
 
+/// Routes this thread's logs to `port` for each poll of `inner`, stamping its
+/// lines with the wall time of that poll.
+pub fn log_scope<F: core::future::Future + Unpin>(port: &mut LogPort, inner: F) -> LogScope<'_, F> {
+    LogScope { port, inner }
+}
+
+/// The future [`log_scope`] returns.
+pub struct LogScope<'a, F> {
+    port: &'a mut LogPort,
+    inner: F,
+}
+
+impl<F: core::future::Future + Unpin> core::future::Future for LogScope<'_, F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<F::Output> {
+        let this = self.get_mut();
+        this.port.now = Timestamp::now();
+        let _restore = RestoreSlot(SLOT.replace(Some(NonNull::from(&mut *this.port))));
+        let polled = core::pin::Pin::new(&mut this.inner).poll(cx);
+        with_port(LogPort::report_dropped);
+        polled
+    }
+}
+
 struct RestoreSlot(Option<NonNull<LogPort>>);
 
 impl Drop for RestoreSlot {
@@ -277,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_lines_carry_the_stamp_level_and_kind() {
+    fn test_log_metadata() {
         let (_ring, mut port, mut input) = log_pair(8);
         let mut log = Log;
         with_log_port(&mut port, Timestamp(5), || {
@@ -298,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn traced_events_land_with_their_fields_and_location() {
+    fn test_trace_fields_and_location() {
         let (_ring, mut port, mut input) = log_pair(8);
         let subscriber = tracing_subscriber::registry().with(layer());
         with_log_port(&mut port, Timestamp(9), || {
@@ -320,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn an_event_with_no_port_entered_reaches_no_ring() {
+    fn test_log_without_port() {
         let (_ring, mut port, mut input) = log_pair(8);
         let subscriber = tracing_subscriber::registry().with(layer());
         tracing::subscriber::with_default(subscriber, || {
@@ -331,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_scopes_restore_the_outer_port() {
+    fn test_nested_scope_restores_port() {
         let (_outer_ring, mut outer, mut outer_input) = log_pair(8);
         let (_inner_ring, mut inner, mut inner_input) = log_pair(8);
         let result = with_log_port(&mut outer, Timestamp(1), || {
@@ -354,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_panic_restores_the_previous_slot() {
+    fn test_callback_panic_restores_port() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
         let (_outer_ring, mut outer, mut outer_input) = log_pair(8);
@@ -381,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn scopes_are_independent_between_threads() {
+    fn test_thread_local_scopes() {
         let (_ring, mut port, mut input) = log_pair(8);
         with_log_port(&mut port, Timestamp(1), || {
             let worker = std::thread::spawn(|| {
@@ -403,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn formatting_cannot_reenter_the_active_port() {
+    fn test_formatting_reentrancy() {
         struct Recursive;
 
         impl core::fmt::Debug for Recursive {
@@ -430,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn formatting_panic_restores_the_active_port() {
+    fn test_formatting_panic_restores_port() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
         struct Panics;
@@ -462,7 +494,7 @@ mod tests {
     /// The count survives a ring with no room for the warning and lands once
     /// there is room again.
     #[test]
-    fn a_full_ring_drops_lines_and_reports_the_count_once() {
+    fn test_log_overflow_report() {
         let padded = "p".repeat(LogEvent::MAX_LEN / 2);
         let (_ring, mut port, mut input) = log_pair(4);
         let records = ring_capacity(LogEvent::MAX_LEN, 4).expect("valid")

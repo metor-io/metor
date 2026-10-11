@@ -4,6 +4,7 @@ use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto_wkt::{LogEvent, LogLevel};
 
 use super::*;
+use crate::DefCx;
 use crate::port::{Input, ring_capacity};
 use crate::record::Record;
 use crate::tests::utils::{Imu, Nav, Recorder};
@@ -38,8 +39,27 @@ fn raw(ring: &TestRing) -> RawRing {
     RawRing::of(&ring.export)
 }
 
+/// The def the host would resolve for `ty`, as JSON; an unknown type gets an
+/// empty one, since `create` never reaches the bindings.
+fn instance_def(ty: &str) -> Vec<u8> {
+    let def = build()
+        .get(ty)
+        .map(|entry| entry.def.clone())
+        .unwrap_or_else(|| {
+            crate::SystemDef::new::<(), ()>("unknown", &crate::DefCx::empty())
+                .expect("a static definition")
+        });
+    let instance = crate::pack::def::Instance {
+        id: ty.to_string(),
+        def,
+        thread: crate::thread::DEFAULT_THREAD.to_string(),
+    };
+    serde_json::to_vec(&instance).expect("encodes")
+}
+
 /// Calls `create` the way an export does, returning the instance or the error.
 fn create_raw(ty: &str, params: &str, inputs: &[RawPort], outputs: &[RawRing]) -> Instance {
+    let def = instance_def(ty);
     let mut error = RawSlice::EMPTY;
     // SAFETY: every array outlives the call, and the rings outlive the instance.
     let handle = unsafe {
@@ -47,6 +67,7 @@ fn create_raw(ty: &str, params: &str, inputs: &[RawPort], outputs: &[RawRing]) -
             build,
             RawSlice::of(ty.as_bytes()),
             RawSlice::of(params.as_bytes()),
+            RawSlice::of(&def),
             RawSlice::of(inputs),
             RawSlice::of(outputs),
             &raw mut error,
@@ -98,7 +119,7 @@ fn descriptor(build: fn() -> SystemTable, buffer: &mut [u8]) -> (u32, usize) {
 }
 
 #[test]
-fn the_descriptor_decodes_as_the_tables_projection() {
+fn test_descriptor_export() {
     let mut bytes = vec![0u8; 64 * 1024];
     let (status, len) = descriptor(build, &mut bytes);
     assert_eq!(status, DefStatus::Ok as u32);
@@ -119,8 +140,72 @@ fn the_descriptor_decodes_as_the_tables_projection() {
     assert_eq!(descriptor(build, &mut []), (DefStatus::TooSmall as u32, 0));
 }
 
+/// Calls the definition export the way the host does.
+fn system_def_raw(ty: &str, cx: &DefCxOwned, buffer: &mut [u8]) -> (u32, usize) {
+    let cx = serde_json::to_vec(cx).expect("encodes");
+    let mut written = usize::MAX;
+    // SAFETY: both arrays outlive the call; the result slots are writable.
+    let status = unsafe {
+        system_def(
+            build,
+            RawSlice::of(ty.as_bytes()),
+            RawSlice::of(&cx),
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut written,
+        )
+    };
+    (status, written)
+}
+
 #[test]
-fn descriptor_initialization_panics_are_contained() {
+fn test_configured_port_export() {
+    let producer = crate::Output::<Imu>::def(&DefCx::empty(), "imu");
+    let cx = DefCxOwned {
+        inputs: vec![("plant.imu".to_string(), producer)],
+        ..DefCxOwned::default()
+    };
+    let mut bytes = vec![0u8; 64 * 1024];
+    let (status, len) = system_def_raw("tap", &cx, &mut bytes);
+    assert_eq!(status, DefStatus::Ok as u32);
+    let def: SystemDef = serde_json::from_slice(&bytes[..len]).expect("decodes");
+    assert_eq!(def.inputs[0].name, "plant.imu");
+    assert_eq!(
+        system_def_raw("tap", &cx, &mut bytes[..len - 1]),
+        (DefStatus::TooSmall as u32, 0)
+    );
+}
+
+#[test]
+fn test_definition_export_errors() {
+    let mut bytes = vec![0u8; 4096];
+    let (status, len) = system_def_raw("missing", &DefCxOwned::default(), &mut bytes);
+    assert_eq!(status, DefStatus::Refused as u32);
+    assert!(matches!(
+        serde_json::from_slice(&bytes[..len]).expect("decodes"),
+        DefError::Pack { message } if message.contains("missing")
+    ));
+
+    let cx = DefCxOwned {
+        outputs: vec![crate::OutputConfig {
+            port: "out".into(),
+            record: "gyro".into(),
+        }],
+        ..DefCxOwned::default()
+    };
+    let (status, len) = system_def_raw("emit", &cx, &mut bytes);
+    assert_eq!(status, DefStatus::Refused as u32);
+    assert_eq!(
+        serde_json::from_slice::<DefError>(&bytes[..len]).expect("decodes"),
+        DefError::UnknownRecord {
+            port: "out".into(),
+            record: "gyro".into(),
+        }
+    );
+}
+
+#[test]
+fn test_descriptor_panic_containment() {
     fn broken() -> SystemTable {
         panic!("table build");
     }
@@ -136,7 +221,7 @@ fn descriptor_initialization_panics_are_contained() {
 }
 
 #[test]
-fn table_captures_are_owned_once_per_thread_and_released_on_exit() {
+fn test_table_capture_lifetime() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     struct Capture;
@@ -148,10 +233,12 @@ fn table_captures_are_owned_once_per_thread_and_released_on_exit() {
     fn captured() -> SystemTable {
         let capture = Capture;
         let mut table = SystemTable::new();
-        table.register_system("imu", move |_| {
-            let _ = &capture;
-            Ok((crate::tests::utils::ImuSource, 0))
-        });
+        table
+            .register_system("imu", move |_| {
+                let _ = &capture;
+                Ok((crate::tests::utils::ImuSource, 0))
+            })
+            .expect("valid records");
         table
     }
     std::thread::spawn(|| {
@@ -167,7 +254,7 @@ fn table_captures_are_owned_once_per_thread_and_released_on_exit() {
 }
 
 #[test]
-fn an_unknown_type_returns_a_decode_error() {
+fn test_unknown_system_type() {
     let instance = create_raw("gyro", "", &[], &[]);
     assert!(instance.handle.is_null());
     let error: ParamError = serde_json::from_slice(instance.error()).expect("error");
@@ -175,7 +262,7 @@ fn an_unknown_type_returns_a_decode_error() {
 }
 
 #[test]
-fn a_bad_params_key_returns_the_tables_own_error() {
+fn test_unknown_param_key() {
     let nav = ring::<Nav>(1);
     let outputs = [raw(&nav)];
     let instance = create_raw("nav", r#"{"gain":2.0}"#, &[input(&[])], &outputs);
@@ -185,7 +272,7 @@ fn a_bad_params_key_returns_the_tables_own_error() {
 }
 
 #[test]
-fn malformed_params_are_a_decode_error() {
+fn test_malformed_params() {
     let nav = ring::<Nav>(1);
     let outputs = [raw(&nav)];
     let instance = create_raw("nav", "{", &[input(&[])], &outputs);
@@ -195,7 +282,7 @@ fn malformed_params_are_a_decode_error() {
 }
 
 #[test]
-fn a_two_system_pipeline_moves_a_record_within_one_cycle() {
+fn test_pipeline_single_cycle() {
     let (imu, nav) = (ring::<Imu>(1), ring::<Nav>(1));
     let imu_out = [raw(&imu)];
     let nav_out = [raw(&nav)];
@@ -214,7 +301,7 @@ fn a_two_system_pipeline_moves_a_record_within_one_cycle() {
 }
 
 #[test]
-fn a_panicking_system_returns_panicked_and_writes_one_fault_line() {
+fn test_system_panic_status_and_log() {
     let (imu, log) = (ring::<Imu>(1), ring::<LogEvent>(1));
     let outputs = [raw(&imu), raw(&log)];
     let boom = create_raw("boom", "", &[], &outputs);
@@ -232,7 +319,7 @@ fn a_panicking_system_returns_panicked_and_writes_one_fault_line() {
 }
 
 #[test]
-fn destroy_frees_the_reader_slot_and_the_writer() {
+fn test_destroy_releases_ring_handles() {
     let (imu, nav) = (ring::<Imu>(1), ring::<Nav>(1));
     let nav_out = [raw(&nav)];
     let edges = [raw(&imu)];
@@ -246,21 +333,16 @@ fn destroy_frees_the_reader_slot_and_the_writer() {
 }
 
 #[test]
-fn an_unknown_status_word_is_a_panic() {
+fn test_unknown_status_is_panicked() {
     assert_eq!(Status::from_raw(0), Status::Ok);
     assert_eq!(Status::from_raw(1), Status::Panicked);
     assert_eq!(Status::from_raw(7), Status::Panicked);
 }
 
-#[test]
-fn the_abi_version_is_two() {
-    assert_eq!(ABI_VERSION, 2);
-}
-
 /// The `metor-fsw-abi` distribution exists to pin this number; a pack's
 /// editable wheel requires it exactly.
 #[test]
-fn the_abi_distributions_version_is_the_abi_version() {
+fn test_python_abi_version() {
     let manifest: toml::Value = include_str!("../../python/metor-fsw-abi/pyproject.toml")
         .parse()
         .expect("valid TOML");
@@ -268,4 +350,15 @@ fn the_abi_distributions_version_is_the_abi_version() {
         .as_str()
         .expect("a version string");
     assert_eq!(version, ABI_VERSION.to_string());
+}
+
+/// The built-in links ship with the host, so `metor_config` declares their
+/// pack at this ABI.
+#[test]
+fn test_builtin_abi_version() {
+    let source = include_str!("../../python/metor-config/metor_config/_config.py");
+    assert!(
+        source.contains(&format!("\nABI_VERSION = {ABI_VERSION}\n")),
+        "metor_config declares another ABI"
+    );
 }

@@ -10,6 +10,7 @@ metor-fsw-3-ring = { path = "ring" }
 
 metor-component = { workspace = true }
 metor-proto = { path = "../metor-proto", features = ["std"] }
+metor-proto-stellar = { path = "../metor-proto/stellar" }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
 clap = { version = "4", features = ["derive"] }
@@ -18,6 +19,7 @@ libc = "0.2"
 libloading = "0.8"
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
 postcard = { version = "1.1", features = ["alloc", "experimental-derive"] }
+postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"

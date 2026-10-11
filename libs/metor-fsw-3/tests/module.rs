@@ -66,7 +66,7 @@ fn nested_schema() -> Value {
 }
 
 #[test]
-fn defaults_are_independent_and_explicit_none_is_preserved() {
+fn test_independent_defaults_preserve_none() {
     execute(
         nested_schema(),
         "probe",
@@ -102,7 +102,7 @@ assert params['mapping'] == {'items': [1]}
 }
 
 #[test]
-fn strings_and_dictionary_keys_round_trip_through_python() {
+fn test_python_string_round_trip() {
     let text = "line\nreturn\rtab\t\0\u{1}\u{8}\u{c}\u{1f}\"\\ café 🚀";
     let schema = json!({
         "type": "object",
@@ -135,7 +135,7 @@ assert params == {'text': expected, 'mapping': {expected: expected}}
 }
 
 #[test]
-fn required_fields_are_still_required() {
+fn test_missing_required_fields() {
     execute(
         nested_schema(),
         "probe",
@@ -155,6 +155,24 @@ except TypeError:
     pass
 else:
     raise AssertionError('nested fields must be keyword-only')
+"#,
+    );
+}
+
+#[test]
+fn test_subscription_preserves_pack_dependency() {
+    execute(
+        json!({}),
+        "probe",
+        r#"
+from generated import PACK, LogEvent
+from metor_config import Subscribe, Target
+
+target = Target(1)
+target.add('logs', Subscribe([LogEvent], listen='127.0.0.1:0'))
+config = target.to_config()
+assert config['packs'] == [PACK.to_json()]
+assert [system['ty'] for system in config['coordinator']['systems']] == ['fsw.subscribe']
 "#,
     );
 }
