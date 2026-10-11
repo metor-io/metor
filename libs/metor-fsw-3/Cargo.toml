@@ -1,0 +1,25 @@
+[package]
+name = "metor-fsw-3"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+metor-fsw-3-macros = { path = "macros" }
+
+metor-component = { workspace = true }
+metor-proto = { path = "../metor-proto", features = ["std"] }
+metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
+
+postcard = { version = "1.1", features = ["alloc", "experimental-derive"] }
+postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2.0"
+zerocopy = { version = "0.8.2", features = ["derive"] }
+
+[dev-dependencies]
+trybuild = "1"
+
+[lints]
+workspace = true

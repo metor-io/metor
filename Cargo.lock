@@ -9571,6 +9571,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "metor-fsw-3"
+version = "0.14.2"
+dependencies = [
+ "metor-component",
+ "metor-fsw-3-macros",
+ "metor-proto",
+ "metor-proto-wkt",
+ "postcard",
+ "postcard-schema",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "trybuild",
+ "zerocopy",
+]
+
+[[package]]
+name = "metor-fsw-3-macros"
+version = "0.14.2"
+dependencies = [
+ "convert_case 0.6.0",
+ "darling 0.20.11",
+ "metor-component-derive-impl",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "metor-fsw-3-ring"
 version = "0.14.2"
 dependencies = [
