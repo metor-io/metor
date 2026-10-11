@@ -15,7 +15,7 @@ use metor_proto_wkt::{LogEvent, SequenceChannelEvent, SequenceCommand};
 use super::pack_dev::PackDevError;
 use crate::channel::{ABORT_PORT, COMMANDS_PORT, ChannelStatus, EVENTS_PORT};
 use crate::coordinator::{STATUS_PORT, SystemStatus, SystemTable};
-use crate::dl::PackRef;
+use crate::dl::{PackKind, PackRef};
 use crate::fn_system::LOG_PORT;
 use crate::io::{Cqe, IO_CQ, IO_SQ, ResourceStatus, Sqe};
 use crate::pack::ABI_VERSION;
@@ -68,6 +68,8 @@ struct Module {
     pack_id: String,
     lib: String,
     abi_version: u32,
+    /// Whether the pack also ships as a wasm module.
+    wasm: bool,
     /// One class per record the pack uses, sorted by class name.
     records: Vec<RecordClass>,
     /// One dataclass per nested params object, sorted by name.
@@ -263,6 +265,7 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
         pack_id: pack.id.clone(),
         lib: pack.lib.clone(),
         abi_version,
+        wasm: pack.kind == PackKind::Wasm,
         records: records(def),
         dataclasses: defs
             .iter()
@@ -732,6 +735,22 @@ mod tests {
         assert!(text.contains(
             "class SystemStatus(Record):\n    _name = \"status\"\n    _kind = \"frame\"\n"
         ));
+    }
+
+    #[test]
+    fn test_render_wasm_flag() {
+        let mut reference = PackRef::dylib("test".into(), "test_pack".into(), "unused".into());
+        let def = PackDef {
+            systems: Vec::new(),
+        };
+        let dylib = render(&reference, 1, &def).expect("renders");
+        assert!(!dylib.contains("wasm"), "{dylib}");
+        reference.kind = PackKind::Wasm;
+        let wasm = render(&reference, 1, &def).expect("renders");
+        assert!(
+            wasm.contains("    abi_version=1,\n    wasm=True,\n)"),
+            "{wasm}"
+        );
     }
 
     #[test]

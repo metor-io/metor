@@ -55,10 +55,12 @@ fn open() -> Arc<Pack> {
     Arc::new(Pack::Dl(pack))
 }
 
-/// Returns the fixture's loaded library.
+/// Returns the fixture's loaded library. Panics for a wasm pack, which has
+/// none.
 fn library(pack: &Pack) -> &Arc<libloading::Library> {
     match pack {
         Pack::Dl(pack) => pack.library(),
+        Pack::Wasm(_) => panic!("a module has no library"),
     }
 }
 
@@ -450,6 +452,19 @@ mod io {
         assert!(*seen.borrow() > 0, "the dylib driver read a fix");
     }
 
+    #[test]
+    fn wasm_driver_reads_the_wire() {
+        let pack = Arc::new(Pack::Wasm(common::open_wasm()));
+        let seen = Fixes::default();
+        let mut c = sim_target().build(&io_table(&pack, &seen)).unwrap();
+        for t in 1..6 {
+            c.step(Timestamp(t));
+        }
+        let ended: Vec<_> = c.ended().collect();
+        assert!(ended.is_empty(), "{ended:?}");
+        assert!(*seen.borrow() > 0, "the guest's read bytes reached it");
+    }
+
     fn model_serves_a_host_driver(pack: Arc<Pack>) {
         let seen = Fixes::default();
         let mut config = sim_target();
@@ -467,6 +482,11 @@ mod io {
     #[test]
     fn dylib_model_serves_a_host_driver() {
         model_serves_a_host_driver(open());
+    }
+
+    #[test]
+    fn wasm_model_serves_a_host_driver() {
+        model_serves_a_host_driver(Arc::new(Pack::Wasm(common::open_wasm())));
     }
 }
 
@@ -609,7 +629,8 @@ mod quiesce {
     }
 
     /// A remade instance whose ctor asks for more than the region holds
-    /// fails, and the channel reports it.
+    /// fails, and the channel reports it. Only a dylib keeps the state that
+    /// makes its ctor grow: a wasm guest starts fresh on every make.
     #[test]
     fn dylib_remake_past_the_region_fails() {
         let pack = open();
@@ -639,5 +660,10 @@ mod quiesce {
     #[test]
     fn dylib_reset_waits_for_the_cancel() {
         reset_waits_for_the_cancel(open());
+    }
+
+    #[test]
+    fn wasm_reset_waits_for_the_cancel() {
+        reset_waits_for_the_cancel(Arc::new(Pack::Wasm(common::open_wasm())));
     }
 }

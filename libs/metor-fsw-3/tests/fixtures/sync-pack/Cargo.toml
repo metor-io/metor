@@ -1,0 +1,17 @@
+[package]
+name = "sync-pack"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "A pack with no async systems, which `pack dev` builds as a module"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+metor-fsw-3 = { path = "../../..", default-features = false, features = ["threads"] }
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

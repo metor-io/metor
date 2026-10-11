@@ -1,7 +1,7 @@
 //! Mirrors copy records between rings across an adapter boundary.
 //!
-//! A system that runs on its own thread does not touch the real rings
-//! directly. Instead, it gets its own copy of each port's ring, and
+//! A system that runs on its own thread or in a wasm guest does not touch the
+//! real rings directly. Instead, it gets its own copy of each port's ring, and
 //! each cycle the adapter mirrors the real inputs into those copies and the
 //! copies back out to the real outputs.
 //! A copy that is full drops records, and the mirrors periodically log how
@@ -206,6 +206,16 @@ impl<W: WakeSource> Mirrors<W> {
     }
 }
 
+#[cfg(feature = "host")]
+impl<W: WakeSource> Mirrors<W> {
+    /// Drops the input mirrors, which frees their reader slots on the real
+    /// rings.
+    pub(crate) fn release_inputs(&mut self) {
+        self.fields.drain(1..=self.inputs.len());
+        self.inputs.clear();
+    }
+}
+
 /// Drains every mirror in `mirrors`. Returns an error if any ring was
 /// corrupt.
 fn drain<W: WakeSource>(mirrors: &mut [Mirror<W>]) -> Result<(), Corrupt> {
@@ -333,6 +343,24 @@ pub(crate) mod tests {
         assert_eq!(copy.drain(), Ok(()));
         // The target fits four 32-byte records, and its reader never reads.
         assert_eq!(copy.dropped, 4);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn test_release_inputs_frees_reader_slot() {
+        let (real, copy) = (ring(256), ring(256));
+        let def = SystemDef {
+            name: "nav".into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            grants: Vec::new(),
+        };
+        let mut mirrors = Mirrors::new(&def, vec![mirror(&real, &copy)], Vec::new());
+        assert!(real.view(NoWake).is_err());
+        mirrors.release_inputs();
+        assert!(real.view(NoWake).is_ok());
+        assert_eq!(mirrors.fields.len(), 1);
+        assert_eq!(mirrors.drain_inputs(), Ok(()));
     }
 
     #[test]

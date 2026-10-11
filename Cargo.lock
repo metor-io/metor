@@ -9618,6 +9618,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trybuild",
+ "wasmi",
+ "wat",
  "zerocopy",
 ]
 
@@ -14146,6 +14148,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "sync-pack"
+version = "0.14.2"
+dependencies = [
+ "metor-fsw-3",
+ "serde",
 ]
 
 [[package]]

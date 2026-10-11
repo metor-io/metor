@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 
 from adcs_stub import PACK, Ctrl, Fan, Hold, Mode, MotorCmd, Nav, Ping, Plant, Safe, Tap
 
@@ -211,6 +212,19 @@ class LocationTest(ConfigTest):
         mode._location = None
         fsw.add("mode", mode)
         self.assertNotIn("location", fsw.to_config()["coordinator"]["systems"][0])
+
+
+class WasmTest(ConfigTest):
+    def test_wasm_writes_kind_fuel_and_memory(self) -> None:
+        fsw = adcs_target()
+        fsw.wasm(replace(PACK, wasm=True), fuel=10_000_000, memory=16 << 20)
+        wasm = {"kind": "wasm", "fuel": 10_000_000, "memory": 16 << 20}
+        self.assertEqual(fsw.to_config()["packs"], [{**PACK.to_json(), **wasm}])
+
+    def test_pack_without_module_raises(self) -> None:
+        fsw = adcs_target()
+        with self.assertRaisesRegex(ConfigError, "`adcs` has no module"):
+            fsw.wasm(PACK)
 
 
 class LinkTest(ConfigTest):

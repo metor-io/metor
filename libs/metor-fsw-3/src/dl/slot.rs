@@ -5,8 +5,8 @@
 //! on that channel picks which candidate runs.
 //!
 //! `metor build` resolves each candidate ahead of time. It copies the library
-//! into the store and writes its path, hash, ports, and pack kind into the
-//! slot's params. The slot takes its ports from the first
+//! or module into the store and writes its path, hash, ports, pack kind, and
+//! limits into the slot's params. The slot takes its ports from the first
 //! candidate. On a `Load`, the slot hashes the candidate's file, opens it,
 //! checks that its ports match the slot's, and creates it on the slot's rings.
 
@@ -27,6 +27,7 @@ use crate::dl::PackKind;
 use crate::io::IoState;
 use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
+use crate::wasm::{Limits, WasmPack};
 use crate::{FrameBytes, FrameStr};
 
 use super::{DlPack, InstanceRings, Pack, is_loaded, store};
@@ -62,6 +63,8 @@ pub(crate) struct Stored {
     pub(crate) def: SystemDef,
     #[serde(default)]
     pub(crate) kind: PackKind,
+    #[serde(flatten)]
+    pub(crate) limits: Limits,
 }
 
 /// A library hash, written as hex.
@@ -86,6 +89,7 @@ struct Resolved {
     path: PathBuf,
     hash: blake3::Hash,
     kind: PackKind,
+    limits: Limits,
     occupant: Occupant,
 }
 
@@ -134,10 +138,11 @@ impl SystemDef {
 }
 
 impl Resolved {
-    /// Opens this candidate's library after checking its hash.
+    /// Opens this candidate's library or module after checking its hash.
     fn open(&self) -> Result<Pack, LoadError> {
         match self.kind {
             PackKind::Dylib => self.open_dylib(),
+            PackKind::Wasm => self.open_wasm(),
         }
     }
 
@@ -168,9 +173,24 @@ impl Resolved {
         Ok(Pack::Dl(pack))
     }
 
+    /// Reads this candidate's module, checks its hash, and compiles those
+    /// bytes.
+    fn open_wasm(&self) -> Result<Pack, LoadError> {
+        let bytes = std::fs::read(&self.path).map_err(|e| LoadError::Open(e.to_string()))?;
+        if blake3::hash(&bytes) != self.hash {
+            return Err(LoadError::Hash(self.name.clone()));
+        }
+        let pack = WasmPack::open(&bytes, &self.limits);
+        Ok(Pack::Wasm(pack.map_err(|e| LoadError::Open(e.to_string()))?))
+    }
+
     fn of(index: usize, candidate: Candidate) -> Result<Self, MakeError> {
         let Stored {
-            path, hash, kind, ..
+            path,
+            hash,
+            kind,
+            limits,
+            ..
         } = candidate.stored;
         let file = path
             .file_name()
@@ -190,6 +210,7 @@ impl Resolved {
             path,
             hash,
             kind,
+            limits,
         })
     }
 }
