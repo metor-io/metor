@@ -1,6 +1,7 @@
 //! Storage for ring regions: heap, memory-mapped, or owned by the caller.
 
 use std::cell::UnsafeCell;
+use std::ptr::NonNull;
 
 use crate::owner::{Lease, RawOwner};
 
@@ -12,14 +13,14 @@ pub(super) struct Word(pub(super) UnsafeCell<[u64; 2]>);
 pub(super) struct Backing {
     pub(super) base: *mut u8,
     pub(super) len: usize,
-    _owner: BackingOwner,
+    owner: BackingOwner,
 }
 
 enum BackingOwner {
     /// Held as a raw pointer rather than a `Box`, so pointers derived from the
     /// allocation stay valid when the `Backing` moves.
     Heap {
-        words: *mut [Word],
+        words: NonNull<[Word]>,
     },
     #[cfg(feature = "mmap")]
     Mmap {
@@ -40,11 +41,12 @@ impl Backing {
             .collect();
         let len = buf.len() * size_of::<Word>();
         // Derive pointers only after transferring allocation ownership.
-        let words = Box::into_raw(buf);
+        // SAFETY: `Box::into_raw` never returns null.
+        let words = unsafe { NonNull::new_unchecked(Box::into_raw(buf)) };
         Self {
-            base: words.cast::<u8>(),
+            base: words.as_ptr().cast::<u8>(),
             len,
-            _owner: BackingOwner::Heap { words },
+            owner: BackingOwner::Heap { words },
         }
     }
 
@@ -58,19 +60,22 @@ impl Backing {
         Self {
             base,
             len,
-            _owner: BackingOwner::Raw,
+            owner: BackingOwner::Raw,
         }
     }
 
+    /// Borrows storage that `owner` keeps alive, holding one reference on it.
+    ///
     /// # Safety
-    /// `owner` meets `RawOwner`'s contract and keeps the entire region alive.
+    /// `owner` must meet [`RawOwner`]'s contract, and the reference it holds must
+    /// keep all `len` bytes at `base` alive.
     pub(super) unsafe fn owned(base: *mut u8, len: usize, owner: RawOwner) -> Self {
         // SAFETY: the caller guarantees a live, thread-safe owner.
         let lease = unsafe { Lease::acquire(owner) };
         Self {
             base,
             len,
-            _owner: BackingOwner::Owned { _lease: lease },
+            owner: BackingOwner::Owned { _lease: lease },
         }
     }
 
@@ -83,16 +88,16 @@ impl Backing {
         Self {
             base,
             len,
-            _owner: BackingOwner::Mmap { _map: map },
+            owner: BackingOwner::Mmap { _map: map },
         }
     }
 }
 
 impl Drop for Backing {
     fn drop(&mut self) {
-        if let BackingOwner::Heap { words } = self._owner {
+        if let BackingOwner::Heap { words } = self.owner {
             // SAFETY: reconstruct the sole owning pointer exactly once.
-            drop(unsafe { Box::from_raw(words) });
+            drop(unsafe { Box::from_raw(words.as_ptr()) });
         }
     }
 }

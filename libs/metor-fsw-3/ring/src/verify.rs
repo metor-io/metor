@@ -37,18 +37,18 @@ fn frame_alignment() {
 }
 
 #[kani::proof]
-fn record_fits_bounds() {
+fn payload_in_bounds_holds() {
     let cap = any_capacity();
-    let phys: u64 = kani::any();
-    kani::assume(phys < cap && phys.is_multiple_of(16));
+    let offset: u64 = kani::any();
+    kani::assume(offset < cap && offset.is_multiple_of(16));
     // The reader takes the low 32 bits of the length word.
     let len: u64 = kani::any();
     kani::assume(len <= u32::MAX as u64);
 
-    if record_fits(len, phys, cap) {
-        assert!(phys + 16 <= cap);
-        assert!(phys + 16 + len <= cap);
-        assert!(phys + 16 + round_up16_u64(len) <= cap);
+    if payload_in_bounds(len, offset, cap) {
+        assert!(offset + 16 <= cap);
+        assert!(offset + 16 + len <= cap);
+        assert!(offset + 16 + round_up16_u64(len) <= cap);
         // The frame length is also representable in 32-bit arithmetic.
         let padded = (len as u32).checked_add(15).expect("round_up16 would wrap") & !15u32;
         let frame = padded.checked_add(16).expect("frame_len would wrap");
@@ -57,13 +57,13 @@ fn record_fits_bounds() {
 }
 
 #[kani::proof]
-fn reserve_never_straddles() {
+fn frame_start_never_straddles() {
     let cap = any_capacity();
     let rec = any_record(cap);
     let committed: u64 = kani::any();
     kani::assume(committed.is_multiple_of(16) && committed <= u64::MAX - 2 * cap);
 
-    let (start, gap) = reserve(committed, rec, cap);
+    let (start, gap) = frame_start(committed, rec, cap);
 
     assert_eq!(start - committed, gap);
     assert!(gap < cap);
@@ -85,41 +85,49 @@ fn fits_implies_no_lap() {
     let rec = any_record(cap);
     let committed: u64 = kani::any();
     kani::assume(committed.is_multiple_of(16) && committed <= u64::MAX - 4 * cap);
-    let slowest: u64 = kani::any();
-    kani::assume(slowest <= committed);
+    let slowest_cursor: u64 = kani::any();
+    kani::assume(slowest_cursor <= committed);
 
-    let (start, gap) = reserve(committed, rec, cap);
-    let need = gap + rec;
+    let (start, gap) = frame_start(committed, rec, cap);
+    let write_len = gap + rec;
 
-    if fits(committed, slowest, need, cap) == Ok(true) {
-        assert!(start + rec - slowest <= cap);
+    if fits(committed, slowest_cursor, write_len, cap) == Ok(true) {
+        assert!(start + rec - slowest_cursor <= cap);
     } else {
-        assert!(committed - slowest + need > cap);
+        assert!(committed - slowest_cursor + write_len > cap);
     }
 
     // With no readers registered the writer passes its own position as
-    // `slowest`, leaving capacity as the only bound.
-    assert_eq!(fits(committed, committed, need, cap), Ok(need <= cap));
+    // `slowest_cursor`, leaving capacity as the only bound.
+    assert_eq!(
+        fits(committed, committed, write_len, cap),
+        Ok(write_len <= cap)
+    );
 }
 
 #[kani::proof]
 fn fits_hostile_cursor() {
     let cap: u64 = kani::any();
     let committed: u64 = kani::any();
-    let slowest: u64 = kani::any();
-    let need: u64 = kani::any();
+    let slowest_cursor: u64 = kani::any();
+    let write_len: u64 = kani::any();
 
-    match fits(committed, slowest, need, cap) {
+    match fits(committed, slowest_cursor, write_len, cap) {
         Ok(fit) => {
-            assert!(slowest <= committed);
+            assert!(slowest_cursor <= committed);
             assert_eq!(
                 fit,
-                (committed - slowest) as u128 + need as u128 <= cap as u128
+                (committed - slowest_cursor) as u128 + write_len as u128 <= cap as u128
             );
         }
         Err(e) => {
             assert_eq!(e, WriteError::Corrupt);
-            assert!(slowest > committed || (committed - slowest).checked_add(need).is_none());
+            assert!(
+                slowest_cursor > committed
+                    || (committed - slowest_cursor)
+                        .checked_add(write_len)
+                        .is_none()
+            );
         }
     }
 }
@@ -180,11 +188,11 @@ fn validate_header_hostile() {
     let data_end = g.data_offset.checked_add(g.capacity as usize).unwrap();
     assert!(data_end <= region_len);
 
-    let phys: u64 = kani::any();
-    kani::assume(phys <= g.capacity);
-    assert!(g.data_offset + (phys as usize) <= region_len);
-    if phys < g.capacity && phys.is_multiple_of(16) {
-        assert!(phys + 16 <= g.capacity);
+    let offset: u64 = kani::any();
+    kani::assume(offset <= g.capacity);
+    assert!(g.data_offset + (offset as usize) <= region_len);
+    if offset < g.capacity && offset.is_multiple_of(16) {
+        assert!(offset + 16 <= g.capacity);
     }
 }
 
@@ -199,7 +207,7 @@ fn layout_roundtrip() {
         capacity,
         max_readers,
     };
-    let geometry = layout(&cfg);
+    let geometry = Geometry::from_config(&cfg);
 
     let hdr = RegionHeader {
         magic: MAGIC,
@@ -234,7 +242,7 @@ impl Region {
             capacity: CAP,
             max_readers: 1,
         };
-        let geometry = layout(&cfg);
+        let geometry = Geometry::from_config(&cfg);
         assert_eq!(geometry.total_size, REGION);
         let base = self.0.as_mut_ptr();
         // SAFETY: the aligned region is exclusively held and outlives its handles.
@@ -294,7 +302,7 @@ fn backpressure_at_capacity() {
     // The reader has consumed nothing, so the second write is bounded by what
     // the first left behind.
     let second = w.try_write(&[0u8; CAP][..b]);
-    let (start, gap) = reserve(used as u64, frame_len(b) as u64, CAP as u64);
+    let (start, gap) = frame_start(used as u64, frame_len(b) as u64, CAP as u64);
     if frame_len(b) > CAP {
         assert_eq!(second, Err(WriteError::InsufficientCapacity));
         assert_eq!(v.committed(), used as u64);
@@ -395,8 +403,8 @@ unsafe fn fill_data(base: *mut u8) {
 unsafe fn write_control(base: *mut u8, committed: u64, hwm: u64) {
     // SAFETY: the control words lie within the region (caller contract).
     unsafe {
-        base.add(OFF_CONTROL).cast::<u64>().write(committed);
-        base.add(OFF_CONTROL + 8).cast::<u64>().write(hwm);
+        base.add(CONTROL_OFFSET).cast::<u64>().write(committed);
+        base.add(CONTROL_OFFSET + 8).cast::<u64>().write(hwm);
     }
 }
 

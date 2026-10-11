@@ -1,12 +1,22 @@
-//! A single-writer, multi-reader ring buffer over heap or shared memory.
+//! A ring buffer of variable-length records, with one writer and many readers.
 //!
-//! One [`Writer`] appends variable-length records. Up to
-//! [`Config::max_readers`] [`View`]s read them, each with its own cursor, so one
-//! reader never consumes records for another. The writer never overwrites a
-//! record that some view has not read yet. Instead, the write fails with
-//! [`WriteError::WouldBlock`]. A record borrowed from a view stays valid until
-//! the borrow is released. A new view starts at the current write position and
-//! does not see records written before it was created.
+//! The ring lives in one region of memory: on the heap, in a file that several
+//! processes map, or in storage the caller provides. A [`Writer`] appends
+//! records, and each [`View`] reads them at its own pace with its own cursor.
+//! The writer never overwrites bytes that a view has not read. When a record
+//! would need them, [`Writer::try_write`] returns [`WriteError::WouldBlock`]
+//! until the slowest view catches up.
+//!
+//! Positions count bytes from the ring's creation and only grow. A position
+//! modulo the capacity is an offset into the data region. Each record is a
+//! 16-byte header followed by its payload, padded to 16 bytes. Records never
+//! wrap around the end of the data region. When one would, the writer leaves the
+//! last bytes of the lap empty and starts the record at the beginning of the
+//! next lap, and readers skip the empty bytes.
+//!
+//! A new view starts where the writer is, so it never sees older records.
+//! Reads borrow the payload in place, and the view's cursor stays put until the
+//! borrow ends, which keeps the writer off those bytes.
 //!
 //! ```
 //! use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
@@ -21,9 +31,9 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! The `mmap` feature adds file-backed regions. The `notify` feature adds
-//! in-process async notifications. Pass [`NoWake`] when readers poll instead.
-//! See `DESIGN.md` in the crate source for layout and synchronization rules.
+//! The `mmap` feature adds file-backed regions, and the `notify` feature adds
+//! `Notifier` for async readers in the same process. Pass [`NoWake`] when
+//! readers poll. `DESIGN.md` covers the region layout and memory ordering.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod wake;
@@ -56,9 +66,6 @@ fn owner_tag() -> u64 {
     1
 }
 
-/// Rounds `n` up to a multiple of 16.
-///
-/// `n` must be at most `usize::MAX - 15`.
 #[inline]
 const fn round_up_16(n: usize) -> usize {
     (n + (PAYLOAD_ALIGNMENT - 1)) & !(PAYLOAD_ALIGNMENT - 1)
@@ -73,31 +80,38 @@ pub const fn frame_len(payload_len: usize) -> usize {
     RECORD_HEADER_SIZE + round_up_16(payload_len)
 }
 
-/// Returns where a record starts and the wrap gap before it.
+/// Returns where the next frame starts, and the wrap gap before it.
 ///
-/// A record that would run past the end of the data region starts at the next
-/// lap instead. The skipped bytes form the gap. `capacity` must be a power of
-/// two, `rec` must be at most `capacity`, and positions must not overflow.
+/// Frames never cross the end of the data region. When the bytes left before
+/// the end are too few for `frame_len`, the frame starts at the next lap and
+/// those bytes become the gap. This only places the frame; [`fits`] checks
+/// that readers have released the space. `capacity` must be a power of two,
+/// `frame_len` at most `capacity`, and positions must not overflow.
 #[inline]
-const fn reserve(committed: u64, rec: u64, capacity: u64) -> (u64, u64) {
-    let phys = committed & (capacity - 1);
-    if phys + rec > capacity {
-        let gap = capacity - phys;
-        (committed + gap, gap)
+const fn frame_start(committed: u64, frame_len: u64, capacity: u64) -> (u64, u64) {
+    let offset = committed & (capacity - 1);
+    let left_in_lap = capacity - offset;
+    if frame_len > left_in_lap {
+        (committed + left_in_lap, left_in_lap)
     } else {
         (committed, 0)
     }
 }
 
-/// Returns whether `need` more bytes fit without overwriting unread data.
+/// Returns whether `write_len` more bytes fit without overwriting unread data.
 ///
-/// Returns `Corrupt` if `slowest` is ahead of `committed` or the sum overflows.
+/// Returns `Corrupt` if `slowest_cursor` is ahead of `committed` or the sum overflows.
 #[inline]
-const fn fits(committed: u64, slowest: u64, need: u64, capacity: u64) -> Result<bool, WriteError> {
-    if slowest > committed {
+const fn fits(
+    committed: u64,
+    slowest_cursor: u64,
+    write_len: u64,
+    capacity: u64,
+) -> Result<bool, WriteError> {
+    if slowest_cursor > committed {
         return Err(WriteError::Corrupt);
     }
-    match (committed - slowest).checked_add(need) {
+    match (committed - slowest_cursor).checked_add(write_len) {
         Some(used) => Ok(used <= capacity),
         None => Err(WriteError::Corrupt),
     }
@@ -111,17 +125,19 @@ const fn writable_from(committed: u64, capacity: u64) -> bool {
     committed.is_multiple_of(PAYLOAD_ALIGNMENT as u64) && committed <= u64::MAX - 2 * capacity
 }
 
-/// Returns whether a payload of `len` bytes with its header at `phys` fits.
+/// Returns whether a payload of `len` bytes, with its header at `offset`, ends
+/// within the data region.
 ///
-/// Use it on a raw length read from the region before converting it to
-/// `usize`. `phys` must be a 16-aligned position in the data region.
+/// Unlike [`fits`], this ignores readers and only checks bounds. Use it on a raw
+/// length read from the region before converting it to `usize`. `offset` must be
+/// a 16-aligned offset in the data region.
 #[inline]
-const fn record_fits(len: u64, phys: u64, capacity: u64) -> bool {
-    len <= capacity - RECORD_HEADER_SIZE as u64 - phys
+const fn payload_in_bounds(len: u64, offset: u64, capacity: u64) -> bool {
+    len <= capacity - RECORD_HEADER_SIZE as u64 - offset
 }
 
 fn checked_frame_len(payload_len: usize, capacity: u64) -> Result<u64, WriteError> {
-    if payload_len > u32::MAX as usize || !record_fits(payload_len as u64, 0, capacity) {
+    if payload_len > u32::MAX as usize || !payload_in_bounds(payload_len as u64, 0, capacity) {
         return Err(WriteError::InsufficientCapacity);
     }
     Ok(frame_len(payload_len) as u64)
@@ -287,7 +303,7 @@ impl Inner {
     #[inline]
     fn control(&self) -> &Control {
         // SAFETY: validated geometry places this aligned, all-atomic block within the backing.
-        unsafe { &*(self.base().add(OFF_CONTROL) as *const Control) }
+        unsafe { &*(self.base().add(CONTROL_OFFSET) as *const Control) }
     }
 
     #[inline]
@@ -298,13 +314,15 @@ impl Inner {
         unsafe { &*(self.base().add(off) as *const ReaderSlot) }
     }
 
+    /// Returns a pointer to `offset` bytes into the data region.
+    ///
     /// # Safety
-    /// `phys <= capacity`. The one-past pointer may only form an empty slice.
+    /// `offset <= capacity`. The one-past pointer may only form an empty slice.
     #[inline]
-    unsafe fn data_ptr(&self, phys: usize) -> *mut u8 {
-        // SAFETY: validated geometry and phys <= capacity keep this within the allocation
+    unsafe fn data_ptr(&self, offset: usize) -> *mut u8 {
+        // SAFETY: validated geometry and offset <= capacity keep this within the allocation
         // or one byte position past its end.
-        unsafe { self.base().add(self.geometry.data_offset + phys) }
+        unsafe { self.base().add(self.geometry.data_offset + offset) }
     }
 
     fn slowest_active_cursor(&self) -> Option<u64> {
@@ -316,15 +334,20 @@ impl Inner {
             .min()
     }
 
+    /// Writes a record's header and payload at `offset` without publishing it.
+    ///
+    /// The header's first word holds the payload length in its low 32 bits.
+    /// The rest of the header is reserved.
+    ///
     /// # Safety
     /// The caller holds the writer claim. The record is aligned, contiguous, and
     /// fits in the data region. Its length fits in a `u32`, and no reader cursor
     /// pins the destination.
-    unsafe fn write_record(&self, phys: usize, payload: &[u8]) {
-        // SAFETY: phys is 8-aligned and in-bounds (caller contract).
-        let p = unsafe { self.data_ptr(phys) };
-        let len = payload.len() as u64; // low 32 bits = length, high = pad.
-        // SAFETY: p is 8-aligned; [phys, phys+frame_len) is in-bounds.
+    unsafe fn write_record(&self, offset: usize, payload: &[u8]) {
+        // SAFETY: offset is 8-aligned and in-bounds (caller contract).
+        let p = unsafe { self.data_ptr(offset) };
+        let len = payload.len() as u64;
+        // SAFETY: p is 8-aligned; [offset, offset+frame_len) is in-bounds.
         unsafe {
             (p as *mut u64).write(len);
             std::ptr::copy_nonoverlapping(
@@ -335,14 +358,19 @@ impl Inner {
         }
     }
 
+    /// Reads the payload length from the record header at `offset`.
+    ///
+    /// Only the low 32 bits hold the length. The mask drops the reserved high
+    /// bits, which a peer could have set.
+    ///
     /// # Safety
-    /// `phys` is the aligned position of a record header with eight readable
+    /// `offset` is the aligned position of a record header with eight readable
     /// bytes. The record was published before this read, and a reader cursor
     /// keeps it pinned.
-    unsafe fn read_len(&self, phys: usize) -> u64 {
-        // SAFETY: phys is 8-aligned and in-bounds (caller contract); the read
+    unsafe fn read_len(&self, offset: usize) -> u64 {
+        // SAFETY: offset is 8-aligned and in-bounds (caller contract); the read
         // is ordered after the write via `committed`.
-        let hdr = unsafe { (self.data_ptr(phys) as *const u64).read() };
+        let hdr = unsafe { (self.data_ptr(offset) as *const u64).read() };
         hdr & 0xFFFF_FFFF
     }
 
@@ -370,11 +398,11 @@ impl Inner {
                 r = self.next_lap(r).ok_or(ReadError::Corrupt)?;
                 continue;
             }
-            let phys = (r & self.geometry.mask()) as usize;
+            let offset = (r & self.geometry.mask()) as usize;
             // SAFETY: r is pinned and below an acquired committed position.
             // Alignment and capacity >= 16 leave room for the header.
-            let len = unsafe { self.read_len(phys) };
-            if !record_fits(len, phys as u64, cap) {
+            let len = unsafe { self.read_len(offset) };
+            if !payload_in_bounds(len, offset as u64, cap) {
                 return Err(ReadError::Corrupt);
             }
             let len = len as usize;
@@ -386,7 +414,7 @@ impl Inner {
                 r,
                 Some(Located {
                     start: r,
-                    phys,
+                    offset,
                     payload_len: len,
                     frame_len: rec,
                 }),
@@ -400,13 +428,16 @@ impl Inner {
         (pos & !self.geometry.mask()).checked_add(self.geometry.capacity)
     }
 
+    /// Borrows a located record's payload.
+    ///
     /// # Safety
-    /// `loc` came from `locate_before`. A reader cursor at or before the
-    /// record's start must pin the record for as long as the returned slice lives.
+    /// A reader cursor at or before `loc.start` must stay in place for as long
+    /// as the returned slice lives. That cursor is what stops the writer from
+    /// reusing the bytes. `loc` must come from `locate_before`.
     unsafe fn payload(&self, loc: &Located) -> &[u8] {
         // SAFETY: the record is contiguous and in-bounds (caller contract).
         unsafe {
-            let p = self.data_ptr(loc.phys + RECORD_HEADER_SIZE);
+            let p = self.data_ptr(loc.offset + RECORD_HEADER_SIZE);
             std::slice::from_raw_parts(p as *const u8, loc.payload_len)
         }
     }
@@ -428,7 +459,7 @@ impl RingBuffer {
     /// Panics if the capacity is not a power of two of at least 16, if the reader
     /// count is zero or above `u32::MAX`, or if the total size is above `isize::MAX`.
     pub fn create_in_memory(cfg: Config) -> Self {
-        let geometry = layout(&cfg);
+        let geometry = Geometry::from_config(&cfg);
         let backing = Backing::heap(geometry.total_size);
         // SAFETY: fresh, aligned storage large enough for the checked geometry.
         unsafe { Self::initialize(backing, geometry) }
@@ -451,7 +482,7 @@ impl RingBuffer {
         if !(base as usize).is_multiple_of(PAYLOAD_ALIGNMENT) {
             return Err(AttachError::Misaligned);
         }
-        let geometry = layout(&cfg);
+        let geometry = Geometry::from_config(&cfg);
         if len < geometry.total_size {
             return Err(AttachError::TooSmall);
         }
@@ -476,7 +507,7 @@ impl RingBuffer {
     /// Panics on an invalid configuration, like [`Self::create_in_memory`].
     #[cfg(feature = "mmap")]
     pub unsafe fn create_mmap(path: &std::path::Path, cfg: Config) -> std::io::Result<Self> {
-        let geometry = layout(&cfg);
+        let geometry = Geometry::from_config(&cfg);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -602,9 +633,9 @@ impl RingBuffer {
     /// Claims the ring's single writer.
     ///
     /// Returns [`WriterClaimed`] if another writer holds the claim. Dropping the
-    /// writer releases it. The writer notifies `data` after each publish. Pass
+    /// writer releases it. The writer notifies `wake` after each publish. Pass
     /// [`NoWake`] if readers poll instead of waiting.
-    pub fn writer<WD: WakeSource>(&self, data: WD) -> Result<Writer<WD>, WriterClaimed> {
+    pub fn writer<WD: WakeSource>(&self, wake: WD) -> Result<Writer<WD>, WriterClaimed> {
         // Acquire the state released by the previous writer or reclaimer.
         self.inner
             .control()
@@ -614,7 +645,7 @@ impl RingBuffer {
         Ok(Writer {
             committed: Cell::new(self.inner.control().committed.load(Relaxed)),
             inner: self.inner.clone(),
-            data,
+            wake,
         })
     }
 
@@ -646,8 +677,8 @@ impl RingBuffer {
     ///
     /// The view does not see records published before this call. Returns
     /// [`FullReaderTable`] if every reader slot is taken. The view waits for new
-    /// data through `data`.
-    pub fn view<RD: WakeSink>(&self, data: RD) -> Result<View<RD>, FullReaderTable> {
+    /// data through `wake`.
+    pub fn view<RD: WakeSink>(&self, wake: RD) -> Result<View<RD>, FullReaderTable> {
         let mut start = self.inner.control().committed.load(Acquire);
         for slot in 0..self.inner.geometry.max_readers {
             // Acquire the slot released by its previous owner.
@@ -675,7 +706,7 @@ impl RingBuffer {
                     cursor: Cell::new(start),
                     inner: self.inner.clone(),
                     slot,
-                    data,
+                    wake,
                     pending: None,
                 });
             }
@@ -688,7 +719,7 @@ impl RingBuffer {
 ///
 /// Returns `None` if `cfg` cannot form a valid region.
 pub fn checked_region_len(cfg: &Config) -> Option<usize> {
-    checked_layout(cfg).map(|geometry| geometry.total_size)
+    Geometry::checked_from_config(cfg).map(|geometry| geometry.total_size)
 }
 
 /// The ring's single writer.
@@ -708,7 +739,7 @@ pub fn checked_region_len(cfg: &Config) -> Option<usize> {
 /// ```
 pub struct Writer<WD: WakeSource> {
     inner: Arc<Inner>,
-    data: WD,
+    wake: WD,
     /// The writer's position.
     ///
     /// The copy in the region exists only for readers.
@@ -731,8 +762,11 @@ impl<WD: WakeSource> Writer<WD> {
         if !writable_from(c, cap) {
             return Err(WriteError::Corrupt);
         }
-        let (start_abs, mut gap) = reserve(c, rec, cap);
+        let (start_abs, mut gap) = frame_start(c, rec, cap);
+        // Readers may not have released the space for the gap and the frame yet.
         if !self.fits(c, gap + rec)? {
+            // When only the gap fits, publish it alone. Readers then skip to the
+            // next lap and release the space at its start.
             if gap == 0 || !self.fits(c, gap)? {
                 return Err(WriteError::WouldBlock);
             }
@@ -741,7 +775,7 @@ impl<WD: WakeSource> Writer<WD> {
             c = start_abs;
             gap = 0;
             if !self.fits(c, rec)? {
-                self.data.notify();
+                self.wake.notify();
                 return Err(WriteError::WouldBlock);
             }
         }
@@ -752,9 +786,14 @@ impl<WD: WakeSource> Writer<WD> {
     }
 
     #[inline]
-    fn fits(&self, committed: u64, need: u64) -> Result<bool, WriteError> {
-        let slowest = self.inner.slowest_active_cursor().unwrap_or(committed);
-        fits(committed, slowest, need, self.inner.geometry.capacity)
+    fn fits(&self, committed: u64, write_len: u64) -> Result<bool, WriteError> {
+        let slowest_cursor = self.inner.slowest_active_cursor().unwrap_or(committed);
+        fits(
+            committed,
+            slowest_cursor,
+            write_len,
+            self.inner.geometry.capacity,
+        )
     }
 
     /// Stores a new position locally, then in the region with Release ordering.
@@ -768,16 +807,16 @@ impl<WD: WakeSource> Writer<WD> {
     /// The writer claim is held. The record fits contiguously in space no reader
     /// pins, and `end_abs` is `start_abs` plus the record's frame length.
     unsafe fn commit(&self, committed: u64, start_abs: u64, end_abs: u64, gap: u64, bytes: &[u8]) {
-        let phys = (start_abs & self.inner.geometry.mask()) as usize;
+        let offset = (start_abs & self.inner.geometry.mask()) as usize;
         // SAFETY: record is contiguous and in-bounds (caller contract).
-        unsafe { self.inner.write_record(phys, bytes) };
+        unsafe { self.inner.write_record(offset, bytes) };
         if gap > 0 {
             // Publish the wrap marker before the position that crosses it.
             self.inner.control().hwm.store(committed, Release);
         }
         // Release publishes record bytes to acquiring readers.
         self.publish(end_abs);
-        self.data.notify();
+        self.wake.notify();
     }
 }
 
@@ -793,7 +832,7 @@ struct Located {
     /// Absolute record start.
     start: u64,
     /// Record offset within the data region.
-    phys: usize,
+    offset: usize,
     payload_len: usize,
     frame_len: usize,
 }
@@ -815,7 +854,7 @@ pub struct View<RD: WakeSink> {
     ///
     /// The copy in its slot exists for the writer.
     cursor: Cell<u64>,
-    data: RD,
+    wake: RD,
     /// The position a drain has read up to.
     ///
     /// It is applied to the cursor once the drain's slices can no longer be used.
@@ -841,7 +880,7 @@ impl<RD: WakeSink> View<RD> {
     ///
     /// Use it when one caller waits on several views.
     pub fn wake(&self) -> &RD {
-        &self.data
+        &self.wake
     }
 
     /// Returns whether an unread record is waiting.

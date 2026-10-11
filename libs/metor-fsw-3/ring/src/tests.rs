@@ -407,7 +407,7 @@ fn test_read_rejects_corrupt_length() {
     let mut v = rb.view(NoWake).unwrap();
 
     w.try_write(&[5u8; 16]).unwrap();
-    // SAFETY: phys 0 is in-bounds and nothing reads concurrently.
+    // SAFETY: offset 0 is in-bounds and nothing reads concurrently.
     unsafe { (rb.inner.data_ptr(0) as *mut u64).write(0xFFFF_FFFF) };
     assert_eq!(v.try_read().err(), Some(ReadError::Corrupt));
 
@@ -1005,7 +1005,7 @@ fn test_attach_accepts_extra_storage() {
         capacity: 64,
         max_readers: 2,
     };
-    let mut geometry = layout(&cfg);
+    let mut geometry = Geometry::from_config(&cfg);
     geometry.reader_table_offset += 16;
     geometry.data_offset += 32;
     geometry.total_size += 48;

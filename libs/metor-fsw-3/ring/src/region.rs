@@ -56,19 +56,19 @@ pub(super) const READER_SLOT_PAD: usize = 48;
 #[cfg(ring_loom)]
 pub(super) const READER_SLOT_PAD: usize = 0;
 
-pub(super) const OFF_CONTROL: usize = 0x40;
+pub(super) const CONTROL_OFFSET: usize = 0x40;
 
 /// The start of the reader table. Loom needs extra space for its atomics.
 #[cfg(not(ring_loom))]
 pub(super) const HEADER_SIZE: usize = 0x80;
 #[cfg(ring_loom)]
-pub(super) const HEADER_SIZE: usize = (OFF_CONTROL + size_of::<Control>()).next_multiple_of(64);
+pub(super) const HEADER_SIZE: usize = (CONTROL_OFFSET + size_of::<Control>()).next_multiple_of(64);
 
 // PANIC Safety: compile-time assertions pin the shipped layout.
 #[cfg(not(ring_loom))]
 const _: () = {
-    assert!(size_of::<RegionHeader>() <= OFF_CONTROL);
-    assert!(OFF_CONTROL + size_of::<Control>() <= HEADER_SIZE);
+    assert!(size_of::<RegionHeader>() <= CONTROL_OFFSET);
+    assert!(CONTROL_OFFSET + size_of::<Control>() <= HEADER_SIZE);
     assert!(size_of::<ReaderSlot>() == 64);
     assert!(align_of::<ReaderSlot>() == 8);
 };
@@ -89,37 +89,6 @@ pub(super) const fn arch_tag() -> u64 {
     (0x0102_0304u32 as u64) << 32
 }
 
-pub(super) fn layout(cfg: &Config) -> Geometry {
-    // PANIC Safety: callers of this infallible API must provide a valid config.
-    checked_layout(cfg)
-        .expect("ring capacity and reader table must form a valid, representable region")
-}
-
-pub(super) fn checked_layout(cfg: &Config) -> Option<Geometry> {
-    if !cfg.capacity.is_power_of_two()
-        || cfg.capacity < RECORD_HEADER_SIZE
-        || cfg.max_readers == 0
-        || u32::try_from(cfg.max_readers).is_err()
-    {
-        return None;
-    }
-    let data_offset = cfg
-        .max_readers
-        .checked_mul(READER_SLOT_SIZE)?
-        .checked_add(HEADER_SIZE)?;
-    let total = data_offset.checked_add(cfg.capacity)?;
-    if total > isize::MAX as usize {
-        return None;
-    }
-    Some(Geometry {
-        capacity: cfg.capacity as u64,
-        reader_table_offset: HEADER_SIZE,
-        data_offset,
-        max_readers: cfg.max_readers as u32,
-        total_size: total,
-    })
-}
-
 /// # Safety
 /// The backing is aligned, writable only through this call, and large enough for
 /// a valid `geometry`. No other handle may observe initialization.
@@ -138,7 +107,7 @@ pub(super) unsafe fn init_region(backing: &Backing, geometry: &Geometry) {
             total_size: geometry.total_size as u64,
             arch_tag: arch_tag(),
         });
-        base.add(OFF_CONTROL).cast::<Control>().write(Control {
+        base.add(CONTROL_OFFSET).cast::<Control>().write(Control {
             committed: AtomicU64::new(0),
             hwm: AtomicU64::new(HWM_NONE),
             writer: AtomicU64::new(0),
@@ -155,16 +124,56 @@ pub(super) unsafe fn init_region(backing: &Backing, geometry: &Geometry) {
     }
 }
 
-/// Validated sizes and offsets, in this process's native integer types.
+/// The validated sizes and offsets of a region.
 pub(super) struct Geometry {
+    /// Bytes in the whole region, including the header, reader table, and data.
     pub(super) total_size: usize,
+    /// Bytes in the data region. Kept as `u64` because positions are `u64`.
     pub(super) capacity: u64,
+    /// Offset of the data region from the region base.
     pub(super) data_offset: usize,
+    /// Offset of the reader table from the region base.
     pub(super) reader_table_offset: usize,
     pub(super) max_readers: u32,
 }
 
 impl Geometry {
+    /// Returns the compact layout for `cfg`.
+    ///
+    /// # Panics
+    /// Panics if `cfg` cannot form a valid region.
+    pub(super) fn from_config(cfg: &Config) -> Self {
+        // PANIC Safety: callers of this infallible API must provide a valid config.
+        Self::checked_from_config(cfg)
+            .expect("ring capacity and reader table must form a valid, representable region")
+    }
+
+    /// Returns the compact layout for `cfg`, or `None` if it cannot form a valid region.
+    pub(super) fn checked_from_config(cfg: &Config) -> Option<Self> {
+        if !cfg.capacity.is_power_of_two()
+            || cfg.capacity < RECORD_HEADER_SIZE
+            || cfg.max_readers == 0
+            || u32::try_from(cfg.max_readers).is_err()
+        {
+            return None;
+        }
+        let data_offset = cfg
+            .max_readers
+            .checked_mul(READER_SLOT_SIZE)?
+            .checked_add(HEADER_SIZE)?;
+        let total = data_offset.checked_add(cfg.capacity)?;
+        if total > isize::MAX as usize {
+            return None;
+        }
+        Some(Self {
+            capacity: cfg.capacity as u64,
+            reader_table_offset: HEADER_SIZE,
+            data_offset,
+            max_readers: cfg.max_readers as u32,
+            total_size: total,
+        })
+    }
+
     pub(super) fn mask(&self) -> u64 {
         self.capacity - 1
     }
