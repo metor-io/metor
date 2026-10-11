@@ -3,9 +3,10 @@
 use std::cell::RefCell;
 
 use metor_fsw_3::ring::Notifier;
+use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
-    DefCx, DefError, DynInputs, Input, InputBinding, Output, OutputBinding, PortDef, Record, Stop,
-    System, SystemDef, SystemInputs, SystemOutputs, SystemTable, Timestamp, system,
+    DefCx, DefError, DynInputs, Frame, Input, InputBinding, Output, OutputBinding, PortDef, Record,
+    Stop, System, SystemDef, SystemInputs, SystemOutputs, SystemTable, Timestamp, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,47 @@ use serde::{Deserialize, Serialize};
 #[record(max_len = 8)]
 pub struct Ping {
     pub n: u32,
+}
+
+/// The frame this pack carries, so one can cross targets.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
+#[frame(name = "sample")]
+#[repr(C)]
+pub struct Sample {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub value: f64,
+}
+
+/// Writes one sample per cycle, counting up.
+#[derive(Default)]
+pub struct Sampler(i64);
+
+#[system]
+impl Sampler {
+    /// Counts up, one sample per cycle.
+    fn execute(&mut self, sample: &mut Output<Sample>) {
+        self.0 += 1;
+        let _ = sample.write(&Sample {
+            timestamp: Timestamp(self.0),
+            value: self.0 as f64,
+        });
+    }
+}
+
+/// Turns the newest sample into a ping.
+#[derive(Default)]
+pub struct Meter;
+
+#[system]
+impl Meter {
+    /// Pings the newest sample's value.
+    fn execute(&mut self, sample: &mut Input<Sample>, output: &mut Output<Ping>) {
+        if let Ok(Some(sample)) = sample.latest() {
+            let n = sample.value as u32;
+            let _ = output.write(&Ping { n });
+        }
+    }
 }
 
 /// Copies its input onto its output.
@@ -205,6 +247,12 @@ pub fn pack() -> SystemTable {
     }
     let mut table = SystemTable::new();
     // PANIC Safety: these static record schemas are compatible.
+    table
+        .register("sampler", Sampler::default)
+        .expect("valid records");
+    table
+        .register("meter", Meter::default)
+        .expect("valid records");
     table
         .register("echo", Echo::default)
         .expect("valid records");

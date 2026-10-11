@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
-use metor_fsw_3::cli::build::cargo_build;
+use metor_fsw_3::cli::cargo::cargo_build;
 use metor_fsw_3::coordinator::{
     BuildError, Coordinator, CoordinatorConfig, InputConfig, ParamError, PortRef, SystemConfig,
     SystemTable,
@@ -144,6 +144,8 @@ fn test_pack_reports_system_metadata() {
     assert_eq!(
         types,
         vec![
+            "sampler",
+            "meter",
             "echo",
             "relay",
             "tap",
@@ -158,7 +160,7 @@ fn test_pack_reports_system_metadata() {
     assert!(tap.takes_inputs && !tap.takes_outputs);
     assert!(tap.def.inputs.is_empty());
 
-    let echo = pack.systems().next().expect("one system");
+    let echo = pack.systems().find(|s| s.ty == "echo").expect("echo");
     assert_eq!(echo.def.inputs[0].name, "input");
     assert_eq!(echo.def.inputs[0].record, Ping::NAME);
     assert_eq!(echo.def.inputs[0].id, Ping::ID);
@@ -170,7 +172,7 @@ fn test_pack_reports_system_metadata() {
     let gain = pack.systems().find(|s| s.ty == "gain").expect("gain");
     let schema = gain.params.as_deref().expect("gain takes params").get();
     assert!(schema.contains(r#""description":"Scales every ping.""#));
-    assert!(pack.systems().next().expect("echo").params.is_none());
+    assert!(echo.params.is_none());
 }
 
 /// The host wires two of the fixture's outputs into one pack system, which

@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use metor_proto::types::{IntoLenPacket, PACKET_HEADER_LEN, PacketId, PacketTy, table_id};
 use metor_proto_wkt::{
-    LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata, SetComponentMetadata, SetMsgMetadata, VTableMsg,
+    LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata, MsgStream, SetComponentMetadata, SetMsgMetadata,
+    VTableMsg,
 };
 
 use crate::record::{MsgCodec, RecordSchema};
@@ -22,6 +23,16 @@ pub(crate) fn link_info(
         link: link.to_string(),
     };
     (&info).into_len_packet().inner
+}
+
+/// What a dialer sends first: one stream request per message it takes, so a
+/// db peer forwards those logs. A `Publish` peer discards them.
+pub(crate) fn msg_streams(ids: &[PacketId]) -> Vec<u8> {
+    let mut blob = Vec::new();
+    for &msg_id in ids {
+        blob.extend_from_slice(&(&MsgStream { msg_id }).into_len_packet().inner);
+    }
+    blob
 }
 
 /// The message that is sent at the start of a connection, and the id each
@@ -80,7 +91,7 @@ pub(crate) fn announce(
 
 /// A message's schema as the ground decodes it: the type's own for postcard,
 /// an opaque payload plus the codec's name for anything else.
-fn msg_metadata(name: &str, codec: &MsgCodec) -> MsgMetadata {
+pub(crate) fn msg_metadata(name: &str, codec: &MsgCodec) -> MsgMetadata {
     let (name, schema) = match codec {
         MsgCodec::Postcard(schema) => (schema.name.to_string(), schema.clone()),
         _ => (
@@ -259,6 +270,15 @@ mod tests {
         let (blob, wire) = announced(&defs);
         assert_eq!(wire[0], wire[1]);
         assert_eq!(blob, announced(&defs[..1]).0);
+    }
+
+    #[test]
+    fn test_msg_streams_request_each_id() {
+        let blob = msg_streams(&[[1, 2], [3, 4]]);
+        let mut expected = (&MsgStream { msg_id: [1, 2] }).into_len_packet().inner;
+        expected.extend_from_slice(&(&MsgStream { msg_id: [3, 4] }).into_len_packet().inner);
+        assert_eq!(blob, expected);
+        assert!(msg_streams(&[]).is_empty());
     }
 
     #[test]

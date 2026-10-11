@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 from typing import Any
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 
-ABI_VERSION = 6
+ABI_VERSION = 8
 """The host ABI the built-in systems are compiled against; a Rust test pins it."""
 
 ABI_ENV = "METOR_FSW_ABI_VERSION"

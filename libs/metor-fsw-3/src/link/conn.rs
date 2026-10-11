@@ -130,8 +130,9 @@ impl Connections {
     }
 
     /// Serves `stream` from `slot` until either half ends or `stop`, then frees
-    /// the slot.
+    /// the slot. Each connection's announce is checked on its own.
     pub(crate) async fn serve(&self, slot: Slot, stream: TcpStream, stop: &Stop) {
+        self.inbox.connected();
         let (rx, tx) = stream.split();
         let halves = future::or(
             write_half(&slot.outbox, &self.changed, tx, self.seed.clone()),
@@ -356,7 +357,7 @@ mod tests {
 
     #[stellarator::test]
     async fn test_inbound_packet_reaches_inbox() {
-        let (inbox, mut view) = Inbox::new(vec![[7, 7]], 2, 8).expect("a small ring");
+        let (inbox, mut view) = Inbox::new(vec![[7, 7]], Vec::new(), 2, 8).expect("a small ring");
         let conns = Rc::new(Connections::new(1, 64, Vec::new(), Rc::new(inbox)));
         let (_handle, stop) = stop_pair();
         let (client, served) = pair().await;
@@ -371,7 +372,10 @@ mod tests {
             .try_read()
             .expect("a read")
             .expect("the packet arrived");
-        assert_eq!(inbox::message(&record), Some(([7, 7], &b"ping"[..])));
+        assert_eq!(
+            inbox::packet(&record),
+            Some((PacketTy::Msg, [7, 7], &b"ping"[..]))
+        );
     }
 
     #[stellarator::test]

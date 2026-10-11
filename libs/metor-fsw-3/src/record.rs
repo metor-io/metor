@@ -115,16 +115,31 @@ impl RecordSchema {
         }
     }
 
-    /// Whether two ports announcing these carry one record. Messages must
-    /// agree; a frame's vtable is its port's, so frames are told apart by
-    /// their record elsewhere.
-    pub fn same_record(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Frame { .. }, Self::Frame { .. }) => true,
-            (Self::Msg { .. }, Self::Msg { .. }) => self == other,
-            _ => false,
+    /// A frame's layout fingerprint, taken at the record's own name so it does
+    /// not move with the port's root; a message has none.
+    pub fn layout(&self) -> u64 {
+        match self {
+            Self::Frame { vtable, .. } => fnv1a(&vtable_bytes(vtable)),
+            Self::Msg { .. } => 0,
         }
     }
+
+    /// Whether two ports announcing these carry one record. Messages must
+    /// agree; a frame's vtable is its port's, so frames are told apart by
+    /// [`PortDef::layout`](crate::PortDef::layout).
+    pub fn same_record(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Msg { .. }, Self::Msg { .. }) => self == other,
+            _ => core::mem::discriminant(self) == core::mem::discriminant(other),
+        }
+    }
+}
+
+/// FNV-1a over bytes.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// Frames compare by their announced bytes, which is what the ground sees.

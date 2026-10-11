@@ -18,6 +18,9 @@ pub struct PortDef {
     pub max_len: usize,
     pub alignment: usize,
     pub depth: usize,
+    /// A frame's field layout, taken at the record's own name; zero for a
+    /// message.
+    pub layout: u64,
     /// What this port announces to the ground.
     pub schema: RecordSchema,
 }
@@ -31,12 +34,14 @@ impl PortDef {
             self.max_len,
             self.alignment,
             self.depth,
+            self.layout,
         ) == (
             &other.record,
             other.id,
             other.max_len,
             other.alignment,
             other.depth,
+            other.layout,
         ) && self.schema.same_record(&other.schema)
     }
 }
@@ -157,7 +162,7 @@ mod tests {
     use super::*;
     use crate::def::DefCx;
     use crate::port::{Input, Output, ring_capacity};
-    use crate::tests::utils::{Imu, Nav, static_inputs, static_outputs};
+    use crate::tests::utils::{Imu, ImuPair, Nav, static_inputs, static_outputs};
     use crate::{Frame, Record};
 
     #[derive(crate::SystemInputs)]
@@ -225,6 +230,34 @@ mod tests {
     }
 
     #[test]
+    fn test_layout_tells_frames_of_one_name_apart() {
+        let cx = DefCx::empty();
+        let (imu, pair) = (
+            Output::<Imu>::def(&cx, "imu"),
+            Output::<ImuPair>::def(&cx, "imu"),
+        );
+        assert_eq!((imu.record.as_ref(), imu.max_len), ("imu", pair.max_len));
+        assert_ne!(imu.layout, pair.layout);
+        assert!(!imu.same_record(&pair));
+    }
+
+    #[test]
+    fn test_layout_survives_the_port_root() {
+        let rooted = DefCx {
+            id: "plant",
+            namespace: Some("cube_sat"),
+            ..DefCx::empty()
+        };
+        let (here, there) = (
+            Output::<Imu>::def(&DefCx::empty(), "imu"),
+            Output::<Imu>::def(&rooted, "imu"),
+        );
+        assert_ne!(here.schema, there.schema);
+        assert_eq!(here.layout, there.layout);
+        assert!(here.same_record(&there));
+    }
+
+    #[test]
     fn test_derived_port_definitions() {
         assert_eq!(
             static_inputs::<DerivedIn, _>(),
@@ -239,6 +272,7 @@ mod tests {
                 max_len: size_of::<Nav>(),
                 alignment: align_of::<Nav>(),
                 depth: 1,
+                layout: Nav::schema().layout(),
                 schema: Nav::schema(),
             }]
         );

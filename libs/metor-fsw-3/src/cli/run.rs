@@ -1,4 +1,5 @@
-//! `metor run`: evaluate a target file, load its packs, and cycle the graph.
+//! `metor run`: evaluate a target file, resolve its deployment, load a
+//! target's packs, and cycle its graph.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
@@ -10,10 +11,11 @@ use std::process::{Command, ExitStatus};
 
 use tracing_subscriber::layer::SubscriberExt;
 
-use super::build::{cdylib_name, read_toml, string, triple};
-use super::config::{ConfigError, TargetConfig};
+use super::cargo::{cdylib_name, read_toml, string, triple};
+use super::config::{ConfigError, DeploymentConfig, TargetConfig};
 use super::pack_dev::{PackDevError, pack_dev};
 use crate::coordinator::{BuildError, Clock, Coordinator, SystemTable};
+use crate::deploy::{self, DeployError};
 use crate::dl::{Pack, PackError};
 use crate::pack::ABI_VERSION;
 
@@ -25,6 +27,9 @@ const IN_REPO_CONFIG_PY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/python/met
 pub struct Run {
     /// The target file to evaluate; `./target.py` by default.
     pub target: Option<PathBuf>,
+    /// The deployment member to run, by namespace; needed when there are several.
+    #[arg(long = "target", value_name = "NS")]
+    pub member: Option<String>,
     /// Stop after this many cycles instead of on SIGINT.
     #[arg(long)]
     pub cycles: Option<u64>,
@@ -54,25 +59,32 @@ pub enum RunError {
     Pack(#[from] PackError),
     #[error(transparent)]
     Build(#[from] BuildError),
+    #[error(transparent)]
+    Deploy(#[from] DeployError),
     #[error("--sim-dt must be a positive number of seconds, got {0}")]
     SimDt(f64),
     #[error("these systems latched off: {0}")]
     Latched(String),
+    #[error("these targets did not exit cleanly: {0}")]
+    Children(String),
+    #[error("interrupted")]
+    Interrupted,
+    #[error("--print-ports names one target's links; pick one with --target")]
+    PrintPortsNeedsTarget,
 }
 
 /// Refreshes every dev pack, evaluates the target, and cycles until stopped.
 pub fn run(args: Run) -> Result<(), RunError> {
     install_logging();
-    let target = args
-        .target
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("target.py"));
-    let packs = dev_packs(target.parent().unwrap_or(Path::new(".")));
-    for pack in &packs {
-        pack_dev(pack)?;
+    let config = prepare(args.target.as_deref())?;
+    if config.targets.len() > 1 && args.member.is_none() {
+        if args.print_ports {
+            return Err(RunError::PrintPortsNeedsTarget);
+        }
+        return run_children(&config, &args);
     }
-    let config = eval_target(&target, &packs)?;
-    let coordinator = load(config, &args)?;
+    let member = config.target(args.member.as_deref())?;
+    let coordinator = load(&config.targets[member], &args)?;
     if args.print_ports {
         print_ports();
     }
@@ -90,6 +102,31 @@ pub fn run(args: Run) -> Result<(), RunError> {
         return Ok(());
     }
     Err(RunError::Latched(latched.join(", ")))
+}
+
+/// Writes the resolved envelope to a temp file and runs every target from it
+/// as a child, until all have exited.
+fn run_children(config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
+    let path = std::env::temp_dir().join(format!("metor-deploy-{}.json", std::process::id()));
+    std::fs::write(
+        &path,
+        serde_json::to_vec(config).map_err(ConfigError::Decode)?,
+    )?;
+    watch_sigint();
+    let result = supervise(&path, config, args);
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+/// Runs every target of `config` from `envelope` until all have exited, or
+/// until SIGINT ends them.
+fn supervise(envelope: &Path, config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
+    let children = super::children::spawn_all(envelope, &config.namespaces(), args)?;
+    super::children::wait_all(children).map_err(|failed| RunError::Children(failed.join(", ")))?;
+    if interrupted() {
+        return Err(RunError::Interrupted);
+    }
+    Ok(())
 }
 
 /// Writes every bound link address to stdout, for a caller that asked a link to
@@ -116,6 +153,31 @@ fn install_logging() {
         .with(crate::log::layer());
     // A host that already installed a subscriber keeps it.
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// Refreshes every dev pack beside `target`, evaluates it (or reads it, for a
+/// `.json`), and resolves every peer reference, which needs every target's
+/// packs only while a reference remains.
+pub fn prepare(target: Option<&Path>) -> Result<DeploymentConfig, RunError> {
+    let target = target.unwrap_or(Path::new("target.py"));
+    let packs = dev_packs(target.parent().unwrap_or(Path::new(".")));
+    for pack in &packs {
+        pack_dev(pack)?;
+    }
+    let mut config = if target.extension().is_some_and(|ext| ext == "json") {
+        DeploymentConfig::from_slice(&std::fs::read(target)?)?
+    } else {
+        eval_target(target, &packs)?
+    };
+    if deploy::unresolved(&config) {
+        let tables: Vec<SystemTable> = config
+            .targets
+            .iter()
+            .map(table_for)
+            .collect::<Result<_, _>>()?;
+        deploy::resolve(&mut config, &tables)?;
+    }
+    Ok(config)
 }
 
 /// The dev packs a target depends on: `[tool.uv.sources]` paths that are both a
@@ -155,8 +217,8 @@ fn is_dev_pack(root: &Path) -> bool {
         })
 }
 
-/// Runs the target file as a script and reads the config it emitted.
-pub fn eval_target(path: &Path, dev_packs: &[PathBuf]) -> Result<TargetConfig, RunError> {
+/// Runs the target file as a script and reads the deployment it emitted.
+pub fn eval_target(path: &Path, dev_packs: &[PathBuf]) -> Result<DeploymentConfig, RunError> {
     let out = std::env::temp_dir().join(format!("metor-config-{}.json", std::process::id()));
     let status = Command::new(interpreter())
         .arg(path)
@@ -169,7 +231,7 @@ pub fn eval_target(path: &Path, dev_packs: &[PathBuf]) -> Result<TargetConfig, R
     }
     let bytes = std::fs::read(&out)?;
     let _ = std::fs::remove_file(&out);
-    Ok(TargetConfig::from_slice(&bytes)?)
+    Ok(DeploymentConfig::from_slice(&bytes)?)
 }
 
 /// `$METOR_PYTHON`, else the active virtualenv's, else `python3`.
@@ -199,8 +261,9 @@ fn python_path(dev_packs: &[PathBuf]) -> OsString {
     path
 }
 
-/// Applies the clock overrides, opens every pack, and builds the graph.
-pub fn load(mut config: TargetConfig, overrides: &Run) -> Result<Coordinator, RunError> {
+/// Applies the clock overrides, opens the target's packs, and builds its graph.
+pub fn load(config: &TargetConfig, overrides: &Run) -> Result<Coordinator, RunError> {
+    let mut config = config.clone();
     if let Some(rate) = overrides.wall {
         config.coordinator.clock = Clock::Wall { rate };
     }
@@ -209,6 +272,12 @@ pub fn load(mut config: TargetConfig, overrides: &Run) -> Result<Coordinator, Ru
         config.coordinator.clock = Clock::Simulated { dt };
     }
 
+    let table = table_for(&config)?;
+    Ok(config.coordinator.build(&table)?)
+}
+
+/// The built-ins plus every pack `config` names, opened.
+fn table_for(config: &TargetConfig) -> Result<SystemTable, RunError> {
     let mut table = SystemTable::new();
     crate::link::register_builtins(&mut table)?;
     let opened: Vec<Pack> = config
@@ -224,7 +293,7 @@ pub fn load(mut config: TargetConfig, overrides: &Run) -> Result<Coordinator, Ru
     for (reference, pack) in config.packs.iter().zip(&opened) {
         table.register_pack(&reference.id, pack)?;
     }
-    Ok(config.coordinator.build(&table)?)
+    Ok(table)
 }
 
 /// Set once SIGINT arrived; the run's stop future reads it each cycle.
@@ -232,6 +301,11 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn interrupt(_signal: core::ffi::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+/// Whether SIGINT has arrived.
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed)
 }
 
 /// Makes SIGINT flip [`INTERRUPTED`] instead of killing the process.
@@ -247,7 +321,7 @@ fn stop(cycles: Option<u64>) -> impl Future<Output = ()> {
     let mut polls = 0;
     poll_fn(move |_| {
         polls += 1;
-        let done = INTERRUPTED.load(Ordering::Relaxed) || cycles.is_some_and(|n| polls >= n);
+        let done = interrupted() || cycles.is_some_and(|n| polls >= n);
         if done { Poll::Ready(()) } else { Poll::Pending }
     })
 }
@@ -296,17 +370,13 @@ mod tests {
 
     #[test]
     fn test_reject_negative_sim_dt() {
-        let config = TargetConfig {
-            config_version: super::super::config::CONFIG_VERSION,
-            packs: Vec::new(),
-            coordinator: Default::default(),
-        };
+        let config = TargetConfig::default();
         let overrides = Run {
             sim_dt: Some(-1.0),
             ..Default::default()
         };
         assert!(matches!(
-            load(config, &overrides),
+            load(&config, &overrides),
             Err(RunError::SimDt(dt)) if dt == -1.0
         ));
     }

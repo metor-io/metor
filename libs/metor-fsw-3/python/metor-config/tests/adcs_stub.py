@@ -15,36 +15,43 @@ PACK = Pack(id="adcs", lib="adcs_systems", libs="/abs/.metor/adcs_pack/_libs", a
 
 
 class Imu(Record):
+    _kind = "frame"
     _name = "imu"
     _pack = PACK
 
 
 class LogEvent(Record):
+    _kind = "msg"
     _name = "log"
     _pack = PACK
 
 
 class SystemStatus(Record):
+    _kind = "frame"
     _name = "status"
     _pack = PACK
 
 
 class Est(Record):
+    _kind = "frame"
     _name = "est"
     _pack = PACK
 
 
 class ModeCmd(Record):
+    _kind = "msg"
     _name = "mode_cmd"
     _pack = PACK
 
 
 class MotorCmd(Record):
+    _kind = "frame"
     _name = "motor_cmd"
     _pack = PACK
 
 
 class Ping(Record):
+    _kind = "msg"
     _name = "ping"
     _pack = PACK
 
@@ -54,7 +61,7 @@ class Plant(System):
 
     _pack = PACK
     _ty = "plant"
-    _outputs = ("imu",)
+    _ports = {"imu": Imu, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, motor_cmd: Sources[MotorCmd] = (), altitude: float = 400e3) -> None:
         super().__init__({"motor_cmd": motor_cmd}, {"altitude": altitude})
@@ -67,7 +74,7 @@ class Plant(System):
 class Nav(System):
     _pack = PACK
     _ty = "nav"
-    _outputs = ("est",)
+    _ports = {"est": Est, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, imu: Sources[Imu] = (), gain: float = 0.1) -> None:
         super().__init__({"imu": imu}, {"gain": gain})
@@ -80,7 +87,7 @@ class Nav(System):
 class Mode(System):
     _pack = PACK
     _ty = "mode"
-    _outputs = ("cmd",)
+    _ports = {"cmd": ModeCmd, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self) -> None:
         super().__init__({}, {})
@@ -93,7 +100,7 @@ class Mode(System):
 class Ctrl(System):
     _pack = PACK
     _ty = "ctrl"
-    _outputs = ("motor_cmd",)
+    _ports = {"motor_cmd": MotorCmd, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, est: Sources[Est] = (), mode: Sources[ModeCmd] = ()) -> None:
         super().__init__({"est": est, "mode": mode}, {})
@@ -109,7 +116,7 @@ class Tap(System):
     _pack = PACK
     _ty = "tap"
     _takes_inputs = True
-    _outputs = ("output",)
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, items: Sequence[Item] = (), gain: float = 1.0) -> None:
         super().__init__({}, {"gain": gain}, items=items)
@@ -125,6 +132,7 @@ class Fan(System):
     _pack = PACK
     _ty = "fan"
     _takes_outputs = True
+    _ports = {"log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, records: Sequence[type[Record]] = ()) -> None:
         super().__init__({}, {}, records=records)

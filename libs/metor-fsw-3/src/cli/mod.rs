@@ -1,6 +1,9 @@
-//! The `metor` binary: build a pack's editable module, or run a target.
+//! The `metor` binary: build a pack's editable module, resolve a deployment,
+//! or run a target.
 
 pub mod build;
+pub mod cargo;
+pub mod children;
 pub mod config;
 pub mod module;
 pub mod pack_dev;
@@ -28,6 +31,8 @@ pub enum Command {
     AbiVersion,
     /// Evaluates a target file and runs the graph it describes.
     Run(run::Run),
+    /// Evaluates a target file and writes its resolved deployment.
+    Build(build::Build),
 }
 
 #[derive(Subcommand)]
@@ -58,5 +63,6 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Run(args) => run::run(args).map_err(|error| error.to_string()),
+        Command::Build(args) => build::build(args).map_err(|error| error.to_string()),
     }
 }

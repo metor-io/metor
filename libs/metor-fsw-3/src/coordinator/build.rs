@@ -122,7 +122,7 @@ fn resolve<'a>(
         );
         plan.rings.push(RingSpec::new(
             &system.id,
-            &Output::<SystemStatus>::def(&DefCx::empty(), STATUS_PORT),
+            &status_def(&system.id, namespace),
         ));
         plan.systems.push(PlannedSystem {
             id: &system.id,
@@ -138,6 +138,16 @@ fn resolve<'a>(
     Ok(plan)
 }
 
+/// The coordinator's status port for instance `id`, rooted like any other port.
+pub(crate) fn status_def(id: &str, namespace: Option<&str>) -> PortDef {
+    let cx = DefCx {
+        id,
+        namespace,
+        ..DefCx::empty()
+    };
+    Output::<SystemStatus>::def(&cx, STATUS_PORT)
+}
+
 /// Each system's position in the config, by id.
 fn index(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, BuildError> {
     let mut index = HashMap::with_capacity(config.systems.len());
@@ -151,7 +161,8 @@ fn index(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, BuildError>
     Ok(index)
 }
 
-/// The definition the type computes from this instance's config.
+/// The definition the type computes from this instance's config, over the
+/// producers this pass has resolved so far.
 fn instance_def(
     system: &SystemConfig,
     entry: &TableEntry,
@@ -160,59 +171,35 @@ fn instance_def(
     records: &Records,
     namespace: Option<&str>,
 ) -> Result<SystemDef, BuildError> {
-    let producers = producers(system, entry, plan, index)?;
-    let inputs: Vec<(&str, &PortDef)> = producers.iter().map(|(port, def)| (*port, def)).collect();
-    let cx = DefCx {
-        id: &system.id,
-        namespace,
-        inputs: &inputs,
-        outputs: &system.outputs,
-        records,
-    };
-    entry.def_for(&cx).map_err(|source| BuildError::Def {
-        id: system.id.clone(),
-        source,
+    crate::def::instance_def(system, entry, namespace, records, |from| {
+        let Some(&at) = index.get(from.system.as_str()) else {
+            return Err(BuildError::UnknownSystem {
+                id: system.id.clone(),
+                port: from_port(system, from),
+                from: from.system.clone(),
+            });
+        };
+        let Some(producer) = plan.systems.get(at) else {
+            return Ok(None);
+        };
+        let Some(ring) = producer.output_ring(&from.port) else {
+            return Err(BuildError::UnknownOutput {
+                system: from.system.clone(),
+                port: from.port.clone(),
+            });
+        };
+        Ok(Some(plan.rings[ring].port.clone()))
     })
 }
 
-/// One entry per config edge: the input port it names and the def of the
-/// output feeding it. A producer this pass has not resolved yet only feeds a
-/// port the type declares, which needs no def of its own.
-fn producers<'a>(
-    system: &'a SystemConfig,
-    entry: &TableEntry,
-    plan: &Plan<'_>,
-    index: &HashMap<&str, usize>,
-) -> Result<Vec<(&'a str, PortDef)>, BuildError> {
-    let mut edges = Vec::new();
-    for input in &system.inputs {
-        for from in &input.from {
-            let Some(&at) = index.get(from.system.as_str()) else {
-                return Err(BuildError::UnknownSystem {
-                    id: system.id.clone(),
-                    port: input.port.clone(),
-                    from: from.system.clone(),
-                });
-            };
-            let Some(producer) = plan.systems.get(at) else {
-                if entry.def.inputs.iter().any(|p| p.name == input.port) {
-                    continue;
-                }
-                return Err(BuildError::DynamicFromLater {
-                    system: system.id.clone(),
-                    port: input.port.clone(),
-                });
-            };
-            let Some(ring) = producer.output_ring(&from.port) else {
-                return Err(BuildError::UnknownOutput {
-                    system: from.system.clone(),
-                    port: from.port.clone(),
-                });
-            };
-            edges.push((input.port.as_str(), plan.rings[ring].port.clone()));
-        }
-    }
-    Ok(edges)
+/// The input port of `system` that reads `from`.
+fn from_port(system: &SystemConfig, from: &super::PortRef) -> String {
+    system
+        .inputs
+        .iter()
+        .find(|input| input.from.contains(from))
+        .map(|input| input.port.clone())
+        .unwrap_or_default()
 }
 
 fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildError> {
@@ -444,7 +431,7 @@ mod tests {
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     use super::*;
-    use crate::coordinator::{InputConfig, OutputConfig, PortRef, SystemConfig};
+    use crate::coordinator::{InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig};
     use crate::def::DefError;
     use crate::tests::utils::{self, Recorder, pipeline_config, table};
     use crate::{Frame, Record};
@@ -479,10 +466,7 @@ mod tests {
 
     fn emits(record: &str) -> SystemConfig {
         SystemConfig {
-            outputs: vec![OutputConfig {
-                port: "imu".into(),
-                record: record.into(),
-            }],
+            outputs: vec![OutputConfig::record("imu", record)],
             ..SystemConfig::new("emit", "emit")
         }
     }
@@ -505,6 +489,7 @@ mod tests {
                 max_len: 32,
                 alignment: 32,
                 depth: 1,
+                layout: utils::Imu::schema().layout(),
                 schema: utils::Imu::schema(),
             };
             let def = crate::SystemDef {
@@ -875,6 +860,82 @@ mod tests {
         assert_eq!(recorder.take(), vec![(Timestamp(1), 11.0)]);
     }
 
+    /// A resolved definition completes the port as-is, under the config's name,
+    /// so a consumer of that record binds to it without the table knowing it.
+    #[test]
+    fn test_resolve_dynamic_output_def() {
+        let recorder = Recorder::default();
+        let def = crate::Output::<crate::tests::utils::Imu>::def(
+            &DefCx {
+                id: "plant",
+                namespace: Some("a"),
+                ..DefCx::empty()
+            },
+            "imu",
+        );
+        let config = CoordinatorConfig {
+            systems: vec![
+                SystemConfig {
+                    outputs: vec![OutputConfig {
+                        port: "imu".into(),
+                        source: OutputSource::Def(def.clone()),
+                    }],
+                    ..SystemConfig::new("emit", "emit")
+                },
+                SystemConfig {
+                    inputs: vec![InputConfig {
+                        port: "imu".into(),
+                        from: vec![PortRef::new("emit", "imu")],
+                    }],
+                    ..SystemConfig::new("nav", "nav")
+                },
+                SystemConfig {
+                    inputs: vec![InputConfig {
+                        port: "nav".into(),
+                        from: vec![PortRef::new("nav", "nav")],
+                    }],
+                    ..SystemConfig::new("control", "control")
+                },
+            ],
+            ..Default::default()
+        };
+        let table = table(&recorder);
+        let plan = resolve(&config, &table).expect("valid config");
+        let emitted = &plan.systems[0].def.outputs[0];
+        assert_eq!(emitted.name, "imu");
+        assert_eq!(emitted.schema, def.schema, "the peer's root is kept");
+        assert_eq!(plan.rings[0].port.max_len, def.max_len);
+        drop(plan);
+        let mut coordinator = config.build(&table).expect("valid config");
+        coordinator.step(Timestamp(1));
+        assert_eq!(recorder.take(), vec![(Timestamp(1), 11.0)]);
+    }
+
+    #[test]
+    fn test_reject_unresolved_peer_output() {
+        let config = CoordinatorConfig {
+            systems: vec![SystemConfig {
+                outputs: vec![OutputConfig {
+                    port: "imu".into(),
+                    source: OutputSource::Peer(super::super::PeerPort {
+                        target: "a".into(),
+                        link: "pub".into(),
+                        port: "plant.imu".into(),
+                    }),
+                }],
+                ..SystemConfig::new("emit", "emit")
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            build(config).err(),
+            Some(BuildError::Def {
+                id: "emit".into(),
+                source: DefError::Unresolved { port: "imu".into() },
+            })
+        );
+    }
+
     #[test]
     fn test_reject_unknown_record() {
         let config = CoordinatorConfig {
@@ -941,10 +1002,7 @@ mod tests {
     fn test_reject_static_output_config() {
         let config = CoordinatorConfig {
             systems: vec![SystemConfig {
-                outputs: vec![OutputConfig {
-                    port: "extra".into(),
-                    record: "imu".into(),
-                }],
+                outputs: vec![OutputConfig::record("extra", "imu")],
                 ..SystemConfig::new("imu", "imu")
             }],
             ..Default::default()

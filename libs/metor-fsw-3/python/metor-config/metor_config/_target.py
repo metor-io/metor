@@ -1,23 +1,16 @@
-"""Record a target's systems and emit its coordinator config."""
+"""Record a target's systems and build its config."""
 
 from __future__ import annotations
 
-import atexit
-import json
-import os
-import sys
 from typing import Any, TypeVar, cast
 
-from ._config import OUT_ENV, CONFIG_VERSION, ConfigError, check_abi, simulated_clock, wall_clock
+from ._config import ConfigError, check_abi, simulated_clock, wall_clock
 from ._model import Loop, OutPort, Pack, Record, Source, System, _json
 
 S = TypeVar("S", bound=System)
 T = TypeVar("T", bound=Record)
 
 _targets: list["Target"] = []
-_emitted = False
-
-ALWAYS_OUTPUTS = ("log", "status")
 
 
 class SystemHandle:
@@ -25,14 +18,20 @@ class SystemHandle:
     declared output; `Target.add` types it as the `System` subclass it was
     handed, so a checker resolves each port's record."""
 
-    def __init__(self, name: str, outputs: tuple[str, ...]) -> None:
+    def __init__(self, name: str, target: "Target", system: System) -> None:
         self._name = name
-        self._outputs = tuple(outputs) + ALWAYS_OUTPUTS
+        self._target = target
+        self._system = system
 
     def __getattr__(self, port: str) -> Any:
-        if port not in self._outputs:
+        record = self._system._port_map().get(port)
+        if record is None:
             raise AttributeError(f"system `{self._name}` has no output port `{port}`")
-        return OutPort(self._name, port)
+        return OutPort(self._name, port, record, self._target)
+
+    def port(self, source: OutPort[T]) -> OutPort[T]:
+        """This system's copy of ``source``; see `Subscribe.port`."""
+        return self._system._port(source, self._name, self._target)
 
 
 class Target:
@@ -76,18 +75,26 @@ class Target:
             check_abi(pack.id, pack.abi_version)
         for pack in packs:
             self._packs.setdefault(pack.id, pack)
+        system._name = name
+        system._target = self
         self._systems.append((name, system, thread))
-        handle = SystemHandle(name, system._outputs)
+        handle = SystemHandle(name, self, system)
         self._handles[name] = handle
         return cast(S, handle)
 
+    def index(self, name: str) -> int:
+        """Where the system `name` sits in step order."""
+        for index, (added, _, _) in enumerate(self._systems):
+            if added == name:
+                return index
+        raise ConfigError(f"target `{self.namespace}` has no system `{name}`")
+
     def to_config(self) -> dict[str, Any]:
-        """The config file as a dict: this target's packs and its coordinator.
+        """This target's packs and its coordinator, as one member of the envelope.
 
         A pack with no library is built into the host, so it is not listed.
         """
         return {
-            "config_version": CONFIG_VERSION,
             "packs": [pack.to_json() for pack in self._packs.values() if pack.lib],
             "coordinator": {
                 "clock": self._clock(),
@@ -101,12 +108,23 @@ class Target:
 
     def _system(self, index: int) -> dict[str, Any]:
         name, system, thread = self._systems[index]
-        inputs = system._inputs_for(self, index)
-        entry = _system(name, system, thread, inputs)
-        if system._wants_target:
-            params = entry["params"] or {}
-            params.update(namespace=self.namespace, link=name)
-            entry["params"] = params
+        entry: dict[str, Any] = {
+            "id": name,
+            "ty": f"{system._pack.id}.{system._ty}",
+            "params": _json(system._params_for(self, index)),
+        }
+        if thread is not None:
+            entry["thread"] = thread
+        entry["inputs"] = [
+            {
+                "port": port,
+                "from": [_resolve(self, name, port, source) for source in sources],
+            }
+            for port, sources in system._inputs_for(self, index).items()
+        ]
+        outputs = system._outputs_for(self, index)
+        if outputs:
+            entry["outputs"] = _json(outputs)
         return entry
 
     def _clock(self) -> dict[str, Any]:
@@ -115,60 +133,22 @@ class Target:
         return wall_clock(self.cycle_rate)
 
 
-def _system(
-    name: str, system: System, thread: str | None, inputs: dict[str, list[Source[Any]]]
-) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "id": name,
-        "ty": f"{system._pack.id}.{system._ty}",
-        "params": _json(system._params) or None,
-    }
-    if thread is not None:
-        entry["thread"] = thread
-    entry["inputs"] = [
-        {"port": port, "from": [_resolve(name, port, source) for source in sources]}
-        for port, sources in inputs.items()
-    ]
-    if system._dyn_outputs:
-        entry["outputs"] = _json(system._dyn_outputs)
-    return entry
-
-
-def _resolve(name: str, port: str, source: Source[Any]) -> dict[str, str]:
+def _resolve(target: Target, name: str, port: str, source: Source[Any]) -> dict[str, str]:
     if isinstance(source, Loop):
         if source.producer is None:
             raise ConfigError(
                 f"the loop into `{name}.{port}` has no producer; call `connect` on it"
             )
-        return source.producer.ref.to_json()
+        return _local(target, name, port, source.producer)
+    return _local(target, name, port, source)
+
+
+def _local(target: Target, name: str, port: str, source: OutPort[Any]) -> dict[str, str]:
+    """``source``'s reference, which only names a port of ``target`` itself."""
+    if source.target is not None and source.target is not target:
+        raise ConfigError(
+            f"`{name}.{port}` reads `{source.name}` on another target; subscribe to "
+            "that link and pass the subscriber's `port()` instead"
+        )
     return source.ref.to_json()
 
-
-def emit(path: str | None = None) -> None:
-    """Write this file's target config to ``path``, else ``$METOR_CONFIG_OUT``,
-    else stdout."""
-    global _emitted
-    text = json.dumps(_the_target().to_config(), indent=2, sort_keys=False) + "\n"
-    out = path or os.environ.get(OUT_ENV)
-    if out:
-        with open(out, "w", encoding="utf-8") as file:
-            file.write(text)
-    else:
-        sys.stdout.write(text)
-    _emitted = True
-
-
-def _the_target() -> Target:
-    if len(_targets) != 1:
-        raise ConfigError(f"exactly one Target must exist at emission, found {len(_targets)}")
-    return _targets[0]
-
-
-def _emit_at_exit() -> None:
-    # A target file is a script that ends; a file that raised has already
-    # printed its traceback.
-    if not _emitted and len(_targets) == 1:
-        emit()
-
-
-atexit.register(_emit_at_exit)

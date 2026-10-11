@@ -9,8 +9,9 @@ import unittest
 
 from adcs_stub import PACK, Ctrl, Fan, Mode, MotorCmd, Nav, Ping, Plant, Tap
 
+import metor_config._deployment as deploy_mod
 import metor_config._target as target_mod
-from metor_config import ConfigError, PortRef, Publish, Subscribe, Target, emit
+from metor_config import ConfigError, Deployment, PortRef, Publish, Subscribe, Target, emit
 from metor_config._config import ABI_VERSION
 
 GOLDEN = os.path.join(
@@ -40,24 +41,22 @@ def adcs_target() -> Target:
 
 class TargetTest(unittest.TestCase):
     def setUp(self) -> None:
-        target_mod._targets.clear()
-        target_mod._emitted = False
+        reset()
         os.environ.pop("METOR_FSW_ABI_VERSION", None)
         os.environ.pop("METOR_CONFIG_OUT", None)
 
     def tearDown(self) -> None:
-        # Leave no target behind, or the atexit hook emits one to stdout.
-        target_mod._targets.clear()
+        reset()
 
     def test_atexit_emits_once(self) -> None:
         adcs_target()
         with tempfile.TemporaryDirectory() as dir:
             path = os.path.join(dir, "out.json")
             os.environ["METOR_CONFIG_OUT"] = path
-            target_mod._emit_at_exit()
+            deploy_mod._emit_at_exit()
             self.assertTrue(os.path.exists(path))
             os.remove(path)
-            target_mod._emit_at_exit()
+            deploy_mod._emit_at_exit()
             self.assertFalse(os.path.exists(path))
 
     def test_example_matches_golden(self) -> None:
@@ -77,7 +76,7 @@ class TargetTest(unittest.TestCase):
             os.environ["METOR_CONFIG_OUT"] = path
             emit()
             with open(path, encoding="utf-8") as file:
-                self.assertEqual(json.load(file)["config_version"], 1)
+                self.assertEqual(json.load(file)["config_version"], 2)
 
     def test_sim_dt_selects_simulated_clock(self) -> None:
         fsw = Target(cycle_rate=120.0, sim_dt=1 / 120)
@@ -171,13 +170,82 @@ class TargetTest(unittest.TestCase):
             emit()
 
 
-class LinkTest(unittest.TestCase):
+def reset() -> None:
+    """Leave no target or deployment behind, or the atexit hook emits to stdout."""
+    target_mod._targets.clear()
+    deploy_mod._deployments.clear()
+    deploy_mod._emitted = False
+
+
+def member(namespace: str | None) -> Target:
+    fsw = Target(cycle_rate=100.0, namespace=namespace)
+    fsw.add("plant", Plant())
+    return fsw
+
+
+class DeploymentTest(unittest.TestCase):
     def setUp(self) -> None:
-        target_mod._targets.clear()
+        reset()
         os.environ.pop("METOR_FSW_ABI_VERSION", None)
 
     def tearDown(self) -> None:
-        target_mod._targets.clear()
+        reset()
+
+    def test_bare_target_is_deployment_of_one(self) -> None:
+        bare = adcs_target().to_config()
+        reset()
+        wrapped = Deployment(targets=[adcs_target()]).to_config()
+        self.assertEqual(deploy_mod.to_config(), wrapped)
+        self.assertEqual(wrapped, {"config_version": 2, "hosts": {}, "targets": [bare]})
+
+    def test_envelope_lists_members_in_order(self) -> None:
+        a, b = member("a"), member("b")
+        config = Deployment(targets=[b, a], hosts={"a": "10.0.0.2"}).to_config()
+        self.assertEqual(
+            [t["coordinator"]["namespace"] for t in config["targets"]], ["b", "a"]
+        )
+        self.assertEqual(config["hosts"], {"a": "10.0.0.2"})
+
+    def test_deployment_of_one_needs_no_namespace(self) -> None:
+        config = Deployment(targets=[member(None)]).to_config()
+        self.assertIsNone(config["targets"][0]["coordinator"]["namespace"])
+
+    def test_members_need_distinct_namespaces(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "names a namespace"):
+            Deployment(targets=[member("a"), member(None)]).to_config()
+        with self.assertRaisesRegex(ConfigError, "namespaced `a`"):
+            Deployment(targets=[member("a"), member("a")]).to_config()
+
+    def test_hosts_name_members(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "hosts names `c`"):
+            Deployment(targets=[member("a"), member("b")], hosts={"c": "h"}).to_config()
+
+    def test_two_bare_targets_raise(self) -> None:
+        member("a")
+        member("b")
+        with self.assertRaisesRegex(ConfigError, "found 2"):
+            deploy_mod.to_config()
+
+    def test_two_deployments_raise(self) -> None:
+        Deployment(targets=[member("a")])
+        Deployment(targets=[member("b")])
+        with self.assertRaisesRegex(ConfigError, "at most one Deployment"):
+            deploy_mod.to_config()
+
+    def test_deployment_must_include_every_target(self) -> None:
+        member("a")
+        Deployment(targets=[member("b")])
+        with self.assertRaisesRegex(ConfigError, "leaves out 1 target"):
+            deploy_mod.to_config()
+
+
+class LinkTest(unittest.TestCase):
+    def setUp(self) -> None:
+        reset()
+        os.environ.pop("METOR_FSW_ABI_VERSION", None)
+
+    def tearDown(self) -> None:
+        reset()
 
     def test_publish_handle_includes_log_and_status(self) -> None:
         fsw = Target(cycle_rate=100.0)
@@ -341,7 +409,7 @@ class LinkTest(unittest.TestCase):
             ["plant.imu", "plant.log", "plant.status", "pub1.link_status", "pub1.log", "pub1.status"],
         )
         self.assertEqual(fsw.to_config(), config)
-        self.assertEqual(publish._params["link"], "")
+        self.assertNotIn("link", publish._params)
         self.assertEqual(publish._inputs, {})
 
     def test_target_config_isolation(self) -> None:

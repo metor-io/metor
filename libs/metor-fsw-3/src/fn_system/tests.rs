@@ -709,10 +709,7 @@ fn test_dynamic_parameter_port_order() {
     let declared = Output::<Imu>::def(&DefCx::empty(), "imu");
     let edges = [("nav.nav", &producer), ("imu", &declared)];
     let records = Records::of([Output::<Nav>::def(&DefCx::empty(), "nav")].iter());
-    let outputs = [crate::coordinator::OutputConfig {
-        port: "sink".into(),
-        record: Nav::NAME.into(),
-    }];
+    let outputs = [crate::coordinator::OutputConfig::record("sink", Nav::NAME)];
     let cx = DefCx {
         inputs: &edges,
         outputs: &outputs,

@@ -12,23 +12,62 @@ PACK = Pack(
     id="echo",
     lib="echo_pack",
     libs=str(Path(__file__).resolve().parent / "_libs"),
-    abi_version=6,
+    abi_version=8,
 )
 
 
 class LogEvent(Record):
     _name = "log"
+    _kind = "msg"
     _pack = PACK
 
 
 class Ping(Record):
     _name = "ping"
+    _kind = "msg"
+    _pack = PACK
+
+
+class Sample(Record):
+    _name = "sample"
+    _kind = "frame"
     _pack = PACK
 
 
 class SystemStatus(Record):
     _name = "status"
+    _kind = "frame"
     _pack = PACK
+
+
+class Sampler(System):
+    "Counts up, one sample per cycle."
+
+    _pack = PACK
+    _ty = "sampler"
+    _ports = {"sample": Sample, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self) -> None:
+        super().__init__({}, {})
+
+    sample: OutPort[Sample]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Meter(System):
+    "Pings the newest sample's value."
+
+    _pack = PACK
+    _ty = "meter"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, sample: Sources[Sample] = ()) -> None:
+        super().__init__({"sample": sample}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
 
 
 class Echo(System):
@@ -36,7 +75,7 @@ class Echo(System):
 
     _pack = PACK
     _ty = "echo"
-    _outputs = ("output",)
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, input: Sources[Ping] = ()) -> None:
         super().__init__({"input": input}, {})
@@ -51,7 +90,7 @@ class Relay(System):
 
     _pack = PACK
     _ty = "relay"
-    _outputs = ("output",)
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, input: Sources[Ping] = ()) -> None:
         super().__init__({"input": input}, {})
@@ -67,7 +106,7 @@ class Tap(System):
     _pack = PACK
     _ty = "tap"
     _takes_inputs = True
-    _outputs = ("output",)
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, items: Sequence[Item] = ()) -> None:
         super().__init__({}, {}, items=items)
@@ -82,7 +121,7 @@ class Boom(System):
 
     _pack = PACK
     _ty = "boom"
-    _outputs = ("output",)
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self) -> None:
         super().__init__({}, {})
@@ -97,7 +136,7 @@ class Gain(System):
 
     _pack = PACK
     _ty = "gain"
-    _outputs = ("output",)
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, input: Sources[Ping] = (), gain: float) -> None:
         super().__init__({"input": input}, {"gain": gain})
@@ -110,7 +149,7 @@ class Gain(System):
 class FailInput(System):
     _pack = PACK
     _ty = "fail_input"
-    _outputs = ()
+    _ports = {"log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, input: Sources[Ping] = ()) -> None:
         super().__init__({"input": input}, {})
@@ -122,7 +161,7 @@ class FailInput(System):
 class Retained(System):
     _pack = PACK
     _ty = "retained"
-    _outputs = ("output",)
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, input: Sources[Ping] = ()) -> None:
         super().__init__({"input": input}, {})

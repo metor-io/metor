@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use stellarator::net::{TcpListener, TcpStream};
 
 use crate::async_system::Stop;
-use crate::coordinator::ParamError;
+use crate::coordinator::{ParamError, PeerLink};
 
 use super::conn::Connections;
 
@@ -32,6 +32,8 @@ pub enum Transport {
     },
     /// Dial `addr`, holding one connection.
     Connect { addr: String },
+    /// Dial a link of the deployment; `metor build` turns it into `Connect`.
+    Peer(PeerLink),
 }
 
 fn max_connections() -> usize {
@@ -65,6 +67,10 @@ impl Transport {
             Self::Connect { addr } => Ok(Endpoint::Connect {
                 dialer: Dialer::new(resolve(addr)?),
             }),
+            Self::Peer(peer) => Err(ParamError::Decode(format!(
+                "peer link `{}` on target `{}` is not resolved; run `metor build`",
+                peer.link, peer.target
+            ))),
         }
     }
 }
@@ -75,6 +81,15 @@ impl Endpoint {
         match self {
             Self::Listen { slots, .. } => *slots,
             Self::Connect { .. } => 1,
+        }
+    }
+
+    /// The bound listener, for a system that accepts on it itself.
+    #[cfg(feature = "db")]
+    pub(crate) fn listener(&self) -> Option<&TcpListener> {
+        match self {
+            Self::Listen { listener, .. } => Some(listener),
+            Self::Connect { .. } => None,
         }
     }
 
@@ -175,7 +190,7 @@ async fn dial(mut dialer: Dialer, conns: Rc<Connections>, stop: Stop) {
 ///
 /// A failure is the host's, not the peer's, so it is waited out rather than
 /// retried at once.
-async fn accept(listener: &TcpListener, stop: &Stop) -> Option<TcpStream> {
+pub(crate) async fn accept(listener: &TcpListener, stop: &Stop) -> Option<TcpStream> {
     let accepted = futures_lite::future::or(async { Some(listener.accept().await) }, async {
         stop.wait().await;
         None
@@ -230,6 +245,19 @@ mod tests {
         let parsed: Transport =
             serde_json::from_str(r#"{"connect":{"addr":"127.0.0.1:2240"}}"#).expect("decodes");
         assert!(matches!(parsed, Transport::Connect { addr } if addr == "127.0.0.1:2240"));
+    }
+
+    #[test]
+    fn test_peer_transport_is_unresolved() {
+        let parsed: Transport =
+            serde_json::from_str(r#"{"peer":{"target":"a","link":"pub"}}"#).expect("peer form");
+        let Err(ParamError::Decode(message)) = parsed.bind() else {
+            panic!("a peer transport does not bind")
+        };
+        assert!(
+            message.contains("`pub`") && message.contains("metor build"),
+            "{message}"
+        );
     }
 
     #[test]

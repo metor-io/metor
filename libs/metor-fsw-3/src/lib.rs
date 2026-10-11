@@ -51,6 +51,7 @@ pub mod async_system;
 pub mod cli;
 pub mod coordinator;
 pub mod def;
+pub mod deploy;
 pub mod dl;
 pub mod fn_system;
 pub mod frame;
@@ -68,8 +69,8 @@ mod tests;
 
 pub use async_system::{AsyncSystem, Stop};
 pub use coordinator::{
-    BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, OutputConfig, ParamError,
-    Params, PortRef, Step, SystemConfig, SystemStatus, SystemTable,
+    BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, OutputConfig, OutputSource,
+    ParamError, Params, PeerLink, PeerPort, PortRef, Step, SystemConfig, SystemStatus, SystemTable,
 };
 pub use def::{DefCx, DefError, Records};
 pub use dl::{DlStep, Pack, PackError, PackFns};

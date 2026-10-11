@@ -187,10 +187,7 @@ fn test_definition_export_errors() {
     ));
 
     let cx = DefCxOwned {
-        outputs: vec![crate::OutputConfig {
-            port: "out".into(),
-            record: "gyro".into(),
-        }],
+        outputs: vec![crate::OutputConfig::record("out", "gyro")],
         ..DefCxOwned::default()
     };
     let (status, len) = system_def_raw("emit", &cx, &mut bytes);

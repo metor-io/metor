@@ -72,10 +72,7 @@ fn probe(entry: &TableEntry) -> (bool, bool) {
     let record = crate::Output::<crate::SystemStatus>::def(&DefCx::empty(), PROBE);
     let records = Records::of(core::iter::once(&record));
     let inputs = [(PROBE, &record)];
-    let outputs = [OutputConfig {
-        port: PROBE.to_string(),
-        record: record.record.to_string(),
-    }];
+    let outputs = [OutputConfig::record(PROBE, record.record.as_ref())];
     let cx = DefCx {
         inputs: &inputs,
         outputs: &outputs,

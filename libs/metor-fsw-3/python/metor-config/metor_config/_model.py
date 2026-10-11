@@ -14,11 +14,31 @@ T = TypeVar("T", bound="Record")
 class Record:
     """Marker base of a record type; a pack module declares one class per record name.
 
-    ``_name`` names the record on the host. ``_pack`` supplies its descriptor.
+    ``_name`` names the record on the host, ``_kind`` says whether it is a
+    ``"frame"`` or a ``"msg"``, and ``_pack`` supplies its descriptor.
     """
 
     _name: str = ""
+    _kind: str = "msg"
     _pack: Pack | None = None
+
+
+class LogEvent(Record):
+    """The log every system writes."""
+
+    _name = "log"
+    _kind = "msg"
+
+
+class SystemStatus(Record):
+    """The status the coordinator writes for every system."""
+
+    _name = "status"
+    _kind = "frame"
+
+
+FRAMEWORK_PORTS: dict[str, type[Record]] = {"log": LogEvent, "status": SystemStatus}
+"""The outputs every system has whatever it declared."""
 
 
 @dataclass(frozen=True)
@@ -33,10 +53,27 @@ class PortRef:
 
 
 class OutPort(Generic[T]):
-    """An output port carrying record ``T``, read off a handle returned by `Target.add`."""
+    """An output port carrying record ``T``, read off a handle returned by `Target.add`.
 
-    def __init__(self, system: str, port: str) -> None:
+    ``record`` is the port's record class and ``target`` the `Target` it is on,
+    which a deployment needs to tell two targets' `plant.imu` apart.
+    """
+
+    def __init__(
+        self, system: str, port: str, record: type[Record] | None = None, target: Any = None
+    ) -> None:
         self.ref = PortRef(system, port)
+        self.record = record
+        self.target = target
+
+    @property
+    def kind(self) -> str:
+        return self.record._kind if self.record is not None else "msg"
+
+    @property
+    def name(self) -> str:
+        """`{system}.{port}`, the name a port list gives this port."""
+        return f"{self.ref.system}.{self.ref.port}"
 
 
 class Loop(Generic[T]):
@@ -92,7 +129,7 @@ class System:
         class Nav(System):
             _pack = PACK
             _ty = "nav"
-            _outputs = ("est",)
+            _ports = {"est": Est, "log": LogEvent, "status": SystemStatus}
 
             def __init__(self, *, imu: Sources[Imu] = (), gain: float = 0.1) -> None:
                 super().__init__({"imu": imu}, {"gain": gain})
@@ -101,8 +138,7 @@ class System:
             log: OutPort[LogEvent]
             status: OutPort[SystemStatus]
 
-    `_ty` is the pack's table key, `_outputs` the ports a handle resolves
-    (`log` and `status` are outputs of every system and need not be listed).
+    `_ty` is the pack's table key, `_ports` every output with its record.
 
     A type that takes the ports its config lists sets `_takes_inputs` or
     `_takes_outputs`, and forwards `items` or `records`.
@@ -110,47 +146,68 @@ class System:
 
     _pack: Pack
     _ty: str
-    _outputs: tuple[str, ...] = ()
+    _ports: dict[str, type[Record]] = {}
     _record_packs: tuple[Pack, ...] = ()
-    _wants_target: bool = False
-    """Whether `Target.to_config` fills this system's `namespace` and `link` params."""
     _takes_inputs: bool = False
     """Whether this type takes an `items` port list of its own."""
     _takes_outputs: bool = False
     """Whether this type takes a `records` list, one output port each."""
+    _name: str = ""
+    """The instance name `Target.add` registered this system under."""
+    _target: Any = None
+    """The `Target` this system was added to."""
 
     def __init__(
         self,
         inputs: dict[str, Sources[Any]],
         params: dict[str, Any],
-        outputs: list[dict[str, str]] | None = None,
+        outputs: list[dict[str, Any]] | None = None,
         items: Sequence[Item] = (),
         records: Sequence[type[Record]] = (),
     ) -> None:
         self._inputs = {port: _sources(port, src) for port, src in inputs.items()}
-        self._inputs.update(_edges(_ports(items)))
+        self._inputs.update(_edges(_item_ports(items)))
         self._params = {name: _json(value) for name, value in params.items()}
         names = _record_names(records)
         self._dyn_outputs = list(outputs or [])
         self._dyn_outputs += [{"port": name, "record": name} for name in names]
-        self._outputs = tuple(names) + type(self)._outputs
+        self._ports = {**dict(zip(names, records)), **type(self)._ports}
         self._record_packs = tuple(
             record._pack for record in records if record._pack is not None
         )
+
+    def _port_map(self) -> dict[str, type[Record]]:
+        """Every output this instance has, with its record."""
+        return self._ports
 
     def _inputs_for(self, target: Any, index: int) -> dict[str, list[Source[Any]]]:
         """Resolve inputs for this registration without changing the system."""
         return self._inputs
 
+    def _outputs_for(self, target: Any, index: int) -> list[dict[str, Any]]:
+        """The `outputs` config entries for this registration."""
+        return self._dyn_outputs
 
-def _ports(items: Sequence[Item]) -> list[OutPort[Any]]:
+    def _params_for(self, target: Any, index: int) -> Any:
+        """The `params` config entry for this registration."""
+        return self._params or None
+
+    def port(self, source: OutPort[T]) -> OutPort[T]:
+        """This system's copy of ``source``, on a system that copies ports."""
+        return self._port(source, self._name, self._target)
+
+    def _port(self, source: OutPort[T], name: str, target: Any) -> OutPort[T]:
+        raise ConfigError(f"`{name}` copies no ports; only a Subscribe with a peer does")
+
+
+def _item_ports(items: Sequence[Item]) -> list[OutPort[Any]]:
     """Every port the items name, a handle standing for all of its own."""
     from ._target import SystemHandle
 
     ports: list[OutPort[Any]] = []
     for item in items:
         if isinstance(item, SystemHandle):
-            ports.extend(OutPort(item._name, port) for port in item._outputs)
+            ports.extend(getattr(item, port) for port in item._system._port_map())
         elif isinstance(item, OutPort):
             ports.append(item)
         else:
@@ -162,7 +219,7 @@ def _edges(ports: Sequence[OutPort[Any]]) -> dict[str, list[Source[Any]]]:
     """One input per port, named `{producer}.{port}`, first mention winning."""
     edges: dict[str, list[Source[Any]]] = {}
     for port in ports:
-        edges.setdefault(f"{port.ref.system}.{port.ref.port}", [port])
+        edges.setdefault(port.name, [port])
     return edges
 
 
