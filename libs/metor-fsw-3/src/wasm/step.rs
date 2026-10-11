@@ -11,17 +11,21 @@ use crate::mirror::{Corrupt, Mirrors};
 use crate::pack::Status;
 
 use super::guest::{Guest, Trap};
+use super::io::IoCopy;
 
 /// A system instance running in its own wasm guest.
 ///
 /// Each cycle, it copies new records from the real input rings into the
 /// guest's copies, calls `metor_fsw_execute`, and then copies the guest's
 /// output records into the real output rings. Outputs are copied even if the
-/// call failed.
+/// call failed. A system with a `Cap` also has its IO buffer bytes copied
+/// around the call.
 pub struct WasmStep {
     /// Must be declared before `guest`, because dropping these handles writes
     /// into guest memory.
     mirrors: Mirrors<NoWake>,
+    /// Declared before `guest`, since it reads guest memory.
+    io: Option<IoCopy>,
     guest: Guest,
     instance: u32,
     fuel: u64,
@@ -29,9 +33,16 @@ pub struct WasmStep {
 }
 
 impl WasmStep {
-    pub(super) fn new(mirrors: Mirrors<NoWake>, guest: Guest, instance: u32, fuel: u64) -> Self {
+    pub(super) fn new(
+        mirrors: Mirrors<NoWake>,
+        io: Option<IoCopy>,
+        guest: Guest,
+        instance: u32,
+        fuel: u64,
+    ) -> Self {
         Self {
             mirrors,
+            io,
             guest,
             instance,
             fuel,
@@ -46,9 +57,15 @@ impl Step for WasmStep {
             return;
         }
         let fed = self.mirrors.drain_inputs();
+        let read = self.io.as_mut().map_or(Ok(()), IoCopy::completions);
         let result = self.guest.execute(self.instance, now.0, self.fuel);
+        let written = self.io.as_mut().map_or(Ok(()), IoCopy::submissions);
         let taken = self.mirrors.drain_outputs();
-        if let Some(end) = end_of(fed.and(taken), result) {
+        let end = match read.and(written) {
+            Ok(()) => end_of(fed.and(taken), result),
+            Err(_) => Some(corrupt_table()),
+        };
+        if let Some(end) = end {
             if let Some((kind, message)) = end.line {
                 self.mirrors.write_line(now, LogLevel::Error, kind, message);
             }
@@ -83,6 +100,12 @@ impl End {
             line: Some((kind, message)),
         }
     }
+}
+
+/// The end of a step whose guest's buffer table did not match its mirror.
+fn corrupt_table() -> End {
+    let reason = EndReason::Failed(Cow::Borrowed("corrupt table"));
+    End::host(reason, "corrupt", "a guest's buffer table is corrupt")
 }
 
 /// Decides whether one cycle ended the step.

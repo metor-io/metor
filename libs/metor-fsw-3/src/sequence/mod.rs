@@ -90,7 +90,7 @@ use metor_fsw_3_ring::NoWake;
 use crate::channel::{ABORT_PORT, AbortRequest};
 use crate::coordinator::{SystemKind, TableEntry, bindings, refuse_thread};
 use crate::def::{DefCx, DefError};
-use crate::fn_system::{Ctor, InSet, OutSet, Param, Ports};
+use crate::fn_system::{Ctor, Defs, InSet, OutSet, Param, Ports};
 use crate::port::Input;
 use crate::system::{SystemDef, SystemInputs, SystemOutputs};
 
@@ -147,6 +147,7 @@ pub fn def<S: SequenceFn>(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         name: S::NAME.into(),
         inputs,
         outputs: OutSet::<S>::defs(cx)?,
+        grants: Defs::of::<S>(cx)?.grants,
     })
 }
 
@@ -164,9 +165,15 @@ pub(crate) fn entry<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
         schema: C::schema(),
         make: std::sync::Arc::new(move |cx| {
             refuse_thread(cx.adapter)?;
-            let state = ctor.make(cx.params)?;
+            let instance = crate::fn_system::Instance::of(&cx);
             let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
-            Ok(Box::new(SequenceStep::new::<S>(state, views, writers)))
+            let mut views = views.into_iter();
+            // PANIC Safety: `def` declares `abort` first, and build binds one
+            // list per declared input.
+            let abort = Input::new(views.next().expect("the abort binding").views);
+            let (ins, outs, io) = crate::fn_system::bind::<S>(views.collect(), writers, instance)?;
+            let state = crate::fn_system::make_state(&ctor, cx.id, cx.params, io.as_ref())?;
+            Ok(Box::new(SequenceStep::new::<S>(state, abort, ins, outs)))
         }),
     })
 }

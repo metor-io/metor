@@ -22,8 +22,8 @@ mod tests;
 #[cfg(feature = "host")]
 pub(crate) use build::{instance_def, status_def};
 pub use config::{
-    Adapter, ChannelConfig, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig,
-    OutputConfig, OutputSource, PeerLink, PeerPort, PortRef, RunState, SystemConfig,
+    Adapter, BuildOptions, ChannelConfig, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH,
+    InputConfig, OutputConfig, OutputSource, PeerLink, PeerPort, PortRef, RunState, SystemConfig,
 };
 pub use error::BuildError;
 pub use params::{ParamError, Params};

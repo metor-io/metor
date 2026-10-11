@@ -169,7 +169,10 @@ async fn run(inbox: Arc<Inbox>, stop: Stop) {
 ///
 /// A panic in the system's constructor becomes a `ParamError`, so it does not
 /// take down the group's thread.
-fn build(launch: Box<dyn Launch>, stop: Stop) -> Result<crate::async_system::Running, ParamError> {
+pub(super) fn build(
+    launch: Box<dyn Launch>,
+    stop: Stop,
+) -> Result<crate::async_system::Running, ParamError> {
     match std::panic::catch_unwind(AssertUnwindSafe(|| launch.launch(stop))) {
         Ok(result) => result,
         Err(payload) => {
@@ -182,7 +185,7 @@ fn build(launch: Box<dyn Launch>, stop: Stop) -> Result<crate::async_system::Run
 
 /// Runs one system. If it panics, the panic is caught and reported to its
 /// adapter.
-async fn task(running: crate::async_system::Running, panicked: Panicked) {
+pub(super) async fn task(running: crate::async_system::Running, panicked: Panicked) {
     let caught = std::panic::AssertUnwindSafe(running).catch_unwind().await;
     if let Err(payload) = caught {
         let message = crate::panic::message(&*payload).to_string();

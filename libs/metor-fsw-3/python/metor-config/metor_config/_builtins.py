@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence, TypeVar
 
 from ._config import ABI_VERSION, ConfigError, check_abi
+from ._io import IO_RECORDS
 from ._model import (
     FRAMEWORK_PORTS,
     Item,
@@ -131,7 +132,8 @@ class Sink(Link):
         if not self._all:
             return self._inputs
         earlier = [target._handles[name] for name, _, _ in target._systems[:index]]
-        return _edges(_item_ports(self._items) + _item_ports(earlier))
+        ports = [p for p in _item_ports(earlier) if p.record is None or p.record._name not in IO_RECORDS]
+        return _edges(_item_ports(self._items) + ports)
 
 
 class Publish(Sink):

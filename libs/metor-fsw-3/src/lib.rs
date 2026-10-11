@@ -150,6 +150,7 @@ pub mod deploy;
 pub mod dl;
 pub mod fn_system;
 pub mod frame;
+pub mod io;
 #[cfg(feature = "host")]
 pub mod link;
 pub mod log;
@@ -159,6 +160,7 @@ pub mod pack;
 mod panic;
 pub mod port;
 pub mod record;
+mod rng;
 pub mod sequence;
 pub mod system;
 pub mod thread;
@@ -184,6 +186,7 @@ pub use fn_system::{
     AsyncSystemFn, Ctor, Cycle, FnSystem, InSet, OutSet, Param, ParamNames, Ports, SystemFn,
 };
 pub use frame::Frame;
+pub use io::{Buf, Cap, Handle, Io, IoInit, Pending, ResourceStatus, Slot};
 #[cfg(feature = "host")]
 pub use link::{LinkStatus, Transport};
 pub use log::{Log, LogLayer};
@@ -195,6 +198,7 @@ pub use port::{
     DynInputs, DynOutputs, Input, Latest, Output, RecvError, Sample, SendError, ring_capacity,
 };
 pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Record, RecordSchema};
+pub use rng::Rng;
 pub use sequence::{OnAbort, Redline, Seq, SeqError, SequenceFn};
 pub use system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,

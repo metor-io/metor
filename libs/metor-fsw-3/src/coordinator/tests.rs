@@ -105,6 +105,7 @@ fn coordinator(entries: Vec<Entry>, rings: Vec<RingBuffer>) -> Coordinator {
         entries,
         clock: Clock::Simulated {
             dt: std::time::Duration::from_millis(1),
+            epoch: None,
         },
         epoch: Timestamp(0),
         cycle: 0,

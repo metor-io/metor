@@ -24,6 +24,7 @@ use nox::{ArrayRepr, Quaternion, Vector};
 mod environment;
 mod frames;
 mod mtq;
+pub mod novatel;
 mod orbit;
 mod params;
 mod pointing;

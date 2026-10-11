@@ -26,6 +26,23 @@ use crate::coordinator::{
     BuildError, CoordinatorConfig, InputConfig, SystemConfig, SystemStatus, SystemTable,
 };
 
+/// Sends `cmd` on its cap whenever its buffer is idle.
+pub struct Uplink(crate::io::Slot<crate::io::Send>);
+
+impl Uplink {
+    pub fn new(io: &crate::io::IoInit<'_>) -> Self {
+        Self(crate::io::Slot::Idle(io.alloc_from(b"cmd")))
+    }
+}
+
+#[crate::system]
+fn uplink(#[state] s: &mut Uplink, udp: &crate::io::Cap<crate::io::Udp>) {
+    let _ = s.0.poll();
+    if let Some(buf) = s.0.take_idle() {
+        s.0 = crate::io::Slot::Busy(udp.send(buf));
+    }
+}
+
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
 #[frame(name = "imu")]
 #[repr(C)]
@@ -298,7 +315,7 @@ async fn next(imu: &mut Input<Imu, Notifier>, stop: &Stop) -> Option<Imu> {
 }
 
 /// Returns this thread's ID, hashed into a number a frame can carry.
-fn thread_id() -> u64 {
+pub fn thread_id() -> u64 {
     use core::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::thread::current().id().hash(&mut hasher);
@@ -377,6 +394,7 @@ pub fn table(recorder: &Recorder) -> SystemTable {
             panic!("a constructor that panics")
         })?;
         table.register_async("who_am_i", who_am_i(), Default::default)?;
+        table.register("uplink", uplink(), Uplink::new)?;
         Ok(())
     };
     register().expect("valid records");

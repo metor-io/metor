@@ -597,6 +597,9 @@ fn test_async_adapter_relay() {
         inputs: vec![vec![&imu]],
         outputs: vec![&nav, &log],
         threads: &mut threads,
+        io: &crate::io::SharedIo::default(),
+        seed: Some(0),
+        namespace: "",
     })
     .expect("no params");
 
@@ -770,6 +773,9 @@ fn flooded(a: usize, b: usize, cycles: i64) -> Vec<LogEvent> {
         inputs: Vec::new(),
         outputs: vec![&ring_a, &ring_b, &log],
         threads: &mut threads,
+        io: &crate::io::SharedIo::default(),
+        seed: Some(0),
+        namespace: "",
     })
     .expect("no params");
     let mut seen = Vec::new();
@@ -840,4 +846,145 @@ fn test_outputs_share_one_counter() {
         .collect();
     let set = OutSet::<TwoOutputs>::bind(bindings);
     assert_eq!(std::sync::Arc::strong_count(&set.dropped), 3);
+}
+
+type Draws = Rc<RefCell<Vec<(String, u64)>>>;
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct Tagged {
+    tag: String,
+}
+
+struct Drawer {
+    tag: String,
+    seen: Draws,
+}
+
+/// Records one draw a cycle, under its tag.
+#[crate::system]
+fn drawer(#[state] s: &mut Drawer, rng: &mut crate::Rng) {
+    s.seen.borrow_mut().push((s.tag.clone(), rng.next_u64()));
+}
+
+#[crate::system]
+async fn async_drawer(rng: &mut crate::Rng, stop: Stop) {
+    let _ = (rng.next_u64(), stop);
+}
+
+fn drawer_table(seen: &Draws) -> SystemTable {
+    let mut table = SystemTable::new();
+    let seen = seen.clone();
+    let make = move |p: Tagged| Drawer {
+        tag: p.tag,
+        seen: seen.clone(),
+    };
+    table.register("drawer", drawer(), make).expect("valid");
+    table
+}
+
+fn drawers(seed: u64, namespace: Option<&str>, ids: &[&str], cycles: i64) -> Vec<(String, u64)> {
+    let seen = Draws::default();
+    let systems = ids.iter().map(|id| SystemConfig {
+        params: json!({ "tag": id }),
+        ..SystemConfig::new(*id, "drawer")
+    });
+    let config = CoordinatorConfig {
+        systems: systems.collect(),
+        seed,
+        namespace: namespace.map(Into::into),
+        ..Default::default()
+    };
+    let mut coordinator = config.build(&drawer_table(&seen)).expect("valid");
+    (0..cycles).for_each(|t| coordinator.step(Timestamp(t)));
+    seen.take()
+}
+
+fn first(draws: &[(String, u64)], tag: &str) -> Vec<u64> {
+    let mine = draws.iter().filter(|(t, _)| t == tag);
+    mine.map(|(_, d)| *d).collect()
+}
+
+#[test]
+fn test_rng_draws_from_the_target_seed_and_name() {
+    let draws = drawers(7, None, &["a"], 2);
+    let mut want = crate::Rng::seeded(7, "a");
+    assert_eq!(first(&draws, "a"), [want.next_u64(), want.next_u64()]);
+    let named = drawers(7, Some("t"), &["a"], 1);
+    assert_eq!(
+        first(&named, "a"),
+        [crate::Rng::seeded(7, "t.a").next_u64()]
+    );
+    assert_eq!(drawers(7, None, &["a"], 3), drawers(7, None, &["a"], 3));
+}
+
+#[test]
+fn test_rng_streams_are_per_instance() {
+    let two = drawers(7, None, &["a", "b"], 3);
+    assert_ne!(first(&two, "a"), first(&two, "b"));
+    let three = drawers(7, None, &["a", "b", "c"], 3);
+    assert_eq!(
+        first(&two, "a"),
+        first(&three, "a"),
+        "a new system leaves a alone"
+    );
+    assert_eq!(first(&two, "b"), first(&three, "b"));
+    assert_ne!(first(&two, "a"), first(&drawers(8, None, &["a"], 3), "a"));
+}
+
+#[test]
+fn test_rng_without_a_seed_fails_the_make() {
+    let seen = Draws::default();
+    let table = drawer_table(&seen);
+    let entry = table.get("drawer").expect("registered");
+    let def = entry.def.clone();
+    let log = ring::<LogEvent>(4, 1);
+    let mut threads = crate::thread::Threads::new();
+    let made = (entry.make)(crate::coordinator::MakeCx {
+        id: "d",
+        adapter: None,
+        def: &def,
+        params: crate::coordinator::Params(&json!({ "tag": "d" })),
+        inputs: Vec::new(),
+        outputs: vec![&log],
+        threads: &mut threads,
+        io: &crate::io::SharedIo::default(),
+        seed: None,
+        namespace: "",
+    });
+    let err = made.err();
+    assert!(
+        matches!(&err, Some(crate::coordinator::ParamError::GuestRng { system }) if system == "d"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn test_rng_on_an_async_system_is_refused() {
+    let mut table = SystemTable::new();
+    let err = table.register_async("d", async_drawer(), || ()).err();
+    let refused = |e: &BuildError| {
+        matches!(
+            e,
+            BuildError::Def {
+                source: DefError::RngOnAsync { .. },
+                ..
+            }
+        )
+    };
+    assert!(err.as_ref().is_some_and(refused), "{err:?}");
+}
+
+#[test]
+fn test_seed_is_left_out_when_zero() {
+    let config = CoordinatorConfig::default();
+    let json = serde_json::to_value(&config).expect("encodes");
+    assert!(json.get("seed").is_none());
+    let decoded: CoordinatorConfig = serde_json::from_value(json).expect("decodes");
+    assert_eq!(decoded.seed, 0);
+    let seeded = CoordinatorConfig {
+        seed: 7,
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&seeded).expect("encodes");
+    assert_eq!(json["seed"], 7);
 }

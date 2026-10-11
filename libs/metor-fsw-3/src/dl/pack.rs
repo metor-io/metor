@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use libloading::Library;
-use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
 use crate::coordinator::{EndReason, ParamError, Step};
@@ -30,6 +29,7 @@ type CreateFn = unsafe extern "C" fn(
     RawSlice,
     RawSlice,
     RawSlice,
+    *mut RawRing,
     *mut RawSlice,
 ) -> *mut c_void;
 type ExecuteFn = unsafe extern "C" fn(*mut c_void, i64) -> u32;
@@ -181,14 +181,15 @@ impl DlPack {
     /// Creates one instance of type `ty` on the given rings.
     ///
     /// `instance` has the definition the host resolved, including any ports the
-    /// config added, and the instance's adapter.
+    /// config added, and the instance's adapter. `table` is the system's IO
+    /// region in, and the region the pack uses out; see `pack::create`.
     pub fn create(
         &self,
         ty: &str,
         params: &serde_json::Value,
         instance: &Instance,
-        inputs: &[Vec<&RingBuffer>],
-        outputs: &[&RingBuffer],
+        (inputs, outputs): super::Ports<'_>,
+        table: &mut RawRing,
     ) -> Result<DlStep, ParamError> {
         let (params, def) = encode_instance(params, instance)?;
         let input_owners: Vec<Vec<_>> = inputs
@@ -213,6 +214,7 @@ impl DlPack {
                 RawSlice::of(&def),
                 RawSlice::of(&ports),
                 RawSlice::of(&outs),
+                table,
                 &raw mut error,
             )
         };

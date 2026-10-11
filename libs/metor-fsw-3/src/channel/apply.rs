@@ -11,6 +11,8 @@ pub struct State {
     pub ended: bool,
     /// Whether the system has an `abort` input.
     pub abortable: bool,
+    /// Whether a reset or load waits for the system's ops in flight.
+    pub quiescing: bool,
 }
 
 /// A channel command, without its payload.
@@ -46,6 +48,8 @@ pub enum Refusal {
     Ended,
     #[error("the system takes no abort")]
     NotAbortable,
+    #[error("the system is quiescing")]
+    Quiescing,
 }
 
 /// Checks whether a channel in `state` accepts `command`.
@@ -55,6 +59,10 @@ pub enum Refusal {
 pub fn apply(state: State, command: Command) -> Result<(), Refusal> {
     let live = state.run == RunState::Running && !state.ended;
     match command {
+        Command::Start | Command::Load | Command::Abort if state.quiescing => {
+            Err(Refusal::Quiescing)
+        }
+        Command::Stop | Command::Reset if state.quiescing => Ok(()),
         Command::Start if state.ended => Err(Refusal::Ended),
         Command::Start if live => Err(Refusal::Running),
         Command::Stop | Command::Abort if state.ended => Err(Refusal::Ended),
@@ -82,7 +90,18 @@ mod tests {
             run,
             ended,
             abortable: true,
+            quiescing: false,
         }
+    }
+
+    #[test]
+    fn test_quiescing_takes_only_stop_and_reset() {
+        let quiescing = State {
+            quiescing: true,
+            ..state(RunState::Stopped, false)
+        };
+        assert_eq!(accepted(quiescing), [Command::Stop, Command::Reset]);
+        assert_eq!(apply(quiescing, Command::Start), Err(Refusal::Quiescing));
     }
 
     fn accepted(state: State) -> Vec<Command> {
@@ -162,18 +181,23 @@ mod proofs {
             },
             ended: kani::any(),
             abortable: kani::any(),
+            quiescing: kani::any(),
         }
     }
 
     /// A live channel accepts only `Stop` and `Abort`, and a channel that is
     /// not live never accepts them. So `Reset` and `Load` never apply to a
-    /// running system.
+    /// running system. A quiescing channel accepts only `Stop` and `Reset`.
     #[kani::proof]
     fn test_live_channel_transitions() {
         let state = any_state();
         let command = any_command();
         let live = state.run == RunState::Running && !state.ended;
         if apply(state, command).is_ok() {
+            if state.quiescing {
+                assert!(matches!(command, Command::Stop | Command::Reset));
+                return;
+            }
             let leaves = matches!(command, Command::Stop | Command::Abort);
             assert_eq!(leaves, live);
         }

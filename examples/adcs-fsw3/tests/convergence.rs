@@ -122,7 +122,8 @@ fn manifest() -> &'static Path {
 }
 
 /// Returns `sim.py`'s coordinator on a simulated clock, with the recorders added
-/// and the publish link removed so the runs don't contend for its port.
+/// and the publish link and db removed so the runs don't contend for their
+/// ports.
 ///
 /// `prepare` stages the packs and holds them open, so it runs once per process.
 fn config() -> &'static CoordinatorConfig {
@@ -141,8 +142,11 @@ fn evaluate() -> CoordinatorConfig {
         .coordinator;
     config.clock = Clock::Simulated {
         dt: Duration::from_secs_f64(DT),
+        epoch: None,
     };
-    config.systems.retain(|system| system.ty != "fsw.publish");
+    config
+        .systems
+        .retain(|system| !["fsw.publish", "fsw.db"].contains(&system.ty.as_str()));
     config.systems.push(SystemConfig {
         inputs: vec![
             input("body", PortRef::new("plant", "body")),

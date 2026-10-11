@@ -89,6 +89,15 @@ pub enum DefError {
 
     #[error("async system `{system}` takes a `Sample`, which only a stepped system takes")]
     SampleOnAsync { system: String },
+
+    #[error("async system `{system}` takes a `Cap`, which only a stepped system takes")]
+    IoOnAsync { system: String },
+
+    #[error("async system `{system}` takes an `Rng`, which only a stepped system takes")]
+    RngOnAsync { system: String },
+
+    #[error("`{system}` takes a `Cap`; register it with `register` or `register_sequence`")]
+    IoOnTraitPath { system: String },
 }
 
 /// Every record a system table knows about, looked up by name.

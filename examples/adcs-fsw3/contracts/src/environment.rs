@@ -49,6 +49,43 @@ pub fn mag_field_eci(model: &mut MagneticModel, epoch: Epoch, pos_eci: &V3) -> V
     ecef_to_eci(epoch).dot(&b_ecef)
 }
 
+/// Earth's rotation rate about the ECI z axis (rad/s).
+const EARTH_RATE: f64 = 7.292_115_146_7e-5;
+/// Seconds in a GPS week.
+const WEEK: f64 = 604_800.0;
+
+/// Converts an ECI position and velocity at `epoch` to ECEF. The velocity is
+/// relative to the rotating Earth.
+pub fn eci_to_ecef_state(epoch: Epoch, pos_eci: &V3, vel_eci: &V3) -> (V3, V3) {
+    let r = eci_to_ecef(epoch);
+    let carried = earth_rate().cross(pos_eci);
+    (r.dot(pos_eci), r.dot(&(*vel_eci - carried)))
+}
+
+/// Converts an ECEF position and velocity at `epoch` to ECI, the inverse of
+/// [`eci_to_ecef_state`].
+pub fn ecef_to_eci_state(epoch: Epoch, pos_ecef: &V3, vel_ecef: &V3) -> (V3, V3) {
+    let r = ecef_to_eci(epoch);
+    let pos = r.dot(pos_ecef);
+    (pos, r.dot(vel_ecef) + earth_rate().cross(&pos))
+}
+
+fn earth_rate() -> V3 {
+    V3::from_buf([0.0, 0.0, EARTH_RATE])
+}
+
+/// Returns `epoch` as a GPS week and seconds into it, to the millisecond.
+pub fn gps_time(epoch: Epoch) -> (u32, f64) {
+    let ms = (epoch.to_gpst_seconds() * 1e3).round();
+    let week = (ms / (WEEK * 1e3)).floor();
+    (week as u32, (ms - week * WEEK * 1e3) / 1e3)
+}
+
+/// Returns the epoch of a GPS week and seconds into it.
+pub fn gps_epoch(week: u32, seconds: f64) -> Epoch {
+    Epoch::from_gpst_seconds(f64::from(week) * WEEK + seconds)
+}
+
 /// Returns the UTC epoch at simulated time zero, fixed so simulated runs repeat exactly.
 pub fn target_epoch() -> Epoch {
     Epoch::from_gregorian_utc(2024, 1, 1, 0, 0, 0, 0)
@@ -156,5 +193,33 @@ mod tests {
             (alt - (radius - WGS84_A)).abs() < 1.0,
             "recovered altitude within 1 m of |r| - a: {alt}"
         );
+    }
+
+    #[test]
+    fn state_round_trips_through_ecef() {
+        let epoch = epoch_at(1234.5);
+        let (pos, vel) = (
+            V3::from_buf([6.8e6, 1.0e5, -2.0e5]),
+            V3::from_buf([10.0, 7600.0, 5.0]),
+        );
+        let (pos_e, vel_e) = eci_to_ecef_state(epoch, &pos, &vel);
+        let (pos_i, vel_i) = ecef_to_eci_state(epoch, &pos_e, &vel_e);
+        assert!(norm(pos_i - pos) < 1e-6);
+        assert!(norm(vel_i - vel) < 1e-9);
+        assert!(norm(vel_e - vel) > 400.0, "the Earth's rotation is carried");
+    }
+
+    #[test]
+    fn gps_time_round_trips_to_the_millisecond() {
+        let epoch = epoch_at(98.765_4);
+        let (week, seconds) = gps_time(epoch);
+        assert_eq!(week, 2295);
+        let back = gps_epoch(week, seconds);
+        assert!((back - epoch).to_seconds().abs() <= 5e-4);
+        assert_eq!(gps_time(back), (week, seconds));
+    }
+
+    fn norm(v: V3) -> f64 {
+        v.norm().into_buf()
     }
 }

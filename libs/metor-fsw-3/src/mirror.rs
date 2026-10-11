@@ -236,13 +236,17 @@ fn drop_fields<'a>(ports: impl Iterator<Item = &'a Cow<'static, str>>) -> Fields
 
 /// Returns the config for a mirror ring and the length of its region.
 ///
-/// The mirror has one reader and `factor` times the capacity of the
+/// The mirror has `readers` readers and `factor` times the capacity of the
 /// `capacity`-byte ring it copies.
-pub(crate) fn mirror_config(capacity: usize, factor: usize) -> Result<(Config, usize), ParamError> {
+pub(crate) fn mirror_config(
+    capacity: usize,
+    factor: usize,
+    readers: usize,
+) -> Result<(Config, usize), ParamError> {
     let too_large = ParamError::MirrorTooLarge { capacity };
     let config = Config {
         capacity: capacity.checked_mul(factor).ok_or(too_large.clone())?,
-        max_readers: 1,
+        max_readers: readers,
     };
     let len = metor_fsw_3_ring::checked_region_len(&config).ok_or(too_large)?;
     Ok((config, len))
@@ -358,6 +362,7 @@ pub(crate) mod tests {
             name: "nav".into(),
             inputs: Vec::new(),
             outputs: Vec::new(),
+            grants: Vec::new(),
         };
         let mut mirrors = Mirrors::new(&def, vec![mirror(&real, &copy)], Vec::new());
         assert!(real.view(NoWake).is_err());
@@ -368,13 +373,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_mirror_takes_its_readers() {
+        let config = |readers| mirror_config(64, 4, readers).unwrap().0;
+        let two = RingBuffer::create_in_memory(config(2));
+        let _first = two.view(NoWake).unwrap();
+        assert!(two.view(NoWake).is_ok(), "a second reader");
+        let one = RingBuffer::create_in_memory(config(1));
+        let _first = one.view(NoWake).unwrap();
+        assert!(one.view(NoWake).is_err(), "only one");
+    }
+
+    #[test]
     fn test_reject_oversize_mirror() {
-        assert!(mirror_config(64, 4).is_ok());
+        assert!(mirror_config(64, 4, 1).is_ok());
         // A capacity that is not a valid ring size once multiplied by four,
         // and one whose multiple overflows.
         for capacity in [3, usize::MAX / 2] {
             assert_eq!(
-                mirror_config(capacity, 4).err(),
+                mirror_config(capacity, 4, 1).err(),
                 Some(ParamError::MirrorTooLarge { capacity })
             );
         }

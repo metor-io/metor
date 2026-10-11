@@ -168,6 +168,7 @@ name = "adcs-systems-3"
 version = "0.14.2"
 dependencies = [
  "adcs-contracts-3",
+ "futures-lite 2.6.1",
  "metor-adcs",
  "metor-fsw-3",
  "nox",
@@ -9651,6 +9652,7 @@ dependencies = [
  "clap 4.6.3",
  "cordyceps",
  "futures-lite 2.6.1",
+ "io-uring",
  "libc",
  "libloading",
  "maitake-sync 0.1.2",
@@ -9662,6 +9664,7 @@ dependencies = [
  "metor-proto-stellar",
  "metor-proto-wkt",
  "minijinja",
+ "polling",
  "postcard",
  "postcard-schema",
  "schemars 1.2.1",

@@ -41,7 +41,8 @@ impl From<FrameField> for Field {
     }
 }
 
-/// The struct being derived, with its fields and `#[frame(name = "..")]`.
+/// The struct being derived, with its fields, `#[frame(name = "..")]`, and
+/// `#[frame(depth = N)]`.
 #[derive(FromDeriveInput)]
 #[darling(attributes(frame), supports(struct_named))]
 struct FrameInput {
@@ -49,6 +50,7 @@ struct FrameInput {
     generics: Generics,
     data: ast::Data<(), FrameField>,
     name: Option<String>,
+    depth: Option<usize>,
 }
 
 /// Expands `#[derive(Frame)]`.
@@ -77,6 +79,9 @@ pub fn frame(input: TokenStream) -> TokenStream {
         .name
         .unwrap_or_else(|| raw.ident.to_string().to_case(Case::Snake));
     let frame_id = quote! { #proto::types::ComponentId::new(#frame_name) };
+    let depth = raw
+        .depth
+        .map(|depth| quote! { const DEPTH: usize = #depth; });
 
     let timestamp_body = match fields.iter().find(|f| f.timestamp) {
         Some(f) => {
@@ -119,6 +124,7 @@ pub fn frame(input: TokenStream) -> TokenStream {
             const NAME: &'static str = #frame_name;
             const MAX_LEN: usize = ::core::mem::size_of::<Self>();
             const ALIGN: usize = ::core::mem::align_of::<Self>();
+            #depth
             type Read<'a> = &'a Self where Self: 'a;
             fn encode<'a>(&'a self, _buf: &'a mut [u8])
                 -> Result<&'a [u8], #fsw::EncodeError> {

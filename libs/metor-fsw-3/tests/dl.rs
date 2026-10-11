@@ -3,6 +3,10 @@
 
 mod common;
 
+#[path = "fixtures/echo-pack/src/gps.rs"]
+#[allow(dead_code)]
+mod gps;
+
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -148,11 +152,27 @@ fn test_pack_reports_system_metadata() {
             "gain",
             "fail_input",
             "retained",
+            "gps",
+            "uart_script",
+            "chatter",
+            "reader",
+            "grower",
+            "until_fix",
             "count_up",
             "count_down",
             "count_by"
         ]
     );
+
+    let gps = pack
+        .descriptor()
+        .systems
+        .iter()
+        .find(|s| s.ty == "gps")
+        .expect("gps");
+    let grant = &gps.def.grants[..];
+    assert_eq!(grant.len(), 1);
+    assert_eq!((&*grant[0].param, &*grant[0].interface), ("uart", "uart"));
 
     let tap = pack
         .descriptor()
@@ -365,4 +385,275 @@ fn test_guest_ports_survive_pack_drop() {
     // SAFETY: as above. A second call checks that both TLS handles were
     // released.
     assert_eq!(unsafe { release() }, 0);
+}
+
+mod io {
+    use metor_fsw_3::coordinator::{CoordinatorConfig, SystemConfig};
+
+    use super::*;
+    use crate::gps;
+
+    type Fixes = Rc<RefCell<usize>>;
+
+    #[system]
+    fn fixes(#[state] seen: &mut Fixes, fix: &mut Input<gps::Gps>) {
+        *seen.borrow_mut() += fix.drain().count();
+    }
+
+    fn io_table(pack: &Arc<Pack>, fixes_seen: &Fixes) -> SystemTable {
+        let mut table = SystemTable::new();
+        metor_fsw_3::link::register_builtins(&mut table).unwrap();
+        table.register_pack("echo", pack.clone()).unwrap();
+        table
+            .register("uart_script", gps::uart_script(), gps::UartScript::new)
+            .unwrap();
+        table
+            .register("gps", gps::gps(), gps::GpsState::new)
+            .unwrap();
+        let seen = fixes_seen.clone();
+        table
+            .register("fixes", fixes(), move || seen.clone())
+            .unwrap();
+        table
+    }
+
+    /// `tests/golden/sim.py`'s target: echo-pack's `gps` driver on a sim
+    /// serial port, served by a host model.
+    fn sim_target() -> CoordinatorConfig {
+        let mut config: CoordinatorConfig =
+            serde_json::from_str(include_str!("golden/sim.json")).unwrap();
+        config.systems[2].ty = "uart_script".into();
+        config.systems.push(SystemConfig {
+            inputs: vec![InputConfig::new("fix", "gps", "fix")],
+            ..SystemConfig::new("fixes", "fixes")
+        });
+        config
+    }
+
+    #[test]
+    fn dylib_driver_reads_the_wire() {
+        let pack = open();
+        let seen = Fixes::default();
+        let mut c = sim_target().build(&io_table(&pack, &seen)).unwrap();
+        for t in 1..6 {
+            c.step(Timestamp(t));
+        }
+        assert_eq!(c.latched().count(), 0);
+        assert!(*seen.borrow() > 0, "the dylib driver read a fix");
+    }
+
+    #[test]
+    fn wasm_driver_reads_the_wire() {
+        let pack = Arc::new(Pack::Wasm(common::open_wasm()));
+        let seen = Fixes::default();
+        let mut c = sim_target().build(&io_table(&pack, &seen)).unwrap();
+        for t in 1..6 {
+            c.step(Timestamp(t));
+        }
+        let ended: Vec<_> = c.ended().collect();
+        assert!(ended.is_empty(), "{ended:?}");
+        assert!(*seen.borrow() > 0, "the guest's read bytes reached it");
+    }
+
+    fn model_serves_a_host_driver(pack: Arc<Pack>) {
+        let seen = Fixes::default();
+        let mut config = sim_target();
+        config.systems[0].ty = "gps".into();
+        config.systems[2].ty = "echo.uart_script".into();
+        let mut c = config.build(&io_table(&pack, &seen)).unwrap();
+        for t in 1..6 {
+            c.step(Timestamp(t));
+        }
+        let ended: Vec<_> = c.ended().collect();
+        assert!(ended.is_empty(), "{ended:?}");
+        assert!(*seen.borrow() > 0, "the guest model wrote the driver's fix");
+    }
+
+    #[test]
+    fn dylib_model_serves_a_host_driver() {
+        model_serves_a_host_driver(open());
+    }
+
+    #[test]
+    fn wasm_model_serves_a_host_driver() {
+        model_serves_a_host_driver(Arc::new(Pack::Wasm(common::open_wasm())));
+    }
+}
+
+/// A guest's `Reset` waits for its ops in flight, as a host system's does.
+mod quiesce {
+    use metor_fsw_3::coordinator::{Adapter, ChannelConfig, CoordinatorConfig, RunState};
+    use metor_fsw_3::io::ResourceStatus;
+    use metor_fsw_3::metor_proto_wkt::{
+        SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
+    };
+    use metor_fsw_3::{ChannelState, ChannelStatus};
+
+    use super::*;
+    use crate::gps;
+
+    type Log<T> = Rc<RefCell<Vec<(i64, T)>>>;
+
+    #[system]
+    fn states(#[state] seen: &mut Log<u32>, now: Timestamp, st: &mut Input<ChannelStatus>) {
+        let got = st.drain().flatten().map(|s| (now.0, s.state));
+        seen.borrow_mut().extend(got);
+    }
+
+    #[system]
+    fn statuses(#[state] seen: &mut Log<u64>, now: Timestamp, st: &mut Input<ResourceStatus>) {
+        let got = st.drain().flatten().map(|s| (now.0, s.submitted));
+        seen.borrow_mut().extend(got);
+    }
+
+    /// Keeps each failure's reason.
+    #[system]
+    fn failures(
+        #[state] seen: &mut Rc<RefCell<Vec<String>>>,
+        events: &mut Input<SequenceChannelEvent>,
+    ) {
+        for event in events.drain().flatten() {
+            if let SequenceEventKind::Failed { reason } = event.kind {
+                seen.borrow_mut().push(reason);
+            }
+        }
+    }
+
+    #[system]
+    fn cmds(
+        #[state] queue: &mut Rc<RefCell<Vec<SequenceCommandKind>>>,
+        commands: &mut Output<SequenceCommand>,
+    ) {
+        for command in queue.borrow_mut().drain(..) {
+            let channel = "gps".into();
+            let _ = commands.write(&SequenceCommand { channel, command });
+        }
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        failures: Rc<RefCell<Vec<String>>>,
+        states: Log<u32>,
+        submitted: Log<u64>,
+        queue: Rc<RefCell<Vec<SequenceCommandKind>>>,
+    }
+
+    fn table(pack: &Arc<Pack>, seen: &Seen) -> SystemTable {
+        let mut table = SystemTable::new();
+        metor_fsw_3::link::register_builtins(&mut table).unwrap();
+        table.register_pack("echo", pack.clone()).unwrap();
+        table
+            .register("uart_script", gps::uart_script(), gps::UartScript::new)
+            .unwrap();
+        let s = seen.states.clone();
+        table
+            .register("states", states(), move || s.clone())
+            .unwrap();
+        let s = seen.submitted.clone();
+        table
+            .register("statuses", statuses(), move || s.clone())
+            .unwrap();
+        let s = seen.queue.clone();
+        table.register("cmds", cmds(), move || s.clone()).unwrap();
+        let s = seen.failures.clone();
+        table
+            .register("failures", failures(), move || s.clone())
+            .unwrap();
+        table
+    }
+
+    /// The sim target with `gps` behind channel `gps` and a silent model, so
+    /// its read stays in flight.
+    fn target() -> CoordinatorConfig {
+        let mut config: CoordinatorConfig =
+            serde_json::from_str(include_str!("golden/sim.json")).unwrap();
+        config.systems[2].ty = "uart_script".into();
+        config.systems[2].params = serde_json::json!({ "script": [] });
+        let gps = &mut config.systems[0];
+        gps.adapter = Some(Adapter::Channel(ChannelConfig {
+            name: "gps".into(),
+            start: RunState::Running,
+        }));
+        gps.inputs
+            .push(InputConfig::new("commands", "cmds", "commands"));
+        config.systems.insert(0, SystemConfig::new("cmds", "cmds"));
+        config.systems.extend([
+            SystemConfig {
+                inputs: vec![InputConfig::new("st", "gps", "channel_status")],
+                ..SystemConfig::new("states", "states")
+            },
+            SystemConfig {
+                inputs: vec![InputConfig::new("st", "io_complete", "io_status")],
+                ..SystemConfig::new("statuses", "statuses")
+            },
+        ]);
+        config
+    }
+
+    fn reset_waits_for_the_cancel(pack: Arc<Pack>) {
+        let seen = Seen::default();
+        let mut c = target().build(&table(&pack, &seen)).unwrap();
+        let mut step = |from, to| (from..to).for_each(|t| c.step(Timestamp(t)));
+        step(1, 4);
+        seen.queue
+            .borrow_mut()
+            .extend([SequenceCommandKind::Stop, SequenceCommandKind::Reset]);
+        step(4, 6);
+        let quiescing = ChannelState::Quiescing as u32;
+        let states = seen.states.borrow().clone();
+        let waited = states.iter().find(|(_, s)| *s == quiescing);
+        let (t, _) = *waited.unwrap_or_else(|| panic!("no wait: {states:?}"));
+        let after = states.iter().find(|(at, _)| *at > t);
+        let stopped = (t + 1, ChannelState::Stopped as u32);
+        assert_eq!(
+            after,
+            Some(&stopped),
+            "remade once the cancel landed: {states:?}"
+        );
+        let before = seen.submitted.borrow().last().map_or(0, |s| s.1);
+        seen.queue.borrow_mut().push(SequenceCommandKind::Start);
+        step(6, 10);
+        let after = seen.submitted.borrow().last().map_or(0, |s| s.1);
+        assert!(after > before, "the remade system submits again");
+        assert_eq!(c.latched().count(), 0);
+    }
+
+    /// A remade instance whose ctor asks for more than the region holds
+    /// fails, and the channel reports it. Only a dylib keeps the state that
+    /// makes its ctor grow: a wasm guest starts fresh on every make.
+    #[test]
+    fn dylib_remake_past_the_region_fails() {
+        let pack = open();
+        let seen = Seen::default();
+        let mut config = target();
+        let at = config.systems.iter().position(|s| s.id == "gps").unwrap();
+        config.systems[at].ty = "echo.grower".into();
+        config.systems.push(SystemConfig {
+            inputs: vec![InputConfig::new("events", "gps", "events")],
+            ..SystemConfig::new("failures", "failures")
+        });
+        let mut c = config.build(&table(&pack, &seen)).unwrap();
+        c.step(Timestamp(1));
+        seen.queue
+            .borrow_mut()
+            .extend([SequenceCommandKind::Stop, SequenceCommandKind::Reset]);
+        (2..5).for_each(|t| c.step(Timestamp(t)));
+        let last = seen.states.borrow().last().map(|s| s.1);
+        assert_eq!(last, Some(ChannelState::Failed as u32));
+        let failures = seen.failures.borrow();
+        assert!(
+            failures.iter().any(|r| r.contains("IO memory")),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn dylib_reset_waits_for_the_cancel() {
+        reset_waits_for_the_cancel(open());
+    }
+
+    #[test]
+    fn wasm_reset_waits_for_the_cancel() {
+        reset_waits_for_the_cancel(Arc::new(Pack::Wasm(common::open_wasm())));
+    }
 }

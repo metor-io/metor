@@ -8,10 +8,14 @@ use metor_proto_wkt::LogEvent;
 
 use metor_fsw_3_ring::{NoWake, WakeSink};
 
+use crate::Rng;
+use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
+use crate::io::{Arena, Io, SharedIo};
 use crate::log::LogPort;
-use crate::port::{Output, Samplers};
+use crate::port::{Input, Output, Samplers};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
+use std::rc::Rc;
 
 use super::Ports;
 use super::param::{Bindings, Defs, Param, Views, Writers};
@@ -60,19 +64,15 @@ impl<S: Ports, W: WakeSink + Clone + 'static> SystemInputs<W> for InSet<S, W> {
     }
 
     fn bind(inputs: Vec<InputBinding<W>>) -> Self {
-        let declared = Defs::declared::<S>().inputs.len();
-        let mut views = Views {
-            bindings: Bindings::new(inputs, declared),
-            samplers: Samplers::default(),
-        };
-        let ins = S::Params::bind_in::<W>(&mut views);
-        // PANIC Safety: the coordinator binds one list per port of the
-        // definition these parameters produced.
-        assert!(views.bindings.is_empty(), "more bindings than input params");
-        Self {
-            ins,
-            samplers: views.samplers,
-        }
+        let defs = Defs::declared::<S>();
+        // PANIC Safety: every make of a system with IO ports binds through
+        // `fn_system::bind`.
+        assert_eq!(
+            defs.io_ports(),
+            0,
+            "IO ports bind through `fn_system::bind`"
+        );
+        bind_inputs::<S, W>(inputs, defs.inputs.len())
     }
 }
 
@@ -84,26 +84,137 @@ impl<S: Ports> SystemOutputs for OutSet<S> {
     }
 
     fn bind(outputs: Vec<OutputBinding>) -> Self {
-        let declared = Defs::declared::<S>().outputs.len();
-        let mut writers = Writers {
-            bindings: Bindings::new(outputs, declared + 1),
-            dropped: Arc::default(),
-        };
-        let outs = S::Params::bind_out(&mut writers);
-        // PANIC Safety: `defs` always appends the log as the last output.
-        let log = writers
-            .bindings
-            .next()
-            .expect("one writer for the log output");
-        let log = LogPort::new(Output::new(log.writer));
-        assert!(
-            writers.bindings.is_empty(),
-            "more bindings than output params"
+        let defs = Defs::declared::<S>();
+        // PANIC Safety: as in `InSet::bind`.
+        assert_eq!(
+            defs.io_ports(),
+            0,
+            "IO ports bind through `fn_system::bind`"
         );
+        let writers = writers(outputs, defs.outputs.len() + 1, Arc::default());
+        bind_outputs::<S>(writers)
+    }
+}
+
+/// A fn system's bound ports, and its queue if it has one.
+pub(crate) type Bound<S> = (InSet<S>, OutSet<S>, Option<Io>);
+
+/// The system instance a fn system binds for.
+#[derive(Clone, Copy)]
+pub(crate) struct Instance<'a> {
+    pub(crate) io: &'a SharedIo,
+    pub(crate) id: &'a str,
+    pub(crate) namespace: &'a str,
+    /// The target seed. A guest's make has none.
+    pub(crate) seed: Option<u64>,
+}
+
+impl<'a> Instance<'a> {
+    pub(crate) fn of(cx: &crate::coordinator::MakeCx<'a>) -> Self {
         Self {
-            outs,
-            log,
-            dropped: writers.dropped,
+            io: cx.io,
+            id: cx.id,
+            namespace: cx.namespace,
+            seed: cx.seed,
         }
+    }
+
+    /// The stream an `Rng` parameter draws, named `{namespace}.{id}`.
+    fn rng(&self) -> Result<Rng, ParamError> {
+        let system = self.id.to_string();
+        let seed = self.seed.ok_or(ParamError::GuestRng { system })?;
+        Ok(match self.namespace {
+            "" => Rng::seeded(seed, self.id),
+            ns => Rng::seeded(seed, &format!("{ns}.{}", self.id)),
+        })
+    }
+}
+
+/// Binds a fn system's ports, including its queue pair.
+///
+/// The IO ports come after the parameters' own (see `Defs::append_io`). A
+/// system with a `Cap` takes its member's arena from `io`.
+pub(crate) fn bind<S: Ports>(
+    mut inputs: Vec<InputBinding>,
+    mut outputs: Vec<OutputBinding>,
+    instance: Instance<'_>,
+) -> Result<Bound<S>, ParamError> {
+    let Instance { io, id, .. } = instance;
+    let defs = Defs::declared::<S>();
+    let rng = defs.rng.then(|| instance.rng()).transpose()?;
+    let arena = defs.io.then(|| io.borrow_mut().member(id));
+    let io_ports = defs.io_ports();
+    // PANIC Safety: build binds one entry per port of the definition these
+    // `Defs` describe, with `log` last among the outputs.
+    let log = outputs.pop().expect("the log output");
+    let io_in = inputs.split_off(inputs.len() - io_ports);
+    let io_out = outputs.split_off(outputs.len() - io_ports);
+    outputs.push(log);
+    let dropped = Arc::<AtomicU32>::default();
+    let io = queue(arena, io_in, io_out);
+    let ins = bind_inputs::<S, NoWake>(inputs, defs.inputs.len() - io_ports);
+    let mut writers = writers(outputs, defs.outputs.len() - io_ports + 1, dropped);
+    writers.io = io.clone();
+    writers.rng = rng;
+    Ok((ins, bind_outputs::<S>(writers), io))
+}
+
+/// The queue pair over `io_cq` and `io_sq`, for a system with a `Cap`.
+fn queue(
+    arena: Option<Rc<Arena>>,
+    inputs: Vec<InputBinding>,
+    outputs: Vec<OutputBinding>,
+) -> Option<Io> {
+    let (cq, sq) = inputs.into_iter().zip(outputs).next()?;
+    Some(Io::new(
+        Output::new(sq.writer),
+        Input::new(cq.views),
+        arena?,
+    ))
+}
+
+fn writers(outputs: Vec<OutputBinding>, declared: usize, dropped: Arc<AtomicU32>) -> Writers {
+    Writers {
+        bindings: Bindings::new(outputs, declared),
+        dropped,
+        io: None,
+        rng: None,
+    }
+}
+
+fn bind_inputs<S: Ports, W: WakeSink + Clone + 'static>(
+    inputs: Vec<InputBinding<W>>,
+    declared: usize,
+) -> InSet<S, W> {
+    let mut views = Views {
+        bindings: Bindings::new(inputs, declared),
+        samplers: Samplers::default(),
+    };
+    let ins = S::Params::bind_in::<W>(&mut views);
+    // PANIC Safety: the coordinator binds one list per port of the
+    // definition these parameters produced.
+    assert!(views.bindings.is_empty(), "more bindings than input params");
+    InSet {
+        ins,
+        samplers: views.samplers,
+    }
+}
+
+fn bind_outputs<S: Ports>(mut writers: Writers) -> OutSet<S> {
+    let outs = S::Params::bind_out(&mut writers);
+    // PANIC Safety: `defs` always appends the log as the last output.
+    let log = writers
+        .bindings
+        .next()
+        .expect("one writer for the log output");
+    let log = LogPort::new(Output::new(log.writer));
+    assert!(
+        writers.bindings.is_empty(),
+        "more bindings than output params"
+    );
+    OutSet {
+        outs,
+        log,
+        dropped: writers.dropped,
     }
 }

@@ -21,11 +21,12 @@ use crate::{
     system::{System, SystemDef},
 };
 
-pub use ctor::Ctor;
-use param::Defs;
+pub(crate) use ctor::make_state;
+pub use ctor::{Ctor, WithIo};
 pub use param::{Cycle, Param, ParamNames, Views, Writers};
-pub(crate) use set::report_dropped;
+pub(crate) use param::{Defs, param_name};
 pub use set::{InSet, LOG_PORT, OutSet};
+pub(crate) use set::{Instance, bind, report_dropped};
 
 /// Describes the parameters of a system written as a fn.
 pub trait Ports: Sized + 'static {
@@ -87,11 +88,20 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
     /// # Errors
     /// Refuses a [`Sample`](crate::port::Sample) parameter, because async
     /// systems have no step to take samples each cycle.
+    ///
+    /// Refuses a `Cap` parameter too: async systems keep
+    /// stellarator's own IO.
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        if Defs::of::<S>(cx)?.sampled {
-            return Err(DefError::SampleOnAsync {
-                system: S::NAME.into(),
-            });
+        let defs = Defs::of::<S>(cx)?;
+        let system = S::NAME.into();
+        if defs.sampled {
+            return Err(DefError::SampleOnAsync { system });
+        }
+        if !defs.grants.is_empty() {
+            return Err(DefError::IoOnAsync { system });
+        }
+        if defs.rng {
+            return Err(DefError::RngOnAsync { system });
         }
         SystemDef::new::<InSet<S, Notifier>, OutSet<S>, _>(S::NAME, cx)
     }
@@ -118,7 +128,10 @@ impl<S: SystemFn> System for FnSystem<S> {
     type Outputs = OutSet<S>;
 
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<InSet<S>, OutSet<S>, _>(S::NAME, cx)
+        Ok(SystemDef {
+            grants: Defs::of::<S>(cx)?.grants,
+            ..SystemDef::new::<InSet<S>, OutSet<S>, _>(S::NAME, cx)?
+        })
     }
 
     /// Runs one cycle, sending its log lines to the system's own `log` output.

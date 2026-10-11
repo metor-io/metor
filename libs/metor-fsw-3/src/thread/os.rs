@@ -3,13 +3,18 @@
 //! Systems are grouped by thread name, and each group runs one executor on
 //! its own thread. The coordinator steps a [`Thread`] adapter for each system,
 //! which copies records between the real rings and the system's mirrors.
+//!
+//! In a deterministic build each group is turned instead: its executor runs
+//! on the coordinator thread, once a cycle, at the step of its first member.
 
 mod group;
 #[cfg(test)]
 mod tests;
+mod turned;
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::rc::{Rc, Weak as RcWeak};
 use std::sync::{Arc, Weak};
 
 use metor_fsw_3_ring::{NoWake, Notifier, RingBuffer};
@@ -22,6 +27,7 @@ use crate::mirror::{Mirror, Mirrors, mirror_config};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef, SystemInputs, SystemOutputs};
 
 use group::{GroupHandle, Member, Panicked};
+use turned::TurnedGroup;
 
 /// The registry of running thread groups, one per thread name.
 ///
@@ -31,11 +37,42 @@ use group::{GroupHandle, Member, Panicked};
 #[derive(Default)]
 pub struct Threads {
     groups: HashMap<String, Weak<GroupHandle>>,
+    turned: HashMap<String, RcWeak<TurnedGroup>>,
+    /// Whether groups are turned on the coordinator thread.
+    deterministic: bool,
+}
+
+/// A group, as a `Thread` step holds it.
+enum Group {
+    Spawned(#[allow(dead_code)] Arc<GroupHandle>),
+    Turned(Rc<TurnedGroup>),
 }
 
 impl Threads {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry whose groups the coordinator turns, for a deterministic
+    /// run.
+    pub fn deterministic() -> Self {
+        Self {
+            deterministic: true,
+            ..Self::default()
+        }
+    }
+
+    /// Adds `member` to the group named `name`, starting the group if it is
+    /// not running.
+    fn join(&mut self, name: &str, member: Member) -> Result<Group, ParamError> {
+        if self.deterministic {
+            let group = self.get_or_turn(name)?;
+            group.add(member)?;
+            return Ok(Group::Turned(group));
+        }
+        let group = self.get_or_spawn(name)?;
+        group.add(member)?;
+        Ok(Group::Spawned(group))
     }
 
     /// Returns the group named `name`, starting it if it is not running.
@@ -45,6 +82,15 @@ impl Threads {
         }
         let group = group::spawn(name)?;
         self.groups.insert(name.to_string(), Arc::downgrade(&group));
+        Ok(group)
+    }
+
+    fn get_or_turn(&mut self, name: &str) -> Result<Rc<TurnedGroup>, ParamError> {
+        if let Some(group) = self.turned.get(name).and_then(RcWeak::upgrade) {
+            return Ok(group);
+        }
+        let group = TurnedGroup::new(name)?;
+        self.turned.insert(name.to_string(), Rc::downgrade(&group));
         Ok(group)
     }
 }
@@ -107,9 +153,7 @@ where
         }),
         panicked: thread.panicked.clone(),
     };
-    let group = cx.threads.get_or_spawn(&thread_name)?;
-    group.add(member)?;
-    thread.group = Some(group);
+    thread.group = Some(cx.threads.join(&thread_name, member)?);
     Ok(Box::new(thread))
 }
 
@@ -128,12 +172,15 @@ pub struct Thread {
     mirrors: Mirrors<Notifier>,
     panicked: Panicked,
     end: Option<EndReason>,
-    group: Option<Arc<GroupHandle>>,
+    group: Option<Group>,
 }
 
 impl Step for Thread {
     fn execute(&mut self, now: Timestamp) {
         let _ = self.mirrors.drain_inputs();
+        if let Some(Group::Turned(group)) = &self.group {
+            group.turn(now);
+        }
         let _ = self.mirrors.drain_outputs();
         self.mirrors.report_drops(now);
         self.check_panic(now);
@@ -237,6 +284,6 @@ fn bind_outputs(ports: &[PortDef], outputs: Vec<&RingBuffer>) -> Result<BoundOut
 
 /// Creates a mirror ring for `real`, [`MIRROR_FACTOR`] times its capacity.
 fn mirror(real: &RingBuffer) -> Result<RingBuffer, ParamError> {
-    let (config, _) = mirror_config(real.config().capacity, MIRROR_FACTOR)?;
+    let (config, _) = mirror_config(real.config().capacity, MIRROR_FACTOR, 1)?;
     Ok(RingBuffer::create_in_memory(config))
 }

@@ -38,10 +38,14 @@ zerocopy = { version = "0.8.2", features = ["derive"] }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 stellarator = { path = "../stellarator", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+polling = { version = "3.7", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7.1", optional = true }
+
 [features]
 default = ["host", "db"]
-# Stepping systems in this process: the coordinator's build and run loop, the
-# channel adapter, dl, wasm, links, deployments, and the CLI.
 host = [
     "threads",
     "dep:blake3",
@@ -50,13 +54,13 @@ host = [
     "dep:libloading",
     "dep:metor-proto-stellar",
     "dep:minijinja",
+    "dep:polling",
+    "dep:io-uring",
     "dep:toml",
     "dep:wasmi",
 ]
-# Running async systems on OS threads. A dylib pack turns this on; it does
-# nothing on wasm32.
+
 threads = ["dep:stellarator"]
-# The embedded database as a built-in system.
 db = ["host", "dep:metor-db"]
 
 [dev-dependencies]

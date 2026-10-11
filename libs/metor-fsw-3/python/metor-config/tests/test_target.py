@@ -101,6 +101,20 @@ class TargetTest(ConfigTest):
             with open(path, encoding="utf-8") as file:
                 self.assertEqual(json.load(file)["config_version"], 2)
 
+    def test_seed_is_emitted_when_set(self) -> None:
+        self.assertEqual(Target(cycle_rate=1.0, seed=7).to_config()["coordinator"]["seed"], 7)
+        self.assertNotIn("seed", Target(cycle_rate=1.0).to_config()["coordinator"])
+        with self.assertRaisesRegex(ConfigError, "seed"):
+            Target(cycle_rate=1.0, seed=-1)
+
+    def test_epoch_is_emitted_when_set(self) -> None:
+        clock = Target(cycle_rate=1.0, sim_dt=0.01, epoch=0).to_config()["coordinator"]["clock"]
+        self.assertEqual(clock["Simulated"]["epoch"], 0)
+        clock = Target(cycle_rate=1.0, sim_dt=0.01).to_config()["coordinator"]["clock"]
+        self.assertNotIn("epoch", clock["Simulated"])
+        with self.assertRaisesRegex(ConfigError, "epoch"):
+            Target(cycle_rate=1.0, epoch=0)
+
     def test_sim_dt_selects_simulated_clock(self) -> None:
         fsw = Target(cycle_rate=120.0, sim_dt=1 / 120)
         self.assertEqual(

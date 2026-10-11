@@ -11,7 +11,8 @@ use serde_json::value::RawValue;
 use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError};
-use crate::fn_system::{AsyncSystemFn, Ctor, FnSystem, SystemFn};
+use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, SystemFn};
+use crate::io::SharedIo;
 use crate::sequence::SequenceFn;
 use crate::system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
@@ -36,6 +37,12 @@ pub struct MakeCx<'a> {
     pub inputs: Vec<Vec<&'a RingBuffer>>,
     pub outputs: Vec<&'a RingBuffer>,
     pub threads: &'a mut Threads,
+    /// What the build's IO systems and io steps share.
+    pub io: &'a SharedIo,
+    /// The target seed. A guest's make has none.
+    pub seed: Option<u64>,
+    /// The target's namespace, or empty.
+    pub namespace: &'a str,
 }
 
 impl MakeCx<'_> {
@@ -120,9 +127,7 @@ impl SystemTable {
         _system: S,
         ctor: C,
     ) -> Result<(), BuildError> {
-        let make = move |params: Params<'_>| Ok((FnSystem::default(), ctor.make(params)?));
-        let entry = entry::<FnSystem<S>>(make, Cow::Borrowed(S::DOC), C::schema())
-            .map_err(def_error(ty))?;
+        let entry = fn_entry::<S, M, C>(ctor).map_err(def_error(ty))?;
         self.insert(ty, entry)
     }
 
@@ -160,7 +165,10 @@ impl SystemTable {
         _system: S,
         ctor: C,
     ) -> Result<(), BuildError> {
-        let make = move |params: Params<'_>| Ok((FnSystem::default(), ctor.make(params)?));
+        let make = move |params: Params<'_>| {
+            let state = ctor.make(params, &crate::io::IoInit::empty())?;
+            Ok((FnSystem::default(), state))
+        };
         let entry = async_entry::<FnSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema())
             .map_err(def_error(ty))?;
         self.insert(ty, entry)
@@ -296,9 +304,15 @@ fn entry<S: System + 'static>(
     doc: Cow<'static, str>,
     schema: Option<Box<RawValue>>,
 ) -> Result<TableEntry, DefError> {
+    let def = S::def(&DefCx::empty())?;
+    // Binding IO ports takes `fn_system::bind`, which this path skips.
+    if !def.grants.is_empty() {
+        let system = def.name.to_string();
+        return Err(DefError::IoOnTraitPath { system });
+    }
     Ok(TableEntry {
         kind: SystemKind::Cyclic,
-        def: S::def(&DefCx::empty())?,
+        def,
         def_fn: Box::new(S::def),
         doc,
         schema,
@@ -311,6 +325,35 @@ fn entry<S: System + 'static>(
                 state,
                 inputs: S::Inputs::bind(views),
                 outputs: S::Outputs::bind(writers),
+            }))
+        }),
+    })
+}
+
+/// Builds the table entry for a `#[system]` fn.
+///
+/// The entry's `make` binds the system's ports, including its queue pair,
+/// before `ctor` builds its state.
+fn fn_entry<S: SystemFn, M, C: Ctor<S::State, M> + 'static>(
+    ctor: C,
+) -> Result<TableEntry, DefError> {
+    Ok(TableEntry {
+        kind: SystemKind::Cyclic,
+        def: FnSystem::<S>::def(&DefCx::empty())?,
+        def_fn: Box::new(FnSystem::<S>::def),
+        doc: Cow::Borrowed(S::DOC),
+        schema: C::schema(),
+        make: Arc::new(move |cx| {
+            refuse_thread(cx.adapter)?;
+            let instance = fn_system::Instance::of(&cx);
+            let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
+            let (inputs, outputs, io) = fn_system::bind::<S>(views, writers, instance)?;
+            let state = fn_system::make_state(&ctor, cx.id, cx.params, io.as_ref())?;
+            Ok(Box::new(Runner {
+                system: FnSystem::default(),
+                state,
+                inputs,
+                outputs,
             }))
         }),
     })
@@ -785,6 +828,9 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             threads: &mut threads,
+            io: &crate::io::SharedIo::default(),
+            seed: Some(0),
+            namespace: "",
         })
         .expect("no params");
         let started = std::time::Instant::now();

@@ -78,6 +78,13 @@ pub struct RawRing {
 }
 
 impl RawRing {
+    /// No region.
+    pub const EMPTY: Self = Self {
+        base: core::ptr::null_mut(),
+        len: 0,
+        owner: None,
+    };
+
     /// Creates a `RawRing` from `export`.
     ///
     /// `export` must stay alive until the receiver attaches to the ring.

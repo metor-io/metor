@@ -7,7 +7,7 @@ from typing import Any
 
 CONFIG_VERSION = 2
 
-ABI_VERSION = 9
+ABI_VERSION = 13
 """The host ABI version the built-in systems are compiled against.
 
 A Rust test keeps this in sync with the host.
@@ -27,15 +27,21 @@ def wall_clock(rate: float) -> dict[str, Any]:
     return {"Wall": {"rate": rate}}
 
 
-def simulated_clock(dt: float) -> dict[str, Any]:
-    """Encodes a simulated clock that advances ``dt`` seconds per cycle.
+def simulated_clock(dt: float, epoch: int | None = None) -> dict[str, Any]:
+    """Encodes a simulated clock that advances ``dt`` seconds per cycle,
+    starting at ``epoch`` microseconds since the Unix epoch when set.
 
     The step is encoded the way serde reads a Rust `Duration`.
     """
     if dt <= 0.0:
         raise ConfigError(f"sim_dt must be positive, got {dt}")
     nanos = round(dt * NANOS_PER_SEC)
-    return {"Simulated": {"dt": {"secs": nanos // NANOS_PER_SEC, "nanos": nanos % NANOS_PER_SEC}}}
+    clock: dict[str, Any] = {
+        "dt": {"secs": nanos // NANOS_PER_SEC, "nanos": nanos % NANOS_PER_SEC}
+    }
+    if epoch is not None:
+        clock["epoch"] = epoch
+    return {"Simulated": clock}
 
 
 def check_abi(pack_id: str, abi_version: int) -> None:

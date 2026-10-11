@@ -94,7 +94,11 @@ mod tests {
     use crate::tests::utils::pair;
 
     fn make(params: serde_json::Value) -> Result<Registry, ParamError> {
-        Ctor::<Registry, (RegistryParams, ParamError)>::make(&Registry::new, Params(&params))
+        Ctor::<Registry, (RegistryParams, ParamError)>::make(
+            &Registry::new,
+            Params(&params),
+            &crate::io::IoInit::empty(),
+        )
     }
 
     #[test]

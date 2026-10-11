@@ -16,6 +16,7 @@ use crate::coordinator::{
     Adapter, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, Stepped, catch_step,
 };
 use crate::def::DefCx;
+use crate::io::SharedIo;
 use crate::port::{Input, Output, ring_capacity};
 use crate::record::Record;
 use crate::system::{PortDef, SystemDef};
@@ -88,6 +89,9 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
         params: cx.params.0.clone(),
         inputs,
         outputs: outputs.into_iter().cloned().collect(),
+        io: cx.io.clone(),
+        seed: cx.seed,
+        namespace: cx.namespace.to_string(),
     };
     let mut threads = Threads::new();
     let inner = recipe.make(&mut threads)?;
@@ -100,6 +104,7 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
             end_reason: None,
             reported_end_reason: None,
             loaded: None,
+            deferred: None,
             recipe,
             threads,
             abort,
@@ -153,6 +158,9 @@ struct SystemRecipe {
     params: serde_json::Value,
     inputs: Vec<Vec<RingBuffer>>,
     outputs: Vec<RingBuffer>,
+    io: SharedIo,
+    seed: Option<u64>,
+    namespace: String,
 }
 
 impl SystemRecipe {
@@ -169,6 +177,9 @@ impl SystemRecipe {
                 .collect(),
             outputs: self.outputs.iter().collect(),
             threads,
+            io: &self.io,
+            seed: self.seed,
+            namespace: &self.namespace,
         })
     }
 }
@@ -193,11 +204,19 @@ struct Core {
     reported_end_reason: Option<EndReason>,
     /// The last name a `Load` accepted. A reset loads it again.
     loaded: Option<String>,
+    /// A reset or load waiting for the system's ops in flight to finish.
+    deferred: Option<Deferred>,
     recipe: SystemRecipe,
     threads: Threads,
     abort: Option<Output<AbortRequest>>,
     events: Output<SequenceChannelEvent>,
     status: Output<ChannelStatus>,
+}
+
+/// What a quiescing channel does once its system has nothing in flight.
+enum Deferred {
+    Restart,
+    Load(String),
 }
 
 /// The longest reason, in bytes, that an event carries.
@@ -232,6 +251,7 @@ impl Core {
             run: self.run,
             ended: self.ended().is_some(),
             abortable: self.abort.is_some(),
+            quiescing: self.deferred.is_some(),
         }
     }
 
@@ -247,7 +267,7 @@ impl Core {
             }
             SequenceCommandKind::Abort => self.abort(),
             SequenceCommandKind::Reset => self.reset(),
-            SequenceCommandKind::Load { name } => self.load(name),
+            SequenceCommandKind::Load { name } => self.defer_load(name),
         }
     }
 
@@ -264,8 +284,21 @@ impl Core {
         }
     }
 
+    /// Resets the system. An IO system is dropped now and made again once its
+    /// ops in flight finish.
     fn reset(&mut self) -> SequenceEventKind {
         self.run = RunState::Stopped;
+        if !self.has_io() {
+            return self.restarted();
+        }
+        self.inner = None;
+        self.end_reason = None;
+        self.recipe.io.borrow_mut().quiesce_system(&self.recipe.id);
+        self.deferred = Some(Deferred::Restart);
+        quiescing()
+    }
+
+    fn restarted(&mut self) -> SequenceEventKind {
         match self.restart() {
             Ok(()) => SequenceEventKind::Loaded {
                 name: self.loaded_name(),
@@ -285,6 +318,41 @@ impl Core {
             (Some(inner), Some(name)) => reload(inner, name),
             _ => Ok(()),
         }
+    }
+
+    /// Loads `name`. On an IO system whose step loads occupants, the load
+    /// waits for its ops in flight. Any other step loads, or refuses, at once.
+    fn defer_load(&mut self, name: String) -> SequenceEventKind {
+        let loads = self
+            .inner
+            .as_ref()
+            .is_some_and(|inner| inner.occupant().is_some());
+        if !loads || !self.has_io() {
+            return self.load(name);
+        }
+        self.recipe.io.borrow_mut().quiesce_system(&self.recipe.id);
+        self.deferred = Some(Deferred::Load(name));
+        quiescing()
+    }
+
+    /// Whether the system does IO.
+    fn has_io(&self) -> bool {
+        self.recipe.io.borrow().index(&self.recipe.id).is_some()
+    }
+
+    /// Runs the deferred reset or load once the system is idle.
+    fn settle(&mut self) {
+        let id = &self.recipe.id;
+        if !self.recipe.io.borrow().is_system_idle(id) {
+            return;
+        }
+        self.recipe.io.borrow_mut().end_queiscing_system(id);
+        let event = match self.deferred.take() {
+            Some(Deferred::Restart) => self.restarted(),
+            Some(Deferred::Load(name)) => self.load(name),
+            None => return,
+        };
+        self.emit(event);
     }
 
     fn load(&mut self, name: String) -> SequenceEventKind {
@@ -334,7 +402,9 @@ impl Core {
     }
 
     fn step(&mut self, now: Timestamp) {
-        if self.run == RunState::Running
+        if self.deferred.is_some() {
+            self.settle();
+        } else if self.run == RunState::Running
             && self.end_reason.is_none()
             && catch_step(&mut self.inner, now) == Stepped::Unwound
         {
@@ -369,12 +439,19 @@ impl Core {
         let occupant = self.inner.as_ref().and_then(|inner| inner.occupant());
         let status = ChannelStatus {
             timestamp: now,
-            state: ChannelState::of(self.run, self.ended()).code(),
+            state: self.channel_state().code(),
             loaded: occupant.map_or(u32::MAX, |o| o.index),
             artifact: occupant.map_or(FrameStr::EMPTY, |o| o.artifact),
             hash: occupant.map_or(FrameBytes::ZERO, |o| o.hash),
         };
         let _ = self.status.write(&status);
+    }
+
+    fn channel_state(&self) -> ChannelState {
+        match self.deferred {
+            Some(_) => ChannelState::Quiescing,
+            None => ChannelState::of(self.run, self.ended()),
+        }
     }
 
     fn emit(&self, kind: SequenceEventKind) {
@@ -393,6 +470,12 @@ fn reload(inner: &mut Box<dyn Step>, name: &str) -> Result<(), String> {
     crate::panic::catch(|| inner.load(name))
         .ok_or_else(|| "the load panicked".to_string())?
         .map_err(|e| e.to_string())
+}
+
+fn quiescing() -> SequenceEventKind {
+    SequenceEventKind::Progress {
+        detail: "quiescing".into(),
+    }
 }
 
 fn refused(reason: String) -> SequenceEventKind {

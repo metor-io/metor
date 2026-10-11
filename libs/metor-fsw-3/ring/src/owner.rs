@@ -22,15 +22,20 @@ pub struct RawOwner {
     pub release: unsafe extern "C" fn(*const c_void),
 }
 
-pub(super) struct Lease(RawOwner);
+/// One reference on a `RawOwner`, given back on drop.
+pub struct Lease(RawOwner);
 
 impl Lease {
     /// # Safety
     /// `owner` meets `RawOwner`'s contract and is live for this call.
-    pub(super) unsafe fn acquire(owner: RawOwner) -> Self {
+    pub unsafe fn acquire(owner: RawOwner) -> Self {
         // SAFETY: the caller guarantees a live owner and valid callbacks.
         unsafe { (owner.retain)(owner.context) };
         Self(owner)
+    }
+
+    pub fn owner(&self) -> RawOwner {
+        self.0
     }
 }
 

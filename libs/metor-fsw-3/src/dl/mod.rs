@@ -17,7 +17,9 @@ use metor_fsw_3_ring::RingBuffer;
 
 use crate::coordinator::{BuildError, ParamError, Step, SystemTable, TableEntry};
 use crate::def::{DefCx, DefError};
+use crate::io::SharedIo;
 use crate::pack::def::{Instance, PackDef, PackSystemDef};
+use crate::pack::raw::RawRing;
 use crate::system::SystemDef;
 use crate::wasm::{Trap, WasmError, WasmPack};
 
@@ -75,20 +77,36 @@ impl Pack {
     }
 
     /// Creates one instance of type `ty` on the given rings.
+    ///
+    /// A system with a `Cap` shares its IO region with the host: on its first
+    /// make the pack lays one out and the host's member adopts it; a remake
+    /// is given the member's region. The host never rewinds it.
     pub fn create(
         &self,
         ty: &str,
         params: &serde_json::Value,
         instance: &Instance,
-        inputs: &[Vec<&RingBuffer>],
-        outputs: &[&RingBuffer],
+        ports: Ports<'_>,
+        io: &SharedIo,
     ) -> Result<Box<dyn Step>, ParamError> {
-        Ok(match self {
-            Pack::Dl(pack) => Box::new(pack.create(ty, params, instance, inputs, outputs)?),
-            Pack::Wasm(pack) => Box::new(pack.create(ty, params, instance, inputs, outputs)?),
-        })
+        let id = &instance.id;
+        let arena = io.borrow().arena(id);
+        let mut table = arena
+            .as_deref()
+            .map_or(RawRing::EMPTY, crate::pack::ring_of);
+        let step: Box<dyn Step> = match self {
+            Pack::Dl(pack) => Box::new(pack.create(ty, params, instance, ports, &mut table)?),
+            Pack::Wasm(pack) => Box::new(pack.create(ty, params, instance, ports, io)?),
+        };
+        // SAFETY: a pack writes back a live region with an owner that meets
+        // `RawOwner`'s contract, or an empty one.
+        unsafe { crate::pack::adopt(io, instance, table) };
+        Ok(step)
     }
 }
+
+/// An instance's input and output rings.
+pub type Ports<'a> = (&'a [Vec<&'a RingBuffer>], &'a [&'a RingBuffer]);
 
 impl SystemTable {
     /// Registers every system in `pack` under the name `"{id}.{ty}"`, in order.
@@ -124,7 +142,8 @@ fn entry(pack: &Arc<Pack>, system: &PackSystemDef) -> TableEntry {
                 def: cx.def.clone(),
                 adapter: cx.adapter.cloned(),
             };
-            make_pack.create(&make_ty, cx.params.0, &instance, &cx.inputs, &cx.outputs)
+            let ports = (&cx.inputs[..], &cx.outputs[..]);
+            make_pack.create(&make_ty, cx.params.0, &instance, ports, cx.io)
         }),
     }
 }

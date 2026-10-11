@@ -1,3 +1,4 @@
+use crate::io::End;
 use metor_proto::types::{ComponentId, PacketId};
 use thiserror::Error;
 
@@ -9,6 +10,15 @@ use crate::def::DefError;
 pub enum BuildError {
     #[error("wall clock rate must be finite and at least 0.001 Hz")]
     InvalidClockRate,
+
+    #[error("a deterministic build needs a simulated clock")]
+    DeterministicWall,
+
+    #[error("a deterministic build needs a dt of at least 1 µs")]
+    DeterministicZeroDt,
+
+    #[error("a deterministic build needs a simulated clock with an epoch of 0 or later")]
+    DeterministicEpoch,
 
     #[error("system id `{id}` is used twice")]
     DuplicateId { id: String },
@@ -89,6 +99,52 @@ pub enum BuildError {
 
     #[error("port `{id}.{port}` is reserved for the channel adapter")]
     ReservedChannelPort { id: String, port: String },
+
+    #[error("`{system}` has no grant for its `Cap` parameter `{param}`")]
+    Ungranted { system: String, param: String },
+
+    #[error("`{system}` grants its parameter `{param}` twice")]
+    DuplicateGrant { system: String, param: String },
+
+    #[error("`{system}` grants `{param}`, which is not a `Cap` parameter")]
+    UnknownGrant { system: String, param: String },
+
+    #[error("`{id}`: the io steps take no channel")]
+    IoAdapter { id: String },
+
+    #[error("io steps: {message}")]
+    IoSystems { message: String },
+
+    #[error("resource `{id}` is created twice")]
+    DuplicateResource { id: String },
+
+    #[error("`{system}` grants `{param}` resource `{resource}`, which the target does not create")]
+    UnknownResource {
+        system: String,
+        param: String,
+        resource: String,
+    },
+
+    /// `cap` is `{system}.{param}`.
+    #[error("`{cap}` takes a `{expected}`, but resource `{resource}` provides `{found}`")]
+    Interface {
+        cap: String,
+        resource: String,
+        expected: String,
+        found: String,
+    },
+
+    #[error("sim resource `{resource}` has no holder on its {missing:?} end")]
+    OneEnd { resource: String, missing: End },
+
+    #[error("`{system}` holds the device end of `{resource}`, which is not simulated")]
+    RealDeviceEnd { system: String, resource: String },
+
+    #[error("resource `{resource}` did not open: {message}")]
+    Open { resource: String, message: String },
+
+    #[error("resource `{resource}` has a `{backing}` backing, which this build does not run")]
+    Backing { resource: String, backing: String },
 
     #[error("definition for `{id}`: {source}")]
     Def {

@@ -23,7 +23,7 @@ pub struct Sensors {
     pub mag_b: V3,
 }
 
-/// A GPS fix, the true orbit state with the receiver's error model applied.
+/// A GPS fix: the plant's, or the GPS driver's from the receiver's logs.
 #[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[repr(C)]
 #[frame(name = "gps")]
@@ -36,6 +36,18 @@ pub struct Gps {
     pub vel_eci: V3,
     /// Measured position as `[latitude_deg, longitude_deg, altitude_m]`.
     pub lla: V3,
+}
+
+/// A fault the GPS receiver model applies, as a scenario or the panel sends
+/// it.
+#[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
+#[repr(C)]
+#[frame(name = "gps_fault")]
+pub struct GpsFault {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    /// Nonzero while the receiver has no solution.
+    pub outage: u64,
 }
 
 /// The navigation filter's attitude estimate.

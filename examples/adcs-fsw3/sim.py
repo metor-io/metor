@@ -1,10 +1,14 @@
 """Runs the whole ADCS loop in one process, feeding the controller's commands
-back to the plant one cycle late."""
+back to the plant one cycle late.
+
+Nav and ctrl take their GPS fixes from a driver reading a simulated receiver
+over a serial port. The receiver logs the plant's true orbit state. A db
+records everything and serves it on 2250."""
 
 import math
 
-from adcs_pack import Ctrl, Mode, MtqCmd, Nav, Plant, TorqueCmd
-from metor_config import Publish, Target
+from adcs_pack import Ctrl, GpsDriver, GpsReceiver, Mode, MtqCmd, Nav, Plant, TorqueCmd
+from metor_config import Db, Publish, SimUart, Target
 
 fsw = Target(cycle_rate=120.0, namespace="sim")
 
@@ -38,13 +42,17 @@ plant = fsw.add(
         init_orbit_phase=0.0,
     ),
 )
-nav = fsw.add("nav", Nav(sensors=plant.sensors, gps=plant.gps, meas_sigma=0.02))
+gps_uart = fsw.resource("gps_uart", SimUart())
+gps = fsw.add("gps", GpsDriver(uart=gps_uart))
+fsw.sim("gps_rx", GpsReceiver(uart=gps_uart.device, truth=plant.body, seed=7))
+
+nav = fsw.add("nav", Nav(sensors=plant.sensors, gps=gps.fix, meas_sigma=0.02))
 mode = fsw.add("mode", Mode())
 ctrl = fsw.add(
     "ctrl",
     Ctrl(
         estimate=nav.attitude_estimate,
-        gps=plant.gps,
+        gps=gps.fix,
         mode=mode.mode_cmd,
         sensors=plant.sensors,
         wheels=plant.wheels,
@@ -59,3 +67,6 @@ torque.connect(ctrl.torque_cmd)
 mtq.connect(ctrl.mtq_cmd)
 
 fsw.add("pub", Publish(listen="0.0.0.0:2240", all=True))
+# Records the whole loop, GPS included, for a panel on 2250, as target.py's
+# gateway does.
+fsw.add("db", Db(listen="0.0.0.0:2250", all=True), thread="db")

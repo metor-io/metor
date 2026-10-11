@@ -231,6 +231,10 @@ mod tests {
         for port in ports {
             match &port.schema {
                 RecordSchema::Frame { metadata, .. } => assert!(!metadata.is_empty()),
+                // The IO records name their own codec.
+                RecordSchema::Msg { codec, .. } if port.record.starts_with("io_") => {
+                    assert!(matches!(codec, MsgCodec::Other(_)))
+                }
                 RecordSchema::Msg { codec, .. } => {
                     assert!(matches!(codec, MsgCodec::Postcard(_)))
                 }

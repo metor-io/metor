@@ -15,6 +15,7 @@ use crate::coordinator::{
     EndReason, MakeCx, ParamError, Params, Step, Stepped, SystemTable, catch_step,
 };
 use crate::def::DefError;
+use crate::io::{Arena, Keep, SharedIo};
 use crate::system::SystemDef;
 use crate::thread::Threads;
 use def::{DefCxOwned, Instance, PackDef};
@@ -23,7 +24,7 @@ use raw::{RawRing, RawSlice};
 /// The ABI version of the exports in this module.
 ///
 /// The host refuses to load a pack whose version does not match its own.
-pub const ABI_VERSION: u32 = 9;
+pub const ABI_VERSION: u32 = 13;
 
 /// The status word [`execute`] returns.
 ///
@@ -97,6 +98,8 @@ thread_local! {
     static TABLE: OnceCell<SystemTable> = const { OnceCell::new() };
     /// The threads this pack runs its own async systems on.
     static THREADS: RefCell<Threads> = RefCell::new(Threads::new());
+    /// What the pack's own IO systems share.
+    static IO: crate::io::SharedIo = crate::io::SharedIo::default();
     static ERROR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -221,6 +224,21 @@ fn write_json<T: serde::Serialize>(
     }
 }
 
+/// The arguments of `metor_fsw_create`, but its error slot.
+pub struct CreateArgs {
+    pub ty: RawSlice,
+    pub params: RawSlice,
+    pub def: RawSlice,
+    /// A slice of [`RawSlice`]s of [`RawRing`]s.
+    pub inputs: RawSlice,
+    /// A slice of [`RawRing`]s.
+    pub outputs: RawSlice,
+    /// Read and written. In, the host's copy of the system's IO region, or
+    /// empty on its first make; out, the region in use, or empty for a
+    /// system with no IO.
+    pub table: *mut RawRing,
+}
+
 /// Creates one system instance on the rings the host passed in.
 ///
 /// Returns null on failure. If the failure has a [`ParamError`], it is written
@@ -228,25 +246,21 @@ fn write_json<T: serde::Serialize>(
 /// slice.
 ///
 /// # Safety
-/// `ty`, `params`, `def`, `inputs` (a slice of [`RawSlice`]s of [`RawRing`]s),
-/// and `outputs` (a slice of [`RawRing`]s) must each meet the contract of
-/// [`RawSlice::as_slice`]. Every ring must have live, valid ownership callbacks
-/// covering its region. `error` must be writable and must not alias the input
-/// arrays. Calls on this thread must not reenter `create`.
+/// Each slice in `args` meets the contract of [`RawSlice::as_slice`]. Every
+/// ring, and a non-empty `table`, has live, valid ownership callbacks
+/// covering its region. `table` and `error` are writable and do not alias
+/// the input arrays. Calls on this thread must not reenter `create`.
 pub unsafe fn create(
     build: fn() -> SystemTable,
-    ty: RawSlice,
-    params: RawSlice,
-    def: RawSlice,
-    inputs: RawSlice,
-    outputs: RawSlice,
+    args: CreateArgs,
     error: *mut RawSlice,
 ) -> *mut c_void {
     // SAFETY: the caller supplies a writable result pointer.
     unsafe { error.write(RawSlice::EMPTY) };
     crate::panic::catch(|| {
-        // SAFETY: the caller's arrays and ownership callbacks remain valid here.
-        match unsafe { make(build, ty, params, def, inputs, outputs) } {
+        // SAFETY: the caller's arrays, region, and ownership callbacks remain
+        // valid here.
+        match unsafe { make(build, args) } {
             Ok(step) => Box::into_raw(Box::new(Some(step))).cast(),
             Err(source) => {
                 // SAFETY: `error` remains writable for this call.
@@ -262,14 +276,15 @@ pub unsafe fn create(
 ///
 /// # Safety
 /// The same as for [`create`].
-unsafe fn make(
-    build: fn() -> SystemTable,
-    ty: RawSlice,
-    params: RawSlice,
-    def: RawSlice,
-    inputs: RawSlice,
-    outputs: RawSlice,
-) -> Result<Box<dyn Step>, ParamError> {
+unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn Step>, ParamError> {
+    let CreateArgs {
+        ty,
+        params,
+        def,
+        inputs,
+        outputs,
+        table,
+    } = args;
     // SAFETY: the caller's contract.
     let (ty, params, def) = unsafe { (ty.as_bytes(), params.as_bytes(), def.as_bytes()) };
     let ty = core::str::from_utf8(ty).map_err(|e| ParamError::Decode(e.to_string()))?;
@@ -288,7 +303,12 @@ unsafe fn make(
 
     let views = ins.iter().map(|rings| rings.iter().collect()).collect();
     let writers = outs.iter().collect();
-    with_table(build, |table| {
+    let io = IO.with(Clone::clone);
+    // SAFETY: the caller's contract.
+    let given = unsafe { table.read() };
+    // SAFETY: as above; the region and its owner are live.
+    unsafe { adopt(&io, &instance, given) };
+    let step = with_table(build, |table| {
         let entry = table
             .get(ty)
             .ok_or_else(|| ParamError::Decode(format!("unknown system type `{ty}`")))?;
@@ -303,9 +323,64 @@ unsafe fn make(
                 inputs: views,
                 outputs: writers,
                 threads,
+                io: &io,
+                seed: None,
+                namespace: "",
             })
         })
-    })
+    })?;
+    // SAFETY: the caller's contract.
+    unsafe { table.write(region_of(&io, &instance.id)) };
+    Ok(step)
+}
+
+/// Sets system `instance`'s arena to the region `ring` names, unless the
+/// system has no `Cap`, its arena is already set, or the region is empty.
+///
+/// # Safety
+/// A non-empty `ring` is live, and its owner meets `RawOwner`'s contract.
+/// A region with no owner outlives the arena, such as memory a wasm host
+/// wrote into its guest.
+pub(crate) unsafe fn adopt(io: &SharedIo, instance: &Instance, ring: RawRing) {
+    if host_caps(&instance.def).next().is_none() {
+        return;
+    }
+    let arena = io.borrow_mut().member(&instance.id);
+    let base = core::ptr::NonNull::new(ring.base).filter(|_| ring.len > 0);
+    let Some(base) = base.filter(|_| arena.region().is_none()) else {
+        return;
+    };
+    // SAFETY: the caller's contract.
+    let keep = match ring.owner {
+        Some(owner) => Keep::Lease(unsafe { metor_fsw_3_ring::Lease::acquire(owner) }),
+        None => Keep::Unowned,
+    };
+    // SAFETY: the caller's contract, and `keep` holds the owner's reference.
+    unsafe { arena.set(base, ring.len, keep) };
+}
+
+/// An arena's region, with an owner that keeps it alive, to pass across the
+/// pack ABI. Empty before the arena is set.
+pub(crate) fn ring_of(arena: &Arena) -> RawRing {
+    arena
+        .region()
+        .map_or(RawRing::EMPTY, |(base, len)| RawRing {
+            base: base.as_ptr(),
+            len,
+            owner: arena.owner(),
+        })
+}
+
+/// The region of system `id`'s member, or an empty one when it has no IO.
+fn region_of(io: &SharedIo, id: &str) -> RawRing {
+    io.borrow()
+        .arena(id)
+        .map_or(RawRing::EMPTY, |arena| ring_of(&arena))
+}
+
+/// The names of the `Cap` parameters in `def`.
+pub(crate) fn host_caps(def: &SystemDef) -> impl Iterator<Item = String> + '_ {
+    def.grants.iter().map(|g| g.param.to_string())
 }
 
 /// Decodes the params JSON. Empty bytes mean no params.
@@ -443,9 +518,18 @@ macro_rules! export_pack {
             def: $crate::pack::raw::RawSlice,
             inputs: $crate::pack::raw::RawSlice,
             outputs: $crate::pack::raw::RawSlice,
+            table: *mut $crate::pack::raw::RawRing,
             error: *mut $crate::pack::raw::RawSlice,
         ) -> *mut ::core::ffi::c_void {
-            unsafe { $crate::pack::create($build, ty, params, def, inputs, outputs, error) }
+            let args = $crate::pack::CreateArgs {
+                ty,
+                params,
+                def,
+                inputs,
+                outputs,
+                table,
+            };
+            unsafe { $crate::pack::create($build, args, error) }
         }
 
         #[unsafe(no_mangle)]

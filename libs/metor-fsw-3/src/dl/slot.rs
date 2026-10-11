@@ -23,6 +23,7 @@ use crate::coordinator::{
 };
 use crate::def::{DefCx, DefError};
 use crate::dl::{PackKind, PackRef};
+use crate::io::SharedIo;
 use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
 use crate::wasm::{Limits, WasmPack};
@@ -93,6 +94,7 @@ pub(crate) fn entry() -> TableEntry {
             name: SLOT_NAME.into(),
             inputs: Vec::new(),
             outputs: Vec::new(),
+            grants: Vec::new(),
         },
         def_fn: Box::new(def),
         doc: "Loads one of the pack systems it allows on its channel's `Load`.".into(),
@@ -150,6 +152,7 @@ fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
         candidates,
         current: None,
         end: None,
+        io: cx.io.clone(),
     };
     if let Some(name) = params.initial
         && let Err(error) = slot.load(&name)
@@ -213,6 +216,8 @@ pub struct DlSlot {
     current: Option<Loaded>,
     /// Why the slot is empty, if a failed load emptied it.
     end: Option<EndReason>,
+    /// Where the slot's candidates share one IO region.
+    io: SharedIo,
 }
 
 /// The loaded system and the pack it was created from.
@@ -245,12 +250,13 @@ impl DlSlot {
             .map(|rings| rings.iter().collect())
             .collect();
         let outputs: Vec<&RingBuffer> = self.outputs.iter().collect();
+        let ports = (&inputs[..], &outputs[..]);
         pack.create(
             &candidate.ty,
             &candidate.params,
             &self.instance,
-            &inputs,
-            &outputs,
+            ports,
+            &self.io,
         )
         .map_err(LoadError::Create)
     }
@@ -362,8 +368,9 @@ fn open_error(error: PackError) -> LoadError {
 ///
 /// Ports match when their names and records match. The namespace each port is
 /// announced under is ignored.
+/// Whether two definitions take the same ports and the same grants.
 pub(crate) fn same_ports(a: &SystemDef, b: &SystemDef) -> bool {
-    same_list(&a.inputs, &b.inputs) && same_list(&a.outputs, &b.outputs)
+    same_list(&a.inputs, &b.inputs) && same_list(&a.outputs, &b.outputs) && a.grants == b.grants
 }
 
 fn same_list(a: &[PortDef], b: &[PortDef]) -> bool {

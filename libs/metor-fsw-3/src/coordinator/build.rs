@@ -14,11 +14,12 @@ use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 
 use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
+use crate::io::{Backing, End, IO_CQ, IO_SQ, IO_TYPE, RealKind, ResourceConfig, SharedIo};
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
 
-use super::config::{Adapter, Clock, CoordinatorConfig, PortRef, SystemConfig};
+use super::config::{Adapter, BuildOptions, Clock, CoordinatorConfig, PortRef, SystemConfig};
 use super::error::BuildError;
 use super::params::Params;
 use super::run::{Coordinator, Entry};
@@ -72,23 +73,46 @@ impl PlannedSystem<'_> {
 impl CoordinatorConfig {
     /// Builds a [`Coordinator`] from this config, creating systems from `table`.
     pub fn build(self, table: &SystemTable) -> Result<Coordinator, BuildError> {
+        self.build_with(table, BuildOptions::default())
+    }
+
+    /// Builds a [`Coordinator`] with `options`.
+    pub fn build_with(
+        self,
+        table: &SystemTable,
+        options: BuildOptions,
+    ) -> Result<Coordinator, BuildError> {
         self.clock.validate()?;
+        if options.deterministic {
+            self.clock.check_deterministic()?;
+        }
         check_channels(&self)?;
+        check_resources(&self.resources)?;
         let mut plan = resolve(&self, table)?;
         check_ids(&plan)?;
+        check_ends(&self)?;
         count_readers(&plan.systems, &mut plan.rings);
         let rings = plan
             .rings
             .iter()
             .map(|spec| allocate_ring(spec, self.ring_depth))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut threads = Threads::new();
-        let entries = bind_rings(&plan, &rings, &mut threads)?;
+        let mut threads = match options.deterministic {
+            true => Threads::deterministic(),
+            false => Threads::new(),
+        };
+        let members = io_members(&plan, &self);
+        let io = SharedIo::new(crate::io::host::build(&self.resources, members)?.into());
+        let target = Target {
+            seed: Some(self.seed),
+            namespace: self.namespace.as_deref().unwrap_or_default(),
+        };
+        let entries = bind_rings(&plan, &rings, &mut threads, &io, target)?;
 
         Ok(Coordinator {
             entries,
             clock: self.clock,
-            epoch: Timestamp::now(),
+            epoch: self.clock.epoch().unwrap_or_else(Timestamp::now),
             cycle: 0,
             rings,
         })
@@ -117,6 +141,8 @@ fn resolve<'a>(
         let namespace = config.namespace.as_deref();
         let def = planned_def(system, entry, &plan, &index, &records, namespace)?;
         check_port_names(&system.id, &def)?;
+        check_grants(system, &def)?;
+        check_interfaces(system, &def, &config.resources)?;
         if def.outputs.iter().any(|p| p.name == STATUS_PORT) {
             return Err(BuildError::ReservedPort {
                 ty: system.ty.clone(),
@@ -142,8 +168,118 @@ fn resolve<'a>(
             base_ring_idx,
         });
     }
+    check_io_steps(config, &plan)?;
     resolve_edges(config, &mut plan, &index)?;
     Ok(plan)
+}
+
+/// Checks the io systems' place and wiring.
+///
+/// Each system with a `Cap` is a member. Its SQ goes to the next `fsw.io`
+/// after it, so one must follow it, and its CQ comes from the one before it,
+/// wrapping to the last. Every `fsw.io` lists exactly its members, in step
+/// order, and takes no channel.
+fn check_io_steps(config: &CoordinatorConfig, plan: &Plan<'_>) -> Result<(), BuildError> {
+    let members: Vec<usize> = (0..plan.systems.len())
+        .filter(|&at| !plan.systems[at].def.grants.is_empty())
+        .collect();
+    let Some(points) = IoPoints::new(config)? else {
+        return match members.first() {
+            Some(&m) => io_error(format!(
+                "`{}` holds a `Cap`, so the config needs an {IO_TYPE}",
+                config.systems[m].id
+            )),
+            None => Ok(()),
+        };
+    };
+    if let Some(&m) = members.iter().find(|&&m| points.next(m).is_none()) {
+        let id = &config.systems[m].id;
+        return io_error(format!(
+            "`{id}` holds a `Cap`, so an {IO_TYPE} must follow it"
+        ));
+    }
+    for &point in &points.at {
+        check_io_point(config, point, &points, &members)?;
+    }
+    for &m in &members {
+        let (member, prev) = (&config.systems[m].id, &config.systems[points.prev(m)].id);
+        let cq = config.systems[m].inputs.iter().find(|i| i.port == IO_CQ);
+        if cq.is_none_or(|cq| cq.from != [PortRef::new(prev.as_str(), member.as_str())]) {
+            return io_error(format!("`{member}.{IO_CQ}` must read `{prev}.{member}`"));
+        }
+    }
+    Ok(())
+}
+
+/// The places of the `fsw.io` instances in the schedule.
+struct IoPoints {
+    at: Vec<usize>,
+    last: usize,
+}
+
+impl IoPoints {
+    /// `None` when the config places no `fsw.io`.
+    fn new(config: &CoordinatorConfig) -> Result<Option<Self>, BuildError> {
+        let at: Vec<usize> = (0..config.systems.len())
+            .filter(|&at| config.systems[at].ty == IO_TYPE)
+            .collect();
+        let channel = |&&p: &&usize| matches!(config.systems[p].adapter, Some(Adapter::Channel(_)));
+        if let Some(&p) = at.iter().find(channel) {
+            let id = config.systems[p].id.clone();
+            return Err(BuildError::IoAdapter { id });
+        }
+        Ok(at.last().copied().map(|last| Self { at, last }))
+    }
+
+    /// The instance after `at`.
+    fn next(&self, at: usize) -> Option<usize> {
+        self.at.iter().copied().find(|&p| p > at)
+    }
+
+    /// The instance before `at`, wrapping to the last.
+    fn prev(&self, at: usize) -> usize {
+        let mut before = self.at.iter().rev().copied();
+        before.find(|&p| p < at).unwrap_or(self.last)
+    }
+}
+
+/// Checks that the instance at `point` reads the SQs of the members whose
+/// next instance it is, and writes the CQs of those whose previous one it is.
+fn check_io_point(
+    config: &CoordinatorConfig,
+    point: usize,
+    points: &IoPoints,
+    members: &[usize],
+) -> Result<(), BuildError> {
+    let ids = |side: &dyn Fn(usize) -> Option<usize>| -> Vec<&str> {
+        let ours = members.iter().filter(|&&m| side(m) == Some(point));
+        ours.map(|&m| config.systems[m].id.as_str()).collect()
+    };
+    let (sqs, cqs) = (ids(&|m| points.next(m)), ids(&|m| Some(points.prev(m))));
+    let io = &config.systems[point];
+    let inputs: Vec<&str> = io.inputs.iter().map(|i| i.port.as_str()).collect();
+    let outputs: Vec<&str> = io.outputs.iter().map(|o| o.port.as_str()).collect();
+    if inputs != sqs || outputs != cqs {
+        return io_error(format!(
+            "`{}` must read the SQs of {sqs:?} and write the CQs of {cqs:?}, in that order",
+            io.id
+        ));
+    }
+    match io
+        .inputs
+        .iter()
+        .find(|i| i.from != [PortRef::new(i.port.as_str(), IO_SQ)])
+    {
+        Some(input) => {
+            let m = &input.port;
+            io_error(format!("`{}`'s input `{m}` must read `{m}.{IO_SQ}`", io.id))
+        }
+        None => Ok(()),
+    }
+}
+
+fn io_error(message: String) -> Result<(), BuildError> {
+    Err(BuildError::IoSystems { message })
 }
 
 /// Returns the definition of system `id`'s `status` output.
@@ -318,6 +454,148 @@ fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildErr
     Ok(())
 }
 
+/// Checks that each `Cap` parameter has exactly one grant,
+/// and that every grant names one.
+fn check_grants(system: &SystemConfig, def: &SystemDef) -> Result<(), BuildError> {
+    let error = |param: &str| (system.id.clone(), param.to_string());
+    for grant in &system.grants {
+        if !def.grants.iter().any(|g| g.param == grant.param) {
+            let (system, param) = error(&grant.param);
+            return Err(BuildError::UnknownGrant { system, param });
+        }
+    }
+    for param in def.grants.iter().map(|g| &g.param) {
+        match system.grants.iter().filter(|g| g.param == *param).count() {
+            1 => {}
+            0 => {
+                let (system, param) = error(param);
+                return Err(BuildError::Ungranted { system, param });
+            }
+            _ => {
+                let (system, param) = error(param);
+                return Err(BuildError::DuplicateGrant { system, param });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks that only a sim resource's device end is held, and that a sim
+/// resource held on one end is held on the other.
+fn check_ends(config: &CoordinatorConfig) -> Result<(), BuildError> {
+    for resource in &config.resources {
+        let grants = config
+            .systems
+            .iter()
+            .flat_map(|s| s.grants.iter().map(move |g| (s, g)));
+        let ends: Vec<(&str, End)> = grants
+            .filter(|(_, g)| g.resource == resource.id)
+            .map(|(s, g)| (s.id.as_str(), g.end))
+            .collect();
+        let held = |end: End| ends.iter().any(|&(_, e)| e == end);
+        let sim = matches!(resource.backing, Backing::Sim(_));
+        if sim
+            && !ends.is_empty()
+            && let Some(missing) = [End::Host, End::Device].into_iter().find(|&e| !held(e))
+        {
+            let resource = resource.id.clone();
+            return Err(BuildError::OneEnd { resource, missing });
+        }
+        if let Some(&(system, _)) = ends.iter().find(|&&(_, e)| !sim && e == End::Device) {
+            return Err(BuildError::RealDeviceEnd {
+                system: system.to_string(),
+                resource: resource.id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Each system with a `Cap`, in config order: its id and the resource index
+/// and end of each `Cap` parameter, in definition order.
+fn io_members(plan: &Plan<'_>, config: &CoordinatorConfig) -> Vec<(String, Vec<(u16, End)>)> {
+    let resource = |system: &SystemConfig, param: &str| {
+        let grant = system.grants.iter().find(|g| g.param == param);
+        let at = grant.and_then(|g| {
+            let at = config.resources.iter().position(|r| r.id == g.resource)?;
+            Some((at as u16, g.end))
+        });
+        // PANIC Safety: `check_grants` and `check_interfaces` gave every
+        // `Cap` one grant of a resource the config creates.
+        at.expect("a checked grant")
+    };
+    let systems = config.systems.iter().zip(&plan.systems);
+    systems
+        .filter(|(_, planned)| !planned.def.grants.is_empty())
+        .map(|(system, planned)| {
+            let caps = planned
+                .def
+                .grants
+                .iter()
+                .map(|g| resource(system, &g.param));
+            (system.id.clone(), caps.collect())
+        })
+        .collect()
+}
+
+/// Checks that resource ids are unique and that each backing is one this
+/// build runs.
+fn check_resources(resources: &[ResourceConfig]) -> Result<(), BuildError> {
+    for (at, resource) in resources.iter().enumerate() {
+        if resources[..at].iter().any(|r| r.id == resource.id) {
+            let id = resource.id.clone();
+            return Err(BuildError::DuplicateResource { id });
+        }
+        let backing = match &resource.backing {
+            Backing::Peer(_) => resource.backing.name(),
+            Backing::Real(RealKind::TcpConnect { .. }) => "tcp_connect",
+            _ => continue,
+        };
+        return Err(BuildError::Backing {
+            resource: resource.id.clone(),
+            backing: backing.into(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks that each grant names a resource that provides its parameter's
+/// interface.
+fn check_interfaces(
+    system: &SystemConfig,
+    def: &SystemDef,
+    resources: &[ResourceConfig],
+) -> Result<(), BuildError> {
+    for grant in &system.grants {
+        let resource = resources.iter().find(|r| r.id == grant.resource);
+        let Some(resource) = resource else {
+            return Err(BuildError::UnknownResource {
+                system: system.id.clone(),
+                param: grant.param.clone(),
+                resource: grant.resource.clone(),
+            });
+        };
+        let Some(found) = resource.backing.interface() else {
+            continue;
+        };
+        // PANIC Safety: `check_grants` ran first, so every grant names a cap.
+        let cap = def
+            .grants
+            .iter()
+            .find(|g| g.param == grant.param)
+            .expect("a checked grant");
+        if cap.interface != found {
+            return Err(BuildError::Interface {
+                cap: format!("{}.{}", system.id, grant.param),
+                resource: resource.id.clone(),
+                expected: cap.interface.to_string(),
+                found: found.into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Returns the first port whose name repeats an earlier port's name.
 fn duplicate(ports: &[PortDef]) -> Option<&PortDef> {
     ports
@@ -446,10 +724,19 @@ fn allocate_ring(spec: &RingSpec, ring_depth: usize) -> Result<RingBuffer, Build
     Ok(RingBuffer::create_in_memory(config))
 }
 
+/// What every system of one target shares at make.
+#[derive(Clone, Copy)]
+struct Target<'a> {
+    seed: Option<u64>,
+    namespace: &'a str,
+}
+
 fn bind_rings(
     plan: &Plan<'_>,
     rings: &[RingBuffer],
     threads: &mut Threads,
+    io: &SharedIo,
+    target: Target<'_>,
 ) -> Result<Vec<Entry>, BuildError> {
     let mut entries = Vec::with_capacity(plan.systems.len());
     for system in &plan.systems {
@@ -469,6 +756,9 @@ fn bind_rings(
             inputs,
             outputs,
             threads,
+            io,
+            seed: target.seed,
+            namespace: target.namespace,
         };
         let step = match system.adapter {
             Some(Adapter::Channel(_)) => crate::channel::make(&system.entry.make, cx),
@@ -499,6 +789,30 @@ impl Clock {
             return Err(BuildError::InvalidClockRate);
         }
         Ok(())
+    }
+
+    /// Checks that cycle times are fixed and strictly increasing: a turned
+    /// group keys its turns on them, and its clock counts whole microseconds
+    /// from zero.
+    fn check_deterministic(&self) -> Result<(), BuildError> {
+        match *self {
+            Self::Wall { .. } => Err(BuildError::DeterministicWall),
+            Self::Simulated { dt, .. } if dt < Duration::from_micros(1) => {
+                Err(BuildError::DeterministicZeroDt)
+            }
+            Self::Simulated { epoch, .. } if epoch.is_none_or(|e| e.0 < 0) => {
+                Err(BuildError::DeterministicEpoch)
+            }
+            Self::Simulated { .. } => Ok(()),
+        }
+    }
+
+    /// The fixed start of a simulated clock, if it has one.
+    pub(crate) fn epoch(&self) -> Option<Timestamp> {
+        match self {
+            Self::Simulated { epoch, .. } => *epoch,
+            Self::Wall { .. } => None,
+        }
     }
 
     /// Returns the wall-clock time budget for one cycle.
@@ -584,6 +898,7 @@ mod tests {
                     Vec::new()
                 },
                 outputs: if input { Vec::new() } else { vec![port] },
+                grants: Vec::new(),
             };
             assert_eq!(
                 check_alignment("test", &def),
@@ -612,6 +927,7 @@ mod tests {
                 } else {
                     vec![port.clone(), port.clone()]
                 },
+                grants: Vec::new(),
             };
             let expected = if input {
                 BuildError::DuplicateInput {
@@ -635,6 +951,7 @@ mod tests {
             name: "test".into(),
             inputs: vec![port.clone()],
             outputs: vec![port],
+            grants: Vec::new(),
         };
         assert_eq!(check_port_names("instance", &def), Ok(()));
         assert_eq!(
@@ -1125,7 +1442,8 @@ mod tests {
     fn test_zero_cycle_budget() {
         assert_eq!(
             Clock::Simulated {
-                dt: Duration::from_millis(5)
+                dt: Duration::from_millis(5),
+                epoch: None,
             }
             .cycle_budget(),
             Duration::ZERO
@@ -1142,5 +1460,162 @@ mod tests {
         };
         assert_eq!(clock.validate(), Ok(()));
         assert_eq!(clock.cycle_budget(), Duration::from_secs(1_000));
+    }
+
+    #[cfg(unix)]
+    mod io {
+        use serde_json::{Value, json};
+
+        use super::*;
+        use crate::io::{Cap, Uart};
+
+        #[system]
+        fn line(uart: &Cap<Uart>) {
+            let _ = uart;
+        }
+
+        fn table() -> SystemTable {
+            let mut table = SystemTable::new();
+            crate::link::register_builtins(&mut table).unwrap();
+            table.register("line", line(), || ()).unwrap();
+            table
+        }
+
+        fn io(id: &str, sqs: &[&str], cqs: &[&str]) -> Value {
+            let sq = |m: &&str| json!({ "port": m, "from": [{ "system": m, "port": IO_SQ }] });
+            let cq = |m: &&str| json!({ "port": m, "record": "io_cqe" });
+            json!({
+                "id": id,
+                "ty": IO_TYPE,
+                "inputs": sqs.iter().map(sq).collect::<Vec<_>>(),
+                "outputs": cqs.iter().map(cq).collect::<Vec<_>>(),
+            })
+        }
+
+        fn member(id: &str, end: &str, cq_from: &str) -> Value {
+            json!({
+                "id": id,
+                "ty": "line",
+                "inputs": [{ "port": IO_CQ, "from": [{ "system": cq_from, "port": id }] }],
+                "grants": [{ "param": "uart", "resource": "wire", "end": end }],
+            })
+        }
+
+        fn config(systems: Vec<Value>) -> CoordinatorConfig {
+            let resources = json!([{ "id": "wire", "backing": { "sim": "uart" } }]);
+            CoordinatorConfig {
+                systems: serde_json::from_value(Value::Array(systems)).unwrap(),
+                resources: serde_json::from_value(resources).unwrap(),
+                ..Default::default()
+            }
+        }
+
+        /// A driver, `io_submit`, a model, then `io_complete`.
+        fn nominal() -> Vec<Value> {
+            vec![
+                member("a", "host", "io_complete"),
+                io("io_submit", &["a"], &["b"]),
+                member("b", "device", "io_submit"),
+                io("io_complete", &["b"], &["a"]),
+            ]
+        }
+
+        fn error(systems: Vec<Value>) -> BuildError {
+            match config(systems).build(&table()) {
+                Ok(_) => panic!("the config built"),
+                Err(e) => e,
+            }
+        }
+
+        fn io_message(systems: Vec<Value>) -> String {
+            match error(systems) {
+                BuildError::IoSystems { message } => message,
+                e => panic!("{e}"),
+            }
+        }
+
+        /// `a`'s CQ wraps around from `io_complete`.
+        #[test]
+        fn test_io_nominal_placement_builds() {
+            config(nominal()).build(&table()).unwrap();
+        }
+
+        #[test]
+        fn test_io_member_after_the_last_instance_is_refused() {
+            let mut systems = nominal();
+            systems[3] = io("io_complete", &["b"], &["a", "c"]);
+            systems.push(member("c", "host", "io_complete"));
+            let message = io_message(systems);
+            assert_eq!(message, "`c` holds a `Cap`, so an fsw.io must follow it");
+        }
+
+        #[test]
+        fn test_io_sq_on_the_wrong_instance_is_refused() {
+            let mut systems = nominal();
+            systems[1] = io("io_submit", &[], &["b"]);
+            systems[3] = io("io_complete", &["a", "b"], &["a"]);
+            let message = io_message(systems);
+            assert!(
+                message.starts_with("`io_submit` must read the SQs of [\"a\"]"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn test_io_cq_from_the_wrong_instance_is_refused() {
+            let mut systems = nominal();
+            systems[0] = member("a", "host", "io_submit");
+            assert_eq!(io_message(systems), "`a.io_cq` must read `io_complete.a`");
+        }
+
+        #[test]
+        fn test_io_sq_read_from_another_port_is_refused() {
+            let mut systems = nominal();
+            systems[1]["inputs"][0]["from"][0]["port"] = json!("status");
+            let message = io_message(systems);
+            assert_eq!(message, "`io_submit`'s input `a` must read `a.io_sq`");
+        }
+
+        #[test]
+        fn test_io_member_without_an_instance_is_refused() {
+            let mut systems = vec![nominal().remove(0), nominal().remove(2)];
+            systems.iter_mut().for_each(|s| s["inputs"] = json!([]));
+            assert!(io_message(systems).contains("needs an fsw.io"));
+        }
+
+        #[test]
+        fn test_io_on_a_channel_is_refused() {
+            let mut systems = nominal();
+            systems[3]["channel"] = json!({ "name": "io" });
+            let e = error(systems);
+            assert!(
+                matches!(&e, BuildError::IoAdapter { id } if id == "io_complete"),
+                "{e}"
+            );
+        }
+
+        #[test]
+        fn test_sim_resource_held_on_one_end_is_refused() {
+            let mut systems = nominal();
+            systems[2]["grants"][0]["end"] = json!("host");
+            let e = error(systems);
+            let one = |e: &BuildError| matches!(e, BuildError::OneEnd { resource, missing: End::Device } if resource == "wire");
+            assert!(one(&e), "{e}");
+        }
+
+        #[test]
+        fn test_device_end_of_a_real_resource_is_refused() {
+            let mut config = config(nominal());
+            config.resources[0].backing = Backing::Real(crate::io::RealKind::Tty {
+                path: "/dev/null".into(),
+                baud: 9600,
+            });
+            let e = config.build(&table()).err().unwrap();
+            let refused = |e: &BuildError| {
+                matches!(e, BuildError::RealDeviceEnd { system, resource }
+                    if system == "b" && resource == "wire")
+            };
+            assert!(refused(&e), "{e}");
+        }
     }
 }

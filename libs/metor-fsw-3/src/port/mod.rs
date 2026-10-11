@@ -233,7 +233,21 @@ impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
     /// Creates an input that reads from `views`, one per producer.
     ///
     /// A record type that needs more alignment than the ring provides fails to
-    /// compile.
+    /// compile:
+    ///
+    /// ```compile_fail,E0080
+    /// # use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+    /// # use metor_fsw_3::{Frame, Input, Timestamp};
+    /// #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+    /// #[repr(C, align(32))]
+    /// struct Overaligned {
+    ///     #[frame(timestamp)]
+    ///     timestamp: Timestamp,
+    ///     value: [u64; 3],
+    /// }
+    ///
+    /// let _ = Input::<Overaligned>::new(Vec::new());
+    /// ```
     pub fn new(views: Vec<View<W>>) -> Self {
         const {
             assert!(

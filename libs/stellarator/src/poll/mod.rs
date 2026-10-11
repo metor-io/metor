@@ -275,6 +275,7 @@ impl Executor<PollingReactor> {
         Ok(Executor {
             reactor: RefCell::new(reactor),
             scheduler,
+            tasks: RefCell::new(Vec::new()),
             timer: Timer::new(crate::os::os_clock()),
         })
     }

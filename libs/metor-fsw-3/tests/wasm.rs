@@ -77,7 +77,7 @@ fn test_export_signatures() {
         [
             "metor_fsw_abi_version [] -> [I32]",
             "metor_fsw_alloc [I32, I32] -> [I32]",
-            "metor_fsw_create [I32, I32, I32, I32, I32, I32] -> [I32]",
+            "metor_fsw_create [I32, I32, I32, I32, I32, I32, I32] -> [I32]",
             "metor_fsw_def [I32, I32, I32, I32, I32] -> [I32]",
             "metor_fsw_destroy [I32] -> []",
             "metor_fsw_execute [I32, I64] -> [I32]",

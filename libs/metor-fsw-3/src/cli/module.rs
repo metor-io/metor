@@ -12,6 +12,7 @@ use serde_json::Value;
 use super::pack_dev::PackDevError;
 use crate::channel::ABORT_PORT;
 use crate::dl::{PackKind, PackRef};
+use crate::io::{GrantDef, IO_CQ, IO_SQ};
 use crate::pack::def::{PackDef, PackSystemDef};
 use crate::record::RecordSchema;
 use crate::system::PortDef;
@@ -40,6 +41,8 @@ struct Module {
     systems: Vec<Entry>,
     /// Whether any system takes a port list from its config.
     takes_ports: bool,
+    /// Whether any system takes a `Cap`, so the module imports `ResourceHandle`.
+    takes_caps: bool,
 }
 
 /// A record class in the generated module.
@@ -86,8 +89,16 @@ struct Entry {
     takes_outputs: bool,
     inputs: Vec<Port>,
     params: Vec<Field>,
+    /// Each `Cap` parameter, with the interface it takes.
+    caps: Vec<CapKw>,
     /// Every output port with its record class. The built-in ports come last.
     ports: Vec<Port>,
+}
+
+#[derive(Clone, Serialize)]
+struct CapKw {
+    name: String,
+    interface: String,
 }
 
 #[derive(Serialize)]
@@ -126,6 +137,7 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
         takes_ports: systems
             .iter()
             .any(|entry| entry.takes_inputs || entry.takes_outputs),
+        takes_caps: systems.iter().any(|entry| !entry.caps.is_empty()),
         pack_id: pack.id.clone(),
         lib: pack.lib.clone(),
         abi_version,
@@ -165,11 +177,15 @@ fn kind(frame: bool) -> &'static str {
     if frame { "frame" } else { "msg" }
 }
 
+/// The `__init__` keywords a generated class passes on itself.
+const RESERVED_KEYWORDS: [&str; 3] = ["items", "records", "grants"];
+
 /// Returns the ports a target can wire.
 ///
-/// This is every port except `abort`, which only a channel writes to.
+/// This is every port except `abort`, which only a channel writes to, and
+/// the IO ports, which the builder wires.
 fn ports(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
-    wired_inputs(system).chain(&system.def.outputs)
+    wired_inputs(system).chain(exposed_outputs(system))
 }
 
 fn wired_inputs(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
@@ -177,7 +193,20 @@ fn wired_inputs(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
         .def
         .inputs
         .iter()
-        .filter(|port| port.name != ABORT_PORT)
+        .filter(|port| port.name != ABORT_PORT && !is_io(system, &port.name))
+}
+
+fn exposed_outputs(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
+    system
+        .def
+        .outputs
+        .iter()
+        .filter(|port| !is_io(system, &port.name))
+}
+
+/// Whether `port` is one of the IO ports a `Cap` adds.
+fn is_io(system: &PackSystemDef, port: &str) -> bool {
+    !system.def.grants.is_empty() && (port == IO_SQ || port == IO_CQ)
 }
 
 fn is_builtin(port: &str) -> bool {
@@ -261,19 +290,28 @@ fn entry(
     defs: &BTreeMap<String, Value>,
 ) -> Result<Entry, PackDevError> {
     let params = fields(schema, defs, false);
-    for field in &params {
-        if system.def.inputs.iter().any(|port| port.name == field.name) {
-            return Err(PackDevError::NameClash {
-                system: system.ty.to_string(),
-                name: field.name.clone(),
-            });
-        }
+    let kw = |g: &GrantDef| CapKw {
+        name: g.param.to_string(),
+        interface: g.interface.to_string(),
+    };
+    let grants = &system.def.grants;
+    let caps: Vec<CapKw> = grants.iter().map(kw).collect();
+    let input = |name: &str| wired_inputs(system).any(|port| port.name == name);
+    let param = |name: &str| params.iter().any(|field| field.name == name);
+    let clash = params.iter().map(|f| &f.name).find(|name| input(name));
+    let taken = |name: &str| input(name) || param(name) || RESERVED_KEYWORDS.contains(&name);
+    let clash = clash.or(caps.iter().map(|c| &c.name).find(|name| taken(name)));
+    if let Some(name) = clash {
+        return Err(PackDevError::NameClash {
+            system: system.ty.to_string(),
+            name: name.clone(),
+        });
     }
     let port = |port: &PortDef| Port {
         name: port.name.to_string(),
         record: class_of(&port.record),
     };
-    let declared = system.def.outputs.iter().filter(|p| !is_builtin(&p.name));
+    let declared = exposed_outputs(system).filter(|p| !is_builtin(&p.name));
     let builtin = BUILTIN_PORTS.iter().map(|(name, class, _)| Port {
         name: name.to_string(),
         record: class.to_string(),
@@ -287,6 +325,7 @@ fn entry(
         takes_outputs: system.takes_outputs,
         inputs: wired_inputs(system).map(port).collect(),
         params,
+        caps,
         ports: declared.map(port).chain(builtin).collect(),
     })
 }
@@ -475,6 +514,7 @@ mod tests {
                 name: ty.into(),
                 inputs,
                 outputs,
+                grants: Vec::new(),
             },
             doc: "".into(),
             params: params.map(|text| RawValue::from_string(text.into()).expect("json")),
@@ -592,5 +632,62 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("AbortRequest"), "{text}");
+    }
+
+    fn capped(params: Option<&'static str>, caps: &[&'static str]) -> PackSystemDef {
+        let mut def = system(
+            "gps",
+            vec![port("est", "est"), port(IO_CQ, "io_cqe")],
+            vec![port("fix", "gps_fix"), port(IO_SQ, "io_sqe")],
+            params,
+        );
+        def.def.grants = caps
+            .iter()
+            .map(|name| GrantDef {
+                param: (*name).into(),
+                interface: "uart".into(),
+            })
+            .collect();
+        def
+    }
+
+    #[test]
+    fn test_caps_render_keywords_and_grants() {
+        let text = rendered(vec![capped(None, &["main", "aux"])]).expect("renders");
+        assert!(text.contains("Record, ResourceHandle, Sources"), "{text}");
+        assert!(
+            text.contains("    _caps = {\"main\": \"uart\", \"aux\": \"uart\"}\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("est: Sources[Est] = (), main: ResourceHandle, aux: ResourceHandle)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("grants={\"main\": main, \"aux\": aux})"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_io_ports_are_not_wired_or_exposed() {
+        let text = rendered(vec![capped(None, &["uart"])]).expect("renders");
+        assert!(!text.contains("io_cq"), "{text}");
+        assert!(!text.contains("io_sq"), "{text}");
+        assert!(!text.contains("IoSqe") && !text.contains("IoCqe"), "{text}");
+    }
+
+    #[test]
+    fn test_reject_cap_param_collision() {
+        let params = r#"{"type":"object","properties":{"uart":{"type":"number"}}}"#;
+        let clash = rendered(vec![capped(Some(params), &["uart"])]);
+        let Err(PackDevError::NameClash { name, .. }) = clash else {
+            panic!("the clash is reported")
+        };
+        assert_eq!(name, "uart");
+        let clash = rendered(vec![capped(None, &["est"])]);
+        assert!(matches!(clash, Err(PackDevError::NameClash { .. })));
+        let clash = rendered(vec![capped(None, &["grants"])]);
+        assert!(matches!(clash, Err(PackDevError::NameClash { .. })));
     }
 }

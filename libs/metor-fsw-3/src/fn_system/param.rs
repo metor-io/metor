@@ -8,9 +8,11 @@ use std::sync::Arc;
 use metor_fsw_3_ring::WakeSink;
 use metor_proto::types::Timestamp;
 
+use crate::Rng;
 use crate::channel::{ABORT_PORT, Abort, AbortRequest};
 use crate::def::{DefCx, DefError};
 use crate::frame::Frame;
+use crate::io::{Cqe, GrantDef, IO_CQ, IO_SQ, Io, Sqe};
 use crate::log::Log;
 use crate::port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers};
 use crate::record::Record;
@@ -64,10 +66,14 @@ pub struct Views<W: WakeSink> {
 
 /// Bound outputs, waiting to be handed to parameters.
 ///
-/// Every output built from these shares one counter of failed writes.
+/// Every output built from these shares one counter of failed writes. A
+/// `Cap` takes its handle from `io`.
 pub struct Writers {
     pub(crate) bindings: Bindings<OutputBinding>,
     pub(crate) dropped: Arc<AtomicU32>,
+    pub(crate) io: Option<Io>,
+    /// The instance's stream, for an `Rng` parameter.
+    pub(crate) rng: Option<Rng>,
 }
 /// The parameter names that [`Param::append_defs`] reads from.
 pub type ParamNames<'n> = core::slice::Iter<'n, &'static str>;
@@ -83,6 +89,12 @@ pub struct Defs {
     /// Whether any parameter is a [`Sample`]. Only a stepped system can take
     /// one.
     pub(crate) sampled: bool,
+    /// Whether any parameter is a `Cap`, which gives the system a queue pair.
+    pub(crate) io: bool,
+    /// The `Cap` parameters, in order.
+    pub(crate) grants: Vec<GrantDef>,
+    /// Whether any parameter is an `Rng`.
+    pub(crate) rng: bool,
 }
 
 impl Defs {
@@ -108,7 +120,22 @@ impl Defs {
 
     fn walk<S: crate::fn_system::Ports>(cx: &DefCx<'_>, mut defs: Self) -> Result<Self, DefError> {
         S::Params::append_defs(&mut S::NAMES.iter(), cx, &mut defs)?;
+        defs.append_io(cx);
         Ok(defs)
+    }
+
+    /// Appends `io_cq` and `io_sq`, for a `Cap`, after the parameters' own
+    /// ports.
+    fn append_io(&mut self, cx: &DefCx<'_>) {
+        if self.io {
+            self.inputs.push(Input::<Cqe>::def(cx, IO_CQ));
+            self.outputs.push(Output::<Sqe>::def(cx, IO_SQ));
+        }
+    }
+
+    /// The IO ports at the end of each port list.
+    pub(crate) fn io_ports(&self) -> usize {
+        usize::from(self.io)
     }
 }
 
@@ -222,7 +249,7 @@ pub trait Param {
 }
 
 /// Takes the name of the next non-tuple parameter.
-fn name(names: &mut ParamNames<'_>) -> &'static str {
+pub(crate) fn param_name(names: &mut ParamNames<'_>) -> &'static str {
     // PANIC Safety: `#[system]` emits one name per parameter.
     names.next().expect("one name per parameter")
 }
@@ -240,7 +267,7 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
         cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        defs.inputs.push(Input::<T>::def(cx, name(names)));
+        defs.inputs.push(Input::<T>::def(cx, param_name(names)));
         Ok(())
     }
 
@@ -276,7 +303,7 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
         cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        defs.inputs.push(Input::<T>::def(cx, name(names)));
+        defs.inputs.push(Input::<T>::def(cx, param_name(names)));
         defs.sampled = true;
         Ok(())
     }
@@ -299,6 +326,40 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
     }
 }
 
+/// An `Rng` draws from the target seed and the instance name. It takes no
+/// port.
+impl Param for Rng {
+    type In<W: WakeSink + Clone + 'static> = ();
+    type Out = Rng;
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Rng;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        param_name(names);
+        defs.rng = true;
+        Ok(())
+    }
+
+    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+
+    fn bind_out(writers: &mut Writers) -> Rng {
+        // PANIC Safety: `fn_system::bind` refuses a set with an `Rng` and no
+        // seed, and every other bind path refuses an `Rng` at its definition.
+        writers.rng.clone().expect("a seeded stream")
+    }
+
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        _input: &'a mut (),
+        output: &'a mut Rng,
+        _cx: &mut Cycle<'a>,
+    ) -> &'a mut Rng {
+        output
+    }
+}
+
 impl<T: Record + 'static + ?Sized> Param for Output<T> {
     type In<W: WakeSink + Clone + 'static> = ();
     type Out = Output<T>;
@@ -309,7 +370,7 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
         cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        defs.outputs.push(Output::<T>::def(cx, name(names)));
+        defs.outputs.push(Output::<T>::def(cx, param_name(names)));
         Ok(())
     }
 
@@ -344,7 +405,7 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
         cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        name(names);
+        param_name(names);
         let ports = crate::port::dyn_input_defs(cx, &defs.declared_inputs)?;
         defs.inputs.extend(ports);
         Ok(())
@@ -375,7 +436,7 @@ impl Param for DynOutputs {
         cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        name(names);
+        param_name(names);
         let ports = crate::port::dyn_output_defs(cx, &defs.declared_outputs)?;
         defs.outputs.extend(ports);
         Ok(())
@@ -406,7 +467,7 @@ impl Param for Timestamp {
         _cx: &DefCx<'_>,
         _defs: &mut Defs,
     ) -> Result<(), DefError> {
-        name(names);
+        param_name(names);
         Ok(())
     }
 
@@ -434,7 +495,7 @@ impl<D: WakeSink + 'static> Param for Abort<D> {
         cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        name(names);
+        param_name(names);
         defs.inputs.push(Input::<AbortRequest>::def(cx, ABORT_PORT));
         Ok(())
     }
@@ -464,7 +525,7 @@ impl Param for Seq<'static> {
         _cx: &DefCx<'_>,
         _defs: &mut Defs,
     ) -> Result<(), DefError> {
-        name(names);
+        param_name(names);
         Ok(())
     }
 
@@ -491,7 +552,7 @@ impl Param for Log {
         _cx: &DefCx<'_>,
         _defs: &mut Defs,
     ) -> Result<(), DefError> {
-        name(names);
+        param_name(names);
         Ok(())
     }
 

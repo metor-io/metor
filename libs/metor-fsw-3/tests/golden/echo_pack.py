@@ -6,14 +6,20 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
-from metor_config import Item, OutPort, Pack, Record, Sources, System
+from metor_config import Item, OutPort, Pack, Record, ResourceHandle, Sources, System
 
 PACK = Pack(
     id="echo",
     lib="echo_pack",
     libs=str(Path(__file__).resolve().parent / "_libs"),
-    abi_version=9,
+    abi_version=13,
 )
+
+
+class GpsFix(Record):
+    _name = "gps_fix"
+    _kind = "msg"
+    _pack = PACK
 
 
 class LogEvent(Record):
@@ -201,6 +207,105 @@ class Retained(System):
         super().__init__({"input": input}, {})
 
     output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Gps(System):
+    "Sets the receiver to 10 Hz, then publishes each fix it reports."
+
+    _pack = PACK
+    _ty = "gps"
+    _ports = {"fix": GpsFix, "log": LogEvent, "status": SystemStatus}
+    _caps = {"uart": "uart"}
+
+    def __init__(self, *, uart: ResourceHandle) -> None:
+        super().__init__({}, {}, grants={"uart": uart})
+
+    fix: OutPort[GpsFix]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class UartScript(System):
+    "A serial device that sends its script, one entry per write."
+
+    _pack = PACK
+    _ty = "uart_script"
+    _ports = {"log": LogEvent, "status": SystemStatus}
+    _caps = {"uart": "uart"}
+
+    def __init__(self, *, uart: ResourceHandle, script: list[str]) -> None:
+        """
+        Args:
+            script: What the device sends, one entry per write.
+        """
+        super().__init__({}, {"script": script}, grants={"uart": uart})
+
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Chatter(System):
+    "A serial device that sends random bytes, drawn from the target seed."
+
+    _pack = PACK
+    _ty = "chatter"
+    _ports = {"log": LogEvent, "status": SystemStatus}
+    _caps = {"uart": "uart"}
+
+    def __init__(self, *, uart: ResourceHandle) -> None:
+        super().__init__({}, {}, grants={"uart": uart})
+
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Reader(System):
+    "Reads continuously, and pings the sum of each read's bytes."
+
+    _pack = PACK
+    _ty = "reader"
+    _ports = {"sums": Ping, "log": LogEvent, "status": SystemStatus}
+    _caps = {"uart": "uart"}
+
+    def __init__(self, *, uart: ResourceHandle) -> None:
+        super().__init__({}, {}, grants={"uart": uart})
+
+    sums: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Grower(System):
+    "Holds a buffer and a serial port, and does nothing with them."
+
+    _pack = PACK
+    _ty = "grower"
+    _ports = {"log": LogEvent, "status": SystemStatus}
+    _caps = {"uart": "uart"}
+
+    def __init__(self, *, uart: ResourceHandle) -> None:
+        super().__init__({}, {}, grants={"uart": uart})
+
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class UntilFix(System):
+    "Completes on the first fix, or fails after `timeout_s` of cycle time."
+
+    _pack = PACK
+    _ty = "until_fix"
+    _ports = {"log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, fix: Sources[GpsFix] = (), timeout_s: float) -> None:
+        """
+        Args:
+            timeout_s: How long to wait for a fix, in seconds of cycle time.
+        """
+        super().__init__({"fix": fix}, {"timeout_s": timeout_s})
+
     log: OutPort[LogEvent]
     status: OutPort[SystemStatus]
 

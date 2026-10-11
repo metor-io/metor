@@ -17,6 +17,7 @@ export = []
 
 [dependencies]
 adcs-contracts = { package = "adcs-contracts-3", path = "../../contracts" }
+futures-lite = "2"
 metor-fsw-3 = { path = "../../../../libs/metor-fsw-3", default-features = false, features = ["threads"] }
 metor-adcs = { workspace = true }
 nox = { workspace = true }

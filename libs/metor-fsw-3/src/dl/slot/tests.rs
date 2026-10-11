@@ -13,6 +13,7 @@ fn def_with(outputs: Vec<PortDef>) -> SystemDef {
         name: "count_up".into(),
         inputs: Vec::new(),
         outputs,
+        grants: Vec::new(),
     }
 }
 
@@ -131,4 +132,12 @@ fn test_same_ports() {
         ..a.clone()
     };
     assert!(same_ports(&a, &rooted));
+    let capped = SystemDef {
+        grants: vec![crate::io::GrantDef {
+            param: "uart".into(),
+            interface: "uart".into(),
+        }],
+        ..a.clone()
+    };
+    assert!(!same_ports(&a, &capped), "candidates take the same caps");
 }

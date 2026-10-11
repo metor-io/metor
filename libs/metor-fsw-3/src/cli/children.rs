@@ -34,7 +34,9 @@ pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsS
         ),
         ("--wall", overrides.wall.map(|rate| rate.to_string())),
         ("--sim-dt", overrides.sim_dt.map(|dt| dt.to_string())),
+        ("--epoch", overrides.epoch.map(|at| at.to_string())),
     ];
+    let deterministic = overrides.deterministic.then(|| "--deterministic".into());
     let set = flags
         .into_iter()
         .filter_map(|(flag, value)| Some([flag.into(), value?.into()]));
@@ -46,6 +48,7 @@ pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsS
     ]
     .into_iter()
     .chain(set.flatten())
+    .chain(deterministic)
     .collect()
 }
 
@@ -247,13 +250,26 @@ mod tests {
             cycles: Some(3),
             wall: Some(50.0),
             sim_dt: Some(0.01),
+            epoch: Some(5),
+            deterministic: true,
             ..Run::default()
         };
         assert_eq!(
             member_argv(Path::new("d.json"), "fsw", &overrides),
             [
-                "run", "d.json", "--target", "fsw", "--cycles", "3", "--wall", "50", "--sim-dt",
-                "0.01"
+                "run",
+                "d.json",
+                "--target",
+                "fsw",
+                "--cycles",
+                "3",
+                "--wall",
+                "50",
+                "--sim-dt",
+                "0.01",
+                "--epoch",
+                "5",
+                "--deterministic"
             ]
             .map(OsString::from)
         );

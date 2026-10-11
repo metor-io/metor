@@ -56,6 +56,14 @@ pub enum ParamError {
     ThreadsUnsupported { system: String },
     #[error("the wasm guest: {0}")]
     Wasm(String),
+    #[error("IO memory: {reason}")]
+    IoMemory { need: usize, reason: String },
+    #[error("`{system}` takes an `Rng`, but a guest's make has no target seed")]
+    GuestRng { system: String },
+    #[error("resource `{id}`: {message}")]
+    Resource { id: String, message: String },
+    #[error("`{system}` feeds io_submit but holds no `Cap` made in this process")]
+    NoIoMember { system: String },
 }
 
 #[cfg(test)]

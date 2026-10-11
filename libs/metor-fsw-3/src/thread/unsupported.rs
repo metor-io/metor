@@ -15,6 +15,10 @@ impl Threads {
     pub fn new() -> Self {
         Self
     }
+
+    pub fn deterministic() -> Self {
+        Self
+    }
 }
 
 /// Returns an error naming the system, since async systems need threads.
@@ -50,6 +54,9 @@ mod tests {
             inputs: vec![vec![&imu]],
             outputs: vec![&nav, &log],
             threads: &mut Threads::new(),
+            io: &crate::io::SharedIo::default(),
+            seed: Some(0),
+            namespace: "",
         });
         assert_eq!(
             refused.err(),

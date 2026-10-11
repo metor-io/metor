@@ -900,6 +900,7 @@ async fn test_simulated_clock_preserves_connection() {
         &seen,
         Clock::Simulated {
             dt: Duration::from_millis(1),
+            epoch: None,
         },
     );
 

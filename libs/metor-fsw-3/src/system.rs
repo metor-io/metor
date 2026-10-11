@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
 use crate::def::{DefCx, DefError};
+use crate::io::GrantDef;
 use crate::record::RecordSchema;
 
 /// Describes one port: its name and the record it carries.
@@ -58,6 +59,9 @@ pub struct SystemDef {
     pub name: Cow<'static, str>,
     pub inputs: Vec<PortDef>,
     pub outputs: Vec<PortDef>,
+    /// The `Cap` parameters, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<GrantDef>,
 }
 
 impl SystemDef {
@@ -73,6 +77,7 @@ impl SystemDef {
             name: name.into(),
             inputs: I::defs(cx)?,
             outputs: O::defs(cx)?,
+            grants: Vec::new(),
         })
     }
 }

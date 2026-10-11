@@ -26,10 +26,10 @@ fn wat(memory: &str, extra: &str, execute: &str) -> String {
         r#"(module
             (import "env" "memory" (memory {memory}))
             {extra}
-            (func (export "metor_fsw_abi_version") (result i32) i32.const 9)
+            (func (export "metor_fsw_abi_version") (result i32) i32.const 13)
             (func (export "metor_fsw_pack_def") (param i32 i32 i32) (result i32) i32.const 0)
             (func (export "metor_fsw_def") (param i32 i32 i32 i32 i32) (result i32) i32.const 0)
-            (func (export "metor_fsw_create") (param i32 i32 i32 i32 i32 i32) (result i32)
+            (func (export "metor_fsw_create") (param i32 i32 i32 i32 i32 i32 i32) (result i32)
                 i32.const 0)
             (func (export "metor_fsw_execute") (param i32 i64) (result i32) {execute})
             (func (export "metor_fsw_alloc") (param i32 i32) (result i32) i32.const 0)
@@ -166,7 +166,7 @@ fn test_accesses_stay_in_memory() {
 #[test]
 fn test_calls_reach_each_export() {
     let mut guest = guest("1", "", "i32.const 4", PAGE);
-    assert_eq!(guest.abi_version(1_000), Ok(9));
+    assert_eq!(guest.abi_version(1_000), Ok(13));
     assert_eq!(guest.execute(0, 0, 1_000), Ok(4));
     assert_eq!(guest.alloc(16, 16, 1_000), Ok(0));
     assert_eq!(guest.free(0, 16, 16, 1_000), Ok(()));
@@ -189,7 +189,7 @@ fn open(text: &str) -> Result<WasmPack, PackError> {
 #[test]
 fn test_wrong_abi_is_mismatch() {
     let text = wat("1", "", "i32.const 0")
-        .replace("(result i32) i32.const 9)", "(result i32) i32.const 1)");
+        .replace("(result i32) i32.const 13)", "(result i32) i32.const 1)");
     assert!(matches!(
         open(&text),
         Err(PackError::AbiMismatch {
@@ -237,14 +237,14 @@ fn step_wat(execute: &str) -> String {
             (global $in (mut i32) (i32.const 0))
             (global $out (mut i32) (i32.const 0))
             (data (i32.const 16) "{json}")
-            (func (export "metor_fsw_abi_version") (result i32) i32.const 9)
+            (func (export "metor_fsw_abi_version") (result i32) i32.const 13)
             (func (export "metor_fsw_pack_def") (param $dst i32) (param i32) (param $written i32)
                 (result i32)
                 (memory.copy (local.get $dst) (i32.const 16) (i32.const {len}))
                 (i32.store (local.get $written) (i32.const {len}))
                 i32.const 0)
             (func (export "metor_fsw_def") (param i32 i32 i32 i32 i32) (result i32) i32.const 2)
-            (func (export "metor_fsw_create") (param i32 i32 i32 i32 i32 i32) (result i32)
+            (func (export "metor_fsw_create") (param i32 i32 i32 i32 i32 i32 i32) (result i32)
                 (if (i32.load offset=4 (local.get 3))
                     (then (global.set $in (i32.load (i32.load (i32.load (local.get 3)))))))
                 (if (i32.load offset=4 (local.get 4))
@@ -273,7 +273,7 @@ const LOG_RING: usize = 1 << 16;
 ///
 /// If `corrupt` is set, the record's length is written as `u32::MAX`.
 fn record_stores(record: &[u8], corrupt: bool) -> String {
-    let (config, _) = mirror_config(RING, 2).expect("fits");
+    let (config, _) = mirror_config(RING, 2, 1).expect("fits");
     let ring = RingBuffer::create_in_memory(config);
     let _host = ring.view(NoWake).expect("a free reader slot");
     let before = region_bytes(&ring);
@@ -326,6 +326,7 @@ fn rig(execute: &str) -> Rig {
             Output::<LogEvent>::def(&cx, "output"),
             Output::<LogEvent>::def(&cx, "log"),
         ],
+        grants: Vec::new(),
     };
     let instance = Instance {
         id: "guest".into(),
@@ -333,13 +334,15 @@ fn rig(execute: &str) -> Rig {
         adapter: None,
     };
     let (seen, lines) = (output.view(NoWake), log.view(NoWake));
+    let (inputs, outputs) = ([vec![&input]], [&output, &log]);
+    let io = crate::io::SharedIo::default();
     let step = pack
         .create(
             "guest",
             &serde_json::Value::Null,
             &instance,
-            &[vec![&input]],
-            &[&output, &log],
+            (&inputs, &outputs),
+            &io,
         )
         .expect("creates");
     Rig {
@@ -412,7 +415,7 @@ fn test_each_end() {
 
 #[test]
 fn test_corrupt_input_ring_ends_the_step() {
-    let cursor = slot_cursor(mirror_config(RING, 2).expect("fits").0);
+    let cursor = slot_cursor(mirror_config(RING, 2, 1).expect("fits").0);
     let at = format!("(i32.add (global.get $in) (i32.const {cursor}))");
     let mut rig = rig(&format!("(i64.store {at} (i64.const -2)) i32.const 0"));
     rig.execute();
