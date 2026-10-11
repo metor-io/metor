@@ -22,14 +22,18 @@ mod tests;
 #[cfg(feature = "host")]
 pub(crate) use config::Adapters;
 pub use config::{
-    Adapter, BuildOptions, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig,
-    InvalidWallRate, Location, OutputConfig, OutputSource, PortRef, SystemConfig, WallRate,
+    Adapter, BuildOptions, ChannelConfig, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH,
+    InputConfig, InvalidWallRate, Location, OutputConfig, OutputSource, PortRef, RunState,
+    SystemConfig, WallRate,
 };
 pub use error::BuildError;
 pub use params::{MakeError, ParamError, Params};
 #[cfg(feature = "host")]
 pub use run::Coordinator;
 pub use status::SystemStatus;
-pub use step::{EndReason, LoadError, Occupant, Step, StepCx};
+pub use step::{EndReason, LoadError, Occupant, Step};
+pub(crate) use step::{Stepped, catch_step};
+#[cfg(feature = "host")]
+pub(crate) use table::MakeFn;
 pub(crate) use table::TableEntry;
 pub use table::{MakeCx, SystemKind, SystemTable};

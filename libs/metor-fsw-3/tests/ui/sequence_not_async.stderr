@@ -1,0 +1,5 @@
+error: a `#[sequence]` fn is `async`
+ --> tests/ui/sequence_not_async.rs:4:1
+  |
+4 | fn arm(seq: &Seq) -> Result<(), SeqError> {
+  | ^^

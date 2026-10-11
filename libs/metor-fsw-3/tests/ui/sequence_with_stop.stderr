@@ -1,0 +1,5 @@
+error: a `#[sequence]` fn takes no `stop`; `seq.aborted()` and its waits report an abort
+ --> tests/ui/sequence_with_stop.rs:4:31
+  |
+4 | async fn arm(seq: &Seq, stop: Stop) -> Result<(), SeqError> {
+  |                               ^^^^

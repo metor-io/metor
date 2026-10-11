@@ -13,7 +13,9 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
+use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 
+use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
 use crate::io::{Backing, Cqe, IO_CQ, IO_SQ, IO_TYPE, IoState, ResourceEnd, ResourceIndex};
 use crate::port::{Output, ring_capacity};
@@ -84,6 +86,7 @@ impl CoordinatorConfig {
         if options.deterministic {
             self.clock.check_deterministic()?;
         }
+        check_channels(&self)?;
         let bindings = Bindings::collect(&self)?;
         wire_io(&mut self.systems, &bindings)?;
         let records = Arc::new(table.records());
@@ -306,6 +309,7 @@ impl TableEntry {
         let adapter = match &system.adapter {
             None => "without an adapter".to_string(),
             Some(Adapter::Thread(thread)) => format!("on thread `{thread}`"),
+            Some(Adapter::Channel(channel)) => format!("behind channel `{}`", channel.name),
         };
         Err(BuildError::UnsupportedAdapter {
             id: system.id.clone(),
@@ -322,6 +326,11 @@ impl TableEntry {
 /// final one if none comes before. Each `fsw.io` gets its members' ports in
 /// step order.
 fn wire_io(systems: &mut [SystemConfig], bindings: &Bindings) -> Result<(), BuildError> {
+    let channel =
+        |s: &&SystemConfig| s.ty == IO_TYPE && matches!(s.adapter, Some(Adapter::Channel(_)));
+    if let Some(io) = systems.iter().find(channel) {
+        return Err(BuildError::IoAdapter { id: io.id.clone() });
+    }
     let members: Vec<usize> = (0..systems.len())
         .filter(|&m| bindings.holds(&systems[m].id))
         .collect();
@@ -380,6 +389,35 @@ impl IoPoints {
     }
 }
 
+/// Checks that channel names are short enough and unique.
+///
+/// A name must fit the wire format's length cap, and no two systems may use
+/// the same one.
+fn check_channels(config: &CoordinatorConfig) -> Result<(), BuildError> {
+    let names = config
+        .systems
+        .iter()
+        .filter_map(|system| match &system.adapter {
+            Some(Adapter::Channel(channel)) => Some(channel.name.as_str()),
+            _ => None,
+        });
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if name.len() > SEQUENCE_CHANNEL_NAME_CAP {
+            return Err(BuildError::ChannelName {
+                name: name.to_string(),
+                cap: SEQUENCE_CHANNEL_NAME_CAP,
+            });
+        }
+        if !seen.insert(name) {
+            return Err(BuildError::DuplicateChannel {
+                name: name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Maps each system id to its position in the config, rejecting duplicate ids.
 fn index_by_id(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, BuildError> {
     let mut index = HashMap::with_capacity(config.systems.len());
@@ -428,8 +466,16 @@ impl SystemDef {
         records: &Records,
         producer: impl Fn(&str, &PortRef) -> Result<Option<PortDef>, BuildError>,
     ) -> Result<Self, BuildError> {
+        let channel = matches!(system.adapter, Some(Adapter::Channel(_)));
         let mut edges: Vec<(&str, PortDef)> = Vec::new();
         for input in &system.inputs {
+            if channel && input.port == ABORT_PORT {
+                return Err(reserved(system, ABORT_PORT));
+            }
+            // The channel reads its commands; the system never sees them.
+            if channel && input.port == COMMANDS_PORT {
+                continue;
+            }
             for from in &input.from {
                 match producer(&input.port, from)? {
                     Some(def) => edges.push((input.port.as_str(), def)),
@@ -460,6 +506,9 @@ impl SystemDef {
             return Err(BuildError::ReservedPort {
                 ty: system.ty.clone(),
             });
+        }
+        if channel {
+            def = crate::channel::def(def, &cx).map_err(|port| reserved(system, &port))?;
         }
         def.outputs.push(SystemStatus::port_def(&cx));
         Ok(def)
@@ -503,6 +552,13 @@ impl SystemDef {
             }
         }
         Ok(())
+    }
+}
+
+fn reserved(system: &SystemConfig, port: &str) -> BuildError {
+    BuildError::ReservedChannelPort {
+        id: system.id.clone(),
+        port: port.to_string(),
     }
 }
 
@@ -756,7 +812,11 @@ fn make_systems(
             namespace: args.namespace,
             records: args.records,
         };
-        let step = (system.entry.make)(cx).map_err(|source| {
+        let step = match system.adapter {
+            Some(Adapter::Channel(_)) => crate::channel::make(&system.entry.make, cx),
+            _ => (system.entry.make)(cx),
+        }
+        .map_err(|source| {
             let id = system.id.to_string();
             BuildError::Make { id, source }.at(system.location)
         })?;
@@ -813,7 +873,7 @@ mod tests {
 
     use super::*;
     use crate::coordinator::{
-        InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig, WallRate,
+        ChannelConfig, InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig, WallRate,
     };
     use crate::def::DefError;
     use crate::tests::utils::{self, Recorder, pipeline_config, table};
@@ -1605,8 +1665,24 @@ mod tests {
             let mut config = config(nominal(), "a", "b");
             config.systems[3].adapter = Some(Adapter::Thread("io".into()));
             let e = error(config);
-            let refused = |e: &BuildError| matches!(e, BuildError::UnsupportedAdapter { id, .. } if id == "io_complete");
+            let refused = |e: &BuildError| {
+                matches!(e, BuildError::UnsupportedAdapter { id, .. } if id == "io_complete")
+            };
             assert!(refused(&e), "{e}");
+        }
+
+        #[test]
+        fn test_io_on_a_channel_is_refused() {
+            let mut config = config(nominal(), "a", "b");
+            config.systems[3].adapter = Some(Adapter::Channel(ChannelConfig {
+                name: "io".into(),
+                start: Default::default(),
+            }));
+            let e = error(config);
+            assert!(
+                matches!(&e, BuildError::IoAdapter { id } if id == "io_complete"),
+                "{e}"
+            );
         }
 
         #[test]

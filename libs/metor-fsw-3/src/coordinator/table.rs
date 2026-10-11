@@ -12,8 +12,9 @@ use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, InSet, OutSet, SystemFn};
-use crate::io::{Io, IoState};
+use crate::io::{Io, SharedIo};
 use crate::port::{Input, Output};
+use crate::sequence::SequenceFn;
 use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 use crate::thread::{DEFAULT_THREAD, LaunchCx, Launched, Threads};
 
@@ -126,6 +127,8 @@ pub enum SystemKind {
     /// Executed once per cycle.
     #[default]
     Cyclic,
+    /// A `#[sequence]` fn, polled once per cycle until it returns.
+    Sequence,
     /// An async system that runs on its own thread.
     Async,
 }
@@ -135,7 +138,7 @@ impl SystemKind {
     /// The adapters a type of this kind runs behind.
     pub(crate) fn adapters(self) -> Adapters {
         match self {
-            Self::Cyclic => Adapters {
+            Self::Cyclic | Self::Sequence => Adapters {
                 thread: false,
                 ..Adapters::default()
             },
@@ -207,6 +210,19 @@ impl SystemTable {
                 ty: ty.to_string(),
                 source,
             })?;
+        self.insert(ty, entry)
+    }
+
+    /// Registers a `#[sequence]` fn under the name `ty`.
+    ///
+    /// `ctor` builds its state.
+    pub fn register_sequence<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
+        &mut self,
+        ty: &str,
+        _sequence: S,
+        ctor: C,
+    ) -> Result<(), BuildError> {
+        let entry = crate::sequence::entry::<S, M, C>(ctor).map_err(def_error(ty))?;
         self.insert(ty, entry)
     }
 
@@ -301,11 +317,12 @@ impl SystemTable {
 impl SystemTable {
     /// Collects every record the table's ports use.
     ///
-    /// This includes the `status` port the coordinator adds.
+    /// This includes the `status` and channel ports the coordinator adds.
     pub(crate) fn records(&self) -> crate::def::Records {
         let status = SystemStatus::port_def(&DefCx::empty());
         crate::def::Records::from_port_defs(
             core::iter::once(&status)
+                .chain(&crate::channel::ports(&DefCx::empty()))
                 .chain(self.entries().flat_map(|(_, entry)| entry.def.ports_iter())),
         )
     }
@@ -507,6 +524,9 @@ mod tests {
             Some(out(&SystemStatus::port_def(&DefCx::empty())))
         );
         assert!(record(&table, "missing").is_none());
+        for port in &crate::channel::ports(&DefCx::empty()) {
+            assert_eq!(record(&table, &port.record), Some(out(port)));
+        }
         let first = Output::<Imu>::def(&DefCx::empty(), "first");
         let mut second = first.clone();
         second.name = "second".into();

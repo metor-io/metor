@@ -91,6 +91,42 @@
 //! table.register_async("relay", relay(), Default::default)?;
 //! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
+//!
+//! A sequence is an `async fn` marked `#[sequence]`. The coordinator polls it
+//! once per cycle until it returns. Its [`Seq`] handle gives it the cycle's
+//! time and lets it wait in cycle time. An abort ends any wait with
+//! [`SeqError::Aborted`].
+//!
+//! ```
+//! # use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+//! # use metor_fsw_3::{Frame, Timestamp};
+//! # #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+//! # #[repr(C)]
+//! # struct Gps {
+//! #     #[frame(timestamp)]
+//! #     timestamp: Timestamp,
+//! #     pos: [f64; 3],
+//! # }
+//! use core::time::Duration;
+//! use metor_fsw_3::{Input, Output, Seq, SeqError, SystemTable, sequence};
+//!
+//! /// Waits for a fix, then publishes the origin for one second.
+//! #[sequence]
+//! async fn hold(seq: &Seq, gps: &mut Input<Gps>, out: &mut Output<Gps>) -> Result<(), SeqError> {
+//!     seq.wait_for(Duration::from_secs(5), || gps.latest().is_ok_and(|f| f.is_some()))
+//!         .await?;
+//!     let _ = out.write(&Gps { timestamp: seq.now(), pos: [0.0; 3] });
+//!     seq.sleep(Duration::from_secs(1)).await
+//! }
+//!
+//! let mut table = SystemTable::new();
+//! table.register_sequence("hold", hold(), Default::default)?;
+//! # Ok::<(), metor_fsw_3::BuildError>(())
+//! ```
+//!
+//! Setting `channel=` in a system's config wraps the system in the [`channel`]
+//! adapter. A channel lets an operator start, stop, reset, abort, or load the
+//! system by sending `SequenceCommand` messages.
 
 // The derives name this crate by its package name, in doctests as well as here.
 extern crate self as metor_fsw_3;
@@ -98,6 +134,7 @@ extern crate self as metor_fsw_3;
 pub mod async_system;
 #[cfg(feature = "host")]
 pub mod builtins;
+pub mod channel;
 pub mod coordinator;
 pub mod def;
 pub mod fn_system;
@@ -110,6 +147,7 @@ mod panic;
 pub mod port;
 pub mod record;
 mod rng;
+pub mod sequence;
 pub mod system;
 pub mod thread;
 
@@ -117,12 +155,13 @@ pub mod thread;
 mod tests;
 
 pub use async_system::{AsyncSystem, Stop};
+pub use channel::{Abort, AbortRequest, ChannelState, ChannelStatus};
 #[cfg(feature = "host")]
 pub use coordinator::Coordinator;
 pub use coordinator::{
-    Adapter, BuildError, Clock, CoordinatorConfig, EndReason, InputConfig, LoadError, MakeError,
-    Occupant, OutputConfig, OutputSource, ParamError, Params, PortRef, Step, SystemConfig,
-    SystemKind, SystemStatus, SystemTable, WallRate,
+    Adapter, BuildError, ChannelConfig, Clock, CoordinatorConfig, EndReason, InputConfig,
+    LoadError, MakeError, Occupant, OutputConfig, OutputSource, ParamError, Params, PortRef,
+    RunState, Step, SystemConfig, SystemKind, SystemStatus, SystemTable, WallRate,
 };
 pub use def::{DefCx, DefError, Records};
 pub use fn_system::{
@@ -131,7 +170,7 @@ pub use fn_system::{
 pub use frame::Frame;
 pub use io::{Buf, Cap, Handle, Io, IoInit, Pending, ResourceStatus, Slot};
 pub use log::{Log, LogLayer};
-pub use metor_fsw_3_macros::{Frame, Record, system};
+pub use metor_fsw_3_macros::{Frame, Record, sequence, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
 pub use port::{
     DynInputs, DynOutputs, Input, InputWake, Latest, Output, RecvError, Sample, SendError,
@@ -139,6 +178,7 @@ pub use port::{
 };
 pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Payload, Record, RecordSchema};
 pub use rng::Rng;
+pub use sequence::{OnAbort, Redline, Seq, SeqError, SequenceFn};
 pub use system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 
 pub use metor_fsw_3_ring as ring;

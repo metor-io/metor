@@ -1,8 +1,10 @@
 //! A GPS receiver driver on a serial port: it sets the receiver to 10 Hz,
 //! then publishes each fix the receiver reports.
 
+use core::time::Duration;
+
 use metor_fsw_3::io::{Cap, ReadOp, Uart, WriteOp};
-use metor_fsw_3::{IoInit, Log, MakeError, Output, Record, Slot, system};
+use metor_fsw_3::{Input, IoInit, Log, MakeError, Output, Record, Seq, SeqError, Slot, sequence, system};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -209,6 +211,36 @@ pub fn uart_script(#[state] s: &mut UartScript, uart: &Cap<Uart>) {
         buf.fill(&entry);
         s.tx = Slot::Busy(uart.write(buf));
     }
+}
+
+/// The params for `until_fix`.
+#[derive(Deserialize, JsonSchema)]
+pub struct UntilFixParams {
+    /// How long to wait for a fix, in seconds of cycle time.
+    pub timeout_s: f64,
+}
+
+pub struct UntilFix {
+    timeout: Duration,
+}
+
+impl UntilFix {
+    pub fn new(params: UntilFixParams) -> Self {
+        Self {
+            timeout: Duration::from_secs_f64(params.timeout_s.max(0.0)),
+        }
+    }
+}
+
+/// Completes on the first fix, or fails after `timeout_s` of cycle time.
+#[sequence]
+pub async fn until_fix(
+    #[state] s: &mut UntilFix,
+    seq: &Seq,
+    fix: &mut Input<Gps>,
+) -> Result<(), SeqError> {
+    let fixed = || fix.latest().is_ok_and(|f| f.is_some());
+    seq.wait_for(s.timeout, fixed).await
 }
 
 #[cfg(test)]
