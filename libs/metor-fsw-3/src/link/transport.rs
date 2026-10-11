@@ -88,6 +88,15 @@ impl Endpoint {
         }
     }
 
+    /// Returns the bound listener, for a system that runs its own accept loop.
+    #[cfg(feature = "db")]
+    pub(crate) fn listener(&self) -> Option<&TcpListener> {
+        match self {
+            Self::Listen { listener, .. } => Some(listener),
+            Self::Connect { .. } => None,
+        }
+    }
+
     /// Returns the address the listener bound. This is how a caller that asked
     /// for port zero learns the real port.
     pub(crate) fn local_addr(&self) -> Option<SocketAddr> {

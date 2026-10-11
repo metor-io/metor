@@ -14,8 +14,11 @@ mod slot;
 
 use std::collections::HashMap;
 
+use metor_proto::types::PacketId;
+
 use crate::coordinator::{OutputSource, PeerLink, SystemConfig, SystemTable};
-use crate::link::{LINK_TYPES, LinkParams, Transport};
+use crate::link::{DB_TYPE, DbParams, LINK_TYPES, LinkParams, Transport};
+use crate::record::RecordSchema;
 
 pub use config::{CONFIG_VERSION, ConfigError, DeploymentConfig, TargetConfig};
 pub use error::DeployError;
@@ -29,8 +32,9 @@ pub const LOOPBACK: &str = "127.0.0.1";
 /// Resolves every peer reference in `envelope`.
 ///
 /// `tables` holds one system table per target. Peer transports become
-/// addresses, and peer outputs become port definitions. An envelope with
-/// nothing to resolve is left unchanged.
+/// addresses, and peer outputs become port definitions. Each database is also
+/// told which command messages its subscribers receive through it. An
+/// envelope with nothing to resolve is left unchanged.
 pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Result<(), DeployError> {
     let plan = plan(envelope, tables)?;
     for (at, addr) in plan.transports {
@@ -41,6 +45,12 @@ pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Resul
     }
     for ((at, output), def) in plan.outputs {
         at.get_mut(envelope).outputs[output].source = OutputSource::Def(def);
+    }
+    for (at, ids) in plan.commands {
+        let system = at.get_mut(envelope);
+        let mut params = Part::<DbParams>::read(system)?;
+        params.part.command_ids = ids;
+        params.write(system)?;
     }
     check_ports(envelope)
 }
@@ -74,6 +84,7 @@ fn dials_peer(system: &SystemConfig) -> bool {
 struct Plan {
     transports: Vec<(At, String)>,
     outputs: Vec<((At, usize), crate::PortDef)>,
+    commands: Vec<(At, Vec<PacketId>)>,
 }
 
 fn plan(envelope: &DeploymentConfig, tables: &[SystemTable]) -> Result<Plan, DeployError> {
@@ -81,7 +92,9 @@ fn plan(envelope: &DeploymentConfig, tables: &[SystemTable]) -> Result<Plan, Dep
     let mut plan = Plan {
         transports: Vec::new(),
         outputs: Vec::new(),
+        commands: Vec::new(),
     };
+    let mut commands: HashMap<At, Vec<PacketId>> = HashMap::new();
     for (t, target) in envelope.targets.iter().enumerate() {
         for (s, system) in target.coordinator.systems.iter().enumerate() {
             let at = At::new(t, s);
@@ -107,8 +120,24 @@ fn plan(envelope: &DeploymentConfig, tables: &[SystemTable]) -> Result<Plan, Dep
                 })?;
             plan.transports
                 .push((at, address(host(envelope, &peer.target), port)));
+            if peer_at.get(envelope).ty == DB_TYPE {
+                let ids = commands.entry(peer_at).or_default();
+                for port in &index.def(at)?.outputs {
+                    if let RecordSchema::Msg { id, .. } = &port.schema
+                        && !ids.contains(id)
+                    {
+                        ids.push(*id);
+                    }
+                }
+            }
         }
     }
+    let mut commands: Vec<_> = commands.into_iter().collect();
+    commands.sort_unstable_by_key(|(at, _)| *at);
+    for (_, ids) in &mut commands {
+        ids.sort_unstable();
+    }
+    plan.commands = commands;
     Ok(plan)
 }
 

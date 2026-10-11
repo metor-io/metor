@@ -6,9 +6,9 @@ each and groups them in a `Deployment`. When the file finishes, the config
 is written to `$METOR_CONFIG_OUT`, or to stdout, for `metor run` to read.
 """
 
-from ._builtins import ChannelRegistry, DlSlot, LinkStatus, Publish, Subscribe
+from ._builtins import ChannelRegistry, Db, DbStatus, DlSlot, LinkStatus, Publish, Subscribe
 from ._config import CONFIG_VERSION, ConfigError
-from ._deployment import Deployment, emit
+from ._deployment import Deployment, emit, gateway
 from ._io import (
     Can,
     Dir,
@@ -65,9 +65,12 @@ __all__ = [
     "SequenceChannelEvent",
     "SequenceCommand",
     "SequenceRegistry",
+    "gateway",
     "SystemStatus",
     "LogEvent",
     "LinkStatus",
+    "DbStatus",
+    "Db",
     "CONFIG_VERSION",
     "ConfigError",
     "Deployment",

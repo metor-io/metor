@@ -1,13 +1,14 @@
 """Built-in systems that any target can add.
 
-`Publish` sends records to other targets, and `Subscribe` receives them.
-`DlSlot` and `ChannelRegistry` support channels.
+`Publish` sends records to other targets, and `Subscribe` receives them. `Db`
+is an embedded database, which is how a gateway records telemetry. `DlSlot`
+and `ChannelRegistry` support channels.
 
 These systems are built into the host rather than supplied by a pack, so
 their pack has no library and is left out of the config's pack list.
 
-The two link systems (`Publish` and `Subscribe`) each take exactly one
-transport: a `listen` address, a `connect` address, or a `peer` link in
+The three link systems (`Publish`, `Subscribe`, and `Db`) each take exactly
+one transport: a `listen` address, a `connect` address, or a `peer` link in
 the same deployment, which `metor build` turns into an address.
 """
 
@@ -48,6 +49,14 @@ class LinkStatus(Record):
     """Socket statistics that a link writes when they change."""
 
     _name = "link_status"
+    _kind = "frame"
+    _pack = PACK
+
+
+class DbStatus(Record):
+    """Ingest counters that a `Db` writes when they change."""
+
+    _name = "db_status"
     _kind = "frame"
     _pack = PACK
 
@@ -149,6 +158,31 @@ class Publish(Sink):
         all: bool = False,
     ) -> None:
         super().__init__({"conn_cap": conn_cap}, listen, connect, peer, max_connections, items, all)
+
+
+class Db(Sink):
+    """An embedded database that records telemetry.
+
+    It stores every record from the ports in `items`, and serves the database
+    to clients on `listen`. `path` is the database directory. When unset, a
+    fresh temporary directory is used. With `all`, it records every system
+    added before this one.
+    """
+
+    _ty = "db"
+    _ports = {"db_status": DbStatus, **FRAMEWORK_PORTS}
+
+    def __init__(
+        self,
+        listen: str,
+        path: str | None = None,
+        items: Sequence[Item] = (),
+        max_connections: int | None = None,
+        all: bool = False,
+    ) -> None:
+        super().__init__(
+            {"path": path, "command_ids": []}, listen, None, None, max_connections, items, all
+        )
 
 
 class Subscribe(Link):

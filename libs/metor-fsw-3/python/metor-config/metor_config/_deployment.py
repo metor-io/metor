@@ -8,9 +8,9 @@ import os
 import sys
 from typing import Any, Mapping, Sequence
 
-from ._builtins import Link
+from ._builtins import Db, Link, Subscribe, _namespace
 from ._config import CONFIG_VERSION, OUT_ENV, ConfigError
-from ._target import Target, _targets
+from ._target import SystemHandle, Target, _targets
 
 LOOPBACK = "127.0.0.1"
 
@@ -107,6 +107,26 @@ def _check_ports(targets: Sequence[Target], hosts: Mapping[str, str]) -> None:
         if (host, port) in bound:
             raise ConfigError(f"`{name}` and `{bound[host, port]}` both bind {host}:{port}")
         bound[host, port] = name
+
+
+def gateway(
+    namespace: str,
+    peers: Sequence[SystemHandle],
+    listen: str,
+    cycle_rate: float = 10.0,
+    path: str | None = None,
+) -> tuple[Target, SystemHandle]:
+    """Creates a gateway target that records telemetry from other targets.
+
+    The gateway subscribes to each link in ``peers`` and records everything
+    it receives in a `Db`, which clients reach on ``listen``. Returns the
+    gateway target and the db's handle.
+    """
+    gw = Target(cycle_rate=cycle_rate, namespace=namespace)
+    for peer in peers:
+        gw.add(_namespace(peer), Subscribe(peer=peer))
+    db = gw.add("db", Db(listen=listen, path=path, all=True), thread="db")
+    return gw, db
 
 
 def to_config() -> dict[str, Any]:

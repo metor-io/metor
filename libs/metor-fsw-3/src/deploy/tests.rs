@@ -1,11 +1,12 @@
+use metor_proto_wkt::LogEvent;
 use serde_json::json;
 
 use super::*;
 use super::{CONFIG_VERSION, TargetConfig};
 use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig, PeerPort};
 use crate::link::{PUBLISH_TYPE, SUBSCRIBE_TYPE};
-use crate::record::RecordSchema;
-use crate::tests::utils::{Emit, Recorder, Tap, emit, table, tap};
+use crate::record::Record;
+use crate::tests::utils::{Emit, Recorder, Tap, emit, imu_source, table, tap};
 
 fn tables(count: usize) -> Vec<SystemTable> {
     (0..count)
@@ -14,7 +15,8 @@ fn tables(count: usize) -> Vec<SystemTable> {
             let mut table = table(&recorder);
             let register = || -> Result<(), crate::BuildError> {
                 table.register(PUBLISH_TYPE, tap(), move || Tap(recorder.clone()))?;
-                table.register(SUBSCRIBE_TYPE, emit(), || Emit(Vec::new()))
+                table.register(SUBSCRIBE_TYPE, emit(), || Emit(Vec::new()))?;
+                table.register(DB_TYPE, imu_source(), i64::default)
             };
             register().expect("valid records");
             table
@@ -50,8 +52,8 @@ fn member(namespace: &str, systems: Vec<SystemConfig>) -> TargetConfig {
 }
 
 /// Builds a two-target deployment. `a` publishes its `imu` frame and log
-/// through `pub`. `b` subscribes to both and publishes on `out`. `a.cmds`
-/// subscribes to `out` for log messages.
+/// through `pub`. `b` subscribes to both and runs a db. `a.cmds` subscribes
+/// to that db for log messages.
 fn envelope() -> DeploymentConfig {
     let a = member(
         "a",
@@ -67,7 +69,7 @@ fn envelope() -> DeploymentConfig {
                 ..SystemConfig::new("pub", PUBLISH_TYPE)
             },
             SystemConfig {
-                params: peer("b", "out"),
+                params: peer("b", "db"),
                 outputs: vec![OutputConfig::with_record("log", "log")],
                 ..SystemConfig::new("cmds", SUBSCRIBE_TYPE)
             },
@@ -92,7 +94,7 @@ fn envelope() -> DeploymentConfig {
             },
             SystemConfig {
                 params: listen(2250),
-                ..SystemConfig::new("out", PUBLISH_TYPE)
+                ..SystemConfig::new("db", DB_TYPE)
             },
         ],
     );
@@ -150,6 +152,14 @@ fn test_peer_transport_takes_host_address() {
     );
     let cmds = &placed.targets[0].coordinator.systems[3];
     assert_eq!(cmds.params["transport"]["connect"]["addr"], "[::1]:2250");
+}
+
+#[test]
+fn test_db_collects_subscriber_command_ids() {
+    let envelope = resolved();
+    let db = &envelope.targets[1].coordinator.systems[1];
+    let id = LogEvent::schema().packet_id();
+    assert_eq!(db.params["command_ids"], json!([id]));
 }
 
 #[test]
@@ -236,7 +246,7 @@ fn test_two_listeners_on_one_host_port() {
             host: LOOPBACK.into(),
             port: 2240,
             first: "a.pub".into(),
-            second: "b.out".into(),
+            second: "b.db".into(),
         })
     );
 }
@@ -288,7 +298,7 @@ fn test_unknown_type_is_a_build_error() {
 #[test]
 fn test_non_link_transport_is_untouched() {
     let mut envelope = envelope();
-    envelope.targets[0].coordinator.systems[0].params = peer("b", "out");
+    envelope.targets[0].coordinator.systems[0].params = peer("b", "db");
     let params = envelope.targets[0].coordinator.systems[0].params.clone();
     resolve(&mut envelope, &tables(2)).expect("resolves");
     assert!(!unresolved(&envelope));
@@ -310,9 +320,9 @@ fn test_undecodable_link_names_itself() {
 fn test_resolve_keeps_other_params() {
     let mut envelope = envelope();
     envelope.targets[1].coordinator.systems[0].params["conn_cap"] = json!(64);
-    envelope.targets[1].coordinator.systems[1].params["conn_cap"] = json!(32);
+    envelope.targets[1].coordinator.systems[1].params["path"] = json!("/db");
     resolve(&mut envelope, &tables(2)).expect("resolves");
-    let [mirror, out] = &envelope.targets[1].coordinator.systems[..] else {
+    let [mirror, db] = &envelope.targets[1].coordinator.systems[..] else {
         panic!("two systems")
     };
     assert_eq!(mirror.params["conn_cap"], 64);
@@ -320,8 +330,8 @@ fn test_resolve_keeps_other_params() {
         mirror.params["transport"]["connect"]["addr"],
         "127.0.0.1:2240"
     );
-    assert_eq!(out.params["conn_cap"], 32);
-    assert_eq!(out.params["transport"]["listen"]["max_connections"], 1);
+    assert_eq!(db.params["path"], "/db");
+    assert_eq!(db.params["transport"]["listen"]["max_connections"], 1);
 }
 
 #[test]

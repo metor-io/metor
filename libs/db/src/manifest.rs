@@ -16,31 +16,19 @@ use crate::{
 pub const MANIFEST_FILE: &str = "manifest";
 const MANIFEST_VERSION: u32 = 2;
 
-/// Where a span's bytes originally came from. Tiering treats the two very
-/// differently: a [`SpanSource::RemoteFetch`] span is a cache entry that
-/// can be purged for free, while a [`SpanSource::LocalIngest`] span is the
-/// only copy until a store acks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpanSource {
     LocalIngest,
     RemoteFetch,
 }
 
-/// Residency of a sealed span. The live head node is deliberately absent
-/// from the manifest — its extent changes per sample and is answered by
-/// the node list itself; spans only exist once a node is sealed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpanState {
     Resident,
     RemoteOnly,
-    /// A hydration fetch is in flight. Transient: never persisted (it
-    /// normalizes back to [`SpanState::RemoteOnly`] on reload).
     Fetching,
 }
 
-/// One sealed node's worth of history, resident or not. The [`SealRecord`]
-/// carries the byte-exact identity (lengths + checksum) that fetch,
-/// offload, and verification all key on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSpan {
     pub seal: SealRecord,
@@ -89,10 +77,6 @@ pub struct Gap {
 
 pub type GapVec = SmallVec<[Gap; 4]>;
 
-/// Plain time ranges, as reported by
-/// [`TimeSeries::uncovered`](crate::time_series_2::TimeSeries::uncovered):
-/// stretches with no span behind them at all, so there is nothing to
-/// carry but the range itself.
 pub type RangeVec = SmallVec<[Range<Timestamp>; 4]>;
 
 /// How much of a queried range is locally answerable.
@@ -185,17 +169,8 @@ impl ComponentManifest {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        // Postcard is not self-describing, so the version is decoded
-        // alone and selects the span layout for the rest of the buffer.
-        let (version, rest) = postcard::take_from_bytes::<u32>(&buf)?;
-        let mut spans = match version {
-            1 => postcard::from_bytes::<Vec<NodeSpanV1>>(rest)?
-                .into_iter()
-                .map(NodeSpan::from)
-                .collect(),
-            MANIFEST_VERSION => postcard::from_bytes::<Vec<NodeSpan>>(rest)?,
-            other => return Err(Error::UnsupportedManifestVersion(other)),
-        };
+        let (_version, rest) = postcard::take_from_bytes::<u32>(&buf)?;
+        let mut spans = postcard::from_bytes::<Vec<NodeSpan>>(rest)?;
         for span in &mut spans {
             // In-flight fetches do not survive a restart.
             if span.state == SpanState::Fetching {
@@ -237,21 +212,6 @@ impl ComponentManifest {
 struct ManifestFile {
     version: u32,
     spans: Vec<NodeSpan>,
-}
-
-/// Span layout before coverage trimming existed; reads as a whole span.
-#[derive(Deserialize)]
-struct NodeSpanV1 {
-    seal: SealRecord,
-    state: SpanState,
-    source: SpanSource,
-    acked: bool,
-}
-
-impl From<NodeSpanV1> for NodeSpan {
-    fn from(v1: NodeSpanV1) -> Self {
-        NodeSpan::whole(v1.seal, v1.state, v1.source, v1.acked)
-    }
 }
 
 /// The swap point between background mutators and readers. Reads clone an
@@ -440,46 +400,6 @@ mod tests {
         m.write_to(dir.path()).unwrap();
         let read = ComponentManifest::read_from(dir.path()).unwrap().unwrap();
         assert_eq!(read.spans[0].cover_end, Timestamp(49));
-    }
-
-    /// Manifests written before coverage trimming existed read back as
-    /// whole spans.
-    #[test]
-    fn reads_v1_manifest() {
-        #[derive(Serialize)]
-        struct V1File {
-            version: u32,
-            spans: Vec<NodeSpanV1Out>,
-        }
-        #[derive(Serialize)]
-        struct NodeSpanV1Out {
-            seal: SealRecord,
-            state: SpanState,
-            source: SpanSource,
-            acked: bool,
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let s = span(0, 99, SpanState::RemoteOnly);
-        let file = V1File {
-            version: 1,
-            spans: vec![NodeSpanV1Out {
-                seal: s.seal,
-                state: s.state,
-                source: s.source,
-                acked: true,
-            }],
-        };
-        atomic_write(
-            dir.path(),
-            MANIFEST_FILE,
-            &postcard::to_allocvec(&file).unwrap(),
-        )
-        .unwrap();
-        let read = ComponentManifest::read_from(dir.path()).unwrap().unwrap();
-        assert_eq!(read.spans.len(), 1);
-        assert_eq!(read.spans[0].cover_end, Timestamp(99));
-        assert!(read.spans[0].acked);
     }
 
     #[test]
