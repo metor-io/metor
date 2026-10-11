@@ -47,6 +47,8 @@ pub enum ParamError {
 pub enum MakeError {
     #[error(transparent)]
     Params(#[from] ParamError),
+    #[error("a slot is loaded through its channel, and has none")]
+    SlotChannel,
     #[error("thread `{thread}` is not running")]
     ThreadStart { thread: String },
     #[error("the constructor panicked: {0}")]

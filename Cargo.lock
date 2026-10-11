@@ -5675,6 +5675,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 
 [[package]]
+name = "echo-pack"
+version = "0.14.2"
+dependencies = [
+ "futures-lite 2.6.1",
+ "metor-fsw-3",
+ "schemars 1.2.1",
+ "serde",
+ "zerocopy",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9574,18 +9585,22 @@ dependencies = [
 name = "metor-fsw-3"
 version = "0.14.2"
 dependencies = [
+ "blake3",
+ "clap 4.6.3",
  "const-fnv1a-hash",
  "cordyceps",
  "futures-lite 2.6.1",
  "indexmap 2.14.0",
  "io-uring",
  "libc",
+ "libloading",
  "maitake-sync 0.1.2",
  "metor-component",
  "metor-fsw-3-macros",
  "metor-fsw-3-ring",
  "metor-proto",
  "metor-proto-wkt",
+ "minijinja",
  "polling",
  "postcard",
  "postcard-schema",
@@ -9597,6 +9612,7 @@ dependencies = [
  "tempfile",
  "thingbuf",
  "thiserror 2.0.20",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "trybuild",

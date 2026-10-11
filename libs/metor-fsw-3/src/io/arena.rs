@@ -2,10 +2,13 @@
 //! start.
 
 use core::cell::{Cell, OnceCell};
+use core::ffi::c_void;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
+
+use metor_fsw_3_ring::{Lease, RawOwner};
 
 use super::{Op, Span};
 use crate::coordinator::MakeError;
@@ -19,7 +22,15 @@ pub(crate) struct Arena {
 struct Mem {
     base: NonNull<u8>,
     len: usize,
-    _owned: Arc<Owned>,
+    keep: Keep,
+}
+
+/// What keeps an arena's memory alive.
+pub(crate) enum Keep {
+    Owned(Arc<Owned>),
+    Lease(Lease),
+    /// Memory that outlives the arena, such as a wasm guest's.
+    Unowned,
 }
 
 impl Arena {
@@ -28,16 +39,21 @@ impl Arena {
         Self::default()
     }
 
+    /// Sets the memory to `len` bytes at `base`. False if it was already set.
+    ///
+    /// # Safety
+    /// The bytes stay alive and unmoved while `keep` lives, or for the
+    /// arena's whole life when `keep` is `Unowned`.
+    pub(crate) unsafe fn set(&self, base: NonNull<u8>, len: usize, keep: Keep) -> bool {
+        self.mem.set(Mem { base, len, keep }).is_ok()
+    }
+
     /// Sets the memory to `bytes`. The memory is set once.
     pub(crate) fn set_owned(&self, bytes: Box<[u8]>) {
         let owned = Arc::new(Owned(NonNull::from(Box::leak(bytes))));
         let (base, len) = (owned.0.cast(), owned.0.len());
-        let mem = Mem {
-            base,
-            len,
-            _owned: owned,
-        };
-        let set = self.mem.set(mem).is_ok();
+        // SAFETY: `owned` holds the bytes and lives in the arena.
+        let set = unsafe { self.set(base, len, Keep::Owned(owned)) };
         debug_assert!(set, "an arena's memory is set once");
     }
 
@@ -61,6 +77,20 @@ impl Arena {
         let start = unsafe { base.add(span.off() as usize) };
         Some(NonNull::slice_from_raw_parts(start, span.len() as usize))
     }
+
+    /// An owner that keeps the memory alive, to share it across the pack
+    /// ABI. A lease passes on its own owner.
+    pub(crate) fn owner(&self) -> Option<RawOwner> {
+        match &self.mem.get()?.keep {
+            Keep::Owned(owned) => Some(RawOwner {
+                context: Arc::as_ptr(owned).cast(),
+                retain: retain_owned,
+                release: release_owned,
+            }),
+            Keep::Lease(lease) => Some(lease.owner()),
+            Keep::Unowned => None,
+        }
+    }
 }
 
 /// Memory leaked from a `Box` and freed by the last `Arc`.
@@ -76,6 +106,16 @@ impl Drop for Owned {
         // SAFETY: `self.0` came from `Box::leak`, and is freed once.
         drop(unsafe { Box::from_raw(self.0.as_ptr()) });
     }
+}
+
+unsafe extern "C" fn retain_owned(context: *const c_void) {
+    // SAFETY: `owner` made `context` from a live `Arc<Owned>`.
+    unsafe { Arc::increment_strong_count(context.cast::<Owned>()) };
+}
+
+unsafe extern "C" fn release_owned(context: *const c_void) {
+    // SAFETY: each release gives back one reference `retain_owned` took.
+    unsafe { Arc::decrement_strong_count(context.cast::<Owned>()) };
 }
 
 /// A span of its system's arena.

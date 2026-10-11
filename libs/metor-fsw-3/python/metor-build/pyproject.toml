@@ -1,0 +1,16 @@
+# The PEP 517 backend a pack's `pyproject.toml` names. Stdlib only: the hooks
+# shell out to `metor pack dev` and write the editable wheel themselves.
+
+[project]
+name = "metor-build"
+version = "0.1.0"
+description = "PEP 517 backend for metor-fsw-3 packs: `metor pack dev` plus an editable wheel"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "metor_build"
+module-root = ""

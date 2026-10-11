@@ -12,12 +12,16 @@ metor-component = { workspace = true }
 metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
+blake3 = { version = "1.8", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
 const-fnv1a-hash = "1.1.0"
 cordyceps = { version = "0.3.4", default-features = false }
 futures-lite = "2"
 indexmap = { version = "2", features = ["serde"] }
 libc = { version = "0.2", optional = true }
+libloading = { version = "0.8", optional = true }
 maitake-sync = { path = "../stellarator/maitake/sync" }
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde"], optional = true }
 postcard = { version = "1.1", features = ["alloc", "experimental-derive"] }
 postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
 schemars = "1"
@@ -25,6 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2.0"
+toml = { version = "0.8", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
 zerocopy = { version = "0.8.2", features = ["derive"] }
@@ -43,9 +48,14 @@ io-uring = { version = "0.7.1", optional = true }
 default = ["host"]
 host = [
     "threads",
+    "dep:blake3",
+    "dep:clap",
     "dep:libc",
+    "dep:libloading",
+    "dep:minijinja",
     "dep:polling",
     "dep:io-uring",
+    "dep:toml",
 ]
 
 threads = ["dep:stellarator", "dep:thingbuf"]
@@ -53,6 +63,11 @@ threads = ["dep:stellarator", "dep:thingbuf"]
 [dev-dependencies]
 tempfile = "3"
 trybuild = "1"
+
+[[bin]]
+name = "metor"
+path = "src/bin/metor.rs"
+required-features = ["host"]
 
 [lints]
 workspace = true
