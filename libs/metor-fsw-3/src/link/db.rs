@@ -44,7 +44,9 @@ pub struct DbParams {
 }
 
 /// What a `Db` reports about what it ingested, each cycle its counters change.
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
+#[derive(
+    Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, Default, PartialEq,
+)]
 #[frame(name = "db_status")]
 #[repr(C)]
 pub struct DbStatus {
@@ -56,7 +58,10 @@ pub struct DbStatus {
 
 impl DbStatus {
     fn changed(&self, other: &Self) -> bool {
-        (self.records, self.refused) != (other.records, other.refused)
+        Self {
+            timestamp: other.timestamp,
+            ..*self
+        } != *other
     }
 }
 
@@ -64,8 +69,7 @@ impl DbStatus {
 pub struct Db {
     endpoint: Option<Endpoint>,
     db: Arc<DB>,
-    namespace: Option<String>,
-    command_ids: Vec<PacketId>,
+    params: DbParams,
 }
 
 impl Db {
@@ -79,7 +83,7 @@ impl Db {
                 "a db listens; it takes no `connect`".into(),
             ));
         }
-        let path = params.path.unwrap_or_else(|| {
+        let path = params.path.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("metor-db-{}-{}", params.link, std::process::id()))
         });
         let store = if path.exists() {
@@ -93,8 +97,7 @@ impl Db {
         Ok(Self {
             endpoint: Some(endpoint),
             db: Arc::new(db),
-            namespace: params.namespace,
-            command_ids: params.command_ids,
+            params,
         })
     }
 }
@@ -112,7 +115,7 @@ pub async fn db(
     let endpoint = s.endpoint.take().expect("one run per instance");
     let db = s.db.clone();
     let sinks = announce(&db, inputs, log);
-    db.set_identity(s.namespace.clone(), s.command_ids.clone());
+    db.set_identity(s.params.namespace.clone(), s.params.command_ids.clone());
     let addr = endpoint.local_addr();
     if let Some(addr) = addr {
         log.info(format!("serving {} on {addr}", db.path.display()));
@@ -121,11 +124,7 @@ pub async fn db(
     let _serve = stellarator::spawn(serve(endpoint, db.clone(), stop.clone())).drop_guard();
     metor_db::lod::spawn(db.clone());
 
-    let mut status = DbStatus {
-        timestamp: Timestamp(0),
-        records: 0,
-        refused: 0,
-    };
+    let mut status = DbStatus::default();
     let mut reported = status;
     loop {
         let ready = async {
@@ -258,20 +257,16 @@ fn announce(db: &DB, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sin
 /// refused port drains, and its records count as refused.
 fn ingest(db: &DB, inputs: &mut DynInputs<Notifier>, sinks: &[Sink], status: &mut DbStatus) {
     for ((_, input), sink) in inputs.iter_mut().zip(sinks) {
-        if let Sink::Refused = sink {
-            status.refused += input.drain().count() as u64;
-            continue;
-        }
         for record in input.drain() {
-            let Ok(bytes) = record else { continue };
-            let result = match sink {
-                Sink::Table(id) => db.ingest_table(*id, bytes),
-                Sink::Msg(id) => db.push_msg(Timestamp::now(), *id, bytes),
-                Sink::Refused => continue,
+            let stored = match (sink, record) {
+                (Sink::Refused, _) => false,
+                (_, Err(_)) => continue,
+                (Sink::Table(id), Ok(bytes)) => db.ingest_table(*id, bytes).is_ok(),
+                (Sink::Msg(id), Ok(bytes)) => db.push_msg(Timestamp::now(), *id, bytes).is_ok(),
             };
-            match result {
-                Ok(()) => status.records += 1,
-                Err(_) => status.refused += 1,
+            match stored {
+                true => status.records += 1,
+                false => status.refused += 1,
             }
         }
     }
@@ -279,26 +274,17 @@ fn ingest(db: &DB, inputs: &mut DynInputs<Notifier>, sinks: &[Sink], status: &mu
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, RingBuffer};
-    use metor_proto::types::PacketId;
-
+    use metor_fsw_3_ring::RingBuffer;
     use stellarator::net::TcpStream;
 
     use crate::DefCx;
     use crate::async_system::stop_pair;
-    use crate::port::{Input, ring_capacity};
+    use crate::port::Input;
     use crate::record::Record;
     use crate::system::{InputBinding, SystemInputs};
-    use crate::tests::utils::{Fixed, Imu};
+    use crate::tests::utils::{Fixed, Imu, ring};
 
     use super::*;
-
-    fn ring<R: Record>() -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(R::MAX_LEN, 8).expect("valid capacity"),
-            max_readers: 2,
-        })
-    }
 
     /// An `Imu` frame port of instance `plant` on target `a`, and a `Fixed`
     /// message port.
@@ -346,32 +332,16 @@ mod tests {
         (dir, Arc::new(db))
     }
 
-    fn status() -> DbStatus {
-        DbStatus {
-            timestamp: Timestamp(0),
-            records: 0,
-            refused: 0,
-        }
-    }
-
     #[test]
     fn test_ingest_frames_and_messages() {
         let (_dir, db) = store();
-        let rings = [ring::<Imu>(), ring::<Fixed>()];
+        let rings = [ring::<Imu>(8, 2), ring::<Fixed>(8, 2)];
         let mut inputs = ports(&rings);
-        let sinks = announce(&db, &mut inputs, &mut Log);
-        let RecordSchema::Frame { metadata, .. } = &Input::<Imu>::def(
-            &DefCx {
-                id: "plant",
-                namespace: Some("a"),
-                ..DefCx::empty()
-            },
-            "imu",
-        )
-        .schema
-        else {
+        let (imu, _) = inputs.iter_mut().next().expect("a frame port");
+        let RecordSchema::Frame { metadata, .. } = imu.schema.clone() else {
             panic!("a frame")
         };
+        let sinks = announce(&db, &mut inputs, &mut Log);
         assert!(matches!(sinks[0], Sink::Table(_)), "a table sink");
         assert!(matches!(sinks[1], Sink::Msg(id) if id == Fixed::schema().packet_id()));
         assert_eq!(metadata[0].name, "a.plant.imu.sample");
@@ -379,7 +349,7 @@ mod tests {
         for n in 1..=3 {
             produce(&rings, n);
         }
-        let mut status = status();
+        let mut status = DbStatus::default();
         ingest(&db, &mut inputs, &sinks, &mut status);
         assert_eq!((status.records, status.refused), (6, 0));
 
@@ -407,18 +377,18 @@ mod tests {
         assert_eq!(name.as_deref(), Some("a.plant.imu.sample"));
     }
 
-    /// The table id a frame port announces under.
-    fn table_id_of(inputs: &mut DynInputs<Notifier>) -> PacketId {
-        let (def, _) = inputs.iter_mut().next().expect("a frame port");
-        def.schema.packet_id()
-    }
-
     #[test]
     fn test_colliding_table_is_refused() {
         let (_dir, db) = store();
-        let rings = [ring::<Imu>(), ring::<Fixed>()];
+        let rings = [ring::<Imu>(8, 2), ring::<Fixed>(8, 2)];
         let mut inputs = ports(&rings);
-        let id = table_id_of(&mut inputs);
+        let id = inputs
+            .iter_mut()
+            .next()
+            .expect("a frame port")
+            .0
+            .schema
+            .packet_id();
         let RecordSchema::Frame { vtable, .. } = Input::<Imu>::def(&DefCx::empty(), "other").schema
         else {
             panic!("a frame")
@@ -432,7 +402,7 @@ mod tests {
         );
         assert!(matches!(sinks[1], Sink::Msg(_)));
         produce(&rings, 1);
-        let mut status = status();
+        let mut status = DbStatus::default();
         ingest(&db, &mut inputs, &sinks, &mut status);
         assert_eq!((status.records, status.refused), (1, 1));
     }
@@ -511,6 +481,6 @@ mod tests {
         };
         let db = Db::new(params).expect("a free port and a writable dir");
         assert!(dir.path().join("store").is_dir());
-        assert_eq!(db.command_ids, vec![[1, 2]]);
+        assert_eq!(db.params.command_ids, vec![[1, 2]]);
     }
 }

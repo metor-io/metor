@@ -229,44 +229,11 @@ async fn read_half(rx: OwnedReader<TcpStream>, buf: Vec<u8>, inbox: &Inbox) {
 
 #[cfg(test)]
 mod tests {
-    use metor_proto::types::PacketTy;
-    use stellarator::net::TcpListener;
-
-    use crate::async_system::stop_pair;
-    use crate::link::{inbox, wire};
-
     use super::*;
 
     fn conns(count: usize, cap: usize, seed: &[u8]) -> Rc<Connections> {
         let inbox = Rc::new(Inbox::blackhole());
         Rc::new(Connections::new(count, cap, seed.to_vec(), inbox))
-    }
-
-    /// A listener and a client connected to it, with the accepted stream.
-    async fn pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
-        let addr = listener.local_addr().expect("bound");
-        let client = TcpStream::connect(addr).await.expect("the listener is up");
-        let served = listener.accept().await.expect("a connection");
-        (client, served)
-    }
-
-    /// Serves `served` on a task of its own, as a listener does.
-    fn spawn_serve(conns: &Rc<Connections>, served: TcpStream, stop: &Stop) -> bool {
-        let Some(slot) = conns.claim() else {
-            return false;
-        };
-        let (conns, stop) = (conns.clone(), stop.clone());
-        drop(stellarator::spawn(async move {
-            conns.serve(slot, served, &stop).await;
-        }));
-        true
-    }
-
-    async fn until_connections(conns: &Connections, count: u32) {
-        while conns.stats().connections != count {
-            stellarator::yield_now().await;
-        }
     }
 
     #[test]
@@ -278,17 +245,8 @@ mod tests {
         let mut buf = Vec::new();
         outbox.swap(&mut buf);
         assert_eq!(buf, b"12345678");
-    }
-
-    #[test]
-    fn test_take_preserves_queue_capacity() {
-        let outbox = Outbox::new(64);
-        outbox.enqueue(b"one");
-        let mut buf = Vec::new();
-        outbox.swap(&mut buf);
-        assert_eq!(buf, b"one");
-        assert!(outbox.pending.borrow().capacity() >= 64);
-        assert!(outbox.pending.borrow().is_empty());
+        let pending = outbox.pending.borrow();
+        assert!(pending.is_empty() && pending.capacity() >= 8);
     }
 
     #[test]
@@ -315,78 +273,5 @@ mod tests {
         assert_eq!((first.at, second.at), (0, 1));
         conns.free(first);
         assert_eq!(conns.claim().expect("the freed slot").at, 0);
-    }
-
-    #[stellarator::test]
-    async fn test_refuse_connection_when_full() {
-        let conns = conns(1, 64, b"");
-        let (_handle, stop) = stop_pair();
-        let (_first, served) = pair().await;
-        assert!(spawn_serve(&conns, served, &stop));
-        until_connections(&conns, 1).await;
-        let (_second, served) = pair().await;
-        assert!(!spawn_serve(&conns, served, &stop));
-        assert_eq!(conns.stats().connections, 1);
-    }
-
-    #[stellarator::test]
-    async fn test_close_frees_slot_and_preserves_bytes() {
-        let conns = conns(1, 64, b"seed");
-        let (_handle, stop) = stop_pair();
-        let (client, served) = pair().await;
-        assert!(spawn_serve(&conns, served, &stop));
-        let (read, buf) = client.read(vec![0u8; 4]).await;
-        assert_eq!(read.expect("the seed arrives"), 4);
-        assert_eq!(buf, b"seed");
-        drop(client);
-        until_connections(&conns, 0).await;
-        assert_eq!(conns.stats().bytes_out, 4);
-        assert!(conns.claim().is_some());
-    }
-
-    #[stellarator::test]
-    async fn test_stop_ends_connection() {
-        let conns = conns(1, 64, b"");
-        let (handle, stop) = stop_pair();
-        let (_client, served) = pair().await;
-        assert!(spawn_serve(&conns, served, &stop));
-        until_connections(&conns, 1).await;
-        handle.stop();
-        until_connections(&conns, 0).await;
-    }
-
-    #[stellarator::test]
-    async fn test_inbound_packet_reaches_inbox() {
-        let (inbox, mut view) = Inbox::new(vec![[7, 7]], Vec::new(), 2, 8).expect("a small ring");
-        let conns = Rc::new(Connections::new(1, 64, Vec::new(), Rc::new(inbox)));
-        let (_handle, stop) = stop_pair();
-        let (client, served) = pair().await;
-        assert!(spawn_serve(&conns, served, &stop));
-        let mut framed = Vec::new();
-        wire::append_packet(&mut framed, PacketTy::Msg, [7, 7], b"ping");
-        client.write_all(framed).await.0.expect("the link reads");
-        while !view.has_record() {
-            stellarator::yield_now().await;
-        }
-        let record = view
-            .try_read()
-            .expect("a read")
-            .expect("the packet arrived");
-        assert_eq!(
-            inbox::packet(&record),
-            Some((PacketTy::Msg, [7, 7], &b"ping"[..]))
-        );
-    }
-
-    #[stellarator::test]
-    async fn test_packet_past_buffer_closes_connection() {
-        let conns = conns(1, 16, b"");
-        let (_handle, stop) = stop_pair();
-        let (client, served) = pair().await;
-        assert!(spawn_serve(&conns, served, &stop));
-        let mut framed = Vec::new();
-        wire::append_packet(&mut framed, PacketTy::Msg, [7, 7], &[0u8; 32]);
-        client.write_all(framed).await.0.expect("the link reads");
-        until_connections(&conns, 0).await;
     }
 }

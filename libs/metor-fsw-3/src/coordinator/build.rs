@@ -1,7 +1,5 @@
-//! Build is responsible for creating new ring buffers for systems and linking them together
-//!
-//! It takes a pass through the system table to discover all the connections between systems, and
-//! then allocated the rings with the appropriate reader capacity.
+//! Build turns a config into a coordinator: it resolves each system's ports
+//! and edges, then allocates one ring per output with a reader slot per edge.
 
 use std::collections::HashMap;
 
@@ -14,9 +12,9 @@ use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
 
-use super::config::{Adapter, CoordinatorConfig, SystemConfig};
+use super::config::{Adapter, CoordinatorConfig, PortRef, SystemConfig};
 use super::error::BuildError;
-use super::params::{ParamError, Params};
+use super::params::Params;
 use super::status::SystemStatus;
 use super::table::{MakeCx, SystemTable, TableEntry};
 use super::{Coordinator, Entry};
@@ -72,13 +70,16 @@ impl CoordinatorConfig {
         let mut plan = resolve(&self, table)?;
         check_ids(&plan)?;
         count_readers(&plan.systems, &mut plan.rings);
-        let rings = allocate_rings(&plan.rings, self.ring_depth)?;
+        let rings = plan
+            .rings
+            .iter()
+            .map(|spec| allocate_ring(spec, self.ring_depth))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut threads = Threads::new();
         let entries = bind_rings(&plan, &rings, &mut threads)?;
 
         Ok(Coordinator {
             entries,
-            threads,
             clock: self.clock,
             epoch: Timestamp::now(),
             cycle: 0,
@@ -117,15 +118,13 @@ fn resolve<'a>(
         check_alignment(&system.id, &def)?;
         check_outputs(system, &def)?;
         let base_ring_idx = plan.rings.len();
-        plan.rings.extend(
-            def.outputs
-                .iter()
-                .map(|port| RingSpec::new(&system.id, port)),
-        );
-        plan.rings.push(RingSpec::new(
-            &system.id,
-            &status_def(&system.id, namespace),
-        ));
+        let status = status_def(&system.id, namespace);
+        plan.rings
+            .extend(def.outputs.iter().chain([&status]).map(|port| RingSpec {
+                system: system.id.clone(),
+                port: port.clone(),
+                readers: 0,
+            }));
         plan.systems.push(PlannedSystem {
             id: &system.id,
             entry,
@@ -199,62 +198,56 @@ fn instance_def(
     records: &Records,
     namespace: Option<&str>,
 ) -> Result<SystemDef, BuildError> {
-    crate::def::instance_def(system, entry, namespace, records, |from| {
-        let Some(&at) = index.get(from.system.as_str()) else {
-            return Err(BuildError::UnknownSystem {
-                id: system.id.clone(),
-                port: from_port(system, from),
-                from: from.system.clone(),
-            });
-        };
-        let Some(producer) = plan.systems.get(at) else {
-            return Ok(None);
-        };
-        let Some(ring) = producer.output_ring(&from.port) else {
-            return Err(BuildError::UnknownOutput {
-                system: from.system.clone(),
-                port: from.port.clone(),
-            });
-        };
-        Ok(Some(plan.rings[ring].port.clone()))
+    crate::def::instance_def(system, entry, namespace, records, |port, from| {
+        let ring = producer_ring(plan, index, &system.id, port, from)?;
+        Ok(ring.map(|ring| plan.rings[ring].port.clone()))
     })
 }
 
-/// The input port of `system` that reads `from`.
-fn from_port(system: &SystemConfig, from: &super::PortRef) -> String {
-    system
-        .inputs
-        .iter()
-        .find(|input| input.from.contains(from))
-        .map(|input| input.port.clone())
-        .unwrap_or_default()
+/// The ring `from` names for input `port` of system `id`, or `None` while its
+/// producer is not planned yet.
+fn producer_ring(
+    plan: &Plan<'_>,
+    index: &HashMap<&str, usize>,
+    id: &str,
+    port: &str,
+    from: &PortRef,
+) -> Result<Option<RingIndex>, BuildError> {
+    let Some(&at) = index.get(from.system.as_str()) else {
+        return Err(BuildError::UnknownSystem {
+            id: id.to_string(),
+            port: port.to_string(),
+            from: from.system.clone(),
+        });
+    };
+    let Some(producer) = plan.systems.get(at) else {
+        return Ok(None);
+    };
+    let ring = producer.output_ring(&from.port);
+    ring.map(Some).ok_or_else(|| BuildError::UnknownOutput {
+        system: from.system.clone(),
+        port: from.port.clone(),
+    })
 }
 
 fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildError> {
-    for (index, port) in def.inputs.iter().enumerate() {
-        if def.inputs[..index]
-            .iter()
-            .any(|other| other.name == port.name)
-        {
-            return Err(BuildError::DuplicateInput {
-                system: system.to_string(),
-                port: port.name.to_string(),
-            });
-        }
+    let port = |port: &PortDef| (system.to_string(), port.name.to_string());
+    if let Some((system, port)) = duplicate(&def.inputs).map(port) {
+        return Err(BuildError::DuplicateInput { system, port });
     }
-
-    for (index, port) in def.outputs.iter().enumerate() {
-        if def.outputs[..index]
-            .iter()
-            .any(|other| other.name == port.name)
-        {
-            return Err(BuildError::DuplicateOutput {
-                system: system.to_string(),
-                port: port.name.to_string(),
-            });
-        }
+    if let Some((system, port)) = duplicate(&def.outputs).map(port) {
+        return Err(BuildError::DuplicateOutput { system, port });
     }
     Ok(())
+}
+
+/// The first port named like one before it.
+fn duplicate(ports: &[PortDef]) -> Option<&PortDef> {
+    ports
+        .iter()
+        .enumerate()
+        .find(|(at, port)| ports[..*at].iter().any(|other| other.name == port.name))
+        .map(|(_, port)| port)
 }
 
 /// Every output the config lists is one the type took.
@@ -302,18 +295,8 @@ fn resolve_edges(
                 });
             }
             for from in &input.from {
-                let Some(&producer) = index.get(from.system.as_str()) else {
-                    return Err(BuildError::UnknownSystem {
-                        id: system.id.clone(),
-                        port: input.port.clone(),
-                        from: from.system.clone(),
-                    });
-                };
-                let Some(ring) = plan.systems[producer].output_ring(&from.port) else {
-                    return Err(BuildError::UnknownOutput {
-                        system: from.system.clone(),
-                        port: from.port.clone(),
-                    });
+                let Some(ring) = producer_ring(plan, index, &system.id, &input.port, from)? else {
+                    continue;
                 };
                 let Some(port) = port else {
                     return Err(BuildError::UnknownInput {
@@ -358,13 +341,6 @@ fn count_readers(systems: &[PlannedSystem<'_>], rings: &mut [RingSpec]) {
     for ring in rings.iter_mut() {
         ring.readers = ring.readers.max(1);
     }
-}
-
-fn allocate_rings(specs: &[RingSpec], depth: usize) -> Result<Vec<RingBuffer>, BuildError> {
-    specs
-        .iter()
-        .map(|spec| allocate_ring(spec, depth))
-        .collect()
 }
 
 /// Allocates one ring holding `spec.depth * ring_depth` records.
@@ -419,48 +395,21 @@ fn bind_rings(
             Some(Adapter::Channel(_)) => crate::channel::make(&system.entry.make, cx),
             _ => (system.entry.make)(cx),
         }
-        .map_err(|source| build_error(system.id, source))?;
+        .map_err(|source| BuildError::Params {
+            id: system.id.to_string(),
+            source,
+        })?;
         entries.push(Entry {
             name: system.id.to_string(),
             step: Some(step),
-            // PANIC Safety: SystemStatus requires only eight-byte alignment.
-            status: Output::try_new({
+            // PANIC Safety: build allocates one ring per output.
+            status: Output::new({
                 let ring: &RingBuffer = &rings[system.status_ring()];
                 ring.writer(NoWake).expect("one writer per output ring")
-            })
-            .expect("supported status alignment"),
+            }),
         });
     }
     Ok(entries)
-}
-
-/// Names the system a `make` failed on, keeping a refused placement its own error.
-fn build_error(id: &str, source: ParamError) -> BuildError {
-    match source {
-        ParamError::Thread { thread } => BuildError::ThreadOnCyclic {
-            id: id.to_string(),
-            thread,
-        },
-        ParamError::Channel { channel } => BuildError::ChannelOnAsync {
-            id: id.to_string(),
-            channel,
-        },
-        ParamError::SlotChannel => BuildError::SlotWithoutChannel { id: id.to_string() },
-        source => BuildError::Params {
-            id: id.to_string(),
-            source,
-        },
-    }
-}
-
-impl RingSpec {
-    fn new(system: &str, port: &PortDef) -> Self {
-        Self {
-            system: system.to_string(),
-            port: port.clone(),
-            readers: 0,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -589,7 +538,7 @@ mod tests {
         assert_eq!(
             check_port_names(
                 "empty",
-                &crate::SystemDef::new::<(), ()>("empty", &crate::DefCx::empty())
+                &crate::SystemDef::new::<(), (), NoWake>("empty", &crate::DefCx::empty())
                     .expect("a static definition")
             ),
             Ok(())
@@ -621,22 +570,15 @@ mod tests {
         config.systems.truncate(2);
         config.systems[1].inputs[0].from = vec![PortRef::new("imu", "imu")];
         let coordinator = build(config).expect("valid config");
-        // imu + nav outputs, plus one status ring each.
-        assert_eq!(coordinator.rings(), 4);
-        assert_eq!(
-            coordinator.entry_names().collect::<Vec<_>>(),
-            vec!["imu", "nav"]
-        );
+        // imu + nav outputs and logs, plus one status ring each.
+        assert_eq!(coordinator.rings(), 6);
     }
 
     #[test]
     fn test_status_ring() {
         let mut config = pipeline_config();
         config.systems.push(SystemConfig {
-            inputs: vec![InputConfig {
-                port: "status".into(),
-                from: vec![PortRef::new("nav", "status")],
-            }],
+            inputs: vec![InputConfig::new("status", "nav", "status")],
             ..SystemConfig::new("watch", "status_watch")
         });
         assert!(build(config).is_ok());
@@ -803,10 +745,7 @@ mod tests {
         let mut config = pipeline_config();
         // A second consumer of `imu.imu`, so that ring carries two edges.
         config.systems.push(SystemConfig {
-            inputs: vec![InputConfig {
-                port: "imu".into(),
-                from: vec![PortRef::new("imu", "imu")],
-            }],
+            inputs: vec![InputConfig::new("imu", "imu", "imu")],
             ..SystemConfig::new("nav_two", "nav")
         });
         let coordinator = build(config).expect("valid config");
@@ -823,14 +762,8 @@ mod tests {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         config.systems.push(tap(vec![
-            InputConfig {
-                port: "imu.imu".into(),
-                from: vec![PortRef::new("imu", "imu")],
-            },
-            InputConfig {
-                port: "nav.nav".into(),
-                from: vec![PortRef::new("nav", "nav")],
-            },
+            InputConfig::new("imu.imu", "imu", "imu"),
+            InputConfig::new("nav.nav", "nav", "nav"),
         ]));
         let mut coordinator = config.build(&table(&recorder)).expect("valid config");
         coordinator.step(Timestamp(1));
@@ -872,17 +805,11 @@ mod tests {
             systems: vec![
                 emits("imu"),
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "imu".into(),
-                        from: vec![PortRef::new("emit", "imu")],
-                    }],
+                    inputs: vec![InputConfig::new("imu", "emit", "imu")],
                     ..SystemConfig::new("nav", "nav")
                 },
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "nav".into(),
-                        from: vec![PortRef::new("nav", "nav")],
-                    }],
+                    inputs: vec![InputConfig::new("nav", "nav", "nav")],
                     ..SystemConfig::new("control", "control")
                 },
             ],
@@ -916,17 +843,11 @@ mod tests {
                     ..SystemConfig::new("emit", "emit")
                 },
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "imu".into(),
-                        from: vec![PortRef::new("emit", "imu")],
-                    }],
+                    inputs: vec![InputConfig::new("imu", "emit", "imu")],
                     ..SystemConfig::new("nav", "nav")
                 },
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "nav".into(),
-                        from: vec![PortRef::new("nav", "nav")],
-                    }],
+                    inputs: vec![InputConfig::new("nav", "nav", "nav")],
                     ..SystemConfig::new("control", "control")
                 },
             ],
@@ -1053,10 +974,9 @@ mod tests {
     #[test]
     fn test_reject_dynamic_forward_reference() {
         let mut config = pipeline_config();
-        config.systems.push(tap(vec![InputConfig {
-            port: "late.nav".into(),
-            from: vec![PortRef::new("late", "nav")],
-        }]));
+        config
+            .systems
+            .push(tap(vec![InputConfig::new("late.nav", "late", "nav")]));
         config.systems.push(SystemConfig::new("late", "nav"));
         assert_eq!(
             build(config).err(),
@@ -1074,18 +994,12 @@ mod tests {
         let config = CoordinatorConfig {
             systems: vec![
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "nav".into(),
-                        from: vec![PortRef::new("nav", "nav")],
-                    }],
+                    inputs: vec![InputConfig::new("nav", "nav", "nav")],
                     ..SystemConfig::new("control", "control")
                 },
                 SystemConfig::new("imu", "imu"),
                 SystemConfig {
-                    inputs: vec![InputConfig {
-                        port: "imu".into(),
-                        from: vec![PortRef::new("imu", "imu")],
-                    }],
+                    inputs: vec![InputConfig::new("imu", "imu", "imu")],
                     ..SystemConfig::new("nav", "nav")
                 },
             ],

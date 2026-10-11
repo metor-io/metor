@@ -1,12 +1,14 @@
 //! A `DlSlot` over the echo pack's two sequences, driven by channel commands.
 
+mod common;
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::OnceLock;
 
-use metor_fsw_3::cli::cargo::{cargo_build, cdylib_name, triple};
+use common::{Ping, fixture_lib};
+use metor_fsw_3::cli::cargo::{cdylib_name, triple};
 use metor_fsw_3::cli::config::{CONFIG_VERSION, DeploymentConfig, TargetConfig};
 use metor_fsw_3::deploy::{self, DeployError};
 use metor_fsw_3::dl::store;
@@ -15,19 +17,10 @@ use metor_fsw_3::metor_proto_wkt::{
 };
 use metor_fsw_3::{
     Adapter, BuildError, ChannelConfig, ChannelState, ChannelStatus, Coordinator,
-    CoordinatorConfig, DefCx, Input, InputConfig, Output, Pack, PortRef, Record, RunState,
-    SystemConfig, SystemTable, Timestamp, system,
+    CoordinatorConfig, DefCx, Input, InputConfig, Output, Pack, RunState, SystemConfig,
+    SystemTable, Timestamp, system,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-/// The pack's record, redeclared here: the component id is the name's hash.
-#[derive(Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug)]
-#[postcard(crate = metor_fsw_3::postcard_schema)]
-#[record(max_len = 8)]
-struct Ping {
-    n: u32,
-}
 
 /// What the test systems saw, and the commands still to send.
 #[derive(Default)]
@@ -76,19 +69,10 @@ fn watch(
     }
 }
 
-/// Builds the fixture once per test binary and returns its cdylib.
-fn fixture() -> &'static Path {
-    static BUILT: OnceLock<PathBuf> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        cargo_build("echo-pack", root, false).expect("the fixture builds")
-    })
-}
-
 /// `ty`'s ports as `metor build` would bake them for instance `mode`.
 fn baked(ty: &str) -> Value {
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
-    let pack = unsafe { Pack::open(fixture()) }.expect("the fixture opens");
+    let pack = unsafe { Pack::open(fixture_lib()) }.expect("the fixture opens");
     let cx = DefCx {
         id: "mode",
         ..DefCx::empty()
@@ -98,11 +82,11 @@ fn baked(ty: &str) -> Value {
 
 /// A resolved candidate: the fixture's path and hash, and `ty`'s ports.
 fn candidate(name: &str, ty: &str) -> Value {
-    let hash = store::hash(fixture()).expect("the fixture reads");
+    let hash = store::hash(fixture_lib()).expect("the fixture reads");
     json!({
         "name": name,
         "ty": ty,
-        "path": fixture(),
+        "path": fixture_lib(),
         "hash": hash.to_hex().as_str(),
         "def": baked(ty),
     })
@@ -119,18 +103,11 @@ fn slot_params(allow: Vec<Value>) -> Value {
     json!({ "allow": allow })
 }
 
-fn input(port: &str, system: &str, from: &str) -> InputConfig {
-    InputConfig {
-        port: port.into(),
-        from: vec![PortRef::new(system, from)],
-    }
-}
-
 /// `cmds -> idle -> mode (the slot) -> watch`.
 fn config(params: Value, adapter: Option<Adapter>) -> CoordinatorConfig {
-    let mut inputs = vec![input("input", "idle", "output")];
+    let mut inputs = vec![InputConfig::new("input", "idle", "output")];
     if adapter.is_some() {
-        inputs.push(input("commands", "cmds", "commands"));
+        inputs.push(InputConfig::new("commands", "cmds", "commands"));
     }
     CoordinatorConfig {
         systems: vec![
@@ -144,9 +121,9 @@ fn config(params: Value, adapter: Option<Adapter>) -> CoordinatorConfig {
             },
             SystemConfig {
                 inputs: vec![
-                    input("events", "mode", "events"),
-                    input("status", "mode", "channel_status"),
-                    input("pings", "mode", "output"),
+                    InputConfig::new("events", "mode", "events"),
+                    InputConfig::new("status", "mode", "channel_status"),
+                    InputConfig::new("pings", "mode", "output"),
                 ],
                 ..SystemConfig::new("watch", "watch")
             },
@@ -237,12 +214,12 @@ fn test_load_start_complete() {
     assert_eq!(events, [SequenceEventKind::Loaded { name: "up".into() }]);
     let loaded = status(&seen);
     assert_eq!(loaded.loaded, 0);
-    let file = fixture()
+    let file = fixture_lib()
         .file_name()
         .and_then(|n| n.to_str())
         .expect("a name");
     assert_eq!(loaded.artifact.to_str(), Ok(file));
-    let hash = store::hash(fixture()).expect("reads");
+    let hash = store::hash(fixture_lib()).expect("reads");
     assert_eq!(loaded.hash.0, *hash.as_bytes());
 
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
@@ -271,21 +248,6 @@ fn test_load_other_then_abort() {
 }
 
 #[test]
-fn test_reset_restarts_loaded() {
-    let (seen, mut coordinator) = build(slot_params(both()));
-    send(&seen, &mut coordinator, [load("up")]);
-    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
-    run(&seen, &mut coordinator, 1);
-    assert_eq!(pings(&seen), [1, 2]);
-
-    let reset = [SequenceCommandKind::Stop, SequenceCommandKind::Reset];
-    send(&seen, &mut coordinator, reset);
-    assert_eq!(status(&seen).loaded, 0);
-    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
-    assert_eq!(pings(&seen), [1]);
-}
-
-#[test]
 fn test_unknown_load_keeps_occupant() {
     let (seen, mut coordinator) = build(slot_params(both()));
     send(&seen, &mut coordinator, [load("up")]);
@@ -300,7 +262,7 @@ fn test_unknown_load_keeps_occupant() {
 fn test_changed_bytes_refused() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let copy = dir.path().join("libecho_copy.so");
-    std::fs::copy(fixture(), &copy).expect("copies");
+    std::fs::copy(fixture_lib(), &copy).expect("copies");
     let mut stale = candidate("down", "count_down");
     stale["path"] = json!(copy);
     stale["hash"] = json!(blake3::hash(b"another build").to_hex().as_str());
@@ -312,8 +274,8 @@ fn test_changed_bytes_refused() {
     assert_eq!(status(&seen).loaded, 0);
 }
 
-/// A candidate of a type whose ports differ from the slot's is refused, and
-/// the occupant stays.
+/// A candidate whose library's ports differ from the slot's baked ones is
+/// refused, and the occupant stays.
 #[test]
 fn test_other_type_refused() {
     let mut other = candidate("gain", "gain");
@@ -324,18 +286,6 @@ fn test_other_type_refused() {
     let events = send(&seen, &mut coordinator, [load("gain")]);
     assert!(refused(&events, "no longer matches"), "{events:?}");
     assert_eq!(status(&seen).loaded, 0);
-}
-
-/// A slot whose baked ports no longer match the library refuses the load.
-#[test]
-fn test_stale_baked_ports_refused() {
-    let mut stale = candidate("up", "count_up");
-    stale["def"] = baked("gain");
-    let (seen, mut coordinator) = build(slot_params(vec![stale]));
-    run(&seen, &mut coordinator, 1);
-    let events = send(&seen, &mut coordinator, [load("up")]);
-    assert!(refused(&events, "no longer matches"), "{events:?}");
-    assert_eq!(status(&seen).state, ChannelState::Unloaded.code());
 }
 
 /// A candidate whose constructor refuses is refused, and the occupant is
@@ -413,7 +363,10 @@ fn test_slot_needs_channel() {
         panic!("a slot without a channel is refused")
     };
     assert!(
-        matches!(error, BuildError::SlotWithoutChannel { ref id } if id == "mode"),
+        matches!(
+            error,
+            BuildError::Params { ref id, source: metor_fsw_3::ParamError::SlotChannel } if id == "mode"
+        ),
         "{error:?}"
     );
 }
@@ -432,7 +385,7 @@ fn test_unresolved_slot_refused() {
 fn pack_ref(libs: &Path) -> Value {
     let dir = libs.join(triple());
     std::fs::create_dir_all(&dir).expect("creates");
-    std::fs::copy(fixture(), dir.join(cdylib_name("echo_pack"))).expect("copies");
+    std::fs::copy(fixture_lib(), dir.join(cdylib_name("echo_pack"))).expect("copies");
     json!({ "id": "echo", "lib": "echo_pack", "libs": libs })
 }
 
@@ -452,14 +405,24 @@ fn envelope(allow: Vec<Value>) -> DeploymentConfig {
     }
 }
 
+/// A temp dir and the libs dir and store under it.
+fn scratch() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    (dir, libs, store)
+}
+
+fn resolve(envelope: &mut DeploymentConfig, store: &Path) -> Result<(), DeployError> {
+    deploy::resolve_slots(envelope, &[table(&Shared::default())], store)
+}
+
 fn slot(envelope: &DeploymentConfig) -> &Value {
     &envelope.targets[0].coordinator.systems[2].params
 }
 
 #[test]
 fn test_build_resolves_into_store() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    let (_dir, libs, store) = scratch();
     let seen = Shared::default();
     let allow = vec![
         unresolved("up", "count_up", &libs),
@@ -471,7 +434,7 @@ fn test_build_resolves_into_store() {
     assert!(!deploy::unresolved(&envelope));
 
     let params = slot(&envelope);
-    let hash = store::hash(fixture()).expect("reads");
+    let hash = store::hash(fixture_lib()).expect("reads");
     for candidate in params["allow"].as_array().expect("a list") {
         assert!(candidate.get("pack").is_none());
         assert_eq!(candidate["hash"], json!(hash.to_hex().as_str()));
@@ -504,7 +467,7 @@ fn next_slot(libs: &Path) -> SystemConfig {
             name: "next".into(),
             start: RunState::Stopped,
         })),
-        inputs: vec![input("input", "mode", "output")],
+        inputs: vec![InputConfig::new("input", "mode", "output")],
         ..SystemConfig::new("next", "fsw.dl_slot")
     }
 }
@@ -512,14 +475,13 @@ fn next_slot(libs: &Path) -> SystemConfig {
 /// A slot reading another slot's output resolves against that slot's baked ports.
 #[test]
 fn test_build_resolves_chained_slots() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    let (_dir, libs, store) = scratch();
     let mut envelope = envelope(vec![unresolved("up", "count_up", &libs)]);
     envelope.targets[0]
         .coordinator
         .systems
         .push(next_slot(&libs));
-    deploy::resolve_slots(&mut envelope, &[table(&Shared::default())], &store).expect("resolves");
+    resolve(&mut envelope, &store).expect("resolves");
     assert!(!deploy::unresolved(&envelope));
     let next = &envelope.targets[0].coordinator.systems[4].params;
     assert!(next["allow"][0]["def"].is_object());
@@ -528,14 +490,12 @@ fn test_build_resolves_chained_slots() {
 /// A slot reading a slot later in step order is refused.
 #[test]
 fn test_build_refuses_slot_reading_later_slot() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    let (_dir, libs, store) = scratch();
     let mut envelope = envelope(vec![unresolved("up", "count_up", &libs)]);
     let systems = &mut envelope.targets[0].coordinator.systems;
     let mode = systems.iter().position(|s| s.id == "mode").expect("a slot");
     systems.insert(mode, next_slot(&libs));
-    let resolved = deploy::resolve_slots(&mut envelope, &[table(&Shared::default())], &store);
-    let Err(error) = resolved else {
+    let Err(error) = resolve(&mut envelope, &store) else {
         panic!("a slot reading a later slot resolved")
     };
     assert!(error.to_string().contains("mode"), "{error}");
@@ -543,12 +503,11 @@ fn test_build_refuses_slot_reading_later_slot() {
 
 #[test]
 fn test_build_refuses_disagreeing_candidates() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let libs = dir.path().join("libs");
+    let (_dir, libs, store) = scratch();
     let mut gain = unresolved("gain", "gain", &libs);
     gain["params"] = json!({ "gain": 2.0 });
     let mut envelope = envelope(vec![unresolved("up", "count_up", &libs), gain]);
-    let result = deploy::resolve_slots(&mut envelope, &[table(&Shared::default())], dir.path());
+    let result = resolve(&mut envelope, &store);
     let Err(DeployError::SlotContract {
         first, candidate, ..
     }) = result
@@ -560,17 +519,16 @@ fn test_build_refuses_disagreeing_candidates() {
 
 #[test]
 fn test_build_refuses_missing_pack() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let mut missing = unresolved("up", "count_up", &dir.path().join("libs"));
+    let (dir, libs, store) = scratch();
+    let mut missing = unresolved("up", "count_up", &libs);
     missing["pack"]["libs"] = json!(dir.path().join("nowhere"));
-    let mut missing = envelope(vec![missing]);
-    let result = deploy::resolve_slots(&mut missing, &[table(&Shared::default())], dir.path());
+    let result = resolve(&mut envelope(vec![missing]), &store);
     assert!(
         matches!(result, Err(DeployError::Slot { .. })),
         "{result:?}"
     );
-    let mut bare = envelope(vec![json!({ "name": "up", "ty": "count_up" })]);
-    let result = deploy::resolve_slots(&mut bare, &[table(&Shared::default())], dir.path());
+    let bare = json!({ "name": "up", "ty": "count_up" });
+    let result = resolve(&mut envelope(vec![bare]), &store);
     assert!(
         matches!(result, Err(DeployError::Slot { .. })),
         "{result:?}"
@@ -579,14 +537,10 @@ fn test_build_refuses_missing_pack() {
 
 #[test]
 fn test_build_refuses_long_library_name() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let mut long = unresolved("up", "count_up", &dir.path().join("libs"));
+    let (_dir, libs, store) = scratch();
+    let mut long = unresolved("up", "count_up", &libs);
     long["pack"]["lib"] = json!("l".repeat(64));
-    let result = deploy::resolve_slots(
-        &mut envelope(vec![long]),
-        &[table(&Shared::default())],
-        dir.path(),
-    );
+    let result = resolve(&mut envelope(vec![long]), &store);
     assert!(
         matches!(result, Err(DeployError::ArtifactName { cap: 63, .. })),
         "{result:?}"

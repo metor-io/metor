@@ -3,18 +3,16 @@ use serde_json::json;
 
 use super::*;
 use crate::cli::config::{CONFIG_VERSION, TargetConfig};
-use crate::coordinator::{
-    CoordinatorConfig, InputConfig, OutputConfig, PeerPort, PortRef, SystemConfig,
-};
+use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig, PeerPort, SystemConfig};
 use crate::record::Record;
-use crate::tests::utils::{ImuSource, Recorder, table};
+use crate::tests::utils::{Recorder, imu_source, table};
 
 fn tables(count: usize) -> Vec<SystemTable> {
     (0..count)
         .map(|_| {
             let mut table = table(&Recorder::default());
             table
-                .register_system(DB_TYPE, |_| Ok((ImuSource, 0)))
+                .register(DB_TYPE, imu_source(), i64::default)
                 .expect("valid records");
             table
         })
@@ -34,13 +32,6 @@ fn peer_port(target: &str, link: &str, port: &str) -> PeerPort {
         target: target.into(),
         link: link.into(),
         port: port.into(),
-    }
-}
-
-fn edge(port: &str, system: &str, from: &str) -> InputConfig {
-    InputConfig {
-        port: port.into(),
-        from: vec![PortRef::new(system, from)],
     }
 }
 
@@ -66,8 +57,8 @@ fn envelope() -> DeploymentConfig {
             SystemConfig {
                 params: listen(2240),
                 inputs: vec![
-                    edge("imu.imu", "imu", "imu"),
-                    edge("noisy.log", "noisy", "log"),
+                    InputConfig::new("imu.imu", "imu", "imu"),
+                    InputConfig::new("noisy.log", "noisy", "log"),
                 ],
                 ..SystemConfig::new("pub", "tap")
             },
@@ -266,7 +257,7 @@ fn test_mirror_of_a_mirror_of_itself_cycles() {
     };
     let publish = SystemConfig {
         params: listen(1),
-        inputs: vec![edge("mirror.imu", "mirror", "mirror.imu")],
+        inputs: vec![InputConfig::new("mirror.imu", "mirror", "mirror.imu")],
         ..SystemConfig::new("pub", "tap")
     };
     let mut envelope = DeploymentConfig {

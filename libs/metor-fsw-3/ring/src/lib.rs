@@ -30,8 +30,6 @@ mod region;
 mod sync;
 
 use backing::Backing;
-#[cfg(all(test, not(ring_loom)))]
-use backing::Word;
 pub use owner::{RawOwner, RingExport};
 use region::*;
 
@@ -39,26 +37,18 @@ use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use crate::sync::{Arc, AtomicU64, fence};
 use core::cell::Cell;
 use core::marker::PhantomData;
-#[cfg(all(test, not(ring_loom)))]
-use std::cell::UnsafeCell;
 
 /// Alignment of every record payload, in bytes.
 pub const PAYLOAD_ALIGNMENT: usize = 16;
 
 #[inline]
-#[cfg(all(not(kani), not(target_arch = "wasm32")))]
+#[cfg(not(any(kani, target_arch = "wasm32")))]
 fn owner_tag() -> u64 {
     std::process::id() as u64
 }
 
 #[inline]
-#[cfg(all(not(kani), target_arch = "wasm32"))]
-fn owner_tag() -> u64 {
-    1
-}
-
-#[inline]
-#[cfg(kani)]
+#[cfg(any(kani, target_arch = "wasm32"))]
 fn owner_tag() -> u64 {
     1
 }
@@ -120,112 +110,49 @@ pub struct Config {
 }
 
 /// Why a write was rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WriteError {
-    /// The record exceeds the ring capacity or the format's payload limit.
+    #[error("record exceeds the ring capacity or the payload length limit")]
     InsufficientCapacity,
-    /// Writing would overwrite unread or borrowed data.
+    #[error("ring is full: writing would overwrite unread or borrowed data")]
     WouldBlock,
 }
 
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            WriteError::InsufficientCapacity => {
-                write!(
-                    f,
-                    "record exceeds ring capacity or the payload length limit"
-                )
-            }
-            WriteError::WouldBlock => write!(
-                f,
-                "ring is full: writing now would overwrite the slowest active reader"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for WriteError {}
-
-/// Why a read failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A record length extends beyond the data region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ReadError {
-    /// A record length extends beyond the data region.
+    #[error("ring region violates a structural invariant")]
     Corrupt,
 }
 
-impl core::fmt::Display for ReadError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("ring region violates a structural invariant (possible external corruption)")
-    }
-}
-
-impl std::error::Error for ReadError {}
-
 /// All reader slots are claimed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the ring's reader table is full")]
 pub struct FullReaderTable;
 
-impl core::fmt::Display for FullReaderTable {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("the ring's reader table is full; no free slot for another view")
-    }
-}
-
-impl std::error::Error for FullReaderTable {}
-
 /// The writer role is already claimed. Dead owners require explicit reclamation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a writer already holds this ring's claim")]
 pub struct WriterClaimed;
 
-impl core::fmt::Display for WriterClaimed {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("a writer already exists for this ring (or a crashed process leaked its claim)")
-    }
-}
-
-impl std::error::Error for WriterClaimed {}
-
 /// Why a region could not be attached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AttachError {
+    #[error("region header has the wrong magic")]
     BadMagic,
+    #[error("region was written by an incompatible ring version")]
     BadVersion,
-    /// The region has an incompatible endianness tag.
+    #[error("region has an incompatible endianness tag")]
     ArchMismatch,
-    /// The region is too short for its header or requested configuration.
+    #[error("region is shorter than its header or configuration")]
     TooSmall,
-    /// The base address is not 16-byte aligned.
+    #[error("region base is not 16-byte aligned")]
     Misaligned,
-    /// Sizes or offsets are invalid, overlapping, misaligned, or unrepresentable.
+    #[error("region sizes or offsets are invalid, overlapping, or unrepresentable")]
     BadGeometry,
-    /// The declared region size exceeds the backing length.
+    #[error("region header's total size exceeds the backing length")]
     RegionTruncated,
 }
-
-impl core::fmt::Display for AttachError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            AttachError::BadMagic => f.write_str("region header has the wrong magic"),
-            AttachError::BadVersion => {
-                f.write_str("region was written by an incompatible ring version")
-            }
-            AttachError::ArchMismatch => {
-                f.write_str("region was written with an incompatible endianness tag")
-            }
-            AttachError::TooSmall => f.write_str("region is shorter than the fixed header"),
-            AttachError::Misaligned => f.write_str("region base pointer is not 16-byte aligned"),
-            AttachError::BadGeometry => {
-                f.write_str("region header fields are internally inconsistent")
-            }
-            AttachError::RegionTruncated => f.write_str(
-                "region header's total_size exceeds the backing region (truncated file?)",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AttachError {}
 
 /// Notifies readers after data or wrap padding is published.
 ///
@@ -249,7 +176,7 @@ pub trait WakeSink {
     }
 }
 
-/// Disables notifications. Async reads on an empty ring spin without yielding.
+/// Disables notifications. A wait on it resolves at once.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoWake;
 
@@ -311,7 +238,7 @@ struct Inner {
 impl Inner {
     #[inline]
     fn base(&self) -> *mut u8 {
-        self.backing.base()
+        self.backing.base
     }
 
     #[inline]
@@ -375,10 +302,6 @@ impl Inner {
     }
 
     /// Locate a record, skipping any wrap gap. Also return the position after the skip.
-    fn locate_from(&self, r: u64) -> Result<(u64, Option<Located>), ReadError> {
-        self.locate_before(r, self.control().committed.load(Acquire))
-    }
-
     fn locate_before(
         &self,
         mut r: u64,
@@ -561,7 +484,7 @@ impl RingBuffer {
     /// lifetime and all concurrent access must satisfy the ring protocol.
     unsafe fn attach(backing: Backing) -> Result<Self, AttachError> {
         // SAFETY: the caller guarantees readable, immutable header bytes.
-        let geometry = unsafe { read_header(backing.base(), backing.len()) }?;
+        let geometry = unsafe { read_header(backing.base, backing.len) }?;
         Ok(Self::from_parts(backing, geometry))
     }
 
@@ -581,7 +504,7 @@ impl RingBuffer {
 
     /// Base address and backing length. Raw attachments do not keep the owner alive.
     pub fn region(&self) -> (*mut u8, usize) {
-        (self.inner.backing.base(), self.inner.backing.len())
+        (self.inner.backing.base, self.inner.backing.len)
     }
 
     /// Absolute published position in bytes, including wrap padding.
@@ -638,7 +561,7 @@ impl RingBuffer {
     }
 
     /// Register a reader at the current published position.
-    /// Earlier records are skipped. Async reads wait on `data`.
+    /// Earlier records are skipped. Waiters on the view use `data`.
     pub fn view<RD: WakeSink>(&self, data: RD) -> Result<View<RD>, FullReaderTable> {
         let mut start = self.inner.control().committed.load(Acquire);
         for slot in 0..self.inner.geometry.max_readers {
@@ -673,35 +596,6 @@ impl RingBuffer {
         }
         Err(FullReaderTable)
     }
-
-    #[cfg(all(test, not(ring_loom)))]
-    pub(crate) fn reader_count(&self) -> usize {
-        (0..self.inner.geometry.max_readers)
-            .filter(|&s| self.inner.slot(s).cursor.load(Relaxed) != FREE_SLOT)
-            .count()
-    }
-}
-
-/// Read the configuration from a region without allocating a handle.
-///
-/// # Safety
-/// `base..base + len` is one readable allocation. The header bytes are initialized
-/// and must not change during this call.
-pub unsafe fn config_of(base: *mut u8, len: usize) -> Result<Config, AttachError> {
-    // SAFETY: the caller guarantees readable, immutable header bytes.
-    let geometry = unsafe { read_header(base, len) }?;
-    Ok(Config {
-        capacity: geometry.capacity as usize,
-        max_readers: geometry.max_readers as usize,
-    })
-}
-
-/// Required backing size for this configuration.
-///
-/// # Panics
-/// Panics on invalid configurations, as [`RingBuffer::create_in_memory`] does.
-pub fn region_len(cfg: &Config) -> usize {
-    layout(cfg).total_size
 }
 
 /// Required backing size, or `None` if the configuration cannot form a valid region.
@@ -846,18 +740,6 @@ impl<RD: WakeSink> View<RD> {
         }
     }
 
-    /// Copy and consume the next record; return `false` when caught up.
-    /// Leaves `buf` unchanged on an empty read or error. Reserve enough buffer
-    /// capacity during initialization to avoid allocation while reading.
-    pub fn try_read_into(&mut self, buf: &mut Vec<u8>) -> Result<bool, ReadError> {
-        let Some(grant) = self.try_read()? else {
-            return Ok(false);
-        };
-        buf.clear();
-        buf.extend_from_slice(&grant);
-        Ok(true)
-    }
-
     /// Borrow the next unread record, or return `None` if caught up.
     /// Dropping the grant consumes the record and lets the writer reuse its space.
     pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_>>, ReadError> {
@@ -865,33 +747,13 @@ impl<RD: WakeSink> View<RD> {
         let Some(loc) = self.locate()? else {
             return Ok(None);
         };
-        let end = loc.end();
-        Ok(Some(self.grant(loc, end)))
+        Ok(Some(self.grant(loc)))
     }
 
-    /// Wait for the next record and borrow it. Dropping the grant consumes it.
-    pub async fn read(&mut self) -> Result<ReadGrant<'_>, ReadError> {
-        self.settle();
-        let loc = loop {
-            if let Some(loc) = self.locate()? {
-                break loc;
-            }
-            let inner = &self.inner;
-            let slot = self.slot;
-            self.data
-                .wait_until(|| {
-                    inner.control().committed.load(Acquire) > inner.slot(slot).cursor.load(Acquire)
-                })
-                .await;
-        };
-        let end = loc.end();
-        Ok(self.grant(loc, end))
-    }
-
-    /// Skip older unread records and borrow the newest.
-    /// The newest stays pinned after grant drop, so repeated calls can return it
-    /// again. Returns `None` when this view has no unread record.
-    pub fn try_latest(&mut self) -> Result<Option<ReadGrant<'_>>, ReadError> {
+    /// Skip older unread records and borrow the newest until the next mutable
+    /// access to this view. The newest stays pinned, so repeated calls can
+    /// return it again. Returns `None` when this view has no unread record.
+    pub fn try_latest(&mut self) -> Result<Option<&[u8]>, ReadError> {
         self.settle();
         loop {
             let Some(loc) = self.locate()? else {
@@ -899,35 +761,29 @@ impl<RD: WakeSink> View<RD> {
             };
             let end = loc.end();
             if end >= self.data_end() {
-                let start = loc.start;
-                return Ok(Some(self.grant(loc, start)));
+                // SAFETY: lookup validated the record, and `locate` left the
+                // cursor at its start, pinning it until the next mutable access.
+                return Ok(Some(unsafe { self.inner.payload(&loc) }));
             }
             self.advance(end);
         }
     }
 
-    /// Borrow the newest record until the next mutable access to this view.
-    /// The record stays pinned, as with [`Self::try_latest`].
-    pub fn try_latest_bytes(&mut self) -> Result<Option<&[u8]>, ReadError> {
-        // Dropping a latest grant leaves its record pinned by the view.
-        Ok(self.try_latest()?.map(|grant| grant.slice))
-    }
-
     fn locate(&self) -> Result<Option<Located>, ReadError> {
         let r = self.inner.slot(self.slot).cursor.load(Acquire);
-        let (skipped, loc) = self.inner.locate_from(r)?;
+        let (skipped, loc) = self.inner.locate_before(r, self.committed())?;
         if skipped != r {
             self.advance(skipped);
         }
         Ok(loc)
     }
 
-    fn grant(&mut self, loc: Located, release_at: u64) -> ReadGrant<'_> {
+    fn grant(&mut self, loc: Located) -> ReadGrant<'_> {
         // SAFETY: lookup validated the record; this exclusive view borrow keeps it pinned.
         let slice = unsafe { self.inner.payload(&loc) };
         ReadGrant {
             cursor: &self.inner.slot(self.slot).cursor,
-            release_at,
+            end: loc.end(),
             slice,
         }
     }
@@ -975,11 +831,10 @@ impl<RD: WakeSink> Drop for View<RD> {
     }
 }
 
-/// A borrowed record, dereferencing to its payload.
-/// Dropping it consumes an ordinary read or keeps a latest read pinned.
+/// A borrowed record, dereferencing to its payload. Dropping it consumes the record.
 pub struct ReadGrant<'a> {
     cursor: &'a AtomicU64,
-    release_at: u64,
+    end: u64,
     slice: &'a [u8],
 }
 
@@ -992,7 +847,7 @@ impl std::ops::Deref for ReadGrant<'_> {
 
 impl Drop for ReadGrant<'_> {
     fn drop(&mut self) {
-        self.cursor.store(self.release_at, Release);
+        self.cursor.store(self.end, Release);
     }
 }
 
@@ -1033,6 +888,9 @@ impl<'a> Iterator for Drain<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod models;
 
 #[cfg(all(test, not(ring_loom)))]
 mod tests;

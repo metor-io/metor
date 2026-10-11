@@ -1,42 +1,34 @@
 //! The exports, driven in process against the shared test table.
 
-use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+use metor_fsw_3_ring::{NoWake, RingBuffer};
 use metor_proto_wkt::{LogEvent, LogLevel};
 
 use super::*;
 use crate::DefCx;
-use crate::port::{Input, ring_capacity};
 use crate::record::Record;
-use crate::tests::utils::{Imu, Nav, Recorder};
+use crate::tests::utils::{self, Imu, Nav, Recorder};
 
 /// The one table these tests export; a thread builds it once.
 fn build() -> SystemTable {
     crate::tests::utils::table(&Recorder::default())
 }
 
+/// A ring and the export its raw view borrows.
 struct TestRing {
     ring: RingBuffer,
     export: metor_fsw_3_ring::RingExport,
 }
 
-impl core::ops::Deref for TestRing {
-    type Target = RingBuffer;
-    fn deref(&self) -> &RingBuffer {
-        &self.ring
+impl TestRing {
+    fn raw(&self) -> RawRing {
+        RawRing::of(&self.export)
     }
 }
 
 fn ring<T: Record>(readers: usize) -> TestRing {
-    let ring = RingBuffer::create_in_memory(Config {
-        capacity: ring_capacity(T::MAX_LEN, 8).expect("valid capacity"),
-        max_readers: readers,
-    });
+    let ring = utils::ring::<T>(8, readers);
     let export = ring.export();
     TestRing { ring, export }
-}
-
-fn raw(ring: &TestRing) -> RawRing {
-    RawRing::of(&ring.export)
 }
 
 /// The def the host would resolve for `ty`, as JSON; an unknown type gets an
@@ -46,7 +38,7 @@ fn instance_def(ty: &str) -> Vec<u8> {
         .get(ty)
         .map(|entry| entry.def.clone())
         .unwrap_or_else(|| {
-            crate::SystemDef::new::<(), ()>("unknown", &crate::DefCx::empty())
+            crate::SystemDef::new::<(), (), crate::ring::NoWake>("unknown", &crate::DefCx::empty())
                 .expect("a static definition")
         });
     let instance = crate::pack::def::Instance {
@@ -58,7 +50,7 @@ fn instance_def(ty: &str) -> Vec<u8> {
 }
 
 /// Calls `create` the way an export does, returning the instance or the error.
-fn create_raw(ty: &str, params: &str, inputs: &[RawPort], outputs: &[RawRing]) -> Instance {
+fn create_raw(ty: &str, params: &str, inputs: &[RawSlice], outputs: &[RawRing]) -> Instance {
     let def = instance_def(ty);
     let mut error = RawSlice::EMPTY;
     // SAFETY: every array outlives the call, and the rings outlive the instance.
@@ -101,13 +93,6 @@ impl Drop for Instance {
             // SAFETY: the handle came from `create` and is destroyed once.
             unsafe { destroy(self.handle) };
         }
-    }
-}
-
-fn input(rings: &[RawRing]) -> RawPort {
-    RawPort {
-        rings: rings.as_ptr(),
-        len: rings.len(),
     }
 }
 
@@ -231,9 +216,9 @@ fn test_table_capture_lifetime() {
         let capture = Capture;
         let mut table = SystemTable::new();
         table
-            .register_system("imu", move |_| {
+            .register("imu", crate::tests::utils::imu_source(), move || {
                 let _ = &capture;
-                Ok((crate::tests::utils::ImuSource, 0))
+                0
             })
             .expect("valid records");
         table
@@ -259,36 +244,34 @@ fn test_unknown_system_type() {
 }
 
 #[test]
-fn test_unknown_param_key() {
-    let nav = ring::<Nav>(1);
-    let outputs = [raw(&nav)];
-    let instance = create_raw("nav", r#"{"gain":2.0}"#, &[input(&[])], &outputs);
-    assert!(instance.handle.is_null());
-    let decoded: ParamError = serde_json::from_slice(instance.error()).expect("decodes");
-    assert_eq!(decoded, ParamError::UnknownKey("gain".into()));
-}
-
-#[test]
-fn test_malformed_params() {
-    let nav = ring::<Nav>(1);
-    let outputs = [raw(&nav)];
-    let instance = create_raw("nav", "{", &[input(&[])], &outputs);
-    assert!(instance.handle.is_null());
-    let decoded: ParamError = serde_json::from_slice(instance.error()).expect("decodes");
-    assert!(matches!(decoded, ParamError::Decode(_)));
+fn test_bad_params_refused() {
+    let refused = |params: &str| {
+        let nav = ring::<Nav>(1);
+        let instance = create_raw("nav", params, &[RawSlice::EMPTY], &[nav.raw()]);
+        assert!(instance.handle.is_null());
+        serde_json::from_slice::<ParamError>(instance.error()).expect("decodes")
+    };
+    assert_eq!(
+        refused(r#"{"gain":2.0}"#),
+        ParamError::UnknownKey("gain".into())
+    );
+    assert!(matches!(refused("{"), ParamError::Decode(_)));
 }
 
 #[test]
 fn test_pipeline_single_cycle() {
     let (imu, nav) = (ring::<Imu>(1), ring::<Nav>(1));
-    let imu_out = [raw(&imu)];
-    let nav_out = [raw(&nav)];
-    let edges = [raw(&imu)];
-    let source = create_raw("imu", "", &[], &imu_out);
-    let filter = create_raw("nav", "", &[input(&edges)], &nav_out);
+    let (imu_log, nav_log) = (ring::<LogEvent>(1), ring::<LogEvent>(1));
+    let edges = [imu.raw()];
+    let source = create_raw("imu", "", &[], &[imu.raw(), imu_log.raw()]);
+    let filter = create_raw(
+        "nav",
+        "",
+        &[RawSlice::of(&edges)],
+        &[nav.raw(), nav_log.raw()],
+    );
     assert!(!source.handle.is_null() && !filter.handle.is_null());
-    let mut sink = Input::<Nav>::try_new(vec![nav.view(NoWake).expect("free slot")])
-        .expect("supported alignment");
+    let mut sink = utils::input::<Nav>(&nav.ring);
 
     assert_eq!(source.step(1), Status::Ok);
     assert_eq!(filter.step(1), Status::Ok);
@@ -300,10 +283,8 @@ fn test_pipeline_single_cycle() {
 #[test]
 fn test_system_panic_status_and_log() {
     let (imu, log) = (ring::<Imu>(1), ring::<LogEvent>(1));
-    let outputs = [raw(&imu), raw(&log)];
-    let boom = create_raw("boom", "", &[], &outputs);
-    let mut lines = Input::<LogEvent>::try_new(vec![log.view(NoWake).expect("free slot")])
-        .expect("supported alignment");
+    let boom = create_raw("boom", "", &[], &[imu.raw(), log.raw()]);
+    let mut lines = utils::input::<LogEvent>(&log.ring);
     assert_eq!(boom.step(1), Status::Ok);
     assert_eq!(boom.step(2), Status::Panicked);
     assert_eq!(boom.step(3), Status::Panicked);
@@ -317,16 +298,15 @@ fn test_system_panic_status_and_log() {
 
 #[test]
 fn test_destroy_releases_ring_handles() {
-    let (imu, nav) = (ring::<Imu>(1), ring::<Nav>(1));
-    let nav_out = [raw(&nav)];
-    let edges = [raw(&imu)];
-    let filter = create_raw("nav", "", &[input(&edges)], &nav_out);
-    assert!(imu.view(NoWake).is_err());
-    assert!(nav.writer(NoWake).is_err());
+    let (imu, nav, log) = (ring::<Imu>(1), ring::<Nav>(1), ring::<LogEvent>(1));
+    let edges = [imu.raw()];
+    let filter = create_raw("nav", "", &[RawSlice::of(&edges)], &[nav.raw(), log.raw()]);
+    assert!(imu.ring.view(NoWake).is_err());
+    assert!(nav.ring.writer(NoWake).is_err());
 
     drop(filter);
-    assert!(imu.view(NoWake).is_ok());
-    assert!(nav.writer(NoWake).is_ok());
+    assert!(imu.ring.view(NoWake).is_ok());
+    assert!(nav.ring.writer(NoWake).is_ok());
 }
 
 #[test]

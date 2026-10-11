@@ -23,22 +23,26 @@ pub struct Child {
 /// The arguments a child runs with: the envelope, its target, and the
 /// clock and cycle overrides the parent was given.
 pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = vec![
+    let flags = [
+        (
+            "--cycles",
+            overrides.cycles.map(|cycles| cycles.to_string()),
+        ),
+        ("--wall", overrides.wall.map(|rate| rate.to_string())),
+        ("--sim-dt", overrides.sim_dt.map(|dt| dt.to_string())),
+    ];
+    let set = flags
+        .into_iter()
+        .filter_map(|(flag, value)| Some([flag.into(), value?.into()]));
+    [
         "run".into(),
         envelope.into(),
         "--target".into(),
         namespace.into(),
-    ];
-    if let Some(cycles) = overrides.cycles {
-        argv.extend(["--cycles".into(), cycles.to_string().into()]);
-    }
-    if let Some(rate) = overrides.wall {
-        argv.extend(["--wall".into(), rate.to_string().into()]);
-    }
-    if let Some(dt) = overrides.sim_dt {
-        argv.extend(["--sim-dt".into(), dt.to_string().into()]);
-    }
-    argv
+    ]
+    .into_iter()
+    .chain(set.flatten())
+    .collect()
 }
 
 /// Starts `namespace` from `envelope`, its stdout and stderr each copied to
@@ -71,11 +75,10 @@ pub fn spawn_all(
     namespaces: &[&str],
     overrides: &Run,
 ) -> std::io::Result<Vec<Child>> {
-    let mut children = Vec::with_capacity(namespaces.len());
-    for namespace in namespaces {
-        children.push(spawn(envelope, namespace, overrides)?);
-    }
-    Ok(children)
+    namespaces
+        .iter()
+        .map(|namespace| spawn(envelope, namespace, overrides))
+        .collect()
 }
 
 impl Child {

@@ -41,6 +41,12 @@ pub enum ParamError {
     Channel { channel: String },
     #[error("a slot is loaded through its channel, and has none")]
     SlotChannel,
+    #[error("thread `{thread}` is not running")]
+    ThreadStart { thread: String },
+    #[error("the constructor panicked: {0}")]
+    Panicked(String),
+    #[error("a mirror of a {capacity}-byte ring is too large")]
+    MirrorTooLarge { capacity: usize },
 }
 
 #[cfg(test)]

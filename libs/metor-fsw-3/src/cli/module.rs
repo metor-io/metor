@@ -179,13 +179,13 @@ fn class_of(record: &str) -> String {
 
 fn pascal(name: &str) -> String {
     name.split('_')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
+        .flat_map(|part| {
             let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
+            chars
+                .next()
+                .into_iter()
+                .flat_map(char::to_uppercase)
+                .chain(chars)
         })
         .collect()
 }

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
-use crate::coordinator::BuildError;
+use crate::coordinator::ParamError;
 
 use super::group::{self, GroupHandle};
 
@@ -20,7 +20,7 @@ impl Threads {
     }
 
     /// The group named `name`, started if it is not already running.
-    pub(crate) fn get_or_spawn(&mut self, name: &str) -> Result<Arc<GroupHandle>, BuildError> {
+    pub(crate) fn get_or_spawn(&mut self, name: &str) -> Result<Arc<GroupHandle>, ParamError> {
         if let Some(group) = self.groups.get(name).and_then(Weak::upgrade) {
             return Ok(group);
         }

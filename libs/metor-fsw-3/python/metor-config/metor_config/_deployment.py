@@ -8,7 +8,7 @@ import os
 import sys
 from typing import Any, Mapping, Sequence
 
-from ._builtins import Db, Link, Subscribe
+from ._builtins import Db, Link, Subscribe, _namespace
 from ._config import CONFIG_VERSION, OUT_ENV, ConfigError
 from ._target import SystemHandle, Target, _targets
 
@@ -114,10 +114,7 @@ def gateway(
     `Db` served on ``listen``; returns the target and the db's handle."""
     gw = Target(cycle_rate=cycle_rate, namespace=namespace)
     for peer in peers:
-        name = peer._target.namespace
-        if not name:
-            raise ConfigError(f"the target of peer `{peer._name}` names no namespace")
-        gw.add(name, Subscribe(peer=peer))
+        gw.add(_namespace(peer), Subscribe(peer=peer))
     db = gw.add("db", Db(listen=listen, path=path, all=True), thread="db")
     return gw, db
 

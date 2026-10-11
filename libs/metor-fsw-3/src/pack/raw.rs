@@ -6,7 +6,8 @@
 use core::ffi::c_void;
 
 /// A borrowed array: the descriptor, a type name, params, an error, or the
-/// `RawPort` and `RawRing` arrays `create` takes. `len` counts elements.
+/// arrays `create` takes: one `RawSlice` of `RawRing`s per input port, and
+/// the output `RawRing`s. `len` counts elements.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RawSlice {
@@ -73,29 +74,6 @@ impl RawRing {
     }
 }
 
-/// One input port: its producers' rings, in edge order.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct RawPort {
-    pub rings: *const RawRing,
-    pub len: usize,
-}
-
-impl RawPort {
-    /// The rings feeding this port.
-    ///
-    /// # Safety
-    /// Either `len` is zero, or `rings` is `RawRing`-aligned and points at
-    /// `len` initialized `RawRing`s that live for the returned slice's life.
-    pub unsafe fn rings<'a>(&self) -> &'a [RawRing] {
-        if self.len == 0 {
-            return &[];
-        }
-        // SAFETY: the caller's contract is exactly `from_raw_parts`'.
-        unsafe { core::slice::from_raw_parts(self.rings, self.len) }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,22 +93,11 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_null_slices() {
-        // SAFETY: a zero length never reads the pointer.
-        assert!(unsafe { RawSlice::EMPTY.as_bytes() }.is_empty());
-        let port = RawPort {
-            rings: core::ptr::null(),
-            len: 0,
-        };
-        // SAFETY: a zero length never reads the pointer.
-        assert!(unsafe { port.rings() }.is_empty());
-    }
-
-    #[test]
-    fn test_empty_raw_slice() {
-        let raw = RawSlice::of::<u8>(&[]);
-        assert_eq!(raw.len, 0);
-        // SAFETY: a zero length never reads the pointer.
-        assert!(unsafe { raw.as_bytes() }.is_empty());
+    fn test_empty_slices() {
+        for raw in [RawSlice::EMPTY, RawSlice::of::<u8>(&[])] {
+            assert_eq!(raw.len, 0);
+            // SAFETY: a zero length never reads the pointer.
+            assert!(unsafe { raw.as_bytes() }.is_empty());
+        }
     }
 }

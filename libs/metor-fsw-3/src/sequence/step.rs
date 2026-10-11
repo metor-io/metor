@@ -42,9 +42,9 @@ impl SequenceStep {
     ) -> Self {
         let mut inputs = inputs.into_iter();
         // PANIC Safety: `def` declares `abort` first, and build binds one list
-        // per declared input; `AbortRequest` needs no alignment.
+        // per declared input.
         let abort = inputs.next().expect("the abort binding");
-        let abort = Input::try_new(abort.views).expect("byte alignment");
+        let abort = Input::new(abort.views);
         let InSet { ins, samplers } = InSet::<S>::bind(inputs.collect());
         let OutSet { outs, log } = OutSet::<S>::bind(outputs);
         let seq = Rc::new(Seq::new());

@@ -12,3 +12,6 @@ pub(crate) use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 #[cfg(ring_loom)]
 pub(crate) use loom::thread;
+
+#[cfg(all(test, not(ring_loom)))]
+pub(crate) use std::thread;

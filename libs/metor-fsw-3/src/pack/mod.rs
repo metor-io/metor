@@ -17,7 +17,7 @@ use crate::def::DefError;
 use crate::system::SystemDef;
 use crate::thread::Threads;
 use def::{DefCxOwned, Instance, PackDef};
-use raw::{RawPort, RawRing, RawSlice};
+use raw::{RawRing, RawSlice};
 
 /// The ABI the exports in this module are built against.
 pub const ABI_VERSION: u32 = 9;
@@ -91,7 +91,7 @@ thread_local! {
 fn with_table<R>(build: fn() -> SystemTable, f: impl FnOnce(&SystemTable) -> R) -> R {
     TABLE.with(|cell| {
         f(cell.get_or_init(|| {
-            let subscriber = tracing_subscriber::registry().with(crate::log::layer());
+            let subscriber = tracing_subscriber::registry().with(crate::log::LogLayer);
             let _ = tracing::subscriber::set_global_default(subscriber);
             build()
         }))
@@ -112,13 +112,8 @@ pub unsafe fn def(
     // SAFETY: the caller supplies a writable result pointer.
     unsafe { written.write(0) };
     crate::panic::catch(|| {
-        let buffer = if capacity == 0 {
-            &mut []
-        } else {
-            // SAFETY: the caller supplies this writable, nonoverlapping region.
-            unsafe { core::slice::from_raw_parts_mut(dst, capacity) }
-        };
-        let mut out = std::io::Cursor::new(buffer);
+        // SAFETY: the caller's contract.
+        let mut out = unsafe { out_buf(dst, capacity) };
         with_table(build, |table| {
             write_json(
                 &mut out,
@@ -152,13 +147,8 @@ pub unsafe fn system_def(
     crate::panic::catch(|| {
         // SAFETY: the caller's contract.
         let (ty, cx) = unsafe { (ty.as_bytes(), cx.as_bytes()) };
-        let buffer = if capacity == 0 {
-            &mut []
-        } else {
-            // SAFETY: the caller supplies this writable, nonoverlapping region.
-            unsafe { core::slice::from_raw_parts_mut(dst, capacity) }
-        };
-        let mut out = std::io::Cursor::new(buffer);
+        // SAFETY: the caller's contract.
+        let mut out = unsafe { out_buf(dst, capacity) };
         match with_table(build, |table| resolve_def(table, ty, cx)) {
             Ok(def) => write_json(&mut out, &def, written, DefStatus::Ok),
             Err(source) => write_json(&mut out, &source, written, DefStatus::Refused),
@@ -176,7 +166,22 @@ fn resolve_def(table: &SystemTable, ty: &[u8], cx: &[u8]) -> Result<SystemDef, D
         .get(ty)
         .ok_or_else(|| refused(format!("unknown system type `{ty}`")))?;
     let edges = owned.edges();
-    entry.def_for(&owned.borrow(&edges))
+    (entry.def_fn)(&owned.borrow(&edges))
+}
+
+/// The caller's output region, as a cursor a writer fills.
+///
+/// # Safety
+/// `dst` points to `capacity` writable bytes no other reference touches for
+/// the cursor's life, or `capacity` is zero.
+unsafe fn out_buf<'a>(dst: *mut u8, capacity: usize) -> std::io::Cursor<&'a mut [u8]> {
+    let buffer = if capacity == 0 {
+        &mut []
+    } else {
+        // SAFETY: the caller's contract.
+        unsafe { core::slice::from_raw_parts_mut(dst, capacity) }
+    };
+    std::io::Cursor::new(buffer)
 }
 
 /// Writes one value as JSON, reporting `ok` when it fit.
@@ -203,8 +208,8 @@ fn write_json<T: serde::Serialize>(
 /// `error` when there is one and an empty slice when the failure was a panic.
 ///
 /// # Safety
-/// `ty`, `params`, `def`, `inputs` (over [`RawPort`]) and `outputs` (over
-/// [`RawRing`]) each meet [`RawSlice::as_slice`]'s contract and every ring has
+/// `ty`, `params`, `def`, `inputs` (over [`RawSlice`]s of [`RawRing`]) and
+/// `outputs` (over [`RawRing`]) each meet [`RawSlice::as_slice`]'s contract and every ring has
 /// live, valid ownership callbacks covering its region. `error` is writable and
 /// does not alias the input arrays. Calls on this thread must not reenter `create`.
 pub unsafe fn create(
@@ -252,11 +257,11 @@ unsafe fn make(
     let instance: Instance =
         serde_json::from_slice(def).map_err(|e| ParamError::Decode(e.to_string()))?;
     // SAFETY: the caller's contract.
-    let (ports, out_rings) = unsafe { (inputs.as_slice::<RawPort>(), outputs.as_slice()) };
+    let (ports, out_rings) = unsafe { (inputs.as_slice::<RawSlice>(), outputs.as_slice()) };
     let ins: Vec<Vec<RingBuffer>> = ports
         .iter()
         // SAFETY: the caller's contract.
-        .map(|port| unsafe { port.rings() }.iter().map(attach).collect())
+        .map(|port| unsafe { port.as_slice() }.iter().map(attach).collect())
         .collect::<Result<_, _>>()?;
     let outs: Vec<RingBuffer> = out_rings.iter().map(attach).collect::<Result<_, _>>()?;
 

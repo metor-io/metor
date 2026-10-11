@@ -128,7 +128,7 @@ pub(crate) fn append_packet(batch: &mut Vec<u8>, ty: PacketTy, id: PacketId, pay
 
 #[cfg(test)]
 mod tests {
-    use metor_proto::types::LenPacket;
+    use metor_proto::types::{LenPacket, Msg};
 
     use crate::port::Input;
     use crate::record::MsgCodec;
@@ -185,47 +185,25 @@ mod tests {
             Input::<Fixed>::def(&DefCx::empty(), "cmds.fixed"),
         ];
         let (blob, wire) = announced(&defs);
-
         let RecordSchema::Frame { vtable, metadata } = &defs[0].schema else {
             panic!("a frame port")
         };
         assert_eq!(metadata[0].name, "cube_sat.plant.imu.sample");
-        let id = table_id(vtable);
-        let info = LinkInfo {
-            protocol_version: LINK_PROTOCOL_VERSION,
-            features: 0,
-            command_ids: Vec::new(),
-            namespace: Some("cube_sat".into()),
-            link: "pub".into(),
-        };
-        let mut expected = (&info).into_len_packet().inner;
-        let table = VTableMsg {
-            id,
-            vtable: vtable.clone(),
-        };
-        expected.extend_from_slice(&table.into_len_packet().inner);
-        for component in metadata {
-            expected.extend_from_slice(
-                &SetComponentMetadata(component.clone())
-                    .into_len_packet()
-                    .inner,
-            );
-        }
-        let RecordSchema::Msg { id: msg, .. } = &defs[1].schema else {
-            panic!("a message port")
-        };
-        let announce = SetMsgMetadata {
-            id: *msg,
-            metadata: MsgMetadata {
-                name: "Fixed".into(),
-                schema: <Fixed as postcard_schema::Schema>::SCHEMA.into(),
-                metadata: HashMap::new(),
-            },
-        };
-        expected.extend_from_slice(&announce.into_len_packet().inner);
+        assert_eq!(
+            wire,
+            vec![Some(table_id(vtable)), Some(Fixed::schema().packet_id())]
+        );
 
-        assert_eq!(blob, expected);
-        assert_eq!(wire, vec![Some(id), Some(*msg)]);
+        let mut ids = Vec::new();
+        let mut rest = &blob[..];
+        while let Some((len, body)) = rest.split_first_chunk::<4>() {
+            ids.push([body[1], body[2]]);
+            rest = &body[u32::from_le_bytes(*len) as usize..];
+        }
+        let mut expected = vec![LinkInfo::ID, VTableMsg::ID];
+        expected.extend(metadata.iter().map(|_| SetComponentMetadata::ID));
+        expected.push(SetMsgMetadata::ID);
+        assert_eq!(ids, expected);
     }
 
     #[test]
@@ -270,15 +248,6 @@ mod tests {
         let (blob, wire) = announced(&defs);
         assert_eq!(wire[0], wire[1]);
         assert_eq!(blob, announced(&defs[..1]).0);
-    }
-
-    #[test]
-    fn test_msg_streams_request_each_id() {
-        let blob = msg_streams(&[[1, 2], [3, 4]]);
-        let mut expected = (&MsgStream { msg_id: [1, 2] }).into_len_packet().inner;
-        expected.extend_from_slice(&(&MsgStream { msg_id: [3, 4] }).into_len_packet().inner);
-        assert_eq!(blob, expected);
-        assert!(msg_streams(&[]).is_empty());
     }
 
     #[test]

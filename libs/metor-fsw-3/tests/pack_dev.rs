@@ -1,38 +1,17 @@
 //! `pack dev` against the fixture pack: the rendered module and the layout.
 
+mod common;
+
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
+use common::fixture_dir;
+use metor_fsw_3::Pack;
 use metor_fsw_3::cli::cargo::{PackConfig, cargo_build, cdylib_name, triple};
-use metor_fsw_3::cli::config::PackRef;
-use metor_fsw_3::cli::module::render;
 use metor_fsw_3::cli::pack_dev::{PackDevError, pack_dev};
-use metor_fsw_3::{ABI_VERSION, Pack};
-
-fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack")
-}
 
 const GOLDEN: &str = include_str!("golden/echo_pack.py");
-
-#[test]
-fn test_fixture_matches_golden_module() {
-    let built = cargo_build("echo-pack", &root(), false).expect("the fixture builds");
-    // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
-    let pack = unsafe { Pack::open(&built) }.expect("it opens");
-    let reference = PackRef {
-        id: "echo".into(),
-        lib: "echo_pack".into(),
-        libs: "unused".into(),
-    };
-    let text = render(&reference, ABI_VERSION, pack.descriptor()).expect("renders");
-    assert_eq!(text, GOLDEN);
-    assert!(
-        !text.contains(env!("CARGO_MANIFEST_DIR")),
-        "no absolute paths"
-    );
-}
 
 #[test]
 fn test_golden_module_type_checks() {
@@ -81,7 +60,7 @@ fn pyright() -> Option<Vec<String>> {
 
 #[test]
 fn test_pack_dev_installs_module_and_library() {
-    let root = root();
+    let root = fixture_dir();
     let config = PackConfig::read(&root).expect("the fixture names its pack");
     assert_eq!(config.id, "echo");
     assert_eq!(
@@ -137,10 +116,10 @@ fn run_pack_dev(root: &Path) {
 
 #[test]
 fn test_pack_dev_rejects_loaded_destination() {
-    let built = cargo_build("echo-pack", &root(), false).expect("fixture builds");
+    let built = cargo_build("echo-pack", &fixture_dir()).expect("fixture builds");
     let temp = tempfile::tempdir().expect("temporary staging root");
     for name in ["pyproject.toml", "Cargo.toml"] {
-        std::fs::copy(root().join(name), temp.path().join(name)).expect("copy config");
+        std::fs::copy(fixture_dir().join(name), temp.path().join(name)).expect("copy config");
     }
     let config = PackConfig::read(temp.path()).expect("read copied config");
     let module = temp.path().join(".metor").join(&config.module);

@@ -1,6 +1,6 @@
 //! The [`System`] trait and the port bundles that feed it.
 
-use metor_fsw_3_ring::{NoWake, Notifier, View, WakeSink, WakeSource, Writer};
+use metor_fsw_3_ring::{NoWake, View, WakeSink, WakeSource, Writer};
 use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -47,20 +47,9 @@ pub struct SystemDef {
 }
 
 impl SystemDef {
-    /// The definition this instance's config asks the bundles for.
-    pub fn new<I: SystemInputs, O: SystemOutputs>(
-        name: &'static str,
-        cx: &DefCx<'_>,
-    ) -> Result<Self, DefError> {
-        Ok(Self {
-            name: name.into(),
-            inputs: I::defs(cx)?,
-            outputs: O::defs(cx)?,
-        })
-    }
-
-    /// The same definition for an async system, whose inputs park on a notifier.
-    pub fn new_async<I: SystemInputs<Notifier>, O: SystemOutputs>(
+    /// The definition this instance's config asks the bundles for, whose
+    /// inputs wake `W`.
+    pub fn new<I: SystemInputs<W>, O: SystemOutputs, W: WakeSink>(
         name: &'static str,
         cx: &DefCx<'_>,
     ) -> Result<Self, DefError> {
@@ -84,7 +73,7 @@ pub struct OutputBinding<W: WakeSource = NoWake> {
     pub writer: Writer<W>,
 }
 
-/// A `System` is the core composable element of metor-fsw, it provides
+/// A `System` runs once per cycle over its state and bound ports.
 pub trait System {
     type State;
     type Inputs: SystemInputs;
@@ -105,7 +94,7 @@ pub trait System {
     fn fault(&self, _now: Timestamp, _outputs: &mut Self::Outputs, _message: &str) {}
 }
 
-/// A struct of `Input<F>` fields. Derive with `#[derive(SystemInputs)]`.
+/// A system's input ports, bound in [`defs`](SystemInputs::defs) order.
 ///
 /// `W` is the wake endpoint of the ports it binds: [`NoWake`] for a cyclic
 /// system, [`Notifier`](metor_fsw_3_ring::Notifier) for an async one.
@@ -115,11 +104,11 @@ pub trait SystemInputs<W: WakeSink = NoWake> {
     /// One binding per [`defs`](SystemInputs::defs) entry, in order.
     ///
     /// # Panics
-    /// Derived implementations panic on a wrong list length or unsupported frame alignment.
+    /// May panic on a list that does not match `defs`.
     fn bind(inputs: Vec<InputBinding<W>>) -> Self;
 }
 
-/// A struct of `Output<F>` fields. Derive with `#[derive(SystemOutputs)]`.
+/// A system's output ports, bound in [`defs`](SystemOutputs::defs) order.
 ///
 /// `W` is the wake endpoint of the ports it binds, as for [`SystemInputs`].
 pub trait SystemOutputs<W: WakeSource = NoWake> {
@@ -128,7 +117,7 @@ pub trait SystemOutputs<W: WakeSource = NoWake> {
     /// One binding per [`defs`](SystemOutputs::defs) entry, in order.
     ///
     /// # Panics
-    /// Derived implementations panic on a wrong list length or unsupported frame alignment.
+    /// May panic on a list that does not match `defs`.
     fn bind(outputs: Vec<OutputBinding<W>>) -> Self;
 }
 
@@ -148,77 +137,29 @@ impl<W: WakeSource> SystemOutputs<W> for () {
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, RingBuffer};
-    use metor_proto::types::Timestamp;
+    use metor_fsw_3_ring::RingBuffer;
 
     use super::*;
+    use crate::Record;
     use crate::def::DefCx;
-    use crate::port::{Input, Output, ring_capacity};
-    use crate::tests::utils::{Imu, ImuPair, Nav, static_inputs, static_outputs};
-    use crate::{Frame, Record};
+    use crate::port::{DynInputs, DynOutputs, Input, Output};
+    use crate::tests::utils::{Imu, ImuPair, Nav, ring};
 
-    #[derive(crate::SystemInputs)]
-    struct DerivedIn {
-        imu: Input<Imu>,
-        nav: Input<Nav>,
-    }
-
-    struct HandIn {
-        imu: Input<Imu>,
-        nav: Input<Nav>,
-    }
-
-    impl SystemInputs for HandIn {
-        fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
-            Ok(vec![
-                Input::<Imu>::def(cx, "imu"),
-                Input::<Nav>::def(cx, "nav"),
-            ])
-        }
-        fn bind(mut inputs: Vec<InputBinding>) -> Self {
-            let nav = inputs.pop().expect("two bindings");
-            let imu = inputs.pop().expect("two bindings");
-            Self {
-                imu: Input::try_new(imu.views).expect("supported alignment"),
-                nav: Input::try_new(nav.views).expect("supported alignment"),
+    #[test]
+    fn test_port_definition() {
+        assert_eq!(
+            Output::<Nav>::def(&DefCx::empty(), "nav"),
+            PortDef {
+                name: "nav".into(),
+                record: Nav::NAME.into(),
+                id: Nav::ID,
+                max_len: size_of::<Nav>(),
+                alignment: align_of::<Nav>(),
+                depth: 1,
+                layout: Nav::schema().layout(),
+                schema: Nav::schema(),
             }
-        }
-    }
-
-    /// One binding per def, each over the rings listed beside it.
-    fn bound_in(ports: Vec<(PortDef, Vec<&RingBuffer>)>) -> Vec<InputBinding> {
-        ports
-            .into_iter()
-            .map(|(def, rings)| InputBinding {
-                def,
-                views: rings
-                    .into_iter()
-                    .map(|ring| ring.view(NoWake).expect("free slot"))
-                    .collect(),
-            })
-            .collect()
-    }
-
-    fn bound_out(ports: Vec<(PortDef, &RingBuffer)>) -> Vec<OutputBinding> {
-        ports
-            .into_iter()
-            .map(|(def, ring)| OutputBinding {
-                def,
-                writer: ring.writer(NoWake).expect("free writer"),
-            })
-            .collect()
-    }
-
-    #[derive(crate::SystemOutputs)]
-    struct DerivedOut {
-        nav: Output<Nav>,
-    }
-
-    fn ring<F: Frame>() -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(F::MAX_LEN, 4).expect("valid capacity"),
-            max_readers: 2,
-        })
+        );
     }
 
     #[test]
@@ -250,105 +191,18 @@ mod tests {
     }
 
     #[test]
-    fn test_derived_port_definitions() {
-        assert_eq!(
-            static_inputs::<DerivedIn, _>(),
-            static_inputs::<HandIn, _>()
-        );
-        assert_eq!(
-            static_outputs::<DerivedOut>(),
-            vec![PortDef {
-                name: "nav".into(),
-                record: Nav::NAME.into(),
-                id: Nav::ID,
-                max_len: size_of::<Nav>(),
-                alignment: align_of::<Nav>(),
-                depth: 1,
-                layout: Nav::schema().layout(),
-                schema: Nav::schema(),
-            }]
-        );
-    }
-
-    #[test]
-    fn test_system_input_output_definitions() {
-        let def = SystemDef::new::<DerivedIn, DerivedOut>("nav", &DefCx::empty())
-            .expect("a static definition");
-        assert_eq!(def.name, "nav");
-        assert_eq!(def.inputs, static_inputs::<DerivedIn, _>());
-        assert_eq!(def.outputs, static_outputs::<DerivedOut>());
-    }
-
-    #[test]
-    fn test_unit_bundles_empty() {
-        assert!(static_inputs::<(), NoWake>().is_empty());
-        assert!(static_outputs::<()>().is_empty());
-        <() as SystemInputs>::bind(Vec::new());
-        <() as SystemOutputs>::bind(Vec::new());
-    }
-
-    #[test]
-    fn test_bind_field_order() {
-        let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
-        let mut bound = DerivedIn::bind(bound_in(vec![
-            (Input::<Imu>::def(&DefCx::empty(), "imu"), vec![&imu]),
-            (Input::<Nav>::def(&DefCx::empty(), "nav"), vec![&nav]),
-        ]));
-        let imu_out = Output::<Imu>::try_new(imu.writer(NoWake).expect("free writer"))
-            .expect("supported alignment");
-        imu_out.write(&Imu::new(1, 5.0)).expect("ring has room");
-        assert_eq!(
-            bound.imu.latest().expect("valid").expect("record").sample,
-            5.0
-        );
-        assert!(bound.nav.latest().expect("valid").is_none());
-    }
-
-    #[test]
-    fn test_manual_bundle_binding() {
-        let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
-        let out = DerivedOut::bind(bound_out(vec![(
-            Output::<Nav>::def(&DefCx::empty(), "nav"),
-            &nav,
-        )]));
-        let mut bound = HandIn::bind(bound_in(vec![
-            (Input::<Imu>::def(&DefCx::empty(), "imu"), vec![&imu]),
-            (Input::<Nav>::def(&DefCx::empty(), "nav"), vec![&nav]),
-        ]));
-        out.nav
-            .write(&Nav {
-                timestamp: Timestamp(2),
-                estimate: 7.0,
-            })
-            .expect("ring has room");
-        assert!(bound.imu.latest().expect("valid").is_none());
-        assert_eq!(
-            bound.nav.latest().expect("valid").expect("record").estimate,
-            7.0
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "DerivedIn::defs()")]
-    fn test_bind_wrong_length_panics() {
-        let _ = DerivedIn::bind(bound_in(vec![(
-            Input::<Imu>::def(&DefCx::empty(), "imu"),
-            Vec::new(),
-        )]));
-    }
-
-    #[test]
     fn test_dynamic_bundle_configuration() {
-        use crate::port::{DynInputs, DynOutputs};
-
-        let def = SystemDef::new::<DynInputs, DynOutputs>("link", &DefCx::empty())
+        let def = SystemDef::new::<DynInputs, DynOutputs, _>("link", &DefCx::empty())
             .expect("a static definition");
         assert!(def.inputs.is_empty() && def.outputs.is_empty());
 
         let producer = Output::<Imu>::def(&DefCx::empty(), "imu");
         let edges = [("plant.imu", &producer)];
-        let def = SystemDef::new::<DynInputs, DynOutputs>("link", &DefCx::of_inputs(&edges))
-            .expect("one config port");
+        let cx = DefCx {
+            inputs: &edges,
+            ..DefCx::empty()
+        };
+        let def = SystemDef::new::<DynInputs, DynOutputs, _>("link", &cx).expect("one config port");
         // The dynamic input carries the producer's def under the config's name.
         assert_eq!(
             def.inputs,
@@ -358,11 +212,12 @@ mod tests {
             }]
         );
 
-        let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
-        let mut bound = DynInputs::bind(bound_in(vec![
-            (Input::<Imu>::def(&DefCx::empty(), "plant.imu"), vec![&imu]),
-            (Input::<Nav>::def(&DefCx::empty(), "nav.nav"), vec![&nav]),
-        ]));
+        let (imu, nav) = (ring::<Imu>(4, 2), ring::<Nav>(4, 2));
+        let binding = |name, ring: &RingBuffer| InputBinding {
+            def: Input::<Imu>::def(&DefCx::empty(), name),
+            views: vec![ring.view(NoWake).expect("free slot")],
+        };
+        let mut bound = DynInputs::bind(vec![binding("plant.imu", &imu), binding("nav.nav", &nav)]);
         let names: Vec<_> = bound
             .iter_mut()
             .map(|(def, _)| def.name.to_string())

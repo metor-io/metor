@@ -90,24 +90,21 @@ pub fn frame(input: TokenStream) -> TokenStream {
         }
     };
 
-    let input = Input::Struct(StructInput {
+    let (ident, generics) = (raw.ident.clone(), raw.generics.clone());
+    let struct_input = StructInput {
         ident: raw.ident,
         generics: raw.generics,
         fields,
         parent: None,
         group: None,
-    });
+    };
+    let componentize = componentize_impl(&struct_input, &fsw);
+    let decomponentize = decomponentize_impl(&struct_input, &fsw);
+    let input = Input::Struct(struct_input);
     let as_vtable = as_vtable_impl(&input, Some(frame_id), &fsw);
     let metadatatize = metadatatize_impl(&input, &fsw);
-    // PANIC Safety: `input` was built as `Input::Struct` two lines up.
-    let Input::Struct(struct_input) = &input else {
-        unreachable!("just constructed above")
-    };
-    let componentize = componentize_impl(struct_input, &fsw);
-    let decomponentize = decomponentize_impl(struct_input, &fsw);
 
-    let ident = &struct_input.ident;
-    let (impl_generics, ty_generics, where_clause) = struct_input.generics.split_for_impl();
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     quote! {
         #as_vtable
         #metadatatize

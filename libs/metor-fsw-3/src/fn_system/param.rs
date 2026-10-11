@@ -9,37 +9,37 @@ use crate::channel::{ABORT_PORT, Abort, AbortRequest};
 use crate::def::{DefCx, DefError};
 use crate::frame::Frame;
 use crate::log::Log;
-use crate::port::{DynInputs, DynOutputs, Input, Output, Sample, Sampler, Samplers};
+use crate::port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers};
 use crate::record::Record;
 use crate::sequence::Seq;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
 
-/// The bindings a bundle binds from, in parameter order: each parameter takes
-/// the share its [`Defs`] walk appended.
+/// The bindings a bundle binds from, in parameter order: each declared
+/// parameter takes one, and the one dynamic parameter that bound any takes
+/// the rest.
 pub struct Bindings<B> {
     items: std::vec::IntoIter<B>,
-    counts: std::vec::IntoIter<usize>,
+    spare: usize,
 }
 
 impl<B> Bindings<B> {
-    /// Hands out `items` in the shares `counts` names.
-    pub(crate) fn new(items: Vec<B>, counts: Vec<usize>) -> Self {
+    /// Hands out `items`, of which `declared` belong to declared parameters.
+    pub(crate) fn new(items: Vec<B>, declared: usize) -> Self {
         Self {
+            spare: items.len().saturating_sub(declared),
             items: items.into_iter(),
-            counts: counts.into_iter(),
         }
     }
 
-    /// The one binding the next parameter takes.
+    /// The one binding the next declared parameter takes.
     pub(crate) fn next(&mut self) -> Option<B> {
-        self.counts.next()?;
         self.items.next()
     }
 
-    /// Every binding the next parameter takes.
+    /// Every binding the next dynamic parameter takes.
     pub(crate) fn take(&mut self) -> Vec<B> {
-        let count = self.counts.next().unwrap_or_default();
-        self.items.by_ref().take(count).collect()
+        let spare = core::mem::take(&mut self.spare);
+        self.items.by_ref().take(spare).collect()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -49,40 +49,8 @@ impl<B> Bindings<B> {
 
 /// "Views" are bound inputs, plus the samplers [`Sample`] parameters push.
 pub struct Views<W: WakeSink> {
-    bindings: Bindings<InputBinding<W>>,
-    samplers: Samplers,
-}
-
-impl<W: WakeSink> Views<W> {
-    pub(crate) fn new(bindings: Bindings<InputBinding<W>>) -> Self {
-        Self {
-            bindings,
-            samplers: Samplers::default(),
-        }
-    }
-
-    /// The one binding the next parameter takes.
-    pub(crate) fn next(&mut self) -> Option<InputBinding<W>> {
-        self.bindings.next()
-    }
-
-    /// Every binding the next parameter takes.
-    pub(crate) fn take(&mut self) -> Vec<InputBinding<W>> {
-        self.bindings.take()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.bindings.is_empty()
-    }
-
-    /// Adds a sampler the step takes each cycle.
-    pub(crate) fn sample(&mut self, sampler: Box<dyn Sampler>) {
-        self.samplers.push(sampler);
-    }
-
-    pub(crate) fn into_samplers(self) -> Samplers {
-        self.samplers
-    }
+    pub(crate) bindings: Bindings<InputBinding<W>>,
+    pub(crate) samplers: Samplers,
 }
 
 /// "Writers" are bound outputs
@@ -90,26 +58,22 @@ pub type Writers = Bindings<OutputBinding>;
 /// A bundles parameter names
 pub type ParamNames<'n> = core::slice::Iter<'n, &'static str>;
 
-/// The ports a system's parameters take under one instance's config, and how
-/// many each of them took.
+/// The ports a system's parameters take under one instance's config.
 #[derive(Default)]
 pub struct Defs {
-    pub inputs: Vec<PortDef>,
-    pub outputs: Vec<PortDef>,
-    /// One count per input parameter, in parameter order.
-    pub(crate) input_counts: Vec<usize>,
-    /// One count per output parameter, in parameter order.
-    pub(crate) output_counts: Vec<usize>,
-    declared_inputs: Vec<Cow<'static, str>>,
-    declared_outputs: Vec<Cow<'static, str>>,
+    pub(crate) inputs: Vec<PortDef>,
+    pub(crate) outputs: Vec<PortDef>,
+    /// The ports the type declares whatever its config.
+    pub(crate) declared_inputs: Vec<Cow<'static, str>>,
+    pub(crate) declared_outputs: Vec<Cow<'static, str>>,
     /// Whether a parameter is a [`Sample`], which only a stepped system takes.
     pub(crate) sampled: bool,
 }
 
 impl Defs {
     /// Every port a system's parameters take under `cx`, under the names it gave them.
-    pub fn of<S: crate::fn_system::Ports>(cx: &DefCx<'_>) -> Result<Self, DefError> {
-        let declared = Self::walk::<S>(&DefCx::empty(), Self::default())?;
+    pub(crate) fn of<S: crate::fn_system::Ports>(cx: &DefCx<'_>) -> Result<Self, DefError> {
+        let declared = Self::declared::<S>();
         Self::walk::<S>(
             cx,
             Self {
@@ -120,41 +84,16 @@ impl Defs {
         )
     }
 
+    /// The ports a system's parameters take whatever its config.
+    pub(crate) fn declared<S: crate::fn_system::Ports>() -> Self {
+        // PANIC Safety: a dynamic parameter refuses only config ports, and
+        // the empty context has none.
+        Self::walk::<S>(&DefCx::empty(), Self::default()).expect("no config ports")
+    }
+
     fn walk<S: crate::fn_system::Ports>(cx: &DefCx<'_>, mut defs: Self) -> Result<Self, DefError> {
         S::Params::append_defs(&mut S::NAMES.iter(), cx, &mut defs)?;
         Ok(defs)
-    }
-
-    /// Appends the one port a declared parameter names.
-    pub fn push_input(&mut self, def: PortDef) {
-        self.inputs.push(def);
-        self.input_counts.push(1);
-    }
-
-    pub fn push_output(&mut self, def: PortDef) {
-        self.outputs.push(def);
-        self.output_counts.push(1);
-    }
-
-    /// Appends the ports one parameter takes from the config.
-    pub fn push_inputs(&mut self, defs: Vec<PortDef>) {
-        self.input_counts.push(defs.len());
-        self.inputs.extend(defs);
-    }
-
-    pub fn push_outputs(&mut self, defs: Vec<PortDef>) {
-        self.output_counts.push(defs.len());
-        self.outputs.extend(defs);
-    }
-
-    /// The input ports the type declares whatever its config.
-    pub fn declared_inputs(&self) -> &[Cow<'static, str>] {
-        &self.declared_inputs
-    }
-
-    /// The output ports the type declares whatever its config.
-    pub fn declared_outputs(&self) -> &[Cow<'static, str>] {
-        &self.declared_outputs
     }
 }
 
@@ -275,15 +214,15 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
         cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        defs.push_input(Input::<T>::def(cx, name(names)));
+        defs.inputs.push(Input::<T>::def(cx, name(names)));
         Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
-        // PANIC Safety: the coordinator binds one list per declared input and
-        // validates alignment at build; a mismatch is a coordinator bug.
-        let binding = views.next().expect("one binding per input param");
-        Input::try_new(binding.views).expect("alignment checked at build")
+        // PANIC Safety: the coordinator binds one list per declared input;
+        // a mismatch is a coordinator bug.
+        let binding = views.bindings.next().expect("one binding per input param");
+        Input::new(binding.views)
     }
 
     fn bind_out(_writers: &mut Writers) {}
@@ -308,7 +247,7 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
         cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        defs.push_input(Input::<T>::def(cx, name(names)));
+        defs.inputs.push(Input::<T>::def(cx, name(names)));
         defs.sampled = true;
         Ok(())
     }
@@ -316,7 +255,7 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
         let input = <Input<T> as Param>::bind_in(views);
         let (sample, sampler) = Sample::bind(input);
-        views.sample(sampler);
+        views.samplers.push(sampler);
         sample
     }
 
@@ -341,17 +280,17 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
         cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        defs.push_output(Output::<T>::def(cx, name(names)));
+        defs.outputs.push(Output::<T>::def(cx, name(names)));
         Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
     fn bind_out(writers: &mut Writers) -> Self::Out {
-        // PANIC Safety: the coordinator binds one writer per declared output and
-        // validates alignment at build; a mismatch is a coordinator bug.
+        // PANIC Safety: the coordinator binds one writer per declared output;
+        // a mismatch is a coordinator bug.
         let binding = writers.next().expect("one binding per output param");
-        Output::try_new(binding.writer).expect("alignment checked at build")
+        Output::new(binding.writer)
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
@@ -374,13 +313,13 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
         defs: &mut Defs,
     ) -> Result<(), DefError> {
         name(names);
-        let ports = crate::port::dyn_input_defs(cx, defs.declared_inputs())?;
-        defs.push_inputs(ports);
+        let ports = crate::port::dyn_input_defs(cx, &defs.declared_inputs)?;
+        defs.inputs.extend(ports);
         Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
-        SystemInputs::bind(views.take())
+        SystemInputs::bind(views.bindings.take())
     }
 
     fn bind_out(_writers: &mut Writers) {}
@@ -405,8 +344,8 @@ impl Param for DynOutputs {
         defs: &mut Defs,
     ) -> Result<(), DefError> {
         name(names);
-        let ports = crate::port::dyn_output_defs(cx, defs.declared_outputs())?;
-        defs.push_outputs(ports);
+        let ports = crate::port::dyn_output_defs(cx, &defs.declared_outputs)?;
+        defs.outputs.extend(ports);
         Ok(())
     }
 
@@ -464,7 +403,7 @@ impl<D: WakeSink + 'static> Param for Abort<D> {
         defs: &mut Defs,
     ) -> Result<(), DefError> {
         name(names);
-        defs.push_input(Input::<AbortRequest>::def(cx, ABORT_PORT));
+        defs.inputs.push(Input::<AbortRequest>::def(cx, ABORT_PORT));
         Ok(())
     }
 
@@ -539,7 +478,7 @@ impl Param for Log {
 
 /// A tuple of `Param`s is a `Param`: each half is the tuple of the elements' halves.
 macro_rules! impl_param_for_tuple {
-    ($(($P:ident, $i:tt)),*) => {
+    ($($P:ident $i:tt),*) => {
         impl<$($P: Param),*> Param for ($($P,)*) {
             type In<W: WakeSink + Clone + 'static> = ($($P::In<W>,)*);
             type Out = ($($P::Out,)*);
@@ -569,137 +508,14 @@ macro_rules! impl_param_for_tuple {
     };
 }
 
+/// Implements `Param` for every prefix of the list: `()`, `(A,)`, `(A, B)`, ...
+macro_rules! impl_param_for_tuples {
+    ([$($done:ident $di:tt),*]) => {};
+    ([$($done:ident $di:tt),*] $next:ident $ni:tt $(, $rest:ident $ri:tt)*) => {
+        impl_param_for_tuple!($($done $di,)* $next $ni);
+        impl_param_for_tuples!([$($done $di,)* $next $ni] $($rest $ri),*);
+    };
+}
+
 impl_param_for_tuple!();
-impl_param_for_tuple!((A, 0));
-impl_param_for_tuple!((A, 0), (B, 1));
-impl_param_for_tuple!((A, 0), (B, 1), (C, 2));
-impl_param_for_tuple!((A, 0), (B, 1), (C, 2), (D, 3));
-impl_param_for_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4));
-impl_param_for_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5));
-impl_param_for_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6));
-impl_param_for_tuple!(
-    (A, 0),
-    (B, 1),
-    (C, 2),
-    (D, 3),
-    (E, 4),
-    (F, 5),
-    (G, 6),
-    (H, 7)
-);
-impl_param_for_tuple!(
-    (A, 0),
-    (B, 1),
-    (C, 2),
-    (D, 3),
-    (E, 4),
-    (F, 5),
-    (G, 6),
-    (H, 7),
-    (I, 8)
-);
-impl_param_for_tuple!(
-    (A, 0),
-    (B, 1),
-    (C, 2),
-    (D, 3),
-    (E, 4),
-    (F, 5),
-    (G, 6),
-    (H, 7),
-    (I, 8),
-    (J, 9)
-);
-impl_param_for_tuple!(
-    (A, 0),
-    (B, 1),
-    (C, 2),
-    (D, 3),
-    (E, 4),
-    (F, 5),
-    (G, 6),
-    (H, 7),
-    (I, 8),
-    (J, 9),
-    (K, 10)
-);
-impl_param_for_tuple!(
-    (A, 0),
-    (B, 1),
-    (C, 2),
-    (D, 3),
-    (E, 4),
-    (F, 5),
-    (G, 6),
-    (H, 7),
-    (I, 8),
-    (J, 9),
-    (K, 10),
-    (L, 11)
-);
-impl_param_for_tuple!(
-    (A, 0),
-    (B, 1),
-    (C, 2),
-    (D, 3),
-    (E, 4),
-    (F, 5),
-    (G, 6),
-    (H, 7),
-    (I, 8),
-    (J, 9),
-    (K, 10),
-    (L, 11),
-    (M, 12)
-);
-impl_param_for_tuple!(
-    (A, 0),
-    (B, 1),
-    (C, 2),
-    (D, 3),
-    (E, 4),
-    (F, 5),
-    (G, 6),
-    (H, 7),
-    (I, 8),
-    (J, 9),
-    (K, 10),
-    (L, 11),
-    (M, 12),
-    (N, 13)
-);
-impl_param_for_tuple!(
-    (A, 0),
-    (B, 1),
-    (C, 2),
-    (D, 3),
-    (E, 4),
-    (F, 5),
-    (G, 6),
-    (H, 7),
-    (I, 8),
-    (J, 9),
-    (K, 10),
-    (L, 11),
-    (M, 12),
-    (N, 13),
-    (O, 14)
-);
-impl_param_for_tuple!(
-    (A, 0),
-    (B, 1),
-    (C, 2),
-    (D, 3),
-    (E, 4),
-    (F, 5),
-    (G, 6),
-    (H, 7),
-    (I, 8),
-    (J, 9),
-    (K, 10),
-    (L, 11),
-    (M, 12),
-    (N, 13),
-    (O, 14),
-    (P, 15)
-);
+impl_param_for_tuples!([] A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11, M 12, N 13, O 14, P 15);

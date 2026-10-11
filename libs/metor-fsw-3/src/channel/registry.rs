@@ -7,9 +7,6 @@ use serde::Deserialize;
 use crate::coordinator::ParamError;
 use crate::port::Output;
 
-/// Cycles between two writes when the params name no period.
-const DEFAULT_PERIOD: u64 = 100;
-
 /// The registry a target publishes, as its config lists it.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -29,8 +26,9 @@ pub struct ChannelSpec {
     pub available: Vec<String>,
 }
 
+/// Cycles between two writes when the params name no period.
 fn default_period() -> u64 {
-    DEFAULT_PERIOD
+    100
 }
 
 /// A `Registry` holds the registry it writes and when it next writes it.
@@ -78,27 +76,17 @@ pub fn channel_registry(#[state] s: &mut Registry, registry: &mut Output<Sequenc
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+
     use serde_json::json;
 
     use super::*;
     use crate::coordinator::Params;
     use crate::fn_system::Ctor;
-    use crate::port::{Input, ring_capacity};
-    use crate::record::Record;
+
+    use crate::tests::utils::pair;
 
     fn make(params: serde_json::Value) -> Result<Registry, ParamError> {
         Ctor::<Registry, (RegistryParams, ParamError)>::make(&Registry::new, Params(&params))
-    }
-
-    fn pair() -> (Output<SequenceRegistry>, Input<SequenceRegistry>) {
-        let ring = RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(SequenceRegistry::MAX_LEN, 4).expect("valid"),
-            max_readers: 1,
-        });
-        let input = Input::try_new(vec![ring.view(NoWake).expect("slot")]).expect("aligned");
-        let output = Output::try_new(ring.writer(NoWake).expect("writer")).expect("aligned");
-        (output, input)
     }
 
     #[test]
@@ -108,7 +96,7 @@ mod tests {
             "period": 3
         }))
         .expect("valid params");
-        let (mut output, mut input) = pair();
+        let (_ring, mut output, mut input) = pair::<SequenceRegistry>(4);
         let mut written = Vec::new();
         for cycle in 0..7 {
             channel_registry()(&mut state, &mut output);
@@ -123,7 +111,7 @@ mod tests {
     fn test_registry_decodes_to_params() {
         let mut state = make(json!({ "channels": [{ "name": "mode", "available": ["a"] }] }))
             .expect("valid params");
-        let (mut output, mut input) = pair();
+        let (_ring, mut output, mut input) = pair::<SequenceRegistry>(4);
         channel_registry()(&mut state, &mut output);
         let registry = input.drain().next().expect("a record").expect("decodes");
         assert_eq!(registry.channels.len(), 1);

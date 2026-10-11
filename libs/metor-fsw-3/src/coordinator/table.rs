@@ -10,7 +10,7 @@ use serde_json::value::RawValue;
 use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError, Records};
-use crate::fn_system::{AsyncSystemFn, Ctor, FnAsyncSystem, FnSystem, SystemFn};
+use crate::fn_system::{AsyncSystemFn, Ctor, FnSystem, SystemFn};
 use crate::sequence::SequenceFn;
 use crate::system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
@@ -27,7 +27,7 @@ static STATUS: LazyLock<PortDef> =
     LazyLock::new(|| crate::Output::<super::SystemStatus>::def(&DefCx::empty(), "status"));
 
 /// The ports a channel adds to whatever system it wraps.
-static CHANNEL: LazyLock<[PortDef; 3]> = LazyLock::new(crate::channel::ports);
+static CHANNEL: LazyLock<[PortDef; 3]> = LazyLock::new(|| crate::channel::ports(&DefCx::empty()));
 
 /// Arguments for constructing a system using [`MakeFn`].
 pub struct MakeCx<'a> {
@@ -65,13 +65,6 @@ pub(crate) struct TableEntry {
     /// The JSON Schema of the type's params, `None` when it takes none.
     pub schema: Option<Box<RawValue>>,
     pub make: Arc<MakeFn>,
-}
-
-impl TableEntry {
-    /// This type's definition under one instance's config.
-    pub(crate) fn def_for(&self, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        (self.def_fn)(cx)
-    }
 }
 
 /// A `SystemTable` maps systems names to their definitions and constructors.
@@ -139,8 +132,8 @@ impl SystemTable {
         _system: S,
         ctor: C,
     ) -> Result<(), BuildError> {
-        let make = move |params: Params<'_>| Ok((FnAsyncSystem::default(), ctor.make(params)?));
-        let entry = async_entry::<FnAsyncSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema())
+        let make = move |params: Params<'_>| Ok((FnSystem::default(), ctor.make(params)?));
+        let entry = async_entry::<FnSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema())
             .map_err(def_error(ty))?;
         self.insert(ty, entry)
     }
@@ -230,7 +223,7 @@ fn check_definitions(known: &SystemDef, incoming: &SystemDef) -> Result<(), Buil
 }
 
 fn check_record(known: &PortDef, port: &PortDef) -> Result<(), BuildError> {
-    if known.record == port.record && !same_record(known, port) {
+    if known.record == port.record && !known.same_record(port) {
         return Err(BuildError::RecordConflict {
             record: port.record.to_string(),
         });
@@ -254,12 +247,6 @@ fn check_record(known: &PortDef, port: &PortDef) -> Result<(), BuildError> {
         });
     }
     Ok(())
-}
-
-fn same_record(a: &PortDef, b: &PortDef) -> bool {
-    (a.id, a.max_len, a.alignment, a.depth, a.layout)
-        == (b.id, b.max_len, b.alignment, b.depth, b.layout)
-        && a.schema.same_record(&b.schema)
 }
 
 /// Builds one entry, binding the system's bundles from the rings' handles.
@@ -354,18 +341,20 @@ mod tests {
     use super::*;
     use crate::Record;
     use crate::async_system::Stop;
-    use crate::tests::utils::{Imu, ImuOffset, ImuPair, ImuSource, NavFilter};
+    use crate::tests::utils::{Imu, ImuPair, Trap, imu_offset, imu_source, nav_filter};
     use crate::{MsgCodec, Output};
     use metor_proto::types::ComponentId;
 
-    /// The port declaring `name`, as the table sees it.
+    /// The record `name`, as the table sees it, on a port named `out`.
     fn record(table: &SystemTable, name: &str) -> Option<PortDef> {
-        table.records().get(name).cloned()
+        table.records().port("out", name).ok()
     }
 
-    /// A type's definition under the empty context.
-    fn static_def<S: System>() -> SystemDef {
-        S::def(&DefCx::empty()).expect("a static definition")
+    fn out(port: &PortDef) -> PortDef {
+        PortDef {
+            name: "out".into(),
+            ..port.clone()
+        }
     }
 
     fn message(name: &'static str, codec: MsgCodec) -> PortDef {
@@ -382,7 +371,7 @@ mod tests {
     }
 
     fn declared(outputs: Vec<PortDef>) -> TableEntry {
-        let mut entry = entry::<ImuSource>(|_| Ok((ImuSource, 0)), Cow::Borrowed(""), None)
+        let mut entry = entry::<Trap>(|_| Ok((Trap, ())), Cow::Borrowed(""), None)
             .expect("a static definition");
         entry.def.outputs = outputs;
         entry
@@ -391,10 +380,10 @@ mod tests {
     #[test]
     fn test_record_lookup() {
         let mut table = SystemTable::new();
-        assert_eq!(record(&table, "status"), Some(STATUS.clone()));
+        assert_eq!(record(&table, "status"), Some(out(&STATUS)));
         assert!(record(&table, "missing").is_none());
         for port in CHANNEL.iter() {
-            assert_eq!(record(&table, &port.record), Some(port.clone()));
+            assert_eq!(record(&table, &port.record), Some(out(port)));
         }
         let first = Output::<Imu>::def(&DefCx::empty(), "first");
         let mut second = first.clone();
@@ -405,7 +394,7 @@ mod tests {
         table
             .insert("two", declared(vec![first.clone()]))
             .expect("same record");
-        assert_eq!(record(&table, Imu::NAME), Some(first.clone()));
+        assert_eq!(record(&table, Imu::NAME), Some(out(&first)));
     }
 
     #[test]
@@ -680,23 +669,10 @@ mod tests {
     fn test_register_definition() {
         let mut table = SystemTable::new();
         table
-            .register_system("imu", |_| Ok((ImuSource, 0)))
+            .register("imu", imu_source(), i64::default)
             .expect("valid records");
         let entry = table.get("imu").expect("registered");
         assert_eq!(entry.def.outputs[0].id, Imu::ID);
-    }
-
-    #[test]
-    fn test_register_replaces_type() {
-        let mut table = SystemTable::new();
-        table
-            .register_system("shared", |_| Ok((ImuSource, 0)))
-            .expect("valid records");
-        table
-            .register_system("shared", |_| Ok((NavFilter, ())))
-            .expect("valid records");
-        let entry = table.get("shared").expect("registered");
-        assert_eq!(entry.def.name, static_def::<NavFilter>().name);
     }
 
     #[test]
@@ -709,21 +685,15 @@ mod tests {
     #[test]
     fn test_replacement_preserves_order() {
         let mut table = SystemTable::new();
-        table
-            .register_system("imu", |_| Ok((ImuSource, 0)))
-            .expect("valid records");
-        table
-            .register_system("nav", |_| Ok((NavFilter, ())))
-            .expect("valid records");
-        table
-            .register_system("imu", |_| Ok((ImuOffset, 0)))
-            .expect("valid records");
+        let mut register = || -> Result<(), BuildError> {
+            table.register("imu", imu_source(), i64::default)?;
+            table.register("nav", nav_filter(), Default::default)?;
+            table.register("imu", imu_offset(), i64::default)
+        };
+        register().expect("valid records");
         let seen: Vec<_> = table.entries().map(|(ty, _)| ty).collect();
         assert_eq!(seen, vec!["imu", "nav"]);
-        assert_eq!(
-            table.get("imu").expect("registered").def.name,
-            static_def::<ImuOffset>().name
-        );
+        assert_eq!(table.get("imu").expect("registered").def.name, "imu_offset");
     }
 
     /// An async system with no ports, which returns when its stop is set.
@@ -735,7 +705,7 @@ mod tests {
         type Outputs = ();
 
         fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-            SystemDef::new_async::<(), ()>("idle", cx)
+            SystemDef::new::<(), (), metor_fsw_3_ring::Notifier>("idle", cx)
         }
 
         async fn run(&self, _state: &mut (), _in: &mut (), _out: &mut (), stop: Stop) {
@@ -774,9 +744,9 @@ mod tests {
     fn test_trait_registration_metadata() {
         let mut table = SystemTable::new();
         table
-            .register_system("imu", |_| Ok((ImuSource, 0)))
+            .register_system("trap", |_| Ok((Trap, ())))
             .expect("valid records");
-        let entry = table.get("imu").expect("registered");
+        let entry = table.get("trap").expect("registered");
         assert_eq!(entry.doc, "");
         assert!(entry.schema.is_none());
     }

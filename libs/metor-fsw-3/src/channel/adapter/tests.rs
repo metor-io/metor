@@ -11,13 +11,13 @@ use metor_proto_wkt::{
 use crate::channel::{Abort, ChannelState, ChannelStatus};
 use crate::coordinator::{
     Adapter, BuildError, ChannelConfig, Coordinator, CoordinatorConfig, EndReason, InputConfig,
-    LoadError, Occupant, PortRef, RunState, Step, SystemConfig, SystemTable, TableEntry,
+    LoadError, Occupant, RunState, Step, SystemConfig, SystemTable, TableEntry,
 };
 use crate::def::DefCx;
 use crate::port::{Input, Output};
 use crate::sequence::{Seq, SeqError};
 use crate::system::SystemDef;
-use crate::tests::utils::{Imu, ImuSource};
+use crate::tests::utils::{Imu, NoParams, imu_source};
 use crate::{FrameBytes, FrameStr, system};
 
 /// What the test systems saw, shared with the test.
@@ -117,9 +117,6 @@ fn counter(#[state] c: &mut Counter, imu: &mut Input<Imu>, abort: &mut Abort) {
 fn plain(#[state] c: &mut Counter) {
     c.tick();
 }
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-struct NoParams {}
 
 /// Counts cycles and never reads its abort.
 #[system]
@@ -221,34 +218,24 @@ fn slot_entry(shared: &Shared) -> TableEntry {
 
 fn table(shared: &Shared) -> SystemTable {
     let mut table = SystemTable::new();
-    let s = shared.clone();
-    table
-        .register("source", source(), move || Source(s.clone()))
-        .expect("valid");
-    let s = shared.clone();
-    table
-        .register("counter", counter(), move || Counter::new(s.clone()))
-        .expect("valid");
-    let s = shared.clone();
-    table
-        .register("plain", plain(), move || Counter::new(s.clone()))
-        .expect("valid");
-    let s = shared.clone();
-    table
-        .register("deaf", deaf(), move |p| Counter::try_new(s.clone(), p))
-        .expect("valid");
-    let s = shared.clone();
-    table
-        .register("watch", watch(), move || Watch(s.clone()))
-        .expect("valid");
-    table
-        .register_system("imu", |_| Ok((ImuSource, 0)))
-        .expect("valid");
-    let s = shared.clone();
-    table
-        .register_sequence("ticker", ticker(), move || Counter::new(s.clone()))
-        .expect("valid");
-    table.insert("slot", slot_entry(shared)).expect("valid");
+    let mut register = || -> Result<(), BuildError> {
+        let s = shared.clone();
+        table.register("source", source(), move || Source(s.clone()))?;
+        let s = shared.clone();
+        table.register("counter", counter(), move || Counter::new(s.clone()))?;
+        let s = shared.clone();
+        table.register("plain", plain(), move || Counter::new(s.clone()))?;
+        let s = shared.clone();
+        table.register("deaf", deaf(), move |p| Counter::try_new(s.clone(), p))?;
+        let s = shared.clone();
+        table.register("watch", watch(), move || Watch(s.clone()))?;
+        table.register("imu", imu_source(), i64::default)?;
+        let s = shared.clone();
+        table.register_sequence("ticker", ticker(), move || Counter::new(s.clone()))?;
+        table.insert("slot", slot_entry(shared))?;
+        Ok(())
+    };
+    register().expect("valid");
     table
 }
 
@@ -259,18 +246,11 @@ fn channel(name: &str, start: RunState) -> Option<Adapter> {
     }))
 }
 
-fn input(port: &str, system: &str, from: &str) -> InputConfig {
-    InputConfig {
-        port: port.into(),
-        from: vec![PortRef::new(system, from)],
-    }
-}
-
 /// `cmds -> imu -> {ty} as channel "ctr" -> watch`.
 fn config(ty: &str, start: RunState) -> CoordinatorConfig {
-    let mut inputs = vec![input("commands", "cmds", "commands")];
+    let mut inputs = vec![InputConfig::new("commands", "cmds", "commands")];
     if ty == "counter" {
-        inputs.push(input("imu", "imu", "imu"));
+        inputs.push(InputConfig::new("imu", "imu", "imu"));
     }
     CoordinatorConfig {
         systems: vec![
@@ -283,8 +263,8 @@ fn config(ty: &str, start: RunState) -> CoordinatorConfig {
             },
             SystemConfig {
                 inputs: vec![
-                    input("events", "ctr", "events"),
-                    input("status", "ctr", "channel_status"),
+                    InputConfig::new("events", "ctr", "events"),
+                    InputConfig::new("status", "ctr", "channel_status"),
                 ],
                 ..SystemConfig::new("watch", "watch")
             },
@@ -484,7 +464,7 @@ fn test_reserved_ports_refused() {
     let mut into_abort = config("counter", RunState::Running);
     into_abort.systems[2]
         .inputs
-        .push(input("abort", "cmds", "commands"));
+        .push(InputConfig::new("abort", "cmds", "commands"));
     assert!(matches!(
         into_abort.build(&table(&shared)),
         Err(BuildError::ReservedChannelPort { port, .. }) if port == "abort"

@@ -71,30 +71,19 @@ impl Samplers {
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, NoWake, RingBuffer, Writer};
+    use metor_fsw_3_ring::{NoWake, RingBuffer, Writer};
     use metor_proto::types::Timestamp;
     use metor_proto_wkt::LogEvent;
     use zerocopy::IntoBytes;
 
     use super::*;
     use crate::log::{LogPort, with_log_port};
-    use crate::port::{Output, ring_capacity};
-    use crate::record::Record;
-    use crate::tests::utils::Imu;
-
-    fn ring(depth: usize) -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(Imu::MAX_LEN, depth).expect("valid capacity"),
-            max_readers: 1,
-        })
-    }
+    use crate::tests::utils::{Imu, input, pair, ring};
 
     /// A writer onto `ring` and the sample its one view fills.
     fn sampled(ring: &RingBuffer) -> (Writer<NoWake>, Sample<Imu>, Box<dyn Sampler>) {
         let writer = ring.writer(NoWake).expect("free writer");
-        let input = Input::<Imu>::try_new(vec![ring.view(NoWake).expect("free slot")])
-            .expect("supported alignment");
-        let (sample, sampler) = Sample::bind(input);
+        let (sample, sampler) = Sample::bind(input::<Imu>(ring));
         (writer, sample, sampler)
     }
 
@@ -104,7 +93,7 @@ mod tests {
 
     #[test]
     fn test_none_before_first_then_newest() {
-        let ring = ring(8);
+        let ring = ring::<Imu>(8, 1);
         let (mut writer, sample, mut sampler) = sampled(&ring);
         sampler.take();
         assert_eq!(sample.get(), None);
@@ -116,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_quiet_cycle_keeps_value() {
-        let ring = ring(8);
+        let ring = ring::<Imu>(8, 1);
         let (mut writer, sample, mut sampler) = sampled(&ring);
         write(&mut writer, Imu::new(1, 1.0));
         sampler.take();
@@ -126,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_takes_last_of_a_cycle() {
-        let ring = ring(8);
+        let ring = ring::<Imu>(8, 1);
         let (mut writer, sample, mut sampler) = sampled(&ring);
         for t in 1..=3 {
             write(&mut writer, Imu::new(t, t as f64));
@@ -137,7 +126,7 @@ mod tests {
 
     #[test]
     fn test_unread_sample_never_blocks_writer() {
-        let ring = ring(2);
+        let ring = ring::<Imu>(2, 1);
         let (mut writer, sample, mut sampler) = sampled(&ring);
         for t in 0..1000 {
             write(&mut writer, Imu::new(t, t as f64));
@@ -148,16 +137,10 @@ mod tests {
 
     #[test]
     fn test_decode_error_keeps_value() {
-        let log_ring = RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(LogEvent::MAX_LEN, 4).expect("valid capacity"),
-            max_readers: 1,
-        });
-        let output = Output::try_new(log_ring.writer(NoWake).expect("free writer"));
-        let mut port = LogPort::new(output.expect("byte alignment"));
-        let mut lines = Input::<LogEvent>::try_new(vec![log_ring.view(NoWake).expect("free slot")])
-            .expect("byte alignment");
+        let (_log_ring, output, mut lines) = pair::<LogEvent>(4);
+        let mut port = LogPort::new(output);
 
-        let ring = ring(8);
+        let ring = ring::<Imu>(8, 1);
         let (mut writer, sample, mut sampler) = sampled(&ring);
         write(&mut writer, Imu::new(1, 1.0));
         sampler.take();

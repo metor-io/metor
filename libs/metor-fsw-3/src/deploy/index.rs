@@ -20,6 +20,14 @@ impl At {
     pub(crate) fn new(target: usize, system: usize) -> Self {
         Self { target, system }
     }
+
+    pub(crate) fn get(self, envelope: &DeploymentConfig) -> &SystemConfig {
+        &envelope.targets[self.target].coordinator.systems[self.system]
+    }
+
+    pub(crate) fn get_mut(self, envelope: &mut DeploymentConfig) -> &mut SystemConfig {
+        &mut envelope.targets[self.target].coordinator.systems[self.system]
+    }
 }
 
 /// A `DefIndex` computes a system's definition when a reference needs it,
@@ -70,12 +78,8 @@ impl<'a> DefIndex<'a> {
 
     /// The name a reference is reported by: `{namespace}.{id}`.
     pub(crate) fn name(&self, at: At) -> String {
-        let target = &self.envelope.targets[at.target];
-        format!(
-            "{}.{}",
-            target.namespace(),
-            target.coordinator.systems[at.system].id
-        )
+        let namespace = self.envelope.targets[at.target].namespace();
+        format!("{namespace}.{}", at.get(self.envelope).id)
     }
 
     /// The definition of the input port a peer reference names, as the port
@@ -126,16 +130,16 @@ impl<'a> DefIndex<'a> {
 
     fn compute(&mut self, at: At) -> Result<SystemDef, DeployError> {
         let target = &self.envelope.targets[at.target];
-        let system = &target.coordinator.systems[at.system];
-        let entry = self.tables[at.target]
-            .get(&system.ty)
-            .ok_or_else(|| DeployError::Build {
-                target: target.namespace().to_string(),
-                source: crate::BuildError::UnknownType {
+        let system = at.get(self.envelope);
+        let entry = self.tables[at.target].get(&system.ty).ok_or_else(|| {
+            self.build_error(
+                at,
+                crate::BuildError::UnknownType {
                     id: system.id.clone(),
                     ty: system.ty.clone(),
                 },
-            })?;
+            )
+        })?;
         let system = self.resolved_outputs(at, system)?;
         let producers = self.producers(at, &system, &entry.def)?;
         instance_def(
@@ -143,12 +147,9 @@ impl<'a> DefIndex<'a> {
             entry,
             target.coordinator.namespace.as_deref(),
             &self.records[at.target],
-            |from| Ok(producers.get(from).cloned().flatten()),
+            |_, from| Ok(producers.get(from).cloned().flatten()),
         )
-        .map_err(|source| DeployError::Build {
-            target: target.namespace().to_string(),
-            source,
-        })
+        .map_err(|source| self.build_error(at, source))
     }
 
     /// The records target `target`'s table knows.
@@ -159,7 +160,7 @@ impl<'a> DefIndex<'a> {
     /// Each config edge into the system at `at` and the definition feeding
     /// it, less the channel's own `commands`.
     pub(crate) fn edges(&mut self, at: At) -> Result<Vec<(String, PortDef)>, DeployError> {
-        let system = &self.envelope.targets[at.target].coordinator.systems[at.system];
+        let system = at.get(self.envelope);
         let mut edges = Vec::new();
         for input in &system.inputs {
             if input.port == crate::channel::COMMANDS_PORT {
@@ -212,7 +213,6 @@ impl<'a> DefIndex<'a> {
     /// The definition of an output port of a system on the same target.
     fn output(&mut self, at: At, from: &PortRef) -> Result<PortDef, DeployError> {
         let target = &self.envelope.targets[at.target];
-        let namespace = target.namespace().to_string();
         let Some(s) = target
             .coordinator
             .systems
@@ -222,7 +222,7 @@ impl<'a> DefIndex<'a> {
             return Err(self.build_error(
                 at,
                 crate::BuildError::UnknownSystem {
-                    id: target.coordinator.systems[at.system].id.clone(),
+                    id: at.get(self.envelope).id.clone(),
                     port: from.port.clone(),
                     from: from.system.clone(),
                 },
@@ -239,12 +239,14 @@ impl<'a> DefIndex<'a> {
             .iter()
             .find(|port| port.name == from.port)
             .cloned()
-            .ok_or_else(|| DeployError::Build {
-                target: namespace,
-                source: crate::BuildError::UnknownOutput {
-                    system: from.system.clone(),
-                    port: from.port.clone(),
-                },
+            .ok_or_else(|| {
+                self.build_error(
+                    at,
+                    crate::BuildError::UnknownOutput {
+                        system: from.system.clone(),
+                        port: from.port.clone(),
+                    },
+                )
             })
     }
 

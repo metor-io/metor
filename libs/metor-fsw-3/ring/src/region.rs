@@ -113,7 +113,7 @@ pub(super) fn checked_layout(cfg: &Config) -> Option<Geometry> {
 /// The backing is aligned, exclusively writable, and large enough for geometry
 /// whose sizes and offsets are valid. No other handle may observe initialization.
 pub(super) unsafe fn init_region(backing: &Backing, geometry: &Geometry) {
-    let base = backing.base();
+    let base = backing.base;
     // SAFETY: checked geometry fits the exclusive, aligned backing.
     unsafe {
         base.cast::<RegionHeader>().write(RegionHeader {

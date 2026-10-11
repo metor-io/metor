@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use futures_lite::future;
 use metor_fsw_3_ring::{Notifier, View, WakeSink};
-use metor_proto::types::{PacketId, PacketTy, Timestamp};
+use metor_proto::types::{PacketId, PacketTy};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -18,13 +18,11 @@ use super::conn::{self, Connections, Event};
 use super::inbox::{self, Inbox};
 use super::transport::{Endpoint, Transport, source};
 use super::wire;
-use super::{LinkStatus, default_conn_cap};
+use super::{LinkStatus, default_conn_cap, report};
 
 /// Records a link holds for its ports, at least, before it drops one.
-const DEFAULT_INBOUND_CAP: usize = 256;
-
 fn default_inbound_cap() -> usize {
-    DEFAULT_INBOUND_CAP
+    256
 }
 
 /// What a `Subscribe` is configured with.
@@ -47,10 +45,7 @@ pub struct SubscribeParams {
 /// Writes every record its peers send onto the port that carries it.
 pub struct Subscribe {
     endpoint: Option<Endpoint>,
-    namespace: Option<String>,
-    link: String,
-    conn_cap: usize,
-    inbound_cap: usize,
+    params: SubscribeParams,
 }
 
 impl Subscribe {
@@ -60,10 +55,7 @@ impl Subscribe {
         super::record_bound(&params.link, &endpoint);
         Ok(Self {
             endpoint: Some(endpoint),
-            namespace: params.namespace,
-            link: params.link,
-            conn_cap: params.conn_cap,
-            inbound_cap: params.inbound_cap,
+            params,
         })
     }
 }
@@ -85,6 +77,13 @@ pub async fn subscribe(
     } = routes(outputs, log);
     let msgs: Vec<PacketId> = ids(&ports, PacketTy::Msg);
     let table_ids: Vec<PacketId> = tables.iter().map(|(id, _)| *id).collect();
+    let SubscribeParams {
+        namespace,
+        link,
+        conn_cap,
+        inbound_cap,
+        ..
+    } = &s.params;
 
     // PANIC Safety: a system runs once, and the endpoint is the bind's.
     let endpoint = s.endpoint.take().expect("one run per instance");
@@ -93,15 +92,14 @@ pub async fn subscribe(
     }
 
     let seed = match endpoint {
-        Endpoint::Listen { .. } => wire::link_info(msgs.clone(), s.namespace.as_deref(), &s.link),
+        Endpoint::Listen { .. } => wire::link_info(msgs.clone(), namespace.as_deref(), link),
         Endpoint::Connect { .. } => wire::msg_streams(&msgs),
     };
 
-    let Some((inbox, mut view)) = Inbox::new(msgs, table_ids, s.inbound_cap, max_len) else {
-        let cap = s.inbound_cap;
+    let Some((inbox, mut view)) = Inbox::new(msgs, table_ids, *inbound_cap, max_len) else {
         log.fault(
             "inbound_cap",
-            format!("no ring holds {cap} records of {max_len} bytes"),
+            format!("no ring holds {inbound_cap} records of {max_len} bytes"),
         );
         return;
     };
@@ -111,13 +109,13 @@ pub async fn subscribe(
     let inbox = Rc::new(inbox);
     let conns = Rc::new(Connections::new(
         endpoint.slots(),
-        s.conn_cap,
+        *conn_cap,
         seed,
         inbox.clone(),
     ));
     let _source = stellarator::spawn(source(endpoint, conns.clone(), stop.clone())).drop_guard();
     let mut dropped = 0;
-    let mut reported = LinkStatus::new(Timestamp(0), Default::default(), 0);
+    let mut reported = LinkStatus::default();
     loop {
         let ready = async {
             view.wake()
@@ -134,7 +132,7 @@ pub async fn subscribe(
             Event::Changed => {}
             Event::Stop => return,
         }
-        let status = LinkStatus::new(Timestamp::now(), conns.stats(), dropped + inbox.dropped());
+        let status = LinkStatus::new(conns.stats(), dropped + inbox.dropped());
         report(&status, &mut reported, link_status, log);
     }
 }
@@ -150,23 +148,6 @@ fn report_unannounced(inbox: &Inbox, tables: &[(PacketId, String)], log: &mut Lo
             "peer_schema_mismatch",
             format!("port `{port}` was built against a table the peer does not announce"),
         );
-    }
-}
-
-/// Writes the status when its counters moved, faulting the packets no port saw.
-fn report(
-    status: &LinkStatus,
-    reported: &mut LinkStatus,
-    link_status: &Output<LinkStatus>,
-    log: &mut Log,
-) {
-    if status.inbound_dropped > reported.inbound_dropped {
-        let dropped = status.inbound_dropped - reported.inbound_dropped;
-        log.fault("inbound_dropped", format!("{dropped} packets dropped"));
-    }
-    if status.changed(reported) {
-        let _ = link_status.write(status);
-        *reported = *status;
     }
 }
 
@@ -249,14 +230,14 @@ fn deliver(
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+    use metor_fsw_3_ring::{NoWake, RingBuffer};
     use zerocopy::IntoBytes;
 
     use crate::DefCx;
-    use crate::port::ring_capacity;
+
     use crate::record::Record;
     use crate::system::{OutputBinding, PortDef, SystemOutputs};
-    use crate::tests::utils::{Fixed, Imu, Note};
+    use crate::tests::utils::{Fixed, Imu, Note, ring};
 
     use super::*;
 
@@ -273,13 +254,6 @@ mod tests {
 
     fn id_of<R: Record>() -> PacketId {
         R::schema().packet_id()
-    }
-
-    fn ring<R: Record>() -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(R::MAX_LEN, 2).expect("valid capacity"),
-            max_readers: 1,
-        })
     }
 
     /// One `Fixed` port and one `Note` port, as the config would list them.
@@ -328,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_route_packet_by_record_id() {
-        let rings = [ring::<Fixed>(), ring::<Note>()];
+        let rings = [ring::<Fixed>(2, 1), ring::<Note>(2, 1)];
         let mut outputs = ports(&rings);
         let mut log = Log;
         let Routes {
@@ -349,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_route_table_by_table_id() {
-        let rings = [ring::<Fixed>(), ring::<Imu>()];
+        let rings = [ring::<Fixed>(2, 1), ring::<Imu>(2, 1)];
         let mut outputs = mixed(&rings);
         let mut log = Log;
         let Routes {
@@ -386,7 +360,7 @@ mod tests {
     fn test_port_rejects_oversized_record() {
         // Both rings hold the longest record, so only a port's own bound can
         // refuse one routed to the shorter port.
-        let rings = [ring::<Note>(), ring::<Note>()];
+        let rings = [ring::<Note>(2, 1), ring::<Note>(2, 1)];
         let mut outputs = ports(&rings);
         let Routes {
             mut ports, max_len, ..
@@ -402,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_reject_duplicate_record_route() {
-        let rings = [ring::<Fixed>(), ring::<Fixed>()];
+        let rings = [ring::<Fixed>(2, 1), ring::<Fixed>(2, 1)];
         let mut outputs = bind(
             [
                 Output::<Fixed>::def(&DefCx::empty(), "cmds.first"),
@@ -419,7 +393,7 @@ mod tests {
     /// carrying one announced table are one route.
     #[test]
     fn test_reject_duplicate_table_route() {
-        let rings = [ring::<Imu>(), ring::<Imu>()];
+        let rings = [ring::<Imu>(2, 1), ring::<Imu>(2, 1)];
         let mut distinct = bind(
             [
                 Output::<Imu>::def(&DefCx::empty(), "a.imu"),
@@ -430,7 +404,7 @@ mod tests {
         assert_eq!(routes(&mut distinct, &mut Log).tables.len(), 2);
 
         let def = Output::<Imu>::def(&DefCx::empty(), "a.imu");
-        let rings = [ring::<Imu>(), ring::<Imu>()];
+        let rings = [ring::<Imu>(2, 1), ring::<Imu>(2, 1)];
         let mut same = bind(
             [
                 def.clone(),
@@ -448,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_ring_overflow_counts_drops() {
-        let rings = [ring::<Fixed>(), ring::<Note>()];
+        let rings = [ring::<Fixed>(2, 1), ring::<Note>(2, 1)];
         let mut outputs = ports(&rings);
         let mut log = Log;
         let Routes { mut ports, .. } = routes(&mut outputs, &mut log);

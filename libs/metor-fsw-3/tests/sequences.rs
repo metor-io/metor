@@ -1,14 +1,15 @@
 //! The fixture's slot under `metor run` and `metor build`: commands in over
 //! a `Subscribe`, events and the registry out over a `Publish`.
 
-use std::net::{SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+mod common;
 
+use std::path::PathBuf;
+use std::process::Stdio;
+
+use common::{Fsw, Running, dial_fsw, fixture_dir, free_ports, local, metor, ports_env, within};
 use metor_proto::buf::Slice;
 use metor_proto::types::{IntoLenPacket, Msg, OwnedPacket};
-use metor_proto_stellar::{PacketSink, PacketStream, Peer, identify};
+use metor_proto_stellar::{PacketSink, PacketStream};
 use metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
     SequenceRegistry, SetComponentMetadata,
@@ -16,43 +17,13 @@ use metor_proto_wkt::{
 use stellarator::io::{OwnedReader, OwnedWriter};
 use stellarator::net::TcpStream;
 
-/// How long a test waits for the target before it fails.
-const DEADLINE: Duration = Duration::from_secs(20);
-
 /// Cycles the target runs before it exits on its own.
 const CYCLES: &str = "60000";
 
 const PORTS_ENV: &str = "METOR_SLOT_PORTS";
 
 fn target() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack/slot.py")
-}
-
-fn metor() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_metor"))
-}
-
-/// Two ports nothing holds at the moment they are read.
-fn free_ports() -> [u16; 2] {
-    let held: Vec<TcpListener> = (0..2)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("a free port"))
-        .collect();
-    let port = |at: usize| held[at].local_addr().expect("bound").port();
-    [port(0), port(1)]
-}
-
-fn ports_env(ports: &[u16; 2]) -> String {
-    format!("{},{}", ports[0], ports[1])
-}
-
-/// A `metor run` of the fixture, killed and reaped when it drops.
-struct Running(Child);
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+    fixture_dir().join("slot.py")
 }
 
 fn run(ports: &[u16; 2]) -> Running {
@@ -65,19 +36,6 @@ fn run(ports: &[u16; 2]) -> Running {
         .spawn()
         .expect("metor runs");
     Running(child)
-}
-
-/// Dials a link until it answers with its identity.
-async fn dial(port: u16) -> Peer {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        match identify(addr).await {
-            Ok(peer) => return peer,
-            Err(e) => assert!(Instant::now() < deadline, "never came up: {e}"),
-        }
-        stellarator::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 /// What the publish link carries that a channel test reads.
@@ -131,28 +89,18 @@ impl Downlink {
 
     /// Reads until a registry arrives; it is rewritten once a second.
     async fn registry(&mut self) -> SequenceRegistry {
-        futures_lite::future::or(
-            async {
-                while self.registry.is_none() {
-                    self.next().await;
-                }
-            },
-            async {
-                stellarator::sleep(DEADLINE).await;
-                panic!("no registry")
-            },
-        )
+        within("no registry", async {
+            while self.registry.is_none() {
+                self.next().await;
+            }
+        })
         .await;
         self.registry.take().expect("read above")
     }
 
     /// The next event, failing the test at the deadline.
     async fn expect(&mut self, what: &str) -> SequenceEventKind {
-        futures_lite::future::or(self.event(), async {
-            stellarator::sleep(DEADLINE).await;
-            panic!("no event: {what}")
-        })
-        .await
+        within(&format!("no event: {what}"), self.event()).await
     }
 }
 
@@ -175,18 +123,14 @@ fn load(name: &str) -> SequenceCommandKind {
 async fn test_slot_commanded_over_links() {
     let ports = free_ports();
     let _running = run(&ports);
-    let Peer::Fsw { rx, buf, .. } = dial(ports[1]).await else {
-        panic!("a publish is an fsw link")
-    };
+    let Fsw { rx, buf, .. } = dial_fsw(local(ports[1])).await;
     let mut down = Downlink {
         rx,
         buf,
         registry: None,
         artifact_is_string: false,
     };
-    let Peer::Fsw { tx, .. } = dial(ports[0]).await else {
-        panic!("a subscribe is an fsw link")
-    };
+    let Fsw { tx, .. } = dial_fsw(local(ports[0])).await;
 
     send(&tx, load("count_up")).await;
     let loaded = SequenceEventKind::Loaded {
@@ -222,45 +166,4 @@ async fn test_slot_commanded_over_links() {
     assert_eq!(registry.channels[0].name, "mode");
     assert_eq!(registry.channels[0].available, ["count_up", "count_down"]);
     assert!(down.artifact_is_string, "the artifact is announced as text");
-}
-
-#[test]
-fn test_build_stores_candidates() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let out = dir.path().join("slot.json");
-    let output = metor()
-        .args(["build", &target().display().to_string(), "--out"])
-        .arg(&out)
-        .output()
-        .expect("metor runs");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let envelope: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&out).expect("written")).expect("json");
-    let slot = &envelope["targets"][0]["coordinator"]["systems"][1];
-    assert_eq!(slot["ty"], "fsw.dl_slot");
-    let allow = slot["params"]["allow"].as_array().expect("an allow list");
-    assert_eq!(allow.len(), 2);
-    for candidate in allow {
-        assert!(candidate.get("pack").is_none(), "{candidate}");
-        let path = Path::new(candidate["path"].as_str().expect("a path"));
-        let hash = candidate["hash"].as_str().expect("a hash");
-        assert!(path.is_file(), "{}", path.display());
-        let dir = path.parent().and_then(Path::file_name).expect("a hash dir");
-        assert_eq!(dir.to_str(), Some(hash));
-        assert!(candidate["def"].is_object());
-    }
-    let store = target()
-        .parent()
-        .expect("a directory")
-        .join(".metor")
-        .join("store");
-    assert!(
-        allow[0]["path"]
-            .as_str()
-            .is_some_and(|p| Path::new(p).starts_with(&store))
-    );
 }

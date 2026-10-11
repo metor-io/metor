@@ -1,4 +1,4 @@
-//! Sequential Kani harnesses; see `KANI.md` for assumptions and bounds.
+//! Sequential Kani harnesses; see `VERIFY.md` for assumptions and bounds.
 use super::*;
 
 const CAP: usize = 64;
@@ -16,12 +16,8 @@ fn any_record(cap: u64) -> u64 {
     rec
 }
 
-// ---------------------------------------------------------------------------
-// Tier A: position arithmetic
-// ---------------------------------------------------------------------------
-
 #[kani::proof]
-fn round_up16_alignment() {
+fn frame_alignment() {
     let n: usize = kani::any();
     kani::assume(n <= usize::MAX - 15);
     let r = round_up_16(n);
@@ -29,18 +25,15 @@ fn round_up16_alignment() {
     // Subtraction avoids overflow in the assertion near `usize::MAX`.
     assert!(r >= n);
     assert!(r - n < 16);
-}
 
-#[kani::proof]
-fn frame_len_alignment() {
-    let n: usize = kani::any();
-    kani::assume(n <= usize::MAX - 31);
-    let f = frame_len(n);
-    assert_eq!(f, 16 + round_up_16(n));
-    assert!(f.is_multiple_of(16));
-    assert!(f >= 16);
-    assert!(f - 16 >= n);
-    assert!(f - n < 32);
+    if n <= usize::MAX - 31 {
+        let f = frame_len(n);
+        assert_eq!(f, 16 + r);
+        assert!(f.is_multiple_of(16));
+        assert!(f >= 16);
+        assert!(f - 16 >= n);
+        assert!(f - n < 32);
+    }
 }
 
 #[kani::proof]
@@ -53,26 +46,12 @@ fn record_fits_bounds() {
     kani::assume(len <= u32::MAX as u64);
 
     if record_fits(len, phys, cap) {
-        assert!(phys + 16 <= cap); // the header itself
-        assert!(phys + 16 + len <= cap); // the payload slice
-        assert!(phys + 16 + round_up16_u64(len) <= cap); // and its padding
-    }
-}
-
-#[kani::proof]
-fn straddle_bound_blocks_32bit_overflow() {
-    let cap = any_capacity();
-    let phys: u64 = kani::any();
-    kani::assume(phys < cap && phys.is_multiple_of(16));
-    let len: u64 = kani::any();
-    kani::assume(len <= u32::MAX as u64);
-
-    if record_fits(len, phys, cap) {
-        // `round_up16` then `frame_len`, in 32-bit arithmetic.
-        let n = len as u32;
-        let padded = n.checked_add(15).expect("round_up16 would wrap") & !15u32;
+        assert!(phys + 16 <= cap);
+        assert!(phys + 16 + len <= cap);
+        assert!(phys + 16 + round_up16_u64(len) <= cap);
+        // The frame length is also representable in 32-bit arithmetic.
+        let padded = (len as u32).checked_add(15).expect("round_up16 would wrap") & !15u32;
         let frame = padded.checked_add(16).expect("frame_len would wrap");
-        // And it agrees with the 64-bit computation the check was made in.
         assert_eq!(frame as u64, 16 + round_up16_u64(len));
     }
 }
@@ -89,17 +68,9 @@ fn reserve_never_straddles() {
     assert_eq!(start - committed, gap);
     assert!(gap < cap);
     assert!(start.is_multiple_of(16));
-    // The whole frame fits before the physical end.
     assert!((start & (cap - 1)) + rec <= cap);
-}
 
-#[kani::proof]
-fn padding_enables_empty_ring_write() {
-    let cap = any_capacity();
-    let rec = any_record(cap);
-    let committed: u64 = kani::any();
-    kani::assume(committed.is_multiple_of(16) && committed <= u64::MAX - 2 * cap);
-    let (start, gap) = reserve(committed, rec, cap);
+    // On an empty ring, padding alone always makes room for the record.
     if !fits(committed, committed, gap + rec, cap) {
         assert!(gap > 0);
         assert!(fits(committed, committed, gap, cap));
@@ -157,10 +128,6 @@ fn round_up16_u64(n: u64) -> u64 {
     (n + 15) & !15
 }
 
-// ---------------------------------------------------------------------------
-// Tier B: geometry, against a fully hostile header
-// ---------------------------------------------------------------------------
-
 fn any_header() -> RegionHeader {
     RegionHeader {
         magic: kani::any(),
@@ -184,13 +151,12 @@ fn validate_header_hostile() {
         return;
     };
 
-    // Capacity is maskable, holds a record header, and fits this target.
     assert!(g.capacity.is_power_of_two());
     assert!(g.capacity >= 16);
     assert!(g.max_readers > 0);
+    assert!(region_len >= HEADER_SIZE);
 
-    // The reader table sits behind the fixed header, 8-aligned, and ends at or
-    // before the data region.
+    // The reader table sits behind the header, 8-aligned, before the data region.
     assert!(g.reader_table_offset >= HEADER_SIZE);
     assert!(g.reader_table_offset.is_multiple_of(8));
     let table_end = g
@@ -203,43 +169,19 @@ fn validate_header_hostile() {
         .unwrap();
     assert!(table_end <= g.data_offset);
 
+    let slot: u32 = kani::any();
+    kani::assume(slot < g.max_readers);
+    let off = g.reader_table_offset + slot as usize * READER_SLOT_SIZE;
+    assert!(off.is_multiple_of(8));
+    assert!(off + READER_SLOT_SIZE <= g.data_offset);
+
     // The data region is 16-aligned and ends inside the backing.
     assert!(g.data_offset.is_multiple_of(16));
     let data_end = g.data_offset.checked_add(g.capacity as usize).unwrap();
     assert!(data_end <= region_len);
 
-    // The control block also fits.
-    assert!(region_len >= HEADER_SIZE);
-}
-
-#[kani::proof]
-fn slot_offsets_in_bounds() {
-    let hdr = any_header();
-    let region_len: usize = kani::any();
-    let Ok(g) = validate_header(&hdr, region_len) else {
-        return;
-    };
-
-    let slot: u32 = kani::any();
-    kani::assume(slot < g.max_readers);
-
-    let off = g.reader_table_offset + slot as usize * READER_SLOT_SIZE;
-    assert!(off.is_multiple_of(8));
-    assert!(off + READER_SLOT_SIZE <= g.data_offset);
-    assert!(off + READER_SLOT_SIZE <= region_len);
-}
-
-#[kani::proof]
-fn data_ptr_in_bounds() {
-    let hdr = any_header();
-    let region_len: usize = kani::any();
-    let Ok(g) = validate_header(&hdr, region_len) else {
-        return;
-    };
-
     let phys: u64 = kani::any();
     kani::assume(phys <= g.capacity);
-
     assert!(g.data_offset + (phys as usize) <= region_len);
     if phys < g.capacity && phys.is_multiple_of(16) {
         assert!(phys + 16 <= g.capacity);
@@ -278,10 +220,6 @@ fn layout_roundtrip() {
     assert_eq!(g.total_size, geometry.total_size);
     assert_eq!(g.max_readers, max_readers as u32);
 }
-
-// ---------------------------------------------------------------------------
-// Tier C: bounded operational proofs on a real ring
-// ---------------------------------------------------------------------------
 
 #[repr(C, align(16))]
 struct Region([u8; REGION]);
@@ -429,19 +367,36 @@ fn try_latest_pins() {
     w.try_write(&[x]).unwrap();
     w.try_write(&[y]).unwrap();
 
-    let g = v.try_latest().unwrap().expect("two records committed");
-    assert_eq!(&g[..], &[y]);
-    let pinned = g.release_at;
-    drop(g);
-    assert_eq!(v.cursor(), pinned);
-
-    let again = v.try_latest().unwrap().expect("still the newest");
-    assert_eq!(&again[..], &[y]);
+    assert_eq!(v.try_latest(), Ok(Some(&[y][..])));
+    assert_eq!(v.cursor(), frame_len(1) as u64);
+    assert_eq!(v.try_latest(), Ok(Some(&[y][..])), "still the newest");
 }
 
-// ---------------------------------------------------------------------------
-// Tier D: symbolic corruption
-// ---------------------------------------------------------------------------
+/// Symbolic data bytes, written as words to shorten the loop.
+///
+/// # Safety
+/// `base` is the sole handle's region of `REGION` bytes.
+unsafe fn fill_data(base: *mut u8) {
+    for i in 0..CAP / 8 {
+        // SAFETY: word `i` lies within the data region (caller contract).
+        unsafe {
+            base.add(REGION - CAP)
+                .cast::<u64>()
+                .add(i)
+                .write(kani::any())
+        };
+    }
+}
+
+/// # Safety
+/// `base` is the sole handle's region of `REGION` bytes.
+unsafe fn write_control(base: *mut u8, committed: u64, hwm: u64) {
+    // SAFETY: the control words lie within the region (caller contract).
+    unsafe {
+        base.add(OFF_CONTROL).cast::<u64>().write(committed);
+        base.add(OFF_CONTROL + 8).cast::<u64>().write(hwm);
+    }
+}
 
 #[kani::proof]
 #[kani::unwind(12)]
@@ -452,32 +407,20 @@ fn corrupt_data_never_ub() {
     let (base, region_len) = ring.region();
     assert_eq!(region_len, REGION);
 
-    // SAFETY: we hold the only handle, and the offsets come from the geometry
-    // this region was created with.
+    // A committed position a writer that died mid-lap could leave behind.
+    let committed: u64 = kani::any();
+    kani::assume(committed <= 4 * CAP as u64 && committed.is_multiple_of(16));
+    let hwm: u64 = kani::any();
+    kani::assume(hwm <= 4 * CAP as u64 || hwm == HWM_NONE);
+    // SAFETY: we hold the only handle to this region.
     unsafe {
-        // Symbolic words cover all data bytes with fewer loop iterations.
-        for i in 0..CAP / 8 {
-            base.add(REGION - CAP)
-                .cast::<u64>()
-                .add(i)
-                .write(kani::any());
-        }
-        // Claim a committed position somewhere in the region, as a writer that
-        // died mid-lap would leave behind.
-        let committed: u64 = kani::any();
-        kani::assume(committed <= 4 * CAP as u64 && committed.is_multiple_of(16));
-        let hwm: u64 = kani::any();
-        kani::assume(hwm <= 4 * CAP as u64 || hwm == HWM_NONE);
-        base.add(OFF_CONTROL).cast::<u64>().write(committed);
-        base.add(OFF_CONTROL + 8).cast::<u64>().write(hwm);
+        fill_data(base);
+        write_control(base, committed, hwm);
     }
 
     match v.try_read() {
         Err(ReadError::Corrupt) | Ok(None) => {}
-        Ok(Some(g)) => {
-            // A served record fits in the region with room for its header.
-            assert!(g.len() <= CAP - 16);
-        }
+        Ok(Some(g)) => assert!(g.len() <= CAP - 16),
     }
 }
 
@@ -495,11 +438,9 @@ fn corrupt_control_never_ub() {
     kani::assume(committed <= 2 * CAP as u64 && committed.is_multiple_of(16));
     kani::assume(hwm <= 2 * CAP as u64 || hwm == HWM_NONE);
     kani::assume(cursor <= 2 * CAP as u64 && cursor.is_multiple_of(16));
-
-    // SAFETY: sole handle; offsets from this region's own geometry.
+    // SAFETY: we hold the only handle; the cursor is the first reader slot's.
     unsafe {
-        base.add(OFF_CONTROL).cast::<u64>().write(committed);
-        base.add(OFF_CONTROL + 8).cast::<u64>().write(hwm);
+        write_control(base, committed, hwm);
         base.add(HEADER_SIZE).cast::<u64>().write(cursor);
     }
 
@@ -516,17 +457,10 @@ fn corrupt_latest_never_ub() {
     let ring = region.attach();
     let mut v = ring.view(NoWake).unwrap();
     let (base, _) = ring.region();
-
-    // SAFETY: sole handle; offsets from this region's own geometry.
+    // SAFETY: we hold the only handle to this region.
     unsafe {
-        // Symbolic words cover all data bytes with fewer loop iterations.
-        for i in 0..CAP / 8 {
-            base.add(REGION - CAP)
-                .cast::<u64>()
-                .add(i)
-                .write(kani::any());
-        }
-        base.add(OFF_CONTROL).cast::<u64>().write(CAP as u64);
+        fill_data(base);
+        write_control(base, CAP as u64, HWM_NONE);
     }
 
     match v.try_latest() {

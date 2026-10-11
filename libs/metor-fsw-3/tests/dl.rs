@@ -1,25 +1,18 @@
 //! The host side against a real pack: build `echo-pack`, open it, run it.
 
-use std::cell::RefCell;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+mod common;
 
-use metor_fsw_3::cli::cargo::cargo_build;
+use std::cell::RefCell;
+use std::path::Path;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use common::{Ping, fixture_lib};
 use metor_fsw_3::coordinator::{
     BuildError, Coordinator, CoordinatorConfig, InputConfig, ParamError, PortRef, SystemConfig,
     SystemTable,
 };
 use metor_fsw_3::{ABI_VERSION, Input, Output, Pack, PackError, Record, Timestamp, system};
-use serde::{Deserialize, Serialize};
-
-/// The pack's record, redeclared here: the component id is the name's hash.
-#[derive(Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug)]
-#[postcard(crate = metor_fsw_3::postcard_schema)]
-#[record(max_len = 8)]
-struct Ping {
-    n: u32,
-}
 
 /// Counts up and publishes the count.
 #[derive(Default)]
@@ -42,19 +35,10 @@ fn sink(#[state] s: &mut Sink, input: &mut Input<Ping>) {
     }
 }
 
-/// Builds the fixture once per test binary and returns its cdylib.
-fn fixture() -> &'static Path {
-    static BUILT: OnceLock<PathBuf> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        cargo_build("echo-pack", root, false).expect("the fixture builds")
-    })
-}
-
 /// Opens the fixture, which is a pack built against this ABI.
 fn open() -> Pack {
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
-    unsafe { Pack::open(fixture()) }.expect("the fixture opens")
+    unsafe { Pack::open(fixture_lib()) }.expect("the fixture opens")
 }
 
 #[test]
@@ -63,7 +47,7 @@ fn test_pack_builder_panic_returns_error() {
     if std::env::var_os(CHILD).is_some() {
         // SAFETY: the fixture uses this workspace's ABI, including panic containment.
         assert!(matches!(
-            unsafe { Pack::open(fixture()) },
+            unsafe { Pack::open(fixture_lib()) },
             Err(PackError::DescriptorStatus(3))
         ));
         return;
@@ -92,17 +76,11 @@ fn pipeline(ty: &str, params: serde_json::Value) -> (CoordinatorConfig, Rc<RefCe
             SystemConfig::new("source", "source"),
             SystemConfig {
                 params,
-                inputs: vec![InputConfig {
-                    port: "input".into(),
-                    from: vec![PortRef::new("source", "output")],
-                }],
+                inputs: vec![InputConfig::new("input", "source", "output")],
                 ..SystemConfig::new("middle", format!("echo.{ty}"))
             },
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "input".into(),
-                    from: vec![PortRef::new("middle", "output")],
-                }],
+                inputs: vec![InputConfig::new("input", "middle", "output")],
                 ..SystemConfig::new("sink", "sink")
             },
         ],
@@ -136,7 +114,12 @@ fn built(ty: &str, params: serde_json::Value) -> (Coordinator, Rc<RefCell<Vec<u3
 #[test]
 fn test_pack_reports_system_metadata() {
     let pack = open();
-    let types: Vec<_> = pack.systems().map(|s| s.ty.as_str()).collect();
+    let types: Vec<_> = pack
+        .descriptor()
+        .systems
+        .iter()
+        .map(|s| s.ty.as_str())
+        .collect();
     assert_eq!(
         types,
         vec![
@@ -155,11 +138,21 @@ fn test_pack_reports_system_metadata() {
         ]
     );
 
-    let tap = pack.systems().find(|s| s.ty == "tap").expect("tap");
+    let tap = pack
+        .descriptor()
+        .systems
+        .iter()
+        .find(|s| s.ty == "tap")
+        .expect("tap");
     assert!(tap.takes_inputs && !tap.takes_outputs);
     assert!(tap.def.inputs.is_empty());
 
-    let echo = pack.systems().find(|s| s.ty == "echo").expect("echo");
+    let echo = pack
+        .descriptor()
+        .systems
+        .iter()
+        .find(|s| s.ty == "echo")
+        .expect("echo");
     assert_eq!(echo.def.inputs[0].name, "input");
     assert_eq!(echo.def.inputs[0].record, Ping::NAME);
     assert_eq!(echo.def.inputs[0].id, Ping::ID);
@@ -168,7 +161,12 @@ fn test_pack_reports_system_metadata() {
     assert_eq!(outputs, vec!["output", "log"]);
     assert_eq!(echo.doc, "Copies the newest ping.");
 
-    let gain = pack.systems().find(|s| s.ty == "gain").expect("gain");
+    let gain = pack
+        .descriptor()
+        .systems
+        .iter()
+        .find(|s| s.ty == "gain")
+        .expect("gain");
     let schema = gain.params.as_deref().expect("gain takes params").get();
     assert!(schema.contains(r#""description":"Scales every ping.""#));
     assert!(echo.params.is_none());
@@ -193,10 +191,7 @@ fn test_pack_configures_inputs() {
                 ..SystemConfig::new("tap", "echo.tap")
             },
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "input".into(),
-                    from: vec![PortRef::new("tap", "output")],
-                }],
+                inputs: vec![InputConfig::new("input", "tap", "output")],
                 ..SystemConfig::new("sink", "sink")
             },
         ],
@@ -229,7 +224,7 @@ fn test_missing_export_error() {
 #[test]
 fn test_abi_error_reports_versions() {
     // SAFETY: the fixture is a pack; only the expected version is wrong.
-    let Err(error) = (unsafe { Pack::open_with(fixture(), ABI_VERSION + 1) }) else {
+    let Err(error) = (unsafe { Pack::open_with(fixture_lib(), ABI_VERSION + 1) }) else {
         panic!("the versions differ")
     };
     assert!(matches!(

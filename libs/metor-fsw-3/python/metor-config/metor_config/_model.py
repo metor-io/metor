@@ -203,7 +203,7 @@ class System:
         self._inputs = {port: _sources(port, src) for port, src in inputs.items()}
         self._inputs.update(_edges(_item_ports(items)))
         self._params = {name: _json(value) for name, value in params.items()}
-        names = _record_names(records)
+        names = _unique([_record_name(record) for record in records], "a system takes record")
         self._dyn_outputs = list(outputs or [])
         self._dyn_outputs += [{"port": name, "record": name} for name in names]
         self._ports = {**dict(zip(names, records)), **type(self)._ports}
@@ -258,12 +258,11 @@ def _edges(ports: Sequence[OutPort[Any]]) -> dict[str, list[Source[Any]]]:
     return edges
 
 
-def _record_names(records: Sequence[type[Record]]) -> list[str]:
-    """One port name per record, each named once."""
-    names = [_record_name(record) for record in records]
+def _unique(names: list[str], what: str) -> list[str]:
+    """`names`, refusing any that repeats."""
     for name in names:
         if names.count(name) > 1:
-            raise ConfigError(f"a system takes record `{name}` twice")
+            raise ConfigError(f"{what} `{name}` twice")
     return names
 
 

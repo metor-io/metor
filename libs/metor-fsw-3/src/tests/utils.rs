@@ -2,8 +2,7 @@
 
 use core::cell::RefCell;
 use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::task::Poll;
 use std::rc::Rc;
 
 use metor_proto::types::Timestamp;
@@ -11,16 +10,17 @@ use metor_proto_wkt::LogEvent;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use metor_fsw_3_ring::Notifier;
+use metor_fsw_3_ring::{Config, NoWake, Notifier, RingBuffer};
 
+use crate::Frame;
 use crate::async_system::Stop;
 use crate::def::{DefCx, DefError};
-use crate::port::{DynInputs, DynOutputs, Input, Output};
+use crate::port::{DynInputs, DynOutputs, Input, Output, ring_capacity};
+use crate::record::Record;
 use crate::system::{System, SystemDef};
-use crate::{Frame, SystemInputs, SystemOutputs};
 
 use crate::coordinator::{
-    CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemStatus, SystemTable,
+    BuildError, CoordinatorConfig, InputConfig, SystemConfig, SystemStatus, SystemTable,
 };
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
@@ -104,189 +104,66 @@ pub struct Control {
     pub command: f64,
 }
 
-#[derive(SystemOutputs)]
-pub struct ImuOut {
-    imu: Output<Imu>,
-}
-
-#[derive(SystemInputs)]
-pub struct NavIn {
-    imu: Input<Imu>,
-}
-
-#[derive(SystemOutputs)]
-pub struct NavOut {
-    nav: Output<Nav>,
-}
-
-#[derive(SystemInputs)]
-pub struct ControlIn {
-    nav: Input<Nav>,
-}
-
-#[derive(SystemOutputs)]
-pub struct ControlOut {
-    control: Output<Control>,
-}
-
-#[derive(SystemInputs)]
-pub struct StatusIn {
-    status: Input<SystemStatus>,
-}
-
-#[derive(SystemOutputs)]
-pub struct ReservedOut {
-    status: Output<Imu>,
-}
-
 /// Declares an output under the coordinator's reserved name.
-pub struct Reserved;
-
-impl System for Reserved {
-    type State = ();
-    type Inputs = ();
-    type Outputs = ReservedOut;
-
-    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<(), ReservedOut>("reserved", cx)
-    }
-
-    fn execute(
-        &self,
-        now: Timestamp,
-        _state: &mut (),
-        _inputs: &mut (),
-        outputs: &mut ReservedOut,
-    ) {
-        let _ = outputs.status.write(&Imu {
-            timestamp: now,
-            sample: 0.0,
-        });
-    }
+#[crate::system]
+pub fn reserved(status: &mut Output<Imu>, now: Timestamp) {
+    let _ = status.write(&Imu::new(now.0, 0.0));
 }
 
 /// Counts up and publishes the count as a sample.
-pub struct ImuSource;
-
-impl System for ImuSource {
-    type State = i64;
-    type Inputs = ();
-    type Outputs = ImuOut;
-
-    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<(), ImuOut>("imu_source", cx)
-    }
-
-    fn execute(&self, _now: Timestamp, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
-        *tick += 1;
-        let _ = outputs.imu.write(&Imu {
-            timestamp: Timestamp(*tick),
-            sample: *tick as f64,
-        });
-    }
+#[crate::system]
+pub fn imu_source(#[state] tick: &mut i64, imu: &mut Output<Imu>) {
+    *tick += 1;
+    let _ = imu.write(&Imu::new(*tick, *tick as f64));
 }
 
-/// A second `imu` producer, always ahead of [`ImuSource`] in time.
-pub struct ImuOffset;
-
-impl System for ImuOffset {
-    type State = i64;
-    type Inputs = ();
-    type Outputs = ImuOut;
-
-    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<(), ImuOut>("imu_offset", cx)
-    }
-
-    fn execute(&self, _now: Timestamp, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
-        *tick += 1;
-        let _ = outputs.imu.write(&Imu {
-            timestamp: Timestamp(*tick + 100),
-            sample: *tick as f64 * 10.0,
-        });
-    }
+/// A second `imu` producer, always ahead of [`imu_source`] in time.
+#[crate::system]
+pub fn imu_offset(#[state] tick: &mut i64, imu: &mut Output<Imu>) {
+    *tick += 1;
+    let _ = imu.write(&Imu::new(*tick + 100, *tick as f64 * 10.0));
 }
 
 /// Doubles the newest sample, spinning long enough to be timed.
-pub struct NavFilter;
-
-impl System for NavFilter {
-    type State = ();
-    type Inputs = NavIn;
-    type Outputs = NavOut;
-
-    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<NavIn, NavOut>("nav_filter", cx)
-    }
-
-    fn execute(&self, _now: Timestamp, _state: &mut (), inputs: &mut NavIn, outputs: &mut NavOut) {
-        spin();
-        let Ok(Some(imu)) = inputs.imu.latest() else {
-            return;
-        };
-        let nav = Nav {
-            timestamp: imu.timestamp,
-            estimate: imu.sample * 2.0,
-        };
-        let _ = outputs.nav.write(&nav);
-    }
+#[crate::system]
+pub fn nav_filter(imu: &mut Input<Imu>, nav: &mut Output<Nav>) {
+    spin();
+    let Ok(Some(imu)) = imu.latest() else {
+        return;
+    };
+    let _ = nav.write(&Nav {
+        timestamp: imu.timestamp,
+        estimate: imu.sample * 2.0,
+    });
 }
 
 /// Publishes a command and records what it published.
-pub struct ControlLaw;
-
-impl System for ControlLaw {
-    type State = Recorder;
-    type Inputs = ControlIn;
-    type Outputs = ControlOut;
-
-    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<ControlIn, ControlOut>("control_law", cx)
-    }
-
-    fn execute(
-        &self,
-        _now: Timestamp,
-        recorder: &mut Recorder,
-        inputs: &mut ControlIn,
-        outputs: &mut ControlOut,
-    ) {
-        let Ok(Some(nav)) = inputs.nav.latest() else {
-            return;
-        };
-        let control = Control {
-            timestamp: nav.timestamp,
-            command: nav.estimate + 1.0,
-        };
-        recorder.push_command(control.timestamp, control.command);
-        let _ = outputs.control.write(&control);
-    }
+#[crate::system]
+pub fn control_law(
+    #[state] recorder: &mut Recorder,
+    nav: &mut Input<Nav>,
+    control: &mut Output<Control>,
+) {
+    let Ok(Some(nav)) = nav.latest() else {
+        return;
+    };
+    let command = Control {
+        timestamp: nav.timestamp,
+        command: nav.estimate + 1.0,
+    };
+    recorder
+        .0
+        .borrow_mut()
+        .commands
+        .push((command.timestamp, command.command));
+    let _ = control.write(&command);
 }
 
 /// Reads other systems' status rings like any other input.
-pub struct StatusWatch;
-
-impl System for StatusWatch {
-    type State = Recorder;
-    type Inputs = StatusIn;
-    type Outputs = ();
-
-    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<StatusIn, ()>("status_watch", cx)
-    }
-
-    fn execute(
-        &self,
-        _now: Timestamp,
-        recorder: &mut Recorder,
-        inputs: &mut StatusIn,
-        _outputs: &mut (),
-    ) {
-        for res in inputs.status.drain() {
-            let Ok(status) = res else { continue };
-            recorder.push_status(*status);
-        }
-    }
+#[crate::system]
+pub fn status_watch(#[state] recorder: &mut Recorder, status: &mut Input<SystemStatus>) {
+    let mut recorded = recorder.0.borrow_mut();
+    recorded.statuses.extend(status.drain().flatten().copied());
 }
 
 /// Publishes a sample, then panics from its second cycle on.
@@ -298,30 +175,35 @@ pub struct Boom(u64);
 fn boom(#[state] s: &mut Boom, imu: &mut Output<Imu>, now: Timestamp) {
     s.0 += 1;
     assert!(s.0 < 2, "boom on cycle {}", s.0);
-    let _ = imu.write(&Imu {
-        timestamp: now,
-        sample: 1.0,
-    });
+    let _ = imu.write(&Imu::new(now.0, 1.0));
 }
 
-/// A cyclic type's ports under the empty context.
-pub fn static_def<S: System>() -> SystemDef {
-    S::def(&DefCx::empty()).expect("a static definition")
+/// A ring of `depth` records of `max_len` bytes with `readers` reader slots.
+pub fn ring_of(max_len: usize, depth: usize, readers: usize) -> RingBuffer {
+    RingBuffer::create_in_memory(Config {
+        capacity: ring_capacity(max_len, depth).expect("valid capacity"),
+        max_readers: readers,
+    })
 }
 
-/// An async type's ports under the empty context.
-pub fn static_async_def<A: crate::AsyncSystem>() -> SystemDef {
-    A::def(&DefCx::empty()).expect("a static definition")
+/// A ring of `depth` `T` records with `readers` reader slots.
+pub fn ring<T: Record + ?Sized>(depth: usize, readers: usize) -> RingBuffer {
+    ring_of(T::MAX_LEN, depth, readers)
 }
 
-/// An input bundle's ports under the empty context.
-pub fn static_inputs<I: SystemInputs<W>, W: metor_fsw_3_ring::WakeSink>() -> Vec<crate::PortDef> {
-    I::defs(&DefCx::empty()).expect("a static definition")
+pub fn input<T: Record + ?Sized>(ring: &RingBuffer) -> Input<T> {
+    Input::new(vec![ring.view(NoWake).expect("free slot")])
 }
 
-/// An output bundle's ports under the empty context.
-pub fn static_outputs<O: SystemOutputs>() -> Vec<crate::PortDef> {
-    O::defs(&DefCx::empty()).expect("a static definition")
+pub fn output<T: Record + ?Sized>(ring: &RingBuffer) -> Output<T> {
+    Output::new(ring.writer(NoWake).expect("free writer"))
+}
+
+/// A one-reader ring of `depth` `T` records and both its ports.
+pub fn pair<T: Record + ?Sized>(depth: usize) -> (RingBuffer, Output<T>, Input<T>) {
+    let ring = ring::<T>(depth, 1);
+    let (output, input) = (output(&ring), input(&ring));
+    (ring, output, input)
 }
 
 /// A trait-path system that panics, so it has no `log` port to fault onto.
@@ -333,7 +215,7 @@ impl System for Trap {
     type Outputs = ();
 
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<(), ()>("trap", cx)
+        SystemDef::new::<(), (), NoWake>("trap", cx)
     }
 
     fn execute(&self, _now: Timestamp, _state: &mut (), _inputs: &mut (), _outputs: &mut ()) {
@@ -349,7 +231,10 @@ fn tap(#[state] s: &mut Tap, inputs: &mut DynInputs) {
     for (def, input) in inputs.iter_mut() {
         for record in input.drain() {
             let Ok(bytes) = record else { continue };
-            s.0.push_tap(def.name.to_string(), bytes.to_vec());
+            s.0.0
+                .borrow_mut()
+                .taps
+                .push((def.name.to_string(), bytes.to_vec()));
         }
     }
 }
@@ -422,10 +307,7 @@ pub struct LogSink(Recorder);
 
 #[crate::system]
 fn log_sink(#[state] s: &mut LogSink, lines: &mut Input<LogEvent>) {
-    for line in lines.drain() {
-        let Ok(line) = line else { continue };
-        s.0.push_log(line);
-    }
+    s.0.0.borrow_mut().logs.extend(lines.drain().flatten());
 }
 
 /// What the recording systems saw, shared with the test that built them.
@@ -441,22 +323,6 @@ struct Recorded {
 }
 
 impl Recorder {
-    fn push_command(&self, timestamp: Timestamp, command: f64) {
-        self.0.borrow_mut().commands.push((timestamp, command));
-    }
-
-    fn push_status(&self, status: SystemStatus) {
-        self.0.borrow_mut().statuses.push(status);
-    }
-
-    fn push_log(&self, line: LogEvent) {
-        self.0.borrow_mut().logs.push(line);
-    }
-
-    fn push_tap(&self, port: String, bytes: Vec<u8>) {
-        self.0.borrow_mut().taps.push((port, bytes));
-    }
-
     pub fn take(&self) -> Vec<(Timestamp, f64)> {
         core::mem::take(&mut self.0.borrow_mut().commands)
     }
@@ -481,62 +347,34 @@ pub struct NoParams {}
 /// Every system type the coordinator tests name, recording into `recorder`.
 pub fn table(recorder: &Recorder) -> SystemTable {
     let mut table = SystemTable::new();
-    table
-        .register_system("imu", |_| Ok((ImuSource, 0)))
-        .expect("valid records");
-    table
-        .register_system("imu_offset", |_| Ok((ImuOffset, 0)))
-        .expect("valid records");
-    table
-        .register_system("nav", |p| p.decode::<NoParams>().map(|_| (NavFilter, ())))
-        .expect("valid records");
-    let control = recorder.clone();
-    table
-        .register_system("control", move |_| Ok((ControlLaw, control.clone())))
-        .expect("valid records");
-    let watch = recorder.clone();
-    table
-        .register_system("status_watch", move |_| Ok((StatusWatch, watch.clone())))
-        .expect("valid records");
-    table
-        .register_system("reserved", |_| Ok((Reserved, ())))
-        .expect("valid records");
-    table
-        .register("boom", boom(), Boom::default)
-        .expect("valid records");
-    table
-        .register_system("trap", |_| Ok((Trap, ())))
-        .expect("valid records");
-    let logs = recorder.clone();
-    table
-        .register("log_sink", log_sink(), move || LogSink(logs.clone()))
-        .expect("valid records");
-    let taps = recorder.clone();
-    table
-        .register("tap", tap(), move || Tap(taps.clone()))
-        .expect("valid records");
-    table
-        .register("emit", emit(), || {
+    let mut register = || -> Result<(), BuildError> {
+        table.register("imu", imu_source(), i64::default)?;
+        table.register("imu_offset", imu_offset(), i64::default)?;
+        table.register("nav", nav_filter(), |_: NoParams| ())?;
+        let control = recorder.clone();
+        table.register("control", control_law(), move || control.clone())?;
+        let watch = recorder.clone();
+        table.register("status_watch", status_watch(), move || watch.clone())?;
+        table.register("reserved", reserved(), Default::default)?;
+        table.register("boom", boom(), Boom::default)?;
+        table.register_system("trap", |_| Ok((Trap, ())))?;
+        let logs = recorder.clone();
+        table.register("log_sink", log_sink(), move || LogSink(logs.clone()))?;
+        let taps = recorder.clone();
+        table.register("tap", tap(), move || Tap(taps.clone()))?;
+        table.register("emit", emit(), || {
             Emit(Imu::new(1, 5.0).as_bytes().to_vec())
-        })
-        .expect("valid records");
-    table
-        .register_async("relay", relay(), Default::default)
-        .expect("valid records");
-    table
-        .register_async("sleeper", sleeper(), Default::default)
-        .expect("valid records");
-    table
-        .register_async("async_boom", async_boom(), Default::default)
-        .expect("valid records");
-    table
-        .register_async("ctor_boom", async_boom(), || -> () {
+        })?;
+        table.register_async("relay", relay(), Default::default)?;
+        table.register_async("sleeper", sleeper(), Default::default)?;
+        table.register_async("async_boom", async_boom(), Default::default)?;
+        table.register_async("ctor_boom", async_boom(), || -> () {
             panic!("a constructor that panics")
-        })
-        .expect("valid records");
-    table
-        .register_async("who_am_i", who_am_i(), Default::default)
-        .expect("valid records");
+        })?;
+        table.register_async("who_am_i", who_am_i(), Default::default)?;
+        Ok(())
+    };
+    register().expect("valid records");
     table
 }
 
@@ -546,17 +384,11 @@ pub fn pipeline_config() -> CoordinatorConfig {
         systems: vec![
             SystemConfig::new("imu", "imu"),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "imu".into(),
-                    from: vec![PortRef::new("imu", "imu")],
-                }],
+                inputs: vec![InputConfig::new("imu", "imu", "imu")],
                 ..SystemConfig::new("nav", "nav")
             },
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "nav".into(),
-                    from: vec![PortRef::new("nav", "nav")],
-                }],
+                inputs: vec![InputConfig::new("nav", "nav", "nav")],
                 ..SystemConfig::new("control", "control")
             },
         ],
@@ -566,24 +398,15 @@ pub fn pipeline_config() -> CoordinatorConfig {
 
 /// A stop future for [`Coordinator::run`], which polls it once per cycle.
 pub fn after_cycles(cycles: usize) -> impl Future<Output = ()> {
-    AfterCycles { left: cycles }
-}
-
-struct AfterCycles {
-    left: usize,
-}
-
-impl Future for AfterCycles {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        self.left = self.left.saturating_sub(1);
-        if self.left == 0 {
+    let mut left = cycles;
+    core::future::poll_fn(move |_| {
+        left = left.saturating_sub(1);
+        if left == 0 {
             Poll::Ready(())
         } else {
             Poll::Pending
         }
-    }
+    })
 }
 
 /// Burns a measurable amount of time so a status record carries a nonzero

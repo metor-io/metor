@@ -1,73 +1,32 @@
 //! The fixture deployment under `metor run`: `a` samples, `b` mirrors and
 //! pings, and the gateway's db holds both.
 
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll};
-use std::net::{SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+mod common;
 
-use metor_fsw_3::coordinator::{
-    CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable,
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
+
+use common::{
+    DEADLINE, Deadline, Fsw, Running, Source, Target, dial_fsw, fixture_dir, free_ports, local,
+    metor, ports_env, source,
 };
+use metor_fsw_3::coordinator::{CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
 use metor_fsw_3::link::register_builtins;
-use metor_fsw_3::{Clock, Frame, LinkStatus, Output, Timestamp, system};
+use metor_fsw_3::{Clock, LinkStatus, Timestamp};
 use metor_proto::types::{ComponentId, Msg, OwnedPacket};
-use metor_proto_stellar::{Client, Peer, identify};
+use metor_proto_stellar::Client;
 use metor_proto_wkt::{DumpMetadata, DumpMetadataResp, GetTimeSeries, LogEvent};
 use serde_json::json;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-
-/// How long a test waits for the deployment before it fails.
-const DEADLINE: Duration = Duration::from_secs(15);
+use zerocopy::FromBytes;
 
 /// Cycles a target runs before it exits on its own, which outlives any test
 /// here and bounds what a killed run's children live on for.
 const CYCLES: &str = "20000";
 
 const PORTS_ENV: &str = "METOR_DEPLOY_PORTS";
-
-fn fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack")
-}
-
-fn metor() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_metor"))
-}
-
-/// Three ports nothing holds at the moment they are read.
-fn free_ports() -> [u16; 3] {
-    let held: Vec<TcpListener> = (0..3)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("a free port"))
-        .collect();
-    let ports: Vec<u16> = held
-        .iter()
-        .map(|listener| listener.local_addr().expect("bound").port())
-        .collect();
-    [ports[0], ports[1], ports[2]]
-}
-
-fn ports_env(ports: &[u16; 3]) -> String {
-    format!("{},{},{}", ports[0], ports[1], ports[2])
-}
-
-fn addr(port: u16) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], port))
-}
-
-/// A `metor run` of the fixture, killed and reaped when it drops.
-struct Running(Child);
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 fn run(target: &Path, ports: &[u16; 3], args: &[&str]) -> Running {
     let child = metor()
@@ -82,14 +41,13 @@ fn run(target: &Path, ports: &[u16; 3], args: &[&str]) -> Running {
 }
 
 /// Dials the db until it answers.
-async fn connect(addr: SocketAddr) -> Client {
-    let deadline = Instant::now() + DEADLINE;
+async fn connect(addr: std::net::SocketAddr) -> Client {
+    let deadline = Deadline::new();
     loop {
         if let Ok(client) = Client::connect(addr).await {
             return client;
         }
-        assert!(Instant::now() < deadline, "the db never came up");
-        stellarator::sleep(Duration::from_millis(20)).await;
+        deadline.tick("the db never came up").await;
     }
 }
 
@@ -100,12 +58,16 @@ async fn metadata(client: &mut Client) -> DumpMetadataResp {
 #[stellarator::test]
 async fn test_gateway_records_every_target() {
     let ports = free_ports();
-    let _running = run(&fixture().join("deploy.py"), &ports, &["--cycles", CYCLES]);
-    let mut client = connect(addr(ports[2])).await;
+    let _running = run(
+        &fixture_dir().join("deploy.py"),
+        &ports,
+        &["--cycles", CYCLES],
+    );
+    let mut client = connect(local(ports[2])).await;
 
     // A mirrored frame keeps its origin's names, so `b`'s copy of the sample
     // lands in the same table as `a`'s own; `b`'s link status is `b`'s.
-    let deadline = Instant::now() + DEADLINE;
+    let deadline = Deadline::new();
     let wanted = ["a.sampler.sample.value", "b.mirror.link_status.connections"];
     loop {
         let dump = metadata(&mut client).await;
@@ -119,8 +81,7 @@ async fn test_gateway_records_every_target() {
         {
             break;
         }
-        assert!(Instant::now() < deadline, "announced only {names:?}");
-        stellarator::sleep(Duration::from_millis(20)).await;
+        deadline.tick(format!("announced only {names:?}")).await;
     }
 
     // Samples reach a series once the db's persistence drains its log, so a
@@ -145,11 +106,9 @@ async fn test_gateway_records_every_target() {
             assert!(stamps.windows(2).all(|w| w[0] <= w[1]), "{stamps:?}");
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the series never filled: {series:?}"
-        );
-        stellarator::sleep(Duration::from_millis(20)).await;
+        deadline
+            .tick(format!("the series never filled: {series:?}"))
+            .await;
     }
 }
 
@@ -159,7 +118,7 @@ fn build(ports: Option<&[u16; 3]>, out: &Path) -> serde_json::Value {
     command
         .args([
             "build",
-            &fixture().join("deploy.py").display().to_string(),
+            &fixture_dir().join("deploy.py").display().to_string(),
             "-o",
         ])
         .arg(out);
@@ -179,11 +138,21 @@ fn build(ports: Option<&[u16; 3]>, out: &Path) -> serde_json::Value {
 fn test_build_matches_golden() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut built = build(None, &dir.path().join("deploy.json"));
-    let libs = fixture().join(".metor/echo_pack/_libs");
+    let libs = fixture_dir().join(".metor/echo_pack/_libs");
     for target in built["targets"].as_array_mut().expect("targets") {
         for pack in target["packs"].as_array_mut().expect("packs") {
             assert_eq!(pack["libs"], json!(libs.display().to_string()));
             pack["libs"] = json!("<libs>");
+        }
+        // Baked peer schemas are pinned by `deploy`'s unit tests.
+        for system in target["coordinator"]["systems"]
+            .as_array_mut()
+            .expect("systems")
+        {
+            for output in system["outputs"].as_array_mut().expect("outputs") {
+                let def = output.as_object_mut().and_then(|o| o.remove("def"));
+                assert!(def.is_some_and(|def| def.is_object()), "{output}");
+            }
         }
     }
     let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/deploy.json");
@@ -225,112 +194,46 @@ fn test_resolved_target_opens_only_its_packs() {
     );
 }
 
-/// A frame the fixture does not know, served in `a`'s place.
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
-#[frame(name = "imu")]
-#[repr(C)]
-struct Imu {
-    #[frame(timestamp)]
-    timestamp: Timestamp,
-    sample: f64,
-}
-
-/// Writes a frame per cycle once `gate` is set.
-struct Source(i64, Arc<AtomicBool>);
-
-#[system]
-fn source(#[state] s: &mut Source, imu: &mut Output<Imu>) {
-    if !s.1.load(Ordering::Acquire) {
-        return;
-    }
-    s.0 += 1;
-    let _ = imu.write(&Imu {
-        timestamp: Timestamp(s.0),
-        sample: s.0 as f64,
-    });
-}
-
-/// An in-process target on its own thread, stopped and joined when dropped;
-/// it announces at once and sends data once `gate` is set.
+/// An in-process target serving a frame the fixture does not know in `a`'s
+/// place; it announces at once and sends data once `gate` is set.
 struct Impostor {
-    stop: Arc<AtomicBool>,
+    _target: Target,
     gate: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for Impostor {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-struct Until(Arc<AtomicBool>);
-
-impl Future for Until {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        match self.0.load(Ordering::Acquire) {
-            true => Poll::Ready(()),
-            false => Poll::Pending,
-        }
-    }
 }
 
 /// Serves `imu.imu` as target `a`'s `pub` on `port`, which is not the table
 /// `b` was built against.
 fn impostor(port: u16) -> Impostor {
-    let stop = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(AtomicBool::new(false));
-    let (flag, open) = (stop.clone(), gate.clone());
-    let thread = std::thread::spawn(move || {
+    let open = gate.clone();
+    let table = move || {
         let mut table = SystemTable::new();
         table
-            .register("source", source(), move || Source(0, open.clone()))
+            .register("source", source(), move || Source(0, Some(open.clone())))
             .expect("valid records");
         register_builtins(&mut table).expect("valid records");
-        let config = CoordinatorConfig {
-            clock: Clock::Wall { rate: 1000.0 },
-            namespace: Some("a".into()),
-            systems: vec![
-                SystemConfig::new("imu", "source"),
-                SystemConfig {
-                    params: json!({
-                        "transport": { "listen": { "addr": format!("127.0.0.1:{port}"), "max_connections": 2 } },
-                        "namespace": "a",
-                        "link": "pub",
-                    }),
-                    inputs: vec![InputConfig {
-                        port: "imu.imu".into(),
-                        from: vec![PortRef::new("imu", "imu")],
-                    }],
-                    ..SystemConfig::new("pub", "fsw.publish")
-                },
-            ],
-            ..Default::default()
-        };
-        let mut coordinator = config.build(&table).expect("valid config");
-        stellarator::run(|| async move { coordinator.run(Until(flag)).await });
-    });
+        table
+    };
+    let config = CoordinatorConfig {
+        clock: Clock::Wall { rate: 1000.0 },
+        namespace: Some("a".into()),
+        systems: vec![
+            SystemConfig::new("imu", "source"),
+            SystemConfig {
+                params: json!({
+                    "transport": { "listen": { "addr": format!("127.0.0.1:{port}"), "max_connections": 2 } },
+                    "namespace": "a",
+                    "link": "pub",
+                }),
+                inputs: vec![InputConfig::new("imu.imu", "imu", "imu")],
+                ..SystemConfig::new("pub", "fsw.publish")
+            },
+        ],
+        ..Default::default()
+    };
     Impostor {
-        stop,
+        _target: Target::spawn(config, table, Arc::new(AtomicU64::new(0))),
         gate,
-        thread: Some(thread),
-    }
-}
-
-/// Dials until the link is up.
-async fn dial(addr: SocketAddr) -> Peer {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        match identify(addr).await {
-            Ok(peer) => return peer,
-            Err(e) => assert!(Instant::now() < deadline, "never came up: {e}"),
-        }
-        stellarator::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -347,16 +250,12 @@ async fn test_peer_announcing_another_table_is_faulted() {
         "{mirror}"
     );
     let impostor = impostor(ports[0]);
-    let Peer::Fsw { info, .. } = dial(addr(ports[0])).await else {
-        panic!("the impostor is an fsw link")
-    };
+    let Fsw { info, .. } = dial_fsw(local(ports[0])).await;
     assert_eq!(info.link, "pub");
     let _running = run(&out, &ports, &["--target", "b", "--cycles", CYCLES]);
     // The fault is logged once, on the peer's first data packet, so the
     // observer attaches before the impostor sends any.
-    let Peer::Fsw { mut rx, buf, .. } = dial(addr(ports[1])).await else {
-        panic!("b's publish is an fsw link")
-    };
+    let Fsw { mut rx, buf, .. } = dial_fsw(local(ports[1])).await;
     impostor.gate.store(true, Ordering::Release);
     let mut buf = buf;
     let mut seen: Vec<String> = Vec::new();

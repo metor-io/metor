@@ -4,7 +4,7 @@ use core::cell::{Cell, RefCell};
 use core::time::Duration;
 use std::rc::Rc;
 
-use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+use metor_fsw_3_ring::{NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogLevel;
 
@@ -15,22 +15,16 @@ use zerocopy::FromBytes;
 
 use crate::coordinator::{
     Adapter, BuildError, ChannelConfig, Coordinator, CoordinatorConfig, EndReason, InputConfig,
-    PortRef, RunState, Step, SystemConfig, SystemTable,
+    RunState, Step, SystemConfig, SystemTable,
 };
 use crate::log::Log;
-use crate::port::{Output, Sample, ring_capacity};
+use crate::port::{Output, Sample};
 use crate::system::{InputBinding, OutputBinding};
 use crate::tests::utils::{self, Imu, Recorder};
 
 /// The phase a sequence has reached, shared with the test.
 #[derive(Clone, Default)]
 struct Phase(Rc<Cell<u32>>);
-
-impl Phase {
-    fn get(&self) -> u32 {
-        self.0.get()
-    }
-}
 
 /// Marks three phases, one cycle apart.
 #[crate::sequence]
@@ -76,10 +70,7 @@ async fn doomed(seq: &Seq) -> Result<(), SeqError> {
 /// Writes one sample, then ends.
 #[crate::sequence]
 async fn one_sample(seq: &Seq, imu: &mut Output<Imu>) -> Result<(), SeqError> {
-    let _ = imu.write(&Imu {
-        timestamp: seq.now(),
-        sample: 1.0,
-    });
+    let _ = imu.write(&Imu::new(seq.now().0, 1.0));
     Ok(())
 }
 
@@ -92,7 +83,7 @@ fn aborter(#[state] cycles: &mut u64, abort: &mut Output<AbortRequest>) {
     }
 }
 
-fn ms(ms: i64) -> Timestamp {
+pub(super) fn ms(ms: i64) -> Timestamp {
     Timestamp(ms * 1_000)
 }
 
@@ -103,7 +94,7 @@ fn def_of<S: SequenceFn>(_sequence: S) -> crate::system::SystemDef {
 
 /// One step of `S` over fresh rings, with nothing feeding its inputs.
 fn step_of<S: SequenceFn>(sequence: S, state: S::State) -> (SequenceStep, Vec<RingBuffer>) {
-    let def = def::<S>(&crate::def::DefCx::empty()).expect("a static definition");
+    let def = def_of(sequence);
     let inputs = def
         .inputs
         .iter()
@@ -112,25 +103,19 @@ fn step_of<S: SequenceFn>(sequence: S, state: S::State) -> (SequenceStep, Vec<Ri
             views: Vec::new(),
         })
         .collect();
-    step_over(sequence, state, inputs)
+    step_over::<S>(&def, state, inputs)
 }
 
-/// One step of `S` reading `inputs`, writing to fresh rings.
+/// One step of `S`, defined by `def`, reading `inputs` and writing to fresh rings.
 fn step_over<S: SequenceFn>(
-    _sequence: S,
+    def: &crate::system::SystemDef,
     state: S::State,
     inputs: Vec<InputBinding>,
 ) -> (SequenceStep, Vec<RingBuffer>) {
-    let def = def::<S>(&crate::def::DefCx::empty()).expect("a static definition");
     let rings: Vec<RingBuffer> = def
         .outputs
         .iter()
-        .map(|port| {
-            RingBuffer::create_in_memory(Config {
-                capacity: ring_capacity(port.max_len, 8).expect("valid capacity"),
-                max_readers: 1,
-            })
-        })
+        .map(|port| utils::ring_of(port.max_len, 8, 1))
         .collect();
     let outputs = def
         .outputs
@@ -146,21 +131,15 @@ fn step_over<S: SequenceFn>(
 
 fn table(recorder: &Recorder) -> SystemTable {
     let mut table = utils::table(recorder);
-    table
-        .register_sequence("no_fix", no_fix(), Default::default)
-        .expect("valid records");
-    table
-        .register_sequence("patient", patient(), Default::default)
-        .expect("valid records");
-    table
-        .register_sequence("doomed", doomed(), Default::default)
-        .expect("valid records");
-    table
-        .register_sequence("phases", phases(), Phase::default)
-        .expect("valid records");
-    table
-        .register("aborter", aborter(), u64::default)
-        .expect("valid records");
+    let mut register = || -> Result<(), BuildError> {
+        table.register_sequence("no_fix", no_fix(), Default::default)?;
+        table.register_sequence("patient", patient(), Default::default)?;
+        table.register_sequence("doomed", doomed(), Default::default)?;
+        table.register_sequence("phases", phases(), Phase::default)?;
+        table.register("aborter", aborter(), u64::default)?;
+        Ok(())
+    };
+    register().expect("valid records");
     table
 }
 
@@ -170,10 +149,7 @@ fn logged(id: &str, ty: &str) -> CoordinatorConfig {
         systems: vec![
             SystemConfig::new(id, ty),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "lines".into(),
-                    from: vec![PortRef::new(id, "log")],
-                }],
+                inputs: vec![InputConfig::new("lines", id, "log")],
                 ..SystemConfig::new("logs", "log_sink")
             },
         ],
@@ -196,12 +172,12 @@ fn test_sequence_completes() {
     let phase = Phase::default();
     let (mut step, _rings) = step_of(phases(), phase.clone());
     step.execute(ms(0));
-    assert_eq!((phase.get(), step.ended()), (1, None));
+    assert_eq!((phase.0.get(), step.ended()), (1, None));
     step.execute(ms(1));
-    assert_eq!((phase.get(), step.ended()), (2, None));
+    assert_eq!((phase.0.get(), step.ended()), (2, None));
     step.execute(ms(2));
     assert_eq!(
-        (phase.get(), step.ended()),
+        (phase.0.get(), step.ended()),
         (3, Some(&EndReason::Completed))
     );
 }
@@ -215,7 +191,7 @@ fn test_paused_step_resumes_at_its_await() {
     // Cycles 2 to 9 pass with the step not executed, as a stopped channel's.
     step.execute(ms(10));
     assert_eq!(
-        (phase.get(), step.ended()),
+        (phase.0.get(), step.ended()),
         (3, Some(&EndReason::Completed))
     );
 }
@@ -226,10 +202,10 @@ fn test_sleep_counts_paused_time() {
     let (mut step, _rings) = step_of(napper(), phase.clone());
     step.execute(ms(0));
     step.execute(ms(5));
-    assert_eq!(phase.get(), 0);
+    assert_eq!(phase.0.get(), 0);
     step.execute(ms(40));
     assert_eq!(
-        (phase.get(), step.ended()),
+        (phase.0.get(), step.ended()),
         (1, Some(&EndReason::Completed))
     );
 }
@@ -243,7 +219,7 @@ fn test_ended_step_polls_nothing() {
     phase.0.set(7);
     step.execute(ms(20));
     assert_eq!(
-        (phase.get(), step.ended()),
+        (phase.0.get(), step.ended()),
         (7, Some(&EndReason::Completed))
     );
 }
@@ -279,10 +255,7 @@ fn test_abort_ends_the_sequence() {
         systems: vec![
             SystemConfig::new("aborter", "aborter"),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "abort".into(),
-                    from: vec![PortRef::new("aborter", "abort")],
-                }],
+                inputs: vec![InputConfig::new("abort", "aborter", "abort")],
                 ..SystemConfig::new("wait", "patient")
             },
         ],
@@ -321,7 +294,10 @@ fn test_sequence_refuses_a_thread() {
     };
     assert!(matches!(
         config.build(&table(&Recorder::default())),
-        Err(BuildError::ThreadOnCyclic { .. })
+        Err(BuildError::Params {
+            source: crate::ParamError::Thread { .. },
+            ..
+        })
     ));
 }
 
@@ -339,23 +315,20 @@ async fn watcher(#[state] seen: &mut Seen, seq: &Seq, imu: &Sample<Imu>) -> Resu
     Ok(())
 }
 
-#[test]
-fn test_sample_held_across_cycles() {
+/// What `sequence` saw over three cycles, its `imu` fed by the test imu.
+fn imu_into<S: SequenceFn<State = Seen>>(sequence: S) -> Vec<Option<f64>> {
     let seen = Seen::default();
     let mut table = table(&Recorder::default());
     let state = seen.clone();
     table
-        .register_sequence("watcher", watcher(), move || state.clone())
+        .register_sequence("s", sequence, move || state.clone())
         .expect("valid records");
     let config = CoordinatorConfig {
         systems: vec![
             SystemConfig::new("imu", "imu"),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "imu".into(),
-                    from: vec![PortRef::new("imu", "imu")],
-                }],
-                ..SystemConfig::new("watch", "watcher")
+                inputs: vec![InputConfig::new("imu", "imu", "imu")],
+                ..SystemConfig::new("s", "s")
             },
         ],
         ..Default::default()
@@ -364,7 +337,12 @@ fn test_sample_held_across_cycles() {
     for at in 1..=3 {
         coordinator.step(ms(at));
     }
-    assert_eq!(*seen.0.borrow(), [Some(1.0), Some(2.0), Some(3.0)]);
+    seen.0.take()
+}
+
+#[test]
+fn test_sample_held_across_cycles() {
+    assert_eq!(imu_into(watcher()), [Some(1.0), Some(2.0), Some(3.0)]);
 }
 
 #[test]
@@ -377,14 +355,14 @@ fn test_sequence_registers_its_doc() {
 
 /// The handlers that ran, in order, shared with the test.
 #[derive(Clone, Default)]
-struct Trace(Rc<RefCell<Vec<&'static str>>>);
+pub(super) struct Trace(Rc<RefCell<Vec<&'static str>>>);
 
 impl Trace {
-    fn push(&self, name: &'static str) {
+    pub(super) fn push(&self, name: &'static str) {
         self.0.borrow_mut().push(name);
     }
 
-    fn take(&self) -> Vec<&'static str> {
+    pub(super) fn take(&self) -> Vec<&'static str> {
         self.0.take()
     }
 }
@@ -474,24 +452,23 @@ fn traced<S: SequenceFn<State = Trace>>(
     commands: &Commands,
 ) -> SystemTable {
     let mut table = table(recorder);
-    let state = trace.clone();
-    table
-        .register_sequence("traced", sequence, move || state.clone())
-        .expect("valid records");
-    let queue = commands.clone();
-    table
-        .register("commander", commander(), move || queue.clone())
-        .expect("valid records");
+    let register = || -> Result<(), BuildError> {
+        let state = trace.clone();
+        table.register_sequence("traced", sequence, move || state.clone())?;
+        let queue = commands.clone();
+        table.register("commander", commander(), move || queue.clone())?;
+        Ok(())
+    };
+    register().expect("valid records");
     table
 }
 
 /// `traced` as `t`, its log drained, aborted by `aborter` from the second cycle.
 fn aborted() -> CoordinatorConfig {
     let mut config = logged("t", "traced");
-    config.systems[0].inputs.push(InputConfig {
-        port: "abort".into(),
-        from: vec![PortRef::new("aborter", "abort")],
-    });
+    config.systems[0]
+        .inputs
+        .push(InputConfig::new("abort", "aborter", "abort"));
     config
         .systems
         .insert(0, SystemConfig::new("aborter", "aborter"));
@@ -504,10 +481,7 @@ fn channeled(start: RunState) -> CoordinatorConfig {
         systems: vec![
             SystemConfig::new("cmds", "commander"),
             SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "commands".into(),
-                    from: vec![PortRef::new("cmds", "commands")],
-                }],
+                inputs: vec![InputConfig::new("commands", "cmds", "commands")],
                 adapter: Some(Adapter::Channel(ChannelConfig {
                     name: "seq".into(),
                     start,
@@ -610,14 +584,6 @@ fn test_reset_of_stopped_sequence_runs_no_handlers() {
     assert!(trace.take().is_empty());
 }
 
-/// A valve position, written as an [`Imu`] sample.
-fn valve(seq: &Seq, open: f64) -> Imu {
-    Imu {
-        timestamp: seq.now(),
-        sample: open,
-    }
-}
-
 /// Opens its valve until the imu reads 2 or more, closing it on abort.
 #[crate::sequence]
 async fn guarded(
@@ -628,12 +594,12 @@ async fn guarded(
 ) -> Result<(), SeqError> {
     let _closed = seq.on_abort(|seq| {
         trace.push("closed");
-        let _ = valve_cmd.write(&valve(seq, 0.0));
+        let _ = valve_cmd.write(&Imu::new(seq.now().0, 0.0));
     });
     crate::redline!(seq, "imu high", || imu
         .get()
         .is_some_and(|i| i.sample >= 2.0));
-    let _ = valve_cmd.write(&valve(seq, 1.0));
+    let _ = valve_cmd.write(&Imu::new(seq.now().0, 1.0));
     loop {
         seq.next_cycle().await;
     }
@@ -694,15 +660,11 @@ async fn twin_reads(
 fn sampled() -> CoordinatorConfig {
     let mut config = channeled(RunState::Running);
     config.systems.insert(0, SystemConfig::new("imu", "imu"));
-    config.systems[2].inputs.push(InputConfig {
-        port: "imu".into(),
-        from: vec![PortRef::new("imu", "imu")],
-    });
+    config.systems[2]
+        .inputs
+        .push(InputConfig::new("imu", "imu", "imu"));
     config.systems.push(SystemConfig {
-        inputs: vec![InputConfig {
-            port: "lines".into(),
-            from: vec![PortRef::new("t", "log")],
-        }],
+        inputs: vec![InputConfig::new("lines", "t", "log")],
         ..SystemConfig::new("logs", "log_sink")
     });
     config
@@ -712,10 +674,7 @@ fn sampled() -> CoordinatorConfig {
 fn tapped() -> CoordinatorConfig {
     let mut config = sampled();
     config.systems.push(SystemConfig {
-        inputs: vec![InputConfig {
-            port: "valve".into(),
-            from: vec![PortRef::new("t", "valve_cmd")],
-        }],
+        inputs: vec![InputConfig::new("valve", "t", "valve_cmd")],
         ..SystemConfig::new("taps", "tap")
     });
     config
@@ -815,36 +774,13 @@ fn test_panicking_condition_runs_handlers() {
 
 #[test]
 fn test_redline_and_body_read_one_sample() {
-    let seen = Seen::default();
-    let mut table = table(&Recorder::default());
-    let state = seen.clone();
-    table
-        .register_sequence("twin", twin_reads(), move || state.clone())
-        .expect("valid records");
-    let config = CoordinatorConfig {
-        systems: vec![
-            SystemConfig::new("imu", "imu"),
-            SystemConfig {
-                inputs: vec![InputConfig {
-                    port: "imu".into(),
-                    from: vec![PortRef::new("imu", "imu")],
-                }],
-                ..SystemConfig::new("t", "twin")
-            },
-        ],
-        ..Default::default()
-    };
-    let mut coordinator = config.build(&table).expect("valid");
-    for at in 1..=3 {
-        coordinator.step(ms(at));
-    }
     let twice = |v| [Some(v), Some(v)];
     let expected: Vec<_> = [Some(1.0)]
         .into_iter()
         .chain(twice(2.0))
         .chain(twice(3.0))
         .collect();
-    assert_eq!(*seen.0.borrow(), expected);
+    assert_eq!(imu_into(twin_reads()), expected);
 }
 
 /// Glances at its sample once, then ends.
@@ -856,13 +792,10 @@ async fn glance(imu: &Sample<Imu>) -> Result<(), SeqError> {
 
 /// One step of `S`, whose one port `imu` reads the returned output.
 fn step_on_imu<S: SequenceFn<State = ()>>(
-    sequence: fn() -> S,
+    sequence: S,
 ) -> (SequenceStep, Output<Imu>, Vec<RingBuffer>) {
-    let def = def_of(sequence());
-    let ring = RingBuffer::create_in_memory(Config {
-        capacity: ring_capacity(def.inputs[1].max_len, 2).expect("valid capacity"),
-        max_readers: 1,
-    });
+    let def = def_of(sequence);
+    let ring = utils::ring_of(def.inputs[1].max_len, 2, 1);
     let inputs = vec![
         InputBinding {
             def: def.inputs[0].clone(),
@@ -873,26 +806,22 @@ fn step_on_imu<S: SequenceFn<State = ()>>(
             views: vec![ring.view(NoWake).expect("a free slot")],
         },
     ];
-    let (step, mut rings) = step_over(sequence(), (), inputs);
-    let imu = Output::try_new(ring.writer(NoWake).expect("a free writer")).expect("aligned");
+    let (step, mut rings) = step_over::<S>(&def, (), inputs);
+    let imu = utils::output(&ring);
     rings.push(ring);
     (step, imu, rings)
 }
 
-fn imu_at(at: i64, sample: f64) -> Imu {
-    Imu {
-        timestamp: ms(at),
-        sample,
-    }
-}
-
 #[test]
 fn test_ended_sequence_releases_its_samples() {
-    let (mut step, imu, _rings) = step_on_imu(glance);
+    let (mut step, imu, _rings) = step_on_imu(glance());
     step.execute(ms(0));
     assert_eq!(step.ended(), Some(&EndReason::Completed));
     for at in 0..16 {
-        assert!(imu.write(&imu_at(at, 1.0)).is_ok(), "write {at} blocked");
+        assert!(
+            imu.write(&Imu::new(ms(at).0, 1.0)).is_ok(),
+            "write {at} blocked"
+        );
     }
 }
 
@@ -953,9 +882,9 @@ async fn leaks_a_redline(seq: &Seq<'_>, imu: &Sample<Imu>) -> Result<(), SeqErro
 
 /// Runs `S` reading `sample` each cycle, past its end, then drops it.
 fn run_past_its_end<S: SequenceFn<State = ()>>(sequence: fn() -> S, sample: f64) -> EndReason {
-    let (mut step, imu, _rings) = step_on_imu(sequence);
+    let (mut step, imu, _rings) = step_on_imu(sequence());
     for at in 0..6 {
-        let _ = imu.write(&imu_at(at, sample));
+        let _ = imu.write(&Imu::new(ms(at).0, sample));
         step.execute(ms(at));
     }
     step.ended().cloned().expect("an ended sequence")

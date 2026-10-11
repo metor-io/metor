@@ -10,28 +10,34 @@ use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Context;
 
 use crate::port::Output;
-use crate::record::{DecodeError, EncodeError, Record};
 
-impl Record for LogEvent {
+/// A line from no module or source file, stamped `now`.
+pub(crate) fn line(
+    now: Timestamp,
+    level: LogLevel,
+    message: impl Into<Cow<'static, str>>,
+    fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+) -> LogEvent {
+    LogEvent {
+        timestamp: now,
+        level,
+        source: Cow::Borrowed(""),
+        target: Cow::Borrowed(""),
+        message: message.into(),
+        span: None,
+        fields,
+        file: None,
+        line: None,
+    }
+}
+
+impl crate::record::PostcardRecord for LogEvent {
     const NAME: &'static str = "log";
     const MAX_LEN: usize = 4096;
     const DEPTH: usize = 8;
-    type Read<'a> = LogEvent;
-
-    fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
-        crate::record::postcard::encode(self, buf)
-    }
-
-    fn decode(bytes: &[u8]) -> Result<LogEvent, DecodeError> {
-        crate::record::postcard::decode(bytes)
-    }
 
     fn timestamp(&self) -> Option<Timestamp> {
         Some(self.timestamp)
-    }
-
-    fn schema() -> crate::record::RecordSchema {
-        crate::record::RecordSchema::postcard::<LogEvent>(Self::NAME)
     }
 }
 
@@ -51,26 +57,6 @@ impl LogPort {
         }
     }
 
-    /// Writes one line with the given level and fields, stamped with the cycle time.
-    fn write(
-        &mut self,
-        level: LogLevel,
-        message: Cow<'static, str>,
-        fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
-    ) {
-        self.emit(LogEvent {
-            timestamp: self.now,
-            level,
-            source: Cow::Borrowed(""),
-            target: Cow::Borrowed(""),
-            message,
-            span: None,
-            fields,
-            file: None,
-            line: None,
-        });
-    }
-
     /// Writes an error line whose first field is `kind`, the fault's identity for the ground.
     pub(crate) fn fault(
         &mut self,
@@ -78,14 +64,11 @@ impl LogPort {
         kind: impl Into<Cow<'static, str>>,
         message: impl Into<Cow<'static, str>>,
     ) {
-        self.now = now;
-        let fields = vec![(Cow::Borrowed("kind"), kind.into())];
-        self.write(LogLevel::Error, message.into(), fields);
+        with_log_port(self, now, || Log.fault(kind, message));
     }
 
-    /// Stamps and publishes one event; a ring with no room counts as a drop.
-    fn emit(&mut self, mut event: LogEvent) {
-        event.timestamp = self.now;
+    /// Publishes one event; a ring with no room counts as a drop.
+    fn emit(&mut self, event: LogEvent) {
         if self.output.write(&event).is_err() {
             self.dropped = self.dropped.saturating_add(1);
         }
@@ -96,17 +79,12 @@ impl LogPort {
         if self.dropped == 0 {
             return;
         }
-        let event = LogEvent {
-            timestamp: self.now,
-            level: LogLevel::Warn,
-            source: Cow::Borrowed(""),
-            target: Cow::Borrowed(""),
-            message: Cow::Borrowed("log lines dropped"),
-            span: None,
-            fields: vec![(Cow::Borrowed("dropped"), self.dropped.to_string().into())],
-            file: None,
-            line: None,
-        };
+        let event = line(
+            self.now,
+            LogLevel::Warn,
+            "log lines dropped",
+            vec![(Cow::Borrowed("dropped"), self.dropped.to_string().into())],
+        );
         if self.output.write(&event).is_ok() {
             self.dropped = 0;
         }
@@ -145,7 +123,7 @@ impl Log {
         fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     ) {
         let message = message.into();
-        with_port(|port| port.write(level, message, fields));
+        with_port(|port| port.emit(line(port.now, level, message, fields)));
     }
 }
 
@@ -191,11 +169,9 @@ impl<F: core::future::Future + Unpin> core::future::Future for LogScope<'_, F> {
         cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<F::Output> {
         let this = self.get_mut();
-        this.port.now = Timestamp::now();
-        let _restore = RestoreSlot(SLOT.replace(Some(NonNull::from(&mut *this.port))));
-        let polled = core::pin::Pin::new(&mut this.inner).poll(cx);
-        with_port(LogPort::report_dropped);
-        polled
+        with_log_port(this.port, Timestamp::now(), || {
+            core::pin::Pin::new(&mut this.inner).poll(cx)
+        })
     }
 }
 
@@ -218,11 +194,6 @@ fn with_port(f: impl FnOnce(&mut LogPort)) {
     f(unsafe { port.as_mut() });
 }
 
-/// Returns the layer that writes `tracing` events to the entered [`LogPort`].
-pub fn layer() -> LogLayer {
-    LogLayer
-}
-
 /// A `LogLayer` writes each `tracing` event as a [`LogEvent`] on this thread's port.
 pub struct LogLayer;
 
@@ -233,7 +204,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogLayer {
             let mut visitor = Fields::default();
             event.record(&mut visitor);
             port.emit(LogEvent {
-                timestamp: Timestamp(0),
+                timestamp: port.now,
                 level: level_of(meta.level()),
                 source: Cow::Borrowed(meta.target()),
                 target: Cow::Borrowed(meta.target()),
@@ -286,22 +257,18 @@ impl Visit for Fields {
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, NoWake, RingBuffer, frame_len};
+    use metor_fsw_3_ring::{RingBuffer, frame_len};
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
     use crate::port::{Input, ring_capacity};
+    use crate::record::Record;
+    use crate::tests::utils::pair;
 
     /// A port whose ring holds `records` lines of `MAX_LEN`.
     fn log_pair(records: usize) -> (RingBuffer, LogPort, Input<LogEvent>) {
-        let ring = RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(LogEvent::MAX_LEN, records).expect("valid"),
-            max_readers: 1,
-        });
-        let port =
-            LogPort::new(Output::try_new(ring.writer(NoWake).expect("writer")).expect("aligned"));
-        let input = Input::try_new(vec![ring.view(NoWake).expect("slot")]).expect("aligned");
-        (ring, port, input)
+        let (ring, output, input) = pair(records);
+        (ring, LogPort::new(output), input)
     }
 
     fn lines(input: &mut Input<LogEvent>) -> Vec<LogEvent> {
@@ -332,7 +299,7 @@ mod tests {
     #[test]
     fn test_trace_fields_and_location() {
         let (_ring, mut port, mut input) = log_pair(8);
-        let subscriber = tracing_subscriber::registry().with(layer());
+        let subscriber = tracing_subscriber::registry().with(LogLayer);
         with_log_port(&mut port, Timestamp(9), || {
             tracing::subscriber::with_default(subscriber, || {
                 tracing::warn!(slot = "nav", attempts = 3, "occupant failed");
@@ -354,7 +321,7 @@ mod tests {
     #[test]
     fn test_log_without_port() {
         let (_ring, mut port, mut input) = log_pair(8);
-        let subscriber = tracing_subscriber::registry().with(layer());
+        let subscriber = tracing_subscriber::registry().with(LogLayer);
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("between systems");
         });
@@ -447,7 +414,7 @@ mod tests {
         }
 
         let (_ring, mut port, mut input) = log_pair(8);
-        let subscriber = tracing_subscriber::registry().with(layer());
+        let subscriber = tracing_subscriber::registry().with(LogLayer);
         with_log_port(&mut port, Timestamp(3), || {
             tracing::subscriber::with_default(subscriber, || {
                 tracing::info!(value = ?Recursive, "outer");
@@ -475,7 +442,7 @@ mod tests {
         }
 
         let (_ring, mut port, mut input) = log_pair(8);
-        let subscriber = tracing_subscriber::registry().with(layer());
+        let subscriber = tracing_subscriber::registry().with(LogLayer);
         with_log_port(&mut port, Timestamp(4), || {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 tracing::subscriber::with_default(subscriber, || {
@@ -523,17 +490,7 @@ mod tests {
 
     /// The encoded length of the line `Log::info(message)` writes.
     fn encoded_len(message: &str, now: Timestamp) -> usize {
-        let event = LogEvent {
-            timestamp: now,
-            level: LogLevel::Info,
-            source: Cow::Borrowed(""),
-            target: Cow::Borrowed(""),
-            message: message.to_string().into(),
-            span: None,
-            fields: Vec::new(),
-            file: None,
-            line: None,
-        };
+        let event = line(now, LogLevel::Info, message.to_string(), Vec::new());
         let mut buf = vec![0u8; LogEvent::MAX_LEN];
         event.encode(&mut buf).expect("encodes").len()
     }

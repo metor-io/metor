@@ -20,22 +20,14 @@ pub enum CargoError {
 /// Builds `package` from `manifest_dir` and returns the cdylib cargo wrote.
 ///
 /// Cargo's stderr is inherited, so its progress is the caller's progress.
-pub fn cargo_build(
-    package: &str,
-    manifest_dir: &Path,
-    release: bool,
-) -> Result<PathBuf, CargoError> {
+pub fn cargo_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoError> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut command = Command::new(cargo);
-    command
+    let output = Command::new(cargo)
         .current_dir(manifest_dir)
         .args(["build", "-p", package, "--message-format=json"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    if release {
-        command.arg("--release");
-    }
-    let output = command.output()?;
+        .stderr(Stdio::inherit())
+        .output()?;
     if !output.status.success() {
         return Err(CargoError::Cargo(output.status));
     }
@@ -85,13 +77,9 @@ impl PackConfig {
             .ok_or(PackDevError::MissingField("[project] name"))?;
         let field = |key| string(&pyproject, &["tool", "metor", "pack", key]);
         let module = field("module").unwrap_or_else(|| identifier(&dist));
-        let krate = match field("crate") {
-            Some(krate) => krate,
-            None => cargo_package(root)?,
-        };
-        let lib = match field("lib") {
-            Some(lib) => lib,
-            None => cargo_lib(root)?.unwrap_or_else(|| identifier(&krate)),
+        let (krate, lib) = match (field("crate"), field("lib")) {
+            (Some(krate), Some(lib)) => (krate, lib),
+            (krate, lib) => cargo_names(root, krate, lib)?,
         };
         Ok(PackConfig {
             id: field("id").unwrap_or_else(|| module.clone()),
@@ -103,18 +91,21 @@ impl PackConfig {
     }
 }
 
-/// The cargo package name, `[package] name` of `<root>/Cargo.toml`.
-fn cargo_package(root: &Path) -> Result<String, PackDevError> {
-    string(&read_toml(&root.join("Cargo.toml"))?, &["package", "name"])
-        .ok_or(PackDevError::MissingField("[package] name"))
-}
-
-/// The `[lib] name` of `<root>/Cargo.toml`, absent when cargo derives it.
-fn cargo_lib(root: &Path) -> Result<Option<String>, PackDevError> {
-    Ok(string(
-        &read_toml(&root.join("Cargo.toml"))?,
-        &["lib", "name"],
-    ))
+/// The cargo package and cdylib stem, each filled from `<root>/Cargo.toml`
+/// when not given: `[package] name`, then `[lib] name` or the package's.
+fn cargo_names(
+    root: &Path,
+    krate: Option<String>,
+    lib: Option<String>,
+) -> Result<(String, String), PackDevError> {
+    let cargo = read_toml(&root.join("Cargo.toml"))?;
+    let krate = krate
+        .or_else(|| string(&cargo, &["package", "name"]))
+        .ok_or(PackDevError::MissingField("[package] name"))?;
+    let lib = lib
+        .or_else(|| string(&cargo, &["lib", "name"]))
+        .unwrap_or_else(|| identifier(&krate));
+    Ok((krate, lib))
 }
 
 pub(super) fn read_toml(path: &Path) -> Result<toml::Value, PackDevError> {
@@ -128,12 +119,14 @@ pub(super) fn read_toml(path: &Path) -> Result<toml::Value, PackDevError> {
     })
 }
 
+/// The value at `path`, absent when any step of it is.
+pub(super) fn lookup<'a>(table: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
+    path.iter().try_fold(table, |value, key| value.get(key))
+}
+
 /// The string at `path`, absent when any step of it is.
 pub(super) fn string(table: &toml::Value, path: &[&str]) -> Option<String> {
-    path.iter()
-        .try_fold(table, |value, key| value.get(key))?
-        .as_str()
-        .map(str::to_string)
+    lookup(table, path)?.as_str().map(str::to_string)
 }
 
 /// A distribution or crate name as a Python or Rust identifier.
@@ -301,15 +294,5 @@ mod tests {
             .map(|entry| entry.expect("an entry").file_name())
             .collect();
         assert_eq!(names.len(), 2, "no temp file is left: {names:?}");
-    }
-
-    #[test]
-    fn test_host_artifact_names() {
-        let triple = triple();
-        assert!(triple.starts_with(std::env::consts::ARCH), "{triple}");
-        assert_eq!(triple.split('-').count(), 3, "{triple}");
-        let name = cdylib_name("echo_pack");
-        assert!(name.contains("echo_pack"));
-        assert!(name.ends_with(std::env::consts::DLL_SUFFIX));
     }
 }

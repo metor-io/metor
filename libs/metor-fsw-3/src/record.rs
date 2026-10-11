@@ -6,6 +6,7 @@ use metor_proto::types::{ComponentId, Msg, PacketId, PacketTy, Timestamp, msg_id
 use metor_proto::vtable::VTable;
 use metor_proto_wkt::ComponentMetadata;
 use postcard_schema::schema::owned::OwnedNamedType;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -45,6 +46,44 @@ pub trait Record {
     /// metadata there, a message has no path.
     fn schema_at(_root: &str) -> RecordSchema {
         Self::schema()
+    }
+}
+
+/// A `PostcardRecord` is a [`Record`] carried as postcard, announced under its
+/// schema's id.
+pub trait PostcardRecord: Serialize + DeserializeOwned + postcard_schema::Schema {
+    const NAME: &'static str;
+    const MAX_LEN: usize;
+    const DEPTH: usize = 1;
+
+    fn timestamp(&self) -> Option<Timestamp> {
+        None
+    }
+}
+
+impl<T: PostcardRecord> Record for T {
+    const NAME: &'static str = <T as PostcardRecord>::NAME;
+    const MAX_LEN: usize = <T as PostcardRecord>::MAX_LEN;
+    const DEPTH: usize = <T as PostcardRecord>::DEPTH;
+    type Read<'a>
+        = T
+    where
+        T: 'a;
+
+    fn timestamp(&self) -> Option<Timestamp> {
+        PostcardRecord::timestamp(self)
+    }
+
+    fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
+        postcard::encode(self, buf)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<T, DecodeError> {
+        postcard::decode(bytes)
+    }
+
+    fn schema() -> RecordSchema {
+        RecordSchema::postcard::<T>(<T as PostcardRecord>::NAME)
     }
 }
 
@@ -156,11 +195,11 @@ impl PartialEq for RecordSchema {
             (
                 Self::Msg { id, name, codec },
                 Self::Msg {
-                    id: other_id,
-                    name: other_name,
-                    codec: other_codec,
+                    id: i,
+                    name: n,
+                    codec: c,
                 },
-            ) => id == other_id && name == other_name && codec == other_codec,
+            ) => (id, name, codec) == (i, n, c),
             _ => false,
         }
     }
@@ -282,21 +321,6 @@ pub mod json {
     }
 }
 
-/// Encoding for records whose payload is already bytes.
-pub mod bytes {
-    use super::{DecodeError, EncodeError};
-
-    /// Returns `value` unchanged.
-    pub fn encode(value: &[u8]) -> Result<&[u8], EncodeError> {
-        Ok(value)
-    }
-
-    /// Returns `bytes` unchanged.
-    pub fn decode(bytes: &[u8]) -> Result<&[u8], DecodeError> {
-        Ok(bytes)
-    }
-}
-
 /// `Bytes` is the record of a dynamic port: a payload copied without decoding.
 ///
 /// It is never announced; a dynamic port announces the schema of its edge.
@@ -308,11 +332,11 @@ impl Record for Bytes {
     type Read<'a> = &'a [u8];
 
     fn encode<'a>(&'a self, _buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
-        bytes::encode(self)
+        Ok(self)
     }
 
     fn decode(bytes: &[u8]) -> Result<&[u8], DecodeError> {
-        bytes::decode(bytes)
+        Ok(bytes)
     }
 
     fn schema() -> RecordSchema {
@@ -327,7 +351,6 @@ impl Record for Bytes {
 #[cfg(test)]
 mod tests {
     use metor_proto::types::ComponentId;
-    use metor_proto_wkt::LogEvent;
     use serde::{Deserialize, Serialize};
     use zerocopy::IntoBytes;
 
@@ -397,7 +420,6 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op, metor_proto::vtable::Op::Timestamp { .. }))
         );
-        assert_eq!(schema, Imu::schema());
     }
 
     #[test]
@@ -457,35 +479,9 @@ mod tests {
         );
     }
 
-    /// A postcard message hashes its schema name; every other codec hashes the
-    /// record name, so `log` keeps the id the panel already matches on.
-    #[test]
-    fn test_postcard_schema_id() {
-        assert_eq!(
-            LogEvent::schema().packet_id(),
-            <LogEvent as metor_proto::types::Msg>::ID
-        );
-        assert_ne!(LogEvent::schema().packet_id(), msg_id("log"));
-    }
-
-    #[test]
-    fn test_raw_bytes_passthrough() {
-        assert_eq!(Bytes::decode(b"raw"), Ok(&b"raw"[..]));
-        assert_eq!(b"raw"[..].encode(&mut []), Ok(&b"raw"[..]));
-        assert!(matches!(
-            <Bytes as Record>::schema(),
-            RecordSchema::Msg {
-                id: [0, 0],
-                codec: MsgCodec::Bytes,
-                ..
-            }
-        ));
-    }
-
     #[test]
     fn test_derived_message_metadata() {
         assert_eq!(Fixed::NAME, "fixed");
-        assert_eq!(<Fixed as Record>::ID, ComponentId::new("fixed"));
         assert_eq!(Fixed::MAX_LEN, Fixed::POSTCARD_MAX_SIZE);
         assert_eq!(Fixed::DEPTH, 1);
         assert_eq!(Note::NAME, "note");

@@ -1,6 +1,5 @@
 //! The erased runner and the cycle loop.
 
-use core::any::Any;
 use core::future::Future;
 use core::pin::pin;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -63,22 +62,12 @@ pub(crate) fn catch_step(slot: &mut Option<Box<dyn Step>>, now: Timestamp) -> St
         Ok(false) => Stepped::Ran,
         Ok(true) => Stepped::Ended,
         Err(payload) => {
-            crate::panic::catch(|| step.fault(now, message_of(&*payload)));
+            crate::panic::catch(|| step.fault(now, crate::panic::message(&*payload)));
             crate::panic::discard(payload);
             crate::panic::catch(|| drop(slot.take()));
             Stepped::Unwound
         }
     }
-}
-
-pub(crate) fn message_of(payload: &(dyn Any + Send)) -> &str {
-    if let Some(text) = payload.downcast_ref::<&str>() {
-        return text;
-    }
-    if let Some(text) = payload.downcast_ref::<String>() {
-        return text;
-    }
-    "panic"
 }
 
 impl Coordinator {
@@ -173,6 +162,7 @@ mod tests {
     use super::*;
     use crate::coordinator::CoordinatorConfig;
     use crate::coordinator::config::{InputConfig, PortRef, SystemConfig};
+    use crate::coordinator::tests::Twice;
     use crate::tests::utils::{self, Recorder, pipeline_config, table};
 
     fn watched(config: &mut CoordinatorConfig, from: &[&str]) {
@@ -295,10 +285,7 @@ mod tests {
         config.systems[0] = SystemConfig::new("boom", "boom");
         config.systems[1].inputs[0].from = vec![PortRef::new("boom", "imu")];
         config.systems.push(SystemConfig {
-            inputs: vec![InputConfig {
-                port: "lines".into(),
-                from: vec![PortRef::new("boom", "log")],
-            }],
+            inputs: vec![InputConfig::new("lines", "boom", "log")],
             ..SystemConfig::new("logs", "log_sink")
         });
         watched(&mut config, &["boom"]);
@@ -375,7 +362,7 @@ mod tests {
                 std::panic::panic_any(7u8);
             }
         }
-        assert_eq!(message_of(&7u8), "panic");
+        assert_eq!(crate::panic::message(&7u8), "panic");
         let mut step: Option<Box<dyn Step>> = Some(Box::new(Odd));
         assert_eq!(catch_step(&mut step, Timestamp(0)), Stepped::Unwound);
         assert!(step.is_none());
@@ -393,22 +380,6 @@ mod tests {
         let mut step: Option<Box<dyn Step>> = Some(Box::new(Clean(0)));
         assert_eq!(catch_step(&mut step, Timestamp(0)), Stepped::Ran);
         assert!(step.is_some());
-    }
-
-    /// Counts its cycles and ends after the second.
-    struct Twice(std::rc::Rc<core::cell::Cell<u64>>, Option<EndReason>);
-
-    impl Step for Twice {
-        fn execute(&mut self, _now: Timestamp) {
-            self.0.set(self.0.get() + 1);
-            if self.0.get() == 2 {
-                self.1 = Some(EndReason::Completed);
-            }
-        }
-
-        fn ended(&self) -> Option<&EndReason> {
-            self.1.as_ref()
-        }
     }
 
     #[test]

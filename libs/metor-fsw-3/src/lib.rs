@@ -157,15 +157,14 @@ pub use coordinator::{
     PeerPort, PortRef, RunState, Step, SystemConfig, SystemStatus, SystemTable,
 };
 pub use def::{DefCx, DefError, Records};
-pub use dl::{DlStep, Pack, PackError, PackFns};
+pub use dl::{DlStep, Pack, PackError};
 pub use fn_system::{
-    AsyncSystemFn, Ctor, Cycle, FnAsyncSystem, FnSystem, InSet, OutSet, Param, ParamNames, Ports,
-    SystemFn,
+    AsyncSystemFn, Ctor, Cycle, FnSystem, InSet, OutSet, Param, ParamNames, Ports, SystemFn,
 };
 pub use frame::Frame;
 pub use link::{LinkStatus, Transport};
 pub use log::{Log, LogLayer};
-pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs, sequence, system};
+pub use metor_fsw_3_macros::{Frame, Record, sequence, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
 pub use pack::def::{PackDef, PackSystemDef};
 pub use pack::{ABI_VERSION, Status};

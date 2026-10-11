@@ -17,6 +17,7 @@ use metor_proto_wkt::{LogEvent, LogLevel};
 
 use crate::async_system::{AsyncSystem, Running, Stop};
 use crate::coordinator::{Adapter, EndReason, MakeCx, ParamError, Params, Step};
+use crate::fn_system::LOG_PORT;
 use crate::record::Record;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef, SystemInputs, SystemOutputs};
 
@@ -83,10 +84,7 @@ where
         }),
         panicked: thread.panicked.clone(),
     };
-    let group = cx
-        .threads
-        .get_or_spawn(&thread_name)
-        .map_err(|e| ParamError::Decode(e.to_string()))?;
+    let group = cx.threads.get_or_spawn(&thread_name)?;
     group.add(member)?;
     thread.group = Some(group);
     Ok(Box::new(thread))
@@ -97,9 +95,6 @@ pub(crate) const MIRROR_FACTOR: usize = 4;
 
 /// Cycles between two drop reports; the counts accumulate between them.
 const DROP_REPORT_CYCLES: u64 = 100;
-
-/// The port name the adapter writes its own lines on.
-const LOG_PORT: &str = "log";
 
 /// One ring copied into another, and the records the destination refused.
 struct Mirror<W: WakeSource> {
@@ -180,17 +175,12 @@ impl Thread {
             return;
         }
         let fields = core::mem::take(&mut self.fields);
-        let event = LogEvent {
-            timestamp: now,
-            level: LogLevel::Error,
-            source: Cow::Borrowed(""),
-            target: Cow::Borrowed(""),
-            message: Cow::Borrowed("records dropped into a full mirror"),
-            span: None,
+        let event = crate::log::line(
+            now,
+            LogLevel::Error,
+            "records dropped into a full mirror",
             fields,
-            file: None,
-            line: None,
-        };
+        );
         self.emit(&event);
         self.fields = event.fields;
     }
@@ -198,19 +188,18 @@ impl Thread {
     /// Writes each port's count into its own field, clearing the counts, and
     /// reports whether any port dropped a record.
     fn take_drops(&mut self) -> bool {
+        let inputs = self
+            .inputs
+            .iter_mut()
+            .map(|m| core::mem::take(&mut m.dropped));
+        let outputs = self
+            .outputs
+            .iter_mut()
+            .map(|m| core::mem::take(&mut m.dropped));
         let mut dropped = false;
-        let mut at = 1;
-        for mirror in self.inputs.iter_mut() {
-            dropped |= mirror.dropped > 0;
-            set_count(&mut self.fields[at].1, mirror.dropped);
-            mirror.dropped = 0;
-            at += 1;
-        }
-        for mirror in self.outputs.iter_mut() {
-            dropped |= mirror.dropped > 0;
-            set_count(&mut self.fields[at].1, mirror.dropped);
-            mirror.dropped = 0;
-            at += 1;
+        for ((_, field), count) in self.fields[1..].iter_mut().zip(inputs.chain(outputs)) {
+            dropped |= count > 0;
+            set_count(field, count);
         }
         dropped
     }
@@ -227,17 +216,8 @@ impl Thread {
     }
 
     fn write_line(&mut self, now: Timestamp, level: LogLevel, kind: &'static str, message: &str) {
-        self.emit(&LogEvent {
-            timestamp: now,
-            level,
-            source: Cow::Borrowed(""),
-            target: Cow::Borrowed(""),
-            message: message.to_string().into(),
-            span: None,
-            fields: vec![(Cow::Borrowed("kind"), Cow::Borrowed(kind))],
-            file: None,
-            line: None,
-        });
+        let fields = vec![(Cow::Borrowed("kind"), Cow::Borrowed(kind))];
+        self.emit(&crate::log::line(now, level, message.to_string(), fields));
     }
 
     /// Publishes one line on the system's own `log`, if it declares one.
@@ -358,14 +338,14 @@ fn mirror(real: &RingBuffer) -> Result<RingBuffer, ParamError> {
 
 /// The geometry of a mirror of a ring of `capacity` bytes.
 fn mirror_config(capacity: usize) -> Result<Config, ParamError> {
-    let too_large =
-        || ParamError::Decode(format!("a mirror of {capacity} bytes each is too large"));
-    let capacity = capacity.checked_mul(MIRROR_FACTOR).ok_or_else(too_large)?;
+    let too_large = ParamError::MirrorTooLarge { capacity };
     let config = Config {
-        capacity,
+        capacity: capacity
+            .checked_mul(MIRROR_FACTOR)
+            .ok_or(too_large.clone())?,
         max_readers: 1,
     };
-    metor_fsw_3_ring::checked_region_len(&config).ok_or_else(too_large)?;
+    metor_fsw_3_ring::checked_region_len(&config).ok_or(too_large)?;
     Ok(config)
 }
 

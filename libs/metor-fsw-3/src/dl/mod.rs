@@ -15,8 +15,8 @@ use crate::system::SystemDef;
 
 use crate::coordinator::{BuildError, EndReason, ParamError, Step, SystemTable, TableEntry};
 use crate::def::{DefCx, DefError};
-use crate::pack::def::{DefCxOwned, Instance, PackDef, PackSystemDef};
-use crate::pack::raw::{RawPort, RawRing, RawSlice};
+use crate::pack::def::{DefCxOwned, Instance, PackDef};
+use crate::pack::raw::{RawRing, RawSlice};
 use crate::pack::{ABI_VERSION, DefStatus, Status};
 
 type VersionFn = unsafe extern "C" fn() -> u32;
@@ -90,26 +90,35 @@ unsafe fn resident_library(path: &Path) -> Result<Arc<Library>, PackError> {
 }
 
 unsafe fn descriptor(def_fn: PackDefFn) -> Result<PackDef, PackError> {
-    let mut bytes = vec![0u8; DESCRIPTOR_CAPACITY];
-    let mut written = 0;
     // SAFETY: the matched ABI writes only inside this buffer and result slot.
-    let status = unsafe { def_fn(bytes.as_mut_ptr(), bytes.len(), &mut written) };
+    let (status, bytes) = call_export(|dst, cap, written| unsafe { def_fn(dst, cap, written) });
     if status == DefStatus::TooSmall as u32 {
         return Err(PackError::DescriptorTooLarge {
-            capacity: bytes.len(),
+            capacity: DESCRIPTOR_CAPACITY,
         });
     }
     if status != DefStatus::Ok as u32 {
         return Err(PackError::DescriptorStatus(status));
     }
-    let bytes = bytes.get(..written).ok_or(PackError::Decode)?;
-    serde_json::from_slice(bytes).map_err(|_| PackError::Decode)
+    serde_json::from_slice(bytes.as_deref().ok_or(PackError::Decode)?)
+        .map_err(|_| PackError::Decode)
+}
+
+/// Calls an export that writes into a host buffer, returning its status and
+/// the bytes it reports writing, or `None` when that is past the buffer.
+fn call_export(export: impl FnOnce(*mut u8, usize, *mut usize) -> u32) -> (u32, Option<Vec<u8>>) {
+    let mut bytes = vec![0u8; DESCRIPTOR_CAPACITY];
+    let mut written = 0;
+    let status = export(bytes.as_mut_ptr(), bytes.len(), &mut written);
+    let fits = written <= bytes.len();
+    bytes.truncate(written);
+    (status, fits.then_some(bytes))
 }
 
 /// The exports after the version check, as bare pointers valid while the
 /// library is loaded.
 #[derive(Clone, Copy)]
-pub struct PackFns {
+pub(crate) struct PackFns {
     def: DefFn,
     create: CreateFn,
     execute: ExecuteFn,
@@ -167,11 +176,6 @@ impl Pack {
         instance_def(self.fns.def, ty, cx)
     }
 
-    /// The systems this pack exports, in the order it registered them.
-    pub fn systems(&self) -> impl Iterator<Item = &PackSystemDef> {
-        self.def.systems.iter()
-    }
-
     /// The descriptor this pack exported.
     pub fn descriptor(&self) -> &PackDef {
         &self.def
@@ -187,31 +191,27 @@ impl Pack {
 fn instance_def(def_fn: DefFn, ty: &str, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
     let refused = |message: String| DefError::Pack { message };
     let owned = serde_json::to_vec(&DefCxOwned::of(cx)).map_err(|e| refused(e.to_string()))?;
-    let mut bytes = vec![0u8; DESCRIPTOR_CAPACITY];
-    let mut written = 0;
     // SAFETY: the matched ABI writes only inside this buffer and result slot,
     // and reads the two arrays for the length of the call.
-    let status = unsafe {
+    let (status, bytes) = call_export(|dst, cap, written| unsafe {
         def_fn(
             RawSlice::of(ty.as_bytes()),
             RawSlice::of(&owned),
-            bytes.as_mut_ptr(),
-            bytes.len(),
-            &mut written,
+            dst,
+            cap,
+            written,
         )
-    };
-    let bytes = bytes
-        .get(..written)
-        .ok_or_else(|| refused("the pack reported more than it wrote".to_string()))?;
+    });
+    let bytes = bytes.ok_or_else(|| refused("the pack reported more than it wrote".to_string()))?;
     if status == DefStatus::Refused as u32 {
-        return Err(serde_json::from_slice(bytes).unwrap_or_else(|e| refused(e.to_string())));
+        return Err(serde_json::from_slice(&bytes).unwrap_or_else(|e| refused(e.to_string())));
     }
     if status != DefStatus::Ok as u32 {
         return Err(refused(format!(
             "definition export failed with status {status}"
         )));
     }
-    serde_json::from_slice(bytes).map_err(|e| refused(e.to_string()))
+    serde_json::from_slice(&bytes).map_err(|e| refused(e.to_string()))
 }
 
 /// Resolves one export, naming it when it is missing.
@@ -227,7 +227,7 @@ impl SystemTable {
     /// Stops at the first conflict, leaving earlier registrations in the table.
     pub fn register_pack(&mut self, id: &str, pack: &Pack) -> Result<(), BuildError> {
         let mut entries = Vec::new();
-        for system in pack.systems() {
+        for system in &pack.def.systems {
             let (lib, fns) = (pack.lib.clone(), pack.fns);
             let ty = system.ty.to_string();
             let (def_lib, def_ty) = (pack.lib.clone(), system.ty.to_string());
@@ -287,7 +287,7 @@ pub(crate) fn create(
         .iter()
         .map(|rings| rings.iter().map(RawRing::of).collect())
         .collect();
-    let ports: Vec<RawPort> = edges.iter().map(|rings| port(rings)).collect();
+    let ports: Vec<RawSlice> = edges.iter().map(|rings| RawSlice::of(rings)).collect();
     let outs: Vec<RawRing> = output_owners.iter().map(RawRing::of).collect();
     let mut error = RawSlice::EMPTY;
     // SAFETY: arrays and export owners outlive the call. Guest attachments
@@ -311,14 +311,6 @@ pub(crate) fn create(
         lib: lib.clone(),
         end: None,
     })
-}
-
-/// One input port over the rings of its producers.
-fn port(rings: &[RawRing]) -> RawPort {
-    RawPort {
-        rings: rings.as_ptr(),
-        len: rings.len(),
-    }
 }
 
 /// Decodes the error a failed `create` wrote, or names the failure it could not.

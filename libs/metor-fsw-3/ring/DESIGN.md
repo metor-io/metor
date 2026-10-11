@@ -83,8 +83,7 @@ reader claims. Exporting caller-owned raw storage does not extend its lifetime.
 
 ## Verification limits
 
-[Miri](MIRI.md) checks executed memory accesses, [Kani](KANI.md) checks bounded
-sequential properties, and [Loom](LOOM.md) explores modeled atomic schedules.
+[VERIFY.md](VERIFY.md) describes the Miri, Kani, and Loom checks and their bounds.
 None establishes every possible execution. In particular, `fits` requires an
 ordered cursor snapshot; arithmetic outside its preconditions can wrap in a
 release build. Payload lengths occupy the low 32 bits of the header word; the
