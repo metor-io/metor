@@ -153,13 +153,15 @@ class Pack:
 
     ``id`` is the prefix of every system type in the pack. ``lib`` is the
     cdylib's file stem, and ``libs`` is the directory holding one library per
-    platform triple.
+    platform triple. ``wasm`` says whether `metor pack dev` also built the
+    pack as a WebAssembly module.
     """
 
     id: str
     lib: str
     libs: str
     abi_version: int
+    wasm: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {"id": self.id, "lib": self.lib, "libs": str(self.libs)}

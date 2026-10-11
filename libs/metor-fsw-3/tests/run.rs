@@ -4,7 +4,12 @@ mod common;
 
 use std::path::Path;
 
-use common::{fixture_dir, metor};
+use common::{fixture_dir, fixture_wasm, metor};
+use metor_fsw_3::cli::run::{Run, load};
+use metor_fsw_3::coordinator::CoordinatorConfig;
+use metor_fsw_3::deploy::TargetConfig;
+use metor_fsw_3::dl::{PackKind, PackRef, WASM_TRIPLE, wasm_name};
+use metor_fsw_3::{InputConfig, SystemConfig, Timestamp};
 
 #[test]
 fn test_target_exits_after_fixed_cycles() {
@@ -195,4 +200,43 @@ fn test_sigint_ends_every_child() {
         !stderr.contains("did not exit cleanly"),
         "an interrupted child is not a failed one: {stderr}"
     );
+}
+
+/// Builds the chain `sampler -> meter -> echo`, all from the fixture pack.
+fn chain() -> CoordinatorConfig {
+    CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("sampler", "echo.sampler"),
+            SystemConfig {
+                inputs: vec![InputConfig::new("sample", "sampler", "sample")],
+                ..SystemConfig::new("meter", "echo.meter")
+            },
+            SystemConfig {
+                inputs: vec![InputConfig::new("input", "meter", "output")],
+                ..SystemConfig::new("echo", "echo.echo")
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_wasm_pack_loads_and_runs() {
+    let libs = tempfile::tempdir().expect("a temp dir");
+    let dir = libs.path().join(WASM_TRIPLE);
+    std::fs::create_dir_all(&dir).expect("creates");
+    std::fs::write(dir.join(wasm_name("echo_pack")), fixture_wasm()).expect("writes");
+    let config = TargetConfig {
+        packs: vec![PackRef {
+            kind: PackKind::Wasm,
+            ..PackRef::dylib("echo".into(), "echo_pack".into(), libs.path().into())
+        }],
+        coordinator: chain(),
+    };
+    let mut coordinator = load(&config, &Run::default()).expect("loads");
+    for cycle in 1..=3 {
+        coordinator.step(Timestamp(cycle));
+    }
+    assert_eq!(coordinator.cycle(), 3);
+    assert_eq!(coordinator.latched().count(), 0);
 }

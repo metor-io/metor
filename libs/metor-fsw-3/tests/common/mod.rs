@@ -14,8 +14,9 @@ use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use metor_fsw_3::cli::cargo::cargo_build;
+use metor_fsw_3::cli::cargo::{cargo_build, wasm_build};
 use metor_fsw_3::coordinator::{CoordinatorConfig, SystemTable};
+use metor_fsw_3::wasm::{Limits, WasmPack};
 use metor_fsw_3::{Frame, Output, Record, Timestamp, system};
 use metor_proto_stellar::{PacketSink, PacketStream, Peer, identify};
 use metor_proto_wkt::LinkInfo;
@@ -80,6 +81,22 @@ pub fn fixture_lib() -> &'static Path {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         cargo_build("echo-pack", root).expect("the fixture builds")
     })
+}
+
+/// Builds the fixture as a wasm module once per test binary and returns its
+/// bytes.
+pub fn fixture_wasm() -> &'static [u8] {
+    static BUILT: OnceLock<Vec<u8>> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = wasm_build("echo-pack", root).expect("the module builds");
+        std::fs::read(&path).expect("the module was written")
+    })
+}
+
+/// Opens the fixture's wasm module with the default limits.
+pub fn open_wasm() -> WasmPack {
+    WasmPack::open(fixture_wasm(), &Limits::default()).expect("the module opens")
 }
 
 pub fn metor() -> Command {
