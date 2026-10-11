@@ -2,6 +2,9 @@
 //!
 //! Field order is part of the on-disk and shared-memory format.
 
+use core::ops::Deref;
+use core::ptr;
+
 use crate::backing::Backing;
 use crate::sync::AtomicU64;
 use crate::{AttachError, Config, PAYLOAD_ALIGNMENT};
@@ -41,38 +44,78 @@ pub(super) struct Control {
 }
 
 /// One reader's entry in the reader table.
-///
-/// The padding fills a cache line so readers do not contend with each other.
 #[repr(C)]
 pub(super) struct ReaderSlot {
     pub(super) cursor: AtomicU64,
     pub(super) owner: AtomicU64,
-    pub(super) _pad: [u8; READER_SLOT_PAD],
 }
 
-/// Loom atomics are larger, and Loom tests don't need cache-line padding.
-#[cfg(not(ring_loom))]
-pub(super) const READER_SLOT_PAD: usize = 48;
-#[cfg(ring_loom)]
-pub(super) const READER_SLOT_PAD: usize = 0;
+/// A value padded out to whole 64-byte cache lines.
+///
+/// It pads instead of aligning, so a region base only needs 16-byte alignment.
+#[repr(C)]
+pub(super) struct CacheLine<T, const PAD: usize> {
+    value: T,
+    _pad: [u8; PAD],
+}
 
-pub(super) const CONTROL_OFFSET: usize = 0x40;
+impl<T, const PAD: usize> CacheLine<T, PAD> {
+    const fn new(value: T) -> Self {
+        Self {
+            value,
+            _pad: [0; PAD],
+        }
+    }
+}
 
-/// The start of the reader table. Loom needs extra space for its atomics.
-#[cfg(not(ring_loom))]
-pub(super) const HEADER_SIZE: usize = 0x80;
-#[cfg(ring_loom)]
-pub(super) const HEADER_SIZE: usize = (CONTROL_OFFSET + size_of::<Control>()).next_multiple_of(64);
+impl<T, const PAD: usize> Deref for CacheLine<T, PAD> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+/// Returns the padding that rounds `size` up to whole cache lines.
+const fn line_pad(size: usize) -> usize {
+    size.next_multiple_of(64) - size
+}
+
+type HeaderLine = CacheLine<RegionHeader, { line_pad(size_of::<RegionHeader>()) }>;
+type ControlLine = CacheLine<Control, { line_pad(size_of::<Control>()) }>;
+pub(super) type SlotLine = CacheLine<ReaderSlot, { line_pad(size_of::<ReaderSlot>()) }>;
+
+/// The start of a region: its header, control words, and reader table.
+///
+/// The data region follows at the header's `data_offset`. Sharing `&Region`
+/// between handles and processes is sound because the header and all padding
+/// are written only during initialization, before any handle exists. Every
+/// field written after that is atomic.
+#[repr(C)]
+pub(super) struct Region {
+    pub(super) header: HeaderLine,
+    pub(super) control: ControlLine,
+    pub(super) slots: [SlotLine],
+}
+
+/// The reader table's offset from the region base.
+pub(super) const SLOTS_OFFSET: usize = size_of::<HeaderLine>() + size_of::<ControlLine>();
 
 // PANIC Safety: compile-time assertions pin the shipped layout.
 #[cfg(not(ring_loom))]
 const _: () = {
-    assert!(size_of::<RegionHeader>() <= CONTROL_OFFSET);
-    assert!(CONTROL_OFFSET + size_of::<Control>() <= HEADER_SIZE);
-    assert!(size_of::<ReaderSlot>() == 64);
-    assert!(align_of::<ReaderSlot>() == 8);
+    assert!(core::mem::offset_of!(Region, control) == 0x40);
+    assert!(SLOTS_OFFSET == 0x80);
+    assert!(size_of::<SlotLine>() == 64);
 };
-pub(super) const READER_SLOT_SIZE: usize = size_of::<ReaderSlot>();
+// PANIC Safety: a compile-time assertion that the table follows the control
+// words without padding.
+const _: () = assert!(SLOTS_OFFSET.is_multiple_of(align_of::<SlotLine>()));
+
+/// Returns a pointer to the region at `base` with `max_readers` reader slots.
+pub(super) fn region_ptr(base: *mut u8, max_readers: u32) -> *mut Region {
+    ptr::slice_from_raw_parts_mut(base, max_readers as usize) as *mut Region
+}
 
 /// The cursor value of a free slot.
 ///
@@ -93,33 +136,31 @@ pub(super) const fn arch_tag() -> u64 {
 /// The backing is aligned, writable only through this call, and large enough for
 /// a valid `geometry`. No other handle may observe initialization.
 pub(super) unsafe fn init_region(backing: &Backing, geometry: &Geometry) {
-    let base = backing.base;
+    let region = region_ptr(backing.base, geometry.max_readers);
     // SAFETY: checked geometry fits the exclusive, aligned backing.
     unsafe {
-        base.cast::<RegionHeader>().write(RegionHeader {
+        (&raw mut (*region).header).write(CacheLine::new(RegionHeader {
             magic: MAGIC,
             version: VERSION,
             flags: 0,
             capacity: geometry.capacity,
             data_offset: geometry.data_offset as u64,
             max_readers: geometry.max_readers,
-            reader_table_offset: geometry.reader_table_offset as u32,
+            reader_table_offset: SLOTS_OFFSET as u32,
             total_size: geometry.total_size as u64,
             arch_tag: arch_tag(),
-        });
-        base.add(CONTROL_OFFSET).cast::<Control>().write(Control {
+        }));
+        (&raw mut (*region).control).write(CacheLine::new(Control {
             committed: AtomicU64::new(0),
             hwm: AtomicU64::new(HWM_NONE),
             writer: AtomicU64::new(0),
-        });
+        }));
+        let slots = (&raw mut (*region).slots).cast::<SlotLine>();
         for slot in 0..geometry.max_readers as usize {
-            base.add(geometry.reader_table_offset + slot * READER_SLOT_SIZE)
-                .cast::<ReaderSlot>()
-                .write(ReaderSlot {
-                    cursor: AtomicU64::new(FREE_SLOT),
-                    owner: AtomicU64::new(0),
-                    _pad: [0; READER_SLOT_PAD],
-                });
+            slots.add(slot).write(CacheLine::new(ReaderSlot {
+                cursor: AtomicU64::new(FREE_SLOT),
+                owner: AtomicU64::new(0),
+            }));
         }
     }
 }
@@ -132,8 +173,6 @@ pub(super) struct Geometry {
     pub(super) capacity: u64,
     /// Offset of the data region from the region base.
     pub(super) data_offset: usize,
-    /// Offset of the reader table from the region base.
-    pub(super) reader_table_offset: usize,
     pub(super) max_readers: u32,
 }
 
@@ -159,15 +198,14 @@ impl Geometry {
         }
         let data_offset = cfg
             .max_readers
-            .checked_mul(READER_SLOT_SIZE)?
-            .checked_add(HEADER_SIZE)?;
+            .checked_mul(size_of::<SlotLine>())?
+            .checked_add(SLOTS_OFFSET)?;
         let total = data_offset.checked_add(cfg.capacity)?;
         if total > isize::MAX as usize {
             return None;
         }
         Some(Self {
             capacity: cfg.capacity as u64,
-            reader_table_offset: HEADER_SIZE,
             data_offset,
             max_readers: cfg.max_readers as u32,
             total_size: total,
@@ -189,7 +227,7 @@ pub(super) unsafe fn read_header(
     if !(base as usize).is_multiple_of(PAYLOAD_ALIGNMENT) {
         return Err(AttachError::Misaligned);
     }
-    if region_len < HEADER_SIZE {
+    if region_len < SLOTS_OFFSET {
         return Err(AttachError::TooSmall);
     }
     // SAFETY: the checked length covers the immutable header. Exclude the
@@ -232,14 +270,12 @@ pub(super) fn validate_header(
     if max_readers == 0 {
         return Err(AttachError::BadGeometry);
     }
+    // The table is the tail of `Region`, so it must sit exactly where the struct puts it.
     let table_end = (max_readers as u64)
-        .checked_mul(READER_SLOT_SIZE as u64)
+        .checked_mul(size_of::<SlotLine>() as u64)
         .and_then(|sz| reader_table_offset.checked_add(sz))
         .ok_or(AttachError::BadGeometry)?;
-    if reader_table_offset < HEADER_SIZE as u64
-        || !reader_table_offset.is_multiple_of(8)
-        || table_end > data_offset
-    {
+    if reader_table_offset != SLOTS_OFFSET as u64 || table_end > data_offset {
         return Err(AttachError::BadGeometry);
     }
     let data_end = data_offset
@@ -257,7 +293,6 @@ pub(super) fn validate_header(
         capacity,
         // Both fit usize: they are <= total_size <= region_len: usize.
         data_offset: data_offset as usize,
-        reader_table_offset: reader_table_offset as usize,
         max_readers,
     })
 }

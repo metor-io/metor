@@ -7,11 +7,14 @@ reuse bytes at or after the slowest reader's cursor.
 
 ## Region layout
 
-Version 6 stores an immutable region header, atomic control words, a reader
-table, and a data region. Each reader slot stores a cursor and an owner tag.
-Control words store the published position (`committed`), the latest wrap gap
-start (`hwm`), and the writer owner tag. Creation uses a compact layout;
-attachment also accepts validated gaps between sections and trailing storage.
+Version 6 stores an immutable region header at 0x00, atomic control words at
+0x40, a reader table of 64-byte slots at 0x80, and a data region. Each reader
+slot stores a cursor and an owner tag. Control words store the published
+position (`committed`), the latest wrap gap start (`hwm`), and the writer owner
+tag. The `Region` struct covers the header, control words, and reader table, and
+compile-time assertions pin these offsets. Creation uses a compact layout;
+attachment also accepts a validated gap before the data region and trailing
+storage. The reader table must start at 0x80.
 
 The base and data region are 16-byte aligned. Each record has a 16-byte header
 followed by its payload and padding to the next 16-byte boundary. Records never
@@ -63,11 +66,12 @@ still in use.
 The writer and each view keep their own positions and only publish them to the
 region. The writer reads `committed` once, when it claims the ring; a view sets
 its cursor at registration. A peer that writes the control block can make a read
-or write fail with `Corrupt`, but cannot move either handle outside the region.
-The writer reports `Corrupt` for a reader cursor ahead of its position or a used
-byte count that overflows. A view reports it for a cursor more than a lap behind
-`committed`, off the 16-byte grid, or whose gap skip overflows. That lap bound
-also limits every read loop to one lap of records.
+or write fail with a corruption error, but cannot move either handle outside the
+region. The writer reports `WriteError::Corrupt` for a reader cursor ahead of its
+position or a used byte count that overflows. A view reports `ReadError` for a
+cursor more than a lap behind `committed`, off the 16-byte grid, or whose gap
+skip overflows. A lookup skips at most one gap. That lap bound also limits every
+read loop to one lap of records.
 
 ## Ownership and reclamation
 

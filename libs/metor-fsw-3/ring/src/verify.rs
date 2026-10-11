@@ -1,8 +1,9 @@
 //! Sequential Kani harnesses; see `VERIFY.md` for assumptions and bounds.
 use super::*;
+use core::mem::offset_of;
 
 const CAP: usize = 64;
-const REGION: usize = HEADER_SIZE + READER_SLOT_SIZE + CAP;
+const REGION: usize = SLOTS_OFFSET + size_of::<SlotLine>() + CAP;
 
 fn any_capacity() -> u64 {
     let cap: u64 = kani::any();
@@ -162,26 +163,14 @@ fn validate_header_hostile() {
     assert!(g.capacity.is_power_of_two());
     assert!(g.capacity >= 16);
     assert!(g.max_readers > 0);
-    assert!(region_len >= HEADER_SIZE);
+    assert!(region_len >= SLOTS_OFFSET);
 
-    // The reader table sits behind the header, 8-aligned, before the data region.
-    assert!(g.reader_table_offset >= HEADER_SIZE);
-    assert!(g.reader_table_offset.is_multiple_of(8));
-    let table_end = g
-        .reader_table_offset
-        .checked_add(
-            (g.max_readers as usize)
-                .checked_mul(READER_SLOT_SIZE)
-                .unwrap(),
-        )
+    // The reader table ends before the data region.
+    let table_end = (g.max_readers as usize)
+        .checked_mul(size_of::<SlotLine>())
+        .and_then(|len| len.checked_add(SLOTS_OFFSET))
         .unwrap();
     assert!(table_end <= g.data_offset);
-
-    let slot: u32 = kani::any();
-    kani::assume(slot < g.max_readers);
-    let off = g.reader_table_offset + slot as usize * READER_SLOT_SIZE;
-    assert!(off.is_multiple_of(8));
-    assert!(off + READER_SLOT_SIZE <= g.data_offset);
 
     // The data region is 16-aligned and ends inside the backing.
     assert!(g.data_offset.is_multiple_of(16));
@@ -216,7 +205,7 @@ fn layout_roundtrip() {
         capacity: capacity as u64,
         data_offset: geometry.data_offset as u64,
         max_readers: max_readers as u32,
-        reader_table_offset: geometry.reader_table_offset as u32,
+        reader_table_offset: SLOTS_OFFSET as u32,
         total_size: geometry.total_size as u64,
         arch_tag: arch_tag(),
     };
@@ -224,17 +213,16 @@ fn layout_roundtrip() {
     let g = validate_header(&hdr, geometry.total_size).expect("a header we just laid out");
     assert_eq!(g.capacity, capacity as u64);
     assert_eq!(g.data_offset, geometry.data_offset);
-    assert_eq!(g.reader_table_offset, geometry.reader_table_offset);
     assert_eq!(g.total_size, geometry.total_size);
     assert_eq!(g.max_readers, max_readers as u32);
 }
 
 #[repr(C, align(16))]
-struct Region([u8; REGION]);
+struct StackRegion([u8; REGION]);
 
-impl Region {
+impl StackRegion {
     fn new() -> Self {
-        Region([0u8; REGION])
+        StackRegion([0u8; REGION])
     }
 
     fn attach(&mut self) -> RingBuffer {
@@ -257,7 +245,7 @@ impl Region {
 #[kani::proof]
 #[kani::unwind(12)]
 fn write_read_roundtrip() {
-    let mut region = Region::new();
+    let mut region = StackRegion::new();
     let ring = region.attach();
     let w = ring.writer(NoWake).unwrap();
     let mut v = ring.view(NoWake).unwrap();
@@ -280,7 +268,7 @@ fn write_read_roundtrip() {
 #[kani::proof]
 #[kani::unwind(12)]
 fn backpressure_at_capacity() {
-    let mut region = Region::new();
+    let mut region = StackRegion::new();
     let ring = region.attach();
     let w = ring.writer(NoWake).unwrap();
     let v = ring.view(NoWake).unwrap();
@@ -323,7 +311,7 @@ fn backpressure_at_capacity() {
 #[kani::proof]
 #[kani::unwind(12)]
 fn read_skips_wrap_gap() {
-    let mut region = Region::new();
+    let mut region = StackRegion::new();
     let ring = region.attach();
     let w = ring.writer(NoWake).unwrap();
     let mut v = ring.view(NoWake).unwrap();
@@ -365,7 +353,7 @@ fn read_skips_wrap_gap() {
 #[kani::proof]
 #[kani::unwind(12)]
 fn try_latest_pins() {
-    let mut region = Region::new();
+    let mut region = StackRegion::new();
     let ring = region.attach();
     let w = ring.writer(NoWake).unwrap();
     let mut v = ring.view(NoWake).unwrap();
@@ -403,15 +391,16 @@ unsafe fn fill_data(base: *mut u8) {
 unsafe fn write_control(base: *mut u8, committed: u64, hwm: u64) {
     // SAFETY: the control words lie within the region (caller contract).
     unsafe {
-        base.add(CONTROL_OFFSET).cast::<u64>().write(committed);
-        base.add(CONTROL_OFFSET + 8).cast::<u64>().write(hwm);
+        let control = offset_of!(Region, control);
+        base.add(control).cast::<u64>().write(committed);
+        base.add(control + 8).cast::<u64>().write(hwm);
     }
 }
 
 #[kani::proof]
 #[kani::unwind(12)]
 fn corrupt_data_never_ub() {
-    let mut region = Region::new();
+    let mut region = StackRegion::new();
     let ring = region.attach();
     let mut v = ring.view(NoWake).unwrap();
     let (base, region_len) = ring.region();
@@ -429,7 +418,7 @@ fn corrupt_data_never_ub() {
     }
 
     match v.try_read() {
-        Err(ReadError::Corrupt) | Ok(None) => {}
+        Err(ReadError) | Ok(None) => {}
         Ok(Some(g)) => assert!(g.len() <= CAP - 16),
     }
 }
@@ -437,7 +426,7 @@ fn corrupt_data_never_ub() {
 #[kani::proof]
 #[kani::unwind(12)]
 fn corrupt_control_never_ub() {
-    let mut region = Region::new();
+    let mut region = StackRegion::new();
     let ring = region.attach();
     let mut v = ring.view(NoWake).unwrap();
     let (base, _) = ring.region();
@@ -451,11 +440,11 @@ fn corrupt_control_never_ub() {
     // SAFETY: we hold the only handle; the cursor is the first reader slot's.
     unsafe {
         write_control(base, committed, hwm);
-        base.add(HEADER_SIZE).cast::<u64>().write(cursor);
+        base.add(SLOTS_OFFSET).cast::<u64>().write(cursor);
     }
 
     match v.try_read() {
-        Err(ReadError::Corrupt) | Ok(None) => {}
+        Err(ReadError) | Ok(None) => {}
         Ok(Some(g)) => assert!(g.len() <= CAP - 16),
     }
 }
@@ -463,7 +452,7 @@ fn corrupt_control_never_ub() {
 #[kani::proof]
 #[kani::unwind(12)]
 fn corrupt_latest_never_ub() {
-    let mut region = Region::new();
+    let mut region = StackRegion::new();
     let ring = region.attach();
     let mut v = ring.view(NoWake).unwrap();
     let (base, _) = ring.region();
@@ -474,7 +463,7 @@ fn corrupt_latest_never_ub() {
     }
 
     match v.try_latest() {
-        Err(ReadError::Corrupt) | Ok(None) => {}
+        Err(ReadError) | Ok(None) => {}
         Ok(Some(g)) => assert!(g.len() <= CAP - 16),
     }
 }
@@ -485,14 +474,14 @@ unsafe fn write_peer_words(base: *mut u8) {
     // SAFETY: the control words and the first reader slot lie within the region.
     unsafe {
         write_control(base, kani::any(), kani::any());
-        base.add(HEADER_SIZE).cast::<u64>().write(kani::any());
+        base.add(SLOTS_OFFSET).cast::<u64>().write(kani::any());
     }
 }
 
 #[kani::proof]
 #[kani::unwind(12)]
 fn corrupt_peer_writer_never_ub() {
-    let mut region = Region::new();
+    let mut region = StackRegion::new();
     let ring = region.attach();
     let (base, _) = ring.region();
     // SAFETY: we hold the only handle to this region.
@@ -513,7 +502,7 @@ fn corrupt_peer_writer_never_ub() {
 #[kani::proof]
 #[kani::unwind(12)]
 fn corrupt_peer_view_never_ub() {
-    let mut region = Region::new();
+    let mut region = StackRegion::new();
     let ring = region.attach();
     let (base, _) = ring.region();
     // SAFETY: we hold the only handle to this region.
@@ -529,11 +518,11 @@ fn corrupt_peer_view_never_ub() {
 
     match kani::any::<u8>() % 3 {
         0 => match v.try_read() {
-            Err(ReadError::Corrupt) | Ok(None) => {}
+            Err(ReadError) | Ok(None) => {}
             Ok(Some(g)) => assert!(g.len() <= CAP - 16),
         },
         1 => match v.try_latest() {
-            Err(ReadError::Corrupt) | Ok(None) => {}
+            Err(ReadError) | Ok(None) => {}
             Ok(Some(g)) => assert!(g.len() <= CAP - 16),
         },
         _ => {

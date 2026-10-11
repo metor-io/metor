@@ -1,26 +1,21 @@
 //! Storage for ring regions: heap, memory-mapped, or owned by the caller.
 
-use std::cell::UnsafeCell;
+use std::alloc::{self, Layout};
 use std::ptr::NonNull;
 
+use crate::PAYLOAD_ALIGNMENT;
 use crate::owner::{Lease, RawOwner};
-
-/// A 16-byte aligned unit of storage that allows interior mutation.
-#[repr(C, align(16))]
-pub(super) struct Word(pub(super) UnsafeCell<[u64; 2]>);
 
 /// A byte region, owned or borrowed, whose base address never moves.
 pub(super) struct Backing {
     pub(super) base: *mut u8,
     pub(super) len: usize,
-    owner: BackingOwner,
+    _owner: BackingOwner,
 }
 
 enum BackingOwner {
-    /// Held as a raw pointer rather than a `Box`, so pointers derived from the
-    /// allocation stay valid when the `Backing` moves.
     Heap {
-        words: NonNull<[Word]>,
+        _region: HeapRegion,
     },
     #[cfg(feature = "mmap")]
     Mmap {
@@ -32,21 +27,46 @@ enum BackingOwner {
     },
 }
 
+/// A zeroed, 16-byte aligned heap allocation that is freed on drop.
+///
+/// It holds a raw pointer rather than a `Box`, so pointers derived from the
+/// allocation stay valid when it moves.
+struct HeapRegion {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl HeapRegion {
+    /// Allocates at least `size` zeroed bytes, rounded up to 16.
+    fn new(size: usize) -> Self {
+        // PANIC Safety: ring geometry keeps sizes at or below `isize::MAX` minus the alignment.
+        let layout = Layout::from_size_align(size.max(1), PAYLOAD_ALIGNMENT)
+            .expect("heap ring size fits a Layout")
+            .pad_to_align();
+        // SAFETY: the layout has a nonzero size.
+        let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        let Some(ptr) = NonNull::new(ptr) else {
+            alloc::handle_alloc_error(layout)
+        };
+        Self { ptr, layout }
+    }
+}
+
+impl Drop for HeapRegion {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` came from `alloc_zeroed` with this layout and is freed once.
+        unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
 impl Backing {
     /// Allocates zeroed, 16-byte aligned storage.
     pub(super) fn heap(size: usize) -> Self {
-        let count = size.div_ceil(size_of::<Word>());
-        let buf: Box<[Word]> = (0..count)
-            .map(|_| Word(UnsafeCell::new([0u64; 2])))
-            .collect();
-        let len = buf.len() * size_of::<Word>();
-        // Derive pointers only after transferring allocation ownership.
-        // SAFETY: `Box::into_raw` never returns null.
-        let words = unsafe { NonNull::new_unchecked(Box::into_raw(buf)) };
+        let region = HeapRegion::new(size);
         Self {
-            base: words.as_ptr().cast::<u8>(),
-            len,
-            owner: BackingOwner::Heap { words },
+            base: region.ptr.as_ptr(),
+            len: region.layout.size(),
+            _owner: BackingOwner::Heap { _region: region },
         }
     }
 
@@ -60,7 +80,7 @@ impl Backing {
         Self {
             base,
             len,
-            owner: BackingOwner::Raw,
+            _owner: BackingOwner::Raw,
         }
     }
 
@@ -75,7 +95,7 @@ impl Backing {
         Self {
             base,
             len,
-            owner: BackingOwner::Owned { _lease: lease },
+            _owner: BackingOwner::Owned { _lease: lease },
         }
     }
 
@@ -88,16 +108,7 @@ impl Backing {
         Self {
             base,
             len,
-            owner: BackingOwner::Mmap { _map: map },
-        }
-    }
-}
-
-impl Drop for Backing {
-    fn drop(&mut self) {
-        if let BackingOwner::Heap { words } = self.owner {
-            // SAFETY: reconstruct the sole owning pointer exactly once.
-            drop(unsafe { Box::from_raw(words.as_ptr()) });
+            _owner: BackingOwner::Mmap { _map: map },
         }
     }
 }

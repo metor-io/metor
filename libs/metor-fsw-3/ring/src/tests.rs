@@ -1,6 +1,5 @@
 //! Ring behavior tests. Miri skips the mmap and executor tests. See `VERIFY.md`.
 use super::*;
-use crate::backing::Word;
 use crate::models::{self, DEAD_PID, read, ring};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering as O};
@@ -11,6 +10,10 @@ fn reader_count(ring: &RingBuffer) -> usize {
         .filter(|&s| ring.inner.slot(s).cursor.load(Relaxed) != FREE_SLOT)
         .count()
 }
+
+/// A 16-byte aligned unit of storage that allows interior mutation.
+#[repr(C, align(16))]
+struct Word(UnsafeCell<[u64; 2]>);
 
 /// Zeroed, 16-aligned storage of at least `len` bytes.
 fn words(len: usize) -> Vec<Word> {
@@ -409,7 +412,7 @@ fn test_read_rejects_corrupt_length() {
     w.try_write(&[5u8; 16]).unwrap();
     // SAFETY: offset 0 is in-bounds and nothing reads concurrently.
     unsafe { (rb.inner.data_ptr(0) as *mut u64).write(0xFFFF_FFFF) };
-    assert_eq!(v.try_read().err(), Some(ReadError::Corrupt));
+    assert_eq!(v.try_read().err(), Some(ReadError));
 
     // The cursor never moved, so the restored record reads back intact.
     // SAFETY: as above.
@@ -516,7 +519,7 @@ fn test_attach_rejects_bad_regions() {
     .unwrap();
     type Case = (fn(&mut RegionHeader), usize, usize, AttachError);
     let keep: fn(&mut RegionHeader) = |_| {};
-    let cases: [Case; 17] = [
+    let cases: [Case; 18] = [
         (keep, 0, full - 8, RegionTruncated),
         (keep, 0, 8, TooSmall),
         (keep, 1, full - 1, Misaligned),
@@ -528,6 +531,7 @@ fn test_attach_rejects_bad_regions() {
         (|h| h.capacity = 8, 0, full, BadGeometry),
         (|h| h.capacity = 48, 0, full, BadGeometry),
         (|h| h.capacity = u64::MAX, 0, full, BadGeometry),
+        (|h| h.reader_table_offset += 64, 0, full, BadGeometry),
         (
             |h| h.reader_table_offset = h.data_offset as u32,
             0,
@@ -787,10 +791,7 @@ fn test_region_size_rejects_overflow() {
         capacity: 64,
         max_readers: 2,
     };
-    assert_eq!(
-        checked_region_len(&cfg),
-        Some(HEADER_SIZE + 2 * READER_SLOT_SIZE + 64)
-    );
+    assert_eq!(checked_region_len(&cfg), Some(0x80 + 2 * 64 + 64));
 }
 
 fn check_payload_alignment(rb: &RingBuffer) {
@@ -943,7 +944,7 @@ fn test_drain_reports_corrupt_once() {
         // SAFETY: the published header has no concurrent readers or writer.
         unsafe { ring.inner.data_ptr(0).cast::<u64>().write(len) };
         let mut batch = view.drain();
-        assert_eq!(batch.next(), Some(Err(ReadError::Corrupt)));
+        assert_eq!(batch.next(), Some(Err(ReadError)));
         assert_eq!(batch.next(), None);
     }
 }
@@ -1006,11 +1007,10 @@ fn test_attach_accepts_extra_storage() {
         max_readers: 2,
     };
     let mut geometry = Geometry::from_config(&cfg);
-    geometry.reader_table_offset += 16;
     geometry.data_offset += 32;
-    geometry.total_size += 48;
+    geometry.total_size += 32;
     let backing = Backing::heap(geometry.total_size + 32);
-    // SAFETY: fresh aligned storage; both section gaps and trailing bytes fit.
+    // SAFETY: fresh aligned storage; the data gap and trailing bytes fit.
     unsafe { init_region(&backing, &geometry) };
     // SAFETY: backing outlives every handle; all later access uses the ring.
     let ring = unsafe { RingBuffer::attach_raw(backing.base, backing.len) }.unwrap();
@@ -1106,7 +1106,7 @@ fn test_writer_ignores_peer_committed() {
     let mut v = rb.view(NoWake).unwrap();
     w.try_write(&[1; 8]).unwrap();
     peer_committed(&rb, u64::MAX);
-    assert_eq!(v.try_read().err(), Some(ReadError::Corrupt));
+    assert_eq!(v.try_read().err(), Some(ReadError));
 
     w.try_write(&[2; 8]).unwrap();
     assert_eq!(
@@ -1127,7 +1127,7 @@ fn test_misaligned_claim_is_corrupt() {
 
     let mut v = rb.view(NoWake).unwrap();
     peer_committed(&rb, 40);
-    assert_eq!(v.try_read().err(), Some(ReadError::Corrupt));
+    assert_eq!(v.try_read().err(), Some(ReadError));
 }
 
 #[test]
@@ -1159,9 +1159,9 @@ fn test_max_committed_never_panics() {
         peer_committed(&rb, u64::MAX);
         rb.inner.control().hwm.store(hwm, Release);
         assert!(!v.has_record());
-        assert_eq!(v.try_read().err(), Some(ReadError::Corrupt));
-        assert_eq!(v.try_latest(), Err(ReadError::Corrupt));
-        assert_eq!(v.drain().collect::<Vec<_>>(), [Err(ReadError::Corrupt)]);
+        assert_eq!(v.try_read().err(), Some(ReadError));
+        assert_eq!(v.try_latest(), Err(ReadError));
+        assert_eq!(v.drain().collect::<Vec<_>>(), [Err(ReadError)]);
         v.settle();
         assert_eq!(v.cursor(), 0);
     }

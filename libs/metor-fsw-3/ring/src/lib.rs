@@ -163,12 +163,10 @@ pub enum WriteError {
     Corrupt,
 }
 
-/// Why a read was rejected.
+/// Returned when a read finds the ring region corrupt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ReadError {
-    #[error("ring region violates a structural invariant")]
-    Corrupt,
-}
+#[error("ring region violates a structural invariant")]
+pub struct ReadError;
 
 /// Returned when every reader slot is already claimed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -292,26 +290,40 @@ impl WakeSink for Notifier {
 struct Inner {
     backing: Backing,
     geometry: Geometry,
+    /// The region's header, control words, and reader table, within `backing`.
+    region: *const Region,
 }
 
+// SAFETY: `region` points into `backing`, which is `Send` and `Sync`, and
+// `Region` documents why sharing it is sound.
+unsafe impl Send for Inner {}
+unsafe impl Sync for Inner {}
+
 impl Inner {
+    fn new(backing: Backing, geometry: Geometry) -> Self {
+        let region = region_ptr(backing.base, geometry.max_readers);
+        Self {
+            backing,
+            geometry,
+            region,
+        }
+    }
+
     #[inline]
-    fn base(&self) -> *mut u8 {
-        self.backing.base
+    fn region(&self) -> &Region {
+        // SAFETY: validated geometry places the region within the live backing.
+        unsafe { &*self.region }
     }
 
     #[inline]
     fn control(&self) -> &Control {
-        // SAFETY: validated geometry places this aligned, all-atomic block within the backing.
-        unsafe { &*(self.base().add(CONTROL_OFFSET) as *const Control) }
+        &self.region().control
     }
 
     #[inline]
     fn slot(&self, slot: u32) -> &ReaderSlot {
-        let off = self.geometry.reader_table_offset + slot as usize * READER_SLOT_SIZE;
-        // SAFETY: callers use slot < max_readers. Geometry bounds and aligns the slot;
-        // its fields are atomic and its padding is immutable after initialization.
-        unsafe { &*(self.base().add(off) as *const ReaderSlot) }
+        // PANIC Safety: callers pass slot < max_readers, the table's length.
+        &self.region().slots[slot as usize]
     }
 
     /// Returns a pointer to `offset` bytes into the data region.
@@ -322,14 +334,16 @@ impl Inner {
     unsafe fn data_ptr(&self, offset: usize) -> *mut u8 {
         // SAFETY: validated geometry and offset <= capacity keep this within the allocation
         // or one byte position past its end.
-        unsafe { self.base().add(self.geometry.data_offset + offset) }
+        unsafe { self.backing.base.add(self.geometry.data_offset + offset) }
     }
 
     fn slowest_active_cursor(&self) -> Option<u64> {
         // Pair with the registration fence: a scan sees the claim or the reader sees publication.
         fence(SeqCst);
-        (0..self.geometry.max_readers)
-            .map(|slot| self.slot(slot).cursor.load(Acquire))
+        self.region()
+            .slots
+            .iter()
+            .map(|slot| slot.cursor.load(Acquire))
             .filter(|&cursor| cursor != FREE_SLOT)
             .min()
     }
@@ -377,49 +391,51 @@ impl Inner {
     /// Finds the record at `r`, skipping a wrap gap if `r` sits on one.
     ///
     /// Returns the position after any skip, and the record if one was published
-    /// before `committed`. Returns `Corrupt` if `r` is more than a lap behind
+    /// before `committed`. Returns [`ReadError`] if `r` is more than a lap behind
     /// `committed` or is not on a 16-byte boundary.
-    fn locate_before(
-        &self,
-        mut r: u64,
-        committed: u64,
-    ) -> Result<(u64, Option<Located>), ReadError> {
-        let cap = self.geometry.capacity;
-        loop {
-            if r >= committed {
-                return Ok((r, None));
-            }
-            if committed - r > cap || !r.is_multiple_of(PAYLOAD_ALIGNMENT as u64) {
-                return Err(ReadError::Corrupt);
-            }
-            let hwm = self.control().hwm.load(Acquire);
-            if r == hwm {
-                // Skip this gap once; absolute gap positions increase.
-                r = self.next_lap(r).ok_or(ReadError::Corrupt)?;
-                continue;
-            }
-            let offset = (r & self.geometry.mask()) as usize;
-            // SAFETY: r is pinned and below an acquired committed position.
-            // Alignment and capacity >= 16 leave room for the header.
-            let len = unsafe { self.read_len(offset) };
-            if !payload_in_bounds(len, offset as u64, cap) {
-                return Err(ReadError::Corrupt);
-            }
-            let len = len as usize;
-            let rec = frame_len(len);
-            if rec as u64 > committed - r {
-                return Err(ReadError::Corrupt);
-            }
-            return Ok((
-                r,
-                Some(Located {
-                    start: r,
-                    offset,
-                    payload_len: len,
-                    frame_len: rec,
-                }),
-            ));
+    fn locate_before(&self, r: u64, committed: u64) -> Result<(u64, Option<Located>), ReadError> {
+        if r >= committed {
+            return Ok((r, None));
         }
+        if committed - r > self.geometry.capacity || !r.is_multiple_of(PAYLOAD_ALIGNMENT as u64) {
+            return Err(ReadError);
+        }
+        // A gap runs to the end of its lap, so skipping it lands on a lap start,
+        // which is aligned and still within a lap of `committed`.
+        let r = if r == self.control().hwm.load(Acquire) {
+            self.next_lap(r).ok_or(ReadError)?
+        } else {
+            r
+        };
+        if r >= committed {
+            return Ok((r, None));
+        }
+        let loc = self.record_at(r, committed)?;
+        Ok((r, Some(loc)))
+    }
+
+    /// Reads and bounds-checks the header of the record at `r`.
+    ///
+    /// `r` is aligned, pinned, and within a lap below `committed`.
+    fn record_at(&self, r: u64, committed: u64) -> Result<Located, ReadError> {
+        let offset = (r & self.geometry.mask()) as usize;
+        // SAFETY: r is pinned and below an acquired committed position.
+        // Alignment and capacity >= 16 leave room for the header.
+        let len = unsafe { self.read_len(offset) };
+        if !payload_in_bounds(len, offset as u64, self.geometry.capacity) {
+            return Err(ReadError);
+        }
+        let payload_len = len as usize;
+        let frame_len = frame_len(payload_len);
+        if frame_len as u64 > committed - r {
+            return Err(ReadError);
+        }
+        Ok(Located {
+            start: r,
+            offset,
+            payload_len,
+            frame_len,
+        })
     }
 
     /// Returns the start of the lap after `pos`, or `None` on overflow.
@@ -595,7 +611,7 @@ impl RingBuffer {
 
     fn from_parts(backing: Backing, geometry: Geometry) -> Self {
         Self {
-            inner: Arc::new(Inner { backing, geometry }),
+            inner: Arc::new(Inner::new(backing, geometry)),
         }
     }
 
@@ -656,8 +672,7 @@ impl RingBuffer {
     /// stores have finished, and its handles will never be used again. PID reuse
     /// must not have given that ID to a live claimant.
     pub unsafe fn reclaim_owner(&self, pid: u64) {
-        for index in 0..self.inner.geometry.max_readers {
-            let slot = self.inner.slot(index);
+        for slot in &self.inner.region().slots {
             if slot.cursor.load(Acquire) != FREE_SLOT
                 && slot.owner.compare_exchange(pid, 0, AcqRel, Acquire).is_ok()
             {
