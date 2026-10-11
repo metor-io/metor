@@ -7,11 +7,13 @@ These systems are built into the host rather than supplied by a pack, so
 their pack has no library and is left out of the config's pack list.
 
 The two link systems (`Publish` and `Subscribe`) each take exactly one
-transport: a `listen` address or a `connect` address.
+transport: a `listen` address, a `connect` address, or a `peer` link in
+the same deployment, which `metor build` turns into an address.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Sequence, TypeVar
 
 from ._config import ABI_VERSION, ConfigError, check_abi
@@ -31,7 +33,7 @@ from ._model import (
     _json,
     _unique,
 )
-from ._target import Target
+from ._target import SystemHandle, Target
 
 T = TypeVar("T", bound=Record)
 
@@ -64,21 +66,35 @@ class Link(System):
         params: dict[str, Any],
         listen: str | None,
         connect: str | None,
+        peer: SystemHandle | None,
         max_connections: int | None,
         items: Sequence[Item] = (),
         records: Sequence[type[Record]] = (),
     ) -> None:
-        self._transport = _transport(listen, connect, max_connections)
+        self._peer = _peer(peer)
+        self._transport = _transport(listen, connect, peer, max_connections)
         super().__init__({}, params, items=items, records=records)
 
     def _params_for(self, target: Any, index: int) -> Any:
         link = target._systems[index][0]
         return {
-            "transport": self._transport,
+            "transport": self._transport_json(),
             "namespace": target.namespace,
             "link": link,
             **self._params,
         }
+
+    def _transport_json(self) -> dict[str, Any]:
+        if self._peer is None:
+            return self._transport
+        return {"peer": {"target": _namespace(self._peer), "link": self._peer._name}}
+
+    def listen_port(self) -> int | None:
+        """Returns the port this link listens on, or `None` if it dials."""
+        listen = self._transport.get("listen") if self._peer is None else None
+        if listen is None:
+            return None
+        return int(listen["addr"].rsplit(":", 1)[1])
 
 
 class Sink(Link):
@@ -94,11 +110,12 @@ class Sink(Link):
         params: dict[str, Any],
         listen: str | None,
         connect: str | None,
+        peer: SystemHandle | None,
         max_connections: int | None,
         items: Sequence[Item],
         all: bool,
     ) -> None:
-        super().__init__(params, listen, connect, max_connections, items=items)
+        super().__init__(params, listen, connect, peer, max_connections, items=items)
         self._items = list(items)
         self._all = all
 
@@ -126,11 +143,12 @@ class Publish(Sink):
         items: Sequence[Item] = (),
         listen: str | None = None,
         connect: str | None = None,
+        peer: SystemHandle | None = None,
         max_connections: int | None = None,
         conn_cap: int = CONN_CAP,
         all: bool = False,
     ) -> None:
-        super().__init__({"conn_cap": conn_cap}, listen, connect, max_connections, items, all)
+        super().__init__({"conn_cap": conn_cap}, listen, connect, peer, max_connections, items, all)
 
 
 class Subscribe(Link):
@@ -138,6 +156,13 @@ class Subscribe(Link):
 
     `records` lists message classes to accept. Each one gets an output port
     named after the record.
+
+    With a `peer`, the subscriber copies ports that the peer `Publish`
+    serves. `items` lists which of the peer's ports to copy, and each copy
+    keeps its `{system}.{port}` name. A message record gets only one port,
+    even if the peer publishes it on several; the first one listed wins.
+    With neither `items` nor `records`, it copies everything the peer
+    publishes. Use `port()` to get this subscriber's copy of a peer's port.
     """
 
     _ty = "subscribe"
@@ -149,30 +174,137 @@ class Subscribe(Link):
         records: Sequence[type[Record]] = (),
         listen: str | None = None,
         connect: str | None = None,
+        peer: SystemHandle | None = None,
+        items: Sequence[Item] = (),
         max_connections: int | None = None,
         conn_cap: int = CONN_CAP,
         inbound_cap: int = INBOUND_CAP,
     ) -> None:
+        if items and peer is None:
+            raise ConfigError("`items` names a peer's ports, so it needs `peer`")
         super().__init__(
             {"conn_cap": conn_cap, "inbound_cap": inbound_cap},
             listen,
             connect,
+            peer,
             max_connections,
             records=records,
         )
+        self._items = list(items)
+        self._records = list(records)
+        self._copies: list[Copy] | None = None
+
+    def _port_map(self) -> dict[str, type[Record]]:
+        return {**{copy.port: copy.record for copy in self._peer_copies()}, **self._ports}
+
+    def _outputs_for(self, target: Any, index: int) -> list[dict[str, Any]]:
+        if self._peer is None:
+            return self._dyn_outputs
+        peer = {"target": _namespace(self._peer), "link": self._peer._name}
+        copies = [
+            {"port": copy.port, "peer": {**peer, "port": copy.source}}
+            for copy in self._peer_copies()
+        ]
+        return copies + self._dyn_outputs
+
+    def _port(self, source: OutPort[T], name: str, target: Any) -> OutPort[T]:
+        for copy in self._peer_copies():
+            if copy.target is not source.target:
+                continue
+            same_port = copy.source == source.name
+            same_msg = (
+                source.kind == "msg"
+                and source.record is not None
+                and copy.record._name == source.record._name
+            )
+            if same_port or same_msg:
+                return OutPort(name, copy.port, copy.record, target)
+        raise ConfigError(f"`{name}` does not copy `{source.name}`")
+
+    def _peer_copies(self) -> list[Copy]:
+        """Returns one copy for each of the peer's ports this subscriber
+        takes."""
+        if self._copies is None:
+            self._copies = _copies(self._peer, self._items, self._records) if self._peer else []
+        return self._copies
+
+
+@dataclass(frozen=True)
+class Copy:
+    """An output port that copies one of a peer's published ports.
+
+    ``port`` is the name on this subscriber, ``record`` is its record class,
+    and ``source`` is the name of the peer's port it copies.
+    """
+
+    port: str
+    record: type[Record]
+    source: str
+    target: Any
+
+
+def _copies(peer: SystemHandle, items: Sequence[Item], records: Sequence[type[Record]]) -> list[Copy]:
+    published = _published(peer)
+    if items:
+        wanted = _item_ports(items)
+    elif records:
+        wanted = []
+    else:
+        wanted = published
+    copies: list[Copy] = []
+    for port in wanted:
+        if not any(p.ref == port.ref and p.target is port.target for p in published):
+            raise ConfigError(f"`{peer._name}` on `{_namespace(peer)}` does not publish `{port.name}`")
+        record = port.record
+        if record is None:
+            raise ConfigError(f"`{port.name}` carries no record class")
+        taken = any(
+            copy.port == port.name or (record._kind == "msg" and copy.record._name == record._name)
+            for copy in copies
+        )
+        if not taken:
+            copies.append(Copy(port.name, record, port.name, port.target))
+    return copies
+
+
+def _published(peer: SystemHandle) -> list[OutPort[Any]]:
+    """Returns every port the peer link publishes, including those added by
+    `all`."""
+    system = peer._system
+    if not isinstance(system, Publish):
+        return []
+    inputs = system._inputs_for(peer._target, peer._target.index(peer._name))
+    return [sources[0] for sources in inputs.values() if isinstance(sources[0], OutPort)]
+
+
+def _peer(peer: SystemHandle | None) -> SystemHandle | None:
+    if peer is None:
+        return None
+    if not isinstance(peer, SystemHandle) or not isinstance(peer._system, Link):
+        raise ConfigError(f"`peer` takes a link's handle, got {peer!r}")
+    return peer
+
+
+def _namespace(peer: SystemHandle) -> str:
+    namespace = peer._target.namespace
+    if not namespace:
+        raise ConfigError(f"the target of peer `{peer._name}` names no namespace")
+    return namespace
 
 
 def _transport(
     listen: str | None,
     connect: str | None,
+    peer: SystemHandle | None,
     max_connections: int | None,
 ) -> dict[str, Any]:
-    if (listen is None) == (connect is None):
-        raise ConfigError("a link takes exactly one of `listen` and `connect`")
+    given = [x is not None for x in (listen, connect, peer)]
+    if given.count(True) != 1:
+        raise ConfigError("a link takes exactly one of `listen`, `connect`, and `peer`")
     if listen is None:
         if max_connections is not None:
             raise ConfigError("a dialing link holds one connection, so it takes no `max_connections`")
-        return {"connect": {"addr": connect}}
+        return {"connect": {"addr": connect}} if connect is not None else {}
     slots = MAX_CONNECTIONS if max_connections is None else max_connections
     if slots < 1:
         raise ConfigError("a listening link takes at least one connection")

@@ -45,6 +45,10 @@ class SystemHandle:
             return ports
         return {**ports, **CHANNEL_PORTS}
 
+    def port(self, source: OutPort[T]) -> OutPort[T]:
+        """Returns this system's copy of ``source``. See `Subscribe.port`."""
+        return self._system._port(source, self._name, self._target)
+
 
 class Target:
     """A target: a set of systems that run together, in a fixed order.
