@@ -1,0 +1,5 @@
+error: #[system] needs an `execute` method in this impl block
+ --> tests/ui/system_no_execute.rs:6:6
+  |
+6 | impl Idle {
+  |      ^^^^

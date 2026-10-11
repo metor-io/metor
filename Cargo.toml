@@ -39,6 +39,9 @@ members = [
     "examples/adcs-fsw2/contracts",
     "examples/adcs-fsw2/systems/adcs-systems",
     "examples/adcs-fsw2/systems/adcs-sequences",
+    "libs/metor-fsw-3",
+    "libs/metor-fsw-3/ring",
+    "libs/metor-fsw-3/macros",
 ]
 exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve", "apps/metor"]
 
