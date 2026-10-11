@@ -31,7 +31,7 @@ type Fields = Vec<(Cow<'static, str>, Cow<'static, str>)>;
 pub(crate) struct Corrupt;
 
 impl From<ReadError> for Corrupt {
-    fn from(ReadError::Corrupt: ReadError) -> Self {
+    fn from(_: ReadError) -> Self {
         Corrupt
     }
 }
