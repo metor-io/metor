@@ -42,8 +42,8 @@ pub struct LogState {
 
 impl LogState {
     fn push(&mut self, event: LogEvent) {
-        if !event.source.is_empty() && !self.sources.contains(&event.source) {
-            self.sources.insert(event.source.clone());
+        if !event.source.is_empty() && !self.sources.contains(event.source.as_ref()) {
+            self.sources.insert(event.source.to_string());
         }
         self.history.push_back(LogRecord {
             seq: self.pushed,
@@ -145,9 +145,9 @@ mod tests {
         LogEvent {
             timestamp: Timestamp(1),
             level,
-            source: source.to_string(),
-            target: String::new(),
-            message: message.to_string(),
+            source: source.to_string().into(),
+            target: "".into(),
+            message: message.to_string().into(),
             span: None,
             fields: Vec::new(),
             file: None,

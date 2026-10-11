@@ -1,0 +1,5 @@
+error: a `#[system]` fn takes one `#[state]` parameter at most
+ --> tests/ui/system_two_states.rs:6:38
+  |
+6 | fn counter(#[state] a: &mut Counter, #[state] b: &mut Counter, now: Timestamp) {
+  |                                      ^^^^^^^^

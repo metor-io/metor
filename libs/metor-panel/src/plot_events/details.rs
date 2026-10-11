@@ -7,10 +7,15 @@ pub(crate) fn fields(detail: &EventDetail) -> Vec<(String, String)> {
         EventDetail::Log(event) => {
             let mut fields = vec![
                 ("level".into(), format!("{:?}", event.level)),
-                ("source".into(), event.source.clone()),
-                ("message".into(), event.message.clone()),
+                ("source".into(), event.source.to_string()),
+                ("message".into(), event.message.to_string()),
             ];
-            fields.extend(event.fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+            fields.extend(
+                event
+                    .fields
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string())),
+            );
             fields
         }
         EventDetail::Alarm(event) => vec![
