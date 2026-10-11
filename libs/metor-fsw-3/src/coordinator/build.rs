@@ -7,13 +7,14 @@ use std::collections::HashMap;
 
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer, checked_region_len};
 use metor_proto::types::Timestamp;
+use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 
 use crate::def::{DefCx, Records};
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
-use crate::thread::{DEFAULT_THREAD, Threads};
+use crate::thread::Threads;
 
-use super::config::{CoordinatorConfig, SystemConfig};
+use super::config::{Adapter, CoordinatorConfig, SystemConfig};
 use super::error::BuildError;
 use super::params::{ParamError, Params};
 use super::status::SystemStatus;
@@ -37,8 +38,8 @@ struct PlannedSystem<'a> {
     entry: &'a TableEntry,
     def: SystemDef,
     params: Params<'a>,
-    /// The background thread this system is placed on, if it is async.
-    thread: &'a str,
+    /// The adapter the config runs this system behind.
+    adapter: Option<&'a Adapter>,
     base_ring_idx: RingIndex,
     inputs: Vec<Vec<RingIndex>>,
 }
@@ -67,6 +68,7 @@ impl CoordinatorConfig {
     /// Builds a [`Coordinator`] from this config and the given system table
     pub fn build(self, table: &SystemTable) -> Result<Coordinator, BuildError> {
         self.clock.validate()?;
+        check_channels(&self)?;
         let mut plan = resolve(&self, table)?;
         check_ids(&plan)?;
         count_readers(&plan.systems, &mut plan.rings);
@@ -130,7 +132,7 @@ fn resolve<'a>(
             inputs: vec![Vec::new(); def.inputs.len()],
             def,
             params: Params(&system.params),
-            thread: system.thread.as_deref().unwrap_or(DEFAULT_THREAD),
+            adapter: system.adapter.as_ref(),
             base_ring_idx,
         });
     }
@@ -146,6 +148,32 @@ pub(crate) fn status_def(id: &str, namespace: Option<&str>) -> PortDef {
         ..DefCx::empty()
     };
     Output::<SystemStatus>::def(&cx, STATUS_PORT)
+}
+
+/// Every channel name fits the wire's cap and addresses one system.
+fn check_channels(config: &CoordinatorConfig) -> Result<(), BuildError> {
+    let names = config
+        .systems
+        .iter()
+        .filter_map(|system| match &system.adapter {
+            Some(Adapter::Channel(channel)) => Some(channel.name.as_str()),
+            _ => None,
+        });
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if name.len() > SEQUENCE_CHANNEL_NAME_CAP {
+            return Err(BuildError::ChannelName {
+                name: name.to_string(),
+                cap: SEQUENCE_CHANNEL_NAME_CAP,
+            });
+        }
+        if !seen.insert(name) {
+            return Err(BuildError::DuplicateChannel {
+                name: name.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Each system's position in the config, by id.
@@ -378,15 +406,19 @@ fn bind_rings(
             .iter()
             .map(|edges| edges.iter().map(|&ring| &rings[ring]).collect())
             .collect();
-        let step = (system.entry.make)(MakeCx {
+        let cx = MakeCx {
             id: system.id,
-            thread: system.thread,
+            adapter: system.adapter,
             def: &system.def,
             params: system.params,
             inputs,
             outputs,
             threads,
-        })
+        };
+        let step = match system.adapter {
+            Some(Adapter::Channel(_)) => crate::channel::make(&system.entry.make, cx),
+            _ => (system.entry.make)(cx),
+        }
         .map_err(|source| build_error(system.id, source))?;
         entries.push(Entry {
             name: system.id.to_string(),
@@ -409,6 +441,11 @@ fn build_error(id: &str, source: ParamError) -> BuildError {
             id: id.to_string(),
             thread,
         },
+        ParamError::Channel { channel } => BuildError::ChannelOnAsync {
+            id: id.to_string(),
+            channel,
+        },
+        ParamError::SlotChannel => BuildError::SlotWithoutChannel { id: id.to_string() },
         source => BuildError::Params {
             id: id.to_string(),
             source,

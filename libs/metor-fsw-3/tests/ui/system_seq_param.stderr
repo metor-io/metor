@@ -1,0 +1,5 @@
+error: a `Seq` parameter belongs on a `#[sequence]` fn
+ --> tests/ui/system_seq_param.rs:4:13
+  |
+4 | fn arm(seq: &Seq) {
+  |             ^^^^

@@ -18,6 +18,7 @@ use crate::{
 };
 
 pub use ctor::Ctor;
+use param::Defs;
 pub use param::{Cycle, Param, ParamNames, Views, Writers};
 pub use set::{InSet, LOG_PORT, OutSet};
 
@@ -79,7 +80,13 @@ impl<S: AsyncSystemFn> AsyncSystem for FnAsyncSystem<S> {
     type Inputs = InSet<S, Notifier>;
     type Outputs = OutSet<S>;
 
+    /// Refuses a [`Sample`](crate::port::Sample) parameter, since no step takes it.
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        if Defs::of::<S>(cx)?.sampled {
+            return Err(DefError::SampleOnAsync {
+                system: S::NAME.into(),
+            });
+        }
         SystemDef::new_async::<InSet<S, Notifier>, OutSet<S>>(S::NAME, cx)
     }
 
@@ -93,7 +100,7 @@ impl<S: AsyncSystemFn> AsyncSystem for FnAsyncSystem<S> {
     ) {
         let mut log = log::Log;
         let mut cx = Cycle::new(Timestamp::now(), &mut log);
-        let items = S::Params::get::<Notifier>(&mut inputs.0, &mut outputs.outs, &mut cx);
+        let items = S::Params::get::<Notifier>(&mut inputs.ins, &mut outputs.outs, &mut cx);
         let call = core::pin::pin!(S::call(state, items, stop));
         log::log_scope(&mut outputs.log, call).await;
     }
@@ -117,11 +124,12 @@ impl<S: SystemFn> System for FnSystem<S> {
         outputs: &mut OutSet<S>,
     ) {
         log::with_log_port(&mut outputs.log, now, || {
+            inputs.samplers.take_all();
             let mut log = log::Log;
             let mut cx = Cycle::new(now, &mut log);
             S::call(
                 state,
-                S::Params::get(&mut inputs.0, &mut outputs.outs, &mut cx),
+                S::Params::get(&mut inputs.ins, &mut outputs.outs, &mut cx),
             );
         });
     }

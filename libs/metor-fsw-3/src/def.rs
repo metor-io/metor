@@ -5,7 +5,8 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::coordinator::{BuildError, OutputConfig, PortRef, SystemConfig, TableEntry};
+use crate::channel::{ABORT_PORT, COMMANDS_PORT};
+use crate::coordinator::{Adapter, BuildError, OutputConfig, PortRef, SystemConfig, TableEntry};
 use crate::system::{PortDef, SystemDef};
 
 /// What a type sees of one instance's config when it computes its def.
@@ -21,9 +22,12 @@ pub struct DefCx<'a> {
     pub outputs: &'a [OutputConfig],
     /// Every record the table knows.
     pub records: &'a Records,
+    /// The instance's params.
+    pub params: &'a serde_json::Value,
 }
 
 static NO_RECORDS: LazyLock<Records> = LazyLock::new(Records::default);
+static NO_PARAMS: serde_json::Value = serde_json::Value::Null;
 
 impl DefCx<'static> {
     /// The context with nothing in it: the def the descriptor carries.
@@ -34,6 +38,7 @@ impl DefCx<'static> {
             inputs: &[],
             outputs: &[],
             records: &NO_RECORDS,
+            params: &NO_PARAMS,
         }
     }
 }
@@ -47,6 +52,7 @@ impl<'a> DefCx<'a> {
             inputs,
             outputs: &[],
             records: &NO_RECORDS,
+            params: &NO_PARAMS,
         }
     }
 
@@ -58,6 +64,7 @@ impl<'a> DefCx<'a> {
             inputs: &[],
             outputs,
             records,
+            params: &NO_PARAMS,
         }
     }
 
@@ -89,6 +96,12 @@ pub enum DefError {
 
     #[error("output `{port}` names a peer's port that is not resolved; run `metor build`")]
     Unresolved { port: String },
+
+    #[error("slot: {message}")]
+    Slot { message: String },
+
+    #[error("async system `{system}` takes a `Sample`, which only a stepped system takes")]
+    SampleOnAsync { system: String },
 }
 
 /// The definition `entry`'s type computes for `system`, over the producers
@@ -101,8 +114,16 @@ pub(crate) fn instance_def(
     records: &Records,
     producer: impl Fn(&PortRef) -> Result<Option<PortDef>, BuildError>,
 ) -> Result<SystemDef, BuildError> {
+    let channel = matches!(system.adapter, Some(Adapter::Channel(_)));
     let mut edges: Vec<(&str, PortDef)> = Vec::new();
     for input in &system.inputs {
+        if channel && input.port == ABORT_PORT {
+            return Err(reserved(system, ABORT_PORT));
+        }
+        // The channel reads its commands; the system never sees them.
+        if channel && input.port == COMMANDS_PORT {
+            continue;
+        }
         for from in &input.from {
             match producer(from)? {
                 Some(def) => edges.push((input.port.as_str(), def)),
@@ -123,11 +144,23 @@ pub(crate) fn instance_def(
         inputs: &inputs,
         outputs: &system.outputs,
         records,
+        params: &system.params,
     };
-    entry.def_for(&cx).map_err(|source| BuildError::Def {
+    let def = entry.def_for(&cx).map_err(|source| BuildError::Def {
         id: system.id.clone(),
         source,
-    })
+    })?;
+    if !channel {
+        return Ok(def);
+    }
+    crate::channel::def(def, &cx).map_err(|port| reserved(system, &port))
+}
+
+fn reserved(system: &SystemConfig, port: &str) -> BuildError {
+    BuildError::ReservedChannelPort {
+        id: system.id.clone(),
+        port: port.to_string(),
+    }
 }
 
 /// Every record a table knows, by name.

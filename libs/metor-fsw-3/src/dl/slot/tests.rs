@@ -1,0 +1,104 @@
+use serde_json::json;
+
+use super::*;
+use crate::Output;
+use crate::tests::utils::Imu;
+
+fn port(name: &'static str) -> PortDef {
+    Output::<Imu>::def(&DefCx::empty(), name)
+}
+
+fn def_with(outputs: Vec<PortDef>) -> SystemDef {
+    SystemDef {
+        name: "count_up".into(),
+        inputs: Vec::new(),
+        outputs,
+    }
+}
+
+fn slot_def(params: &Value) -> Result<SystemDef, DefError> {
+    def(&DefCx {
+        params,
+        ..DefCx::empty()
+    })
+}
+
+fn candidate(path: &str, hash: &str) -> Candidate {
+    Candidate {
+        name: "up".into(),
+        ty: "count_up".into(),
+        params: Value::Null,
+        path: Some(path.into()),
+        hash: Some(hash.into()),
+        def: None,
+    }
+}
+
+#[test]
+fn test_def_is_first_candidate() {
+    let baked = def_with(vec![port("imu")]);
+    let params = json!({ "allow": [
+        { "name": "up", "ty": "count_up", "def": baked },
+        { "name": "down", "ty": "count_down" },
+    ]});
+    let def = slot_def(&params).expect("a baked def");
+    assert_eq!(def.name, SLOT_NAME);
+    assert_eq!(def.outputs, baked.outputs);
+}
+
+#[test]
+fn test_def_refuses_unresolved() {
+    let params = json!({ "allow": [{ "name": "up", "ty": "count_up" }] });
+    let Err(DefError::Slot { message }) = slot_def(&params) else {
+        panic!("an unresolved candidate has no def")
+    };
+    assert!(message.contains("metor build"), "{message}");
+}
+
+#[test]
+fn test_def_refuses_empty_or_malformed() {
+    assert!(slot_def(&json!({ "allow": [] })).is_err());
+    assert!(slot_def(&json!({ "allow": 3 })).is_err());
+    assert!(slot_def(&Value::Null).is_err());
+}
+
+#[test]
+fn test_resolved_occupant() {
+    let hash = blake3::hash(b"lib");
+    let resolved = Resolved::of(2, candidate("/store/x/libup.so", &hash.to_hex()))
+        .expect("a resolved candidate");
+    assert_eq!(resolved.occupant.index, 2);
+    assert_eq!(resolved.occupant.artifact.to_str(), Ok("libup.so"));
+    assert_eq!(resolved.occupant.hash.0, *hash.as_bytes());
+}
+
+#[test]
+fn test_resolved_refuses_bad_fields() {
+    let hash = blake3::hash(b"lib").to_hex();
+    let long = format!("/store/x/{}", "l".repeat(64));
+    assert!(Resolved::of(0, candidate("/store/x/libup.so", "not hex")).is_err());
+    assert!(Resolved::of(0, candidate(&long, &hash)).is_err());
+    let mut bare = candidate("/store/x/libup.so", &hash);
+    bare.path = None;
+    assert!(Resolved::of(0, bare).is_err());
+}
+
+#[test]
+fn test_same_ports() {
+    let a = def_with(vec![port("imu")]);
+    assert!(same_ports(&a, &a));
+    assert!(!same_ports(&a, &def_with(vec![port("other")])));
+    assert!(!same_ports(&a, &def_with(Vec::new())));
+    let rooted = SystemDef {
+        outputs: vec![Output::<Imu>::def(
+            &DefCx {
+                id: "mode",
+                namespace: Some("sat"),
+                ..DefCx::empty()
+            },
+            "imu",
+        )],
+        ..a.clone()
+    };
+    assert!(same_ports(&a, &rooted));
+}

@@ -115,7 +115,7 @@ mod tests {
         let (base, len) = export.region();
         // SAFETY: the export owns this initialized region and its callback context.
         let guest = unsafe { RingBuffer::attach_owned(base, len, export.owner()) }?;
-        let mut writer = guest.writer(NoWake)?;
+        let writer = guest.writer(NoWake)?;
         let mut view = guest.view(NoWake)?;
         drop(export);
         drop(guest);
@@ -139,7 +139,7 @@ mod tests {
         let (base, len) = export.region();
         // SAFETY: the export owns this initialized region and its callback context.
         let guest = unsafe { RingBuffer::attach_owned(base, len, export.owner()) }?;
-        let mut writer = guest.writer(NoWake)?;
+        let writer = guest.writer(NoWake)?;
         let mut view = guest.view(NoWake)?;
         drop(guest);
         drop(export);

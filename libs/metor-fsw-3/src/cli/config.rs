@@ -33,6 +33,14 @@ pub struct PackRef {
     pub libs: PathBuf,
 }
 
+impl PackRef {
+    /// The pack's library for this host.
+    pub fn artifact(&self) -> PathBuf {
+        let (triple, name) = (super::cargo::triple(), super::cargo::cdylib_name(&self.lib));
+        self.libs.join(triple).join(name)
+    }
+}
+
 /// A whole target: the packs that supply the types and the graph over them.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TargetConfig {

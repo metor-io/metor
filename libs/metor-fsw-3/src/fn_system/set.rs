@@ -8,19 +8,21 @@ use crate::coordinator::OutputConfig;
 use crate::def::Records;
 use crate::def::{DefCx, DefError};
 use crate::log::LogPort;
-use crate::port::Output;
+use crate::port::{Output, Samplers};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
 
 use super::Ports;
-use super::param::{Bindings, Defs, Param};
+use super::param::{Bindings, Defs, Param, Views};
 
 /// LOG_PORT is the name of the port that receives log events.
 pub const LOG_PORT: &str = "log";
 
-/// An `InSet` is the bound inputs of a fn system's parameters.
-pub struct InSet<S: Ports, W: WakeSink + Clone + 'static = NoWake>(
-    pub(crate) <S::Params as Param>::In<W>,
-);
+/// An `InSet` is the bound inputs of a fn system's parameters, and the
+/// samplers its step takes each cycle.
+pub struct InSet<S: Ports, W: WakeSink + Clone + 'static = NoWake> {
+    pub(crate) ins: <S::Params as Param>::In<W>,
+    pub(crate) samplers: Samplers,
+}
 
 /// An `OutSet` is the bound outputs of a fn system's parameters, plus its `log`.
 pub struct OutSet<S: Ports> {
@@ -35,12 +37,15 @@ impl<S: Ports, W: WakeSink + Clone + 'static> SystemInputs<W> for InSet<S, W> {
 
     fn bind(inputs: Vec<InputBinding<W>>) -> Self {
         let counts = input_counts::<S, W>(&inputs);
-        let mut views = Bindings::new(inputs, counts);
+        let mut views = Views::new(Bindings::new(inputs, counts));
         let ins = S::Params::bind_in::<W>(&mut views);
         // PANIC Safety: the coordinator binds one list per port of the
         // definition these counts were taken from.
         assert!(views.is_empty(), "more bindings than input params");
-        Self(ins)
+        Self {
+            ins,
+            samplers: views.into_samplers(),
+        }
     }
 }
 

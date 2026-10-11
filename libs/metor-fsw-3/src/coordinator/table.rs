@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use metor_fsw_3_ring::{NoWake, RingBuffer};
 use serde_json::value::RawValue;
@@ -11,27 +11,43 @@ use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{AsyncSystemFn, Ctor, FnAsyncSystem, FnSystem, SystemFn};
+use crate::sequence::SequenceFn;
 use crate::system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
 };
 use crate::thread::{DEFAULT_THREAD, Threads};
 
 use super::BuildError;
+use super::config::Adapter;
 use super::params::{ParamError, Params};
-use super::run::{Runner, Step};
+use super::run::Runner;
+use super::step::Step;
 
 static STATUS: LazyLock<PortDef> =
     LazyLock::new(|| crate::Output::<super::SystemStatus>::def(&DefCx::empty(), "status"));
 
+/// The ports a channel adds to whatever system it wraps.
+static CHANNEL: LazyLock<[PortDef; 3]> = LazyLock::new(crate::channel::ports);
+
 /// Arguments for constructing a system using [`MakeFn`].
 pub struct MakeCx<'a> {
     pub id: &'a str,
-    pub thread: &'a str,
+    pub adapter: Option<&'a Adapter>,
     pub def: &'a SystemDef,
     pub params: Params<'a>,
     pub inputs: Vec<Vec<&'a RingBuffer>>,
     pub outputs: Vec<&'a RingBuffer>,
     pub threads: &'a mut Threads,
+}
+
+impl MakeCx<'_> {
+    /// The thread the adapter names, or the default one.
+    pub fn thread(&self) -> &str {
+        match self.adapter {
+            Some(Adapter::Thread(thread)) => thread,
+            _ => DEFAULT_THREAD,
+        }
+    }
 }
 
 /// Builds a system from [`MakeCx`].
@@ -48,7 +64,7 @@ pub(crate) struct TableEntry {
     pub doc: Cow<'static, str>,
     /// The JSON Schema of the type's params, `None` when it takes none.
     pub schema: Option<Box<RawValue>>,
-    pub make: Box<MakeFn>,
+    pub make: Arc<MakeFn>,
 }
 
 impl TableEntry {
@@ -92,6 +108,17 @@ impl SystemTable {
         let make = move |params: Params<'_>| Ok((FnSystem::default(), ctor.make(params)?));
         let entry = entry::<FnSystem<S>>(make, Cow::Borrowed(S::DOC), C::schema())
             .map_err(def_error(ty))?;
+        self.insert(ty, entry)
+    }
+
+    /// Registers a `#[sequence]` fn under `ty`, its state built by `ctor`.
+    pub fn register_sequence<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
+        &mut self,
+        ty: &str,
+        _sequence: S,
+        ctor: C,
+    ) -> Result<(), BuildError> {
+        let entry = crate::sequence::entry::<S, M, C>(ctor).map_err(def_error(ty))?;
         self.insert(ty, entry)
     }
 
@@ -161,10 +188,11 @@ impl SystemTable {
         self.entries.iter().map(|(ty, entry)| (ty.as_str(), entry))
     }
 
-    /// Every record the registered ports and the implicit status port declare.
+    /// Every record the registered ports and the implicit status and channel ports declare.
     pub(crate) fn records(&self) -> Records {
         Records::of(
             core::iter::once(&*STATUS)
+                .chain(CHANNEL.iter())
                 .chain(self.entries().flat_map(|(_, entry)| ports(&entry.def))),
         )
     }
@@ -245,38 +273,10 @@ fn entry<S: System + 'static>(
         def_fn: Box::new(S::def),
         doc,
         schema,
-        make: Box::new(move |cx| {
-            if cx.thread != DEFAULT_THREAD {
-                return Err(ParamError::Thread {
-                    thread: cx.thread.to_string(),
-                });
-            }
+        make: Arc::new(move |cx| {
+            refuse_thread(cx.adapter)?;
             let (system, state) = make(cx.params)?;
-            let views = cx
-                .def
-                .inputs
-                .iter()
-                .zip(cx.inputs)
-                .map(|(def, rings)| InputBinding {
-                    def: def.clone(),
-                    views: rings
-                        .into_iter()
-                        // PANIC Safety: the build pass counts one reader slot per edge.
-                        .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
-                        .collect(),
-                })
-                .collect();
-            let writers = cx
-                .def
-                .outputs
-                .iter()
-                .zip(cx.outputs)
-                .map(|(def, ring)| OutputBinding {
-                    def: def.clone(),
-                    // PANIC Safety: one ring is allocated per output port.
-                    writer: ring.writer(NoWake).expect("one writer per output ring"),
-                })
-                .collect();
+            let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
             Ok(Box::new(Runner {
                 system,
                 state,
@@ -285,6 +285,48 @@ fn entry<S: System + 'static>(
             }))
         }),
     })
+}
+
+/// Refuses a thread, which only an async system runs on.
+pub(crate) fn refuse_thread(adapter: Option<&Adapter>) -> Result<(), ParamError> {
+    match adapter {
+        Some(Adapter::Thread(thread)) => Err(ParamError::Thread {
+            thread: thread.clone(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// One view per input edge and one writer per output, for a cyclic system.
+pub(crate) fn bindings(
+    def: &SystemDef,
+    inputs: Vec<Vec<&RingBuffer>>,
+    outputs: Vec<&RingBuffer>,
+) -> (Vec<InputBinding>, Vec<OutputBinding>) {
+    let views = def
+        .inputs
+        .iter()
+        .zip(inputs)
+        .map(|(def, rings)| InputBinding {
+            def: def.clone(),
+            views: rings
+                .into_iter()
+                // PANIC Safety: the build pass counts one reader slot per edge.
+                .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
+                .collect(),
+        })
+        .collect();
+    let writers = def
+        .outputs
+        .iter()
+        .zip(outputs)
+        .map(|(def, ring)| OutputBinding {
+            def: def.clone(),
+            // PANIC Safety: one ring is allocated per output port.
+            writer: ring.writer(NoWake).expect("one writer per output ring"),
+        })
+        .collect();
+    (views, writers)
 }
 
 /// Builds one async entry, whose `make` places the system on its group's thread.
@@ -297,13 +339,13 @@ where
     A: AsyncSystem + 'static,
     M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
 {
-    let make = std::sync::Arc::new(make);
+    let make = Arc::new(make);
     Ok(TableEntry {
         def: A::def(&DefCx::empty())?,
         def_fn: Box::new(A::def),
         doc,
         schema,
-        make: Box::new(move |cx| crate::thread::place::<A, M>(make.clone(), cx)),
+        make: Arc::new(move |cx| crate::thread::place::<A, M>(make.clone(), cx)),
     })
 }
 
@@ -351,6 +393,9 @@ mod tests {
         let mut table = SystemTable::new();
         assert_eq!(record(&table, "status"), Some(STATUS.clone()));
         assert!(record(&table, "missing").is_none());
+        for port in CHANNEL.iter() {
+            assert_eq!(record(&table, &port.record), Some(port.clone()));
+        }
         let first = Output::<Imu>::def(&DefCx::empty(), "first");
         let mut second = first.clone();
         second.name = "second".into();
@@ -711,7 +756,7 @@ mod tests {
         let def = entry.def.clone();
         let step = (entry.make)(MakeCx {
             id: "idle",
-            thread: DEFAULT_THREAD,
+            adapter: None,
             def: &def,
             params: Params(&serde_json::Value::Null),
             inputs: Vec::new(),

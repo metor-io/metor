@@ -11,11 +11,12 @@ use std::process::{Command, ExitStatus};
 
 use tracing_subscriber::layer::SubscriberExt;
 
-use super::cargo::{cdylib_name, read_toml, string, triple};
+use super::cargo::{read_toml, string};
 use super::config::{ConfigError, DeploymentConfig, TargetConfig};
 use super::pack_dev::{PackDevError, pack_dev};
 use crate::coordinator::{BuildError, Clock, Coordinator, SystemTable};
 use crate::deploy::{self, DeployError};
+use crate::dl::store;
 use crate::dl::{Pack, PackError};
 use crate::pack::ABI_VERSION;
 
@@ -175,6 +176,9 @@ pub fn prepare(target: Option<&Path>) -> Result<DeploymentConfig, RunError> {
             .iter()
             .map(table_for)
             .collect::<Result<_, _>>()?;
+        let dir = target.parent().filter(|dir| !dir.as_os_str().is_empty());
+        let dir = std::path::absolute(dir.unwrap_or(Path::new(".")))?;
+        deploy::resolve_slots(&mut config, &tables, &store::dir(&dir))?;
         deploy::resolve(&mut config, &tables)?;
     }
     Ok(config)
@@ -284,7 +288,7 @@ fn table_for(config: &TargetConfig) -> Result<SystemTable, RunError> {
         .packs
         .iter()
         .map(|pack| {
-            let path = pack.libs.join(triple()).join(cdylib_name(&pack.lib));
+            let path = pack.artifact();
             // SAFETY: the path names a pack `pack dev` built against this ABI;
             // `open` checks the version before calling anything else.
             unsafe { Pack::open(&path) }

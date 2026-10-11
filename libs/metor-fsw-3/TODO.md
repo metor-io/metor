@@ -67,11 +67,23 @@ fixed by metor-panel and metor-db, so it is reproduced, not designed.
   write stuck on a silent peer then holds its slot until TCP gives up,
   which needs a bound.
 
-## 5. Sequences and slots
+## 5. Sequences and slots, done
 
-Async fns polled once per cycle with `wait_for` and `sleep`, and slots
-that load, start, abort, and stop them at runtime. In-process occupants
-only; `SequenceCommand` arrives as an ordinary message.
+`channel=` wraps a cyclic system in the channel adapter, which applies
+`Start`, `Stop`, `Abort`, `Reset`, and `Load` from `SequenceCommand`
+messages and reports `SequenceChannelEvent`s and a `channel_status`
+frame. `#[sequence]` async fns are polled once per cycle through a `Seq`
+handle. `DlSlot` loads pack systems from a content-addressed store that
+`metor build` fills, and `ChannelRegistry` publishes the target's
+channels. Landed 2026-09-24, `12-sequences.md`, `12-sequences-impl.md`.
+
+- Channels on async systems: a per-member stop and cancel in the thread
+  group, and a `Threads` handle the recipe can re-place with.
+- `Target.add` returns the system's own type, so a checker does not see
+  a channel's `events` and `channel_status` handles.
+- Postcard samples: `Sample<T>` holds only `Frame + Copy` records. A
+  postcard record needs its decoded value held across the cycle without
+  allocating after make (`13-abort-handlers-redlines.md`, decision 4).
 
 ## 6. Process and wasm adapters
 

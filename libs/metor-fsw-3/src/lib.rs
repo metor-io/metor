@@ -84,6 +84,42 @@
 //! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
 //!
+//! An `async fn` under `#[sequence]` is polled once per cycle instead, and
+//! returns when its steps are done. Its [`Seq`] handle reads the cycle's
+//! time and waits in cycle time; an abort ends any wait with
+//! [`SeqError::Aborted`].
+//!
+//! ```
+//! # use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+//! # use metor_fsw_3::{Frame, Timestamp};
+//! # #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+//! # #[repr(C)]
+//! # struct Gps {
+//! #     #[frame(timestamp)]
+//! #     timestamp: Timestamp,
+//! #     pos: [f64; 3],
+//! # }
+//! use core::time::Duration;
+//! use metor_fsw_3::{Input, Output, Seq, SeqError, SystemTable, sequence};
+//!
+//! /// Waits for a fix, then publishes the origin for one second.
+//! #[sequence]
+//! async fn hold(seq: &Seq, gps: &mut Input<Gps>, out: &mut Output<Gps>) -> Result<(), SeqError> {
+//!     seq.wait_for(Duration::from_secs(5), || gps.latest().is_ok_and(|f| f.is_some()))
+//!         .await?;
+//!     let _ = out.write(&Gps { timestamp: seq.now(), pos: [0.0; 3] });
+//!     seq.sleep(Duration::from_secs(1)).await
+//! }
+//!
+//! let mut table = SystemTable::new();
+//! table.register_sequence("hold", hold(), Default::default)?;
+//! # Ok::<(), metor_fsw_3::BuildError>(())
+//! ```
+//!
+//! `channel=` in a system's config wraps it in the [`channel`] adapter, which
+//! starts, stops, resets, aborts, and loads it on `SequenceCommand`s; a
+//! [`dl`] slot loads pack systems into one place in the schedule.
+//!
 //! The built-in [`link`] systems, `Publish` and `Subscribe`, are async
 //! systems with config-listed ports; they carry a target's records over
 //! metor-proto to whoever connects, and its commands back.
@@ -92,6 +128,7 @@
 extern crate self as metor_fsw_3;
 
 pub mod async_system;
+pub mod channel;
 pub mod cli;
 pub mod coordinator;
 pub mod def;
@@ -105,6 +142,7 @@ pub mod pack;
 mod panic;
 pub mod port;
 pub mod record;
+pub mod sequence;
 pub mod system;
 pub mod thread;
 
@@ -112,9 +150,11 @@ pub mod thread;
 mod tests;
 
 pub use async_system::{AsyncSystem, Stop};
+pub use channel::{Abort, AbortRequest, ChannelState, ChannelStatus};
 pub use coordinator::{
-    BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, OutputConfig, OutputSource,
-    ParamError, Params, PeerLink, PeerPort, PortRef, Step, SystemConfig, SystemStatus, SystemTable,
+    Adapter, BuildError, ChannelConfig, Clock, Coordinator, CoordinatorConfig, EndReason,
+    InputConfig, LoadError, Occupant, OutputConfig, OutputSource, ParamError, Params, PeerLink,
+    PeerPort, PortRef, RunState, Step, SystemConfig, SystemStatus, SystemTable,
 };
 pub use def::{DefCx, DefError, Records};
 pub use dl::{DlStep, Pack, PackError, PackFns};
@@ -125,12 +165,15 @@ pub use fn_system::{
 pub use frame::Frame;
 pub use link::{LinkStatus, Transport};
 pub use log::{Log, LogLayer};
-pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs, system};
+pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs, sequence, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
 pub use pack::def::{PackDef, PackSystemDef};
 pub use pack::{ABI_VERSION, Status};
-pub use port::{DynInputs, DynOutputs, Input, Latest, Output, RecvError, SendError, ring_capacity};
+pub use port::{
+    DynInputs, DynOutputs, Input, Latest, Output, RecvError, Sample, SendError, ring_capacity,
+};
 pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Record, RecordSchema};
+pub use sequence::{OnAbort, Redline, Seq, SeqError, SequenceFn};
 pub use system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
 };
@@ -139,7 +182,9 @@ pub use metor_fsw_3_ring as ring;
 pub use metor_proto::types::Timestamp;
 
 pub use metor_component::path;
-pub use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
+pub use metor_component::{
+    AsVTable, Componentize, Decomponentize, FrameBytes, FrameStr, FrameStrError, Metadatatize,
+};
 pub use metor_proto;
 pub use metor_proto_wkt;
 pub use postcard;

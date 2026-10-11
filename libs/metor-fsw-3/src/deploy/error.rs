@@ -43,4 +43,21 @@ pub enum DeployError {
 
     #[error("target `{target}`: {source}")]
     Build { target: String, source: BuildError },
+
+    #[error("slot `{slot}`: {message}")]
+    Slot { slot: String, message: String },
+
+    #[error("slot `{slot}`: `{candidate}` has different ports than `{first}`")]
+    SlotContract {
+        slot: String,
+        first: String,
+        candidate: String,
+    },
+
+    #[error("slot `{slot}`: library name `{name}` is longer than {cap} bytes")]
+    ArtifactName {
+        slot: String,
+        name: String,
+        cap: usize,
+    },
 }

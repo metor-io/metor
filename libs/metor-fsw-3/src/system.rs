@@ -294,7 +294,7 @@ mod tests {
             (Input::<Imu>::def(&DefCx::empty(), "imu"), vec![&imu]),
             (Input::<Nav>::def(&DefCx::empty(), "nav"), vec![&nav]),
         ]));
-        let mut imu_out = Output::<Imu>::try_new(imu.writer(NoWake).expect("free writer"))
+        let imu_out = Output::<Imu>::try_new(imu.writer(NoWake).expect("free writer"))
             .expect("supported alignment");
         imu_out.write(&Imu::new(1, 5.0)).expect("ring has room");
         assert_eq!(
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn test_manual_bundle_binding() {
         let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
-        let mut out = DerivedOut::bind(bound_out(vec![(
+        let out = DerivedOut::bind(bound_out(vec![(
             Output::<Nav>::def(&DefCx::empty(), "nav"),
             &nav,
         )]));

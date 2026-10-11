@@ -10,6 +10,7 @@ mod error;
 mod params;
 mod run;
 mod status;
+mod step;
 mod table;
 
 #[cfg(test)]
@@ -22,16 +23,16 @@ use crate::port::Output;
 
 pub(crate) use build::status_def;
 pub use config::{
-    Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig, OutputConfig, OutputSource,
-    PeerLink, PeerPort, PortRef, SystemConfig,
+    Adapter, ChannelConfig, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig,
+    OutputConfig, OutputSource, PeerLink, PeerPort, PortRef, RunState, SystemConfig,
 };
 pub use error::BuildError;
 pub use params::{ParamError, Params};
-pub use run::Step;
-pub(crate) use run::{catch_step, message_of as panic_message};
+pub(crate) use run::{Stepped, catch_step, message_of as panic_message};
 pub use status::SystemStatus;
-pub(crate) use table::TableEntry;
+pub use step::{EndReason, LoadError, Occupant, Step};
 pub use table::{MakeCx, SystemTable};
+pub(crate) use table::{MakeFn, TableEntry, bindings, refuse_thread};
 
 /// One bound system and the status port the coordinator owns for it.
 struct Entry {
@@ -67,11 +68,17 @@ impl Coordinator {
         self.entries.iter().map(|entry| entry.name.as_str())
     }
 
-    /// The ids of the systems a panic latched off, in step order.
-    pub fn latched(&self) -> impl Iterator<Item = &str> {
+    /// The ids of the systems that ended and how, in step order.
+    pub fn ended(&self) -> impl Iterator<Item = (&str, &EndReason)> {
         self.entries
             .iter()
-            .filter(|entry| entry.latched())
-            .map(|entry| entry.name.as_str())
+            .filter_map(|entry| Some((entry.name.as_str(), entry.ended()?)))
+    }
+
+    /// The ids of the systems a panic latched off, in step order.
+    pub fn latched(&self) -> impl Iterator<Item = &str> {
+        self.ended()
+            .filter(|(_, end)| **end == EndReason::Panicked)
+            .map(|(id, _)| id)
     }
 }

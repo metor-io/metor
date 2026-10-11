@@ -97,6 +97,36 @@ class Mode(System):
     status: OutPort[SystemStatus]
 
 
+class Safe(System):
+    """A second mode, with `Mode`'s ports."""
+
+    _pack = PACK
+    _ty = "safe"
+    _ports = {"cmd": ModeCmd, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, est: Sources[Est] = (), hold: float = 1.0) -> None:
+        super().__init__({"est": est}, {"hold": hold})
+
+    cmd: OutPort[ModeCmd]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Hold(System):
+    """A third mode, with `Safe`'s ports and no params."""
+
+    _pack = PACK
+    _ty = "hold"
+    _ports = {"cmd": ModeCmd, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, est: Sources[Est] = ()) -> None:
+        super().__init__({"est": est}, {})
+
+    cmd: OutPort[ModeCmd]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
 class Ctrl(System):
     _pack = PACK
     _ty = "ctrl"

@@ -46,9 +46,95 @@ pub struct SystemConfig {
     pub inputs: Vec<InputConfig>,
     #[serde(default)]
     pub outputs: Vec<OutputConfig>,
-    /// If set chooses a particular background thread for the system to run on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thread: Option<String>,
+    /// The adapter the system runs behind, if any.
+    #[serde(flatten, with = "adapter_keys")]
+    pub adapter: Option<Adapter>,
+}
+
+/// What a system runs behind: a named background thread, or a channel.
+///
+/// In a config it is a `thread` or a `channel` key beside `id`, never both.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Adapter {
+    Thread(String),
+    Channel(ChannelConfig),
+}
+
+/// A channel's name, which commands address, and its state at boot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelConfig {
+    pub name: String,
+    #[serde(default)]
+    pub start: RunState,
+}
+
+/// An adapter as a config spells it: at most one of two keys.
+mod adapter_keys {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{Adapter, ChannelConfig};
+
+    #[derive(Default, Deserialize)]
+    struct Keys {
+        #[serde(default)]
+        thread: Option<String>,
+        #[serde(default)]
+        channel: Option<ChannelConfig>,
+    }
+
+    #[derive(Default, Serialize)]
+    struct KeysRef<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel: Option<&'a ChannelConfig>,
+    }
+
+    pub fn serialize<S: Serializer>(adapter: &Option<Adapter>, s: S) -> Result<S::Ok, S::Error> {
+        let keys = match adapter {
+            Some(Adapter::Thread(thread)) => KeysRef {
+                thread: Some(thread),
+                ..KeysRef::default()
+            },
+            Some(Adapter::Channel(channel)) => KeysRef {
+                channel: Some(channel),
+                ..KeysRef::default()
+            },
+            None => KeysRef::default(),
+        };
+        keys.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Adapter>, D::Error> {
+        match Keys::deserialize(d)? {
+            Keys {
+                thread: Some(_),
+                channel: Some(_),
+            } => Err(D::Error::custom(
+                "a system takes a `thread` or a `channel`, not both",
+            )),
+            Keys {
+                thread: Some(thread),
+                ..
+            } => Ok(Some(Adapter::Thread(thread))),
+            Keys {
+                channel: Some(channel),
+                ..
+            } => Ok(Some(Adapter::Channel(channel))),
+            Keys { .. } => Ok(None),
+        }
+    }
+}
+
+/// Whether a channel's system is executed each cycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    #[default]
+    Running,
+    Stopped,
 }
 
 impl SystemConfig {
@@ -60,7 +146,7 @@ impl SystemConfig {
             params: serde_json::Value::Null,
             inputs: Vec::new(),
             outputs: Vec::new(),
-            thread: None,
+            adapter: None,
         }
     }
 }
@@ -177,6 +263,65 @@ mod tests {
             serde_json::from_str::<SystemConfig>(&text).expect("round trips"),
             full
         );
+    }
+
+    fn adapter_of(text: &str) -> Result<Option<Adapter>, serde_json::Error> {
+        serde_json::from_str::<SystemConfig>(text).map(|system| system.adapter)
+    }
+
+    #[test]
+    fn test_adapter_forms_round_trip() {
+        let thread = SystemConfig {
+            adapter: Some(Adapter::Thread("gps".into())),
+            ..SystemConfig::new("a", "t")
+        };
+        let channel = SystemConfig {
+            adapter: Some(Adapter::Channel(ChannelConfig {
+                name: "mode".into(),
+                start: RunState::Stopped,
+            })),
+            ..SystemConfig::new("a", "t")
+        };
+        for system in [SystemConfig::new("a", "t"), thread, channel] {
+            let text = serde_json::to_string(&system).expect("serializable");
+            assert_eq!(
+                serde_json::from_str::<SystemConfig>(&text).expect("round trips"),
+                system
+            );
+        }
+        let text = serde_json::to_string(&SystemConfig::new("a", "t")).expect("serializable");
+        assert!(
+            !text.contains("thread") && !text.contains("channel"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_adapter_keys_parse() {
+        assert_eq!(adapter_of(r#"{"id":"a","ty":"t"}"#).unwrap(), None);
+        assert_eq!(
+            adapter_of(r#"{"id":"a","ty":"t","thread":"gps"}"#).unwrap(),
+            Some(Adapter::Thread("gps".into()))
+        );
+        assert_eq!(
+            adapter_of(r#"{"id":"a","ty":"t","channel":{"name":"m"}}"#).unwrap(),
+            Some(Adapter::Channel(ChannelConfig {
+                name: "m".into(),
+                start: RunState::Running,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_reject_bad_adapter() {
+        for text in [
+            r#"{"id":"a","ty":"t","thread":"gps","channel":{"name":"m"}}"#,
+            r#"{"id":"a","ty":"t","thread":5}"#,
+            r#"{"id":"a","ty":"t","channel":{"nam":"m"}}"#,
+            r#"{"id":"a","ty":"t","channel":{"name":"m","start":"paused"}}"#,
+        ] {
+            assert!(adapter_of(text).is_err(), "{text}");
+        }
     }
 
     #[test]

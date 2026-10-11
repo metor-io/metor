@@ -1,27 +1,43 @@
 //! `#[system]` on a free fn: rewrites `fn nav(..)` into `fn nav() -> impl
 //! SystemFn`, or `impl AsyncSystemFn` for an `async fn` ending in `stop: Stop`.
+//! `#[sequence]` on an `async fn` rewrites it into `impl SequenceFn`.
 //!
-//! The attribute reads parameter identifiers and doc comments. It never
-//! classifies a type; each parameter type's `Param` impl does that.
+//! The attribute reads parameter identifiers and doc comments. It classifies
+//! no type beyond refusing the few that belong to the other kind of fn; each
+//! parameter type's `Param` impl does the rest. A sequence's `Seq` and its
+//! parameters' elided lifetimes are named `'__seq`, the brand's lifetime.
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{ToTokens, format_ident, quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
+use syn::visit_mut::{self, VisitMut};
 use syn::{
-    Attribute, Expr, ExprLit, FnArg, Generics, Ident, Item, ItemFn, Lifetime, Lit, Meta, Pat,
-    ReturnType, Signature, Type, TypeImplTrait, TypeParamBound,
+    Attribute, Expr, ExprLit, FnArg, GenericArgument, Generics, Ident, Item, ItemFn, Lifetime, Lit,
+    Meta, Pat, PathArguments, ReturnType, Signature, Type, TypeImplTrait, TypeParamBound, TypePath,
 };
+
+/// Which attribute is expanding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    System,
+    Sequence,
+}
 
 /// Expands `#[system]`.
 pub fn system(item: TokenStream) -> TokenStream {
-    expand(item.into(), &crate::fsw_crate()).into()
+    expand(item.into(), &crate::fsw_crate(), Kind::System).into()
 }
 
-fn expand(item: TokenStream2, fsw: &TokenStream2) -> TokenStream2 {
+/// Expands `#[sequence]`.
+pub fn sequence(item: TokenStream) -> TokenStream {
+    expand(item.into(), &crate::fsw_crate(), Kind::Sequence).into()
+}
+
+fn expand(item: TokenStream2, fsw: &TokenStream2, kind: Kind) -> TokenStream2 {
     match syn::parse2::<Item>(item) {
-        Ok(Item::Fn(f)) => expand_fn(f, fsw),
+        Ok(Item::Fn(f)) => expand_fn(f, fsw, kind),
         Ok(Item::Impl(block)) => {
             let err = syn::Error::new_spanned(
                 &block.self_ty,
@@ -49,8 +65,9 @@ struct Arg {
     ty: Type,
 }
 
-/// A checked `#[system]` fn signature.
+/// A checked `#[system]` or `#[sequence]` fn signature.
 struct Sig {
+    kind: Kind,
     args: Vec<Arg>,
     /// The index of the `#[state]` parameter.
     state: Option<usize>,
@@ -59,23 +76,29 @@ struct Sig {
 }
 
 impl Sig {
-    fn parse(sig: &Signature, states: &[(usize, Attribute)]) -> syn::Result<Self> {
+    fn parse(sig: &Signature, states: &[(usize, Attribute)], kind: Kind) -> syn::Result<Self> {
         check_generics(&sig.generics)?;
-        check_output(&sig.output)?;
+        match kind {
+            Kind::System => check_output(&sig.output)?,
+            Kind::Sequence => check_sequence_output(sig)?,
+        }
         let args = sig
             .inputs
             .iter()
             .map(arg)
             .collect::<syn::Result<Vec<_>>>()?;
+        check_kinds(&args, kind)?;
         let state = state(&args, states)?;
-        let stop = sig.asyncness.is_some();
-        if stop && !ends_in_stop(&args, state) {
-            return Err(syn::Error::new_spanned(
-                sig,
-                "an async `#[system]` fn takes `stop: Stop` as its last parameter",
-            ));
-        }
-        Ok(Self { args, state, stop })
+        let stop = match kind {
+            Kind::System => system_stop(sig, &args, state)?,
+            Kind::Sequence => sequence_stop(sig, &args, state)?,
+        };
+        Ok(Self {
+            kind,
+            args,
+            state,
+            stop,
+        })
     }
 
     /// The parameters that are ports, in order.
@@ -154,6 +177,67 @@ fn state(args: &[Arg], states: &[(usize, Attribute)]) -> syn::Result<Option<usiz
     }
 }
 
+/// Whether an async `#[system]` fn ends in `stop`, which it must.
+fn system_stop(sig: &Signature, args: &[Arg], state: Option<usize>) -> syn::Result<bool> {
+    let stop = sig.asyncness.is_some();
+    if stop && !ends_in_stop(args, state) {
+        return Err(syn::Error::new_spanned(
+            sig,
+            "an async `#[system]` fn takes `stop: Stop` as its last parameter",
+        ));
+    }
+    Ok(stop)
+}
+
+/// A `#[sequence]` fn is async and hears abort through its `Seq`, not `stop`.
+fn sequence_stop(sig: &Signature, args: &[Arg], state: Option<usize>) -> syn::Result<bool> {
+    if sig.asyncness.is_none() {
+        return Err(syn::Error::new_spanned(
+            sig.fn_token,
+            "a `#[sequence]` fn is `async`",
+        ));
+    }
+    if let Some(last) = args.last().filter(|_| ends_in_stop(args, state)) {
+        return Err(syn::Error::new_spanned(
+            &last.ty,
+            "a `#[sequence]` fn takes no `stop`; `seq.aborted()` and its waits report an abort",
+        ));
+    }
+    Ok(false)
+}
+
+/// Refuses the parameter types that belong to the other kind of fn.
+fn check_kinds(args: &[Arg], kind: Kind) -> syn::Result<()> {
+    let refused: &[(&str, &str)] = match kind {
+        Kind::System => &[("Seq", "a `Seq` parameter belongs on a `#[sequence]` fn")],
+        Kind::Sequence => &[
+            (
+                "Timestamp",
+                "a `#[sequence]` fn reads the time with `seq.now()`",
+            ),
+            (
+                "Abort",
+                "a `#[sequence]` fn hears an abort through its `Seq`",
+            ),
+        ],
+    };
+    for arg in args {
+        if let Some((_, message)) = refused.iter().find(|(name, _)| names(&arg.ty, name)) {
+            return Err(syn::Error::new_spanned(&arg.ty, *message));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `ty`, behind any references, is a path ending in `name`.
+fn names(ty: &Type, name: &str) -> bool {
+    match ty {
+        Type::Reference(r) => names(&r.elem, name),
+        Type::Path(path) => path.path.segments.last().is_some_and(|s| s.ident == name),
+        _ => false,
+    }
+}
+
 fn ends_in_stop(args: &[Arg], state: Option<usize>) -> bool {
     let Some(last) = args.len().checked_sub(1) else {
         return false;
@@ -178,6 +262,17 @@ fn check_output(output: &ReturnType) -> syn::Result<()> {
         _ => Ok(()),
     }
 }
+
+/// A `#[sequence]` fn returns `Result<(), SeqError>`.
+fn check_sequence_output(sig: &Signature) -> syn::Result<()> {
+    match &sig.output {
+        ReturnType::Type(_, ty) if names(ty, "Result") => Ok(()),
+        ReturnType::Type(_, ty) => Err(syn::Error::new_spanned(ty, SEQUENCE_OUTPUT)),
+        ReturnType::Default => Err(syn::Error::new_spanned(&sig.ident, SEQUENCE_OUTPUT)),
+    }
+}
+
+const SEQUENCE_OUTPUT: &str = "a `#[sequence]` fn returns `Result<(), SeqError>`";
 
 const NAMED_LIFETIME: &str = "`#[system]` parameters take no named lifetimes";
 
@@ -209,11 +304,17 @@ impl<'ast> Visit<'ast> for TypeCheck {
 }
 
 /// Rewrites a fn, or emits it without its `#[state]` attributes plus the error.
-fn expand_fn(mut f: ItemFn, fsw: &TokenStream2) -> TokenStream2 {
+fn expand_fn(mut f: ItemFn, fsw: &TokenStream2, kind: Kind) -> TokenStream2 {
     let states = take_states(&mut f.sig);
-    match Sig::parse(&f.sig, &states) {
+    match Sig::parse(&f.sig, &states, kind) {
         Ok(sig) => emit(f, &sig, fsw),
-        Err(e) => with_error(f, e),
+        Err(e) => {
+            // An `async fn` cannot elide `Seq`'s lifetime.
+            if kind == Kind::Sequence {
+                brand(&mut f.sig);
+            }
+            with_error(f, e)
+        }
     }
 }
 
@@ -245,7 +346,12 @@ fn emit(f: ItemFn, sig: &Sig, fsw: &TokenStream2) -> TokenStream2 {
     let type_params = f.sig.generics.type_params().map(|p| &p.ident);
     let state_ty = sig.state_ty();
     let fn_ptr = fn_ptr(sig);
-    let (bound, call) = if sig.stop {
+    let (bound, call) = if sig.kind == Kind::Sequence {
+        (
+            quote!(#fsw::SequenceFn<State = #state_ty>),
+            sequence_call(sig, &generics, fsw),
+        )
+    } else if sig.stop {
         (
             quote!(#fsw::AsyncSystemFn<State = #state_ty>),
             async_call(sig, &generics, fsw),
@@ -257,13 +363,17 @@ fn emit(f: ItemFn, sig: &Sig, fsw: &TokenStream2) -> TokenStream2 {
         )
     };
     let ports = ports_impl(sig, &name.to_string(), &doc, &generics, fsw);
+    let mut body_sig = Signature {
+        ident: format_ident!("__metor_body"),
+        ..f.sig.clone()
+    };
+    if sig.kind == Kind::Sequence {
+        brand(&mut body_sig);
+    }
     let body = ItemFn {
         attrs: inner,
         vis: syn::Visibility::Inherited,
-        sig: Signature {
-            ident: format_ident!("__metor_body"),
-            ..f.sig.clone()
-        },
+        sig: body_sig,
         block: f.block,
     };
     quote! {
@@ -394,6 +504,29 @@ fn async_call(sig: &Sig, generics: &Generics, fsw: &TokenStream2) -> TokenStream
     }
 }
 
+fn sequence_call(sig: &Sig, generics: &Generics, fsw: &TokenStream2) -> TokenStream2 {
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let CallParts {
+        state,
+        items,
+        asserts,
+        body,
+    } = call_parts(sig, generics, fsw);
+    let state_ty = sig.state_ty();
+    let brand = brand_lifetime();
+    quote! {
+        impl #impl_generics #fsw::SequenceFn for __MetorSystem #ty_generics #where_clause {
+            async fn call<#brand>(
+                #state: &#brand mut #state_ty,
+                #items: <Self::Params as #fsw::Param>::Item<#brand, #fsw::ring::NoWake>,
+            ) -> ::core::result::Result<(), #fsw::SeqError> {
+                #asserts
+                #body.await
+            }
+        }
+    }
+}
+
 /// Joins the doc comment lines, each without its leading space.
 fn doc(attrs: &[Attribute]) -> String {
     attrs
@@ -414,11 +547,89 @@ fn doc(attrs: &[Attribute]) -> String {
         .join("\n")
 }
 
-/// Strips one outer `&mut`, so `&mut Input<T>` and `Input<T>` share a key.
+/// Strips one outer reference, so `&mut Input<T>`, `&Seq`, and `Input<T>`
+/// name their `Param` alike. A `Seq` keys as `Seq<'static>`.
 fn key_type(ty: &Type) -> Type {
-    match ty {
-        Type::Reference(r) if r.mutability.is_some() => (*r.elem).clone(),
+    let key = match ty {
+        Type::Reference(r) => (*r.elem).clone(),
         other => other.clone(),
+    };
+    match &key {
+        Type::Path(path) if is_seq(path) => {
+            let mut path = path.clone();
+            set_seq_lifetime(&mut path, &Lifetime::new("'static", Span::call_site()));
+            Type::Path(path)
+        }
+        _ => key,
+    }
+}
+
+/// The lifetime a sequence body's elided lifetimes and its `Seq` share.
+fn brand_lifetime() -> Lifetime {
+    Lifetime::new("'__seq", Span::call_site())
+}
+
+/// Names every elided lifetime in a sequence body's parameters, and its
+/// `Seq`'s, `'__seq`, so a redline's condition may borrow any parameter.
+fn brand(sig: &mut Signature) {
+    let lifetime = brand_lifetime();
+    sig.generics.params.insert(
+        0,
+        syn::GenericParam::Lifetime(syn::LifetimeParam::new(lifetime.clone())),
+    );
+    let mut brander = Brander(lifetime);
+    for input in &mut sig.inputs {
+        if let FnArg::Typed(typed) = input {
+            brander.visit_type_mut(&mut typed.ty);
+        }
+    }
+}
+
+struct Brander(Lifetime);
+
+impl VisitMut for Brander {
+    fn visit_type_reference_mut(&mut self, r: &mut syn::TypeReference) {
+        if r.lifetime.is_none() {
+            r.lifetime = Some(self.0.clone());
+        }
+        visit_mut::visit_type_reference_mut(self, r);
+    }
+
+    fn visit_lifetime_mut(&mut self, lt: &mut Lifetime) {
+        if lt.ident == "_" {
+            *lt = self.0.clone();
+        }
+    }
+
+    fn visit_type_path_mut(&mut self, path: &mut TypePath) {
+        if is_seq(path) {
+            set_seq_lifetime(path, &self.0);
+        }
+        visit_mut::visit_type_path_mut(self, path);
+    }
+}
+
+/// Whether `path` is `Seq` or `Seq<'_>`, whose lifetime the macro names.
+fn is_seq(path: &TypePath) -> bool {
+    let Some(last) = path.path.segments.last() else {
+        return false;
+    };
+    if path.qself.is_some() || last.ident != "Seq" {
+        return false;
+    }
+    match &last.arguments {
+        PathArguments::None => true,
+        PathArguments::AngleBracketed(args) => {
+            args.args.len() == 1
+                && matches!(args.args.first(), Some(GenericArgument::Lifetime(lt)) if lt.ident == "_")
+        }
+        PathArguments::Parenthesized(_) => false,
+    }
+}
+
+fn set_seq_lifetime(path: &mut TypePath, lifetime: &Lifetime) {
+    if let Some(last) = path.path.segments.last_mut() {
+        last.arguments = PathArguments::AngleBracketed(syn::parse_quote!(<#lifetime>));
     }
 }
 

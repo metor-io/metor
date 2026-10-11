@@ -16,7 +16,7 @@ use crate::coordinator::{
     BuildError, CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable,
 };
 use crate::log::Log;
-use crate::port::{Input, Output, ring_capacity};
+use crate::port::{Input, Output, Sample, ring_capacity};
 use crate::tests::utils::{
     Control, Imu, Nav, NoParams, static_async_def, static_def, static_inputs, static_outputs,
 };
@@ -707,7 +707,7 @@ fn test_async_and_cyclic_ports_match() {
 #[test]
 fn test_async_adapter_relay() {
     use crate::coordinator::MakeCx;
-    use crate::thread::{DEFAULT_THREAD, Threads};
+    use crate::thread::Threads;
 
     let mut table = SystemTable::new();
     table
@@ -720,7 +720,7 @@ fn test_async_adapter_relay() {
     );
 
     let (imu, nav, log) = (ring::<Imu>(), ring::<Nav>(), ring::<LogEvent>());
-    let mut source = Output::<Imu, _>::try_new(imu.writer(NoWake).expect("free writer"))
+    let source = Output::<Imu, _>::try_new(imu.writer(NoWake).expect("free writer"))
         .expect("supported alignment");
     let mut estimates = Input::<Nav>::try_new(vec![nav.view(NoWake).expect("free slot")])
         .expect("supported alignment");
@@ -731,7 +731,7 @@ fn test_async_adapter_relay() {
     let def = entry.def.clone();
     let mut step = (entry.make)(MakeCx {
         id: "relay",
-        thread: DEFAULT_THREAD,
+        adapter: None,
         def: &def,
         params: crate::coordinator::Params(&json!(null)),
         inputs: vec![vec![&imu]],
@@ -811,4 +811,85 @@ fn test_reject_multiple_dynamic_producers() {
             port: "plant.imu".into()
         })
     );
+}
+
+/// Publishes the cycle count as a sample.
+#[crate::system]
+fn counting(#[state] tick: &mut i64, imu: &mut Output<Imu>) {
+    *tick += 1;
+    let _ = imu.write(&Imu::new(*tick, *tick as f64));
+}
+
+/// Keeps each cycle's sample for the test.
+struct Samples(Rc<RefCell<Vec<Option<f64>>>>);
+
+#[crate::system]
+fn sampling(#[state] s: &mut Samples, imu: &Sample<Imu>) {
+    s.0.borrow_mut().push(imu.get().map(|imu| imu.sample));
+}
+
+/// A `Sample` sees the record its producer wrote earlier in the cycle.
+#[test]
+fn test_sample_sees_this_cycle() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let state = seen.clone();
+    let mut table = SystemTable::new();
+    table
+        .register("counting", counting(), i64::default)
+        .expect("valid records");
+    table
+        .register("sampling", sampling(), move || Samples(state.clone()))
+        .expect("valid records");
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("count", "counting"),
+            SystemConfig {
+                inputs: vec![InputConfig {
+                    port: "imu".into(),
+                    from: vec![PortRef::new("count", "imu")],
+                }],
+                ..SystemConfig::new("sample", "sampling")
+            },
+        ],
+        ..Default::default()
+    };
+    let mut coordinator = config.build(&table).expect("valid");
+    coordinator.step(Timestamp(1));
+    coordinator.step(Timestamp(2));
+    assert_eq!(*seen.borrow(), [Some(1.0), Some(2.0)]);
+    assert_eq!(
+        def_of(sampling()).inputs,
+        vec![Input::<Imu>::def(&DefCx::empty(), "imu")]
+    );
+}
+
+/// Waits for `stop`, holding a sample no step would take.
+#[crate::system]
+async fn sampling_async(imu: &Sample<Imu>, stop: Stop) {
+    let _ = imu;
+    stop.wait().await;
+}
+
+/// An async `#[system]` fn's definition under `cx`.
+fn async_def_in<S: AsyncSystemFn>(_: S, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+    FnAsyncSystem::<S>::def(cx)
+}
+
+#[test]
+fn test_async_sample_refused() {
+    let refused = DefError::SampleOnAsync {
+        system: "sampling_async".into(),
+    };
+    assert_eq!(
+        async_def_in(sampling_async(), &DefCx::empty()),
+        Err(refused)
+    );
+    let mut table = SystemTable::new();
+    assert!(matches!(
+        table.register_async("sampling_async", sampling_async(), Default::default),
+        Err(BuildError::Def {
+            source: DefError::SampleOnAsync { .. },
+            ..
+        })
+    ));
 }

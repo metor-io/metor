@@ -1,0 +1,5 @@
+error: a `#[sequence]` fn returns `Result<(), SeqError>`
+ --> tests/ui/sequence_bad_return.rs:4:10
+  |
+4 | async fn arm(seq: &Seq) {
+  |          ^^^

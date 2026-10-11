@@ -157,7 +157,7 @@ fn report_unannounced(inbox: &Inbox, tables: &[(PacketId, String)], log: &mut Lo
 fn report(
     status: &LinkStatus,
     reported: &mut LinkStatus,
-    link_status: &mut Output<LinkStatus>,
+    link_status: &Output<LinkStatus>,
     log: &mut Log,
 ) {
     if status.inbound_dropped > reported.inbound_dropped {

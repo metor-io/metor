@@ -32,7 +32,7 @@ fn test_mirror_drain_snapshot() {
         capacity: 256,
         max_readers: 1,
     });
-    let mut writer = source.writer(NoWake).expect("writer");
+    let writer = source.writer(NoWake).expect("writer");
     let mut received = target.view(NoWake).expect("reader");
     let mut mirror = super::Mirror {
         port: "out".into(),
@@ -66,7 +66,7 @@ fn test_mirror_drain_snapshot() {
 /// A system on a named thread, or the shared one when `thread` is `None`.
 fn placed(id: &str, ty: &str, thread: Option<&str>) -> SystemConfig {
     SystemConfig {
-        thread: thread.map(str::to_string),
+        adapter: thread.map(|thread| crate::Adapter::Thread(thread.to_string())),
         ..SystemConfig::new(id, ty)
     }
 }
@@ -283,4 +283,62 @@ fn test_reject_cyclic_thread_placement() {
             thread: "io".into(),
         })
     );
+}
+
+fn channel(id: &str, ty: &str, name: &str) -> SystemConfig {
+    SystemConfig {
+        adapter: Some(crate::Adapter::Channel(crate::ChannelConfig {
+            name: name.into(),
+            start: crate::RunState::Running,
+        })),
+        ..SystemConfig::new(id, ty)
+    }
+}
+
+#[test]
+fn test_reject_channel_on_async() {
+    let config = CoordinatorConfig {
+        systems: vec![channel("sleeper", "sleeper", "mode")],
+        ..Default::default()
+    };
+    assert_eq!(
+        config.build(&table(&Recorder::default())).err(),
+        Some(BuildError::ChannelOnAsync {
+            id: "sleeper".into(),
+            channel: "mode".into(),
+        })
+    );
+}
+
+#[test]
+fn test_reject_bad_channel_names() {
+    let long = "c".repeat(metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP + 1);
+    let config = CoordinatorConfig {
+        systems: vec![channel("imu", "imu", &long)],
+        ..Default::default()
+    };
+    assert!(matches!(
+        config.build(&table(&Recorder::default())).err(),
+        Some(BuildError::ChannelName { .. })
+    ));
+    let config = CoordinatorConfig {
+        systems: vec![channel("a", "imu", "mode"), channel("b", "imu", "mode")],
+        ..Default::default()
+    };
+    assert_eq!(
+        config.build(&table(&Recorder::default())).err(),
+        Some(BuildError::DuplicateChannel {
+            name: "mode".into()
+        })
+    );
+}
+
+#[test]
+fn test_cyclic_channel_at_cap_builds() {
+    let name = "c".repeat(metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP);
+    let config = CoordinatorConfig {
+        systems: vec![channel("imu", "imu", &name)],
+        ..Default::default()
+    };
+    assert!(config.build(&table(&Recorder::default())).is_ok());
 }

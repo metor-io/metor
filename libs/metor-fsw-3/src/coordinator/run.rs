@@ -14,19 +14,20 @@ use crate::system::System;
 use super::Coordinator;
 use super::config::Clock;
 use super::status::SystemStatus;
+use super::step::{EndReason, Step};
 
-/// A bound system, stepped once per cycle with the system type erased.
-pub trait Step {
-    fn execute(&mut self, now: Timestamp);
-
-    /// Called once after `execute` panicked, with the payload's message.
-    fn fault(&mut self, _now: Timestamp, _message: &str) {}
-
-    /// Whether the step latched itself off, as one across an ABI does.
-    fn latched(&self) -> bool {
-        false
-    }
+/// What one [`catch_step`] call did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stepped {
+    Ran,
+    /// The step reports an end, before or after this call's execute.
+    Ended,
+    /// The step panicked and was dropped, now or on an earlier call.
+    Unwound,
 }
+
+/// The end an entry whose step unwound reports.
+const UNWOUND: &EndReason = &EndReason::Panicked;
 
 pub(crate) struct Runner<S: System> {
     pub system: S,
@@ -46,31 +47,28 @@ impl<S: System> Step for Runner<S> {
     }
 }
 
-/// Executes once, reporting a fault and retiring the runner on failure.
-pub(crate) fn catch_step(slot: &mut Option<Box<dyn Step>>, now: Timestamp) -> bool {
+/// Executes a step that has not ended, faulting and dropping it if it panics.
+pub(crate) fn catch_step(slot: &mut Option<Box<dyn Step>>, now: Timestamp) -> Stepped {
     let Some(step) = slot.as_mut() else {
-        return false;
+        return Stepped::Unwound;
     };
-    // PANIC Safety: a failed step is faulted once and removed before returning.
+    // PANIC Safety: a panicking step is faulted once and removed before returning.
     let result = catch_unwind(AssertUnwindSafe(|| {
-        if step.latched() {
-            return false;
+        if step.ended().is_none() {
+            step.execute(now);
         }
-        step.execute(now);
-        !step.latched()
+        step.ended().is_some()
     }));
-    let healthy = match result {
-        Ok(healthy) => healthy,
+    match result {
+        Ok(false) => Stepped::Ran,
+        Ok(true) => Stepped::Ended,
         Err(payload) => {
             crate::panic::catch(|| step.fault(now, message_of(&*payload)));
             crate::panic::discard(payload);
-            false
+            crate::panic::catch(|| drop(slot.take()));
+            Stepped::Unwound
         }
-    };
-    if !healthy {
-        crate::panic::catch(|| drop(slot.take()));
     }
-    healthy
 }
 
 pub(crate) fn message_of(payload: &(dyn Any + Send)) -> &str {
@@ -135,18 +133,22 @@ impl Coordinator {
 }
 
 impl super::Entry {
-    pub(super) fn latched(&self) -> bool {
-        self.step.is_none()
+    /// How this entry's step ended, including by unwinding out of it.
+    pub(super) fn ended(&self) -> Option<&EndReason> {
+        match &self.step {
+            Some(step) => step.ended(),
+            None => Some(UNWOUND),
+        }
     }
 
     fn run(&mut self, now: Timestamp) -> Duration {
-        if self.latched() {
+        if self.ended().is_some() {
             return Duration::ZERO;
         }
         let started = Instant::now();
-        let healthy = catch_step(&mut self.step, now);
+        let stepped = catch_step(&mut self.step, now);
         let elapsed = started.elapsed();
-        if !healthy {
+        if stepped != Stepped::Ran && self.ended() == Some(UNWOUND) {
             crate::panic::catch(|| tracing::error!(system = self.name, "system panicked"));
         }
         elapsed
@@ -375,8 +377,9 @@ mod tests {
         }
         assert_eq!(message_of(&7u8), "panic");
         let mut step: Option<Box<dyn Step>> = Some(Box::new(Odd));
-        assert!(!catch_step(&mut step, Timestamp(0)));
+        assert_eq!(catch_step(&mut step, Timestamp(0)), Stepped::Unwound);
         assert!(step.is_none());
+        assert_eq!(catch_step(&mut step, Timestamp(1)), Stepped::Unwound);
     }
 
     #[test]
@@ -388,7 +391,34 @@ mod tests {
             }
         }
         let mut step: Option<Box<dyn Step>> = Some(Box::new(Clean(0)));
-        assert!(catch_step(&mut step, Timestamp(0)));
+        assert_eq!(catch_step(&mut step, Timestamp(0)), Stepped::Ran);
+        assert!(step.is_some());
+    }
+
+    /// Counts its cycles and ends after the second.
+    struct Twice(std::rc::Rc<core::cell::Cell<u64>>, Option<EndReason>);
+
+    impl Step for Twice {
+        fn execute(&mut self, _now: Timestamp) {
+            self.0.set(self.0.get() + 1);
+            if self.0.get() == 2 {
+                self.1 = Some(EndReason::Completed);
+            }
+        }
+
+        fn ended(&self) -> Option<&EndReason> {
+            self.1.as_ref()
+        }
+    }
+
+    #[test]
+    fn test_catch_step_keeps_ended_step() {
+        let runs = std::rc::Rc::default();
+        let mut step: Option<Box<dyn Step>> = Some(Box::new(Twice(Clone::clone(&runs), None)));
+        assert_eq!(catch_step(&mut step, Timestamp(0)), Stepped::Ran);
+        assert_eq!(catch_step(&mut step, Timestamp(1)), Stepped::Ended);
+        assert_eq!(catch_step(&mut step, Timestamp(2)), Stepped::Ended);
+        assert_eq!(runs.get(), 2);
         assert!(step.is_some());
     }
 

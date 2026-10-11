@@ -6,7 +6,8 @@ use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
     DefCx, DefError, DynInputs, Frame, Input, InputBinding, Output, OutputBinding, PortDef, Record,
-    Stop, System, SystemDef, SystemInputs, SystemOutputs, SystemTable, Timestamp, system,
+    Seq, SeqError, Stop, System, SystemDef, SystemInputs, SystemOutputs, SystemTable, Timestamp,
+    sequence, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -179,7 +180,7 @@ impl System for Retained {
 
 fn release_retained() -> Option<u32> {
     let mut input = RETAINED_INPUT.with(|slot| slot.borrow_mut().take())?;
-    let mut output = RETAINED_OUTPUT.with(|slot| slot.borrow_mut().take())?;
+    let output = RETAINED_OUTPUT.with(|slot| slot.borrow_mut().take())?;
     let n = input.latest().ok()??.n;
     output.write(&Ping { n }).ok()?;
     Some(n)
@@ -197,6 +198,69 @@ fn gain(#[state] s: &mut Gain, input: &mut Input<Ping>, output: &mut Output<Ping
         let n = (f64::from(ping.n) * s.0) as u32;
         let _ = output.write(&Ping { n });
     }
+}
+
+/// Pings one, two, and three on successive cycles, then completes.
+#[sequence]
+async fn count_up(
+    seq: &Seq,
+    input: &mut Input<Ping>,
+    output: &mut Output<Ping>,
+) -> Result<(), SeqError> {
+    let _ = input;
+    for n in 1..=3 {
+        let _ = output.write(&Ping { n });
+        seq.next_cycle().await;
+    }
+    Ok(())
+}
+
+/// Pings zero, then waits until aborted.
+#[sequence]
+async fn count_down(
+    seq: &Seq,
+    input: &mut Input<Ping>,
+    output: &mut Output<Ping>,
+) -> Result<(), SeqError> {
+    let _ = input;
+    let _ = output.write(&Ping { n: 0 });
+    seq.sleep(core::time::Duration::from_secs(3600)).await
+}
+
+/// `count_by`'s params.
+#[derive(Deserialize, JsonSchema)]
+pub struct StrideParams {
+    /// The step between pings; zero is refused.
+    pub by: u32,
+}
+
+/// Counts in strides of `by`.
+pub struct Stride(u32);
+
+impl Stride {
+    fn new(params: StrideParams) -> Result<Self, metor_fsw_3::ParamError> {
+        if params.by == 0 {
+            return Err(metor_fsw_3::ParamError::Decode("`by` is zero".into()));
+        }
+        Ok(Self(params.by))
+    }
+}
+
+/// Pings three strides on successive cycles, then completes; `count_up`'s
+/// ports, with a constructor that can refuse.
+#[sequence]
+async fn count_by(
+    #[state] s: &mut Stride,
+    seq: &Seq,
+    input: &mut Input<Ping>,
+    output: &mut Output<Ping>,
+) -> Result<(), SeqError> {
+    let _ = input;
+    for n in 1..=3 {
+        let _ = output.write(&Ping { n: n * s.0 });
+        seq.next_cycle().await;
+    }
+    Ok(())
 }
 
 /// The table this pack exports.
@@ -233,6 +297,15 @@ pub fn pack() -> SystemTable {
         .expect("valid records");
     table
         .register_system("retained", |_| Ok((Retained, ())))
+        .expect("valid records");
+    table
+        .register_sequence("count_up", count_up(), Default::default)
+        .expect("valid records");
+    table
+        .register_sequence("count_down", count_down(), Default::default)
+        .expect("valid records");
+    table
+        .register_sequence("count_by", count_by(), Stride::new)
         .expect("valid records");
     table
 }

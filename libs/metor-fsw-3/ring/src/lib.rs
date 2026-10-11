@@ -37,6 +37,8 @@ use region::*;
 
 use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use crate::sync::{Arc, AtomicU64, fence};
+use core::cell::Cell;
+use core::marker::PhantomData;
 #[cfg(all(test, not(ring_loom)))]
 use std::cell::UnsafeCell;
 
@@ -226,6 +228,8 @@ impl core::fmt::Display for AttachError {
 impl std::error::Error for AttachError {}
 
 /// Notifies readers after data or wrap padding is published.
+///
+/// A write notifies last, once its state is final, so `notify` may write again.
 pub trait WakeSource {
     fn notify(&self);
 }
@@ -605,6 +609,7 @@ impl RingBuffer {
         Ok(Writer {
             inner: self.inner.clone(),
             data,
+            _unsync: PhantomData,
         })
     }
 
@@ -705,16 +710,30 @@ pub fn checked_region_len(cfg: &Config) -> Option<usize> {
 }
 
 /// The region's sole writer. Dropping it releases the shared writer claim.
+///
+/// `Writer` is `Send` but not `Sync`, so writes through `&Writer` never overlap:
+///
+/// ```compile_fail
+/// use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+///
+/// let ring = RingBuffer::create_in_memory(Config { capacity: 1024, max_readers: 1 });
+/// let writer = ring.writer(NoWake).unwrap();
+/// std::thread::scope(|s| {
+///     s.spawn(|| writer.try_write(b"a"));
+///     writer.try_write(b"b")
+/// });
+/// ```
 pub struct Writer<WD: WakeSource> {
     inner: Arc<Inner>,
     data: WD,
+    _unsync: PhantomData<Cell<()>>,
 }
 
 impl<WD: WakeSource> Writer<WD> {
     /// Publish one record without blocking.
     /// Returns [`WriteError::WouldBlock`] if readers pin the required space.
     /// A blocked write may publish wrap padding, but never a payload.
-    pub fn try_write(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
+    pub fn try_write(&self, bytes: &[u8]) -> Result<(), WriteError> {
         let rec = checked_frame_len(bytes.len(), self.inner.geometry.capacity)?;
         let mut c = self.inner.control().committed.load(Relaxed); // sole writer
         let (start_abs, mut gap) = reserve(c, rec, self.inner.geometry.capacity);
@@ -724,10 +743,10 @@ impl<WD: WakeSource> Writer<WD> {
             }
             self.inner.control().hwm.store(c, Release);
             self.inner.control().committed.store(start_abs, Release);
-            self.data.notify();
             c = start_abs;
             gap = 0;
             if !self.fits(c, rec) {
+                self.data.notify();
                 return Err(WriteError::WouldBlock);
             }
         }

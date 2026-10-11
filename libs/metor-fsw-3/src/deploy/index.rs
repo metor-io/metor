@@ -151,6 +151,27 @@ impl<'a> DefIndex<'a> {
         })
     }
 
+    /// The records target `target`'s table knows.
+    pub(crate) fn records(&self, target: usize) -> &Records {
+        &self.records[target]
+    }
+
+    /// Each config edge into the system at `at` and the definition feeding
+    /// it, less the channel's own `commands`.
+    pub(crate) fn edges(&mut self, at: At) -> Result<Vec<(String, PortDef)>, DeployError> {
+        let system = &self.envelope.targets[at.target].coordinator.systems[at.system];
+        let mut edges = Vec::new();
+        for input in &system.inputs {
+            if input.port == crate::channel::COMMANDS_PORT {
+                continue;
+            }
+            for from in &input.from {
+                edges.push((input.port.clone(), self.output(at, from)?));
+            }
+        }
+        Ok(edges)
+    }
+
     /// The system's config with every peer output replaced by its definition.
     fn resolved_outputs(
         &mut self,

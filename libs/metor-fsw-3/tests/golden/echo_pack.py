@@ -12,7 +12,7 @@ PACK = Pack(
     id="echo",
     lib="echo_pack",
     libs=str(Path(__file__).resolve().parent / "_libs"),
-    abi_version=8,
+    abi_version=9,
 )
 
 
@@ -169,6 +169,55 @@ class Retained(System):
 
     def __init__(self, *, input: Sources[Ping] = ()) -> None:
         super().__init__({"input": input}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class CountUp(System):
+    "Pings one, two, and three on successive cycles, then completes."
+
+    _pack = PACK
+    _ty = "count_up"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, input: Sources[Ping] = ()) -> None:
+        super().__init__({"input": input}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class CountDown(System):
+    "Pings zero, then waits until aborted."
+
+    _pack = PACK
+    _ty = "count_down"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, input: Sources[Ping] = ()) -> None:
+        super().__init__({"input": input}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class CountBy(System):
+    "Pings three strides on successive cycles, then completes; `count_up`'s\nports, with a constructor that can refuse."
+
+    _pack = PACK
+    _ty = "count_by"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, input: Sources[Ping] = (), by: int) -> None:
+        """
+        Args:
+            by: The step between pings; zero is refused.
+        """
+        super().__init__({"input": input}, {"by": by})
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]

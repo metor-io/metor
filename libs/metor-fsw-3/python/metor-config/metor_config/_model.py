@@ -41,6 +41,41 @@ FRAMEWORK_PORTS: dict[str, type[Record]] = {"log": LogEvent, "status": SystemSta
 """The outputs every system has whatever it declared."""
 
 
+class SequenceCommand(Record):
+    """A command addressed to a channel by name."""
+
+    _name = "sequence_command"
+    _kind = "msg"
+
+
+class SequenceChannelEvent(Record):
+    """What a channel did with a command, or how its system ended."""
+
+    _name = "sequence_channel_event"
+    _kind = "msg"
+
+
+class ChannelStatus(Record):
+    """A channel's state, written every cycle."""
+
+    _name = "channel_status"
+    _kind = "frame"
+
+
+class SequenceRegistry(Record):
+    """Every channel of a target and the names a `Load` on each may name."""
+
+    _name = "sequence_registry"
+    _kind = "msg"
+
+
+CHANNEL_PORTS: dict[str, type[Record]] = {
+    "events": SequenceChannelEvent,
+    "channel_status": ChannelStatus,
+}
+"""The outputs a channel adds to the system it wraps."""
+
+
 @dataclass(frozen=True)
 class PortRef:
     """One end of an edge: an output port of a named system."""
@@ -207,7 +242,7 @@ def _item_ports(items: Sequence[Item]) -> list[OutPort[Any]]:
     ports: list[OutPort[Any]] = []
     for item in items:
         if isinstance(item, SystemHandle):
-            ports.extend(getattr(item, port) for port in item._system._port_map())
+            ports.extend(getattr(item, port) for port in item._port_map())
         elif isinstance(item, OutPort):
             ports.append(item)
         else:
