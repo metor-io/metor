@@ -33,94 +33,63 @@ pub struct Sample {
 #[derive(Default)]
 pub struct Sampler(i64);
 
+/// Counts up, one sample per cycle.
 #[system]
-impl Sampler {
-    /// Counts up, one sample per cycle.
-    fn execute(&mut self, sample: &mut Output<Sample>) {
-        self.0 += 1;
-        let _ = sample.write(&Sample {
-            timestamp: Timestamp(self.0),
-            value: self.0 as f64,
-        });
+fn sampler(#[state] s: &mut Sampler, sample: &mut Output<Sample>) {
+    s.0 += 1;
+    let _ = sample.write(&Sample {
+        timestamp: Timestamp(s.0),
+        value: s.0 as f64,
+    });
+}
+
+/// Pings the newest sample's value.
+#[system]
+fn meter(sample: &mut Input<Sample>, output: &mut Output<Ping>) {
+    if let Ok(Some(sample)) = sample.latest() {
+        let n = sample.value as u32;
+        let _ = output.write(&Ping { n });
     }
 }
 
-/// Turns the newest sample into a ping.
-#[derive(Default)]
-pub struct Meter;
-
+/// Copies the newest ping.
 #[system]
-impl Meter {
-    /// Pings the newest sample's value.
-    fn execute(&mut self, sample: &mut Input<Sample>, output: &mut Output<Ping>) {
-        if let Ok(Some(sample)) = sample.latest() {
-            let n = sample.value as u32;
-            let _ = output.write(&Ping { n });
-        }
+fn echo(input: &mut Input<Ping>, output: &mut Output<Ping>) {
+    if let Ok(Some(ping)) = input.latest() {
+        let n = ping.n;
+        let _ = output.write(&Ping { n });
     }
 }
 
-/// Copies its input onto its output.
-#[derive(Default)]
-pub struct Echo;
-
+/// Copies every ping.
 #[system]
-impl Echo {
-    /// Copies the newest ping.
-    fn execute(&mut self, input: &mut Input<Ping>, output: &mut Output<Ping>) {
-        if let Ok(Some(ping)) = input.latest() {
-            let n = ping.n;
-            let _ = output.write(&Ping { n });
-        }
+async fn relay(input: &mut Input<Ping, Notifier>, output: &mut Output<Ping>, stop: Stop) {
+    while !stop.is_set() {
+        let ping = futures_lite::future::or(async { input.next().await.ok() }, async {
+            stop.wait().await;
+            None
+        })
+        .await;
+        let Some(ping) = ping else { return };
+        let _ = output.write(&Ping { n: ping.n });
     }
 }
 
-/// Copies every ping as it arrives, on a thread inside the pack.
-#[derive(Default)]
-pub struct Relay;
-
+/// Adds up what every configured port carries.
 #[system]
-impl Relay {
-    /// Copies every ping.
-    async fn run(
-        &mut self,
-        input: &mut Input<Ping, Notifier>,
-        output: &mut Output<Ping>,
-        stop: Stop,
-    ) {
-        while !stop.is_set() {
-            let ping = futures_lite::future::or(async { input.next().await.ok() }, async {
-                stop.wait().await;
-                None
-            })
-            .await;
-            let Some(ping) = ping else { return };
-            let _ = output.write(&Ping { n: ping.n });
+fn tap(taps: &mut DynInputs, output: &mut Output<Ping>) {
+    let mut n = 0;
+    for (_, input) in taps.iter_mut() {
+        for record in input.drain() {
+            let Ok(bytes) = record else { continue };
+            let Ok(ping) = Ping::decode(bytes) else {
+                continue;
+            };
+            n += ping.n;
         }
     }
-}
-
-/// Sums the pings on every port its config gave it.
-#[derive(Default)]
-pub struct Tap;
-
-#[system]
-impl Tap {
-    /// Adds up what every configured port carries.
-    fn execute(&mut self, taps: &mut DynInputs, output: &mut Output<Ping>) {
-        let mut n = 0;
-        for (_, input) in taps.iter_mut() {
-            for record in input.drain() {
-                let Ok(bytes) = record else { continue };
-                let Ok(ping) = Ping::decode(bytes) else {
-                    continue;
-                };
-                n += ping.n;
-            }
-        }
-        if n > 0 {
-            let _ = output.write(&Ping { n });
-        }
+    if n > 0 {
+        let _ = output.write(&Ping { n });
     }
 }
 
@@ -128,14 +97,12 @@ impl Tap {
 #[derive(Default)]
 pub struct Boom(u32);
 
+/// Fails on its second cycle.
 #[system]
-impl Boom {
-    /// Fails on its second cycle.
-    fn execute(&mut self, output: &mut Output<Ping>) {
-        self.0 += 1;
-        assert!(self.0 < 2, "boom on cycle {}", self.0);
-        let _ = output.write(&Ping { n: self.0 });
-    }
+fn boom(#[state] s: &mut Boom, output: &mut Output<Ping>) {
+    s.0 += 1;
+    assert!(s.0 < 2, "boom on cycle {}", s.0);
+    let _ = output.write(&Ping { n: s.0 });
 }
 
 /// `gain`'s params.
@@ -154,16 +121,11 @@ impl Gain {
     }
 }
 
-#[derive(Default)]
-pub struct FailInput;
-
 #[system]
-impl FailInput {
-    fn execute(&mut self, input: &mut Input<Ping>) {
-        let _ = input;
-        // PANIC Safety: tests guest failure isolation.
-        panic!("consumer failed");
-    }
+fn fail_input(input: &mut Input<Ping>) {
+    let _ = input;
+    // PANIC Safety: tests guest failure isolation.
+    panic!("consumer failed");
 }
 
 thread_local! {
@@ -228,14 +190,12 @@ pub extern "C" fn echo_pack_release_retained() -> u32 {
     release_retained().unwrap_or(0)
 }
 
+/// Scales the newest ping.
 #[system]
-impl Gain {
-    /// Scales the newest ping.
-    fn execute(&mut self, input: &mut Input<Ping>, output: &mut Output<Ping>) {
-        if let Ok(Some(ping)) = input.latest() {
-            let n = (f64::from(ping.n) * self.0) as u32;
-            let _ = output.write(&Ping { n });
-        }
+fn gain(#[state] s: &mut Gain, input: &mut Input<Ping>, output: &mut Output<Ping>) {
+    if let Ok(Some(ping)) = input.latest() {
+        let n = (f64::from(ping.n) * s.0) as u32;
+        let _ = output.write(&Ping { n });
     }
 }
 
@@ -248,24 +208,28 @@ pub fn pack() -> SystemTable {
     let mut table = SystemTable::new();
     // PANIC Safety: these static record schemas are compatible.
     table
-        .register("sampler", Sampler::default)
+        .register("sampler", sampler(), Sampler::default)
         .expect("valid records");
     table
-        .register("meter", Meter::default)
+        .register("meter", meter(), Default::default)
         .expect("valid records");
     table
-        .register("echo", Echo::default)
+        .register("echo", echo(), Default::default)
         .expect("valid records");
     table
-        .register_async("relay", Relay::default)
+        .register_async("relay", relay(), Default::default)
         .expect("valid records");
-    table.register("tap", Tap::default).expect("valid records");
     table
-        .register("boom", Boom::default)
+        .register("tap", tap(), Default::default)
         .expect("valid records");
-    table.register("gain", Gain::new).expect("valid records");
     table
-        .register("fail_input", FailInput::default)
+        .register("boom", boom(), Boom::default)
+        .expect("valid records");
+    table
+        .register("gain", gain(), Gain::new)
+        .expect("valid records");
+    table
+        .register("fail_input", fail_input(), Default::default)
         .expect("valid records");
     table
         .register_system("retained", |_| Ok((Retained, ())))

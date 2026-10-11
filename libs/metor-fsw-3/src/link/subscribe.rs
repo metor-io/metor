@@ -68,80 +68,74 @@ impl Subscribe {
     }
 }
 
+/// Tells each peer what it may send, or asks a dialed peer for its
+/// message streams, then routes what arrives by its id.
 #[system]
-impl Subscribe {
-    /// Tells each peer what it may send, or asks a dialed peer for its
-    /// message streams, then routes what arrives by its id.
-    async fn run(
-        &mut self,
-        outputs: &mut DynOutputs,
-        link_status: &mut Output<LinkStatus>,
-        log: &mut Log,
-        stop: Stop,
-    ) {
-        let Routes {
-            mut ports,
-            max_len,
-            tables,
-        } = routes(outputs, log);
-        let msgs: Vec<PacketId> = ids(&ports, PacketTy::Msg);
-        let table_ids: Vec<PacketId> = tables.iter().map(|(id, _)| *id).collect();
+pub async fn subscribe(
+    #[state] s: &mut Subscribe,
+    outputs: &mut DynOutputs,
+    link_status: &mut Output<LinkStatus>,
+    log: &mut Log,
+    stop: Stop,
+) {
+    let Routes {
+        mut ports,
+        max_len,
+        tables,
+    } = routes(outputs, log);
+    let msgs: Vec<PacketId> = ids(&ports, PacketTy::Msg);
+    let table_ids: Vec<PacketId> = tables.iter().map(|(id, _)| *id).collect();
 
-        // PANIC Safety: `run` is called once, and the endpoint is the bind's.
-        let endpoint = self.endpoint.take().expect("one run per instance");
-        if let Some(addr) = endpoint.local_addr() {
-            log.info(format!("listening on {addr}"));
-        }
+    // PANIC Safety: a system runs once, and the endpoint is the bind's.
+    let endpoint = s.endpoint.take().expect("one run per instance");
+    if let Some(addr) = endpoint.local_addr() {
+        log.info(format!("listening on {addr}"));
+    }
 
-        let seed = match endpoint {
-            Endpoint::Listen { .. } => {
-                wire::link_info(msgs.clone(), self.namespace.as_deref(), &self.link)
-            }
-            Endpoint::Connect { .. } => wire::msg_streams(&msgs),
+    let seed = match endpoint {
+        Endpoint::Listen { .. } => wire::link_info(msgs.clone(), s.namespace.as_deref(), &s.link),
+        Endpoint::Connect { .. } => wire::msg_streams(&msgs),
+    };
+
+    let Some((inbox, mut view)) = Inbox::new(msgs, table_ids, s.inbound_cap, max_len) else {
+        let cap = s.inbound_cap;
+        log.fault(
+            "inbound_cap",
+            format!("no ring holds {cap} records of {max_len} bytes"),
+        );
+        return;
+    };
+    if matches!(endpoint, Endpoint::Connect { .. }) {
+        inbox.watch();
+    }
+    let inbox = Rc::new(inbox);
+    let conns = Rc::new(Connections::new(
+        endpoint.slots(),
+        s.conn_cap,
+        seed,
+        inbox.clone(),
+    ));
+    let _source = stellarator::spawn(source(endpoint, conns.clone(), stop.clone())).drop_guard();
+    let mut dropped = 0;
+    let mut reported = LinkStatus::new(Timestamp(0), Default::default(), 0);
+    loop {
+        let ready = async {
+            view.wake()
+                .wait_until(|| view.has_record() || inbox.check_due())
+                .await;
+            Event::Ready
         };
-
-        let Some((inbox, mut view)) = Inbox::new(msgs, table_ids, self.inbound_cap, max_len) else {
-            let cap = self.inbound_cap;
-            log.fault(
-                "inbound_cap",
-                format!("no ring holds {cap} records of {max_len} bytes"),
-            );
-            return;
-        };
-        if matches!(endpoint, Endpoint::Connect { .. }) {
-            inbox.watch();
-        }
-        let inbox = Rc::new(inbox);
-        let conns = Rc::new(Connections::new(
-            endpoint.slots(),
-            self.conn_cap,
-            seed,
-            inbox.clone(),
-        ));
-        let _source =
-            stellarator::spawn(source(endpoint, conns.clone(), stop.clone())).drop_guard();
-        let mut dropped = 0;
-        let mut reported = LinkStatus::new(Timestamp(0), Default::default(), 0);
-        loop {
-            let ready = async {
-                view.wake()
-                    .wait_until(|| view.has_record() || inbox.check_due())
-                    .await;
-                Event::Ready
-            };
-            let event = future::or(conn::next(&conns, &stop), ready).await;
-            match event {
-                Event::Ready => {
-                    dropped += deliver(&mut view, &mut ports);
-                    report_unannounced(&inbox, &tables, log);
-                }
-                Event::Changed => {}
-                Event::Stop => return,
+        let event = future::or(conn::next(&conns, &stop), ready).await;
+        match event {
+            Event::Ready => {
+                dropped += deliver(&mut view, &mut ports);
+                report_unannounced(&inbox, &tables, log);
             }
-            let status =
-                LinkStatus::new(Timestamp::now(), conns.stats(), dropped + inbox.dropped());
-            report(&status, &mut reported, link_status, log);
+            Event::Changed => {}
+            Event::Stop => return,
         }
+        let status = LinkStatus::new(Timestamp::now(), conns.stats(), dropped + inbox.dropped());
+        report(&status, &mut reported, link_status, log);
     }
 }
 

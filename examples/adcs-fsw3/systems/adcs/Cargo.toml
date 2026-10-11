@@ -1,0 +1,31 @@
+[package]
+name = "adcs-systems-3"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "The adcs pack: plant, nav, ctrl, and mode systems for the adcs-fsw3 example"
+
+# The host loads the cdylib, and tests link the rlib to register `pack()` directly.
+# The `export` feature adds the C ABI, so tests turn it off.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["export"]
+export = []
+
+[dependencies]
+adcs-contracts = { package = "adcs-contracts-3", path = "../../contracts" }
+metor-fsw-3 = { path = "../../../../libs/metor-fsw-3", default-features = false }
+metor-adcs = { workspace = true }
+nox = { workspace = true }
+rand = "0.9"
+rand_distr = "0.5"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+zerocopy = { version = "0.8.2", features = ["derive"] }
+
+[lints]
+workspace = true

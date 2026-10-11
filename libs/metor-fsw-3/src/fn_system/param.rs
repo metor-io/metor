@@ -1,4 +1,4 @@
-//! The [`Param`] trait, one per `execute` parameter type, and its tuple impls.
+//! The [`Param`] trait, one per system fn parameter type, and its tuple impls.
 
 use std::borrow::Cow;
 
@@ -121,7 +121,7 @@ fn names(ports: &[PortDef]) -> Vec<Cow<'static, str>> {
     ports.iter().map(|port| port.name.clone()).collect()
 }
 
-/// `Cycle` is the extra parameter passed to execute beyonds its ports.
+/// `Cycle` is what a system fn's parameters read beyond their ports.
 pub struct Cycle<'a> {
     pub now: Timestamp,
     log: Option<&'a mut Log>,
@@ -158,7 +158,7 @@ pub trait Param {
     type In<W: WakeSink + Clone + 'static>;
     /// The bound writer, or `()`.
     type Out;
-    /// The value `execute` receives.
+    /// The value the system fn receives.
     type Item<'a, W: WakeSink + Clone + 'static>
     where
         Self: 'a;
@@ -177,7 +177,7 @@ pub trait Param {
     /// Returns this parameter's output (if one exists) by popping a writer from `writers`.
     fn bind_out(writers: &mut Writers) -> Self::Out;
 
-    /// Returns the value that will be passed into `execute`
+    /// Returns the value passed to the system fn.
     fn get<'a, W: WakeSink + Clone + 'static>(
         input: &'a mut Self::In<W>,
         output: &'a mut Self::Out,

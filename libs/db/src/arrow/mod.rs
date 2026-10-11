@@ -20,7 +20,7 @@ use std::{
 };
 use zerocopy::{Immutable, IntoBytes};
 
-use crate::{Component, DB, Error, append_log::AppendLog, time_series_2::TimeSeriesNode};
+use crate::{Component, DB, Error, append_log::AppendLog, time_series::TimeSeriesNode};
 
 mod fft;
 use fft::{FftUDF, FrequencyDomainUDF};

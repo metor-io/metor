@@ -82,10 +82,11 @@ impl SystemTable {
         )
     }
 
-    /// Registers a `#[system]` with `ty`
-    pub fn register<S: SystemFn, M, C: Ctor<S, M> + 'static>(
+    /// Registers a `#[system]` fn under `ty`, its state built by `ctor`.
+    pub fn register<S: SystemFn, M, C: Ctor<S::State, M> + 'static>(
         &mut self,
         ty: &str,
+        _system: S,
         ctor: C,
     ) -> Result<(), BuildError> {
         let make = move |params: Params<'_>| Ok((FnSystem::default(), ctor.make(params)?));
@@ -104,10 +105,11 @@ impl SystemTable {
         self.insert(ty, entry)
     }
 
-    /// Registers a `#[system]` type with an `async run` under `ty`.
-    pub fn register_async<S: AsyncSystemFn, M, C: Ctor<S, M> + Send + Sync + 'static>(
+    /// Registers an async `#[system]` fn under `ty`, its state built by `ctor`.
+    pub fn register_async<S: AsyncSystemFn, M, C: Ctor<S::State, M> + Send + Sync + 'static>(
         &mut self,
         ty: &str,
+        _system: S,
         ctor: C,
     ) -> Result<(), BuildError> {
         let make = move |params: Params<'_>| Ok((FnAsyncSystem::default(), ctor.make(params)?));

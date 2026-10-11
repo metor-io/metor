@@ -1,9 +1,9 @@
-//! Hand-written `SystemFn` impls, the shape `#[system]` emits.
+//! Hand-written `SystemFn` impls over a self-typed state, the shape `#[system]` emits.
 
 use core::cell::RefCell;
 use std::rc::Rc;
 
-use metor_fsw_3_ring::{NoWake, Notifier, frame_len};
+use metor_fsw_3_ring::{Config, NoWake, Notifier, RingBuffer, frame_len};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 use serde::Deserialize;
@@ -38,14 +38,15 @@ impl Doubler {
 }
 
 impl Ports for Doubler {
+    type State = Self;
     type Params = (Input<Imu>, Output<Nav>, Timestamp);
     const NAME: &'static str = "doubler";
     const NAMES: &'static [&'static str] = &["imu", "nav", "now"];
 }
 
 impl SystemFn for Doubler {
-    fn call(&mut self, (imu, nav, now): <Self::Params as Param>::Item<'_, NoWake>) {
-        self.execute(imu, nav, now);
+    fn call(state: &mut Self, (imu, nav, now): <Self::Params as Param>::Item<'_, NoWake>) {
+        state.execute(imu, nav, now);
     }
 }
 
@@ -64,14 +65,15 @@ impl Summer {
 }
 
 impl Ports for Summer {
+    type State = Self;
     type Params = (Output<Control>, Input<Imu>, Input<Imu>);
     const NAME: &'static str = "summer";
     const NAMES: &'static [&'static str] = &["sum", "a", "b"];
 }
 
 impl SystemFn for Summer {
-    fn call(&mut self, (sum, a, b): <Self::Params as Param>::Item<'_, NoWake>) {
-        self.execute(sum, a, b);
+    fn call(state: &mut Self, (sum, a, b): <Self::Params as Param>::Item<'_, NoWake>) {
+        state.execute(sum, a, b);
     }
 }
 
@@ -90,33 +92,32 @@ impl Gain {
     }
 }
 
+/// Publishes the gain.
+///
+/// One sample per cycle.
 #[crate::system]
-impl Gain {
-    /// Publishes the gain.
-    ///
-    /// One sample per cycle.
-    fn execute(&mut self, imu: &mut Output<Imu>) {
-        let _ = imu.write(&Imu::new(1, self.0));
-    }
+fn gain(#[state] s: &mut Gain, imu: &mut Output<Imu>) {
+    let _ = imu.write(&Imu::new(1, s.0));
 }
 
 /// Records the newest frame on its one input for the test to read.
 struct Probe<T>(Rc<RefCell<Option<T>>>);
 
 #[crate::system]
-impl<T: Frame + Clone + 'static> Probe<T> {
-    fn execute(&mut self, input: &mut Input<T>) {
-        if let Ok(Some(frame)) = input.latest() {
-            *self.0.borrow_mut() = Some(frame.clone());
-        }
+fn probe<T: Frame + Clone>(#[state] s: &mut Probe<T>, input: &mut Input<T>) {
+    if let Ok(Some(frame)) = input.latest() {
+        *s.0.borrow_mut() = Some(frame.clone());
     }
 }
 
-fn probe<T: Frame + Clone + 'static>(table: &mut SystemTable, ty: &str) -> Rc<RefCell<Option<T>>> {
+fn register_probe<T: Frame + Clone + 'static>(
+    table: &mut SystemTable,
+    ty: &str,
+) -> Rc<RefCell<Option<T>>> {
     let seen = Rc::new(RefCell::new(None));
     let state = seen.clone();
     table
-        .register(ty, move || Probe(state.clone()))
+        .register(ty, probe::<T>(), move || Probe(state.clone()))
         .expect("valid records");
     seen
 }
@@ -142,24 +143,40 @@ impl Counter {
 }
 
 impl Ports for Counter {
+    type State = Self;
     type Params = ();
     const NAME: &'static str = "counter";
     const NAMES: &'static [&'static str] = &[];
 }
 
 impl SystemFn for Counter {
-    fn call(&mut self, (): ()) {
-        self.execute();
+    fn call(state: &mut Self, (): ()) {
+        state.execute();
     }
+}
+
+/// A system's `Ports` consts, read through its value.
+fn ports<P: Ports>(_: &P) -> (&'static str, &'static [&'static str], &'static str) {
+    (P::NAME, P::NAMES, P::DOC)
+}
+
+/// A `#[system]` fn's ports under the empty context.
+fn def_of<S: SystemFn>(_: S) -> SystemDef {
+    static_def::<FnSystem<S>>()
+}
+
+/// A `#[system]` fn's ports under `cx`.
+fn def_in<S: SystemFn>(_: S, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+    FnSystem::<S>::def(cx)
 }
 
 #[test]
 fn test_attribute_type_and_ports() {
-    assert_eq!(Gain::NAME, "gain");
-    assert_eq!(Gain::NAMES, &["imu"]);
-    assert_eq!(<Probe<Imu>>::NAME, "probe");
+    assert_eq!(ports(&gain()).0, "gain");
+    assert_eq!(ports(&gain()).1, &["imu"]);
+    assert_eq!(ports(&probe::<Imu>()).0, "probe");
     assert_eq!(
-        static_def::<FnSystem<Gain>>().outputs,
+        def_of(gain()).outputs,
         vec![
             Output::<Imu>::def(&DefCx::empty(), "imu"),
             Output::<LogEvent>::def(&DefCx::empty(), "log")
@@ -169,7 +186,7 @@ fn test_attribute_type_and_ports() {
 
 #[test]
 fn test_port_parameter_order() {
-    let def = static_def::<FnSystem<Doubler>>();
+    let def = def_of(Doubler);
     assert_eq!(def.name, "doubler");
     assert_eq!(def.inputs, vec![Input::<Imu>::def(&DefCx::empty(), "imu")]);
     assert_eq!(
@@ -187,13 +204,17 @@ fn test_port_parameter_order() {
 
 fn gain_table() -> SystemTable {
     let mut table = SystemTable::new();
-    table.register("gain", Gain::new).expect("valid records");
     table
-        .register("doubler", || Doubler)
+        .register("gain", gain(), Gain::new)
         .expect("valid records");
-    table.register("summer", || Summer).expect("valid records");
     table
-        .register("counter", Counter::default)
+        .register("doubler", Doubler, || Doubler)
+        .expect("valid records");
+    table
+        .register("summer", Summer, || Summer)
+        .expect("valid records");
+    table
+        .register("counter", Counter::default(), Counter::default)
         .expect("valid records");
     table
 }
@@ -201,7 +222,7 @@ fn gain_table() -> SystemTable {
 #[test]
 fn test_constructor_receives_params() {
     let mut table = gain_table();
-    let seen = probe::<Imu>(&mut table, "imu_probe");
+    let seen = register_probe::<Imu>(&mut table, "imu_probe");
     let config = CoordinatorConfig {
         systems: vec![
             SystemConfig {
@@ -278,7 +299,7 @@ fn test_separate_input_bindings() {
         ..Default::default()
     };
     let mut table = gain_table();
-    let seen = probe::<Control>(&mut table, "control_probe");
+    let seen = register_probe::<Control>(&mut table, "control_probe");
     let mut config = config;
     config
         .systems
@@ -313,7 +334,7 @@ fn test_pipeline_matches_trait() {
         ],
         ..Default::default()
     };
-    let seen = probe::<Nav>(&mut table, "nav_probe");
+    let seen = register_probe::<Nav>(&mut table, "nav_probe");
     let mut config = config;
     config
         .systems
@@ -331,12 +352,10 @@ struct Talker {
 }
 
 #[crate::system]
-impl Talker {
-    fn execute(&mut self, log: &mut Log) {
-        log.info("direct");
-        for i in 0..self.lines {
-            tracing::info!(i, "traced");
-        }
+fn talker(#[state] s: &mut Talker, log: &mut Log) {
+    log.info("direct");
+    for i in 0..s.lines {
+        tracing::info!(i, "traced");
     }
 }
 
@@ -361,25 +380,23 @@ impl crate::System for Noisy {
 struct LogProbe(Rc<RefCell<Vec<LogEvent>>>);
 
 #[crate::system]
-impl LogProbe {
-    fn execute(&mut self, log: &mut Input<LogEvent>) {
-        let mut seen = self.0.borrow_mut();
-        seen.extend(log.drain().map(|r| r.expect("decodes")));
-    }
+fn log_probe(#[state] s: &mut LogProbe, log: &mut Input<LogEvent>) {
+    let mut seen = s.0.borrow_mut();
+    seen.extend(log.drain().map(|r| r.expect("decodes")));
 }
 
 fn log_config(lines: usize) -> (CoordinatorConfig, SystemTable, Rc<RefCell<Vec<LogEvent>>>) {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut table = SystemTable::new();
     table
-        .register("talker", move || Talker { lines })
+        .register("talker", talker(), move || Talker { lines })
         .expect("valid records");
     table
         .register_system("noisy", |_| Ok((Noisy, ())))
         .expect("valid records");
     let sink = seen.clone();
     table
-        .register("log_probe", move || LogProbe(sink.clone()))
+        .register("log_probe", log_probe(), move || LogProbe(sink.clone()))
         .expect("valid records");
     let config = CoordinatorConfig {
         systems: vec![
@@ -431,11 +448,9 @@ struct Padder {
 }
 
 #[crate::system]
-impl Padder {
-    fn execute(&mut self, log: &mut Log) {
-        for _ in 0..core::mem::take(&mut self.lines) {
-            log.info(self.line.clone());
-        }
+fn padder(#[state] s: &mut Padder, log: &mut Log) {
+    for _ in 0..core::mem::take(&mut s.lines) {
+        log.info(s.line.clone());
     }
 }
 
@@ -447,13 +462,13 @@ fn pad_config(
     let mut table = SystemTable::new();
     let (line, sink) = (line.to_string(), seen.clone());
     table
-        .register("padder", move || Padder {
+        .register("padder", padder(), move || Padder {
             line: line.clone(),
             lines,
         })
         .expect("valid records");
     table
-        .register("log_probe", move || LogProbe(sink.clone()))
+        .register("log_probe", log_probe(), move || LogProbe(sink.clone()))
         .expect("valid records");
     let config = CoordinatorConfig {
         systems: vec![
@@ -524,18 +539,14 @@ fn test_log_ring_capacity() {
 
 #[test]
 fn test_reject_explicit_log_output() {
-    struct LogOutput;
-
     #[crate::system]
-    impl LogOutput {
-        fn execute(&mut self, log: &mut Output<LogEvent>) {
-            let _ = log;
-        }
+    fn log_output(log: &mut Output<LogEvent>) {
+        let _ = log;
     }
 
     let mut table = SystemTable::new();
     table
-        .register("log_output", || LogOutput)
+        .register("log_output", log_output(), Default::default)
         .expect("valid records");
     let config = CoordinatorConfig {
         systems: vec![SystemConfig::new("logger", "log_output")],
@@ -550,11 +561,87 @@ fn test_reject_explicit_log_output() {
     );
 }
 
+/// The name of a system's state type.
+fn state_of<P: Ports>(_: &P) -> &'static str {
+    core::any::type_name::<P::State>()
+}
+
+#[test]
+fn test_ports_consts() {
+    assert_eq!(ports(&gain()), ("gain", &["imu"][..], ports(&gain()).2));
+    assert_eq!(state_of(&gain()), core::any::type_name::<Gain>());
+    assert_eq!(ports(&relay()).0, "relay");
+    assert_eq!(state_of(&relay()), "()");
+    assert_eq!(ports(&probe::<Nav>()), ("probe", &["input"][..], ""));
+    assert_eq!(
+        state_of(&probe::<Nav>()),
+        core::any::type_name::<Probe<Nav>>()
+    );
+    assert_eq!(ports(&relay_cyclic()).1, &["imu", "nav", "log"]);
+    assert_eq!(state_of(&relay_cyclic()), "()");
+}
+
+/// Publishes one fixed sample per cycle, with no state.
+#[crate::system]
+fn unit(imu: &mut Output<Imu>) {
+    let _ = imu.write(&Imu::new(1, 9.0));
+}
+
+#[test]
+fn test_stateless_default_registration() {
+    let mut table = SystemTable::new();
+    table
+        .register("unit", unit(), Default::default)
+        .expect("valid records");
+    let seen = register_probe::<Imu>(&mut table, "imu_probe");
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("u", "unit"),
+            probing("p", "imu_probe", PortRef::new("u", "imu")),
+        ],
+        ..Default::default()
+    };
+    let mut coordinator = config.build(&table).expect("valid");
+    coordinator.step(Timestamp(0));
+    assert_eq!(seen.borrow().as_ref().map(|f| f.sample), Some(9.0));
+}
+
+#[test]
+fn test_direct_call_writes_output() {
+    let imu = ring::<Imu>();
+    let mut output = Output::<Imu>::try_new(imu.writer(NoWake).expect("free writer"))
+        .expect("supported alignment");
+    let mut input = Input::<Imu>::try_new(vec![imu.view(NoWake).expect("free slot")])
+        .expect("supported alignment");
+    gain()(&mut Gain(3.0), &mut output);
+    let sample = input.latest().expect("valid").map(|f| f.sample);
+    assert_eq!(sample, Some(3.0));
+}
+
+#[test]
+fn test_generic_system_two_records() {
+    let mut table = SystemTable::new();
+    let _imu = register_probe::<Imu>(&mut table, "imu_probe");
+    let _nav = register_probe::<Nav>(&mut table, "nav_probe");
+    let inputs = |ty| table.get(ty).expect("registered").def.inputs.clone();
+    assert_eq!(
+        inputs("imu_probe"),
+        vec![Input::<Imu>::def(&DefCx::empty(), "input")]
+    );
+    assert_eq!(
+        inputs("nav_probe"),
+        vec![Input::<Nav>::def(&DefCx::empty(), "input")]
+    );
+}
+
 #[test]
 fn test_execute_doc_comment() {
-    assert_eq!(Gain::DOC, "Publishes the gain.\n\nOne sample per cycle.");
+    assert_eq!(
+        ports(&gain()).2,
+        "Publishes the gain.\n\nOne sample per cycle."
+    );
     assert_eq!(Doubler::DOC, "");
-    assert_eq!(<Probe<Imu> as Ports>::DOC, "");
+    assert_eq!(ports(&probe::<Imu>()).2, "");
 }
 
 #[test]
@@ -569,54 +656,47 @@ fn test_constructor_param_schema() {
     assert!(schema.get().contains(r#""k""#));
 }
 
-/// Doubles every sample as it arrives, until stop.
-struct Relay;
+fn ring<R: Record + ?Sized>() -> RingBuffer {
+    RingBuffer::create_in_memory(Config {
+        capacity: ring_capacity(R::MAX_LEN, 8).expect("valid capacity"),
+        max_readers: 2,
+    })
+}
 
+/// Forwards records as they arrive.
 #[crate::system]
-impl Relay {
-    /// Forwards records as they arrive.
-    async fn run(
-        &mut self,
-        imu: &mut Input<Imu, Notifier>,
-        nav: &mut Output<Nav>,
-        log: &mut Log,
-        stop: Stop,
-    ) {
-        log.info("relaying");
-        loop {
-            let waited =
-                futures_lite::future::or(async { imu.next().await.ok().copied() }, async {
-                    stop.wait().await;
-                    None
-                });
-            let Some(sample) = waited.await else { return };
-            let _ = nav.write(&Nav {
-                timestamp: sample.timestamp,
-                estimate: sample.sample * 2.0,
-            });
-        }
+async fn relay(imu: &mut Input<Imu, Notifier>, nav: &mut Output<Nav>, log: &mut Log, stop: Stop) {
+    log.info("relaying");
+    loop {
+        let waited = futures_lite::future::or(async { imu.next().await.ok().copied() }, async {
+            stop.wait().await;
+            None
+        });
+        let Some(sample) = waited.await else { return };
+        let _ = nav.write(&Nav {
+            timestamp: sample.timestamp,
+            estimate: sample.sample * 2.0,
+        });
     }
 }
 
-/// The cyclic twin of [`Relay`], to compare definitions.
-struct RelayCyclic;
-
+/// Forwards records as they arrive.
 #[crate::system]
-impl RelayCyclic {
-    /// Forwards records as they arrive.
-    fn execute(&mut self, imu: &mut Input<Imu>, nav: &mut Output<Nav>, log: &mut Log) {
-        let _ = (imu, nav, log);
-    }
+fn relay_cyclic(imu: &mut Input<Imu>, nav: &mut Output<Nav>, log: &mut Log) {
+    let _ = (imu, nav, log);
+}
+
+/// An async `#[system]` fn's ports under the empty context.
+fn async_def_of<S: AsyncSystemFn>(_: S) -> SystemDef {
+    static_async_def::<FnAsyncSystem<S>>()
 }
 
 #[test]
 fn test_async_and_cyclic_ports_match() {
-    assert_eq!(Relay::NAMES, &["imu", "nav", "log"]);
-    assert_eq!(Relay::DOC, "Forwards records as they arrive.");
-    let (relay, cyclic) = (
-        static_async_def::<FnAsyncSystem<Relay>>(),
-        static_def::<FnSystem<RelayCyclic>>(),
-    );
+    let (_, names, doc) = ports(&relay());
+    assert_eq!(names, &["imu", "nav", "log"]);
+    assert_eq!(doc, "Forwards records as they arrive.");
+    let (relay, cyclic) = (async_def_of(relay()), def_of(relay_cyclic()));
     assert_eq!(relay.inputs, cyclic.inputs);
     assert_eq!(relay.outputs, cyclic.outputs);
     assert_eq!(relay.name, "relay");
@@ -628,18 +708,10 @@ fn test_async_and_cyclic_ports_match() {
 fn test_async_adapter_relay() {
     use crate::coordinator::MakeCx;
     use crate::thread::{DEFAULT_THREAD, Threads};
-    use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
-
-    fn ring<R: Record + ?Sized>() -> RingBuffer {
-        RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(R::MAX_LEN, 8).expect("valid capacity"),
-            max_readers: 2,
-        })
-    }
 
     let mut table = SystemTable::new();
     table
-        .register_async("relay", || Relay)
+        .register_async("relay", relay(), Default::default)
         .expect("valid records");
     let entry = table.get("relay").expect("registered");
     assert_eq!(
@@ -693,16 +765,12 @@ fn test_dynamic_parameter_port_order() {
     use crate::def::{DefCx, Records};
     use crate::port::{DynInputs, DynOutputs};
 
-    struct Link;
-
     #[crate::system]
-    impl Link {
-        fn execute(&mut self, taps: &mut DynInputs, imu: &mut Input<Imu>, sinks: &mut DynOutputs) {
-            let _ = (taps, imu, sinks);
-        }
+    fn link(taps: &mut DynInputs, imu: &mut Input<Imu>, sinks: &mut DynOutputs) {
+        let _ = (taps, imu, sinks);
     }
 
-    let def = static_def::<FnSystem<Link>>();
+    let def = def_of(link());
     assert_eq!(def.inputs, vec![Input::<Imu>::def(&DefCx::empty(), "imu")]);
 
     let producer = Output::<Nav>::def(&DefCx::empty(), "nav");
@@ -716,7 +784,7 @@ fn test_dynamic_parameter_port_order() {
         records: &records,
         ..DefCx::empty()
     };
-    let def = FnSystem::<Link>::def(&cx).expect("a definition");
+    let def = def_in(link(), &cx).expect("a definition");
     let names: Vec<_> = def.inputs.iter().map(|port| port.name.as_ref()).collect();
     assert_eq!(names, vec!["nav.nav", "imu"]);
     let names: Vec<_> = def.outputs.iter().map(|port| port.name.as_ref()).collect();
@@ -729,20 +797,16 @@ fn test_reject_multiple_dynamic_producers() {
     use crate::def::{DefCx, DefError};
     use crate::port::DynInputs;
 
-    struct Tap;
-
     #[crate::system]
-    impl Tap {
-        fn execute(&mut self, taps: &mut DynInputs) {
-            let _ = taps;
-        }
+    fn tap(taps: &mut DynInputs) {
+        let _ = taps;
     }
 
     let first = Output::<Imu>::def(&DefCx::empty(), "imu");
     let second = Output::<Imu>::def(&DefCx::empty(), "imu");
     let edges = [("plant.imu", &first), ("plant.imu", &second)];
     assert_eq!(
-        FnSystem::<Tap>::def(&DefCx::of_inputs(&edges)),
+        def_in(tap(), &DefCx::of_inputs(&edges)),
         Err(DefError::FanIn {
             port: "plant.imu".into()
         })

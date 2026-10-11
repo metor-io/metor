@@ -95,10 +95,18 @@ impl LinkStatus {
 
 /// Registers the link systems every target may name, under `fsw.`.
 pub fn register_builtins(table: &mut SystemTable) -> Result<(), BuildError> {
-    table.register_async::<Publish, _, _>(&format!("{BUILTIN}.publish"), Publish::new)?;
-    table.register_async::<Subscribe, _, _>(&format!("{BUILTIN}.subscribe"), Subscribe::new)?;
+    table.register_async(
+        &format!("{BUILTIN}.publish"),
+        publish::publish(),
+        Publish::new,
+    )?;
+    table.register_async(
+        &format!("{BUILTIN}.subscribe"),
+        subscribe::subscribe(),
+        Subscribe::new,
+    )?;
     #[cfg(feature = "db")]
-    table.register_async::<Db, _, _>(crate::deploy::DB_TYPE, Db::new)?;
+    table.register_async(crate::deploy::DB_TYPE, db::db(), Db::new)?;
     Ok(())
 }
 

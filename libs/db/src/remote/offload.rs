@@ -7,7 +7,7 @@ use crate::{
     Error,
     seal::SealRecordExt,
     store::{NodeKey, NodeStore, SealedNode, StoreError},
-    time_series_2::TimeSeries,
+    time_series::TimeSeries,
 };
 
 /// Push one sealed resident span to `store` and record the ack. `Ok`

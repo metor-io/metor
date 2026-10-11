@@ -1,4 +1,4 @@
-//! `imu -> nav -> control` as `#[system]` blocks, with a trait-path monitor
+//! `imu -> nav -> control` as `#[system]` fns, with a trait-path monitor
 //! reading the three status rings, run on the stellarator runtime.
 
 use core::cell::RefCell;
@@ -55,48 +55,38 @@ struct Gyro {
 }
 
 #[system]
-impl Gyro {
-    fn execute(&mut self, imu: &mut Output<Imu>) {
-        self.tick += 1;
-        let _ = imu.write(&Imu {
-            timestamp: Timestamp(self.tick),
-            omega: self.tick as f64,
-        });
-    }
+fn gyro(#[state] s: &mut Gyro, imu: &mut Output<Imu>) {
+    s.tick += 1;
+    let _ = imu.write(&Imu {
+        timestamp: Timestamp(s.tick),
+        omega: s.tick as f64,
+    });
 }
 
 /// Halves the newest rate into an attitude.
-struct NavFilter;
-
 #[system]
-impl NavFilter {
-    fn execute(&mut self, imu: &mut Input<Imu>, nav: &mut Output<Nav>) {
-        let Ok(Some(imu)) = imu.latest() else {
-            return;
-        };
-        let out = Nav {
-            timestamp: imu.timestamp,
-            attitude: imu.omega * 0.5,
-        };
-        let _ = nav.write(&out);
-    }
+fn nav_filter(imu: &mut Input<Imu>, nav: &mut Output<Nav>) {
+    let Ok(Some(imu)) = imu.latest() else {
+        return;
+    };
+    let out = Nav {
+        timestamp: imu.timestamp,
+        attitude: imu.omega * 0.5,
+    };
+    let _ = nav.write(&out);
 }
 
 /// Commands the opposite of the attitude.
-struct ControlLaw;
-
 #[system]
-impl ControlLaw {
-    fn execute(&mut self, nav: &mut Input<Nav>, control: &mut Output<Control>) {
-        let Ok(Some(nav)) = nav.latest() else {
-            return;
-        };
-        let out = Control {
-            timestamp: nav.timestamp,
-            torque: -nav.attitude,
-        };
-        let _ = control.write(&out);
-    }
+fn control_law(nav: &mut Input<Nav>, control: &mut Output<Control>) {
+    let Ok(Some(nav)) = nav.latest() else {
+        return;
+    };
+    let out = Control {
+        timestamp: nav.timestamp,
+        torque: -nav.attitude,
+    };
+    let _ = control.write(&out);
 }
 
 /// Reads the pipeline's product and the three status rings behind it.
@@ -177,11 +167,13 @@ fn input(port: &str, from: PortRef) -> InputConfig {
 fn table(report: &Rc<RefCell<Report>>) -> SystemTable {
     let mut table = SystemTable::new();
     table
-        .register("gyro", Gyro::default)
+        .register("gyro", gyro(), Gyro::default)
         .expect("valid records");
-    table.register("nav", || NavFilter).expect("valid records");
     table
-        .register("control", || ControlLaw)
+        .register("nav", nav_filter(), Default::default)
+        .expect("valid records");
+    table
+        .register("control", control_law(), Default::default)
         .expect("valid records");
     let report = report.clone();
     table

@@ -57,6 +57,8 @@ struct Field {
     annotation: String,
     /// ` = <literal>`, or empty for a required field.
     default: String,
+    /// The property's description, or empty.
+    doc: String,
 }
 
 #[derive(Serialize)]
@@ -64,6 +66,8 @@ struct Entry {
     name: String,
     ty: String,
     doc: String,
+    /// The `__init__` docstring's `Args:` section, or empty when no param has a doc.
+    args_doc: String,
     /// Whether the type takes an `items` port list.
     takes_inputs: bool,
     /// Whether the type takes a `records` list.
@@ -85,6 +89,7 @@ pub fn render(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<String,
     let module = view(pack, abi_version, def)?;
     let mut env = minijinja::Environment::new();
     env.add_filter("python_string", python_string);
+    env.add_filter("docstring", docstring);
     env.add_template("module", TEMPLATE)?;
     Ok(env.get_template("module")?.render(module)?)
 }
@@ -202,11 +207,7 @@ fn collect_defs(schema: &Value, defs: &mut BTreeMap<String, Value>) {
 fn dataclass(name: &str, object: &Value, defs: &BTreeMap<String, Value>) -> Class {
     Class {
         name: name.to_string(),
-        doc: object
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_default(),
+        doc: description(object),
         fields: fields(object, defs, true),
     }
 }
@@ -218,6 +219,7 @@ fn fields(schema: &Value, defs: &BTreeMap<String, Value>, dataclass: bool) -> Ve
         .map(|(name, property)| Field {
             annotation: python_type(&property, defs),
             default: default_of(&property, is_required(schema, &name), dataclass),
+            doc: description(&property),
             name,
         })
         .collect()
@@ -251,12 +253,58 @@ fn entry(
         name: pascal(&system.ty),
         ty: system.ty.to_string(),
         doc: system.doc.to_string(),
+        args_doc: args_doc(&params),
         takes_inputs: system.takes_inputs,
         takes_outputs: system.takes_outputs,
         inputs: system.def.inputs.iter().map(port).collect(),
         params,
         ports: declared.map(port).chain(builtin).collect(),
     })
+}
+
+fn description(schema: &Value) -> String {
+    schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+/// A Google-style `Args:` section over the params that have a doc.
+fn args_doc(params: &[Field]) -> String {
+    let args: Vec<String> = params
+        .iter()
+        .filter(|field| !field.doc.is_empty())
+        .map(|field| {
+            let lines: Vec<&str> = field
+                .doc
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            format!("    {}: {}", field.name, lines.join("\n        "))
+        })
+        .collect();
+    if args.is_empty() {
+        return String::new();
+    }
+    format!("Args:\n{}", args.join("\n"))
+}
+
+/// A triple-quoted literal whose continuation lines sit `indent` spaces in.
+fn docstring(text: &str, indent: usize) -> String {
+    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    if !escaped.contains('\n') {
+        return format!("\"\"\"{escaped}\"\"\"");
+    }
+    let pad = " ".repeat(indent);
+    let body: Vec<String> = escaped
+        .lines()
+        .map(|line| match line {
+            "" => String::new(),
+            line => format!("{pad}{line}"),
+        })
+        .collect();
+    format!("\"\"\"\n{}\n{pad}\"\"\"", body.join("\n"))
 }
 
 /// A schema object's properties, in the order the schema lists them.
@@ -409,7 +457,7 @@ mod tests {
     #[test]
     fn test_render_param_defaults() {
         let schema = r##"{"type":"object","properties":{
-            "rate":{"type":"number","default":0.5},
+            "rate":{"type":"number","default":0.5,"description":"Loop rate, Hz.\n\nClamped to \"max\"."},
             "count":{"type":"integer","default":3},
             "armed":{"type":"boolean","default":false},
             "mode":{"type":"string","default":"nadir"},
@@ -418,7 +466,7 @@ mod tests {
             "slack":{"type":["number","null"]}},
             "required":["limits"],
             "$defs":{"Limits":{"description":"Bounds on the actuator.",
-                "type":"object","properties":{"max":{"type":"number","default":1.0}}}}}"##;
+                "type":"object","properties":{"max":{"type":"number","default":1.0,"description":"Upper bound."}}}}}"##;
         let text = rendered(vec![system(
             "ctrl",
             vec![port("est", "est")],
@@ -428,7 +476,11 @@ mod tests {
         .expect("renders");
 
         assert!(text.contains("from dataclasses import dataclass, field\n"));
-        assert!(text.contains("@dataclass(kw_only=True)\nclass Limits:\n    \"Bounds on the actuator.\"\n    max: float = 1.0\n"));
+        assert!(text.contains("@dataclass(kw_only=True)\nclass Limits:\n    \"Bounds on the actuator.\"\n    max: float = 1.0\n    \"\"\"Upper bound.\"\"\"\n"));
+        assert!(
+            text.contains(") -> None:\n        \"\"\"\n        Args:\n            rate: Loop rate, Hz.\n                Clamped to \\\"max\\\".\n        \"\"\"\n        super()"),
+            "params with a description get an Args entry: {text}"
+        );
         assert!(text.contains("armed: bool = False"));
         assert!(text.contains("mode: str = \"nadir\""));
         assert!(text.contains("gains: list[float] = [1.0, 2.0]"));
@@ -471,7 +523,8 @@ mod tests {
             "class SystemStatus(Record):\n    _name = \"status\"\n    _kind = \"frame\"\n"
         ));
         assert!(
-            text.contains("    def __init__(self) -> None:\n        super().__init__({}, {})\n")
+            text.contains("    def __init__(self) -> None:\n        super().__init__({}, {})\n"),
+            "no params, no docstring: {text}"
         );
         assert!(text.contains("_ports = {\"log\": LogEvent, \"status\": SystemStatus}"));
         assert!(text.contains("    log: OutPort[LogEvent]\n    status: OutPort[SystemStatus]\n"));

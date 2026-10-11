@@ -60,17 +60,12 @@ struct Wide {
 }
 
 /// Publishes one wide frame per cycle.
-#[derive(Default)]
-struct WideSource;
-
 #[system]
-impl WideSource {
-    fn execute(&mut self, now: Timestamp, wide: &mut Output<Wide>) {
-        let _ = wide.write(&Wide {
-            timestamp: now,
-            samples: [1.0; 256],
-        });
-    }
+fn wide_source(now: Timestamp, wide: &mut Output<Wide>) {
+    let _ = wide.write(&Wide {
+        timestamp: now,
+        samples: [1.0; 256],
+    });
 }
 
 /// Publishes one sample per cycle, counting up.
@@ -78,26 +73,22 @@ impl WideSource {
 struct Source(i64);
 
 #[system]
-impl Source {
-    fn execute(&mut self, imu: &mut Output<Imu>) {
-        self.0 += 1;
-        let _ = imu.write(&Imu {
-            timestamp: Timestamp(self.0),
-            sample: self.0 as f64,
-        });
-    }
+fn source(#[state] s: &mut Source, imu: &mut Output<Imu>) {
+    s.0 += 1;
+    let _ = imu.write(&Imu {
+        timestamp: Timestamp(s.0),
+        sample: s.0 as f64,
+    });
 }
 
 /// Records every status its link publishes.
 struct StatusSink(Arc<Mutex<Vec<LinkStatus>>>);
 
 #[system]
-impl StatusSink {
-    fn execute(&mut self, link_status: &mut Input<LinkStatus>) {
-        for status in link_status.drain().flatten() {
-            // PANIC Safety: no test holds this lock across a panic.
-            self.0.lock().expect("an unpoisoned sink").push(*status);
-        }
+fn status_sink(#[state] s: &mut StatusSink, link_status: &mut Input<LinkStatus>) {
+    for status in link_status.drain().flatten() {
+        // PANIC Safety: no test holds this lock across a panic.
+        s.0.lock().expect("an unpoisoned sink").push(*status);
     }
 }
 
@@ -106,26 +97,21 @@ impl StatusSink {
 struct Pinger(u32);
 
 #[system]
-impl Pinger {
-    fn execute(&mut self, ping: &mut Output<Ping>) {
-        self.0 += 1;
-        let _ = ping.write(&Ping { n: self.0 });
-    }
+fn pinger(#[state] s: &mut Pinger, ping: &mut Output<Ping>) {
+    s.0 += 1;
+    let _ = ping.write(&Ping { n: s.0 });
 }
 
 /// Records every frame's sample it is wired to, as a whole number, beside the pings.
 struct ImuSink(Arc<Mutex<Vec<u32>>>);
 
 #[system]
-impl ImuSink {
-    fn execute(&mut self, imu: &mut Input<Imu>) {
-        for imu in imu.drain().flatten() {
-            // PANIC Safety: no test holds this lock across a panic.
-            self.0
-                .lock()
-                .expect("an unpoisoned sink")
-                .push(imu.sample as u32);
-        }
+fn imu_sink(#[state] s: &mut ImuSink, imu: &mut Input<Imu>) {
+    for imu in imu.drain().flatten() {
+        // PANIC Safety: no test holds this lock across a panic.
+        s.0.lock()
+            .expect("an unpoisoned sink")
+            .push(imu.sample as u32);
     }
 }
 
@@ -133,12 +119,10 @@ impl ImuSink {
 struct PingSink(Arc<Mutex<Vec<u32>>>);
 
 #[system]
-impl PingSink {
-    fn execute(&mut self, ping: &mut Input<Ping>) {
-        for ping in ping.drain().flatten() {
-            // PANIC Safety: no test holds this lock across a panic.
-            self.0.lock().expect("an unpoisoned sink").push(ping.n);
-        }
+fn ping_sink(#[state] s: &mut PingSink, ping: &mut Input<Ping>) {
+    for ping in ping.drain().flatten() {
+        // PANIC Safety: no test holds this lock across a panic.
+        s.0.lock().expect("an unpoisoned sink").push(ping.n);
     }
 }
 
@@ -146,17 +130,15 @@ impl PingSink {
 struct LogSink(Arc<Mutex<Vec<String>>>);
 
 #[system]
-impl LogSink {
-    fn execute(&mut self, log: &mut Input<LogEvent>) {
-        for event in log.drain().flatten() {
-            let kind = event.fields.iter().find(|(name, _)| name == "kind");
-            let line = match kind {
-                Some((_, kind)) => kind.to_string(),
-                None => format!("line: {}", event.message),
-            };
-            // PANIC Safety: no test holds this lock across a panic.
-            self.0.lock().expect("an unpoisoned sink").push(line);
-        }
+fn log_sink(#[state] s: &mut LogSink, log: &mut Input<LogEvent>) {
+    for event in log.drain().flatten() {
+        let kind = event.fields.iter().find(|(name, _)| name == "kind");
+        let line = match kind {
+            Some((_, kind)) => kind.to_string(),
+            None => format!("line: {}", event.message),
+        };
+        // PANIC Safety: no test holds this lock across a panic.
+        s.0.lock().expect("an unpoisoned sink").push(line);
     }
 }
 
@@ -199,29 +181,31 @@ impl Seen {
 fn table(seen: &Seen) -> SystemTable {
     let mut table = SystemTable::new();
     table
-        .register("source", Source::default)
+        .register("source", source(), Source::default)
         .expect("valid records");
     table
-        .register("wide", WideSource::default)
+        .register("wide", wide_source(), Default::default)
         .expect("valid records");
     table
-        .register("pinger", Pinger::default)
+        .register("pinger", pinger(), Pinger::default)
         .expect("valid records");
     let statuses = seen.statuses.clone();
     table
-        .register("status_sink", move || StatusSink(statuses.clone()))
+        .register("status_sink", status_sink(), move || {
+            StatusSink(statuses.clone())
+        })
         .expect("valid records");
     let pings = seen.pings.clone();
     table
-        .register("ping_sink", move || PingSink(pings.clone()))
+        .register("ping_sink", ping_sink(), move || PingSink(pings.clone()))
         .expect("valid records");
     let samples = seen.pings.clone();
     table
-        .register("imu_sink", move || ImuSink(samples.clone()))
+        .register("imu_sink", imu_sink(), move || ImuSink(samples.clone()))
         .expect("valid records");
     let faults = seen.faults.clone();
     table
-        .register("log_sink", move || LogSink(faults.clone()))
+        .register("log_sink", log_sink(), move || LogSink(faults.clone()))
         .expect("valid records");
     register_builtins(&mut table).expect("valid records");
     table

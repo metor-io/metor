@@ -139,6 +139,10 @@ class Gain(System):
     _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, input: Sources[Ping] = (), gain: float) -> None:
+        """
+        Args:
+            gain: Scales every ping.
+        """
         super().__init__({"input": input}, {"gain": gain})
 
     output: OutPort[Ping]

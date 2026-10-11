@@ -293,17 +293,15 @@ impl System for StatusWatch {
 #[derive(Default)]
 pub struct Boom(u64);
 
+/// Fails on its second cycle.
 #[crate::system]
-impl Boom {
-    /// Fails on its second cycle.
-    fn execute(&mut self, imu: &mut Output<Imu>, now: Timestamp) {
-        self.0 += 1;
-        assert!(self.0 < 2, "boom on cycle {}", self.0);
-        let _ = imu.write(&Imu {
-            timestamp: now,
-            sample: 1.0,
-        });
-    }
+fn boom(#[state] s: &mut Boom, imu: &mut Output<Imu>, now: Timestamp) {
+    s.0 += 1;
+    assert!(s.0 < 2, "boom on cycle {}", s.0);
+    let _ = imu.write(&Imu {
+        timestamp: now,
+        sample: 1.0,
+    });
 }
 
 /// A cyclic type's ports under the empty context.
@@ -347,13 +345,11 @@ impl System for Trap {
 pub struct Tap(Recorder);
 
 #[crate::system]
-impl Tap {
-    fn execute(&mut self, inputs: &mut DynInputs) {
-        for (def, input) in inputs.iter_mut() {
-            for record in input.drain() {
-                let Ok(bytes) = record else { continue };
-                self.0.push_tap(def.name.to_string(), bytes.to_vec());
-            }
+fn tap(#[state] s: &mut Tap, inputs: &mut DynInputs) {
+    for (def, input) in inputs.iter_mut() {
+        for record in input.drain() {
+            let Ok(bytes) = record else { continue };
+            s.0.push_tap(def.name.to_string(), bytes.to_vec());
         }
     }
 }
@@ -362,65 +358,46 @@ impl Tap {
 pub struct Emit(Vec<u8>);
 
 #[crate::system]
-impl Emit {
-    fn execute(&mut self, outputs: &mut DynOutputs) {
-        for (_, output) in outputs.iter_mut() {
-            let _ = output.write_bytes(&self.0);
-        }
+fn emit(#[state] s: &mut Emit, outputs: &mut DynOutputs) {
+    for (_, output) in outputs.iter_mut() {
+        let _ = output.write_bytes(&s.0);
     }
 }
 
-/// Doubles every sample as it arrives, on a background thread.
-pub struct Relay;
-
+/// Publishes one estimate per sample.
 #[crate::system]
-impl Relay {
-    /// Publishes one estimate per sample.
-    async fn run(&mut self, imu: &mut Input<Imu, Notifier>, nav: &mut Output<Nav>, stop: Stop) {
-        while let Some(sample) = next(imu, &stop).await {
-            let _ = nav.write(&Nav {
-                timestamp: sample.timestamp,
-                estimate: sample.sample * 2.0,
-            });
-        }
+async fn relay(imu: &mut Input<Imu, Notifier>, nav: &mut Output<Nav>, stop: Stop) {
+    while let Some(sample) = next(imu, &stop).await {
+        let _ = nav.write(&Nav {
+            timestamp: sample.timestamp,
+            estimate: sample.sample * 2.0,
+        });
     }
 }
 
 /// Reads nothing, so its input mirror fills and drops.
-pub struct Sleeper;
-
 #[crate::system]
-impl Sleeper {
-    async fn run(&mut self, imu: &mut Input<Imu, Notifier>, stop: Stop) {
-        let _ = imu;
-        stop.wait().await;
-    }
+async fn sleeper(imu: &mut Input<Imu, Notifier>, stop: Stop) {
+    let _ = imu;
+    stop.wait().await;
 }
 
 /// Panics once it has read one record.
-pub struct AsyncBoom;
-
 #[crate::system]
-impl AsyncBoom {
-    async fn run(&mut self, imu: &mut Input<Imu, Notifier>, stop: Stop) {
-        if next(imu, &stop).await.is_some() {
-            panic!("boom on the background thread");
-        }
+async fn async_boom(imu: &mut Input<Imu, Notifier>, stop: Stop) {
+    if next(imu, &stop).await.is_some() {
+        panic!("boom on the background thread");
     }
 }
 
 /// Publishes the hash of its thread's id once, then waits for stop.
-pub struct WhoAmI;
-
 #[crate::system]
-impl WhoAmI {
-    async fn run(&mut self, nav: &mut Output<Nav>, stop: Stop) {
-        let _ = nav.write(&Nav {
-            timestamp: Timestamp(0),
-            estimate: thread_id() as f64,
-        });
-        stop.wait().await;
-    }
+async fn who_am_i(nav: &mut Output<Nav>, stop: Stop) {
+    let _ = nav.write(&Nav {
+        timestamp: Timestamp(0),
+        estimate: thread_id() as f64,
+    });
+    stop.wait().await;
 }
 
 /// The next sample, or `None` once stop resolves.
@@ -444,12 +421,10 @@ fn thread_id() -> u64 {
 pub struct LogSink(Recorder);
 
 #[crate::system]
-impl LogSink {
-    fn execute(&mut self, lines: &mut Input<LogEvent>) {
-        for line in lines.drain() {
-            let Ok(line) = line else { continue };
-            self.0.push_log(line);
-        }
+fn log_sink(#[state] s: &mut LogSink, lines: &mut Input<LogEvent>) {
+    for line in lines.drain() {
+        let Ok(line) = line else { continue };
+        s.0.push_log(line);
     }
 }
 
@@ -527,38 +502,40 @@ pub fn table(recorder: &Recorder) -> SystemTable {
         .register_system("reserved", |_| Ok((Reserved, ())))
         .expect("valid records");
     table
-        .register("boom", Boom::default)
+        .register("boom", boom(), Boom::default)
         .expect("valid records");
     table
         .register_system("trap", |_| Ok((Trap, ())))
         .expect("valid records");
     let logs = recorder.clone();
     table
-        .register("log_sink", move || LogSink(logs.clone()))
+        .register("log_sink", log_sink(), move || LogSink(logs.clone()))
         .expect("valid records");
     let taps = recorder.clone();
     table
-        .register("tap", move || Tap(taps.clone()))
+        .register("tap", tap(), move || Tap(taps.clone()))
         .expect("valid records");
     table
-        .register("emit", || Emit(Imu::new(1, 5.0).as_bytes().to_vec()))
+        .register("emit", emit(), || {
+            Emit(Imu::new(1, 5.0).as_bytes().to_vec())
+        })
         .expect("valid records");
     table
-        .register_async("relay", || Relay)
+        .register_async("relay", relay(), Default::default)
         .expect("valid records");
     table
-        .register_async("sleeper", || Sleeper)
+        .register_async("sleeper", sleeper(), Default::default)
         .expect("valid records");
     table
-        .register_async("async_boom", || AsyncBoom)
+        .register_async("async_boom", async_boom(), Default::default)
         .expect("valid records");
     table
-        .register_async("ctor_boom", || -> AsyncBoom {
+        .register_async("ctor_boom", async_boom(), || -> () {
             panic!("a constructor that panics")
         })
         .expect("valid records");
     table
-        .register_async("who_am_i", || WhoAmI)
+        .register_async("who_am_i", who_am_i(), Default::default)
         .expect("valid records");
     table
 }
