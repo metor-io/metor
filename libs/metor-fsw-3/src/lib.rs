@@ -128,6 +128,12 @@
 //! adapter. A channel lets an operator start, stop, reset, abort, or load the
 //! system by sending `SequenceCommand` messages. A [`dl`] slot is a place in the
 //! schedule whose system can be swapped for another pack system at run time.
+//!
+//! The built-in [`link`] systems, `Publish` and `Subscribe`, move records
+//! between targets. They are async systems whose ports are listed in config.
+//! `Publish` sends records over metor-proto to every connected peer.
+//! `Subscribe` writes the records peers send onto its outputs. Together they
+//! carry a target's telemetry out and its commands back.
 
 // The derives name this crate by its package name, in doctests as well as here.
 extern crate self as metor_fsw_3;
@@ -145,6 +151,8 @@ pub mod dl;
 pub mod fn_system;
 pub mod frame;
 pub mod io;
+#[cfg(feature = "host")]
+pub mod link;
 pub mod log;
 #[cfg(all(feature = "threads", not(target_family = "wasm")))]
 mod mirror;
@@ -177,6 +185,8 @@ pub use fn_system::{
 };
 pub use frame::Frame;
 pub use io::{Buf, Cap, Handle, Io, IoInit, Pending, ResourceStatus, Slot};
+#[cfg(feature = "host")]
+pub use link::{LinkStatus, Transport};
 pub use log::{Log, LogLayer};
 pub use metor_fsw_3_macros::{Frame, Record, sequence, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};

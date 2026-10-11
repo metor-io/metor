@@ -117,6 +117,9 @@ impl<A: AsyncRead, L: Length> LengthDelReader<A, L> {
         let len = len.as_usize();
         let required_len = len.checked_add(L::SIZE).ok_or(Error::IntegerOverflow)?;
         buf.grow(required_len);
+        if required_len > buf.total_len() {
+            return Err(Error::BufferOverflow);
+        }
         while total_read < required_len {
             let mut slice = buf.try_slice(total_read..).ok_or(Error::BufferOverflow)?;
             let read_len = rent!(self.read(slice).await, slice)?;
