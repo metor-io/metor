@@ -1,6 +1,7 @@
 //! The config value a system is built from.
 
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -26,7 +27,9 @@ impl Params<'_> {
 }
 
 /// A `ParamError` is why a config value did not decode as the system's params.
-#[derive(Clone, Debug, PartialEq, Eq, Error)]
+///
+/// It crosses the pack boundary as JSON, so it derives serde.
+#[derive(Clone, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
 pub enum ParamError {
     #[error("unknown key `{0}`")]
     UnknownKey(String),

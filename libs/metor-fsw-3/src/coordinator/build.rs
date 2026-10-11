@@ -214,7 +214,7 @@ fn resolve_edges(
 fn check_ids(plan: &Plan<'_>) -> Result<(), BuildError> {
     for system in &plan.systems {
         for (port, edges) in system.inputs.iter().enumerate() {
-            let def = system.entry.def.inputs[port];
+            let def = &system.entry.def.inputs[port];
             for &ring in edges {
                 let spec = &plan.rings[ring];
                 if spec.id != def.id {
@@ -274,25 +274,15 @@ fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Result<Vec<Entry>, Build
     plan.systems
         .iter()
         .map(|system| {
-            let outputs = system.entry.def.outputs.len();
-            let writers = (0..outputs)
-                .map(|i| {
-                    let ring: &RingBuffer = &rings[system.base_ring_idx + i];
-                    ring.writer(NoWake).expect("one writer per output ring")
-                })
+            let outputs = (0..system.entry.def.outputs.len())
+                .map(|i| &rings[system.base_ring_idx + i])
                 .collect();
-            let views = system
+            let inputs = system
                 .inputs
                 .iter()
-                .map(|edges| {
-                    edges
-                        .iter()
-                        // PANIC Safety: The ring allocation pass will allocate a ring for every input
-                        .map(|&ring| rings[ring].view(NoWake).expect("a counted reader slot"))
-                        .collect()
-                })
+                .map(|edges| edges.iter().map(|&ring| &rings[ring]).collect())
                 .collect();
-            let step = (system.entry.make)(system.params, views, writers).map_err(|source| {
+            let step = (system.entry.make)(system.params, inputs, outputs).map_err(|source| {
                 BuildError::Params {
                     id: system.id.to_string(),
                     source,
@@ -300,7 +290,7 @@ fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Result<Vec<Entry>, Build
             })?;
             Ok(Entry {
                 name: system.id.to_string(),
-                step,
+                step: Some(step),
                 // PANIC Safety: SystemStatus requires only eight-byte alignment.
                 status: Output::try_new({
                     let ring: &RingBuffer = &rings[system.status_ring()];
@@ -345,15 +335,20 @@ mod tests {
     fn unsupported_input_and_output_alignment_is_rejected() {
         for input in [true, false] {
             let port = crate::PortDef {
-                name: "aligned",
+                name: "aligned".into(),
+                record: utils::Imu::NAME.into(),
                 id: utils::Imu::ID,
                 max_len: 32,
                 alignment: 32,
                 depth: 1,
             };
             let def = crate::SystemDef {
-                name: "test",
-                inputs: if input { vec![port] } else { Vec::new() },
+                name: "test".into(),
+                inputs: if input {
+                    vec![port.clone()]
+                } else {
+                    Vec::new()
+                },
                 outputs: if input { Vec::new() } else { vec![port] },
             };
             assert_eq!(
@@ -372,9 +367,17 @@ mod tests {
         let port = Output::<utils::Imu>::def("sample");
         for input in [true, false] {
             let def = crate::SystemDef {
-                name: "test",
-                inputs: if input { vec![port, port] } else { vec![] },
-                outputs: if input { vec![] } else { vec![port, port] },
+                name: "test".into(),
+                inputs: if input {
+                    vec![port.clone(), port.clone()]
+                } else {
+                    vec![]
+                },
+                outputs: if input {
+                    vec![]
+                } else {
+                    vec![port.clone(), port.clone()]
+                },
             };
             let expected = if input {
                 BuildError::DuplicateInput {
@@ -395,8 +398,8 @@ mod tests {
     fn input_and_output_can_share_a_name() {
         let port = Output::<utils::Imu>::def("sample");
         let def = crate::SystemDef {
-            name: "test",
-            inputs: vec![port],
+            name: "test".into(),
+            inputs: vec![port.clone()],
             outputs: vec![port],
         };
         assert_eq!(check_port_names("instance", &def), Ok(()));
@@ -606,6 +609,26 @@ mod tests {
                 source: crate::coordinator::ParamError::UnknownKey("gain".into()),
             })
         );
+    }
+
+    #[test]
+    fn every_edge_claims_exactly_one_reader_slot() {
+        let mut config = pipeline_config();
+        // A second consumer of `imu.imu`, so that ring carries two edges.
+        config.systems.push(SystemConfig {
+            inputs: vec![InputConfig {
+                port: "imu".into(),
+                from: vec![PortRef::new("imu", "imu")],
+            }],
+            ..SystemConfig::new("nav_two", "nav")
+        });
+        let coordinator = build(config).expect("valid config");
+        let imu = &coordinator.rings[0];
+        assert_eq!(
+            imu.view(NoWake).err(),
+            Some(metor_fsw_3_ring::FullReaderTable)
+        );
+        assert!(imu.writer(NoWake).is_err());
     }
 
     #[test]

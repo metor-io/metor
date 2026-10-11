@@ -1,25 +1,9 @@
-//! Loom models.
-//!
-//! These cover what Kani cannot: the atomic orderings. Loom runs each model
-//! under every interleaving and every reordering its memory model permits,
-//! which is how the reader-registration handshake and the wrap-gap publication
-//! order get checked rather than sampled. `LOOM.md` in the crate root has the
-//! details, including where loom's own modelling stops short.
-//!
-//! Models stay tiny on purpose. The writer's in-use scan is one atomic load
-//! per reader slot inside a `SeqCst`-fenced region, so the state space grows
-//! fast in both `max_readers` and message count.
-
+//! Bounded concurrency models; see `LOOM.md` for limits.
 use super::*;
 use crate::sync::thread;
 
-/// Data region size for the models.
 const CAP: usize = 64;
-/// Payload size, chosen so a record's frame does not divide the capacity.
-/// That is what forces a wrap gap: with a frame that divides it, records land
-/// flush against the lap boundary forever and the gap path never runs.
 const PAYLOAD: usize = 17;
-/// Bytes one record occupies, header and padding included.
 const FRAME: usize = 48;
 
 const _: () = assert!(FRAME == frame_len(PAYLOAD));
@@ -28,8 +12,6 @@ const _: () = assert!(CAP % FRAME != 0, "a gap would never form");
 // wrap costs `CAP - FRAME` bytes of gap on top of the record itself.
 const _: () = assert!(FRAME + (CAP - FRAME) <= CAP);
 
-/// Payload bytes for record `n`, distinct per record so a reader that picks up
-/// overwritten bytes fails an equality check rather than passing silently.
 fn payload(n: u8) -> [u8; PAYLOAD] {
     let mut p = [0u8; PAYLOAD];
     let mut i = 0;
@@ -47,14 +29,6 @@ fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
     })
 }
 
-/// A view registering while the writer is mid-stream must never be lapped, and
-/// must never see a torn or stale record.
-///
-/// This is the race the crate docs call the one racy edge: the writer can scan
-/// the reader table an instant before a new claim lands, validate a write
-/// against nobody, and reuse bytes the new view believes are pinned. Both
-/// sides fence `SeqCst` to close it. Loom explores the interleavings that
-/// `concurrent_view_churn` can only sample under Miri seeds.
 #[test]
 fn registration_races_backpressure() {
     loom::model(|| {
@@ -109,13 +83,6 @@ fn registration_races_backpressure() {
     });
 }
 
-/// A reader parked on a wrap gap must see the gap marker before it could
-/// misread the stale bytes behind it as a record header.
-///
-/// The writer stores `hwm` before `committed`; the reader loads `committed`
-/// before `hwm`. That pairing is what makes a post-wrap `committed` imply a
-/// visible marker, and it is the kind of ordering claim only an exhaustive
-/// model can check.
 #[test]
 fn hwm_visible_before_committed() {
     loom::model(|| {
@@ -149,7 +116,6 @@ fn hwm_visible_before_committed() {
     });
 }
 
-/// Exactly one of two racing claimants gets the writer role.
 #[test]
 fn writer_claim_handoff() {
     loom::model(|| {
@@ -165,15 +131,11 @@ fn writer_claim_handoff() {
             .map(|mut w| w.try_write(&payload(1)).is_ok());
         let theirs = t.join().unwrap();
 
-        // The claim is a CAS, so they cannot hold it at once. Both succeeding
-        // is legal only if the first dropped before the second claimed, which
-        // is a real ordering rather than a double claim.
+        // Both may succeed if the first claim is dropped before the second.
         assert!(mine.is_ok() || theirs.is_ok());
     });
 }
 
-/// A held [`ReadGrant`] pins its bytes: the writer must refuse a write that
-/// would reuse them, and the borrow reads back correctly throughout.
 #[test]
 fn grant_pins_bytes() {
     loom::model(|| {
@@ -187,8 +149,7 @@ fn grant_pins_bytes() {
         let grant = v.try_read().expect("never corrupt").expect("committed");
         assert_eq!(&grant[..], &payload(1)[..]);
         let wrote = t.join().unwrap();
-        // The writer cannot lap a reader, so the bytes held still for the
-        // grant's whole lifetime whatever the other thread decided.
+        // Bytes must remain stable until the grant is dropped.
         assert_eq!(&grant[..], &payload(1)[..]);
         // The grant pins the cursor at 0, and a second record needs the gap
         // plus its own frame, which is the entire lap.
@@ -197,8 +158,6 @@ fn grant_pins_bytes() {
     });
 }
 
-/// With two views the writer is bounded by the slower of them, whichever order
-/// the in-use scan happens to observe their claims in.
 #[test]
 fn two_readers_slowest() {
     loom::model(|| {
@@ -239,12 +198,6 @@ fn two_readers_slowest() {
     });
 }
 
-/// The `slowest <= committed` precondition [`fits`] relies on. Kani proves a
-/// violation can only cost a panic or a spurious `WouldBlock`, never a bad
-/// write; this decides whether a writer can observe one at all, by racing a
-/// writer that wraps against a reader doing gap skips.
-///
-/// The check is the `debug_assert!` in `Writer::fits`, which loom builds keep.
 #[test]
 fn cursor_never_exceeds_committed_at_fits() {
     loom::model(|| {
@@ -315,14 +268,14 @@ fn reclaim_does_not_free_a_reused_slot() {
     loom::model(|| {
         let ring = ring(64, 1);
         let reader = ring.view(NoWake).unwrap();
-        ring.inner.slot_owner(0).store(DEAD_PID, Release);
+        ring.inner.slot(0).owner.store(DEAD_PID, Release);
         drop(reader);
-        assert_eq!(ring.inner.slot_owner(0).load(Acquire), 0);
+        assert_eq!(ring.inner.slot(0).owner.load(Acquire), 0);
         let consumer = ring.clone();
         let task = thread::spawn(move || {
             let reader = consumer.view(NoWake).unwrap();
-            assert_ne!(consumer.inner.slot_cursor(0).load(Acquire), FREE_SLOT);
-            assert_eq!(consumer.inner.slot_owner(0).load(Acquire), owner_tag());
+            assert_ne!(consumer.inner.slot(0).cursor.load(Acquire), FREE_SLOT);
+            assert_eq!(consumer.inner.slot(0).owner.load(Acquire), owner_tag());
             drop(reader);
         });
         // SAFETY: the synthetic owner has no live handles.
@@ -335,8 +288,8 @@ fn reclaim_does_not_free_a_reused_slot() {
 fn concurrent_reclaimers_do_not_free_a_new_owner() {
     loom::model(|| {
         let ring = ring(64, 1);
-        ring.inner.slot_cursor(0).store(0, Release);
-        ring.inner.slot_owner(0).store(DEAD_PID, Release);
+        ring.inner.slot(0).cursor.store(0, Release);
+        ring.inner.slot(0).owner.store(DEAD_PID, Release);
         let reclaimer = ring.clone();
         let task = thread::spawn(move || {
             // SAFETY: the synthetic owner has no live handles.
@@ -345,10 +298,10 @@ fn concurrent_reclaimers_do_not_free_a_new_owner() {
         // SAFETY: the synthetic owner has no live handles.
         unsafe { ring.reclaim_owner(DEAD_PID) };
         if let Ok(reader) = ring.view(NoWake) {
-            assert_ne!(ring.inner.slot_cursor(0).load(Acquire), FREE_SLOT);
-            assert_eq!(ring.inner.slot_owner(0).load(Acquire), owner_tag());
+            assert_ne!(ring.inner.slot(0).cursor.load(Acquire), FREE_SLOT);
+            assert_eq!(ring.inner.slot(0).owner.load(Acquire), owner_tag());
             task.join().unwrap();
-            assert_ne!(ring.inner.slot_cursor(0).load(Acquire), FREE_SLOT);
+            assert_ne!(ring.inner.slot(0).cursor.load(Acquire), FREE_SLOT);
             drop(reader);
         } else {
             task.join().unwrap();

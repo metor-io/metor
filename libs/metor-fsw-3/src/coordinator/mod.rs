@@ -7,6 +7,8 @@
 mod build;
 mod config;
 mod error;
+#[cfg(test)]
+mod fault_tests;
 mod params;
 mod run;
 mod status;
@@ -21,13 +23,15 @@ pub use config::{Clock, CoordinatorConfig, InputConfig, PortRef, SystemConfig};
 pub use error::BuildError;
 pub use params::{ParamError, Params};
 pub use run::Step;
+pub(crate) use run::catch_step;
 pub use status::SystemStatus;
 pub use table::SystemTable;
+pub(crate) use table::TableEntry;
 
 /// One bound system and the status port the coordinator owns for it.
 struct Entry {
     name: String,
-    step: Box<dyn Step>,
+    step: Option<Box<dyn Step>>,
     status: Output<SystemStatus>,
 }
 
@@ -39,7 +43,7 @@ pub struct Coordinator {
     /// Start of the simulated timeline, taken at build.
     epoch: Timestamp,
     cycle: u64,
-    /// Declared last so every port drops before the region it points into.
+    /// Retained handles share ownership of these regions.
     rings: Vec<RingBuffer>,
 }
 
@@ -52,5 +56,13 @@ impl Coordinator {
     /// The systems' config ids, in step order.
     pub fn entry_names(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|entry| entry.name.as_str())
+    }
+
+    /// The ids of the systems a panic latched off, in step order.
+    pub fn latched(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.latched())
+            .map(|entry| entry.name.as_str())
     }
 }

@@ -1,23 +1,16 @@
-//! The `log` output every fn system has, and the `tracing` bridge onto it.
-//!
-//! [`Log`] writes stamped [`LogEvent`]s directly. [`layer`] queues `tracing`
-//! events on the current thread, and [`drain`] moves the queue onto one
-//! output, stamped with the cycle time. `FnSystem::execute` clears the queue
-//! before the user's `execute` and drains it after, so a line lands on the
-//! ring of the system that emitted it.
+//! Log is a tracing_subscriber that takes tracing logs and puts them into [`LogEvent`] messages
 
-use core::cell::{Cell, RefCell};
+use core::cell::Cell;
+use core::ptr::NonNull;
+use std::borrow::Cow;
 
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Context;
 
-use crate::port::{Output, SendError};
+use crate::port::Output;
 use crate::record::{DecodeError, EncodeError, Record};
-
-/// Queued lines per cycle; later ones are dropped and counted.
-pub const MAX_LINES: usize = 64;
 
 impl Record for LogEvent {
     const NAME: &'static str = "log";
@@ -38,136 +31,186 @@ impl Record for LogEvent {
     }
 }
 
-/// A `Log` writes one system's log lines, stamped with the cycle time.
-pub struct Log {
+/// A `LogPort` writes one system's log lines, stamped with the cycle time.
+pub struct LogPort {
     output: Output<LogEvent>,
     now: Timestamp,
+    dropped: u32,
 }
 
-impl Log {
-    pub(crate) fn new(output: Output<LogEvent>) -> Self {
+impl LogPort {
+    pub fn new(output: Output<LogEvent>) -> Self {
         Self {
             output,
             now: Timestamp(0),
+            dropped: 0,
         }
     }
 
-    /// Sets the stamp every line written this cycle carries.
-    pub(crate) fn begin(&mut self, now: Timestamp) {
-        self.now = now;
-    }
-
-    /// Writes an info line.
-    pub fn info(&mut self, message: impl Into<String>) {
-        let _ = self.write(LogLevel::Info, message.into(), Vec::new());
-    }
-
-    /// Writes a warning line.
-    pub fn warn(&mut self, message: impl Into<String>) {
-        let _ = self.write(LogLevel::Warn, message.into(), Vec::new());
+    /// Writes one line with the given level and fields, stamped with the cycle time.
+    fn write(
+        &mut self,
+        level: LogLevel,
+        message: Cow<'static, str>,
+        fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+    ) {
+        self.emit(LogEvent {
+            timestamp: self.now,
+            level,
+            source: Cow::Borrowed(""),
+            target: Cow::Borrowed(""),
+            message,
+            span: None,
+            fields,
+            file: None,
+            line: None,
+        });
     }
 
     /// Writes an error line whose first field is `kind`, the fault's identity for the ground.
-    pub fn fault(&mut self, kind: &str, message: impl Into<String>) {
-        let fields = vec![("kind".to_string(), kind.to_string())];
-        let _ = self.write(LogLevel::Error, message.into(), fields);
+    pub(crate) fn fault(
+        &mut self,
+        now: Timestamp,
+        kind: impl Into<Cow<'static, str>>,
+        message: impl Into<Cow<'static, str>>,
+    ) {
+        self.now = now;
+        let fields = vec![(Cow::Borrowed("kind"), kind.into())];
+        self.write(LogLevel::Error, message.into(), fields);
+    }
+
+    /// Stamps and publishes one event; a ring with no room counts as a drop.
+    fn emit(&mut self, mut event: LogEvent) {
+        event.timestamp = self.now;
+        if self.output.write(&event).is_err() {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    /// Writes the count of lines the ring refused, clearing it only if the line lands.
+    fn report_dropped(&mut self) {
+        if self.dropped == 0 {
+            return;
+        }
+        let event = LogEvent {
+            timestamp: self.now,
+            level: LogLevel::Warn,
+            source: Cow::Borrowed(""),
+            target: Cow::Borrowed(""),
+            message: Cow::Borrowed("log lines dropped"),
+            span: None,
+            fields: vec![(Cow::Borrowed("dropped"), self.dropped.to_string().into())],
+            file: None,
+            line: None,
+        };
+        if self.output.write(&event).is_ok() {
+            self.dropped = 0;
+        }
+    }
+}
+
+/// A `Log` writes the running system's log lines onto the entered [`LogPort`].
+pub struct Log;
+
+impl Log {
+    /// Writes an info line.
+    pub fn info(&mut self, message: impl Into<Cow<'static, str>>) {
+        self.write(LogLevel::Info, message, Vec::new());
+    }
+
+    /// Writes a warning line.
+    pub fn warn(&mut self, message: impl Into<Cow<'static, str>>) {
+        self.write(LogLevel::Warn, message, Vec::new());
+    }
+
+    /// Writes an error line whose first field is `kind`, the fault's identity for the ground.
+    pub fn fault(
+        &mut self,
+        kind: impl Into<Cow<'static, str>>,
+        message: impl Into<Cow<'static, str>>,
+    ) {
+        let fields = vec![(Cow::Borrowed("kind"), kind.into())];
+        self.write(LogLevel::Error, message, fields);
     }
 
     /// Writes one line with the given level and fields.
     pub fn write(
         &mut self,
         level: LogLevel,
-        message: String,
-        fields: Vec<(String, String)>,
-    ) -> Result<(), SendError> {
-        self.output.write(&LogEvent {
-            timestamp: self.now,
-            level,
-            source: String::new(),
-            target: String::new(),
-            message,
-            span: None,
-            fields,
-            file: None,
-            line: None,
-        })
-    }
-
-    /// Moves this thread's queued `tracing` events onto the output.
-    pub(crate) fn drain_queue(&mut self) {
-        drain(self.now, &mut self.output);
+        message: impl Into<Cow<'static, str>>,
+        fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+    ) {
+        let message = message.into();
+        with_port(|port| port.write(level, message, fields));
     }
 }
 
 thread_local! {
-    static QUEUE: RefCell<Vec<LogEvent>> = RefCell::new(Vec::with_capacity(MAX_LINES));
-    static DROPPED: Cell<u32> = const { Cell::new(0) };
+    static SLOT: Cell<Option<NonNull<LogPort>>> = const { Cell::new(None) };
 }
 
-/// Empties this thread's queue; events queued before a system ran are not its lines.
-pub fn clear() {
-    QUEUE.with(|q| q.borrow_mut().clear());
-    DROPPED.set(0);
+/// Routes this thread's logs to `port` during `f`, stamping its lines `now`.
+///
+/// ```compile_fail
+/// use metor_fsw_3::log::{LogPort, with_log_port};
+/// use metor_proto::types::Timestamp;
+///
+/// fn cannot_drop_port(mut port: LogPort) {
+///     with_log_port(&mut port, Timestamp(0), || drop(port));
+/// }
+/// ```
+pub fn with_log_port<R>(port: &mut LogPort, now: Timestamp, f: impl FnOnce() -> R) -> R {
+    port.now = now;
+    let _restore = RestoreSlot(SLOT.replace(Some(NonNull::from(port))));
+    let result = f();
+    with_port(LogPort::report_dropped);
+    result
 }
 
-/// Writes every queued event onto `output` stamped `now`, then one warning if any were dropped.
-pub fn drain(now: Timestamp, output: &mut Output<LogEvent>) {
-    QUEUE.with(|q| {
-        for mut event in q.borrow_mut().drain(..) {
-            event.timestamp = now;
-            let _ = output.write(&event);
-        }
-    });
-    let dropped = DROPPED.replace(0);
-    if dropped > 0 {
-        let _ = output.write(&LogEvent {
-            timestamp: now,
-            level: LogLevel::Warn,
-            source: String::new(),
-            target: String::new(),
-            message: "log lines dropped".to_string(),
-            span: None,
-            fields: vec![("dropped".to_string(), dropped.to_string())],
-            file: None,
-            line: None,
-        });
+struct RestoreSlot(Option<NonNull<LogPort>>);
+
+impl Drop for RestoreSlot {
+    fn drop(&mut self) {
+        SLOT.set(self.0);
     }
 }
 
-fn push(event: LogEvent) {
-    QUEUE.with(|q| {
-        let mut q = q.borrow_mut();
-        if q.len() < MAX_LINES {
-            q.push(event);
-        } else {
-            DROPPED.set(DROPPED.get().saturating_add(1));
-        }
-    });
+fn with_port(f: impl FnOnce(&mut LogPort)) {
+    let Some(mut port) = SLOT.take() else {
+        return;
+    };
+    let _restore = RestoreSlot(Some(port));
+    // SAFETY: with_log_port borrows the port until its private guard restores
+    // the previous slot, including on unwind. Removing this thread-local
+    // pointer for the entire callback prevents recursive mutable access.
+    f(unsafe { port.as_mut() });
 }
 
-/// Returns the layer that queues `tracing` events for [`drain`].
+/// Returns the layer that writes `tracing` events to the entered [`LogPort`].
 pub fn layer() -> LogLayer {
     LogLayer
 }
 
-/// A `LogLayer` converts each `tracing` event to a [`LogEvent`] on this thread's queue.
+/// A `LogLayer` writes each `tracing` event as a [`LogEvent`] on this thread's port.
 pub struct LogLayer;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let meta = event.metadata();
-        let mut visitor = Fields::default();
-        event.record(&mut visitor);
-        push(LogEvent {
-            timestamp: Timestamp(0),
-            level: level_of(meta.level()),
-            source: meta.target().to_string(),
-            target: meta.target().to_string(),
-            message: visitor.message,
-            span: None,
-            fields: visitor.fields,
-            file: meta.file().map(str::to_string),
-            line: meta.line(),
+        with_port(|port| {
+            let meta = event.metadata();
+            let mut visitor = Fields::default();
+            event.record(&mut visitor);
+            port.emit(LogEvent {
+                timestamp: Timestamp(0),
+                level: level_of(meta.level()),
+                source: Cow::Borrowed(meta.target()),
+                target: Cow::Borrowed(meta.target()),
+                message: visitor.message,
+                span: None,
+                fields: visitor.fields,
+                file: meta.file().map(Cow::Borrowed),
+                line: meta.line(),
+            });
         });
     }
 }
@@ -185,46 +228,48 @@ fn level_of(level: &tracing::Level) -> LogLevel {
 /// Collects an event's `message` and its other fields as strings.
 #[derive(Default)]
 struct Fields {
-    message: String,
-    fields: Vec<(String, String)>,
+    message: Cow<'static, str>,
+    fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
 }
 
 impl Visit for Fields {
     fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
         if field.name() == "message" {
-            self.message = format!("{value:?}");
+            self.message = format!("{value:?}").into();
         } else {
             self.fields
-                .push((field.name().to_string(), format!("{value:?}")));
+                .push((Cow::Borrowed(field.name()), format!("{value:?}").into()));
         }
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
-            self.message = value.to_string();
+            self.message = value.to_string().into();
         } else {
             self.fields
-                .push((field.name().to_string(), value.to_string()));
+                .push((Cow::Borrowed(field.name()), value.to_string().into()));
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+    use metor_fsw_3_ring::{Config, NoWake, RingBuffer, frame_len};
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
     use crate::port::{Input, ring_capacity};
 
-    fn log_pair() -> (RingBuffer, Log, Input<LogEvent>) {
+    /// A port whose ring holds `records` lines of `MAX_LEN`.
+    fn log_pair(records: usize) -> (RingBuffer, LogPort, Input<LogEvent>) {
         let ring = RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(LogEvent::MAX_LEN, 128).expect("valid"),
+            capacity: ring_capacity(LogEvent::MAX_LEN, records).expect("valid"),
             max_readers: 1,
         });
-        let log = Log::new(Output::try_new(ring.writer(NoWake).expect("writer")).expect("aligned"));
+        let port =
+            LogPort::new(Output::try_new(ring.writer(NoWake).expect("writer")).expect("aligned"));
         let input = Input::try_new(vec![ring.view(NoWake).expect("slot")]).expect("aligned");
-        (ring, log, input)
+        (ring, port, input)
     }
 
     fn lines(input: &mut Input<LogEvent>) -> Vec<LogEvent> {
@@ -233,36 +278,34 @@ mod tests {
 
     #[test]
     fn direct_lines_carry_the_stamp_level_and_kind() {
-        let (_ring, mut log, mut input) = log_pair();
-        log.begin(Timestamp(5));
-        log.info("hello");
-        log.warn("careful");
-        log.fault("sensor_stale", "no gps");
+        let (_ring, mut port, mut input) = log_pair(8);
+        let mut log = Log;
+        with_log_port(&mut port, Timestamp(5), || {
+            log.info("hello");
+            log.warn("careful");
+            log.fault("sensor_stale", "no gps");
+        });
         let seen = lines(&mut input);
         assert_eq!(seen.len(), 3);
         assert!(seen.iter().all(|l| l.timestamp == Timestamp(5)));
         assert_eq!(
-            (seen[0].level, seen[0].message.as_str()),
+            (seen[0].level, &*seen[0].message),
             (LogLevel::Info, "hello")
         );
         assert_eq!(seen[1].level, LogLevel::Warn);
         assert_eq!(seen[2].level, LogLevel::Error);
-        assert_eq!(
-            seen[2].fields,
-            vec![("kind".to_string(), "sensor_stale".to_string())]
-        );
+        assert_eq!(seen[2].fields, vec![("kind".into(), "sensor_stale".into())]);
     }
 
     #[test]
-    fn traced_events_drain_with_their_fields_and_location() {
-        let (_ring, mut log, mut input) = log_pair();
-        clear();
+    fn traced_events_land_with_their_fields_and_location() {
+        let (_ring, mut port, mut input) = log_pair(8);
         let subscriber = tracing_subscriber::registry().with(layer());
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::warn!(slot = "nav", attempts = 3, "occupant failed");
+        with_log_port(&mut port, Timestamp(9), || {
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::warn!(slot = "nav", attempts = 3, "occupant failed");
+            });
         });
-        log.begin(Timestamp(9));
-        log.drain_queue();
         let seen = lines(&mut input);
         assert_eq!(seen.len(), 1);
         let ev = &seen[0];
@@ -277,35 +320,189 @@ mod tests {
     }
 
     #[test]
-    fn the_queue_caps_and_reports_drops_once() {
-        let (_ring, mut log, mut input) = log_pair();
-        clear();
+    fn an_event_with_no_port_entered_reaches_no_ring() {
+        let (_ring, mut port, mut input) = log_pair(8);
         let subscriber = tracing_subscriber::registry().with(layer());
         tracing::subscriber::with_default(subscriber, || {
-            for i in 0..(MAX_LINES + 2) {
-                tracing::info!(i, "line");
-            }
+            tracing::info!("between systems");
         });
-        log.begin(Timestamp(1));
-        log.drain_queue();
-        let seen = lines(&mut input);
-        assert_eq!(seen.len(), MAX_LINES + 1);
-        let last = seen.last().expect("warning");
-        assert_eq!(last.level, LogLevel::Warn);
-        assert_eq!(last.fields, vec![("dropped".to_string(), "2".to_string())]);
-        log.drain_queue();
+        with_log_port(&mut port, Timestamp(0), || {});
         assert!(lines(&mut input).is_empty());
     }
 
     #[test]
-    fn clear_discards_events_from_before_a_system_ran() {
-        let (_ring, mut log, mut input) = log_pair();
-        let subscriber = tracing_subscriber::registry().with(layer());
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::info!("stale");
+    fn nested_scopes_restore_the_outer_port() {
+        let (_outer_ring, mut outer, mut outer_input) = log_pair(8);
+        let (_inner_ring, mut inner, mut inner_input) = log_pair(8);
+        let result = with_log_port(&mut outer, Timestamp(1), || {
+            Log.info("before");
+            with_log_port(&mut inner, Timestamp(2), || Log.info("inner"));
+            Log.info("after");
+            42
         });
-        clear();
-        log.drain_queue();
+        Log.info("outside");
+        assert_eq!(result, 42);
+        let outer = lines(&mut outer_input);
+        assert_eq!(outer.len(), 2);
+        assert_eq!(outer[0].message, "before");
+        assert_eq!(outer[1].message, "after");
+        assert!(outer.iter().all(|line| line.timestamp == Timestamp(1)));
+        let inner = lines(&mut inner_input);
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].message, "inner");
+        assert_eq!(inner[0].timestamp, Timestamp(2));
+    }
+
+    #[test]
+    fn callback_panic_restores_the_previous_slot() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let (_outer_ring, mut outer, mut outer_input) = log_pair(8);
+        let (_inner_ring, mut inner, mut inner_input) = log_pair(8);
+        with_log_port(&mut outer, Timestamp(1), || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                with_log_port(&mut inner, Timestamp(2), || {
+                    Log.info("inner");
+                    // PANIC Safety: caught to verify scope cleanup.
+                    panic!("callback failed");
+                });
+            }));
+            assert!(result.is_err());
+            drop(inner);
+            Log.info("outer");
+        });
+        drop(outer);
+        Log.info("outside");
+        assert!(SLOT.get().is_none());
+        assert_eq!(lines(&mut inner_input).len(), 1);
+        let outer = lines(&mut outer_input);
+        assert_eq!(outer.len(), 1);
+        assert_eq!(outer[0].message, "outer");
+    }
+
+    #[test]
+    fn scopes_are_independent_between_threads() {
+        let (_ring, mut port, mut input) = log_pair(8);
+        with_log_port(&mut port, Timestamp(1), || {
+            let worker = std::thread::spawn(|| {
+                assert!(SLOT.get().is_none());
+                let (_ring, mut port, mut input) = log_pair(8);
+                with_log_port(&mut port, Timestamp(2), || Log.info("worker"));
+                lines(&mut input)
+            });
+            Log.info("main");
+            let worker = worker.join().expect("worker completed");
+            assert_eq!(worker.len(), 1);
+            assert_eq!(worker[0].timestamp, Timestamp(2));
+            assert_eq!(worker[0].message, "worker");
+            Log.info("main after worker");
+        });
+        let main = lines(&mut input);
+        assert_eq!(main.len(), 2);
+        assert!(main.iter().all(|line| line.timestamp == Timestamp(1)));
+    }
+
+    #[test]
+    fn formatting_cannot_reenter_the_active_port() {
+        struct Recursive;
+
+        impl core::fmt::Debug for Recursive {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                Log.info("recursive direct log");
+                tracing::info!("recursive tracing event");
+                f.write_str("formatted")
+            }
+        }
+
+        let (_ring, mut port, mut input) = log_pair(8);
+        let subscriber = tracing_subscriber::registry().with(layer());
+        with_log_port(&mut port, Timestamp(3), || {
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(value = ?Recursive, "outer");
+            });
+            Log.info("after formatting");
+        });
+        let seen = lines(&mut input);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].message, "outer");
+        assert_eq!(seen[0].fields, vec![("value".into(), "formatted".into())]);
+        assert_eq!(seen[1].message, "after formatting");
+    }
+
+    #[test]
+    fn formatting_panic_restores_the_active_port() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        struct Panics;
+
+        impl core::fmt::Debug for Panics {
+            fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                // PANIC Safety: caught to verify the temporarily removed slot.
+                panic!("formatting failed");
+            }
+        }
+
+        let (_ring, mut port, mut input) = log_pair(8);
+        let subscriber = tracing_subscriber::registry().with(layer());
+        with_log_port(&mut port, Timestamp(4), || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                tracing::subscriber::with_default(subscriber, || {
+                    tracing::info!(value = ?Panics);
+                });
+            }));
+            assert!(result.is_err());
+            Log.info("after panic");
+        });
+        let seen = lines(&mut input);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].message, "after panic");
+        assert_eq!(seen[0].timestamp, Timestamp(4));
+    }
+
+    /// The count survives a ring with no room for the warning and lands once
+    /// there is room again.
+    #[test]
+    fn a_full_ring_drops_lines_and_reports_the_count_once() {
+        let padded = "p".repeat(LogEvent::MAX_LEN / 2);
+        let (_ring, mut port, mut input) = log_pair(4);
+        let records = ring_capacity(LogEvent::MAX_LEN, 4).expect("valid")
+            / frame_len(encoded_len(&padded, Timestamp(1)));
+        let mut log = Log;
+        with_log_port(&mut port, Timestamp(1), || {
+            for _ in 0..records + 3 {
+                log.info(padded.clone());
+            }
+        });
+        let seen = lines(&mut input);
+        assert_eq!(seen.len(), records);
+        assert!(seen.iter().all(|l| l.level == LogLevel::Info));
+
+        // The reader releases what it drained on its next call, freeing the ring.
         assert!(lines(&mut input).is_empty());
+        with_log_port(&mut port, Timestamp(2), || {});
+        let seen = lines(&mut input);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].level, LogLevel::Warn);
+        assert_eq!(seen[0].fields, vec![("dropped".into(), "3".into())]);
+
+        with_log_port(&mut port, Timestamp(3), || {});
+        assert!(lines(&mut input).is_empty());
+    }
+
+    /// The encoded length of the line `Log::info(message)` writes.
+    fn encoded_len(message: &str, now: Timestamp) -> usize {
+        let event = LogEvent {
+            timestamp: now,
+            level: LogLevel::Info,
+            source: Cow::Borrowed(""),
+            target: Cow::Borrowed(""),
+            message: message.to_string().into(),
+            span: None,
+            fields: Vec::new(),
+            file: None,
+            line: None,
+        };
+        let mut buf = vec![0u8; LogEvent::MAX_LEN];
+        event.encode(&mut buf).expect("encodes").len()
     }
 }

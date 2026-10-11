@@ -8,7 +8,10 @@ use core::marker::PhantomData;
 
 use metor_proto::types::Timestamp;
 
-use crate::system::{System, SystemDef};
+use crate::{
+    log,
+    system::{System, SystemDef},
+};
 
 pub use ctor::Ctor;
 pub use param::{Cycle, Names, Param, Views, Writers};
@@ -20,6 +23,8 @@ pub trait SystemFn: Sized + 'static {
     const NAME: &'static str;
     /// One name per parameter, in parameter order.
     const NAMES: &'static [&'static str];
+    /// The doc comment on `execute`, lines joined with newlines.
+    const DOC: &'static str = "";
 
     /// Calls `execute` with this cycle's parameter values.
     fn call(&mut self, items: <Self::Params as Param>::Item<'_>);
@@ -48,7 +53,7 @@ impl<S: SystemFn> System for FnSystem<S> {
         SystemDef::new::<InSet<S>, OutSet<S>>(S::NAME)
     }
 
-    /// Clears the tracing queue, runs `execute`, then drains the queue onto `log`.
+    /// Points this thread's log lines at the system's own `log` output, then runs `execute`.
     fn execute(
         &self,
         now: Timestamp,
@@ -56,11 +61,16 @@ impl<S: SystemFn> System for FnSystem<S> {
         inputs: &mut InSet<S>,
         outputs: &mut OutSet<S>,
     ) {
-        crate::log::clear();
-        outputs.log.begin(now);
-        let mut cx = Cycle::new(now, &mut outputs.log);
-        state.call(S::Params::get(&mut inputs.0, &mut outputs.outs, &mut cx));
-        outputs.log.drain_queue();
+        log::with_log_port(&mut outputs.log, now, || {
+            let mut log = log::Log;
+            let mut cx = Cycle::new(now, &mut log);
+            state.call(S::Params::get(&mut inputs.0, &mut outputs.outs, &mut cx));
+        });
+    }
+
+    /// Writes the panic as a fault line on the system's own `log` output.
+    fn fault(&self, now: Timestamp, outputs: &mut OutSet<S>, message: &str) {
+        outputs.log.fault(now, "panic", message.to_string());
     }
 }
 
