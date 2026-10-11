@@ -12,6 +12,7 @@ use crate::{
     Rng,
     def::{DefCx, DefError, Records},
     frame::Frame,
+    io::{Cqe, GrantDef, IO_CQ, IO_SQ, Io, Sqe},
     log::Log,
     port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers},
     record::Record,
@@ -65,10 +66,12 @@ pub struct Views<W: WakeSink> {
 
 /// Bound outputs, waiting to be handed to parameters.
 ///
-/// Every output built from these shares one counter of failed writes.
+/// Every output built from these shares one counter of failed writes. A
+/// `Cap` takes its handle from `io`.
 pub struct Writers {
     pub(crate) bindings: Bindings<OutputBinding>,
     pub(crate) dropped: Arc<AtomicU32>,
+    pub(crate) io: Option<Io>,
     /// The instance's stream, for an `Rng` parameter.
     pub(crate) rng: Option<Rng>,
     /// The host's record table, for a `Records` parameter.
@@ -88,6 +91,10 @@ pub struct Defs {
     /// Whether any parameter is a [`Sample`]. Only a stepped system can take
     /// one.
     pub(crate) sampled: bool,
+    /// Whether any parameter is a `Cap`, which gives the system a queue pair.
+    pub(crate) io: bool,
+    /// The `Cap` parameters, in order.
+    pub(crate) grants: Vec<GrantDef>,
     /// Whether any parameter is an `Rng`.
     pub(crate) rng: bool,
     /// Whether any parameter is the [`Records`] table.
@@ -118,7 +125,22 @@ impl Defs {
     /// Appends the ports `S`'s parameters take under the config in `cx`.
     fn walk<S: crate::fn_system::FnSignature>(mut self, cx: &DefCx<'_>) -> Result<Self, DefError> {
         S::Params::append_defs(&mut S::NAMES.iter(), cx, &mut self)?;
+        self.append_io(cx);
         Ok(self)
+    }
+
+    /// Appends `io_cq` and `io_sq`, for a `Cap`, after the parameters' own
+    /// ports.
+    fn append_io(&mut self, cx: &DefCx<'_>) {
+        if self.io {
+            self.inputs.push(Input::<Cqe>::def(cx, IO_CQ));
+            self.outputs.push(Output::<Sqe>::def(cx, IO_SQ));
+        }
+    }
+
+    /// The IO ports at the end of each port list.
+    pub(crate) fn io_ports(&self) -> usize {
+        usize::from(self.io)
     }
 }
 

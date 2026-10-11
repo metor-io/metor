@@ -1,3 +1,4 @@
+use crate::io::End;
 use metor_proto::types::{ComponentId, PacketId};
 use thiserror::Error;
 
@@ -86,6 +87,49 @@ pub enum BuildError {
 
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
     ReservedPort { ty: String },
+
+    #[error("`{system}` has no grant for its `Cap` parameter `{param}`")]
+    Ungranted { system: String, param: String },
+
+    #[error("`{system}` grants its parameter `{param}` twice")]
+    DuplicateGrant { system: String, param: String },
+
+    #[error("`{system}` grants `{param}`, which is not a `Cap` parameter")]
+    UnknownGrant { system: String, param: String },
+
+    #[error("io steps: {message}")]
+    IoSystems { message: String },
+
+    #[error("resource `{id}` is created twice")]
+    DuplicateResource { id: String },
+
+    #[error("`{system}` grants `{param}` resource `{resource}`, which the target does not create")]
+    UnknownResource {
+        system: String,
+        param: String,
+        resource: String,
+    },
+
+    /// `cap` is `{system}.{param}`.
+    #[error("`{cap}` takes a `{expected}`, but resource `{resource}` provides `{found}`")]
+    Interface {
+        cap: String,
+        resource: String,
+        expected: String,
+        found: String,
+    },
+
+    #[error("sim resource `{resource}` has no holder on its {missing:?} end")]
+    OneEnd { resource: String, missing: End },
+
+    #[error("`{system}` holds the device end of `{resource}`, which is not simulated")]
+    RealDeviceEnd { system: String, resource: String },
+
+    #[error("resource `{resource}` did not open: {message}")]
+    Open { resource: String, message: String },
+
+    #[error("resource `{resource}` has a `{backing}` backing, which this build does not run")]
+    Backing { resource: String, backing: String },
 
     #[error("definition for `{id}`: {source}")]
     Def {

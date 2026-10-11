@@ -1,0 +1,118 @@
+{
+  "clock": {
+    "Simulated": {
+      "dt": {
+        "secs": 0,
+        "nanos": 10000000
+      }
+    }
+  },
+  "ring_depth": 8,
+  "namespace": null,
+  "systems": [
+    {
+      "id": "gps",
+      "ty": "echo.gps",
+      "params": null,
+      "inputs": [
+        {
+          "port": "io_cq",
+          "from": [
+            {
+              "system": "io_complete",
+              "port": "gps"
+            }
+          ]
+        }
+      ],
+      "grants": [
+        {
+          "param": "uart",
+          "resource": "gps1"
+        }
+      ]
+    },
+    {
+      "id": "io_submit",
+      "ty": "fsw.io",
+      "inputs": [
+        {
+          "port": "gps",
+          "from": [
+            {
+              "system": "gps",
+              "port": "io_sq"
+            }
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "port": "receiver",
+          "record": "io_cqe"
+        }
+      ]
+    },
+    {
+      "id": "receiver",
+      "ty": "echo.uart_script",
+      "params": {
+        "script": [
+          "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n",
+          "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n",
+          "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n"
+        ]
+      },
+      "inputs": [
+        {
+          "port": "io_cq",
+          "from": [
+            {
+              "system": "io_submit",
+              "port": "receiver"
+            }
+          ]
+        }
+      ],
+      "grants": [
+        {
+          "param": "uart",
+          "resource": "gps1",
+          "end": "device"
+        }
+      ]
+    },
+    {
+      "id": "io_complete",
+      "ty": "fsw.io",
+      "inputs": [
+        {
+          "port": "receiver",
+          "from": [
+            {
+              "system": "receiver",
+              "port": "io_sq"
+            }
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "port": "gps",
+          "record": "io_cqe"
+        }
+      ],
+      "params": {
+        "status": true
+      }
+    }
+  ],
+  "resources": [
+    {
+      "id": "gps1",
+      "backing": {
+        "sim": "uart"
+      }
+    }
+  ]
+}
