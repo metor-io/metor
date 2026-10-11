@@ -137,6 +137,15 @@ pub(super) fn demo_manifest() -> Vec<u8> {
             PackEntryDesc {
                 params_schema: OwnedNamedType::from(<() as Schema>::SCHEMA),
                 ..entry_desc(
+                    "Sink",
+                    vec![table_port("sensors", "sensors", false)],
+                    Vec::new(),
+                    Vec::new(),
+                )
+            },
+            PackEntryDesc {
+                params_schema: OwnedNamedType::from(<() as Schema>::SCHEMA),
+                ..entry_desc(
                     "startup",
                     Vec::new(),
                     vec![table_port("mode_cmd", "mode_cmd", true)],
@@ -179,6 +188,7 @@ fn render_is_deterministic_and_structured() {
     assert!(a.contains("manifest_hash=\"sha256:"));
     // A CapWords entry is a class; a snake_case entry an occupant callable.
     assert!(a.contains("class Widget(System):"));
+    assert!(a.contains("class Sink(System):"));
     assert!(a.contains("def startup() -> System:"));
     // Frame markers, one per distinct frame, named from metadata.
     assert!(a.contains("class Cmd(Frame):"));

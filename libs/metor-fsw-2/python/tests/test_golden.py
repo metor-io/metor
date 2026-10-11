@@ -29,13 +29,22 @@ from metor_config import (
     Component,
     Connector,
     Dashboard,
+    Db,
+    Deployment,
+    Downlink,
     Edge,
     FrameType,
     Gauge,
     Image,
+    Ingest,
     Meter,
     Outline,
     Pivot,
+    Presets,
+    Preset,
+    Publish,
+    Record,
+    Subscribe,
     Place,
     SequenceControl,
     State,
@@ -64,6 +73,12 @@ DASHBOARD_GOLDEN = os.path.join(
 )
 OUTLINE_GOLDEN = os.path.join(
     os.path.dirname(__file__), "..", "..", "tests", "golden", "outline.json"
+)
+DEPLOYMENT_GOLDEN = os.path.join(
+    os.path.dirname(__file__), "..", "..", "tests", "golden", "deployment.json"
+)
+GATEWAY_GOLDEN = os.path.join(
+    os.path.dirname(__file__), "..", "..", "tests", "golden", "deployment_gateway.json"
 )
 FIXTURE_PNG = os.path.join(os.path.dirname(__file__), "data", "pixel.png")
 
@@ -237,6 +252,80 @@ def build_target() -> Target:
     return m
 
 
+def build_deployment() -> Deployment:
+    """The two-member deployment whose IR is the golden envelope: a `plant`
+    that downlinks and publishes `plant` to peers, and an `fsw` that mirrors it
+    and carries a Python system, a scope, and a preset — the shapes a member
+    may add over a bare `Wiring`."""
+    plant = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="plant")
+    fsw = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="fsw")
+
+    @system("sensors.gyro_b")
+    def gyro_norm(gyro_b) -> f64:
+        return (gyro_b @ gyro_b) ** 0.5
+
+    plant_link = plant.state("link", TcpServer(addr="[::]:2240", name="plant"))
+    plant_peers = plant.state("peer", TcpServer(addr="[::]:2242", name="plant-peers"))
+    sim = plant.add(
+        "plant",
+        System(
+            "Plant",
+            Artifact(id="adcs", crate="adcs-systems", lib="adcs_systems"),
+            seed=42,
+        ),
+    )
+    plant.add("downlink", Downlink(plant_link))
+    publish = plant.add("publish", Publish(plant_peers, [sim]))
+
+    fsw.add("plant", Subscribe(sim, via=publish))
+    with fsw.scope("adcs"):
+        fsw.add("gyro_norm", gyro_norm)
+    fsw.add(
+        "presets",
+        Presets(
+            [
+                Preset(
+                    name="ops",
+                    time_range="LAST 30m",
+                    layout=TimeSeriesPlot([Trace("adcs.gyro_norm", element=0)]),
+                )
+            ]
+        ),
+    )
+    return Deployment(targets=[plant, fsw], hosts={"plant": "10.0.0.5"})
+
+
+def build_gateway_deployment() -> Deployment:
+    """The three-member deployment whose IR is the gateway golden: a `plant`
+    and an `fsw`, each serving a ground link with an uplink of its own, and a
+    `gw` that ingests both into an embedded db and records its own outputs."""
+    plant = Target(cycle_rate=120.0, namespace="plant")
+    fsw = Target(cycle_rate=120.0, namespace="fsw")
+    gw = Target(cycle_rate=120.0, namespace="gw")
+
+    plant_link = plant.state("link", TcpServer(addr="[::]:2240", name="plant"))
+    plant.add("uplink", Uplink(plant_link, msgs=["AlarmAck"]))
+    plant.add(
+        "plant",
+        System(
+            "Plant",
+            Artifact(id="adcs", crate="adcs-systems", lib="adcs_systems"),
+            seed=42,
+        ),
+    )
+    plant.add("downlink", Downlink(plant_link))
+
+    fsw_link = fsw.state("link", TcpServer(addr="[::]:2241", name="fsw"))
+    fsw.add("uplink", Uplink(fsw_link, msgs=["SequenceCommand", "ReloadSequences"]))
+    fsw.add("downlink", Downlink(fsw_link))
+
+    db = gw.state("db", Db(addr="[::]:2250", store="/var/lib/metor/gw"))
+    gw.add("plant", Ingest(db, plant_link))
+    gw.add("fsw", Ingest(db, fsw_link, commands=["SequenceCommand"]))
+    gw.add("record", Record(db))
+    return Deployment(targets=[plant, fsw, gw])
+
+
 def normalize(v):
     """Drop the fields the cross-language comparison ignores: every ``src``
     anchor, the top-level ``metor_config_version`` envelope, and each artifact's
@@ -256,13 +345,30 @@ def normalize(v):
 class GoldenTest(unittest.TestCase):
     def setUp(self):
         mc._targets.clear()
+        mc._deployments.clear()
         mc._program.clear()
 
     def test_emits_the_golden_fixture(self):
         with open(GOLDEN, encoding="utf-8") as f:
             expected = normalize(json.load(f))
-        actual = normalize(build_target().to_ir())
+        target = build_target()
+        actual = normalize(target.to_ir())
         self.assertEqual(actual, expected)
+
+        # The implicit deployment of one carries that same `Wiring` unchanged.
+        envelope = Deployment(targets=[target]).to_ir()
+        self.assertEqual(envelope["ir_version"], mc.IR_VERSION)
+        self.assertEqual(normalize(envelope["targets"][0]), expected)
+
+    def test_emits_the_golden_deployment(self):
+        with open(DEPLOYMENT_GOLDEN, encoding="utf-8") as f:
+            expected = normalize(json.load(f))
+        self.assertEqual(normalize(build_deployment().to_ir()), expected)
+
+    def test_emits_the_golden_gateway_deployment(self):
+        with open(GATEWAY_GOLDEN, encoding="utf-8") as f:
+            expected = normalize(json.load(f))
+        self.assertEqual(normalize(build_gateway_deployment().to_ir()), expected)
 
     def test_emits_the_golden_dashboard(self):
         # `sat1` so the fixture also pins namespace qualification of every

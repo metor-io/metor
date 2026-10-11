@@ -384,6 +384,52 @@ fn max_sleep() {
     test.assert_all_complete();
 }
 
+/// One rotation of the top-level wheel, and one of its slots, in ticks.
+const ROTATION: Ticks = wheel::Core::MAX_SLEEP_TICKS + 1;
+const TOP_SLOT: Ticks = ROTATION / 64;
+
+/// A sleep whose deadline lies past the top-level wheel's wrap sits in that
+/// wheel *behind* the `now` slot. Its reported deadline must be the slot's
+/// start in the next rotation, not this one's: a deadline already in the
+/// past makes `advance_locked` spin `continue` until the clock crosses the
+/// boundary — at stellarator's 1 ns tick, a full-CPU stall of up to the
+/// sleep's own length, every 68.7 s of uptime.
+#[test]
+fn deadline_past_wrap_slot_0() {
+    static TIMER: Timer = Timer::new(TestClock::clock());
+    let mut test = SleepGroupTest::new(&TIMER);
+    test.advance(ROTATION - 5);
+    // Five ticks past the boundary: slot 0 of the next rotation.
+    test.spawn_group(10, 1);
+    test.scheduler.tick();
+    let now = test.now();
+    let (fired, next) = test.timer.core.with_lock(|core| core.turn_to(now));
+    assert_eq!(fired, 0);
+    assert_eq!(next.map(|d| d.ticks), Some(ROTATION));
+    test.advance(5);
+    test.advance(5);
+    test.assert_all_complete();
+}
+
+/// Same, three slots into the next rotation: the wrap must count as one
+/// skipped rotation, not as many as the slot index.
+#[test]
+fn deadline_past_wrap_slot_3() {
+    static TIMER: Timer = Timer::new(TestClock::clock());
+    let mut test = SleepGroupTest::new(&TIMER);
+    test.advance(ROTATION - 5);
+    test.spawn_group(3 * TOP_SLOT + 10, 1);
+    test.scheduler.tick();
+    let now = test.now();
+    let (fired, next) = test.timer.core.with_lock(|core| core.turn_to(now));
+    assert_eq!(fired, 0);
+    assert_eq!(next.map(|d| d.ticks), Some(ROTATION + 3 * TOP_SLOT));
+    test.advance(5);
+    test.advance(3 * TOP_SLOT);
+    test.advance(5);
+    test.assert_all_complete();
+}
+
 use proptest::{prop_oneof, strategy::Strategy};
 
 #[derive(Debug)]

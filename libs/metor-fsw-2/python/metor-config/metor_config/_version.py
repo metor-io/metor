@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 
-__version__ = "0.4.0"
+__version__ = "0.4.3"
 
 
-IR_VERSION = 9
+IR_VERSION = 11
 
 
 PROGRAM_ARTIFACT = "program"

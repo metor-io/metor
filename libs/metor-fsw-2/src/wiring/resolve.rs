@@ -21,7 +21,7 @@ use metor_fsw_2_core::SystemDescriptor;
 use metor_proto::types::ComponentId;
 use slots::resolve_slot;
 
-use super::error::{LoadError, LoadErrorKind};
+use super::error::LoadError;
 use super::model::{
     ClockSpec, CoordinatorSpec, EdgeKind, ParamSource, StateSpec, SystemSpec, Wiring,
 };
@@ -135,9 +135,17 @@ pub fn resolve_with(
 
     // States pass
     let mut state_tokens: HashMap<&str, metor_fsw_2_core::AttachTarget> = HashMap::new();
+    let mut state_cells: Vec<std::rc::Rc<dyn metor_fsw_2_core::ErasedShared>> = Vec::new();
     for spec in &wiring.states {
-        let target = resolve_state(spec, registry)?;
-        state_tokens.insert(spec.name.as_str(), target);
+        let instance = resolve_state(spec, registry, graph.namespace.as_deref())?;
+        state_tokens.insert(
+            spec.name.as_str(),
+            metor_fsw_2_core::AttachTarget {
+                ty: registry.states[spec.ty.as_str()].borrow().name(),
+                token: instance.token,
+            },
+        );
+        state_cells.push(instance.cell);
     }
 
     // Systems pass
@@ -158,6 +166,9 @@ pub fn resolve_with(
     let mut deferred: Vec<&SystemSpec> = Vec::new();
     let mut packs = PackCache::default();
     let mut wasm = WasmCache::default();
+    // The peer types a mirror describes, by artifact id: one dlopen-describe
+    // per cdylib per resolve, however many mirrors read it.
+    let mut described: HashMap<String, Vec<metor_fsw_2_core::abi::PackEntryDesc>> = HashMap::new();
     let mut pending: Vec<PendingSynth> = Vec::new();
     for spec in &wiring.systems {
         // The dl and proc arms must never see a wasm module: dlopen on one
@@ -168,6 +179,18 @@ pub fn resolve_with(
                 .iter()
                 .any(|a| a.id == id && a.kind == ArtifactKind::Wasm)
         });
+        if spec.peer.is_some() {
+            let (handle, desc) = resolve_mirror(
+                spec,
+                wiring,
+                registry,
+                &mut described,
+                &mut wasm,
+                &mut graph,
+            )?;
+            instances.insert(spec.name.clone(), Instance { handle, desc });
+            continue;
+        }
         let (handle, desc) = match (&spec.artifact, spec.process) {
             (Some(artifact_id), false) if wasm_backed => resolve_wasm(
                 spec,
@@ -178,15 +201,14 @@ pub fn resolve_with(
                 &mut graph,
             )?,
             (Some(_), true) if wasm_backed => {
-                return Err(LoadErrorKind::WasmSystem(
+                return Err(LoadError::WasmSystem(
                     format!(
                         "system `{}`: `process=#true` is redundant for a wasm system \
                          (the interpreter already isolates it)",
                         spec.name
                     )
                     .into_boxed_str(),
-                )
-                .bare());
+                ));
             }
             (Some(artifact_id), true) => resolve_proc(spec, artifact_id, wiring, &mut graph)?,
             (Some(artifact_id), false) => {
@@ -240,17 +262,12 @@ pub fn resolve_with(
     // Every declared state must have gained an attachment by now (attach
     // counts at entry create): a state serving nobody, a link server with no
     // downlink, is a config defect and fails like any other wiring mistake.
-    for spec in &wiring.states {
-        let entry = registry
-            .states
-            .get(spec.ty.as_str())
-            .expect("the states pass resolved this type");
-        if entry.borrow().cell.attached() == 0 {
-            return Err(LoadErrorKind::StateUnused {
+    for (spec, cell) in wiring.states.iter().zip(&state_cells) {
+        if cell.attached() == 0 {
+            return Err(LoadError::StateUnused {
                 name: spec.name.clone(),
                 ty: spec.ty.clone(),
-            }
-            .bare());
+            });
         }
     }
 
@@ -274,29 +291,27 @@ pub fn resolve_with(
         }
     }
 
-    graph
-        .build()
-        .map_err(|source| LoadErrorKind::Wire { source }.bare())
+    graph.build().map_err(|source| LoadError::Wire { source })
 }
 
 /// Construct one pack-shared state through its registered
 /// [`StateEntry`](crate::StateEntry): decode the spec's params off the value
 /// surface and run the state's init fn. Construction failure (a listener
-/// bind) is a load error, not a runtime one. Returns the
-/// [`AttachTarget`](metor_fsw_2_core::AttachTarget) a by-name attach downcasts.
+/// bind) is a load error, not a runtime one. Returns the instance this
+/// declaration minted, whose token a by-name attach downcasts.
 fn resolve_state(
     spec: &StateSpec,
     registry: &Registry,
-) -> Result<metor_fsw_2_core::AttachTarget, LoadError> {
+    namespace: Option<&str>,
+) -> Result<metor_fsw_2_core::StateInstance, LoadError> {
     let Some(entry) = registry.states.get(spec.ty.as_str()) else {
         let mut available: Vec<&str> = registry.states.keys().copied().collect();
         available.sort_unstable();
-        return Err(LoadErrorKind::UnknownStateType {
+        return Err(LoadError::UnknownStateType {
             name: spec.name.clone(),
             ty: spec.ty.clone(),
             available: available.join(", "),
-        }
-        .bare());
+        });
     };
     // A paramless spec conforms an empty object against the state's schema,
     // the same all-defaults decode a paramless pack entry gets.
@@ -312,22 +327,17 @@ fn resolve_state(
         value,
         src: "",
         name: &spec.name,
+        namespace,
         msgs: &registry.msgs,
         attach: None,
     };
     entry.borrow_mut().create(params).map_err(|e| match e {
         metor_fsw_2_core::MakeError::Params(e) => (*e).into(),
-        other => LoadErrorKind::StateInit {
+        other => LoadError::StateInit {
             name: spec.name.clone(),
             ty: spec.ty.clone(),
             message: other.to_string(),
-        }
-        .bare(),
-    })?;
-    let entry = entry.borrow();
-    Ok(metor_fsw_2_core::AttachTarget {
-        ty: entry.name(),
-        token: entry.token.clone(),
+        },
     })
 }
 
@@ -351,7 +361,7 @@ fn resolve_static(
     let factory = registry
         .factories
         .get(ty)
-        .ok_or_else(|| LoadErrorKind::UnknownType { ty: ty.to_string() }.bare())?;
+        .ok_or_else(|| LoadError::UnknownType { ty: ty.to_string() })?;
 
     // Attach/shared consistency: a shared-state entry needs an `attach`, and a
     // plain entry must not carry one. `validate` already proved a present
@@ -363,17 +373,15 @@ fn resolve_static(
                 .expect("validate() proved this attach names a declared state"),
         ),
         (true, None) => {
-            return Err(LoadErrorKind::MissingAttach {
+            return Err(LoadError::MissingAttach {
                 system: spec.name.clone(),
-            }
-            .bare());
+            });
         }
         (false, Some(attach)) => {
-            return Err(LoadErrorKind::AttachOnNonSharedSystem {
+            return Err(LoadError::AttachOnNonSharedSystem {
                 system: spec.name.clone(),
                 attach: attach.to_string(),
-            }
-            .bare());
+            });
         }
         (false, None) => None,
     };
@@ -433,6 +441,101 @@ fn wasm_entry<'e>(
     }
 }
 
+/// Resolve a mirror of a peer member's instance: its ports are the peer
+/// type's telemetered outputs, and the built-in
+/// [`SubscribeSystem`](crate::SubscribeSystem) fills them.
+///
+/// The peer type's descriptor comes from wherever this target would have got
+/// it had it run the type itself — the registry for a static type, the wasm
+/// module's entries, or a describe of the cdylib, which loads, describes, and
+/// unloads without creating anything in the pack. The framework's own
+/// `system_status` and `log` are dropped (the mirror gets its own from
+/// `push_node`), as are ports the peer never announces, and every input:
+/// a mirror is a source.
+fn resolve_mirror(
+    spec: &SystemSpec,
+    wiring: &Wiring,
+    registry: &Registry,
+    described: &mut HashMap<String, Vec<metor_fsw_2_core::abi::PackEntryDesc>>,
+    wasm: &mut WasmCache,
+    graph: &mut InitGraph,
+) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
+    let peer = spec.peer.as_ref().expect("the caller matched on `peer`");
+    let unknown = || LoadError::PeerType {
+        system: spec.name.clone(),
+        ty: spec.ty.clone().unwrap_or_default(),
+        artifact: spec.artifact.clone(),
+    };
+    let bad = |_detail: String| unknown();
+    let outputs = match &spec.artifact {
+        None => {
+            let ty = spec.ty.as_deref().expect("validate requires a static type");
+            registry
+                .factories
+                .get(ty)
+                .ok_or_else(unknown)?
+                .descriptor
+                .descriptor()
+                .outputs
+        }
+        Some(artifact_id) if is_wasm(wiring, artifact_id) => {
+            let module = wasm.open(
+                wiring,
+                artifact_id,
+                &spec.name,
+                graph.config.wasm_memory_limit_bytes,
+            )?;
+            let (_, entry) = wasm_entry(&module.entries, spec.ty.as_deref(), &bad)?;
+            entry.descriptor.outputs.clone()
+        }
+        Some(artifact_id) => {
+            let entries = match described.entry(artifact_id.to_string()) {
+                std::collections::hash_map::Entry::Occupied(entries) => entries.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let artifact = find_built_artifact(wiring, artifact_id, &spec.name)?;
+                    let path = artifact
+                        .path
+                        .as_ref()
+                        .expect("checked by find_built_artifact");
+                    let dl_error = |source| LoadError::DlOpen {
+                        system: spec.name.clone(),
+                        artifact: artifact_id.to_string(),
+                        source: Box::new(source),
+                    };
+                    let bytes = crate::dl::describe_raw(path).map_err(dl_error)?;
+                    slot.insert(crate::dl::decode_pack_manifest(&bytes).map_err(dl_error)?)
+                }
+            };
+            let (_, entry) = wasm_entry(entries, spec.ty.as_deref(), &bad)?;
+            entry.descriptor.outputs.clone()
+        }
+    };
+
+    let status = metor_fsw_2_core::host_status_port().name;
+    let ports: Vec<metor_fsw_2_core::PortDesc> = outputs
+        .into_iter()
+        .filter(|port| port.telemetered && port.name != status && port.name != "log")
+        .map(|mut port| {
+            port.telemetered = peer.telemetered;
+            port
+        })
+        .collect();
+    let node = crate::coordinator::init::async_node(
+        spec.name.clone(),
+        crate::SubscribeSystem::new(peer.clone(), ports),
+    );
+    let desc = node.desc.clone();
+    Ok((graph.push_node(node), desc))
+}
+
+/// Whether `artifact_id` names a wasm artifact of this wiring.
+fn is_wasm(wiring: &Wiring, artifact_id: &str) -> bool {
+    wiring
+        .artifacts
+        .iter()
+        .any(|a| a.id == artifact_id && a.kind == ArtifactKind::Wasm)
+}
+
 /// One compiled Python instance awaiting edge synthesis, recorded during the
 /// systems pass and wired after every instance is registered.
 struct PendingSynth {
@@ -461,14 +564,13 @@ fn resolve_wasm(
     let max_memory = graph.config.wasm_memory_limit_bytes;
     let module = wasm.open(wiring, artifact_id, &spec.name, max_memory)?;
     let bad = |detail: String| {
-        LoadErrorKind::WasmSystem(
+        LoadError::WasmSystem(
             format!(
                 "system `{}` (artifact `{artifact_id}`): {detail}",
                 spec.name
             )
             .into_boxed_str(),
         )
-        .bare()
     };
     let (index, entry) = wasm_entry(&module.entries, spec.ty.as_deref(), &bad)?;
     let compiled = module
@@ -558,13 +660,10 @@ fn resolve_proc(
         .path
         .as_ref()
         .expect("checked by find_built_artifact");
-    let proc_describe = |detail: String| {
-        LoadErrorKind::ProcDescribe {
-            system: spec.name.clone(),
-            artifact: artifact_id.to_string(),
-            detail,
-        }
-        .bare()
+    let proc_describe = |detail: String| LoadError::ProcDescribe {
+        system: spec.name.clone(),
+        artifact: artifact_id.to_string(),
+        detail,
     };
     let bytes = crate::proc::host::describe_via_worker(None, path)
         .map_err(|e| proc_describe(e.to_string()))?;
@@ -590,10 +689,9 @@ fn resolve_proc(
     _wiring: &Wiring,
     _graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    Err(LoadErrorKind::ProcessUnsupported {
+    Err(LoadError::ProcessUnsupported {
         name: spec.name.clone(),
-    }
-    .bare())
+    })
 }
 
 /// Convert the serializable [`CoordinatorSpec`] into the runtime
@@ -608,15 +706,14 @@ fn coordinator_config(spec: &CoordinatorSpec) -> Result<CoordinatorConfig, LoadE
     }
     if let Some(fuel) = spec.wasm_fuel_per_poll {
         if fuel == 0 {
-            return Err(LoadErrorKind::InvalidWasmFuel.bare());
+            return Err(LoadError::InvalidWasmFuel);
         }
         config.wasm_fuel_per_poll = fuel;
     }
     if let Some(bytes) = spec.wasm_memory_limit_bytes {
-        let bytes = usize::try_from(bytes)
-            .map_err(|_| LoadErrorKind::InvalidWasmMemory { bytes }.bare())?;
+        let bytes = usize::try_from(bytes).map_err(|_| LoadError::InvalidWasmMemory { bytes })?;
         if bytes == 0 {
-            return Err(LoadErrorKind::InvalidWasmMemory { bytes: 0 }.bare());
+            return Err(LoadError::InvalidWasmMemory { bytes: 0 });
         }
         config.wasm_memory_limit_bytes = bytes;
     }
@@ -624,9 +721,9 @@ fn coordinator_config(spec: &CoordinatorSpec) -> Result<CoordinatorConfig, LoadE
         ClockSpec::Wall => ClockMode::Wall,
         ClockSpec::Simulated { dt_secs } => {
             let dt = Duration::try_from_secs_f64(dt_secs)
-                .map_err(|_| LoadErrorKind::InvalidSimulatedStep { dt_secs }.bare())?;
+                .map_err(|_| LoadError::InvalidSimulatedStep { dt_secs })?;
             if dt.is_zero() {
-                return Err(LoadErrorKind::InvalidSimulatedStep { dt_secs }.bare());
+                return Err(LoadError::InvalidSimulatedStep { dt_secs });
             }
             ClockMode::Simulated { dt }
         }

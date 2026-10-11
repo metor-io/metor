@@ -2,12 +2,13 @@ use std::{
     marker::PhantomData,
     net::SocketAddr,
     ops::{Deref, DerefMut},
+    time::Duration,
 };
 
 use metor_proto::types::{
     IntoLenPacket, LenPacket, Msg, OwnedPacket, Request, RequestId, TryFromPacket,
 };
-use metor_proto_wkt::ErrorResponse;
+use metor_proto_wkt::{DbInfoResp, ErrorResponse, GetDbInfo, LinkInfo};
 use stellarator::{
     BufResult,
     buf::{IoBufMut, Slice},
@@ -135,6 +136,68 @@ impl Client {
             _phantom_data: PhantomData,
         })
     }
+}
+
+/// Bound on the identity read: a peer that records unknown request
+/// messages as telemetry and never replies would otherwise hang forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What answered at the far end of one shared wire protocol.
+pub enum Peer {
+    /// Answered the probe: a metor-db server. The probe connection is
+    /// dropped; callers hand off to a db client, which dials and
+    /// supervises itself.
+    Db(DbInfoResp),
+    /// Pushed its identity unprompted: an fsw link server. The connection
+    /// is live and the announce replay is already streaming behind the
+    /// identity.
+    Fsw {
+        info: LinkInfo,
+        rx: PacketStream<OwnedReader<TcpStream>>,
+        tx: PacketSink<OwnedWriter<TcpStream>>,
+        /// The recycled receive buffer, mid-flight from the identity read.
+        buf: Vec<u8>,
+    },
+}
+
+/// Dial `addr` and let the first packet say what lives there. Bounded by
+/// the handshake timeout; a peer that answers with neither identity (or
+/// nothing) is an error naming what was expected.
+pub async fn identify(addr: SocketAddr) -> Result<Peer, Error> {
+    let Client { tx, mut rx, .. } = Client::connect(addr).await?;
+    tx.send((&GetDbInfo).with_request_id(1)).await.0?;
+    let pkt = futures_lite::future::or(rx.next_grow(vec![0u8; 64 * 1024]), async {
+        stellarator::sleep(HANDSHAKE_TIMEOUT).await;
+        Err(stellarator::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut)).into())
+    })
+    .await?;
+    let OwnedPacket::Msg(m) = &pkt else {
+        return Err(identity_err("a table packet"));
+    };
+    if m.id == LinkInfo::ID {
+        let info: LinkInfo =
+            postcard::from_bytes(&m.buf).map_err(|_| identity_err("a malformed LinkInfo"))?;
+        let buf = pkt.into_buf().into_inner();
+        Ok(Peer::Fsw { info, rx, tx, buf })
+    } else if m.id == DbInfoResp::ID {
+        let resp: DbInfoResp =
+            postcard::from_bytes(&m.buf).map_err(|_| identity_err("a malformed DbInfoResp"))?;
+        Ok(Peer::Db(resp))
+    } else {
+        Err(identity_err("an unknown first message"))
+    }
+}
+
+fn identity_err(got: &str) -> Error {
+    Error::Stellar(
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "peer sent {got}; expected a DbInfoResp (metor-db) or LinkInfo (fsw link) identity"
+            ),
+        )
+        .into(),
+    )
 }
 
 pub struct SubStream<'a, R> {

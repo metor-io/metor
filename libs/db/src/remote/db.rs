@@ -2,11 +2,13 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use metor_proto::schema::Schema;
 use metor_proto::types::{ComponentId, IntoLenPacket, LenPacket, PacketTy, Timestamp};
-use metor_proto_stellar::Client;
+use metor_proto_stellar::{Client, PacketSink, PacketStream};
 use metor_proto_wkt::{
-    DbInfoResp, DumpMetadata, DumpMetadataResp, GetDbInfo, Stream,
-    StreamBehavior,
+    DbInfoResp, DumpMetadata, DumpMetadataResp, FEATURE_MSG_SYNC, GetDbInfo, Stream,
+    StreamBehavior, SyncMsgs,
 };
+use stellarator::io::{OwnedReader, OwnedWriter};
+use stellarator::net::TcpStream;
 use stellarator::sync::Mutex;
 use tracing::{info, warn};
 
@@ -137,12 +139,18 @@ pub(super) async fn handshake_request<T>(
     .await
 }
 
-/// One connection lifetime: handshake, metadata sync, then ingest the
-/// real-time stream until the connection drops.
+/// One connection lifetime: handshake, metadata sync, then the real-time
+/// stream — plus the message logs when the peer answers [`SyncMsgs`] —
+/// ingested until the connection drops, raced against the forwarder for
+/// the commands the peer advertised.
 async fn mirror(db: &Arc<DB>, addr: SocketAddr, emit: &impl Fn(MirrorEvent)) -> Result<(), Error> {
     let mut client = Client::connect(addr).await?;
     let info: DbInfoResp = handshake_request(client.request(&GetDbInfo)).await?;
-    info!(?addr, peer_version = info.protocol_version, "mirroring remote db");
+    info!(
+        ?addr,
+        peer_version = info.protocol_version,
+        "mirroring remote db"
+    );
     emit(MirrorEvent::Connected);
 
     let metadata: DumpMetadataResp = handshake_request(client.request(&DumpMetadata)).await?;
@@ -159,18 +167,38 @@ async fn mirror(db: &Arc<DB>, addr: SocketAddr, emit: &impl Fn(MirrorEvent)) -> 
         id: fastrand::u64(..),
     };
     client.send((&stream).with_request_id(1)).await.0?;
+    if info.features & FEATURE_MSG_SYNC != 0 {
+        client.send((&SyncMsgs).with_request_id(2)).await.0?;
+    }
 
     // From here the remote pushes VTableMsg + table packets — the same
     // shapes local producers send — so the local packet handler ingests
     // them verbatim. Replies (none are expected) go back over the same
-    // socket.
-    let Client { tx, mut rx, .. } = client;
+    // socket, as do the commands the peer advertised.
+    let Client { tx, rx, .. } = client;
     let tx = Arc::new(Mutex::new(tx));
+    Err(futures_lite::future::race(
+        ingest(rx, tx.clone(), db),
+        super::forward(info.command_ids, tx, db),
+    )
+    .await)
+}
+
+/// Every pushed packet through the local packet handler, warn-and-continue
+/// on a bad one, returning the error that ended the connection.
+async fn ingest(
+    mut rx: PacketStream<OwnedReader<TcpStream>>,
+    tx: Arc<Mutex<PacketSink<OwnedWriter<TcpStream>>>>,
+    db: &Arc<DB>,
+) -> Error {
     let mut conn = ConnState::default();
     let mut buf = vec![0u8; 1024 * 1024];
     let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024);
     loop {
-        let pkt = rx.next_grow(buf).await?;
+        let pkt = match rx.next_grow(buf).await {
+            Ok(pkt) => pkt,
+            Err(err) => return err.into(),
+        };
         let mut pkt_tx = PacketTx {
             req_id: pkt.req_id(),
             tx: tx.clone(),
@@ -209,7 +237,10 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    fn event_log() -> (Arc<StdMutex<Vec<MirrorEvent>>>, impl Fn(MirrorEvent) + Send + Sync) {
+    fn event_log() -> (
+        Arc<StdMutex<Vec<MirrorEvent>>>,
+        impl Fn(MirrorEvent) + Send + Sync,
+    ) {
         let log = Arc::new(StdMutex::new(Vec::new()));
         let sink = log.clone();
         (log, move |event| sink.lock().unwrap().push(event))
@@ -298,17 +329,14 @@ async fn seed_manifests(
             warn!(?err, ?component_id, "failed to create mirrored component");
             continue;
         }
-        let Some(component) =
-            db.with_state(|state| state.components.get(&component_id).cloned())
+        let Some(component) = db.with_state(|state| state.components.get(&component_id).cloned())
         else {
             continue;
         };
         let bounds = seals
             .iter()
             .fold(None::<(i64, i64)>, |acc, seal| match acc {
-                Some((min, max)) => {
-                    Some((min.min(seal.start_ts.0), max.max(seal.end_ts.0)))
-                }
+                Some((min, max)) => Some((min.min(seal.start_ts.0), max.max(seal.end_ts.0))),
                 None => Some((seal.start_ts.0, seal.end_ts.0)),
             });
         match component.time_series.merge_remote_spans(seals) {

@@ -922,7 +922,10 @@ pub struct LogEvent {
 /// telemetry, so probing with anything else pollutes the remote DB.
 /// Messages added after version 1 are additionally feature-gated — see
 /// [`DbInfoResp::features`].
-pub const NODE_PROTOCOL_VERSION: u32 = 2;
+pub const NODE_PROTOCOL_VERSION: u32 = 3;
+
+/// [`DbInfoResp::features`] bit: the server answers [`SyncMsgs`].
+pub const FEATURE_MSG_SYNC: u64 = 1 << 1;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct GetDbInfo;
@@ -935,17 +938,35 @@ impl Request for GetDbInfo {
     type Reply<B: IoBuf + Clone> = DbInfoResp;
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DbInfoResp {
     pub protocol_version: u32,
     /// Capability bits; clients gate post-version-1 requests on these.
     /// Bit 0 was the retired envelope protocol ([224,56]/[224,57]) and
-    /// must not be reused.
+    /// must not be reused. Bit 1 is [`FEATURE_MSG_SYNC`].
     pub features: u64,
+    /// The msg ids a client should forward up this connection: requests
+    /// going to the server, never records coming back. Added in version 3.
+    #[serde(default)]
+    pub command_ids: Vec<PacketId>,
+    /// The serving target's telemetry namespace, when it has one: the bare
+    /// dotted prefix its components carry. Added in version 3.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 impl Msg for DbInfoResp {
     const ID: PacketId = [224, 46];
+}
+
+/// Asks a db to stream every message log outside its command set over this
+/// connection: the log's latest record first, then live records. Gated on
+/// [`FEATURE_MSG_SYNC`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct SyncMsgs;
+
+impl Msg for SyncMsgs {
+    const ID: PacketId = [224, 63];
 }
 
 /// Durable summary of one sealed storage node. Defined here because it is
@@ -1101,7 +1122,7 @@ impl Msg for NodeAck {
 
 /// Version of the fsw link identity protocol ([`LinkInfo`]), independent
 /// of [`NODE_PROTOCOL_VERSION`].
-pub const LINK_PROTOCOL_VERSION: u32 = 1;
+pub const LINK_PROTOCOL_VERSION: u32 = 2;
 
 /// Identity push from an fsw link server: the FIRST packet on every
 /// accepted connection, ahead of the schema announce replay. A metor-db
@@ -1118,6 +1139,14 @@ pub struct LinkInfo {
     /// should forward up the link. The uplink's minted ports are
     /// untelemetered, so forwarding these can never echo back down.
     pub command_ids: Vec<PacketId>,
+    /// The serving target's telemetry namespace, when it has one: the bare
+    /// dotted prefix its components carry. Added in protocol version 2.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// The serving `TcpServer` state's declaration name, so a subscriber can
+    /// tell one of a target's links from another. Added in version 2.
+    #[serde(default)]
+    pub link: String,
 }
 
 impl Msg for LinkInfo {
@@ -1136,6 +1165,10 @@ pub const TXT_PROTOCOL_VERSION: &str = "pv";
 /// TXT-record key for the fsw's telemetry namespace, when it has one — the
 /// same bare dotted prefix its components carry.
 pub const TXT_NAMESPACE: &str = "ns";
+
+/// TXT-record key for the serving link's declaration name, the second half
+/// of the machine identity a subscriber matches on (`ns` is the first).
+pub const TXT_LINK: &str = "link";
 
 /// TXT-record key naming the advertised role, always `"fsw"` for a link
 /// server; reserved so one service type can grow sibling roles later.
@@ -1163,6 +1196,7 @@ pub const NODE_PROTOCOL_MESSAGES: &[PacketId] = &[
     [224, 56],
     [224, 57],
     LinkInfo::ID,
+    SyncMsgs::ID,
 ];
 
 #[cfg(test)]
@@ -1602,6 +1636,8 @@ mod link_info_tests {
     fn link_info_id_is_pinned_and_protocol_member() {
         assert_eq!(LinkInfo::ID, [224, 61]);
         assert!(NODE_PROTOCOL_MESSAGES.contains(&LinkInfo::ID));
+        assert_eq!(SyncMsgs::ID, [224, 63]);
+        assert!(NODE_PROTOCOL_MESSAGES.contains(&SyncMsgs::ID));
     }
 
     #[test]
@@ -1610,9 +1646,77 @@ mod link_info_tests {
             protocol_version: LINK_PROTOCOL_VERSION,
             features: 0,
             command_ids: vec![SequenceCommand::ID, AlarmAck::ID],
+            namespace: Some("sat".into()),
+            link: "ground".into(),
         };
         let bytes = postcard::to_allocvec(&info).expect("encode");
         let back: LinkInfo = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(back, info);
+    }
+
+    /// A v1 reader decodes a v2 identity: postcard stops at the fields it
+    /// knows and ignores the trailing bytes.
+    #[test]
+    fn link_info_v2_decodes_under_v1() {
+        #[derive(Deserialize, Debug, PartialEq, Eq)]
+        struct LinkInfoV1 {
+            protocol_version: u32,
+            features: u64,
+            command_ids: Vec<PacketId>,
+        }
+        let info = LinkInfo {
+            protocol_version: LINK_PROTOCOL_VERSION,
+            features: 0,
+            command_ids: vec![SequenceCommand::ID],
+            namespace: Some("sat".into()),
+            link: "ground".into(),
+        };
+        let bytes = postcard::to_allocvec(&info).expect("encode");
+        let v1: LinkInfoV1 = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(
+            v1,
+            LinkInfoV1 {
+                protocol_version: 2,
+                features: 0,
+                command_ids: vec![SequenceCommand::ID],
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod db_info_tests {
+    use super::*;
+
+    /// A v2 reader decodes a v3 reply: postcard stops at the fields it knows
+    /// and ignores the trailing bytes. The reverse does not hold — a
+    /// truncated v2 encoding is an unexpected end, the `LinkInfo` precedent —
+    /// so a v3 client must gate on `protocol_version`, not on the decode.
+    #[test]
+    fn db_info_v3_decodes_under_v2() {
+        #[derive(Deserialize, Debug, PartialEq, Eq)]
+        struct DbInfoRespV2 {
+            protocol_version: u32,
+            features: u64,
+        }
+        let v3 = DbInfoResp {
+            protocol_version: NODE_PROTOCOL_VERSION,
+            features: FEATURE_MSG_SYNC,
+            command_ids: vec![AlarmAck::ID],
+            namespace: Some("sat".into()),
+        };
+        let bytes = postcard::to_allocvec(&v3).expect("encode");
+        let v2: DbInfoRespV2 = postcard::from_bytes(&bytes).expect("decode v3 as v2");
+        assert_eq!(
+            v2,
+            DbInfoRespV2 {
+                protocol_version: 3,
+                features: FEATURE_MSG_SYNC,
+            }
+        );
+        assert_eq!(
+            postcard::from_bytes::<DbInfoResp>(&bytes).expect("round trip"),
+            v3
+        );
     }
 }
