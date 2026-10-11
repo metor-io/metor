@@ -121,7 +121,7 @@ pub use handler::{
 };
 pub use pack::{
     AttachTarget, Created, Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending,
-    StepStatus,
+    StateCtx, StepStatus,
 };
 pub use registry::{AllOutputs, Registry, RegistryEntry};
 #[doc(hidden)]
@@ -158,11 +158,11 @@ pub use system::{
 #[doc(hidden)]
 pub use clock::{now_or_wall, set_now};
 #[doc(hidden)]
-pub use descriptor::compatible;
+pub use descriptor::{announced_covers, compatible};
 #[doc(hidden)]
 pub use message::LOG_DEPTH;
 #[doc(hidden)]
-pub use pack::{CreateFn, DriverSlot, StateEntry, decode_params, resolve_defaults};
+pub use pack::{CreateFn, DriverSlot, StateEntry, StateInstance, decode_params, resolve_defaults};
 #[doc(hidden)]
 pub use port::{drain_view, frame_list_iter};
 

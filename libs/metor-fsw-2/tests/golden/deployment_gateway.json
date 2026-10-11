@@ -1,0 +1,281 @@
+{
+  "ir_version": 11,
+  "metor_config_version": "0.4.3",
+  "targets": [
+    {
+      "ir_version": 11,
+      "coordinator": {
+        "cycle_rate": 120.0,
+        "default_depth": null,
+        "clock": "Wall",
+        "namespace": "plant",
+        "wasm_fuel_per_poll": null,
+        "wasm_memory_limit_bytes": null
+      },
+      "artifacts": [
+        {
+          "id": "adcs",
+          "path": null,
+          "prebuilt_dir": null,
+          "dist": null,
+          "manifest_hash": null,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 308,
+            "col": 1
+          },
+          "crate_name": "adcs-systems",
+          "lib": "adcs_systems"
+        }
+      ],
+      "states": [
+        {
+          "name": "link",
+          "ty": "TcpServer",
+          "params": {
+            "Value": {
+              "addr": "[::]:2240",
+              "name": "plant"
+            }
+          },
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 306,
+            "col": 1
+          }
+        }
+      ],
+      "systems": [
+        {
+          "name": "uplink",
+          "ty": "Uplink",
+          "artifact": null,
+          "params": {
+            "Value": {
+              "msgs": [
+                "AlarmAck"
+              ]
+            }
+          },
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 307,
+            "col": 1
+          },
+          "scope": null,
+          "attach": "link",
+          "layout": null
+        },
+        {
+          "name": "plant",
+          "ty": "Plant",
+          "artifact": "adcs",
+          "params": {
+            "Value": {
+              "seed": 42
+            }
+          },
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 308,
+            "col": 1
+          },
+          "scope": null,
+          "attach": null,
+          "layout": null
+        },
+        {
+          "name": "downlink",
+          "ty": "Downlink",
+          "artifact": null,
+          "params": "None",
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 316,
+            "col": 1
+          },
+          "scope": null,
+          "attach": "link",
+          "layout": null
+        }
+      ],
+      "slots": [],
+      "edges": [],
+      "scopes": [],
+      "program": null
+    },
+    {
+      "ir_version": 11,
+      "coordinator": {
+        "cycle_rate": 120.0,
+        "default_depth": null,
+        "clock": "Wall",
+        "namespace": "fsw",
+        "wasm_fuel_per_poll": null,
+        "wasm_memory_limit_bytes": null
+      },
+      "artifacts": [],
+      "states": [
+        {
+          "name": "link",
+          "ty": "TcpServer",
+          "params": {
+            "Value": {
+              "addr": "[::]:2241",
+              "name": "fsw"
+            }
+          },
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 318,
+            "col": 1
+          }
+        }
+      ],
+      "systems": [
+        {
+          "name": "uplink",
+          "ty": "Uplink",
+          "artifact": null,
+          "params": {
+            "Value": {
+              "msgs": [
+                "SequenceCommand",
+                "ReloadSequences"
+              ]
+            }
+          },
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 319,
+            "col": 1
+          },
+          "scope": null,
+          "attach": "link",
+          "layout": null
+        },
+        {
+          "name": "downlink",
+          "ty": "Downlink",
+          "artifact": null,
+          "params": "None",
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 320,
+            "col": 1
+          },
+          "scope": null,
+          "attach": "link",
+          "layout": null
+        }
+      ],
+      "slots": [],
+      "edges": [],
+      "scopes": [],
+      "program": null
+    },
+    {
+      "ir_version": 11,
+      "coordinator": {
+        "cycle_rate": 120.0,
+        "default_depth": null,
+        "clock": "Wall",
+        "namespace": "gw",
+        "wasm_fuel_per_poll": null,
+        "wasm_memory_limit_bytes": null
+      },
+      "artifacts": [],
+      "states": [
+        {
+          "name": "db",
+          "ty": "Db",
+          "params": {
+            "Value": {
+              "addr": "[::]:2250",
+              "store": "/var/lib/metor/gw"
+            }
+          },
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 322,
+            "col": 1
+          }
+        }
+      ],
+      "systems": [
+        {
+          "name": "plant",
+          "ty": "Ingest",
+          "artifact": null,
+          "params": {
+            "Value": {
+              "namespace": "plant",
+              "link": "link",
+              "port": 2240,
+              "commands": [
+                "AlarmAck"
+              ]
+            }
+          },
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 323,
+            "col": 1
+          },
+          "scope": null,
+          "attach": "db",
+          "layout": null
+        },
+        {
+          "name": "fsw",
+          "ty": "Ingest",
+          "artifact": null,
+          "params": {
+            "Value": {
+              "namespace": "fsw",
+              "link": "link",
+              "port": 2241,
+              "commands": [
+                "SequenceCommand"
+              ]
+            }
+          },
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 324,
+            "col": 1
+          },
+          "scope": null,
+          "attach": "db",
+          "layout": null
+        },
+        {
+          "name": "record",
+          "ty": "Record",
+          "artifact": null,
+          "params": "None",
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 325,
+            "col": 1
+          },
+          "scope": null,
+          "attach": "db",
+          "layout": null
+        }
+      ],
+      "slots": [],
+      "edges": [],
+      "scopes": [],
+      "program": null
+    }
+  ]
+}

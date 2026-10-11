@@ -94,6 +94,7 @@ fn python_wiring(artifact_id: &str, source: &str, decls: &[&str], cycle_rate: f6
                 layout: None,
                 status: None,
                 encompassing: false,
+                peer: None,
             });
         }
     }

@@ -52,6 +52,9 @@ pub enum EntryParams<'a> {
         value: &'a serde_json::Value,
         src: &'a str,
         name: &'a str,
+        /// The target namespace, when the front-end set one; the same fact
+        /// [`BuildCtx::namespace`](crate::BuildCtx::namespace) carries.
+        namespace: Option<&'a str>,
         msgs: &'a crate::message::MsgTable,
         /// The shared state this system attaches to, resolved by name from
         /// the target's `SystemSpec::attach` during the states
@@ -244,20 +247,36 @@ impl PackEntry {
     }
 }
 
-/// The construction half of one pack-declared shared state: decode the
-/// state's own params off its wiring declaration and run the init fn.
-pub(crate) type StateCreateFn = Box<dyn for<'p> FnMut(EntryParams<'p>) -> Result<(), MakeError>>;
+/// What a shared state knows about itself at construction: the two facts a
+/// listener's advertised identity is made of.
+pub struct StateCtx<'a> {
+    /// The state's wiring declaration name (`TcpServer(name=)`'s `state`).
+    pub name: &'a str,
+    /// The target namespace, when the front-end set one.
+    pub namespace: Option<&'a str>,
+}
 
-/// One pack-declared shared state: its name (the wiring `state` type key),
-/// its params schema, its construction fn, and the erased cell the resolve
-/// passes check construction/attachment against.
+/// One constructed instance of a pack-declared shared state: the erased cell
+/// its lifecycle and attach counting run through, and the `Shared<St>` token
+/// an attaching system downcasts.
+///
+/// One per `state` declaration, so a target may declare several states of one
+/// type — a ground link server and a peer one — and each attach picks its own.
+pub struct StateInstance {
+    pub cell: std::rc::Rc<dyn crate::shared::ErasedShared>,
+    pub token: std::rc::Rc<dyn core::any::Any>,
+}
+
+/// The construction half of one pack-declared shared state: decode the
+/// state's own params off its wiring declaration, run the init fn, and hand
+/// back the instance it filled.
+pub(crate) type StateCreateFn =
+    Box<dyn for<'p> FnMut(EntryParams<'p>) -> Result<StateInstance, MakeError>>;
+
+/// One pack-declared shared state: its name (the wiring `state` type key) and
+/// its construction fn, which mints one [`StateInstance`] per declaration.
 pub struct StateEntry {
     pub name: &'static str,
-    pub cell: std::rc::Rc<dyn crate::shared::ErasedShared>,
-    /// The `Shared<St>` token, erased as `Rc<dyn Any>`, so a system attaching
-    /// by name can downcast it back to the concrete `Shared<St>` at create.
-    /// Cloned into the resolver's name→[`AttachTarget`] map each states pass.
-    pub token: std::rc::Rc<dyn core::any::Any>,
     pub create: StateCreateFn,
 }
 
@@ -266,8 +285,8 @@ impl StateEntry {
         self.name
     }
 
-    /// Construct the state from its wiring declaration's params.
-    pub fn create(&mut self, params: EntryParams<'_>) -> Result<(), MakeError> {
+    /// Construct one instance from a wiring declaration's params.
+    pub fn create(&mut self, params: EntryParams<'_>) -> Result<StateInstance, MakeError> {
         (self.create)(params)
     }
 }
@@ -295,34 +314,46 @@ impl Pack {
         S: crate::SharedLifecycle,
         P: DeserializeOwned + postcard_schema::Schema + 'static,
         E: core::fmt::Display + 'static,
-        F: FnMut(P) -> Result<S, E> + 'static,
+        F: FnMut(StateCtx<'_>, P) -> Result<S, E> + 'static,
     {
         let token = crate::Shared::new(name);
-        let cell = token.erased();
-        // The token erased as `Rc<dyn Any>`, so a system attaching by name can
-        // downcast it back to `Shared<S>` at create (`S: SharedLifecycle` is
-        // `'static`, so `Shared<S>: 'static` and `Any` holds).
-        let token_any: std::rc::Rc<dyn core::any::Any> = std::rc::Rc::new(token.clone());
         let create: StateCreateFn = {
-            let token = token.clone();
+            // The declaration this pack's own entries captured is the first
+            // one a target declares; a second declaration mints its own.
+            let mut first = Some(token.clone());
             Box::new(move |params: EntryParams<'_>| {
+                let ctx = match &params {
+                    EntryParams::Value {
+                        name, namespace, ..
+                    } => StateCtx {
+                        name,
+                        namespace: *namespace,
+                    },
+                    EntryParams::Postcard(_) => StateCtx {
+                        name,
+                        namespace: None,
+                    },
+                };
                 let p: P = decode_params(params)?;
-                let state = init(p).map_err(|e| MakeError::StateInit {
+                let state = init(ctx, p).map_err(|e| MakeError::StateInit {
                     state: name,
                     detail: e.to_string(),
                 })?;
+                let token = first.take().unwrap_or_else(|| crate::Shared::new(name));
                 token.set(state).map_err(|_| MakeError::StateInit {
                     state: name,
                     detail: "already constructed (duplicate declaration)".into(),
+                })?;
+                Ok(StateInstance {
+                    cell: token.erased(),
+                    // Erased as `Rc<dyn Any>`, so a system attaching by name
+                    // downcasts it back to `Shared<S>` at create (`S:
+                    // SharedLifecycle` is `'static`, so `Any` holds).
+                    token: std::rc::Rc::new(token),
                 })
             })
         };
-        self.states.push(StateEntry {
-            name,
-            cell,
-            token: token_any,
-            create,
-        });
+        self.states.push(StateEntry { name, create });
         token
     }
 
@@ -334,11 +365,49 @@ impl Pack {
     /// state of any other type is an `AttachTypeMismatch`. The driver is
     /// wrapped so the state's [`SharedLifecycle`](crate::SharedLifecycle) hooks
     /// run once across all attached entries. Attached entries are cyclic-only,
-    /// instantiable once, and never slot occupants.
+    /// instantiable once per state instance, and never slot occupants. Use
+    /// [`system_type_shared_many`](Self::system_type_shared_many) where the
+    /// state serves several instances.
     pub fn system_type_shared<T, St>(
+        self,
+        name: &'static str,
+        ctor: impl FnMut(T::Params, crate::Shared<St>) -> T + 'static,
+    ) -> Self
+    where
+        St: crate::SharedLifecycle,
+        T: crate::CyclicSystem + crate::BuildSystem + 'static,
+        T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
+        T::Input: crate::BindPorts + 'static,
+        T::Output: crate::LogOutput + crate::BindPorts + 'static,
+    {
+        self.shared_entry(name, ctor, true)
+    }
+
+    /// [`system_type_shared`](Self::system_type_shared) for a state that
+    /// serves several attached instances: a gateway's `Db` runs one `Ingest`
+    /// per source member, where a link server runs one `Downlink`.
+    pub fn system_type_shared_many<T, St>(
+        self,
+        name: &'static str,
+        ctor: impl FnMut(T::Params, crate::Shared<St>) -> T + 'static,
+    ) -> Self
+    where
+        St: crate::SharedLifecycle,
+        T: crate::CyclicSystem + crate::BuildSystem + 'static,
+        T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
+        T::Input: crate::BindPorts + 'static,
+        T::Output: crate::LogOutput + crate::BindPorts + 'static,
+    {
+        self.shared_entry(name, ctor, false)
+    }
+
+    /// The shared-entry registration both forms share; `unique` is whether
+    /// one state instance may hold only one of these systems.
+    fn shared_entry<T, St>(
         mut self,
         name: &'static str,
         mut ctor: impl FnMut(T::Params, crate::Shared<St>) -> T + 'static,
+        unique: bool,
     ) -> Self
     where
         St: crate::SharedLifecycle,
@@ -350,19 +419,24 @@ impl Pack {
         let mut descriptor = <T as crate::CyclicSystem>::descriptor();
         descriptor.name = name.into();
         let static_desc = descriptor.clone();
-        let mut taken = false;
+        // A unique entry is built once per state instance: a target with two
+        // link servers runs a downlink on each, and neither may be built
+        // twice over one server.
+        let mut taken: Vec<*const ()> = Vec::new();
         let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
-            if taken {
-                return Err(MakeError::SharedEntryReinstantiated);
-            }
             // A shared entry resolves only through the static registry's value
             // path; the postcard/dl path never attaches.
             {
                 // Copy the resolved attach target + msgs off the value surface
                 // before `params` moves into decode (the proven `msgs` pattern).
-                let (attach, msgs) = match &params {
-                    EntryParams::Value { attach, msgs, .. } => (*attach, Some(*msgs)),
-                    EntryParams::Postcard(_) => (None, None),
+                let (attach, msgs, namespace) = match &params {
+                    EntryParams::Value {
+                        attach,
+                        msgs,
+                        namespace,
+                        ..
+                    } => (*attach, Some(*msgs), *namespace),
+                    EntryParams::Postcard(_) => (None, None, None),
                 };
                 let attach = attach.ok_or(MakeError::MissingAttach { system: name })?;
                 // Recover the concrete token; a wrong-typed state is a clean
@@ -379,15 +453,16 @@ impl Pack {
                 if !cell.is_constructed() {
                     return Err(MakeError::StateNotConstructed { state: cell.name() });
                 }
+                let id = std::rc::Rc::as_ptr(&cell) as *const ();
+                if unique && taken.contains(&id) {
+                    return Err(MakeError::SharedEntryReinstantiated);
+                }
                 let p: T::Params = decode_params(params)?;
                 let mut system = ctor(p, token);
                 if let Some(msgs) = msgs {
-                    system.configure(&crate::BuildCtx {
-                        msgs,
-                        namespace: None,
-                    })?;
+                    system.configure(&crate::BuildCtx { msgs, namespace })?;
                 }
-                taken = true;
+                taken.push(id);
                 cell.attach();
                 let instance_desc = instance_desc_if_minted(&system, &static_desc, name);
                 let pending: Pending = Box::new(move |src, mount| {

@@ -232,18 +232,26 @@ pub fn provision_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(
 /// when the target has any (one directory holds every produced artifact),
 /// else the workspace `target/<profile>` dir, found like [`locate_built`]
 /// and created on demand.
+///
+/// Every member of a deployment names its program `program.wasm`, so a
+/// member with a namespace nests under it and two members' programs cannot
+/// overwrite each other.
 fn wasm_out_dir(wiring: &Wiring, release: bool) -> PathBuf {
-    if let Some(dir) = wiring
+    let base = wiring
         .artifacts
         .iter()
         .filter(|a| a.prebuilt_dir.is_none() && a.kind == crate::ir::ArtifactKind::Cdylib)
         .filter_map(|a| a.path.as_deref().and_then(Path::parent))
         .next()
-    {
-        return dir.to_path_buf();
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            let profile = if release { "release" } else { "debug" };
+            target_root().join(profile)
+        });
+    match &wiring.coordinator.namespace {
+        Some(ns) => base.join(ns),
+        None => base,
     }
-    let profile = if release { "release" } else { "debug" };
-    target_root().join(profile)
 }
 
 /// The workspace `target/` dir: `CARGO_TARGET_DIR`, else the nearest

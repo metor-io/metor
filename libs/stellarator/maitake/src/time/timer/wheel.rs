@@ -380,7 +380,9 @@ impl Wheel {
 
         let slot = distance % Self::SLOTS;
         // does the next slot wrap this wheel around from the now slot?
-        let skipped = distance.saturating_sub(Self::SLOTS);
+        // `next_set_bit` returns the slot index plus `SLOTS` when it does, so
+        // this is 0 or 1 — one whole rotation, not the slot index's worth.
+        let skipped = distance / Self::SLOTS;
 
         debug_assert!(distance < Self::SLOTS * 2);
         debug_assert!(

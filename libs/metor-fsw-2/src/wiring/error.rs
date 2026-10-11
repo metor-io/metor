@@ -7,46 +7,19 @@ use thiserror::Error;
 use crate::coordinator::WireError;
 use crate::dl::DlError;
 
-/// A reason a wiring failed to validate or resolve into a runnable system
-/// graph, from missing params through graph-level [`WireError`]s and
-/// shared-library loading failures ([`DlError`]).
-#[derive(Debug)]
-pub struct LoadError {
-    pub kind: LoadErrorKind,
-}
-
-impl std::fmt::Display for LoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.kind, f)
-    }
-}
-
-impl std::error::Error for LoadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.kind.source()
-    }
-}
-
 impl Diagnostic for LoadError {}
 
 impl From<ParamError> for LoadError {
     fn from(e: ParamError) -> Self {
-        LoadError {
-            kind: LoadErrorKind::Params(e.kind),
-        }
+        LoadError::Params(e.kind)
     }
 }
 
-impl LoadErrorKind {
-    /// Wrap this error kind for the resolver's public error surface.
-    pub fn bare(self) -> LoadError {
-        LoadError { kind: self }
-    }
-}
-
-/// The payload and display string behind a [`LoadError`].
+/// A reason a wiring failed to validate or resolve into a runnable system
+/// graph, from missing params through graph-level [`WireError`]s and
+/// shared-library loading failures ([`DlError`]).
 #[derive(Error, Debug)]
-pub enum LoadErrorKind {
+pub enum LoadError {
     /// A [`Wiring`](super::Wiring) stamped with a different
     /// [`IR_VERSION`](super::IR_VERSION) than this build's. Spanless: version
     /// skew is producer/host drift, not a mistake in the document text.
@@ -55,6 +28,46 @@ pub enum LoadErrorKind {
          (regenerate the wiring)"
     )]
     IrVersionMismatch { found: u32, expected: u32 },
+
+    /// A [`Deployment`](super::Deployment) with several members and no
+    /// request: the caller must name one. Spanless, like the other envelope
+    /// faults: the document is well-formed, the invocation is not.
+    #[error(
+        "deployment has {} targets; pick one with --target ({})",
+        available.len(),
+        available.join(", ")
+    )]
+    TargetRequired { available: Vec<String> },
+
+    /// A requested namespace no member carries.
+    #[error("deployment has no target `{requested}`; targets: {}", available.join(", "))]
+    UnknownTarget {
+        requested: String,
+        available: Vec<String>,
+    },
+
+    /// A member of a multi-member deployment without a namespace. The
+    /// namespace is a member's identity, so only a deployment of one may
+    /// leave it unset.
+    #[error(
+        "target {index} has no `namespace`; every target of a deployment with more than one \
+         needs one"
+    )]
+    NamespaceRequired { index: usize },
+
+    /// Two members share a namespace, which would merge their component id
+    /// spaces.
+    #[error("duplicate target namespace `{namespace}`")]
+    DuplicateNamespace { namespace: String },
+
+    /// One member's namespace is a dotted prefix of another's, so a
+    /// component id under the inner one names a component in either.
+    #[error("target namespace `{inner}` is nested under `{outer}`; namespaces must be disjoint")]
+    NamespaceOverlap { outer: String, inner: String },
+
+    /// A deployment document with no members: nothing to run.
+    #[error("deployment declares no targets")]
+    EmptyDeployment,
 
     /// A serialized simulated-clock step cannot be represented as a positive
     /// [`Duration`](std::time::Duration).
@@ -245,10 +258,100 @@ pub enum LoadErrorKind {
         available: String,
     },
 
-    /// Two `state` specs share one instance name (or one state type, which
-    /// has exactly one instance).
+    /// Two `state` specs share one instance name, which `attach` addresses by.
     #[error("state `{name}` is declared more than once")]
     DuplicateState { name: String },
+
+    /// Two `TcpServer` states would advertise one mDNS instance name: an
+    /// unnamed server takes the target namespace (else the host name), so
+    /// all but one must set `name=`.
+    #[error(
+        "state `{state}` advertises the link name `{name}`, which another `TcpServer` \
+         state already advertises — give each server a distinct `name=`"
+    )]
+    DuplicateLinkName { state: String, name: String },
+
+    /// Two `Downlink` systems attach to one `TcpServer` state: the second
+    /// would replay a conflicting announce set over that server's clients.
+    #[error(
+        "state `{state}` has more than one `Downlink` attached; one server publishes one          announce set"
+    )]
+    DuplicateDownlink { state: String },
+
+    /// A mirror's `peer` spec is not well formed: a mirror runs the built-in
+    /// subscriber, so it takes no params, no worker process, and no state,
+    /// and it names a peer member other than its own.
+    #[error("system `{system}`: {reason}")]
+    PeerSpec { system: String, reason: String },
+
+    /// A mirror's type is not declared where its peer's would be loaded from,
+    /// so there is no descriptor to mirror.
+    #[error(
+        "system `{system}` mirrors type `{ty}`, which {} does not declare",
+        artifact.as_deref().map(|a| format!("artifact `{a}`")).unwrap_or_else(|| "the registry".to_string())
+    )]
+    PeerType {
+        system: String,
+        ty: String,
+        artifact: Option<String>,
+    },
+
+    /// A `hosts` key naming no member of the deployment.
+    #[error("deployment `hosts` names `{namespace}`, which is not a target of this deployment")]
+    UnknownHost { namespace: String },
+
+    /// A mirror pointed at a namespace no member of the deployment carries.
+    #[error(
+        "system `{system}` mirrors target `{namespace}`, which is not a target of this deployment"
+    )]
+    UnknownPeer { system: String, namespace: String },
+
+    /// Two `Record` systems attach to one `Db` state: both would write the
+    /// same records into the same store.
+    #[error("state `{state}` has more than one `Record` attached; one db records this target once")]
+    DuplicateRecord { state: String },
+
+    /// An `Ingest`'s params are not well formed: they decode as
+    /// [`IngestParams`](crate::IngestParams), name a port a listener chose,
+    /// and name a member other than this one.
+    #[error("system `{system}`: {reason}")]
+    IngestSpec { system: String, reason: String },
+
+    /// An `Ingest` pointed at a namespace no member of the deployment carries.
+    #[error(
+        "system `{system}` ingests target `{namespace}`, which is not a target of this deployment"
+    )]
+    UnknownSource { system: String, namespace: String },
+
+    /// An `Ingest` named a link the source member does not serve on that port.
+    #[error("system `{system}` ingests `{namespace}/{link}`, but {reason}")]
+    SourceLink {
+        system: String,
+        namespace: String,
+        link: String,
+        reason: String,
+    },
+
+    /// An `Ingest` forwards a command the source member's link does not
+    /// accept, so it would be dropped on arrival.
+    #[error("system `{system}` forwards `{token}` up its source link, but {reason}")]
+    SourceCommands {
+        system: String,
+        token: String,
+        reason: String,
+    },
+
+    /// Two `Ingest`s on one `Db` forward the same command, so the gateway's
+    /// forwarder would send one command to two members.
+    #[error(
+        "systems `{first}` and `{second}` both forward `{token}`; a gateway commands one member \
+         per message — narrow one with `commands=[…]`"
+    )]
+    CommandOverlap {
+        first: String,
+        second: String,
+        token: String,
+    },
 
     /// A shared state's own init fn failed, such as a resource acquisition
     /// like a listener bind, or its params did not decode.
@@ -360,4 +463,13 @@ pub enum LoadErrorKind {
     /// set, so every occupant's ports must agree with the first one's.
     #[error("`slot \"{slot}\"` occupant `{occupant}` is incompatible with the slot contract")]
     SlotOccupantMismatch { slot: String, occupant: String },
+}
+
+impl LoadError {
+    pub fn occupant_not_reloadable(slot: impl ToString, occupant: impl ToString) -> Self {
+        LoadError::OccupantNotReloadable {
+            slot: slot.to_string(),
+            occupant: occupant.to_string(),
+        }
+    }
 }

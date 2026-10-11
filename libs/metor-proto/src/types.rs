@@ -597,17 +597,30 @@ pub trait Msg: Serialize {
     const ID: PacketId;
 }
 
+/// Note that this blanket id is the bare fold: unlike [`msg_id`] it does not apply the
+/// reserved-row remap, so a schema name whose fold lands on `[224, _]` keeps it.
 impl<T: Serialize + postcard_schema::Schema> Msg for T {
     const ID: PacketId = const_fnv1a_hash::fnv1a_hash_str_16_xor(T::SCHEMA.name).to_le_bytes();
 }
 
-pub const fn msg_id(name: &str) -> PacketId {
-    let bytes = const_fnv1a_hash::fnv1a_hash_str_16_xor(name).to_le_bytes();
+/// Fold a 16-bit hash onto a packet id, off the reserved protocol row: `[224, x]` becomes `[223, x]`.
+pub const fn off_reserved(bytes: [u8; 2]) -> PacketId {
     if bytes[0] == 224 {
         [223, bytes[1]]
     } else {
         bytes
     }
+}
+
+pub const fn msg_id(name: &str) -> PacketId {
+    off_reserved(const_fnv1a_hash::fnv1a_hash_str_16_xor(name).to_le_bytes())
+}
+
+/// A table's packet id: the fold of its announced vtable's postcard bytes, off the reserved row.
+#[cfg(feature = "alloc")]
+pub fn table_id(vtable: &crate::vtable::VTable) -> PacketId {
+    let bytes = postcard::to_allocvec(vtable).expect("vtable with owned buffers cannot fail");
+    off_reserved(const_fnv1a_hash::fnv1a_hash_16_xor(&bytes, None).to_le_bytes())
 }
 
 #[cfg(feature = "alloc")]
@@ -1106,5 +1119,44 @@ mod tests {
         assert_eq!(PrimType::U8.padding(5), 0);
         assert_eq!(PrimType::U16.padding(12), 0);
         assert_eq!(PrimType::U16.padding(11), 1);
+    }
+
+    #[cfg(feature = "alloc")]
+    fn test_vtable(name: &str, dim: &[u64]) -> crate::vtable::VTable {
+        use crate::vtable::builder::{component, raw_field, schema, vtable};
+        vtable([raw_field(
+            0u32,
+            dim.iter().product::<u64>() as u32 * 4,
+            schema(PrimType::F32, dim, component(name)),
+        )])
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn table_id_is_stable_and_schema_keyed() {
+        let a = test_vtable("gps", &[3]);
+        assert_eq!(table_id(&a), table_id(&test_vtable("gps", &[3])));
+        assert_ne!(table_id(&a), table_id(&test_vtable("imu", &[3])));
+        assert_ne!(table_id(&a), table_id(&test_vtable("gps", &[4])));
+    }
+
+    #[test]
+    fn off_reserved_moves_the_protocol_row() {
+        assert_eq!(off_reserved([224, 7]), [223, 7]);
+        assert_eq!(off_reserved([223, 7]), [223, 7]);
+        assert_eq!(off_reserved([1, 0]), [1, 0]);
+
+        let mut on_the_row = None;
+        for i in 0..100_000u32 {
+            let name = alloc::format!("reserved_row_probe_{i}");
+            let raw = const_fnv1a_hash::fnv1a_hash_str_16_xor(&name).to_le_bytes();
+            if raw[0] == 224 {
+                on_the_row = Some((name, raw));
+                break;
+            }
+        }
+        let (name, raw) = on_the_row.expect("no name folds onto the reserved row");
+        assert_eq!(msg_id(&name), off_reserved(raw));
+        assert_eq!(msg_id(&name)[0], 223);
     }
 }

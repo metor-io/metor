@@ -90,15 +90,9 @@ name = "adcs-fsw2"
 version = "0.14.2"
 dependencies = [
  "adcs-contracts",
- "adcs-systems",
  "anyhow",
  "metor-fsw-2",
- "postcard",
- "serde",
- "serde_json",
  "stellarator",
- "tempfile",
- "zerocopy",
 ]
 
 [[package]]
@@ -9409,6 +9403,7 @@ dependencies = [
  "postcard",
  "postcard-c-codegen",
  "postcard-dyn",
+ "postcard-schema",
  "rustfft",
  "serde",
  "smallvec 1.16.0",
@@ -9476,12 +9471,14 @@ dependencies = [
  "bbqueue",
  "clap 4.6.3",
  "crc32fast",
+ "fastrand 2.5.0",
  "futures-lite 2.6.1",
  "gethostname",
  "libloading",
  "mdns-sd",
  "memmap2",
  "metor-component",
+ "metor-db",
  "metor-expr",
  "metor-fsw-2-core",
  "metor-fsw-2-macros",
@@ -9498,6 +9495,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "stellarator",
+ "supports-color 3.0.2",
  "tar",
  "tempfile",
  "thingbuf",

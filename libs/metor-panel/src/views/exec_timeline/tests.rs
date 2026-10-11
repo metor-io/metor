@@ -127,6 +127,7 @@ fn system(name: &str, ty: &str) -> SystemSpec {
         attach: None,
         layout: None,
         status: None,
+        peer: None,
         encompassing: false,
     }
 }

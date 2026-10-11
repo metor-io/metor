@@ -566,6 +566,21 @@ pub fn compatible(producer: &PortDesc, consumer: &PortDesc) -> bool {
     }
 }
 
+/// Whether an announced (prefixed) vtable carries every component of
+/// `expected` with equal type and shape.
+///
+/// The subset half of [`compatible`], over a peer's announced vtable rather
+/// than a local producer's descriptor: a mirror compares its port's
+/// [`announce`](PortDesc::announce) form against what the peer said it sends,
+/// and extra components on the peer's side are as harmless as they are on a
+/// local edge.
+pub fn announced_covers(announced: &VTable, expected: &VTable) -> bool {
+    let announced = realize_set(announced);
+    realize_set(expected)
+        .iter()
+        .all(|(id, want)| announced.get(id) == Some(want))
+}
+
 #[cfg(test)]
 mod tests {
     use metor_proto::types::{Msg, Timestamp};
@@ -585,6 +600,28 @@ mod tests {
         #[metor_fsw(timestamp)]
         timestamp: Timestamp,
         value: f64,
+    }
+
+    /// [`AxisProbe`] as a peer that ships one field more would announce it.
+    #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+    #[repr(C)]
+    #[metor_fsw(name = "axis_probe")]
+    struct AxisProbeWide {
+        #[metor_fsw(timestamp)]
+        timestamp: Timestamp,
+        value: f64,
+        extra: f64,
+    }
+
+    /// [`AxisProbe`] with its one field renamed: a different port under the
+    /// same frame name.
+    #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+    #[repr(C)]
+    #[metor_fsw(name = "axis_probe")]
+    struct AxisProbeRenamed {
+        #[metor_fsw(timestamp)]
+        timestamp: Timestamp,
+        reading: f64,
     }
 
     /// The constructors set the documented axis defaults, and each `id()` sits
@@ -658,6 +695,23 @@ mod tests {
         assert!(!compatible(&f, &log_f));
         assert!(!compatible(&log_f, &f));
         assert!(compatible(&log_f, &log_f));
+    }
+
+    /// An announce covers a port when it carries every component the port
+    /// expects; extra components are the peer's business, a renamed one is
+    /// a different port.
+    #[test]
+    fn announced_covers_is_the_subset_half() {
+        let expected = PortDesc::of::<AxisProbe>().announce("a.sim").unwrap().0;
+        let wide = PortDesc::of::<AxisProbeWide>().announce("a.sim").unwrap().0;
+        let renamed = PortDesc::of::<AxisProbeRenamed>()
+            .announce("a.sim")
+            .unwrap()
+            .0;
+
+        assert!(announced_covers(&wide, &expected));
+        assert!(!announced_covers(&expected, &wide));
+        assert!(!announced_covers(&renamed, &expected));
     }
 
     /// A descriptor round-trips through postcard, with the host-only `conn`

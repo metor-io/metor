@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use metor_proto_wkt::FSW_SERVICE_TYPE;
+use metor_proto_wkt::{FSW_SERVICE_TYPE, TXT_ROLE};
 
 use super::{ConnectionTarget, RegistryHandle, TargetId};
 
@@ -58,10 +58,9 @@ fn browse(handle: RegistryHandle) {
         };
         match event {
             ServiceEvent::ServiceResolved(info) => {
-                let Some(addr) = pick_addr(&info) else {
+                let Some(target) = resolved_target(&info) else {
                     continue;
                 };
-                let target = ConnectionTarget::tcp(instance_name(info.get_fullname()), addr);
                 seen.insert(info.get_fullname().to_string(), target.id.clone());
                 handle.upsert(target);
             }
@@ -74,6 +73,20 @@ fn browse(handle: RegistryHandle) {
         }
     }
     drop(daemon);
+}
+
+/// The picker row for a resolved instance. A plain fsw is the unremarkable
+/// case and reads as the bare address; any other advertised role names what
+/// serves the link. `None` when the instance advertised only loopback.
+pub(super) fn resolved_target(info: &ServiceInfo) -> Option<ConnectionTarget> {
+    let addr = pick_addr(info)?;
+    let mut target = ConnectionTarget::tcp(instance_name(info.get_fullname()), addr);
+    if let Some(role) = info.get_property_val_str(TXT_ROLE)
+        && role != "fsw"
+    {
+        target.detail = format!("{addr} · {role}").into();
+    }
+    Some(target)
 }
 
 /// Pick one address for the target id: the first non-loopback IPv4 (stable and

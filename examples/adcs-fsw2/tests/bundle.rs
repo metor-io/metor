@@ -5,17 +5,17 @@
 //! the built `.so`s, not verbatim source — so a target runs with no Python and
 //! no config parse on target. Two legs, both packaged from `target.py` (evaluate
 //! → IR → bundle → run): the directory bundle and the single-file `.metor`
-//! archive. Convergence parity stays in `closed_loop.rs`; here we only assert the
-//! bundle is self-contained and runnable. Gated off `miri` (it builds + `dlopen`s
-//! real cdylibs) and skipped without a CPython ≥ 3.10 to evaluate `target.py`.
+//! archive: here we only assert the bundle is self-contained and runnable.
+//! Gated off `miri` (it builds + `dlopen`s real cdylibs) and skipped without a
+//! CPython ≥ 3.10 to evaluate `target.py`.
 
 #![cfg(not(miri))]
 
 use std::path::{Path, PathBuf};
 
 use metor_fsw_2::wiring::{
-    Registry, Wiring, build_target, eval_python_target, load_bundle, provision_artifacts, resolve,
-    write_bundle,
+    Registry, Wiring, build_target, eval_python_deployment, load_bundle, provision_artifacts,
+    resolve, write_bundle,
 };
 use metor_fsw_2::{BuildOptions, PackageOptions};
 
@@ -33,20 +33,24 @@ fn temp_bundle_dir(tag: &str) -> PathBuf {
     ))
 }
 
-/// Evaluate `target.py` into a built `Wiring`, in-process (test binaries can't host a
-/// `process=#true` worker). `None` — skip, not fail — when Python or the build plumbing is
-/// unavailable (offline/sandboxed cargo, no CPython ≥ 3.10).
-fn eval_and_build() -> Option<Wiring> {
+/// Evaluate one of `target.py`'s members into a built `Wiring`, in-process (test binaries
+/// can't host a `process=#true` worker). `None` — skip, not fail — when Python or the build
+/// plumbing is unavailable (offline/sandboxed cargo, no CPython ≥ 3.10).
+fn eval_and_build(member: &str) -> Option<Wiring> {
     if !common::ensure_stubs() {
         return None;
     }
-    let mut wiring = match eval_python_target(&target("target.py")) {
-        Ok(w) => w,
+    let deployment = match eval_python_deployment(&target("target.py")) {
+        Ok(d) => d,
         Err(e) => {
             eprintln!("skipping: target.py did not evaluate: {e}");
             return None;
         }
     };
+    let mut wiring = deployment
+        .target(Some(member))
+        .unwrap_or_else(|_| panic!("the `{member}` member"))
+        .clone();
     for spec in &mut wiring.systems {
         spec.process = false;
     }
@@ -62,7 +66,7 @@ fn python_target_packages_and_runs() {
     // A `.py` target packages through the IR path, then runs cargo-free with no Python on
     // the run side: load the frozen IR and run it.
     let _guard = common::link_port_guard();
-    let Some(wiring) = eval_and_build() else {
+    let Some(wiring) = eval_and_build("fsw") else {
         return;
     };
 
@@ -127,7 +131,7 @@ fn python_target_round_trips_as_metor_archive() {
     // The single-file `.metor` form: pack the target into one tar, then load it back
     // (unpacked to a temp dir) and run it cargo-free.
     let _guard = common::link_port_guard();
-    let Some(wiring) = eval_and_build() else {
+    let Some(wiring) = eval_and_build("fsw") else {
         return;
     };
 
@@ -155,4 +159,34 @@ fn python_target_round_trips_as_metor_archive() {
     });
 
     let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn gateway_member_packages_and_runs() {
+    // The gateway packages like any other member — no artifacts, no program —
+    // and runs cargo-free with its embedded db served and both ingests dialling
+    // members that are not up here.
+    let _guard = common::link_port_guard();
+    let Some(wiring) = eval_and_build("gw") else {
+        return;
+    };
+
+    let dir = temp_bundle_dir("gw");
+    let _ = std::fs::remove_dir_all(&dir);
+    let opts = PackageOptions {
+        target: build_target(&[]),
+        provenance: Some(target("target.py")),
+        ..PackageOptions::default()
+    };
+    write_bundle(&wiring, &opts, &dir).expect("write the bundle");
+    assert!(dir.join("wiring.json").exists(), "frozen IR written");
+
+    let loaded = load_bundle(&dir).expect("load the bundle");
+    assert!(loaded.artifacts.is_empty(), "the gateway builds nothing");
+    let mut coord = resolve(&loaded, &Registry::with_builtins()).expect("resolve the bundle");
+    stellarator::run(move || async move {
+        coord.run_for(20).await;
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
