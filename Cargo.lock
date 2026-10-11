@@ -9571,6 +9571,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "metor-fsw-3-ring"
+version = "0.14.2"
+dependencies = [
+ "libc",
+ "loom",
+ "maitake-sync 0.1.2",
+ "memmap2",
+ "stellarator",
+ "tempfile",
+ "thiserror 2.0.20",
+ "zerocopy",
+]
+
+[[package]]
 name = "metor-fsw-ring"
 version = "0.14.2"
 dependencies = [
