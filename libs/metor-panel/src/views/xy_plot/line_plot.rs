@@ -464,9 +464,8 @@ impl Render for XyLinePlot {
                                     })
                                 })
                                 .collect();
-                            if !draws.is_empty()
-                                && let Some(handle) =
-                                    lp.gpu_state.render(cx, bounds, scale_factor, view, &draws)
+                            if let Some(handle) =
+                                lp.gpu_state.render(cx, bounds, scale_factor, view, &draws)
                             {
                                 handle.spawn_and_set(cx, xy_plot_gpu_state);
                             }

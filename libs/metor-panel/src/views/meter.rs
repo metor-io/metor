@@ -271,18 +271,23 @@ pub(crate) fn default_label(
 /// and the value, in whichever direction the value lies. Any other scale
 /// fills from the low end.
 pub(crate) fn fill_span(value: f64, min: f64, max: f64) -> (f32, f32) {
+    let Some(v) = scale_position(value, min, max) else {
+        return (0.0, 0.0);
+    };
+    match scale_position(0.0, min, max) {
+        Some(zero) if min < 0.0 && max > 0.0 => (zero.min(v), zero.max(v)),
+        _ => (0.0, v),
+    }
+}
+
+/// Where `value` sits along a `min..max` scale, pinned to its ends; `None`
+/// when the scale is degenerate.
+pub(crate) fn scale_position(value: f64, min: f64, max: f64) -> Option<f32> {
     let span = max - min;
     if !span.is_finite() || span.abs() < f64::EPSILON {
-        return (0.0, 0.0);
+        return None;
     }
-    let norm = |v: f64| (((v - min) / span).clamp(0.0, 1.0)) as f32;
-    let v = norm(value);
-    if min < 0.0 && max > 0.0 {
-        let zero = norm(0.0);
-        (zero.min(v), zero.max(v))
-    } else {
-        (0.0, v)
-    }
+    Some(((value - min) / span).clamp(0.0, 1.0) as f32)
 }
 
 /// A starting scale for a meter on `at`, derived from whatever limits the
@@ -464,6 +469,14 @@ fn paint_rounded(bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_needle_points_at_the_value_on_a_bipolar_scale() {
+        assert_eq!(scale_position(50.0, -100.0, 100.0), Some(0.75));
+        assert_eq!(scale_position(-100.0, -100.0, 100.0), Some(0.0));
+        assert_eq!(scale_position(500.0, -100.0, 100.0), Some(1.0));
+        assert_eq!(scale_position(1.0, 5.0, 5.0), None);
+    }
 
     #[test]
     fn unipolar_fills_from_the_low_end() {

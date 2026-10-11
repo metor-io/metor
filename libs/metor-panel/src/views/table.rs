@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, ElementId, Empty, IntoElement,
+    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, ElementId, Empty, EntityId, IntoElement,
     MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollHandle, SharedString,
     UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
@@ -161,8 +161,13 @@ impl ColState {
     }
 }
 
+/// A column divider in flight. gpui hands drag moves to every listener of
+/// the payload type, so the drag names the table it belongs to.
 #[derive(Clone)]
-struct ResizeDrag(usize);
+struct ResizeDrag {
+    table: EntityId,
+    col_ix: usize,
+}
 
 impl Render for ResizeDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -173,6 +178,7 @@ impl Render for ResizeDrag {
 /// A header in flight; the preview is the column name as a chip.
 #[derive(Clone)]
 struct ColumnDrag {
+    table: EntityId,
     col_ix: usize,
     name: SharedString,
 }
@@ -355,14 +361,20 @@ impl<D: TableDelegate> Table<D> {
 
         if col.movable {
             let drop_target = theme.drop_target;
+            let table = cx.entity_id();
             cell = cell
                 .on_drag(
                     ColumnDrag {
+                        table,
                         col_ix,
                         name: col.name.clone(),
                     },
                     |drag, _, _, cx| cx.new(|_| drag.clone()),
                 )
+                .can_drop(move |drag, _, _| {
+                    drag.downcast_ref::<ColumnDrag>()
+                        .is_some_and(|drag| drag.table == table)
+                })
                 .drag_over::<ColumnDrag>(move |style, _, _, _| style.bg(drop_target))
                 .on_drop(cx.listener(move |this, drag: &ColumnDrag, window, cx| {
                     let bounds = this.col_states[col_ix].bounds;
@@ -403,26 +415,37 @@ impl<D: TableDelegate> Table<D> {
             .bottom_0()
             .w(px(RESIZE_HANDLE_WIDTH))
             .cursor_col_resize()
-            .on_drag(ResizeDrag(col_ix), |drag, _, _, cx| {
-                cx.new(|_| drag.clone())
-            })
-            .on_drag_move(
-                cx.listener(move |this, e: &DragMoveEvent<ResizeDrag>, _window, cx| {
-                    let columns = this.delegate.columns();
-                    let col_ix = e.drag(cx).0;
-                    if let Some(col) = columns.get(col_ix) {
-                        let col_left = this.col_states[col_ix].bounds.left();
-                        let new_width =
-                            (e.event.position.x - col_left).clamp(col.min_width, col.max_width);
-                        if let Some(state) = this.col_states.get_mut(col_ix)
-                            && state.width != new_width
-                        {
-                            state.width = new_width;
-                            cx.notify();
-                        }
-                    }
-                }),
+            .on_drag(
+                ResizeDrag {
+                    table: cx.entity_id(),
+                    col_ix,
+                },
+                |drag, _, _, cx| cx.new(|_| drag.clone()),
             )
+    }
+
+    fn resize_column(
+        &mut self,
+        e: &DragMoveEvent<ResizeDrag>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let drag = e.drag(cx);
+        if drag.table != cx.entity_id() {
+            return;
+        }
+        let col_ix = drag.col_ix;
+        let Some(col) = self.delegate.columns().into_iter().nth(col_ix) else {
+            return;
+        };
+        let col_left = self.col_states[col_ix].bounds.left();
+        let new_width = (e.event.position.x - col_left).clamp(col.min_width, col.max_width);
+        if let Some(state) = self.col_states.get_mut(col_ix)
+            && state.width != new_width
+        {
+            state.width = new_width;
+            cx.notify();
+        }
     }
 }
 
@@ -639,6 +662,7 @@ impl<D: TableDelegate> Render for Table<D> {
             .size_full()
             .relative()
             .bg(theme.bg_primary)
+            .on_drag_move(cx.listener(Self::resize_column))
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(scroll_wrap)
             .child(vertical_scrollbar);

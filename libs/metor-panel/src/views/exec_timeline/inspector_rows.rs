@@ -160,10 +160,9 @@ fn params_summary(params: &ParamSource) -> SharedString {
         ParamSource::Postcard(_) => "postcard".into(),
         ParamSource::Value(v) => {
             let s = v.to_string();
-            if s.len() > 60 {
-                SharedString::from(format!("{}…", &s[..60]))
-            } else {
-                SharedString::from(s)
+            match s.char_indices().nth(60) {
+                Some((cut, _)) => SharedString::from(format!("{}…", &s[..cut])),
+                None => SharedString::from(s),
             }
         }
     }

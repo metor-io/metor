@@ -470,11 +470,14 @@ fn render_resize_handle(
         .on_drag_move({
             let tg = tg.clone();
             move |event: &DragMoveEvent<ResizeDrag>, _window, cx| {
+                // Every handle hears every resize drag; only the grabbed one
+                // answers.
                 let drag = event.drag(cx);
-                let path = drag.path.clone();
-                let handle_ix = drag.handle_ix;
+                if drag.path != path || drag.handle_ix != handle_ix {
+                    return;
+                }
                 let position = event.event.position;
-
+                let path = path.clone();
                 tg.update(cx, |this, cx| {
                     this.handle_resize(path, handle_ix, position, cx);
                 });
@@ -864,7 +867,11 @@ impl TileGroup {
             let flex_before_pair: f32 = axis.flexes[..left].iter().sum();
             let flex_sum: f32 = axis.flexes.iter().sum();
 
-            let target_left = (ratio * flex_sum - flex_before_pair).clamp(0.05, pair_flex - 0.05);
+            // Saved layouts can hold a pair thinner than two minimum panes;
+            // split what there is rather than let the bounds cross.
+            let min_flex = 0.05f32.min(pair_flex / 2.0);
+            let target_left =
+                (ratio * flex_sum - flex_before_pair).clamp(min_flex, pair_flex - min_flex);
             let target_right = pair_flex - target_left;
 
             axis.flexes[left] = target_left;

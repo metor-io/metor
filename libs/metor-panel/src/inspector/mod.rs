@@ -1272,6 +1272,10 @@ mod temporal_tests {
         let db = Arc::new(metor_db::DB::create(temp.path().join("db")).unwrap());
         cx.update(|cx| {
             crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            cx.set_global(crate::theme::FontSettings {
+                family: "monospace".into(),
+                config: Default::default(),
+            });
             temporal::TemporalController::init(db, cx);
             temporal::dispatch(
                 temporal::TimeAction::Seek(temporal::TimeExpr::fixed(

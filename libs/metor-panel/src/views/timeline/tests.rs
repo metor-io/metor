@@ -217,6 +217,10 @@ fn event_chip_body_hits_the_rendered_burst_and_span(cx: &mut gpui::TestAppContex
     let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
     cx.update(|cx| {
         crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        cx.set_global(crate::theme::FontSettings {
+            family: "monospace".into(),
+            config: Default::default(),
+        });
         temporal::TemporalController::init(db.clone(), cx);
     });
     let (timeline, cx) = cx.add_window_view(|_, cx| {
@@ -318,6 +322,10 @@ fn right_click_opens_shared_commands_and_can_execute_them(cx: &mut gpui::TestApp
     let requests = Rc::new(RefCell::new(Vec::<InspectorRequest>::new()));
     cx.update(|cx| {
         crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        cx.set_global(crate::theme::FontSettings {
+            family: "monospace".into(),
+            config: Default::default(),
+        });
         temporal::TemporalController::init(db.clone(), cx);
         let requests = requests.clone();
         cx.set_global(OpenInspectorGlobal(Arc::new(move |request, _, _| {

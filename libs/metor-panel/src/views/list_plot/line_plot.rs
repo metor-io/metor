@@ -395,9 +395,8 @@ impl Render for ListLinePlot {
                                     })
                                 })
                                 .collect();
-                            if !draws.is_empty()
-                                && let Some(handle) =
-                                    lp.gpu_state.render(cx, bounds, scale_factor, view, &draws)
+                            if let Some(handle) =
+                                lp.gpu_state.render(cx, bounds, scale_factor, view, &draws)
                             {
                                 handle.spawn_and_set(cx, list_plot_gpu_state);
                             }

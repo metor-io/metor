@@ -31,7 +31,8 @@ pub(super) enum ResizeEdge {
 ///
 /// `grab_offset` is the cursor position relative to the widget's top-left
 /// so the drag handler can move the widget without snapping the cursor to
-/// the origin.
+/// the origin. gpui hands drag moves to every dashboard on screen, and
+/// widget ids repeat across dashboards, so handlers check `dashboard`.
 pub(super) struct DraggedWidget {
     pub(super) widget_id: WidgetId,
     pub(super) dashboard: Entity<DashboardPanel>,
@@ -68,6 +69,9 @@ impl DashboardPanel {
         cx: &mut Context<Self>,
     ) {
         let drag = event.drag(cx);
+        if drag.dashboard != cx.entity() {
+            return;
+        }
         let widget_id = drag.widget_id;
         let grab_offset = drag.grab_offset;
 
@@ -89,6 +93,9 @@ impl DashboardPanel {
         cx: &mut Context<Self>,
     ) {
         let drag = event.drag(cx);
+        if drag.dashboard != cx.entity() {
+            return;
+        }
         let widget_id = drag.widget_id;
         let edge = drag.edge;
         let orig = drag.original_rect;
@@ -195,10 +202,13 @@ impl DashboardPanel {
         if self.editing {
             let widget_id = widget.id;
             let widget_rect = widget.rect;
-            // Edit-mode blocker: swallows inner-view clicks so drag/resize
-            // zones are the only interactive surface. Right-click still
-            // opens the widget's inspector.
-            let blocker_entity = cx.entity();
+            // Edit-mode blocker: keeps clicks away from the widget's own
+            // controls, so editing never fires a command or pans a plot.
+            // Stopping propagation also hides the click from the canvas
+            // behind, so the blocker hands it on itself (connector anchors
+            // land on widgets). Right-click opens the widget's inspector.
+            let left_entity = cx.entity();
+            let right_entity = cx.entity();
             let blocker_widget_id = widget.id;
             container = container.child(
                 div()
@@ -207,12 +217,21 @@ impl DashboardPanel {
                     .top_0()
                     .left_0()
                     .size_full()
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, _| {})
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        move |event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            left_entity.update(cx, |this, cx| {
+                                this.handle_canvas_mouse_down(event, window, cx);
+                            });
+                        },
+                    )
                     .on_mouse_down(
                         gpui::MouseButton::Right,
                         move |event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
                             let pos = event.position;
-                            blocker_entity.update(cx, |this, cx| {
+                            right_entity.update(cx, |this, cx| {
                                 this.open_widget_inspector(blocker_widget_id, pos, window, cx);
                             });
                         },
