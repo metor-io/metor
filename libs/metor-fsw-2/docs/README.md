@@ -83,7 +83,7 @@ See [Systems](system.md) and [Coordinator](coordinator.md).
 
 ## Target input
 
-A `target.py` file and the Rust `WiringBuilder` both produce wiring IR v9.
+A `target.py` file and the Rust `WiringBuilder` both produce wiring IR v11.
 The IR holds shared states, systems, runtime slots, edges, artifacts, and
 coordinator settings.
 
@@ -113,6 +113,12 @@ check, and publish commands.
 The link service accepts TCP clients, sends schema and identity data, then
 sends live telemetry. Its uplink side turns valid message packets into normal
 message outputs. Local mDNS can announce the server address.
+
+The same link carries target-to-target data: one member publishes an instance
+on a server, another mirrors it and reads its ports like a local system's.
+
+A gateway member embeds a metor-db, ingests every other member's ground link
+into it, and serves the ground one address for the whole deployment.
 
 The alarm system reads telemetered frame values and sends alarm messages. A
 runtime slot can load, start, stop, or replace one allowed pack entry.

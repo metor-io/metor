@@ -96,6 +96,12 @@ pub struct State {
 
     msg_logs: HashMap<PacketId, MsgLog>,
 
+    /// Msg ids this db serves as commands: a client forwards them up, and
+    /// they never ride a [`SyncMsgs`] stream back down.
+    command_ids: Vec<PacketId>,
+    /// This db's telemetry namespace, when it serves one target's prefix.
+    namespace: Option<String>,
+
     vtable_registry: registry::HashMapRegistry,
     streams: HashMap<StreamId, Arc<FixedRateStreamState>>,
 
@@ -285,9 +291,23 @@ impl DB {
         })
     }
 
+    /// Register an announced vtable under its id. A re-announce of the same
+    /// vtable — a reconnect replay — is a no-op; a *different* vtable under
+    /// a registered id is refused, so one link's records can never be
+    /// decoded through another's schema.
     pub fn insert_vtable(&self, vtable: VTableMsg) -> Result<(), Error> {
-        info!(id = ?vtable.id, "inserting vtable");
         self.with_state_mut(|state| {
+            if let Some(registered) = state.vtable_registry.map.get(&vtable.id) {
+                return if postcard::to_allocvec(registered)?
+                    == postcard::to_allocvec(&vtable.vtable)?
+                {
+                    debug!(id = ?vtable.id, "vtable already registered");
+                    Ok(())
+                } else {
+                    Err(Error::VTableConflict(vtable.id))
+                };
+            }
+            info!(id = ?vtable.id, "inserting vtable");
             // For static fields this registers the concrete component. For dynamic
             // frames (`List`/`Map`), `realize_fields(None)` yields each member *template*
             // (e.g. `processes.pid`) so its ty/shape is registered up front; the concrete
@@ -427,6 +447,26 @@ impl DB {
         let mut pkt = LenPacket::table(id, cached.len());
         pkt.extend_from_slice(&cached);
         Some(pkt)
+    }
+
+    /// Set what this db advertises in its [`DbInfoResp`]: the namespace its
+    /// components carry and the command set clients forward up.
+    pub fn set_identity(&self, namespace: Option<String>, command_ids: Vec<PacketId>) {
+        self.with_state_mut(|s| {
+            s.namespace = namespace;
+            s.command_ids = command_ids;
+        });
+    }
+
+    /// Union more ids into the advertised command set.
+    pub fn add_command_ids(&self, ids: &[PacketId]) {
+        self.with_state_mut(|s| {
+            for id in ids {
+                if !s.command_ids.contains(id) {
+                    s.command_ids.push(*id);
+                }
+            }
+        });
     }
 
     pub fn push_msg(&self, timestamp: Timestamp, id: PacketId, msg: &[u8]) -> Result<(), Error> {
@@ -616,6 +656,9 @@ impl State {
                         .join("msgs")
                         .join(u16::from_le_bytes(id).to_string()),
                 )?;
+                // A new log is a metadata change: it is how a `SyncMsgs`
+                // sweep learns there is another log to tail.
+                self.metadata_generation = self.metadata_generation.wrapping_add(1);
                 entry.insert(msg_log)
             }
         })
@@ -1452,6 +1495,9 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             let req_id = m.req_id;
             stellarator::spawn(handle_msg_stream(msg_id, req_id, msg_log, tx.tx.clone()));
         }
+        Packet::Msg(m) if m.id == SyncMsgs::ID => {
+            stellarator::spawn(handle_msg_sync(tx.tx.clone(), db.clone(), m.req_id));
+        }
         Packet::Msg(m) if m.id == FixedRateMsgStream::ID => {
             let FixedRateMsgStream { msg_id, fixed_rate } = m.parse::<FixedRateMsgStream>()?;
             let msg_log =
@@ -1560,9 +1606,13 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             })?;
         }
         Packet::Msg(m) if m.id == GetDbInfo::ID => {
+            let (command_ids, namespace) =
+                db.with_state(|s| (s.command_ids.clone(), s.namespace.clone()));
             tx.send_msg(&DbInfoResp {
                 protocol_version: NODE_PROTOCOL_VERSION,
-                features: 0,
+                features: FEATURE_MSG_SYNC,
+                command_ids,
+                namespace,
             })
             .await?;
         }
@@ -1785,6 +1835,109 @@ pub async fn handle_msg_stream<A: AsyncWrite>(
         };
         pkt.extend_from_slice(msg);
         rent!(tx.send(pkt).await, pkt)?;
+    }
+}
+
+/// Stream every message log outside the command set over one connection:
+/// each log's metadata, its latest record, then its live records. New logs
+/// join as `metadata_gen` moves.
+async fn handle_msg_sync<A: AsyncWrite + 'static>(
+    sink: Arc<Mutex<PacketSink<A>>>,
+    db: Arc<DB>,
+    req_id: RequestId,
+) -> Result<(), Error> {
+    let mut visited: HashSet<PacketId> = HashSet::new();
+    loop {
+        let fresh: Vec<(PacketId, MsgLog)> = db.with_state(|s| {
+            s.msg_logs
+                .iter()
+                .filter(|(id, _)| !visited.contains(*id) && !s.command_ids.contains(id))
+                .map(|(id, log)| (*id, log.clone()))
+                .collect()
+        });
+        for (id, log) in fresh {
+            visited.insert(id);
+            stellarator::spawn(sync_msg_log(sink.clone(), id, log, req_id));
+        }
+        db.metadata_gen.wait().await;
+    }
+}
+
+/// One log's tail: the WAL reader is taken before `latest` is read, so no
+/// record falls between the two; the reader's own copy of the seeded latest
+/// is dropped once.
+async fn sync_msg_log<A: AsyncWrite>(
+    sink: Arc<Mutex<PacketSink<A>>>,
+    id: PacketId,
+    log: MsgLog,
+    req_id: RequestId,
+) -> Result<(), Error> {
+    use crate::msg_log_2::read_msg;
+
+    async fn send<A: AsyncWrite>(
+        sink: &Mutex<PacketSink<A>>,
+        pkt: LenPacket,
+    ) -> Result<bool, Error> {
+        let tx = sink.lock().await;
+        let (sent, _) = tx.send(pkt).await;
+        match sent {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                let err = Error::from(err);
+                if err.is_stream_closed() {
+                    Ok(false)
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    if let Some(metadata) = log.metadata().cloned() {
+        let pkt = (&SetMsgMetadata { id, metadata }).with_request_id(req_id);
+        if !send(&sink, pkt).await? {
+            return Ok(());
+        }
+    }
+
+    let mut reader = log.wal_reader();
+    // `latest` reads the persisted head, which trails the WAL by one
+    // persist pass; flushing behind the reader makes the seed complete,
+    // and a record committed between the two arrives twice — the seam the
+    // skip below closes.
+    log.flush_pending()?;
+    let mut seed: Option<(Timestamp, Vec<u8>)> = None;
+    if let Some(latest) = log.latest()
+        && let Some(data) = latest.data()
+    {
+        let ts = latest.timestamp();
+        seed = Some((ts, data.to_vec()));
+        let mut pkt = LenPacket::msg_with_timestamp(id, ts, data.len());
+        pkt.extend_from_slice(data);
+        if !send(&sink, pkt.with_request_id(req_id)).await? {
+            return Ok(());
+        }
+    }
+
+    loop {
+        while let Some(grant) = reader.try_next() {
+            let mut buf: &[u8] = &grant;
+            while let Some((rest, ts, msg)) = read_msg(buf) {
+                buf = rest;
+                if let Some((seed_ts, seed_msg)) = seed.take()
+                    && seed_ts == ts
+                    && seed_msg == msg
+                {
+                    continue;
+                }
+                let mut pkt = LenPacket::msg_with_timestamp(id, ts, msg.len());
+                pkt.extend_from_slice(msg);
+                if !send(&sink, pkt.with_request_id(req_id)).await? {
+                    return Ok(());
+                }
+            }
+        }
+        log.wait().await;
     }
 }
 
@@ -2019,7 +2172,7 @@ async fn handle_real_time_component<A: AsyncWrite>(
         timestamp(timestamp_loc, component.as_vtable_op()),
     )]);
     let waiter = component.time_series.waiter();
-    let vtable_id: PacketId = fastrand::u16(..).to_le_bytes();
+    let vtable_id = metor_proto::types::table_id(&vtable);
     {
         let stream = stream.lock().await;
         stream
@@ -2539,5 +2692,290 @@ mod dynamic_ingest_tests {
                 "counts.over"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod msg_sync_tests {
+    use super::*;
+    use metor_proto_stellar::Client;
+    use std::sync::Mutex as StdMutex;
+
+    use postcard_schema::Schema as _;
+
+    #[derive(postcard_schema::Schema, serde::Serialize, serde::Deserialize)]
+    struct Payload {
+        i: u32,
+    }
+
+    const CMD: PacketId = [0x51, 0];
+    const LOG_A: PacketId = [0x33, 7];
+    const LOG_B: PacketId = [0x34, 7];
+
+    type Seen = Arc<StdMutex<Vec<(PacketId, Option<Timestamp>, Vec<u8>)>>>;
+
+    fn serve(db: Arc<DB>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Server { listener, db };
+        stellarator::struc_con::stellar(move || server.run());
+        addr
+    }
+
+    /// Send `SyncMsgs` and record every packet the server pushes back.
+    async fn sync(addr: SocketAddr) -> Seen {
+        let mut client = Client::connect(addr).await.unwrap();
+        client.send((&SyncMsgs).with_request_id(2)).await.0.unwrap();
+        let seen: Seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink = seen.clone();
+        let Client { mut rx, .. } = client;
+        stellarator::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok(pkt) = rx.next_grow(buf).await else {
+                    return;
+                };
+                if let Packet::Msg(m) = &pkt {
+                    sink.lock()
+                        .unwrap()
+                        .push((m.id, m.timestamp, m.buf[..].to_vec()));
+                }
+                buf = pkt.into_buf().into_inner();
+            }
+        });
+        seen
+    }
+
+    async fn wait_for(pred: impl Fn() -> bool, what: &str) {
+        for _ in 0..200 {
+            if pred() {
+                return;
+            }
+            stellarator::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("never saw {what}");
+    }
+
+    fn payloads(seen: &Seen, id: PacketId) -> Vec<Vec<u8>> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(pkt_id, _, _)| *pkt_id == id)
+            .map(|(_, _, buf)| buf.clone())
+            .collect()
+    }
+
+    #[stellarator::test]
+    async fn db_info_advertises_commands_and_features() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(dir.path().join("db")).unwrap());
+        db.set_identity(Some("sat".into()), vec![CMD]);
+        let addr = serve(db);
+        let mut client = Client::connect(addr).await.unwrap();
+        let info: DbInfoResp = client.request(&GetDbInfo).await.unwrap();
+        assert_eq!(info.protocol_version, NODE_PROTOCOL_VERSION);
+        assert_ne!(info.features & FEATURE_MSG_SYNC, 0);
+        assert_eq!(info.command_ids, vec![CMD]);
+        assert_eq!(info.namespace.as_deref(), Some("sat"));
+    }
+
+    /// The seeded latest arrives with its source timestamp, live records
+    /// follow, a log in the command set never streams, and a log created
+    /// after the request joins.
+    #[stellarator::test]
+    async fn sync_msgs_streams_latest_then_live_and_skips_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(dir.path().join("db")).unwrap());
+        db.set_identity(None, vec![CMD]);
+        db.with_state_mut(|s| {
+            s.set_msg_metadata(
+                LOG_A,
+                MsgMetadata {
+                    name: "log_a".into(),
+                    schema: Payload::SCHEMA.into(),
+                    metadata: Default::default(),
+                },
+                &db.path,
+            )
+        })
+        .unwrap();
+        db.push_msg(Timestamp(10), LOG_A, b"a0").unwrap();
+        db.push_msg(Timestamp(11), LOG_A, b"a1").unwrap();
+        db.push_msg(Timestamp(12), CMD, b"c0").unwrap();
+
+        let addr = serve(db.clone());
+        let seen = sync(addr).await;
+
+        let probe = seen.clone();
+        wait_for(
+            move || !payloads(&probe, LOG_A).is_empty(),
+            "the seeded latest",
+        )
+        .await;
+        assert_eq!(payloads(&seen, LOG_A), vec![b"a1".to_vec()]);
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _, _)| *id == LOG_A)
+                .and_then(|(_, ts, _)| *ts),
+            Some(Timestamp(11)),
+            "the source timestamp survives",
+        );
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _, _)| *id == SetMsgMetadata::ID),
+            "the log's metadata precedes its records",
+        );
+
+        // Live records follow, and a log created after the request joins.
+        db.push_msg(Timestamp(13), LOG_A, b"a2").unwrap();
+        db.push_msg(Timestamp(14), LOG_B, b"b0").unwrap();
+        let probe = seen.clone();
+        wait_for(
+            move || payloads(&probe, LOG_A).len() == 2 && !payloads(&probe, LOG_B).is_empty(),
+            "the live record and the new log",
+        )
+        .await;
+        assert_eq!(payloads(&seen, LOG_A), vec![b"a1".to_vec(), b"a2".to_vec()]);
+        assert_eq!(payloads(&seen, LOG_B), vec![b"b0".to_vec()]);
+
+        // The command log never streams, before or after.
+        db.push_msg(Timestamp(15), CMD, b"c1").unwrap();
+        stellarator::sleep(Duration::from_millis(200)).await;
+        assert!(payloads(&seen, CMD).is_empty());
+    }
+
+    /// The WAL reader is taken before `latest`, so the seeded record can
+    /// arrive twice; it is dropped once.
+    #[stellarator::test]
+    async fn sync_msgs_does_not_duplicate_the_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(dir.path().join("db")).unwrap());
+        db.push_msg(Timestamp(1), LOG_A, b"first").unwrap();
+        let addr = serve(db.clone());
+        let seen = sync(addr).await;
+        let probe = seen.clone();
+        wait_for(move || !payloads(&probe, LOG_A).is_empty(), "the seed").await;
+        db.push_msg(Timestamp(2), LOG_A, b"second").unwrap();
+        let probe = seen.clone();
+        wait_for(
+            move || payloads(&probe, LOG_A).len() == 2,
+            "the live record",
+        )
+        .await;
+        stellarator::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            payloads(&seen, LOG_A),
+            vec![b"first".to_vec(), b"second".to_vec()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod vtable_id_tests {
+    use super::*;
+    use metor_proto::vtable::builder::{component, raw_field, schema, vtable};
+    use metor_proto_stellar::Client;
+
+    const ID: PacketId = [7, 3];
+
+    fn announce(name: &str) -> VTable {
+        vtable([raw_field(
+            0,
+            8,
+            schema(PrimType::F64, &[1], component(name)),
+        )])
+    }
+
+    /// A reconnect replay re-announces the same bytes: no components are
+    /// re-inserted and nothing invalidates.
+    #[stellarator::test]
+    async fn insert_vtable_is_idempotent_on_equal_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::create(dir.path().to_path_buf()).unwrap();
+        let msg = VTableMsg {
+            id: ID,
+            vtable: announce("one"),
+        };
+        db.insert_vtable(msg.clone()).unwrap();
+        let generation = db.vtable_gen.latest();
+        db.insert_vtable(msg).unwrap();
+        assert_eq!(db.vtable_gen.latest(), generation);
+        assert!(
+            db.with_state(|s| s.get_component(ComponentId::new("one")).is_some())
+                && db.with_state(|s| s.components.len() == 1)
+        );
+    }
+
+    /// Two producers announcing different schemas under one id: the second
+    /// is refused and the first stays registered.
+    #[stellarator::test]
+    async fn insert_vtable_refuses_a_different_vtable_under_one_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::create(dir.path().to_path_buf()).unwrap();
+        db.insert_vtable(VTableMsg {
+            id: ID,
+            vtable: announce("first"),
+        })
+        .unwrap();
+        let err = db
+            .insert_vtable(VTableMsg {
+                id: ID,
+                vtable: announce("second"),
+            })
+            .expect_err("a different vtable under a registered id is refused");
+        assert!(matches!(err, Error::VTableConflict(ID)), "{err:?}");
+        db.with_state(|s| {
+            assert!(s.get_component(ComponentId::new("first")).is_some());
+            assert!(s.get_component(ComponentId::new("second")).is_none());
+        });
+    }
+
+    /// The real-time stream ids its per-component vtable by content, so two
+    /// connections to one db agree.
+    #[stellarator::test]
+    async fn real_time_stream_ids_are_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(dir.path().to_path_buf()).unwrap());
+        db.insert_vtable(VTableMsg {
+            id: ID,
+            vtable: announce("live"),
+        })
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Server { listener, db };
+        stellarator::struc_con::stellar(move || server.run());
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let mut client = Client::connect(addr).await.unwrap();
+            client
+                .send(
+                    (&Stream {
+                        behavior: StreamBehavior::RealTime,
+                        id: 1,
+                    })
+                        .with_request_id(1),
+                )
+                .await
+                .0
+                .unwrap();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let pkt = client.rx.next_grow(buf).await.unwrap();
+                if let Packet::Msg(m) = &pkt
+                    && m.id == VTableMsg::ID
+                {
+                    ids.push(m.parse::<VTableMsg>().unwrap().id);
+                    break;
+                }
+                buf = pkt.into_buf().into_inner();
+            }
+        }
+        assert_eq!(ids[0], ids[1]);
     }
 }

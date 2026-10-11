@@ -1,13 +1,14 @@
 //! Artifact loading, caching, manifest checks, and entry selection.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use metor_fsw_2_core::SystemDescriptor;
 
 use crate::dl::DlSystem;
 use crate::wiring::pack_module;
-use crate::wiring::{Artifact, LoadError, LoadErrorKind, ParamSource, Wiring, encode_value_params};
+use crate::wiring::{Artifact, LoadError, ParamSource, Wiring, encode_value_params};
 
 /// The per-resolve cache of opened packs, keyed by artifact id, so an
 /// artifact serving several systems or occupants is opened (and its pack
@@ -25,30 +26,25 @@ impl PackCache {
         artifact_id: &str,
         owner: &str,
     ) -> Result<&crate::dl::DlPack, LoadError> {
-        if !self.packs.contains_key(artifact_id) {
-            let artifact = find_built_artifact(wiring, artifact_id, owner)?;
-            let path = artifact
-                .path
-                .as_ref()
-                .expect("checked by find_built_artifact");
-            let pack = crate::dl::DlPack::open(path).map_err(|source| {
-                LoadErrorKind::DlOpen {
-                    system: owner.to_string(),
-                    artifact: artifact_id.to_string(),
-                    source: Box::new(source),
-                }
-                .bare()
-            })?;
-            self.packs.insert(artifact_id.to_string(), pack);
-        }
-        Ok(&self.packs[artifact_id])
+        let entry = match self.packs.entry(artifact_id.to_string()) {
+            Entry::Occupied(pack) => return Ok(pack.into_mut()),
+            Entry::Vacant(entry) => entry,
+        };
+        let artifact = find_built_artifact(wiring, artifact_id, owner)?;
+        let path = artifact
+            .path
+            .as_ref()
+            .expect("checked by find_built_artifact");
+        let pack = crate::dl::DlPack::open(path).map_err(|source| LoadError::DlOpen {
+            system: owner.to_string(),
+            artifact: artifact_id.to_string(),
+            source: Box::new(source),
+        })?;
+        Ok(entry.insert(pack))
     }
 }
 
-/// The per-resolve cache of described wasm artifacts, the [`PackCache`] twin:
-/// bytes read once, the pack manifest decoded through a short-lived describe
-/// instance, and, for a compiled Python pack, the expr manifest read
-/// alongside, since edge synthesis and `@rng` seeding both key off it.
+/// The per-resolve cache of described wasm artifacts
 #[derive(Default)]
 pub(super) struct WasmCache {
     pub(super) modules: HashMap<String, WasmModule>,
@@ -73,44 +69,40 @@ impl WasmCache {
         owner: &str,
         max_memory: usize,
     ) -> Result<&WasmModule, LoadError> {
-        if !self.modules.contains_key(artifact_id) {
-            let bad = |detail: String| {
-                LoadErrorKind::WasmSystem(
-                    format!("`{owner}`: wasm artifact `{artifact_id}`: {detail}").into_boxed_str(),
-                )
-                .bare()
-            };
-            let artifact = find_built_artifact(wiring, artifact_id, owner)?;
-            let path = artifact
-                .path
-                .as_ref()
-                .expect("checked by find_built_artifact");
-            let bytes =
-                std::fs::read(path).map_err(|e| bad(format!("reading {}: {e}", path.display())))?;
-            let mut pack = crate::wasm::WasmPack::open_with_memory_limit(
-                &bytes,
-                crate::coordinator::slot::WASM_SETUP_FUEL,
-                max_memory,
+        let entry = match self.modules.entry(artifact_id.to_string()) {
+            Entry::Occupied(pack) => return Ok(pack.into_mut()),
+            Entry::Vacant(entry) => entry,
+        };
+        let bad = |detail: String| {
+            LoadError::WasmSystem(
+                format!("`{owner}`: wasm artifact `{artifact_id}`: {detail}").into_boxed_str(),
             )
-            .map_err(|e| bad(e.to_string()))?;
-            let entries = pack.manifest().systems.clone();
-            let expr = match pack.expr_manifest_bytes().map_err(|e| bad(e.to_string()))? {
-                Some(manifest) => Some(
-                    metor_expr::describe(&manifest)
-                        .map_err(|e| bad(format!("expr manifest: {e}")))?,
-                ),
-                None => None,
-            };
-            self.modules.insert(
-                artifact_id.to_string(),
-                WasmModule {
-                    bytes: Arc::new(bytes),
-                    entries,
-                    expr,
-                },
-            );
-        }
-        Ok(&self.modules[artifact_id])
+        };
+        let artifact = find_built_artifact(wiring, artifact_id, owner)?;
+        let path = artifact
+            .path
+            .as_ref()
+            .expect("checked by find_built_artifact");
+        let bytes =
+            std::fs::read(path).map_err(|e| bad(format!("reading {}: {e}", path.display())))?;
+        let mut pack = crate::wasm::WasmPack::open_with_memory_limit(
+            &bytes,
+            crate::coordinator::slot::WASM_SETUP_FUEL,
+            max_memory,
+        )
+        .map_err(|e| bad(e.to_string()))?;
+        let entries = pack.manifest().systems.clone();
+        let expr = match pack.expr_manifest_bytes().map_err(|e| bad(e.to_string()))? {
+            Some(manifest) => Some(
+                metor_expr::describe(&manifest).map_err(|e| bad(format!("expr manifest: {e}")))?,
+            ),
+            None => None,
+        };
+        Ok(entry.insert(WasmModule {
+            bytes: Arc::new(bytes),
+            entries,
+            expr,
+        }))
     }
 }
 
@@ -142,8 +134,8 @@ impl EntrySource<'_> {
         }
     }
 
-    /// The sole exported entry name, in which case a spec may omit `type=`.
-    pub(super) fn sole_entry(&self) -> Option<&str> {
+    /// If there is only a single entry, return it
+    fn single_entry(&self) -> Option<&str> {
         match self {
             EntrySource::Opened { pack, .. } => pack.sole_system(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -212,34 +204,22 @@ pub(super) fn resolve_occupant(
 ) -> Result<(OccupantEntry, Vec<u8>), LoadError> {
     let name = match entry {
         Some(name) => name,
-        None => source.sole_entry().ok_or_else(|| {
-            LoadErrorKind::PackTypeRequired {
+        None => source
+            .single_entry()
+            .ok_or_else(|| LoadError::PackTypeRequired {
                 system: owner.to_string(),
                 artifact: source.artifact().to_string(),
                 available: source.entry_names().join(", "),
-            }
-            .bare()
-        })?,
-    };
-    let pack_system = |source: crate::dl::DlError| {
-        LoadErrorKind::PackSystem {
-            system: owner.to_string(),
-            source: Box::new(source),
-        }
-        .bare()
-    };
-    let not_reloadable = || {
-        LoadErrorKind::OccupantNotReloadable {
-            slot: owner.to_string(),
-            occupant: name.to_string(),
-        }
-        .bare()
+            })?,
     };
     match source {
         EntrySource::Opened { pack, .. } => {
-            let loaded = pack.system(name).map_err(pack_system)?;
+            let loaded = pack.system(name).map_err(|source| LoadError::PackSystem {
+                system: owner.to_string(),
+                source: Box::new(source),
+            })?;
             if require_reloadable && !loaded.reloadable() {
-                return Err(not_reloadable());
+                return Err(LoadError::occupant_not_reloadable(owner, name));
             }
             let params = encode_occupant_params(
                 params,
@@ -254,14 +234,15 @@ pub(super) fn resolve_occupant(
             let meta = entries
                 .iter()
                 .find(|e| e.descriptor.name == name)
-                .ok_or_else(|| {
-                    pack_system(crate::dl::DlError::UnknownPackSystem {
+                .ok_or_else(|| LoadError::PackSystem {
+                    system: owner.to_string(),
+                    source: Box::new(crate::dl::DlError::UnknownPackSystem {
                         name: name.to_string(),
                         available: source.entry_names(),
-                    })
+                    }),
                 })?;
             if require_reloadable && !meta.reloadable {
-                return Err(not_reloadable());
+                return Err(LoadError::occupant_not_reloadable(owner, name));
             }
             let params = encode_occupant_params(
                 params,
@@ -303,25 +284,21 @@ pub(super) fn find_built_artifact<'w>(
         .artifacts
         .iter()
         .find(|a| a.id == artifact_id)
-        .ok_or_else(|| {
-            LoadErrorKind::UnknownArtifact {
-                system: owner.to_string(),
-                artifact: artifact_id.to_string(),
-            }
-            .bare()
+        .ok_or_else(|| LoadError::UnknownArtifact {
+            system: owner.to_string(),
+            artifact: artifact_id.to_string(),
         })?;
     if artifact.path.is_none() {
-        return Err(LoadErrorKind::ArtifactNotBuilt {
+        return Err(LoadError::ArtifactNotBuilt {
             artifact: artifact_id.to_string(),
-        }
-        .bare());
+        });
     }
     Ok(artifact)
 }
 
 /// Enforce generated-stub freshness: for each artifact whose stub module
 /// recorded a `manifest_hash`, compare it against the live pack manifest and
-/// fail with [`LoadErrorKind::StaleStubs`] on a mismatch. Artifacts with no
+/// fail with [`LoadError::StaleStubs`] on a mismatch. Artifacts with no
 /// recorded hash (builder-authored, hand-written `pack()` handles) or no built
 /// path yet are skipped; the dlopen path still opens them.
 pub(super) fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
@@ -341,10 +318,9 @@ pub(super) fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
             continue;
         };
         if pack_module::manifest_hash(&bytes) != recorded {
-            return Err(LoadErrorKind::StaleStubs {
+            return Err(LoadError::StaleStubs {
                 artifact: artifact.id.clone(),
-            }
-            .bare());
+            });
         }
     }
     Ok(())

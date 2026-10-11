@@ -1,8 +1,6 @@
 # Telemetry link
 
-For the new offline ICD API for FSW-to-FSW exchange, see
-[Peer endpoint contracts](peer-contracts.md). Peer transport is still planned;
-the link described below is the existing ground telemetry service.
+One target reads another's data over the same link; see "Peers" below.
 
 The telemetry link serves telemetry and commands on one TCP socket. Ground tools connect to the flight software. The flight software does not dial a ground address.
 
@@ -49,6 +47,8 @@ downlink = m.add(
 ```
 
 The two lists use OR rules. An entry matches if either list contains its name. The `frames` list also matches message channel names.
+
+Write bare instance names. A target namespace is applied to them for you, so `instances=["nav"]` on a namespaced target matches `sat.nav`.
 
 The uplink creates one message output for each name in `msgs`. A route must connect that output to each user:
 
@@ -98,7 +98,7 @@ The delivery setting controls how the downlink reads the ring:
 
 For example, a state frame often uses table schema with snapshot delivery. An alarm event uses message schema with log delivery. The downlink handles both through the same tap code.
 
-Table bytes need no data conversion. The downlink gives each table tap a packet id, then sends its vtable and component metadata before table data.
+Table bytes need no data conversion. The downlink gives each table tap a packet id, then sends its vtable and component metadata before table data. A table packet's id is a hash of its announced vtable, so it is stable across connections and links; two tables hashing alike are reported by `telemetry_table_id_collision` and the later one is dropped.
 
 The link also sends `SetMsgMetadata` for each known message id. It sends each message schema once, even when many systems have an output with that id.
 
@@ -112,7 +112,7 @@ Each new TCP client receives this data in order:
 4. The latest retained snapshot messages.
 5. Live cycle batches.
 
-`LinkInfo` contains the link protocol version, feature bits, and the message ids that the uplink accepts. The current packet does not contain the mDNS node name.
+`LinkInfo` contains the link protocol version, feature bits, the message ids that the uplink accepts, and, since version 2, the serving target's namespace and the serving state's declaration name. A subscriber checks those two before it reads anything. The packet does not contain the mDNS node name.
 
 The link retains snapshot messages because some of them report boot state once. It does not retain table snapshots. Systems tend to publish table state each cycle, so a new client soon gets a fresh value.
 
@@ -154,9 +154,9 @@ The current server advertises non-loopback binds with mDNS and DNS-SD. It uses t
 _metor-fsw._tcp.local.
 ```
 
-The service instance uses `TcpServer.name`. If the config omits the name, it uses the OS host name.
+The service instance uses `TcpServer.name`. If the config omits the name, it uses the target namespace, and the OS host name when the target has none. A target with several `TcpServer` states must give all but one a `name`, checked when the wiring loads: two servers cannot advertise one instance name.
 
-The TXT record includes the link protocol version as `pv` and the role `fsw`. A wildcard bind lets the mDNS service list the host network addresses. A fixed non-loopback bind advertises that address.
+The TXT record includes the link protocol version as `pv`, the role (`fsw`, or `gateway` for a db a gateway member serves), the serving state's declaration name as `link`, and the target namespace as `ns` when it has one. `ns` and `link` are the machine identity a subscriber matches on; the instance name is for people. A wildcard bind lets the mDNS service list the host network addresses. A fixed non-loopback bind advertises that address.
 
 The server does not advertise a loopback bind. Local development with `127.0.0.1` still needs a direct address.
 
@@ -165,3 +165,87 @@ mDNS works on the local multicast link. Routers do not carry it by default. It d
 The TCP link has no auth or encryption. Any host that can reach the port can read telemetry and send accepted command ids. Use discovery and this link only on a trusted network until the link gains peer auth.
 
 Stopping the server shuts down the mDNS service and closes all TCP tasks.
+
+## Peers
+
+A target reads another target's data by mirroring one of its instances. The
+producer serves the instance and the consumer dials it; nothing new goes on
+the wire.
+
+`Publish(state, instances)` is a `Downlink` on a `TcpServer` state, filtered
+to the listed instances. A target may publish on its ground link or on a
+second server kept for peers.
+
+`Subscribe(handle)` takes a system handle from another member of the
+deployment and records a mirror: a system with the peer instance's type and
+artifact, whose ports are that type's outputs and whose implementation is the
+built-in subscriber. Consumers read a mirrored port exactly as they read a
+local one, one cycle plus network time late. Mirror components carry the
+subscriber's namespace, so `fsw.sim.gps.lla` is the plant's `gps` as fsw saw
+it.
+
+The subscriber dials, in order, until a connection verifies:
+
+1. the `--peer <ns>=<host[:port]>` override, when given;
+2. both loopback families on the peer's port;
+3. every mDNS instance of `_metor-fsw._tcp` whose TXT carries `ns=` and
+   `link=` matching the peer.
+
+On connect it checks `LinkInfo`'s protocol version, namespace, and link name,
+then reads the announce replay and binds each mirrored port to the peer's
+packet id, comparing the announced vtable against the port's own. It logs
+`kind=` fault lines like the downlink's:
+
+- `peer_identity` when the address answers as something other than the named
+  peer's link
+- `peer_schema_mismatch` when an announced port's type or shape differs
+- `peer_channel_missing` when the peer announces no channel for a port
+- `peer_disconnect` when the connection ends
+
+A failed round backs off 500 ms, doubling to 10 s, and starts over. While the
+peer is down its consumers read `None`, exactly as they do before the first
+record.
+
+The `peer_status` frame reports `connected`, `sessions`, `records`,
+`last_rx_cycle`, and `dropped`, and publishes when one of them changes. It is
+the mirror's readiness signal; the launcher has no readiness gate.
+
+## Gateway
+
+A gateway is a member with a `Db` state: an embedded metor-db that listens
+on `addr`, keeps its data under `path` (a temp dir when omitted), and
+advertises over mDNS with `role=gateway` so a picker can tell it from a
+target link. `Db(store=, max_bytes=, max_age_secs=)` maps onto the db's
+tiering; without a store nothing is evicted.
+
+Each `Ingest` attached to the `Db` dials one member's ground link the way a
+subscriber dials a peer: the `--peer` override, both loopback families on the
+link's port, then mDNS by `ns=` and `link=`. It checks `LinkInfo` the same
+way, then streams everything that link announces into the db. Component ids
+carry the member's namespace, so members never collide. A failed round backs
+off 500 ms, doubling to 10 s. Its `source_status` frame reports `connected`,
+`sessions`, `packets`, and `rejected`, and publishes on change; it is named by
+the source, so `gw.plant.source_status` says whether `plant` is live. Fault
+lines:
+
+- `source_identity` when the address answers as something other than the
+  named member's link
+- `source_disconnect` when the connection ends
+- `source_commands` when a configured command token is one the member no
+  longer advertises
+
+`Record` attached to the same `Db` stores the gateway's own telemetry: it
+taps the gateway's rings as a downlink does and writes records straight into
+the db, with no packet framing. It faults `record_table_conflict` when a
+table id is already registered with a different schema and counts records
+the db refuses under `record_rejected`.
+
+Commands travel two hops. A ground db mirroring the gateway forwards the
+command ids the gateway advertises; the gateway forwards each source's
+`commands` up that source's link. The sets are disjoint across one `Db`, so
+a command reaches exactly one member. A command recorded in a db never rides
+that db's message stream back out, so nothing echoes.
+
+The ground connects to the gateway as a db. The mirror carries every
+member's frames, and, when both ends speak the current db protocol, every
+non-command message log too, latest record first, then live.

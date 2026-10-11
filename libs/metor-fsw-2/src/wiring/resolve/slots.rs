@@ -14,9 +14,7 @@ use crate::coordinator::{
     AllowedOccupant, InitialOccupant, OccupantBacking, SlotConfigError, SystemHandle,
 };
 use crate::ir::ArtifactKind;
-use crate::wiring::{
-    AllowedOccupantSpec, LoadError, LoadErrorKind, ParamSource, SlotInitState, SlotSpec, Wiring,
-};
+use crate::wiring::{AllowedOccupantSpec, LoadError, ParamSource, SlotInitState, SlotSpec, Wiring};
 
 /// The artifact whose pack exports `occ.occupant`: the `artifact=` the allow
 /// line named, or (absent one) the unique artifact exporting an entry of
@@ -52,12 +50,11 @@ pub(super) fn occupant_artifact(
     }
     match matches.as_slice() {
         [only] => Ok(only.clone()),
-        _ => Err(LoadErrorKind::OccupantAmbiguous {
+        _ => Err(LoadError::OccupantAmbiguous {
             slot: slot.to_string(),
             occupant: occ.occupant.clone(),
             matches,
-        }
-        .bare()),
+        }),
     }
 }
 
@@ -67,25 +64,23 @@ pub(super) fn occupant_artifact(
 pub(in crate::wiring) fn slot_config_error(err: SlotConfigError, slot: &SlotSpec) -> LoadError {
     let name = slot.name.clone();
     match err {
-        SlotConfigError::Empty => LoadErrorKind::EmptySlot { slot: name }.bare(),
+        SlotConfigError::Empty => LoadError::EmptySlot { slot: name },
         SlotConfigError::UnknownInitial { occupant, allowed } => {
-            LoadErrorKind::UnknownInitialOccupant {
+            LoadError::UnknownInitialOccupant {
                 slot: name,
                 occupant,
                 allowed,
             }
-            .bare()
         }
         // A mount-reserved port and a declared capability are
         // occupant-contract defects too: the occupant cannot honor the
         // slot's contract as declared.
         SlotConfigError::OccupantMismatch { occupant, .. }
         | SlotConfigError::ReservedPort { occupant, .. }
-        | SlotConfigError::CapabilityOccupant { occupant } => LoadErrorKind::SlotOccupantMismatch {
+        | SlotConfigError::CapabilityOccupant { occupant } => LoadError::SlotOccupantMismatch {
             slot: name,
             occupant,
-        }
-        .bare(),
+        },
         SlotConfigError::MixedBacking => {
             unreachable!("resolve_slot sources every occupant of a slot from one backing arm")
         }
@@ -104,14 +99,13 @@ pub(super) fn resolve_wasm_occupant(
     slot: &str,
 ) -> Result<AllowedOccupant, LoadError> {
     let bad = |detail: String| {
-        LoadErrorKind::WasmOccupant(
+        LoadError::WasmOccupant(
             format!(
                 "slot `{slot}`: wasm occupant `{}` from artifact `{}`: {detail}",
                 occ.occupant, art.id
             )
             .into_boxed_str(),
         )
-        .bare()
     };
     let path = art
         .path
@@ -225,12 +219,11 @@ pub(super) fn resolve_slot(
                 .iter()
                 .any(|p| p.conn == PortConn::Edge && &p.name == frame)
             {
-                return Err(LoadErrorKind::SlotContractMismatch {
+                return Err(LoadError::SlotContractMismatch {
                     slot: slot.name.clone(),
                     dir,
                     frame: frame.clone(),
-                }
-                .bare());
+                });
             }
         }
     }
@@ -264,13 +257,10 @@ pub(super) fn describe_occupants(
             .path
             .as_ref()
             .expect("checked by find_built_artifact");
-        let proc_describe = |detail: String| {
-            LoadErrorKind::ProcDescribe {
-                system: slot.name.clone(),
-                artifact: artifact_id.to_string(),
-                detail,
-            }
-            .bare()
+        let proc_describe = |detail: String| LoadError::ProcDescribe {
+            system: slot.name.clone(),
+            artifact: artifact_id.to_string(),
+            detail,
         };
         let bytes = crate::proc::host::describe_via_worker(None, path)
             .map_err(|e| proc_describe(e.to_string()))?;
@@ -301,12 +291,11 @@ pub(super) fn describe_occupants(
                 match matches.as_slice() {
                     [only] => only.clone(),
                     _ => {
-                        return Err(LoadErrorKind::OccupantAmbiguous {
+                        return Err(LoadError::OccupantAmbiguous {
                             slot: slot.name.clone(),
                             occupant: occ.occupant.clone(),
                             matches,
-                        }
-                        .bare());
+                        });
                     }
                 }
             }
@@ -340,8 +329,7 @@ pub(super) fn describe_occupants(
     slot: &SlotSpec,
     _wiring: &Wiring,
 ) -> Result<Vec<AllowedOccupant>, LoadError> {
-    Err(LoadErrorKind::ProcessUnsupported {
+    Err(LoadError::ProcessUnsupported {
         name: slot.name.clone(),
-    }
-    .bare())
+    })
 }

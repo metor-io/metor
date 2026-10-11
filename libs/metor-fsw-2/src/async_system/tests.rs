@@ -147,7 +147,11 @@ async fn async_filter_one_cycle() {
         stellarator::yield_now().await;
         cancel_after_one.cancel();
     });
-    let mut context = AsyncContext { cancel, status };
+    let mut context = AsyncContext {
+        cancel,
+        status,
+        cycle: std::sync::Arc::default(),
+    };
     let mut sys = AsyncFilter;
     sys.run(&mut context, &mut input, &mut output).await;
     let _ = canceller.await;

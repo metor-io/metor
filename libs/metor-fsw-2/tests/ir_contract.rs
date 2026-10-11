@@ -9,7 +9,11 @@
 //! consumes — deserialized and re-serialized to prove it is exactly what Rust
 //! accepts and emits.
 
-use metor_fsw_2::ir::{ArtifactKind, EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
+use std::collections::BTreeMap;
+
+use metor_fsw_2::ir::{
+    ArtifactKind, Deployment, EdgeKind, IR_VERSION, PeerSpec, ScopeSpec, SourceRef,
+};
 use metor_fsw_2::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EdgeSpec,
     InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, SlotInitState, SlotSpec,
@@ -92,6 +96,7 @@ fn maximal() -> Wiring {
                 layout: Some((40.0, 80.0)),
                 status: Some("nav.system_status".into()),
                 encompassing: true,
+                peer: None,
             },
             SystemSpec {
                 name: "postcard_sys".into(),
@@ -105,6 +110,7 @@ fn maximal() -> Wiring {
                 layout: None,
                 status: None,
                 encompassing: false,
+                peer: None,
             },
             SystemSpec {
                 name: "bare".into(),
@@ -118,6 +124,7 @@ fn maximal() -> Wiring {
                 layout: None,
                 status: None,
                 encompassing: false,
+                peer: None,
             },
             // A registered `@system`: an ordinary spec, free to sit anywhere
             // in the list, carry a scope, and name its instance apart from
@@ -134,6 +141,30 @@ fn maximal() -> Wiring {
                 layout: Some((420.0, 180.0)),
                 status: None,
                 encompassing: false,
+                peer: None,
+            },
+            // A mirror: the peer type and artifact, no params of its own, and
+            // the `peer` spec that makes the subscriber its implementation.
+            SystemSpec {
+                name: "sim".into(),
+                ty: Some("Plant".into()),
+                artifact: Some("adcs".into()),
+                params: ParamSource::None,
+                src: src(20),
+                process: false,
+                scope: None,
+                attach: None,
+                layout: None,
+                status: None,
+                encompassing: false,
+                peer: Some(PeerSpec {
+                    namespace: "plant".into(),
+                    link: "peer".into(),
+                    port: 2242,
+                    instance: "plant".into(),
+                    telemetered: true,
+                    host: None,
+                }),
             },
         ],
         slots: vec![SlotSpec {
@@ -294,6 +325,15 @@ fn representation_is_externally_tagged() {
     assert_eq!(v["program"]["decls"][0]["name"], json!("omega_norm"));
     assert_eq!(v["program"]["decls"][0]["offset"], json!(0));
 
+    // A mirror carries `peer` and nothing else new; `telemetered` is an
+    // opt-out, so the common `true` never reaches the wire, and `host` is
+    // filled by the CLI rather than a front end.
+    assert_eq!(
+        v["systems"][4]["peer"],
+        json!({ "namespace": "plant", "link": "peer", "port": 2242, "instance": "plant" })
+    );
+    assert!(v["systems"][0].get("peer").is_none());
+
     // Artifact kind renders snake_case and is omitted for the default cdylib;
     // a program-built wasm artifact omits the crate/lib fields entirely.
     assert_eq!(v["artifacts"][2]["kind"], json!("wasm"));
@@ -316,6 +356,29 @@ fn representation_is_externally_tagged() {
     );
 }
 
+/// The two v11 fields are additive: a v10 document carries neither, so it
+/// deserializes once its version is bumped and reads as the defaults —
+/// no `peer`, no `hosts`, and a mirror that is telemetered.
+#[test]
+fn a_v10_document_defaults_the_new_fields() {
+    let mut v = serde_json::to_value(maximal()).unwrap();
+    for system in v["systems"].as_array_mut().unwrap() {
+        system.as_object_mut().unwrap().remove("peer");
+    }
+    let envelope = json!({ "ir_version": IR_VERSION, "targets": [v] });
+
+    let d: Deployment = serde_json::from_value(envelope).unwrap();
+    assert!(d.hosts.is_empty());
+    assert!(d.targets[0].systems.iter().all(|s| s.peer.is_none()));
+
+    let telemetered: PeerSpec = serde_json::from_value(
+        json!({ "namespace": "plant", "link": "peer", "port": 2242, "instance": "plant" }),
+    )
+    .unwrap();
+    assert!(telemetered.telemetered);
+    assert_eq!(telemetered.host, None);
+}
+
 /// The shared fixture: the exact JSON the Python emitter must produce, minus
 /// the build- and provenance-dependent fields both consumers normalize away
 /// (`src` everywhere, and each artifact's located `path`/`prebuilt_dir`).
@@ -333,12 +396,154 @@ fn golden_fixture_round_trips() {
     );
 }
 
+/// The deployment envelope is the document both front-ends emit, so its JSON
+/// must survive a round-trip with its members intact and in order.
+#[test]
+fn envelope_round_trips() {
+    let member = |namespace: &str| {
+        let mut w = maximal();
+        w.coordinator.namespace = Some(namespace.into());
+        w
+    };
+    let deployment = Deployment {
+        ir_version: IR_VERSION,
+        targets: vec![member("plant"), member("fsw")],
+        hosts: BTreeMap::from([("plant".to_string(), "10.0.0.5".to_string())]),
+    };
+
+    let json = serde_json::to_string(&deployment).unwrap();
+    let back: Deployment = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, deployment);
+    assert_eq!(
+        back.target(Some("fsw"))
+            .unwrap()
+            .coordinator
+            .namespace
+            .as_deref(),
+        Some("fsw")
+    );
+}
+
+/// The shared `tests/golden/deployment.json` fixture: the two-member envelope
+/// the Python golden test also pins. Beyond the round-trip, it holds the two
+/// facts a deployment adds over a `Wiring` — members compile only their own
+/// Python systems, and a member's presets are qualified with its namespace.
+#[test]
+fn golden_deployment_round_trips() {
+    const GOLDEN: &str = include_str!("golden/deployment.json");
+    let d: Deployment =
+        serde_json::from_str(GOLDEN).expect("golden fixture deserializes as Deployment");
+    let reserialized = normalize(serde_json::to_value(&d).unwrap());
+    let on_disk = normalize(serde_json::from_str(GOLDEN).unwrap());
+    assert_eq!(
+        reserialized, on_disk,
+        "the golden deployment must equal its own Rust round-trip after normalization"
+    );
+
+    let decls = |w: &Wiring| {
+        w.program
+            .as_ref()
+            .map(|p| p.decls.iter().map(|d| d.name.clone()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let plant = d.target(Some("plant")).unwrap();
+    let fsw = d.target(Some("fsw")).unwrap();
+    assert!(
+        decls(plant).iter().all(|n| !decls(fsw).contains(n)),
+        "a member's program carries only the systems it added"
+    );
+    assert_eq!(decls(fsw), ["gyro_norm"]);
+
+    let presets = fsw
+        .systems
+        .iter()
+        .find(|s| s.ty.as_deref() == Some("Presets"))
+        .expect("the fsw member broadcasts presets");
+    let ParamSource::Value(params) = &presets.params else {
+        panic!("presets carry inline params")
+    };
+    let id = metor_proto::types::ComponentId::new("fsw.adcs.gyro_norm").0;
+    assert!(
+        serde_json::to_string(params)
+            .unwrap()
+            .contains(&id.to_string()),
+        "preset component ids are qualified with the member's namespace"
+    );
+}
+
+/// The shared `tests/golden/deployment_gateway.json` fixture: the three-member
+/// envelope with a gateway, the one the Python golden test also pins. Beyond the
+/// round-trip it holds what the gateway adds — a `Db` state, one `Ingest` per
+/// member carrying the source its deployment resolved, and a `Record`.
+#[test]
+fn golden_gateway_round_trips() {
+    const GOLDEN: &str = include_str!("golden/deployment_gateway.json");
+    let d: Deployment =
+        serde_json::from_str(GOLDEN).expect("golden fixture deserializes as Deployment");
+    let reserialized = normalize(serde_json::to_value(&d).unwrap());
+    let on_disk = normalize(serde_json::from_str(GOLDEN).unwrap());
+    assert_eq!(
+        reserialized, on_disk,
+        "the golden gateway deployment must equal its own Rust round-trip after normalization"
+    );
+
+    let gw = d.target(Some("gw")).unwrap();
+    let db = gw.states.iter().find(|s| s.name == "db").unwrap();
+    assert_eq!(db.ty, "Db");
+    let ParamSource::Value(params) = &db.params else {
+        panic!("a db state carries inline params")
+    };
+    assert_eq!(params["addr"], json!("[::]:2250"));
+
+    // One ingest per member, attached to the db, each carrying the
+    // `(namespace, link, port, commands)` source the deployment resolved.
+    let sources: Vec<Value> = gw
+        .systems
+        .iter()
+        .filter(|s| s.ty.as_deref() == Some("Ingest"))
+        .map(|s| {
+            assert_eq!(s.attach.as_deref(), Some("db"));
+            let ParamSource::Value(params) = &s.params else {
+                panic!("a resolved ingest carries inline params")
+            };
+            params.clone()
+        })
+        .collect();
+    assert_eq!(
+        sources,
+        [
+            json!({
+                "namespace": "plant",
+                "link": "link",
+                "port": 2240,
+                "commands": ["AlarmAck"],
+            }),
+            json!({
+                "namespace": "fsw",
+                "link": "link",
+                "port": 2241,
+                "commands": ["SequenceCommand"],
+            }),
+        ]
+    );
+
+    let record = gw
+        .systems
+        .iter()
+        .find(|s| s.ty.as_deref() == Some("Record"))
+        .expect("the gateway records its own outputs");
+    assert_eq!(record.attach.as_deref(), Some("db"));
+    assert!(matches!(record.params, ParamSource::None));
+}
+
 /// Strip the fields the cross-language comparison ignores: every `src` anchor
-/// (line numbers track the emitting source) and each artifact's `path` and
-/// `prebuilt_dir` (both machine-located). The `lib` stem is arch-neutral and
-/// stays in the comparison.
+/// (line numbers track the emitting source), the envelope's emitter-only
+/// `metor_config_version`, and each artifact's `path` and `prebuilt_dir` (both
+/// machine-located). The `lib` stem is arch-neutral and stays in the
+/// comparison.
 fn normalize(mut v: Value) -> Value {
     strip_key(&mut v, "src");
+    strip_key(&mut v, "metor_config_version");
     if let Some(artifacts) = v.get_mut("artifacts").and_then(Value::as_array_mut) {
         for a in artifacts {
             if let Some(obj) = a.as_object_mut() {

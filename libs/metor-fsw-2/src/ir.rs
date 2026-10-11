@@ -4,20 +4,23 @@
 //! produce [`Wiring`]. The resolver converts these specs into runtime types;
 //! the IR itself contains no runtime state.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::wiring::LoadError;
+
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
 /// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
-pub const IR_VERSION: u32 = 9;
+pub const IR_VERSION: u32 = 11;
 
 /// A plain-data description of a complete target, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
 ///
-/// Produced by [`eval_python_target`](crate::wiring::eval_python_target) or
+/// Produced by [`eval_python_deployment`](crate::wiring::eval_python_deployment) or
 /// [`WiringBuilder`](crate::wiring::WiringBuilder), and consumed by
 /// [`resolve`](crate::wiring::resolve). The telemetry link appears
 /// here as an ordinary [`TCP_SERVER_TYPE`] state plus [`DOWNLINK_TYPE`]/
@@ -76,6 +79,62 @@ impl Wiring {
     }
 }
 
+/// A deployment: the targets one `target.py` declares, in declaration order.
+///
+/// The document a front-end emits is this envelope; each member is a complete
+/// [`Wiring`], stamped with its own [`IR_VERSION`] so a bundle or a
+/// `WiringManifest` stays self-describing on its own. The envelope version
+/// gates the document, the member version gates the member.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Deployment {
+    /// The [`IR_VERSION`] this envelope was produced against.
+    pub ir_version: u32,
+    /// The members, in the order they were declared. `build` provisions them
+    /// in this order; nothing else reads meaning into it.
+    pub targets: Vec<Wiring>,
+    /// Where each member runs, by namespace, for the deploy renderer. Empty
+    /// for a local run: a subscriber dials loopback and mDNS on its own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hosts: BTreeMap<String, String>,
+}
+
+impl Deployment {
+    /// A clone with every member [`path_stripped`](Wiring::path_stripped).
+    pub fn path_stripped(&self) -> Deployment {
+        Deployment {
+            ir_version: self.ir_version,
+            targets: self.targets.iter().map(Wiring::path_stripped).collect(),
+            hosts: self.hosts.clone(),
+        }
+    }
+
+    /// The member `namespace` selects: the only member when the deployment
+    /// has one and nothing was requested, else the member whose
+    /// [`CoordinatorSpec::namespace`] equals the request.
+    pub fn target(&self, namespace: Option<&str>) -> Result<&Wiring, LoadError> {
+        let available = || -> Vec<String> {
+            self.targets
+                .iter()
+                .filter_map(|w| w.coordinator.namespace.clone())
+                .collect()
+        };
+        match (self.targets.as_slice(), namespace) {
+            ([], _) => Err(LoadError::EmptyDeployment),
+            ([only], None) => Ok(only),
+            (_, None) => Err(LoadError::TargetRequired {
+                available: available(),
+            }),
+            (targets, Some(requested)) => targets
+                .iter()
+                .find(|w| w.coordinator.namespace.as_deref() == Some(requested))
+                .ok_or_else(|| LoadError::UnknownTarget {
+                    requested: requested.to_string(),
+                    available: available(),
+                }),
+        }
+    }
+}
+
 /// Where a spec came from in the document that declared it: an optional file
 /// name and a 1-based line and column, matching miette's rendering. One
 /// anchor for now; a stack of caller frames can be added later without
@@ -110,6 +169,12 @@ pub struct ScopeSpec {
 /// tools connect to it for the downlink stream and command ingest alike.
 pub const TCP_SERVER_TYPE: &str = "TcpServer";
 
+/// State `type=` of the gateway's embedded db, a [`DbState`](crate::DbState)
+/// configured by [`DbParams`](crate::DbParams). It listens on its `addr` and
+/// answers the db protocol, so metor-panel connects to a gateway member as
+/// it connects to any db.
+pub const DB_TYPE: &str = "Db";
+
 /// Registry `type=` of the built-in telemetry downlink, a
 /// [`TelemetrySystem`](crate::TelemetrySystem) attached to the target's
 /// [`TCP_SERVER_TYPE`] state, configured by
@@ -121,6 +186,17 @@ pub const DOWNLINK_TYPE: &str = "Downlink";
 /// [`TCP_SERVER_TYPE`] state, configured by
 /// [`UplinkParams`](crate::UplinkParams).
 pub const UPLINK_TYPE: &str = "Uplink";
+
+/// Registry `type=` of the gateway's ingest, an
+/// [`IngestSystem`](crate::IngestSystem) attached to a [`DB_TYPE`] state and
+/// configured by [`IngestParams`](crate::IngestParams): one member's ground
+/// link, streamed into the embedded db.
+pub const INGEST_TYPE: &str = "Ingest";
+
+/// Registry `type=` of the gateway's recorder, a
+/// [`RecordSystem`](crate::RecordSystem) attached to a [`DB_TYPE`] state,
+/// which stores the gateway member's own telemetry in the embedded db.
+pub const RECORD_TYPE: &str = "Record";
 
 /// The captured Python program of one target: every `Frame`/`State` class the
 /// target file declares, plus each `@system` function it adds, assembled in
@@ -281,7 +357,7 @@ pub struct Artifact {
     /// was produced against, carried through from the
     /// module's `ARTIFACT` constant. [`resolve`](crate::wiring::resolve)
     /// compares it against the live manifest and refuses a stale module
-    /// ([`StaleStubs`](crate::wiring::LoadErrorKind::StaleStubs)). `None` for a
+    /// ([`StaleStubs`](crate::wiring::LoadError::StaleStubs)). `None` for a
     /// builder-authored artifact, which skips the check.
     #[serde(default)]
     pub manifest_hash: Option<String>,
@@ -399,6 +475,45 @@ pub struct SystemSpec {
     /// round-trips byte-identically.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub encompassing: bool,
+    /// `Some` makes this instance a mirror of a peer member's instance of the
+    /// same `ty` and `artifact`: its ports are the peer type's outputs and its
+    /// implementation is the built-in subscriber, not the type itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<PeerSpec>,
+}
+
+/// Where a mirror's peer instance lives, and what the mirror keeps of it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PeerSpec {
+    /// The peer member's [`CoordinatorSpec::namespace`].
+    pub namespace: String,
+    /// The [`StateSpec`] name of the `TcpServer` the peer publishes on.
+    pub link: String,
+    /// That server's port, from its `addr`. The bind address itself is a
+    /// listener choice, not a destination, so it is not copied.
+    pub port: u16,
+    /// The peer instance's bare name.
+    pub instance: String,
+    /// Whether the mirror's outputs keep the peer type's telemetry flags.
+    #[serde(
+        default = "peer_telemetered",
+        skip_serializing_if = "peer_is_telemetered"
+    )]
+    pub telemetered: bool,
+    /// Where the peer runs, when a deployment host table named it. Never
+    /// emitted by a front-end; the CLI fills it from `--peer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+/// `telemetered` defaults to on: a mirror is telemetry like any other node,
+/// so an unset field reads as `true` and a `true` field is left off the wire.
+fn peer_telemetered() -> bool {
+    true
+}
+
+fn peer_is_telemetered(telemetered: &bool) -> bool {
+    *telemetered
 }
 
 impl StateSpec {
@@ -459,6 +574,7 @@ impl SystemSpec {
             layout: None,
             status: None,
             encompassing: false,
+            peer: None,
         }
     }
 }
@@ -484,7 +600,7 @@ pub enum ParamSource {
     None,
     /// Canonical postcard `Params` bytes, the typed Rust builder path.
     /// dl-only; the static path rejects it as
-    /// [`StaticPostcardParams`](crate::wiring::LoadErrorKind::StaticPostcardParams).
+    /// [`StaticPostcardParams`](crate::wiring::LoadError::StaticPostcardParams).
     Postcard(Vec<u8>),
     /// A params value tree (schema-conform + encode for loaded, serde
     /// deserialize for static).

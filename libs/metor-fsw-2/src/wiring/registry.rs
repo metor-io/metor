@@ -15,7 +15,7 @@ use metor_fsw_2_core::{BuildCtx, BuildSystem, ConfigureError, CyclicSystem, LogO
 
 use metor_fsw_2_core::params::{NoParams, ParamErrorKind, decode_value_params};
 
-use super::error::{LoadError, LoadErrorKind};
+use super::error::LoadError;
 
 /// Everything a factory decodes to build a [`Node`], erased of the concrete
 /// system type.
@@ -127,12 +127,11 @@ where
             namespace: ctx.namespace,
         })
         .map_err(|e| match e {
-            ConfigureError::UnknownMsg { name, available } => LoadErrorKind::UnknownMsgName {
+            ConfigureError::UnknownMsg { name, available } => LoadError::UnknownMsgName {
                 system: ctx.name.to_string(),
                 msg: name,
                 available: available.join(", "),
-            }
-            .bare(),
+            },
         })?;
     Ok(system.into_node(ctx.name.to_string()))
 }
@@ -162,7 +161,7 @@ fn decode_static_params<P: serde::de::DeserializeOwned>(
 /// registrations by capability.
 pub(super) struct RegistryEntry {
     pub(super) factory: SystemFactory,
-    descriptor: EntryDescriptor,
+    pub(super) descriptor: EntryDescriptor,
     /// `true` for a pack entry that attaches to a pack-shared state by name
     /// ([`Pack::system_type_shared`](crate::Pack::system_type_shared)): the
     /// resolver requires its spec to carry an `attach`, and rejects an
@@ -172,12 +171,21 @@ pub(super) struct RegistryEntry {
 
 /// A registered type's descriptor without construction: computed on demand
 /// for a type-registered system, carried by value for a pack entry.
-enum EntryDescriptor {
+pub(super) enum EntryDescriptor {
     Fn(fn() -> SystemDescriptor),
     Value(Box<SystemDescriptor>),
 }
 
 impl EntryDescriptor {
+    /// The descriptor itself, computed or cloned. A mirror of this type
+    /// ([`resolve`](super::resolve)) reads its ports without constructing it.
+    pub(super) fn descriptor(&self) -> SystemDescriptor {
+        match self {
+            EntryDescriptor::Fn(f) => f(),
+            EntryDescriptor::Value(d) => (**d).clone(),
+        }
+    }
+
     fn capabilities_contain(&self, cap: crate::Capability) -> bool {
         match self {
             EntryDescriptor::Fn(f) => f().capabilities.contains(&cap),
@@ -210,9 +218,11 @@ impl Registry {
     /// A registry pre-loaded with the built-in systems under their `type=`
     /// names: the alarm engine (`"Alarms"`) and the link pack, one shared
     /// `"TcpServer"` state serving the `"Downlink"` and `"Uplink"` systems
-    /// attached to it, plus the well-known message set in the message table
-    /// so a target's `msgs` list can name any of them out of the box. An
-    /// app-built registry starts here and adds its own systems.
+    /// attached to it, the gateway pack's `"Db"` state with the `"Ingest"`
+    /// and `"Record"` systems attached to it, plus the well-known
+    /// message set in the message table so a target's `msgs` list can name
+    /// any of them out of the box. An app-built registry starts here and
+    /// adds its own systems.
     pub fn with_builtins() -> Self {
         use crate::telemetry::{LinkParams, LinkState, TelemetrySystem, UplinkSystem};
         use metor_proto_wkt::{
@@ -224,9 +234,12 @@ impl Registry {
         r.register::<crate::AlarmSystem, _>("Alarms");
         r.register::<crate::PresetSystem, _>("Presets");
         let mut link_pack = crate::Pack::new();
-        link_pack.shared_state("TcpServer", |p: LinkParams| {
-            LinkState::bind(p.addr).map(|s| s.with_name(p.name))
-        });
+        link_pack.shared_state(
+            "TcpServer",
+            |ctx: metor_fsw_2_core::StateCtx<'_>, p: LinkParams| {
+                LinkState::bind(p.addr).map(|s| s.with_identity(ctx.name, ctx.namespace, p.name))
+            },
+        );
         // The resolver hands each `ctor` the `Shared<LinkState>` a target
         // named via `attach=`, and the ctor attaches it.
         let link_pack = link_pack
@@ -237,6 +250,22 @@ impl Registry {
                 <UplinkSystem as BuildSystem>::new(p).attach(link)
             });
         r.register_pack(link_pack);
+        let mut gateway_pack = crate::Pack::new();
+        gateway_pack.shared_state(
+            "Db",
+            |ctx: metor_fsw_2_core::StateCtx<'_>, p: crate::DbParams| {
+                let name = p.name.clone();
+                crate::DbState::open(p, ctx.namespace).map(|s| s.with_identity(ctx.name, name))
+            },
+        );
+        let gateway_pack = gateway_pack
+            .system_type_shared_many::<crate::IngestSystem, crate::DbState>("Ingest", |p, db| {
+                crate::IngestSystem::new(p).attach(db)
+            })
+            .system_type_shared::<crate::RecordSystem, crate::DbState>("Record", |(), db| {
+                crate::RecordSystem::new().attach(db)
+            });
+        r.register_pack(gateway_pack);
         r.register_msg::<SequenceCommand>()
             .register_msg::<SequenceRegistry>()
             .register_msg::<SequenceChannelEvent>()
@@ -315,6 +344,7 @@ impl Registry {
                     value,
                     src: "",
                     name: ctx.name,
+                    namespace: ctx.namespace,
                     msgs: ctx.msgs,
                     attach: ctx.attach,
                 };
@@ -326,26 +356,23 @@ impl Registry {
                     // A by-name attach that named a wrong-typed state: refine
                     // the generic create error into the attach diagnostic.
                     metor_fsw_2_core::MakeError::AttachTypeMismatch { system, state } => {
-                        LoadErrorKind::AttachTypeMismatch {
+                        LoadError::AttachTypeMismatch {
                             system: system.to_string(),
                             attach: state.to_string(),
                         }
-                        .bare()
                     }
                     // Reached only when a shared entry's create runs without a
                     // resolved attach; the resolver's pre-check normally
                     // pre-empts it with `MissingAttach`.
                     metor_fsw_2_core::MakeError::MissingAttach { system } => {
-                        LoadErrorKind::MissingAttach {
+                        LoadError::MissingAttach {
                             system: system.to_string(),
                         }
-                        .bare()
                     }
-                    other => LoadErrorKind::PackCreate {
+                    other => LoadError::PackCreate {
                         system: ctx.name.to_string(),
                         message: other.to_string(),
-                    }
-                    .bare(),
+                    },
                 })
             });
             self.factories.insert(
@@ -362,7 +389,7 @@ impl Registry {
 
     /// Whether `ty` names a registered system whose descriptor carries
     /// [`Capability::ReceiveAll`](crate::Capability). Unknown types answer
-    /// `false`; the systems pass reports them as [`LoadErrorKind::UnknownType`] in
+    /// `false`; the systems pass reports them as [`LoadError::UnknownType`] in
     /// document order.
     pub(super) fn is_receive_all(&self, ty: Option<&str>) -> bool {
         ty.and_then(|ty| self.factories.get(ty)).is_some_and(|e| {

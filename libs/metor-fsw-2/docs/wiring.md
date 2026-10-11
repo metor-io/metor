@@ -59,6 +59,59 @@ m.route(uplink, mode, msg="SequenceCommand")
 Message edges can fan in and out. They do not take part in frame cycle checks.
 They cannot use a delay.
 
+## Deployments
+
+One `target.py` may declare several targets. A `Deployment` lists them; each
+member keeps its own clock, systems, and edges, and runs as its own process.
+A member's identity is its `namespace`. With more than one member every
+namespace is required, distinct, and not a dotted prefix of another.
+
+```python
+from metor_config import (
+    Db, Deployment, Downlink, Ingest, Publish, Record, Subscribe, Target, TcpServer,
+)
+from adcs_pack import Fsw, Plant
+
+plant = Target(cycle_rate=120.0, namespace="plant")
+fsw = Target(cycle_rate=120.0, namespace="fsw")
+gw = Target(cycle_rate=120.0, namespace="gw")
+
+plant_link = plant.state("link", TcpServer(addr="[::]:2240"))
+sim = plant.add("plant", Plant(seed=42))
+plant.add("downlink", Downlink(plant_link))
+plant.add("publish", Publish(plant.state("peer", TcpServer(addr="[::]:2242")), [sim]))
+
+fsw_link = fsw.state("link", TcpServer(addr="[::]:2241"))
+mirror = fsw.add("plant", Subscribe(sim))
+control = fsw.add("fsw", Fsw())
+fsw.connect(mirror.sensors, control.sensors)
+fsw.add("downlink", Downlink(fsw_link))
+
+db = gw.state("db", Db(addr="[::]:2250"))
+gw.add("plant", Ingest(db, plant_link))
+gw.add("fsw", Ingest(db, fsw_link))
+gw.add("record", Record(db))
+
+deploy = Deployment(targets=[plant, fsw, gw])
+```
+
+`Publish` serves the listed instances on a `TcpServer`; `Subscribe` takes an
+instance handle from another member and adds a mirror of it, typed as that
+instance, whose ports the subscriber wires like any local system's. The
+mirror runs the built-in subscriber, which dials the peer and writes arriving
+records into those ports ([telemetry.md](telemetry.md)).
+
+`gw` is a gateway: a member whose `Db` state embeds a metor-db that the
+ground connects to. Each `Ingest` streams one member's ground link into it;
+`Record` stores the gateway's own telemetry beside them. A deployment with
+no gateway needs none of this.
+
+A file with one `Target` and no `Deployment` is a deployment of one. Python
+systems declared with `@system` belong to the target that adds them.
+`Presets` qualify their component references with the namespace of the target
+that adds them. The CLI selects a member with `--target <namespace>` or
+runs every member at once ([cli.md](cli.md)).
+
 ## Rust targets
 
 `WiringBuilder` builds the same IR without Python:
@@ -83,15 +136,22 @@ checks Rust-built and serialized IR alike and returns a `LoadError`.
 ## The wiring IR
 
 Both examples produce `Wiring`, a plain data value that serde can read and
-write. The current IR version is 8. A host rejects another version during
-resolve.
+write. The current IR version is 11. A host rejects another version during
+ingest and resolve.
 
-The top-level fields are:
+The document a `target.py` emits is an envelope, `Deployment`, with
+`ir_version`, `targets` (one complete `Wiring` per member), and `hosts`, the
+optional per-namespace address table a deploy renderer reads. The host checks
+the envelope once at ingest, then selects one member; everything after that
+reads a `Wiring`. A bundle stores the member `Wiring` alone.
+
+The `Wiring` fields are:
 
 - `coordinator`: cycle rate, clock, ring depth, and an optional name prefix
 - `artifacts`: loadable pack libraries
 - `states`: state shared by entries in one static pack
-- `systems`: fixed system instances
+- `systems`: fixed system instances; a `peer` on one makes it a mirror of
+  another member's instance
 - `slots`: places that can load an allowed entry at run time
 - `edges`: frame and message links
 - `scopes`: block names and parent links recorded by the Python front end
@@ -144,8 +204,10 @@ picks which instance. A shared-state system given no handle is a resolve-time
 error, and a plain system given one is rejected too.
 
 The resolver creates all states before it creates systems, so a system's
-`attach` resolves to a constructed instance. Each state name and type must be
-unique, and each declared state must serve at least one system.
+`attach` resolves to a constructed instance. Each state name must be unique,
+and each declared state must serve at least one system. Several states of one
+type are fine: a target serving both a ground link and a peer link declares
+two `TcpServer` states.
 
 The built-in network link uses this feature. A `TcpServer` state owns the
 listener; the `Downlink` and `Uplink` systems attach to it by name.
@@ -159,7 +221,9 @@ uplink = m.add("uplink", Uplink(link, msgs=["SequenceCommand"]))
 ```
 
 The CLI `run --serve ADDR` changes the address of an existing `TcpServer`. If
-the target has no server, it adds one and adds an all-output downlink.
+the target has no server, it adds one and adds an all-output downlink. A
+target with several servers is an error: the flag names one socket and does
+not pick.
 
 ## Slots
 

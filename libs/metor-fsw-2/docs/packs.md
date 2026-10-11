@@ -105,12 +105,13 @@ and the resolver rejects it as a slot occupant.
 ## Pack-shared state
 
 `Pack::shared_state` declares state that several entries in one static pack can
-use. A target state declaration supplies its params.
+use. A target state declaration supplies its params. The constructor also gets a
+`StateCtx`: the declaration name and the target namespace.
 
 ```rust
 pub fn pack() -> Pack {
     let mut pack = Pack::new();
-    pack.shared_state("Bus", open_bus);
+    pack.shared_state("Bus", |_ctx, params| open_bus(params));
 
     pack
         .system_type_shared::<Reader, Bus>("Reader", |p, bus| Reader::new(p).attach(bus))
@@ -119,8 +120,12 @@ pub fn pack() -> Pack {
 ```
 
 The state's lifecycle starts before the first attached system init and ends
-after the last attached system shutdown. Attached entries can instantiate once
-and cannot fill slots. Each worker calls `pack()` in its own process, so pack
+after the last attached system shutdown. Each `state` declaration constructs
+its own instance, so a target may declare several of one type (a ground link
+server and a peer one) and each `attach` picks one. The token
+`shared_state` returns is the first declaration's, the one this pack's own
+entries capture. An attached entry instantiates once per state instance and
+cannot fill slots. Each worker calls `pack()` in its own process, so pack
 state does not cross a process boundary.
 
 ## ABI v12

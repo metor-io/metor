@@ -4,12 +4,12 @@
 //! pipeline's tracing output into a live display (active `build`-target
 //! spans render as a pinned progress line with a spinner, label, the crate
 //! cargo is currently compiling, and elapsed time, while `cargo`-target
-//! events stream above it), and [`print_preflight`] lists the systems and
+//! events stream above it), [`print_build_member`] lists what one deployment
+//! member's build produced, and [`print_preflight`] lists the systems and
 //! slots a target will run before it starts. Both degrade to plain text when
 //! stderr is not a terminal: indicatif hides its bars and events print as
 //! ordinary lines, and the pre-flight colors are gated on stream support.
 
-use std::io::IsTerminal;
 use std::path::Path;
 
 use owo_colors::{OwoColorize, Stream};
@@ -47,7 +47,7 @@ pub(super) fn init_tracing() {
         .with_target("build", tracing::level_filters::LevelFilter::OFF)
         .with_target("cargo", tracing::level_filters::LevelFilter::OFF)
         .with_default(tracing::Level::INFO);
-    let ansi = std::io::stderr().is_terminal();
+    let ansi = supports_color::on(supports_color::Stream::Stderr).is_some();
     let ui = |meta: &tracing::Metadata<'_>| matches!(meta.target(), "build" | "cargo");
     tracing_subscriber::registry()
         .with(indicatif_layer.with_filter(filter_fn(|meta| meta.target() == "build")))
@@ -72,6 +72,27 @@ pub(super) fn init_tracing() {
         .init();
 }
 
+/// Print where one member's artifacts landed, under a bold namespace header
+/// when the member carries one. A deployment of one with no namespace prints
+/// the bare listing, as `build` always has.
+pub(super) fn print_build_member(wiring: &Wiring) {
+    let indent = match &wiring.coordinator.namespace {
+        Some(ns) => {
+            println!("  {}", ns.if_supports_color(Stream::Stdout, |t| t.bold()));
+            "    "
+        }
+        None => "  ",
+    };
+    for a in &wiring.artifacts {
+        let path = a
+            .path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        println!("{indent}{:<28} →  {path}", a.crate_name);
+    }
+}
+
 /// One two-line entry in the pre-flight listing, with the dot color that
 /// signifies its kind.
 struct Entry {
@@ -85,15 +106,21 @@ struct Entry {
 /// stderr: a header with the effective clock, then one two-line entry each,
 /// instance name and type, with the source (pack distribution, crate, or
 /// builtin; a slot's allowed occupants) dimmed underneath. Each entry carries
-/// a colored dot keying its kind: magenta for pack-loaded systems, yellow
-/// for worker-process systems, cyan for builtins, green for slots. The order
+/// a colored dot keying its kind: magenta for pack-loaded systems and peer
+/// mirrors, yellow for worker-process systems, cyan for builtins, green for
+/// slots. The order
 /// is [`Wiring::systems`] then [`Wiring::slots`], which is also resolve's
-/// registration order.
+/// registration order. A member of a deployment names itself
+/// `target.py · fsw`; a member with no namespace is the file name alone.
 pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
-    let name = target
+    let file = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| target.display().to_string());
+    let name = match &wiring.coordinator.namespace {
+        Some(ns) => format!("{file} · {ns}"),
+        None => file,
+    };
     let clock = match wiring.coordinator.clock {
         ClockSpec::Wall => "wall clock".to_string(),
         ClockSpec::Simulated { dt_secs } => format!("sim dt {} ms", trim(dt_secs * 1e3)),
@@ -118,22 +145,18 @@ pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
         .map(|sys| {
             let dot = if sys.process {
                 owo_colors::Style::new().bright_yellow()
-            } else if sys.artifact.is_some() {
+            } else if sys.artifact.is_some() || sys.peer.is_some() {
                 owo_colors::Style::new().bright_magenta()
             } else {
                 owo_colors::Style::new().bright_cyan()
             };
-            let mut detail = source_of(wiring, sys.artifact.as_deref());
-            if sys.process {
-                detail.push_str(" · process");
-            }
             Entry {
+                detail: system_detail(wiring, sys),
                 name: sys.name.clone(),
                 ty: sys
                     .ty
                     .clone()
                     .unwrap_or_else(|| "(sole pack entry)".to_string()),
-                detail,
                 dot,
             }
         })
@@ -186,6 +209,29 @@ pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
     eprintln!();
 }
 
+/// The dimmed line under one system: where it comes from, then what it is —
+/// a worker process, a mirror of a peer member's instance, a gateway's
+/// ingest of one.
+fn system_detail(wiring: &Wiring, sys: &crate::ir::SystemSpec) -> String {
+    let mut detail = source_of(wiring, sys.artifact.as_deref());
+    if sys.process {
+        detail.push_str(" · process");
+    }
+    if let Some(peer) = &sys.peer {
+        detail.push_str(&format!(" · mirror of {}/{}", peer.namespace, peer.link));
+    }
+    if sys.ty.as_deref() == Some(crate::ir::INGEST_TYPE)
+        && let crate::ir::ParamSource::Value(v) = &sys.params
+        && let (Some(namespace), Some(link)) = (
+            v.get("namespace").and_then(|n| n.as_str()),
+            v.get("link").and_then(|l| l.as_str()),
+        )
+    {
+        detail.push_str(&format!(" · ingests {namespace}/{link}"));
+    }
+    detail
+}
+
 /// Where a system comes from, for the pre-flight listing: its artifact's
 /// distribution (`adcs-pack 1.2.0`), bare crate, or the static registry.
 fn source_of(wiring: &Wiring, artifact: Option<&str>) -> String {
@@ -206,4 +252,65 @@ fn source_of(wiring: &Wiring, artifact: Option<&str>) -> String {
 fn trim(value: f64) -> String {
     let text = format!("{value:.3}");
     text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::PeerSpec;
+    use crate::wiring::WiringBuilder;
+
+    /// A mirror's dimmed line names where its type came from and which peer
+    /// link it mirrors; a worker process keeps its own suffix.
+    #[test]
+    fn detail_names_the_mirrored_peer() {
+        let wiring = WiringBuilder::new()
+            .subscribe(
+                "sim",
+                "Plant",
+                None,
+                PeerSpec {
+                    namespace: "plant".into(),
+                    link: "peer".into(),
+                    port: 2242,
+                    instance: "sim".into(),
+                    telemetered: true,
+                    host: None,
+                },
+            )
+            .system("nav")
+            .ty("Nav")
+            .end()
+            .build();
+        assert_eq!(
+            system_detail(&wiring, &wiring.systems[0]),
+            "builtin · mirror of plant/peer"
+        );
+        assert_eq!(system_detail(&wiring, &wiring.systems[1]), "builtin");
+    }
+
+    /// A gateway's ingest names the member link it streams.
+    #[test]
+    fn detail_names_the_ingested_source() {
+        let wiring = WiringBuilder::new()
+            .db("db", "127.0.0.1:0".parse().unwrap())
+            .ingest(
+                "a",
+                "db",
+                crate::IngestParams {
+                    namespace: "a".into(),
+                    link: "link".into(),
+                    port: 2256,
+                    commands: Vec::new(),
+                    host: None,
+                },
+            )
+            .record("record", "db")
+            .build();
+        assert_eq!(
+            system_detail(&wiring, &wiring.systems[0]),
+            "builtin · ingests a/link"
+        );
+        assert_eq!(system_detail(&wiring, &wiring.systems[1]), "builtin");
+    }
 }

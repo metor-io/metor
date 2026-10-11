@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import sys
 import textwrap
 from dataclasses import dataclass
 from typing import Any
@@ -106,12 +107,31 @@ def _output_frame(func: Any) -> str:
 def _system(func: Any) -> ExprHandle:
     entry = _capture(func)
     entry["system"] = True
-    # The instance name the handle was added under; `None` until then.
+    # The instance name the handle was added under, and the target that added
+    # it; both `None` until then.
     entry["added"] = None
+    entry["target"] = None
     placed = getattr(func, "_metor_node", None)
     if placed is not None:
         entry["layout"] = placed
     return ExprHandle(func.__name__, entry, _output_frame(func))
+
+
+def _warn_unadded() -> None:
+    """Warn about every ``@system`` no target added: staged code, legal but
+    left out of the program. Called once per emission, not once per target."""
+    for entry in _program:
+        if entry["system"] and entry["added"] is None:
+            src = entry["src"]
+            at = (
+                f"{src['file']}:{src['line']}" if src["file"] else f"line {src['line']}"
+            )
+            print(
+                f"warning: @system `{entry['name']}` ({at}) was never added and "
+                f'will not run; register it with target.add("{entry["name"]}", '
+                f"{entry['name']})",
+                file=sys.stderr,
+            )
 
 
 def system(*args: Any, **kwargs: Any) -> Any:

@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import os
 import sys
 import unittest
@@ -16,12 +17,18 @@ from metor_config import (
     Alarms,
     Artifact,
     Component,
+    Db,
+    Deployment,
     Frame,
+    Ingest,
+    Record,
     State,
     Target,
     Tensor,
     System,
     Downlink,
+    Publish,
+    Subscribe,
     TcpServer,
     Uplink,
     band,
@@ -36,6 +43,7 @@ class RecorderTest(unittest.TestCase):
     def setUp(self):
         # The capture trackers are module-global; isolate each test.
         mc._targets.clear()
+        mc._deployments.clear()
         mc._program.clear()
 
     def test_artifact_conflicts_are_rejected_without_mutating_ir(self):
@@ -358,7 +366,7 @@ class RecorderTest(unittest.TestCase):
         m.add("omega_norm", omega_norm)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            ir = m.to_ir()
+            ir = Deployment(targets=[m]).to_ir()["targets"][0]
         self.assertIn("@system `staged`", err.getvalue())
         self.assertIn("test_recorder.py", err.getvalue())
         self.assertNotIn("omega_norm`", err.getvalue())
@@ -372,8 +380,7 @@ class RecorderTest(unittest.TestCase):
         def staged() -> f64:
             return 1.0
 
-        with contextlib.redirect_stderr(io.StringIO()):
-            ir = m.to_ir()
+        ir = m.to_ir()
         self.assertIsNone(ir["program"])
         self.assertEqual([a["id"] for a in ir["artifacts"]], [])
 
@@ -427,19 +434,364 @@ class RecorderTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             Alarm(id="x", name="n", target=Component("c"), nope=1)
 
-    def test_exactly_one_target_rule(self):
-        mc._targets.clear()
+    def test_emission_needs_one_deployment_or_one_target(self):
         with self.assertRaisesRegex(RuntimeError, "found 0"):
             mc.emit()
-        Target(cycle_rate=1.0)
+
+        # One bare target is the deployment of one it emits as.
+        one = Target(cycle_rate=1.0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mc.emit()
+        emitted = json.loads(out.getvalue())
+        self.assertEqual(emitted["ir_version"], mc.IR_VERSION)
+        self.assertEqual(emitted["targets"], [one.to_ir()])
+
+        # A second bare target has no implicit deployment to belong to.
+        mc._deployments.clear()
         Target(cycle_rate=2.0)
         with self.assertRaisesRegex(RuntimeError, "found 2"):
             mc.emit()
+
+    def test_deployment_membership_rules(self):
+        a = Target(cycle_rate=1.0, namespace="a")
+        b = Target(cycle_rate=2.0, namespace="b")
+        with self.assertRaisesRegex(TypeError, "must be a Target"):
+            Deployment(targets=[a, "b"])  # type: ignore[list-item]
+        with self.assertRaisesRegex(ValueError, "one deployment"):
+            Deployment(targets=[a, a])
+
+        deployment = Deployment(targets=[a, b])
+        self.assertEqual(
+            [t["coordinator"]["namespace"] for t in deployment.to_ir()["targets"]],
+            ["a", "b"],
+        )
+        with self.assertRaisesRegex(RuntimeError, "exactly one Deployment"):
+            Deployment(targets=[b])
+
+    def test_members_partition_their_python_systems(self):
+        plant = Target(cycle_rate=100.0, namespace="plant")
+        fsw = Target(cycle_rate=100.0, namespace="fsw")
+
+        class RateEstimate(Frame):
+            omega: Tensor[f64, 3]
+
+        @system("imu.omega_b")
+        def omega_norm(omega_b):
+            return (omega_b @ omega_b) ** 0.5
+
+        @system
+        def smooth(est: RateEstimate) -> RateEstimate:
+            return RateEstimate(omega=est.omega)
+
+        @system
+        def staged() -> f64:
+            return 1.0
+
+        plant.add("omega_norm", omega_norm)
+        fsw.add("smooth", smooth)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            members = Deployment(targets=[plant, fsw]).to_ir()["targets"]
+
+        # Each member compiles its own systems, and the shared frame class.
+        self.assertEqual(
+            [d["name"] for d in members[0]["program"]["decls"]],
+            ["RateEstimate", "omega_norm"],
+        )
+        self.assertEqual(
+            [d["name"] for d in members[1]["program"]["decls"]],
+            ["RateEstimate", "smooth"],
+        )
+        self.assertEqual([s["name"] for s in members[0]["systems"]], ["omega_norm"])
+        self.assertEqual([s["name"] for s in members[1]["systems"]], ["smooth"])
+
+        # The never-added warning is one per emission, not one per member.
+        self.assertEqual(err.getvalue().count("@system `staged`"), 1)
+
+
+class PeerTest(unittest.TestCase):
+    """`Publish`/`Subscribe`: what one member offers a peer, and what the
+    deployment can check that neither target can see alone."""
+
+    def setUp(self):
+        mc._targets.clear()
+        mc._deployments.clear()
+        mc._program.clear()
+
+    def members(self, addr: str = "[::]:2242", instances: bool = True):
+        """A `plant` publishing `sim` on its peer server, and an empty `fsw`."""
+        plant = Target(cycle_rate=100.0, namespace="plant")
+        fsw = Target(cycle_rate=100.0, namespace="fsw")
+        peers = plant.state("peer", TcpServer(addr=addr))
+        sim = plant.add("sim", static_system("Plant"))
+        taps = [sim] if instances else []
+        publish = plant.add("publish", Publish(peers, taps))
+        return plant, fsw, sim, publish
+
+    def test_a_mirror_records_the_peer_spec(self):
+        plant, fsw, sim, _ = self.members()
+        mirror = fsw.add("sim", Subscribe(sim))
+        nav = fsw.add("nav", static_system("Nav"))
+        fsw.connect(mirror.gps, nav.gps)
+
+        ir = Deployment(targets=[plant, fsw], hosts={"plant": "10.0.0.5"}).to_ir()
+        member = ir["targets"][1]["systems"][0]
+        self.assertEqual(member["ty"], "Plant")
+        self.assertEqual(member["params"], "None")
+        self.assertIsNone(member["attach"])
+        self.assertEqual(
+            member["peer"],
+            {
+                "namespace": "plant",
+                "link": "peer",
+                "port": 2242,
+                "instance": "sim",
+            },
+        )
+        self.assertEqual(ir["hosts"], {"plant": "10.0.0.5"})
+
+        # The publish is an ordinary downlink filtered to the offered instance.
+        publish = ir["targets"][0]["systems"][1]
+        self.assertEqual(publish["ty"], "Downlink")
+        self.assertEqual(publish["attach"], "peer")
+        self.assertEqual(publish["params"], {"Value": {"instances": ["sim"]}})
+
+    def test_untelemetered_mirror_records_the_opt_out(self):
+        plant, fsw, sim, _ = self.members()
+        fsw.add("sim", Subscribe(sim, telemetered=False))
+        ir = Deployment(targets=[plant, fsw]).to_ir()
+        self.assertIs(ir["targets"][1]["systems"][0]["peer"]["telemetered"], False)
+        self.assertNotIn("hosts", ir)
+
+    def test_a_mirror_of_this_target_is_rejected(self):
+        plant, _, sim, _ = self.members()
+        with self.assertRaisesRegex(ValueError, "runs on this target"):
+            plant.add("mirror", Subscribe(sim))
+
+    def test_a_mirror_of_a_non_member_is_rejected(self):
+        _, fsw, sim, _ = self.members()
+        fsw.add("sim", Subscribe(sim))
+        with self.assertRaisesRegex(ValueError, "outside this deployment"):
+            Deployment(targets=[fsw])
+
+    def test_an_unpublished_instance_is_rejected(self):
+        plant, fsw, _, _ = self.members()
+        other = plant.add("other", static_system("Nav"))
+        fsw.add("other", Subscribe(other))
+        with self.assertRaisesRegex(ValueError, r"publishes no `other`.*peer"):
+            Deployment(targets=[plant, fsw])
+
+    def test_an_explicit_listing_beats_the_ground_downlink(self):
+        plant, fsw, sim, _ = self.members()
+        plant.add(
+            "downlink", Downlink(plant.state("link", TcpServer(addr="[::]:2240")))
+        )
+        fsw.add("sim", Subscribe(sim))
+        self.assertEqual(
+            Deployment(targets=[plant, fsw]).to_ir()["targets"][1]["systems"][0][
+                "peer"
+            ]["link"],
+            "peer",
+        )
+
+    def test_two_publishers_need_via(self):
+        plant, fsw, sim, publish = self.members()
+        plant.add(
+            "publish2",
+            Publish(plant.state("peer2", TcpServer(addr="[::]:2244")), [sim]),
+        )
+        fsw.add("sim", Subscribe(sim))
+        with self.assertRaisesRegex(ValueError, "more than one downlink.*via="):
+            Deployment(targets=[plant, fsw])
+
+        mc._deployments.clear()
+        fsw._subscribes["sim"].via = publish
+        self.assertEqual(
+            Deployment(targets=[plant, fsw]).to_ir()["targets"][1]["systems"][0][
+                "peer"
+            ]["link"],
+            "peer",
+        )
+
+    def test_a_published_server_declares_its_port(self):
+        plant, fsw, sim, _ = self.members(addr="[::]:0")
+        fsw.add("sim", Subscribe(sim))
+        with self.assertRaisesRegex(ValueError, "binds port 0"):
+            Deployment(targets=[plant, fsw])
+
+    def test_a_python_system_cannot_be_mirrored(self):
+        _, fsw, _, _ = self.members()
+
+        @system("sim.gps")
+        def gps_norm(gps) -> f64:
+            return gps @ gps
+
+        with self.assertRaisesRegex(TypeError, "not a system instance"):
+            Subscribe(fsw.add("gps_norm", gps_norm))
+
+    def test_publish_taps_only_its_own_target(self):
+        _, fsw, sim, _ = self.members()
+        peers = fsw.state("peer", TcpServer(addr="[::]:2243"))
+        with self.assertRaisesRegex(ValueError, "belongs to another target"):
+            fsw.add("publish", Publish(peers, [sim]))
+
+
+class GatewayTest(unittest.TestCase):
+    """`Db`/`Ingest`/`Record`: the sources a gateway dials, and what the
+    deployment can check that neither member can see alone."""
+
+    def setUp(self):
+        mc._targets.clear()
+        mc._deployments.clear()
+        mc._program.clear()
+
+    def members(self, addr: str = "[::]:2240", msgs: list[str] | None = None):
+        """A `plant` serving a ground link with an uplink, and a bare `gw`."""
+        plant = Target(cycle_rate=100.0, namespace="plant")
+        gw = Target(cycle_rate=100.0, namespace="gw")
+        link = plant.state("link", TcpServer(addr=addr))
+        plant.add("uplink", Uplink(link, msgs=msgs or ["AlarmAck", "SequenceCommand"]))
+        plant.add("downlink", Downlink(link))
+        db = gw.state("db", Db(addr="[::]:2250"))
+        return plant, gw, link, db
+
+    def test_an_ingest_records_its_source(self):
+        plant, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link))
+        gw.add("record", Record(db))
+
+        ir = Deployment(targets=[plant, gw]).to_ir()
+        gateway = ir["targets"][1]
+        self.assertEqual(
+            gateway["states"][0]["params"],
+            {"Value": {"addr": "[::]:2250"}},
+        )
+        ingest, record = gateway["systems"]
+        self.assertEqual(ingest["ty"], "Ingest")
+        self.assertEqual(ingest["attach"], "db")
+        self.assertEqual(
+            ingest["params"],
+            {
+                "Value": {
+                    "namespace": "plant",
+                    "link": "link",
+                    "port": 2240,
+                    "commands": ["AlarmAck", "SequenceCommand"],
+                }
+            },
+        )
+        self.assertEqual(record["ty"], "Record")
+        self.assertEqual(record["attach"], "db")
+        self.assertEqual(record["params"], "None")
+
+    def test_commands_narrow_to_a_subset(self):
+        plant, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link, commands=["SequenceCommand"]))
+        ir = Deployment(targets=[plant, gw]).to_ir()
+        params = ir["targets"][1]["systems"][0]["params"]["Value"]
+        self.assertEqual(params["commands"], ["SequenceCommand"])
+
+    def test_an_empty_command_list_forwards_none(self):
+        plant, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link, commands=[]))
+        ir = Deployment(targets=[plant, gw]).to_ir()
+        params = ir["targets"][1]["systems"][0]["params"]["Value"]
+        self.assertEqual(params["commands"], [])
+
+    def test_a_db_carries_its_storage_params(self):
+        gw = Target(cycle_rate=100.0, namespace="gw")
+        gw.state(
+            "db",
+            Db(
+                addr="[::]:2250",
+                path="/var/lib/metor/gw",
+                name="gateway",
+                store="/var/lib/metor/gw/cold",
+                max_bytes=1 << 30,
+                max_age_secs=3600.0,
+            ),
+        )
+        self.assertEqual(
+            gw.to_ir()["states"][0]["params"],
+            {
+                "Value": {
+                    "addr": "[::]:2250",
+                    "path": "/var/lib/metor/gw",
+                    "name": "gateway",
+                    "store": "/var/lib/metor/gw/cold",
+                    "max_bytes": 1 << 30,
+                    "max_age_secs": 3600.0,
+                }
+            },
+        )
+
+    def test_an_ingest_of_this_target_is_rejected(self):
+        _, gw, _, db = self.members()
+        own = gw.state("link", TcpServer(addr="[::]:2251"))
+        with self.assertRaisesRegex(ValueError, "link of this target"):
+            gw.add("self", Ingest(db, own))
+
+    def test_an_ingest_of_a_non_member_is_rejected(self):
+        _, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link))
+        with self.assertRaisesRegex(ValueError, "outside this deployment"):
+            Deployment(targets=[gw])
+
+    def test_a_source_is_a_link_server(self):
+        plant, gw, _, db = self.members()
+        other = plant.state("db", Db(addr="[::]:2252"))
+        gw.add("plant", Ingest(db, other))
+        with self.assertRaisesRegex(ValueError, "is a `Db` state.*TcpServer"):
+            Deployment(targets=[plant, gw])
+
+    def test_an_ingested_link_declares_its_port(self):
+        plant, gw, link, db = self.members(addr="[::]:0")
+        gw.add("plant", Ingest(db, link))
+        with self.assertRaisesRegex(ValueError, "on port 0"):
+            Deployment(targets=[plant, gw])
+
+    def test_an_unaccepted_command_is_rejected(self):
+        plant, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link, commands=["ReloadSequences"]))
+        with self.assertRaisesRegex(
+            ValueError, r"accepts no `ReloadSequences`.*AlarmAck, SequenceCommand"
+        ):
+            Deployment(targets=[plant, gw])
+
+    def test_two_ingests_may_not_forward_one_token(self):
+        plant, gw, link, db = self.members()
+        fsw = Target(cycle_rate=100.0, namespace="fsw")
+        fsw_link = fsw.state("link", TcpServer(addr="[::]:2241"))
+        fsw.add("uplink", Uplink(fsw_link, msgs=["SequenceCommand"]))
+        gw.add("plant", Ingest(db, link))
+        gw.add("fsw", Ingest(db, fsw_link))
+        with self.assertRaisesRegex(
+            ValueError, r"`fsw` forwards `SequenceCommand`.*commands=\[…\]"
+        ):
+            Deployment(targets=[plant, fsw, gw])
+
+        # Narrowing one of the two settles it.
+        mc._deployments.clear()
+        gw._ingests["plant"].commands = ["AlarmAck"]
+        ir = Deployment(targets=[plant, fsw, gw]).to_ir()
+        self.assertEqual(
+            [s["params"]["Value"]["commands"] for s in ir["targets"][2]["systems"]],
+            [["AlarmAck"], ["SequenceCommand"]],
+        )
+
+    def test_an_unresolved_ingest_names_the_deployment(self):
+        _, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link))
+        with self.assertRaisesRegex(RuntimeError, "never resolved"):
+            gw.to_ir()
 
 
 class PresetTest(unittest.TestCase):
     def setUp(self):
         mc._targets.clear()
+        mc._deployments.clear()
 
     def test_component_id_masks_and_hashes(self):
         # Pinned against the Rust `ComponentId::new` (see the parity test in
@@ -448,8 +800,6 @@ class PresetTest(unittest.TestCase):
         self.assertEqual(mc.component_id("x") >> 63, 0)
 
     def test_presets_qualify_and_embed(self):
-        import json
-
         m = Target(cycle_rate=100.0, namespace="sat1")
         m.add(
             "presets",
@@ -497,21 +847,43 @@ class PresetTest(unittest.TestCase):
         self.assertEqual([i["kind"] for i in tab_pane["items"]], ["logs", "alarm"])
 
     def test_presets_flex_arity_is_checked(self):
-        Target(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         with self.assertRaisesRegex(ValueError, "2 split children but 1 flexes"):
-            mc.Presets(
-                [
-                    mc.Preset(
-                        name="bad",
-                        layout=mc.HSplit(mc.Logs(), mc.DataTable(), flexes=[1.0]),
-                    )
-                ]
+            m.add(
+                "presets",
+                mc.Presets(
+                    [
+                        mc.Preset(
+                            name="bad",
+                            layout=mc.HSplit(mc.Logs(), mc.DataTable(), flexes=[1.0]),
+                        )
+                    ]
+                ),
             )
+
+    def test_presets_qualify_with_the_target_that_adds_them(self):
+        # Construction order no longer decides: the member registering the
+        # presets is the one whose namespace qualifies their references.
+        bare = Target(cycle_rate=100.0)
+        sat = Target(cycle_rate=100.0, namespace="sat1")
+        presets = [mc.Preset(name="ops", layout=mc.TimeSeriesPlot([mc.Trace("a.b")]))]
+
+        def trace(target):
+            spec = next(s for s in target.to_ir()["systems"] if s["name"] == "presets")
+            layout = spec["params"]["Value"]["preset"][0]["layout"]
+            pane = layout["root"]["Pane"]
+            return json.loads(pane["items"][0]["state"])["traces"][0]
+
+        sat.add("presets", mc.Presets(presets))
+        bare.add("presets", mc.Presets(presets))
+        self.assertEqual(trace(sat)["component_id"], mc.component_id("sat1.a.b"))
+        self.assertEqual(trace(bare)["component_id"], mc.component_id("a.b"))
 
 
 class DashboardTest(unittest.TestCase):
     def setUp(self):
         mc._targets.clear()
+        mc._deployments.clear()
 
     def _dashboard_state(self, dashboard, namespace="sat1"):
         import json

@@ -54,7 +54,9 @@ fn outbound_queue_enforces_the_byte_cap_and_reuses_storage() {
 #[test]
 fn link_replays_fans_out_and_ingests_without_per_message_buffers() {
     stellarator::run(|| async {
-        let mut link = LinkState::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let mut link = LinkState::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .with_identity("ground", Some("sat"), None);
         let addr = link.local_addr;
         crate::SharedLifecycle::start(&mut link);
 
@@ -69,6 +71,8 @@ fn link_replays_fans_out_and_ingests_without_per_message_buffers() {
             protocol_version: LINK_PROTOCOL_VERSION,
             features: 0,
             command_ids: vec![command_id],
+            namespace: Some("sat".into()),
+            link: "ground".into(),
         }
         .into_len_packet()
         .inner;
