@@ -4,8 +4,8 @@ use core::future::Future;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use maitake_sync::WaitQueue;
 use metor_fsw_3_ring::Notifier;
-use stellarator::sync::WaitQueue;
 
 use crate::def::{DefCx, DefError};
 use crate::system::{SystemDef, SystemInputs, SystemOutputs};
@@ -81,7 +81,7 @@ impl StopHandle {
 /// The future an async system's launch produces, owning its state and ports.
 pub type Running = core::pin::Pin<Box<dyn Future<Output = ()>>>;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
 

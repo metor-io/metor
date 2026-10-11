@@ -94,6 +94,22 @@ fn tap(taps: &mut DynInputs, output: &mut Output<Ping>) {
     }
 }
 
+/// Never returns: loops until `now` is before the epoch, which it never is.
+#[system]
+fn spin(now: Timestamp, input: &mut Input<Ping>, output: &mut Output<Ping>) {
+    let _ = (input, output);
+    while now >= Timestamp(0) {
+        core::hint::spin_loop();
+    }
+}
+
+/// Logs each cycle's time, and pings it.
+#[system]
+fn tick(now: Timestamp, output: &mut Output<Ping>) {
+    metor_fsw_3::tracing::info!(now = now.0, "tick");
+    let _ = output.write(&Ping { n: now.0 as u32 });
+}
+
 /// Panics from its second cycle on.
 #[derive(Default)]
 pub struct Boom(u32);
@@ -285,6 +301,12 @@ pub fn pack() -> SystemTable {
         .expect("valid records");
     table
         .register("tap", tap(), Default::default)
+        .expect("valid records");
+    table
+        .register("spin", spin(), Default::default)
+        .expect("valid records");
+    table
+        .register("tick", tick(), Default::default)
         .expect("valid records");
     table
         .register("boom", boom(), Boom::default)

@@ -4,13 +4,14 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 publish = false
-description = "Cube-sat attitude control example: one pack, a simulation, and a three-target deployment"
+description = "Cube-sat attitude control example: two packs, a simulation, and a three-target deployment"
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 adcs-contracts = { package = "adcs-contracts-3", path = "contracts" }
+adcs-seqs = { package = "adcs-seqs-3", path = "systems/seqs", default-features = false }
 adcs-systems = { package = "adcs-systems-3", path = "systems/adcs", default-features = false }
 metor-fsw-3 = { path = "../../libs/metor-fsw-3" }
 metor-proto = { path = "../../libs/metor-proto", features = ["std"] }

@@ -1,11 +1,14 @@
-//! The [`Step`] trait every bound system is stepped through, and how one ends.
+//! The [`Step`] trait every bound system is stepped through, how one ends,
+//! and [`catch_step`], which contains a step's panic.
 
 use std::borrow::Cow;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use metor_component::{FrameBytes, FrameStr};
 use metor_proto::types::Timestamp;
 
 use super::params::ParamError;
+use crate::system::System;
 
 /// A bound system, stepped once per cycle with the system type erased.
 pub trait Step {
@@ -67,4 +70,56 @@ pub enum LoadError {
     Open(String),
     #[error("creating the system: {0}")]
     Create(ParamError),
+}
+
+/// What one [`catch_step`] call did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stepped {
+    Ran,
+    /// The step reports an end, before or after this call's execute.
+    Ended,
+    /// The step panicked and was dropped, now or on an earlier call.
+    Unwound,
+}
+
+pub(crate) struct Runner<S: System> {
+    pub system: S,
+    pub state: S::State,
+    pub inputs: S::Inputs,
+    pub outputs: S::Outputs,
+}
+
+impl<S: System> Step for Runner<S> {
+    fn execute(&mut self, now: Timestamp) {
+        self.system
+            .execute(now, &mut self.state, &mut self.inputs, &mut self.outputs);
+    }
+
+    fn fault(&mut self, now: Timestamp, message: &str) {
+        self.system.fault(now, &mut self.outputs, message);
+    }
+}
+
+/// Executes a step that has not ended, faulting and dropping it if it panics.
+pub(crate) fn catch_step(slot: &mut Option<Box<dyn Step>>, now: Timestamp) -> Stepped {
+    let Some(step) = slot.as_mut() else {
+        return Stepped::Unwound;
+    };
+    // PANIC Safety: a panicking step is faulted once and removed before returning.
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if step.ended().is_none() {
+            step.execute(now);
+        }
+        step.ended().is_some()
+    }));
+    match result {
+        Ok(false) => Stepped::Ran,
+        Ok(true) => Stepped::Ended,
+        Err(payload) => {
+            crate::panic::catch(|| step.fault(now, crate::panic::message(&*payload)));
+            crate::panic::discard(payload);
+            crate::panic::catch(|| drop(slot.take()));
+            Stepped::Unwound
+        }
+    }
 }

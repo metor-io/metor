@@ -12,11 +12,15 @@
 //! carry the plant's ground truth for plotting and for scoring convergence, and
 //! no flight system reads them.
 //!
+//! The `environment` feature, on by default, adds the models and their epoch
+//! types. Without it the crate has no C dependencies and builds for wasm32.
+//!
 //! Vector names end in the frame they are expressed in: `_b` for the body frame
 //! and `_eci` for Earth-centered inertial.
 
 use nox::{ArrayRepr, Quaternion, Vector};
 
+#[cfg(feature = "environment")]
 mod environment;
 mod frames;
 mod mtq;
@@ -25,6 +29,7 @@ mod params;
 mod pointing;
 mod spacecraft;
 
+#[cfg(feature = "environment")]
 pub use environment::*;
 pub use frames::*;
 pub use mtq::*;
@@ -33,7 +38,9 @@ pub use params::*;
 pub use pointing::*;
 pub use spacecraft::*;
 
+#[cfg(feature = "environment")]
 pub use hifitime::Epoch;
+#[cfg(feature = "environment")]
 pub use wmm::MagneticModel;
 
 /// A 3-vector of `f64`.

@@ -115,6 +115,7 @@ name = "adcs-fsw3"
 version = "0.14.2"
 dependencies = [
  "adcs-contracts-3",
+ "adcs-seqs-3",
  "adcs-systems-3",
  "metor-fsw-3",
  "metor-proto",
@@ -127,6 +128,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zerocopy",
+]
+
+[[package]]
+name = "adcs-seqs-3"
+version = "0.14.2"
+dependencies = [
+ "adcs-contracts-3",
+ "metor-fsw-3",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -9641,6 +9653,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "libc",
  "libloading",
+ "maitake-sync 0.1.2",
  "metor-component",
  "metor-db",
  "metor-fsw-3-macros",
@@ -9662,6 +9675,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trybuild",
+ "wasmi",
+ "wat",
  "zerocopy",
 ]
 
@@ -9684,6 +9699,7 @@ version = "0.14.2"
 dependencies = [
  "libc",
  "loom",
+ "maitake-sync 0.1.2",
  "memmap2",
  "stellarator",
  "tempfile",
@@ -14189,6 +14205,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "sync-pack"
+version = "0.14.2"
+dependencies = [
+ "metor-fsw-3",
+ "serde",
 ]
 
 [[package]]

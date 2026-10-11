@@ -129,15 +129,21 @@ extern crate self as metor_fsw_3;
 
 pub mod async_system;
 pub mod channel;
+#[cfg(feature = "host")]
 pub mod cli;
 pub mod coordinator;
 pub mod def;
+#[cfg(feature = "host")]
 pub mod deploy;
+#[cfg(feature = "host")]
 pub mod dl;
 pub mod fn_system;
 pub mod frame;
+#[cfg(feature = "host")]
 pub mod link;
 pub mod log;
+#[cfg(all(feature = "threads", not(target_family = "wasm")))]
+mod mirror;
 pub mod pack;
 mod panic;
 pub mod port;
@@ -145,23 +151,29 @@ pub mod record;
 pub mod sequence;
 pub mod system;
 pub mod thread;
+#[cfg(feature = "host")]
+pub mod wasm;
 
 #[cfg(test)]
 mod tests;
 
 pub use async_system::{AsyncSystem, Stop};
 pub use channel::{Abort, AbortRequest, ChannelState, ChannelStatus};
+#[cfg(feature = "host")]
+pub use coordinator::Coordinator;
 pub use coordinator::{
-    Adapter, BuildError, ChannelConfig, Clock, Coordinator, CoordinatorConfig, EndReason,
-    InputConfig, LoadError, Occupant, OutputConfig, OutputSource, ParamError, Params, PeerLink,
-    PeerPort, PortRef, RunState, Step, SystemConfig, SystemStatus, SystemTable,
+    Adapter, BuildError, ChannelConfig, Clock, CoordinatorConfig, EndReason, InputConfig,
+    LoadError, Occupant, OutputConfig, OutputSource, ParamError, Params, PeerLink, PeerPort,
+    PortRef, RunState, Step, SystemConfig, SystemKind, SystemStatus, SystemTable,
 };
 pub use def::{DefCx, DefError, Records};
-pub use dl::{DlStep, Pack, PackError};
+#[cfg(feature = "host")]
+pub use dl::{DlPack, DlStep, Pack, PackError};
 pub use fn_system::{
     AsyncSystemFn, Ctor, Cycle, FnSystem, InSet, OutSet, Param, ParamNames, Ports, SystemFn,
 };
 pub use frame::Frame;
+#[cfg(feature = "host")]
 pub use link::{LinkStatus, Transport};
 pub use log::{Log, LogLayer};
 pub use metor_fsw_3_macros::{Frame, Record, sequence, system};

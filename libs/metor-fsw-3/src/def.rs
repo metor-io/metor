@@ -5,9 +5,8 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::channel::{ABORT_PORT, COMMANDS_PORT};
-use crate::coordinator::{Adapter, BuildError, OutputConfig, PortRef, SystemConfig, TableEntry};
-use crate::system::{PortDef, SystemDef};
+use crate::coordinator::OutputConfig;
+use crate::system::PortDef;
 
 /// What a type sees of one instance's config when it computes its def.
 pub struct DefCx<'a> {
@@ -78,65 +77,6 @@ pub enum DefError {
 
     #[error("async system `{system}` takes a `Sample`, which only a stepped system takes")]
     SampleOnAsync { system: String },
-}
-
-/// The definition `entry`'s type computes for `system`, over the producers
-/// `producer` finds. A producer it returns `None` for is not resolved yet,
-/// which only a port the type declares may read.
-pub(crate) fn instance_def(
-    system: &SystemConfig,
-    entry: &TableEntry,
-    namespace: Option<&str>,
-    records: &Records,
-    producer: impl Fn(&str, &PortRef) -> Result<Option<PortDef>, BuildError>,
-) -> Result<SystemDef, BuildError> {
-    let channel = matches!(system.adapter, Some(Adapter::Channel(_)));
-    let mut edges: Vec<(&str, PortDef)> = Vec::new();
-    for input in &system.inputs {
-        if channel && input.port == ABORT_PORT {
-            return Err(reserved(system, ABORT_PORT));
-        }
-        // The channel reads its commands; the system never sees them.
-        if channel && input.port == COMMANDS_PORT {
-            continue;
-        }
-        for from in &input.from {
-            match producer(&input.port, from)? {
-                Some(def) => edges.push((input.port.as_str(), def)),
-                None if entry.def.inputs.iter().any(|p| p.name == input.port) => {}
-                None => {
-                    return Err(BuildError::DynamicFromLater {
-                        system: system.id.clone(),
-                        port: input.port.clone(),
-                    });
-                }
-            }
-        }
-    }
-    let inputs: Vec<(&str, &PortDef)> = edges.iter().map(|(port, def)| (*port, def)).collect();
-    let cx = DefCx {
-        id: &system.id,
-        namespace,
-        inputs: &inputs,
-        outputs: &system.outputs,
-        records,
-        params: &system.params,
-    };
-    let def = (entry.def_fn)(&cx).map_err(|source| BuildError::Def {
-        id: system.id.clone(),
-        source,
-    })?;
-    if !channel {
-        return Ok(def);
-    }
-    crate::channel::def(def, &cx).map_err(|port| reserved(system, &port))
-}
-
-fn reserved(system: &SystemConfig, port: &str) -> BuildError {
-    BuildError::ReservedChannelPort {
-        id: system.id.clone(),
-        port: port.to_string(),
-    }
 }
 
 /// Every record a table knows, by name.

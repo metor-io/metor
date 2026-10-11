@@ -349,7 +349,7 @@ impl Future for NextCycle<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests {
     use core::pin::pin;
     use core::task::Waker;

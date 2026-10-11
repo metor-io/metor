@@ -201,9 +201,9 @@ fn test_cursor_within_committed() {
             let _ = v.try_read().map(drop);
         });
 
-        // Each write calls `fits`, and so its precondition assert.
-        let _ = w.try_write(&payload(2));
-        let _ = w.try_write(&payload(3));
+        // A cursor ahead of the writer would make `fits` report `Corrupt`.
+        assert_ne!(w.try_write(&payload(2)), Err(WriteError::Corrupt));
+        assert_ne!(w.try_write(&payload(3)), Err(WriteError::Corrupt));
         reader.join().unwrap();
     });
 }

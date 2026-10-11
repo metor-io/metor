@@ -4,7 +4,8 @@ use std::rc::Rc;
 use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
-use super::{Clock, Coordinator, EndReason, Entry, Step, SystemStatus};
+use super::run::{Coordinator, Entry};
+use super::{Clock, EndReason, Step, SystemStatus};
 use crate::port::{Input, Output};
 use crate::tests::utils::{Imu, input, output, ring};
 

@@ -828,7 +828,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod async_tests {
     use core::future::Future;
     use core::task::{Context, Poll};

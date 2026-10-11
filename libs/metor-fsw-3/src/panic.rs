@@ -35,6 +35,20 @@ pub(crate) fn discard(payload: Payload) {
     }
 }
 
+/// Logs each panic as an `error!` with `kind = "panic"`. A wasm32 panic
+/// aborts the instance, so this line is the guest's only report of it.
+#[cfg(target_family = "wasm")]
+pub(crate) fn log_panics() {
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!(kind = "panic", "{info}");
+    }));
+}
+
+/// Leaves the hook alone: a native panic unwinds to `catch_step`, which
+/// reports it.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn log_panics() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

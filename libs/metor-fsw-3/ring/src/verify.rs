@@ -71,11 +71,11 @@ fn reserve_never_straddles() {
     assert!((start & (cap - 1)) + rec <= cap);
 
     // On an empty ring, padding alone always makes room for the record.
-    if !fits(committed, committed, gap + rec, cap) {
+    if fits(committed, committed, gap + rec, cap) == Ok(false) {
         assert!(gap > 0);
-        assert!(fits(committed, committed, gap, cap));
+        assert_eq!(fits(committed, committed, gap, cap), Ok(true));
         assert_eq!(start & (cap - 1), 0);
-        assert!(fits(start, start, rec, cap));
+        assert_eq!(fits(start, start, rec, cap), Ok(true));
     }
 }
 
@@ -91,7 +91,7 @@ fn fits_implies_no_lap() {
     let (start, gap) = reserve(committed, rec, cap);
     let need = gap + rec;
 
-    if fits(committed, slowest, need, cap) {
+    if fits(committed, slowest, need, cap) == Ok(true) {
         assert!(start + rec - slowest <= cap);
     } else {
         assert!(committed - slowest + need > cap);
@@ -99,28 +99,28 @@ fn fits_implies_no_lap() {
 
     // With no readers registered the writer passes its own position as
     // `slowest`, leaving capacity as the only bound.
-    assert_eq!(fits(committed, committed, need, cap), need <= cap);
+    assert_eq!(fits(committed, committed, need, cap), Ok(need <= cap));
 }
 
 #[kani::proof]
-fn fits_checked_cursor_arithmetic() {
-    let cap = any_capacity();
+fn fits_hostile_cursor() {
+    let cap: u64 = kani::any();
     let committed: u64 = kani::any();
-    kani::assume(committed <= u64::MAX - 4 * cap);
     let slowest: u64 = kani::any();
-    // A cursor is a published position, never more than a lap out of step.
-    kani::assume(slowest <= committed + cap);
     let need: u64 = kani::any();
-    kani::assume(need >= 16 && need <= 2 * cap);
 
-    if slowest <= committed {
-        // Inside the precondition the arithmetic `fits` performs is total.
-        assert!((committed - slowest).checked_add(need).is_some());
-    } else {
-        // Overflow here can wrap to a successful fit in release builds.
-        // This checks checked arithmetic, not the protocol precondition.
-        let raw = committed.wrapping_sub(slowest);
-        assert!(raw.checked_add(need).is_none_or(|sum| sum > cap));
+    match fits(committed, slowest, need, cap) {
+        Ok(fit) => {
+            assert!(slowest <= committed);
+            assert_eq!(
+                fit,
+                (committed - slowest) as u128 + need as u128 <= cap as u128
+            );
+        }
+        Err(e) => {
+            assert_eq!(e, WriteError::Corrupt);
+            assert!(slowest > committed || (committed - slowest).checked_add(need).is_none());
+        }
     }
 }
 
@@ -466,5 +466,73 @@ fn corrupt_latest_never_ub() {
     match v.try_latest() {
         Err(ReadError::Corrupt) | Ok(None) => {}
         Ok(Some(g)) => assert!(g.len() <= CAP - 16),
+    }
+}
+
+/// # Safety
+/// `base` is the sole handle's region of `REGION` bytes.
+unsafe fn write_peer_words(base: *mut u8) {
+    // SAFETY: the control words and the first reader slot lie within the region.
+    unsafe {
+        write_control(base, kani::any(), kani::any());
+        base.add(HEADER_SIZE).cast::<u64>().write(kani::any());
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(12)]
+fn corrupt_peer_writer_never_ub() {
+    let mut region = Region::new();
+    let ring = region.attach();
+    let (base, _) = ring.region();
+    // SAFETY: we hold the only handle to this region.
+    unsafe { write_peer_words(base) };
+    let w = ring.writer(NoWake).unwrap();
+    // SAFETY: the peer writes control words the writer only publishes.
+    unsafe { write_peer_words(base) };
+
+    for _ in 0..2 {
+        let len: usize = kani::any();
+        kani::assume(len <= CAP);
+        if w.try_write(&[7u8; CAP][..len]).is_ok() {
+            assert!(w.committed.get().is_multiple_of(16));
+        }
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(12)]
+fn corrupt_peer_view_never_ub() {
+    let mut region = Region::new();
+    let ring = region.attach();
+    let (base, _) = ring.region();
+    // SAFETY: we hold the only handle to this region.
+    unsafe { write_peer_words(base) };
+    let mut v = ring.view(NoWake).unwrap();
+    let start = v.cursor();
+    // SAFETY: the peer writes control words and the view's published cursor.
+    unsafe {
+        fill_data(base);
+        write_peer_words(base);
+    }
+    assert_eq!(v.cursor(), start);
+
+    match kani::any::<u8>() % 3 {
+        0 => match v.try_read() {
+            Err(ReadError::Corrupt) | Ok(None) => {}
+            Ok(Some(g)) => assert!(g.len() <= CAP - 16),
+        },
+        1 => match v.try_latest() {
+            Err(ReadError::Corrupt) | Ok(None) => {}
+            Ok(Some(g)) => assert!(g.len() <= CAP - 16),
+        },
+        _ => {
+            for record in v.drain() {
+                if let Ok(g) = record {
+                    assert!(g.len() <= CAP - 16);
+                }
+            }
+            v.settle();
+        }
     }
 }

@@ -4,6 +4,7 @@
 //! how a system hears an abort, and [`ChannelStatus`] is the state a channel
 //! reports each cycle.
 
+#[cfg(feature = "host")]
 mod adapter;
 mod apply;
 mod records;
@@ -30,7 +31,9 @@ pub const EVENTS_PORT: &str = "events";
 /// The output a channel writes its [`ChannelStatus`] to each cycle.
 pub const STATUS_PORT: &str = "channel_status";
 
+#[cfg(feature = "host")]
 pub use adapter::Channel;
+#[cfg(feature = "host")]
 pub(crate) use adapter::{def, make, ports};
 pub use apply::{Command, Refusal, State, apply};
 pub use registry::{ChannelSpec, Registry, RegistryParams, channel_registry};

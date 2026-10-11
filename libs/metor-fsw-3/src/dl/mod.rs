@@ -1,39 +1,24 @@
-//! Dynamic library pack loading
+//! Loading packs: the systems a pack exports, registered into a table.
 
+pub(crate) mod codec;
+mod pack;
 pub mod slot;
 pub mod store;
 
-use core::ffi::c_void;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use libloading::Library;
 use metor_fsw_3_ring::RingBuffer;
-use metor_proto::types::Timestamp;
 
-use crate::system::SystemDef;
-
-use crate::coordinator::{BuildError, EndReason, ParamError, Step, SystemTable, TableEntry};
+use crate::coordinator::{BuildError, ParamError, Step, SystemTable, TableEntry};
 use crate::def::{DefCx, DefError};
-use crate::pack::def::{DefCxOwned, Instance, PackDef};
-use crate::pack::raw::{RawRing, RawSlice};
-use crate::pack::{ABI_VERSION, DefStatus, Status};
+use crate::pack::def::{Instance, PackDef, PackSystemDef};
+use crate::system::SystemDef;
+use crate::wasm::{Trap, WasmError, WasmPack};
 
-type VersionFn = unsafe extern "C" fn() -> u32;
-type PackDefFn = unsafe extern "C" fn(*mut u8, usize, *mut usize) -> u32;
-type DefFn = unsafe extern "C" fn(RawSlice, RawSlice, *mut u8, usize, *mut usize) -> u32;
-type CreateFn = unsafe extern "C" fn(
-    RawSlice,
-    RawSlice,
-    RawSlice,
-    RawSlice,
-    RawSlice,
-    *mut RawSlice,
-) -> *mut c_void;
-type ExecuteFn = unsafe extern "C" fn(*mut c_void, i64) -> u32;
-type DestroyFn = unsafe extern "C" fn(*mut c_void);
+pub(crate) use pack::is_loaded;
+pub use pack::{DlPack, DlStep};
 
-/// A `PackError` is why a library is no usable pack.
+/// A `PackError` is why an artifact is no usable pack.
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {
     #[error("loading the pack: {0}")]
@@ -48,372 +33,87 @@ pub enum PackError {
     DescriptorTooLarge { capacity: usize },
     #[error("pack descriptor export failed with status {0}")]
     DescriptorStatus(u32),
+    #[error("reading the module: {0}")]
+    Read(std::io::Error),
+    #[error("the module: {0}")]
+    Wasm(#[from] WasmError),
+    #[error("the module trapped: {0}")]
+    Trap(#[from] Trap),
 }
 
 /// The type a `DlSlot` registers as.
 pub const SLOT_TYPE: &str = "fsw.dl_slot";
 
-const DESCRIPTOR_CAPACITY: usize = 1024 * 1024;
-
-// Resident code may still be used by guest threads and TLS destructors.
-static LIBRARIES: Mutex<Vec<(PathBuf, Arc<Library>)>> = Mutex::new(Vec::new());
-
-fn library_key(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-pub(crate) fn is_loaded(path: &Path) -> bool {
-    let key = library_key(path);
-    LIBRARIES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .any(|(path, _)| *path == key)
-}
-
-unsafe fn resident_library(path: &Path) -> Result<Arc<Library>, PackError> {
-    let key = library_key(path);
-    {
-        let libraries = LIBRARIES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, lib)) = libraries.iter().find(|(path, _)| *path == key) {
-            return Ok(lib.clone());
-        }
-    }
-    // SAFETY: Pack::open's caller authorizes library initialization.
-    let lib = Arc::new(unsafe { Library::new(path) }.map_err(PackError::Open)?);
-    let mut libraries = LIBRARIES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, existing)) = libraries.iter().find(|(path, _)| *path == key) {
-        return Ok(existing.clone());
-    }
-    libraries.push((key, lib.clone()));
-    Ok(lib)
-}
-
-unsafe fn descriptor(def_fn: PackDefFn) -> Result<PackDef, PackError> {
-    // SAFETY: the matched ABI writes only inside this buffer and result slot.
-    let (status, bytes) = call_export(|dst, cap, written| unsafe { def_fn(dst, cap, written) });
-    if status == DefStatus::TooSmall as u32 {
-        return Err(PackError::DescriptorTooLarge {
-            capacity: DESCRIPTOR_CAPACITY,
-        });
-    }
-    if status != DefStatus::Ok as u32 {
-        return Err(PackError::DescriptorStatus(status));
-    }
-    serde_json::from_slice(bytes.as_deref().ok_or(PackError::Decode)?)
-        .map_err(|_| PackError::Decode)
-}
-
-/// Calls an export that writes into a host buffer, returning its status and
-/// the bytes it reports writing, or `None` when that is past the buffer.
-fn call_export(export: impl FnOnce(*mut u8, usize, *mut usize) -> u32) -> (u32, Option<Vec<u8>>) {
-    let mut bytes = vec![0u8; DESCRIPTOR_CAPACITY];
-    let mut written = 0;
-    let status = export(bytes.as_mut_ptr(), bytes.len(), &mut written);
-    let fits = written <= bytes.len();
-    bytes.truncate(written);
-    (status, fits.then_some(bytes))
-}
-
-/// The exports after the version check, as bare pointers valid while the
-/// library is loaded.
-#[derive(Clone, Copy)]
-pub(crate) struct PackFns {
-    def: DefFn,
-    create: CreateFn,
-    execute: ExecuteFn,
-    destroy: DestroyFn,
-}
-
-/// A `Pack` is a loaded pack library and the descriptor it exported.
-pub struct Pack {
-    lib: Arc<Library>,
-    fns: PackFns,
-    def: PackDef,
+/// A `Pack` is an opened pack of any kind and the descriptor it exported.
+pub enum Pack {
+    Dl(DlPack),
+    Wasm(WasmPack),
 }
 
 impl Pack {
-    /// Loads a pack, checking its ABI version before anything else.
-    ///
-    /// # Safety
-    /// `path` names a metor-fsw-3 pack built against this ABI; loading a
-    /// library runs the code in its initializers. The artifact must not be
-    /// removed or replaced while this process runs, including during this call.
-    pub unsafe fn open(path: &Path) -> Result<Pack, PackError> {
-        // SAFETY: the caller's contract.
-        unsafe { Self::open_with(path, ABI_VERSION) }
-    }
-
-    /// As [`open`](Pack::open), against an ABI version the caller chooses.
-    /// Only a test passes anything but [`ABI_VERSION`].
-    ///
-    /// # Safety
-    /// As [`open`](Pack::open).
-    #[doc(hidden)]
-    pub unsafe fn open_with(path: &Path, expected: u32) -> Result<Pack, PackError> {
-        // SAFETY: the caller's contract.
-        let lib = unsafe { resident_library(path) }?;
-        // SAFETY: the version export takes nothing and returns a `u32` in
-        // every ABI, which is why it is resolved and called first.
-        let found = unsafe { symbol::<VersionFn>(&lib, "metor_fsw_abi_version")?() };
-        if found != expected {
-            return Err(PackError::AbiMismatch { found, expected });
+    /// The descriptor this pack exported.
+    pub fn descriptor(&self) -> &PackDef {
+        match self {
+            Pack::Dl(pack) => pack.descriptor(),
+            Pack::Wasm(pack) => pack.descriptor(),
         }
-        let fns = PackFns {
-            def: symbol(&lib, "metor_fsw_def")?,
-            create: symbol(&lib, "metor_fsw_create")?,
-            execute: symbol(&lib, "metor_fsw_execute")?,
-            destroy: symbol(&lib, "metor_fsw_destroy")?,
-        };
-        let def_fn: PackDefFn = symbol(&lib, "metor_fsw_pack_def")?;
-        // SAFETY: the descriptor function belongs to the checked ABI.
-        let def = unsafe { descriptor(def_fn) }?;
-        Ok(Pack { lib, fns, def })
     }
 
     /// One exported type's definition under an instance's config.
     pub fn def(&self, ty: &str, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        instance_def(self.fns.def, ty, cx)
+        match self {
+            Pack::Dl(pack) => pack.def(ty, cx),
+            Pack::Wasm(pack) => pack.def(ty, cx),
+        }
     }
 
-    /// The descriptor this pack exported.
-    pub fn descriptor(&self) -> &PackDef {
-        &self.def
+    /// Creates one instance of `ty` over the host's rings.
+    pub fn create(
+        &self,
+        ty: &str,
+        params: &serde_json::Value,
+        instance: &Instance,
+        inputs: &[Vec<&RingBuffer>],
+        outputs: &[&RingBuffer],
+    ) -> Result<Box<dyn Step>, ParamError> {
+        Ok(match self {
+            Pack::Dl(pack) => Box::new(pack.create(ty, params, instance, inputs, outputs)?),
+            Pack::Wasm(pack) => Box::new(pack.create(ty, params, instance, inputs, outputs)?),
+        })
     }
-
-    /// The loaded library, shared with every instance created from it.
-    pub fn library(&self) -> &Arc<Library> {
-        &self.lib
-    }
-}
-
-/// Reads one definition back from a pack, as [`descriptor`] reads the pack's own.
-fn instance_def(def_fn: DefFn, ty: &str, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-    let refused = |message: String| DefError::Pack { message };
-    let owned = serde_json::to_vec(&DefCxOwned::of(cx)).map_err(|e| refused(e.to_string()))?;
-    // SAFETY: the matched ABI writes only inside this buffer and result slot,
-    // and reads the two arrays for the length of the call.
-    let (status, bytes) = call_export(|dst, cap, written| unsafe {
-        def_fn(
-            RawSlice::of(ty.as_bytes()),
-            RawSlice::of(&owned),
-            dst,
-            cap,
-            written,
-        )
-    });
-    let bytes = bytes.ok_or_else(|| refused("the pack reported more than it wrote".to_string()))?;
-    if status == DefStatus::Refused as u32 {
-        return Err(serde_json::from_slice(&bytes).unwrap_or_else(|e| refused(e.to_string())));
-    }
-    if status != DefStatus::Ok as u32 {
-        return Err(refused(format!(
-            "definition export failed with status {status}"
-        )));
-    }
-    serde_json::from_slice(&bytes).map_err(|e| refused(e.to_string()))
-}
-
-/// Resolves one export, naming it when it is missing.
-fn symbol<T: Copy>(lib: &Library, name: &'static str) -> Result<T, PackError> {
-    // SAFETY: the name is one of the five the ABI fixes, and `T` is the
-    // signature that version guarantees for it.
-    let symbol = unsafe { lib.get::<T>(name.as_bytes()) };
-    Ok(*symbol.map_err(|_| PackError::MissingSymbol(name))?)
 }
 
 impl SystemTable {
     /// Registers systems in `pack` under `"{id}.{ty}"` in order.
     /// Stops at the first conflict, leaving earlier registrations in the table.
-    pub fn register_pack(&mut self, id: &str, pack: &Pack) -> Result<(), BuildError> {
-        let mut entries = Vec::new();
-        for system in &pack.def.systems {
-            let (lib, fns) = (pack.lib.clone(), pack.fns);
-            let ty = system.ty.to_string();
-            let (def_lib, def_ty) = (pack.lib.clone(), system.ty.to_string());
-            let entry = TableEntry {
-                def: system.def.clone(),
-                def_fn: Box::new(move |cx| {
-                    let _ = &def_lib;
-                    instance_def(fns.def, &def_ty, cx)
-                }),
-                doc: system.doc.clone(),
-                schema: system.params.clone(),
-                make: Arc::new(move |cx| {
-                    let instance = Instance {
-                        id: cx.id.to_string(),
-                        def: cx.def.clone(),
-                        adapter: cx.adapter.cloned(),
-                    };
-                    let step = create(
-                        &lib,
-                        fns,
-                        &ty,
-                        cx.params.0,
-                        &instance,
-                        &cx.inputs,
-                        &cx.outputs,
-                    )?;
-                    Ok(Box::new(step))
-                }),
-            };
-            entries.push((format!("{id}.{}", system.ty), entry));
-        }
+    pub fn register_pack(&mut self, id: &str, pack: Arc<Pack>) -> Result<(), BuildError> {
+        let entries = pack
+            .descriptor()
+            .systems
+            .iter()
+            .map(|system| (format!("{id}.{}", system.ty), entry(&pack, system)))
+            .collect();
         self.insert_all(entries)
     }
 }
 
-/// Creates one instance of `ty` over the host's rings.
-///
-/// `instance` carries the definition the host resolved, including any ports
-/// the config added, and the adapter the config named.
-pub(crate) fn create(
-    lib: &Arc<Library>,
-    fns: PackFns,
-    ty: &str,
-    params: &serde_json::Value,
-    instance: &Instance,
-    inputs: &[Vec<&RingBuffer>],
-    outputs: &[&RingBuffer],
-) -> Result<DlStep, ParamError> {
-    let params = serde_json::to_vec(params).map_err(|e| ParamError::Decode(e.to_string()))?;
-    let def = serde_json::to_vec(instance).map_err(|e| ParamError::Decode(e.to_string()))?;
-    let input_owners: Vec<Vec<_>> = inputs
-        .iter()
-        .map(|rings| rings.iter().map(|ring| ring.export()).collect())
-        .collect();
-    let output_owners: Vec<_> = outputs.iter().map(|ring| ring.export()).collect();
-    let edges: Vec<Vec<RawRing>> = input_owners
-        .iter()
-        .map(|rings| rings.iter().map(RawRing::of).collect())
-        .collect();
-    let ports: Vec<RawSlice> = edges.iter().map(|rings| RawSlice::of(rings)).collect();
-    let outs: Vec<RawRing> = output_owners.iter().map(RawRing::of).collect();
-    let mut error = RawSlice::EMPTY;
-    // SAFETY: arrays and export owners outlive the call. Guest attachments
-    // retain their backing through host callbacks.
-    let instance = unsafe {
-        (fns.create)(
-            RawSlice::of(ty.as_bytes()),
-            RawSlice::of(&params),
-            RawSlice::of(&def),
-            RawSlice::of(&ports),
-            RawSlice::of(&outs),
-            &raw mut error,
-        )
-    };
-    if instance.is_null() {
-        return Err(create_error(&error));
-    }
-    Ok(DlStep {
-        instance,
-        fns,
-        lib: lib.clone(),
-        end: None,
-    })
-}
-
-/// Decodes the error a failed `create` wrote, or names the failure it could not.
-fn create_error(error: &RawSlice) -> ParamError {
-    // SAFETY: the pack owns the buffer until the next `create` on this thread.
-    let bytes = unsafe { error.as_bytes() };
-    if bytes.is_empty() {
-        return ParamError::Decode("pack create failed".to_string());
-    }
-    serde_json::from_slice(bytes).unwrap_or_else(|e| ParamError::Decode(e.to_string()))
-}
-
-/// A `DlStep` is one instance living inside a pack library.
-pub struct DlStep {
-    instance: *mut c_void,
-    fns: PackFns,
-    /// Keeps the library loaded for as long as the instance lives.
-    lib: Arc<Library>,
-    end: Option<EndReason>,
-}
-
-impl Step for DlStep {
-    fn execute(&mut self, now: Timestamp) {
-        if self.end.is_some() {
-            return;
-        }
-        // SAFETY: the instance came from `create` on this thread and has not
-        // been destroyed.
-        let status = Status::from_raw(unsafe { (self.fns.execute)(self.instance, now.0) });
-        self.end = status.end();
-    }
-
-    /// Nothing: the pack has already written the fault line.
-    fn fault(&mut self, _now: Timestamp, _message: &str) {}
-
-    fn ended(&self) -> Option<&EndReason> {
-        self.end.as_ref()
-    }
-}
-
-impl Drop for DlStep {
-    fn drop(&mut self) {
-        // SAFETY: the instance came from `create` and is destroyed once. `lib`
-        // drops after this, so the code running here is still mapped.
-        unsafe { (self.fns.destroy)(self.instance) };
-        let _ = &self.lib;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    unsafe extern "C" fn status<const STATUS: u32>(_: *mut u8, _: usize, _: *mut usize) -> u32 {
-        STATUS
-    }
-
-    unsafe extern "C" fn oversized_length(_: *mut u8, capacity: usize, written: *mut usize) -> u32 {
-        // SAFETY: descriptor supplies a writable result slot.
-        unsafe { written.write(capacity + 1) };
-        DefStatus::Ok as u32
-    }
-
-    unsafe extern "C" fn empty_table(dst: *mut u8, capacity: usize, written: *mut usize) -> u32 {
-        // SAFETY: descriptor supplies valid, nonoverlapping storage.
-        unsafe { crate::pack::def(SystemTable::new, dst, capacity, written) }
-    }
-
-    #[test]
-    fn test_descriptor_owned_storage() {
-        // SAFETY: this callback implements the descriptor ABI.
-        let def = unsafe { descriptor(empty_table) }.unwrap();
-        assert!(def.systems.is_empty());
-    }
-
-    #[test]
-    fn test_descriptor_export_errors() {
-        // SAFETY: these callbacks touch no storage and return failure statuses.
-        assert!(matches!(
-            unsafe { descriptor(status::<1>) },
-            Err(PackError::DescriptorTooLarge {
-                capacity: DESCRIPTOR_CAPACITY
-            })
-        ));
-        for (callback, expected) in [
-            (status::<2> as PackDefFn, 2),
-            (status::<3>, 3),
-            (status::<99>, 99),
-        ] {
-            // SAFETY: as above.
-            assert!(matches!(unsafe { descriptor(callback) },
-                Err(PackError::DescriptorStatus(found)) if found == expected));
-        }
-    }
-
-    #[test]
-    fn test_descriptor_invalid_length_and_json() {
-        for callback in [oversized_length as PackDefFn, status::<0>] {
-            // SAFETY: callbacks write at most the supplied result slot.
-            assert!(matches!(
-                unsafe { descriptor(callback) },
-                Err(PackError::Decode)
-            ));
-        }
+/// The table entry for one exported system, whose closures share `pack`.
+fn entry(pack: &Arc<Pack>, system: &PackSystemDef) -> TableEntry {
+    let (def_pack, def_ty) = (pack.clone(), system.ty.clone());
+    let (make_pack, make_ty) = (pack.clone(), system.ty.clone());
+    TableEntry {
+        kind: system.kind,
+        def: system.def.clone(),
+        def_fn: Box::new(move |cx| def_pack.def(&def_ty, cx)),
+        doc: system.doc.clone(),
+        schema: system.params.clone(),
+        make: Arc::new(move |cx| {
+            let instance = Instance {
+                id: cx.id.to_string(),
+                def: cx.def.clone(),
+                adapter: cx.adapter.cloned(),
+            };
+            make_pack.create(&make_ty, cx.params.0, &instance, &cx.inputs, &cx.outputs)
+        }),
     }
 }

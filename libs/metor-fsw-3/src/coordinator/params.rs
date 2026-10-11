@@ -47,6 +47,10 @@ pub enum ParamError {
     Panicked(String),
     #[error("a mirror of a {capacity}-byte ring is too large")]
     MirrorTooLarge { capacity: usize },
+    #[error("`{system}`: an async system needs OS threads, which this build has none of")]
+    ThreadsUnsupported { system: String },
+    #[error("the wasm guest: {0}")]
+    Wasm(String),
 }
 
 #[cfg(test)]

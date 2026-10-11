@@ -7,8 +7,10 @@ use std::path::Path;
 use std::process::Command;
 
 use common::fixture_dir;
-use metor_fsw_3::Pack;
-use metor_fsw_3::cli::cargo::{PackConfig, cargo_build, cdylib_name, triple};
+use metor_fsw_3::DlPack;
+use metor_fsw_3::cli::cargo::{
+    PackConfig, WASM_TRIPLE, cargo_build, cdylib_name, triple, wasm_name,
+};
 use metor_fsw_3::cli::pack_dev::{PackDevError, pack_dev};
 
 const GOLDEN: &str = include_str!("golden/echo_pack.py");
@@ -131,7 +133,7 @@ fn test_pack_dev_rejects_loaded_destination() {
     std::fs::write(&init, "existing module\n").expect("write sentinel module");
     let before = dylib.metadata().expect("library metadata");
     // SAFETY: this is a copy of the fixture built against this workspace's ABI.
-    drop(unsafe { Pack::open(&dylib) }.expect("load staged fixture"));
+    drop(unsafe { DlPack::open(&dylib) }.expect("load staged fixture"));
 
     assert!(matches!(
         pack_dev(temp.path()),
@@ -149,4 +151,48 @@ fn test_pack_dev_rejects_loaded_destination() {
         "existing module\n"
     );
     assert!(!module.join("py.typed").exists());
+}
+
+/// A pack spelled out so no `Cargo.toml` is read, with `wasm`.
+fn wasm_pyproject(krate: &str) -> String {
+    let lib = krate.replace('-', "_");
+    format!(
+        "[project]\nname = \"{krate}\"\n\n[tool.metor.pack]\n\
+         id = \"echo\"\ncrate = \"{krate}\"\nlib = \"{lib}\"\nwasm = true\n"
+    )
+}
+
+/// A pack root under the target dir, where cargo finds this workspace and
+/// its config.
+fn root_in_target() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("a temp dir")
+}
+
+#[test]
+fn test_wasm_pack_dev_refuses_async() {
+    let root = root_in_target();
+    let pyproject = wasm_pyproject("echo-pack");
+    std::fs::write(root.path().join("pyproject.toml"), pyproject).expect("writes");
+    let refused = pack_dev(root.path());
+    assert!(
+        matches!(&refused, Err(PackDevError::AsyncInWasm { system }) if system == "relay"),
+        "{refused:?}"
+    );
+    let module = root.path().join(".metor/echo_pack");
+    assert!(!module.join("__init__.py").exists());
+    assert!(!module.join("_libs").join(WASM_TRIPLE).exists());
+}
+
+#[test]
+fn test_wasm_pack_dev_stages_module() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sync-pack");
+    pack_dev(&root).expect("pack dev lays out both");
+    let module = root.join(".metor/sync_pack");
+    let staged = module
+        .join("_libs")
+        .join(WASM_TRIPLE)
+        .join(wasm_name("sync_pack"));
+    assert!(staged.is_file(), "{} is missing", staged.display());
+    let init = std::fs::read_to_string(module.join("__init__.py")).expect("reads");
+    assert!(init.contains("    wasm=True,\n)"), "{init}");
 }

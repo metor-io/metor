@@ -5,6 +5,7 @@ use metor_proto_wkt::{LogEvent, LogLevel};
 
 use super::*;
 use crate::DefCx;
+use crate::coordinator::SystemKind;
 use crate::record::Record;
 use crate::tests::utils::{self, Imu, Nav, Recorder};
 
@@ -310,10 +311,87 @@ fn test_destroy_releases_ring_handles() {
 }
 
 #[test]
+fn test_unowned_ring_attach() {
+    let (imu, nav, log) = (ring::<Imu>(1), ring::<Nav>(1), ring::<LogEvent>(1));
+    let unowned = |ring: &TestRing| RawRing {
+        owner: None,
+        ..ring.raw()
+    };
+    let edges = [unowned(&imu)];
+    let filter = create_raw(
+        "nav",
+        "",
+        &[RawSlice::of(&edges)],
+        &[unowned(&nav), unowned(&log)],
+    );
+    assert!(!filter.handle.is_null());
+    let source = utils::output::<Imu>(&imu.ring);
+    let mut sink = utils::input::<Nav>(&nav.ring);
+    source.write(&Imu::new(1, 3.0)).expect("room");
+    assert_eq!(filter.step(1), Status::Ok);
+    assert_eq!(sink.latest().expect("valid").expect("record").estimate, 6.0);
+
+    drop(filter);
+    assert!(imu.ring.view(NoWake).is_ok());
+    assert!(nav.ring.writer(NoWake).is_ok());
+    assert_eq!(sink.latest().expect("valid").expect("record").estimate, 6.0);
+}
+
+#[test]
+fn test_alloc_free() {
+    let ptr = alloc(64, 16);
+    assert!(!ptr.is_null() && (ptr as usize).is_multiple_of(16));
+    // SAFETY: `alloc` returned 64 zeroed bytes.
+    assert!(
+        unsafe { core::slice::from_raw_parts(ptr, 64) }
+            .iter()
+            .all(|b| *b == 0)
+    );
+    // SAFETY: the same length and alignment `alloc` took, freed once.
+    unsafe { free(ptr, 64, 16) };
+
+    assert!(alloc(0, 8).is_null());
+    assert!(alloc(8, 3).is_null());
+    // SAFETY: a null pointer is ignored.
+    unsafe { free(core::ptr::null_mut(), 8, 8) };
+}
+
+/// Marks one cycle, then completes.
+#[crate::sequence]
+async fn blink(seq: &crate::Seq) -> Result<(), crate::SeqError> {
+    seq.next_cycle().await;
+    Ok(())
+}
+
+#[test]
+fn test_descriptor_kinds() {
+    let mut table = build();
+    table
+        .register_sequence("blink", blink(), Default::default)
+        .expect("valid records");
+    let kinds = PackDef::from_table(&table);
+    let kind = |ty: &str| {
+        let system = kinds.systems.iter().find(|s| s.ty == ty).expect("exported");
+        system.kind
+    };
+    assert_eq!(kind("imu"), SystemKind::Cyclic);
+    assert_eq!(kind("trap"), SystemKind::Cyclic);
+    assert_eq!(kind("relay"), SystemKind::Async);
+    assert_eq!(kind("blink"), SystemKind::Sequence);
+
+    let mut untagged = serde_json::to_value(&kinds.systems[0]).expect("encodes");
+    untagged.as_object_mut().expect("an object").remove("kind");
+    let decoded: def::PackSystemDef = serde_json::from_value(untagged).expect("decodes");
+    assert_eq!(decoded.kind, SystemKind::Cyclic);
+}
+
+#[test]
 fn test_unknown_status_is_panicked() {
     assert_eq!(Status::from_raw(0), Status::Ok);
     assert_eq!(Status::from_raw(1), Status::Panicked);
     assert_eq!(Status::from_raw(7), Status::Panicked);
+    assert_eq!(Status::try_from_raw(4), Some(Status::Failed));
+    assert_eq!(Status::try_from_raw(7), None);
 }
 
 #[test]

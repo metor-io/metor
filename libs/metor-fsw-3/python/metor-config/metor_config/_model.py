@@ -144,12 +144,14 @@ Item: TypeAlias = Union["SystemHandle", OutPort[Any]]
 @dataclass(frozen=True)
 class Pack:
     """A pack as its generated module declares it: the id prefixing every `ty`,
-    the cdylib stem, and the per-triple library directory the module locates."""
+    the cdylib stem, the per-triple library directory the module locates, and
+    whether `metor pack dev` also staged it as a WebAssembly module."""
 
     id: str
     lib: str
     libs: str
     abi_version: int
+    wasm: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {"id": self.id, "lib": self.lib, "libs": str(self.libs)}

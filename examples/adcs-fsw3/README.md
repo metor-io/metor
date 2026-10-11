@@ -1,15 +1,19 @@
 # adcs-fsw3
 
-A cube-sat attitude control loop on metor-fsw-3. One pack, `adcs`, holds four
+A cube-sat attitude control loop on metor-fsw-3. The `adcs` pack holds four
 systems: a rigid-body plant in a 400 km orbit with sensors and disturbances, a
 MEKF filter, an LQR controller that drives reaction wheels and magnetorquers,
-and a `mode` system that holds the commanded phase and pointing law.
+and a `mode` system that holds the commanded phase and pointing law. The `seqs`
+pack holds `commission`, a sequence that detumbles and then holds nadir. It
+builds as a wasm module as well as a library.
 
 ```
 contracts/        adcs-contracts-3: frames, params, and shared physics
 systems/adcs/     adcs-systems-3: plant, nav, ctrl, mode, and pack()
-sim.py            the whole loop in one process
-target.py         a deployment of three targets: plant, fsw, and a gateway
+systems/seqs/     adcs-seqs-3: commission and pack()
+sim.py            the whole loop in one process, with mode
+target.py         a deployment of three targets: plant, fsw, and a gateway;
+                  fsw runs commission as a wasm module
 tests/            the convergence and deployment tests
 ```
 
@@ -32,9 +36,10 @@ both, each as a child process:
 cargo run -p metor-fsw-3 --bin metor -- run examples/adcs-fsw3/target.py
 ```
 
-Connect a panel to the gateway on `127.0.0.1:2250`. The plant and the flight
-software listen on 2240 and 2241. `METOR_DEPLOY_PORTS=a,b,c` overrides all
-three ports, which lets the tests pick free ones.
+Connect a panel to the gateway on `127.0.0.1:2250`; the `commission` channel
+takes its commands through it. The plant and the flight software listen on 2240
+and 2241. `METOR_DEPLOY_PORTS=a,b,c` overrides all three ports, which lets the
+tests pick free ones.
 `metor build examples/adcs-fsw3/target.py` prints the resolved deployment
 without running it.
 
@@ -55,7 +60,6 @@ spherical-harmonic workspaces inside that call. Reusing them needs a patch to
 
 ## Not ported
 
-`examples/adcs-fsw2` also has commissioning and safe-mode sequences, alarms,
-presets and dashboards, the Python expression system, and uplink routes.
-fsw-3 has none of these yet, so `mode` holds one fixed command for the whole
-run.
+`examples/adcs-fsw2` also has a safe-mode sequence, alarms, presets and
+dashboards, the Python expression system, and uplink routes. fsw-3 has none of
+these yet.

@@ -1,8 +1,9 @@
 //! `DlSlot`: one place in the schedule a pack system is loaded into.
 //!
 //! The slot's ports are its first candidate's, baked into its params by
-//! `metor build`. A `Load` hashes the candidate's library, opens it, checks
-//! its ports against the slot's, and creates it over the slot's rings.
+//! `metor build`, along with each candidate's pack kind and limits. A `Load`
+//! hashes the candidate's library or module, opens it, checks its ports
+//! against the slot's, and creates it over the slot's rings.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,15 +13,17 @@ use metor_proto::types::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::cli::config::PackKind;
 use crate::coordinator::{
-    Adapter, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, TableEntry,
+    Adapter, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, SystemKind, TableEntry,
 };
 use crate::def::{DefCx, DefError};
 use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
+use crate::wasm::{Limits, WasmPack};
 use crate::{FrameBytes, FrameStr};
 
-use super::{DlStep, Pack, create, store};
+use super::{DlPack, Pack, PackError, is_loaded, store};
 
 /// The name the slot's definition carries.
 const SLOT_NAME: &str = "dl_slot";
@@ -45,6 +48,10 @@ struct Candidate {
     hash: Option<String>,
     #[serde(default)]
     def: Option<SystemDef>,
+    #[serde(default)]
+    kind: PackKind,
+    #[serde(flatten)]
+    limits: Limits,
 }
 
 /// A candidate `metor build` resolved: where its library is and what it is.
@@ -54,12 +61,15 @@ struct Resolved {
     params: Value,
     path: PathBuf,
     hash: blake3::Hash,
+    kind: PackKind,
+    limits: Limits,
     occupant: Occupant,
 }
 
 /// The table entry `fsw.dl_slot` registers as.
 pub(crate) fn entry() -> TableEntry {
     TableEntry {
+        kind: SystemKind::Cyclic,
         def: SystemDef {
             name: SLOT_NAME.into(),
             inputs: Vec::new(),
@@ -155,6 +165,8 @@ impl Resolved {
             params: candidate.params,
             path,
             hash,
+            kind: candidate.kind,
+            limits: candidate.limits,
         })
     }
 }
@@ -174,36 +186,11 @@ pub struct DlSlot {
 /// The occupant and the pack it was created from.
 struct Loaded {
     at: usize,
-    pack: Pack,
-    step: DlStep,
+    pack: Arc<Pack>,
+    step: Box<dyn Step>,
 }
 
 impl DlSlot {
-    /// Opens a candidate's library once its bytes and ports check out.
-    ///
-    /// A resident library is the bytes checked when it was first opened, so
-    /// only a first open hashes the file, and re-checks that the file it
-    /// hashed is the one it opened.
-    fn open(&self, candidate: &Resolved) -> Result<Pack, LoadError> {
-        let open_error = |e: super::PackError| LoadError::Open(e.to_string());
-        let io_error = |e: std::io::Error| LoadError::Open(e.to_string());
-        if super::is_loaded(&candidate.path) {
-            // SAFETY: the library is already mapped in this process.
-            return unsafe { Pack::open(&candidate.path) }.map_err(open_error);
-        }
-        let hashed = store::Hashed::of(&candidate.path).map_err(io_error)?;
-        if hashed.hash != candidate.hash {
-            return Err(LoadError::Hash(candidate.name.clone()));
-        }
-        // SAFETY: the library is in the store `metor build` wrote, and its
-        // bytes are the ones build hashed; `open` checks the ABI first.
-        let pack = unsafe { Pack::open(&candidate.path) }.map_err(open_error)?;
-        if !hashed.still_at(&candidate.path).map_err(io_error)? {
-            return Err(LoadError::Hash(candidate.name.clone()));
-        }
-        Ok(pack)
-    }
-
     fn check_ports(&self, pack: &Pack, candidate: &Resolved) -> Result<(), LoadError> {
         let cx = DefCx {
             id: &self.instance.id,
@@ -219,16 +206,14 @@ impl DlSlot {
         Ok(())
     }
 
-    fn create(&self, pack: &Pack, candidate: &Resolved) -> Result<DlStep, LoadError> {
+    fn create(&self, pack: &Pack, candidate: &Resolved) -> Result<Box<dyn Step>, LoadError> {
         let inputs: Vec<Vec<&RingBuffer>> = self
             .inputs
             .iter()
             .map(|rings| rings.iter().collect())
             .collect();
         let outputs: Vec<&RingBuffer> = self.outputs.iter().collect();
-        create(
-            &pack.lib,
-            pack.fns,
+        pack.create(
             &candidate.ty,
             &candidate.params,
             &self.instance,
@@ -239,7 +224,7 @@ impl DlSlot {
     }
 
     /// Creates candidate `at` over the slot's rings, which must be free.
-    fn place(&mut self, at: usize, pack: Pack) -> Result<(), LoadError> {
+    fn place(&mut self, at: usize, pack: Arc<Pack>) -> Result<(), LoadError> {
         let step = self.create(&pack, &self.candidates[at])?;
         self.current = Some(Loaded { at, pack, step });
         self.end = None;
@@ -272,7 +257,7 @@ impl Step for DlSlot {
             .iter()
             .position(|candidate| candidate.name == name)
             .ok_or_else(|| LoadError::Unknown(name.to_string()))?;
-        let pack = self.open(&self.candidates[at])?;
+        let pack = Arc::new(open(&self.candidates[at])?);
         self.check_ports(&pack, &self.candidates[at])?;
         // The old occupant releases its views and writers before the new one claims them.
         let previous = self.current.take().map(|loaded| (loaded.at, loaded.pack));
@@ -288,6 +273,53 @@ impl Step for DlSlot {
         let loaded = self.current.as_ref()?;
         Some(&self.candidates[loaded.at].occupant)
     }
+}
+
+/// Opens a candidate's library or module once its bytes check out.
+fn open(candidate: &Resolved) -> Result<Pack, LoadError> {
+    match candidate.kind {
+        PackKind::Dylib => open_dylib(candidate),
+        PackKind::Wasm => open_wasm(candidate),
+    }
+}
+
+/// Opens a candidate's library.
+///
+/// A resident library is the bytes checked when it was first opened, so only
+/// a first open hashes the file, and re-checks that the file it hashed is the
+/// one it opened.
+fn open_dylib(candidate: &Resolved) -> Result<Pack, LoadError> {
+    let io_error = |e: std::io::Error| LoadError::Open(e.to_string());
+    if is_loaded(&candidate.path) {
+        // SAFETY: the library is already mapped in this process.
+        let pack = unsafe { DlPack::open(&candidate.path) }.map_err(open_error)?;
+        return Ok(Pack::Dl(pack));
+    }
+    let hashed = store::Hashed::of(&candidate.path).map_err(io_error)?;
+    if hashed.hash != candidate.hash {
+        return Err(LoadError::Hash(candidate.name.clone()));
+    }
+    // SAFETY: the library is in the store `metor build` wrote, and its
+    // bytes are the ones build hashed; `open` checks the ABI first.
+    let pack = unsafe { DlPack::open(&candidate.path) }.map_err(open_error)?;
+    if !hashed.still_at(&candidate.path).map_err(io_error)? {
+        return Err(LoadError::Hash(candidate.name.clone()));
+    }
+    Ok(Pack::Dl(pack))
+}
+
+/// Reads a candidate's module once, and compiles the bytes it hashed.
+fn open_wasm(candidate: &Resolved) -> Result<Pack, LoadError> {
+    let bytes = std::fs::read(&candidate.path).map_err(|e| LoadError::Open(e.to_string()))?;
+    if blake3::hash(&bytes) != candidate.hash {
+        return Err(LoadError::Hash(candidate.name.clone()));
+    }
+    let pack = WasmPack::open(&bytes, &candidate.limits).map_err(open_error)?;
+    Ok(Pack::Wasm(pack))
+}
+
+fn open_error(error: PackError) -> LoadError {
+    LoadError::Open(error.to_string())
 }
 
 /// Whether two definitions have the same ports in the same order, carrying

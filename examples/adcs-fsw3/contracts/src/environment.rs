@@ -4,16 +4,7 @@ use hifitime::Duration;
 use nox_frames::earth::{ecef_to_eci, eci_to_ecef, ned_to_ecef};
 use wmm::GeodeticCoords;
 
-use crate::{Epoch, MagneticModel, V3};
-
-/// Gravitational constant (m³·kg⁻¹·s⁻²).
-pub const G: f64 = 6.6743e-11;
-/// Mass of Earth (kg).
-pub const M: f64 = 5.972e24;
-/// Earth's gravitational parameter `G·M` (m³·s⁻²).
-pub const MU: f64 = G * M;
-/// Earth radius (m).
-pub const EARTH_RADIUS: f64 = 6378.1e3;
+use crate::{EARTH_RADIUS, Epoch, MagneticModel, V3};
 
 /// WGS84 semi-major axis (m).
 const WGS84_A: f64 = 6378137.0;
@@ -71,6 +62,13 @@ pub fn epoch_at(t_sim_s: f64) -> Epoch {
 /// Returns the unit vector toward the sun in ECI at `epoch`.
 pub fn sun_dir_eci(epoch: Epoch) -> V3 {
     nox_frames::earth::sun_vec(epoch)
+}
+
+/// Returns the RAAN (rad) that puts the ascending node at local mean solar time
+/// `ltan_hours` at `epoch`.
+pub fn raan_for_ltan(epoch: Epoch, ltan_hours: f64) -> f64 {
+    let [x, y, _] = sun_dir_eci(epoch).into_buf();
+    y.atan2(x) + (ltan_hours - 12.0) / 24.0 * core::f64::consts::TAU
 }
 
 /// Returns whether `pos_eci` lies in Earth's shadow, modeled as a cylinder of

@@ -5,6 +5,8 @@
 
 use core::ffi::c_void;
 
+use metor_fsw_3_ring::{RawOwner, RingExport};
+
 /// A borrowed array: the descriptor, a type name, params, an error, or the
 /// arrays `create` takes: one `RawSlice` of `RawRing`s per input port, and
 /// the output `RawRing`s. `len` counts elements.
@@ -54,25 +56,39 @@ impl RawSlice {
 }
 
 /// One ring's region, as [`RingBuffer::region`](metor_fsw_3_ring::RingBuffer::region) reports it.
+///
+/// A ring with no owner lives in the receiver's own memory, which outlives
+/// every handle the receiver attaches to it.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawRing {
     pub base: *mut u8,
     pub len: usize,
-    pub owner: metor_fsw_3_ring::RawOwner,
+    pub owner: Option<RawOwner>,
 }
 
 impl RawRing {
     /// Borrows an export that must remain alive until the receiver attaches.
-    pub fn of(export: &metor_fsw_3_ring::RingExport) -> Self {
+    pub fn of(export: &RingExport) -> Self {
         let (base, len) = export.region();
         Self {
             base,
             len,
-            owner: export.owner(),
+            owner: Some(export.owner()),
         }
     }
 }
+
+/// A [`RawSlice`]'s size in a wasm32 guest.
+pub const WASM32_RAW_SLICE: usize = 8;
+/// A [`RawRing`]'s size in a wasm32 guest.
+pub const WASM32_RAW_RING: usize = 20;
+
+// The owner's function pointers are its niche, so the option adds nothing.
+const _: () = assert!(size_of::<Option<RawOwner>>() == size_of::<RawOwner>());
+#[cfg(target_arch = "wasm32")]
+const _: () =
+    assert!(size_of::<RawSlice>() == WASM32_RAW_SLICE && size_of::<RawRing>() == WASM32_RAW_RING);
 
 #[cfg(test)]
 mod tests {

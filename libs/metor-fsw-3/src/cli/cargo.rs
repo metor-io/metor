@@ -1,41 +1,83 @@
-//! Building a pack's cdylib with cargo, finding what it wrote, and the
-//! `pyproject.toml` fields that name it.
+//! Building a pack's cdylib or module with cargo, finding what it wrote, and
+//! the `pyproject.toml` fields that name it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 use super::pack_dev::PackDevError;
 
-/// A `CargoError` is why a pack's cdylib did not appear.
+/// A `CargoError` is why a pack's cdylib or module did not appear.
 #[derive(Debug, thiserror::Error)]
 pub enum CargoError {
     #[error("running cargo: {0}")]
     Spawn(#[from] std::io::Error),
     #[error("cargo build failed: {0}")]
     Cargo(ExitStatus),
-    #[error("cargo built no cdylib for `{0}`")]
-    NoCdylib(String),
+    #[error("cargo built no {0} for `{1}`")]
+    NoArtifact(&'static str, String),
 }
 
 /// Builds `package` from `manifest_dir` and returns the cdylib cargo wrote.
 ///
 /// Cargo's stderr is inherited, so its progress is the caller's progress.
 pub fn cargo_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoError> {
+    let args = ["build", "-p", package, "--message-format=json"];
+    let stdout = cargo(manifest_dir, &args)?;
+    cdylib(&stdout).ok_or_else(|| CargoError::NoArtifact("cdylib", package.to_string()))
+}
+
+/// Builds `package` from `manifest_dir` for wasm32, importing its memory, and
+/// returns the module cargo wrote.
+///
+/// `cargo rustc` passes the link flag to the pack crate alone, so its
+/// dependencies stay cached.
+pub fn wasm_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoError> {
+    let args = [
+        "rustc",
+        "-p",
+        package,
+        "--target",
+        WASM_TRIPLE,
+        "--release",
+        "--message-format=json",
+        "--",
+        "-C",
+        "link-arg=--import-memory",
+    ];
+    let stdout = cargo(manifest_dir, &args)?;
+    module(&stdout).ok_or_else(|| CargoError::NoArtifact("module", package.to_string()))
+}
+
+/// Runs cargo with `args` in `dir`, returning its stdout. Cargo's stderr is
+/// inherited, so its progress is the caller's progress.
+fn cargo(dir: &Path, args: &[&str]) -> Result<Vec<u8>, CargoError> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
-        .current_dir(manifest_dir)
-        .args(["build", "-p", package, "--message-format=json"])
+        .current_dir(dir)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()?;
     if !output.status.success() {
         return Err(CargoError::Cargo(output.status));
     }
-    cdylib(&output.stdout).ok_or_else(|| CargoError::NoCdylib(package.to_string()))
+    Ok(output.stdout)
 }
 
-/// Reads the last cdylib filename out of cargo's `compiler-artifact` lines.
+/// Reads the last cdylib's library out of cargo's `compiler-artifact` lines.
 fn cdylib(stdout: &[u8]) -> Option<PathBuf> {
+    cdylib_file(stdout, |name| {
+        !name.ends_with(".rlib") && !name.ends_with(".rmeta")
+    })
+}
+
+/// Reads the last cdylib's module out of cargo's `compiler-artifact` lines.
+fn module(stdout: &[u8]) -> Option<PathBuf> {
+    cdylib_file(stdout, |name| name.ends_with(".wasm"))
+}
+
+/// The first file `pick` takes from the last cdylib artifact cargo reported.
+fn cdylib_file(stdout: &[u8], pick: impl Fn(&str) -> bool) -> Option<PathBuf> {
     stdout.split(|&byte| byte == b'\n').rev().find_map(|line| {
         let message: serde_json::Value = serde_json::from_slice(line).ok()?;
         if message["reason"] != "compiler-artifact" {
@@ -49,7 +91,7 @@ fn cdylib(stdout: &[u8]) -> Option<PathBuf> {
         names
             .iter()
             .filter_map(|name| name.as_str())
-            .find(|name| !name.ends_with(".rlib") && !name.ends_with(".rmeta"))
+            .find(|name| pick(name))
             .map(PathBuf::from)
     })
 }
@@ -67,6 +109,8 @@ pub struct PackConfig {
     pub lib: String,
     /// The Python module the generated code lands in.
     pub module: String,
+    /// Whether the pack is also built as a module, `[tool.metor.pack] wasm`.
+    pub wasm: bool,
 }
 
 impl PackConfig {
@@ -81,8 +125,12 @@ impl PackConfig {
             (Some(krate), Some(lib)) => (krate, lib),
             (krate, lib) => cargo_names(root, krate, lib)?,
         };
+        let wasm = lookup(&pyproject, &["tool", "metor", "pack", "wasm"])
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
         Ok(PackConfig {
             id: field("id").unwrap_or_else(|| module.clone()),
+            wasm,
             dist,
             krate,
             lib,
@@ -155,6 +203,14 @@ pub fn cdylib_name(stem: &str) -> String {
     )
 }
 
+/// The target a pack is built for as a module.
+pub const WASM_TRIPLE: &str = "wasm32-unknown-unknown";
+
+/// The file name a module of `stem` has.
+pub fn wasm_name(stem: &str) -> String {
+    format!("{stem}.wasm")
+}
+
 /// Copies `src` over `dst` through a temp file beside it, then renames.
 ///
 /// macOS kill-caches a code signature by inode, so a dylib written in place
@@ -209,6 +265,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_module_artifact() {
+        let line = r#"{"reason":"compiler-artifact",
+            "target":{"name":"echo_pack","kind":["cdylib"]},
+            "filenames":["/t/wasm32-unknown-unknown/release/echo_pack.wasm"]}"#
+            .replace('\n', "");
+        let module = PathBuf::from("/t/wasm32-unknown-unknown/release/echo_pack.wasm");
+        assert_eq!(super::module(line.as_bytes()), Some(module));
+        assert_eq!(super::module(ARTIFACT.replace('\n', "").as_bytes()), None);
+    }
+
+    #[test]
     fn test_skip_non_json_output() {
         assert_eq!(cdylib(b"warning: something\n"), None);
         assert_eq!(cdylib(b""), None);
@@ -236,6 +303,7 @@ mod tests {
                 krate: "adcs-systems".into(),
                 lib: "adcs_systems".into(),
                 module: "adcs_pack".into(),
+                wasm: false,
             }
         );
     }
@@ -244,7 +312,8 @@ mod tests {
     fn test_pyproject_overrides_defaults() {
         let dir = root(
             "[project]\nname = \"adcs-pack\"\n\n[tool.metor.pack]\n\
-             id = \"adcs\"\ncrate = \"adcs\"\nlib = \"adcs_dylib\"\nmodule = \"adcs_mod\"\n",
+             id = \"adcs\"\ncrate = \"adcs\"\nlib = \"adcs_dylib\"\nmodule = \"adcs_mod\"\n\
+             wasm = true\n",
             "[package]\nname = \"ignored\"\n\n[lib]\nname = \"ignored_too\"\n",
         );
         assert_eq!(
@@ -255,6 +324,7 @@ mod tests {
                 krate: "adcs".into(),
                 lib: "adcs_dylib".into(),
                 module: "adcs_mod".into(),
+                wasm: true,
             }
         );
     }

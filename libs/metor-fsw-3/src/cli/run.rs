@@ -8,11 +8,12 @@ use std::ffi::OsString;
 use std::future::{Future, poll_fn};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::Arc;
 
 use tracing_subscriber::layer::SubscriberExt;
 
 use super::cargo::{lookup, read_toml, string};
-use super::config::{ConfigError, DeploymentConfig, TargetConfig};
+use super::config::{ConfigError, DeploymentConfig, PackRef, TargetConfig};
 use super::pack_dev::{PackDevError, pack_dev};
 use crate::coordinator::{BuildError, Clock, Coordinator, SystemTable};
 use crate::deploy::{self, DeployError};
@@ -273,15 +274,10 @@ fn table_for(config: &TargetConfig) -> Result<SystemTable, RunError> {
     let opened: Vec<Pack> = config
         .packs
         .iter()
-        .map(|pack| {
-            let path = pack.artifact();
-            // SAFETY: the path names a pack `pack dev` built against this ABI;
-            // `open` checks the version before calling anything else.
-            unsafe { Pack::open(&path) }
-        })
+        .map(PackRef::open)
         .collect::<Result<_, _>>()?;
-    for (reference, pack) in config.packs.iter().zip(&opened) {
-        table.register_pack(&reference.id, pack)?;
+    for (reference, pack) in config.packs.iter().zip(opened) {
+        table.register_pack(&reference.id, Arc::new(pack))?;
     }
     Ok(table)
 }

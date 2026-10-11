@@ -31,6 +31,8 @@ fn candidate(path: &str, hash: &str) -> Candidate {
         path: Some(path.into()),
         hash: Some(hash.into()),
         def: None,
+        kind: PackKind::Dylib,
+        limits: Limits::default(),
     }
 }
 

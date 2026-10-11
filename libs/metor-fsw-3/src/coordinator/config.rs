@@ -5,10 +5,7 @@ use core::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::error::BuildError;
 use crate::system::PortDef;
-
-const MIN_WALL_RATE: f64 = 0.001;
 
 /// Default number of records a ring can hold
 pub const DEFAULT_RING_DEPTH: usize = 8;
@@ -215,27 +212,6 @@ pub enum Clock {
     Simulated { dt: Duration },
 }
 
-impl Clock {
-    pub(crate) fn validate(&self) -> Result<(), BuildError> {
-        if let Self::Wall { rate } = self
-            && (!rate.is_finite() || *rate < MIN_WALL_RATE)
-        {
-            return Err(BuildError::InvalidClockRate);
-        }
-        Ok(())
-    }
-
-    /// The wall budget for one cycle; zero under a simulated clock.
-    pub(crate) fn cycle_budget(&self) -> Duration {
-        match self {
-            Clock::Wall { rate } if *rate > 0.0 => {
-                Duration::try_from_secs_f64(1.0 / rate).unwrap_or(Duration::MAX)
-            }
-            _ => Duration::ZERO,
-        }
-    }
-}
-
 impl InputConfig {
     /// An input port fed by one producer's output.
     pub fn new(
@@ -351,28 +327,5 @@ mod tests {
         let text = serde_json::to_string(&peer).expect("encodes");
         assert!(text.starts_with(r#"{"port":"est.est","peer":{"#), "{text}");
         assert!(serde_json::from_str::<OutputConfig>(r#"{"port":"x"}"#).is_err());
-    }
-
-    #[test]
-    fn test_zero_cycle_budget() {
-        assert_eq!(
-            Clock::Simulated {
-                dt: Duration::from_millis(5)
-            }
-            .cycle_budget(),
-            Duration::ZERO
-        );
-        let clock = Clock::Wall { rate: f64::MAX };
-        assert_eq!(clock.validate(), Ok(()));
-        assert_eq!(clock.cycle_budget(), Duration::ZERO);
-    }
-
-    #[test]
-    fn test_minimum_wall_rate_budget() {
-        let clock = Clock::Wall {
-            rate: MIN_WALL_RATE,
-        };
-        assert_eq!(clock.validate(), Ok(()));
-        assert_eq!(clock.cycle_budget(), Duration::from_secs(1_000));
     }
 }

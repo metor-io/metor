@@ -4,8 +4,8 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+use maitake_sync::wait_queue::WaitOwned;
 use metor_fsw_3_ring::{Notifier, View, WakeSink};
-use stellarator::sync::wait_queue::WaitOwned;
 
 use super::{DynInputs, Input};
 use crate::record::Record;

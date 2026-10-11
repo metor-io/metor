@@ -134,7 +134,8 @@ impl SlotCx {
         Ok(params)
     }
 
-    /// Stores one candidate's library and writes its path, hash, and ports.
+    /// Stores one candidate's library or module and writes its path, hash,
+    /// ports, and the pack's kind and limits.
     fn candidate(
         &self,
         candidate: &mut Map<String, Value>,
@@ -148,9 +149,7 @@ impl SlotCx {
         let artifact = pack.artifact();
         self.check_name(&artifact)?;
         let within = |e: String| self.fail(format!("`{name}`: {e}"));
-        // SAFETY: a pack reference names a library `pack dev` built against
-        // this ABI; `open` checks the version before calling anything else.
-        let opened = unsafe { Pack::open(&artifact) }.map_err(|e| within(e.to_string()))?;
+        let opened = pack.open().map_err(|e| within(e.to_string()))?;
         let params = candidate.get("params").unwrap_or(&Value::Null);
         let def = self
             .def(&opened, &ty, params)
@@ -160,6 +159,10 @@ impl SlotCx {
         candidate.insert("path".into(), json!(stored.path));
         candidate.insert("hash".into(), json!(stored.hash.to_hex().as_str()));
         candidate.insert("def".into(), json!(def));
+        candidate.insert("kind".into(), json!(pack.kind));
+        if let Value::Object(limits) = json!(pack.limits) {
+            candidate.extend(limits);
+        }
         Ok((name, def))
     }
 
