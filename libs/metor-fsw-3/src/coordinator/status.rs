@@ -1,16 +1,16 @@
-//! The frame every system's coordinator-owned `status` output carries.
+//! The frame the coordinator writes to each system's `status` output.
 
 use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::Frame;
 
-/// The status of a system for once cycle
+/// The status of one system for one cycle.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
 #[frame(name = "status")]
 #[repr(C)]
 pub struct SystemStatus {
-    /// The cycle's timestamp, shared by every system in it.
+    /// The cycle's timestamp, which is the same for every system in the cycle.
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     /// Wall time spent inside `execute` in nanoseconds.

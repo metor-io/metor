@@ -1,4 +1,4 @@
-//! Systems authored as one `async fn run` on a background thread.
+//! Systems written as one long-running `async fn` on a background thread.
 
 use core::future::Future;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -10,17 +10,20 @@ use metor_fsw_3_ring::Notifier;
 use crate::def::{DefCx, DefError};
 use crate::system::{SystemDef, SystemInputs, SystemOutputs};
 
-/// An `AsyncSystem` runs once, paces itself, and returns when `stop` resolves.
+/// A system that runs on its own thread and sets its own pace.
 ///
-/// Its ports are the same as a cyclic system's, over the mirror rings the
-/// thread adapter copies across, so a read parks the background thread.
+/// Unlike a cyclic system, [`AsyncSystem::run`] is called once and keeps
+/// running until `stop` is set. Use it for work that blocks or doesn't fit in
+/// a cycle, like network IO. Its ports work like a cyclic system's, but the
+/// thread adapter copies their data to and from the schedule. Waiting on an
+/// input parks the background thread, not the schedule.
 #[allow(async_fn_in_trait)]
 pub trait AsyncSystem {
     type State;
     type Inputs: SystemInputs<Notifier>;
     type Outputs: SystemOutputs;
 
-    /// This instance's ports, computed from its config.
+    /// Returns this instance's ports, computed from its config.
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError>;
 
     async fn run(
@@ -37,15 +40,19 @@ struct StopInner {
     woken: WaitQueue,
 }
 
-/// A `Stop` is the end of an async system's `run`, shared with its group.
+/// Tells an async system when to stop.
+///
+/// Every system placed on the same thread shares one stop.
 #[derive(Clone)]
 pub struct Stop(Arc<StopInner>);
 
-/// A `StopHandle` ends every [`Stop`] it was made with.
+/// Sets a [`Stop`], telling every system that shares it to return.
 #[derive(Clone)]
 pub struct StopHandle(Arc<StopInner>);
 
-/// Returns the handle the adapter keeps and the stop its systems await.
+/// Creates a linked [`StopHandle`] and [`Stop`].
+///
+/// A thread group keeps the handle and gives the stop to its systems.
 pub fn stop_pair() -> (StopHandle, Stop) {
     let inner = Arc::new(StopInner {
         set: AtomicBool::new(false),
@@ -55,12 +62,14 @@ pub fn stop_pair() -> (StopHandle, Stop) {
 }
 
 impl Stop {
-    /// Whether the stop has been set.
+    /// Returns whether the stop has been set.
     pub fn is_set(&self) -> bool {
         self.0.set.load(Ordering::Acquire)
     }
 
-    /// Resolves once the stop is set, including from another thread.
+    /// Waits until the stop is set.
+    ///
+    /// The stop may be set from another thread.
     pub async fn wait(&self) {
         let inner = &self.0;
         let _ = inner
@@ -78,7 +87,9 @@ impl StopHandle {
     }
 }
 
-/// The future an async system's launch produces, owning its state and ports.
+/// A launched async system, as a future.
+///
+/// Polling it to completion runs the system until it stops.
 pub type Running = core::pin::Pin<Box<dyn Future<Output = ()>>>;
 
 #[cfg(all(test, feature = "host"))]

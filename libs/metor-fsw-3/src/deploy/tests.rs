@@ -2,18 +2,23 @@ use metor_proto_wkt::LogEvent;
 use serde_json::json;
 
 use super::*;
-use crate::cli::config::{CONFIG_VERSION, TargetConfig};
-use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig, PeerPort, SystemConfig};
+use super::{CONFIG_VERSION, TargetConfig};
+use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig, PeerPort};
+use crate::link::{PUBLISH_TYPE, SUBSCRIBE_TYPE};
 use crate::record::Record;
-use crate::tests::utils::{Recorder, imu_source, table};
+use crate::tests::utils::{Emit, Recorder, Tap, emit, imu_source, table, tap};
 
 fn tables(count: usize) -> Vec<SystemTable> {
     (0..count)
         .map(|_| {
-            let mut table = table(&Recorder::default());
-            table
-                .register(DB_TYPE, imu_source(), i64::default)
-                .expect("valid records");
+            let recorder = Recorder::default();
+            let mut table = table(&recorder);
+            let register = || -> Result<(), crate::BuildError> {
+                table.register(PUBLISH_TYPE, tap(), move || Tap(recorder.clone()))?;
+                table.register(SUBSCRIBE_TYPE, emit(), || Emit(Vec::new()))?;
+                table.register(DB_TYPE, imu_source(), i64::default)
+            };
+            register().expect("valid records");
             table
         })
         .collect()
@@ -46,8 +51,9 @@ fn member(namespace: &str, systems: Vec<SystemConfig>) -> TargetConfig {
     }
 }
 
-/// `a` publishes its `imu` frame and log through `pub`; `b` mirrors both and
-/// runs a db; `a.cmds` subscribes to that db for log messages.
+/// Builds a two-target deployment. `a` publishes its `imu` frame and log
+/// through `pub`. `b` subscribes to both and runs a db. `a.cmds` subscribes
+/// to that db for log messages.
 fn envelope() -> DeploymentConfig {
     let a = member(
         "a",
@@ -60,12 +66,12 @@ fn envelope() -> DeploymentConfig {
                     InputConfig::new("imu.imu", "imu", "imu"),
                     InputConfig::new("noisy.log", "noisy", "log"),
                 ],
-                ..SystemConfig::new("pub", "tap")
+                ..SystemConfig::new("pub", PUBLISH_TYPE)
             },
             SystemConfig {
                 params: peer("b", "db"),
                 outputs: vec![OutputConfig::record("log", "log")],
-                ..SystemConfig::new("cmds", "emit")
+                ..SystemConfig::new("cmds", SUBSCRIBE_TYPE)
             },
         ],
     );
@@ -84,7 +90,7 @@ fn envelope() -> DeploymentConfig {
                         source: OutputSource::Peer(peer_port("a", "pub", "noisy.log")),
                     },
                 ],
-                ..SystemConfig::new("mirror", "emit")
+                ..SystemConfig::new("mirror", SUBSCRIBE_TYPE)
             },
             SystemConfig {
                 params: listen(2250),
@@ -253,12 +259,12 @@ fn test_mirror_of_a_mirror_of_itself_cycles() {
             port: "mirror.imu".into(),
             source: OutputSource::Peer(peer_port(peer_target, "pub", "mirror.imu")),
         }],
-        ..SystemConfig::new("mirror", "emit")
+        ..SystemConfig::new("mirror", SUBSCRIBE_TYPE)
     };
     let publish = SystemConfig {
         params: listen(1),
         inputs: vec![InputConfig::new("mirror.imu", "mirror", "mirror.imu")],
-        ..SystemConfig::new("pub", "tap")
+        ..SystemConfig::new("pub", PUBLISH_TYPE)
     };
     let mut envelope = DeploymentConfig {
         config_version: CONFIG_VERSION,
@@ -287,4 +293,62 @@ fn test_unknown_type_is_a_build_error() {
         resolve(&mut envelope, &tables(2)),
         Err(DeployError::Build { target, source: crate::BuildError::UnknownType { .. } }) if target == "a"
     ));
+}
+
+#[test]
+fn test_non_link_transport_is_untouched() {
+    let mut envelope = envelope();
+    envelope.targets[0].coordinator.systems[0].params = peer("b", "db");
+    let params = envelope.targets[0].coordinator.systems[0].params.clone();
+    resolve(&mut envelope, &tables(2)).expect("resolves");
+    assert!(!unresolved(&envelope));
+    assert_eq!(envelope.targets[0].coordinator.systems[0].params, params);
+}
+
+#[test]
+fn test_undecodable_link_names_itself() {
+    let mut envelope = envelope();
+    envelope.targets[0].coordinator.systems[2].params = json!({ "transport": 5 });
+    assert!(unresolved(&envelope));
+    let Err(DeployError::Params { system, .. }) = resolve(&mut envelope, &tables(2)) else {
+        panic!("a link's params must decode")
+    };
+    assert_eq!(system, "pub");
+}
+
+#[test]
+fn test_resolve_keeps_other_params() {
+    let mut envelope = envelope();
+    envelope.targets[1].coordinator.systems[0].params["conn_cap"] = json!(64);
+    envelope.targets[1].coordinator.systems[1].params["path"] = json!("/db");
+    resolve(&mut envelope, &tables(2)).expect("resolves");
+    let [mirror, db] = &envelope.targets[1].coordinator.systems[..] else {
+        panic!("two systems")
+    };
+    assert_eq!(mirror.params["conn_cap"], 64);
+    assert_eq!(
+        mirror.params["transport"]["connect"]["addr"],
+        "127.0.0.1:2240"
+    );
+    assert_eq!(db.params["path"], "/db");
+    assert_eq!(db.params["transport"]["listen"]["max_connections"], 1);
+}
+
+#[test]
+fn test_stored_slots_resolve_to_themselves() {
+    let def = json!({ "name": "up", "inputs": [], "outputs": [] });
+    let stored = json!({ "path": "/store/x/libup.so", "hash": "00", "def": def, "kind": "dylib" });
+    let slot = SystemConfig {
+        params: json!({ "allow": [{ "name": "up", "ty": "up", "params": null,
+            "source": { "stored": stored } }], "initial": null }),
+        ..SystemConfig::new("mode", crate::dl::SLOT_TYPE)
+    };
+    let mut envelope = envelope();
+    envelope.targets[0].coordinator.systems.push(slot);
+    let before = envelope.clone();
+    resolve_slots(&mut envelope, &tables(2), std::path::Path::new("/no/store")).expect("resolves");
+    assert_eq!(envelope, before);
+    let mut stored = envelope.clone();
+    resolve(&mut stored, &tables(2)).expect("resolves");
+    assert!(!unresolved(&stored));
 }

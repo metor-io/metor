@@ -74,6 +74,15 @@ async fn one_sample(seq: &Seq, imu: &mut Output<Imu>) -> Result<(), SeqError> {
     Ok(())
 }
 
+/// Writes more samples in one poll than its ring holds, then ends.
+#[crate::sequence]
+async fn flood(seq: &Seq, imu: &mut Output<Imu>) -> Result<(), SeqError> {
+    for _ in 0..64 {
+        let _ = imu.write(&Imu::new(seq.now().0, 1.0));
+    }
+    Ok(())
+}
+
 /// Asks for an abort from its second cycle on.
 #[crate::system]
 fn aborter(#[state] cycles: &mut u64, abort: &mut Output<AbortRequest>) {
@@ -143,7 +152,8 @@ fn table(recorder: &Recorder) -> SystemTable {
     table
 }
 
-/// `id`, of type `ty`, with its log drained into the recorder after it.
+/// A config with system `id` of type `ty`, followed by a `log_sink` that
+/// drains its log into the recorder.
 fn logged(id: &str, ty: &str) -> CoordinatorConfig {
     CoordinatorConfig {
         systems: vec![
@@ -165,6 +175,24 @@ fn test_def_reads_abort_first() {
     assert_eq!(inputs, ["abort"]);
     assert_eq!(outputs, ["imu", "log"]);
     assert_eq!(def.name, "one_sample");
+}
+
+#[test]
+fn test_failed_writes_fault_after_the_poll() {
+    let (mut step, rings) = step_of(flood(), ());
+    let mut samples = utils::input::<Imu>(&rings[0]);
+    let mut lines = utils::input::<metor_proto_wkt::LogEvent>(&rings[1]);
+    step.execute(ms(1));
+    assert_eq!(step.ended(), Some(&EndReason::Completed));
+    let landed = samples.drain().count();
+    let lines: Vec<_> = lines.drain().map(|line| line.expect("decodes")).collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].level, LogLevel::Error);
+    assert_eq!(
+        lines[0].fields,
+        vec![("kind".into(), "publish_dropped".into())]
+    );
+    assert_eq!(lines[0].message, format!("{} writes dropped", 64 - landed));
 }
 
 #[test]
@@ -444,7 +472,8 @@ fn commander(#[state] queue: &mut Commands, commands: &mut Output<SequenceComman
     }
 }
 
-/// The test table plus `sequence` as `traced` over `trace`, and a commander.
+/// The test table, plus `sequence` registered as `traced` with `trace` as
+/// its state, and a `commander` that sends `commands`.
 fn traced<S: SequenceFn<State = Trace>>(
     recorder: &Recorder,
     sequence: S,
@@ -463,7 +492,8 @@ fn traced<S: SequenceFn<State = Trace>>(
     table
 }
 
-/// `traced` as `t`, its log drained, aborted by `aborter` from the second cycle.
+/// Runs `traced` as `t` with its log drained. An `aborter` sends it an
+/// abort from the second cycle on.
 fn aborted() -> CoordinatorConfig {
     let mut config = logged("t", "traced");
     config.systems[0]
@@ -475,7 +505,8 @@ fn aborted() -> CoordinatorConfig {
     config
 }
 
-/// `traced` as channel `seq`, driven by `commander`.
+/// Runs `traced` as `t` behind a channel called `seq`, which `commander`
+/// sends commands to.
 fn channeled(start: RunState) -> CoordinatorConfig {
     CoordinatorConfig {
         systems: vec![
@@ -493,7 +524,8 @@ fn channeled(start: RunState) -> CoordinatorConfig {
     }
 }
 
-/// Builds `config` over `sequence`, returning what its handlers ran into.
+/// Builds `config` with `sequence` and runs it, returning the trace its
+/// handlers wrote.
 fn run<S: SequenceFn<State = Trace>>(
     sequence: S,
     config: CoordinatorConfig,
@@ -656,7 +688,7 @@ async fn twin_reads(
     }
 }
 
-/// `imu -> t` as channel `seq`, its log drained.
+/// [`channeled`] with an `imu` feeding `t`, and `t`'s log drained.
 fn sampled() -> CoordinatorConfig {
     let mut config = channeled(RunState::Running);
     config.systems.insert(0, SystemConfig::new("imu", "imu"));
@@ -670,7 +702,7 @@ fn sampled() -> CoordinatorConfig {
     config
 }
 
-/// [`sampled`], with `t`'s valve tapped.
+/// [`sampled`], plus a `tap` that records `t`'s valve commands.
 fn tapped() -> CoordinatorConfig {
     let mut config = sampled();
     config.systems.push(SystemConfig {

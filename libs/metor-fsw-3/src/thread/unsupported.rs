@@ -1,11 +1,13 @@
-//! Placement in a build without OS threads, which refuses every async system.
+//! Thread placement for builds without OS threads. Every async system is
+//! refused.
 
 use std::sync::Arc;
 
 use crate::async_system::AsyncSystem;
 use crate::coordinator::{MakeCx, ParamError, Params, Step};
 
-/// `Threads` holds nothing: there are no groups to run.
+/// A stand-in for the thread registry. Builds without OS threads run no
+/// threads.
 #[derive(Default)]
 pub struct Threads;
 
@@ -15,7 +17,7 @@ impl Threads {
     }
 }
 
-/// Refuses the system `cx` names.
+/// Returns an error naming the system, since async systems need threads.
 pub(crate) fn place<A, M>(_make: Arc<M>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>
 where
     A: AsyncSystem + 'static,

@@ -1,5 +1,6 @@
-//! The [`Step`] trait every bound system is stepped through, how one ends,
-//! and [`catch_step`], which contains a step's panic.
+//! The [`Step`] trait the coordinator uses to run each system, the reasons a
+//! step can end, and [`catch_step`], which stops a panicking step from taking
+//! down the coordinator.
 
 use std::borrow::Cow;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -10,37 +11,44 @@ use metor_proto::types::Timestamp;
 use super::params::ParamError;
 use crate::system::System;
 
-/// A bound system, stepped once per cycle with the system type erased.
+/// A system the coordinator can run.
+///
+/// The coordinator calls [`Step::execute`] once per cycle. The trait hides each
+/// system's concrete type, so systems of any type can share one schedule.
 pub trait Step {
     fn execute(&mut self, now: Timestamp);
 
-    /// Called once after `execute` panicked, with the payload's message.
+    /// Called once after `execute` panics, with the panic message.
     fn fault(&mut self, _now: Timestamp, _message: &str) {}
 
-    /// How the step ended, once it has. An ended step is not executed again.
+    /// Returns why the step ended, or `None` while it is still running.
+    ///
+    /// The coordinator never executes a step that has ended.
     fn ended(&self) -> Option<&EndReason> {
         None
     }
 
-    /// Replaces what this step runs with the system `name` names.
+    /// Replaces the system this step runs with the system called `name`.
     fn load(&mut self, _name: &str) -> Result<(), LoadError> {
         Err(LoadError::NotLoadable)
     }
 
-    /// What this step has loaded, if it loads anything.
+    /// Returns the system this step has loaded, if any.
     fn occupant(&self) -> Option<&Occupant> {
         None
     }
 }
 
-/// One loaded system, as a channel's status reports it.
+/// Identifies the system loaded into a step.
+///
+/// A channel reports it in its status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Occupant {
-    /// Its index among the names the step can load.
+    /// The system's index in the list of names the step can load.
     pub index: u32,
-    /// Its library's file name.
+    /// The file name of the library the system came from.
     pub artifact: FrameStr<64>,
-    /// The blake3 of its library.
+    /// The blake3 hash of that library.
     pub hash: FrameBytes<32>,
 }
 
@@ -51,11 +59,11 @@ pub enum EndReason {
     Aborted,
     Failed(Cow<'static, str>),
     Panicked,
-    /// A slot with no occupant.
+    /// The step is a slot with nothing loaded.
     Unloaded,
 }
 
-/// Why a step refused a `Load`.
+/// The reason a step refused a load request.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LoadError {
     #[error("nothing can be loaded here")]
@@ -72,13 +80,13 @@ pub enum LoadError {
     Create(ParamError),
 }
 
-/// What one [`catch_step`] call did.
+/// The outcome of one [`catch_step`] call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stepped {
     Ran,
-    /// The step reports an end, before or after this call's execute.
+    /// The step has ended, either before this call or during it.
     Ended,
-    /// The step panicked and was dropped, now or on an earlier call.
+    /// The step panicked and was dropped, during this call or an earlier one.
     Unwound,
 }
 
@@ -100,7 +108,10 @@ impl<S: System> Step for Runner<S> {
     }
 }
 
-/// Executes a step that has not ended, faulting and dropping it if it panics.
+/// Executes the step in `slot` unless it has ended.
+///
+/// If `execute` panics, the step's `fault` hook runs and the step is dropped,
+/// leaving `slot` empty.
 pub(crate) fn catch_step(slot: &mut Option<Box<dyn Step>>, now: Timestamp) -> Stepped {
     let Some(step) = slot.as_mut() else {
         return Stepped::Unwound;

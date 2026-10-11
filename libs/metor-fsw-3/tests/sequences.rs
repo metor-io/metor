@@ -1,5 +1,7 @@
-//! The fixture's slot under `metor run` and `metor build`: commands in over
-//! a `Subscribe`, events and the registry out over a `Publish`.
+//! Tests the fixture's sequence slot under `metor run` and `metor build`.
+//!
+//! Commands arrive through a `Subscribe`. Sequence events and the registry go
+//! out through a `Publish`.
 
 mod common;
 
@@ -17,7 +19,7 @@ use metor_proto_wkt::{
 use stellarator::io::{OwnedReader, OwnedWriter};
 use stellarator::net::TcpStream;
 
-/// Cycles the target runs before it exits on its own.
+/// How many cycles the target runs before it exits on its own.
 const CYCLES: &str = "60000";
 
 const PORTS_ENV: &str = "METOR_SLOT_PORTS";
@@ -38,7 +40,8 @@ fn run(ports: &[u16; 2]) -> Running {
     Running(child)
 }
 
-/// What the publish link carries that a channel test reads.
+/// A client of the target's `Publish` link, which reads what the channel
+/// tests check.
 struct Downlink {
     rx: PacketStream<OwnedReader<TcpStream>>,
     buf: Vec<u8>,
@@ -48,7 +51,8 @@ struct Downlink {
 }
 
 impl Downlink {
-    /// Reads until `mode` reports an event, keeping what else it sees.
+    /// Reads packets until `mode` reports an event. Other packets it
+    /// understands are recorded along the way.
     async fn event(&mut self) -> SequenceEventKind {
         loop {
             if let Some(kind) = self.next().await {
@@ -57,7 +61,7 @@ impl Downlink {
         }
     }
 
-    /// Reads one packet, returning the event it carries for `mode`.
+    /// Reads one packet. Returns the event it carries for `mode`, if any.
     async fn next(&mut self) -> Option<SequenceEventKind> {
         let taken = core::mem::take(&mut self.buf);
         let packet = self.rx.next_grow(taken).await.expect("the link stays up");
@@ -87,7 +91,7 @@ impl Downlink {
         None
     }
 
-    /// Reads until a registry arrives; it is rewritten once a second.
+    /// Reads until a registry arrives. The target sends one every second.
     async fn registry(&mut self) -> SequenceRegistry {
         within("no registry", async {
             while self.registry.is_none() {
@@ -98,7 +102,7 @@ impl Downlink {
         self.registry.take().expect("read above")
     }
 
-    /// The next event, failing the test at the deadline.
+    /// Returns the next event, failing the test at the deadline.
     async fn expect(&mut self, what: &str) -> SequenceEventKind {
         within(&format!("no event: {what}"), self.event()).await
     }

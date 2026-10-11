@@ -1,35 +1,56 @@
-//! The slot pass: each `fsw.dl_slot` candidate's library copied into the
-//! store, and its path, hash, and ports written into the slot's params.
+//! Resolves the candidates of every `fsw.dl_slot` in a deployment.
+//!
+//! A slot lists candidate systems from packs. For each candidate, `metor
+//! build` copies the pack's library into the store and writes its path, hash,
+//! and ports into the slot's params, so the target can load it without the
+//! pack at run time.
 
 use std::path::Path;
 
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 
+use super::DeploymentConfig;
 use crate::FrameStr;
-use crate::cli::config::{DeploymentConfig, PackRef};
 use crate::coordinator::{SystemConfig, SystemTable};
 use crate::def::{DefCx, DefError};
-use crate::dl::{Pack, SLOT_TYPE, slot::same_ports, store};
+use crate::dl::slot::{Candidate, SlotParams, Source, Stored, same_ports};
+use crate::dl::{Pack, PackRef, SLOT_TYPE, store};
 use crate::pack::def::DefCxOwned;
 use crate::system::SystemDef;
 
 use super::error::DeployError;
 use super::index::{At, DefIndex};
 
-/// The longest library file name a channel's status can carry.
+/// The longest library file name that fits in a channel's status frame.
 const ARTIFACT_CAP: usize = FrameStr::<64>::CAPACITY;
 
-/// Whether any slot in `envelope` has a candidate `metor build` has not resolved.
+/// Returns true if any slot in `envelope` has a candidate that is not yet
+/// resolved.
 pub(crate) fn unresolved(envelope: &DeploymentConfig) -> bool {
     first_unresolved(envelope).is_some()
 }
 
+/// Returns true if `system` is a slot with a candidate that still points at a
+/// pack.
+///
+/// Also returns true if the slot's params do not decode, so that
+/// `resolve_slots` runs and reports the error.
 fn unresolved_slot(system: &SystemConfig) -> bool {
-    system.ty == SLOT_TYPE && candidates(&system.params).any(|c| !resolved(c))
+    if system.ty != SLOT_TYPE {
+        return false;
+    }
+    match SlotParams::deserialize(&system.params) {
+        Ok(params) => params
+            .allow
+            .iter()
+            .any(|candidate| matches!(candidate.source, Source::Pack(_))),
+        Err(_) => true,
+    }
 }
 
-/// The first slot in step order with a candidate still to resolve.
+/// Returns the first slot, in step order, that still has a candidate to
+/// resolve.
 fn first_unresolved(envelope: &DeploymentConfig) -> Option<At> {
     envelope.targets.iter().enumerate().find_map(|(t, target)| {
         let systems = &target.coordinator.systems;
@@ -38,10 +59,11 @@ fn first_unresolved(envelope: &DeploymentConfig) -> Option<At> {
     })
 }
 
-/// Resolves every slot in `envelope`, putting candidate libraries in `store`.
+/// Resolves every slot in `envelope`, copying candidate libraries into
+/// `store`.
 ///
-/// Slots resolve in step order, one at a time, so a slot reading another
-/// slot's output sees that slot's baked ports.
+/// Slots are resolved one at a time, in step order. That way, when a slot
+/// reads another slot's output, the other slot's ports are already known.
 pub fn resolve_slots(
     envelope: &mut DeploymentConfig,
     tables: &[SystemTable],
@@ -76,23 +98,8 @@ fn resolve_slot(
     cx.params(&system.params, store)
 }
 
-/// Whether build has written a candidate's path, hash, and ports.
-fn resolved(candidate: &Value) -> bool {
-    ["path", "hash", "def"]
-        .iter()
-        .all(|key| candidate.get(key).is_some_and(|v| !v.is_null()))
-        && candidate.get("pack").is_none()
-}
-
-fn candidates(params: &Value) -> impl Iterator<Item = &Value> {
-    params
-        .get("allow")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-}
-
-/// What a slot's candidates compute their ports under: the slot's own config.
+/// The context a slot's candidates compute their ports in. It comes from the
+/// slot's own config, so every candidate sees the same edges.
 struct SlotCx {
     slot: String,
     cx: DefCxOwned,
@@ -106,64 +113,66 @@ impl SlotCx {
         }
     }
 
-    /// The slot's params with every candidate resolved.
+    /// Returns the slot's params with every candidate resolved.
+    ///
+    /// Every candidate must have the same ports as the first one.
     fn params(&self, params: &Value, store: &Path) -> Result<Value, DeployError> {
-        let mut params = params.clone();
-        let allow = params
-            .get_mut("allow")
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| self.fail("the slot has no `allow` list".into()))?;
+        let mut params = SlotParams::deserialize(params).map_err(|e| self.fail(e.to_string()))?;
         let mut first: Option<(String, SystemDef)> = None;
-        for candidate in allow {
-            let candidate = candidate
-                .as_object_mut()
-                .ok_or_else(|| self.fail("a candidate is not an object".into()))?;
-            let (name, def) = self.candidate(candidate, store)?;
+        for candidate in &mut params.allow {
+            let def = self.resolve(candidate, store)?;
             match &first {
                 Some((first, first_def)) if !same_ports(first_def, &def) => {
                     return Err(DeployError::SlotContract {
                         slot: self.slot.clone(),
                         first: first.clone(),
-                        candidate: name,
+                        candidate: candidate.name.clone(),
                     });
                 }
                 Some(_) => {}
-                None => first = Some((name, def)),
+                None => first = Some((candidate.name.clone(), def)),
             }
         }
-        Ok(params)
+        serde_json::to_value(&params).map_err(|e| self.fail(e.to_string()))
     }
 
-    /// Stores one candidate's library or module and writes its path, hash,
-    /// ports, and the pack's kind and limits.
-    fn candidate(
+    /// Copies a pack candidate's library into the store and points the
+    /// candidate at the stored copy. Returns the candidate's ports.
+    fn resolve(&self, candidate: &mut Candidate, store: &Path) -> Result<SystemDef, DeployError> {
+        let stored = match &candidate.source {
+            Source::Stored(stored) => return Ok(stored.def.clone()),
+            Source::Pack(pack) => self.store(candidate, pack, store)?,
+        };
+        let def = stored.def.clone();
+        candidate.source = Source::Stored(stored);
+        Ok(def)
+    }
+
+    /// Copies a candidate's library or module into the store.
+    ///
+    /// Returns the stored entry, which records the candidate's ports and the
+    /// pack's kind and limits.
+    fn store(
         &self,
-        candidate: &mut Map<String, Value>,
+        candidate: &Candidate,
+        pack: &PackRef,
         store: &Path,
-    ) -> Result<(String, SystemDef), DeployError> {
-        let (name, ty) = (self.text(candidate, "name")?, self.text(candidate, "ty")?);
-        let pack = candidate
-            .get("pack")
-            .ok_or_else(|| self.fail(format!("`{name}` names no pack")))?;
-        let pack = PackRef::deserialize(pack).map_err(|e| self.fail(e.to_string()))?;
+    ) -> Result<Stored, DeployError> {
         let artifact = pack.artifact();
         self.check_name(&artifact)?;
-        let within = |e: String| self.fail(format!("`{name}`: {e}"));
+        let within = |e: String| self.fail(format!("`{}`: {e}", candidate.name));
         let opened = pack.open().map_err(|e| within(e.to_string()))?;
-        let params = candidate.get("params").unwrap_or(&Value::Null);
         let def = self
-            .def(&opened, &ty, params)
+            .def(&opened, &candidate.ty, &candidate.params)
             .map_err(|e| within(e.to_string()))?;
-        let stored = store::put(store, &artifact).map_err(|e| within(e.to_string()))?;
-        candidate.remove("pack");
-        candidate.insert("path".into(), json!(stored.path));
-        candidate.insert("hash".into(), json!(stored.hash.to_hex().as_str()));
-        candidate.insert("def".into(), json!(def));
-        candidate.insert("kind".into(), json!(pack.kind));
-        if let Value::Object(limits) = json!(pack.limits) {
-            candidate.extend(limits);
-        }
-        Ok((name, def))
+        let put = store::put(store, &artifact).map_err(|e| within(e.to_string()))?;
+        Ok(Stored {
+            path: put.path,
+            hash: put.hash.to_hex().to_string(),
+            def,
+            kind: pack.kind,
+            limits: pack.limits,
+        })
     }
 
     fn def(&self, pack: &Pack, ty: &str, params: &Value) -> Result<SystemDef, DefError> {
@@ -175,15 +184,8 @@ impl SlotCx {
         pack.def(ty, &cx)
     }
 
-    fn text(&self, candidate: &Map<String, Value>, key: &str) -> Result<String, DeployError> {
-        candidate
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| self.fail(format!("a candidate has no `{key}`")))
-    }
-
-    /// Refuses a library whose file name the channel's status cannot carry.
+    /// Returns an error if a library's file name is too long for the
+    /// channel's status frame.
     fn check_name(&self, artifact: &Path) -> Result<(), DeployError> {
         let name = artifact
             .file_name()

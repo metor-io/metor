@@ -1,4 +1,5 @@
-//! `Subscribe`: the records a target is sent, written onto its rings.
+//! `Subscribe`, the link that receives records from peers and writes them
+//! onto the target's output ports.
 
 use std::rc::Rc;
 
@@ -16,43 +17,42 @@ use crate::{Stop, system};
 
 use super::conn::{self, Connections, Event};
 use super::inbox::{self, Inbox};
-use super::transport::{Endpoint, Transport, source};
+use super::transport::{Endpoint, source};
 use super::wire;
-use super::{LinkStatus, default_conn_cap, report};
+use super::{LinkParams, LinkStatus, default_conn_cap, report};
 
-/// Records a link holds for its ports, at least, before it drops one.
+/// The default minimum number of records the inbox holds before it starts
+/// dropping them.
 fn default_inbound_cap() -> usize {
     256
 }
 
-/// What a `Subscribe` is configured with.
+/// The configuration for a [`Subscribe`].
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SubscribeParams {
-    pub transport: Transport,
-    /// The target's telemetry namespace, which its identity carries.
-    #[serde(default)]
-    pub namespace: Option<String>,
-    /// This link's name, so a peer can tell one of a target's links from another.
-    #[serde(default)]
-    pub link: String,
-    /// The size of the per-connection pending write buffer.
+    #[serde(flatten)]
+    pub link: LinkParams,
+    /// The size in bytes of each connection's pending write buffer. It also
+    /// sizes each connection's receive buffer.
     #[serde(default = "default_conn_cap")]
     pub conn_cap: usize,
     #[serde(default = "default_inbound_cap")]
     pub inbound_cap: usize,
 }
 
-/// Writes every record its peers send onto the port that carries it.
+/// A link that receives records from its peers and writes each one onto the
+/// output port for that record's id.
 pub struct Subscribe {
     endpoint: Option<Endpoint>,
     params: SubscribeParams,
 }
 
 impl Subscribe {
-    /// Binds the transport, so a taken address fails the build.
+    /// Binds the transport. This happens at build time, so a taken address
+    /// fails the build.
     pub fn new(params: SubscribeParams) -> Result<Self, ParamError> {
-        let endpoint = params.transport.bind()?;
-        super::record_bound(&params.link, &endpoint);
+        let endpoint = params.link.transport.bind()?;
+        super::record_bound(&params.link.link, &endpoint);
         Ok(Self {
             endpoint: Some(endpoint),
             params,
@@ -60,8 +60,13 @@ impl Subscribe {
     }
 }
 
-/// Tells each peer what it may send, or asks a dialed peer for its
-/// message streams, then routes what arrives by its id.
+/// Runs the `Subscribe` link.
+///
+/// A listening link sends each peer a `LinkInfo` listing the messages it
+/// accepts. A dialing link instead asks its peer to stream those messages,
+/// and checks that the peer announces every table an output port expects.
+/// Either way, every packet that arrives is routed to an output port by its
+/// type and id.
 #[system]
 pub async fn subscribe(
     #[state] s: &mut Subscribe,
@@ -78,14 +83,14 @@ pub async fn subscribe(
     let msgs: Vec<PacketId> = ids(&ports, PacketTy::Msg);
     let table_ids: Vec<PacketId> = tables.iter().map(|(id, _)| *id).collect();
     let SubscribeParams {
-        namespace,
-        link,
+        link: LinkParams {
+            namespace, link, ..
+        },
         conn_cap,
         inbound_cap,
-        ..
     } = &s.params;
 
-    // PANIC Safety: a system runs once, and the endpoint is the bind's.
+    // PANIC Safety: `new` always sets the endpoint, and a system runs once.
     let endpoint = s.endpoint.take().expect("one run per instance");
     if let Some(addr) = endpoint.local_addr() {
         log.info(format!("listening on {addr}"));
@@ -137,8 +142,10 @@ pub async fn subscribe(
     }
 }
 
-/// Faults each frame port whose table the peer never announced, which is what
-/// a peer rebuilt with a changed frame looks like.
+/// Logs a fault for each frame port whose table the peer did not announce.
+///
+/// This usually means the peer was rebuilt with a changed frame type, so its
+/// table id no longer matches.
 fn report_unannounced(inbox: &Inbox, tables: &[(PacketId, String)], log: &mut Log) {
     for id in inbox.unannounced_iter() {
         let Some((_, port)) = tables.iter().find(|(table, _)| *table == id) else {
@@ -151,18 +158,22 @@ fn report_unannounced(inbox: &Inbox, tables: &[(PacketId, String)], log: &mut Lo
     }
 }
 
-/// The ports records are routed to, each by the packet type and id its
-/// records arrive under, the longest record any takes, and the frame ports
-/// by table id.
+/// The routing table for a `Subscribe`'s output ports.
 struct Routes<'a> {
+    /// Each output port, keyed by the packet type and id its records arrive
+    /// under.
     ports: Vec<(PacketTy, PacketId, &'a mut Output<Bytes>)>,
+    /// The longest record any port accepts.
     max_len: usize,
+    /// The table id and name of every frame port.
     tables: Vec<(PacketId, String)>,
 }
 
-/// A message port takes its record's id, a frame port its vtable's table id.
-/// A second port under an id an earlier port took is faulted and skipped,
-/// since no peer could address it separately.
+/// Builds the routing table for `outputs`.
+///
+/// A message port is keyed by its message id, and a frame port by its
+/// vtable's table id. If a port has the same key as an earlier port, it is
+/// skipped and a fault is logged, since no peer could address it separately.
 fn routes<'a>(outputs: &'a mut DynOutputs, log: &mut Log) -> Routes<'a> {
     let mut routes = Routes {
         ports: Vec::new(),
@@ -194,7 +205,7 @@ fn routes<'a>(outputs: &'a mut DynOutputs, log: &mut Log) -> Routes<'a> {
     routes
 }
 
-/// The ids of the ports routed under packet type `ty`.
+/// Returns the ids of the ports with packet type `ty`.
 fn ids(ports: &[(PacketTy, PacketId, &mut Output<Bytes>)], ty: PacketTy) -> Vec<PacketId> {
     ports
         .iter()
@@ -203,7 +214,8 @@ fn ids(ports: &[(PacketTy, PacketId, &mut Output<Bytes>)], ty: PacketTy) -> Vec<
         .collect()
 }
 
-/// Writes every waiting record onto its port, counting the ones no ring took.
+/// Writes every record waiting in the inbox onto its port. Returns how many
+/// records were dropped because the port's ring was full.
 fn deliver(
     view: &mut View<Notifier>,
     ports: &mut [(PacketTy, PacketId, &mut Output<Bytes>)],
@@ -241,7 +253,7 @@ mod tests {
 
     use super::*;
 
-    /// A packet's body as the wire carries it.
+    /// Builds a packet body in its wire format.
     fn body(ty: PacketTy, id: PacketId, payload: &[u8]) -> Vec<u8> {
         let mut body = vec![ty as u8, id[0], id[1], 0];
         body.extend_from_slice(payload);
@@ -256,7 +268,7 @@ mod tests {
         R::schema().packet_id()
     }
 
-    /// One `Fixed` port and one `Note` port, as the config would list them.
+    /// Builds a `Fixed` port and a `Note` port, as a config would list them.
     fn ports(rings: &[RingBuffer; 2]) -> DynOutputs {
         bind(
             [
@@ -289,7 +301,7 @@ mod tests {
         .expect("a small ring")
     }
 
-    /// One `Fixed` message port and one `Imu` frame port.
+    /// Builds a `Fixed` message port and an `Imu` frame port.
     fn mixed(rings: &[RingBuffer; 2]) -> DynOutputs {
         bind(
             [
@@ -358,15 +370,16 @@ mod tests {
 
     #[test]
     fn test_port_rejects_oversized_record() {
-        // Both rings hold the longest record, so only a port's own bound can
-        // refuse one routed to the shorter port.
+        // Both rings fit the longest record, so only the port's own length
+        // limit can reject a long record sent to the shorter port.
         let rings = [ring::<Note>(2, 1), ring::<Note>(2, 1)];
         let mut outputs = ports(&rings);
         let Routes {
             mut ports, max_len, ..
         } = routes(&mut outputs, &mut Log);
         let mut fixed = rings[0].view(NoWake).expect("a free slot");
-        // The inbox bounds by the longest routed record, which is another port's.
+        // The inbox accepts records up to the longest port's limit, which here
+        // belongs to the other port.
         assert!(Fixed::MAX_LEN < 60 && 60 <= max_len);
         let (inbox, mut view) = inbox(2);
         inbox.accept(&msg(id_of::<Fixed>(), &[0u8; 60]));
@@ -389,8 +402,8 @@ mod tests {
         assert_eq!(ports[0].1, id_of::<Fixed>());
     }
 
-    /// Two ports of one frame under different names are two tables; two
-    /// carrying one announced table are one route.
+    /// Two ports of the same frame type under different names have different
+    /// tables. Two ports that share one table get a single route.
     #[test]
     fn test_reject_duplicate_table_route() {
         let rings = [ring::<Imu>(2, 1), ring::<Imu>(2, 1)];
@@ -427,7 +440,7 @@ mod tests {
         let mut log = Log;
         let Routes { mut ports, .. } = routes(&mut outputs, &mut log);
         let (inbox, mut view) = inbox(8);
-        // The consumer reads nothing, so the ring fills and writes start failing.
+        // Nothing reads the ring, so it fills up and writes start failing.
         let _note = rings[1].view(NoWake).expect("a free slot");
         let mut full = 0;
         for _ in 0..64 {

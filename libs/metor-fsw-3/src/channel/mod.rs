@@ -1,8 +1,9 @@
-//! Channels: systems commanded from outside the target by name.
+//! Channels: named handles for commanding a system from outside the target.
 //!
-//! A channel's commands arrive as `SequenceCommand` messages. [`Abort`] is
-//! how a system hears an abort, and [`ChannelStatus`] is the state a channel
-//! reports each cycle.
+//! An operator starts, stops, aborts, resets, or loads a system by sending
+//! `SequenceCommand` messages addressed to its channel's name. Each cycle
+//! the channel reports its state as a [`ChannelStatus`]. A system hears
+//! abort requests through an [`Abort`] parameter.
 
 #[cfg(feature = "host")]
 mod adapter;
@@ -18,17 +19,22 @@ use crate::coordinator::{EndReason, RunState};
 use crate::port::Input;
 use crate::{Frame, FrameBytes, FrameStr, MaxSize, Record, Schema, Timestamp};
 
-/// Asks a system to finish what it is doing and stop.
+/// A request for a system to finish what it is doing and stop.
 #[derive(Record, MaxSize, Schema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AbortRequest {}
 
-/// The port an abort arrives on, whatever the parameter is called.
+/// The input that abort requests arrive on.
+///
+/// An [`Abort`] parameter always reads this port, whatever it is called.
 pub const ABORT_PORT: &str = "abort";
-/// The input a channel reads its commands from.
+/// The input that a channel reads commands from.
 pub const COMMANDS_PORT: &str = "commands";
-/// The output a channel reports each accepted or refused command on.
+/// The output where a channel reports its events.
+///
+/// Events include each accepted or refused command, and how the system
+/// ended.
 pub const EVENTS_PORT: &str = "events";
-/// The output a channel writes its [`ChannelStatus`] to each cycle.
+/// The output that a channel writes its [`ChannelStatus`] to each cycle.
 pub const STATUS_PORT: &str = "channel_status";
 
 #[cfg(feature = "host")]
@@ -38,7 +44,7 @@ pub(crate) use adapter::{def, make, ports};
 pub use apply::{Command, Refusal, State, apply};
 pub use registry::{ChannelSpec, Registry, RegistryParams, channel_registry};
 
-/// Whether an abort has been asked for, read from the system's `abort` input.
+/// A system parameter that reports whether an abort was requested.
 pub struct Abort<W: WakeSink = NoWake> {
     input: Input<AbortRequest, W>,
     requested: bool,
@@ -52,7 +58,9 @@ impl<W: WakeSink> Abort<W> {
         }
     }
 
-    /// Whether an abort has arrived; once true it stays true.
+    /// Returns whether an abort has been requested.
+    ///
+    /// Once this returns true, it keeps returning true.
     pub fn requested(&mut self) -> bool {
         if self.input.drain().count() > 0 {
             self.requested = true;
@@ -61,7 +69,7 @@ impl<W: WakeSink> Abort<W> {
     }
 }
 
-/// One channel's state, written every cycle.
+/// A channel's state, written every cycle.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[repr(C)]
 pub struct ChannelStatus {
@@ -69,15 +77,18 @@ pub struct ChannelStatus {
     pub timestamp: Timestamp,
     /// A [`ChannelState`] code.
     pub state: u32,
-    /// The occupant's index in the registry's `available`, or `u32::MAX`.
+    /// The loaded occupant's index in the registry's `available` list, or
+    /// `u32::MAX` if nothing is loaded.
     pub loaded: u32,
-    /// The occupant's library file name; empty when there is none.
+    /// The file name of the occupant's library, or empty if nothing is
+    /// loaded.
     pub artifact: FrameStr<64>,
-    /// The blake3 of the occupant's library; zeros when there is none.
+    /// The blake3 hash of the occupant's library, or zeros if nothing is
+    /// loaded.
     pub hash: FrameBytes<32>,
 }
 
-/// What [`ChannelStatus::state`] reports.
+/// The states a channel reports in [`ChannelStatus::state`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelState {
     Running,
@@ -90,7 +101,10 @@ pub enum ChannelState {
 }
 
 impl ChannelState {
-    /// A channel's state: its end if it has one, otherwise its run state.
+    /// Returns a channel's state.
+    ///
+    /// If the channel has ended, this is how it ended. Otherwise it is the
+    /// channel's run state.
     pub fn of(run: RunState, end: Option<&EndReason>) -> Self {
         match (end, run) {
             (Some(EndReason::Completed), _) => Self::Completed,
@@ -103,7 +117,7 @@ impl ChannelState {
         }
     }
 
-    /// The word written to [`ChannelStatus::state`].
+    /// Returns the code written to [`ChannelStatus::state`].
     pub fn code(self) -> u32 {
         self as u32
     }

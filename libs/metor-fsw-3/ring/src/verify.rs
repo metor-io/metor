@@ -372,10 +372,12 @@ fn try_latest_pins() {
     assert_eq!(v.try_latest(), Ok(Some(&[y][..])), "still the newest");
 }
 
-/// Symbolic data bytes, written as words to shorten the loop.
+/// Fills the data region with symbolic bytes.
+///
+/// It writes whole words to keep the loop short.
 ///
 /// # Safety
-/// `base` is the sole handle's region of `REGION` bytes.
+/// `base` points to a region of `REGION` bytes that no other handle uses.
 unsafe fn fill_data(base: *mut u8) {
     for i in 0..CAP / 8 {
         // SAFETY: word `i` lies within the data region (caller contract).
@@ -389,7 +391,7 @@ unsafe fn fill_data(base: *mut u8) {
 }
 
 /// # Safety
-/// `base` is the sole handle's region of `REGION` bytes.
+/// `base` points to a region of `REGION` bytes that no other handle uses.
 unsafe fn write_control(base: *mut u8, committed: u64, hwm: u64) {
     // SAFETY: the control words lie within the region (caller contract).
     unsafe {
@@ -470,7 +472,7 @@ fn corrupt_latest_never_ub() {
 }
 
 /// # Safety
-/// `base` is the sole handle's region of `REGION` bytes.
+/// `base` points to a region of `REGION` bytes that no other handle uses.
 unsafe fn write_peer_words(base: *mut u8) {
     // SAFETY: the control words and the first reader slot lie within the region.
     unsafe {

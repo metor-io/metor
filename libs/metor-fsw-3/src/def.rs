@@ -1,4 +1,7 @@
-//! The instance config a type computes its [`SystemDef`](crate::SystemDef) from.
+//! The config context a system uses to compute its [`SystemDef`](crate::SystemDef).
+//!
+//! Most systems declare fixed ports and ignore it. Systems whose ports come
+//! from config, like links, read their ports from it.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -8,20 +11,24 @@ use serde::{Deserialize, Serialize};
 use crate::coordinator::OutputConfig;
 use crate::system::PortDef;
 
-/// What a type sees of one instance's config when it computes its def.
+/// The part of one instance's config a system sees when computing its ports.
 pub struct DefCx<'a> {
-    /// The instance this def is for.
+    /// The ID of the instance being defined.
     pub id: &'a str,
-    /// The target's namespace, which announced names hang under.
+    /// The target's namespace.
+    ///
+    /// Every name the instance announces is prefixed with it.
     pub namespace: Option<&'a str>,
-    /// One entry per config edge: the input port it names and the def of the
-    /// output feeding it.
+    /// The instance's connected inputs.
+    ///
+    /// Each entry pairs an input port name with the definition of the output
+    /// that feeds it.
     pub inputs: &'a [(&'a str, &'a PortDef)],
-    /// Each config output port and the record it names.
+    /// The output ports listed in the config, with the record each one carries.
     pub outputs: &'a [OutputConfig],
-    /// Every record the table knows.
+    /// Every record the system table knows about.
     pub records: &'a Records,
-    /// The instance's params.
+    /// The instance's params from the config.
     pub params: &'a serde_json::Value,
 }
 
@@ -29,7 +36,10 @@ static NO_RECORDS: LazyLock<Records> = LazyLock::new(Records::default);
 static NO_PARAMS: serde_json::Value = serde_json::Value::Null;
 
 impl DefCx<'static> {
-    /// The context with nothing in it: the def the descriptor carries.
+    /// Returns a context with nothing in it.
+    ///
+    /// A system's definition under this context is the one its descriptor
+    /// carries.
     pub fn empty() -> Self {
         Self {
             id: "",
@@ -43,8 +53,10 @@ impl DefCx<'static> {
 }
 
 impl DefCx<'_> {
-    /// Where port `port`'s components hang: `{namespace}.{id}.{port}`,
-    /// skipping the parts this context lacks.
+    /// Returns the path that port `port` announces its components under.
+    ///
+    /// The path is `{namespace}.{id}.{port}`, leaving out any part that is
+    /// empty.
     pub fn root(&self, port: &str) -> String {
         [self.namespace.unwrap_or(""), self.id, port]
             .into_iter()
@@ -54,7 +66,7 @@ impl DefCx<'_> {
     }
 }
 
-/// A `DefError` is why a type refused its instance config.
+/// An error from computing a system's ports from its config.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum DefError {
     #[error("input `{port}` takes one producer")]
@@ -79,12 +91,15 @@ pub enum DefError {
     SampleOnAsync { system: String },
 }
 
-/// Every record a table knows, by name.
+/// Every record a system table knows about, looked up by name.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Records(HashMap<String, Option<PortDef>>);
 
 impl Records {
-    /// Collects ports by record name, keeping `None` where two disagree.
+    /// Collects the records that `ports` carry.
+    ///
+    /// If two ports carry different records under the same name, that name is
+    /// marked as a conflict.
     pub fn of<'a>(ports: impl Iterator<Item = &'a PortDef>) -> Self {
         let mut records = HashMap::new();
         for port in ports {
@@ -101,7 +116,9 @@ impl Records {
         Self(records)
     }
 
-    /// The record `record` names, as a port called `port`.
+    /// Returns a definition for a port called `port` that carries `record`.
+    ///
+    /// Fails if the record is unknown, or if two ports declared it differently.
     pub fn port(&self, port: &str, record: &str) -> Result<PortDef, DefError> {
         match self.0.get(record) {
             Some(Some(def)) => Ok(PortDef {

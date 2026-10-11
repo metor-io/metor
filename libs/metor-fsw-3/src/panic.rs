@@ -1,4 +1,4 @@
-//! Containment for user callbacks and ABI exports.
+//! Keeps panics in user code from unwinding into the runtime or across an ABI.
 
 use core::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -16,7 +16,9 @@ pub(crate) fn catch<T>(f: impl FnOnce() -> T) -> Option<T> {
     }
 }
 
-/// The text a panic payload carries, or `"panic"` for any other payload.
+/// Returns a panic payload's message.
+///
+/// Returns `"panic"` if the payload is not a string.
 pub(crate) fn message(payload: &(dyn Any + Send)) -> &str {
     if let Some(text) = payload.downcast_ref::<&str>() {
         return text;
@@ -35,8 +37,10 @@ pub(crate) fn discard(payload: Payload) {
     }
 }
 
-/// Logs each panic as an `error!` with `kind = "panic"`. A wasm32 panic
-/// aborts the instance, so this line is the guest's only report of it.
+/// Logs each panic as an `error!` with `kind = "panic"`.
+///
+/// A panic in a wasm guest aborts the instance, so this line is the only
+/// report of it.
 #[cfg(target_family = "wasm")]
 pub(crate) fn log_panics() {
     std::panic::set_hook(Box::new(|info| {
@@ -44,8 +48,9 @@ pub(crate) fn log_panics() {
     }));
 }
 
-/// Leaves the hook alone: a native panic unwinds to `catch_step`, which
-/// reports it.
+/// Does nothing on native targets.
+///
+/// A native panic unwinds to `catch_step`, which reports it.
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn log_panics() {}
 

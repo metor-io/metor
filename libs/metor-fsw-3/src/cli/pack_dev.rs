@@ -1,22 +1,24 @@
-//! `metor pack dev`: build a pack and lay out the editable module beside it,
-//! and with `wasm = true` build and check the pack's module too.
+//! `metor pack dev` builds a pack and writes its editable Python module.
+//!
+//! The module lands in `.metor/` next to the pack, so a target in the same
+//! workspace can import it without installing a wheel. A pack with
+//! `wasm = true` is also built as a wasm module, which is checked against the
+//! native library.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use super::cargo::{
-    CargoError, PackConfig, cargo_build, cdylib_name, copy_atomic, triple, wasm_build, write_atomic,
-};
-use super::config::{PackKind, PackRef};
+use super::cargo::{CargoError, PackConfig, cargo_build, wasm_build};
 use super::module::render;
 use crate::coordinator::SystemKind;
-use crate::dl::{DlPack, Pack, PackError};
+use crate::dl::store::{copy_atomic, write_atomic};
+use crate::dl::{DlPack, Pack, PackError, PackKind, PackRef, cdylib_name, triple};
 use crate::pack::ABI_VERSION;
 use crate::pack::def::PackDef;
 
 static BUILD: Mutex<()> = Mutex::new(());
 
-/// A `PackDevError` is why a pack's editable module was not laid out.
+/// An error building a pack or writing its editable module.
 #[derive(Debug, thiserror::Error)]
 pub enum PackDevError {
     #[error("reading {path}: {source}")]
@@ -58,7 +60,8 @@ pub enum PackDevError {
 }
 
 impl PackDevError {
-    /// Maps a failed write of `path`.
+    /// Returns a closure that turns an IO error into a `Write` error for
+    /// `path`.
     fn write(path: &Path) -> impl FnOnce(std::io::Error) -> Self + '_ {
         |source| Self::Write {
             path: path.to_path_buf(),
@@ -67,11 +70,12 @@ impl PackDevError {
     }
 }
 
-/// Builds the pack at `root` and writes `<root>/.metor/<module>/`.
+/// Builds the pack at `root` and writes its module to
+/// `<root>/.metor/<module>/`.
 ///
-/// Calls are serialized. Loaded artifacts must remain at their staged paths;
-/// rebuilding one requires a fresh process.
-/// The laid-out paths are printed on stderr, cargo's own stream.
+/// Only one call runs at a time. A library this process has already loaded
+/// cannot be replaced, so rebuilding it requires a new process. The written
+/// paths are printed to stderr, next to cargo's output.
 pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
     let _build = BUILD.lock().unwrap_or_else(|e| e.into_inner());
     let config = PackConfig::read(root)?;
@@ -85,7 +89,8 @@ pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
     let built = cargo_build(&config.krate, root)?;
     std::fs::create_dir_all(&libs).map_err(PackDevError::write(&libs))?;
     copy_atomic(&built, &dylib).map_err(PackDevError::write(&dylib))?;
-    // SAFETY: this staged copy was just built against the pack ABI.
+    // SAFETY: this library was just built from the pack crate, against this
+    // pack ABI.
     let pack = Pack::Dl(unsafe { DlPack::open(&dylib) }?);
     let mut staged = vec![dylib];
     if config.wasm {
@@ -104,7 +109,8 @@ pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
     Ok(())
 }
 
-/// Refuses a pack with an async system, which a module cannot place.
+/// Returns an error if the pack has an async system, since a wasm module
+/// cannot run one.
 fn refuse_async(def: &PackDef) -> Result<(), PackDevError> {
     let found = def.systems.iter().find(|s| s.kind == SystemKind::Async);
     match found {
@@ -115,8 +121,11 @@ fn refuse_async(def: &PackDef) -> Result<(), PackDevError> {
     }
 }
 
-/// Builds the pack as a module, stages it where `reference` finds it, and
-/// checks it describes what the library does.
+/// Builds the pack as a wasm module and copies it to where `reference`
+/// expects it.
+///
+/// Returns an error if the module's descriptor differs from the native
+/// library's.
 fn stage_module(
     config: &PackConfig,
     root: &Path,
@@ -136,7 +145,7 @@ fn stage_module(
     Ok(staged)
 }
 
-/// Whether two descriptors serialize to the same JSON.
+/// Returns true if two descriptors serialize to the same JSON.
 fn same_descriptor(a: &PackDef, b: &PackDef) -> bool {
     matches!((serde_json::to_value(a), serde_json::to_value(b)), (Ok(a), Ok(b)) if a == b)
 }

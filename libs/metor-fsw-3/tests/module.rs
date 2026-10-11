@@ -1,11 +1,12 @@
-//! Execute generated modules with the supported configuration interpreter.
+//! Runs generated pack modules under the Python interpreter that target files
+//! use.
 
 use std::path::Path;
 use std::process::Command;
 
 use metor_fsw_3::ABI_VERSION;
-use metor_fsw_3::cli::config::PackRef;
 use metor_fsw_3::cli::module::render;
+use metor_fsw_3::dl::PackRef;
 use metor_fsw_3::pack::def::PackDef;
 use serde_json::{Value, json};
 

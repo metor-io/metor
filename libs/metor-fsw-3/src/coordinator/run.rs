@@ -1,4 +1,4 @@
-//! The built graph and the cycle loop that steps it.
+//! The built [`Coordinator`] and the loop that runs it one cycle at a time.
 
 use core::future::Future;
 use core::pin::pin;
@@ -14,42 +14,48 @@ use super::config::Clock;
 use super::status::SystemStatus;
 use super::step::{EndReason, Step, Stepped, catch_step};
 
-/// The end an entry whose step unwound reports.
+/// The end reason reported for an entry whose step panicked and was dropped.
 const UNWOUND: &EndReason = &EndReason::Panicked;
 
-/// One bound system and the status port the coordinator owns for it.
+/// One system in the coordinator's schedule.
 pub(super) struct Entry {
     pub(super) name: String,
     pub(super) step: Option<Box<dyn Step>>,
     pub(super) status: Output<SystemStatus>,
 }
 
-/// A built graph: the systems in step order, the clock that stamps each cycle,
-/// and the rings holding them together.
+/// Runs systems in a fixed order, once per cycle.
+///
+/// Build one with [`CoordinatorConfig::build`](super::CoordinatorConfig::build).
+/// Call [`step`](Coordinator::step) to run a single cycle at a time you choose,
+/// or [`run`](Coordinator::run) to run cycles on the configured clock. A system
+/// that panics is stopped, and the rest keep running.
 pub struct Coordinator {
     pub(super) entries: Vec<Entry>,
     pub(super) clock: Clock,
-    /// Start of the simulated timeline, taken at build.
+    /// Time zero of the simulated clock, taken at build.
     pub(super) epoch: Timestamp,
     pub(super) cycle: u64,
-    /// Retained handles share ownership of these regions.
+    /// Keeps the ring memory alive alongside the systems' readers and writers.
     pub(super) rings: Vec<RingBuffer>,
 }
 
 impl Coordinator {
-    /// Rings allocated: one per output port plus one status ring per system.
+    /// Returns the number of rings allocated.
+    ///
+    /// There is one ring per output port, plus one status ring per system.
     pub fn rings(&self) -> usize {
         self.rings.len()
     }
 
-    /// The ids of the systems that ended and how, in step order.
+    /// Returns each system that has ended, with its end reason, in step order.
     pub fn ended(&self) -> impl Iterator<Item = (&str, &EndReason)> {
         self.entries
             .iter()
             .filter_map(|entry| Some((entry.name.as_str(), entry.ended()?)))
     }
 
-    /// The ids of the systems a panic latched off, in step order.
+    /// Returns the ids of systems stopped by a panic, in step order.
     pub fn latched(&self) -> impl Iterator<Item = &str> {
         self.ended()
             .filter(|(_, end)| **end == EndReason::Panicked)
@@ -58,15 +64,15 @@ impl Coordinator {
 }
 
 impl Coordinator {
-    /// Cycles completed so far.
+    /// Returns the number of cycles completed so far.
     pub fn cycle(&self) -> u64 {
         self.cycle
     }
 
-    /// Execute a single step of the coordinator, running each system once.
+    /// Runs one cycle, executing each system once.
     ///
-    /// A system that panicked on an earlier cycle is skipped; its status keeps
-    /// arriving with a zero execution time.
+    /// A system that has ended, including one that panicked, is skipped. Its
+    /// status is still written each cycle, with an execution time of zero.
     pub fn step(&mut self, now: Timestamp) {
         let cycle_start = Instant::now();
         for entry in &mut self.entries {
@@ -81,7 +87,10 @@ impl Coordinator {
         self.cycle += 1;
     }
 
-    /// Step until `stop` is ready
+    /// Runs cycles until `stop` completes.
+    ///
+    /// Under a wall clock, each cycle sleeps out the rest of its time budget.
+    /// If a cycle overruns, or the clock is simulated, it yields instead.
     pub async fn run(&mut self, stop: impl Future<Output = ()>) {
         let mut stop = pin!(stop);
         let budget = self.clock.cycle_budget();
@@ -99,7 +108,7 @@ impl Coordinator {
         }
     }
 
-    /// This cycle's timestamp.
+    /// Returns the timestamp for the current cycle.
     fn now(&self) -> Timestamp {
         match self.clock {
             Clock::Wall { .. } => Timestamp::now(),
@@ -109,7 +118,9 @@ impl Coordinator {
 }
 
 impl Entry {
-    /// How this entry's step ended, including by unwinding out of it.
+    /// Returns why this entry's step ended.
+    ///
+    /// A step that was dropped after a panic reports [`EndReason::Panicked`].
     pub(super) fn ended(&self) -> Option<&EndReason> {
         match &self.step {
             Some(step) => step.ended(),
@@ -131,7 +142,7 @@ impl Entry {
     }
 }
 
-/// Calculates the simulation time from an epoch, the current cycle, and dt.
+/// Returns `epoch + cycle * dt`, saturating on overflow.
 fn simulated_time(epoch: Timestamp, cycle: u64, dt: core::time::Duration) -> Timestamp {
     let nanos = dt.as_nanos().saturating_mul(u128::from(cycle));
     let micros = i64::try_from(nanos / 1_000).unwrap_or(i64::MAX);

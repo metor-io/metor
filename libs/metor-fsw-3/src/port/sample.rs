@@ -1,4 +1,4 @@
-//! [`Sample`], an input read once per cycle and held.
+//! [`Sample`], an input that is read once per cycle and then held.
 
 use core::cell::Cell;
 use std::rc::Rc;
@@ -9,13 +9,16 @@ use super::Input;
 use crate::frame::Frame;
 use crate::log::Log;
 
-/// The newest record of an input as of this cycle, held until a newer one arrives.
+/// Holds an input's newest record.
+///
+/// The value is refreshed once per cycle, before the system runs. It keeps the
+/// last record until a newer one arrives.
 pub struct Sample<T: Frame + Copy> {
     value: Rc<Cell<Option<T>>>,
 }
 
 impl<T: Frame + Copy + 'static> Sample<T> {
-    /// Moves `input` into the sampler that fills the returned `Sample`.
+    /// Creates a `Sample` and the sampler that fills it from `input`.
     pub(crate) fn bind<W: WakeSink + 'static>(input: Input<T, W>) -> (Self, Box<dyn Sampler>) {
         let value = Rc::new(Cell::new(None));
         let taker = Taker {
@@ -25,13 +28,15 @@ impl<T: Frame + Copy + 'static> Sample<T> {
         (Self { value }, Box::new(taker))
     }
 
-    /// This cycle's value: the newest record so far, or `None` before the first.
+    /// Returns the newest record as of this cycle.
+    ///
+    /// Returns `None` until the first record arrives.
     pub fn get(&self) -> Option<T> {
         self.value.get()
     }
 }
 
-/// A `Sampler` takes one input's sample for the cycle.
+/// Refreshes one [`Sample`] for the cycle.
 pub(crate) trait Sampler {
     fn take(&mut self);
 }
@@ -42,8 +47,9 @@ struct Taker<T: Frame + Copy, W: WakeSink> {
 }
 
 impl<T: Frame + Copy, W: WakeSink> Sampler for Taker<T, W> {
-    /// Holds the newest record, keeping the last one when none arrived or it
-    /// failed to read.
+    /// Stores the newest record.
+    ///
+    /// Keeps the previous value if nothing arrived or the read failed.
     fn take(&mut self) {
         match self.input.latest() {
             Ok(Some(record)) => self.value.set(Some(*record)),
@@ -53,7 +59,7 @@ impl<T: Frame + Copy, W: WakeSink> Sampler for Taker<T, W> {
     }
 }
 
-/// The samplers one step takes each cycle.
+/// The samplers one step refreshes each cycle.
 #[derive(Default)]
 pub(crate) struct Samplers(Vec<Box<dyn Sampler>>);
 

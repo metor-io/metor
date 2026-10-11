@@ -1,4 +1,4 @@
-//! `Publish`: the records a target lists, served to whoever connects.
+//! `Publish`, the link that sends a target's records to its peers.
 
 use std::rc::Rc;
 
@@ -16,36 +16,34 @@ use crate::{Stop, system};
 
 use super::conn::{self, Connections, Event};
 use super::inbox::Inbox;
-use super::transport::{Endpoint, Transport, source};
+use super::transport::{Endpoint, source};
 use super::wire;
-use super::{LinkStatus, default_conn_cap, report};
+use super::{LinkParams, LinkStatus, default_conn_cap, report};
 
-/// What a `Publish` is configured with.
+/// The configuration for a [`Publish`].
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PublishParams {
-    pub transport: Transport,
-    /// The target's telemetry namespace, which every leaf hangs under.
-    #[serde(default)]
-    pub namespace: Option<String>,
-    /// This link's name, so a subscriber can tell one of a target's links from another.
-    #[serde(default)]
-    pub link: String,
-    /// The size of the per-connection pending write buffer, and of a batch.
+    #[serde(flatten)]
+    pub link: LinkParams,
+    /// The size in bytes of each connection's pending write buffer. It is
+    /// also the largest batch the link builds.
     #[serde(default = "default_conn_cap")]
     pub conn_cap: usize,
 }
 
-/// Serves every record its config wires into it over metor-proto.
+/// A link that sends every record wired into it to its peers over
+/// metor-proto.
 pub struct Publish {
     endpoint: Option<Endpoint>,
     params: PublishParams,
 }
 
 impl Publish {
-    /// Binds the transport, so a taken address fails the build.
+    /// Binds the transport. This happens at build time, so a taken address
+    /// fails the build.
     pub fn new(params: PublishParams) -> Result<Self, ParamError> {
-        let endpoint = params.transport.bind()?;
-        super::record_bound(&params.link, &endpoint);
+        let endpoint = params.link.transport.bind()?;
+        super::record_bound(&params.link.link, &endpoint);
         Ok(Self {
             endpoint: Some(endpoint),
             params,
@@ -53,7 +51,11 @@ impl Publish {
     }
 }
 
-/// Announces its ports to each new connection, then batches their records.
+/// Runs the `Publish` link.
+///
+/// Each new connection is first sent the announce, which describes every
+/// input port's schema. After that, the link collects the records waiting on
+/// its inputs into a batch and queues the batch on every connection.
 #[system]
 pub async fn publish(
     #[state] s: &mut Publish,
@@ -64,14 +66,14 @@ pub async fn publish(
 ) {
     let defs: Vec<PortDef> = inputs.iter_mut().map(|(def, _)| def.clone()).collect();
     let PublishParams {
-        namespace,
-        link,
+        link: LinkParams {
+            namespace, link, ..
+        },
         conn_cap,
-        ..
     } = &s.params;
     let (blob, ids) = wire::announce(&defs, namespace.as_deref(), link);
     report_collisions(log, &defs, &ids);
-    // PANIC Safety: a system runs once, and the endpoint is the bind's.
+    // PANIC Safety: `new` always sets the endpoint, and a system runs once.
     let endpoint = s.endpoint.take().expect("one run per instance");
     if let Some(addr) = endpoint.local_addr() {
         log.info(format!("listening on {addr}"));
@@ -103,7 +105,8 @@ pub async fn publish(
     }
 }
 
-/// Faults every port that announces a table an earlier port already did.
+/// Logs a fault for every port whose table id was already announced by an
+/// earlier port.
 fn report_collisions(log: &mut Log, defs: &[PortDef], ids: &[Option<PacketId>]) {
     for (def, _) in defs.iter().zip(ids).filter(|(_, id)| id.is_none()) {
         log.fault(
@@ -116,7 +119,11 @@ fn report_collisions(log: &mut Log, defs: &[PortDef], ids: &[Option<PacketId>]) 
     }
 }
 
-/// Appends a packet per record
+/// Appends one packet per waiting record to `batch`, stopping before `batch`
+/// would grow past `cap`.
+///
+/// Records on a port with no id (a table id collision) are drained and
+/// dropped.
 fn fill(
     batch: &mut Vec<u8>,
     inputs: &mut DynInputs<Notifier>,
@@ -154,12 +161,14 @@ mod tests {
 
     use super::*;
 
-    /// The framed length of one `Imu` and one `Fixed` record.
+    /// The length of one `Imu` record once framed as a packet.
     const IMU_LEN: usize = wire::PACKET_OVERHEAD + Imu::MAX_LEN;
-    // Postcard's varint for `a` plus eight bytes of `b`.
+    // The framed length of one `Fixed` record: postcard's varint for `a`
+    // plus eight bytes of `b`.
     const FIXED_LEN: usize = wire::PACKET_OVERHEAD + 9;
 
-    /// Two ports, an `Imu` frame and a `Fixed` message, over their own rings.
+    /// Builds two input ports, an `Imu` frame port and a `Fixed` message
+    /// port, each reading its own ring.
     fn ports(rings: &[RingBuffer; 2]) -> DynInputs<Notifier> {
         let wake = Notifier::default();
         let defs = [
@@ -177,7 +186,7 @@ mod tests {
         )
     }
 
-    /// One record on each port, as their producers would write them.
+    /// Writes one record to each ring, the way each port's producer would.
     fn produce(rings: &[RingBuffer; 2], sample: f64) {
         let imu = Imu::new(1, sample);
         rings[0]
@@ -235,7 +244,8 @@ mod tests {
         for cycle in 0..4 {
             produce(&rings, cycle as f64);
         }
-        // Room for three `Imu` records, so what waits takes several fills.
+        // Room for three `Imu` records, so draining everything takes several
+        // fills.
         let cap = 3 * IMU_LEN + FIXED_LEN - 1;
         let mut batch = Vec::with_capacity(cap);
         let mut lengths = Vec::new();

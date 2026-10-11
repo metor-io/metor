@@ -1,5 +1,11 @@
-//! Copies of a system's rings across an adapter boundary, and the log lines
-//! that report what the copies dropped.
+//! Mirrors copy records between rings across an adapter boundary.
+//!
+//! A system that runs on its own thread or in a wasm guest does not touch the
+//! real rings directly. Instead, it gets its own copy of each port's ring, and
+//! each cycle the adapter mirrors the real inputs into those copies and the
+//! copies back out to the real outputs.
+//! A copy that is full drops records, and the mirrors periodically log how
+//! many each port dropped.
 
 use core::fmt::Write;
 use std::borrow::Cow;
@@ -13,13 +19,14 @@ use crate::fn_system::LOG_PORT;
 use crate::record::Record;
 use crate::system::SystemDef;
 
-/// Cycles between two drop reports; the counts accumulate between them.
+/// How many cycles pass between drop reports. Drop counts add up in between.
 const DROP_REPORT_CYCLES: u64 = 100;
 
-/// A log line's fields, as the mirrors keep them between cycles.
+/// The key/value fields of a log line, kept between cycles so they can be
+/// reused.
 type Fields = Vec<(Cow<'static, str>, Cow<'static, str>)>;
 
-/// A ring on either side of a mirror broke a structural invariant.
+/// A ring on either side of a mirror is corrupt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Corrupt;
 
@@ -29,7 +36,9 @@ impl From<ReadError> for Corrupt {
     }
 }
 
-/// One ring copied into another, and the records the destination refused.
+/// Copies records from one ring into another.
+///
+/// Records that do not fit in the destination are dropped and counted.
 pub(crate) struct Mirror<W: WakeSource> {
     port: Cow<'static, str>,
     from: View<NoWake>,
@@ -38,7 +47,8 @@ pub(crate) struct Mirror<W: WakeSource> {
 }
 
 impl<W: WakeSource> Mirror<W> {
-    /// `from` copied into `into`, reported as `port`.
+    /// Creates a mirror from `from` into `into`. Drops are reported under the
+    /// name `port`.
     pub(crate) fn new(port: Cow<'static, str>, from: View<NoWake>, into: Writer<W>) -> Self {
         Self {
             port,
@@ -48,9 +58,10 @@ impl<W: WakeSource> Mirror<W> {
         }
     }
 
-    /// Moves every waiting record, counting the ones that found no room.
-    /// Stops at the first corrupt record or destination, keeping the records
-    /// before it moved.
+    /// Copies every waiting record, counting the ones that did not fit.
+    ///
+    /// Stops at the first sign of corruption in either ring. Records copied
+    /// before that point stay copied.
     pub(crate) fn drain(&mut self) -> Result<(), Corrupt> {
         let moved = self
             .from
@@ -68,21 +79,26 @@ impl<W: WakeSource> Mirror<W> {
     }
 }
 
-/// `Mirrors` are every port of one system, copied across a boundary: the real
-/// input rings into the system's copies, and its copies into the real outputs.
+/// The mirrors for every port of one system.
+///
+/// Input mirrors copy the real input rings into the system's copies. Output
+/// mirrors copy the system's copies into the real output rings. Drop reports
+/// and adapter log lines go out on the system's `log` output.
 pub(crate) struct Mirrors<W: WakeSource> {
     inputs: Vec<Mirror<W>>,
     outputs: Vec<Mirror<NoWake>>,
-    /// Which output is the system's `log`, where the adapter's lines go too.
+    /// The index of the system's `log` output. The adapter writes its own
+    /// log lines there too.
     log: Option<usize>,
     line: Vec<u8>,
-    /// One field per port, written in place, so a drop report allocates nothing.
+    /// One field per port. Counts are written into these in place, so a drop
+    /// report does not allocate.
     fields: Fields,
     since_report: u64,
 }
 
 impl<W: WakeSource> Mirrors<W> {
-    /// Mirrors over `def`'s ports, in bind order.
+    /// Groups the mirrors for `def`'s ports. Both lists are in bind order.
     pub(crate) fn new(
         def: &SystemDef,
         inputs: Vec<Mirror<W>>,
@@ -102,18 +118,21 @@ impl<W: WakeSource> Mirrors<W> {
         }
     }
 
-    /// Drains every input mirror, returning the first corruption.
+    /// Drains every input mirror. Returns an error if any ring was corrupt.
     pub(crate) fn drain_inputs(&mut self) -> Result<(), Corrupt> {
         drain(&mut self.inputs)
     }
 
-    /// Drains every output mirror, returning the first corruption.
+    /// Drains every output mirror. Returns an error if any ring was corrupt.
     pub(crate) fn drain_outputs(&mut self) -> Result<(), Corrupt> {
         drain(&mut self.outputs)
     }
 
-    /// One line per [`DROP_REPORT_CYCLES`], counting what every port dropped
-    /// since the last one.
+    /// Counts one cycle, and logs the drops every [`DROP_REPORT_CYCLES`]
+    /// cycles.
+    ///
+    /// The log line lists how many records each port dropped since the last
+    /// report. Nothing is logged if no port dropped anything.
     pub(crate) fn report_drops(&mut self, now: Timestamp) {
         self.since_report += 1;
         if self.since_report < DROP_REPORT_CYCLES {
@@ -134,7 +153,7 @@ impl<W: WakeSource> Mirrors<W> {
         self.fields = event.fields;
     }
 
-    /// Publishes one line with a `kind` field on the system's own `log`.
+    /// Writes a log line with a `kind` field to the system's `log` output.
     pub(crate) fn write_line(
         &mut self,
         now: Timestamp,
@@ -146,8 +165,8 @@ impl<W: WakeSource> Mirrors<W> {
         self.emit(&crate::log::line(now, level, message.to_string(), fields));
     }
 
-    /// Writes each port's count into its own field, clearing the counts, and
-    /// reports whether any port dropped a record.
+    /// Moves each port's drop count into its field and resets the count.
+    /// Returns true if any port dropped a record.
     fn take_drops(&mut self) -> bool {
         let mut dropped = false;
         let counts = counts(&mut self.inputs, &mut self.outputs);
@@ -158,7 +177,7 @@ impl<W: WakeSource> Mirrors<W> {
         dropped
     }
 
-    /// Publishes one line on the system's own `log`, if it declares one.
+    /// Writes `event` to the system's `log` output, if the system has one.
     fn emit(&mut self, event: &LogEvent) {
         let Some(log) = self.log else { return };
         let Ok(bytes) = event.encode(&mut self.line) else {
@@ -170,14 +189,16 @@ impl<W: WakeSource> Mirrors<W> {
 
 #[cfg(feature = "host")]
 impl<W: WakeSource> Mirrors<W> {
-    /// Drops the input mirrors, freeing their reader slots on the real rings.
+    /// Drops the input mirrors, which frees their reader slots on the real
+    /// rings.
     pub(crate) fn release_inputs(&mut self) {
         self.fields.drain(1..=self.inputs.len());
         self.inputs.clear();
     }
 }
 
-/// Drains every mirror, returning the first corruption.
+/// Drains every mirror in `mirrors`. Returns an error if any ring was
+/// corrupt.
 fn drain<W: WakeSource>(mirrors: &mut [Mirror<W>]) -> Result<(), Corrupt> {
     mirrors
         .iter_mut()
@@ -185,7 +206,7 @@ fn drain<W: WakeSource>(mirrors: &mut [Mirror<W>]) -> Result<(), Corrupt> {
         .fold(Ok(()), Result::and)
 }
 
-/// Each mirror's drop count, inputs then outputs, cleared as it is read.
+/// Takes each mirror's drop count, inputs first, resetting each to zero.
 fn counts<'a, W: WakeSource>(
     inputs: &'a mut [Mirror<W>],
     outputs: &'a mut [Mirror<NoWake>],
@@ -195,14 +216,15 @@ fn counts<'a, W: WakeSource>(
     inputs.chain(outputs)
 }
 
-/// Writes `count` into a field's own buffer, which allocates nothing.
+/// Writes `count` into a field's existing buffer, without allocating.
 fn set_count(value: &mut Cow<'static, str>, count: u64) {
     let Cow::Owned(text) = value else { return };
     text.clear();
     let _ = write!(text, "{count}");
 }
 
-/// One field per port, holding the count it dropped, in bind order.
+/// Builds the fields of a drop report: a `kind` field, then one count field
+/// per port in bind order.
 fn drop_fields<'a>(ports: impl Iterator<Item = &'a Cow<'static, str>>) -> Fields {
     let kind = (Cow::Borrowed("kind"), Cow::Borrowed("mirror_dropped"));
     let counts = ports.map(|port| {
@@ -212,8 +234,10 @@ fn drop_fields<'a>(ports: impl Iterator<Item = &'a Cow<'static, str>>) -> Fields
     core::iter::once(kind).chain(counts).collect()
 }
 
-/// The geometry of a mirror `factor` times as deep as a ring of `capacity`
-/// bytes, with one reader, and the length of its region.
+/// Returns the config for a mirror ring and the length of its region.
+///
+/// The mirror has one reader and `factor` times the capacity of the
+/// `capacity`-byte ring it copies.
 pub(crate) fn mirror_config(capacity: usize, factor: usize) -> Result<(Config, usize), ParamError> {
     let too_large = ParamError::MirrorTooLarge { capacity };
     let config = Config {
@@ -224,7 +248,7 @@ pub(crate) fn mirror_config(capacity: usize, factor: usize) -> Result<(Config, u
     Ok((config, len))
 }
 
-/// The index of the system's `log` output, which is where its lines go.
+/// Returns the index of the system's `log` output, if it has one.
 fn log_port(def: &SystemDef) -> Option<usize> {
     def.outputs
         .iter()
@@ -258,8 +282,10 @@ pub(crate) mod tests {
         unsafe { core::slice::from_raw_parts(base, len) }.to_vec()
     }
 
-    /// Where reader slot 0's cursor sits in a region of `config`: the first
-    /// byte that claiming the slot changes.
+    /// Returns the offset of reader slot 0's cursor in a region of `config`.
+    ///
+    /// It finds the cursor as the first byte that changes when the slot is
+    /// claimed.
     pub(crate) fn slot_cursor(config: Config) -> usize {
         let ring = RingBuffer::create_in_memory(config);
         let free = region_bytes(&ring);
@@ -320,7 +346,7 @@ pub(crate) mod tests {
             writer.try_write(&[7; 16]).expect("room");
         }
         assert_eq!(copy.drain(), Ok(()));
-        // The target holds four 32-byte records, and its reader takes none.
+        // The target fits four 32-byte records, and its reader never reads.
         assert_eq!(copy.dropped, 4);
     }
 
@@ -344,7 +370,8 @@ pub(crate) mod tests {
     #[test]
     fn test_reject_oversize_mirror() {
         assert!(mirror_config(64, 4).is_ok());
-        // Four times a capacity no region can hold, and one that overflows.
+        // A capacity that is not a valid ring size once multiplied by four,
+        // and one whose multiple overflows.
         for capacity in [3, usize::MAX / 2] {
             assert_eq!(
                 mirror_config(capacity, 4).err(),

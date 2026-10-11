@@ -1,8 +1,12 @@
 //! A single-writer, multi-reader ring buffer over heap or shared memory.
 //!
-//! Each [`View`] reads independently. Writes return [`WriteError::WouldBlock`]
-//! before overwriting unread data. Borrowed records stay valid until released.
-//! New views start at the current write position; they do not read earlier data.
+//! One [`Writer`] appends variable-length records. Up to
+//! [`Config::max_readers`] [`View`]s read them, each with its own cursor, so one
+//! reader never consumes records for another. The writer never overwrites a
+//! record that some view has not read yet. Instead, the write fails with
+//! [`WriteError::WouldBlock`]. A record borrowed from a view stays valid until
+//! the borrow is released. A new view starts at the current write position and
+//! does not see records written before it was created.
 //!
 //! ```
 //! use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
@@ -18,7 +22,7 @@
 //! ```
 //!
 //! The `mmap` feature adds file-backed regions. The `notify` feature adds
-//! in-process async notifications; [`NoWake`] supports synchronous use.
+//! in-process async notifications. Pass [`NoWake`] when readers poll instead.
 //! See `DESIGN.md` in the crate source for layout and synchronization rules.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -52,21 +56,28 @@ fn owner_tag() -> u64 {
     1
 }
 
-/// Round up to a multiple of 16. Requires `n <= usize::MAX - 15`.
+/// Rounds `n` up to a multiple of 16.
+///
+/// `n` must be at most `usize::MAX - 15`.
 #[inline]
 const fn round_up_16(n: usize) -> usize {
     (n + (PAYLOAD_ALIGNMENT - 1)) & !(PAYLOAD_ALIGNMENT - 1)
 }
 
-/// Bytes occupied by a record: a 16-byte header and padded payload.
-/// Requires `payload_len <= usize::MAX - 31`.
+/// Returns the bytes a record takes up in the ring.
+///
+/// That is a 16-byte header plus the payload padded to 16 bytes. `payload_len`
+/// must be at most `usize::MAX - 31`.
 #[inline]
 pub const fn frame_len(payload_len: usize) -> usize {
     RECORD_HEADER_SIZE + round_up_16(payload_len)
 }
 
-/// Return the record start and preceding wrap gap.
-/// Requires a power-of-two capacity and `rec <= capacity`; positions must not overflow.
+/// Returns where a record starts and the wrap gap before it.
+///
+/// A record that would run past the end of the data region starts at the next
+/// lap instead. The skipped bytes form the gap. `capacity` must be a power of
+/// two, `rec` must be at most `capacity`, and positions must not overflow.
 #[inline]
 const fn reserve(committed: u64, rec: u64, capacity: u64) -> (u64, u64) {
     let phys = committed & (capacity - 1);
@@ -78,8 +89,9 @@ const fn reserve(committed: u64, rec: u64, capacity: u64) -> (u64, u64) {
     }
 }
 
-/// Test whether a write preserves unread bytes.
-/// A cursor ahead of `committed` or an unrepresentable sum is `Corrupt`.
+/// Returns whether `need` more bytes fit without overwriting unread data.
+///
+/// Returns `Corrupt` if `slowest` is ahead of `committed` or the sum overflows.
 #[inline]
 const fn fits(committed: u64, slowest: u64, need: u64, capacity: u64) -> Result<bool, WriteError> {
     if slowest > committed {
@@ -91,14 +103,18 @@ const fn fits(committed: u64, slowest: u64, need: u64, capacity: u64) -> Result<
     }
 }
 
-/// Whether the writer can reserve from `committed` without overflow or misalignment.
+/// Returns whether the writer can safely reserve space at `committed`.
+///
+/// Reserving must neither overflow nor break alignment.
 #[inline]
 const fn writable_from(committed: u64, capacity: u64) -> bool {
     committed.is_multiple_of(PAYLOAD_ALIGNMENT as u64) && committed <= u64::MAX - 2 * capacity
 }
 
-/// Check a raw payload length before converting it to `usize`.
-/// `phys` must be a 16-aligned header position within the data region.
+/// Returns whether a payload of `len` bytes with its header at `phys` fits.
+///
+/// Use it on a raw length read from the region before converting it to
+/// `usize`. `phys` must be a 16-aligned position in the data region.
 #[inline]
 const fn record_fits(len: u64, phys: u64, capacity: u64) -> bool {
     len <= capacity - RECORD_HEADER_SIZE as u64 - phys
@@ -111,7 +127,7 @@ fn checked_frame_len(payload_len: usize, capacity: u64) -> Result<u64, WriteErro
     Ok(frame_len(payload_len) as u64)
 }
 
-/// Fixed sizes of a ring region.
+/// The sizes a ring region is created with.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     /// Data capacity in bytes: a power of two, at least 16.
@@ -138,12 +154,15 @@ pub enum ReadError {
     Corrupt,
 }
 
-/// All reader slots are claimed.
+/// Returned when every reader slot is already claimed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the ring's reader table is full")]
 pub struct FullReaderTable;
 
-/// The writer role is already claimed. Dead owners require explicit reclamation.
+/// Returned when the ring already has a writer.
+///
+/// A claim held by a process that died stays held until
+/// [`RingBuffer::reclaim_owner`] releases it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("a writer already holds this ring's claim")]
 pub struct WriterClaimed;
@@ -167,29 +186,35 @@ pub enum AttachError {
     RegionTruncated,
 }
 
-/// Notifies readers after data or wrap padding is published.
+/// Tells readers that the writer published new data.
 ///
-/// A write notifies last, once its state is final, so `notify` may write again.
+/// New data is a record or wrap padding. The writer calls `notify` last, once the write is fully published, so
+/// `notify` may itself write to the ring again.
 pub trait WakeSource {
     fn notify(&self);
 }
 
-/// Waits for a readiness change.
+/// Lets a reader wait until new data may be ready.
 ///
-/// Implementations must check `ready` after arming to avoid missed wakeups.
-/// They may return before readiness; the caller checks again after each return.
+/// `wait_until` must check `ready` after it registers for wakeups. Otherwise a
+/// wakeup that arrives in between is lost. It may return while `ready` is still
+/// false, so callers check again after every return.
 #[allow(async_fn_in_trait)]
 pub trait WakeSink {
     async fn wait_until<F: FnMut() -> bool>(&self, ready: F);
 
-    /// Prepares an owned notification wait, when this sink supports one.
+    /// Returns a wait future that does not borrow this sink.
+    ///
+    /// Returns `None` if the sink does not support one.
     #[cfg(feature = "notify")]
     fn wait_owned(&self) -> Option<maitake_sync::wait_queue::WaitOwned> {
         None
     }
 }
 
-/// Disables notifications. A wait on it resolves at once.
+/// A wake source and sink that does nothing.
+///
+/// Waiting on it returns immediately, so use it when readers poll.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoWake;
 
@@ -204,7 +229,9 @@ impl WakeSink for NoWake {
     }
 }
 
-/// Wakes all tasks waiting on clones of this notifier within one process.
+/// Wakes async readers in the same process.
+///
+/// Notifying it wakes every task waiting on any clone of it.
 #[cfg(feature = "notify")]
 #[derive(Clone)]
 pub struct Notifier(Arc<maitake_sync::WaitQueue>);
@@ -218,8 +245,11 @@ impl Default for Notifier {
 
 #[cfg(feature = "notify")]
 impl Notifier {
-    /// Waits for a notification without borrowing this handle or allocating.
-    /// Check readiness after polling the returned future to avoid missed wakes.
+    /// Returns a future that completes on the next notification.
+    ///
+    /// The future does not borrow this handle and does not allocate. It
+    /// registers when first polled. Check readiness after that first poll, or a
+    /// notification sent before registration is missed.
     pub fn wait_owned(&self) -> maitake_sync::wait_queue::WaitOwned {
         self.0.wait_owned()
     }
@@ -287,8 +317,9 @@ impl Inner {
     }
 
     /// # Safety
-    /// The caller holds the writer claim. The aligned, contiguous record fits in
-    /// the data region, its length fits `u32`, and no reader pins the destination.
+    /// The caller holds the writer claim. The record is aligned, contiguous, and
+    /// fits in the data region. Its length fits in a `u32`, and no reader cursor
+    /// pins the destination.
     unsafe fn write_record(&self, phys: usize, payload: &[u8]) {
         // SAFETY: phys is 8-aligned and in-bounds (caller contract).
         let p = unsafe { self.data_ptr(phys) };
@@ -305,8 +336,9 @@ impl Inner {
     }
 
     /// # Safety
-    /// `phys` is an aligned record header with eight readable bytes. Publication
-    /// happens before this read, and a reader cursor keeps the record pinned.
+    /// `phys` is the aligned position of a record header with eight readable
+    /// bytes. The record was published before this read, and a reader cursor
+    /// keeps it pinned.
     unsafe fn read_len(&self, phys: usize) -> u64 {
         // SAFETY: phys is 8-aligned and in-bounds (caller contract); the read
         // is ordered after the write via `committed`.
@@ -314,8 +346,11 @@ impl Inner {
         hdr & 0xFFFF_FFFF
     }
 
-    /// Locate a record, skipping any wrap gap. Also return the position after the skip.
-    /// A cursor more than a lap behind `committed` or off the record grid is `Corrupt`.
+    /// Finds the record at `r`, skipping a wrap gap if `r` sits on one.
+    ///
+    /// Returns the position after any skip, and the record if one was published
+    /// before `committed`. Returns `Corrupt` if `r` is more than a lap behind
+    /// `committed` or is not on a 16-byte boundary.
     fn locate_before(
         &self,
         mut r: u64,
@@ -359,15 +394,15 @@ impl Inner {
         }
     }
 
-    /// Start of the lap after the one containing `pos`, or `None` on overflow.
+    /// Returns the start of the lap after `pos`, or `None` on overflow.
     #[inline]
     fn next_lap(&self, pos: u64) -> Option<u64> {
         (pos & !self.geometry.mask()).checked_add(self.geometry.capacity)
     }
 
     /// # Safety
-    /// `loc` came from lookup. A reader cursor at or before its start must keep
-    /// the record pinned for the returned slice's lifetime.
+    /// `loc` came from `locate_before`. A reader cursor at or before the
+    /// record's start must pin the record for as long as the returned slice lives.
     unsafe fn payload(&self, loc: &Located) -> &[u8] {
         // SAFETY: the record is contiguous and in-bounds (caller contract).
         unsafe {
@@ -377,18 +412,21 @@ impl Inner {
     }
 }
 
-/// A cloneable region handle. Its writers and views keep the backing alive.
+/// A cloneable handle to a ring.
+///
+/// Use it to create the ring's [`Writer`] and its [`View`]s. The ring's storage
+/// stays alive while any handle, writer, or view exists.
 #[derive(Clone)]
 pub struct RingBuffer {
     inner: Arc<Inner>,
 }
 
 impl RingBuffer {
-    /// Create a heap-backed ring.
+    /// Creates a ring on the heap.
     ///
     /// # Panics
-    /// Panics if capacity is not a power of two of at least 16, the reader count
-    /// is zero or exceeds `u32::MAX`, or the total size exceeds `isize::MAX`.
+    /// Panics if the capacity is not a power of two of at least 16, if the reader
+    /// count is zero or above `u32::MAX`, or if the total size is above `isize::MAX`.
     pub fn create_in_memory(cfg: Config) -> Self {
         let geometry = layout(&cfg);
         let backing = Backing::heap(geometry.total_size);
@@ -396,15 +434,19 @@ impl RingBuffer {
         unsafe { Self::initialize(backing, geometry) }
     }
 
-    /// Initialize caller-owned storage. Checks base alignment and available size.
+    /// Creates a ring in caller-owned storage.
+    ///
+    /// Returns an error if `base` is not 16-byte aligned or `len` is too small
+    /// for `cfg`.
     ///
     /// # Safety
-    /// The region is one writable, interior-mutable allocation, exclusively
-    /// accessible during initialization. It must outlive all resulting handles,
-    /// clones, exports, and borrows. Afterwards, access must follow the ring protocol.
+    /// The region must be one writable allocation that allows interior mutation.
+    /// Nothing else may access it during initialization. It must outlive every
+    /// handle, clone, export, and borrow created from the ring. After
+    /// initialization, all access must follow the ring protocol.
     ///
     /// # Panics
-    /// Panics on invalid configurations, as [`Self::create_in_memory`] does.
+    /// Panics on an invalid configuration, like [`Self::create_in_memory`].
     pub unsafe fn create_raw(base: *mut u8, len: usize, cfg: Config) -> Result<Self, AttachError> {
         if !(base as usize).is_multiple_of(PAYLOAD_ALIGNMENT) {
             return Err(AttachError::Misaligned);
@@ -420,15 +462,18 @@ impl RingBuffer {
         }
     }
 
-    /// Create a file-backed ring, truncating any existing file.
+    /// Creates a ring backed by the file at `path`.
+    ///
+    /// Any existing file is truncated.
     ///
     /// # Safety
-    /// The caller has exclusive access during creation, with no previous mappings
-    /// or handles in use. Until all resulting handles and borrows are dropped,
-    /// the file must not be truncated, reformatted, or modified outside the protocol.
+    /// The caller has exclusive access to the file during creation, and no
+    /// earlier mappings or handles to it are in use. Until every handle and
+    /// borrow from the ring is dropped, the file must not be truncated,
+    /// reformatted, or modified outside the ring protocol.
     ///
     /// # Panics
-    /// Panics on invalid configurations, as [`Self::create_in_memory`] does.
+    /// Panics on an invalid configuration, like [`Self::create_in_memory`].
     #[cfg(feature = "mmap")]
     pub unsafe fn create_mmap(path: &std::path::Path, cfg: Config) -> std::io::Result<Self> {
         let geometry = layout(&cfg);
@@ -451,12 +496,12 @@ impl RingBuffer {
         Ok(unsafe { Self::initialize(Backing::mmap(map), geometry) })
     }
 
-    /// Map an existing ring and validate its header.
+    /// Maps an existing ring file and validates its header.
     ///
     /// # Safety
-    /// The file contains an initialized ring. Until all resulting handles and
-    /// borrows are dropped, it must not be truncated, reformatted, or modified
-    /// outside the ring protocol. The header must remain immutable.
+    /// The file contains an initialized ring. Until every handle and borrow from
+    /// the ring is dropped, the file must not be truncated, reformatted, or
+    /// modified outside the ring protocol. The header must never change.
     #[cfg(feature = "mmap")]
     pub unsafe fn attach_mmap(path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
@@ -470,23 +515,26 @@ impl RingBuffer {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// Attach to caller-owned storage after validating its header.
+    /// Attaches to an existing ring in caller-owned storage.
+    ///
+    /// Returns an error if the ring's header is invalid.
     ///
     /// # Safety
-    /// The region is one live, interior-mutable allocation containing an initialized
-    /// ring. It must outlive all resulting handles, clones, exports, and borrows. The header
-    /// remains immutable; all other access follows the ring protocol.
+    /// The region is one live allocation that allows interior mutation and holds
+    /// an initialized ring. It must outlive every handle, clone, export, and
+    /// borrow created from the ring. The header must never change, and all other
+    /// access must follow the ring protocol.
     pub unsafe fn attach_raw(base: *mut u8, len: usize) -> Result<Self, AttachError> {
         // SAFETY: the caller guarantees the region's lifetime and shared-memory access.
         unsafe { Self::attach(Backing::raw(base, len)) }
     }
 
-    /// Attach to storage retained through process-local ownership callbacks.
+    /// Attaches to an existing ring whose storage is kept alive by `owner`.
     ///
     /// # Safety
-    /// `owner` must satisfy [`RawOwner`]'s contract and keep this entire region
-    /// alive. The region contains an initialized ring with an immutable header;
-    /// all other access follows the ring protocol.
+    /// `owner` must meet [`RawOwner`]'s contract and keep the entire region
+    /// alive. The region holds an initialized ring whose header never changes,
+    /// and all other access follows the ring protocol.
     pub unsafe fn attach_owned(
         base: *mut u8,
         len: usize,
@@ -496,15 +544,18 @@ impl RingBuffer {
         unsafe { Self::attach(Backing::owned(base, len, owner)) }
     }
 
-    /// Retain this ring while its region and owner are passed across an ABI.
-    /// Raw storage still requires its caller-provided lifetime guarantee.
+    /// Exports this ring to pass across an ABI boundary.
+    ///
+    /// The returned [`RingExport`] keeps the region alive until the receiver takes
+    /// its own reference. Storage from [`Self::create_raw`] or
+    /// [`Self::attach_raw`] still relies on the caller to keep it alive.
     pub fn export(&self) -> RingExport {
         RingExport::new(self.inner.clone())
     }
 
     /// # Safety
-    /// The backing contains an initialized ring with an immutable header. Its
-    /// lifetime and all concurrent access must satisfy the ring protocol.
+    /// The backing holds an initialized ring whose header never changes. Its
+    /// lifetime and all concurrent access must follow the ring protocol.
     unsafe fn attach(backing: Backing) -> Result<Self, AttachError> {
         // SAFETY: the caller guarantees readable, immutable header bytes.
         let geometry = unsafe { read_header(backing.base, backing.len) }?;
@@ -525,17 +576,22 @@ impl RingBuffer {
         Self::from_parts(backing, geometry)
     }
 
-    /// Base address and backing length. Raw attachments do not keep the owner alive.
+    /// Returns the region's base address and length.
+    ///
+    /// For raw storage, the pointer stays valid only as long as the caller keeps
+    /// the storage alive.
     pub fn region(&self) -> (*mut u8, usize) {
         (self.inner.backing.base, self.inner.backing.len)
     }
 
-    /// Absolute published position in bytes, including wrap padding.
+    /// Returns the absolute published position in bytes.
+    ///
+    /// Wrap padding counts toward it.
     pub fn committed(&self) -> u64 {
         self.inner.control().committed.load(Acquire)
     }
 
-    /// The geometry this region was created with.
+    /// Returns the configuration this region was created with.
     pub fn config(&self) -> Config {
         Config {
             capacity: self.inner.geometry.capacity as usize,
@@ -543,8 +599,11 @@ impl RingBuffer {
         }
     }
 
-    /// Claim the region's only writer. Dropping it releases the claim.
-    /// `data` is notified after publication; use [`NoWake`] for synchronous readers.
+    /// Claims the ring's single writer.
+    ///
+    /// Returns [`WriterClaimed`] if another writer holds the claim. Dropping the
+    /// writer releases it. The writer notifies `data` after each publish. Pass
+    /// [`NoWake`] if readers poll instead of waiting.
     pub fn writer<WD: WakeSource>(&self, data: WD) -> Result<Writer<WD>, WriterClaimed> {
         // Acquire the state released by the previous writer or reclaimer.
         self.inner
@@ -559,12 +618,12 @@ impl RingBuffer {
         })
     }
 
-    /// Release writer and reader claims held by a dead process.
+    /// Releases the writer claim and reader slots held by a dead process.
     ///
     /// # Safety
-    /// `pid` is a nonzero ID of an exited, reaped process whose stores have finished
-    /// and whose handles will never be used again. It must not identify a live
-    /// claimant through PID reuse.
+    /// `pid` is the nonzero ID of a process that has exited and been reaped. Its
+    /// stores have finished, and its handles will never be used again. PID reuse
+    /// must not have given that ID to a live claimant.
     pub unsafe fn reclaim_owner(&self, pid: u64) {
         for index in 0..self.inner.geometry.max_readers {
             let slot = self.inner.slot(index);
@@ -583,8 +642,11 @@ impl RingBuffer {
             .compare_exchange(pid, 0, Release, Relaxed);
     }
 
-    /// Register a reader at the current published position.
-    /// Earlier records are skipped. Waiters on the view use `data`.
+    /// Registers a new reader at the current published position.
+    ///
+    /// The view does not see records published before this call. Returns
+    /// [`FullReaderTable`] if every reader slot is taken. The view waits for new
+    /// data through `data`.
     pub fn view<RD: WakeSink>(&self, data: RD) -> Result<View<RD>, FullReaderTable> {
         let mut start = self.inner.control().committed.load(Acquire);
         for slot in 0..self.inner.geometry.max_readers {
@@ -622,13 +684,16 @@ impl RingBuffer {
     }
 }
 
-/// Required backing size, or `None` if the configuration cannot form a valid region.
+/// Returns the backing size `cfg` needs.
+///
+/// Returns `None` if `cfg` cannot form a valid region.
 pub fn checked_region_len(cfg: &Config) -> Option<usize> {
     checked_layout(cfg).map(|geometry| geometry.total_size)
 }
 
-/// The region's sole writer. Dropping it releases the shared writer claim.
+/// The ring's single writer.
 ///
+/// Dropping it releases the writer claim, so another writer can take over.
 /// `Writer` is `Send` but not `Sync`, so writes through `&Writer` never overlap:
 ///
 /// ```compile_fail
@@ -644,15 +709,21 @@ pub fn checked_region_len(cfg: &Config) -> Option<usize> {
 pub struct Writer<WD: WakeSource> {
     inner: Arc<Inner>,
     data: WD,
-    /// The writer's position; the region copy is published for readers only.
+    /// The writer's position.
+    ///
+    /// The copy in the region exists only for readers.
     committed: Cell<u64>,
 }
 
 impl<WD: WakeSource> Writer<WD> {
-    /// Publish one record without blocking.
-    /// Returns [`WriteError::WouldBlock`] if readers pin the required space.
-    /// A blocked write may publish wrap padding, but never a payload.
-    /// Returns [`WriteError::Corrupt`] if a reader cursor is ahead of this writer.
+    /// Publishes one record without blocking.
+    ///
+    /// # Errors
+    /// - [`WriteError::InsufficientCapacity`] if the record can never fit.
+    /// - [`WriteError::WouldBlock`] if readers have not yet read the space the
+    ///   record needs. The call may still publish wrap padding, but never part
+    ///   of the record.
+    /// - [`WriteError::Corrupt`] if a reader cursor is ahead of this writer.
     pub fn try_write(&self, bytes: &[u8]) -> Result<(), WriteError> {
         let cap = self.inner.geometry.capacity;
         let rec = checked_frame_len(bytes.len(), cap)?;
@@ -686,7 +757,7 @@ impl<WD: WakeSource> Writer<WD> {
         fits(committed, slowest, need, self.inner.geometry.capacity)
     }
 
-    /// Store a new position locally and, with Release, to the region.
+    /// Stores a new position locally, then in the region with Release ordering.
     #[inline]
     fn publish(&self, committed: u64) {
         self.committed.set(committed);
@@ -694,8 +765,8 @@ impl<WD: WakeSource> Writer<WD> {
     }
 
     /// # Safety
-    /// The writer claim is held. The record fits contiguously in unpinned space,
-    /// and `end_abs` equals its start plus its frame length.
+    /// The writer claim is held. The record fits contiguously in space no reader
+    /// pins, and `end_abs` is `start_abs` plus the record's frame length.
     unsafe fn commit(&self, committed: u64, start_abs: u64, end_abs: u64, gap: u64, bytes: &[u8]) {
         let phys = (start_abs & self.inner.geometry.mask()) as usize;
         // SAFETY: record is contiguous and in-bounds (caller contract).
@@ -733,47 +804,66 @@ impl Located {
     }
 }
 
-/// An independent reader. Dropping it releases its shared reader slot.
+/// A reader with its own cursor.
+///
+/// Views never consume records for each other. Dropping a view frees its
+/// reader slot, so the writer stops waiting on it.
 pub struct View<RD: WakeSink> {
     inner: Arc<Inner>,
     slot: u32,
-    /// The view's position; its slot holds a published copy for the writer.
+    /// The view's position.
+    ///
+    /// The copy in its slot exists for the writer.
     cursor: Cell<u64>,
     data: RD,
-    /// Drain progress applied once its borrowed slices can no longer be used.
+    /// The position a drain has read up to.
+    ///
+    /// It is applied to the cursor once the drain's slices can no longer be used.
     pending: Option<u64>,
 }
 
 impl<RD: WakeSink> View<RD> {
-    /// Absolute read position. Pending drain consumption is not yet included.
+    /// Returns the absolute read position.
+    ///
+    /// Records a drain has yielded are not counted until the view settles.
     pub fn cursor(&self) -> u64 {
         self.cursor.get()
     }
 
-    /// Absolute published position in bytes, including wrap padding.
+    /// Returns the absolute published position in bytes.
+    ///
+    /// Wrap padding counts toward it.
     pub fn committed(&self) -> u64 {
         self.inner.control().committed.load(Acquire)
     }
 
-    /// The endpoint this view waits on, for a caller waiting on several views.
+    /// Returns the sink this view waits on.
+    ///
+    /// Use it when one caller waits on several views.
     pub fn wake(&self) -> &RD {
         &self.data
     }
 
-    /// Whether an unread record is waiting, skipping any wrap padding.
+    /// Returns whether an unread record is waiting.
+    ///
+    /// Wrap padding does not count.
     pub fn has_record(&self) -> bool {
         matches!(self.locate(), Ok(Some(_)))
     }
 
-    /// Apply a drain's deferred consumption now, so the cursor is exact.
+    /// Applies a drain's deferred consumption now.
+    ///
+    /// After this, [`Self::cursor`] is exact.
     pub fn settle(&mut self) {
         if let Some(pos) = self.pending.take() {
             self.advance(pos);
         }
     }
 
-    /// Borrow the next unread record, or return `None` if caught up.
-    /// Dropping the grant consumes the record and lets the writer reuse its space.
+    /// Borrows the next unread record.
+    ///
+    /// Returns `None` if the view has caught up. Dropping the grant consumes the
+    /// record and lets the writer reuse its space.
     pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_>>, ReadError> {
         self.settle();
         let Some(loc) = self.locate()? else {
@@ -782,9 +872,11 @@ impl<RD: WakeSink> View<RD> {
         Ok(Some(self.grant(loc)))
     }
 
-    /// Skip older unread records and borrow the newest until the next mutable
-    /// access to this view. The newest stays pinned, so repeated calls can
-    /// return it again. Returns `None` when this view has no unread record.
+    /// Skips older unread records and borrows the newest one.
+    ///
+    /// The newest record is not consumed. It stays pinned, so calling this again
+    /// returns it again until a newer record arrives. Returns `None` when the
+    /// view has no unread record.
     pub fn try_latest(&mut self) -> Result<Option<&[u8]>, ReadError> {
         self.settle();
         loop {
@@ -821,9 +913,12 @@ impl<RD: WakeSink> View<RD> {
         }
     }
 
-    /// Iterate records published before this call as borrowed slices, which may coexist.
-    /// Consumption is deferred until the next mutable view operation, after all
-    /// slices are no longer used. Stopping early consumes only yielded records.
+    /// Borrows every record published before this call.
+    ///
+    /// All the slices can be held at once, because consumption is deferred. The
+    /// view's cursor moves at the next mutable operation on the view, once no
+    /// slice is in use. If iteration stops early, only the records already
+    /// yielded are consumed.
     pub fn drain(&mut self) -> Drain<'_> {
         self.settle();
         let pos = self.cursor();
@@ -838,7 +933,7 @@ impl<RD: WakeSink> View<RD> {
         }
     }
 
-    /// Published position excluding a trailing wrap gap.
+    /// Returns the published position, minus a wrap gap at the very end.
     fn data_end(&self) -> u64 {
         let committed = self.inner.control().committed.load(Acquire);
         let hwm = self.inner.control().hwm.load(Acquire);
@@ -862,14 +957,16 @@ impl<RD: WakeSink> Drop for View<RD> {
     }
 }
 
-/// Store a view position locally and release it to the view's slot.
+/// Stores a view's position locally, then in its slot with Release ordering.
 #[inline]
 fn store_cursor(local: &Cell<u64>, slot: &AtomicU64, pos: u64) {
     local.set(pos);
     slot.store(pos, Release);
 }
 
-/// A borrowed record, dereferencing to its payload. Dropping it consumes the record.
+/// A borrowed record.
+///
+/// It derefs to the record's payload. Dropping it consumes the record.
 pub struct ReadGrant<'a> {
     cursor: &'a Cell<u64>,
     slot: &'a AtomicU64,
@@ -890,7 +987,9 @@ impl Drop for ReadGrant<'_> {
     }
 }
 
-/// Borrows unread records while deferring consumption. See [`View::drain`].
+/// An iterator over unread records that defers consuming them.
+///
+/// See [`View::drain`].
 pub struct Drain<'a> {
     inner: &'a Inner,
     pos: u64,

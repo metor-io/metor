@@ -1,4 +1,4 @@
-//! Ring behavior tests. Miri skips mmap and executor tests; see `VERIFY.md`.
+//! Ring behavior tests. Miri skips the mmap and executor tests. See `VERIFY.md`.
 use super::*;
 use crate::backing::Word;
 use crate::models::{self, DEAD_PID, read, ring};

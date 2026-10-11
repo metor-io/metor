@@ -1,10 +1,16 @@
-//! Typed ports over ring handles.
+//! Typed ports that systems read and write.
+//!
+//! A port wraps ring handles and encodes or decodes records of one type. An
+//! [`Output`] writes to one ring. An [`Input`] reads from every ring that feeds
+//! it, one per producer.
 
 use core::borrow::Borrow;
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::ops::Deref;
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::coordinator::OutputSource;
 use crate::def::{DefCx, DefError};
@@ -23,7 +29,10 @@ use readiness::Waiters;
 pub use sample::Sample;
 pub(crate) use sample::Samplers;
 
-/// Returns the power-of-two capacity for a ring of `depth` records of `max_len` bytes.
+/// Returns the ring capacity needed to hold `depth` records.
+///
+/// Each record is at most `max_len` bytes. The capacity is a power of two and
+/// always fits at least two records. Returns `None` on overflow.
 pub fn ring_capacity(max_len: usize, depth: usize) -> Option<usize> {
     u32::try_from(max_len).ok()?;
     max_len.checked_add(2 * PAYLOAD_ALIGNMENT - 1)?;
@@ -32,7 +41,9 @@ pub fn ring_capacity(max_len: usize, depth: usize) -> Option<usize> {
         .checked_next_power_of_two()
 }
 
-/// A `SendError` is why a write published no record.
+/// An error from writing to an [`Output`].
+///
+/// When a write returns an error, no record was published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SendError {
     #[error("record of {len} bytes exceeds the port's {max}")]
@@ -45,7 +56,7 @@ pub enum SendError {
     Busy,
 }
 
-/// A `RecvError` is why a drained record produced no value.
+/// An error from reading an [`Input`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RecvError {
     #[error(transparent)]
@@ -54,7 +65,7 @@ pub enum RecvError {
     Decode(DecodeError),
 }
 
-/// Rejects a record longer than the port's bound before it reaches the ring.
+/// Rejects a record longer than `max` before it reaches the ring.
 fn bounded(bytes: &[u8], max: usize) -> Result<&[u8], SendError> {
     if bytes.len() > max {
         return Err(SendError::Oversize {
@@ -65,7 +76,9 @@ fn bounded(bytes: &[u8], max: usize) -> Result<&[u8], SendError> {
     Ok(bytes)
 }
 
-/// A scratch buffer lent out of its cell for one write, returned on drop.
+/// A scratch buffer borrowed for one write.
+///
+/// Dropping it puts the buffer back in its cell.
 struct Lent<'a> {
     cell: &'a Cell<Option<Box<[u8]>>>,
     buf: Box<[u8]>,
@@ -84,23 +97,51 @@ impl Drop for Lent<'_> {
     }
 }
 
-/// An `Output` is the writing half of one ring, publishing records of type `T`.
+/// Publishes records of type `T` to one ring.
 ///
-/// `W` is the endpoint notified after each write. System outputs use [`NoWake`];
-/// adapter writers feeding async inputs use [`Notifier`].
+/// `W` is notified after each write. System outputs use [`NoWake`]. Adapters
+/// that feed async inputs use [`Notifier`], so the async system wakes up.
 pub struct Output<T: ?Sized, W: WakeSource = NoWake> {
     writer: Writer<W>,
-    /// Empty while a write holds it.
+    /// The encode buffer.
+    ///
+    /// It is empty while a write is using it.
     scratch: Cell<Option<Box<[u8]>>>,
-    /// The longest record this port takes: the type's bound, or the binding's
-    /// for a dynamic port, whose record the type does not know.
+    /// The longest record this port accepts.
+    ///
+    /// For a typed port this is `T::MAX_LEN`. A dynamic port does not know its
+    /// record type, so its binding sets the limit.
     max_len: usize,
+    /// The count of failed writes, shared with the system's other outputs.
+    dropped: Arc<AtomicU32>,
     _t: PhantomData<T>,
 }
 
+impl<T: ?Sized, W: WakeSource> Output<T, W> {
+    /// Counts a failed write and returns `result` unchanged.
+    ///
+    /// The count saturates instead of wrapping.
+    fn counted(&self, result: Result<(), SendError>) -> Result<(), SendError> {
+        if result.is_err() {
+            let _ = self
+                .dropped
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1));
+        }
+        result
+    }
+}
+
 impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
-    /// Binds a writer. A record aligned above the ring guarantee fails the build.
+    /// Creates an output that writes through `writer`.
+    ///
+    /// A record type that needs more alignment than the ring provides fails to
+    /// compile.
     pub fn new(writer: Writer<W>) -> Self {
+        Self::counting(writer, Arc::default())
+    }
+
+    /// Creates an output that counts its failed writes in `dropped`.
+    pub fn counting(writer: Writer<W>, dropped: Arc<AtomicU32>) -> Self {
         const {
             assert!(
                 T::ALIGN <= PAYLOAD_ALIGNMENT,
@@ -111,12 +152,14 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
             writer,
             scratch: Cell::new(Some(vec![0; T::MAX_LEN].into_boxed_slice())),
             max_len: T::MAX_LEN,
+            dropped,
             _t: PhantomData,
         }
     }
 
-    /// This port's entry in a bundle's `defs()` walk, announcing its record
-    /// under `cx`'s root for `name`.
+    /// Returns the definition of an output port called `name`.
+    ///
+    /// The record's schema is rooted at `name` under `cx`'s root.
     pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
         PortDef {
             name: name.into(),
@@ -130,9 +173,15 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
         }
     }
 
-    /// Publishes one value as one record.
-    /// An `encode` that writes to this same port gets [`SendError::Busy`].
+    /// Encodes `value` and publishes it as one record.
+    ///
+    /// A failure is counted as well as returned. If `T::encode` itself writes
+    /// to this same port, that inner write fails with [`SendError::Busy`].
     pub fn write(&self, value: &T) -> Result<(), SendError> {
+        self.counted(self.encode_write(value))
+    }
+
+    fn encode_write(&self, value: &T) -> Result<(), SendError> {
         let mut scratch = Lent::take(&self.scratch)?;
         let bytes = value.encode(&mut scratch.buf).map_err(SendError::Encode)?;
         let bytes = bounded(bytes, self.max_len)?;
@@ -141,28 +190,39 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
 }
 
 impl<W: WakeSource> Output<Bytes, W> {
-    /// Binds a dynamic port's writer, bounding it by the record `max_len` its
-    /// binding named.
+    /// Creates a dynamic output that writes raw bytes.
+    ///
+    /// Records longer than `max_len` are rejected.
     pub fn bytes(writer: Writer<W>, max_len: usize) -> Self {
+        Self::bytes_counting(writer, max_len, Arc::default())
+    }
+
+    /// Creates a dynamic output that counts its failed writes in `dropped`.
+    pub fn bytes_counting(writer: Writer<W>, max_len: usize, dropped: Arc<AtomicU32>) -> Self {
         Self {
             writer,
             scratch: Cell::new(Some(Box::default())),
             max_len,
+            dropped,
             _t: PhantomData,
         }
     }
 
-    /// Publishes a record's bytes as they arrived, without encoding.
+    /// Publishes already-encoded bytes as one record.
+    ///
+    /// A failure is counted as well as returned.
     pub fn write_bytes(&self, bytes: &[u8]) -> Result<(), SendError> {
-        let bytes = bounded(bytes, self.max_len)?;
-        self.writer.try_write(bytes).map_err(SendError::Ring)
+        let written = bounded(bytes, self.max_len)
+            .and_then(|bytes| self.writer.try_write(bytes).map_err(SendError::Ring));
+        self.counted(written)
     }
 }
 
-/// An `Input` is the reading half of every ring feeding one port of type `T`.
+/// Reads records of type `T` from every producer feeding one port.
 ///
-/// `W` is the endpoint each view waits on. Async inputs wait on every producer,
-/// whether their [`Notifier`] handles are shared or independent.
+/// Each producer writes its own ring, and the input holds one view per ring.
+/// `W` is what those views wait on. An async input wakes when any producer
+/// writes, whether the producers share one [`Notifier`] or each have their own.
 pub struct Input<T: ?Sized, W: WakeSink = NoWake> {
     views: Vec<View<W>>,
     waiters: Waiters,
@@ -170,8 +230,10 @@ pub struct Input<T: ?Sized, W: WakeSink = NoWake> {
 }
 
 impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
-    /// Binds one view per producer. A record aligned above the ring guarantee
-    /// fails the build.
+    /// Creates an input that reads from `views`, one per producer.
+    ///
+    /// A record type that needs more alignment than the ring provides fails to
+    /// compile.
     pub fn new(views: Vec<View<W>>) -> Self {
         const {
             assert!(
@@ -186,12 +248,14 @@ impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
         }
     }
 
-    /// This port's entry in a bundle's `defs()` walk.
+    /// Returns the definition of an input port called `name`.
     pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
         Output::<T>::def(cx, name)
     }
 
-    /// Reads every unread record, producer by producer in bind order.
+    /// Reads every unread record.
+    ///
+    /// Producers are read one at a time, in the order they were bound.
     pub fn drain(&mut self) -> impl Iterator<Item = Result<T::Read<'_>, RecvError>> + '_ {
         self.views.iter_mut().flat_map(|view| {
             view.drain().map(|record| {
@@ -201,9 +265,12 @@ impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
         })
     }
 
-    /// Returns the newest record across producers
+    /// Returns the newest unread record across all producers.
     ///
-    /// Records without timestamps are produced in order of the producers
+    /// Records are compared by timestamp. On a tie, or when records have no
+    /// timestamp, the earliest-bound producer wins. Older records are skipped.
+    /// The returned record stays unread, so the next call returns it again
+    /// until a newer one arrives.
     pub fn latest(&mut self) -> Result<Option<Latest<'_, T>>, RecvError> {
         let mut best: Option<(Option<Timestamp>, T::Read<'_>)> = None;
         for view in self.views.iter_mut() {
@@ -219,7 +286,9 @@ impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
         Ok(best.map(|(_, decoded)| Latest { decoded }))
     }
 
-    /// Applies deferred drain consumption, then reports the first producer with a record.
+    /// Returns the index of the first producer with an unread record.
+    ///
+    /// Deferred drain consumption is applied first.
     fn ready(&mut self) -> Option<usize> {
         self.views.iter_mut().position(|view| {
             view.settle();
@@ -229,8 +298,9 @@ impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
 }
 
 impl<T: Record + ?Sized> Input<T, Notifier> {
-    /// Waits for the next record, then reads it from the first producer holding one.
+    /// Waits for the next record and reads it.
     ///
+    /// If several producers have records, the earliest-bound one is read first.
     /// Never resolves on a port with no producer.
     pub async fn next(&mut self) -> Result<T::Read<'_>, RecvError> {
         let at = readiness::wait(self).await;
@@ -245,8 +315,9 @@ impl<T: Record + ?Sized> Input<T, Notifier> {
     }
 }
 
-/// One port per config edge no declared port took, under the config's name
-/// and its producer's definition.
+/// Returns definitions for config inputs that no declared port claimed.
+///
+/// Each port takes its name from the config and its record from its producer.
 pub fn dyn_input_defs(
     cx: &DefCx<'_>,
     declared: &[Cow<'static, str>],
@@ -269,8 +340,10 @@ pub fn dyn_input_defs(
     Ok(ports)
 }
 
-/// One port per config output no declared port took, defined by the record it
-/// names or the definition `metor build` resolved for it.
+/// Returns definitions for config outputs that no declared port claimed.
+///
+/// Each port's record comes from the record the config names, or from the
+/// definition `metor build` resolved for it.
 pub fn dyn_output_defs(
     cx: &DefCx<'_>,
     declared: &[Cow<'static, str>],
@@ -291,16 +364,16 @@ pub fn dyn_output_defs(
         .collect()
 }
 
-/// A `DynInputs` is the input side of a system whose ports the config lists.
+/// Inputs for a system whose ports are listed in config instead of code.
 ///
-/// Each port carries the definition it computed from the config and the bytes
-/// its producer wrote, undecoded.
+/// Records arrive as raw bytes, undecoded. Each port comes with the definition
+/// computed from the config, so the system can tell what it carries.
 pub struct DynInputs<W: WakeSink = NoWake> {
     ports: Vec<(PortDef, Input<Bytes, W>)>,
 }
 
 impl<W: WakeSink> DynInputs<W> {
-    /// Every port's definition and the records waiting on it.
+    /// Returns each port's definition alongside its input.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Input<Bytes, W>)> {
         self.ports.iter_mut().map(|(def, input)| (&*def, input))
     }
@@ -329,13 +402,25 @@ impl<W: WakeSink> SystemInputs<W> for DynInputs<W> {
     }
 }
 
-/// A `DynOutputs` is the output side of a system whose ports the config lists.
+/// Outputs for a system whose ports are listed in config instead of code.
 pub struct DynOutputs<W: WakeSource = NoWake> {
     ports: Vec<(PortDef, Output<Bytes, W>)>,
 }
 
 impl<W: WakeSource> DynOutputs<W> {
-    /// Every port's definition and the writer publishing on it.
+    /// Creates the outputs, counting their failed writes in `dropped`.
+    pub fn counting(outputs: Vec<OutputBinding<W>>, dropped: &Arc<AtomicU32>) -> Self {
+        let ports = outputs
+            .into_iter()
+            .map(|b| {
+                let output = Output::bytes_counting(b.writer, b.def.max_len, dropped.clone());
+                (b.def, output)
+            })
+            .collect();
+        Self { ports }
+    }
+
+    /// Returns each port's definition alongside its output.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Output<Bytes, W>)> {
         self.ports.iter_mut().map(|(def, output)| (&*def, output))
     }
@@ -347,24 +432,21 @@ impl<W: WakeSource> SystemOutputs<W> for DynOutputs<W> {
     }
 
     fn bind(outputs: Vec<OutputBinding<W>>) -> Self {
-        let ports = outputs
-            .into_iter()
-            .map(|b| {
-                let output = Output::bytes(b.writer, b.def.max_len);
-                (b.def, output)
-            })
-            .collect();
-        Self { ports }
+        Self::counting(outputs, &Arc::default())
     }
 }
 
-/// A `Latest` holds a decoded record, borrowed from the input or owned.
+/// The newest record, returned by [`Input::latest`].
+///
+/// It derefs to the decoded record.
 pub struct Latest<'a, T: Record + ?Sized + 'a> {
     decoded: T::Read<'a>,
 }
 
 impl<'a, T: Record + ?Sized> Latest<'a, T> {
-    /// Returns the decoded record: a borrow for a frame, an owned value for a message.
+    /// Returns the decoded record.
+    ///
+    /// A frame is borrowed from the ring. A message is decoded into an owned value.
     pub fn into_inner(self) -> T::Read<'a> {
         self.decoded
     }
@@ -562,6 +644,44 @@ mod tests {
             out.write(&Imu::new(2, 2.0)),
             Err(SendError::Ring(WriteError::WouldBlock))
         );
+    }
+
+    #[test]
+    fn test_full_ring_write_counts() {
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: 64,
+            max_readers: 1,
+        });
+        let dropped = Arc::new(AtomicU32::new(0));
+        let writer = ring.writer(NoWake).expect("free writer");
+        let out = Output::<Imu>::counting(writer, dropped.clone());
+        let _input = input::<Imu>(&ring);
+        out.write(&Imu::new(0, 0.0)).expect("ring has room");
+        out.write(&Imu::new(1, 1.0)).expect("ring has room");
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            out.write(&Imu::new(2, 2.0)),
+            Err(SendError::Ring(WriteError::WouldBlock))
+        );
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        dropped.store(u32::MAX, Ordering::Relaxed);
+        assert!(out.write(&Imu::new(3, 3.0)).is_err());
+        assert_eq!(dropped.load(Ordering::Relaxed), u32::MAX, "saturates");
+    }
+
+    #[test]
+    fn test_oversize_write_counts() {
+        let ring = ring::<Imu>(8, 1);
+        let dropped = Arc::new(AtomicU32::new(0));
+        let writer = ring.writer(NoWake).expect("free writer");
+        let out = Output::bytes_counting(writer, 4, dropped.clone());
+        assert_eq!(
+            out.write_bytes(&[0; 5]),
+            Err(SendError::Oversize { len: 5, max: 4 })
+        );
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        out.write_bytes(&[0; 4]).expect("fits");
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 
     #[test]

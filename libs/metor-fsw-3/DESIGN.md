@@ -1,285 +1,116 @@
 # Metor FSW
 
-Metor FSW is a framework for building modular and reusable flight software and ground systems. We achieve this by breaking up software into a series of sub-programs we call "systems". Systems can broadly be thought of as function that has some inputs, some outputs, and shared state. Systems are joined together using a series of shared memory ring buffers.
-
-## Rings, Frames, and Messages
-
-A key concept in Metor FSW is the ring. A ring is a single producer multi consumer ring buffer. Readers create "views" into rings that allow them to read the contents. Systems take in "views" as inputs, and create rings as outputs. This allows you to compose systems into each other. For example you can do the following in pseudo code
+Metor FSW is a framework for building modular flight software and ground
+systems. Software is split into systems. A system is a function over some
+inputs, some outputs, and a state of its own. Systems are joined by ring
+buffers, and a coordinator steps them in a fixed order once per cycle.
 
 ```python
-gps = gps_driver()
-imu = imu_driver()
-nav = nav_filter(gps = gps, accel = imu.accel)
+gps = fsw.add("gps", GpsDriver())
+imu = fsw.add("imu", ImuDriver())
+nav = fsw.add("nav", NavFilter(gps=gps.fix, accel=imu.accel))
 ```
 
-nav_filter takes in a series of rings –- in this case gps and accell - and produces its own outputs also has rings. When nav_filter accepts data it is in the form of a "View"
+`nav` reads the rings `gps` and `imu` write, and writes rings of its own
+that later systems read.
 
-### Rings
+## Rings
 
-Ring buffers in metor are SPMC (single producer multi consumer) ring buffers, that can work cross process. Ring buffers have a fixed number of reader slots, than new readers can claim a slot. More details on the implementation can be found in ../metor-fsw-2/ring/lib.rs
+A ring (`metor-fsw-3-ring`) has one writer and a fixed number of reader
+slots. Each reader keeps its own cursor, and the writer never reuses bytes
+a reader has not released, so a full ring refuses a write rather than
+overwrite. A ring lives in memory it is handed, so it works across
+processes as well as within one. `ring/DESIGN.md` has the layout and the
+memory ordering, and `ring/VERIFY.md` the Miri, Kani, and Loom checks.
 
+## Records
 
-### Frames
+Everything on a ring is a `Record`: a name, an id, a largest length, and a
+codec. There are two kinds.
 
-Frames are collections of data that can be decomposed into "components". A component is a multi-dimensional array (aka a tensor) of a fixed size. For example the following is a valid frame;
+- A frame is a fixed `#[repr(C)]` value whose bytes are its record. Its
+  fields decompose into components, the tensors telemetry announces. A
+  frame may carry a timestamp.
+- A message is any serde value with a codec: postcard, JSON, or raw bytes.
 
 ```rust
-#[derive(Frame)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
-struct IMU {
+struct Imu {
     #[frame(timestamp)]
     timestamp: Timestamp,
     accel: [f64; 3],
     gyro: [f64; 3],
 }
-```
 
-You will also notice that a frame has an optional timestamp field. This is particularly useful for data that might come from time-domains other than the main software run-loop.
-
-### Dynamic Frames 
-
-A feauture of the fsw ring implementation is that each write as an associated length. This allows you to encode variable length data in the ring buffer. One use case for this is dynamic frames. A dynamic frame is a frame that has a variable number of components.
-
-This feature is similar in concept to how flatbuffers or rkyv handle dynamic data, with some minor differences. A dynamic container is really a pointer into extra space at the end of the frame.  For instance the memory layout would look something like this:
-
-```
-+----------------+
-| frame header   |
-+----------------+
-| component 1    |
-+----------------+
-| len | offset   |
-+----------------+
-| dynamic data   |
-+----------------+
-```
-
-In code you would define this as follows:
-
-```rust
-struct Top {
-    #[frame(timestamp)]
-    timestamp: Timestamp,
-    processes: FrameList<Process>,
+#[derive(Record, Schema, Serialize, Deserialize)]
+#[record(max_len = 8)]
+struct Arm {
+    on: bool,
 }
 ```
- 
-Reading and writing the frame is then done via a "Yoke" (inspired by the fantastic ). So you would have a `Yoke<Top, &[u8]>` that you could then use to read from the frame using generator accessors like `top.processes()`. Similarly this would work for writing as well with a `Yoke<Top, &mut [u8]>`; you could use this with `top.processes_mut()` to write to the dynamic data.
 
-### Messages
-
-Sometimes you need to send structured data that can not or should not be easily repersented as a series of components. In this case we also support "Messages" that are sent as variables length raw bytes, and not interpreted as a series of components.
-
-In previous versions of metor-fsw, there were different delivery semantics for messages and frames by default. Now all messages and frames use the same delivery semantic. All writes will be read by all readers. Similarly messages used to be hard-coded for postcard, that should no longer be the case 
+Frames and messages share one delivery rule: every reader reads every
+record. `Output<T>` writes, `Input<T>` reads with `latest`, `drain`, or, on
+an async system, `next`. An input fed by several producers holds one view
+per producer. `latest` returns the newest record by timestamp, and records
+without one in producer order.
 
 ## Systems
 
-As discussed above systems are conceptually functions that do some isolated task. Systems are called by metor-fsw in a fixed order, and are initialized with a series of rings. Broadly systems follow this series of traits:
+A system is a `#[system]` fn. Each parameter is a port named after its
+identifier, and one `#[state]` parameter is the state its constructor
+builds. The fn's doc comment is the system's doc.
 
 ```rust
-type System {
-    fn def() -> SystemDef;
-    type State: SystemState;
-    type Inputs: SystemInputs;
-    type Outputs: SystemOutputs;
-    fn execute(state: &mut State, inputs: &Inputs, outputs: &mut Outputs);
+/// Counts fixes and forwards the newest.
+#[system]
+fn nav(#[state] s: &mut NavState, gps: &mut Input<Gps>, out: &mut Output<Gps>) {
+    if let Ok(Some(fix)) = gps.latest() {
+        s.fixes += 1;
+        let _ = out.write(&Gps { timestamp: fix.timestamp, pos: fix.pos });
+    }
 }
 
-trait SystemState {
-    fn from_config()
-}
-
-trait SystemInputs {
-    fn from_views(views: &[View]) -> Self;
-}
+table.register("nav", nav(), NavState::default)?;
 ```
 
-A `SystemDef` contains all of the type information about a system. Basically just what inputs and outputs it expects. This allows the fsw to feed views into the system, and to create new ring buffers for its outputs.
+A constructor is `Fn() -> S`, `Fn(P) -> S`, or `Fn(P) -> Result<S,
+ParamError>`. `P` is decoded from the instance's JSON params, and its JSON
+Schema types the Python binding.
 
-Systems have "state" which is a mutably accesible type that they can put whatever state they need into. A system's state is its own; no other system can reach it. Sharing is an opt-in extra, a parameter naming a shared instance, designed in `docs/plans/05-links.md` and held until a case needs it.
+Other parameters a system may take:
 
+- `Timestamp`: this cycle's time.
+- `&mut Log`: the system's `log` output, which every system has. `tracing`
+  events inside the call land there too.
+- `&Sample<T>`: the newest frame on an input, taken once at the cycle's
+  start.
+- `DynInputs` and `DynOutputs`: ports its config lists rather than its type.
 
-### Defining Systems
+A failed write returns its error. It also counts toward one
+`publish_dropped` fault on the system's `log` that cycle, so a caller that
+ignores the error still leaves a trace.
 
-Although systems can be anything that implements the `System` trait, they are typically defined using a system builder. You can define a new system as follows:
+A system's definition is computed from its instance config, so a type whose
+ports depend on its params, such as a link, is an ordinary system.
 
-```rust
-struct Nav { ... }
-impl Nav { 
-    fn new() -> Self { ... }
-}
+The coordinator adds a `status` output to every system and writes
+`SystemStatus` there each cycle: the execution time and its offset into
+the cycle.
 
-fn nav(state: &mut Nav, gps: &mut Input<Gps>, imu: &mut Input<Imu>, est: &mut Output<Est>) { ... }
+### Async systems
 
-let system = system(nav).with_state(Nav::new);
-```
-
-
-### Adapters
-
-Often we will want systems to run in different contexts; for instance we might want a system to run in a different process, in a shared object library, in a different thread, or even in WASM. Adapters are the way that we bridge between native in process systems, and these different types of systems. metor-fsw natively does not know about any of these other contexts.
-
-
-Broadly adapters pretend to be a normal system, and then call out to the "real" system in the background. For WASM that means executign the system in the WASM worker. For a process that means notifying the other process to execute, and using shared memory to bridge the rings. Rings are backed by mmaped memory slices to facilitate this shared memory behaivor.
-
-The first adapter is the thread adapter. A system authored as one `async fn run(.., stop)` runs on a background thread; the adapter mirrors each of its rings and copies records across every cycle, so the loop never waits on IO and a slow consumer drops only its own copies. Async systems share one background thread by default and are placed on a named thread with `fsw.add(.., thread="gps")`. Adapters are ordinary table entries: one closure that takes the instance's id, thread, definition, params, and rings, and returns a step.
-
-
-## Coordinator
-
-The coordinator is responsible for calling out to systems. Fundementally it is a very simple structure that loops through a list of systems and executes them one after another. 
-
-The coordinator takes in a low level config, that is not designed to be authored by end-users. It is shaped roughly as follows:
-
-```
-struct CoordinatorConfig {
-  systems: Vec<SystemConfig>,
-}
-
-struct SystemConfig {
-  id: String,
-  ty: String,
-  inputs: Vec<InputConfig>
-}
-
-struct InputConfig {
-  system: String,
-  port: String,
-}
-```
-
-These configurations assume that the list of systems available to the coordinator is provided ahead of time.
-
-The coordinator also injects its own port into each system that includes telemetry about how the system ran including:
-```
-exec_time_ns: u64,
-exec_offset_ns: u64,
-```
-
-## Configuration
-
-Most users will configure metor-fsw through Python that generates a valid config for the build system and coordinator.
-
-For instance the following is an example of a simple metor-fsw configuration:
-
-```python
-from adcs import Nav, Control
-from plant import Plant
-
-fsw = Target(cycle_rate = 100.0, namespace = "cube_sat")
-motor_cmd = fsw.loop()
-plant = fsw.add("plant", Plant(
-    altitude=400e3,  
-    inclination=math.radians(97.03),  
-    ltan_hours=10.5, 
-    motor_cmd = motor_cmd,
-))
-
-nav = fsw.add("nav", Nav(imu = plant.imu))
-control = fsw.add("control", Control(est = nav.est))
-
-motor_cmd.connect(control)
-```
-
-There are a number of notable things going on here. For starts, we are importing type-safe Python bindings for each "pack", a pack is a set of systems built together.
-
-For another, we are declaring a "loop" that is a place where the outputs of a system feed into the input of a system that runs before it. You have to manually declare these, because they invoke a 1 cycle phase delay.
-
-### Build System
-
-So far we have side-stepped how we actually get systems to be built or included. Like what is a system actually? Some systems are built into metor-fsw, but most useful systems will be distributed external to metor-fsw.
-
-Systems are bundled into "packs". To define a pack you create a pyproject.toml file:
-
-```toml
-[project]
-name = "adcs"
-version = "0.1.0"
-description = "The plant, nav, and ctrl systems of the cube-sat example"
-requires-python = ">=3.11"
-
-[build-system]
-requires = ["metor-build"]
-build-backend = "metor_build"
-
-[tool.metor.pack]
-id = "adcs"
-
-[tool.uv.sources]
-metor-build = { path = "../../../../libs/metor-fsw-2/python/metor-build" }
-```
-
-Similarly to define a metor-fsw deployment you create a pyproject:
-
-```toml
-[project]
-name = "cube-sat"
-version = "0.1.0"
-description = "cube-sat target config"
-requires-python = ">=3.11"
-dependencies = ["adcs-pack", "adcs-seqs", "metor-config"]
-
-[tool.uv.sources]
-adcs-pack = { path = "systems/adcs", editable = true }
-adcs-seqs = { path = "systems/plant", editable = true }
-metor-config = { path = "../../libs/metor-fsw-2/python/metor-config", editable = true }
-```
-
-## Types of systems
-
-Thus far we've been dancing around what a system actually is. Broadly there are four types of system artifacts:
-- Shared object libraries - these are compiled libraries that are dlopened into the final executable
-- Executable - these are standalone executables that are run by metor-fsw
-- WASM - these are WASM libraries that are run by metor-fsw
-- Built-in - these are systems that are included with metor-fsw
-
-Each of these types of systems has a different adapter that allows it to be run by metor-fsw. Each of these adapters features a stable ABI. Broadly each of these ABIs are very similar, though may be subtetly differnet to account for the specifics of the binary type
-
-### Channels
-
-A channel is a name that addresses one system from outside the target, the name a `SequenceCommand` carries. `fsw.add(.., channel="mode")` wraps a cyclic system in the channel adapter, a step that reads the system's commands and applies them:
-
-- `Stop` stops executing the system, and `Start` resumes it where it stopped.
-- `Reset` drops the system and makes it again from its config, over the same rings.
-- `Abort` asks the system to finish. It arrives as a record on the system's `abort` input, which only the adapter feeds, so it crosses a pack boundary like any other ring.
-- `Load` replaces what the system runs, for a system that can load (a slot, below).
-
-The adapter adds three ports to the system: a `commands` input, an `events` output that reports each accepted or refused command and how the system ended, and a `channel_status` frame written every cycle. `fsw.commands(..)` wires one source of commands into every channel, and a `ChannelRegistry` publishes every channel of the target. Async systems take no channel.
-
-```python
-cmds = fsw.add("cmds", Subscribe([SequenceCommand], listen="0.0.0.0:2241"))
-fsw.commands(cmds.sequence_command)
-nav = fsw.add("nav", Nav(imu=plant.imu), channel="nav")
-registry = fsw.add("channels", ChannelRegistry())
-```
-
-### Slots
-
-Occasionally we might want to swap what system is running at runtime. That is what slots are for. A `DlSlot` is one place in the schedule that loads one of the pack systems it allows when its channel receives `Load`. Every allowed system has the first one's ports; `metor build` checks that, copies each library into a store under the hash of its bytes, and writes the stored path and hash into the slot's config. A `Load` hashes the library on its first open, opens it, checks its ports, and creates it over the slot's rings; a load that fails keeps the system the slot had. A rebuilt pack is a new hash and a new path, so it never replaces a library a running process has mapped.
-
-```python
-mode = fsw.add("mode", DlSlot(allow=[Commissioning(), SafeMode()], attitude=nav.est), channel="mode")
-```
-
-The slot's `channel_status` names what it has loaded: its index in the registry, its library's file name, and the library's hash.
+An `async fn` ending in `stop: Stop` runs on a background thread instead,
+and paces itself. The thread adapter gives it mirrors of its rings and
+copies records across each cycle, so the cycle never waits on it, and a
+full mirror drops records for that system alone. Async systems share one
+thread unless their config names another with `thread=`.
 
 ### Sequences
 
-Sequences are a special type of system that has re-entrant execution. A normal system executes the same function every cycle, starting from the top of a function. But in flight software we often want to execute a sequence of steps, that might take multiple cycles. In psuedo-code we want to write something like this:
-
-```
-motor0.power_en = true
-motor1.power_en = true
-motor2.power_en = true
-wait_for(|| motor0.healthy == true && motor1.healthy == true && motor2.healthy == true, timeout = 1.0)
-motor0.arm = true
-motor1.arm = true
-motor2.arm = true
-sleep(0.5s)
-control.arm = true
-```
-
-One way to think of this sequence is a state machine that moves through the, power, motor arm, and control arm, states. But it is nice to write this out sequentially because that is the "true" form of the sequence. Thankfully Rust has a nice convinent way of expressing a state machine. Async functions
+A `#[sequence]` async fn is polled once per cycle until it returns. Its
+`&Seq` handle reads the cycle's time and waits in cycle time.
 
 ```rust
 #[sequence]
@@ -297,15 +128,16 @@ async fn arm_controls(
 }
 ```
 
-The future the function returns is polled once per cycle. `seq` is the sequence's handle: `now()` is the cycle's time, `sleep` resolves once that much cycle time has passed, and `wait_for` checks its predicate every cycle until it holds or times out. Every sequence has an `abort` input, and a sequence given a channel can be started, stopped, reset, and aborted like any other system, or loaded into a slot from a pack.
+Every sequence has an `abort` input. An abort record, a tripped redline, or
+`seq.abort()` raises the abort flag, which never comes down. At the next
+cycle's start the step drops the body and ends `Aborted`. A failure or
+timeout does not abort on its own.
 
-#### Aborts, handlers, and redlines
-
-An abort record, a tripped redline, or the body calling `seq.abort()` raises the sequence's abort flag, which never comes down. At the next cycle's start the step does not poll the body: it drops it and ends `Aborted`. A failure or timeout does not abort on its own; the body calls `seq.abort()` when it should.
-
-An abort handler safes hardware. `seq.on_abort(|seq| ..)` returns a guard in the sequence's frame; when the guard drops with the flag up, its handler runs. Handlers cover the block that binds them and run innermost first, each under `catch_unwind`, so a panicking handler logs a `handler` fault and the rest still run. A panic in the body runs them too.
-
-A redline is a condition checked every cycle. `redline!(seq, "name", || cond)` pins it in the caller's block and links it into the `Seq`; it unlinks when the block ends. After the samples are taken and before the body is polled, the step checks the linked redlines in order. The first that holds logs a `redline` fault with its name and aborts the sequence. A condition may borrow the sequence's parameters, or own what it moves in, but not a body local, since a leaked redline would outlive it.
+`seq.on_abort(|seq| ..)` returns a guard. When it drops with the flag up,
+its handler runs, innermost first, each under `catch_unwind`. A redline is a
+condition checked every cycle before the body is polled:
+`redline!(seq, "name", || cond)`. The first that holds logs a `redline`
+fault and aborts the sequence.
 
 ```rust
 #[sequence]
@@ -321,59 +153,124 @@ async fn burn(seq: &Seq, valve: &mut Output<Valve>, pc: &Sample<Chamber>) -> Res
 }
 ```
 
-Handlers and the body write the same port because `Output::write` takes `&self`. Conditions read a `Sample<T>`: the newest frame on an input as of this cycle, taken once at the cycle's start and held, so the body and every redline see one value.
+Handlers and the body write one port because `Output::write` takes `&self`.
 
-A stopped channel is inert: its step is not executed, so samples are not taken, redlines are not checked, and handlers do not run. `Reset`, `Load`, or shutdown drop an unfinished body with the flag down, so no handlers run. An operator who wants to safe a stopped sequence starts it and aborts it.
+## The coordinator
 
-### ABI
+`CoordinatorConfig` lists systems in step order. Each names its registered
+type, its params, the producers of each input, and an optional adapter.
 
-metor-fsw uses a minimal ABI format to load packs from shared object libraries, and to execute systems from them. There will be a single public symbol `metor_fsw_pack_def` which will send a serialized `PackDef` struct to the caller. PackDef will rougly be defined as follows:
 ```rust
-struct PackDef {
-    systems: Vec<AbiSystemDef>,
-}
-struct AbiSystemDef {
-    /// Includes name, inputs, and outputs
-    system_def: SystemDef, 
-    /// fn pointer to the system's state constructor
-    state_ctor: Option<usize>,
-    /// fn pointer to the system's execution fn
-    execute_fn: usize, 
-}
+struct CoordinatorConfig { clock: Clock, ring_depth: usize, namespace: Option<String>, systems: Vec<SystemConfig> }
+struct SystemConfig { id, ty, params, inputs: Vec<InputConfig>, outputs: Vec<OutputConfig>, adapter: Option<Adapter> }
 ```
 
+`build` resolves each system's definition against a `SystemTable`, checks
+every edge's record, allocates one ring per output with one reader slot per
+edge, and binds each system over its rings. `step` executes the systems in
+list order with one timestamp. `run` paces `step` on a wall or simulated
+clock until its stop future resolves.
 
-## Deployments
+A system reads an output of a system after it through a loop edge, and
+reads the value of the cycle before. The Python `loop()` builds one. The
+coordinator does not mark or check it.
 
-So far we have discussed how a single target, or an instance of metor-fsw, functions, but in reality you often want to chain together multiple targets to form a large "deployment". A deployment is really just a collection of targets defined in a single config file. You can define one as follows:
+The coordinator steps `Box<dyn Step>` and knows nothing else. A panicking
+step is faulted once and dropped. Everything beyond a system's own call is
+an adapter: a table entry whose make returns a step.
+
+## Adapters
+
+- **Thread.** Runs an async system, as above.
+- **Channel.** `channel=` wraps a cyclic system in a step that applies
+  `SequenceCommand`s addressed to its name: `Start`, `Stop`, `Reset` (make
+  the system again over the same rings), `Abort` (a record on its `abort`
+  input), and `Load`. It adds a `commands` input, an `events` output that
+  reports each accepted or refused command and how the system ended, and a
+  `channel_status` output. `fsw.commands(..)` feeds every channel, and a
+  `ChannelRegistry` publishes the target's channels.
+- **Slot.** A `DlSlot` is one place in the schedule that loads one of the
+  pack systems its allow list names, on its channel's `Load`. Every
+  candidate has the first one's ports. A failed load keeps the occupant.
+- **Wasm.** A pack built as a module runs each system instance in a guest
+  of its own, with a fuel grant per step and a memory ceiling. Its rings
+  are copied into guest memory and back around each step.
+- **Dylib.** A pack built as a shared library is loaded into the process
+  and steps its systems through the ABI.
+
+## Packs and the ABI
+
+A pack is a crate that builds a `SystemTable` and exports it with
+`export_pack!`. It builds as a shared library, a wasm module, or both. One
+ABI serves both, eight `metor_fsw_*` symbols over JSON:
+
+| Symbol | Does |
+|---|---|
+| `abi_version` | the version the pack was built against |
+| `pack_def` | every system's type, kind, declared ports, doc, and params schema |
+| `def` | one instance's definition, from its config |
+| `create` | one instance over the host's rings |
+| `execute` | one step; returns a `Status` |
+| `destroy` | drops an instance |
+| `alloc`, `free` | memory the host hands across |
+
+`metor pack dev` builds a pack and writes its Python module: one class per
+system, typed from its definition and params schema.
+
+A slot loads from a content-addressed store. `metor build` copies each
+candidate into `.metor/store/<blake3>/<file>` and writes the stored path,
+hash, and ports into the slot's params. A load hashes the file on its first
+open. A rebuilt pack is a new path, so it never replaces a library a
+running process has mapped.
+
+## Configuration
+
+Targets are written in Python. Pack modules supply typed system classes,
+and `metor_config` records what the file adds.
 
 ```python
-deployment = Deployment(targets = [plant, fsw, gw])
+from adcs_pack import Ctrl, Nav, Plant, TorqueCmd
+from metor_config import Target
+
+fsw = Target(cycle_rate=100.0, namespace="cube_sat")
+torque = fsw.loop(TorqueCmd)
+plant = fsw.add("plant", Plant(torque_cmd=torque, seed=42))
+nav = fsw.add("nav", Nav(sensors=plant.sensors))
+ctrl = fsw.add("ctrl", Ctrl(estimate=nav.attitude_estimate))
+torque.connect(ctrl.torque_cmd)
 ```
 
-#### Running
+Add order is step order, so a system names only ports of systems already
+added, or a loop.
 
-Deployments can be run a few ways. For local development the primrary path is to run it using the `metor run` command. In that state the entire deployment will be run at once. Deployments can also be run individually using the `metor run --target` command. 
+A file emits one envelope, config version 2: every target's packs and
+`CoordinatorConfig`, and a map of where each target runs. A file with one
+`Target` is a deployment of one. `metor build` resolves the envelope:
 
-For production deployments you likely want to distribute the work across multiple machines. metor-fsw supports different deployment backends to facilitate this. For example you can render the set of deployments out into a NixOS configuration, and then dploy it using whatever tools you want. 
+- a `peer` transport becomes the address of the link it names;
+- a peer output becomes the definition of the port it copies;
+- a db learns the commands its subscribers take;
+- a slot candidate's pack becomes a stored library.
 
+`metor run` builds and runs every target, or one with `--target`.
 
-### Cross target communication
+## Links and gateways
 
-What good is multiple targets if they can't talk to each other? To facilate that metor-fsw supports cross-targets coms. A `Publish` system serves the records you pass it as inputs over metor-proto, and a `Subscribe` system receives records and emits them as outputs. Each owns its own socket: a transport of `listen=` or `connect=`, so a target can serve the panel, push into a db, or dial another target with the same two systems.
+`Publish` serves the records wired into it over metor-proto. `Subscribe`
+writes the records it is sent onto ports of its own. Each owns one
+transport: `listen`, `connect`, or `peer`, a link of the deployment that
+`metor build` turns into an address.
 
 ```python
-imu = a.add("imu", Imu())
-publish = a.add("publish", Publish([imu], listen="0.0.0.0:2240"))
-cmds = a.add("cmds", Subscribe([Arm], listen="0.0.0.0:2241"))
-sub = b.add("subscribe", Subscribe([publish.imu.accel], connect=a_addr))
+plant_pub = plant.add("pub", Publish(listen="0.0.0.0:2240", items=[sim]))
+mirror = fsw.add("plant", Subscribe(peer=plant_pub, items=[sim]))
+nav = fsw.add("nav", Nav(sensors=mirror.port(sim.sensors)))
 ```
 
-You reference the typed output of the Publish system, which allows you to subscrib to fields from a specific target. The last line, subscribing to a peer's frames with the address resolved by the deployment, is slice 7.
+A subscriber faults each frame port whose table the publisher never
+announced, so a peer built against other definitions shows up on `log`.
 
-
-### Gateways
-
-If you have multiple targets downlinking telemetry becomes challenging. Who do you ask for data? The answer is a single target called the gateway, that embeddeds a metor-db instance. The gateway subscribes to all telemetry from all targets, and then pushes it into metor-db. Then panel, and other downstream subscribes, can interact with the DB.
-
-This has a few advantages. One is that slow consumers can interact with the DB without blocking the main run-loop, collecting passed or missed data easily. Another is that you can sync this gateway DB insance with other instances of the DB for replication.
+A gateway is a target whose `Db` embeds a metor-db. It subscribes to every
+peer and records what arrives. The ground reads one database, not each
+target's stream, and a slow reader never holds a target's rings.
+`gateway(..)` builds one.

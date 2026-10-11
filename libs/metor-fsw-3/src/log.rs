@@ -1,4 +1,9 @@
-//! Log is a tracing_subscriber that takes tracing logs and puts them into [`LogEvent`] messages
+//! Per-system logging.
+//!
+//! Each system gets its own [`LogPort`], an output of [`LogEvent`] messages.
+//! While a system runs, its port is set as the current thread's log port.
+//! [`Log`] and the `tracing` [`LogLayer`] both write to whichever port is
+//! current, so log lines end up on the running system's port.
 
 use core::cell::Cell;
 use core::ptr::NonNull;
@@ -11,7 +16,7 @@ use tracing_subscriber::layer::Context;
 
 use crate::port::Output;
 
-/// A line from no module or source file, stamped `now`.
+/// Creates a log line stamped `now`, with no module or source file.
 pub(crate) fn line(
     now: Timestamp,
     level: LogLevel,
@@ -41,7 +46,10 @@ impl crate::record::PostcardRecord for LogEvent {
     }
 }
 
-/// A `LogPort` writes one system's log lines, stamped with the cycle time.
+/// The output a system's log lines are written to.
+///
+/// Lines are stamped with the cycle time. Lines that don't fit in the ring are
+/// counted, and the count is reported in a later line.
 pub struct LogPort {
     output: Output<LogEvent>,
     now: Timestamp,
@@ -57,7 +65,10 @@ impl LogPort {
         }
     }
 
-    /// Writes an error line whose first field is `kind`, the fault's identity for the ground.
+    /// Writes an error line for a fault.
+    ///
+    /// The line's first field is `kind`, which the ground uses to identify the
+    /// fault.
     pub(crate) fn fault(
         &mut self,
         now: Timestamp,
@@ -67,14 +78,18 @@ impl LogPort {
         with_log_port(self, now, || Log.fault(kind, message));
     }
 
-    /// Publishes one event; a ring with no room counts as a drop.
+    /// Publishes one event.
+    ///
+    /// If the ring has no room, the event is counted as dropped.
     fn emit(&mut self, event: LogEvent) {
         if self.output.write(&event).is_err() {
             self.dropped = self.dropped.saturating_add(1);
         }
     }
 
-    /// Writes the count of lines the ring refused, clearing it only if the line lands.
+    /// Writes a warning with the number of dropped lines.
+    ///
+    /// The count resets only if the warning itself is written.
     fn report_dropped(&mut self) {
         if self.dropped == 0 {
             return;
@@ -91,7 +106,10 @@ impl LogPort {
     }
 }
 
-/// A `Log` writes the running system's log lines onto the entered [`LogPort`].
+/// Writes log lines for the running system.
+///
+/// Lines go to the current thread's [`LogPort`]. Outside a system, they are
+/// discarded.
 pub struct Log;
 
 impl Log {
@@ -105,7 +123,10 @@ impl Log {
         self.write(LogLevel::Warn, message, Vec::new());
     }
 
-    /// Writes an error line whose first field is `kind`, the fault's identity for the ground.
+    /// Writes an error line for a fault.
+    ///
+    /// The line's first field is `kind`, which the ground uses to identify the
+    /// fault.
     pub fn fault(
         &mut self,
         kind: impl Into<Cow<'static, str>>,
@@ -131,7 +152,10 @@ thread_local! {
     static SLOT: Cell<Option<NonNull<LogPort>>> = const { Cell::new(None) };
 }
 
-/// Routes this thread's logs to `port` during `f`, stamping its lines `now`.
+/// Runs `f` with `port` as this thread's log port.
+///
+/// Lines written during `f` are stamped `now`. The previous port is restored
+/// afterwards, even if `f` panics.
 ///
 /// ```compile_fail
 /// use metor_fsw_3::log::{LogPort, with_log_port};
@@ -149,8 +173,10 @@ pub fn with_log_port<R>(port: &mut LogPort, now: Timestamp, f: impl FnOnce() -> 
     result
 }
 
-/// Routes this thread's logs to `port` for each poll of `inner`, stamping its
-/// lines with the wall time of that poll.
+/// Wraps a future so its logs go to `port`.
+///
+/// `port` is the thread's log port during each poll of `inner`. Lines are
+/// stamped with the wall time of that poll.
 pub fn log_scope<F: core::future::Future + Unpin>(port: &mut LogPort, inner: F) -> LogScope<'_, F> {
     LogScope { port, inner }
 }
@@ -194,7 +220,9 @@ fn with_port(f: impl FnOnce(&mut LogPort)) {
     f(unsafe { port.as_mut() });
 }
 
-/// A `LogLayer` writes each `tracing` event as a [`LogEvent`] on this thread's port.
+/// A `tracing` layer that writes events to the current log port.
+///
+/// Each event becomes one [`LogEvent`].
 pub struct LogLayer;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogLayer {
@@ -228,7 +256,7 @@ fn level_of(level: &tracing::Level) -> LogLevel {
     }
 }
 
-/// Collects an event's `message` and its other fields as strings.
+/// Collects an event's `message` and other fields as strings.
 #[derive(Default)]
 struct Fields {
     message: Cow<'static, str>,

@@ -61,8 +61,7 @@ Landed 2026-09-18; the fixture's
   system is a build error.
 
 - Link loops: `publish.rs` and `subscribe.rs` repeat the readiness race
-  and the status tail, and their params repeat four fields; fold them
-  into one helper in `conn.rs` when a third link arrives.
+  and the status tail; fold them into one helper in `conn.rs`.
 
 - Message ids: postcard messages hash the schema name, other codecs the
   record name. Unify in metor-proto-wkt (the panel's matchers depend on

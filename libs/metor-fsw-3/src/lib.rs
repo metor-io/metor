@@ -1,10 +1,13 @@
-//! metor-fsw is a flight software framework.
+//! metor-fsw is a framework for writing flight software.
 //!
-//! Systems are functions over typed ring ports, stepped in order by the
-//! [`Coordinator`]. `#[system]` on a free fn makes one: each parameter is a
-//! port named by its identifier, and one `#[state]` parameter, `&mut S`, is
-//! the state the registered constructor builds. The fn's name is the
-//! system's name, and its doc comment is the system's doc.
+//! Flight software is built from systems. A system is a function that reads
+//! and writes typed ports, which are backed by ring buffers. The
+//! [`Coordinator`] runs every system in a fixed order, once per cycle.
+//!
+//! The usual way to write a system is `#[system]` on a free fn. Each parameter
+//! is a port, named after the parameter. A `#[state] s: &mut S` parameter gives
+//! the system state, built by the constructor passed at registration. The fn's
+//! name becomes the system's name, and its doc comment becomes the system's doc.
 //!
 //! ```
 //! use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -44,13 +47,18 @@
 //! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
 //!
+//! A failed write, for example into a full ring, returns an error. The
+//! failure is also counted. After the cycle, the system's `log` gets one
+//! `publish_dropped` fault covering every failed write.
+//!
 //! A fn without `#[state]` is stateless and registers with
-//! `Default::default`. `nav()` derefs to a fn pointer, so a test calls the
+//! `Default::default`. `nav()` derefs to a fn pointer, so a test can call the
 //! system directly: `nav()(&mut state, &mut gps, &mut out)`.
 //!
-//! An `async fn` ending in `stop: Stop` instead runs on a background thread
-//! behind the [`thread`] adapter, which mirrors its ports. It has no direct
-//! call; a test drives it through [`AsyncSystemFn::call`].
+//! An `async fn` whose last parameter is `stop: Stop` becomes an async system.
+//! It runs on a background thread, and the [`thread`] adapter copies its port
+//! data to and from the schedule. It cannot be called directly, so a test
+//! drives it through [`AsyncSystemFn::call`].
 //!
 //! ```
 //! # use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -84,9 +92,9 @@
 //! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
 //!
-//! An `async fn` under `#[sequence]` is polled once per cycle instead, and
-//! returns when its steps are done. Its [`Seq`] handle reads the cycle's
-//! time and waits in cycle time; an abort ends any wait with
+//! A sequence is an `async fn` marked `#[sequence]`. The coordinator polls it
+//! once per cycle until it returns. Its [`Seq`] handle gives it the cycle's
+//! time and lets it wait in cycle time. An abort ends any wait with
 //! [`SeqError::Aborted`].
 //!
 //! ```
@@ -116,13 +124,16 @@
 //! # Ok::<(), metor_fsw_3::BuildError>(())
 //! ```
 //!
-//! `channel=` in a system's config wraps it in the [`channel`] adapter, which
-//! starts, stops, resets, aborts, and loads it on `SequenceCommand`s; a
-//! [`dl`] slot loads pack systems into one place in the schedule.
+//! Setting `channel=` in a system's config wraps the system in the [`channel`]
+//! adapter. A channel lets an operator start, stop, reset, abort, or load the
+//! system by sending `SequenceCommand` messages. A [`dl`] slot is a place in the
+//! schedule whose system can be swapped for another pack system at run time.
 //!
-//! The built-in [`link`] systems, `Publish` and `Subscribe`, are async
-//! systems with config-listed ports; they carry a target's records over
-//! metor-proto to whoever connects, and its commands back.
+//! The built-in [`link`] systems, `Publish` and `Subscribe`, move records
+//! between targets. They are async systems whose ports are listed in config.
+//! `Publish` sends records over metor-proto to every connected peer.
+//! `Subscribe` writes the records peers send onto its outputs. Together they
+//! carry a target's telemetry out and its commands back.
 
 // The derives name this crate by its package name, in doctests as well as here.
 extern crate self as metor_fsw_3;

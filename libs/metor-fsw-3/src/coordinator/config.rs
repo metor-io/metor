@@ -1,4 +1,7 @@
-//! The graph description a coordinator is built from.
+//! The config a coordinator is built from.
+//!
+//! It lists the systems to run and wires each system's inputs to other
+//! systems' outputs.
 
 use core::time::Duration;
 
@@ -7,15 +10,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::system::PortDef;
 
-/// Default number of records a ring can hold
+/// The default [`CoordinatorConfig::ring_depth`].
 pub const DEFAULT_RING_DEPTH: usize = 8;
 
-/// The configuration for a coordinator
+/// The configuration for a coordinator.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoordinatorConfig {
     pub clock: Clock,
+    /// Scales each port's ring size.
+    ///
+    /// A port's ring holds its declared depth times this many records.
     pub ring_depth: usize,
-    /// The prefix every announced name hangs under.
+    /// A prefix added to every name the coordinator announces.
     #[serde(default)]
     pub namespace: Option<String>,
     pub systems: Vec<SystemConfig>,
@@ -32,7 +38,7 @@ impl Default for CoordinatorConfig {
     }
 }
 
-/// A `SystemConfig` names one system, its registered type, its params, and the edges into it.
+/// Configures one system instance.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SystemConfig {
     pub id: String,
@@ -43,14 +49,18 @@ pub struct SystemConfig {
     pub inputs: Vec<InputConfig>,
     #[serde(default)]
     pub outputs: Vec<OutputConfig>,
-    /// The adapter the system runs behind, if any.
+    /// The adapter the system runs behind, if any. See [`Adapter`].
     #[serde(flatten, with = "adapter_keys")]
     pub adapter: Option<Adapter>,
 }
 
-/// What a system runs behind: a named background thread, or a channel.
+/// Changes how a system is run.
 ///
-/// In a config it is a `thread` or a `channel` key beside `id`, never both.
+/// [`Adapter::Thread`] runs it on a named background thread. [`Adapter::Channel`]
+/// puts it behind a channel, so commands can start, stop, and load it.
+///
+/// In a config, the adapter is written as a `thread` or a `channel` key next to
+/// `id`. A system can have one or the other, not both.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Adapter {
@@ -58,7 +68,10 @@ pub enum Adapter {
     Channel(ChannelConfig),
 }
 
-/// A channel's name, which commands address, and its state at boot.
+/// Configures a channel.
+///
+/// Commands find the channel by `name`. `start` sets whether its system runs at
+/// boot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelConfig {
     pub name: String,
@@ -66,7 +79,7 @@ pub struct ChannelConfig {
     pub start: RunState,
 }
 
-/// An adapter as a config spells it: at most one of two keys.
+/// Serializes an [`Adapter`] as either a `thread` key or a `channel` key.
 mod adapter_keys {
     use serde::de::Error;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -148,7 +161,7 @@ impl SystemConfig {
     }
 }
 
-/// One port of a system with dynamic outputs, and where its definition comes from.
+/// An output port declared by the config instead of the system type.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputConfig {
     pub port: String,
@@ -157,7 +170,7 @@ pub struct OutputConfig {
 }
 
 impl OutputConfig {
-    /// A port carrying the record `record` names.
+    /// Creates an output port that carries the record called `record`.
     pub fn record(port: impl Into<String>, record: impl Into<String>) -> Self {
         Self {
             port: port.into(),
@@ -166,8 +179,11 @@ impl OutputConfig {
     }
 }
 
-/// What defines a dynamic output: a record name looked up in the table, a
-/// peer's port `metor build` has yet to resolve, or the definition it resolved.
+/// Where a config-defined output gets its definition from.
+///
+/// `Record` refers to a record registered in the system table. `Peer` points at a
+/// port on another target, which `metor build` replaces with `Def`, the
+/// resolved definition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputSource {
@@ -176,7 +192,7 @@ pub enum OutputSource {
     Def(PortDef),
 }
 
-/// A port of a link on some target of the deployment.
+/// A port on a link of another target in the same deployment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PeerPort {
     pub target: String,
@@ -184,28 +200,31 @@ pub struct PeerPort {
     pub port: String,
 }
 
-/// A link on some target of the deployment.
+/// A link on another target in the same deployment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PeerLink {
     pub target: String,
     pub link: String,
 }
 
-/// The producers of one input port
+/// An input port and the outputs that feed it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InputConfig {
     pub port: String,
     pub from: Vec<PortRef>,
 }
 
-/// An reference to an output port of another system
+/// A reference to an output port of another system.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PortRef {
     pub system: String,
     pub port: String,
 }
 
-/// The clock mode for the coordinator either real wall time or a simulated clock.
+/// The clock that paces the coordinator's cycles.
+///
+/// `Wall` runs `rate` cycles per second of real time. `Simulated` advances time
+/// by `dt` each cycle, as fast as the systems run.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Clock {
     Wall { rate: f64 },
@@ -213,7 +232,7 @@ pub enum Clock {
 }
 
 impl InputConfig {
-    /// An input port fed by one producer's output.
+    /// Creates an input port fed by the output `output` of system `system`.
     pub fn new(
         port: impl Into<String>,
         system: impl Into<String>,

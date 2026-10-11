@@ -1,8 +1,9 @@
-//! `Db`: the embedded database, recording every record its config wires into
-//! it and serving the store to whoever connects.
+//! `Db`, a link that embeds a metor-db database.
+//!
+//! It stores every record wired into its inputs, and serves the database over
+//! TCP and UDP to any client that connects, such as the panel.
 
 use core::cell::Cell;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -11,8 +12,6 @@ use metor_db::{DB, Server};
 use metor_fsw_3_ring::Notifier;
 use metor_proto::types::{PacketId, Timestamp, table_id};
 use metor_proto_wkt::VTableMsg;
-use schemars::JsonSchema;
-use serde::Deserialize;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::coordinator::ParamError;
@@ -21,29 +20,12 @@ use crate::port::{DynInputs, Output};
 use crate::record::RecordSchema;
 use crate::{Frame, Stop, system};
 
-use super::transport::{Endpoint, Transport};
+use super::DbParams;
+use super::transport::Endpoint;
 use super::wire;
 
-/// What a `Db` is configured with.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct DbParams {
-    /// Where the db listens
-    pub transport: Transport,
-    /// The store's directory; unset, a fresh one under the temp dir.
-    #[serde(default)]
-    pub path: Option<PathBuf>,
-    /// The target's telemetry namespace, which the store identifies as.
-    #[serde(default)]
-    pub namespace: Option<String>,
-    /// This system's name.
-    #[serde(default)]
-    pub link: String,
-    /// The messages subscribers take through this db, which `metor build` fills.
-    #[serde(default)]
-    pub command_ids: Vec<PacketId>,
-}
-
-/// What a `Db` reports about what it ingested, each cycle its counters change.
+/// Ingest counters for a `Db`. It writes one on every cycle where a counter
+/// changed.
 #[derive(
     Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, Default, PartialEq,
 )]
@@ -65,7 +47,7 @@ impl DbStatus {
     }
 }
 
-/// Records every record its config wires into it into an embedded metor-db.
+/// A link that stores every record wired into it in an embedded metor-db.
 pub struct Db {
     endpoint: Option<Endpoint>,
     db: Arc<DB>,
@@ -73,18 +55,24 @@ pub struct Db {
 }
 
 impl Db {
-    /// Binds the listener and opens or creates the store, so a taken address
-    /// or an unwritable path fails the build.
+    /// Binds the listener and opens the database, creating it if needed.
+    ///
+    /// Both happen here so that a taken address or an unwritable path fails
+    /// the build instead of the run.
     pub fn new(params: DbParams) -> Result<Self, ParamError> {
-        let endpoint = params.transport.bind()?;
-        super::record_bound(&params.link, &endpoint);
+        let endpoint = params.link.transport.bind()?;
+        super::record_bound(&params.link.link, &endpoint);
         if endpoint.listener().is_none() {
             return Err(ParamError::Decode(
                 "a db listens; it takes no `connect`".into(),
             ));
         }
         let path = params.path.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("metor-db-{}-{}", params.link, std::process::id()))
+            std::env::temp_dir().join(format!(
+                "metor-db-{}-{}",
+                params.link.link,
+                std::process::id()
+            ))
         });
         let store = if path.exists() {
             DB::open(path.clone())
@@ -102,7 +90,10 @@ impl Db {
     }
 }
 
-/// Announces every port into the store, serves it, and ingests what arrives.
+/// Runs the `Db` link.
+///
+/// Registers every input port's schema with the database, starts serving it,
+/// and then writes each record that arrives on an input into it.
 #[system]
 pub async fn db(
     #[state] s: &mut Db,
@@ -111,11 +102,14 @@ pub async fn db(
     log: &mut Log,
     stop: Stop,
 ) {
-    // PANIC Safety: a system runs once, and the endpoint is the bind's.
+    // PANIC Safety: `new` always sets the endpoint, and a system runs once.
     let endpoint = s.endpoint.take().expect("one run per instance");
     let db = s.db.clone();
     let sinks = announce(&db, inputs, log);
-    db.set_identity(s.params.namespace.clone(), s.params.command_ids.clone());
+    db.set_identity(
+        s.params.link.namespace.clone(),
+        s.params.command_ids.clone(),
+    );
     let addr = endpoint.local_addr();
     if let Some(addr) = addr {
         log.info(format!("serving {} on {addr}", db.path.display()));
@@ -147,16 +141,20 @@ pub async fn db(
     }
 }
 
-/// One connection served from the store: the task, cancelled with its slot,
-/// and the flag it frees the slot with.
+/// One client connection to the database.
+///
+/// Dropping a `Conn` cancels its task. The task clears `open` when the client
+/// disconnects, which marks the slot free.
 struct Conn {
     open: Rc<Cell<bool>>,
     _task: stellarator::JoinHandleDropGuard<()>,
 }
 
-/// Accepts peers into a fixed set of slots, one connection each; a peer past
-/// the last free slot is closed at once. Every connection ends with this
-/// future.
+/// Accepts clients into a fixed number of slots, one connection per slot.
+///
+/// A client that arrives when every slot is taken is closed right away. The
+/// slots hold each connection's task, so dropping this future closes every
+/// connection.
 async fn serve(endpoint: Endpoint, db: Arc<DB>, stop: Stop) {
     let Some(listener) = endpoint.listener() else {
         return;
@@ -182,29 +180,34 @@ async fn serve(endpoint: Endpoint, db: Arc<DB>, stop: Stop) {
     }
 }
 
-/// Whether a slot holds a connection that is still up.
+/// Returns true if `slot` holds a connection that is still open.
 fn occupied(slot: &Option<Conn>) -> bool {
     slot.as_ref().is_some_and(|conn| conn.open.get())
 }
 
-/// Serves the store's datagram protocol on the listener's address.
+/// Serves the database's UDP protocol on the same address as the listener.
 async fn udp(addr: std::net::SocketAddr, db: Arc<DB>) {
     if let Err(error) = Server::handle_udp(addr, db).await {
         tracing::warn!(%error, "db udp ended");
     }
 }
 
-/// Where one port's records go: the table id its frames land under, the id
-/// its messages carry, or nothing for a port the store refused.
+/// Where the records from one input port are stored.
 enum Sink {
+    /// Frames, stored under this table id.
     Table(PacketId),
+    /// Messages with this id.
     Msg(PacketId),
+    /// The database rejected this port's schema, so its records are dropped.
     Refused,
 }
 
-/// Registers each port's vtable and metadata, or message metadata, with the
-/// store, and picks the sink its records take. A frame whose table id the
-/// store already holds for another vtable is refused.
+/// Registers each input port with the database.
+///
+/// A frame port registers its vtable and component metadata. A message port
+/// registers its message metadata. If the database already holds a different
+/// vtable under the frame's table id, the port is refused and a fault is
+/// logged. Returns one [`Sink`] per port.
 fn announce(db: &DB, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sink> {
     let mut sinks = Vec::new();
     for (def, _) in inputs.iter_mut() {
@@ -253,8 +256,10 @@ fn announce(db: &DB, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sin
     sinks
 }
 
-/// Writes every waiting record into the store, counting what it refused. A
-/// refused port drains, and its records count as refused.
+/// Writes every waiting record into the database and updates the counters.
+///
+/// Records on a refused port are still drained, and each one counts as
+/// refused.
 fn ingest(db: &DB, inputs: &mut DynInputs<Notifier>, sinks: &[Sink], status: &mut DbStatus) {
     for ((_, input), sink) in inputs.iter_mut().zip(sinks) {
         for record in input.drain() {
@@ -279,6 +284,7 @@ mod tests {
 
     use crate::DefCx;
     use crate::async_system::stop_pair;
+    use crate::link::{LinkParams, Transport};
     use crate::port::Input;
     use crate::record::Record;
     use crate::system::{InputBinding, SystemInputs};
@@ -286,8 +292,8 @@ mod tests {
 
     use super::*;
 
-    /// An `Imu` frame port of instance `plant` on target `a`, and a `Fixed`
-    /// message port.
+    /// Builds two input ports: an `Imu` frame port for instance `plant` on
+    /// target `a`, and a `Fixed` message port.
     fn ports(rings: &[RingBuffer; 2]) -> DynInputs<Notifier> {
         let wake = Notifier::default();
         let plant = DefCx {
@@ -353,8 +359,9 @@ mod tests {
         ingest(&db, &mut inputs, &sinks, &mut status);
         assert_eq!((status.records, status.refused), (6, 0));
 
-        // Pushes land in each store's write-ahead log; what is synchronous is
-        // the component's newest stamp and the announced message metadata.
+        // Pushed records land in the store's write-ahead log, which this test
+        // does not read. The component's latest timestamp and the message
+        // metadata update synchronously, so the test checks those.
         let component = metadata[0].component_id;
         let newest = db.with_state(|state| {
             state
@@ -407,7 +414,8 @@ mod tests {
         assert_eq!((status.records, status.refused), (1, 1));
     }
 
-    /// A listening endpoint on a free port, with the address it bound.
+    /// Binds a listening endpoint on a free port and returns it with its
+    /// address.
     fn endpoint(slots: usize) -> (Endpoint, std::net::SocketAddr) {
         let endpoint = Transport::Listen {
             addr: "127.0.0.1:0".into(),
@@ -419,7 +427,8 @@ mod tests {
         (endpoint, addr)
     }
 
-    /// The peer's next byte, or the error its socket closed with.
+    /// Reads one byte from the peer, or returns the error the socket closed
+    /// with.
     async fn read_byte(stream: &TcpStream) -> Result<usize, stellarator::Error> {
         stream.read(vec![0u8; 1]).await.0
     }
@@ -452,12 +461,14 @@ mod tests {
     #[test]
     fn test_reject_connect_transport() {
         let params = DbParams {
-            transport: Transport::Connect {
-                addr: "127.0.0.1:1".into(),
+            link: LinkParams {
+                transport: Transport::Connect {
+                    addr: "127.0.0.1:1".into(),
+                },
+                namespace: None,
+                link: "db".into(),
             },
             path: None,
-            namespace: None,
-            link: "db".into(),
             command_ids: Vec::new(),
         };
         let Err(ParamError::Decode(message)) = Db::new(params) else {
@@ -470,13 +481,15 @@ mod tests {
     fn test_open_store_at_path() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let params = DbParams {
-            transport: Transport::Listen {
-                addr: "127.0.0.1:0".into(),
-                max_connections: 1,
+            link: LinkParams {
+                transport: Transport::Listen {
+                    addr: "127.0.0.1:0".into(),
+                    max_connections: 1,
+                },
+                namespace: Some("gw".into()),
+                link: "db".into(),
             },
             path: Some(dir.path().join("store")),
-            namespace: Some("gw".into()),
-            link: "db".into(),
             command_ids: vec![[1, 2]],
         };
         let db = Db::new(params).expect("a free port and a writable dir");

@@ -1,5 +1,9 @@
-//! Build turns a config into a coordinator: it resolves each system's ports
-//! and edges, then allocates one ring per output with a reader slot per edge.
+//! Turns a [`CoordinatorConfig`] into a running [`Coordinator`].
+//!
+//! Building happens in two passes. The first pass resolves each system's
+//! definition and works out which output feeds which input. The second pass
+//! allocates one ring per output, with one reader slot for every input that
+//! reads from it, and binds each system to its rings.
 
 use core::time::Duration;
 use std::collections::HashMap;
@@ -33,14 +37,13 @@ struct RingSpec {
 
 type RingIndex = usize;
 
-/// One system as build resolved it: the definition its type computed and the
-/// rings feeding each of its input ports.
+/// A system whose definition and input edges have been resolved.
 struct PlannedSystem<'a> {
     id: &'a str,
     entry: &'a TableEntry,
     def: SystemDef,
     params: Params<'a>,
-    /// The adapter the config runs this system behind.
+    /// The adapter this system runs behind, if the config gives one.
     adapter: Option<&'a Adapter>,
     base_ring_idx: RingIndex,
     inputs: Vec<Vec<RingIndex>>,
@@ -67,7 +70,7 @@ impl PlannedSystem<'_> {
 }
 
 impl CoordinatorConfig {
-    /// Builds a [`Coordinator`] from this config and the given system table
+    /// Builds a [`Coordinator`] from this config, creating systems from `table`.
     pub fn build(self, table: &SystemTable) -> Result<Coordinator, BuildError> {
         self.clock.validate()?;
         check_channels(&self)?;
@@ -143,7 +146,10 @@ fn resolve<'a>(
     Ok(plan)
 }
 
-/// The coordinator's status port for instance `id`, rooted like any other port.
+/// Returns the definition of system `id`'s `status` output.
+///
+/// The coordinator adds this output to every system. It is namespaced like the
+/// system's own ports.
 pub(crate) fn status_def(id: &str, namespace: Option<&str>) -> PortDef {
     let cx = DefCx {
         id,
@@ -153,7 +159,10 @@ pub(crate) fn status_def(id: &str, namespace: Option<&str>) -> PortDef {
     Output::<SystemStatus>::def(&cx, STATUS_PORT)
 }
 
-/// Every channel name fits the wire's cap and addresses one system.
+/// Checks that channel names are short enough and unique.
+///
+/// A name must fit the wire format's length cap, and no two systems may use
+/// the same one.
 fn check_channels(config: &CoordinatorConfig) -> Result<(), BuildError> {
     let names = config
         .systems
@@ -179,7 +188,7 @@ fn check_channels(config: &CoordinatorConfig) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// Each system's position in the config, by id.
+/// Maps each system id to its position in the config, rejecting duplicate ids.
 fn index(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, BuildError> {
     let mut index = HashMap::with_capacity(config.systems.len());
     for (at, system) in config.systems.iter().enumerate() {
@@ -192,8 +201,9 @@ fn index(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, BuildError>
     Ok(index)
 }
 
-/// The definition the type computes from this instance's config, over the
-/// producers this pass has resolved so far.
+/// Computes the definition for `system` during the first build pass.
+///
+/// Only producers planned earlier in the pass are known.
 fn planned_def(
     system: &SystemConfig,
     entry: &TableEntry,
@@ -208,9 +218,12 @@ fn planned_def(
     })
 }
 
-/// The definition `entry`'s type computes for `system`, over the producers
-/// `producer` finds. A producer it returns `None` for is not resolved yet,
-/// which only a port the type declares may read.
+/// Computes the definition that `entry`'s type produces for `system`.
+///
+/// `producer` looks up the output definition behind each input edge. It returns
+/// `None` when that producer is not resolved yet. That is only allowed for input
+/// ports the type declares statically, because their definition does not depend
+/// on the producer.
 pub(crate) fn instance_def(
     system: &SystemConfig,
     entry: &TableEntry,
@@ -267,8 +280,9 @@ fn reserved(system: &SystemConfig, port: &str) -> BuildError {
     }
 }
 
-/// The ring `from` names for input `port` of system `id`, or `None` while its
-/// producer is not planned yet.
+/// Returns the ring that input `port` of system `id` reads through `from`.
+///
+/// Returns `None` if the producing system has not been planned yet.
 fn producer_ring(
     plan: &Plan<'_>,
     index: &HashMap<&str, usize>,
@@ -304,7 +318,7 @@ fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildErr
     Ok(())
 }
 
-/// The first port named like one before it.
+/// Returns the first port whose name repeats an earlier port's name.
 fn duplicate(ports: &[PortDef]) -> Option<&PortDef> {
     ports
         .iter()
@@ -313,7 +327,7 @@ fn duplicate(ports: &[PortDef]) -> Option<&PortDef> {
         .map(|(_, port)| port)
 }
 
-/// Every output the config lists is one the type took.
+/// Checks that every output listed in the config is an output the type defines.
 fn check_outputs(system: &SystemConfig, def: &SystemDef) -> Result<(), BuildError> {
     for output in &system.outputs {
         if !def.outputs.iter().any(|port| port.name == output.port) {
@@ -395,8 +409,10 @@ fn check_ids(plan: &Plan<'_>) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// One reader slot per edge into a ring. A ring with no edges keeps one slot,
-/// the fewest the ring format allows.
+/// Counts one reader slot for each edge into a ring.
+///
+/// A ring with no edges still gets one slot, because the ring format requires
+/// at least one.
 fn count_readers(systems: &[PlannedSystem<'_>], rings: &mut [RingSpec]) {
     for edge in systems.iter().flat_map(|s| s.inputs.iter().flatten()) {
         rings[*edge].readers += 1;
@@ -406,7 +422,7 @@ fn count_readers(systems: &[PlannedSystem<'_>], rings: &mut [RingSpec]) {
     }
 }
 
-/// Allocates one ring holding `spec.depth * ring_depth` records.
+/// Allocates a ring that holds `spec.port.depth * ring_depth` records.
 fn allocate_ring(spec: &RingSpec, ring_depth: usize) -> Result<RingBuffer, BuildError> {
     let too_large = || BuildError::RingTooLarge {
         system: spec.system.clone(),
@@ -485,7 +501,9 @@ impl Clock {
         Ok(())
     }
 
-    /// The wall budget for one cycle; zero under a simulated clock.
+    /// Returns the wall-clock time budget for one cycle.
+    ///
+    /// Returns zero for a simulated clock.
     pub(crate) fn cycle_budget(&self) -> Duration {
         match self {
             Clock::Wall { rate } if *rate > 0.0 => {
@@ -507,7 +525,7 @@ mod tests {
     use crate::{Frame, Record};
     use crate::{port, system};
 
-    /// A second frame named `imu`, so the record name resolves two ways.
+    /// A second frame named `imu`, so the same record name has two layouts.
     #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
     #[frame(name = "imu")]
     #[repr(C)]
@@ -904,8 +922,9 @@ mod tests {
         assert_eq!(recorder.take(), vec![(Timestamp(1), 11.0)]);
     }
 
-    /// A resolved definition completes the port as-is, under the config's name,
-    /// so a consumer of that record binds to it without the table knowing it.
+    /// An output configured with a full definition is used as-is.
+    ///
+    /// Consumers bind to it even though no registered type declares it.
     #[test]
     fn test_resolve_dynamic_output_def() {
         let recorder = Recorder::default();
@@ -1054,7 +1073,9 @@ mod tests {
         );
     }
 
-    /// A `loop()` edge into an undeclared port has no producer definition yet.
+    /// An edge from a later system into an undeclared port fails.
+    ///
+    /// The producer's definition is not known yet when the port is resolved.
     #[test]
     fn test_reject_dynamic_forward_reference() {
         let mut config = pipeline_config();
@@ -1071,8 +1092,9 @@ mod tests {
         );
     }
 
-    /// A declared port takes its definition from the type, so its producer may
-    /// come later.
+    /// A declared port's producer may appear later in the config.
+    ///
+    /// The port's definition comes from the type, not the producer.
     #[test]
     fn test_static_forward_reference() {
         let config = CoordinatorConfig {

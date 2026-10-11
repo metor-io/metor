@@ -1,4 +1,5 @@
-"""Deployments: peers, copied ports, the gateway, and the envelope golden."""
+"""Tests for deployments: peers, copied ports, the gateway, and the golden
+config file."""
 
 from __future__ import annotations
 

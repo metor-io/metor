@@ -1,4 +1,5 @@
-//! `pack dev` against the fixture pack: the rendered module and the layout.
+//! Tests `pack dev` on the fixture pack: the rendered module and the files it
+//! writes.
 
 mod common;
 
@@ -8,10 +9,9 @@ use std::process::Command;
 
 use common::fixture_dir;
 use metor_fsw_3::DlPack;
-use metor_fsw_3::cli::cargo::{
-    PackConfig, WASM_TRIPLE, cargo_build, cdylib_name, triple, wasm_name,
-};
+use metor_fsw_3::cli::cargo::{PackConfig, cargo_build};
 use metor_fsw_3::cli::pack_dev::{PackDevError, pack_dev};
+use metor_fsw_3::dl::{WASM_TRIPLE, cdylib_name, triple, wasm_name};
 
 const GOLDEN: &str = include_str!("golden/echo_pack.py");
 
@@ -47,7 +47,7 @@ fn test_golden_module_type_checks() {
     );
 }
 
-/// The command that runs pyright, absent when nothing can.
+/// Returns the command that runs pyright, or `None` if it is not available.
 fn pyright() -> Option<Vec<String>> {
     for command in [vec!["pyright"], vec!["uvx", "pyright"]] {
         let Ok(status) = Command::new(command[0]).arg("--version").output() else {
@@ -95,7 +95,7 @@ fn test_pack_dev_installs_module_and_library() {
         inode,
         "a replaced dylib lands at a new inode"
     );
-    // No temp file survives either run.
+    // Neither run leaves a temp file behind.
     let left: Vec<_> = std::fs::read_dir(dylib.parent().expect("a directory"))
         .expect("lists")
         .map(|entry| entry.expect("an entry").file_name())
@@ -153,7 +153,8 @@ fn test_pack_dev_rejects_loaded_destination() {
     assert!(!module.join("py.typed").exists());
 }
 
-/// A pack spelled out so no `Cargo.toml` is read, with `wasm`.
+/// Returns a `pyproject.toml` for a wasm pack. It names the crate and lib
+/// itself, so no `Cargo.toml` is read.
 fn wasm_pyproject(krate: &str) -> String {
     let lib = krate.replace('-', "_");
     format!(
@@ -162,8 +163,8 @@ fn wasm_pyproject(krate: &str) -> String {
     )
 }
 
-/// A pack root under the target dir, where cargo finds this workspace and
-/// its config.
+/// Creates a pack root under the target dir, so cargo finds this workspace
+/// and its config.
 fn root_in_target() -> tempfile::TempDir {
     tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("a temp dir")
 }

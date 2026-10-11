@@ -1,4 +1,4 @@
-//! The exports, driven in process against the shared test table.
+//! Tests that call the pack exports in process, using the shared test table.
 
 use metor_fsw_3_ring::{NoWake, RingBuffer};
 use metor_proto_wkt::{LogEvent, LogLevel};
@@ -9,12 +9,12 @@ use crate::coordinator::SystemKind;
 use crate::record::Record;
 use crate::tests::utils::{self, Imu, Nav, Recorder};
 
-/// The one table these tests export; a thread builds it once.
+/// Builds the table these tests export. Each thread builds it once.
 fn build() -> SystemTable {
     crate::tests::utils::table(&Recorder::default())
 }
 
-/// A ring and the export its raw view borrows.
+/// A ring plus the export that its [`RawRing`] borrows from.
 struct TestRing {
     ring: RingBuffer,
     export: metor_fsw_3_ring::RingExport,
@@ -32,8 +32,10 @@ fn ring<T: Record>(readers: usize) -> TestRing {
     TestRing { ring, export }
 }
 
-/// The def the host would resolve for `ty`, as JSON; an unknown type gets an
-/// empty one, since `create` never reaches the bindings.
+/// Returns the instance JSON the host would send for `ty`.
+///
+/// An unknown type gets an empty definition, since `create` fails before it
+/// binds any ports.
 fn instance_def(ty: &str) -> Vec<u8> {
     let def = build()
         .get(ty)
@@ -50,7 +52,7 @@ fn instance_def(ty: &str) -> Vec<u8> {
     serde_json::to_vec(&instance).expect("encodes")
 }
 
-/// Calls `create` the way an export does, returning the instance or the error.
+/// Calls `create` the way the host does and returns the result.
 fn create_raw(ty: &str, params: &str, inputs: &[RawSlice], outputs: &[RawRing]) -> Instance {
     let def = instance_def(ty);
     let mut error = RawSlice::EMPTY;
@@ -69,7 +71,7 @@ fn create_raw(ty: &str, params: &str, inputs: &[RawSlice], outputs: &[RawRing]) 
     Instance { handle, error }
 }
 
-/// One `create` result, destroyed when the test drops it.
+/// One `create` result. It is destroyed when the test drops it.
 struct Instance {
     handle: *mut c_void,
     error: RawSlice,
@@ -81,7 +83,7 @@ impl Instance {
         Status::from_raw(unsafe { execute(self.handle, now) })
     }
 
-    /// The error bytes `create` wrote, empty when it wrote none.
+    /// Returns the error bytes `create` wrote, or an empty slice.
     fn error(&self) -> &[u8] {
         // SAFETY: the buffer lives until the next `create` on this thread.
         unsafe { self.error.as_bytes() }
@@ -99,7 +101,8 @@ impl Drop for Instance {
 
 fn descriptor(build: fn() -> SystemTable, buffer: &mut [u8]) -> (u32, usize) {
     let mut written = usize::MAX;
-    // SAFETY: buffer and length slot are writable, separate, and live for the call.
+    // SAFETY: the buffer and the length slot are writable, do not overlap, and
+    // live for the whole call.
     let status = unsafe { def(build, buffer.as_mut_ptr(), buffer.len(), &mut written) };
     (status, written)
 }
@@ -130,7 +133,7 @@ fn test_descriptor_export() {
 fn system_def_raw(ty: &str, cx: &DefCxOwned, buffer: &mut [u8]) -> (u32, usize) {
     let cx = serde_json::to_vec(cx).expect("encodes");
     let mut written = usize::MAX;
-    // SAFETY: both arrays outlive the call; the result slots are writable.
+    // SAFETY: both arrays outlive the call, and the result slots are writable.
     let status = unsafe {
         system_def(
             build,
@@ -356,7 +359,7 @@ fn test_alloc_free() {
     unsafe { free(core::ptr::null_mut(), 8, 8) };
 }
 
-/// Marks one cycle, then completes.
+/// Waits one cycle, then completes.
 #[crate::sequence]
 async fn blink(seq: &crate::Seq) -> Result<(), crate::SeqError> {
     seq.next_cycle().await;
@@ -412,13 +415,14 @@ fn test_end_status_words() {
             end.as_ref().map(core::mem::discriminant)
         );
     }
-    // A slot's own state has no word; a pack reporting it has failed.
+    // `Unloaded` has no status word of its own, so a pack reports it as failed.
     assert_eq!(Status::of_end(Some(&EndReason::Unloaded)), Status::Failed);
     assert_eq!(Status::from_raw(5).end(), Some(EndReason::Panicked));
 }
 
-/// The `metor-fsw-abi` distribution exists to pin this number; a pack's
-/// editable wheel requires it exactly.
+/// The `metor-fsw-abi` Python package pins this version number.
+///
+/// A pack's editable wheel requires that exact version.
 #[test]
 fn test_python_abi_version() {
     let manifest: toml::Value = include_str!("../../python/metor-fsw-abi/pyproject.toml")
@@ -430,8 +434,9 @@ fn test_python_abi_version() {
     assert_eq!(version, ABI_VERSION.to_string());
 }
 
-/// The built-in links ship with the host, so `metor_config` declares their
-/// pack at this ABI.
+/// `metor_config` declares the built-in links' pack at this ABI version.
+///
+/// The built-in links ship with the host, so the versions must match.
 #[test]
 fn test_builtin_abi_version() {
     let source = include_str!("../../python/metor-config/metor_config/_config.py");

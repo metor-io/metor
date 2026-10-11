@@ -1,4 +1,4 @@
-//! The host side against `echo-pack` built as a module.
+//! Tests the host against `echo-pack` built as a wasm module.
 
 mod common;
 
@@ -55,8 +55,10 @@ fn test_def_of_unknown_type_is_refused() {
     assert!(matches!(refused, Err(metor_fsw_3::DefError::Pack { .. })));
 }
 
-/// rustc passes a by-value `RawSlice` as an `i32` pointer; a change there
-/// fails here first.
+/// Pins the wasm signatures of the exported ABI functions.
+///
+/// rustc passes a by-value `RawSlice` as an `i32` pointer. If that ever
+/// changes, this test fails first.
 #[test]
 fn test_export_signatures() {
     let engine = wasmi::Engine::default();
@@ -90,7 +92,10 @@ fn test_export_signatures() {
     assert_eq!(imports, ["env.memory"]);
 }
 
-/// The pack's frame, redeclared: the component id is the name's hash.
+/// The fixture pack's `Sample` frame, declared again here.
+///
+/// The host matches records by a hash of the name, so this copy is the same
+/// frame as the pack's.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[frame(name = "sample")]
 #[repr(C)]
@@ -100,16 +105,17 @@ struct Sample {
     value: f64,
 }
 
-/// What the host's systems saw, and the commands still to send.
+/// What the host's test systems have seen, plus the commands still to send.
 #[derive(Default)]
 struct Seen {
     pings: Vec<u32>,
     lines: Vec<LogEvent>,
     events: Vec<SequenceEventKind>,
     queue: VecDeque<SequenceCommandKind>,
-    /// Writes a source's ring refused.
+    /// How many of the source's writes its ring rejected.
     refused: u32,
-    /// Cycles the system after the one under test ran.
+    /// How many cycles the sink has run. The sink runs after the system under
+    /// test.
     after: u32,
 }
 
@@ -117,7 +123,8 @@ type Shared = Rc<RefCell<Seen>>;
 
 struct Source(u32, Shared);
 
-/// Counts up, and counts each write its ring refused.
+/// Publishes a count that goes up by one each cycle, and counts the writes
+/// its ring rejects.
 #[system]
 fn source(#[state] s: &mut Source, output: &mut Output<Ping>) {
     s.0 += 1;
@@ -126,7 +133,8 @@ fn source(#[state] s: &mut Source, output: &mut Output<Ping>) {
     }
 }
 
-/// Writes one sample per cycle, `offset` after twice the cycle.
+/// Writes one sample per cycle, timestamped at twice the cycle plus an
+/// offset.
 struct Sampler(i64, i64);
 
 #[system]
@@ -141,7 +149,7 @@ fn sampler(#[state] s: &mut Sampler, sample: &mut Output<Sample>) {
 
 struct Sink(Shared);
 
-/// Records every ping and log line it is wired to, and counts its cycles.
+/// Records every ping and log line it receives, and counts its cycles.
 #[system]
 fn sink(#[state] s: &mut Sink, pings: &mut Input<Ping>, lines: &mut Input<LogEvent>) {
     let mut seen = s.0.borrow_mut();
@@ -211,7 +219,8 @@ fn dylib_pack() -> Arc<Pack> {
     Arc::new(Pack::Dl(open_dylib()))
 }
 
-/// `source -> middle (echo.<ty>) -> sink`, with the sink on middle's log too.
+/// Builds `source -> middle (echo.<ty>) -> sink`. The sink also reads
+/// `middle`'s log.
 fn pipeline(ty: &str) -> CoordinatorConfig {
     CoordinatorConfig {
         systems: vec![
@@ -251,7 +260,7 @@ fn pings(seen: &Shared) -> Vec<u32> {
     std::mem::take(&mut seen.borrow_mut().pings)
 }
 
-/// The `kind` of every line the sink saw.
+/// Returns the `kind` field of every log line the sink saw.
 fn kinds(seen: &Shared) -> Vec<String> {
     let seen = seen.borrow();
     let fields = seen.lines.iter().flat_map(|line| &line.fields);
@@ -271,8 +280,9 @@ fn test_echo_delivers_each_cycle() {
     assert_eq!(coordinator.latched().count(), 0);
 }
 
-/// `older, newer -> middle (echo.meter) -> sink`: the meter pings the
-/// newest sample across its two producers.
+/// Builds `older, newer -> middle (echo.meter) -> sink`.
+///
+/// The meter pings the newest sample from either of its two producers.
 fn fan_in() -> CoordinatorConfig {
     let producers = vec![
         PortRef::new("older", "sample"),
@@ -385,7 +395,8 @@ fn test_logging_guest_runs() {
     assert_eq!(ticks, 100);
 }
 
-/// `cmds -> source -> mode (echo.count_up behind a channel) -> watch, sink`.
+/// Builds `cmds -> source -> mode (echo.count_up behind a channel) -> watch,
+/// sink`.
 fn channel() -> CoordinatorConfig {
     CoordinatorConfig {
         systems: vec![
@@ -415,7 +426,8 @@ fn channel() -> CoordinatorConfig {
     }
 }
 
-/// Sends `command` and runs `cycles` cycles, returning the events they produced.
+/// Sends `command` and runs `cycles` cycles. Returns the events they
+/// produced.
 fn send(
     coordinator: &mut Coordinator,
     seen: &Shared,
@@ -443,7 +455,8 @@ fn sequence_completes_aborts_and_resets(pack: &Arc<Pack>) {
 
     send(&mut coordinator, &seen, SequenceCommandKind::Reset, 1);
     send(&mut coordinator, &seen, SequenceCommandKind::Start, 1);
-    // The sequence sees the abort on the cycle it is sent, and ends there.
+    // The sequence sees the abort on the same cycle it is sent, and ends on
+    // that cycle.
     let events = send(&mut coordinator, &seen, SequenceCommandKind::Abort, 1);
     assert!(events.contains(&SequenceEventKind::Aborted), "{events:?}");
     assert_eq!(pings(&seen), [1]);

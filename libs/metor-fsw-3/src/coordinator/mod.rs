@@ -1,6 +1,9 @@
-//! The coordinator steps systems in order over the rings that connect them.
+//! The coordinator runs systems in a fixed order, once per cycle. Systems pass
+//! data to each other through rings: each output writes to its own ring, and
+//! each input reads from the rings of the outputs it is wired to.
 //!
-//! [`build`] resolves a config into systems and rings; [`run`] steps them.
+//! The `build` module turns a config into systems and rings. The `run` module
+//! steps them.
 
 #[cfg(feature = "host")]
 mod build;

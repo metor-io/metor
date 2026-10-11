@@ -1,15 +1,19 @@
-//! The `repr(C)` views the ABI passes byte slices and ring regions through.
+//! The `repr(C)` types the ABI uses to pass byte slices and rings.
 //!
-//! Each is a pointer and an element count, with no lifetime. The reader
-//! restores one through an `unsafe` accessor whose contract the caller keeps.
+//! Each one is a pointer and a length, with no lifetime. The receiver turns it
+//! back into a Rust value through an `unsafe` accessor, and the caller is
+//! responsible for upholding that accessor's contract.
 
 use core::ffi::c_void;
 
 use metor_fsw_3_ring::{RawOwner, RingExport};
 
-/// A borrowed array: the descriptor, a type name, params, an error, or the
-/// arrays `create` takes: one `RawSlice` of `RawRing`s per input port, and
-/// the output `RawRing`s. `len` counts elements.
+/// A borrowed array passed across the ABI.
+///
+/// It carries byte strings such as a type name, params, or an error. It also
+/// carries the ring arrays `create` takes: one `RawSlice` of `RawRing`s per
+/// input port, and one `RawSlice` of output `RawRing`s. `len` counts elements,
+/// not bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RawSlice {
@@ -18,13 +22,15 @@ pub struct RawSlice {
 }
 
 impl RawSlice {
-    /// The empty array, which is what an export returns when it has nothing.
+    /// An empty array. Exports return it when they have nothing to report.
     pub const EMPTY: RawSlice = RawSlice {
         ptr: core::ptr::null(),
         len: 0,
     };
 
-    /// Points at `items`, which must outlive every read of the result.
+    /// Creates a `RawSlice` pointing at `items`.
+    ///
+    /// `items` must outlive every read of the result.
     pub fn of<T>(items: &[T]) -> RawSlice {
         RawSlice {
             ptr: items.as_ptr().cast(),
@@ -32,12 +38,14 @@ impl RawSlice {
         }
     }
 
-    /// Reads this array back as a slice of `T`. The returned lifetime is the
-    /// caller's to choose, as it is for any raw pointer.
+    /// Reads this array back as a slice of `T`.
+    ///
+    /// The caller picks the returned lifetime, as with any raw pointer.
     ///
     /// # Safety
-    /// Either `len` is zero, or `ptr` is `T`-aligned and points at `len`
-    /// initialized `T`s that live, unwritten, for the returned slice's life.
+    /// Either `len` is zero, or `ptr` is aligned for `T` and points at `len`
+    /// initialized `T`s. Those values must stay alive and unmodified for as long
+    /// as the returned slice is used.
     pub unsafe fn as_slice<'a, T>(&self) -> &'a [T] {
         if self.len == 0 {
             return &[];
@@ -49,16 +57,18 @@ impl RawSlice {
     /// Reads this array back as bytes.
     ///
     /// # Safety
-    /// As [`as_slice`](RawSlice::as_slice), with `T` as `u8`.
+    /// The same as for [`as_slice`](RawSlice::as_slice), with `T` as `u8`.
     pub unsafe fn as_bytes<'a>(&self) -> &'a [u8] {
         unsafe { self.as_slice() }
     }
 }
 
-/// One ring's region, as [`RingBuffer::region`](metor_fsw_3_ring::RingBuffer::region) reports it.
+/// A ring's memory region passed across the ABI.
 ///
-/// A ring with no owner lives in the receiver's own memory, which outlives
-/// every handle the receiver attaches to it.
+/// `base` and `len` are the region [`RingBuffer::region`](metor_fsw_3_ring::RingBuffer::region)
+/// reports. `owner` holds callbacks that keep the region alive while the
+/// receiver uses it. A ring with no owner lives in the receiver's own memory,
+/// which outlives every handle the receiver attaches to it.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawRing {
@@ -68,7 +78,9 @@ pub struct RawRing {
 }
 
 impl RawRing {
-    /// Borrows an export that must remain alive until the receiver attaches.
+    /// Creates a `RawRing` from `export`.
+    ///
+    /// `export` must stay alive until the receiver attaches to the ring.
     pub fn of(export: &RingExport) -> Self {
         let (base, len) = export.region();
         Self {
@@ -79,12 +91,12 @@ impl RawRing {
     }
 }
 
-/// A [`RawSlice`]'s size in a wasm32 guest.
+/// The size of a [`RawSlice`] in a wasm32 guest.
 pub const WASM32_RAW_SLICE: usize = 8;
-/// A [`RawRing`]'s size in a wasm32 guest.
+/// The size of a [`RawRing`] in a wasm32 guest.
 pub const WASM32_RAW_RING: usize = 20;
 
-// The owner's function pointers are its niche, so the option adds nothing.
+// `RawOwner`'s function pointers are never null, so `Option` adds no size.
 const _: () = assert!(size_of::<Option<RawOwner>>() == size_of::<RawOwner>());
 #[cfg(target_arch = "wasm32")]
 const _: () =

@@ -1,4 +1,4 @@
-//! The [`Ctor`] trait, which builds a state from a plain constructor fn.
+//! The [`Ctor`] trait, which lets a plain fn build a system's state.
 
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -6,12 +6,20 @@ use serde_json::value::RawValue;
 
 use crate::coordinator::{ParamError, Params};
 
-/// A `Ctor` builds a system's state from its params
+/// Builds a system's state from its config params.
+///
+/// It is implemented for fns that take no params, fns that take a
+/// deserializable params type, and fns that take params and may fail with a
+/// [`ParamError`]. `Marker` keeps these impls from overlapping.
 pub trait Ctor<S, Marker> {
-    /// Builds the state, decoding `params` when the constructor takes them.
+    /// Builds the state.
+    ///
+    /// Decodes `params` first if the constructor takes them.
     fn make(&self, params: Params<'_>) -> Result<S, ParamError>;
 
-    /// The JSON Schema of the params type, or `None` when the constructor takes none.
+    /// Returns the JSON Schema of the params type.
+    ///
+    /// Returns `None` if the constructor takes no params.
     fn schema() -> Option<Box<RawValue>>;
 }
 
@@ -35,7 +43,7 @@ impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> S> Ctor<S, (P,)> for F {
     }
 }
 
-/// A constructor that can refuse its params, such as one binding a socket.
+/// A constructor that can reject its params, such as one that binds a socket.
 impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> Result<S, ParamError>>
     Ctor<S, (P, ParamError)> for F
 {
@@ -67,7 +75,9 @@ mod tests {
         }
     }
 
-    /// The turbofish a fallible registration needs, since `Fn(P) -> S` also matches.
+    /// Calls `build` as a fallible constructor.
+    ///
+    /// The turbofish is needed because `Fn(P) -> S` also matches `build`.
     fn ctor(params: &serde_json::Value) -> Result<u16, ParamError> {
         Ctor::<u16, (Port, ParamError)>::make(&build, Params(params))
     }

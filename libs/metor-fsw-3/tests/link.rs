@@ -1,5 +1,5 @@
-//! A running target's links: what a client sees on a `Publish`, and what a
-//! `Subscribe` does with what it is sent.
+//! Tests the links of a running target: what a client receives from a
+//! `Publish`, and what a `Subscribe` does with the packets it receives.
 
 mod common;
 
@@ -27,7 +27,7 @@ use stellarator::io::{AsyncWrite, OwnedReader, SplitExt};
 use stellarator::net::TcpStream;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// A frame whose vtable and metadata announce as several kilobytes.
+/// A frame whose announce (vtable and metadata) is several kilobytes long.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[frame(name = "wide")]
 #[repr(C)]
@@ -46,7 +46,7 @@ fn wide_source(now: Timestamp, wide: &mut Output<Wide>) {
     });
 }
 
-/// Records every status its link publishes.
+/// Records every status its link writes.
 struct StatusSink(Arc<Mutex<Vec<LinkStatus>>>);
 
 #[system]
@@ -67,7 +67,8 @@ fn pinger(#[state] s: &mut Pinger, ping: &mut Output<Ping>) {
     let _ = ping.write(&Ping { n: s.0 });
 }
 
-/// Records every frame's sample it is wired to, as a whole number, beside the pings.
+/// Records the sample of every frame it receives, as a whole number. The
+/// samples go in the same list as the pings.
 struct ImuSink(Arc<Mutex<Vec<u32>>>);
 
 #[system]
@@ -80,7 +81,7 @@ fn imu_sink(#[state] s: &mut ImuSink, imu: &mut Input<Imu>) {
     }
 }
 
-/// Records every ping it is wired to.
+/// Records every ping it receives.
 struct PingSink(Arc<Mutex<Vec<u32>>>);
 
 #[system]
@@ -91,7 +92,7 @@ fn ping_sink(#[state] s: &mut PingSink, ping: &mut Input<Ping>) {
     }
 }
 
-/// Records the fault kinds its link logs.
+/// Records the `kind` of every log line it receives.
 struct LogSink(Arc<Mutex<Vec<String>>>);
 
 #[system]
@@ -142,7 +143,8 @@ impl Seen {
     }
 }
 
-/// The systems every test in this file may name, plus the built-in links.
+/// Builds the system table for these tests: the test systems plus the
+/// built-in links.
 fn table(seen: &Seen) -> SystemTable {
     let mut table = SystemTable::new();
     table
@@ -176,7 +178,7 @@ fn table(seen: &Seen) -> SystemTable {
     table
 }
 
-/// One system reading one port of another.
+/// Returns the config for system `id`, reading `from` on its `port` input.
 fn reading(id: &str, ty: &str, port: &str, from: PortRef) -> SystemConfig {
     SystemConfig {
         inputs: vec![InputConfig {
@@ -187,7 +189,7 @@ fn reading(id: &str, ty: &str, port: &str, from: PortRef) -> SystemConfig {
     }
 }
 
-/// A `Publish` named `link` over `transport`, serving `imu.imu`.
+/// Returns a `Publish` named `link` on `transport` that serves `imu.imu`.
 fn publish(link: &str, transport: serde_json::Value, conn_cap: usize) -> SystemConfig {
     SystemConfig {
         params: json!({
@@ -200,12 +202,13 @@ fn publish(link: &str, transport: serde_json::Value, conn_cap: usize) -> SystemC
     }
 }
 
-/// A listening transport on a port the OS picks.
+/// Returns a transport that listens on a port the OS picks.
 fn listen_any() -> serde_json::Value {
     json!({ "listen": { "addr": "127.0.0.1:0" } })
 }
 
-/// `imu` and a `Publish` named `link` serving it on a port the OS picks.
+/// Returns an `imu` source and a `Publish` named `link` that serves it on a
+/// port the OS picks.
 fn imu_publisher(link: &str) -> Vec<SystemConfig> {
     vec![
         SystemConfig::new("imu", "source"),
@@ -213,7 +216,7 @@ fn imu_publisher(link: &str) -> Vec<SystemConfig> {
     ]
 }
 
-/// A status sink on the link system `link`.
+/// Returns a status sink that reads the link system `link`.
 fn status_reader(link: &str) -> SystemConfig {
     reading(
         "status",
@@ -223,12 +226,12 @@ fn status_reader(link: &str) -> SystemConfig {
     )
 }
 
-/// Builds and runs `systems` on a thread of its own, cycling at `rate`.
+/// Builds `systems` and runs them on a new thread, cycling at `rate`.
 fn spawn(systems: Vec<SystemConfig>, seen: &Seen, rate: f64) -> Target {
     spawn_on(systems, seen, Clock::Wall { rate })
 }
 
-/// Builds and runs `systems` on a thread of its own, under `clock`.
+/// Builds `systems` and runs them on a new thread with `clock`.
 fn spawn_on(systems: Vec<SystemConfig>, seen: &Seen, clock: Clock) -> Target {
     let config = CoordinatorConfig {
         clock,
@@ -241,8 +244,9 @@ fn spawn_on(systems: Vec<SystemConfig>, seen: &Seen, clock: Clock) -> Target {
     Target::spawn(config, move || table(&seen), cycles)
 }
 
-/// The address the link named `link` bound, once its target has built it.
-/// Links bind port zero, so nothing in a test picks a port.
+/// Waits for the link named `link` to bind, and returns its address.
+///
+/// The test links bind port zero, so tests never have to pick a port.
 async fn bound(link: &str) -> SocketAddr {
     let deadline = Deadline::new();
     loop {
@@ -258,7 +262,8 @@ async fn bound(link: &str) -> SocketAddr {
     }
 }
 
-/// Connects until the target's listener is up, without a handshake.
+/// Connects to `addr` once the listener is up, without reading its
+/// handshake.
 async fn raw_dial(addr: SocketAddr) -> TcpStream {
     let deadline = Deadline::new();
     loop {
@@ -269,7 +274,7 @@ async fn raw_dial(addr: SocketAddr) -> TcpStream {
     }
 }
 
-/// The next packet, growing the buffer the previous one left.
+/// Reads the next packet, growing the buffer if needed.
 async fn next(
     rx: &mut PacketStream<OwnedReader<TcpStream>>,
     buf: &mut Vec<u8>,
@@ -283,7 +288,7 @@ async fn next(
     packet
 }
 
-/// Waits until `done`, failing the test at the deadline.
+/// Waits until `done` returns true, failing the test at the deadline.
 async fn until(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Deadline::new();
     while !done() {
@@ -291,7 +296,8 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// As [`until`], naming the last status and faults the target reported.
+/// Like [`until`], but the failure message includes the target's last
+/// status and faults.
 async fn until_seen(what: &str, seen: &Seen, mut done: impl FnMut() -> bool) {
     let deadline = Deadline::new();
     while !done() {
@@ -362,8 +368,8 @@ async fn test_publish_retries_connection() {
         &seen,
         500.0,
     );
-    // The first connection is refused by hanging up, so the link backs off
-    // and dials again; the second carries the announce.
+    // Hang up on the first connection. The link backs off and dials again,
+    // and the second connection carries the announce.
     drop(listener.accept().await.expect("the link dials"));
 
     let (rx, _tx) = listener.accept().await.expect("the link redials").split();
@@ -421,7 +427,8 @@ async fn test_slow_client_isolation() {
     assert_eq!(seen.status().expect("a status").connections, 2);
 }
 
-/// A `Subscribe` named `link` over `transport`, publishing what it is sent on `ping`.
+/// Returns a `Subscribe` named `link` on `transport`, which writes the pings
+/// it receives to its `ping` output.
 fn subscribe(link: &str, transport: serde_json::Value) -> SystemConfig {
     SystemConfig {
         params: json!({
@@ -494,8 +501,8 @@ async fn test_subscribe_announces_and_routes() {
     })
     .await;
 
-    // A table is the peer's business: not routed, not counted, and the
-    // connection stays up.
+    // A table no port takes is ignored: it is not routed or counted as
+    // dropped, and the connection stays up.
     tx.send(LenPacket::table([1, 2], 8)).await.0.expect("up");
     tx.send((&Ping { n: 9 }).into_len_packet())
         .await
@@ -552,8 +559,10 @@ async fn test_subscribe_receives_records() {
     assert!(steps.iter().all(|step| *step == 1), "{pings:?}");
 }
 
-/// A `Subscribe` dialing `addr` whose `imu` output was built against `def`,
-/// as `metor build` bakes a peer's port, with a log sink on its faults.
+/// Returns a `Subscribe` that dials `addr`, plus sinks for its frames and
+/// faults.
+///
+/// Its `imu` output uses `def`, the way `metor build` resolves a peer's port.
 fn mirror(addr: SocketAddr, def: metor_fsw_3::PortDef) -> Vec<SystemConfig> {
     vec![
         SystemConfig {
@@ -572,7 +581,8 @@ fn mirror(addr: SocketAddr, def: metor_fsw_3::PortDef) -> Vec<SystemConfig> {
     ]
 }
 
-/// The def `imu.imu` announces on a `cube_sat` target, under a mirror's name.
+/// Returns the definition `imu.imu` announces on a `cube_sat` target, renamed
+/// to the subscriber's `imu` port.
 fn published_imu() -> metor_fsw_3::PortDef {
     let cx = DefCx {
         id: "imu",
@@ -600,7 +610,7 @@ async fn test_subscribe_mirrors_frames() {
     assert!(!client.faulted("peer_schema_mismatch"));
 }
 
-/// A target that dials a peer and listens for the ground on one thread.
+/// A target can dial a peer and listen for the ground on the same thread.
 #[stellarator::test]
 async fn test_dialing_beside_a_listener() {
     let (server, client) = (Seen::default(), Seen::default());
@@ -631,7 +641,7 @@ async fn test_subscribe_faults_unannounced_table() {
     let (server, client) = (Seen::default(), Seen::default());
     let _server = spawn(imu_publisher("pub-other"), &server, 500.0);
     let addr = bound("pub-other").await;
-    // Built against the same frame on another target: another table id.
+    // The same frame on a different target has a different table id.
     let elsewhere = DefCx {
         id: "imu",
         namespace: Some("other"),
@@ -649,7 +659,7 @@ async fn test_subscribe_faults_unannounced_table() {
     assert!(client.pings().is_empty(), "nothing routes under a stale id");
 }
 
-/// A port no other target holds, for two targets in a row.
+/// Returns a free port, so two targets can use it one after the other.
 fn free_port() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
     listener.local_addr().expect("its address")
@@ -679,7 +689,8 @@ async fn test_reconnect_checks_the_new_peer() {
     assert!(!client.faulted("peer_schema_mismatch"));
     drop(first);
 
-    // The same address, rebuilt around a frame the mirror's port never takes.
+    // A new target on the same address, serving a frame the subscriber's port
+    // does not take.
     let rebuilt = Seen::default();
     let _second = spawn(
         vec![
@@ -769,7 +780,8 @@ async fn test_oversized_packet_closes_connection() {
     })
     .await;
 
-    // Four gigabytes the link must refuse rather than allocate.
+    // A length prefix of four gigabytes, which the link must refuse rather
+    // than allocate.
     let (written, _) = peer.write_all(u32::MAX.to_le_bytes().to_vec()).await;
     written.expect("the link takes the prefix");
     until_seen("the link kept a connection it cannot serve", &seen, || {
@@ -794,11 +806,12 @@ async fn test_disconnect_frees_slot() {
     );
     let addr = bound("cmds-slot").await;
 
-    // A peer that takes the slot and leaves without ever sending a command.
+    // A peer takes the slot and leaves without sending a command.
     let Fsw { rx, tx, .. } = dial_fsw(addr).await;
     drop((rx, tx));
 
-    // Nothing else stirs the link, so only the hang-up can free the slot.
+    // Nothing else wakes the link, so only noticing the hang-up can free the
+    // slot.
     let Fsw { tx, .. } = dial_fsw(addr).await;
     tx.send((&Ping { n: 3 }).into_len_packet())
         .await
@@ -828,7 +841,7 @@ async fn test_refuse_peer_past_limit() {
 
     let Fsw { rx: _rx, tx, .. } = dial_fsw(addr).await;
 
-    // A second peer is accepted and closed at once, rather than left waiting.
+    // A second peer is accepted and closed right away, not left waiting.
     let refused = raw_dial(addr).await;
     let (read, _) = within(
         "the link kept the refused peer waiting",
@@ -861,7 +874,8 @@ async fn test_stop_closes_connections() {
     assert!(read.is_err());
 }
 
-/// A `Publish` dialing `addr`, serving `imu.imu` and logging onto `pub.log`.
+/// Returns a `Publish` that dials `addr` and serves `imu.imu`, plus a sink
+/// for its log.
 fn dialing_publish(addr: SocketAddr) -> Vec<SystemConfig> {
     vec![
         SystemConfig::new("imu", "source"),
@@ -876,8 +890,8 @@ fn dialing_publish(addr: SocketAddr) -> Vec<SystemConfig> {
 
 #[stellarator::test]
 async fn test_simulated_clock_preserves_connection() {
-    // The peer listens before the target exists, so its connection predates
-    // the first cycle.
+    // The peer listens before the target exists, so the connection opens
+    // before the first cycle.
     let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
     let addr = listener.local_addr().expect("bound");
     let seen = Seen::default();
@@ -920,18 +934,20 @@ async fn test_simulated_clock_preserves_connection() {
     .await;
 }
 
-/// How many cycles the fixture target runs before it exits on its own; the test
-/// kills it long before that.
+/// How many cycles the fixture target runs before it exits on its own. The
+/// test kills it long before that.
 const FIXTURE_CYCLES: &str = "600000";
 
-/// The fixture's target under `metor run`, with the links it bound.
+/// The fixture's target running under `metor run`, with the addresses its
+/// links bound.
 struct Fixture {
     _child: Running,
     ports: Vec<(String, SocketAddr)>,
 }
 
 impl Fixture {
-    /// Runs the fixture target with `--print-ports` and reads what it bound.
+    /// Runs the fixture target with `--print-ports` and reads the addresses
+    /// it prints.
     fn start() -> Self {
         let target = fixture_dir().join("target.py");
         let mut child = metor()
@@ -972,7 +988,8 @@ impl Fixture {
 #[stellarator::test]
 async fn test_fixture_link_round_trip() {
     let fixture = Fixture::start();
-    // The publisher takes the connection first, so the answer cannot precede it.
+    // Connect to the publisher first, so the reply cannot arrive before the
+    // connection exists.
     let Fsw { mut rx, buf, .. } = dial_fsw(fixture.addr("pub")).await;
     let Fsw { info, tx, .. } = dial_fsw(fixture.addr("cmds")).await;
     assert_eq!(info.command_ids, vec![<Ping as Msg>::ID]);

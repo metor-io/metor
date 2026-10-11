@@ -1,4 +1,8 @@
-//! `FnSystem` allows you to author a system as one `#[system]` fn.
+//! Systems written as a single `#[system]` fn.
+//!
+//! Each parameter of the fn is a port, or another value the system reads
+//! each cycle, such as the cycle time. [`FnSystem`] turns the fn into a
+//! [`System`] or an [`AsyncSystem`].
 
 mod ctor;
 mod param;
@@ -20,31 +24,33 @@ use crate::{
 pub use ctor::Ctor;
 use param::Defs;
 pub use param::{Cycle, Param, ParamNames, Views, Writers};
+pub(crate) use set::report_dropped;
 pub use set::{InSet, LOG_PORT, OutSet};
 
-/// A `Ports` names one authored system's parameters, which are its ports.
+/// Describes the parameters of a system written as a fn.
 pub trait Ports: Sized + 'static {
-    /// The `#[state]` parameter's type, or `()`.
+    /// The type of the `#[state]` parameter, or `()` if there is none.
     type State: 'static;
     type Params: Param;
     const NAME: &'static str;
-    /// One name per parameter, in parameter order.
+    /// The name of each parameter, in order.
     const NAMES: &'static [&'static str];
-    /// The doc comment on the fn, lines joined with newlines.
+    /// The fn's doc comment, with its lines joined by newlines.
     const DOC: &'static str = "";
 }
 
-/// A `SystemFn` is a cyclic system whose parameters are the ports.
+/// A cyclic system written as a fn.
 pub trait SystemFn: Ports {
-    /// Runs one cycle with this cycle's parameter values.
+    /// Runs one cycle.
     fn call(state: &mut Self::State, items: <Self::Params as Param>::Item<'_, NoWake>);
 }
 
-/// An `AsyncSystemFn` is an async system whose parameters are the ports, plus
-/// the [`Stop`] that ends it.
+/// An async system written as a fn.
+///
+/// Besides its ports, the fn receives a [`Stop`] that tells it when to end.
 #[allow(async_fn_in_trait)]
 pub trait AsyncSystemFn: Ports {
-    /// Runs the system, returning once `stop` resolves.
+    /// Runs the system until `stop` resolves.
     async fn call(
         state: &mut Self::State,
         items: <Self::Params as Param>::Item<'_, Notifier>,
@@ -52,13 +58,17 @@ pub trait AsyncSystemFn: Ports {
     );
 }
 
-/// Compiles only when `P` is a `Param`; `#[system]` calls it once per parameter.
+/// Fails to compile unless `P` implements [`Param`].
+///
+/// `#[system]` calls this once per parameter.
 #[doc(hidden)]
 #[inline(always)]
 pub fn assert_param<P: Param>() {}
 
-/// A `FnSystem` is the [`System`] a [`SystemFn`] registers as, or the
-/// [`AsyncSystem`] an [`AsyncSystemFn`] does.
+/// Runs a fn system as a [`System`] or an [`AsyncSystem`].
+///
+/// A [`SystemFn`] becomes a `System`, and an [`AsyncSystemFn`] becomes an
+/// `AsyncSystem`.
 pub struct FnSystem<S>(PhantomData<S>);
 
 impl<S> Default for FnSystem<S> {
@@ -72,7 +82,11 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
     type Inputs = InSet<S, Notifier>;
     type Outputs = OutSet<S>;
 
-    /// Refuses a [`Sample`](crate::port::Sample) parameter, since no step takes it.
+    /// Returns the system's definition.
+    ///
+    /// # Errors
+    /// Refuses a [`Sample`](crate::port::Sample) parameter, because async
+    /// systems have no step to take samples each cycle.
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         if Defs::of::<S>(cx)?.sampled {
             return Err(DefError::SampleOnAsync {
@@ -82,7 +96,7 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
         SystemDef::new::<InSet<S, Notifier>, OutSet<S>, _>(S::NAME, cx)
     }
 
-    /// Points each poll's log lines at the system's own `log` output, then runs the system.
+    /// Runs the system, sending its log lines to its own `log` output.
     async fn run(
         &self,
         state: &mut S::State,
@@ -107,7 +121,10 @@ impl<S: SystemFn> System for FnSystem<S> {
         SystemDef::new::<InSet<S>, OutSet<S>, _>(S::NAME, cx)
     }
 
-    /// Points this thread's log lines at the system's own `log` output, then runs one cycle.
+    /// Runs one cycle, sending its log lines to the system's own `log` output.
+    ///
+    /// Samples are taken before the fn runs. Failed writes are reported as a
+    /// fault afterward.
     fn execute(
         &self,
         now: Timestamp,
@@ -124,9 +141,10 @@ impl<S: SystemFn> System for FnSystem<S> {
                 S::Params::get(&mut inputs.ins, &mut outputs.outs, &mut cx),
             );
         });
+        outputs.report_dropped(now);
     }
 
-    /// Writes the panic as a fault line on the system's own `log` output.
+    /// Logs a panic as a fault on the system's own `log` output.
     fn fault(&self, now: Timestamp, outputs: &mut OutSet<S>, message: &str) {
         outputs.log.fault(now, "panic", message.to_string());
     }

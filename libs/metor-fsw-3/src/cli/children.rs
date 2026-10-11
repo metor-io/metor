@@ -1,5 +1,7 @@
-//! Every target of a deployment as a child of this binary, each running
-//! `metor run <envelope> --target NS` with its output prefixed by its name.
+//! Runs each target of a deployment as a child process.
+//!
+//! Each child runs `metor run <config> --target NS`. Its output is copied to
+//! this process's stderr, with every line prefixed by the target's namespace.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -10,17 +12,19 @@ use std::time::Duration;
 
 use super::run::Run;
 
-/// How often the parent looks for an exited child.
+/// How often the parent checks whether a child has exited.
 const POLL: Duration = Duration::from_millis(50);
 
-/// One running target and the threads copying its output.
+/// A running target process. Dropping it kills the process.
 pub struct Child {
     pub namespace: String,
     process: Process,
     drains: Vec<JoinHandle<()>>,
 }
 
-/// The arguments a child runs with: the envelope, its target, and the
+/// Returns the command-line arguments for one child.
+///
+/// The child runs the target `namespace` from `envelope`, and inherits the
 /// clock and cycle overrides the parent was given.
 pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsString> {
     let flags = [
@@ -45,8 +49,10 @@ pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsS
     .collect()
 }
 
-/// Starts `namespace` from `envelope`, its stdout and stderr each copied to
-/// this process's stderr under a `NS │ ` prefix.
+/// Starts the target `namespace` from `envelope` as a child process.
+///
+/// The child's stdout and stderr are both copied to this process's stderr,
+/// with each line prefixed by `NS │ `.
 pub fn spawn(envelope: &Path, namespace: &str, overrides: &Run) -> std::io::Result<Child> {
     let mut process = Command::new(std::env::current_exe()?)
         .args(member_argv(envelope, namespace, overrides))
@@ -68,8 +74,10 @@ pub fn spawn(envelope: &Path, namespace: &str, overrides: &Run) -> std::io::Resu
     })
 }
 
-/// Starts every namespace; a failed spawn drops the children already started,
-/// which kills and reaps them.
+/// Starts one child per namespace.
+///
+/// If a spawn fails, the children already started are dropped, which kills
+/// them.
 pub fn spawn_all(
     envelope: &Path,
     namespaces: &[&str],
@@ -82,14 +90,15 @@ pub fn spawn_all(
 }
 
 impl Child {
-    /// Asks the child to stop, for a parent that was interrupted itself.
+    /// Sends the child SIGINT. The parent forwards its own interrupt this way.
     fn interrupt(&self) {
-        // SAFETY: `kill` takes a pid and a signal number and touches no memory.
+        // SAFETY: `kill` takes a pid and a signal number and does not touch
+        // memory.
         unsafe { libc::kill(self.process.id() as i32, libc::SIGINT) };
     }
 }
 
-/// Kills and reaps the child, then joins its drains.
+/// Kills and reaps the child, then waits for its output to finish copying.
 impl Drop for Child {
     fn drop(&mut self) {
         let _ = self.process.kill();
@@ -104,17 +113,22 @@ fn drain(reader: impl Read + Send + 'static, namespace: String) -> JoinHandle<()
     std::thread::spawn(move || prefix(reader, &namespace, std::io::stderr()))
 }
 
-/// Copies `reader` line by line onto `sink`, each line under `namespace`.
-/// A sink that locks does so per line, never while the reader blocks.
+/// Copies `reader` to `sink` line by line, prefixing each line with
+/// `namespace`.
+///
+/// Each line is written in one call, so a sink that locks, like stderr, only
+/// holds the lock while writing and never while waiting on the reader.
 pub fn prefix(reader: impl Read, namespace: &str, mut sink: impl Write) {
     for line in BufReader::new(reader).lines().map_while(Result::ok) {
         let _ = writeln!(sink, "{namespace} │ {line}");
     }
 }
 
-/// Waits for every child. The first to exit nonzero kills the rest, and a
-/// SIGINT to this process is forwarded to all of them; the result names every
-/// child that did not exit zero.
+/// Waits for every child to exit.
+///
+/// If any child exits with a failure, the rest are killed. A SIGINT to this
+/// process is forwarded to every child. On failure, returns the namespace of
+/// every child that did not exit successfully.
 pub fn wait_all(mut children: Vec<Child>) -> Result<(), Vec<String>> {
     let mut failed = Vec::new();
     let mut running: Vec<usize> = (0..children.len()).collect();
@@ -166,7 +180,8 @@ mod tests {
 
     use super::*;
 
-    /// A reader that yields what the sender pushes and blocks in between.
+    /// A reader that returns whatever the sender pushes, and blocks until
+    /// then.
     struct Channel(Receiver<Vec<u8>>, Vec<u8>);
 
     impl Read for Channel {
@@ -184,7 +199,7 @@ mod tests {
         }
     }
 
-    /// A sink that takes a lock per write, as `Stderr` does.
+    /// A sink that takes a lock on every write, like `Stderr` does.
     #[derive(Clone)]
     struct Locking(Arc<Mutex<Vec<u8>>>);
 
@@ -216,7 +231,8 @@ mod tests {
     }
 
     fn alive(pid: u32) -> bool {
-        // SAFETY: signal zero only probes for the pid.
+        // SAFETY: signal zero sends nothing; it only checks that the pid
+        // exists.
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
 

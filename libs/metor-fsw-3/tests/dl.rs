@@ -1,4 +1,5 @@
-//! The host side against a real pack: build `echo-pack`, open it, run it.
+//! Tests the host against a real pack: builds `echo-pack`, opens it, and runs
+//! its systems.
 
 mod common;
 
@@ -24,7 +25,7 @@ fn source(#[state] s: &mut Source, output: &mut Output<Ping>) {
     let _ = output.write(&Ping { n: s.0 });
 }
 
-/// Records every ping it is wired to.
+/// Records every ping it receives.
 struct Sink(Rc<RefCell<Vec<u32>>>);
 
 #[system]
@@ -35,14 +36,15 @@ fn sink(#[state] s: &mut Sink, input: &mut Input<Ping>) {
     }
 }
 
-/// Opens the fixture, which is a pack built against this ABI.
+/// Opens the fixture pack.
 fn open() -> Arc<Pack> {
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
     let pack = unsafe { DlPack::open(fixture_lib()) }.expect("the fixture opens");
     Arc::new(Pack::Dl(pack))
 }
 
-/// The fixture's library, which only a dylib pack has.
+/// Returns the fixture's loaded library. Panics for a wasm pack, which has
+/// none.
 fn library(pack: &Pack) -> &Arc<libloading::Library> {
     match pack {
         Pack::Dl(pack) => pack.library(),
@@ -77,7 +79,8 @@ fn test_pack_builder_panic_returns_error() {
     );
 }
 
-/// `source -> <pack>.<ty> -> sink`, with the pack system's params.
+/// Builds the pipeline `source -> echo.<ty> -> sink`, passing `params` to the
+/// pack system.
 fn pipeline(ty: &str, params: serde_json::Value) -> (CoordinatorConfig, Rc<RefCell<Vec<u32>>>) {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let config = CoordinatorConfig {
@@ -169,7 +172,7 @@ fn test_pack_reports_system_metadata() {
     assert_eq!(echo.def.inputs[0].name, "input");
     assert_eq!(echo.def.inputs[0].record, Ping::NAME);
     assert_eq!(echo.def.inputs[0].id, Ping::ID);
-    // The `log` output every fn system declares comes last.
+    // Every fn system has a `log` output, and it comes last.
     let outputs: Vec<_> = echo.def.outputs.iter().map(|p| p.name.as_ref()).collect();
     assert_eq!(outputs, vec!["output", "log"]);
     assert_eq!(echo.doc, "Copies the newest ping.");
@@ -185,8 +188,8 @@ fn test_pack_reports_system_metadata() {
     assert!(echo.params.is_none());
 }
 
-/// The host wires two of the fixture's outputs into one pack system, which
-/// declares neither: the ports come back with the definition the pack computed.
+/// The host wires two outputs into a pack system that does not declare those
+/// inputs. The pack computes their definitions from the wiring.
 #[test]
 fn test_pack_configures_inputs() {
     let pack = open();
@@ -214,7 +217,7 @@ fn test_pack_configures_inputs() {
         .build(&table(&pack, &seen))
         .expect("the config builds");
     coordinator.step(Timestamp(1));
-    // One ping from each source, summed on the pack's side.
+    // One ping from each source, summed by the pack system.
     assert_eq!(*seen.borrow(), vec![2]);
 }
 
@@ -224,7 +227,8 @@ fn test_missing_export_error() {
     let path = Path::new("/usr/lib/libSystem.B.dylib");
     #[cfg(not(target_os = "macos"))]
     let path = Path::new("libc.so.6");
-    // SAFETY: a system library, loaded to check that it exports nothing of ours.
+    // SAFETY: this is a system library. It is only loaded to check that it
+    // does not export the pack symbols.
     let Err(error) = (unsafe { DlPack::open(path) }) else {
         panic!("a system library is no pack")
     };
@@ -236,7 +240,7 @@ fn test_missing_export_error() {
 
 #[test]
 fn test_abi_error_reports_versions() {
-    // SAFETY: the fixture is a pack; only the expected version is wrong.
+    // SAFETY: the fixture is a valid pack; only the expected version is wrong.
     let Err(error) = (unsafe { DlPack::open_with(fixture_lib(), ABI_VERSION + 1) }) else {
         panic!("the versions differ")
     };
@@ -309,7 +313,8 @@ fn test_pack_panic_preserves_cycle() {
     coordinator.step(Timestamp(2));
     assert_eq!(coordinator.latched().collect::<Vec<_>>(), vec!["middle"]);
     coordinator.step(Timestamp(3));
-    // The sink ran on every cycle, including the two after the panic.
+    // The coordinator kept cycling after the panic. The sink only got the
+    // ping `boom` wrote before it failed.
     assert_eq!(*seen.borrow(), vec![1]);
     assert_eq!(coordinator.cycle(), 3);
 }
@@ -344,7 +349,8 @@ fn test_failed_consumer_isolation() {
 #[test]
 fn test_guest_ports_survive_pack_drop() {
     let (mut coordinator, _, pack) = built("retained", serde_json::Value::Null);
-    // SAFETY: the fixture exports this exact function and its code stays resident.
+    // SAFETY: the fixture exports a function with this signature, and its
+    // code stays loaded.
     let release = unsafe {
         *library(&pack)
             .get::<unsafe extern "C" fn() -> u32>(b"echo_pack_release_retained")
@@ -356,6 +362,7 @@ fn test_guest_ports_survive_pack_drop() {
 
     // SAFETY: called on the thread that bound the retained fixture ports.
     assert_eq!(unsafe { release() }, 1);
-    // SAFETY: a repeated call checks that both TLS handles were released.
+    // SAFETY: as above. A second call checks that both TLS handles were
+    // released.
     assert_eq!(unsafe { release() }, 0);
 }

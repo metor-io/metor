@@ -1,5 +1,4 @@
-//! One system instance in a guest of its own, stepped through copies of its
-//! rings.
+//! Runs one system instance inside its own wasm guest.
 
 use std::borrow::Cow;
 
@@ -13,13 +12,15 @@ use crate::pack::Status;
 
 use super::guest::{Guest, Trap};
 
-/// A `WasmStep` is one instance living in its own guest.
+/// A system instance running in its own wasm guest.
 ///
-/// Each cycle it copies the real input rings into the guest's, calls
-/// `metor_fsw_execute`, and copies the guest's output rings into the real
-/// ones, whatever the call returned.
+/// Each cycle, it copies new records from the real input rings into the
+/// guest's copies, calls `metor_fsw_execute`, and then copies the guest's
+/// output records into the real output rings. Outputs are copied even if the
+/// call failed.
 pub struct WasmStep {
-    /// Declared before `guest`: dropping its handles writes into guest memory.
+    /// Must be declared before `guest`, because dropping these handles writes
+    /// into guest memory.
     mirrors: Mirrors<NoWake>,
     guest: Guest,
     instance: u32,
@@ -57,7 +58,7 @@ impl Step for WasmStep {
         self.mirrors.report_drops(now);
     }
 
-    /// Nothing: the host's line already reports how a guest ended.
+    /// Does nothing, because the host already logged how the guest ended.
     fn fault(&mut self, _now: Timestamp, _message: &str) {}
 
     fn ended(&self) -> Option<&EndReason> {
@@ -65,11 +66,13 @@ impl Step for WasmStep {
     }
 }
 
-/// How a step ended, and the host's line about it when the guest wrote none.
+/// How a step ended, plus the log line the host writes about it.
+///
+/// `line` is `None` when the guest reported the end itself.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct End {
     pub(super) reason: EndReason,
-    /// The line's `kind` and message.
+    /// The log line's `kind` and message.
     pub(super) line: Option<(&'static str, &'static str)>,
 }
 
@@ -82,7 +85,10 @@ impl End {
     }
 }
 
-/// The end one cycle's copies and call add up to, `None` while it runs.
+/// Decides whether one cycle ended the step.
+///
+/// `copied` is the result of copying the rings, and `result` is the result of
+/// the `execute` call. Returns `None` if the step is still running.
 pub(super) fn end_of(copied: Result<(), Corrupt>, result: Result<u32, Trap>) -> Option<End> {
     if copied.is_err() {
         let reason = EndReason::Failed(Cow::Borrowed("corrupt ring"));

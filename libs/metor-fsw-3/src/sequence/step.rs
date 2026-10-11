@@ -1,40 +1,47 @@
-//! The step a sequence is bound as: its future, polled once per cycle.
+//! The step that runs a sequence.
 
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::AtomicU32;
 use core::task::{Context, Poll, Waker};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use metor_fsw_3_ring::NoWake;
 use metor_proto::types::Timestamp;
 
 use crate::channel::Abort;
 use crate::coordinator::{EndReason, Step};
-use crate::fn_system::{Cycle, InSet, OutSet, Param};
+use crate::fn_system::{Cycle, InSet, OutSet, Param, report_dropped};
 use crate::log::{self, Log, LogPort};
 use crate::port::{Input, Samplers};
 use crate::system::{InputBinding, OutputBinding, SystemInputs, SystemOutputs};
 
 use super::{Seq, SeqError, SequenceFn};
 
-/// A sequence's future, owning its state, its ports, and its handle.
+/// A sequence's body, boxed as a future.
 type Run = Pin<Box<dyn Future<Output = Result<(), SeqError>>>>;
 
-/// A `SequenceStep` polls one sequence each cycle until it ends.
+/// Runs one sequence, polling its body once per cycle until it ends.
 pub(crate) struct SequenceStep {
     seq: Rc<Seq<'static>>,
     abort: Abort,
     samplers: Samplers,
     log: LogPort,
+    /// Counts failed writes on the outputs the body owns.
+    dropped: Arc<AtomicU32>,
     run: Option<Run>,
     end: Option<EndReason>,
 }
 
 impl SequenceStep {
-    /// Binds the sequence and builds its future, which runs nothing until polled.
+    /// Binds the sequence's ports and creates its body.
+    ///
+    /// The body does not start running until it is first polled.
     ///
     /// # Panics
-    /// When `inputs` does not start with the `abort` binding [`super::def`] puts first.
+    /// Panics if `inputs` does not start with the `abort` binding, which
+    /// [`super::def`] always declares first.
     pub(crate) fn new<S: SequenceFn>(
         state: S::State,
         inputs: Vec<InputBinding>,
@@ -46,7 +53,7 @@ impl SequenceStep {
         let abort = inputs.next().expect("the abort binding");
         let abort = Input::new(abort.views);
         let InSet { ins, samplers } = InSet::<S>::bind(inputs.collect());
-        let OutSet { outs, log } = OutSet::<S>::bind(outputs);
+        let OutSet { outs, log, dropped } = OutSet::<S>::bind(outputs);
         let seq = Rc::new(Seq::new());
         Self {
             run: Some(Box::pin(run::<S>(state, ins, outs, seq.clone()))),
@@ -54,11 +61,15 @@ impl SequenceStep {
             seq,
             abort: Abort::new(abort),
             log,
+            dropped,
             end: None,
         }
     }
 
-    /// Keeps the end, logging a failure's reason, which is all a pack's host sees.
+    /// Records how the sequence ended.
+    ///
+    /// A failure's reason is also logged as a fault, since that log line is
+    /// the only way a pack's host sees it.
     fn finish(&mut self, now: Timestamp, result: Result<(), SeqError>) {
         let end = match result {
             Ok(()) => EndReason::Completed,
@@ -73,7 +84,10 @@ impl SequenceStep {
     }
 }
 
-/// Hands the sequence its parameters and runs it, all inside one future.
+/// Runs the sequence's body.
+///
+/// The parameters are created inside the same future, so they can borrow
+/// the state and ports it holds across `.await` points.
 async fn run<S: SequenceFn>(
     mut state: S::State,
     mut ins: <S::Params as Param>::In<NoWake>,
@@ -86,11 +100,13 @@ async fn run<S: SequenceFn>(
     S::call(&mut state, items).await
 }
 
-/// Polls the body once, or drops it, running its handlers, if the sequence
-/// is aborted or a redline trips.
+/// Polls the body once, or drops it if the sequence should abort.
 ///
-/// The redlines are checked only behind a live body, which holds all their
-/// conditions borrow.
+/// The body is dropped if the sequence was aborted or a redline trips.
+/// Dropping it runs its abort handlers.
+///
+/// Redlines are only checked while the body is alive, because the body owns
+/// everything their conditions borrow.
 fn advance(
     seq: &Seq<'_>,
     samplers: &mut Samplers,
@@ -111,7 +127,9 @@ fn advance(
     body.as_mut().poll(&mut Context::from_waker(Waker::noop()))
 }
 
-/// Aborts the sequence if a redline holds, logging a fault that names it.
+/// Aborts the sequence if any redline trips.
+///
+/// Logs a `redline` fault with the name of the redline that tripped.
 fn trip(seq: &Seq<'_>) {
     if let Some(name) = seq.tripped() {
         Log.fault("redline", name);
@@ -136,6 +154,7 @@ impl Step for SequenceStep {
             ..
         } = self;
         let polled = log::with_log_port(log, now, || advance(seq, samplers, run));
+        report_dropped(log, &self.dropped, now);
         if let Poll::Ready(result) = polled {
             self.run = None;
             self.samplers = Samplers::default();
@@ -148,6 +167,7 @@ impl Step for SequenceStep {
         let _ = self.seq.abort();
         let run = &mut self.run;
         log::with_log_port(&mut self.log, now, || drop(run.take()));
+        report_dropped(&mut self.log, &self.dropped, now);
     }
 
     fn ended(&self) -> Option<&EndReason> {

@@ -1,14 +1,14 @@
-//! The `metor` binary against the fixture's own target file.
+//! Tests the `metor` binary against the fixture's target files.
 
 mod common;
 
 use std::path::Path;
 
 use common::{fixture_dir, fixture_wasm, metor};
-use metor_fsw_3::cli::cargo::{WASM_TRIPLE, wasm_name};
-use metor_fsw_3::cli::config::{PackKind, PackRef, TargetConfig};
 use metor_fsw_3::cli::run::{Run, load};
 use metor_fsw_3::coordinator::CoordinatorConfig;
+use metor_fsw_3::deploy::TargetConfig;
+use metor_fsw_3::dl::{PackKind, PackRef, WASM_TRIPLE, wasm_name};
 use metor_fsw_3::{InputConfig, SystemConfig, Timestamp};
 
 #[test]
@@ -57,14 +57,15 @@ fn test_missing_target_returns_error() {
         .expect("metor runs");
     assert_eq!(output.status.code(), Some(1));
     let message = String::from_utf8_lossy(&output.stderr);
-    // Python's own traceback reaches this stderr, then the host's one line.
+    // Python's traceback goes to stderr first, then the host's error line.
     assert!(
         message.contains("metor: the target file exited"),
         "{message}"
     );
 }
 
-/// A deployment of two empty targets, written into a temp dir.
+/// Writes a deployment of two empty targets into `dir`. `body` is inserted
+/// before the deployment is created.
 fn two_targets(dir: &Path, body: &str) -> std::path::PathBuf {
     let target = dir.join("deploy.py");
     std::fs::write(
@@ -94,8 +95,9 @@ fn test_deployment_runs_every_target_as_a_child() {
     assert!(stderr.is_empty(), "a clean target prints nothing: {stderr}");
 }
 
-/// A system's log lines stay on its log port; what a child prints is its
-/// own CLI's last word, which the parent prefixes with the child's name.
+/// A system's log lines go to its log port, not stderr. The only thing a
+/// child prints is its final CLI error, which the parent prefixes with the
+/// child's name.
 #[test]
 fn test_every_child_is_prefixed() {
     let fixture = fixture_dir();
@@ -219,9 +221,10 @@ fn test_sigint_ends_every_child() {
         .spawn()
         .expect("metor runs");
 
-    // The parent evaluates the target file before it watches for SIGINT.
+    // The parent only watches for SIGINT after it evaluates the target file.
     std::thread::sleep(std::time::Duration::from_secs(3));
-    // SAFETY: `kill` takes a pid and a signal number and touches no memory.
+    // SAFETY: `kill` takes a pid and a signal number and does not touch
+    // memory.
     unsafe { libc::kill(parent.id() as i32, libc::SIGINT) };
 
     let status = wait_bounded(&mut parent).expect("the deployment ends on SIGINT");
@@ -234,7 +237,7 @@ fn test_sigint_ends_every_child() {
     );
 }
 
-/// `sampler -> meter -> echo`, every system from the pack.
+/// Builds the chain `sampler -> meter -> echo`, all from the fixture pack.
 fn chain() -> CoordinatorConfig {
     CoordinatorConfig {
         systems: vec![

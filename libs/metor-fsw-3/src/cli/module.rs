@@ -1,43 +1,51 @@
-//! The typed Python module `pack dev` renders from a pack's descriptor.
+//! Generates a pack's typed Python module.
+//!
+//! `metor pack dev` reads the pack's descriptor and renders one Python class
+//! per system and record, so target files can wire the pack with type
+//! checking.
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
 use serde_json::Value;
 
-use super::config::{PackKind, PackRef};
 use super::pack_dev::PackDevError;
 use crate::channel::ABORT_PORT;
+use crate::dl::{PackKind, PackRef};
 use crate::pack::def::{PackDef, PackSystemDef};
 use crate::record::RecordSchema;
 use crate::system::PortDef;
 
 const TEMPLATE: &str = include_str!("module.py.jinja");
 
-/// The records every system has whatever it declared, named after their Rust
-/// types, and whether each is a frame.
+/// The output ports every system has, whether or not it declares them.
+///
+/// Each entry is the port name, the record class named after its Rust type,
+/// and whether the record is a frame.
 const BUILTIN_PORTS: [(&str, &str, bool); 2] =
     [("log", "LogEvent", false), ("status", "SystemStatus", true)];
 
-/// What the template renders.
+/// The data the template renders.
 #[derive(Serialize)]
 struct Module {
     pack_id: String,
     lib: String,
     abi_version: u32,
-    /// Whether the pack also ships as a module.
+    /// Whether the pack also ships as a wasm module.
     wasm: bool,
-    /// One class per record the pack carries, sorted by class name.
+    /// One class per record the pack uses, sorted by class name.
     records: Vec<RecordClass>,
-    /// Nested params objects, by name.
+    /// One dataclass per nested params object, sorted by name.
     dataclasses: Vec<Class>,
     systems: Vec<Entry>,
-    /// Whether any system takes the ports its config lists.
+    /// Whether any system takes a port list from its config.
     takes_ports: bool,
 }
 
-/// A record's name on the host, the class a target names it by, and whether
-/// it is a frame or a message.
+/// A record class in the generated module.
+///
+/// `name` is the record's name on the host, `class` is the Python class name,
+/// and `kind` is `"frame"` or `"msg"`.
 #[derive(Serialize)]
 struct RecordClass {
     name: String,
@@ -58,7 +66,7 @@ struct Class {
 struct Field {
     name: String,
     annotation: String,
-    /// ` = <literal>`, or empty for a required field.
+    /// The default, rendered as ` = <literal>`. Empty for a required field.
     default: String,
     /// The property's description, or empty.
     doc: String,
@@ -69,7 +77,8 @@ struct Entry {
     name: String,
     ty: String,
     doc: String,
-    /// The `__init__` docstring's `Args:` section, or empty when no param has a doc.
+    /// The `Args:` section of the `__init__` docstring. Empty when no param
+    /// has a doc.
     args_doc: String,
     /// Whether the type takes an `items` port list.
     takes_inputs: bool,
@@ -77,7 +86,7 @@ struct Entry {
     takes_outputs: bool,
     inputs: Vec<Port>,
     params: Vec<Field>,
-    /// Every output with its record class, the framework's last.
+    /// Every output port with its record class. The built-in ports come last.
     ports: Vec<Port>,
 }
 
@@ -156,7 +165,9 @@ fn kind(frame: bool) -> &'static str {
     if frame { "frame" } else { "msg" }
 }
 
-/// The ports a target can wire: every one but `abort`, which only a channel feeds.
+/// Returns the ports a target can wire.
+///
+/// This is every port except `abort`, which only a channel writes to.
 fn ports(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
     wired_inputs(system).chain(&system.def.outputs)
 }
@@ -193,7 +204,8 @@ fn pascal(name: &str) -> String {
         .collect()
 }
 
-/// The params schema as an object, or an empty one for a system without params.
+/// Parses a system's params schema. A system without params gets an empty
+/// object.
 fn parse_schema(system: &PackSystemDef) -> Result<Value, PackDevError> {
     let Some(raw) = system.params.as_deref() else {
         return Ok(Value::Object(serde_json::Map::new()));
@@ -216,7 +228,7 @@ fn collect_defs(schema: &Value, defs: &mut BTreeMap<String, Value>) {
     }
 }
 
-/// One nested params object as a dataclass of its properties.
+/// Builds a dataclass for one nested params object.
 fn dataclass(name: &str, object: &Value, defs: &BTreeMap<String, Value>) -> Class {
     Class {
         name: name.to_string(),
@@ -225,7 +237,8 @@ fn dataclass(name: &str, object: &Value, defs: &BTreeMap<String, Value>) -> Clas
     }
 }
 
-/// A schema object's properties as fields, each with its annotation and default.
+/// Builds a field for each property of a schema object, with its type
+/// annotation and default.
 fn fields(schema: &Value, defs: &BTreeMap<String, Value>, dataclass: bool) -> Vec<Field> {
     properties(schema)
         .into_iter()
@@ -238,7 +251,10 @@ fn fields(schema: &Value, defs: &BTreeMap<String, Value>, dataclass: bool) -> Ve
         .collect()
 }
 
-/// One system as its `System` subclass.
+/// Builds the `System` subclass for one system.
+///
+/// Returns an error if a param has the same name as an input port, since both
+/// become `__init__` keywords.
 fn entry(
     system: &PackSystemDef,
     schema: &Value,
@@ -283,7 +299,7 @@ fn description(schema: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// A Google-style `Args:` section over the params that have a doc.
+/// Builds a Google-style `Args:` section for the params that have a doc.
 fn args_doc(params: &[Field]) -> String {
     let args: Vec<String> = params
         .iter()
@@ -303,7 +319,8 @@ fn args_doc(params: &[Field]) -> String {
     format!("Args:\n{}", args.join("\n"))
 }
 
-/// A triple-quoted literal whose continuation lines sit `indent` spaces in.
+/// Formats `text` as a triple-quoted docstring, indenting continuation lines
+/// by `indent` spaces.
 fn docstring(text: &str, indent: usize) -> String {
     let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
     if !escaped.contains('\n') {
@@ -320,7 +337,7 @@ fn docstring(text: &str, indent: usize) -> String {
     format!("\"\"\"\n{}\n{pad}\"\"\"", body.join("\n"))
 }
 
-/// A schema object's properties, in the order the schema lists them.
+/// Returns a schema object's properties, in the order the schema lists them.
 fn properties(schema: &Value) -> Vec<(String, Value)> {
     schema
         .get("properties")
@@ -341,7 +358,7 @@ fn is_required(schema: &Value, name: &str) -> bool {
         .is_some_and(|names| names.iter().any(|entry| entry == name))
 }
 
-/// The Python annotation for one property's schema.
+/// Returns the Python type annotation for one property's schema.
 fn python_type(schema: &Value, defs: &BTreeMap<String, Value>) -> String {
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         let name = reference.rsplit('/').next().unwrap_or(reference);
@@ -379,7 +396,11 @@ fn python_ty(ty: &str, schema: &Value, defs: &BTreeMap<String, Value>) -> String
     }
 }
 
-/// The keyword default: the schema's `default`, or none for a required field.
+/// Returns the rendered default for a field.
+///
+/// This is the schema's `default` if it has one, nothing for a required
+/// field, and ` = None` otherwise. Mutable defaults on a dataclass use a
+/// `default_factory`.
 fn default_of(schema: &Value, required: bool, dataclass: bool) -> String {
     match schema.get("default") {
         Some(value) if dataclass && (value.is_array() || value.is_object()) => {

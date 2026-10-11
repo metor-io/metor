@@ -28,20 +28,33 @@ fn candidate(path: &str, hash: &str) -> Candidate {
         name: "up".into(),
         ty: "count_up".into(),
         params: Value::Null,
-        path: Some(path.into()),
-        hash: Some(hash.into()),
-        def: None,
-        kind: PackKind::Dylib,
-        limits: Limits::default(),
+        source: Source::Stored(Stored {
+            path: path.into(),
+            hash: hash.into(),
+            def: def_with(Vec::new()),
+            kind: PackKind::Dylib,
+            limits: Limits::default(),
+        }),
     }
+}
+
+fn stored(name: &str, def: &SystemDef) -> Value {
+    json!({ "name": name, "ty": name, "source": { "stored": {
+        "path": "/store/x/lib.so", "hash": "00", "def": def,
+    }}})
+}
+
+fn from_pack(name: &str) -> Value {
+    let pack = json!({ "id": "echo", "lib": "echo_pack", "libs": "/l" });
+    json!({ "name": name, "ty": name, "source": { "pack": pack } })
 }
 
 #[test]
 fn test_def_is_first_candidate() {
     let baked = def_with(vec![port("imu")]);
     let params = json!({ "allow": [
-        { "name": "up", "ty": "count_up", "def": baked },
-        { "name": "down", "ty": "count_down" },
+        stored("up", &baked),
+        stored("down", &def_with(Vec::new())),
     ]});
     let def = slot_def(&params).expect("a baked def");
     assert_eq!(def.name, SLOT_NAME);
@@ -50,10 +63,20 @@ fn test_def_is_first_candidate() {
 
 #[test]
 fn test_def_refuses_unresolved() {
-    let params = json!({ "allow": [{ "name": "up", "ty": "count_up" }] });
+    let params = json!({ "allow": [from_pack("up")] });
     let Err(DefError::Slot { message }) = slot_def(&params) else {
         panic!("an unresolved candidate has no def")
     };
+    assert!(message.contains("metor build"), "{message}");
+}
+
+#[test]
+fn test_def_refuses_later_unresolved() {
+    let params = json!({ "allow": [stored("up", &def_with(Vec::new())), from_pack("down")] });
+    let Err(DefError::Slot { message }) = slot_def(&params) else {
+        panic!("every candidate must be resolved")
+    };
+    assert!(message.contains("`down`"), "{message}");
     assert!(message.contains("metor build"), "{message}");
 }
 
@@ -62,6 +85,8 @@ fn test_def_refuses_empty_or_malformed() {
     assert!(slot_def(&json!({ "allow": [] })).is_err());
     assert!(slot_def(&json!({ "allow": 3 })).is_err());
     assert!(slot_def(&Value::Null).is_err());
+    let sourceless = json!({ "allow": [{ "name": "up", "ty": "count_up" }] });
+    assert!(slot_def(&sourceless).is_err());
 }
 
 #[test]
@@ -80,9 +105,12 @@ fn test_resolved_refuses_bad_fields() {
     let long = format!("/store/x/{}", "l".repeat(64));
     assert!(Resolved::of(0, candidate("/store/x/libup.so", "not hex")).is_err());
     assert!(Resolved::of(0, candidate(&long, &hash)).is_err());
-    let mut bare = candidate("/store/x/libup.so", &hash);
-    bare.path = None;
-    assert!(Resolved::of(0, bare).is_err());
+    let unresolved = Candidate {
+        source: serde_json::from_value(json!({ "pack": { "id": "a", "lib": "a", "libs": "/l" } }))
+            .expect("a pack source"),
+        ..candidate("/store/x/libup.so", &hash)
+    };
+    assert!(Resolved::of(0, unresolved).is_err());
 }
 
 #[test]

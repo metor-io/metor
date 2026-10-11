@@ -1,8 +1,11 @@
-//! Redlines: conditions a sequence's step checks before each poll.
+//! Redlines: conditions that abort a sequence.
 //!
-//! A [`Redline`] is pinned in the sequence's frame by [`redline!`](crate::redline)
-//! and linked into its [`Seq`]'s intrusive list. The list holds type-erased
-//! [`Node`] heads; each node's `check` casts back to its `Redline<C>`.
+//! A sequence's step checks the redlines before each poll of the body.
+//! [`redline!`](crate::redline) pins a [`Redline`] inside the body's future
+//! and links it into the [`Seq`]'s intrusive list. The list cannot know each
+//! redline's condition type, so it links a type-erased [`Node`], which is
+//! the first field of every `Redline`. A node's `check` function casts the
+//! node back to its `Redline<C>` to call the condition.
 
 use core::cell::Cell;
 use core::marker::PhantomPinned;
@@ -13,27 +16,33 @@ use cordyceps::list::Links;
 
 use super::Seq;
 
-/// One redline, pinned in the sequence's frame and linked into its [`Seq`].
+/// A named condition that aborts a sequence when it returns true.
+///
+/// A `Redline` does nothing until it is pinned and linked into a [`Seq`],
+/// usually with [`redline!`](crate::redline). Dropping it unlinks it.
 #[repr(C)]
 pub struct Redline<C: Fn() -> bool> {
     pub(super) node: Node,
     cond: C,
 }
 
-/// The type-erased head of a [`Redline`], which the list links.
+/// The type-erased part of a [`Redline`] that a `Seq` links.
 pub(crate) struct Node {
     links: Links<Node>,
     pub(super) name: &'static str,
-    /// Calls the `cond` of the `Redline` this node heads.
+    /// Calls the `cond` of the `Redline` that contains this node.
     check: unsafe fn(NonNull<Node>) -> bool,
-    /// The `Seq` it is linked into, if any, to unlink from on drop. Its
-    /// brand is erased; unlinking calls no condition.
+    /// The `Seq` this node is linked into, if any, so that dropping the node
+    /// can unlink it. The `Seq`'s lifetime is erased to `'static`, which is
+    /// fine because unlinking never calls a condition.
     seq: Cell<Option<NonNull<Seq<'static>>>>,
     _pin: PhantomPinned,
 }
 
 impl<C: Fn() -> bool> Redline<C> {
-    /// A redline named `name` that trips once `cond` holds.
+    /// Creates a redline called `name`.
+    ///
+    /// Once linked, it trips the first cycle `cond` returns true.
     pub fn new(name: &'static str, cond: C) -> Self {
         Self {
             node: Node {
@@ -48,20 +57,25 @@ impl<C: Fn() -> bool> Redline<C> {
     }
 }
 
-/// Calls the condition of the `Redline<C>` that `node` heads.
+/// Calls the condition of the `Redline<C>` that contains `node`.
 ///
 /// # Safety
-/// `node` heads a live `Redline<C>` and was made from a pointer to all of it.
+/// `node` must point to the node of a live `Redline<C>`, and must have been
+/// derived from a pointer to the whole redline.
 unsafe fn check<C: Fn() -> bool>(node: NonNull<Node>) -> bool {
-    // SAFETY: `Redline` is `repr(C)` with `node` first, so the head's address
-    // is the redline's, and the caller gives the pointer the whole redline's
-    // provenance. Conditions take only shared borrows.
+    // SAFETY: `Redline` is `repr(C)` with `node` as its first field, so the
+    // node's address is the redline's address. The caller guarantees the
+    // pointer has provenance over the whole redline. Conditions only take
+    // shared borrows.
     let redline = unsafe { node.cast::<Redline<C>>().as_ref() };
     (redline.cond)()
 }
 
 impl Node {
-    /// Links this node into `seq`, unless it is linked already.
+    /// Marks this node as linked into `seq`.
+    ///
+    /// Returns `false` without changing anything if the node is already
+    /// linked.
     pub(crate) fn claim(&self, seq: &Seq<'_>) -> bool {
         if self.seq.get().is_some() {
             return false;
@@ -70,18 +84,21 @@ impl Node {
         true
     }
 
-    /// Forgets the `Seq` it was linked into, which is dropping.
+    /// Forgets the `Seq` this node was linked into.
+    ///
+    /// The `Seq` calls this while it is being dropped.
     pub(crate) fn release(&self) {
         self.seq.set(None);
     }
 
-    /// Whether the condition of the redline `node` heads holds.
+    /// Returns whether the redline's condition is true.
     ///
     /// # Safety
-    /// `node` is linked, so it heads a live redline and was made from a
-    /// pointer to all of it.
+    /// `node` must be linked. A linked node belongs to a live redline, and
+    /// its pointer was derived from a pointer to the whole redline.
     pub(crate) unsafe fn holds(node: NonNull<Node>) -> bool {
-        // SAFETY: the caller vouches `node` is live and whole.
+        // SAFETY: the caller guarantees `node` is live and points to a whole
+        // redline.
         unsafe { (node.as_ref().check)(node) }
     }
 }
@@ -91,17 +108,18 @@ impl Drop for Node {
         let Some(seq) = self.seq.take() else {
             return;
         };
-        // SAFETY: a `Seq` releases every node it holds when it drops, and is
-        // built only inside this crate, where it never moves once a node is
-        // linked, so a node that still names its `Seq` points at a live one.
+        // SAFETY: a `Seq` releases every node it holds when it is dropped.
+        // Only this crate creates a `Seq`, and it never moves one after a
+        // node is linked. So if a node still points to a `Seq`, that `Seq`
+        // is live.
         let seq = unsafe { seq.as_ref() };
         seq.unlink(NonNull::from(self));
     }
 }
 
-// SAFETY: a `Node` is pinned inside its `Redline` for as long as it is
-// linked, since the pin guarantee means its `Drop` runs before its memory is
-// reused, and that `Drop` unlinks it. Handles are bare pointers, so the list
+// SAFETY: a `Node` stays pinned inside its `Redline` for as long as it is
+// linked. The pin guarantee means its `Drop` runs before its memory is
+// reused, and that `Drop` unlinks it. Handles are raw pointers, so the list
 // owns nothing.
 unsafe impl Linked<Links<Node>> for Node {
     type Handle = NonNull<Node>;

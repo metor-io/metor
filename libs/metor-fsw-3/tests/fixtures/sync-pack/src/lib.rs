@@ -1,4 +1,5 @@
-//! One stepped system, so the pack builds as a module.
+//! A pack with a single stepped system and no async ones, so `pack dev` can
+//! build it as a wasm module.
 
 use metor_fsw_3::{Input, Output, Record, SystemTable, system};
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,7 @@ fn echo(input: &mut Input<Ping>, output: &mut Output<Ping>) {
 /// The table this pack exports.
 pub fn pack() -> SystemTable {
     let mut table = SystemTable::new();
-    // PANIC Safety: one system cannot conflict with itself.
+    // PANIC Safety: there is only one system, so nothing can conflict with it.
     table
         .register("echo", echo(), Default::default)
         .expect("valid records");

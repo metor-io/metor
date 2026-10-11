@@ -1,4 +1,4 @@
-"""Target recording, to_config(), and emission."""
+"""Tests for building targets, `to_config()`, and emitting the config."""
 
 from __future__ import annotations
 
@@ -51,7 +51,8 @@ def adcs_target() -> Target:
 
 
 def reset() -> None:
-    """Leave no target or deployment behind, or the atexit hook emits to stdout."""
+    """Clears every target and deployment, so the atexit hook has nothing to
+    emit to stdout."""
     target_mod._targets.clear()
     deploy_mod._deployments.clear()
     deploy_mod._emitted = False
@@ -464,7 +465,7 @@ class ChannelTest(ConfigTest):
         self.assertEqual([c["name"] for c in allow], ["safe", "hold"])
         self.assertEqual(allow[0]["params"], {"hold": 2.0})
         self.assertIsNone(allow[1]["params"])
-        self.assertEqual(allow[0]["pack"], PACK.to_json())
+        self.assertEqual(allow[0]["source"]["pack"], PACK.to_json())
         self.assertEqual(mode["params"]["initial"], "hold")
         self.assertEqual(mode["inputs"][0], {"port": "est", "from": [{"system": "nav", "port": "est"}]})
         self.assertEqual(fsw.to_config()["packs"], [PACK.to_json()])

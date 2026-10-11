@@ -1,4 +1,4 @@
-"""The config file's constants, clock encoding, and the ABI check."""
+"""Config file constants, clock encoding, and the pack ABI check."""
 
 from __future__ import annotations
 
@@ -8,7 +8,10 @@ from typing import Any
 CONFIG_VERSION = 2
 
 ABI_VERSION = 9
-"""The host ABI the built-in systems are compiled against; a Rust test pins it."""
+"""The host ABI version the built-in systems are compiled against.
+
+A Rust test keeps this in sync with the host.
+"""
 
 ABI_ENV = "METOR_FSW_ABI_VERSION"
 OUT_ENV = "METOR_CONFIG_OUT"
@@ -17,7 +20,7 @@ NANOS_PER_SEC = 1_000_000_000
 
 
 class ConfigError(Exception):
-    """A target that cannot be turned into a config."""
+    """Raised when a target cannot be turned into a valid config."""
 
 
 def wall_clock(rate: float) -> dict[str, Any]:
@@ -25,7 +28,10 @@ def wall_clock(rate: float) -> dict[str, Any]:
 
 
 def simulated_clock(dt: float) -> dict[str, Any]:
-    """The simulated clock over a step of ``dt`` seconds, as serde reads a `Duration`."""
+    """Encodes a simulated clock that advances ``dt`` seconds per cycle.
+
+    The step is encoded the way serde reads a Rust `Duration`.
+    """
     if dt <= 0.0:
         raise ConfigError(f"sim_dt must be positive, got {dt}")
     nanos = round(dt * NANOS_PER_SEC)
@@ -33,7 +39,11 @@ def simulated_clock(dt: float) -> dict[str, Any]:
 
 
 def check_abi(pack_id: str, abi_version: int) -> None:
-    """Fail in the target file when the host's ABI differs from the pack module's."""
+    """Raises `ConfigError` if the host's ABI differs from the pack module's.
+
+    This catches a stale pack module while the target file runs, instead of
+    later when the host loads the pack.
+    """
     host = os.environ.get(ABI_ENV)
     if host is None or int(host) == abi_version:
         return

@@ -181,7 +181,7 @@ fn boom(#[state] s: &mut Boom, imu: &mut Output<Imu>, now: Timestamp) {
     let _ = imu.write(&Imu::new(now.0, 1.0));
 }
 
-/// A ring of `depth` records of `max_len` bytes with `readers` reader slots.
+/// Creates a ring for `depth` records of `max_len` bytes, with `readers` slots.
 pub fn ring_of(max_len: usize, depth: usize, readers: usize) -> RingBuffer {
     RingBuffer::create_in_memory(Config {
         capacity: ring_capacity(max_len, depth).expect("valid capacity"),
@@ -189,7 +189,7 @@ pub fn ring_of(max_len: usize, depth: usize, readers: usize) -> RingBuffer {
     })
 }
 
-/// A ring of `depth` `T` records with `readers` reader slots.
+/// Creates a ring for `depth` `T` records, with `readers` slots.
 pub fn ring<T: Record + ?Sized>(depth: usize, readers: usize) -> RingBuffer {
     ring_of(T::MAX_LEN, depth, readers)
 }
@@ -202,7 +202,7 @@ pub fn output<T: Record + ?Sized>(ring: &RingBuffer) -> Output<T> {
     Output::new(ring.writer(NoWake).expect("free writer"))
 }
 
-/// A one-reader ring of `depth` `T` records and both its ports.
+/// Creates a one-reader ring for `depth` `T` records, plus its two ports.
 pub fn pair<T: Record + ?Sized>(depth: usize) -> (RingBuffer, Output<T>, Input<T>) {
     let ring = ring::<T>(depth, 1);
     let (output, input) = (output(&ring), input(&ring));
@@ -227,10 +227,10 @@ impl System for Trap {
 }
 
 /// Records the port name and bytes of every dynamic input, each cycle.
-pub struct Tap(Recorder);
+pub struct Tap(pub Recorder);
 
 #[crate::system]
-fn tap(#[state] s: &mut Tap, inputs: &mut DynInputs) {
+pub fn tap(#[state] s: &mut Tap, inputs: &mut DynInputs) {
     for (def, input) in inputs.iter_mut() {
         for record in input.drain() {
             let Ok(bytes) = record else { continue };
@@ -243,10 +243,10 @@ fn tap(#[state] s: &mut Tap, inputs: &mut DynInputs) {
 }
 
 /// Writes one fixed record onto every port the config gave it.
-pub struct Emit(Vec<u8>);
+pub struct Emit(pub Vec<u8>);
 
 #[crate::system]
-fn emit(#[state] s: &mut Emit, outputs: &mut DynOutputs) {
+pub fn emit(#[state] s: &mut Emit, outputs: &mut DynOutputs) {
     for (_, output) in outputs.iter_mut() {
         let _ = output.write_bytes(&s.0);
     }
@@ -288,7 +288,7 @@ async fn who_am_i(nav: &mut Output<Nav>, stop: Stop) {
     stop.wait().await;
 }
 
-/// The next sample, or `None` once stop resolves.
+/// Waits for the next sample, or returns `None` once `stop` is set.
 async fn next(imu: &mut Input<Imu, Notifier>, stop: &Stop) -> Option<Imu> {
     futures_lite::future::or(async { imu.next().await.ok().copied() }, async {
         stop.wait().await;
@@ -297,7 +297,7 @@ async fn next(imu: &mut Input<Imu, Notifier>, stop: &Stop) -> Option<Imu> {
     .await
 }
 
-/// This thread's id, hashed into a number a frame can carry.
+/// Returns this thread's ID, hashed into a number a frame can carry.
 fn thread_id() -> u64 {
     use core::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -347,7 +347,9 @@ impl Recorder {
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct NoParams {}
 
-/// Every system type the coordinator tests name, recording into `recorder`.
+/// Returns a table of every system type the coordinator tests use.
+///
+/// The recording systems record into `recorder`.
 pub fn table(recorder: &Recorder) -> SystemTable {
     let mut table = SystemTable::new();
     let mut register = || -> Result<(), BuildError> {
@@ -399,7 +401,9 @@ pub fn pipeline_config() -> CoordinatorConfig {
     }
 }
 
-/// A stop future for [`Coordinator::run`], which polls it once per cycle.
+/// Returns a stop future that resolves after `cycles` polls.
+///
+/// [`Coordinator::run`] polls it once per cycle.
 pub fn after_cycles(cycles: usize) -> impl Future<Output = ()> {
     let mut left = cycles;
     core::future::poll_fn(move |_| {
@@ -412,8 +416,9 @@ pub fn after_cycles(cycles: usize) -> impl Future<Output = ()> {
     })
 }
 
-/// Burns a measurable amount of time so a status record carries a nonzero
-/// execution time.
+/// Burns a measurable amount of time.
+///
+/// This gives a status record a nonzero execution time.
 fn spin() {
     for i in 0..50_000u64 {
         core::hint::black_box(i);

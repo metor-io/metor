@@ -1,4 +1,5 @@
-//! A module's systems allocate nothing on the host once built.
+//! Checks that a wasm module's systems do not allocate on the host once they
+//! are built.
 
 mod common;
 
@@ -11,7 +12,8 @@ use common::{Ping, open_wasm};
 use metor_fsw_3::coordinator::{Coordinator, CoordinatorConfig};
 use metor_fsw_3::{InputConfig, Output, Pack, SystemConfig, SystemTable, Timestamp, system};
 
-/// Counts the allocations made on a thread that armed it.
+/// A global allocator that counts allocations made while the current thread
+/// has counting turned on.
 struct Counting;
 
 thread_local! {
@@ -26,7 +28,7 @@ fn count() {
     }
 }
 
-// SAFETY: every call forwards to `System` with the caller's arguments.
+// SAFETY: every method forwards to `System` with the caller's arguments.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         count();
@@ -55,7 +57,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-/// The allocations this thread makes while `f` runs.
+/// Returns how many allocations this thread makes while `f` runs.
 fn allocations(f: impl FnOnce()) -> usize {
     ALLOCATIONS.store(0, Ordering::Relaxed);
     ARMED.set(true);
@@ -73,7 +75,7 @@ fn source(#[state] s: &mut Source, output: &mut Output<Ping>) {
     let _ = output.write(&Ping { n: s.0 });
 }
 
-/// `source -> middle (echo.<ty>)`, with nothing reading the middle.
+/// Builds `source -> middle (echo.<ty>)`, with nothing reading `middle`.
 fn built(ty: &str) -> Coordinator {
     let pack = open_wasm();
     let mut table = SystemTable::new();

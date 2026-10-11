@@ -20,10 +20,14 @@ use crate::thread::Threads;
 use def::{DefCxOwned, Instance, PackDef};
 use raw::{RawRing, RawSlice};
 
-/// The ABI the exports in this module are built against.
+/// The ABI version of the exports in this module.
+///
+/// The host refuses to load a pack whose version does not match its own.
 pub const ABI_VERSION: u32 = 9;
 
-/// What [`execute`] returns: an unknown word is a panic.
+/// The status word [`execute`] returns.
+///
+/// The host treats an unknown word as a panic.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -31,12 +35,12 @@ pub enum Status {
     Panicked = 1,
     Completed = 2,
     Aborted = 3,
-    /// The reason is a fault line on the system's `log`.
+    /// The system failed. The reason is logged as a fault on its `log` output.
     Failed = 4,
 }
 
 impl Status {
-    /// Reads a returned status word, `None` for a word no status has.
+    /// Converts a status word, returning `None` if the word is unknown.
     pub fn try_from_raw(word: u32) -> Option<Status> {
         match word {
             0 => Some(Status::Ok),
@@ -48,12 +52,12 @@ impl Status {
         }
     }
 
-    /// Reads a returned status word; an unknown word is a panic.
+    /// Converts a status word, treating an unknown word as a panic.
     pub fn from_raw(word: u32) -> Status {
         Status::try_from_raw(word).unwrap_or(Status::Panicked)
     }
 
-    /// The word a step that ended as `end` returns.
+    /// Returns the status for a step whose end reason is `end`.
     pub fn of_end(end: Option<&EndReason>) -> Status {
         match end {
             None => Status::Ok,
@@ -64,7 +68,8 @@ impl Status {
         }
     }
 
-    /// The end this word reports, `None` for a step still running.
+    /// Returns the end reason this status reports, or `None` if the step is
+    /// still running.
     pub fn end(self) -> Option<EndReason> {
         match self {
             Status::Ok => None,
@@ -76,7 +81,7 @@ impl Status {
     }
 }
 
-/// Descriptor export status words.
+/// The status words returned by the descriptor and definition exports.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DefStatus {
@@ -84,13 +89,13 @@ pub enum DefStatus {
     TooSmall = 1,
     Encode = 2,
     Panicked = 3,
-    /// The type refused the config; `dst` holds the [`DefError`] as JSON.
+    /// The type rejected the config. `dst` holds the [`DefError`] as JSON.
     Refused = 4,
 }
 
 thread_local! {
     static TABLE: OnceCell<SystemTable> = const { OnceCell::new() };
-    /// The groups this pack runs its own async systems on.
+    /// The threads this pack runs its own async systems on.
     static THREADS: RefCell<Threads> = RefCell::new(Threads::new());
     static ERROR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
@@ -106,11 +111,14 @@ fn with_table<R>(build: fn() -> SystemTable, f: impl FnOnce(&SystemTable) -> R) 
     })
 }
 
-/// Writes the descriptor into caller-owned storage. Failures leave `written` zero.
+/// Writes the pack's descriptor as JSON into a buffer the caller owns.
+///
+/// On failure, `written` is left at zero.
 ///
 /// # Safety
-/// `dst` points to `capacity` writable bytes (or is null when capacity is zero).
-/// `written` is writable and does not overlap `dst`. Neither pointer is retained.
+/// `dst` must point to `capacity` writable bytes, or be null when `capacity` is
+/// zero. `written` must be writable and must not overlap `dst`. Neither pointer
+/// is kept after the call.
 pub unsafe fn def(
     build: fn() -> SystemTable,
     dst: *mut u8,
@@ -134,14 +142,17 @@ pub unsafe fn def(
     .unwrap_or(DefStatus::Panicked) as u32
 }
 
-/// Writes one type's definition for the config in `cx` into caller-owned
-/// storage. Failures leave `written` zero, except a refusal, which writes the
-/// [`DefError`] as JSON.
+/// Writes the definition of type `ty` for the config in `cx` into a buffer the
+/// caller owns.
+///
+/// If the type rejects the config, the [`DefError`] is written as JSON instead.
+/// On any other failure, `written` is left at zero.
 ///
 /// # Safety
-/// `ty` and `cx` meet [`RawSlice::as_bytes`]'s contract. `dst` points to
-/// `capacity` writable bytes (or is null when capacity is zero). `written` is
-/// writable and does not overlap `dst`. Neither pointer is retained.
+/// `ty` and `cx` must meet the contract of [`RawSlice::as_bytes`]. `dst` must
+/// point to `capacity` writable bytes, or be null when `capacity` is zero.
+/// `written` must be writable and must not overlap `dst`. Neither pointer is
+/// kept after the call.
 pub unsafe fn system_def(
     build: fn() -> SystemTable,
     ty: RawSlice,
@@ -165,7 +176,7 @@ pub unsafe fn system_def(
     .unwrap_or(DefStatus::Panicked) as u32
 }
 
-/// One type's definition under a decoded context.
+/// Decodes `ty` and `cx`, then computes that type's definition.
 fn resolve_def(table: &SystemTable, ty: &[u8], cx: &[u8]) -> Result<SystemDef, DefError> {
     let refused = |message: String| DefError::Pack { message };
     let ty = core::str::from_utf8(ty).map_err(|e| refused(e.to_string()))?;
@@ -177,11 +188,11 @@ fn resolve_def(table: &SystemTable, ty: &[u8], cx: &[u8]) -> Result<SystemDef, D
     (entry.def_fn)(&owned.borrow(&edges))
 }
 
-/// The caller's output region, as a cursor a writer fills.
+/// Wraps the caller's output buffer in a cursor.
 ///
 /// # Safety
-/// `dst` points to `capacity` writable bytes no other reference touches for
-/// the cursor's life, or `capacity` is zero.
+/// `dst` must point to `capacity` writable bytes that nothing else touches
+/// while the cursor lives, or `capacity` must be zero.
 unsafe fn out_buf<'a>(dst: *mut u8, capacity: usize) -> std::io::Cursor<&'a mut [u8]> {
     let buffer = if capacity == 0 {
         &mut []
@@ -192,7 +203,7 @@ unsafe fn out_buf<'a>(dst: *mut u8, capacity: usize) -> std::io::Cursor<&'a mut 
     std::io::Cursor::new(buffer)
 }
 
-/// Writes one value as JSON, reporting `ok` when it fit.
+/// Writes one value as JSON and returns `ok` if it fit.
 fn write_json<T: serde::Serialize>(
     out: &mut std::io::Cursor<&mut [u8]>,
     value: &T,
@@ -210,16 +221,18 @@ fn write_json<T: serde::Serialize>(
     }
 }
 
-/// Builds one system instance and binds it to the rings it was handed.
+/// Creates one system instance on the rings the host passed in.
 ///
-/// Returns null on a failure, writing the [`ParamError`] as JSON through
-/// `error` when there is one and an empty slice when the failure was a panic.
+/// Returns null on failure. If the failure has a [`ParamError`], it is written
+/// through `error` as JSON. If the failure was a panic, `error` is an empty
+/// slice.
 ///
 /// # Safety
-/// `ty`, `params`, `def`, `inputs` (over [`RawSlice`]s of [`RawRing`]) and
-/// `outputs` (over [`RawRing`]) each meet [`RawSlice::as_slice`]'s contract and every ring has
-/// live, valid ownership callbacks covering its region. `error` is writable and
-/// does not alias the input arrays. Calls on this thread must not reenter `create`.
+/// `ty`, `params`, `def`, `inputs` (a slice of [`RawSlice`]s of [`RawRing`]s),
+/// and `outputs` (a slice of [`RawRing`]s) must each meet the contract of
+/// [`RawSlice::as_slice`]. Every ring must have live, valid ownership callbacks
+/// covering its region. `error` must be writable and must not alias the input
+/// arrays. Calls on this thread must not reenter `create`.
 pub unsafe fn create(
     build: fn() -> SystemTable,
     ty: RawSlice,
@@ -245,10 +258,10 @@ pub unsafe fn create(
     .unwrap_or(core::ptr::null_mut())
 }
 
-/// Looks `ty` up, attaches every ring, and binds the entry to them.
+/// Looks up `ty`, attaches every ring, and creates the system on them.
 ///
 /// # Safety
-/// As [`create`].
+/// The same as for [`create`].
 unsafe fn make(
     build: fn() -> SystemTable,
     ty: RawSlice,
@@ -279,8 +292,8 @@ unsafe fn make(
         let entry = table
             .get(ty)
             .ok_or_else(|| ParamError::Decode(format!("unknown system type `{ty}`")))?;
-        // A pack's async system runs on a thread inside the pack, on the group
-        // the host's config placed it on.
+        // A pack's async systems run on threads inside the pack. The host's
+        // config picks which thread.
         THREADS.with_borrow_mut(|threads| {
             (entry.make)(MakeCx {
                 id: &instance.id,
@@ -295,7 +308,7 @@ unsafe fn make(
     })
 }
 
-/// Reads the params JSON, taking no bytes as no params.
+/// Decodes the params JSON. Empty bytes mean no params.
 fn decode_params(bytes: &[u8]) -> Result<serde_json::Value, ParamError> {
     if bytes.is_empty() {
         return Ok(serde_json::Value::Null);
@@ -303,13 +316,13 @@ fn decode_params(bytes: &[u8]) -> Result<serde_json::Value, ParamError> {
     serde_json::from_slice(bytes).map_err(|e| ParamError::Decode(e.to_string()))
 }
 
-/// Attaches to one ring region the host allocated.
+/// Attaches to a ring the host allocated.
 fn attach(ring: &RawRing) -> Result<RingBuffer, ParamError> {
     let attached = match ring.owner {
         // SAFETY: `create` requires live, thread-safe ownership callbacks.
         Some(owner) => unsafe { RingBuffer::attach_owned(ring.base, ring.len, owner) },
-        // SAFETY: an unowned ring lives in this module's own memory, which
-        // outlives every handle in it.
+        // SAFETY: a ring with no owner lives in this module's own memory, which
+        // outlives every handle to it.
         None => unsafe { RingBuffer::attach_raw(ring.base, ring.len) },
     };
     attached.map_err(|e| ParamError::Decode(e.to_string()))
@@ -319,16 +332,17 @@ fn attach(ring: &RawRing) -> Result<RingBuffer, ParamError> {
 fn store_error(source: &ParamError) -> RawSlice {
     ERROR.with_borrow_mut(|buf| {
         buf.clear();
-        // An error that does not serialize leaves the host with an empty slice.
+        // If the error fails to serialize, the host gets an empty slice.
         let _ = serde_json::to_writer(&mut *buf, source);
         RawSlice::of(buf)
     })
 }
 
-/// Runs one cycle of one instance.
+/// Runs one cycle of an instance.
 ///
 /// # Safety
-/// `instance` came from [`create`] on this thread and has not been destroyed.
+/// `instance` must come from [`create`] on this thread and must not have been
+/// destroyed.
 pub unsafe fn execute(instance: *mut c_void, now: i64) -> u32 {
     crate::panic::catch(|| {
         // SAFETY: `create` allocated this slot, and it is still live on this thread.
@@ -341,10 +355,11 @@ pub unsafe fn execute(instance: *mut c_void, now: i64) -> u32 {
     .unwrap_or(Status::Panicked) as u32
 }
 
-/// Drops one instance, freeing the reader slots and writer it claimed.
+/// Drops an instance, which frees its ring readers and writers.
 ///
 /// # Safety
-/// `instance` came from [`create`] on this thread and is destroyed once.
+/// `instance` must come from [`create`] on this thread, and must be destroyed
+/// only once.
 pub unsafe fn destroy(instance: *mut c_void) {
     crate::panic::catch(|| {
         // SAFETY: the caller's contract; the box was made by `create`.
@@ -352,8 +367,9 @@ pub unsafe fn destroy(instance: *mut c_void) {
     });
 }
 
-/// Allocates `len` zeroed bytes aligned to `align` for the host to write
-/// into. Null on a zero length, an invalid layout, or no memory.
+/// Allocates `len` zeroed bytes, aligned to `align`, for the host to write into.
+///
+/// Returns null if `len` is zero, the layout is invalid, or memory runs out.
 pub fn alloc(len: usize, align: usize) -> *mut u8 {
     match layout(len, align) {
         // SAFETY: `layout` refuses a zero size.
@@ -362,11 +378,13 @@ pub fn alloc(len: usize, align: usize) -> *mut u8 {
     }
 }
 
-/// Frees what [`alloc`] returned. A null `ptr` or an invalid layout is ignored.
+/// Frees memory returned by [`alloc`].
+///
+/// A null `ptr` or an invalid layout is ignored.
 ///
 /// # Safety
-/// A non-null `ptr` came from [`alloc`] with the same `len` and `align`,
-/// and is freed once.
+/// A non-null `ptr` must come from [`alloc`] with the same `len` and `align`,
+/// and must be freed only once.
 pub unsafe fn free(ptr: *mut u8, len: usize, align: usize) {
     if let Some(layout) = layout(len, align)
         && !ptr.is_null()
@@ -376,7 +394,8 @@ pub unsafe fn free(ptr: *mut u8, len: usize, align: usize) {
     }
 }
 
-/// The layout [`alloc`] and [`free`] agree on, `None` for a zero length.
+/// Returns the layout that [`alloc`] and [`free`] share, or `None` if `len` is
+/// zero.
 fn layout(len: usize, align: usize) -> Option<Layout> {
     if len == 0 {
         return None;
@@ -384,7 +403,11 @@ fn layout(len: usize, align: usize) -> Option<Layout> {
     Layout::from_size_align(len, align).ok()
 }
 
-/// Exports `$build`'s table under the eight ABI names.
+/// Exports a pack's systems through the C ABI.
+///
+/// `$build` is a function that returns the pack's [`SystemTable`]. The macro
+/// defines the eight `extern "C"` functions the host looks up when it loads the
+/// pack.
 #[macro_export]
 macro_rules! export_pack {
     ($build:path) => {

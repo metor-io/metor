@@ -1,4 +1,5 @@
-//! One background thread running one executor for a group of async systems.
+//! A thread group: one background thread running an executor shared by
+//! several async systems.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,12 +16,14 @@ use crate::coordinator::ParamError;
 
 use super::Launch;
 
-/// How long a dropped group waits for its thread before detaching it.
+/// How long a dropped group waits for its thread to stop before giving up
+/// and detaching it.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// What a panicked task left behind, read by its system's adapter.
+/// Reports a task's panic to its system's adapter.
 ///
-/// The flag is what the adapter reads each cycle; the message is taken once.
+/// The adapter checks it every cycle. The check is a cheap atomic load, and
+/// the panic message can be taken only once.
 #[derive(Clone, Default)]
 pub(crate) struct Panicked(Arc<Slot>);
 
@@ -32,12 +35,13 @@ struct Slot {
 
 impl Panicked {
     fn set(&self, message: String) {
-        // PANIC Safety: neither side panics while it holds this lock.
+        // PANIC Safety: no code panics while holding this lock.
         *self.0.message.lock().expect("an unpoisoned slot") = Some(message);
         self.0.set.store(true, Ordering::Release);
     }
 
-    /// The message the task left, once.
+    /// Takes the panic message, if the task panicked. Later calls return
+    /// `None`.
     pub(crate) fn take(&self) -> Option<String> {
         if !self.0.set.load(Ordering::Acquire) {
             return None;
@@ -47,19 +51,20 @@ impl Panicked {
     }
 }
 
-/// One async system on its way to a thread.
+/// An async system waiting to be built on a group's thread.
 pub(crate) struct Member {
     pub launch: Box<dyn Launch>,
     pub panicked: Panicked,
 }
 
-/// One member and the slot its construction result is reported through.
+/// A member queued for the group's thread, and the channel that reports
+/// whether building it succeeded.
 struct Job {
     member: Member,
     report: SyncSender<Option<ParamError>>,
 }
 
-/// The jobs waiting for the group's thread to build them.
+/// The queue of jobs waiting for the group's thread to build them.
 struct Inbox {
     jobs: Mutex<Vec<Job>>,
     woken: WaitQueue,
@@ -68,7 +73,7 @@ struct Inbox {
 impl Inbox {
     /// Takes every waiting job.
     fn take(&self) -> Vec<Job> {
-        // PANIC Safety: neither side panics while it holds this lock.
+        // PANIC Safety: no code panics while holding this lock.
         core::mem::take(&mut *self.jobs.lock().expect("an unpoisoned inbox"))
     }
 
@@ -78,7 +83,7 @@ impl Inbox {
     }
 }
 
-/// A `GroupHandle` owns one thread; dropping it stops and joins that thread.
+/// A handle to a running thread group. Dropping it stops and joins the thread.
 pub(crate) struct GroupHandle {
     name: String,
     stop: StopHandle,
@@ -86,7 +91,8 @@ pub(crate) struct GroupHandle {
     thread: Option<JoinHandle<()>>,
 }
 
-/// Starts one empty group on a new thread, which takes members as they come.
+/// Starts an empty group on a new thread. Members are added with
+/// [`GroupHandle::add`].
 pub(crate) fn spawn(name: &str) -> Result<Arc<GroupHandle>, ParamError> {
     let (handle, stop) = stop_pair();
     let inbox = Arc::new(Inbox {
@@ -111,10 +117,11 @@ pub(crate) fn spawn(name: &str) -> Result<Arc<GroupHandle>, ParamError> {
 }
 
 impl GroupHandle {
-    /// Builds one member on this group's thread, returning once it is running.
+    /// Builds `member` on this group's thread. Returns once it is running, or
+    /// with the error that stopped it from building.
     pub(crate) fn add(&self, member: Member) -> Result<(), ParamError> {
         let (report, built) = sync_channel(1);
-        // PANIC Safety: neither side panics while it holds this lock.
+        // PANIC Safety: no code panics while holding this lock.
         self.inbox
             .jobs
             .lock()
@@ -131,7 +138,8 @@ impl GroupHandle {
     }
 }
 
-/// Builds every member the group is handed, running them until the stop is set.
+/// The group thread's main loop. Builds and runs each member it is handed,
+/// until `stop` is set.
 async fn run(inbox: Arc<Inbox>, stop: Stop) {
     let mut tasks = Vec::new();
     while !stop.is_set() {
@@ -157,8 +165,10 @@ async fn run(inbox: Arc<Inbox>, stop: Stop) {
     }
 }
 
-/// Constructs one system, a panicking constructor reading as a param error
-/// rather than taking the group's thread down with it.
+/// Builds one system.
+///
+/// A panic in the system's constructor becomes a `ParamError`, so it does not
+/// take down the group's thread.
 fn build(launch: Box<dyn Launch>, stop: Stop) -> Result<crate::async_system::Running, ParamError> {
     match std::panic::catch_unwind(AssertUnwindSafe(|| launch.launch(stop))) {
         Ok(result) => result,
@@ -170,7 +180,8 @@ fn build(launch: Box<dyn Launch>, stop: Stop) -> Result<crate::async_system::Run
     }
 }
 
-/// Runs one system, recording a panic for its adapter instead of unwinding out.
+/// Runs one system. If it panics, the panic is caught and reported to its
+/// adapter.
 async fn task(running: crate::async_system::Running, panicked: Panicked) {
     let caught = std::panic::AssertUnwindSafe(running).catch_unwind().await;
     if let Err(payload) = caught {
@@ -181,7 +192,8 @@ async fn task(running: crate::async_system::Running, panicked: Panicked) {
 }
 
 impl Drop for GroupHandle {
-    /// Stops the thread and joins it, detaching it if it outlives the timeout.
+    /// Stops the thread and joins it. If the thread is still running after
+    /// [`JOIN_TIMEOUT`], it is detached instead.
     fn drop(&mut self) {
         self.stop.stop();
         self.inbox.woken.wake_all();
@@ -210,7 +222,7 @@ mod tests {
     use super::*;
     use crate::async_system::Running;
 
-    /// A launch that panics where a user's constructor would.
+    /// A launch that panics, like a user's constructor might.
     struct PanicCtor;
 
     impl Launch for PanicCtor {
@@ -219,7 +231,7 @@ mod tests {
         }
     }
 
-    /// A launch whose task says it started, then parks.
+    /// A launch whose task signals that it started, then waits forever.
     struct Started(SyncSender<()>);
 
     impl Launch for Started {
@@ -253,7 +265,8 @@ mod tests {
             .expect("the group still builds");
         assert_eq!(started.recv_timeout(Duration::from_secs(5)), Ok(()));
 
-        // A thread that died would be detached at the timeout instead.
+        // If the thread had died, the drop would wait for the timeout and
+        // detach it instead.
         let at = Instant::now();
         drop(group);
         assert!(at.elapsed() < JOIN_TIMEOUT / 2, "{:?}", at.elapsed());
