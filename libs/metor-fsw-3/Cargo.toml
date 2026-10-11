@@ -10,6 +10,7 @@ metor-fsw-3-ring = { path = "ring", default-features = false, features = ["notif
 
 metor-component = { workspace = true }
 metor-proto = { path = "../metor-proto", features = ["std"] }
+metor-proto-stellar = { path = "../metor-proto/stellar", optional = true }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
 blake3 = { version = "1.8", optional = true }
@@ -52,6 +53,7 @@ host = [
     "dep:clap",
     "dep:libc",
     "dep:libloading",
+    "dep:metor-proto-stellar",
     "dep:minijinja",
     "dep:polling",
     "dep:io-uring",
