@@ -15,11 +15,12 @@ mod slot;
 use std::collections::HashMap;
 use std::path::Path;
 
+use metor_proto::types::PacketId;
 use serde::{Deserialize, Serialize};
 
 use crate::coordinator::{OutputSource, SystemTable};
-use crate::dl::SLOT_TYPE;
-use crate::link::{LINK_TYPES, Transport};
+use crate::link::{DB_TYPE, DbParams, LINK_TYPES, Transport};
+use crate::record::RecordSchema;
 
 pub use config::{
     CONFIG_VERSION, ConfigError, DeploySource, DeploySystem, DeploymentConfig, PeerLink, PeerPort,
@@ -65,53 +66,12 @@ pub struct Pending {
 /// Decodes every system's params in `envelope` once, and returns them if a
 /// peer reference or a slot candidate that points at a pack is left.
 ///
-/// # Errors
-/// Returns an error if a link's or a slot's params do not decode.
-pub fn pending(envelope: &DeploymentConfig) -> Result<Option<Pending>, DeployError> {
-    let mut pending = Pending {
-        links: Links(HashMap::new()),
-        slots: Vec::new(),
-    };
-    for (index, system) in SystemIndex::iter(envelope) {
-        match DeployParams::read(envelope, index, system)? {
-            DeployParams::Link(part) => {
-                pending.links.0.insert(index, part);
-            }
-            DeployParams::Slot(slot) if slot.pending() => pending.slots.push((index, slot)),
-            DeployParams::Slot(_) | DeployParams::Other => {}
-        }
-    }
-    let peer_output = SystemIndex::iter(envelope).any(|(_, system)| {
-        let mut outputs = system.outputs.iter();
-        outputs.any(|output| matches!(output.source, DeploySource::Peer(_)))
-    });
-    let left = peer_output || pending.links.dials_peer() || !pending.slots.is_empty();
-    Ok(left.then_some(pending))
-}
-
-impl Pending {
-    /// Resolves every slot, copying candidate libraries into `store`, then
-    /// every peer reference.
-    ///
-    /// `tables` holds one system table per target. Peer transports become
-    /// addresses, and peer outputs become port definitions.
-    pub fn resolve(
-        self,
-        envelope: &mut DeploymentConfig,
-        tables: &[SystemTable],
-        store: &Path,
-    ) -> Result<(), DeployError> {
-        slot::resolve_slots(envelope, tables, store, self.slots)?;
-        resolve_peers(envelope, tables, self.links)
-    }
-}
-
-/// Resolves every peer reference in `envelope`, using its decoded `links`.
-fn resolve_peers(
-    envelope: &mut DeploymentConfig,
-    tables: &[SystemTable],
-    mut links: Links,
-) -> Result<(), DeployError> {
+/// `tables` holds one system table per target. Peer transports become
+/// addresses, and peer outputs become port definitions. Each database is also
+/// told which command messages its subscribers receive through it. An
+/// envelope with nothing to resolve is left unchanged.
+pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Result<(), DeployError> {
+    let mut links = Links::read(envelope)?;
     let plan = plan(envelope, tables, &links)?;
     check_ports(envelope, &links)?;
     for (index, addr) in plan.transports {
@@ -123,6 +83,12 @@ fn resolve_peers(
     for ((index, output), def) in plan.outputs {
         let source = DeploySource::Runtime(OutputSource::Def(def));
         index.get_mut(envelope).outputs[output].source = source;
+    }
+    for (index, ids) in plan.commands {
+        let system = index.get_mut(envelope);
+        let mut params = Part::<DbParams>::read(system)?;
+        params.part.command_ids = ids;
+        params.write(system)?;
     }
     Ok(())
 }
@@ -173,6 +139,7 @@ impl Links {
 struct Plan {
     transports: Vec<(SystemIndex, String)>,
     outputs: Vec<((SystemIndex, usize), crate::PortDef)>,
+    commands: Vec<(SystemIndex, Vec<PacketId>)>,
 }
 
 fn plan(
@@ -184,23 +151,32 @@ fn plan(
     let mut plan = Plan {
         transports: Vec::new(),
         outputs: Vec::new(),
+        commands: Vec::new(),
     };
+    let mut commands: HashMap<SystemIndex, Vec<PacketId>> = HashMap::new();
     for (index, system) in SystemIndex::iter(envelope) {
-        plan.add(envelope, &mut defs, links, index)
+        plan.add(envelope, &mut defs, links, index, &mut commands)
             .map_err(|e| e.at(system.location.as_ref()))?;
     }
+    let mut commands: Vec<_> = commands.into_iter().collect();
+    commands.sort_unstable_by_key(|(index, _)| *index);
+    for (_, ids) in &mut commands {
+        ids.sort_unstable();
+    }
+    plan.commands = commands;
     Ok(plan)
 }
 
 impl Plan {
     /// Plans the peer outputs and the peer transport of the system at
-    /// `index`.
+    /// `index`, and adds its messages to `commands` when it dials a db.
     fn add(
         &mut self,
         envelope: &DeploymentConfig,
         defs: &mut DefIndex<'_>,
         links: &Links,
         index: SystemIndex,
+        commands: &mut HashMap<SystemIndex, Vec<PacketId>>,
     ) -> Result<(), DeployError> {
         let system = index.get(envelope);
         for (output_index, output) in system.outputs.iter().enumerate() {
@@ -224,6 +200,16 @@ impl Plan {
             })?;
         self.transports
             .push((index, address(host(envelope, &peer.target), port)));
+        if peer_index.get(envelope).ty == DB_TYPE {
+            let ids = commands.entry(peer_index).or_default();
+            for port in &defs.def(index)?.outputs {
+                if let RecordSchema::Msg { id, .. } = &port.schema
+                    && !ids.contains(id)
+                {
+                    ids.push(*id);
+                }
+            }
+        }
         Ok(())
     }
 }

@@ -258,6 +258,250 @@
           }
         ]
       }
+    },
+    {
+      "packs": [],
+      "coordinator": {
+        "clock": {
+          "Wall": {
+            "rate": 1000.0
+          }
+        },
+        "ring_depth": 8,
+        "namespace": "gw",
+        "systems": [
+          {
+            "id": "a",
+            "ty": "fsw.subscribe",
+            "params": {
+              "conn_cap": 1048576,
+              "inbound_cap": 256,
+              "link": "a",
+              "namespace": "gw",
+              "transport": {
+                "connect": {
+                  "addr": "127.0.0.1:2240"
+                }
+              }
+            },
+            "inputs": [],
+            "outputs": [
+              {
+                "port": "sampler.sample"
+              },
+              {
+                "port": "sampler.log"
+              },
+              {
+                "port": "sampler.status"
+              }
+            ]
+          },
+          {
+            "id": "b",
+            "ty": "fsw.subscribe",
+            "params": {
+              "conn_cap": 1048576,
+              "inbound_cap": 256,
+              "link": "b",
+              "namespace": "gw",
+              "transport": {
+                "connect": {
+                  "addr": "127.0.0.1:2241"
+                }
+              }
+            },
+            "inputs": [],
+            "outputs": [
+              {
+                "port": "mirror.sampler.sample"
+              },
+              {
+                "port": "mirror.sampler.log"
+              },
+              {
+                "port": "mirror.sampler.status"
+              },
+              {
+                "port": "mirror.link_status"
+              },
+              {
+                "port": "mirror.status"
+              },
+              {
+                "port": "meter.output"
+              },
+              {
+                "port": "meter.status"
+              }
+            ]
+          },
+          {
+            "id": "db",
+            "ty": "fsw.db",
+            "params": {
+              "command_ids": [],
+              "link": "db",
+              "namespace": "gw",
+              "path": null,
+              "transport": {
+                "listen": {
+                  "addr": "127.0.0.1:2250",
+                  "max_connections": 8
+                }
+              }
+            },
+            "inputs": [
+              {
+                "port": "a.sampler.sample",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "sampler.sample"
+                  }
+                ]
+              },
+              {
+                "port": "a.sampler.log",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "sampler.log"
+                  }
+                ]
+              },
+              {
+                "port": "a.sampler.status",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "sampler.status"
+                  }
+                ]
+              },
+              {
+                "port": "a.link_status",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "a.log",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "a.status",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "status"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.sampler.sample",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.sampler.sample"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.sampler.log",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.sampler.log"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.sampler.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.sampler.status"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.link_status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.link_status"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.status"
+                  }
+                ]
+              },
+              {
+                "port": "b.meter.output",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "meter.output"
+                  }
+                ]
+              },
+              {
+                "port": "b.meter.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "meter.status"
+                  }
+                ]
+              },
+              {
+                "port": "b.link_status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "b.log",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "b.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "status"
+                  }
+                ]
+              }
+            ],
+            "outputs": [],
+            "thread": "db"
+          }
+        ]
+      }
     }
   ]
 }

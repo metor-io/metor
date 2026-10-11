@@ -29,7 +29,7 @@ use crate::{
     Error,
     append_log::AppendLog,
     seal::{SealRecord, SealRecordExt},
-    time_series_2::{NODE_SIZE, TimeSeriesNode},
+    time_series::{NODE_SIZE, TimeSeriesNode},
 };
 
 /// Store futures run on background tasks of a local executor; they do not
@@ -247,10 +247,8 @@ impl NodeStaging {
     pub fn trim_to(&self, cover_end: Timestamp) -> Result<SealRecord, Error> {
         let node = self.node();
         let keep = node.timestamps().partition_point(|ts| ts.0 <= cover_end.0);
-        self.index
-            .truncate((keep * size_of::<Timestamp>()) as u64);
-        self.data
-            .truncate((keep * node.element_size()) as u64);
+        self.index.truncate((keep * size_of::<Timestamp>()) as u64);
+        self.data.truncate((keep * node.element_size()) as u64);
         self.seal()
             .ok_or_else(|| StoreError::Other("trim left an empty node".to_string()).into())
     }
@@ -273,9 +271,7 @@ impl NodeStaging {
         node.index.flush()?;
         node.data.flush()?;
         seal.write(&self.dir)?;
-        let final_dir = self
-            .dir
-            .with_file_name(seal.start_ts.0.to_string());
+        let final_dir = self.dir.with_file_name(seal.start_ts.0.to_string());
         if final_dir.exists() {
             return Err(StoreError::Other(format!(
                 "node {} was committed by a concurrent fetch",
@@ -315,8 +311,11 @@ impl Drop for NodeStaging {
 ///   store may keep files, a database may explode samples into rows) as
 ///   long as the round trip is exact.
 pub trait NodeStore: Send + Sync + 'static {
-    fn put<'a>(&'a self, key: NodeKey<'a>, node: SealedNode<'a>)
-    -> BoxFuture<'a, Result<(), StoreError>>;
+    fn put<'a>(
+        &'a self,
+        key: NodeKey<'a>,
+        node: SealedNode<'a>,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Stream the node's payloads into `dst` (in order, per file) and
     /// return the store's seal record for it.
@@ -336,4 +335,3 @@ pub trait NodeStore: Send + Sync + 'static {
 
     fn contains<'a>(&'a self, key: NodeKey<'a>) -> BoxFuture<'a, Result<bool, StoreError>>;
 }
-

@@ -1,14 +1,15 @@
 """Built-in systems that any target can add.
 
-`Publish` sends records to other targets, and `Subscribe` receives them.
-`DlSlot` and `ChannelRegistry` support channels.
+`Publish` sends records to other targets, and `Subscribe` receives them. `Db`
+is an embedded database, which is how a gateway records telemetry. `DlSlot`
+and `ChannelRegistry` support channels.
 
 These systems are built into the host rather than supplied by a pack, so
 their pack has no library and is left out of the config's pack list.
 
-The two link systems (`Publish` and `Subscribe`) each take one
-`transport`: `Listen` on an address, `Connect` to an address, or dial a
-`Peer` link in the same deployment, which `metor build` turns into an
+`Publish` and `Subscribe` each take one `transport`: `Listen` on an
+address, `Connect` to an address, or dial a `Peer` link in the same
+deployment, which `metor build` turns into an address. `Db` listens on an
 address.
 """
 
@@ -19,7 +20,7 @@ from typing import Any, Sequence, TypeVar
 
 from . import _generated
 from ._config import ConfigError
-from ._generated import IO_RECORDS, SequenceRegistry
+from ._generated import FRAMEWORK_PORTS, IO_RECORDS, PACK, SequenceRegistry
 from ._model import (
     Item,
     OutPort,
@@ -78,6 +79,14 @@ class Peer:
 
 Transport = Listen | Connect | Peer
 """How a link gets its connections."""
+
+
+class DbStatus(Record):
+    """Ingest counters that a `Db` writes when they change."""
+
+    _name = "db_status"
+    _kind = "frame"
+    _pack = PACK
 
 
 class Link(System):
@@ -157,6 +166,31 @@ class Publish(Sink, _generated.Publish):
         all: bool = False,
     ) -> None:
         super().__init__({"conn_cap": conn_cap}, transport, items, all)
+
+
+class Db(Sink):
+    """An embedded database that records telemetry.
+
+    It stores every record from the ports in `items`, and serves the database
+    to clients on `listen`. `path` is the database directory. When unset, a
+    fresh temporary directory is used. With `all`, it records every system
+    added before this one.
+    """
+
+    _ty = "db"
+    _ports = {"db_status": DbStatus, **FRAMEWORK_PORTS}
+
+    def __init__(
+        self,
+        listen: str,
+        path: str | None = None,
+        items: Sequence[Item] = (),
+        max_connections: int | None = None,
+        all: bool = False,
+    ) -> None:
+        slots = MAX_CONNECTIONS if max_connections is None else max_connections
+        params = {"path": path, "command_ids": []}
+        super().__init__(params, Listen(listen, slots), items, all)
 
 
 class Subscribe(Link, _generated.Subscribe):
