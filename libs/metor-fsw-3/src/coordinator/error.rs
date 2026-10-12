@@ -7,9 +7,6 @@ use crate::def::DefError;
 /// Errors from registering system types or building a coordinator.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum BuildError {
-    #[error("wall clock rate must be finite and at least 0.001 Hz")]
-    InvalidClockRate,
-
     #[error("a deterministic build needs a simulated clock")]
     DeterministicWall,
 

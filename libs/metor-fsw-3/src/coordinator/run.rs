@@ -147,9 +147,9 @@ mod tests {
     use core::time::Duration;
 
     use super::*;
-    use crate::coordinator::CoordinatorConfig;
     use crate::coordinator::config::{InputConfig, PortRef, SystemConfig};
     use crate::coordinator::tests::Twice;
+    use crate::coordinator::{CoordinatorConfig, WallRate};
     use crate::tests::utils::{self, Recorder, ended_with, pipeline_config, table};
 
     fn watched(config: &mut CoordinatorConfig, from: &[&str]) {
@@ -219,7 +219,9 @@ mod tests {
     async fn test_run_stop() {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
-        config.clock = Clock::Wall { rate: 10_000.0 };
+        config.clock = Clock::Wall {
+            rate: WallRate::try_from(10_000.0).expect("valid"),
+        };
         let mut coordinator = config.build(&table(&recorder)).unwrap();
         coordinator.run(utils::after_cycles(5)).await;
         assert_eq!(coordinator.cycle(), 5);
@@ -231,7 +233,9 @@ mod tests {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         // A budget no cycle can meet, so every iteration takes the yield path.
-        config.clock = Clock::Wall { rate: 1e12 };
+        config.clock = Clock::Wall {
+            rate: WallRate::try_from(1e12).expect("valid"),
+        };
         let mut coordinator = config.build(&table(&recorder)).unwrap();
         coordinator.run(utils::after_cycles(3)).await;
         assert_eq!(coordinator.cycle(), 3);

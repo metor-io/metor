@@ -25,8 +25,6 @@ use super::table::{MakeCx, SystemTable, TableEntry};
 
 const STATUS_PORT: &str = "status";
 
-const MIN_WALL_RATE: f64 = 0.001;
-
 struct RingSpec {
     system: String,
     port: PortDef,
@@ -79,7 +77,6 @@ impl CoordinatorConfig {
         table: &SystemTable,
         options: BuildOptions,
     ) -> Result<Coordinator, BuildError> {
-        self.clock.validate()?;
         if options.deterministic {
             self.clock.check_deterministic()?;
         }
@@ -474,15 +471,6 @@ fn make_systems(
 }
 
 impl Clock {
-    pub(crate) fn validate(&self) -> Result<(), BuildError> {
-        if let Self::Wall { rate } = self
-            && (!rate.is_finite() || *rate < MIN_WALL_RATE)
-        {
-            return Err(BuildError::InvalidClockRate);
-        }
-        Ok(())
-    }
-
     /// Checks that cycle times are fixed and strictly increasing: a turned
     /// group keys its turns on them, and its clock counts whole microseconds
     /// from zero.
@@ -512,10 +500,10 @@ impl Clock {
     /// Returns zero for a simulated clock.
     pub(crate) fn cycle_budget(&self) -> Duration {
         match self {
-            Clock::Wall { rate } if *rate > 0.0 => {
-                Duration::try_from_secs_f64(1.0 / rate).unwrap_or(Duration::MAX)
+            Clock::Wall { rate } => {
+                Duration::try_from_secs_f64(1.0 / rate.get()).unwrap_or(Duration::MAX)
             }
-            _ => Duration::ZERO,
+            Clock::Simulated { .. } => Duration::ZERO,
         }
     }
 }
@@ -525,7 +513,9 @@ mod tests {
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     use super::*;
-    use crate::coordinator::{InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig};
+    use crate::coordinator::{
+        InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig, WallRate,
+    };
     use crate::def::DefError;
     use crate::tests::utils::{self, Recorder, pipeline_config, table};
     use crate::{Frame, Record};
@@ -664,12 +654,15 @@ mod tests {
             1e-300,
             0.000_999,
         ] {
-            let config = CoordinatorConfig {
-                clock: super::super::Clock::Wall { rate },
-                ..Default::default()
-            };
-            assert_eq!(build(config).err(), Some(BuildError::InvalidClockRate));
+            assert!(WallRate::try_from(rate).is_err(), "{rate}");
+            let json = serde_json::json!({ "Wall": { "rate": rate } });
+            assert!(serde_json::from_value::<Clock>(json).is_err(), "{rate}");
         }
+        let clock: Clock = serde_json::from_str(r#"{"Wall":{"rate":0.001}}"#).expect("the minimum");
+        assert_eq!(
+            serde_json::to_string(&clock).expect("encodes"),
+            r#"{"Wall":{"rate":0.001}}"#
+        );
     }
 
     #[test]
@@ -1112,17 +1105,17 @@ mod tests {
             .cycle_budget(),
             Duration::ZERO
         );
-        let clock = Clock::Wall { rate: f64::MAX };
-        assert_eq!(clock.validate(), Ok(()));
+        let clock = Clock::Wall {
+            rate: WallRate::try_from(f64::MAX).expect("finite"),
+        };
         assert_eq!(clock.cycle_budget(), Duration::ZERO);
     }
 
     #[test]
     fn test_minimum_wall_rate_budget() {
         let clock = Clock::Wall {
-            rate: MIN_WALL_RATE,
+            rate: WallRate::try_from(WallRate::MIN).expect("the minimum"),
         };
-        assert_eq!(clock.validate(), Ok(()));
         assert_eq!(clock.cycle_budget(), Duration::from_secs(1_000));
     }
 }

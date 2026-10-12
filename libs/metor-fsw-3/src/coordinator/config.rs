@@ -32,7 +32,9 @@ pub struct CoordinatorConfig {
 impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
-            clock: Clock::Wall { rate: 100.0 },
+            clock: Clock::Wall {
+                rate: WallRate(100.0),
+            },
             ring_depth: DEFAULT_RING_DEPTH,
             namespace: None,
             systems: Vec::new(),
@@ -171,7 +173,7 @@ pub struct PortRef {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Clock {
     Wall {
-        rate: f64,
+        rate: WallRate,
     },
     Simulated {
         dt: Duration,
@@ -179,6 +181,42 @@ pub enum Clock {
         epoch: Option<Timestamp>,
     },
 }
+
+/// A wall clock's rate in cycles per second: finite and at least
+/// [`WallRate::MIN`].
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct WallRate(f64);
+
+impl WallRate {
+    pub const MIN: f64 = 0.001;
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for WallRate {
+    type Error = InvalidWallRate;
+
+    fn try_from(rate: f64) -> Result<Self, InvalidWallRate> {
+        match rate.is_finite() && rate >= Self::MIN {
+            true => Ok(Self(rate)),
+            false => Err(InvalidWallRate(rate)),
+        }
+    }
+}
+
+impl From<WallRate> for f64 {
+    fn from(rate: WallRate) -> f64 {
+        rate.0
+    }
+}
+
+/// A wall clock rate that is not finite or is below [`WallRate::MIN`].
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+#[error("wall clock rate {0} must be finite and at least 0.001 Hz")]
+pub struct InvalidWallRate(pub f64);
 
 /// Choices one build makes that the target's config does not.
 #[derive(Clone, Copy, Debug, Default)]
