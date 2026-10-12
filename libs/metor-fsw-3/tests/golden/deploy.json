@@ -248,6 +248,7 @@
           }
         },
         "ring_depth": 8,
+        "seed": 0,
         "namespace": "gw",
         "systems": [
           {
