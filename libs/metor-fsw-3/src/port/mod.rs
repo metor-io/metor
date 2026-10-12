@@ -193,7 +193,7 @@ impl<W: WakeSource> Output<Bytes, W> {
     /// Creates a dynamic output that writes raw bytes.
     ///
     /// Records longer than `max_len` are rejected.
-    pub fn bytes(writer: Writer<W>, max_len: usize) -> Self {
+    pub fn with_max_len(writer: Writer<W>, max_len: usize) -> Self {
         Self::with_dropped_counter(writer, max_len, Arc::default())
     }
 
