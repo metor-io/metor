@@ -15,7 +15,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use metor_fsw_3::cli::cargo::{cargo_build, wasm_build};
-use metor_fsw_3::coordinator::{CoordinatorConfig, SystemTable};
+use metor_fsw_3::coordinator::{Coordinator, CoordinatorConfig, EndReason, SystemTable};
 use metor_fsw_3::wasm::{Limits, WasmPack};
 use metor_fsw_3::{Frame, Output, Record, Timestamp, system};
 use metor_proto_stellar::{PacketSink, PacketStream, Peer, identify};
@@ -233,4 +233,12 @@ impl Future for Until {
             false => Poll::Pending,
         }
     }
+}
+
+/// The ids of `c`'s systems that panicked, in step order.
+pub fn panicked(c: &Coordinator) -> Vec<&str> {
+    c.systems()
+        .filter(|(_, end)| *end == Some(&EndReason::Panicked))
+        .map(|(id, _)| id)
+        .collect()
 }

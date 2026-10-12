@@ -274,7 +274,7 @@ const LOG_RING: usize = 1 << 16;
 /// If `corrupt` is set, the record's length is written as `u32::MAX`.
 fn record_stores(record: &[u8], corrupt: bool) -> String {
     let (config, _) = mirror_config(RING, 2, 1).expect("fits");
-    let ring = RingBuffer::create_in_memory(config);
+    let ring = RingBuffer::create_in_memory(config).expect("a valid ring config");
     let _host = ring.view(NoWake).expect("a free reader slot");
     let before = region_bytes(&ring);
     let writer = ring.writer(NoWake).expect("a free writer");
@@ -308,6 +308,7 @@ fn ring(capacity: usize) -> RingBuffer {
         capacity,
         max_readers: 1,
     })
+    .expect("a valid ring config")
 }
 
 fn rig(execute: &str) -> Rig {

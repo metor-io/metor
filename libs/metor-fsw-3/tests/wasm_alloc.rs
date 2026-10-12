@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::{Ping, open_wasm};
+use common::{Ping, open_wasm, panicked};
 use metor_fsw_3::coordinator::{Coordinator, CoordinatorConfig};
 use metor_fsw_3::{InputConfig, Output, Pack, SystemConfig, SystemTable, Timestamp, system};
 
@@ -108,14 +108,14 @@ fn run(coordinator: &mut Coordinator, cycles: i64) {
 fn test_cyclic_steps_allocate_nothing() {
     let mut coordinator = built("echo");
     assert_eq!(allocations(|| run(&mut coordinator, 64)), 0);
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(panicked(&coordinator).len(), 0);
 }
 
 #[test]
 fn test_sequence_steps_allocate_nothing() {
     let mut coordinator = built("count_up");
     assert_eq!(allocations(|| run(&mut coordinator, 8)), 0);
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(panicked(&coordinator).len(), 0);
 }
 
 #[test]

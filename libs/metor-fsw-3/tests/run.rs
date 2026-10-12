@@ -4,7 +4,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{fixture_dir, fixture_wasm, metor};
+use common::{fixture_dir, fixture_wasm, metor, panicked};
 use metor_fsw_3::cli::run::{Run, load};
 use metor_fsw_3::coordinator::CoordinatorConfig;
 use metor_fsw_3::deploy::TargetConfig;
@@ -238,5 +238,5 @@ fn test_wasm_pack_loads_and_runs() {
         coordinator.step(Timestamp(cycle));
     }
     assert_eq!(coordinator.cycle(), 3);
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(panicked(&coordinator).len(), 0);
 }
