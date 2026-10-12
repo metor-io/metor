@@ -265,7 +265,7 @@ mod through_the_io_steps {
                     ..SystemConfig::new("io_submit", IO_TYPE)
                 },
                 SystemConfig {
-                    outputs: vec![OutputConfig::record("p", "io_cqe")],
+                    outputs: vec![OutputConfig::with_record("p", "io_cqe")],
                     params: serde_json::json!({ "status": true }),
                     ..SystemConfig::new("io_complete", IO_TYPE)
                 },
