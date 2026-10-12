@@ -25,6 +25,7 @@ fn ring<T: Record>(readers: usize) -> RingBuffer {
         capacity: ring_capacity(T::MAX_LEN, 4 * MAX_OPS).expect("a small ring"),
         max_readers: readers,
     })
+    .expect("a valid ring config")
 }
 
 fn writer<T: Record>(ring: &RingBuffer) -> Output<T> {

@@ -19,7 +19,7 @@ use metor_fsw_3::coordinator::{
 };
 use metor_fsw_3::io::{Backing, End, Grant, IO_CQ, IO_SQ, IO_TYPE, ResourceConfig, SimKind};
 use metor_fsw_3::ring::Notifier;
-use metor_fsw_3::{DynInputs, Input, Output, Stop, Timestamp, system};
+use metor_fsw_3::{DynInputs, EndReason, Input, Output, Stop, Timestamp, system};
 
 /// A record one port carried: the cycle time, the port, and its bytes.
 type Tapped = Vec<(i64, String, Vec<u8>)>;
@@ -157,7 +157,10 @@ fn on(tapped: &Tapped, port: &str) -> Tapped {
 #[test]
 fn same_seed_gives_the_same_records() {
     let (first, c) = run(7, true);
-    assert_eq!(c.latched().count(), 0);
+    assert!(
+        c.systems()
+            .all(|(_, end)| end != Some(&EndReason::Panicked))
+    );
     let echoes = on(&first, "echo");
     assert!(!echoes.is_empty(), "the async system answered");
     assert!(!on(&first, "model_sq").is_empty(), "the model answered");
@@ -183,6 +186,9 @@ fn another_seed_gives_other_bytes() {
 #[test]
 fn threaded_build_still_runs() {
     let (_, c) = run(7, false);
-    assert_eq!(c.latched().count(), 0);
+    assert!(
+        c.systems()
+            .all(|(_, end)| end != Some(&EndReason::Panicked))
+    );
     assert_eq!(c.cycle(), CYCLES as u64);
 }

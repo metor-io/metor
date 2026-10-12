@@ -34,7 +34,7 @@ fn rig(sq_depth: usize, cq_depth: usize) -> Rig {
         os: host(MAX_OPS).unwrap(),
     });
     let sq_ring = ring::<Sqe>(sq_depth, 1);
-    let sq = Output::bytes(sq_ring.writer(NoWake).unwrap(), Sqe::MAX_LEN);
+    let sq = Output::with_max_len(sq_ring.writer(NoWake).unwrap(), Sqe::MAX_LEN);
     let sq_in = input::<Sqe>(&sq_ring);
     let (cq_ring, cq_out, cq) = pair::<Cqe>(cq_depth);
     let (log_ring, log_out, log) = pair::<LogEvent>(16);
