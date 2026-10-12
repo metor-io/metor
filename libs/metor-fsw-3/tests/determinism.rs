@@ -93,7 +93,7 @@ fn config(seed: u64) -> CoordinatorConfig {
         },
         SystemConfig {
             inputs: vec![InputConfig::new("reader", "reader", IO_SQ)],
-            outputs: vec![OutputConfig::record("chatter", "io_cqe")],
+            outputs: vec![OutputConfig::with_record("chatter", "io_cqe")],
             ..SystemConfig::new("io_submit", IO_TYPE)
         },
         SystemConfig {
@@ -103,7 +103,7 @@ fn config(seed: u64) -> CoordinatorConfig {
         },
         SystemConfig {
             inputs: vec![InputConfig::new("chatter", "chatter", IO_SQ)],
-            outputs: vec![OutputConfig::record("reader", "io_cqe")],
+            outputs: vec![OutputConfig::with_record("reader", "io_cqe")],
             ..SystemConfig::new("io_complete", IO_TYPE)
         },
         SystemConfig {
