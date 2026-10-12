@@ -16,13 +16,13 @@ use std::sync::{Arc, Once, OnceLock};
 
 use adcs_contracts::{AttitudeEstimate, BodyState, DT, ModeCmd, TorqueCmd, tracking_sample};
 use adcs_seqs::Commission;
+use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::cli::run::prepare;
 use metor_fsw_3::coordinator::{
     Clock, Coordinator, CoordinatorConfig, EndReason, InputConfig, PortRef, SystemConfig,
     SystemTable,
 };
 use metor_fsw_3::dl::{PackKind, PackRef, cdylib_name, triple};
-use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::{DlPack, Input, Pack, system};
 use metor_proto_wkt::LogEvent;
 use serde_json::json;
@@ -277,10 +277,17 @@ fn drive(coordinators: Vec<Coordinator>, cycles: u64) -> Vec<Vec<(String, EndRea
         let mut ended = Vec::new();
         for mut coordinator in coordinators {
             coordinator.run(stop(cycles)).await;
-            let latched: Vec<&str> = coordinator.latched().collect();
+            let steps: Vec<(String, EndReason)> = coordinator
+                .systems()
+                .filter_map(|(id, why)| Some((id.into(), why?.clone())))
+                .collect();
+            let latched: Vec<&str> = steps
+                .iter()
+                .filter(|(_, why)| *why == EndReason::Panicked)
+                .map(|(id, _)| id.as_str())
+                .collect();
             assert!(latched.is_empty(), "latched off: {latched:?}");
-            let steps = coordinator.ended();
-            ended.push(steps.map(|(id, why)| (id.into(), why.clone())).collect());
+            ended.push(steps);
         }
         ended
     })

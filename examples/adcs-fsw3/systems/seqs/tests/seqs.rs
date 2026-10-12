@@ -104,7 +104,7 @@ impl Rig {
     }
 
     fn ended(&self) -> Option<&EndReason> {
-        self.coordinator.ended().map(|(_, reason)| reason).next()
+        self.coordinator.systems().find_map(|(_, reason)| reason)
     }
 
     fn commands(&self) -> Vec<(u8, u8)> {

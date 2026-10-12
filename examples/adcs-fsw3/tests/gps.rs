@@ -6,8 +6,8 @@ use core::time::Duration;
 use std::rc::Rc;
 
 use adcs_contracts::{BodyState, Gps, GpsFault, Quat, V3};
-use metor_fsw_3::coordinator::{Clock, Coordinator, CoordinatorConfig, SystemTable};
 use metor_fsw_3::builtins::register_builtins;
+use metor_fsw_3::coordinator::{Clock, Coordinator, CoordinatorConfig, SystemTable};
 use metor_fsw_3::{Input, Output, Timestamp, system};
 use serde_json::json;
 
@@ -90,7 +90,7 @@ impl Rig {
             self.now = Timestamp(self.now.0 + DT);
             self.c.step(self.now);
         }
-        let ended: Vec<_> = self.c.ended().collect();
+        let ended: Vec<_> = self.c.systems().filter(|(_, end)| end.is_some()).collect();
         assert!(ended.is_empty(), "{ended:?}");
         self.fixes.take()
     }
