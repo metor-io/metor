@@ -24,7 +24,7 @@ use metor_proto_wkt::LogLevel;
 use crate::async_system::{AsyncSystem, Running, Stop};
 use crate::coordinator::{EndReason, MakeCx, ParamError, Params, Step};
 use crate::mirror::{Mirror, Mirrors, mirror_config};
-use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef, SystemInputs, SystemOutputs};
+use crate::system::{InputBinding, OutputBinding, PortDef, Ports, SystemDef};
 
 use group::{GroupHandle, Member, Panicked};
 use turned::TurnedGroup;

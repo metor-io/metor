@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::coordinator::OutputSource;
 use crate::def::{DefCx, DefError};
 use crate::record::{Bytes, DecodeError, EncodeError, Record};
-use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
+use crate::system::{InputBinding, OutputBinding, PortDef, Ports};
 use metor_fsw_3_ring::{
     NoWake, Notifier, PAYLOAD_ALIGNMENT, ReadError, View, WakeSink, WakeSource, WriteError, Writer,
     frame_len,
@@ -389,7 +389,7 @@ impl DynInputs<Notifier> {
     }
 }
 
-impl<W: WakeSink> SystemInputs<W> for DynInputs<W> {
+impl<W: WakeSink> Ports<InputBinding<W>> for DynInputs<W> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         dyn_input_defs(cx, &[])
     }
@@ -427,7 +427,7 @@ impl<W: WakeSource> DynOutputs<W> {
     }
 }
 
-impl<W: WakeSource> SystemOutputs<W> for DynOutputs<W> {
+impl<W: WakeSource> Ports<OutputBinding<W>> for DynOutputs<W> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         dyn_output_defs(cx, &[])
     }

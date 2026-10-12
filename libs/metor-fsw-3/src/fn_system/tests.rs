@@ -834,7 +834,7 @@ impl FnSignature for TwoOutputs {
 
 #[test]
 fn test_outputs_share_one_counter() {
-    use crate::system::{OutputBinding, SystemOutputs};
+    use crate::system::{OutputBinding, Ports};
 
     let rings = [ring::<Imu>(8, 1), ring::<Imu>(8, 1), ring::<LogEvent>(8, 1)];
     let defs = OutSet::<TwoOutputs>::defs(&DefCx::empty()).expect("static ports");
