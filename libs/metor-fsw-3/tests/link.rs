@@ -13,7 +13,7 @@ use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::coordinator::{
     CoordinatorConfig, InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig, SystemTable,
 };
-use metor_fsw_3::{Clock, DefCx, Frame, Input, LinkStatus, Output, Timestamp, system};
+use metor_fsw_3::{Clock, DefCx, Frame, Input, LinkStatus, Output, Timestamp, WallRate, system};
 use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::PacketStream;
 use metor_proto_wkt::LogEvent;
@@ -224,6 +224,7 @@ fn status_reader(link: &str) -> SystemConfig {
 
 /// Builds `systems` and runs them on a new thread, cycling at `rate`.
 fn spawn(systems: Vec<SystemConfig>, seen: &Seen, rate: f64) -> Target {
+    let rate = WallRate::try_from(rate).expect("a valid rate");
     spawn_on(systems, seen, Clock::Wall { rate })
 }
 

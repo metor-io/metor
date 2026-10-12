@@ -52,7 +52,8 @@ impl Inbox {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: cap,
             max_readers: 1,
-        });
+        })
+        .ok()?;
         let wake = Notifier::default();
         // PANIC Safety: the ring is new, so its writer and its one reader slot
         // are both free.

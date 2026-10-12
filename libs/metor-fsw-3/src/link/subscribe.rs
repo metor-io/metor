@@ -248,7 +248,7 @@ mod tests {
     use crate::DefCx;
 
     use crate::record::Record;
-    use crate::system::{OutputBinding, PortDef, SystemOutputs};
+    use crate::system::{OutputBinding, PortDef, Ports};
     use crate::tests::utils::{Fixed, Imu, Note, ring};
 
     use super::*;
