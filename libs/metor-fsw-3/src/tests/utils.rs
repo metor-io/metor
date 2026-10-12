@@ -425,3 +425,16 @@ fn spin() {
         core::hint::black_box(i);
     }
 }
+
+/// The ids of `coordinator`'s systems that ended with `reason`, in step order.
+#[cfg(feature = "host")]
+pub fn ended_with<'a>(
+    coordinator: &'a crate::Coordinator,
+    reason: &crate::EndReason,
+) -> Vec<&'a str> {
+    coordinator
+        .systems()
+        .filter(|(_, end)| *end == Some(reason))
+        .map(|(id, _)| id)
+        .collect()
+}

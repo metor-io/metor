@@ -8,7 +8,7 @@ use metor_proto::types::Timestamp;
 
 use crate::coordinator::{BuildError, Coordinator, CoordinatorConfig, InputConfig, PortRef};
 use crate::coordinator::{BuildOptions, Clock, ParamError, SystemConfig, SystemTable};
-use crate::tests::utils::{Recorder, table};
+use crate::tests::utils::{Recorder, ended_with, table};
 
 /// Both ways a group runs: on its own thread, and turned by the coordinator.
 const MODES: [bool; 2] = [false, true];
@@ -118,7 +118,7 @@ fn test_mirror_overflow_report() {
         assert!(reports[0].fields.iter().any(|(name, _)| name == "imu"));
         // No system is latched off: the producer's ring is fine, and only the
         // mirror drops records.
-        assert!(coordinator.latched().next().is_none());
+        assert!(ended_with(&coordinator, &crate::EndReason::Panicked).is_empty());
     }
 }
 
@@ -151,7 +151,10 @@ fn test_task_panic_isolation() {
             lines.extend(recorder.take_logs());
             lines.iter().any(|line| kind(line) == Some("panic"))
         });
-        assert_eq!(coordinator.latched().collect::<Vec<_>>(), vec!["boom"]);
+        assert_eq!(
+            ended_with(&coordinator, &crate::EndReason::Panicked),
+            vec!["boom"]
+        );
         let panic = lines
             .iter()
             .find(|line| kind(line) == Some("panic"))

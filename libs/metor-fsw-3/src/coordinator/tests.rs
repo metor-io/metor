@@ -7,7 +7,7 @@ use metor_proto::types::Timestamp;
 use super::run::{Coordinator, Entry};
 use super::{Clock, EndReason, Step, SystemStatus};
 use crate::port::{Input, Output};
-use crate::tests::utils::{Imu, input, output, ring};
+use crate::tests::utils::{Imu, ended_with, input, output, ring};
 
 #[derive(Default)]
 struct Calls {
@@ -148,7 +148,7 @@ fn assert_retirement(fault_panics: bool, drop_panics: bool) {
 
     for cycle in 1..=32 {
         coordinator.step(Timestamp(cycle));
-        assert_eq!(coordinator.latched().collect::<Vec<_>>(), ["failed"]);
+        assert_eq!(ended_with(&coordinator, &EndReason::Panicked), ["failed"]);
         assert_eq!(calls.execute.get(), 1);
         assert_eq!(calls.fault.get(), 1);
         assert_eq!(calls.drop.get(), 1);
@@ -222,8 +222,8 @@ fn test_ended_step_stays_and_is_skipped() {
     }
     assert_eq!(runs.get(), 2);
     assert_eq!(
-        coordinator.ended().collect::<Vec<_>>(),
-        [("twice", &EndReason::Completed)]
+        coordinator.systems().collect::<Vec<_>>(),
+        [("twice", Some(&EndReason::Completed))]
     );
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(ended_with(&coordinator, &EndReason::Panicked).len(), 0);
 }
