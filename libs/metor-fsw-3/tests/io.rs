@@ -375,7 +375,7 @@ mod gps_on_a_pty {
         let start = Instant::now();
         while start.elapsed() < limit {
             c.step(Timestamp(start.elapsed().as_micros() as i64));
-            if let Some((_, end)) = c.ended().find(|(id, _)| *id == "until") {
+            if let Some((_, Some(end))) = c.systems().find(|(id, _)| *id == "until") {
                 return Some(end.clone());
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -431,7 +431,10 @@ mod gps_on_a_pty {
             1,
             "configured exactly once"
         );
-        assert_eq!(c.latched().count(), 0);
+        assert!(
+            c.systems()
+                .all(|(_, end)| end != Some(&EndReason::Panicked))
+        );
     }
 
     #[test]
@@ -441,7 +444,10 @@ mod gps_on_a_pty {
         let mut c = build(&path, 0.2, &seen);
         let end = run(&mut c, Duration::from_secs(5));
         assert!(matches!(end, Some(EndReason::Failed(_))), "{end:?}");
-        assert!(c.ended().all(|(id, _)| id == "until"), "gps never ends");
+        assert!(
+            c.systems().all(|(id, end)| end.is_none() || id == "until"),
+            "gps never ends"
+        );
         assert!(
             seen.borrow().is_empty(),
             "gps never faults: {:?}",
@@ -457,7 +463,11 @@ mod gps_on_a_pty {
         drop((master, slave));
         let end = run(&mut c, Duration::from_secs(5));
         assert!(matches!(end, Some(EndReason::Failed(_))), "{end:?}");
-        assert_eq!(c.latched().count(), 0, "nothing panicked");
+        assert!(
+            c.systems()
+                .all(|(_, end)| end != Some(&EndReason::Panicked)),
+            "nothing panicked"
+        );
         let seen = seen.borrow();
         assert!(!seen.is_empty(), "the driver logs its failed IO");
         assert!(

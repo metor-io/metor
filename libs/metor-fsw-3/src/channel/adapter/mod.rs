@@ -142,6 +142,7 @@ fn abort_ring() -> RingBuffer {
         capacity: ring_capacity(AbortRequest::MAX_LEN, ABORT_DEPTH).expect("a small ring"),
         max_readers: 1,
     })
+    .expect("a valid ring config")
 }
 
 fn writer<T: Record>(ring: &RingBuffer) -> Output<T> {
