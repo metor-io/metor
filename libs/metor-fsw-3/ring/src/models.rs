@@ -10,6 +10,7 @@ pub(crate) fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
         capacity,
         max_readers,
     })
+    .expect("a valid test config")
 }
 
 /// Copies and consumes the next record.

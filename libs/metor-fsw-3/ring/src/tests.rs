@@ -786,12 +786,14 @@ fn test_region_size_rejects_overflow() {
             max_readers,
         };
         assert_eq!(checked_region_len(&cfg), None);
+        assert!(matches!(RingBuffer::create_in_memory(cfg), Err(InvalidConfig)));
     }
     let cfg = Config {
         capacity: 64,
         max_readers: 2,
     };
     assert_eq!(checked_region_len(&cfg), Some(0x80 + 2 * 64 + 64));
+    assert!(RingBuffer::create_in_memory(cfg).is_ok());
 }
 
 fn check_payload_alignment(rb: &RingBuffer) {

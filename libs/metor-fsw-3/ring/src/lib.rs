@@ -21,7 +21,7 @@
 //! ```
 //! use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 //!
-//! let ring = RingBuffer::create_in_memory(Config { capacity: 1024, max_readers: 4 });
+//! let ring = RingBuffer::create_in_memory(Config { capacity: 1024, max_readers: 4 })?;
 //! let mut writer = ring.writer(NoWake)?;
 //! let mut view = ring.view(NoWake)?;
 //! writer.try_write(b"hello")?;
@@ -172,6 +172,14 @@ pub struct ReadError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the ring's reader table is full")]
 pub struct FullReaderTable;
+
+/// Returned when a config cannot form a valid ring region.
+///
+/// The capacity must be a power of two of at least 16, the reader count must be
+/// between 1 and `u32::MAX`, and the total size must fit `isize::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("ring capacity and reader count do not form a valid region")]
+pub struct InvalidConfig;
 
 /// Returned when the ring already has a writer.
 ///
@@ -471,14 +479,12 @@ pub struct RingBuffer {
 impl RingBuffer {
     /// Creates a ring on the heap.
     ///
-    /// # Panics
-    /// Panics if the capacity is not a power of two of at least 16, if the reader
-    /// count is zero or above `u32::MAX`, or if the total size is above `isize::MAX`.
-    pub fn create_in_memory(cfg: Config) -> Self {
-        let geometry = Geometry::from_config(&cfg);
+    /// Returns [`InvalidConfig`] if `cfg` cannot form a valid region.
+    pub fn create_in_memory(cfg: Config) -> Result<Self, InvalidConfig> {
+        let geometry = Geometry::checked_from_config(&cfg).ok_or(InvalidConfig)?;
         let backing = Backing::heap(geometry.total_size);
         // SAFETY: fresh, aligned storage large enough for the checked geometry.
-        unsafe { Self::initialize(backing, geometry) }
+        Ok(unsafe { Self::initialize(backing, geometry) })
     }
 
     /// Creates a ring in caller-owned storage.
@@ -493,7 +499,7 @@ impl RingBuffer {
     /// initialization, all access must follow the ring protocol.
     ///
     /// # Panics
-    /// Panics on an invalid configuration, like [`Self::create_in_memory`].
+    /// Panics if `cfg` cannot form a valid region (see [`InvalidConfig`]).
     pub unsafe fn create_raw(base: *mut u8, len: usize, cfg: Config) -> Result<Self, AttachError> {
         if !(base as usize).is_multiple_of(PAYLOAD_ALIGNMENT) {
             return Err(AttachError::Misaligned);
@@ -520,7 +526,7 @@ impl RingBuffer {
     /// reformatted, or modified outside the ring protocol.
     ///
     /// # Panics
-    /// Panics on an invalid configuration, like [`Self::create_in_memory`].
+    /// Panics if `cfg` cannot form a valid region (see [`InvalidConfig`]).
     #[cfg(feature = "mmap")]
     pub unsafe fn create_mmap(path: &std::path::Path, cfg: Config) -> std::io::Result<Self> {
         let geometry = Geometry::from_config(&cfg);
@@ -745,7 +751,7 @@ pub fn checked_region_len(cfg: &Config) -> Option<usize> {
 /// ```compile_fail
 /// use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 ///
-/// let ring = RingBuffer::create_in_memory(Config { capacity: 1024, max_readers: 1 });
+/// let ring = RingBuffer::create_in_memory(Config { capacity: 1024, max_readers: 1 }).unwrap();
 /// let writer = ring.writer(NoWake).unwrap();
 /// std::thread::scope(|s| {
 ///     s.spawn(|| writer.try_write(b"a"));
