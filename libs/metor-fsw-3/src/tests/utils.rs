@@ -187,6 +187,7 @@ pub fn ring_of(max_len: usize, depth: usize, readers: usize) -> RingBuffer {
         capacity: ring_capacity(max_len, depth).expect("valid capacity"),
         max_readers: readers,
     })
+    .expect("a valid ring config")
 }
 
 /// Creates a ring for `depth` `T` records, with `readers` slots.

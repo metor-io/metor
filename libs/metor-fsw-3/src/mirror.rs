@@ -249,6 +249,7 @@ pub(crate) mod tests {
             capacity,
             max_readers: 1,
         })
+        .expect("a valid ring config")
     }
 
     fn mirror(from: &RingBuffer, into: &RingBuffer) -> Mirror<NoWake> {
@@ -270,7 +271,7 @@ pub(crate) mod tests {
     /// It finds the cursor as the first byte that changes when the slot is
     /// claimed.
     pub(crate) fn slot_cursor(config: Config) -> usize {
-        let ring = RingBuffer::create_in_memory(config);
+        let ring = RingBuffer::create_in_memory(config).expect("a valid ring config");
         let free = region_bytes(&ring);
         let _view = ring.view(NoWake).expect("a free reader slot");
         let claimed = region_bytes(&ring);
@@ -336,10 +337,10 @@ pub(crate) mod tests {
     #[test]
     fn test_mirror_takes_its_readers() {
         let config = |readers| mirror_config(64, 4, readers).unwrap().0;
-        let two = RingBuffer::create_in_memory(config(2));
+        let two = RingBuffer::create_in_memory(config(2)).expect("a valid ring config");
         let _first = two.view(NoWake).unwrap();
         assert!(two.view(NoWake).is_ok(), "a second reader");
-        let one = RingBuffer::create_in_memory(config(1));
+        let one = RingBuffer::create_in_memory(config(1)).expect("a valid ring config");
         let _first = one.view(NoWake).unwrap();
         assert!(one.view(NoWake).is_err(), "only one");
     }
@@ -374,11 +375,13 @@ pub(crate) mod tests {
         let source = RingBuffer::create_in_memory(Config {
             capacity: 256,
             max_readers: 1,
-        });
+        })
+        .expect("a valid ring config");
         let target = RingBuffer::create_in_memory(Config {
             capacity: 256,
             max_readers: 1,
-        });
+        })
+        .expect("a valid ring config");
         let writer = source.writer(NoWake).expect("writer");
         let mut received = target.view(NoWake).expect("reader");
         let from = source.view(NoWake).expect("reader");
