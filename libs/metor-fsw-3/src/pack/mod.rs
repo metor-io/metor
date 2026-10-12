@@ -97,7 +97,7 @@ pub enum DefStatus {
 thread_local! {
     static TABLE: OnceCell<SystemTable> = const { OnceCell::new() };
     /// The threads this pack runs its own async systems on.
-    static THREADS: RefCell<Threads> = RefCell::new(Threads::new());
+    static THREADS: RefCell<Threads> = RefCell::default();
     /// What the pack's own IO systems share.
     static IO: crate::io::SharedIo = crate::io::SharedIo::default();
     static ERROR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
