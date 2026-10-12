@@ -156,7 +156,7 @@ mod tests {
     use crate::DefCx;
     use crate::port::Input;
     use crate::record::Record;
-    use crate::system::{InputBinding, SystemInputs};
+    use crate::system::{InputBinding, Ports};
     use crate::tests::utils::{Fixed, Imu, ring};
 
     use super::*;
