@@ -8,9 +8,8 @@ use std::cell::RefCell;
 use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
-    DefCx, DefError, DynInputs, Frame, Input, InputBinding, Output, OutputBinding, PortDef, Record,
-    Seq, SeqError, Stop, System, SystemDef, SystemInputs, SystemOutputs, SystemTable, Timestamp,
-    sequence, system,
+    DefCx, DefError, DynInputs, Frame, Input, InputBinding, Output, OutputBinding, PortDef, Ports,
+    Record, Seq, SeqError, Stop, System, SystemDef, SystemTable, Timestamp, sequence, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -156,7 +155,7 @@ thread_local! {
 
 pub struct RetainedInput;
 
-impl SystemInputs for RetainedInput {
+impl Ports<InputBinding> for RetainedInput {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         Ok(vec![Input::<Ping>::def(cx, "input")])
     }
@@ -171,7 +170,7 @@ impl SystemInputs for RetainedInput {
 
 pub struct RetainedOutput;
 
-impl SystemOutputs for RetainedOutput {
+impl Ports<OutputBinding> for RetainedOutput {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         Ok(vec![Output::<Ping>::def(cx, "output")])
     }
