@@ -92,7 +92,7 @@ use crate::coordinator::{SystemKind, TableEntry, bindings, refuse_thread};
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Ctor, Defs, FnSignature, InSet, OutSet, Param};
 use crate::port::Input;
-use crate::system::{SystemDef, SystemInputs, SystemOutputs};
+use crate::system::{Ports, SystemDef};
 
 pub use redline::Redline;
 pub use seq::{NextCycle, OnAbort, Seq, SeqError, Sleep, WaitFor};

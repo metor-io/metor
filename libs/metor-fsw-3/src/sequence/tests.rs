@@ -269,9 +269,12 @@ fn test_failure_ends_with_its_text() {
     let mut coordinator = logged("fix", "no_fix").build(&table(&recorder)).unwrap();
     coordinator.step(ms(1));
     coordinator.step(ms(2));
-    let ended: Vec<_> = coordinator.ended().collect();
+    let ended: Vec<_> = crate::tests::utils::ended(&coordinator);
     assert_eq!(ended, [("fix", &EndReason::Failed("no fix".into()))]);
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(
+        crate::tests::utils::ended_with(&coordinator, &EndReason::Panicked).len(),
+        0
+    );
 
     let lines = recorder.take_logs();
     assert_eq!(lines.len(), 2);
@@ -302,9 +305,9 @@ fn test_abort_ends_the_sequence() {
     };
     let mut coordinator = config.build(&table(&recorder)).unwrap();
     coordinator.step(ms(1));
-    assert_eq!(coordinator.ended().count(), 0);
+    assert_eq!(crate::tests::utils::ended(&coordinator).len(), 0);
     coordinator.step(ms(2));
-    let ended: Vec<_> = coordinator.ended().collect();
+    let ended: Vec<_> = crate::tests::utils::ended(&coordinator);
     assert_eq!(ended, [("wait", &EndReason::Aborted)]);
 }
 
@@ -313,9 +316,15 @@ fn test_panic_unwinds_to_the_coordinator() {
     let recorder = Recorder::default();
     let mut coordinator = logged("doom", "doomed").build(&table(&recorder)).unwrap();
     coordinator.step(ms(1));
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(
+        crate::tests::utils::ended_with(&coordinator, &EndReason::Panicked).len(),
+        0
+    );
     coordinator.step(ms(2));
-    assert_eq!(coordinator.latched().collect::<Vec<_>>(), ["doom"]);
+    assert_eq!(
+        crate::tests::utils::ended_with(&coordinator, &EndReason::Panicked),
+        ["doom"]
+    );
     let lines = recorder.take_logs();
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].message, "doomed on its second poll");
@@ -554,7 +563,7 @@ fn test_abort_cancels_a_cycle_loop() {
     assert!(trace.take().is_empty());
     coordinator.step(ms(2));
     assert_eq!(trace.take(), ["closed"]);
-    let ended: Vec<_> = coordinator.ended().collect();
+    let ended: Vec<_> = crate::tests::utils::ended(&coordinator);
     assert_eq!(ended, [("t", &EndReason::Aborted)]);
 }
 
@@ -565,7 +574,7 @@ fn test_explicit_abort_after_timeout() {
     assert!(trace.take().is_empty());
     coordinator.step(ms(2));
     assert_eq!(trace.take(), ["vented", "closed"]);
-    let ended: Vec<_> = coordinator.ended().collect();
+    let ended: Vec<_> = crate::tests::utils::ended(&coordinator);
     assert_eq!(ended, [("t", &EndReason::Aborted)]);
     assert!(recorder.take_logs().is_empty());
 }
@@ -577,7 +586,7 @@ fn test_raised_flag_is_never_lowered() {
     assert!(trace.take().is_empty());
     coordinator.step(ms(2));
     assert_eq!(trace.take(), ["closed"]);
-    let ended: Vec<_> = coordinator.ended().collect();
+    let ended: Vec<_> = crate::tests::utils::ended(&coordinator);
     assert_eq!(ended, [("t", &EndReason::Aborted)]);
 }
 
@@ -597,7 +606,10 @@ fn test_panic_runs_handlers() {
     coordinator.step(ms(1));
     coordinator.step(ms(2));
     assert_eq!(trace.take(), ["closed"]);
-    assert_eq!(coordinator.latched().collect::<Vec<_>>(), ["t"]);
+    assert_eq!(
+        crate::tests::utils::ended_with(&coordinator, &EndReason::Panicked),
+        ["t"]
+    );
     let lines = recorder.take_logs();
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].message, "doomed with a valve open");
@@ -610,7 +622,7 @@ fn test_completion_runs_no_handlers() {
     coordinator.step(ms(1));
     coordinator.step(ms(2));
     assert!(trace.take().is_empty());
-    let ended: Vec<_> = coordinator.ended().collect();
+    let ended: Vec<_> = crate::tests::utils::ended(&coordinator);
     assert_eq!(ended, [("t", &EndReason::Completed)]);
 }
 
@@ -789,7 +801,7 @@ fn test_redline_is_checked_before_the_next_poll() {
     assert_eq!(trace.take(), ["linked"]);
     coordinator.step(ms(2));
     assert_eq!(trace.take(), ["closed"]);
-    let ended: Vec<_> = coordinator.ended().collect();
+    let ended: Vec<_> = crate::tests::utils::ended(&coordinator);
     assert_eq!(ended, [("t", &EndReason::Aborted)]);
     assert_eq!(recorder.take_logs()[0].message, "at once");
 }
@@ -808,7 +820,10 @@ fn test_panicking_condition_runs_handlers() {
     coordinator.step(ms(1));
     coordinator.step(ms(2));
     assert_eq!(trace.take(), ["closed"]);
-    assert_eq!(coordinator.latched().collect::<Vec<_>>(), ["t"]);
+    assert_eq!(
+        crate::tests::utils::ended_with(&coordinator, &EndReason::Panicked),
+        ["t"]
+    );
     let lines = recorder.take_logs();
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].message, "sensor wire cut");

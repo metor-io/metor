@@ -342,7 +342,10 @@ fn test_inner_panic_keeps_channel() {
     coordinator.step(Timestamp(1));
     coordinator.step(Timestamp(2));
     coordinator.step(Timestamp(3));
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(
+        crate::tests::utils::ended_with(&coordinator, &EndReason::Panicked).len(),
+        0
+    );
     let panicked = SequenceEventKind::Failed {
         reason: "panicked".into(),
     };

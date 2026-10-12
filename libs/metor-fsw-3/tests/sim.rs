@@ -200,7 +200,10 @@ fn reset_cancels_a_read_parked_on_the_wire() {
     let after = states.iter().find(|(t, _)| *t > waited[0]).unwrap();
     let stopped = (waited[0] + 1, ChannelState::Stopped as u32);
     assert_eq!(*after, stopped, "remade the cycle after: {states:?}");
-    assert_eq!(c.latched().count(), 0);
+    assert!(
+        c.systems()
+            .all(|(_, end)| end != Some(&EndReason::Panicked))
+    );
 }
 
 #[test]
