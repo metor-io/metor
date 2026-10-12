@@ -119,7 +119,7 @@ pub use coordinator::Coordinator;
 pub use coordinator::{
     Adapter, BuildError, Clock, CoordinatorConfig, EndReason, InputConfig, LoadError, Occupant,
     OutputConfig, OutputSource, ParamError, Params, PortRef, Step, SystemConfig, SystemKind,
-    SystemStatus, SystemTable,
+    SystemStatus, SystemTable, WallRate,
 };
 pub use def::{DefCx, DefError, Records};
 pub use fn_system::{
