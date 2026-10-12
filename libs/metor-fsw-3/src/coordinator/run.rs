@@ -45,18 +45,12 @@ impl Coordinator {
         self.rings.len()
     }
 
-    /// Returns each system that has ended, with its end reason, in step order.
-    pub fn ended(&self) -> impl Iterator<Item = (&str, &EndReason)> {
+    /// Returns each system's id and why it ended, or `None` while it runs, in
+    /// step order.
+    pub fn systems(&self) -> impl Iterator<Item = (&str, Option<&EndReason>)> {
         self.entries
             .iter()
-            .filter_map(|entry| Some((entry.name.as_str(), entry.end_reason()?)))
-    }
-
-    /// Returns the ids of systems stopped by a panic, in step order.
-    pub fn latched(&self) -> impl Iterator<Item = &str> {
-        self.ended()
-            .filter(|(_, end)| **end == EndReason::Panicked)
-            .map(|(id, _)| id)
+            .map(|entry| (entry.name.as_str(), entry.end_reason()))
     }
 
     /// Returns the number of cycles completed so far.
@@ -156,7 +150,7 @@ mod tests {
     use crate::coordinator::CoordinatorConfig;
     use crate::coordinator::config::{InputConfig, PortRef, SystemConfig};
     use crate::coordinator::tests::Twice;
-    use crate::tests::utils::{self, Recorder, pipeline_config, table};
+    use crate::tests::utils::{self, Recorder, ended_with, pipeline_config, table};
 
     fn watched(config: &mut CoordinatorConfig, from: &[&str]) {
         config.systems.push(SystemConfig {
@@ -324,11 +318,11 @@ mod tests {
         let recorder = Recorder::default();
         let mut coordinator = boom_config().build(&table(&recorder)).unwrap();
         coordinator.step(Timestamp(1));
-        assert_eq!(coordinator.latched().count(), 0);
+        assert_eq!(ended_with(&coordinator, &EndReason::Panicked).len(), 0);
         assert!(recorder.take_logs().is_empty());
 
         coordinator.step(Timestamp(2));
-        assert_eq!(coordinator.latched().collect::<Vec<_>>(), vec!["boom"]);
+        assert_eq!(ended_with(&coordinator, &EndReason::Panicked), vec!["boom"]);
         // `nav` and `control` still ran on the cycle `boom` failed.
         assert_eq!(
             recorder.take(),
@@ -376,7 +370,7 @@ mod tests {
         let mut coordinator = config.build(&table(&recorder)).unwrap();
         coordinator.step(Timestamp(1));
         coordinator.step(Timestamp(2));
-        assert_eq!(coordinator.latched().collect::<Vec<_>>(), vec!["trap"]);
+        assert_eq!(ended_with(&coordinator, &EndReason::Panicked), vec!["trap"]);
         assert!(recorder.take_logs().is_empty());
         assert_eq!(recorder.take_status().len(), 2);
     }
