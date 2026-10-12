@@ -4,12 +4,13 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use futures_lite::FutureExt;
-use stellarator::sync::WaitQueue;
+use thingbuf::mpsc::{Receiver, Sender, with_recycle};
+use thingbuf::recycling::Recycle;
 
 use crate::async_system::{Stop, StopHandle, stop_pair};
 use crate::coordinator::ParamError;
@@ -64,22 +65,24 @@ struct Job {
     report: SyncSender<Option<ParamError>>,
 }
 
-/// The queue of jobs waiting for the group's thread to build them.
-struct Inbox {
-    jobs: Mutex<Vec<Job>>,
-    woken: WaitQueue,
-}
+/// How many jobs the inbox holds. `add` waits for each job's report, so a
+/// caller has at most one in flight.
+const INBOX_CAPACITY: usize = 4;
 
-impl Inbox {
-    /// Takes every waiting job.
-    fn take(&self) -> Vec<Job> {
-        // PANIC Safety: no code panics while holding this lock.
-        core::mem::take(&mut *self.jobs.lock().expect("an unpoisoned inbox"))
+/// One inbox slot. The `Mutex` makes it `Sync`, which the queue needs; it is
+/// never locked, since a job is only moved in and out.
+type InboxSlot = Option<Mutex<Job>>;
+
+/// Leaves an inbox slot empty once its job is taken.
+struct EmptySlot;
+
+impl Recycle<InboxSlot> for EmptySlot {
+    fn new_element(&self) -> InboxSlot {
+        None
     }
 
-    fn is_empty(&self) -> bool {
-        // PANIC Safety: as above.
-        self.jobs.lock().expect("an unpoisoned inbox").is_empty()
+    fn recycle(&self, job: &mut InboxSlot) {
+        *job = None;
     }
 }
 
@@ -87,7 +90,7 @@ impl Inbox {
 pub(crate) struct GroupHandle {
     name: String,
     stop: StopHandle,
-    inbox: Arc<Inbox>,
+    inbox: Sender<InboxSlot, EmptySlot>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -95,19 +98,13 @@ pub(crate) struct GroupHandle {
 /// [`GroupHandle::add`].
 pub(crate) fn spawn(name: &str) -> Result<Arc<GroupHandle>, ParamError> {
     let (handle, stop) = stop_pair();
-    let inbox = Arc::new(Inbox {
-        jobs: Mutex::new(Vec::new()),
-        woken: WaitQueue::new(),
-    });
-    let thread = {
-        let inbox = inbox.clone();
-        std::thread::Builder::new()
-            .name(format!("fsw-{name}"))
-            .spawn(move || stellarator::run(move || run(inbox, stop)))
-            .map_err(|_| ParamError::ThreadStart {
-                thread: name.to_string(),
-            })?
-    };
+    let (inbox, jobs) = with_recycle(INBOX_CAPACITY, EmptySlot);
+    let thread = std::thread::Builder::new()
+        .name(format!("fsw-{name}"))
+        .spawn(move || stellarator::run(move || run(jobs, stop)))
+        .map_err(|_| ParamError::ThreadStart {
+            thread: name.to_string(),
+        })?;
     Ok(Arc::new(GroupHandle {
         name: name.to_string(),
         stop: handle,
@@ -121,48 +118,48 @@ impl GroupHandle {
     /// with the error that stopped it from building.
     pub(crate) fn add(&self, member: Member) -> Result<(), ParamError> {
         let (report, built) = sync_channel(1);
-        // PANIC Safety: no code panics while holding this lock.
-        self.inbox
-            .jobs
-            .lock()
-            .expect("an unpoisoned inbox")
-            .push(Job { member, report });
-        self.inbox.woken.wake_all();
+        let queued = self
+            .inbox
+            .try_send(Some(Mutex::new(Job { member, report })));
+        let thread = || ParamError::ThreadStart {
+            thread: self.name.clone(),
+        };
+        queued.map_err(|_| thread())?;
         match built.recv() {
             Ok(None) => Ok(()),
             Ok(Some(source)) => Err(source),
-            Err(_) => Err(ParamError::ThreadStart {
-                thread: self.name.clone(),
-            }),
+            Err(_) => Err(thread()),
         }
     }
 }
 
 /// The group thread's main loop. Builds and runs each member it is handed,
 /// until `stop` is set.
-async fn run(inbox: Arc<Inbox>, stop: Stop) {
+async fn run(jobs: Receiver<InboxSlot, EmptySlot>, stop: Stop) {
     let mut tasks = Vec::new();
-    while !stop.is_set() {
-        for Job { member, report } in inbox.take() {
-            let Member { launch, panicked } = member;
-            match build(launch, stop.clone()) {
-                Ok(running) => {
-                    tasks.push(stellarator::spawn(task(running, panicked)));
-                    let _ = report.send(None);
-                }
-                Err(source) => {
-                    let _ = report.send(Some(source));
-                }
+    while let Some(job) = stopped(&stop).or(jobs.recv()).await {
+        let Some(job) = job else { continue };
+        let Job { member, report } = job.into_inner().unwrap_or_else(PoisonError::into_inner);
+        let Member { launch, panicked } = member;
+        match build(launch, stop.clone()) {
+            Ok(running) => {
+                tasks.push(stellarator::spawn(task(running, panicked)));
+                let _ = report.send(None);
+            }
+            Err(source) => {
+                let _ = report.send(Some(source));
             }
         }
-        let _ = inbox
-            .woken
-            .wait_for(|| stop.is_set() || !inbox.is_empty())
-            .await;
     }
     for task in tasks {
         let _ = task.await;
     }
+}
+
+/// Resolves to `None` once `stop` is set.
+async fn stopped(stop: &Stop) -> Option<InboxSlot> {
+    stop.wait().await;
+    None
 }
 
 /// Builds one system.
@@ -196,7 +193,6 @@ impl Drop for GroupHandle {
     /// [`JOIN_TIMEOUT`], it is detached instead.
     fn drop(&mut self) {
         self.stop.stop();
-        self.inbox.woken.wake_all();
         let deadline = Instant::now() + JOIN_TIMEOUT;
         while self
             .thread

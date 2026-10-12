@@ -27,6 +27,7 @@ zerocopy = { version = "0.8.2", features = ["derive"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 stellarator = { path = "../stellarator", optional = true }
+thingbuf = { version = "0.1.6", optional = true }
 
 [features]
 default = ["host"]
@@ -34,7 +35,7 @@ host = [
     "threads",
 ]
 
-threads = ["dep:stellarator"]
+threads = ["dep:stellarator", "dep:thingbuf"]
 
 [dev-dependencies]
 trybuild = "1"
