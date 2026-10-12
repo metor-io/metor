@@ -354,7 +354,7 @@ mod gps_on_a_pty {
                     ..SystemConfig::new("io_submit", IO_TYPE)
                 },
                 SystemConfig {
-                    outputs: vec![OutputConfig::record("gps", "io_cqe")],
+                    outputs: vec![OutputConfig::with_record("gps", "io_cqe")],
                     params: serde_json::json!({ "status": true }),
                     ..SystemConfig::new("io_complete", IO_TYPE)
                 },
