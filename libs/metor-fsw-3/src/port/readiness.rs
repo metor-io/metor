@@ -14,24 +14,26 @@ use metor_fsw_3_ring::{Notifier, View, WakeSink};
 use super::{DynInputs, Input};
 use crate::record::Record;
 
+/// One wait slot per producer, each beside the [`Notifier`] that re-arms it.
 pub(super) struct Waiters {
-    slots: Vec<Pin<Box<Option<WaitOwned>>>>,
+    slots: Vec<(Notifier, Pin<Box<Option<WaitOwned>>>)>,
 }
 
 impl Waiters {
+    /// Clones each view's notifier. Views that wait on no notifier get no slot.
     pub(super) fn new<W: WakeSink>(views: &[View<W>]) -> Self {
         let slots = views
             .iter()
-            .filter_map(|view| view.wake().wait_owned())
-            .map(|wait| Box::pin(Some(wait)))
+            .filter_map(|view| view.wake().notifier())
+            .map(|notifier| (notifier.clone(), Box::pin(Some(notifier.wait_owned()))))
             .collect();
         Self { slots }
     }
 
-    fn poll<'a>(&mut self, wakes: impl Iterator<Item = &'a Notifier>, cx: &mut Context<'_>) {
-        for (slot, wake) in self.slots.iter_mut().zip(wakes) {
+    fn poll(&mut self, cx: &mut Context<'_>) {
+        for (notifier, slot) in &mut self.slots {
             if slot.is_none() {
-                slot.as_mut().set(Some(wake.wait_owned()));
+                slot.as_mut().set(Some(notifier.wait_owned()));
             }
             if let Some(wait) = slot.as_mut().as_pin_mut()
                 && wait.poll(cx).is_ready()
@@ -44,7 +46,7 @@ impl Waiters {
     }
 
     fn clear(&mut self) {
-        for slot in &mut self.slots {
+        for (_, slot) in &mut self.slots {
             slot.as_mut().set(None);
         }
     }
@@ -77,7 +79,7 @@ impl<T: Record + ?Sized> Readiness for Input<T, Notifier> {
         if let Some(at) = self.ready() {
             return Poll::Ready(at);
         }
-        self.waiters.poll(self.views.iter().map(View::wake), cx);
+        self.waiters.poll(cx);
         // Writers may publish while notification waits are being armed.
         self.ready().map_or(Poll::Pending, Poll::Ready)
     }
