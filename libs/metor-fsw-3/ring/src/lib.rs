@@ -225,11 +225,9 @@ pub trait WakeSource {
 pub trait WakeSink {
     async fn wait_until<F: FnMut() -> bool>(&self, ready: F);
 
-    /// Returns a wait future that does not borrow this sink.
-    ///
-    /// Returns `None` if the sink does not support one.
+    /// Returns the [`Notifier`] behind this sink, if it is one.
     #[cfg(feature = "notify")]
-    fn wait_owned(&self) -> Option<maitake_sync::wait_queue::WaitOwned> {
+    fn notifier(&self) -> Option<&Notifier> {
         None
     }
 }
@@ -290,8 +288,8 @@ impl WakeSink for Notifier {
         let _ = self.0.wait_for(ready).await;
     }
 
-    fn wait_owned(&self) -> Option<maitake_sync::wait_queue::WaitOwned> {
-        Some(Notifier::wait_owned(self))
+    fn notifier(&self) -> Option<&Notifier> {
+        Some(self)
     }
 }
 

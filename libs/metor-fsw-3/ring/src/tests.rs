@@ -786,7 +786,10 @@ fn test_region_size_rejects_overflow() {
             max_readers,
         };
         assert_eq!(checked_region_len(&cfg), None);
-        assert!(matches!(RingBuffer::create_in_memory(cfg), Err(InvalidConfig)));
+        assert!(matches!(
+            RingBuffer::create_in_memory(cfg),
+            Err(InvalidConfig)
+        ));
     }
     let cfg = Config {
         capacity: 64,
