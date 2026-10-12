@@ -43,27 +43,27 @@ struct PlannedSystem<'a> {
     params: Params<'a>,
     /// The adapter this system runs behind, if the config gives one.
     adapter: Option<&'a Adapter>,
-    base_ring_idx: RingIndex,
+    /// The ring of each output port, in definition order.
+    outputs: Vec<RingIndex>,
+    status: RingIndex,
     inputs: Vec<Vec<RingIndex>>,
 }
 
 struct Plan<'a> {
+    /// Each system id's position in the config.
+    index: HashMap<&'a str, usize>,
     systems: Vec<PlannedSystem<'a>>,
     rings: Vec<RingSpec>,
 }
 
 impl PlannedSystem<'_> {
-    fn status_ring(&self) -> RingIndex {
-        self.base_ring_idx + self.def.outputs.len()
-    }
-
     /// Returns the ring index for a given output port, or `None` if the port is not declared.
     fn output_ring(&self, port: &str) -> Option<RingIndex> {
         if port == STATUS_PORT {
-            return Some(self.status_ring());
+            return Some(self.status);
         }
-        let index = self.def.outputs.iter().position(|p| p.name == port)?;
-        Some(self.base_ring_idx + index)
+        let at = self.def.outputs.iter().position(|p| p.name == port)?;
+        Some(self.outputs[at])
     }
 }
 
@@ -83,9 +83,9 @@ impl CoordinatorConfig {
         if options.deterministic {
             self.clock.check_deterministic()?;
         }
-        let mut plan = resolve(&self, table)?;
+        let mut plan = Plan::resolve(&self, table)?;
         check_ids(&plan)?;
-        count_readers(&plan.systems, &mut plan.rings);
+        plan.set_reader_counts();
         let rings = plan
             .rings
             .iter()
@@ -93,13 +93,13 @@ impl CoordinatorConfig {
             .collect::<Result<Vec<_>, _>>()?;
         let mut threads = match options.deterministic {
             true => Threads::deterministic(),
-            false => Threads::new(),
+            false => Threads::default(),
         };
-        let target = Target {
+        let args = SharedMakeArgs {
             seed: Some(self.seed),
             namespace: self.namespace.as_deref().unwrap_or_default(),
         };
-        let entries = bind_rings(&plan, &rings, &mut threads, target)?;
+        let entries = make_systems(&plan, &rings, &mut threads, args)?;
 
         Ok(Coordinator {
             entries,
@@ -111,55 +111,128 @@ impl CoordinatorConfig {
     }
 }
 
-fn resolve<'a>(
-    config: &'a CoordinatorConfig,
-    table: &'a SystemTable,
-) -> Result<Plan<'a>, BuildError> {
-    let index = index(config)?;
-    let records = table.records();
-    let mut plan = Plan {
-        systems: Vec::with_capacity(config.systems.len()),
-        rings: vec![],
-    };
-
-    for system in &config.systems {
-        let entry = table
-            .get(&system.ty)
-            .ok_or_else(|| BuildError::UnknownType {
-                id: system.id.clone(),
-                ty: system.ty.clone(),
-            })?;
-
+impl<'a> Plan<'a> {
+    /// Resolves every system's definition, its rings, and its input edges.
+    fn resolve(config: &'a CoordinatorConfig, table: &'a SystemTable) -> Result<Self, BuildError> {
+        let mut plan = Self {
+            index: index_by_id(config)?,
+            systems: Vec::with_capacity(config.systems.len()),
+            rings: Vec::new(),
+        };
+        let records = table.records();
         let namespace = config.namespace.as_deref();
-        let def = planned_def(system, entry, &plan, &index, &records, namespace)?;
-        check_port_names(&system.id, &def)?;
-        if def.outputs.iter().any(|p| p.name == STATUS_PORT) {
-            return Err(BuildError::ReservedPort {
-                ty: system.ty.clone(),
-            });
+        for system in &config.systems {
+            let entry = table
+                .get(&system.ty)
+                .ok_or_else(|| BuildError::UnknownType {
+                    id: system.id.clone(),
+                    ty: system.ty.clone(),
+                })?;
+            let def = SystemDef::planned(system, entry, &plan, &records, namespace)?;
+            plan.push(system, entry, def, namespace);
         }
-        check_alignment(&system.id, &def)?;
-        check_outputs(system, &def)?;
-        let base_ring_idx = plan.rings.len();
-        let status = status_def(&system.id, namespace);
-        plan.rings
-            .extend(def.outputs.iter().chain([&status]).map(|port| RingSpec {
-                system: system.id.clone(),
-                port: port.clone(),
-                readers: 0,
-            }));
-        plan.systems.push(PlannedSystem {
+        plan.resolve_edges(config)?;
+        Ok(plan)
+    }
+
+    /// Adds `system`, with one ring per output and one for its status.
+    fn push(
+        &mut self,
+        system: &'a SystemConfig,
+        entry: &'a TableEntry,
+        def: SystemDef,
+        namespace: Option<&str>,
+    ) {
+        let outputs = def
+            .outputs
+            .iter()
+            .map(|port| self.add_ring(&system.id, port.clone()))
+            .collect();
+        let status = self.add_ring(&system.id, status_def(&system.id, namespace));
+        self.systems.push(PlannedSystem {
             id: &system.id,
             entry,
             inputs: vec![Vec::new(); def.inputs.len()],
             def,
             params: Params(&system.params),
             adapter: system.adapter.as_ref(),
-            base_ring_idx,
+            outputs,
+            status,
         });
     }
-    resolve_edges(config, &mut plan, &index)?;
-    Ok(plan)
+
+    fn add_ring(&mut self, system: &str, port: PortDef) -> RingIndex {
+        self.rings.push(RingSpec {
+            system: system.to_string(),
+            port,
+            readers: 0,
+        });
+        self.rings.len() - 1
+    }
+
+    /// Returns the ring that input `port` of system `id` reads through `from`.
+    ///
+    /// Returns `None` if the producing system has not been planned yet.
+    fn producer_ring(
+        &self,
+        id: &str,
+        port: &str,
+        from: &PortRef,
+    ) -> Result<Option<RingIndex>, BuildError> {
+        let Some(&at) = self.index.get(from.system.as_str()) else {
+            return Err(BuildError::UnknownSystem {
+                id: id.to_string(),
+                port: port.to_string(),
+                from: from.system.clone(),
+            });
+        };
+        let Some(producer) = self.systems.get(at) else {
+            return Ok(None);
+        };
+        let ring = producer.output_ring(&from.port);
+        ring.map(Some).ok_or_else(|| BuildError::UnknownOutput {
+            system: from.system.clone(),
+            port: from.port.clone(),
+        })
+    }
+
+    /// Records the ring behind every input edge in `config`.
+    fn resolve_edges(&mut self, config: &CoordinatorConfig) -> Result<(), BuildError> {
+        for (i, system) in config.systems.iter().enumerate() {
+            for input in &system.inputs {
+                let Some(port) = self.systems[i]
+                    .def
+                    .inputs
+                    .iter()
+                    .position(|p| p.name == input.port)
+                else {
+                    return Err(BuildError::UnknownInput {
+                        system: system.id.clone(),
+                        port: input.port.clone(),
+                    });
+                };
+                for from in &input.from {
+                    if let Some(ring) = self.producer_ring(&system.id, &input.port, from)? {
+                        self.systems[i].inputs[port].push(ring);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sets each ring's reader count to the number of edges into it.
+    ///
+    /// A ring with no edges still gets one slot, because the ring format requires
+    /// at least one.
+    fn set_reader_counts(&mut self) {
+        for edge in self.systems.iter().flat_map(|s| s.inputs.iter().flatten()) {
+            self.rings[*edge].readers += 1;
+        }
+        for ring in &mut self.rings {
+            ring.readers = ring.readers.max(1);
+        }
+    }
 }
 
 /// Returns the definition of system `id`'s `status` output.
@@ -176,7 +249,7 @@ pub(crate) fn status_def(id: &str, namespace: Option<&str>) -> PortDef {
 }
 
 /// Maps each system id to its position in the config, rejecting duplicate ids.
-fn index(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, BuildError> {
+fn index_by_id(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, BuildError> {
     let mut index = HashMap::with_capacity(config.systems.len());
     for (at, system) in config.systems.iter().enumerate() {
         if index.insert(system.id.as_str(), at).is_some() {
@@ -188,172 +261,125 @@ fn index(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, BuildError>
     Ok(index)
 }
 
-/// Computes the definition for `system` during the first build pass.
-///
-/// Only producers planned earlier in the pass are known.
-fn planned_def(
-    system: &SystemConfig,
-    entry: &TableEntry,
-    plan: &Plan<'_>,
-    index: &HashMap<&str, usize>,
-    records: &Records,
-    namespace: Option<&str>,
-) -> Result<SystemDef, BuildError> {
-    instance_def(system, entry, namespace, records, |port, from| {
-        let ring = producer_ring(plan, index, &system.id, port, from)?;
-        Ok(ring.map(|ring| plan.rings[ring].port.clone()))
-    })
-}
+impl SystemDef {
+    /// Computes and checks the definition for `system` during the first build
+    /// pass.
+    ///
+    /// Only producers planned earlier in the pass are known.
+    fn planned(
+        system: &SystemConfig,
+        entry: &TableEntry,
+        plan: &Plan<'_>,
+        records: &Records,
+        namespace: Option<&str>,
+    ) -> Result<Self, BuildError> {
+        let def = Self::instance(system, entry, namespace, records, |port, from| {
+            let ring = plan.producer_ring(&system.id, port, from)?;
+            Ok(ring.map(|ring| plan.rings[ring].port.clone()))
+        })?;
+        def.check_port_names(system)?;
+        def.check_alignment(&system.id)?;
+        def.check_outputs(system)?;
+        Ok(def)
+    }
 
-/// Computes the definition that `entry`'s type produces for `system`.
-///
-/// `producer` looks up the output definition behind each input edge. It returns
-/// `None` when that producer is not resolved yet. That is only allowed for input
-/// ports the type declares statically, because their definition does not depend
-/// on the producer.
-pub(crate) fn instance_def(
-    system: &SystemConfig,
-    entry: &TableEntry,
-    namespace: Option<&str>,
-    records: &Records,
-    producer: impl Fn(&str, &PortRef) -> Result<Option<PortDef>, BuildError>,
-) -> Result<SystemDef, BuildError> {
-    let mut edges: Vec<(&str, PortDef)> = Vec::new();
-    for input in &system.inputs {
-        for from in &input.from {
-            match producer(&input.port, from)? {
-                Some(def) => edges.push((input.port.as_str(), def)),
-                None if entry.def.inputs.iter().any(|p| p.name == input.port) => {}
-                None => {
-                    return Err(BuildError::DynamicFromLater {
-                        system: system.id.clone(),
-                        port: input.port.clone(),
-                    });
+    /// Computes the definition that `entry`'s type produces for `system`.
+    ///
+    /// `producer` looks up the output definition behind each input edge. It
+    /// returns `None` when that producer is not resolved yet. That is only
+    /// allowed for input ports the type declares statically, because their
+    /// definition does not depend on the producer.
+    pub(crate) fn instance(
+        system: &SystemConfig,
+        entry: &TableEntry,
+        namespace: Option<&str>,
+        records: &Records,
+        producer: impl Fn(&str, &PortRef) -> Result<Option<PortDef>, BuildError>,
+    ) -> Result<Self, BuildError> {
+        let mut edges: Vec<(&str, PortDef)> = Vec::new();
+        for input in &system.inputs {
+            for from in &input.from {
+                match producer(&input.port, from)? {
+                    Some(def) => edges.push((input.port.as_str(), def)),
+                    None if entry.def.inputs.iter().any(|p| p.name == input.port) => {}
+                    None => {
+                        return Err(BuildError::DynamicFromLater {
+                            system: system.id.clone(),
+                            port: input.port.clone(),
+                        });
+                    }
                 }
             }
         }
+        let inputs: Vec<(&str, &PortDef)> = edges.iter().map(|(port, def)| (*port, def)).collect();
+        let cx = DefCx {
+            id: &system.id,
+            namespace,
+            inputs: &inputs,
+            outputs: &system.outputs,
+            records,
+            params: &system.params,
+        };
+        (entry.def_fn)(&cx).map_err(|source| BuildError::Def {
+            id: system.id.clone(),
+            source,
+        })
     }
-    let inputs: Vec<(&str, &PortDef)> = edges.iter().map(|(port, def)| (*port, def)).collect();
-    let cx = DefCx {
-        id: &system.id,
-        namespace,
-        inputs: &inputs,
-        outputs: &system.outputs,
-        records,
-        params: &system.params,
-    };
-    (entry.def_fn)(&cx).map_err(|source| BuildError::Def {
-        id: system.id.clone(),
-        source,
-    })
-}
 
-/// Returns the ring that input `port` of system `id` reads through `from`.
-///
-/// Returns `None` if the producing system has not been planned yet.
-fn producer_ring(
-    plan: &Plan<'_>,
-    index: &HashMap<&str, usize>,
-    id: &str,
-    port: &str,
-    from: &PortRef,
-) -> Result<Option<RingIndex>, BuildError> {
-    let Some(&at) = index.get(from.system.as_str()) else {
-        return Err(BuildError::UnknownSystem {
-            id: id.to_string(),
-            port: port.to_string(),
-            from: from.system.clone(),
-        });
-    };
-    let Some(producer) = plan.systems.get(at) else {
-        return Ok(None);
-    };
-    let ring = producer.output_ring(&from.port);
-    ring.map(Some).ok_or_else(|| BuildError::UnknownOutput {
-        system: from.system.clone(),
-        port: from.port.clone(),
-    })
-}
+    /// Checks that no two inputs and no two outputs share a name, and that no
+    /// output takes the coordinator's `status` name.
+    fn check_port_names(&self, system: &SystemConfig) -> Result<(), BuildError> {
+        let port = |port: &PortDef| (system.id.clone(), port.name.to_string());
+        if let Some((system, port)) = find_duplicate(&self.inputs).map(port) {
+            return Err(BuildError::DuplicateInput { system, port });
+        }
+        if let Some((system, port)) = find_duplicate(&self.outputs).map(port) {
+            return Err(BuildError::DuplicateOutput { system, port });
+        }
+        if self.outputs.iter().any(|p| p.name == STATUS_PORT) {
+            return Err(BuildError::ReservedPort {
+                ty: system.ty.clone(),
+            });
+        }
+        Ok(())
+    }
 
-fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildError> {
-    let port = |port: &PortDef| (system.to_string(), port.name.to_string());
-    if let Some((system, port)) = duplicate(&def.inputs).map(port) {
-        return Err(BuildError::DuplicateInput { system, port });
+    /// Checks that no port needs more alignment than ring payloads get.
+    fn check_alignment(&self, system: &str) -> Result<(), BuildError> {
+        for port in self.inputs.iter().chain(&self.outputs) {
+            if port.alignment > metor_fsw_3_ring::PAYLOAD_ALIGNMENT {
+                return Err(BuildError::UnsupportedFrameAlignment {
+                    system: system.to_string(),
+                    port: port.name.to_string(),
+                    alignment: port.alignment,
+                });
+            }
+        }
+        Ok(())
     }
-    if let Some((system, port)) = duplicate(&def.outputs).map(port) {
-        return Err(BuildError::DuplicateOutput { system, port });
+
+    /// Checks that every output listed in the config is an output the type
+    /// defines.
+    fn check_outputs(&self, system: &SystemConfig) -> Result<(), BuildError> {
+        for output in &system.outputs {
+            if !self.outputs.iter().any(|port| port.name == output.port) {
+                return Err(BuildError::UnknownOutput {
+                    system: system.id.clone(),
+                    port: output.port.clone(),
+                });
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Returns the first port whose name repeats an earlier port's name.
-fn duplicate(ports: &[PortDef]) -> Option<&PortDef> {
+fn find_duplicate(ports: &[PortDef]) -> Option<&PortDef> {
     ports
         .iter()
         .enumerate()
         .find(|(at, port)| ports[..*at].iter().any(|other| other.name == port.name))
         .map(|(_, port)| port)
-}
-
-/// Checks that every output listed in the config is an output the type defines.
-fn check_outputs(system: &SystemConfig, def: &SystemDef) -> Result<(), BuildError> {
-    for output in &system.outputs {
-        if !def.outputs.iter().any(|port| port.name == output.port) {
-            return Err(BuildError::UnknownOutput {
-                system: system.id.clone(),
-                port: output.port.clone(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn check_alignment(system: &str, def: &crate::SystemDef) -> Result<(), BuildError> {
-    for port in def.inputs.iter().chain(&def.outputs) {
-        if port.alignment > metor_fsw_3_ring::PAYLOAD_ALIGNMENT {
-            return Err(BuildError::UnsupportedFrameAlignment {
-                system: system.to_string(),
-                port: port.name.to_string(),
-                alignment: port.alignment,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn resolve_edges(
-    config: &CoordinatorConfig,
-    plan: &mut Plan<'_>,
-    index: &HashMap<&str, usize>,
-) -> Result<(), BuildError> {
-    for (i, system) in config.systems.iter().enumerate() {
-        for input in &system.inputs {
-            let port = plan.systems[i]
-                .def
-                .inputs
-                .iter()
-                .position(|p| p.name == input.port);
-            if input.from.is_empty() && port.is_none() {
-                return Err(BuildError::UnknownInput {
-                    system: system.id.clone(),
-                    port: input.port.clone(),
-                });
-            }
-            for from in &input.from {
-                let Some(ring) = producer_ring(plan, index, &system.id, &input.port, from)? else {
-                    continue;
-                };
-                let Some(port) = port else {
-                    return Err(BuildError::UnknownInput {
-                        system: system.id.clone(),
-                        port: input.port.clone(),
-                    });
-                };
-                plan.systems[i].inputs[port].push(ring);
-            }
-        }
-    }
-    Ok(())
 }
 
 fn check_ids(plan: &Plan<'_>) -> Result<(), BuildError> {
@@ -375,19 +401,6 @@ fn check_ids(plan: &Plan<'_>) -> Result<(), BuildError> {
         }
     }
     Ok(())
-}
-
-/// Counts one reader slot for each edge into a ring.
-///
-/// A ring with no edges still gets one slot, because the ring format requires
-/// at least one.
-fn count_readers(systems: &[PlannedSystem<'_>], rings: &mut [RingSpec]) {
-    for edge in systems.iter().flat_map(|s| s.inputs.iter().flatten()) {
-        rings[*edge].readers += 1;
-    }
-    for ring in rings.iter_mut() {
-        ring.readers = ring.readers.max(1);
-    }
 }
 
 /// Allocates a ring that holds `spec.port.depth * ring_depth` records.
@@ -414,29 +427,32 @@ fn allocate_ring(spec: &RingSpec, ring_depth: usize) -> Result<RingBuffer, Build
     Ok(RingBuffer::create_in_memory(config))
 }
 
-/// What every system of one target shares at make.
+/// The make arguments every system in the target shares.
 #[derive(Clone, Copy)]
-struct Target<'a> {
+struct SharedMakeArgs<'a> {
     seed: Option<u64>,
     namespace: &'a str,
 }
 
-fn bind_rings(
+/// Makes every planned system, bound to its rings.
+fn make_systems(
     plan: &Plan<'_>,
     rings: &[RingBuffer],
     threads: &mut Threads,
-    target: Target<'_>,
+    args: SharedMakeArgs<'_>,
 ) -> Result<Vec<Entry>, BuildError> {
     let mut entries = Vec::with_capacity(plan.systems.len());
     for system in &plan.systems {
-        let outputs: Vec<&RingBuffer> = (0..system.def.outputs.len())
-            .map(|i| &rings[system.base_ring_idx + i])
-            .collect();
+        let outputs: Vec<&RingBuffer> = system.outputs.iter().map(|&ring| &rings[ring]).collect();
         let inputs: Vec<Vec<&RingBuffer>> = system
             .inputs
             .iter()
             .map(|edges| edges.iter().map(|&ring| &rings[ring]).collect())
             .collect();
+        // PANIC Safety: build allocates one ring per output.
+        let status = rings[system.status]
+            .writer(NoWake)
+            .expect("one writer per output ring");
         let cx = MakeCx {
             id: system.id,
             adapter: system.adapter,
@@ -445,8 +461,8 @@ fn bind_rings(
             inputs,
             outputs,
             threads,
-            seed: target.seed,
-            namespace: target.namespace,
+            seed: args.seed,
+            namespace: args.namespace,
         };
         let step = (system.entry.make)(cx).map_err(|source| BuildError::Params {
             id: system.id.to_string(),
@@ -455,11 +471,7 @@ fn bind_rings(
         entries.push(Entry {
             name: system.id.to_string(),
             step: Some(step),
-            // PANIC Safety: build allocates one ring per output.
-            status: Output::new({
-                let ring: &RingBuffer = &rings[system.status_ring()];
-                ring.writer(NoWake).expect("one writer per output ring")
-            }),
+            status: Output::new(status),
         });
     }
     Ok(entries)
@@ -548,7 +560,7 @@ mod tests {
 
     fn emits(record: &str) -> SystemConfig {
         SystemConfig {
-            outputs: vec![OutputConfig::record("imu", record)],
+            outputs: vec![OutputConfig::with_record("imu", record)],
             ..SystemConfig::new("emit", "emit")
         }
     }
@@ -584,7 +596,7 @@ mod tests {
                 outputs: if input { Vec::new() } else { vec![port] },
             };
             assert_eq!(
-                check_alignment("test", &def),
+                def.check_alignment("test"),
                 Err(BuildError::UnsupportedFrameAlignment {
                     system: "test".into(),
                     port: "aligned".into(),
@@ -597,6 +609,7 @@ mod tests {
     #[test]
     fn test_reject_duplicate_port_names() {
         let port = Output::<utils::Imu>::def(&DefCx::empty(), "sample");
+        let instance = SystemConfig::new("instance", "test");
         for input in [true, false] {
             let def = crate::SystemDef {
                 name: "test".into(),
@@ -622,25 +635,24 @@ mod tests {
                     port: "sample".into(),
                 }
             };
-            assert_eq!(check_port_names("instance", &def), Err(expected));
+            assert_eq!(def.check_port_names(&instance), Err(expected));
         }
     }
 
     #[test]
     fn test_input_output_shared_name() {
         let port = Output::<utils::Imu>::def(&DefCx::empty(), "sample");
+        let instance = SystemConfig::new("instance", "test");
         let def = crate::SystemDef {
             name: "test".into(),
             inputs: vec![port.clone()],
             outputs: vec![port],
         };
-        assert_eq!(check_port_names("instance", &def), Ok(()));
+        assert_eq!(def.check_port_names(&instance), Ok(()));
         assert_eq!(
-            check_port_names(
-                "empty",
-                &crate::SystemDef::new::<(), (), NoWake>("empty", &crate::DefCx::empty())
-                    .expect("a static definition")
-            ),
+            crate::SystemDef::new::<(), (), NoWake>("empty", &crate::DefCx::empty())
+                .expect("a static definition")
+                .check_port_names(&SystemConfig::new("empty", "empty")),
             Ok(())
         );
     }
@@ -671,7 +683,7 @@ mod tests {
         config.systems[1].inputs[0].from = vec![PortRef::new("imu", "imu")];
         let coordinator = build(config).expect("valid config");
         // imu + nav outputs and logs, plus one status ring each.
-        assert_eq!(coordinator.rings(), 6);
+        assert_eq!(coordinator.ring_count(), 6);
     }
 
     #[test]
@@ -955,7 +967,7 @@ mod tests {
             ..Default::default()
         };
         let table = table(&recorder);
-        let plan = resolve(&config, &table).expect("valid config");
+        let plan = Plan::resolve(&config, &table).expect("valid config");
         let emitted = &plan.systems[0].def.outputs[0];
         assert_eq!(emitted.name, "imu");
         assert_eq!(emitted.schema, def.schema, "the peer's root is kept");
@@ -1032,7 +1044,7 @@ mod tests {
     fn test_reject_static_output_config() {
         let config = CoordinatorConfig {
             systems: vec![SystemConfig {
-                outputs: vec![OutputConfig::record("extra", "imu")],
+                outputs: vec![OutputConfig::with_record("extra", "imu")],
                 ..SystemConfig::new("imu", "imu")
             }],
             ..Default::default()

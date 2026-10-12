@@ -52,21 +52,24 @@ fn test_sync_fn() {
         Kind::System,
     );
     assert!(f.sig.inputs.is_empty());
-    assert_eq!(impl_item(&f, "Ports", "NAME"), quote!("nav").to_string());
     assert_eq!(
-        impl_item(&f, "Ports", "NAMES"),
+        impl_item(&f, "FnSignature", "NAME"),
+        quote!("nav").to_string()
+    );
+    assert_eq!(
+        impl_item(&f, "FnSignature", "NAMES"),
         quote!(&["now", "sensors", "attitude_estimate"]).to_string()
     );
     assert_eq!(
-        impl_item(&f, "Ports", "State"),
+        impl_item(&f, "FnSignature", "State"),
         quote!(NavState).to_string()
     );
     assert_eq!(
-        impl_item(&f, "Ports", "Params"),
+        impl_item(&f, "FnSignature", "Params"),
         quote!((Timestamp, Input<Sensors>, Output<AttitudeEstimate>,)).to_string()
     );
     assert_eq!(
-        impl_item(&f, "Ports", "DOC"),
+        impl_item(&f, "FnSignature", "DOC"),
         quote!("One filter cycle.").to_string()
     );
     assert!(has_impl(&f, "SystemFn") && has_impl(&f, "Deref"));
@@ -82,10 +85,13 @@ fn test_async_fn() {
         Kind::System,
     );
     assert_eq!(
-        impl_item(&f, "Ports", "NAMES"),
+        impl_item(&f, "FnSignature", "NAMES"),
         quote!(&["gps"]).to_string()
     );
-    assert_eq!(impl_item(&f, "Ports", "State"), quote!(Relay).to_string());
+    assert_eq!(
+        impl_item(&f, "FnSignature", "State"),
+        quote!(Relay).to_string()
+    );
     assert!(has_impl(&f, "AsyncSystemFn"));
     assert!(!has_impl(&f, "Deref"));
     assert!(!f.to_token_stream().to_string().contains("# [state]"));
@@ -100,10 +106,16 @@ fn test_generic_fn() {
         Kind::System,
     );
     assert_eq!(f.sig.generics.params.len(), 1);
-    assert_eq!(impl_item(&f, "Ports", "NAME"), quote!("probe").to_string());
-    assert_eq!(impl_item(&f, "Ports", "State"), quote!(Seen<T>).to_string());
     assert_eq!(
-        impl_item(&f, "Ports", "Params"),
+        impl_item(&f, "FnSignature", "NAME"),
+        quote!("probe").to_string()
+    );
+    assert_eq!(
+        impl_item(&f, "FnSignature", "State"),
+        quote!(Seen<T>).to_string()
+    );
+    assert_eq!(
+        impl_item(&f, "FnSignature", "Params"),
         quote!((Input<T>,)).to_string()
     );
 }
@@ -117,8 +129,11 @@ fn test_stateless_fn() {
         },
         Kind::System,
     );
-    assert_eq!(impl_item(&f, "Ports", "State"), quote!(()).to_string());
-    assert_eq!(impl_item(&f, "Ports", "DOC"), quote!("").to_string());
+    assert_eq!(
+        impl_item(&f, "FnSignature", "State"),
+        quote!(()).to_string()
+    );
+    assert_eq!(impl_item(&f, "FnSignature", "DOC"), quote!("").to_string());
     assert!(f.attrs.is_empty(), "lint attrs go on the body");
 }
 
@@ -165,16 +180,19 @@ fn test_sequence_fn() {
         Kind::Sequence,
     );
     assert_eq!(
-        impl_item(&f, "Ports", "NAMES"),
+        impl_item(&f, "FnSignature", "NAMES"),
         quote!(&["seq", "cmd"]).to_string()
     );
     assert_eq!(
-        impl_item(&f, "Ports", "Params"),
+        impl_item(&f, "FnSignature", "Params"),
         quote!((Seq<'static>, Output<Cmd>,)).to_string()
     );
-    assert_eq!(impl_item(&f, "Ports", "State"), quote!(Arm).to_string());
     assert_eq!(
-        impl_item(&f, "Ports", "DOC"),
+        impl_item(&f, "FnSignature", "State"),
+        quote!(Arm).to_string()
+    );
+    assert_eq!(
+        impl_item(&f, "FnSignature", "DOC"),
         quote!("Arms the motors.").to_string()
     );
     assert!(has_impl(&f, "SequenceFn"));
@@ -197,7 +215,7 @@ fn body_sig(f: &ItemFn) -> String {
 }
 
 #[test]
-fn test_sequence_body_shares_the_brand() {
+fn test_sequence_body_shares_one_lifetime() {
     let f = expand_fn(
         quote! {
             async fn arm(
@@ -211,7 +229,7 @@ fn test_sequence_body_shares_the_brand() {
         Kind::Sequence,
     );
     assert_eq!(
-        impl_item(&f, "Ports", "Params"),
+        impl_item(&f, "FnSignature", "Params"),
         quote!((Seq<'static>, Sample<Chamber>,)).to_string()
     );
     let expected = quote! {

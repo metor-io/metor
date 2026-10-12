@@ -149,7 +149,7 @@ impl Log {
 }
 
 thread_local! {
-    static SLOT: Cell<Option<NonNull<LogPort>>> = const { Cell::new(None) };
+    static CURRENT_PORT: Cell<Option<NonNull<LogPort>>> = const { Cell::new(None) };
 }
 
 /// Runs `f` with `port` as this thread's log port.
@@ -167,7 +167,7 @@ thread_local! {
 /// ```
 pub fn with_log_port<R>(port: &mut LogPort, now: Timestamp, f: impl FnOnce() -> R) -> R {
     port.now = now;
-    let _restore = RestoreSlot(SLOT.replace(Some(NonNull::from(port))));
+    let _restore = RestorePort(CURRENT_PORT.replace(Some(NonNull::from(port))));
     let result = f();
     with_port(LogPort::report_dropped);
     result
@@ -177,11 +177,11 @@ pub fn with_log_port<R>(port: &mut LogPort, now: Timestamp, f: impl FnOnce() -> 
 ///
 /// `port` is the thread's log port during each poll of `inner`. Lines are
 /// stamped with the wall time of that poll.
-pub fn log_scope<F: core::future::Future + Unpin>(port: &mut LogPort, inner: F) -> LogScope<'_, F> {
+pub fn with_logs<F: core::future::Future + Unpin>(port: &mut LogPort, inner: F) -> LogScope<'_, F> {
     LogScope { port, inner }
 }
 
-/// The future [`log_scope`] returns.
+/// The future [`with_logs`] returns.
 pub struct LogScope<'a, F> {
     port: &'a mut LogPort,
     inner: F,
@@ -201,19 +201,19 @@ impl<F: core::future::Future + Unpin> core::future::Future for LogScope<'_, F> {
     }
 }
 
-struct RestoreSlot(Option<NonNull<LogPort>>);
+struct RestorePort(Option<NonNull<LogPort>>);
 
-impl Drop for RestoreSlot {
+impl Drop for RestorePort {
     fn drop(&mut self) {
-        SLOT.set(self.0);
+        CURRENT_PORT.set(self.0);
     }
 }
 
 fn with_port(f: impl FnOnce(&mut LogPort)) {
-    let Some(mut port) = SLOT.take() else {
+    let Some(mut port) = CURRENT_PORT.take() else {
         return;
     };
-    let _restore = RestoreSlot(Some(port));
+    let _restore = RestorePort(Some(port));
     // SAFETY: with_log_port borrows the port until its private guard restores
     // the previous slot, including on unwind. Removing this thread-local
     // pointer for the entire callback prevents recursive mutable access.
@@ -400,7 +400,7 @@ mod tests {
         });
         drop(outer);
         Log.info("outside");
-        assert!(SLOT.get().is_none());
+        assert!(CURRENT_PORT.get().is_none());
         assert_eq!(lines(&mut inner_input).len(), 1);
         let outer = lines(&mut outer_input);
         assert_eq!(outer.len(), 1);
@@ -412,7 +412,7 @@ mod tests {
         let (_ring, mut port, mut input) = log_pair(8);
         with_log_port(&mut port, Timestamp(1), || {
             let worker = std::thread::spawn(|| {
-                assert!(SLOT.get().is_none());
+                assert!(CURRENT_PORT.get().is_none());
                 let (_ring, mut port, mut input) = log_pair(8);
                 with_log_port(&mut port, Timestamp(2), || Log.info("worker"));
                 lines(&mut input)

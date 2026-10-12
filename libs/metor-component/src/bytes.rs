@@ -15,13 +15,9 @@ use crate::{AsVTable, Metadatatize, path::ComponentPath};
 #[repr(transparent)]
 pub struct FrameBytes<const N: usize>(pub [u8; N]);
 
-impl<const N: usize> FrameBytes<N> {
-    pub const ZERO: Self = Self([0; N]);
-}
-
 impl<const N: usize> Default for FrameBytes<N> {
     fn default() -> Self {
-        Self::ZERO
+        Self([0; N])
     }
 }
 
@@ -72,7 +68,7 @@ mod tests {
         let bytes = FrameBytes([7u8; 4]);
         let back = FrameBytes::<4>::from_component_view(bytes.as_component_view()).expect("same");
         assert_eq!(back, bytes);
-        assert_eq!(FrameBytes::<4>::default(), FrameBytes::ZERO);
+        assert_eq!(FrameBytes::<4>::default(), FrameBytes([0; 4]));
         assert!(FrameBytes::<3>::from_component_view(bytes.as_component_view()).is_err());
     }
 }

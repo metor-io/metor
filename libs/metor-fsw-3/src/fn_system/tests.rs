@@ -35,7 +35,7 @@ impl Doubler {
     }
 }
 
-impl Ports for Doubler {
+impl FnSignature for Doubler {
     type State = Self;
     type Params = (Input<Imu>, Output<Nav>, Timestamp);
     const NAME: &'static str = "doubler";
@@ -62,7 +62,7 @@ impl Summer {
     }
 }
 
-impl Ports for Summer {
+impl FnSignature for Summer {
     type State = Self;
     type Params = (Output<Control>, Input<Imu>, Input<Imu>);
     const NAME: &'static str = "summer";
@@ -140,7 +140,7 @@ impl Counter {
     }
 }
 
-impl Ports for Counter {
+impl FnSignature for Counter {
     type State = Self;
     type Params = ();
     const NAME: &'static str = "counter";
@@ -587,7 +587,7 @@ fn test_async_adapter_relay() {
     let mut estimates = input::<Nav>(&nav);
     let mut lines = input::<LogEvent>(&log);
 
-    let mut threads = Threads::new();
+    let mut threads = Threads::default();
     let def = entry.def.clone();
     let mut step = (entry.make)(MakeCx {
         id: "relay",
@@ -638,8 +638,11 @@ fn test_dynamic_parameter_port_order() {
     let producer = Output::<Nav>::def(&DefCx::empty(), "nav");
     let declared = Output::<Imu>::def(&DefCx::empty(), "imu");
     let edges = [("nav.nav", &producer), ("imu", &declared)];
-    let records = Records::of([Output::<Nav>::def(&DefCx::empty(), "nav")].iter());
-    let outputs = [crate::coordinator::OutputConfig::record("sink", Nav::NAME)];
+    let records = Records::from_port_defs([Output::<Nav>::def(&DefCx::empty(), "nav")].iter());
+    let outputs = [crate::coordinator::OutputConfig::with_record(
+        "sink",
+        Nav::NAME,
+    )];
     let cx = DefCx {
         inputs: &edges,
         outputs: &outputs,
@@ -763,7 +766,7 @@ fn flooded(a: usize, b: usize, cycles: i64) -> Vec<LogEvent> {
     let (ring_a, ring_b, log) = (two_record_ring(), two_record_ring(), ring::<LogEvent>(8, 1));
     let _readers = (input::<Imu>(&ring_a), input::<Imu>(&ring_b));
     let mut lines = input::<LogEvent>(&log);
-    let mut threads = Threads::new();
+    let mut threads = Threads::default();
     let mut step = (entry.make)(MakeCx {
         id: "flood",
         adapter: None,
@@ -821,7 +824,7 @@ fn test_failed_writes_sum_across_outputs() {
 /// Two declared outputs, for binding by hand.
 struct TwoOutputs;
 
-impl Ports for TwoOutputs {
+impl FnSignature for TwoOutputs {
     type State = ();
     type Params = (Output<Imu>, Output<Imu>);
     const NAME: &'static str = "two_outputs";
@@ -936,7 +939,7 @@ fn test_rng_without_a_seed_fails_the_make() {
     let entry = table.get("drawer").expect("registered");
     let def = entry.def.clone();
     let log = ring::<LogEvent>(4, 1);
-    let mut threads = crate::thread::Threads::new();
+    let mut threads = crate::thread::Threads::default();
     let made = (entry.make)(crate::coordinator::MakeCx {
         id: "d",
         adapter: None,
@@ -972,10 +975,9 @@ fn test_rng_on_an_async_system_is_refused() {
 }
 
 #[test]
-fn test_seed_is_left_out_when_zero() {
-    let config = CoordinatorConfig::default();
-    let json = serde_json::to_value(&config).expect("encodes");
-    assert!(json.get("seed").is_none());
+fn test_seed_defaults_to_zero() {
+    let mut json = serde_json::to_value(CoordinatorConfig::default()).expect("encodes");
+    json.as_object_mut().expect("an object").remove("seed");
     let decoded: CoordinatorConfig = serde_json::from_value(json).expect("decodes");
     assert_eq!(decoded.seed, 0);
     let seeded = CoordinatorConfig {

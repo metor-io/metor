@@ -173,14 +173,11 @@ pub(super) fn build(
     launch: Box<dyn Launch>,
     stop: Stop,
 ) -> Result<crate::async_system::Running, ParamError> {
-    match std::panic::catch_unwind(AssertUnwindSafe(|| launch.launch(stop))) {
-        Ok(result) => result,
-        Err(payload) => {
-            let message = crate::panic::message(&*payload).to_string();
-            crate::panic::discard(payload);
-            Err(ParamError::Panicked(message))
-        }
-    }
+    std::panic::catch_unwind(AssertUnwindSafe(|| launch.launch(stop))).map_err(|payload| {
+        let message = crate::panic::message(&*payload).to_string();
+        crate::panic::discard(payload);
+        ParamError::Panicked(message)
+    })?
 }
 
 /// Runs one system. If it panics, the panic is caught and reported to its

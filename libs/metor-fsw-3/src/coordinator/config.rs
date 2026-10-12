@@ -16,22 +16,17 @@ pub const DEFAULT_RING_DEPTH: usize = 8;
 /// The configuration for a coordinator.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoordinatorConfig {
+    /// The clock that paces the cycles.
     pub clock: Clock,
-    /// Scales each port's ring size.
-    ///
-    /// A port's ring holds its declared depth times this many records.
+    /// How many records a ring holds per unit of its port's declared depth.
     pub ring_depth: usize,
     /// A prefix added to every name the coordinator announces.
     #[serde(default)]
     pub namespace: Option<String>,
     pub systems: Vec<SystemConfig>,
     /// The seed every `Rng` parameter draws from.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(default)]
     pub seed: u64,
-}
-
-fn is_zero(seed: &u64) -> bool {
-    *seed == 0
 }
 
 impl Default for CoordinatorConfig {
@@ -135,7 +130,7 @@ pub struct OutputConfig {
 
 impl OutputConfig {
     /// Creates an output port that carries the record called `record`.
-    pub fn record(port: impl Into<String>, record: impl Into<String>) -> Self {
+    pub fn with_record(port: impl Into<String>, record: impl Into<String>) -> Self {
         Self {
             port: port.into(),
             source: OutputSource::Record(record.into()),
@@ -274,7 +269,7 @@ mod tests {
     fn test_output_source_forms() {
         let record: OutputConfig =
             serde_json::from_str(r#"{"port":"ping","record":"ping"}"#).expect("record form");
-        assert_eq!(record, OutputConfig::record("ping", "ping"));
+        assert_eq!(record, OutputConfig::with_record("ping", "ping"));
         assert!(serde_json::from_str::<OutputConfig>(r#"{"port":"x"}"#).is_err());
     }
 }

@@ -57,7 +57,7 @@ impl DefCx<'_> {
     ///
     /// The path is `{namespace}.{id}.{port}`, leaving out any part that is
     /// empty.
-    pub fn root(&self, port: &str) -> String {
+    pub fn port_path(&self, port: &str) -> String {
         [self.namespace.unwrap_or(""), self.id, port]
             .into_iter()
             .filter(|part| !part.is_empty())
@@ -88,7 +88,9 @@ pub enum DefError {
     RngOnAsync { system: String },
 }
 
-/// Every record a system table knows about, looked up by name.
+/// Port definitions by record name.
+///
+/// A record that two ports declare differently maps to `None`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Records(HashMap<String, Option<PortDef>>);
 
@@ -97,7 +99,7 @@ impl Records {
     ///
     /// If two ports carry different records under the same name, that name is
     /// marked as a conflict.
-    pub fn of<'a>(ports: impl Iterator<Item = &'a PortDef>) -> Self {
+    pub fn from_port_defs<'a>(ports: impl Iterator<Item = &'a PortDef>) -> Self {
         let mut records = HashMap::new();
         for port in ports {
             match records.get(port.record.as_ref()) {
@@ -116,7 +118,7 @@ impl Records {
     /// Returns a definition for a port called `port` that carries `record`.
     ///
     /// Fails if the record is unknown, or if two ports declared it differently.
-    pub fn port(&self, port: &str, record: &str) -> Result<PortDef, DefError> {
+    pub fn port_def(&self, port: &str, record: &str) -> Result<PortDef, DefError> {
         match self.0.get(record) {
             Some(Some(def)) => Ok(PortDef {
                 name: port.to_string().into(),
@@ -140,34 +142,36 @@ mod tests {
     use crate::{Output, Record};
 
     #[test]
-    fn test_root_skips_missing_parts() {
-        assert_eq!(DefCx::empty().root("imu"), "imu");
+    fn test_port_path_skips_missing_parts() {
+        assert_eq!(DefCx::empty().port_path("imu"), "imu");
         let named = DefCx {
             id: "plant",
             ..DefCx::empty()
         };
-        assert_eq!(named.root("imu"), "plant.imu");
+        assert_eq!(named.port_path("imu"), "plant.imu");
         let namespaced = DefCx {
             id: "plant",
             namespace: Some("cube_sat"),
             ..DefCx::empty()
         };
-        assert_eq!(namespaced.root("imu"), "cube_sat.plant.imu");
+        assert_eq!(namespaced.port_path("imu"), "cube_sat.plant.imu");
     }
 
     #[test]
     fn test_record_port_lookup() {
-        let records = Records::of([Output::<Imu>::def(&DefCx::empty(), "imu")].iter());
-        let port = records.port("plant.imu", Imu::NAME).expect("known record");
+        let records = Records::from_port_defs([Output::<Imu>::def(&DefCx::empty(), "imu")].iter());
+        let port = records
+            .port_def("plant.imu", Imu::NAME)
+            .expect("known record");
         assert_eq!(port.name, "plant.imu");
         assert_eq!(port.id, Output::<Imu>::def(&DefCx::empty(), "imu").id);
     }
 
     #[test]
     fn test_unknown_record_error() {
-        let records = Records::of([Output::<Imu>::def(&DefCx::empty(), "imu")].iter());
+        let records = Records::from_port_defs([Output::<Imu>::def(&DefCx::empty(), "imu")].iter());
         assert_eq!(
-            records.port("out", Nav::NAME),
+            records.port_def("out", Nav::NAME),
             Err(DefError::UnknownRecord {
                 port: "out".into(),
                 record: Nav::NAME.into(),
@@ -179,9 +183,10 @@ mod tests {
     fn test_conflicting_record_definitions() {
         let mut wide = Output::<Imu>::def(&DefCx::empty(), "imu");
         wide.max_len += 8;
-        let records = Records::of([Output::<Imu>::def(&DefCx::empty(), "imu"), wide].iter());
+        let records =
+            Records::from_port_defs([Output::<Imu>::def(&DefCx::empty(), "imu"), wide].iter());
         assert_eq!(
-            records.port("out", Imu::NAME),
+            records.port_def("out", Imu::NAME),
             Err(DefError::RecordConflict {
                 record: Imu::NAME.into(),
             })
@@ -192,7 +197,7 @@ mod tests {
     #[test]
     fn test_conflicting_frame_layouts() {
         let cx = DefCx::empty();
-        let records = Records::of(
+        let records = Records::from_port_defs(
             [
                 Output::<Imu>::def(&cx, "imu"),
                 Output::<ImuPair>::def(&cx, "imu"),
@@ -200,7 +205,7 @@ mod tests {
             .iter(),
         );
         assert_eq!(
-            records.port("out", Imu::NAME),
+            records.port_def("out", Imu::NAME),
             Err(DefError::RecordConflict {
                 record: Imu::NAME.into(),
             })
@@ -211,6 +216,6 @@ mod tests {
     fn test_empty_context() {
         let cx = DefCx::empty();
         assert!(cx.inputs.is_empty() && cx.outputs.is_empty());
-        assert!(cx.records.port("out", "imu").is_err());
+        assert!(cx.records.port_def("out", "imu").is_err());
     }
 }
