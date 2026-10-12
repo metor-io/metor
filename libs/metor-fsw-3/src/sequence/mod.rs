@@ -90,7 +90,7 @@ use metor_fsw_3_ring::NoWake;
 use crate::channel::{ABORT_PORT, AbortRequest};
 use crate::coordinator::{SystemKind, TableEntry};
 use crate::def::{DefCx, DefError};
-use crate::fn_system::{Ctor, Defs, InSet, OutSet, Param, Ports};
+use crate::fn_system::{Ctor, Defs, FnSignature, InSet, OutSet, Param};
 use crate::port::Input;
 use crate::system::{SystemDef, SystemInputs, SystemOutputs};
 
@@ -124,7 +124,7 @@ macro_rules! redline {
 /// `#[sequence]` implements this trait. The fn's parameters are its ports
 /// and, optionally, its [`Seq`].
 #[allow(async_fn_in_trait)]
-pub trait SequenceFn: Ports {
+pub trait SequenceFn: FnSignature {
     /// Runs the sequence to its end.
     ///
     /// `state` and `items` share the lifetime `'a`, and the [`Seq`] in
@@ -165,7 +165,7 @@ pub(crate) fn entry<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
         doc: Cow::Borrowed(S::DOC),
         schema: C::schema(),
         make: std::sync::Arc::new(move |mut cx| {
-            let instance = crate::fn_system::Instance::of(&cx);
+            let instance = crate::fn_system::Instance::from_make_cx(&cx);
             let (views, writers) = cx.take_bindings();
             let mut views = views.into_iter();
             // PANIC Safety: `def` declares `abort` first, and build binds one

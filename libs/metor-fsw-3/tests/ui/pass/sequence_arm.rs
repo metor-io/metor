@@ -2,7 +2,7 @@ use core::time::Duration;
 
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
-    Frame, Input, Log, Output, Ports, Seq, SeqError, SystemTable, Timestamp, sequence,
+    FnSignature, Frame, Input, Log, Output, Seq, SeqError, SystemTable, Timestamp, sequence,
 };
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
@@ -58,7 +58,7 @@ async fn arm_controls(
     Ok(())
 }
 
-fn names<P: Ports>(_: &P) -> (&'static str, &'static [&'static str]) {
+fn names<P: FnSignature>(_: &P) -> (&'static str, &'static [&'static str]) {
     (P::NAME, P::NAMES)
 }
 

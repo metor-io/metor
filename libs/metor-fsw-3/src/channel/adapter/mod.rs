@@ -12,6 +12,7 @@ use metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
 
+use crate::FrameStr;
 use crate::coordinator::{
     Adapter, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, Stepped, catch_step,
 };
@@ -21,7 +22,6 @@ use crate::port::{Input, Output, ring_capacity};
 use crate::record::Record;
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
-use crate::{FrameBytes, FrameStr};
 
 use super::apply::{Command, State, apply};
 use super::{
@@ -93,7 +93,7 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
         seed: cx.seed,
         namespace: cx.namespace.to_string(),
     };
-    let mut threads = Threads::new();
+    let mut threads = Threads::default();
     let inner = recipe.make(&mut threads)?;
     Ok(Box::new(Channel {
         commands: command_input(commands),
@@ -442,7 +442,7 @@ impl Core {
             state: self.channel_state().code(),
             loaded: occupant.map_or(u32::MAX, |o| o.index),
             artifact: occupant.map_or(FrameStr::EMPTY, |o| o.artifact),
-            hash: occupant.map_or(FrameBytes::ZERO, |o| o.hash),
+            hash: occupant.map(|o| o.hash).unwrap_or_default(),
         };
         let _ = self.status.write(&status);
     }
