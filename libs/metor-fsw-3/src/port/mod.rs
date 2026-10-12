@@ -516,7 +516,8 @@ mod tests {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: 128,
             max_readers: 1,
-        });
+        })
+        .expect("a valid ring config");
         let output = output::<Aligned>(&ring);
         let mut input = input::<Aligned>(&ring);
         for value in 0..20 {
@@ -633,7 +634,8 @@ mod tests {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: 64,
             max_readers: 1,
-        });
+        })
+        .expect("a valid ring config");
         let out = output(&ring);
         let mut input = input::<Imu>(&ring);
         out.write(&Imu::new(0, 0.0)).expect("ring has room");
@@ -652,7 +654,8 @@ mod tests {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: 64,
             max_readers: 1,
-        });
+        })
+        .expect("a valid ring config");
         let dropped = Arc::new(AtomicU32::new(0));
         let writer = ring.writer(NoWake).expect("free writer");
         let out = Output::<Imu>::counting(writer, dropped.clone());

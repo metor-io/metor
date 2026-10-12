@@ -751,6 +751,7 @@ fn two_record_ring() -> metor_fsw_3_ring::RingBuffer {
         capacity: 64,
         max_readers: 1,
     })
+    .expect("a valid ring config")
 }
 
 /// The log lines `flood` writes over `cycles` cycles into two-record rings.

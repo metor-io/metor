@@ -8,7 +8,7 @@
 use core::time::Duration;
 use std::collections::HashMap;
 
-use metor_fsw_3_ring::{Config, NoWake, RingBuffer, checked_region_len};
+use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
 
 use crate::def::{DefCx, Records};
@@ -420,11 +420,7 @@ fn allocate_ring(spec: &RingSpec, ring_depth: usize) -> Result<RingBuffer, Build
         capacity,
         max_readers: spec.readers,
     };
-    // The capacity fits `usize`, but the region around it may not.
-    if checked_region_len(&config).is_none() {
-        return Err(too_large());
-    }
-    Ok(RingBuffer::create_in_memory(config))
+    RingBuffer::create_in_memory(config).map_err(|_| too_large())
 }
 
 /// The make arguments every system in the target shares.
