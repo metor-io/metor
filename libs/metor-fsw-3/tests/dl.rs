@@ -17,7 +17,17 @@ use metor_fsw_3::coordinator::{
     BuildError, Coordinator, CoordinatorConfig, InputConfig, ParamError, PortRef, SystemConfig,
     SystemTable,
 };
-use metor_fsw_3::{ABI_VERSION, DlPack, Input, Output, Pack, PackError, Record, Timestamp, system};
+use metor_fsw_3::{
+    ABI_VERSION, DlPack, EndReason, Input, Output, Pack, PackError, Record, Timestamp, system,
+};
+
+/// The ids of the systems that panicked, in step order.
+fn panicked(c: &Coordinator) -> Vec<&str> {
+    c.systems()
+        .filter(|(_, end)| *end == Some(&EndReason::Panicked))
+        .map(|(id, _)| id)
+        .collect()
+}
 
 /// Counts up and publishes the count.
 #[derive(Default)]
@@ -276,7 +286,7 @@ fn test_pack_transfers_record() {
     assert_eq!(*seen.borrow(), vec![1]);
     coordinator.step(Timestamp(2));
     assert_eq!(*seen.borrow(), vec![1, 2]);
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(panicked(&coordinator).len(), 0);
 }
 
 #[test]
@@ -293,7 +303,7 @@ fn test_async_pack_transfers_record() {
         coordinator.step(Timestamp(cycle));
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(panicked(&coordinator).len(), 0);
     assert_eq!(&seen.borrow()[..2], &[1, 2]);
 }
 
@@ -327,9 +337,9 @@ fn test_pack_panic_preserves_cycle() {
     let mut coordinator = config.build(&table(&pack, &seen)).expect("builds");
 
     coordinator.step(Timestamp(1));
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(panicked(&coordinator).len(), 0);
     coordinator.step(Timestamp(2));
-    assert_eq!(coordinator.latched().collect::<Vec<_>>(), vec!["middle"]);
+    assert_eq!(panicked(&coordinator), vec!["middle"]);
     coordinator.step(Timestamp(3));
     // The coordinator kept cycling after the panic. The sink only got the
     // ping `boom` wrote before it failed.
@@ -361,7 +371,7 @@ fn test_failed_consumer_isolation() {
         coordinator.step(Timestamp(cycle));
     }
     assert_eq!(*seen.borrow(), (1..=32).collect::<Vec<_>>());
-    assert_eq!(coordinator.latched().collect::<Vec<_>>(), vec!["middle"]);
+    assert_eq!(panicked(&coordinator), vec!["middle"]);
 }
 
 #[test]
@@ -436,7 +446,7 @@ mod io {
         for t in 1..6 {
             c.step(Timestamp(t));
         }
-        assert_eq!(c.latched().count(), 0);
+        assert_eq!(panicked(&c).len(), 0);
         assert!(*seen.borrow() > 0, "the dylib driver read a fix");
     }
 
@@ -449,7 +459,7 @@ mod io {
         for t in 1..6 {
             c.step(Timestamp(t));
         }
-        let ended: Vec<_> = c.ended().collect();
+        let ended: Vec<_> = c.systems().filter(|(_, end)| end.is_some()).collect();
         assert!(ended.is_empty(), "{ended:?}");
         assert!(*seen.borrow() > 0, "the guest model wrote the driver's fix");
     }
@@ -595,7 +605,7 @@ mod quiesce {
         step(6, 10);
         let after = seen.submitted.borrow().last().map_or(0, |s| s.1);
         assert!(after > before, "the remade system submits again");
-        assert_eq!(c.latched().count(), 0);
+        assert_eq!(panicked(&c).len(), 0);
     }
 
     /// A remade instance whose ctor asks for more than the region holds
