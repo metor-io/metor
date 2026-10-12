@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use common::{Ping, fixture_lib, fixture_wasm, open_wasm};
+use common::{Ping, fixture_lib, fixture_wasm, open_wasm, panicked};
 use metor_fsw_3::coordinator::{BuildError, Coordinator, CoordinatorConfig, ParamError};
 use metor_fsw_3::metor_proto_wkt::{
     LogEvent, SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
@@ -277,7 +277,7 @@ fn test_echo_delivers_each_cycle() {
         run(&mut coordinator, 1);
         assert_eq!(pings(&seen), [cycle], "cycle {cycle}");
     }
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(panicked(&coordinator).len(), 0);
 }
 
 /// Builds `older, newer -> middle (echo.meter) -> sink`.
@@ -352,7 +352,7 @@ fn test_panic_reports_trap_and_message() {
     config.systems[1].inputs.clear();
     let (mut coordinator, seen) = build(config, &wasm_pack());
     run(&mut coordinator, 3);
-    assert_eq!(coordinator.latched().collect::<Vec<_>>(), ["middle"]);
+    assert_eq!(panicked(&coordinator), ["middle"]);
     assert_eq!(pings(&seen), [1]);
     assert_eq!(kinds(&seen), ["panic", "trap"]);
     let lines = &seen.borrow().lines;
@@ -384,7 +384,7 @@ fn test_logging_guest_runs() {
     config.systems[1].inputs.clear();
     let (mut coordinator, seen) = build(config, &wasm_pack());
     run(&mut coordinator, 100);
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(panicked(&coordinator).len(), 0);
     assert_eq!(pings(&seen), (1..=100).collect::<Vec<_>>());
     let ticks = seen
         .borrow()
@@ -465,5 +465,5 @@ fn sequence_completes_aborts_and_resets(pack: &Arc<Pack>) {
     let events = send(&mut coordinator, &seen, SequenceCommandKind::Start, 4);
     assert_eq!(events, completed);
     assert_eq!(pings(&seen), [1, 2, 3]);
-    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(panicked(&coordinator).len(), 0);
 }

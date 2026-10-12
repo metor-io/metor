@@ -12,20 +12,12 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use common::{Ping, fixture_lib};
+use common::{Ping, fixture_lib, panicked};
 use metor_fsw_3::coordinator::{
     BuildError, Coordinator, CoordinatorConfig, InputConfig, MakeError, ParamError, PortRef,
     SystemConfig, SystemTable,
 };
-use metor_fsw_3::{DlPack, EndReason, Input, Output, Pack, PackError, Record, Timestamp, system};
-
-/// The ids of the systems that panicked, in step order.
-fn panicked(c: &Coordinator) -> Vec<&str> {
-    c.systems()
-        .filter(|(_, end)| *end == Some(&EndReason::Panicked))
-        .map(|(id, _)| id)
-        .collect()
-}
+use metor_fsw_3::{ABI_VERSION, DlPack, Input, Output, Pack, PackError, Record, Timestamp, system};
 
 /// Counts up and publishes the count.
 #[derive(Default)]
@@ -460,7 +452,7 @@ mod io {
         for t in 1..6 {
             c.step(Timestamp(t));
         }
-        let ended: Vec<_> = c.ended().collect();
+        let ended: Vec<_> = c.systems().filter(|(_, end)| end.is_some()).collect();
         assert!(ended.is_empty(), "{ended:?}");
         assert!(*seen.borrow() > 0, "the guest's read bytes reached it");
     }
