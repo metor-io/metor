@@ -326,7 +326,7 @@ fn expand_fn(mut f: ItemFn, fsw: &TokenStream2, kind: Kind) -> TokenStream2 {
         Err(e) => {
             // An `async fn` cannot elide `Seq`'s lifetime.
             if kind == Kind::Sequence {
-                brand(&mut f.sig);
+                share_lifetime(&mut f.sig);
             }
             with_error(f, e)
         }
@@ -342,7 +342,7 @@ fn is_outer(attr: &Attribute) -> bool {
 
 /// Adds a `'static` bound to every type parameter.
 ///
-/// `Ports` requires `'static`.
+/// `FnSignature` requires `'static`.
 fn static_generics(generics: &Generics) -> Generics {
     let mut generics = generics.clone();
     let bound: TypeParamBound = syn::parse_quote!('static);
@@ -356,20 +356,25 @@ fn static_generics(generics: &Generics) -> Generics {
 
 fn emit(f: ItemFn, sig: &Sig, fsw: &TokenStream2) -> TokenStream2 {
     let (outer, inner): (Vec<_>, Vec<_>) = f.attrs.iter().cloned().partition(is_outer);
-    let doc = doc(&outer);
+    let doc = extract_doc(&outer);
     let generics = static_generics(&f.sig.generics);
     let (impl_generics, _, where_clause) = generics.split_for_impl();
     let (vis, name) = (&f.vis, &f.sig.ident);
     let type_params = f.sig.generics.type_params().map(|p| &p.ident);
     let state_ty = sig.state_ty();
-    let (bound, call) = call_impl(sig, &state_ty, &generics, fsw);
+    // The trait bound the rewritten fn returns, plus the impls behind it.
+    let (bound, call) = match (sig.kind, sig.args.last().filter(|_| sig.stop)) {
+        (Kind::Sequence, _) => sequence_call(sig, &state_ty, &generics, fsw),
+        (Kind::System, Some(stop)) => async_call(sig, &stop.ident, &state_ty, &generics, fsw),
+        (Kind::System, None) => cyclic_call(sig, &state_ty, &generics, fsw),
+    };
     let ports = ports_impl(sig, &name.to_string(), &doc, &state_ty, &generics, fsw);
     let mut body_sig = Signature {
         ident: format_ident!("__metor_body"),
         ..f.sig.clone()
     };
     if sig.kind == Kind::Sequence {
-        brand(&mut body_sig);
+        share_lifetime(&mut body_sig);
     }
     let body = ItemFn {
         attrs: inner,
@@ -403,7 +408,7 @@ fn ports_impl(
     let keys = sig.ports().map(|arg| key_type(&arg.ty));
     let names = sig.ports().map(|arg| arg.ident.to_string());
     quote! {
-        impl #impl_generics #fsw::Ports for __MetorSystem #ty_generics #where_clause {
+        impl #impl_generics #fsw::FnSignature for __MetorSystem #ty_generics #where_clause {
             type State = #state_ty;
             type Params = (#(#keys,)*);
             const NAME: &'static str = #name;
@@ -413,18 +418,16 @@ fn ports_impl(
     }
 }
 
-/// Returns the trait bound the rewritten fn returns, plus the impls behind it.
+/// The parts every generated `call` shares.
 ///
-/// Each generated `call` unpacks the state and ports, asserts that each port
-/// type implements `Param`, and calls the original body.
-fn call_impl(
+/// That is the `#[state]` parameter's name (or `_`), the destructured ports,
+/// and a body that asserts each port type implements `Param` and then calls
+/// the original fn.
+fn call_parts(
     sig: &Sig,
-    state_ty: &Type,
     generics: &Generics,
     fsw: &TokenStream2,
-) -> (TokenStream2, TokenStream2) {
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let turbofish = ty_generics.as_turbofish();
+) -> (TokenStream2, TokenStream2, TokenStream2) {
     let state = match sig.state {
         Some(i) => sig.args[i].ident.to_token_stream(),
         None => quote!(_),
@@ -437,76 +440,106 @@ fn call_impl(
         quote_spanned! { arg.ty.span() => #fsw::fn_system::assert_param::<#key>(); }
     });
     let args = sig.args.iter().map(|arg| &arg.ident);
+    let turbofish = generics.split_for_impl().1.as_turbofish().to_token_stream();
     let body = quote!(#(#asserts)* __metor_body #turbofish (#(#args),*));
-    let impl_for = |trait_: TokenStream2, call: TokenStream2| {
-        quote! {
-            impl #impl_generics #fsw::#trait_ for __MetorSystem #ty_generics #where_clause {
-                #call
-            }
-        }
-    };
-    match (sig.kind, sig.args.last().filter(|_| sig.stop)) {
-        (Kind::Sequence, _) => {
-            let brand = brand_lifetime();
-            let call = quote! {
-                async fn call<#brand>(
-                    #state: &#brand mut #state_ty,
-                    #items<#brand, #fsw::ring::NoWake>,
-                ) -> ::core::result::Result<(), #fsw::SeqError> {
-                    #body.await
-                }
-            };
-            (
-                quote!(#fsw::SequenceFn<State = #state_ty>),
-                impl_for(quote!(SequenceFn), call),
-            )
-        }
-        (Kind::System, Some(stop)) => {
-            let stop = &stop.ident;
-            let call = quote! {
-                async fn call(
-                    #state: &mut #state_ty,
-                    #items<'_, #fsw::ring::Notifier>,
-                    #stop: #fsw::Stop,
-                ) {
-                    #body.await
-                }
-            };
-            (
-                quote!(#fsw::AsyncSystemFn<State = #state_ty>),
-                impl_for(quote!(AsyncSystemFn), call),
-            )
-        }
-        (Kind::System, None) => {
-            let tys = sig.args.iter().map(|arg| &arg.ty);
-            let fn_ptr = quote!(fn(#(#tys),*));
-            let call = impl_for(
-                quote!(SystemFn),
-                quote! {
-                    fn call(#state: &mut #state_ty, #items<'_, #fsw::ring::NoWake>) {
-                        #body
-                    }
-                },
-            );
-            let impls = quote! {
-                #call
-                impl #impl_generics ::core::ops::Deref for __MetorSystem #ty_generics #where_clause {
-                    type Target = #fn_ptr;
-                    fn deref(&self) -> &Self::Target {
-                        &(__metor_body #turbofish as #fn_ptr)
-                    }
-                }
-            };
-            (
-                quote!(#fsw::SystemFn<State = #state_ty> + ::core::ops::Deref<Target = #fn_ptr>),
-                impls,
-            )
+    (state, items, body)
+}
+
+/// Implements `fsw::trait_` for the generated struct, with `items` inside.
+fn impl_for(
+    trait_: TokenStream2,
+    items: TokenStream2,
+    generics: &Generics,
+    fsw: &TokenStream2,
+) -> TokenStream2 {
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    quote! {
+        impl #impl_generics #fsw::#trait_ for __MetorSystem #ty_generics #where_clause {
+            #items
         }
     }
 }
 
+fn sequence_call(
+    sig: &Sig,
+    state_ty: &Type,
+    generics: &Generics,
+    fsw: &TokenStream2,
+) -> (TokenStream2, TokenStream2) {
+    let (state, items, body) = call_parts(sig, generics, fsw);
+    let lifetime = seq_lifetime();
+    let call = quote! {
+        async fn call<#lifetime>(
+            #state: &#lifetime mut #state_ty,
+            #items<#lifetime, #fsw::ring::NoWake>,
+        ) -> ::core::result::Result<(), #fsw::SeqError> {
+            #body.await
+        }
+    };
+    (
+        quote!(#fsw::SequenceFn<State = #state_ty>),
+        impl_for(quote!(SequenceFn), call, generics, fsw),
+    )
+}
+
+fn async_call(
+    sig: &Sig,
+    stop: &Ident,
+    state_ty: &Type,
+    generics: &Generics,
+    fsw: &TokenStream2,
+) -> (TokenStream2, TokenStream2) {
+    let (state, items, body) = call_parts(sig, generics, fsw);
+    let call = quote! {
+        async fn call(
+            #state: &mut #state_ty,
+            #items<'_, #fsw::ring::Notifier>,
+            #stop: #fsw::Stop,
+        ) {
+            #body.await
+        }
+    };
+    (
+        quote!(#fsw::AsyncSystemFn<State = #state_ty>),
+        impl_for(quote!(AsyncSystemFn), call, generics, fsw),
+    )
+}
+
+/// A cyclic system also derefs to a fn pointer to the original body.
+fn cyclic_call(
+    sig: &Sig,
+    state_ty: &Type,
+    generics: &Generics,
+    fsw: &TokenStream2,
+) -> (TokenStream2, TokenStream2) {
+    let (state, items, body) = call_parts(sig, generics, fsw);
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let turbofish = ty_generics.as_turbofish();
+    let tys = sig.args.iter().map(|arg| &arg.ty);
+    let fn_ptr = quote!(fn(#(#tys),*));
+    let call = quote! {
+        fn call(#state: &mut #state_ty, #items<'_, #fsw::ring::NoWake>) {
+            #body
+        }
+    };
+    let call = impl_for(quote!(SystemFn), call, generics, fsw);
+    let impls = quote! {
+        #call
+        impl #impl_generics ::core::ops::Deref for __MetorSystem #ty_generics #where_clause {
+            type Target = #fn_ptr;
+            fn deref(&self) -> &Self::Target {
+                &(__metor_body #turbofish as #fn_ptr)
+            }
+        }
+    };
+    (
+        quote!(#fsw::SystemFn<State = #state_ty> + ::core::ops::Deref<Target = #fn_ptr>),
+        impls,
+    )
+}
+
 /// Joins the doc comment lines, stripping one leading space from each.
-fn doc(attrs: &[Attribute]) -> String {
+fn extract_doc(attrs: &[Attribute]) -> String {
     attrs
         .iter()
         .filter(|attr| attr.path().is_ident("doc"))
@@ -545,7 +578,7 @@ fn key_type(ty: &Type) -> Type {
 }
 
 /// Returns `'__seq`, the lifetime shared by a sequence's parameters.
-fn brand_lifetime() -> Lifetime {
+fn seq_lifetime() -> Lifetime {
     Lifetime::new("'__seq", Span::call_site())
 }
 
@@ -553,23 +586,24 @@ fn brand_lifetime() -> Lifetime {
 ///
 /// This includes the `Seq`'s lifetime. With one shared lifetime, a redline's
 /// condition can borrow any parameter.
-fn brand(sig: &mut Signature) {
-    let lifetime = brand_lifetime();
+fn share_lifetime(sig: &mut Signature) {
+    let lifetime = seq_lifetime();
     sig.generics.params.insert(
         0,
         syn::GenericParam::Lifetime(syn::LifetimeParam::new(lifetime.clone())),
     );
-    let mut brander = Brander(lifetime);
+    let mut namer = ElidedLifetimes(lifetime);
     for input in &mut sig.inputs {
         if let FnArg::Typed(typed) = input {
-            brander.visit_type_mut(&mut typed.ty);
+            namer.visit_type_mut(&mut typed.ty);
         }
     }
 }
 
-struct Brander(Lifetime);
+/// Names every elided lifetime it visits with the lifetime it holds.
+struct ElidedLifetimes(Lifetime);
 
-impl VisitMut for Brander {
+impl VisitMut for ElidedLifetimes {
     fn visit_type_reference_mut(&mut self, r: &mut syn::TypeReference) {
         if r.lifetime.is_none() {
             r.lifetime = Some(self.0.clone());

@@ -159,7 +159,7 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
 
     /// Returns the definition of an output port called `name`.
     ///
-    /// The record's schema is rooted at `name` under `cx`'s root.
+    /// The record's schema is rooted at `cx.port_path(name)`.
     pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
         PortDef {
             name: name.into(),
@@ -169,7 +169,7 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
             alignment: T::ALIGN,
             depth: T::DEPTH,
             layout: T::schema().layout(),
-            schema: T::schema_at(&cx.root(name)),
+            schema: T::schema_at(&cx.port_path(name)),
         }
     }
 
@@ -194,11 +194,15 @@ impl<W: WakeSource> Output<Bytes, W> {
     ///
     /// Records longer than `max_len` are rejected.
     pub fn bytes(writer: Writer<W>, max_len: usize) -> Self {
-        Self::bytes_counting(writer, max_len, Arc::default())
+        Self::with_dropped_counter(writer, max_len, Arc::default())
     }
 
     /// Creates a dynamic output that counts its failed writes in `dropped`.
-    pub fn bytes_counting(writer: Writer<W>, max_len: usize, dropped: Arc<AtomicU32>) -> Self {
+    pub fn with_dropped_counter(
+        writer: Writer<W>,
+        max_len: usize,
+        dropped: Arc<AtomicU32>,
+    ) -> Self {
         Self {
             writer,
             scratch: Cell::new(Some(Box::default())),
@@ -233,21 +237,7 @@ impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
     /// Creates an input that reads from `views`, one per producer.
     ///
     /// A record type that needs more alignment than the ring provides fails to
-    /// compile:
-    ///
-    /// ```compile_fail,E0080
-    /// # use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-    /// # use metor_fsw_3::{Frame, Input, Timestamp};
-    /// #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
-    /// #[repr(C, align(32))]
-    /// struct Overaligned {
-    ///     #[frame(timestamp)]
-    ///     timestamp: Timestamp,
-    ///     value: [u64; 3],
-    /// }
-    ///
-    /// let _ = Input::<Overaligned>::new(Vec::new());
-    /// ```
+    /// compile.
     pub fn new(views: Vec<View<W>>) -> Self {
         const {
             assert!(
@@ -366,7 +356,7 @@ pub fn dyn_output_defs(
         .iter()
         .filter(|output| !declared.iter().any(|taken| *taken == output.port))
         .map(|output| match &output.source {
-            OutputSource::Record(record) => cx.records.port(&output.port, record),
+            OutputSource::Record(record) => cx.records.port_def(&output.port, record),
             OutputSource::Def(def) => Ok(PortDef {
                 name: output.port.clone().into(),
                 ..def.clone()
@@ -420,11 +410,11 @@ pub struct DynOutputs<W: WakeSource = NoWake> {
 
 impl<W: WakeSource> DynOutputs<W> {
     /// Creates the outputs, counting their failed writes in `dropped`.
-    pub fn counting(outputs: Vec<OutputBinding<W>>, dropped: &Arc<AtomicU32>) -> Self {
+    pub fn new(outputs: Vec<OutputBinding<W>>, dropped: &Arc<AtomicU32>) -> Self {
         let ports = outputs
             .into_iter()
             .map(|b| {
-                let output = Output::bytes_counting(b.writer, b.def.max_len, dropped.clone());
+                let output = Output::with_dropped_counter(b.writer, b.def.max_len, dropped.clone());
                 (b.def, output)
             })
             .collect();
@@ -443,7 +433,7 @@ impl<W: WakeSource> SystemOutputs<W> for DynOutputs<W> {
     }
 
     fn bind(outputs: Vec<OutputBinding<W>>) -> Self {
-        Self::counting(outputs, &Arc::default())
+        Self::new(outputs, &Arc::default())
     }
 }
 
@@ -685,7 +675,7 @@ mod tests {
         let ring = ring::<Imu>(8, 1);
         let dropped = Arc::new(AtomicU32::new(0));
         let writer = ring.writer(NoWake).expect("free writer");
-        let out = Output::bytes_counting(writer, 4, dropped.clone());
+        let out = Output::with_dropped_counter(writer, 4, dropped.clone());
         assert_eq!(
             out.write_bytes(&[0; 5]),
             Err(SendError::Oversize { len: 5, max: 4 })

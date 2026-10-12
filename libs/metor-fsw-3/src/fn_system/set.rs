@@ -15,14 +15,14 @@ use crate::log::LogPort;
 use crate::port::{Output, Samplers};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
 
-use super::Ports;
+use super::FnSignature;
 use super::param::{Bindings, Defs, Param, Views, Writers};
 
 /// The output that every fn system writes its log events to.
 pub const LOG_PORT: &str = "log";
 
 /// The bound inputs of a fn system's parameters.
-pub struct InSet<S: Ports, W: WakeSink + Clone + 'static = NoWake> {
+pub struct InSet<S: FnSignature, W: WakeSink + Clone + 'static = NoWake> {
     pub(crate) ins: <S::Params as Param>::In<W>,
     pub(crate) samplers: Samplers,
 }
@@ -31,13 +31,13 @@ pub struct InSet<S: Ports, W: WakeSink + Clone + 'static = NoWake> {
 ///
 /// Failed writes on any of the outputs are counted and reported together on
 /// `log`.
-pub struct OutSet<S: Ports> {
+pub struct OutSet<S: FnSignature> {
     pub(crate) outs: <S::Params as Param>::Out,
     pub(crate) log: LogPort,
     pub(crate) dropped: Arc<AtomicU32>,
 }
 
-impl<S: Ports> OutSet<S> {
+impl<S: FnSignature> OutSet<S> {
     /// Reports the writes that failed since the last report.
     ///
     /// Writes at most one fault on `log`.
@@ -56,7 +56,7 @@ pub(crate) fn report_dropped(log: &mut LogPort, dropped: &AtomicU32, now: Timest
     }
 }
 
-impl<S: Ports, W: WakeSink + Clone + 'static> SystemInputs<W> for InSet<S, W> {
+impl<S: FnSignature, W: WakeSink + Clone + 'static> SystemInputs<W> for InSet<S, W> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         Ok(Defs::of::<S>(cx)?.inputs)
     }
@@ -67,7 +67,7 @@ impl<S: Ports, W: WakeSink + Clone + 'static> SystemInputs<W> for InSet<S, W> {
     }
 }
 
-impl<S: Ports> SystemOutputs for OutSet<S> {
+impl<S: FnSignature> SystemOutputs for OutSet<S> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         let mut outputs = Defs::of::<S>(cx)?.outputs;
         outputs.push(Output::<LogEvent>::def(cx, LOG_PORT));
@@ -82,9 +82,9 @@ impl<S: Ports> SystemOutputs for OutSet<S> {
 }
 
 /// A fn system's bound ports.
-pub(crate) type Bound<S> = (InSet<S>, OutSet<S>);
+pub(crate) type BoundSet<S> = (InSet<S>, OutSet<S>);
 
-/// The system instance a fn system binds for.
+/// The id, namespace, and seed of the system instance being bound.
 #[derive(Clone, Copy)]
 pub(crate) struct Instance<'a> {
     pub(crate) id: &'a str,
@@ -94,7 +94,7 @@ pub(crate) struct Instance<'a> {
 }
 
 impl<'a> Instance<'a> {
-    pub(crate) fn of(cx: &crate::coordinator::MakeCx<'a>) -> Self {
+    pub(crate) fn from_make_cx(cx: &crate::coordinator::MakeCx<'a>) -> Self {
         Self {
             id: cx.id,
             namespace: cx.namespace,
@@ -114,11 +114,11 @@ impl<'a> Instance<'a> {
 }
 
 /// Binds a fn system's ports.
-pub(crate) fn bind<S: Ports>(
+pub(crate) fn bind<S: FnSignature>(
     inputs: Vec<InputBinding>,
     outputs: Vec<OutputBinding>,
     instance: Instance<'_>,
-) -> Result<Bound<S>, ParamError> {
+) -> Result<BoundSet<S>, ParamError> {
     let defs = Defs::declared::<S>();
     let rng = defs.rng.then(|| instance.rng()).transpose()?;
     let dropped = Arc::<AtomicU32>::default();
@@ -136,7 +136,7 @@ fn writers(outputs: Vec<OutputBinding>, declared: usize, dropped: Arc<AtomicU32>
     }
 }
 
-fn bind_inputs<S: Ports, W: WakeSink + Clone + 'static>(
+fn bind_inputs<S: FnSignature, W: WakeSink + Clone + 'static>(
     inputs: Vec<InputBinding<W>>,
     declared: usize,
 ) -> InSet<S, W> {
@@ -154,7 +154,7 @@ fn bind_inputs<S: Ports, W: WakeSink + Clone + 'static>(
     }
 }
 
-fn bind_outputs<S: Ports>(mut writers: Writers) -> OutSet<S> {
+fn bind_outputs<S: FnSignature>(mut writers: Writers) -> OutSet<S> {
     let outs = S::Params::bind_out(&mut writers);
     // PANIC Safety: `defs` always appends the log as the last output.
     let log = writers

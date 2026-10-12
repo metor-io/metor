@@ -49,10 +49,6 @@ enum Group {
 }
 
 impl Threads {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// A registry whose groups the coordinator turns, for a deterministic
     /// run.
     pub fn deterministic() -> Self {
@@ -68,11 +64,12 @@ impl Threads {
         if self.deterministic {
             let group = self.get_or_turn(name)?;
             group.add(member)?;
-            return Ok(Group::Turned(group));
+            Ok(Group::Turned(group))
+        } else {
+            let group = self.get_or_spawn(name)?;
+            group.add(member)?;
+            Ok(Group::Spawned(group))
         }
-        let group = self.get_or_spawn(name)?;
-        group.add(member)?;
-        Ok(Group::Spawned(group))
     }
 
     /// Returns the group named `name`, starting it if it is not running.

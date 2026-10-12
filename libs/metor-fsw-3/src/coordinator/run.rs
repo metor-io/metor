@@ -14,10 +14,7 @@ use super::config::Clock;
 use super::status::SystemStatus;
 use super::step::{EndReason, Step, Stepped, catch_step};
 
-/// The end reason reported for an entry whose step panicked and was dropped.
-const UNWOUND: &EndReason = &EndReason::Panicked;
-
-/// One system in the coordinator's schedule.
+/// A system in the coordinator's schedule.
 pub(super) struct Entry {
     pub(super) name: String,
     pub(super) step: Option<Box<dyn Step>>,
@@ -44,7 +41,7 @@ impl Coordinator {
     /// Returns the number of rings allocated.
     ///
     /// There is one ring per output port, plus one status ring per system.
-    pub fn rings(&self) -> usize {
+    pub fn ring_count(&self) -> usize {
         self.rings.len()
     }
 
@@ -52,7 +49,7 @@ impl Coordinator {
     pub fn ended(&self) -> impl Iterator<Item = (&str, &EndReason)> {
         self.entries
             .iter()
-            .filter_map(|entry| Some((entry.name.as_str(), entry.ended()?)))
+            .filter_map(|entry| Some((entry.name.as_str(), entry.end_reason()?)))
     }
 
     /// Returns the ids of systems stopped by a panic, in step order.
@@ -61,9 +58,7 @@ impl Coordinator {
             .filter(|(_, end)| **end == EndReason::Panicked)
             .map(|(id, _)| id)
     }
-}
 
-impl Coordinator {
     /// Returns the number of cycles completed so far.
     pub fn cycle(&self) -> u64 {
         self.cycle
@@ -121,21 +116,21 @@ impl Entry {
     /// Returns why this entry's step ended.
     ///
     /// A step that was dropped after a panic reports [`EndReason::Panicked`].
-    pub(super) fn ended(&self) -> Option<&EndReason> {
+    pub(super) fn end_reason(&self) -> Option<&EndReason> {
         match &self.step {
             Some(step) => step.ended(),
-            None => Some(UNWOUND),
+            None => Some(&EndReason::Panicked),
         }
     }
 
     fn run(&mut self, now: Timestamp) -> Duration {
-        if self.ended().is_some() {
+        if self.end_reason().is_some() {
             return Duration::ZERO;
         }
         let started = Instant::now();
         let stepped = catch_step(&mut self.step, now);
         let elapsed = started.elapsed();
-        if stepped != Stepped::Ran && self.ended() == Some(UNWOUND) {
+        if stepped != Stepped::Ran && self.end_reason() == Some(&EndReason::Panicked) {
             crate::panic::catch(|| tracing::error!(system = self.name, "system panicked"));
         }
         elapsed

@@ -12,10 +12,6 @@ use crate::coordinator::{MakeCx, ParamError, Params, Step};
 pub struct Threads;
 
 impl Threads {
-    pub fn new() -> Self {
-        Self
-    }
-
     pub fn deterministic() -> Self {
         Self
     }
@@ -53,7 +49,7 @@ mod tests {
             params: Params(&serde_json::Value::Null),
             inputs: vec![vec![&imu]],
             outputs: vec![&nav, &log],
-            threads: &mut Threads::new(),
+            threads: &mut Threads::default(),
             seed: Some(0),
             namespace: "",
         });

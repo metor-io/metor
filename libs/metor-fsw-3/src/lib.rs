@@ -123,7 +123,7 @@ pub use coordinator::{
 };
 pub use def::{DefCx, DefError, Records};
 pub use fn_system::{
-    AsyncSystemFn, Ctor, Cycle, FnSystem, InSet, OutSet, Param, ParamNames, Ports, SystemFn,
+    AsyncSystemFn, Ctor, Cycle, FnSignature, FnSystem, InSet, OutSet, Param, ParamNames, SystemFn,
 };
 pub use frame::Frame;
 pub use log::{Log, LogLayer};

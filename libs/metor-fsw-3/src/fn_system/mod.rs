@@ -28,7 +28,7 @@ pub use set::{InSet, LOG_PORT, OutSet};
 pub(crate) use set::{Instance, bind};
 
 /// Describes the parameters of a system written as a fn.
-pub trait Ports: Sized + 'static {
+pub trait FnSignature: Sized + 'static {
     /// The type of the `#[state]` parameter, or `()` if there is none.
     type State: 'static;
     type Params: Param;
@@ -40,7 +40,7 @@ pub trait Ports: Sized + 'static {
 }
 
 /// A cyclic system written as a fn.
-pub trait SystemFn: Ports {
+pub trait SystemFn: FnSignature {
     /// Runs one cycle.
     fn call(state: &mut Self::State, items: <Self::Params as Param>::Item<'_, NoWake>);
 }
@@ -49,7 +49,7 @@ pub trait SystemFn: Ports {
 ///
 /// Besides its ports, the fn receives a [`Stop`] that tells it when to end.
 #[allow(async_fn_in_trait)]
-pub trait AsyncSystemFn: Ports {
+pub trait AsyncSystemFn: FnSignature {
     /// Runs the system until `stop` resolves.
     async fn call(
         state: &mut Self::State,
@@ -111,7 +111,7 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
         let mut cx = Cycle::new(Timestamp::now(), &mut log);
         let items = S::Params::get::<Notifier>(&mut inputs.ins, &mut outputs.outs, &mut cx);
         let call = core::pin::pin!(S::call(state, items, stop));
-        log::log_scope(&mut outputs.log, call).await;
+        log::with_logs(&mut outputs.log, call).await;
     }
 }
 

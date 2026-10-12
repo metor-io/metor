@@ -104,13 +104,16 @@ impl<W: WakeSource> Mirrors<W> {
         inputs: Vec<Mirror<W>>,
         outputs: Vec<Mirror<NoWake>>,
     ) -> Self {
-        let ports = inputs
+        // A drop report's fields: a `kind`, then one count per port in bind order.
+        let kind = (Cow::Borrowed("kind"), Cow::Borrowed("mirror_dropped"));
+        let counts = inputs
             .iter()
             .map(|mirror| &mirror.port)
-            .chain(outputs.iter().map(|mirror| &mirror.port));
+            .chain(outputs.iter().map(|mirror| &mirror.port))
+            .map(|port| (port.clone(), Cow::Owned(String::with_capacity(20))));
         Self {
             line: vec![0; LogEvent::MAX_LEN],
-            fields: drop_fields(ports),
+            fields: core::iter::once(kind).chain(counts).collect(),
             since_report: 0,
             log: log_port(def),
             inputs,
@@ -172,7 +175,11 @@ impl<W: WakeSource> Mirrors<W> {
         let counts = counts(&mut self.inputs, &mut self.outputs);
         for ((_, field), count) in self.fields[1..].iter_mut().zip(counts) {
             dropped |= count > 0;
-            set_count(field, count);
+            // Writes into the field's existing buffer, without allocating.
+            if let Cow::Owned(text) = field {
+                text.clear();
+                let _ = write!(text, "{count}");
+            }
         }
         dropped
     }
@@ -204,24 +211,6 @@ fn counts<'a, W: WakeSource>(
     let inputs = inputs.iter_mut().map(|m| core::mem::take(&mut m.dropped));
     let outputs = outputs.iter_mut().map(|m| core::mem::take(&mut m.dropped));
     inputs.chain(outputs)
-}
-
-/// Writes `count` into a field's existing buffer, without allocating.
-fn set_count(value: &mut Cow<'static, str>, count: u64) {
-    let Cow::Owned(text) = value else { return };
-    text.clear();
-    let _ = write!(text, "{count}");
-}
-
-/// Builds the fields of a drop report: a `kind` field, then one count field
-/// per port in bind order.
-fn drop_fields<'a>(ports: impl Iterator<Item = &'a Cow<'static, str>>) -> Fields {
-    let kind = (Cow::Borrowed("kind"), Cow::Borrowed("mirror_dropped"));
-    let counts = ports.map(|port| {
-        let count = Cow::Owned(String::with_capacity(20));
-        (port.clone(), count)
-    });
-    core::iter::once(kind).chain(counts).collect()
 }
 
 /// Returns the config for a mirror ring and the length of its region.

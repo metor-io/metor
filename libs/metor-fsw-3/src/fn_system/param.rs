@@ -8,13 +8,15 @@ use std::sync::Arc;
 use metor_fsw_3_ring::WakeSink;
 use metor_proto::types::Timestamp;
 
-use crate::Rng;
-use crate::def::{DefCx, DefError};
-use crate::frame::Frame;
-use crate::log::Log;
-use crate::port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers};
-use crate::record::Record;
-use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs};
+use crate::{
+    Rng,
+    def::{DefCx, DefError},
+    frame::Frame,
+    log::Log,
+    port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers},
+    record::Record,
+    system::{InputBinding, OutputBinding, PortDef, SystemInputs},
+};
 
 /// Hands out port bindings to parameters, in parameter order.
 ///
@@ -90,28 +92,29 @@ pub struct Defs {
 
 impl Defs {
     /// Returns every port `S`'s parameters take under the config in `cx`.
-    pub(crate) fn of<S: crate::fn_system::Ports>(cx: &DefCx<'_>) -> Result<Self, DefError> {
+    pub(crate) fn of<S: crate::fn_system::FnSignature>(cx: &DefCx<'_>) -> Result<Self, DefError> {
         let declared = Self::declared::<S>();
-        Self::walk::<S>(
-            cx,
-            Self {
-                declared_inputs: names(&declared.inputs),
-                declared_outputs: names(&declared.outputs),
-                ..Self::default()
-            },
-        )
+        Self {
+            declared_inputs: names(&declared.inputs),
+            declared_outputs: names(&declared.outputs),
+            ..Self::default()
+        }
+        .walk::<S>(cx)
     }
 
     /// Returns the ports `S`'s parameters take regardless of config.
-    pub(crate) fn declared<S: crate::fn_system::Ports>() -> Self {
+    pub(crate) fn declared<S: crate::fn_system::FnSignature>() -> Self {
         // PANIC Safety: a dynamic parameter only fails on ports named in the
         // config, and the empty context names none.
-        Self::walk::<S>(&DefCx::empty(), Self::default()).expect("no config ports")
+        Self::default()
+            .walk::<S>(&DefCx::empty())
+            .expect("no config ports")
     }
 
-    fn walk<S: crate::fn_system::Ports>(cx: &DefCx<'_>, mut defs: Self) -> Result<Self, DefError> {
-        S::Params::append_defs(&mut S::NAMES.iter(), cx, &mut defs)?;
-        Ok(defs)
+    /// Appends the ports `S`'s parameters take under the config in `cx`.
+    fn walk<S: crate::fn_system::FnSignature>(mut self, cx: &DefCx<'_>) -> Result<Self, DefError> {
+        S::Params::append_defs(&mut S::NAMES.iter(), cx, &mut self)?;
+        Ok(self)
     }
 }
 
@@ -387,7 +390,7 @@ impl Param for DynOutputs {
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
     fn bind_out(writers: &mut Writers) -> Self::Out {
-        DynOutputs::counting(writers.bindings.take(), &writers.dropped)
+        DynOutputs::new(writers.bindings.take(), &writers.dropped)
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(

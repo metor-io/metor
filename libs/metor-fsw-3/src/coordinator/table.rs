@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use metor_fsw_3_ring::{NoWake, RingBuffer};
 use serde::{Deserialize, Serialize};
@@ -22,9 +22,6 @@ use super::config::Adapter;
 use super::params::{ParamError, Params};
 use super::step::Runner;
 use super::step::Step;
-
-static STATUS: LazyLock<PortDef> =
-    LazyLock::new(|| crate::Output::<super::SystemStatus>::def(&DefCx::empty(), "status"));
 
 /// The arguments a system type's constructor receives.
 pub struct MakeCx<'a> {
@@ -111,7 +108,7 @@ impl SystemTable {
     ) -> Result<(), BuildError> {
         self.insert(
             ty,
-            entry::<S>(make, Cow::Borrowed(""), None).map_err(def_error(ty))?,
+            TableEntry::system::<S>(make, Cow::Borrowed(""), None).map_err(def_error(ty))?,
         )
     }
 
@@ -124,7 +121,7 @@ impl SystemTable {
         _system: S,
         ctor: C,
     ) -> Result<(), BuildError> {
-        let entry = fn_entry::<S, M, C>(ctor).map_err(def_error(ty))?;
+        let entry = TableEntry::system_fn::<S, M, C>(ctor).map_err(def_error(ty))?;
         self.insert(ty, entry)
     }
 
@@ -136,7 +133,8 @@ impl SystemTable {
         ty: &str,
         make: impl Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
     ) -> Result<(), BuildError> {
-        let entry = async_entry::<A, _>(make, Cow::Borrowed(""), None).map_err(def_error(ty))?;
+        let entry = TableEntry::async_system::<A, _>(make, Cow::Borrowed(""), None)
+            .map_err(def_error(ty))?;
         self.insert(ty, entry)
     }
 
@@ -153,8 +151,9 @@ impl SystemTable {
             let state = ctor.make(params)?;
             Ok((FnSystem::default(), state))
         };
-        let entry = async_entry::<FnSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema())
-            .map_err(def_error(ty))?;
+        let entry =
+            TableEntry::async_system::<FnSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema())
+                .map_err(def_error(ty))?;
         self.insert(ty, entry)
     }
 
@@ -200,8 +199,9 @@ impl SystemTable {
     ///
     /// This includes the `status` port the coordinator adds.
     pub(crate) fn records(&self) -> crate::def::Records {
-        crate::def::Records::of(
-            core::iter::once(&*STATUS)
+        let status = status_port();
+        crate::def::Records::from_port_defs(
+            core::iter::once(&status)
                 .chain(self.entries().flat_map(|(_, entry)| ports(&entry.def))),
         )
     }
@@ -215,13 +215,21 @@ fn def_error(ty: &str) -> impl FnOnce(DefError) -> BuildError + '_ {
     }
 }
 
+/// The `status` port the coordinator adds to every system.
+fn status_port() -> PortDef {
+    crate::Output::<super::SystemStatus>::def(&DefCx::empty(), "status")
+}
+
 fn ports(def: &SystemDef) -> impl Iterator<Item = &PortDef> {
     def.inputs.iter().chain(&def.outputs)
 }
 
+/// Checks that `def`'s ports agree on their records, with each other and with
+/// the `status` port the coordinator adds.
 fn check_definition(def: &SystemDef) -> Result<(), BuildError> {
+    let status = status_port();
     for (at, port) in ports(def).enumerate() {
-        check_record(&STATUS, port)?;
+        check_record(&status, port)?;
         for known in ports(def).take(at) {
             check_record(known, port)?;
         }
@@ -265,63 +273,89 @@ fn check_record(known: &PortDef, port: &PortDef) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// Builds the table entry for a cyclic `System`.
-///
-/// The entry's `make` binds the system's inputs and outputs to the rings it is
-/// given.
-fn entry<S: System + 'static>(
-    make: impl Fn(Params<'_>) -> Result<(S, S::State), ParamError> + 'static,
-    doc: Cow<'static, str>,
-    schema: Option<Box<RawValue>>,
-) -> Result<TableEntry, DefError> {
-    let def = S::def(&DefCx::empty())?;
-    Ok(TableEntry {
-        kind: SystemKind::Cyclic,
-        def,
-        def_fn: Box::new(S::def),
-        doc,
-        schema,
-        make: Arc::new(move |cx| {
-            refuse_thread(cx.adapter)?;
-            let (system, state) = make(cx.params)?;
-            let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
-            Ok(Box::new(Runner {
-                system,
-                state,
-                inputs: S::Inputs::bind(views),
-                outputs: S::Outputs::bind(writers),
-            }))
-        }),
-    })
-}
+impl TableEntry {
+    /// Builds the table entry for a cyclic `System`.
+    ///
+    /// The entry's `make` binds the system's inputs and outputs to the rings it is
+    /// given.
+    fn system<S: System + 'static>(
+        make: impl Fn(Params<'_>) -> Result<(S, S::State), ParamError> + 'static,
+        doc: Cow<'static, str>,
+        schema: Option<Box<RawValue>>,
+    ) -> Result<Self, DefError> {
+        let def = S::def(&DefCx::empty())?;
+        Ok(Self {
+            kind: SystemKind::Cyclic,
+            def,
+            def_fn: Box::new(S::def),
+            doc,
+            schema,
+            make: Arc::new(move |cx| {
+                refuse_thread(cx.adapter)?;
+                let (system, state) = make(cx.params)?;
+                let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
+                Ok(Box::new(Runner {
+                    system,
+                    state,
+                    inputs: S::Inputs::bind(views),
+                    outputs: S::Outputs::bind(writers),
+                }))
+            }),
+        })
+    }
 
-/// Builds the table entry for a `#[system]` fn.
-///
-/// The entry's `make` binds the system's ports before `ctor` builds its
-/// state.
-fn fn_entry<S: SystemFn, M, C: Ctor<S::State, M> + 'static>(
-    ctor: C,
-) -> Result<TableEntry, DefError> {
-    Ok(TableEntry {
-        kind: SystemKind::Cyclic,
-        def: FnSystem::<S>::def(&DefCx::empty())?,
-        def_fn: Box::new(FnSystem::<S>::def),
-        doc: Cow::Borrowed(S::DOC),
-        schema: C::schema(),
-        make: Arc::new(move |cx| {
-            refuse_thread(cx.adapter)?;
-            let instance = fn_system::Instance::of(&cx);
-            let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
-            let (inputs, outputs) = fn_system::bind::<S>(views, writers, instance)?;
-            let state = ctor.make(cx.params)?;
-            Ok(Box::new(Runner {
-                system: FnSystem::default(),
-                state,
-                inputs,
-                outputs,
-            }))
-        }),
-    })
+    /// Builds the table entry for a `#[system]` fn.
+    ///
+    /// The entry's `make` binds the system's ports before `ctor` builds its
+    /// state.
+    fn system_fn<S: SystemFn, M, C: Ctor<S::State, M> + 'static>(
+        ctor: C,
+    ) -> Result<Self, DefError> {
+        Ok(Self {
+            kind: SystemKind::Cyclic,
+            def: FnSystem::<S>::def(&DefCx::empty())?,
+            def_fn: Box::new(FnSystem::<S>::def),
+            doc: Cow::Borrowed(S::DOC),
+            schema: C::schema(),
+            make: Arc::new(move |cx| {
+                refuse_thread(cx.adapter)?;
+                let instance = fn_system::Instance::from_make_cx(&cx);
+                let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
+                let (inputs, outputs) = fn_system::bind::<S>(views, writers, instance)?;
+                let state = ctor.make(cx.params)?;
+                Ok(Box::new(Runner {
+                    system: FnSystem::default(),
+                    state,
+                    inputs,
+                    outputs,
+                }))
+            }),
+        })
+    }
+
+    /// Builds the table entry for an async system.
+    ///
+    /// The entry's `make` places the system on the thread its adapter asks for, or on
+    /// the default thread.
+    fn async_system<A, M>(
+        make: M,
+        doc: Cow<'static, str>,
+        schema: Option<Box<RawValue>>,
+    ) -> Result<Self, DefError>
+    where
+        A: AsyncSystem + 'static,
+        M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+    {
+        let make = Arc::new(make);
+        Ok(Self {
+            kind: SystemKind::Async,
+            def: A::def(&DefCx::empty())?,
+            def_fn: Box::new(A::def),
+            doc,
+            schema,
+            make: Arc::new(move |cx| crate::thread::place::<A, M>(make.clone(), cx)),
+        })
+    }
 }
 
 /// Returns an error if the adapter is a thread.
@@ -370,30 +404,6 @@ pub(crate) fn bindings(
     (views, writers)
 }
 
-/// Builds the table entry for an async system.
-///
-/// The entry's `make` places the system on the thread its adapter asks for, or on
-/// the default thread.
-fn async_entry<A, M>(
-    make: M,
-    doc: Cow<'static, str>,
-    schema: Option<Box<RawValue>>,
-) -> Result<TableEntry, DefError>
-where
-    A: AsyncSystem + 'static,
-    M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
-{
-    let make = Arc::new(make);
-    Ok(TableEntry {
-        kind: SystemKind::Async,
-        def: A::def(&DefCx::empty())?,
-        def_fn: Box::new(A::def),
-        doc,
-        schema,
-        make: Arc::new(move |cx| crate::thread::place::<A, M>(make.clone(), cx)),
-    })
-}
-
 #[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
@@ -405,7 +415,7 @@ mod tests {
 
     /// Looks up the record `name` in the table and returns it on a port named `out`.
     fn record(table: &SystemTable, name: &str) -> Option<PortDef> {
-        table.records().port("out", name).ok()
+        table.records().port_def("out", name).ok()
     }
 
     fn out(port: &PortDef) -> PortDef {
@@ -429,7 +439,7 @@ mod tests {
     }
 
     fn declared(outputs: Vec<PortDef>) -> TableEntry {
-        let mut entry = entry::<Trap>(|_| Ok((Trap, ())), Cow::Borrowed(""), None)
+        let mut entry = TableEntry::system::<Trap>(|_| Ok((Trap, ())), Cow::Borrowed(""), None)
             .expect("a static definition");
         entry.def.outputs = outputs;
         entry
@@ -438,7 +448,7 @@ mod tests {
     #[test]
     fn test_record_lookup() {
         let mut table = SystemTable::new();
-        assert_eq!(record(&table, "status"), Some(out(&STATUS)));
+        assert_eq!(record(&table, "status"), Some(out(&status_port())));
         assert!(record(&table, "missing").is_none());
         let first = Output::<Imu>::def(&DefCx::empty(), "first");
         let mut second = first.clone();
@@ -590,7 +600,7 @@ mod tests {
     #[test]
     fn test_reject_status_replacement() {
         let mut table = SystemTable::new();
-        let mut status = STATUS.clone();
+        let mut status = status_port();
         status.schema = RecordSchema::msg("status", MsgCodec::Bytes);
         assert!(matches!(
             table.insert("bad", declared(vec![status])),
@@ -704,7 +714,7 @@ mod tests {
         let entry = table.get("idle").expect("registered");
         assert_eq!(entry.def.name, "idle");
         assert!(entry.def.inputs.is_empty() && entry.def.outputs.is_empty());
-        let mut threads = Threads::new();
+        let mut threads = Threads::default();
         let def = entry.def.clone();
         let step = (entry.make)(MakeCx {
             id: "idle",
