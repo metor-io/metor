@@ -16,7 +16,7 @@ use common::{
 };
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::coordinator::{CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
-use metor_fsw_3::{Clock, LinkStatus};
+use metor_fsw_3::{Clock, LinkStatus, WallRate};
 use metor_proto::types::{Msg, OwnedPacket};
 use metor_proto_wkt::LogEvent;
 use serde_json::json;
@@ -148,7 +148,9 @@ fn impostor(port: u16) -> Impostor {
         table
     };
     let config = CoordinatorConfig {
-        clock: Clock::Wall { rate: 1000.0 },
+        clock: Clock::Wall {
+            rate: WallRate::try_from(1000.0).expect("a valid rate"),
+        },
         namespace: Some("a".into()),
         systems: vec![
             SystemConfig::new("imu", "source"),

@@ -17,7 +17,9 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use super::cargo::{lookup, read_toml, string};
 use super::pack_dev::{PackDevError, pack_dev};
-use crate::coordinator::{BuildError, BuildOptions, Clock, Coordinator, SystemTable};
+use crate::coordinator::{
+    BuildError, BuildOptions, Clock, Coordinator, EndReason, SystemTable, WallRate,
+};
 use crate::deploy::{self, ConfigError, DeployError, DeploymentConfig, TargetConfig};
 use crate::dl::store;
 use crate::dl::{Pack, PackError, PackRef};
@@ -40,8 +42,8 @@ pub struct Run {
     #[arg(long)]
     pub cycles: Option<u64>,
     /// Pace the loop at this wall rate in Hz, overriding the target's clock.
-    #[arg(long, conflicts_with = "sim_dt")]
-    pub wall: Option<f64>,
+    #[arg(long, conflicts_with = "sim_dt", value_parser = wall_rate)]
+    pub wall: Option<WallRate>,
     /// Step a simulated clock by this many seconds per cycle.
     #[arg(long)]
     pub sim_dt: Option<f64>,
@@ -89,6 +91,12 @@ pub enum RunError {
     PrintPortsNeedsTarget,
 }
 
+/// Parses `--wall` into a [`WallRate`].
+fn wall_rate(arg: &str) -> Result<WallRate, String> {
+    let rate: f64 = arg.parse().map_err(|e| format!("{e}"))?;
+    WallRate::try_from(rate).map_err(|e| e.to_string())
+}
+
 /// Runs `metor run`.
 ///
 /// Rebuilds every dev pack, evaluates the target file, and cycles the target
@@ -116,7 +124,11 @@ pub fn run(args: Run) -> Result<(), RunError> {
         coordinator
     });
 
-    let latched: Vec<&str> = coordinator.latched().collect();
+    let latched: Vec<&str> = coordinator
+        .systems()
+        .filter(|(_, end)| *end == Some(&EndReason::Panicked))
+        .map(|(id, _)| id)
+        .collect();
     if latched.is_empty() {
         return Ok(());
     }

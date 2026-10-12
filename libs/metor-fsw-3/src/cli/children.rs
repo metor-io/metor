@@ -32,7 +32,7 @@ pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsS
             "--cycles",
             overrides.cycles.map(|cycles| cycles.to_string()),
         ),
-        ("--wall", overrides.wall.map(|rate| rate.to_string())),
+        ("--wall", overrides.wall.map(|rate| rate.get().to_string())),
         ("--sim-dt", overrides.sim_dt.map(|dt| dt.to_string())),
         ("--epoch", overrides.epoch.map(|at| at.to_string())),
     ];
@@ -248,7 +248,7 @@ mod tests {
         );
         let overrides = Run {
             cycles: Some(3),
-            wall: Some(50.0),
+            wall: crate::WallRate::try_from(50.0).ok(),
             sim_dt: Some(0.01),
             epoch: Some(5),
             deterministic: true,
