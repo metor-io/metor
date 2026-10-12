@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 
 use super::DeploymentConfig;
-use crate::coordinator::instance_def;
 use crate::coordinator::{OutputSource, PeerPort, PortRef, SystemConfig, SystemTable};
 use crate::def::Records;
 use crate::system::{PortDef, SystemDef};
@@ -150,7 +149,7 @@ impl<'a> DefIndex<'a> {
         })?;
         let system = self.resolved_outputs(at, system)?;
         let producers = self.producers(at, &system, &entry.def)?;
-        instance_def(
+        SystemDef::instance(
             &system,
             entry,
             target.coordinator.namespace.as_deref(),

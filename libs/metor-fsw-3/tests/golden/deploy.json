@@ -17,6 +17,7 @@
           }
         },
         "ring_depth": 8,
+        "seed": 0,
         "namespace": "a",
         "systems": [
           {
@@ -89,6 +90,7 @@
           }
         },
         "ring_depth": 8,
+        "seed": 0,
         "namespace": "b",
         "systems": [
           {
