@@ -13,7 +13,7 @@ use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::log::LogPort;
 use crate::port::{Output, Samplers};
-use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
+use crate::system::{InputBinding, OutputBinding, PortDef, Ports};
 
 use super::FnSignature;
 use super::param::{Bindings, Defs, Param, Views, Writers};
@@ -56,7 +56,7 @@ pub(crate) fn report_dropped(log: &mut LogPort, dropped: &AtomicU32, now: Timest
     }
 }
 
-impl<S: FnSignature, W: WakeSink + Clone + 'static> SystemInputs<W> for InSet<S, W> {
+impl<S: FnSignature, W: WakeSink + Clone + 'static> Ports<InputBinding<W>> for InSet<S, W> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         Ok(Defs::of::<S>(cx)?.inputs)
     }
@@ -67,7 +67,7 @@ impl<S: FnSignature, W: WakeSink + Clone + 'static> SystemInputs<W> for InSet<S,
     }
 }
 
-impl<S: FnSignature> SystemOutputs for OutSet<S> {
+impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         let mut outputs = Defs::of::<S>(cx)?.outputs;
         outputs.push(Output::<LogEvent>::def(cx, LOG_PORT));

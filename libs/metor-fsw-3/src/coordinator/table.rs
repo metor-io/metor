@@ -12,9 +12,7 @@ use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, SystemFn};
-use crate::system::{
-    InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
-};
+use crate::system::{InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 use crate::thread::{DEFAULT_THREAD, Threads};
 
 use super::BuildError;

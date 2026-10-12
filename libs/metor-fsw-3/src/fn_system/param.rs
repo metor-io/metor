@@ -15,7 +15,7 @@ use crate::{
     log::Log,
     port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers},
     record::Record,
-    system::{InputBinding, OutputBinding, PortDef, SystemInputs},
+    system::{InputBinding, OutputBinding, PortDef, Ports},
 };
 
 /// Hands out port bindings to parameters, in parameter order.
@@ -357,7 +357,7 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
-        SystemInputs::bind(views.bindings.take())
+        Ports::bind(views.bindings.take())
     }
 
     fn bind_out(_writers: &mut Writers) {}

@@ -134,9 +134,7 @@ pub use port::{
 };
 pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Record, RecordSchema};
 pub use rng::Rng;
-pub use system::{
-    InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
-};
+pub use system::{InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 
 pub use metor_fsw_3_ring as ring;
 pub use metor_proto::types::Timestamp;

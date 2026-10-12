@@ -8,7 +8,7 @@ use maitake_sync::WaitQueue;
 use metor_fsw_3_ring::Notifier;
 
 use crate::def::{DefCx, DefError};
-use crate::system::{SystemDef, SystemInputs, SystemOutputs};
+use crate::system::{InputBinding, OutputBinding, Ports, SystemDef};
 
 /// A system that runs on its own thread and sets its own pace.
 ///
@@ -20,8 +20,8 @@ use crate::system::{SystemDef, SystemInputs, SystemOutputs};
 #[allow(async_fn_in_trait)]
 pub trait AsyncSystem {
     type State;
-    type Inputs: SystemInputs<Notifier>;
-    type Outputs: SystemOutputs;
+    type Inputs: Ports<InputBinding<Notifier>>;
+    type Outputs: Ports<OutputBinding>;
 
     /// Returns this instance's ports, computed from its config.
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError>;

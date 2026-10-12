@@ -1,4 +1,4 @@
-//! The [`System`] trait, and the traits for binding a system's ports.
+//! The [`System`] trait, and the [`Ports`] trait for binding a system's ports.
 //!
 //! A system declares its ports as definitions first. The coordinator matches
 //! those definitions against the config, creates the rings, and then binds
@@ -65,7 +65,7 @@ impl SystemDef {
     ///
     /// `I` and `O` compute the input and output ports from `cx`. The inputs
     /// wait on `W`.
-    pub fn new<I: SystemInputs<W>, O: SystemOutputs, W: WakeSink>(
+    pub fn new<I: Ports<InputBinding<W>>, O: Ports<OutputBinding>, W: WakeSink>(
         name: &'static str,
         cx: &DefCx<'_>,
     ) -> Result<Self, DefError> {
@@ -97,8 +97,8 @@ pub struct OutputBinding<W: WakeSource = NoWake> {
 /// writes its outputs.
 pub trait System {
     type State;
-    type Inputs: SystemInputs;
-    type Outputs: SystemOutputs;
+    type Inputs: Ports<InputBinding>;
+    type Outputs: Ports<OutputBinding>;
 
     /// Returns this instance's ports, computed from its config.
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError>;
@@ -116,53 +116,30 @@ pub trait System {
     fn fault(&self, _now: Timestamp, _outputs: &mut Self::Outputs, _message: &str) {}
 }
 
-/// A system's input ports.
+/// A system's input or output ports, bound from one `B` per port.
 ///
-/// Ports are bound in the order [`defs`](SystemInputs::defs) lists them. `W`
-/// is what the ports wait on: [`NoWake`] for a cyclic system, and
-/// [`Notifier`](metor_fsw_3_ring::Notifier) for an async one.
-pub trait SystemInputs<W: WakeSink = NoWake> {
+/// `B` is an [`InputBinding`] for inputs and an [`OutputBinding`] for outputs.
+/// Its wake parameter is what the ports wait on or notify: [`NoWake`] for a
+/// cyclic system, and [`Notifier`](metor_fsw_3_ring::Notifier) for an async
+/// system's inputs.
+pub trait Ports<B> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError>;
 
     /// Binds the ports.
     ///
-    /// `inputs` has one binding per [`defs`](SystemInputs::defs) entry, in the
-    /// same order.
+    /// `bindings` has one entry per [`defs`](Ports::defs) entry, in the same
+    /// order.
     ///
     /// # Panics
-    /// May panic if `inputs` does not match `defs`.
-    fn bind(inputs: Vec<InputBinding<W>>) -> Self;
+    /// May panic if `bindings` does not match `defs`.
+    fn bind(bindings: Vec<B>) -> Self;
 }
 
-/// A system's output ports.
-///
-/// Ports are bound in the order [`defs`](SystemOutputs::defs) lists them. `W`
-/// is what the ports notify, as with [`SystemInputs`].
-pub trait SystemOutputs<W: WakeSource = NoWake> {
-    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError>;
-
-    /// Binds the ports.
-    ///
-    /// `outputs` has one binding per [`defs`](SystemOutputs::defs) entry, in
-    /// the same order.
-    ///
-    /// # Panics
-    /// May panic if `outputs` does not match `defs`.
-    fn bind(outputs: Vec<OutputBinding<W>>) -> Self;
-}
-
-impl<W: WakeSink> SystemInputs<W> for () {
+impl<B> Ports<B> for () {
     fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         Ok(Vec::new())
     }
-    fn bind(_inputs: Vec<InputBinding<W>>) -> Self {}
-}
-
-impl<W: WakeSource> SystemOutputs<W> for () {
-    fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
-        Ok(Vec::new())
-    }
-    fn bind(_outputs: Vec<OutputBinding<W>>) -> Self {}
+    fn bind(_bindings: Vec<B>) -> Self {}
 }
 
 #[cfg(test)]
