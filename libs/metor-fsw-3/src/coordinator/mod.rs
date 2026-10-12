@@ -22,7 +22,7 @@ mod tests;
 #[cfg(feature = "host")]
 pub(crate) use config::Adapters;
 #[cfg(feature = "host")]
-pub(crate) use build::{instance_def, status_def};
+pub(crate) use build::status_def;
 pub use config::{
     Adapter, BuildOptions, ChannelConfig, ChannelName, ChannelNameTooLong, Clock,
     CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig, InvalidWallRate, Location, OutputConfig,

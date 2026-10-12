@@ -68,7 +68,7 @@ fn envelope() -> DeploymentConfig {
             },
             SystemConfig {
                 params: peer("b", "out"),
-                outputs: vec![OutputConfig::record("log", "log")],
+                outputs: vec![OutputConfig::with_record("log", "log")],
                 ..SystemConfig::new("cmds", SUBSCRIBE_TYPE)
             },
         ],
