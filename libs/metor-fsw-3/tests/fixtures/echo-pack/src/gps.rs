@@ -229,6 +229,7 @@ mod tests {
             capacity: ring_capacity(T::MAX_LEN, 32).unwrap(),
             max_readers: 1,
         })
+        .expect("a valid ring config")
     }
 
     /// The driver, its outputs, and the model behind its uart.

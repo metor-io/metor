@@ -154,9 +154,9 @@ fn panicking_model_ends_alone() {
     config.systems[2].params = serde_json::Value::Null;
     let seen = Seen::default();
     let c = run(&seen, config, 20);
-    let ended: Vec<_> = c.ended().collect();
+    let ended: Vec<_> = c.systems().filter(|(_, end)| end.is_some()).collect();
     assert!(
-        matches!(ended.as_slice(), [("receiver", EndReason::Panicked)]),
+        matches!(ended.as_slice(), [("receiver", Some(EndReason::Panicked))]),
         "{ended:?}"
     );
     assert_eq!(first_fix(&seen), None, "the read never completes");
