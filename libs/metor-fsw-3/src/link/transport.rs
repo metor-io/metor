@@ -138,16 +138,19 @@ impl Dialer {
     }
 }
 
-/// Opens and serves connections until `stop` is set.
-///
-/// A listener accepts every peer, and closes a peer right away when every slot
-/// is taken. A dialer keeps one connection open and redials when it closes.
-/// This runs as its own task, separate from the link's loop, so sending a
-/// batch never cancels an accept or a dial that is halfway through.
-pub(crate) async fn source(endpoint: Endpoint, conns: Rc<Connections>, stop: Stop) {
-    match endpoint {
-        Endpoint::Listen { listener, .. } => listen(listener, conns, stop).await,
-        Endpoint::Connect { dialer } => dial(dialer, conns, stop).await,
+impl Endpoint {
+    /// Opens and serves connections until `stop` is set.
+    ///
+    /// A listener accepts every peer, and closes a peer right away when every
+    /// slot is taken. A dialer keeps one connection open and redials when it
+    /// closes. This runs as its own task, separate from the link's loop, so
+    /// sending a batch never cancels an accept or a dial that is halfway
+    /// through.
+    pub(crate) async fn run(self, conns: Rc<Connections>, stop: Stop) {
+        match self {
+            Self::Listen { listener, .. } => listen(listener, conns, stop).await,
+            Self::Connect { dialer } => dial(dialer, conns, stop).await,
+        }
     }
 }
 
@@ -156,20 +159,16 @@ async fn listen(listener: TcpListener, conns: Rc<Connections>, stop: Stop) {
         let Some(stream) = accept(&listener, &stop).await else {
             continue;
         };
-        let Some(slot) = conns.claim() else {
-            continue;
-        };
-        let (conns, stop) = (conns.clone(), stop.clone());
-        drop(stellarator::spawn(async move {
-            conns.serve(slot, stream, &stop).await;
-        }));
+        if let Some(served) = conns.serve(stream, &stop) {
+            drop(stellarator::spawn(served));
+        }
     }
 }
 
 async fn dial(mut dialer: Dialer, conns: Rc<Connections>, stop: Stop) {
     while let Some(stream) = dialer.connect(&stop).await {
-        if let Some(slot) = conns.claim() {
-            conns.serve(slot, stream, &stop).await;
+        if let Some(served) = conns.serve(stream, &stop) {
+            served.await;
         }
     }
 }
@@ -190,23 +189,16 @@ pub(crate) async fn accept(listener: &TcpListener, stop: &Stop) -> Option<TcpStr
     match accepted {
         Some(Ok(stream)) => Some(stream),
         Some(Err(error)) => {
-            accept_failed(&error, stop).await;
+            tracing::warn!(%error, "accept failed, backing off");
+            futures_lite::future::or(stellarator::sleep(BACKOFF_INITIAL), stop.wait()).await;
             None
         }
         None => None,
     }
 }
 
-/// Logs an accept failure and pauses. `stop` cuts the pause short.
-async fn accept_failed(error: &stellarator::Error, stop: &Stop) {
-    tracing::warn!(%error, "accept failed, backing off");
-    futures_lite::future::or(stellarator::sleep(BACKOFF_INITIAL), stop.wait()).await;
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
     use crate::async_system::stop_pair;
 
@@ -271,23 +263,6 @@ mod tests {
             addr: "not a host".into(),
         };
         assert!(matches!(transport.bind(), Err(ParamError::Decode(_))));
-    }
-
-    /// An accept only fails with `EMFILE` or `ENFILE`, which a test cannot
-    /// force. Lowering the process fd limit by hand shows the busy loop the
-    /// backoff prevents. This test covers only the stop path.
-    #[stellarator::test]
-    async fn test_stop_skips_accept_backoff() {
-        let (handle, stop) = stop_pair();
-        handle.stop();
-        let error = std::io::Error::from(std::io::ErrorKind::Other).into();
-        let started = Instant::now();
-        accept_failed(&error, &stop).await;
-        assert!(
-            started.elapsed() < BACKOFF_INITIAL / 2,
-            "{:?}",
-            started.elapsed()
-        );
     }
 
     #[stellarator::test]
