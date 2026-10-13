@@ -45,8 +45,8 @@ fn rig_with(kind: SimKind) -> Rig {
         },
     ];
     let members = vec![
-        vec![(0, End::Host), (1, End::Host)],
-        vec![(0, End::Host), (1, End::Device)],
+        vec![(0, ResourceEnd::Host), (1, ResourceEnd::Host)],
+        vec![(0, ResourceEnd::Host), (1, ResourceEnd::Device)],
     ];
     Rig {
         d: Dispatch::new(members, resources, vec![Wire::new(kind, 2 * MAX_OPS)]).unwrap(),

@@ -17,7 +17,9 @@ use metor_fsw_3::coordinator::{
     Adapter, BuildOptions, Clock, Coordinator, CoordinatorConfig, InputConfig, OutputConfig,
     SystemConfig, SystemTable,
 };
-use metor_fsw_3::io::{Backing, End, Grant, IO_CQ, IO_SQ, IO_TYPE, ResourceConfig, SimKind};
+use metor_fsw_3::io::{
+    Backing, Grant, IO_CQ, IO_SQ, IO_TYPE, ResourceConfig, ResourceEnd, SimKind,
+};
 use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::{DynInputs, EndReason, Input, Output, Stop, Timestamp, system};
 
@@ -67,7 +69,7 @@ fn table(seen: &Rc<RefCell<Tapped>>) -> SystemTable {
     table
 }
 
-fn grant(param: &str, end: End) -> Vec<Grant> {
+fn grant(param: &str, end: ResourceEnd) -> Vec<Grant> {
     let resource = "line".into();
     vec![Grant {
         param: param.into(),
@@ -82,7 +84,7 @@ fn grant(param: &str, end: End) -> Vec<Grant> {
 fn config(seed: u64) -> CoordinatorConfig {
     let systems = vec![
         SystemConfig {
-            grants: grant("uart", End::Host),
+            grants: grant("uart", ResourceEnd::Host),
             inputs: vec![InputConfig::new(IO_CQ, "io_complete", "reader")],
             ..SystemConfig::new("reader", "reader")
         },
@@ -97,7 +99,7 @@ fn config(seed: u64) -> CoordinatorConfig {
             ..SystemConfig::new("io_submit", IO_TYPE)
         },
         SystemConfig {
-            grants: grant("uart", End::Device),
+            grants: grant("uart", ResourceEnd::Device),
             inputs: vec![InputConfig::new(IO_CQ, "io_submit", "chatter")],
             ..SystemConfig::new("chatter", "chatter")
         },

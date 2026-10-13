@@ -1,4 +1,4 @@
-use crate::io::End;
+use crate::io::ResourceEnd;
 use metor_proto::types::{ComponentId, PacketId};
 use thiserror::Error;
 
@@ -141,7 +141,10 @@ pub enum BuildError {
     },
 
     #[error("sim resource `{resource}` has no holder on its {missing:?} end")]
-    OneEnd { resource: String, missing: End },
+    OneEnd {
+        resource: String,
+        missing: ResourceEnd,
+    },
 
     #[error("`{system}` holds the device end of `{resource}`, which is not simulated")]
     RealDeviceEnd { system: String, resource: String },

@@ -7,13 +7,6 @@ use super::cap::{Cap, Handle, Interface};
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers, param_name};
 
-fn grant<K: Interface>(param: &'static str) -> GrantDef {
-    GrantDef {
-        param: param.into(),
-        interface: K::NAME.into(),
-    }
-}
-
 /// A `Cap<K>` gives its system a queue pair. It takes no port of its own.
 impl<K: Interface> Param for Cap<K> {
     type In<W: WakeSink + Clone + 'static> = ();
@@ -25,7 +18,7 @@ impl<K: Interface> Param for Cap<K> {
         _cx: &DefCx<'_>,
         defs: &mut Defs,
     ) -> Result<(), DefError> {
-        defs.grants.push(grant::<K>(param_name(names)));
+        defs.grants.push(GrantDef::new::<K>(param_name(names)));
         defs.io = true;
         Ok(())
     }

@@ -16,7 +16,7 @@ use super::{Class, OpId, OsDone, OsOp, Out};
 use crate::coordinator::BuildError;
 use crate::io::arena::Arena;
 use crate::io::status::{Counters, ResourceStatus, resource_name};
-use crate::io::{Cqe, End, IoError, MAX_OPS, Op, OpKind, RawHandle, Sqe, Token};
+use crate::io::{Cqe, IoError, MAX_OPS, Op, OpKind, RawHandle, ResourceEnd, Sqe, Token};
 use crate::port::Output;
 
 /// The most `io_status` records written in one cycle.
@@ -61,7 +61,7 @@ struct Handle {
     generation: u16,
     res: u16,
     /// The end of a sim resource a grant holds.
-    end: End,
+    end: ResourceEnd,
     open: Open,
 }
 
@@ -73,8 +73,8 @@ struct Member {
 }
 
 impl Member {
-    fn new(grants: Vec<(u16, End)>) -> Member {
-        let grant = |&(res, end): &(u16, End)| Handle {
+    fn new(grants: Vec<(u16, ResourceEnd)>) -> Member {
+        let grant = |&(res, end): &(u16, ResourceEnd)| Handle {
             generation: 0,
             res,
             end,
@@ -83,7 +83,7 @@ impl Member {
         let free = (0..MAX_OPS).map(|_| Handle {
             generation: 0,
             res: 0,
-            end: End::Host,
+            end: ResourceEnd::Host,
             open: Open::Closed,
         });
         Member {
@@ -126,7 +126,7 @@ pub(crate) struct Rejected;
 enum Target {
     Fd(i32, Class),
     /// The wire at this index, from this end.
-    Wire(usize, End),
+    Wire(usize, ResourceEnd),
 }
 
 pub(crate) struct Dispatch {
@@ -149,7 +149,7 @@ impl Dispatch {
     /// One member per system with a `Cap`, given as the resource and end of
     /// each grant, in order. `wires` holds the wires the resources name.
     pub(crate) fn new(
-        members: Vec<Vec<(u16, End)>>,
+        members: Vec<Vec<(u16, ResourceEnd)>>,
         resources: Vec<Resource>,
         wires: Vec<Wire>,
     ) -> Result<Self, BuildError> {

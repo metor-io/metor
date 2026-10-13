@@ -4,9 +4,8 @@ use core::marker::PhantomData;
 use core::ops::Deref;
 
 use super::arena::Buf;
-use super::queue::{
-    Accept, Close, Fsync, Gpio, Io, IoOp, Open, Pending, Read, Recv, Send, Tty, Write,
-};
+use super::ops::{Accept, Close, Fsync, Gpio, IoOp, Open, Read, Recv, Send, Tty, Write};
+use super::queue::{Io, Pending};
 use super::{Op, OpenFlags, RawHandle, TtyConfig, TtyQueue};
 
 /// What a resource lets a handle do. Build and stubgen compare interfaces by

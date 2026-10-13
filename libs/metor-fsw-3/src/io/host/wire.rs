@@ -8,7 +8,7 @@ use core::ptr::NonNull;
 use std::collections::VecDeque;
 
 use super::{OpId, OsDone, Out};
-use crate::io::{End, IoError, Op, SimKind, TtyConfig, TtyQueue};
+use crate::io::{IoError, Op, ResourceEnd, SimKind, TtyConfig, TtyQueue};
 
 /// The bytes a UART buffers toward each end.
 pub(crate) const FIFO: usize = 4096;
@@ -56,7 +56,7 @@ impl Wire {
     /// a read it woke, goes to `done`. Returns the bytes a full FIFO dropped.
     pub(crate) fn run(
         &mut self,
-        end: End,
+        end: ResourceEnd,
         id: OpId,
         op: Op,
         buf: Option<NonNull<[u8]>>,
@@ -113,7 +113,7 @@ impl Wire {
 impl Uart {
     /// Takes what `end`'s FIFO holds into `buf`, or parks the read while it
     /// is empty. A read of no bytes finishes at once, as `read(2)` does.
-    fn read(&mut self, end: End, id: OpId, buf: Option<NonNull<[u8]>>) -> Option<usize> {
+    fn read(&mut self, end: ResourceEnd, id: OpId, buf: Option<NonNull<[u8]>>) -> Option<usize> {
         let Some(buf) = buf.filter(|b| !b.is_empty()) else {
             return Some(0);
         };
@@ -132,7 +132,7 @@ impl Uart {
     /// and those dropped past a full FIFO.
     fn write(
         &mut self,
-        end: End,
+        end: ResourceEnd,
         buf: Option<NonNull<[u8]>>,
         done: &mut Vec<OsDone>,
     ) -> (usize, usize) {
@@ -194,9 +194,9 @@ impl Fifo {
     }
 }
 
-fn index(end: End) -> usize {
+fn index(end: ResourceEnd) -> usize {
     match end {
-        End::Host => 0,
-        End::Device => 1,
+        ResourceEnd::Host => 0,
+        ResourceEnd::Device => 1,
     }
 }

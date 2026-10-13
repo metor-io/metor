@@ -4,7 +4,7 @@
 use core::ptr::NonNull;
 use std::os::fd::{OwnedFd, RawFd};
 
-use super::{Backing, End, IoShared, MAX_OPS, ResourceConfig, Token};
+use super::{Backing, IoState, MAX_OPS, ResourceConfig, ResourceEnd, Token};
 use crate::coordinator::BuildError;
 use dispatch::Resource;
 use wire::Wire;
@@ -177,10 +177,10 @@ impl Host {
 /// resource a member holds, makes a wire for each sim one, and the backend.
 pub(crate) fn build(
     resources: &[ResourceConfig],
-    members: Vec<(String, Vec<(u16, End)>)>,
-) -> Result<IoShared, BuildError> {
+    members: Vec<(String, Vec<(u16, ResourceEnd)>)>,
+) -> Result<IoState, BuildError> {
     if members.is_empty() {
-        return Ok(IoShared::default());
+        return Ok(IoState::default());
     }
     let ops = members.len() * MAX_OPS;
     let held = |at: usize| {
@@ -196,7 +196,7 @@ pub(crate) fn build(
     let os = host(ops).map_err(|e| BuildError::IoSystems {
         message: format!("the IO backend: {e}"),
     })?;
-    let mut io = IoShared::with_members(members.iter().map(|(id, _)| id.as_str()));
+    let mut io = IoState::with_members(members.iter().map(|(id, _)| id.as_str()));
     io.host = Some(Host { dispatch, os });
     Ok(io)
 }

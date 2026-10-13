@@ -7,7 +7,7 @@ use zerocopy::IntoBytes;
 use super::*;
 use crate::io::host::wire::Wire;
 use crate::io::host::{Backed, Dispatch, dispatch::Resource, host};
-use crate::io::{End, Op, RawHandle, SimKind, Span, Token};
+use crate::io::{Op, RawHandle, ResourceEnd, SimKind, Span, Token};
 use crate::record::{Bytes, Record};
 use crate::tests::utils::{input, pair, ring};
 
@@ -22,13 +22,14 @@ struct Rig {
 }
 
 fn rig(sq_depth: usize, cq_depth: usize) -> Rig {
-    let mut io = IoShared::with_members(["a"].into_iter());
+    let mut io = IoState::with_members(["a"].into_iter());
     let line = Resource {
         id: "line".into(),
         backed: Backed::Wire(0),
     };
     let wire = Wire::new(SimKind::GpioLine, MAX_OPS);
-    let dispatch = Dispatch::new(vec![vec![(0, End::Host)]], vec![line], vec![wire]).unwrap();
+    let dispatch =
+        Dispatch::new(vec![vec![(0, ResourceEnd::Host)]], vec![line], vec![wire]).unwrap();
     io.host = Some(Host {
         dispatch,
         os: host(MAX_OPS).unwrap(),
