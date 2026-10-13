@@ -16,6 +16,7 @@ mod config;
 mod error;
 #[cfg(all(feature = "host", unix))]
 pub mod host;
+mod ops;
 mod param;
 mod queue;
 mod shared;
@@ -35,11 +36,9 @@ pub use config::{Access, Backing, CanFilter, GpioDirection, RealKind, ResourceCo
 pub use error::{Errno, IoError, IoStatus};
 #[cfg(all(feature = "host", unix))]
 pub use host::{IO_STATUS_PORT, IO_TYPE};
-pub use queue::{
-    Accept, BufOp, Close, Fsync, Gpio, Io, IoOp, Open, Pending, Raw, Read, Recv, Send, Slot, Tty,
-    Write,
-};
-pub use shared::{IoShared, SharedIo};
+pub use ops::{Accept, BufOp, Close, Fsync, Gpio, IoOp, Open, Raw, Read, Recv, Send, Tty, Write};
+pub use queue::{Io, Pending, Slot};
+pub use shared::{IoState, SharedIo};
 pub use status::ResourceStatus;
 pub use wire::{
     Cqe, Op, OpKind, OpenFlags, RawAddr, RawHandle, Span, Sqe, Token, TtyConfig, TtyQueue,
@@ -50,6 +49,8 @@ pub const IO_SQ: &str = "io_sq";
 /// The input a system reads completions from.
 pub const IO_CQ: &str = "io_cq";
 /// The most ops one system may have in flight.
+///
+/// Kani proofs use a smaller queue to keep their state space tractable.
 #[cfg(not(kani))]
 pub const MAX_OPS: usize = 16;
 #[cfg(kani)]
@@ -60,10 +61,9 @@ pub const MAX_OPS: usize = 4;
 pub struct Grant {
     pub param: String,
     pub resource: String,
-    /// Which end of a sim resource the parameter holds. A real resource has
-    /// only the host end.
-    #[serde(default, skip_serializing_if = "End::is_host")]
-    pub end: End,
+    /// Which end of the resource the parameter holds.
+    #[serde(default, skip_serializing_if = "ResourceEnd::is_host")]
+    pub end: ResourceEnd,
 }
 
 /// A `Cap<K>` parameter in a system's definition.
@@ -74,18 +74,31 @@ pub struct GrantDef {
     pub interface: Cow<'static, str>,
 }
 
-/// An end of a sim resource, a wire with two ends.
+impl GrantDef {
+    /// The definition of a `Cap<K>` parameter called `param`.
+    pub fn new<K: Interface>(param: &'static str) -> Self {
+        Self {
+            param: param.into(),
+            interface: K::NAME.into(),
+        }
+    }
+}
+
+/// Which end of a resource a system holds.
+///
+/// A sim resource is a wire between a driver and a device model. A real
+/// resource has only the driver's end.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum End {
-    /// The end a driver holds, and a real resource's only end.
+pub enum ResourceEnd {
+    /// The driver's end.
     #[default]
     Host,
-    /// The end a model holds.
+    /// The device model's end.
     Device,
 }
 
-impl End {
+impl ResourceEnd {
     pub fn is_host(&self) -> bool {
         *self == Self::Host
     }

@@ -1,4 +1,4 @@
-//! `IoShared`: what a build's IO systems, models, guests, channel adapters,
+//! `IoState`: what a build's IO systems, models, guests, channel adapters,
 //! and io steps share, behind `MakeCx::io`.
 
 use core::cell::RefCell;
@@ -6,13 +6,14 @@ use std::rc::Rc;
 
 use super::arena::Arena;
 
-/// The state one build's IO shares.
+/// The IO state a build shares: each system's arena and, in a target's build,
+/// the dispatch.
 ///
-/// A target's build makes one member per system with a `Cap`, in config
-/// order, and its dispatch and backend. A pack makes a member as each of its
-/// systems is first made, and has no dispatch.
+/// A target's build adds one member per system with a `Cap`, in config order.
+/// A pack adds a member the first time each of its systems is made, and has
+/// no dispatch.
 #[derive(Default)]
-pub struct IoShared {
+pub struct IoState {
     /// Every system with a `Cap`, by member index: its id and arena.
     pub(crate) members: Vec<(String, Rc<Arena>)>,
     /// The dispatch and backend, in a target's build.
@@ -20,10 +21,10 @@ pub struct IoShared {
     pub(crate) host: Option<super::host::Host>,
 }
 
-/// `IoShared`, shared through `MakeCx::io`.
-pub type SharedIo = Rc<RefCell<IoShared>>;
+/// `IoState`, shared through `MakeCx::io`.
+pub type SharedIo = Rc<RefCell<IoState>>;
 
-impl IoShared {
+impl IoState {
     /// A target's members, in config order.
     #[cfg(feature = "host")]
     pub(crate) fn with_members<'a>(ids: impl Iterator<Item = &'a str>) -> Self {
@@ -52,7 +53,7 @@ impl IoShared {
 }
 
 #[cfg(all(feature = "host", unix))]
-impl Drop for IoShared {
+impl Drop for IoState {
     /// Cancels every op in flight. If some never land, leaks every arena, so
     /// the kernel never writes freed memory.
     fn drop(&mut self) {

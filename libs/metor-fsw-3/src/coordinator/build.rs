@@ -13,7 +13,7 @@ use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
 
 use crate::def::{DefCx, Records};
-use crate::io::{Backing, End, IO_CQ, IO_SQ, IO_TYPE, RealKind, ResourceConfig, SharedIo};
+use crate::io::{Backing, IO_CQ, IO_SQ, IO_TYPE, RealKind, ResourceConfig, ResourceEnd, SharedIo};
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
@@ -246,12 +246,13 @@ impl<'a> Plan<'a> {
     }
 }
 
-/// Checks the io systems' place and wiring.
+/// Checks how the config wires each system with a `Cap` (a member) to the
+/// `fsw.io` instances.
 ///
-/// Each system with a `Cap` is a member. Its SQ goes to the next `fsw.io`
-/// after it, so one must follow it, and its CQ comes from the one before it,
-/// wrapping to the last. Every `fsw.io` lists exactly its members, in step
-/// order, and takes no channel.
+/// A member's SQ is read by the first `fsw.io` after it in step order, so one
+/// must follow it. Its CQ is written by the last `fsw.io` before it, or by
+/// the final one if none comes before. Each `fsw.io` lists exactly the
+/// members it serves, in step order.
 fn check_io_steps(config: &CoordinatorConfig, plan: &Plan<'_>) -> Result<(), BuildError> {
     let members: Vec<usize> = (0..plan.systems.len())
         .filter(|&at| !plan.systems[at].def.grants.is_empty())
@@ -311,8 +312,11 @@ impl IoPoints {
     }
 }
 
-/// Checks that the instance at `point` reads the SQs of the members whose
-/// next instance it is, and writes the CQs of those whose previous one it is.
+/// Checks the ports of the `fsw.io` at `point`.
+///
+/// Its inputs must be the SQs of the members it is the next `fsw.io` for, and
+/// its outputs the CQs of the members it is the previous one for, both in
+/// step order.
 fn check_io_point(
     config: &CoordinatorConfig,
     point: usize,
@@ -522,20 +526,25 @@ fn check_ends(config: &CoordinatorConfig) -> Result<(), BuildError> {
             .systems
             .iter()
             .flat_map(|s| s.grants.iter().map(move |g| (s, g)));
-        let ends: Vec<(&str, End)> = grants
+        let ends: Vec<(&str, ResourceEnd)> = grants
             .filter(|(_, g)| g.resource == resource.id)
             .map(|(s, g)| (s.id.as_str(), g.end))
             .collect();
-        let held = |end: End| ends.iter().any(|&(_, e)| e == end);
+        let held = |end: ResourceEnd| ends.iter().any(|&(_, e)| e == end);
         let sim = matches!(resource.backing, Backing::Sim(_));
         if sim
             && !ends.is_empty()
-            && let Some(missing) = [End::Host, End::Device].into_iter().find(|&e| !held(e))
+            && let Some(missing) = [ResourceEnd::Host, ResourceEnd::Device]
+                .into_iter()
+                .find(|&e| !held(e))
         {
             let resource = resource.id.clone();
             return Err(BuildError::OneEnd { resource, missing });
         }
-        if let Some(&(system, _)) = ends.iter().find(|&&(_, e)| !sim && e == End::Device) {
+        if let Some(&(system, _)) = ends
+            .iter()
+            .find(|&&(_, e)| !sim && e == ResourceEnd::Device)
+        {
             return Err(BuildError::RealDeviceEnd {
                 system: system.to_string(),
                 resource: resource.id.clone(),
@@ -547,7 +556,10 @@ fn check_ends(config: &CoordinatorConfig) -> Result<(), BuildError> {
 
 /// Each system with a `Cap`, in config order: its id and the resource index
 /// and end of each `Cap` parameter, in definition order.
-fn io_members(plan: &Plan<'_>, config: &CoordinatorConfig) -> Vec<(String, Vec<(u16, End)>)> {
+fn io_members(
+    plan: &Plan<'_>,
+    config: &CoordinatorConfig,
+) -> Vec<(String, Vec<(u16, ResourceEnd)>)> {
     let resource = |system: &SystemConfig, param: &str| {
         let grant = system.grants.iter().find(|g| g.param == param);
         let at = grant.and_then(|g| {
@@ -1512,7 +1524,7 @@ mod tests {
             let mut systems = nominal();
             systems[2]["grants"][0]["end"] = json!("host");
             let e = error(systems);
-            let one = |e: &BuildError| matches!(e, BuildError::OneEnd { resource, missing: End::Device } if resource == "wire");
+            let one = |e: &BuildError| matches!(e, BuildError::OneEnd { resource, missing: ResourceEnd::Device } if resource == "wire");
             assert!(one(&e), "{e}");
         }
 

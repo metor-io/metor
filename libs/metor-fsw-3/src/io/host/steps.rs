@@ -32,7 +32,7 @@ use crate::def::{DefCx, DefError};
 use crate::fn_system::LOG_PORT;
 use crate::io::arena::Arena;
 use crate::io::status::ResourceStatus;
-use crate::io::{Cqe, IoShared, MAX_OPS, SharedIo, Sqe};
+use crate::io::{Cqe, IoState, MAX_OPS, SharedIo, Sqe};
 use crate::log::LogPort;
 use crate::port::{Input, Output, dyn_input_defs, dyn_output_defs};
 use crate::system::SystemDef;
@@ -115,7 +115,7 @@ fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     }))
 }
 
-fn member(io: &IoShared, id: &str) -> Result<usize, ParamError> {
+fn member(io: &IoState, id: &str) -> Result<usize, ParamError> {
     let system = id.to_string();
     io.index(id).ok_or(ParamError::NoIoMember { system })
 }
@@ -150,7 +150,7 @@ impl Step for IoStep {
     fn execute(&mut self, now: Timestamp) {
         let shared = self.io.clone();
         let mut io = shared.borrow_mut();
-        let IoShared { members, host, .. } = &mut *io;
+        let IoState { members, host, .. } = &mut *io;
         let Some(Host { dispatch, os }) = host.as_mut() else {
             return;
         };

@@ -1,5 +1,5 @@
 //! `Io`, a system's queue pair; `Pending<O>`, an op in flight; and `Slot<O>`,
-//! which keeps a buffer at home in state.
+//! which keeps a buffer at home in state. The op types live in `ops`.
 
 use core::cell::{Cell, RefCell};
 use core::future::Future;
@@ -9,19 +9,19 @@ use core::task::{Context, Poll};
 use std::rc::Rc;
 
 use super::arena::{Arena, Buf};
-use super::cap::{File, Handle, Stream};
+use super::ops::{BufOp, IoOp, Raw};
 use super::{Cqe, IoError, IoStatus, MAX_OPS, Op, RawHandle, Span, Sqe, Token};
 use crate::port::{Input, Output};
 
 #[derive(Clone, Copy)]
-enum State {
+enum SlotState {
     Free,
     Waiting {
         opens: bool,
     },
     /// Its `Pending` was dropped. The completion frees it, closing any handle
     /// the op opened first.
-    Orphan {
+    Orphaned {
         opens: bool,
     },
     /// Closing the handle an orphaned op opened, under the op's own token.
@@ -41,8 +41,8 @@ enum State {
 #[derive(Clone, Copy)]
 struct OpSlot {
     generation: u16,
-    state: State,
-    /// A cancel the SQ refused, written again on a later pump.
+    state: SlotState,
+    /// A cancel that did not fit in the SQ. The next pump writes it.
     cancel: bool,
 }
 
@@ -55,9 +55,7 @@ struct Queue {
     next_grant: Cell<u16>,
 }
 
-/// A system's queue pair and arena, shared by `Rc`.
-///
-/// Handles and pending ops each hold one.
+/// A system's queue pair and arena.
 #[derive(Clone)]
 pub struct Io(Rc<Queue>);
 
@@ -65,7 +63,7 @@ impl Io {
     pub(crate) fn new(sq: Output<Sqe>, cq: Input<Cqe>, arena: Rc<Arena>) -> Self {
         let free = OpSlot {
             generation: 0,
-            state: State::Free,
+            state: SlotState::Free,
             cancel: false,
         };
         Self(Rc::new(Queue {
@@ -97,7 +95,7 @@ impl Io {
         buf: Option<Buf>,
     ) -> Pending<O> {
         Pending {
-            state: self.start(handle, &op, buf.as_ref()),
+            state: self.queue_op(handle, &op, buf.as_ref()),
             io: self.clone(),
             buf,
             _o: PhantomData,
@@ -109,12 +107,15 @@ impl Io {
         self.submit(handle, op, buf)
     }
 
-    fn start(&self, handle: RawHandle, op: &Op, buf: Option<&Buf>) -> Stage {
-        let local = |e| Stage::Local(IoStatus::err(e));
+    /// Writes `op` to the SQ under a free slot's token.
+    ///
+    /// Fails without queueing if `buf` does not suit `op`, or if no slot or
+    /// no SQ room is free.
+    fn queue_op(&self, handle: RawHandle, op: &Op, buf: Option<&Buf>) -> OpState {
         let span = match buf {
             Some(buf) if buf.live() => buf.span_for(op),
-            Some(_) => return local(IoError::BadBuf),
-            None if op.fills() || op.drains() => return local(IoError::BadBuf),
+            Some(_) => return OpState::failed(IoError::BadBuf),
+            None if op.fills() || op.drains() => return OpState::failed(IoError::BadBuf),
             None => Span::default(),
         };
         self.pump();
@@ -122,23 +123,23 @@ impl Io {
             .0
             .ops
             .iter()
-            .position(|s| matches!(s.get().state, State::Free))
+            .position(|s| matches!(s.get().state, SlotState::Free))
         else {
-            return local(IoError::QueueFull);
+            return OpState::failed(IoError::QueueFull);
         };
         let generation = self.0.generation.get().wrapping_add(1);
         self.0.generation.set(generation);
         let token = Token::new(slot as u16, generation);
         if self.0.sq.write(&Sqe::new(token, handle, op, span)).is_err() {
-            return local(IoError::QueueFull);
+            return OpState::failed(IoError::QueueFull);
         }
         let opens = op.opens();
         self.0.ops[slot].set(OpSlot {
             generation,
-            state: State::Waiting { opens },
+            state: SlotState::Waiting { opens },
             cancel: false,
         });
-        Stage::Queued(token)
+        OpState::Queued(token)
     }
 
     /// Writes again what the SQ refused, then records every completion on
@@ -153,22 +154,25 @@ impl Io {
             return;
         };
         for cqe in cq.drain().flatten() {
-            self.land(cqe);
+            self.record_completion(cqe);
         }
     }
 
     /// `slot` after writing its refused cancel or close, if the SQ takes it.
     fn resend(&self, token: Token, mut slot: OpSlot) -> OpSlot {
-        let in_flight = matches!(slot.state, State::Waiting { .. } | State::Orphan { .. });
+        let in_flight = matches!(
+            slot.state,
+            SlotState::Waiting { .. } | SlotState::Orphaned { .. }
+        );
         slot.cancel =
             slot.cancel && in_flight && !self.write(token, RawHandle::new(0, 0), &Op::Cancel);
-        if let State::Closing {
+        if let SlotState::Closing {
             handle,
             sent: false,
         } = slot.state
         {
             let sent = self.write(token, handle, &Op::Close);
-            slot.state = State::Closing { handle, sent };
+            slot.state = SlotState::Closing { handle, sent };
         }
         slot
     }
@@ -181,7 +185,9 @@ impl Io {
             .is_ok()
     }
 
-    fn land(&self, cqe: Cqe) {
+    /// Records `cqe` on its op's slot. A completion for a dropped op frees the
+    /// slot, closing any handle the op opened first.
+    fn record_completion(&self, cqe: Cqe) {
         let Some(cell) = self.0.ops.get(usize::from(cqe.token.slot())) else {
             return;
         };
@@ -190,26 +196,28 @@ impl Io {
             return;
         }
         slot.state = match slot.state {
-            State::Waiting { opens } => State::Done {
+            SlotState::Waiting { opens } => SlotState::Done {
                 status: cqe.status,
                 value: cqe.value.get(),
                 opens,
             },
-            State::Orphan { opens: true } => self.close_orphan(cqe.token, cqe.result()),
-            done @ State::Done { .. } => done,
-            State::Orphan { .. } | State::Closing { .. } | State::Free => State::Free,
+            SlotState::Orphaned { opens: true } => self.close_orphan(cqe.token, cqe.result()),
+            done @ SlotState::Done { .. } => done,
+            SlotState::Orphaned { .. } | SlotState::Closing { .. } | SlotState::Free => {
+                SlotState::Free
+            }
         };
         cell.set(slot);
     }
 
     /// Closes the handle an orphaned op opened, under the op's own token.
-    fn close_orphan(&self, token: Token, opened: Result<u32, IoError>) -> State {
+    fn close_orphan(&self, token: Token, opened: Result<u32, IoError>) -> SlotState {
         let Ok(raw) = opened else {
-            return State::Free;
+            return SlotState::Free;
         };
         let handle = RawHandle::from_raw(raw);
         let sent = self.write(token, handle, &Op::Close);
-        State::Closing { handle, sent }
+        SlotState::Closing { handle, sent }
     }
 
     /// Takes a finished op's result, freeing its slot.
@@ -217,14 +225,14 @@ impl Io {
         self.pump();
         let cell = self.0.ops.get(usize::from(token.slot()))?;
         let slot = cell.get();
-        let State::Done { status, value, .. } = slot.state else {
+        let SlotState::Done { status, value, .. } = slot.state else {
             return None;
         };
         if slot.generation != token.generation() {
             return None;
         }
         cell.set(OpSlot {
-            state: State::Free,
+            state: SlotState::Free,
             ..slot
         });
         Some((status, value))
@@ -240,13 +248,13 @@ impl Io {
             return;
         }
         slot.state = match slot.state {
-            State::Waiting { opens } => State::Orphan { opens },
-            State::Done {
+            SlotState::Waiting { opens } => SlotState::Orphaned { opens },
+            SlotState::Done {
                 status,
                 value,
                 opens: true,
             } => self.close_orphan(token, status.result().map(|()| value)),
-            _ => State::Free,
+            _ => SlotState::Free,
         };
         cell.set(slot);
     }
@@ -267,16 +275,24 @@ impl Io {
     /// Ops not yet taken, or orphaned and not yet landed.
     pub fn in_flight(&self) -> usize {
         self.pump();
-        let used = |s: &&Cell<OpSlot>| !matches!(s.get().state, State::Free);
+        let used = |s: &&Cell<OpSlot>| !matches!(s.get().state, SlotState::Free);
         self.0.ops.iter().filter(used).count()
     }
 }
 
-enum Stage {
+/// Where a `Pending` op is.
+enum OpState {
     Queued(Token),
     /// Finished without reaching the queue, such as a `QueueFull`.
-    Local(IoStatus),
-    Taken,
+    Failed(IoStatus),
+    /// Its result was already returned.
+    Returned,
+}
+
+impl OpState {
+    fn failed(error: IoError) -> Self {
+        Self::Failed(IoStatus::err(error))
+    }
 }
 
 /// An op in flight.
@@ -286,7 +302,7 @@ enum Stage {
 #[must_use]
 pub struct Pending<O: IoOp> {
     io: Io,
-    state: Stage,
+    state: OpState,
     buf: Option<Buf>,
     _o: PhantomData<fn() -> O>,
 }
@@ -296,11 +312,11 @@ impl<O: IoOp> Pending<O> {
     /// the result was taken.
     pub fn poll(&mut self) -> Option<O::Output> {
         let (status, value) = match self.state {
-            Stage::Queued(token) => self.io.take(token)?,
-            Stage::Local(status) => (status, 0),
-            Stage::Taken => return None,
+            OpState::Queued(token) => self.io.take(token)?,
+            OpState::Failed(status) => (status, 0),
+            OpState::Returned => return None,
         };
-        self.state = Stage::Taken;
+        self.state = OpState::Returned;
         Some(O::finish(&self.io, status, value, self.buf.take()))
     }
 
@@ -312,7 +328,7 @@ impl<O: IoOp> Pending<O> {
     /// Cancels the op. Its completion still arrives, usually `Canceled`. The
     /// cancel takes no slot of its own.
     pub fn cancel(&self) {
-        if let Stage::Queued(token) = self.state {
+        if let OpState::Queued(token) = self.state {
             self.io.cancel(token);
         }
     }
@@ -333,194 +349,10 @@ impl<O: IoOp> Future for Pending<O> {
 
 impl<O: IoOp> Drop for Pending<O> {
     fn drop(&mut self) {
-        if let Stage::Queued(token) = self.state {
+        if let OpState::Queued(token) = self.state {
             self.io.orphan(token);
         }
     }
-}
-
-mod sealed {
-    pub trait Sealed {}
-}
-
-/// How an op's completion becomes the value its `Pending` resolves to.
-pub trait IoOp: sealed::Sealed {
-    type Output;
-
-    #[doc(hidden)]
-    fn finish(io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output;
-}
-
-/// An op that lends a buffer and hands it back with its result.
-pub trait BufOp: IoOp<Output = (Result<Self::Ok, IoError>, Buf)> {
-    type Ok;
-}
-
-/// Fills a buffer; resolves to the bytes read.
-pub struct Read;
-/// Sends a buffer's bytes; resolves to the bytes written.
-pub struct Write;
-/// Receives one message into a buffer.
-pub struct Recv;
-/// Sends one message from a buffer.
-pub struct Send;
-/// Opens a file under a directory.
-pub struct Open;
-/// Accepts a connection on a listener.
-pub struct Accept;
-/// Closes a handle.
-pub struct Close;
-/// Flushes a file to storage.
-pub struct Fsync;
-/// Configures or flushes a serial port.
-pub struct Tty;
-/// Reads or sets a GPIO line; resolves to the line's level.
-pub struct Gpio;
-/// Any op, with its raw result.
-pub struct Raw;
-
-/// The buffer back, with the length the op reports. A fill sets the
-/// buffer's length to it.
-fn moved(
-    status: IoStatus,
-    value: u32,
-    buf: Option<Buf>,
-    fill: bool,
-) -> (Result<usize, IoError>, Buf) {
-    let mut buf = buf.unwrap_or_else(Buf::empty);
-    let result = status.result().map(|()| value as usize);
-    if let (Ok(n), true) = (result, fill) {
-        buf.set_len(n);
-    }
-    (result, buf)
-}
-
-fn opened<K>(io: &Io, status: IoStatus, value: u32) -> Result<Handle<K>, IoError> {
-    status.result()?;
-    Ok(Handle::new(RawHandle::from_raw(value), io.clone()))
-}
-
-impl sealed::Sealed for Read {}
-
-impl IoOp for Read {
-    type Output = (Result<usize, IoError>, Buf);
-
-    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
-        moved(status, value, buf, true)
-    }
-}
-
-impl sealed::Sealed for Recv {}
-
-impl IoOp for Recv {
-    type Output = (Result<usize, IoError>, Buf);
-
-    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
-        moved(status, value, buf, true)
-    }
-}
-
-impl sealed::Sealed for Write {}
-
-impl IoOp for Write {
-    type Output = (Result<usize, IoError>, Buf);
-
-    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
-        moved(status, value, buf, false)
-    }
-}
-
-impl sealed::Sealed for Send {}
-
-impl IoOp for Send {
-    type Output = (Result<usize, IoError>, Buf);
-
-    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
-        moved(status, value, buf, false)
-    }
-}
-
-impl sealed::Sealed for Open {}
-
-impl IoOp for Open {
-    type Output = Result<Handle<File>, IoError>;
-
-    fn finish(io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
-        opened(io, status, value)
-    }
-}
-
-impl sealed::Sealed for Accept {}
-
-impl IoOp for Accept {
-    type Output = Result<Handle<Stream>, IoError>;
-
-    fn finish(io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
-        opened(io, status, value)
-    }
-}
-
-impl sealed::Sealed for Close {}
-
-impl IoOp for Close {
-    type Output = Result<(), IoError>;
-
-    fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
-        status.result()
-    }
-}
-
-impl sealed::Sealed for Fsync {}
-
-impl IoOp for Fsync {
-    type Output = Result<(), IoError>;
-
-    fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
-        status.result()
-    }
-}
-
-impl sealed::Sealed for Tty {}
-
-impl IoOp for Tty {
-    type Output = Result<(), IoError>;
-
-    fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
-        status.result()
-    }
-}
-
-impl sealed::Sealed for Gpio {}
-
-impl IoOp for Gpio {
-    type Output = Result<u32, IoError>;
-
-    fn finish(_io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
-        status.result().map(|()| value)
-    }
-}
-
-impl sealed::Sealed for Raw {}
-
-impl IoOp for Raw {
-    type Output = (Result<u32, IoError>, Option<Buf>);
-
-    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
-        (status.result().map(|()| value), buf)
-    }
-}
-
-impl BufOp for Read {
-    type Ok = usize;
-}
-impl BufOp for Recv {
-    type Ok = usize;
-}
-impl BufOp for Write {
-    type Ok = usize;
-}
-impl BufOp for Send {
-    type Ok = usize;
 }
 
 /// A buffer kept in state, either idle or lent to an op.
