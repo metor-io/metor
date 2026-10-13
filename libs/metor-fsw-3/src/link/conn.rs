@@ -18,9 +18,8 @@ use super::inbox::Inbox;
 
 /// The queue of bytes between a link and one connection's writer.
 ///
-/// The link appends batches, and the writer swaps the whole buffer out. Both
-/// run on the same executor, so a `RefCell` and a wait queue are enough; no
-/// lock is needed.
+/// The link appends batches, and the writer swaps the whole buffer out. It is
+/// not `Send`.
 struct Outbox {
     pending: RefCell<Vec<u8>>,
     written: Cell<u64>,
@@ -123,7 +122,7 @@ impl Connections {
     /// This allocates a fresh outbox rather than reusing the old one, because
     /// the previous connection's writer may still hold its buffer in an
     /// in-flight write.
-    pub(crate) fn claim(&self) -> Option<Slot> {
+    fn claim_slot(&self) -> Option<Slot> {
         let mut slots = self.slots.borrow_mut();
         let at = slots.iter().position(Option::is_none)?;
         let outbox = Rc::new(Outbox::new(self.cap));
@@ -133,27 +132,36 @@ impl Connections {
 
     /// Frees the slot of a closed connection. Its written bytes are added to
     /// the link's running total.
-    fn free(&self, slot: Slot) {
+    fn free_slot(&self, slot: Slot) {
         self.slots.borrow_mut()[slot.at] = None;
         self.bytes_out
             .set(self.bytes_out.get() + slot.outbox.written.get());
         self.changed.wake_all();
     }
 
-    /// Serves `stream` from `slot` until the read or write side ends or `stop`
-    /// is set, then frees the slot.
+    /// Claims a slot for `stream` and returns the future that serves it, or
+    /// `None` when every slot is taken.
     ///
-    /// Each connection resets the inbox's announce watch, so every peer's
-    /// announce is checked separately.
-    pub(crate) async fn serve(&self, slot: Slot, stream: TcpStream, stop: &Stop) {
-        self.inbox.connected();
-        let (rx, tx) = stream.split();
-        let halves = future::or(
-            write_half(&slot.outbox, &self.changed, tx, self.seed.clone()),
-            read_half(rx, vec![0u8; self.cap], &self.inbox),
-        );
-        future::or(halves, stop.wait()).await;
-        self.free(slot);
+    /// The future runs until the read or write side ends or `stop` is set,
+    /// then frees the slot. Each connection resets the inbox's announce
+    /// watch, so every peer's announce is checked separately.
+    pub(crate) fn serve(
+        self: &Rc<Self>,
+        stream: TcpStream,
+        stop: &Stop,
+    ) -> Option<impl Future<Output = ()> + 'static> {
+        let slot = self.claim_slot()?;
+        let (conns, stop) = (self.clone(), stop.clone());
+        Some(async move {
+            conns.inbox.connected();
+            let (rx, tx) = stream.split();
+            let halves = future::or(
+                write_half(&slot.outbox, &conns.changed, tx, conns.seed.clone()),
+                read_half(rx, conns.cap, &conns.inbox),
+            );
+            future::or(halves, stop.wait()).await;
+            conns.free_slot(slot);
+        })
     }
 
     /// Queues `batch` on every open connection. Each connection whose outbox
@@ -227,18 +235,18 @@ async fn write_half(
 }
 
 /// Reads packet bodies into `inbox` until the peer errors or hangs up. One
-/// buffer is reused for every read.
+/// `cap`-byte buffer is reused for every read.
 ///
 /// A packet larger than the buffer is a read error, so it closes the
 /// connection.
-async fn read_half(rx: OwnedReader<TcpStream>, buf: Vec<u8>, inbox: &Inbox) {
+async fn read_half(rx: OwnedReader<TcpStream>, cap: usize, inbox: &Inbox) {
     let mut reader = LengthDelReader::<_, u32>::new(rx);
-    let mut buf = buf;
+    let mut buf = vec![0u8; cap];
     loop {
         let Ok(body) = reader.recv(buf).await else {
             return;
         };
-        inbox.accept(&body);
+        inbox.route(&body);
         buf = body.into_inner();
     }
 }
@@ -283,11 +291,11 @@ mod tests {
     #[test]
     fn test_claim_fills_slots_in_order() {
         let conns = conns(2, 16, b"");
-        let first = conns.claim().expect("a free slot");
-        let second = conns.claim().expect("another");
-        assert!(conns.claim().is_none());
+        let first = conns.claim_slot().expect("a free slot");
+        let second = conns.claim_slot().expect("another");
+        assert!(conns.claim_slot().is_none());
         assert_eq!((first.at, second.at), (0, 1));
-        conns.free(first);
-        assert_eq!(conns.claim().expect("the freed slot").at, 0);
+        conns.free_slot(first);
+        assert_eq!(conns.claim_slot().expect("the freed slot").at, 0);
     }
 }

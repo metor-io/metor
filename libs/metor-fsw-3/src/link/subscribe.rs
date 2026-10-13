@@ -5,7 +5,8 @@ use std::rc::Rc;
 
 use futures_lite::future;
 use metor_fsw_3_ring::{Notifier, View, WakeSink};
-use metor_proto::types::{PacketId, PacketTy};
+use metor_proto::types::{IntoLenPacket, PacketId, PacketTy};
+use metor_proto_wkt::MsgStream;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -17,7 +18,7 @@ use crate::{Stop, system};
 
 use super::conn::{self, Connections, Event};
 use super::inbox::{self, Inbox};
-use super::transport::{Endpoint, source};
+use super::transport::Endpoint;
 use super::wire;
 use super::{LinkParams, LinkStatus, default_conn_cap, report};
 
@@ -98,19 +99,23 @@ pub async fn subscribe(
 
     let seed = match endpoint {
         Endpoint::Listen { .. } => wire::link_info(msgs.clone(), namespace.as_deref(), link),
-        Endpoint::Connect { .. } => wire::msg_streams(&msgs),
+        // A db peer answers these by forwarding the message logs. A
+        // `Publish` peer ignores them.
+        Endpoint::Connect { .. } => msgs
+            .iter()
+            .flat_map(|&msg_id| (&MsgStream { msg_id }).into_len_packet().inner)
+            .collect(),
     };
 
-    let Some((inbox, mut view)) = Inbox::new(msgs, table_ids, *inbound_cap, max_len) else {
+    let dialing = matches!(endpoint, Endpoint::Connect { .. });
+    let Some((inbox, mut view)) = Inbox::new(msgs, table_ids, *inbound_cap, max_len, dialing)
+    else {
         log.fault(
             "inbound_cap",
             format!("no ring holds {inbound_cap} records of {max_len} bytes"),
         );
         return;
     };
-    if matches!(endpoint, Endpoint::Connect { .. }) {
-        inbox.watch();
-    }
     let inbox = Rc::new(inbox);
     let conns = Rc::new(Connections::new(
         endpoint.slots(),
@@ -118,13 +123,13 @@ pub async fn subscribe(
         seed,
         inbox.clone(),
     ));
-    let _source = stellarator::spawn(source(endpoint, conns.clone(), stop.clone())).drop_guard();
+    let _source = stellarator::spawn(endpoint.run(conns.clone(), stop.clone())).drop_guard();
     let mut dropped = 0;
     let mut reported = LinkStatus::default();
     loop {
         let ready = async {
             view.wake()
-                .wait_until(|| view.has_record() || inbox.check_due())
+                .wait_until(|| view.has_record() || inbox.announce_due())
                 .await;
             Event::Ready
         };
@@ -147,7 +152,7 @@ pub async fn subscribe(
 /// This usually means the peer was rebuilt with a changed frame type, so its
 /// table id no longer matches.
 fn report_unannounced(inbox: &Inbox, tables: &[(PacketId, String)], log: &mut Log) {
-    for id in inbox.unannounced_iter() {
+    for id in inbox.take_unannounced() {
         let Some((_, port)) = tables.iter().find(|(table, _)| *table == id) else {
             continue;
         };
@@ -297,6 +302,7 @@ mod tests {
             Vec::new(),
             cap,
             Note::MAX_LEN,
+            false,
         )
         .expect("a small ring")
     }
@@ -327,7 +333,7 @@ mod tests {
 
         let mut note = rings[1].view(NoWake).expect("a free slot");
         let (inbox, mut view) = inbox(4);
-        inbox.accept(&msg(id_of::<Note>(), b"hello"));
+        inbox.route(&msg(id_of::<Note>(), b"hello"));
         assert_eq!(deliver(&mut view, &mut ports), 0);
         assert_eq!(note.drain().next().expect("a record"), Ok(&b"hello"[..]));
         assert_eq!(inbox.dropped(), 0);
@@ -358,10 +364,11 @@ mod tests {
 
         let mut imu = rings[1].view(NoWake).expect("a free slot");
         let (inbox, mut view) =
-            Inbox::new(vec![id_of::<Fixed>()], vec![table], 4, Imu::MAX_LEN).expect("a ring");
+            Inbox::new(vec![id_of::<Fixed>()], vec![table], 4, Imu::MAX_LEN, false)
+                .expect("a ring");
         let frame = Imu::new(3, 4.0);
-        inbox.accept(&body(PacketTy::Table, table, frame.as_bytes()));
-        inbox.accept(&body(PacketTy::Table, [9, 9], frame.as_bytes()));
+        inbox.route(&body(PacketTy::Table, table, frame.as_bytes()));
+        inbox.route(&body(PacketTy::Table, [9, 9], frame.as_bytes()));
         assert_eq!(deliver(&mut view, &mut ports), 0);
         let received = imu.drain().next().expect("a record").expect("intact");
         assert_eq!(Imu::decode(received), Ok(&frame));
@@ -382,7 +389,7 @@ mod tests {
         // belongs to the other port.
         assert!(Fixed::MAX_LEN < 60 && 60 <= max_len);
         let (inbox, mut view) = inbox(2);
-        inbox.accept(&msg(id_of::<Fixed>(), &[0u8; 60]));
+        inbox.route(&msg(id_of::<Fixed>(), &[0u8; 60]));
         assert_eq!(deliver(&mut view, &mut ports), 1);
         assert!(fixed.drain().next().is_none());
     }
@@ -445,7 +452,7 @@ mod tests {
         let mut full = 0;
         for _ in 0..64 {
             for _ in 0..8 {
-                inbox.accept(&msg(id_of::<Note>(), b"filler"));
+                inbox.route(&msg(id_of::<Note>(), b"filler"));
             }
             full += deliver(&mut view, &mut ports);
         }

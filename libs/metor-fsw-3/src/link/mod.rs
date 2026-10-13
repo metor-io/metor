@@ -44,7 +44,7 @@ pub struct LinkParams {
     /// The target's telemetry namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
-    /// The link's name. It tells apart the links of a single target.
+    /// The link's name, unique within its target.
     #[serde(default)]
     pub link: String,
 }

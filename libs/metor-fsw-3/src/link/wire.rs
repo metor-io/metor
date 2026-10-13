@@ -2,8 +2,7 @@ use std::collections::HashMap;
 
 use metor_proto::types::{IntoLenPacket, PACKET_HEADER_LEN, PacketId, PacketTy, table_id};
 use metor_proto_wkt::{
-    LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata, MsgStream, SetComponentMetadata, SetMsgMetadata,
-    VTableMsg,
+    LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata, SetComponentMetadata, SetMsgMetadata, VTableMsg,
 };
 
 use crate::record::{MsgCodec, RecordSchema};
@@ -27,19 +26,6 @@ pub(crate) fn link_info(
     (&info).into_len_packet().inner
 }
 
-/// Encodes one `MsgStream` request per message id in `ids`.
-///
-/// A dialing `Subscribe` sends these first.
-/// A db peer answers by forwarding those message logs. A `Publish` peer
-/// ignores the requests.
-pub(crate) fn msg_streams(ids: &[PacketId]) -> Vec<u8> {
-    let mut blob = Vec::new();
-    for &msg_id in ids {
-        blob.extend_from_slice(&(&MsgStream { msg_id }).into_len_packet().inner);
-    }
-    blob
-}
-
 /// Encodes the announce a `Publish` sends on every new connection.
 ///
 /// Also returns the packet id each port's records are sent under. The
@@ -55,7 +41,7 @@ pub(crate) fn announce(
     let mut blob = link_info(Vec::new(), namespace, link);
     let mut ids = vec![None; defs.len()];
     let mut tables: Vec<PacketId> = Vec::new();
-    for (at, def) in defs.iter().enumerate() {
+    for (index, def) in defs.iter().enumerate() {
         let RecordSchema::Frame { vtable, metadata } = &def.schema else {
             continue;
         };
@@ -64,7 +50,7 @@ pub(crate) fn announce(
             continue;
         }
         tables.push(id);
-        ids[at] = Some(id);
+        ids[index] = Some(id);
         let table = VTableMsg {
             id,
             vtable: vtable.clone(),
@@ -76,48 +62,50 @@ pub(crate) fn announce(
         }
     }
     let mut msgs: Vec<PacketId> = Vec::new();
-    for (at, def) in defs.iter().enumerate() {
+    for (index, def) in defs.iter().enumerate() {
         let RecordSchema::Msg { id, name, codec } = &def.schema else {
             continue;
         };
-        ids[at] = Some(*id);
+        ids[index] = Some(*id);
         if msgs.contains(id) {
             continue;
         }
         msgs.push(*id);
         let announce = SetMsgMetadata {
             id: *id,
-            metadata: msg_metadata(name, codec),
+            metadata: codec.msg_metadata(name),
         };
         blob.extend_from_slice(&announce.into_len_packet().inner);
     }
     (blob, ids)
 }
 
-/// Builds the metadata the ground uses to decode a message.
-///
-/// A postcard message uses the type's own schema. Any other codec is
-/// described as an opaque byte payload, tagged with the codec's name.
-pub(crate) fn msg_metadata(name: &str, codec: &MsgCodec) -> MsgMetadata {
-    let (name, schema) = match codec {
-        MsgCodec::Postcard(schema) => (schema.name.to_string(), schema.clone()),
-        _ => (
-            name.to_string(),
-            <Vec<u8> as postcard_schema::Schema>::SCHEMA.into(),
-        ),
-    };
-    let codec = match codec {
-        MsgCodec::Postcard(_) => None,
-        MsgCodec::Json => Some("json".to_string()),
-        MsgCodec::Bytes => Some("bytes".to_string()),
-        MsgCodec::Other(name) => Some(name.clone()),
-    };
-    MsgMetadata {
-        name,
-        schema,
-        metadata: codec
-            .map(|codec| HashMap::from([("codec".to_string(), codec)]))
-            .unwrap_or_default(),
+impl MsgCodec {
+    /// Builds the metadata the ground uses to decode a message called `name`.
+    ///
+    /// A postcard message uses the type's own schema. Any other codec is
+    /// described as an opaque byte payload, tagged with the codec's name.
+    pub(crate) fn msg_metadata(&self, name: &str) -> MsgMetadata {
+        let (name, schema) = match self {
+            Self::Postcard(schema) => (schema.name.to_string(), schema.clone()),
+            _ => (
+                name.to_string(),
+                <Vec<u8> as postcard_schema::Schema>::SCHEMA.into(),
+            ),
+        };
+        let codec = match self {
+            Self::Postcard(_) => None,
+            Self::Json => Some("json".to_string()),
+            Self::Bytes => Some("bytes".to_string()),
+            Self::Other(name) => Some(name.clone()),
+        };
+        MsgMetadata {
+            name,
+            schema,
+            metadata: codec
+                .map(|codec| HashMap::from([("codec".to_string(), codec)]))
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -221,7 +209,7 @@ mod tests {
             "cmds.telecommand",
         )];
         let (blob, wire) = announced(&defs);
-        let metadata = msg_metadata("telecommand", &MsgCodec::Json);
+        let metadata = MsgCodec::Json.msg_metadata("telecommand");
         assert_eq!(
             metadata.metadata.get("codec").map(String::as_str),
             Some("json")

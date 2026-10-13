@@ -16,7 +16,7 @@ use crate::{Stop, system};
 
 use super::conn::{self, Connections, Event};
 use super::inbox::Inbox;
-use super::transport::{Endpoint, source};
+use super::transport::Endpoint;
 use super::wire;
 use super::{LinkParams, LinkStatus, default_conn_cap, report};
 
@@ -80,7 +80,7 @@ pub async fn publish(
     }
     let inbox = Rc::new(Inbox::blackhole());
     let conns = Rc::new(Connections::new(endpoint.slots(), *conn_cap, blob, inbox));
-    let _source = stellarator::spawn(source(endpoint, conns.clone(), stop.clone())).drop_guard();
+    let _source = stellarator::spawn(endpoint.run(conns.clone(), stop.clone())).drop_guard();
     let mut batch = Vec::with_capacity(*conn_cap);
     let mut reported = LinkStatus::default();
     loop {
