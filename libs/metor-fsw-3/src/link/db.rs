@@ -22,7 +22,6 @@ use crate::{Frame, Stop, system};
 
 use super::DbParams;
 use super::transport::Endpoint;
-use super::wire;
 
 /// Ingest counters for a `Db`. It writes one on every cycle where a counter
 /// changed.
@@ -243,7 +242,7 @@ fn announce(db: &DB, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sin
                 Sink::Table(id)
             }
             RecordSchema::Msg { id, name, codec } => {
-                let metadata = wire::msg_metadata(name, codec);
+                let metadata = codec.msg_metadata(name);
                 let result =
                     db.with_state_mut(|state| state.set_msg_metadata(*id, metadata, &db.path));
                 if let Err(error) = result {
