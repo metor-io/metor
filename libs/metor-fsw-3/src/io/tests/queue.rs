@@ -158,7 +158,7 @@ fn steady_state_allocates_nothing() {
     let mut lb = Loopback::new();
     let buf = lb.init().alloc(4);
     let uart = uart(&lb);
-    let mut rx: Slot<Read> = Slot::Idle(buf);
+    let mut rx: Slot<ReadOp> = Slot::Idle(buf);
     let mut sqes = Vec::with_capacity(4);
     let n = allocations(|| {
         for _ in 0..8 {
@@ -174,7 +174,7 @@ fn steady_state_allocates_nothing() {
 }
 
 /// Submits flushes until the SQ refuses one.
-fn fill(uart: &Cap<Uart>) -> Vec<Pending<Tty>> {
+fn fill(uart: &Cap<Uart>) -> Vec<Pending<TtyOp>> {
     let mut held = Vec::new();
     loop {
         let mut flush = uart.flush(TtyQueue::Both);

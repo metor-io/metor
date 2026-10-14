@@ -9,7 +9,7 @@ use core::task::{Context, Poll};
 use std::rc::Rc;
 
 use super::arena::{Arena, Buf};
-use super::ops::{BufOp, IoOp, Raw};
+use super::ops::{BufOp, IoOp, RawOp};
 use super::{Cqe, IoError, IoStatus, MAX_OPS, Op, RawHandle, Span, Sqe, Token};
 use crate::port::{Input, Output};
 
@@ -103,7 +103,7 @@ impl Io {
     }
 
     /// Submits any op on any handle. Most systems use a `Handle` instead.
-    pub fn submit_raw(&self, handle: RawHandle, op: Op, buf: Option<Buf>) -> Pending<Raw> {
+    pub fn submit_raw(&self, handle: RawHandle, op: Op, buf: Option<Buf>) -> Pending<RawOp> {
         self.submit(handle, op, buf)
     }
 

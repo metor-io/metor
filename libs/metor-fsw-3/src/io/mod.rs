@@ -27,22 +27,17 @@ mod wire;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub(crate) use arena::Arena;
-pub use arena::{Buf, IoInit};
-pub use cap::{
-    Can, Cap, Dir, File, GpioLine, Handle, Interface, Listen, Messages, Stream, Uart, Udp,
-};
-pub use config::{Access, Backing, CanFilter, GpioDirection, RealKind, ResourceConfig, SimKind};
-pub use error::{Errno, IoError, IoStatus};
+pub use arena::*;
+pub use cap::*;
+pub use config::*;
+pub use error::*;
 #[cfg(all(feature = "host", unix))]
 pub use host::{IO_STATUS_PORT, IO_TYPE};
-pub use ops::{Accept, BufOp, Close, Fsync, Gpio, IoOp, Open, Raw, Read, Recv, Send, Tty, Write};
-pub use queue::{Io, Pending, Slot};
-pub use shared::{IoState, SharedIo};
-pub use status::ResourceStatus;
-pub use wire::{
-    Cqe, Op, OpKind, OpenFlags, RawAddr, RawHandle, Span, Sqe, Token, TtyConfig, TtyQueue,
-};
+pub use ops::*;
+pub use queue::*;
+pub use shared::*;
+pub use status::*;
+pub use wire::*;
 
 /// The output a system submits ops on.
 pub const IO_SQ: &str = "io_sq";

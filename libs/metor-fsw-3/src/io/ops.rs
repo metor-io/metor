@@ -2,7 +2,7 @@
 //! into its result.
 
 use super::arena::Buf;
-use super::cap::{File, Handle, Stream};
+use super::cap::{Handle, RegularFile, Stream};
 use super::queue::Io;
 use super::{IoError, IoStatus, RawHandle};
 
@@ -24,27 +24,27 @@ pub trait BufOp: IoOp<Output = (Result<Self::Ok, IoError>, Buf)> {
 }
 
 /// Fills a buffer; resolves to the bytes read.
-pub struct Read;
+pub struct ReadOp;
 /// Sends a buffer's bytes; resolves to the bytes written.
-pub struct Write;
+pub struct WriteOp;
 /// Receives one message into a buffer.
-pub struct Recv;
+pub struct RecvOp;
 /// Sends one message from a buffer.
-pub struct Send;
+pub struct SendOp;
 /// Opens a file under a directory.
-pub struct Open;
+pub struct OpenOp;
 /// Accepts a connection on a listener.
-pub struct Accept;
+pub struct AcceptOp;
 /// Closes a handle.
-pub struct Close;
+pub struct CloseOp;
 /// Flushes a file to storage.
-pub struct Fsync;
+pub struct FsyncOp;
 /// Configures or flushes a serial port.
-pub struct Tty;
+pub struct TtyOp;
 /// Reads or sets a GPIO line; resolves to the line's level.
-pub struct Gpio;
+pub struct GpioOp;
 /// Any op, with its raw result.
-pub struct Raw;
+pub struct RawOp;
 
 /// The buffer back, with the length the op reports. A fill sets the
 /// buffer's length to it.
@@ -67,9 +67,9 @@ fn opened<K>(io: &Io, status: IoStatus, value: u32) -> Result<Handle<K>, IoError
     Ok(Handle::new(RawHandle::from_raw(value), io.clone()))
 }
 
-impl sealed::Sealed for Read {}
+impl sealed::Sealed for ReadOp {}
 
-impl IoOp for Read {
+impl IoOp for ReadOp {
     type Output = (Result<usize, IoError>, Buf);
 
     fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
@@ -77,9 +77,9 @@ impl IoOp for Read {
     }
 }
 
-impl sealed::Sealed for Recv {}
+impl sealed::Sealed for RecvOp {}
 
-impl IoOp for Recv {
+impl IoOp for RecvOp {
     type Output = (Result<usize, IoError>, Buf);
 
     fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
@@ -87,9 +87,9 @@ impl IoOp for Recv {
     }
 }
 
-impl sealed::Sealed for Write {}
+impl sealed::Sealed for WriteOp {}
 
-impl IoOp for Write {
+impl IoOp for WriteOp {
     type Output = (Result<usize, IoError>, Buf);
 
     fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
@@ -97,9 +97,9 @@ impl IoOp for Write {
     }
 }
 
-impl sealed::Sealed for Send {}
+impl sealed::Sealed for SendOp {}
 
-impl IoOp for Send {
+impl IoOp for SendOp {
     type Output = (Result<usize, IoError>, Buf);
 
     fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
@@ -107,19 +107,19 @@ impl IoOp for Send {
     }
 }
 
-impl sealed::Sealed for Open {}
+impl sealed::Sealed for OpenOp {}
 
-impl IoOp for Open {
-    type Output = Result<Handle<File>, IoError>;
+impl IoOp for OpenOp {
+    type Output = Result<Handle<RegularFile>, IoError>;
 
     fn finish(io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
         opened(io, status, value)
     }
 }
 
-impl sealed::Sealed for Accept {}
+impl sealed::Sealed for AcceptOp {}
 
-impl IoOp for Accept {
+impl IoOp for AcceptOp {
     type Output = Result<Handle<Stream>, IoError>;
 
     fn finish(io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
@@ -127,9 +127,9 @@ impl IoOp for Accept {
     }
 }
 
-impl sealed::Sealed for Close {}
+impl sealed::Sealed for CloseOp {}
 
-impl IoOp for Close {
+impl IoOp for CloseOp {
     type Output = Result<(), IoError>;
 
     fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
@@ -137,9 +137,9 @@ impl IoOp for Close {
     }
 }
 
-impl sealed::Sealed for Fsync {}
+impl sealed::Sealed for FsyncOp {}
 
-impl IoOp for Fsync {
+impl IoOp for FsyncOp {
     type Output = Result<(), IoError>;
 
     fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
@@ -147,9 +147,9 @@ impl IoOp for Fsync {
     }
 }
 
-impl sealed::Sealed for Tty {}
+impl sealed::Sealed for TtyOp {}
 
-impl IoOp for Tty {
+impl IoOp for TtyOp {
     type Output = Result<(), IoError>;
 
     fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
@@ -157,9 +157,9 @@ impl IoOp for Tty {
     }
 }
 
-impl sealed::Sealed for Gpio {}
+impl sealed::Sealed for GpioOp {}
 
-impl IoOp for Gpio {
+impl IoOp for GpioOp {
     type Output = Result<u32, IoError>;
 
     fn finish(_io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
@@ -167,9 +167,9 @@ impl IoOp for Gpio {
     }
 }
 
-impl sealed::Sealed for Raw {}
+impl sealed::Sealed for RawOp {}
 
-impl IoOp for Raw {
+impl IoOp for RawOp {
     type Output = (Result<u32, IoError>, Option<Buf>);
 
     fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
@@ -177,15 +177,15 @@ impl IoOp for Raw {
     }
 }
 
-impl BufOp for Read {
+impl BufOp for ReadOp {
     type Ok = usize;
 }
-impl BufOp for Recv {
+impl BufOp for RecvOp {
     type Ok = usize;
 }
-impl BufOp for Write {
+impl BufOp for WriteOp {
     type Ok = usize;
 }
-impl BufOp for Send {
+impl BufOp for SendOp {
     type Ok = usize;
 }

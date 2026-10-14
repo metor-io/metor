@@ -6,7 +6,7 @@ use crate::io::*;
 struct Reader {
     uart: Cap<Uart>,
     io: TestIo,
-    rx: Slot<Read>,
+    rx: Slot<ReadOp>,
 }
 
 impl Reader {
@@ -97,8 +97,8 @@ fn serving_allocates_nothing() {
 #[test]
 fn driver_configures_once_then_reads() {
     struct Driver {
-        tx: Slot<Write>,
-        rx: Slot<Read>,
+        tx: Slot<WriteOp>,
+        rx: Slot<ReadOp>,
         configured: bool,
         got: Vec<u8>,
     }
