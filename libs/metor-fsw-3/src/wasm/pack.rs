@@ -215,7 +215,7 @@ fn attach(
     (sq, cq): (Input<Sqe>, Input<Cqe>),
 ) -> Result<IoCopy, ParamError> {
     let len = region.len as usize;
-    let mirror = io.borrow_mut().member(&instance.id);
+    let mirror = io.borrow_mut().get_or_add_member(&instance.id);
     if mirror.region().is_none() {
         mirror.set_owned(vec![0; len].into());
     }
