@@ -9,42 +9,10 @@ use core::task::{Context, Poll};
 use std::rc::Rc;
 
 use super::arena::{Arena, Buf};
+use super::op_slot::{Event, OpSlot, Write};
 use super::ops::{BufOp, IoOp, RawOp};
 use super::{Cqe, IoError, IoStatus, MAX_OPS, Op, RawHandle, Span, Sqe, Token};
 use crate::port::{Input, Output};
-
-#[derive(Clone, Copy)]
-enum SlotState {
-    Free,
-    Waiting {
-        opens: bool,
-    },
-    /// Its `Pending` was dropped. The completion frees it, closing any handle
-    /// the op opened first.
-    Orphaned {
-        opens: bool,
-    },
-    /// Closing the handle an orphaned op opened, under the op's own token.
-    /// The close's completion frees it. A close the SQ refused is `sent`
-    /// on a later pump.
-    Closing {
-        handle: RawHandle,
-        sent: bool,
-    },
-    Done {
-        status: IoStatus,
-        value: u32,
-        opens: bool,
-    },
-}
-
-#[derive(Clone, Copy)]
-struct OpSlot {
-    generation: u16,
-    state: SlotState,
-    /// A cancel that did not fit in the SQ. The next pump writes it.
-    cancel: bool,
-}
 
 struct Queue {
     sq: Output<Sqe>,
@@ -61,15 +29,10 @@ pub struct Io(Rc<Queue>);
 
 impl Io {
     pub(crate) fn new(sq: Output<Sqe>, cq: Input<Cqe>, arena: Rc<Arena>) -> Self {
-        let free = OpSlot {
-            generation: 0,
-            state: SlotState::Free,
-            cancel: false,
-        };
         Self(Rc::new(Queue {
             sq,
             cq: RefCell::new(cq),
-            ops: core::array::from_fn(|_| Cell::new(free)),
+            ops: core::array::from_fn(|_| Cell::new(OpSlot::FREE)),
             generation: Cell::new(0),
             arena,
             next_grant: Cell::new(0),
@@ -119,164 +82,95 @@ impl Io {
             None => Span::default(),
         };
         self.pump();
-        let Some(slot) = self
-            .0
-            .ops
-            .iter()
-            .position(|s| matches!(s.get().state, SlotState::Free))
-        else {
+        let Some(index) = self.0.ops.iter().position(|s| s.get().is_free()) else {
             return OpState::failed(IoError::QueueFull);
         };
         let generation = self.0.generation.get().wrapping_add(1);
         self.0.generation.set(generation);
-        let token = Token::new(slot as u16, generation);
+        let token = Token::new(index as u16, generation);
         if self.0.sq.write(&Sqe::new(token, handle, op, span)).is_err() {
             return OpState::failed(IoError::QueueFull);
         }
         let opens = op.opens();
-        self.0.ops[slot].set(OpSlot {
-            generation,
-            state: SlotState::Waiting { opens },
-            cancel: false,
-        });
+        self.apply(index, Event::Submitted { generation, opens });
         OpState::Queued(token)
     }
 
     /// Writes again what the SQ refused, then records every completion on
     /// the CQ.
     fn pump(&self) {
-        for (at, cell) in self.0.ops.iter().enumerate() {
-            let slot = cell.get();
-            let token = Token::new(at as u16, slot.generation);
-            cell.set(self.resend(token, slot));
+        for index in 0..MAX_OPS {
+            self.apply(index, Event::Pumped);
         }
         let Ok(mut cq) = self.0.cq.try_borrow_mut() else {
             return;
         };
         for cqe in cq.drain().flatten() {
-            self.record_completion(cqe);
+            let (generation, status, value) = (cqe.token.generation(), cqe.status, cqe.value.get());
+            let event = Event::Completed {
+                generation,
+                status,
+                value,
+            };
+            self.apply(usize::from(cqe.token.slot()), event);
         }
     }
 
-    /// `slot` after writing its refused cancel or close, if the SQ takes it.
-    fn resend(&self, token: Token, mut slot: OpSlot) -> OpSlot {
-        let in_flight = matches!(
-            slot.state,
-            SlotState::Waiting { .. } | SlotState::Orphaned { .. }
-        );
-        slot.cancel =
-            slot.cancel && in_flight && !self.write(token, RawHandle::new(0, 0), &Op::Cancel);
-        if let SlotState::Closing {
-            handle,
-            sent: false,
-        } = slot.state
-        {
-            let sent = self.write(token, handle, &Op::Close);
-            slot.state = SlotState::Closing { handle, sent };
-        }
-        slot
-    }
-
-    /// Writes an op that takes no buffer. False if the SQ is full.
-    fn write(&self, token: Token, handle: RawHandle, op: &Op) -> bool {
-        self.0
-            .sq
-            .write(&Sqe::new(token, handle, op, Span::default()))
-            .is_ok()
-    }
-
-    /// Records `cqe` on its op's slot. A completion for a dropped op frees the
-    /// slot, closing any handle the op opened first.
-    fn record_completion(&self, cqe: Cqe) {
-        let Some(cell) = self.0.ops.get(usize::from(cqe.token.slot())) else {
+    /// Applies `event` to slot `index` and writes what the slot asks for. A
+    /// write the SQ refuses is reported back to the slot.
+    fn apply(&self, index: usize, event: Event) {
+        let Some(cell) = self.0.ops.get(index) else {
             return;
         };
-        let mut slot = cell.get();
-        if slot.generation != cqe.token.generation() {
-            return;
-        }
-        slot.state = match slot.state {
-            SlotState::Waiting { opens } => SlotState::Done {
-                status: cqe.status,
-                value: cqe.value.get(),
-                opens,
-            },
-            SlotState::Orphaned { opens: true } => self.close_orphan(cqe.token, cqe.result()),
-            done @ SlotState::Done { .. } => done,
-            SlotState::Orphaned { .. } | SlotState::Closing { .. } | SlotState::Free => {
-                SlotState::Free
+        let (mut slot, write) = cell.get().on(event);
+        if let Some(write) = write {
+            let token = Token::new(index as u16, slot.generation);
+            if !self.write(token, write) {
+                slot = slot.on(Event::Refused(write)).0;
             }
-        };
+        }
         cell.set(slot);
     }
 
-    /// Closes the handle an orphaned op opened, under the op's own token.
-    fn close_orphan(&self, token: Token, opened: Result<u32, IoError>) -> SlotState {
-        let Ok(raw) = opened else {
-            return SlotState::Free;
+    /// Writes a slot's cancel or close. False if the SQ is full.
+    fn write(&self, token: Token, write: Write) -> bool {
+        let (handle, op) = match write {
+            Write::Cancel => (RawHandle::new(0, 0), Op::Cancel),
+            Write::Close(handle) => (handle, Op::Close),
         };
-        let handle = RawHandle::from_raw(raw);
-        let sent = self.write(token, handle, &Op::Close);
-        SlotState::Closing { handle, sent }
+        self.0
+            .sq
+            .write(&Sqe::new(token, handle, &op, Span::default()))
+            .is_ok()
     }
 
     /// Takes a finished op's result, freeing its slot.
     fn take(&self, token: Token) -> Option<(IoStatus, u32)> {
         self.pump();
-        let cell = self.0.ops.get(usize::from(token.slot()))?;
-        let slot = cell.get();
-        let SlotState::Done { status, value, .. } = slot.state else {
-            return None;
-        };
-        if slot.generation != token.generation() {
-            return None;
-        }
-        cell.set(OpSlot {
-            state: SlotState::Free,
-            ..slot
-        });
-        Some((status, value))
+        let index = usize::from(token.slot());
+        let generation = token.generation();
+        let result = self.0.ops.get(index)?.get().result(generation)?;
+        self.apply(index, Event::Taken { generation });
+        Some(result)
     }
 
     /// Drops interest in an op.
     fn orphan(&self, token: Token) {
-        let Some(cell) = self.0.ops.get(usize::from(token.slot())) else {
-            return;
-        };
-        let mut slot = cell.get();
-        if slot.generation != token.generation() {
-            return;
-        }
-        slot.state = match slot.state {
-            SlotState::Waiting { opens } => SlotState::Orphaned { opens },
-            SlotState::Done {
-                status,
-                value,
-                opens: true,
-            } => self.close_orphan(token, status.result().map(|()| value)),
-            _ => SlotState::Free,
-        };
-        cell.set(slot);
+        let generation = token.generation();
+        self.apply(usize::from(token.slot()), Event::Dropped { generation });
     }
 
     /// Cancels an op in flight. A cancel the SQ refuses is written again on
     /// a later pump.
     fn cancel(&self, token: Token) {
-        let Some(cell) = self.0.ops.get(usize::from(token.slot())) else {
-            return;
-        };
-        let mut slot = cell.get();
-        if slot.generation == token.generation() {
-            slot.cancel = true;
-            cell.set(self.resend(token, slot));
-        }
+        let generation = token.generation();
+        self.apply(usize::from(token.slot()), Event::Canceled { generation });
     }
 
     /// Ops not yet taken, or orphaned and not yet landed.
     pub fn in_flight(&self) -> usize {
         self.pump();
-        let used = |s: &&Cell<OpSlot>| !matches!(s.get().state, SlotState::Free);
-        self.0.ops.iter().filter(used).count()
+        self.0.ops.iter().filter(|s| !s.get().is_free()).count()
     }
 }
 
