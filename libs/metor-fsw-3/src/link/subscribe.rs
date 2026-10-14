@@ -240,7 +240,7 @@ fn deliver(
 
 #[cfg(test)]
 mod tests {
-    use super::super::inbox::Announce;
+    use super::super::inbox::ConnectionState;
     use metor_fsw_3_ring::{NoWake, RingBuffer};
     use zerocopy::IntoBytes;
 
@@ -329,7 +329,10 @@ mod tests {
 
         let mut note = rings[1].view(NoWake).expect("a free slot");
         let (inbox, mut view) = inbox(4);
-        inbox.route(&mut Announce::Streaming, &msg(id_of::<Note>(), b"hello"));
+        inbox.route(
+            &mut ConnectionState::Streaming,
+            &msg(id_of::<Note>(), b"hello"),
+        );
         assert_eq!(deliver(&mut view, &mut ports), 0);
         assert_eq!(note.drain().next().expect("a record"), Ok(&b"hello"[..]));
         assert_eq!(inbox.dropped(), 0);
@@ -368,11 +371,11 @@ mod tests {
         .expect("a ring");
         let frame = Imu::new(3, 4.0);
         inbox.route(
-            &mut Announce::Streaming,
+            &mut ConnectionState::Streaming,
             &body(PacketTy::Table, table, frame.as_bytes()),
         );
         inbox.route(
-            &mut Announce::Streaming,
+            &mut ConnectionState::Streaming,
             &body(PacketTy::Table, [9, 9], frame.as_bytes()),
         );
         assert_eq!(deliver(&mut view, &mut ports), 0);
@@ -395,7 +398,10 @@ mod tests {
         // belongs to the other port.
         assert!(Fixed::MAX_LEN < 60 && 60 <= max_len);
         let (inbox, mut view) = inbox(2);
-        inbox.route(&mut Announce::Streaming, &msg(id_of::<Fixed>(), &[0u8; 60]));
+        inbox.route(
+            &mut ConnectionState::Streaming,
+            &msg(id_of::<Fixed>(), &[0u8; 60]),
+        );
         assert_eq!(deliver(&mut view, &mut ports), 1);
         assert!(fixed.drain().next().is_none());
     }
@@ -458,7 +464,10 @@ mod tests {
         let mut full = 0;
         for _ in 0..64 {
             for _ in 0..8 {
-                inbox.route(&mut Announce::Streaming, &msg(id_of::<Note>(), b"filler"));
+                inbox.route(
+                    &mut ConnectionState::Streaming,
+                    &msg(id_of::<Note>(), b"filler"),
+                );
             }
             full += deliver(&mut view, &mut ports);
         }
