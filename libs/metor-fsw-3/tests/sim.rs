@@ -10,7 +10,7 @@ use std::rc::Rc;
 use metor_fsw_3::coordinator::{
     CoordinatorConfig, EndReason, InputConfig, SystemConfig, SystemTable,
 };
-use metor_fsw_3::io::{Cap, IO_CQ, IO_SQ, ResourceStatus, Uart};
+use metor_fsw_3::io::{Cap, ResourceStatus, Uart};
 use metor_fsw_3::{Coordinator, Input, Timestamp, system};
 
 use gps::{Gps, GpsState, UartScript, gps, uart_script};
@@ -128,18 +128,9 @@ fn model_between_the_io_steps_answers_the_next_cycle() {
 #[test]
 fn model_before_io_submit_is_wired_like_a_driver() {
     let mut config = golden();
-    let mut model = config.systems.remove(2);
+    let model = config.systems.remove(2);
     assert_eq!(model.id, "receiver");
-    model.inputs = vec![InputConfig::new(IO_CQ, "io_complete", "receiver")];
     config.systems.insert(1, model);
-    let [_, _, submit, complete] = &mut config.systems[..] else {
-        panic!("four systems");
-    };
-    submit
-        .inputs
-        .push(InputConfig::new("receiver", "receiver", IO_SQ));
-    complete.inputs.clear();
-    complete.outputs.append(&mut submit.outputs);
     for _ in 0..2 {
         let seen = Seen::default();
         let _c = run(&seen, probed(config.clone()), 6);

@@ -16,7 +16,7 @@ pub struct ResourceConfig {
 #[serde(rename_all = "snake_case")]
 pub enum Backing {
     Real(RealKind),
-    Sim(SimKind),
+    Sim(SimResource),
     /// Another target's resource, by name.
     Peer(String),
 }
@@ -84,7 +84,33 @@ pub enum Access {
     ReadWrite,
 }
 
-/// A simulated resource. A model system serves its device end.
+/// A simulated resource: a wire between a driver's `Cap` and a device model's.
+///
+/// It names both holders, so neither end can be left unheld.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimResource {
+    pub kind: SimKind,
+    pub host: Holder,
+    pub device: Holder,
+}
+
+/// A system's `Cap` parameter, as a sim resource names its holder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holder {
+    pub system: String,
+    pub param: String,
+}
+
+impl Holder {
+    pub fn new(system: impl Into<String>, param: impl Into<String>) -> Self {
+        Self {
+            system: system.into(),
+            param: param.into(),
+        }
+    }
+}
+
+/// What a simulated resource carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SimKind {
@@ -123,7 +149,7 @@ impl Backing {
     pub fn interface(&self) -> Option<&'static str> {
         match self {
             Self::Real(kind) => Some(kind.interface()),
-            Self::Sim(kind) => Some(kind.interface()),
+            Self::Sim(sim) => Some(sim.kind.interface()),
             Self::Peer(_) => None,
         }
     }

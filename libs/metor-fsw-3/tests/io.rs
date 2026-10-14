@@ -167,12 +167,9 @@ mod through_the_io_steps {
     use std::rc::Rc;
     use std::time::Duration;
 
-    use metor_fsw_3::coordinator::{
-        CoordinatorConfig, InputConfig, OutputConfig, SystemConfig, SystemTable,
-    };
+    use metor_fsw_3::coordinator::{CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
     use metor_fsw_3::io::{
-        Backing, Cap, Grant, IO_CQ, IO_SQ, IO_STATUS_PORT, IO_TYPE, RealKind, RecvOp,
-        ResourceConfig, SendOp, Udp,
+        Backing, Cap, IO_STATUS_PORT, IO_TYPE, RealKind, RecvOp, ResourceConfig, SendOp, Udp,
     };
     use metor_fsw_3::{Input, IoInit, ResourceStatus, Slot, Timestamp, system};
 
@@ -252,20 +249,11 @@ mod through_the_io_steps {
             }],
             systems: vec![
                 SystemConfig {
-                    grants: vec![Grant {
-                        param: "udp".into(),
-                        resource: "loop".into(),
-                        end: Default::default(),
-                    }],
-                    inputs: vec![InputConfig::new(IO_CQ, "io_complete", "p")],
+                    grants: [("udp".into(), "loop".into())].into(),
                     ..SystemConfig::new("p", "pinger")
                 },
+                SystemConfig::new("io_submit", IO_TYPE),
                 SystemConfig {
-                    inputs: vec![InputConfig::new("p", "p", IO_SQ)],
-                    ..SystemConfig::new("io_submit", IO_TYPE)
-                },
-                SystemConfig {
-                    outputs: vec![OutputConfig::with_record("p", "io_cqe")],
                     params: serde_json::json!({ "status": true }),
                     ..SystemConfig::new("io_complete", IO_TYPE)
                 },

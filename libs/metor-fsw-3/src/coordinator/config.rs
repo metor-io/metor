@@ -5,11 +5,13 @@
 
 use core::num::NonZeroUsize;
 use core::time::Duration;
+use std::collections::BTreeMap;
 
 use metor_proto::types::Timestamp;
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::io::{Grant, ResourceConfig};
+use crate::io::ResourceConfig;
 use crate::system::PortDef;
 
 /// The default [`CoordinatorConfig::ring_depth`].
@@ -61,9 +63,14 @@ pub struct SystemConfig {
     pub inputs: Vec<InputConfig>,
     #[serde(default)]
     pub outputs: Vec<OutputConfig>,
-    /// Gives each `Cap<K>` parameter a resource.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub grants: Vec<Grant>,
+    /// Gives `Cap<K>` parameters real resources, by parameter name. A sim
+    /// resource names its holders itself.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "unique_keys"
+    )]
+    pub grants: BTreeMap<String, String>,
     /// The adapter the system runs behind, if any. See [`Adapter`].
     #[serde(flatten, with = "adapter_keys")]
     pub adapter: Option<Adapter>,
@@ -83,6 +90,33 @@ impl core::fmt::Display for Location {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}:{}", self.file, self.line)
     }
+}
+
+/// Deserializes a map, rejecting a key that appears twice, which serde would
+/// otherwise let the last one win.
+fn unique_keys<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String, String>, D::Error> {
+    struct Unique;
+
+    impl<'de> Visitor<'de> for Unique {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+            f.write_str("a map from parameter to resource")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                if out.contains_key(&key) {
+                    return Err(A::Error::custom(format!("`{key}` is granted twice")));
+                }
+                out.insert(key, value);
+            }
+            Ok(out)
+        }
+    }
+
+    d.deserialize_map(Unique)
 }
 
 /// Changes how a system is run.
@@ -178,7 +212,7 @@ impl SystemConfig {
             params: serde_json::Value::Null,
             inputs: Vec::new(),
             outputs: Vec::new(),
-            grants: Vec::new(),
+            grants: BTreeMap::new(),
             adapter: None,
             location: None,
         }
@@ -373,11 +407,7 @@ mod tests {
         let text = serde_json::to_string(&bare).expect("serializable");
         assert!(!text.contains("grants"));
         let granted = SystemConfig {
-            grants: vec![Grant {
-                end: Default::default(),
-                param: "uart".into(),
-                resource: "gps1".into(),
-            }],
+            grants: BTreeMap::from([("uart".into(), "gps1".into())]),
             ..bare
         };
         let text = serde_json::to_string(&granted).expect("serializable");
@@ -389,8 +419,18 @@ mod tests {
 
     #[test]
     fn test_grant_needs_a_resource() {
-        let text = r#"{"id":"gps","ty":"gps","grants":[{"param":"uart"}]}"#;
+        let text = r#"{"id":"gps","ty":"gps","grants":{"uart":5}}"#;
         assert!(serde_json::from_str::<SystemConfig>(text).is_err());
+    }
+
+    #[test]
+    fn test_reject_a_parameter_granted_twice() {
+        let text = r#"{"id":"gps","ty":"gps","grants":{"uart":"a","uart":"b"}}"#;
+        let error = serde_json::from_str::<SystemConfig>(text).expect_err("a duplicate key");
+        assert!(
+            error.to_string().contains("`uart` is granted twice"),
+            "{error}"
+        );
     }
 
     fn adapter_of(text: &str) -> Result<Option<Adapter>, serde_json::Error> {

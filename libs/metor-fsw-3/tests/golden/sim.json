@@ -13,45 +13,11 @@
     {
       "id": "gps",
       "ty": "echo.gps",
-      "params": null,
-      "inputs": [
-        {
-          "port": "io_cq",
-          "from": [
-            {
-              "system": "io_complete",
-              "port": "gps"
-            }
-          ]
-        }
-      ],
-      "grants": [
-        {
-          "param": "uart",
-          "resource": "gps1"
-        }
-      ]
+      "params": null
     },
     {
       "id": "io_submit",
-      "ty": "fsw.io",
-      "inputs": [
-        {
-          "port": "gps",
-          "from": [
-            {
-              "system": "gps",
-              "port": "io_sq"
-            }
-          ]
-        }
-      ],
-      "outputs": [
-        {
-          "port": "receiver",
-          "record": "io_cqe"
-        }
-      ]
+      "ty": "fsw.io"
     },
     {
       "id": "receiver",
@@ -62,46 +28,11 @@
           "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n",
           "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n"
         ]
-      },
-      "inputs": [
-        {
-          "port": "io_cq",
-          "from": [
-            {
-              "system": "io_submit",
-              "port": "receiver"
-            }
-          ]
-        }
-      ],
-      "grants": [
-        {
-          "param": "uart",
-          "resource": "gps1",
-          "end": "device"
-        }
-      ]
+      }
     },
     {
       "id": "io_complete",
       "ty": "fsw.io",
-      "inputs": [
-        {
-          "port": "receiver",
-          "from": [
-            {
-              "system": "receiver",
-              "port": "io_sq"
-            }
-          ]
-        }
-      ],
-      "outputs": [
-        {
-          "port": "gps",
-          "record": "io_cqe"
-        }
-      ],
       "params": {
         "status": true
       }
@@ -111,7 +42,17 @@
     {
       "id": "gps1",
       "backing": {
-        "sim": "uart"
+        "sim": {
+          "kind": "uart",
+          "host": {
+            "system": "gps",
+            "param": "uart"
+          },
+          "device": {
+            "system": "receiver",
+            "param": "uart"
+          }
+        }
       }
     }
   ]
