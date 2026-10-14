@@ -16,7 +16,7 @@ use crate::port::{DynOutputs, Output};
 use crate::record::{Bytes, RecordSchema};
 use crate::{Stop, system};
 
-use super::conn::{self, Connections, Event};
+use super::conn::Connections;
 use super::inbox::{self, Inbox};
 use super::transport::Endpoint;
 use super::wire;
@@ -82,7 +82,7 @@ pub async fn subscribe(
         tables,
     } = routes(outputs, log);
     let msgs: Vec<PacketId> = ids(&ports, PacketTy::Msg);
-    let table_ids: Vec<PacketId> = tables.iter().map(|(id, _)| *id).collect();
+    let routes: Vec<(PacketTy, PacketId)> = ports.iter().map(|(ty, id, _)| (*ty, *id)).collect();
     let SubscribeParams {
         link: LinkParams {
             namespace, link, ..
@@ -108,8 +108,7 @@ pub async fn subscribe(
     };
 
     let dialing = matches!(endpoint, Endpoint::Connect { .. });
-    let Some((inbox, mut view)) = Inbox::new(msgs, table_ids, *inbound_cap, max_len, dialing)
-    else {
+    let Some((inbox, mut view)) = Inbox::new(&routes, *inbound_cap, max_len, dialing) else {
         log.fault(
             "inbound_cap",
             format!("no ring holds {inbound_cap} records of {max_len} bytes"),
@@ -117,34 +116,27 @@ pub async fn subscribe(
         return;
     };
     let inbox = Rc::new(inbox);
-    let conns = Rc::new(Connections::new(
-        endpoint.slots(),
-        *conn_cap,
-        seed,
-        inbox.clone(),
-    ));
+    let Some(conns) = Connections::new(endpoint.slots(), *conn_cap, seed, inbox.clone()) else {
+        log.fault("conn_cap", format!("no ring holds a {conn_cap}-byte batch"));
+        return;
+    };
+    let conns = Rc::new(conns);
     let _source = stellarator::spawn(endpoint.run(conns.clone(), stop.clone())).drop_guard();
     let mut dropped = 0;
     let mut reported = LinkStatus::default();
-    loop {
-        let ready = async {
-            view.wake()
-                .wait_until(|| view.has_record() || inbox.announce_due())
-                .await;
-            Event::Ready
-        };
-        let event = future::or(conn::next(&conns, &stop), ready).await;
-        match event {
-            Event::Ready => {
-                dropped += deliver(&mut view, &mut ports);
-                report_unannounced(&inbox, &tables, log);
-            }
-            Event::Changed => {}
-            Event::Stop => return,
+    let run = async {
+        loop {
+            let ready = view
+                .wake()
+                .wait_until(|| view.has_record() || inbox.announce_due());
+            future::or(ready, conns.changed()).await;
+            dropped += deliver(&mut view, &mut ports);
+            report_unannounced(&inbox, &tables, log);
+            let status = LinkStatus::new(conns.stats(), dropped + inbox.dropped());
+            report(&status, &mut reported, link_status, log);
         }
-        let status = LinkStatus::new(conns.stats(), dropped + inbox.dropped());
-        report(&status, &mut reported, link_status, log);
-    }
+    };
+    future::or(run, stop.wait()).await;
 }
 
 /// Logs a fault for each frame port whose table the peer did not announce.
@@ -296,10 +288,15 @@ mod tests {
         )
     }
 
+    fn route_set(msgs: &[PacketId], tables: &[PacketId]) -> Vec<(PacketTy, PacketId)> {
+        let msgs = msgs.iter().map(|&id| (PacketTy::Msg, id));
+        msgs.chain(tables.iter().map(|&id| (PacketTy::Table, id)))
+            .collect()
+    }
+
     fn inbox(cap: usize) -> (Inbox, View<Notifier>) {
         Inbox::new(
-            vec![id_of::<Fixed>(), id_of::<Note>()],
-            Vec::new(),
+            &route_set(&[id_of::<Fixed>(), id_of::<Note>()], &[]),
             cap,
             Note::MAX_LEN,
             false,
@@ -363,9 +360,13 @@ mod tests {
         assert_eq!(ids(&ports, PacketTy::Table), vec![table]);
 
         let mut imu = rings[1].view(NoWake).expect("a free slot");
-        let (inbox, mut view) =
-            Inbox::new(vec![id_of::<Fixed>()], vec![table], 4, Imu::MAX_LEN, false)
-                .expect("a ring");
+        let (inbox, mut view) = Inbox::new(
+            &route_set(&[id_of::<Fixed>()], &[table]),
+            4,
+            Imu::MAX_LEN,
+            false,
+        )
+        .expect("a ring");
         let frame = Imu::new(3, 4.0);
         inbox.route(&body(PacketTy::Table, table, frame.as_bytes()));
         inbox.route(&body(PacketTy::Table, [9, 9], frame.as_bytes()));

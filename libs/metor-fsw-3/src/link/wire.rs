@@ -30,27 +30,21 @@ pub(crate) fn link_info(
 ///
 /// Also returns the packet id each port's records are sent under. The
 /// announce is a `LinkInfo`, then each frame port's vtable and component
-/// metadata, then each message port's metadata. A frame port whose table id
-/// collides with an earlier port's gets `None` as its id, because the peer
-/// could not tell the two tables apart.
+/// metadata, then each message port's metadata. Frame ports have distinct
+/// table ids; `Publish`'s definition rejects a collision.
 pub(crate) fn announce(
     defs: &[PortDef],
     namespace: Option<&str>,
     link: &str,
-) -> (Vec<u8>, Vec<Option<PacketId>>) {
+) -> (Vec<u8>, Vec<PacketId>) {
     let mut blob = link_info(Vec::new(), namespace, link);
-    let mut ids = vec![None; defs.len()];
-    let mut tables: Vec<PacketId> = Vec::new();
+    let mut ids = vec![[0; 2]; defs.len()];
     for (index, def) in defs.iter().enumerate() {
         let RecordSchema::Frame { vtable, metadata } = &def.schema else {
             continue;
         };
         let id = table_id(vtable);
-        if tables.contains(&id) {
-            continue;
-        }
-        tables.push(id);
-        ids[index] = Some(id);
+        ids[index] = id;
         let table = VTableMsg {
             id,
             vtable: vtable.clone(),
@@ -66,7 +60,7 @@ pub(crate) fn announce(
         let RecordSchema::Msg { id, name, codec } = &def.schema else {
             continue;
         };
-        ids[index] = Some(*id);
+        ids[index] = *id;
         if msgs.contains(id) {
             continue;
         }
@@ -170,7 +164,7 @@ mod tests {
         Input::<Imu>::def(&plant(), "imu")
     }
 
-    fn announced(defs: &[PortDef]) -> (Vec<u8>, Vec<Option<PacketId>>) {
+    fn announced(defs: &[PortDef]) -> (Vec<u8>, Vec<PacketId>) {
         announce(defs, Some("cube_sat"), "pub")
     }
 
@@ -185,10 +179,7 @@ mod tests {
             panic!("a frame port")
         };
         assert_eq!(metadata[0].name, "cube_sat.plant.imu.sample");
-        assert_eq!(
-            wire,
-            vec![Some(table_id(vtable)), Some(Fixed::schema().packet_id())]
-        );
+        assert_eq!(wire, vec![table_id(vtable), Fixed::schema().packet_id()]);
 
         let mut ids = Vec::new();
         let mut rest = &blob[..];
@@ -220,19 +211,10 @@ mod tests {
         );
         assert_eq!(metadata.name, "telecommand");
         let announce = SetMsgMetadata {
-            id: wire[0].expect("an id"),
+            id: wire[0],
             metadata,
         };
         assert!(blob.ends_with(&announce.into_len_packet().inner));
-    }
-
-    #[test]
-    fn test_deduplicate_table_ports() {
-        let defs = vec![imu_port(), imu_port()];
-        let (blob, wire) = announced(&defs);
-        assert!(wire[0].is_some() && wire[1].is_none());
-        let once = announced(&defs[..1]).0;
-        assert_eq!(blob, once);
     }
 
     #[test]

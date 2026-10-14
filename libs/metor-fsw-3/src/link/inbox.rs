@@ -2,6 +2,7 @@
 
 use core::cell::{Cell, RefCell};
 use core::mem::size_of;
+use std::collections::HashSet;
 
 use metor_fsw_3_ring::{Config, Notifier, RingBuffer, View, WakeSource, Writer};
 use metor_proto::types::{Msg, PACKET_HEADER_LEN, PacketHeader, PacketId, PacketTy, Timestamp};
@@ -33,18 +34,17 @@ pub(crate) struct Inbox {
     writer: RefCell<Writer<Notifier>>,
     wake: Notifier,
     max_len: usize,
-    /// The message ids some port takes.
-    msg_ids: Vec<PacketId>,
-    /// The table ids some port takes.
-    table_ids: Vec<PacketId>,
+    /// The packet type and id of every record some port takes. A timestamped
+    /// message is keyed as a plain `Msg`.
+    routes: HashSet<(PacketTy, PacketId)>,
     dropped: Cell<u64>,
     announce: Option<AnnounceWatch>,
 }
 
 /// Which of the inbox's tables the current peer has announced.
 struct AnnounceWatch {
-    /// One flag per entry of `Inbox::table_ids`.
-    announced: RefCell<Vec<bool>>,
+    /// Each routed table id, and whether the peer announced it.
+    tables: RefCell<Vec<(PacketId, bool)>>,
     phase: Cell<Phase>,
 }
 
@@ -62,11 +62,11 @@ enum Phase {
 impl Inbox {
     /// Creates an inbox and the view the link drains it from.
     ///
+    /// `routes` lists the packet type and id of each port, in port order.
     /// With `watch_announce`, each connection's announce is tracked until its
     /// first data packet.
     pub(crate) fn new(
-        msg_ids: Vec<PacketId>,
-        table_ids: Vec<PacketId>,
+        routes: &[(PacketTy, PacketId)],
         inbox_cap: usize,
         record_max_len: usize,
         watch_announce: bool,
@@ -83,15 +83,20 @@ impl Inbox {
         let writer = ring.writer(wake.clone()).expect("a new ring's writer");
         let view = ring.view(wake.clone()).expect("a new ring's reader slot");
         let announce = watch_announce.then(|| AnnounceWatch {
-            announced: RefCell::new(vec![false; table_ids.len()]),
+            tables: RefCell::new(
+                routes
+                    .iter()
+                    .filter(|(ty, _)| *ty == PacketTy::Table)
+                    .map(|&(_, id)| (id, false))
+                    .collect(),
+            ),
             phase: Cell::new(Phase::Checked),
         });
         let inbox = Self {
             writer: RefCell::new(writer),
             wake,
             max_len: record_max_len,
-            msg_ids,
-            table_ids,
+            routes: routes.iter().copied().collect(),
             dropped: Cell::new(0),
             announce,
         };
@@ -101,16 +106,16 @@ impl Inbox {
     /// Creates an inbox that routes no packets anywhere.
     pub(crate) fn blackhole() -> Self {
         // PANIC Safety: a ring with room for one empty record always builds.
-        Self::new(Vec::new(), Vec::new(), 1, 0, false)
-            .expect("a one-record ring")
-            .0
+        Self::new(&[], 1, 0, false).expect("a one-record ring").0
     }
 
     /// Marks the start of a new connection. A watched inbox forgets what the
     /// previous peer announced.
     pub(crate) fn connected(&self) {
         if let Some(watch) = &self.announce {
-            watch.announced.borrow_mut().fill(false);
+            for (_, announced) in watch.tables.borrow_mut().iter_mut() {
+                *announced = false;
+            }
             watch.phase.set(Phase::Announcing);
         }
     }
@@ -128,21 +133,19 @@ impl Inbox {
     ///
     /// Yields nothing unless [`announce_due`](Self::announce_due) is true.
     pub(crate) fn take_unannounced(&self) -> impl Iterator<Item = PacketId> + '_ {
-        let watch = self.announce.as_ref().filter(|_| self.announce_due());
-        let announced = watch.map(|watch| {
-            watch.phase.set(Phase::Checked);
-            watch.announced.borrow()
-        });
-        let missing = move |&(index, _): &(usize, &PacketId)| {
-            announced
-                .as_ref()
-                .is_some_and(|announced| !announced[index])
-        };
-        self.table_ids
-            .iter()
-            .enumerate()
-            .filter(missing)
-            .map(|(_, id)| *id)
+        let tables = self
+            .announce
+            .as_ref()
+            .filter(|_| self.announce_due())
+            .map(|watch| {
+                watch.phase.set(Phase::Checked);
+                watch.tables.borrow()
+            });
+        let len = tables.as_ref().map_or(0, |tables| tables.len());
+        (0..len).filter_map(move |index| {
+            let (id, announced) = tables.as_ref()?[index];
+            (!announced).then_some(id)
+        })
     }
 
     /// Queues one packet body for the link's ports.
@@ -161,11 +164,11 @@ impl Inbox {
             return;
         }
         self.note_data();
-        let wanted = match ty {
-            PacketTy::Table => &self.table_ids,
-            _ => &self.msg_ids,
+        let ty = match ty {
+            PacketTy::MsgWithTimestamp => PacketTy::Msg,
+            ty => ty,
         };
-        if !wanted.contains(&id) {
+        if !self.routes.contains(&(ty, id)) {
             return;
         }
         if bytes.len() > self.max_len || self.writer.borrow_mut().try_write(body).is_err() {
@@ -187,8 +190,9 @@ impl Inbox {
         if watch.phase.get() == Phase::Checked {
             return;
         }
-        if let Some(index) = self.table_ids.iter().position(|id| *id == [a, b]) {
-            watch.announced.borrow_mut()[index] = true;
+        let mut tables = watch.tables.borrow_mut();
+        if let Some((_, announced)) = tables.iter_mut().find(|(id, _)| *id == [a, b]) {
+            *announced = true;
         }
     }
 
@@ -253,10 +257,16 @@ mod tests {
         routed(cap, true)
     }
 
+    /// Routes for message ports `msgs` and frame ports `tables`.
+    fn routes(msgs: &[PacketId], tables: &[PacketId]) -> Vec<(PacketTy, PacketId)> {
+        let msgs = msgs.iter().map(|&id| (PacketTy::Msg, id));
+        msgs.chain(tables.iter().map(|&id| (PacketTy::Table, id)))
+            .collect()
+    }
+
     fn routed(cap: usize, watch_announce: bool) -> (Inbox, View<Notifier>) {
         Inbox::new(
-            vec![id_of::<Fixed>(), id_of::<Note>()],
-            vec![TABLE],
+            &routes(&[id_of::<Fixed>(), id_of::<Note>()], &[TABLE]),
             cap,
             Note::MAX_LEN,
             watch_announce,
@@ -434,7 +444,7 @@ mod tests {
     #[test]
     fn test_reject_oversized_record() {
         let (inbox, mut view) =
-            Inbox::new(vec![id_of::<Fixed>()], Vec::new(), 2, Fixed::MAX_LEN, false)
+            Inbox::new(&routes(&[id_of::<Fixed>()], &[]), 2, Fixed::MAX_LEN, false)
                 .expect("a small ring");
         inbox.route(&msg(id_of::<Fixed>(), &[0u8; Fixed::MAX_LEN + 1]));
         assert!(drain(&mut view).is_empty());
@@ -443,6 +453,6 @@ mod tests {
 
     #[test]
     fn test_reject_ring_too_large_for_memory() {
-        assert!(Inbox::new(Vec::new(), Vec::new(), usize::MAX, 8, false).is_none());
+        assert!(Inbox::new(&[], usize::MAX, 8, false).is_none());
     }
 }

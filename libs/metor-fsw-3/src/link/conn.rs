@@ -8,60 +8,87 @@ use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use futures_lite::future;
+use metor_fsw_3_ring::{Config, NoWake, Notifier, OwnedGrant, RingBuffer, View, WakeSink, Writer};
+use stellarator::buf::IoBuf;
 use stellarator::io::{AsyncWrite, LengthDelReader, OwnedReader, OwnedWriter, SplitExt};
 use stellarator::net::TcpStream;
 use stellarator::sync::WaitQueue;
 
 use crate::Stop;
+use crate::port::ring_capacity;
 
 use super::inbox::Inbox;
 
-/// The queue of bytes between a link and one connection's writer.
-///
-/// The link appends batches, and the writer swaps the whole buffer out. It is
-/// not `Send`.
+/// The link's end of the queue to one connection's writer: a ring that holds
+/// one record per batch. It is not `Send`.
 struct Outbox {
-    pending: RefCell<Vec<u8>>,
+    writer: Writer<Notifier>,
     written: Cell<u64>,
-    wake: WaitQueue,
-    cap: usize,
+}
+
+/// The connection writer's end of its outbox ring.
+struct OutboxReader {
+    view: View<NoWake>,
+    wake: Notifier,
 }
 
 impl Outbox {
-    fn new(cap: usize) -> Self {
-        Self {
-            pending: RefCell::new(Vec::with_capacity(cap)),
+    /// Creates an outbox ring with `config`, and the writer's end of it.
+    fn new(config: Config) -> Option<(Self, OutboxReader)> {
+        let ring = RingBuffer::create_in_memory(config).ok()?;
+        let wake = Notifier::default();
+        // PANIC Safety: the ring is new, so its writer and its one reader slot
+        // are both free.
+        let writer = ring.writer(wake.clone()).expect("a new ring's writer");
+        let view = ring.view(NoWake).expect("a new ring's reader slot");
+        let outbox = Self {
+            writer,
             written: Cell::new(0),
-            wake: WaitQueue::new(),
-            cap,
-        }
+        };
+        Some((outbox, OutboxReader { view, wake }))
     }
 
-    /// Queues all of `batch`, or none of it. Returns false if it does not fit.
+    /// Queues `batch` as one record. Returns false if it does not fit.
     fn enqueue(&self, batch: &[u8]) -> bool {
-        {
-            let mut pending = self.pending.borrow_mut();
-            if pending.len() + batch.len() > self.cap {
-                return false;
-            }
-            pending.extend_from_slice(batch);
-        }
-        self.wake.wake_all();
-        true
+        self.writer.try_write(batch).is_ok()
     }
 
-    /// Swaps the queued bytes into `buf` and leaves the queue empty with its
-    /// full capacity reserved.
-    fn swap(&self, buf: &mut Vec<u8>) {
-        let mut pending = self.pending.borrow_mut();
-        core::mem::swap(&mut *pending, buf);
-        pending.clear();
-        pending.reserve_exact(self.cap);
+    /// Counts `len` more bytes written to the socket.
+    fn sent(&self, len: usize, changed: &WaitQueue) {
+        self.written.set(self.written.get() + len as u64);
+        changed.wake_all();
+    }
+}
+
+/// A record held in its outbox ring for an in-flight socket write.
+///
+/// The write reads straight from the ring. The grant keeps the record
+/// pinned, so the ring's writer cannot reuse those bytes until this drops.
+struct GrantBuf(OwnedGrant<NoWake>);
+
+// A dropped op's buffer is kept inline in stellarator's reactor, which has
+// room for seven words, until its completion arrives. A larger buffer would be
+// dropped while the kernel still reads it.
+const _: () = assert!(size_of::<GrantBuf>() <= 7 * size_of::<usize>());
+
+// SAFETY: The pointer is into the ring's heap region. The grant holds the
+// ring, so the region outlives the buffer, and it pins the record, so the
+// bytes do not change while the buffer lives. Stellarator owns the buffer for
+// the whole op and, when the op's future is dropped or cancelled first, keeps
+// it until the op's completion arrives (the assert above keeps it small enough
+// for that), so the grant outlives every write that reads it. `init_len` is the
+// record's unsent payload, all initialized.
+unsafe impl IoBuf for GrantBuf {
+    fn stable_init_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
     }
 
-    /// Returns true if there are bytes waiting to be written.
-    fn ready(&self) -> bool {
-        !self.pending.borrow().is_empty()
+    fn init_len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn total_len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -74,9 +101,10 @@ pub(crate) struct Stats {
 }
 
 /// A claimed slot, reserved for a connection that is about to be served.
-pub(crate) struct Slot {
+struct Slot {
     at: usize,
     outbox: Rc<Outbox>,
+    reader: OutboxReader,
 }
 
 /// The set of connections a link is serving.
@@ -86,6 +114,8 @@ pub(crate) struct Slot {
 pub(crate) struct Connections {
     slots: RefCell<Vec<Option<Rc<Outbox>>>>,
     cap: usize,
+    /// The outbox ring each connection gets.
+    ring: Config,
     seed: Vec<u8>,
     inbox: Rc<Inbox>,
     changed: WaitQueue,
@@ -95,47 +125,56 @@ pub(crate) struct Connections {
 }
 
 impl Connections {
-    /// Creates `count` empty slots.
+    /// Creates `count` empty slots, or `None` if no ring holds a `cap`-byte
+    /// batch.
     ///
-    /// Each connection gets a `cap`-byte outbox and a `cap`-byte receive
-    /// buffer. It is sent `seed` first, and every packet it reads goes to
-    /// `inbox`.
-    pub(crate) fn new(count: usize, cap: usize, seed: Vec<u8>, inbox: Rc<Inbox>) -> Self {
-        Self {
+    /// Each connection gets an outbox ring with room for two `cap`-byte
+    /// batches, and a `cap`-byte receive buffer. It is sent `seed` first, and
+    /// every packet it reads goes to `inbox`.
+    pub(crate) fn new(count: usize, cap: usize, seed: Vec<u8>, inbox: Rc<Inbox>) -> Option<Self> {
+        let ring = Config {
+            capacity: ring_capacity(cap, 2)?,
+            max_readers: 1,
+        };
+        metor_fsw_3_ring::checked_region_len(&ring)?;
+        Some(Self {
             slots: RefCell::new((0..count).map(|_| None).collect()),
             cap,
+            ring,
             seed,
             inbox,
             changed: WaitQueue::new(),
             bytes_out: Cell::new(0),
             batches_dropped: Cell::new(0),
-        }
+        })
     }
 
-    /// Waits until the counters differ from `observed`.
-    async fn changed(&self, observed: Stats) {
+    /// Waits until the counters differ from what they are now.
+    pub(crate) async fn changed(&self) {
+        let observed = self.stats();
         let _ = self.changed.wait_for(|| self.stats() != observed).await;
     }
 
     /// Claims a free slot, or returns `None` when every slot is taken.
     ///
     /// This allocates a fresh outbox rather than reusing the old one, because
-    /// the previous connection's writer may still hold its buffer in an
-    /// in-flight write.
+    /// the previous connection's write may still hold a record of its ring.
     fn claim_slot(&self) -> Option<Slot> {
         let mut slots = self.slots.borrow_mut();
         let at = slots.iter().position(Option::is_none)?;
-        let outbox = Rc::new(Outbox::new(self.cap));
+        // `new` checked that this config forms a ring.
+        let (outbox, reader) = Outbox::new(self.ring)?;
+        let outbox = Rc::new(outbox);
         slots[at] = Some(outbox.clone());
-        Some(Slot { at, outbox })
+        Some(Slot { at, outbox, reader })
     }
 
     /// Frees the slot of a closed connection. Its written bytes are added to
     /// the link's running total.
-    fn free_slot(&self, slot: Slot) {
-        self.slots.borrow_mut()[slot.at] = None;
+    fn free_slot(&self, at: usize, outbox: &Outbox) {
+        self.slots.borrow_mut()[at] = None;
         self.bytes_out
-            .set(self.bytes_out.get() + slot.outbox.written.get());
+            .set(self.bytes_out.get() + outbox.written.get());
         self.changed.wake_all();
     }
 
@@ -150,17 +189,17 @@ impl Connections {
         stream: TcpStream,
         stop: &Stop,
     ) -> Option<impl Future<Output = ()> + 'static> {
-        let slot = self.claim_slot()?;
+        let Slot { at, outbox, reader } = self.claim_slot()?;
         let (conns, stop) = (self.clone(), stop.clone());
         Some(async move {
             conns.inbox.connected();
             let (rx, tx) = stream.split();
             let halves = future::or(
-                write_half(&slot.outbox, &conns.changed, tx, conns.seed.clone()),
+                write_half(&outbox, &conns.changed, tx, conns.seed.clone(), reader),
                 read_half(rx, conns.cap, &conns.inbox),
             );
             future::or(halves, stop.wait()).await;
-            conns.free_slot(slot);
+            conns.free_slot(at, &outbox);
         })
     }
 
@@ -185,53 +224,53 @@ impl Connections {
     }
 }
 
-pub(crate) enum Event {
-    /// The link's own input has data. The link's loop raises this itself.
-    Ready,
-    Changed,
-    Stop,
-}
-
-/// Waits until a counter changes or `stop` is set.
-pub(crate) async fn next(conns: &Connections, stop: &Stop) -> Event {
-    let observed = conns.stats();
-    let changed = async {
-        conns.changed(observed).await;
-        Event::Changed
-    };
-    let stopped = async {
-        stop.wait().await;
-        Event::Stop
-    };
-    future::or(changed, stopped).await
-}
-
-/// Writes the seed, then every batch the link queues. Each write sends the
-/// whole outbox at once.
+/// Writes the seed, then each batch the link queues, straight from the
+/// outbox ring.
 async fn write_half(
     outbox: &Outbox,
     changed: &WaitQueue,
     tx: OwnedWriter<TcpStream>,
     seed: Vec<u8>,
+    reader: OutboxReader,
 ) {
-    let mut buf = seed;
-    loop {
-        if !buf.is_empty() {
-            let len = buf.len() as u64;
-            let (result, mut written) = tx.write_all(buf).await;
-            written.clear();
-            buf = written;
-            if result.is_err() {
-                return;
-            }
-            outbox.written.set(outbox.written.get() + len);
-            changed.wake_all();
-        }
-        if outbox.wake.wait_for(|| outbox.ready()).await.is_err() {
+    let OutboxReader { mut view, wake } = reader;
+    let len = seed.len();
+    if len > 0 {
+        if tx.write_all(seed).await.0.is_err() {
             return;
         }
-        outbox.swap(&mut buf);
+        outbox.sent(len, changed);
     }
+    loop {
+        wake.wait_until(|| view.has_record()).await;
+        view = match view.try_read_owned() {
+            Ok(Ok(grant)) => {
+                let len = grant.len();
+                let Some(view) = send(&tx, grant).await else {
+                    return;
+                };
+                outbox.sent(len, changed);
+                view
+            }
+            Ok(Err(view)) => view,
+            Err(_) => return,
+        };
+    }
+}
+
+/// Writes all of `grant`'s record to `tx` and returns its view. Returns
+/// `None` if the socket fails.
+async fn send(tx: &OwnedWriter<TcpStream>, grant: OwnedGrant<NoWake>) -> Option<View<NoWake>> {
+    let mut buf = GrantBuf(grant);
+    while !buf.0.is_empty() {
+        let (result, back) = tx.write(buf).await;
+        buf = back;
+        match result {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.0.skip(n),
+        }
+    }
+    Some(buf.0.into_view())
 }
 
 /// Reads packet bodies into `inbox` until the peer errors or hangs up. One
@@ -257,20 +296,51 @@ mod tests {
 
     fn conns(count: usize, cap: usize, seed: &[u8]) -> Rc<Connections> {
         let inbox = Rc::new(Inbox::blackhole());
-        Rc::new(Connections::new(count, cap, seed.to_vec(), inbox))
+        Rc::new(Connections::new(count, cap, seed.to_vec(), inbox).expect("a small ring"))
+    }
+
+    fn outbox(cap: usize) -> (Outbox, OutboxReader) {
+        let config = Config {
+            capacity: ring_capacity(cap, 2).expect("a small ring"),
+            max_readers: 1,
+        };
+        Outbox::new(config).expect("a valid config")
     }
 
     #[test]
-    fn test_queue_recovers_after_oversized_batch() {
-        let outbox = Outbox::new(8);
-        assert!(outbox.enqueue(b"12345"));
-        assert!(!outbox.enqueue(b"6789"));
-        assert!(outbox.enqueue(b"678"));
-        let mut buf = Vec::new();
-        outbox.swap(&mut buf);
-        assert_eq!(buf, b"12345678");
-        let pending = outbox.pending.borrow();
-        assert!(pending.is_empty() && pending.capacity() >= 8);
+    fn test_outbox_drops_batch_that_does_not_fit() {
+        let (outbox, OutboxReader { view, .. }) = outbox(8);
+        assert!(outbox.enqueue(b"12345678"));
+        assert!(outbox.enqueue(b"abc"));
+        assert!(!outbox.enqueue(b"full"), "two batches fill the ring");
+        let Ok(Ok(grant)) = view.try_read_owned() else {
+            panic!("a queued batch")
+        };
+        assert_eq!(&grant[..], b"12345678");
+        drop(grant.into_view());
+        assert!(outbox.enqueue(b"room"), "sending a batch frees its space");
+    }
+
+    #[test]
+    fn test_grant_buf_lends_the_ring_bytes() {
+        let (outbox, OutboxReader { view, .. }) = outbox(8);
+        assert!(outbox.enqueue(b"12345678"));
+        let Ok(Ok(grant)) = view.try_read_owned() else {
+            panic!("a queued batch")
+        };
+        let mut buf = GrantBuf(grant);
+        // SAFETY: the buffer is live and `init_len` bytes are initialized.
+        let lent = unsafe { core::slice::from_raw_parts(buf.stable_init_ptr(), buf.init_len()) };
+        assert_eq!(lent, b"12345678");
+        assert!(outbox.enqueue(b"abc"));
+        assert!(!outbox.enqueue(b"held"), "the lent record stays pinned");
+        buf.0.skip(5);
+        assert_eq!((buf.init_len(), buf.total_len()), (3, 3));
+        drop(buf);
+        assert!(
+            outbox.enqueue(b"gone"),
+            "dropping the buffer releases the reader"
+        );
     }
 
     #[test]
@@ -284,7 +354,7 @@ mod tests {
     fn test_ignore_unchanged_notification() {
         let conns = conns(1, 64, b"");
         conns.changed.wake_all();
-        let changed = future::poll_once(conns.changed(conns.stats()));
+        let changed = future::poll_once(conns.changed());
         assert!(future::block_on(changed).is_none());
     }
 
@@ -295,7 +365,7 @@ mod tests {
         let second = conns.claim_slot().expect("another");
         assert!(conns.claim_slot().is_none());
         assert_eq!((first.at, second.at), (0, 1));
-        conns.free_slot(first);
+        conns.free_slot(first.at, &first.outbox);
         assert_eq!(conns.claim_slot().expect("the freed slot").at, 0);
     }
 }
