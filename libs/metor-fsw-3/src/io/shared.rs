@@ -29,12 +29,12 @@ impl IoState {
     #[cfg(feature = "host")]
     pub(crate) fn with_members<'a>(ids: impl Iterator<Item = &'a str>) -> Self {
         let mut io = Self::default();
-        ids.for_each(|id| drop(io.member(id)));
+        ids.for_each(|id| drop(io.get_or_add_member(id)));
         io
     }
 
     /// System `id`'s arena, joining it as a member if it is not one.
-    pub(crate) fn member(&mut self, id: &str) -> Rc<Arena> {
+    pub(crate) fn get_or_add_member(&mut self, id: &str) -> Rc<Arena> {
         if let Some(arena) = self.arena(id) {
             return arena;
         }
