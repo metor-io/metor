@@ -4,7 +4,9 @@ use core::marker::PhantomData;
 use core::ops::Deref;
 
 use super::arena::Buf;
-use super::ops::{Accept, Close, Fsync, Gpio, IoOp, Open, Read, Recv, Send, Tty, Write};
+use super::ops::{
+    AcceptOp, CloseOp, FsyncOp, GpioOp, IoOp, OpenOp, ReadOp, RecvOp, SendOp, TtyOp, WriteOp,
+};
 use super::queue::{Io, Pending};
 use super::{Op, OpenFlags, RawHandle, TtyConfig, TtyQueue};
 
@@ -23,7 +25,7 @@ pub struct Udp;
 /// A directory files are opened under.
 pub struct Dir;
 /// A file, granted directly or opened under a `Dir`.
-pub struct File;
+pub struct RegularFile;
 /// A TCP listener.
 pub struct Listen;
 /// A GPIO line.
@@ -43,7 +45,7 @@ impl Interface for Udp {
 impl Interface for Dir {
     const NAME: &'static str = "dir";
 }
-impl Interface for File {
+impl Interface for RegularFile {
     const NAME: &'static str = "file";
 }
 impl Interface for Listen {
@@ -87,26 +89,26 @@ impl<K> Handle<K> {
     }
 
     /// Ends this capability. Later ops on it fail with `Stale`.
-    pub fn close(&self) -> Pending<Close> {
+    pub fn close(&self) -> Pending<CloseOp> {
         self.submit(Op::Close, None)
     }
 }
 
 impl Handle<Uart> {
     /// Reads whatever bytes have arrived, up to the buffer's capacity.
-    pub fn read(&self, buf: Buf) -> Pending<Read> {
+    pub fn read(&self, buf: Buf) -> Pending<ReadOp> {
         self.submit(Op::Read { offset: None }, Some(buf))
     }
 
-    pub fn write(&self, buf: Buf) -> Pending<Write> {
+    pub fn write(&self, buf: Buf) -> Pending<WriteOp> {
         self.submit(Op::Write { offset: None }, Some(buf))
     }
 
-    pub fn configure(&self, config: TtyConfig) -> Pending<Tty> {
+    pub fn configure(&self, config: TtyConfig) -> Pending<TtyOp> {
         self.submit(Op::TtyConfigure(config), None)
     }
 
-    pub fn flush(&self, queue: TtyQueue) -> Pending<Tty> {
+    pub fn flush(&self, queue: TtyQueue) -> Pending<TtyOp> {
         self.submit(Op::TtyFlush(queue), None)
     }
 }
@@ -118,51 +120,51 @@ impl Messages for Udp {}
 impl Messages for Stream {}
 
 impl<K: Messages> Handle<K> {
-    pub fn recv(&self, buf: Buf) -> Pending<Recv> {
+    pub fn recv(&self, buf: Buf) -> Pending<RecvOp> {
         self.submit(Op::Recv, Some(buf))
     }
 
-    pub fn send(&self, buf: Buf) -> Pending<Send> {
+    pub fn send(&self, buf: Buf) -> Pending<SendOp> {
         self.submit(Op::Send, Some(buf))
     }
 }
 
-impl Handle<File> {
-    pub fn read(&self, buf: Buf, offset: u64) -> Pending<Read> {
+impl Handle<RegularFile> {
+    pub fn read(&self, buf: Buf, offset: u64) -> Pending<ReadOp> {
         let offset = Some(offset);
         self.submit(Op::Read { offset }, Some(buf))
     }
 
-    pub fn write(&self, buf: Buf, offset: u64) -> Pending<Write> {
+    pub fn write(&self, buf: Buf, offset: u64) -> Pending<WriteOp> {
         let offset = Some(offset);
         self.submit(Op::Write { offset }, Some(buf))
     }
 
-    pub fn fsync(&self) -> Pending<Fsync> {
+    pub fn fsync(&self) -> Pending<FsyncOp> {
         self.submit(Op::Fsync, None)
     }
 }
 
 impl Handle<Dir> {
     /// Opens the file at the path in `path`, relative to this directory.
-    pub fn open(&self, path: Buf, flags: OpenFlags) -> Pending<Open> {
+    pub fn open(&self, path: Buf, flags: OpenFlags) -> Pending<OpenOp> {
         self.submit(Op::Open(flags), Some(path))
     }
 }
 
 impl Handle<Listen> {
-    pub fn accept(&self) -> Pending<Accept> {
+    pub fn accept(&self) -> Pending<AcceptOp> {
         self.submit(Op::Accept, None)
     }
 }
 
 impl Handle<GpioLine> {
-    pub fn get(&self) -> Pending<Gpio> {
+    pub fn get(&self) -> Pending<GpioOp> {
         self.submit(Op::GpioGet, None)
     }
 
     /// Drives the line high for any nonzero `value`.
-    pub fn set(&self, value: u32) -> Pending<Gpio> {
+    pub fn set(&self, value: u32) -> Pending<GpioOp> {
         self.submit(Op::GpioSet(value != 0), None)
     }
 }

@@ -1,14 +1,14 @@
 //! A serial device that sends random bytes, and a driver that reads them.
 
 use metor_fsw_3::Rng;
-use metor_fsw_3::io::{Cap, Read, Uart, Write};
+use metor_fsw_3::io::{Cap, ReadOp, Uart, WriteOp};
 use metor_fsw_3::{IoInit, Output, Slot, system};
 
 use super::Ping;
 
 /// A serial device's buffer for the bytes it sends.
 pub struct Chatter {
-    tx: Slot<Write>,
+    tx: Slot<WriteOp>,
 }
 
 impl Chatter {
@@ -61,7 +61,7 @@ pub fn grower(#[state] s: &mut Grower, uart: &Cap<Uart>) {
 }
 
 pub struct Reader {
-    rx: Slot<Read>,
+    rx: Slot<ReadOp>,
 }
 
 impl Reader {

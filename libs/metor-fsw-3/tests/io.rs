@@ -171,8 +171,8 @@ mod through_the_io_steps {
         CoordinatorConfig, InputConfig, OutputConfig, SystemConfig, SystemTable,
     };
     use metor_fsw_3::io::{
-        Backing, Cap, Grant, IO_CQ, IO_SQ, IO_STATUS_PORT, IO_TYPE, RealKind, Recv, ResourceConfig,
-        Send, Udp,
+        Backing, Cap, Grant, IO_CQ, IO_SQ, IO_STATUS_PORT, IO_TYPE, RealKind, RecvOp,
+        ResourceConfig, SendOp, Udp,
     };
     use metor_fsw_3::{Input, IoInit, ResourceStatus, Slot, Timestamp, system};
 
@@ -180,8 +180,8 @@ mod through_the_io_steps {
 
     /// Sends `ping` once, and receives whatever arrives.
     struct Pinger {
-        tx: Slot<Send>,
-        rx: Slot<Recv>,
+        tx: Slot<SendOp>,
+        rx: Slot<RecvOp>,
         sent: bool,
         got: Got,
     }

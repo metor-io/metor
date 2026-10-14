@@ -27,7 +27,7 @@ use crate::coordinator::{
 };
 
 /// Sends `cmd` on its cap whenever its buffer is idle.
-pub struct Uplink(crate::io::Slot<crate::io::Send>);
+pub struct Uplink(crate::io::Slot<crate::io::SendOp>);
 
 impl Uplink {
     pub fn new(io: &crate::io::IoInit<'_>) -> Self {

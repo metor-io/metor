@@ -1,8 +1,8 @@
-use metor_fsw_3::io::{Cap, Uart, Write};
+use metor_fsw_3::io::{Cap, Uart, WriteOp};
 use metor_fsw_3::{IoInit, Slot, SystemTable, system};
 
 struct Driver {
-    tx: Slot<Write>,
+    tx: Slot<WriteOp>,
 }
 
 impl Driver {

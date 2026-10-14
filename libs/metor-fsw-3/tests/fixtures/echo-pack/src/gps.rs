@@ -1,7 +1,7 @@
 //! A GPS receiver driver on a serial port: it sets the receiver to 10 Hz,
 //! then publishes each fix the receiver reports.
 
-use metor_fsw_3::io::{Cap, Read, Uart, Write};
+use metor_fsw_3::io::{Cap, ReadOp, Uart, WriteOp};
 use metor_fsw_3::{IoInit, Log, Output, Record, Slot, system};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -131,8 +131,8 @@ fn sign(hemisphere: &str, negative: &str) -> f64 {
 }
 
 pub struct GpsState {
-    rx: Slot<Read>,
-    tx: Slot<Write>,
+    rx: Slot<ReadOp>,
+    tx: Slot<WriteOp>,
     configured: bool,
     nmea: Nmea,
 }
@@ -184,7 +184,7 @@ pub struct UartScriptParams {
 /// A serial device's script, and the buffer it sends each entry from.
 pub struct UartScript {
     script: std::collections::VecDeque<Vec<u8>>,
-    tx: Slot<Write>,
+    tx: Slot<WriteOp>,
 }
 
 impl UartScript {
