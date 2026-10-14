@@ -55,9 +55,6 @@ pub struct Run {
     /// the same results every time. Needs a simulated clock with an epoch.
     #[arg(long)]
     pub deterministic: bool,
-    /// Print `<link> <addr>` for every listening link once the graph is built.
-    #[arg(long)]
-    pub print_ports: bool,
 }
 
 /// An error running a target.
@@ -87,8 +84,6 @@ pub enum RunError {
     Children(String),
     #[error("interrupted")]
     Interrupted,
-    #[error("--print-ports names one target's links; pick one with --target")]
-    PrintPortsNeedsTarget,
 }
 
 /// Parses `--wall` into a [`WallRate`].
@@ -105,16 +100,10 @@ pub fn run(args: Run) -> Result<(), RunError> {
     install_logging();
     let config = prepare(args.target.as_deref())?;
     if config.targets.len() > 1 && args.member.is_none() {
-        if args.print_ports {
-            return Err(RunError::PrintPortsNeedsTarget);
-        }
         return run_children(&config, &args);
     }
     let member = config.target(args.member.as_deref())?;
     let coordinator = load(&config.targets[member], &args)?;
-    if args.print_ports {
-        print_ports();
-    }
 
     watch_sigint();
     let cycles = args.cycles;
@@ -154,19 +143,6 @@ fn run_children(config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
         return Err(RunError::Interrupted);
     }
     Ok(())
-}
-
-/// Prints the address of every bound link to stdout.
-///
-/// A caller that asked a link to bind port zero uses this to learn the real
-/// port.
-fn print_ports() {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    for (link, addr) in crate::link::bound_ports() {
-        let _ = writeln!(out, "{link} {addr}");
-    }
-    let _ = out.flush();
 }
 
 /// Sets up tracing to print to stderr and to forward lines to `log` ports.
