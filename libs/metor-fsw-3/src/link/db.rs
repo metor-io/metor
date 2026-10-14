@@ -60,7 +60,6 @@ impl Db {
     /// the build instead of the run.
     pub fn new(params: DbParams) -> Result<Self, ParamError> {
         let endpoint = params.link.transport.bind()?;
-        super::record_bound(&params.link.link, &endpoint);
         if endpoint.listener().is_none() {
             return Err(ParamError::Decode(
                 "a db listens; it takes no `connect`".into(),
