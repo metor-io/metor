@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use futures_lite::future;
-use metor_fsw_3_ring::{Notifier, View, WakeSink};
+use metor_fsw_3_ring::{NoWake, Notifier, View, WakeSink};
 use metor_proto::types::{IntoLenPacket, PacketId, PacketTy};
 use metor_proto_wkt::MsgStream;
 use schemars::JsonSchema;
@@ -53,7 +53,6 @@ impl Subscribe {
     /// fails the build.
     pub fn new(params: SubscribeParams) -> Result<Self, ParamError> {
         let endpoint = params.link.transport.bind()?;
-        super::record_bound(&params.link.link, &endpoint);
         Ok(Self {
             endpoint: Some(endpoint),
             params,
@@ -108,7 +107,8 @@ pub async fn subscribe(
     };
 
     let dialing = matches!(endpoint, Endpoint::Connect { .. });
-    let Some((inbox, mut view)) = Inbox::new(&routes, *inbound_cap, max_len, dialing) else {
+    let Some((inbox, mut view, mut missing)) = Inbox::new(&routes, *inbound_cap, max_len, dialing)
+    else {
         log.fault(
             "inbound_cap",
             format!("no ring holds {inbound_cap} records of {max_len} bytes"),
@@ -128,10 +128,10 @@ pub async fn subscribe(
         loop {
             let ready = view
                 .wake()
-                .wait_until(|| view.has_record() || inbox.announce_due());
+                .wait_until(|| view.has_record() || missing.has_record());
             future::or(ready, conns.changed()).await;
             dropped += deliver(&mut view, &mut ports);
-            report_unannounced(&inbox, &tables, log);
+            report_missing(&mut missing, &tables, log);
             let status = LinkStatus::new(conns.stats(), dropped + inbox.dropped());
             report(&status, &mut reported, link_status, log);
         }
@@ -143,9 +143,9 @@ pub async fn subscribe(
 ///
 /// This usually means the peer was rebuilt with a changed frame type, so its
 /// table id no longer matches.
-fn report_unannounced(inbox: &Inbox, tables: &[(PacketId, String)], log: &mut Log) {
-    for id in inbox.take_missing_table_ids() {
-        let Some((_, port)) = tables.iter().find(|(table, _)| *table == id) else {
+fn report_missing(missing: &mut View<NoWake>, tables: &[(PacketId, String)], log: &mut Log) {
+    for id in missing.drain().filter_map(Result::ok) {
+        let Some((_, port)) = tables.iter().find(|(table, _)| table[..] == *id) else {
             continue;
         };
         log.fault(
@@ -153,6 +153,7 @@ fn report_unannounced(inbox: &Inbox, tables: &[(PacketId, String)], log: &mut Lo
             format!("port `{port}` was built against a table the peer does not announce"),
         );
     }
+    missing.settle();
 }
 
 /// The routing table for a `Subscribe`'s output ports.
@@ -239,6 +240,7 @@ fn deliver(
 
 #[cfg(test)]
 mod tests {
+    use super::super::inbox::Announce;
     use metor_fsw_3_ring::{NoWake, RingBuffer};
     use zerocopy::IntoBytes;
 
@@ -295,13 +297,10 @@ mod tests {
     }
 
     fn inbox(cap: usize) -> (Inbox, View<Notifier>) {
-        Inbox::new(
-            &route_set(&[id_of::<Fixed>(), id_of::<Note>()], &[]),
-            cap,
-            Note::MAX_LEN,
-            false,
-        )
-        .expect("a small ring")
+        let routes = route_set(&[id_of::<Fixed>(), id_of::<Note>()], &[]);
+        let (inbox, view, _) =
+            Inbox::new(&routes, cap, Note::MAX_LEN, false).expect("a small ring");
+        (inbox, view)
     }
 
     /// Builds a `Fixed` message port and an `Imu` frame port.
@@ -330,7 +329,7 @@ mod tests {
 
         let mut note = rings[1].view(NoWake).expect("a free slot");
         let (inbox, mut view) = inbox(4);
-        inbox.route(&msg(id_of::<Note>(), b"hello"));
+        inbox.route(&mut Announce::Streaming, &msg(id_of::<Note>(), b"hello"));
         assert_eq!(deliver(&mut view, &mut ports), 0);
         assert_eq!(note.drain().next().expect("a record"), Ok(&b"hello"[..]));
         assert_eq!(inbox.dropped(), 0);
@@ -360,7 +359,7 @@ mod tests {
         assert_eq!(ids(&ports, PacketTy::Table), vec![table]);
 
         let mut imu = rings[1].view(NoWake).expect("a free slot");
-        let (inbox, mut view) = Inbox::new(
+        let (inbox, mut view, _) = Inbox::new(
             &route_set(&[id_of::<Fixed>()], &[table]),
             4,
             Imu::MAX_LEN,
@@ -368,8 +367,14 @@ mod tests {
         )
         .expect("a ring");
         let frame = Imu::new(3, 4.0);
-        inbox.route(&body(PacketTy::Table, table, frame.as_bytes()));
-        inbox.route(&body(PacketTy::Table, [9, 9], frame.as_bytes()));
+        inbox.route(
+            &mut Announce::Streaming,
+            &body(PacketTy::Table, table, frame.as_bytes()),
+        );
+        inbox.route(
+            &mut Announce::Streaming,
+            &body(PacketTy::Table, [9, 9], frame.as_bytes()),
+        );
         assert_eq!(deliver(&mut view, &mut ports), 0);
         let received = imu.drain().next().expect("a record").expect("intact");
         assert_eq!(Imu::decode(received), Ok(&frame));
@@ -390,7 +395,7 @@ mod tests {
         // belongs to the other port.
         assert!(Fixed::MAX_LEN < 60 && 60 <= max_len);
         let (inbox, mut view) = inbox(2);
-        inbox.route(&msg(id_of::<Fixed>(), &[0u8; 60]));
+        inbox.route(&mut Announce::Streaming, &msg(id_of::<Fixed>(), &[0u8; 60]));
         assert_eq!(deliver(&mut view, &mut ports), 1);
         assert!(fixed.drain().next().is_none());
     }
@@ -453,7 +458,7 @@ mod tests {
         let mut full = 0;
         for _ in 0..64 {
             for _ in 0..8 {
-                inbox.route(&msg(id_of::<Note>(), b"filler"));
+                inbox.route(&mut Announce::Streaming, &msg(id_of::<Note>(), b"filler"));
             }
             full += deliver(&mut view, &mut ports);
         }

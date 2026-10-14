@@ -182,8 +182,7 @@ impl Connections {
     /// `None` when every slot is taken.
     ///
     /// The future runs until the read or write side ends or `stop` is set,
-    /// then frees the slot. Each connection resets the inbox's announce
-    /// watch, so every peer's announce is checked separately.
+    /// then frees the slot. Each connection checks its own peer's announce.
     pub(crate) fn serve(
         self: &Rc<Self>,
         stream: TcpStream,
@@ -192,7 +191,6 @@ impl Connections {
         let Slot { at, outbox, reader } = self.claim_slot()?;
         let (conns, stop) = (self.clone(), stop.clone());
         Some(async move {
-            conns.inbox.connected();
             let (rx, tx) = stream.split();
             let halves = future::or(
                 write_half(&outbox, &conns.changed, tx, conns.seed.clone(), reader),
@@ -281,11 +279,12 @@ async fn send(tx: &OwnedWriter<TcpStream>, grant: OwnedGrant<NoWake>) -> Option<
 async fn read_half(rx: OwnedReader<TcpStream>, cap: usize, inbox: &Inbox) {
     let mut reader = LengthDelReader::<_, u32>::new(rx);
     let mut buf = vec![0u8; cap];
+    let mut announce = inbox.announce();
     loop {
         let Ok(body) = reader.recv(buf).await else {
             return;
         };
-        inbox.route(&body);
+        inbox.route(&mut announce, &body);
         buf = body.into_inner();
     }
 }

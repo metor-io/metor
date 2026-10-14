@@ -13,9 +13,6 @@ mod subscribe;
 mod transport;
 mod wire;
 
-use std::net::SocketAddr;
-use std::sync::Mutex;
-
 use metor_proto::types::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -53,29 +50,6 @@ pub struct LinkParams {
 /// would go past this is dropped.
 fn default_conn_cap() -> usize {
     1 << 20
-}
-
-/// Every socket address bound by a link in this process, keyed by link name.
-static BOUND: Mutex<Vec<(String, SocketAddr)>> = Mutex::new(Vec::new());
-
-/// Adds `endpoint`'s local address to [`BOUND`], if it has one.
-fn record_bound(link: &str, endpoint: &transport::Endpoint) {
-    let Some(addr) = endpoint.local_addr() else {
-        return;
-    };
-    // PANIC Safety: no code panics while holding this lock, so it is never
-    // poisoned.
-    BOUND
-        .lock()
-        .expect("an unpoisoned registry")
-        .push((link.to_string(), addr));
-}
-
-/// Returns every address a link in this process has bound, with the link's
-/// name.
-pub fn bound_ports() -> Vec<(String, SocketAddr)> {
-    // PANIC Safety: as above.
-    BOUND.lock().expect("an unpoisoned registry").clone()
 }
 
 /// Socket statistics for a link. A link writes one on every cycle where a
