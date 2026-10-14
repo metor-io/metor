@@ -1,10 +1,10 @@
 //! The inbox where a link's connections put the packets they read.
 
-use core::cell::{Cell, RefCell};
+use core::cell::Cell;
 use core::mem::size_of;
 use std::collections::HashSet;
 
-use metor_fsw_3_ring::{Config, Notifier, RingBuffer, View, WakeSource, Writer};
+use metor_fsw_3_ring::{Config, NoWake, Notifier, RingBuffer, View, Writer};
 use metor_proto::types::{Msg, PACKET_HEADER_LEN, PacketHeader, PacketId, PacketTy, Timestamp};
 use metor_proto_wkt::{LinkInfo, SetComponentMetadata, SetMsgMetadata, VTableMsg};
 use zerocopy::TryFromBytes;
@@ -27,80 +27,97 @@ const ANNOUNCE: [PacketId; 4] = [
 /// Connections push the packets they read, and the link drains them onto its
 /// ports. Packets no port wants never enter the queue.
 ///
-/// An inbox can also watch each peer's announce: the vtable messages a peer
-/// sends before its first data packet. The link then logs a fault for any of
-/// its tables the peer never announced.
+/// A dialing link also checks each peer's announce: the vtable messages a peer
+/// sends before its first data packet. Each connection tracks its own
+/// [`Announce`], and the tables its peer never announced are queued for the
+/// link to log.
 pub(crate) struct Inbox {
-    writer: RefCell<Writer<Notifier>>,
-    wake: Notifier,
+    writer: Writer<Notifier>,
+    /// One record per table id a peer did not announce.
+    missing: Writer<Notifier>,
     max_len: usize,
     /// The packet type and id of every record some port takes. A timestamped
     /// message is keyed as a plain `Msg`.
     routes: HashSet<(PacketTy, PacketId)>,
+    /// The table ids some port takes, in port order.
+    tables: Vec<PacketId>,
+    watch_announce: bool,
     dropped: Cell<u64>,
-    announce: Option<AnnounceWatch>,
 }
 
-/// Which of the inbox's tables the current peer has announced.
-struct AnnounceWatch {
-    /// Each routed table id, and whether the peer announced it.
-    tables: RefCell<Vec<(PacketId, bool)>>,
-    phase: Cell<Phase>,
+/// Where one connection's peer is in its announce.
+pub(crate) enum Announce {
+    /// The peer has sent no data yet. `expected` holds the tables some port
+    /// takes that the peer has not announced.
+    Announcing {
+        expected: HashSet<PacketId>,
+    },
+    Streaming,
 }
 
-/// Where the current peer is in its announce.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    /// The peer has not sent data yet.
-    Announcing,
-    /// The peer sent data, and the link has not checked its announce yet.
-    Due,
-    /// The announce was checked, or no peer has connected.
-    Checked,
+impl Announce {
+    /// Notes a table a `VTableMsg` announces.
+    ///
+    /// Postcard encodes a `VTableMsg` with the table id's two bytes first, so
+    /// only those are read.
+    fn recognize_vtable(&mut self, bytes: &[u8]) {
+        if let (Self::Announcing { expected }, Some(&[a, b])) = (self, bytes.get(..2)) {
+            expected.remove(&[a, b]);
+        }
+    }
+
+    /// Ends the announce, returning the tables the peer never announced the
+    /// first time this is called.
+    fn start_streaming(&mut self) -> Option<HashSet<PacketId>> {
+        match core::mem::replace(self, Self::Streaming) {
+            Self::Announcing { expected } => Some(expected),
+            Self::Streaming => None,
+        }
+    }
 }
 
 impl Inbox {
-    /// Creates an inbox and the view the link drains it from.
+    /// Creates an inbox, the view the link drains packets from, and the view
+    /// of the table ids peers did not announce.
     ///
     /// `routes` lists the packet type and id of each port, in port order.
-    /// With `watch_announce`, each connection's announce is tracked until its
-    /// first data packet.
+    /// With `watch_announce`, each connection checks its peer's announce.
     pub(crate) fn new(
         routes: &[(PacketTy, PacketId)],
         inbox_cap: usize,
         record_max_len: usize,
         watch_announce: bool,
-    ) -> Option<(Self, View<Notifier>)> {
-        let cap = ring_capacity(record_max_len.checked_add(PER_RECORD_OVERHEAD)?, inbox_cap)?;
-        let ring = RingBuffer::create_in_memory(Config {
-            capacity: cap,
-            max_readers: 1,
-        })
-        .ok()?;
+    ) -> Option<(Self, View<Notifier>, View<NoWake>)> {
+        let ring = |max_len: usize, depth: usize| {
+            let config = Config {
+                capacity: ring_capacity(max_len, depth)?,
+                max_readers: 1,
+            };
+            RingBuffer::create_in_memory(config).ok()
+        };
+        let packets = ring(record_max_len.checked_add(PER_RECORD_OVERHEAD)?, inbox_cap)?;
+        let tables: Vec<PacketId> = routes
+            .iter()
+            .filter(|(ty, _)| *ty == PacketTy::Table)
+            .map(|&(_, id)| id)
+            .collect();
+        let missing = ring(size_of::<PacketId>(), 4 * tables.len().max(1))?;
         let wake = Notifier::default();
-        // PANIC Safety: the ring is new, so its writer and its one reader slot
-        // are both free.
-        let writer = ring.writer(wake.clone()).expect("a new ring's writer");
-        let view = ring.view(wake.clone()).expect("a new ring's reader slot");
-        let announce = watch_announce.then(|| AnnounceWatch {
-            tables: RefCell::new(
-                routes
-                    .iter()
-                    .filter(|(ty, _)| *ty == PacketTy::Table)
-                    .map(|&(_, id)| (id, false))
-                    .collect(),
-            ),
-            phase: Cell::new(Phase::Checked),
-        });
+        // PANIC Safety: the rings are new, so their writers and their one
+        // reader slots are free.
+        let writer = |ring: &RingBuffer| ring.writer(wake.clone()).expect("a new ring's writer");
         let inbox = Self {
-            writer: RefCell::new(writer),
-            wake,
+            writer: writer(&packets),
+            missing: writer(&missing),
             max_len: record_max_len,
             routes: routes.iter().copied().collect(),
+            tables,
+            watch_announce,
             dropped: Cell::new(0),
-            announce,
         };
-        Some((inbox, view))
+        let packets = packets.view(wake).expect("a new ring's reader slot");
+        let missing = missing.view(NoWake).expect("a new ring's reader slot");
+        Some((inbox, packets, missing))
     }
 
     /// Creates an inbox that routes no packets anywhere.
@@ -109,62 +126,39 @@ impl Inbox {
         Self::new(&[], 1, 0, false).expect("a one-record ring").0
     }
 
-    /// Marks the start of a new connection. A watched inbox forgets what the
-    /// previous peer announced.
-    pub(crate) fn connected(&self) {
-        if let Some(watch) = &self.announce {
-            for (_, announced) in watch.tables.borrow_mut().iter_mut() {
-                *announced = false;
-            }
-            watch.phase.set(Phase::Announcing);
+    /// Where a new connection starts: announcing, if this inbox checks
+    /// announces, with every table some port takes expected.
+    pub(crate) fn announce(&self) -> Announce {
+        match self.watch_announce {
+            true => Announce::Announcing {
+                expected: self.tables.iter().copied().collect(),
+            },
+            false => Announce::Streaming,
         }
     }
 
-    /// Returns true once the current peer has sent data and the link has not
-    /// yet checked its announce.
-    pub(crate) fn announce_due(&self) -> bool {
-        self.announce
-            .as_ref()
-            .is_some_and(|watch| watch.phase.get() == Phase::Due)
-    }
-
-    /// Returns the ids of the tables some port takes that the current peer did
-    /// not announce before its first data packet, and marks its announce
-    /// checked.
+    /// Queues one packet body that a connection in `announce` read.
     ///
-    /// Yields nothing unless [`announce_due`](Self::announce_due) is true.
-    pub(crate) fn take_missing_table_ids(&self) -> impl Iterator<Item = PacketId> + '_ {
-        let tables = self
-            .announce
-            .as_ref()
-            .filter(|_| self.announce_due())
-            .map(|watch| {
-                watch.phase.set(Phase::Checked);
-                watch.tables.borrow()
-            });
-        let len = tables.as_ref().map_or(0, |tables| tables.len());
-        (0..len).filter_map(move |index| {
-            let (id, announced) = tables.as_ref()?[index];
-            (!announced).then_some(id)
-        })
-    }
-
-    /// Queues one packet body for the link's ports.
-    ///
-    /// An announce updates the watch and is not queued, nor is a packet no
-    /// port takes. A packet whose payload is longer than any port accepts, or
-    /// that does not fit in the queue, is counted as dropped.
-    pub(crate) fn route(&self, body: &[u8]) {
+    /// An announce updates `announce` and is not queued. The first data
+    /// packet ends the announce and queues the tables the peer never
+    /// announced. A packet no port takes is not queued, and one whose payload
+    /// is longer than any port accepts, or that does not fit, is counted as
+    /// dropped.
+    pub(crate) fn route(&self, announce: &mut Announce, body: &[u8]) {
         let Some((ty, id, bytes)) = packet(body) else {
             return;
         };
         if ty == PacketTy::Msg && ANNOUNCE.contains(&id) {
             if id == VTableMsg::ID {
-                self.recognize_vtable(bytes);
+                announce.recognize_vtable(bytes);
             }
             return;
         }
-        self.note_data();
+        if let Some(expected) = announce.start_streaming() {
+            for table in self.tables.iter().filter(|id| expected.contains(*id)) {
+                let _ = self.missing.try_write(table);
+            }
+        }
         let ty = match ty {
             PacketTy::MsgWithTimestamp => PacketTy::Msg,
             ty => ty,
@@ -172,41 +166,8 @@ impl Inbox {
         if !self.routes.contains(&(ty, id)) {
             return;
         }
-        if bytes.len() > self.max_len || self.writer.borrow_mut().try_write(body).is_err() {
+        if bytes.len() > self.max_len || self.writer.try_write(body).is_err() {
             self.dropped.set(self.dropped.get() + 1);
-        }
-    }
-
-    /// Marks the table a `VTableMsg` announces as one the peer sent, if a port
-    /// takes it.
-    ///
-    /// Postcard encodes a `VTableMsg` with the table id's two bytes first, so
-    /// only those are read.
-    fn recognize_vtable(&self, bytes: &[u8]) {
-        let Some(watch) = self.announce.as_ref() else {
-            return;
-        };
-        let Some(&[a, b]) = bytes.get(..2) else {
-            return;
-        };
-        if watch.phase.get() == Phase::Checked {
-            return;
-        }
-        let mut tables = watch.tables.borrow_mut();
-        if let Some((_, announced)) = tables.iter_mut().find(|(id, _)| *id == [a, b]) {
-            *announced = true;
-        }
-    }
-
-    /// Notes that the peer sent data, which ends its announce. On the first
-    /// data packet, this wakes the link so it can check the announce.
-    fn note_data(&self) {
-        let Some(watch) = self.announce.as_ref() else {
-            return;
-        };
-        if watch.phase.get() == Phase::Announcing {
-            watch.phase.set(Phase::Due);
-            self.wake.notify();
         }
     }
 
@@ -252,11 +213,29 @@ mod tests {
     const TABLE: PacketId = [1, 2];
 
     fn inbox(cap: usize) -> (Inbox, View<Notifier>) {
-        routed(cap, false)
+        let (inbox, view, _) = routed(cap, false);
+        (inbox, view)
     }
 
-    fn watched(cap: usize) -> (Inbox, View<Notifier>) {
-        routed(cap, true)
+    /// An inbox that checks announces, and its view of missing tables.
+    fn watched() -> (Inbox, View<NoWake>) {
+        let (inbox, _, missing) = routed(4, true);
+        (inbox, missing)
+    }
+
+    /// Routes `body` on a connection that does not check announces.
+    fn route(inbox: &Inbox, body: &[u8]) {
+        inbox.route(&mut Announce::Streaming, body);
+    }
+
+    fn missing(view: &mut View<NoWake>) -> Vec<PacketId> {
+        let ids = view
+            .drain()
+            .filter_map(Result::ok)
+            .map(|id| [id[0], id[1]])
+            .collect();
+        view.settle();
+        ids
     }
 
     /// Routes for message ports `msgs` and frame ports `tables`.
@@ -266,7 +245,7 @@ mod tests {
             .collect()
     }
 
-    fn routed(cap: usize, watch_announce: bool) -> (Inbox, View<Notifier>) {
+    fn routed(cap: usize, watch_announce: bool) -> (Inbox, View<Notifier>, View<NoWake>) {
         Inbox::new(
             &routes(&[id_of::<Fixed>(), id_of::<Note>()], &[TABLE]),
             cap,
@@ -294,8 +273,8 @@ mod tests {
     #[test]
     fn test_drain_yields_in_arrival_order() {
         let (inbox, mut view) = inbox(4);
-        inbox.route(&msg(id_of::<Note>(), b"one"));
-        inbox.route(&msg(id_of::<Fixed>(), b"two"));
+        route(&inbox, &msg(id_of::<Note>(), b"one"));
+        route(&inbox, &msg(id_of::<Fixed>(), b"two"));
         assert_eq!(
             drain(&mut view),
             vec![
@@ -312,14 +291,17 @@ mod tests {
         let (inbox, mut view) = inbox(4);
         let mut stamped = 7i64.to_le_bytes().to_vec();
         stamped.extend_from_slice(b"late");
-        inbox.route(&body(PacketTy::MsgWithTimestamp, id_of::<Note>(), &stamped));
+        route(
+            &inbox,
+            &body(PacketTy::MsgWithTimestamp, id_of::<Note>(), &stamped),
+        );
         assert_eq!(drain(&mut view), vec![(id_of::<Note>(), b"late".to_vec())]);
     }
 
     #[test]
     fn test_ignore_unknown_record_id() {
         let (inbox, mut view) = inbox(4);
-        inbox.route(&msg([9, 9], b"probe"));
+        route(&inbox, &msg([9, 9], b"probe"));
         assert!(drain(&mut view).is_empty());
         assert_eq!(inbox.dropped(), 0);
     }
@@ -327,66 +309,56 @@ mod tests {
     #[test]
     fn test_route_table_by_id() {
         let (inbox, mut view) = inbox(4);
-        inbox.route(&body(PacketTy::Table, TABLE, &[0u8; 4]));
-        inbox.route(&body(PacketTy::Table, [3, 4], &[0u8; 4]));
+        route(&inbox, &body(PacketTy::Table, TABLE, &[0u8; 4]));
+        route(&inbox, &body(PacketTy::Table, [3, 4], &[0u8; 4]));
         assert_eq!(drain(&mut view), vec![(TABLE, vec![0u8; 4])]);
         assert_eq!(inbox.dropped(), 0);
     }
 
-    fn unannounced(inbox: &Inbox) -> Vec<PacketId> {
-        inbox.take_missing_table_ids().collect()
+    #[test]
+    fn test_missing_tables_are_queued_on_first_data() {
+        let (inbox, mut view) = watched();
+        let mut announce = inbox.announce();
+        inbox.route(&mut announce, &vtable([3, 4]));
+        assert!(missing(&mut view).is_empty(), "no data yet");
+        inbox.route(&mut announce, &msg([9, 9], b"probe"));
+        assert_eq!(missing(&mut view), vec![TABLE]);
+        inbox.route(&mut announce, &msg([9, 9], b"probe"));
+        assert!(missing(&mut view).is_empty(), "reported once");
     }
 
     #[test]
-    fn test_watch_reports_unannounced_tables() {
-        let (inbox, _view) = watched(4);
-        assert!(
-            unannounced(&inbox).is_empty(),
-            "nothing is due before a peer"
-        );
-        inbox.connected();
-        inbox.route(&vtable([3, 4]));
-        assert!(!inbox.announce_due(), "no data yet");
-        assert!(unannounced(&inbox).is_empty(), "a read before data is none");
-        inbox.route(&msg([9, 9], b"probe"));
-        assert!(inbox.announce_due(), "any data packet ends the announce");
-        assert_eq!(unannounced(&inbox), vec![TABLE]);
-        assert!(
-            !inbox.announce_due() && unannounced(&inbox).is_empty(),
-            "reported once"
-        );
-    }
-
-    #[test]
-    fn test_watch_passes_announced_table() {
-        let (inbox, _view) = watched(4);
-        inbox.connected();
-        inbox.route(&vtable(TABLE));
-        inbox.route(&body(PacketTy::Table, TABLE, &[0u8; 4]));
-        assert!(unannounced(&inbox).is_empty());
+    fn test_announced_table_is_not_missing() {
+        let (inbox, mut view) = watched();
+        let mut announce = inbox.announce();
+        inbox.route(&mut announce, &vtable(TABLE));
+        inbox.route(&mut announce, &body(PacketTy::Table, TABLE, &[0u8; 4]));
+        assert!(missing(&mut view).is_empty());
     }
 
     #[test]
     fn test_unwatched_inbox_never_checks() {
-        let (inbox, _view) = inbox(4);
-        inbox.connected();
-        inbox.route(&msg([9, 9], b"probe"));
-        assert!(!inbox.announce_due(), "a listener watches nothing");
+        let (inbox, _, mut view) = routed(4, false);
+        let mut announce = inbox.announce();
+        assert!(
+            matches!(announce, Announce::Streaming),
+            "a listener checks nothing"
+        );
+        inbox.route(&mut announce, &msg([9, 9], b"probe"));
+        assert!(missing(&mut view).is_empty());
     }
 
     #[test]
     fn test_each_connection_is_checked_again() {
-        let (inbox, _view) = watched(4);
-        inbox.connected();
-        inbox.route(&vtable(TABLE));
-        inbox.route(&body(PacketTy::Table, TABLE, &[0u8; 4]));
-        assert!(unannounced(&inbox).is_empty());
-
-        inbox.connected();
-        inbox.route(&vtable([3, 4]));
-        inbox.route(&msg([9, 9], b"probe"));
+        let (inbox, mut view) = watched();
+        let mut first = inbox.announce();
+        inbox.route(&mut first, &vtable(TABLE));
+        inbox.route(&mut first, &body(PacketTy::Table, TABLE, &[0u8; 4]));
+        let mut second = inbox.announce();
+        inbox.route(&mut second, &vtable([3, 4]));
+        inbox.route(&mut second, &msg([9, 9], b"probe"));
         assert_eq!(
-            unannounced(&inbox),
+            missing(&mut view),
             vec![TABLE],
             "a peer rebuilt without the table faults again"
         );
@@ -394,26 +366,29 @@ mod tests {
 
     #[test]
     fn test_announce_is_never_routed() {
-        let (inbox, mut view) = watched(4);
-        inbox.connected();
-        inbox.route(&vtable(TABLE));
-        inbox.route(&msg(LinkInfo::ID, b"identity"));
-        inbox.route(&msg(SetComponentMetadata::ID, b"component"));
-        inbox.route(&msg(SetMsgMetadata::ID, b"message"));
-        assert!(drain(&mut view).is_empty());
-        assert!(!inbox.announce_due(), "an announce is not data");
+        let (inbox, mut packets, mut view) = routed(4, true);
+        let mut announce = inbox.announce();
+        inbox.route(&mut announce, &vtable(TABLE));
+        inbox.route(&mut announce, &msg(LinkInfo::ID, b"identity"));
+        inbox.route(&mut announce, &msg(SetComponentMetadata::ID, b"component"));
+        inbox.route(&mut announce, &msg(SetMsgMetadata::ID, b"message"));
+        assert!(drain(&mut packets).is_empty());
+        assert!(
+            matches!(announce, Announce::Announcing { .. }),
+            "an announce is not data"
+        );
+        assert!(missing(&mut view).is_empty());
     }
 
     #[test]
     fn test_ignore_malformed_body() {
         let (inbox, mut view) = inbox(4);
-        inbox.route(&[PacketTy::Msg as u8, 1]);
-        inbox.route(&[0xff, 1, 2, 0, 9]);
-        inbox.route(&body(
-            PacketTy::MsgWithTimestamp,
-            id_of::<Note>(),
-            &[0u8; 3],
-        ));
+        route(&inbox, &[PacketTy::Msg as u8, 1]);
+        route(&inbox, &[0xff, 1, 2, 0, 9]);
+        route(
+            &inbox,
+            &body(PacketTy::MsgWithTimestamp, id_of::<Note>(), &[0u8; 3]),
+        );
         assert!(drain(&mut view).is_empty());
         assert_eq!(inbox.dropped(), 0);
     }
@@ -421,7 +396,7 @@ mod tests {
     #[test]
     fn test_empty_inbox_takes_nothing() {
         let inbox = Inbox::blackhole();
-        inbox.route(&msg(id_of::<Fixed>(), b"one"));
+        route(&inbox, &msg(id_of::<Fixed>(), b"one"));
         assert_eq!(inbox.dropped(), 0);
     }
 
@@ -430,7 +405,7 @@ mod tests {
         let (inbox, mut view) = inbox(2);
         let offered = 64;
         for _ in 0..offered {
-            inbox.route(&msg(id_of::<Fixed>(), b"one"));
+            route(&inbox, &msg(id_of::<Fixed>(), b"one"));
         }
         let ones = drain(&mut view);
         assert!(ones.len() >= 2 && inbox.dropped() >= 1);
@@ -438,17 +413,17 @@ mod tests {
         assert!(ones.iter().all(|(_, bytes)| bytes == b"one"));
         // Draining freed room in the ring for the next record.
         let dropped = inbox.dropped();
-        inbox.route(&msg(id_of::<Fixed>(), b"two"));
+        route(&inbox, &msg(id_of::<Fixed>(), b"two"));
         assert_eq!(drain(&mut view), vec![(id_of::<Fixed>(), b"two".to_vec())]);
         assert_eq!(inbox.dropped(), dropped);
     }
 
     #[test]
     fn test_reject_oversized_record() {
-        let (inbox, mut view) =
+        let (inbox, mut view, _) =
             Inbox::new(&routes(&[id_of::<Fixed>()], &[]), 2, Fixed::MAX_LEN, false)
                 .expect("a small ring");
-        inbox.route(&msg(id_of::<Fixed>(), &[0u8; Fixed::MAX_LEN + 1]));
+        route(&inbox, &msg(id_of::<Fixed>(), &[0u8; Fixed::MAX_LEN + 1]));
         assert!(drain(&mut view).is_empty());
         assert_eq!(inbox.dropped(), 1);
     }

@@ -198,9 +198,25 @@ fn publish(link: &str, transport: serde_json::Value, conn_cap: usize) -> SystemC
     }
 }
 
-/// Returns a transport that listens on a port the OS picks.
-fn listen_any() -> serde_json::Value {
-    json!({ "listen": { "addr": "127.0.0.1:0" } })
+/// The address each test link listens on, by link name.
+static PICKED: Mutex<Vec<(String, SocketAddr)>> = Mutex::new(Vec::new());
+
+/// Returns a free address for link `link` to listen on, and remembers it.
+fn pick_port(link: &str) -> SocketAddr {
+    let addr = free_port();
+    PICKED.lock().unwrap().push((link.to_string(), addr));
+    addr
+}
+
+/// Returns a transport for link `link` that listens on a free port.
+fn listen_any(link: &str) -> serde_json::Value {
+    json!({ "listen": { "addr": pick_port(link).to_string() } })
+}
+
+/// Returns a transport for link `link` that listens on a free port and serves
+/// one peer at a time.
+fn listen_one(link: &str) -> serde_json::Value {
+    json!({ "listen": { "addr": pick_port(link).to_string(), "max_connections": 1 } })
 }
 
 /// Returns an `imu` source and a `Publish` named `link` that serves it on a
@@ -208,7 +224,7 @@ fn listen_any() -> serde_json::Value {
 fn imu_publisher(link: &str) -> Vec<SystemConfig> {
     vec![
         SystemConfig::new("imu", "source"),
-        publish(link, listen_any(), 1 << 20),
+        publish(link, listen_any(link), 1 << 20),
     ]
 }
 
@@ -241,22 +257,11 @@ fn spawn_on(systems: Vec<SystemConfig>, seen: &Seen, clock: Clock) -> Target {
     Target::spawn(config, move || table(&seen), cycles)
 }
 
-/// Waits for the link named `link` to bind, and returns its address.
-///
-/// The test links bind port zero, so tests never have to pick a port.
-async fn bound(link: &str) -> SocketAddr {
-    let deadline = Deadline::new();
-    loop {
-        let found = metor_fsw_3::link::bound_ports()
-            .into_iter()
-            .rev()
-            .find(|(name, _)| name == link)
-            .map(|(_, addr)| addr);
-        if let Some(addr) = found {
-            return addr;
-        }
-        deadline.tick(format!("link `{link}` never bound")).await;
-    }
+/// Returns the address link `link` listens on.
+fn bound(link: &str) -> SocketAddr {
+    let picked = PICKED.lock().unwrap();
+    let found = picked.iter().rev().find(|(name, _)| name == link);
+    found.map(|(_, addr)| *addr).expect("a picked port")
 }
 
 /// Connects to `addr` once the listener is up, without reading its
@@ -309,7 +314,7 @@ async fn until_seen(what: &str, seen: &Seen, mut done: impl FnMut() -> bool) {
 async fn test_publish_announces_and_streams() {
     let seen = Seen::default();
     let _target = spawn(imu_publisher("pub-announces"), &seen, 500.0);
-    let addr = bound("pub-announces").await;
+    let addr = bound("pub-announces");
 
     let Fsw {
         info, mut rx, buf, ..
@@ -397,13 +402,13 @@ async fn test_slow_client_isolation() {
     let _target = spawn(
         vec![
             SystemConfig::new("imu", "source"),
-            publish("pub-slow", listen_any(), 256),
+            publish("pub-slow", listen_any("pub-slow"), 256),
             status_reader("pub"),
         ],
         &seen,
         50_000.0,
     );
-    let addr = bound("pub-slow").await;
+    let addr = bound("pub-slow");
 
     let _slow = dial_fsw(addr).await;
     let Fsw { mut rx, buf, .. } = dial_fsw(addr).await;
@@ -442,11 +447,14 @@ fn subscribe(link: &str, transport: serde_json::Value) -> SystemConfig {
 async fn test_subscribe_counts_identity_write_once() {
     let seen = Seen::default();
     let _target = spawn(
-        vec![subscribe("cmds-idle", listen_any()), status_reader("cmds")],
+        vec![
+            subscribe("cmds-idle", listen_any("cmds-idle")),
+            status_reader("cmds"),
+        ],
         &seen,
         500.0,
     );
-    let addr = bound("cmds-idle").await;
+    let addr = bound("cmds-idle");
 
     let peer = raw_dial(addr).await;
     let (rx, _tx) = peer.split();
@@ -476,14 +484,14 @@ async fn test_subscribe_announces_and_routes() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe("cmds-routes", listen_any()),
+            subscribe("cmds-routes", listen_any("cmds-routes")),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
             status_reader("cmds"),
         ],
         &seen,
         500.0,
     );
-    let addr = bound("cmds-routes").await;
+    let addr = bound("cmds-routes");
 
     let Fsw { info, tx, .. } = dial_fsw(addr).await;
     assert_eq!(info.command_ids, vec![<Ping as Msg>::ID]);
@@ -520,7 +528,7 @@ async fn test_subscribe_receives_records() {
             SystemConfig::new("src", "pinger"),
             SystemConfig {
                 params: json!({
-                    "transport": listen_any(),
+                    "transport": listen_any("pub-records"),
                     "link": "pub-records",
                 }),
                 ..reading(
@@ -534,7 +542,7 @@ async fn test_subscribe_receives_records() {
         &server,
         500.0,
     );
-    let addr = bound("pub-records").await;
+    let addr = bound("pub-records");
     let _client = spawn(
         vec![
             subscribe(
@@ -596,7 +604,7 @@ fn published_imu() -> metor_fsw_3::PortDef {
 async fn test_subscribe_mirrors_frames() {
     let (server, client) = (Seen::default(), Seen::default());
     let _server = spawn(imu_publisher("pub-frames"), &server, 500.0);
-    let addr = bound("pub-frames").await;
+    let addr = bound("pub-frames");
     let _client = spawn(mirror(addr, published_imu()), &client, 500.0);
     until("the mirror never received a frame", || {
         client.pings().len() >= 3
@@ -612,11 +620,11 @@ async fn test_subscribe_mirrors_frames() {
 async fn test_dialing_beside_a_listener() {
     let (server, client) = (Seen::default(), Seen::default());
     let _server = spawn(imu_publisher("pub-beside"), &server, 500.0);
-    let addr = bound("pub-beside").await;
+    let addr = bound("pub-beside");
     let mut systems = mirror(addr, published_imu());
     systems.push(SystemConfig {
         params: json!({
-            "transport": listen_any(),
+            "transport": listen_any("ground-beside"),
             "link": "ground-beside",
         }),
         ..reading(
@@ -637,7 +645,7 @@ async fn test_dialing_beside_a_listener() {
 async fn test_subscribe_faults_unannounced_table() {
     let (server, client) = (Seen::default(), Seen::default());
     let _server = spawn(imu_publisher("pub-other"), &server, 500.0);
-    let addr = bound("pub-other").await;
+    let addr = bound("pub-other");
     // The same frame on a different target has a different table id.
     let elsewhere = DefCx {
         id: "imu",
@@ -729,7 +737,7 @@ async fn test_subscribe_skips_large_announce() {
         .inputs
         .push(InputConfig::new("wide.wide", "wide", "wide"));
     publish.params = json!({
-        "transport": listen_any(),
+        "transport": listen_any("pub-wide"),
         "link": "pub-wide",
     });
     let _server = spawn(
@@ -741,7 +749,7 @@ async fn test_subscribe_skips_large_announce() {
         &server,
         500.0,
     );
-    let addr = bound("pub-wide").await;
+    let addr = bound("pub-wide");
     let _client = spawn(
         vec![
             subscribe(
@@ -769,7 +777,7 @@ async fn test_oversized_packet_closes_connection() {
         reading("logs", "log_sink", "log", PortRef::new("pub", "log")),
     ]);
     let _target = spawn(systems, &seen, 500.0);
-    let addr = bound("pub-cap").await;
+    let addr = bound("pub-cap");
 
     let peer = raw_dial(addr).await;
     until_seen("the link never took the connection", &seen, || {
@@ -792,16 +800,13 @@ async fn test_disconnect_frees_slot() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe(
-                "cmds-slot",
-                json!({ "listen": { "addr": "127.0.0.1:0", "max_connections": 1 } }),
-            ),
+            subscribe("cmds-slot", listen_one("cmds-slot")),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &seen,
         500.0,
     );
-    let addr = bound("cmds-slot").await;
+    let addr = bound("cmds-slot");
 
     // A peer takes the slot and leaves without sending a command.
     let Fsw { rx, tx, .. } = dial_fsw(addr).await;
@@ -825,16 +830,13 @@ async fn test_refuse_peer_past_limit() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe(
-                "cmds-full",
-                json!({ "listen": { "addr": "127.0.0.1:0", "max_connections": 1 } }),
-            ),
+            subscribe("cmds-full", listen_one("cmds-full")),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &seen,
         500.0,
     );
-    let addr = bound("cmds-full").await;
+    let addr = bound("cmds-full");
 
     let Fsw { rx: _rx, tx, .. } = dial_fsw(addr).await;
 
@@ -861,11 +863,11 @@ async fn test_refuse_peer_past_limit() {
 #[stellarator::test]
 async fn test_stop_closes_connections() {
     let target = spawn(
-        vec![subscribe("cmds-stop", listen_any())],
+        vec![subscribe("cmds-stop", listen_any("cmds-stop"))],
         &Seen::default(),
         500.0,
     );
-    let Fsw { mut rx, buf, .. } = dial_fsw(bound("cmds-stop").await).await;
+    let Fsw { mut rx, buf, .. } = dial_fsw(bound("cmds-stop")).await;
     drop(target);
     let read = within("the stopped link kept its peer", rx.next_grow(buf)).await;
     assert!(read.is_err());

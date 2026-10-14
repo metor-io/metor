@@ -48,7 +48,6 @@ impl Publish {
     /// fails the build.
     pub fn new(params: PublishParams) -> Result<Self, ParamError> {
         let endpoint = params.link.transport.bind()?;
-        super::record_bound(&params.link.link, &endpoint);
         Ok(Self {
             endpoint: Some(endpoint),
             params,
