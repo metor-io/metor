@@ -279,12 +279,12 @@ async fn send(tx: &OwnedWriter<TcpStream>, grant: OwnedGrant<NoWake>) -> Option<
 async fn read_half(rx: OwnedReader<TcpStream>, cap: usize, inbox: &Inbox) {
     let mut reader = LengthDelReader::<_, u32>::new(rx);
     let mut buf = vec![0u8; cap];
-    let mut announce = inbox.announce();
+    let mut state = inbox.initial_state();
     loop {
         let Ok(body) = reader.recv(buf).await else {
             return;
         };
-        inbox.route(&mut announce, &body);
+        inbox.route(&mut state, &body);
         buf = body.into_inner();
     }
 }

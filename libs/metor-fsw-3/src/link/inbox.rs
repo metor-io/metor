@@ -29,7 +29,7 @@ const ANNOUNCE: [PacketId; 4] = [
 ///
 /// A dialing link also checks each peer's announce: the vtable messages a peer
 /// sends before its first data packet. Each connection tracks its own
-/// [`Announce`], and the tables its peer never announced are queued for the
+/// [`ConnectionState`], and the tables its peer never announced are queued for the
 /// link to log.
 pub(crate) struct Inbox {
     writer: Writer<Notifier>,
@@ -46,7 +46,7 @@ pub(crate) struct Inbox {
 }
 
 /// Where one connection's peer is in its announce.
-pub(crate) enum Announce {
+pub(crate) enum ConnectionState {
     /// The peer has sent no data yet. `expected` holds the tables some port
     /// takes that the peer has not announced.
     Announcing {
@@ -55,7 +55,7 @@ pub(crate) enum Announce {
     Streaming,
 }
 
-impl Announce {
+impl ConnectionState {
     /// Notes a table a `VTableMsg` announces.
     ///
     /// Postcard encodes a `VTableMsg` with the table id's two bytes first, so
@@ -126,35 +126,35 @@ impl Inbox {
         Self::new(&[], 1, 0, false).expect("a one-record ring").0
     }
 
-    /// Where a new connection starts: announcing, if this inbox checks
-    /// announces, with every table some port takes expected.
-    pub(crate) fn announce(&self) -> Announce {
+    /// The state a new connection starts in: announcing, if this inbox
+    /// checks announces, with every table some port takes expected.
+    pub(crate) fn initial_state(&self) -> ConnectionState {
         match self.watch_announce {
-            true => Announce::Announcing {
+            true => ConnectionState::Announcing {
                 expected: self.tables.iter().copied().collect(),
             },
-            false => Announce::Streaming,
+            false => ConnectionState::Streaming,
         }
     }
 
-    /// Queues one packet body that a connection in `announce` read.
+    /// Queues one packet body that a connection in `state` read.
     ///
-    /// An announce updates `announce` and is not queued. The first data
+    /// An announce updates `state` and is not queued. The first data
     /// packet ends the announce and queues the tables the peer never
     /// announced. A packet no port takes is not queued, and one whose payload
     /// is longer than any port accepts, or that does not fit, is counted as
     /// dropped.
-    pub(crate) fn route(&self, announce: &mut Announce, body: &[u8]) {
+    pub(crate) fn route(&self, state: &mut ConnectionState, body: &[u8]) {
         let Some((ty, id, bytes)) = packet(body) else {
             return;
         };
         if ty == PacketTy::Msg && ANNOUNCE.contains(&id) {
             if id == VTableMsg::ID {
-                announce.recognize_vtable(bytes);
+                state.recognize_vtable(bytes);
             }
             return;
         }
-        if let Some(expected) = announce.start_streaming() {
+        if let Some(expected) = state.start_streaming() {
             for table in self.tables.iter().filter(|id| expected.contains(*id)) {
                 let _ = self.missing.try_write(table);
             }
@@ -225,7 +225,7 @@ mod tests {
 
     /// Routes `body` on a connection that does not check announces.
     fn route(inbox: &Inbox, body: &[u8]) {
-        inbox.route(&mut Announce::Streaming, body);
+        inbox.route(&mut ConnectionState::Streaming, body);
     }
 
     fn missing(view: &mut View<NoWake>) -> Vec<PacketId> {
@@ -318,43 +318,43 @@ mod tests {
     #[test]
     fn test_missing_tables_are_queued_on_first_data() {
         let (inbox, mut view) = watched();
-        let mut announce = inbox.announce();
-        inbox.route(&mut announce, &vtable([3, 4]));
+        let mut state = inbox.initial_state();
+        inbox.route(&mut state, &vtable([3, 4]));
         assert!(missing(&mut view).is_empty(), "no data yet");
-        inbox.route(&mut announce, &msg([9, 9], b"probe"));
+        inbox.route(&mut state, &msg([9, 9], b"probe"));
         assert_eq!(missing(&mut view), vec![TABLE]);
-        inbox.route(&mut announce, &msg([9, 9], b"probe"));
+        inbox.route(&mut state, &msg([9, 9], b"probe"));
         assert!(missing(&mut view).is_empty(), "reported once");
     }
 
     #[test]
     fn test_announced_table_is_not_missing() {
         let (inbox, mut view) = watched();
-        let mut announce = inbox.announce();
-        inbox.route(&mut announce, &vtable(TABLE));
-        inbox.route(&mut announce, &body(PacketTy::Table, TABLE, &[0u8; 4]));
+        let mut state = inbox.initial_state();
+        inbox.route(&mut state, &vtable(TABLE));
+        inbox.route(&mut state, &body(PacketTy::Table, TABLE, &[0u8; 4]));
         assert!(missing(&mut view).is_empty());
     }
 
     #[test]
     fn test_unwatched_inbox_never_checks() {
         let (inbox, _, mut view) = routed(4, false);
-        let mut announce = inbox.announce();
+        let mut state = inbox.initial_state();
         assert!(
-            matches!(announce, Announce::Streaming),
+            matches!(state, ConnectionState::Streaming),
             "a listener checks nothing"
         );
-        inbox.route(&mut announce, &msg([9, 9], b"probe"));
+        inbox.route(&mut state, &msg([9, 9], b"probe"));
         assert!(missing(&mut view).is_empty());
     }
 
     #[test]
     fn test_each_connection_is_checked_again() {
         let (inbox, mut view) = watched();
-        let mut first = inbox.announce();
+        let mut first = inbox.initial_state();
         inbox.route(&mut first, &vtable(TABLE));
         inbox.route(&mut first, &body(PacketTy::Table, TABLE, &[0u8; 4]));
-        let mut second = inbox.announce();
+        let mut second = inbox.initial_state();
         inbox.route(&mut second, &vtable([3, 4]));
         inbox.route(&mut second, &msg([9, 9], b"probe"));
         assert_eq!(
@@ -367,14 +367,14 @@ mod tests {
     #[test]
     fn test_announce_is_never_routed() {
         let (inbox, mut packets, mut view) = routed(4, true);
-        let mut announce = inbox.announce();
-        inbox.route(&mut announce, &vtable(TABLE));
-        inbox.route(&mut announce, &msg(LinkInfo::ID, b"identity"));
-        inbox.route(&mut announce, &msg(SetComponentMetadata::ID, b"component"));
-        inbox.route(&mut announce, &msg(SetMsgMetadata::ID, b"message"));
+        let mut state = inbox.initial_state();
+        inbox.route(&mut state, &vtable(TABLE));
+        inbox.route(&mut state, &msg(LinkInfo::ID, b"identity"));
+        inbox.route(&mut state, &msg(SetComponentMetadata::ID, b"component"));
+        inbox.route(&mut state, &msg(SetMsgMetadata::ID, b"message"));
         assert!(drain(&mut packets).is_empty());
         assert!(
-            matches!(announce, Announce::Announcing { .. }),
+            matches!(state, ConnectionState::Announcing { .. }),
             "an announce is not data"
         );
         assert!(missing(&mut view).is_empty());
