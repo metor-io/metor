@@ -100,28 +100,23 @@ impl Rig {
 /// `io_complete`, then the fix sink.
 fn config(pos_sigma: f64) -> CoordinatorConfig {
     let input = |port: &str, system: &str, from: &str| json!({ "port": port, "from": [{ "system": system, "port": from }] });
-    let sq = |id: &str| input(id, id, "io_sq");
-    let cqe = |id: &str| json!({ "port": id, "record": "io_cqe" });
     let params = json!({ "seed": 7, "pos_sigma": pos_sigma, "vel_sigma": 0.0 });
     let systems = json!([
         { "id": "truth", "ty": "truth" },
         { "id": "outage", "ty": "outage" },
-        { "id": "gps", "ty": "gps_driver",
-          "inputs": [input("io_cq", "io_complete", "gps")],
-          "grants": [{ "param": "uart", "resource": "gps_uart" }] },
-        { "id": "io_submit", "ty": "fsw.io", "inputs": [sq("gps")], "outputs": [cqe("rx")] },
+        { "id": "gps", "ty": "gps_driver" },
+        { "id": "io_submit", "ty": "fsw.io" },
         { "id": "rx", "ty": "gps_receiver", "params": params,
-          "inputs": [
-              input("io_cq", "io_submit", "rx"),
-              input("truth", "truth", "body"),
-              input("faults", "outage", "fault"),
-          ],
-          "grants": [{ "param": "uart", "resource": "gps_uart", "end": "device" }] },
-        { "id": "io_complete", "ty": "fsw.io", "inputs": [sq("rx")], "outputs": [cqe("gps")],
-          "params": { "status": true } },
+          "inputs": [input("truth", "truth", "body"), input("faults", "outage", "fault")] },
+        { "id": "io_complete", "ty": "fsw.io", "params": { "status": true } },
         { "id": "fixes", "ty": "fixes", "inputs": [input("fix", "gps", "fix")] },
     ]);
-    let resources = json!([{ "id": "gps_uart", "backing": { "sim": "uart" } }]);
+    let sim = json!({
+        "kind": "uart",
+        "host": { "system": "gps", "param": "uart" },
+        "device": { "system": "rx", "param": "uart" },
+    });
+    let resources = json!([{ "id": "gps_uart", "backing": { "sim": sim } }]);
     CoordinatorConfig {
         clock: Clock::Simulated {
             dt: Duration::from_micros(DT as u64),
