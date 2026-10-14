@@ -292,9 +292,9 @@ mod gps_on_a_pty {
     use std::time::{Duration, Instant};
 
     use metor_fsw_3::coordinator::{
-        CoordinatorConfig, EndReason, InputConfig, OutputConfig, SystemConfig, SystemTable,
+        CoordinatorConfig, EndReason, InputConfig, SystemConfig, SystemTable,
     };
-    use metor_fsw_3::io::{Backing, Grant, IO_CQ, IO_SQ, IO_TYPE, RealKind, ResourceConfig};
+    use metor_fsw_3::io::{Backing, IO_TYPE, RealKind, ResourceConfig};
     use metor_fsw_3::metor_proto_wkt::LogEvent;
     use metor_fsw_3::{Coordinator, Input, Timestamp, system};
     use std::cell::RefCell;
@@ -337,12 +337,7 @@ mod gps_on_a_pty {
             }],
             systems: vec![
                 SystemConfig {
-                    grants: vec![Grant {
-                        param: "uart".into(),
-                        resource: "gps1".into(),
-                        end: Default::default(),
-                    }],
-                    inputs: vec![InputConfig::new(IO_CQ, "io_complete", "gps")],
+                    grants: [("uart".into(), "gps1".into())].into(),
                     ..SystemConfig::new("gps", "gps")
                 },
                 SystemConfig {
@@ -350,12 +345,8 @@ mod gps_on_a_pty {
                     params: serde_json::json!({ "timeout_s": timeout_s }),
                     ..SystemConfig::new("until", "until_fix")
                 },
+                SystemConfig::new("io_submit", IO_TYPE),
                 SystemConfig {
-                    inputs: vec![InputConfig::new("gps", "gps", IO_SQ)],
-                    ..SystemConfig::new("io_submit", IO_TYPE)
-                },
-                SystemConfig {
-                    outputs: vec![OutputConfig::with_record("gps", "io_cqe")],
                     params: serde_json::json!({ "status": true }),
                     ..SystemConfig::new("io_complete", IO_TYPE)
                 },

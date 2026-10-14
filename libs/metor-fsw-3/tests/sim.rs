@@ -11,7 +11,7 @@ use metor_fsw_3::coordinator::{
     Adapter, ChannelConfig, CoordinatorConfig, EndReason, InputConfig, RunState, SystemConfig,
     SystemTable,
 };
-use metor_fsw_3::io::{Cap, IO_CQ, IO_SQ, ResourceStatus, Uart};
+use metor_fsw_3::io::{Cap, ResourceStatus, Uart};
 use metor_fsw_3::metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
 use metor_fsw_3::{ChannelState, ChannelStatus, Coordinator, Input, Output, Timestamp, system};
 
