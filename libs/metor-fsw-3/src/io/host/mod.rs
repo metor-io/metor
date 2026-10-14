@@ -210,8 +210,8 @@ fn resource(
     wires: &mut Vec<Wire>,
 ) -> Result<Resource, BuildError> {
     let backed = match &config.backing {
-        Backing::Sim(kind) if held => {
-            wires.push(Wire::new(*kind, ops));
+        Backing::Sim(sim) if held => {
+            wires.push(Wire::new(sim.kind, ops));
             Backed::Wire(wires.len() - 1)
         }
         Backing::Real(kind) if held => {

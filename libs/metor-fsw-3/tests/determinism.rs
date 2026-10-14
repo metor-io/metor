@@ -14,12 +14,10 @@ use std::time::Duration;
 
 use common::Ping;
 use metor_fsw_3::coordinator::{
-    Adapter, BuildOptions, Clock, Coordinator, CoordinatorConfig, InputConfig, OutputConfig,
-    SystemConfig, SystemTable,
+    Adapter, BuildOptions, Clock, Coordinator, CoordinatorConfig, InputConfig, SystemConfig,
+    SystemTable,
 };
-use metor_fsw_3::io::{
-    Backing, Grant, IO_CQ, IO_SQ, IO_TYPE, ResourceConfig, ResourceEnd, SimKind,
-};
+use metor_fsw_3::io::{Backing, Holder, IO_SQ, IO_TYPE, ResourceConfig, SimKind, SimResource};
 use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::{DynInputs, EndReason, Input, Output, Stop, Timestamp, system};
 
@@ -69,45 +67,20 @@ fn table(seen: &Rc<RefCell<Tapped>>) -> SystemTable {
     table
 }
 
-fn grant(param: &str, end: ResourceEnd) -> Vec<Grant> {
-    let resource = "line".into();
-    vec![Grant {
-        param: param.into(),
-        resource,
-        end,
-    }]
-}
-
 /// `reader` on sim resource `line`, `chatter` on its other end between the io
 /// systems, `napper` on a thread, and `tap` on every IO port and `napper`'s
 /// output.
 fn config(seed: u64) -> CoordinatorConfig {
     let systems = vec![
-        SystemConfig {
-            grants: grant("uart", ResourceEnd::Host),
-            inputs: vec![InputConfig::new(IO_CQ, "io_complete", "reader")],
-            ..SystemConfig::new("reader", "reader")
-        },
+        SystemConfig::new("reader", "reader"),
         SystemConfig {
             inputs: vec![InputConfig::new("input", "reader", "sums")],
             adapter: Some(Adapter::Thread("io".into())),
             ..SystemConfig::new("napper", "napper")
         },
-        SystemConfig {
-            inputs: vec![InputConfig::new("reader", "reader", IO_SQ)],
-            outputs: vec![OutputConfig::with_record("chatter", "io_cqe")],
-            ..SystemConfig::new("io_submit", IO_TYPE)
-        },
-        SystemConfig {
-            grants: grant("uart", ResourceEnd::Device),
-            inputs: vec![InputConfig::new(IO_CQ, "io_submit", "chatter")],
-            ..SystemConfig::new("chatter", "chatter")
-        },
-        SystemConfig {
-            inputs: vec![InputConfig::new("chatter", "chatter", IO_SQ)],
-            outputs: vec![OutputConfig::with_record("reader", "io_cqe")],
-            ..SystemConfig::new("io_complete", IO_TYPE)
-        },
+        SystemConfig::new("io_submit", IO_TYPE),
+        SystemConfig::new("chatter", "chatter"),
+        SystemConfig::new("io_complete", IO_TYPE),
         SystemConfig {
             inputs: vec![
                 InputConfig::new("sq", "reader", IO_SQ),
@@ -127,7 +100,11 @@ fn config(seed: u64) -> CoordinatorConfig {
         systems,
         resources: vec![ResourceConfig {
             id: "line".into(),
-            backing: Backing::Sim(SimKind::Uart),
+            backing: Backing::Sim(SimResource {
+                kind: SimKind::Uart,
+                host: Holder::new("reader", "uart"),
+                device: Holder::new("chatter", "uart"),
+            }),
         }],
         seed,
         ..CoordinatorConfig::default()

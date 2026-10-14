@@ -52,16 +52,6 @@ pub const MAX_OPS: usize = 16;
 #[cfg(kani)]
 pub const MAX_OPS: usize = 4;
 
-/// A config entry that gives a system's `Cap<K>` parameter a resource.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct Grant {
-    pub param: String,
-    pub resource: String,
-    /// Which end of the resource the parameter holds.
-    #[serde(default, skip_serializing_if = "ResourceEnd::is_host")]
-    pub end: ResourceEnd,
-}
-
 /// A `Cap<K>` parameter in a system's definition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantDef {

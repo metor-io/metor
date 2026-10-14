@@ -1,4 +1,3 @@
-use crate::io::ResourceEnd;
 use metor_proto::types::{ComponentId, PacketId};
 use thiserror::Error;
 
@@ -91,7 +90,7 @@ pub enum BuildError {
     #[error("`{system}` has no grant for its `Cap` parameter `{param}`")]
     Ungranted { system: String, param: String },
 
-    #[error("`{system}` grants its parameter `{param}` twice")]
+    #[error("`{system}`'s parameter `{param}` is bound to two resources")]
     DuplicateGrant { system: String, param: String },
 
     #[error("`{system}` grants `{param}`, which is not a `Cap` parameter")]
@@ -119,14 +118,17 @@ pub enum BuildError {
         found: String,
     },
 
-    #[error("sim resource `{resource}` has no holder on its {missing:?} end")]
-    OneEnd {
+    #[error(
+        "`{system}` grants `{param}` sim resource `{resource}`, which names its holders itself"
+    )]
+    SimGrant {
+        system: String,
+        param: String,
         resource: String,
-        missing: ResourceEnd,
     },
 
-    #[error("`{system}` holds the device end of `{resource}`, which is not simulated")]
-    RealDeviceEnd { system: String, resource: String },
+    #[error("sim resource `{resource}` names holder `{system}`, which is not in the config")]
+    UnknownHolder { resource: String, system: String },
 
     #[error("resource `{resource}` did not open: {message}")]
     Open { resource: String, message: String },
