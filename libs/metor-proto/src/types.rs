@@ -547,7 +547,7 @@ impl ElementValue {
 }
 
 #[derive(
-    TryFromBytes, Unaligned, Immutable, KnownLayout, PartialEq, Debug, Clone, Copy, IntoBytes,
+    TryFromBytes, Unaligned, Immutable, KnownLayout, PartialEq, Eq, Hash, Debug, Clone, Copy, IntoBytes,
 )]
 #[repr(u8)]
 pub enum PacketTy {

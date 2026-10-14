@@ -111,29 +111,16 @@ impl Dialer {
         }
     }
 
-    /// Dials until a connection succeeds, or returns `None` once `stop` is set.
-    pub(crate) async fn connect(&mut self, stop: &Stop) -> Option<TcpStream> {
+    /// Dials until a connection succeeds.
+    pub(crate) async fn connect(&mut self) -> TcpStream {
         loop {
-            if stop.is_set() {
-                return None;
-            }
-            let dial = futures_lite::future::or(
-                async { TcpStream::connect(self.addr).await.ok() },
-                async {
-                    stop.wait().await;
-                    None
-                },
-            );
-            if let Some(stream) = dial.await {
+            if let Ok(stream) = TcpStream::connect(self.addr).await {
                 self.delay = BACKOFF_INITIAL;
-                return Some(stream);
-            }
-            if stop.is_set() {
-                return None;
+                return stream;
             }
             let delay = self.delay;
             self.delay = (delay * 2).min(BACKOFF_MAX);
-            futures_lite::future::or(stellarator::sleep(delay), stop.wait()).await;
+            stellarator::sleep(delay).await;
         }
     }
 }
@@ -147,53 +134,49 @@ impl Endpoint {
     /// sending a batch never cancels an accept or a dial that is halfway
     /// through.
     pub(crate) async fn run(self, conns: Rc<Connections>, stop: Stop) {
-        match self {
-            Self::Listen { listener, .. } => listen(listener, conns, stop).await,
-            Self::Connect { dialer } => dial(dialer, conns, stop).await,
-        }
+        let serve = async {
+            match self {
+                Self::Listen { listener, .. } => listen(listener, &conns, &stop).await,
+                Self::Connect { dialer } => dial(dialer, &conns, &stop).await,
+            }
+        };
+        futures_lite::future::or(serve, stop.wait()).await;
     }
 }
 
-async fn listen(listener: TcpListener, conns: Rc<Connections>, stop: Stop) {
-    while !stop.is_set() {
-        let Some(stream) = accept(&listener, &stop).await else {
+async fn listen(listener: TcpListener, conns: &Rc<Connections>, stop: &Stop) {
+    loop {
+        let Some(stream) = accept(&listener).await else {
             continue;
         };
-        if let Some(served) = conns.serve(stream, &stop) {
+        if let Some(served) = conns.serve(stream, stop) {
             drop(stellarator::spawn(served));
         }
     }
 }
 
-async fn dial(mut dialer: Dialer, conns: Rc<Connections>, stop: Stop) {
-    while let Some(stream) = dialer.connect(&stop).await {
-        if let Some(served) = conns.serve(stream, &stop) {
+async fn dial(mut dialer: Dialer, conns: &Rc<Connections>, stop: &Stop) {
+    loop {
+        let stream = dialer.connect().await;
+        if let Some(served) = conns.serve(stream, stop) {
             served.await;
         }
     }
 }
 
-/// Accepts the next peer.
-///
-/// Returns `None` once `stop` is set, or after an accept fails.
+/// Accepts the next peer, or returns `None` after an accept fails.
 ///
 /// An accept failure comes from the host (for example, running out of file
 /// descriptors), not from the peer, so this pauses before returning instead
 /// of letting the caller retry at once.
-pub(crate) async fn accept(listener: &TcpListener, stop: &Stop) -> Option<TcpStream> {
-    let accepted = futures_lite::future::or(async { Some(listener.accept().await) }, async {
-        stop.wait().await;
-        None
-    })
-    .await;
-    match accepted {
-        Some(Ok(stream)) => Some(stream),
-        Some(Err(error)) => {
+pub(crate) async fn accept(listener: &TcpListener) -> Option<TcpStream> {
+    match listener.accept().await {
+        Ok(stream) => Some(stream),
+        Err(error) => {
             tracing::warn!(%error, "accept failed, backing off");
-            futures_lite::future::or(stellarator::sleep(BACKOFF_INITIAL), stop.wait()).await;
+            stellarator::sleep(BACKOFF_INITIAL).await;
             None
         }
-        None => None,
     }
 }
 
@@ -266,21 +249,22 @@ mod tests {
     }
 
     #[stellarator::test]
-    async fn test_stop_cancels_dial() {
+    async fn test_stop_ends_a_dialing_endpoint() {
         let (handle, stop) = stop_pair();
-        // A port nothing listens on, so the dial is refused at once.
-        let mut dialer = Dialer::new("127.0.0.1:1".parse().expect("an address"));
+        // A port nothing listens on, so every dial is refused.
+        let dialer = Dialer::new("127.0.0.1:1".parse().expect("an address"));
+        let inbox = Rc::new(super::super::inbox::Inbox::blackhole());
+        let conns = Connections::new(1, 64, Vec::new(), inbox).expect("a small ring");
         handle.stop();
-        assert!(dialer.connect(&stop).await.is_none());
+        Endpoint::Connect { dialer }.run(Rc::new(conns), stop).await;
     }
 
     #[stellarator::test]
     async fn test_dial_connects_without_backoff() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
         let addr = listener.local_addr().expect("bound");
-        let (_handle, stop) = stop_pair();
         let mut dialer = Dialer::new(addr);
-        assert!(dialer.connect(&stop).await.is_some());
+        dialer.connect().await;
         assert_eq!(dialer.delay, BACKOFF_INITIAL);
     }
 }

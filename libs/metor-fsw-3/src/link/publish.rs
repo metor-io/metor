@@ -2,19 +2,24 @@
 
 use std::rc::Rc;
 
+use core::ops::{Deref, DerefMut};
+
 use futures_lite::future;
-use metor_fsw_3_ring::Notifier;
-use metor_proto::types::PacketId;
+use metor_fsw_3_ring::{Notifier, WakeSink};
+use metor_proto::types::{PacketId, table_id};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::coordinator::ParamError;
+use crate::def::{DefCx, DefError};
+use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers};
 use crate::log::Log;
 use crate::port::{DynInputs, Output};
+use crate::record::RecordSchema;
 use crate::system::PortDef;
 use crate::{Stop, system};
 
-use super::conn::{self, Connections, Event};
+use super::conn::Connections;
 use super::inbox::Inbox;
 use super::transport::Endpoint;
 use super::wire;
@@ -59,7 +64,7 @@ impl Publish {
 #[system]
 pub async fn publish(
     #[state] s: &mut Publish,
-    inputs: &mut DynInputs<Notifier>,
+    inputs: &mut PublishInputs,
     link_status: &mut Output<LinkStatus>,
     log: &mut Log,
     stop: Stop,
@@ -72,69 +77,107 @@ pub async fn publish(
         conn_cap,
     } = &s.params;
     let (blob, ids) = wire::announce(&defs, namespace.as_deref(), link);
-    report_collisions(log, &defs, &ids);
     // PANIC Safety: `new` always sets the endpoint, and a system runs once.
     let endpoint = s.endpoint.take().expect("one run per instance");
     if let Some(addr) = endpoint.local_addr() {
         log.info(format!("listening on {addr}"));
     }
     let inbox = Rc::new(Inbox::blackhole());
-    let conns = Rc::new(Connections::new(endpoint.slots(), *conn_cap, blob, inbox));
+    let Some(conns) = Connections::new(endpoint.slots(), *conn_cap, blob, inbox) else {
+        log.fault("conn_cap", format!("no ring holds a {conn_cap}-byte batch"));
+        return;
+    };
+    let conns = Rc::new(conns);
     let _source = stellarator::spawn(endpoint.run(conns.clone(), stop.clone())).drop_guard();
     let mut batch = Vec::with_capacity(*conn_cap);
     let mut reported = LinkStatus::default();
-    loop {
-        let input_ready = async {
-            inputs.any_ready().await;
-            Event::Ready
-        };
-        let event = future::or(conn::next(&conns, &stop), input_ready).await;
-        match event {
-            Event::Ready => {
-                batch.clear();
-                fill(&mut batch, inputs, &ids, *conn_cap);
-                if !batch.is_empty() {
-                    conns.enqueue(&batch);
-                }
+    let run = async {
+        loop {
+            future::or(inputs.any_ready(), conns.changed()).await;
+            batch.clear();
+            fill(&mut batch, inputs, &ids, *conn_cap);
+            if !batch.is_empty() {
+                conns.enqueue(&batch);
             }
-            Event::Changed => {}
-            Event::Stop => return,
+            let status = LinkStatus::new(conns.stats(), 0);
+            report(&status, &mut reported, link_status, log);
         }
-        let status = LinkStatus::new(conns.stats(), 0);
-        report(&status, &mut reported, link_status, log);
+    };
+    future::or(run, stop.wait()).await;
+}
+
+/// A `Publish`'s inputs: one dynamic port per wired output.
+///
+/// A record is sent under its frame's table id, so the definition rejects two
+/// frame ports whose tables share an id.
+pub struct PublishInputs<W: WakeSink = Notifier>(DynInputs<W>);
+
+impl<W: WakeSink> Deref for PublishInputs<W> {
+    type Target = DynInputs<W>;
+    fn deref(&self) -> &DynInputs<W> {
+        &self.0
     }
 }
 
-/// Logs a fault for every port whose table id was already announced by an
-/// earlier port.
-fn report_collisions(log: &mut Log, defs: &[PortDef], ids: &[Option<PacketId>]) {
-    for (def, _) in defs.iter().zip(ids).filter(|(_, id)| id.is_none()) {
-        log.fault(
-            "table_id_collision",
-            format!(
-                "port `{}` announces a table another port already did",
-                def.name
-            ),
-        );
+impl<W: WakeSink> DerefMut for PublishInputs<W> {
+    fn deref_mut(&mut self) -> &mut DynInputs<W> {
+        &mut self.0
     }
+}
+
+impl<D: WakeSink + 'static> Param for PublishInputs<D> {
+    type In<W: WakeSink + Clone + 'static> = PublishInputs<W>;
+    type Out = ();
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut PublishInputs<W>;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        cx: &DefCx<'_>,
+        defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        let first = defs.inputs.len();
+        <DynInputs<D> as Param>::append_defs(names, cx, defs)?;
+        check_table_ids(&defs.inputs[first..])
+    }
+
+    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> PublishInputs<W> {
+        PublishInputs(<DynInputs<D> as Param>::bind_in(views))
+    }
+
+    fn bind_out(_writers: &mut Writers) {}
+
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        input: &'a mut PublishInputs<W>,
+        _output: &'a mut (),
+        _cx: &mut Cycle<'a>,
+    ) -> &'a mut PublishInputs<W> {
+        input
+    }
+}
+
+/// Rejects two frame ports whose tables share an id.
+fn check_table_ids(ports: &[PortDef]) -> Result<(), DefError> {
+    let mut seen: Vec<(PacketId, &str)> = Vec::with_capacity(ports.len());
+    for port in ports {
+        let RecordSchema::Frame { vtable, .. } = &port.schema else {
+            continue;
+        };
+        let id = table_id(vtable);
+        if let Some((_, other)) = seen.iter().find(|(known, _)| *known == id) {
+            return Err(DefError::TableIdCollision {
+                port: port.name.to_string(),
+                other: other.to_string(),
+            });
+        }
+        seen.push((id, &port.name));
+    }
+    Ok(())
 }
 
 /// Appends one packet per waiting record to `batch`, stopping before `batch`
 /// would grow past `cap`.
-///
-/// Records on a port with no id (a table id collision) are drained and
-/// dropped.
-fn fill(
-    batch: &mut Vec<u8>,
-    inputs: &mut DynInputs<Notifier>,
-    ids: &[Option<PacketId>],
-    cap: usize,
-) {
+fn fill(batch: &mut Vec<u8>, inputs: &mut DynInputs<Notifier>, ids: &[PacketId], cap: usize) {
     for ((def, input), id) in inputs.iter_mut().zip(ids) {
-        let Some(id) = id else {
-            input.drain().for_each(drop);
-            continue;
-        };
         let (ty, room) = (def.schema.packet_ty(), def.max_len + wire::PACKET_OVERHEAD);
         let mut records = input.drain();
         while batch.len() + room <= cap {
@@ -214,7 +257,7 @@ mod tests {
 
         let mut batch = Vec::new();
         fill(&mut batch, &mut inputs, &ids, default_conn_cap());
-        let (table, msg) = (ids[0].expect("a table id"), ids[1].expect("a message id"));
+        let (table, msg) = (ids[0], ids[1]);
         assert_eq!(batch.len(), IMU_LEN + FIXED_LEN);
         assert_eq!(&batch[4..5], &[PacketTy::Table as u8]);
         assert_eq!(&batch[5..7], &table);
@@ -223,16 +266,22 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_colliding_port() {
-        let rings = [ring::<Imu>(8, 2), ring::<Fixed>(8, 2)];
-        let mut inputs = ports(&rings);
-        produce(&rings, 1.0);
-        let mut batch = Vec::new();
-        fill(&mut batch, &mut inputs, &[None, None], default_conn_cap());
-        assert!(batch.is_empty());
-        produce(&rings, 2.0);
-        fill(&mut batch, &mut inputs, &[None, None], default_conn_cap());
-        assert!(batch.is_empty());
+    fn test_reject_colliding_tables() {
+        let imu = Input::<Imu>::def(&DefCx::empty(), "plant.imu");
+        let fixed = Input::<Fixed>::def(&DefCx::empty(), "cmds.fixed");
+        let twin = PortDef {
+            name: "copy.imu".into(),
+            ..imu.clone()
+        };
+        assert_eq!(check_table_ids(&[imu.clone(), fixed.clone()]), Ok(()));
+        assert_eq!(
+            check_table_ids(&[imu, fixed.clone(), twin, fixed]),
+            Err(DefError::TableIdCollision {
+                port: "copy.imu".into(),
+                other: "plant.imu".into(),
+            }),
+            "messages may share an id; tables may not"
+        );
     }
 
     #[test]
