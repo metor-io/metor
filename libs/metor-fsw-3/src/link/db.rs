@@ -159,24 +159,27 @@ async fn serve(endpoint: Endpoint, db: Arc<DB>, stop: Stop) {
         return;
     };
     let mut slots: Vec<Option<Conn>> = (0..endpoint.slots()).map(|_| None).collect();
-    while !stop.is_set() {
-        let Some(stream) = super::transport::accept(listener, &stop).await else {
-            continue;
-        };
-        let Some(slot) = slots.iter_mut().find(|slot| !occupied(slot)) else {
-            continue;
-        };
-        let open = Rc::new(Cell::new(true));
-        let (conn_db, conn_open) = (db.clone(), open.clone());
-        let task = stellarator::spawn(async move {
-            metor_db::handle_conn(stream, conn_db).await;
-            conn_open.set(false);
-        });
-        *slot = Some(Conn {
-            open,
-            _task: task.drop_guard(),
-        });
-    }
+    let accept = async {
+        loop {
+            let Some(stream) = super::transport::accept(listener).await else {
+                continue;
+            };
+            let Some(slot) = slots.iter_mut().find(|slot| !occupied(slot)) else {
+                continue;
+            };
+            let open = Rc::new(Cell::new(true));
+            let (conn_db, conn_open) = (db.clone(), open.clone());
+            let task = stellarator::spawn(async move {
+                metor_db::handle_conn(stream, conn_db).await;
+                conn_open.set(false);
+            });
+            *slot = Some(Conn {
+                open,
+                _task: task.drop_guard(),
+            });
+        }
+    };
+    futures_lite::future::or(accept, stop.wait()).await;
 }
 
 /// Returns true if `slot` holds a connection that is still open.
