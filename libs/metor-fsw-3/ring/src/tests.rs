@@ -125,6 +125,51 @@ fn test_borrow_read() {
 }
 
 #[test]
+fn test_owned_grant_pins_until_returned() {
+    let rb = ring(64, 1);
+    let w = rb.writer(NoWake).unwrap();
+    let v = rb.view(NoWake).unwrap();
+    let Err(v) = v.try_read_owned().unwrap() else {
+        panic!("an empty ring yields no grant")
+    };
+    w.try_write(&[1u8; 16]).unwrap();
+    w.try_write(&[2u8; 16]).unwrap();
+    let Ok(Ok(mut grant)) = v.try_read_owned() else {
+        panic!("a record")
+    };
+    assert_eq!(&grant[..], &[1u8; 16]);
+    assert_eq!(
+        w.try_write(&[3u8; 16]),
+        Err(WriteError::WouldBlock),
+        "pinned"
+    );
+    grant.skip(10);
+    assert_eq!(&grant[..], &[1u8; 6]);
+    grant.skip(100);
+    assert!(grant.is_empty());
+    let mut v = grant.into_view();
+    w.try_write(&[3u8; 16]).expect("the record was consumed");
+    assert_eq!(read(&mut v).as_deref(), Some(&[2u8; 16][..]));
+    assert_eq!(read(&mut v).as_deref(), Some(&[3u8; 16][..]));
+}
+
+#[test]
+fn test_dropped_owned_grant_frees_slot() {
+    let rb = ring(64, 1);
+    let w = rb.writer(NoWake).unwrap();
+    let v = rb.view(NoWake).unwrap();
+    w.try_write(&[1u8; 16]).unwrap();
+    let Ok(Ok(grant)) = v.try_read_owned() else {
+        panic!("a record")
+    };
+    assert_eq!(reader_count(&rb), 1);
+    assert!(rb.view(NoWake).is_err(), "the grant holds the only slot");
+    drop(grant);
+    assert_eq!(reader_count(&rb), 0);
+    assert!(rb.view(NoWake).is_ok());
+}
+
+#[test]
 fn test_oversize_message_rejected() {
     let rb = ring(64, 1);
     let w = rb.writer(NoWake).unwrap();

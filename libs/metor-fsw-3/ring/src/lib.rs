@@ -951,6 +951,42 @@ impl<RD: WakeSink> View<RD> {
         }
     }
 
+    /// Takes the next unread record as a grant that owns this view.
+    ///
+    /// Unlike a [`ReadGrant`], the grant borrows nothing, so it can be held
+    /// by an op that completes later. Returns the view back when it has
+    /// caught up.
+    pub fn try_read_owned(mut self) -> Result<Result<OwnedGrant<RD>, Self>, ReadError> {
+        self.settle();
+        let Some(loc) = self.locate()? else {
+            return Ok(Err(self));
+        };
+        let (inner, slot, wake) = self.into_parts();
+        Ok(Ok(OwnedGrant {
+            inner,
+            slot,
+            offset: loc.offset + RECORD_HEADER_SIZE,
+            len: loc.payload_len,
+            end: loc.end(),
+            wake,
+        }))
+    }
+
+    /// Splits the view into its ring, reader slot, and wake, keeping the slot
+    /// claimed.
+    fn into_parts(self) -> (Arc<Inner>, u32, RD) {
+        let view = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `view` is never dropped or used again, so each field is
+        // moved out exactly once.
+        unsafe {
+            (
+                core::ptr::read(&view.inner),
+                view.slot,
+                core::ptr::read(&view.wake),
+            )
+        }
+    }
+
     fn locate(&self) -> Result<Option<Located>, ReadError> {
         let r = self.cursor.get();
         let (skipped, loc) = self.inner.locate_before(r, self.committed())?;
@@ -1042,6 +1078,69 @@ impl std::ops::Deref for ReadGrant<'_> {
 impl Drop for ReadGrant<'_> {
     fn drop(&mut self) {
         store_cursor(self.cursor, self.slot, self.end);
+    }
+}
+
+/// A record taken with [`View::try_read_owned`], holding the view it came
+/// from.
+///
+/// It derefs to the payload bytes not yet [`skip`](Self::skip)ped. The
+/// record stays pinned until the grant is consumed: [`into_view`]
+/// (Self::into_view) consumes the record and returns the view, and dropping
+/// the grant releases the view's reader slot.
+pub struct OwnedGrant<RD: WakeSink> {
+    inner: Arc<Inner>,
+    slot: u32,
+    /// Data-region offset of the first unskipped payload byte.
+    offset: usize,
+    /// Payload bytes not yet skipped.
+    len: usize,
+    /// Absolute end of the record.
+    end: u64,
+    wake: RD,
+}
+
+impl<RD: WakeSink> OwnedGrant<RD> {
+    /// Drops the first `n` payload bytes from what the grant derefs to.
+    pub fn skip(&mut self, n: usize) {
+        let n = n.min(self.len);
+        self.offset += n;
+        self.len -= n;
+    }
+
+    /// Consumes the record and returns the view.
+    pub fn into_view(self) -> View<RD> {
+        let grant = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `grant` is never dropped or used again, so each field is
+        // moved out exactly once.
+        let (inner, wake) =
+            unsafe { (core::ptr::read(&grant.inner), core::ptr::read(&grant.wake)) };
+        let view = View {
+            inner,
+            slot: grant.slot,
+            cursor: Cell::new(grant.end),
+            wake,
+            pending: None,
+        };
+        view.advance(grant.end);
+        view
+    }
+}
+
+impl<RD: WakeSink> std::ops::Deref for OwnedGrant<RD> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: lookup validated the record, and the grant's slot cursor
+        // still sits at its start, so the writer cannot reuse these bytes
+        // while the grant lives. `offset + len` stays within the record.
+        unsafe { std::slice::from_raw_parts(self.inner.data_ptr(self.offset), self.len) }
+    }
+}
+
+impl<RD: WakeSink> Drop for OwnedGrant<RD> {
+    fn drop(&mut self) {
+        self.inner.slot(self.slot).owner.store(0, Relaxed);
+        self.inner.slot(self.slot).cursor.store(FREE_SLOT, Release);
     }
 }
 
