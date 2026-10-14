@@ -154,7 +154,7 @@ pub(crate) fn bind<S: FnSignature>(
     let defs = Defs::declared::<S>();
     let rng = defs.rng.then(|| instance.rng()).transpose()?;
     let records = defs.records.then(|| instance.records.clone());
-    let arena = defs.io.then(|| io.borrow_mut().member(id));
+    let arena = defs.io.then(|| io.borrow_mut().get_or_add_member(id));
     let io_ports = defs.io_ports();
     // PANIC Safety: build binds one entry per port of the definition these
     // `Defs` describe, with `log` last among the outputs.
