@@ -383,7 +383,8 @@ impl DB {
                 let component = state
                     .get_component(rf.component_id)
                     .ok_or(Error::ComponentNotFound(rf.component_id))?;
-                pushed.push(component, &rf, received)
+                pushed.merge(push_field(component, &rf, received)?);
+                Ok(())
             })?;
             Ok(Some(pushed))
         })
@@ -408,7 +409,8 @@ impl DB {
             for_each_realized(&vtable, buf, |rf| {
                 let (component, created) = state.realize_component(&rf, &self.path)?;
                 pushed.new_series |= created;
-                pushed.push(component, &rf, received)
+                pushed.merge(push_field(component, &rf, received)?);
+                Ok(())
             })?;
             state.latest_dynamic_tables.insert(id, buf.to_vec());
             Ok(pushed)
@@ -849,7 +851,7 @@ pub(crate) fn max_node_age_override() -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-/// What sinking one table did: its newest stamp, and whether a series began.
+/// The newest timestamp pushed, and whether a push began an empty series.
 #[derive(Default)]
 struct Pushed {
     max_ts: Option<Timestamp>,
@@ -857,22 +859,28 @@ struct Pushed {
 }
 
 impl Pushed {
-    /// Pushes one realized field into `component`, stamped `received` when
-    /// its vtable names no timestamp.
-    fn push(
-        &mut self,
-        component: &Component,
-        rf: &RealizedField,
-        received: Timestamp,
-    ) -> Result<(), Error> {
-        // PANIC Safety: `for_each_realized` walks a table, so every field realizes a view.
-        let view = rf.view.as_ref().expect("table provided to for_each_field");
-        let ts = rf.timestamp.unwrap_or(received);
-        self.new_series |= component.time_series.is_empty();
-        component.push_buf(ts, view.as_bytes())?;
-        self.max_ts = self.max_ts.max(Some(ts));
-        Ok(())
+    fn merge(&mut self, other: Pushed) {
+        self.max_ts = self.max_ts.max(other.max_ts);
+        self.new_series |= other.new_series;
     }
+}
+
+/// Pushes one realized field into `component`, stamped `received` when its
+/// vtable names no timestamp.
+fn push_field(
+    component: &Component,
+    rf: &RealizedField,
+    received: Timestamp,
+) -> Result<Pushed, Error> {
+    // PANIC Safety: `for_each_realized` walks a table, so every field realizes a view.
+    let view = rf.view.as_ref().expect("table provided to for_each_field");
+    let ts = rf.timestamp.unwrap_or(received);
+    let new_series = component.time_series.is_empty();
+    component.push_buf(ts, view.as_bytes())?;
+    Ok(Pushed {
+        max_ts: Some(ts),
+        new_series,
+    })
 }
 
 /// Walks the fields `buf` realizes, stopping at the first error `f` returns.
