@@ -145,10 +145,8 @@ class TcpConnect(Kind):
 
 class SimKind(Kind):
     """A simulated resource: a wire with two ends. Drivers hold its host end
-    and models its `device` end, each through a `Cap`."""
-
-    def to_json(self) -> dict[str, Any]:
-        return {"sim": self._key}
+    and models its `device` end, each through a `Cap`. The target names both
+    holders in the resource's entry."""
 
 
 @dataclass(frozen=True)

@@ -345,7 +345,7 @@ pub(crate) unsafe fn adopt(io: &SharedIo, instance: &Instance, ring: RawRing) {
     if host_caps(&instance.def).next().is_none() {
         return;
     }
-    let arena = io.borrow_mut().member(&instance.id);
+    let arena = io.borrow_mut().get_or_add_member(&instance.id);
     let base = core::ptr::NonNull::new(ring.base).filter(|_| ring.len > 0);
     let Some(base) = base.filter(|_| arena.region().is_none()) else {
         return;

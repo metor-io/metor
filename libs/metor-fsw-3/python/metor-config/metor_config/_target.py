@@ -171,7 +171,7 @@ class Target:
 
         Only a target with grants has io steps to write it.
         """
-        if not self._members(self._systems) + self._members(self._sims):
+        if not self._holds_caps():
             raise ConfigError("no system holds a resource, so there is no io_status")
         return OutPort(IO_COMPLETE, "io_status", ResourceStatus, self)
 
@@ -229,7 +229,6 @@ class Target:
         with no library is built into the host, so it is not listed.
         """
         self._check_commands()
-        self._check_ends()
         coordinator: dict[str, Any] = {
             "clock": self._clock(),
             "ring_depth": self.ring_depth,
@@ -239,7 +238,7 @@ class Target:
         if self.seed:
             coordinator["seed"] = self.seed
         if self._resources:
-            coordinator["resources"] = [r.to_json() for r in self._resources.values()]
+            coordinator["resources"] = [self._resource(r) for r in self._resources.values()]
         return {
             "packs": [
                 pack.to_json()
@@ -249,56 +248,40 @@ class Target:
             "coordinator": coordinator,
         }
 
-    def _members(self, systems: list[tuple[str, System, dict[str, Any] | None]]) -> list[str]:
-        """Returns each system of ``systems`` that holds a `Cap`, in step order."""
-        return [name for name, system, _ in systems if type(system)._caps]
-
     def _steps(self) -> list[dict[str, Any]]:
         """Returns every system's entry: the flight systems, `io_submit`, the
         models added with `sim`, then `io_complete`.
 
-        Each io system lowers the ops of the systems since the previous one,
-        and posts the completions of the systems up to the next one, wrapping
-        from the last io system around to the first systems.
+        The build wires each system that holds a `Cap` to the io systems.
         """
         flight = [self._system(self._systems, index) for index in range(len(self._systems))]
         sims = [self._system(self._sims, index) for index in range(len(self._sims))]
-        drivers, models = self._members(self._systems), self._members(self._sims)
-        if not drivers and not models:
+        if not self._holds_caps():
             return flight + sims
-        submit = self._io(IO_SUBMIT, drivers, models, False)
-        complete = self._io(IO_COMPLETE, models, drivers, True)
+        submit = {"id": IO_SUBMIT, "ty": IO_TYPE}
+        complete = {"id": IO_COMPLETE, "ty": IO_TYPE, "params": {"status": True}}
         return flight + [submit, *sims, complete]
 
-    def _io(self, name: str, sqs: list[str], cqs: list[str], status: bool) -> dict[str, Any]:
-        """An io system, reading the SQs of ``sqs`` and writing the CQs of
-        ``cqs``."""
-        entry: dict[str, Any] = {
-            "id": name,
-            "ty": IO_TYPE,
-            "inputs": [{"port": m, "from": [{"system": m, "port": "io_sq"}]} for m in sqs],
-        }
-        if cqs:
-            entry["outputs"] = [{"port": m, "record": "io_cqe"} for m in cqs]
-        if status:
-            entry["params"] = {"status": True}
-        return entry
+    def _holds_caps(self) -> bool:
+        """Returns whether any system holds a `Cap`, so the target needs io steps."""
+        return any(type(system)._caps for _, system, _ in self._systems + self._sims)
 
-    def _check_ends(self) -> None:
-        """Raises `ConfigError` unless each sim resource that is held is held
-        on both ends."""
-        held = [
-            (grant.name, grant.end)
-            for _, system, _ in self._systems + self._sims
-            for grant in system._grants.values()
-        ]
-        for resource in self._resources.values():
-            ends = {end for name, end in held if name == resource.name}
-            if not isinstance(resource.kind, SimKind) or not ends:
-                continue
-            for end in ("host", "device"):
-                if end not in ends:
-                    raise ConfigError(f"sim resource `{resource.name}` has no holder on its {end} end")
+    def _resource(self, resource: ResourceHandle) -> dict[str, Any]:
+        """Returns a resource's entry. A sim resource names the system and
+        parameter holding each of its ends, and raises `ConfigError` if either
+        end has no holder."""
+        if not isinstance(resource.kind, SimKind):
+            return resource.to_json()
+        ends: dict[str, dict[str, str]] = {}
+        for name, system, _ in self._systems + self._sims:
+            for param, grant in system._grants.items():
+                if grant.name == resource.name:
+                    ends[grant.end] = {"system": name, "param": param}
+        for end in ("host", "device"):
+            if end not in ends:
+                raise ConfigError(f"sim resource `{resource.name}` has no holder on its {end} end")
+        sim = {"kind": resource.kind._key, "host": ends["host"], "device": ends["device"]}
+        return {"id": resource.name, "backing": {"sim": sim}}
 
     def _check_commands(self) -> None:
         """Raises `ConfigError` if the target has channels but no command
@@ -330,11 +313,13 @@ class Target:
             }
             for port, sources in inputs.items()
         ]
-        if system._grants:
-            entry["grants"] = [_grant(param, grant) for param, grant in system._grants.items()]
-        if type(system)._caps:
-            posts = IO_SUBMIT if systems is self._sims else IO_COMPLETE
-            entry["inputs"].append({"port": "io_cq", "from": [{"system": posts, "port": name}]})
+        grants = {
+            param: grant.name
+            for param, grant in system._grants.items()
+            if not isinstance(grant.kind, SimKind)
+        }
+        if grants:
+            entry["grants"] = grants
         outputs = system._outputs_for(self, index)
         if outputs:
             entry["outputs"] = _json(outputs)
@@ -344,14 +329,6 @@ class Target:
         if self.sim_dt is not None:
             return simulated_clock(self.sim_dt, self.epoch)
         return wall_clock(self.cycle_rate)
-
-
-def _grant(param: str, grant: ResourceHandle) -> dict[str, Any]:
-    """Returns a grant's entry, naming its end when it is not the host."""
-    entry = {"param": param, "resource": grant.name}
-    if grant.end != "host":
-        entry["end"] = grant.end
-    return entry
 
 
 def _adapter(

@@ -79,6 +79,21 @@ class UartModel(System):
         super().__init__({}, {}, grants={"uart": uart})
 
 
+def _holder(interface: str, handle: ResourceHandle) -> System:
+    """A system with one `Cap` of ``interface``, granted ``handle``."""
+
+    class Holder(System):
+        _pack = PACK
+        _ty = "holder"
+        _ports = {}
+        _caps = {"cap": interface}
+
+        def __init__(self) -> None:
+            super().__init__({}, {}, grants={"cap": handle})
+
+    return Holder()
+
+
 def coordinator(target: Target) -> dict[str, Any]:
     return target.to_config()["coordinator"]
 
@@ -97,25 +112,11 @@ class ResourceTests(unittest.TestCase):
             [{"id": "gps1", "backing": {"real": {"tty": {"path": "/dev/ttyTHS0", "baud": 9600}}}}],
         )
         gps, submit, complete = config["systems"]
-        self.assertEqual(gps["grants"], [{"param": "uart", "resource": "gps1"}])
-        self.assertIn({"port": "io_cq", "from": [{"system": "io_complete", "port": "gps"}]}, gps["inputs"])
+        self.assertEqual(gps["grants"], {"uart": "gps1"})
+        self.assertEqual(gps["inputs"], [], "the build wires io_cq")
+        self.assertEqual(submit, {"id": "io_submit", "ty": "fsw.io"})
         self.assertEqual(
-            submit,
-            {
-                "id": "io_submit",
-                "ty": "fsw.io",
-                "inputs": [{"port": "gps", "from": [{"system": "gps", "port": "io_sq"}]}],
-            },
-        )
-        self.assertEqual(
-            complete,
-            {
-                "id": "io_complete",
-                "ty": "fsw.io",
-                "inputs": [],
-                "outputs": [{"port": "gps", "record": "io_cqe"}],
-                "params": {"status": True},
-            },
+            complete, {"id": "io_complete", "ty": "fsw.io", "params": {"status": True}}
         )
 
     def test_resource_status_names_io_status(self) -> None:
@@ -128,8 +129,8 @@ class ResourceTests(unittest.TestCase):
         fsw.add("b", Gps(uart=gps1))
         config = coordinator(fsw)
         self.assertEqual(len(config["resources"]), 1)
-        submit = config["systems"][2]
-        self.assertEqual([i["port"] for i in submit["inputs"]], ["a", "b"])
+        a, b = config["systems"][:2]
+        self.assertEqual((a["grants"], b["grants"]), ({"uart": "gps1"}, {"uart": "gps1"}))
 
     def test_no_grants_emits_no_io(self) -> None:
         fsw = Target(cycle_rate=10.0)
@@ -194,20 +195,39 @@ class SimTests(unittest.TestCase):
         target_mod._targets.clear()
 
     def test_sim_kinds_emit_their_backing(self) -> None:
-        self.assertEqual(SimUart().to_json(), {"sim": "uart"})
-        self.assertEqual(SimGpioLine().to_json(), {"sim": "gpio_line"})
+        for kind, key in ((SimUart(), "uart"), (SimGpioLine(), "gpio_line")):
+            fsw = Target(cycle_rate=10.0)
+            line = fsw.resource("line", kind)
+            fsw.add("a", _holder(kind.interface, line))
+            fsw.sim("b", _holder(kind.interface, line.device))
+            (resource,) = coordinator(fsw)["resources"]
+            self.assertEqual(resource["backing"]["sim"]["kind"], key)
+            target_mod._targets.clear()
 
-    def test_model_holds_the_device_end(self) -> None:
+    def test_sim_resource_names_its_holders(self) -> None:
         fsw = Target(cycle_rate=10.0)
         gps1 = fsw.resource("gps1", SimUart())
         fsw.add("gps", Gps(uart=gps1))
         fsw.sim("model", UartModel(uart=gps1.device))
-        gps, submit, model, complete = coordinator(fsw)["systems"]
-        self.assertEqual(model["grants"], [{"param": "uart", "resource": "gps1", "end": "device"}])
-        self.assertEqual(gps["grants"], [{"param": "uart", "resource": "gps1"}])
-        self.assertIn({"port": "io_cq", "from": [{"system": "io_submit", "port": "model"}]}, model["inputs"])
-        self.assertEqual(submit["outputs"], [{"port": "model", "record": "io_cqe"}])
-        self.assertEqual([i["port"] for i in complete["inputs"]], ["model"])
+        config = coordinator(fsw)
+        gps, submit, model, complete = config["systems"]
+        self.assertNotIn("grants", gps)
+        self.assertNotIn("grants", model)
+        self.assertEqual(
+            config["resources"],
+            [
+                {
+                    "id": "gps1",
+                    "backing": {
+                        "sim": {
+                            "kind": "uart",
+                            "host": {"system": "gps", "param": "uart"},
+                            "device": {"system": "model", "param": "uart"},
+                        }
+                    },
+                }
+            ],
+        )
 
     def test_sim_resource_held_on_one_end_is_refused(self) -> None:
         fsw = Target(cycle_rate=10.0)
@@ -221,8 +241,11 @@ class SimTests(unittest.TestCase):
         fsw.add("a", Gps(uart=fsw.resource("port", Tty("/dev/ttyS0"))))
         fsw.add("b", Gps(uart=sim))
         fsw.sim("model", UartModel(uart=sim.device))
-        submit = coordinator(fsw)["systems"][2]
-        self.assertEqual([i["port"] for i in submit["inputs"]], ["a", "b"])
+        config = coordinator(fsw)
+        a, b = config["systems"][:2]
+        self.assertEqual(a["grants"], {"uart": "port"})
+        self.assertNotIn("grants", b)
+        self.assertEqual(len(config["resources"]), 2)
 
     def test_real_resource_has_no_device_end(self) -> None:
         fsw = Target(cycle_rate=10.0)
@@ -247,8 +270,6 @@ class SimTests(unittest.TestCase):
         fsw.add("model", UartModel(uart=gps1.device))
         systems = coordinator(fsw)["systems"]
         self.assertEqual([s["id"] for s in systems], ["gps", "model", "io_submit", "io_complete"])
-        self.assertEqual([i["port"] for i in systems[2]["inputs"]], ["gps", "model"])
-        self.assertEqual([o["port"] for o in systems[3]["outputs"]], ["gps", "model"])
 
     def test_sim_golden_matches(self) -> None:
         golden = os.path.join(os.path.dirname(__file__), "..", "..", "..", "tests", "golden")
