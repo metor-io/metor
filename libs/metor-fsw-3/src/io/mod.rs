@@ -16,6 +16,7 @@ mod config;
 mod error;
 #[cfg(all(feature = "host", unix))]
 pub mod host;
+mod op_slot;
 mod ops;
 mod param;
 mod queue;
