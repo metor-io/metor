@@ -10,13 +10,7 @@ use common::{fixture_dir, metor};
 fn test_target_exits_after_fixed_cycles() {
     let target = fixture_dir().join("target.py");
     let output = metor()
-        .args([
-            "run",
-            &target.display().to_string(),
-            "--cycles",
-            "3",
-            "--print-ports",
-        ])
+        .args(["run", &target.display().to_string(), "--cycles", "3"])
         .output()
         .expect("metor runs");
     assert!(
@@ -24,13 +18,6 @@ fn test_target_exits_after_fixed_cycles() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let ports = String::from_utf8_lossy(&output.stdout);
-    let links: Vec<&str> = ports
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .map(|(link, _)| link)
-        .collect();
-    assert_eq!(links, vec!["cmds", "pub"], "{ports}");
 }
 
 #[test]
@@ -138,28 +125,6 @@ fn test_latched_child_fails_the_deployment() {
     assert!(stderr.contains("did not exit cleanly: b"), "{stderr}");
     assert!(
         stderr.contains("b │ metor: these systems latched off: boom"),
-        "{stderr}"
-    );
-}
-
-#[test]
-fn test_print_ports_needs_one_target() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let target = two_targets(dir.path(), "");
-    let output = metor()
-        .args([
-            "run",
-            &target.display().to_string(),
-            "--cycles",
-            "1",
-            "--print-ports",
-        ])
-        .output()
-        .expect("metor runs");
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--print-ports") && stderr.contains("--target"),
         "{stderr}"
     );
 }

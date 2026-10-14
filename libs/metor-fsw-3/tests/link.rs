@@ -4,9 +4,7 @@
 mod common;
 
 use core::time::Duration;
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -942,50 +940,35 @@ async fn test_simulated_clock_preserves_connection() {
 /// test kills it long before that.
 const FIXTURE_CYCLES: &str = "600000";
 
-/// The fixture's target running under `metor run`, with the addresses its
-/// links bound.
+/// The fixture's target running under `metor run`, with its links on
+/// pre-picked free ports.
 struct Fixture {
     _child: Running,
-    ports: Vec<(String, SocketAddr)>,
+    cmds: SocketAddr,
+    publish: SocketAddr,
 }
 
 impl Fixture {
-    /// Runs the fixture target with `--print-ports` and reads the addresses
-    /// it prints.
+    /// Runs the fixture target, passing it the ports its links listen on.
     fn start() -> Self {
+        let (cmds, publish) = (free_port(), free_port());
         let target = fixture_dir().join("target.py");
-        let mut child = metor()
+        let child = metor()
             .args([
                 "run",
                 &target.display().to_string(),
                 "--cycles",
                 FIXTURE_CYCLES,
-                "--print-ports",
             ])
-            .stdout(Stdio::piped())
+            .env("FIXTURE_CMDS_PORT", cmds.port().to_string())
+            .env("FIXTURE_PUB_PORT", publish.port().to_string())
             .spawn()
             .expect("metor runs");
-        // PANIC Safety: the child was just spawned with a piped stdout.
-        let stdout = child.stdout.take().expect("a piped stdout");
-        let ports = BufReader::new(stdout)
-            .lines()
-            .take(2)
-            .map_while(Result::ok)
-            .filter_map(|line| {
-                let (link, addr) = line.split_once(' ')?;
-                Some((link.to_string(), addr.parse().ok()?))
-            })
-            .collect();
         Self {
             _child: Running(child),
-            ports,
+            cmds,
+            publish,
         }
-    }
-
-    fn addr(&self, link: &str) -> SocketAddr {
-        let found = self.ports.iter().find(|(name, _)| name == link);
-        // PANIC Safety: a target that did not bind both links fails the test.
-        found.expect("the target printed both links").1
     }
 }
 
@@ -994,8 +977,8 @@ async fn test_fixture_link_round_trip() {
     let fixture = Fixture::start();
     // Connect to the publisher first, so the reply cannot arrive before the
     // connection exists.
-    let Fsw { mut rx, buf, .. } = dial_fsw(fixture.addr("pub")).await;
-    let Fsw { info, tx, .. } = dial_fsw(fixture.addr("cmds")).await;
+    let Fsw { mut rx, buf, .. } = dial_fsw(fixture.publish).await;
+    let Fsw { info, tx, .. } = dial_fsw(fixture.cmds).await;
     assert_eq!(info.command_ids, vec![<Ping as Msg>::ID]);
 
     tx.send((&Ping { n: 41 }).into_len_packet())
