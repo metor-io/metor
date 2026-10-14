@@ -128,11 +128,12 @@ impl Inbox {
             .is_some_and(|watch| watch.phase.get() == Phase::Due)
     }
 
-    /// Returns the tables the current peer did not announce before its first
-    /// data packet, and marks its announce checked.
+    /// Returns the ids of the tables some port takes that the current peer did
+    /// not announce before its first data packet, and marks its announce
+    /// checked.
     ///
     /// Yields nothing unless [`announce_due`](Self::announce_due) is true.
-    pub(crate) fn take_unannounced(&self) -> impl Iterator<Item = PacketId> + '_ {
+    pub(crate) fn take_missing_table_ids(&self) -> impl Iterator<Item = PacketId> + '_ {
         let tables = self
             .announce
             .as_ref()
@@ -159,7 +160,7 @@ impl Inbox {
         };
         if ty == PacketTy::Msg && ANNOUNCE.contains(&id) {
             if id == VTableMsg::ID {
-                self.note_announced(bytes);
+                self.recognize_vtable(bytes);
             }
             return;
         }
@@ -176,11 +177,12 @@ impl Inbox {
         }
     }
 
-    /// Records that the peer announced a table.
+    /// Marks the table a `VTableMsg` announces as one the peer sent, if a port
+    /// takes it.
     ///
     /// Postcard encodes a `VTableMsg` with the table id's two bytes first, so
-    /// only those are read. Tables no port takes are ignored.
-    fn note_announced(&self, bytes: &[u8]) {
+    /// only those are read.
+    fn recognize_vtable(&self, bytes: &[u8]) {
         let Some(watch) = self.announce.as_ref() else {
             return;
         };
@@ -332,7 +334,7 @@ mod tests {
     }
 
     fn unannounced(inbox: &Inbox) -> Vec<PacketId> {
-        inbox.take_unannounced().collect()
+        inbox.take_missing_table_ids().collect()
     }
 
     #[test]

@@ -144,7 +144,7 @@ pub async fn subscribe(
 /// This usually means the peer was rebuilt with a changed frame type, so its
 /// table id no longer matches.
 fn report_unannounced(inbox: &Inbox, tables: &[(PacketId, String)], log: &mut Log) {
-    for id in inbox.take_unannounced() {
+    for id in inbox.take_missing_table_ids() {
         let Some((_, port)) = tables.iter().find(|(table, _)| *table == id) else {
             continue;
         };
