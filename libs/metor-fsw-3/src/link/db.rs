@@ -103,7 +103,7 @@ pub async fn db(
     // PANIC Safety: `new` always sets the endpoint, and a system runs once.
     let endpoint = s.endpoint.take().expect("one run per instance");
     let db = s.db.clone();
-    let sinks = announce(&db, inputs, log);
+    let sinks = register(&db, inputs, log);
     db.set_identity(
         s.params.link.namespace.clone(),
         s.params.command_ids.clone(),
@@ -209,7 +209,7 @@ enum Sink {
 /// registers its message metadata. If the database already holds a different
 /// vtable under the frame's table id, the port is refused and a fault is
 /// logged. Returns one [`Sink`] per port.
-fn announce(db: &DB, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sink> {
+fn register(db: &DB, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sink> {
     let mut sinks = Vec::new();
     for (def, _) in inputs.iter_mut() {
         sinks.push(match &def.schema {
@@ -223,7 +223,7 @@ fn announce(db: &DB, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sin
                     log.fault(
                         "table_id_collision",
                         format!(
-                            "port `{}` announces a table the store refuses: {error}",
+                            "port `{}` registers a table the store refuses: {error}",
                             def.name
                         ),
                     );
@@ -348,7 +348,7 @@ mod tests {
         let RecordSchema::Frame { metadata, .. } = imu.schema.clone() else {
             panic!("a frame")
         };
-        let sinks = announce(&db, &mut inputs, &mut Log);
+        let sinks = register(&db, &mut inputs, &mut Log);
         assert!(matches!(sinks[0], Sink::Table(_)), "a table sink");
         assert!(matches!(sinks[1], Sink::Msg(id) if id == Fixed::schema().packet_id()));
         assert_eq!(metadata[0].name, "a.plant.imu.sample");
@@ -403,7 +403,7 @@ mod tests {
         };
         db.insert_vtable(VTableMsg { id, vtable })
             .expect("the first vtable under an id is taken");
-        let sinks = announce(&db, &mut inputs, &mut Log);
+        let sinks = register(&db, &mut inputs, &mut Log);
         assert!(
             matches!(sinks[0], Sink::Refused),
             "a different vtable under a held id is refused"
