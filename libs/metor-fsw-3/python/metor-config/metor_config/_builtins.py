@@ -177,12 +177,9 @@ class Db(Sink):
         listen: str,
         path: str | None = None,
         items: Sequence[Item] = (),
-        max_connections: int | None = None,
         all: bool = False,
     ) -> None:
-        super().__init__(
-            {"path": path, "command_ids": []}, listen, None, None, max_connections, items, all
-        )
+        super().__init__({"path": path, "command_ids": []}, listen, None, None, None, items, all)
 
 
 class Subscribe(Link):
