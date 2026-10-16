@@ -1,0 +1,5 @@
+error: `#[state]` takes `&mut S`
+ --> tests/ui/system_state_by_value.rs:6:24
+  |
+6 | fn counter(#[state] s: Counter, now: Timestamp) {
+  |                        ^^^^^^^

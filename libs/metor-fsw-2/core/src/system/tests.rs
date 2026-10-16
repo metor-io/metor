@@ -75,10 +75,7 @@ fn drain_log(input: &mut MsgIn<LogEvent>) -> Vec<LogEvent> {
 }
 
 fn field<'a>(ev: &'a LogEvent, key: &str) -> Option<&'a str> {
-    ev.fields
-        .iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.as_str())
+    ev.fields.iter().find(|(k, _)| k == key).map(|(_, v)| &**v)
 }
 
 struct Filter {
