@@ -143,6 +143,7 @@ fn step_over<S: SequenceFn>(
         id: "seq",
         namespace: "",
         seed: Some(0),
+        records: &Default::default(),
     };
     let (ins, outs, _io) =
         crate::fn_system::bind::<S>(inputs.collect(), outputs, instance).expect("binds");
