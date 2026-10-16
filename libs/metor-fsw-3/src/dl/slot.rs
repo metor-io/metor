@@ -5,8 +5,8 @@
 //! on that channel picks which candidate runs.
 //!
 //! `metor build` resolves each candidate ahead of time. It copies the library
-//! into the store and writes its path, hash, ports, and pack kind into the
-//! slot's params. The slot takes its ports from the first
+//! or module into the store and writes its path, hash, ports, pack kind, and
+//! limits into the slot's params. The slot takes its ports from the first
 //! candidate. On a `Load`, the slot hashes the candidate's file, opens it,
 //! checks that its ports match the slot's, and creates it on the slot's rings.
 
@@ -26,6 +26,7 @@ use crate::dl::{PackKind, PackRef};
 use crate::io::SharedIo;
 use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
+use crate::wasm::{Limits, WasmPack};
 use crate::{FrameBytes, FrameStr};
 
 use super::{DlPack, Pack, PackError, is_loaded, store};
@@ -69,6 +70,8 @@ pub(crate) struct Stored {
     pub(crate) def: SystemDef,
     #[serde(default)]
     pub(crate) kind: PackKind,
+    #[serde(flatten)]
+    pub(crate) limits: Limits,
 }
 
 /// A candidate after the slot has decoded it, ready to load.
@@ -79,6 +82,7 @@ struct Resolved {
     path: PathBuf,
     hash: blake3::Hash,
     kind: PackKind,
+    limits: Limits,
     occupant: Occupant,
 }
 
@@ -161,7 +165,11 @@ fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
 impl Resolved {
     fn of(index: usize, candidate: Candidate) -> Result<Self, ParamError> {
         let Source::Stored(Stored {
-            path, hash, kind, ..
+            path,
+            hash,
+            kind,
+            limits,
+            ..
         }) = candidate.source
         else {
             return Err(ParamError::Decode(not_resolved(&candidate.name)));
@@ -185,6 +193,7 @@ impl Resolved {
             path,
             hash,
             kind,
+            limits,
         })
     }
 }
@@ -308,10 +317,11 @@ impl Step for DlSlot {
     }
 }
 
-/// Opens a candidate's library after checking its hash.
+/// Opens a candidate's library or module after checking its hash.
 fn open(candidate: &Resolved) -> Result<Pack, LoadError> {
     match candidate.kind {
         PackKind::Dylib => open_dylib(candidate),
+        PackKind::Wasm => open_wasm(candidate),
     }
 }
 
@@ -338,6 +348,16 @@ fn open_dylib(candidate: &Resolved) -> Result<Pack, LoadError> {
         return Err(LoadError::Hash(candidate.name.clone()));
     }
     Ok(Pack::Dl(pack))
+}
+
+/// Reads a candidate's module, checks its hash, and compiles those bytes.
+fn open_wasm(candidate: &Resolved) -> Result<Pack, LoadError> {
+    let bytes = std::fs::read(&candidate.path).map_err(|e| LoadError::Open(e.to_string()))?;
+    if blake3::hash(&bytes) != candidate.hash {
+        return Err(LoadError::Hash(candidate.name.clone()));
+    }
+    let pack = WasmPack::open(&bytes, &candidate.limits).map_err(open_error)?;
+    Ok(Pack::Wasm(pack))
 }
 
 fn open_error(error: PackError) -> LoadError {

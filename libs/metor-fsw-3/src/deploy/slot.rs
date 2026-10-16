@@ -148,10 +148,10 @@ impl SlotCx {
         Ok(def)
     }
 
-    /// Copies a candidate's library into the store.
+    /// Copies a candidate's library or module into the store.
     ///
     /// Returns the stored entry, which records the candidate's ports and the
-    /// pack's kind.
+    /// pack's kind and limits.
     fn store(
         &self,
         candidate: &Candidate,
@@ -171,6 +171,7 @@ impl SlotCx {
             hash: put.hash.to_hex().to_string(),
             def,
             kind: pack.kind,
+            limits: pack.limits,
         })
     }
 

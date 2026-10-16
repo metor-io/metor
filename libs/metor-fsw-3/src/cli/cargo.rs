@@ -1,13 +1,14 @@
 //! Builds packs with cargo and reads their `pyproject.toml` settings.
 //!
-//! A pack builds as a native cdylib.
+//! A pack builds as a native cdylib, and optionally as a wasm module too.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 use super::pack_dev::PackDevError;
+use crate::dl::WASM_TRIPLE;
 
-/// An error building a pack's cdylib.
+/// An error building a pack's cdylib or wasm module.
 #[derive(Debug, thiserror::Error)]
 pub enum CargoError {
     #[error("running cargo: {0}")]
@@ -25,6 +26,28 @@ pub fn cargo_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoE
     let args = ["build", "-p", package, "--message-format=json"];
     let stdout = cargo(manifest_dir, &args)?;
     cdylib(&stdout).ok_or_else(|| CargoError::NoArtifact("cdylib", package.to_string()))
+}
+
+/// Builds `package` from `manifest_dir` as a wasm module and returns its path.
+///
+/// The module imports its memory from the host. This uses `cargo rustc` so
+/// the `--import-memory` link flag applies only to the pack crate, and its
+/// dependencies stay cached.
+pub fn wasm_build(package: &str, manifest_dir: &Path) -> Result<PathBuf, CargoError> {
+    let args = [
+        "rustc",
+        "-p",
+        package,
+        "--target",
+        WASM_TRIPLE,
+        "--release",
+        "--message-format=json",
+        "--",
+        "-C",
+        "link-arg=--import-memory",
+    ];
+    let stdout = cargo(manifest_dir, &args)?;
+    module(&stdout).ok_or_else(|| CargoError::NoArtifact("module", package.to_string()))
 }
 
 /// Runs cargo with `args` in `dir` and returns its stdout.
@@ -49,6 +72,11 @@ fn cdylib(stdout: &[u8]) -> Option<PathBuf> {
     cdylib_file(stdout, |name| {
         !name.ends_with(".rlib") && !name.ends_with(".rmeta")
     })
+}
+
+/// Finds the wasm module of the last cdylib in cargo's JSON output.
+fn module(stdout: &[u8]) -> Option<PathBuf> {
+    cdylib_file(stdout, |name| name.ends_with(".wasm"))
 }
 
 /// Returns the first file matching `pick` from the last cdylib artifact in
@@ -85,6 +113,9 @@ pub struct PackConfig {
     pub lib: String,
     /// The Python module the generated code is written to.
     pub module: String,
+    /// Whether the pack is also built as a wasm module, from
+    /// `[tool.metor.pack] wasm`.
+    pub wasm: bool,
 }
 
 impl PackConfig {
@@ -100,8 +131,12 @@ impl PackConfig {
             (Some(krate), Some(lib)) => (krate, lib),
             (krate, lib) => cargo_names(root, krate, lib)?,
         };
+        let wasm = lookup(&pyproject, &["tool", "metor", "pack", "wasm"])
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
         Ok(PackConfig {
             id: field("id").unwrap_or_else(|| module.clone()),
+            wasm,
             dist,
             krate,
             lib,
@@ -186,6 +221,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_module_artifact() {
+        let line = r#"{"reason":"compiler-artifact",
+            "target":{"name":"echo_pack","kind":["cdylib"]},
+            "filenames":["/t/wasm32-unknown-unknown/release/echo_pack.wasm"]}"#
+            .replace('\n', "");
+        let module = PathBuf::from("/t/wasm32-unknown-unknown/release/echo_pack.wasm");
+        assert_eq!(super::module(line.as_bytes()), Some(module));
+        assert_eq!(super::module(ARTIFACT.replace('\n', "").as_bytes()), None);
+    }
+
+    #[test]
     fn test_skip_non_json_output() {
         assert_eq!(cdylib(b"warning: something\n"), None);
         assert_eq!(cdylib(b""), None);
@@ -214,6 +260,7 @@ mod tests {
                 krate: "adcs-systems".into(),
                 lib: "adcs_systems".into(),
                 module: "adcs_pack".into(),
+                wasm: false,
             }
         );
     }
@@ -222,7 +269,8 @@ mod tests {
     fn test_pyproject_overrides_defaults() {
         let dir = root(
             "[project]\nname = \"adcs-pack\"\n\n[tool.metor.pack]\n\
-             id = \"adcs\"\ncrate = \"adcs\"\nlib = \"adcs_dylib\"\nmodule = \"adcs_mod\"\n",
+             id = \"adcs\"\ncrate = \"adcs\"\nlib = \"adcs_dylib\"\nmodule = \"adcs_mod\"\n\
+             wasm = true\n",
             "[package]\nname = \"ignored\"\n\n[lib]\nname = \"ignored_too\"\n",
         );
         assert_eq!(
@@ -233,6 +281,7 @@ mod tests {
                 krate: "adcs".into(),
                 lib: "adcs_dylib".into(),
                 module: "adcs_mod".into(),
+                wasm: true,
             }
         );
     }
