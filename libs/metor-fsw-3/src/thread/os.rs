@@ -23,6 +23,7 @@ use metor_proto_wkt::LogLevel;
 
 use crate::async_system::{AsyncSystem, Running, Stop};
 use crate::coordinator::{EndReason, MakeCx, ParamError, Params, Step};
+use crate::def::Records;
 use crate::mirror::{Mirror, Mirrors, mirror_config};
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports, SystemDef};
 
@@ -103,6 +104,7 @@ struct AsyncLaunch<A: AsyncSystem, M> {
     params: serde_json::Value,
     inputs: Vec<InputBinding<Notifier>>,
     outputs: Vec<OutputBinding>,
+    records: Arc<Records>,
     _a: PhantomData<fn() -> A>,
 }
 
@@ -114,7 +116,7 @@ where
     fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError> {
         let (system, mut state) = (self.make)(Params(&self.params))?;
         let mut inputs = A::Inputs::bind(self.inputs);
-        let mut outputs = A::Outputs::bind(self.outputs);
+        let mut outputs = A::Outputs::bind_with_records(self.outputs, &self.records);
         Ok(Box::pin(async move {
             system
                 .run(&mut state, &mut inputs, &mut outputs, stop)
@@ -141,6 +143,7 @@ where
             params: cx.params.0.clone(),
             inputs: bound_in,
             outputs: bound_out,
+            records: cx.records.clone(),
             _a: PhantomData,
         }),
         panicked: thread.panicked.clone(),

@@ -52,6 +52,7 @@ mod tests {
             threads: &mut Threads::default(),
             seed: Some(0),
             namespace: "",
+            records: &Default::default(),
         });
         assert_eq!(
             refused.err(),

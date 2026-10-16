@@ -599,6 +599,7 @@ fn test_async_adapter_relay() {
         threads: &mut threads,
         seed: Some(0),
         namespace: "",
+        records: &Default::default(),
     })
     .expect("no params");
 
@@ -778,6 +779,7 @@ fn flooded(a: usize, b: usize, cycles: i64) -> Vec<LogEvent> {
         threads: &mut threads,
         seed: Some(0),
         namespace: "",
+        records: &Default::default(),
     })
     .expect("no params");
     let mut seen = Vec::new();
@@ -951,6 +953,7 @@ fn test_rng_without_a_seed_fails_the_make() {
         threads: &mut threads,
         seed: None,
         namespace: "",
+        records: &Default::default(),
     });
     let err = made.err();
     assert!(
@@ -987,4 +990,96 @@ fn test_seed_defaults_to_zero() {
     };
     let json = serde_json::to_value(&seeded).expect("encodes");
     assert_eq!(json["seed"], 7);
+}
+
+type Found = Rc<RefCell<Vec<bool>>>;
+
+/// Records whether the host knows the `imu` and `nav` records.
+#[crate::system]
+fn lookup(#[state] found: &mut Found, records: &crate::Records) {
+    let known = |name| records.port_def("x", name).is_ok();
+    found
+        .borrow_mut()
+        .extend([known(Imu::NAME), known(Nav::NAME)]);
+}
+
+/// Writes one `nav` whose estimate says whether the host knows `imu`.
+#[crate::system]
+async fn async_lookup(records: &crate::Records, nav: &mut Output<Nav>, stop: Stop) {
+    let known = records.port_def("x", Imu::NAME).is_ok();
+    let _ = nav.write(&Nav {
+        timestamp: Timestamp(1),
+        estimate: f64::from(u8::from(known)),
+    });
+    stop.wait().await;
+}
+
+#[test]
+fn test_records_param_reads_the_host_table() {
+    let found = Found::default();
+    let mut table = SystemTable::new();
+    table
+        .register("source", crate::tests::utils::imu_source(), i64::default)
+        .expect("valid");
+    let seen = found.clone();
+    table
+        .register("lookup", lookup(), move || seen.clone())
+        .expect("valid");
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("source", "source"),
+            SystemConfig::new("lookup", "lookup"),
+        ],
+        ..Default::default()
+    };
+    let mut coordinator = config.build(&table).expect("valid");
+    coordinator.step(Timestamp(1));
+    assert_eq!(
+        *found.borrow(),
+        [true, false],
+        "imu is registered, nav is not"
+    );
+}
+
+#[test]
+fn test_async_records_param_reads_the_host_table() {
+    use crate::coordinator::MakeCx;
+    use crate::thread::Threads;
+
+    let mut table = SystemTable::new();
+    table
+        .register("source", crate::tests::utils::imu_source(), i64::default)
+        .expect("valid");
+    table
+        .register_async("lookup", async_lookup(), Default::default)
+        .expect("valid");
+    let records = std::sync::Arc::new(table.records());
+    let entry = table.get("lookup").expect("registered");
+    let (nav, log) = (ring::<Nav>(8, 1), ring::<LogEvent>(8, 1));
+    let mut estimates = input::<Nav>(&nav);
+    let mut threads = Threads::default();
+    let def = entry.def.clone();
+    let mut step = (entry.make)(MakeCx {
+        id: "lookup",
+        adapter: None,
+        def: &def,
+        params: crate::coordinator::Params(&json!(null)),
+        inputs: Vec::new(),
+        outputs: vec![&nav, &log],
+        threads: &mut threads,
+        seed: Some(0),
+        namespace: "",
+        records: &records,
+    })
+    .expect("no params");
+    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+    let estimate = loop {
+        assert!(std::time::Instant::now() < deadline, "no lookup arrived");
+        step.execute(Timestamp(1));
+        if let Some(nav) = estimates.latest().expect("valid") {
+            break nav.estimate;
+        }
+        std::thread::sleep(core::time::Duration::from_millis(1));
+    };
+    assert_eq!(estimate, 1.0);
 }
