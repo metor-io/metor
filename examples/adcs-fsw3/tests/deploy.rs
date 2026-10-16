@@ -1,5 +1,6 @@
 //! Runs `target.py` under `metor run` and checks that the gateway's db records
-//! both the plant and the flight software.
+//! both the plant and the flight software, and forwards the flight software's
+//! commands.
 
 use core::time::Duration;
 use std::net::{SocketAddr, TcpListener};
@@ -8,8 +9,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use metor_proto::types::Msg;
 use metor_proto_stellar::Client;
-use metor_proto_wkt::DumpMetadata;
+use metor_proto_wkt::{DumpMetadata, GetDbInfo, SequenceCommand};
 
 /// How long the test waits for the deployment.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -114,4 +116,15 @@ async fn test_gateway_records_both_members() {
         assert!(Instant::now() < deadline, "announced only {names:?}");
         stellarator::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The gateway's db advertises `sequence_command`, the record the flight
+/// software's `cmds` subscriber takes, under the id that record's port carries.
+#[stellarator::test]
+async fn test_gateway_advertises_sequence_command() {
+    let ports = free_ports();
+    let _running = run(&ports);
+    let mut client = connect(SocketAddr::from(([127, 0, 0, 1], ports[2]))).await;
+    let info = client.request(&GetDbInfo).await.expect("the db answers");
+    assert_eq!(info.command_ids, vec![<SequenceCommand as Msg>::ID]);
 }
