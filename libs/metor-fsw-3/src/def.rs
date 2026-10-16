@@ -93,6 +93,9 @@ pub enum DefError {
     #[error("async system `{system}` takes an `Rng`, which only a stepped system takes")]
     RngOnAsync { system: String },
 
+    #[error("ports `{port}` and `{other}` carry tables with the same id")]
+    TableIdCollision { port: String, other: String },
+
     #[error("`{system}` takes a `Cap`; register it with `register` or `register_sequence`")]
     IoOnTraitPath { system: String },
 }
