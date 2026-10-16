@@ -6,6 +6,7 @@ use core::cell::OnceCell;
 use core::ffi::c_void;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
@@ -312,6 +313,8 @@ unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn S
         let entry = table
             .get(ty)
             .ok_or_else(|| ParamError::Decode(format!("unknown system type `{ty}`")))?;
+        // A pack's systems see the records its own table knows.
+        let records = Arc::new(table.records());
         // A pack's async systems run on threads inside the pack. The host's
         // config picks which thread.
         THREADS.with_borrow_mut(|threads| {
@@ -326,6 +329,7 @@ unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn S
                 io: &io,
                 seed: None,
                 namespace: "",
+                records: &records,
             })
         })
     })?;
