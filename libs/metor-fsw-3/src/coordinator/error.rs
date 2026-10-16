@@ -87,6 +87,55 @@ pub enum BuildError {
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
     ReservedPort { ty: String },
 
+    #[error("`{system}` has no grant for its `Cap` parameter `{param}`")]
+    Ungranted { system: String, param: String },
+
+    #[error("`{system}`'s parameter `{param}` is bound to two resources")]
+    DuplicateGrant { system: String, param: String },
+
+    #[error("`{system}` grants `{param}`, which is not a `Cap` parameter")]
+    UnknownGrant { system: String, param: String },
+
+    #[error("io steps: {message}")]
+    IoSystems { message: String },
+
+    #[error("resource `{id}` is created twice")]
+    DuplicateResource { id: String },
+
+    #[error("`{system}` grants `{param}` resource `{resource}`, which the target does not create")]
+    UnknownResource {
+        system: String,
+        param: String,
+        resource: String,
+    },
+
+    /// `cap` is `{system}.{param}`.
+    #[error("`{cap}` takes a `{expected}`, but resource `{resource}` provides `{found}`")]
+    Interface {
+        cap: String,
+        resource: String,
+        expected: String,
+        found: String,
+    },
+
+    #[error(
+        "`{system}` grants `{param}` sim resource `{resource}`, which names its holders itself"
+    )]
+    SimGrant {
+        system: String,
+        param: String,
+        resource: String,
+    },
+
+    #[error("sim resource `{resource}` names holder `{system}`, which is not in the config")]
+    UnknownHolder { resource: String, system: String },
+
+    #[error("resource `{resource}` did not open: {message}")]
+    Open { resource: String, message: String },
+
+    #[error("resource `{resource}` has a `{backing}` backing, which this build does not run")]
+    Backing { resource: String, backing: String },
+
     #[error("definition for `{id}`: {source}")]
     Def {
         id: String,

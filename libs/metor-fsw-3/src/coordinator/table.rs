@@ -12,6 +12,7 @@ use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, SystemFn};
+use crate::io::SharedIo;
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 use crate::thread::{DEFAULT_THREAD, Threads};
 
@@ -30,6 +31,8 @@ pub struct MakeCx<'a> {
     pub inputs: Vec<Vec<&'a RingBuffer>>,
     pub outputs: Vec<&'a RingBuffer>,
     pub threads: &'a mut Threads,
+    /// What the build's IO systems and io steps share.
+    pub io: &'a SharedIo,
     /// The target seed. A guest's make has none.
     pub seed: Option<u64>,
     /// The target's namespace, or empty.
@@ -148,7 +151,7 @@ impl SystemTable {
         ctor: C,
     ) -> Result<(), BuildError> {
         let make = move |params: Params<'_>| {
-            let state = ctor.make(params)?;
+            let state = ctor.make(params, &crate::io::IoInit::empty())?;
             Ok((FnSystem::default(), state))
         };
         let entry =
@@ -284,6 +287,11 @@ impl TableEntry {
         schema: Option<Box<RawValue>>,
     ) -> Result<Self, DefError> {
         let def = S::def(&DefCx::empty())?;
+        // Binding IO ports takes `fn_system::bind`, which this path skips.
+        if !def.grants.is_empty() {
+            let system = def.name.to_string();
+            return Err(DefError::IoOnTraitPath { system });
+        }
         Ok(Self {
             kind: SystemKind::Cyclic,
             def,
@@ -306,8 +314,8 @@ impl TableEntry {
 
     /// Builds the table entry for a `#[system]` fn.
     ///
-    /// The entry's `make` binds the system's ports before `ctor` builds its
-    /// state.
+    /// The entry's `make` binds the system's ports, including its queue pair,
+    /// before `ctor` builds its state.
     fn system_fn<S: SystemFn, M, C: Ctor<S::State, M> + 'static>(
         ctor: C,
     ) -> Result<Self, DefError> {
@@ -321,8 +329,8 @@ impl TableEntry {
                 refuse_thread(cx.adapter)?;
                 let instance = fn_system::Instance::from_make_cx(&cx);
                 let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
-                let (inputs, outputs) = fn_system::bind::<S>(views, writers, instance)?;
-                let state = ctor.make(cx.params)?;
+                let (inputs, outputs, io) = fn_system::bind::<S>(views, writers, instance)?;
+                let state = fn_system::make_state(&ctor, cx.id, cx.params, io.as_ref())?;
                 Ok(Box::new(Runner {
                     system: FnSystem::default(),
                     state,
@@ -724,6 +732,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             threads: &mut threads,
+            io: &crate::io::SharedIo::default(),
             seed: Some(0),
             namespace: "",
             records: &Default::default(),

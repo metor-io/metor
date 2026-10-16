@@ -50,6 +50,7 @@ mod tests {
             inputs: vec![vec![&imu]],
             outputs: vec![&nav, &log],
             threads: &mut Threads::default(),
+            io: &crate::io::SharedIo::default(),
             seed: Some(0),
             namespace: "",
             records: &Default::default(),

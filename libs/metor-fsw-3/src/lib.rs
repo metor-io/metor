@@ -96,10 +96,13 @@
 extern crate self as metor_fsw_3;
 
 pub mod async_system;
+#[cfg(feature = "host")]
+pub mod builtins;
 pub mod coordinator;
 pub mod def;
 pub mod fn_system;
 pub mod frame;
+pub mod io;
 pub mod log;
 #[cfg(all(feature = "threads", not(target_family = "wasm")))]
 mod mirror;
@@ -126,6 +129,7 @@ pub use fn_system::{
     AsyncSystemFn, Ctor, Cycle, FnSignature, FnSystem, InSet, OutSet, Param, ParamNames, SystemFn,
 };
 pub use frame::Frame;
+pub use io::{Buf, Cap, Handle, Io, IoInit, Pending, ResourceStatus, Slot};
 pub use log::{Log, LogLayer};
 pub use metor_fsw_3_macros::{Frame, Record, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
