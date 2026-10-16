@@ -1,4 +1,5 @@
-"""Tests for deployments: peers, copied ports, and the golden config file."""
+"""Tests for deployments: peers, copied ports, the gateway, and the golden
+config file."""
 
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ from adcs_stub import Ctrl, Imu, LogEvent, Mode, Nav, Ping, Plant
 from test_target import ConfigTest, adcs_target, reset
 
 import metor_config._deployment as deploy_mod
-from metor_config import ConfigError, Deployment, Publish, Subscribe, Target
+from metor_config import ConfigError, Db, Deployment, Publish, Subscribe, Target, gateway
 
 GOLDEN = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "tests", "golden", "deployment.json"
@@ -17,7 +18,7 @@ GOLDEN = os.path.join(
 
 
 def design_example() -> Deployment:
-    """A two-target file, over the stub pack."""
+    """The design doc's three-target file, over the stub pack."""
     a = Target(cycle_rate=100.0, namespace="a")
     plant = a.add("plant", Plant())
     nav = a.add("nav", Nav(imu=plant.imu))
@@ -29,8 +30,9 @@ def design_example() -> Deployment:
     b.add("ctrl", Ctrl(est=mirror.port(nav.est), mode=mode.cmd))
     b_pub = b.add("pub", Publish(listen="0.0.0.0:2241", all=True))
 
-    a.add("cmds", Subscribe(peer=b_pub, records=[Ping]))
-    return Deployment(targets=[a, b], hosts={"a": "10.0.0.2"})
+    gw, gw_db = gateway("gw", peers=[a_pub, b_pub], listen="0.0.0.0:2250")
+    a.add("cmds", Subscribe(peer=gw_db, records=[Ping]))
+    return Deployment(targets=[a, b, gw], hosts={"a": "10.0.0.2"})
 
 
 def plant_and_peer() -> tuple[Target, Plant, Target]:
@@ -245,6 +247,55 @@ class DeploymentTest(ConfigTest):
         with self.assertRaisesRegex(ConfigError, "both bind 127.0.0.1:2240"):
             Deployment(targets=[a, b]).to_config()
         Deployment(targets=[a, b], hosts={"b": "10.0.0.2"}).to_config()
+
+    def test_db_emits_builtin_with_all(self) -> None:
+        gw = Target(cycle_rate=10.0, namespace="gw")
+        plant = gw.add("plant", Plant())
+        gw.add("db", Db(listen="0.0.0.0:2250", all=True), thread="db")
+        entry = gw.to_config()["coordinator"]["systems"][1]
+        self.assertEqual(entry["ty"], "fsw.db")
+        self.assertEqual(entry["thread"], "db")
+        self.assertEqual(
+            entry["params"],
+            {"listen": "0.0.0.0:2250", "path": None, "namespace": "gw", "commands": []},
+        )
+        self.assertEqual([i["port"] for i in entry["inputs"]], ["plant.imu", "plant.log", "plant.status"])
+        self.assertEqual(plant.imu.record, Imu)
+
+    def test_db_collects_subscriber_commands(self) -> None:
+        a = Target(cycle_rate=100.0, namespace="a")
+        plant = a.add("plant", Plant())
+        a_pub = a.add("pub", Publish([plant], listen="0.0.0.0:2240"))
+        b = Target(cycle_rate=100.0, namespace="b")
+        b.add("cmds", Subscribe(records=[Ping], listen="0.0.0.0:2260"))
+        gw, db = gateway("gw", peers=[a_pub], listen="0.0.0.0:2250")
+        a.add("cmds", Subscribe(peer=db, records=[Ping, LogEvent]))
+        b.add("pings", Subscribe(peer=db, records=[Ping]))
+        gw.add("local", Subscribe(peer=db, records=[LogEvent]))
+        config = Deployment(targets=[a, b, gw]).to_config()
+        db_entry = config["targets"][2]["coordinator"]["systems"][1]
+        self.assertEqual(db_entry["params"]["commands"], sorted([LogEvent._name, Ping._name]))
+
+    def test_db_without_subscribers_has_no_commands(self) -> None:
+        a = Target(cycle_rate=100.0, namespace="a")
+        a.add("cmds", Subscribe(records=[Ping], listen="0.0.0.0:2260"))
+        gw, _ = gateway("gw", peers=[], listen="0.0.0.0:2250")
+        config = Deployment(targets=[a, gw]).to_config()
+        self.assertEqual(config["targets"][1]["coordinator"]["systems"][0]["params"]["commands"], [])
+
+    def test_gateway_composes_subscribes_and_db(self) -> None:
+        a = Target(cycle_rate=100.0, namespace="a")
+        plant = a.add("plant", Plant())
+        a_pub = a.add("pub", Publish([plant], listen="0.0.0.0:2240"))
+        gw, db = gateway("gw", peers=[a_pub], listen="0.0.0.0:2250")
+        config = Deployment(targets=[a, gw]).to_config()
+        systems = config["targets"][1]["coordinator"]["systems"]
+        self.assertEqual([s["id"] for s in systems], ["a", "db"])
+        self.assertEqual(
+            [i["port"] for i in systems[1]["inputs"]],
+            ["a.plant.imu", "a.plant.log", "a.plant.status", "a.link_status", "a.log", "a.status"],
+        )
+        self.assertEqual(db.db_status.record.__name__, "DbStatus")
 
     def test_subscribe_copies_are_publishable(self) -> None:
         a, plant, b = plant_and_peer()

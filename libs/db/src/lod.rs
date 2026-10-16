@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 use crate::{
     Component, ComponentSchema, DB, Error,
     manifest::{ComponentManifest, RangeVec, SpanSource, SpanState},
-    time_series_2::{TimeSeries, TimeSeriesNodeSlice, TimerSeriesWriter},
+    time_series::{TimeSeries, TimeSeriesNodeSlice, TimerSeriesWriter},
 };
 
 /// Bucket-size cascade, as multiples of the source's mean sample period.
@@ -734,7 +734,7 @@ pub(crate) fn read_f64(prim: PrimType, bytes: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::time_series_2::TimeSeriesNode;
+    use crate::time_series::TimeSeriesNode;
     use std::path::Path;
 
     fn f64_schema(shape: &[usize]) -> ComponentSchema {

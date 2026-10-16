@@ -19,7 +19,7 @@ use metor_fsw_3::{Clock, DefCx, Frame, Input, LinkStatus, Output, Timestamp, Wal
 use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::PacketStream;
 use metor_proto_wkt::LogEvent;
-use metor_proto_wkt::{LinkInfo, SetComponentMetadata, VTableMsg};
+use metor_proto_wkt::{LinkInfo, SequenceCommand, SetComponentMetadata, VTableMsg};
 use serde_json::json;
 use stellarator::io::{AsyncWrite, OwnedReader, SplitExt};
 use stellarator::net::TcpStream;
@@ -998,4 +998,41 @@ async fn test_fixture_link_round_trip() {
     })
     .await;
     assert_eq!(echoed, 41);
+}
+
+/// Dials `addr` until a db answers, and returns its info.
+async fn dial_db(addr: SocketAddr) -> metor_proto_wkt::DbInfoResp {
+    let deadline = Deadline::new();
+    loop {
+        match metor_proto_stellar::identify(addr).await {
+            Ok(metor_proto_stellar::Peer::Db(info)) => return info,
+            Ok(_) => panic!("{addr} is an fsw link, not a db"),
+            Err(e) => deadline.tick(format!("{addr} never came up: {e}")).await,
+        }
+    }
+}
+
+/// A db resolves its command names to the ids their records carry, even
+/// when a record's name differs from its type's.
+#[stellarator::test]
+async fn test_db_advertises_command_record_ids() {
+    let seen = Seen::default();
+    let addr = pick_port("db-commands");
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let db = SystemConfig {
+        params: json!({
+            "listen": addr.to_string(),
+            "path": dir.path().join("db"),
+            "namespace": "gw",
+            "commands": ["sequence_command", "ping"],
+        }),
+        ..SystemConfig::new("db", "fsw.db")
+    };
+    let _target = spawn(vec![db], &seen, 500.0);
+    let info = dial_db(addr).await;
+    assert_eq!(info.namespace.as_deref(), Some("gw"));
+    assert_eq!(
+        info.command_ids,
+        vec![<SequenceCommand as Msg>::ID, <Ping as Msg>::ID]
+    );
 }

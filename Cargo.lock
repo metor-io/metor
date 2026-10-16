@@ -9594,6 +9594,7 @@ dependencies = [
  "libloading",
  "maitake-sync 0.1.2",
  "metor-component",
+ "metor-db",
  "metor-fsw-3-macros",
  "metor-fsw-3-ring",
  "metor-proto",
