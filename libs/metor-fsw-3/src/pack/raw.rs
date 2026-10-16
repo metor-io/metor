@@ -98,8 +98,16 @@ impl RawRing {
     }
 }
 
+/// The size of a [`RawSlice`] in a wasm32 guest.
+pub const WASM32_RAW_SLICE: usize = 8;
+/// The size of a [`RawRing`] in a wasm32 guest.
+pub const WASM32_RAW_RING: usize = 20;
+
 // `RawOwner`'s function pointers are never null, so `Option` adds no size.
 const _: () = assert!(size_of::<Option<RawOwner>>() == size_of::<RawOwner>());
+#[cfg(target_arch = "wasm32")]
+const _: () =
+    assert!(size_of::<RawSlice>() == WASM32_RAW_SLICE && size_of::<RawRing>() == WASM32_RAW_RING);
 
 #[cfg(test)]
 mod tests {

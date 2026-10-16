@@ -34,6 +34,7 @@ fn candidate(path: &str, hash: &str) -> Candidate {
             hash: hash.into(),
             def: def_with(Vec::new()),
             kind: PackKind::Dylib,
+            limits: Limits::default(),
         }),
     }
 }
