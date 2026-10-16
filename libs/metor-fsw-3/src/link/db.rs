@@ -142,48 +142,40 @@ pub async fn db(
 /// One client connection to the database.
 ///
 /// Dropping a `Conn` cancels its task. The task clears `open` when the client
-/// disconnects, which marks the slot free.
+/// disconnects.
 struct Conn {
     open: Rc<Cell<bool>>,
     _task: stellarator::JoinHandleDropGuard<()>,
 }
 
-/// Accepts clients into a fixed number of slots, one connection per slot.
+/// Accepts every client and serves each on its own task.
 ///
-/// A client that arrives when every slot is taken is closed right away. The
-/// slots hold each connection's task, so dropping this future closes every
-/// connection.
+/// The listener's `max_connections` does not apply. Closed connections are
+/// pruned on each accept, and dropping this future closes every connection.
 async fn serve(endpoint: Endpoint, db: Arc<DB>, stop: Stop) {
     let Some(listener) = endpoint.listener() else {
         return;
     };
-    let mut slots: Vec<Option<Conn>> = (0..endpoint.slots()).map(|_| None).collect();
+    let mut conns: Vec<Conn> = Vec::new();
     let accept = async {
         loop {
             let Some(stream) = super::transport::accept(listener).await else {
                 continue;
             };
-            let Some(slot) = slots.iter_mut().find(|slot| !occupied(slot)) else {
-                continue;
-            };
+            conns.retain(|conn| conn.open.get());
             let open = Rc::new(Cell::new(true));
             let (conn_db, conn_open) = (db.clone(), open.clone());
             let task = stellarator::spawn(async move {
                 metor_db::handle_conn(stream, conn_db).await;
                 conn_open.set(false);
             });
-            *slot = Some(Conn {
+            conns.push(Conn {
                 open,
                 _task: task.drop_guard(),
             });
         }
     };
     futures_lite::future::or(accept, stop.wait()).await;
-}
-
-/// Returns true if `slot` holds a connection that is still open.
-fn occupied(slot: &Option<Conn>) -> bool {
-    slot.as_ref().is_some_and(|conn| conn.open.get())
 }
 
 /// Serves the database's UDP protocol on the same address as the listener.
@@ -280,7 +272,12 @@ fn ingest(db: &DB, inputs: &mut DynInputs<Notifier>, sinks: &[Sink], status: &mu
 
 #[cfg(test)]
 mod tests {
+    use core::time::Duration;
+
     use metor_fsw_3_ring::RingBuffer;
+    use metor_proto::types::IntoLenPacket;
+    use metor_proto_wkt::GetDbInfo;
+    use stellarator::io::AsyncWrite;
     use stellarator::net::TcpStream;
 
     use crate::DefCx;
@@ -417,10 +414,10 @@ mod tests {
 
     /// Binds a listening endpoint on a free port and returns it with its
     /// address.
-    fn endpoint(slots: usize) -> (Endpoint, std::net::SocketAddr) {
+    fn endpoint() -> (Endpoint, std::net::SocketAddr) {
         let endpoint = Transport::Listen {
             addr: "127.0.0.1:0".into(),
-            max_connections: slots,
+            max_connections: 1,
         }
         .bind()
         .expect("a free port");
@@ -434,29 +431,54 @@ mod tests {
         stream.read(vec![0u8; 1]).await.0
     }
 
+    /// Returns true if the peer closes `stream` within a second. Bytes still
+    /// in flight are read off first.
+    async fn closes(stream: &TcpStream) -> bool {
+        let drained = async {
+            while let Ok(1) = read_byte(stream).await {}
+            true
+        };
+        let late = async {
+            stellarator::sleep(Duration::from_secs(1)).await;
+            false
+        };
+        future::or(drained, late).await
+    }
+
+    /// Connects a client and waits for the db to answer a `GetDbInfo`.
+    async fn served_client(addr: std::net::SocketAddr) -> TcpStream {
+        let client = TcpStream::connect(addr).await.expect("the db accepts");
+        let request = (&GetDbInfo).into_len_packet().inner;
+        client
+            .write_all(request)
+            .await
+            .0
+            .expect("the request is sent");
+        assert_eq!(read_byte(&client).await.ok(), Some(1), "the db answers");
+        client
+    }
+
     #[stellarator::test]
-    async fn test_one_slot_refuses_a_second_client() {
+    async fn test_serve_past_max_connections_until_dropped() {
         let (_dir, db) = store();
-        let (endpoint, addr) = endpoint(1);
+        let (endpoint, addr) = endpoint();
         let (_handle, stop) = stop_pair();
         let served = stellarator::spawn(serve(endpoint, db, stop)).drop_guard();
 
-        let first = TcpStream::connect(addr).await.expect("the db accepts");
-        let second = TcpStream::connect(addr)
-            .await
-            .expect("the listener accepts");
-        assert_eq!(
-            read_byte(&second).await.ok(),
-            Some(0),
-            "a peer past the slots is closed at once"
-        );
+        let mut clients = Vec::new();
+        for _ in 0..12 {
+            clients.push(served_client(addr).await);
+        }
+        drop(clients.remove(0));
+        clients.push(served_client(addr).await);
 
         drop(served);
-        assert_eq!(
-            read_byte(&first).await.ok(),
-            Some(0),
-            "dropping the coordinator's guard closes what it served"
-        );
+        for client in &clients {
+            assert!(
+                closes(client).await,
+                "dropping the coordinator's guard closes what it served"
+            );
+        }
     }
 
     #[test]
