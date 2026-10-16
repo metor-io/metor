@@ -20,8 +20,9 @@ mod table;
 mod tests;
 
 pub use config::{
-    Adapter, BuildOptions, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig,
-    InvalidWallRate, OutputConfig, OutputSource, PortRef, SystemConfig, WallRate,
+    Adapter, BuildOptions, ChannelConfig, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH,
+    InputConfig, InvalidWallRate, OutputConfig, OutputSource, PortRef, RunState, SystemConfig,
+    WallRate,
 };
 pub use error::BuildError;
 pub use params::{ParamError, Params};
@@ -29,5 +30,8 @@ pub use params::{ParamError, Params};
 pub use run::Coordinator;
 pub use status::SystemStatus;
 pub use step::{EndReason, LoadError, Occupant, Step};
+pub(crate) use step::{Stepped, catch_step};
+#[cfg(feature = "host")]
+pub(crate) use table::MakeFn;
 pub use table::{MakeCx, SystemKind, SystemTable};
 pub(crate) use table::{TableEntry, bindings, refuse_thread};

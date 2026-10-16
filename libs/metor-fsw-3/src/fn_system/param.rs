@@ -10,12 +10,14 @@ use metor_proto::types::Timestamp;
 
 use crate::{
     Rng,
+    channel::{ABORT_PORT, Abort, AbortRequest},
     def::{DefCx, DefError, Records},
     frame::Frame,
     io::{Cqe, GrantDef, IO_CQ, IO_SQ, Io, Sqe},
     log::Log,
     port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers},
     record::Record,
+    sequence::Seq,
     system::{InputBinding, OutputBinding, PortDef, Ports},
 };
 
@@ -150,10 +152,11 @@ fn names(ports: &[PortDef]) -> Vec<Cow<'static, str>> {
 
 /// The per-cycle values a system fn's parameters can read besides ports.
 ///
-/// These are the cycle time and the log.
+/// These are the cycle time, the log, and, for a sequence, its [`Seq`].
 pub struct Cycle<'a> {
     pub now: Timestamp,
     log: Option<&'a mut Log>,
+    seq: Option<&'a Seq<'static>>,
 }
 
 impl<'a> Cycle<'a> {
@@ -161,7 +164,40 @@ impl<'a> Cycle<'a> {
         Self {
             now,
             log: Some(log),
+            seq: None,
         }
+    }
+
+    /// Creates a cycle for a sequence.
+    ///
+    /// The parameter that takes a [`Seq`] receives `seq`. `'a` borrows locals
+    /// of the body future the step polls, so it ends no later than that body.
+    pub(crate) fn with_seq(now: Timestamp, log: &'a mut Log, seq: &'a Seq<'static>) -> Self {
+        Self {
+            now,
+            log: Some(log),
+            seq: Some(seq),
+        }
+    }
+
+    /// Returns the sequence's handle as a `Seq<'a>`.
+    ///
+    /// Redlines linked through it may only borrow what outlives `'a`.
+    pub fn seq(&self) -> &'a Seq<'a> {
+        // PANIC Safety: `#[system]` rejects a `Seq` parameter, so only a
+        // sequence, whose step builds its cycle `with_seq`, reaches this.
+        let seq = self
+            .seq
+            .expect("a `Seq` parameter only on a `#[sequence]` fn");
+        // SAFETY: the lifetime parameter is phantom, so the layout does not
+        // change. Through the result, a condition can only be linked if it
+        // outlives `'a`, which ends no later than the body (see `with_seq`).
+        // The step checks redlines only while it holds that body: `advance`
+        // walks them behind `run.as_mut()`, and `run` is `None` from the
+        // moment the body is dropped, in both `execute` and `fault`. `Seq`'s
+        // `Drop` clears the back-pointers of nodes that are still linked,
+        // without calling any condition.
+        unsafe { &*core::ptr::from_ref(seq).cast::<Seq<'a>>() }
     }
 
     /// Hands out the log to the one `&mut Log` parameter.
@@ -486,6 +522,64 @@ impl Param for Timestamp {
         cx: &mut Cycle<'a>,
     ) -> Timestamp {
         cx.now
+    }
+}
+
+/// An [`Abort`] reads the `abort` input, whatever the parameter is called.
+impl<D: WakeSink + 'static> Param for Abort<D> {
+    type In<W: WakeSink + Clone + 'static> = Abort<W>;
+    type Out = ();
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Abort<W>;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        cx: &DefCx<'_>,
+        defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        param_name(names);
+        defs.inputs.push(Input::<AbortRequest>::def(cx, ABORT_PORT));
+        Ok(())
+    }
+
+    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
+        Abort::new(<Input<AbortRequest> as Param>::bind_in(views))
+    }
+
+    fn bind_out(_writers: &mut Writers) {}
+
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        input: &'a mut Self::In<W>,
+        _output: &'a mut (),
+        _cx: &mut Cycle<'a>,
+    ) -> Self::Item<'a, W> {
+        input
+    }
+}
+
+impl Param for Seq<'static> {
+    type In<W: WakeSink + Clone + 'static> = ();
+    type Out = ();
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a Seq<'a>;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        _defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        param_name(names);
+        Ok(())
+    }
+
+    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+
+    fn bind_out(_writers: &mut Writers) {}
+
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        _input: &'a mut (),
+        _output: &'a mut (),
+        cx: &mut Cycle<'a>,
+    ) -> &'a Seq<'a> {
+        cx.seq()
     }
 }
 

@@ -9574,6 +9574,7 @@ dependencies = [
 name = "metor-fsw-3"
 version = "0.14.2"
 dependencies = [
+ "cordyceps",
  "futures-lite 2.6.1",
  "io-uring",
  "libc",
