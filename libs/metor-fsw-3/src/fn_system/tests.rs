@@ -1097,6 +1097,7 @@ fn test_async_records_param_reads_the_host_table() {
         inputs: Vec::new(),
         outputs: vec![&nav, &log],
         threads: &mut threads,
+        io: &crate::io::SharedIo::default(),
         seed: 0,
         namespace: None,
         records: &records,
