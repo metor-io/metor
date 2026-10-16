@@ -10,7 +10,7 @@ use metor_fsw_3_ring::{NoWake, WakeSink};
 
 use crate::Rng;
 use crate::coordinator::ParamError;
-use crate::def::{DefCx, DefError};
+use crate::def::{DefCx, DefError, Records};
 use crate::log::LogPort;
 use crate::port::{Output, Samplers};
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports};
@@ -79,18 +79,28 @@ impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
         let writers = writers(outputs, defs.outputs.len() + 1, Arc::default());
         bind_outputs::<S>(writers)
     }
+
+    fn bind_with_records(outputs: Vec<OutputBinding>, records: &Arc<Records>) -> Self {
+        let defs = Defs::declared::<S>();
+        let mut writers = writers(outputs, defs.outputs.len() + 1, Arc::default());
+        writers.records = defs.records.then(|| records.clone());
+        bind_outputs::<S>(writers)
+    }
 }
 
 /// A fn system's bound ports.
 pub(crate) type BoundSet<S> = (InSet<S>, OutSet<S>);
 
-/// The id, namespace, and seed of the system instance being bound.
+/// The id, namespace, seed, and record table of the system instance being
+/// bound.
 #[derive(Clone, Copy)]
 pub(crate) struct Instance<'a> {
     pub(crate) id: &'a str,
     pub(crate) namespace: &'a str,
     /// The target seed. A guest's make has none.
     pub(crate) seed: Option<u64>,
+    /// Every record the system table knows about.
+    pub(crate) records: &'a Arc<Records>,
 }
 
 impl<'a> Instance<'a> {
@@ -99,6 +109,7 @@ impl<'a> Instance<'a> {
             id: cx.id,
             namespace: cx.namespace,
             seed: cx.seed,
+            records: cx.records,
         }
     }
 
@@ -121,10 +132,12 @@ pub(crate) fn bind<S: FnSignature>(
 ) -> Result<BoundSet<S>, ParamError> {
     let defs = Defs::declared::<S>();
     let rng = defs.rng.then(|| instance.rng()).transpose()?;
+    let records = defs.records.then(|| instance.records.clone());
     let dropped = Arc::<AtomicU32>::default();
     let ins = bind_inputs::<S, NoWake>(inputs, defs.inputs.len());
     let mut writers = writers(outputs, defs.outputs.len() + 1, dropped);
     writers.rng = rng;
+    writers.records = records;
     Ok((ins, bind_outputs::<S>(writers)))
 }
 
@@ -133,6 +146,7 @@ fn writers(outputs: Vec<OutputBinding>, declared: usize, dropped: Arc<AtomicU32>
         bindings: Bindings::new(outputs, declared),
         dropped,
         rng: None,
+        records: None,
     }
 }
 

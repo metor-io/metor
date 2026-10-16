@@ -7,6 +7,7 @@
 
 use core::time::Duration;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
@@ -80,7 +81,8 @@ impl CoordinatorConfig {
         if options.deterministic {
             self.clock.check_deterministic()?;
         }
-        let mut plan = Plan::resolve(&self, table)?;
+        let records = Arc::new(table.records());
+        let mut plan = Plan::resolve(&self, table, &records)?;
         check_ids(&plan)?;
         plan.set_reader_counts();
         let rings = plan
@@ -95,6 +97,7 @@ impl CoordinatorConfig {
         let args = SharedMakeArgs {
             seed: Some(self.seed),
             namespace: self.namespace.as_deref().unwrap_or_default(),
+            records: &records,
         };
         let entries = make_systems(&plan, &rings, &mut threads, args)?;
 
@@ -110,13 +113,16 @@ impl CoordinatorConfig {
 
 impl<'a> Plan<'a> {
     /// Resolves every system's definition, its rings, and its input edges.
-    fn resolve(config: &'a CoordinatorConfig, table: &'a SystemTable) -> Result<Self, BuildError> {
+    fn resolve(
+        config: &'a CoordinatorConfig,
+        table: &'a SystemTable,
+        records: &Records,
+    ) -> Result<Self, BuildError> {
         let mut plan = Self {
             index: index_by_id(config)?,
             systems: Vec::with_capacity(config.systems.len()),
             rings: Vec::new(),
         };
-        let records = table.records();
         let namespace = config.namespace.as_deref();
         for system in &config.systems {
             let entry = table
@@ -125,7 +131,7 @@ impl<'a> Plan<'a> {
                     id: system.id.clone(),
                     ty: system.ty.clone(),
                 })?;
-            let def = SystemDef::planned(system, entry, &plan, &records, namespace)?;
+            let def = SystemDef::planned(system, entry, &plan, records, namespace)?;
             plan.push(system, entry, def, namespace);
         }
         plan.resolve_edges(config)?;
@@ -425,6 +431,7 @@ fn allocate_ring(spec: &RingSpec, ring_depth: usize) -> Result<RingBuffer, Build
 struct SharedMakeArgs<'a> {
     seed: Option<u64>,
     namespace: &'a str,
+    records: &'a Arc<Records>,
 }
 
 /// Makes every planned system, bound to its rings.
@@ -456,6 +463,7 @@ fn make_systems(
             threads,
             seed: args.seed,
             namespace: args.namespace,
+            records: args.records,
         };
         let step = (system.entry.make)(cx).map_err(|source| BuildError::Params {
             id: system.id.to_string(),
@@ -956,7 +964,7 @@ mod tests {
             ..Default::default()
         };
         let table = table(&recorder);
-        let plan = Plan::resolve(&config, &table).expect("valid config");
+        let plan = Plan::resolve(&config, &table, &table.records()).expect("valid config");
         let emitted = &plan.systems[0].def.outputs[0];
         assert_eq!(emitted.name, "imu");
         assert_eq!(emitted.schema, def.schema, "the peer's root is kept");

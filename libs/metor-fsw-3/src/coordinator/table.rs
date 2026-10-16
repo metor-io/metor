@@ -10,7 +10,7 @@ use serde_json::value::RawValue;
 
 use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
-use crate::def::{DefCx, DefError};
+use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, SystemFn};
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 use crate::thread::{DEFAULT_THREAD, Threads};
@@ -34,6 +34,8 @@ pub struct MakeCx<'a> {
     pub seed: Option<u64>,
     /// The target's namespace, or empty.
     pub namespace: &'a str,
+    /// Every record the system table knows about.
+    pub records: &'a Arc<Records>,
 }
 
 impl MakeCx<'_> {
@@ -724,6 +726,7 @@ mod tests {
             threads: &mut threads,
             seed: Some(0),
             namespace: "",
+            records: &Default::default(),
         })
         .expect("no params");
         let started = std::time::Instant::now();

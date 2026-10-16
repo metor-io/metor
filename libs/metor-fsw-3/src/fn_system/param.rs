@@ -10,7 +10,7 @@ use metor_proto::types::Timestamp;
 
 use crate::{
     Rng,
-    def::{DefCx, DefError},
+    def::{DefCx, DefError, Records},
     frame::Frame,
     log::Log,
     port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers},
@@ -71,6 +71,8 @@ pub struct Writers {
     pub(crate) dropped: Arc<AtomicU32>,
     /// The instance's stream, for an `Rng` parameter.
     pub(crate) rng: Option<Rng>,
+    /// The host's record table, for a `Records` parameter.
+    pub(crate) records: Option<Arc<Records>>,
 }
 /// The parameter names that [`Param::append_defs`] reads from.
 pub type ParamNames<'n> = core::slice::Iter<'n, &'static str>;
@@ -88,6 +90,8 @@ pub struct Defs {
     pub(crate) sampled: bool,
     /// Whether any parameter is an `Rng`.
     pub(crate) rng: bool,
+    /// Whether any parameter is the [`Records`] table.
+    pub(crate) records: bool,
 }
 
 impl Defs {
@@ -301,6 +305,40 @@ impl Param for Rng {
         output: &'a mut Rng,
         _cx: &mut Cycle<'a>,
     ) -> &'a mut Rng {
+        output
+    }
+}
+
+/// The host's record table: every record the system table knows, by name.
+/// It takes no port.
+impl Param for Records {
+    type In<W: WakeSink + Clone + 'static> = ();
+    type Out = Arc<Records>;
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a Records;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        param_name(names);
+        defs.records = true;
+        Ok(())
+    }
+
+    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+
+    fn bind_out(writers: &mut Writers) -> Arc<Records> {
+        // PANIC Safety: `fn_system::bind` and every async bind path pass the
+        // table.
+        writers.records.clone().expect("the host record table")
+    }
+
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        _input: &'a mut (),
+        output: &'a mut Arc<Records>,
+        _cx: &mut Cycle<'a>,
+    ) -> &'a Records {
         output
     }
 }
