@@ -27,7 +27,7 @@ use stellarator::io::OwnedWriter;
 use stellarator::net::TcpStream;
 use stellarator::sync::Mutex;
 
-use crate::{DB, Error, msg_log_2::MsgLog};
+use crate::{DB, Error, msg_log::MsgLog};
 
 /// One forwarder for the whole advertised set: drain every log's WAL
 /// reader — a fresh reader only ever sees records committed from now on,
@@ -44,7 +44,7 @@ pub(crate) async fn forward(
     db: &Arc<DB>,
 ) -> Error {
     use crate::disruptor::Reader;
-    use crate::msg_log_2::read_msg;
+    use crate::msg_log::read_msg;
 
     let mut logs: Vec<(PacketId, MsgLog, Reader)> = Vec::new();
     for id in ids {
@@ -104,7 +104,7 @@ mod tests {
         manifest::{SpanSource, SpanState},
         seal::SealRecord,
         store::{LocalDirStore, NodeKey, NodeStore},
-        time_series_2::{TimeSeries, TimeSeriesNode},
+        time_series::{TimeSeries, TimeSeriesNode},
     };
     use metor_proto::{
         schema::Schema,

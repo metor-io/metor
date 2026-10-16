@@ -4,9 +4,13 @@
 //! listening for peers or by dialing one. There are two core links:
 //! [`Publish`] sends the records wired into it to every connected peer, and
 //! [`Subscribe`] receives records from connected peers and writes them onto
-//! its output ports.
+//! its output ports. `Db`, behind the `db` feature, is a third link that
+//! records everything wired into it in an embedded metor-db, which is how a
+//! gateway stores telemetry.
 
 mod conn;
+#[cfg(feature = "db")]
+mod db;
 mod inbox;
 mod publish;
 mod subscribe;
@@ -23,6 +27,8 @@ use crate::coordinator::{BuildError, SystemTable};
 use crate::log::Log;
 use crate::port::Output;
 
+#[cfg(feature = "db")]
+pub use db::{Db, DbParams, DbStatus};
 pub use publish::{Publish, PublishParams};
 pub use subscribe::{Subscribe, SubscribeParams};
 pub use transport::Transport;
@@ -31,6 +37,8 @@ pub use transport::Transport;
 pub const PUBLISH_TYPE: &str = "fsw.publish";
 /// The system type name for [`Subscribe`].
 pub const SUBSCRIBE_TYPE: &str = "fsw.subscribe";
+/// The system type name for a gateway's embedded database.
+pub const DB_TYPE: &str = "fsw.db";
 /// Every link system type. Each one's params include [`LinkParams`].
 pub const LINK_TYPES: [&str; 2] = [PUBLISH_TYPE, SUBSCRIBE_TYPE];
 
@@ -115,6 +123,8 @@ fn report(
 pub(crate) fn register(table: &mut SystemTable) -> Result<(), BuildError> {
     table.register_async(PUBLISH_TYPE, publish::publish(), Publish::new)?;
     table.register_async(SUBSCRIBE_TYPE, subscribe::subscribe(), Subscribe::new)?;
+    #[cfg(feature = "db")]
+    table.register_async(DB_TYPE, db::db(), Db::new)?;
     Ok(())
 }
 

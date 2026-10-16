@@ -9,6 +9,7 @@ metor-fsw-3-macros = { path = "macros" }
 metor-fsw-3-ring = { path = "ring", default-features = false, features = ["notify"] }
 
 metor-component = { workspace = true }
+metor-db = { path = "../db", optional = true }
 metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-stellar = { path = "../metor-proto/stellar", optional = true }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
@@ -44,7 +45,7 @@ polling = { version = "3.7", optional = true }
 io-uring = { version = "0.7.1", optional = true }
 
 [features]
-default = ["host"]
+default = ["host", "db"]
 host = [
     "threads",
     "dep:blake3",
@@ -59,6 +60,7 @@ host = [
 ]
 
 threads = ["dep:stellarator", "dep:thingbuf"]
+db = ["host", "dep:metor-db"]
 
 [dev-dependencies]
 tempfile = "3"

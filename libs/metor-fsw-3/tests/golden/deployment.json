@@ -129,8 +129,8 @@
             "params": {
               "transport": {
                 "peer": {
-                  "target": "b",
-                  "link": "pub"
+                  "target": "gw",
+                  "link": "db"
                 }
               },
               "namespace": "a",
@@ -376,6 +376,382 @@
                 "from": [
                   {
                     "system": "ctrl",
+                    "port": "status"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "packs": [],
+      "coordinator": {
+        "clock": {
+          "Wall": {
+            "rate": 10.0
+          }
+        },
+        "ring_depth": 8,
+        "namespace": "gw",
+        "systems": [
+          {
+            "id": "a",
+            "ty": "fsw.subscribe",
+            "params": {
+              "transport": {
+                "peer": {
+                  "target": "a",
+                  "link": "pub"
+                }
+              },
+              "namespace": "gw",
+              "link": "a",
+              "conn_cap": 1048576,
+              "inbound_cap": 256
+            },
+            "inputs": [],
+            "outputs": [
+              {
+                "port": "plant.imu",
+                "peer": {
+                  "target": "a",
+                  "link": "pub",
+                  "port": "plant.imu"
+                }
+              },
+              {
+                "port": "plant.log",
+                "peer": {
+                  "target": "a",
+                  "link": "pub",
+                  "port": "plant.log"
+                }
+              },
+              {
+                "port": "plant.status",
+                "peer": {
+                  "target": "a",
+                  "link": "pub",
+                  "port": "plant.status"
+                }
+              },
+              {
+                "port": "nav.est",
+                "peer": {
+                  "target": "a",
+                  "link": "pub",
+                  "port": "nav.est"
+                }
+              },
+              {
+                "port": "nav.status",
+                "peer": {
+                  "target": "a",
+                  "link": "pub",
+                  "port": "nav.status"
+                }
+              }
+            ]
+          },
+          {
+            "id": "b",
+            "ty": "fsw.subscribe",
+            "params": {
+              "transport": {
+                "peer": {
+                  "target": "b",
+                  "link": "pub"
+                }
+              },
+              "namespace": "gw",
+              "link": "b",
+              "conn_cap": 1048576,
+              "inbound_cap": 256
+            },
+            "inputs": [],
+            "outputs": [
+              {
+                "port": "mirror.plant.imu",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "mirror.plant.imu"
+                }
+              },
+              {
+                "port": "mirror.plant.log",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "mirror.plant.log"
+                }
+              },
+              {
+                "port": "mirror.plant.status",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "mirror.plant.status"
+                }
+              },
+              {
+                "port": "mirror.nav.est",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "mirror.nav.est"
+                }
+              },
+              {
+                "port": "mirror.link_status",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "mirror.link_status"
+                }
+              },
+              {
+                "port": "mirror.status",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "mirror.status"
+                }
+              },
+              {
+                "port": "mode.cmd",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "mode.cmd"
+                }
+              },
+              {
+                "port": "mode.status",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "mode.status"
+                }
+              },
+              {
+                "port": "ctrl.motor_cmd",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "ctrl.motor_cmd"
+                }
+              },
+              {
+                "port": "ctrl.status",
+                "peer": {
+                  "target": "b",
+                  "link": "pub",
+                  "port": "ctrl.status"
+                }
+              }
+            ]
+          },
+          {
+            "id": "db",
+            "ty": "fsw.db",
+            "params": {
+              "listen": "0.0.0.0:2250",
+              "path": null,
+              "namespace": "gw",
+              "commands": [
+                "ping"
+              ]
+            },
+            "thread": "db",
+            "inputs": [
+              {
+                "port": "a.plant.imu",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "plant.imu"
+                  }
+                ]
+              },
+              {
+                "port": "a.plant.log",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "plant.log"
+                  }
+                ]
+              },
+              {
+                "port": "a.plant.status",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "plant.status"
+                  }
+                ]
+              },
+              {
+                "port": "a.nav.est",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "nav.est"
+                  }
+                ]
+              },
+              {
+                "port": "a.nav.status",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "nav.status"
+                  }
+                ]
+              },
+              {
+                "port": "a.link_status",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "a.log",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "a.status",
+                "from": [
+                  {
+                    "system": "a",
+                    "port": "status"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.plant.imu",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.plant.imu"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.plant.log",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.plant.log"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.plant.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.plant.status"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.nav.est",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.nav.est"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.link_status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.link_status"
+                  }
+                ]
+              },
+              {
+                "port": "b.mirror.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mirror.status"
+                  }
+                ]
+              },
+              {
+                "port": "b.mode.cmd",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mode.cmd"
+                  }
+                ]
+              },
+              {
+                "port": "b.mode.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "mode.status"
+                  }
+                ]
+              },
+              {
+                "port": "b.ctrl.motor_cmd",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "ctrl.motor_cmd"
+                  }
+                ]
+              },
+              {
+                "port": "b.ctrl.status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "ctrl.status"
+                  }
+                ]
+              },
+              {
+                "port": "b.link_status",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "b.log",
+                "from": [
+                  {
+                    "system": "b",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "b.status",
+                "from": [
+                  {
+                    "system": "b",
                     "port": "status"
                   }
                 ]

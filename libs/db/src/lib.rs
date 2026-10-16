@@ -17,7 +17,7 @@ use metor_proto::{
 };
 use metor_proto_stellar::{PacketSink, PacketStream};
 use metor_proto_wkt::*;
-use msg_log_2::MsgLog;
+use msg_log::MsgLog;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use smallvec::SmallVec;
 use std::{
@@ -56,17 +56,13 @@ mod arrow;
 pub mod disruptor;
 mod error;
 pub mod lod;
-//mod msg_log;
 pub mod manifest;
-pub mod msg_log_2;
+pub mod msg_log;
 pub mod remote;
 pub mod seal;
 pub mod store;
 pub mod tiering;
-//pub(crate) mod time_series;
-pub mod time_series_2;
-pub use msg_log_2 as msg_log;
-pub use time_series_2 as time_series;
+pub mod time_series;
 
 mod vtable_stream;
 
@@ -342,100 +338,83 @@ impl DB {
         Ok(())
     }
 
-    /// Sinks a table `buf` described by the registered vtable `id`, creating any
-    /// concrete component lazily on first sample.
+    /// Sinks a table `buf` described by the registered vtable `id`, stamping a
+    /// field whose vtable names no timestamp with its arrival.
     ///
-    /// Unlike the old `Table::sink` path (which drove `Decomponentize` under a
-    /// read lock and dropped `frame`/`element`), this drives
-    /// [`VTable::for_each_field`] directly under [`DB::with_state_mut`]: the
-    /// vtable is cloned out of the registry to free the `state` borrow, then each
-    /// realized field get-or-creates its component (idempotent schema check) and
-    /// pushes the sample. A newly created component (or first sample into an empty
-    /// series) bumps `vtable_gen` so subscribers re-derive membership. For dynamic
-    /// vtables the raw table bytes are cached as the authoritative latest table the
-    /// dynamic stream forwards (see [`State::latest_dynamic_tables`]).
+    /// A static table's components exist from [`insert_vtable`](Self::insert_vtable),
+    /// so it sinks under the read lock without copying its vtable. A dynamic
+    /// table realizes members on first sample under the write lock, and caches
+    /// its bytes as the latest table the dynamic stream forwards (see
+    /// [`State::latest_dynamic_tables`]). A new component, or a first sample
+    /// into an empty series, bumps `vtable_gen` so subscribers re-derive
+    /// membership.
     pub fn ingest_table(&self, id: PacketId, buf: &[u8]) -> Result<(), Error> {
         let received = Timestamp::now();
-        let mut max_ts = Timestamp(i64::MIN);
+        let pushed = match self.ingest_static(id, buf, received)? {
+            Some(pushed) => pushed,
+            None => self.ingest_dynamic(id, buf, received)?,
+        };
+        if pushed.new_series {
+            self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
+        }
+        if let Some(max_ts) = pushed.max_ts {
+            self.last_updated.update_max(max_ts);
+        }
+        Ok(())
+    }
+
+    /// Sinks a static table under the read lock; `None` for a dynamic one.
+    fn ingest_static(
+        &self,
+        id: PacketId,
+        buf: &[u8],
+        received: Timestamp,
+    ) -> Result<Option<Pushed>, Error> {
+        self.with_state(|state| {
+            let vtable = state
+                .vtable_registry
+                .get(&id)
+                .ok_or(Error::Impeller(metor_proto::error::Error::VTableNotFound))?;
+            if vtable.is_dynamic() {
+                return Ok(None);
+            }
+            let mut pushed = Pushed::default();
+            for_each_realized(vtable, buf, |rf| {
+                let component = state
+                    .get_component(rf.component_id)
+                    .ok_or(Error::ComponentNotFound(rf.component_id))?;
+                pushed.merge(push_field(component, &rf, received)?);
+                Ok(())
+            })?;
+            Ok(Some(pushed))
+        })
+    }
+
+    /// Sinks a dynamic table under the write lock, realizing each member on
+    /// its first sample.
+    fn ingest_dynamic(
+        &self,
+        id: PacketId,
+        buf: &[u8],
+        received: Timestamp,
+    ) -> Result<Pushed, Error> {
         self.with_state_mut(|state| {
-            // Clone the vtable out so the closure can hold `&mut state`.
+            // Cloned out so realizing a member can take `&mut state`.
             let vtable = state
                 .vtable_registry
                 .get(&id)
                 .ok_or(Error::Impeller(metor_proto::error::Error::VTableNotFound))?
                 .clone();
-            let dynamic = vtable.is_dynamic();
-            let mut new_series = false;
-            let mut db_err: Option<Error> = None;
-            let res = vtable.for_each_field(Some(buf), &mut |rf| {
-                let mut sink = || -> Result<(), Error> {
-                    let view = rf.view.expect("table provided to for_each_field");
-                    let ts = rf.timestamp.unwrap_or(received);
-                    if !state.components.contains_key(&rf.component_id) {
-                        // Static fields must be pre-registered (via `insert_vtable`);
-                        // only dynamic element-members are created lazily on first
-                        // sample. This keeps static ingest behaviorally identical.
-                        if !rf.dynamic {
-                            return Err(Error::ComponentNotFound(rf.component_id));
-                        }
-                        // Name the keyed member by its dotted path before
-                        // `insert_component` falls back to the numeric id, so the
-                        // panel shows `alarm_defs.limits.<key>`. A member that
-                        // reappears already has real metadata, so leave it be.
-                        if !state.component_metadata.contains_key(&rf.component_id)
-                            && let Some(name) = dynamic_member_name(&rf)
-                        {
-                            state.set_component_metadata(
-                                ComponentMetadata {
-                                    component_id: rf.component_id,
-                                    name,
-                                    metadata: Default::default(),
-                                },
-                                &self.path,
-                            )?;
-                        }
-                        let schema = ComponentSchema::new(rf.ty, rf.shape);
-                        state.insert_component(rf.component_id, schema, &self.path)?;
-                        new_series = true;
-                    }
-                    let component = state
-                        .components
-                        .get(&rf.component_id)
-                        .expect("component just inserted");
-                    if component.time_series.is_empty() {
-                        new_series = true;
-                    }
-                    component.push_buf(ts, view.as_bytes())?;
-                    if ts > max_ts {
-                        max_ts = ts;
-                    }
-                    Ok(())
-                };
-                match sink() {
-                    Ok(()) => Ok(()),
-                    Err(err) => {
-                        db_err = Some(err);
-                        // Sentinel to stop iteration; the real error is surfaced below.
-                        Err(metor_proto::error::Error::InvalidOp)
-                    }
-                }
-            });
-            if let Some(err) = db_err {
-                return Err(err);
-            }
-            res?;
-            if dynamic {
-                state.latest_dynamic_tables.insert(id, buf.to_vec());
-            }
-            if new_series {
-                self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
-            }
-            Ok::<_, Error>(())
-        })?;
-        if max_ts > Timestamp(i64::MIN) {
-            self.last_updated.update_max(max_ts);
-        }
-        Ok(())
+            let mut pushed = Pushed::default();
+            for_each_realized(&vtable, buf, |rf| {
+                let (component, created) = state.realize_component(&rf, &self.path)?;
+                pushed.new_series |= created;
+                pushed.merge(push_field(component, &rf, received)?);
+                Ok(())
+            })?;
+            state.latest_dynamic_tables.insert(id, buf.to_vec());
+            Ok(pushed)
+        })
     }
 
     /// Builds one streamed `Table` packet for a dynamic vtable subscription from
@@ -592,6 +571,47 @@ impl State {
 
     pub fn get_component_metadata(&self, component_id: ComponentId) -> Option<&ComponentMetadata> {
         self.component_metadata.get(&component_id)
+    }
+
+    /// The component a dynamic table's field lands in, created and named on
+    /// its first sample; `true` when it was created. A static field's
+    /// component must already exist.
+    fn realize_component(
+        &mut self,
+        rf: &RealizedField,
+        db_path: &Path,
+    ) -> Result<(&Component, bool), Error> {
+        let created = !self.components.contains_key(&rf.component_id);
+        if created {
+            if !rf.dynamic {
+                return Err(Error::ComponentNotFound(rf.component_id));
+            }
+            // Name the keyed member by its dotted path before
+            // `insert_component` falls back to the numeric id, so the panel
+            // shows `alarm_defs.limits.<key>`. A member that reappears already
+            // has real metadata, so leave it be.
+            if !self.component_metadata.contains_key(&rf.component_id)
+                && let Some(name) = dynamic_member_name(rf)
+            {
+                self.set_component_metadata(
+                    ComponentMetadata {
+                        component_id: rf.component_id,
+                        name,
+                        metadata: Default::default(),
+                    },
+                    db_path,
+                )?;
+            }
+            self.insert_component(
+                rf.component_id,
+                ComponentSchema::new(rf.ty, rf.shape),
+                db_path,
+            )?;
+        }
+        let component = self
+            .get_component(rf.component_id)
+            .ok_or(Error::ComponentNotFound(rf.component_id))?;
+        Ok((component, created))
     }
 
     pub fn get_component(&self, component_id: ComponentId) -> Option<&Component> {
@@ -829,6 +849,58 @@ pub(crate) fn max_node_age_override() -> Option<Duration> {
                 .and_then(|v| v.parse().ok())
         })
         .map(Duration::from_secs)
+}
+
+/// The newest timestamp pushed, and whether a push began an empty series.
+#[derive(Default)]
+struct Pushed {
+    max_ts: Option<Timestamp>,
+    new_series: bool,
+}
+
+impl Pushed {
+    fn merge(&mut self, other: Pushed) {
+        self.max_ts = self.max_ts.max(other.max_ts);
+        self.new_series |= other.new_series;
+    }
+}
+
+/// Pushes one realized field into `component`, stamped `received` when its
+/// vtable names no timestamp.
+fn push_field(
+    component: &Component,
+    rf: &RealizedField,
+    received: Timestamp,
+) -> Result<Pushed, Error> {
+    // PANIC Safety: `for_each_realized` walks a table, so every field realizes a view.
+    let view = rf.view.as_ref().expect("table provided to for_each_field");
+    let ts = rf.timestamp.unwrap_or(received);
+    let new_series = component.time_series.is_empty();
+    component.push_buf(ts, view.as_bytes())?;
+    Ok(Pushed {
+        max_ts: Some(ts),
+        new_series,
+    })
+}
+
+/// Walks the fields `buf` realizes, stopping at the first error `f` returns.
+fn for_each_realized<'a>(
+    vtable: &'a VTable,
+    buf: &'a [u8],
+    mut f: impl FnMut(RealizedField<'a>) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let mut db_err = None;
+    let res = vtable.for_each_field(Some(buf), &mut |rf| {
+        f(rf).map_err(|err| {
+            db_err = Some(err);
+            // Stops the walk; the real error is surfaced below.
+            metor_proto::error::Error::InvalidOp
+        })
+    });
+    match db_err {
+        Some(err) => Err(err),
+        None => Ok(res?),
+    }
 }
 
 #[derive(Clone)]
@@ -1872,7 +1944,7 @@ async fn sync_msg_log<A: AsyncWrite>(
     log: MsgLog,
     req_id: RequestId,
 ) -> Result<(), Error> {
-    use crate::msg_log_2::read_msg;
+    use crate::msg_log::read_msg;
 
     async fn send<A: AsyncWrite>(
         sink: &Mutex<PacketSink<A>>,
@@ -2977,5 +3049,99 @@ mod vtable_id_tests {
             }
         }
         assert_eq!(ids[0], ids[1]);
+    }
+}
+
+#[cfg(test)]
+mod static_ingest_tests {
+    use super::*;
+    use metor_proto::vtable::builder::{
+        component, raw_field, raw_table, schema, timestamp, vtable,
+    };
+
+    const ID: PacketId = [9, 1];
+
+    /// Two `f64` fields sharing the table's leading timestamp.
+    fn two_fields() -> VTable {
+        vtable([
+            raw_field(
+                8,
+                8,
+                timestamp(raw_table(0, 8), schema(PrimType::F64, &[1], component("a"))),
+            ),
+            raw_field(
+                16,
+                8,
+                timestamp(raw_table(0, 8), schema(PrimType::F64, &[1], component("b"))),
+            ),
+        ])
+    }
+
+    fn sample(timestamp: i64, a: f64, b: f64) -> Vec<u8> {
+        let mut buf = timestamp.to_le_bytes().to_vec();
+        buf.extend_from_slice(&a.to_le_bytes());
+        buf.extend_from_slice(&b.to_le_bytes());
+        buf
+    }
+
+    fn store() -> (tempfile::TempDir, DB) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::create(dir.path().to_path_buf()).unwrap();
+        db.insert_vtable(VTableMsg {
+            id: ID,
+            vtable: two_fields(),
+        })
+        .unwrap();
+        (dir, db)
+    }
+
+    fn latest(db: &DB, name: &str) -> Timestamp {
+        db.with_state(|state| {
+            state
+                .get_component(ComponentId::new(name))
+                .unwrap()
+                .last_timestamp
+                .latest()
+        })
+    }
+
+    #[stellarator::test]
+    async fn static_table_lands_in_its_components() {
+        let (_dir, db) = store();
+        db.ingest_table(ID, &sample(5, 1.5, 2.5)).unwrap();
+        db.ingest_table(ID, &sample(7, 1.5, 2.5)).unwrap();
+        for name in ["a", "b"] {
+            assert_eq!(latest(&db, name), Timestamp(7));
+        }
+        assert_eq!(db.last_updated.latest(), Timestamp(7));
+    }
+
+    /// A series' first sample changes membership.
+    #[stellarator::test]
+    async fn first_sample_bumps_vtable_gen() {
+        let (_dir, db) = store();
+        let before = db.vtable_gen.latest();
+        db.ingest_table(ID, &sample(1, 0.0, 0.0)).unwrap();
+        assert!(db.vtable_gen.latest() > before);
+    }
+
+    #[stellarator::test]
+    async fn unknown_table_is_refused() {
+        let (_dir, db) = store();
+        let err = db.ingest_table([0, 0], &sample(1, 0.0, 0.0)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Impeller(metor_proto::error::Error::VTableNotFound)
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A table too short for its vtable surfaces the walk's error.
+    #[stellarator::test]
+    async fn short_table_is_refused() {
+        let (_dir, db) = store();
+        assert!(db.ingest_table(ID, &5i64.to_le_bytes()).is_err());
     }
 }

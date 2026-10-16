@@ -164,18 +164,25 @@ fn peer_link(params: &LinkParams) -> Option<&PeerLink> {
     }
 }
 
-/// Returns the port a link listens on, unless it is zero.
+/// Returns the port a system listens on, unless it is zero.
 fn fixed_port(system: &SystemConfig) -> Result<Option<u16>, DeployError> {
-    let port = link(system)?.and_then(|params| listen_port(&params.part));
+    let port = listen_addr(system)?.and_then(|addr| addr.rsplit_once(':')?.1.parse().ok());
     Ok(port.filter(|&port| port != 0))
 }
 
-/// Returns the port a link's transport listens on.
-fn listen_port(params: &LinkParams) -> Option<u16> {
-    let Transport::Listen { addr, .. } = &params.transport else {
-        return None;
-    };
-    addr.rsplit_once(':')?.1.parse().ok()
+/// Returns the address a system listens on.
+///
+/// A link listens on its transport's `listen` address. Any other system
+/// listens on its top-level `listen` param, if it has one.
+fn listen_addr(system: &SystemConfig) -> Result<Option<String>, DeployError> {
+    if let Some(params) = link(system)? {
+        return Ok(match params.part.transport {
+            Transport::Listen { addr, .. } => Some(addr),
+            _ => None,
+        });
+    }
+    let listen = system.params.get("listen").and_then(|addr| addr.as_str());
+    Ok(listen.map(str::to_string))
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use metor_proto::types::{ComponentId, Timestamp};
 use crate::{
     seal::{SealRecord, seal_node},
     store::{NodeKey, NodeStaging, NodeStore, SealedNode},
-    time_series_2::TimeSeriesNode,
+    time_series::TimeSeriesNode,
 };
 
 struct Fixture {
@@ -75,7 +75,10 @@ pub async fn run(store: &dyn NodeStore, scratch: &Path) {
     std::fs::create_dir_all(&staging_dir).expect("staging dir");
     let staging = NodeStaging::create(&staging_dir, &a.seal).expect("staging");
     assert!(
-        store.get(key(&a.seal, component_id, &schema), &staging).await.is_err(),
+        store
+            .get(key(&a.seal, component_id, &schema), &staging)
+            .await
+            .is_err(),
         "get of a missing node must fail"
     );
     drop(staging);
