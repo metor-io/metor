@@ -1,0 +1,32 @@
+# The seqs pack as a Python distribution. `uv sync` runs the build backend,
+# which writes the typed module, the host library, and the wasm module to
+# `.metor/adcs_seqs/` and adds it to the venv.
+
+[project]
+name = "adcs-seqs"
+version = "0.1.0"
+description = "The commissioning sequence of the adcs-fsw3 example"
+requires-python = ">=3.11"
+
+# The backend comes from this checkout, since uv >= 0.11 applies
+# `[tool.uv.sources]` to `build-system.requires`.
+[build-system]
+requires = ["metor-build"]
+build-backend = "metor_build"
+
+[tool.metor.pack]
+id = "seqs"
+wasm = true
+
+[tool.uv.sources]
+metor-build = { path = "../../../../libs/metor-fsw-3/python/metor-build" }
+
+# Rebuild when the pack or its contracts change. The `../` globs need uv >= 0.11.
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "../../contracts/src/**/*.rs" },
+    { file = "../../contracts/Cargo.toml" },
+]
