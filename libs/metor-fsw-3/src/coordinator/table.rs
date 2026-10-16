@@ -315,6 +315,22 @@ impl SystemTable {
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, &TableEntry)> {
         self.entries.iter().map(|(ty, entry)| (ty.as_str(), entry))
     }
+
+    /// Collects every record the table's ports use.
+    ///
+    /// This includes the `status` and channel ports the coordinator adds.
+    pub(crate) fn records(&self) -> crate::def::Records {
+        let status = SystemStatus::port_def(&DefCx::empty());
+        #[cfg(feature = "host")]
+        let channel = crate::channel::channel_ports(&DefCx::empty());
+        #[cfg(not(feature = "host"))]
+        let channel: [PortDef; 0] = [];
+        crate::def::Records::from_port_defs(
+            core::iter::once(&status)
+                .chain(&channel)
+                .chain(self.entries().flat_map(|(_, entry)| entry.def.ports_iter())),
+        )
+    }
 }
 
 #[cfg(feature = "host")]
@@ -332,17 +348,6 @@ impl SystemTable {
         Ok(())
     }
 
-    /// Collects every record the table's ports use.
-    ///
-    /// This includes the `status` and channel ports the coordinator adds.
-    pub(crate) fn records(&self) -> crate::def::Records {
-        let status = SystemStatus::port_def(&DefCx::empty());
-        crate::def::Records::from_port_defs(
-            core::iter::once(&status)
-                .chain(&crate::channel::channel_ports(&DefCx::empty()))
-                .chain(self.entries().flat_map(|(_, entry)| entry.def.ports_iter())),
-        )
-    }
 }
 
 impl SystemDef {
