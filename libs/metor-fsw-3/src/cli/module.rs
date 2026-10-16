@@ -1,0 +1,674 @@
+//! Generates a pack's typed Python module.
+//!
+//! `metor pack dev` reads the pack's descriptor and renders one Python class
+//! per system and record, so target files can wire the pack with type
+//! checking.
+
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+use serde_json::Value;
+
+use super::pack_dev::PackDevError;
+use crate::channel::ABORT_PORT;
+use crate::dl::PackRef;
+use crate::io::{GrantDef, IO_CQ, IO_SQ};
+use crate::pack::def::{PackDef, PackSystemDef};
+use crate::record::RecordSchema;
+use crate::system::PortDef;
+
+const TEMPLATE: &str = include_str!("module.py.jinja");
+
+/// The output ports every system has, whether or not it declares them.
+///
+/// Each entry is the port name, the record class named after its Rust type,
+/// and whether the record is a frame.
+const BUILTIN_PORTS: [(&str, &str, bool); 2] =
+    [("log", "LogEvent", false), ("status", "SystemStatus", true)];
+
+/// The data the template renders.
+#[derive(Serialize)]
+struct Module {
+    pack_id: String,
+    lib: String,
+    abi_version: u32,
+    /// One class per record the pack uses, sorted by class name.
+    records: Vec<RecordClass>,
+    /// One dataclass per nested params object, sorted by name.
+    dataclasses: Vec<Class>,
+    systems: Vec<Entry>,
+    /// Whether any system takes a port list from its config.
+    takes_ports: bool,
+    /// Whether any system takes a `Cap`, so the module imports `ResourceHandle`.
+    takes_caps: bool,
+}
+
+/// A record class in the generated module.
+///
+/// `name` is the record's name on the host, `class` is the Python class name,
+/// and `kind` is `"frame"` or `"msg"`.
+#[derive(Serialize)]
+struct RecordClass {
+    name: String,
+    class: String,
+    kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct Class {
+    name: String,
+    /// The class docstring, or empty.
+    doc: String,
+    fields: Vec<Field>,
+}
+
+/// A dataclass field or an `__init__` keyword.
+#[derive(Serialize)]
+struct Field {
+    name: String,
+    annotation: String,
+    /// The default, rendered as ` = <literal>`. Empty for a required field.
+    default: String,
+    /// The property's description, or empty.
+    doc: String,
+}
+
+#[derive(Serialize)]
+struct Entry {
+    name: String,
+    ty: String,
+    doc: String,
+    /// The `Args:` section of the `__init__` docstring. Empty when no param
+    /// has a doc.
+    args_doc: String,
+    /// Whether the type takes an `items` port list.
+    takes_inputs: bool,
+    /// Whether the type takes a `records` list.
+    takes_outputs: bool,
+    inputs: Vec<Port>,
+    params: Vec<Field>,
+    /// Each `Cap` parameter, with the interface it takes.
+    caps: Vec<CapKw>,
+    /// Every output port with its record class. The built-in ports come last.
+    ports: Vec<Port>,
+}
+
+#[derive(Clone, Serialize)]
+struct CapKw {
+    name: String,
+    interface: String,
+}
+
+#[derive(Serialize)]
+struct Port {
+    name: String,
+    record: String,
+}
+
+/// Renders `<module>/__init__.py` for `def`.
+pub fn render(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<String, PackDevError> {
+    let module = view(pack, abi_version, def)?;
+    let mut env = minijinja::Environment::new();
+    env.add_filter("python_string", python_string);
+    env.add_filter("docstring", docstring);
+    env.add_template("module", TEMPLATE)?;
+    Ok(env.get_template("module")?.render(module)?)
+}
+
+fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackDevError> {
+    let schemas: Vec<Value> = def
+        .systems
+        .iter()
+        .map(parse_schema)
+        .collect::<Result<_, _>>()?;
+    let mut defs = BTreeMap::new();
+    for schema in &schemas {
+        collect_defs(schema, &mut defs);
+    }
+    let systems: Vec<Entry> = def
+        .systems
+        .iter()
+        .zip(&schemas)
+        .map(|(system, schema)| entry(system, schema, &defs))
+        .collect::<Result<_, _>>()?;
+    Ok(Module {
+        takes_ports: systems
+            .iter()
+            .any(|entry| entry.takes_inputs || entry.takes_outputs),
+        takes_caps: systems.iter().any(|entry| !entry.caps.is_empty()),
+        pack_id: pack.id.clone(),
+        lib: pack.lib.clone(),
+        abi_version,
+        records: records(def),
+        dataclasses: defs
+            .iter()
+            .map(|(name, object)| dataclass(name, object, &defs))
+            .collect(),
+        systems,
+    })
+}
+
+fn records(def: &PackDef) -> Vec<RecordClass> {
+    let mut records: Vec<RecordClass> = BUILTIN_PORTS
+        .iter()
+        .map(|(name, class, frame)| RecordClass {
+            name: name.to_string(),
+            class: class.to_string(),
+            kind: kind(*frame),
+        })
+        .collect();
+    for port in def.systems.iter().flat_map(ports) {
+        if !records.iter().any(|record| record.name == port.record) {
+            records.push(RecordClass {
+                name: port.record.to_string(),
+                class: class_of(&port.record),
+                kind: kind(matches!(port.schema, RecordSchema::Frame { .. })),
+            });
+        }
+    }
+    records.sort_unstable_by(|a, b| a.class.cmp(&b.class));
+    records
+}
+
+fn kind(frame: bool) -> &'static str {
+    if frame { "frame" } else { "msg" }
+}
+
+/// The `__init__` keywords a generated class passes on itself.
+const RESERVED_KEYWORDS: [&str; 3] = ["items", "records", "grants"];
+
+/// Returns the ports a target can wire.
+///
+/// This is every port except `abort`, which only a channel writes to, and
+/// the IO ports, which the builder wires.
+fn ports(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
+    wired_inputs(system).chain(exposed_outputs(system))
+}
+
+fn wired_inputs(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
+    system
+        .def
+        .inputs
+        .iter()
+        .filter(|port| port.name != ABORT_PORT && !is_io(system, &port.name))
+}
+
+fn exposed_outputs(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
+    system
+        .def
+        .outputs
+        .iter()
+        .filter(|port| !is_io(system, &port.name))
+}
+
+/// Whether `port` is one of the IO ports a `Cap` adds.
+fn is_io(system: &PackSystemDef, port: &str) -> bool {
+    !system.def.grants.is_empty() && (port == IO_SQ || port == IO_CQ)
+}
+
+fn is_builtin(port: &str) -> bool {
+    BUILTIN_PORTS.iter().any(|(name, ..)| *name == port)
+}
+
+fn class_of(record: &str) -> String {
+    match BUILTIN_PORTS.iter().find(|(name, ..)| *name == record) {
+        Some((_, class, _)) => (*class).to_string(),
+        None => pascal(record),
+    }
+}
+
+fn pascal(name: &str) -> String {
+    name.split('_')
+        .flat_map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .into_iter()
+                .flat_map(char::to_uppercase)
+                .chain(chars)
+        })
+        .collect()
+}
+
+/// Parses a system's params schema. A system without params gets an empty
+/// object.
+fn parse_schema(system: &PackSystemDef) -> Result<Value, PackDevError> {
+    let Some(raw) = system.params.as_deref() else {
+        return Ok(Value::Object(serde_json::Map::new()));
+    };
+    serde_json::from_str(raw.get()).map_err(|source| PackDevError::Schema {
+        system: system.ty.to_string(),
+        source,
+    })
+}
+
+/// Adds every object in the schema's `$defs` to the module's dataclasses.
+fn collect_defs(schema: &Value, defs: &mut BTreeMap<String, Value>) {
+    let Some(entries) = schema.get("$defs").and_then(Value::as_object) else {
+        return;
+    };
+    for (name, object) in entries {
+        if object.get("properties").is_some() {
+            defs.insert(name.clone(), object.clone());
+        }
+    }
+}
+
+/// Builds a dataclass for one nested params object.
+fn dataclass(name: &str, object: &Value, defs: &BTreeMap<String, Value>) -> Class {
+    Class {
+        name: name.to_string(),
+        doc: description(object),
+        fields: fields(object, defs, true),
+    }
+}
+
+/// Builds a field for each property of a schema object, with its type
+/// annotation and default.
+fn fields(schema: &Value, defs: &BTreeMap<String, Value>, dataclass: bool) -> Vec<Field> {
+    properties(schema)
+        .into_iter()
+        .map(|(name, property)| Field {
+            annotation: python_type(&property, defs),
+            default: default_of(&property, is_required(schema, &name), dataclass),
+            doc: description(&property),
+            name,
+        })
+        .collect()
+}
+
+/// Builds the `System` subclass for one system.
+///
+/// Returns an error if a param has the same name as an input port, since both
+/// become `__init__` keywords.
+fn entry(
+    system: &PackSystemDef,
+    schema: &Value,
+    defs: &BTreeMap<String, Value>,
+) -> Result<Entry, PackDevError> {
+    let params = fields(schema, defs, false);
+    let kw = |g: &GrantDef| CapKw {
+        name: g.param.to_string(),
+        interface: g.interface.to_string(),
+    };
+    let grants = &system.def.grants;
+    let caps: Vec<CapKw> = grants.iter().map(kw).collect();
+    let input = |name: &str| wired_inputs(system).any(|port| port.name == name);
+    let param = |name: &str| params.iter().any(|field| field.name == name);
+    let clash = params.iter().map(|f| &f.name).find(|name| input(name));
+    let taken = |name: &str| input(name) || param(name) || RESERVED_KEYWORDS.contains(&name);
+    let clash = clash.or(caps.iter().map(|c| &c.name).find(|name| taken(name)));
+    if let Some(name) = clash {
+        return Err(PackDevError::NameClash {
+            system: system.ty.to_string(),
+            name: name.clone(),
+        });
+    }
+    let port = |port: &PortDef| Port {
+        name: port.name.to_string(),
+        record: class_of(&port.record),
+    };
+    let declared = exposed_outputs(system).filter(|p| !is_builtin(&p.name));
+    let builtin = BUILTIN_PORTS.iter().map(|(name, class, _)| Port {
+        name: name.to_string(),
+        record: class.to_string(),
+    });
+    Ok(Entry {
+        name: pascal(&system.ty),
+        ty: system.ty.to_string(),
+        doc: system.doc.to_string(),
+        args_doc: args_doc(&params),
+        takes_inputs: system.takes_inputs,
+        takes_outputs: system.takes_outputs,
+        inputs: wired_inputs(system).map(port).collect(),
+        params,
+        caps,
+        ports: declared.map(port).chain(builtin).collect(),
+    })
+}
+
+fn description(schema: &Value) -> String {
+    schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+/// Builds a Google-style `Args:` section for the params that have a doc.
+fn args_doc(params: &[Field]) -> String {
+    let args: Vec<String> = params
+        .iter()
+        .filter(|field| !field.doc.is_empty())
+        .map(|field| {
+            let lines: Vec<&str> = field
+                .doc
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            format!("    {}: {}", field.name, lines.join("\n        "))
+        })
+        .collect();
+    if args.is_empty() {
+        return String::new();
+    }
+    format!("Args:\n{}", args.join("\n"))
+}
+
+/// Formats `text` as a triple-quoted docstring, indenting continuation lines
+/// by `indent` spaces.
+fn docstring(text: &str, indent: usize) -> String {
+    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    if !escaped.contains('\n') {
+        return format!("\"\"\"{escaped}\"\"\"");
+    }
+    let pad = " ".repeat(indent);
+    let body: Vec<String> = escaped
+        .lines()
+        .map(|line| match line {
+            "" => String::new(),
+            line => format!("{pad}{line}"),
+        })
+        .collect();
+    format!("\"\"\"\n{}\n{pad}\"\"\"", body.join("\n"))
+}
+
+/// Returns a schema object's properties, in the order the schema lists them.
+fn properties(schema: &Value) -> Vec<(String, Value)> {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|fields| {
+            fields
+                .iter()
+                .map(|(name, schema)| (name.clone(), schema.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_required(schema: &Value, name: &str) -> bool {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|names| names.iter().any(|entry| entry == name))
+}
+
+/// Returns the Python type annotation for one property's schema.
+fn python_type(schema: &Value, defs: &BTreeMap<String, Value>) -> String {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let name = reference.rsplit('/').next().unwrap_or(reference);
+        if defs.contains_key(name) {
+            return name.to_string();
+        }
+        return "object".to_string();
+    }
+    match schema.get("type") {
+        Some(Value::String(ty)) => python_ty(ty, schema, defs),
+        Some(Value::Array(types)) => {
+            let names: Vec<String> = types
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|ty| python_ty(ty, schema, defs))
+                .collect();
+            names.join(" | ")
+        }
+        _ => "object".to_string(),
+    }
+}
+
+fn python_ty(ty: &str, schema: &Value, defs: &BTreeMap<String, Value>) -> String {
+    match ty {
+        "number" => "float".to_string(),
+        "integer" => "int".to_string(),
+        "boolean" => "bool".to_string(),
+        "string" => "str".to_string(),
+        "null" => "None".to_string(),
+        "array" => match schema.get("items") {
+            Some(items) => format!("list[{}]", python_type(items, defs)),
+            None => "list[object]".to_string(),
+        },
+        _ => "object".to_string(),
+    }
+}
+
+/// Returns the rendered default for a field.
+///
+/// This is the schema's `default` if it has one, nothing for a required
+/// field, and ` = None` otherwise. Mutable defaults on a dataclass use a
+/// `default_factory`.
+fn default_of(schema: &Value, required: bool, dataclass: bool) -> String {
+    match schema.get("default") {
+        Some(value) if dataclass && (value.is_array() || value.is_object()) => {
+            format!(" = field(default_factory=lambda: {})", literal(value))
+        }
+        Some(value) => format!(" = {}", literal(value)),
+        None if required => String::new(),
+        None => " = None".to_string(),
+    }
+}
+
+fn literal(value: &Value) -> String {
+    match value {
+        Value::Null => "None".to_string(),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => python_string(text),
+        Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(literal).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Object(fields) => format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|(key, item)| format!("{}: {}", python_string(key), literal(item)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn python_string(text: &str) -> String {
+    Value::String(text.to_string()).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use metor_proto::types::ComponentId;
+    use serde_json::value::RawValue;
+
+    use super::*;
+    use crate::SystemKind;
+    use crate::system::SystemDef;
+
+    fn port(name: &'static str, record: &'static str) -> PortDef {
+        PortDef {
+            name: name.into(),
+            record: record.into(),
+            id: ComponentId::new(record),
+            max_len: 8,
+            alignment: 4,
+            depth: 8,
+            layout: 0,
+            schema: <crate::Bytes as crate::Record>::schema(),
+        }
+    }
+
+    fn system(
+        ty: &'static str,
+        inputs: Vec<PortDef>,
+        outputs: Vec<PortDef>,
+        params: Option<&'static str>,
+    ) -> PackSystemDef {
+        PackSystemDef {
+            ty: ty.into(),
+            kind: SystemKind::Cyclic,
+            takes_inputs: false,
+            takes_outputs: false,
+            def: SystemDef {
+                name: ty.into(),
+                inputs,
+                outputs,
+                grants: Vec::new(),
+            },
+            doc: "".into(),
+            params: params.map(|text| RawValue::from_string(text.into()).expect("json")),
+        }
+    }
+
+    fn rendered(systems: Vec<PackSystemDef>) -> Result<String, PackDevError> {
+        let reference = PackRef::dylib("test".into(), "test_pack".into(), "unused".into());
+        render(&reference, 1, &PackDef { systems })
+    }
+
+    #[test]
+    fn test_render_param_defaults() {
+        let schema = r##"{"type":"object","properties":{
+            "rate":{"type":"number","default":0.5,"description":"Loop rate, Hz.\n\nClamped to \"max\"."},
+            "count":{"type":"integer","default":3},
+            "armed":{"type":"boolean","default":false},
+            "mode":{"type":"string","default":"nadir"},
+            "gains":{"type":"array","items":{"type":"number"},"default":[1.0,2.0]},
+            "limits":{"$ref":"#/$defs/Limits"},
+            "slack":{"type":["number","null"]}},
+            "required":["limits"],
+            "$defs":{"Limits":{"description":"Bounds on the actuator.",
+                "type":"object","properties":{"max":{"type":"number","default":1.0,"description":"Upper bound."}}}}}"##;
+        let text = rendered(vec![system(
+            "ctrl",
+            vec![port("est", "est")],
+            vec![port("cmd", "motor_cmd"), port("log", "log")],
+            Some(schema),
+        )])
+        .expect("renders");
+
+        assert!(text.contains("from dataclasses import dataclass, field\n"));
+        assert!(text.contains("@dataclass(kw_only=True)\nclass Limits:\n    \"Bounds on the actuator.\"\n    max: float = 1.0\n    \"\"\"Upper bound.\"\"\"\n"));
+        assert!(
+            text.contains(") -> None:\n        \"\"\"\n        Args:\n            rate: Loop rate, Hz.\n                Clamped to \\\"max\\\".\n        \"\"\"\n        super()"),
+            "params with a description get an Args entry: {text}"
+        );
+        assert!(text.contains("armed: bool = False"));
+        assert!(text.contains("mode: str = \"nadir\""));
+        assert!(text.contains("gains: list[float] = [1.0, 2.0]"));
+        assert!(text.contains("count: int = 3"));
+        assert!(
+            text.contains("limits: Limits,"),
+            "a required param has no default: {text}"
+        );
+        assert!(text.contains("slack: float | None = None"));
+        assert!(text.contains("cmd: OutPort[MotorCmd]"));
+        assert!(
+            text.contains(
+                "_ports = {\"cmd\": MotorCmd, \"log\": LogEvent, \"status\": SystemStatus}"
+            )
+        );
+    }
+
+    #[test]
+    fn test_reject_param_input_collision() {
+        let clash = rendered(vec![system(
+            "nav",
+            vec![port("gain", "imu")],
+            vec![],
+            Some(r#"{"type":"object","properties":{"gain":{"type":"number"}}}"#),
+        )]);
+        let Err(PackDevError::NameClash { system, name }) = clash else {
+            panic!("the clash is reported")
+        };
+        assert_eq!((system.as_str(), name.as_str()), ("nav", "gain"));
+    }
+
+    #[test]
+    fn test_empty_system_includes_framework_records() {
+        let text = rendered(vec![system("mode", vec![], vec![], None)]).expect("renders");
+        assert!(!text.contains("dataclass"));
+        assert!(
+            text.contains("class LogEvent(Record):\n    _name = \"log\"\n    _kind = \"msg\"\n")
+        );
+        assert!(text.contains(
+            "class SystemStatus(Record):\n    _name = \"status\"\n    _kind = \"frame\"\n"
+        ));
+        assert!(
+            text.contains("    def __init__(self) -> None:\n        super().__init__({}, {})\n"),
+            "no params, no docstring: {text}"
+        );
+        assert!(text.contains("_ports = {\"log\": LogEvent, \"status\": SystemStatus}"));
+        assert!(text.contains("    log: OutPort[LogEvent]\n    status: OutPort[SystemStatus]\n"));
+    }
+
+    #[test]
+    fn test_abort_input_not_wired() {
+        let text = rendered(vec![system(
+            "arm",
+            vec![port("abort", "abort_request"), port("est", "est")],
+            vec![],
+            None,
+        )])
+        .expect("renders");
+        assert!(
+            text.contains("def __init__(self, *, est: Sources[Est] = ()) -> None:"),
+            "{text}"
+        );
+        assert!(!text.contains("AbortRequest"), "{text}");
+    }
+
+    fn capped(params: Option<&'static str>, caps: &[&'static str]) -> PackSystemDef {
+        let mut def = system(
+            "gps",
+            vec![port("est", "est"), port(IO_CQ, "io_cqe")],
+            vec![port("fix", "gps_fix"), port(IO_SQ, "io_sqe")],
+            params,
+        );
+        def.def.grants = caps
+            .iter()
+            .map(|name| GrantDef {
+                param: (*name).into(),
+                interface: "uart".into(),
+            })
+            .collect();
+        def
+    }
+
+    #[test]
+    fn test_caps_render_keywords_and_grants() {
+        let text = rendered(vec![capped(None, &["main", "aux"])]).expect("renders");
+        assert!(text.contains("Record, ResourceHandle, Sources"), "{text}");
+        assert!(
+            text.contains("    _caps = {\"main\": \"uart\", \"aux\": \"uart\"}\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("est: Sources[Est] = (), main: ResourceHandle, aux: ResourceHandle)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("grants={\"main\": main, \"aux\": aux})"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_io_ports_are_not_wired_or_exposed() {
+        let text = rendered(vec![capped(None, &["uart"])]).expect("renders");
+        assert!(!text.contains("io_cq"), "{text}");
+        assert!(!text.contains("io_sq"), "{text}");
+        assert!(!text.contains("IoSqe") && !text.contains("IoCqe"), "{text}");
+    }
+
+    #[test]
+    fn test_reject_cap_param_collision() {
+        let params = r#"{"type":"object","properties":{"uart":{"type":"number"}}}"#;
+        let clash = rendered(vec![capped(Some(params), &["uart"])]);
+        let Err(PackDevError::NameClash { name, .. }) = clash else {
+            panic!("the clash is reported")
+        };
+        assert_eq!(name, "uart");
+        let clash = rendered(vec![capped(None, &["est"])]);
+        assert!(matches!(clash, Err(PackDevError::NameClash { .. })));
+        let clash = rendered(vec![capped(None, &["grants"])]);
+        assert!(matches!(clash, Err(PackDevError::NameClash { .. })));
+    }
+}

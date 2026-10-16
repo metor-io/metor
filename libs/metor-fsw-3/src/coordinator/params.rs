@@ -44,6 +44,8 @@ pub enum ParamError {
     Thread { thread: String },
     #[error("`{channel}`: an async system takes no channel")]
     Channel { channel: String },
+    #[error("a slot is loaded through its channel, and has none")]
+    SlotChannel,
     #[error("thread `{thread}` is not running")]
     ThreadStart { thread: String },
     #[error("the constructor panicked: {0}")]

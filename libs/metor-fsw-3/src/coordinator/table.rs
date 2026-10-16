@@ -74,7 +74,6 @@ pub enum SystemKind {
 }
 
 pub(crate) struct TableEntry {
-    #[allow(dead_code)]
     pub kind: SystemKind,
     /// The ports the type always has, whatever the config says.
     pub def: SystemDef,
@@ -82,10 +81,8 @@ pub(crate) struct TableEntry {
     /// The doc comment on the type's `execute`.
     ///
     /// Empty for types registered through the `System` or `AsyncSystem` traits.
-    #[allow(dead_code)]
     pub doc: Cow<'static, str>,
     /// The JSON Schema of the type's params, or `None` if it takes no params.
-    #[allow(dead_code)]
     pub schema: Option<Box<RawValue>>,
     pub make: Arc<MakeFn>,
 }
@@ -210,20 +207,37 @@ impl SystemTable {
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, &TableEntry)> {
         self.entries.iter().map(|(ty, entry)| (ty.as_str(), entry))
     }
-}
 
-#[cfg(feature = "host")]
-impl SystemTable {
     /// Collects every record the table's ports use.
     ///
     /// This includes the `status` and channel ports the coordinator adds.
     pub(crate) fn records(&self) -> crate::def::Records {
         let status = status_port();
+        #[cfg(feature = "host")]
+        let channel = crate::channel::ports(&DefCx::empty());
+        #[cfg(not(feature = "host"))]
+        let channel: [PortDef; 0] = [];
         crate::def::Records::from_port_defs(
             core::iter::once(&status)
-                .chain(&crate::channel::ports(&DefCx::empty()))
+                .chain(&channel)
                 .chain(self.entries().flat_map(|(_, entry)| ports(&entry.def))),
         )
+    }
+}
+
+#[cfg(feature = "host")]
+impl SystemTable {
+    /// Inserts entries in order, stopping at the first conflict.
+    ///
+    /// Entries inserted before the conflict stay in the table.
+    pub(crate) fn insert_all(
+        &mut self,
+        entries: Vec<(String, TableEntry)>,
+    ) -> Result<(), BuildError> {
+        for (ty, entry) in entries {
+            self.insert(&ty, entry)?;
+        }
+        Ok(())
     }
 }
 
@@ -588,6 +602,82 @@ mod tests {
         assert_eq!(table.entries().count(), 0);
         assert!(record(&table, "unrelated").is_none());
         assert!(record(&table, "command").is_none());
+    }
+
+    #[test]
+    fn test_pack_stops_at_conflict() {
+        let mut table = SystemTable::new();
+        let original = message("command", MsgCodec::Json);
+        table
+            .insert("existing", declared(vec![original.clone()]))
+            .expect("first");
+        let pack = vec![
+            (
+                "new".into(),
+                declared(vec![message("new", MsgCodec::Bytes)]),
+            ),
+            (
+                "bad".into(),
+                declared(vec![message("command", MsgCodec::Bytes)]),
+            ),
+            (
+                "later".into(),
+                declared(vec![message("later", MsgCodec::Json)]),
+            ),
+        ];
+        assert!(matches!(
+            table.insert_all(pack),
+            Err(BuildError::RecordConflict { .. })
+        ));
+        assert!(table.get("new").is_some());
+        assert!(table.get("bad").is_none());
+        assert!(table.get("later").is_none());
+        assert_eq!(record(&table, "command"), Some(original.clone()));
+        assert!(record(&table, "new").is_some());
+    }
+
+    #[test]
+    fn test_pack_replacement_order() {
+        let mut table = SystemTable::new();
+        let pack = vec![
+            (
+                "same".into(),
+                declared(vec![message("first", MsgCodec::Json)]),
+            ),
+            (
+                "same".into(),
+                declared(vec![message("second", MsgCodec::Bytes)]),
+            ),
+        ];
+        table.insert_all(pack).expect("compatible replacement");
+        assert_eq!(table.entries().count(), 1);
+        assert!(record(&table, "first").is_none());
+        assert!(record(&table, "second").is_some());
+    }
+
+    #[test]
+    fn test_reject_conflicting_pack_replacement() {
+        let mut table = SystemTable::new();
+        let old = message("command", MsgCodec::Json);
+        for name in ["one", "two"] {
+            table
+                .insert(name, declared(vec![old.clone()]))
+                .expect("initial");
+        }
+        let new = message("command", MsgCodec::Bytes);
+        let pack = ["one", "two"]
+            .into_iter()
+            .map(|name| (name.to_string(), declared(vec![new.clone()])))
+            .collect();
+        assert!(matches!(
+            table.insert_all(pack),
+            Err(BuildError::RecordConflict { .. })
+        ));
+        assert_eq!(record(&table, "command"), Some(old.clone()));
+        assert_eq!(
+            table.entries().map(|(name, _)| name).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
     }
 
     #[test]
