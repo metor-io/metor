@@ -5,10 +5,12 @@ mod common;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use common::{Ping, fixture_lib};
+use metor_fsw_3::deploy::{self, DeployError};
+use metor_fsw_3::deploy::{CONFIG_VERSION, DeploymentConfig, TargetConfig};
 use metor_fsw_3::dl::store;
 use metor_fsw_3::dl::{cdylib_name, triple};
 use metor_fsw_3::metor_proto_wkt::{
@@ -400,4 +402,159 @@ fn pack_ref(libs: &Path) -> Value {
 /// path, hash, or ports yet.
 fn unresolved(name: &str, ty: &str, libs: &Path) -> Value {
     json!({ "name": name, "ty": ty, "source": { "pack": pack_ref(libs) } })
+}
+
+fn envelope(allow: Vec<Value>) -> DeploymentConfig {
+    DeploymentConfig {
+        config_version: CONFIG_VERSION,
+        hosts: Default::default(),
+        targets: vec![TargetConfig {
+            packs: Vec::new(),
+            coordinator: config(json!({ "allow": allow }), channel()),
+        }],
+    }
+}
+
+/// Returns a temp dir, plus paths for a libs dir and a store inside it.
+fn scratch() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (libs, store) = (dir.path().join("libs"), dir.path().join("store"));
+    (dir, libs, store)
+}
+
+fn resolve(envelope: &mut DeploymentConfig, store: &Path) -> Result<(), DeployError> {
+    deploy::resolve_slots(envelope, &[table(&Shared::default())], store)
+}
+
+fn slot(envelope: &DeploymentConfig) -> &Value {
+    &envelope.targets[0].coordinator.systems[2].params
+}
+
+#[test]
+fn test_build_resolves_into_store() {
+    let (_dir, libs, store) = scratch();
+    let seen = Shared::default();
+    let allow = vec![
+        unresolved("up", "count_up", &libs),
+        unresolved("down", "count_down", &libs),
+    ];
+    let mut envelope = envelope(allow);
+    assert!(deploy::unresolved(&envelope));
+    deploy::resolve_slots(&mut envelope, &[table(&seen)], &store).expect("resolves");
+    assert!(!deploy::unresolved(&envelope));
+
+    let params = slot(&envelope);
+    let hash = store::hash(fixture_lib()).expect("reads");
+    for candidate in params["allow"].as_array().expect("a list") {
+        assert!(candidate["source"].get("pack").is_none());
+        let stored = &candidate["source"]["stored"];
+        assert_eq!(stored["hash"], json!(hash.to_hex().as_str()));
+        let path = PathBuf::from(stored["path"].as_str().expect("a path"));
+        assert!(path.starts_with(&store), "{}", path.display());
+        assert!(stored["def"].is_object());
+    }
+
+    // Resolving again changes nothing.
+    let before = params.clone();
+    deploy::resolve_slots(&mut envelope, &[table(&seen)], &store).expect("resolves");
+    assert_eq!(*slot(&envelope), before);
+
+    let mut coordinator = envelope.targets[0]
+        .coordinator
+        .clone()
+        .build(&table(&seen))
+        .expect("the resolved slot builds");
+    send(&seen, &mut coordinator, [load("up")]);
+    send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
+    let events = run(&seen, &mut coordinator, 4);
+    assert_eq!(events, [SequenceEventKind::Completed]);
+}
+
+/// Returns the config for slot `next`, which reads slot `mode`'s output.
+fn next_slot(libs: &Path) -> SystemConfig {
+    SystemConfig {
+        params: json!({ "allow": [unresolved("down", "count_down", libs)] }),
+        adapter: Some(Adapter::Channel(ChannelConfig {
+            name: "next".into(),
+            start: RunState::Stopped,
+        })),
+        inputs: vec![InputConfig::new("input", "mode", "output")],
+        ..SystemConfig::new("next", "fsw.dl_slot")
+    }
+}
+
+/// A slot that reads another slot's output resolves against that slot's
+/// resolved ports.
+#[test]
+fn test_build_resolves_chained_slots() {
+    let (_dir, libs, store) = scratch();
+    let mut envelope = envelope(vec![unresolved("up", "count_up", &libs)]);
+    envelope.targets[0]
+        .coordinator
+        .systems
+        .push(next_slot(&libs));
+    resolve(&mut envelope, &store).expect("resolves");
+    assert!(!deploy::unresolved(&envelope));
+    let next = &envelope.targets[0].coordinator.systems[4].params;
+    assert!(next["allow"][0]["source"]["stored"]["def"].is_object());
+}
+
+/// A slot that reads from a slot later in step order is rejected.
+#[test]
+fn test_build_refuses_slot_reading_later_slot() {
+    let (_dir, libs, store) = scratch();
+    let mut envelope = envelope(vec![unresolved("up", "count_up", &libs)]);
+    let systems = &mut envelope.targets[0].coordinator.systems;
+    let mode = systems.iter().position(|s| s.id == "mode").expect("a slot");
+    systems.insert(mode, next_slot(&libs));
+    let Err(error) = resolve(&mut envelope, &store) else {
+        panic!("a slot reading a later slot resolved")
+    };
+    assert!(error.to_string().contains("mode"), "{error}");
+}
+
+#[test]
+fn test_build_refuses_disagreeing_candidates() {
+    let (_dir, libs, store) = scratch();
+    let mut gain = unresolved("gain", "gain", &libs);
+    gain["params"] = json!({ "gain": 2.0 });
+    let mut envelope = envelope(vec![unresolved("up", "count_up", &libs), gain]);
+    let result = resolve(&mut envelope, &store);
+    let Err(DeployError::SlotContract {
+        first, candidate, ..
+    }) = result
+    else {
+        panic!("gain's ports differ from count_up's: {result:?}")
+    };
+    assert_eq!((first.as_str(), candidate.as_str()), ("up", "gain"));
+}
+
+#[test]
+fn test_build_refuses_missing_pack() {
+    let (dir, libs, store) = scratch();
+    let mut missing = unresolved("up", "count_up", &libs);
+    missing["source"]["pack"]["libs"] = json!(dir.path().join("nowhere"));
+    let result = resolve(&mut envelope(vec![missing]), &store);
+    assert!(
+        matches!(result, Err(DeployError::Slot { .. })),
+        "{result:?}"
+    );
+    let bare = json!({ "name": "up", "ty": "count_up" });
+    let result = resolve(&mut envelope(vec![bare]), &store);
+    assert!(
+        matches!(result, Err(DeployError::Slot { .. })),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn test_build_refuses_long_library_name() {
+    let (_dir, libs, store) = scratch();
+    let mut long = unresolved("up", "count_up", &libs);
+    long["source"]["pack"]["lib"] = json!("l".repeat(64));
+    let result = resolve(&mut envelope(vec![long]), &store);
+    assert!(
+        matches!(result, Err(DeployError::ArtifactName { cap: 63, .. })),
+        "{result:?}"
+    );
 }

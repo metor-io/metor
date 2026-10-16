@@ -1,10 +1,14 @@
 //! The `metor` command line.
 //!
-//! It builds a pack's editable Python module.
+//! It builds a pack's editable Python module, resolves a deployment, and runs
+//! targets.
 
+pub mod build;
 pub mod cargo;
+pub mod children;
 pub mod module;
 pub mod pack_dev;
+pub mod run;
 
 use std::path::PathBuf;
 
@@ -26,6 +30,10 @@ pub enum Command {
     Pack(PackCommand),
     /// Prints the pack ABI version this binary supports.
     AbiVersion,
+    /// Evaluates a target file and runs its targets.
+    Run(run::Run),
+    /// Evaluates a target file and writes out the resolved deployment.
+    Build(build::Build),
 }
 
 #[derive(Subcommand)]
@@ -52,6 +60,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Pack(PackCommand::Dev { root }) => pack_dev::pack_dev(&root)?,
         Command::AbiVersion => println!("{ABI_VERSION}"),
+        Command::Run(args) => run::run(args)?,
+        Command::Build(args) => build::build(args)?,
     }
     Ok(())
 }
