@@ -4,6 +4,8 @@
 //! TCP and UDP to any client that connects, such as the panel.
 
 use core::cell::Cell;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,16 +14,34 @@ use metor_db::{DB, Server};
 use metor_fsw_3_ring::Notifier;
 use metor_proto::types::{PacketId, Timestamp, table_id};
 use metor_proto_wkt::VTableMsg;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use stellarator::net::TcpListener;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::coordinator::ParamError;
 use crate::log::Log;
 use crate::port::{DynInputs, Output};
 use crate::record::RecordSchema;
-use crate::{Frame, Stop, system};
+use crate::{Frame, Records, Stop, system};
 
-use super::DbParams;
-use super::transport::Endpoint;
+/// The configuration for a `Db`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DbParams {
+    /// The address the database serves clients on.
+    pub listen: String,
+    /// The directory the database is stored in. When unset, the database
+    /// uses a fresh directory under the system temp dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// The target's telemetry namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// The names of the message records that subscribers receive through
+    /// this database.
+    #[serde(default)]
+    pub commands: Vec<String>,
+}
 
 /// Ingest counters for a `Db`. It writes one on every cycle where a counter
 /// changed.
@@ -48,7 +68,7 @@ impl DbStatus {
 
 /// A link that stores every record wired into it in an embedded metor-db.
 pub struct Db {
-    endpoint: Option<Endpoint>,
+    listener: Option<TcpListener>,
     db: Arc<DB>,
     params: DbParams,
 }
@@ -59,18 +79,11 @@ impl Db {
     /// Both happen here so that a taken address or an unwritable path fails
     /// the build instead of the run.
     pub fn new(params: DbParams) -> Result<Self, ParamError> {
-        let endpoint = params.link.transport.bind()?;
-        if endpoint.listener().is_none() {
-            return Err(ParamError::Decode(
-                "a db listens; it takes no `connect`".into(),
-            ));
-        }
+        let listener = TcpListener::bind(params.listen.as_str())
+            .map_err(|e| ParamError::Decode(format!("binding `{}`: {e}", params.listen)))?;
+        let port = listener.local_addr().map_or(0, |addr| addr.port());
         let path = params.path.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!(
-                "metor-db-{}-{}",
-                params.link.link,
-                std::process::id()
-            ))
+            std::env::temp_dir().join(format!("metor-db-{}-{port}", std::process::id()))
         });
         let store = if path.exists() {
             DB::open(path.clone())
@@ -81,7 +94,7 @@ impl Db {
             ParamError::Decode(format!("opening the db at `{}`: {error}", path.display()))
         })?;
         Ok(Self {
-            endpoint: Some(endpoint),
+            listener: Some(listener),
             db: Arc::new(db),
             params,
         })
@@ -90,30 +103,34 @@ impl Db {
 
 /// Runs the `Db` link.
 ///
-/// Registers every input port's schema with the database, starts serving it,
-/// and then writes each record that arrives on an input into it.
+/// Resolves its command names against the host's records, registers every
+/// input port's schema with the database, starts serving it, and then writes
+/// each record that arrives on an input into it. An unknown command name is
+/// a fault, and the link stops.
 #[system]
 pub async fn db(
     #[state] s: &mut Db,
     inputs: &mut DynInputs<Notifier>,
     db_status: &mut Output<DbStatus>,
+    records: &Records,
     log: &mut Log,
     stop: Stop,
 ) {
-    // PANIC Safety: `new` always sets the endpoint, and a system runs once.
-    let endpoint = s.endpoint.take().expect("one run per instance");
+    let commands = match command_ids(records, &s.params.commands) {
+        Ok(ids) => ids,
+        Err(message) => return log.fault("unknown_command", message),
+    };
+    // PANIC Safety: `new` always sets the listener, and a system runs once.
+    let listener = s.listener.take().expect("one run per instance");
     let db = s.db.clone();
     let sinks = register(&db, inputs, log);
-    db.set_identity(
-        s.params.link.namespace.clone(),
-        s.params.command_ids.clone(),
-    );
-    let addr = endpoint.local_addr();
+    db.set_identity(s.params.namespace.clone(), commands);
+    let addr = listener.local_addr().ok();
     if let Some(addr) = addr {
         log.info(format!("serving {} on {addr}", db.path.display()));
     }
     let _udp = addr.map(|addr| stellarator::spawn(udp(addr, db.clone())).drop_guard());
-    let _serve = stellarator::spawn(serve(endpoint, db.clone(), stop.clone())).drop_guard();
+    let _serve = stellarator::spawn(serve(listener, db.clone(), stop.clone())).drop_guard();
     metor_db::lod::spawn(db.clone());
 
     let mut status = DbStatus::default();
@@ -150,16 +167,13 @@ struct Conn {
 
 /// Accepts every client and serves each on its own task.
 ///
-/// The listener's `max_connections` does not apply. Closed connections are
-/// pruned on each accept, and dropping this future closes every connection.
-async fn serve(endpoint: Endpoint, db: Arc<DB>, stop: Stop) {
-    let Some(listener) = endpoint.listener() else {
-        return;
-    };
+/// Closed connections are pruned on each accept, and dropping this future
+/// closes every connection.
+async fn serve(listener: TcpListener, db: Arc<DB>, stop: Stop) {
     let mut conns: Vec<Conn> = Vec::new();
     let accept = async {
         loop {
-            let Some(stream) = super::transport::accept(listener).await else {
+            let Some(stream) = super::transport::accept(&listener).await else {
                 continue;
             };
             conns.retain(|conn| conn.open.get());
@@ -179,10 +193,27 @@ async fn serve(endpoint: Endpoint, db: Arc<DB>, stop: Stop) {
 }
 
 /// Serves the database's UDP protocol on the same address as the listener.
-async fn udp(addr: std::net::SocketAddr, db: Arc<DB>) {
+async fn udp(addr: SocketAddr, db: Arc<DB>) {
     if let Err(error) = Server::handle_udp(addr, db).await {
         tracing::warn!(%error, "db udp ended");
     }
+}
+
+/// Returns the packet id of each message record named in `names`.
+///
+/// Each name resolves the way an output's `record` does, so the id is the
+/// one the record's port carries.
+fn command_ids(records: &Records, names: &[String]) -> Result<Vec<PacketId>, String> {
+    let id = |name: &String| match records.port_def("commands", name) {
+        Ok(def) => match def.schema {
+            RecordSchema::Msg { id, .. } => Ok(id),
+            RecordSchema::Frame { .. } => {
+                Err(format!("command `{name}` is a frame, not a message"))
+            }
+        },
+        Err(_) => Err(format!("command `{name}` names no record the host knows")),
+    };
+    names.iter().map(id).collect()
 }
 
 /// Where the records from one input port are stored.
@@ -275,14 +306,13 @@ mod tests {
     use core::time::Duration;
 
     use metor_fsw_3_ring::RingBuffer;
-    use metor_proto::types::IntoLenPacket;
-    use metor_proto_wkt::GetDbInfo;
+    use metor_proto::types::{IntoLenPacket, Msg, msg_id};
+    use metor_proto_wkt::{GetDbInfo, SequenceCommand};
     use stellarator::io::AsyncWrite;
     use stellarator::net::TcpStream;
 
     use crate::DefCx;
     use crate::async_system::stop_pair;
-    use crate::link::{LinkParams, Transport};
     use crate::port::Input;
     use crate::record::Record;
     use crate::system::{InputBinding, Ports};
@@ -412,17 +442,11 @@ mod tests {
         assert_eq!((status.records, status.refused), (1, 1));
     }
 
-    /// Binds a listening endpoint on a free port and returns it with its
-    /// address.
-    fn endpoint() -> (Endpoint, std::net::SocketAddr) {
-        let endpoint = Transport::Listen {
-            addr: "127.0.0.1:0".into(),
-            max_connections: 1,
-        }
-        .bind()
-        .expect("a free port");
-        let addr = endpoint.local_addr().expect("a listener binds");
-        (endpoint, addr)
+    /// Binds a listener on a free port and returns it with its address.
+    fn listener() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let addr = listener.local_addr().expect("a listener binds");
+        (listener, addr)
     }
 
     /// Reads one byte from the peer, or returns the error the socket closed
@@ -446,7 +470,7 @@ mod tests {
     }
 
     /// Connects a client and waits for the db to answer a `GetDbInfo`.
-    async fn served_client(addr: std::net::SocketAddr) -> TcpStream {
+    async fn served_client(addr: SocketAddr) -> TcpStream {
         let client = TcpStream::connect(addr).await.expect("the db accepts");
         let request = (&GetDbInfo).into_len_packet().inner;
         client
@@ -459,11 +483,11 @@ mod tests {
     }
 
     #[stellarator::test]
-    async fn test_serve_past_max_connections_until_dropped() {
+    async fn test_serve_every_client_until_dropped() {
         let (_dir, db) = store();
-        let (endpoint, addr) = endpoint();
+        let (listener, addr) = listener();
         let (_handle, stop) = stop_pair();
-        let served = stellarator::spawn(serve(endpoint, db, stop)).drop_guard();
+        let served = stellarator::spawn(serve(listener, db, stop)).drop_guard();
 
         let mut clients = Vec::new();
         for _ in 0..12 {
@@ -482,41 +506,67 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_connect_transport() {
-        let params = DbParams {
-            link: LinkParams {
-                transport: Transport::Connect {
-                    addr: "127.0.0.1:1".into(),
-                },
-                namespace: None,
-                link: "db".into(),
-            },
-            path: None,
-            command_ids: Vec::new(),
-        };
-        let Err(ParamError::Decode(message)) = Db::new(params) else {
-            panic!("a db does not dial")
-        };
-        assert!(message.contains("listens"), "{message}");
-    }
-
-    #[test]
     fn test_open_store_at_path() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let params = DbParams {
-            link: LinkParams {
-                transport: Transport::Listen {
-                    addr: "127.0.0.1:0".into(),
-                    max_connections: 1,
-                },
-                namespace: Some("gw".into()),
-                link: "db".into(),
-            },
+            listen: "127.0.0.1:0".into(),
             path: Some(dir.path().join("store")),
-            command_ids: vec![[1, 2]],
+            namespace: Some("gw".into()),
+            commands: Vec::new(),
         };
-        let db = Db::new(params).expect("a free port and a writable dir");
+        Db::new(params).expect("a free port and a writable dir");
         assert!(dir.path().join("store").is_dir());
-        assert_eq!(db.params.command_ids, vec![[1, 2]]);
+    }
+
+    #[test]
+    fn test_reject_an_unassignable_address() {
+        let params = DbParams {
+            listen: "203.0.113.1:9".into(),
+            path: None,
+            namespace: None,
+            commands: Vec::new(),
+        };
+        let Err(ParamError::Decode(message)) = Db::new(params) else {
+            panic!("an unassignable address is an error")
+        };
+        assert!(message.contains("203.0.113.1:9"), "{message}");
+    }
+
+    /// The records a host knows: `sequence_command`, whose id hashes its type
+    /// name, a `Fixed` message, and an `Imu` frame.
+    fn records() -> Records {
+        let cx = DefCx::empty();
+        Records::from_port_defs(
+            [
+                Input::<SequenceCommand>::def(&cx, "cmd"),
+                Input::<Fixed>::def(&cx, "fixed"),
+                Input::<Imu>::def(&cx, "imu"),
+            ]
+            .iter(),
+        )
+    }
+
+    #[test]
+    fn test_commands_resolve_to_record_ids() {
+        let names = [SequenceCommand::NAME, Fixed::NAME].map(String::from);
+        let ids = command_ids(&records(), &names).expect("known messages");
+        assert_eq!(
+            ids,
+            [<SequenceCommand as Msg>::ID, Fixed::schema().packet_id()]
+        );
+        assert_ne!(
+            ids[0],
+            msg_id(SequenceCommand::NAME),
+            "the id is the record's, not a hash of its name"
+        );
+        assert_eq!(command_ids(&records(), &[]), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn test_unknown_or_frame_command_is_an_error() {
+        let unknown = command_ids(&records(), &["nope".into()]).expect_err("unknown");
+        assert!(unknown.contains("`nope`"), "{unknown}");
+        let frame = command_ids(&records(), &[Imu::NAME.into()]).expect_err("a frame");
+        assert!(frame.contains("frame"), "{frame}");
     }
 }

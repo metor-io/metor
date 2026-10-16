@@ -15,12 +15,11 @@ mod slot;
 use std::collections::HashMap;
 use std::path::Path;
 
-use metor_proto::types::PacketId;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::coordinator::{OutputSource, SystemTable};
-use crate::link::{DB_TYPE, DbParams, LINK_TYPES, Transport};
-use crate::record::RecordSchema;
+use crate::link::{LINK_TYPES, Transport};
 
 pub use config::{
     CONFIG_VERSION, ConfigError, DeploySource, DeploySystem, DeploymentConfig, PeerLink, PeerPort,
@@ -67,28 +66,21 @@ pub struct Pending {
 /// peer reference or a slot candidate that points at a pack is left.
 ///
 /// `tables` holds one system table per target. Peer transports become
-/// addresses, and peer outputs become port definitions. Each database is also
-/// told which command messages its subscribers receive through it. An
-/// envelope with nothing to resolve is left unchanged.
+/// addresses, and peer outputs become port definitions. An envelope with
+/// nothing to resolve is left unchanged.
 pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Result<(), DeployError> {
     let mut links = Links::read(envelope)?;
     let plan = plan(envelope, tables, &links)?;
     check_ports(envelope, &links)?;
     for (index, addr) in plan.transports {
         // PANIC Safety: `plan` only names systems that `links` decoded.
-        let mut params = links.0.remove(&index).expect("a decoded link");
+        let mut params = links.links.remove(&index).expect("a decoded link");
         params.part.transport = DeployTransport::Runtime(Transport::Connect { addr });
         params.write(index.get_mut(envelope))?;
     }
     for ((index, output), def) in plan.outputs {
         let source = DeploySource::Runtime(OutputSource::Def(def));
         index.get_mut(envelope).outputs[output].source = source;
-    }
-    for (index, ids) in plan.commands {
-        let system = index.get_mut(envelope);
-        let mut params = Part::<DbParams>::read(system)?;
-        params.part.command_ids = ids;
-        params.write(system)?;
     }
     Ok(())
 }
@@ -109,29 +101,51 @@ struct LinkPart {
     transport: DeployTransport,
 }
 
-/// The params of every link in a deployment, decoded once.
-struct Links(HashMap<SystemIndex, Part<LinkPart>>);
+/// The params of every link in a deployment, and the address each system
+/// listens on, decoded once.
+struct Links {
+    links: HashMap<SystemIndex, Part<LinkPart>>,
+    listen: HashMap<SystemIndex, String>,
+}
 
 impl Links {
+    /// Decodes the params of every link in `envelope`.
+    ///
+    /// A link listens on its transport's `listen` address. Any other system
+    /// listens on its top-level `listen` param, if it has one.
+    fn read(envelope: &DeploymentConfig) -> Result<Self, DeployError> {
+        let (mut links, mut listen) = (HashMap::new(), HashMap::new());
+        for (index, system) in SystemIndex::iter(envelope) {
+            if LINK_TYPES.contains(&system.ty.as_str()) {
+                let params = Part::<LinkPart>::read(system)?;
+                if let DeployTransport::Runtime(Transport::Listen { addr, .. }) =
+                    &params.part.transport
+                {
+                    listen.insert(index, addr.clone());
+                }
+                links.insert(index, params);
+            } else if let Some(addr) = system.params.get("listen").and_then(Value::as_str) {
+                listen.insert(index, addr.to_string());
+            }
+        }
+        Ok(Self { links, listen })
+    }
+
     fn get(&self, index: SystemIndex) -> Option<&LinkPart> {
-        self.0.get(&index).map(|params| &params.part)
+        self.links.get(&index).map(|params| &params.part)
     }
 
     /// Whether any link dials a peer.
     fn dials_peer(&self) -> bool {
-        self.0
+        self.links
             .values()
             .any(|params| matches!(params.part.transport, DeployTransport::Peer(_)))
     }
 
-    /// The port the link at `index` listens on, unless it is zero or the
-    /// system is no listening link.
+    /// The port the system at `index` listens on, unless it is zero or the
+    /// system does not listen.
     fn fixed_port(&self, index: SystemIndex) -> Option<u16> {
-        let DeployTransport::Runtime(Transport::Listen { addr, .. }) = &self.get(index)?.transport
-        else {
-            return None;
-        };
-        let port: u16 = addr.rsplit_once(':')?.1.parse().ok()?;
+        let port: u16 = self.listen.get(&index)?.rsplit_once(':')?.1.parse().ok()?;
         (port != 0).then_some(port)
     }
 }
@@ -139,7 +153,6 @@ impl Links {
 struct Plan {
     transports: Vec<(SystemIndex, String)>,
     outputs: Vec<((SystemIndex, usize), crate::PortDef)>,
-    commands: Vec<(SystemIndex, Vec<PacketId>)>,
 }
 
 fn plan(
@@ -151,32 +164,23 @@ fn plan(
     let mut plan = Plan {
         transports: Vec::new(),
         outputs: Vec::new(),
-        commands: Vec::new(),
     };
-    let mut commands: HashMap<SystemIndex, Vec<PacketId>> = HashMap::new();
     for (index, system) in SystemIndex::iter(envelope) {
-        plan.add(envelope, &mut defs, links, index, &mut commands)
+        plan.add(envelope, &mut defs, links, index)
             .map_err(|e| e.at(system.location.as_ref()))?;
     }
-    let mut commands: Vec<_> = commands.into_iter().collect();
-    commands.sort_unstable_by_key(|(index, _)| *index);
-    for (_, ids) in &mut commands {
-        ids.sort_unstable();
-    }
-    plan.commands = commands;
     Ok(plan)
 }
 
 impl Plan {
     /// Plans the peer outputs and the peer transport of the system at
-    /// `index`, and adds its messages to `commands` when it dials a db.
+    /// `index`.
     fn add(
         &mut self,
         envelope: &DeploymentConfig,
         defs: &mut DefIndex<'_>,
         links: &Links,
         index: SystemIndex,
-        commands: &mut HashMap<SystemIndex, Vec<PacketId>>,
     ) -> Result<(), DeployError> {
         let system = index.get(envelope);
         for (output_index, output) in system.outputs.iter().enumerate() {
@@ -200,16 +204,6 @@ impl Plan {
             })?;
         self.transports
             .push((index, address(host(envelope, &peer.target), port)));
-        if peer_index.get(envelope).ty == DB_TYPE {
-            let ids = commands.entry(peer_index).or_default();
-            for port in &defs.def(index)?.outputs {
-                if let RecordSchema::Msg { id, .. } = &port.schema
-                    && !ids.contains(id)
-                {
-                    ids.push(*id);
-                }
-            }
-        }
         Ok(())
     }
 }

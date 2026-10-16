@@ -341,16 +341,10 @@
             "id": "db",
             "ty": "fsw.db",
             "params": {
-              "command_ids": [],
-              "link": "db",
+              "commands": [],
+              "listen": "127.0.0.1:2250",
               "namespace": "gw",
-              "path": null,
-              "transport": {
-                "listen": {
-                  "addr": "127.0.0.1:2250",
-                  "max_connections": 8
-                }
-              }
+              "path": null
             },
             "inputs": [
               {
