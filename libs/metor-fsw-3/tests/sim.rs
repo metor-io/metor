@@ -8,10 +8,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use metor_fsw_3::coordinator::{
-    CoordinatorConfig, EndReason, InputConfig, SystemConfig, SystemTable,
+    Adapter, ChannelConfig, CoordinatorConfig, EndReason, InputConfig, RunState, SystemConfig,
+    SystemTable,
 };
 use metor_fsw_3::io::{Cap, ResourceStatus, Uart};
-use metor_fsw_3::{Coordinator, Input, Timestamp, system};
+use metor_fsw_3::metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
+use metor_fsw_3::{ChannelState, ChannelStatus, Coordinator, Input, Output, Timestamp, system};
 
 use gps::{Gps, GpsState, UartScript, gps, uart_script};
 
@@ -34,10 +36,28 @@ fn statuses(
     seen.borrow_mut().extend(got);
 }
 
+#[system]
+fn states(#[state] seen: &mut Log<u32>, now: Timestamp, st: &mut Input<ChannelStatus>) {
+    let got = st.drain().flatten().map(|s| (now.0, s.state));
+    seen.borrow_mut().extend(got);
+}
+
 /// Counts the cycles it runs.
 #[system]
 fn ticks(#[state] n: &mut Rc<RefCell<u32>>) {
     *n.borrow_mut() += 1;
+}
+
+/// Sends the commands the test queues.
+#[system]
+fn cmds(
+    #[state] queue: &mut Rc<RefCell<Vec<SequenceCommandKind>>>,
+    commands: &mut Output<SequenceCommand>,
+) {
+    for command in queue.borrow_mut().drain(..) {
+        let channel = "gps".into();
+        let _ = commands.write(&SequenceCommand { channel, command });
+    }
 }
 
 /// A model that never writes and panics on its fifth cycle.
@@ -52,7 +72,9 @@ fn boom(#[state] n: &mut u32, uart: &Cap<Uart>) {
 struct Seen {
     fixes: Log<()>,
     statuses: Log<ResourceStatus>,
+    states: Log<u32>,
     ticks: Rc<RefCell<u32>>,
+    queue: Rc<RefCell<Vec<SequenceCommandKind>>>,
 }
 
 fn table(seen: &Seen) -> SystemTable {
@@ -68,8 +90,14 @@ fn table(seen: &Seen) -> SystemTable {
     table
         .register("statuses", statuses(), move || s.clone())
         .unwrap();
+    let s = seen.states.clone();
+    table
+        .register("states", states(), move || s.clone())
+        .unwrap();
     let s = seen.ticks.clone();
     table.register("ticks", ticks(), move || s.clone()).unwrap();
+    let s = seen.queue.clone();
+    table.register("cmds", cmds(), move || s.clone()).unwrap();
     table.register("boom", boom(), u32::default).unwrap();
     table
 }
@@ -136,6 +164,46 @@ fn model_before_io_submit_is_wired_like_a_driver() {
         let _c = run(&seen, probed(config.clone()), 6);
         assert_eq!(first_fix(&seen), Some(2));
     }
+}
+
+#[test]
+fn reset_cancels_a_read_parked_on_the_wire() {
+    let mut config = golden();
+    config.systems[2].params = serde_json::json!({ "script": [] });
+    let driver = &mut config.systems[0];
+    driver.adapter = Some(Adapter::Channel(ChannelConfig {
+        name: "gps".into(),
+        start: RunState::Running,
+    }));
+    driver
+        .inputs
+        .push(InputConfig::new("commands", "cmds", "commands"));
+    config.systems.insert(0, SystemConfig::new("cmds", "cmds"));
+    config.systems.push(SystemConfig {
+        inputs: vec![InputConfig::new("st", "gps", "channel_status")],
+        ..SystemConfig::new("states", "states")
+    });
+    let seen = Seen::default();
+    let mut c = run(&seen, config, 3);
+    seen.queue
+        .borrow_mut()
+        .extend([SequenceCommandKind::Stop, SequenceCommandKind::Reset]);
+    steps(&mut c, 4, 10);
+    let states = seen.states.borrow();
+    let quiescing = ChannelState::Quiescing as u32;
+    let waited: Vec<i64> = states
+        .iter()
+        .filter(|(_, s)| *s == quiescing)
+        .map(|(t, _)| *t)
+        .collect();
+    assert!(!waited.is_empty(), "the reset waits: {states:?}");
+    let after = states.iter().find(|(t, _)| *t > waited[0]).unwrap();
+    let stopped = (waited[0] + 1, ChannelState::Stopped as u32);
+    assert_eq!(*after, stopped, "remade the cycle after: {states:?}");
+    assert!(
+        c.systems()
+            .all(|(_, end)| end != Some(&EndReason::Panicked))
+    );
 }
 
 #[test]

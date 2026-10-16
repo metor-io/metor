@@ -241,6 +241,20 @@ fn a_cancel_on_the_device_end_completes_its_read() {
 }
 
 #[test]
+fn a_quiescing_model_with_a_parked_read_goes_idle_once_drained() {
+    let mut r = rig();
+    r.lower(1, read(0, SIM));
+    r.d.quiesce_member(1);
+    assert!(
+        r.replies().is_empty(),
+        "a quiescing member gets no completion"
+    );
+    assert!(!r.d.member_idle(1), "its queue may still hold ops");
+    r.d.member_drained(1);
+    assert!(r.d.member_idle(1));
+}
+
+#[test]
 fn each_io_step_takes_only_the_completions_it_posts() {
     let mut r = rig();
     r.lower(0, sqe(0, SIM, Op::Write { offset: None }, Span::new(0, 1)));
@@ -318,6 +332,21 @@ fn teardown_waits_only_for_ops_on_descriptors() {
 }
 
 #[test]
+fn closed_grant_is_stale_until_a_remake() {
+    let mut r = rig();
+    r.lower(0, sqe(0, TTY, Op::Close, Span::default()));
+    assert_eq!(r.replies(), [(0, Cqe::ok(Token::new(0, 7), 0))]);
+    assert!(r.routes().is_empty(), "the resource stays open");
+    r.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
+    assert_eq!(r.replies()[0].1.result(), Err(IoError::Stale));
+    r.d.quiesce_member(0);
+    r.d.member_drained(0);
+    r.d.end_queiscing_member(0);
+    r.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
+    assert_eq!(r.routes().len(), 1);
+}
+
+#[test]
 fn accepted_stream_is_a_derived_handle() {
     let mut r = rig();
     r.lower(0, sqe(0, TTY, Op::Accept, Span::default()));
@@ -374,6 +403,41 @@ fn cancel_goes_out_once() {
         [(0, Cqe::err(Token::new(1, 7), IoError::Canceled))],
         "a parked read completes at once"
     );
+}
+
+#[test]
+fn quiesce_cancels_drops_and_waits() {
+    let mut r = rig();
+    r.lower(0, read(0, TTY));
+    r.lower(0, sqe(1, TTY, Op::Accept, Span::default()));
+    let ids: Vec<OpId> = r
+        .routes()
+        .into_iter()
+        .map(|route| match route {
+            Route::Os(op) => op.id,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    r.d.quiesce_member(0);
+    assert_eq!(r.routes().len(), 2, "one cancel per op");
+    r.d.quiesce_member(0);
+    assert!(r.routes().is_empty(), "never twice");
+    r.lower(0, read(2, TTY));
+    assert!(
+        r.routes().is_empty() && r.replies().is_empty(),
+        "new ops are dropped"
+    );
+    assert!(!r.d.member_idle(0));
+    r.d.member_drained(0);
+    assert_eq!(r.done(ids[0], Err(IoError::Canceled)), None);
+    assert!(!r.d.member_idle(0));
+    assert_eq!(r.done(ids[1], Ok(Out::Opened(null(), Class::Stream))), None);
+    assert!(
+        matches!(r.routes()[..], [Route::Close(_)]),
+        "nothing will close it"
+    );
+    assert!(r.d.member_idle(0));
+    assert!(r.d.member_idle(1), "a member not quiescing is idle");
 }
 
 #[test]

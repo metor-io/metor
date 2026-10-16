@@ -456,3 +456,12 @@ pub fn ended_with<'a>(
         .map(|(id, _)| id)
         .collect()
 }
+
+/// `coordinator`'s systems that have ended, with why, in step order.
+#[cfg(feature = "host")]
+pub fn ended(coordinator: &crate::Coordinator) -> Vec<(&str, &crate::EndReason)> {
+    coordinator
+        .systems()
+        .filter_map(|(id, end)| Some((id, end?)))
+        .collect()
+}

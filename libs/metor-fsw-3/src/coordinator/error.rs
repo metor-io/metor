@@ -87,6 +87,15 @@ pub enum BuildError {
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
     ReservedPort { ty: String },
 
+    #[error("channel `{name}` is longer than {cap} bytes")]
+    ChannelName { name: String, cap: usize },
+
+    #[error("channel `{name}` is named by two systems")]
+    DuplicateChannel { name: String },
+
+    #[error("port `{id}.{port}` is reserved for the channel adapter")]
+    ReservedChannelPort { id: String, port: String },
+
     #[error("`{system}` has no grant for its `Cap` parameter `{param}`")]
     Ungranted { system: String, param: String },
 
@@ -95,6 +104,9 @@ pub enum BuildError {
 
     #[error("`{system}` grants `{param}`, which is not a `Cap` parameter")]
     UnknownGrant { system: String, param: String },
+
+    #[error("`{id}`: the io steps take no channel")]
+    IoAdapter { id: String },
 
     #[error("io steps: {message}")]
     IoSystems { message: String },
