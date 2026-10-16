@@ -126,7 +126,8 @@
 //!
 //! Setting `channel=` in a system's config wraps the system in the [`channel`]
 //! adapter. A channel lets an operator start, stop, reset, abort, or load the
-//! system by sending `SequenceCommand` messages.
+//! system by sending `SequenceCommand` messages. A [`dl`] slot is a place in the
+//! schedule whose system can be swapped for another pack system at run time.
 
 // The derives name this crate by its package name, in doctests as well as here.
 extern crate self as metor_fsw_3;
@@ -135,14 +136,19 @@ pub mod async_system;
 #[cfg(feature = "host")]
 pub mod builtins;
 pub mod channel;
+#[cfg(feature = "host")]
+pub mod cli;
 pub mod coordinator;
 pub mod def;
+#[cfg(feature = "host")]
+pub mod dl;
 pub mod fn_system;
 pub mod frame;
 pub mod io;
 pub mod log;
 #[cfg(all(feature = "threads", not(target_family = "wasm")))]
 mod mirror;
+pub mod pack;
 mod panic;
 pub mod port;
 pub mod record;
@@ -164,6 +170,8 @@ pub use coordinator::{
     SystemConfig, SystemKind, SystemStatus, SystemTable, WallRate,
 };
 pub use def::{DefCx, DefError, Records};
+#[cfg(feature = "host")]
+pub use dl::{DlPack, DlStep, Pack, PackError};
 pub use fn_system::{
     AsyncSystemFn, Ctor, Cycle, FnSignature, FnSystem, InSet, OutSet, Param, ParamNames, SystemFn,
 };
@@ -172,6 +180,8 @@ pub use io::{Buf, Cap, Handle, Io, IoInit, Pending, ResourceStatus, Slot};
 pub use log::{Log, LogLayer};
 pub use metor_fsw_3_macros::{Frame, Record, sequence, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
+pub use pack::def::{PackDef, PackSystemDef};
+pub use pack::{ABI_VERSION, Status};
 pub use port::{
     DynInputs, DynOutputs, Input, Latest, Output, RecvError, Sample, SendError, ring_capacity,
 };
