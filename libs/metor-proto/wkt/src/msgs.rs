@@ -902,17 +902,17 @@ pub struct LogEvent {
     pub level: LogLevel,
     /// Filter key: the emitting system's instance name for health-port lines,
     /// the tracing target for forwarded events.
-    pub source: String,
+    pub source: Cow<'static, str>,
     /// The tracing target (module path); empty for health-port lines.
-    pub target: String,
-    pub message: String,
+    pub target: Cow<'static, str>,
+    pub message: Cow<'static, str>,
     /// Active tracing span scope, root → leaf joined with `:` (e.g.
     /// `"run:load_slot"`). `None` for health-port lines.
-    pub span: Option<String>,
+    pub span: Option<Cow<'static, str>>,
     /// Event key-values beyond the message, Debug-formatted.
-    pub fields: Vec<(String, String)>,
+    pub fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     /// Source location of the emitting tracing event, when known.
-    pub file: Option<String>,
+    pub file: Option<Cow<'static, str>>,
     pub line: Option<u32>,
 }
 

@@ -1,4 +1,4 @@
-//! Derive macros for metor-fsw-3.
+//! Derive and attribute macros for metor-fsw-3.
 
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
@@ -8,6 +8,7 @@ use syn::Ident;
 
 mod frame;
 mod record;
+mod system_attr;
 
 /// Derives `Frame` for a struct sent as its raw bytes.
 ///
@@ -29,6 +30,48 @@ pub fn frame_derive(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(Record, attributes(record))]
 pub fn record_derive(input: TokenStream) -> TokenStream {
     record::record(input)
+}
+
+/// Turns a free fn into a system.
+///
+/// `#[system] fn nav(..)` becomes `fn nav() -> impl SystemFn`, which you
+/// register with a table. Each parameter is a port, named after the parameter.
+/// Mark one `&mut S` parameter `#[state]` to give the system state. Without
+/// one, the state is `()`. The value `nav()` returns derefs to a fn pointer to
+/// the original body, so tests can call it directly. The fn's doc comment
+/// becomes the system's documentation.
+///
+/// An `async fn` whose last parameter is `stop: Stop` becomes an async system
+/// instead. It has no fn pointer.
+///
+/// ```ignore
+/// #[system]
+/// fn nav(#[state] s: &mut NavState, now: Timestamp, est: &mut Output<Estimate>) { .. }
+///
+/// table.register("nav", nav(), NavState::new)?;
+/// ```
+#[proc_macro_attribute]
+pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    system_attr::system(item)
+}
+
+/// Turns an `async fn` into a sequence.
+///
+/// A sequence is an async fn that the runtime polls once per cycle until it
+/// returns. `#[sequence] async fn arm(..)` becomes `fn arm() -> impl SequenceFn`.
+/// Parameters are ports, as with `#[system]`. A `seq: &Seq` parameter gives the
+/// sequence the current time, waits, and aborts. The fn must return
+/// `Result<(), SeqError>`.
+///
+/// ```ignore
+/// #[sequence]
+/// async fn arm(seq: &Seq, cmd: &mut Output<Arm>) -> Result<(), SeqError> { .. }
+///
+/// table.register_sequence("arm", arm(), Default::default)?;
+/// ```
+#[proc_macro_attribute]
+pub fn sequence(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    system_attr::sequence(item)
 }
 
 /// Returns the path generated code uses to reach `metor-fsw-3`.
