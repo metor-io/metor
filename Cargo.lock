@@ -9597,6 +9597,7 @@ dependencies = [
  "metor-fsw-3-macros",
  "metor-fsw-3-ring",
  "metor-proto",
+ "metor-proto-stellar",
  "metor-proto-wkt",
  "minijinja",
  "polling",
