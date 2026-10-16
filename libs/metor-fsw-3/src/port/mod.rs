@@ -361,6 +361,9 @@ pub fn dyn_output_defs(
                 name: output.port.clone().into(),
                 ..def.clone()
             }),
+            OutputSource::Peer(_) => Err(DefError::Unresolved {
+                port: output.port.clone(),
+            }),
         })
         .collect()
 }

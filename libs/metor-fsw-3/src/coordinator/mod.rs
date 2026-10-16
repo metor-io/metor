@@ -19,10 +19,12 @@ mod table;
 #[cfg(all(test, feature = "host"))]
 mod tests;
 
+#[cfg(feature = "host")]
+pub(crate) use build::status_def;
 pub use config::{
     Adapter, BuildOptions, ChannelConfig, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH,
-    InputConfig, InvalidWallRate, OutputConfig, OutputSource, PortRef, RunState, SystemConfig,
-    WallRate,
+    InputConfig, InvalidWallRate, OutputConfig, OutputSource, PeerLink, PeerPort, PortRef,
+    RunState, SystemConfig, WallRate,
 };
 pub use error::BuildError;
 pub use params::{ParamError, Params};

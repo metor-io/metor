@@ -147,6 +147,8 @@ pub mod cli;
 pub mod coordinator;
 pub mod def;
 #[cfg(feature = "host")]
+pub mod deploy;
+#[cfg(feature = "host")]
 pub mod dl;
 pub mod fn_system;
 pub mod frame;
@@ -174,8 +176,8 @@ pub use channel::{Abort, AbortRequest, ChannelState, ChannelStatus};
 pub use coordinator::Coordinator;
 pub use coordinator::{
     Adapter, BuildError, ChannelConfig, Clock, CoordinatorConfig, EndReason, InputConfig,
-    LoadError, Occupant, OutputConfig, OutputSource, ParamError, Params, PortRef, RunState, Step,
-    SystemConfig, SystemKind, SystemStatus, SystemTable, WallRate,
+    LoadError, Occupant, OutputConfig, OutputSource, ParamError, Params, PeerLink, PeerPort,
+    PortRef, RunState, Step, SystemConfig, SystemKind, SystemStatus, SystemTable, WallRate,
 };
 pub use def::{DefCx, DefError, Records};
 #[cfg(feature = "host")]

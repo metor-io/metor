@@ -7,6 +7,7 @@ use core::time::Duration;
 use std::collections::BTreeMap;
 
 use metor_proto::types::Timestamp;
+use schemars::JsonSchema;
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -229,13 +230,30 @@ impl OutputConfig {
 
 /// Where a config-defined output gets its definition from.
 ///
-/// `Record` refers to a record registered in the system table. `Def` is a
-/// definition given in full.
+/// `Record` refers to a record registered in the system table. `Peer` points at a
+/// port on another target, which `metor build` replaces with `Def`, the
+/// resolved definition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputSource {
     Record(String),
+    Peer(PeerPort),
     Def(PortDef),
+}
+
+/// A port on a link of another target in the same deployment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PeerPort {
+    pub target: String,
+    pub link: String,
+    pub port: String,
+}
+
+/// A link on another target in the same deployment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PeerLink {
+    pub target: String,
+    pub link: String,
 }
 
 /// An input port and the outputs that feed it.
@@ -451,6 +469,13 @@ mod tests {
         let record: OutputConfig =
             serde_json::from_str(r#"{"port":"ping","record":"ping"}"#).expect("record form");
         assert_eq!(record, OutputConfig::with_record("ping", "ping"));
+        let peer: OutputConfig = serde_json::from_str(
+            r#"{"port":"est.est","peer":{"target":"a","link":"pub","port":"est.est"}}"#,
+        )
+        .expect("peer form");
+        assert!(matches!(peer.source, OutputSource::Peer(ref p) if p.link == "pub"));
+        let text = serde_json::to_string(&peer).expect("encodes");
+        assert!(text.starts_with(r#"{"port":"est.est","peer":{"#), "{text}");
         assert!(serde_json::from_str::<OutputConfig>(r#"{"port":"x"}"#).is_err());
     }
 }

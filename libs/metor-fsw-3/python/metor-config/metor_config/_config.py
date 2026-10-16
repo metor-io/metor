@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+CONFIG_VERSION = 2
+
 ABI_VERSION = 13
 """The host ABI version the built-in systems are compiled against.
 
@@ -12,6 +14,7 @@ A Rust test keeps this in sync with the host.
 """
 
 ABI_ENV = "METOR_FSW_ABI_VERSION"
+OUT_ENV = "METOR_CONFIG_OUT"
 
 NANOS_PER_SEC = 1_000_000_000
 

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use stellarator::net::{TcpListener, TcpStream};
 
 use crate::async_system::Stop;
-use crate::coordinator::ParamError;
+use crate::coordinator::{ParamError, PeerLink};
 
 use super::conn::Connections;
 
@@ -30,6 +30,9 @@ pub enum Transport {
     },
     /// Dial `addr` and keep a single connection open.
     Connect { addr: String },
+    /// Dial another link in the same deployment. `metor build` replaces this
+    /// with a `Connect` to that link's address.
+    Peer(PeerLink),
 }
 
 /// The default number of connections a listening link serves at once.
@@ -48,6 +51,7 @@ pub(crate) enum Endpoint {
 
 impl Transport {
     /// Binds the listener for `Listen`, or resolves the address for `Connect`.
+    /// A `Peer` that `metor build` has not resolved is an error.
     pub(crate) fn bind(&self) -> Result<Endpoint, ParamError> {
         match self {
             Self::Listen {
@@ -67,6 +71,10 @@ impl Transport {
             Self::Connect { addr } => Ok(Endpoint::Connect {
                 dialer: Dialer::new(resolve(addr)?),
             }),
+            Self::Peer(peer) => Err(ParamError::Decode(format!(
+                "peer link `{}` on target `{}` is not resolved; run `metor build`",
+                peer.link, peer.target
+            ))),
         }
     }
 }
@@ -205,6 +213,19 @@ mod tests {
         };
         assert_eq!(addr, "127.0.0.1:0");
         assert_eq!(max_connections, super::max_connections());
+    }
+
+    #[test]
+    fn test_peer_transport_is_unresolved() {
+        let parsed: Transport =
+            serde_json::from_str(r#"{"peer":{"target":"a","link":"pub"}}"#).expect("peer form");
+        let Err(ParamError::Decode(message)) = parsed.bind() else {
+            panic!("a peer transport does not bind")
+        };
+        assert!(
+            message.contains("`pub`") && message.contains("metor build"),
+            "{message}"
+        );
     }
 
     #[test]
