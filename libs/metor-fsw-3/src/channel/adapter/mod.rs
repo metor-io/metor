@@ -16,7 +16,7 @@ use crate::FrameStr;
 use crate::coordinator::{
     Adapter, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, Stepped, catch_step,
 };
-use crate::def::DefCx;
+use crate::def::{DefCx, Records};
 use crate::io::SharedIo;
 use crate::port::{Input, Output, ring_capacity};
 use crate::record::Record;
@@ -92,6 +92,7 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
         io: cx.io.clone(),
         seed: cx.seed,
         namespace: cx.namespace.to_string(),
+        records: cx.records.clone(),
     };
     let mut threads = Threads::default();
     let inner = recipe.make(&mut threads)?;
@@ -162,6 +163,7 @@ struct SystemRecipe {
     io: SharedIo,
     seed: Option<u64>,
     namespace: String,
+    records: Arc<Records>,
 }
 
 impl SystemRecipe {
@@ -181,6 +183,7 @@ impl SystemRecipe {
             io: &self.io,
             seed: self.seed,
             namespace: &self.namespace,
+            records: &self.records,
         })
     }
 }
