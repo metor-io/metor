@@ -558,16 +558,12 @@
             "id": "db",
             "ty": "fsw.db",
             "params": {
-              "transport": {
-                "listen": {
-                  "addr": "0.0.0.0:2250",
-                  "max_connections": 8
-                }
-              },
-              "namespace": "gw",
-              "link": "db",
+              "listen": "0.0.0.0:2250",
               "path": null,
-              "command_ids": []
+              "namespace": "gw",
+              "commands": [
+                "ping"
+              ]
             },
             "thread": "db",
             "inputs": [

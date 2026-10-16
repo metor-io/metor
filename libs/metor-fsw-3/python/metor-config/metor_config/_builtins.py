@@ -7,9 +7,9 @@ and `ChannelRegistry` support channels.
 These systems are built into the host rather than supplied by a pack, so
 their pack has no library and is left out of the config's pack list.
 
-The three link systems (`Publish`, `Subscribe`, and `Db`) each take exactly
-one transport: a `listen` address, a `connect` address, or a `peer` link in
-the same deployment, which `metor build` turns into an address.
+The link systems `Publish` and `Subscribe` each take exactly one transport:
+a `listen` address, a `connect` address, or a `peer` link in the same
+deployment, which `metor build` turns into an address. A `Db` only listens.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from ._model import (
     _json,
     _unique,
 )
-from ._target import SystemHandle, Target
+from ._target import SystemHandle, Target, _targets
 
 T = TypeVar("T", bound=Record)
 
@@ -167,6 +167,9 @@ class Db(Sink):
     to clients on `listen`. `path` is the database directory. When unset, a
     fresh temporary directory is used. With `all`, it records every system
     added before this one.
+
+    Its commands are the message records of every `Subscribe` whose `peer` is
+    this db. They are collected when the config is emitted.
     """
 
     _ty = "db"
@@ -179,7 +182,30 @@ class Db(Sink):
         items: Sequence[Item] = (),
         all: bool = False,
     ) -> None:
-        super().__init__({"path": path, "command_ids": []}, listen, None, None, None, items, all)
+        super().__init__({}, listen, None, None, None, items, all)
+        self._listen = listen
+        self._path = path
+
+    def _params_for(self, target: Any, index: int) -> Any:
+        return {
+            "listen": self._listen,
+            "path": self._path,
+            "namespace": target.namespace,
+            "commands": self._commands(),
+        }
+
+    def _commands(self) -> list[str]:
+        """Returns the message record names that subscribers of this db take."""
+        names: set[str] = set()
+        for target in _targets:
+            for _, system, _ in target._systems:
+                if not isinstance(system, Subscribe) or system._peer is None:
+                    continue
+                if system._peer._system is not self:
+                    continue
+                records = [copy.record for copy in system._peer_copies()] + system._records
+                names.update(record._name for record in records if record._kind == "msg")
+        return sorted(names)
 
 
 class Subscribe(Link):

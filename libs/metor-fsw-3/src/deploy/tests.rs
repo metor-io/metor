@@ -1,11 +1,10 @@
-use metor_proto_wkt::LogEvent;
 use serde_json::json;
 
 use super::*;
 use super::{CONFIG_VERSION, TargetConfig};
 use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig, PeerPort};
-use crate::link::{PUBLISH_TYPE, SUBSCRIBE_TYPE};
-use crate::record::Record;
+use crate::link::{DB_TYPE, PUBLISH_TYPE, SUBSCRIBE_TYPE};
+use crate::record::RecordSchema;
 use crate::tests::utils::{Emit, Recorder, Tap, emit, imu_source, table, tap};
 
 fn tables(count: usize) -> Vec<SystemTable> {
@@ -26,6 +25,11 @@ fn tables(count: usize) -> Vec<SystemTable> {
 
 fn listen(port: u16) -> serde_json::Value {
     json!({ "transport": { "listen": { "addr": format!("127.0.0.1:{port}"), "max_connections": 1 } } })
+}
+
+/// A db's params, listening on `port`.
+fn db_listen(port: u16) -> serde_json::Value {
+    json!({ "listen": format!("127.0.0.1:{port}") })
 }
 
 fn peer(target: &str, link: &str) -> serde_json::Value {
@@ -93,7 +97,7 @@ fn envelope() -> DeploymentConfig {
                 ..SystemConfig::new("mirror", SUBSCRIBE_TYPE)
             },
             SystemConfig {
-                params: listen(2250),
+                params: db_listen(2250),
                 ..SystemConfig::new("db", DB_TYPE)
             },
         ],
@@ -152,14 +156,6 @@ fn test_peer_transport_takes_host_address() {
     );
     let cmds = &placed.targets[0].coordinator.systems[3];
     assert_eq!(cmds.params["transport"]["connect"]["addr"], "[::1]:2250");
-}
-
-#[test]
-fn test_db_collects_subscriber_command_ids() {
-    let envelope = resolved();
-    let db = &envelope.targets[1].coordinator.systems[1];
-    let id = LogEvent::schema().packet_id();
-    assert_eq!(db.params["command_ids"], json!([id]));
 }
 
 #[test]
@@ -239,7 +235,7 @@ fn test_peer_must_listen_on_a_fixed_port() {
 #[test]
 fn test_two_listeners_on_one_host_port() {
     let mut envelope = envelope();
-    envelope.targets[1].coordinator.systems[1].params = listen(2240);
+    envelope.targets[1].coordinator.systems[1].params = db_listen(2240);
     assert_eq!(
         resolve(&mut envelope, &tables(2)),
         Err(DeployError::PortTaken {
@@ -331,7 +327,7 @@ fn test_resolve_keeps_other_params() {
         "127.0.0.1:2240"
     );
     assert_eq!(db.params["path"], "/db");
-    assert_eq!(db.params["transport"]["listen"]["max_connections"], 1);
+    assert_eq!(db.params["listen"], "127.0.0.1:2250");
 }
 
 #[test]

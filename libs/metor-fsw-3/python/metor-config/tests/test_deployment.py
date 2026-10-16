@@ -255,10 +255,33 @@ class DeploymentTest(ConfigTest):
         entry = gw.to_config()["coordinator"]["systems"][1]
         self.assertEqual(entry["ty"], "fsw.db")
         self.assertEqual(entry["thread"], "db")
-        self.assertEqual(entry["params"]["command_ids"], [])
-        self.assertIsNone(entry["params"]["path"])
+        self.assertEqual(
+            entry["params"],
+            {"listen": "0.0.0.0:2250", "path": None, "namespace": "gw", "commands": []},
+        )
         self.assertEqual([i["port"] for i in entry["inputs"]], ["plant.imu", "plant.log", "plant.status"])
         self.assertEqual(plant.imu.record, Imu)
+
+    def test_db_collects_subscriber_commands(self) -> None:
+        a = Target(cycle_rate=100.0, namespace="a")
+        plant = a.add("plant", Plant())
+        a_pub = a.add("pub", Publish([plant], listen="0.0.0.0:2240"))
+        b = Target(cycle_rate=100.0, namespace="b")
+        b.add("cmds", Subscribe(records=[Ping], listen="0.0.0.0:2260"))
+        gw, db = gateway("gw", peers=[a_pub], listen="0.0.0.0:2250")
+        a.add("cmds", Subscribe(peer=db, records=[Ping, LogEvent]))
+        b.add("pings", Subscribe(peer=db, records=[Ping]))
+        gw.add("local", Subscribe(peer=db, records=[LogEvent]))
+        config = Deployment(targets=[a, b, gw]).to_config()
+        db_entry = config["targets"][2]["coordinator"]["systems"][1]
+        self.assertEqual(db_entry["params"]["commands"], sorted([LogEvent._name, Ping._name]))
+
+    def test_db_without_subscribers_has_no_commands(self) -> None:
+        a = Target(cycle_rate=100.0, namespace="a")
+        a.add("cmds", Subscribe(records=[Ping], listen="0.0.0.0:2260"))
+        gw, _ = gateway("gw", peers=[], listen="0.0.0.0:2250")
+        config = Deployment(targets=[a, gw]).to_config()
+        self.assertEqual(config["targets"][1]["coordinator"]["systems"][0]["params"]["commands"], [])
 
     def test_gateway_composes_subscribes_and_db(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")

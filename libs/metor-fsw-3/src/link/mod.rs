@@ -17,9 +17,7 @@ mod subscribe;
 mod transport;
 mod wire;
 
-use std::path::PathBuf;
-
-use metor_proto::types::{PacketId, Timestamp};
+use metor_proto::types::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -30,7 +28,7 @@ use crate::log::Log;
 use crate::port::Output;
 
 #[cfg(feature = "db")]
-pub use db::{Db, DbStatus};
+pub use db::{Db, DbParams, DbStatus};
 pub use publish::{Publish, PublishParams};
 pub use subscribe::{Subscribe, SubscribeParams};
 pub use transport::Transport;
@@ -42,7 +40,7 @@ pub const SUBSCRIBE_TYPE: &str = "fsw.subscribe";
 /// The system type name for a gateway's embedded database.
 pub const DB_TYPE: &str = "fsw.db";
 /// Every link system type. Each one's params include [`LinkParams`].
-pub const LINK_TYPES: [&str; 3] = [PUBLISH_TYPE, SUBSCRIBE_TYPE, DB_TYPE];
+pub const LINK_TYPES: [&str; 2] = [PUBLISH_TYPE, SUBSCRIBE_TYPE];
 
 /// The configuration shared by every link.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -54,21 +52,6 @@ pub struct LinkParams {
     /// The link's name, unique within its target.
     #[serde(default)]
     pub link: String,
-}
-
-/// The configuration for a `Db`.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct DbParams {
-    #[serde(flatten)]
-    pub link: LinkParams,
-    /// The directory the database is stored in. When unset, the database
-    /// uses a fresh directory under the system temp dir.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-    /// The ids of messages that subscribers receive through this database.
-    /// `metor build` fills this in.
-    #[serde(default)]
-    pub command_ids: Vec<PacketId>,
 }
 
 /// The default number of bytes a link queues for one connection. A batch that
