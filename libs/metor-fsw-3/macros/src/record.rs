@@ -37,7 +37,10 @@ pub fn record(input: TokenStream) -> TokenStream {
         Ok(raw) => raw,
         Err(e) => return e.write_errors().into(),
     };
-    let fsw = crate::fsw_crate();
+    let fsw = match crate::fsw_crate() {
+        Ok(fsw) => fsw,
+        Err(e) => return e.to_compile_error().into(),
+    };
     let name = raw
         .name
         .unwrap_or_else(|| raw.ident.to_string().to_case(Case::Snake));

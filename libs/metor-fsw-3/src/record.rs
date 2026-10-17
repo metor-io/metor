@@ -34,11 +34,6 @@ pub trait Record {
     /// A ring holds `DEPTH * ring_depth` records.
     const DEPTH: usize = 1;
     /// Returns the record's timestamp, if it has one.
-    ///
-    /// When several producers feed one input, [`Input::latest`] uses the
-    /// timestamp to pick the newest record. Without one, producer order decides.
-    ///
-    /// [`Input::latest`]: crate::Input::latest
     fn timestamp(&self) -> Option<Timestamp> {
         None
     }
@@ -195,7 +190,9 @@ impl RecordSchema {
     /// returns 0.
     pub fn layout(&self) -> u64 {
         match self {
-            Self::Frame { vtable, .. } => fnv1a(&vtable_bytes(vtable)),
+            Self::Frame { vtable, .. } => {
+                const_fnv1a_hash::fnv1a_hash_64(&vtable_bytes(vtable), None)
+            }
             Self::Msg { .. } => 0,
         }
     }
@@ -203,21 +200,13 @@ impl RecordSchema {
     /// Returns whether two ports carry the same record.
     ///
     /// Messages must match exactly. A frame's vtable depends on its port's
-    /// path, so any two frames match here. Use
-    /// [`PortDef::layout`](crate::PortDef::layout) to tell frames apart.
+    /// path, so any two frames match here.
     pub fn same_record(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Msg { .. }, Self::Msg { .. }) => self == other,
             _ => core::mem::discriminant(self) == core::mem::discriminant(other),
         }
     }
-}
-
-/// Hashes `bytes` with FNV-1a.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
 }
 
 /// Frames are compared by their encoded vtables, which is what the ground sees.
@@ -302,10 +291,10 @@ pub mod postcard {
         let max = buf.len();
         match ::postcard::to_slice(value, buf) {
             Ok(used) => Ok(used),
-            Err(::postcard::Error::SerializeBufferFull) => Err(EncodeError::Oversize {
-                len: ::postcard::experimental::serialized_size(value).unwrap_or(usize::MAX),
-                max,
-            }),
+            Err(::postcard::Error::SerializeBufferFull) => {
+                Err(::postcard::experimental::serialized_size(value)
+                    .map_or(EncodeError::Codec, |len| EncodeError::Oversize { len, max }))
+            }
             Err(_) => Err(EncodeError::Codec),
         }
     }

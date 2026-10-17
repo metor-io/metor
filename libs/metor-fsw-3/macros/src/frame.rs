@@ -34,7 +34,10 @@ pub fn frame(input: TokenStream) -> TokenStream {
     // shape before this point.
     let fields = raw.data.take_struct().expect("named struct").fields;
 
-    let fsw = crate::fsw_crate();
+    let fsw = match crate::fsw_crate() {
+        Ok(fsw) => fsw,
+        Err(e) => return e.to_compile_error().into(),
+    };
     let proto = quote! { #fsw::metor_proto };
     let frame_name = raw
         .name

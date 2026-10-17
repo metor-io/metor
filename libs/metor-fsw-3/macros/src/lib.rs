@@ -33,17 +33,17 @@ pub fn record_derive(input: TokenStream) -> TokenStream {
 
 /// Returns the path generated code uses to reach `metor-fsw-3`.
 ///
-/// # Panics
-/// Panics if the calling crate does not list `metor-fsw-3` in `[dependencies]`.
-pub(crate) fn fsw_crate() -> proc_macro2::TokenStream {
+/// Fails if the calling crate does not list `metor-fsw-3` in `[dependencies]`.
+pub(crate) fn fsw_crate() -> syn::Result<proc_macro2::TokenStream> {
     match crate_name("metor-fsw-3") {
-        Ok(FoundCrate::Itself) => quote!(::metor_fsw_3),
+        Ok(FoundCrate::Itself) => Ok(quote!(::metor_fsw_3)),
         Ok(FoundCrate::Name(name)) => {
             let ident = Ident::new(&name, Span::call_site());
-            quote!( #ident )
+            Ok(quote!( #ident ))
         }
-        // PANIC Safety: expansion has no crate to name; a compile error here
-        // would point at the derive rather than the missing dependency.
-        Err(_) => panic!("metor-fsw-3 macros require `metor-fsw-3` in [dependencies]"),
+        Err(_) => Err(syn::Error::new(
+            Span::call_site(),
+            "metor-fsw-3 macros require `metor-fsw-3` in [dependencies]",
+        )),
     }
 }

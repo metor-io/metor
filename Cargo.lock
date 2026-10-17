@@ -9574,6 +9574,7 @@ dependencies = [
 name = "metor-fsw-3"
 version = "0.14.2"
 dependencies = [
+ "const-fnv1a-hash",
  "metor-component",
  "metor-fsw-3-macros",
  "metor-proto",
