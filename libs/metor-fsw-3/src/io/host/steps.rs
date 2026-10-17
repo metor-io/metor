@@ -34,7 +34,7 @@ use crate::io::arena::Arena;
 use crate::io::status::ResourceStatus;
 use crate::io::{Cqe, IoState, MAX_OPS, SharedIo, Sqe};
 use crate::log::LogPort;
-use crate::port::{Input, Output, dyn_input_defs, dyn_output_defs};
+use crate::port::{Input, Output};
 use crate::system::SystemDef;
 
 pub const IO_TYPE: &str = "fsw.io";
@@ -74,10 +74,10 @@ fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         Output::<LogEvent>::def(cx, LOG_PORT),
         Output::<ResourceStatus>::def(cx, IO_STATUS_PORT),
     ];
-    outputs.extend(dyn_output_defs(cx, &fixed)?);
+    outputs.extend(cx.dyn_output_defs(&fixed)?);
     Ok(SystemDef {
         name: "io".into(),
-        inputs: dyn_input_defs(cx, &[])?,
+        inputs: cx.dyn_input_defs(&[])?,
         outputs,
         grants: Vec::new(),
     })
