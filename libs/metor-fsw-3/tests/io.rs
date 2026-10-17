@@ -294,7 +294,7 @@ mod gps_on_a_pty {
     use metor_fsw_3::coordinator::{
         CoordinatorConfig, EndReason, InputConfig, SystemConfig, SystemTable,
     };
-    use metor_fsw_3::io::{Backing, IO_TYPE, RealKind, ResourceConfig};
+    use metor_fsw_3::io::{Backing, Baud, IO_TYPE, RealKind};
     use metor_fsw_3::metor_proto_wkt::LogEvent;
     use metor_fsw_3::{Coordinator, Input, Timestamp, system};
     use std::cell::RefCell;
@@ -328,13 +328,15 @@ mod gps_on_a_pty {
             .register_sequence("until_fix", until_fix(), UntilFix::new)
             .unwrap();
         let config = CoordinatorConfig {
-            resources: vec![ResourceConfig {
-                id: "gps1".into(),
-                backing: Backing::Real(RealKind::Tty {
+            resources: [(
+                "gps1".to_string(),
+                Backing::Real(RealKind::Tty {
                     path: path.into(),
-                    baud: 9600,
+                    baud: Baud::B9600,
                 }),
-            }],
+            )]
+            .into_iter()
+            .collect(),
             systems: vec![
                 SystemConfig {
                     grants: [("uart".into(), "gps1".into())].into(),

@@ -172,7 +172,7 @@ pub(crate) fn entry<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
             // list per declared input.
             let abort = Input::new(views.next().expect("the abort binding").views);
             let (ins, outs, io) = crate::fn_system::bind::<S>(views.collect(), writers, instance)?;
-            let state = crate::fn_system::make_state(&ctor, cx.id, cx.params, io.as_ref())?;
+            let state = ctor.make_with_io(cx.id, cx.params, io.as_ref())?;
             Ok(Box::new(SequenceStep::new::<S>(state, abort, ins, outs)))
         }),
     })
