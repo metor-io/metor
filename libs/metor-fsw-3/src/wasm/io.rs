@@ -50,7 +50,7 @@ impl IoCopy {
     pub(super) fn completions(&mut self) -> Result<(), Corrupt> {
         for cqe in self.cq.drain() {
             let cqe = cqe.map_err(|_| Corrupt)?;
-            let read = self.reads.get_mut(usize::from(cqe.token.slot()));
+            let read = self.reads.get_mut(usize::from(cqe.token.index()));
             let Some((_, span)) = read.and_then(|r| r.take_if(|(t, _)| *t == cqe.token)) else {
                 continue;
             };
@@ -69,7 +69,7 @@ impl IoCopy {
             let sqe = sqe.map_err(|_| Corrupt)?;
             let Ok(op) = sqe.op() else { continue };
             if op.fills()
-                && let Some(read) = self.reads.get_mut(usize::from(sqe.token.slot()))
+                && let Some(read) = self.reads.get_mut(usize::from(sqe.token.index()))
             {
                 *read = Some((sqe.token, sqe.buf));
             }
