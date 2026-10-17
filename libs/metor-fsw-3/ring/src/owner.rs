@@ -26,6 +26,8 @@ pub struct RawOwner {
 pub struct Lease(RawOwner);
 
 impl Lease {
+    /// Takes one reference on `owner`.
+    ///
     /// # Safety
     /// `owner` meets `RawOwner`'s contract and is live for this call.
     pub unsafe fn acquire(owner: RawOwner) -> Self {

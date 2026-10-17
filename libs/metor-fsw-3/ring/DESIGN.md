@@ -51,10 +51,10 @@ publication when identifying the newest record.
 
 ## Borrowed records
 
-A view's cursor pins borrowed bytes. An ordinary read grant releases through the
-record's end when dropped. A latest-read grant releases to the record's start,
-so repeated latest reads can serve the same record. The view's exclusive borrow
-keeps either cursor from moving while the slice is live.
+A view's cursor pins borrowed bytes. A read grant moves the cursor to the
+record's end when dropped. `try_latest` leaves the cursor at the newest record's
+start, so repeated calls return the same record until a newer one arrives. The
+view's exclusive borrow keeps the cursor from moving while the slice is live.
 
 A drain can yield several slices that outlive the iterator. It keeps the shared
 cursor pinned and records progress locally. The next mutable operation on the
@@ -76,8 +76,7 @@ read loop to one lap of records.
 ## Ownership and reclamation
 
 The writer claim is a CAS on a shared owner tag. Dropping the writer releases
-that claim. `Writer` is `!Sync`, so writes never overlap; that, not `&mut`,
-keeps one writer. Dropping a view clears its owner tag before freeing its cursor.
+that claim. Dropping a view clears its owner tag before freeing its cursor.
 Reclamation is unsafe: the caller must establish that the owner has stopped,
 all its handles are unusable, and its tag has not been reused. A reclaimer uses
 an owner CAS before releasing a slot so competing reclaimers cannot free a new
@@ -99,5 +98,4 @@ reader claims. Exporting caller-owned raw storage does not extend its lifetime.
 ## Verification limits
 
 [VERIFY.md](VERIFY.md) describes the Miri, Kani, and Loom checks and their bounds.
-None establishes every possible execution. Payload lengths occupy the low 32 bits of the header word; the
-writer rejects lengths above `u32::MAX` before computing a frame size.
+None establishes every possible execution.

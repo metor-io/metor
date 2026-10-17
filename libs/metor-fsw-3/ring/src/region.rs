@@ -7,7 +7,7 @@ use core::ptr;
 
 use crate::backing::Backing;
 use crate::sync::AtomicU64;
-use crate::{AttachError, Config, PAYLOAD_ALIGNMENT};
+use crate::{AttachError, Config, InvalidConfig, PAYLOAD_ALIGNMENT, WriteError};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub(super) const MAGIC: u32 = u32::from_ne_bytes(*b"MFR1");
@@ -112,9 +112,11 @@ const _: () = {
 // words without padding.
 const _: () = assert!(SLOTS_OFFSET.is_multiple_of(align_of::<SlotLine>()));
 
-/// Returns a pointer to the region at `base` with `max_readers` reader slots.
-pub(super) fn region_ptr(base: *mut u8, max_readers: u32) -> *mut Region {
-    ptr::slice_from_raw_parts_mut(base, max_readers as usize) as *mut Region
+impl Region {
+    /// Returns a pointer to the region at `base` with `max_readers` reader slots.
+    pub(super) fn ptr_at(base: *mut u8, max_readers: u32) -> *mut Self {
+        ptr::slice_from_raw_parts_mut(base, max_readers as usize) as *mut Self
+    }
 }
 
 /// The cursor value of a free slot.
@@ -132,11 +134,13 @@ pub(super) const fn arch_tag() -> u64 {
     (0x0102_0304u32 as u64) << 32
 }
 
+/// Writes a fresh header, control words, and free reader table into `backing`.
+///
 /// # Safety
 /// The backing is aligned, writable only through this call, and large enough for
 /// a valid `geometry`. No other handle may observe initialization.
 pub(super) unsafe fn init_region(backing: &Backing, geometry: &Geometry) {
-    let region = region_ptr(backing.base, geometry.max_readers);
+    let region = Region::ptr_at(backing.base, geometry.max_readers);
     // SAFETY: checked geometry fits the exclusive, aligned backing.
     unsafe {
         (&raw mut (*region).header).write(CacheLine::new(RegionHeader {
@@ -176,47 +180,55 @@ pub(super) struct Geometry {
     pub(super) max_readers: u32,
 }
 
-impl Geometry {
-    /// Returns the compact layout for `cfg`.
-    ///
-    /// # Panics
-    /// Panics if `cfg` cannot form a valid region.
-    pub(super) fn from_config(cfg: &Config) -> Self {
-        // PANIC Safety: callers of this infallible API must provide a valid config.
-        Self::checked_from_config(cfg)
-            .expect("ring capacity and reader table must form a valid, representable region")
-    }
+impl TryFrom<Config> for Geometry {
+    type Error = InvalidConfig;
 
-    /// Returns the compact layout for `cfg`, or `None` if it cannot form a valid region.
-    pub(super) fn checked_from_config(cfg: &Config) -> Option<Self> {
-        if !cfg.capacity.is_power_of_two()
-            || cfg.capacity < RECORD_HEADER_SIZE
-            || cfg.max_readers == 0
-            || u32::try_from(cfg.max_readers).is_err()
+    /// Returns the compact layout for `cfg`.
+    fn try_from(cfg: Config) -> Result<Self, InvalidConfig> {
+        let max_readers = u32::try_from(cfg.max_readers).map_err(|_| InvalidConfig)?;
+        if !cfg.capacity.is_power_of_two() || cfg.capacity < RECORD_HEADER_SIZE || max_readers == 0
         {
-            return None;
+            return Err(InvalidConfig);
         }
         let data_offset = cfg
             .max_readers
-            .checked_mul(size_of::<SlotLine>())?
-            .checked_add(SLOTS_OFFSET)?;
-        let total = data_offset.checked_add(cfg.capacity)?;
-        if total > isize::MAX as usize {
-            return None;
-        }
-        Some(Self {
+            .checked_mul(size_of::<SlotLine>())
+            .and_then(|len| len.checked_add(SLOTS_OFFSET))
+            .ok_or(InvalidConfig)?;
+        let total_size = data_offset
+            .checked_add(cfg.capacity)
+            .filter(|&total| total <= isize::MAX as usize)
+            .ok_or(InvalidConfig)?;
+        Ok(Self {
+            total_size,
             capacity: cfg.capacity as u64,
             data_offset,
-            max_readers: cfg.max_readers as u32,
-            total_size: total,
+            max_readers,
         })
-    }
-
-    pub(super) fn mask(&self) -> u64 {
-        self.capacity - 1
     }
 }
 
+impl Geometry {
+    pub(super) fn mask(&self) -> u64 {
+        self.capacity - 1
+    }
+
+    /// Returns the bytes a `payload_len`-byte record takes up in this ring.
+    ///
+    /// Returns [`WriteError::InsufficientCapacity`] if the record can never fit
+    /// or its length does not fit the header's 32 bits.
+    pub(super) fn frame_len(&self, payload_len: usize) -> Result<u64, WriteError> {
+        if payload_len > u32::MAX as usize
+            || !crate::payload_in_bounds(payload_len as u64, 0, self.capacity)
+        {
+            return Err(WriteError::InsufficientCapacity);
+        }
+        Ok(crate::frame_len(payload_len) as u64)
+    }
+}
+
+/// Reads and validates the header at `base`, returning the region's geometry.
+///
 /// # Safety
 /// `base` points to one readable allocation of `region_len` bytes. The header
 /// bytes are initialized and do not change during the call.

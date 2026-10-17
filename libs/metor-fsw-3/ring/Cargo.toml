@@ -11,15 +11,9 @@ authors = ["sascha@metor.io"]
 [lints]
 workspace = true
 
-# Both default-on. A target without a filesystem, such as
-# `wasm32-unknown-unknown`, drops `mmap`, since `memmap2` has no mapping to
-# offer there. Neither feature touches the region format or the reader
-# protocol, so a ring created with one set is readable with the other.
 [features]
 default = ["mmap", "notify"]
-# File-backed regions: `RingBuffer::create_mmap` / `attach_mmap`.
 mmap = ["dep:memmap2"]
-# `Notifier`, the in-process wake endpoint. `NoWake` needs nothing.
 notify = ["dep:maitake-sync"]
 
 [dependencies]

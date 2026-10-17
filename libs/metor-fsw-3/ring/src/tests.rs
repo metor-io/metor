@@ -24,10 +24,9 @@ fn words(len: usize) -> Vec<Word> {
 
 #[test]
 fn test_alignment_rounding_boundary() {
-    assert_eq!(round_up_16(0), 0);
-    assert_eq!(round_up_16(1), 16);
-    assert_eq!(round_up_16(16), 16);
-    assert_eq!(round_up_16(usize::MAX - 15), usize::MAX - 15);
+    assert_eq!(frame_len(0), 16);
+    assert_eq!(frame_len(1), 32);
+    assert_eq!(frame_len(16), 32);
     assert_eq!(frame_len(usize::MAX - 31), usize::MAX - 15);
 }
 
@@ -557,10 +556,11 @@ fn test_reader_skips_wrap_gap() {
 #[test]
 fn test_attach_rejects_bad_regions() {
     use AttachError::*;
-    let full = checked_region_len(&Config {
+    let full = Config {
         capacity: 64,
         max_readers: 2,
-    })
+    }
+    .region_len()
     .unwrap();
     type Case = (fn(&mut RegionHeader), usize, usize, AttachError);
     let keep: fn(&mut RegionHeader) = |_| {};
@@ -782,7 +782,7 @@ fn test_create_raw_formats_region() {
         capacity: 1024,
         max_readers: 4,
     };
-    let len = checked_region_len(&cfg).unwrap();
+    let len = cfg.region_len().unwrap();
     // A region larger than the ring.
     let mut region = words(len + 64);
     let base = region.as_mut_ptr().cast::<u8>();
@@ -805,7 +805,7 @@ fn test_create_raw_rejects_bad_regions() {
         capacity: 1024,
         max_readers: 4,
     };
-    let len = checked_region_len(&cfg).unwrap();
+    let len = cfg.region_len().unwrap();
     let mut region = words(len + 16);
     let base = region.as_mut_ptr().cast::<u8>();
 
@@ -830,17 +830,21 @@ fn test_region_size_rejects_overflow() {
             capacity,
             max_readers,
         };
-        assert_eq!(checked_region_len(&cfg), None);
+        assert_eq!(cfg.region_len(), Err(InvalidConfig));
         assert!(matches!(
             RingBuffer::create_in_memory(cfg),
             Err(InvalidConfig)
         ));
+        let mut region = words(64);
+        // SAFETY: a live region; the call fails before touching it.
+        let raw = unsafe { RingBuffer::create_raw(region.as_mut_ptr().cast(), 1024, cfg) };
+        assert_eq!(raw.err(), Some(AttachError::InvalidConfig(InvalidConfig)));
     }
     let cfg = Config {
         capacity: 64,
         max_readers: 2,
     };
-    assert_eq!(checked_region_len(&cfg), Some(0x80 + 2 * 64 + 64));
+    assert_eq!(cfg.region_len(), Ok(0x80 + 2 * 64 + 64));
     assert!(RingBuffer::create_in_memory(cfg).is_ok());
 }
 
@@ -1056,7 +1060,7 @@ fn test_attach_accepts_extra_storage() {
         capacity: 64,
         max_readers: 2,
     };
-    let mut geometry = Geometry::from_config(&cfg);
+    let mut geometry = Geometry::try_from(cfg).unwrap();
     geometry.data_offset += 32;
     geometry.total_size += 32;
     let backing = Backing::heap(geometry.total_size + 32);
@@ -1078,26 +1082,31 @@ fn test_attach_accepts_extra_storage() {
 
 #[test]
 fn test_frame_length_rejects_overflow() {
-    assert_eq!(checked_frame_len(0, 16), Ok(16));
-    assert_eq!(checked_frame_len(48, 64), Ok(64));
+    assert_eq!(geometry(16).frame_len(0), Ok(16));
+    assert_eq!(geometry(64).frame_len(48), Ok(64));
     for len in [49, usize::MAX, usize::MAX - 15] {
         assert_eq!(
-            checked_frame_len(len, 64),
+            geometry(64).frame_len(len),
             Err(WriteError::InsufficientCapacity)
         );
     }
 }
 
+fn geometry(capacity: usize) -> Geometry {
+    Geometry::try_from(Config {
+        capacity,
+        max_readers: 1,
+    })
+    .unwrap()
+}
+
 #[cfg(target_pointer_width = "64")]
 #[test]
 fn test_frame_length_rejects_excess_length() {
-    let capacity = 1u64 << 33;
+    let geometry = geometry(1 << 33);
+    assert_eq!(geometry.frame_len(u32::MAX as usize), Ok((1u64 << 32) + 16));
     assert_eq!(
-        checked_frame_len(u32::MAX as usize, capacity),
-        Ok((1u64 << 32) + 16)
-    );
-    assert_eq!(
-        checked_frame_len(u32::MAX as usize + 1, capacity),
+        geometry.frame_len(u32::MAX as usize + 1),
         Err(WriteError::InsufficientCapacity)
     );
 }

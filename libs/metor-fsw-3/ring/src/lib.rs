@@ -48,7 +48,7 @@ pub use owner::{Lease, RawOwner, RingExport};
 use region::*;
 
 use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
-use crate::sync::{Arc, AtomicU64, fence};
+use crate::sync::{Arc, fence};
 use core::cell::Cell;
 
 /// Alignment of every record payload, in bytes.
@@ -66,18 +66,13 @@ fn owner_tag() -> u64 {
     1
 }
 
-#[inline]
-const fn round_up_16(n: usize) -> usize {
-    (n + (PAYLOAD_ALIGNMENT - 1)) & !(PAYLOAD_ALIGNMENT - 1)
-}
-
 /// Returns the bytes a record takes up in the ring.
 ///
 /// That is a 16-byte header plus the payload padded to 16 bytes. `payload_len`
 /// must be at most `usize::MAX - 31`.
 #[inline]
 pub const fn frame_len(payload_len: usize) -> usize {
-    RECORD_HEADER_SIZE + round_up_16(payload_len)
+    RECORD_HEADER_SIZE + payload_len.next_multiple_of(PAYLOAD_ALIGNMENT)
 }
 
 /// Returns where the next frame starts, and the wrap gap before it.
@@ -136,13 +131,6 @@ const fn payload_in_bounds(len: u64, offset: u64, capacity: u64) -> bool {
     len <= capacity - RECORD_HEADER_SIZE as u64 - offset
 }
 
-fn checked_frame_len(payload_len: usize, capacity: u64) -> Result<u64, WriteError> {
-    if payload_len > u32::MAX as usize || !payload_in_bounds(payload_len as u64, 0, capacity) {
-        return Err(WriteError::InsufficientCapacity);
-    }
-    Ok(frame_len(payload_len) as u64)
-}
-
 /// The sizes a ring region is created with.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -150,6 +138,13 @@ pub struct Config {
     pub capacity: usize,
     /// Reader slots: nonzero and representable as `u32`.
     pub max_readers: usize,
+}
+
+impl Config {
+    /// Returns the backing size this config needs.
+    pub fn region_len(&self) -> Result<usize, InvalidConfig> {
+        Geometry::try_from(*self).map(|geometry| geometry.total_size)
+    }
 }
 
 /// Why a write was rejected.
@@ -206,6 +201,8 @@ pub enum AttachError {
     BadGeometry,
     #[error("region header's total size exceeds the backing length")]
     RegionTruncated,
+    #[error(transparent)]
+    InvalidConfig(#[from] InvalidConfig),
 }
 
 /// Tells readers that the writer published new data.
@@ -307,7 +304,7 @@ unsafe impl Sync for Inner {}
 
 impl Inner {
     fn new(backing: Backing, geometry: Geometry) -> Self {
-        let region = region_ptr(backing.base, geometry.max_readers);
+        let region = Region::ptr_at(backing.base, geometry.max_readers);
         Self {
             backing,
             geometry,
@@ -327,9 +324,9 @@ impl Inner {
     }
 
     #[inline]
-    fn slot(&self, slot: u32) -> &ReaderSlot {
-        // PANIC Safety: callers pass slot < max_readers, the table's length.
-        &self.region().slots[slot as usize]
+    fn slot(&self, slot_index: u32) -> &ReaderSlot {
+        // PANIC Safety: callers pass slot_index < max_readers, the table's length.
+        &self.region().slots[slot_index as usize]
     }
 
     /// Returns a pointer to `offset` bytes into the data region.
@@ -364,10 +361,10 @@ impl Inner {
     /// fits in the data region. Its length fits in a `u32`, and no reader cursor
     /// pins the destination.
     unsafe fn write_record(&self, offset: usize, payload: &[u8]) {
-        // SAFETY: offset is 8-aligned and in-bounds (caller contract).
+        // SAFETY: offset is 16-aligned and in bounds (caller contract).
         let p = unsafe { self.data_ptr(offset) };
         let len = payload.len() as u64;
-        // SAFETY: p is 8-aligned; [offset, offset+frame_len) is in-bounds.
+        // SAFETY: p is 16-aligned and [offset, offset + frame_len) is in bounds.
         unsafe {
             (p as *mut u64).write(len);
             std::ptr::copy_nonoverlapping(
@@ -388,44 +385,50 @@ impl Inner {
     /// bytes. The record was published before this read, and a reader cursor
     /// keeps it pinned.
     unsafe fn read_len(&self, offset: usize) -> u64 {
-        // SAFETY: offset is 8-aligned and in-bounds (caller contract); the read
+        // SAFETY: offset is 16-aligned and in bounds (caller contract). The read
         // is ordered after the write via `committed`.
         let hdr = unsafe { (self.data_ptr(offset) as *const u64).read() };
         hdr & 0xFFFF_FFFF
     }
 
-    /// Finds the record at `r`, skipping a wrap gap if `r` sits on one.
+    /// Finds the record at `read_pos`, skipping a wrap gap if `read_pos` sits on one.
     ///
     /// Returns the position after any skip, and the record if one was published
-    /// before `committed`. Returns [`ReadError`] if `r` is more than a lap behind
-    /// `committed` or is not on a 16-byte boundary.
-    fn locate_before(&self, r: u64, committed: u64) -> Result<(u64, Option<Located>), ReadError> {
-        if r >= committed {
-            return Ok((r, None));
+    /// before `committed`. Returns [`ReadError`] if `read_pos` is more than a lap
+    /// behind `committed` or is not on a 16-byte boundary.
+    fn locate_before(
+        &self,
+        read_pos: u64,
+        committed: u64,
+    ) -> Result<(u64, Option<Located>), ReadError> {
+        if read_pos >= committed {
+            return Ok((read_pos, None));
         }
-        if committed - r > self.geometry.capacity || !r.is_multiple_of(PAYLOAD_ALIGNMENT as u64) {
+        if committed - read_pos > self.geometry.capacity
+            || !read_pos.is_multiple_of(PAYLOAD_ALIGNMENT as u64)
+        {
             return Err(ReadError);
         }
         // A gap runs to the end of its lap, so skipping it lands on a lap start,
         // which is aligned and still within a lap of `committed`.
-        let r = if r == self.control().hwm.load(Acquire) {
-            self.next_lap(r).ok_or(ReadError)?
+        let read_pos = if read_pos == self.control().hwm.load(Acquire) {
+            self.next_lap(read_pos).ok_or(ReadError)?
         } else {
-            r
+            read_pos
         };
-        if r >= committed {
-            return Ok((r, None));
+        if read_pos >= committed {
+            return Ok((read_pos, None));
         }
-        let loc = self.record_at(r, committed)?;
-        Ok((r, Some(loc)))
+        let loc = self.record_at(read_pos, committed)?;
+        Ok((read_pos, Some(loc)))
     }
 
-    /// Reads and bounds-checks the header of the record at `r`.
+    /// Reads and bounds-checks the header of the record at `read_pos`.
     ///
-    /// `r` is aligned, pinned, and within a lap below `committed`.
-    fn record_at(&self, r: u64, committed: u64) -> Result<Located, ReadError> {
-        let offset = (r & self.geometry.mask()) as usize;
-        // SAFETY: r is pinned and below an acquired committed position.
+    /// `read_pos` is aligned, pinned, and within a lap below `committed`.
+    fn record_at(&self, read_pos: u64, committed: u64) -> Result<Located, ReadError> {
+        let offset = (read_pos & self.geometry.mask()) as usize;
+        // SAFETY: read_pos is pinned and below an acquired committed position.
         // Alignment and capacity >= 16 leave room for the header.
         let len = unsafe { self.read_len(offset) };
         if !payload_in_bounds(len, offset as u64, self.geometry.capacity) {
@@ -433,11 +436,11 @@ impl Inner {
         }
         let payload_len = len as usize;
         let frame_len = frame_len(payload_len);
-        if frame_len as u64 > committed - r {
+        if frame_len as u64 > committed - read_pos {
             return Err(ReadError);
         }
         Ok(Located {
-            start: r,
+            start: read_pos,
             offset,
             payload_len,
             frame_len,
@@ -465,6 +468,69 @@ impl Inner {
     }
 }
 
+/// A claimed reader slot and the reader's position.
+///
+/// Dropping it frees the slot.
+struct ClaimedSlot {
+    inner: Arc<Inner>,
+    index: u32,
+    /// The reader's position.
+    ///
+    /// The copy in the slot exists for the writer.
+    cursor: Cell<u64>,
+}
+
+impl ClaimedSlot {
+    /// Claims a free reader slot at the current published position.
+    fn claim(inner: &Arc<Inner>) -> Result<Self, FullReaderTable> {
+        let mut start = inner.control().committed.load(Acquire);
+        for index in 0..inner.geometry.max_readers {
+            let shared_cursor = &inner.slot(index).cursor;
+            // Acquire the slot released by its previous owner.
+            if shared_cursor
+                .compare_exchange(FREE_SLOT, start, AcqRel, Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            // Record ownership promptly; a crash before this store leaves an unattributed slot.
+            inner.slot(index).owner.store(owner_tag(), Release);
+            // Retry until publication stays stable across the fence paired with the writer scan.
+            loop {
+                fence(SeqCst);
+                let committed = inner.control().committed.load(Acquire);
+                if committed == start {
+                    break;
+                }
+                // Publication raced registration; start at the new edge and recheck.
+                start = committed;
+                shared_cursor.store(start, Release);
+            }
+            return Ok(Self {
+                inner: inner.clone(),
+                index,
+                cursor: Cell::new(start),
+            });
+        }
+        Err(FullReaderTable)
+    }
+
+    /// Stores a new position locally, then in the slot with Release ordering.
+    #[inline]
+    fn advance(&self, pos: u64) {
+        self.cursor.set(pos);
+        self.inner.slot(self.index).cursor.store(pos, Release);
+    }
+}
+
+impl Drop for ClaimedSlot {
+    fn drop(&mut self) {
+        let slot = self.inner.slot(self.index);
+        slot.owner.store(0, Relaxed);
+        slot.cursor.store(FREE_SLOT, Release);
+    }
+}
+
 /// A cloneable handle to a ring.
 ///
 /// Use it to create the ring's [`Writer`] and its [`View`]s. The ring's storage
@@ -479,7 +545,7 @@ impl RingBuffer {
     ///
     /// Returns [`InvalidConfig`] if `cfg` cannot form a valid region.
     pub fn create_in_memory(cfg: Config) -> Result<Self, InvalidConfig> {
-        let geometry = Geometry::checked_from_config(&cfg).ok_or(InvalidConfig)?;
+        let geometry = Geometry::try_from(cfg)?;
         let backing = Backing::heap(geometry.total_size);
         // SAFETY: fresh, aligned storage large enough for the checked geometry.
         Ok(unsafe { Self::initialize(backing, geometry) })
@@ -487,22 +553,19 @@ impl RingBuffer {
 
     /// Creates a ring in caller-owned storage.
     ///
-    /// Returns an error if `base` is not 16-byte aligned or `len` is too small
-    /// for `cfg`.
+    /// Returns an error if `cfg` cannot form a valid region, `base` is not
+    /// 16-byte aligned, or `len` is too small for `cfg`.
     ///
     /// # Safety
     /// The region must be one writable allocation that allows interior mutation.
     /// Nothing else may access it during initialization. It must outlive every
     /// handle, clone, export, and borrow created from the ring. After
     /// initialization, all access must follow the ring protocol.
-    ///
-    /// # Panics
-    /// Panics if `cfg` cannot form a valid region (see [`InvalidConfig`]).
     pub unsafe fn create_raw(base: *mut u8, len: usize, cfg: Config) -> Result<Self, AttachError> {
+        let geometry = Geometry::try_from(cfg)?;
         if !(base as usize).is_multiple_of(PAYLOAD_ALIGNMENT) {
             return Err(AttachError::Misaligned);
         }
-        let geometry = Geometry::from_config(&cfg);
         if len < geometry.total_size {
             return Err(AttachError::TooSmall);
         }
@@ -515,19 +578,18 @@ impl RingBuffer {
 
     /// Creates a ring backed by the file at `path`.
     ///
-    /// Any existing file is truncated.
+    /// Any existing file is truncated. Returns an `InvalidInput` error if `cfg`
+    /// cannot form a valid region.
     ///
     /// # Safety
     /// The caller has exclusive access to the file during creation, and no
     /// earlier mappings or handles to it are in use. Until every handle and
     /// borrow from the ring is dropped, the file must not be truncated,
     /// reformatted, or modified outside the ring protocol.
-    ///
-    /// # Panics
-    /// Panics if `cfg` cannot form a valid region (see [`InvalidConfig`]).
     #[cfg(feature = "mmap")]
     pub unsafe fn create_mmap(path: &std::path::Path, cfg: Config) -> std::io::Result<Self> {
-        let geometry = Geometry::from_config(&cfg);
+        let geometry = Geometry::try_from(cfg)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -604,6 +666,8 @@ impl RingBuffer {
         RingExport::new(self.inner.clone())
     }
 
+    /// Validates the header in `backing` and wraps it in a handle.
+    ///
     /// # Safety
     /// The backing holds an initialized ring whose header never changes. Its
     /// lifetime and all concurrent access must follow the ring protocol.
@@ -619,6 +683,8 @@ impl RingBuffer {
         }
     }
 
+    /// Writes a fresh region into `backing` and wraps it in a handle.
+    ///
     /// # Safety
     /// The backing is aligned, exclusively writable, and holds the checked geometry.
     unsafe fn initialize(backing: Backing, geometry: Geometry) -> Self {
@@ -698,64 +764,18 @@ impl RingBuffer {
     /// [`FullReaderTable`] if every reader slot is taken. The view waits for new
     /// data through `wake`.
     pub fn view<RD: WakeSink>(&self, wake: RD) -> Result<View<RD>, FullReaderTable> {
-        let mut start = self.inner.control().committed.load(Acquire);
-        for slot in 0..self.inner.geometry.max_readers {
-            // Acquire the slot released by its previous owner.
-            if self
-                .inner
-                .slot(slot)
-                .cursor
-                .compare_exchange(FREE_SLOT, start, AcqRel, Relaxed)
-                .is_ok()
-            {
-                // Record ownership promptly; a crash before this store leaves an unattributed slot.
-                self.inner.slot(slot).owner.store(owner_tag(), Release);
-                // Retry until publication stays stable across the fence paired with the writer scan.
-                loop {
-                    fence(SeqCst);
-                    let c2 = self.inner.control().committed.load(Acquire);
-                    if c2 == start {
-                        break;
-                    }
-                    // Publication raced registration; start at the new edge and recheck.
-                    start = c2;
-                    self.inner.slot(slot).cursor.store(start, Release);
-                }
-                return Ok(View {
-                    cursor: Cell::new(start),
-                    inner: self.inner.clone(),
-                    slot,
-                    wake,
-                    pending: None,
-                });
-            }
-        }
-        Err(FullReaderTable)
+        Ok(View {
+            slot: ClaimedSlot::claim(&self.inner)?,
+            wake,
+            pending: None,
+        })
     }
-}
-
-/// Returns the backing size `cfg` needs.
-///
-/// Returns `None` if `cfg` cannot form a valid region.
-pub fn checked_region_len(cfg: &Config) -> Option<usize> {
-    Geometry::checked_from_config(cfg).map(|geometry| geometry.total_size)
 }
 
 /// The ring's single writer.
 ///
 /// Dropping it releases the writer claim, so another writer can take over.
-/// `Writer` is `Send` but not `Sync`, so writes through `&Writer` never overlap:
-///
-/// ```compile_fail
-/// use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
-///
-/// let ring = RingBuffer::create_in_memory(Config { capacity: 1024, max_readers: 1 }).unwrap();
-/// let writer = ring.writer(NoWake).unwrap();
-/// std::thread::scope(|s| {
-///     s.spawn(|| writer.try_write(b"a"));
-///     writer.try_write(b"b")
-/// });
-/// ```
+/// `Writer` is `Send` but not `Sync`, so writes through `&Writer` never overlap.
 pub struct Writer<WD: WakeSource> {
     inner: Arc<Inner>,
     wake: WD,
@@ -775,44 +795,42 @@ impl<WD: WakeSource> Writer<WD> {
     ///   of the record.
     /// - [`WriteError::Corrupt`] if a reader cursor is ahead of this writer.
     pub fn try_write(&self, bytes: &[u8]) -> Result<(), WriteError> {
-        let cap = self.inner.geometry.capacity;
-        let rec = checked_frame_len(bytes.len(), cap)?;
-        let mut c = self.committed.get();
-        if !writable_from(c, cap) {
+        let capacity = self.inner.geometry.capacity;
+        let frame_len = self.inner.geometry.frame_len(bytes.len())?;
+        let committed = self.committed.get();
+        if !writable_from(committed, capacity) {
             return Err(WriteError::Corrupt);
         }
-        let (start_abs, mut gap) = frame_start(c, rec, cap);
-        // Readers may not have released the space for the gap and the frame yet.
-        if !self.fits(c, gap + rec)? {
-            // When only the gap fits, publish it alone. Readers then skip to the
-            // next lap and release the space at its start.
-            if gap == 0 || !self.fits(c, gap)? {
-                return Err(WriteError::WouldBlock);
-            }
-            self.inner.control().hwm.store(c, Release);
-            self.publish(start_abs);
-            c = start_abs;
-            gap = 0;
-            if !self.fits(c, rec)? {
-                self.wake.notify();
-                return Err(WriteError::WouldBlock);
-            }
+        let (start, gap) = frame_start(committed, frame_len, capacity);
+        // Cursors only grow, so one scan stays a safe bound for both checks.
+        let slowest_cursor = self.slowest_cursor(committed);
+        if fits(committed, slowest_cursor, gap + frame_len, capacity)? {
+            let wrap_hwm = (gap > 0).then_some(committed);
+            // SAFETY: the reservation is contiguous, the length is valid, and the
+            // reader scan allows this writer to reuse the destination.
+            unsafe { self.commit(start, frame_len, wrap_hwm, bytes) };
+            return Ok(());
         }
-        // SAFETY: reservation is contiguous, the length is valid, and the reader scan
-        // allows this writer to reuse the destination.
-        unsafe { self.commit(c, start_abs, start_abs + rec, gap, bytes) };
+        // When only the gap fits, publish it alone. Readers then skip to the
+        // next lap and release the space at its start.
+        if gap == 0 || !fits(committed, slowest_cursor, gap, capacity)? {
+            return Err(WriteError::WouldBlock);
+        }
+        self.publish_gap(committed);
+        self.publish(start);
+        if !fits(start, self.slowest_cursor(start), frame_len, capacity)? {
+            self.wake.notify();
+            return Err(WriteError::WouldBlock);
+        }
+        // SAFETY: as above, with the rescan taken after the gap was published.
+        unsafe { self.commit(start, frame_len, None, bytes) };
         Ok(())
     }
 
+    /// Returns the slowest reader cursor, or `committed` when no reader is active.
     #[inline]
-    fn fits(&self, committed: u64, write_len: u64) -> Result<bool, WriteError> {
-        let slowest_cursor = self.inner.slowest_active_cursor().unwrap_or(committed);
-        fits(
-            committed,
-            slowest_cursor,
-            write_len,
-            self.inner.geometry.capacity,
-        )
+    fn slowest_cursor(&self, committed: u64) -> u64 {
+        self.inner.slowest_active_cursor().unwrap_or(committed)
     }
 
     /// Stores a new position locally, then in the region with Release ordering.
@@ -822,19 +840,30 @@ impl<WD: WakeSource> Writer<WD> {
         self.inner.control().committed.store(committed, Release);
     }
 
+    /// Publishes the start of a wrap gap.
+    ///
+    /// Call it before publishing the position that crosses the gap.
+    #[inline]
+    fn publish_gap(&self, hwm: u64) {
+        self.inner.control().hwm.store(hwm, Release);
+    }
+
+    /// Writes a record at `start` and publishes it.
+    ///
+    /// `wrap_hwm` is the start of the gap before `start`, if there is one.
+    ///
     /// # Safety
-    /// The writer claim is held. The record fits contiguously in space no reader
-    /// pins, and `end_abs` is `start_abs` plus the record's frame length.
-    unsafe fn commit(&self, committed: u64, start_abs: u64, end_abs: u64, gap: u64, bytes: &[u8]) {
-        let offset = (start_abs & self.inner.geometry.mask()) as usize;
-        // SAFETY: record is contiguous and in-bounds (caller contract).
+    /// The writer claim is held. The `frame_len`-byte record fits contiguously at
+    /// `start` in space no reader pins.
+    unsafe fn commit(&self, start: u64, frame_len: u64, wrap_hwm: Option<u64>, bytes: &[u8]) {
+        let offset = (start & self.inner.geometry.mask()) as usize;
+        // SAFETY: the record is contiguous and in bounds (caller contract).
         unsafe { self.inner.write_record(offset, bytes) };
-        if gap > 0 {
-            // Publish the wrap marker before the position that crosses it.
-            self.inner.control().hwm.store(committed, Release);
+        if let Some(hwm) = wrap_hwm {
+            self.publish_gap(hwm);
         }
         // Release publishes record bytes to acquiring readers.
-        self.publish(end_abs);
+        self.publish(start + frame_len);
         self.wake.notify();
     }
 }
@@ -867,12 +896,7 @@ impl Located {
 /// Views never consume records for each other. Dropping a view frees its
 /// reader slot, so the writer stops waiting on it.
 pub struct View<RD: WakeSink> {
-    inner: Arc<Inner>,
-    slot: u32,
-    /// The view's position.
-    ///
-    /// The copy in its slot exists for the writer.
-    cursor: Cell<u64>,
+    slot: ClaimedSlot,
     wake: RD,
     /// The position a drain has read up to.
     ///
@@ -885,14 +909,14 @@ impl<RD: WakeSink> View<RD> {
     ///
     /// Records a drain has yielded are not counted until the view settles.
     pub fn cursor(&self) -> u64 {
-        self.cursor.get()
+        self.slot.cursor.get()
     }
 
     /// Returns the absolute published position in bytes.
     ///
     /// Wrap padding counts toward it.
     pub fn committed(&self) -> u64 {
-        self.inner.control().committed.load(Acquire)
+        self.inner().control().committed.load(Acquire)
     }
 
     /// Returns the sink this view waits on.
@@ -906,7 +930,7 @@ impl<RD: WakeSink> View<RD> {
     ///
     /// Wrap padding does not count.
     pub fn has_record(&self) -> bool {
-        matches!(self.locate(), Ok(Some(_)))
+        matches!(self.skip_gap_and_locate(), Ok(Some(_)))
     }
 
     /// Applies a drain's deferred consumption now.
@@ -914,7 +938,7 @@ impl<RD: WakeSink> View<RD> {
     /// After this, [`Self::cursor`] is exact.
     pub fn settle(&mut self) {
         if let Some(pos) = self.pending.take() {
-            self.advance(pos);
+            self.slot.advance(pos);
         }
     }
 
@@ -924,10 +948,16 @@ impl<RD: WakeSink> View<RD> {
     /// record and lets the writer reuse its space.
     pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_>>, ReadError> {
         self.settle();
-        let Some(loc) = self.locate()? else {
+        let Some(loc) = self.skip_gap_and_locate()? else {
             return Ok(None);
         };
-        Ok(Some(self.grant(loc)))
+        // SAFETY: lookup validated the record; this exclusive view borrow keeps it pinned.
+        let slice = unsafe { self.slot.inner.payload(&loc) };
+        Ok(Some(ReadGrant {
+            slot: &self.slot,
+            end: loc.end(),
+            slice,
+        }))
     }
 
     /// Skips older unread records and borrows the newest one.
@@ -938,16 +968,16 @@ impl<RD: WakeSink> View<RD> {
     pub fn try_latest(&mut self) -> Result<Option<&[u8]>, ReadError> {
         self.settle();
         loop {
-            let Some(loc) = self.locate()? else {
+            let Some(loc) = self.skip_gap_and_locate()? else {
                 return Ok(None);
             };
             let end = loc.end();
             if end >= self.data_end() {
-                // SAFETY: lookup validated the record, and `locate` left the
+                // SAFETY: lookup validated the record, and the lookup left the
                 // cursor at its start, pinning it until the next mutable access.
-                return Ok(Some(unsafe { self.inner.payload(&loc) }));
+                return Ok(Some(unsafe { self.slot.inner.payload(&loc) }));
             }
-            self.advance(end);
+            self.slot.advance(end);
         }
     }
 
@@ -958,53 +988,17 @@ impl<RD: WakeSink> View<RD> {
     /// caught up.
     pub fn try_read_owned(mut self) -> Result<Result<OwnedGrant<RD>, Self>, ReadError> {
         self.settle();
-        let Some(loc) = self.locate()? else {
+        let Some(loc) = self.skip_gap_and_locate()? else {
             return Ok(Err(self));
         };
-        let (inner, slot, wake) = self.into_parts();
+        let View { slot, wake, .. } = self;
         Ok(Ok(OwnedGrant {
-            inner,
             slot,
             offset: loc.offset + RECORD_HEADER_SIZE,
             len: loc.payload_len,
             end: loc.end(),
             wake,
         }))
-    }
-
-    /// Splits the view into its ring, reader slot, and wake, keeping the slot
-    /// claimed.
-    fn into_parts(self) -> (Arc<Inner>, u32, RD) {
-        let view = core::mem::ManuallyDrop::new(self);
-        // SAFETY: `view` is never dropped or used again, so each field is
-        // moved out exactly once.
-        unsafe {
-            (
-                core::ptr::read(&view.inner),
-                view.slot,
-                core::ptr::read(&view.wake),
-            )
-        }
-    }
-
-    fn locate(&self) -> Result<Option<Located>, ReadError> {
-        let r = self.cursor.get();
-        let (skipped, loc) = self.inner.locate_before(r, self.committed())?;
-        if skipped != r {
-            self.advance(skipped);
-        }
-        Ok(loc)
-    }
-
-    fn grant(&mut self, loc: Located) -> ReadGrant<'_> {
-        // SAFETY: lookup validated the record; this exclusive view borrow keeps it pinned.
-        let slice = unsafe { self.inner.payload(&loc) };
-        ReadGrant {
-            cursor: &self.cursor,
-            slot: &self.inner.slot(self.slot).cursor,
-            end: loc.end(),
-            slice,
-        }
     }
 
     /// Borrows every record published before this call.
@@ -1017,9 +1011,9 @@ impl<RD: WakeSink> View<RD> {
         self.settle();
         let pos = self.cursor();
         let committed = self.committed();
-        let View { inner, pending, .. } = self;
+        let View { slot, pending, .. } = self;
         Drain {
-            inner,
+            inner: &slot.inner,
             pos,
             committed,
             pending,
@@ -1027,43 +1021,39 @@ impl<RD: WakeSink> View<RD> {
         }
     }
 
+    #[inline]
+    fn inner(&self) -> &Inner {
+        &self.slot.inner
+    }
+
+    /// Finds the next unread record, moving the cursor past a wrap gap first.
+    fn skip_gap_and_locate(&self) -> Result<Option<Located>, ReadError> {
+        let read_pos = self.cursor();
+        let (skipped, loc) = self.inner().locate_before(read_pos, self.committed())?;
+        if skipped != read_pos {
+            self.slot.advance(skipped);
+        }
+        Ok(loc)
+    }
+
     /// Returns the published position, minus a wrap gap at the very end.
     fn data_end(&self) -> u64 {
-        let committed = self.inner.control().committed.load(Acquire);
-        let hwm = self.inner.control().hwm.load(Acquire);
-        if hwm < committed && self.inner.next_lap(hwm) == Some(committed) {
+        let control = self.inner().control();
+        let committed = control.committed.load(Acquire);
+        let hwm = control.hwm.load(Acquire);
+        if hwm < committed && self.inner().next_lap(hwm) == Some(committed) {
             hwm
         } else {
             committed
         }
     }
-
-    #[inline]
-    fn advance(&self, end_abs: u64) {
-        store_cursor(&self.cursor, &self.inner.slot(self.slot).cursor, end_abs);
-    }
-}
-
-impl<RD: WakeSink> Drop for View<RD> {
-    fn drop(&mut self) {
-        self.inner.slot(self.slot).owner.store(0, Relaxed);
-        self.inner.slot(self.slot).cursor.store(FREE_SLOT, Release);
-    }
-}
-
-/// Stores a view's position locally, then in its slot with Release ordering.
-#[inline]
-fn store_cursor(local: &Cell<u64>, slot: &AtomicU64, pos: u64) {
-    local.set(pos);
-    slot.store(pos, Release);
 }
 
 /// A borrowed record.
 ///
 /// It derefs to the record's payload. Dropping it consumes the record.
 pub struct ReadGrant<'a> {
-    cursor: &'a Cell<u64>,
-    slot: &'a AtomicU64,
+    slot: &'a ClaimedSlot,
     end: u64,
     slice: &'a [u8],
 }
@@ -1077,7 +1067,7 @@ impl std::ops::Deref for ReadGrant<'_> {
 
 impl Drop for ReadGrant<'_> {
     fn drop(&mut self) {
-        store_cursor(self.cursor, self.slot, self.end);
+        self.slot.advance(self.end);
     }
 }
 
@@ -1089,8 +1079,7 @@ impl Drop for ReadGrant<'_> {
 /// (Self::into_view) consumes the record and returns the view, and dropping
 /// the grant releases the view's reader slot.
 pub struct OwnedGrant<RD: WakeSink> {
-    inner: Arc<Inner>,
-    slot: u32,
+    slot: ClaimedSlot,
     /// Data-region offset of the first unskipped payload byte.
     offset: usize,
     /// Payload bytes not yet skipped.
@@ -1110,20 +1099,12 @@ impl<RD: WakeSink> OwnedGrant<RD> {
 
     /// Consumes the record and returns the view.
     pub fn into_view(self) -> View<RD> {
-        let grant = core::mem::ManuallyDrop::new(self);
-        // SAFETY: `grant` is never dropped or used again, so each field is
-        // moved out exactly once.
-        let (inner, wake) =
-            unsafe { (core::ptr::read(&grant.inner), core::ptr::read(&grant.wake)) };
-        let view = View {
-            inner,
-            slot: grant.slot,
-            cursor: Cell::new(grant.end),
-            wake,
+        self.slot.advance(self.end);
+        View {
+            slot: self.slot,
+            wake: self.wake,
             pending: None,
-        };
-        view.advance(grant.end);
-        view
+        }
     }
 }
 
@@ -1133,14 +1114,7 @@ impl<RD: WakeSink> std::ops::Deref for OwnedGrant<RD> {
         // SAFETY: lookup validated the record, and the grant's slot cursor
         // still sits at its start, so the writer cannot reuse these bytes
         // while the grant lives. `offset + len` stays within the record.
-        unsafe { std::slice::from_raw_parts(self.inner.data_ptr(self.offset), self.len) }
-    }
-}
-
-impl<RD: WakeSink> Drop for OwnedGrant<RD> {
-    fn drop(&mut self) {
-        self.inner.slot(self.slot).owner.store(0, Relaxed);
-        self.inner.slot(self.slot).cursor.store(FREE_SLOT, Release);
+        unsafe { std::slice::from_raw_parts(self.slot.inner.data_ptr(self.offset), self.len) }
     }
 }
 

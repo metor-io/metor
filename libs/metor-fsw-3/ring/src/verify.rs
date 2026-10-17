@@ -21,7 +21,7 @@ fn any_record(cap: u64) -> u64 {
 fn frame_alignment() {
     let n: usize = kani::any();
     kani::assume(n <= usize::MAX - 15);
-    let r = round_up_16(n);
+    let r = n.next_multiple_of(16);
     assert!(r.is_multiple_of(16));
     // Subtraction avoids overflow in the assertion near `usize::MAX`.
     assert!(r >= n);
@@ -49,11 +49,11 @@ fn payload_in_bounds_holds() {
     if payload_in_bounds(len, offset, cap) {
         assert!(offset + 16 <= cap);
         assert!(offset + 16 + len <= cap);
-        assert!(offset + 16 + round_up16_u64(len) <= cap);
+        assert!(offset + 16 + len.next_multiple_of(16) <= cap);
         // The frame length is also representable in 32-bit arithmetic.
         let padded = (len as u32).checked_add(15).expect("round_up16 would wrap") & !15u32;
         let frame = padded.checked_add(16).expect("frame_len would wrap");
-        assert_eq!(frame as u64, 16 + round_up16_u64(len));
+        assert_eq!(frame as u64, 16 + len.next_multiple_of(16));
     }
 }
 
@@ -133,10 +133,6 @@ fn fits_hostile_cursor() {
     }
 }
 
-fn round_up16_u64(n: u64) -> u64 {
-    (n + 15) & !15
-}
-
 fn any_header() -> RegionHeader {
     RegionHeader {
         magic: kani::any(),
@@ -196,7 +192,7 @@ fn layout_roundtrip() {
         capacity,
         max_readers,
     };
-    let geometry = Geometry::from_config(&cfg);
+    let geometry = Geometry::try_from(cfg).expect("a valid config");
 
     let hdr = RegionHeader {
         magic: MAGIC,
@@ -230,7 +226,7 @@ impl StackRegion {
             capacity: CAP,
             max_readers: 1,
         };
-        let geometry = Geometry::from_config(&cfg);
+        let geometry = Geometry::try_from(cfg).expect("a valid config");
         assert_eq!(geometry.total_size, REGION);
         let base = self.0.as_mut_ptr();
         // SAFETY: the aligned region is exclusively held and outlives its handles.
