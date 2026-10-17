@@ -118,9 +118,9 @@ pub(super) fn end_of(copied: Result<(), Corrupt>, result: Result<u32, Trap>) -> 
         return Some(End::host(reason, "corrupt", "a guest ring is corrupt"));
     }
     match result {
-        Ok(word) => match Status::try_from_raw(word) {
-            Some(status) => status.end().map(|reason| End { reason, line: None }),
-            None => Some(End::host(
+        Ok(word) => match Status::try_from(word) {
+            Ok(status) => status.end().map(|reason| End { reason, line: None }),
+            Err(_) => Some(End::host(
                 EndReason::Panicked,
                 "bad_status",
                 "the guest returned no known status",

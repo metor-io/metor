@@ -180,8 +180,9 @@ impl Resolved {
         if blake3::hash(&bytes) != self.hash {
             return Err(LoadError::Hash(self.name.clone()));
         }
-        let pack = WasmPack::open(&bytes, &self.limits);
-        Ok(Pack::Wasm(pack.map_err(|e| LoadError::Open(e.to_string()))?))
+        let pack =
+            WasmPack::open(&bytes, &self.limits).map_err(|e| LoadError::Open(e.to_string()))?;
+        Ok(Pack::Wasm(pack))
     }
 
     fn of(index: usize, candidate: Candidate) -> Result<Self, MakeError> {

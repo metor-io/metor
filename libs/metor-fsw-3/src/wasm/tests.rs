@@ -342,7 +342,10 @@ fn rig(execute: &str) -> Rig {
             "guest",
             &serde_json::Value::Null,
             &instance,
-            (&inputs, &outputs),
+            crate::dl::InstanceRings {
+                inputs: &inputs,
+                outputs: &outputs,
+            },
             &io,
         )
         .expect("creates");

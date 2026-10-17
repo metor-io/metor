@@ -404,7 +404,8 @@ fn channel() -> CoordinatorConfig {
             SystemConfig::new("source", "source"),
             SystemConfig {
                 adapter: Some(Adapter::Channel(ChannelConfig {
-                    name: "mode".into(),
+                    name: metor_fsw_3::ChannelName::try_from("mode".to_string())
+                        .expect("a short name"),
                     start: RunState::Stopped,
                 })),
                 inputs: vec![

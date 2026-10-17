@@ -5,15 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
-use crate::dl::PackError;
-use crate::dl::Ports;
-use crate::dl::codec::{
-    decode_create_error, decode_def, decode_descriptor, encode_def_cx, encode_instance,
-};
+use crate::dl::{InstanceRings, PackError};
 use crate::io::{Arena, Cqe, IO_CQ, IO_SQ, SharedIo, Sqe};
 use crate::mirror::{Mirror, Mirrors, mirror_config};
-use crate::pack::def::{Instance, PackDef};
-use crate::pack::{ABI_VERSION, host_caps};
+use crate::pack::ABI_VERSION;
+use crate::pack::def::{DefCxOwned, Instance, PackDef};
 use crate::port::Input;
 use crate::system::{PortDef, SystemDef};
 
@@ -82,11 +78,11 @@ impl WasmPack {
     ///
     /// Each call runs in a scratch guest.
     pub fn def(&self, ty: &str, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        let cx = encode_def_cx(cx)?;
+        let cx = DefCxOwned::encode(cx)?;
         let (status, bytes) = self.call_def(ty, &cx).map_err(|e| DefError::Pack {
             message: e.to_string(),
         })?;
-        decode_def(status, bytes.as_deref())
+        SystemDef::decode(status, bytes.as_deref())
     }
 
     /// Creates one instance of type `ty` in a new guest.
@@ -100,12 +96,12 @@ impl WasmPack {
         ty: &str,
         params: &serde_json::Value,
         instance: &Instance,
-        (inputs, outputs): Ports<'_>,
+        InstanceRings { inputs, outputs }: InstanceRings<'_>,
         io: &SharedIo,
     ) -> Result<WasmStep, ParamError> {
-        let (params, def) = encode_instance(params, instance)?;
+        let (params, def) = instance.encode(params)?;
         let mut guest = self.guest().map_err(PackError::from)?;
-        let capped = host_caps(&instance.def).next().is_some();
+        let capped = !instance.def.grants.is_empty();
         let io_port = |name: &str| capped && (name == IO_SQ || name == IO_CQ);
         let ins = copy_inputs(&mut guest, &instance.def.inputs, inputs, io_port)?;
         let outs = copy_outputs(&mut guest, &instance.def.outputs, outputs, io_port)?;
@@ -168,7 +164,7 @@ fn descriptor(guest: &mut Guest) -> Result<PackDef, PackError> {
     let mut args = Args::new(guest);
     let out = args.out()?;
     let status = args.guest().pack_def(out, DEFAULT_SETUP_FUEL)?;
-    decode_descriptor(status, args.written(out)?.as_deref())
+    PackDef::decode(status, args.written(out)?.as_deref())
 }
 
 impl From<PackError> for ParamError {
@@ -253,7 +249,7 @@ fn call_create(guest: &mut Guest, call: Create<'_>) -> Result<(u32, GuestRing), 
         .create(create, DEFAULT_SETUP_FUEL)
         .map_err(PackError::from)?;
     if handle == 0 {
-        return Err(decode_create_error(&args.slice_bytes(error)?));
+        return Err(ParamError::from_create_error(&args.slice_bytes(error)?));
     }
     Ok((handle, args.ring(table)?))
 }
