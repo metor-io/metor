@@ -227,7 +227,7 @@ pub(crate) fn mirror_config(
         capacity: capacity.checked_mul(factor).ok_or(too_large.clone())?,
         max_readers: readers,
     };
-    let len = metor_fsw_3_ring::checked_region_len(&config).ok_or(too_large)?;
+    let len = config.region_len().map_err(|_| too_large)?;
     Ok((config, len))
 }
 

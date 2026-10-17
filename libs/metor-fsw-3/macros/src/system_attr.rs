@@ -32,12 +32,19 @@ enum Kind {
 
 /// Expands `#[system]`.
 pub fn system(item: TokenStream) -> TokenStream {
-    expand(item.into(), &crate::fsw_crate(), Kind::System).into()
+    expand_attr(item, Kind::System)
 }
 
 /// Expands `#[sequence]`.
 pub fn sequence(item: TokenStream) -> TokenStream {
-    expand(item.into(), &crate::fsw_crate(), Kind::Sequence).into()
+    expand_attr(item, Kind::Sequence)
+}
+
+fn expand_attr(item: TokenStream, kind: Kind) -> TokenStream {
+    match crate::fsw_crate() {
+        Ok(fsw) => expand(item.into(), &fsw, kind).into(),
+        Err(e) => e.to_compile_error().into(),
+    }
 }
 
 fn expand(item: TokenStream2, fsw: &TokenStream2, kind: Kind) -> TokenStream2 {
