@@ -222,7 +222,7 @@ fn staged_library() -> Arc<Pack> {
 /// Opens the `seqs` module `pack dev` staged beside the pack's crate.
 fn staged_module() -> Arc<Pack> {
     let reference = PackRef {
-        kind: PackKind::Wasm,
+        kind: PackKind::Wasm(Default::default()),
         ..PackRef::dylib(
             "seqs".into(),
             "adcs_seqs_3".into(),
