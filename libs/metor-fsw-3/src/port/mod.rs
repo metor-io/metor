@@ -169,7 +169,7 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
             alignment: T::ALIGN,
             depth: T::DEPTH,
             layout: T::schema().layout(),
-            schema: T::schema_at(&cx.port_path(name)),
+            schema: T::schema_with_root(&cx.port_path(name)),
         }
     }
 
