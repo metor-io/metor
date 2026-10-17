@@ -136,7 +136,7 @@ impl Connections {
             capacity: ring_capacity(cap, 2)?,
             max_readers: 1,
         };
-        metor_fsw_3_ring::checked_region_len(&ring)?;
+        ring.region_len().ok()?;
         Some(Self {
             slots: RefCell::new((0..count).map(|_| None).collect()),
             cap,
