@@ -281,13 +281,13 @@ impl From<io_uring::squeue::PushError> for Error {
     }
 }
 
-impl Default for Executor<UringReactor> {
+impl Default for Executor {
     fn default() -> Self {
         Self::try_new().unwrap()
     }
 }
 
-impl Executor<UringReactor> {
+impl Executor {
     pub fn try_new() -> Result<Self, Error> {
         let reactor = UringReactor {
             uring: SharedUring::with_uring(io_uring::IoUring::new(256)?),

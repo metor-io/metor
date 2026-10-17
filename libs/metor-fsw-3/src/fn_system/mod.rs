@@ -144,7 +144,7 @@ impl<S: SystemFn> System for FnSystem<S> {
                 S::Params::get(&mut inputs.ins, &mut outputs.outs, &mut cx),
             );
         });
-        outputs.report_dropped(now);
+        outputs.report_failed_writes(now);
     }
 
     /// Logs a panic as a fault on the system's own `log` output.

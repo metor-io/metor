@@ -89,7 +89,7 @@ impl TcpListener {
     }
 
     /// Wraps a `std` listener that is already bound and listening.
-    pub fn adopt(listener: std::net::TcpListener) -> io::Result<TcpListener> {
+    pub fn from_std(listener: std::net::TcpListener) -> io::Result<TcpListener> {
         let socket = socket2::Socket::from(listener);
         #[cfg(not(target_os = "windows"))]
         socket.set_cloexec(true)?;
@@ -138,9 +138,9 @@ mod tests {
     }
 
     #[test]
-    async fn adopted_listener_accepts() {
+    async fn listener_from_std_accepts() {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let listener = TcpListener::adopt(std_listener).unwrap();
+        let listener = TcpListener::from_std(std_listener).unwrap();
         let addr = listener.local_addr().unwrap();
         let accept = crate::spawn(async move { listener.accept().await.map(|_| ()) });
         let _stream = TcpStream::connect(addr).await.unwrap();
@@ -148,21 +148,21 @@ mod tests {
     }
 
     #[test]
-    async fn adopted_listener_accepts_queued_client() {
+    async fn listener_from_std_accepts_queued_client() {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = std_listener.local_addr().unwrap();
         let _queued = std::net::TcpStream::connect(addr).unwrap();
-        let listener = TcpListener::adopt(std_listener).unwrap();
+        let listener = TcpListener::from_std(std_listener).unwrap();
         listener.accept().await.unwrap();
     }
 
     #[test]
-    async fn adopted_listener_that_is_not_listening_fails_accept() {
+    async fn listener_from_std_that_is_not_listening_fails_accept() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let domain = socket2::Domain::for_address(addr);
         let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None).unwrap();
         socket.bind(&addr.into()).unwrap();
-        let listener = TcpListener::adopt(socket.into()).unwrap();
+        let listener = TcpListener::from_std(socket.into()).unwrap();
         let timeout = async {
             crate::sleep(Duration::from_secs(2)).await;
             panic!("accept on a socket that is not listening never returned");

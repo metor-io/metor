@@ -87,6 +87,13 @@ pub enum BuildError {
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
     ReservedPort { ty: String },
 
+    #[error("definition of type `{ty}`: {source}")]
+    TypeDef {
+        ty: String,
+        #[source]
+        source: DefError,
+    },
+
     #[error("definition for `{id}`: {source}")]
     Def {
         id: String,

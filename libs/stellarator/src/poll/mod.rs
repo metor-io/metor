@@ -256,13 +256,13 @@ impl<O: OpCode> PinnedDrop for Completion<O> {
     }
 }
 
-impl Default for Executor<PollingReactor> {
+impl Default for Executor {
     fn default() -> Self {
         Self::try_new().unwrap()
     }
 }
 
-impl Executor<PollingReactor> {
+impl Executor {
     pub fn try_new() -> Result<Self, Error> {
         let reactor = PollingReactor {
             poller: Arc::new(Poller::new()?),

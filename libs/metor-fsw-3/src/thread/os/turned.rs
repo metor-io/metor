@@ -7,10 +7,10 @@ use std::rc::Rc;
 use metor_proto::types::Timestamp;
 use stellarator::{Executor, JoinHandle};
 
-use crate::async_system::{StopHandle, stop_pair};
+use crate::async_system::{Stop, StopHandle};
 use crate::coordinator::ParamError;
 
-use super::group::{Member, build, task};
+use super::group::Member;
 
 /// How many turns a dropped group gives its tasks to finish.
 const DROP_TURNS: usize = 64;
@@ -19,7 +19,7 @@ const DROP_TURNS: usize = 64;
 /// time the coordinator sets.
 pub(crate) struct TurnedGroup {
     stop: StopHandle,
-    stop_rx: crate::async_system::Stop,
+    stop_rx: Stop,
     /// Declared before `executor`, so the handles drop first.
     tasks: RefCell<Vec<JoinHandle<()>>>,
     executor: Rc<Executor>,
@@ -34,7 +34,7 @@ impl TurnedGroup {
             Executor::new(stellarator::time::Clock::Sim).map_err(|_| ParamError::ThreadStart {
                 thread: thread.to_string(),
             })?;
-        let (stop, stop_rx) = stop_pair();
+        let (stop, stop_rx) = Stop::pair();
         Ok(Rc::new(Self {
             stop,
             stop_rx,
@@ -47,10 +47,10 @@ impl TurnedGroup {
     /// Builds `member` on this thread, inside the executor's scope, and
     /// spawns its task.
     pub(crate) fn add(&self, member: Member) -> Result<(), ParamError> {
-        let Member { launch, panicked } = member;
+        let panicked = member.panicked.clone();
         let stop = self.stop_rx.clone();
-        let running = self.executor.enter(|| build(launch, stop))?;
-        let handle = self.executor.spawn(task(running, panicked));
+        let running = self.executor.enter(|| member.launch(stop))?;
+        let handle = self.executor.spawn(Member::run(running, panicked));
         self.tasks.borrow_mut().push(handle);
         Ok(())
     }

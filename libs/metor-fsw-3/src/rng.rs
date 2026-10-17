@@ -8,7 +8,9 @@ pub struct Rng(u64);
 impl Rng {
     /// The stream for instance `name` under target seed `seed`.
     pub fn seeded(seed: u64, name: &str) -> Self {
-        Self(finalize(seed ^ finalize(fnv1a64(name))))
+        Self(finalize(
+            seed ^ finalize(const_fnv1a_hash::fnv1a_hash_str_64(name)),
+        ))
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -34,11 +36,6 @@ fn finalize(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
-}
-
-fn fnv1a64(name: &str) -> u64 {
-    let step = |hash: u64, byte: &u8| (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
-    name.as_bytes().iter().fold(0xcbf2_9ce4_8422_2325, step)
 }
 
 #[cfg(test)]

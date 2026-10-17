@@ -5,6 +5,7 @@
 //! allocates one ring per output, with one reader slot for every input that
 //! reads from it, and binds each system to its rings.
 
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,10 +22,8 @@ use super::config::{Adapter, BuildOptions, Clock, CoordinatorConfig, PortRef, Sy
 use super::error::BuildError;
 use super::params::Params;
 use super::run::{Coordinator, Entry};
-use super::status::SystemStatus;
+use super::status::{STATUS_PORT, SystemStatus};
 use super::table::{MakeCx, SystemTable, TableEntry};
-
-const STATUS_PORT: &str = "status";
 
 struct RingSpec {
     system: String,
@@ -61,8 +60,8 @@ impl PlannedSystem<'_> {
         if port == STATUS_PORT {
             return Some(self.status);
         }
-        let at = self.def.outputs.iter().position(|p| p.name == port)?;
-        Some(self.outputs[at])
+        let index = self.def.outputs.iter().position(|p| p.name == port)?;
+        Some(self.outputs[index])
     }
 }
 
@@ -83,12 +82,12 @@ impl CoordinatorConfig {
         }
         let records = Arc::new(table.records());
         let mut plan = Plan::resolve(&self, table, &records)?;
-        check_ids(&plan)?;
+        plan.check_ids()?;
         plan.set_reader_counts();
         let rings = plan
             .rings
             .iter()
-            .map(|spec| allocate_ring(spec, self.ring_depth))
+            .map(|spec| spec.allocate(self.ring_depth))
             .collect::<Result<Vec<_>, _>>()?;
         let mut threads = match options.deterministic {
             true => Threads::deterministic(),
@@ -96,7 +95,7 @@ impl CoordinatorConfig {
         };
         let args = SharedMakeArgs {
             seed: Some(self.seed),
-            namespace: self.namespace.as_deref().unwrap_or_default(),
+            namespace: self.namespace.as_deref(),
             records: &records,
         };
         let entries = make_systems(&plan, &rings, &mut threads, args)?;
@@ -151,7 +150,12 @@ impl<'a> Plan<'a> {
             .iter()
             .map(|port| self.add_ring(&system.id, port.clone()))
             .collect();
-        let status = self.add_ring(&system.id, status_def(&system.id, namespace));
+        let status_cx = DefCx {
+            id: &system.id,
+            namespace,
+            ..DefCx::empty()
+        };
+        let status = self.add_ring(&system.id, SystemStatus::port_def(&status_cx));
         self.systems.push(PlannedSystem {
             id: &system.id,
             entry,
@@ -182,14 +186,14 @@ impl<'a> Plan<'a> {
         port: &str,
         from: &PortRef,
     ) -> Result<Option<RingIndex>, BuildError> {
-        let Some(&at) = self.index.get(from.system.as_str()) else {
+        let Some(&index) = self.index.get(from.system.as_str()) else {
             return Err(BuildError::UnknownSystem {
                 id: id.to_string(),
                 port: port.to_string(),
                 from: from.system.clone(),
             });
         };
-        let Some(producer) = self.systems.get(at) else {
+        let Some(producer) = self.systems.get(index) else {
             return Ok(None);
         };
         let ring = producer.output_ring(&from.port);
@@ -236,26 +240,35 @@ impl<'a> Plan<'a> {
             ring.readers = ring.readers.max(1);
         }
     }
-}
 
-/// Returns the definition of system `id`'s `status` output.
-///
-/// The coordinator adds this output to every system. It is namespaced like the
-/// system's own ports.
-pub(crate) fn status_def(id: &str, namespace: Option<&str>) -> PortDef {
-    let cx = DefCx {
-        id,
-        namespace,
-        ..DefCx::empty()
-    };
-    Output::<SystemStatus>::def(&cx, STATUS_PORT)
+    /// Checks that every input edge reads the record id its port expects.
+    fn check_ids(&self) -> Result<(), BuildError> {
+        for system in &self.systems {
+            for (port, edges) in system.inputs.iter().enumerate() {
+                let def = &system.def.inputs[port];
+                for &ring in edges {
+                    let spec = &self.rings[ring];
+                    if spec.port.id != def.id {
+                        return Err(BuildError::IdMismatch {
+                            id: system.id.to_string(),
+                            port: def.name.to_string(),
+                            from: format!("{}.{}", spec.system, spec.port.name),
+                            expected: def.id,
+                            found: spec.port.id,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Maps each system id to its position in the config, rejecting duplicate ids.
 fn index_by_id(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, BuildError> {
     let mut index = HashMap::with_capacity(config.systems.len());
-    for (at, system) in config.systems.iter().enumerate() {
-        if index.insert(system.id.as_str(), at).is_some() {
+    for (position, system) in config.systems.iter().enumerate() {
+        if index.insert(system.id.as_str(), position).is_some() {
             return Err(BuildError::DuplicateId {
                 id: system.id.clone(),
             });
@@ -381,56 +394,37 @@ fn find_duplicate(ports: &[PortDef]) -> Option<&PortDef> {
     ports
         .iter()
         .enumerate()
-        .find(|(at, port)| ports[..*at].iter().any(|other| other.name == port.name))
+        .find(|(index, port)| ports[..*index].iter().any(|other| other.name == port.name))
         .map(|(_, port)| port)
 }
 
-fn check_ids(plan: &Plan<'_>) -> Result<(), BuildError> {
-    for system in &plan.systems {
-        for (port, edges) in system.inputs.iter().enumerate() {
-            let def = &system.def.inputs[port];
-            for &ring in edges {
-                let spec = &plan.rings[ring];
-                if spec.port.id != def.id {
-                    return Err(BuildError::IdMismatch {
-                        id: system.id.to_string(),
-                        port: def.name.to_string(),
-                        from: format!("{}.{}", spec.system, spec.port.name),
-                        expected: def.id,
-                        found: spec.port.id,
-                    });
-                }
-            }
-        }
+impl RingSpec {
+    /// Allocates a ring that holds `self.port.depth * ring_depth` records.
+    fn allocate(&self, ring_depth: NonZeroUsize) -> Result<RingBuffer, BuildError> {
+        let too_large = || BuildError::RingTooLarge {
+            system: self.system.clone(),
+            port: self.port.name.to_string(),
+            max_len: self.port.max_len,
+        };
+        let depth = self
+            .port
+            .depth
+            .checked_mul(ring_depth.get())
+            .ok_or_else(too_large)?;
+        let capacity = ring_capacity(self.port.max_len, depth).ok_or_else(too_large)?;
+        let config = Config {
+            capacity,
+            max_readers: self.readers,
+        };
+        RingBuffer::create_in_memory(config).map_err(|_| too_large())
     }
-    Ok(())
-}
-
-/// Allocates a ring that holds `spec.port.depth * ring_depth` records.
-fn allocate_ring(spec: &RingSpec, ring_depth: usize) -> Result<RingBuffer, BuildError> {
-    let too_large = || BuildError::RingTooLarge {
-        system: spec.system.clone(),
-        port: spec.port.name.to_string(),
-        max_len: spec.port.max_len,
-    };
-    let depth = spec
-        .port
-        .depth
-        .checked_mul(ring_depth)
-        .ok_or_else(too_large)?;
-    let capacity = ring_capacity(spec.port.max_len, depth).ok_or_else(too_large)?;
-    let config = Config {
-        capacity,
-        max_readers: spec.readers,
-    };
-    RingBuffer::create_in_memory(config).map_err(|_| too_large())
 }
 
 /// The make arguments every system in the target shares.
 #[derive(Clone, Copy)]
 struct SharedMakeArgs<'a> {
     seed: Option<u64>,
-    namespace: &'a str,
+    namespace: Option<&'a str>,
     records: &'a Arc<Records>,
 }
 
@@ -503,15 +497,14 @@ impl Clock {
         }
     }
 
-    /// Returns the wall-clock time budget for one cycle.
-    ///
-    /// Returns zero for a simulated clock.
-    pub(crate) fn cycle_budget(&self) -> Duration {
+    /// Returns the wall-clock time budget for one cycle, or `None` for a
+    /// simulated clock.
+    pub(crate) fn cycle_budget(&self) -> Option<Duration> {
         match self {
             Clock::Wall { rate } => {
-                Duration::try_from_secs_f64(1.0 / rate.get()).unwrap_or(Duration::MAX)
+                Some(Duration::try_from_secs_f64(1.0 / rate.get()).unwrap_or(Duration::MAX))
             }
-            Clock::Simulated { .. } => Duration::ZERO,
+            Clock::Simulated { .. } => None,
         }
     }
 }
@@ -779,7 +772,7 @@ mod tests {
     #[test]
     fn test_reject_ring_address_overflow() {
         let config = CoordinatorConfig {
-            ring_depth: usize::MAX,
+            ring_depth: NonZeroUsize::MAX,
             systems: vec![source("imu")],
             ..Default::default()
         };
@@ -799,7 +792,7 @@ mod tests {
     fn test_reject_region_address_overflow() {
         // A capacity of 2^63 fits `usize`; the region around it does not.
         let config = CoordinatorConfig {
-            ring_depth: 1 << 58,
+            ring_depth: NonZeroUsize::new(1 << 58).expect("nonzero"),
             systems: vec![source("imu")],
             ..Default::default()
         };
@@ -1104,19 +1097,16 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_cycle_budget() {
-        assert_eq!(
-            Clock::Simulated {
-                dt: Duration::from_millis(5),
-                epoch: None,
-            }
-            .cycle_budget(),
-            Duration::ZERO
-        );
+    fn test_cycle_budget() {
+        let simulated = Clock::Simulated {
+            dt: Duration::from_millis(5),
+            epoch: None,
+        };
+        assert_eq!(simulated.cycle_budget(), None);
         let clock = Clock::Wall {
             rate: WallRate::try_from(f64::MAX).expect("finite"),
         };
-        assert_eq!(clock.cycle_budget(), Duration::ZERO);
+        assert_eq!(clock.cycle_budget(), Some(Duration::ZERO));
     }
 
     #[test]
@@ -1124,6 +1114,6 @@ mod tests {
         let clock = Clock::Wall {
             rate: WallRate::try_from(WallRate::MIN).expect("the minimum"),
         };
-        assert_eq!(clock.cycle_budget(), Duration::from_secs(1_000));
+        assert_eq!(clock.cycle_budget(), Some(Duration::from_secs(1_000)));
     }
 }

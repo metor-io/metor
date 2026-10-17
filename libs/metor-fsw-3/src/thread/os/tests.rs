@@ -94,7 +94,7 @@ fn test_mirror_overflow_report() {
     for deterministic in MODES {
         let recorder = Recorder::default();
         let config = CoordinatorConfig {
-            ring_depth: 2,
+            ring_depth: core::num::NonZeroUsize::new(2).expect("nonzero"),
             systems: vec![
                 SystemConfig::new("imu", "imu"),
                 reading("sleeper", "sleeper", "imu", PortRef::new("imu", "imu")),
@@ -260,6 +260,58 @@ fn test_reject_cyclic_thread_placement() {
             },
         })
     );
+}
+
+#[test]
+fn test_corrupt_mirror_ends_the_system() {
+    use metor_proto_wkt::LogEvent;
+
+    use crate::coordinator::{EndReason, MakeCx, Params};
+    use crate::mirror::tests::slot_cursor;
+    use crate::tests::utils::{Imu, Nav, input, output, ring};
+
+    let table = table(&Recorder::default());
+    let entry = table.get("relay").expect("registered");
+    let (imu, nav, log) = (ring::<Imu>(8, 1), ring::<Nav>(8, 1), ring::<LogEvent>(8, 1));
+    let mut lines = input::<LogEvent>(&log);
+    let mut threads = super::Threads::deterministic();
+    let mut step = (entry.make)(MakeCx {
+        id: "relay",
+        adapter: None,
+        def: &entry.def,
+        params: Params(&serde_json::Value::Null),
+        inputs: vec![vec![&imu]],
+        outputs: vec![&nav, &log],
+        threads: &mut threads,
+        seed: Some(0),
+        namespace: None,
+        records: &Default::default(),
+    })
+    .expect("a placed relay");
+    let (base, _) = nav.region();
+    // SAFETY: the slot is inside the region, and nothing reads it concurrently.
+    unsafe {
+        base.add(slot_cursor(nav.config()))
+            .cast::<u64>()
+            .write(u64::MAX - 1)
+    };
+    output::<Imu>(&imu).write(&Imu::new(1, 1.0)).expect("room");
+
+    for cycle in 1..=8 {
+        step.execute(Timestamp(cycle * 1_000_000));
+        if step.ended().is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        step.ended(),
+        Some(&EndReason::Failed("corrupt ring".into()))
+    );
+    let corrupt = lines
+        .drain()
+        .filter_map(Result::ok)
+        .any(|line| kind(&line) == Some("corrupt"));
+    assert!(corrupt, "a corrupt fault line");
 }
 
 mod turned {

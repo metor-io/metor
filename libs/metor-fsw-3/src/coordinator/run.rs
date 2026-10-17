@@ -87,8 +87,9 @@ impl Coordinator {
             let started = Instant::now();
             let now = self.now();
             self.step(now);
-            match started.elapsed() {
-                elapsed if elapsed < budget => stellarator::sleep(budget - elapsed).await,
+            let elapsed = started.elapsed();
+            match budget {
+                Some(budget) if elapsed < budget => stellarator::sleep(budget - elapsed).await,
                 _ => stellarator::yield_now().await,
             }
             if poll_once(stop.as_mut()).await.is_some() {

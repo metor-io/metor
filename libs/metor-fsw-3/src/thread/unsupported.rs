@@ -51,7 +51,7 @@ mod tests {
             outputs: vec![&nav, &log],
             threads: &mut Threads::default(),
             seed: Some(0),
-            namespace: "",
+            namespace: None,
             records: &Default::default(),
         });
         assert_eq!(

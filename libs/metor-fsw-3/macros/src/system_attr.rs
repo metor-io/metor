@@ -30,6 +30,16 @@ enum Kind {
     Sequence,
 }
 
+impl Kind {
+    /// The attribute, as error messages name it.
+    fn attr(self) -> &'static str {
+        match self {
+            Self::System => "#[system]",
+            Self::Sequence => "#[sequence]",
+        }
+    }
+}
+
 /// Expands `#[system]`.
 pub fn system(item: TokenStream) -> TokenStream {
     expand_attr(item, Kind::System)
@@ -51,8 +61,8 @@ fn expand(item: TokenStream2, fsw: &TokenStream2, kind: Kind) -> TokenStream2 {
     match syn::parse2::<Item>(item) {
         Ok(Item::Fn(f)) => expand_fn(f, fsw, kind),
         Ok(other) => {
-            let err = syn::Error::new(Span::call_site(), "`#[system]` goes on a free fn");
-            with_error(other, err)
+            let message = format!("`{}` goes on a free fn", kind.attr());
+            with_error(other, syn::Error::new(Span::call_site(), message))
         }
         Err(e) => e.to_compile_error(),
     }
@@ -72,19 +82,27 @@ struct Arg {
     ty: Type,
 }
 
+/// What a checked fn expands to.
+enum Shape {
+    /// A `#[system]` fn the coordinator calls once a cycle.
+    Cyclic,
+    /// An async `#[system]` fn, whose last parameter is `stop`.
+    Async { stop: Ident },
+    /// A `#[sequence]` fn.
+    Sequence,
+}
+
 /// A checked `#[system]` or `#[sequence]` fn signature.
 struct Sig {
-    kind: Kind,
+    shape: Shape,
     args: Vec<Arg>,
     /// The index of the `#[state]` parameter.
     state: Option<usize>,
-    /// Whether the last parameter is the async `stop: Stop`.
-    stop: bool,
 }
 
 impl Sig {
     fn parse(sig: &Signature, states: &[(usize, Attribute)], kind: Kind) -> syn::Result<Self> {
-        check_generics(&sig.generics)?;
+        check_generics(&sig.generics, kind)?;
         match kind {
             Kind::System => check_output(&sig.output)?,
             Kind::Sequence => check_sequence_output(sig)?,
@@ -92,25 +110,24 @@ impl Sig {
         let args = sig
             .inputs
             .iter()
-            .map(arg)
+            .map(|input| arg(input, kind))
             .collect::<syn::Result<Vec<_>>>()?;
         check_kinds(&args, kind)?;
-        let state = state(&args, states)?;
-        let stop = match kind {
-            Kind::System => system_stop(sig, &args, state)?,
-            Kind::Sequence => sequence_stop(sig, &args, state)?,
+        let state = state(&args, states, kind)?;
+        let shape = match kind {
+            Kind::System => system_shape(sig, &args, state)?,
+            Kind::Sequence => {
+                check_no_stop(sig, &args, state)?;
+                Shape::Sequence
+            }
         };
-        Ok(Self {
-            kind,
-            args,
-            state,
-            stop,
-        })
+        Ok(Self { shape, args, state })
     }
 
     /// Returns the parameters that are ports, in order.
     fn ports(&self) -> impl Iterator<Item = &Arg> {
-        let end = self.args.len() - usize::from(self.stop);
+        let stop = matches!(self.shape, Shape::Async { .. });
+        let end = self.args.len() - usize::from(stop);
         self.args[..end]
             .iter()
             .enumerate()
@@ -147,26 +164,20 @@ fn take_states(sig: &mut Signature) -> Vec<(usize, Attribute)> {
     states
 }
 
-fn arg(input: &FnArg) -> syn::Result<Arg> {
+fn arg(input: &FnArg, kind: Kind) -> syn::Result<Arg> {
+    let attr = kind.attr();
     let FnArg::Typed(typed) = input else {
-        return Err(syn::Error::new_spanned(
-            input,
-            "`#[system]` goes on a free fn",
-        ));
+        let message = format!("`{attr}` goes on a free fn");
+        return Err(syn::Error::new_spanned(input, message));
     };
+    let plain_name = format!("{attr} parameters need a plain name");
     let Pat::Ident(pat) = &*typed.pat else {
-        return Err(syn::Error::new_spanned(
-            &typed.pat,
-            "#[system] parameters need a plain name",
-        ));
+        return Err(syn::Error::new_spanned(&typed.pat, plain_name));
     };
     if pat.subpat.is_some() || pat.by_ref.is_some() {
-        return Err(syn::Error::new_spanned(
-            pat,
-            "#[system] parameters need a plain name",
-        ));
+        return Err(syn::Error::new_spanned(pat, plain_name));
     }
-    check_type(&typed.ty)?;
+    check_type(&typed.ty, kind)?;
     Ok(Arg {
         ident: pat.ident.clone(),
         ty: (*typed.ty).clone(),
@@ -174,7 +185,7 @@ fn arg(input: &FnArg) -> syn::Result<Arg> {
 }
 
 /// Finds the one `#[state]` parameter and checks it is `&mut S`.
-fn state(args: &[Arg], states: &[(usize, Attribute)]) -> syn::Result<Option<usize>> {
+fn state(args: &[Arg], states: &[(usize, Attribute)], kind: Kind) -> syn::Result<Option<usize>> {
     match states {
         [] => Ok(None),
         [(i, _)] => match &args[*i].ty {
@@ -183,30 +194,36 @@ fn state(args: &[Arg], states: &[(usize, Attribute)]) -> syn::Result<Option<usiz
         },
         [_, (_, second), ..] => Err(syn::Error::new_spanned(
             second,
-            "a `#[system]` fn takes one `#[state]` parameter at most",
+            format!(
+                "a `{}` fn takes one `#[state]` parameter at most",
+                kind.attr()
+            ),
         )),
     }
 }
 
-/// Returns whether a `#[system]` fn is async.
+/// Returns whether a `#[system]` fn is cyclic or async.
 ///
 /// An async `#[system]` fn must take `stop: Stop` as its last parameter.
-fn system_stop(sig: &Signature, args: &[Arg], state: Option<usize>) -> syn::Result<bool> {
-    let stop = sig.asyncness.is_some();
-    if stop && !ends_in_stop(args, state) {
-        return Err(syn::Error::new_spanned(
+fn system_shape(sig: &Signature, args: &[Arg], state: Option<usize>) -> syn::Result<Shape> {
+    if sig.asyncness.is_none() {
+        return Ok(Shape::Cyclic);
+    }
+    match args.last().filter(|_| ends_in_stop(args, state)) {
+        Some(stop) => Ok(Shape::Async {
+            stop: stop.ident.clone(),
+        }),
+        None => Err(syn::Error::new_spanned(
             sig,
             "an async `#[system]` fn takes `stop: Stop` as its last parameter",
-        ));
+        )),
     }
-    Ok(stop)
 }
 
 /// Checks that a `#[sequence]` fn is async and takes no `stop`.
 ///
-/// A sequence learns about an abort through its `Seq`, so this returns
-/// `Ok(false)` on success.
-fn sequence_stop(sig: &Signature, args: &[Arg], state: Option<usize>) -> syn::Result<bool> {
+/// A sequence learns about an abort through its `Seq`.
+fn check_no_stop(sig: &Signature, args: &[Arg], state: Option<usize>) -> syn::Result<()> {
     if sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
             sig.fn_token,
@@ -219,7 +236,7 @@ fn sequence_stop(sig: &Signature, args: &[Arg], state: Option<usize>) -> syn::Re
             "a `#[sequence]` fn takes no `stop`; `seq.aborted()` and its waits report an abort",
         ));
     }
-    Ok(false)
+    Ok(())
 }
 
 /// Rejects parameter types that belong to the other kind of fn.
@@ -238,7 +255,10 @@ fn check_kinds(args: &[Arg], kind: Kind) -> syn::Result<()> {
         ],
     };
     for arg in args {
-        if let Some((_, message)) = refused.iter().find(|(name, _)| names(&arg.ty, name)) {
+        if let Some((_, message)) = refused
+            .iter()
+            .find(|(name, _)| is_type_named(&arg.ty, name))
+        {
             return Err(syn::Error::new_spanned(&arg.ty, *message));
         }
     }
@@ -246,9 +266,9 @@ fn check_kinds(args: &[Arg], kind: Kind) -> syn::Result<()> {
 }
 
 /// Returns whether `ty` is a path ending in `name`, ignoring references.
-fn names(ty: &Type, name: &str) -> bool {
+fn is_type_named(ty: &Type, name: &str) -> bool {
     match ty {
-        Type::Reference(r) => names(&r.elem, name),
+        Type::Reference(r) => is_type_named(&r.elem, name),
         Type::Path(path) => path.path.segments.last().is_some_and(|s| s.ident == name),
         _ => false,
     }
@@ -258,14 +278,13 @@ fn ends_in_stop(args: &[Arg], state: Option<usize>) -> bool {
     let Some(last) = args.len().checked_sub(1) else {
         return false;
     };
-    let is_stop = matches!(&args[last].ty, Type::Path(path)
-        if path.path.segments.last().is_some_and(|s| s.ident == "Stop"));
+    let is_stop = matches!(&args[last].ty, Type::Path(_)) && is_type_named(&args[last].ty, "Stop");
     is_stop && state != Some(last)
 }
 
-fn check_generics(generics: &Generics) -> syn::Result<()> {
+fn check_generics(generics: &Generics, kind: Kind) -> syn::Result<()> {
     match generics.lifetimes().next() {
-        Some(lt) => Err(syn::Error::new_spanned(lt, NAMED_LIFETIME)),
+        Some(lt) => Err(syn::Error::new_spanned(lt, named_lifetime(kind))),
         None => Ok(()),
     }
 }
@@ -284,7 +303,7 @@ fn check_output(output: &ReturnType) -> syn::Result<()> {
 /// The expected type is `Result<(), SeqError>`.
 fn check_sequence_output(sig: &Signature) -> syn::Result<()> {
     match &sig.output {
-        ReturnType::Type(_, ty) if names(ty, "Result") => Ok(()),
+        ReturnType::Type(_, ty) if is_type_named(ty, "Result") => Ok(()),
         ReturnType::Type(_, ty) => Err(syn::Error::new_spanned(ty, SEQUENCE_OUTPUT)),
         ReturnType::Default => Err(syn::Error::new_spanned(&sig.ident, SEQUENCE_OUTPUT)),
     }
@@ -292,32 +311,35 @@ fn check_sequence_output(sig: &Signature) -> syn::Result<()> {
 
 const SEQUENCE_OUTPUT: &str = "a `#[sequence]` fn returns `Result<(), SeqError>`";
 
-const NAMED_LIFETIME: &str = "`#[system]` parameters take no named lifetimes";
+fn named_lifetime(kind: Kind) -> String {
+    format!("`{}` parameters take no named lifetimes", kind.attr())
+}
 
 /// Rejects named lifetimes and `impl Trait` in a parameter type.
 ///
 /// Neither can be written in the fn pointer type or the `Params` tuple.
-fn check_type(ty: &Type) -> syn::Result<()> {
-    let mut check = TypeCheck(None);
+fn check_type(ty: &Type, kind: Kind) -> syn::Result<()> {
+    let mut check = TypeCheck { kind, error: None };
     check.visit_type(ty);
-    check.0.map_or(Ok(()), Err)
+    check.error.map_or(Ok(()), Err)
 }
 
-struct TypeCheck(Option<syn::Error>);
+struct TypeCheck {
+    kind: Kind,
+    error: Option<syn::Error>,
+}
 
 impl<'ast> Visit<'ast> for TypeCheck {
     fn visit_lifetime(&mut self, lt: &'ast Lifetime) {
-        if lt.ident != "_" && self.0.is_none() {
-            self.0 = Some(syn::Error::new_spanned(lt, NAMED_LIFETIME));
+        if lt.ident != "_" && self.error.is_none() {
+            self.error = Some(syn::Error::new_spanned(lt, named_lifetime(self.kind)));
         }
     }
 
     fn visit_type_impl_trait(&mut self, ty: &'ast TypeImplTrait) {
-        if self.0.is_none() {
-            self.0 = Some(syn::Error::new_spanned(
-                ty,
-                "`#[system]` parameters take no `impl Trait`",
-            ));
+        if self.error.is_none() {
+            let message = format!("`{}` parameters take no `impl Trait`", self.kind.attr());
+            self.error = Some(syn::Error::new_spanned(ty, message));
         }
     }
 }
@@ -370,17 +392,17 @@ fn emit(f: ItemFn, sig: &Sig, fsw: &TokenStream2) -> TokenStream2 {
     let type_params = f.sig.generics.type_params().map(|p| &p.ident);
     let state_ty = sig.state_ty();
     // The trait bound the rewritten fn returns, plus the impls behind it.
-    let (bound, call) = match (sig.kind, sig.args.last().filter(|_| sig.stop)) {
-        (Kind::Sequence, _) => sequence_call(sig, &state_ty, &generics, fsw),
-        (Kind::System, Some(stop)) => async_call(sig, &stop.ident, &state_ty, &generics, fsw),
-        (Kind::System, None) => cyclic_call(sig, &state_ty, &generics, fsw),
+    let (bound, call) = match &sig.shape {
+        Shape::Sequence => sequence_call(sig, &state_ty, &generics, fsw),
+        Shape::Async { stop } => async_call(sig, stop, &state_ty, &generics, fsw),
+        Shape::Cyclic => cyclic_call(sig, &state_ty, &generics, fsw),
     };
     let ports = ports_impl(sig, &name.to_string(), &doc, &state_ty, &generics, fsw);
     let mut body_sig = Signature {
         ident: format_ident!("__metor_body"),
         ..f.sig.clone()
     };
-    if sig.kind == Kind::Sequence {
+    if matches!(sig.shape, Shape::Sequence) {
         share_lifetime(&mut body_sig);
     }
     let body = ItemFn {

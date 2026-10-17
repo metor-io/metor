@@ -70,10 +70,8 @@ impl Drop for Own {
 struct Installed(*const Executor);
 
 impl Installed {
-    /// Casts to `Executor<DefaultReactor>`. This is sound because only the
-    /// default reactor's constructors can build an `Executor`.
-    fn new<R: Reactor>(exec: &Executor<R>) -> Self {
-        let exec = (exec as *const Executor<R>).cast::<Executor>();
+    fn new(exec: &Executor) -> Self {
+        let exec: *const Executor = exec;
         Self(EXEC.try_with(|e| e.replace(exec)).unwrap_or(exec))
     }
 }
@@ -140,14 +138,67 @@ impl From<rustix::io::Errno> for Error {
 
 pub type BufResult<T, B> = (Result<T, Error>, B);
 
-pub struct Executor<R: Reactor = DefaultReactor> {
-    reactor: RefCell<R>,
+pub struct Executor {
+    reactor: RefCell<DefaultReactor>,
     scheduler: maitake::scheduler::LocalScheduler,
     tasks: RefCell<Vec<TaskRef>>,
     timer: maitake::time::Timer,
 }
 
-impl<R: Reactor> Executor<R> {
+impl Drop for Executor {
+    /// Cancels every task and ticks once, so each task drops its future and any
+    /// `Sleep` on this timer before the timer drops. Then cancels pending IO.
+    /// Skips all of it while the thread exits.
+    fn drop(&mut self) {
+        if EXITING.try_with(Cell::get).unwrap_or(true) {
+            return;
+        }
+        let this = &*self;
+        let _installed = Installed::new(this);
+        for task in this.tasks.borrow().iter() {
+            task.cancel();
+        }
+        this.scheduler.tick();
+        this.scheduler.cancel_all();
+        this.tasks.borrow_mut().clear();
+        let io = &mut this.reactor.borrow_mut().drain_io();
+        io.cancel();
+    }
+}
+
+pub trait Reactor {
+    fn wait_for_io(&mut self, timeout: Option<Duration>) -> Result<(), Error>;
+    fn process_io(&mut self) -> Result<(), Error>;
+
+    type RemainingIo: IoStates;
+
+    fn drain_io(&mut self) -> Self::RemainingIo;
+    fn waker(&self) -> Waker;
+    fn external_waker(&self) -> impl ExternalWaker;
+}
+
+pub trait IoStates {
+    fn cancel(&mut self);
+}
+
+impl IoStates for () {
+    fn cancel(&mut self) {}
+}
+
+/// Runs `func`'s future to completion on the thread's default executor, then
+/// drops that executor. The next `run` creates a new one.
+pub fn run<R, F>(func: impl FnOnce() -> F) -> R
+where
+    F: Future<Output = R> + 'static,
+    R: 'static,
+{
+    let exec = Executor::own();
+    let out = exec.run(func).unwrap();
+    OWN.with(|o| o.0.borrow_mut().take());
+    out
+}
+
+impl Executor {
     pub fn run<O, F>(&self, func: impl FnOnce() -> F) -> Result<O, Error>
     where
         F: Future<Output = O> + 'static,
@@ -186,7 +237,7 @@ impl<R: Reactor> Executor<R> {
             }
         };
         self.scheduler.cancel_all();
-        let mut io = self.reactor.borrow_mut().drain_io();
+        let io = &mut self.reactor.borrow_mut().drain_io();
         io.cancel();
         Ok(out)
     }
@@ -200,62 +251,7 @@ impl<R: Reactor> Executor<R> {
         }
         tasks.push(task);
     }
-}
 
-impl<R: Reactor> Drop for Executor<R> {
-    /// Cancels every task and ticks once, so each task drops its future and any
-    /// `Sleep` on this timer before the timer drops. Then cancels pending IO.
-    /// Skips all of it while the thread exits.
-    fn drop(&mut self) {
-        if EXITING.try_with(Cell::get).unwrap_or(true) {
-            return;
-        }
-        let this = &*self;
-        let _installed = Installed::new(this);
-        for task in this.tasks.borrow().iter() {
-            task.cancel();
-        }
-        this.scheduler.tick();
-        this.scheduler.cancel_all();
-        this.tasks.borrow_mut().clear();
-        let mut io = this.reactor.borrow_mut().drain_io();
-        io.cancel();
-    }
-}
-
-pub trait Reactor {
-    fn wait_for_io(&mut self, timeout: Option<Duration>) -> Result<(), Error>;
-    fn process_io(&mut self) -> Result<(), Error>;
-
-    type RemainingIo: IoStates;
-
-    fn drain_io(&mut self) -> Self::RemainingIo;
-    fn waker(&self) -> Waker;
-    fn external_waker(&self) -> impl ExternalWaker;
-}
-
-pub trait IoStates {
-    fn cancel(&mut self);
-}
-
-impl IoStates for () {
-    fn cancel(&mut self) {}
-}
-
-/// Runs `func`'s future to completion on the thread's default executor, then
-/// drops that executor. The next `run` creates a new one.
-pub fn run<R, F>(func: impl FnOnce() -> F) -> R
-where
-    F: Future<Output = R> + 'static,
-    R: 'static,
-{
-    let exec = Executor::own();
-    let out = exec.run(func).unwrap();
-    OWN.with(|o| o.0.borrow_mut().take());
-    out
-}
-
-impl Executor<DefaultReactor> {
     /// Creates an executor with its own reactor and the given clock.
     pub fn new(clock: time::Clock) -> Result<Self, Error> {
         let mut exec = Self::try_new()?;
@@ -266,7 +262,7 @@ impl Executor<DefaultReactor> {
     /// Advances the timer, processes IO, and ticks the scheduler once, with
     /// `self` as the current executor. Never blocks and never moves the clock.
     pub fn turn(self: &Rc<Self>) -> Turned {
-        let _installed = Installed::new(&**self);
+        let _installed = Installed::new(self);
         self.timer.try_turn();
         let _ = self.reactor.borrow_mut().process_io();
         let tick = self.scheduler.tick();
@@ -281,7 +277,7 @@ impl Executor<DefaultReactor> {
     /// Runs `f` with `self` as the current executor, so `spawn` and `sleep`
     /// inside it reach `self`.
     pub fn enter<T>(self: &Rc<Self>, f: impl FnOnce() -> T) -> T {
-        let _installed = Installed::new(&**self);
+        let _installed = Installed::new(self);
         f()
     }
 
@@ -293,7 +289,7 @@ impl Executor<DefaultReactor> {
         F: Future + 'static,
         F::Output: Send + 'static,
     {
-        let _installed = Installed::new(&**self);
+        let _installed = Installed::new(self);
         spawn(f)
     }
 

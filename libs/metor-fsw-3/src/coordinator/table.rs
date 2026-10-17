@@ -1,9 +1,9 @@
 //! The [`SystemTable`], a registry of the system types a config can use.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use metor_fsw_3_ring::{NoWake, RingBuffer};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -16,6 +16,7 @@ use crate::system::{InputBinding, OutputBinding, PortDef, Ports, System, SystemD
 use crate::thread::{DEFAULT_THREAD, Threads};
 
 use super::BuildError;
+use super::SystemStatus;
 use super::config::Adapter;
 use super::params::{ParamError, Params};
 use super::step::Runner;
@@ -32,8 +33,8 @@ pub struct MakeCx<'a> {
     pub threads: &'a mut Threads,
     /// The target seed. A guest's make has none.
     pub seed: Option<u64>,
-    /// The target's namespace, or empty.
-    pub namespace: &'a str,
+    /// The target's namespace.
+    pub namespace: Option<&'a str>,
     /// Every record the system table knows about.
     pub records: &'a Arc<Records>,
 }
@@ -89,8 +90,7 @@ pub(crate) struct TableEntry {
 /// A config refers to each type by the name it was registered under.
 #[derive(Default)]
 pub struct SystemTable {
-    entries: Vec<(String, TableEntry)>,
-    index: HashMap<String, usize>,
+    entries: IndexMap<String, TableEntry>,
 }
 
 impl SystemTable {
@@ -106,10 +106,13 @@ impl SystemTable {
         ty: &str,
         make: impl Fn(Params<'_>) -> Result<(S, S::State), ParamError> + 'static,
     ) -> Result<(), BuildError> {
-        self.insert(
-            ty,
-            TableEntry::system::<S>(make, Cow::Borrowed(""), None).map_err(def_error(ty))?,
-        )
+        let entry = TableEntry::system::<S>(make, Cow::Borrowed(""), None).map_err(|source| {
+            BuildError::TypeDef {
+                ty: ty.to_string(),
+                source,
+            }
+        })?;
+        self.insert(ty, entry)
     }
 
     /// Registers a `#[system]` fn under the name `ty`.
@@ -121,7 +124,11 @@ impl SystemTable {
         _system: S,
         ctor: C,
     ) -> Result<(), BuildError> {
-        let entry = TableEntry::system_fn::<S, M, C>(ctor).map_err(def_error(ty))?;
+        let entry =
+            TableEntry::system_fn::<S, M, C>(ctor).map_err(|source| BuildError::TypeDef {
+                ty: ty.to_string(),
+                source,
+            })?;
         self.insert(ty, entry)
     }
 
@@ -133,8 +140,13 @@ impl SystemTable {
         ty: &str,
         make: impl Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
     ) -> Result<(), BuildError> {
-        let entry = TableEntry::async_system::<A, _>(make, Cow::Borrowed(""), None)
-            .map_err(def_error(ty))?;
+        let entry =
+            TableEntry::async_system::<A, _>(make, Cow::Borrowed(""), None).map_err(|source| {
+                BuildError::TypeDef {
+                    ty: ty.to_string(),
+                    source,
+                }
+            })?;
         self.insert(ty, entry)
     }
 
@@ -153,7 +165,10 @@ impl SystemTable {
         };
         let entry =
             TableEntry::async_system::<FnSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema())
-                .map_err(def_error(ty))?;
+                .map_err(|source| BuildError::TypeDef {
+                    ty: ty.to_string(),
+                    source,
+                })?;
         self.insert(ty, entry)
     }
 
@@ -162,29 +177,18 @@ impl SystemTable {
     /// An entry with the same name is replaced in place, so iteration order
     /// stays the order types were first registered.
     pub(crate) fn insert(&mut self, ty: &str, entry: TableEntry) -> Result<(), BuildError> {
-        check_definition(&entry.def)?;
+        entry.def.check_records()?;
         for (name, known) in &self.entries {
             if name != ty {
-                check_definitions(&known.def, &entry.def)?;
+                entry.def.check_records_against(&known.def)?;
             }
         }
-        self.put(ty, entry);
+        self.entries.insert(ty.to_string(), entry);
         Ok(())
     }
 
-    fn put(&mut self, ty: &str, entry: TableEntry) {
-        match self.index.get(ty) {
-            Some(&at) => self.entries[at].1 = entry,
-            None => {
-                self.index.insert(ty.to_string(), self.entries.len());
-                self.entries.push((ty.to_string(), entry));
-            }
-        }
-    }
-
     pub(crate) fn get(&self, ty: &str) -> Option<&TableEntry> {
-        let &at = self.index.get(ty)?;
-        Some(&self.entries[at].1)
+        self.entries.get(ty)
     }
 
     /// Iterates over every registered type and its entry, in registration order.
@@ -199,78 +203,73 @@ impl SystemTable {
     ///
     /// This includes the `status` port the coordinator adds.
     pub(crate) fn records(&self) -> crate::def::Records {
-        let status = status_port();
+        let status = SystemStatus::port_def(&DefCx::empty());
         crate::def::Records::from_port_defs(
             core::iter::once(&status)
-                .chain(self.entries().flat_map(|(_, entry)| ports(&entry.def))),
+                .chain(self.entries().flat_map(|(_, entry)| entry.def.ports_iter())),
         )
     }
 }
 
-/// Wraps a [`DefError`] with the name of the type whose definition failed.
-fn def_error(ty: &str) -> impl FnOnce(DefError) -> BuildError + '_ {
-    |source| BuildError::Def {
-        id: ty.to_string(),
-        source,
+impl SystemDef {
+    /// Iterates over the inputs, then the outputs.
+    pub(crate) fn ports_iter(&self) -> impl Iterator<Item = &PortDef> {
+        self.inputs.iter().chain(&self.outputs)
     }
-}
 
-/// The `status` port the coordinator adds to every system.
-fn status_port() -> PortDef {
-    crate::Output::<super::SystemStatus>::def(&DefCx::empty(), "status")
-}
-
-fn ports(def: &SystemDef) -> impl Iterator<Item = &PortDef> {
-    def.inputs.iter().chain(&def.outputs)
-}
-
-/// Checks that `def`'s ports agree on their records, with each other and with
-/// the `status` port the coordinator adds.
-fn check_definition(def: &SystemDef) -> Result<(), BuildError> {
-    let status = status_port();
-    for (at, port) in ports(def).enumerate() {
-        check_record(&status, port)?;
-        for known in ports(def).take(at) {
-            check_record(known, port)?;
+    /// Checks that the ports agree on their records, with each other and with
+    /// the `status` port the coordinator adds.
+    fn check_records(&self) -> Result<(), BuildError> {
+        let status = SystemStatus::port_def(&DefCx::empty());
+        for (index, port) in self.ports_iter().enumerate() {
+            status.check_compatible(port)?;
+            for known in self.ports_iter().take(index) {
+                known.check_compatible(port)?;
+            }
         }
+        Ok(())
     }
-    Ok(())
-}
 
-fn check_definitions(known: &SystemDef, incoming: &SystemDef) -> Result<(), BuildError> {
-    for port in ports(incoming) {
-        for known in ports(known) {
-            check_record(known, port)?;
+    /// Checks that the ports agree on their records with every port of `known`.
+    fn check_records_against(&self, known: &SystemDef) -> Result<(), BuildError> {
+        for port in self.ports_iter() {
+            for known in known.ports_iter() {
+                known.check_compatible(port)?;
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
-fn check_record(known: &PortDef, port: &PortDef) -> Result<(), BuildError> {
-    if known.record == port.record && !known.same_record(port) {
-        return Err(BuildError::RecordConflict {
-            record: port.record.to_string(),
-        });
+impl PortDef {
+    /// Checks that `self` and `port` do not define one record, record id, or
+    /// message id two ways.
+    fn check_compatible(&self, port: &PortDef) -> Result<(), BuildError> {
+        if self.record == port.record && !self.same_record(port) {
+            return Err(BuildError::RecordConflict {
+                record: port.record.to_string(),
+            });
+        }
+        if self.record != port.record && self.id == port.id {
+            return Err(BuildError::RecordIdConflict {
+                id: port.id,
+                first: self.record.to_string(),
+                second: port.record.to_string(),
+            });
+        }
+        if let (RecordSchema::Msg { id: a, .. }, RecordSchema::Msg { id: b, .. }) =
+            (&self.schema, &port.schema)
+            && a == b
+            && self.schema != port.schema
+        {
+            return Err(BuildError::MessageIdConflict {
+                id: *a,
+                first: self.record.to_string(),
+                second: port.record.to_string(),
+            });
+        }
+        Ok(())
     }
-    if known.record != port.record && known.id == port.id {
-        return Err(BuildError::RecordIdConflict {
-            id: port.id,
-            first: known.record.to_string(),
-            second: port.record.to_string(),
-        });
-    }
-    if let (RecordSchema::Msg { id: a, .. }, RecordSchema::Msg { id: b, .. }) =
-        (&known.schema, &port.schema)
-        && a == b
-        && known.schema != port.schema
-    {
-        return Err(BuildError::MessageIdConflict {
-            id: *a,
-            first: known.record.to_string(),
-            second: port.record.to_string(),
-        });
-    }
-    Ok(())
 }
 
 impl TableEntry {
@@ -448,7 +447,10 @@ mod tests {
     #[test]
     fn test_record_lookup() {
         let mut table = SystemTable::new();
-        assert_eq!(record(&table, "status"), Some(out(&status_port())));
+        assert_eq!(
+            record(&table, "status"),
+            Some(out(&SystemStatus::port_def(&DefCx::empty())))
+        );
         assert!(record(&table, "missing").is_none());
         let first = Output::<Imu>::def(&DefCx::empty(), "first");
         let mut second = first.clone();
@@ -600,7 +602,7 @@ mod tests {
     #[test]
     fn test_reject_status_replacement() {
         let mut table = SystemTable::new();
-        let mut status = status_port();
+        let mut status = SystemStatus::port_def(&DefCx::empty());
         status.schema = RecordSchema::msg("status", MsgCodec::Bytes);
         assert!(matches!(
             table.insert("bad", declared(vec![status])),
@@ -725,7 +727,7 @@ mod tests {
             outputs: Vec::new(),
             threads: &mut threads,
             seed: Some(0),
-            namespace: "",
+            namespace: None,
             records: &Default::default(),
         })
         .expect("no params");

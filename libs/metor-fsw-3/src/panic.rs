@@ -37,6 +37,13 @@ pub(crate) fn discard(payload: Payload) {
     }
 }
 
+/// Returns a panic payload's message and discards the payload.
+pub(crate) fn into_message(payload: Payload) -> String {
+    let text = message(&*payload).to_string();
+    discard(payload);
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +58,12 @@ mod tests {
         }
         assert!(catch(|| std::panic::panic_any(BadDrop)).is_none());
         assert_eq!(catch(|| 7), Some(7));
+    }
+
+    #[test]
+    fn test_into_message() {
+        assert_eq!(into_message(Box::new("static")), "static");
+        assert_eq!(into_message(Box::new(String::from("owned"))), "owned");
+        assert_eq!(into_message(Box::new(7u8)), "panic");
     }
 }

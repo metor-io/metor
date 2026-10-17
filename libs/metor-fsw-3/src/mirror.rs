@@ -10,12 +10,15 @@
 use core::fmt::Write;
 use std::borrow::Cow;
 
-use metor_fsw_3_ring::{Config, NoWake, ReadError, View, WakeSource, WriteError, Writer};
+use metor_fsw_3_ring::{
+    Config, NoWake, ReadError, RingBuffer, View, WakeSource, WriteError, Writer,
+};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 
 use crate::coordinator::ParamError;
 use crate::fn_system::LOG_PORT;
+use crate::log::LogEventExt;
 use crate::record::Record;
 use crate::system::SystemDef;
 
@@ -76,6 +79,16 @@ impl<W: WakeSource> Mirror<W> {
             });
         self.from.settle();
         moved
+    }
+}
+
+impl Mirror<NoWake> {
+    /// Creates a ring with one reader to mirror `real`, `factor` times its
+    /// capacity.
+    pub(crate) fn ring_for(real: &RingBuffer, factor: usize) -> Result<RingBuffer, ParamError> {
+        let capacity = real.config().capacity;
+        let config = mirror_config(capacity, factor, 1)?;
+        RingBuffer::create_in_memory(config).map_err(|_| ParamError::MirrorTooLarge { capacity })
     }
 }
 
@@ -146,7 +159,7 @@ impl<W: WakeSource> Mirrors<W> {
             return;
         }
         let fields = core::mem::take(&mut self.fields);
-        let event = crate::log::line(
+        let event = LogEvent::line(
             now,
             LogLevel::Error,
             "records dropped into a full mirror",
@@ -165,7 +178,7 @@ impl<W: WakeSource> Mirrors<W> {
         message: &str,
     ) {
         let fields = vec![(Cow::Borrowed("kind"), Cow::Borrowed(kind))];
-        self.emit(&crate::log::line(now, level, message.to_string(), fields));
+        self.emit(&LogEvent::line(now, level, message.to_string(), fields));
     }
 
     /// Moves each port's drop count into its field and resets the count.
@@ -213,7 +226,7 @@ fn counts<'a, W: WakeSource>(
     inputs.chain(outputs)
 }
 
-/// Returns the config for a mirror ring and the length of its region.
+/// Returns the config for a mirror ring.
 ///
 /// The mirror has `readers` readers and `factor` times the capacity of the
 /// `capacity`-byte ring it copies.
@@ -221,14 +234,12 @@ pub(crate) fn mirror_config(
     capacity: usize,
     factor: usize,
     readers: usize,
-) -> Result<(Config, usize), ParamError> {
+) -> Result<Config, ParamError> {
     let too_large = ParamError::MirrorTooLarge { capacity };
-    let config = Config {
-        capacity: capacity.checked_mul(factor).ok_or(too_large.clone())?,
+    Ok(Config {
+        capacity: capacity.checked_mul(factor).ok_or(too_large)?,
         max_readers: readers,
-    };
-    let len = config.region_len().map_err(|_| too_large)?;
-    Ok((config, len))
+    })
 }
 
 /// Returns the index of the system's `log` output, if it has one.
@@ -240,8 +251,6 @@ fn log_port(def: &SystemDef) -> Option<usize> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use metor_fsw_3_ring::RingBuffer;
-
     use super::*;
 
     fn ring(capacity: usize) -> RingBuffer {
@@ -336,7 +345,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_mirror_takes_its_readers() {
-        let config = |readers| mirror_config(64, 4, readers).unwrap().0;
+        let config = |readers| mirror_config(64, 4, readers).unwrap();
         let two = RingBuffer::create_in_memory(config(2)).expect("a valid ring config");
         let _first = two.view(NoWake).unwrap();
         assert!(two.view(NoWake).is_ok(), "a second reader");
@@ -347,15 +356,18 @@ pub(crate) mod tests {
 
     #[test]
     fn test_reject_oversize_mirror() {
-        assert!(mirror_config(64, 4, 1).is_ok());
-        // A capacity that is not a valid ring size once multiplied by four,
-        // and one whose multiple overflows.
-        for capacity in [3, usize::MAX / 2] {
-            assert_eq!(
-                mirror_config(capacity, 4, 1).err(),
-                Some(ParamError::MirrorTooLarge { capacity })
-            );
-        }
+        let capacity = usize::MAX / 2;
+        assert_eq!(
+            mirror_config(capacity, 4, 1).err(),
+            Some(ParamError::MirrorTooLarge { capacity })
+        );
+    }
+
+    #[test]
+    fn test_ring_for_scales_capacity() {
+        let copy = Mirror::ring_for(&ring(256), 4).expect("a valid mirror");
+        assert_eq!(copy.config().capacity, 1024);
+        assert_eq!(copy.config().max_readers, 1);
     }
 
     #[test]

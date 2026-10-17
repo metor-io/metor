@@ -9,10 +9,8 @@ use core::cell::Cell;
 use core::marker::PhantomData;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicU32, Ordering};
-use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::coordinator::OutputSource;
 use crate::def::{DefCx, DefError};
 use crate::record::{Bytes, DecodeError, EncodeError, Record};
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports};
@@ -34,7 +32,9 @@ pub(crate) use sample::Samplers;
 /// Each record is at most `max_len` bytes. The capacity is a power of two and
 /// always fits at least two records. Returns `None` on overflow.
 pub fn ring_capacity(max_len: usize, depth: usize) -> Option<usize> {
+    // The ring refuses a payload longer than `u32::MAX`.
     u32::try_from(max_len).ok()?;
+    // `frame_len` overflows for a payload over `usize::MAX - 31`.
     max_len.checked_add(2 * PAYLOAD_ALIGNMENT - 1)?;
     frame_len(max_len)
         .checked_mul(depth.max(2))?
@@ -319,52 +319,6 @@ impl<T: Record + ?Sized> Input<T, Notifier> {
     }
 }
 
-/// Returns definitions for config inputs that no declared port claimed.
-///
-/// Each port takes its name from the config and its record from its producer.
-pub fn dyn_input_defs(
-    cx: &DefCx<'_>,
-    declared: &[Cow<'static, str>],
-) -> Result<Vec<PortDef>, DefError> {
-    let mut ports: Vec<PortDef> = Vec::new();
-    for (name, producer) in cx.inputs {
-        if declared.iter().any(|taken| taken == name) {
-            continue;
-        }
-        if ports.iter().any(|port| port.name == *name) {
-            return Err(DefError::FanIn {
-                port: name.to_string(),
-            });
-        }
-        ports.push(PortDef {
-            name: name.to_string().into(),
-            ..(*producer).clone()
-        });
-    }
-    Ok(ports)
-}
-
-/// Returns definitions for config outputs that no declared port claimed.
-///
-/// Each port's record comes from the record the config names, or from the
-/// definition `metor build` resolved for it.
-pub fn dyn_output_defs(
-    cx: &DefCx<'_>,
-    declared: &[Cow<'static, str>],
-) -> Result<Vec<PortDef>, DefError> {
-    cx.outputs
-        .iter()
-        .filter(|output| !declared.iter().any(|taken| *taken == output.port))
-        .map(|output| match &output.source {
-            OutputSource::Record(record) => cx.records.port_def(&output.port, record),
-            OutputSource::Def(def) => Ok(PortDef {
-                name: output.port.clone().into(),
-                ..def.clone()
-            }),
-        })
-        .collect()
-}
-
 /// Inputs for a system whose ports are listed in config instead of code.
 ///
 /// Records arrive as raw bytes, undecoded. Each port comes with the definition
@@ -391,7 +345,7 @@ impl DynInputs<Notifier> {
 
 impl<W: WakeSink> Ports<InputBinding<W>> for DynInputs<W> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
-        dyn_input_defs(cx, &[])
+        cx.dyn_input_defs(&[])
     }
 
     fn bind(inputs: Vec<InputBinding<W>>) -> Self {
@@ -429,7 +383,7 @@ impl<W: WakeSource> DynOutputs<W> {
 
 impl<W: WakeSource> Ports<OutputBinding<W>> for DynOutputs<W> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
-        dyn_output_defs(cx, &[])
+        cx.dyn_output_defs(&[])
     }
 
     fn bind(outputs: Vec<OutputBinding<W>>) -> Self {

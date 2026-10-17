@@ -127,8 +127,8 @@ pub(crate) fn catch_step(slot: &mut Option<Box<dyn Step>>, now: Timestamp) -> St
         Ok(false) => Stepped::Ran,
         Ok(true) => Stepped::Ended,
         Err(payload) => {
-            crate::panic::catch(|| step.fault(now, crate::panic::message(&*payload)));
-            crate::panic::discard(payload);
+            let message = crate::panic::into_message(payload);
+            crate::panic::catch(|| step.fault(now, &message));
             crate::panic::catch(|| drop(slot.take()));
             Stepped::Unwound
         }

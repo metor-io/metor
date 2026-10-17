@@ -389,7 +389,7 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
         defs: &mut Defs,
     ) -> Result<(), DefError> {
         param_name(names);
-        let ports = crate::port::dyn_input_defs(cx, &defs.declared_inputs)?;
+        let ports = cx.dyn_input_defs(&defs.declared_inputs)?;
         defs.inputs.extend(ports);
         Ok(())
     }
@@ -420,7 +420,7 @@ impl Param for DynOutputs {
         defs: &mut Defs,
     ) -> Result<(), DefError> {
         param_name(names);
-        let ports = crate::port::dyn_output_defs(cx, &defs.declared_outputs)?;
+        let ports = cx.dyn_output_defs(&defs.declared_outputs)?;
         defs.outputs.extend(ports);
         Ok(())
     }

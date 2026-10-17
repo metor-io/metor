@@ -50,18 +50,18 @@ pub struct Stop(Arc<StopInner>);
 #[derive(Clone)]
 pub struct StopHandle(Arc<StopInner>);
 
-/// Creates a linked [`StopHandle`] and [`Stop`].
-///
-/// A thread group keeps the handle and gives the stop to its systems.
-pub fn stop_pair() -> (StopHandle, Stop) {
-    let inner = Arc::new(StopInner {
-        set: AtomicBool::new(false),
-        woken: WaitQueue::new(),
-    });
-    (StopHandle(inner.clone()), Stop(inner))
-}
-
 impl Stop {
+    /// Creates a linked [`StopHandle`] and [`Stop`].
+    ///
+    /// A thread group keeps the handle and gives the stop to its systems.
+    pub fn pair() -> (StopHandle, Self) {
+        let inner = Arc::new(StopInner {
+            set: AtomicBool::new(false),
+            woken: WaitQueue::new(),
+        });
+        (StopHandle(inner.clone()), Self(inner))
+    }
+
     /// Returns whether the stop has been set.
     pub fn is_set(&self) -> bool {
         self.0.set.load(Ordering::Acquire)
@@ -98,7 +98,7 @@ mod tests {
 
     #[stellarator::test]
     async fn test_stop_resolves() {
-        let (handle, stop) = stop_pair();
+        let (handle, stop) = Stop::pair();
         assert!(!stop.is_set());
         handle.stop();
         assert!(stop.is_set());
@@ -107,7 +107,7 @@ mod tests {
 
     #[stellarator::test]
     async fn test_stop_wakes_across_threads() {
-        let (handle, stop) = stop_pair();
+        let (handle, stop) = Stop::pair();
         std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(20));
             handle.stop();

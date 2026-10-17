@@ -3,12 +3,13 @@
 //! Most systems declare fixed ports and ignore it. Systems whose ports come
 //! from config, like links, read their ports from it.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::coordinator::OutputConfig;
+use crate::coordinator::{OutputConfig, OutputSource};
 use crate::system::PortDef;
 
 /// The part of one instance's config a system sees when computing its ports.
@@ -58,7 +59,55 @@ impl DefCx<'_> {
     /// The path is `{namespace}.{id}.{port}`, leaving out any part that is
     /// empty.
     pub fn port_path(&self, port: &str) -> String {
-        [self.namespace.unwrap_or(""), self.id, port]
+        Self::path(self.namespace, self.id, port)
+    }
+
+    /// Returns definitions for config inputs that no declared port claimed.
+    ///
+    /// Each port takes its name from the config and its record from its producer.
+    pub fn dyn_input_defs(&self, declared: &[Cow<'static, str>]) -> Result<Vec<PortDef>, DefError> {
+        let mut ports: Vec<PortDef> = Vec::new();
+        for (name, producer) in self.inputs {
+            if declared.iter().any(|taken| taken == name) {
+                continue;
+            }
+            if ports.iter().any(|port| port.name == *name) {
+                return Err(DefError::FanIn {
+                    port: name.to_string(),
+                });
+            }
+            ports.push(PortDef {
+                name: name.to_string().into(),
+                ..(*producer).clone()
+            });
+        }
+        Ok(ports)
+    }
+
+    /// Returns definitions for config outputs that no declared port claimed.
+    ///
+    /// Each port's record comes from the record the config names, or from the
+    /// definition `metor build` resolved for it.
+    pub fn dyn_output_defs(
+        &self,
+        declared: &[Cow<'static, str>],
+    ) -> Result<Vec<PortDef>, DefError> {
+        self.outputs
+            .iter()
+            .filter(|output| !declared.iter().any(|taken| *taken == output.port))
+            .map(|output| match &output.source {
+                OutputSource::Record(record) => self.records.port_def(&output.port, record),
+                OutputSource::Def(def) => Ok(PortDef {
+                    name: output.port.clone().into(),
+                    ..def.clone()
+                }),
+            })
+            .collect()
+    }
+
+    /// Returns `{namespace}.{id}.{port}`, leaving out any part that is empty.
+    pub(crate) fn path(namespace: Option<&str>, id: &str, port: &str) -> String {
+        [namespace.unwrap_or(""), id, port]
             .into_iter()
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()

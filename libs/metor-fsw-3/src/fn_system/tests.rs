@@ -15,7 +15,7 @@ use crate::async_system::Stop;
 use crate::coordinator::{
     BuildError, CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable,
 };
-use crate::log::Log;
+use crate::log::{Log, LogEventExt};
 use crate::port::{Input, Output, Sample, ring_capacity};
 use crate::tests::utils::{Control, Imu, Nav, NoParams, input, output, pair, ring};
 use crate::{Frame, Record};
@@ -420,10 +420,10 @@ fn pad_config(
 
 /// Lines of `line` one `log` ring holds at the default ring depth.
 fn padded_records(line: &str, now: Timestamp) -> usize {
-    let event = crate::log::line(now, LogLevel::Info, line.to_string(), Vec::new());
+    let event = LogEvent::line(now, LogLevel::Info, line.to_string(), Vec::new());
     let mut buf = vec![0u8; LogEvent::MAX_LEN];
     let len = event.encode(&mut buf).expect("encodes").len();
-    let depth = LogEvent::DEPTH * CoordinatorConfig::default().ring_depth;
+    let depth = LogEvent::DEPTH * CoordinatorConfig::default().ring_depth.get();
     ring_capacity(LogEvent::MAX_LEN, depth).expect("valid") / frame_len(len)
 }
 
@@ -449,7 +449,7 @@ fn test_log_overflow_report() {
 fn test_log_ring_capacity() {
     let line = "p".repeat(LogEvent::MAX_LEN / 2);
     let records = padded_records(&line, Timestamp(0));
-    assert!(records >= LogEvent::DEPTH * CoordinatorConfig::default().ring_depth);
+    assert!(records >= LogEvent::DEPTH * CoordinatorConfig::default().ring_depth.get());
     let (config, table, seen) = pad_config(records, &line);
     let mut coordinator = config.build(&table).expect("valid");
     coordinator.step(Timestamp(0));
@@ -598,7 +598,7 @@ fn test_async_adapter_relay() {
         outputs: vec![&nav, &log],
         threads: &mut threads,
         seed: Some(0),
-        namespace: "",
+        namespace: None,
         records: &Default::default(),
     })
     .expect("no params");
@@ -723,7 +723,7 @@ fn test_async_sample_refused() {
     let mut table = SystemTable::new();
     assert!(matches!(
         table.register_async("sampling_async", sampling_async(), Default::default),
-        Err(BuildError::Def {
+        Err(BuildError::TypeDef {
             source: DefError::SampleOnAsync { .. },
             ..
         })
@@ -778,7 +778,7 @@ fn flooded(a: usize, b: usize, cycles: i64) -> Vec<LogEvent> {
         outputs: vec![&ring_a, &ring_b, &log],
         threads: &mut threads,
         seed: Some(0),
-        namespace: "",
+        namespace: None,
         records: &Default::default(),
     })
     .expect("no params");
@@ -952,7 +952,7 @@ fn test_rng_without_a_seed_fails_the_make() {
         outputs: vec![&log],
         threads: &mut threads,
         seed: None,
-        namespace: "",
+        namespace: None,
         records: &Default::default(),
     });
     let err = made.err();
@@ -969,7 +969,7 @@ fn test_rng_on_an_async_system_is_refused() {
     let refused = |e: &BuildError| {
         matches!(
             e,
-            BuildError::Def {
+            BuildError::TypeDef {
                 source: DefError::RngOnAsync { .. },
                 ..
             }
@@ -1068,7 +1068,7 @@ fn test_async_records_param_reads_the_host_table() {
         outputs: vec![&nav, &log],
         threads: &mut threads,
         seed: Some(0),
-        namespace: "",
+        namespace: None,
         records: &records,
     })
     .expect("no params");

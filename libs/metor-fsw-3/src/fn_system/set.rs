@@ -1,6 +1,6 @@
 //! [`InSet`] and [`OutSet`], the bound ports of a fn system.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 use metor_proto::types::Timestamp;
@@ -41,18 +41,8 @@ impl<S: FnSignature> OutSet<S> {
     /// Reports the writes that failed since the last report.
     ///
     /// Writes at most one fault on `log`.
-    pub(crate) fn report_dropped(&mut self, now: Timestamp) {
-        report_dropped(&mut self.log, &self.dropped, now);
-    }
-}
-
-/// Reports and resets the count in `dropped`.
-///
-/// If the count was nonzero, writes one `publish_dropped` fault on `log`.
-pub(crate) fn report_dropped(log: &mut LogPort, dropped: &AtomicU32, now: Timestamp) {
-    let count = dropped.swap(0, Ordering::Relaxed);
-    if count != 0 {
-        log.fault(now, "publish_dropped", format!("{count} writes dropped"));
+    pub(crate) fn report_failed_writes(&mut self, now: Timestamp) {
+        self.log.report_failed_writes(&self.dropped, now);
     }
 }
 
@@ -96,7 +86,7 @@ pub(crate) type BoundSet<S> = (InSet<S>, OutSet<S>);
 #[derive(Clone, Copy)]
 pub(crate) struct Instance<'a> {
     pub(crate) id: &'a str,
-    pub(crate) namespace: &'a str,
+    pub(crate) namespace: Option<&'a str>,
     /// The target seed. A guest's make has none.
     pub(crate) seed: Option<u64>,
     /// Every record the system table knows about.
@@ -117,10 +107,7 @@ impl<'a> Instance<'a> {
     fn rng(&self) -> Result<Rng, ParamError> {
         let system = self.id.to_string();
         let seed = self.seed.ok_or(ParamError::GuestRng { system })?;
-        Ok(match self.namespace {
-            "" => Rng::seeded(seed, self.id),
-            ns => Rng::seeded(seed, &format!("{ns}.{}", self.id)),
-        })
+        Ok(Rng::seeded(seed, &DefCx::path(self.namespace, self.id, "")))
     }
 }
 

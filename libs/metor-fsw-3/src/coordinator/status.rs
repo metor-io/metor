@@ -4,6 +4,12 @@ use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::Frame;
+use crate::def::DefCx;
+use crate::port::Output;
+use crate::system::PortDef;
+
+/// The name of the output the coordinator adds to every system.
+pub(crate) const STATUS_PORT: &str = "status";
 
 /// The status of one system for one cycle.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
@@ -17,4 +23,12 @@ pub struct SystemStatus {
     pub exec_time_ns: u64,
     /// Wall time from the start of the cycle to the start of `execute` in nanoseconds.
     pub exec_offset_ns: u64,
+}
+
+impl SystemStatus {
+    /// Returns the definition of the `status` output the coordinator adds to
+    /// every system.
+    pub(crate) fn port_def(cx: &DefCx<'_>) -> PortDef {
+        Output::<Self>::def(cx, STATUS_PORT)
+    }
 }

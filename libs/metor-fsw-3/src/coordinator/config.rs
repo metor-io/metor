@@ -3,6 +3,7 @@
 //! It lists the systems to run and wires each system's inputs to other
 //! systems' outputs.
 
+use core::num::NonZeroUsize;
 use core::time::Duration;
 
 use metor_proto::types::Timestamp;
@@ -11,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::system::PortDef;
 
 /// The default [`CoordinatorConfig::ring_depth`].
-pub const DEFAULT_RING_DEPTH: usize = 8;
+// PANIC Safety: evaluated at compile time.
+pub const DEFAULT_RING_DEPTH: NonZeroUsize = NonZeroUsize::new(8).expect("nonzero");
 
 /// The configuration for a coordinator.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -19,7 +21,7 @@ pub struct CoordinatorConfig {
     /// The clock that paces the cycles.
     pub clock: Clock,
     /// How many records a ring holds per unit of its port's declared depth.
-    pub ring_depth: usize,
+    pub ring_depth: NonZeroUsize,
     /// A prefix added to every name the coordinator announces.
     #[serde(default)]
     pub namespace: Option<String>,

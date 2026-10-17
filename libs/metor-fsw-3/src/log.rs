@@ -7,6 +7,7 @@
 
 use core::cell::Cell;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::borrow::Cow;
 
 use metor_proto::types::Timestamp;
@@ -16,23 +17,35 @@ use tracing_subscriber::layer::Context;
 
 use crate::port::Output;
 
-/// Creates a log line stamped `now`, with no module or source file.
-pub(crate) fn line(
-    now: Timestamp,
-    level: LogLevel,
-    message: impl Into<Cow<'static, str>>,
-    fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
-) -> LogEvent {
-    LogEvent {
-        timestamp: now,
-        level,
-        source: Cow::Borrowed(""),
-        target: Cow::Borrowed(""),
-        message: message.into(),
-        span: None,
-        fields,
-        file: None,
-        line: None,
+/// Builds the log lines the runtime writes itself.
+pub(crate) trait LogEventExt {
+    /// Creates a log line stamped `now`, with no module or source file.
+    fn line(
+        now: Timestamp,
+        level: LogLevel,
+        message: impl Into<Cow<'static, str>>,
+        fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+    ) -> Self;
+}
+
+impl LogEventExt for LogEvent {
+    fn line(
+        now: Timestamp,
+        level: LogLevel,
+        message: impl Into<Cow<'static, str>>,
+        fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+    ) -> Self {
+        Self {
+            timestamp: now,
+            level,
+            source: Cow::Borrowed(""),
+            target: Cow::Borrowed(""),
+            message: message.into(),
+            span: None,
+            fields,
+            file: None,
+            line: None,
+        }
     }
 }
 
@@ -78,6 +91,16 @@ impl LogPort {
         with_log_port(self, now, || Log.fault(kind, message));
     }
 
+    /// Reports and resets the count of failed port writes in `failed`.
+    ///
+    /// If the count was nonzero, writes one `publish_dropped` fault.
+    pub(crate) fn report_failed_writes(&mut self, failed: &AtomicU32, now: Timestamp) {
+        let count = failed.swap(0, Ordering::Relaxed);
+        if count != 0 {
+            self.fault(now, "publish_dropped", format!("{count} writes dropped"));
+        }
+    }
+
     /// Publishes one event.
     ///
     /// If the ring has no room, the event is counted as dropped.
@@ -94,7 +117,7 @@ impl LogPort {
         if self.dropped == 0 {
             return;
         }
-        let event = line(
+        let event = LogEvent::line(
             self.now,
             LogLevel::Warn,
             "log lines dropped",
@@ -144,7 +167,7 @@ impl Log {
         fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     ) {
         let message = message.into();
-        with_port(|port| port.emit(line(port.now, level, message, fields)));
+        with_port(|port| port.emit(LogEvent::line(port.now, level, message, fields)));
     }
 }
 
@@ -518,7 +541,7 @@ mod tests {
 
     /// The encoded length of the line `Log::info(message)` writes.
     fn encoded_len(message: &str, now: Timestamp) -> usize {
-        let event = line(now, LogLevel::Info, message.to_string(), Vec::new());
+        let event = LogEvent::line(now, LogLevel::Info, message.to_string(), Vec::new());
         let mut buf = vec![0u8; LogEvent::MAX_LEN];
         event.encode(&mut buf).expect("encodes").len()
     }

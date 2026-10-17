@@ -28,7 +28,6 @@ pub enum FrameStrError {
 impl<const N: usize> FrameStr<N> {
     /// Text bytes it holds; one byte is always the terminator.
     pub const CAPACITY: usize = N - 1;
-    pub const EMPTY: Self = Self([0; N]);
 
     /// Refuses text longer than [`CAPACITY`](Self::CAPACITY) or holding a NUL.
     pub fn new(text: &str) -> Result<Self, FrameStrError> {
@@ -59,7 +58,7 @@ impl<const N: usize> FrameStr<N> {
 
 impl<const N: usize> Default for FrameStr<N> {
     fn default() -> Self {
-        Self::EMPTY
+        Self([0; N])
     }
 }
 
@@ -135,8 +134,7 @@ mod tests {
         let text = FrameStr::<8>::new("liba.so").expect("fits at capacity");
         assert_eq!(text.to_str(), Ok("liba.so"));
         assert_eq!(text.as_bytes()[7], 0);
-        assert_eq!(FrameStr::<8>::EMPTY.to_str(), Ok(""));
-        assert_eq!(FrameStr::<8>::default(), FrameStr::<8>::EMPTY);
+        assert_eq!(FrameStr::<8>::default().to_str(), Ok(""));
     }
 
     #[test]
