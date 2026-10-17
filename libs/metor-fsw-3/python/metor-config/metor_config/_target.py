@@ -78,7 +78,14 @@ class SystemHandle:
         return {**ports, **CHANNEL_PORTS}
 
     def port(self, source: OutPort[T]) -> OutPort[T]:
-        """Returns this system's copy of ``source``. See `Subscribe.port`."""
+        """Returns this system's copy of ``source``. See `Subscribe.port`.
+
+        Raises `ConfigError` unless the system is a `Subscribe`.
+        """
+        from ._builtins import Subscribe
+
+        if not isinstance(self._system, Subscribe):
+            raise ConfigError(f"`{self._name}` copies no ports; only a Subscribe with a peer does")
         return self._system._port(source, self._name, self._target)
 
 

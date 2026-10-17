@@ -6,7 +6,7 @@
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child as Process, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -16,9 +16,9 @@ use super::run::Run;
 const POLL: Duration = Duration::from_millis(50);
 
 /// A running target process. Dropping it kills the process.
-pub struct Child {
+pub struct TargetProcess {
     pub namespace: String,
-    process: Process,
+    process: Child,
     drains: Vec<JoinHandle<()>>,
 }
 
@@ -33,7 +33,10 @@ pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsS
             overrides.cycles.map(|cycles| cycles.to_string()),
         ),
         ("--wall", overrides.wall.map(|rate| rate.get().to_string())),
-        ("--sim-dt", overrides.sim_dt.map(|dt| dt.to_string())),
+        (
+            "--sim-dt",
+            overrides.sim_dt.map(|dt| dt.as_secs_f64().to_string()),
+        ),
         ("--epoch", overrides.epoch.map(|at| at.to_string())),
     ];
     let deterministic = overrides.deterministic.then(|| "--deterministic".into());
@@ -56,7 +59,7 @@ pub fn member_argv(envelope: &Path, namespace: &str, overrides: &Run) -> Vec<OsS
 ///
 /// The child's stdout and stderr are both copied to this process's stderr,
 /// with each line prefixed by `NS │ `.
-pub fn spawn(envelope: &Path, namespace: &str, overrides: &Run) -> std::io::Result<Child> {
+pub fn spawn(envelope: &Path, namespace: &str, overrides: &Run) -> std::io::Result<TargetProcess> {
     let mut process = Command::new(std::env::current_exe()?)
         .args(member_argv(envelope, namespace, overrides))
         .stdin(Stdio::null())
@@ -70,7 +73,7 @@ pub fn spawn(envelope: &Path, namespace: &str, overrides: &Run) -> std::io::Resu
     if let Some(stderr) = process.stderr.take() {
         drains.push(drain(stderr, namespace.to_string()));
     }
-    Ok(Child {
+    Ok(TargetProcess {
         namespace: namespace.to_string(),
         process,
         drains,
@@ -85,14 +88,14 @@ pub fn spawn_all(
     envelope: &Path,
     namespaces: &[&str],
     overrides: &Run,
-) -> std::io::Result<Vec<Child>> {
+) -> std::io::Result<Vec<TargetProcess>> {
     namespaces
         .iter()
         .map(|namespace| spawn(envelope, namespace, overrides))
         .collect()
 }
 
-impl Child {
+impl TargetProcess {
     /// Sends the child SIGINT. The parent forwards its own interrupt this way.
     fn interrupt(&self) {
         // SAFETY: `kill` takes a pid and a signal number and does not touch
@@ -102,7 +105,7 @@ impl Child {
 }
 
 /// Kills and reaps the child, then waits for its output to finish copying.
-impl Drop for Child {
+impl Drop for TargetProcess {
     fn drop(&mut self) {
         let _ = self.process.kill();
         let _ = self.process.wait();
@@ -132,43 +135,35 @@ pub fn prefix(reader: impl Read, namespace: &str, mut sink: impl Write) {
 /// If any child exits with a failure, the rest are killed. A SIGINT to this
 /// process is forwarded to every child. On failure, returns the namespace of
 /// every child that did not exit successfully.
-pub fn wait_all(mut children: Vec<Child>) -> Result<(), Vec<String>> {
-    let mut failed = Vec::new();
-    let mut running: Vec<usize> = (0..children.len()).collect();
+pub fn wait_all(mut children: Vec<TargetProcess>) -> Result<(), Vec<String>> {
+    let mut exits: Vec<Option<ExitStatus>> = vec![None; children.len()];
     let mut forwarded = false;
-    while !running.is_empty() {
-        if !forwarded && super::run::interrupted() {
-            forwarded = true;
-            for &at in &running {
-                children[at].interrupt();
+    while exits.iter().any(Option::is_none) {
+        let interrupt = !forwarded && super::run::interrupted();
+        forwarded |= interrupt;
+        let failing = exits.iter().flatten().any(|status| !status.success());
+        for (child, exit) in children.iter_mut().zip(&mut exits) {
+            if exit.is_some() {
+                continue;
             }
-        }
-        let mut exited = Vec::new();
-        for &at in &running {
-            if let Some(status) = children[at].process.try_wait().ok().flatten() {
-                exited.push((at, status));
+            if interrupt {
+                child.interrupt();
             }
-        }
-        for (at, status) in exited {
-            running.retain(|&r| r != at);
-            if !status.success() {
-                failed.push(children[at].namespace.clone());
-                for &other in &running {
-                    let _ = children[other].process.kill();
-                }
+            if failing {
+                let _ = child.process.kill();
             }
+            *exit = child.process.try_wait().ok().flatten();
         }
-        if !running.is_empty() {
+        if exits.iter().any(Option::is_none) {
             std::thread::sleep(POLL);
         }
     }
-    for child in &mut children {
-        let status = child.process.wait();
-        if status.as_ref().is_ok_and(ExitStatus::success) || failed.contains(&child.namespace) {
-            continue;
-        }
-        failed.push(child.namespace.clone());
-    }
+    let failed: Vec<String> = children
+        .iter()
+        .zip(&exits)
+        .filter(|(_, exit)| !exit.is_some_and(|status| status.success()))
+        .map(|(child, _)| child.namespace.clone())
+        .collect();
     if failed.is_empty() {
         Ok(())
     } else {
@@ -220,17 +215,21 @@ mod tests {
         }
     }
 
-    fn sleeper() -> Child {
-        let process = Command::new("sleep")
-            .arg("30")
+    fn process(namespace: &str, program: &str, args: &[&str]) -> TargetProcess {
+        let process = Command::new(program)
+            .args(args)
             .stdin(Stdio::null())
             .spawn()
-            .expect("sleep runs");
-        Child {
-            namespace: "sleeper".into(),
+            .expect("the program runs");
+        TargetProcess {
+            namespace: namespace.into(),
             process,
             drains: Vec::new(),
         }
+    }
+
+    fn sleeper() -> TargetProcess {
+        process("sleeper", "sleep", &["30"])
     }
 
     fn alive(pid: u32) -> bool {
@@ -249,7 +248,7 @@ mod tests {
         let overrides = Run {
             cycles: Some(3),
             wall: crate::WallRate::try_from(50.0).ok(),
-            sim_dt: Some(0.01),
+            sim_dt: Some(Duration::from_millis(10)),
             epoch: Some(5),
             deterministic: true,
             ..Run::default()
@@ -294,6 +293,14 @@ mod tests {
 
         drop(lines);
         drain.join().expect("the drain ends");
+    }
+
+    #[test]
+    fn test_wait_all_reports_failures_and_kills_the_rest() {
+        assert_eq!(wait_all(vec![process("ok", "true", &[])]), Ok(()));
+        assert_eq!(wait_all(Vec::new()), Ok(()));
+        let failed = wait_all(vec![process("bad", "false", &[]), sleeper()]);
+        assert_eq!(failed, Err(vec!["bad".to_string(), "sleeper".to_string()]));
     }
 
     #[test]

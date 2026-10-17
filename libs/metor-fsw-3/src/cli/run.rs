@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 use core::time::Duration;
 use std::collections::BTreeMap;
+use std::env::JoinPathsError;
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
 use std::path::{Path, PathBuf};
@@ -47,8 +48,8 @@ pub struct Run {
     #[arg(long, conflicts_with = "sim_dt", value_parser = wall_rate)]
     pub wall: Option<WallRate>,
     /// Step a simulated clock by this many seconds per cycle.
-    #[arg(long)]
-    pub sim_dt: Option<f64>,
+    #[arg(long, value_parser = sim_dt)]
+    pub sim_dt: Option<Duration>,
     /// Start the simulated clock at this time, in microseconds since the Unix
     /// epoch.
     #[arg(long)]
@@ -66,6 +67,8 @@ pub enum RunError {
     Spawn(#[from] std::io::Error),
     #[error("the target file exited with {0}")]
     Python(ExitStatus),
+    #[error("building PYTHONPATH: {0}")]
+    PythonPath(#[from] JoinPathsError),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
@@ -76,8 +79,6 @@ pub enum RunError {
     Build(#[from] BuildError),
     #[error(transparent)]
     Deploy(#[from] DeployError),
-    #[error("--sim-dt must be a positive number of seconds, got {0}")]
-    SimDt(f64),
     #[error("--epoch sets a simulated clock's start; pass --sim-dt or use a simulated target")]
     EpochWall,
     #[error("these systems latched off: {0}")]
@@ -86,6 +87,12 @@ pub enum RunError {
     Children(String),
     #[error("interrupted")]
     Interrupted,
+}
+
+/// Parses `--sim-dt` seconds into a [`Duration`].
+fn sim_dt(arg: &str) -> Result<Duration, String> {
+    let secs: f64 = arg.parse().map_err(|e| format!("{e}"))?;
+    Duration::try_from_secs_f64(secs).map_err(|e| e.to_string())
 }
 
 /// Parses `--wall` into a [`WallRate`].
@@ -179,7 +186,7 @@ pub fn prepare(target: Option<&Path>) -> Result<DeploymentConfig, RunError> {
     } else {
         eval_target(target, &packs)?
     };
-    if deploy::unresolved(&config) {
+    if deploy::unresolved(&config)? {
         let tables: Vec<SystemTable> = config
             .targets
             .iter()
@@ -270,7 +277,7 @@ pub fn eval_target(path: &Path, dev_packs: &[PathBuf]) -> Result<DeploymentConfi
     let out = std::env::temp_dir().join(format!("metor-config-{}.json", std::process::id()));
     let status = Command::new(interpreter())
         .arg(path)
-        .env("PYTHONPATH", python_path(dev_packs))
+        .env("PYTHONPATH", python_path(dev_packs)?)
         .env("METOR_CONFIG_OUT", &out)
         .env("METOR_FSW_ABI_VERSION", ABI_VERSION.to_string())
         .status()?;
@@ -298,19 +305,17 @@ fn interpreter() -> OsString {
 ///
 /// It lists `metor-config` and every dev pack's generated module, followed
 /// by the inherited `PYTHONPATH`.
-fn python_path(dev_packs: &[PathBuf]) -> OsString {
+fn python_path(dev_packs: &[PathBuf]) -> Result<OsString, JoinPathsError> {
     let mut entries: Vec<PathBuf> = match std::env::var_os("METOR_CONFIG_PY") {
         Some(config_py) => vec![config_py.into()],
         None if Path::new(IN_REPO_CONFIG_PY).is_dir() => vec![IN_REPO_CONFIG_PY.into()],
         None => Vec::new(),
     };
     entries.extend(dev_packs.iter().map(|root| root.join(".metor")));
-    let mut path = std::env::join_paths(entries).unwrap_or_default();
     if let Some(inherited) = std::env::var_os("PYTHONPATH") {
-        path.push(":");
-        path.push(inherited);
+        entries.extend(std::env::split_paths(&inherited));
     }
-    path
+    std::env::join_paths(entries)
 }
 
 /// Builds a target's coordinator.
@@ -333,7 +338,6 @@ fn apply_overrides(config: &TargetConfig, overrides: &Run) -> Result<TargetConfi
         config.coordinator.clock = Clock::Wall { rate };
     }
     if let Some(dt) = overrides.sim_dt {
-        let dt = Duration::try_from_secs_f64(dt).map_err(|_| RunError::SimDt(dt))?;
         let epoch = config.coordinator.clock.epoch();
         config.coordinator.clock = Clock::Simulated { dt, epoch };
     }
@@ -443,7 +447,7 @@ mod tests {
             epoch: Some(metor_proto::types::Timestamp(1)),
         };
         let kept = Run {
-            sim_dt: Some(0.02),
+            sim_dt: Some(Duration::from_millis(20)),
             ..Default::default()
         };
         let clock = apply_overrides(&config, &kept).unwrap().coordinator.clock;
@@ -474,7 +478,7 @@ mod tests {
         ));
         let simulated = Run {
             deterministic: true,
-            sim_dt: Some(0.01),
+            sim_dt: Some(Duration::from_millis(10)),
             epoch: Some(0),
             ..Default::default()
         };
@@ -482,16 +486,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_negative_sim_dt() {
-        let config = TargetConfig::default();
-        let overrides = Run {
-            sim_dt: Some(-1.0),
-            ..Default::default()
-        };
-        assert!(matches!(
-            load(&config, &overrides),
-            Err(RunError::SimDt(dt)) if dt == -1.0
-        ));
+    fn test_sim_dt_parses_seconds() {
+        assert_eq!(sim_dt("0.01"), Ok(Duration::from_millis(10)));
+        assert_eq!(sim_dt("0"), Ok(Duration::ZERO));
+        assert!(sim_dt("-1").is_err());
+        assert!(sim_dt("fast").is_err());
     }
 
     #[test]

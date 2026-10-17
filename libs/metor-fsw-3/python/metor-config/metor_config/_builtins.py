@@ -184,6 +184,11 @@ class Subscribe(Link, _generated.Subscribe):
         ]
         return copies + self._dyn_outputs
 
+    def port(self, source: OutPort[T]) -> OutPort[T]:
+        """Returns this subscriber's copy of ``source``, a port of its peer's
+        target."""
+        return self._port(source, self._name, self._target)
+
     def _port(self, source: OutPort[T], name: str, target: Any) -> OutPort[T]:
         for copy in self._peer_copies():
             if copy.target is not source.target:

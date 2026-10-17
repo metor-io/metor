@@ -14,12 +14,12 @@ mod slot;
 
 use std::collections::HashMap;
 
-use crate::coordinator::{OutputSource, PeerLink, SystemConfig, SystemTable};
+use crate::coordinator::{OutputSource, SystemTable};
 use crate::link::{LINK_TYPES, LinkParams, Transport};
 
 pub use config::{CONFIG_VERSION, ConfigError, DeploymentConfig, TargetConfig};
 pub use error::DeployError;
-use index::{At, DefIndex};
+use index::{DefIndex, SystemIndex};
 use part::Part;
 pub use slot::resolve_slots;
 
@@ -32,104 +32,133 @@ pub const LOOPBACK: &str = "127.0.0.1";
 /// addresses, and peer outputs become port definitions. An envelope with
 /// nothing to resolve is left unchanged.
 pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Result<(), DeployError> {
-    let plan = plan(envelope, tables)?;
-    for (at, addr) in plan.transports {
-        let system = at.get_mut(envelope);
-        let mut params = Part::<LinkParams>::read(system)?;
+    let mut links = Links::read(envelope)?;
+    let plan = plan(envelope, tables, &links)?;
+    check_ports(envelope, &links)?;
+    for (index, addr) in plan.transports {
+        // PANIC Safety: `plan` only names systems that `links` decoded.
+        let mut params = links.0.remove(&index).expect("a decoded link");
         params.part.transport = Transport::Connect { addr };
-        params.write(system)?;
+        params.write(index.get_mut(envelope))?;
     }
-    for ((at, output), def) in plan.outputs {
-        at.get_mut(envelope).outputs[output].source = OutputSource::Def(def);
+    for ((index, output), def) in plan.outputs {
+        index.get_mut(envelope).outputs[output].source = OutputSource::Def(def);
     }
-    check_ports(envelope)
+    Ok(())
 }
 
 /// Returns true if `envelope` still has a peer reference or a slot candidate
 /// that points at a pack.
-pub fn unresolved(envelope: &DeploymentConfig) -> bool {
-    slot::unresolved(envelope)
-        || envelope.targets.iter().any(|target| {
-            target.coordinator.systems.iter().any(|system| {
-                dials_peer(system)
-                    || system
-                        .outputs
-                        .iter()
-                        .any(|output| matches!(output.source, OutputSource::Peer(_)))
-            })
+///
+/// # Errors
+/// Returns an error if a link's or a slot's params do not decode.
+pub fn unresolved(envelope: &DeploymentConfig) -> Result<bool, DeployError> {
+    let peer_output = envelope.targets.iter().any(|target| {
+        target.coordinator.systems.iter().any(|system| {
+            system
+                .outputs
+                .iter()
+                .any(|output| matches!(output.source, OutputSource::Peer(_)))
         })
+    });
+    let dials_peer = Links::read(envelope)?.dials_peer();
+    Ok(slot::unresolved(envelope)? || dials_peer || peer_output)
 }
 
-/// Returns true if `system` is a link that dials a peer.
-///
-/// Also returns true if the link's params do not decode, so that `resolve`
-/// runs and reports the error.
-fn dials_peer(system: &SystemConfig) -> bool {
-    match link(system) {
-        Ok(params) => params.is_some_and(|params| peer_link(&params.part).is_some()),
-        Err(_) => true,
+/// The params of every link in a deployment, decoded once.
+struct Links(HashMap<SystemIndex, Part<LinkParams>>);
+
+impl Links {
+    /// Decodes the params of every link in `envelope`.
+    fn read(envelope: &DeploymentConfig) -> Result<Self, DeployError> {
+        let mut links = HashMap::new();
+        for (index, system) in SystemIndex::iter(envelope) {
+            if LINK_TYPES.contains(&system.ty.as_str()) {
+                links.insert(index, Part::read(system)?);
+            }
+        }
+        Ok(Self(links))
+    }
+
+    fn get(&self, index: SystemIndex) -> Option<&LinkParams> {
+        self.0.get(&index).map(|params| &params.part)
+    }
+
+    /// Whether any link dials a peer.
+    fn dials_peer(&self) -> bool {
+        self.0
+            .values()
+            .any(|params| matches!(params.part.transport, Transport::Peer(_)))
+    }
+
+    /// The port the link at `index` listens on, unless it is zero or the
+    /// system is no listening link.
+    fn fixed_port(&self, index: SystemIndex) -> Option<u16> {
+        let Transport::Listen { addr, .. } = &self.get(index)?.transport else {
+            return None;
+        };
+        let port: u16 = addr.rsplit_once(':')?.1.parse().ok()?;
+        (port != 0).then_some(port)
     }
 }
 
 struct Plan {
-    transports: Vec<(At, String)>,
-    outputs: Vec<((At, usize), crate::PortDef)>,
+    transports: Vec<(SystemIndex, String)>,
+    outputs: Vec<((SystemIndex, usize), crate::PortDef)>,
 }
 
-fn plan(envelope: &DeploymentConfig, tables: &[SystemTable]) -> Result<Plan, DeployError> {
-    let mut index = DefIndex::new(envelope, tables);
+fn plan(
+    envelope: &DeploymentConfig,
+    tables: &[SystemTable],
+    links: &Links,
+) -> Result<Plan, DeployError> {
+    let mut defs = DefIndex::new(envelope, tables);
     let mut plan = Plan {
         transports: Vec::new(),
         outputs: Vec::new(),
     };
-    for (t, target) in envelope.targets.iter().enumerate() {
-        for (s, system) in target.coordinator.systems.iter().enumerate() {
-            let at = At::new(t, s);
-            for (o, output) in system.outputs.iter().enumerate() {
-                if let OutputSource::Peer(peer) = &output.source {
-                    plan.outputs
-                        .push(((at, o), index.peer_port(at, &output.port, peer)?));
-                }
+    for (index, system) in SystemIndex::iter(envelope) {
+        for (output_index, output) in system.outputs.iter().enumerate() {
+            if let OutputSource::Peer(peer) = &output.source {
+                let def = defs.peer_port(index, &output.port, peer)?;
+                plan.outputs.push(((index, output_index), def));
             }
-            let Some(params) = link(system)? else {
-                continue;
-            };
-            let Some(peer) = peer_link(&params.part) else {
-                continue;
-            };
-            let from = index.name(at);
-            let peer_at = index.locate(&from, &peer.target, &peer.link)?;
-            let port =
-                fixed_port(peer_at.get(envelope))?.ok_or_else(|| DeployError::NotAListener {
-                    from: from.clone(),
-                    target: peer.target.clone(),
-                    link: peer.link.clone(),
-                })?;
-            plan.transports
-                .push((at, address(host(envelope, &peer.target), port)));
         }
+        let Some(Transport::Peer(peer)) = links.get(index).map(|params| &params.transport) else {
+            continue;
+        };
+        let from = defs.name(index);
+        let peer_index = defs.locate(&from, &peer.target, &peer.link)?;
+        let port = links
+            .fixed_port(peer_index)
+            .ok_or_else(|| DeployError::NotAListener {
+                from: from.clone(),
+                target: peer.target.clone(),
+                link: peer.link.clone(),
+            })?;
+        plan.transports
+            .push((index, address(host(envelope, &peer.target), port)));
     }
     Ok(plan)
 }
 
 /// Checks that no two listeners on the same host bind the same port.
-fn check_ports(envelope: &DeploymentConfig) -> Result<(), DeployError> {
+fn check_ports(envelope: &DeploymentConfig, links: &Links) -> Result<(), DeployError> {
     let mut bound: HashMap<(String, u16), String> = HashMap::new();
-    for target in &envelope.targets {
+    for (index, system) in SystemIndex::iter(envelope) {
+        let Some(port) = links.fixed_port(index) else {
+            continue;
+        };
+        let target = &envelope.targets[index.target];
         let host = host(envelope, target.namespace()).to_string();
-        for system in &target.coordinator.systems {
-            let Some(port) = fixed_port(system)? else {
-                continue;
-            };
-            let name = format!("{}.{}", target.namespace(), system.id);
-            if let Some(first) = bound.insert((host.clone(), port), name.clone()) {
-                return Err(DeployError::PortTaken {
-                    host,
-                    port,
-                    first,
-                    second: name,
-                });
-            }
+        let name = format!("{}.{}", target.namespace(), system.id);
+        if let Some(first) = bound.insert((host.clone(), port), name.clone()) {
+            return Err(DeployError::PortTaken {
+                host,
+                port,
+                first,
+                second: name,
+            });
         }
     }
     Ok(())
@@ -146,36 +175,6 @@ fn address(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
-}
-
-/// Reads a link's params. Returns `None` if `system` is not a link.
-fn link(system: &SystemConfig) -> Result<Option<Part<LinkParams>>, DeployError> {
-    if !LINK_TYPES.contains(&system.ty.as_str()) {
-        return Ok(None);
-    }
-    Part::read(system).map(Some)
-}
-
-/// Returns the peer a link dials, if its transport is a peer reference.
-fn peer_link(params: &LinkParams) -> Option<&PeerLink> {
-    match &params.transport {
-        Transport::Peer(peer) => Some(peer),
-        _ => None,
-    }
-}
-
-/// Returns the port a link listens on, unless it is zero.
-fn fixed_port(system: &SystemConfig) -> Result<Option<u16>, DeployError> {
-    let port = link(system)?.and_then(|params| listen_port(&params.part));
-    Ok(port.filter(|&port| port != 0))
-}
-
-/// Returns the port a link's transport listens on.
-fn listen_port(params: &LinkParams) -> Option<u16> {
-    let Transport::Listen { addr, .. } = &params.transport else {
-        return None;
-    };
-    addr.rsplit_once(':')?.1.parse().ok()
 }
 
 #[cfg(test)]

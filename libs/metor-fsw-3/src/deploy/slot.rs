@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::DeploymentConfig;
 use crate::FrameStr;
-use crate::coordinator::{SystemConfig, SystemTable};
+use crate::coordinator::SystemTable;
 use crate::def::{DefCx, DefError};
 use crate::dl::slot::{Candidate, SlotParams, Source, Stored};
 use crate::dl::{Pack, PackRef, SLOT_TYPE, store};
@@ -20,43 +20,48 @@ use crate::pack::def::DefCxOwned;
 use crate::system::SystemDef;
 
 use super::error::DeployError;
-use super::index::{At, DefIndex};
+use super::index::{DefIndex, SystemIndex};
 
-/// The longest library file name that fits in a channel's status frame.
-const ARTIFACT_CAP: usize = FrameStr::<64>::CAPACITY;
+/// The size of the frame string a channel's status carries a library's file
+/// name in.
+const ARTIFACT_LEN: usize = 64;
 
 /// Returns true if any slot in `envelope` has a candidate that is not yet
 /// resolved.
-pub(crate) fn unresolved(envelope: &DeploymentConfig) -> bool {
-    first_unresolved(envelope).is_some()
+///
+/// # Errors
+/// Returns an error if a slot's params do not decode.
+pub(crate) fn unresolved(envelope: &DeploymentConfig) -> Result<bool, DeployError> {
+    Ok(!unresolved_slots(envelope)?.is_empty())
 }
 
-/// Returns true if `system` is a slot with a candidate that still points at a
-/// pack.
-///
-/// Also returns true if the slot's params do not decode, so that
-/// `resolve_slots` runs and reports the error.
-fn unresolved_slot(system: &SystemConfig) -> bool {
-    if system.ty != SLOT_TYPE {
-        return false;
-    }
-    match SlotParams::deserialize(&system.params) {
-        Ok(params) => params
+/// Every slot, in step order, that still has a candidate that points at a
+/// pack, with its decoded params.
+fn unresolved_slots(
+    envelope: &DeploymentConfig,
+) -> Result<Vec<(SystemIndex, SlotParams)>, DeployError> {
+    let mut slots = Vec::new();
+    for (index, system) in SystemIndex::iter(envelope) {
+        if system.ty != SLOT_TYPE {
+            continue;
+        }
+        let params = SlotParams::deserialize(&system.params).map_err(|e| DeployError::Slot {
+            slot: format!(
+                "{}.{}",
+                envelope.targets[index.target].namespace(),
+                system.id
+            ),
+            message: e.to_string(),
+        })?;
+        let pending = params
             .allow
             .iter()
-            .any(|candidate| matches!(candidate.source, Source::Pack(_))),
-        Err(_) => true,
+            .any(|candidate| matches!(candidate.source, Source::Pack(_)));
+        if pending {
+            slots.push((index, params));
+        }
     }
-}
-
-/// Returns the first slot, in step order, that still has a candidate to
-/// resolve.
-fn first_unresolved(envelope: &DeploymentConfig) -> Option<At> {
-    envelope.targets.iter().enumerate().find_map(|(t, target)| {
-        let systems = &target.coordinator.systems;
-        let s = systems.iter().position(unresolved_slot)?;
-        Some(At::new(t, s))
-    })
+    Ok(slots)
 }
 
 /// Resolves every slot in `envelope`, copying candidate libraries into
@@ -69,33 +74,11 @@ pub fn resolve_slots(
     tables: &[SystemTable],
     store: &Path,
 ) -> Result<(), DeployError> {
-    while let Some(at) = first_unresolved(envelope) {
-        let params = resolve_slot(envelope, tables, at, store)?;
-        at.get_mut(envelope).params = params;
+    for (index, params) in unresolved_slots(envelope)? {
+        let resolved = SlotCx::new(envelope, tables, index)?.params(params, store)?;
+        index.get_mut(envelope).params = resolved;
     }
     Ok(())
-}
-
-fn resolve_slot(
-    envelope: &DeploymentConfig,
-    tables: &[SystemTable],
-    at: At,
-    store: &Path,
-) -> Result<Value, DeployError> {
-    let mut index = DefIndex::new(envelope, tables);
-    let system = at.get(envelope);
-    let cx = SlotCx {
-        slot: index.name(at),
-        cx: DefCxOwned {
-            id: system.id.clone(),
-            namespace: envelope.targets[at.target].coordinator.namespace.clone(),
-            inputs: index.edges(at)?,
-            outputs: system.outputs.clone(),
-            records: index.records(at.target).clone(),
-            params: Value::Null,
-        },
-    };
-    cx.params(&system.params, store)
 }
 
 /// The context a slot's candidates compute their ports in. It comes from the
@@ -106,6 +89,30 @@ struct SlotCx {
 }
 
 impl SlotCx {
+    /// The context for the slot at `index`, computed from its own config.
+    ///
+    /// Every slot before it in step order is already resolved, so a fresh
+    /// `DefIndex` sees their stored ports.
+    fn new(
+        envelope: &DeploymentConfig,
+        tables: &[SystemTable],
+        index: SystemIndex,
+    ) -> Result<Self, DeployError> {
+        let mut defs = DefIndex::new(envelope, tables);
+        let system = index.get(envelope);
+        Ok(Self {
+            slot: defs.name(index),
+            cx: DefCxOwned {
+                id: system.id.clone(),
+                namespace: envelope.targets[index.target].coordinator.namespace.clone(),
+                inputs: defs.edges(index)?,
+                outputs: system.outputs.clone(),
+                records: defs.records(index.target).clone(),
+                params: Value::Null,
+            },
+        })
+    }
+
     fn fail(&self, message: String) -> DeployError {
         DeployError::Slot {
             slot: self.slot.clone(),
@@ -116,8 +123,7 @@ impl SlotCx {
     /// Returns the slot's params with every candidate resolved.
     ///
     /// Every candidate must have the same ports as the first one.
-    fn params(&self, params: &Value, store: &Path) -> Result<Value, DeployError> {
-        let mut params = SlotParams::deserialize(params).map_err(|e| self.fail(e.to_string()))?;
+    fn params(&self, mut params: SlotParams, store: &Path) -> Result<Value, DeployError> {
         let mut first: Option<(String, SystemDef)> = None;
         for candidate in &mut params.allow {
             let def = self.resolve(candidate, store)?;
@@ -159,7 +165,15 @@ impl SlotCx {
         store: &Path,
     ) -> Result<Stored, DeployError> {
         let artifact = pack.artifact();
-        self.check_name(&artifact)?;
+        let name = artifact
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| self.fail(format!("`{}` names no file", artifact.display())))?;
+        FrameStr::<ARTIFACT_LEN>::new(name).map_err(|_| DeployError::ArtifactName {
+            slot: self.slot.clone(),
+            name: name.to_string(),
+            cap: FrameStr::<ARTIFACT_LEN>::CAPACITY,
+        })?;
         let within = |e: String| self.fail(format!("`{}`: {e}", candidate.name));
         let opened = pack.open().map_err(|e| within(e.to_string()))?;
         let def = self
@@ -181,22 +195,5 @@ impl SlotCx {
             ..self.cx.borrow(&edges)
         };
         pack.def(ty, &cx)
-    }
-
-    /// Returns an error if a library's file name is too long for the
-    /// channel's status frame.
-    fn check_name(&self, artifact: &Path) -> Result<(), DeployError> {
-        let name = artifact
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if name.len() > ARTIFACT_CAP {
-            return Err(DeployError::ArtifactName {
-                slot: self.slot.clone(),
-                name,
-                cap: ARTIFACT_CAP,
-            });
-        }
-        Ok(())
     }
 }

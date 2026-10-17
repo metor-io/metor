@@ -448,9 +448,9 @@ fn test_build_resolves_into_store() {
         unresolved("down", "count_down", &libs),
     ];
     let mut envelope = envelope(allow);
-    assert!(deploy::unresolved(&envelope));
+    assert!(deploy::unresolved(&envelope).expect("decodes"));
     deploy::resolve_slots(&mut envelope, &[table(&seen)], &store).expect("resolves");
-    assert!(!deploy::unresolved(&envelope));
+    assert!(!deploy::unresolved(&envelope).expect("decodes"));
 
     let params = slot(&envelope);
     let hash = store::hash(fixture_lib()).expect("reads");
@@ -503,7 +503,7 @@ fn test_build_resolves_chained_slots() {
         .systems
         .push(next_slot(&libs));
     resolve(&mut envelope, &store).expect("resolves");
-    assert!(!deploy::unresolved(&envelope));
+    assert!(!deploy::unresolved(&envelope).expect("decodes"));
     let next = &envelope.targets[0].coordinator.systems[4].params;
     assert!(next["allow"][0]["source"]["stored"]["def"].is_object());
 }

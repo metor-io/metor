@@ -2,7 +2,7 @@ use serde_json::json;
 
 use super::*;
 use super::{CONFIG_VERSION, TargetConfig};
-use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig, PeerPort};
+use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig, PeerPort, SystemConfig};
 use crate::link::{PUBLISH_TYPE, SUBSCRIBE_TYPE};
 use crate::record::RecordSchema;
 use crate::tests::utils::{Emit, Recorder, Tap, emit, table, tap};
@@ -155,9 +155,9 @@ fn test_peer_transport_takes_host_address() {
 #[test]
 fn test_resolved_envelope_is_a_fixpoint() {
     let mut envelope = envelope();
-    assert!(unresolved(&envelope));
+    assert!(unresolved(&envelope).expect("decodes"));
     resolve(&mut envelope, &tables(2)).expect("resolves");
-    assert!(!unresolved(&envelope));
+    assert!(!unresolved(&envelope).expect("decodes"));
     let again = envelope.clone();
     resolve(&mut envelope, &tables(2)).expect("resolves again");
     assert_eq!(envelope, again);
@@ -291,7 +291,7 @@ fn test_non_link_transport_is_untouched() {
     envelope.targets[0].coordinator.systems[0].params = peer("b", "out");
     let params = envelope.targets[0].coordinator.systems[0].params.clone();
     resolve(&mut envelope, &tables(2)).expect("resolves");
-    assert!(!unresolved(&envelope));
+    assert!(!unresolved(&envelope).expect("decodes"));
     assert_eq!(envelope.targets[0].coordinator.systems[0].params, params);
 }
 
@@ -299,7 +299,10 @@ fn test_non_link_transport_is_untouched() {
 fn test_undecodable_link_names_itself() {
     let mut envelope = envelope();
     envelope.targets[0].coordinator.systems[2].params = json!({ "transport": 5 });
-    assert!(unresolved(&envelope));
+    let Err(DeployError::Params { system, .. }) = unresolved(&envelope) else {
+        panic!("a link's params must decode")
+    };
+    assert_eq!(system, "pub");
     let Err(DeployError::Params { system, .. }) = resolve(&mut envelope, &tables(2)) else {
         panic!("a link's params must decode")
     };
@@ -340,5 +343,5 @@ fn test_stored_slots_resolve_to_themselves() {
     assert_eq!(envelope, before);
     let mut stored = envelope.clone();
     resolve(&mut stored, &tables(2)).expect("resolves");
-    assert!(!unresolved(&stored));
+    assert!(!unresolved(&stored).expect("decodes"));
 }

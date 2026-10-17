@@ -14,14 +14,32 @@ use super::error::DeployError;
 /// The location of a system: the index of its target, and its index within
 /// that target.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub(crate) struct At {
+pub(crate) struct SystemIndex {
     pub(crate) target: usize,
     pub(crate) system: usize,
 }
 
-impl At {
+impl SystemIndex {
     pub(crate) fn new(target: usize, system: usize) -> Self {
         Self { target, system }
+    }
+
+    /// Every system in `envelope`, in target and step order, with its index.
+    pub(crate) fn iter(
+        envelope: &DeploymentConfig,
+    ) -> impl Iterator<Item = (SystemIndex, &SystemConfig)> {
+        envelope
+            .targets
+            .iter()
+            .enumerate()
+            .flat_map(|(target, member)| {
+                member
+                    .coordinator
+                    .systems
+                    .iter()
+                    .enumerate()
+                    .map(move |(system, config)| (Self::new(target, system), config))
+            })
     }
 
     pub(crate) fn get(self, envelope: &DeploymentConfig) -> &SystemConfig {
@@ -44,8 +62,8 @@ pub(crate) struct DefIndex<'a> {
     envelope: &'a DeploymentConfig,
     tables: &'a [SystemTable],
     records: Vec<Records>,
-    memo: HashMap<At, SystemDef>,
-    visiting: Vec<At>,
+    memo: HashMap<SystemIndex, SystemDef>,
+    visiting: Vec<SystemIndex>,
 }
 
 impl<'a> DefIndex<'a> {
@@ -61,8 +79,13 @@ impl<'a> DefIndex<'a> {
 
     /// Finds the system `link` on the target named `target`. `from` is the
     /// system making the reference, used in error messages.
-    pub(crate) fn locate(&self, from: &str, target: &str, link: &str) -> Result<At, DeployError> {
-        let t = self
+    pub(crate) fn locate(
+        &self,
+        from: &str,
+        target: &str,
+        link: &str,
+    ) -> Result<SystemIndex, DeployError> {
+        let target_index = self
             .envelope
             .targets
             .iter()
@@ -71,7 +94,7 @@ impl<'a> DefIndex<'a> {
                 from: from.to_string(),
                 target: target.to_string(),
             })?;
-        let s = self.envelope.targets[t]
+        let system_index = self.envelope.targets[target_index]
             .coordinator
             .systems
             .iter()
@@ -81,26 +104,26 @@ impl<'a> DefIndex<'a> {
                 target: target.to_string(),
                 link: link.to_string(),
             })?;
-        Ok(At::new(t, s))
+        Ok(SystemIndex::new(target_index, system_index))
     }
 
     /// Returns the name used for a system in errors: `{namespace}.{id}`.
-    pub(crate) fn name(&self, at: At) -> String {
-        let namespace = self.envelope.targets[at.target].namespace();
-        format!("{namespace}.{}", at.get(self.envelope).id)
+    pub(crate) fn name(&self, index: SystemIndex) -> String {
+        let namespace = self.envelope.targets[index.target].namespace();
+        format!("{namespace}.{}", index.get(self.envelope).id)
     }
 
     /// Returns the definition of the peer input port that `peer` refers to,
     /// renamed to `port` on the system at `from`.
     pub(crate) fn peer_port(
         &mut self,
-        from: At,
+        from: SystemIndex,
         port: &str,
         peer: &PeerPort,
     ) -> Result<PortDef, DeployError> {
         let name = self.name(from);
-        let at = self.locate(&name, &peer.target, &peer.link)?;
-        let def = self.def(at)?;
+        let peer_index = self.locate(&name, &peer.target, &peer.link)?;
+        let def = self.def(peer_index)?;
         def.inputs
             .iter()
             .find(|input| input.name == peer.port)
@@ -116,49 +139,53 @@ impl<'a> DefIndex<'a> {
             })
     }
 
-    /// Returns the definition of the system at `at`, computing it on the first
+    /// Returns the definition of the system at `index`, computing it on the first
     /// call.
-    pub(crate) fn def(&mut self, at: At) -> Result<SystemDef, DeployError> {
-        if let Some(def) = self.memo.get(&at) {
+    pub(crate) fn def(&mut self, index: SystemIndex) -> Result<SystemDef, DeployError> {
+        if let Some(def) = self.memo.get(&index) {
             return Ok(def.clone());
         }
-        if self.visiting.contains(&at) {
-            let mut path: Vec<String> = self.visiting.iter().map(|&v| self.name(v)).collect();
-            path.push(self.name(at));
+        if self.visiting.contains(&index) {
+            let mut path: Vec<String> = self
+                .visiting
+                .iter()
+                .map(|&visited| self.name(visited))
+                .collect();
+            path.push(self.name(index));
             return Err(DeployError::Cycle {
                 path: path.join(" -> "),
             });
         }
-        self.visiting.push(at);
-        let def = self.compute(at);
+        self.visiting.push(index);
+        let def = self.compute(index);
         self.visiting.pop();
         let def = def?;
-        self.memo.insert(at, def.clone());
+        self.memo.insert(index, def.clone());
         Ok(def)
     }
 
-    fn compute(&mut self, at: At) -> Result<SystemDef, DeployError> {
-        let target = &self.envelope.targets[at.target];
-        let system = at.get(self.envelope);
-        let entry = self.tables[at.target].get(&system.ty).ok_or_else(|| {
+    fn compute(&mut self, index: SystemIndex) -> Result<SystemDef, DeployError> {
+        let target = &self.envelope.targets[index.target];
+        let system = index.get(self.envelope);
+        let entry = self.tables[index.target].get(&system.ty).ok_or_else(|| {
             self.build_error(
-                at,
+                index,
                 crate::BuildError::UnknownType {
                     id: system.id.clone(),
                     ty: system.ty.clone(),
                 },
             )
         })?;
-        let system = self.resolved_outputs(at, system)?;
-        let producers = self.producers(at, &system, &entry.def)?;
+        let system = self.resolved_outputs(index, system)?;
+        let producers = self.producers(index, &system, &entry.def)?;
         SystemDef::instance(
             &system,
             entry,
             target.coordinator.namespace.as_deref(),
-            &self.records[at.target],
+            &self.records[index.target],
             |_, from| Ok(producers.get(from).cloned().flatten()),
         )
-        .map_err(|source| self.build_error(at, source))
+        .map_err(|source| self.build_error(index, source))
     }
 
     /// Returns the records known to the system table of target `target`.
@@ -166,17 +193,20 @@ impl<'a> DefIndex<'a> {
         &self.records[target]
     }
 
-    /// Returns every edge into the system at `at`, with the definition of the
+    /// Returns every edge into the system at `index`, with the definition of the
     /// output that feeds it. A channel's `commands` input is skipped.
-    pub(crate) fn edges(&mut self, at: At) -> Result<Vec<(String, PortDef)>, DeployError> {
-        let system = at.get(self.envelope);
+    pub(crate) fn edges(
+        &mut self,
+        index: SystemIndex,
+    ) -> Result<Vec<(String, PortDef)>, DeployError> {
+        let system = index.get(self.envelope);
         let mut edges = Vec::new();
         for input in &system.inputs {
             if input.port == crate::channel::COMMANDS_PORT {
                 continue;
             }
             for from in &input.from {
-                edges.push((input.port.clone(), self.output(at, from)?));
+                edges.push((input.port.clone(), self.output(index, from)?));
             }
         }
         Ok(edges)
@@ -186,13 +216,13 @@ impl<'a> DefIndex<'a> {
     /// by its definition.
     fn resolved_outputs(
         &mut self,
-        at: At,
+        index: SystemIndex,
         system: &SystemConfig,
     ) -> Result<SystemConfig, DeployError> {
         let mut system = system.clone();
         for output in &mut system.outputs {
             if let OutputSource::Peer(peer) = &output.source {
-                output.source = OutputSource::Def(self.peer_port(at, &output.port, peer)?);
+                output.source = OutputSource::Def(self.peer_port(index, &output.port, peer)?);
             }
         }
         Ok(system)
@@ -205,7 +235,7 @@ impl<'a> DefIndex<'a> {
     /// reported as a cycle.
     fn producers(
         &mut self,
-        at: At,
+        index: SystemIndex,
         system: &SystemConfig,
         declared: &SystemDef,
     ) -> Result<HashMap<PortRef, Option<PortDef>>, DeployError> {
@@ -215,7 +245,7 @@ impl<'a> DefIndex<'a> {
                 let def = if declared.inputs.iter().any(|p| p.name == input.port) {
                     None
                 } else {
-                    Some(self.output(at, from)?)
+                    Some(self.output(index, from)?)
                 };
                 producers.insert(from.clone(), def);
             }
@@ -225,18 +255,18 @@ impl<'a> DefIndex<'a> {
 
     /// Returns the definition of an output port on another system in the same
     /// target.
-    fn output(&mut self, at: At, from: &PortRef) -> Result<PortDef, DeployError> {
-        let target = &self.envelope.targets[at.target];
-        let Some(s) = target
+    fn output(&mut self, index: SystemIndex, from: &PortRef) -> Result<PortDef, DeployError> {
+        let target = &self.envelope.targets[index.target];
+        let Some(system_index) = target
             .coordinator
             .systems
             .iter()
             .position(|system| system.id == from.system)
         else {
             return Err(self.build_error(
-                at,
+                index,
                 crate::BuildError::UnknownSystem {
-                    id: at.get(self.envelope).id.clone(),
+                    id: index.get(self.envelope).id.clone(),
                     port: from.port.clone(),
                     from: from.system.clone(),
                 },
@@ -250,14 +280,14 @@ impl<'a> DefIndex<'a> {
             };
             return Ok(SystemStatus::port_def(&cx));
         }
-        let def = self.def(At::new(at.target, s))?;
+        let def = self.def(SystemIndex::new(index.target, system_index))?;
         def.outputs
             .iter()
             .find(|port| port.name == from.port)
             .cloned()
             .ok_or_else(|| {
                 self.build_error(
-                    at,
+                    index,
                     crate::BuildError::UnknownOutput {
                         system: from.system.clone(),
                         port: from.port.clone(),
@@ -266,9 +296,9 @@ impl<'a> DefIndex<'a> {
             })
     }
 
-    fn build_error(&self, at: At, source: crate::BuildError) -> DeployError {
+    fn build_error(&self, index: SystemIndex, source: crate::BuildError) -> DeployError {
         DeployError::Build {
-            target: self.envelope.targets[at.target].namespace().to_string(),
+            target: self.envelope.targets[index.target].namespace().to_string(),
             source,
         }
     }
