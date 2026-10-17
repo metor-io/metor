@@ -39,6 +39,8 @@ pub struct TimeSeries {
     structural: Arc<Mutex<()>>,
     lifecycle_waker: Arc<WaitQueue>,
     seal_waker: Arc<WaitQueue>,
+    /// The longest data-time span the head node covers, in microseconds,
+    /// before a write rolls it. Zero means unbounded.
     max_node_age: Arc<AtomicI64>,
 }
 

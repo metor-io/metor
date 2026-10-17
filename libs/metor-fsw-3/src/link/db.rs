@@ -4,7 +4,6 @@
 //! TCP and UDP to any client that connects, such as the panel.
 
 use core::cell::Cell;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,9 +19,11 @@ use stellarator::net::TcpListener;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::coordinator::ParamError;
+use crate::def::RecordError;
 use crate::log::Log;
 use crate::port::{DynInputs, Output};
 use crate::record::RecordSchema;
+use crate::system::PortDef;
 use crate::{Frame, Records, Stop, system};
 
 /// The configuration for a `Db`.
@@ -79,8 +80,10 @@ impl Db {
     /// Both happen here so that a taken address or an unwritable path fails
     /// the build instead of the run.
     pub fn new(params: DbParams) -> Result<Self, ParamError> {
-        let listener = TcpListener::bind(params.listen.as_str())
-            .map_err(|e| ParamError::Decode(format!("binding `{}`: {e}", params.listen)))?;
+        let listener = TcpListener::bind(params.listen.as_str()).map_err(|e| ParamError::Bind {
+            addr: params.listen.clone(),
+            message: e.to_string(),
+        })?;
         let port = listener.local_addr().map_or(0, |addr| addr.port());
         let path = params.path.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("metor-db-{}-{port}", std::process::id()))
@@ -90,8 +93,9 @@ impl Db {
         } else {
             DB::create(path.clone())
         };
-        let db = store.map_err(|error| {
-            ParamError::Decode(format!("opening the db at `{}`: {error}", path.display()))
+        let db = store.map_err(|error| ParamError::OpenDb {
+            path: path.display().to_string(),
+            message: error.to_string(),
         })?;
         Ok(Self {
             listener: Some(listener),
@@ -116,20 +120,37 @@ pub async fn db(
     log: &mut Log,
     stop: Stop,
 ) {
-    let commands = match command_ids(records, &s.params.commands) {
+    let commands: Result<Vec<PacketId>, RecordError> = s
+        .params
+        .commands
+        .iter()
+        .map(|name| records.msg_id(name))
+        .collect();
+    let commands = match commands {
         Ok(ids) => ids,
-        Err(message) => return log.fault("unknown_command", message),
+        Err(error) => return log.fault("unknown_command", error.to_string()),
     };
     // PANIC Safety: `new` always sets the listener, and a system runs once.
     let listener = s.listener.take().expect("one run per instance");
     let db = s.db.clone();
-    let sinks = register(&db, inputs, log);
+    let sinks: Vec<Sink> = inputs
+        .iter_mut()
+        .map(|(def, _)| Sink::register(&db, def, log))
+        .collect();
     db.set_identity(s.params.namespace.clone(), commands);
     let addr = listener.local_addr().ok();
     if let Some(addr) = addr {
         log.info(format!("serving {} on {addr}", db.path.display()));
     }
-    let _udp = addr.map(|addr| stellarator::spawn(udp(addr, db.clone())).drop_guard());
+    let _udp = addr.map(|addr| {
+        let db = db.clone();
+        let udp = async move {
+            if let Err(error) = Server::handle_udp(addr, db).await {
+                tracing::warn!(%error, "db udp ended");
+            }
+        };
+        stellarator::spawn(udp).drop_guard()
+    });
     let _serve = stellarator::spawn(serve(listener, db.clone(), stop.clone())).drop_guard();
     metor_db::lod::spawn(db.clone());
 
@@ -192,30 +213,6 @@ async fn serve(listener: TcpListener, db: Arc<DB>, stop: Stop) {
     futures_lite::future::or(accept, stop.wait()).await;
 }
 
-/// Serves the database's UDP protocol on the same address as the listener.
-async fn udp(addr: SocketAddr, db: Arc<DB>) {
-    if let Err(error) = Server::handle_udp(addr, db).await {
-        tracing::warn!(%error, "db udp ended");
-    }
-}
-
-/// Returns the packet id of each message record named in `names`.
-///
-/// Each name resolves the way an output's `record` does, so the id is the
-/// one the record's port carries.
-fn command_ids(records: &Records, names: &[String]) -> Result<Vec<PacketId>, String> {
-    let id = |name: &String| match records.port_def("commands", name) {
-        Ok(def) => match def.schema {
-            RecordSchema::Msg { id, .. } => Ok(id),
-            RecordSchema::Frame { .. } => {
-                Err(format!("command `{name}` is a frame, not a message"))
-            }
-        },
-        Err(_) => Err(format!("command `{name}` names no record the host knows")),
-    };
-    names.iter().map(id).collect()
-}
-
 /// Where the records from one input port are stored.
 enum Sink {
     /// Frames, stored under this table id.
@@ -226,16 +223,15 @@ enum Sink {
     Refused,
 }
 
-/// Registers each input port with the database.
-///
-/// A frame port registers its vtable and component metadata. A message port
-/// registers its message metadata. If the database already holds a different
-/// vtable under the frame's table id, the port is refused and a fault is
-/// logged. Returns one [`Sink`] per port.
-fn register(db: &DB, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sink> {
-    let mut sinks = Vec::new();
-    for (def, _) in inputs.iter_mut() {
-        sinks.push(match &def.schema {
+impl Sink {
+    /// Registers one input port with the database.
+    ///
+    /// A frame port registers its vtable and component metadata. A message
+    /// port registers its message metadata. If the database already holds a
+    /// different vtable under the frame's table id, the port is refused and a
+    /// fault is logged.
+    fn register(db: &DB, def: &PortDef, log: &mut Log) -> Sink {
+        match &def.schema {
             RecordSchema::Frame { vtable, metadata } => {
                 let id = table_id(vtable);
                 let table = VTableMsg {
@@ -250,8 +246,7 @@ fn register(db: &DB, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sin
                             def.name
                         ),
                     );
-                    sinks.push(Sink::Refused);
-                    continue;
+                    return Sink::Refused;
                 }
                 for component in metadata {
                     let result = db.with_state_mut(|state| {
@@ -275,9 +270,8 @@ fn register(db: &DB, inputs: &mut DynInputs<Notifier>, log: &mut Log) -> Vec<Sin
                 }
                 Sink::Msg(*id)
             }
-        });
+        }
     }
-    sinks
 }
 
 /// Writes every waiting record into the database and updates the counters.
@@ -304,6 +298,7 @@ fn ingest(db: &DB, inputs: &mut DynInputs<Notifier>, sinks: &[Sink], status: &mu
 #[cfg(test)]
 mod tests {
     use core::time::Duration;
+    use std::net::SocketAddr;
 
     use metor_fsw_3_ring::RingBuffer;
     use metor_proto::types::{IntoLenPacket, Msg, msg_id};
@@ -374,7 +369,7 @@ mod tests {
         let RecordSchema::Frame { metadata, .. } = imu.schema.clone() else {
             panic!("a frame")
         };
-        let sinks = register(&db, &mut inputs, &mut Log);
+        let sinks = sinks(&db, &mut inputs);
         assert!(matches!(sinks[0], Sink::Table(_)), "a table sink");
         assert!(matches!(sinks[1], Sink::Msg(id) if id == Fixed::schema().packet_id()));
         assert_eq!(metadata[0].name, "a.plant.imu.sample");
@@ -429,7 +424,7 @@ mod tests {
         };
         db.insert_vtable(VTableMsg { id, vtable })
             .expect("the first vtable under an id is taken");
-        let sinks = register(&db, &mut inputs, &mut Log);
+        let sinks = sinks(&db, &mut inputs);
         assert!(
             matches!(sinks[0], Sink::Refused),
             "a different vtable under a held id is refused"
@@ -525,10 +520,10 @@ mod tests {
             namespace: None,
             commands: Vec::new(),
         };
-        let Err(ParamError::Decode(message)) = Db::new(params) else {
+        let Err(ParamError::Bind { addr, .. }) = Db::new(params) else {
             panic!("an unassignable address is an error")
         };
-        assert!(message.contains("203.0.113.1:9"), "{message}");
+        assert_eq!(addr, "203.0.113.1:9");
     }
 
     /// The records a host knows: `sequence_command`, whose id hashes its type
@@ -545,9 +540,21 @@ mod tests {
         )
     }
 
+    /// Registers each of `inputs` with `db`.
+    fn sinks(db: &DB, inputs: &mut DynInputs<Notifier>) -> Vec<Sink> {
+        inputs
+            .iter_mut()
+            .map(|(def, _)| Sink::register(db, def, &mut Log))
+            .collect()
+    }
+
+    fn command_ids(records: &Records, names: &[&str]) -> Result<Vec<PacketId>, RecordError> {
+        names.iter().map(|name| records.msg_id(name)).collect()
+    }
+
     #[test]
     fn test_commands_resolve_to_record_ids() {
-        let names = [SequenceCommand::NAME, Fixed::NAME].map(String::from);
+        let names = [SequenceCommand::NAME, Fixed::NAME];
         let ids = command_ids(&records(), &names).expect("known messages");
         assert_eq!(
             ids,
@@ -563,9 +570,9 @@ mod tests {
 
     #[test]
     fn test_unknown_or_frame_command_is_an_error() {
-        let unknown = command_ids(&records(), &["nope".into()]).expect_err("unknown");
-        assert!(unknown.contains("`nope`"), "{unknown}");
-        let frame = command_ids(&records(), &[Imu::NAME.into()]).expect_err("a frame");
-        assert!(frame.contains("frame"), "{frame}");
+        let unknown = command_ids(&records(), &["nope"]);
+        assert_eq!(unknown, Err(RecordError::Unknown("nope".into())));
+        let frame = command_ids(&records(), &[Imu::NAME]);
+        assert_eq!(frame, Err(RecordError::Frame(Imu::NAME.into())));
     }
 }

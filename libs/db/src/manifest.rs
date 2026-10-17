@@ -169,7 +169,10 @@ impl ComponentManifest {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        let (_version, rest) = postcard::take_from_bytes::<u32>(&buf)?;
+        let (version, rest) = postcard::take_from_bytes::<u32>(&buf)?;
+        if version != MANIFEST_VERSION {
+            return Err(Error::UnsupportedManifestVersion(version));
+        }
         let mut spans = postcard::from_bytes::<Vec<NodeSpan>>(rest)?;
         for span in &mut spans {
             // In-flight fetches do not survive a restart.
@@ -408,10 +411,17 @@ mod tests {
         atomic_write(
             dir.path(),
             MANIFEST_FILE,
-            &postcard::to_allocvec(&99u32).unwrap(),
+            &postcard::to_allocvec(&ManifestFile {
+                version: 99,
+                spans: Vec::new(),
+            })
+            .unwrap(),
         )
         .unwrap();
-        assert!(ComponentManifest::read_from(dir.path()).is_err());
+        assert!(matches!(
+            ComponentManifest::read_from(dir.path()),
+            Err(Error::UnsupportedManifestVersion(99))
+        ));
     }
 
     #[test]

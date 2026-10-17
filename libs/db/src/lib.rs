@@ -351,8 +351,8 @@ impl DB {
     pub fn ingest_table(&self, id: PacketId, buf: &[u8]) -> Result<(), Error> {
         let received = Timestamp::now();
         let pushed = match self.ingest_static(id, buf, received)? {
-            Some(pushed) => pushed,
-            None => self.ingest_dynamic(id, buf, received)?,
+            StaticIngest::Pushed(pushed) => pushed,
+            StaticIngest::Dynamic => self.ingest_dynamic(id, buf, received)?,
         };
         if pushed.new_series {
             self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
@@ -363,20 +363,21 @@ impl DB {
         Ok(())
     }
 
-    /// Sinks a static table under the read lock; `None` for a dynamic one.
+    /// Sinks a static table under the read lock, or reports that the table
+    /// is dynamic.
     fn ingest_static(
         &self,
         id: PacketId,
         buf: &[u8],
         received: Timestamp,
-    ) -> Result<Option<Pushed>, Error> {
+    ) -> Result<StaticIngest, Error> {
         self.with_state(|state| {
             let vtable = state
                 .vtable_registry
                 .get(&id)
                 .ok_or(Error::Impeller(metor_proto::error::Error::VTableNotFound))?;
             if vtable.is_dynamic() {
-                return Ok(None);
+                return Ok(StaticIngest::Dynamic);
             }
             let mut pushed = Pushed::default();
             for_each_realized(vtable, buf, |rf| {
@@ -386,7 +387,7 @@ impl DB {
                 pushed.merge(push_field(component, &rf, received)?);
                 Ok(())
             })?;
-            Ok(Some(pushed))
+            Ok(StaticIngest::Pushed(pushed))
         })
     }
 
@@ -407,8 +408,7 @@ impl DB {
                 .clone();
             let mut pushed = Pushed::default();
             for_each_realized(&vtable, buf, |rf| {
-                let (component, created) = state.realize_component(&rf, &self.path)?;
-                pushed.new_series |= created;
+                let component = state.realize_component(&rf, &self.path)?;
                 pushed.merge(push_field(component, &rf, received)?);
                 Ok(())
             })?;
@@ -574,15 +574,13 @@ impl State {
     }
 
     /// The component a dynamic table's field lands in, created and named on
-    /// its first sample; `true` when it was created. A static field's
-    /// component must already exist.
+    /// its first sample. A static field's component must already exist.
     fn realize_component(
         &mut self,
         rf: &RealizedField,
         db_path: &Path,
-    ) -> Result<(&Component, bool), Error> {
-        let created = !self.components.contains_key(&rf.component_id);
-        if created {
+    ) -> Result<&Component, Error> {
+        if !self.components.contains_key(&rf.component_id) {
             if !rf.dynamic {
                 return Err(Error::ComponentNotFound(rf.component_id));
             }
@@ -608,10 +606,8 @@ impl State {
                 db_path,
             )?;
         }
-        let component = self
-            .get_component(rf.component_id)
-            .ok_or(Error::ComponentNotFound(rf.component_id))?;
-        Ok((component, created))
+        self.get_component(rf.component_id)
+            .ok_or(Error::ComponentNotFound(rf.component_id))
     }
 
     pub fn get_component(&self, component_id: ComponentId) -> Option<&Component> {
@@ -849,6 +845,14 @@ pub(crate) fn max_node_age_override() -> Option<Duration> {
                 .and_then(|v| v.parse().ok())
         })
         .map(Duration::from_secs)
+}
+
+/// What sinking a table under the read lock did.
+enum StaticIngest {
+    /// The table is static, and these samples were pushed.
+    Pushed(Pushed),
+    /// The table is dynamic, so it sinks under the write lock.
+    Dynamic,
 }
 
 /// The newest timestamp pushed, and whether a push began an empty series.

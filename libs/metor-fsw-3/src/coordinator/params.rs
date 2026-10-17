@@ -70,6 +70,10 @@ pub enum MakeError {
     NoIoMember { system: String },
     #[error("the pack's create {0}")]
     Pack(String),
+    #[error("binding `{addr}`: {message}")]
+    Bind { addr: String, message: String },
+    #[error("opening the db at `{path}`: {message}")]
+    OpenDb { path: String, message: String },
 }
 
 #[cfg(test)]

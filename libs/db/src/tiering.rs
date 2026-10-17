@@ -68,9 +68,8 @@ pub async fn run(db: Arc<DB>, store: Option<Arc<dyn NodeStore>>, config: Tiering
 
 /// Per-pass scratch owned by the [`run`] task so a cycle reuses these
 /// buffers instead of allocating. Cloning a [`Component`] into `components`
-/// (and into each [`Victim`]) is pure `Arc` refcount bumps — see the
-/// `Arc<Path>` note on [`TimeSeries`](crate::time_series::TimeSeries) — so
-/// the whole passive pass is allocation-free once capacity is warm.
+/// (and into each [`Victim`]) only bumps `Arc` counts, so the whole passive
+/// pass is allocation-free once capacity is warm.
 #[derive(Default)]
 pub struct TieringScratch {
     components: Vec<(ComponentId, Component)>,

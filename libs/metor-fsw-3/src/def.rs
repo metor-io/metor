@@ -9,7 +9,10 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
+use metor_proto::types::PacketId;
+
 use crate::coordinator::{OutputConfig, OutputSource};
+use crate::record::RecordSchema;
 use crate::system::PortDef;
 
 /// The part of one instance's config a system sees when computing its ports.
@@ -178,6 +181,29 @@ impl Records {
             ..def.clone()
         })
     }
+
+    /// Returns the packet id of the message record `name`.
+    pub fn msg_id(&self, name: &str) -> Result<PacketId, RecordError> {
+        match self.0.get(name) {
+            Some(Some(def)) => match def.schema {
+                RecordSchema::Msg { id, .. } => Ok(id),
+                RecordSchema::Frame { .. } => Err(RecordError::Frame(name.to_string())),
+            },
+            Some(None) => Err(RecordError::Conflict(name.to_string())),
+            None => Err(RecordError::Unknown(name.to_string())),
+        }
+    }
+}
+
+/// Why a record name does not resolve to a message id.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RecordError {
+    #[error("`{0}` names no record the host knows")]
+    Unknown(String),
+    #[error("record `{0}` is declared differently by two registered ports")]
+    Conflict(String),
+    #[error("`{0}` is a frame, not a message")]
+    Frame(String),
 }
 
 #[cfg(test)]
