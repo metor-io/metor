@@ -347,7 +347,6 @@ impl SystemTable {
         }
         Ok(())
     }
-
 }
 
 impl SystemDef {

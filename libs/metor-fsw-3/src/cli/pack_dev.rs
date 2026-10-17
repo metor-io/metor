@@ -27,13 +27,11 @@ pub enum PackDevError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{path} is not valid TOML: {source}")]
+    #[error("reading {path}: {source}")]
     Toml {
         path: PathBuf,
         source: toml::de::Error,
     },
-    #[error("`{0}` is missing")]
-    MissingField(&'static str),
     #[error("the params schema of `{system}` did not decode: {source}")]
     Schema {
         system: String,

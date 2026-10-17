@@ -5,6 +5,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+
 use super::pack_dev::PackDevError;
 
 /// An error building a pack's cdylib.
@@ -91,23 +94,73 @@ impl PackConfig {
     /// Reads `<root>/pyproject.toml`. Fields it leaves out are filled in from
     /// `Cargo.toml` where possible.
     pub fn read(root: &Path) -> Result<PackConfig, PackDevError> {
-        let pyproject = read_toml(&root.join("pyproject.toml"))?;
-        let dist = string(&pyproject, &["project", "name"])
-            .ok_or(PackDevError::MissingField("[project] name"))?;
-        let field = |key| string(&pyproject, &["tool", "metor", "pack", key]);
-        let module = field("module").unwrap_or_else(|| identifier(&dist));
-        let (krate, lib) = match (field("crate"), field("lib")) {
+        let PyProject { project, tool } = read_toml(&root.join("pyproject.toml"))?;
+        let pack = tool.metor.pack;
+        let module = pack.module.unwrap_or_else(|| identifier(&project.name));
+        let (krate, lib) = match (pack.krate, pack.lib) {
             (Some(krate), Some(lib)) => (krate, lib),
             (krate, lib) => cargo_names(root, krate, lib)?,
         };
         Ok(PackConfig {
-            id: field("id").unwrap_or_else(|| module.clone()),
-            dist,
+            id: pack.id.unwrap_or_else(|| module.clone()),
+            dist: project.name,
             krate,
             lib,
             module,
         })
     }
+}
+
+/// The parts of a pack's `pyproject.toml` that [`PackConfig`] reads.
+#[derive(Deserialize)]
+struct PyProject {
+    project: Project,
+    #[serde(default)]
+    tool: Tool,
+}
+
+#[derive(Deserialize)]
+struct Project {
+    name: String,
+}
+
+#[derive(Default, Deserialize)]
+struct Tool {
+    #[serde(default)]
+    metor: MetorTool,
+}
+
+#[derive(Default, Deserialize)]
+struct MetorTool {
+    #[serde(default)]
+    pack: PackTable,
+}
+
+/// `[tool.metor.pack]`.
+#[derive(Default, Deserialize)]
+struct PackTable {
+    id: Option<String>,
+    module: Option<String>,
+    #[serde(rename = "crate")]
+    krate: Option<String>,
+    lib: Option<String>,
+}
+
+/// The parts of a pack's `Cargo.toml` that [`PackConfig`] reads.
+#[derive(Deserialize)]
+struct CargoToml {
+    package: Package,
+    lib: Option<Lib>,
+}
+
+#[derive(Deserialize)]
+struct Package {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct Lib {
+    name: Option<String>,
 }
 
 /// Returns the cargo package name and cdylib stem.
@@ -120,35 +173,24 @@ fn cargo_names(
     krate: Option<String>,
     lib: Option<String>,
 ) -> Result<(String, String), PackDevError> {
-    let cargo = read_toml(&root.join("Cargo.toml"))?;
-    let krate = krate
-        .or_else(|| string(&cargo, &["package", "name"]))
-        .ok_or(PackDevError::MissingField("[package] name"))?;
+    let cargo: CargoToml = read_toml(&root.join("Cargo.toml"))?;
+    let krate = krate.unwrap_or(cargo.package.name);
     let lib = lib
-        .or_else(|| string(&cargo, &["lib", "name"]))
+        .or_else(|| cargo.lib.and_then(|lib| lib.name))
         .unwrap_or_else(|| identifier(&krate));
     Ok((krate, lib))
 }
 
-pub(super) fn read_toml(path: &Path) -> Result<toml::Value, PackDevError> {
+/// Reads the TOML file at `path` as a `T`.
+pub(super) fn read_toml<T: DeserializeOwned>(path: &Path) -> Result<T, PackDevError> {
     let text = std::fs::read_to_string(path).map_err(|source| PackDevError::Read {
         path: path.to_path_buf(),
         source,
     })?;
-    text.parse().map_err(|source| PackDevError::Toml {
+    toml::from_str(&text).map_err(|source| PackDevError::Toml {
         path: path.to_path_buf(),
         source,
     })
-}
-
-/// Returns the value at `path`, or `None` if any key along it is missing.
-pub(super) fn lookup<'a>(table: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
-    path.iter().try_fold(table, |value, key| value.get(key))
-}
-
-/// Returns the string at `path`, or `None` if any key along it is missing.
-pub(super) fn string(table: &toml::Value, path: &[&str]) -> Option<String> {
-    lookup(table, path)?.as_str().map(str::to_string)
 }
 
 /// Turns a distribution or crate name into a Python or Rust identifier.
@@ -252,9 +294,9 @@ mod tests {
             "[tool.metor.pack]\nid = \"adcs\"\n",
             "[package]\nname = \"adcs\"\n",
         );
-        assert!(matches!(
-            PackConfig::read(dir.path()),
-            Err(PackDevError::MissingField("[project] name"))
-        ));
+        let Err(PackDevError::Toml { source, .. }) = PackConfig::read(dir.path()) else {
+            panic!("a pyproject.toml without [project] is an error")
+        };
+        assert!(source.to_string().contains("project"), "{source}");
     }
 }
