@@ -3,8 +3,10 @@
 use std::collections::HashMap;
 
 use super::DeploymentConfig;
-use crate::coordinator::{OutputSource, PeerPort, PortRef, SystemConfig, SystemTable};
-use crate::def::Records;
+use crate::coordinator::{
+    OutputSource, PeerPort, PortRef, SystemConfig, SystemStatus, SystemTable,
+};
+use crate::def::{DefCx, Records};
 use crate::system::{PortDef, SystemDef};
 
 use super::error::DeployError;
@@ -241,10 +243,12 @@ impl<'a> DefIndex<'a> {
             ));
         };
         if from.port == "status" {
-            return Ok(crate::coordinator::status_def(
-                &from.system,
-                target.coordinator.namespace.as_deref(),
-            ));
+            let cx = DefCx {
+                id: &from.system,
+                namespace: target.coordinator.namespace.as_deref(),
+                ..DefCx::empty()
+            };
+            return Ok(SystemStatus::port_def(&cx));
         }
         let def = self.def(At::new(at.target, s))?;
         def.outputs
