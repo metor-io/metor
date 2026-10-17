@@ -4,7 +4,7 @@ use super::*;
 use super::{CONFIG_VERSION, TargetConfig};
 use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig};
 use crate::link::{DB_TYPE, PUBLISH_TYPE, SUBSCRIBE_TYPE};
-use crate::record::{Record, RecordSchema};
+use crate::record::RecordSchema;
 use crate::tests::utils::{Emit, Recorder, Tap, emit, imu_source, table, tap};
 
 /// Resolves whatever `envelope` has pending, with no store.
