@@ -83,14 +83,11 @@ mod step;
 #[cfg(all(test, feature = "host"))]
 mod tests;
 
-use std::borrow::Cow;
-
 use metor_fsw_3_ring::NoWake;
 
 use crate::channel::{ABORT_PORT, AbortRequest};
-use crate::coordinator::{SystemKind, TableEntry};
 use crate::def::{DefCx, DefError};
-use crate::fn_system::{Ctor, Defs, FnSignature, InSet, OutSet, Param};
+use crate::fn_system::{Defs, FnSignature, InSet, OutSet, Param};
 use crate::port::Input;
 use crate::system::{Ports, SystemDef};
 
@@ -148,32 +145,5 @@ pub fn def<S: SequenceFn>(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         inputs,
         outputs: OutSet::<S>::defs(cx)?,
         grants: Defs::of::<S>(cx)?.grants,
-    })
-}
-
-/// Builds the system table entry for a `#[sequence]` fn.
-///
-/// `ctor` creates the sequence's state each time the sequence is made.
-pub(crate) fn entry<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
-    ctor: C,
-) -> Result<TableEntry, DefError> {
-    Ok(TableEntry {
-        kind: SystemKind::Sequence,
-        adapters: SystemKind::Sequence.adapters(),
-        def: def::<S>(&DefCx::empty())?,
-        def_fn: Box::new(def::<S>),
-        doc: Cow::Borrowed(S::DOC),
-        schema: C::schema(),
-        make: std::sync::Arc::new(move |mut cx| {
-            let instance = crate::fn_system::Instance::from_make_cx(&cx);
-            let (views, writers) = cx.take_bindings();
-            let mut views = views.into_iter();
-            // PANIC Safety: `def` declares `abort` first, and build binds one
-            // list per declared input.
-            let abort = Input::new(views.next().expect("the abort binding").views);
-            let (ins, outs, io) = crate::fn_system::bind::<S>(views.collect(), writers, instance)?;
-            let state = ctor.make_with_io(cx.id, cx.params, io.as_ref())?;
-            Ok(Box::new(SequenceStep::new::<S>(state, abort, ins, outs)))
-        }),
     })
 }

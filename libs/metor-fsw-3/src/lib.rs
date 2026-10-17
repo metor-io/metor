@@ -159,9 +159,9 @@ pub use channel::{Abort, AbortRequest, ChannelState, ChannelStatus};
 #[cfg(feature = "host")]
 pub use coordinator::Coordinator;
 pub use coordinator::{
-    Adapter, BuildError, ChannelConfig, Clock, CoordinatorConfig, EndReason, InputConfig,
-    LoadError, MakeError, Occupant, OutputConfig, OutputSource, ParamError, Params, PortRef,
-    RunState, Step, SystemConfig, SystemKind, SystemStatus, SystemTable, WallRate,
+    Adapter, BuildError, ChannelConfig, ChannelName, ChannelNameTooLong, Clock, CoordinatorConfig,
+    EndReason, InputConfig, LoadError, MakeError, Occupant, OutputConfig, OutputSource, ParamError,
+    Params, PortRef, RunState, Step, SystemConfig, SystemKind, SystemStatus, SystemTable, WallRate,
 };
 pub use def::{DefCx, DefError, Records};
 pub use fn_system::{

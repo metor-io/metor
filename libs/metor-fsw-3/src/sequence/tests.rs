@@ -532,7 +532,7 @@ fn channeled(start: RunState) -> CoordinatorConfig {
             SystemConfig {
                 inputs: vec![InputConfig::new("commands", "cmds", "commands")],
                 adapter: Some(Adapter::Channel(ChannelConfig {
-                    name: "seq".into(),
+                    name: crate::ChannelName::try_from("seq".to_string()).expect("a short name"),
                     start,
                 })),
                 ..SystemConfig::new("t", "traced")

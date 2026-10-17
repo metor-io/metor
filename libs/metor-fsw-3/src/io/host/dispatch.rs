@@ -425,7 +425,7 @@ impl Dispatch {
         !member.quiescing || (member.drained && ops.iter().all(|e| !e.live))
     }
 
-    pub(crate) fn end_queiscing_member(&mut self, m: usize) {
+    pub(crate) fn end_quiescing_member(&mut self, m: usize) {
         self.members[m].quiescing = false;
     }
 

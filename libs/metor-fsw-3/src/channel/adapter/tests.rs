@@ -244,7 +244,7 @@ fn table(shared: &Shared) -> SystemTable {
 
 fn channel(name: &str, start: RunState) -> Option<Adapter> {
     Some(Adapter::Channel(ChannelConfig {
-        name: name.into(),
+        name: crate::ChannelName::try_from(name.to_string()).expect("a short name"),
         start,
     }))
 }

@@ -363,7 +363,7 @@ fn closed_grant_is_stale_until_a_remake() {
     assert_eq!(r.replies()[0].1.result(), Err(IoError::Stale));
     r.d.quiesce_member(0);
     r.d.member_drained(0);
-    r.d.end_queiscing_member(0);
+    r.d.end_quiescing_member(0);
     r.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
     assert_eq!(r.routes().len(), 1);
 }

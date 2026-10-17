@@ -108,9 +108,6 @@ pub enum BuildError {
         source: DefError,
     },
 
-    #[error("channel `{name}` is longer than {cap} bytes")]
-    ChannelName { name: String, cap: usize },
-
     #[error("channel `{name}` is named by two systems")]
     DuplicateChannel { name: String },
 

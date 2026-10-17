@@ -3,11 +3,12 @@
 //! [`channel_registry`] publishes every channel, and the names each one may
 //! load, as one `SequenceRegistry` message.
 
+use core::num::NonZeroU64;
+
 use metor_proto_wkt::{SequenceChannelSpec, SequenceRegistry};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::coordinator::ParamError;
 use crate::port::Output;
 
 /// The config for [`channel_registry`].
@@ -17,7 +18,7 @@ pub struct RegistryParams {
     pub channels: Vec<ChannelSpec>,
     /// The number of cycles between writes.
     #[serde(default = "default_period")]
-    pub period: u64,
+    pub period: NonZeroU64,
 }
 
 /// One channel, and the names a `Load` command on it may use.
@@ -30,28 +31,21 @@ pub struct ChannelSpec {
 }
 
 /// The period used when the config does not set one.
-fn default_period() -> u64 {
-    100
+fn default_period() -> NonZeroU64 {
+    // PANIC Safety: evaluated at compile time.
+    const { NonZeroU64::new(100).expect("100 is non-zero") }
 }
 
 /// The state of [`channel_registry`].
 pub struct Registry {
     registry: SequenceRegistry,
-    period: u64,
+    period: NonZeroU64,
     until: u64,
 }
 
 impl Registry {
     /// Creates the state from its config.
-    ///
-    /// # Errors
-    /// Returns an error if `period` is zero.
-    pub fn new(params: RegistryParams) -> Result<Self, ParamError> {
-        if params.period == 0 {
-            return Err(ParamError::Decode(
-                "period must be at least one cycle".into(),
-            ));
-        }
+    pub fn new(params: RegistryParams) -> Self {
         let registry = SequenceRegistry {
             channels: params
                 .channels
@@ -62,11 +56,11 @@ impl Registry {
                 })
                 .collect(),
         };
-        Ok(Self {
+        Self {
             registry,
             period: params.period,
             until: 0,
-        })
+        }
     }
 }
 
@@ -77,7 +71,7 @@ impl Registry {
 pub fn channel_registry(#[state] s: &mut Registry, registry: &mut Output<SequenceRegistry>) {
     if s.until == 0 {
         let _ = registry.write(&s.registry);
-        s.until = s.period;
+        s.until = s.period.get();
     }
     s.until -= 1;
 }
@@ -88,13 +82,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::coordinator::Params;
+    use crate::coordinator::{ParamError, Params};
     use crate::fn_system::Ctor;
 
     use crate::tests::utils::pair;
 
     fn make(params: serde_json::Value) -> Result<Registry, ParamError> {
-        Ctor::<Registry, (RegistryParams, ParamError)>::make(
+        Ctor::<Registry, (RegistryParams,)>::make(
             &Registry::new,
             Params(&params),
             &crate::io::IoInit::empty(),

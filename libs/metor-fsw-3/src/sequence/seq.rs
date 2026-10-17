@@ -5,7 +5,7 @@ use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
 use core::ptr::NonNull;
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -29,7 +29,7 @@ pub struct Seq<'a> {
     polling: Cell<bool>,
     redlines: UnsafeCell<List<Node>>,
     walking: Cell<bool>,
-    _brand: PhantomData<fn(&'a ()) -> &'a ()>,
+    _share_lifetime: PhantomData<fn(&'a ()) -> &'a ()>,
 }
 
 /// The cycle time and abort flag that the wait futures read.
@@ -49,16 +49,6 @@ pub enum SeqError {
     Failed(Cow<'static, str>),
 }
 
-impl Clock {
-    /// Returns the wait's deadline.
-    ///
-    /// The first call sets `deadline` to `dur` after the current cycle time.
-    /// Later calls return that same deadline.
-    fn arm(&self, deadline: &mut Option<Timestamp>, dur: Duration) -> Timestamp {
-        *deadline.get_or_insert_with(|| after(self.now.get(), dur))
-    }
-}
-
 impl<'a> Seq<'a> {
     pub(crate) fn new() -> Self {
         Self {
@@ -69,7 +59,7 @@ impl<'a> Seq<'a> {
             polling: Cell::new(false),
             redlines: UnsafeCell::new(List::new()),
             walking: Cell::new(false),
-            _brand: PhantomData,
+            _share_lifetime: PhantomData,
         }
     }
 
@@ -146,9 +136,26 @@ impl<'a> Seq<'a> {
         self.clock.now.set(now);
     }
 
-    /// Marks the body as being polled until the returned guard is dropped.
-    pub(crate) fn polling(&self) -> Raised<'_> {
-        Raised::new(&self.polling)
+    /// Polls `body` once, unless the sequence is aborted or a redline trips.
+    ///
+    /// Returns [`SeqError::Aborted`] without polling `body` once the sequence
+    /// is aborted. A tripped redline logs a `redline` fault with its name and
+    /// aborts the sequence.
+    pub(crate) fn advance(
+        &self,
+        body: Pin<&mut dyn Future<Output = Result<(), SeqError>>>,
+    ) -> Poll<Result<(), SeqError>> {
+        if !self.aborted()
+            && let Some(name) = self.tripped()
+        {
+            Log.fault("redline", name);
+            let _ = self.abort();
+        }
+        if self.aborted() {
+            return Poll::Ready(Err(SeqError::Aborted));
+        }
+        let _polling = Raised::new(&self.polling);
+        body.poll(&mut Context::from_waker(Waker::noop()))
     }
 
     /// Links a pinned redline into this `Seq`.
@@ -160,48 +167,7 @@ impl<'a> Seq<'a> {
     /// example, from inside a condition).
     ///
     /// A condition must outlive the sequence's parameters, so it cannot
-    /// borrow a local of the body, even through a leaked redline:
-    ///
-    /// ```compile_fail,E0373
-    /// use metor_fsw_3::{Redline, Seq, SeqError, sequence};
-    ///
-    /// #[sequence]
-    /// async fn dangle(seq: &Seq) -> Result<(), SeqError> {
-    ///     let value = Box::new(42u32);
-    ///     let redline = Box::pin(Redline::new("dangling", || *value == 42));
-    ///     seq.redline(redline.as_ref());
-    ///     core::mem::forget(redline);
-    ///     drop(value);
-    ///     seq.next_cycle().await;
-    ///     Ok(())
-    /// }
-    /// ```
-    ///
-    /// It also cannot borrow one through a leaked future that linked a
-    /// redline:
-    ///
-    /// ```compile_fail,E0373
-    /// use core::future::{Future, poll_fn};
-    /// use core::task::Poll;
-    /// use metor_fsw_3::{Seq, SeqError, redline, sequence};
-    ///
-    /// #[sequence]
-    /// async fn dangle(seq: &Seq<'_>) -> Result<(), SeqError> {
-    ///     let mut nested = Box::pin(async {
-    ///         let value = Box::new(42u32);
-    ///         redline!(seq, "dangling", || *value == 42);
-    ///         seq.next_cycle().await;
-    ///     });
-    ///     poll_fn(|cx| {
-    ///         let _ = nested.as_mut().poll(cx);
-    ///         Poll::Ready(())
-    ///     })
-    ///     .await;
-    ///     core::mem::forget(nested);
-    ///     seq.next_cycle().await;
-    ///     Ok(())
-    /// }
-    /// ```
+    /// borrow a local of the body.
     pub fn redline<C: Fn() -> bool + 'a>(&self, redline: Pin<&Redline<C>>) {
         if self.walking.get() || !redline.node.claim(self) {
             return;
@@ -316,12 +282,6 @@ fn run_handler<'a>(seq: &Seq<'a>, f: impl FnOnce(&Seq<'a>)) {
     }
 }
 
-/// Returns `now` plus `dur`, saturating instead of overflowing.
-fn after(now: Timestamp, dur: Duration) -> Timestamp {
-    let micros = i64::try_from(dur.as_micros()).unwrap_or(i64::MAX);
-    Timestamp(now.0.saturating_add(micros))
-}
-
 /// The future returned by [`Seq::sleep`].
 ///
 /// It wraps a [`WaitFor`] whose condition is never true, and treats that
@@ -360,8 +320,12 @@ impl<F: FnMut() -> bool + Unpin> Future for WaitFor<'_, F> {
         if (this.pred)() {
             return Poll::Ready(Ok(()));
         }
-        let deadline = this.clock.arm(&mut this.deadline, this.timeout);
-        if this.clock.now.get() >= deadline {
+        let now = this.clock.now.get();
+        let deadline = *this.deadline.get_or_insert_with(|| {
+            let micros = i64::try_from(this.timeout.as_micros()).unwrap_or(i64::MAX);
+            Timestamp(now.0.saturating_add(micros))
+        });
+        if now >= deadline {
             return Poll::Ready(Err(SeqError::TimedOut));
         }
         Poll::Pending
@@ -390,7 +354,6 @@ impl Future for NextCycle<'_> {
 #[cfg(all(test, feature = "host"))]
 mod tests {
     use core::pin::pin;
-    use core::task::Waker;
 
     use super::*;
     use crate::sequence::tests::{Trace, ms};

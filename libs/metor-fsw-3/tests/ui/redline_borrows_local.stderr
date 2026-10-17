@@ -1,0 +1,33 @@
+error[E0373]: closure may outlive the current function, but it borrows `*value`, which is owned by the current function
+ --> tests/ui/redline_borrows_local.rs:6:53
+  |
+3 | #[sequence]
+  | ----------- lifetime `'__seq` defined here
+...
+6 |     let redline = Box::pin(Redline::new("dangling", || *value == 42));
+  |                                                     ^^ ------ `*value` is borrowed here
+  |                                                     |
+  |                                                     may outlive borrowed value `*value`
+  |
+note: function requires argument type to outlive `'__seq`
+ --> tests/ui/redline_borrows_local.rs:7:5
+  |
+7 |     seq.redline(redline.as_ref());
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: to force the closure to take ownership of `*value` (and any other referenced variables), use the `move` keyword
+  |
+6 |     let redline = Box::pin(Redline::new("dangling", move || *value == 42));
+  |                                                     ++++
+
+error[E0505]: cannot move out of `value` because it is borrowed
+  --> tests/ui/redline_borrows_local.rs:9:10
+   |
+ 6 |     let redline = Box::pin(Redline::new("dangling", || *value == 42));
+   |                                                     -- ------ borrow occurs due to use in closure
+   |                                                     |
+   |                                                     borrow of `*value` occurs here
+...
+ 9 |     drop(value);
+   |          ^^^^^ move out of `value` occurs here
+10 |     seq.next_cycle().await;
+   |     --- borrow later used here

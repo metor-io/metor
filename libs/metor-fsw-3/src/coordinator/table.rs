@@ -14,7 +14,7 @@ use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, InSet, OutSet, SystemFn};
 use crate::io::{Io, SharedIo};
 use crate::port::{Input, Output};
-use crate::sequence::SequenceFn;
+use crate::sequence::{self, SequenceFn, SequenceStep};
 use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 use crate::thread::{DEFAULT_THREAD, LaunchCx, Launched, Threads};
 
@@ -223,7 +223,7 @@ impl SystemTable {
         ctor: C,
     ) -> Result<(), BuildError> {
         let entry =
-            crate::sequence::entry::<S, M, C>(ctor).map_err(|source| BuildError::TypeDef {
+            TableEntry::sequence::<S, M, C>(ctor).map_err(|source| BuildError::TypeDef {
                 ty: ty.to_string(),
                 source,
             })?;
@@ -448,6 +448,33 @@ impl TableEntry {
                     inputs,
                     outputs,
                 }))
+            }),
+        })
+    }
+
+    /// Builds the table entry for a `#[sequence]` fn.
+    ///
+    /// `ctor` creates the sequence's state each time the sequence is made.
+    fn sequence<S: SequenceFn, M, C: Ctor<S::State, M> + 'static>(
+        ctor: C,
+    ) -> Result<Self, DefError> {
+        Ok(Self {
+            kind: SystemKind::Sequence,
+            adapters: SystemKind::Sequence.adapters(),
+            def: sequence::def::<S>(&DefCx::empty())?,
+            def_fn: Box::new(sequence::def::<S>),
+            doc: Cow::Borrowed(S::DOC),
+            schema: C::schema(),
+            make: Arc::new(move |mut cx| {
+                let instance = fn_system::Instance::from_make_cx(&cx);
+                let (views, writers) = cx.take_bindings();
+                let mut views = views.into_iter();
+                // PANIC Safety: `def` declares `abort` first, and build binds one
+                // list per declared input.
+                let abort = Input::new(views.next().expect("the abort binding").views);
+                let (ins, outs, io) = fn_system::bind::<S>(views.collect(), writers, instance)?;
+                let state = ctor.make_with_io(cx.id, cx.params, io.as_ref())?;
+                Ok(Box::new(SequenceStep::new::<S>(state, abort, ins, outs)))
             }),
         })
     }

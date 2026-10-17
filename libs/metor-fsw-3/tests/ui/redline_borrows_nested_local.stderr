@@ -1,0 +1,21 @@
+error[E0373]: closure may outlive the current function, but it borrows `*value`, which is owned by the current function
+ --> tests/ui/redline_borrows_nested_local.rs:9:35
+  |
+6 | async fn dangle(seq: &Seq<'_>) -> Result<(), SeqError> {
+  |                 --- lifetime `'1` appears in the type of `seq`
+...
+9 |         redline!(seq, "dangling", || *value == 42);
+  |                                   ^^ ------ `*value` is borrowed here
+  |                                   |
+  |                                   may outlive borrowed value `*value`
+  |
+note: function requires argument type to outlive `'1`
+ --> tests/ui/redline_borrows_nested_local.rs:9:9
+  |
+9 |         redline!(seq, "dangling", || *value == 42);
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: this error originates in the macro `redline` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: to force the closure to take ownership of `*value` (and any other referenced variables), use the `move` keyword
+  |
+9 |         redline!(seq, "dangling", move || *value == 42);
+  |                                   ++++

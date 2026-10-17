@@ -3,7 +3,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::AtomicU32;
-use core::task::{Context, Poll, Waker};
+use core::task::Poll;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -91,51 +91,11 @@ async fn run<S: SequenceFn>(
     S::call(&mut state, items).await
 }
 
-/// Polls the body once, or drops it if the sequence should abort.
-///
-/// The body is dropped if the sequence was aborted or a redline trips.
-/// Dropping it runs its abort handlers.
-///
-/// Redlines are only checked while the body is alive, because the body owns
-/// everything their conditions borrow.
-fn advance(
-    seq: &Seq<'_>,
-    samplers: &mut Samplers,
-    run: &mut Option<Run>,
-) -> Poll<Result<(), SeqError>> {
-    let Some(body) = run.as_mut() else {
-        return Poll::Pending;
-    };
-    if !seq.aborted() {
-        samplers.take_all();
-        trip(seq);
-    }
-    if seq.aborted() {
-        *run = None;
-        return Poll::Ready(Err(SeqError::Aborted));
-    }
-    let _polling = seq.polling();
-    body.as_mut().poll(&mut Context::from_waker(Waker::noop()))
-}
-
-/// Aborts the sequence if any redline trips.
-///
-/// Logs a `redline` fault with the name of the redline that tripped.
-fn trip(seq: &Seq<'_>) {
-    if let Some(name) = seq.tripped() {
-        Log.fault("redline", name);
-        let _ = seq.abort();
-    }
-}
-
 impl Step for SequenceStep {
     fn execute(&mut self, now: Timestamp) {
         self.seq.set_now(now);
         if self.abort.requested() {
             let _ = self.seq.abort();
-        }
-        if self.run.is_none() {
-            return;
         }
         let Self {
             seq,
@@ -144,11 +104,21 @@ impl Step for SequenceStep {
             run,
             ..
         } = self;
-        let polled = log::with_log_port(log, now, || advance(seq, samplers, run));
+        let Some(body) = run.as_mut() else {
+            return;
+        };
+        let polled = log::with_log_port(log, now, || {
+            if !seq.aborted() {
+                samplers.take_all();
+            }
+            seq.advance(body.as_mut())
+        });
+        if polled.is_ready() {
+            log::with_log_port(log, now, || drop(run.take()));
+            *samplers = Samplers::default();
+        }
         log.report_failed_writes(&self.dropped, now);
         if let Poll::Ready(result) = polled {
-            self.run = None;
-            self.samplers = Samplers::default();
             self.finish(now, result);
         }
     }

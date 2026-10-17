@@ -13,7 +13,6 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
-use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
 
 use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
@@ -389,10 +388,7 @@ impl IoPoints {
     }
 }
 
-/// Checks that channel names are short enough and unique.
-///
-/// A name must fit the wire format's length cap, and no two systems may use
-/// the same one.
+/// Checks that no two systems use the same channel name.
 fn check_channels(config: &CoordinatorConfig) -> Result<(), BuildError> {
     let names = config
         .systems
@@ -403,12 +399,6 @@ fn check_channels(config: &CoordinatorConfig) -> Result<(), BuildError> {
         });
     let mut seen_names = std::collections::HashSet::new();
     for name in names {
-        if name.len() > SEQUENCE_CHANNEL_NAME_CAP {
-            return Err(BuildError::ChannelName {
-                name: name.to_string(),
-                cap: SEQUENCE_CHANNEL_NAME_CAP,
-            });
-        }
         if !seen_names.insert(name) {
             return Err(BuildError::DuplicateChannel {
                 name: name.to_string(),
@@ -1669,7 +1659,7 @@ mod tests {
         fn test_io_on_a_channel_is_refused() {
             let mut config = config(nominal(), "a", "b");
             config.systems[3].adapter = Some(Adapter::Channel(ChannelConfig {
-                name: "io".into(),
+                name: crate::ChannelName::try_from("io".to_string()).expect("a short name"),
                 start: Default::default(),
             }));
             let e = error(config);

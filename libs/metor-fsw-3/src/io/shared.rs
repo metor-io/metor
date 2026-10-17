@@ -56,19 +56,14 @@ impl IoState {
         self.index(id).ok_or(MakeError::NoIoMember { system })
     }
 
-    /// Starts quiescing system `id`: cancels its ops in flight. False if it
-    /// has no IO.
+    /// Starts quiescing system `id` by cancelling its ops in flight.
     #[cfg(feature = "host")]
-    pub(crate) fn quiesce_system(&mut self, id: &str) -> bool {
-        let Some(m) = self.index(id) else {
-            return false;
-        };
+    pub(crate) fn quiesce_system(&mut self, id: &str) {
         #[cfg(all(feature = "host", unix))]
-        if let Some(host) = &mut self.host {
+        if let (Some(m), Some(host)) = (self.index(id), &mut self.host) {
             host.dispatch.quiesce_member(m);
         }
-        let _ = m;
-        true
+        let _ = id;
     }
 
     /// Whether system `id` has nothing left in flight.
@@ -83,10 +78,10 @@ impl IoState {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn end_queiscing_system(&mut self, id: &str) {
+    pub(crate) fn end_quiescing_system(&mut self, id: &str) {
         #[cfg(all(feature = "host", unix))]
         if let (Some(m), Some(host)) = (self.index(id), &mut self.host) {
-            host.dispatch.end_queiscing_member(m);
+            host.dispatch.end_quiescing_member(m);
         }
         let _ = id;
     }

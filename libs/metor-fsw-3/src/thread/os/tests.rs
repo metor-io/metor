@@ -323,7 +323,7 @@ fn test_corrupt_mirror_ends_the_system() {
 fn channel(id: &str, ty: &str, name: &str) -> SystemConfig {
     SystemConfig {
         adapter: Some(crate::Adapter::Channel(crate::ChannelConfig {
-            name: name.into(),
+            name: crate::ChannelName::try_from(name.to_string()).expect("a short name"),
             start: crate::RunState::Running,
         })),
         ..SystemConfig::new(id, ty)
@@ -352,14 +352,9 @@ fn test_reject_channel_on_async() {
 #[test]
 fn test_reject_bad_channel_names() {
     let long = "c".repeat(metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP + 1);
-    let config = CoordinatorConfig {
-        systems: vec![channel("imu", "imu", &long)],
-        ..Default::default()
-    };
-    assert!(matches!(
-        config.build(&table(&Recorder::default())).err(),
-        Some(BuildError::ChannelName { .. })
-    ));
+    let system = serde_json::json!({ "id": "imu", "ty": "imu", "channel": { "name": long } });
+    let error = serde_json::from_value::<SystemConfig>(system).expect_err("a long name");
+    assert!(error.to_string().contains("is longer than"), "{error}");
     let config = CoordinatorConfig {
         systems: vec![channel("a", "imu", "mode"), channel("b", "imu", "mode")],
         ..Default::default()

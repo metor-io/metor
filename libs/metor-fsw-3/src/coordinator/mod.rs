@@ -22,9 +22,9 @@ mod tests;
 #[cfg(feature = "host")]
 pub(crate) use config::Adapters;
 pub use config::{
-    Adapter, BuildOptions, ChannelConfig, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH,
-    InputConfig, InvalidWallRate, Location, OutputConfig, OutputSource, PortRef, RunState,
-    SystemConfig, WallRate,
+    Adapter, BuildOptions, ChannelConfig, ChannelName, ChannelNameTooLong, Clock,
+    CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig, InvalidWallRate, Location, OutputConfig,
+    OutputSource, PortRef, RunState, SystemConfig, WallRate,
 };
 pub use error::BuildError;
 pub use params::{MakeError, ParamError, Params};

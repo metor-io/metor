@@ -157,7 +157,7 @@ where
 {
     if let Some(Adapter::Channel(channel)) = cx.adapter {
         return Err(ParamError::Channel {
-            channel: channel.name.clone(),
+            channel: channel.name.to_string(),
         });
     }
     let thread_name = cx.thread().to_string();

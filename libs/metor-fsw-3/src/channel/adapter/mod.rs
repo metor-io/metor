@@ -101,7 +101,7 @@ pub(crate) fn make_channel(
     Ok(Box::new(Channel {
         commands: command_input(commands),
         core: Core {
-            name: channel.name.clone(),
+            name: channel.name.to_string(),
             run: channel.start,
             inner: Some(inner),
             end_reason: None,
@@ -122,9 +122,9 @@ pub(crate) fn make_channel(
 /// Returns the writer the adapter uses to send aborts, or `None` if the
 /// system has no `abort` input.
 fn private_abort(def: &SystemDef, inputs: &mut [Vec<RingBuffer>]) -> Option<Output<AbortRequest>> {
-    let at = def.inputs.iter().position(|p| p.name == ABORT_PORT)?;
+    let index = def.inputs.iter().position(|p| p.name == ABORT_PORT)?;
     let ring = abort_ring();
-    inputs[at] = vec![ring.clone()];
+    inputs[index] = vec![ring.clone()];
     Some(writer::<AbortRequest>(&ring))
 }
 
@@ -225,11 +225,6 @@ enum Deferred {
     Load(String),
 }
 
-/// The longest reason, in bytes, that an event carries.
-///
-/// This keeps every refusal small enough to fit in its record.
-const REASON_CAP: usize = 512;
-
 impl Step for Channel {
     fn execute(&mut self, now: Timestamp) {
         let Self { commands, core } = self;
@@ -295,7 +290,7 @@ impl Core {
     fn reset(&mut self) -> SequenceEventKind {
         self.run = RunState::Stopped;
         if !self.has_io() {
-            return self.restarted();
+            return self.restart_event();
         }
         self.inner = None;
         self.end_reason = None;
@@ -304,7 +299,7 @@ impl Core {
         SequenceEventKind::quiescing()
     }
 
-    fn restarted(&mut self) -> SequenceEventKind {
+    fn restart_event(&mut self) -> SequenceEventKind {
         match self.restart() {
             Ok(()) => SequenceEventKind::Loaded {
                 name: self.loaded_name(),
@@ -321,7 +316,9 @@ impl Core {
             self.remake()?;
         }
         match (self.inner.as_mut(), &self.loaded) {
-            (Some(inner), Some(name)) => reload(inner, name),
+            (Some(inner), Some(name)) => crate::panic::catch(|| inner.load(name))
+                .ok_or_else(|| "the load panicked".to_string())?
+                .map_err(|e| e.to_string()),
             _ => Ok(()),
         }
     }
@@ -352,9 +349,9 @@ impl Core {
         if !self.recipe.io.borrow().is_system_idle(id) {
             return;
         }
-        self.recipe.io.borrow_mut().end_queiscing_system(id);
+        self.recipe.io.borrow_mut().end_quiescing_system(id);
         let event = match self.deferred.take() {
-            Some(Deferred::Restart) => self.restarted(),
+            Some(Deferred::Restart) => self.restart_event(),
             Some(Deferred::Load(name)) => self.load(name),
             None => return,
         };
@@ -469,15 +466,6 @@ impl Core {
     }
 }
 
-/// Loads `name` again.
-///
-/// This drops the current occupant and creates a new one.
-fn reload(inner: &mut Box<dyn Step>, name: &str) -> Result<(), String> {
-    crate::panic::catch(|| inner.load(name))
-        .ok_or_else(|| "the load panicked".to_string())?
-        .map_err(|e| e.to_string())
-}
-
 /// The events a channel reports beyond what the wire type builds itself.
 trait ChannelEvent {
     fn quiescing() -> Self;
@@ -512,6 +500,11 @@ impl ChannelEvent for SequenceEventKind {
         }
     }
 }
+
+/// The longest reason, in bytes, that an event carries.
+///
+/// This keeps every refusal small enough to fit in its record.
+const REASON_CAP: usize = 512;
 
 /// Cuts `text` to at most `REASON_CAP` bytes, on a char boundary.
 fn clipped(mut text: String) -> String {

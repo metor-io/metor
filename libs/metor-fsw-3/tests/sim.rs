@@ -172,7 +172,7 @@ fn reset_cancels_a_read_parked_on_the_wire() {
     config.systems[2].params = serde_json::json!({ "script": [] });
     let driver = &mut config.systems[0];
     driver.adapter = Some(Adapter::Channel(ChannelConfig {
-        name: "gps".into(),
+        name: metor_fsw_3::ChannelName::try_from("gps".to_string()).expect("a short name"),
         start: RunState::Running,
     }));
     driver
