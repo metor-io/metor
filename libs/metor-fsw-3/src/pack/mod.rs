@@ -328,7 +328,7 @@ unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn S
                 threads,
                 io: &io,
                 seed: None,
-                namespace: "",
+                namespace: None,
                 records: &records,
             })
         })

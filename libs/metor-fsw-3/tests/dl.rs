@@ -363,7 +363,7 @@ fn test_library_survives_instance_drop() {
 fn test_failed_consumer_isolation() {
     let pack = open();
     let (mut config, seen) = pipeline("fail_input", serde_json::Value::Null);
-    config.ring_depth = 2;
+    config.ring_depth = core::num::NonZeroUsize::new(2).expect("nonzero");
     config.systems[2].inputs[0].from = vec![PortRef::new("source", "output")];
     let mut coordinator = config.build(&table(&pack, &seen)).expect("builds");
 
