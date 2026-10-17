@@ -116,7 +116,7 @@ fn config(pos_sigma: f64) -> CoordinatorConfig {
         "host": { "system": "gps", "param": "uart" },
         "device": { "system": "rx", "param": "uart" },
     });
-    let resources = json!([{ "id": "gps_uart", "backing": { "sim": sim } }]);
+    let resources = json!({ "gps_uart": { "sim": sim } });
     CoordinatorConfig {
         clock: Clock::Simulated {
             dt: Duration::from_micros(DT as u64),
