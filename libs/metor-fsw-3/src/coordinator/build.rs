@@ -401,7 +401,7 @@ fn check_channels(config: &CoordinatorConfig) -> Result<(), BuildError> {
             Some(Adapter::Channel(channel)) => Some(channel.name.as_str()),
             _ => None,
         });
-    let mut seen = std::collections::HashSet::new();
+    let mut seen_names = std::collections::HashSet::new();
     for name in names {
         if name.len() > SEQUENCE_CHANNEL_NAME_CAP {
             return Err(BuildError::ChannelName {
@@ -409,7 +409,7 @@ fn check_channels(config: &CoordinatorConfig) -> Result<(), BuildError> {
                 cap: SEQUENCE_CHANNEL_NAME_CAP,
             });
         }
-        if !seen.insert(name) {
+        if !seen_names.insert(name) {
             return Err(BuildError::DuplicateChannel {
                 name: name.to_string(),
             });
@@ -470,7 +470,7 @@ impl SystemDef {
         let mut edges: Vec<(&str, PortDef)> = Vec::new();
         for input in &system.inputs {
             if channel && input.port == ABORT_PORT {
-                return Err(reserved(system, ABORT_PORT));
+                return Err(BuildError::reserved_channel_port(&system.id, ABORT_PORT));
             }
             // The channel reads its commands; the system never sees them.
             if channel && input.port == COMMANDS_PORT {
@@ -508,7 +508,8 @@ impl SystemDef {
             });
         }
         if channel {
-            def = crate::channel::def(def, &cx).map_err(|port| reserved(system, &port))?;
+            def = crate::channel::def(def, &cx)
+                .map_err(|port| BuildError::reserved_channel_port(&system.id, &port))?;
         }
         def.outputs.push(SystemStatus::port_def(&cx));
         Ok(def)
@@ -552,13 +553,6 @@ impl SystemDef {
             }
         }
         Ok(())
-    }
-}
-
-fn reserved(system: &SystemConfig, port: &str) -> BuildError {
-    BuildError::ReservedChannelPort {
-        id: system.id.clone(),
-        port: port.to_string(),
     }
 }
 
@@ -813,7 +807,7 @@ fn make_systems(
             records: args.records,
         };
         let step = match system.adapter {
-            Some(Adapter::Channel(_)) => crate::channel::make(&system.entry.make, cx),
+            Some(Adapter::Channel(_)) => crate::channel::make_channel(&system.entry.make, cx),
             _ => (system.entry.make)(cx),
         }
         .map_err(|source| {

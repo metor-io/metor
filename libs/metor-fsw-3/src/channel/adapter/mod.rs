@@ -42,7 +42,7 @@ pub(crate) fn def(mut inner: SystemDef, cx: &DefCx<'_>) -> Result<SystemDef, Str
     if let Some(port) = taken.find(|p| reserved.contains(&p.name.as_ref())) {
         return Err(port.name.to_string());
     }
-    let [commands, events, status] = ports(cx);
+    let [commands, events, status] = channel_ports(cx);
     inner.inputs.push(commands);
     inner.outputs.extend([events, status]);
     Ok(inner)
@@ -51,7 +51,7 @@ pub(crate) fn def(mut inner: SystemDef, cx: &DefCx<'_>) -> Result<SystemDef, Str
 /// Returns the ports every channel adds.
 ///
 /// These are the commands input, then the events and status outputs.
-pub(crate) fn ports(cx: &DefCx<'_>) -> [PortDef; 3] {
+pub(crate) fn channel_ports(cx: &DefCx<'_>) -> [PortDef; 3] {
     [
         Input::<SequenceCommand>::def(cx, COMMANDS_PORT),
         Output::<SequenceChannelEvent>::def(cx, EVENTS_PORT),
@@ -64,19 +64,22 @@ pub(crate) fn ports(cx: &DefCx<'_>) -> [PortDef; 3] {
 /// Without a channel adapter in `cx`, returns the system unwrapped. `cx.def`
 /// must be the definition [`def`] returned, so the channel's ports are the
 /// last input and the last two outputs.
-pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
+pub(crate) fn make_channel(
+    make: &Arc<MakeFn>,
+    mut cx: MakeCx<'_>,
+) -> Result<Box<dyn Step>, ParamError> {
     let Some(Adapter::Channel(channel)) = cx.adapter else {
         return make(cx);
     };
-    let (mut inputs, mut outputs) = (cx.inputs, cx.outputs);
     // PANIC Safety: `def` appended one input and two outputs.
-    let commands = inputs.pop().expect("the commands input");
-    let status = outputs.pop().expect("the channel_status output");
-    let events = outputs.pop().expect("the events output");
+    let commands = cx.inputs.pop().expect("the commands input");
+    let status = cx.outputs.pop().expect("the channel_status output");
+    let events = cx.outputs.pop().expect("the events output");
     let mut def = cx.def.clone();
     def.inputs.pop();
-    def.outputs.truncate(outputs.len());
-    let mut inputs: Vec<Vec<RingBuffer>> = inputs
+    def.outputs.truncate(cx.outputs.len());
+    let mut inputs: Vec<Vec<RingBuffer>> = cx
+        .inputs
         .into_iter()
         .map(|rings| rings.into_iter().cloned().collect())
         .collect();
@@ -88,7 +91,7 @@ pub(crate) fn make(make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, 
         def,
         params: cx.params.0.clone(),
         inputs,
-        outputs: outputs.into_iter().cloned().collect(),
+        outputs: cx.outputs.into_iter().cloned().collect(),
         io: cx.io.clone(),
         seed: cx.seed,
         namespace: cx.namespace.to_string(),
@@ -126,16 +129,6 @@ fn private_abort(def: &SystemDef, inputs: &mut [Vec<RingBuffer>]) -> Option<Outp
     Some(writer::<AbortRequest>(&ring))
 }
 
-fn command_input(rings: Vec<&RingBuffer>) -> Input<SequenceCommand> {
-    // PANIC Safety: the build pass counts one reader slot per edge.
-    Input::new(
-        rings
-            .into_iter()
-            .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
-            .collect(),
-    )
-}
-
 /// Creates a ring that only the adapter writes and only the system reads.
 fn abort_ring() -> RingBuffer {
     RingBuffer::create_in_memory(Config {
@@ -144,6 +137,16 @@ fn abort_ring() -> RingBuffer {
         max_readers: 1,
     })
     .expect("a valid ring config")
+}
+
+fn command_input(rings: Vec<&RingBuffer>) -> Input<SequenceCommand> {
+    // PANIC Safety: the build pass counts one reader slot per edge.
+    Input::new(
+        rings
+            .into_iter()
+            .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
+            .collect(),
+    )
 }
 
 fn writer<T: Record>(ring: &RingBuffer) -> Output<T> {
@@ -245,7 +248,7 @@ impl Core {
     fn command(&mut self, kind: SequenceCommandKind) {
         let event = match apply(self.state(), Command::of(&kind)) {
             Ok(()) => self.transition(kind),
-            Err(refusal) => refused(refusal.to_string()),
+            Err(refusal) => SequenceEventKind::refused(refusal.to_string()),
         };
         self.emit(event);
     }
@@ -281,7 +284,7 @@ impl Core {
             .as_mut()
             .is_some_and(|abort| abort.write(&AbortRequest {}).is_ok());
         if !written {
-            return refused("the abort ring is full".into());
+            return SequenceEventKind::refused("the abort ring is full".into());
         }
         SequenceEventKind::Progress {
             detail: "abort requested".into(),
@@ -299,7 +302,7 @@ impl Core {
         self.end_reason = None;
         self.recipe.io.borrow_mut().quiesce_system(&self.recipe.id);
         self.deferred = Some(Deferred::Restart);
-        quiescing()
+        SequenceEventKind::quiescing()
     }
 
     fn restarted(&mut self) -> SequenceEventKind {
@@ -336,7 +339,7 @@ impl Core {
         }
         self.recipe.io.borrow_mut().quiesce_system(&self.recipe.id);
         self.deferred = Some(Deferred::Load(name));
-        quiescing()
+        SequenceEventKind::quiescing()
     }
 
     /// Whether the system does IO.
@@ -361,7 +364,7 @@ impl Core {
 
     fn load(&mut self, name: String) -> SequenceEventKind {
         let Some(inner) = self.inner.as_mut() else {
-            return refused("the system is gone; reset it first".into());
+            return SequenceEventKind::refused("the system is gone; reset it first".into());
         };
         match crate::panic::catch(|| inner.load(&name)) {
             Some(Ok(())) => {
@@ -370,7 +373,7 @@ impl Core {
                 self.loaded = Some(name.clone());
                 SequenceEventKind::Loaded { name }
             }
-            Some(Err(error)) => refused(error.to_string()),
+            Some(Err(error)) => SequenceEventKind::refused(error.to_string()),
             None => {
                 self.inner = None;
                 self.fail("the load panicked".into())
@@ -434,7 +437,7 @@ impl Core {
             return;
         }
         if let Some(end) = &end {
-            self.emit(end_event(end));
+            self.emit(SequenceEventKind::ended(end));
         }
         self.reported_end_reason = end;
     }
@@ -476,15 +479,38 @@ fn reload(inner: &mut Box<dyn Step>, name: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn quiescing() -> SequenceEventKind {
-    SequenceEventKind::Progress {
-        detail: "quiescing".into(),
-    }
+/// The events a channel reports beyond what the wire type builds itself.
+trait ChannelEvent {
+    fn quiescing() -> Self;
+    fn refused(reason: String) -> Self;
+    fn ended(end: &EndReason) -> Self;
 }
 
-fn refused(reason: String) -> SequenceEventKind {
-    SequenceEventKind::Refused {
-        reason: clipped(reason),
+impl ChannelEvent for SequenceEventKind {
+    fn quiescing() -> Self {
+        Self::Progress {
+            detail: "quiescing".into(),
+        }
+    }
+
+    fn refused(reason: String) -> Self {
+        Self::Refused {
+            reason: clipped(reason),
+        }
+    }
+
+    fn ended(end: &EndReason) -> Self {
+        match end {
+            EndReason::Completed => Self::Completed,
+            EndReason::Aborted => Self::Aborted,
+            EndReason::Failed(reason) => Self::Failed {
+                reason: clipped(reason.to_string()),
+            },
+            EndReason::Panicked => Self::Failed {
+                reason: "panicked".into(),
+            },
+            EndReason::Unloaded => Self::Unloaded,
+        }
     }
 }
 
@@ -496,20 +522,6 @@ fn clipped(mut text: String) -> String {
     }
     text.truncate(end);
     text
-}
-
-fn end_event(end: &EndReason) -> SequenceEventKind {
-    match end {
-        EndReason::Completed => SequenceEventKind::Completed,
-        EndReason::Aborted => SequenceEventKind::Aborted,
-        EndReason::Failed(reason) => SequenceEventKind::Failed {
-            reason: clipped(reason.to_string()),
-        },
-        EndReason::Panicked => SequenceEventKind::Failed {
-            reason: "panicked".into(),
-        },
-        EndReason::Unloaded => SequenceEventKind::Unloaded,
-    }
 }
 
 #[cfg(test)]

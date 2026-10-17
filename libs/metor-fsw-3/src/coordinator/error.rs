@@ -201,4 +201,13 @@ impl BuildError {
             _ => self,
         }
     }
+
+    /// Port `port` of system `id` takes a name the channel adapter reserves.
+    #[cfg(feature = "host")]
+    pub(crate) fn reserved_channel_port(id: &str, port: &str) -> Self {
+        Self::ReservedChannelPort {
+            id: id.to_string(),
+            port: port.to_string(),
+        }
+    }
 }

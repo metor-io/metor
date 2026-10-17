@@ -322,7 +322,7 @@ impl SystemTable {
         let status = SystemStatus::port_def(&DefCx::empty());
         crate::def::Records::from_port_defs(
             core::iter::once(&status)
-                .chain(&crate::channel::ports(&DefCx::empty()))
+                .chain(&crate::channel::channel_ports(&DefCx::empty()))
                 .chain(self.entries().flat_map(|(_, entry)| entry.def.ports_iter())),
         )
     }
@@ -524,7 +524,7 @@ mod tests {
             Some(out(&SystemStatus::port_def(&DefCx::empty())))
         );
         assert!(record(&table, "missing").is_none());
-        for port in &crate::channel::ports(&DefCx::empty()) {
+        for port in &crate::channel::channel_ports(&DefCx::empty()) {
             assert_eq!(record(&table, &port.record), Some(out(port)));
         }
         let first = Output::<Imu>::def(&DefCx::empty(), "first");
