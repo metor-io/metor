@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use metor_fsw_3::io::host::{Access, Class, OpenError, RealKind, open};
+use metor_fsw_3::io::host::{Access, Baud, Class, OpenError, RealKind, open};
 
 /// A pty pair and the slave's path.
 fn pty() -> (OwnedFd, OwnedFd, String) {
@@ -40,7 +40,7 @@ fn tty_opens_raw_at_its_baud() {
     let (_master, _slave, path) = pty();
     let (fd, class) = open(&RealKind::Tty {
         path: path.into(),
-        baud: 115_200,
+        baud: Baud::B115200,
     })
     .unwrap();
     assert_eq!(class, Class::Tty);
@@ -114,18 +114,15 @@ fn read_only_file_refuses_a_write() {
 }
 
 #[test]
-fn missing_tty_and_odd_baud_fail() {
+fn missing_tty_fails_and_odd_baud_does_not_parse() {
     let missing = open(&RealKind::Tty {
         path: "/dev/no-such-tty".into(),
-        baud: 9600,
+        baud: Baud::B9600,
     });
     assert!(matches!(missing, Err(OpenError::Io(_))));
-    let (_master, _slave, path) = pty();
-    let odd = open(&RealKind::Tty {
-        path: path.into(),
-        baud: 12_345,
-    });
-    assert!(matches!(odd, Err(OpenError::Baud(12_345))));
+    let tty = |baud: u32| serde_json::json!({ "tty": { "path": "/dev/tty", "baud": baud } });
+    assert!(serde_json::from_value::<RealKind>(tty(9600)).is_ok());
+    assert!(serde_json::from_value::<RealKind>(tty(12_345)).is_err());
 }
 
 #[test]
@@ -168,9 +165,7 @@ mod through_the_io_steps {
     use std::time::Duration;
 
     use metor_fsw_3::coordinator::{CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
-    use metor_fsw_3::io::{
-        Backing, Cap, IO_STATUS_PORT, IO_TYPE, RealKind, RecvOp, ResourceConfig, SendOp, Udp,
-    };
+    use metor_fsw_3::io::{Backing, Cap, IO_STATUS_PORT, IO_TYPE, RealKind, RecvOp, SendOp, Udp};
     use metor_fsw_3::{Input, IoInit, ResourceStatus, Slot, Timestamp, system};
 
     type Got = Rc<RefCell<Vec<Vec<u8>>>>;
@@ -240,13 +235,15 @@ mod through_the_io_steps {
 
         let addr = format!("127.0.0.1:{}", free_port());
         let config = CoordinatorConfig {
-            resources: vec![ResourceConfig {
-                id: "loop".into(),
-                backing: Backing::Real(RealKind::Udp {
+            resources: [(
+                "loop".to_string(),
+                Backing::Real(RealKind::Udp {
                     bind: addr.clone(),
                     connect: Some(addr),
                 }),
-            }],
+            )]
+            .into_iter()
+            .collect(),
             systems: vec![
                 SystemConfig {
                     grants: [("udp".into(), "loop".into())].into(),

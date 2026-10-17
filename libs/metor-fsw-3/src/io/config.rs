@@ -4,14 +4,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// One resource a target creates.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceConfig {
-    pub id: String,
-    pub backing: Backing,
-}
+use super::Baud;
+use super::cap::{self, Interface};
 
-/// What a resource is backed by.
+/// What backs a resource a target creates.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backing {
@@ -27,7 +23,7 @@ pub enum Backing {
 pub enum RealKind {
     Tty {
         path: PathBuf,
-        baud: u32,
+        baud: Baud,
     },
     Can {
         iface: String,
@@ -122,8 +118,8 @@ impl SimKind {
     /// The interface both ends of the resource take.
     pub fn interface(&self) -> &'static str {
         match self {
-            Self::Uart => "uart",
-            Self::GpioLine => "gpio_line",
+            Self::Uart => cap::Uart::NAME,
+            Self::GpioLine => cap::GpioLine::NAME,
         }
     }
 }
@@ -132,13 +128,13 @@ impl RealKind {
     /// The interface the resource provides, as a `Cap`'s interface names it.
     pub fn interface(&self) -> &'static str {
         match self {
-            Self::Tty { .. } => "uart",
-            Self::Can { .. } => "can",
-            Self::GpioLine { .. } => "gpio_line",
-            Self::Udp { .. } => "udp",
-            Self::File { .. } => "file",
-            Self::Dir { .. } => "dir",
-            Self::TcpListen { .. } => "listen",
+            Self::Tty { .. } => cap::Uart::NAME,
+            Self::Can { .. } => cap::Can::NAME,
+            Self::GpioLine { .. } => cap::GpioLine::NAME,
+            Self::Udp { .. } => cap::Udp::NAME,
+            Self::File { .. } => cap::RegularFile::NAME,
+            Self::Dir { .. } => cap::Dir::NAME,
+            Self::TcpListen { .. } => cap::Listen::NAME,
             Self::TcpConnect { .. } => "dial",
         }
     }

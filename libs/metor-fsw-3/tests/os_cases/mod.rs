@@ -160,14 +160,14 @@ pub fn tty_configure_and_gpio_on_a_tty(b: Backend) {
     let mut rig = Rig::new(b);
     let (_master, slave) = pty();
     let fd = slave.as_raw_fd();
-    let cfg = TtyConfig::new(115_200);
+    let cfg = TtyConfig::new(Baud::B115200);
     rig.run(fd, Class::Tty, Op::TtyConfigure(cfg), None)
         .unwrap();
     rig.run(fd, Class::Tty, Op::TtyFlush(TtyQueue::Both), None)
         .unwrap();
-    let bad = TtyConfig::new(12_345);
-    let refused = rig.run(fd, Class::Tty, Op::TtyConfigure(bad), None);
-    assert_eq!(refused.unwrap_err(), IoError::Os(Errno::EINVAL));
+    let file = tempfile::tempfile().unwrap();
+    let refused = rig.run(file.as_raw_fd(), Class::Tty, Op::TtyConfigure(cfg), None);
+    assert_eq!(refused.unwrap_err(), IoError::Os(Errno::ENOTTY));
     assert!(rig.run(fd, Class::Gpio, Op::GpioGet, None).is_err());
 }
 

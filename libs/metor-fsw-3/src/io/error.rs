@@ -1,8 +1,7 @@
-use zerocopy::little_endian::U32;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+use core::num::{NonZeroU16, NonZeroU32};
 
-/// Where framework error codes start. Codes below it are Linux errnos.
-const FRAMEWORK: u32 = 0x1_0000;
+use zerocopy::little_endian::U32;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 /// An op's status: 0 for success, `1..=0xFFFF` for a Linux errno, and
 /// `0x1_0000..` for a framework error.
@@ -16,35 +15,68 @@ impl IoStatus {
     pub const OK: Self = Self(U32::ZERO);
 
     pub fn err(e: IoError) -> Self {
-        let code = match e {
-            IoError::Os(Errno(0)) => u32::from(Errno::EIO.0),
-            IoError::Os(errno) => u32::from(errno.0),
-            IoError::QueueFull => FRAMEWORK,
-            IoError::Stale => FRAMEWORK + 1,
-            IoError::Canceled => FRAMEWORK + 2,
-            IoError::Refused => FRAMEWORK + 3,
-            IoError::Unsupported => FRAMEWORK + 5,
-            IoError::BadBuf => FRAMEWORK + 6,
-            IoError::BadAddr => FRAMEWORK + 7,
-        };
-        Self(U32::new(code))
+        Self(U32::new(e.code()))
     }
 
     /// An unknown framework code reads as `Refused`.
     pub fn result(self) -> Result<(), IoError> {
-        let code = self.0.get();
-        let e = match code.checked_sub(FRAMEWORK) {
-            None if code == 0 => return Ok(()),
-            None => IoError::Os(Errno(code as u16)),
-            Some(0) => IoError::QueueFull,
-            Some(1) => IoError::Stale,
-            Some(2) => IoError::Canceled,
-            Some(5) => IoError::Unsupported,
-            Some(6) => IoError::BadBuf,
-            Some(7) => IoError::BadAddr,
-            Some(_) => IoError::Refused,
+        let Some(code) = NonZeroU32::new(self.0.get()) else {
+            return Ok(());
         };
-        Err(e)
+        Err(match NonZeroU16::try_from(code) {
+            Ok(errno) => IoError::Os(Errno(errno)),
+            Err(_) => FrameworkError::try_from(code.get()).map_or(IoError::Refused, IoError::from),
+        })
+    }
+}
+
+/// The framework errors, each with a code from `0x1_0000` up.
+macro_rules! framework_errors {
+    ($first:ident $(, $name:ident)* $(,)?) => {
+        #[repr(u32)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, KnownLayout, Immutable)]
+        enum FrameworkError {
+            $first = 0x1_0000,
+            $($name),*
+        }
+
+        impl From<FrameworkError> for IoError {
+            fn from(e: FrameworkError) -> Self {
+                match e {
+                    FrameworkError::$first => Self::$first,
+                    $(FrameworkError::$name => Self::$name),*
+                }
+            }
+        }
+
+        impl IoError {
+            /// The error's status code.
+            fn code(self) -> u32 {
+                match self {
+                    Self::Os(errno) => u32::from(errno.get()),
+                    Self::$first => FrameworkError::$first as u32,
+                    $(Self::$name => FrameworkError::$name as u32),*
+                }
+            }
+        }
+    };
+}
+
+framework_errors!(
+    QueueFull,
+    Stale,
+    Canceled,
+    Refused,
+    Unsupported,
+    BadBuf,
+    BadAddr
+);
+
+impl TryFrom<u32> for FrameworkError {
+    type Error = ();
+
+    fn try_from(code: u32) -> Result<Self, ()> {
+        Self::try_read_from_bytes(&code.to_ne_bytes()).map_err(drop)
     }
 }
 
@@ -82,13 +114,17 @@ impl From<IoError> for std::borrow::Cow<'static, str> {
 
 /// A Linux error number.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Errno(pub(crate) u16);
+pub struct Errno(pub(crate) NonZeroU16);
 
 macro_rules! errnos {
     ($($name:ident = $n:literal),* $(,)?) => {
         impl Errno {
-            $(pub const $name: Self = Self($n);)*
+            // PANIC Safety: evaluated at compile time, and every code is nonzero.
+            $(pub const $name: Self = Self(NonZeroU16::new($n).expect("nonzero"));)*
             const NAMED: &[(Self, &'static str)] = &[$((Self::$name, stringify!($name))),*];
+            /// Each host errno and its Linux one.
+            #[cfg(all(feature = "host", unix, not(target_os = "linux")))]
+            pub(crate) const HOST: &[(i32, Self)] = &[$((libc::$name, Self::$name)),*];
         }
     };
 }
@@ -107,12 +143,16 @@ errnos! {
 }
 
 impl Errno {
-    pub const fn new(n: u16) -> Self {
-        Self(n)
+    /// The errno `n`, unless it is 0.
+    pub const fn new(n: u16) -> Option<Self> {
+        match NonZeroU16::new(n) {
+            Some(n) => Some(Self(n)),
+            None => None,
+        }
     }
 
     pub fn get(self) -> u16 {
-        self.0
+        self.0.get()
     }
 
     pub fn name(self) -> Option<&'static str> {

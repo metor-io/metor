@@ -2,9 +2,12 @@
 //! between every system's queue and them.
 
 use core::ptr::NonNull;
+use std::collections::HashSet;
 use std::os::fd::{OwnedFd, RawFd};
 
-use super::{Backing, IoState, MAX_OPS, ResourceConfig, ResourceEnd, Token};
+use indexmap::IndexMap;
+
+use super::{Backing, Generational, IoState, MAX_OPS, ResourceEnd, ResourceIndex};
 use crate::coordinator::BuildError;
 use dispatch::Resource;
 use wire::Wire;
@@ -26,7 +29,9 @@ pub use steps::{IO_STATUS_PORT, IO_TYPE};
 #[cfg(target_os = "linux")]
 pub use uring::UringOs;
 
-pub use super::{Access, Errno, IoError, Op, OpKind, OpenFlags, RealKind, TtyConfig, TtyQueue};
+pub use super::{
+    Access, Baud, Errno, IoError, Op, OpKind, OpenFlags, RealKind, TtyConfig, TtyQueue,
+};
 
 /// How a descriptor's ops run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,36 +55,11 @@ impl Class {
     }
 }
 
+/// The table an [`OpId`] indexes.
+pub enum DispatchTable {}
+
 /// An op's index in the dispatch's op table, and its system's generation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OpId(u32);
-
-impl OpId {
-    pub const fn new(index: u16, generation: u16) -> Self {
-        Self(index as u32 | (generation as u32) << 16)
-    }
-
-    pub fn index(self) -> u16 {
-        self.0 as u16
-    }
-
-    pub fn generation(self) -> u16 {
-        (self.0 >> 16) as u16
-    }
-
-    pub fn get(self) -> u32 {
-        self.0
-    }
-
-    pub fn from_raw(raw: u32) -> Self {
-        Self(raw)
-    }
-
-    /// The id as a token, for a sim op's request and reply.
-    pub fn token(self) -> Token {
-        Token::new(self.index(), self.generation())
-    }
-}
+pub type OpId = Generational<DispatchTable>;
 
 /// An op ready for an `Os`: its descriptor and buffer resolved.
 #[derive(Debug)]
@@ -103,6 +83,13 @@ impl OsOp {
 pub enum Out {
     Len(u32),
     Opened(OwnedFd, Class),
+}
+
+impl Out {
+    /// A length of `n` bytes, which an op's buffer bounds below `u32::MAX`.
+    pub(crate) fn len(n: usize) -> Self {
+        Self::Len(n as u32)
+    }
 }
 
 #[derive(Debug)]
@@ -163,7 +150,7 @@ impl Host {
             for d in done.drain(..) {
                 dispatch.raise(d);
             }
-            if !dispatch.live() {
+            if !dispatch.has_kernel_ops_in_flight() {
                 return true;
             }
             std::thread::sleep(core::time::Duration::from_millis(1));
@@ -172,59 +159,69 @@ impl Host {
     }
 }
 
-/// A target's IO: one member per system with a `Cap`, given as its id and
-/// the resource and end of each grant, in config order. Opens every real
-/// resource a member holds, makes a wire for each sim one, and the backend.
-pub(crate) fn build(
-    resources: &[ResourceConfig],
-    members: Vec<(String, Vec<(u16, ResourceEnd)>)>,
-) -> Result<IoState, BuildError> {
-    if members.is_empty() {
-        return Ok(IoState::default());
+impl IoState {
+    /// A target's IO: one member per system with a `Cap`, given as its id and
+    /// the resource and end of each grant, in config order. Opens every real
+    /// resource a member holds, makes a wire for each sim one, and the backend.
+    pub(crate) fn build(
+        resources: &IndexMap<String, Backing>,
+        members: Vec<(String, Vec<(ResourceIndex, ResourceEnd)>)>,
+    ) -> Result<Self, BuildError> {
+        if members.is_empty() {
+            return Ok(Self::default());
+        }
+        let ops = members.len() * MAX_OPS;
+        let held: HashSet<ResourceIndex> = members
+            .iter()
+            .flat_map(|(_, grants)| grants.iter().map(|&(res, _)| res))
+            .collect();
+        let mut wires = Vec::new();
+        let resources = resources
+            .iter()
+            .enumerate()
+            .map(|(index, (id, backing))| {
+                let held = ResourceIndex::try_from(index).is_ok_and(|r| held.contains(&r));
+                Resource::open(id, backing, held, ops, &mut wires)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let grants = members.iter().map(|(_, g)| g.clone()).collect();
+        let dispatch = Dispatch::new(grants, resources, wires)?;
+        let os = host(ops).map_err(|e| BuildError::IoBackend {
+            message: e.to_string(),
+        })?;
+        let mut io = Self::with_members(members.iter().map(|(id, _)| id.as_str()));
+        io.host = Some(Host { dispatch, os });
+        Ok(io)
     }
-    let ops = members.len() * MAX_OPS;
-    let held = |at: usize| {
-        let mut grants = members.iter().flat_map(|(_, g)| g);
-        grants.any(|&(r, _)| usize::from(r) == at)
-    };
-    let mut wires = Vec::new();
-    let resources = (0..resources.len())
-        .map(|at| resource(&resources[at], held(at), ops, &mut wires))
-        .collect::<Result<Vec<_>, _>>()?;
-    let grants = members.iter().map(|(_, g)| g.clone()).collect();
-    let dispatch = Dispatch::new(grants, resources, wires)?;
-    let os = host(ops).map_err(|e| BuildError::IoSystems {
-        message: format!("the IO backend: {e}"),
-    })?;
-    let mut io = IoState::with_members(members.iter().map(|(id, _)| id.as_str()));
-    io.host = Some(Host { dispatch, os });
-    Ok(io)
 }
 
-/// A resource, opened if it is `held`, or wired by adding its wire to
-/// `wires`. A wire parks at most `ops` ops per end.
-fn resource(
-    config: &ResourceConfig,
-    held: bool,
-    ops: usize,
-    wires: &mut Vec<Wire>,
-) -> Result<Resource, BuildError> {
-    let backed = match &config.backing {
-        Backing::Sim(sim) if held => {
-            wires.push(Wire::new(sim.kind, ops));
-            Backed::Wire(wires.len() - 1)
-        }
-        Backing::Real(kind) if held => {
-            let (fd, class) = open(kind).map_err(|e| BuildError::Open {
-                resource: config.id.clone(),
-                message: e.to_string(),
-            })?;
-            Backed::Fd(fd, class)
-        }
-        _ => Backed::Unused,
-    };
-    Ok(Resource {
-        id: config.id.clone(),
-        backed,
-    })
+impl Resource {
+    /// Resource `id`, opened if it is `held`, or wired by adding its wire to
+    /// `wires`. A wire parks at most `ops` ops per end.
+    fn open(
+        id: &str,
+        backing: &Backing,
+        held: bool,
+        ops: usize,
+        wires: &mut Vec<Wire>,
+    ) -> Result<Self, BuildError> {
+        let backed = match backing {
+            Backing::Sim(sim) if held => {
+                wires.push(Wire::new(sim.kind, ops));
+                Backed::Wire(wires.len() - 1)
+            }
+            Backing::Real(kind) if held => {
+                let (fd, class) = open(kind).map_err(|e| BuildError::Open {
+                    resource: id.to_string(),
+                    message: e.to_string(),
+                })?;
+                Backed::Fd(fd, class)
+            }
+            _ => Backed::Unused,
+        };
+        Ok(Self {
+            id: id.to_string(),
+            backed,
+        })
+    }
 }

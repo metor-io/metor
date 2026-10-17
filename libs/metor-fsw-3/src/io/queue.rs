@@ -13,6 +13,7 @@ use super::op_slot::{Event, OpSlot, Write};
 use super::ops::{BufOp, IoOp, RawOp};
 use super::{Cqe, IoError, IoStatus, MAX_OPS, Op, RawHandle, Span, Sqe, Token};
 use crate::port::{Input, Output};
+use crate::system::{InputBinding, OutputBinding};
 
 struct Queue {
     sq: Output<Sqe>,
@@ -32,11 +33,25 @@ impl Io {
         Self(Rc::new(Queue {
             sq,
             cq: RefCell::new(cq),
-            ops: core::array::from_fn(|_| Cell::new(OpSlot::FREE)),
+            ops: core::array::from_fn(|_| Cell::default()),
             generation: Cell::new(0),
             arena,
             next_grant: Cell::new(0),
         }))
+    }
+
+    /// The queue pair over `io_cq` and `io_sq`, for a system with a `Cap`.
+    pub(crate) fn from_bindings(
+        arena: Option<Rc<Arena>>,
+        inputs: Vec<InputBinding>,
+        outputs: Vec<OutputBinding>,
+    ) -> Option<Self> {
+        let (cq, sq) = inputs.into_iter().zip(outputs).next()?;
+        Some(Self::new(
+            Output::new(sq.writer),
+            Input::new(cq.views),
+            arena?,
+        ))
     }
 
     pub(crate) fn arena(&self) -> &Rc<Arena> {
@@ -112,7 +127,7 @@ impl Io {
                 status,
                 value,
             };
-            self.apply(usize::from(cqe.token.slot()), event);
+            self.apply(usize::from(cqe.token.index()), event);
         }
     }
 
@@ -122,11 +137,11 @@ impl Io {
         let Some(cell) = self.0.ops.get(index) else {
             return;
         };
-        let (mut slot, write) = cell.get().on(event);
+        let (mut slot, write) = cell.get().apply(event);
         if let Some(write) = write {
             let token = Token::new(index as u16, slot.generation);
             if !self.write(token, write) {
-                slot = slot.on(Event::Refused(write)).0;
+                slot = slot.apply(Event::Refused(write)).0;
             }
         }
         cell.set(slot);
@@ -147,24 +162,24 @@ impl Io {
     /// Takes a finished op's result, freeing its slot.
     fn take(&self, token: Token) -> Option<(IoStatus, u32)> {
         self.pump();
-        let index = usize::from(token.slot());
+        let index = usize::from(token.index());
         let generation = token.generation();
         let result = self.0.ops.get(index)?.get().result(generation)?;
-        self.apply(index, Event::Taken { generation });
+        self.apply(index, Event::Returned { generation });
         Some(result)
     }
 
     /// Drops interest in an op.
     fn orphan(&self, token: Token) {
         let generation = token.generation();
-        self.apply(usize::from(token.slot()), Event::Dropped { generation });
+        self.apply(usize::from(token.index()), Event::Dropped { generation });
     }
 
     /// Cancels an op in flight. A cancel the SQ refuses is written again on
     /// a later pump.
     fn cancel(&self, token: Token) {
         let generation = token.generation();
-        self.apply(usize::from(token.slot()), Event::Canceled { generation });
+        self.apply(usize::from(token.index()), Event::Canceled { generation });
     }
 
     /// Ops not yet taken, or orphaned and not yet landed.

@@ -10,12 +10,13 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
 
 use crate::def::{DefCx, Records};
 use crate::io::{
-    Backing, Cqe, IO_CQ, IO_SQ, IO_TYPE, RealKind, ResourceConfig, ResourceEnd, SharedIo,
+    Backing, Cqe, IO_CQ, IO_SQ, IO_TYPE, IoState, RealKind, ResourceEnd, ResourceIndex, SharedIo,
 };
 use crate::port::{Output, ring_capacity};
 use crate::record::Record;
@@ -86,9 +87,8 @@ impl CoordinatorConfig {
             self.clock.check_deterministic()?;
         }
         check_resources(&self.resources)?;
-        let members = member_positions(&self)?;
-        wire_io(&mut self.systems, &members)?;
-        let bindings = bindings(&self)?;
+        let bindings = Bindings::collect(&self)?;
+        wire_io(&mut self.systems, &bindings)?;
         let records = Arc::new(table.records());
         let mut plan = Plan::resolve(&self, table, &records, &bindings)?;
         plan.check_ids()?;
@@ -103,7 +103,7 @@ impl CoordinatorConfig {
             false => Threads::default(),
         };
         let members = io_members(&plan, &bindings);
-        let io = SharedIo::new(crate::io::host::build(&self.resources, members)?.into());
+        let io = SharedIo::new(IoState::build(&self.resources, members)?.into());
         let args = SharedMakeArgs {
             seed: self.seed,
             namespace: self.namespace.as_deref(),
@@ -127,7 +127,7 @@ impl<'a> Plan<'a> {
         config: &'a CoordinatorConfig,
         table: &'a SystemTable,
         records: &Records,
-        bindings: &Bindings<'_>,
+        bindings: &Bindings,
     ) -> Result<Self, BuildError> {
         let mut plan = Self {
             index: index_by_id(config)?,
@@ -151,7 +151,7 @@ impl<'a> Plan<'a> {
         table: &'a SystemTable,
         records: &Records,
         config: &CoordinatorConfig,
-        bindings: &Bindings<'_>,
+        bindings: &Bindings,
     ) -> Result<(&'a TableEntry, SystemDef), BuildError> {
         let entry = table
             .get(&system.ty)
@@ -162,10 +162,7 @@ impl<'a> Plan<'a> {
         entry.check_adapter(system)?;
         let namespace = config.namespace.as_deref();
         let def = SystemDef::planned(system, entry, self, records, namespace)?;
-        let bound = bindings
-            .get(system.id.as_str())
-            .map_or(&[][..], Vec::as_slice);
-        check_bindings(&system.id, &def, bound, &config.resources)?;
+        check_bindings(&system.id, &def, bindings.of(&system.id), &config.resources)?;
         Ok((entry, def))
     }
 
@@ -315,29 +312,28 @@ impl TableEntry {
     }
 }
 
-/// Wires each system with a `Cap` (a member, at a position in `members`) to
-/// the `fsw.io` instances.
+/// Wires each system with a `Cap` (a member) to the `fsw.io` instances.
 ///
 /// A member's SQ is read by the first `fsw.io` after it in step order, so one
 /// must follow it. Its CQ is written by the last `fsw.io` before it, or by the
 /// final one if none comes before. Each `fsw.io` gets its members' ports in
 /// step order.
-fn wire_io(systems: &mut [SystemConfig], members: &[usize]) -> Result<(), BuildError> {
-    let Some(points) = IoPoints::new(systems)? else {
+fn wire_io(systems: &mut [SystemConfig], bindings: &Bindings) -> Result<(), BuildError> {
+    let members: Vec<usize> = (0..systems.len())
+        .filter(|&m| bindings.holds(&systems[m].id))
+        .collect();
+    let Some(points) = IoPoints::new(systems) else {
         return match members.first() {
-            Some(&m) => io_error(format!(
-                "`{}` holds a `Cap`, so the config needs an {IO_TYPE}",
-                systems[m].id
-            )),
+            Some(&m) => Err(BuildError::NoIoStep {
+                system: systems[m].id.clone(),
+            }),
             None => Ok(()),
         };
     };
-    for &m in members {
+    for m in members {
         let id = systems[m].id.clone();
         let Some(next) = points.next(m) else {
-            return io_error(format!(
-                "`{id}` holds a `Cap`, so an {IO_TYPE} must follow it"
-            ));
+            return Err(BuildError::NoIoStepAfter { system: id });
         };
         let prev = points.prev(m);
         let prev_id = systems[prev].id.clone();
@@ -350,35 +346,33 @@ fn wire_io(systems: &mut [SystemConfig], members: &[usize]) -> Result<(), BuildE
     Ok(())
 }
 
-/// The places of the `fsw.io` instances in the schedule.
+/// The positions of the `fsw.io` instances in the schedule, never empty.
 struct IoPoints {
-    at: Vec<usize>,
-    last: usize,
+    positions: Vec<usize>,
 }
 
 impl IoPoints {
     /// `None` when the config places no `fsw.io`.
-    fn new(systems: &[SystemConfig]) -> Result<Option<Self>, BuildError> {
-        let at: Vec<usize> = (0..systems.len())
-            .filter(|&at| systems[at].ty == IO_TYPE)
+    fn new(systems: &[SystemConfig]) -> Option<Self> {
+        let positions: Vec<usize> = (0..systems.len())
+            .filter(|&position| systems[position].ty == IO_TYPE)
             .collect();
-        Ok(at.last().copied().map(|last| Self { at, last }))
+        (!positions.is_empty()).then_some(Self { positions })
     }
 
-    /// The instance after `at`.
-    fn next(&self, at: usize) -> Option<usize> {
-        self.at.iter().copied().find(|&p| p > at)
+    /// The instance after `position`.
+    fn next(&self, position: usize) -> Option<usize> {
+        self.positions.iter().copied().find(|&p| p > position)
     }
 
-    /// The instance before `at`, wrapping to the last.
-    fn prev(&self, at: usize) -> usize {
-        let mut before = self.at.iter().rev().copied();
-        before.find(|&p| p < at).unwrap_or(self.last)
+    /// The instance before `position`, wrapping to the last.
+    fn prev(&self, position: usize) -> usize {
+        let before = self.positions.iter().rev().copied().find(|&p| p < position);
+        // PANIC Safety: `new` makes no `IoPoints` without a position.
+        before
+            .or(self.positions.last().copied())
+            .expect("an fsw.io")
     }
-}
-
-fn io_error(message: String) -> Result<(), BuildError> {
-    Err(BuildError::IoSystems { message })
 }
 
 /// Maps each system id to its position in the config, rejecting duplicate ids.
@@ -507,82 +501,99 @@ impl SystemDef {
     }
 }
 
-/// Each system's `Cap` bindings, by system id: the parameter, the resource's
-/// index, and the end it holds.
-type Bindings<'a> = HashMap<&'a str, Vec<(&'a str, usize, ResourceEnd)>>;
+/// One `Cap` parameter's resource, and the end it holds.
+struct Binding {
+    param: String,
+    resource: ResourceIndex,
+    end: ResourceEnd,
+}
 
-/// Collects each system's bindings: its grants of real resources, and the
-/// holders each sim resource names.
-///
-/// Rejects a grant of an unknown or a sim resource, a holder the config does
-/// not have, and a parameter bound twice.
-fn bindings(config: &CoordinatorConfig) -> Result<Bindings<'_>, BuildError> {
-    let mut bound = Bindings::new();
-    for system in &config.systems {
-        for (param, resource) in &system.grants {
-            let unknown = || BuildError::UnknownResource {
-                system: system.id.clone(),
-                param: param.clone(),
-                resource: resource.clone(),
-            };
-            let at = config
-                .resources
-                .iter()
-                .position(|r| r.id == *resource)
-                .ok_or_else(unknown)?;
-            if let Backing::Sim(_) = config.resources[at].backing {
-                return Err(BuildError::SimGrant {
+/// Each system's `Cap` bindings, by system id.
+#[derive(Default)]
+struct Bindings(HashMap<String, Vec<Binding>>);
+
+impl Bindings {
+    /// Collects each system's bindings: its grants of real resources, and the
+    /// holders each sim resource names.
+    ///
+    /// Rejects a grant of an unknown or a sim resource, a holder the config
+    /// does not have, and a parameter bound twice.
+    fn collect(config: &CoordinatorConfig) -> Result<Self, BuildError> {
+        let mut bound = Self::default();
+        let index = |position: usize| {
+            let count = config.resources.len();
+            ResourceIndex::try_from(position).map_err(|_| BuildError::TooManyResources { count })
+        };
+        for system in &config.systems {
+            for (param, resource) in &system.grants {
+                let unknown = || BuildError::UnknownResource {
                     system: system.id.clone(),
                     param: param.clone(),
                     resource: resource.clone(),
-                });
+                };
+                let (position, _, backing) =
+                    config.resources.get_full(resource).ok_or_else(unknown)?;
+                if let Backing::Sim(_) = backing {
+                    return Err(BuildError::SimGrant {
+                        system: system.id.clone(),
+                        param: param.clone(),
+                        resource: resource.clone(),
+                    });
+                }
+                bound.bind(&system.id, param, index(position)?, ResourceEnd::Host)?;
             }
-            bind(&mut bound, &system.id, param, at, ResourceEnd::Host)?;
         }
-    }
-    for (at, resource) in config.resources.iter().enumerate() {
-        let Backing::Sim(sim) = &resource.backing else {
-            continue;
-        };
-        for (holder, end) in [
-            (&sim.host, ResourceEnd::Host),
-            (&sim.device, ResourceEnd::Device),
-        ] {
-            if !config.systems.iter().any(|s| s.id == holder.system) {
-                return Err(BuildError::UnknownHolder {
-                    resource: resource.id.clone(),
-                    system: holder.system.clone(),
-                });
+        for (position, (id, backing)) in config.resources.iter().enumerate() {
+            let Backing::Sim(sim) = backing else {
+                continue;
+            };
+            for (holder, end) in [
+                (&sim.host, ResourceEnd::Host),
+                (&sim.device, ResourceEnd::Device),
+            ] {
+                if !config.systems.iter().any(|s| s.id == holder.system) {
+                    return Err(BuildError::UnknownHolder {
+                        resource: id.clone(),
+                        system: holder.system.clone(),
+                    });
+                }
+                bound.bind(&holder.system, &holder.param, index(position)?, end)?;
             }
-            bind(&mut bound, &holder.system, &holder.param, at, end)?;
         }
+        Ok(bound)
     }
-    Ok(bound)
-}
 
-fn bind<'a>(
-    bound: &mut Bindings<'a>,
-    system: &'a str,
-    param: &'a str,
-    at: usize,
-    end: ResourceEnd,
-) -> Result<(), BuildError> {
-    let caps = bound.entry(system).or_default();
-    if caps.iter().any(|(p, ..)| *p == param) {
-        return Err(BuildError::DuplicateGrant {
-            system: system.to_string(),
+    fn bind(
+        &mut self,
+        system: &str,
+        param: &str,
+        resource: ResourceIndex,
+        end: ResourceEnd,
+    ) -> Result<(), BuildError> {
+        let caps = self.0.entry(system.to_string()).or_default();
+        if caps.iter().any(|b| b.param == param) {
+            return Err(BuildError::DuplicateGrant {
+                system: system.to_string(),
+                param: param.to_string(),
+            });
+        }
+        caps.push(Binding {
             param: param.to_string(),
+            resource,
+            end,
         });
+        Ok(())
     }
-    caps.push((param, at, end));
-    Ok(())
-}
 
-/// The config positions of the systems that hold a resource.
-fn member_positions(config: &CoordinatorConfig) -> Result<Vec<usize>, BuildError> {
-    let bound = bindings(config)?;
-    let held = |at: &usize| bound.contains_key(config.systems[*at].id.as_str());
-    Ok((0..config.systems.len()).filter(held).collect())
+    /// `system`'s bindings, in the order they were bound.
+    fn of(&self, system: &str) -> &[Binding] {
+        self.0.get(system).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether `system` holds a resource.
+    fn holds(&self, system: &str) -> bool {
+        self.0.contains_key(system)
+    }
 }
 
 /// Checks that `system`'s bindings and its `Cap` parameters match one to
@@ -590,22 +601,24 @@ fn member_positions(config: &CoordinatorConfig) -> Result<Vec<usize>, BuildError
 fn check_bindings(
     system: &str,
     def: &SystemDef,
-    bound: &[(&str, usize, ResourceEnd)],
-    resources: &[ResourceConfig],
+    bound: &[Binding],
+    resources: &IndexMap<String, Backing>,
 ) -> Result<(), BuildError> {
     let error = |param: &str| (system.to_string(), param.to_string());
-    for &(param, at, _) in bound {
-        let Some(cap) = def.grants.iter().find(|g| g.param == param) else {
-            let (system, param) = error(param);
+    for binding in bound {
+        let Some(cap) = def.grants.iter().find(|g| g.param == binding.param) else {
+            let (system, param) = error(&binding.param);
             return Err(BuildError::UnknownGrant { system, param });
         };
-        let resource = &resources[at];
-        if let Some(found) = resource.backing.interface()
+        let position = usize::from(binding.resource.get());
+        // PANIC Safety: `Bindings::collect` took every index from `resources`.
+        let (id, backing) = resources.get_index(position).expect("a bound resource");
+        if let Some(found) = backing.interface()
             && cap.interface != found
         {
             return Err(BuildError::Interface {
-                cap: format!("{system}.{param}"),
-                resource: resource.id.clone(),
+                cap: format!("{system}.{}", binding.param),
+                resource: id.clone(),
                 expected: cap.interface.to_string(),
                 found: found.into(),
             });
@@ -614,7 +627,7 @@ fn check_bindings(
     if let Some(cap) = def
         .grants
         .iter()
-        .find(|g| !bound.iter().any(|b| b.0 == g.param))
+        .find(|g| !bound.iter().any(|b| b.param == g.param))
     {
         let (system, param) = error(&cap.param);
         return Err(BuildError::Ungranted { system, param });
@@ -624,16 +637,19 @@ fn check_bindings(
 
 /// Each system with a `Cap`, in config order: its id and the resource index
 /// and end of each `Cap` parameter, in definition order.
-fn io_members(plan: &Plan<'_>, bindings: &Bindings<'_>) -> Vec<(String, Vec<(u16, ResourceEnd)>)> {
+fn io_members(
+    plan: &Plan<'_>,
+    bindings: &Bindings,
+) -> Vec<(String, Vec<(ResourceIndex, ResourceEnd)>)> {
     let caps = |system: &PlannedSystem<'_>| {
-        let bound = bindings.get(system.id).map_or(&[][..], Vec::as_slice);
-        let at = |param: &str| {
-            let found = bound.iter().find(|b| b.0 == param);
+        let bound = bindings.of(system.id);
+        let grant = |param: &str| {
+            let found = bound.iter().find(|b| b.param == param);
             // PANIC Safety: `check_bindings` bound every `Cap` exactly once.
-            let &(_, at, end) = found.expect("a checked binding");
-            (at as u16, end)
+            let binding = found.expect("a checked binding");
+            (binding.resource, binding.end)
         };
-        system.def.grants.iter().map(|g| at(&g.param)).collect()
+        system.def.grants.iter().map(|g| grant(&g.param)).collect()
     };
     plan.systems
         .iter()
@@ -642,22 +658,17 @@ fn io_members(plan: &Plan<'_>, bindings: &Bindings<'_>) -> Vec<(String, Vec<(u16
         .collect()
 }
 
-/// Checks that resource ids are unique and that each backing is one this
-/// build runs.
-fn check_resources(resources: &[ResourceConfig]) -> Result<(), BuildError> {
-    for (at, resource) in resources.iter().enumerate() {
-        if resources[..at].iter().any(|r| r.id == resource.id) {
-            let id = resource.id.clone();
-            return Err(BuildError::DuplicateResource { id });
-        }
-        let backing = match &resource.backing {
-            Backing::Peer(_) => resource.backing.name(),
+/// Checks that each backing is one this build runs.
+fn check_resources(resources: &IndexMap<String, Backing>) -> Result<(), BuildError> {
+    for (id, backing) in resources {
+        let name = match backing {
+            Backing::Peer(_) => backing.name(),
             Backing::Real(RealKind::TcpConnect { .. }) => "tcp_connect",
             _ => continue,
         };
         return Err(BuildError::Backing {
-            resource: resource.id.clone(),
-            backing: backing.into(),
+            resource: id.clone(),
+            backing: name.into(),
         });
     }
     Ok(())
@@ -1304,7 +1315,7 @@ mod tests {
             ..Default::default()
         };
         let table = table(&recorder);
-        let plan = Plan::resolve(&config, &table, &table.records(), &Bindings::new())
+        let plan = Plan::resolve(&config, &table, &table.records(), &Bindings::default())
             .expect("valid config");
         let emitted = &plan.systems[0].def.outputs[0];
         assert_eq!(emitted.name, "imu");
@@ -1499,10 +1510,9 @@ mod tests {
             };
             CoordinatorConfig {
                 systems,
-                resources: vec![ResourceConfig {
-                    id: "wire".into(),
-                    backing: Backing::Sim(sim),
-                }],
+                resources: [("wire".to_string(), Backing::Sim(sim))]
+                    .into_iter()
+                    .collect(),
                 ..Default::default()
             }
         }
@@ -1519,13 +1529,6 @@ mod tests {
             }
         }
 
-        fn io_message(config: CoordinatorConfig) -> String {
-            match error(config) {
-                BuildError::IoSystems { message } => message,
-                e => panic!("{e}"),
-            }
-        }
-
         #[test]
         fn test_io_nominal_placement_builds() {
             config(nominal(), "a", "b").build(&table()).unwrap();
@@ -1534,8 +1537,10 @@ mod tests {
         /// `a`'s CQ wraps around from `io_complete`.
         #[test]
         fn test_io_wiring_follows_step_order() {
-            let mut systems = nominal();
-            wire_io(&mut systems, &[0, 2]).unwrap();
+            let config = config(nominal(), "a", "b");
+            let bindings = Bindings::collect(&config).unwrap();
+            let mut systems = config.systems;
+            wire_io(&mut systems, &bindings).unwrap();
             let ports = |s: &SystemConfig| {
                 let inputs = s.inputs.iter().map(|i| (i.port.clone(), i.from.clone()));
                 let outputs = s.outputs.iter().map(|o| o.port.clone());
@@ -1565,23 +1570,25 @@ mod tests {
             let mut systems = nominal();
             systems.push(member("c"));
             let mut config = config(systems, "a", "b");
-            config.resources.push(ResourceConfig {
-                id: "second".into(),
-                backing: Backing::Sim(SimResource {
-                    kind: SimKind::Uart,
-                    host: Holder::new("c", "uart"),
-                    device: Holder::new("c2", "uart"),
-                }),
+            let second = Backing::Sim(SimResource {
+                kind: SimKind::Uart,
+                host: Holder::new("c", "uart"),
+                device: Holder::new("c2", "uart"),
             });
+            config.resources.insert("second".into(), second);
             config.systems.push(member("c2"));
-            let message = io_message(config);
-            assert_eq!(message, "`c` holds a `Cap`, so an fsw.io must follow it");
+            let e = error(config);
+            let after =
+                |e: &BuildError| matches!(e, BuildError::NoIoStepAfter { system } if system == "c");
+            assert!(after(&e), "{e}");
         }
 
         #[test]
         fn test_io_member_without_an_instance_is_refused() {
-            let config = config(vec![member("a"), member("b")], "a", "b");
-            assert!(io_message(config).contains("needs an fsw.io"));
+            let e = error(config(vec![member("a"), member("b")], "a", "b"));
+            let none =
+                |e: &BuildError| matches!(e, BuildError::NoIoStep { system } if system == "a");
+            assert!(none(&e), "{e}");
         }
 
         #[test]

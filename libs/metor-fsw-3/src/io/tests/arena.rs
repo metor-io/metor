@@ -40,7 +40,7 @@ fn remake_within_capacity_reuses_the_arena() {
     let base = arena.region().unwrap().0;
     let init = IoInit::new(&arena);
     let new = init.alloc(2);
-    assert!(init.finish().is_ok());
+    assert!(init.finish("a").is_ok());
     assert_eq!(arena.region().unwrap().0, base);
     assert!(old.is_empty(), "a buffer from the old make reads empty");
     assert_eq!(new.capacity(), 2);
@@ -56,9 +56,16 @@ fn remake_past_capacity_fails_the_make() {
     let init = IoInit::new(&arena);
     let buf = init.alloc(9);
     assert_eq!(buf.capacity(), 0);
-    let err = init.finish().unwrap_err();
+    let err = init.finish("a").unwrap_err();
     assert!(
-        matches!(err, ParamError::IoMemory { need: 9, .. }),
+        matches!(
+            err,
+            ParamError::IoMemory {
+                requested_len: 9,
+                available: Some(4),
+                ..
+            }
+        ),
         "{err:?}"
     );
 }
@@ -68,10 +75,14 @@ fn no_arena_fails_any_allocation() {
     let init = IoInit::empty();
     drop(init.alloc(1));
     assert!(matches!(
-        init.finish(),
-        Err(ParamError::IoMemory { need: 1, .. })
+        init.finish("a"),
+        Err(ParamError::IoMemory {
+            requested_len: 1,
+            available: None,
+            ..
+        })
     ));
-    assert!(IoInit::empty().finish().is_ok());
+    assert!(IoInit::empty().finish("a").is_ok());
 }
 
 #[test]

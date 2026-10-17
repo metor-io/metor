@@ -1,12 +1,5 @@
-//! `Arena`, one system's IO memory; `Buf`, a span of it; and `IoInit`, which
-//! allocates spans while the system is made.
-//!
-//! An arena's memory is set once and never moves, so the kernel and other
-//! parties may hold pointers into it. A system's first make sizes it: `IoInit`
-//! stages the allocations, then hands the arena the bytes. A remake starts a
-//! new epoch and allocates
-//! from the start again, within the same memory; a `Buf` from an older epoch
-//! reads as empty.
+//! An arena is one system's fixed IO memory; a remake reuses it from the
+//! start.
 
 use core::cell::{Cell, OnceCell, RefCell};
 use core::ops::{Deref, DerefMut};
@@ -239,16 +232,16 @@ impl<'a> IoInit<'a> {
     /// Allocates `len` zeroed bytes. If the arena cannot, returns an empty
     /// buffer and the make fails afterward.
     pub fn alloc(&self, len: usize) -> Buf {
-        self.take(len, &[])
+        self.alloc_with(len, &[])
     }
 
     /// Allocates a buffer filled with `bytes`.
     pub fn alloc_from(&self, bytes: &[u8]) -> Buf {
-        self.take(bytes.len(), bytes)
+        self.alloc_with(bytes.len(), bytes)
     }
 
     /// Allocates `len` bytes starting with `fill`, zeroing the rest.
-    fn take(&self, len: usize, fill: &[u8]) -> Buf {
+    fn alloc_with(&self, len: usize, fill: &[u8]) -> Buf {
         let span = self.arena.zip(self.bump(len));
         let Some((arena, span)) = span else {
             self.short.set(self.short.get().saturating_add(len));
@@ -288,17 +281,18 @@ impl<'a> IoInit<'a> {
         })
     }
 
-    /// Fails with `IoMemory` if any allocation was refused.
-    pub(crate) fn finish(self) -> Result<(), ParamError> {
-        let need = self.short.get();
-        if need == 0 {
+    /// Fails with `IoMemory`, naming system `system`, if any allocation was
+    /// refused.
+    pub(crate) fn finish(self, system: &str) -> Result<(), ParamError> {
+        let requested_len = self.short.get();
+        if requested_len == 0 {
             return Ok(());
         }
-        let reason = match self.arena.and_then(|a| a.region()) {
-            Some((_, len)) => format!("needs {need} bytes more than the arena's {len}"),
-            None => format!("needs {need} bytes, but the system has no `Cap`"),
-        };
-        Err(ParamError::IoMemory { need, reason })
+        Err(ParamError::IoMemory {
+            system: system.to_string(),
+            requested_len,
+            available: self.arena.and_then(|a| a.region()).map(|(_, len)| len),
+        })
     }
 }
 

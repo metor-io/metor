@@ -7,15 +7,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use super::Class;
-use super::sys::{configure, speed};
-use crate::io::{Access, CanFilter, GpioDirection, IoError, RealKind, TtyConfig};
+use super::sys::configure;
+use crate::io::{Access, Baud, CanFilter, GpioDirection, IoError, RealKind, TtyConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("no termios speed for {0} baud")]
-    Baud(u32),
     #[error("{0} is not supported on this host")]
     Unsupported(&'static str),
     #[error("configuring the port: {0}")]
@@ -45,10 +43,7 @@ pub fn open(kind: &RealKind) -> Result<(OwnedFd, Class), OpenError> {
 }
 
 /// A serial port in raw mode at `baud`, 8N1.
-fn open_tty(path: &Path, baud: u32) -> Result<OwnedFd, OpenError> {
-    if speed(baud).is_none() {
-        return Err(OpenError::Baud(baud));
-    }
+fn open_tty(path: &Path, baud: Baud) -> Result<OwnedFd, OpenError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)

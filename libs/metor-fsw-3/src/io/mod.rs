@@ -70,6 +70,30 @@ impl GrantDef {
     }
 }
 
+/// A resource's position in a target's resources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResourceIndex(u16);
+
+impl ResourceIndex {
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl From<u16> for ResourceIndex {
+    fn from(index: u16) -> Self {
+        Self(index)
+    }
+}
+
+impl TryFrom<usize> for ResourceIndex {
+    type Error = core::num::TryFromIntError;
+
+    fn try_from(position: usize) -> Result<Self, Self::Error> {
+        u16::try_from(position).map(Self)
+    }
+}
+
 /// Which end of a resource a system holds.
 ///
 /// A sim resource is a wire between a driver and a device model. A real
@@ -87,6 +111,14 @@ pub enum ResourceEnd {
 impl ResourceEnd {
     pub fn is_host(&self) -> bool {
         *self == Self::Host
+    }
+
+    /// The end's position in a pair indexed by end.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Host => 0,
+            Self::Device => 1,
+        }
     }
 
     /// The other end of the wire.

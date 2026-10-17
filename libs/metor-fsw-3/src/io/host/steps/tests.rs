@@ -28,8 +28,12 @@ fn rig(sq_depth: usize, cq_depth: usize) -> Rig {
         backed: Backed::Wire(0),
     };
     let wire = Wire::new(SimKind::GpioLine, MAX_OPS);
-    let dispatch =
-        Dispatch::new(vec![vec![(0, ResourceEnd::Host)]], vec![line], vec![wire]).unwrap();
+    let dispatch = Dispatch::new(
+        vec![vec![(0.into(), ResourceEnd::Host)]],
+        vec![line],
+        vec![wire],
+    )
+    .unwrap();
     io.host = Some(Host {
         dispatch,
         os: host(MAX_OPS).unwrap(),
@@ -43,7 +47,6 @@ fn rig(sq_depth: usize, cq_depth: usize) -> Rig {
         io: Rc::new(RefCell::new(io)),
         sqs: vec![(0, sq_in)],
         cqs: vec![Some(cq_out)],
-        owns: [true].into(),
         status: None,
         log: LogPort::new(log_out),
         done: Vec::with_capacity(2 * MAX_OPS),
@@ -87,7 +90,7 @@ impl Rig {
     }
 
     fn slots(&mut self) -> Vec<u16> {
-        self.cq.drain().map(|c| c.unwrap().token.slot()).collect()
+        self.cq.drain().map(|c| c.unwrap().token.index()).collect()
     }
 
     fn faults(&mut self) -> Vec<String> {

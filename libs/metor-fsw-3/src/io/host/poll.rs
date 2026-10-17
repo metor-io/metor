@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use polling::{Event, Events, Poller};
 
 use super::{OpId, Os, OsDone, OsOp, sys};
-use crate::io::{Errno, IoError, Op};
+use crate::io::{Errno, IoError};
 
 /// The `Os` for Unix development hosts.
 pub struct PollOs {
@@ -53,7 +53,7 @@ impl PollOs {
     /// Polls `fd` once for every interest its parked ops have.
     fn arm(&mut self, fd: RawFd) {
         let parked = self.parked.iter().filter(|p| p.fd == fd);
-        let (reads, writes) = parked.fold((false, false), |(r, w), p| match writes(&p.op) {
+        let (reads, writes) = parked.fold((false, false), |(r, w), p| match p.op.writes() {
             true => (r, true),
             false => (true, w),
         });
@@ -77,18 +77,18 @@ impl PollOs {
     /// Takes `fd` out of the poller once no op is parked on it.
     fn prune(&mut self, fd: RawFd) {
         let parked = self.parked.iter().any(|p| p.fd == fd);
-        let Some(at) = self.added.iter().position(|&a| a == fd).filter(|_| !parked) else {
+        let Some(position) = self.added.iter().position(|&a| a == fd).filter(|_| !parked) else {
             return;
         };
-        self.added.swap_remove(at);
+        self.added.swap_remove(position);
         // SAFETY: as in `arm`.
         let _ = self.poller.delete(unsafe { BorrowedFd::borrow_raw(fd) });
     }
 
     /// Completes every parked op `hit` picks with `e`.
     fn finish_where(&mut self, hit: impl Fn(&OsOp) -> bool, e: IoError) {
-        while let Some(at) = self.parked.iter().position(&hit) {
-            let op = self.parked.remove(at);
+        while let Some(position) = self.parked.iter().position(&hit) {
+            let op = self.parked.remove(position);
             self.done.push(OsDone {
                 id: op.id,
                 result: Err(e),
@@ -100,17 +100,13 @@ impl PollOs {
     fn retry(&mut self, fd: RawFd) {
         let waiting = self.parked.iter().filter(|p| p.fd == fd).count();
         for _ in 0..waiting {
-            if let Some(at) = self.parked.iter().position(|p| p.fd == fd) {
-                let op = self.parked.remove(at);
+            if let Some(position) = self.parked.iter().position(|p| p.fd == fd) {
+                let op = self.parked.remove(position);
                 self.attempt(op);
             }
         }
         self.prune(fd);
     }
-}
-
-fn writes(op: &Op) -> bool {
-    matches!(op, Op::Write { .. } | Op::Send | Op::SendTo(_))
 }
 
 impl Os for PollOs {
@@ -140,8 +136,8 @@ impl Os for PollOs {
         }
         self.fired
             .extend(self.events.iter().map(|e| e.key as RawFd));
-        for at in 0..self.fired.len() {
-            self.retry(self.fired[at]);
+        for index in 0..self.fired.len() {
+            self.retry(self.fired[index]);
         }
         self.fired.clear();
     }

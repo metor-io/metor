@@ -8,7 +8,7 @@ use core::ptr::NonNull;
 use std::collections::VecDeque;
 
 use super::{OpId, OsDone, Out};
-use crate::io::{IoError, Op, ResourceEnd, SimKind, TtyConfig, TtyQueue};
+use crate::io::{IoError, Op, ResourceEnd, SimKind, TtyQueue};
 
 /// The bytes a UART buffers toward each end.
 pub(crate) const FIFO: usize = 4096;
@@ -23,7 +23,6 @@ pub(crate) struct Uart {
     /// Indexed by the end that reads it.
     fifos: [Fifo; 2],
     parked: [VecDeque<Parked>; 2],
-    config: Option<TtyConfig>,
 }
 
 /// A read waiting for bytes.
@@ -32,12 +31,8 @@ struct Parked {
     buf: NonNull<[u8]>,
 }
 
-/// A ring of bytes with a fixed capacity.
-struct Fifo {
-    bytes: Box<[u8]>,
-    head: usize,
-    len: usize,
-}
+/// A queue of at most `FIFO` bytes.
+struct Fifo(VecDeque<u8>);
 
 impl Wire {
     /// A wire of `kind`, parking at most `ops` ops per end.
@@ -46,7 +41,6 @@ impl Wire {
             SimKind::Uart => Self::Uart(Uart {
                 fifos: [Fifo::new(), Fifo::new()],
                 parked: [VecDeque::with_capacity(ops), VecDeque::with_capacity(ops)],
-                config: None,
             }),
             SimKind::GpioLine => Self::Gpio { level: false },
         }
@@ -62,33 +56,29 @@ impl Wire {
         buf: Option<NonNull<[u8]>>,
         done: &mut Vec<OsDone>,
     ) -> usize {
-        let len = |n: usize| Ok(Out::Len(n as u32));
         let mut dropped = 0;
         let result = match (self, op) {
             (Self::Uart(uart), Op::Read { .. }) => match uart.read(end, id, buf) {
-                Some(n) => len(n),
+                Some(n) => Ok(Out::len(n)),
                 None => return 0,
             },
             (Self::Uart(uart), Op::Write { .. }) => {
                 let (n, lost) = uart.write(end, buf, done);
                 dropped = lost;
-                len(n)
+                Ok(Out::len(n))
             }
-            (Self::Uart(uart), Op::TtyConfigure(cfg)) => {
-                uart.config = Some(cfg);
-                len(0)
-            }
+            (Self::Uart(_), Op::TtyConfigure(_)) => Ok(Out::len(0)),
             (Self::Uart(uart), Op::TtyFlush(queue)) => {
                 if queue != TtyQueue::Output {
-                    uart.fifos[index(end)].clear();
+                    uart.fifos[end.index()].0.clear();
                 }
-                len(0)
+                Ok(Out::len(0))
             }
             (Self::Gpio { level }, Op::GpioSet(set)) => {
                 *level = set;
-                len(0)
+                Ok(Out::len(0))
             }
-            (Self::Gpio { level }, Op::GpioGet) => len(usize::from(*level)),
+            (Self::Gpio { level }, Op::GpioGet) => Ok(Out::len(usize::from(*level))),
             _ => Err(IoError::Unsupported),
         };
         done.push(OsDone { id, result });
@@ -101,8 +91,8 @@ impl Wire {
             return;
         };
         for parked in &mut uart.parked {
-            if let Some(at) = parked.iter().position(|p| p.id == id) {
-                parked.remove(at);
+            if let Some(position) = parked.iter().position(|p| p.id == id) {
+                parked.remove(position);
                 let result = Err(IoError::Canceled);
                 done.push(OsDone { id, result });
             }
@@ -117,9 +107,9 @@ impl Uart {
         let Some(buf) = buf.filter(|b| !b.is_empty()) else {
             return Some(0);
         };
-        let fifo = &mut self.fifos[index(end)];
-        if fifo.len == 0 {
-            self.parked[index(end)].push_back(Parked { id, buf });
+        let fifo = &mut self.fifos[end.index()];
+        if fifo.0.is_empty() {
+            self.parked[end.index()].push_back(Parked { id, buf });
             return None;
         }
         // SAFETY: the reader lent `buf` to this op until its completion,
@@ -139,16 +129,16 @@ impl Uart {
         let Some(buf) = buf else {
             return (0, 0);
         };
-        let to = index(end.other());
+        let to = end.other().index();
         // SAFETY: the writer lent `buf` to this op until its completion. The
         // borrow ends before any parked read's buffer is borrowed.
         let dropped = self.fifos[to].put(unsafe { buf.as_ref() });
-        while self.fifos[to].len > 0
+        while !self.fifos[to].0.is_empty()
             && let Some(parked) = self.parked[to].pop_front()
         {
             // SAFETY: as in `read`.
             let n = self.fifos[to].take(unsafe { &mut *parked.buf.as_ptr() });
-            let result = Ok(Out::Len(n as u32));
+            let result = Ok(Out::len(n));
             done.push(OsDone {
                 id: parked.id,
                 result,
@@ -160,43 +150,22 @@ impl Uart {
 
 impl Fifo {
     fn new() -> Self {
-        Self {
-            bytes: vec![0; FIFO].into(),
-            head: 0,
-            len: 0,
-        }
+        Self(VecDeque::with_capacity(FIFO))
     }
 
     /// Appends what fits of `bytes`. Returns how many were dropped.
     fn put(&mut self, bytes: &[u8]) -> usize {
-        let n = bytes.len().min(FIFO - self.len);
-        let tail = (self.head + self.len) % FIFO;
-        let first = n.min(FIFO - tail);
-        self.bytes[tail..tail + first].copy_from_slice(&bytes[..first]);
-        self.bytes[..n - first].copy_from_slice(&bytes[first..n]);
-        self.len += n;
+        let n = bytes.len().min(FIFO - self.0.len());
+        self.0.extend(&bytes[..n]);
         bytes.len() - n
     }
 
     /// Moves the oldest bytes into `out`, as many as fit.
     fn take(&mut self, out: &mut [u8]) -> usize {
-        let n = out.len().min(self.len);
-        let first = n.min(FIFO - self.head);
-        out[..first].copy_from_slice(&self.bytes[self.head..self.head + first]);
-        out[first..n].copy_from_slice(&self.bytes[..n - first]);
-        self.head = (self.head + n) % FIFO;
-        self.len -= n;
+        let n = out.len().min(self.0.len());
+        for (dst, src) in out.iter_mut().zip(self.0.drain(..n)) {
+            *dst = src;
+        }
         n
-    }
-
-    fn clear(&mut self) {
-        self.len = 0;
-    }
-}
-
-fn index(end: ResourceEnd) -> usize {
-    match end {
-        ResourceEnd::Host => 0,
-        ResourceEnd::Device => 1,
     }
 }

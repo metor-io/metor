@@ -143,7 +143,7 @@ impl Os for UringOs {
             let res = cqe.result();
             let result = match res {
                 ..0 if res == -libc::ECANCELED => Err(IoError::Canceled),
-                ..0 => Err(IoError::Os(Errno::new(-res as u16))),
+                ..0 => Err(IoError::Os(sys::linux(-res).unwrap_or(Errno::EIO))),
                 // SAFETY: an accept's result is a new descriptor, now owned here.
                 _ if accept => Ok(Out::Opened(
                     unsafe { OwnedFd::from_raw_fd(res) },

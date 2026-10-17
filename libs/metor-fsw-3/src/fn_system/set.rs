@@ -10,11 +10,10 @@ use metor_fsw_3_ring::NoWake;
 
 use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError, Records};
-use crate::io::{Arena, Io, SharedIo};
+use crate::io::{Io, SharedIo};
 use crate::log::LogPort;
-use crate::port::{Input, InputWake, Output};
+use crate::port::{InputWake, Output};
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports, SystemDef};
-use std::rc::Rc;
 
 use super::FnSignature;
 use super::param::{Defs, Instance, Param, Views, Writers};
@@ -194,7 +193,7 @@ pub(crate) fn bind<S: FnSignature>(
     let defs = Defs::declared::<S>();
     let rng = defs.rng.then(|| instance.rng());
     let records = defs.records.then(|| instance.records.clone());
-    let arena = defs.io.then(|| io.borrow_mut().get_or_add_member(id));
+    let arena = defs.has_io().then(|| io.borrow_mut().get_or_add_member(id));
     let io_ports = defs.io_ports();
     // PANIC Safety: build binds one entry per port of the definition these
     // `Defs` describe, with `log` last among the outputs.
@@ -203,27 +202,13 @@ pub(crate) fn bind<S: FnSignature>(
     let io_out = outputs.split_off(outputs.len() - io_ports);
     outputs.push(log);
     let dropped = Arc::<AtomicU32>::default();
-    let io = queue(arena, io_in, io_out);
+    let io = Io::from_bindings(arena, io_in, io_out);
     let ins = bind_inputs::<S, NoWake>(inputs, defs.inputs.len() - io_ports);
     let mut writers = writers(outputs, defs.outputs.len() - io_ports + 1, dropped);
     writers.io = io.clone();
     writers.rng = rng;
     writers.records = records;
     Ok((ins, bind_outputs::<S>(writers), io))
-}
-
-/// The queue pair over `io_cq` and `io_sq`, for a system with a `Cap`.
-fn queue(
-    arena: Option<Rc<Arena>>,
-    inputs: Vec<InputBinding>,
-    outputs: Vec<OutputBinding>,
-) -> Option<Io> {
-    let (cq, sq) = inputs.into_iter().zip(outputs).next()?;
-    Some(Io::new(
-        Output::new(sq.writer),
-        Input::new(cq.views),
-        arena?,
-    ))
 }
 
 fn writers(outputs: Vec<OutputBinding>, declared: usize, dropped: Arc<AtomicU32>) -> Writers {

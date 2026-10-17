@@ -163,9 +163,8 @@ impl Handle<GpioLine> {
         self.submit(Op::GpioGet, None)
     }
 
-    /// Drives the line high for any nonzero `value`.
-    pub fn set(&self, value: u32) -> Pending<GpioOp> {
-        self.submit(Op::GpioSet(value != 0), None)
+    pub fn set(&self, high: bool) -> Pending<GpioOp> {
+        self.submit(Op::GpioSet(high), None)
     }
 }
 

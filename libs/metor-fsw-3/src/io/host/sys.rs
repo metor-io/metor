@@ -7,7 +7,9 @@ use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use super::{Class, OsOp, Out};
-use crate::io::{Errno, IoError, Op, OpenFlags, TtyConfig, TtyQueue};
+use crate::io::{
+    Baud, DataBits, Errno, Flow, IoError, Op, OpenFlags, Parity, StopBits, TtyConfig, TtyQueue,
+};
 
 /// `send` never raises `SIGPIPE`.
 #[cfg(target_os = "linux")]
@@ -15,73 +17,20 @@ pub(super) const SEND_FLAGS: i32 = libc::MSG_NOSIGNAL;
 #[cfg(not(target_os = "linux"))]
 pub(super) const SEND_FLAGS: i32 = 0;
 
-/// The last host error, as a Linux errno.
+/// The last host error, as a Linux errno, or `EIO` for one with no name here.
 pub(crate) fn errno() -> IoError {
-    let raw = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    IoError::Os(linux(raw))
+    let raw = std::io::Error::last_os_error().raw_os_error();
+    IoError::Os(raw.and_then(linux).unwrap_or(Errno::EIO))
 }
 
 #[cfg(target_os = "linux")]
-fn linux(raw: i32) -> Errno {
-    Errno::new(raw as u16)
+pub(super) fn linux(raw: i32) -> Option<Errno> {
+    u16::try_from(raw).ok().and_then(Errno::new)
 }
 
-/// The Linux errno for a host's, or `EIO` for one with no name here.
 #[cfg(not(target_os = "linux"))]
-fn linux(raw: i32) -> Errno {
-    let host = [
-        (libc::EPERM, Errno::EPERM),
-        (libc::ENOENT, Errno::ENOENT),
-        (libc::EINTR, Errno::EINTR),
-        (libc::EIO, Errno::EIO),
-        (libc::ENXIO, Errno::ENXIO),
-        (libc::EBADF, Errno::EBADF),
-        (libc::EAGAIN, Errno::EAGAIN),
-        (libc::ENOMEM, Errno::ENOMEM),
-        (libc::EACCES, Errno::EACCES),
-        (libc::EFAULT, Errno::EFAULT),
-        (libc::EBUSY, Errno::EBUSY),
-        (libc::EEXIST, Errno::EEXIST),
-        (libc::ENODEV, Errno::ENODEV),
-        (libc::ENOTDIR, Errno::ENOTDIR),
-        (libc::EISDIR, Errno::EISDIR),
-        (libc::EINVAL, Errno::EINVAL),
-        (libc::EMFILE, Errno::EMFILE),
-        (libc::ENOTTY, Errno::ENOTTY),
-        (libc::EFBIG, Errno::EFBIG),
-        (libc::ENOSPC, Errno::ENOSPC),
-        (libc::ESPIPE, Errno::ESPIPE),
-        (libc::EROFS, Errno::EROFS),
-        (libc::EPIPE, Errno::EPIPE),
-        (libc::ENAMETOOLONG, Errno::ENAMETOOLONG),
-        (libc::ENOSYS, Errno::ENOSYS),
-        (libc::ENOTEMPTY, Errno::ENOTEMPTY),
-        (libc::ELOOP, Errno::ELOOP),
-        (libc::ETIME, Errno::ETIME),
-        (libc::EOVERFLOW, Errno::EOVERFLOW),
-        (libc::ENOTSOCK, Errno::ENOTSOCK),
-        (libc::EMSGSIZE, Errno::EMSGSIZE),
-        (libc::EOPNOTSUPP, Errno::EOPNOTSUPP),
-        (libc::EAFNOSUPPORT, Errno::EAFNOSUPPORT),
-        (libc::EADDRINUSE, Errno::EADDRINUSE),
-        (libc::EADDRNOTAVAIL, Errno::EADDRNOTAVAIL),
-        (libc::ENETDOWN, Errno::ENETDOWN),
-        (libc::ENETUNREACH, Errno::ENETUNREACH),
-        (libc::ECONNABORTED, Errno::ECONNABORTED),
-        (libc::ECONNRESET, Errno::ECONNRESET),
-        (libc::ENOBUFS, Errno::ENOBUFS),
-        (libc::EISCONN, Errno::EISCONN),
-        (libc::ENOTCONN, Errno::ENOTCONN),
-        (libc::ETIMEDOUT, Errno::ETIMEDOUT),
-        (libc::ECONNREFUSED, Errno::ECONNREFUSED),
-        (libc::EHOSTUNREACH, Errno::EHOSTUNREACH),
-        (libc::EALREADY, Errno::EALREADY),
-        (libc::EINPROGRESS, Errno::EINPROGRESS),
-        (libc::ECANCELED, Errno::ECANCELED),
-    ];
-    host.iter()
-        .find(|(h, _)| *h == raw)
-        .map_or(Errno::EIO, |(_, e)| *e)
+pub(super) fn linux(raw: i32) -> Option<Errno> {
+    Errno::HOST.iter().find(|(h, _)| *h == raw).map(|(_, e)| *e)
 }
 
 /// `r`, or the last host error when it is negative.
@@ -116,7 +65,7 @@ pub(super) fn run(op: &OsOp) -> Result<Out, IoError> {
             Op::Fsync => libc::fsync(fd) as isize,
             Op::Accept => return accept(fd),
             Op::Open(flags) => return open_at(fd, buf, flags),
-            Op::TtyConfigure(cfg) => return configure(fd, &cfg).map(|()| Out::Len(0)),
+            Op::TtyConfigure(cfg) => return configure(fd, &cfg).map(|()| Out::len(0)),
             Op::TtyFlush(queue) => return flush(fd, queue).map(|()| Out::Len(0)),
             Op::GpioGet => return gpio(fd, None).map(Out::Len),
             Op::GpioSet(level) => return gpio(fd, Some(level)).map(Out::Len),
@@ -194,14 +143,7 @@ fn open_flags(f: OpenFlags) -> (i32, u32) {
 
 /// Applies `cfg` to a serial port, in raw mode.
 pub(crate) fn configure(fd: RawFd, cfg: &TtyConfig) -> Result<(), IoError> {
-    let speed = speed(cfg.baud()).ok_or(IoError::Os(Errno::EINVAL))?;
-    let size = match cfg.data_bits {
-        5 => libc::CS5,
-        6 => libc::CS6,
-        7 => libc::CS7,
-        8 => libc::CS8,
-        _ => return Err(IoError::Os(Errno::EINVAL)),
-    };
+    let speed = speed(cfg.baud);
     let mut t = MaybeUninit::<libc::termios>::uninit();
     // SAFETY: `tcgetattr` fills `t` when it succeeds.
     cvt(unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) })?;
@@ -214,18 +156,26 @@ pub(crate) fn configure(fd: RawFd, cfg: &TtyConfig) -> Result<(), IoError> {
         cvt(libc::cfsetospeed(&mut t, speed))?;
     }
     t.c_cflag &= !(libc::CSIZE | libc::PARENB | libc::PARODD | libc::CSTOPB | libc::CRTSCTS);
-    t.c_cflag |= libc::CLOCAL | libc::CREAD | size;
-    t.c_cflag |= match cfg.parity {
-        0 => 0,
-        1 => libc::PARENB | libc::PARODD,
-        _ => libc::PARENB,
+    t.c_cflag |= libc::CLOCAL | libc::CREAD;
+    t.c_cflag |= match cfg.data_bits {
+        DataBits::Five => libc::CS5,
+        DataBits::Six => libc::CS6,
+        DataBits::Seven => libc::CS7,
+        DataBits::Eight => libc::CS8,
     };
-    if cfg.stop_bits == 2 {
-        t.c_cflag |= libc::CSTOPB;
-    }
-    if cfg.flow == 1 {
-        t.c_cflag |= libc::CRTSCTS;
-    }
+    t.c_cflag |= match cfg.parity {
+        Parity::None => 0,
+        Parity::Odd => libc::PARENB | libc::PARODD,
+        Parity::Even => libc::PARENB,
+    };
+    t.c_cflag |= match cfg.stop_bits {
+        StopBits::One => 0,
+        StopBits::Two => libc::CSTOPB,
+    };
+    t.c_cflag |= match cfg.flow {
+        Flow::None => 0,
+        Flow::RtsCts => libc::CRTSCTS,
+    };
     t.c_cc[libc::VMIN] = cfg.vmin;
     t.c_cc[libc::VTIME] = cfg.vtime;
     // SAFETY: `t` is a valid termios and `fd` is open.
@@ -242,26 +192,29 @@ fn flush(fd: RawFd, queue: TtyQueue) -> Result<(), IoError> {
     cvt(unsafe { libc::tcflush(fd, queue) }).map(drop)
 }
 
-/// The termios speed for `baud`, if the host has one.
-pub(crate) fn speed(baud: u32) -> Option<libc::speed_t> {
-    let speeds: &[(u32, libc::speed_t)] = &[
-        (1200, libc::B1200),
-        (2400, libc::B2400),
-        (4800, libc::B4800),
-        (9600, libc::B9600),
-        (19200, libc::B19200),
-        (38400, libc::B38400),
-        (57600, libc::B57600),
-        (115200, libc::B115200),
-        (230400, libc::B230400),
-        #[cfg(target_os = "linux")]
-        (460800, libc::B460800),
-        #[cfg(target_os = "linux")]
-        (921600, libc::B921600),
-        #[cfg(target_os = "linux")]
-        (1000000, libc::B1000000),
-    ];
-    speeds.iter().find(|(b, _)| *b == baud).map(|(_, s)| *s)
+/// The termios speed for `baud`.
+#[cfg(target_os = "linux")]
+fn speed(baud: Baud) -> libc::speed_t {
+    match baud {
+        Baud::B1200 => libc::B1200,
+        Baud::B2400 => libc::B2400,
+        Baud::B4800 => libc::B4800,
+        Baud::B9600 => libc::B9600,
+        Baud::B19200 => libc::B19200,
+        Baud::B38400 => libc::B38400,
+        Baud::B57600 => libc::B57600,
+        Baud::B115200 => libc::B115200,
+        Baud::B230400 => libc::B230400,
+        Baud::B460800 => libc::B460800,
+        Baud::B921600 => libc::B921600,
+        Baud::B1000000 => libc::B1000000,
+    }
+}
+
+/// The termios speed for `baud`, which on BSD hosts is the rate itself.
+#[cfg(not(target_os = "linux"))]
+fn speed(baud: Baud) -> libc::speed_t {
+    libc::speed_t::from(baud.bits_per_second())
 }
 
 /// Reads a GPIO line, or sets it to `level`, with the GPIO v2 line ioctls.

@@ -117,11 +117,20 @@ pub enum BuildError {
     #[error("`{system}` grants `{param}`, which is not a `Cap` parameter")]
     UnknownGrant { system: String, param: String },
 
-    #[error("io steps: {message}")]
-    IoSystems { message: String },
+    #[error("`{system}` holds a `Cap`, so the config needs an fsw.io")]
+    NoIoStep { system: String },
 
-    #[error("resource `{id}` is created twice")]
-    DuplicateResource { id: String },
+    #[error("`{system}` holds a `Cap`, so an fsw.io must follow it")]
+    NoIoStepAfter { system: String },
+
+    #[error("{count} systems hold a `Cap`, past the limit")]
+    TooManyIoMembers { count: usize },
+
+    #[error("{count} resources, past the limit")]
+    TooManyResources { count: usize },
+
+    #[error("the IO backend did not start: {message}")]
+    IoBackend { message: String },
 
     #[error("`{system}` grants `{param}` resource `{resource}`, which the target does not create")]
     UnknownResource {

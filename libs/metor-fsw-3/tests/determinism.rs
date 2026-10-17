@@ -17,7 +17,7 @@ use metor_fsw_3::coordinator::{
     Adapter, BuildOptions, Clock, Coordinator, CoordinatorConfig, InputConfig, SystemConfig,
     SystemTable,
 };
-use metor_fsw_3::io::{Backing, Holder, IO_SQ, IO_TYPE, ResourceConfig, SimKind, SimResource};
+use metor_fsw_3::io::{Backing, Holder, IO_SQ, IO_TYPE, SimKind, SimResource};
 use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::{DynInputs, EndReason, Input, Output, Stop, Timestamp, system};
 
@@ -98,14 +98,16 @@ fn config(seed: u64) -> CoordinatorConfig {
             epoch: Some(Timestamp(0)),
         },
         systems,
-        resources: vec![ResourceConfig {
-            id: "line".into(),
-            backing: Backing::Sim(SimResource {
+        resources: [(
+            "line".to_string(),
+            Backing::Sim(SimResource {
                 kind: SimKind::Uart,
                 host: Holder::new("reader", "uart"),
                 device: Holder::new("chatter", "uart"),
             }),
-        }],
+        )]
+        .into_iter()
+        .collect(),
         seed,
         ..CoordinatorConfig::default()
     }

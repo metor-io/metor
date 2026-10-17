@@ -19,15 +19,14 @@ impl<K: Interface> Param for Cap<K> {
         defs: &mut Defs,
     ) -> Result<(), DefError> {
         defs.grants.push(GrantDef::new::<K>(param_name(names)));
-        defs.io = true;
         Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
     fn bind_out(writers: &mut Writers) -> Cap<K> {
-        // PANIC Safety: `fn_system::bind` builds a queue for every set whose
-        // `Defs::io` is set, and a `Cap` sets it.
+        // PANIC Safety: `fn_system::bind` builds a queue for every set with a
+        // grant, and a `Cap` adds one.
         let io = writers
             .io
             .as_ref()

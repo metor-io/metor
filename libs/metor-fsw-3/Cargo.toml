@@ -14,7 +14,7 @@ metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
 const-fnv1a-hash = "1.1.0"
 futures-lite = "2"
-indexmap = "2"
+indexmap = { version = "2", features = ["serde"] }
 libc = { version = "0.2", optional = true }
 maitake-sync = { path = "../stellarator/maitake/sync" }
 postcard = { version = "1.1", features = ["alloc", "experimental-derive"] }

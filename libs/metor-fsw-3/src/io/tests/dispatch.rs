@@ -45,8 +45,11 @@ fn rig_with(kind: SimKind) -> Rig {
         },
     ];
     let members = vec![
-        vec![(0, ResourceEnd::Host), (1, ResourceEnd::Host)],
-        vec![(0, ResourceEnd::Host), (1, ResourceEnd::Device)],
+        vec![(0.into(), ResourceEnd::Host), (1.into(), ResourceEnd::Host)],
+        vec![
+            (0.into(), ResourceEnd::Host),
+            (1.into(), ResourceEnd::Device),
+        ],
     ];
     Rig {
         d: Dispatch::new(members, resources, vec![Wire::new(kind, 2 * MAX_OPS)]).unwrap(),
@@ -77,7 +80,7 @@ impl Rig {
 
     fn replies(&mut self) -> Vec<(usize, Cqe)> {
         let mut out = Vec::new();
-        self.d.take_ready(&[true, true], &mut out);
+        self.d.take_ready(|_| true, &mut out);
         out
     }
 
@@ -246,8 +249,8 @@ fn each_io_step_takes_only_the_completions_it_posts() {
     r.lower(0, sqe(0, SIM, Op::Write { offset: None }, Span::new(0, 1)));
     r.lower(1, sqe(1, RawHandle::new(9, 0), Op::Fsync, Span::default()));
     let (mut first, mut second) = (Vec::new(), Vec::new());
-    r.d.take_ready(&[false, true], &mut first);
-    r.d.take_ready(&[true, false], &mut second);
+    r.d.take_ready(|m| m == 1, &mut first);
+    r.d.take_ready(|m| m == 0, &mut second);
     assert_eq!(first, [(1, Cqe::err(Token::new(1, 7), IoError::Stale))]);
     assert_eq!(second, [(0, Cqe::ok(Token::new(0, 7), 1))]);
     assert!(r.replies().is_empty());
@@ -312,9 +315,9 @@ fn teardown_waits_only_for_ops_on_descriptors() {
     let mut r = rig();
     r.lower(0, read(0, SIM));
     let _ = r.routes();
-    assert!(!r.d.live(), "a model holds the op");
+    assert!(!r.d.has_kernel_ops_in_flight(), "a model holds the op");
     r.lower(0, read(1, TTY));
-    assert!(r.d.live());
+    assert!(r.d.has_kernel_ops_in_flight());
 }
 
 #[test]
@@ -423,7 +426,7 @@ fn lowering_and_raising_allocate_nothing() {
                 id,
                 result: Ok(Out::Len(1)),
             });
-            r.d.take_ready(&[true, true], &mut ready);
+            r.d.take_ready(|_| true, &mut ready);
             ready.clear();
         }
     });

@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::io::*;
 use crate::record::{DecodeError, Record};
@@ -19,7 +19,7 @@ fn ops() -> Vec<Op> {
         Op::Close,
         Op::Fsync,
         Op::Accept,
-        Op::TtyConfigure(TtyConfig::new(115_200)),
+        Op::TtyConfigure(TtyConfig::new(Baud::B115200)),
         Op::TtyFlush(TtyQueue::Both),
         Op::GpioGet,
         Op::GpioSet(true),
@@ -88,7 +88,7 @@ fn short_records_are_truncated_and_trailing_bytes_ignored() {
 fn status_codes_round_trip() {
     let errors = [
         IoError::Os(Errno::EIO),
-        IoError::Os(Errno::new(4000)),
+        IoError::Os(Errno::new(4000).unwrap()),
         IoError::QueueFull,
         IoError::Stale,
         IoError::Canceled,
@@ -101,25 +101,52 @@ fn status_codes_round_trip() {
         assert_eq!(IoStatus::err(e).result(), Err(e));
         assert_eq!(Cqe::err(Token::new(0, 0), e).result(), Err(e));
     }
-    assert_eq!(
-        IoStatus::err(IoError::Os(Errno::new(0))).result(),
-        Err(IoError::Os(Errno::EIO))
-    );
+    assert_eq!(Errno::new(0), None);
     assert_eq!(IoStatus::OK.result(), Ok(()));
+    let unknown = IoStatus::read_from_bytes(&0x1_00FF_u32.to_le_bytes()).unwrap();
+    assert_eq!(unknown.result(), Err(IoError::Refused));
 }
 
 #[test]
 fn errno_names_parse_back() {
     assert_eq!(Errno::parse("ECONNREFUSED"), Some(Errno::ECONNREFUSED));
-    assert_eq!(format!("{:?}", Errno::new(4000)), "Errno(4000)");
+    assert_eq!(format!("{:?}", Errno::new(4000).unwrap()), "Errno(4000)");
     assert_eq!(Errno::parse("ENOPE"), None);
 }
 
 #[test]
 fn tokens_and_handles_pack_slot_and_generation() {
     let t = Token::new(u16::MAX, 7);
-    assert_eq!((t.slot(), t.generation()), (u16::MAX, 7));
+    assert_eq!((t.index(), t.generation()), (u16::MAX, 7));
     let h = RawHandle::new(3, u16::MAX);
     assert_eq!((h.index(), h.generation()), (3, u16::MAX));
     assert_eq!(RawHandle::from_raw(h.get()), h);
+}
+
+#[test]
+fn baud_parses_only_supported_rates() {
+    assert_eq!(Baud::try_from(115_200), Ok(Baud::B115200));
+    assert_eq!(u32::from(Baud::B1000000), 1_000_000);
+    assert_eq!(Baud::try_from(12_345), Err(UnsupportedBaud(12_345)));
+    let parsed: Baud = serde_json::from_value(serde_json::json!(9600)).unwrap();
+    assert_eq!(parsed, Baud::B9600);
+    assert!(serde_json::from_value::<Baud>(serde_json::json!(0)).is_err());
+}
+
+#[test]
+fn bad_tty_settings_do_not_decode() {
+    let op = Op::TtyConfigure(TtyConfig::new(Baud::B9600));
+    let mut sqe = Sqe::new(Token::new(0, 0), RawHandle::new(0, 0), &op, Span::default());
+    assert_eq!(sqe.op(), Ok(op));
+    sqe.arg[1] = 9;
+    assert_eq!(sqe.op(), Err(IoError::Os(Errno::EINVAL)));
+    let flush = Op::TtyFlush(TtyQueue::Both);
+    let mut sqe = Sqe::new(
+        Token::new(0, 0),
+        RawHandle::new(0, 0),
+        &flush,
+        Span::default(),
+    );
+    sqe.aux = 3;
+    assert_eq!(sqe.op(), Err(IoError::Unsupported));
 }

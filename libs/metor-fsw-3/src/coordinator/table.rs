@@ -391,7 +391,7 @@ impl TableEntry {
                 let instance = fn_system::Instance::from_make_cx(&cx);
                 let (views, writers) = cx.take_bindings();
                 let (inputs, outputs, io) = fn_system::bind::<S>(views, writers, instance)?;
-                let state = fn_system::make_state(&ctor, cx.id, cx.params, io.as_ref())?;
+                let state = ctor.make_with_io(cx.id, cx.params, io.as_ref())?;
                 Ok(Box::new(Runner {
                     system: FnSystem::default(),
                     state,

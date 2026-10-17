@@ -1,18 +1,5 @@
-//! `fsw.io`: the system that carries every IO system's ops to the backend or
-//! a wire, and their completions back.
-//!
-//! A target places it twice, as `io_submit` after the drivers and as
-//! `io_complete` after the models. Both instances share one dispatch and
-//! backend, and run the same body: lower the SQs of the members that ran
-//! since the previous instance, hand the ops to the backend, reap it, and
-//! post the ready completions of the members whose CQ the instance writes.
-//! A member's SQ goes to the next instance after it, so one must follow it,
-//! and its CQ comes from the one before it, wrapping to the last for members
-//! placed before the first. So a driver's request reaches its model in the
-//! cycle it is sent, and the model's answer reaches the driver in the next.
-//!
-//! A pass lowers at most two records per slot from each SQ, and a
-//! completion its CQ refuses is held for the next pass, up to a bound.
+//! `fsw.io`: lowers its members' SQs to the backend or a wire, and posts
+//! their completions to their CQs.
 
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -35,7 +22,7 @@ use crate::io::status::ResourceStatus;
 use crate::io::{Cqe, IoState, MAX_OPS, SharedIo, Sqe};
 use crate::log::LogPort;
 use crate::port::{Input, Output};
-use crate::system::SystemDef;
+use crate::system::{OutputBinding, SystemDef};
 
 pub const IO_TYPE: &str = "fsw.io";
 /// The output the instance with `status` writes resource counts to.
@@ -85,19 +72,23 @@ fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
 
 fn make(mut cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     let params: IoParams = cx.params.decode()?;
-    let (views, writers) = cx.take_bindings();
+    let (views, mut fixed) = cx.take_bindings();
     let io = cx.io.borrow();
     let names = cx.def.inputs.iter().map(|p| p.name.as_ref());
-    let members: Vec<usize> = names.map(|n| member(&io, n)).collect::<Result<_, _>>()?;
+    let members: Vec<usize> = names
+        .map(|n| io.member_index(n))
+        .collect::<Result<_, _>>()?;
     let sqs = members.into_iter().zip(views);
-    let mut writers = writers.into_iter();
-    // PANIC Safety: `def` declares `log`, then `io_status`, first.
-    let mut fixed = || writers.next().expect("a fixed output").writer;
-    let log = LogPort::new(Output::new(fixed()));
-    let status = Output::new(fixed());
+    // PANIC Safety: `def` declares `log`, then `io_status`, before the CQs.
+    let cq_writers = fixed.split_off(2);
+    let Ok([log, status]) = <[OutputBinding; 2]>::try_from(fixed) else {
+        panic!("`def` declares two fixed outputs");
+    };
+    let log = LogPort::new(Output::new(log.writer));
+    let status = Output::new(status.writer);
     let mut cqs: Vec<Option<Output<Cqe>>> = io.members.iter().map(|_| None).collect();
-    for b in writers {
-        let m = member(&io, &b.def.name)?;
+    for b in cq_writers {
+        let m = io.member_index(&b.def.name)?;
         cqs[m] = Some(Output::new(b.writer));
     }
     let owned = cqs.iter().flatten().count() * MAX_OPS;
@@ -105,7 +96,6 @@ fn make(mut cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     Ok(Box::new(IoStep {
         io: cx.io.clone(),
         sqs: sqs.map(|(m, b)| (m, Input::new(b.views))).collect(),
-        owns: cqs.iter().map(Option::is_some).collect(),
         cqs,
         status: params.status.then_some(status),
         log,
@@ -115,11 +105,6 @@ fn make(mut cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     }))
 }
 
-fn member(io: &IoState, id: &str) -> Result<usize, ParamError> {
-    let system = id.to_string();
-    io.index(id).ok_or(ParamError::NoIoMember { system })
-}
-
 /// One placement of `fsw.io`.
 struct IoStep {
     io: SharedIo,
@@ -127,7 +112,6 @@ struct IoStep {
     sqs: Vec<(usize, Input<Sqe>)>,
     /// The CQ of each member it posts to, by member index.
     cqs: Vec<Option<Output<Cqe>>>,
-    owns: Box<[bool]>,
     status: Option<Output<ResourceStatus>>,
     log: LogPort,
     done: Vec<OsDone>,
@@ -156,7 +140,8 @@ impl Step for IoStep {
         };
         let mut faults = self.lower(dispatch, members);
         self.run(dispatch, os.as_mut());
-        dispatch.take_ready(&self.owns, &mut self.ready);
+        let cqs = &self.cqs;
+        dispatch.take_ready(|m| matches!(cqs.get(m), Some(Some(_))), &mut self.ready);
         faults.lost = self.post();
         if let Some(status) = &self.status {
             dispatch.report(now, status);
@@ -210,7 +195,8 @@ impl IoStep {
         let (cqs, held) = (&self.cqs, self.held);
         let (mut kept, mut lost) = (0, false);
         self.ready.retain(|(m, cqe)| {
-            let Some(Some(cq)) = cqs.get(*m) else {
+            debug_assert!(cqs[*m].is_some(), "`take_ready` keeps only owned members");
+            let Some(cq) = &cqs[*m] else {
                 return false;
             };
             if cq.write(cqe).is_ok() {

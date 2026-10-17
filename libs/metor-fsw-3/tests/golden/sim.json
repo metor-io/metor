@@ -38,22 +38,19 @@
       }
     }
   ],
-  "resources": [
-    {
-      "id": "gps1",
-      "backing": {
-        "sim": {
-          "kind": "uart",
-          "host": {
-            "system": "gps",
-            "param": "uart"
-          },
-          "device": {
-            "system": "receiver",
-            "param": "uart"
-          }
+  "resources": {
+    "gps1": {
+      "sim": {
+        "kind": "uart",
+        "host": {
+          "system": "gps",
+          "param": "uart"
+        },
+        "device": {
+          "system": "receiver",
+          "param": "uart"
         }
       }
     }
-  ]
+  }
 }

@@ -23,32 +23,21 @@ pub trait Ctor<S, Marker> {
     ///
     /// Returns `None` if the constructor takes no params.
     fn schema() -> Option<Box<RawValue>>;
+
+    /// Builds the state with an `IoInit` over `io`'s arena, or one that
+    /// refuses every allocation when the system has no queue.
+    ///
+    /// A refused allocation fails the make with `IoMemory`, naming system `id`.
+    fn make_with_io(&self, id: &str, params: Params<'_>, io: Option<&Io>) -> Result<S, ParamError> {
+        let init = io.map_or_else(IoInit::empty, |io| IoInit::new(io.arena()));
+        let state = self.make(params, &init)?;
+        init.finish(id)?;
+        Ok(state)
+    }
 }
 
 /// Marks the constructor forms that take an `&IoInit`.
 pub struct WithIo;
-
-/// Builds a system's state, giving its constructor an `IoInit` over `io`,
-/// or one that refuses every allocation when the system has no queue.
-///
-/// A refused allocation fails the make with `IoMemory`, naming system `id`.
-pub(crate) fn make_state<S, M, C: Ctor<S, M>>(
-    ctor: &C,
-    id: &str,
-    params: Params<'_>,
-    io: Option<&Io>,
-) -> Result<S, ParamError> {
-    let init = io.map_or_else(IoInit::empty, |io| IoInit::new(io.arena()));
-    let state = ctor.make(params, &init)?;
-    init.finish().map_err(|e| match e {
-        ParamError::IoMemory { need, reason } => ParamError::IoMemory {
-            need,
-            reason: format!("`{id}`: {reason}"),
-        },
-        e => e,
-    })?;
-    Ok(state)
-}
 
 fn schema_of<P: JsonSchema>() -> Option<Box<RawValue>> {
     serde_json::value::to_raw_value(&schemars::schema_for!(P)).ok()
@@ -190,7 +179,7 @@ mod tests {
         let arena = std::rc::Rc::new(crate::io::Arena::new());
         let init = IoInit::new(&arena);
         let bufs = ctor.make(Params(params), &init)?;
-        init.finish()?;
+        init.finish("a")?;
         Ok(bufs.0.iter().map(|b| b.capacity()).collect())
     }
 
@@ -211,7 +200,7 @@ mod tests {
             Ctor::<u16, ()>::make(&|| 5u16, Params(&json!(null)), &init),
             Ok(5)
         );
-        assert_eq!(init.finish(), Ok(()));
+        assert_eq!(init.finish("a"), Ok(()));
     }
 
     #[test]

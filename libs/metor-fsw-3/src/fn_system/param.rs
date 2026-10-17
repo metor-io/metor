@@ -141,8 +141,6 @@ pub struct Defs {
     /// Whether any parameter is a [`Sample`]. Only a stepped system can take
     /// one.
     pub(crate) sampled: bool,
-    /// Whether any parameter is a `Cap`, which gives the system a queue pair.
-    pub(crate) io: bool,
     /// The `Cap` parameters, in order.
     pub(crate) grants: Vec<GrantDef>,
     /// Whether any parameter is an `Rng`.
@@ -180,15 +178,20 @@ impl Defs {
     /// Appends `io_cq` and `io_sq`, for a `Cap`, after the parameters' own
     /// ports.
     fn append_io(&mut self, cx: &DefCx<'_>) {
-        if self.io {
+        if self.has_io() {
             self.inputs.push(Input::<Cqe>::def(cx, IO_CQ));
             self.outputs.push(Output::<Sqe>::def(cx, IO_SQ));
         }
     }
 
+    /// Whether any parameter is a `Cap`, which gives the system a queue pair.
+    pub(crate) fn has_io(&self) -> bool {
+        !self.grants.is_empty()
+    }
+
     /// The IO ports at the end of each port list.
     pub(crate) fn io_ports(&self) -> usize {
-        usize::from(self.io)
+        usize::from(self.has_io())
     }
 }
 

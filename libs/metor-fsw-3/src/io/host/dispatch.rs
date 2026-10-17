@@ -15,19 +15,24 @@ use super::wire::Wire;
 use super::{Class, OpId, OsDone, OsOp, Out};
 use crate::coordinator::BuildError;
 use crate::io::arena::Arena;
-use crate::io::status::{Counters, ResourceStatus, resource_name};
-use crate::io::{Cqe, IoError, MAX_OPS, Op, OpKind, RawHandle, ResourceEnd, Sqe, Token};
+use crate::io::status::{Counters, ResourceStatus};
+use crate::io::{
+    Cqe, IoError, MAX_OPS, Op, OpKind, RawHandle, ResourceEnd, ResourceIndex, Sqe, Token,
+};
 use crate::port::Output;
 
 /// The most `io_status` records written in one cycle.
 const STATUS_PER_CYCLE: usize = 16;
-/// The most routes one op slot queues between drains: its SQ share of two
-/// lowered records, a quiesce cancel, a close for the handle its completion
-/// opened, and a close when its member drains.
-const ROUTES_PER_SLOT: usize = 5;
-/// The most completions one op slot queues before an io step posts them:
-/// its SQ share of two refused records, and its op's own completion.
-const READY_PER_SLOT: usize = 3;
+/// The SQ records one op slot may have lowered in one pass.
+const LOWERED_PER_SLOT: usize = 2;
+const QUIESCE_CANCEL: usize = 1;
+const CLOSE_OPENED: usize = 1;
+const CLOSE_ON_DRAIN: usize = 1;
+const OWN_COMPLETION: usize = 1;
+/// The most routes one op slot queues between drains.
+const ROUTES_PER_SLOT: usize = LOWERED_PER_SLOT + QUIESCE_CANCEL + CLOSE_OPENED + CLOSE_ON_DRAIN;
+/// The most completions one op slot queues before an io step posts them.
+const READY_PER_SLOT: usize = LOWERED_PER_SLOT + OWN_COMPLETION;
 
 /// What backs a resource.
 pub(crate) enum Backed {
@@ -73,10 +78,10 @@ struct Member {
 }
 
 impl Member {
-    fn new(grants: Vec<(u16, ResourceEnd)>) -> Member {
-        let grant = |&(res, end): &(u16, ResourceEnd)| Handle {
+    fn new(grants: Vec<(ResourceIndex, ResourceEnd)>) -> Member {
+        let grant = |&(res, end): &(ResourceIndex, ResourceEnd)| Handle {
             generation: 0,
-            res,
+            res: res.get(),
             end,
             open: Open::Grant,
         };
@@ -149,14 +154,14 @@ impl Dispatch {
     /// One member per system with a `Cap`, given as the resource and end of
     /// each grant, in order. `wires` holds the wires the resources name.
     pub(crate) fn new(
-        members: Vec<Vec<(u16, ResourceEnd)>>,
+        members: Vec<Vec<(ResourceIndex, ResourceEnd)>>,
         resources: Vec<Resource>,
         wires: Vec<Wire>,
     ) -> Result<Self, BuildError> {
         let ops = members.len() * MAX_OPS;
         if ops > usize::from(u16::MAX) + 1 {
-            let message = format!("{} systems hold a `Cap`, past the limit", members.len());
-            return Err(BuildError::IoSystems { message });
+            let count = members.len();
+            return Err(BuildError::TooManyIoMembers { count });
         }
         let idle = Entry {
             generation: 0,
@@ -169,7 +174,10 @@ impl Dispatch {
         Ok(Self {
             members: members.into_iter().map(Member::new).collect(),
             ops: vec![idle; ops].into(),
-            names: resources.iter().map(|r| resource_name(&r.id)).collect(),
+            names: resources
+                .iter()
+                .map(|r| FrameStr::truncated(&r.id))
+                .collect(),
             resources: resources.into(),
             wires: wires.into(),
             counters: vec![Counters::default(); count].into(),
@@ -199,15 +207,16 @@ impl Dispatch {
     }
 
     fn try_lower(&mut self, m: usize, sqe: Sqe, arena: &Arena) -> Result<(), Refusal> {
-        if sqe.opcode == OpKind::Cancel as u8 {
+        let op = sqe.op();
+        if op == Ok(Op::Cancel) {
             self.cancel(m, sqe.token);
             return Ok(());
         }
-        let index = index(m, sqe.token.slot()).ok_or(Refusal::Drop)?;
+        let index = Self::op_index(m, sqe.token.index()).ok_or(Refusal::Drop)?;
         if self.ops[index].live {
             return Err(Refusal::Drop);
         }
-        let op = sqe.op()?;
+        let op = op?;
         let (res, target) = self.target(m, sqe.handle).ok_or(IoError::Stale)?;
         if op == Op::Close {
             self.close(m, sqe.handle);
@@ -274,7 +283,7 @@ impl Dispatch {
 
     /// Cancels member `m`'s op `token`, once.
     fn cancel(&mut self, m: usize, token: Token) {
-        let Some(index) = index(m, token.slot()) else {
+        let Some(index) = Self::op_index(m, token.index()) else {
             return;
         };
         let entry = &mut self.ops[index];
@@ -296,9 +305,9 @@ impl Dispatch {
     /// no system waits for it.
     pub(crate) fn raise(&mut self, done: OsDone) {
         let index = usize::from(done.id.index());
-        let Some(entry) = self.ops.get_mut(index) else {
-            return;
-        };
+        debug_assert!(index < self.ops.len(), "an id from this dispatch's table");
+        // PANIC Safety: every `OpId` comes from this dispatch's op table.
+        let entry = &mut self.ops[index];
         if !entry.live || entry.generation != done.id.generation() {
             return;
         }
@@ -314,11 +323,7 @@ impl Dispatch {
         if self.members[m].quiescing {
             return;
         }
-        count_cqe(
-            &mut self.counters[usize::from(entry.res)],
-            entry.kind,
-            &result,
-        );
+        self.counters[usize::from(entry.res)].record_completion(entry.kind, &result);
         let cqe = result.map_or_else(|e| Cqe::err(token, e), |n| Cqe::ok(token, n));
         self.ready.push((m, cqe));
     }
@@ -330,11 +335,10 @@ impl Dispatch {
         self.wired = wired;
     }
 
-    /// Moves the ready completions of the members `owns` marks into `out`,
+    /// Moves the ready completions of the members `owns` picks into `out`,
     /// oldest first. The others stay for the io step that posts them.
-    pub(crate) fn take_ready(&mut self, owns: &[bool], out: &mut Vec<(usize, Cqe)>) {
-        let owned = |&(m, _): &(usize, Cqe)| owns.get(m) == Some(&true);
-        out.extend(self.ready.extract_if(.., |r| owned(r)));
+    pub(crate) fn take_ready(&mut self, owns: impl Fn(usize) -> bool, out: &mut Vec<(usize, Cqe)>) {
+        out.extend(self.ready.extract_if(.., |(m, _)| owns(*m)));
     }
 
     /// Maps a new descriptor to a free derived handle of member `m`, or closes
@@ -344,16 +348,16 @@ impl Dispatch {
         let free = member.handles[member.grants..]
             .iter()
             .position(|h| matches!(h.open, Open::Closed));
-        let (Some(at), false) = (free, member.quiescing) else {
+        let (Some(free), false) = (free, member.quiescing) else {
             self.routes.push(Route::Close(fd));
             return Err(IoError::Refused);
         };
-        let at = member.grants + at;
-        let handle = &mut member.handles[at];
+        let index = member.grants + free;
+        let handle = &mut member.handles[index];
         handle.generation = handle.generation.wrapping_add(1);
         handle.res = res;
         handle.open = Open::Derived(fd, class);
-        Ok(RawHandle::new(at as u16, handle.generation).get())
+        Ok(RawHandle::new(index as u16, handle.generation).get())
     }
 
     /// Starts quiescing member `m`: drops its new ops and cancels those in
@@ -376,8 +380,8 @@ impl Dispatch {
             return;
         }
         let grants = member.grants;
-        for (at, handle) in member.handles.iter_mut().enumerate() {
-            let open = match at < grants {
+        for (index, handle) in member.handles.iter_mut().enumerate() {
+            let open = match index < grants {
                 true => Open::Grant,
                 false => Open::Closed,
             };
@@ -399,7 +403,7 @@ impl Dispatch {
 
     /// Whether any op is in flight on a descriptor. An op parked on a wire
     /// names no memory the kernel writes.
-    pub(crate) fn live(&self) -> bool {
+    pub(crate) fn has_kernel_ops_in_flight(&self) -> bool {
         let real =
             |e: &Entry| !matches!(self.resources[usize::from(e.res)].backed, Backed::Wire(_));
         self.ops.iter().any(|e| e.live && real(e))
@@ -411,41 +415,24 @@ impl Dispatch {
         let count = self.counters.len();
         let mut written = 0;
         for step in 0..count {
-            let at = (self.next_status + step) % count;
-            if self.counters[at] == self.reported[at] {
+            let index = (self.next_status + step) % count;
+            if self.counters[index] == self.reported[index] {
                 continue;
             }
-            let status = self.counters[at].status(now, self.names[at]);
+            let status = self.counters[index].status(now, self.names[index]);
             if written == STATUS_PER_CYCLE || out.write(&status).is_err() {
-                self.next_status = at;
+                self.next_status = index;
                 return;
             }
-            self.reported[at] = self.counters[at];
+            self.reported[index] = self.counters[index];
             written += 1;
         }
     }
-}
 
-/// The op table index of member `m`'s slot, if the slot is one.
-fn index(m: usize, slot: u16) -> Option<usize> {
-    let slot = usize::from(slot);
-    (slot < MAX_OPS).then_some(m * MAX_OPS + slot)
-}
-
-/// Counts one finished op: its result, and the bytes it moved.
-fn count_cqe(counters: &mut Counters, kind: OpKind, result: &Result<u32, IoError>) {
-    counters.completed += 1;
-    let byte_count = match result {
-        Ok(n) => u64::from(*n),
-        Err(_) => {
-            counters.failed += 1;
-            0
-        }
-    };
-    match kind {
-        OpKind::Read | OpKind::Recv => counters.bytes_in += byte_count,
-        OpKind::Write | OpKind::Send | OpKind::SendTo => counters.bytes_out += byte_count,
-        _ => {}
+    /// The op table index of member `m`'s slot, if the slot is one.
+    fn op_index(m: usize, slot: u16) -> Option<usize> {
+        let slot = usize::from(slot);
+        (slot < MAX_OPS).then_some(m * MAX_OPS + slot)
     }
 }
 
@@ -460,10 +447,10 @@ mod proofs {
         let (m, slot): (u16, u16) = (kani::any(), kani::any());
         kani::assume(usize::from(m) < (usize::from(u16::MAX) + 1) / MAX_OPS);
         let m = usize::from(m);
-        if let Some(at) = index(m, slot) {
-            assert_eq!((at / MAX_OPS, at % MAX_OPS), (m, usize::from(slot)));
-            let id = OpId::new(at as u16, kani::any());
-            assert_eq!(usize::from(id.index()), at);
+        if let Some(index) = Dispatch::op_index(m, slot) {
+            assert_eq!((index / MAX_OPS, index % MAX_OPS), (m, usize::from(slot)));
+            let id = OpId::new(index as u16, kani::any());
+            assert_eq!(usize::from(id.index()), index);
         }
     }
 }

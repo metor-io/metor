@@ -61,7 +61,7 @@ fn dropped_pending_frees_its_slot_when_it_lands() {
     let mut lb = Loopback::new();
     drop(lb.init());
     let uart = uart(&lb);
-    drop(uart.configure(TtyConfig::new(9600)));
+    drop(uart.configure(TtyConfig::new(Baud::B9600)));
     assert_eq!(lb.io.in_flight(), 1);
     let [sqe] = lb.submitted()[..] else { panic!() };
     lb.complete(Cqe::ok(sqe.token, 0));
@@ -145,7 +145,7 @@ fn stale_generation_is_ignored() {
     let uart = uart(&lb);
     let mut first = uart.flush(TtyQueue::Input);
     let [sqe] = lb.submitted()[..] else { panic!() };
-    let stale = Token::new(sqe.token.slot(), sqe.token.generation().wrapping_sub(1));
+    let stale = Token::new(sqe.token.index(), sqe.token.generation().wrapping_sub(1));
     lb.complete(Cqe::ok(stale, 0));
     assert!(first.poll().is_none());
     lb.complete(Cqe::err(sqe.token, IoError::Os(Errno::EIO)));

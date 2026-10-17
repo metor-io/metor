@@ -5,6 +5,8 @@ use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::Frame;
+#[cfg(all(feature = "host", unix))]
+use crate::io::{IoError, OpKind};
 
 /// One resource's op counts, as `io_complete` reports them.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
@@ -38,6 +40,23 @@ pub(crate) struct Counters {
 
 #[cfg(all(feature = "host", unix))]
 impl Counters {
+    /// Counts one finished op of `kind`: its result, and the bytes it moved.
+    pub(crate) fn record_completion(&mut self, kind: OpKind, result: &Result<u32, IoError>) {
+        self.completed += 1;
+        let byte_count = match result {
+            Ok(n) => u64::from(*n),
+            Err(_) => {
+                self.failed += 1;
+                0
+            }
+        };
+        match kind {
+            OpKind::Read | OpKind::Recv => self.bytes_in += byte_count,
+            OpKind::Write | OpKind::Send | OpKind::SendTo => self.bytes_out += byte_count,
+            _ => {}
+        }
+    }
+
     pub(crate) fn status(&self, now: Timestamp, resource: FrameStr<64>) -> ResourceStatus {
         ResourceStatus {
             timestamp: now,
@@ -50,14 +69,4 @@ impl Counters {
             dropped: self.dropped,
         }
     }
-}
-
-/// `id`, cut to the longest whole-character prefix a `FrameStr<64>` holds.
-#[cfg(all(feature = "host", unix))]
-pub(crate) fn resource_name(id: &str) -> FrameStr<64> {
-    let mut end = id.len().min(FrameStr::<64>::CAPACITY);
-    while !id.is_char_boundary(end) {
-        end -= 1;
-    }
-    FrameStr::new(&id[..end]).unwrap_or_default()
 }
