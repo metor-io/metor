@@ -7,15 +7,17 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 use core::time::Duration;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::future::{Future, poll_fn};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::Arc;
 
+use serde::Deserialize;
 use tracing_subscriber::layer::SubscriberExt;
 
-use super::cargo::{lookup, read_toml, string};
+use super::cargo::read_toml;
 use super::pack_dev::{PackDevError, pack_dev};
 use crate::coordinator::{
     BuildError, BuildOptions, Clock, Coordinator, EndReason, SystemTable, WallRate,
@@ -196,17 +198,15 @@ pub fn prepare(target: Option<&Path>) -> Result<DeploymentConfig, RunError> {
 /// A dev pack is a `[tool.uv.sources]` path that is both a cargo crate and a
 /// metor pack.
 pub fn dev_packs(target_dir: &Path) -> Vec<PathBuf> {
-    let Ok(pyproject) = read_toml(&target_dir.join("pyproject.toml")) else {
+    let Ok(project) = read_toml::<UvProject>(&target_dir.join("pyproject.toml")) else {
         return Vec::new();
     };
-    let Some(sources) =
-        lookup(&pyproject, &["tool", "uv", "sources"]).and_then(toml::Value::as_table)
-    else {
-        return Vec::new();
-    };
-    let mut packs: Vec<_> = sources
-        .values()
-        .filter_map(|source| string(source, &["path"]))
+    let mut packs: Vec<_> = project
+        .tool
+        .uv
+        .sources
+        .into_values()
+        .filter_map(|source| source.path)
         .map(|path| target_dir.join(path))
         .filter(|root| is_dev_pack(root))
         .filter_map(|root| root.canonicalize().ok())
@@ -218,8 +218,51 @@ pub fn dev_packs(target_dir: &Path) -> Vec<PathBuf> {
 
 fn is_dev_pack(root: &Path) -> bool {
     root.join("Cargo.toml").is_file()
-        && read_toml(&root.join("pyproject.toml"))
-            .is_ok_and(|pyproject| lookup(&pyproject, &["tool", "metor", "pack"]).is_some())
+        && read_toml::<PackProject>(&root.join("pyproject.toml"))
+            .is_ok_and(|project| project.tool.metor.pack.is_some())
+}
+
+/// The `[tool.uv.sources]` of a target's `pyproject.toml`.
+#[derive(Deserialize)]
+struct UvProject {
+    #[serde(default)]
+    tool: UvTool,
+}
+
+#[derive(Default, Deserialize)]
+struct UvTool {
+    #[serde(default)]
+    uv: Uv,
+}
+
+#[derive(Default, Deserialize)]
+struct Uv {
+    #[serde(default)]
+    sources: BTreeMap<String, UvSource>,
+}
+
+/// One uv source. Only a `path` source can be a dev pack.
+#[derive(Deserialize)]
+struct UvSource {
+    path: Option<PathBuf>,
+}
+
+/// The `[tool.metor.pack]` table of a `pyproject.toml`, if it has one.
+#[derive(Deserialize)]
+struct PackProject {
+    #[serde(default)]
+    tool: PackTool,
+}
+
+#[derive(Default, Deserialize)]
+struct PackTool {
+    #[serde(default)]
+    metor: PackMetor,
+}
+
+#[derive(Default, Deserialize)]
+struct PackMetor {
+    pack: Option<toml::Table>,
 }
 
 /// Runs the target file as a script and reads the deployment it emitted.
