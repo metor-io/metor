@@ -14,7 +14,7 @@ use super::DeploymentConfig;
 use crate::FrameStr;
 use crate::coordinator::{SystemConfig, SystemTable};
 use crate::def::{DefCx, DefError};
-use crate::dl::slot::{Candidate, SlotParams, Source, Stored, same_ports};
+use crate::dl::slot::{Candidate, SlotParams, Source, Stored};
 use crate::dl::{Pack, PackRef, SLOT_TYPE, store};
 use crate::pack::def::DefCxOwned;
 use crate::system::SystemDef;
@@ -122,7 +122,7 @@ impl SlotCx {
         for candidate in &mut params.allow {
             let def = self.resolve(candidate, store)?;
             match &first {
-                Some((first, first_def)) if !same_ports(first_def, &def) => {
+                Some((first, first_def)) if !first_def.same_ports(&def) => {
                     return Err(DeployError::SlotContract {
                         slot: self.slot.clone(),
                         first: first.clone(),

@@ -484,7 +484,7 @@ fn next_slot(libs: &Path) -> SystemConfig {
     SystemConfig {
         params: json!({ "allow": [unresolved("down", "count_down", libs)] }),
         adapter: Some(Adapter::Channel(ChannelConfig {
-            name: "next".into(),
+            name: metor_fsw_3::ChannelName::try_from("next".to_string()).expect("a short name"),
             start: RunState::Stopped,
         })),
         inputs: vec![InputConfig::new("input", "mode", "output")],
