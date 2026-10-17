@@ -238,7 +238,9 @@ class Target:
         if self.seed:
             coordinator["seed"] = self.seed
         if self._resources:
-            coordinator["resources"] = [self._resource(r) for r in self._resources.values()]
+            coordinator["resources"] = {
+                name: self._resource(r) for name, r in self._resources.items()
+            }
         return {
             "packs": [
                 pack.to_json()
@@ -267,7 +269,7 @@ class Target:
         return any(type(system)._caps for _, system, _ in self._systems + self._sims)
 
     def _resource(self, resource: ResourceHandle) -> dict[str, Any]:
-        """Returns a resource's entry. A sim resource names the system and
+        """Returns a resource's backing. A sim resource names the system and
         parameter holding each of its ends, and raises `ConfigError` if either
         end has no holder."""
         if not isinstance(resource.kind, SimKind):
@@ -281,7 +283,7 @@ class Target:
             if end not in ends:
                 raise ConfigError(f"sim resource `{resource.name}` has no holder on its {end} end")
         sim = {"kind": resource.kind._key, "host": ends["host"], "device": ends["device"]}
-        return {"id": resource.name, "backing": {"sim": sim}}
+        return {"sim": sim}
 
     def _check_commands(self) -> None:
         """Raises `ConfigError` if the target has channels but no command

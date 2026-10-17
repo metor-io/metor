@@ -109,7 +109,7 @@ class ResourceTests(unittest.TestCase):
         config = coordinator(fsw)
         self.assertEqual(
             config["resources"],
-            [{"id": "gps1", "backing": {"real": {"tty": {"path": "/dev/ttyTHS0", "baud": 9600}}}}],
+            {"gps1": {"real": {"tty": {"path": "/dev/ttyTHS0", "baud": 9600}}}},
         )
         gps, submit, complete = config["systems"]
         self.assertEqual(gps["grants"], {"uart": "gps1"})
@@ -200,8 +200,8 @@ class SimTests(unittest.TestCase):
             line = fsw.resource("line", kind)
             fsw.add("a", _holder(kind.interface, line))
             fsw.sim("b", _holder(kind.interface, line.device))
-            (resource,) = coordinator(fsw)["resources"]
-            self.assertEqual(resource["backing"]["sim"]["kind"], key)
+            (backing,) = coordinator(fsw)["resources"].values()
+            self.assertEqual(backing["sim"]["kind"], key)
             target_mod._targets.clear()
 
     def test_sim_resource_names_its_holders(self) -> None:
@@ -215,18 +215,15 @@ class SimTests(unittest.TestCase):
         self.assertNotIn("grants", model)
         self.assertEqual(
             config["resources"],
-            [
-                {
-                    "id": "gps1",
-                    "backing": {
-                        "sim": {
-                            "kind": "uart",
-                            "host": {"system": "gps", "param": "uart"},
-                            "device": {"system": "model", "param": "uart"},
-                        }
-                    },
+            {
+                "gps1": {
+                    "sim": {
+                        "kind": "uart",
+                        "host": {"system": "gps", "param": "uart"},
+                        "device": {"system": "model", "param": "uart"},
+                    }
                 }
-            ],
+            },
         )
 
     def test_sim_resource_held_on_one_end_is_refused(self) -> None:

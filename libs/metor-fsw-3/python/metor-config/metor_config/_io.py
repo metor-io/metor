@@ -187,4 +187,5 @@ class ResourceHandle:
         return ResourceHandle(self.name, self.kind, self.target, "device")
 
     def to_json(self) -> dict[str, Any]:
-        return {"id": self.name, "backing": self.kind.to_json()}
+        """The resource's backing, as the target's `resources` map holds it."""
+        return self.kind.to_json()
