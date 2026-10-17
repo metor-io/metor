@@ -273,7 +273,7 @@ const LOG_RING: usize = 1 << 16;
 ///
 /// If `corrupt` is set, the record's length is written as `u32::MAX`.
 fn record_stores(record: &[u8], corrupt: bool) -> String {
-    let (config, _) = mirror_config(RING, 2, 1).expect("fits");
+    let config = mirror_config(RING, 2, 1).expect("fits");
     let ring = RingBuffer::create_in_memory(config).expect("a valid ring config");
     let _host = ring.view(NoWake).expect("a free reader slot");
     let before = region_bytes(&ring);
@@ -416,7 +416,7 @@ fn test_each_end() {
 
 #[test]
 fn test_corrupt_input_ring_ends_the_step() {
-    let cursor = slot_cursor(mirror_config(RING, 2, 1).expect("fits").0);
+    let cursor = slot_cursor(mirror_config(RING, 2, 1).expect("fits"));
     let at = format!("(i32.add (global.get $in) (i32.const {cursor}))");
     let mut rig = rig(&format!("(i64.store {at} (i64.const -2)) i32.const 0"));
     rig.execute();

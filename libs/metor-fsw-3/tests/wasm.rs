@@ -367,7 +367,7 @@ fn test_panic_reports_trap_and_message() {
 #[test]
 fn test_spin_fails_and_frees_its_producer() {
     let mut config = pipeline("spin");
-    config.ring_depth = 2;
+    config.ring_depth = core::num::NonZeroUsize::new(2).expect("nonzero");
     config.systems[2].inputs[0].from = vec![PortRef::new("source", "output")];
     let (mut coordinator, seen) = build(config, &wasm_pack());
     run(&mut coordinator, 1);

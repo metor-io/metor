@@ -343,8 +343,10 @@ fn guest_ring(
     capacity: usize,
     readers: usize,
 ) -> Result<(GuestRing, RingBuffer), ParamError> {
-    let (config, len) = mirror_config(capacity, COPY_FACTOR, readers)?;
-    let len = u32::try_from(len).map_err(|_| ParamError::MirrorTooLarge { capacity })?;
+    let too_large = || ParamError::MirrorTooLarge { capacity };
+    let config = mirror_config(capacity, COPY_FACTOR, readers)?;
+    let len = config.region_len().map_err(|_| too_large())?;
+    let len = u32::try_from(len).map_err(|_| too_large())?;
     let offset = allocated(guest, len, PAYLOAD_ALIGNMENT as u32)?;
     let base = guest
         .region(offset, len as usize)
