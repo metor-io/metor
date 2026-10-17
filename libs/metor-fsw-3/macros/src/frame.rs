@@ -1,45 +1,13 @@
 use convert_case::{Case, Casing};
+use darling::FromDeriveInput;
 use darling::ast;
-use darling::{FromDeriveInput, FromField};
 use metor_component_derive_impl::{
-    Field, Input, StructInput, as_vtable_impl, componentize_impl, decomponentize_impl,
-    metadatatize_impl,
+    Field, StructInput, componentize_impl, decomponentize_impl, struct_as_vtable_impl,
+    struct_metadatatize_impl,
 };
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
-
-/// One field of the frame struct, read from `#[frame(..)]` attributes.
-///
-/// It converts into the shared derive-impl `Field`, which drives the four
-/// component derives.
-#[derive(FromField)]
-#[darling(attributes(frame))]
-struct FrameField {
-    ident: Option<Ident>,
-    ty: syn::Type,
-    component_id: Option<String>,
-    #[darling(default)]
-    timestamp: bool,
-    #[darling(default)]
-    nest: bool,
-    #[darling(default)]
-    skip: Option<bool>,
-}
-
-impl From<FrameField> for Field {
-    fn from(f: FrameField) -> Self {
-        Field {
-            ident: f.ident,
-            ty: f.ty,
-            component_id: f.component_id,
-            timestamp: f.timestamp,
-            nest: f.nest,
-            max: None,
-            skip: f.skip,
-        }
-    }
-}
 
 /// The struct being derived, with its fields, `#[frame(name = "..")]`, and
 /// `#[frame(depth = N)]`.
@@ -48,7 +16,7 @@ impl From<FrameField> for Field {
 struct FrameInput {
     ident: Ident,
     generics: Generics,
-    data: ast::Data<(), FrameField>,
+    data: ast::Data<(), Field>,
     name: Option<String>,
     depth: Option<usize>,
 }
@@ -64,14 +32,7 @@ pub fn frame(input: TokenStream) -> TokenStream {
     };
     // PANIC Safety: darling's `supports(struct_named)` rejects every other
     // shape before this point.
-    let fields = raw
-        .data
-        .take_struct()
-        .expect("named struct")
-        .fields
-        .into_iter()
-        .map(Field::from)
-        .collect::<Vec<_>>();
+    let fields = raw.data.take_struct().expect("named struct").fields;
 
     let fsw = crate::fsw_crate();
     let proto = quote! { #fsw::metor_proto };
@@ -83,21 +44,22 @@ pub fn frame(input: TokenStream) -> TokenStream {
         .depth
         .map(|depth| quote! { const DEPTH: usize = #depth; });
 
-    let timestamp_body = match fields.iter().find(|f| f.timestamp) {
-        Some(f) => {
-            // PANIC Safety: a named struct's fields all have idents.
-            let id = f.ident.as_ref().expect("named field");
-            quote! { self.#id }
-        }
-        None => {
-            return syn::Error::new_spanned(
-                &raw.ident,
-                "#[derive(Frame)] requires a #[frame(timestamp)] field",
-            )
+    let mut stamps = fields.iter().filter(|f| f.timestamp);
+    let Some(stamp) = stamps.next() else {
+        let message = "#[derive(Frame)] requires a #[frame(timestamp)] field";
+        return syn::Error::new_spanned(&raw.ident, message)
             .to_compile_error()
             .into();
-        }
     };
+    if let Some(extra) = stamps.next() {
+        let message = "only one field can be marked #[frame(timestamp)]";
+        return syn::Error::new_spanned(&extra.ident, message)
+            .to_compile_error()
+            .into();
+    }
+    // PANIC Safety: a named struct's fields all have idents.
+    let stamp = stamp.ident.as_ref().expect("named field");
+    let timestamp_body = quote! { self.#stamp };
 
     let (ident, generics) = (raw.ident.clone(), raw.generics.clone());
     let struct_input = StructInput {
@@ -109,9 +71,8 @@ pub fn frame(input: TokenStream) -> TokenStream {
     };
     let componentize = componentize_impl(&struct_input, &fsw);
     let decomponentize = decomponentize_impl(&struct_input, &fsw);
-    let input = Input::Struct(struct_input);
-    let as_vtable = as_vtable_impl(&input, Some(frame_id), &fsw);
-    let metadatatize = metadatatize_impl(&input, &fsw);
+    let as_vtable = struct_as_vtable_impl(&struct_input, Some(frame_id), &fsw);
+    let metadatatize = struct_metadatatize_impl(&struct_input, &fsw);
 
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     quote! {
@@ -126,8 +87,7 @@ pub fn frame(input: TokenStream) -> TokenStream {
             const ALIGN: usize = ::core::mem::align_of::<Self>();
             #depth
             type Read<'a> = &'a Self where Self: 'a;
-            fn encode<'a>(&'a self, _buf: &'a mut [u8])
-                -> Result<&'a [u8], #fsw::EncodeError> {
+            fn encode<'a>(&'a self, _buf: &'a mut [u8]) -> Result<&'a [u8], #fsw::EncodeError> {
                 Ok(#fsw::zerocopy::IntoBytes::as_bytes(self))
             }
             fn decode(bytes: &[u8]) -> Result<&Self, #fsw::DecodeError> {
@@ -139,7 +99,7 @@ pub fn frame(input: TokenStream) -> TokenStream {
             fn schema() -> #fsw::record::RecordSchema {
                 #fsw::record::RecordSchema::frame::<Self>(Self::NAME)
             }
-            fn schema_at(root: &str) -> #fsw::record::RecordSchema {
+            fn schema_with_root(root: &str) -> #fsw::record::RecordSchema {
                 #fsw::record::RecordSchema::frame::<Self>(root)
             }
         }

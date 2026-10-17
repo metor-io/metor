@@ -15,9 +15,9 @@ mod field;
 mod input;
 mod metadatatize;
 
-pub use as_vtable::as_vtable_impl;
+pub use as_vtable::{as_vtable_impl, enum_as_vtable_impl, struct_as_vtable_impl};
 pub use componentize::componentize_impl;
 pub use decomponentize::decomponentize_impl;
 pub use field::Field;
 pub use input::{EnumInput, Input, StructInput};
-pub use metadatatize::metadatatize_impl;
+pub use metadatatize::{enum_metadatatize_impl, metadatatize_impl, struct_metadatatize_impl};

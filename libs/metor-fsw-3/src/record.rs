@@ -24,19 +24,15 @@ pub trait Record {
     const ID: ComponentId = ComponentId::new(Self::NAME);
     /// The largest encoded size of this record, in bytes.
     const MAX_LEN: usize;
+    /// The alignment a record's bytes need in the ring.
+    ///
+    /// An encoded message decodes from any address. A frame is borrowed in
+    /// place, so `#[derive(Frame)]` sets this to the frame's own alignment.
     const ALIGN: usize = 1;
     /// How many records a producer expects to write per cycle.
     ///
     /// A ring holds `DEPTH * ring_depth` records.
     const DEPTH: usize = 1;
-    /// The type a read returns.
-    ///
-    /// A frame is borrowed straight from the ring. Other records are decoded
-    /// into an owned value.
-    type Read<'a>: Borrow<Self>
-    where
-        Self: 'a;
-
     /// Returns the record's timestamp, if it has one.
     ///
     /// When several producers feed one input, [`Input::latest`] uses the
@@ -52,6 +48,14 @@ pub trait Record {
     /// Returns the encoded bytes, which may borrow from `buf` or from `self`.
     fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError>;
 
+    /// The type a read returns.
+    ///
+    /// A frame is borrowed straight from the ring. Other records are decoded
+    /// into an owned value.
+    type Read<'a>: Borrow<Self>
+    where
+        Self: 'a;
+
     /// Decodes one record from `bytes`.
     fn decode(bytes: &[u8]) -> Result<Self::Read<'_>, DecodeError>;
 
@@ -64,7 +68,7 @@ pub trait Record {
     ///
     /// A frame names its fields under `root`. A message has no field paths, so
     /// it announces the same schema as [`Record::schema`].
-    fn schema_at(_root: &str) -> RecordSchema {
+    fn schema_with_root(_root: &str) -> RecordSchema {
         Self::schema()
     }
 }
@@ -430,8 +434,8 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_schema_at_root() {
-        let schema = Imu::schema_at("cube_sat.plant.imu");
+    fn test_frame_schema_with_root() {
+        let schema = Imu::schema_with_root("cube_sat.plant.imu");
         assert_eq!(component_names(&schema), vec!["cube_sat.plant.imu.sample"]);
         let RecordSchema::Frame { vtable, metadata } = &schema else {
             panic!("a frame announces a vtable")

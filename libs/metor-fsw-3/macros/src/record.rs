@@ -14,9 +14,11 @@ struct RecordField {
     ident: Option<Ident>,
     #[darling(default)]
     timestamp: bool,
+    ty: syn::Type,
 }
 
-/// The type being derived, with its `#[record(..)]` options.
+/// The struct being derived, with its `#[record(..)]` options. Only structs
+/// can be records; darling rejects enums and unions.
 #[derive(FromDeriveInput)]
 #[darling(attributes(record), supports(struct_any))]
 struct RecordInput {
@@ -46,17 +48,33 @@ pub fn record(input: TokenStream) -> TokenStream {
     let depth = raw
         .depth
         .map(|depth| quote! { const DEPTH: usize = #depth; });
-    let timestamp = raw.data.as_ref().take_struct().and_then(|fields| {
-        fields
-            .into_iter()
-            .find(|f| f.timestamp)
-            .and_then(|f| f.ident.as_ref())
-            .map(|id| {
-                quote! {
-                    fn timestamp(&self) -> Option<#fsw::Timestamp> { Some(self.#id) }
-                }
-            })
-    });
+    // PANIC Safety: darling's `supports(struct_any)` rejects every other
+    // shape before this point.
+    let fields = raw.data.as_ref().take_struct().expect("a struct").fields;
+    let mut stamps = fields.into_iter().filter(|f| f.timestamp);
+    let stamp = stamps.next();
+    if let Some(extra) = stamps.next() {
+        let message = "only one field can be marked #[record(timestamp)]";
+        return syn::Error::new_spanned(&extra.ty, message)
+            .to_compile_error()
+            .into();
+    }
+    let timestamp = match stamp {
+        None => None,
+        Some(RecordField {
+            ident: Some(id), ..
+        }) => Some(quote! {
+            fn timestamp(&self) -> Option<#fsw::Timestamp> { Some(self.#id) }
+        }),
+        Some(RecordField {
+            ident: None, ty, ..
+        }) => {
+            let message = "#[record(timestamp)] needs a named field";
+            return syn::Error::new_spanned(ty, message)
+                .to_compile_error()
+                .into();
+        }
+    };
     let ident = &raw.ident;
     let (impl_generics, ty_generics, where_clause) = raw.generics.split_for_impl();
     quote! {
@@ -66,8 +84,7 @@ pub fn record(input: TokenStream) -> TokenStream {
             #depth
             #timestamp
             type Read<'a> = Self where Self: 'a;
-            fn encode<'a>(&'a self, buf: &'a mut [u8])
-                -> Result<&'a [u8], #fsw::EncodeError> {
+            fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], #fsw::EncodeError> {
                 #fsw::record::postcard::encode(self, buf)
             }
             fn decode(bytes: &[u8]) -> Result<Self, #fsw::DecodeError> {
