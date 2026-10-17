@@ -17,21 +17,17 @@ use metor_fsw_3::{
     Adapter, ChannelConfig, DefCx, DlPack, Frame, Input, InputConfig, Output, Pack, PortRef,
     RunState, SystemConfig, SystemTable, Timestamp, system,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
 fn open_dylib() -> DlPack {
     // SAFETY: the fixture is a metor-fsw-3 pack this workspace just built.
     unsafe { DlPack::open(fixture_lib()) }.expect("the fixture opens")
 }
 
-fn value(value: impl serde::Serialize) -> Value {
-    serde_json::to_value(value).expect("encodes")
-}
-
 #[test]
 fn test_descriptor_matches_dylib() {
     let (wasm, dylib) = (open_wasm(), open_dylib());
-    assert_eq!(value(wasm.descriptor()), value(dylib.descriptor()));
+    assert_eq!(wasm.descriptor(), dylib.descriptor());
     let kinds: Vec<_> = wasm.descriptor().systems.iter().map(|s| s.kind).collect();
     assert!(kinds.contains(&metor_fsw_3::SystemKind::Async));
     assert!(kinds.contains(&metor_fsw_3::SystemKind::Sequence));

@@ -36,7 +36,6 @@ fn candidate(path: &str) -> Candidate {
             hash: blake3::hash(b"lib"),
             def: def_with(Vec::new()),
             kind: PackKind::Dylib,
-            limits: Limits::default(),
         },
     }
 }

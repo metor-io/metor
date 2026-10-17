@@ -1,8 +1,10 @@
 //! Writes the ABI's arguments into a guest's memory, in wasm32 layout.
 
+use zerocopy::{FromZeros, IntoBytes};
+
 use crate::dl::PackError;
 use crate::dl::codec::DESCRIPTOR_CAPACITY;
-use crate::pack::raw::{WASM32_RAW_RING, WASM32_RAW_SLICE};
+use crate::pack::raw::{Wasm32RawRing, Wasm32RawSlice};
 
 use super::DEFAULT_SETUP_FUEL;
 use super::guest::{Guest, Out, WasmError};
@@ -17,14 +19,21 @@ pub(super) struct GuestRing {
     pub(super) len: u32,
 }
 
+/// One block of guest memory that [`Args`] frees when it drops.
+#[derive(Clone, Copy, Debug)]
+struct Allocation {
+    offset: u32,
+    len: u32,
+    align: u32,
+}
+
 /// Writes one call's arguments into guest memory.
 ///
 /// Arguments are allocated with the guest's own allocator, using setup fuel.
 /// They are all freed when `Args` drops.
 pub(super) struct Args<'g> {
     guest: &'g mut Guest,
-    /// Each allocation, as `(offset, len, align)`.
-    held: Vec<(u32, u32, u32)>,
+    held: Vec<Allocation>,
 }
 
 impl<'g> Args<'g> {
@@ -47,56 +56,58 @@ impl<'g> Args<'g> {
         if len == 0 {
             return Ok(0);
         }
-        let offset = allocated(self.guest, len, align)?;
-        self.held.push((offset, len, align));
+        let offset = self.guest.alloc_nonnull(len, align)?;
+        self.held.push(Allocation { offset, len, align });
         Ok(offset)
     }
 
     /// Copies `bytes` into guest memory and returns their offset.
     fn copy(&mut self, bytes: &[u8], align: u32) -> Result<u32, PackError> {
-        let offset = self.alloc(len(bytes.len())?, align)?;
+        let offset = self.alloc(guest_usize(bytes.len())?, align)?;
         self.guest.write(offset, bytes)?;
         Ok(offset)
     }
 
     /// Writes a `RawSlice` of `len` elements at `ptr` and returns its offset.
     pub(super) fn slice(&mut self, ptr: u32, len: u32) -> Result<u32, PackError> {
-        let offset = self.alloc(WASM32_RAW_SLICE as u32, WASM32_USIZE)?;
-        self.guest.write(offset, &raw_slice(ptr, len))?;
-        Ok(offset)
+        self.copy(Wasm32RawSlice::new(ptr, len).as_bytes(), WASM32_USIZE)
     }
 
     /// Copies `bytes` into guest memory and returns the offset of a `RawSlice`
     /// over them.
     pub(super) fn byte_slice(&mut self, bytes: &[u8]) -> Result<u32, PackError> {
         let ptr = self.copy(bytes, 1)?;
-        self.slice(ptr, len(bytes.len())?)
+        self.slice(ptr, guest_usize(bytes.len())?)
     }
 
     /// Writes an array of `RawRing`s with no owner.
     ///
     /// Returns the array's offset and length.
     pub(super) fn rings(&mut self, rings: &[GuestRing]) -> Result<(u32, u32), PackError> {
-        let encoded: Vec<u8> = rings.iter().flat_map(|ring| raw_ring(*ring)).collect();
-        let ptr = self.copy(&encoded, WASM32_USIZE)?;
-        Ok((ptr, len(rings.len())?))
+        let encoded: Vec<Wasm32RawRing> = rings
+            .iter()
+            .map(|ring| Wasm32RawRing::new(ring.offset, ring.len))
+            .collect();
+        let ptr = self.copy(encoded.as_bytes(), WASM32_USIZE)?;
+        Ok((ptr, guest_usize(rings.len())?))
     }
 
     /// Writes a `RawRing` over `region`, or an empty one, and returns its
-    /// offset, for an export to write a region back into.
-    pub(super) fn table(&mut self, region: Option<GuestRing>) -> Result<u32, PackError> {
-        let offset = self.alloc(WASM32_RAW_RING as u32, WASM32_USIZE)?;
-        if let Some(region) = region {
-            self.guest.write(offset, &raw_ring(region))?;
-        }
-        Ok(offset)
+    /// offset, for an export to write the system's IO arena back into.
+    pub(super) fn io_arena(&mut self, region: Option<GuestRing>) -> Result<u32, PackError> {
+        let ring = region.map_or_else(Wasm32RawRing::new_zeroed, |region| {
+            Wasm32RawRing::new(region.offset, region.len)
+        });
+        self.copy(ring.as_bytes(), WASM32_USIZE)
     }
 
     /// Reads the region of the `RawRing` at `offset`.
     pub(super) fn ring(&self, offset: u32) -> Result<GuestRing, PackError> {
+        let mut ring = Wasm32RawRing::new_zeroed();
+        self.guest.read(offset, ring.as_mut_bytes())?;
         Ok(GuestRing {
-            offset: read_u32(self.guest, offset)?,
-            len: read_u32(self.guest, offset.saturating_add(WASM32_USIZE))?,
+            offset: ring.base.get(),
+            len: ring.len.get(),
         })
     }
 
@@ -104,12 +115,12 @@ impl<'g> Args<'g> {
     ///
     /// Returns the offset of a `RawSlice` over that array.
     pub(super) fn ports(&mut self, ports: &[(u32, u32)]) -> Result<u32, PackError> {
-        let encoded: Vec<u8> = ports
+        let encoded: Vec<Wasm32RawSlice> = ports
             .iter()
-            .flat_map(|&(ptr, len)| raw_slice(ptr, len))
+            .map(|&(ptr, len)| Wasm32RawSlice::new(ptr, len))
             .collect();
-        let ptr = self.copy(&encoded, WASM32_USIZE)?;
-        self.slice(ptr, len(ports.len())?)
+        let ptr = self.copy(encoded.as_bytes(), WASM32_USIZE)?;
+        self.slice(ptr, guest_usize(ports.len())?)
     }
 
     /// Allocates an output buffer for an export to write into.
@@ -117,7 +128,7 @@ impl<'g> Args<'g> {
     /// The buffer holds [`DESCRIPTOR_CAPACITY`] bytes, plus a slot for the
     /// length the export wrote.
     pub(super) fn out(&mut self) -> Result<Out, PackError> {
-        let capacity = len(DESCRIPTOR_CAPACITY)?;
+        let capacity = guest_usize(DESCRIPTOR_CAPACITY)?;
         Ok(Out {
             dst: self.alloc(capacity, 1)?,
             capacity,
@@ -127,76 +138,46 @@ impl<'g> Args<'g> {
 
     /// Reads back the bytes an export wrote into `out`.
     ///
-    /// Returns `None` if the export reported writing more than the buffer
-    /// holds.
-    pub(super) fn written(&self, out: Out) -> Result<Option<Vec<u8>>, PackError> {
-        let written = read_u32(self.guest, out.written)?;
+    /// Fails if the export reported writing more than the buffer holds.
+    pub(super) fn written(&self, out: Out) -> Result<Vec<u8>, PackError> {
+        let written = self.guest.read_u32(out.written)?;
         if written > out.capacity {
-            return Ok(None);
+            return Err(WasmError::TooLarge(written as usize).into());
         }
         let mut bytes = vec![0; written as usize];
         self.guest.read(out.dst, &mut bytes)?;
-        Ok(Some(bytes))
+        Ok(bytes)
     }
 
     /// Reads the bytes of the `RawSlice` at `offset`.
     ///
     /// Fails if the slice is longer than [`DESCRIPTOR_CAPACITY`].
     pub(super) fn slice_bytes(&self, offset: u32) -> Result<Vec<u8>, PackError> {
-        let ptr = read_u32(self.guest, offset)?;
-        let len = read_u32(self.guest, offset.saturating_add(WASM32_USIZE))? as usize;
+        let mut slice = Wasm32RawSlice::new_zeroed();
+        self.guest.read(offset, slice.as_mut_bytes())?;
+        let len = slice.len.get() as usize;
         if len > DESCRIPTOR_CAPACITY {
             return Err(WasmError::TooLarge(len).into());
         }
         let mut bytes = vec![0; len];
-        self.guest.read(ptr, &mut bytes)?;
+        self.guest.read(slice.ptr.get(), &mut bytes)?;
         Ok(bytes)
     }
 }
 
 impl Drop for Args<'_> {
     fn drop(&mut self) {
-        for &(offset, len, align) in &self.held {
+        for held in &self.held {
             // A trap while freeing is ignored. The guest is already unusable
             // to the caller.
-            let _ = self.guest.free(offset, len, align, DEFAULT_SETUP_FUEL);
+            let _ = self
+                .guest
+                .free(held.offset, held.len, held.align, DEFAULT_SETUP_FUEL);
         }
     }
 }
 
-/// Allocates `len` bytes with the guest's allocator, using setup fuel.
-///
-/// Fails if the allocator returns the null offset.
-pub(super) fn allocated(guest: &mut Guest, len: u32, align: u32) -> Result<u32, PackError> {
-    match guest.alloc(len, align, DEFAULT_SETUP_FUEL)? {
-        0 => Err(WasmError::Alloc(len).into()),
-        offset => Ok(offset),
-    }
-}
-
 /// Converts a length to a guest `usize`, failing if it does not fit.
-fn len(len: usize) -> Result<u32, PackError> {
+pub(super) fn guest_usize(len: usize) -> Result<u32, PackError> {
     u32::try_from(len).map_err(|_| WasmError::TooLarge(len).into())
-}
-
-/// Reads the little-endian `u32` at `offset`.
-fn read_u32(guest: &Guest, offset: u32) -> Result<u32, PackError> {
-    let mut word = [0; 4];
-    guest.read(offset, &mut word)?;
-    Ok(u32::from_le_bytes(word))
-}
-
-/// Encodes a `RawSlice` in wasm32 layout: `ptr`, then `len`.
-pub(super) fn raw_slice(ptr: u32, len: u32) -> [u8; WASM32_RAW_SLICE] {
-    let mut bytes = [0; WASM32_RAW_SLICE];
-    bytes[..4].copy_from_slice(&ptr.to_le_bytes());
-    bytes[4..].copy_from_slice(&len.to_le_bytes());
-    bytes
-}
-
-/// Encodes a `RawRing` in wasm32 layout: `base`, `len`, then a `None` owner.
-pub(super) fn raw_ring(ring: GuestRing) -> [u8; WASM32_RAW_RING] {
-    let mut bytes = [0; WASM32_RAW_RING];
-    bytes[..WASM32_RAW_SLICE].copy_from_slice(&raw_slice(ring.offset, ring.len));
-    bytes
 }

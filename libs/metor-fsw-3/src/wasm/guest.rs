@@ -6,6 +6,9 @@ use core::ptr::NonNull;
 use std::alloc::Layout;
 
 use metor_fsw_3_ring::PAYLOAD_ALIGNMENT;
+
+use super::DEFAULT_SETUP_FUEL;
+use crate::dl::PackError;
 use wasmi::{
     CompilationMode, Config, Engine, ExternType, Linker, Memory, MemoryType, Store, StoreLimits,
     StoreLimitsBuilder, TrapCode, TypedFunc, WasmParams, WasmResults,
@@ -90,8 +93,10 @@ impl Trap {
             Trap::Other => "trap",
         }
     }
+}
 
-    fn of(error: &wasmi::Error) -> Trap {
+impl From<wasmi::Error> for Trap {
+    fn from(error: wasmi::Error) -> Trap {
         match error.as_trap_code() {
             Some(TrapCode::OutOfFuel) => Trap::OutOfFuel,
             Some(TrapCode::UnreachableCodeReached) => Trap::Unreachable,
@@ -160,12 +165,12 @@ struct Exports {
 /// The host allocates the guest's memory, up to a fixed ceiling. Every call
 /// into the guest runs with a fuel budget.
 pub struct Guest {
-    /// Must be declared before `_arena`, so the store drops while its memory
+    /// Must be declared before `backing`, so the store drops while its memory
     /// is still allocated.
     store: Store<StoreLimits>,
     memory: Memory,
     exports: Exports,
-    _arena: Arena,
+    backing: GuestMemory,
 }
 
 impl Guest {
@@ -174,16 +179,24 @@ impl Guest {
     /// The ceiling is rounded up to whole pages. Instantiation copies the
     /// module's data into memory and may use up to `fuel`.
     pub fn new(module: &Module, ceiling: usize, fuel: u64) -> Result<Guest, WasmError> {
-        let ty = module.memory_import()?;
-        let arena = Arena::new(ceiling)?;
-        let ty = bounded(ty, &arena)?;
-        let mut store = Store::new(module.0.engine(), limits());
+        let backing = GuestMemory::new(ceiling)?;
+        let ty = backing.bound(module.memory_import()?)?;
+        // A store holds one instance, one table, and the host's memory. That
+        // memory counts twice, because instantiation counts it again as the
+        // module's import.
+        let limits = StoreLimitsBuilder::new()
+            .memories(2)
+            .tables(1)
+            .table_elements(TABLE_ELEMENTS)
+            .instances(1)
+            .build();
+        let mut store = Store::new(module.0.engine(), limits);
         store.limiter(|limits| limits);
         store.set_fuel(fuel)?;
         // SAFETY: the store is the only user of these bytes from here. It is
-        // declared after `arena` here and before it in `Guest`, so it drops
+        // declared after `backing` here and before it in `Guest`, so it drops
         // first either way.
-        let bytes = unsafe { arena.bytes() };
+        let bytes = unsafe { backing.bytes() };
         let memory = Memory::new_static(&mut store, ty, bytes)?;
         let mut linker = Linker::new(module.0.engine());
         linker
@@ -195,7 +208,7 @@ impl Guest {
             store,
             memory,
             exports,
-            _arena: arena,
+            backing,
         })
     }
 
@@ -242,20 +255,37 @@ impl Guest {
         call(&mut self.store, self.exports.free, (ptr, len, align), fuel)
     }
 
+    /// Allocates `len` bytes with the guest's allocator, using setup fuel.
+    ///
+    /// Fails if the allocator returns the null offset.
+    pub fn alloc_nonnull(&mut self, len: u32, align: u32) -> Result<u32, PackError> {
+        match self.alloc(len, align, DEFAULT_SETUP_FUEL)? {
+            0 => Err(WasmError::Alloc(len).into()),
+            offset => Ok(offset),
+        }
+    }
+
+    /// Reads the little-endian `u32` at `offset`.
+    pub fn read_u32(&self, offset: u32) -> Result<u32, WasmError> {
+        let mut word = [0; 4];
+        self.read(offset, &mut word)?;
+        Ok(u32::from_le_bytes(word))
+    }
+
     /// Copies `dst.len()` bytes from guest memory at `offset` into `dst`.
     pub fn read(&self, offset: u32, dst: &mut [u8]) -> Result<(), WasmError> {
-        let src = self.at(offset, dst.len())?;
-        // SAFETY: `at` checked the range lies in the memory, and no guest call
-        // runs while `self` is borrowed.
-        unsafe { core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) };
+        let src = self.host_ptr(offset, dst.len())?;
+        // SAFETY: `host_ptr` checked the range lies in the memory, and no
+        // guest call runs while `self` is borrowed.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), dst.len()) };
         Ok(())
     }
 
     /// Copies `src` into guest memory at `offset`.
     pub fn write(&mut self, offset: u32, src: &[u8]) -> Result<(), WasmError> {
-        let dst = self.at(offset, src.len())?;
+        let dst = self.host_ptr(offset, src.len())?;
         // SAFETY: as in `read`. `src` is host memory, so the ranges do not overlap.
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_ptr(), src.len()) };
         Ok(())
     }
 
@@ -267,27 +297,20 @@ impl Guest {
         if !(offset as usize).is_multiple_of(PAYLOAD_ALIGNMENT) {
             return Err(WasmError::Misaligned(offset));
         }
-        let ptr = self.at(offset, len)?;
-        NonNull::new(ptr).ok_or(WasmError::OutOfBounds { offset, len })
-    }
-
-    /// Returns the host address of `len` bytes at `offset`, at any alignment.
-    pub fn span(&self, offset: u32, len: usize) -> Result<NonNull<u8>, WasmError> {
-        let ptr = self.at(offset, len)?;
-        NonNull::new(ptr).ok_or(WasmError::OutOfBounds { offset, len })
+        self.host_ptr(offset, len)
     }
 
     /// Returns the host address of `len` bytes at `offset`.
     ///
-    /// Fails if the range is outside the memory's current size. The arena is
+    /// Fails if the range is outside the memory's current size. The memory is
     /// page aligned, so an offset has the same alignment as its host address.
-    fn at(&self, offset: u32, len: usize) -> Result<*mut u8, WasmError> {
+    pub fn host_ptr(&self, offset: u32, len: usize) -> Result<NonNull<u8>, WasmError> {
         let size = self.memory.data_size(&self.store);
         let start = offset as usize;
         match start.checked_add(len) {
-            // SAFETY: `start` is within the memory, so the offset stays in
-            // the one allocation `data_ptr` points into.
-            Some(end) if end <= size => Ok(unsafe { self.memory.data_ptr(&self.store).add(start) }),
+            // SAFETY: `start` is within the memory, which is `backing`, so the
+            // offset stays in that one allocation.
+            Some(end) if end <= size => Ok(unsafe { self.backing.ptr.add(start) }),
             _ => Err(WasmError::OutOfBounds { offset, len }),
         }
     }
@@ -330,48 +353,18 @@ fn call<P: WasmParams, R: WasmResults>(
 ) -> Result<R, Trap> {
     // `Module::compile` always enables fuel metering, so this cannot fail.
     store.set_fuel(fuel).map_err(|_| Trap::Other)?;
-    func.call(store, params).map_err(|e| Trap::of(&e))
-}
-
-/// Returns the limits for a guest's store.
-///
-/// A store may hold one instance, one table, and the host's memory. That
-/// memory counts twice, because instantiation counts it again as the module's
-/// import.
-fn limits() -> StoreLimits {
-    StoreLimitsBuilder::new()
-        .memories(2)
-        .tables(1)
-        .table_elements(TABLE_ELEMENTS)
-        .instances(1)
-        .build()
-}
-
-/// Returns the imported memory type with its maximum capped at the arena's size.
-fn bounded(ty: MemoryType, arena: &Arena) -> Result<MemoryType, WasmError> {
-    let pages = (arena.len() / PAGE) as u64;
-    if ty.minimum() > pages {
-        return Err(WasmError::MemoryTooSmall {
-            needed: ty.minimum().saturating_mul(PAGE as u64),
-            ceiling: arena.len(),
-        });
-    }
-    let mut builder = MemoryType::builder();
-    builder
-        .min(ty.minimum())
-        .max(Some(ty.maximum().map_or(pages, |max| max.min(pages))));
-    builder.build().map_err(|e| wasmi::Error::from(e).into())
+    func.call(store, params).map_err(Trap::from)
 }
 
 /// The page-aligned, zeroed allocation that backs a guest's memory.
-struct Arena {
+struct GuestMemory {
     ptr: NonNull<u8>,
     layout: Layout,
 }
 
-impl Arena {
+impl GuestMemory {
     /// Allocates enough whole pages to cover `ceiling` bytes.
-    fn new(ceiling: usize) -> Result<Arena, WasmError> {
+    fn new(ceiling: usize) -> Result<GuestMemory, WasmError> {
         let pages = ceiling.div_ceil(PAGE);
         if pages == 0 || pages > MAX_PAGES {
             return Err(WasmError::BadCeiling(ceiling));
@@ -382,18 +375,35 @@ impl Arena {
         // SAFETY: `len` is nonzero.
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr).ok_or(WasmError::OutOfMemory(len))?;
-        Ok(Arena { ptr, layout })
+        Ok(GuestMemory { ptr, layout })
     }
 
     fn len(&self) -> usize {
         self.layout.size()
     }
 
+    /// Returns the imported memory type `ty` with its maximum capped at this
+    /// memory's size.
+    fn bound(&self, ty: MemoryType) -> Result<MemoryType, WasmError> {
+        let pages = (self.len() / PAGE) as u64;
+        if ty.minimum() > pages {
+            return Err(WasmError::MemoryTooSmall {
+                needed: ty.minimum().saturating_mul(PAGE as u64),
+                ceiling: self.len(),
+            });
+        }
+        let mut builder = MemoryType::builder();
+        builder
+            .min(ty.minimum())
+            .max(Some(ty.maximum().map_or(pages, |max| max.min(pages))));
+        builder.build().map_err(|e| wasmi::Error::from(e).into())
+    }
+
     /// Returns the whole arena as one mutable slice.
     ///
     /// # Safety
     /// Nothing else may access the bytes while the slice, or anything derived
-    /// from it, is alive. None of them may be used after the arena drops.
+    /// from it, is alive. None of them may be used after the memory drops.
     unsafe fn bytes(&self) -> &'static mut [u8] {
         // SAFETY: `new` allocated `len` bytes at `ptr`. The caller's contract
         // covers aliasing and lifetime.
@@ -401,7 +411,7 @@ impl Arena {
     }
 }
 
-impl Drop for Arena {
+impl Drop for GuestMemory {
     fn drop(&mut self) {
         // SAFETY: `new` allocated `ptr` with this layout, and it is freed once.
         unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };

@@ -4,7 +4,8 @@ use metor_fsw_3_ring::{Config, NoWake, RingBuffer, View, Writer};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogEvent;
 
-use super::abi::{GuestRing, raw_ring, raw_slice};
+use zerocopy::IntoBytes;
+
 use super::guest::{Guest, Module, Out, TABLE_ELEMENTS};
 use super::*;
 use crate::coordinator::{EndReason, Step};
@@ -14,6 +15,7 @@ use crate::dl::codec::DESCRIPTOR_CAPACITY;
 use crate::mirror::mirror_config;
 use crate::mirror::tests::{region_bytes, slot_cursor};
 use crate::pack::def::Instance;
+use crate::pack::raw::{Wasm32RawRing, Wasm32RawSlice};
 use crate::system::SystemDef;
 use crate::{ABI_VERSION, Input, Output};
 
@@ -210,18 +212,16 @@ fn test_refused_allocation_fails_open() {
 
 #[test]
 fn test_raw_slice_layout() {
-    assert_eq!(raw_slice(0x0403_0201, 5), [1, 2, 3, 4, 5, 0, 0, 0]);
+    let slice = Wasm32RawSlice::new(0x0403_0201, 5);
+    assert_eq!(slice.as_bytes(), [1, 2, 3, 4, 5, 0, 0, 0]);
 }
 
 #[test]
 fn test_raw_ring_layout() {
-    let ring = GuestRing {
-        offset: 0x0403_0201,
-        len: 0x40,
-    };
+    let ring = Wasm32RawRing::new(0x0403_0201, 0x40);
     let mut golden = [0; 20];
     golden[..5].copy_from_slice(&[1, 2, 3, 4, 0x40]);
-    assert_eq!(raw_ring(ring), golden);
+    assert_eq!(ring.as_bytes(), golden);
 }
 
 /// Returns a guest module for step tests.

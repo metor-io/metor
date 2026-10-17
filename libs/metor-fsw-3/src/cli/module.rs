@@ -265,7 +265,7 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
         pack_id: pack.id.clone(),
         lib: pack.lib.clone(),
         abi_version,
-        wasm: pack.kind == PackKind::Wasm,
+        wasm: matches!(pack.kind, PackKind::Wasm(_)),
         records: records(def),
         dataclasses: defs
             .iter()
@@ -745,7 +745,7 @@ mod tests {
         };
         let dylib = render(&reference, 1, &def).expect("renders");
         assert!(!dylib.contains("wasm"), "{dylib}");
-        reference.kind = PackKind::Wasm;
+        reference.kind = PackKind::Wasm(Default::default());
         let wasm = render(&reference, 1, &def).expect("renders");
         assert!(
             wasm.contains("    abi_version=1,\n    wasm=True,\n)"),

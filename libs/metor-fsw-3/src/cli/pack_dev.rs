@@ -95,7 +95,7 @@ pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
     let mut staged = vec![dylib];
     if config.wasm {
         refuse_async(pack.descriptor())?;
-        reference.kind = PackKind::Wasm;
+        reference.kind = PackKind::Wasm(Default::default());
         staged.push(stage_module(&config, root, &reference, pack.descriptor())?);
     }
     let text = render(&reference, ABI_VERSION, pack.descriptor())?;
@@ -139,13 +139,8 @@ fn stage_module(
     }
     copy_atomic(&built, &staged).map_err(PackDevError::write(&staged))?;
     let pack = reference.open()?;
-    if !same_descriptor(pack.descriptor(), library) {
+    if pack.descriptor() != library {
         return Err(PackDevError::DescriptorMismatch);
     }
     Ok(staged)
-}
-
-/// Returns true if two descriptors serialize to the same JSON.
-fn same_descriptor(a: &PackDef, b: &PackDef) -> bool {
-    matches!((serde_json::to_value(a), serde_json::to_value(b)), (Ok(a), Ok(b)) if a == b)
 }

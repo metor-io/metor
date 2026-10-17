@@ -61,10 +61,8 @@ pub(crate) struct Stored {
     #[serde(with = "hex_hash")]
     pub(crate) hash: blake3::Hash,
     pub(crate) def: SystemDef,
-    #[serde(default)]
-    pub(crate) kind: PackKind,
     #[serde(flatten)]
-    pub(crate) limits: Limits,
+    pub(crate) kind: PackKind,
 }
 
 /// A library hash, written as hex.
@@ -89,7 +87,6 @@ struct Resolved {
     path: PathBuf,
     hash: blake3::Hash,
     kind: PackKind,
-    limits: Limits,
     occupant: Occupant,
 }
 
@@ -142,7 +139,7 @@ impl Resolved {
     fn open(&self) -> Result<Pack, LoadError> {
         match self.kind {
             PackKind::Dylib => self.open_dylib(),
-            PackKind::Wasm => self.open_wasm(),
+            PackKind::Wasm(limits) => self.open_wasm(&limits),
         }
     }
 
@@ -175,23 +172,18 @@ impl Resolved {
 
     /// Reads this candidate's module, checks its hash, and compiles those
     /// bytes.
-    fn open_wasm(&self) -> Result<Pack, LoadError> {
+    fn open_wasm(&self, limits: &Limits) -> Result<Pack, LoadError> {
         let bytes = std::fs::read(&self.path).map_err(|e| LoadError::Open(e.to_string()))?;
         if blake3::hash(&bytes) != self.hash {
             return Err(LoadError::Hash(self.name.clone()));
         }
-        let pack =
-            WasmPack::open(&bytes, &self.limits).map_err(|e| LoadError::Open(e.to_string()))?;
+        let pack = WasmPack::open(&bytes, limits).map_err(|e| LoadError::Open(e.to_string()))?;
         Ok(Pack::Wasm(pack))
     }
 
     fn of(index: usize, candidate: Candidate) -> Result<Self, MakeError> {
         let Stored {
-            path,
-            hash,
-            kind,
-            limits,
-            ..
+            path, hash, kind, ..
         } = candidate.stored;
         let file = path
             .file_name()
@@ -211,7 +203,6 @@ impl Resolved {
             path,
             hash,
             kind,
-            limits,
         })
     }
 }

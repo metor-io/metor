@@ -1,19 +1,21 @@
 //! Loads packs built as WebAssembly modules.
 
+use core::ptr::NonNull;
+
 use metor_fsw_3_ring::{NoWake, PAYLOAD_ALIGNMENT, RingBuffer, View};
 use serde::{Deserialize, Serialize};
 
 use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::dl::{InstanceRings, PackError};
-use crate::io::{Arena, Cqe, IO_CQ, IO_SQ, SharedIo, Sqe};
+use crate::io::{Cqe, SharedIo, Sqe};
 use crate::mirror::{Mirror, Mirrors, mirror_config};
 use crate::pack::ABI_VERSION;
 use crate::pack::def::{DefCxOwned, Instance, PackDef};
 use crate::port::Input;
 use crate::system::{PortDef, SystemDef};
 
-use super::abi::{Args, GuestRing, allocated};
+use super::abi::{Args, GuestRing, guest_usize};
 use super::guest::{Guest, Module, WasmError};
 use super::io::IoCopy;
 use super::step::WasmStep;
@@ -59,8 +61,8 @@ impl WasmPack {
         let module = Module::compile(bytes)?;
         let memory = limits.memory.unwrap_or(DEFAULT_MEMORY);
         let mut guest = Guest::new(&module, memory, DEFAULT_SETUP_FUEL)?;
-        check_version(&mut guest)?;
-        let def = descriptor(&mut guest)?;
+        guest.check_abi_version()?;
+        let def = guest.descriptor()?;
         Ok(WasmPack {
             module,
             memory,
@@ -82,7 +84,7 @@ impl WasmPack {
         let (status, bytes) = self.call_def(ty, &cx).map_err(|e| DefError::Pack {
             message: e.to_string(),
         })?;
-        SystemDef::decode(status, bytes.as_deref())
+        SystemDef::decode(status, Some(&bytes))
     }
 
     /// Creates one instance of type `ty` in a new guest.
@@ -102,13 +104,12 @@ impl WasmPack {
         let (params, def) = instance.encode(params)?;
         let mut guest = self.guest().map_err(PackError::from)?;
         let capped = !instance.def.grants.is_empty();
-        let io_port = |name: &str| capped && (name == IO_SQ || name == IO_CQ);
-        let ins = copy_inputs(&mut guest, &instance.def.inputs, inputs, io_port)?;
-        let outs = copy_outputs(&mut guest, &instance.def.outputs, outputs, io_port)?;
+        let ins = Copies::inputs(&mut guest, &instance.def.inputs, inputs, capped)?;
+        let outs = Copies::outputs(&mut guest, &instance.def.outputs, outputs, capped)?;
         let mirrors = Mirrors::new(&instance.def, ins.mirrors, outs.mirrors);
         let mirror = io.borrow().arena(&instance.id);
-        let given = match mirror.filter(|m| m.region().is_some()) {
-            Some(mirror) => Some(give(&mut guest, &mirror)?),
+        let given = match mirror.and_then(|m| m.region()) {
+            Some((_, len)) => Some(GuestRing::alloc_zeroed(&mut guest, len)?),
             None => None,
         };
         let call = Create {
@@ -117,9 +118,9 @@ impl WasmPack {
             def: &def,
             inputs: &ins.rings,
             outputs: &outs.rings,
-            table: given,
+            io_arena: given,
         };
-        let (handle, region) = call_create(&mut guest, call)?;
+        let (handle, region) = call.call(&mut guest)?;
         let copy = match (ins.io, outs.io) {
             (Some(cq), Some(sq)) if region.len > 0 => {
                 let views = (Input::new(vec![sq]), Input::new(vec![cq]));
@@ -138,7 +139,7 @@ impl WasmPack {
     /// Calls `metor_fsw_def` in a new guest.
     ///
     /// Returns the status and the bytes the export wrote.
-    fn call_def(&self, ty: &str, cx: &[u8]) -> Result<(u32, Option<Vec<u8>>), PackError> {
+    fn call_def(&self, ty: &str, cx: &[u8]) -> Result<(u32, Vec<u8>), PackError> {
         let mut guest = self.guest()?;
         let mut args = Args::new(&mut guest);
         let ty = args.byte_slice(ty.as_bytes())?;
@@ -149,22 +150,26 @@ impl WasmPack {
     }
 }
 
-fn check_version(guest: &mut Guest) -> Result<(), PackError> {
-    let found = guest.abi_version(DEFAULT_SETUP_FUEL)?;
-    if found != ABI_VERSION {
-        return Err(PackError::AbiMismatch {
-            found,
-            expected: ABI_VERSION,
-        });
+impl Guest {
+    /// Returns an error unless the module speaks this host's ABI version.
+    fn check_abi_version(&mut self) -> Result<(), PackError> {
+        let found = self.abi_version(DEFAULT_SETUP_FUEL)?;
+        if found != ABI_VERSION {
+            return Err(PackError::AbiMismatch {
+                found,
+                expected: ABI_VERSION,
+            });
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-fn descriptor(guest: &mut Guest) -> Result<PackDef, PackError> {
-    let mut args = Args::new(guest);
-    let out = args.out()?;
-    let status = args.guest().pack_def(out, DEFAULT_SETUP_FUEL)?;
-    PackDef::decode(status, args.written(out)?.as_deref())
+    /// Reads the pack's descriptor.
+    fn descriptor(&mut self) -> Result<PackDef, PackError> {
+        let mut args = Args::new(self);
+        let out = args.out()?;
+        let status = args.guest().pack_def(out, DEFAULT_SETUP_FUEL)?;
+        PackDef::decode(status, Some(&args.written(out)?))
+    }
 }
 
 impl From<PackError> for ParamError {
@@ -185,20 +190,47 @@ struct Create<'a> {
     inputs: &'a [Vec<GuestRing>],
     outputs: &'a [GuestRing],
     /// Room for the system's IO arena, on a remake.
-    table: Option<GuestRing>,
+    io_arena: Option<GuestRing>,
 }
 
-/// A zeroed region in the guest the length of its mirror, for a remade
-/// guest's constructor to lay out its arena in.
-fn give(guest: &mut Guest, mirror: &Arena) -> Result<GuestRing, ParamError> {
-    let len = mirror.region().map_or(0, |(_, len)| len);
-    let len = u32::try_from(len)
-        .map_err(|_| WasmError::TooLarge(len))
-        .map_err(PackError::from)?;
-    let offset = allocated(guest, len, 8)?;
-    let zeroes = vec![0; len as usize];
-    guest.write(offset, &zeroes).map_err(PackError::from)?;
-    Ok(GuestRing { offset, len })
+impl GuestRing {
+    /// Allocates a zeroed region of `len` bytes in the guest, for a remade
+    /// guest's constructor to lay out its IO arena in.
+    fn alloc_zeroed(guest: &mut Guest, len: usize) -> Result<GuestRing, ParamError> {
+        let len = guest_usize(len)?;
+        let offset = guest.alloc_nonnull(len, 8)?;
+        let zeroes = vec![0; len as usize];
+        guest.write(offset, &zeroes).map_err(PackError::from)?;
+        Ok(GuestRing { offset, len })
+    }
+
+    /// Creates a ring in guest memory to mirror a real ring of `capacity`
+    /// bytes, with `readers` reader slots.
+    ///
+    /// The copy is [`COPY_FACTOR`] times as large. The host formats it before
+    /// the guest sees it.
+    fn create(
+        guest: &mut Guest,
+        capacity: usize,
+        readers: usize,
+    ) -> Result<(GuestRing, RingBuffer), ParamError> {
+        let too_large = || ParamError::MirrorTooLarge { capacity };
+        let config = mirror_config(capacity, COPY_FACTOR, readers)?;
+        let len = config.region_len().map_err(|_| too_large())?;
+        let len = u32::try_from(len).map_err(|_| too_large())?;
+        let offset = guest.alloc_nonnull(len, PAYLOAD_ALIGNMENT as u32)?;
+        let base = guest
+            .region(offset, len as usize)
+            .map_err(PackError::from)?;
+        // SAFETY: the region is `len` bytes in the guest's memory, and the
+        // guest has not seen it yet. Every handle on the ring either ends up in
+        // `WasmStep::mirrors`, which is declared before `guest`, or is dropped
+        // before `guest` on an error. So the memory outlives all of them. From
+        // then on, the guest and host both follow the ring protocol.
+        let ring = unsafe { RingBuffer::create_raw(base.as_ptr(), len as usize, config) }
+            .map_err(|e| ParamError::Wasm(e.to_string()))?;
+        Ok((GuestRing { offset, len }, ring))
+    }
 }
 
 /// Makes the host's mirror of the IO arena the guest laid out at `region`,
@@ -218,40 +250,44 @@ fn attach(
     if mirror.region().is_none_or(|(_, l)| l != len) {
         return Err(ParamError::Wasm("a remade guest moved its IO arena".into()));
     }
-    let base = guest.span(region.offset, len).map_err(PackError::from)?;
+    let base = guest
+        .host_ptr(region.offset, len)
+        .map_err(PackError::from)?;
     // SAFETY: the guest's memory never moves, and `WasmStep` drops the copy
     // before the guest.
-    Ok(unsafe { IoCopy::new((base, len), mirror, sq, cq) })
+    Ok(unsafe { IoCopy::new(NonNull::slice_from_raw_parts(base, len), mirror, sq, cq) })
 }
 
-/// Copies `call` into guest memory and calls `metor_fsw_create`.
-///
-/// Returns the instance and the IO region the guest wrote back, or the error
-/// the guest wrote.
-fn call_create(guest: &mut Guest, call: Create<'_>) -> Result<(u32, GuestRing), ParamError> {
-    let mut args = Args::new(guest);
-    let ty = args.byte_slice(call.ty)?;
-    let params = args.byte_slice(call.params)?;
-    let def = args.byte_slice(call.def)?;
-    let edges = call
-        .inputs
-        .iter()
-        .map(|edge| args.rings(edge))
-        .collect::<Result<Vec<_>, _>>()?;
-    let inputs = args.ports(&edges)?;
-    let (outs, len) = args.rings(call.outputs)?;
-    let outputs = args.slice(outs, len)?;
-    let table = args.table(call.table)?;
-    let error = args.slice(0, 0)?;
-    let create = (ty, params, def, inputs, outputs, table, error);
-    let handle = args
-        .guest()
-        .create(create, DEFAULT_SETUP_FUEL)
-        .map_err(PackError::from)?;
-    if handle == 0 {
-        return Err(ParamError::from_create_error(&args.slice_bytes(error)?));
+impl Create<'_> {
+    /// Copies these arguments into guest memory and calls `metor_fsw_create`.
+    ///
+    /// Returns the instance and the IO arena the guest wrote back, or the
+    /// error the guest wrote.
+    fn call(self, guest: &mut Guest) -> Result<(u32, GuestRing), ParamError> {
+        let mut args = Args::new(guest);
+        let ty = args.byte_slice(self.ty)?;
+        let params = args.byte_slice(self.params)?;
+        let def = args.byte_slice(self.def)?;
+        let edges = self
+            .inputs
+            .iter()
+            .map(|edge| args.rings(edge))
+            .collect::<Result<Vec<_>, _>>()?;
+        let inputs = args.ports(&edges)?;
+        let (outs, len) = args.rings(self.outputs)?;
+        let outputs = args.slice(outs, len)?;
+        let io_arena = args.io_arena(self.io_arena)?;
+        let error = args.slice(0, 0)?;
+        let create = (ty, params, def, inputs, outputs, io_arena, error);
+        let handle = args
+            .guest()
+            .create(create, DEFAULT_SETUP_FUEL)
+            .map_err(PackError::from)?;
+        if handle == 0 {
+            return Err(ParamError::from_create_error(&args.slice_bytes(error)?));
+        }
+        Ok((handle, args.ring(io_arena)?))
     }
-    Ok((handle, args.ring(table)?))
 }
 
 /// The guest copies of a system's rings.
@@ -264,95 +300,74 @@ struct Copies<R> {
     io: Option<View<NoWake>>,
 }
 
-/// Creates a guest copy of each input edge's ring, and mirrors that fill each
-/// copy from its real ring. An IO port's copy takes a second reader.
-fn copy_inputs(
-    guest: &mut Guest,
-    ports: &[PortDef],
-    inputs: &[Vec<&RingBuffer>],
-    io_port: impl Fn(&str) -> bool,
-) -> Result<Copies<Vec<GuestRing>>, ParamError> {
-    let mut copies = Copies {
-        mirrors: Vec::new(),
-        rings: Vec::with_capacity(ports.len()),
-        io: None,
-    };
-    for (port, reals) in ports.iter().zip(inputs) {
-        let mut edge = Vec::with_capacity(reals.len());
-        let readers = 1 + usize::from(io_port(&port.name));
-        for real in reals {
-            let (at, copy) = guest_ring(guest, real.config().capacity, readers)?;
-            // PANIC Safety: build counted this reader, and the copy is fresh.
+impl Copies<Vec<GuestRing>> {
+    /// Creates a guest copy of each input edge's ring, and mirrors that fill
+    /// each copy from its real ring. With `capped`, an IO port's copy takes a
+    /// second reader.
+    fn inputs(
+        guest: &mut Guest,
+        ports: &[PortDef],
+        inputs: &[Vec<&RingBuffer>],
+        capped: bool,
+    ) -> Result<Self, ParamError> {
+        let mut copies = Copies {
+            mirrors: Vec::new(),
+            rings: Vec::with_capacity(ports.len()),
+            io: None,
+        };
+        for (port, reals) in ports.iter().zip(inputs) {
+            let mut edge = Vec::with_capacity(reals.len());
+            let readers = 1 + usize::from(capped && port.is_io());
+            for real in reals {
+                let (guest_ring, copy) = GuestRing::create(guest, real.config().capacity, readers)?;
+                // PANIC Safety: build counted this reader, and the copy is fresh.
+                copies.mirrors.push(Mirror::new(
+                    port.name.clone(),
+                    real.view(NoWake).expect("a counted reader slot"),
+                    copy.writer(NoWake).expect("a fresh ring"),
+                ));
+                if readers > 1 {
+                    // PANIC Safety: the copy was made with a second reader slot.
+                    copies.io = Some(copy.view(NoWake).expect("a second reader"));
+                }
+                edge.push(guest_ring);
+            }
+            copies.rings.push(edge);
+        }
+        Ok(copies)
+    }
+}
+
+impl Copies<GuestRing> {
+    /// Creates a guest copy of each output ring, and mirrors that drain each
+    /// copy into its real ring. With `capped`, an IO port's copy takes a
+    /// second reader.
+    fn outputs(
+        guest: &mut Guest,
+        ports: &[PortDef],
+        outputs: &[&RingBuffer],
+        capped: bool,
+    ) -> Result<Self, ParamError> {
+        let mut copies = Copies {
+            mirrors: Vec::with_capacity(ports.len()),
+            rings: Vec::with_capacity(ports.len()),
+            io: None,
+        };
+        for (port, real) in ports.iter().zip(outputs) {
+            let readers = 1 + usize::from(capped && port.is_io());
+            let (guest_ring, copy) = GuestRing::create(guest, real.config().capacity, readers)?;
+            // PANIC Safety: the copy is fresh, and build counted one writer per output.
             copies.mirrors.push(Mirror::new(
                 port.name.clone(),
-                real.view(NoWake).expect("a counted reader slot"),
-                copy.writer(NoWake).expect("a fresh ring"),
+                copy.view(NoWake).expect("a fresh ring"),
+                real.writer(NoWake).expect("one writer per output ring"),
             ));
             if readers > 1 {
                 // PANIC Safety: the copy was made with a second reader slot.
                 copies.io = Some(copy.view(NoWake).expect("a second reader"));
             }
-            edge.push(at);
+            copies.rings.push(guest_ring);
         }
-        copies.rings.push(edge);
+        Ok(copies)
     }
-    Ok(copies)
-}
-
-/// Creates a guest copy of each output ring, and mirrors that drain each copy
-/// into its real ring. An IO port's copy takes a second reader.
-fn copy_outputs(
-    guest: &mut Guest,
-    ports: &[PortDef],
-    outputs: &[&RingBuffer],
-    io_port: impl Fn(&str) -> bool,
-) -> Result<Copies<GuestRing>, ParamError> {
-    let mut copies = Copies {
-        mirrors: Vec::with_capacity(ports.len()),
-        rings: Vec::with_capacity(ports.len()),
-        io: None,
-    };
-    for (port, real) in ports.iter().zip(outputs) {
-        let readers = 1 + usize::from(io_port(&port.name));
-        let (at, copy) = guest_ring(guest, real.config().capacity, readers)?;
-        // PANIC Safety: the copy is fresh, and build counted one writer per output.
-        copies.mirrors.push(Mirror::new(
-            port.name.clone(),
-            copy.view(NoWake).expect("a fresh ring"),
-            real.writer(NoWake).expect("one writer per output ring"),
-        ));
-        if readers > 1 {
-            // PANIC Safety: the copy was made with a second reader slot.
-            copies.io = Some(copy.view(NoWake).expect("a second reader"));
-        }
-        copies.rings.push(at);
-    }
-    Ok(copies)
-}
-
-/// Creates a ring in guest memory to mirror a real ring of `capacity` bytes.
-///
-/// The copy is [`COPY_FACTOR`] times as large. The host formats it before the
-/// guest sees it.
-fn guest_ring(
-    guest: &mut Guest,
-    capacity: usize,
-    readers: usize,
-) -> Result<(GuestRing, RingBuffer), ParamError> {
-    let too_large = || ParamError::MirrorTooLarge { capacity };
-    let config = mirror_config(capacity, COPY_FACTOR, readers)?;
-    let len = config.region_len().map_err(|_| too_large())?;
-    let len = u32::try_from(len).map_err(|_| too_large())?;
-    let offset = allocated(guest, len, PAYLOAD_ALIGNMENT as u32)?;
-    let base = guest
-        .region(offset, len as usize)
-        .map_err(PackError::from)?;
-    // SAFETY: the region is `len` bytes in the guest's arena, and the guest has
-    // not seen it yet. Every handle on the ring either ends up in
-    // `WasmStep::mirrors`, which is declared before `guest`, or is dropped
-    // before `guest` on an error. So the arena outlives all of them. From then
-    // on, the guest and host both follow the ring protocol.
-    let ring = unsafe { RingBuffer::create_raw(base.as_ptr(), len as usize, config) }
-        .map_err(|e| ParamError::Wasm(e.to_string()))?;
-    Ok((GuestRing { offset, len }, ring))
 }

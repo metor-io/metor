@@ -62,8 +62,8 @@ impl Step for WasmStep {
         let written = self.io.as_mut().map_or(Ok(()), IoCopy::submissions);
         let taken = self.mirrors.drain_outputs();
         let end = match read.and(written) {
-            Ok(()) => end_of(fed.and(taken), result),
-            Err(_) => Some(corrupt_table()),
+            Ok(()) => End::from_cycle(fed.and(taken), result),
+            Err(_) => Some(End::corrupt_table()),
         };
         if let Some(end) = end {
             if let Some((kind, message)) = end.line {
@@ -94,43 +94,47 @@ pub(super) struct End {
 }
 
 impl End {
-    fn host(reason: EndReason, kind: &'static str, message: &'static str) -> Self {
+    /// An end the host logs a line about, with `kind` and `message`.
+    fn logged(reason: EndReason, kind: &'static str, message: &'static str) -> Self {
         Self {
             reason,
             line: Some((kind, message)),
         }
     }
-}
 
-/// The end of a step whose guest's buffer table did not match its mirror.
-fn corrupt_table() -> End {
-    let reason = EndReason::Failed(Cow::Borrowed("corrupt table"));
-    End::host(reason, "corrupt", "a guest's buffer table is corrupt")
-}
-
-/// Decides whether one cycle ended the step.
-///
-/// `copied` is the result of copying the rings, and `result` is the result of
-/// the `execute` call. Returns `None` if the step is still running.
-pub(super) fn end_of(copied: Result<(), Corrupt>, result: Result<u32, Trap>) -> Option<End> {
-    if copied.is_err() {
-        let reason = EndReason::Failed(Cow::Borrowed("corrupt ring"));
-        return Some(End::host(reason, "corrupt", "a guest ring is corrupt"));
+    /// The end of a step whose guest's buffer table did not match its mirror.
+    fn corrupt_table() -> Self {
+        let reason = EndReason::Failed(Cow::Borrowed("corrupt table"));
+        Self::logged(reason, "corrupt", "a guest's buffer table is corrupt")
     }
-    match result {
-        Ok(word) => match Status::try_from(word) {
-            Ok(status) => status.end().map(|reason| End { reason, line: None }),
-            Err(_) => Some(End::host(
-                EndReason::Panicked,
-                "bad_status",
-                "the guest returned no known status",
+
+    /// Decides whether one cycle ended the step.
+    ///
+    /// `copied` is the result of copying the rings, and `result` is the result
+    /// of the `execute` call. Returns `None` if the step is still running.
+    pub(super) fn from_cycle(
+        copied: Result<(), Corrupt>,
+        result: Result<u32, Trap>,
+    ) -> Option<Self> {
+        if copied.is_err() {
+            let reason = EndReason::Failed(Cow::Borrowed("corrupt ring"));
+            return Some(Self::logged(reason, "corrupt", "a guest ring is corrupt"));
+        }
+        match result {
+            Ok(word) => match Status::try_from(word) {
+                Ok(status) => status.end().map(|reason| End { reason, line: None }),
+                Err(_) => Some(Self::logged(
+                    EndReason::Panicked,
+                    "bad_status",
+                    "the guest returned no known status",
+                )),
+            },
+            Err(Trap::OutOfFuel) => Some(Self::logged(
+                EndReason::Failed(Cow::Borrowed("out of fuel")),
+                "fuel",
+                "the guest ran out of fuel",
             )),
-        },
-        Err(Trap::OutOfFuel) => Some(End::host(
-            EndReason::Failed(Cow::Borrowed("out of fuel")),
-            "fuel",
-            "the guest ran out of fuel",
-        )),
-        Err(trap) => Some(End::host(EndReason::Panicked, "trap", trap.as_str())),
+            Err(trap) => Some(Self::logged(EndReason::Panicked, "trap", trap.as_str())),
+        }
     }
 }

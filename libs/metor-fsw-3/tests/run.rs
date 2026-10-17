@@ -251,7 +251,7 @@ fn test_wasm_pack_loads_and_runs() {
     std::fs::write(dir.join(wasm_name("echo_pack")), fixture_wasm()).expect("writes");
     let config = TargetConfig {
         packs: vec![PackRef {
-            kind: PackKind::Wasm,
+            kind: PackKind::Wasm(Default::default()),
             ..PackRef::dylib("echo".into(), "echo_pack".into(), libs.path().into())
         }],
         coordinator: chain(),

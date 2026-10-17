@@ -13,12 +13,10 @@ use crate::io::{Arena, Cqe, MAX_OPS, Span, Sqe, Token};
 use crate::mirror::Corrupt;
 use crate::port::Input;
 
-/// A region's base and length.
-type Region = (NonNull<u8>, usize);
-
+/// Keeps a guest's IO arena and the host's mirror of it in step.
 pub(super) struct IoCopy {
     /// The guest's arena, seen from the host.
-    guest: Region,
+    guest: NonNull<[u8]>,
     mirror: Rc<Arena>,
     /// A second reader on the guest's copy of `io_sq`.
     sq: Input<Sqe>,
@@ -29,10 +27,13 @@ pub(super) struct IoCopy {
 }
 
 impl IoCopy {
+    /// Creates a copy between the guest arena `guest` and `mirror`, that reads
+    /// the guest's IO rings through `sq` and `cq`.
+    ///
     /// # Safety
     /// `guest` stays live and unmoved while the copy lives.
     pub(super) unsafe fn new(
-        guest: Region,
+        guest: NonNull<[u8]>,
         mirror: Rc<Arena>,
         sq: Input<Sqe>,
         cq: Input<Cqe>,
@@ -55,7 +56,8 @@ impl IoCopy {
                 continue;
             };
             let n = cqe.result().unwrap_or(0).min(span.len());
-            if let Some(mirror) = self.mirror.region() {
+            if let Some((base, len)) = self.mirror.region() {
+                let mirror = NonNull::slice_from_raw_parts(base, len);
                 copy(mirror, self.guest, Span::new(span.off(), n));
             }
         }
@@ -73,8 +75,14 @@ impl IoCopy {
             {
                 *read = Some((sqe.token, sqe.buf));
             }
-            if let (true, Some(mirror)) = (op.drains(), self.mirror.region()) {
-                copy(self.guest, mirror, sqe.buf);
+            if op.drains()
+                && let Some((base, len)) = self.mirror.region()
+            {
+                copy(
+                    self.guest,
+                    NonNull::slice_from_raw_parts(base, len),
+                    sqe.buf,
+                );
             }
         }
         Ok(())
@@ -83,16 +91,16 @@ impl IoCopy {
 
 /// Copies `span` from `from` to `to`. A span outside either is left for the
 /// dispatch to refuse.
-fn copy(from: Region, to: Region, span: Span) {
+fn copy(from: NonNull<[u8]>, to: NonNull<[u8]>, span: Span) {
     let Some(end) = span.end() else { return };
-    if end as usize > from.1 || end as usize > to.1 {
+    if end as usize > from.len() || end as usize > to.len() {
         return;
     }
     let off = span.off() as usize;
     // SAFETY: the span lies in both regions, which are distinct, and only
     // this step touches them between guest calls.
     unsafe {
-        let (src, dst) = (from.0.add(off), to.0.add(off));
+        let (src, dst) = (from.cast::<u8>().add(off), to.cast::<u8>().add(off));
         core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_ptr(), span.len() as usize);
     }
 }
@@ -121,7 +129,7 @@ mod tests {
         let mirror = Rc::new(crate::io::tests::arena(11));
         let (sq_ring, sq, sq_in) = pair::<Sqe>(16);
         let (cq_ring, cq, cq_in) = pair::<Cqe>(16);
-        let region = (NonNull::from(&mut guest[..]).cast(), guest.len());
+        let region = NonNull::from(&mut guest[..]);
         // SAFETY: the boxed guest bytes never move and outlive the copy.
         let copy = unsafe { IoCopy::new(region, mirror.clone(), sq_in, cq_in) };
         Rig {
@@ -218,8 +226,8 @@ mod proofs {
     fn copy_stays_in_bounds() {
         let mut a = [0u8; 8];
         let mut b = [0u8; 6];
-        let from = (NonNull::from(&mut a[..]).cast(), a.len());
-        let to = (NonNull::from(&mut b[..]).cast(), b.len());
+        let from = NonNull::from(&mut a[..]);
+        let to = NonNull::from(&mut b[..]);
         copy(from, to, Span::new(kani::any(), kani::any()));
     }
 }

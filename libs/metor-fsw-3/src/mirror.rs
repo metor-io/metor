@@ -8,6 +8,8 @@
 //! many each port dropped.
 
 use core::fmt::Write;
+#[cfg(feature = "host")]
+use core::ops::Range;
 use std::borrow::Cow;
 
 use metor_fsw_3_ring::{
@@ -106,6 +108,9 @@ pub(crate) struct Mirrors<W: WakeSource> {
     /// One field per port. Counts are written into these in place, so a drop
     /// report does not allocate.
     fields: Fields,
+    /// The fields of the input ports.
+    #[cfg(feature = "host")]
+    input_fields: Range<usize>,
     since_report: u64,
 }
 
@@ -126,6 +131,8 @@ impl<W: WakeSource> Mirrors<W> {
         Self {
             line: vec![0; LogEvent::MAX_LEN],
             fields: core::iter::once(kind).chain(counts).collect(),
+            #[cfg(feature = "host")]
+            input_fields: 1..1 + inputs.len(),
             since_report: 0,
             log: def.log,
             inputs,
@@ -204,14 +211,13 @@ impl<W: WakeSource> Mirrors<W> {
         };
         let _ = self.outputs[log].into.try_write(bytes);
     }
-}
 
-#[cfg(feature = "host")]
-impl<W: WakeSource> Mirrors<W> {
     /// Drops the input mirrors, which frees their reader slots on the real
     /// rings.
+    #[cfg(feature = "host")]
     pub(crate) fn release_inputs(&mut self) {
-        self.fields.drain(1..=self.inputs.len());
+        self.fields.drain(self.input_fields.clone());
+        self.input_fields.end = self.input_fields.start;
         self.inputs.clear();
     }
 }
