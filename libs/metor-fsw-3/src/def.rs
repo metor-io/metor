@@ -141,6 +141,9 @@ pub enum DefError {
 
     #[error("ports `{port}` and `{other}` carry tables with the same id")]
     TableIdCollision { port: String, other: String },
+
+    #[error("ports `{port}` and `{other}` carry records with the same packet id")]
+    RecordIdCollision { port: String, other: String },
 }
 
 /// Port definitions by record name.

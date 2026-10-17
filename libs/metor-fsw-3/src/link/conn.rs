@@ -8,7 +8,11 @@ use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use futures_lite::future;
-use metor_fsw_3_ring::{Config, NoWake, Notifier, OwnedGrant, RingBuffer, View, WakeSink, Writer};
+use metor_fsw_3_ring::{
+    Config, InvalidConfig, NoWake, Notifier, OwnedGrant, RingBuffer, View, WakeSink, Writer,
+};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::Deserialize;
 use stellarator::buf::IoBuf;
 use stellarator::io::{AsyncWrite, LengthDelReader, OwnedReader, OwnedWriter, SplitExt};
 use stellarator::net::TcpStream;
@@ -34,8 +38,8 @@ struct OutboxReader {
 
 impl Outbox {
     /// Creates an outbox ring with `config`, and the writer's end of it.
-    fn new(config: Config) -> Option<(Self, OutboxReader)> {
-        let ring = RingBuffer::create_in_memory(config).ok()?;
+    fn new(config: Config) -> Result<(Self, OutboxReader), InvalidConfig> {
+        let ring = RingBuffer::create_in_memory(config)?;
         let wake = Notifier::default();
         // PANIC Safety: the ring is new, so its writer and its one reader slot
         // are both free.
@@ -45,7 +49,7 @@ impl Outbox {
             writer,
             written: Cell::new(0),
         };
-        Some((outbox, OutboxReader { view, wake }))
+        Ok((outbox, OutboxReader { view, wake }))
     }
 
     /// Queues `batch` as one record. Returns false if it does not fit.
@@ -54,9 +58,8 @@ impl Outbox {
     }
 
     /// Counts `len` more bytes written to the socket.
-    fn sent(&self, len: usize, changed: &WaitQueue) {
+    fn sent(&self, len: usize) {
         self.written.set(self.written.get() + len as u64);
-        changed.wake_all();
     }
 }
 
@@ -101,11 +104,61 @@ pub(crate) struct Stats {
 }
 
 /// A claimed slot, reserved for a connection that is about to be served.
-struct Slot {
-    at: usize,
+struct ClaimedConnection {
+    index: usize,
     outbox: Rc<Outbox>,
     reader: OutboxReader,
 }
+
+/// The size in bytes of each connection's pending write buffer, and the
+/// outbox ring that holds two batches of that size.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "usize")]
+pub struct ConnCap {
+    bytes: usize,
+    ring: Config,
+}
+
+impl ConnCap {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Default for ConnCap {
+    fn default() -> Self {
+        // PANIC Safety: a 1 MiB batch forms a ring on every supported host.
+        Self::try_from(1 << 20).expect("the default forms a ring")
+    }
+}
+
+impl TryFrom<usize> for ConnCap {
+    type Error = ConnCapTooLarge;
+
+    fn try_from(bytes: usize) -> Result<Self, ConnCapTooLarge> {
+        let ring = Config {
+            capacity: ring_capacity(bytes, 2).ok_or(ConnCapTooLarge(bytes))?,
+            max_readers: 1,
+        };
+        ring.region_len().map_err(|_| ConnCapTooLarge(bytes))?;
+        Ok(Self { bytes, ring })
+    }
+}
+
+impl JsonSchema for ConnCap {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        usize::schema_name()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        usize::json_schema(generator)
+    }
+}
+
+/// A `conn_cap` too large for any ring to hold two batches of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("no ring holds a {0}-byte batch")]
+pub struct ConnCapTooLarge(pub usize);
 
 /// The set of connections a link is serving.
 ///
@@ -113,9 +166,7 @@ struct Slot {
 /// serves one slot. A new connection is sent the seed bytes before any batch.
 pub(crate) struct Connections {
     slots: RefCell<Vec<Option<Rc<Outbox>>>>,
-    cap: usize,
-    /// The outbox ring each connection gets.
-    ring: Config,
+    cap: ConnCap,
     seed: Vec<u8>,
     inbox: Rc<Inbox>,
     changed: WaitQueue,
@@ -125,28 +176,21 @@ pub(crate) struct Connections {
 }
 
 impl Connections {
-    /// Creates `count` empty slots, or `None` if no ring holds a `cap`-byte
-    /// batch.
+    /// Creates `count` empty slots.
     ///
     /// Each connection gets an outbox ring with room for two `cap`-byte
     /// batches, and a `cap`-byte receive buffer. It is sent `seed` first, and
     /// every packet it reads goes to `inbox`.
-    pub(crate) fn new(count: usize, cap: usize, seed: Vec<u8>, inbox: Rc<Inbox>) -> Option<Self> {
-        let ring = Config {
-            capacity: ring_capacity(cap, 2)?,
-            max_readers: 1,
-        };
-        ring.region_len().ok()?;
-        Some(Self {
+    pub(crate) fn new(count: usize, cap: ConnCap, seed: Vec<u8>, inbox: Rc<Inbox>) -> Self {
+        Self {
             slots: RefCell::new((0..count).map(|_| None).collect()),
             cap,
-            ring,
             seed,
             inbox,
             changed: WaitQueue::new(),
             bytes_out: Cell::new(0),
             batches_dropped: Cell::new(0),
-        })
+        }
     }
 
     /// Waits until the counters differ from what they are now.
@@ -159,20 +203,24 @@ impl Connections {
     ///
     /// This allocates a fresh outbox rather than reusing the old one, because
     /// the previous connection's write may still hold a record of its ring.
-    fn claim_slot(&self) -> Option<Slot> {
+    fn claim_slot(&self) -> Option<ClaimedConnection> {
         let mut slots = self.slots.borrow_mut();
-        let at = slots.iter().position(Option::is_none)?;
-        // `new` checked that this config forms a ring.
-        let (outbox, reader) = Outbox::new(self.ring)?;
+        let index = slots.iter().position(Option::is_none)?;
+        // PANIC Safety: `ConnCap` checked that its config forms a ring.
+        let (outbox, reader) = Outbox::new(self.cap.ring).expect("a checked ring config");
         let outbox = Rc::new(outbox);
-        slots[at] = Some(outbox.clone());
-        Some(Slot { at, outbox, reader })
+        slots[index] = Some(outbox.clone());
+        Some(ClaimedConnection {
+            index,
+            outbox,
+            reader,
+        })
     }
 
     /// Frees the slot of a closed connection. Its written bytes are added to
     /// the link's running total.
-    fn free_slot(&self, at: usize, outbox: &Outbox) {
-        self.slots.borrow_mut()[at] = None;
+    fn free_slot(&self, index: usize, outbox: &Outbox) {
+        self.slots.borrow_mut()[index] = None;
         self.bytes_out
             .set(self.bytes_out.get() + outbox.written.get());
         self.changed.wake_all();
@@ -188,16 +236,20 @@ impl Connections {
         stream: TcpStream,
         stop: &Stop,
     ) -> Option<impl Future<Output = ()> + 'static> {
-        let Slot { at, outbox, reader } = self.claim_slot()?;
+        let ClaimedConnection {
+            index,
+            outbox,
+            reader,
+        } = self.claim_slot()?;
         let (conns, stop) = (self.clone(), stop.clone());
         Some(async move {
             let (rx, tx) = stream.split();
             let halves = future::or(
                 write_half(&outbox, &conns.changed, tx, conns.seed.clone(), reader),
-                read_half(rx, conns.cap, &conns.inbox),
+                read_half(rx, conns.cap.bytes, &conns.inbox),
             );
             future::or(halves, stop.wait()).await;
-            conns.free_slot(at, &outbox);
+            conns.free_slot(index, &outbox);
         })
     }
 
@@ -237,7 +289,8 @@ async fn write_half(
         if tx.write_all(seed).await.0.is_err() {
             return;
         }
-        outbox.sent(len, changed);
+        outbox.sent(len);
+        changed.wake_all();
     }
     loop {
         wake.wait_until(|| view.has_record()).await;
@@ -247,7 +300,8 @@ async fn write_half(
                 let Some(view) = send(&tx, grant).await else {
                     return;
                 };
-                outbox.sent(len, changed);
+                outbox.sent(len);
+                changed.wake_all();
                 view
             }
             Ok(Err(view)) => view,
@@ -295,7 +349,8 @@ mod tests {
 
     fn conns(count: usize, cap: usize, seed: &[u8]) -> Rc<Connections> {
         let inbox = Rc::new(Inbox::blackhole());
-        Rc::new(Connections::new(count, cap, seed.to_vec(), inbox).expect("a small ring"))
+        let cap = ConnCap::try_from(cap).expect("a small ring");
+        Rc::new(Connections::new(count, cap, seed.to_vec(), inbox))
     }
 
     fn outbox(cap: usize) -> (Outbox, OutboxReader) {
@@ -363,8 +418,21 @@ mod tests {
         let first = conns.claim_slot().expect("a free slot");
         let second = conns.claim_slot().expect("another");
         assert!(conns.claim_slot().is_none());
-        assert_eq!((first.at, second.at), (0, 1));
-        conns.free_slot(first.at, &first.outbox);
-        assert_eq!(conns.claim_slot().expect("the freed slot").at, 0);
+        assert_eq!((first.index, second.index), (0, 1));
+        conns.free_slot(first.index, &first.outbox);
+        assert_eq!(conns.claim_slot().expect("the freed slot").index, 0);
+    }
+
+    #[test]
+    fn test_conn_cap_forms_a_ring() {
+        let cap: ConnCap = serde_json::from_str("64").expect("a small cap");
+        assert_eq!(cap.bytes(), 64);
+        assert_eq!(ConnCap::default().bytes(), 1 << 20);
+        assert_eq!(ConnCap::try_from(0).map(|cap| cap.bytes()), Ok(0));
+        assert_eq!(
+            ConnCap::try_from(usize::MAX).map(|cap| cap.bytes()),
+            Err(ConnCapTooLarge(usize::MAX))
+        );
+        assert!(serde_json::from_str::<ConnCap>(&usize::MAX.to_string()).is_err());
     }
 }

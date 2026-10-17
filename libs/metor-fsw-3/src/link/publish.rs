@@ -19,11 +19,11 @@ use crate::record::RecordSchema;
 use crate::system::PortDef;
 use crate::{Stop, system};
 
-use super::conn::Connections;
+use super::conn::{ConnCap, Connections};
 use super::inbox::Inbox;
 use super::transport::Endpoint;
 use super::wire;
-use super::{LinkParams, LinkStatus, default_conn_cap, report};
+use super::{LinkParams, LinkStatus, StatusReporter};
 
 /// The configuration for a [`Publish`].
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -32,8 +32,8 @@ pub struct PublishParams {
     pub link: LinkParams,
     /// The size in bytes of each connection's pending write buffer. It is
     /// also the largest batch the link builds.
-    #[serde(default = "default_conn_cap")]
-    pub conn_cap: usize,
+    #[serde(default)]
+    pub conn_cap: ConnCap,
 }
 
 /// A link that sends every record wired into it to its peers over
@@ -82,24 +82,19 @@ pub async fn publish(
         log.info(format!("listening on {addr}"));
     }
     let inbox = Rc::new(Inbox::blackhole());
-    let Some(conns) = Connections::new(endpoint.slots(), *conn_cap, blob, inbox) else {
-        log.fault("conn_cap", format!("no ring holds a {conn_cap}-byte batch"));
-        return;
-    };
-    let conns = Rc::new(conns);
+    let conns = Rc::new(Connections::new(endpoint.slots(), *conn_cap, blob, inbox));
     let _source = stellarator::spawn(endpoint.run(conns.clone(), stop.clone())).drop_guard();
-    let mut batch = Vec::with_capacity(*conn_cap);
-    let mut reported = LinkStatus::default();
+    let mut batch = Vec::with_capacity(conn_cap.bytes());
+    let mut reporter = StatusReporter::default();
     let run = async {
         loop {
             future::or(inputs.any_ready(), conns.changed()).await;
             batch.clear();
-            fill(&mut batch, inputs, &ids, *conn_cap);
+            fill(&mut batch, inputs, &ids, conn_cap.bytes());
             if !batch.is_empty() {
                 conns.enqueue(&batch);
             }
-            let status = LinkStatus::new(conns.stats(), 0);
-            report(&status, &mut reported, link_status, log);
+            reporter.report(LinkStatus::new(conns.stats(), 0), link_status, log);
         }
     };
     future::or(run, stop.wait()).await;
@@ -255,7 +250,7 @@ mod tests {
         produce(&rings, 4.0);
 
         let mut batch = Vec::new();
-        fill(&mut batch, &mut inputs, &ids, default_conn_cap());
+        fill(&mut batch, &mut inputs, &ids, ConnCap::default().bytes());
         let (table, msg) = (ids[0], ids[1]);
         assert_eq!(batch.len(), IMU_LEN + FIXED_LEN);
         assert_eq!(&batch[4..5], &[PacketTy::Table as u8]);

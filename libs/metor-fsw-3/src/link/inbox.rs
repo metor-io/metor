@@ -4,7 +4,7 @@ use core::cell::Cell;
 use core::mem::size_of;
 use std::collections::HashSet;
 
-use metor_fsw_3_ring::{Config, NoWake, Notifier, RingBuffer, View, Writer};
+use metor_fsw_3_ring::{Config, InvalidConfig, NoWake, Notifier, RingBuffer, View, Writer};
 use metor_proto::types::{Msg, PACKET_HEADER_LEN, PacketHeader, PacketId, PacketTy, Timestamp};
 use metor_proto_wkt::{LinkInfo, SetComponentMetadata, SetMsgMetadata, VTableMsg};
 use zerocopy::TryFromBytes;
@@ -12,6 +12,12 @@ use zerocopy::TryFromBytes;
 use crate::port::ring_capacity;
 
 const PER_RECORD_OVERHEAD: usize = PACKET_HEADER_LEN + size_of::<Timestamp>();
+
+/// How many reports of each missing table queue before the link drains them.
+///
+/// Each connect reports a table once, so this holds a few reconnects' worth;
+/// later reports repeat a fault already queued and are dropped.
+const MISSING_REPORTS_PER_TABLE: usize = 4;
 
 /// Messages a peer sends to describe itself before it sends data. None of
 /// them are routed to a port.
@@ -87,28 +93,24 @@ impl Inbox {
         inbox_cap: usize,
         record_max_len: usize,
         watch_announce: bool,
-    ) -> Option<(Self, View<Notifier>, View<NoWake>)> {
-        let ring = |max_len: usize, depth: usize| {
-            let config = Config {
-                capacity: ring_capacity(max_len, depth)?,
-                max_readers: 1,
-            };
-            RingBuffer::create_in_memory(config).ok()
-        };
-        let packets = ring(record_max_len.checked_add(PER_RECORD_OVERHEAD)?, inbox_cap)?;
+    ) -> Result<(Self, View<Notifier>, View<NoWake>), InvalidConfig> {
+        let packet_len = record_max_len
+            .checked_add(PER_RECORD_OVERHEAD)
+            .ok_or(InvalidConfig)?;
+        let packets = ring(packet_len, inbox_cap)?;
         let tables: Vec<PacketId> = routes
             .iter()
             .filter(|(ty, _)| *ty == PacketTy::Table)
             .map(|&(_, id)| id)
             .collect();
-        let missing = ring(size_of::<PacketId>(), 4 * tables.len().max(1))?;
+        let missing_depth = MISSING_REPORTS_PER_TABLE * tables.len().max(1);
+        let missing = ring(size_of::<PacketId>(), missing_depth)?;
         let wake = Notifier::default();
         // PANIC Safety: the rings are new, so their writers and their one
         // reader slots are free.
-        let writer = |ring: &RingBuffer| ring.writer(wake.clone()).expect("a new ring's writer");
         let inbox = Self {
-            writer: writer(&packets),
-            missing: writer(&missing),
+            writer: packets.writer(wake.clone()).expect("a new ring's writer"),
+            missing: missing.writer(wake.clone()).expect("a new ring's writer"),
             max_len: record_max_len,
             routes: routes.iter().copied().collect(),
             tables,
@@ -117,7 +119,7 @@ impl Inbox {
         };
         let packets = packets.view(wake).expect("a new ring's reader slot");
         let missing = missing.view(NoWake).expect("a new ring's reader slot");
-        Some((inbox, packets, missing))
+        Ok((inbox, packets, missing))
     }
 
     /// Creates an inbox that routes no packets anywhere.
@@ -159,10 +161,6 @@ impl Inbox {
                 let _ = self.missing.try_write(table);
             }
         }
-        let ty = match ty {
-            PacketTy::MsgWithTimestamp => PacketTy::Msg,
-            ty => ty,
-        };
         if !self.routes.contains(&(ty, id)) {
             return;
         }
@@ -176,17 +174,28 @@ impl Inbox {
     }
 }
 
-/// Parses a packet body into its type, id, and payload. Returns `None` for a
-/// time series packet, or a body too short for its header, so the type is
-/// never `TimeSeries`.
+/// Creates a one-reader ring that holds `depth` records of `max_len` bytes.
+fn ring(max_len: usize, depth: usize) -> Result<RingBuffer, InvalidConfig> {
+    let config = Config {
+        capacity: ring_capacity(max_len, depth).ok_or(InvalidConfig)?,
+        max_readers: 1,
+    };
+    RingBuffer::create_in_memory(config)
+}
+
+/// Parses a packet body into its type, id, and payload.
+///
+/// A timestamped message is returned as a plain `Msg` without its timestamp.
+/// Returns `None` for a time series packet, or a body too short for its
+/// header, so the type is only ever `Msg` or `Table`.
 pub(crate) fn packet(body: &[u8]) -> Option<(PacketTy, PacketId, &[u8])> {
     let (header, rest) = PacketHeader::try_ref_from_prefix(body).ok()?;
-    let bytes = match header.packet_ty {
-        PacketTy::Msg | PacketTy::Table => rest,
-        PacketTy::MsgWithTimestamp => rest.get(size_of::<Timestamp>()..)?,
+    let (ty, bytes) = match header.packet_ty {
+        PacketTy::Msg | PacketTy::Table => (header.packet_ty, rest),
+        PacketTy::MsgWithTimestamp => (PacketTy::Msg, rest.get(size_of::<Timestamp>()..)?),
         PacketTy::TimeSeries => return None,
     };
-    Some((header.packet_ty, header.id, bytes))
+    Some((ty, header.id, bytes))
 }
 
 #[cfg(test)]
@@ -430,6 +439,6 @@ mod tests {
 
     #[test]
     fn test_reject_ring_too_large_for_memory() {
-        assert!(Inbox::new(&[], usize::MAX, 8, false).is_none());
+        assert!(Inbox::new(&[], usize::MAX, 8, false).is_err());
     }
 }

@@ -23,6 +23,7 @@ use crate::coordinator::{BuildError, SystemTable};
 use crate::log::Log;
 use crate::port::Output;
 
+pub use conn::{ConnCap, ConnCapTooLarge};
 pub use publish::{Publish, PublishParams};
 pub use subscribe::{Subscribe, SubscribeParams};
 pub use transport::Transport;
@@ -44,12 +45,6 @@ pub struct LinkParams {
     /// The link's name, unique within its target.
     #[serde(default)]
     pub link: String,
-}
-
-/// The default number of bytes a link queues for one connection. A batch that
-/// would go past this is dropped.
-fn default_conn_cap() -> usize {
-    1 << 20
 }
 
 /// Socket statistics for a link. A link writes one on every cycle where a
@@ -91,23 +86,27 @@ impl LinkStatus {
     }
 }
 
-/// Writes `status` to `link_status` if any counter changed since `reported`.
-///
-/// If more inbound packets were dropped since the last report, this also logs
-/// a fault with the count.
-fn report(
-    status: &LinkStatus,
-    reported: &mut LinkStatus,
-    link_status: &Output<LinkStatus>,
-    log: &mut Log,
-) {
-    if status.inbound_dropped > reported.inbound_dropped {
-        let dropped = status.inbound_dropped - reported.inbound_dropped;
-        log.fault("inbound_dropped", format!("{dropped} packets dropped"));
-    }
-    if status.changed(reported) {
-        let _ = link_status.write(status);
-        *reported = *status;
+/// Writes a link's status when a counter changes.
+#[derive(Default)]
+struct StatusReporter {
+    reported: LinkStatus,
+}
+
+impl StatusReporter {
+    /// Writes `status` to `link_status` if any counter changed since the last
+    /// report.
+    ///
+    /// If more inbound packets were dropped since the last report, this also
+    /// logs a fault with the count.
+    fn report(&mut self, status: LinkStatus, link_status: &Output<LinkStatus>, log: &mut Log) {
+        if status.inbound_dropped > self.reported.inbound_dropped {
+            let dropped = status.inbound_dropped - self.reported.inbound_dropped;
+            log.fault("inbound_dropped", format!("{dropped} packets dropped"));
+        }
+        if status.changed(&self.reported) {
+            let _ = link_status.write(&status);
+            self.reported = status;
+        }
     }
 }
 

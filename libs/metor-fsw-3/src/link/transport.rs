@@ -1,5 +1,6 @@
 //! How a link gets its connections: by listening for peers, or by dialing one.
 
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
@@ -26,15 +27,16 @@ pub enum Transport {
     Listen {
         addr: String,
         #[serde(default = "max_connections")]
-        max_connections: usize,
+        max_connections: NonZeroUsize,
     },
     /// Dial `addr` and keep a single connection open.
     Connect { addr: String },
 }
 
 /// The default number of connections a listening link serves at once.
-fn max_connections() -> usize {
-    8
+fn max_connections() -> NonZeroUsize {
+    // PANIC Safety: evaluated at compile time.
+    const { NonZeroUsize::new(8).expect("8 is non-zero") }
 }
 
 /// A [`Transport`] that is ready to connect.
@@ -42,8 +44,13 @@ fn max_connections() -> usize {
 /// Links bind at build time, so a taken address fails the build instead of
 /// the run.
 pub(crate) enum Endpoint {
-    Listen { listener: TcpListener, slots: usize },
-    Connect { dialer: Dialer },
+    Listen {
+        listener: TcpListener,
+        slots: NonZeroUsize,
+    },
+    Connect {
+        dialer: Dialer,
+    },
 }
 
 impl Transport {
@@ -54,9 +61,6 @@ impl Transport {
                 addr,
                 max_connections,
             } => {
-                if *max_connections == 0 {
-                    return Err(ParamError::Decode("`max_connections` is at least 1".into()));
-                }
                 let listener = TcpListener::bind(addr.as_str())
                     .map_err(|e| ParamError::Decode(format!("binding `{addr}`: {e}")))?;
                 Ok(Endpoint::Listen {
@@ -75,7 +79,7 @@ impl Endpoint {
     /// Returns how many connections this endpoint serves at once.
     pub(crate) fn slots(&self) -> usize {
         match self {
-            Self::Listen { slots, .. } => *slots,
+            Self::Listen { slots, .. } => slots.get(),
             Self::Connect { .. } => 1,
         }
     }
@@ -87,6 +91,23 @@ impl Endpoint {
             Self::Listen { listener, .. } => listener.local_addr().ok(),
             Self::Connect { .. } => None,
         }
+    }
+
+    /// Opens and serves connections until `stop` is set.
+    ///
+    /// A listener accepts every peer, and closes a peer right away when every
+    /// slot is taken. A dialer keeps one connection open and redials when it
+    /// closes. This runs as its own task, separate from the link's loop, so
+    /// sending a batch never cancels an accept or a dial that is halfway
+    /// through.
+    pub(crate) async fn run(self, conns: Rc<Connections>, stop: Stop) {
+        let serve = async {
+            match self {
+                Self::Listen { listener, .. } => listen(listener, &conns, &stop).await,
+                Self::Connect { dialer } => dial(dialer, &conns, &stop).await,
+            }
+        };
+        futures_lite::future::or(serve, stop.wait()).await;
     }
 }
 
@@ -122,25 +143,6 @@ impl Dialer {
             self.delay = (delay * 2).min(BACKOFF_MAX);
             stellarator::sleep(delay).await;
         }
-    }
-}
-
-impl Endpoint {
-    /// Opens and serves connections until `stop` is set.
-    ///
-    /// A listener accepts every peer, and closes a peer right away when every
-    /// slot is taken. A dialer keeps one connection open and redials when it
-    /// closes. This runs as its own task, separate from the link's loop, so
-    /// sending a batch never cancels an accept or a dial that is halfway
-    /// through.
-    pub(crate) async fn run(self, conns: Rc<Connections>, stop: Stop) {
-        let serve = async {
-            match self {
-                Self::Listen { listener, .. } => listen(listener, &conns, &stop).await,
-                Self::Connect { dialer } => dial(dialer, &conns, &stop).await,
-            }
-        };
-        futures_lite::future::or(serve, stop.wait()).await;
     }
 }
 
@@ -211,7 +213,7 @@ mod tests {
         let endpoint = listen("127.0.0.1:0").bind().expect("a free port");
         let addr = endpoint.local_addr().expect("a bound listener");
         assert_ne!(addr.port(), 0);
-        assert_eq!(endpoint.slots(), max_connections());
+        assert_eq!(endpoint.slots(), max_connections().get());
     }
 
     #[test]
@@ -229,14 +231,8 @@ mod tests {
 
     #[test]
     fn test_reject_zero_connections() {
-        let transport = Transport::Listen {
-            addr: "127.0.0.1:0".into(),
-            max_connections: 0,
-        };
-        let Err(ParamError::Decode(message)) = transport.bind() else {
-            panic!("a listener with no slots is an error")
-        };
-        assert!(message.contains("max_connections"), "{message}");
+        let text = r#"{"listen":{"addr":"127.0.0.1:0","max_connections":0}}"#;
+        assert!(serde_json::from_str::<Transport>(text).is_err());
     }
 
     #[test]
@@ -253,7 +249,8 @@ mod tests {
         // A port nothing listens on, so every dial is refused.
         let dialer = Dialer::new("127.0.0.1:1".parse().expect("an address"));
         let inbox = Rc::new(super::super::inbox::Inbox::blackhole());
-        let conns = Connections::new(1, 64, Vec::new(), inbox).expect("a small ring");
+        let cap = super::super::ConnCap::try_from(64).expect("a small ring");
+        let conns = Connections::new(1, cap, Vec::new(), inbox);
         handle.stop();
         Endpoint::Connect { dialer }.run(Rc::new(conns), stop).await;
     }
