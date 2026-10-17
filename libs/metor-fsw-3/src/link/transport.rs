@@ -183,7 +183,6 @@ pub(crate) async fn accept(listener: &TcpListener) -> Option<TcpStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_system::stop_pair;
 
     fn listen(addr: &str) -> Transport {
         Transport::Listen {
@@ -250,7 +249,7 @@ mod tests {
 
     #[stellarator::test]
     async fn test_stop_ends_a_dialing_endpoint() {
-        let (handle, stop) = stop_pair();
+        let (handle, stop) = Stop::pair();
         // A port nothing listens on, so every dial is refused.
         let dialer = Dialer::new("127.0.0.1:1".parse().expect("an address"));
         let inbox = Rc::new(super::super::inbox::Inbox::blackhole());
