@@ -312,7 +312,6 @@ mod tests {
     use stellarator::net::TcpStream;
 
     use crate::DefCx;
-    use crate::async_system::stop_pair;
     use crate::port::Input;
     use crate::record::Record;
     use crate::system::{InputBinding, Ports};
@@ -486,7 +485,7 @@ mod tests {
     async fn test_serve_every_client_until_dropped() {
         let (_dir, db) = store();
         let (listener, addr) = listener();
-        let (_handle, stop) = stop_pair();
+        let (_handle, stop) = Stop::pair();
         let served = stellarator::spawn(serve(listener, db, stop)).drop_guard();
 
         let mut clients = Vec::new();
