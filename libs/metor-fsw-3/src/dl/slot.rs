@@ -28,7 +28,7 @@ use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
 use crate::{FrameBytes, FrameStr};
 
-use super::{DlPack, Pack, PackError, is_loaded, store};
+use super::{DlPack, InstanceRings, Pack, is_loaded, store};
 
 /// The name in the slot's system definition.
 const SLOT_NAME: &str = "dl_slot";
@@ -82,83 +82,76 @@ struct Resolved {
     occupant: Occupant,
 }
 
-/// Returns the table entry for the `fsw.dl_slot` system type.
-pub(crate) fn entry() -> TableEntry {
-    TableEntry {
-        kind: SystemKind::Cyclic,
-        def: SystemDef {
-            name: SLOT_NAME.into(),
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            grants: Vec::new(),
-        },
-        def_fn: Box::new(def),
-        doc: "Loads one of the pack systems it allows on its channel's `Load`.".into(),
-        schema: None,
-        make: Arc::new(make),
+impl TableEntry {
+    /// The table entry for the `fsw.dl_slot` system type.
+    pub(crate) fn dl_slot() -> Self {
+        Self {
+            kind: SystemKind::Cyclic,
+            def: SystemDef {
+                name: SLOT_NAME.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                grants: Vec::new(),
+            },
+            def_fn: Box::new(DlSlot::def),
+            doc: "Loads one of the pack systems it allows on its channel's `Load`.".into(),
+            schema: None,
+            make: Arc::new(DlSlot::make),
+        }
     }
 }
 
-/// Returns the slot's definition, using the first candidate's ports.
-///
-/// Fails if any candidate has not been resolved by `metor build`.
-fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-    let refused = |message: String| DefError::Slot { message };
-    let params = SlotParams::deserialize(cx.params).map_err(|e| refused(e.to_string()))?;
-    let mut stored = params
-        .allow
-        .iter()
-        .map(|candidate| match &candidate.source {
-            Source::Stored(stored) => Ok(stored),
-            Source::Pack(_) => Err(refused(not_resolved(&candidate.name))),
-        });
-    let first = stored
-        .next()
-        .ok_or_else(|| refused("the slot allows nothing".into()))??;
-    stored.try_for_each(|candidate| candidate.map(drop))?;
-    Ok(SystemDef {
-        name: SLOT_NAME.into(),
-        ..first.def.clone()
-    })
-}
-
-fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
-    let Some(adapter @ Adapter::Channel(_)) = cx.adapter else {
-        return Err(ParamError::SlotChannel);
-    };
-    let params: SlotParams = cx.params.decode()?;
-    let candidates = params
-        .allow
-        .into_iter()
-        .enumerate()
-        .map(|(index, candidate)| Resolved::of(index, candidate))
-        .collect::<Result<_, _>>()?;
-    let mut slot = DlSlot {
-        instance: Instance {
-            id: cx.id.to_string(),
-            def: cx.def.clone(),
-            adapter: Some(adapter.clone()),
-        },
-        inputs: cx
-            .inputs
-            .into_iter()
-            .map(|rings| rings.into_iter().cloned().collect())
-            .collect(),
-        outputs: cx.outputs.into_iter().cloned().collect(),
-        candidates,
-        current: None,
-        end: None,
-        io: cx.io.clone(),
-    };
-    if let Some(name) = params.initial
-        && let Err(error) = slot.load(&name)
-    {
-        slot.end = Some(EndReason::Failed(error.to_string().into()));
+impl SystemDef {
+    /// Whether `self` and `other` take the same ports in the same order, and
+    /// the same grants, ignoring the namespace each port is announced under.
+    pub(crate) fn same_ports(&self, other: &SystemDef) -> bool {
+        let same = |a: &[PortDef], b: &[PortDef]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(a, b)| a.name == b.name && a.same_record(b))
+        };
+        same(&self.inputs, &other.inputs)
+            && same(&self.outputs, &other.outputs)
+            && self.grants == other.grants
     }
-    Ok(Box::new(slot))
 }
 
 impl Resolved {
+    /// Opens this candidate's library after checking its hash.
+    fn open(&self) -> Result<Pack, LoadError> {
+        match self.kind {
+            PackKind::Dylib => self.open_dylib(),
+        }
+    }
+
+    /// Opens this candidate's library.
+    ///
+    /// A library that is already loaded was checked when it was first opened,
+    /// so it is not hashed again. On a first open, the file is hashed, opened,
+    /// and then checked to make sure the opened file is the one that was
+    /// hashed.
+    fn open_dylib(&self) -> Result<Pack, LoadError> {
+        let io_error = |e: std::io::Error| LoadError::Open(e.to_string());
+        if is_loaded(&self.path) {
+            // SAFETY: the library is already mapped in this process.
+            let pack = unsafe { DlPack::open(&self.path) };
+            return Ok(Pack::Dl(pack.map_err(|e| LoadError::Open(e.to_string()))?));
+        }
+        let hashed = store::Hashed::of(&self.path).map_err(io_error)?;
+        if hashed.hash != self.hash {
+            return Err(LoadError::Hash(self.name.clone()));
+        }
+        // SAFETY: the library is in the store that `metor build` wrote, and its
+        // bytes match the hash build recorded. `open` checks the ABI first.
+        let pack = unsafe { DlPack::open(&self.path) };
+        let pack = pack.map_err(|e| LoadError::Open(e.to_string()))?;
+        if !hashed.still_at(&self.path).map_err(io_error)? {
+            return Err(LoadError::Hash(self.name.clone()));
+        }
+        Ok(Pack::Dl(pack))
+    }
+
     fn of(index: usize, candidate: Candidate) -> Result<Self, ParamError> {
         let Source::Stored(Stored {
             path, hash, kind, ..
@@ -213,12 +206,72 @@ pub struct DlSlot {
 
 /// The loaded system and the pack it was created from.
 struct Loaded {
-    at: usize,
+    index: usize,
     pack: Arc<Pack>,
     step: Box<dyn Step>,
 }
 
 impl DlSlot {
+    /// Returns the slot's definition, using the first candidate's ports.
+    ///
+    /// Fails if any candidate has not been resolved by `metor build`.
+    fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        let refused = |message: String| DefError::Slot { message };
+        let params = SlotParams::deserialize(cx.params).map_err(|e| refused(e.to_string()))?;
+        let mut stored = params
+            .allow
+            .iter()
+            .map(|candidate| match &candidate.source {
+                Source::Stored(stored) => Ok(stored),
+                Source::Pack(_) => Err(refused(not_resolved(&candidate.name))),
+            });
+        let first = stored
+            .next()
+            .ok_or_else(|| refused("the slot allows nothing".into()))??;
+        stored.try_for_each(|candidate| candidate.map(drop))?;
+        Ok(SystemDef {
+            name: SLOT_NAME.into(),
+            ..first.def.clone()
+        })
+    }
+
+    /// Creates a slot on the rings `cx` gives, and loads its initial candidate.
+    fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
+        let Some(adapter @ Adapter::Channel(_)) = cx.adapter else {
+            return Err(ParamError::SlotChannel);
+        };
+        let params: SlotParams = cx.params.decode()?;
+        let candidates = params
+            .allow
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| Resolved::of(index, candidate))
+            .collect::<Result<_, _>>()?;
+        let mut slot = DlSlot {
+            instance: Instance {
+                id: cx.id.to_string(),
+                def: cx.def.clone(),
+                adapter: Some(adapter.clone()),
+            },
+            inputs: cx
+                .inputs
+                .into_iter()
+                .map(|rings| rings.into_iter().cloned().collect())
+                .collect(),
+            outputs: cx.outputs.into_iter().cloned().collect(),
+            candidates,
+            current: None,
+            end: None,
+            io: cx.io.clone(),
+        };
+        if let Some(name) = params.initial
+            && let Err(error) = slot.load(&name)
+        {
+            slot.end = Some(EndReason::Failed(error.to_string().into()));
+        }
+        Ok(Box::new(slot))
+    }
+
     fn check_ports(&self, pack: &Pack, candidate: &Resolved) -> Result<(), LoadError> {
         let cx = DefCx {
             id: &self.instance.id,
@@ -228,7 +281,7 @@ impl DlSlot {
         let def = pack
             .def(&candidate.ty, &cx)
             .map_err(|e| LoadError::Mismatch(format!("{}: {e}", candidate.name)))?;
-        if !same_ports(&def, &self.instance.def) {
+        if !def.same_ports(&self.instance.def) {
             return Err(LoadError::Mismatch(candidate.name.clone()));
         }
         Ok(())
@@ -241,23 +294,26 @@ impl DlSlot {
             .map(|rings| rings.iter().collect())
             .collect();
         let outputs: Vec<&RingBuffer> = self.outputs.iter().collect();
-        let ports = (&inputs[..], &outputs[..]);
+        let rings = InstanceRings {
+            inputs: &inputs,
+            outputs: &outputs,
+        };
         pack.create(
             &candidate.ty,
             &candidate.params,
             &self.instance,
-            ports,
+            rings,
             &self.io,
         )
         .map_err(LoadError::Create)
     }
 
-    /// Creates candidate `at` on the slot's rings.
+    /// Creates candidate `index` on the slot's rings.
     ///
     /// No other system may be loaded when this is called.
-    fn place(&mut self, at: usize, pack: Arc<Pack>) -> Result<(), LoadError> {
-        let step = self.create(&pack, &self.candidates[at])?;
-        self.current = Some(Loaded { at, pack, step });
+    fn place(&mut self, index: usize, pack: Arc<Pack>) -> Result<(), LoadError> {
+        let step = self.create(&pack, &self.candidates[index])?;
+        self.current = Some(Loaded { index, pack, step });
         self.end = None;
         Ok(())
     }
@@ -284,80 +340,31 @@ impl Step for DlSlot {
     /// keeps running. If the new system's constructor fails, the previous
     /// system is created again.
     fn load(&mut self, name: &str) -> Result<(), LoadError> {
-        let at = self
+        let index = self
             .candidates
             .iter()
             .position(|candidate| candidate.name == name)
             .ok_or_else(|| LoadError::Unknown(name.to_string()))?;
-        let pack = Arc::new(open(&self.candidates[at])?);
-        self.check_ports(&pack, &self.candidates[at])?;
+        let pack = Arc::new(self.candidates[index].open()?);
+        self.check_ports(&pack, &self.candidates[index])?;
         // Drop the old system first so its ring readers and writers are free
         // for the new one.
-        let previous = self.current.take().map(|loaded| (loaded.at, loaded.pack));
-        let placed = self.place(at, pack);
-        if let (Err(_), Some((at, pack))) = (&placed, previous) {
+        let previous = self
+            .current
+            .take()
+            .map(|loaded| (loaded.index, loaded.pack));
+        let placed = self.place(index, pack);
+        if let (Err(_), Some((previous, pack))) = (&placed, previous) {
             // The old library is still loaded and the rings are free again.
-            let _ = self.place(at, pack);
+            let _ = self.place(previous, pack);
         }
         placed
     }
 
     fn occupant(&self) -> Option<&Occupant> {
         let loaded = self.current.as_ref()?;
-        Some(&self.candidates[loaded.at].occupant)
+        Some(&self.candidates[loaded.index].occupant)
     }
-}
-
-/// Opens a candidate's library after checking its hash.
-fn open(candidate: &Resolved) -> Result<Pack, LoadError> {
-    match candidate.kind {
-        PackKind::Dylib => open_dylib(candidate),
-    }
-}
-
-/// Opens a candidate's library.
-///
-/// A library that is already loaded was checked when it was first opened, so
-/// it is not hashed again. On a first open, the file is hashed, opened, and
-/// then checked to make sure the opened file is the one that was hashed.
-fn open_dylib(candidate: &Resolved) -> Result<Pack, LoadError> {
-    let io_error = |e: std::io::Error| LoadError::Open(e.to_string());
-    if is_loaded(&candidate.path) {
-        // SAFETY: the library is already mapped in this process.
-        let pack = unsafe { DlPack::open(&candidate.path) }.map_err(open_error)?;
-        return Ok(Pack::Dl(pack));
-    }
-    let hashed = store::Hashed::of(&candidate.path).map_err(io_error)?;
-    if hashed.hash != candidate.hash {
-        return Err(LoadError::Hash(candidate.name.clone()));
-    }
-    // SAFETY: the library is in the store that `metor build` wrote, and its
-    // bytes match the hash build recorded. `open` checks the ABI first.
-    let pack = unsafe { DlPack::open(&candidate.path) }.map_err(open_error)?;
-    if !hashed.still_at(&candidate.path).map_err(io_error)? {
-        return Err(LoadError::Hash(candidate.name.clone()));
-    }
-    Ok(Pack::Dl(pack))
-}
-
-fn open_error(error: PackError) -> LoadError {
-    LoadError::Open(error.to_string())
-}
-
-/// Returns whether two definitions have the same ports in the same order.
-///
-/// Ports match when their names and records match. The namespace each port is
-/// announced under is ignored.
-/// Whether two definitions take the same ports and the same grants.
-pub(crate) fn same_ports(a: &SystemDef, b: &SystemDef) -> bool {
-    same_list(&a.inputs, &b.inputs) && same_list(&a.outputs, &b.outputs) && a.grants == b.grants
-}
-
-fn same_list(a: &[PortDef], b: &[PortDef]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(a, b)| a.name == b.name && a.same_record(b))
 }
 
 #[cfg(test)]

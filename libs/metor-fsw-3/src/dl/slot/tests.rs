@@ -18,7 +18,7 @@ fn def_with(outputs: Vec<PortDef>) -> SystemDef {
 }
 
 fn slot_def(params: &Value) -> Result<SystemDef, DefError> {
-    def(&DefCx {
+    DlSlot::def(&DefCx {
         params,
         ..DefCx::empty()
     })
@@ -116,9 +116,9 @@ fn test_resolved_refuses_bad_fields() {
 #[test]
 fn test_same_ports() {
     let a = def_with(vec![port("imu")]);
-    assert!(same_ports(&a, &a));
-    assert!(!same_ports(&a, &def_with(vec![port("other")])));
-    assert!(!same_ports(&a, &def_with(Vec::new())));
+    assert!(a.same_ports(&a));
+    assert!(!a.same_ports(&def_with(vec![port("other")])));
+    assert!(!a.same_ports(&def_with(Vec::new())));
     let rooted = SystemDef {
         outputs: vec![Output::<Imu>::def(
             &DefCx {
@@ -130,7 +130,7 @@ fn test_same_ports() {
         )],
         ..a.clone()
     };
-    assert!(same_ports(&a, &rooted));
+    assert!(a.same_ports(&rooted));
     let capped = SystemDef {
         grants: vec![crate::io::GrantDef {
             param: "uart".into(),
@@ -138,5 +138,5 @@ fn test_same_ports() {
         }],
         ..a.clone()
     };
-    assert!(!same_ports(&a, &capped), "candidates take the same caps");
+    assert!(!a.same_ports(&capped), "candidates take the same caps");
 }

@@ -6,7 +6,10 @@
 
 use core::ffi::c_void;
 
-use metor_fsw_3_ring::{RawOwner, RingExport};
+use metor_fsw_3_ring::{RawOwner, RingBuffer, RingExport};
+
+use crate::coordinator::ParamError;
+use crate::io::Arena;
 
 /// A borrowed array passed across the ABI.
 ///
@@ -95,6 +98,31 @@ impl RawRing {
             len,
             owner: Some(export.owner()),
         }
+    }
+
+    /// The region of `arena`, with an owner that keeps it alive. Empty before
+    /// the arena is set.
+    pub(crate) fn from_arena(arena: &Arena) -> Self {
+        arena.region().map_or(Self::EMPTY, |(base, len)| Self {
+            base: base.as_ptr(),
+            len,
+            owner: arena.owner(),
+        })
+    }
+
+    /// Attaches to the ring in this region.
+    ///
+    /// # Safety
+    /// The region holds a ring. An owner's callbacks are live and
+    /// thread-safe. A region with no owner outlives every handle to the ring.
+    pub(crate) unsafe fn attach(&self) -> Result<RingBuffer, ParamError> {
+        let attached = match self.owner {
+            // SAFETY: the caller's contract.
+            Some(owner) => unsafe { RingBuffer::attach_owned(self.base, self.len, owner) },
+            // SAFETY: the caller's contract.
+            None => unsafe { RingBuffer::attach_raw(self.base, self.len) },
+        };
+        attached.map_err(|e| ParamError::Decode(e.to_string()))
     }
 }
 

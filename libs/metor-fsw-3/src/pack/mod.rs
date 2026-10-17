@@ -16,7 +16,6 @@ use crate::coordinator::{
     EndReason, MakeCx, ParamError, Params, Step, Stepped, SystemTable, catch_step,
 };
 use crate::def::DefError;
-use crate::io::{Arena, Keep, SharedIo};
 use crate::system::SystemDef;
 use crate::thread::Threads;
 use def::{DefCxOwned, Instance, PackDef};
@@ -41,22 +40,25 @@ pub enum Status {
     Failed = 4,
 }
 
-impl Status {
-    /// Converts a status word, returning `None` if the word is unknown.
-    pub fn try_from_raw(word: u32) -> Option<Status> {
+impl TryFrom<u32> for Status {
+    type Error = u32;
+
+    fn try_from(word: u32) -> Result<Status, u32> {
         match word {
-            0 => Some(Status::Ok),
-            1 => Some(Status::Panicked),
-            2 => Some(Status::Completed),
-            3 => Some(Status::Aborted),
-            4 => Some(Status::Failed),
-            _ => None,
+            0 => Ok(Status::Ok),
+            1 => Ok(Status::Panicked),
+            2 => Ok(Status::Completed),
+            3 => Ok(Status::Aborted),
+            4 => Ok(Status::Failed),
+            _ => Err(word),
         }
     }
+}
 
+impl Status {
     /// Converts a status word, treating an unknown word as a panic.
     pub fn from_raw(word: u32) -> Status {
-        Status::try_from_raw(word).unwrap_or(Status::Panicked)
+        Status::try_from(word).unwrap_or(Status::Panicked)
     }
 
     /// Returns the status for a step whose end reason is `end`.
@@ -93,6 +95,21 @@ pub enum DefStatus {
     Panicked = 3,
     /// The type rejected the config. `dst` holds the [`DefError`] as JSON.
     Refused = 4,
+}
+
+impl TryFrom<u32> for DefStatus {
+    type Error = u32;
+
+    fn try_from(word: u32) -> Result<DefStatus, u32> {
+        match word {
+            0 => Ok(DefStatus::Ok),
+            1 => Ok(DefStatus::TooSmall),
+            2 => Ok(DefStatus::Encode),
+            3 => Ok(DefStatus::Panicked),
+            4 => Ok(DefStatus::Refused),
+            _ => Err(word),
+        }
+    }
 }
 
 thread_local! {
@@ -294,21 +311,34 @@ unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn S
     let instance: Instance =
         serde_json::from_slice(def).map_err(|e| ParamError::Decode(e.to_string()))?;
     // SAFETY: the caller's contract.
-    let (ports, out_rings) = unsafe { (inputs.as_slice::<RawSlice>(), outputs.as_slice()) };
+    let (ports, out_rings) =
+        unsafe { (inputs.as_slice::<RawSlice>(), outputs.as_slice::<RawRing>()) };
     let ins: Vec<Vec<RingBuffer>> = ports
         .iter()
-        // SAFETY: the caller's contract.
-        .map(|port| unsafe { port.as_slice() }.iter().map(attach).collect())
+        .map(|port| {
+            // SAFETY: the caller's contract covers the array, each ring, and
+            // its owner.
+            let rings = unsafe { port.as_slice::<RawRing>() };
+            // SAFETY: as above.
+            rings.iter().map(|ring| unsafe { ring.attach() }).collect()
+        })
         .collect::<Result<_, _>>()?;
-    let outs: Vec<RingBuffer> = out_rings.iter().map(attach).collect::<Result<_, _>>()?;
+    let outs: Vec<RingBuffer> = out_rings
+        .iter()
+        // SAFETY: the caller's contract covers each ring and its owner.
+        .map(|ring| unsafe { ring.attach() })
+        .collect::<Result<_, _>>()?;
 
     let views = ins.iter().map(|rings| rings.iter().collect()).collect();
     let writers = outs.iter().collect();
     let io = IO.with(Clone::clone);
     // SAFETY: the caller's contract.
     let given = unsafe { table.read() };
-    // SAFETY: as above; the region and its owner are live.
-    unsafe { adopt(&io, &instance, given) };
+    if !instance.def.grants.is_empty() {
+        let arena = io.borrow_mut().get_or_add_member(&instance.id);
+        // SAFETY: as above; the region and its owner are live.
+        unsafe { arena.adopt(given) };
+    }
     let step = with_table(build, |table| {
         let entry = table
             .get(ty)
@@ -333,58 +363,11 @@ unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn S
             })
         })
     })?;
+    let region = io.borrow().arena(&instance.id);
+    let region = region.map_or(RawRing::EMPTY, |arena| RawRing::from_arena(&arena));
     // SAFETY: the caller's contract.
-    unsafe { table.write(region_of(&io, &instance.id)) };
+    unsafe { table.write(region) };
     Ok(step)
-}
-
-/// Sets system `instance`'s arena to the region `ring` names, unless the
-/// system has no `Cap`, its arena is already set, or the region is empty.
-///
-/// # Safety
-/// A non-empty `ring` is live, and its owner meets `RawOwner`'s contract.
-/// A region with no owner outlives the arena, such as memory a wasm host
-/// wrote into its guest.
-pub(crate) unsafe fn adopt(io: &SharedIo, instance: &Instance, ring: RawRing) {
-    if host_caps(&instance.def).next().is_none() {
-        return;
-    }
-    let arena = io.borrow_mut().get_or_add_member(&instance.id);
-    let base = core::ptr::NonNull::new(ring.base).filter(|_| ring.len > 0);
-    let Some(base) = base.filter(|_| arena.region().is_none()) else {
-        return;
-    };
-    // SAFETY: the caller's contract.
-    let keep = match ring.owner {
-        Some(owner) => Keep::Lease(unsafe { metor_fsw_3_ring::Lease::acquire(owner) }),
-        None => Keep::Unowned,
-    };
-    // SAFETY: the caller's contract, and `keep` holds the owner's reference.
-    unsafe { arena.set(base, ring.len, keep) };
-}
-
-/// An arena's region, with an owner that keeps it alive, to pass across the
-/// pack ABI. Empty before the arena is set.
-pub(crate) fn ring_of(arena: &Arena) -> RawRing {
-    arena
-        .region()
-        .map_or(RawRing::EMPTY, |(base, len)| RawRing {
-            base: base.as_ptr(),
-            len,
-            owner: arena.owner(),
-        })
-}
-
-/// The region of system `id`'s member, or an empty one when it has no IO.
-fn region_of(io: &SharedIo, id: &str) -> RawRing {
-    io.borrow()
-        .arena(id)
-        .map_or(RawRing::EMPTY, |arena| ring_of(&arena))
-}
-
-/// The names of the `Cap` parameters in `def`.
-pub(crate) fn host_caps(def: &SystemDef) -> impl Iterator<Item = String> + '_ {
-    def.grants.iter().map(|g| g.param.to_string())
 }
 
 /// Decodes the params JSON. Empty bytes mean no params.
@@ -393,18 +376,6 @@ fn decode_params(bytes: &[u8]) -> Result<serde_json::Value, ParamError> {
         return Ok(serde_json::Value::Null);
     }
     serde_json::from_slice(bytes).map_err(|e| ParamError::Decode(e.to_string()))
-}
-
-/// Attaches to a ring the host allocated.
-fn attach(ring: &RawRing) -> Result<RingBuffer, ParamError> {
-    let attached = match ring.owner {
-        // SAFETY: `create` requires live, thread-safe ownership callbacks.
-        Some(owner) => unsafe { RingBuffer::attach_owned(ring.base, ring.len, owner) },
-        // SAFETY: a ring with no owner lives in this module's own memory, which
-        // outlives every handle to it.
-        None => unsafe { RingBuffer::attach_raw(ring.base, ring.len) },
-    };
-    attached.map_err(|e| ParamError::Decode(e.to_string()))
 }
 
 /// Serializes `source` into this thread's error buffer.

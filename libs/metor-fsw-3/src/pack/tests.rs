@@ -415,8 +415,10 @@ fn test_unknown_status_is_panicked() {
     assert_eq!(Status::from_raw(0), Status::Ok);
     assert_eq!(Status::from_raw(1), Status::Panicked);
     assert_eq!(Status::from_raw(7), Status::Panicked);
-    assert_eq!(Status::try_from_raw(4), Some(Status::Failed));
-    assert_eq!(Status::try_from_raw(7), None);
+    assert_eq!(Status::try_from(4), Ok(Status::Failed));
+    assert_eq!(DefStatus::try_from(4), Ok(DefStatus::Refused));
+    assert_eq!(Status::try_from(7), Err(7));
+    assert_eq!(DefStatus::try_from(5), Err(5));
 }
 
 #[test]

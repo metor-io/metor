@@ -1,6 +1,8 @@
 //! Loads packs that are built as shared libraries into this process.
 
 use core::ffi::c_void;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -9,16 +11,13 @@ use metor_proto::types::Timestamp;
 
 use crate::coordinator::{EndReason, ParamError, Step};
 use crate::def::{DefCx, DefError};
-use crate::pack::def::{Instance, PackDef};
+use crate::pack::def::{DefCxOwned, Instance, PackDef};
 use crate::pack::raw::{RawRing, RawSlice};
 use crate::pack::{ABI_VERSION, Status};
 use crate::system::SystemDef;
 
-use super::PackError;
-use super::codec::{
-    DESCRIPTOR_CAPACITY, decode_create_error, decode_def, decode_descriptor, encode_def_cx,
-    encode_instance,
-};
+use super::codec::DESCRIPTOR_CAPACITY;
+use super::{InstanceRings, PackError};
 
 type VersionFn = unsafe extern "C" fn() -> u32;
 type PackDefFn = unsafe extern "C" fn(*mut u8, usize, *mut usize) -> u32;
@@ -37,7 +36,7 @@ type DestroyFn = unsafe extern "C" fn(*mut c_void);
 
 // Libraries are never unloaded, because guest threads and TLS destructors may
 // still run their code.
-static LIBRARIES: Mutex<Vec<(PathBuf, Arc<Library>)>> = Mutex::new(Vec::new());
+static LIBRARIES: Mutex<BTreeMap<PathBuf, Arc<Library>>> = Mutex::new(BTreeMap::new());
 
 fn library_key(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
@@ -48,32 +47,25 @@ pub(crate) fn is_loaded(path: &Path) -> bool {
     LIBRARIES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .any(|(path, _)| *path == key)
+        .contains_key(&key)
 }
 
 unsafe fn resident_library(path: &Path) -> Result<Arc<Library>, PackError> {
-    let key = library_key(path);
-    {
-        let libraries = LIBRARIES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, lib)) = libraries.iter().find(|(path, _)| *path == key) {
-            return Ok(lib.clone());
+    let mut libraries = LIBRARIES.lock().unwrap_or_else(|e| e.into_inner());
+    match libraries.entry(library_key(path)) {
+        Entry::Occupied(entry) => Ok(entry.get().clone()),
+        Entry::Vacant(entry) => {
+            // SAFETY: DlPack::open's caller authorizes library initialization.
+            let lib = unsafe { Library::new(path) }.map_err(PackError::Open)?;
+            Ok(entry.insert(Arc::new(lib)).clone())
         }
     }
-    // SAFETY: DlPack::open's caller authorizes library initialization.
-    let lib = Arc::new(unsafe { Library::new(path) }.map_err(PackError::Open)?);
-    let mut libraries = LIBRARIES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, existing)) = libraries.iter().find(|(path, _)| *path == key) {
-        return Ok(existing.clone());
-    }
-    libraries.push((key, lib.clone()));
-    Ok(lib)
 }
 
 unsafe fn descriptor(def_fn: PackDefFn) -> Result<PackDef, PackError> {
     // SAFETY: the matched ABI writes only inside this buffer and result slot.
     let (status, bytes) = call_export(|dst, cap, written| unsafe { def_fn(dst, cap, written) });
-    decode_descriptor(status, bytes.as_deref())
+    PackDef::decode(status, bytes.as_deref())
 }
 
 /// Calls an export that writes into a host buffer.
@@ -151,7 +143,7 @@ impl DlPack {
 
     /// Returns the definition of type `ty` for one instance's config.
     pub fn def(&self, ty: &str, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        let cx = encode_def_cx(cx)?;
+        let cx = DefCxOwned::encode(cx)?;
         // SAFETY: the matched ABI writes only inside this buffer and result slot,
         // and reads the two arrays for the length of the call.
         let (status, bytes) = call_export(|dst, cap, written| unsafe {
@@ -163,7 +155,7 @@ impl DlPack {
                 written,
             )
         });
-        decode_def(status, bytes.as_deref())
+        SystemDef::decode(status, bytes.as_deref())
     }
 
     /// Returns the descriptor this pack exported.
@@ -188,10 +180,10 @@ impl DlPack {
         ty: &str,
         params: &serde_json::Value,
         instance: &Instance,
-        (inputs, outputs): super::Ports<'_>,
+        InstanceRings { inputs, outputs }: InstanceRings<'_>,
         table: &mut RawRing,
     ) -> Result<DlStep, ParamError> {
-        let (params, def) = encode_instance(params, instance)?;
+        let (params, def) = instance.encode(params)?;
         let input_owners: Vec<Vec<_>> = inputs
             .iter()
             .map(|rings| rings.iter().map(|ring| ring.export()).collect())
@@ -220,12 +212,12 @@ impl DlPack {
         };
         if instance.is_null() {
             // SAFETY: the pack owns the buffer until the next `create` on this thread.
-            return Err(decode_create_error(unsafe { error.as_bytes() }));
+            return Err(ParamError::from_create_error(unsafe { error.as_bytes() }));
         }
         Ok(DlStep {
             instance,
             fns: self.fns,
-            lib: self.lib.clone(),
+            _lib: self.lib.clone(),
             end: None,
         })
     }
@@ -246,7 +238,7 @@ pub struct DlStep {
     instance: *mut c_void,
     fns: PackFns,
     /// Keeps the library loaded for as long as the instance lives.
-    lib: Arc<Library>,
+    _lib: Arc<Library>,
     end: Option<EndReason>,
 }
 
@@ -271,10 +263,9 @@ impl Step for DlStep {
 
 impl Drop for DlStep {
     fn drop(&mut self) {
-        // SAFETY: the instance came from `create` and is destroyed once. `lib`
+        // SAFETY: the instance came from `create` and is destroyed once. `_lib`
         // drops after this, so the code running here is still mapped.
         unsafe { (self.fns.destroy)(self.instance) };
-        let _ = &self.lib;
     }
 }
 

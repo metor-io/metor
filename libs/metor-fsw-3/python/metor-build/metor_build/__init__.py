@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import sys
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -98,10 +97,9 @@ def _binary() -> list[str]:
 
 def _cargo_root() -> Path:
     """Returns the cargo workspace root, for the `cargo run` fallback inside
-    the repo."""
+    the repo. Raises `RuntimeError` if no workspace is above the cwd."""
     for directory in [Path.cwd().resolve(), *Path.cwd().resolve().parents]:
         manifest = directory / "Cargo.toml"
         if manifest.is_file() and "[workspace]" in manifest.read_text(encoding="utf-8"):
             return directory
-    print("metor-build: no cargo workspace above this pack", file=sys.stderr)
-    return Path.cwd()
+    raise RuntimeError("no cargo workspace above this pack; set METOR_BIN or put `metor` on PATH")

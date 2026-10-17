@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// A library that [`put`] copied into the store.
-pub struct Stored {
+pub struct StoredLibrary {
     pub path: PathBuf,
     pub hash: blake3::Hash,
 }
@@ -24,7 +24,7 @@ pub fn dir(target_dir: &Path) -> PathBuf {
 ///
 /// A stored file is never rewritten. That way, a library another process has
 /// mapped keeps its inode.
-pub fn put(store: &Path, artifact: &Path) -> io::Result<Stored> {
+pub fn put(store: &Path, artifact: &Path) -> io::Result<StoredLibrary> {
     let hash = hash(artifact)?;
     let name = artifact
         .file_name()
@@ -35,7 +35,7 @@ pub fn put(store: &Path, artifact: &Path) -> io::Result<Stored> {
         std::fs::create_dir_all(&dir)?;
         copy_atomic(artifact, &path)?;
     }
-    Ok(Stored { path, hash })
+    Ok(StoredLibrary { path, hash })
 }
 
 /// Returns the blake3 hash of the file at `path`.

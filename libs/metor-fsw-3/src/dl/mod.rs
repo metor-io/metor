@@ -76,26 +76,30 @@ impl Pack {
         ty: &str,
         params: &serde_json::Value,
         instance: &Instance,
-        ports: Ports<'_>,
+        rings: InstanceRings<'_>,
         io: &SharedIo,
     ) -> Result<Box<dyn Step>, ParamError> {
-        let id = &instance.id;
-        let arena = io.borrow().arena(id);
-        let mut table = arena
-            .as_deref()
-            .map_or(RawRing::EMPTY, crate::pack::ring_of);
+        let arena = io.borrow().arena(&instance.id);
+        let mut table = arena.as_deref().map_or(RawRing::EMPTY, RawRing::from_arena);
         let step: Box<dyn Step> = match self {
-            Pack::Dl(pack) => Box::new(pack.create(ty, params, instance, ports, &mut table)?),
+            Pack::Dl(pack) => Box::new(pack.create(ty, params, instance, rings, &mut table)?),
         };
-        // SAFETY: a pack writes back a live region with an owner that meets
-        // `RawOwner`'s contract, or an empty one.
-        unsafe { crate::pack::adopt(io, instance, table) };
+        if !instance.def.grants.is_empty() {
+            let arena = io.borrow_mut().get_or_add_member(&instance.id);
+            // SAFETY: a pack writes back a live region with an owner that
+            // meets `RawOwner`'s contract, or an empty one.
+            unsafe { arena.adopt(table) };
+        }
         Ok(step)
     }
 }
 
 /// An instance's input and output rings.
-pub type Ports<'a> = (&'a [Vec<&'a RingBuffer>], &'a [&'a RingBuffer]);
+#[derive(Clone, Copy)]
+pub struct InstanceRings<'a> {
+    pub inputs: &'a [Vec<&'a RingBuffer>],
+    pub outputs: &'a [&'a RingBuffer],
+}
 
 impl SystemTable {
     /// Registers every system in `pack` under the name `"{id}.{ty}"`, in order.
@@ -107,32 +111,40 @@ impl SystemTable {
             .descriptor()
             .systems
             .iter()
-            .map(|system| (format!("{id}.{}", system.ty), entry(&pack, system)))
+            .map(|system| {
+                let entry = TableEntry::from_pack(&pack, system);
+                (format!("{id}.{}", system.ty), entry)
+            })
             .collect();
         self.insert_all(entries)
     }
 }
 
-/// Builds the table entry for one exported system.
-///
-/// The entry keeps `pack` open for as long as it exists.
-fn entry(pack: &Arc<Pack>, system: &PackSystemDef) -> TableEntry {
-    let (def_pack, def_ty) = (pack.clone(), system.ty.clone());
-    let (make_pack, make_ty) = (pack.clone(), system.ty.clone());
-    TableEntry {
-        kind: system.kind,
-        def: system.def.clone(),
-        def_fn: Box::new(move |cx| def_pack.def(&def_ty, cx)),
-        doc: system.doc.clone(),
-        schema: system.params.clone(),
-        make: Arc::new(move |cx| {
-            let instance = Instance {
-                id: cx.id.to_string(),
-                def: cx.def.clone(),
-                adapter: cx.adapter.cloned(),
-            };
-            let ports = (&cx.inputs[..], &cx.outputs[..]);
-            make_pack.create(&make_ty, cx.params.0, &instance, ports, cx.io)
-        }),
+impl TableEntry {
+    /// The table entry for one system that `pack` exports.
+    ///
+    /// The entry keeps `pack` open for as long as it exists.
+    fn from_pack(pack: &Arc<Pack>, system: &PackSystemDef) -> Self {
+        let (def_pack, def_ty) = (pack.clone(), system.ty.clone());
+        let (make_pack, make_ty) = (pack.clone(), system.ty.clone());
+        Self {
+            kind: system.kind,
+            def: system.def.clone(),
+            def_fn: Box::new(move |cx| def_pack.def(&def_ty, cx)),
+            doc: system.doc.clone(),
+            schema: system.params.clone(),
+            make: Arc::new(move |cx| {
+                let instance = Instance {
+                    id: cx.id.to_string(),
+                    def: cx.def.clone(),
+                    adapter: cx.adapter.cloned(),
+                };
+                let rings = InstanceRings {
+                    inputs: &cx.inputs,
+                    outputs: &cx.outputs,
+                };
+                make_pack.create(&make_ty, cx.params.0, &instance, rings, cx.io)
+            }),
+        }
     }
 }

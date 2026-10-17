@@ -12,6 +12,7 @@ use metor_fsw_3_ring::{Lease, RawOwner};
 
 use super::{Op, Span};
 use crate::coordinator::MakeError;
+use crate::pack::raw::RawRing;
 
 #[derive(Default)]
 pub(crate) struct Arena {
@@ -46,6 +47,27 @@ impl Arena {
     /// arena's whole life when `keep` is `Unowned`.
     pub(crate) unsafe fn set(&self, base: NonNull<u8>, len: usize, keep: Keep) -> bool {
         self.mem.set(Mem { base, len, keep }).is_ok()
+    }
+
+    /// Sets the memory to the region `ring` names, unless it is already set
+    /// or the region is empty.
+    ///
+    /// # Safety
+    /// A non-empty `ring` is live, and its owner meets `RawOwner`'s contract.
+    /// A region with no owner outlives the arena, such as memory a wasm host
+    /// wrote into its guest.
+    pub(crate) unsafe fn adopt(&self, ring: RawRing) {
+        let base = NonNull::new(ring.base).filter(|_| ring.len > 0);
+        let Some(base) = base.filter(|_| self.region().is_none()) else {
+            return;
+        };
+        let keep = match ring.owner {
+            // SAFETY: the caller's contract.
+            Some(owner) => Keep::Lease(unsafe { Lease::acquire(owner) }),
+            None => Keep::Unowned,
+        };
+        // SAFETY: the caller's contract, and `keep` holds the owner's reference.
+        unsafe { self.set(base, ring.len, keep) };
     }
 
     /// Sets the memory to `bytes`. The memory is set once.
