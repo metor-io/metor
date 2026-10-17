@@ -423,7 +423,7 @@ fn test_load_reports_occupant() {
     assert_eq!(shared.state(), ChannelState::Unloaded.code());
     let status = shared.0.borrow().status.expect("a status");
     assert_eq!(status.loaded, u32::MAX);
-    assert_eq!(status.artifact, FrameStr::EMPTY);
+    assert_eq!(status.artifact, FrameStr::default());
 
     shared.send("ctr", SequenceCommandKind::Start);
     shared.send("ctr", SequenceCommandKind::Load { name: "b".into() });

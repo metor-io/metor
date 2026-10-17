@@ -222,7 +222,11 @@ impl SystemTable {
         _sequence: S,
         ctor: C,
     ) -> Result<(), BuildError> {
-        let entry = crate::sequence::entry::<S, M, C>(ctor).map_err(def_error(ty))?;
+        let entry =
+            crate::sequence::entry::<S, M, C>(ctor).map_err(|source| BuildError::TypeDef {
+                ty: ty.to_string(),
+                source,
+            })?;
         self.insert(ty, entry)
     }
 

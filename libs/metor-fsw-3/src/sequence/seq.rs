@@ -312,8 +312,7 @@ fn run_handler<'a>(seq: &Seq<'a>, f: impl FnOnce(&Seq<'a>)) {
     // PANIC Safety: the panic is caught so that the remaining handlers still
     // run, and so that a panic during an unwind never escapes.
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| f(seq))) {
-        Log.fault("handler", crate::panic::message(&*payload).to_string());
-        crate::panic::discard(payload);
+        Log.fault("handler", crate::panic::into_message(payload));
     }
 }
 

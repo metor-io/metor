@@ -141,7 +141,7 @@ fn step_over<S: SequenceFn>(
     let instance = crate::fn_system::Instance {
         io: &io,
         id: "seq",
-        namespace: "",
+        namespace: None,
         seed: Some(0),
         records: &Default::default(),
     };

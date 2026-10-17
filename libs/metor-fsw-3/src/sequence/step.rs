@@ -12,7 +12,7 @@ use metor_proto::types::Timestamp;
 
 use crate::channel::{Abort, AbortRequest};
 use crate::coordinator::{EndReason, Step};
-use crate::fn_system::{Cycle, InSet, OutSet, Param, report_dropped};
+use crate::fn_system::{Cycle, InSet, OutSet, Param};
 use crate::log::{self, Log, LogPort};
 use crate::port::{Input, Samplers};
 
@@ -145,7 +145,7 @@ impl Step for SequenceStep {
             ..
         } = self;
         let polled = log::with_log_port(log, now, || advance(seq, samplers, run));
-        report_dropped(log, &self.dropped, now);
+        log.report_failed_writes(&self.dropped, now);
         if let Poll::Ready(result) = polled {
             self.run = None;
             self.samplers = Samplers::default();
@@ -158,7 +158,7 @@ impl Step for SequenceStep {
         let _ = self.seq.abort();
         let run = &mut self.run;
         log::with_log_port(&mut self.log, now, || drop(run.take()));
-        report_dropped(&mut self.log, &self.dropped, now);
+        self.log.report_failed_writes(&self.dropped, now);
     }
 
     fn ended(&self) -> Option<&EndReason> {

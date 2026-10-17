@@ -12,7 +12,6 @@ use metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
 
-use crate::FrameStr;
 use crate::coordinator::{
     Adapter, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, Stepped, catch_step,
 };
@@ -94,7 +93,7 @@ pub(crate) fn make_channel(
         outputs: cx.outputs.into_iter().cloned().collect(),
         io: cx.io.clone(),
         seed: cx.seed,
-        namespace: cx.namespace.to_string(),
+        namespace: cx.namespace.map(str::to_string),
         records: cx.records.clone(),
     };
     let mut threads = Threads::default();
@@ -165,7 +164,7 @@ struct SystemRecipe {
     outputs: Vec<RingBuffer>,
     io: SharedIo,
     seed: Option<u64>,
-    namespace: String,
+    namespace: Option<String>,
     records: Arc<Records>,
 }
 
@@ -185,7 +184,7 @@ impl SystemRecipe {
             threads,
             io: &self.io,
             seed: self.seed,
-            namespace: &self.namespace,
+            namespace: self.namespace.as_deref(),
             records: &self.records,
         })
     }
@@ -448,7 +447,7 @@ impl Core {
             timestamp: now,
             state: self.channel_state().code(),
             loaded: occupant.map_or(u32::MAX, |o| o.index),
-            artifact: occupant.map_or(FrameStr::EMPTY, |o| o.artifact),
+            artifact: occupant.map(|o| o.artifact).unwrap_or_default(),
             hash: occupant.map(|o| o.hash).unwrap_or_default(),
         };
         let _ = self.status.write(&status);
