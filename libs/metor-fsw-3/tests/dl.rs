@@ -561,7 +561,7 @@ mod quiesce {
         config.systems[2].params = serde_json::json!({ "script": [] });
         let gps = &mut config.systems[0];
         gps.adapter = Some(Adapter::Channel(ChannelConfig {
-            name: "gps".into(),
+            name: metor_fsw_3::ChannelName::try_from("gps".to_string()).expect("a short name"),
             start: RunState::Running,
         }));
         gps.inputs

@@ -138,7 +138,7 @@ fn config(params: Value, adapter: Option<Adapter>) -> CoordinatorConfig {
 
 fn channel() -> Option<Adapter> {
     Some(Adapter::Channel(ChannelConfig {
-        name: "mode".into(),
+        name: metor_fsw_3::ChannelName::try_from("mode".to_string()).expect("a short name"),
         start: RunState::Stopped,
     }))
 }
