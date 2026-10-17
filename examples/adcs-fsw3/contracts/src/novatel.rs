@@ -4,7 +4,7 @@
 //! The receiver model encodes them and the flight driver decodes them, so the
 //! codec is the interface both sides share. Neither side allocates.
 
-use core::fmt::Write as _;
+use std::io::{Cursor, Write as _};
 
 /// The longest line either side handles, with room to spare.
 pub const LINE_MAX: usize = 512;
@@ -33,132 +33,154 @@ pub struct BestXyz {
 
 /// Why a line did not decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Bad {
+pub enum DecodeError {
     /// The line's CRC does not match its bytes.
     Crc,
     /// A field is missing or does not parse.
     Field,
 }
 
-/// Writes `log` as one line into `out`. Returns its length, or `None` if
-/// `out` is too short.
-pub fn encode(log: &BestXyz, out: &mut [u8]) -> Option<usize> {
-    let mut w = Cursor { out, len: 0 };
-    let (status, kind) = match log.solved {
-        true => ("SOL_COMPUTED", "SINGLE"),
-        false => ("INSUFFICIENT_OBS", "NONE"),
-    };
-    let [px, py, pz] = log.pos_ecef;
-    let [vx, vy, vz] = log.vel_ecef;
-    let (s, n) = (log.pos_sigma, log.sats);
-    write!(
-        w,
-        "#BESTXYZA,COM1,0,0.0,FINESTEERING,{},{:.3},02000000,0000,0;\
-         {status},{kind},{px:.4},{py:.4},{pz:.4},{s:.4},{s:.4},{s:.4},\
-         {status},{kind},{vx:.4},{vy:.4},{vz:.4},0.0500,0.0500,0.0500,\
-         \"\",0.000,0.000,0.000,{n},{n},0,0,0,00,0,00",
-        log.week, log.seconds,
-    )
-    .ok()?;
-    let crc = crc32(&w.out[1..w.len]);
-    write!(w, "*{crc:08x}\r\n").ok()?;
-    Some(w.len)
+impl BestXyz {
+    /// Writes this log as one line into `out`. Returns its length, or `None`
+    /// if `out` is too short.
+    pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+        let mut w = Cursor::new(out);
+        let (status, kind) = match self.solved {
+            true => ("SOL_COMPUTED", "SINGLE"),
+            false => ("INSUFFICIENT_OBS", "NONE"),
+        };
+        let [px, py, pz] = self.pos_ecef;
+        let [vx, vy, vz] = self.vel_ecef;
+        let (s, n) = (self.pos_sigma, self.sats);
+        write!(
+            w,
+            "#BESTXYZA,COM1,0,0.0,FINESTEERING,{},{:.3},02000000,0000,0;\
+             {status},{kind},{px:.4},{py:.4},{pz:.4},{s:.4},{s:.4},{s:.4},\
+             {status},{kind},{vx:.4},{vy:.4},{vz:.4},0.0500,0.0500,0.0500,\
+             \"\",0.000,0.000,0.000,{n},{n},0,0,0,00,0,00",
+            self.week, self.seconds,
+        )
+        .ok()?;
+        let len = w.position() as usize;
+        let crc = crc32(&w.get_ref()[1..len]);
+        write!(w, "*{crc:08x}\r\n").ok()?;
+        Some(w.position() as usize)
+    }
+
+    /// Decodes one line, from `#` up to the CRC. `None` for a log other than
+    /// `BESTXYZA`.
+    pub fn decode(line: &[u8]) -> Option<Result<BestXyz, DecodeError>> {
+        let line = core::str::from_utf8(line).ok()?;
+        let (body, crc) = line.strip_prefix('#')?.rsplit_once('*')?;
+        let (header, fields) = body.split_once(';')?;
+        let mut header = header.split(',');
+        if header.next() != Some("BESTXYZA") {
+            return None;
+        }
+        if u32::from_str_radix(crc, 16) != Ok(crc32(body.as_bytes())) {
+            return Some(Err(DecodeError::Crc));
+        }
+        Some(Self::parse(header, fields).ok_or(DecodeError::Field))
+    }
+
+    fn parse<'a>(mut header: impl Iterator<Item = &'a str>, fields: &str) -> Option<BestXyz> {
+        let week = header.nth(4)?.parse().ok()?;
+        let seconds = header.next()?.parse().ok()?;
+        let mut f = fields.split(',');
+        let pos_solved = f.next()? == "SOL_COMPUTED";
+        let _kind = f.next()?;
+        let pos_ecef = triple(&mut f)?;
+        let pos_sigma = f.next()?.parse().ok()?;
+        let _sigmas = (f.next()?, f.next()?);
+        let vel_solved = f.next()? == "SOL_COMPUTED";
+        let _kind = f.next()?;
+        let vel_ecef = triple(&mut f)?;
+        let sats = f.nth(7)?.parse().ok()?;
+        Some(BestXyz {
+            week,
+            seconds,
+            solved: pos_solved && vel_solved,
+            pos_ecef,
+            vel_ecef,
+            pos_sigma,
+            sats,
+        })
+    }
 }
 
-/// Bytes from a serial port, split into logs.
-pub struct Lines {
-    buf: [u8; LINE_MAX],
+/// Bytes from a serial port, split into lines that end in `\n`.
+pub struct LineBuf<const N: usize> {
+    buf: [u8; N],
+    /// Where the bytes not yet returned as a line start.
+    start: usize,
     len: usize,
 }
 
-impl Default for Lines {
+impl<const N: usize> Default for LineBuf<N> {
     fn default() -> Self {
         Self {
-            buf: [0; LINE_MAX],
+            buf: [0; N],
+            start: 0,
             len: 0,
         }
     }
 }
 
-impl Lines {
+impl<const N: usize> LineBuf<N> {
     /// Appends received bytes. Drops what is buffered if they do not fit.
     pub fn push(&mut self, bytes: &[u8]) {
-        if self.len + bytes.len() > LINE_MAX {
+        self.buf.copy_within(self.start..self.len, 0);
+        self.len -= self.start;
+        self.start = 0;
+        if self.len + bytes.len() > N {
             self.len = 0;
         }
-        let n = bytes.len().min(LINE_MAX);
+        let n = bytes.len().min(N);
         self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
         self.len += n;
     }
 
-    fn consume(&mut self, n: usize) {
-        self.buf.copy_within(n..self.len, 0);
-        self.len -= n;
+    /// Returns the next complete line, through its `\n`.
+    pub fn next_line(&mut self) -> Option<&[u8]> {
+        let rest = &self.buf[self.start..self.len];
+        let end = self.start + rest.iter().position(|&b| b == b'\n')? + 1;
+        let line = &self.buf[self.start..end];
+        self.start = end;
+        Some(line)
+    }
+}
+
+/// The `BESTXYZA` logs in bytes from a serial port.
+#[derive(Default)]
+pub struct Lines(LineBuf<LINE_MAX>);
+
+impl Lines {
+    /// Appends received bytes. Drops what is buffered if they do not fit.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.0.push(bytes);
     }
 }
 
 /// Each complete `BESTXYZA` log buffered, as more bytes arrive.
 impl Iterator for Lines {
-    type Item = Result<BestXyz, Bad>;
+    type Item = Result<BestXyz, DecodeError>;
 
     /// The next complete `BESTXYZA` log. Skips bytes before a `#` and lines
     /// of other logs.
-    fn next(&mut self) -> Option<Result<BestXyz, Bad>> {
+    fn next(&mut self) -> Option<Result<BestXyz, DecodeError>> {
         loop {
-            let start = self.buf[..self.len].iter().position(|&b| b == b'#');
-            let Some(start) = start else {
-                self.len = 0;
-                return None;
+            let line = self.0.next_line()?;
+            let Some(start) = line.iter().position(|&b| b == b'#') else {
+                continue;
             };
-            self.consume(start);
-            let end = find(&self.buf[..self.len], b"\r\n")?;
-            let decoded = decode(&self.buf[..end]);
-            self.consume(end + 2);
-            if let Some(decoded) = decoded {
+            let log = line[start..]
+                .strip_suffix(b"\r\n")
+                .and_then(BestXyz::decode);
+            if let Some(decoded) = log {
                 return Some(decoded);
             }
         }
     }
-}
-
-/// Decodes one line, from `#` up to the CRC. `None` for a log other than
-/// `BESTXYZA`.
-fn decode(line: &[u8]) -> Option<Result<BestXyz, Bad>> {
-    let line = core::str::from_utf8(line).ok()?;
-    let (body, crc) = line.strip_prefix('#')?.rsplit_once('*')?;
-    let (header, fields) = body.split_once(';')?;
-    let mut header = header.split(',');
-    if header.next() != Some("BESTXYZA") {
-        return None;
-    }
-    if u32::from_str_radix(crc, 16) != Ok(crc32(body.as_bytes())) {
-        return Some(Err(Bad::Crc));
-    }
-    Some(parse(header, fields).ok_or(Bad::Field))
-}
-
-fn parse<'a>(mut header: impl Iterator<Item = &'a str>, fields: &str) -> Option<BestXyz> {
-    let week = header.nth(4)?.parse().ok()?;
-    let seconds = header.next()?.parse().ok()?;
-    let mut f = fields.split(',');
-    let pos_solved = f.next()? == "SOL_COMPUTED";
-    let _kind = f.next()?;
-    let pos_ecef = triple(&mut f)?;
-    let pos_sigma = f.next()?.parse().ok()?;
-    let _sigmas = (f.next()?, f.next()?);
-    let vel_solved = f.next()? == "SOL_COMPUTED";
-    let _kind = f.next()?;
-    let vel_ecef = triple(&mut f)?;
-    let sats = f.nth(7)?.parse().ok()?;
-    Some(BestXyz {
-        week,
-        seconds,
-        solved: pos_solved && vel_solved,
-        pos_ecef,
-        vel_ecef,
-        pos_sigma,
-        sats,
-    })
 }
 
 fn triple<'a>(f: &mut impl Iterator<Item = &'a str>) -> Option<[f64; 3]> {
@@ -169,8 +191,23 @@ fn triple<'a>(f: &mut impl Iterator<Item = &'a str>) -> Option<[f64; 3]> {
     ])
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+#[cfg(feature = "environment")]
+impl crate::Gps {
+    /// The fix a solved `log` reports at `now`, rotated to ECI at the log's
+    /// GPS time.
+    pub fn from_best_xyz(now: metor_fsw_3::Timestamp, log: &BestXyz) -> Self {
+        use crate::{V3, ecef_to_eci_state, ecef_to_geodetic, gps_epoch};
+        let (pos_ecef, vel_ecef) = (V3::from_buf(log.pos_ecef), V3::from_buf(log.vel_ecef));
+        let epoch = gps_epoch(log.week, log.seconds);
+        let (pos_eci, vel_eci) = ecef_to_eci_state(epoch, &pos_ecef, &vel_ecef);
+        let (lat, lon, alt) = ecef_to_geodetic(&pos_ecef);
+        Self {
+            timestamp: now,
+            pos_eci,
+            vel_eci,
+            lla: V3::from_buf([lat.to_degrees(), lon.to_degrees(), alt]),
+        }
+    }
 }
 
 /// NovAtel's CRC-32: polynomial `0xEDB88320`, reflected, with a zero
@@ -182,22 +219,6 @@ pub fn crc32(bytes: &[u8]) -> u32 {
             _ => c >> 1,
         })
     })
-}
-
-/// Formats into a byte slice.
-struct Cursor<'a> {
-    out: &'a mut [u8],
-    len: usize,
-}
-
-impl core::fmt::Write for Cursor<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let end = self.len + s.len();
-        let dst = self.out.get_mut(self.len..end).ok_or(core::fmt::Error)?;
-        dst.copy_from_slice(s.as_bytes());
-        self.len = end;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -218,11 +239,11 @@ mod tests {
 
     fn line(log: &BestXyz) -> Vec<u8> {
         let mut out = [0; LINE_MAX];
-        let n = encode(log, &mut out).unwrap();
+        let n = log.encode(&mut out).unwrap();
         out[..n].to_vec()
     }
 
-    fn decoded(bytes: &[u8]) -> Vec<Result<BestXyz, Bad>> {
+    fn decoded(bytes: &[u8]) -> Vec<Result<BestXyz, DecodeError>> {
         let mut lines = Lines::default();
         lines.push(bytes);
         lines.collect()
@@ -238,7 +259,7 @@ mod tests {
     fn a_bad_crc_is_refused() {
         let mut bytes = line(&log(true));
         bytes[30] ^= 1;
-        assert_eq!(decoded(&bytes), [Err(Bad::Crc)]);
+        assert_eq!(decoded(&bytes), [Err(DecodeError::Crc)]);
     }
 
     #[test]
@@ -256,6 +277,6 @@ mod tests {
 
     #[test]
     fn a_short_buffer_does_not_encode() {
-        assert_eq!(encode(&log(true), &mut [0; 64]), None);
+        assert_eq!(log(true).encode(&mut [0; 64]), None);
     }
 }

@@ -4,10 +4,10 @@
 //! It is a sequence that never ends: one `async fn` that configures the
 //! receiver, then reads logs for as long as it runs.
 
-use adcs_contracts::novatel::{BestXyz, LOG_10HZ, Lines};
-use adcs_contracts::{Gps, V3, ecef_to_eci_state, ecef_to_geodetic, gps_epoch};
+use adcs_contracts::Gps;
+use adcs_contracts::novatel::{LOG_10HZ, Lines};
 use metor_fsw_3::io::{Buf, Cap, Uart};
-use metor_fsw_3::{IoInit, Log, Output, Seq, SeqError, Timestamp, sequence};
+use metor_fsw_3::{IoInit, Log, Output, Seq, SeqError, sequence};
 
 /// The bytes one read takes, about one log.
 const READ: usize = 256;
@@ -49,7 +49,7 @@ pub async fn gps_driver(
             Err(e) => log.fault("gps_read", e),
         }
         for line in lines.by_ref().flatten().filter(|l| l.solved) {
-            let _ = fix.write(&to_gps(seq.now(), &line));
+            let _ = fix.write(&Gps::from_best_xyz(seq.now(), &line));
         }
     }
 }
@@ -65,18 +65,5 @@ async fn configure(seq: &Seq<'_>, uart: &Cap<Uart>, mut cmd: Buf, log: &mut Log)
             Err(e) => log.fault("gps_config", e),
         }
         seq.next_cycle().await;
-    }
-}
-
-/// The fix a solved log reports, rotated to ECI at the log's GPS time.
-pub fn to_gps(now: Timestamp, l: &BestXyz) -> Gps {
-    let (pos_ecef, vel_ecef) = (V3::from_buf(l.pos_ecef), V3::from_buf(l.vel_ecef));
-    let (pos_eci, vel_eci) = ecef_to_eci_state(gps_epoch(l.week, l.seconds), &pos_ecef, &vel_ecef);
-    let (lat, lon, alt) = ecef_to_geodetic(&pos_ecef);
-    Gps {
-        timestamp: now,
-        pos_eci,
-        vel_eci,
-        lla: V3::from_buf([lat.to_degrees(), lon.to_degrees(), alt]),
     }
 }

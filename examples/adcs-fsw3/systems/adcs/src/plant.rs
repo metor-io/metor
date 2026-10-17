@@ -10,10 +10,11 @@
 //! tracking is nearly uncorrelated, so it is white.
 
 use adcs_contracts::{
-    BodyState, DT, Disturbances, EARTH_RADIUS, Epoch, Gps, MASS, MU, MagneticModel, MtqCmd,
-    PlantParams, Quat, RW_MOMENTUM_MAX, RW_TORQUE_MAX, ReactionWheel, Sensors, TorqueCmd, V3,
-    Wheels, World, clamp_dipole, eci_to_geodetic, epoch_at, in_earth_shadow, inertia_diag,
-    mag_field_eci, orbit_pos_vel, raan_for_ltan, sun_dir_eci, target_epoch,
+    BodyState, DT, Disturbances, EARTH_RADIUS, Epoch, GPS_POS_SIGMA, GPS_VEL_SIGMA, Gps, GpsError,
+    MASS, MU, MagneticModel, MtqCmd, PlantParams, Quat, RW_MOMENTUM_MAX, RW_TORQUE_MAX,
+    ReactionWheel, Sensors, TorqueCmd, V3, Wheels, World, clamp_dipole, eci_to_geodetic, epoch_at,
+    in_earth_shadow, inertia_diag, mag_field_eci, orbit_pos_vel, raan_for_ltan, sun_dir_eci,
+    target_epoch,
 };
 use metor_fsw_3::{Input, Output, Timestamp, system};
 use nox::{
@@ -22,13 +23,6 @@ use nox::{
 };
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
-
-/// Steady-state GPS position error 1σ per axis (m).
-pub const GPS_POS_SIGMA: f64 = 5.0;
-/// GPS position error correlation time (s).
-pub const GPS_TAU: f64 = 100.0;
-/// GPS velocity error 1σ per axis (m/s).
-pub const GPS_VEL_SIGMA: f64 = 0.05;
 
 /// Magnetometer noise 1σ per axis (T), against a field of 25 to 45 µT at 400 km.
 pub const MAG_SENSOR_SIGMA: f64 = 150e-9;
@@ -141,54 +135,57 @@ pub struct DisturbanceTorques {
     pub aero_force_eci: V3,
 }
 
+/// The true state the disturbance torques act on.
+pub struct TrueState {
+    pub q_b_eci: Quat,
+    pub pos_eci: V3,
+    pub vel_eci: V3,
+    pub sun_eci: V3,
+    /// True field (T), unnormalized.
+    pub mag_eci: V3,
+    pub illuminated: bool,
+}
+
 impl DisturbanceTorques {
+    /// Evaluates the disturbance torques at the true state `s`.
+    ///
+    /// - Gravity gradient: `τ = (3μ/|r|³) · r̂_b × (I ∘ r̂_b)`.
+    /// - Drag: `F = −½ρ·Cd·A·|v|·v` against a still atmosphere, `τ = r_cp × F_b`.
+    /// - Residual dipole: `τ = m_res × B_b`.
+    /// - Solar radiation pressure: `F = −P·A·Cr·ŝ_b`, `τ = r_cp × F_b`, zero in shadow.
+    pub fn at(p: &PlantParams, s: &TrueState) -> Self {
+        let q_eci_b = s.q_b_eci.inverse();
+        let cp_offset_b = V3::from_buf(p.cp_offset_b);
+
+        let r_mag: f64 = s.pos_eci.norm().into_buf();
+        let r_hat_b = q_eci_b * (s.pos_eci.normalize());
+        let gg_b = r_hat_b.cross(&(inertia_diag() * r_hat_b)) * (3.0 * MU / r_mag.powi(3));
+
+        let v_mag: f64 = s.vel_eci.norm().into_buf();
+        let aero_force_eci = s.vel_eci * (-0.5 * p.rho * p.cd * p.area_aero * v_mag);
+        let aero_b = cp_offset_b.cross(&(q_eci_b * aero_force_eci));
+
+        let mag_b = V3::from_buf(p.m_res_b).cross(&(q_eci_b * s.mag_eci));
+
+        let srp_force_b = if s.illuminated {
+            (q_eci_b * s.sun_eci.normalize()) * (-P_SRP * p.area_srp * p.cr)
+        } else {
+            V3::zeros()
+        };
+        let srp_b = cp_offset_b.cross(&srp_force_b);
+
+        DisturbanceTorques {
+            gg_b,
+            aero_b,
+            mag_b,
+            srp_b,
+            aero_force_eci,
+        }
+    }
+
     /// Returns the sum of the torques.
     pub fn total_b(&self) -> V3 {
         self.gg_b + self.aero_b + self.mag_b + self.srp_b
-    }
-}
-
-/// Evaluates the disturbance torques at a true state, given the unnormalized field `mag_eci` (T).
-///
-/// - Gravity gradient: `τ = (3μ/|r|³) · r̂_b × (I ∘ r̂_b)`.
-/// - Drag: `F = −½ρ·Cd·A·|v|·v` against a still atmosphere, `τ = r_cp × F_b`.
-/// - Residual dipole: `τ = m_res × B_b`.
-/// - Solar radiation pressure: `F = −P·A·Cr·ŝ_b`, `τ = r_cp × F_b`, zero in shadow.
-pub fn disturbance_torques(
-    p: &PlantParams,
-    q_b_eci: &Quat,
-    pos_eci: &V3,
-    vel_eci: &V3,
-    sun_eci: &V3,
-    mag_eci: &V3,
-    illuminated: bool,
-) -> DisturbanceTorques {
-    let q_eci_b = q_b_eci.inverse();
-    let cp_offset_b = V3::from_buf(p.cp_offset_b);
-
-    let r_mag: f64 = pos_eci.norm().into_buf();
-    let r_hat_b = q_eci_b * (pos_eci.normalize());
-    let gg_b = r_hat_b.cross(&(inertia_diag() * r_hat_b)) * (3.0 * MU / r_mag.powi(3));
-
-    let v_mag: f64 = vel_eci.norm().into_buf();
-    let aero_force_eci = *vel_eci * (-0.5 * p.rho * p.cd * p.area_aero * v_mag);
-    let aero_b = cp_offset_b.cross(&(q_eci_b * aero_force_eci));
-
-    let mag_b = V3::from_buf(p.m_res_b).cross(&(q_eci_b * *mag_eci));
-
-    let srp_force_b = if illuminated {
-        (q_eci_b * sun_eci.normalize()) * (-P_SRP * p.area_srp * p.cr)
-    } else {
-        V3::zeros()
-    };
-    let srp_b = cp_offset_b.cross(&srp_force_b);
-
-    DisturbanceTorques {
-        gg_b,
-        aero_b,
-        mag_b,
-        srp_b,
-        aero_force_eci,
     }
 }
 
@@ -203,7 +200,7 @@ pub struct PlantState {
     t_sim: f64,
     mag_model: MagneticModel,
     /// GPS position error, stepped each cycle.
-    gps_pos_err: V3,
+    gps_pos_err: GpsError,
     params: PlantParams,
     /// Illumination last cycle, so each shadow edge logs once.
     was_illuminated: Option<bool>,
@@ -223,30 +220,20 @@ struct Ports<'a> {
 
 /// The true state at the start of a cycle and what the sensors measured.
 struct Sample {
-    q_b_eci: Quat,
+    truth: TrueState,
     omega_b_true: V3,
-    pos_eci: V3,
-    vel_eci: V3,
-    sun_eci: V3,
-    /// True field (T), unnormalized.
-    mag_eci: V3,
     /// True field in the body frame, which the magnetorquers act against.
     mag_b_true: V3,
-    illuminated: bool,
     sensors: Sensors,
     gps: Gps,
 }
 
-impl PlantState {
-    fn noise(&mut self, sigma: f64) -> V3 {
-        let (x, y, z) = (self.noise1(sigma), self.noise1(sigma), self.noise1(sigma));
-        tensor![x, y, z]
-    }
-
-    /// Draws zero-mean noise with deviation `sigma`.
-    fn noise1(&mut self, sigma: f64) -> f64 {
-        sigma * self.unit_normal.sample(&mut self.rng)
-    }
+/// The wheels' reaction torque and momentum after a step, and the commanded
+/// dipole.
+struct Actuation {
+    rw_torque_b: V3,
+    h_w_b: V3,
+    dipole_b: V3,
 }
 
 /// Returns point-mass gravity on `body`, `-MU·m / |r|³ · r`.
@@ -308,53 +295,21 @@ impl PlantState {
             rng: StdRng::seed_from_u64(p.seed),
             t_sim: 0.0,
             mag_model: MagneticModel::default(),
-            gps_pos_err: V3::zeros(),
+            gps_pos_err: GpsError::new(GPS_POS_SIGMA),
             params: p,
             was_illuminated: None,
             // PANIC Safety: a unit standard deviation is a valid normal.
             unit_normal: Normal::new(0.0, 1.0).expect("a unit normal"),
         }
     }
-}
 
-#[system]
-/// Steps the wheels, samples the sensors, writes telemetry, and integrates the body.
-#[allow(clippy::too_many_arguments)]
-pub fn plant(
-    #[state] state: &mut PlantState,
-    now: Timestamp,
-    torque_cmd: &mut Input<TorqueCmd>,
-    mtq_cmd: &mut Input<MtqCmd>,
-    sensors: &mut Output<Sensors>,
-    gps: &mut Output<Gps>,
-    wheels: &mut Output<Wheels>,
-    body: &mut Output<BodyState>,
-    world: &mut Output<World>,
-    disturb: &mut Output<Disturbances>,
-) {
-    let (rw_torque_b, h_w_b, dipole_b) = state.actuate(torque_cmd, mtq_cmd);
-    let sample = state.sense(now);
-    let (d, mtq_torque_b) = state.environment(&sample, dipole_b);
-    let ports = Ports {
-        sensors,
-        gps,
-        wheels,
-        body,
-        world,
-        disturb,
-    };
-    state.telemeter(now, &sample, &d, mtq_torque_b, ports);
-    state.integrate(rw_torque_b, h_w_b, &d, mtq_torque_b);
-}
-
-impl PlantState {
-    /// Steps the wheels under the torque command, returning their reaction torque,
-    /// their momentum, and the commanded dipole. A missing command counts as zero.
+    /// Steps the wheels under the torque command. A missing command counts as
+    /// zero.
     fn actuate(
         &mut self,
         torque_cmd: &mut Input<TorqueCmd>,
         mtq_cmd: &mut Input<MtqCmd>,
-    ) -> (V3, V3, V3) {
+    ) -> Actuation {
         let torque_b: V3 = match torque_cmd.latest() {
             Ok(Some(cmd)) => cmd.torque_b,
             _ => V3::zeros(),
@@ -376,7 +331,11 @@ impl PlantState {
             .wheels
             .iter()
             .fold(V3::zeros(), |acc, w| acc + w.ang_momentum);
-        (rw_torque_b, h_w_b, dipole_b)
+        Actuation {
+            rw_torque_b,
+            h_w_b,
+            dipole_b,
+        }
     }
 
     /// Samples the sensors and the GPS receiver from the state at the start of the step.
@@ -399,14 +358,16 @@ impl PlantState {
         let mag_b = mag_b_true + self.noise(MAG_SENSOR_SIGMA);
 
         Sample {
-            q_b_eci,
+            truth: TrueState {
+                q_b_eci,
+                pos_eci,
+                vel_eci,
+                sun_eci,
+                mag_eci,
+                illuminated,
+            },
             omega_b_true,
-            pos_eci,
-            vel_eci,
-            sun_eci,
-            mag_eci,
             mag_b_true,
-            illuminated,
             sensors: Sensors {
                 timestamp: now,
                 gyro_b,
@@ -436,10 +397,8 @@ impl PlantState {
 
     /// Returns a GPS fix of the true orbit state.
     fn gps_fix(&mut self, now: Timestamp, epoch: Epoch, pos_eci: &V3, vel_eci: &V3) -> Gps {
-        let phi = (-DT / GPS_TAU).exp();
-        let drive_sigma = GPS_POS_SIGMA * (1.0 - phi * phi).sqrt();
-        self.gps_pos_err = phi * self.gps_pos_err + self.noise(drive_sigma);
-        let pos = *pos_eci + self.gps_pos_err;
+        let unit = self.noise(1.0);
+        let pos = *pos_eci + self.gps_pos_err.step(DT, unit);
         let vel = *vel_eci + self.noise(GPS_VEL_SIGMA);
         let (lat, lon, alt) = eci_to_geodetic(epoch, &pos);
         Gps {
@@ -461,19 +420,9 @@ impl PlantState {
         illuminated
     }
 
-    /// Returns the disturbance torques and the magnetorquer torque at the start of the step.
-    fn environment(&self, s: &Sample, dipole_b: V3) -> (DisturbanceTorques, V3) {
-        let d = disturbance_torques(
-            &self.params,
-            &s.q_b_eci,
-            &s.pos_eci,
-            &s.vel_eci,
-            &s.sun_eci,
-            &s.mag_eci,
-            s.illuminated,
-        );
-        let mtq_torque_b = clamp_dipole(dipole_b, self.params.mtq_max_dipole).cross(&s.mag_b_true);
-        (d, mtq_torque_b)
+    /// Returns the magnetorquer torque at the start of the step.
+    fn mtq_torque(&self, s: &Sample, dipole_b: V3) -> V3 {
+        clamp_dipole(dipole_b, self.params.mtq_max_dipole).cross(&s.mag_b_true)
     }
 
     /// Writes the cycle's measurements and truth telemetry.
@@ -495,17 +444,18 @@ impl PlantState {
         } = ports;
         let _ = sensors.write(&s.sensors);
         let _ = gps.write(&s.gps);
-        let _ = world.write(&World::new(now, s.sun_eci, s.mag_eci, s.illuminated));
+        let t = &s.truth;
+        let _ = world.write(&World::new(now, t.sun_eci, t.mag_eci, t.illuminated));
         let _ = wheels.write(&Wheels {
             timestamp: now,
             wheels: self.wheels,
         });
         let _ = body.write(&BodyState {
             timestamp: now,
-            q_b_eci: s.q_b_eci,
+            q_b_eci: t.q_b_eci,
             omega_b: s.omega_b_true,
-            pos_eci: s.pos_eci,
-            vel_eci: s.vel_eci,
+            pos_eci: t.pos_eci,
+            vel_eci: t.vel_eci,
         });
         let _ = disturb.write(&Disturbances {
             timestamp: now,
@@ -519,12 +469,53 @@ impl PlantState {
     }
 
     /// Integrates the body one step under every applied torque.
-    fn integrate(&mut self, rw_torque_b: V3, h_w_b: V3, d: &DisturbanceTorques, mtq_torque_b: V3) {
-        let tau_body = rw_torque_b + d.total_b() + mtq_torque_b;
-        let h_w_mid = h_w_b + rw_torque_b * (DT / 2.0);
+    fn integrate(&mut self, act: &Actuation, d: &DisturbanceTorques, mtq_torque_b: V3) {
+        let tau_body = act.rw_torque_b + d.total_b() + mtq_torque_b;
+        let h_w_mid = act.h_w_b + act.rw_torque_b * (DT / 2.0);
         self.body = propagate(self.body.clone(), tau_body, h_w_mid, d.aero_force_eci);
         self.t_sim += DT;
     }
+
+    fn noise(&mut self, sigma: f64) -> V3 {
+        let (x, y, z) = (self.noise1(sigma), self.noise1(sigma), self.noise1(sigma));
+        tensor![x, y, z]
+    }
+
+    /// Draws zero-mean noise with deviation `sigma`.
+    fn noise1(&mut self, sigma: f64) -> f64 {
+        sigma * self.unit_normal.sample(&mut self.rng)
+    }
+}
+
+#[system]
+/// Steps the wheels, samples the sensors, writes telemetry, and integrates the body.
+#[allow(clippy::too_many_arguments)]
+pub fn plant(
+    #[state] state: &mut PlantState,
+    now: Timestamp,
+    torque_cmd: &mut Input<TorqueCmd>,
+    mtq_cmd: &mut Input<MtqCmd>,
+    sensors: &mut Output<Sensors>,
+    gps: &mut Output<Gps>,
+    wheels: &mut Output<Wheels>,
+    body: &mut Output<BodyState>,
+    world: &mut Output<World>,
+    disturb: &mut Output<Disturbances>,
+) {
+    let act = state.actuate(torque_cmd, mtq_cmd);
+    let sample = state.sense(now);
+    let d = DisturbanceTorques::at(&state.params, &sample.truth);
+    let mtq_torque_b = state.mtq_torque(&sample, act.dipole_b);
+    let ports = Ports {
+        sensors,
+        gps,
+        wheels,
+        body,
+        world,
+        disturb,
+    };
+    state.telemeter(now, &sample, &d, mtq_torque_b, ports);
+    state.integrate(&act, &d, mtq_torque_b);
 }
 
 #[cfg(test)]
@@ -688,7 +679,15 @@ mod tests {
         let epoch = adcs_contracts::target_epoch();
         let mut model = MagneticModel::default();
         let mag = mag_field_eci(&mut model, epoch, &pos);
-        let d = disturbance_torques(&p, &q, &pos, &vel, &sun_dir_eci(epoch), &mag, true);
+        let lit = TrueState {
+            q_b_eci: q,
+            pos_eci: pos,
+            vel_eci: vel,
+            sun_eci: sun_dir_eci(epoch),
+            mag_eci: mag,
+            illuminated: true,
+        };
+        let d = DisturbanceTorques::at(&p, &lit);
 
         let mag_of = |v: &V3| -> f64 { v.norm().into_buf() };
         let gg = mag_of(&d.gg_b);
@@ -717,7 +716,11 @@ mod tests {
         assert!(mag_of(&(d.total_b() - sum)) == 0.0);
 
         // Shadow switches off solar radiation pressure and nothing else.
-        let dark = disturbance_torques(&p, &q, &pos, &vel, &sun_dir_eci(epoch), &mag, false);
+        let shadow = TrueState {
+            illuminated: false,
+            ..lit
+        };
+        let dark = DisturbanceTorques::at(&p, &shadow);
         assert!(mag_of(&dark.srp_b) == 0.0, "SRP must vanish in shadow");
         assert!(mag_of(&(dark.gg_b - d.gg_b)) == 0.0);
         assert!(mag_of(&(dark.aero_b - d.aero_b)) == 0.0);

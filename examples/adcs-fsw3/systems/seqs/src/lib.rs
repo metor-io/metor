@@ -6,7 +6,7 @@
 use core::time::Duration;
 
 use adcs_contracts::{AttitudeEstimate, ModeCmd, V3};
-use metor_fsw_3::{JsonSchema, Output, ParamError, Sample, Seq, SeqError, SystemTable, sequence};
+use metor_fsw_3::{JsonSchema, Output, Sample, Seq, SeqError, SystemTable, sequence};
 use serde::Deserialize;
 
 /// Configuration for [`commission`].
@@ -18,24 +18,39 @@ pub struct CommissionParams {
     pub detumble_timeout_s: f64,
 }
 
-/// [`commission`]'s validated params.
+/// [`commission`]'s params, parsed from [`CommissionParams`].
+///
+/// A rate or timeout that is negative or not finite does not parse.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(try_from = "CommissionParams")]
 pub struct Commission {
     rate: f64,
     detumble_timeout: Duration,
 }
 
-impl Commission {
-    /// Refuses a rate or timeout that is negative or not finite.
-    pub fn new(p: CommissionParams) -> Result<Self, ParamError> {
+impl TryFrom<CommissionParams> for Commission {
+    type Error = String;
+
+    fn try_from(p: CommissionParams) -> Result<Self, String> {
         if !(p.rate.is_finite() && p.rate >= 0.0) {
-            return Err(ParamError::Decode(format!("`rate` is {}", p.rate)));
+            return Err(format!("`rate` is {}", p.rate));
         }
         let detumble_timeout = Duration::try_from_secs_f64(p.detumble_timeout_s)
-            .map_err(|err| ParamError::Decode(format!("`detumble_timeout_s`: {err}")))?;
+            .map_err(|err| format!("`detumble_timeout_s`: {err}"))?;
         Ok(Self {
             rate: p.rate,
             detumble_timeout,
         })
+    }
+}
+
+impl JsonSchema for Commission {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        CommissionParams::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        CommissionParams::json_schema(generator)
     }
 }
 
@@ -77,7 +92,11 @@ pub fn pack() -> SystemTable {
     let mut table = SystemTable::new();
     // PANIC Safety: these static record schemas are compatible.
     table
-        .register_sequence("commission", commission(), Commission::new)
+        .register_sequence(
+            "commission",
+            commission(),
+            core::convert::identity::<Commission>,
+        )
         .expect("valid records");
     table
 }

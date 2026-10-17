@@ -23,6 +23,7 @@ use nox::{ArrayRepr, Quaternion, Vector};
 #[cfg(feature = "environment")]
 mod environment;
 mod frames;
+mod gps;
 mod mtq;
 pub mod novatel;
 mod orbit;
@@ -33,6 +34,7 @@ mod spacecraft;
 #[cfg(feature = "environment")]
 pub use environment::*;
 pub use frames::*;
+pub use gps::*;
 pub use mtq::*;
 pub use orbit::*;
 pub use params::*;

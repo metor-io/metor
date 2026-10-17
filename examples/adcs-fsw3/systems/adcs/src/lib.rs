@@ -18,7 +18,7 @@ pub use gps_receiver::GpsReceiver;
 pub use mode::Mode;
 pub use nav::{NavState, sun_from_css};
 pub use plant::{
-    DisturbanceTorques, PlantState, WheelDynamics, css_readings, disturbance_torques, propagate,
+    DisturbanceTorques, PlantState, TrueState, WheelDynamics, css_readings, propagate,
 };
 
 use metor_fsw_3::SystemTable;

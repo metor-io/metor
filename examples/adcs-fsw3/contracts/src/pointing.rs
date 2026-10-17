@@ -49,20 +49,13 @@ pub fn target_for(law: u8, pos_eci: &V3, vel_eci: &V3) -> Quat {
     }
 }
 
-/// Returns the attitude error to identity (rad) and the body rate (rad/s).
-pub fn convergence_sample(b: &BodyState) -> (f64, f64) {
-    let target = Quat::identity();
-    let err = b.q_b_eci.angular_distance(&target).into_buf().abs();
-    let rate = b.omega_b.norm().into_buf();
-    (err, rate)
-}
-
-/// Returns the attitude error to `law`'s target (rad) and the body rate (rad/s).
-pub fn tracking_sample(body: &BodyState, law: u8) -> (f64, f64) {
-    let target = target_for(law, &body.pos_eci, &body.vel_eci);
-    let err = body.q_b_eci.angular_distance(&target).into_buf().abs();
-    let rate = body.omega_b.norm().into_buf();
-    (err, rate)
+impl BodyState {
+    /// Returns the attitude error to `target` (rad) and the body rate (rad/s).
+    pub fn tracking_error(&self, target: &Quat) -> (f64, f64) {
+        let err = self.q_b_eci.angular_distance(target).into_buf().abs();
+        let rate = self.omega_b.norm().into_buf();
+        (err, rate)
+    }
 }
 
 #[cfg(test)]

@@ -11,10 +11,13 @@
 //! Time counts from the first `BodyState`, as `nav` counts from its first
 //! sensor sample, so both see the same epoch.
 
-use adcs_contracts::novatel::{self, BestXyz, LINE_MAX};
 use core::cell::Cell;
 
-use adcs_contracts::{BodyState, GpsFault, V3, eci_to_ecef_state, epoch_at, gps_epoch, gps_time};
+use adcs_contracts::novatel::{BestXyz, LINE_MAX, LineBuf};
+use adcs_contracts::{
+    BodyState, GPS_POS_SIGMA, GPS_VEL_SIGMA, GpsError, GpsFault, V3, eci_to_ecef_state, epoch_at,
+    gps_epoch, gps_time,
+};
 use futures_lite::future;
 use metor_fsw_3::io::{Buf, Cap, IoInit, Uart};
 use metor_fsw_3::{Input, Seq, SeqError, Timestamp, sequence};
@@ -25,8 +28,6 @@ use serde::Deserialize;
 
 /// The command bytes each read takes.
 const COMMAND_READ: usize = 64;
-/// The time constant of the position error (s).
-const TAU: f64 = 100.0;
 
 /// The params for `gps_receiver`.
 #[derive(Deserialize, JsonSchema, Clone, Debug, PartialEq)]
@@ -42,18 +43,19 @@ pub struct GpsReceiverParams {
 }
 
 fn default_pos_sigma() -> f64 {
-    5.0
+    GPS_POS_SIGMA
 }
 
 fn default_vel_sigma() -> f64 {
-    0.05
+    GPS_VEL_SIGMA
 }
 
-/// The receiver's buffers, which its body takes when it starts, and its logs.
+/// The receiver's buffers, which its body takes when it starts, and its
+/// model.
 pub struct GpsReceiver {
     rx: Option<Buf>,
     tx: Option<Buf>,
-    logger: Logger,
+    model: ReceiverModel,
 }
 
 impl GpsReceiver {
@@ -61,7 +63,7 @@ impl GpsReceiver {
         Self {
             rx: Some(io.alloc(COMMAND_READ)),
             tx: Some(io.alloc(LINE_MAX)),
-            logger: Logger::new(p),
+            model: ReceiverModel::new(p),
         }
     }
 }
@@ -79,20 +81,22 @@ pub async fn gps_receiver(
         return Err(SeqError::Failed("the receiver's buffers are taken".into()));
     };
     let period = Cell::new(None);
-    let logs = logs(seq, uart, tx, &mut m.logger, truth, faults, &period);
+    let logs = logs(seq, uart, tx, &mut m.model, truth, faults, &period);
     future::zip(commands(uart, rx, &period), logs).await;
     Ok(())
 }
 
 /// Reads the driver's commands, passing on each log period one sets.
 async fn commands(uart: &Cap<Uart>, mut buf: Buf, period: &Cell<Option<f64>>) {
-    let mut line = Command::default();
+    let mut lines = LineBuf::<COMMAND_READ>::default();
     loop {
         let (read, back) = uart.read(buf).await;
         buf = back;
-        if read.is_ok()
-            && let Some(p) = line.push(&buf)
-        {
+        if read.is_err() {
+            continue;
+        }
+        lines.push(&buf);
+        if let Some(p) = last_period(&mut lines) {
             period.set(Some(p));
         }
     }
@@ -103,7 +107,7 @@ async fn logs(
     seq: &Seq<'_>,
     uart: &Cap<Uart>,
     mut buf: Buf,
-    logger: &mut Logger,
+    model: &mut ReceiverModel,
     truth: &mut Input<BodyState>,
     faults: &mut Input<GpsFault>,
     period: &Cell<Option<f64>>,
@@ -111,13 +115,13 @@ async fn logs(
     let mut line = [0; LINE_MAX];
     loop {
         if let Some(p) = period.take() {
-            logger.set_period(p);
+            model.set_period(p);
         }
         if let Ok(Some(fault)) = faults.latest() {
-            logger.outage = fault.outage != 0;
+            model.outage = fault.outage != 0;
         }
         let due = match truth.latest() {
-            Ok(Some(body)) => logger.update(&body, &mut line),
+            Ok(Some(body)) => model.update(&body, &mut line),
             _ => None,
         };
         match due {
@@ -132,38 +136,14 @@ async fn logs(
     }
 }
 
-/// The command line the driver is writing.
-struct Command {
-    bytes: [u8; COMMAND_READ],
-    len: usize,
-}
-
-impl Default for Command {
-    fn default() -> Self {
-        Self {
-            bytes: [0; COMMAND_READ],
-            len: 0,
-        }
+/// Takes every complete line in `lines`. Returns the last log period one
+/// sets.
+fn last_period(lines: &mut LineBuf<COMMAND_READ>) -> Option<f64> {
+    let mut period = None;
+    while let Some(line) = lines.next_line() {
+        period = parse_period(line).or(period);
     }
-}
-
-impl Command {
-    /// Takes command bytes. Returns the last log period a complete line set.
-    fn push(&mut self, bytes: &[u8]) -> Option<f64> {
-        let mut period = None;
-        for &b in bytes {
-            if self.len == self.bytes.len() {
-                self.len = 0;
-            }
-            self.bytes[self.len] = b;
-            self.len += 1;
-            if b == b'\n' {
-                period = parse_period(&self.bytes[..self.len]).or(period);
-                self.len = 0;
-            }
-        }
-        period
-    }
+    period
 }
 
 /// The period a `LOG BESTXYZA ONTIME` line sets.
@@ -173,27 +153,28 @@ fn parse_period(line: &[u8]) -> Option<f64> {
     period.trim().parse().ok().filter(|p: &f64| *p > 0.0)
 }
 
-/// When logs fall due, and the solution and noise they carry.
-struct Logger {
+/// The simulated receiver: when its logs fall due, and the solution and
+/// noise they carry.
+struct ReceiverModel {
     period: f64,
     next_log: f64,
     first: Option<Timestamp>,
     outage: bool,
-    err: V3,
+    pos_err: GpsError,
     pos_sigma: f64,
     vel_sigma: f64,
     rng: StdRng,
     unit: Normal<f64>,
 }
 
-impl Logger {
+impl ReceiverModel {
     fn new(p: GpsReceiverParams) -> Self {
         Self {
             period: 1.0,
             next_log: 0.0,
             first: None,
             outage: false,
-            err: V3::zeros(),
+            pos_err: GpsError::new(p.pos_sigma),
             pos_sigma: p.pos_sigma,
             vel_sigma: p.vel_sigma,
             rng: StdRng::seed_from_u64(p.seed),
@@ -219,12 +200,12 @@ impl Logger {
         // Keep the cadence while on time, and restart it from `t` when late.
         let next = self.next_log + self.period;
         self.next_log = if next > t { next } else { t + self.period };
-        let log = self.log(body, t);
-        novatel::encode(&log, line)
+        self.next_solution(body, t).encode(line)
     }
 
-    /// The log of `body` at `t` seconds since the first state.
-    fn log(&mut self, body: &BodyState, t: f64) -> BestXyz {
+    /// The solution for `body` at `t` seconds since the first state. This
+    /// steps the position error.
+    fn next_solution(&mut self, body: &BodyState, t: f64) -> BestXyz {
         let (week, seconds) = gps_time(epoch_at(t));
         let mut log = BestXyz {
             week,
@@ -238,9 +219,8 @@ impl Logger {
         if self.outage {
             return log;
         }
-        let phi = (-self.period / TAU).exp();
-        self.err = phi * self.err + self.noise(self.pos_sigma * (1.0 - phi * phi).sqrt());
-        let pos = body.pos_eci + self.err;
+        let unit = self.noise(1.0);
+        let pos = body.pos_eci + self.pos_err.step(self.period, unit);
         let vel = body.vel_eci + self.noise(self.vel_sigma);
         let (pos, vel) = eci_to_ecef_state(gps_epoch(week, seconds), &pos, &vel);
         log.pos_ecef = pos.into_buf();
@@ -279,8 +259,8 @@ mod tests {
         }
     }
 
-    fn logger() -> Logger {
-        Logger::new(GpsReceiverParams {
+    fn model() -> ReceiverModel {
+        ReceiverModel::new(GpsReceiverParams {
             seed: 7,
             pos_sigma: 5.0,
             vel_sigma: 0.0,
@@ -288,7 +268,7 @@ mod tests {
     }
 
     /// The logs `l` writes, one cycle at a time, from `from` for `seconds`.
-    fn run(l: &mut Logger, from: f64, seconds: f64) -> Vec<BestXyz> {
+    fn run(l: &mut ReceiverModel, from: f64, seconds: f64) -> Vec<BestXyz> {
         let (mut lines, mut line) = (Lines::default(), [0; LINE_MAX]);
         let mut logs = Vec::new();
         for k in 0..=(seconds / STEP).round() as usize {
@@ -302,33 +282,39 @@ mod tests {
 
     #[test]
     fn logs_once_a_second_until_commanded_to_ten_hertz() {
-        let mut l = logger();
+        let mut l = model();
         assert_eq!(run(&mut l, 0.0, 2.0).len(), 3, "at 0, 1, and 2 s");
-        l.set_period(Command::default().push(LOG_10HZ).unwrap());
+        l.set_period(push(&mut LineBuf::default(), LOG_10HZ).unwrap());
         assert_eq!(l.period, 0.1);
         assert!((9..=10).contains(&run(&mut l, 2.01, 0.99).len()));
     }
 
+    /// Pushes `bytes` as one read, and returns the last period they set.
+    fn push(lines: &mut LineBuf<COMMAND_READ>, bytes: &[u8]) -> Option<f64> {
+        lines.push(bytes);
+        last_period(lines)
+    }
+
     #[test]
     fn a_command_split_across_reads_is_one_line() {
-        let mut c = Command::default();
-        assert_eq!(c.push(&LOG_10HZ[..9]), None);
-        assert_eq!(c.push(&LOG_10HZ[9..]), Some(0.1));
+        let mut c = LineBuf::default();
+        assert_eq!(push(&mut c, &LOG_10HZ[..9]), None);
+        assert_eq!(push(&mut c, &LOG_10HZ[9..]), Some(0.1));
     }
 
     #[test]
     fn a_bad_or_overlong_command_sets_nothing() {
-        let mut c = Command::default();
-        assert_eq!(c.push(b"LOG BESTXYZA ONTIME -1\r\n"), None);
-        assert_eq!(c.push(b"LOG BESTXYZA ONTIME fast\r\n"), None);
-        assert_eq!(c.push(&[b'x'; COMMAND_READ + 4]), None);
-        assert_eq!(c.push(b"\r\n"), None);
-        assert_eq!(c.push(LOG_10HZ), Some(0.1));
+        let mut c = LineBuf::default();
+        assert_eq!(push(&mut c, b"LOG BESTXYZA ONTIME -1\r\n"), None);
+        assert_eq!(push(&mut c, b"LOG BESTXYZA ONTIME fast\r\n"), None);
+        assert_eq!(push(&mut c, &[b'x'; COMMAND_READ + 4]), None);
+        assert_eq!(push(&mut c, b"\r\n"), None);
+        assert_eq!(push(&mut c, LOG_10HZ), Some(0.1));
     }
 
     #[test]
     fn an_outage_logs_no_solution() {
-        let mut l = logger();
+        let mut l = model();
         l.outage = true;
         let logs = run(&mut l, 0.0, 1.0);
         assert!(!logs.is_empty() && logs.iter().all(|l| !l.solved && l.sats == 0));

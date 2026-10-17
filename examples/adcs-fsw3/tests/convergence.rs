@@ -14,7 +14,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Once, OnceLock};
 
-use adcs_contracts::{AttitudeEstimate, BodyState, DT, ModeCmd, TorqueCmd, tracking_sample};
+use adcs_contracts::{AttitudeEstimate, BodyState, DT, ModeCmd, TorqueCmd, target_for};
 use adcs_seqs::Commission;
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::cli::run::prepare;
@@ -85,7 +85,8 @@ fn watch(
         return;
     };
     let mut record = state.0.borrow_mut();
-    record.track.push(tracking_sample(&body, LAW));
+    let target = target_for(LAW, &body.pos_eci, &body.vel_eci);
+    record.track.push(body.tracking_error(&target));
     if let Ok(Some(estimate)) = estimate.latest() {
         let error = body.q_b_eci.angular_distance(&estimate.q_hat_b_eci);
         record.estimate.push(error.into_buf().abs());
@@ -245,7 +246,11 @@ fn linked(config: &CoordinatorConfig, shared: &Shared) -> Coordinator {
     }
     let mut table = adcs_systems::pack();
     table
-        .register_sequence("commission", adcs_seqs::commission(), Commission::new)
+        .register_sequence(
+            "commission",
+            adcs_seqs::commission(),
+            core::convert::identity::<Commission>,
+        )
         .expect("valid records");
     config
         .build(&with_sinks(table, shared))

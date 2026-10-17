@@ -4,12 +4,8 @@ use nox::tensor;
 
 use crate::V3;
 
-/// Gravitational constant (m³·kg⁻¹·s⁻²).
-pub const G: f64 = 6.6743e-11;
-/// Mass of Earth (kg).
-pub const M: f64 = 5.972e24;
 /// Earth's gravitational parameter `G·M` (m³·s⁻²).
-pub const MU: f64 = G * M;
+pub const MU: f64 = 6.6743e-11 * 5.972e24;
 /// Earth radius (m).
 pub const EARTH_RADIUS: f64 = 6378.1e3;
 

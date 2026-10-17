@@ -83,14 +83,14 @@ ctrl = fsw.add(
 fsw_pub = fsw.add("pub", Publish(listen=f"127.0.0.1:{p_fsw}", all=True))
 
 # The plant applies the controller's commands one cycle late.
-cmds = plant.add("ctrl", Subscribe(peer=fsw_pub, items=[ctrl.torque_cmd, ctrl.mtq_cmd]))
-torque.connect(cmds.port(ctrl.torque_cmd))
-mtq.connect(cmds.port(ctrl.mtq_cmd))
+ctrl_cmds = plant.add("ctrl", Subscribe(peer=fsw_pub, items=[ctrl.torque_cmd, ctrl.mtq_cmd]))
+torque.connect(ctrl_cmds.port(ctrl.torque_cmd))
+mtq.connect(ctrl_cmds.port(ctrl.mtq_cmd))
 
 gw, db = gateway("gw", peers=[plant_pub, fsw_pub], listen=f"127.0.0.1:{p_db}", cycle_rate=120.0)
 
 # The ground commands `commission` through the gateway's db.
-cmds = fsw.add("cmds", Subscribe([SequenceCommand], peer=db))
-fsw.commands(cmds.sequence_command)
+ground_cmds = fsw.add("cmds", Subscribe([SequenceCommand], peer=db))
+fsw.commands(ground_cmds.sequence_command)
 
 Deployment(targets=[plant, fsw, gw])
