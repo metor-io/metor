@@ -141,10 +141,12 @@ pub trait SequenceFn: FnSignature {
 pub fn def<S: SequenceFn>(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
     let mut inputs = vec![Input::<AbortRequest>::def(cx, ABORT_PORT)];
     inputs.extend(InSet::<S>::defs(cx)?);
+    let (outputs, log) = OutSet::<S>::defs_with_log(cx)?;
     Ok(SystemDef {
         name: S::NAME.into(),
         inputs,
-        outputs: OutSet::<S>::defs(cx)?,
+        outputs,
+        log: Some(log),
         grants: Defs::of::<S>(cx)?.grants,
     })
 }
