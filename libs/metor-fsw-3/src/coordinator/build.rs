@@ -131,6 +131,7 @@ impl<'a> Plan<'a> {
                     id: system.id.clone(),
                     ty: system.ty.clone(),
                 })?;
+            entry.check_adapter(system)?;
             let def = SystemDef::planned(system, entry, &plan, records, namespace)?;
             plan.push(system, entry, def, namespace);
         }
@@ -262,6 +263,24 @@ impl<'a> Plan<'a> {
             }
         }
         Ok(())
+    }
+}
+
+impl TableEntry {
+    /// Checks that the type runs behind the adapter `system` gives it.
+    fn check_adapter(&self, system: &SystemConfig) -> Result<(), BuildError> {
+        if self.adapters.accepts(system.adapter.as_ref()) {
+            return Ok(());
+        }
+        let adapter = match &system.adapter {
+            None => "without an adapter".to_string(),
+            Some(Adapter::Thread(thread)) => format!("on thread `{thread}`"),
+        };
+        Err(BuildError::UnsupportedAdapter {
+            id: system.id.clone(),
+            ty: system.ty.clone(),
+            adapter,
+        })
     }
 }
 

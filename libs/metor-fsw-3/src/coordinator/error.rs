@@ -84,6 +84,13 @@ pub enum BuildError {
         second: String,
     },
 
+    #[error("system `{id}` of type `{ty}` cannot run {adapter}")]
+    UnsupportedAdapter {
+        id: String,
+        ty: String,
+        adapter: String,
+    },
+
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
     ReservedPort { ty: String },
 

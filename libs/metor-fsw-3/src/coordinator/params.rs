@@ -40,8 +40,6 @@ pub enum ParamError {
     UnknownKey(String),
     #[error("{0}")]
     Decode(String),
-    #[error("`{thread}`: a cyclic system runs on the cycle thread")]
-    Thread { thread: String },
     #[error("thread `{thread}` is not running")]
     ThreadStart { thread: String },
     #[error("the constructor panicked: {0}")]

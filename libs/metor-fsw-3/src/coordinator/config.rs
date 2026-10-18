@@ -72,6 +72,32 @@ pub enum Adapter {
     Thread(String),
 }
 
+/// The adapters a system type runs behind. `bare` is running behind none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Adapters {
+    pub bare: bool,
+    pub thread: bool,
+}
+
+impl Default for Adapters {
+    fn default() -> Self {
+        Self {
+            bare: true,
+            thread: true,
+        }
+    }
+}
+
+impl Adapters {
+    /// Whether the type runs behind `adapter`, or behind none for `None`.
+    pub fn accepts(self, adapter: Option<&Adapter>) -> bool {
+        match adapter {
+            None => self.bare,
+            Some(Adapter::Thread(_)) => self.thread,
+        }
+    }
+}
+
 /// Serializes an [`Adapter`] as a `thread` key.
 mod adapter_keys {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -268,6 +294,24 @@ mod tests {
             serde_json::from_str::<SystemConfig>(&text).expect("round trips"),
             full
         );
+    }
+
+    #[test]
+    fn test_adapters_accept() {
+        let thread = Adapter::Thread("gps".into());
+        let all = Adapters::default();
+        assert!(all.accepts(None) && all.accepts(Some(&thread)));
+        let bare = Adapters {
+            thread: false,
+            ..all
+        };
+        assert!(bare.accepts(None));
+        assert!(!bare.accepts(Some(&thread)));
+        let none = Adapters {
+            bare: false,
+            ..bare
+        };
+        assert!(!none.accepts(None));
     }
 
     fn adapter_of(text: &str) -> Result<Option<Adapter>, serde_json::Error> {

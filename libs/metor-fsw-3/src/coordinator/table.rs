@@ -17,7 +17,7 @@ use crate::thread::{DEFAULT_THREAD, Threads};
 
 use super::BuildError;
 use super::SystemStatus;
-use super::config::Adapter;
+use super::config::{Adapter, Adapters};
 use super::params::{ParamError, Params};
 use super::step::Runner;
 use super::step::Step;
@@ -49,6 +49,39 @@ impl MakeCx<'_> {
             _ => DEFAULT_THREAD,
         }
     }
+
+    /// Opens the ring handles a cyclic system needs, leaving `inputs` and
+    /// `outputs` empty.
+    ///
+    /// That is one reader per input edge and one writer per output.
+    pub(crate) fn take_bindings(&mut self) -> (Vec<InputBinding>, Vec<OutputBinding>) {
+        let views = self
+            .def
+            .inputs
+            .iter()
+            .zip(core::mem::take(&mut self.inputs))
+            .map(|(def, rings)| InputBinding {
+                def: def.clone(),
+                views: rings
+                    .into_iter()
+                    // PANIC Safety: the build pass counts one reader slot per edge.
+                    .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
+                    .collect(),
+            })
+            .collect();
+        let writers = self
+            .def
+            .outputs
+            .iter()
+            .zip(core::mem::take(&mut self.outputs))
+            .map(|(def, ring)| OutputBinding {
+                def: def.clone(),
+                // PANIC Safety: one ring is allocated per output port.
+                writer: ring.writer(NoWake).expect("one writer per output ring"),
+            })
+            .collect();
+        (views, writers)
+    }
 }
 
 /// Creates a system from a [`MakeCx`].
@@ -68,9 +101,23 @@ pub enum SystemKind {
     Async,
 }
 
+impl SystemKind {
+    /// The adapters a type of this kind runs behind.
+    pub(crate) fn adapters(self) -> Adapters {
+        match self {
+            Self::Cyclic => Adapters {
+                thread: false,
+                ..Adapters::default()
+            },
+            Self::Async => Adapters::default(),
+        }
+    }
+}
+
 pub(crate) struct TableEntry {
     #[allow(dead_code)]
     pub kind: SystemKind,
+    pub adapters: Adapters,
     /// The ports the type always has, whatever the config says.
     pub def: SystemDef,
     pub def_fn: Box<DefFn>,
@@ -285,14 +332,14 @@ impl TableEntry {
         let def = S::def(&DefCx::empty())?;
         Ok(Self {
             kind: SystemKind::Cyclic,
+            adapters: SystemKind::Cyclic.adapters(),
             def,
             def_fn: Box::new(S::def),
             doc,
             schema,
-            make: Arc::new(move |cx| {
-                refuse_thread(cx.adapter)?;
+            make: Arc::new(move |mut cx| {
                 let (system, state) = make(cx.params)?;
-                let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
+                let (views, writers) = cx.take_bindings();
                 Ok(Box::new(Runner {
                     system,
                     state,
@@ -312,14 +359,14 @@ impl TableEntry {
     ) -> Result<Self, DefError> {
         Ok(Self {
             kind: SystemKind::Cyclic,
+            adapters: SystemKind::Cyclic.adapters(),
             def: FnSystem::<S>::def(&DefCx::empty())?,
             def_fn: Box::new(FnSystem::<S>::def),
             doc: Cow::Borrowed(S::DOC),
             schema: C::schema(),
-            make: Arc::new(move |cx| {
-                refuse_thread(cx.adapter)?;
+            make: Arc::new(move |mut cx| {
                 let instance = fn_system::Instance::from_make_cx(&cx);
-                let (views, writers) = bindings(cx.def, cx.inputs, cx.outputs);
+                let (views, writers) = cx.take_bindings();
                 let (inputs, outputs) = fn_system::bind::<S>(views, writers, instance)?;
                 let state = ctor.make(cx.params)?;
                 Ok(Box::new(Runner {
@@ -348,6 +395,7 @@ impl TableEntry {
         let make = Arc::new(make);
         Ok(Self {
             kind: SystemKind::Async,
+            adapters: SystemKind::Async.adapters(),
             def: A::def(&DefCx::empty())?,
             def_fn: Box::new(A::def),
             doc,
@@ -355,52 +403,6 @@ impl TableEntry {
             make: Arc::new(move |cx| crate::thread::place::<A, M>(make.clone(), cx)),
         })
     }
-}
-
-/// Returns an error if the adapter is a thread.
-///
-/// Only async systems can run on their own thread.
-pub(crate) fn refuse_thread(adapter: Option<&Adapter>) -> Result<(), ParamError> {
-    match adapter {
-        Some(Adapter::Thread(thread)) => Err(ParamError::Thread {
-            thread: thread.clone(),
-        }),
-        _ => Ok(()),
-    }
-}
-
-/// Opens the ring handles a cyclic system needs.
-///
-/// That is one reader per input edge and one writer per output.
-pub(crate) fn bindings(
-    def: &SystemDef,
-    inputs: Vec<Vec<&RingBuffer>>,
-    outputs: Vec<&RingBuffer>,
-) -> (Vec<InputBinding>, Vec<OutputBinding>) {
-    let views = def
-        .inputs
-        .iter()
-        .zip(inputs)
-        .map(|(def, rings)| InputBinding {
-            def: def.clone(),
-            views: rings
-                .into_iter()
-                // PANIC Safety: the build pass counts one reader slot per edge.
-                .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
-                .collect(),
-        })
-        .collect();
-    let writers = def
-        .outputs
-        .iter()
-        .zip(outputs)
-        .map(|(def, ring)| OutputBinding {
-            def: def.clone(),
-            // PANIC Safety: one ring is allocated per output port.
-            writer: ring.writer(NoWake).expect("one writer per output ring"),
-        })
-        .collect();
-    (views, writers)
 }
 
 #[cfg(all(test, feature = "host"))]

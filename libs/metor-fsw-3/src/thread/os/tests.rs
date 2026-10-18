@@ -7,7 +7,7 @@ use std::time::Instant;
 use metor_proto::types::Timestamp;
 
 use crate::coordinator::{BuildError, Coordinator, CoordinatorConfig, InputConfig, PortRef};
-use crate::coordinator::{BuildOptions, Clock, ParamError, SystemConfig, SystemTable};
+use crate::coordinator::{BuildOptions, Clock, SystemConfig, SystemTable};
 use crate::tests::utils::{Recorder, ended_with, table};
 
 /// Both ways a group runs: on its own thread, and turned by the coordinator.
@@ -253,11 +253,10 @@ fn test_reject_cyclic_thread_placement() {
     };
     assert_eq!(
         config.build(&table(&recorder)).err(),
-        Some(BuildError::Params {
+        Some(BuildError::UnsupportedAdapter {
             id: "imu".into(),
-            source: ParamError::Thread {
-                thread: "io".into()
-            },
+            ty: "imu".into(),
+            adapter: "on thread `io`".into(),
         })
     );
 }
