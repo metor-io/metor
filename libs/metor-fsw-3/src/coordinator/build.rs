@@ -44,7 +44,6 @@ struct PlannedSystem<'a> {
     adapter: Option<&'a Adapter>,
     /// The ring of each output port, in definition order.
     outputs: Vec<RingIndex>,
-    status: RingIndex,
     inputs: Vec<Vec<RingIndex>>,
 }
 
@@ -58,9 +57,6 @@ struct Plan<'a> {
 impl PlannedSystem<'_> {
     /// Returns the ring index for a given output port, or `None` if the port is not declared.
     fn output_ring(&self, port: &str) -> Option<RingIndex> {
-        if port == STATUS_PORT {
-            return Some(self.status);
-        }
         let index = self.def.outputs.iter().position(|p| p.name == port)?;
         Some(self.outputs[index])
     }
@@ -133,31 +129,19 @@ impl<'a> Plan<'a> {
                 })?;
             entry.check_adapter(system)?;
             let def = SystemDef::planned(system, entry, &plan, records, namespace)?;
-            plan.push(system, entry, def, namespace);
+            plan.push(system, entry, def);
         }
         plan.resolve_edges(config)?;
         Ok(plan)
     }
 
-    /// Adds `system`, with one ring per output and one for its status.
-    fn push(
-        &mut self,
-        system: &'a SystemConfig,
-        entry: &'a TableEntry,
-        def: SystemDef,
-        namespace: Option<&str>,
-    ) {
+    /// Adds `system`, with one ring per output.
+    fn push(&mut self, system: &'a SystemConfig, entry: &'a TableEntry, def: SystemDef) {
         let outputs = def
             .outputs
             .iter()
             .map(|port| self.add_ring(&system.id, port.clone()))
             .collect();
-        let status_cx = DefCx {
-            id: &system.id,
-            namespace,
-            ..DefCx::empty()
-        };
-        let status = self.add_ring(&system.id, SystemStatus::port_def(&status_cx));
         self.systems.push(PlannedSystem {
             id: &system.id,
             entry,
@@ -166,7 +150,6 @@ impl<'a> Plan<'a> {
             params: Params(&system.params),
             adapter: system.adapter.as_ref(),
             outputs,
-            status,
         });
     }
 
@@ -319,7 +302,8 @@ impl SystemDef {
         Ok(def)
     }
 
-    /// Computes the definition that `entry`'s type produces for `system`.
+    /// Computes the definition that `entry`'s type produces for `system`, with
+    /// the coordinator's `status` output last.
     ///
     /// `producer` looks up the output definition behind each input edge. It
     /// returns `None` when that producer is not resolved yet. That is only
@@ -356,14 +340,20 @@ impl SystemDef {
             records,
             params: &system.params,
         };
-        (entry.def_fn)(&cx).map_err(|source| BuildError::Def {
+        let mut def = (entry.def_fn)(&cx).map_err(|source| BuildError::Def {
             id: system.id.clone(),
             source,
-        })
+        })?;
+        if def.outputs.iter().any(|p| p.name == STATUS_PORT) {
+            return Err(BuildError::ReservedPort {
+                ty: system.ty.clone(),
+            });
+        }
+        def.outputs.push(SystemStatus::port_def(&cx));
+        Ok(def)
     }
 
-    /// Checks that no two inputs and no two outputs share a name, and that no
-    /// output takes the coordinator's `status` name.
+    /// Checks that no two inputs and no two outputs share a name.
     fn check_port_names(&self, system: &SystemConfig) -> Result<(), BuildError> {
         let port = |port: &PortDef| (system.id.clone(), port.name.to_string());
         if let Some((system, port)) = find_duplicate(&self.inputs).map(port) {
@@ -371,11 +361,6 @@ impl SystemDef {
         }
         if let Some((system, port)) = find_duplicate(&self.outputs).map(port) {
             return Err(BuildError::DuplicateOutput { system, port });
-        }
-        if self.outputs.iter().any(|p| p.name == STATUS_PORT) {
-            return Err(BuildError::ReservedPort {
-                ty: system.ty.clone(),
-            });
         }
         Ok(())
     }
@@ -457,20 +442,24 @@ fn make_systems(
 ) -> Result<Vec<Entry>, BuildError> {
     let mut entries = Vec::with_capacity(plan.systems.len());
     for system in &plan.systems {
-        let outputs: Vec<&RingBuffer> = system.outputs.iter().map(|&ring| &rings[ring]).collect();
+        // PANIC Safety: `SystemDef::instance` puts `status` last.
+        let (&status, outputs) = system.outputs.split_last().expect("a status output");
+        let outputs: Vec<&RingBuffer> = outputs.iter().map(|&ring| &rings[ring]).collect();
+        let mut def = system.def.clone();
+        def.outputs.pop();
         let inputs: Vec<Vec<&RingBuffer>> = system
             .inputs
             .iter()
             .map(|edges| edges.iter().map(|&ring| &rings[ring]).collect())
             .collect();
         // PANIC Safety: build allocates one ring per output.
-        let status = rings[system.status]
+        let status = rings[status]
             .writer(NoWake)
             .expect("one writer per output ring");
         let cx = MakeCx {
             id: system.id,
             adapter: system.adapter,
-            def: &system.def,
+            def: &def,
             params: system.params,
             inputs,
             outputs,
@@ -704,6 +693,23 @@ mod tests {
             ..SystemConfig::new("watch", "status_watch")
         });
         assert!(build(config).is_ok());
+    }
+
+    #[test]
+    fn test_instance_puts_status_last() {
+        let table = table(&Recorder::default());
+        let system = source("imu");
+        let entry = table.get(&system.ty).expect("registered");
+        let records = table.records();
+        let def = SystemDef::instance(&system, entry, Some("sat"), &records, |_, _| Ok(None))
+            .expect("a static definition");
+        let cx = DefCx {
+            id: "imu",
+            namespace: Some("sat"),
+            ..DefCx::empty()
+        };
+        assert_eq!(def.outputs.last(), Some(&SystemStatus::port_def(&cx)));
+        assert_eq!(def.outputs.len(), entry.def.outputs.len() + 1);
     }
 
     #[test]
