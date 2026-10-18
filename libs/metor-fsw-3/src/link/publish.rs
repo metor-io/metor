@@ -5,7 +5,7 @@ use std::rc::Rc;
 use core::ops::{Deref, DerefMut};
 
 use futures_lite::future;
-use metor_fsw_3_ring::{Notifier, WakeSink};
+use metor_fsw_3_ring::Notifier;
 use metor_proto::types::{PacketId, table_id};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -14,7 +14,7 @@ use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers};
 use crate::log::Log;
-use crate::port::{DynInputs, Output};
+use crate::port::{DynInputs, InputWake, Output};
 use crate::record::RecordSchema;
 use crate::system::PortDef;
 use crate::{Stop, system};
@@ -104,25 +104,25 @@ pub async fn publish(
 ///
 /// A record is sent under its frame's table id, so the definition rejects two
 /// frame ports whose tables share an id.
-pub struct PublishInputs<W: WakeSink = Notifier>(DynInputs<W>);
+pub struct PublishInputs<W: InputWake = Notifier>(DynInputs<W>);
 
-impl<W: WakeSink> Deref for PublishInputs<W> {
+impl<W: InputWake> Deref for PublishInputs<W> {
     type Target = DynInputs<W>;
     fn deref(&self) -> &DynInputs<W> {
         &self.0
     }
 }
 
-impl<W: WakeSink> DerefMut for PublishInputs<W> {
+impl<W: InputWake> DerefMut for PublishInputs<W> {
     fn deref_mut(&mut self) -> &mut DynInputs<W> {
         &mut self.0
     }
 }
 
-impl<D: WakeSink + 'static> Param for PublishInputs<D> {
-    type In<W: WakeSink + Clone + 'static> = PublishInputs<W>;
+impl<D: InputWake> Param for PublishInputs<D> {
+    type In<W: InputWake> = PublishInputs<W>;
     type Out = ();
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut PublishInputs<W>;
+    type Item<'a, W: InputWake> = &'a mut PublishInputs<W>;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -134,7 +134,7 @@ impl<D: WakeSink + 'static> Param for PublishInputs<D> {
         check_table_ids(&defs.inputs[first..])
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> PublishInputs<W> {
+    fn bind_in<W: InputWake>(views: &mut Views<W>) -> PublishInputs<W> {
         PublishInputs(<DynInputs<D> as Param>::bind_in(views))
     }
 
@@ -142,7 +142,7 @@ impl<D: WakeSink + 'static> Param for PublishInputs<D> {
         <DynInputs<D> as Param>::bind_out(names, writers)
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         input: &'a mut PublishInputs<W>,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,

@@ -16,7 +16,7 @@ use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers};
 use crate::log::Log;
-use crate::port::{DynOutputs, Output};
+use crate::port::{DynOutputs, InputWake, Output};
 use crate::record::{Bytes, RecordSchema};
 use crate::system::PortDef;
 use crate::{Stop, system};
@@ -173,9 +173,9 @@ impl DerefMut for SubscribeOutputs {
 }
 
 impl Param for SubscribeOutputs {
-    type In<W: WakeSink + Clone + 'static> = ();
+    type In<W: InputWake> = ();
     type Out = SubscribeOutputs;
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut SubscribeOutputs;
+    type Item<'a, W: InputWake> = &'a mut SubscribeOutputs;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -187,7 +187,7 @@ impl Param for SubscribeOutputs {
         check_route_keys(&defs.outputs[first..])
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
     fn bind_out(
         names: &mut ParamNames<'_>,
@@ -196,7 +196,7 @@ impl Param for SubscribeOutputs {
         <DynOutputs as Param>::bind_out(names, writers).map(SubscribeOutputs)
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         _input: &'a mut (),
         output: &'a mut SubscribeOutputs,
         _cx: &mut Cycle<'a>,
