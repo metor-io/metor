@@ -107,8 +107,14 @@ impl WasmPack {
         let ins = Copies::inputs(&mut guest, &instance.def.inputs, inputs, capped)?;
         let outs = Copies::outputs(&mut guest, &instance.def.outputs, outputs, capped)?;
         let mirrors = Mirrors::new(&instance.def, ins.mirrors, outs.mirrors);
-        let mirror = io.borrow().arena(&instance.id);
-        let given = match mirror.and_then(|m| m.region()) {
+        let ports = ins.io.zip(outs.io).map(|(cq, sq)| IoPorts {
+            sq: Input::new(vec![sq]),
+            cq: Input::new(vec![cq]),
+        });
+        let remade = ports
+            .as_ref()
+            .and_then(|_| io.borrow().arena(&instance.id)?.region());
+        let given = match remade {
             Some((_, len)) => Some(GuestRing::alloc_zeroed(&mut guest, len)?),
             None => None,
         };
@@ -121,13 +127,10 @@ impl WasmPack {
             io_arena: given,
         };
         let (handle, region) = call.call(&mut guest)?;
-        let copy = match (ins.io, outs.io) {
-            (Some(cq), Some(sq)) if region.len > 0 => {
-                let views = (Input::new(vec![sq]), Input::new(vec![cq]));
-                Some(attach(&guest, io, instance, region, views)?)
-            }
-            _ => None,
-        };
+        let copy = ports
+            .filter(|_| region.len > 0)
+            .map(|ports| attach(&guest, io, instance, region, ports))
+            .transpose()?;
         Ok(WasmStep::new(mirrors, copy, guest, handle, self.fuel))
     }
 
@@ -233,6 +236,13 @@ impl GuestRing {
     }
 }
 
+/// A capped system's IO ports: second readers on the guest's copies of its
+/// SQ and CQ.
+struct IoPorts {
+    sq: Input<Sqe>,
+    cq: Input<Cqe>,
+}
+
 /// Makes the host's mirror of the IO arena the guest laid out at `region`,
 /// and the copy that keeps the two in step.
 fn attach(
@@ -240,7 +250,7 @@ fn attach(
     io: &SharedIo,
     instance: &Instance,
     region: GuestRing,
-    (sq, cq): (Input<Sqe>, Input<Cqe>),
+    IoPorts { sq, cq }: IoPorts,
 ) -> Result<IoCopy, ParamError> {
     let len = region.len as usize;
     let mirror = io.borrow_mut().get_or_add_member(&instance.id);
