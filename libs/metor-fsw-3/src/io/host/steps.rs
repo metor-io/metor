@@ -66,6 +66,7 @@ fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         name: "io".into(),
         inputs: cx.dyn_input_defs(&[])?,
         outputs,
+        log: Some(0),
         grants: Vec::new(),
     })
 }
