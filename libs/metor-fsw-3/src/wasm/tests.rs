@@ -329,6 +329,7 @@ fn rig(execute: &str) -> Rig {
         ],
         log: Some(1),
         grants: Vec::new(),
+        io: None,
     };
     let instance = Instance {
         id: "guest".into(),

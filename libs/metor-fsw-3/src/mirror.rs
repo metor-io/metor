@@ -361,6 +361,7 @@ pub(crate) mod tests {
             outputs: Vec::new(),
             log: None,
             grants: Vec::new(),
+            io: None,
         };
         let mut mirrors = Mirrors::new(&def, vec![mirror(&real, &copy)], Vec::new());
         assert!(real.view(NoWake).is_err());
