@@ -10,7 +10,6 @@ use crate::def::{DefCx, DefError};
 use crate::dl::{InstanceRings, PackError};
 use crate::io::{Cqe, IoState, Sqe};
 use crate::mirror::{Mirror, Mirrors, mirror_config};
-use crate::pack::ABI_VERSION;
 use crate::pack::def::{DefCxOwned, Instance, PackDef};
 use crate::port::Input;
 use crate::system::{PortDef, SystemDef};
@@ -61,7 +60,7 @@ impl WasmPack {
         let module = Module::compile(bytes)?;
         let memory = limits.memory.unwrap_or(DEFAULT_MEMORY);
         let mut guest = Guest::new(&module, memory, DEFAULT_SETUP_FUEL)?;
-        guest.check_abi_version()?;
+        PackError::check_abi(guest.abi_version(DEFAULT_SETUP_FUEL)?)?;
         let def = guest.descriptor()?;
         Ok(WasmPack {
             module,
@@ -154,18 +153,6 @@ impl WasmPack {
 }
 
 impl Guest {
-    /// Returns an error unless the module speaks this host's ABI version.
-    fn check_abi_version(&mut self) -> Result<(), PackError> {
-        let found = self.abi_version(DEFAULT_SETUP_FUEL)?;
-        if found != ABI_VERSION {
-            return Err(PackError::AbiMismatch {
-                found,
-                expected: ABI_VERSION,
-            });
-        }
-        Ok(())
-    }
-
     /// Reads the pack's descriptor.
     fn descriptor(&mut self) -> Result<PackDef, PackError> {
         let mut args = Args::new(self);
