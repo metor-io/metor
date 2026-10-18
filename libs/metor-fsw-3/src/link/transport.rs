@@ -3,7 +3,6 @@
 use core::num::NonZeroUsize;
 use core::time::Duration;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::rc::Rc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -12,7 +11,7 @@ use stellarator::net::{TcpListener, TcpStream};
 use crate::async_system::Stop;
 use crate::coordinator::ParamError;
 
-use super::conn::Connections;
+use super::conn::Serving;
 
 /// The delay after the first refused dial. Each later refusal doubles it, up
 /// to [`BACKOFF_MAX`].
@@ -100,11 +99,11 @@ impl Endpoint {
     /// closes. This runs as its own task, separate from the link's loop, so
     /// sending a batch never cancels an accept or a dial that is halfway
     /// through.
-    pub(crate) async fn run(self, conns: Rc<Connections>, stop: Stop) {
+    pub(crate) async fn run(self, mut serving: Serving, stop: Stop) {
         let serve = async {
             match self {
-                Self::Listen { listener, .. } => listen(listener, &conns, &stop).await,
-                Self::Connect { dialer } => dial(dialer, &conns, &stop).await,
+                Self::Listen { listener, .. } => listen(listener, &mut serving, &stop).await,
+                Self::Connect { dialer } => dial(dialer, &serving, &stop).await,
             }
         };
         futures_lite::future::or(serve, stop.wait()).await;
@@ -146,23 +145,19 @@ impl Dialer {
     }
 }
 
-async fn listen(listener: TcpListener, conns: &Rc<Connections>, stop: &Stop) {
+async fn listen(listener: TcpListener, serving: &mut Serving, stop: &Stop) {
     loop {
-        let Some(stream) = accept(&listener).await else {
-            continue;
-        };
-        if let Some(served) = conns.serve(stream, stop) {
-            drop(stellarator::spawn(served));
+        if let Some(stream) = accept(&listener).await {
+            serving.spawn(stream, stop);
         }
     }
 }
 
-async fn dial(mut dialer: Dialer, conns: &Rc<Connections>, stop: &Stop) {
+/// Serves one connection at a time in slot 0.
+async fn dial(mut dialer: Dialer, serving: &Serving, stop: &Stop) {
     loop {
         let stream = dialer.connect().await;
-        if let Some(served) = conns.serve(stream, stop) {
-            served.await;
-        }
+        serving.serve(0, stream, stop).await;
     }
 }
 
@@ -248,11 +243,11 @@ mod tests {
         let (handle, stop) = Stop::pair();
         // A port nothing listens on, so every dial is refused.
         let dialer = Dialer::new("127.0.0.1:1".parse().expect("an address"));
-        let inbox = Rc::new(super::super::inbox::Inbox::blackhole());
+        let inbox = std::rc::Rc::new(super::super::inbox::Inbox::blackhole());
         let cap = super::super::ConnCap::try_from(64).expect("a small ring");
-        let conns = Connections::new(1, cap, Vec::new(), inbox);
+        let (_conns, serving) = super::super::conn::Connections::new(1, cap, Vec::new(), inbox);
         handle.stop();
-        Endpoint::Connect { dialer }.run(Rc::new(conns), stop).await;
+        Endpoint::Connect { dialer }.run(serving, stop).await;
     }
 
     #[stellarator::test]

@@ -118,20 +118,14 @@ pub async fn subscribe(
         return;
     };
     let inbox = Rc::new(inbox);
-    let conns = Rc::new(Connections::new(
-        endpoint.slots(),
-        *conn_cap,
-        seed,
-        inbox.clone(),
-    ));
-    let _source = stellarator::spawn(endpoint.run(conns.clone(), stop.clone())).drop_guard();
+    let (mut conns, serving) = Connections::new(endpoint.slots(), *conn_cap, seed, inbox.clone());
+    let _source = stellarator::spawn(endpoint.run(serving, stop.clone())).drop_guard();
     let mut dropped = 0;
     let mut reporter = StatusReporter::default();
+    let wake = view.wake().clone();
     let run = async {
         loop {
-            let ready = view
-                .wake()
-                .wait_until(|| view.has_record() || missing.has_record());
+            let ready = wake.wait_until(|| view.has_record() || missing.has_record());
             future::or(ready, conns.changed()).await;
             dropped += routes.deliver(&mut view);
             report_missing(&mut missing, &routes.tables, log);

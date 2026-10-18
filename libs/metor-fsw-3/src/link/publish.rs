@@ -82,8 +82,8 @@ pub async fn publish(
         log.info(format!("listening on {addr}"));
     }
     let inbox = Rc::new(Inbox::blackhole());
-    let conns = Rc::new(Connections::new(endpoint.slots(), *conn_cap, blob, inbox));
-    let _source = stellarator::spawn(endpoint.run(conns.clone(), stop.clone())).drop_guard();
+    let (mut conns, serving) = Connections::new(endpoint.slots(), *conn_cap, blob, inbox);
+    let _source = stellarator::spawn(endpoint.run(serving, stop.clone())).drop_guard();
     let mut batch = Vec::with_capacity(conn_cap.bytes());
     let mut reporter = StatusReporter::default();
     let run = async {
