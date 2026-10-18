@@ -10,7 +10,7 @@
 //! tracking is nearly uncorrelated, so it is white.
 
 use adcs_contracts::{
-    BodyState, DT, Disturbances, EARTH_RADIUS, Epoch, GPS_POS_SIGMA, GPS_VEL_SIGMA, Gps, GpsError,
+    BodyState, Disturbances, EARTH_RADIUS, Epoch, GPS_POS_SIGMA, GPS_VEL_SIGMA, Gps, GpsError,
     MASS, MU, MagneticModel, MtqCmd, PlantParams, Quat, RW_MOMENTUM_MAX, RW_TORQUE_MAX,
     ReactionWheel, Sensors, TorqueCmd, V3, Wheels, World, clamp_dipole, eci_to_geodetic, epoch_at,
     in_earth_shadow, inertia_diag, mag_field_eci, orbit_pos_vel, raan_for_ltan, sun_dir_eci,
@@ -65,14 +65,14 @@ pub trait WheelDynamics {
     /// Returns the wheel preloaded with `h` N·m·s along its axis.
     fn with_momentum(self, h: f64) -> Self;
 
-    /// Advances the wheel one step.
+    /// Advances the wheel `dt` seconds.
     ///
     /// The motor torque is the negated set point, clamped to [`RW_TORQUE_MAX`] and
     /// zero when disarmed. Friction can stop the wheel within a step but never
     /// reverse it. Near [`RW_MOMENTUM_MAX`] the motor torque folds back so the
     /// momentum lands exactly on the limit, while torque that unloads the wheel
     /// always passes.
-    fn update(&mut self);
+    fn update(&mut self, dt: f64);
 }
 
 impl WheelDynamics for ReactionWheel {
@@ -82,7 +82,7 @@ impl WheelDynamics for ReactionWheel {
         self
     }
 
-    fn update(&mut self) {
+    fn update(&mut self, dt: f64) {
         let s: f64 = self.axis.dot(&self.ang_momentum).into_buf();
         let omega = s / RW_MOI;
 
@@ -99,21 +99,21 @@ impl WheelDynamics for ReactionWheel {
             let f = -RW_COULOMB * omega.signum() - RW_VISCOUS * omega;
             // Stop at zero rather than reversing.
             if omega > 0.0 {
-                f.max(-s / DT)
+                f.max(-s / dt)
             } else {
-                f.min(-s / DT)
+                f.min(-s / dt)
             }
         };
 
         let mut h_dot = motor + friction;
-        let s_next = s + h_dot * DT;
+        let s_next = s + h_dot * dt;
         if s_next > RW_MOMENTUM_MAX {
-            h_dot = (RW_MOMENTUM_MAX - s) / DT;
+            h_dot = (RW_MOMENTUM_MAX - s) / dt;
         } else if s_next < -RW_MOMENTUM_MAX {
-            h_dot = (-RW_MOMENTUM_MAX - s) / DT;
+            h_dot = (-RW_MOMENTUM_MAX - s) / dt;
         }
 
-        let s = s + h_dot * DT;
+        let s = s + h_dot * dt;
         self.ang_momentum = self.axis * s;
         self.speed = s / RW_MOI;
         self.friction = friction;
@@ -196,8 +196,12 @@ pub struct PlantState {
     /// Gyro bias, a random walk.
     bias: V3,
     rng: StdRng,
-    /// Simulated seconds since boot, advanced one [`DT`] per cycle.
+    /// Simulated seconds since boot, advanced by each step.
     t_sim: f64,
+    /// The time of the last cycle, which the next step starts from.
+    last: Option<Timestamp>,
+    /// What the last cycle applied, held over the step to the next.
+    held: Held,
     mag_model: MagneticModel,
     /// GPS position error, stepped each cycle.
     gps_pos_err: GpsError,
@@ -228,12 +232,12 @@ struct Sample {
     gps: Gps,
 }
 
-/// The wheels' reaction torque and momentum after a step, and the commanded
-/// dipole.
-struct Actuation {
-    rw_torque_b: V3,
-    h_w_b: V3,
-    dipole_b: V3,
+/// The torques and drag one cycle applies, held until the next.
+#[derive(Default)]
+struct Held {
+    disturbance_b: V3,
+    mtq_b: V3,
+    drag_eci: V3,
 }
 
 /// Returns point-mass gravity on `body`, `-MU·m / |r|³ · r`.
@@ -243,7 +247,7 @@ fn gravity(body: &Body) -> V3 {
     r * (-MU * MASS / r_mag.powi(3))
 }
 
-/// Advances `body` one step under the body torque `tau_body_const`, gravity, and drag.
+/// Advances `body` `dt` seconds under the body torque `tau_body_const`, gravity, and drag.
 ///
 /// The torque rides with the body, so each RK4 substep rotates it by that
 /// substep's attitude and adds the wheel coupling `−ω_b × h_w_b`.
@@ -251,8 +255,8 @@ fn gravity(body: &Body) -> V3 {
 /// Pass `h_w_b` at the step midpoint. Wheel momentum changes linearly across the
 /// step while the coupling holds it constant, and centering it cancels the
 /// first-order error that would otherwise leak total angular momentum.
-pub fn propagate(body: Body, tau_body_const: V3, h_w_b: V3, f_drag_eci: V3) -> Body {
-    six_dof_rk4(DT, body, move |b| {
+pub fn propagate(dt: f64, body: Body, tau_body_const: V3, h_w_b: V3, f_drag_eci: V3) -> Body {
+    six_dof_rk4(dt, body, move |b| {
         let q = b.pos.angular();
         let omega_b = q.inverse() * b.vel.angular();
         let tau_b = tau_body_const - omega_b.cross(&h_w_b);
@@ -294,6 +298,8 @@ impl PlantState {
             bias: V3::zeros(),
             rng: StdRng::seed_from_u64(p.seed),
             t_sim: 0.0,
+            last: None,
+            held: Held::default(),
             mag_model: MagneticModel::default(),
             gps_pos_err: GpsError::new(GPS_POS_SIGMA),
             params: p,
@@ -303,13 +309,9 @@ impl PlantState {
         }
     }
 
-    /// Steps the wheels under the torque command. A missing command counts as
-    /// zero.
-    fn actuate(
-        &mut self,
-        torque_cmd: &mut Input<TorqueCmd>,
-        mtq_cmd: &mut Input<MtqCmd>,
-    ) -> Actuation {
+    /// Sets the wheels to the torque command and returns the commanded dipole.
+    /// A missing command counts as zero.
+    fn actuate(&mut self, torque_cmd: &mut Input<TorqueCmd>, mtq_cmd: &mut Input<MtqCmd>) -> V3 {
         let torque_b: V3 = match torque_cmd.latest() {
             Ok(Some(cmd)) => cmd.torque_b,
             _ => V3::zeros(),
@@ -321,25 +323,12 @@ impl PlantState {
         // Each wheel takes the command's component along its axis.
         for wheel in &mut self.wheels {
             wheel.torque_set_point = wheel.axis.dot(&torque_b) * wheel.axis;
-            wheel.update();
         }
-        let rw_torque_b = self
-            .wheels
-            .iter()
-            .fold(V3::zeros(), |acc, w| acc + w.torque);
-        let h_w_b = self
-            .wheels
-            .iter()
-            .fold(V3::zeros(), |acc, w| acc + w.ang_momentum);
-        Actuation {
-            rw_torque_b,
-            h_w_b,
-            dipole_b,
-        }
+        dipole_b
     }
 
     /// Samples the sensors and the GPS receiver from the state at the start of the step.
-    fn sense(&mut self, now: Timestamp) -> Sample {
+    fn sense(&mut self, now: Timestamp, dt: f64) -> Sample {
         let q_b_eci = self.body.pos.angular();
         let q_eci_b = q_b_eci.inverse();
         let omega_b_true = q_eci_b * self.body.vel.angular();
@@ -374,7 +363,7 @@ impl PlantState {
                 css,
                 mag_b,
             },
-            gps: self.gps_fix(now, epoch, &pos_eci, &vel_eci),
+            gps: self.gps_fix(now, dt, epoch, &pos_eci, &vel_eci),
         }
     }
 
@@ -395,10 +384,17 @@ impl PlantState {
         css
     }
 
-    /// Returns a GPS fix of the true orbit state.
-    fn gps_fix(&mut self, now: Timestamp, epoch: Epoch, pos_eci: &V3, vel_eci: &V3) -> Gps {
+    /// Returns a GPS fix of the true orbit state, its error stepped `dt` seconds.
+    fn gps_fix(
+        &mut self,
+        now: Timestamp,
+        dt: f64,
+        epoch: Epoch,
+        pos_eci: &V3,
+        vel_eci: &V3,
+    ) -> Gps {
         let unit = self.noise(1.0);
-        let pos = *pos_eci + self.gps_pos_err.step(DT, unit);
+        let pos = *pos_eci + self.gps_pos_err.step(dt, unit);
         let vel = *vel_eci + self.noise(GPS_VEL_SIGMA);
         let (lat, lon, alt) = eci_to_geodetic(epoch, &pos);
         Gps {
@@ -468,12 +464,35 @@ impl PlantState {
         });
     }
 
-    /// Integrates the body one step under every applied torque.
-    fn integrate(&mut self, act: &Actuation, d: &DisturbanceTorques, mtq_torque_b: V3) {
-        let tau_body = act.rw_torque_b + d.total_b() + mtq_torque_b;
-        let h_w_mid = act.h_w_b + act.rw_torque_b * (DT / 2.0);
-        self.body = propagate(self.body.clone(), tau_body, h_w_mid, d.aero_force_eci);
-        self.t_sim += DT;
+    /// Returns the seconds from the last cycle to `now`, zero on the first.
+    fn step_to(&mut self, now: Timestamp) -> f64 {
+        let last = self.last.replace(now).unwrap_or(now);
+        (now - last).as_secs_f64()
+    }
+
+    /// Steps the wheels and integrates the body `dt` seconds under what the
+    /// last cycle applied.
+    fn integrate(&mut self, dt: f64) {
+        for wheel in &mut self.wheels {
+            wheel.update(dt);
+        }
+        let rw_torque_b = self
+            .wheels
+            .iter()
+            .fold(V3::zeros(), |acc, w| acc + w.torque);
+        let h_w_b = self
+            .wheels
+            .iter()
+            .fold(V3::zeros(), |acc, w| acc + w.ang_momentum);
+        let Held {
+            disturbance_b,
+            mtq_b,
+            drag_eci,
+        } = self.held;
+        let tau_body = rw_torque_b + disturbance_b + mtq_b;
+        let h_w_mid = h_w_b + rw_torque_b * (dt / 2.0);
+        self.body = propagate(dt, self.body.clone(), tau_body, h_w_mid, drag_eci);
+        self.t_sim += dt;
     }
 
     fn noise(&mut self, sigma: f64) -> V3 {
@@ -488,7 +507,8 @@ impl PlantState {
 }
 
 #[system]
-/// Steps the wheels, samples the sensors, writes telemetry, and integrates the body.
+/// Steps the body to `now`, takes the commands, samples the sensors, and writes
+/// telemetry.
 #[allow(clippy::too_many_arguments)]
 pub fn plant(
     #[state] state: &mut PlantState,
@@ -502,10 +522,14 @@ pub fn plant(
     world: &mut Output<World>,
     disturb: &mut Output<Disturbances>,
 ) {
-    let act = state.actuate(torque_cmd, mtq_cmd);
-    let sample = state.sense(now);
+    let dt = state.step_to(now);
+    if dt > 0.0 {
+        state.integrate(dt);
+    }
+    let dipole_b = state.actuate(torque_cmd, mtq_cmd);
+    let sample = state.sense(now, dt);
     let d = DisturbanceTorques::at(&state.params, &sample.truth);
-    let mtq_torque_b = state.mtq_torque(&sample, act.dipole_b);
+    let mtq_torque_b = state.mtq_torque(&sample, dipole_b);
     let ports = Ports {
         sensors,
         gps,
@@ -515,7 +539,11 @@ pub fn plant(
         disturb,
     };
     state.telemeter(now, &sample, &d, mtq_torque_b, ports);
-    state.integrate(&act, &d, mtq_torque_b);
+    state.held = Held {
+        disturbance_b: d.total_b(),
+        mtq_b: mtq_torque_b,
+        drag_eci: d.aero_force_eci,
+    };
 }
 
 #[cfg(test)]
@@ -523,6 +551,9 @@ mod tests {
     use adcs_contracts::{ALTITUDE, MTQ_MAX_DIPOLE, RW_TORQUE_MAX, detumble_dipole};
 
     use super::*;
+
+    /// The step the tests integrate by, one cycle at 120 Hz.
+    const STEP: f64 = 1.0 / 120.0;
 
     fn orbit_body(incline: f64, omega0: V3) -> Body {
         let radius = EARTH_RADIUS + ALTITUDE;
@@ -561,19 +592,19 @@ mod tests {
         };
         let l0 = l_eci(&body, &wheels);
         for k in 0..5000 {
-            let t = k as f64 * DT;
+            let t = k as f64 * STEP;
             for (i, w) in wheels.iter_mut().enumerate() {
                 // Out-of-phase sinusoids keep every wheel trading momentum.
                 let u = RW_TORQUE_MAX * (0.5 * t + i as f64).sin();
                 w.torque_set_point = w.axis * u;
-                w.update();
+                w.update(STEP);
             }
             let rw_torque = wheels.iter().fold(V3::zeros(), |acc, w| acc + w.torque);
             let h_w = wheels
                 .iter()
                 .fold(V3::zeros(), |acc, w| acc + w.ang_momentum);
-            let h_w_mid = h_w + rw_torque * (DT / 2.0);
-            body = propagate(body, rw_torque, h_w_mid, V3::zeros());
+            let h_w_mid = h_w + rw_torque * (STEP / 2.0);
+            body = propagate(STEP, body, rw_torque, h_w_mid, V3::zeros());
         }
         let l = l_eci(&body, &wheels);
         let drift: f64 = (l - l0).norm().into_buf();
@@ -592,7 +623,7 @@ mod tests {
         w.torque_set_point = tensor![-RW_TORQUE_MAX, 0.0, 0.0];
         let mut pinned = 0;
         for _ in 0..5000 {
-            w.update();
+            w.update(STEP);
             let s: f64 = w.ang_momentum.into_buf()[0];
             assert!(
                 s <= RW_MOMENTUM_MAX + 1e-12,
@@ -606,7 +637,7 @@ mod tests {
         let t: f64 = w.torque.into_buf()[0];
         assert!(t.abs() < 1e-12, "pinned wheel still delivered torque: {t}");
         w.torque_set_point = tensor![RW_TORQUE_MAX, 0.0, 0.0];
-        w.update();
+        w.update(STEP);
         let t: f64 = w.torque.into_buf()[0];
         assert!(
             t > 1e-3,
@@ -625,7 +656,7 @@ mod tests {
         assert!(prev > 0.0);
         let mut frozen = 0;
         for _ in 0..30_000 {
-            w.update();
+            w.update(STEP);
             assert!(w.speed <= prev + 1e-15, "friction sped the wheel up");
             assert!(
                 w.speed >= 0.0,
@@ -646,11 +677,8 @@ mod tests {
         );
     }
 
-    /// Each disturbance at 400 km falls in its expected order of magnitude, which
-    /// catches unit mistakes.
-    #[test]
-    fn disturbance_torques_sane_at_400km() {
-        let p = PlantParams {
+    fn params() -> PlantParams {
+        PlantParams {
             init_angle: 0.0,
             init_rate: 0.0,
             meas_sigma: 0.0,
@@ -669,7 +697,27 @@ mod tests {
             inclination: 0.0,
             ltan_hours: 12.0,
             init_orbit_phase: 0.0,
-        };
+        }
+    }
+
+    /// The plant steps by the time between cycles, so its clock follows the
+    /// stamps at any rate, and the first cycle does not step.
+    #[test]
+    fn plant_steps_by_the_time_between_cycles() {
+        let mut plant = PlantState::new(params());
+        for (now, dt) in [(5_000, 0.0), (15_000, 0.01), (15_000, 0.0), (40_000, 0.025)] {
+            let step = plant.step_to(Timestamp(now));
+            assert!((step - dt).abs() < 1e-12, "{now}: {step}");
+            plant.integrate(step);
+        }
+        assert!((plant.t_sim - 0.035).abs() < 1e-12, "{}", plant.t_sim);
+    }
+
+    /// Each disturbance at 400 km falls in its expected order of magnitude, which
+    /// catches unit mistakes.
+    #[test]
+    fn disturbance_torques_sane_at_400km() {
+        let p = params();
         let radius = EARTH_RADIUS + ALTITUDE;
         let pos: V3 = tensor![radius, 0.0, 0.0];
         let v_orbit = (MU / radius).sqrt();
@@ -790,8 +838,8 @@ mod tests {
             let omega_b = q.inverse() * body.vel.angular();
             let m = clamp_dipole(detumble_dipole(k_detumble, &omega_b, &mag_b), mtq_max);
             let tau_mtq_b = m.cross(&mag_b);
-            body = propagate(body, tau_mtq_b, V3::zeros(), V3::zeros());
-            t_sim += DT;
+            body = propagate(STEP, body, tau_mtq_b, V3::zeros(), V3::zeros());
+            t_sim += STEP;
             perp = omega_perp(&body, &mag_b);
             perp0.get_or_insert(perp);
         }

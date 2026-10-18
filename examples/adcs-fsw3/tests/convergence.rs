@@ -14,7 +14,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Once, OnceLock};
 
-use adcs_contracts::{AttitudeEstimate, BodyState, DT, Law, TorqueCmd, target_for};
+use adcs_contracts::{AttitudeEstimate, BodyState, Law, TorqueCmd, target_for};
 use adcs_seqs::Commission;
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::cli::run::prepare;
@@ -142,7 +142,7 @@ fn evaluate() -> CoordinatorConfig {
         .expect("one target")
         .coordinator;
     config.clock = Clock::Simulated {
-        dt: Duration::from_secs_f64(DT),
+        dt: Duration::from_secs_f64(1.0 / 120.0),
         epoch: None,
     };
     config

@@ -50,6 +50,3 @@ pub use wmm::MagneticModel;
 pub type V3 = Vector<f64, 3, ArrayRepr>;
 /// A quaternion of `f64`.
 pub type Quat = Quaternion<f64, ArrayRepr>;
-
-/// Cycle period (s), 120 Hz.
-pub const DT: f64 = 1.0 / 120.0;

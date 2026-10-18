@@ -8,7 +8,7 @@
 //! magnetometer alone.
 
 use adcs_contracts::{
-    AttitudeEstimate, CSS_THRESHOLD, DT, Gps, MagneticModel, NavParams, Sensors, V3, epoch_at,
+    AttitudeEstimate, CSS_THRESHOLD, Gps, MagneticModel, NavParams, Sensors, V3, epoch_at,
     mag_field_eci, sun_dir_eci,
 };
 use metor_fsw_3::{Input, Output, Timestamp, system};
@@ -40,12 +40,16 @@ pub struct NavState {
     had_fix: bool,
 }
 
+/// The filter for a step of `dt` seconds: its gyro and bias noise, and the
+/// process noise they give over the step.
+fn mekf_for(dt: f64) -> metor_adcs::mekf::State {
+    metor_adcs::mekf::State::new(tensor![0.01, 0.01, 0.01], tensor![0.01, 0.01, 0.01], dt)
+}
+
 impl NavState {
     pub fn new(p: NavParams) -> NavState {
-        let mekf =
-            metor_adcs::mekf::State::new(tensor![0.01, 0.01, 0.01], tensor![0.01, 0.01, 0.01], DT);
         NavState {
-            mekf,
+            mekf: mekf_for(0.0),
             sigma: p.meas_sigma,
             mag_model: MagneticModel::default(),
             first: None,
@@ -55,15 +59,22 @@ impl NavState {
         }
     }
 
-    /// Returns seconds from the first sample to `stamp`, or `None` if `stamp` was
-    /// already filtered.
-    fn elapsed(&mut self, stamp: Timestamp) -> Option<f64> {
+    /// Returns seconds from the first sample to `stamp`, and from the last
+    /// filtered sample to it, or `None` if `stamp` was already filtered.
+    fn elapsed(&mut self, stamp: Timestamp) -> Option<(f64, f64)> {
         if self.last == Some(stamp) {
             return None;
         }
-        self.last = Some(stamp);
+        let last = self.last.replace(stamp).unwrap_or(stamp);
         let first = *self.first.get_or_insert(stamp);
-        Some((stamp - first).as_secs_f64())
+        Some(((stamp - first).as_secs_f64(), (stamp - last).as_secs_f64()))
+    }
+
+    /// Sets the filter's step to `dt` seconds, with the process noise for it.
+    fn seed(&mut self, dt: f64) {
+        let seeded = mekf_for(dt);
+        self.mekf.dt = seeded.dt;
+        self.mekf.yqy = seeded.yqy;
     }
 }
 
@@ -83,9 +94,10 @@ pub fn nav(
     let Ok(Some(g)) = gps.latest() else {
         return; // no GPS fix yet
     };
-    let Some(t_sim) = state.elapsed(s.timestamp) else {
+    let Some((t_sim, dt)) = state.elapsed(s.timestamp) else {
         return; // already filtered
     };
+    state.seed(dt);
     let epoch = epoch_at(t_sim);
     let gps_pos: V3 = g.pos_eci;
     if !state.had_fix {
@@ -174,23 +186,30 @@ mod tests {
     #[test]
     fn repeated_sample_is_not_reobserved() {
         let mut nav = NavState::new(NavParams { meas_sigma: 0.01 });
-        assert_eq!(nav.elapsed(Timestamp(1_000)), Some(0.0));
+        assert_eq!(nav.elapsed(Timestamp(1_000)), Some((0.0, 0.0)));
         assert_eq!(nav.elapsed(Timestamp(1_000)), None);
         assert_eq!(nav.elapsed(Timestamp(1_000)), None);
     }
 
-    /// The reference epoch follows the sample stamps, so skipped cycles advance it
-    /// by their full span.
+    /// The reference epoch and the filter's step follow the sample stamps, so
+    /// skipped cycles advance them by their full span.
     #[test]
-    fn epoch_follows_the_samples_stamps() {
+    fn epoch_and_step_follow_the_samples_stamps() {
         let mut nav = NavState::new(NavParams { meas_sigma: 0.01 });
-        let step = (DT * 1e6) as i64;
-        assert_eq!(nav.elapsed(Timestamp(7 * step)), Some(0.0));
-        let one = nav.elapsed(Timestamp(8 * step)).expect("a new sample");
-        assert!((one - DT).abs() < 1e-6, "{one}");
+        let step = 8_333;
+        let secs = step as f64 * 1e-6;
+        assert_eq!(nav.elapsed(Timestamp(7 * step)), Some((0.0, 0.0)));
+        let (one, dt) = nav.elapsed(Timestamp(8 * step)).expect("a new sample");
+        assert!(
+            (one - secs).abs() < 1e-9 && (dt - secs).abs() < 1e-9,
+            "{one} {dt}"
+        );
         // Five cycles arrive at once.
-        let skipped = nav.elapsed(Timestamp(13 * step)).expect("a new sample");
-        assert!((skipped - 6.0 * DT).abs() < 1e-5, "{skipped}");
+        let (skipped, dt) = nav.elapsed(Timestamp(13 * step)).expect("a new sample");
+        assert!((skipped - 6.0 * secs).abs() < 1e-9, "{skipped}");
+        assert!((dt - 5.0 * secs).abs() < 1e-9, "{dt}");
+        nav.seed(dt);
+        assert_eq!(nav.mekf.dt, dt);
     }
 
     /// With every head below the threshold the sun is lost, so noise never becomes
