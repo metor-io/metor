@@ -100,7 +100,11 @@ fn memory_is_set_once() {
     let arena = Rc::new(Arena::new());
     assert!(arena.region().is_none());
     IoInit::new(&arena).finish("a").expect("fits");
-    assert_eq!(arena.region().map(|(_, len)| len), Some(0), "an empty first make sets the memory");
+    assert_eq!(
+        arena.region().map(|(_, len)| len),
+        Some(0),
+        "an empty first make sets the memory"
+    );
     let (base, _) = arena.region().expect("set");
     IoInit::new(&arena).finish("a").expect("fits");
     assert_eq!(arena.region(), Some((base, 0)), "a remake keeps the memory");

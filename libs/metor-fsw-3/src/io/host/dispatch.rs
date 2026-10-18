@@ -56,56 +56,68 @@ pub(crate) enum Route {
     Close(OwnedFd),
 }
 
-enum Open {
-    Closed,
-    Grant,
-    Derived(OwnedFd, Class),
-}
-
-struct Handle {
-    generation: u16,
+/// A `Cap` a member holds on a resource.
+struct Grant {
     res: u16,
-    /// The end of a sim resource a grant holds.
+    /// The end of a sim resource the grant holds.
     end: ResourceEnd,
-    open: Open,
+    /// False once the system closes the capability, until its next make.
+    open: bool,
 }
 
+/// A descriptor an op opened, mapped to a member's handle.
+struct Derived {
+    res: u16,
+    fd: OwnedFd,
+    class: Class,
+}
+
+/// A handle slot for a descriptor an op opens.
+#[derive(Default)]
+struct DerivedSlot {
+    generation: u16,
+    derived: Option<Derived>,
+}
+
+/// Where a member is in a quiesce.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemberState {
+    Running,
+    /// Dropping new ops and waiting for its SQ to drain.
+    Quiescing,
+    /// Its SQ drained, its derived handles closed, and its grants reopened.
+    Drained,
+}
+
+/// A system's handles: its grants at indexes `0..grants.len()`, then its
+/// derived handles.
 struct Member {
-    handles: Box<[Handle]>,
-    grants: usize,
-    quiescing: bool,
-    drained: bool,
+    grants: Box<[Grant]>,
+    derived: Box<[DerivedSlot]>,
+    state: MemberState,
 }
 
 impl Member {
     fn new(grants: Vec<(ResourceIndex, ResourceEnd)>) -> Member {
-        let grant = |&(res, end): &(ResourceIndex, ResourceEnd)| Handle {
-            generation: 0,
+        let grant = |(res, end): (ResourceIndex, ResourceEnd)| Grant {
             res: res.get(),
             end,
-            open: Open::Grant,
+            open: true,
         };
-        let free = (0..MAX_OPS).map(|_| Handle {
-            generation: 0,
-            res: 0,
-            end: ResourceEnd::Host,
-            open: Open::Closed,
-        });
         Member {
-            handles: grants.iter().map(grant).chain(free).collect(),
-            grants: grants.len(),
-            quiescing: false,
-            drained: false,
+            grants: grants.into_iter().map(grant).collect(),
+            derived: (0..MAX_OPS).map(|_| DerivedSlot::default()).collect(),
+            state: MemberState::Running,
         }
     }
 }
 
+/// An op in flight.
 #[derive(Clone, Copy)]
-struct Entry {
+struct InFlight {
     generation: u16,
     res: u16,
     kind: OpKind,
-    live: bool,
     canceled: bool,
 }
 
@@ -136,7 +148,7 @@ enum Target {
 
 pub(crate) struct Dispatch {
     members: Box<[Member]>,
-    ops: Box<[Entry]>,
+    ops: Box<[Option<InFlight>]>,
     resources: Box<[Resource]>,
     wires: Box<[Wire]>,
     names: Box<[FrameStr<64>]>,
@@ -163,17 +175,10 @@ impl Dispatch {
             let count = members.len();
             return Err(BuildError::TooManyIoMembers { count });
         }
-        let idle = Entry {
-            generation: 0,
-            res: 0,
-            kind: OpKind::Close,
-            live: false,
-            canceled: false,
-        };
         let count = resources.len();
         Ok(Self {
             members: members.into_iter().map(Member::new).collect(),
-            ops: vec![idle; ops].into(),
+            ops: vec![None; ops].into(),
             names: resources
                 .iter()
                 .map(|r| FrameStr::truncated(&r.id))
@@ -193,7 +198,7 @@ impl Dispatch {
     /// An op that names no slot of `m`'s, or a slot still in flight, is
     /// dropped unanswered, since its reply would answer another op: `Err`.
     pub(crate) fn lower(&mut self, m: usize, sqe: Sqe, arena: &Arena) -> Result<(), Rejected> {
-        if self.members[m].quiescing {
+        if self.members[m].state != MemberState::Running {
             return Ok(());
         }
         match self.try_lower(m, sqe, arena) {
@@ -213,7 +218,7 @@ impl Dispatch {
             return Ok(());
         }
         let index = Self::op_index(m, sqe.token.index()).ok_or(Refusal::Drop)?;
-        if self.ops[index].live {
+        if self.ops[index].is_some() {
             return Err(Refusal::Drop);
         }
         let op = op?;
@@ -227,13 +232,12 @@ impl Dispatch {
             true => Some(arena.get_slice(sqe.buf).ok_or(IoError::BadBuf)?),
             false => None,
         };
-        self.ops[index] = Entry {
+        self.ops[index] = Some(InFlight {
             generation: sqe.token.generation(),
             res,
             kind: op.kind(),
-            live: true,
             canceled: false,
-        };
+        });
         self.counters[usize::from(res)].submitted += 1;
         let id = OpId::new(index as u16, sqe.token.generation());
         match target {
@@ -255,29 +259,36 @@ impl Dispatch {
 
     /// The live handle `raw` names in member `m`, with its resource.
     fn target(&self, m: usize, raw: RawHandle) -> Option<(u16, Target)> {
-        let handle = self.members[m].handles.get(usize::from(raw.index()))?;
-        if handle.generation != raw.generation() {
-            return None;
-        }
-        let target = match &handle.open {
-            Open::Closed => return None,
-            Open::Derived(fd, class) => Target::Fd(fd.as_raw_fd(), *class),
-            Open::Grant => match &self.resources[usize::from(handle.res)].backed {
+        let member = &self.members[m];
+        let index = usize::from(raw.index());
+        let Some(slot) = index.checked_sub(member.grants.len()) else {
+            let grant = member.grants.get(index).filter(|g| g.open)?;
+            let target = match &self.resources[usize::from(grant.res)].backed {
                 Backed::Fd(fd, class) => Target::Fd(fd.as_raw_fd(), *class),
-                Backed::Wire(w) => Target::Wire(*w, handle.end),
+                Backed::Wire(w) => Target::Wire(*w, grant.end),
                 Backed::Unused => return None,
-            },
+            };
+            return (raw.generation() == 0).then_some((grant.res, target));
         };
-        Some((handle.res, target))
+        let slot = member.derived.get(slot)?;
+        let derived = slot.derived.as_ref()?;
+        let target = Target::Fd(derived.fd.as_raw_fd(), derived.class);
+        (slot.generation == raw.generation()).then_some((derived.res, target))
     }
 
     /// Ends a handle. A grant ends only this capability, and its ops in
     /// flight, parked reads on a wire too, run on until they finish or are
     /// canceled. A derived handle's descriptor closes, ending its ops.
     fn close(&mut self, m: usize, raw: RawHandle) {
-        let handle = &mut self.members[m].handles[usize::from(raw.index())];
-        if let Open::Derived(fd, _) = core::mem::replace(&mut handle.open, Open::Closed) {
-            self.routes.push(Route::Close(fd));
+        let member = &mut self.members[m];
+        let index = usize::from(raw.index());
+        match index.checked_sub(member.grants.len()) {
+            None => member.grants[index].open = false,
+            Some(slot) => {
+                if let Some(derived) = member.derived[slot].derived.take() {
+                    self.routes.push(Route::Close(derived.fd));
+                }
+            }
         }
     }
 
@@ -286,13 +297,15 @@ impl Dispatch {
         let Some(index) = Self::op_index(m, token.index()) else {
             return;
         };
-        let entry = &mut self.ops[index];
-        if !entry.live || entry.canceled || entry.generation != token.generation() {
+        let Some(op) = &mut self.ops[index] else {
+            return;
+        };
+        if op.canceled || op.generation != token.generation() {
             return;
         }
-        entry.canceled = true;
-        let id = OpId::new(index as u16, entry.generation);
-        match self.resources[usize::from(entry.res)].backed {
+        op.canceled = true;
+        let id = OpId::new(index as u16, op.generation);
+        match self.resources[usize::from(op.res)].backed {
             Backed::Wire(w) => {
                 self.wires[w].cancel(id, &mut self.wired);
                 self.raise_wired();
@@ -307,23 +320,21 @@ impl Dispatch {
         let index = usize::from(done.id.index());
         debug_assert!(index < self.ops.len(), "an id from this dispatch's table");
         // PANIC Safety: every `OpId` comes from this dispatch's op table.
-        let entry = &mut self.ops[index];
-        if !entry.live || entry.generation != done.id.generation() {
+        let ours = |op: &mut InFlight| op.generation == done.id.generation();
+        let Some(op) = self.ops[index].take_if(ours) else {
             return;
-        }
-        entry.live = false;
-        let entry = *entry;
+        };
         let m = index / MAX_OPS;
-        let token = Token::new((index % MAX_OPS) as u16, entry.generation);
+        let token = Token::new((index % MAX_OPS) as u16, op.generation);
         let result = match done.result {
             Ok(Out::Len(n)) => Ok(n),
-            Ok(Out::Opened(fd, class)) => self.derive(m, entry.res, fd, class),
+            Ok(Out::Opened(fd, class)) => self.derive(m, op.res, fd, class),
             Err(e) => Err(e),
         };
-        if self.members[m].quiescing {
+        if self.members[m].state != MemberState::Running {
             return;
         }
-        self.counters[usize::from(entry.res)].record_completion(entry.kind, &result);
+        self.counters[usize::from(op.res)].record_completion(op.kind, &result);
         let cqe = result.map_or_else(|e| Cqe::err(token, e), |n| Cqe::ok(token, n));
         self.ready.push((m, cqe));
     }
@@ -345,30 +356,26 @@ impl Dispatch {
     /// it when none is free or the member is quiescing.
     fn derive(&mut self, m: usize, res: u16, fd: OwnedFd, class: Class) -> Result<u32, IoError> {
         let member = &mut self.members[m];
-        let free = member.handles[member.grants..]
-            .iter()
-            .position(|h| matches!(h.open, Open::Closed));
-        let (Some(free), false) = (free, member.quiescing) else {
+        let free = member.derived.iter().position(|d| d.derived.is_none());
+        let (Some(free), MemberState::Running) = (free, member.state) else {
             self.routes.push(Route::Close(fd));
             return Err(IoError::Refused);
         };
-        let index = member.grants + free;
-        let handle = &mut member.handles[index];
-        handle.generation = handle.generation.wrapping_add(1);
-        handle.res = res;
-        handle.open = Open::Derived(fd, class);
-        Ok(RawHandle::new(index as u16, handle.generation).get())
+        let slot = &mut member.derived[free];
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.derived = Some(Derived { res, fd, class });
+        let index = member.grants.len() + free;
+        Ok(RawHandle::new(index as u16, slot.generation).get())
     }
 
     /// Starts quiescing member `m`: drops its new ops and cancels those in
     /// flight.
     pub(crate) fn quiesce_member(&mut self, m: usize) {
-        let member = &mut self.members[m];
-        member.quiescing = true;
-        member.drained = false;
+        self.members[m].state = MemberState::Quiescing;
         for slot in 0..MAX_OPS {
-            let entry = self.ops[m * MAX_OPS + slot];
-            self.cancel(m, Token::new(slot as u16, entry.generation));
+            if let Some(op) = self.ops[m * MAX_OPS + slot] {
+                self.cancel(m, Token::new(slot as u16, op.generation));
+            }
         }
     }
 
@@ -376,19 +383,14 @@ impl Dispatch {
     /// closes its derived handles and revives its grants for the next make.
     pub(crate) fn member_drained(&mut self, m: usize) {
         let member = &mut self.members[m];
-        if !member.quiescing || core::mem::replace(&mut member.drained, true) {
+        if member.state != MemberState::Quiescing {
             return;
         }
-        let grants = member.grants;
-        for (index, handle) in member.handles.iter_mut().enumerate() {
-            let open = match index < grants {
-                true => Open::Grant,
-                false => Open::Closed,
-            };
-            if let Open::Derived(fd, _) = core::mem::replace(&mut handle.open, open) {
-                self.routes.push(Route::Close(fd));
-            }
-        }
+        member.state = MemberState::Drained;
+        member.grants.iter_mut().for_each(|g| g.open = true);
+        let closed = member.derived.iter_mut().filter_map(|d| d.derived.take());
+        self.routes
+            .extend(closed.map(|derived| Route::Close(derived.fd)));
     }
 
     /// The routes queued since the last call.
@@ -405,8 +407,8 @@ impl Dispatch {
     /// names no memory the kernel writes.
     pub(crate) fn has_kernel_ops_in_flight(&self) -> bool {
         let real =
-            |e: &Entry| !matches!(self.resources[usize::from(e.res)].backed, Backed::Wire(_));
-        self.ops.iter().any(|e| e.live && real(e))
+            |op: &InFlight| !matches!(self.resources[usize::from(op.res)].backed, Backed::Wire(_));
+        self.ops.iter().flatten().any(real)
     }
 
     /// Writes up to `STATUS_PER_CYCLE` changed resources, starting after the

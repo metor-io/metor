@@ -7,25 +7,28 @@
 use super::{IoStatus, RawHandle};
 
 /// Where a slot's op is.
+///
+/// `cancel` on an op in flight is a cancel the SQ refused. The next pump
+/// writes it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum SlotState {
     #[default]
     Free,
     Waiting {
         opens: bool,
+        cancel: bool,
     },
     /// Its `Pending` was dropped. The completion frees it, closing any handle
     /// the op opened first.
     Orphaned {
         opens: bool,
+        cancel: bool,
     },
+    /// A close of the handle an orphaned op opened, waiting for SQ room.
+    CloseQueued(RawHandle),
     /// Closing the handle an orphaned op opened, under the op's own token.
-    /// The close's completion frees it. `sent` is false while the close waits
-    /// for SQ room.
-    Closing {
-        handle: RawHandle,
-        sent: bool,
-    },
+    /// The close's completion frees it.
+    Closing(RawHandle),
     Done {
         status: IoStatus,
         value: u32,
@@ -38,8 +41,6 @@ pub(super) enum SlotState {
 pub(super) struct OpSlot {
     pub(super) generation: u16,
     pub(super) state: SlotState,
-    /// A cancel that did not fit in the SQ. The next pump writes it.
-    cancel: bool,
 }
 
 /// Something that happens to a slot. Each event but `Submitted`, `Pumped`,
@@ -79,45 +80,30 @@ impl OpSlot {
     pub(super) fn apply(self, event: Event) -> (Self, Option<Write>) {
         let ours = |generation: u16| generation == self.generation;
         match event {
-            Event::Submitted { generation, opens } => (
-                Self {
-                    generation,
-                    state: SlotState::Waiting { opens },
+            Event::Submitted { generation, opens } => {
+                let state = SlotState::Waiting {
+                    opens,
                     cancel: false,
-                },
-                None,
-            ),
+                };
+                (Self { generation, state }, None)
+            }
             Event::Completed {
                 generation,
                 status,
                 value,
             } if ours(generation) => self.completed(status, value),
             Event::Dropped { generation } if ours(generation) => self.dropped(),
-            Event::Canceled { generation } if ours(generation) && self.in_flight() => (
-                Self {
-                    cancel: false,
-                    ..self
-                },
-                Some(Write::Cancel),
-            ),
+            Event::Canceled { generation } if ours(generation) && self.in_flight() => {
+                (self.with_cancel(false), Some(Write::Cancel))
+            }
             Event::Returned { generation } if ours(generation) && self.done() => {
-                (self.settle(SlotState::Free), None)
+                (self.with(SlotState::Free), None)
             }
             Event::Pumped => self.pumped(),
-            Event::Refused(Write::Cancel) if self.in_flight() => (
-                Self {
-                    cancel: true,
-                    ..self
-                },
-                None,
-            ),
-            Event::Refused(Write::Close(handle)) => (
-                self.settle(SlotState::Closing {
-                    handle,
-                    sent: false,
-                }),
-                None,
-            ),
+            Event::Refused(Write::Cancel) if self.in_flight() => (self.with_cancel(true), None),
+            Event::Refused(Write::Close(handle)) => {
+                (self.with(SlotState::CloseQueued(handle)), None)
+            }
             _ => (self, None),
         }
     }
@@ -147,52 +133,62 @@ impl OpSlot {
         matches!(self.state, SlotState::Done { .. })
     }
 
+    fn with(self, state: SlotState) -> Self {
+        Self { state, ..self }
+    }
+
+    /// The slot with its op's refused cancel set to `cancel`. Only an op in
+    /// flight has one.
+    fn with_cancel(self, cancel: bool) -> Self {
+        match self.state {
+            SlotState::Waiting { opens, .. } => self.with(SlotState::Waiting { opens, cancel }),
+            SlotState::Orphaned { opens, .. } => self.with(SlotState::Orphaned { opens, cancel }),
+            _ => self,
+        }
+    }
+
     fn completed(self, status: IoStatus, value: u32) -> (Self, Option<Write>) {
         let state = match self.state {
-            SlotState::Waiting { opens } => SlotState::Done {
+            SlotState::Waiting { opens, .. } => SlotState::Done {
                 status,
                 value,
                 opens,
             },
-            SlotState::Orphaned { opens: true } => {
+            SlotState::Orphaned { opens: true, .. } => {
                 return self.close_opened(status.result().map(|()| value));
             }
             done @ SlotState::Done { .. } => done,
-            SlotState::Orphaned { .. } | SlotState::Closing { .. } | SlotState::Free => {
-                SlotState::Free
-            }
+            SlotState::Orphaned { .. }
+            | SlotState::CloseQueued(_)
+            | SlotState::Closing(_)
+            | SlotState::Free => SlotState::Free,
         };
-        (self.settle(state), None)
+        (self.with(state), None)
     }
 
     fn dropped(self) -> (Self, Option<Write>) {
         match self.state {
-            SlotState::Waiting { opens } => (self.settle(SlotState::Orphaned { opens }), None),
+            SlotState::Waiting { opens, cancel } => {
+                (self.with(SlotState::Orphaned { opens, cancel }), None)
+            }
             SlotState::Done {
                 status,
                 value,
                 opens: true,
             } => self.close_opened(status.result().map(|()| value)),
-            _ => (self.settle(SlotState::Free), None),
+            _ => (self.with(SlotState::Free), None),
         }
     }
 
     fn pumped(self) -> (Self, Option<Write>) {
         match self.state {
-            SlotState::Closing {
-                handle,
-                sent: false,
-            } => (
-                self.settle(SlotState::Closing { handle, sent: true }),
+            SlotState::CloseQueued(handle) => (
+                self.with(SlotState::Closing(handle)),
                 Some(Write::Close(handle)),
             ),
-            _ if self.cancel && self.in_flight() => (
-                Self {
-                    cancel: false,
-                    ..self
-                },
-                Some(Write::Cancel),
-            ),
+            SlotState::Waiting { cancel: true, .. } | SlotState::Orphaned { cancel: true, .. } => {
+                (self.with_cancel(false), Some(Write::Cancel))
+            }
             _ => (self, None),
         }
     }
@@ -203,19 +199,12 @@ impl OpSlot {
         match opened {
             Ok(raw) => {
                 let handle = RawHandle::from_raw(raw);
-                let state = SlotState::Closing { handle, sent: true };
-                (self.settle(state), Some(Write::Close(handle)))
+                (
+                    self.with(SlotState::Closing(handle)),
+                    Some(Write::Close(handle)),
+                )
             }
-            Err(_) => (self.settle(SlotState::Free), None),
-        }
-    }
-
-    /// The slot in `state`. A pending cancel only outlives an op in flight.
-    fn settle(self, state: SlotState) -> Self {
-        let next = Self { state, ..self };
-        Self {
-            cancel: self.cancel && next.in_flight(),
-            ..next
+            Err(_) => (self.with(SlotState::Free), None),
         }
     }
 }
@@ -279,11 +268,15 @@ mod tests {
     #[test]
     fn test_dropped_open_closes_what_it_opened() {
         let orphan = waiting(true).apply(Event::Dropped { generation: GEN }).0;
-        assert_eq!(orphan.state, SlotState::Orphaned { opens: true });
+        let orphaned = SlotState::Orphaned {
+            opens: true,
+            cancel: false,
+        };
+        assert_eq!(orphan.state, orphaned);
         let (closing, write) = orphan.apply(completed(IoStatus::OK, 42));
         let handle = RawHandle::from_raw(42);
         assert_eq!(write, Some(Write::Close(handle)));
-        assert_eq!(closing.state, SlotState::Closing { handle, sent: true });
+        assert_eq!(closing.state, SlotState::Closing(handle));
         let (free, write) = closing.apply(completed(IoStatus::OK, 0));
         assert!(free.is_free() && write.is_none());
     }
@@ -293,7 +286,7 @@ mod tests {
         let done = waiting(true).apply(completed(IoStatus::OK, 9)).0;
         let (closing, write) = done.apply(Event::Dropped { generation: GEN });
         assert_eq!(write, Some(Write::Close(RawHandle::from_raw(9))));
-        assert!(matches!(closing.state, SlotState::Closing { .. }));
+        assert!(matches!(closing.state, SlotState::Closing(_)));
     }
 
     #[test]
@@ -316,13 +309,7 @@ mod tests {
         };
         let held = closing.apply(Event::Refused(write)).0;
         let handle = RawHandle::from_raw(4);
-        assert_eq!(
-            held.state,
-            SlotState::Closing {
-                handle,
-                sent: false
-            }
-        );
+        assert_eq!(held.state, SlotState::CloseQueued(handle));
         let (sent, write) = held.apply(Event::Pumped);
         assert_eq!(write, Some(Write::Close(handle)));
         assert_eq!(sent.apply(Event::Pumped), (sent, None), "sent once");
@@ -368,14 +355,18 @@ mod proofs {
     }
 
     fn any_state() -> SlotState {
-        match kani::any::<u8>() % 5 {
+        match kani::any::<u8>() % 6 {
             0 => SlotState::Free,
-            1 => SlotState::Waiting { opens: kani::any() },
-            2 => SlotState::Orphaned { opens: kani::any() },
-            3 => SlotState::Closing {
-                handle: RawHandle::from_raw(kani::any()),
-                sent: kani::any(),
+            1 => SlotState::Waiting {
+                opens: kani::any(),
+                cancel: kani::any(),
             },
+            2 => SlotState::Orphaned {
+                opens: kani::any(),
+                cancel: kani::any(),
+            },
+            3 => SlotState::CloseQueued(RawHandle::from_raw(kani::any())),
+            4 => SlotState::Closing(RawHandle::from_raw(kani::any())),
             _ => SlotState::Done {
                 status: any_status(),
                 value: kani::any(),
@@ -388,7 +379,6 @@ mod proofs {
         OpSlot {
             generation: kani::any(),
             state: any_state(),
-            cancel: kani::any(),
         }
     }
 
@@ -434,20 +424,14 @@ mod proofs {
         let (slot, event) = (any_slot(), any_event());
         match slot.apply(event) {
             (next, Some(Write::Close(handle))) => {
-                assert_eq!(next.state, SlotState::Closing { handle, sent: true });
+                assert_eq!(next.state, SlotState::Closing(handle));
             }
-            (next, Some(Write::Cancel)) => assert!(next.in_flight() && !next.cancel),
+            (next, Some(Write::Cancel)) => assert!(matches!(
+                next.state,
+                SlotState::Waiting { cancel: false, .. }
+                    | SlotState::Orphaned { cancel: false, .. }
+            )),
             (_, None) => {}
         }
-    }
-
-    /// A pending cancel is only kept for an op in flight.
-    #[kani::proof]
-    fn pending_cancel_needs_an_op_in_flight() {
-        let mut slot = any_slot();
-        kani::assume(!slot.cancel || slot.in_flight());
-        let (next, _) = slot.apply(any_event());
-        slot = next;
-        assert!(!slot.cancel || slot.in_flight());
     }
 }
