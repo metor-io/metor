@@ -8,7 +8,7 @@ records everything and serves it on 2250."""
 import math
 
 from adcs_pack import Ctrl, GpsDriver, GpsReceiver, Mode, MtqCmd, Nav, Plant, TorqueCmd
-from metor_config import Db, Publish, SimUart, Target
+from metor_config import Db, Listen, Publish, SimUart, Target
 
 fsw = Target(cycle_rate=120.0, namespace="sim")
 
@@ -66,7 +66,7 @@ ctrl = fsw.add(
 torque.connect(ctrl.torque_cmd)
 mtq.connect(ctrl.mtq_cmd)
 
-fsw.add("pub", Publish(listen="0.0.0.0:2240", all=True))
+fsw.add("pub", Publish(transport=Listen("0.0.0.0:2240"), all=True))
 # Records the whole loop, GPS included, for a panel on 2250, as target.py's
 # gateway does.
 fsw.add("db", Db(listen="0.0.0.0:2250", all=True), thread="db")

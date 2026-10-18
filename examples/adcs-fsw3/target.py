@@ -11,7 +11,16 @@ import os
 import adcs_seqs
 from adcs_pack import Ctrl, MtqCmd, Nav, Plant, TorqueCmd
 from adcs_seqs import Commission
-from metor_config import Deployment, Publish, SequenceCommand, Subscribe, Target, gateway
+from metor_config import (
+    Deployment,
+    Listen,
+    Peer,
+    Publish,
+    SequenceCommand,
+    Subscribe,
+    Target,
+    gateway,
+)
 
 p_plant, p_fsw, p_db = os.environ.get("METOR_DEPLOY_PORTS", "2240,2241,2250").split(",")
 
@@ -47,13 +56,13 @@ sim = plant.add(
         init_orbit_phase=0.0,
     ),
 )
-plant_pub = plant.add("pub", Publish(listen=f"127.0.0.1:{p_plant}", items=[sim]))
+plant_pub = plant.add("pub", Publish(transport=Listen(f"127.0.0.1:{p_plant}"), items=[sim]))
 
 fsw = Target(cycle_rate=120.0, namespace="fsw")
 
 # Naming the mirror `plant` gives its components the same paths they have on
 # the plant target.
-mirror = fsw.add("plant", Subscribe(peer=plant_pub, items=[sim]))
+mirror = fsw.add("plant", Subscribe(transport=Peer(plant_pub), items=[sim]))
 nav = fsw.add(
     "nav",
     Nav(sensors=mirror.port(sim.sensors), gps=mirror.port(sim.gps), meas_sigma=0.02),
@@ -80,17 +89,19 @@ ctrl = fsw.add(
         k_detumble=0.00005,
     ),
 )
-fsw_pub = fsw.add("pub", Publish(listen=f"127.0.0.1:{p_fsw}", all=True))
+fsw_pub = fsw.add("pub", Publish(transport=Listen(f"127.0.0.1:{p_fsw}"), all=True))
 
 # The plant applies the controller's commands one cycle late.
-ctrl_cmds = plant.add("ctrl", Subscribe(peer=fsw_pub, items=[ctrl.torque_cmd, ctrl.mtq_cmd]))
+ctrl_cmds = plant.add(
+    "ctrl", Subscribe(transport=Peer(fsw_pub), items=[ctrl.torque_cmd, ctrl.mtq_cmd])
+)
 torque.connect(ctrl_cmds.port(ctrl.torque_cmd))
 mtq.connect(ctrl_cmds.port(ctrl.mtq_cmd))
 
 gw, db = gateway("gw", peers=[plant_pub, fsw_pub], listen=f"127.0.0.1:{p_db}", cycle_rate=120.0)
 
 # The ground commands `commission` through the gateway's db.
-ground_cmds = fsw.add("cmds", Subscribe([SequenceCommand], peer=db))
+ground_cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Peer(db)))
 fsw.commands(ground_cmds.sequence_command)
 
 Deployment(targets=[plant, fsw, gw])
