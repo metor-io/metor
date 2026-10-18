@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use stellarator::net::TcpListener;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::def::RecordError;
 use crate::log::Log;
 use crate::port::{DynInputs, Output};
@@ -77,8 +77,8 @@ impl Db {
     ///
     /// Both happen here so that a taken address or an unwritable path fails
     /// the build instead of the run.
-    pub fn new(params: DbParams) -> Result<Self, ParamError> {
-        let listener = TcpListener::bind(params.listen.as_str()).map_err(|e| ParamError::Bind {
+    pub fn new(params: DbParams) -> Result<Self, MakeError> {
+        let listener = TcpListener::bind(params.listen.as_str()).map_err(|e| MakeError::Bind {
             addr: params.listen.clone(),
             message: e.to_string(),
         })?;
@@ -91,7 +91,7 @@ impl Db {
         } else {
             DB::create(path.clone())
         };
-        let db = store.map_err(|error| ParamError::OpenDb {
+        let db = store.map_err(|error| MakeError::OpenDb {
             path: path.display().to_string(),
             message: error.to_string(),
         })?;
@@ -502,7 +502,7 @@ mod tests {
             namespace: None,
             commands: Vec::new(),
         };
-        let Err(ParamError::Bind { addr, .. }) = Db::new(params) else {
+        let Err(MakeError::Bind { addr, .. }) = Db::new(params) else {
             panic!("an unassignable address is an error")
         };
         assert_eq!(addr, "203.0.113.1:9");
