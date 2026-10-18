@@ -6,12 +6,11 @@
 //! to 0.1 s. During an outage the logs carry no solution.
 //!
 //! It is a sequence that never ends: a loop reading commands joined with a
-//! loop writing logs.
+//! loop writing logs. The command loop passes each log period it reads to
+//! the log loop through a ring.
 //!
 //! Time counts from the first `BodyState`, as `nav` counts from its first
 //! sensor sample, so both see the same epoch.
-
-use core::cell::Cell;
 
 use adcs_contracts::novatel::{BestXyz, LINE_MAX, LineBuf};
 use adcs_contracts::{
@@ -20,7 +19,8 @@ use adcs_contracts::{
 };
 use futures_lite::future;
 use metor_fsw_3::io::{Buf, Cap, IoInit, Uart};
-use metor_fsw_3::{Input, Seq, SeqError, Timestamp, sequence};
+use metor_fsw_3::ring::{Config, NoWake, RingBuffer, View, Writer};
+use metor_fsw_3::{Input, Seq, SeqError, Timestamp, ring_capacity, sequence};
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
 use schemars::JsonSchema;
@@ -50,20 +50,29 @@ fn default_vel_sigma() -> f64 {
     GPS_VEL_SIGMA
 }
 
-/// The receiver's buffers, which its body takes when it starts, and its
-/// model.
+/// The receiver's buffers, which its body takes when it starts, its model,
+/// and the ring that carries log periods from its command loop to its log
+/// loop.
 pub struct GpsReceiver {
     rx: Option<Buf>,
     tx: Option<Buf>,
     model: ReceiverModel,
+    periods: RingBuffer,
 }
 
 impl GpsReceiver {
     pub fn new(p: GpsReceiverParams, io: &mut IoInit) -> Self {
+        let periods = Config {
+            // PANIC Safety: two 8-byte records always form a ring.
+            capacity: ring_capacity(size_of::<f64>(), 2).expect("a small ring"),
+            max_readers: 1,
+        };
         Self {
             rx: Some(io.alloc(COMMAND_READ)),
             tx: Some(io.alloc(LINE_MAX)),
             model: ReceiverModel::new(p),
+            // PANIC Safety: the config above is valid.
+            periods: RingBuffer::create_in_memory(periods).expect("a valid ring"),
         }
     }
 }
@@ -80,14 +89,21 @@ pub async fn gps_receiver(
     let (Some(rx), Some(tx)) = (m.rx.take(), m.tx.take()) else {
         return Err(SeqError::Failed("the receiver's buffers are taken".into()));
     };
-    let period = Cell::new(None);
-    let logs = logs(seq, uart, tx, &mut m.model, truth, faults, &period);
-    future::zip(commands(uart, rx, &period), logs).await;
+    let sent = m
+        .periods
+        .writer(NoWake)
+        .map_err(|_| SeqError::Failed("the period ring's writer is taken".into()))?;
+    let read = m
+        .periods
+        .view(NoWake)
+        .map_err(|_| SeqError::Failed("the period ring has no free reader".into()))?;
+    let logs = logs(seq, uart, tx, &mut m.model, truth, faults, read);
+    future::zip(commands(uart, rx, sent), logs).await;
     Ok(())
 }
 
 /// Reads the driver's commands, passing on each log period one sets.
-async fn commands(uart: &Cap<Uart>, mut buf: Buf, period: &Cell<Option<f64>>) {
+async fn commands(uart: &Cap<Uart>, mut buf: Buf, mut periods: Writer<NoWake>) {
     let mut lines = LineBuf::<COMMAND_READ>::default();
     loop {
         let (read, back) = uart.read(buf).await;
@@ -97,7 +113,9 @@ async fn commands(uart: &Cap<Uart>, mut buf: Buf, period: &Cell<Option<f64>>) {
         }
         lines.push(&buf);
         if let Some(p) = last_period(&mut lines) {
-            period.set(Some(p));
+            // The log loop drains the ring each cycle, so it is full only
+            // when three periods arrive in one cycle, and the last is dropped.
+            let _ = periods.try_write(&p.to_le_bytes());
         }
     }
 }
@@ -110,12 +128,13 @@ async fn logs(
     model: &mut ReceiverModel,
     truth: &mut Input<BodyState>,
     faults: &mut Input<GpsFault>,
-    period: &Cell<Option<f64>>,
+    mut periods: View<NoWake>,
 ) {
     let mut line = [0; LINE_MAX];
     loop {
-        if let Some(p) = period.take() {
-            model.set_period(p);
+        let newest = periods.drain().filter_map(Result::ok).last();
+        if let Some(p) = newest.and_then(|bytes| bytes.try_into().ok()) {
+            model.set_period(f64::from_le_bytes(p));
         }
         if let Ok(Some(fault)) = faults.latest() {
             model.outage = fault.outage != 0;
