@@ -48,7 +48,7 @@ class Gps(System):
     _pack = PACK
     _ty = "gps"
     _ports = {"fix": Fix}
-    _caps = {"uart": "uart"}
+    _caps = ("uart",)
 
     def __init__(self, *, uart: ResourceHandle) -> None:
         super().__init__({}, {}, grants={"uart": uart})
@@ -62,7 +62,7 @@ class Leaky(System):
     _pack = PACK
     _ty = "leaky"
     _ports = {"io_sq": IoSqe, "fix": Fix}
-    _caps = {"uart": "uart"}
+    _caps = ("uart",)
 
     def __init__(self, *, uart: ResourceHandle) -> None:
         super().__init__({}, {}, grants={"uart": uart})
@@ -74,20 +74,20 @@ class UartModel(System):
     _pack = PACK
     _ty = "uart_model"
     _ports = {}
-    _caps = {"uart": "uart"}
+    _caps = ("uart",)
 
     def __init__(self, *, uart: ResourceHandle) -> None:
         super().__init__({}, {}, grants={"uart": uart})
 
 
-def _holder(interface: str, handle: ResourceHandle) -> System:
-    """A system with one `Cap` of ``interface``, granted ``handle``."""
+def _holder(handle: ResourceHandle) -> System:
+    """A system with one `Cap`, granted ``handle``."""
 
     class Holder(System):
         _pack = PACK
         _ty = "holder"
         _ports = {}
-        _caps = {"cap": interface}
+        _caps = ("cap",)
 
         def __init__(self) -> None:
             super().__init__({}, {}, grants={"cap": handle})
@@ -184,8 +184,8 @@ class SimTests(unittest.TestCase):
         for kind, key in ((SimUart(), "uart"), (SimGpioLine(), "gpio_line")):
             fsw = Target(cycle_rate=10.0)
             line = fsw.resource("line", kind)
-            fsw.add("a", _holder(kind.interface, line))
-            fsw.sim("b", _holder(kind.interface, line.device))
+            fsw.add("a", _holder(line))
+            fsw.sim("b", _holder(line.device))
             (backing,) = coordinator(fsw)["resources"].values()
             self.assertEqual(backing["sim"]["kind"], key)
             target_mod._targets.clear()

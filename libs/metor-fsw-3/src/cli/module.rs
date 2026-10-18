@@ -17,10 +17,7 @@ use crate::channel::{ABORT_PORT, COMMANDS_PORT, ChannelStatus, EVENTS_PORT};
 use crate::coordinator::{STATUS_PORT, SystemStatus, SystemTable};
 use crate::dl::PackRef;
 use crate::fn_system::LOG_PORT;
-use crate::io::{
-    Can, Cqe, Dir, GpioLine, GrantDef, IO_CQ, IO_SQ, Interface, Listen, RegularFile,
-    ResourceStatus, Sqe, Stream, Uart, Udp,
-};
+use crate::io::{Cqe, IO_CQ, IO_SQ, ResourceStatus, Sqe};
 use crate::pack::ABI_VERSION;
 use crate::pack::def::{PackDef, PackSystemDef};
 use crate::record::{Record, RecordSchema};
@@ -117,25 +114,7 @@ struct BuiltinModule {
     commands_port: &'static str,
     /// The records on the IO ports, which the build wires.
     io_records: [&'static str; 2],
-    interfaces: Vec<InterfaceName>,
     systems: Vec<BuiltinClass>,
-}
-
-/// A `Cap` interface: its Rust type's name in upper snake case, and its
-/// `NAME`.
-#[derive(Serialize)]
-struct InterfaceName {
-    name: String,
-    value: &'static str,
-}
-
-impl InterfaceName {
-    fn of<I: Interface>() -> Self {
-        Self {
-            name: upper_snake(type_name::<I>()),
-            value: I::NAME,
-        }
-    }
 }
 
 /// The base class of one built-in system.
@@ -181,17 +160,11 @@ struct Entry {
     takes_outputs: bool,
     inputs: Vec<Port>,
     params: Vec<Field>,
-    /// Each `Cap` parameter, with the interface it takes.
-    caps: Vec<CapKw>,
+    /// The name of each `Cap` parameter.
+    caps: Vec<String>,
     /// Every output port with its record class. The framework's ports come
     /// last.
     ports: Vec<Port>,
-}
-
-#[derive(Clone, Serialize)]
-struct CapKw {
-    name: String,
-    interface: String,
 }
 
 #[derive(Serialize)]
@@ -250,16 +223,6 @@ fn builtin_view(def: &PackDef) -> BuiltinModule {
         channel_ports: channel_ports().into_iter().map(Port::of).collect(),
         commands_port: COMMANDS_PORT,
         io_records: [Sqe::NAME, Cqe::NAME],
-        interfaces: vec![
-            InterfaceName::of::<Can>(),
-            InterfaceName::of::<Dir>(),
-            InterfaceName::of::<RegularFile>(),
-            InterfaceName::of::<GpioLine>(),
-            InterfaceName::of::<Listen>(),
-            InterfaceName::of::<Stream>(),
-            InterfaceName::of::<Uart>(),
-            InterfaceName::of::<Udp>(),
-        ],
         systems,
     }
 }
@@ -393,17 +356,6 @@ fn type_name<T>() -> &'static str {
     path.rsplit("::").next().unwrap_or(path)
 }
 
-fn upper_snake(name: &str) -> String {
-    let mut out = String::with_capacity(name.len() + 4);
-    for (index, c) in name.char_indices() {
-        if c.is_uppercase() && index > 0 {
-            out.push('_');
-        }
-        out.push(c.to_ascii_uppercase());
-    }
-    out
-}
-
 fn pascal(name: &str) -> String {
     name.split('_')
         .flat_map(|part| {
@@ -474,17 +426,17 @@ fn entry(
     defs: &BTreeMap<String, Value>,
 ) -> Result<Entry, PackDevError> {
     let params = fields(schema, defs, false);
-    let kw = |g: &GrantDef| CapKw {
-        name: g.param.to_string(),
-        interface: g.interface.to_string(),
-    };
-    let grants = &system.def.grants;
-    let caps: Vec<CapKw> = grants.iter().map(kw).collect();
+    let caps: Vec<String> = system
+        .def
+        .grants
+        .iter()
+        .map(|g| g.param.to_string())
+        .collect();
     let input = |name: &str| wired_inputs(system).any(|port| port.name == name);
     let param = |name: &str| params.iter().any(|field| field.name == name);
     let clash = params.iter().map(|f| &f.name).find(|name| input(name));
     let taken = |name: &str| input(name) || param(name) || RESERVED_KEYWORDS.contains(&name);
-    let clash = clash.or(caps.iter().map(|c| &c.name).find(|name| taken(name)));
+    let clash = clash.or(caps.iter().find(|name| taken(name)));
     if let Some(name) = clash {
         return Err(PackDevError::NameClash {
             system: system.ty.to_string(),
@@ -766,7 +718,7 @@ mod tests {
         );
         assert!(text.contains("FRAMEWORK_PORTS: dict[str, type[Record]] = {\"log\": LogEvent, \"status\": SystemStatus}\n"));
         assert!(text.contains("CHANNEL_PORTS: dict[str, type[Record]] = {\"events\": SequenceChannelEvent, \"channel_status\": ChannelStatus}\n"));
-        assert!(text.contains("    REGULAR_FILE = \"file\"\n    GPIO_LINE = \"gpio_line\"\n"));
+        assert!(!text.contains("class Interface"), "{text}");
         assert!(text.contains("IO_RECORDS = (\"io_sqe\", \"io_cqe\")\n"));
     }
 
@@ -778,7 +730,6 @@ mod tests {
         assert!(text.contains(
             "class SystemStatus(Record):\n    _name = \"status\"\n    _kind = \"frame\"\n"
         ));
-        assert!(text.contains("    UART = \"uart\"\n"));
     }
 
     #[test]
@@ -838,7 +789,7 @@ mod tests {
         );
         def.def.grants = caps
             .iter()
-            .map(|name| GrantDef {
+            .map(|name| crate::io::GrantDef {
                 param: (*name).into(),
                 interface: "uart".into(),
             })
@@ -850,10 +801,7 @@ mod tests {
     fn test_caps_render_keywords_and_grants() {
         let text = rendered(vec![capped(None, &["main", "aux"])]).expect("renders");
         assert!(text.contains("Record, ResourceHandle, Sources"), "{text}");
-        assert!(
-            text.contains("    _caps = {\"main\": \"uart\", \"aux\": \"uart\"}\n"),
-            "{text}"
-        );
+        assert!(text.contains("    _caps = (\"main\", \"aux\")\n"), "{text}");
         assert!(
             text.contains("est: Sources[Est] = (), main: ResourceHandle, aux: ResourceHandle)"),
             "{text}"

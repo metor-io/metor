@@ -6,16 +6,11 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from ._config import ConfigError
-from ._generated import Interface
 
 
 class Kind:
-    """A real resource: a serial port, a socket, a file, and so on.
+    """A real resource: a serial port, a socket, a file, and so on."""
 
-    ``interface`` is the `Cap` interface the resource provides.
-    """
-
-    interface: str = ""
     _key: str = ""
 
     def _fields(self) -> dict[str, Any]:
@@ -31,7 +26,6 @@ class Tty(Kind):
 
     path: str
     baud: int = 9600
-    interface = Interface.UART
     _key = "tty"
 
     def _fields(self) -> dict[str, Any]:
@@ -44,7 +38,6 @@ class Can(Kind):
 
     iface: str
     filters: Sequence[tuple[int, int]] = ()
-    interface = Interface.CAN
     _key = "can"
 
     def _fields(self) -> dict[str, Any]:
@@ -59,7 +52,6 @@ class GpioLine(Kind):
     chip: str
     line: int
     direction: str = "input"
-    interface = Interface.GPIO_LINE
     _key = "gpio_line"
 
     def _fields(self) -> dict[str, Any]:
@@ -72,7 +64,6 @@ class Udp(Kind):
 
     bind: str
     connect: str | None = None
-    interface = Interface.UDP
     _key = "udp"
 
     def _fields(self) -> dict[str, Any]:
@@ -85,7 +76,6 @@ class File(Kind):
 
     path: str
     access: str = "read_write"
-    interface = Interface.REGULAR_FILE
     _key = "file"
 
     def _fields(self) -> dict[str, Any]:
@@ -97,7 +87,6 @@ class Dir(Kind):
     """A directory that files are opened under."""
 
     path: str
-    interface = Interface.DIR
     _key = "dir"
 
     def _fields(self) -> dict[str, Any]:
@@ -109,7 +98,6 @@ class TcpListen(Kind):
     """A TCP listener bound to ``addr``."""
 
     addr: str
-    interface = Interface.LISTEN
     _key = "tcp_listen"
 
     def _fields(self) -> dict[str, Any]:
@@ -126,7 +114,6 @@ class SimKind(Kind):
 class SimUart(SimKind):
     """A simulated serial port."""
 
-    interface = Interface.UART
     _key = "uart"
 
 
@@ -134,7 +121,6 @@ class SimUart(SimKind):
 class SimGpioLine(SimKind):
     """A simulated GPIO line."""
 
-    interface = Interface.GPIO_LINE
     _key = "gpio_line"
 
 
