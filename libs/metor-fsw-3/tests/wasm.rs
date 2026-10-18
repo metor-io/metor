@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use common::{Ping, fixture_lib, fixture_wasm, open_wasm, panicked};
-use metor_fsw_3::coordinator::{BuildError, Coordinator, CoordinatorConfig, ParamError};
+use metor_fsw_3::coordinator::{BuildError, Coordinator, CoordinatorConfig, MakeError};
 use metor_fsw_3::metor_proto_wkt::{
     LogEvent, SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
@@ -73,7 +73,7 @@ fn test_export_signatures() {
         [
             "metor_fsw_abi_version [] -> [I32]",
             "metor_fsw_alloc [I32, I32] -> [I32]",
-            "metor_fsw_create [I32, I32, I32, I32, I32, I32, I32] -> [I32]",
+            "metor_fsw_create [I32, I32, I32, I32, I32, I32, I64, I32, I32, I32, I32] -> [I32]",
             "metor_fsw_def [I32, I32, I32, I32, I32] -> [I32]",
             "metor_fsw_destroy [I32] -> []",
             "metor_fsw_execute [I32, I64] -> [I32]",
@@ -304,6 +304,18 @@ fn fan_in() -> CoordinatorConfig {
     }
 }
 
+/// A wasm pack system's `Rng` draws from the host's target seed.
+#[test]
+fn test_rng_draws_from_the_target_seed() {
+    let mut config = pipeline("dice");
+    config.seed = 7;
+    let (mut coordinator, seen) = build(config, &wasm_pack());
+    run(&mut coordinator, 2);
+    let mut rng = metor_fsw_3::Rng::seeded(7, "middle.rng");
+    let want: Vec<u32> = (0..2).map(|_| rng.next_u64() as u32).collect();
+    assert_eq!(pings(&seen), want);
+}
+
 #[test]
 fn test_fan_in_takes_newest() {
     let (mut coordinator, seen) = build(fan_in(), &wasm_pack());
@@ -333,8 +345,8 @@ fn test_async_refused() {
     assert!(
         matches!(
             error,
-            BuildError::Params {
-                source: ParamError::ThreadsUnsupported { .. },
+            BuildError::Make {
+                source: MakeError::ThreadsUnsupported { .. },
                 ..
             }
         ),

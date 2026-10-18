@@ -5,7 +5,7 @@ use core::ptr::NonNull;
 use metor_fsw_3_ring::{NoWake, PAYLOAD_ALIGNMENT, RingBuffer, View};
 use serde::{Deserialize, Serialize};
 
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::dl::{InstanceRings, PackError};
 use crate::io::{Cqe, IoState, Sqe};
@@ -99,7 +99,7 @@ impl WasmPack {
         instance: &Instance,
         InstanceRings { inputs, outputs }: InstanceRings<'_>,
         io: &mut IoState,
-    ) -> Result<WasmStep, ParamError> {
+    ) -> Result<WasmStep, MakeError> {
         let (params, def) = instance.encode(params)?;
         let mut guest = self.guest().map_err(PackError::from)?;
         let capped = !instance.def.grants.is_empty();
@@ -124,6 +124,7 @@ impl WasmPack {
             inputs: &ins.rings,
             outputs: &outs.rings,
             io_arena: given,
+            seed: instance.seed,
         };
         let (handle, region) = call.call(&mut guest)?;
         let copy = ports
@@ -162,12 +163,12 @@ impl Guest {
     }
 }
 
-impl From<PackError> for ParamError {
+impl From<PackError> for MakeError {
     /// A trap means the guest panicked. Any other failure is the host's.
     fn from(error: PackError) -> Self {
         match error {
-            PackError::Trap(trap) => ParamError::Panicked(trap.to_string()),
-            error => ParamError::Wasm(error.to_string()),
+            PackError::Trap(trap) => MakeError::Panicked(trap.to_string()),
+            error => MakeError::Wasm(error.to_string()),
         }
     }
 }
@@ -181,12 +182,13 @@ struct Create<'a> {
     outputs: &'a [GuestRing],
     /// Room for the system's IO arena, on a remake.
     io_arena: Option<GuestRing>,
+    seed: u64,
 }
 
 impl GuestRing {
     /// Allocates a zeroed region of `len` bytes in the guest, for a remade
     /// guest's constructor to lay out its IO arena in.
-    fn alloc_zeroed(guest: &mut Guest, len: usize) -> Result<GuestRing, ParamError> {
+    fn alloc_zeroed(guest: &mut Guest, len: usize) -> Result<GuestRing, MakeError> {
         let len = guest_usize(len)?;
         let offset = guest.alloc_nonnull(len, 8)?;
         let zeroes = vec![0; len as usize];
@@ -203,8 +205,8 @@ impl GuestRing {
         guest: &mut Guest,
         capacity: usize,
         readers: usize,
-    ) -> Result<(GuestRing, RingBuffer), ParamError> {
-        let too_large = || ParamError::MirrorTooLarge { capacity };
+    ) -> Result<(GuestRing, RingBuffer), MakeError> {
+        let too_large = || MakeError::MirrorTooLarge { capacity };
         let config = mirror_config(capacity, COPY_FACTOR, readers)?;
         let len = config.region_len().map_err(|_| too_large())?;
         let len = u32::try_from(len).map_err(|_| too_large())?;
@@ -218,7 +220,7 @@ impl GuestRing {
         // before `guest` on an error. So the memory outlives all of them. From
         // then on, the guest and host both follow the ring protocol.
         let ring = unsafe { RingBuffer::create_raw(base.as_ptr(), len as usize, config) }
-            .map_err(|e| ParamError::Wasm(e.to_string()))?;
+            .map_err(|e| MakeError::Wasm(e.to_string()))?;
         Ok((GuestRing { offset, len }, ring))
     }
 }
@@ -238,14 +240,14 @@ fn attach(
     instance: &Instance,
     region: GuestRing,
     IoPorts { sq, cq }: IoPorts,
-) -> Result<IoCopy, ParamError> {
+) -> Result<IoCopy, MakeError> {
     let len = region.len as usize;
     let mirror = io.get_or_add_member(&instance.id);
     if mirror.region().is_none() {
         mirror.set_owned(vec![0; len].into());
     }
     if mirror.region().is_none_or(|(_, l)| l != len) {
-        return Err(ParamError::Wasm("a remade guest moved its IO arena".into()));
+        return Err(MakeError::Wasm("a remade guest moved its IO arena".into()));
     }
     let base = guest
         .host_ptr(region.offset, len)
@@ -260,7 +262,7 @@ impl Create<'_> {
     ///
     /// Returns the instance and the IO arena the guest wrote back, or the
     /// error the guest wrote.
-    fn call(self, guest: &mut Guest) -> Result<(u32, GuestRing), ParamError> {
+    fn call(self, guest: &mut Guest) -> Result<(u32, GuestRing), MakeError> {
         let mut args = Args::new(guest);
         let ty = args.byte_slice(self.ty)?;
         let params = args.byte_slice(self.params)?;
@@ -274,16 +276,27 @@ impl Create<'_> {
         let (outs, len) = args.rings(self.outputs)?;
         let outputs = args.slice(outs, len)?;
         let io_arena = args.io_arena(self.io_arena)?;
-        let error = args.slice(0, 0)?;
-        let create = (ty, params, def, inputs, outputs, io_arena, error);
-        let handle = args
+        let handle = args.word()?;
+        let out = args.out()?;
+        let create = (
+            ty,
+            params,
+            def,
+            inputs,
+            outputs,
+            io_arena,
+            self.seed,
+            handle,
+            out.dst,
+            out.capacity,
+            out.written,
+        );
+        let status = args
             .guest()
             .create(create, DEFAULT_SETUP_FUEL)
             .map_err(PackError::from)?;
-        if handle == 0 {
-            return Err(ParamError::from_create_error(&args.slice_bytes(error)?));
-        }
-        Ok((handle, args.ring(io_arena)?))
+        MakeError::check_create(status, args.written(out).ok().as_deref())?;
+        Ok((args.read_word(handle)?, args.ring(io_arena)?))
     }
 }
 
@@ -306,7 +319,7 @@ impl Copies<Vec<GuestRing>> {
         ports: &[PortDef],
         inputs: &[Vec<&RingBuffer>],
         capped: bool,
-    ) -> Result<Self, ParamError> {
+    ) -> Result<Self, MakeError> {
         let mut copies = Copies {
             mirrors: Vec::new(),
             rings: Vec::with_capacity(ports.len()),
@@ -344,7 +357,7 @@ impl Copies<GuestRing> {
         ports: &[PortDef],
         outputs: &[&RingBuffer],
         capped: bool,
-    ) -> Result<Self, ParamError> {
+    ) -> Result<Self, MakeError> {
         let mut copies = Copies {
             mirrors: Vec::with_capacity(ports.len()),
             rings: Vec::with_capacity(ports.len()),

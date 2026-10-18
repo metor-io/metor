@@ -28,11 +28,12 @@ fn wat(memory: &str, extra: &str, execute: &str) -> String {
         r#"(module
             (import "env" "memory" (memory {memory}))
             {extra}
-            (func (export "metor_fsw_abi_version") (result i32) i32.const 13)
+            (func (export "metor_fsw_abi_version") (result i32) i32.const 14)
             (func (export "metor_fsw_pack_def") (param i32 i32 i32) (result i32) i32.const 0)
             (func (export "metor_fsw_def") (param i32 i32 i32 i32 i32) (result i32) i32.const 0)
-            (func (export "metor_fsw_create") (param i32 i32 i32 i32 i32 i32 i32) (result i32)
-                i32.const 0)
+            (func (export "metor_fsw_create")
+                (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32) (result i32)
+                i32.const 3)
             (func (export "metor_fsw_execute") (param i32 i64) (result i32) {execute})
             (func (export "metor_fsw_alloc") (param i32 i32) (result i32) i32.const 0)
             (func (export "metor_fsw_free") (param i32 i32 i32)))"#
@@ -168,7 +169,7 @@ fn test_accesses_stay_in_memory() {
 #[test]
 fn test_calls_reach_each_export() {
     let mut guest = guest("1", "", "i32.const 4", PAGE);
-    assert_eq!(guest.abi_version(1_000), Ok(13));
+    assert_eq!(guest.abi_version(1_000), Ok(14));
     assert_eq!(guest.execute(0, 0, 1_000), Ok(4));
     assert_eq!(guest.alloc(16, 16, 1_000), Ok(0));
     assert_eq!(guest.free(0, 16, 16, 1_000), Ok(()));
@@ -179,6 +180,8 @@ fn test_calls_reach_each_export() {
     };
     assert_eq!(guest.pack_def(out, 1_000), Ok(0));
     assert_eq!(guest.def(0, 0, out, 1_000), Ok(0));
+    let create = (0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0);
+    assert_eq!(guest.create(create, 1_000), Ok(3));
 }
 
 fn open(text: &str) -> Result<WasmPack, PackError> {
@@ -191,7 +194,7 @@ fn open(text: &str) -> Result<WasmPack, PackError> {
 #[test]
 fn test_wrong_abi_is_mismatch() {
     let text = wat("1", "", "i32.const 0")
-        .replace("(result i32) i32.const 13)", "(result i32) i32.const 1)");
+        .replace("(result i32) i32.const 14)", "(result i32) i32.const 1)");
     assert!(matches!(
         open(&text),
         Err(PackError::AbiMismatch {
@@ -237,19 +240,21 @@ fn step_wat(execute: &str) -> String {
             (global $in (mut i32) (i32.const 0))
             (global $out (mut i32) (i32.const 0))
             (data (i32.const 16) "{json}")
-            (func (export "metor_fsw_abi_version") (result i32) i32.const 13)
+            (func (export "metor_fsw_abi_version") (result i32) i32.const 14)
             (func (export "metor_fsw_pack_def") (param $dst i32) (param i32) (param $written i32)
                 (result i32)
                 (memory.copy (local.get $dst) (i32.const 16) (i32.const {len}))
                 (i32.store (local.get $written) (i32.const {len}))
                 i32.const 0)
             (func (export "metor_fsw_def") (param i32 i32 i32 i32 i32) (result i32) i32.const 2)
-            (func (export "metor_fsw_create") (param i32 i32 i32 i32 i32 i32 i32) (result i32)
+            (func (export "metor_fsw_create")
+                (param i32 i32 i32 i32 i32 i32 i64 i32 i32 i32 i32) (result i32)
                 (if (i32.load offset=4 (local.get 3))
                     (then (global.set $in (i32.load (i32.load (i32.load (local.get 3)))))))
                 (if (i32.load offset=4 (local.get 4))
                     (then (global.set $out (i32.load (i32.load (local.get 4))))))
-                i32.const 1)
+                (i32.store (local.get 7) (i32.const 1))
+                i32.const 0)
             (func (export "metor_fsw_execute") (param i32 i64) (result i32) {execute})
             (func (export "metor_fsw_alloc") (param $len i32) (param $align i32) (result i32)
                 (local $at i32)
@@ -335,6 +340,7 @@ fn rig(execute: &str) -> Rig {
         id: "guest".into(),
         def,
         adapter: None,
+        seed: 0,
     };
     let (seen, lines) = (output.view(NoWake), log.view(NoWake));
     let (inputs, outputs) = ([vec![&input]], [&output, &log]);

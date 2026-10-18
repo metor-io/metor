@@ -123,6 +123,16 @@ impl<'g> Args<'g> {
         self.slice(ptr, guest_usize(ports.len())?)
     }
 
+    /// Allocates a zeroed guest `usize`, for an export to write a handle into.
+    pub(super) fn word(&mut self) -> Result<u32, PackError> {
+        self.alloc(WASM32_USIZE, WASM32_USIZE)
+    }
+
+    /// Reads the guest `usize` at `offset`.
+    pub(super) fn read_word(&self, offset: u32) -> Result<u32, PackError> {
+        Ok(self.guest.read_u32(offset)?)
+    }
+
     /// Allocates an output buffer for an export to write into.
     ///
     /// The buffer holds [`DESCRIPTOR_CAPACITY`] bytes, plus a slot for the
@@ -146,21 +156,6 @@ impl<'g> Args<'g> {
         }
         let mut bytes = vec![0; written as usize];
         self.guest.read(out.dst, &mut bytes)?;
-        Ok(bytes)
-    }
-
-    /// Reads the bytes of the `RawSlice` at `offset`.
-    ///
-    /// Fails if the slice is longer than [`DESCRIPTOR_CAPACITY`].
-    pub(super) fn slice_bytes(&self, offset: u32) -> Result<Vec<u8>, PackError> {
-        let mut slice = Wasm32RawSlice::new_zeroed();
-        self.guest.read(offset, slice.as_mut_bytes())?;
-        let len = slice.len.get() as usize;
-        if len > DESCRIPTOR_CAPACITY {
-            return Err(WasmError::TooLarge(len).into());
-        }
-        let mut bytes = vec![0; len];
-        self.guest.read(slice.ptr.get(), &mut bytes)?;
         Ok(bytes)
     }
 }
