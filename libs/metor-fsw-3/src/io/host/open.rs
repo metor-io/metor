@@ -38,7 +38,6 @@ pub fn open(kind: &RealKind) -> Result<(OwnedFd, Class), OpenError> {
             listener.set_nonblocking(true)?;
             (listener.into(), Class::Listener)
         }
-        RealKind::TcpConnect { .. } => return Err(OpenError::Unsupported("tcp_connect")),
     })
 }
 

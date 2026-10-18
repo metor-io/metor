@@ -16,7 +16,7 @@ use metor_proto::types::Timestamp;
 
 use crate::def::{DefCx, Records};
 use crate::io::{
-    Backing, Cqe, IO_CQ, IO_SQ, IO_TYPE, IoState, RealKind, ResourceEnd, ResourceIndex, SharedIo,
+    Backing, Cqe, IO_CQ, IO_SQ, IO_TYPE, IoState, ResourceEnd, ResourceIndex, SharedIo,
 };
 use crate::port::{Output, ring_capacity};
 use crate::record::Record;
@@ -86,7 +86,6 @@ impl CoordinatorConfig {
         if options.deterministic {
             self.clock.check_deterministic()?;
         }
-        check_resources(&self.resources)?;
         let bindings = Bindings::collect(&self)?;
         wire_io(&mut self.systems, &bindings)?;
         let records = Arc::new(table.records());
@@ -613,9 +612,8 @@ fn check_bindings(
         let position = usize::from(binding.resource.get());
         // PANIC Safety: `Bindings::collect` took every index from `resources`.
         let (id, backing) = resources.get_index(position).expect("a bound resource");
-        if let Some(found) = backing.interface()
-            && cap.interface != found
-        {
+        let found = backing.interface();
+        if cap.interface != found {
             return Err(BuildError::Interface {
                 cap: format!("{system}.{}", binding.param),
                 resource: id.clone(),
@@ -656,22 +654,6 @@ fn io_members(
         .filter(|system| !system.def.grants.is_empty())
         .map(|system| (system.id.to_string(), caps(system)))
         .collect()
-}
-
-/// Checks that each backing is one this build runs.
-fn check_resources(resources: &IndexMap<String, Backing>) -> Result<(), BuildError> {
-    for (id, backing) in resources {
-        let name = match backing {
-            Backing::Peer(_) => backing.name(),
-            Backing::Real(RealKind::TcpConnect { .. }) => "tcp_connect",
-            _ => continue,
-        };
-        return Err(BuildError::Backing {
-            resource: id.clone(),
-            backing: name.into(),
-        });
-    }
-    Ok(())
 }
 
 /// Returns the first port whose name repeats an earlier port's name.

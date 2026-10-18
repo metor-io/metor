@@ -4,7 +4,10 @@
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use metor_fsw_3::io::host::{Access, Baud, Class, OpenError, RealKind, open};
+use metor_fsw_3::io::{
+    Backing,
+    host::{Access, Baud, Class, OpenError, RealKind, open},
+};
 
 /// A pty pair and the slave's path.
 fn pty() -> (OwnedFd, OwnedFd, String) {
@@ -126,12 +129,11 @@ fn missing_tty_fails_and_odd_baud_does_not_parse() {
 }
 
 #[test]
-fn tcp_connect_is_unsupported_until_links() {
-    let err = open(&RealKind::TcpConnect {
-        addr: "127.0.0.1:2240".into(),
-    })
-    .unwrap_err();
-    assert!(matches!(err, OpenError::Unsupported("tcp_connect")));
+fn unrunnable_backings_do_not_parse() {
+    let dial = serde_json::json!({ "real": { "tcp_connect": { "addr": "127.0.0.1:2240" } } });
+    let peer = serde_json::json!({ "peer": "uart" });
+    assert!(serde_json::from_value::<Backing>(dial).is_err());
+    assert!(serde_json::from_value::<Backing>(peer).is_err());
 }
 
 #[cfg(not(target_os = "linux"))]

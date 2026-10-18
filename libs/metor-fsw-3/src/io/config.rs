@@ -13,8 +13,6 @@ use super::cap::{self, Interface};
 pub enum Backing {
     Real(RealKind),
     Sim(SimResource),
-    /// Another target's resource, by name.
-    Peer(String),
 }
 
 /// A real resource. The set is closed: nothing registers more.
@@ -49,9 +47,6 @@ pub enum RealKind {
         path: PathBuf,
     },
     TcpListen {
-        addr: String,
-    },
-    TcpConnect {
         addr: String,
     },
 }
@@ -135,27 +130,16 @@ impl RealKind {
             Self::File { .. } => cap::RegularFile::NAME,
             Self::Dir { .. } => cap::Dir::NAME,
             Self::TcpListen { .. } => cap::Listen::NAME,
-            Self::TcpConnect { .. } => "dial",
         }
     }
 }
 
 impl Backing {
-    /// The interface the resource provides. A peer's is not known here.
-    pub fn interface(&self) -> Option<&'static str> {
+    /// The interface the resource provides.
+    pub fn interface(&self) -> &'static str {
         match self {
-            Self::Real(kind) => Some(kind.interface()),
-            Self::Sim(sim) => Some(sim.kind.interface()),
-            Self::Peer(_) => None,
-        }
-    }
-
-    /// The backing's kind, as its config names it.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Real(_) => "real",
-            Self::Sim(_) => "sim",
-            Self::Peer(_) => "peer",
+            Self::Real(kind) => kind.interface(),
+            Self::Sim(sim) => sim.kind.interface(),
         }
     }
 }
