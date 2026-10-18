@@ -40,7 +40,11 @@
                 "port": "ping",
                 "record": "ping"
               }
-            ]
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_target.py",
+              "line": 39
+            }
           },
           {
             "id": "plant",
@@ -58,7 +62,11 @@
                   }
                 ]
               }
-            ]
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_target.py",
+              "line": 41
+            }
           },
           {
             "id": "nav",
@@ -76,13 +84,21 @@
                   }
                 ]
               }
-            ]
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_target.py",
+              "line": 42
+            }
           },
           {
             "id": "mode",
             "ty": "adcs.mode",
             "params": null,
-            "inputs": []
+            "inputs": [],
+            "location": {
+              "file": "python/metor-config/tests/test_target.py",
+              "line": 43
+            }
           },
           {
             "id": "ctrl",
@@ -107,7 +123,11 @@
                   }
                 ]
               }
-            ]
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_target.py",
+              "line": 44
+            }
           },
           {
             "id": "pub",
@@ -161,7 +181,11 @@
                   }
                 ]
               }
-            ]
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_target.py",
+              "line": 46
+            }
           }
         ]
       }

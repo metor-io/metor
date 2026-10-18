@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 
 from adcs_stub import Ctrl, Imu, LogEvent, Mode, Nav, Ping, Plant
-from test_target import ConfigTest, adcs_target, reset
+from test_target import CRATE, ConfigTest, adcs_target, reset
 
 import metor_config._deployment as deploy_mod
 from metor_config import ConfigError, Connect, Deployment, Listen, Peer, Publish, Subscribe, Target
 
-GOLDEN = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "tests", "golden", "deployment.json"
-)
+GOLDEN = os.path.join(CRATE, "tests", "golden", "deployment.json")
 
 
 def design_example() -> Deployment:
@@ -96,7 +95,8 @@ class EnvelopeTest(ConfigTest):
 
 class DeploymentTest(ConfigTest):
     def test_example_matches_golden(self) -> None:
-        design_example()
+        with contextlib.chdir(CRATE):
+            design_example()
         written = json.dumps(deploy_mod.to_config(), indent=2) + "\n"
         with open(GOLDEN, encoding="utf-8") as file:
             self.assertEqual(written, file.read())

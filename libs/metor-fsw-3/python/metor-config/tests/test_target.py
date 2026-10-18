@@ -27,15 +27,10 @@ from metor_config import (
     emit,
 )
 
-GOLDEN = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "..",
-    "..",
-    "tests",
-    "golden",
-    "target.json",
-)
+CRATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+"""The crate root. The goldens' locations are relative to it."""
+
+GOLDEN = os.path.join(CRATE, "tests", "golden", "target.json")
 
 
 def adcs_target() -> Target:
@@ -84,7 +79,8 @@ class TargetTest(ConfigTest):
             self.assertFalse(os.path.exists(path))
 
     def test_example_matches_golden(self) -> None:
-        adcs_target()
+        with contextlib.chdir(CRATE):
+            adcs_target()
         with tempfile.TemporaryDirectory() as dir:
             path = os.path.join(dir, "target.json")
             emit(path)

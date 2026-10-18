@@ -25,7 +25,11 @@
             "ty": "echo.sampler",
             "params": null,
             "inputs": [],
-            "outputs": []
+            "outputs": [],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 15
+            }
           },
           {
             "id": "pub",
@@ -70,7 +74,11 @@
                 ]
               }
             ],
-            "outputs": []
+            "outputs": [],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 16
+            }
           }
         ]
       }
@@ -118,7 +126,11 @@
               {
                 "port": "sampler.status"
               }
-            ]
+            ],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 19
+            }
           },
           {
             "id": "meter",
@@ -135,7 +147,11 @@
                 ]
               }
             ],
-            "outputs": []
+            "outputs": [],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 20
+            }
           },
           {
             "id": "pub",
@@ -234,7 +250,11 @@
                 ]
               }
             ],
-            "outputs": []
+            "outputs": [],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 21
+            }
           }
         ]
       }

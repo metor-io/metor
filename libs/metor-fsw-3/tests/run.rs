@@ -64,6 +64,29 @@ fn two_targets(dir: &Path, body: &str) -> std::path::PathBuf {
     target
 }
 
+/// A deploy error names the line of the target file that made the system.
+#[test]
+fn test_build_error_cites_the_target_file() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    two_targets(
+        dir.path(),
+        "from metor_config import Connect, Peer, Publish, Subscribe\n\
+         out = a.add(\"out\", Publish(transport=Connect(\"127.0.0.1:1\")))\n\
+         b.add(\"mirror\", Subscribe(transport=Peer(out)))",
+    );
+    let output = metor()
+        .args(["build", "deploy.py"])
+        .current_dir(dir.path())
+        .output()
+        .expect("metor runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("metor: deploy.py:6: `b.mirror` names link `a.out`, which does not listen on a fixed port"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn test_deployment_runs_every_target_as_a_child() {
     let dir = tempfile::tempdir().expect("a temp dir");
