@@ -21,6 +21,9 @@ pub struct Instance {
     pub id: String,
     pub def: SystemDef,
     pub adapter: Option<Adapter>,
+    /// The target seed, which `create` takes as its own argument.
+    #[serde(skip)]
+    pub seed: u64,
 }
 
 /// Lists the systems a pack exports, in registration order.

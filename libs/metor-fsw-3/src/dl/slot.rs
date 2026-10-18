@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::coordinator::{
-    Adapters, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, StepCx, SystemKind,
-    TableEntry,
+    Adapters, EndReason, LoadError, MakeCx, MakeError, Occupant, ParamError, Step, StepCx,
+    SystemKind, TableEntry,
 };
 use crate::def::{DefCx, DefError};
 use crate::dl::PackKind;
@@ -168,7 +168,7 @@ impl Resolved {
         Ok(Pack::Dl(pack))
     }
 
-    fn of(index: usize, candidate: Candidate) -> Result<Self, ParamError> {
+    fn of(index: usize, candidate: Candidate) -> Result<Self, MakeError> {
         let Stored {
             path, hash, kind, ..
         } = candidate.stored;
@@ -239,7 +239,7 @@ impl DlSlot {
     }
 
     /// Creates a slot on the rings `cx` gives, and loads its initial candidate.
-    fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
+    fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, MakeError> {
         let params: SlotParams = cx.params.decode()?;
         let candidates = params
             .allow
@@ -252,6 +252,7 @@ impl DlSlot {
                 id: cx.id.to_string(),
                 def: cx.def.clone(),
                 adapter: cx.adapter.cloned(),
+                seed: cx.seed,
             },
             inputs: cx
                 .inputs

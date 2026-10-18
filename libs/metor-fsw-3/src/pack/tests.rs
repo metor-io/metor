@@ -5,7 +5,7 @@ use metor_proto_wkt::{LogEvent, LogLevel};
 
 use super::*;
 use crate::DefCx;
-use crate::coordinator::SystemKind;
+use crate::coordinator::{ParamError, SystemKind};
 use crate::record::Record;
 use crate::tests::utils::{self, Imu, Nav, Recorder};
 
@@ -52,6 +52,7 @@ fn instance_named(ty: &str, id: &str) -> Vec<u8> {
         id: id.to_string(),
         def,
         adapter: None,
+        seed: 0,
     };
     serde_json::to_vec(&instance).expect("encodes")
 }
@@ -70,10 +71,12 @@ fn create_with(
     (inputs, outputs): (&[RawSlice], &[RawRing]),
     mut table: RawRing,
 ) -> Instance {
-    let mut error = RawSlice::EMPTY;
+    let mut handle = core::ptr::null_mut();
+    let mut error = vec![0u8; 4096];
+    let mut written = 0;
     // SAFETY: every array outlives the call, the rings outlive the instance,
     // and a given region's owner is live.
-    let handle = unsafe {
+    let status = unsafe {
         let args = CreateArgs {
             ty: RawSlice::of(ty.as_bytes()),
             params: RawSlice::of(params.as_bytes()),
@@ -81,11 +84,21 @@ fn create_with(
             inputs: RawSlice::of(inputs),
             outputs: RawSlice::of(outputs),
             table: &raw mut table,
+            seed: 0,
         };
-        create(build, args, &raw mut error)
+        create(
+            build,
+            args,
+            &raw mut handle,
+            error.as_mut_ptr(),
+            error.len(),
+            &raw mut written,
+        )
     };
+    error.truncate(written);
     Instance {
         handle,
+        status,
         error,
         table,
     }
@@ -94,7 +107,9 @@ fn create_with(
 /// One `create` result. It is destroyed when the test drops it.
 struct Instance {
     handle: *mut c_void,
-    error: RawSlice,
+    status: u32,
+    /// The error JSON `create` wrote, or nothing.
+    error: Vec<u8>,
     /// The IO region `create` wrote back.
     table: RawRing,
 }
@@ -107,8 +122,7 @@ impl Instance {
 
     /// Returns the error bytes `create` wrote, or an empty slice.
     fn error(&self) -> &[u8] {
-        // SAFETY: the buffer lives until the next `create` on this thread.
-        unsafe { self.error.as_bytes() }
+        &self.error
     }
 }
 
@@ -265,8 +279,9 @@ fn test_table_capture_lifetime() {
 fn test_unknown_system_type() {
     let instance = create_raw("gyro", "", &[], &[]);
     assert!(instance.handle.is_null());
-    let error: ParamError = serde_json::from_slice(instance.error()).expect("error");
-    assert!(matches!(error, ParamError::Decode(_)));
+    assert_eq!(instance.status, DefStatus::Refused as u32);
+    let error: MakeError = serde_json::from_slice(instance.error()).expect("error");
+    assert!(matches!(error, MakeError::Params(ParamError::Decode(_))));
 }
 
 #[test]
@@ -275,13 +290,16 @@ fn test_bad_params_refused() {
         let (nav, log) = (ring::<Nav>(1), ring::<LogEvent>(1));
         let instance = create_raw("nav", params, &[RawSlice::EMPTY], &[nav.raw(), log.raw()]);
         assert!(instance.handle.is_null());
-        serde_json::from_slice::<ParamError>(instance.error()).expect("decodes")
+        serde_json::from_slice::<MakeError>(instance.error()).expect("decodes")
     };
     assert_eq!(
         refused(r#"{"gain":2.0}"#),
-        ParamError::UnknownKey("gain".into())
+        ParamError::UnknownKey("gain".into()).into()
     );
-    assert!(matches!(refused("{"), ParamError::Decode(_)));
+    assert!(matches!(
+        refused("{"),
+        MakeError::Params(ParamError::Decode(_))
+    ));
 }
 
 #[test]

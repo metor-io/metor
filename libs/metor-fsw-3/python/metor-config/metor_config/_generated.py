@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from ._model import Pack, Record, System
 
-ABI_VERSION = 13
+ABI_VERSION = 14
 """The host ABI version the built-in systems are compiled against."""
 
 PACK = Pack(id="fsw", lib="", libs="", abi_version=ABI_VERSION)

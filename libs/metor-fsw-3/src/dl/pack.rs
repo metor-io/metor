@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use libloading::Library;
 use metor_proto::types::Timestamp;
 
-use crate::coordinator::{EndReason, ParamError, Step, StepCx};
+use crate::coordinator::{EndReason, MakeError, Step, StepCx};
 use crate::def::{DefCx, DefError};
 use crate::pack::Status;
 use crate::pack::def::{DefCxOwned, Instance, PackDef};
@@ -29,8 +29,12 @@ type CreateFn = unsafe extern "C" fn(
     RawSlice,
     RawSlice,
     *mut RawRing,
-    *mut RawSlice,
-) -> *mut c_void;
+    u64,
+    *mut *mut c_void,
+    *mut u8,
+    usize,
+    *mut usize,
+) -> u32;
 type ExecuteFn = unsafe extern "C" fn(*mut c_void, i64) -> u32;
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
 
@@ -168,7 +172,7 @@ impl DlPack {
         instance: &Instance,
         InstanceRings { inputs, outputs }: InstanceRings<'_>,
         table: &mut RawRing,
-    ) -> Result<DlStep, ParamError> {
+    ) -> Result<DlStep, MakeError> {
         let (params, def) = instance.encode(params)?;
         let input_owners: Vec<Vec<_>> = inputs
             .iter()
@@ -181,11 +185,13 @@ impl DlPack {
             .collect();
         let ports: Vec<RawSlice> = edges.iter().map(|rings| RawSlice::of(rings)).collect();
         let outs: Vec<RawRing> = output_owners.iter().map(RawRing::of).collect();
-        let mut error = RawSlice::EMPTY;
-        // SAFETY: the arrays and the exported ring handles outlive the call. The
-        // pack keeps its own references to the ring memory through host
+        let seed = instance.seed;
+        let mut instance = core::ptr::null_mut();
+        // SAFETY: the arrays and the exported ring handles outlive the call,
+        // and the export writes only inside this buffer and the result slots.
+        // The pack keeps its own references to the ring memory through host
         // callbacks.
-        let instance = unsafe {
+        let (status, bytes) = call_export(|dst, cap, written| unsafe {
             (self.fns.create)(
                 RawSlice::of(ty.as_bytes()),
                 RawSlice::of(&params),
@@ -193,13 +199,14 @@ impl DlPack {
                 RawSlice::of(&ports),
                 RawSlice::of(&outs),
                 table,
-                &raw mut error,
+                seed,
+                &raw mut instance,
+                dst,
+                cap,
+                written,
             )
-        };
-        if instance.is_null() {
-            // SAFETY: the pack owns the buffer until the next `create` on this thread.
-            return Err(ParamError::from_create_error(unsafe { error.as_bytes() }));
-        }
+        });
+        MakeError::check_create(status, bytes.as_deref())?;
         Ok(DlStep {
             instance,
             fns: self.fns,

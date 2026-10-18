@@ -68,6 +68,8 @@ pub enum MakeError {
     Resource { id: String, message: String },
     #[error("`{system}` feeds io_submit but holds no `Cap` made in this process")]
     NoIoMember { system: String },
+    #[error("the pack's create {0}")]
+    Pack(String),
 }
 
 #[cfg(test)]

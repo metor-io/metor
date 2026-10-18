@@ -8,8 +8,8 @@ use std::cell::RefCell;
 use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
-    BindCx, DefCx, DefError, DynInputs, Frame, Input, InputBinding, Output, OutputBinding,
-    ParamError, Payload, PortDef, Ports, Record, Seq, SeqError, Stop, System, SystemDef,
+    BindCx, DefCx, DefError, DynInputs, Frame, Input, InputBinding, MakeError, Output,
+    OutputBinding, Payload, PortDef, Ports, Record, Seq, SeqError, Stop, System, SystemDef,
     SystemTable, Timestamp, sequence, system,
 };
 use schemars::JsonSchema;
@@ -63,6 +63,18 @@ fn echo(input: &mut Input<Ping>, output: &mut Output<Ping>) {
     if let Ok(Some(ping)) = input.latest() {
         let n = ping.n;
         let _ = output.write(&Ping { n });
+    }
+}
+
+/// Replaces each ping's count with a draw from the target seed.
+#[system]
+fn dice(rng: &mut metor_fsw_3::Rng, input: &mut Input<Ping>, output: &mut Output<Ping>) {
+    for ping in input.drain() {
+        if ping.is_ok() {
+            let _ = output.write(&Ping {
+                n: rng.next_u64() as u32,
+            });
+        }
     }
 }
 
@@ -161,7 +173,7 @@ impl Ports<InputBinding> for RetainedInput {
         Ok(vec![Input::<Ping>::def(cx, "input")])
     }
 
-    fn bind(mut inputs: Vec<InputBinding>, _cx: &BindCx) -> Result<Self, ParamError> {
+    fn bind(mut inputs: Vec<InputBinding>, _cx: &BindCx) -> Result<Self, MakeError> {
         if let Some(binding) = inputs.pop() {
             RETAINED_INPUT.with(|slot| *slot.borrow_mut() = Some(Input::new(binding.views)));
         }
@@ -176,7 +188,7 @@ impl Ports<OutputBinding> for RetainedOutput {
         Ok(vec![Output::<Ping>::def(cx, "output")])
     }
 
-    fn bind(mut outputs: Vec<OutputBinding>, _cx: &BindCx) -> Result<Self, ParamError> {
+    fn bind(mut outputs: Vec<OutputBinding>, _cx: &BindCx) -> Result<Self, MakeError> {
         if let Some(binding) = outputs.pop() {
             RETAINED_OUTPUT.with(|slot| *slot.borrow_mut() = Some(Output::new(binding.writer)));
         }
@@ -258,9 +270,9 @@ pub struct StrideParams {
 pub struct Stride(u32);
 
 impl Stride {
-    fn new(params: StrideParams) -> Result<Self, ParamError> {
+    fn new(params: StrideParams) -> Result<Self, MakeError> {
         if params.by == 0 {
-            return Err(metor_fsw_3::ParamError::Decode("`by` is zero".into()));
+            return Err(metor_fsw_3::ParamError::Decode("`by` is zero".into()).into());
         }
         Ok(Self(params.by))
     }
@@ -301,6 +313,9 @@ pub fn pack() -> SystemTable {
         .expect("valid records");
     table
         .register("echo", echo(), Default::default)
+        .expect("valid records");
+    table
+        .register("dice", dice(), Default::default)
         .expect("valid records");
     table
         .register_async("relay", relay(), Default::default)

@@ -2,7 +2,7 @@
 //!
 //! The host and packs of both kinds use the same encoding.
 
-use crate::coordinator::ParamError;
+use crate::coordinator::{MakeError, ParamError};
 use crate::def::{DefCx, DefError};
 use crate::pack::DefStatus;
 use crate::pack::def::{DefCxOwned, Instance, PackDef};
@@ -47,14 +47,28 @@ impl SystemDef {
     }
 }
 
-impl ParamError {
-    /// Decodes the error a failed `create` wrote, or a generic error if it
-    /// wrote nothing.
-    pub(crate) fn from_create_error(bytes: &[u8]) -> Self {
-        if bytes.is_empty() {
-            return ParamError::Decode("pack create failed".to_string());
+impl MakeError {
+    /// Checks the status a `create` export returned, decoding the error it
+    /// wrote when the type refused.
+    ///
+    /// `bytes` is `None` when the export reported writing more than the buffer
+    /// holds.
+    pub(crate) fn check_create(status: u32, bytes: Option<&[u8]>) -> Result<(), Self> {
+        match DefStatus::try_from(status) {
+            Ok(DefStatus::Ok) => Ok(()),
+            Ok(DefStatus::Refused) => Err(match bytes {
+                Some(bytes) => {
+                    serde_json::from_slice(bytes).unwrap_or_else(|e| Self::Pack(e.to_string()))
+                }
+                None => Self::Pack("reported more than it wrote".into()),
+            }),
+            Ok(DefStatus::TooSmall) => Err(Self::Pack(format!(
+                "error does not fit in {DESCRIPTOR_CAPACITY} bytes"
+            ))),
+            Ok(DefStatus::Encode) => Err(Self::Pack("error does not encode".into())),
+            Ok(DefStatus::Panicked) => Err(Self::Pack("panicked".into())),
+            Err(status) => Err(Self::Pack(format!("returned status {status}"))),
         }
-        serde_json::from_slice(bytes).unwrap_or_else(|e| ParamError::Decode(e.to_string()))
     }
 }
 
@@ -70,7 +84,7 @@ impl Instance {
     pub(crate) fn encode(
         &self,
         params: &serde_json::Value,
-    ) -> Result<(Vec<u8>, Vec<u8>), ParamError> {
+    ) -> Result<(Vec<u8>, Vec<u8>), MakeError> {
         let encode = |e: serde_json::Error| ParamError::Decode(e.to_string());
         let params = serde_json::to_vec(params).map_err(encode)?;
         let instance = serde_json::to_vec(self).map_err(encode)?;
@@ -155,15 +169,26 @@ mod tests {
     }
 
     #[test]
-    fn test_create_error() {
-        let error = serde_json::to_vec(&ParamError::UnknownKey("gian".into())).expect("encodes");
+    fn test_create_status() {
+        let refusal: MakeError = ParamError::UnknownKey("gian".into()).into();
+        let bytes = serde_json::to_vec(&refusal).expect("encodes");
+        let check =
+            |status: DefStatus, bytes: Option<&[u8]>| MakeError::check_create(status as u32, bytes);
+        assert_eq!(check(DefStatus::Ok, Some(b"")), Ok(()));
+        assert_eq!(check(DefStatus::Refused, Some(&bytes)), Err(refusal));
+        for (status, why) in [
+            (DefStatus::Refused, None),
+            (DefStatus::TooSmall, Some(&b""[..])),
+            (DefStatus::Panicked, Some(&b""[..])),
+        ] {
+            assert!(
+                matches!(check(status, why), Err(MakeError::Pack(_))),
+                "{status:?}"
+            );
+        }
         assert_eq!(
-            ParamError::from_create_error(&error),
-            ParamError::UnknownKey("gian".into())
-        );
-        assert_eq!(
-            ParamError::from_create_error(b""),
-            ParamError::Decode("pack create failed".into())
+            MakeError::check_create(9, None),
+            Err(MakeError::Pack("returned status 9".into()))
         );
     }
 }

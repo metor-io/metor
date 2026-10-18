@@ -12,7 +12,7 @@ PACK = Pack(
     id="echo",
     lib="echo_pack",
     libs=str(Path(__file__).resolve().parent / "_libs"),
-    abi_version=13,
+    abi_version=14,
 )
 
 
@@ -81,6 +81,21 @@ class Echo(System):
 
     _pack = PACK
     _ty = "echo"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, input: Sources[Ping] = ()) -> None:
+        super().__init__({"input": input}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Dice(System):
+    "Replaces each ping's count with a draw from the target seed."
+
+    _pack = PACK
+    _ty = "dice"
     _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
 
     def __init__(self, *, input: Sources[Ping] = ()) -> None:

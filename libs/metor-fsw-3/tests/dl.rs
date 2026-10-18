@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use common::{Ping, fixture_lib};
 use metor_fsw_3::coordinator::{
-    BuildError, Coordinator, CoordinatorConfig, InputConfig, ParamError, PortRef, SystemConfig,
-    SystemTable,
+    BuildError, Coordinator, CoordinatorConfig, InputConfig, MakeError, ParamError, PortRef,
+    SystemConfig, SystemTable,
 };
 use metor_fsw_3::{DlPack, EndReason, Input, Output, Pack, PackError, Record, Timestamp, system};
 
@@ -150,6 +150,7 @@ fn test_pack_reports_system_metadata() {
             "sampler",
             "meter",
             "echo",
+            "dice",
             "relay",
             "tap",
             "spin",
@@ -274,6 +275,20 @@ fn test_pack_transfers_record() {
     assert_eq!(panicked(&coordinator).len(), 0);
 }
 
+/// A pack system's `Rng` draws from the host's target seed.
+#[test]
+fn test_pack_rng_draws_from_the_target_seed() {
+    let pack = open();
+    let (mut config, seen) = pipeline("dice", serde_json::Value::Null);
+    config.seed = 7;
+    let mut coordinator = config.build(&table(&pack, &seen)).expect("builds");
+    coordinator.step(Timestamp(1));
+    coordinator.step(Timestamp(2));
+    let mut rng = metor_fsw_3::Rng::seeded(7, "middle.rng");
+    let want: Vec<u32> = (0..2).map(|_| rng.next_u64() as u32).collect();
+    assert_eq!(*seen.borrow(), want);
+}
+
 #[test]
 fn test_async_pack_transfers_record() {
     let (mut coordinator, seen, _pack) = built("relay", serde_json::Value::Null);
@@ -308,7 +323,7 @@ fn test_param_error_identifies_system() {
     };
     assert!(matches!(
         error,
-        BuildError::Params { ref id, source: ParamError::UnknownKey(ref key) }
+        BuildError::Make { ref id, source: MakeError::Params(ParamError::UnknownKey(ref key)) }
             if id == "middle" && key == "gian"
     ));
 }

@@ -13,7 +13,7 @@ use metor_proto::types::Timestamp;
 use tracing_subscriber::layer::SubscriberExt;
 
 use crate::coordinator::{
-    EndReason, MakeCx, ParamError, Params, Step, StepCx, StepState, SystemTable,
+    EndReason, MakeCx, MakeError, ParamError, Params, Step, StepCx, StepState, SystemTable,
 };
 use crate::def::DefError;
 use crate::io::IoState;
@@ -25,7 +25,7 @@ use raw::{RawRing, RawSlice};
 /// The ABI version of the exports in this module.
 ///
 /// The host refuses to load a pack whose version does not match its own.
-pub const ABI_VERSION: u32 = 13;
+pub const ABI_VERSION: u32 = 14;
 
 /// The status word [`execute`] returns.
 ///
@@ -86,7 +86,7 @@ impl Status {
     }
 }
 
-/// The status words returned by the descriptor and definition exports.
+/// The status words returned by the descriptor, definition and create exports.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DefStatus {
@@ -94,7 +94,8 @@ pub enum DefStatus {
     TooSmall = 1,
     Encode = 2,
     Panicked = 3,
-    /// The type rejected the config. `dst` holds the [`DefError`] as JSON.
+    /// The type rejected the config. `dst` holds the [`DefError`], or for
+    /// `create` the [`MakeError`], as JSON.
     Refused = 4,
 }
 
@@ -119,7 +120,6 @@ thread_local! {
     static THREADS: RefCell<Threads> = RefCell::default();
     /// The IO state of the pack's own systems.
     static IO: RefCell<IoState> = RefCell::default();
-    static ERROR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 fn with_table<R>(build: fn() -> SystemTable, f: impl FnOnce(&SystemTable) -> R) -> R {
@@ -243,7 +243,7 @@ fn write_json<T: serde::Serialize>(
     }
 }
 
-/// The arguments of `metor_fsw_create`, but its error slot.
+/// The arguments of `metor_fsw_create`, but its result slots.
 pub struct CreateArgs {
     pub ty: RawSlice,
     pub params: RawSlice,
@@ -256,46 +256,62 @@ pub struct CreateArgs {
     /// empty on its first make; out, the region in use, or empty for a
     /// system with no IO.
     pub table: *mut RawRing,
+    /// The target seed every `Rng` parameter draws from.
+    pub seed: u64,
 }
 
-/// Creates one system instance on the rings the host passed in.
+/// Creates one system instance on the rings the host passed in, and writes
+/// it through `instance`.
 ///
-/// Returns null on failure. If the failure has a [`ParamError`], it is written
-/// through `error` as JSON. If the failure was a panic, `error` is an empty
-/// slice.
+/// Returns the status. If the type refuses to make, the [`MakeError`] is
+/// written into `dst` as JSON and the status is `Refused`. On any failure,
+/// `instance` is null.
 ///
 /// # Safety
 /// Each slice in `args` meets the contract of [`RawSlice::as_slice`]. Every
 /// ring, and a non-empty `table`, has live, valid ownership callbacks
-/// covering its region. `table` and `error` are writable and do not alias
-/// the input arrays. Calls on this thread must not reenter `create`.
+/// covering its region. `dst` must point to `capacity` writable bytes, or be
+/// null when `capacity` is zero. `table`, `instance` and `written` are
+/// writable, and none of the outputs alias each other or the input arrays.
+/// Calls on this thread must not reenter `create`.
 pub unsafe fn create(
     build: fn() -> SystemTable,
     args: CreateArgs,
-    error: *mut RawSlice,
-) -> *mut c_void {
-    // SAFETY: the caller supplies a writable result pointer.
-    unsafe { error.write(RawSlice::EMPTY) };
+    instance: *mut *mut c_void,
+    dst: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> u32 {
+    // SAFETY: the caller supplies writable result pointers.
+    unsafe {
+        instance.write(core::ptr::null_mut());
+        written.write(0);
+    }
     crate::panic::catch(|| {
         // SAFETY: the caller's arrays, region, and ownership callbacks remain
         // valid here.
         match unsafe { make(build, args) } {
-            Ok(step) => Box::into_raw(Box::new(StepState::Live(step))).cast(),
+            Ok(step) => {
+                let step = Box::into_raw(Box::new(StepState::Live(step)));
+                // SAFETY: `instance` remains writable for this call.
+                unsafe { instance.write(step.cast()) };
+                DefStatus::Ok
+            }
             Err(source) => {
-                // SAFETY: `error` remains writable for this call.
-                unsafe { error.write(store_error(&source)) };
-                core::ptr::null_mut()
+                // SAFETY: the caller's contract.
+                let mut out = unsafe { out_buf(dst, capacity) };
+                write_json(&mut out, &source, written, DefStatus::Refused)
             }
         }
     })
-    .unwrap_or(core::ptr::null_mut())
+    .unwrap_or(DefStatus::Panicked) as u32
 }
 
 /// Looks up `ty`, attaches every ring, and creates the system on them.
 ///
 /// # Safety
 /// The same as for [`create`].
-unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn Step>, ParamError> {
+unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn Step>, MakeError> {
     let CreateArgs {
         ty,
         params,
@@ -303,14 +319,17 @@ unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn S
         inputs,
         outputs,
         table,
+        seed,
     } = args;
     // SAFETY: the caller's contract.
     let (ty, params, def) = unsafe { (ty.as_bytes(), params.as_bytes(), def.as_bytes()) };
     let ty = core::str::from_utf8(ty).map_err(|e| ParamError::Decode(e.to_string()))?;
 
     let value = decode_params(params)?;
-    let instance: Instance =
-        serde_json::from_slice(def).map_err(|e| ParamError::Decode(e.to_string()))?;
+    let instance = Instance {
+        seed,
+        ..serde_json::from_slice(def).map_err(|e| ParamError::Decode(e.to_string()))?
+    };
     // SAFETY: the caller's contract.
     let (ports, out_rings) =
         unsafe { (inputs.as_slice::<RawSlice>(), outputs.as_slice::<RawRing>()) };
@@ -358,7 +377,7 @@ fn make_step(
     views: Vec<Vec<&RingBuffer>>,
     writers: Vec<&RingBuffer>,
     io: &mut IoState,
-) -> Result<Box<dyn Step>, ParamError> {
+) -> Result<Box<dyn Step>, MakeError> {
     with_table(build, |table| {
         let entry = table
             .get(ty)
@@ -377,7 +396,7 @@ fn make_step(
                 outputs: writers,
                 threads,
                 io,
-                seed: None,
+                seed: instance.seed,
                 namespace: None,
                 records: &records,
             })
@@ -386,21 +405,11 @@ fn make_step(
 }
 
 /// Decodes the params JSON. Empty bytes mean no params.
-fn decode_params(bytes: &[u8]) -> Result<serde_json::Value, ParamError> {
+fn decode_params(bytes: &[u8]) -> Result<serde_json::Value, MakeError> {
     if bytes.is_empty() {
         return Ok(serde_json::Value::Null);
     }
-    serde_json::from_slice(bytes).map_err(|e| ParamError::Decode(e.to_string()))
-}
-
-/// Serializes `source` into this thread's error buffer.
-fn store_error(source: &ParamError) -> RawSlice {
-    ERROR.with_borrow_mut(|buf| {
-        buf.clear();
-        // If the error fails to serialize, the host gets an empty slice.
-        let _ = serde_json::to_writer(&mut *buf, source);
-        RawSlice::of(buf)
-    })
+    serde_json::from_slice(bytes).map_err(|e| ParamError::Decode(e.to_string()).into())
 }
 
 /// Runs one cycle of an instance.
@@ -507,8 +516,12 @@ macro_rules! export_pack {
             inputs: $crate::pack::raw::RawSlice,
             outputs: $crate::pack::raw::RawSlice,
             table: *mut $crate::pack::raw::RawRing,
-            error: *mut $crate::pack::raw::RawSlice,
-        ) -> *mut ::core::ffi::c_void {
+            seed: u64,
+            instance: *mut *mut ::core::ffi::c_void,
+            dst: *mut u8,
+            capacity: usize,
+            written: *mut usize,
+        ) -> u32 {
             let args = $crate::pack::CreateArgs {
                 ty,
                 params,
@@ -516,8 +529,9 @@ macro_rules! export_pack {
                 inputs,
                 outputs,
                 table,
+                seed,
             };
-            unsafe { $crate::pack::create($build, args, error) }
+            unsafe { $crate::pack::create($build, args, instance, dst, capacity, written) }
         }
 
         #[unsafe(no_mangle)]

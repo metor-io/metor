@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use metor_fsw_3_ring::RingBuffer;
 
-use crate::coordinator::{BuildError, ParamError, Step, SystemTable, TableEntry};
+use crate::coordinator::{BuildError, MakeError, Step, SystemTable, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::io::IoState;
 use crate::pack::ABI_VERSION;
@@ -92,7 +92,7 @@ impl Pack {
         instance: &Instance,
         rings: InstanceRings<'_>,
         io: &mut IoState,
-    ) -> Result<Box<dyn Step>, ParamError> {
+    ) -> Result<Box<dyn Step>, MakeError> {
         let arena = io.arena(&instance.id);
         let mut table = arena.as_deref().map_or(RawRing::EMPTY, RawRing::from_arena);
         let step: Box<dyn Step> = match self {
@@ -155,6 +155,7 @@ impl TableEntry {
                     id: cx.id.to_string(),
                     def: cx.def.clone(),
                     adapter: cx.adapter.cloned(),
+                    seed: cx.seed,
                 };
                 let rings = InstanceRings {
                     inputs: &cx.inputs,
