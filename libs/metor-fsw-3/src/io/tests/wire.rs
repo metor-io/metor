@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::io::*;
-use crate::record::{DecodeError, Record};
+use crate::record::{DecodeError, Payload};
 
 fn ops() -> Vec<Op> {
     let addr: SocketAddr = "[::1]:9000".parse().unwrap();

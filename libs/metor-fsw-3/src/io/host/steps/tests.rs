@@ -85,7 +85,7 @@ fn stale(slot: u16) -> Sqe {
 impl Rig {
     fn pass(&mut self, sqes: impl IntoIterator<Item = Sqe>) {
         sqes.into_iter()
-            .for_each(|sqe| self.sq.write_bytes(sqe.as_bytes()).unwrap());
+            .for_each(|sqe| self.sq.write(sqe.as_bytes()).unwrap());
         self.step.execute(Timestamp(1));
     }
 
@@ -152,7 +152,7 @@ fn bad_records_fault() {
         &Op::GpioGet,
         Span::default(),
     )]);
-    r.sq.write_bytes(&[1, 2, 3]).unwrap();
+    r.sq.write(&[1, 2, 3]).unwrap();
     r.pass([]);
     assert_eq!(r.faults(), ["io_rejected", "io_corrupt"]);
     assert!(r.slots().is_empty());

@@ -10,7 +10,7 @@ use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 use super::{Errno, IoError, IoStatus, MAX_OPS};
-use crate::record::{DecodeError, EncodeError, MsgCodec, Record, RecordSchema};
+use crate::record::{DecodeError, EncodeError, MsgCodec, Payload, Record, RecordSchema};
 
 /// Bytes in the submitting system's arena.
 #[derive(
@@ -632,11 +632,7 @@ impl Cqe {
     }
 }
 
-impl Record for Sqe {
-    const NAME: &'static str = "io_sqe";
-    const MAX_LEN: usize = size_of::<Sqe>();
-    /// A system's ops in flight, plus a cancel for each.
-    const DEPTH: usize = 2 * MAX_OPS;
+impl Payload for Sqe {
     type Read<'a> = Sqe;
 
     fn encode<'a>(&'a self, _buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
@@ -646,16 +642,20 @@ impl Record for Sqe {
     fn decode(bytes: &[u8]) -> Result<Sqe, DecodeError> {
         decode(bytes)
     }
+}
 
-    fn schema() -> RecordSchema {
+impl Record for Sqe {
+    const NAME: &'static str = "io_sqe";
+    const MAX_LEN: usize = size_of::<Sqe>();
+    /// A system's ops in flight, plus a cancel for each.
+    const DEPTH: usize = 2 * MAX_OPS;
+
+    fn schema_with_root(_root: &str) -> RecordSchema {
         RecordSchema::msg(Self::NAME, MsgCodec::Other("io.sqe".into()))
     }
 }
 
-impl Record for Cqe {
-    const NAME: &'static str = "io_cqe";
-    const MAX_LEN: usize = size_of::<Cqe>();
-    const DEPTH: usize = MAX_OPS;
+impl Payload for Cqe {
     type Read<'a> = Cqe;
 
     fn encode<'a>(&'a self, _buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
@@ -665,8 +665,14 @@ impl Record for Cqe {
     fn decode(bytes: &[u8]) -> Result<Cqe, DecodeError> {
         decode(bytes)
     }
+}
 
-    fn schema() -> RecordSchema {
+impl Record for Cqe {
+    const NAME: &'static str = "io_cqe";
+    const MAX_LEN: usize = size_of::<Cqe>();
+    const DEPTH: usize = MAX_OPS;
+
+    fn schema_with_root(_root: &str) -> RecordSchema {
         RecordSchema::msg(Self::NAME, MsgCodec::Other("io.cqe".into()))
     }
 }
