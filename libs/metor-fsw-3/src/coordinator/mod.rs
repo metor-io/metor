@@ -32,7 +32,7 @@ pub use params::{MakeError, ParamError, Params};
 pub use run::Coordinator;
 pub use status::SystemStatus;
 pub(crate) use step::catch_execute;
-pub use step::{EndReason, LoadError, Occupant, Step};
+pub use step::{EndReason, LoadError, Occupant, Step, StepCx};
 #[cfg(feature = "host")]
 pub(crate) use table::MakeFn;
 pub(crate) use table::TableEntry;

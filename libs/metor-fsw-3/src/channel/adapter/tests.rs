@@ -160,7 +160,7 @@ struct Slot {
 }
 
 impl Step for Slot {
-    fn execute(&mut self, _now: Timestamp) {
+    fn execute(&mut self, _now: Timestamp, _cx: &mut crate::coordinator::StepCx<'_>) {
         self.end = self.shared.0.borrow().slot_end.clone();
     }
 

@@ -24,8 +24,8 @@ use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogLevel;
 
 use crate::async_system::{AsyncSystem, Running, Stop};
-use crate::coordinator::{EndReason, MakeCx, MakeError, Params, Step};
-use crate::def::Records;
+use crate::coordinator::{EndReason, MakeCx, MakeError, Params, Step, StepCx};
+use crate::fn_system::Instance;
 use crate::mirror::{Mirror, Mirrors};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef};
 
@@ -155,6 +155,7 @@ where
     A: AsyncSystem + 'static,
     M: Fn(LaunchCx<'_>) -> Result<Launched<A>, MakeError> + Send + Sync + 'static,
 {
+    let instance = Instance::from_make_cx(&cx);
     let thread_name = cx.thread().to_string();
     let bound = Bound::new(cx.def, cx.inputs, cx.outputs)?;
     let panicked = Panicked::default();

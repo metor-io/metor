@@ -11,6 +11,7 @@ use metor_proto::types::Timestamp;
 use crate::{
     Rng,
     channel::{ABORT_PORT, Abort, AbortRequest},
+    coordinator::ParamError,
     def::{DefCx, DefError, Records},
     frame::Frame,
     io::{Cqe, GrantDef, IO_CQ, IO_SQ, Io, IoPorts, Sqe},
@@ -609,7 +610,10 @@ impl<D: WakeSink + 'static> Param for Abort<D> {
         Abort::new(<Input<AbortRequest> as Param>::bind_in(views))
     }
 
-    fn bind_out(_writers: &mut Writers) {}
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
+        param_name(names);
+        Ok(())
+    }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
         input: &'a mut Self::In<W>,
@@ -636,7 +640,10 @@ impl Param for Seq<'static> {
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
-    fn bind_out(_writers: &mut Writers) {}
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
+        param_name(names);
+        Ok(())
+    }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
         _input: &'a mut (),

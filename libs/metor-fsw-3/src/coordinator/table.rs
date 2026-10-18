@@ -12,7 +12,7 @@ use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, InSet, OutSet, SystemFn};
-use crate::io::{Io, SharedIo};
+use crate::io::{Io, IoState};
 use crate::port::{Input, Output};
 use crate::sequence::{self, SequenceFn, SequenceStep};
 use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
@@ -476,7 +476,8 @@ impl TableEntry {
                 // PANIC Safety: `def` declares `abort` first, and build binds one
                 // list per declared input.
                 let abort = Input::new(views.next().expect("the abort binding").views);
-                let (ins, outs, io) = fn_system::bind::<S>(views.collect(), writers, instance)?;
+                let (ins, outs, io) =
+                    fn_system::bind_with_io::<S>(views.collect(), writers, instance, cx.io)?;
                 let state = ctor.make_with_io(cx.id, cx.params, io.as_ref())?;
                 Ok(Box::new(SequenceStep::new::<S>(state, abort, ins, outs)))
             }),

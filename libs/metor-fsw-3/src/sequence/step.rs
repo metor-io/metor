@@ -11,7 +11,7 @@ use metor_fsw_3_ring::NoWake;
 use metor_proto::types::Timestamp;
 
 use crate::channel::{Abort, AbortRequest};
-use crate::coordinator::{EndReason, Step};
+use crate::coordinator::{EndReason, Step, StepCx};
 use crate::fn_system::{Cycle, InSet, OutSet, Param};
 use crate::log::{self, LogPort};
 use crate::port::{Input, Samplers};
@@ -88,7 +88,7 @@ async fn run<S: SequenceFn>(
 }
 
 impl Step for SequenceStep {
-    fn execute(&mut self, now: Timestamp) {
+    fn execute(&mut self, now: Timestamp, _cx: &mut StepCx<'_>) {
         self.seq.set_now(now);
         if self.abort.requested() {
             let _ = self.seq.abort();

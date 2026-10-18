@@ -137,16 +137,18 @@ fn step_over<S: SequenceFn>(
         .collect();
     let mut inputs = inputs.into_iter();
     let abort = crate::port::Input::new(inputs.next().expect("the abort binding").views);
-    let io = crate::io::SharedIo::default();
     let instance = crate::fn_system::Instance {
-        io: &io,
-        id: "seq",
-        namespace: None,
+        id: "seq".into(),
         seed: Some(0),
-        records: &Default::default(),
+        ..Default::default()
     };
-    let (ins, outs, _io) =
-        crate::fn_system::bind::<S>(inputs.collect(), outputs, instance).expect("binds");
+    let (ins, outs, _io) = crate::fn_system::bind_with_io::<S>(
+        inputs.collect(),
+        outputs,
+        instance,
+        &mut Default::default(),
+    )
+    .expect("binds");
     (SequenceStep::new::<S>(state, abort, ins, outs), rings)
 }
 
@@ -194,7 +196,10 @@ fn test_failed_writes_fault_after_the_poll() {
     let (mut step, rings) = step_of(flood(), ());
     let mut samples = utils::input::<Imu>(&rings[0]);
     let mut lines = utils::input::<metor_proto_wkt::LogEvent>(&rings[1]);
-    step.execute(ms(1));
+    step.execute(
+        ms(1),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
     assert_eq!(step.ended(), Some(&EndReason::Completed));
     let landed = samples.drain().count();
     let lines: Vec<_> = lines.drain().map(|line| line.expect("decodes")).collect();
@@ -211,11 +216,20 @@ fn test_failed_writes_fault_after_the_poll() {
 fn test_sequence_completes() {
     let phase = Phase::default();
     let (mut step, _rings) = step_of(phases(), phase.clone());
-    step.execute(ms(0));
+    step.execute(
+        ms(0),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
     assert_eq!((phase.0.get(), step.ended()), (1, None));
-    step.execute(ms(1));
+    step.execute(
+        ms(1),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
     assert_eq!((phase.0.get(), step.ended()), (2, None));
-    step.execute(ms(2));
+    step.execute(
+        ms(2),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
     assert_eq!(
         (phase.0.get(), step.ended()),
         (3, Some(&EndReason::Completed))
@@ -226,10 +240,19 @@ fn test_sequence_completes() {
 fn test_paused_step_resumes_at_its_await() {
     let phase = Phase::default();
     let (mut step, _rings) = step_of(phases(), phase.clone());
-    step.execute(ms(0));
-    step.execute(ms(1));
+    step.execute(
+        ms(0),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
+    step.execute(
+        ms(1),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
     // Cycles 2 to 9 pass with the step not executed, as a stopped channel's.
-    step.execute(ms(10));
+    step.execute(
+        ms(10),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
     assert_eq!(
         (phase.0.get(), step.ended()),
         (3, Some(&EndReason::Completed))
@@ -240,10 +263,19 @@ fn test_paused_step_resumes_at_its_await() {
 fn test_sleep_counts_paused_time() {
     let phase = Phase::default();
     let (mut step, _rings) = step_of(napper(), phase.clone());
-    step.execute(ms(0));
-    step.execute(ms(5));
+    step.execute(
+        ms(0),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
+    step.execute(
+        ms(5),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
     assert_eq!(phase.0.get(), 0);
-    step.execute(ms(40));
+    step.execute(
+        ms(40),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
     assert_eq!(
         (phase.0.get(), step.ended()),
         (1, Some(&EndReason::Completed))
@@ -254,10 +286,19 @@ fn test_sleep_counts_paused_time() {
 fn test_ended_step_polls_nothing() {
     let phase = Phase::default();
     let (mut step, _rings) = step_of(napper(), phase.clone());
-    step.execute(ms(0));
-    step.execute(ms(10));
+    step.execute(
+        ms(0),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
+    step.execute(
+        ms(10),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
     phase.0.set(7);
-    step.execute(ms(20));
+    step.execute(
+        ms(20),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
     assert_eq!(
         (phase.0.get(), step.ended()),
         (7, Some(&EndReason::Completed))
@@ -871,7 +912,10 @@ fn step_on_imu<S: SequenceFn<State = ()>>(
 #[test]
 fn test_ended_sequence_releases_its_samples() {
     let (mut step, mut imu, _rings) = step_on_imu(glance());
-    step.execute(ms(0));
+    step.execute(
+        ms(0),
+        &mut crate::coordinator::StepCx::new(&mut Default::default()),
+    );
     assert_eq!(step.ended(), Some(&EndReason::Completed));
     for at in 0..16 {
         assert!(
@@ -941,7 +985,10 @@ fn run_past_its_end<S: SequenceFn<State = ()>>(sequence: fn() -> S, sample: f64)
     let (mut step, mut imu, _rings) = step_on_imu(sequence());
     for at in 0..6 {
         let _ = imu.write(&Imu::new(ms(at).0, sample));
-        step.execute(ms(at));
+        step.execute(
+            ms(at),
+            &mut crate::coordinator::StepCx::new(&mut Default::default()),
+        );
     }
     step.ended().cloned().expect("an ended sequence")
 }

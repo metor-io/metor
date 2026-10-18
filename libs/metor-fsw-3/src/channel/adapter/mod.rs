@@ -13,11 +13,11 @@ use metor_proto_wkt::{
 };
 
 use crate::coordinator::{
-    Adapter, ChannelConfig, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step,
+    Adapter, ChannelConfig, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, StepCx,
     catch_execute,
 };
 use crate::def::{DefCx, Records};
-use crate::io::SharedIo;
+use crate::io::IoState;
 use crate::port::{Input, Output, ring_capacity};
 use crate::record::Record;
 use crate::system::{PortDef, SystemDef};
@@ -89,13 +89,12 @@ pub(crate) fn make_channel(
         params: cx.params.0.clone(),
         inputs,
         outputs: cx.outputs.into_iter().cloned().collect(),
-        io: cx.io.clone(),
         seed: cx.seed,
         namespace: cx.namespace.map(str::to_string),
         records: cx.records.clone(),
     };
     let mut threads = Threads::default();
-    let inner = recipe.make(&mut threads)?;
+    let inner = recipe.make(&mut threads, cx.io)?;
     Ok(Box::new(Channel {
         commands: command_input(commands),
         core: Core {
@@ -160,14 +159,13 @@ struct SystemRecipe {
     params: serde_json::Value,
     inputs: Vec<Vec<RingBuffer>>,
     outputs: Vec<RingBuffer>,
-    io: SharedIo,
     seed: Option<u64>,
     namespace: Option<String>,
     records: Arc<Records>,
 }
 
 impl SystemRecipe {
-    fn make(&self, threads: &mut Threads) -> Result<Box<dyn Step>, ParamError> {
+    fn make(&self, threads: &mut Threads, io: &mut IoState) -> Result<Box<dyn Step>, ParamError> {
         (self.make)(MakeCx {
             id: &self.id,
             adapter: Some(&self.adapter),
@@ -180,7 +178,7 @@ impl SystemRecipe {
                 .collect(),
             outputs: self.outputs.iter().collect(),
             threads,
-            io: &self.io,
+            io,
             seed: self.seed,
             namespace: self.namespace.as_deref(),
             records: &self.records,
@@ -233,22 +231,22 @@ impl ChannelPhase {
 }
 
 impl Step for Channel {
-    fn execute(&mut self, now: Timestamp) {
+    fn execute(&mut self, now: Timestamp, cx: &mut StepCx<'_>) {
         let Self { commands, core } = self;
         for command in commands.drain() {
             match command {
-                Ok(command) if command.channel == core.name => core.command(command.command),
+                Ok(command) if command.channel == core.name => core.command(command.command, cx.io),
                 _ => {}
             }
         }
-        core.step(now);
+        core.step(now, cx);
     }
 }
 
 impl Core {
-    fn command(&mut self, kind: SequenceCommandKind) {
+    fn command(&mut self, kind: SequenceCommandKind, io: &mut IoState) {
         let event = match apply(self.state(), Command::of(&kind)) {
-            Ok(()) => self.transition(kind),
+            Ok(()) => self.transition(kind, io),
             Err(refusal) => SequenceEventKind::refused(refusal.to_string()),
         };
         self.emit(event);
@@ -270,7 +268,7 @@ impl Core {
         }
     }
 
-    fn transition(&mut self, kind: SequenceCommandKind) -> SequenceEventKind {
+    fn transition(&mut self, kind: SequenceCommandKind, io: &mut IoState) -> SequenceEventKind {
         match kind {
             SequenceCommandKind::Start => {
                 self.set_run(RunState::Running);
@@ -281,8 +279,8 @@ impl Core {
                 SequenceEventKind::Stopped
             }
             SequenceCommandKind::Abort => self.abort(),
-            SequenceCommandKind::Reset => self.reset(),
-            SequenceCommandKind::Load { name } => self.defer_load(name),
+            SequenceCommandKind::Reset => self.reset(io),
+            SequenceCommandKind::Load { name } => self.defer_load(name, io),
         }
     }
 
@@ -307,17 +305,17 @@ impl Core {
 
     /// Resets the system. An IO system is dropped now and made again once its
     /// ops in flight finish.
-    fn reset(&mut self) -> SequenceEventKind {
-        if !self.has_io() {
-            return self.restart_event();
+    fn reset(&mut self, io: &mut IoState) -> SequenceEventKind {
+        if !self.has_io(io) {
+            return self.restart_event(io);
         }
         self.phase = ChannelPhase::Restarting;
-        self.recipe.io.borrow_mut().quiesce_system(&self.recipe.id);
+        io.quiesce_system(&self.recipe.id);
         SequenceEventKind::quiescing()
     }
 
-    fn restart_event(&mut self) -> SequenceEventKind {
-        match self.restart() {
+    fn restart_event(&mut self, io: &mut IoState) -> SequenceEventKind {
+        match self.restart(io) {
             Ok(()) => SequenceEventKind::Loaded {
                 name: self.loaded_name(),
             },
@@ -328,7 +326,7 @@ impl Core {
     /// Loads the last loaded name again, stopped.
     ///
     /// If the system is gone or has nothing loaded, builds it again first.
-    fn restart(&mut self) -> Result<(), String> {
+    fn restart(&mut self, io: &mut IoState) -> Result<(), String> {
         let phase = core::mem::replace(&mut self.phase, ChannelPhase::Restarting);
         let kept = match (phase, &self.loaded) {
             (ChannelPhase::Live { inner, .. }, Some(_)) => Some(inner),
@@ -336,7 +334,7 @@ impl Core {
         };
         let mut inner = match kept {
             Some(inner) => inner,
-            None => self.remake()?,
+            None => self.remake(io)?,
         };
         if let Some(name) = &self.loaded {
             crate::panic::catch(|| inner.load(name))
@@ -352,16 +350,16 @@ impl Core {
 
     /// Loads `name`. On an IO system whose step loads occupants, the load
     /// waits for its ops in flight. Any other step loads, or refuses, at once.
-    fn defer_load(&mut self, name: String) -> SequenceEventKind {
+    fn defer_load(&mut self, name: String, io: &mut IoState) -> SequenceEventKind {
         let loads = self
             .phase
             .inner()
             .is_some_and(|inner| inner.occupant().is_some());
-        let defer = loads && self.has_io();
+        let defer = loads && self.has_io(io);
         match core::mem::replace(&mut self.phase, ChannelPhase::Restarting) {
             ChannelPhase::Live { inner, .. } if defer => {
                 self.phase = ChannelPhase::Loading { inner, name };
-                self.recipe.io.borrow_mut().quiesce_system(&self.recipe.id);
+                io.quiesce_system(&self.recipe.id);
                 SequenceEventKind::quiescing()
             }
             ChannelPhase::Live { inner, run } => self.load(inner, run, name),
@@ -373,19 +371,19 @@ impl Core {
     }
 
     /// Whether the system does IO.
-    fn has_io(&self) -> bool {
-        self.recipe.io.borrow().index(&self.recipe.id).is_some()
+    fn has_io(&self, io: &IoState) -> bool {
+        io.index(&self.recipe.id).is_some()
     }
 
     /// Runs the deferred reset or load once the system is idle.
-    fn settle(&mut self) {
+    fn settle(&mut self, io: &mut IoState) {
         let id = &self.recipe.id;
-        if !self.recipe.io.borrow().is_system_idle(id) {
+        if !io.is_system_idle(id) {
             return;
         }
-        self.recipe.io.borrow_mut().end_quiescing_system(id);
+        io.end_quiescing_system(id);
         let event = match core::mem::replace(&mut self.phase, ChannelPhase::Restarting) {
-            ChannelPhase::Restarting => self.restart_event(),
+            ChannelPhase::Restarting => self.restart_event(io),
             ChannelPhase::Loading { inner, name } => self.load(inner, RunState::Stopped, name),
             phase => {
                 self.phase = phase;
@@ -420,8 +418,8 @@ impl Core {
 
     /// Builds the system again over the same rings. The old one must already
     /// be dropped.
-    fn remake(&mut self) -> Result<Box<dyn Step>, String> {
-        let made = crate::panic::catch(|| self.recipe.make(&mut self.threads))
+    fn remake(&mut self, io: &mut IoState) -> Result<Box<dyn Step>, String> {
+        let made = crate::panic::catch(|| self.recipe.make(&mut self.threads, io))
             .ok_or_else(|| "the system's constructor panicked".to_string())?;
         made.map_err(|e| e.to_string())
     }
@@ -444,17 +442,17 @@ impl Core {
             .unwrap_or_else(|| self.recipe.id.clone())
     }
 
-    fn step(&mut self, now: Timestamp) {
+    fn step(&mut self, now: Timestamp, cx: &mut StepCx<'_>) {
         if matches!(
             self.phase,
             ChannelPhase::Restarting | ChannelPhase::Loading { .. }
         ) {
-            self.settle();
+            self.settle(cx.io);
         } else if let ChannelPhase::Live {
             inner,
             run: RunState::Running,
         } = &mut self.phase
-            && catch_execute(inner.as_mut(), now)
+            && catch_execute(inner.as_mut(), now, cx)
         {
             let panicked = ChannelPhase::Gone(EndReason::Panicked);
             let phase = core::mem::replace(&mut self.phase, panicked);
