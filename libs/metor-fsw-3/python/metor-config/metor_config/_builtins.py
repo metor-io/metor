@@ -6,9 +6,10 @@
 These systems are built into the host rather than supplied by a pack, so
 their pack has no library and is left out of the config's pack list.
 
-The two link systems (`Publish` and `Subscribe`) each take exactly one
-transport: a `listen` address, a `connect` address, or a `peer` link in
-the same deployment, which `metor build` turns into an address.
+The two link systems (`Publish` and `Subscribe`) each take one
+`transport`: `Listen` on an address, `Connect` to an address, or dial a
+`Peer` link in the same deployment, which `metor build` turns into an
+address.
 """
 
 from __future__ import annotations
@@ -40,6 +41,54 @@ CONN_CAP = 1 << 20
 INBOUND_CAP = 256
 
 
+@dataclass(frozen=True)
+class Listen:
+    """Listen on ``addr`` and serve up to ``max_connections`` peers at once."""
+
+    addr: str
+    max_connections: int = MAX_CONNECTIONS
+
+    def __post_init__(self) -> None:
+        if self.max_connections < 1:
+            raise ConfigError("a listening link takes at least one connection")
+
+    @property
+    def port(self) -> int:
+        """The port in ``addr``."""
+        return int(self.addr.rsplit(":", 1)[1])
+
+    def to_json(self) -> dict[str, Any]:
+        return {"listen": {"addr": self.addr, "max_connections": self.max_connections}}
+
+
+@dataclass(frozen=True)
+class Connect:
+    """Dial ``addr`` and keep one connection open."""
+
+    addr: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {"connect": {"addr": self.addr}}
+
+
+@dataclass(frozen=True)
+class Peer:
+    """Dial ``link``, a link on another target in the same deployment."""
+
+    link: SystemHandle
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.link, SystemHandle) or not isinstance(self.link._system, Link):
+            raise ConfigError(f"`Peer` takes a link's handle, got {self.link!r}")
+
+    def to_json(self) -> dict[str, Any]:
+        return {"peer": {"target": _namespace(self.link), "link": self.link._name}}
+
+
+Transport = Listen | Connect | Peer
+"""How a link gets its connections."""
+
+
 class Link(System):
     """Base class for systems that send or receive records over a network
     connection.
@@ -50,37 +99,33 @@ class Link(System):
     def __init__(
         self,
         params: dict[str, Any],
-        listen: str | None,
-        connect: str | None,
-        peer: SystemHandle | None,
-        max_connections: int | None,
+        transport: Transport,
         items: Sequence[Item] = (),
         records: Sequence[type[Record]] = (),
     ) -> None:
-        self._peer = _peer(peer)
-        self._transport = _transport(listen, connect, peer, max_connections)
+        if not isinstance(transport, (Listen, Connect, Peer)):
+            raise ConfigError(
+                f"a link's transport is a `Listen`, `Connect`, or `Peer`, got {transport!r}"
+            )
+        self._transport = transport
         super().__init__({}, params, items=items, records=records)
+
+    @property
+    def _peer(self) -> SystemHandle | None:
+        return self._transport.link if isinstance(self._transport, Peer) else None
 
     def _params_for(self, target: Any, index: int) -> Any:
         link = target._systems[index].name
         return {
-            "transport": self._transport_json(),
+            "transport": self._transport.to_json(),
             "namespace": target.namespace,
             "link": link,
             **self._params,
         }
 
-    def _transport_json(self) -> dict[str, Any]:
-        if self._peer is None:
-            return self._transport
-        return {"peer": {"target": _namespace(self._peer), "link": self._peer._name}}
-
     def listen_port(self) -> int | None:
         """Returns the port this link listens on, or `None` if it dials."""
-        listen = self._transport.get("listen") if self._peer is None else None
-        if listen is None:
-            return None
-        return int(listen["addr"].rsplit(":", 1)[1])
+        return self._transport.port if isinstance(self._transport, Listen) else None
 
 
 class Sink(Link):
@@ -92,14 +137,11 @@ class Sink(Link):
     def __init__(
         self,
         params: dict[str, Any],
-        listen: str | None,
-        connect: str | None,
-        peer: SystemHandle | None,
-        max_connections: int | None,
+        transport: Transport,
         items: Sequence[Item],
         all: bool,
     ) -> None:
-        super().__init__(params, listen, connect, peer, max_connections, items=items)
+        super().__init__(params, transport, items=items)
         self._items = list(items)
         self._all = all
 
@@ -122,14 +164,12 @@ class Publish(Sink, _generated.Publish):
     def __init__(
         self,
         items: Sequence[Item] = (),
-        listen: str | None = None,
-        connect: str | None = None,
-        peer: SystemHandle | None = None,
-        max_connections: int | None = None,
+        *,
+        transport: Transport,
         conn_cap: int = CONN_CAP,
         all: bool = False,
     ) -> None:
-        super().__init__({"conn_cap": conn_cap}, listen, connect, peer, max_connections, items, all)
+        super().__init__({"conn_cap": conn_cap}, transport, items, all)
 
 
 class Subscribe(Link, _generated.Subscribe):
@@ -138,8 +178,8 @@ class Subscribe(Link, _generated.Subscribe):
     `records` lists message classes to accept. Each one gets an output port
     named after the record.
 
-    With a `peer`, the subscriber copies ports that the peer `Publish`
-    serves. `items` lists which of the peer's ports to copy, and each copy
+    With a `Peer` transport, the subscriber copies ports that the peer
+    `Publish` serves. `items` lists which of the peer's ports to copy, and each copy
     keeps its `{system}.{port}` name. A message record gets only one port,
     even if the peer publishes it on several; the first one listed wins.
     With neither `items` nor `records`, it copies everything the peer
@@ -149,22 +189,17 @@ class Subscribe(Link, _generated.Subscribe):
     def __init__(
         self,
         records: Sequence[type[Record]] = (),
-        listen: str | None = None,
-        connect: str | None = None,
-        peer: SystemHandle | None = None,
+        *,
+        transport: Transport,
         items: Sequence[Item] = (),
-        max_connections: int | None = None,
         conn_cap: int = CONN_CAP,
         inbound_cap: int = INBOUND_CAP,
     ) -> None:
-        if items and peer is None:
-            raise ConfigError("`items` names a peer's ports, so it needs `peer`")
+        if items and not isinstance(transport, Peer):
+            raise ConfigError("`items` names a peer's ports, so it needs a `Peer` transport")
         super().__init__(
             {"conn_cap": conn_cap, "inbound_cap": inbound_cap},
-            listen,
-            connect,
-            peer,
-            max_connections,
+            transport,
             records=records,
         )
         self._items = list(items)
@@ -259,36 +294,11 @@ def _published(peer: SystemHandle) -> list[OutPort[Any]]:
     return [sources[0] for sources in inputs.values() if isinstance(sources[0], OutPort)]
 
 
-def _peer(peer: SystemHandle | None) -> SystemHandle | None:
-    if peer is None:
-        return None
-    if not isinstance(peer, SystemHandle) or not isinstance(peer._system, Link):
-        raise ConfigError(f"`peer` takes a link's handle, got {peer!r}")
-    return peer
-
-
 def _namespace(peer: SystemHandle) -> str:
     namespace = peer._target.namespace
     if not namespace:
         raise ConfigError(f"the target of peer `{peer._name}` names no namespace")
     return namespace
-
-
-def _transport(
-    listen: str | None,
-    connect: str | None,
-    peer: SystemHandle | None,
-    max_connections: int | None,
-) -> dict[str, Any]:
-    given = [x is not None for x in (listen, connect, peer)]
-    if given.count(True) != 1:
-        raise ConfigError("a link takes exactly one of `listen`, `connect`, and `peer`")
-    if listen is None:
-        if max_connections is not None:
-            raise ConfigError("a dialing link holds one connection, so it takes no `max_connections`")
-        return {"connect": {"addr": connect}} if connect is not None else {}
-    slots = MAX_CONNECTIONS if max_connections is None else max_connections
-    return {"listen": {"addr": listen, "max_connections": slots}}
 
 
 class DlSlot(_generated.DlSlot):

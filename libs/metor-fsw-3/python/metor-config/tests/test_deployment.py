@@ -9,7 +9,7 @@ from adcs_stub import Ctrl, Imu, LogEvent, Mode, Nav, Ping, Plant
 from test_target import ConfigTest, adcs_target, reset
 
 import metor_config._deployment as deploy_mod
-from metor_config import ConfigError, Deployment, Publish, Subscribe, Target
+from metor_config import ConfigError, Connect, Deployment, Listen, Peer, Publish, Subscribe, Target
 
 GOLDEN = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "tests", "golden", "deployment.json"
@@ -21,15 +21,15 @@ def design_example() -> Deployment:
     a = Target(cycle_rate=100.0, namespace="a")
     plant = a.add("plant", Plant())
     nav = a.add("nav", Nav(imu=plant.imu))
-    a_pub = a.add("pub", Publish(listen="0.0.0.0:2240", all=True))
+    a_pub = a.add("pub", Publish(transport=Listen("0.0.0.0:2240"), all=True))
 
     b = Target(cycle_rate=100.0, namespace="b")
-    mirror = b.add("mirror", Subscribe(peer=a_pub, items=[plant, nav.est]))
+    mirror = b.add("mirror", Subscribe(transport=Peer(a_pub), items=[plant, nav.est]))
     mode = b.add("mode", Mode())
     b.add("ctrl", Ctrl(est=mirror.port(nav.est), mode=mode.cmd))
-    b_pub = b.add("pub", Publish(listen="0.0.0.0:2241", all=True))
+    b_pub = b.add("pub", Publish(transport=Listen("0.0.0.0:2241"), all=True))
 
-    a.add("cmds", Subscribe(peer=b_pub, records=[Ping]))
+    a.add("cmds", Subscribe(transport=Peer(b_pub), records=[Ping]))
     return Deployment(targets=[a, b], hosts={"a": "10.0.0.2"})
 
 
@@ -124,24 +124,24 @@ class DeploymentTest(ConfigTest):
 
     def test_no_items_copies_everything(self) -> None:
         a, plant, b = plant_and_peer()
-        a_pub = a.add("pub", Publish([plant.imu, plant.log], listen="0.0.0.0:2240"))
-        b.add("mirror", Subscribe(peer=a_pub))
+        a_pub = a.add("pub", Publish([plant.imu, plant.log], transport=Listen("0.0.0.0:2240")))
+        b.add("mirror", Subscribe(transport=Peer(a_pub)))
         config = Deployment(targets=[a, b]).to_config()
         outputs = config["targets"][1]["coordinator"]["systems"][0]["outputs"]
         self.assertEqual([o["port"] for o in outputs], ["plant.imu", "plant.log"])
 
     def test_records_alone_copy_nothing(self) -> None:
         a, plant, b = plant_and_peer()
-        a_pub = a.add("pub", Publish([plant], listen="0.0.0.0:2240"))
-        b.add("cmds", Subscribe(peer=a_pub, records=[Ping]))
+        a_pub = a.add("pub", Publish([plant], transport=Listen("0.0.0.0:2240")))
+        b.add("cmds", Subscribe(transport=Peer(a_pub), records=[Ping]))
         config = Deployment(targets=[a, b]).to_config()
         outputs = config["targets"][1]["coordinator"]["systems"][0]["outputs"]
         self.assertEqual(outputs, [{"port": "ping", "record": "ping"}])
 
     def test_port_returns_copy(self) -> None:
         a, plant, b = plant_and_peer()
-        a_pub = a.add("pub", Publish([plant], listen="0.0.0.0:2240"))
-        mirror = b.add("mirror", Subscribe(peer=a_pub, items=[plant]))
+        a_pub = a.add("pub", Publish([plant], transport=Listen("0.0.0.0:2240")))
+        mirror = b.add("mirror", Subscribe(transport=Peer(a_pub), items=[plant]))
         imu = mirror.port(plant.imu)
         self.assertEqual((imu.ref.system, imu.ref.port, imu.record, imu.target), ("mirror", "plant.imu", Imu, b))
         log = mirror.port(plant.log)
@@ -152,9 +152,9 @@ class DeploymentTest(ConfigTest):
 
     def test_builtin_log_finds_the_pack_copy(self) -> None:
         a, plant, b = plant_and_peer()
-        cmds = a.add("cmds", Subscribe(listen="0.0.0.0:2241"))
-        a_pub = a.add("pub", Publish([plant, cmds], listen="0.0.0.0:2240"))
-        mirror = b.add("mirror", Subscribe(peer=a_pub))
+        cmds = a.add("cmds", Subscribe(transport=Listen("0.0.0.0:2241")))
+        a_pub = a.add("pub", Publish([plant, cmds], transport=Listen("0.0.0.0:2240")))
+        mirror = b.add("mirror", Subscribe(transport=Peer(a_pub)))
         self.assertIsNot(cmds.log.record, plant.log.record)
         self.assertEqual(mirror.port(cmds.log).ref.port, "plant.log")
 
@@ -181,14 +181,14 @@ class DeploymentTest(ConfigTest):
     def test_items_need_peer(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
         plant = a.add("plant", Plant())
-        with self.assertRaisesRegex(ConfigError, "needs `peer`"):
-            Subscribe(items=[plant], listen="0.0.0.0:1")
+        with self.assertRaisesRegex(ConfigError, "needs a `Peer` transport"):
+            Subscribe(items=[plant], transport=Listen("0.0.0.0:1"))
 
     def test_unpublished_item_raises(self) -> None:
         a, plant, b = plant_and_peer()
         nav = a.add("nav", Nav(imu=plant.imu))
-        a_pub = a.add("pub", Publish([plant.imu], listen="0.0.0.0:2240"))
-        b.add("mirror", Subscribe(peer=a_pub, items=[nav.est]))
+        a_pub = a.add("pub", Publish([plant.imu], transport=Listen("0.0.0.0:2240")))
+        b.add("mirror", Subscribe(transport=Peer(a_pub), items=[nav.est]))
         with self.assertRaisesRegex(ConfigError, "does not publish `nav.est`"):
             Deployment(targets=[a, b]).to_config()
 
@@ -196,61 +196,53 @@ class DeploymentTest(ConfigTest):
         a = Target(cycle_rate=100.0, namespace="a")
         plant = a.add("plant", Plant())
         with self.assertRaisesRegex(ConfigError, "takes a link's handle"):
-            Subscribe(peer=plant)  # pyright: ignore[reportArgumentType]
+            Peer(plant)
 
     def test_peer_must_be_a_member(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
-        a_pub = a.add("pub", Publish(listen="0.0.0.0:2240"))
+        a_pub = a.add("pub", Publish(transport=Listen("0.0.0.0:2240")))
         b = Target(cycle_rate=100.0, namespace="b")
-        b.add("mirror", Subscribe(peer=a_pub))
+        b.add("mirror", Subscribe(transport=Peer(a_pub)))
         with self.assertRaisesRegex(ConfigError, "does not include"):
             Deployment(targets=[b]).to_config()
 
     def test_peer_must_listen_on_a_fixed_port(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
-        dialer = a.add("out", Publish(connect="127.0.0.1:2240"))
+        dialer = a.add("out", Publish(transport=Connect("127.0.0.1:2240")))
         b = Target(cycle_rate=100.0, namespace="b")
-        b.add("mirror", Subscribe(peer=dialer))
+        b.add("mirror", Subscribe(transport=Peer(dialer)))
         with self.assertRaisesRegex(ConfigError, "which dials"):
             Deployment(targets=[a, b]).to_config()
         reset()
         a = Target(cycle_rate=100.0, namespace="a")
-        any_port = a.add("pub", Publish(listen="127.0.0.1:0"))
+        any_port = a.add("pub", Publish(transport=Listen("127.0.0.1:0")))
         b = Target(cycle_rate=100.0, namespace="b")
-        b.add("mirror", Subscribe(peer=any_port))
+        b.add("mirror", Subscribe(transport=Peer(any_port)))
         with self.assertRaisesRegex(ConfigError, "takes any port"):
             Deployment(targets=[a, b]).to_config()
 
     def test_peer_target_needs_namespace(self) -> None:
         a = Target(cycle_rate=100.0)
-        a_pub = a.add("pub", Publish(listen="0.0.0.0:2240"))
+        a_pub = a.add("pub", Publish(transport=Listen("0.0.0.0:2240")))
         b = Target(cycle_rate=100.0, namespace="b")
-        b.add("mirror", Subscribe(peer=a_pub))
+        b.add("mirror", Subscribe(transport=Peer(a_pub)))
         with self.assertRaisesRegex(ConfigError, "names no namespace"):
             b.to_config()
 
-    def test_one_transport_only(self) -> None:
-        a = Target(cycle_rate=100.0, namespace="a")
-        a_pub = a.add("pub", Publish(listen="0.0.0.0:2240"))
-        with self.assertRaisesRegex(ConfigError, "exactly one"):
-            Subscribe(peer=a_pub, connect="127.0.0.1:1")
-        with self.assertRaisesRegex(ConfigError, "no `max_connections`"):
-            Subscribe(peer=a_pub, max_connections=2)
-
     def test_host_port_collision(self) -> None:
         a = Target(cycle_rate=100.0, namespace="a")
-        a.add("pub", Publish(listen="0.0.0.0:2240"))
+        a.add("pub", Publish(transport=Listen("0.0.0.0:2240")))
         b = Target(cycle_rate=100.0, namespace="b")
-        b.add("pub", Publish(listen="[::]:2240"))
+        b.add("pub", Publish(transport=Listen("[::]:2240")))
         with self.assertRaisesRegex(ConfigError, "both bind 127.0.0.1:2240"):
             Deployment(targets=[a, b]).to_config()
         Deployment(targets=[a, b], hosts={"b": "10.0.0.2"}).to_config()
 
     def test_subscribe_copies_are_publishable(self) -> None:
         a, plant, b = plant_and_peer()
-        a_pub = a.add("pub", Publish([plant.imu], listen="0.0.0.0:2240"))
-        mirror = b.add("mirror", Subscribe(peer=a_pub))
-        b.add("pub", Publish([mirror], listen="0.0.0.0:2241"))
+        a_pub = a.add("pub", Publish([plant.imu], transport=Listen("0.0.0.0:2240")))
+        mirror = b.add("mirror", Subscribe(transport=Peer(a_pub)))
+        b.add("pub", Publish([mirror], transport=Listen("0.0.0.0:2241")))
         config = Deployment(targets=[a, b]).to_config()
         pub = config["targets"][1]["coordinator"]["systems"][1]
         self.assertEqual(
@@ -261,8 +253,8 @@ class DeploymentTest(ConfigTest):
     def test_message_arrives_on_one_port(self) -> None:
         a, plant, b = plant_and_peer()
         nav = a.add("nav", Nav(imu=plant.imu))
-        a_pub = a.add("pub", Publish([plant, nav], listen="0.0.0.0:2240"))
-        mirror = b.add("mirror", Subscribe(peer=a_pub))
+        a_pub = a.add("pub", Publish([plant, nav], transport=Listen("0.0.0.0:2240")))
+        mirror = b.add("mirror", Subscribe(transport=Peer(a_pub)))
         config = Deployment(targets=[a, b]).to_config()
         outputs = config["targets"][1]["coordinator"]["systems"][0]["outputs"]
         self.assertEqual(

@@ -250,7 +250,7 @@ A file emits one envelope, config version 2: every target's packs and
 `CoordinatorConfig`, and a map of where each target runs. A file with one
 `Target` is a deployment of one. `metor build` resolves the envelope:
 
-- a `peer` transport becomes the address of the link it names;
+- a `Peer` transport becomes the address of the link it names;
 - a peer output becomes the definition of the port it copies;
 - a db learns the commands its subscribers take;
 - a slot candidate's pack becomes a stored library.
@@ -260,13 +260,13 @@ A file emits one envelope, config version 2: every target's packs and
 ## Links and gateways
 
 `Publish` serves the records wired into it over metor-proto. `Subscribe`
-writes the records it is sent onto ports of its own. Each owns one
-transport: `listen`, `connect`, or `peer`, a link of the deployment that
+writes the records it is sent onto ports of its own. Each takes one
+`transport`: `Listen`, `Connect`, or `Peer`, a link of the deployment that
 `metor build` turns into an address.
 
 ```python
-plant_pub = plant.add("pub", Publish(listen="0.0.0.0:2240", items=[sim]))
-mirror = fsw.add("plant", Subscribe(peer=plant_pub, items=[sim]))
+plant_pub = plant.add("pub", Publish(transport=Listen("0.0.0.0:2240"), items=[sim]))
+mirror = fsw.add("plant", Subscribe(transport=Peer(plant_pub), items=[sim]))
 nav = fsw.add("nav", Nav(sensors=mirror.port(sim.sensors)))
 ```
 
