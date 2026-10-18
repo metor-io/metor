@@ -6,12 +6,12 @@ use std::sync::Arc;
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogEvent;
 
-use metor_fsw_3_ring::{NoWake, WakeSink};
+use metor_fsw_3_ring::NoWake;
 
 use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::log::LogPort;
-use crate::port::Output;
+use crate::port::{InputWake, Output};
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports};
 
 use super::FnSignature;
@@ -21,7 +21,7 @@ use super::param::{Defs, Instance, Param, Views, Writers};
 pub const LOG_PORT: &str = "log";
 
 /// The bound inputs of a fn system's parameters.
-pub struct InSet<S: FnSignature, W: WakeSink + Clone + 'static = NoWake> {
+pub struct InSet<S: FnSignature, W: InputWake = NoWake> {
     pub(crate) ins: <S::Params as Param>::In<W>,
 }
 
@@ -35,7 +35,7 @@ pub struct OutSet<S: FnSignature> {
     pub(crate) dropped: Arc<AtomicU32>,
 }
 
-impl<S: FnSignature, W: WakeSink + Clone + 'static> InSet<S, W> {
+impl<S: FnSignature, W: InputWake> InSet<S, W> {
     /// Hands `views` to the parameters, in order.
     pub(crate) fn from_views(mut views: Views<W>) -> Self {
         let ins = S::Params::bind_in::<W>(&mut views);
@@ -78,7 +78,7 @@ impl<S: FnSignature> OutSet<S> {
     }
 }
 
-impl<S: FnSignature, W: WakeSink + Clone + 'static> Ports<InputBinding<W>> for InSet<S, W> {
+impl<S: FnSignature, W: InputWake> Ports<InputBinding<W>> for InSet<S, W> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         Ok(Defs::of::<S>(cx)?.inputs)
     }
@@ -111,7 +111,7 @@ impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
 pub(crate) type BoundSet<S, W> = (InSet<S, W>, OutSet<S>);
 
 /// Binds a fn system's ports under `instance`.
-pub(crate) fn bind<S: FnSignature, W: WakeSink + Clone + 'static>(
+pub(crate) fn bind<S: FnSignature, W: InputWake>(
     inputs: Vec<InputBinding<W>>,
     outputs: Vec<OutputBinding>,
     instance: Instance,

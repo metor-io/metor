@@ -9,23 +9,49 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use maitake_sync::wait_queue::WaitOwned;
-use metor_fsw_3_ring::{Notifier, View, WakeSink};
+use metor_fsw_3_ring::{NoWake, Notifier, View, WakeSink};
 
 use super::{DynInputs, Input};
 use crate::record::Payload;
 
+/// The wake sink of an [`Input`]'s views. Only a [`Notifier`] input carries
+/// [`Waiters`].
+pub trait InputWake: WakeSink + Clone + 'static {
+    /// What the input keeps to wait on its views.
+    type Waiters;
+
+    #[doc(hidden)]
+    fn waiters(views: &[View<Self>]) -> Self::Waiters;
+}
+
+impl InputWake for NoWake {
+    type Waiters = ();
+
+    fn waiters(_views: &[View<Self>]) {}
+}
+
+impl InputWake for Notifier {
+    type Waiters = Waiters;
+
+    fn waiters(views: &[View<Self>]) -> Waiters {
+        Waiters::new(views)
+    }
+}
+
 /// One wait slot per producer, each beside the [`Notifier`] that re-arms it.
-pub(super) struct Waiters {
+pub struct Waiters {
     slots: Vec<(Notifier, Pin<Box<Option<WaitOwned>>>)>,
 }
 
 impl Waiters {
-    /// Clones each view's notifier. Views that wait on no notifier get no slot.
-    pub(super) fn new<W: WakeSink>(views: &[View<W>]) -> Self {
+    /// Clones each view's notifier.
+    fn new(views: &[View<Notifier>]) -> Self {
         let slots = views
             .iter()
-            .filter_map(|view| view.wake().notifier())
-            .map(|notifier| (notifier.clone(), Box::pin(Some(notifier.wait_owned()))))
+            .map(|view| {
+                let notifier = view.wake();
+                (notifier.clone(), Box::pin(Some(notifier.wait_owned())))
+            })
             .collect();
         Self { slots }
     }

@@ -130,7 +130,8 @@ pub use log::{Log, LogLayer};
 pub use metor_fsw_3_macros::{Frame, Record, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
 pub use port::{
-    DynInputs, DynOutputs, Input, Latest, Output, RecvError, Sample, SendError, ring_capacity,
+    DynInputs, DynOutputs, Input, InputWake, Latest, Output, RecvError, Sample, SendError,
+    ring_capacity,
 };
 pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Payload, Record, RecordSchema};
 pub use rng::Rng;

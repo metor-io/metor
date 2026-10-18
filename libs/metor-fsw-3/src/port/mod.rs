@@ -14,15 +14,14 @@ use crate::def::{DefCx, DefError};
 use crate::record::{Bytes, DecodeError, EncodeError, Payload, Record};
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports};
 use metor_fsw_3_ring::{
-    NoWake, Notifier, PAYLOAD_ALIGNMENT, ReadError, View, WakeSink, WakeSource, WriteError, Writer,
-    frame_len,
+    NoWake, Notifier, PAYLOAD_ALIGNMENT, ReadError, View, WakeSource, WriteError, Writer, frame_len,
 };
 use metor_proto::types::Timestamp;
 
 mod readiness;
 mod sample;
 
-use readiness::Waiters;
+pub use readiness::InputWake;
 pub use sample::Sample;
 pub(crate) use sample::SampledInput;
 
@@ -191,13 +190,13 @@ impl<W: WakeSource> Output<Bytes, W> {
 /// Each producer writes its own ring, and the input holds one view per ring.
 /// `W` is what those views wait on. An async input wakes when any producer
 /// writes, whether the producers share one [`Notifier`] or each have their own.
-pub struct Input<T: ?Sized, W: WakeSink = NoWake> {
+pub struct Input<T: ?Sized, W: InputWake = NoWake> {
     views: Vec<View<W>>,
-    waiters: Waiters,
+    waiters: W::Waiters,
     _t: PhantomData<T>,
 }
 
-impl<T: Payload + ?Sized, W: WakeSink> Input<T, W> {
+impl<T: Payload + ?Sized, W: InputWake> Input<T, W> {
     /// Creates an input that reads from `views`, one per producer.
     ///
     /// A record type that needs more alignment than the ring provides fails to
@@ -210,7 +209,7 @@ impl<T: Payload + ?Sized, W: WakeSink> Input<T, W> {
             )
         };
         Self {
-            waiters: Waiters::new(&views),
+            waiters: W::waiters(&views),
             views,
             _t: PhantomData,
         }
@@ -260,7 +259,7 @@ impl<T: Payload + ?Sized, W: WakeSink> Input<T, W> {
     }
 }
 
-impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
+impl<T: Record + ?Sized, W: InputWake> Input<T, W> {
     /// Returns the definition of an input port called `name`.
     pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
         Output::<T>::def(cx, name)
@@ -289,11 +288,11 @@ impl<T: Payload + ?Sized> Input<T, Notifier> {
 ///
 /// Records arrive as raw bytes, undecoded. Each port comes with the definition
 /// computed from the config, so the system can tell what it carries.
-pub struct DynInputs<W: WakeSink = NoWake> {
+pub struct DynInputs<W: InputWake = NoWake> {
     ports: Vec<(PortDef, Input<Bytes, W>)>,
 }
 
-impl<W: WakeSink> DynInputs<W> {
+impl<W: InputWake> DynInputs<W> {
     /// Returns each port's definition alongside its input.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Input<Bytes, W>)> {
         self.ports.iter_mut().map(|(def, input)| (&*def, input))
@@ -309,7 +308,7 @@ impl DynInputs<Notifier> {
     }
 }
 
-impl<W: WakeSink> Ports<InputBinding<W>> for DynInputs<W> {
+impl<W: InputWake> Ports<InputBinding<W>> for DynInputs<W> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         cx.dyn_input_defs(&[])
     }

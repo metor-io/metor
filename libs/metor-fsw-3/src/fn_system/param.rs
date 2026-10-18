@@ -14,7 +14,7 @@ use crate::{
     def::{DefCx, DefError, Records},
     frame::Frame,
     log::Log,
-    port::{DynInputs, DynOutputs, Input, Output, Sample, SampledInput},
+    port::{DynInputs, DynOutputs, Input, InputWake, Output, Sample, SampledInput},
     record::Record,
     system::{InputBinding, OutputBinding, PortDef, Ports},
 };
@@ -203,11 +203,11 @@ impl Cycle<'_> {
 /// cycle thread drains an async system's outputs itself.
 pub trait Param {
     /// The bound input, or `()` if the parameter has none.
-    type In<W: WakeSink + Clone + 'static>;
+    type In<W: InputWake>;
     /// The bound output, or `()` if the parameter has none.
     type Out;
     /// The value the system fn receives each cycle.
-    type Item<'a, W: WakeSink + Clone + 'static>
+    type Item<'a, W: InputWake>
     where
         Self: 'a;
 
@@ -222,7 +222,7 @@ pub trait Param {
     ) -> Result<(), DefError>;
 
     /// Binds this parameter's input, if it has one, from `views`.
-    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W>;
+    fn bind_in<W: InputWake>(views: &mut Views<W>) -> Self::In<W>;
 
     /// Binds this parameter's output, if it has one, from `writers`.
     ///
@@ -231,14 +231,14 @@ pub trait Param {
     -> Result<Self::Out, ParamError>;
 
     /// Returns the value passed to the system fn this cycle.
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         input: &'a mut Self::In<W>,
         output: &'a mut Self::Out,
         cx: &mut Cycle<'a>,
     ) -> Self::Item<'a, W>;
 
     /// Refreshes this parameter's [`Sample`]s for the cycle, before `get`.
-    fn refresh<W: WakeSink + Clone + 'static>(_input: &mut Self::In<W>) {}
+    fn refresh<W: InputWake>(_input: &mut Self::In<W>) {}
 }
 
 /// Takes the name of the next non-tuple parameter.
@@ -250,10 +250,10 @@ pub(crate) fn param_name(names: &mut ParamNames<'_>) -> &'static str {
 /// `Input<T>` and `Input<T, Notifier>` declare the same port.
 ///
 /// The fn receives the wake sink that matches the thread it runs on.
-impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> {
-    type In<W: WakeSink + Clone + 'static> = Input<T, W>;
+impl<T: Record + 'static + ?Sized, D: InputWake> Param for Input<T, D> {
+    type In<W: InputWake> = Input<T, W>;
     type Out = ();
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Input<T, W>;
+    type Item<'a, W: InputWake> = &'a mut Input<T, W>;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -264,7 +264,7 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
+    fn bind_in<W: InputWake>(views: &mut Views<W>) -> Self::In<W> {
         // PANIC Safety: the coordinator binds one list per declared input;
         // a mismatch is a coordinator bug.
         let binding = views.bindings.next().expect("one binding per input param");
@@ -276,7 +276,7 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
         Ok(())
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         input: &'a mut Self::In<W>,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
@@ -290,9 +290,9 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
 /// Instead of the input itself, the fn gets the newest record as of this
 /// cycle. The sample is updated once per cycle, before the fn runs.
 impl<T: Frame + Copy + 'static> Param for Sample<T> {
-    type In<W: WakeSink + Clone + 'static> = SampledInput<T, W>;
+    type In<W: InputWake> = SampledInput<T, W>;
     type Out = ();
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a Sample<T>;
+    type Item<'a, W: InputWake> = &'a Sample<T>;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -304,7 +304,7 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
+    fn bind_in<W: InputWake>(views: &mut Views<W>) -> Self::In<W> {
         SampledInput::new(<Input<T> as Param>::bind_in(views))
     }
 
@@ -313,7 +313,7 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
         Ok(())
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         input: &'a mut Self::In<W>,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
@@ -321,7 +321,7 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
         &input.sample
     }
 
-    fn refresh<W: WakeSink + Clone + 'static>(input: &mut Self::In<W>) {
+    fn refresh<W: InputWake>(input: &mut Self::In<W>) {
         input.refresh();
     }
 }
@@ -329,9 +329,9 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
 /// An `Rng` draws from the target seed and its instance and parameter
 /// names. It takes no port.
 impl Param for Rng {
-    type In<W: WakeSink + Clone + 'static> = ();
+    type In<W: InputWake> = ();
     type Out = Rng;
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Rng;
+    type Item<'a, W: InputWake> = &'a mut Rng;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -343,13 +343,13 @@ impl Param for Rng {
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
     fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Rng, ParamError> {
         writers.instance.rng(param_name(names))
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         _input: &'a mut (),
         output: &'a mut Rng,
         _cx: &mut Cycle<'a>,
@@ -361,9 +361,9 @@ impl Param for Rng {
 /// The host's record table: every record the system table knows, by name.
 /// It takes no port.
 impl Param for Records {
-    type In<W: WakeSink + Clone + 'static> = ();
+    type In<W: InputWake> = ();
     type Out = Arc<Records>;
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a Records;
+    type Item<'a, W: InputWake> = &'a Records;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -374,7 +374,7 @@ impl Param for Records {
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
     fn bind_out(
         names: &mut ParamNames<'_>,
@@ -384,7 +384,7 @@ impl Param for Records {
         Ok(writers.instance.records.clone())
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         _input: &'a mut (),
         output: &'a mut Arc<Records>,
         _cx: &mut Cycle<'a>,
@@ -394,9 +394,9 @@ impl Param for Records {
 }
 
 impl<T: Record + 'static + ?Sized> Param for Output<T> {
-    type In<W: WakeSink + Clone + 'static> = ();
+    type In<W: InputWake> = ();
     type Out = Output<T>;
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Output<T>;
+    type Item<'a, W: InputWake> = &'a mut Output<T>;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -407,7 +407,7 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
     fn bind_out(
         names: &mut ParamNames<'_>,
@@ -423,7 +423,7 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
         Ok(Output::counting(binding.writer, writers.dropped.clone()))
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         _input: &'a mut (),
         output: &'a mut Self::Out,
         _cx: &mut Cycle<'a>,
@@ -432,10 +432,10 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
     }
 }
 
-impl<D: WakeSink + 'static> Param for DynInputs<D> {
-    type In<W: WakeSink + Clone + 'static> = DynInputs<W>;
+impl<D: InputWake> Param for DynInputs<D> {
+    type In<W: InputWake> = DynInputs<W>;
     type Out = ();
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut DynInputs<W>;
+    type Item<'a, W: InputWake> = &'a mut DynInputs<W>;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -448,7 +448,7 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
+    fn bind_in<W: InputWake>(views: &mut Views<W>) -> Self::In<W> {
         Ports::bind(views.bindings.take())
     }
 
@@ -457,7 +457,7 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
         Ok(())
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         input: &'a mut Self::In<W>,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
@@ -467,9 +467,9 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
 }
 
 impl Param for DynOutputs {
-    type In<W: WakeSink + Clone + 'static> = ();
+    type In<W: InputWake> = ();
     type Out = DynOutputs;
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut DynOutputs;
+    type Item<'a, W: InputWake> = &'a mut DynOutputs;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -482,7 +482,7 @@ impl Param for DynOutputs {
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
     fn bind_out(
         names: &mut ParamNames<'_>,
@@ -492,7 +492,7 @@ impl Param for DynOutputs {
         Ok(DynOutputs::new(writers.bindings.take(), &writers.dropped))
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         _input: &'a mut (),
         output: &'a mut Self::Out,
         _cx: &mut Cycle<'a>,
@@ -502,9 +502,9 @@ impl Param for DynOutputs {
 }
 
 impl Param for Timestamp {
-    type In<W: WakeSink + Clone + 'static> = ();
+    type In<W: InputWake> = ();
     type Out = ();
-    type Item<'a, W: WakeSink + Clone + 'static> = Timestamp;
+    type Item<'a, W: InputWake> = Timestamp;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -515,14 +515,14 @@ impl Param for Timestamp {
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
     fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
         param_name(names);
         Ok(())
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         _input: &'a mut (),
         _output: &'a mut (),
         cx: &mut Cycle<'a>,
@@ -532,9 +532,9 @@ impl Param for Timestamp {
 }
 
 impl Param for Log {
-    type In<W: WakeSink + Clone + 'static> = ();
+    type In<W: InputWake> = ();
     type Out = Log;
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Log;
+    type Item<'a, W: InputWake> = &'a mut Log;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -545,14 +545,14 @@ impl Param for Log {
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
     fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<Log, ParamError> {
         param_name(names);
         Ok(Log)
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         _input: &'a mut (),
         output: &'a mut Log,
         _cx: &mut Cycle<'a>,
@@ -568,9 +568,9 @@ impl Param for Log {
 macro_rules! impl_param_for_tuple {
     ($($P:ident $i:tt),*) => {
         impl<$($P: Param),*> Param for ($($P,)*) {
-            type In<W: WakeSink + Clone + 'static> = ($($P::In<W>,)*);
+            type In<W: InputWake> = ($($P::In<W>,)*);
             type Out = ($($P::Out,)*);
-            type Item<'a, W: WakeSink + Clone + 'static> = ($($P::Item<'a, W>,)*) where Self: 'a;
+            type Item<'a, W: InputWake> = ($($P::Item<'a, W>,)*) where Self: 'a;
 
             #[allow(unused_variables)]
             fn append_defs(names: &mut ParamNames<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
@@ -579,7 +579,7 @@ macro_rules! impl_param_for_tuple {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
+            fn bind_in<W: InputWake>(views: &mut Views<W>) -> Self::In<W> {
                 ($( $P::bind_in::<W>(views), )*)
             }
 
@@ -589,12 +589,12 @@ macro_rules! impl_param_for_tuple {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn get<'a, W: WakeSink + Clone + 'static>(input: &'a mut Self::In<W>, output: &'a mut Self::Out, cx: &mut Cycle<'a>) -> Self::Item<'a, W> {
+            fn get<'a, W: InputWake>(input: &'a mut Self::In<W>, output: &'a mut Self::Out, cx: &mut Cycle<'a>) -> Self::Item<'a, W> {
                 ($( $P::get::<W>(&mut input.$i, &mut output.$i, cx), )*)
             }
 
             #[allow(unused_variables)]
-            fn refresh<W: WakeSink + Clone + 'static>(input: &mut Self::In<W>) {
+            fn refresh<W: InputWake>(input: &mut Self::In<W>) {
                 $( $P::refresh::<W>(&mut input.$i); )*
             }
         }

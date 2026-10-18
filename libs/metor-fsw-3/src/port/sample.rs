@@ -2,9 +2,7 @@
 
 use core::cell::Cell;
 
-use metor_fsw_3_ring::WakeSink;
-
-use super::Input;
+use super::{Input, InputWake};
 use crate::frame::Frame;
 use crate::log::Log;
 
@@ -27,7 +25,7 @@ impl<T: Frame + Copy> Sample<T> {
     /// Stores the newest record from `input`.
     ///
     /// Keeps the previous value if nothing arrived or the read failed.
-    pub(crate) fn refresh<W: WakeSink>(&self, input: &mut Input<T, W>) {
+    pub(crate) fn refresh<W: InputWake>(&self, input: &mut Input<T, W>) {
         match input.latest() {
             Ok(Some(record)) => self.value.set(Some(*record)),
             Ok(None) => {}
@@ -37,12 +35,12 @@ impl<T: Frame + Copy> Sample<T> {
 }
 
 /// A bound [`Sample`] and the input that fills it.
-pub struct SampledInput<T: Frame + Copy, W: WakeSink> {
+pub struct SampledInput<T: Frame + Copy, W: InputWake> {
     pub(crate) input: Input<T, W>,
     pub(crate) sample: Sample<T>,
 }
 
-impl<T: Frame + Copy, W: WakeSink> SampledInput<T, W> {
+impl<T: Frame + Copy, W: InputWake> SampledInput<T, W> {
     /// Wraps `input`, with no value until the first refresh.
     pub(crate) fn new(input: Input<T, W>) -> Self {
         Self {
