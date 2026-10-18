@@ -66,6 +66,20 @@ pub trait Record {
     fn schema_with_root(_root: &str) -> RecordSchema {
         Self::schema()
     }
+
+    /// Returns a fingerprint of a frame's field layout, or `None` for a message.
+    ///
+    /// The fingerprint hashes [`Record::schema`], so it is the same for every
+    /// port root.
+    fn layout() -> Option<u64> {
+        match Self::schema() {
+            RecordSchema::Frame { vtable, .. } => Some(const_fnv1a_hash::fnv1a_hash_64(
+                &vtable_bytes(&vtable),
+                None,
+            )),
+            RecordSchema::Msg { .. } => None,
+        }
+    }
 }
 
 /// A shortcut for implementing [`Record`] on a type encoded with postcard.
@@ -180,20 +194,6 @@ impl RecordSchema {
         match self {
             Self::Frame { .. } => PacketTy::Table,
             Self::Msg { .. } => PacketTy::Msg,
-        }
-    }
-
-    /// Returns a fingerprint of a frame's layout.
-    ///
-    /// Take it from [`Record::schema`], which names fields relative to the
-    /// record, so the fingerprint does not depend on the port. A message
-    /// returns 0.
-    pub fn layout(&self) -> u64 {
-        match self {
-            Self::Frame { vtable, .. } => {
-                const_fnv1a_hash::fnv1a_hash_64(&vtable_bytes(vtable), None)
-            }
-            Self::Msg { .. } => 0,
         }
     }
 }
@@ -378,7 +378,7 @@ mod tests {
 
     use super::*;
     use crate::MaxSize;
-    use crate::tests::utils::{Fixed, Imu, Note};
+    use crate::tests::utils::{BareName, Fixed, Imu, Note};
 
     /// A message whose codec is JSON, written by hand as a pack author would.
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -422,6 +422,14 @@ mod tests {
         assert_eq!(metadata[0].component_id, leaf);
         assert!(vtable.data.windows(8).any(|w| w == leaf.0.to_le_bytes()));
         assert_ne!(schema.packet_id(), Imu::schema().packet_id());
+    }
+
+    #[test]
+    fn test_layout() {
+        assert!(Imu::layout().is_some());
+        assert_ne!(Imu::layout(), BareName::layout());
+        assert_eq!(Note::layout(), None);
+        assert_eq!(NoteJson::layout(), None);
     }
 
     #[test]
