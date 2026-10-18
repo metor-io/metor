@@ -12,6 +12,8 @@ use crate::dl::store::{copy_atomic, write_atomic};
 use crate::dl::{DlPack, Pack, PackError, PackRef, cdylib_name, triple};
 use crate::pack::ABI_VERSION;
 
+/// Serializes `pack_dev` calls, which would race on the same `.metor` output
+/// and on the libraries this process has loaded.
 static BUILD: Mutex<()> = Mutex::new(());
 
 /// An error building a pack or writing its editable module.
