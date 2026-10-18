@@ -60,8 +60,10 @@ impl Transport {
                 addr,
                 max_connections,
             } => {
-                let listener = TcpListener::bind(addr.as_str())
-                    .map_err(|e| ParamError::Decode(format!("binding `{addr}`: {e}")))?;
+                let listener = TcpListener::bind(addr.as_str()).map_err(|e| MakeError::Bind {
+                    addr: addr.clone(),
+                    message: e.to_string(),
+                })?;
                 Ok(Endpoint::Listen {
                     listener,
                     slots: *max_connections,
@@ -223,11 +225,10 @@ mod tests {
         let addr = held.local_addr().expect("a bound listener");
         // SO_REUSEADDR lets a second bind share the port, so name an address
         // no host owns instead.
-        let Err(MakeError::Params(ParamError::Decode(message))) = listen("203.0.113.1:9").bind()
-        else {
+        let Err(MakeError::Bind { addr: refused, .. }) = listen("203.0.113.1:9").bind() else {
             panic!("an unassignable address is an error")
         };
-        assert!(message.contains("203.0.113.1:9"), "{message}");
+        assert_eq!(refused, "203.0.113.1:9");
         assert_ne!(addr.port(), 0);
     }
 
