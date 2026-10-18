@@ -79,20 +79,23 @@ impl<W: WakeSink> Views<W> {
 pub struct Writers {
     pub(crate) bindings: Bindings<OutputBinding>,
     pub(crate) dropped: Arc<AtomicU32>,
+    pub(crate) instance: Instance,
     pub(crate) io: Option<Io>,
-    /// The instance's stream, for an `Rng` parameter.
-    pub(crate) rng: Option<Rng>,
-    /// The host's record table, for a `Records` parameter.
-    pub(crate) records: Option<Arc<Records>>,
 }
 
 impl Writers {
     /// Wraps `outputs`, of which `declared` belong to declared parameters.
-    pub(crate) fn new(outputs: Vec<OutputBinding>, declared: usize, instance: Instance) -> Self {
+    pub(crate) fn new(
+        outputs: Vec<OutputBinding>,
+        declared: usize,
+        instance: Instance,
+        io: Option<Io>,
+    ) -> Self {
         Self {
             bindings: Bindings::new(outputs, declared),
             dropped: Arc::default(),
             instance,
+            io,
         }
     }
 }

@@ -9,7 +9,7 @@ use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-use crate::def::{DefCx, DefError, Records};
+use crate::def::{DefCx, DefError};
 use crate::io::GrantDef;
 use crate::record::RecordSchema;
 

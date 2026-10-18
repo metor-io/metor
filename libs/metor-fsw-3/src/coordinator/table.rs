@@ -222,9 +222,15 @@ impl SystemTable {
         _system: S,
         ctor: C,
     ) -> Result<(), BuildError> {
-        let make = move |params: Params<'_>| {
-            let state = ctor.make(params, &mut crate::io::IoInit::empty())?;
-            Ok((FnSystem::default(), state))
+        let make = move |cx: LaunchCx<'_>| {
+            let (inputs, outputs) =
+                fn_system::bind::<S, Notifier>(cx.inputs, cx.outputs, cx.instance, None)?;
+            Ok(Launched::<FnSystem<S>> {
+                system: FnSystem::default(),
+                state: ctor.make(cx.params, &mut crate::io::IoInit::empty())?,
+                inputs,
+                outputs,
+            })
         };
         let entry =
             TableEntry::async_system::<FnSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema())
@@ -390,7 +396,8 @@ impl TableEntry {
             make: Arc::new(move |mut cx| {
                 let instance = fn_system::Instance::from_make_cx(&cx);
                 let (views, writers) = cx.take_bindings();
-                let (inputs, outputs, io) = fn_system::bind::<S>(views, writers, instance)?;
+                let (inputs, outputs, io) =
+                    fn_system::bind_with_io::<S>(views, writers, instance, cx.io)?;
                 let state = ctor.make_with_io(cx.id, cx.params, io.as_ref())?;
                 Ok(Box::new(Runner {
                     system: FnSystem::default(),

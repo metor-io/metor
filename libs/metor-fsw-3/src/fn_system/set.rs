@@ -9,7 +9,7 @@ use metor_proto_wkt::LogEvent;
 use metor_fsw_3_ring::NoWake;
 
 use crate::coordinator::MakeError;
-use crate::def::{DefCx, DefError, Records};
+use crate::def::{DefCx, DefError};
 use crate::io::{Io, SharedIo};
 use crate::log::LogPort;
 use crate::port::{InputWake, Output};
@@ -102,7 +102,7 @@ impl<S: FnSignature, W: InputWake> Ports<InputBinding<W>> for InSet<S, W> {
             0,
             "IO ports bind through `fn_system::bind`"
         );
-        bind_inputs::<S, W>(inputs, defs.inputs.len())
+        Self::from_views(Views::new(inputs, defs.inputs.len()))
     }
 }
 
@@ -121,15 +121,10 @@ impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
             0,
             "IO ports bind through `fn_system::bind`"
         );
-        let writers = writers(outputs, defs.outputs.len() + 1, Arc::default());
-        bind_outputs::<S>(writers)
-    }
-
-    fn bind_with_records(outputs: Vec<OutputBinding>, records: &Arc<Records>) -> Self {
-        let defs = Defs::declared::<S>();
-        let mut writers = writers(outputs, defs.outputs.len() + 1, Arc::default());
-        writers.records = defs.records.then(|| records.clone());
-        bind_outputs::<S>(writers)
+        let writers = Writers::new(outputs, defs.outputs.len() + 1, Instance::default(), None);
+        // PANIC Safety: only an `Rng` parameter fails, and a table make binds
+        // an `Rng` through `bind`.
+        Self::from_writers(writers).expect("no Rng parameter")
     }
 }
 
@@ -147,53 +142,40 @@ pub(crate) fn system_def<S: FnSignature, W: InputWake>(
     })
 }
 
-/// A fn system's bound ports, and its queue if it has one.
-pub(crate) type BoundSet<S> = (InSet<S>, OutSet<S>, Option<Io>);
+/// A fn system's bound ports.
+pub(crate) type BoundSet<S, W> = (InSet<S, W>, OutSet<S>);
 
-/// The id, namespace, seed, and record table of the system instance being
-/// bound.
-#[derive(Clone, Copy)]
-pub(crate) struct Instance<'a> {
-    pub(crate) io: &'a SharedIo,
-    pub(crate) id: &'a str,
-    pub(crate) namespace: Option<&'a str>,
-    /// The target seed.
-    pub(crate) seed: u64,
-    /// Every record the system table knows about.
-    pub(crate) records: &'a Arc<Records>,
+/// Binds a fn system's ports under `instance`, handing `io` to its `Cap`s.
+pub(crate) fn bind<S: FnSignature, W: WakeSink + Clone + 'static>(
+    inputs: Vec<InputBinding<W>>,
+    outputs: Vec<OutputBinding>,
+    instance: Instance,
+    io: Option<Io>,
+) -> Result<BoundSet<S, W>, ParamError> {
+    let defs = Defs::declared::<S>();
+    let io_ports = defs.io_ports();
+    let ins = InSet::from_views(Views::new(inputs, defs.inputs.len() - io_ports));
+    let writers = Writers::new(outputs, defs.outputs.len() - io_ports + 1, instance, io);
+    Ok((ins, OutSet::from_writers(writers)?))
 }
 
-impl<'a> Instance<'a> {
-    pub(crate) fn from_make_cx(cx: &crate::coordinator::MakeCx<'a>) -> Self {
-        Self {
-            io: cx.io,
-            id: cx.id,
-            namespace: cx.namespace,
-            seed: cx.seed,
-            records: cx.records,
-        }
-    }
+/// A stepped fn system's bound ports, and its queue if it has one.
+pub(crate) type IoBoundSet<S> = (InSet<S>, OutSet<S>, Option<Io>);
 
-    /// The stream an `Rng` parameter draws, named `{namespace}.{id}`.
-    fn rng(&self) -> Rng {
-        Rng::seeded(self.seed, &DefCx::path(self.namespace, self.id, ""))
-    }
-}
-
-/// Binds a fn system's ports, including its queue pair.
+/// Binds a stepped fn system's ports, including its queue pair.
 ///
 /// The IO ports come after the parameters' own (see `Defs::append_io`). A
-/// system with a `Cap` takes its member's arena from `io`.
-pub(crate) fn bind<S: FnSignature>(
+/// system with a `Cap` takes its member's arena from `shared`.
+pub(crate) fn bind_with_io<S: FnSignature>(
     mut inputs: Vec<InputBinding>,
     mut outputs: Vec<OutputBinding>,
-    instance: Instance<'_>,
-) -> Result<BoundSet<S>, ParamError> {
-    let Instance { io, id, .. } = instance;
+    instance: Instance,
+    shared: &SharedIo,
+) -> Result<IoBoundSet<S>, ParamError> {
     let defs = Defs::declared::<S>();
-    let rng = defs.rng.then(|| instance.rng());
-    let records = defs.records.then(|| instance.records.clone());
-    let arena = defs.has_io().then(|| io.borrow_mut().get_or_add_member(id));
+    let arena = defs
+        .has_io()
+        .then(|| shared.borrow_mut().get_or_add_member(&instance.id));
     let io_ports = defs.io_ports();
     // PANIC Safety: build binds one entry per port of the definition these
     // `Defs` describe, with `log` last among the outputs.
@@ -201,33 +183,7 @@ pub(crate) fn bind<S: FnSignature>(
     let io_in = inputs.split_off(inputs.len() - io_ports);
     let io_out = outputs.split_off(outputs.len() - io_ports);
     outputs.push(log);
-    let dropped = Arc::<AtomicU32>::default();
     let io = Io::from_bindings(arena, io_in, io_out);
-    let ins = bind_inputs::<S, NoWake>(inputs, defs.inputs.len() - io_ports);
-    let mut writers = writers(outputs, defs.outputs.len() - io_ports + 1, dropped);
-    writers.io = io.clone();
-    writers.rng = rng;
-    writers.records = records;
-    Ok((ins, bind_outputs::<S>(writers), io))
-}
-
-fn writers(outputs: Vec<OutputBinding>, declared: usize, dropped: Arc<AtomicU32>) -> Writers {
-    Writers {
-        bindings: Bindings::new(outputs, declared),
-        dropped,
-        io: None,
-        rng: None,
-        records: None,
-    }
-}
-
-fn bind_inputs<S: FnSignature, W: InputWake>(
-    inputs: Vec<InputBinding<W>>,
-    outputs: Vec<OutputBinding>,
-    instance: Instance,
-) -> Result<BoundSet<S, W>, MakeError> {
-    let defs = Defs::declared::<S>();
-    let ins = InSet::from_views(Views::new(inputs, defs.inputs.len()));
-    let writers = Writers::new(outputs, defs.outputs.len() + 1, instance);
-    Ok((ins, OutSet::from_writers(writers)?))
+    let (ins, outs) = bind::<S, NoWake>(inputs, outputs, instance, io.clone())?;
+    Ok((ins, outs, io))
 }

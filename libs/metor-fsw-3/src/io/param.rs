@@ -4,6 +4,7 @@ use metor_fsw_3_ring::WakeSink;
 
 use super::GrantDef;
 use super::cap::{Cap, Handle, Interface};
+use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers, param_name};
 
@@ -24,14 +25,15 @@ impl<K: Interface> Param for Cap<K> {
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
-    fn bind_out(writers: &mut Writers) -> Cap<K> {
+    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Cap<K>, ParamError> {
+        param_name(names);
         // PANIC Safety: `fn_system::bind` builds a queue for every set with a
         // grant, and a `Cap` adds one.
         let io = writers
             .io
             .as_ref()
             .expect("a queue for a system with a `Cap`");
-        Cap::new(Handle::new(io.next_grant(), io.clone()))
+        Ok(Cap::new(Handle::new(io.next_grant(), io.clone())))
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
