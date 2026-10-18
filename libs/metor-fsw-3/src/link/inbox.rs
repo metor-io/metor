@@ -64,14 +64,19 @@ pub(crate) enum ConnectionState {
     Streaming,
 }
 
+/// The first field of a `VTableMsg`, which is all an announce needs.
+#[derive(serde::Deserialize)]
+struct VTableHead {
+    id: PacketId,
+}
+
 impl ConnectionState {
-    /// Notes a table a `VTableMsg` announces.
-    ///
-    /// Postcard encodes a `VTableMsg` with the table id's two bytes first, so
-    /// only those are read.
+    /// Notes the table a `VTableMsg` announces.
     fn recognize_vtable(&mut self, bytes: &[u8]) {
-        if let (Self::Announcing { expected }, Some(&[a, b])) = (self, bytes.get(..2)) {
-            expected.remove(&[a, b]);
+        if let (Self::Announcing { expected }, Ok((head, _))) =
+            (self, postcard::take_from_bytes::<VTableHead>(bytes))
+        {
+            expected.remove(&head.id);
         }
     }
 
@@ -279,7 +284,12 @@ mod tests {
     }
 
     fn vtable(id: PacketId) -> Vec<u8> {
-        body(PacketTy::Msg, VTableMsg::ID, &[id[0], id[1], 0, 0])
+        let msg = VTableMsg {
+            id,
+            vtable: Default::default(),
+        };
+        let bytes = postcard::to_allocvec(&msg).expect("encodes");
+        body(PacketTy::Msg, VTableMsg::ID, &bytes)
     }
 
     #[test]
