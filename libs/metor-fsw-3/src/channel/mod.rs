@@ -41,7 +41,7 @@ pub const STATUS_PORT: &str = "channel_status";
 pub use adapter::Channel;
 #[cfg(feature = "host")]
 pub(crate) use adapter::{channel_ports, def, make_channel};
-pub use apply::{Command, Refusal, State, apply};
+pub use apply::{Command, Phase, Refusal, State, apply};
 pub use registry::{ChannelSpec, Registry, RegistryParams, channel_registry};
 
 /// A system parameter that reports whether an abort was requested.
