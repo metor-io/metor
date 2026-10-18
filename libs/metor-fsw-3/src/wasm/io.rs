@@ -143,7 +143,7 @@ mod tests {
     }
 
     impl Rig {
-        fn submit(&self, slot: u16, op: Op, span: Span) -> Token {
+        fn submit(&mut self, slot: u16, op: Op, span: Span) -> Token {
             let token = Token::new(slot, 1);
             self.sq
                 .write(&Sqe::new(token, RawHandle::new(0, 0), &op, span))

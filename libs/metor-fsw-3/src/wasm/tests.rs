@@ -277,7 +277,7 @@ fn record_stores(record: &[u8], corrupt: bool) -> String {
     let ring = RingBuffer::create_in_memory(config).expect("a valid ring config");
     let _host = ring.view(NoWake).expect("a free reader slot");
     let before = region_bytes(&ring);
-    let writer = ring.writer(NoWake).expect("a free writer");
+    let mut writer = ring.writer(NoWake).expect("a free writer");
     writer.try_write(record).expect("room");
     drop(writer);
     let mut after = region_bytes(&ring);
