@@ -220,12 +220,6 @@ pub trait WakeSource {
 #[allow(async_fn_in_trait)]
 pub trait WakeSink {
     async fn wait_until<F: FnMut() -> bool>(&self, ready: F);
-
-    /// Returns the [`Notifier`] behind this sink, if it is one.
-    #[cfg(feature = "notify")]
-    fn notifier(&self) -> Option<&Notifier> {
-        None
-    }
 }
 
 /// A wake source and sink that does nothing.
@@ -282,10 +276,6 @@ impl WakeSource for Notifier {
 impl WakeSink for Notifier {
     async fn wait_until<F: FnMut() -> bool>(&self, ready: F) {
         let _ = self.0.wait_for(ready).await;
-    }
-
-    fn notifier(&self) -> Option<&Notifier> {
-        Some(self)
     }
 }
 
