@@ -17,7 +17,7 @@ fn test_wkt_records_keep_panel_ids() {
 
 #[test]
 fn test_abort_requested_latches() {
-    let (_ring, out, input) = pair::<AbortRequest>(4);
+    let (_ring, mut out, input) = pair::<AbortRequest>(4);
     let mut abort = Abort::new(input);
     assert!(!abort.requested());
     out.write(&AbortRequest {}).expect("room");

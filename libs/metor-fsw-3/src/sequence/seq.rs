@@ -88,9 +88,25 @@ impl<'a> Seq<'a> {
     ///
     /// `f` stays registered while the returned guard is alive, and runs when
     /// the guard is dropped if the sequence has been aborted by then.
-    pub fn on_abort<F: FnOnce(&Seq<'a>)>(&self, f: F) -> OnAbort<'_, 'a, F> {
+    pub fn on_abort<F: FnOnce(&Seq<'a>)>(
+        &self,
+        f: F,
+    ) -> OnAbort<'_, 'a, (), impl FnOnce(&Seq<'a>, &mut ())> {
+        self.on_abort_with((), move |seq, ()| f(seq))
+    }
+
+    /// Registers `f` to run on `value` if the sequence is aborted.
+    ///
+    /// The returned guard derefs to `value`, so the body and the handler can
+    /// both use it, such as an output the handler writes a safe command to.
+    pub fn on_abort_with<T, F: FnOnce(&Seq<'a>, &mut T)>(
+        &self,
+        value: T,
+        f: F,
+    ) -> OnAbort<'_, 'a, T, F> {
         OnAbort {
             seq: self,
+            value,
             f: Some(f),
         }
     }
@@ -252,12 +268,27 @@ impl Drop for Raised<'_> {
 /// aborted. If the guard is dropped while a panic unwinds out of the body
 /// being polled, it aborts the sequence first, so the handler runs then too.
 #[must_use = "a handler is disarmed when its guard drops; bind it with `let _name`"]
-pub struct OnAbort<'s, 'a, F: FnOnce(&Seq<'a>)> {
+pub struct OnAbort<'s, 'a, T, F: FnOnce(&Seq<'a>, &mut T)> {
     seq: &'s Seq<'a>,
+    value: T,
     f: Option<F>,
 }
 
-impl<'a, F: FnOnce(&Seq<'a>)> Drop for OnAbort<'_, 'a, F> {
+impl<'a, T, F: FnOnce(&Seq<'a>, &mut T)> core::ops::Deref for OnAbort<'_, 'a, T, F> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<'a, T, F: FnOnce(&Seq<'a>, &mut T)> core::ops::DerefMut for OnAbort<'_, 'a, T, F> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
+impl<'a, T, F: FnOnce(&Seq<'a>, &mut T)> Drop for OnAbort<'_, 'a, T, F> {
     fn drop(&mut self) {
         if std::thread::panicking() && self.seq.polling.get() {
             let _ = self.seq.abort();
@@ -265,7 +296,7 @@ impl<'a, F: FnOnce(&Seq<'a>)> Drop for OnAbort<'_, 'a, F> {
         if self.seq.aborted()
             && let Some(f) = self.f.take()
         {
-            run_handler(self.seq, f);
+            run_handler(self.seq, &mut self.value, f);
         }
     }
 }
@@ -274,10 +305,10 @@ impl<'a, F: FnOnce(&Seq<'a>)> Drop for OnAbort<'_, 'a, F> {
 ///
 /// If the handler panics, the panic is logged as a `handler` fault instead
 /// of unwinding.
-fn run_handler<'a>(seq: &Seq<'a>, f: impl FnOnce(&Seq<'a>)) {
+fn run_handler<'a, T>(seq: &Seq<'a>, value: &mut T, f: impl FnOnce(&Seq<'a>, &mut T)) {
     // PANIC Safety: the panic is caught so that the remaining handlers still
     // run, and so that a panic during an unwind never escapes.
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| f(seq))) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| f(seq, value))) {
         Log.fault("handler", crate::panic::into_message(payload));
     }
 }

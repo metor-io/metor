@@ -37,7 +37,7 @@
 //!     bus: &Sample<Bus>,
 //!     cmd: &mut Output<Arm>,
 //! ) -> Result<(), SeqError> {
-//!     let _disarm = seq.on_abort(|seq| {
+//!     let mut cmd = seq.on_abort_with(cmd, |seq, cmd| {
 //!         let _ = cmd.write(&Arm { timestamp: seq.now(), on: 0 });
 //!     });
 //!     redline!(seq, "bus voltage", || bus.get().is_some_and(|b| b.volts < 24.0));
@@ -60,9 +60,10 @@
 //! the start of the next cycle the step drops the body without polling it,
 //! and the sequence ends with [`SeqError::Aborted`].
 //!
-//! A body registers cleanup with [`Seq::on_abort`]. If the sequence has
-//! been aborted, each handler still registered runs when the body is
-//! dropped, innermost first. The handlers also run if the body panics. They
+//! A body registers cleanup with [`Seq::on_abort`], or with
+//! [`Seq::on_abort_with`] when the cleanup uses a port the body also writes.
+//! If the sequence has been aborted, each handler still registered runs when
+//! the body is dropped, innermost first. The handlers also run if the body panics. They
 //! do not run when the body fails, times out, or is dropped before it
 //! finishes for another reason (a `Reset`, a `Load`, or shutdown).
 //!

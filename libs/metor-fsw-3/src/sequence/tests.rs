@@ -645,7 +645,7 @@ async fn guarded(
     imu: &Sample<Imu>,
     valve_cmd: &mut Output<Imu>,
 ) -> Result<(), SeqError> {
-    let _closed = seq.on_abort(|seq| {
+    let mut valve_cmd = seq.on_abort_with(valve_cmd, |seq, valve_cmd| {
         trace.push("closed");
         let _ = valve_cmd.write(&Imu::new(seq.now().0, 0.0));
     });
@@ -870,7 +870,7 @@ fn step_on_imu<S: SequenceFn<State = ()>>(
 
 #[test]
 fn test_ended_sequence_releases_its_samples() {
-    let (mut step, imu, _rings) = step_on_imu(glance());
+    let (mut step, mut imu, _rings) = step_on_imu(glance());
     step.execute(ms(0));
     assert_eq!(step.ended(), Some(&EndReason::Completed));
     for at in 0..16 {
@@ -938,7 +938,7 @@ async fn leaks_a_redline(seq: &Seq<'_>, imu: &Sample<Imu>) -> Result<(), SeqErro
 
 /// Runs `S` reading `sample` each cycle, past its end, then drops it.
 fn run_past_its_end<S: SequenceFn<State = ()>>(sequence: fn() -> S, sample: f64) -> EndReason {
-    let (mut step, imu, _rings) = step_on_imu(sequence());
+    let (mut step, mut imu, _rings) = step_on_imu(sequence());
     for at in 0..6 {
         let _ = imu.write(&Imu::new(ms(at).0, sample));
         step.execute(ms(at));
