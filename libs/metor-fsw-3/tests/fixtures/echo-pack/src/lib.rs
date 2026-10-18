@@ -199,7 +199,7 @@ impl System for Retained {
 
 fn release_retained() -> Option<u32> {
     let mut input = RETAINED_INPUT.with(|slot| slot.borrow_mut().take())?;
-    let output = RETAINED_OUTPUT.with(|slot| slot.borrow_mut().take())?;
+    let mut output = RETAINED_OUTPUT.with(|slot| slot.borrow_mut().take())?;
     let n = input.latest().ok()??.n;
     output.write(&Ping { n }).ok()?;
     Some(n)

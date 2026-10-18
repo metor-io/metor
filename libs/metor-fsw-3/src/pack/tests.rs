@@ -350,7 +350,7 @@ fn test_unowned_ring_attach() {
         &[unowned(&nav), unowned(&log)],
     );
     assert!(!filter.handle.is_null());
-    let source = utils::output::<Imu>(&imu.ring);
+    let mut source = utils::output::<Imu>(&imu.ring);
     let mut sink = utils::input::<Nav>(&nav.ring);
     source.write(&Imu::new(1, 3.0)).expect("room");
     assert_eq!(filter.step(1), Status::Ok);
