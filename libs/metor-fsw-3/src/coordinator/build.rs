@@ -27,11 +27,12 @@ use super::config::{
     SystemConfig,
 };
 use super::error::BuildError;
+use super::params::ParamError;
 use super::params::Params;
 use super::run::{Coordinator, Entry};
 use super::status::{STATUS_PORT, SystemStatus};
-use super::step::StepState;
-use super::table::{MakeCx, SystemTable, TableEntry};
+use super::step::{Step, StepState};
+use super::table::{MakeCx, MakeFn, SystemTable, TableEntry};
 
 struct RingSpec {
     system: String,
@@ -299,6 +300,40 @@ impl<'a> Plan<'a> {
     }
 }
 
+impl Adapter {
+    /// Whether a system behind the adapter may not take input `port`.
+    fn reserves_input(&self, port: &str) -> bool {
+        matches!(self, Self::Channel(_)) && port == ABORT_PORT
+    }
+
+    /// Whether the adapter reads input `port` itself, so the system never
+    /// sees it.
+    fn reads_input(&self, port: &str) -> bool {
+        matches!(self, Self::Channel(_)) && port == COMMANDS_PORT
+    }
+
+    /// Appends the adapter's ports to `def`.
+    ///
+    /// # Errors
+    /// Returns the name of a port of `def` that the adapter's ports take.
+    fn add_ports(&self, def: SystemDef, cx: &DefCx<'_>) -> Result<SystemDef, String> {
+        match self {
+            Self::Thread(_) => Ok(def),
+            Self::Channel(_) => crate::channel::def(def, cx),
+        }
+    }
+
+    /// Makes a system with `make`, behind the adapter.
+    ///
+    /// `cx.def` is the definition [`Adapter::add_ports`] returned.
+    fn make(&self, make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
+        match self {
+            Self::Thread(_) => make(cx),
+            Self::Channel(channel) => crate::channel::make_channel(make, channel, cx),
+        }
+    }
+}
+
 impl TableEntry {
     /// Checks that the type runs behind the adapter `system` gives it.
     fn check_adapter(&self, system: &SystemConfig) -> Result<(), BuildError> {
@@ -325,11 +360,6 @@ impl TableEntry {
 /// final one if none comes before. Each `fsw.io` gets its members' ports in
 /// step order.
 fn wire_io(systems: &mut [SystemConfig], bindings: &Bindings) -> Result<(), BuildError> {
-    let channel =
-        |s: &&SystemConfig| s.ty == IO_TYPE && matches!(s.adapter, Some(Adapter::Channel(_)));
-    if let Some(io) = systems.iter().find(channel) {
-        return Err(BuildError::IoAdapter { id: io.id.clone() });
-    }
     let members: Vec<usize> = (0..systems.len())
         .filter(|&m| bindings.holds(&systems[m].id))
         .collect();
@@ -456,14 +486,13 @@ impl SystemDef {
         records: &Records,
         producer: impl Fn(&str, &PortRef) -> Result<Option<PortDef>, BuildError>,
     ) -> Result<Self, BuildError> {
-        let channel = matches!(system.adapter, Some(Adapter::Channel(_)));
+        let adapter = system.adapter.as_ref();
         let mut edges: Vec<(&str, PortDef)> = Vec::new();
         for input in &system.inputs {
-            if channel && input.port == ABORT_PORT {
-                return Err(BuildError::reserved_channel_port(&system.id, ABORT_PORT));
+            if adapter.is_some_and(|a| a.reserves_input(&input.port)) {
+                return Err(BuildError::reserved_channel_port(&system.id, &input.port));
             }
-            // The channel reads its commands; the system never sees them.
-            if channel && input.port == COMMANDS_PORT {
+            if adapter.is_some_and(|a| a.reads_input(&input.port)) {
                 continue;
             }
             for from in &input.from {
@@ -497,8 +526,9 @@ impl SystemDef {
                 ty: system.ty.clone(),
             });
         }
-        if channel {
-            def = crate::channel::def(def, &cx)
+        if let Some(adapter) = adapter {
+            def = adapter
+                .add_ports(def, &cx)
                 .map_err(|port| BuildError::reserved_channel_port(&system.id, &port))?;
         }
         def.outputs.push(SystemStatus::port_def(&cx));
@@ -797,8 +827,8 @@ fn make_systems(
             records: args.records,
         };
         let step = match system.adapter {
-            Some(Adapter::Channel(_)) => crate::channel::make_channel(&system.entry.make, cx),
-            _ => (system.entry.make)(cx),
+            Some(adapter) => adapter.make(&system.entry.make, cx),
+            None => (system.entry.make)(cx),
         }
         .map_err(|source| {
             let id = system.id.to_string();
@@ -1649,9 +1679,7 @@ mod tests {
             let mut config = config(nominal(), "a", "b");
             config.systems[3].adapter = Some(Adapter::Thread("io".into()));
             let e = error(config);
-            let refused = |e: &BuildError| {
-                matches!(e, BuildError::UnsupportedAdapter { id, .. } if id == "io_complete")
-            };
+            let refused = |e: &BuildError| matches!(e, BuildError::UnsupportedAdapter { id, .. } if id == "io_complete");
             assert!(refused(&e), "{e}");
         }
 
@@ -1663,10 +1691,8 @@ mod tests {
                 start: Default::default(),
             }));
             let e = error(config);
-            assert!(
-                matches!(&e, BuildError::IoAdapter { id } if id == "io_complete"),
-                "{e}"
-            );
+            let refused = |e: &BuildError| matches!(e, BuildError::UnsupportedAdapter { id, .. } if id == "io_complete");
+            assert!(refused(&e), "{e}");
         }
 
         #[test]

@@ -24,7 +24,7 @@ use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogLevel;
 
 use crate::async_system::{AsyncSystem, Running, Stop};
-use crate::coordinator::{Adapter, EndReason, MakeCx, MakeError, Params, Step};
+use crate::coordinator::{EndReason, MakeCx, MakeError, Params, Step};
 use crate::def::Records;
 use crate::mirror::{Mirror, Mirrors};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef};
@@ -149,17 +149,12 @@ where
 ///
 /// The system is built and run on that thread, reading and writing mirror
 /// rings. The returned [`ThreadAdapter`] step copies between the mirrors and
-/// the real rings each cycle. A system with a channel adapter is refused.
+/// the real rings each cycle.
 pub(crate) fn place<A, M>(make: Arc<M>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, MakeError>
 where
     A: AsyncSystem + 'static,
     M: Fn(LaunchCx<'_>) -> Result<Launched<A>, MakeError> + Send + Sync + 'static,
 {
-    if let Some(Adapter::Channel(channel)) = cx.adapter {
-        return Err(ParamError::Channel {
-            channel: channel.name.to_string(),
-        });
-    }
     let thread_name = cx.thread().to_string();
     let bound = Bound::new(cx.def, cx.inputs, cx.outputs)?;
     let panicked = Panicked::default();

@@ -13,7 +13,8 @@ use metor_proto_wkt::{
 };
 
 use crate::coordinator::{
-    Adapter, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, catch_execute,
+    Adapter, ChannelConfig, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step,
+    catch_execute,
 };
 use crate::def::{DefCx, Records};
 use crate::io::SharedIo;
@@ -58,18 +59,15 @@ pub(crate) fn channel_ports(cx: &DefCx<'_>) -> [PortDef; 3] {
     ]
 }
 
-/// Builds a system with `make` and wraps it in a channel.
+/// Builds a system with `make` and wraps it in `channel`.
 ///
-/// Without a channel adapter in `cx`, returns the system unwrapped. `cx.def`
-/// must be the definition [`def`] returned, so the channel's ports are the
-/// last input and the last two outputs.
+/// `cx.def` must be the definition [`def`] returned, so the channel's ports
+/// are the last input and the last two outputs.
 pub(crate) fn make_channel(
     make: &Arc<MakeFn>,
+    channel: &ChannelConfig,
     mut cx: MakeCx<'_>,
 ) -> Result<Box<dyn Step>, ParamError> {
-    let Some(Adapter::Channel(channel)) = cx.adapter else {
-        return make(cx);
-    };
     // PANIC Safety: `def` appended one input and two outputs.
     let commands = cx.inputs.pop().expect("the commands input");
     let status = cx.outputs.pop().expect("the channel_status output");

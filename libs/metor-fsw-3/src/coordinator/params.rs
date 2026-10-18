@@ -47,8 +47,6 @@ pub enum ParamError {
 pub enum MakeError {
     #[error(transparent)]
     Params(#[from] ParamError),
-    #[error("`{channel}`: an async system takes no channel")]
-    Channel { channel: String },
     #[error("thread `{thread}` is not running")]
     ThreadStart { thread: String },
     #[error("the constructor panicked: {0}")]

@@ -339,11 +339,10 @@ fn test_reject_channel_on_async() {
         };
         assert_eq!(
             build(config, &table(&Recorder::default()), deterministic).err(),
-            Some(BuildError::Params {
+            Some(BuildError::UnsupportedAdapter {
                 id: "sleeper".into(),
-                source: ParamError::Channel {
-                    channel: "mode".into()
-                },
+                ty: "sleeper".into(),
+                adapter: "behind channel `mode`".into(),
             })
         );
     }

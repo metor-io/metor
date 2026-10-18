@@ -123,9 +123,6 @@ pub enum BuildError {
     #[error("`{system}` grants `{param}`, which is not a `Cap` parameter")]
     UnknownGrant { system: String, param: String },
 
-    #[error("`{id}`: the io steps take no channel")]
-    IoAdapter { id: String },
-
     #[error("`{system}` holds a `Cap`, so the config needs an fsw.io")]
     NoIoStep { system: String },
 

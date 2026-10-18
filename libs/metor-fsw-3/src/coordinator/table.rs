@@ -142,7 +142,10 @@ impl SystemKind {
                 thread: false,
                 ..Adapters::default()
             },
-            Self::Async => Adapters::default(),
+            Self::Async => Adapters {
+                channel: false,
+                ..Adapters::default()
+            },
         }
     }
 }
