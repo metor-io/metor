@@ -15,6 +15,7 @@ fn def_with(outputs: Vec<PortDef>) -> SystemDef {
         outputs,
         log: None,
         grants: Vec::new(),
+        io: None,
     }
 }
 

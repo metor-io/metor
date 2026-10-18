@@ -105,6 +105,7 @@ impl TableEntry {
                 outputs: Vec::new(),
                 log: None,
                 grants: Vec::new(),
+                io: None,
             },
             def_fn: Box::new(DlSlot::def),
             doc: "Loads one of the pack systems it allows on its channel's `Load`.".into(),

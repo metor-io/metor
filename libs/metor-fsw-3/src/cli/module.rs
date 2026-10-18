@@ -695,6 +695,7 @@ mod tests {
                 outputs,
                 log: None,
                 grants: Vec::new(),
+                io: None,
             },
             doc: "".into(),
             params: params.map(|text| RawValue::from_string(text.into()).expect("json")),
