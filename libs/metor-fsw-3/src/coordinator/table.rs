@@ -17,7 +17,9 @@ use crate::thread::{DEFAULT_THREAD, Threads};
 
 use super::BuildError;
 use super::SystemStatus;
-use super::config::{Adapter, Adapters};
+use super::config::Adapter;
+#[cfg(feature = "host")]
+use super::config::Adapters;
 use super::params::{ParamError, Params};
 use super::step::Runner;
 use super::step::Step;
@@ -101,6 +103,7 @@ pub enum SystemKind {
     Async,
 }
 
+#[cfg(feature = "host")]
 impl SystemKind {
     /// The adapters a type of this kind runs behind.
     pub(crate) fn adapters(self) -> Adapters {
@@ -117,6 +120,7 @@ impl SystemKind {
 pub(crate) struct TableEntry {
     #[allow(dead_code)]
     pub kind: SystemKind,
+    #[cfg(feature = "host")]
     pub adapters: Adapters,
     /// The ports the type always has, whatever the config says.
     pub def: SystemDef,
@@ -332,6 +336,7 @@ impl TableEntry {
         let def = S::def(&DefCx::empty())?;
         Ok(Self {
             kind: SystemKind::Cyclic,
+            #[cfg(feature = "host")]
             adapters: SystemKind::Cyclic.adapters(),
             def,
             def_fn: Box::new(S::def),
@@ -359,6 +364,7 @@ impl TableEntry {
     ) -> Result<Self, DefError> {
         Ok(Self {
             kind: SystemKind::Cyclic,
+            #[cfg(feature = "host")]
             adapters: SystemKind::Cyclic.adapters(),
             def: FnSystem::<S>::def(&DefCx::empty())?,
             def_fn: Box::new(FnSystem::<S>::def),
@@ -395,6 +401,7 @@ impl TableEntry {
         let make = Arc::new(make);
         Ok(Self {
             kind: SystemKind::Async,
+            #[cfg(feature = "host")]
             adapters: SystemKind::Async.adapters(),
             def: A::def(&DefCx::empty())?,
             def_fn: Box::new(A::def),

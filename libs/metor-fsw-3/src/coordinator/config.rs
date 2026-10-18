@@ -89,12 +89,14 @@ pub enum Adapter {
 }
 
 /// The adapters a system type runs behind. `bare` is running behind none.
+#[cfg(feature = "host")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Adapters {
     pub bare: bool,
     pub thread: bool,
 }
 
+#[cfg(feature = "host")]
 impl Default for Adapters {
     fn default() -> Self {
         Self {
@@ -104,6 +106,7 @@ impl Default for Adapters {
     }
 }
 
+#[cfg(feature = "host")]
 impl Adapters {
     /// Whether the type runs behind `adapter`, or behind none for `None`.
     pub fn accepts(self, adapter: Option<&Adapter>) -> bool {
@@ -330,6 +333,7 @@ mod tests {
         assert!(serde_json::from_str::<SystemConfig>(missing_line).is_err());
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn test_adapters_accept() {
         let thread = Adapter::Thread("gps".into());
