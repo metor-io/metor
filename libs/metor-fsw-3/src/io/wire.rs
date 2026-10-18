@@ -362,7 +362,11 @@ impl OpenFlags {
         }
     }
 
-    /// Sets the permission bits of a created file. Zero means `0o644`.
+    /// The permission bits of a created file when no mode is set.
+    pub const DEFAULT_MODE: u32 = 0o644;
+
+    /// Sets the permission bits of a created file. Zero means
+    /// [`DEFAULT_MODE`](Self::DEFAULT_MODE).
     pub fn with_mode(mut self, mode: u32) -> Self {
         self.mode = U32::new(mode);
         self
@@ -372,21 +376,34 @@ impl OpenFlags {
         self.bits.get() & other.bits.get() == other.bits.get()
     }
 
+    /// The permission bits of a created file.
     pub fn mode(self) -> u32 {
-        self.mode.get()
+        match self.mode.get() {
+            0 => Self::DEFAULT_MODE,
+            mode => mode,
+        }
     }
 }
 
+/// Joins the flags. The left side's mode wins if both sides set one.
 impl core::ops::BitOr for OpenFlags {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self {
         Self {
             bits: U32::new(self.bits.get() | rhs.bits.get()),
-            mode: U32::new(self.mode.get() | rhs.mode.get()),
+            mode: match self.mode.get() {
+                0 => rhs.mode,
+                _ => self.mode,
+            },
         }
     }
 }
+
+/// The `Sqe` offset that reads or writes at the file's current position.
+///
+/// It is io_uring's own convention: an offset of -1.
+pub const CURRENT_POSITION: u64 = u64::MAX;
 
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
@@ -528,7 +545,7 @@ pub struct Sqe {
     pub aux: u8,
     _p: [u8; 2],
     pub buf: Span,
-    /// `u64::MAX` uses the current file position.
+    /// The file offset, or [`CURRENT_POSITION`].
     pub offset: U64,
     /// A `TtyConfig`, `OpenFlags`, or `RawAddr`.
     pub arg: [u8; 28],
@@ -543,12 +560,12 @@ impl Sqe {
             aux: 0,
             _p: [0; 2],
             buf,
-            offset: U64::new(u64::MAX),
+            offset: U64::new(CURRENT_POSITION),
             arg: [0; 28],
         };
         match *op {
             Op::Read { offset } | Op::Write { offset } => {
-                sqe.offset = U64::new(offset.unwrap_or(u64::MAX));
+                sqe.offset = U64::new(offset.unwrap_or(CURRENT_POSITION));
             }
             Op::SendTo(addr) => sqe.set_arg(&RawAddr::from(addr)),
             Op::Open(flags) => sqe.set_arg(&flags),
@@ -562,7 +579,7 @@ impl Sqe {
 
     /// Decodes the op. An unknown code is `Unsupported`.
     pub fn op(&self) -> Result<Op, IoError> {
-        let offset = Some(self.offset.get()).filter(|o| *o != u64::MAX);
+        let offset = Some(self.offset.get()).filter(|o| *o != CURRENT_POSITION);
         Ok(match OpKind::try_from(self.opcode)? {
             OpKind::Read => Op::Read { offset },
             OpKind::Write => Op::Write { offset },

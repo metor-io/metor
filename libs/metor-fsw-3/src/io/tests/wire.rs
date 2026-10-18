@@ -150,3 +150,35 @@ fn bad_tty_settings_do_not_decode() {
     sqe.aux = 3;
     assert_eq!(sqe.op(), Err(IoError::Unsupported));
 }
+
+#[test]
+fn open_flags_keep_one_mode() {
+    let plain = OpenFlags::READ | OpenFlags::CREATE;
+    assert_eq!(plain.mode(), OpenFlags::DEFAULT_MODE);
+    let right = OpenFlags::READ | OpenFlags::CREATE.with_mode(0o600);
+    assert_eq!(right.mode(), 0o600, "an unset left mode takes the right");
+    let both = OpenFlags::WRITE.with_mode(0o640) | OpenFlags::CREATE.with_mode(0o600);
+    assert_eq!(both.mode(), 0o640, "the left mode wins");
+    assert!(both.contains(OpenFlags::WRITE | OpenFlags::CREATE));
+}
+
+#[test]
+fn current_position_is_no_offset() {
+    let token = Token::new(0, 1);
+    for offset in [None, Some(0), Some(CURRENT_POSITION - 1)] {
+        let sqe = Sqe::new(
+            token,
+            RawHandle::new(0, 0),
+            &Op::Read { offset },
+            Span::default(),
+        );
+        assert_eq!(sqe.op(), Ok(Op::Read { offset }));
+    }
+    let sqe = Sqe::new(
+        token,
+        RawHandle::new(0, 0),
+        &Op::Read { offset: None },
+        Span::default(),
+    );
+    assert_eq!(sqe.offset.get(), CURRENT_POSITION);
+}

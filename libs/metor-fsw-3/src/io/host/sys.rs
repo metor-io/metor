@@ -134,11 +134,7 @@ fn open_flags(f: OpenFlags) -> (i32, u32) {
             bits |= host;
         }
     }
-    let mode = match f.mode() {
-        0 => 0o644,
-        m => m,
-    };
-    (bits, mode)
+    (bits, f.mode())
 }
 
 /// Applies `cfg` to a serial port, in raw mode.

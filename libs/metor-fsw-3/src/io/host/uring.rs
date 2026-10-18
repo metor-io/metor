@@ -11,7 +11,7 @@ use io_uring::types::{CancelBuilder, Fd};
 use io_uring::{IoUring, opcode};
 
 use super::{Class, OpId, Os, OsDone, OsOp, Out, sys};
-use crate::io::{Errno, IoError, Op};
+use crate::io::{CURRENT_POSITION, Errno, IoError, Op};
 
 /// Set in the `user_data` of a cancel, whose completion is dropped.
 const CANCEL: u64 = 1 << 40;
@@ -56,7 +56,7 @@ impl UringOs {
         let fd = Fd(op.fd);
         let buf = op.bytes();
         let (ptr, len) = (buf.cast::<u8>().as_ptr(), buf.len() as u32);
-        let at = |offset: Option<u64>| offset.unwrap_or(u64::MAX);
+        let at = |offset: Option<u64>| offset.unwrap_or(CURRENT_POSITION);
         let accept = self.accepts.get_mut(usize::from(op.id.index()))?;
         *accept = op.op == Op::Accept;
         let entry = match op.op {
