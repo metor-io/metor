@@ -1,11 +1,17 @@
 //! Errors from resolving a deployment.
 
-use crate::coordinator::BuildError;
+use crate::coordinator::{BuildError, Location};
 
 /// An error resolving a deployment. Each variant says which reference
 /// failed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DeployError {
+    #[error("{location}: {source}")]
+    Located {
+        location: Location,
+        source: Box<DeployError>,
+    },
+
     #[error("`{from}` names target `{target}`, which the deployment has no member of")]
     NoSuchTarget { from: String, target: String },
 
@@ -67,4 +73,17 @@ pub enum DeployError {
         name: String,
         cap: usize,
     },
+}
+
+impl DeployError {
+    /// Cites `location`, when the config gives one, as where the error is.
+    pub fn at(self, location: Option<&Location>) -> Self {
+        match location {
+            Some(location) if !matches!(self, Self::Located { .. }) => Self::Located {
+                location: location.clone(),
+                source: Box::new(self),
+            },
+            _ => self,
+        }
+    }
 }

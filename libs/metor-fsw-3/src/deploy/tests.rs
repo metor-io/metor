@@ -310,6 +310,45 @@ fn test_two_listeners_on_one_host_port() {
     );
 }
 
+/// A deploy error about a system cites where the target file created it.
+#[test]
+fn test_errors_cite_the_system_location() {
+    let at = |line| {
+        Some(crate::coordinator::Location {
+            file: "deploy.py".into(),
+            line,
+        })
+    };
+    let mut missing_link = envelope();
+    let mirror = &mut missing_link.targets[1].coordinator.systems[0];
+    mirror.params = peer("a", "nope");
+    mirror.outputs.clear();
+    mirror.location = at(8);
+    let error = resolve(&mut missing_link, &tables(2)).expect_err("no such link");
+    assert_eq!(
+        error.to_string(),
+        "deploy.py:8: `b.mirror` names link `a.nope`, which is not a system there"
+    );
+
+    let mut taken = envelope();
+    taken.targets[1].coordinator.systems[1].params = listen(2240);
+    taken.targets[1].coordinator.systems[1].location = at(12);
+    let Err(DeployError::Located { location, source }) = resolve(&mut taken, &tables(2)) else {
+        panic!("the second listener is located")
+    };
+    assert_eq!(location.line, 12);
+    assert!(matches!(*source, DeployError::PortTaken { port: 2240, .. }));
+
+    let mut unknown = envelope();
+    unknown.targets[0].coordinator.systems[1].ty = "nope".into();
+    unknown.targets[0].coordinator.systems[1].location = at(3);
+    let error = resolve(&mut unknown, &tables(2)).expect_err("an unknown type");
+    assert!(
+        error.to_string().starts_with("target `a`: deploy.py:3: "),
+        "{error}"
+    );
+}
+
 #[test]
 fn test_mirror_of_a_mirror_of_itself_cycles() {
     let mirror = |peer_target: &str| DeploySystem {

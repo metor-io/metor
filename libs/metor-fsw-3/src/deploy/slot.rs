@@ -73,13 +73,14 @@ fn unresolved_slots(
         if system.ty != SLOT_TYPE {
             continue;
         }
-        let params = DeploySlot::deserialize(&system.params).map_err(|e| DeployError::Slot {
-            slot: format!(
+        let params = DeploySlot::deserialize(&system.params).map_err(|e| {
+            let slot = format!(
                 "{}.{}",
                 envelope.targets[index.target].namespace(),
                 system.id
-            ),
-            message: e.to_string(),
+            );
+            let message = e.to_string();
+            DeployError::Slot { slot, message }.at(system.location.as_ref())
         })?;
         let pending = params
             .allow
@@ -103,7 +104,9 @@ pub fn resolve_slots(
     store: &Path,
 ) -> Result<(), DeployError> {
     for (index, params) in unresolved_slots(envelope)? {
-        let resolved = SlotCx::new(envelope, tables, index)?.params(params, store)?;
+        let resolved = SlotCx::new(envelope, tables, index)
+            .and_then(|slot| slot.params(params, store))
+            .map_err(|e| e.at(index.get(envelope).location.as_ref()))?;
         index.get_mut(envelope).params = resolved;
     }
     Ok(())

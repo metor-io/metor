@@ -372,6 +372,7 @@ impl<O> SystemConfig<O> {
             outputs,
             grants: self.grants,
             adapter: self.adapter,
+            location: self.location,
         })
     }
 }
@@ -544,7 +545,8 @@ mod tests {
             serde_json::from_str::<SystemConfig>(&encoded).expect("round trips"),
             located
         );
-        let bare = serde_json::to_string(&SystemConfig::new("nav", "nav")).expect("encodes");
+        let bare: SystemConfig = SystemConfig::new("nav", "nav");
+        let bare = serde_json::to_string(&bare).expect("encodes");
         assert!(!bare.contains("location"), "{bare}");
         let missing_line = r#"{"id":"nav","ty":"nav","location":{"file":"target.py"}}"#;
         assert!(serde_json::from_str::<SystemConfig>(missing_line).is_err());

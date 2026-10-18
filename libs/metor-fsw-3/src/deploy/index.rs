@@ -284,7 +284,7 @@ impl<'a> DefIndex<'a> {
     fn build_error(&self, index: SystemIndex, source: crate::BuildError) -> DeployError {
         DeployError::Build {
             target: self.envelope.targets[index.target].namespace().to_string(),
-            source,
+            source: source.at(index.get(self.envelope).location.as_ref()),
         }
     }
 }

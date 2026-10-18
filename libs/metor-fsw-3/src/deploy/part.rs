@@ -48,8 +48,9 @@ impl<T: Serialize + DeserializeOwned> Part<T> {
 }
 
 fn params_error<O>(system: &SystemConfig<O>, message: impl ToString) -> DeployError {
-    DeployError::Params {
+    let error = DeployError::Params {
         system: system.id.clone(),
         message: message.to_string(),
-    }
+    };
+    error.at(system.location.as_ref())
 }

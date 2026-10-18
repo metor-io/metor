@@ -135,12 +135,14 @@ impl TargetConfig<DeploySystem> {
         let namespace = self.namespace().to_string();
         let runtime = |system: DeploySystem| {
             let id = system.id.clone();
+            let location = system.location.clone();
             system.try_map_outputs(|port, source| match source {
                 DeploySource::Runtime(source) => Ok(source),
                 DeploySource::Peer(_) => Err(DeployError::Unresolved {
                     system: format!("{namespace}.{id}"),
                     port: port.to_string(),
-                }),
+                }
+                .at(location.as_ref())),
             })
         };
         Ok(TargetConfig {

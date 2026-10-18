@@ -141,15 +141,32 @@ fn plan(
         outputs: Vec::new(),
     };
     for (index, system) in SystemIndex::iter(envelope) {
+        plan.add(envelope, &mut defs, links, index)
+            .map_err(|e| e.at(system.location.as_ref()))?;
+    }
+    Ok(plan)
+}
+
+impl Plan {
+    /// Plans the peer outputs and the peer transport of the system at
+    /// `index`.
+    fn add(
+        &mut self,
+        envelope: &DeploymentConfig,
+        defs: &mut DefIndex<'_>,
+        links: &Links,
+        index: SystemIndex,
+    ) -> Result<(), DeployError> {
+        let system = index.get(envelope);
         for (output_index, output) in system.outputs.iter().enumerate() {
             if let DeploySource::Peer(peer) = &output.source {
                 let def = defs.peer_port(index, &output.port, peer)?;
-                plan.outputs.push(((index, output_index), def));
+                self.outputs.push(((index, output_index), def));
             }
         }
         let Some(DeployTransport::Peer(peer)) = links.get(index).map(|params| &params.transport)
         else {
-            continue;
+            return Ok(());
         };
         let from = defs.name(index);
         let peer_index = defs.locate(&from, &peer.target, &peer.link)?;
@@ -160,10 +177,10 @@ fn plan(
                 target: peer.target.clone(),
                 link: peer.link.clone(),
             })?;
-        plan.transports
+        self.transports
             .push((index, address(host(envelope, &peer.target), port)));
+        Ok(())
     }
-    Ok(plan)
 }
 
 /// Checks that no two listeners on the same host bind the same port.
@@ -177,12 +194,13 @@ fn check_ports(envelope: &DeploymentConfig, links: &Links) -> Result<(), DeployE
         let host = host(envelope, target.namespace()).to_string();
         let name = format!("{}.{}", target.namespace(), system.id);
         if let Some(first) = bound.insert((host.clone(), port), name.clone()) {
-            return Err(DeployError::PortTaken {
+            let taken = DeployError::PortTaken {
                 host,
                 port,
                 first,
                 second: name,
-            });
+            };
+            return Err(taken.at(system.location.as_ref()));
         }
     }
     Ok(())
