@@ -626,6 +626,7 @@ mod tests {
                     Vec::new()
                 },
                 outputs: if input { Vec::new() } else { vec![port] },
+                log: None,
             };
             assert_eq!(
                 def.check_alignment("test"),
@@ -655,6 +656,7 @@ mod tests {
                 } else {
                     vec![port.clone(), port.clone()]
                 },
+                log: None,
             };
             let expected = if input {
                 BuildError::DuplicateInput {
@@ -679,6 +681,7 @@ mod tests {
             name: "test".into(),
             inputs: vec![port.clone()],
             outputs: vec![port],
+            log: None,
         };
         assert_eq!(def.check_port_names(&instance), Ok(()));
         assert_eq!(

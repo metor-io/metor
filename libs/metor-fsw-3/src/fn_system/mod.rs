@@ -97,7 +97,7 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
         if defs.rng {
             return Err(DefError::RngOnAsync { system });
         }
-        SystemDef::new::<InSet<S, Notifier>, OutSet<S>, _>(S::NAME, cx)
+        set::system_def::<S, Notifier>(cx)
     }
 
     /// Runs the system, sending its log lines to its own `log` output.
@@ -121,7 +121,7 @@ impl<S: SystemFn> System for FnSystem<S> {
     type Outputs = OutSet<S>;
 
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        SystemDef::new::<InSet<S>, OutSet<S>, _>(S::NAME, cx)
+        set::system_def::<S, NoWake>(cx)
     }
 
     /// Runs one cycle, sending its log lines to the system's own `log` output.

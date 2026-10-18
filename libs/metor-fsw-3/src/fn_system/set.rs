@@ -12,7 +12,7 @@ use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::log::LogPort;
 use crate::port::{InputWake, Output};
-use crate::system::{InputBinding, OutputBinding, PortDef, Ports};
+use crate::system::{InputBinding, OutputBinding, PortDef, Ports, SystemDef};
 
 use super::FnSignature;
 use super::param::{Defs, Instance, Param, Views, Writers};
@@ -47,6 +47,15 @@ impl<S: FnSignature, W: InputWake> InSet<S, W> {
 }
 
 impl<S: FnSignature> OutSet<S> {
+    /// The parameters' output defs with `log` appended, and the index of
+    /// `log`.
+    fn defs_with_log(cx: &DefCx<'_>) -> Result<(Vec<PortDef>, usize), DefError> {
+        let mut outputs = Defs::of::<S>(cx)?.outputs;
+        let log = outputs.len();
+        outputs.push(Output::<LogEvent>::def(cx, LOG_PORT));
+        Ok((outputs, log))
+    }
+
     /// Hands `writers` to the parameters, in order, and the last one to the
     /// log.
     ///
@@ -91,9 +100,7 @@ impl<S: FnSignature, W: InputWake> Ports<InputBinding<W>> for InSet<S, W> {
 
 impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
-        let mut outputs = Defs::of::<S>(cx)?.outputs;
-        outputs.push(Output::<LogEvent>::def(cx, LOG_PORT));
-        Ok(outputs)
+        Ok(OutSet::<S>::defs_with_log(cx)?.0)
     }
 
     /// Binds the outputs under an unnamed instance with no seed and an empty
@@ -105,6 +112,19 @@ impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
         // an `Rng` through `bind`.
         Self::from_writers(writers).expect("no Rng parameter")
     }
+}
+
+/// Returns fn system `S`'s definition, which records its `log` output.
+pub(crate) fn system_def<S: FnSignature, W: InputWake>(
+    cx: &DefCx<'_>,
+) -> Result<SystemDef, DefError> {
+    let (outputs, log) = OutSet::<S>::defs_with_log(cx)?;
+    Ok(SystemDef {
+        name: S::NAME.into(),
+        inputs: InSet::<S, W>::defs(cx)?,
+        outputs,
+        log: Some(log),
+    })
 }
 
 /// A fn system's bound ports.

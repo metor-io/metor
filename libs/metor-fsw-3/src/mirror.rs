@@ -17,7 +17,6 @@ use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 
 use crate::coordinator::ParamError;
-use crate::fn_system::LOG_PORT;
 use crate::log::LogEventExt;
 use crate::record::{Payload, Record};
 use crate::system::SystemDef;
@@ -128,7 +127,7 @@ impl<W: WakeSource> Mirrors<W> {
             line: vec![0; LogEvent::MAX_LEN],
             fields: core::iter::once(kind).chain(counts).collect(),
             since_report: 0,
-            log: log_port(def),
+            log: def.log,
             inputs,
             outputs,
         }
@@ -240,13 +239,6 @@ pub(crate) fn mirror_config(
         capacity: capacity.checked_mul(factor).ok_or(too_large)?,
         max_readers: readers,
     })
-}
-
-/// Returns the index of the system's `log` output, if it has one.
-fn log_port(def: &SystemDef) -> Option<usize> {
-    def.outputs
-        .iter()
-        .position(|port| port.name == LOG_PORT && port.id == LogEvent::ID)
 }
 
 #[cfg(test)]

@@ -62,6 +62,9 @@ pub struct SystemDef {
     pub name: Cow<'static, str>,
     pub inputs: Vec<PortDef>,
     pub outputs: Vec<PortDef>,
+    /// The index in `outputs` of the `log` output, if the system has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<usize>,
 }
 
 impl SystemDef {
@@ -77,6 +80,7 @@ impl SystemDef {
             name: name.into(),
             inputs: I::defs(cx)?,
             outputs: O::defs(cx)?,
+            log: None,
         })
     }
 }

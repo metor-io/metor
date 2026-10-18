@@ -1137,3 +1137,14 @@ fn test_async_records_param_reads_the_host_table() {
     };
     assert_eq!(estimate, 1.0);
 }
+
+/// A fn system's def records where its `log` output is.
+#[test]
+fn test_def_records_its_log_output() {
+    let def = def_of(counting());
+    let log = def.log.expect("a fn system logs");
+    assert_eq!(def.outputs[log].name, LOG_PORT);
+    assert_eq!(def.outputs[log].id, LogEvent::ID);
+    let bare = SystemDef::new::<(), (), NoWake>("bare", &DefCx::empty()).expect("no ports");
+    assert_eq!(bare.log, None, "a hand-written def names no log");
+}
