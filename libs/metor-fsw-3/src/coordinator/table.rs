@@ -463,6 +463,7 @@ impl TableEntry {
     ) -> Result<Self, DefError> {
         Ok(Self {
             kind: SystemKind::Sequence,
+            #[cfg(feature = "host")]
             adapters: SystemKind::Sequence.adapters(),
             def: sequence::def::<S>(&DefCx::empty())?,
             def_fn: Box::new(sequence::def::<S>),
