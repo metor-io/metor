@@ -15,9 +15,7 @@ use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
 
 use crate::def::{DefCx, Records};
-use crate::io::{
-    Backing, Cqe, IO_CQ, IO_SQ, IO_TYPE, IoState, ResourceEnd, ResourceIndex, SharedIo,
-};
+use crate::io::{Backing, Cqe, IO_CQ, IO_SQ, IO_TYPE, IoState, ResourceEnd, ResourceIndex};
 use crate::port::{Output, ring_capacity};
 use crate::record::Record;
 use crate::system::{PortDef, SystemDef};
@@ -102,13 +100,13 @@ impl CoordinatorConfig {
             false => Threads::default(),
         };
         let members = io_members(&plan, &bindings);
-        let io = SharedIo::new(IoState::build(&self.resources, members)?.into());
+        let mut io = IoState::build(&self.resources, members)?;
         let args = SharedMakeArgs {
             seed: self.seed,
             namespace: self.namespace.as_deref(),
             records: &records,
         };
-        let mut entries = make_systems(&plan, &rings, &mut threads, &io, args)?;
+        let mut entries = make_systems(&plan, &rings, &mut threads, &mut io, args)?;
         for group in threads.into_turned() {
             // PANIC Safety: a group starts with the make of an entry.
             let first = entries.iter_mut().find(|e| e.name == group.first());
@@ -117,6 +115,7 @@ impl CoordinatorConfig {
 
         Ok(Coordinator {
             entries,
+            io,
             clock: self.clock,
             epoch: self.clock.epoch().unwrap_or_else(Timestamp::now),
             cycle: 0,
@@ -725,7 +724,7 @@ fn make_systems(
     plan: &Plan<'_>,
     rings: &[RingBuffer],
     threads: &mut Threads,
-    io: &SharedIo,
+    io: &mut IoState,
     args: SharedMakeArgs<'_>,
 ) -> Result<Vec<Entry>, BuildError> {
     let mut entries = Vec::with_capacity(plan.systems.len());

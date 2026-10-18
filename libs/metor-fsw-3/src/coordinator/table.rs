@@ -12,7 +12,7 @@ use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, SystemFn};
-use crate::io::SharedIo;
+use crate::io::IoState;
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 use crate::thread::{DEFAULT_THREAD, LaunchCx, Launched, Threads};
 
@@ -34,8 +34,8 @@ pub struct MakeCx<'a> {
     pub inputs: Vec<Vec<&'a RingBuffer>>,
     pub outputs: Vec<&'a RingBuffer>,
     pub threads: &'a mut Threads,
-    /// What the build's IO systems and io steps share.
-    pub io: &'a SharedIo,
+    /// The coordinator's IO state, lent for the make.
+    pub io: &'a mut IoState,
     /// The target seed every `Rng` parameter draws from.
     pub seed: u64,
     /// The target's namespace.
@@ -759,7 +759,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             threads: &mut threads,
-            io: &crate::io::SharedIo::default(),
+            io: &mut IoState::default(),
             seed: 0,
             namespace: None,
             records: &Default::default(),

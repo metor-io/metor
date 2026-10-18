@@ -12,12 +12,12 @@ use serde::Deserialize;
 
 use super::dispatch::Dispatch;
 use super::{Host, Os, OsDone, Route};
-use crate::coordinator::{Adapters, MakeCx, ParamError, Step, SystemKind, TableEntry};
+use crate::coordinator::{Adapters, MakeCx, ParamError, Step, StepCx, SystemKind, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::fn_system::LOG_PORT;
 use crate::io::arena::Arena;
 use crate::io::status::ResourceStatus;
-use crate::io::{Cqe, IoState, MAX_OPS, SharedIo, Sqe};
+use crate::io::{Cqe, IoState, MAX_OPS, Sqe};
 use crate::log::LogPort;
 use crate::port::{Input, Output};
 use crate::system::{OutputBinding, SystemDef};
@@ -71,7 +71,7 @@ fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
 fn make(mut cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     let params: IoParams = cx.params.decode()?;
     let (views, mut fixed) = cx.take_bindings();
-    let io = cx.io.borrow();
+    let io = &*cx.io;
     let names = cx.def.inputs.iter().map(|p| p.name.as_ref());
     let members: Vec<usize> = names
         .map(|n| io.member_index(n))
@@ -92,7 +92,6 @@ fn make(mut cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     let owned = cqs.iter().flatten().count() * MAX_OPS;
     let ops = io.members.len() * MAX_OPS;
     Ok(Box::new(IoStep {
-        io: cx.io.clone(),
         sqs: sqs.map(|(m, b)| (m, Input::new(b.views))).collect(),
         cqs,
         status: params.status.then_some(status),
@@ -105,7 +104,6 @@ fn make(mut cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
 
 /// One placement of `fsw.io`.
 struct IoStep {
-    io: SharedIo,
     /// The SQ of each member it lowers, with the member's index.
     sqs: Vec<(usize, Input<Sqe>)>,
     /// The CQ of each member it posts to, by member index.
@@ -129,10 +127,8 @@ struct Faults {
 }
 
 impl Step for IoStep {
-    fn execute(&mut self, now: Timestamp) {
-        let shared = self.io.clone();
-        let mut io = shared.borrow_mut();
-        let IoState { members, host, .. } = &mut *io;
+    fn execute(&mut self, now: Timestamp, cx: &mut StepCx<'_>) {
+        let IoState { members, host, .. } = &mut *cx.io;
         let Some(Host { dispatch, os }) = host.as_mut() else {
             return;
         };

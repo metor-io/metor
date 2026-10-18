@@ -8,12 +8,13 @@ use futures_lite::future::poll_once;
 use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
+use crate::io::IoState;
 use crate::port::Output;
 use crate::thread::TurnedGroup;
 
 use super::config::Clock;
 use super::status::SystemStatus;
-use super::step::{EndReason, StepState};
+use super::step::{EndReason, StepCx, StepState};
 
 /// A system in the coordinator's schedule.
 pub(super) struct Entry {
@@ -32,6 +33,8 @@ pub(super) struct Entry {
 /// that panics is stopped, and the rest keep running.
 pub struct Coordinator {
     pub(super) entries: Vec<Entry>,
+    /// The IO state every step can reach through its `StepCx`.
+    pub(super) io: IoState,
     pub(super) clock: Clock,
     /// Time zero of the simulated clock, taken at build.
     pub(super) epoch: Timestamp,
@@ -67,9 +70,10 @@ impl Coordinator {
     /// status is still written each cycle, with an execution time of zero.
     pub fn step(&mut self, now: Timestamp) {
         let cycle_start = Instant::now();
+        let mut cx = StepCx::new(&mut self.io);
         for entry in &mut self.entries {
             let offset = cycle_start.elapsed();
-            let elapsed = entry.run(now);
+            let elapsed = entry.run(now, &mut cx);
             let _ = entry.status.write(&SystemStatus {
                 timestamp: now,
                 exec_time_ns: duration_to_nanos(elapsed),
@@ -117,7 +121,7 @@ impl Entry {
     }
 
     /// Turns the entry's group, then executes its step unless it has ended.
-    fn run(&mut self, now: Timestamp) -> Duration {
+    fn run(&mut self, now: Timestamp, cx: &mut StepCx<'_>) -> Duration {
         if let Some(group) = &mut self.turned {
             group.turn(now);
         }
@@ -125,7 +129,7 @@ impl Entry {
             return Duration::ZERO;
         }
         let started = Instant::now();
-        let unwound = self.step.run(now);
+        let unwound = self.step.run(now, cx);
         let elapsed = started.elapsed();
         if unwound {
             crate::panic::catch(|| tracing::error!(system = self.name, "system panicked"));
@@ -386,16 +390,22 @@ mod tests {
     fn test_non_string_panic_payload() {
         struct Odd;
         impl Step for Odd {
-            fn execute(&mut self, _now: Timestamp) {
+            fn execute(&mut self, _now: Timestamp, _cx: &mut crate::coordinator::StepCx<'_>) {
                 std::panic::panic_any(7u8);
             }
         }
         assert_eq!(crate::panic::message(&7u8), "panic");
         let mut step = StepState::Live(Box::new(Odd));
-        assert!(step.run(Timestamp(0)));
+        assert!(step.run(
+            Timestamp(0),
+            &mut crate::coordinator::StepCx::new(&mut Default::default())
+        ));
         assert_eq!(step.end_reason(), Some(&EndReason::Panicked));
         assert!(
-            !step.run(Timestamp(1)),
+            !step.run(
+                Timestamp(1),
+                &mut crate::coordinator::StepCx::new(&mut Default::default())
+            ),
             "a dropped step does not unwind again"
         );
     }
@@ -404,12 +414,15 @@ mod tests {
     fn test_step_state_runs_a_live_step() {
         struct Clean(u64);
         impl Step for Clean {
-            fn execute(&mut self, _now: Timestamp) {
+            fn execute(&mut self, _now: Timestamp, _cx: &mut crate::coordinator::StepCx<'_>) {
                 self.0 += 1;
             }
         }
         let mut step = StepState::Live(Box::new(Clean(0)));
-        assert!(!step.run(Timestamp(0)));
+        assert!(!step.run(
+            Timestamp(0),
+            &mut crate::coordinator::StepCx::new(&mut Default::default())
+        ));
         assert_eq!(step.end_reason(), None);
     }
 
@@ -418,7 +431,10 @@ mod tests {
         let runs = std::rc::Rc::default();
         let mut step = StepState::Live(Box::new(Twice(Clone::clone(&runs), None)));
         for now in 0..3 {
-            assert!(!step.run(Timestamp(now)));
+            assert!(!step.run(
+                Timestamp(now),
+                &mut crate::coordinator::StepCx::new(&mut Default::default())
+            ));
         }
         assert_eq!(runs.get(), 2);
         assert!(matches!(step, StepState::Live(_)));

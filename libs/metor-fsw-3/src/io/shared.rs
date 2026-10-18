@@ -1,7 +1,6 @@
-//! `IoState`: what a build's IO systems, models, guests, channel adapters,
-//! and io steps share, behind `MakeCx::io`.
+//! `IoState`: the IO state the coordinator owns, which makes reach through
+//! `MakeCx::io` and steps through `StepCx::io`.
 
-use core::cell::RefCell;
 use std::rc::Rc;
 
 use super::arena::Arena;
@@ -22,9 +21,6 @@ pub struct IoState {
     #[cfg(all(feature = "host", unix))]
     pub(crate) host: Option<super::host::Host>,
 }
-
-/// `IoState`, shared through `MakeCx::io`.
-pub type SharedIo = Rc<RefCell<IoState>>;
 
 impl IoState {
     /// A target's members, in config order.

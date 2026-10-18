@@ -10,7 +10,7 @@ use metor_fsw_3_ring::NoWake;
 
 use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
-use crate::io::{Io, SharedIo};
+use crate::io::{Io, IoState};
 use crate::log::LogPort;
 use crate::port::{InputWake, Output};
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports, SystemDef};
@@ -165,17 +165,15 @@ pub(crate) type IoBoundSet<S> = (InSet<S>, OutSet<S>, Option<Io>);
 /// Binds a stepped fn system's ports, including its queue pair.
 ///
 /// The IO ports come after the parameters' own (see `Defs::append_io`). A
-/// system with a `Cap` takes its member's arena from `shared`.
+/// system with a `Cap` takes its member's arena from `state`.
 pub(crate) fn bind_with_io<S: FnSignature>(
     mut inputs: Vec<InputBinding>,
     mut outputs: Vec<OutputBinding>,
     instance: Instance,
-    shared: &SharedIo,
+    state: &mut IoState,
 ) -> Result<IoBoundSet<S>, ParamError> {
     let defs = Defs::declared::<S>();
-    let arena = defs
-        .has_io()
-        .then(|| shared.borrow_mut().get_or_add_member(&instance.id));
+    let arena = defs.has_io().then(|| state.get_or_add_member(&instance.id));
     let io_ports = defs.io_ports();
     // PANIC Safety: build binds one entry per port of the definition these
     // `Defs` describe, with `log` last among the outputs.

@@ -1,6 +1,3 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use metor_fsw_3_ring::{NoWake, RingBuffer};
 use zerocopy::IntoBytes;
 
@@ -14,6 +11,7 @@ use crate::tests::utils::{input, pair, ring};
 /// One member on a sim GPIO line, its SQ, CQ, and the step's log.
 struct Rig {
     step: IoStep,
+    io: IoState,
     /// Raw, so a test can write a record that does not decode.
     sq: Output<Bytes>,
     cq: Input<Cqe>,
@@ -44,7 +42,6 @@ fn rig(sq_depth: usize, cq_depth: usize) -> Rig {
     let (cq_ring, cq_out, cq) = pair::<Cqe>(cq_depth);
     let (log_ring, log_out, log) = pair::<LogEvent>(16);
     let step = IoStep {
-        io: Rc::new(RefCell::new(io)),
         sqs: vec![(0, sq_in)],
         cqs: vec![Some(cq_out)],
         status: None,
@@ -55,6 +52,7 @@ fn rig(sq_depth: usize, cq_depth: usize) -> Rig {
     };
     Rig {
         step,
+        io,
         sq,
         cq,
         log,
@@ -86,7 +84,8 @@ impl Rig {
     fn pass(&mut self, sqes: impl IntoIterator<Item = Sqe>) {
         sqes.into_iter()
             .for_each(|sqe| self.sq.write(sqe.as_bytes()).unwrap());
-        self.step.execute(Timestamp(1));
+        self.step
+            .execute(Timestamp(1), &mut StepCx::new(&mut self.io));
     }
 
     fn slots(&mut self) -> Vec<u16> {

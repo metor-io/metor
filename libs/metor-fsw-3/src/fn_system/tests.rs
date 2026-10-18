@@ -619,7 +619,7 @@ fn test_async_adapter_relay() {
         inputs: vec![vec![&imu]],
         outputs: vec![&nav, &log],
         threads: &mut threads,
-        io: &crate::io::SharedIo::default(),
+        io: &mut crate::io::IoState::default(),
         seed: 0,
         namespace: None,
         records: &Default::default(),
@@ -634,7 +634,10 @@ fn test_async_adapter_relay() {
             std::time::Instant::now() < deadline,
             "the thread never relayed"
         );
-        step.execute(Timestamp(1));
+        step.execute(
+            Timestamp(1),
+            &mut crate::coordinator::StepCx::new(&mut Default::default()),
+        );
         seen.extend(lines.drain().map(|l| l.expect("decodes").message));
         if let Some(nav) = estimates.latest().expect("valid") {
             break nav.estimate;
@@ -800,7 +803,7 @@ fn flooded(a: usize, b: usize, cycles: i64) -> Vec<LogEvent> {
         inputs: Vec::new(),
         outputs: vec![&ring_a, &ring_b, &log],
         threads: &mut threads,
-        io: &crate::io::SharedIo::default(),
+        io: &mut crate::io::IoState::default(),
         seed: 0,
         namespace: None,
         records: &Default::default(),
@@ -808,7 +811,10 @@ fn flooded(a: usize, b: usize, cycles: i64) -> Vec<LogEvent> {
     .expect("no params");
     let mut seen = Vec::new();
     for cycle in 1..=cycles {
-        step.execute(Timestamp(cycle));
+        step.execute(
+            Timestamp(cycle),
+            &mut crate::coordinator::StepCx::new(&mut Default::default()),
+        );
         seen.extend(lines.drain().map(|line| line.expect("decodes")));
     }
     seen
@@ -1097,7 +1103,7 @@ fn test_async_records_param_reads_the_host_table() {
         inputs: Vec::new(),
         outputs: vec![&nav, &log],
         threads: &mut threads,
-        io: &crate::io::SharedIo::default(),
+        io: &mut crate::io::IoState::default(),
         seed: 0,
         namespace: None,
         records: &records,
@@ -1106,7 +1112,10 @@ fn test_async_records_param_reads_the_host_table() {
     let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
     let estimate = loop {
         assert!(std::time::Instant::now() < deadline, "no lookup arrived");
-        step.execute(Timestamp(1));
+        step.execute(
+            Timestamp(1),
+            &mut crate::coordinator::StepCx::new(&mut Default::default()),
+        );
         if let Some(nav) = estimates.latest().expect("valid") {
             break nav.estimate;
         }

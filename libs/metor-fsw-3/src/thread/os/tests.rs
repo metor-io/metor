@@ -282,7 +282,7 @@ fn test_corrupt_mirror_ends_the_system() {
         inputs: vec![vec![&imu]],
         outputs: vec![&nav, &log],
         threads: &mut threads,
-        io: &crate::io::SharedIo::default(),
+        io: &mut crate::io::IoState::default(),
         seed: 0,
         namespace: None,
         records: &Default::default(),
@@ -301,7 +301,10 @@ fn test_corrupt_mirror_ends_the_system() {
     for cycle in 1..=8 {
         let now = Timestamp(cycle * 1_000_000);
         groups.iter_mut().for_each(|group| group.turn(now));
-        step.execute(now);
+        step.execute(
+            now,
+            &mut crate::coordinator::StepCx::new(&mut Default::default()),
+        );
         if step.ended().is_some() {
             break;
         }

@@ -9,6 +9,7 @@ use metor_component::{FrameBytes, FrameStr};
 use metor_proto::types::Timestamp;
 
 use super::params::MakeError;
+use crate::io::IoState;
 use crate::system::System;
 
 /// A system the coordinator can run.
@@ -16,7 +17,7 @@ use crate::system::System;
 /// The coordinator calls [`Step::execute`] once per cycle. The trait hides each
 /// system's concrete type, so systems of any type can share one schedule.
 pub trait Step {
-    fn execute(&mut self, now: Timestamp);
+    fn execute(&mut self, now: Timestamp, cx: &mut StepCx<'_>);
 
     /// Called once after `execute` panics, with the panic message.
     fn fault(&mut self, _now: Timestamp, _message: &str) {}
@@ -36,6 +37,18 @@ pub trait Step {
     /// Returns the system this step has loaded, if any.
     fn occupant(&self) -> Option<&Occupant> {
         None
+    }
+}
+
+/// What the coordinator lends a step while it executes.
+#[non_exhaustive]
+pub struct StepCx<'a> {
+    pub io: &'a mut IoState,
+}
+
+impl<'a> StepCx<'a> {
+    pub fn new(io: &'a mut IoState) -> Self {
+        Self { io }
     }
 }
 
@@ -88,7 +101,7 @@ pub(crate) struct Runner<S: System> {
 }
 
 impl<S: System> Step for Runner<S> {
-    fn execute(&mut self, now: Timestamp) {
+    fn execute(&mut self, now: Timestamp, _cx: &mut StepCx<'_>) {
         self.system
             .execute(now, &mut self.state, &mut self.inputs, &mut self.outputs);
     }
@@ -117,11 +130,11 @@ impl StepState {
     ///
     /// If `execute` panics, the step's `fault` hook runs, the step is dropped,
     /// and this returns true.
-    pub(crate) fn run(&mut self, now: Timestamp) -> bool {
+    pub(crate) fn run(&mut self, now: Timestamp, cx: &mut StepCx<'_>) -> bool {
         let Self::Live(step) = self else {
             return false;
         };
-        if !catch_execute(step.as_mut(), now) {
+        if !catch_execute(step.as_mut(), now, cx) {
             return false;
         }
         let step = core::mem::replace(self, Self::Panicked);
@@ -134,12 +147,12 @@ impl StepState {
 ///
 /// If `execute` panics, the step's `fault` hook runs and this returns true.
 /// The caller then drops the step.
-pub(crate) fn catch_execute(step: &mut dyn Step, now: Timestamp) -> bool {
+pub(crate) fn catch_execute(step: &mut dyn Step, now: Timestamp, cx: &mut StepCx<'_>) -> bool {
     if step.ended().is_some() {
         return false;
     }
     // PANIC Safety: the panic is caught, and the caller drops the step.
-    let Err(payload) = catch_unwind(AssertUnwindSafe(|| step.execute(now))) else {
+    let Err(payload) = catch_unwind(AssertUnwindSafe(|| step.execute(now, cx))) else {
         return false;
     };
     let message = crate::panic::into_message(payload);

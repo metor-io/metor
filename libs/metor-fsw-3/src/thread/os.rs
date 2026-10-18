@@ -24,7 +24,7 @@ use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogLevel;
 
 use crate::async_system::{AsyncSystem, Running, Stop};
-use crate::coordinator::{EndReason, MakeCx, MakeError, Params, Step};
+use crate::coordinator::{EndReason, MakeCx, MakeError, Params, Step, StepCx};
 use crate::fn_system::Instance;
 use crate::mirror::{Mirror, Mirrors};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef};
@@ -199,7 +199,7 @@ pub struct ThreadAdapter {
 }
 
 impl Step for ThreadAdapter {
-    fn execute(&mut self, now: Timestamp) {
+    fn execute(&mut self, now: Timestamp, _cx: &mut StepCx<'_>) {
         let fed = self.mirrors.drain_inputs();
         let taken = self.mirrors.drain_outputs();
         if fed.and(taken).is_err() {

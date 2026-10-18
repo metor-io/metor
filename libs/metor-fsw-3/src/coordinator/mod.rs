@@ -30,6 +30,6 @@ pub use params::{MakeError, ParamError, Params};
 #[cfg(feature = "host")]
 pub use run::Coordinator;
 pub use status::SystemStatus;
-pub use step::{EndReason, LoadError, Occupant, Step};
+pub use step::{EndReason, LoadError, Occupant, Step, StepCx};
 pub(crate) use table::TableEntry;
 pub use table::{MakeCx, SystemKind, SystemTable};
