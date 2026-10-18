@@ -54,17 +54,15 @@ pub trait Record {
     /// Decodes one record from `bytes`.
     fn decode(bytes: &[u8]) -> Result<Self::Read<'_>, DecodeError>;
 
-    /// Returns the schema this record announces to the ground.
-    ///
-    /// Frame fields are named relative to the record itself.
-    fn schema() -> RecordSchema;
-
     /// Returns the schema a port rooted at `root` announces.
     ///
     /// A frame names its fields under `root`. A message has no field paths, so
-    /// it announces the same schema as [`Record::schema`].
-    fn schema_with_root(_root: &str) -> RecordSchema {
-        Self::schema()
+    /// it ignores `root`.
+    fn schema_with_root(root: &str) -> RecordSchema;
+
+    /// Returns the schema rooted at the record's own name.
+    fn schema() -> RecordSchema {
+        Self::schema_with_root(Self::NAME)
     }
 
     /// Returns a fingerprint of a frame's field layout, or `None` for a message.
@@ -116,7 +114,7 @@ impl<T: PostcardRecord> Record for T {
         postcard::decode(bytes)
     }
 
-    fn schema() -> RecordSchema {
+    fn schema_with_root(_root: &str) -> RecordSchema {
         RecordSchema::postcard::<T>(<T as PostcardRecord>::NAME)
     }
 }
@@ -361,7 +359,7 @@ impl Record for Bytes {
         Ok(bytes)
     }
 
-    fn schema() -> RecordSchema {
+    fn schema_with_root(_root: &str) -> RecordSchema {
         RecordSchema::Msg {
             id: [0, 0],
             name: Self::NAME.to_string(),
@@ -399,7 +397,7 @@ mod tests {
             json::decode(bytes)
         }
 
-        fn schema() -> RecordSchema {
+        fn schema_with_root(_root: &str) -> RecordSchema {
             RecordSchema::msg(Self::NAME, MsgCodec::Json)
         }
     }
@@ -430,6 +428,11 @@ mod tests {
         assert_ne!(Imu::layout(), BareName::layout());
         assert_eq!(Note::layout(), None);
         assert_eq!(NoteJson::layout(), None);
+    }
+
+    #[test]
+    fn test_message_schema_ignores_root() {
+        assert_eq!(Note::schema_with_root("cube_sat.note"), Note::schema());
     }
 
     #[test]

@@ -99,9 +99,6 @@ pub fn frame(input: TokenStream) -> TokenStream {
             fn timestamp(&self) -> Option<#proto::types::Timestamp> {
                 Some(#timestamp_body)
             }
-            fn schema() -> #fsw::record::RecordSchema {
-                #fsw::record::RecordSchema::frame::<Self>(Self::NAME)
-            }
             fn schema_with_root(root: &str) -> #fsw::record::RecordSchema {
                 #fsw::record::RecordSchema::frame::<Self>(root)
             }

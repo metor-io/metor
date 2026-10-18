@@ -93,7 +93,7 @@ pub fn record(input: TokenStream) -> TokenStream {
             fn decode(bytes: &[u8]) -> Result<Self, #fsw::DecodeError> {
                 #fsw::record::postcard::decode(bytes)
             }
-            fn schema() -> #fsw::record::RecordSchema {
+            fn schema_with_root(_root: &str) -> #fsw::record::RecordSchema {
                 #fsw::record::RecordSchema::postcard::<Self>(#name)
             }
         }
