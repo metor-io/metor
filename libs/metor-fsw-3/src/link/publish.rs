@@ -138,7 +138,9 @@ impl<D: WakeSink + 'static> Param for PublishInputs<D> {
         PublishInputs(<DynInputs<D> as Param>::bind_in(views))
     }
 
-    fn bind_out(_writers: &mut Writers) {}
+    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<(), ParamError> {
+        <DynInputs<D> as Param>::bind_out(names, writers)
+    }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
         input: &'a mut PublishInputs<W>,

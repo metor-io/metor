@@ -189,8 +189,11 @@ impl Param for SubscribeOutputs {
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
-    fn bind_out(writers: &mut Writers) -> SubscribeOutputs {
-        SubscribeOutputs(<DynOutputs as Param>::bind_out(writers))
+    fn bind_out(
+        names: &mut ParamNames<'_>,
+        writers: &mut Writers,
+    ) -> Result<SubscribeOutputs, ParamError> {
+        <DynOutputs as Param>::bind_out(names, writers).map(SubscribeOutputs)
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
