@@ -21,6 +21,9 @@ pub struct State {
 }
 
 /// A channel command, without its payload.
+///
+/// It is the Kani proof's input: the proof generates it where it could not
+/// cheaply generate a `Load`'s strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Load,
