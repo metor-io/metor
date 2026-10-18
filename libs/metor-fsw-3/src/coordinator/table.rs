@@ -432,7 +432,7 @@ mod tests {
             max_len: 32,
             alignment: 1,
             depth: 1,
-            layout: 0,
+            layout: None,
             schema: RecordSchema::msg(name, codec),
         }
     }

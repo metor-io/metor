@@ -28,10 +28,10 @@ pub struct PortDef {
     pub max_len: usize,
     pub alignment: usize,
     pub depth: usize,
-    /// A fingerprint of a frame's field layout, or zero for a message.
+    /// A fingerprint of a frame's field layout, or `None` for a message.
     ///
-    /// See [`RecordSchema::layout`].
-    pub layout: u64,
+    /// See [`Record::layout`](crate::Record::layout).
+    pub layout: Option<u64>,
     /// The schema this port announces to the ground.
     pub schema: RecordSchema,
 }
@@ -39,7 +39,8 @@ pub struct PortDef {
 impl PortDef {
     /// Returns whether two ports carry the same record.
     ///
-    /// The ports' own names are ignored.
+    /// The ports' own names are ignored. A frame's schema depends on its port's
+    /// root, so frames are matched by layout and messages by schema.
     pub fn same_record(&self, other: &PortDef) -> bool {
         self.record == other.record
             && self.id == other.id
@@ -47,7 +48,10 @@ impl PortDef {
             && self.alignment == other.alignment
             && self.depth == other.depth
             && self.layout == other.layout
-            && self.schema.same_record(&other.schema)
+            && match (&self.schema, &other.schema) {
+                (RecordSchema::Frame { .. }, RecordSchema::Frame { .. }) => true,
+                (schema, other_schema) => schema == other_schema,
+            }
     }
 }
 
@@ -173,7 +177,7 @@ mod tests {
                 max_len: size_of::<Nav>(),
                 alignment: align_of::<Nav>(),
                 depth: 1,
-                layout: Nav::schema().layout(),
+                layout: Nav::layout(),
                 schema: Nav::schema(),
             }
         );

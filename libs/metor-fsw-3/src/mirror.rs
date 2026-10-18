@@ -19,7 +19,7 @@ use metor_proto_wkt::{LogEvent, LogLevel};
 use crate::coordinator::ParamError;
 use crate::fn_system::LOG_PORT;
 use crate::log::LogEventExt;
-use crate::record::Record;
+use crate::record::{Payload, Record};
 use crate::system::SystemDef;
 
 /// How many cycles pass between drop reports. Drop counts add up in between.

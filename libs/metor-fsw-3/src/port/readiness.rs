@@ -12,7 +12,7 @@ use maitake_sync::wait_queue::WaitOwned;
 use metor_fsw_3_ring::{Notifier, View, WakeSink};
 
 use super::{DynInputs, Input};
-use crate::record::Record;
+use crate::record::Payload;
 
 /// One wait slot per producer, each beside the [`Notifier`] that re-arms it.
 pub(super) struct Waiters {
@@ -72,7 +72,7 @@ impl<R: Readiness> Drop for Waiting<'_, R> {
     }
 }
 
-impl<T: Record + ?Sized> Readiness for Input<T, Notifier> {
+impl<T: Payload + ?Sized> Readiness for Input<T, Notifier> {
     type Output = usize;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<usize> {

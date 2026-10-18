@@ -18,7 +18,7 @@ use crate::coordinator::{
 use crate::log::{Log, LogEventExt};
 use crate::port::{Input, Output, Sample, ring_capacity};
 use crate::tests::utils::{Control, Imu, Nav, NoParams, input, output, pair, ring};
-use crate::{Frame, Record};
+use crate::{Frame, Payload, Record};
 
 /// Doubles the newest sample, stamping it with the cycle time.
 struct Doubler;

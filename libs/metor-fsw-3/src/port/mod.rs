@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::def::{DefCx, DefError};
-use crate::record::{Bytes, DecodeError, EncodeError, Record};
+use crate::record::{Bytes, DecodeError, EncodeError, Payload, Record};
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports};
 use metor_fsw_3_ring::{
     NoWake, Notifier, PAYLOAD_ALIGNMENT, ReadError, View, WakeSink, WakeSource, WriteError, Writer,
@@ -91,7 +91,21 @@ pub struct Output<T: ?Sized, W: WakeSource = NoWake> {
     _t: PhantomData<T>,
 }
 
-impl<T: ?Sized, W: WakeSource> Output<T, W> {
+impl<T: Payload + ?Sized, W: WakeSource> Output<T, W> {
+    /// Encodes `value` and publishes it as one record.
+    ///
+    /// A failure is counted as well as returned.
+    pub fn write(&mut self, value: &T) -> Result<(), SendError> {
+        let written = self.encode_write(value);
+        self.counted(written)
+    }
+
+    fn encode_write(&mut self, value: &T) -> Result<(), SendError> {
+        let bytes = value.encode(&mut self.scratch).map_err(SendError::Encode)?;
+        let bytes = bounded(bytes, self.max_len)?;
+        self.writer.try_write(bytes).map_err(SendError::Ring)
+    }
+
     /// Counts a failed write and returns `result` unchanged.
     ///
     /// The count saturates instead of wrapping.
@@ -142,23 +156,9 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
             max_len: T::MAX_LEN,
             alignment: T::ALIGN,
             depth: T::DEPTH,
-            layout: T::schema().layout(),
+            layout: T::layout(),
             schema: T::schema_with_root(&cx.port_path(name)),
         }
-    }
-
-    /// Encodes `value` and publishes it as one record.
-    ///
-    /// A failure is counted as well as returned.
-    pub fn write(&mut self, value: &T) -> Result<(), SendError> {
-        let written = self.encode_write(value);
-        self.counted(written)
-    }
-
-    fn encode_write(&mut self, value: &T) -> Result<(), SendError> {
-        let bytes = value.encode(&mut self.scratch).map_err(SendError::Encode)?;
-        let bytes = bounded(bytes, self.max_len)?;
-        self.writer.try_write(bytes).map_err(SendError::Ring)
     }
 }
 
@@ -184,15 +184,6 @@ impl<W: WakeSource> Output<Bytes, W> {
             _t: PhantomData,
         }
     }
-
-    /// Publishes already-encoded bytes as one record.
-    ///
-    /// A failure is counted as well as returned.
-    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SendError> {
-        let written = bounded(bytes, self.max_len)
-            .and_then(|bytes| self.writer.try_write(bytes).map_err(SendError::Ring));
-        self.counted(written)
-    }
 }
 
 /// Reads records of type `T` from every producer feeding one port.
@@ -206,7 +197,7 @@ pub struct Input<T: ?Sized, W: WakeSink = NoWake> {
     _t: PhantomData<T>,
 }
 
-impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
+impl<T: Payload + ?Sized, W: WakeSink> Input<T, W> {
     /// Creates an input that reads from `views`, one per producer.
     ///
     /// A record type that needs more alignment than the ring provides fails to
@@ -223,11 +214,6 @@ impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
             views,
             _t: PhantomData,
         }
-    }
-
-    /// Returns the definition of an input port called `name`.
-    pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
-        Output::<T>::def(cx, name)
     }
 
     /// Reads every unread record.
@@ -274,7 +260,14 @@ impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
     }
 }
 
-impl<T: Record + ?Sized> Input<T, Notifier> {
+impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
+    /// Returns the definition of an input port called `name`.
+    pub fn def(cx: &DefCx<'_>, name: &'static str) -> PortDef {
+        Output::<T>::def(cx, name)
+    }
+}
+
+impl<T: Payload + ?Sized> Input<T, Notifier> {
     /// Waits for the next record and reads it.
     ///
     /// If several producers have records, the earliest-bound one is read first.
@@ -367,11 +360,11 @@ impl<W: WakeSource> Ports<OutputBinding<W>> for DynOutputs<W> {
 /// The newest record, returned by [`Input::latest`].
 ///
 /// It derefs to the decoded record.
-pub struct Latest<'a, T: Record + ?Sized + 'a> {
+pub struct Latest<'a, T: Payload + ?Sized + 'a> {
     decoded: T::Read<'a>,
 }
 
-impl<'a, T: Record + ?Sized> Latest<'a, T> {
+impl<'a, T: Payload + ?Sized> Latest<'a, T> {
     /// Returns the decoded record.
     ///
     /// A frame is borrowed from the ring. A message is decoded into an owned value.
@@ -380,7 +373,7 @@ impl<'a, T: Record + ?Sized> Latest<'a, T> {
     }
 }
 
-impl<T: Record + ?Sized> Deref for Latest<'_, T> {
+impl<T: Payload + ?Sized> Deref for Latest<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         self.decoded.borrow()
@@ -607,11 +600,11 @@ mod tests {
         let writer = ring.writer(NoWake).expect("free writer");
         let mut out = Output::with_dropped_counter(writer, 4, dropped.clone());
         assert_eq!(
-            out.write_bytes(&[0; 5]),
+            out.write(&[0; 5]),
             Err(SendError::Oversize { len: 5, max: 4 })
         );
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
-        out.write_bytes(&[0; 4]).expect("fits");
+        out.write(&[0; 4]).expect("fits");
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 
@@ -637,9 +630,7 @@ mod tests {
 
     struct Counted(Stamped);
 
-    impl Record for Counted {
-        const NAME: &'static str = "counted";
-        const MAX_LEN: usize = Stamped::MAX_LEN;
+    impl Payload for Counted {
         type Read<'a> = Self;
 
         fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
@@ -654,8 +645,13 @@ mod tests {
         fn timestamp(&self) -> Option<Timestamp> {
             self.0.timestamp()
         }
+    }
 
-        fn schema() -> crate::record::RecordSchema {
+    impl Record for Counted {
+        const NAME: &'static str = "counted";
+        const MAX_LEN: usize = Stamped::MAX_LEN;
+
+        fn schema_with_root(_root: &str) -> crate::record::RecordSchema {
             Stamped::schema()
         }
     }
@@ -812,9 +808,7 @@ mod tests {
         }
     }
 
-    impl Record for Hostile {
-        const NAME: &'static str = "hostile";
-        const MAX_LEN: usize = 64;
+    impl Payload for Hostile {
         type Read<'a> = Self;
 
         fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
@@ -828,8 +822,13 @@ mod tests {
             let text: String = crate::record::postcard::decode(bytes)?;
             Ok(Self::new(&text))
         }
+    }
 
-        fn schema() -> crate::record::RecordSchema {
+    impl Record for Hostile {
+        const NAME: &'static str = "hostile";
+        const MAX_LEN: usize = 64;
+
+        fn schema_with_root(_root: &str) -> crate::record::RecordSchema {
             Note::schema()
         }
     }

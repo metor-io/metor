@@ -520,7 +520,7 @@ mod tests {
     };
     use crate::def::DefError;
     use crate::tests::utils::{self, Recorder, pipeline_config, table};
-    use crate::{Frame, Record};
+    use crate::{Frame, Payload, Record};
     use crate::{port, system};
 
     /// A second frame named `imu`, so the same record name has two layouts.
@@ -571,7 +571,7 @@ mod tests {
                 max_len: 32,
                 alignment: 32,
                 depth: 1,
-                layout: utils::Imu::schema().layout(),
+                layout: utils::Imu::layout(),
                 schema: utils::Imu::schema(),
             };
             let def = crate::SystemDef {

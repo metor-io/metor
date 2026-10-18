@@ -249,7 +249,7 @@ pub struct Emit(pub Vec<u8>);
 #[crate::system]
 pub fn emit(#[state] s: &mut Emit, outputs: &mut DynOutputs) {
     for (_, output) in outputs.iter_mut() {
-        let _ = output.write_bytes(&s.0);
+        let _ = output.write(&s.0);
     }
 }
 

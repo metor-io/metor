@@ -16,6 +16,7 @@ use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Context;
 
 use crate::port::Output;
+use crate::record::{DecodeError, EncodeError, Payload, Record, RecordSchema, postcard};
 
 /// Builds the log lines the runtime writes itself.
 pub(crate) trait LogEventExt {
@@ -49,13 +50,29 @@ impl LogEventExt for LogEvent {
     }
 }
 
-impl crate::record::PostcardRecord for LogEvent {
+impl Payload for LogEvent {
+    type Read<'a> = Self;
+
+    fn timestamp(&self) -> Option<Timestamp> {
+        Some(self.timestamp)
+    }
+
+    fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
+        postcard::encode(self, buf)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        postcard::decode(bytes)
+    }
+}
+
+impl Record for LogEvent {
     const NAME: &'static str = "log";
     const MAX_LEN: usize = 4096;
     const DEPTH: usize = 8;
 
-    fn timestamp(&self) -> Option<Timestamp> {
-        Some(self.timestamp)
+    fn schema_with_root(_root: &str) -> RecordSchema {
+        RecordSchema::postcard::<Self>(Self::NAME)
     }
 }
 
