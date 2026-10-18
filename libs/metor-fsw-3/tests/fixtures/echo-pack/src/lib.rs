@@ -8,9 +8,9 @@ use std::cell::RefCell;
 use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
-    DefCx, DefError, DynInputs, Frame, Input, InputBinding, Output, OutputBinding, Payload,
-    PortDef, Ports, Record, Seq, SeqError, Stop, System, SystemDef, SystemTable, Timestamp,
-    sequence, system,
+    BindCx, DefCx, DefError, DynInputs, Frame, Input, InputBinding, Output, OutputBinding,
+    ParamError, Payload, PortDef, Ports, Record, Seq, SeqError, Stop, System, SystemDef,
+    SystemTable, Timestamp, sequence, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -161,11 +161,11 @@ impl Ports<InputBinding> for RetainedInput {
         Ok(vec![Input::<Ping>::def(cx, "input")])
     }
 
-    fn bind(mut inputs: Vec<InputBinding>) -> Self {
+    fn bind(mut inputs: Vec<InputBinding>, _cx: &BindCx) -> Result<Self, ParamError> {
         if let Some(binding) = inputs.pop() {
             RETAINED_INPUT.with(|slot| *slot.borrow_mut() = Some(Input::new(binding.views)));
         }
-        Self
+        Ok(Self)
     }
 }
 
@@ -176,11 +176,11 @@ impl Ports<OutputBinding> for RetainedOutput {
         Ok(vec![Output::<Ping>::def(cx, "output")])
     }
 
-    fn bind(mut outputs: Vec<OutputBinding>) -> Self {
+    fn bind(mut outputs: Vec<OutputBinding>, _cx: &BindCx) -> Result<Self, ParamError> {
         if let Some(binding) = outputs.pop() {
             RETAINED_OUTPUT.with(|slot| *slot.borrow_mut() = Some(Output::new(binding.writer)));
         }
-        Self
+        Ok(Self)
     }
 }
 
@@ -258,7 +258,7 @@ pub struct StrideParams {
 pub struct Stride(u32);
 
 impl Stride {
-    fn new(params: StrideParams) -> Result<Self, metor_fsw_3::ParamError> {
+    fn new(params: StrideParams) -> Result<Self, ParamError> {
         if params.by == 0 {
             return Err(metor_fsw_3::ParamError::Decode("`by` is zero".into()));
         }
