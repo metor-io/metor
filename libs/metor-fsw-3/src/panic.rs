@@ -57,7 +57,7 @@ pub(crate) fn log_panics() {
 
 /// Does nothing on native targets.
 ///
-/// A native panic unwinds to `catch_step`, which reports it.
+/// A native panic unwinds to `StepState::run`, which reports it.
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn log_panics() {}
 

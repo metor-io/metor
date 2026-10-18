@@ -31,6 +31,8 @@ pub use params::{MakeError, ParamError, Params};
 #[cfg(feature = "host")]
 pub use run::Coordinator;
 pub use status::SystemStatus;
+pub(crate) use step::StepState;
+#[cfg(feature = "host")]
 pub(crate) use step::catch_execute;
 pub use step::{EndReason, LoadError, Occupant, Step, StepCx};
 #[cfg(feature = "host")]

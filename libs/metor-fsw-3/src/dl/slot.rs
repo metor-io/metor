@@ -197,11 +197,16 @@ pub struct DlSlot {
     inputs: Vec<Vec<RingBuffer>>,
     outputs: Vec<RingBuffer>,
     candidates: Vec<Resolved>,
-    current: Option<Loaded>,
-    /// Why the slot is empty, if a failed load emptied it.
-    end: Option<EndReason>,
+    occupancy: Occupancy,
     /// Where the slot's candidates share one IO region.
     io: SharedIo,
+}
+
+/// What a slot holds.
+enum Occupancy {
+    Loaded(Loaded),
+    /// Nothing, and why: `Unloaded`, or the failure that emptied it.
+    Empty(EndReason),
 }
 
 /// The loaded system and the pack it was created from.
@@ -260,14 +265,13 @@ impl DlSlot {
                 .collect(),
             outputs: cx.outputs.into_iter().cloned().collect(),
             candidates,
-            current: None,
-            end: None,
+            occupancy: Occupancy::Empty(EndReason::Unloaded),
             io: cx.io.clone(),
         };
         if let Some(name) = params.initial
             && let Err(error) = slot.load(&name)
         {
-            slot.end = Some(EndReason::Failed(error.to_string().into()));
+            slot.occupancy = Occupancy::Empty(EndReason::Failed(error.to_string().into()));
         }
         Ok(Box::new(slot))
     }
@@ -313,15 +317,14 @@ impl DlSlot {
     /// No other system may be loaded when this is called.
     fn place(&mut self, index: usize, pack: Arc<Pack>) -> Result<(), LoadError> {
         let step = self.create(&pack, &self.candidates[index])?;
-        self.current = Some(Loaded { index, pack, step });
-        self.end = None;
+        self.occupancy = Occupancy::Loaded(Loaded { index, pack, step });
         Ok(())
     }
 }
 
 impl Step for DlSlot {
     fn execute(&mut self, now: Timestamp) {
-        if let Some(loaded) = self.current.as_mut() {
+        if let Occupancy::Loaded(loaded) = &mut self.occupancy {
             loaded.step.execute(now);
         }
     }
@@ -330,9 +333,9 @@ impl Step for DlSlot {
     fn fault(&mut self, _now: Timestamp, _message: &str) {}
 
     fn ended(&self) -> Option<&EndReason> {
-        match &self.current {
-            Some(loaded) => loaded.step.ended(),
-            None => self.end.as_ref().or(Some(&EndReason::Unloaded)),
+        match &self.occupancy {
+            Occupancy::Loaded(loaded) => loaded.step.ended(),
+            Occupancy::Empty(end) => Some(end),
         }
     }
 
@@ -349,12 +352,15 @@ impl Step for DlSlot {
         self.check_ports(&pack, &self.candidates[index])?;
         // Drop the old system first so its ring readers and writers are free
         // for the new one.
-        let previous = self
-            .current
-            .take()
-            .map(|loaded| (loaded.index, loaded.pack));
+        let unloaded = Occupancy::Empty(EndReason::Unloaded);
+        let previous = match core::mem::replace(&mut self.occupancy, unloaded) {
+            Occupancy::Loaded(loaded) => Some((loaded.index, loaded.pack)),
+            Occupancy::Empty(_) => None,
+        };
         let placed = self.place(index, pack);
-        if let (Err(_), Some((previous, pack))) = (&placed, previous) {
+        if placed.is_err()
+            && let Some((previous, pack)) = previous
+        {
             // The old library is still loaded and the rings are free again.
             let _ = self.place(previous, pack);
         }
@@ -362,7 +368,9 @@ impl Step for DlSlot {
     }
 
     fn occupant(&self) -> Option<&Occupant> {
-        let loaded = self.current.as_ref()?;
+        let Occupancy::Loaded(loaded) = &self.occupancy else {
+            return None;
+        };
         Some(&self.candidates[loaded.index].occupant)
     }
 }

@@ -12,9 +12,7 @@ use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 use tracing_subscriber::layer::SubscriberExt;
 
-use crate::coordinator::{
-    EndReason, MakeCx, ParamError, Params, Step, Stepped, SystemTable, catch_step,
-};
+use crate::coordinator::{EndReason, MakeCx, ParamError, Params, Step, StepState, SystemTable};
 use crate::def::DefError;
 use crate::system::SystemDef;
 use crate::thread::Threads;
@@ -279,7 +277,7 @@ pub unsafe fn create(
         // SAFETY: the caller's arrays, region, and ownership callbacks remain
         // valid here.
         match unsafe { make(build, args) } {
-            Ok(step) => Box::into_raw(Box::new(Some(step))).cast(),
+            Ok(step) => Box::into_raw(Box::new(StepState::Live(step))).cast(),
             Err(source) => {
                 // SAFETY: `error` remains writable for this call.
                 unsafe { error.write(store_error(&source)) };
@@ -396,11 +394,9 @@ fn store_error(source: &ParamError) -> RawSlice {
 pub unsafe fn execute(instance: *mut c_void, now: i64) -> u32 {
     crate::panic::catch(|| {
         // SAFETY: `create` allocated this slot, and it is still live on this thread.
-        let slot = unsafe { &mut *instance.cast::<Option<Box<dyn Step>>>() };
-        match catch_step(slot, Timestamp(now)) {
-            Stepped::Unwound => Status::Panicked,
-            Stepped::Ran | Stepped::Ended => Status::of_end(slot.as_ref().and_then(|s| s.ended())),
-        }
+        let slot = unsafe { &mut *instance.cast::<StepState>() };
+        slot.run(Timestamp(now));
+        Status::of_end(slot.end_reason())
     })
     .unwrap_or(Status::Panicked) as u32
 }
@@ -413,7 +409,7 @@ pub unsafe fn execute(instance: *mut c_void, now: i64) -> u32 {
 pub unsafe fn destroy(instance: *mut c_void) {
     crate::panic::catch(|| {
         // SAFETY: the caller's contract; the box was made by `create`.
-        drop(unsafe { Box::from_raw(instance.cast::<Option<Box<dyn Step>>>()) })
+        drop(unsafe { Box::from_raw(instance.cast::<StepState>()) })
     });
 }
 
