@@ -83,11 +83,9 @@ impl Counter {
         Self { shared, count: 0 }
     }
 
-    fn try_new(shared: Shared, _: NoParams) -> Result<Self, crate::coordinator::ParamError> {
+    fn try_new(shared: Shared, _: NoParams) -> Result<Self, crate::coordinator::MakeError> {
         if shared.0.borrow().make_fails {
-            return Err(crate::coordinator::ParamError::Decode(
-                "no counter today".into(),
-            ));
+            return Err(crate::coordinator::ParamError::Decode("no counter today".into()).into());
         }
         Ok(Self::new(shared))
     }

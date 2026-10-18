@@ -13,7 +13,7 @@ use metor_proto_wkt::{
 };
 
 use crate::coordinator::{
-    Adapter, ChannelConfig, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, StepCx,
+    Adapter, ChannelConfig, EndReason, MakeCx, MakeError, MakeFn, Params, RunState, Step, StepCx,
     catch_execute,
 };
 use crate::def::{DefCx, Records};
@@ -67,7 +67,7 @@ pub(crate) fn make_channel(
     make: &Arc<MakeFn>,
     channel: &ChannelConfig,
     mut cx: MakeCx<'_>,
-) -> Result<Box<dyn Step>, ParamError> {
+) -> Result<Box<dyn Step>, MakeError> {
     // PANIC Safety: `def` appended one input and two outputs.
     let commands = cx.inputs.pop().expect("the commands input");
     let status = cx.outputs.pop().expect("the channel_status output");
@@ -165,7 +165,7 @@ struct SystemRecipe {
 }
 
 impl SystemRecipe {
-    fn make(&self, threads: &mut Threads, io: &mut IoState) -> Result<Box<dyn Step>, ParamError> {
+    fn make(&self, threads: &mut Threads, io: &mut IoState) -> Result<Box<dyn Step>, MakeError> {
         (self.make)(MakeCx {
             id: &self.id,
             adapter: Some(&self.adapter),

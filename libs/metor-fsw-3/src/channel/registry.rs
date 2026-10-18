@@ -82,12 +82,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::coordinator::{ParamError, Params};
+    use crate::coordinator::{MakeError, Params};
     use crate::fn_system::Ctor;
 
     use crate::tests::utils::pair;
 
-    fn make(params: serde_json::Value) -> Result<Registry, ParamError> {
+    fn make(params: serde_json::Value) -> Result<Registry, MakeError> {
         Ctor::<Registry, (RegistryParams,)>::make(
             &Registry::new,
             Params(&params),

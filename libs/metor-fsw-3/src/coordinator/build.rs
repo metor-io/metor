@@ -27,7 +27,7 @@ use super::config::{
     SystemConfig,
 };
 use super::error::BuildError;
-use super::params::ParamError;
+use super::params::MakeError;
 use super::params::Params;
 use super::run::{Coordinator, Entry};
 use super::status::{STATUS_PORT, SystemStatus};
@@ -326,7 +326,7 @@ impl Adapter {
     /// Makes a system with `make`, behind the adapter.
     ///
     /// `cx.def` is the definition [`Adapter::add_ports`] returned.
-    fn make(&self, make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
+    fn make(&self, make: &Arc<MakeFn>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, MakeError> {
         match self {
             Self::Thread(_) => make(cx),
             Self::Channel(channel) => crate::channel::make_channel(make, channel, cx),

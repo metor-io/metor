@@ -87,7 +87,7 @@ mod tests;
 use metor_fsw_3_ring::NoWake;
 
 use crate::channel::{ABORT_PORT, AbortRequest};
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Defs, FnSignature, InSet, OutSet, Param};
 use crate::io::IoPorts;
@@ -170,7 +170,7 @@ impl<S: SequenceFn> Ports<InputBinding> for SeqInputs<S> {
         Ok(def::<S>(cx)?.inputs)
     }
 
-    fn bind(inputs: Vec<InputBinding>, cx: &BindCx) -> Result<Self, ParamError> {
+    fn bind(inputs: Vec<InputBinding>, cx: &BindCx) -> Result<Self, MakeError> {
         let mut inputs = inputs.into_iter();
         // PANIC Safety: `def` declares `abort` first, and build binds one
         // list per declared input.

@@ -4,7 +4,9 @@
 use core::time::Duration;
 
 use metor_fsw_3::io::{Cap, ReadOp, Uart, WriteOp};
-use metor_fsw_3::{Input, IoInit, Log, MakeError, Output, Record, Seq, SeqError, Slot, sequence, system};
+use metor_fsw_3::{
+    Input, IoInit, Log, MakeError, Output, Record, Seq, SeqError, Slot, sequence, system,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
