@@ -505,7 +505,7 @@ fn make_systems(
         };
         let step = (system.entry.make)(cx).map_err(|source| {
             let id = system.id.to_string();
-            BuildError::Params { id, source }.at(system.location)
+            BuildError::Make { id, source }.at(system.location)
         })?;
         entries.push(Entry {
             name: system.id.to_string(),
@@ -943,9 +943,9 @@ mod tests {
         config.systems[1].params = serde_json::json!({ "gain": 2.0 });
         assert_eq!(
             build(config).err(),
-            Some(BuildError::Params {
+            Some(BuildError::Make {
                 id: "nav".into(),
-                source: crate::coordinator::ParamError::UnknownKey("gain".into()),
+                source: crate::coordinator::ParamError::UnknownKey("gain".into()).into(),
             })
         );
     }

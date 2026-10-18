@@ -8,7 +8,7 @@ use metor_proto_wkt::LogEvent;
 
 use metor_fsw_3_ring::NoWake;
 
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::log::LogPort;
 use crate::port::{InputWake, Output};
@@ -61,7 +61,7 @@ impl<S: FnSignature> OutSet<S> {
     ///
     /// # Errors
     /// Fails if a parameter's output does not bind.
-    pub(crate) fn from_writers(mut writers: Writers) -> Result<Self, ParamError> {
+    pub(crate) fn from_writers(mut writers: Writers) -> Result<Self, MakeError> {
         let outs = S::Params::bind_out(&mut S::NAMES.iter(), &mut writers)?;
         // PANIC Safety: `defs` always appends the log as the last output.
         let log = writers
@@ -134,7 +134,7 @@ pub(crate) fn bind<S: FnSignature, W: InputWake>(
     inputs: Vec<InputBinding<W>>,
     outputs: Vec<OutputBinding>,
     instance: Instance,
-) -> Result<BoundSet<S, W>, ParamError> {
+) -> Result<BoundSet<S, W>, MakeError> {
     let defs = Defs::declared::<S>();
     let ins = InSet::from_views(Views::new(inputs, defs.inputs.len()));
     let writers = Writers::new(outputs, defs.outputs.len() + 1, instance);

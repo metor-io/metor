@@ -24,7 +24,7 @@ use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogLevel;
 
 use crate::async_system::{AsyncSystem, Running, Stop};
-use crate::coordinator::{EndReason, MakeCx, ParamError, Params, Step};
+use crate::coordinator::{EndReason, MakeCx, MakeError, Params, Step};
 use crate::fn_system::Instance;
 use crate::mirror::{Mirror, Mirrors};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef};
@@ -79,7 +79,7 @@ impl Threads {
         name: &str,
         id: &str,
         member: Member,
-    ) -> Result<Option<Arc<GroupHandle>>, ParamError> {
+    ) -> Result<Option<Arc<GroupHandle>>, MakeError> {
         match &mut self.0 {
             Groups::Spawned(groups) => {
                 let group = match groups.get(name).and_then(Weak::upgrade) {
@@ -107,7 +107,7 @@ impl Threads {
 
 /// Builds an async system on the thread that will run it.
 pub(crate) trait Launch: Send {
-    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError>;
+    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, MakeError>;
 }
 
 /// Everything needed to build one async system, sent to its thread.
@@ -123,9 +123,9 @@ struct AsyncLaunch<A: AsyncSystem, M> {
 impl<A, M> Launch for AsyncLaunch<A, M>
 where
     A: AsyncSystem + 'static,
-    M: Fn(LaunchCx<'_>) -> Result<Launched<A>, ParamError> + Send + Sync + 'static,
+    M: Fn(LaunchCx<'_>) -> Result<Launched<A>, MakeError> + Send + Sync + 'static,
 {
-    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError> {
+    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, MakeError> {
         let Launched {
             system,
             mut state,
@@ -150,10 +150,10 @@ where
 /// The system is built and run on that thread, reading and writing mirror
 /// rings. The returned [`ThreadAdapter`] step copies between the mirrors and
 /// the real rings each cycle.
-pub(crate) fn place<A, M>(make: Arc<M>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>
+pub(crate) fn place<A, M>(make: Arc<M>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, MakeError>
 where
     A: AsyncSystem + 'static,
-    M: Fn(LaunchCx<'_>) -> Result<Launched<A>, ParamError> + Send + Sync + 'static,
+    M: Fn(LaunchCx<'_>) -> Result<Launched<A>, MakeError> + Send + Sync + 'static,
 {
     let instance = Instance::from_make_cx(&cx);
     let thread_name = cx.thread().to_string();
@@ -251,7 +251,7 @@ impl Bound {
         def: &SystemDef,
         inputs: Vec<Vec<&RingBuffer>>,
         outputs: Vec<&RingBuffer>,
-    ) -> Result<Self, ParamError> {
+    ) -> Result<Self, MakeError> {
         let mut bound = Self {
             input_mirrors: Vec::new(),
             output_mirrors: Vec::with_capacity(def.outputs.len()),
@@ -267,7 +267,7 @@ impl Bound {
         &mut self,
         ports: &[PortDef],
         inputs: Vec<Vec<&RingBuffer>>,
-    ) -> Result<(), ParamError> {
+    ) -> Result<(), MakeError> {
         let wake = Notifier::default();
         for (port, rings) in ports.iter().zip(inputs) {
             let mut views = Vec::with_capacity(rings.len());
@@ -294,7 +294,7 @@ impl Bound {
         &mut self,
         ports: &[PortDef],
         outputs: Vec<&RingBuffer>,
-    ) -> Result<(), ParamError> {
+    ) -> Result<(), MakeError> {
         for (port, ring) in ports.iter().zip(outputs) {
             let mirror = Mirror::ring_for(ring, MIRROR_FACTOR)?;
             // PANIC Safety: the mirror is fresh, and the build gives each output

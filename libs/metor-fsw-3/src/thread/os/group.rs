@@ -12,7 +12,7 @@ use thingbuf::mpsc::{Receiver, Sender, with_recycle};
 use thingbuf::recycling::Recycle;
 
 use crate::async_system::{Running, Stop, StopHandle};
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 
 use super::Launch;
 
@@ -46,7 +46,7 @@ pub(crate) struct Member {
 /// whether building it succeeded.
 struct Job {
     member: Member,
-    report: SyncSender<Option<ParamError>>,
+    report: SyncSender<Option<MakeError>>,
 }
 
 /// How many jobs the inbox holds. `add` waits for each job's report, so a
@@ -81,13 +81,13 @@ pub(crate) struct GroupHandle {
 impl GroupHandle {
     /// Starts an empty group on a new thread. Members are added with
     /// [`GroupHandle::add`].
-    pub(crate) fn spawn(name: &str) -> Result<Arc<Self>, ParamError> {
+    pub(crate) fn spawn(name: &str) -> Result<Arc<Self>, MakeError> {
         let (handle, stop) = Stop::pair();
         let (inbox, jobs) = with_recycle(INBOX_CAPACITY, EmptySlot);
         let thread = std::thread::Builder::new()
             .name(format!("fsw-{name}"))
             .spawn(move || stellarator::run(move || run(jobs, stop)))
-            .map_err(|_| ParamError::ThreadStart {
+            .map_err(|_| MakeError::ThreadStart {
                 thread: name.to_string(),
             })?;
         Ok(Arc::new(Self {
@@ -100,12 +100,12 @@ impl GroupHandle {
 
     /// Builds `member` on this group's thread. Returns once it is running, or
     /// with the error that stopped it from building.
-    pub(crate) fn add(&self, member: Member) -> Result<(), ParamError> {
+    pub(crate) fn add(&self, member: Member) -> Result<(), MakeError> {
         let (report, built) = sync_channel(1);
         let queued = self
             .inbox
             .try_send(Some(Mutex::new(Job { member, report })));
-        let thread = || ParamError::ThreadStart {
+        let thread = || MakeError::ThreadStart {
             thread: self.name.clone(),
         };
         queued.map_err(|_| thread())?;
@@ -149,12 +149,12 @@ async fn stopped(stop: &Stop) -> Option<InboxSlot> {
 impl Member {
     /// Builds the system.
     ///
-    /// A panic in the system's constructor becomes a `ParamError`, so it does
+    /// A panic in the system's constructor becomes a `MakeError`, so it does
     /// not take down the group's thread.
-    pub(super) fn launch(self, stop: Stop) -> Result<Running, ParamError> {
+    pub(super) fn launch(self, stop: Stop) -> Result<Running, MakeError> {
         let launch = self.launch;
         std::panic::catch_unwind(AssertUnwindSafe(|| launch.launch(stop)))
-            .map_err(|payload| ParamError::Panicked(crate::panic::into_message(payload)))?
+            .map_err(|payload| MakeError::Panicked(crate::panic::into_message(payload)))?
     }
 
     /// Runs a launched system. If it panics, the panic is caught and reported
@@ -200,7 +200,7 @@ mod tests {
     struct PanicCtor;
 
     impl Launch for PanicCtor {
-        fn launch(self: Box<Self>, _stop: Stop) -> Result<Running, ParamError> {
+        fn launch(self: Box<Self>, _stop: Stop) -> Result<Running, MakeError> {
             panic!("a constructor that panics")
         }
     }
@@ -209,7 +209,7 @@ mod tests {
     struct Started(SyncSender<()>);
 
     impl Launch for Started {
-        fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError> {
+        fn launch(self: Box<Self>, stop: Stop) -> Result<Running, MakeError> {
             let started = self.0;
             Ok(Box::pin(async move {
                 let _ = started.send(());
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn test_group_survives_constructor_panic() {
         let group = GroupHandle::spawn("ctor").expect("a thread");
-        let Err(ParamError::Panicked(message)) = group.add(member(Box::new(PanicCtor))) else {
+        let Err(MakeError::Panicked(message)) = group.add(member(Box::new(PanicCtor))) else {
             panic!("a panicking constructor is a param error")
         };
         assert!(message.contains("a constructor that panics"), "{message}");

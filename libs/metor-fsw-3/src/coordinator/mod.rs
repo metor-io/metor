@@ -24,7 +24,7 @@ pub use config::{
     InvalidWallRate, Location, OutputConfig, OutputSource, PortRef, SystemConfig, WallRate,
 };
 pub use error::BuildError;
-pub use params::{ParamError, Params};
+pub use params::{MakeError, ParamError, Params};
 #[cfg(feature = "host")]
 pub use run::Coordinator;
 pub use status::SystemStatus;

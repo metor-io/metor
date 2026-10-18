@@ -117,9 +117,9 @@ pub use async_system::{AsyncSystem, Stop};
 #[cfg(feature = "host")]
 pub use coordinator::Coordinator;
 pub use coordinator::{
-    Adapter, BuildError, Clock, CoordinatorConfig, EndReason, InputConfig, LoadError, Occupant,
-    OutputConfig, OutputSource, ParamError, Params, PortRef, Step, SystemConfig, SystemKind,
-    SystemStatus, SystemTable, WallRate,
+    Adapter, BuildError, Clock, CoordinatorConfig, EndReason, InputConfig, LoadError, MakeError,
+    Occupant, OutputConfig, OutputSource, ParamError, Params, PortRef, Step, SystemConfig,
+    SystemKind, SystemStatus, SystemTable, WallRate,
 };
 pub use def::{DefCx, DefError, Records};
 pub use fn_system::{

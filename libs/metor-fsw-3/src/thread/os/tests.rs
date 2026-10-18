@@ -183,7 +183,7 @@ fn test_constructor_panic_cleanup() {
         };
         let started = Instant::now();
         let error = build(config, &table(&recorder), deterministic).err();
-        let Some(BuildError::Params { id, source }) = error else {
+        let Some(BuildError::Make { id, source }) = error else {
             panic!("a panicking constructor is a param error")
         };
         assert_eq!(id, "boom");

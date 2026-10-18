@@ -20,7 +20,7 @@ use super::SystemStatus;
 use super::config::Adapter;
 #[cfg(feature = "host")]
 use super::config::Adapters;
-use super::params::{ParamError, Params};
+use super::params::{MakeError, Params};
 use super::step::Runner;
 use super::step::Step;
 
@@ -87,7 +87,7 @@ impl MakeCx<'_> {
 }
 
 /// Creates a system from a [`MakeCx`].
-pub(crate) type MakeFn = dyn Fn(MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>;
+pub(crate) type MakeFn = dyn Fn(MakeCx<'_>) -> Result<Box<dyn Step>, MakeError>;
 
 /// Computes the definition of one system instance from its config.
 pub(crate) type DefFn = dyn Fn(&DefCx<'_>) -> Result<SystemDef, DefError>;
@@ -155,7 +155,7 @@ impl SystemTable {
     pub fn register_system<S: System + 'static>(
         &mut self,
         ty: &str,
-        make: impl Fn(Params<'_>) -> Result<(S, S::State), ParamError> + 'static,
+        make: impl Fn(Params<'_>) -> Result<(S, S::State), MakeError> + 'static,
     ) -> Result<(), BuildError> {
         let entry = TableEntry::system::<S>(make, Cow::Borrowed(""), None).map_err(|source| {
             BuildError::TypeDef {
@@ -189,7 +189,7 @@ impl SystemTable {
     pub fn register_async_system<A: AsyncSystem + 'static>(
         &mut self,
         ty: &str,
-        make: impl Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+        make: impl Fn(Params<'_>) -> Result<(A, A::State), MakeError> + Send + Sync + 'static,
     ) -> Result<(), BuildError> {
         let make = move |cx: LaunchCx<'_>| {
             let (system, state) = make(cx.params)?;
@@ -344,7 +344,7 @@ impl TableEntry {
     /// The entry's `make` binds the system's inputs and outputs to the rings it is
     /// given.
     fn system<S: System + 'static>(
-        make: impl Fn(Params<'_>) -> Result<(S, S::State), ParamError> + 'static,
+        make: impl Fn(Params<'_>) -> Result<(S, S::State), MakeError> + 'static,
         doc: Cow<'static, str>,
         schema: Option<Box<RawValue>>,
     ) -> Result<Self, DefError> {
@@ -411,7 +411,7 @@ impl TableEntry {
     ) -> Result<Self, DefError>
     where
         A: AsyncSystem + 'static,
-        M: Fn(LaunchCx<'_>) -> Result<Launched<A>, ParamError> + Send + Sync + 'static,
+        M: Fn(LaunchCx<'_>) -> Result<Launched<A>, MakeError> + Send + Sync + 'static,
     {
         let make = Arc::new(make);
         Ok(Self {

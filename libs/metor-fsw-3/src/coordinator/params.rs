@@ -31,15 +31,22 @@ impl Params<'_> {
     }
 }
 
-/// An error from creating a system.
-///
-/// Packs send this error back to the host as JSON, so it derives serde.
+/// A system's config params that do not decode.
 #[derive(Clone, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
 pub enum ParamError {
     #[error("unknown key `{0}`")]
     UnknownKey(String),
     #[error("{0}")]
     Decode(String),
+}
+
+/// An error from making a system.
+///
+/// Packs send this error back to the host as JSON, so it derives serde.
+#[derive(Clone, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
+pub enum MakeError {
+    #[error(transparent)]
+    Params(#[from] ParamError),
     #[error("thread `{thread}` is not running")]
     ThreadStart { thread: String },
     #[error("the constructor panicked: {0}")]

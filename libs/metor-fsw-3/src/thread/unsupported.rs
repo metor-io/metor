@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::async_system::AsyncSystem;
-use crate::coordinator::{MakeCx, ParamError, Step};
+use crate::coordinator::{MakeCx, MakeError, Step};
 
 use super::{LaunchCx, Launched};
 
@@ -38,12 +38,12 @@ impl TurnedGroup {
 }
 
 /// Returns an error naming the system, since async systems need threads.
-pub(crate) fn place<A, M>(_make: Arc<M>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>
+pub(crate) fn place<A, M>(_make: Arc<M>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, MakeError>
 where
     A: AsyncSystem + 'static,
-    M: Fn(LaunchCx<'_>) -> Result<Launched<A>, ParamError> + Send + Sync + 'static,
+    M: Fn(LaunchCx<'_>) -> Result<Launched<A>, MakeError> + Send + Sync + 'static,
 {
-    Err(ParamError::ThreadsUnsupported {
+    Err(MakeError::ThreadsUnsupported {
         system: cx.id.to_string(),
     })
 }
@@ -52,7 +52,7 @@ where
 mod tests {
     use metor_proto_wkt::LogEvent;
 
-    use crate::coordinator::{MakeCx, ParamError, Params};
+    use crate::coordinator::{MakeCx, MakeError, Params};
     use crate::tests::utils::{Imu, Nav, Recorder, ring, table};
 
     use super::Threads;
@@ -76,7 +76,7 @@ mod tests {
         });
         assert_eq!(
             refused.err(),
-            Some(ParamError::ThreadsUnsupported {
+            Some(MakeError::ThreadsUnsupported {
                 system: "relay_1".into()
             })
         );

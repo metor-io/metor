@@ -4,18 +4,18 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
 
-use crate::coordinator::{ParamError, Params};
+use crate::coordinator::{MakeError, Params};
 
 /// Builds a system's state from its config params.
 ///
 /// It is implemented for fns that take no params, fns that take a
 /// deserializable params type, and fns that take params and may fail with a
-/// [`ParamError`]. `Marker` keeps these impls from overlapping.
+/// [`MakeError`]. `Marker` keeps these impls from overlapping.
 pub trait Ctor<S, Marker> {
     /// Builds the state.
     ///
     /// Decodes `params` first if the constructor takes them.
-    fn make(&self, params: Params<'_>) -> Result<S, ParamError>;
+    fn make(&self, params: Params<'_>) -> Result<S, MakeError>;
 
     /// Returns the JSON Schema of the params type.
     ///
@@ -28,7 +28,7 @@ fn schema_of<P: JsonSchema>() -> Option<Box<RawValue>> {
 }
 
 impl<S, F: Fn() -> S> Ctor<S, ()> for F {
-    fn make(&self, _params: Params<'_>) -> Result<S, ParamError> {
+    fn make(&self, _params: Params<'_>) -> Result<S, MakeError> {
         Ok(self())
     }
 
@@ -38,7 +38,7 @@ impl<S, F: Fn() -> S> Ctor<S, ()> for F {
 }
 
 impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> S> Ctor<S, (P,)> for F {
-    fn make(&self, params: Params<'_>) -> Result<S, ParamError> {
+    fn make(&self, params: Params<'_>) -> Result<S, MakeError> {
         Ok(self(params.decode()?))
     }
 
@@ -48,10 +48,10 @@ impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> S> Ctor<S, (P,)> for F {
 }
 
 /// A constructor that can reject its params, such as one that binds a socket.
-impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> Result<S, ParamError>>
-    Ctor<S, (P, ParamError)> for F
+impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> Result<S, MakeError>> Ctor<S, (P, MakeError)>
+    for F
 {
-    fn make(&self, params: Params<'_>) -> Result<S, ParamError> {
+    fn make(&self, params: Params<'_>) -> Result<S, MakeError> {
         self(params.decode()?)
     }
 
@@ -66,15 +66,16 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::coordinator::ParamError;
 
     #[derive(Deserialize, JsonSchema)]
     struct Port {
         port: u16,
     }
 
-    fn build(params: Port) -> Result<u16, ParamError> {
+    fn build(params: Port) -> Result<u16, MakeError> {
         match params.port {
-            0 => Err(ParamError::Decode("port zero".into())),
+            0 => Err(ParamError::Decode("port zero".into()).into()),
             port => Ok(port),
         }
     }
@@ -82,8 +83,8 @@ mod tests {
     /// Calls `build` as a fallible constructor.
     ///
     /// The turbofish is needed because `Fn(P) -> S` also matches `build`.
-    fn ctor(params: &serde_json::Value) -> Result<u16, ParamError> {
-        Ctor::<u16, (Port, ParamError)>::make(&build, Params(params))
+    fn ctor(params: &serde_json::Value) -> Result<u16, MakeError> {
+        Ctor::<u16, (Port, MakeError)>::make(&build, Params(params))
     }
 
     #[test]
@@ -95,7 +96,7 @@ mod tests {
     fn test_constructor_error() {
         assert_eq!(
             ctor(&json!({ "port": 0 })),
-            Err(ParamError::Decode("port zero".into()))
+            Err(ParamError::Decode("port zero".into()).into())
         );
     }
 
@@ -103,10 +104,9 @@ mod tests {
     fn test_invalid_params_skip_constructor() {
         assert!(matches!(
             ctor(&json!({ "port": "eight" })),
-            Err(ParamError::Decode(_))
+            Err(MakeError::Params(ParamError::Decode(_)))
         ));
-        let schema =
-            <fn(Port) -> Result<u16, ParamError> as Ctor<u16, (Port, ParamError)>>::schema();
+        let schema = <fn(Port) -> Result<u16, MakeError> as Ctor<u16, (Port, MakeError)>>::schema();
         assert!(schema.expect("a params schema").get().contains("port"));
     }
 }

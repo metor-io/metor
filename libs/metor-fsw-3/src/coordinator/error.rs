@@ -2,7 +2,7 @@ use metor_proto::types::{ComponentId, PacketId};
 use thiserror::Error;
 
 use super::config::Location;
-use super::params::ParamError;
+use super::params::MakeError;
 use crate::def::DefError;
 
 /// Errors from registering system types or building a coordinator.
@@ -115,11 +115,11 @@ pub enum BuildError {
         source: DefError,
     },
 
-    #[error("params for `{id}`: {source}")]
-    Params {
+    #[error("making `{id}`: {source}")]
+    Make {
         id: String,
         #[source]
-        source: ParamError,
+        source: MakeError,
     },
 }
 

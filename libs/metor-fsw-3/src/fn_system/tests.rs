@@ -255,6 +255,7 @@ fn test_pipeline_matches_trait() {
         .register_system("nav_params", |p| {
             p.decode::<NoParams>()
                 .map(|_| (FnSystem::<Doubler>::default(), Doubler))
+                .map_err(Into::into)
         })
         .expect("valid records");
     let config = CoordinatorConfig {

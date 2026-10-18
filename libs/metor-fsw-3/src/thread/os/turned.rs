@@ -7,7 +7,7 @@ use metor_proto::types::Timestamp;
 use stellarator::{Executor, JoinHandle};
 
 use crate::async_system::{Stop, StopHandle};
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 
 use super::group::Member;
 
@@ -27,9 +27,9 @@ pub(crate) struct TurnedGroup {
 
 impl TurnedGroup {
     /// Starts the group for `thread`, with `first` as its first member's id.
-    pub(crate) fn new(thread: &str, first: &str) -> Result<Self, ParamError> {
+    pub(crate) fn new(thread: &str, first: &str) -> Result<Self, MakeError> {
         let executor =
-            Executor::new(stellarator::time::Clock::Sim).map_err(|_| ParamError::ThreadStart {
+            Executor::new(stellarator::time::Clock::Sim).map_err(|_| MakeError::ThreadStart {
                 thread: thread.to_string(),
             })?;
         let (stop, stop_rx) = Stop::pair();
@@ -49,7 +49,7 @@ impl TurnedGroup {
 
     /// Builds `member` on this thread, inside the executor's scope, and
     /// spawns its task.
-    pub(crate) fn add(&mut self, member: Member) -> Result<(), ParamError> {
+    pub(crate) fn add(&mut self, member: Member) -> Result<(), MakeError> {
         let panicked = member.panicked.clone();
         let stop = self.stop_rx.clone();
         let running = self.executor.enter(|| member.launch(stop))?;

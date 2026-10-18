@@ -10,7 +10,7 @@ use metor_proto::types::Timestamp;
 
 use crate::{
     Rng,
-    coordinator::ParamError,
+    coordinator::MakeError,
     def::{DefCx, DefError, Records},
     frame::Frame,
     log::Log,
@@ -224,8 +224,7 @@ pub trait Param {
     /// Binds this parameter's output, if it has one, from `writers`.
     ///
     /// Takes the parameter's name from `names`.
-    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers)
-    -> Result<Self::Out, ParamError>;
+    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError>;
 
     /// Returns the value passed to the system fn this cycle.
     fn get<'a, W: InputWake>(
@@ -268,7 +267,7 @@ impl<T: Record + 'static + ?Sized, D: InputWake> Param for Input<T, D> {
         Input::new(binding.views)
     }
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
         param_name(names);
         Ok(())
     }
@@ -305,7 +304,7 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
         SampledInput::new(<Input<T> as Param>::bind_in(views))
     }
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
         param_name(names);
         Ok(())
     }
@@ -342,7 +341,7 @@ impl Param for Rng {
 
     fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
-    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Rng, ParamError> {
+    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Rng, MakeError> {
         Ok(writers.instance.rng(param_name(names)))
     }
 
@@ -376,7 +375,7 @@ impl Param for Records {
     fn bind_out(
         names: &mut ParamNames<'_>,
         writers: &mut Writers,
-    ) -> Result<Arc<Records>, ParamError> {
+    ) -> Result<Arc<Records>, MakeError> {
         param_name(names);
         Ok(writers.instance.records.clone())
     }
@@ -406,10 +405,7 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
 
     fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
-    fn bind_out(
-        names: &mut ParamNames<'_>,
-        writers: &mut Writers,
-    ) -> Result<Self::Out, ParamError> {
+    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError> {
         param_name(names);
         // PANIC Safety: the coordinator binds one writer per declared output;
         // a mismatch is a coordinator bug.
@@ -449,7 +445,7 @@ impl<D: InputWake> Param for DynInputs<D> {
         Ports::bind(views.bindings.take())
     }
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
         param_name(names);
         Ok(())
     }
@@ -481,10 +477,7 @@ impl Param for DynOutputs {
 
     fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
-    fn bind_out(
-        names: &mut ParamNames<'_>,
-        writers: &mut Writers,
-    ) -> Result<Self::Out, ParamError> {
+    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError> {
         param_name(names);
         Ok(DynOutputs::new(writers.bindings.take(), &writers.dropped))
     }
@@ -514,7 +507,7 @@ impl Param for Timestamp {
 
     fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
         param_name(names);
         Ok(())
     }
@@ -544,7 +537,7 @@ impl Param for Log {
 
     fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
-    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<Log, ParamError> {
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<Log, MakeError> {
         param_name(names);
         Ok(Log)
     }
@@ -581,7 +574,7 @@ macro_rules! impl_param_for_tuple {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Self::Out, ParamError> {
+            fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Self::Out, MakeError> {
                 Ok(($( $P::bind_out(names, writers)?, )*))
             }
 

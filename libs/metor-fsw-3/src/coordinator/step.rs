@@ -8,7 +8,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use metor_component::{FrameBytes, FrameStr};
 use metor_proto::types::Timestamp;
 
-use super::params::ParamError;
+use super::params::MakeError;
 use crate::system::System;
 
 /// A system the coordinator can run.
@@ -77,7 +77,7 @@ pub enum LoadError {
     #[error("opening the pack: {0}")]
     Open(String),
     #[error("creating the system: {0}")]
-    Create(ParamError),
+    Create(MakeError),
 }
 
 pub(crate) struct Runner<S: System> {

@@ -16,7 +16,7 @@ use metor_fsw_3_ring::{
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::log::LogEventExt;
 use crate::record::{Payload, Record};
 use crate::system::SystemDef;
@@ -84,10 +84,10 @@ impl<W: WakeSource> Mirror<W> {
 impl Mirror<NoWake> {
     /// Creates a ring with one reader to mirror `real`, `factor` times its
     /// capacity.
-    pub(crate) fn ring_for(real: &RingBuffer, factor: usize) -> Result<RingBuffer, ParamError> {
+    pub(crate) fn ring_for(real: &RingBuffer, factor: usize) -> Result<RingBuffer, MakeError> {
         let capacity = real.config().capacity;
         let config = mirror_config(capacity, factor, 1)?;
-        RingBuffer::create_in_memory(config).map_err(|_| ParamError::MirrorTooLarge { capacity })
+        RingBuffer::create_in_memory(config).map_err(|_| MakeError::MirrorTooLarge { capacity })
     }
 }
 
@@ -233,8 +233,8 @@ pub(crate) fn mirror_config(
     capacity: usize,
     factor: usize,
     readers: usize,
-) -> Result<Config, ParamError> {
-    let too_large = ParamError::MirrorTooLarge { capacity };
+) -> Result<Config, MakeError> {
+    let too_large = MakeError::MirrorTooLarge { capacity };
     Ok(Config {
         capacity: capacity.checked_mul(factor).ok_or(too_large)?,
         max_readers: readers,
@@ -351,7 +351,7 @@ pub(crate) mod tests {
         let capacity = usize::MAX / 2;
         assert_eq!(
             mirror_config(capacity, 4, 1).err(),
-            Some(ParamError::MirrorTooLarge { capacity })
+            Some(MakeError::MirrorTooLarge { capacity })
         );
     }
 
