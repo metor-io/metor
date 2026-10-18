@@ -12,7 +12,7 @@ use metor_proto_wkt::MsgStream;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers};
 use crate::log::Log;
@@ -56,7 +56,7 @@ pub struct Subscribe {
 impl Subscribe {
     /// Binds the transport. This happens at build time, so a taken address
     /// fails the build.
-    pub fn new(params: SubscribeParams) -> Result<Self, ParamError> {
+    pub fn new(params: SubscribeParams) -> Result<Self, MakeError> {
         let endpoint = params.link.transport.bind()?;
         Ok(Self {
             endpoint: Some(endpoint),
@@ -192,7 +192,7 @@ impl Param for SubscribeOutputs {
     fn bind_out(
         names: &mut ParamNames<'_>,
         writers: &mut Writers,
-    ) -> Result<SubscribeOutputs, ParamError> {
+    ) -> Result<SubscribeOutputs, MakeError> {
         <DynOutputs as Param>::bind_out(names, writers).map(SubscribeOutputs)
     }
 

@@ -10,7 +10,7 @@ use metor_proto::types::{PacketId, table_id};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers};
 use crate::log::Log;
@@ -46,7 +46,7 @@ pub struct Publish {
 impl Publish {
     /// Binds the transport. This happens at build time, so a taken address
     /// fails the build.
-    pub fn new(params: PublishParams) -> Result<Self, ParamError> {
+    pub fn new(params: PublishParams) -> Result<Self, MakeError> {
         let endpoint = params.link.transport.bind()?;
         Ok(Self {
             endpoint: Some(endpoint),
@@ -138,7 +138,7 @@ impl<D: InputWake> Param for PublishInputs<D> {
         PublishInputs(<DynInputs<D> as Param>::bind_in(views))
     }
 
-    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<(), ParamError> {
+    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<(), MakeError> {
         <DynInputs<D> as Param>::bind_out(names, writers)
     }
 

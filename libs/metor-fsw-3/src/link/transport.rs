@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use stellarator::net::{TcpListener, TcpStream};
 
 use crate::async_system::Stop;
-use crate::coordinator::ParamError;
+use crate::coordinator::{MakeError, ParamError};
 
 use super::conn::Serving;
 
@@ -54,7 +54,7 @@ pub(crate) enum Endpoint {
 
 impl Transport {
     /// Binds the listener for `Listen`, or resolves the address for `Connect`.
-    pub(crate) fn bind(&self) -> Result<Endpoint, ParamError> {
+    pub(crate) fn bind(&self) -> Result<Endpoint, MakeError> {
         match self {
             Self::Listen {
                 addr,
@@ -110,11 +110,11 @@ impl Endpoint {
     }
 }
 
-fn resolve(addr: &str) -> Result<SocketAddr, ParamError> {
+fn resolve(addr: &str) -> Result<SocketAddr, MakeError> {
     addr.to_socket_addrs()
         .map_err(|e| ParamError::Decode(format!("resolving `{addr}`: {e}")))?
         .next()
-        .ok_or_else(|| ParamError::Decode(format!("`{addr}` resolves to no address")))
+        .ok_or_else(|| ParamError::Decode(format!("`{addr}` resolves to no address")).into())
 }
 
 /// Dials one address, waiting longer after each refused attempt.
@@ -217,7 +217,8 @@ mod tests {
         let addr = held.local_addr().expect("a bound listener");
         // SO_REUSEADDR lets a second bind share the port, so name an address
         // no host owns instead.
-        let Err(ParamError::Decode(message)) = listen("203.0.113.1:9").bind() else {
+        let Err(MakeError::Params(ParamError::Decode(message))) = listen("203.0.113.1:9").bind()
+        else {
             panic!("an unassignable address is an error")
         };
         assert!(message.contains("203.0.113.1:9"), "{message}");
@@ -235,7 +236,10 @@ mod tests {
         let transport = Transport::Connect {
             addr: "not a host".into(),
         };
-        assert!(matches!(transport.bind(), Err(ParamError::Decode(_))));
+        assert!(matches!(
+            transport.bind(),
+            Err(MakeError::Params(ParamError::Decode(_)))
+        ));
     }
 
     #[stellarator::test]
