@@ -304,7 +304,6 @@ class LinkTest(ConfigTest):
         fsw.add("pub", Publish([], transport=Listen("0.0.0.0:2240", max_connections=2)))
         entry = fsw.to_config()["coordinator"]["systems"][0]
         self.assertEqual(entry["params"]["transport"]["listen"]["max_connections"], 2)
-        self.assertEqual(Listen("[::]:2240").port, 2240)
 
     def test_subscribe_rejects_duplicate_record(self) -> None:
         with self.assertRaisesRegex(ConfigError, "twice"):

@@ -28,7 +28,6 @@ use crate::deploy::{
 };
 use crate::dl::store;
 use crate::dl::{Pack, PackError, PackRef};
-use crate::pack::ABI_VERSION;
 
 /// The metor-config package in this checkout. Runs inside the repo use it
 /// when it exists.
@@ -281,7 +280,6 @@ pub fn eval_target(path: &Path, dev_packs: &[PathBuf]) -> Result<DeploymentConfi
         .arg(path)
         .env("PYTHONPATH", python_path(dev_packs)?)
         .env("METOR_CONFIG_OUT", &out)
-        .env("METOR_FSW_ABI_VERSION", ABI_VERSION.to_string())
         .status()?;
     if !status.success() {
         return Err(RunError::Python(status));

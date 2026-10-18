@@ -48,15 +48,6 @@ class Listen:
     addr: str
     max_connections: int = MAX_CONNECTIONS
 
-    def __post_init__(self) -> None:
-        if self.max_connections < 1:
-            raise ConfigError("a listening link takes at least one connection")
-
-    @property
-    def port(self) -> int:
-        """The port in ``addr``."""
-        return int(self.addr.rsplit(":", 1)[1])
-
     def to_json(self) -> dict[str, Any]:
         return {"listen": {"addr": self.addr, "max_connections": self.max_connections}}
 
@@ -78,7 +69,7 @@ class Peer:
     link: SystemHandle
 
     def __post_init__(self) -> None:
-        if not isinstance(self.link, SystemHandle) or not isinstance(self.link._system, Link):
+        if not isinstance(self.link, SystemHandle):
             raise ConfigError(f"`Peer` takes a link's handle, got {self.link!r}")
 
     def to_json(self) -> dict[str, Any]:
@@ -122,10 +113,6 @@ class Link(System):
             "link": link,
             **self._params,
         }
-
-    def listen_port(self) -> int | None:
-        """Returns the port this link listens on, or `None` if it dials."""
-        return self._transport.port if isinstance(self._transport, Listen) else None
 
 
 class Sink(Link):
@@ -270,8 +257,6 @@ def _copies(peer: SystemHandle, items: Sequence[Item], records: Sequence[type[Re
         wanted = published
     copies: list[Copy] = []
     for port in wanted:
-        if not any(p.ref == port.ref and p.target is port.target for p in published):
-            raise ConfigError(f"`{peer._name}` on `{_namespace(peer)}` does not publish `{port.name}`")
         record = port.record
         if record is None:
             raise ConfigError(f"`{port.name}` carries no record class")

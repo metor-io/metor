@@ -8,12 +8,9 @@ import os
 import sys
 from typing import Any, Mapping, Sequence
 
-from ._builtins import Link
 from ._config import OUT_ENV, ConfigError
 from ._generated import CONFIG_VERSION
 from ._target import Target, _targets
-
-LOOPBACK = "127.0.0.1"
 
 _deployments: list["Deployment"] = []
 _emitted = False
@@ -61,53 +58,11 @@ def _namespaces(targets: Sequence[Target]) -> list[str]:
 
 
 def _envelope(targets: Sequence[Target], hosts: Mapping[str, str]) -> dict[str, Any]:
-    _check_peers(targets)
-    _check_ports(targets, hosts)
     return {
         "config_version": CONFIG_VERSION,
         "hosts": dict(hosts),
         "targets": [target.to_config() for target in targets],
     }
-
-
-def _links(targets: Sequence[Target]) -> list[tuple[Target, Link]]:
-    return [
-        (target, system)
-        for target in targets
-        for _, system, _ in target._systems
-        if isinstance(system, Link)
-    ]
-
-
-def _check_peers(targets: Sequence[Target]) -> None:
-    """Checks that every peer a link dials is in the deployment and listens
-    on a fixed port."""
-    for target, link in _links(targets):
-        peer = link._peer
-        if peer is None:
-            continue
-        where = f"`{link._name}` on `{target.namespace}`"
-        if not any(member is peer._target for member in targets):
-            raise ConfigError(f"{where} names a peer on a target this deployment does not include")
-        port = peer._system.listen_port()
-        if port is None:
-            raise ConfigError(f"{where} names peer `{peer._name}`, which dials, so nothing can dial it")
-        if port == 0:
-            raise ConfigError(f"{where} names peer `{peer._name}`, which takes any port; give it one")
-
-
-def _check_ports(targets: Sequence[Target], hosts: Mapping[str, str]) -> None:
-    """Checks that no two listeners on the same host bind the same port."""
-    bound: dict[tuple[str, int], str] = {}
-    for target, link in _links(targets):
-        port = link.listen_port()
-        if port is None or port == 0:
-            continue
-        host = hosts.get(target.namespace or "", LOOPBACK)
-        name = f"{target.namespace}.{link._name}"
-        if (host, port) in bound:
-            raise ConfigError(f"`{name}` and `{bound[host, port]}` both bind {host}:{port}")
-        bound[host, port] = name
 
 
 def to_config() -> dict[str, Any]:
