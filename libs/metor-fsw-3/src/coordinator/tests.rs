@@ -98,6 +98,7 @@ fn entry(name: &str, step: impl Step + 'static, status: &RingBuffer) -> Entry {
         name: name.into(),
         step: StepState::Live(Box::new(step)),
         status: output(status),
+        turned: None,
     }
 }
 

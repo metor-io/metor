@@ -4,8 +4,9 @@
 //! its own thread. The coordinator steps a [`ThreadAdapter`] for each system,
 //! which copies records between the real rings and the system's mirrors.
 //!
-//! In a deterministic build each group is turned instead: its executor runs
-//! on the coordinator thread, once a cycle, at the step of its first member.
+//! In a deterministic build each group is turned instead: the coordinator
+//! owns it and runs its executor on the coordinator thread, once a cycle,
+//! just before the step of its first member.
 
 mod group;
 #[cfg(test)]
@@ -14,8 +15,8 @@ mod turned;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::marker::PhantomData;
-use std::rc::{Rc, Weak as RcWeak};
 use std::sync::{Arc, Weak};
 
 use metor_fsw_3_ring::{NoWake, Notifier, RingBuffer};
@@ -30,7 +31,7 @@ use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef};
 
 use super::{LaunchCx, Launched};
 use group::{GroupHandle, Member, Panicked};
-use turned::TurnedGroup;
+pub(crate) use turned::TurnedGroup;
 
 /// The registry of running thread groups, one per thread name.
 ///
@@ -44,13 +45,7 @@ enum Groups {
     /// Each group runs on its own OS thread.
     Spawned(HashMap<String, Weak<GroupHandle>>),
     /// The coordinator turns each group on its own thread.
-    Turned(HashMap<String, RcWeak<TurnedGroup>>),
-}
-
-/// A group, as a [`ThreadAdapter`] holds it.
-enum Group {
-    Spawned(#[allow(dead_code)] Arc<GroupHandle>),
-    Turned(Rc<TurnedGroup>),
+    Turned(HashMap<String, TurnedGroup>),
 }
 
 impl Default for Threads {
@@ -66,9 +61,25 @@ impl Threads {
         Self(Groups::Turned(HashMap::new()))
     }
 
-    /// Adds `member` to the group named `name`, starting the group if it is
-    /// not running.
-    fn join(&mut self, name: &str, member: Member) -> Result<Group, ParamError> {
+    /// Hands over the turned groups, for the coordinator to own.
+    pub(crate) fn into_turned(self) -> impl Iterator<Item = TurnedGroup> {
+        let groups = match self.0 {
+            Groups::Spawned(_) => HashMap::new(),
+            Groups::Turned(groups) => groups,
+        };
+        groups.into_values()
+    }
+
+    /// Adds the member `id` to the group named `name`, starting the group if
+    /// it is not running.
+    ///
+    /// Returns the spawned group the member keeps alive, if it has one.
+    fn join(
+        &mut self,
+        name: &str,
+        id: &str,
+        member: Member,
+    ) -> Result<Option<Arc<GroupHandle>>, ParamError> {
         match &mut self.0 {
             Groups::Spawned(groups) => {
                 let group = match groups.get(name).and_then(Weak::upgrade) {
@@ -80,19 +91,15 @@ impl Threads {
                     }
                 };
                 group.add(member)?;
-                Ok(Group::Spawned(group))
+                Ok(Some(group))
             }
             Groups::Turned(groups) => {
-                let group = match groups.get(name).and_then(RcWeak::upgrade) {
-                    Some(group) => group,
-                    None => {
-                        let group = TurnedGroup::new(name)?;
-                        groups.insert(name.to_string(), Rc::downgrade(&group));
-                        group
-                    }
+                let group = match groups.entry(name.to_string()) {
+                    Entry::Occupied(group) => group.into_mut(),
+                    Entry::Vacant(slot) => slot.insert(TurnedGroup::new(name, id)?),
                 };
                 group.add(member)?;
-                Ok(Group::Turned(group))
+                Ok(None)
             }
         }
     }
@@ -163,12 +170,12 @@ where
         }),
         panicked: panicked.clone(),
     };
-    let group = cx.threads.join(&thread_name, member)?;
+    let group = cx.threads.join(&thread_name, cx.id, member)?;
     Ok(Box::new(ThreadAdapter {
         mirrors: Mirrors::new(cx.def, bound.input_mirrors, bound.output_mirrors),
         panicked,
         end: None,
-        group,
+        _group: group,
     }))
 }
 
@@ -187,15 +194,13 @@ pub struct ThreadAdapter {
     mirrors: Mirrors<Notifier>,
     panicked: Panicked,
     end: Option<EndReason>,
-    group: Group,
+    /// The spawned group, kept running while this system is placed on it.
+    _group: Option<Arc<GroupHandle>>,
 }
 
 impl Step for ThreadAdapter {
     fn execute(&mut self, now: Timestamp) {
         let fed = self.mirrors.drain_inputs();
-        if let Group::Turned(group) = &self.group {
-            group.turn(now);
-        }
         let taken = self.mirrors.drain_outputs();
         if fed.and(taken).is_err() {
             self.end = Some(EndReason::Failed(Cow::Borrowed("corrupt ring")));

@@ -1,7 +1,6 @@
 //! A turned group: async systems whose executor the coordinator turns once a
 //! cycle on its own thread, for a deterministic run.
 
-use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use metor_proto::types::Timestamp;
@@ -20,47 +19,47 @@ const DROP_TURNS: usize = 64;
 pub(crate) struct TurnedGroup {
     stop: StopHandle,
     stop_rx: Stop,
-    /// Declared before `executor`, so the handles drop first.
-    tasks: RefCell<Vec<JoinHandle<()>>>,
+    tasks: Vec<JoinHandle<()>>,
     executor: Rc<Executor>,
-    /// The cycle time this group was last turned at; later steps that cycle
-    /// skip it.
-    turned_at: Cell<Option<Timestamp>>,
+    /// The id of the group's first member, before whose step it turns.
+    first: String,
 }
 
 impl TurnedGroup {
-    pub(crate) fn new(thread: &str) -> Result<Rc<Self>, ParamError> {
+    /// Starts the group for `thread`, with `first` as its first member's id.
+    pub(crate) fn new(thread: &str, first: &str) -> Result<Self, ParamError> {
         let executor =
             Executor::new(stellarator::time::Clock::Sim).map_err(|_| ParamError::ThreadStart {
                 thread: thread.to_string(),
             })?;
         let (stop, stop_rx) = Stop::pair();
-        Ok(Rc::new(Self {
+        Ok(Self {
             stop,
             stop_rx,
-            tasks: RefCell::default(),
+            tasks: Vec::new(),
             executor: Rc::new(executor),
-            turned_at: Cell::new(None),
-        }))
+            first: first.to_string(),
+        })
+    }
+
+    /// The id of the member before whose step the group turns.
+    pub(crate) fn first(&self) -> &str {
+        &self.first
     }
 
     /// Builds `member` on this thread, inside the executor's scope, and
     /// spawns its task.
-    pub(crate) fn add(&self, member: Member) -> Result<(), ParamError> {
+    pub(crate) fn add(&mut self, member: Member) -> Result<(), ParamError> {
         let panicked = member.panicked.clone();
         let stop = self.stop_rx.clone();
         let running = self.executor.enter(|| member.launch(stop))?;
         let handle = self.executor.spawn(Member::run(running, panicked));
-        self.tasks.borrow_mut().push(handle);
+        self.tasks.push(handle);
         Ok(())
     }
 
-    /// Sets simulated time to `now` and turns the executor once. A second
-    /// call in the same cycle does nothing.
-    pub(crate) fn turn(&self, now: Timestamp) {
-        if self.turned_at.replace(Some(now)) == Some(now) {
-            return;
-        }
+    /// Sets simulated time to `now` and turns the executor once.
+    pub(crate) fn turn(&mut self, now: Timestamp) {
         stellarator::time::sim_set(u64::try_from(now.0).unwrap_or(0));
         self.executor.turn();
     }
@@ -72,11 +71,11 @@ impl Drop for TurnedGroup {
     fn drop(&mut self) {
         self.stop.stop();
         for _ in 0..DROP_TURNS {
-            if self.tasks.borrow().iter().all(|t| t.0.is_complete()) {
+            if self.tasks.iter().all(|t| t.0.is_complete()) {
                 break;
             }
             self.executor.turn();
         }
-        self.tasks.borrow_mut().clear();
+        self.tasks.clear();
     }
 }

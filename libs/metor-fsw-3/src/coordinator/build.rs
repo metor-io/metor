@@ -98,7 +98,12 @@ impl CoordinatorConfig {
             namespace: self.namespace.as_deref(),
             records: &records,
         };
-        let entries = make_systems(&plan, &rings, &mut threads, args)?;
+        let mut entries = make_systems(&plan, &rings, &mut threads, args)?;
+        for group in threads.into_turned() {
+            // PANIC Safety: a group starts with the make of an entry.
+            let first = entries.iter_mut().find(|e| e.name == group.first());
+            first.expect("the group's first member").turned = Some(group);
+        }
 
         Ok(Coordinator {
             entries,
@@ -506,6 +511,7 @@ fn make_systems(
             name: system.id.to_string(),
             step: StepState::Live(step),
             status: Output::new(status),
+            turned: None,
         });
     }
     Ok(entries)

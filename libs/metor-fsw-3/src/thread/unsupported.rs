@@ -17,6 +17,24 @@ impl Threads {
     pub fn deterministic() -> Self {
         Self
     }
+
+    /// Hands over the turned groups, of which there are none.
+    pub(crate) fn into_turned(self) -> impl Iterator<Item = TurnedGroup> {
+        core::iter::empty()
+    }
+}
+
+/// A turned group, which a build without OS threads never starts.
+pub(crate) enum TurnedGroup {}
+
+impl TurnedGroup {
+    pub(crate) fn first(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn turn(&mut self, _now: metor_proto::types::Timestamp) {
+        match *self {}
+    }
 }
 
 /// Returns an error naming the system, since async systems need threads.

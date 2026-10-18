@@ -296,8 +296,11 @@ fn test_corrupt_mirror_ends_the_system() {
     };
     output::<Imu>(&imu).write(&Imu::new(1, 1.0)).expect("room");
 
+    let mut groups: Vec<_> = threads.into_turned().collect();
     for cycle in 1..=8 {
-        step.execute(Timestamp(cycle * 1_000_000));
+        let now = Timestamp(cycle * 1_000_000);
+        groups.iter_mut().for_each(|group| group.turn(now));
+        step.execute(now);
         if step.ended().is_some() {
             break;
         }
@@ -429,8 +432,10 @@ mod turned {
         (from..to).for_each(|k| c.step(Timestamp(k * dt)));
     }
 
+    /// The group turns before the relay feeds its input, so each answer
+    /// lands one cycle after its imu record.
     #[test]
-    fn relay_answers_in_the_same_cycle_every_run() {
+    fn relay_answers_a_cycle_later_every_run() {
         let run = || {
             let recorder = Recorder::default();
             let systems = vec![
@@ -443,7 +448,11 @@ mod turned {
             recorder.take()
         };
         let first = run();
-        assert_eq!(first.len(), 6, "an answer every cycle: {first:?}");
+        assert_eq!(
+            first.len(),
+            5,
+            "an answer every cycle after the first: {first:?}"
+        );
         assert_eq!(first, run());
     }
 
@@ -484,7 +493,7 @@ mod turned {
     }
 
     /// A member that never stops is bounded by the scheduler's tick, and
-    /// the group turns once a cycle however many members step it.
+    /// the group turns once a cycle however many members it has.
     #[test]
     fn group_turns_once_a_cycle() {
         let polls_with = |members: usize| {

@@ -13,7 +13,7 @@
 mod os;
 
 pub use os::Threads;
-pub(crate) use os::place;
+pub(crate) use os::{TurnedGroup, place};
 
 use metor_fsw_3_ring::Notifier;
 

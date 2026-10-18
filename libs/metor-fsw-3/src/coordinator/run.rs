@@ -9,6 +9,7 @@ use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
 use crate::port::Output;
+use crate::thread::TurnedGroup;
 
 use super::config::Clock;
 use super::status::SystemStatus;
@@ -19,6 +20,8 @@ pub(super) struct Entry {
     pub(super) name: String,
     pub(super) step: StepState,
     pub(super) status: Output<SystemStatus>,
+    /// The turned group whose first member this is.
+    pub(super) turned: Option<TurnedGroup>,
 }
 
 /// Runs systems in a fixed order, once per cycle.
@@ -113,7 +116,11 @@ impl Entry {
         self.step.end_reason()
     }
 
+    /// Turns the entry's group, then executes its step unless it has ended.
     fn run(&mut self, now: Timestamp) -> Duration {
+        if let Some(group) = &mut self.turned {
+            group.turn(now);
+        }
         if self.end_reason().is_some() {
             return Duration::ZERO;
         }
