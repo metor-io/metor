@@ -286,6 +286,7 @@ impl ReadbackHandle {
         );
         self.staging.unmap();
         self.in_flight.store(false, Ordering::Release);
+        let bytes = bytes?;
         let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(self.width, self.height, bytes)?;
         let frames = SmallVec::from_elem(Frame::new(buffer), 1);
         Some(Arc::new(RenderImage::new(frames)))
@@ -899,23 +900,28 @@ impl PlotRenderState {
     }
 }
 
+/// `None` when the staging buffer never mapped (the device was lost or
+/// `map_async` failed), so the frame is skipped rather than painted stale.
 fn read_mapped_bytes(
     staging: &wgpu::Buffer,
     width: u32,
     height: u32,
     padded_bytes_per_row: u32,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let slice = staging.slice(..);
     let unpadded_row = width as usize * 4;
     let padded_row = padded_bytes_per_row as usize;
     let mut out = Vec::with_capacity(unpadded_row * height as usize);
-    let view = slice.get_mapped_range();
+    let view = slice
+        .get_mapped_range()
+        .inspect_err(|e| tracing::warn!(%e, "plot readback buffer not mapped"))
+        .ok()?;
     for row in 0..height as usize {
         let start = row * padded_row;
         out.extend_from_slice(&view[start..start + unpadded_row]);
     }
     drop(view);
-    out
+    Some(out)
 }
 
 /// Contiguous run of samples in the shared x/y storage buffers that one
@@ -2118,7 +2124,8 @@ mod tests {
             .slice(..)
             .map_async(wgpu::MapMode::Read, |_| {});
         let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        let bytes = read_mapped_bytes(&target.staging, 4, 4, target.padded_bytes_per_row);
+        let bytes = read_mapped_bytes(&target.staging, 4, 4, target.padded_bytes_per_row)
+            .expect("staging buffer mapped");
         target.staging.unmap();
 
         let pixel = |x: usize, y: usize| {

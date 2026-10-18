@@ -45,14 +45,14 @@ jiff = "0.2"
 stellarator.path = "../stellarator"
 metor-expr.path = "../metor-expr"
 wasmi = { version = "1.1", default-features = false, features = ["std"] }
-wgpu = "29"
+wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 image = "0.25"
 # Image widgets carry their bytes inline so a target-shipped preset works on
 # a panel that has never seen the target's filesystem.
 base64 = "0.22"
-glam = "0.32"
+glam = "0.33"
 # Map-tile fetching, on a dedicated current-thread tokio runtime. gpui no
 # longer pulls in an HTTP stack, so this is plain upstream reqwest.
 reqwest = { version = "0.12", default-features = false, features = [
@@ -67,7 +67,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 dirs.workspace = true
-bevy = { git = "https://github.com/bevyengine/bevy", rev = "5330b01ed6dfe8ee9ea98c97ded72e44ca336c74", default-features = false, features = [
+bevy = { git = "https://github.com/bevyengine/bevy", rev = "5036d978a294a3fbb1c42bf005d6a255e2978a74", default-features = false, features = [
     "std",
     # Core rendering
     "bevy_asset",
