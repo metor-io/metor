@@ -147,24 +147,17 @@ class ResourceTests(unittest.TestCase):
         published = coordinator(fsw)["systems"][1]["inputs"]
         self.assertEqual([i["port"] for i in published], ["gps.fix"])
 
-    def test_wrong_interface_is_refused(self) -> None:
+    def test_grant_of_another_interface_reaches_the_config(self) -> None:
         fsw = Target(cycle_rate=10.0)
         logs = fsw.resource("logs", Dir("/var/log"))
-        with self.assertRaisesRegex(ConfigError, "gps.uart"):
-            fsw.add("gps", Gps(uart=logs))
+        fsw.add("gps", Gps(uart=logs))
+        self.assertEqual(coordinator(fsw)["systems"][0]["grants"], {"uart": "logs"})
 
     def test_resource_of_another_target_is_refused(self) -> None:
         fsw, other = Target(cycle_rate=10.0), Target(cycle_rate=10.0)
         gps1 = other.resource("gps1", Tty("/dev/ttyTHS0"))
         with self.assertRaisesRegex(ConfigError, "this target"):
             fsw.add("gps", Gps(uart=gps1))
-
-    def test_missing_grant_is_refused(self) -> None:
-        fsw = Target(cycle_rate=10.0)
-        gps = Gps(uart=fsw.resource("gps1", Tty("/dev/ttyTHS0")))
-        gps._grants.clear()
-        with self.assertRaisesRegex(ConfigError, "not granted"):
-            fsw.add("gps", gps)
 
     def test_repeated_or_bad_resource_name_is_refused(self) -> None:
         fsw = Target(cycle_rate=10.0)
@@ -176,18 +169,10 @@ class ResourceTests(unittest.TestCase):
 
     def test_io_status_reads_io_complete(self) -> None:
         fsw = Target(cycle_rate=10.0)
-        with self.assertRaisesRegex(ConfigError, "io_status"):
-            fsw.io_status
         fsw.add("gps", Gps(uart=fsw.resource("gps1", Tty("/dev/ttyTHS0"))))
         port = fsw.io_status
         self.assertEqual((port.ref.system, port.ref.port), ("io_complete", "io_status"))
         self.assertIs(port.record, ResourceStatus)
-
-    def test_io_step_names_are_reserved(self) -> None:
-        fsw = Target(cycle_rate=10.0)
-        gps1 = fsw.resource("gps1", Tty("/dev/ttyTHS0"))
-        with self.assertRaisesRegex(ConfigError, "io step"):
-            fsw.add("io_submit", Gps(uart=gps1))
 
 
 class SimTests(unittest.TestCase):

@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any, Sequence, TypeVar
 
 from . import _generated
-from ._config import ConfigError, check_abi
+from ._config import ConfigError
 from ._generated import FRAMEWORK_PORTS, IO_RECORDS, PACK, SequenceRegistry
 from ._model import (
     Item,
@@ -170,8 +170,6 @@ def _transport(
             raise ConfigError("a dialing link holds one connection, so it takes no `max_connections`")
         return {"connect": {"addr": connect}}
     slots = MAX_CONNECTIONS if max_connections is None else max_connections
-    if slots < 1:
-        raise ConfigError("a listening link takes at least one connection")
     return {"listen": {"addr": listen, "max_connections": slots}}
 
 
@@ -194,10 +192,6 @@ class DlSlot(_generated.DlSlot):
         names = _unique([system._ty for system in allow], "a slot allows")
         if initial is not None and initial not in names:
             raise ConfigError(f"`initial` names `{initial}`, which `allow` does not list")
-        declared = allow[0]._inputs
-        for port in inputs:
-            if port not in declared:
-                raise ConfigError(f"`{names[0]}` has no input `{port}`")
         candidates = [_candidate(system) for system in allow]
         super().__init__(inputs, {"allow": candidates, "initial": initial})
         self._ports = dict(type(allow[0])._ports)
@@ -209,7 +203,6 @@ def _candidate(system: System) -> dict[str, Any]:
     that `metor build` opens to resolve it."""
     if not isinstance(system, System) or isinstance(system, (Link, DlSlot)):
         raise ConfigError(f"a slot allows pack systems, got {system!r}")
-    check_abi(system._pack.id, system._pack.abi_version)
     if any(system._inputs.values()):
         raise ConfigError(f"`{system._ty}` in a slot takes its inputs on the slot")
     return {

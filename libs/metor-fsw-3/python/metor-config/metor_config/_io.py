@@ -63,8 +63,6 @@ class GpioLine(Kind):
     _key = "gpio_line"
 
     def _fields(self) -> dict[str, Any]:
-        if self.direction not in ("input", "output"):
-            raise ConfigError(f"a GPIO line is `input` or `output`, got {self.direction!r}")
         return {"chip": self.chip, "line": self.line, "direction": self.direction}
 
 
@@ -91,8 +89,6 @@ class File(Kind):
     _key = "file"
 
     def _fields(self) -> dict[str, Any]:
-        if self.access not in ("read", "write", "read_write"):
-            raise ConfigError(f"a file's access is `read`, `write`, or `read_write`, got {self.access!r}")
         return {"path": self.path, "access": self.access}
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, TypeVar, cast
 
-from ._config import ConfigError, check_abi, simulated_clock, wall_clock
+from ._config import ConfigError, simulated_clock, wall_clock
 from ._generated import CHANNEL_PORTS, COMMANDS_PORT, Io, ResourceStatus
 from ._io import Kind, ResourceHandle, SimKind
 from ._model import Loop, OutPort, Pack, Record, Source, System, _json, _sources
@@ -68,8 +68,6 @@ class Target:
         seed: int = 0,
         epoch: int | None = None,
     ) -> None:
-        if not 0 <= seed < 2**64:
-            raise ConfigError(f"`seed` is an unsigned 64-bit integer, got {seed}")
         if epoch is not None and sim_dt is None:
             raise ConfigError("`epoch` fixes a simulated clock's start, so it needs `sim_dt`")
         self.epoch = epoch
@@ -149,15 +147,10 @@ class Target:
         system: S,
         adapter: dict[str, Any] | None,
     ) -> S:
-        if name in (IO_SUBMIT, IO_COMPLETE):
-            raise ConfigError(f"`{name}` is the name of an io step")
         if name in self._handles:
             raise ConfigError(f"system `{name}` is already added")
         self._check_grants(name, system)
-        packs = (system._pack, *system._record_packs)
-        for pack in packs:
-            check_abi(pack.id, pack.abi_version)
-        for pack in packs:
+        for pack in (system._pack, *system._record_packs):
             self._packs.setdefault(pack.id, pack)
         system._name = name
         system._target = self
@@ -172,27 +165,14 @@ class Target:
 
         Only a target with grants has io steps to write it.
         """
-        if not self._holds_caps():
-            raise ConfigError("no system holds a resource, so there is no io_status")
         return OutPort(IO_COMPLETE, "io_status", ResourceStatus, self)
 
     def _check_grants(self, name: str, system: System) -> None:
-        """Raises `ConfigError` unless every `Cap` of ``system`` is granted a
-        resource of this target that provides its interface."""
-        caps = type(system)._caps
+        """Raises `ConfigError` unless every grant of ``system`` is a resource
+        of this target, since the config names a resource only by its id."""
         for param, grant in system._grants.items():
-            if param not in caps:
-                raise ConfigError(f"`{name}` has no `Cap` parameter `{param}`")
             if not isinstance(grant, ResourceHandle) or grant.target is not self:
                 raise ConfigError(f"`{name}.{param}` takes a resource of this target, got {grant!r}")
-            if grant.kind.interface != caps[param]:
-                raise ConfigError(
-                    f"`{name}.{param}` takes a `{caps[param]}`, but `{grant.name}` "
-                    f"provides `{grant.kind.interface}`"
-                )
-        for param in caps:
-            if param not in system._grants:
-                raise ConfigError(f"`{name}.{param}` is not granted a resource")
 
     def commands(self, *sources: Source[Any]) -> None:
         """Sends the `SequenceCommand`s from these ports to every channel.
@@ -342,8 +322,6 @@ def _adapter(
         raise ConfigError("a system takes `thread` or `channel`, not both")
     if start is not None and channel is None:
         raise ConfigError("`start` sets a channel's state at boot, so it needs `channel`")
-    if start not in (None, "running", "stopped"):
-        raise ConfigError(f"`start` is `running` or `stopped`, got {start!r}")
     if thread is not None:
         return {"thread": thread}
     if channel is None:

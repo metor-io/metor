@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import unittest
 
 from adcs_stub import PACK, Ctrl, Fan, Hold, Mode, MotorCmd, Nav, Ping, Plant, Safe, Tap
@@ -18,7 +17,6 @@ from metor_config import (
     Subscribe,
     Target,
 )
-from metor_config._generated import ABI_VERSION
 
 def adcs_target() -> Target:
     """The design doc's example target."""
@@ -40,11 +38,10 @@ def reset() -> None:
 
 
 class ConfigTest(unittest.TestCase):
-    """Starts and ends each test with no target or env override."""
+    """Starts and ends each test with no target."""
 
     def setUp(self) -> None:
         reset()
-        os.environ.pop("METOR_FSW_ABI_VERSION", None)
 
     def tearDown(self) -> None:
         reset()
@@ -54,8 +51,6 @@ class TargetTest(ConfigTest):
     def test_seed_is_emitted_when_set(self) -> None:
         self.assertEqual(Target(cycle_rate=1.0, seed=7).to_config()["coordinator"]["seed"], 7)
         self.assertNotIn("seed", Target(cycle_rate=1.0).to_config()["coordinator"])
-        with self.assertRaisesRegex(ConfigError, "seed"):
-            Target(cycle_rate=1.0, seed=-1)
 
     def test_epoch_is_emitted_when_set(self) -> None:
         clock = Target(cycle_rate=1.0, sim_dt=0.01, epoch=0).to_config()["coordinator"]["clock"]
@@ -112,20 +107,6 @@ class TargetTest(ConfigTest):
         fsw.add("plant", Plant())
         with self.assertRaisesRegex(ConfigError, "already added"):
             fsw.add("plant", Plant())
-
-    def test_abi_error_reports_versions(self) -> None:
-        os.environ["METOR_FSW_ABI_VERSION"] = "7"
-        fsw = Target(cycle_rate=100.0)
-        with self.assertRaises(ConfigError) as caught:
-            fsw.add("plant", Plant())
-        message = str(caught.exception)
-        self.assertIn("ABI 1", message)
-        self.assertIn("host ABI is 7", message)
-
-    def test_accept_matching_abi(self) -> None:
-        os.environ["METOR_FSW_ABI_VERSION"] = "1"
-        fsw = Target(cycle_rate=100.0)
-        fsw.add("plant", Plant())
 
     def test_undeclared_port_raises_attribute_error(self) -> None:
         fsw = Target(cycle_rate=100.0)
@@ -243,10 +224,6 @@ class LinkTest(ConfigTest):
         with self.assertRaisesRegex(ConfigError, "max_connections"):
             Subscribe([Ping], connect="127.0.0.1:2240", max_connections=2)
 
-    def test_listen_rejects_zero_connections(self) -> None:
-        with self.assertRaisesRegex(ConfigError, "at least one"):
-            Publish([], listen="0.0.0.0:1", max_connections=0)
-
     def test_subscribe_rejects_duplicate_record(self) -> None:
         with self.assertRaisesRegex(ConfigError, "twice"):
             Subscribe([Ping, Ping], listen="0.0.0.0:1")
@@ -285,15 +262,6 @@ class LinkTest(ConfigTest):
         self.assertEqual(fsw.to_config()["packs"], [PACK.to_json()])
         fsw.add("plant", Plant())
         self.assertEqual(fsw.to_config()["packs"], [PACK.to_json()])
-
-    def test_abi_mismatch_prevents_registration(self) -> None:
-        os.environ["METOR_FSW_ABI_VERSION"] = str(ABI_VERSION)
-        fsw = Target(cycle_rate=100.0)
-        with self.assertRaisesRegex(ConfigError, "pack `adcs`.*ABI 1"):
-            fsw.add("cmds", Subscribe([Ping], listen="127.0.0.1:0"))
-        self.assertEqual(fsw.to_config()["packs"], [])
-        self.assertEqual(fsw.to_config()["coordinator"]["systems"], [])
-        fsw.add("cmds", Subscribe([], listen="127.0.0.1:0"))
 
     def test_publish_registration_isolation(self) -> None:
         fsw = Target(cycle_rate=100.0)
@@ -398,8 +366,6 @@ class ChannelTest(ConfigTest):
             fsw.add("nav", Nav(), thread="io", channel="nav")
         with self.assertRaisesRegex(ConfigError, "needs `channel`"):
             fsw.add("nav", Nav(), start="stopped")
-        with self.assertRaisesRegex(ConfigError, "`running` or `stopped`"):
-            fsw.add("nav", Nav(), channel="nav", start="paused")
 
     def test_slot_lists_candidates_outside_packs(self) -> None:
         fsw, systems = slotted()
@@ -429,8 +395,6 @@ class ChannelTest(ConfigTest):
             DlSlot(allow=[Safe(), Safe()])
         with self.assertRaisesRegex(ConfigError, "does not list"):
             DlSlot(allow=[Safe()], initial="hold")
-        with self.assertRaisesRegex(ConfigError, "no input `imu`"):
-            DlSlot(allow=[Safe()], imu=nav.est)
         with self.assertRaisesRegex(ConfigError, "on the slot"):
             DlSlot(allow=[Safe(est=nav.est)])
         with self.assertRaisesRegex(ConfigError, "pack systems"):

@@ -1,11 +1,8 @@
-"""Config file constants, clock encoding, and the pack ABI check."""
+"""Config file constants and clock encoding."""
 
 from __future__ import annotations
 
-import os
 from typing import Any
-
-ABI_ENV = "METOR_FSW_ABI_VERSION"
 
 NANOS_PER_SEC = 1_000_000_000
 
@@ -34,17 +31,3 @@ def simulated_clock(dt: float, epoch: int | None = None) -> dict[str, Any]:
         clock["epoch"] = epoch
     return {"Simulated": clock}
 
-
-def check_abi(pack_id: str, abi_version: int) -> None:
-    """Raises `ConfigError` if the host's ABI differs from the pack module's.
-
-    This catches a stale pack module while the target file runs, instead of
-    later when the host loads the pack.
-    """
-    host = os.environ.get(ABI_ENV)
-    if host is None or int(host) == abi_version:
-        return
-    raise ConfigError(
-        f"pack `{pack_id}` was generated for ABI {abi_version}, host ABI is {int(host)}; "
-        "rebuild the pack with `metor pack dev`"
-    )

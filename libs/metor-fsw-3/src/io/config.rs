@@ -231,3 +231,34 @@ mod tests {
         assert!(can.is_err(), "an empty CAN name fails at parse");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn real(text: &str) -> Result<RealKind, serde_json::Error> {
+        serde_json::from_str(text)
+    }
+
+    #[test]
+    fn test_real_kinds_take_known_modes() {
+        let line = real(r#"{"gpio_line":{"chip":"/dev/gpiochip0","line":3,"direction":"output"}}"#);
+        assert!(matches!(
+            line,
+            Ok(RealKind::GpioLine {
+                direction: GpioDirection::Output,
+                ..
+            })
+        ));
+        let file = real(r#"{"file":{"path":"/tmp/log"}}"#);
+        assert!(matches!(
+            file,
+            Ok(RealKind::File {
+                access: Access::ReadWrite,
+                ..
+            })
+        ));
+        assert!(real(r#"{"gpio_line":{"chip":"c","line":3,"direction":"both"}}"#).is_err());
+        assert!(real(r#"{"file":{"path":"/tmp/log","access":"append"}}"#).is_err());
+    }
+}
