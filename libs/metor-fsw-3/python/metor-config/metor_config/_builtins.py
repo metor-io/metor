@@ -19,7 +19,7 @@ from typing import Any, Sequence, TypeVar
 
 from . import _generated
 from ._config import ConfigError
-from ._generated import FRAMEWORK_PORTS, IO_RECORDS, PACK, SequenceRegistry
+from ._generated import IO_RECORDS, SequenceRegistry
 from ._model import (
     Item,
     OutPort,
@@ -78,14 +78,6 @@ class Peer:
 
 Transport = Listen | Connect | Peer
 """How a link gets its connections."""
-
-
-class DbStatus(Record):
-    """Ingest counters that a `Db` writes when they change."""
-
-    _name = "db_status"
-    _kind = "frame"
-    _pack = PACK
 
 
 class Link(System):
@@ -167,7 +159,7 @@ class Publish(Sink, _generated.Publish):
         super().__init__({"conn_cap": conn_cap}, transport, items, all)
 
 
-class Db(Sink):
+class Db(Sink, _generated.Db):
     """An embedded database that records telemetry.
 
     It stores every record from the ports in `items`, and serves the database
@@ -178,9 +170,6 @@ class Db(Sink):
     Its commands are the message records of every `Subscribe` whose `peer` is
     this db. They are collected when the config is emitted.
     """
-
-    _ty = "db"
-    _ports = {"db_status": DbStatus, **FRAMEWORK_PORTS}
 
     def __init__(
         self,

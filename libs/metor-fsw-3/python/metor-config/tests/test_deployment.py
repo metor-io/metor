@@ -13,7 +13,6 @@ from test_target import CRATE, ConfigTest, adcs_target, reset
 import metor_config._deployment as deploy_mod
 from metor_config import (
     ConfigError,
-    Connect,
     Db,
     Deployment,
     Listen,

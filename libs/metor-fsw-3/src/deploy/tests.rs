@@ -349,7 +349,7 @@ fn test_errors_cite_the_system_location() {
     );
 
     let mut taken = envelope();
-    taken.targets[1].coordinator.systems[1].params = listen(2240);
+    taken.targets[1].coordinator.systems[1].params = db_listen(2240);
     taken.targets[1].coordinator.systems[1].location = at(12);
     let Err(DeployError::Located { location, source }) = resolve(&mut taken, &tables(2)) else {
         panic!("the second listener is located")

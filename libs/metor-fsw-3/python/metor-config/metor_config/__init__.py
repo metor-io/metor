@@ -10,7 +10,6 @@ from ._builtins import (
     ChannelRegistry,
     Connect,
     Db,
-    DbStatus,
     DlSlot,
     Listen,
     Peer,
@@ -23,6 +22,7 @@ from ._deployment import Deployment, emit, gateway
 from ._generated import (
     CONFIG_VERSION,
     ChannelStatus,
+    DbStatus,
     LinkStatus,
     LogEvent,
     ResourceStatus,
