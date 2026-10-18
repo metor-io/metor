@@ -5,22 +5,24 @@ use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use metor_fsw_3_ring::{NoWake, RingBuffer};
+
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogEvent;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::dispatch::Dispatch;
-use super::{Host, Os, OsDone, Route};
+use super::{Host, MemberQueue, Os, OsDone, Route};
 use crate::coordinator::{Adapters, MakeCx, ParamError, Step, StepCx, SystemKind, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::fn_system::LOG_PORT;
 use crate::io::arena::Arena;
 use crate::io::status::ResourceStatus;
-use crate::io::{Cqe, IoState, MAX_OPS, Sqe};
+use crate::io::{IoState, MAX_OPS};
 use crate::log::LogPort;
-use crate::port::{Input, Output};
-use crate::system::{OutputBinding, SystemDef};
+use crate::port::Output;
+use crate::system::{PortDef, SystemDef};
 
 pub const IO_TYPE: &str = "fsw.io";
 /// The output the instance with `status` writes resource counts to.
@@ -68,44 +70,54 @@ fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
     })
 }
 
-fn make(mut cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
+fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
     let params: IoParams = cx.params.decode()?;
-    let (views, mut fixed) = cx.take_bindings();
-    let io = &*cx.io;
-    let names = cx.def.inputs.iter().map(|p| p.name.as_ref());
-    let members: Vec<usize> = names
-        .map(|n| io.member_index(n))
-        .collect::<Result<_, _>>()?;
-    let sqs = members.into_iter().zip(views);
+    let MakeCx {
+        def,
+        inputs,
+        outputs,
+        io,
+        ..
+    } = cx;
+    let index = |ports: &[PortDef]| -> Result<Vec<usize>, ParamError> {
+        ports.iter().map(|p| io.member_index(&p.name)).collect()
+    };
+    let lowers = index(&def.inputs)?;
     // PANIC Safety: `def` declares `log`, then `io_status`, before the CQs.
-    let cq_writers = fixed.split_off(2);
-    let Ok([log, status]) = <[OutputBinding; 2]>::try_from(fixed) else {
+    let [log, status, cq_rings @ ..] = outputs.as_slice() else {
         panic!("`def` declares two fixed outputs");
     };
-    let log = LogPort::new(Output::new(log.writer));
-    let status = Output::new(status.writer);
-    let mut cqs: Vec<Option<Output<Cqe>>> = io.members.iter().map(|_| None).collect();
-    for b in cq_writers {
-        let m = io.member_index(&b.def.name)?;
-        cqs[m] = Some(Output::new(b.writer));
+    let cq_members = index(&def.outputs[2..])?;
+    let mut posts = vec![false; io.members.len()];
+    for &m in &cq_members {
+        posts[m] = true;
     }
     let ops = io.members.len() * MAX_OPS;
+    if let Some(host) = &mut io.host {
+        host.bind_sqs(lowers.iter().copied().zip(inputs));
+        host.bind_cqs(cq_members.iter().copied().zip(cq_rings.iter().copied()));
+    }
     Ok(Box::new(IoStep {
-        sqs: sqs.map(|(m, b)| (m, Input::new(b.views))).collect(),
-        held: Dispatch::held_for(cqs.iter().flatten().count()),
-        cqs,
-        status: params.status.then_some(status),
-        log,
+        held: Dispatch::held_for(cq_members.len()),
+        lowers,
+        posts,
+        status: params.status.then(|| writer(status)),
+        log: LogPort::new(writer(log)),
         done: Vec::with_capacity(2 * ops),
     }))
 }
 
-/// One placement of `fsw.io`.
+fn writer<T: crate::Record + ?Sized>(ring: &RingBuffer) -> Output<T> {
+    // PANIC Safety: build allocates one ring per output.
+    Output::new(ring.writer(NoWake).expect("one writer per output ring"))
+}
+
+/// One placement of `fsw.io`. The queues it serves live in `Host`.
 struct IoStep {
-    /// The SQ of each member it lowers, with the member's index.
-    sqs: Vec<(usize, Input<Sqe>)>,
-    /// The CQ of each member it posts to, by member index.
-    cqs: Vec<Option<Output<Cqe>>>,
+    /// The members whose SQ it lowers.
+    lowers: Vec<usize>,
+    /// Whether it posts to each member's CQ, by member index.
+    posts: Vec<bool>,
     status: Option<Output<ResourceStatus>>,
     log: LogPort,
     done: Vec<OsDone>,
@@ -124,14 +136,20 @@ struct Faults {
 impl Step for IoStep {
     fn execute(&mut self, now: Timestamp, cx: &mut StepCx<'_>) {
         let IoState { members, host, .. } = &mut *cx.io;
-        let Some(Host { dispatch, os }) = host.as_mut() else {
+        let Some(Host {
+            dispatch,
+            os,
+            queues,
+        }) = host.as_mut()
+        else {
             return;
         };
-        let mut faults = self.lower(dispatch, members);
+        let mut faults = self.lower(dispatch, queues, members);
         self.run(dispatch, os.as_mut());
-        let cqs = &mut self.cqs;
+        let posts = &self.posts;
         faults.lost = dispatch.post_ready(self.held, |m, cqe| {
-            let cq = cqs.get_mut(m)?.as_mut()?;
+            posts.get(m).copied().unwrap_or(false).then_some(())?;
+            let cq = queues.get_mut(m)?.cq.as_mut()?;
             Some(cq.write(cqe).is_ok())
         });
         if let Some(status) = &mut self.status {
@@ -148,18 +166,26 @@ impl Step for IoStep {
 impl IoStep {
     /// Lowers what each member's SQ holds, and notes the quiescing members
     /// whose SQ is drained.
-    fn lower(&mut self, dispatch: &mut Dispatch, members: &[(String, Rc<Arena>)]) -> Faults {
+    fn lower(
+        &mut self,
+        dispatch: &mut Dispatch,
+        queues: &mut [MemberQueue],
+        members: &[(String, Rc<Arena>)],
+    ) -> Faults {
         let mut faults = Faults::default();
-        for (m, sq) in &mut self.sqs {
+        for &m in &self.lowers {
+            let Some(sq) = queues.get_mut(m).and_then(|q| q.sq.as_mut()) else {
+                continue;
+            };
             for sqe in sq.drain().take(SQ_PER_PASS) {
                 match sqe {
                     Ok(sqe) => {
-                        faults.rejected |= dispatch.lower(*m, sqe, &members[*m].1).is_err();
+                        faults.rejected |= dispatch.lower(m, sqe, &members[m].1).is_err();
                     }
                     Err(_) => faults.corrupt = true,
                 }
             }
-            dispatch.member_drained(*m);
+            dispatch.member_drained(m);
         }
         faults
     }

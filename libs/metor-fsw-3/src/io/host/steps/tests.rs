@@ -4,7 +4,8 @@ use zerocopy::IntoBytes;
 use super::*;
 use crate::io::host::wire::Wire;
 use crate::io::host::{Backed, Dispatch, dispatch::Resource, host};
-use crate::io::{Op, RawHandle, ResourceEnd, SimKind, Span, Token};
+use crate::io::{Cqe, Op, RawHandle, ResourceEnd, SimKind, Span, Sqe, Token};
+use crate::port::Input;
 use crate::record::{Bytes, Record};
 use crate::tests::utils::{input, pair, ring};
 
@@ -32,18 +33,22 @@ fn rig(sq_depth: usize, cq_depth: usize) -> Rig {
         vec![wire],
     )
     .unwrap();
+    let sq_ring = ring::<Sqe>(sq_depth, 1);
+    let sq = Output::with_max_len(sq_ring.writer(NoWake).unwrap(), Sqe::MAX_LEN);
+    let (cq_ring, cq_out, cq) = pair::<Cqe>(cq_depth);
     io.host = Some(Host {
         dispatch,
         os: host(MAX_OPS).unwrap(),
+        queues: [MemberQueue {
+            sq: Some(input::<Sqe>(&sq_ring)),
+            cq: Some(cq_out),
+        }]
+        .into(),
     });
-    let sq_ring = ring::<Sqe>(sq_depth, 1);
-    let sq = Output::with_max_len(sq_ring.writer(NoWake).unwrap(), Sqe::MAX_LEN);
-    let sq_in = input::<Sqe>(&sq_ring);
-    let (cq_ring, cq_out, cq) = pair::<Cqe>(cq_depth);
     let (log_ring, log_out, log) = pair::<LogEvent>(16);
     let step = IoStep {
-        sqs: vec![(0, sq_in)],
-        cqs: vec![Some(cq_out)],
+        lowers: vec![0],
+        posts: vec![true],
         status: None,
         log: LogPort::new(log_out),
         done: Vec::with_capacity(2 * MAX_OPS),

@@ -7,9 +7,11 @@ use std::os::fd::{OwnedFd, RawFd};
 
 use indexmap::IndexMap;
 
-use super::{Backing, Generational, IoState, MAX_OPS, ResourceEnd, ResourceIndex};
+use super::{Backing, Cqe, Generational, IoState, MAX_OPS, ResourceEnd, ResourceIndex, Sqe};
 use crate::coordinator::BuildError;
+use crate::port::{Input, Output};
 use dispatch::Resource;
+use metor_fsw_3_ring::{NoWake, RingBuffer};
 use wire::Wire;
 
 pub(crate) mod dispatch;
@@ -124,17 +126,58 @@ pub fn host(ops: usize) -> std::io::Result<Box<dyn Os>> {
 /// How many submit and reap rounds teardown runs before it gives up.
 const TEARDOWN_ROUNDS: usize = 10;
 
-/// The dispatch and the backend its ops run on.
+/// The dispatch, the backend its ops run on, and each member's queue pair.
 pub(crate) struct Host {
     pub(crate) dispatch: Dispatch,
     pub(crate) os: Box<dyn Os>,
+    /// Each member's SQ and CQ, by member index, once an io step binds them.
+    pub(crate) queues: Box<[MemberQueue]>,
+}
+
+/// A member's SQ, which an io step lowers, and its CQ, which one posts to.
+///
+/// They outlive the io steps, so a remade step reads on where the last one
+/// stopped.
+#[derive(Default)]
+pub(crate) struct MemberQueue {
+    pub(crate) sq: Option<Input<Sqe>>,
+    pub(crate) cq: Option<Output<Cqe>>,
 }
 
 impl Host {
+    /// Binds the SQ of each `(member, rings)` that has none yet.
+    pub(crate) fn bind_sqs<'a>(&mut self, sqs: impl Iterator<Item = (usize, Vec<&'a RingBuffer>)>) {
+        for (m, rings) in sqs {
+            let Some(MemberQueue { sq: sq @ None, .. }) = self.queues.get_mut(m) else {
+                continue;
+            };
+            // PANIC Safety: the build pass counts one reader slot per edge,
+            // and a bound SQ keeps its view across remakes.
+            let views = rings
+                .into_iter()
+                .map(|ring| ring.view(NoWake).expect("a counted reader slot"));
+            *sq = Some(Input::new(views.collect()));
+        }
+    }
+
+    /// Binds the CQ of each `(member, ring)` that has none yet.
+    pub(crate) fn bind_cqs<'a>(&mut self, cqs: impl Iterator<Item = (usize, &'a RingBuffer)>) {
+        for (m, ring) in cqs {
+            let Some(MemberQueue { cq: cq @ None, .. }) = self.queues.get_mut(m) else {
+                continue;
+            };
+            // PANIC Safety: build allocates one ring per output, and a bound
+            // CQ keeps its writer across remakes.
+            *cq = Some(Output::new(
+                ring.writer(NoWake).expect("one writer per output ring"),
+            ));
+        }
+    }
+
     /// Cancels every op and reaps for a few rounds. False if any op is still
     /// in flight.
     pub(crate) fn teardown(&mut self) -> bool {
-        let Self { dispatch, os } = self;
+        let Self { dispatch, os, .. } = self;
         dispatch.quiesce_all();
         let mut done = Vec::new();
         for _ in 0..TEARDOWN_ROUNDS {
@@ -190,7 +233,12 @@ impl IoState {
             message: e.to_string(),
         })?;
         let mut io = Self::with_members(members.iter().map(|(id, _)| id.as_str()));
-        io.host = Some(Host { dispatch, os });
+        let queues = members.iter().map(|_| MemberQueue::default()).collect();
+        io.host = Some(Host {
+            dispatch,
+            os,
+            queues,
+        });
         Ok(io)
     }
 }
