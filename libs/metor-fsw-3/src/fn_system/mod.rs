@@ -126,7 +126,7 @@ impl<S: SystemFn> System for FnSystem<S> {
 
     /// Runs one cycle, sending its log lines to the system's own `log` output.
     ///
-    /// Samples are taken before the fn runs. Failed writes are reported as a
+    /// Samples are refreshed before the fn runs. Failed writes are reported as a
     /// fault afterward.
     fn execute(
         &self,
@@ -136,7 +136,7 @@ impl<S: SystemFn> System for FnSystem<S> {
         outputs: &mut OutSet<S>,
     ) {
         log::with_log_port(&mut outputs.log, now, || {
-            inputs.samplers.take_all();
+            S::Params::refresh(&mut inputs.ins);
             let mut cx = Cycle::new(now);
             S::call(
                 state,

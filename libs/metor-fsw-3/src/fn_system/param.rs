@@ -14,7 +14,7 @@ use crate::{
     def::{DefCx, DefError, Records},
     frame::Frame,
     log::Log,
-    port::{DynInputs, DynOutputs, Input, Output, Sample, Samplers},
+    port::{DynInputs, DynOutputs, Input, Output, Sample, SampledInput},
     record::Record,
     system::{InputBinding, OutputBinding, PortDef, Ports},
 };
@@ -57,11 +57,8 @@ impl<B> Bindings<B> {
 }
 
 /// Bound inputs, waiting to be handed to parameters.
-///
-/// [`Sample`] parameters also register their samplers here.
 pub struct Views<W: WakeSink> {
     pub(crate) bindings: Bindings<InputBinding<W>>,
-    pub(crate) samplers: Samplers,
 }
 
 impl<W: WakeSink> Views<W> {
@@ -69,7 +66,6 @@ impl<W: WakeSink> Views<W> {
     pub(crate) fn new(inputs: Vec<InputBinding<W>>, declared: usize) -> Self {
         Self {
             bindings: Bindings::new(inputs, declared),
-            samplers: Samplers::default(),
         }
     }
 }
@@ -240,6 +236,9 @@ pub trait Param {
         output: &'a mut Self::Out,
         cx: &mut Cycle<'a>,
     ) -> Self::Item<'a, W>;
+
+    /// Refreshes this parameter's [`Sample`]s for the cycle, before `get`.
+    fn refresh<W: WakeSink + Clone + 'static>(_input: &mut Self::In<W>) {}
 }
 
 /// Takes the name of the next non-tuple parameter.
@@ -291,7 +290,7 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
 /// Instead of the input itself, the fn gets the newest record as of this
 /// cycle. The sample is updated once per cycle, before the fn runs.
 impl<T: Frame + Copy + 'static> Param for Sample<T> {
-    type In<W: WakeSink + Clone + 'static> = Sample<T>;
+    type In<W: WakeSink + Clone + 'static> = SampledInput<T, W>;
     type Out = ();
     type Item<'a, W: WakeSink + Clone + 'static> = &'a Sample<T>;
 
@@ -306,10 +305,7 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
-        let input = <Input<T> as Param>::bind_in(views);
-        let (sample, sampler) = Sample::bind(input);
-        views.samplers.push(sampler);
-        sample
+        SampledInput::new(<Input<T> as Param>::bind_in(views))
     }
 
     fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
@@ -322,7 +318,11 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
     ) -> Self::Item<'a, W> {
-        input
+        &input.sample
+    }
+
+    fn refresh<W: WakeSink + Clone + 'static>(input: &mut Self::In<W>) {
+        input.refresh();
     }
 }
 
@@ -591,6 +591,11 @@ macro_rules! impl_param_for_tuple {
             #[allow(unused_variables, clippy::unused_unit)]
             fn get<'a, W: WakeSink + Clone + 'static>(input: &'a mut Self::In<W>, output: &'a mut Self::Out, cx: &mut Cycle<'a>) -> Self::Item<'a, W> {
                 ($( $P::get::<W>(&mut input.$i, &mut output.$i, cx), )*)
+            }
+
+            #[allow(unused_variables)]
+            fn refresh<W: WakeSink + Clone + 'static>(input: &mut Self::In<W>) {
+                $( $P::refresh::<W>(&mut input.$i); )*
             }
         }
     };

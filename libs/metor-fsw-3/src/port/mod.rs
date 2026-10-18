@@ -24,7 +24,7 @@ mod sample;
 
 use readiness::Waiters;
 pub use sample::Sample;
-pub(crate) use sample::Samplers;
+pub(crate) use sample::SampledInput;
 
 /// Returns the ring capacity needed to hold `depth` records.
 ///

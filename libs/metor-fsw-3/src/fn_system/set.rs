@@ -11,7 +11,7 @@ use metor_fsw_3_ring::{NoWake, WakeSink};
 use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::log::LogPort;
-use crate::port::{Output, Samplers};
+use crate::port::Output;
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports};
 
 use super::FnSignature;
@@ -23,7 +23,6 @@ pub const LOG_PORT: &str = "log";
 /// The bound inputs of a fn system's parameters.
 pub struct InSet<S: FnSignature, W: WakeSink + Clone + 'static = NoWake> {
     pub(crate) ins: <S::Params as Param>::In<W>,
-    pub(crate) samplers: Samplers,
 }
 
 /// The bound outputs of a fn system's parameters, plus its `log` output.
@@ -43,10 +42,7 @@ impl<S: FnSignature, W: WakeSink + Clone + 'static> InSet<S, W> {
         // PANIC Safety: the coordinator binds one list per port of the
         // definition these parameters produced.
         assert!(views.bindings.is_empty(), "more bindings than input params");
-        Self {
-            ins,
-            samplers: views.samplers,
-        }
+        Self { ins }
     }
 }
 
