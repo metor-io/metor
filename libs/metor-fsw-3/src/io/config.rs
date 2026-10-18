@@ -230,11 +230,6 @@ mod tests {
         let can = serde_json::from_str::<RealKind>(r#"{"can": {"iface": ""}}"#);
         assert!(can.is_err(), "an empty CAN name fails at parse");
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     fn real(text: &str) -> Result<RealKind, serde_json::Error> {
         serde_json::from_str(text)
