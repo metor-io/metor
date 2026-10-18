@@ -196,17 +196,6 @@ impl RecordSchema {
             Self::Msg { .. } => 0,
         }
     }
-
-    /// Returns whether two ports carry the same record.
-    ///
-    /// Messages must match exactly. A frame's vtable depends on its port's
-    /// path, so any two frames match here.
-    pub fn same_record(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Msg { .. }, Self::Msg { .. }) => self == other,
-            _ => core::mem::discriminant(self) == core::mem::discriminant(other),
-        }
-    }
 }
 
 /// Frames are compared by their encoded vtables, which is what the ground sees.
@@ -433,8 +422,6 @@ mod tests {
         assert_eq!(metadata[0].component_id, leaf);
         assert!(vtable.data.windows(8).any(|w| w == leaf.0.to_le_bytes()));
         assert_ne!(schema.packet_id(), Imu::schema().packet_id());
-        assert!(schema.same_record(&Imu::schema()));
-        assert!(!schema.same_record(&Note::schema()));
     }
 
     #[test]
