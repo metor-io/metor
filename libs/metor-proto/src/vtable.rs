@@ -592,11 +592,12 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
     ///
     /// Member-template fields (those claimed by a `List`/`Map` op) are skipped at the
     /// top level — they are only realized as part of their owning dynamic field.
-    pub fn for_each_field<'a>(
+    /// `f` may fail with its own error type, which the walk returns as is.
+    pub fn for_each_field<'a, E: From<Error>>(
         &'a self,
         table: Option<&'a [u8]>,
-        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
         for (i, field) in self.fields.iter().enumerate() {
             if self.is_template_field(i) {
                 continue;
@@ -623,15 +624,15 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
     ///
     /// `ctx` carries the containing element's base offset, the accumulated dotted-name
     /// prefix, the inherited frame/timestamp, the element key, and the recursion depth.
-    fn walk_field<'a>(
+    fn walk_field<'a, E: From<Error>>(
         &'a self,
         field: &Field,
         ctx: WalkCtx<'a>,
         table: Option<&'a [u8]>,
-        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
         if ctx.depth > MAX_DYNAMIC_DEPTH {
-            return Err(Error::InvalidOp);
+            return Err(Error::InvalidOp.into());
         }
         let mut realized_op = self.realize(field.arg, table)?;
         // Frame and timestamp are inherited from the enclosing frame, but the field's
@@ -674,7 +675,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                 RealizedOp::List(dynm) | RealizedOp::Map(dynm) => {
                     return self.expand_dynamic(field, &ctx, frame, timestamp, timestamp_at, &dynm, table, f);
                 }
-                _ => return Err(Error::InvalidOp),
+                _ => return Err(Error::InvalidOp.into()),
             }
         }
     }
@@ -682,7 +683,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
     /// Builds and emits a single realized component for a leaf (static [`Op::Component`]
     /// or dynamic [`Op::PathComponent`]).
     #[allow(clippy::too_many_arguments)]
-    fn emit_leaf<'a>(
+    fn emit_leaf<'a, E: From<Error>>(
         &'a self,
         field: &Field,
         ctx: &WalkCtx<'a>,
@@ -694,12 +695,12 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         dynamic: bool,
         member: Option<&'a str>,
         table: Option<&'a [u8]>,
-        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
         let schema = schema.as_ref().ok_or(Error::SchemaNotFound)?;
         // NOTE(sphw): bogan version of zerocopy::transmute_ref; see the original
         // realize_fields for the upstream zerocopy issue this works around.
-        let shape: &[usize] = <[usize]>::ref_from_bytes(schema.dim.as_bytes())?;
+        let shape: &[usize] = <[usize]>::ref_from_bytes(schema.dim.as_bytes()).map_err(Error::from)?;
         let offset = ctx.base + field.offset.to_index();
         let view = if let Some(table) = table {
             let data = table
@@ -732,7 +733,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
     /// each member template is emitted once with no element key and no view — enough to
     /// surface the member ty/shape.
     #[allow(clippy::too_many_arguments)]
-    fn expand_dynamic<'a>(
+    fn expand_dynamic<'a, E: From<Error>>(
         &'a self,
         field: &Field,
         ctx: &WalkCtx<'a>,
@@ -741,8 +742,8 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         timestamp_at: Option<usize>,
         dynm: &RealizedDynamic<'a>,
         table: Option<&'a [u8]>,
-        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
         let mut prefix_path = ctx.path;
         prefix_path.push(dynm.name);
         let members_start = dynm.members.start as usize;
@@ -769,7 +770,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
 
         let stride = dynm.stride as usize;
         if stride == 0 {
-            return Err(Error::InvalidOp);
+            return Err(Error::InvalidOp.into());
         }
         let slot_off = ctx.base + field.offset.to_index();
         let (trailer_off, byte_len) = read_slot(table, slot_off)?;
@@ -786,7 +787,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                 // A '.' in a key would alias the dotted-path grammar (it would create
                 // an extra, ambiguous path segment); reject it.
                 if key.contains('.') {
-                    return Err(Error::InvalidComponentData);
+                    return Err(Error::InvalidComponentData.into());
                 }
                 (entry_base + dynm.value_offset as usize, ElementKey::Key(key))
             } else {

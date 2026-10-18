@@ -380,7 +380,7 @@ impl DB {
                 return Ok(StaticIngest::Dynamic);
             }
             let mut pushed = Pushed::default();
-            for_each_realized(vtable, buf, |rf| {
+            vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
                 let component = state
                     .get_component(rf.component_id)
                     .ok_or(Error::ComponentNotFound(rf.component_id))?;
@@ -407,7 +407,7 @@ impl DB {
                 .ok_or(Error::Impeller(metor_proto::error::Error::VTableNotFound))?
                 .clone();
             let mut pushed = Pushed::default();
-            for_each_realized(&vtable, buf, |rf| {
+            vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
                 let component = state.realize_component(&rf, &self.path)?;
                 pushed.merge(push_field(component, &rf, received)?);
                 Ok(())
@@ -876,7 +876,7 @@ fn push_field(
     rf: &RealizedField,
     received: Timestamp,
 ) -> Result<Pushed, Error> {
-    // PANIC Safety: `for_each_realized` walks a table, so every field realizes a view.
+    // PANIC Safety: the callers walk a table, so every field realizes a view.
     let view = rf.view.as_ref().expect("table provided to for_each_field");
     let ts = rf.timestamp.unwrap_or(received);
     let new_series = component.time_series.is_empty();
@@ -885,26 +885,6 @@ fn push_field(
         max_ts: Some(ts),
         new_series,
     })
-}
-
-/// Walks the fields `buf` realizes, stopping at the first error `f` returns.
-fn for_each_realized<'a>(
-    vtable: &'a VTable,
-    buf: &'a [u8],
-    mut f: impl FnMut(RealizedField<'a>) -> Result<(), Error>,
-) -> Result<(), Error> {
-    let mut db_err = None;
-    let res = vtable.for_each_field(Some(buf), &mut |rf| {
-        f(rf).map_err(|err| {
-            db_err = Some(err);
-            // Stops the walk; the real error is surfaced below.
-            metor_proto::error::Error::InvalidOp
-        })
-    });
-    match db_err {
-        Some(err) => Err(err),
-        None => Ok(res?),
-    }
 }
 
 #[derive(Clone)]
