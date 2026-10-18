@@ -221,7 +221,7 @@ mod through_the_io_steps {
         let mut table = SystemTable::new();
         metor_fsw_3::builtins::register_builtins(&mut table).unwrap();
         let g = got.clone();
-        let make = move |io: &IoInit<'_>| Pinger {
+        let make = move |io: &mut IoInit<'_>| Pinger {
             tx: Slot::Idle(io.alloc_from(b"ping")),
             rx: Slot::Idle(io.alloc(64)),
             sent: false,

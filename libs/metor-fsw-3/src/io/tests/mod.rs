@@ -49,8 +49,12 @@ impl Loopback {
         }
     }
 
-    pub fn init(&self) -> IoInit<'_> {
-        IoInit::new(self.io.arena())
+    pub fn make<S>(&self, ctor: impl FnOnce(&mut IoInit<'_>) -> S) -> S {
+        let mut init = IoInit::new(self.io.arena());
+        let state = ctor(&mut init);
+        // PANIC Safety: a test's buffers fit, or the test is wrong.
+        init.finish("test").expect("the test's buffers fit");
+        state
     }
 
     /// The records on the SQ, whose room the ring gives back on its next
@@ -61,7 +65,7 @@ impl Loopback {
         sqes
     }
 
-    pub fn complete(&self, cqe: Cqe) {
+    pub fn complete(&mut self, cqe: Cqe) {
         self.cq.write(&cqe).unwrap();
     }
 }

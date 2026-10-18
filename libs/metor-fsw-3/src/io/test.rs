@@ -74,9 +74,13 @@ pub fn cap<K: Interface>() -> (Cap<K>, TestIo) {
 }
 
 impl TestIo {
-    /// Allocates the system's buffers, as a constructor does.
-    pub fn init(&self) -> IoInit<'_> {
-        IoInit::new(self.io.arena())
+    /// Runs `ctor` with the system's buffers, as a make does.
+    pub fn make<S>(&self, ctor: impl FnOnce(&mut IoInit<'_>) -> S) -> S {
+        let mut init = IoInit::new(self.io.arena());
+        let state = ctor(&mut init);
+        // PANIC Safety: a test's buffers fit, or the test is wrong.
+        init.finish("test").expect("the test's buffers fit");
+        state
     }
 
     /// Advances time and lends the queue's other end, for the test to

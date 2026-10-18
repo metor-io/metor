@@ -11,13 +11,13 @@ use crate::io::{Io, IoInit};
 ///
 /// It is implemented for fns that take no params, fns that take a
 /// deserializable params type, and fns that take params and may fail with a
-/// [`MakeError`]. Each form may also take a trailing `&IoInit` to allocate
+/// [`MakeError`]. Each form may also take a trailing `&mut IoInit` to allocate
 /// IO buffers. `Marker` keeps these impls from overlapping.
 pub trait Ctor<S, Marker> {
     /// Builds the state.
     ///
     /// Decodes `params` first if the constructor takes them.
-    fn make(&self, params: Params<'_>, io: &IoInit<'_>) -> Result<S, MakeError>;
+    fn make(&self, params: Params<'_>, io: &mut IoInit<'_>) -> Result<S, MakeError>;
 
     /// Returns the JSON Schema of the params type.
     ///
@@ -29,14 +29,14 @@ pub trait Ctor<S, Marker> {
     ///
     /// A refused allocation fails the make with `IoMemory`, naming system `id`.
     fn make_with_io(&self, id: &str, params: Params<'_>, io: Option<&Io>) -> Result<S, ParamError> {
-        let init = io.map_or_else(IoInit::empty, |io| IoInit::new(io.arena()));
-        let state = self.make(params, &init)?;
+        let mut init = io.map_or_else(IoInit::empty, |io| IoInit::new(io.arena()));
+        let state = self.make(params, &mut init)?;
         init.finish(id)?;
         Ok(state)
     }
 }
 
-/// Marks the constructor forms that take an `&IoInit`.
+/// Marks the constructor forms that take an `&mut IoInit`.
 pub struct WithIo;
 
 fn schema_of<P: JsonSchema>() -> Option<Box<RawValue>> {
@@ -44,7 +44,7 @@ fn schema_of<P: JsonSchema>() -> Option<Box<RawValue>> {
 }
 
 impl<S, F: Fn() -> S> Ctor<S, ()> for F {
-    fn make(&self, _params: Params<'_>, _io: &IoInit<'_>) -> Result<S, MakeError> {
+    fn make(&self, _params: Params<'_>, _io: &mut IoInit<'_>) -> Result<S, MakeError> {
         Ok(self())
     }
 
@@ -54,7 +54,7 @@ impl<S, F: Fn() -> S> Ctor<S, ()> for F {
 }
 
 impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> S> Ctor<S, (P,)> for F {
-    fn make(&self, params: Params<'_>, _io: &IoInit<'_>) -> Result<S, MakeError> {
+    fn make(&self, params: Params<'_>, _io: &mut IoInit<'_>) -> Result<S, MakeError> {
         Ok(self(params.decode()?))
     }
 
@@ -67,7 +67,7 @@ impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> S> Ctor<S, (P,)> for F {
 impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> Result<S, MakeError>> Ctor<S, (P, MakeError)>
     for F
 {
-    fn make(&self, params: Params<'_>, _io: &IoInit<'_>) -> Result<S, MakeError> {
+    fn make(&self, params: Params<'_>, _io: &mut IoInit<'_>) -> Result<S, MakeError> {
         self(params.decode()?)
     }
 
@@ -76,8 +76,8 @@ impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> Result<S, MakeError>> Ctor
     }
 }
 
-impl<S, F: Fn(&IoInit<'_>) -> S> Ctor<S, (WithIo,)> for F {
-    fn make(&self, _params: Params<'_>, io: &IoInit<'_>) -> Result<S, ParamError> {
+impl<S, F: Fn(&mut IoInit<'_>) -> S> Ctor<S, (WithIo,)> for F {
+    fn make(&self, _params: Params<'_>, io: &mut IoInit<'_>) -> Result<S, ParamError> {
         Ok(self(io))
     }
 
@@ -86,8 +86,10 @@ impl<S, F: Fn(&IoInit<'_>) -> S> Ctor<S, (WithIo,)> for F {
     }
 }
 
-impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P, &IoInit<'_>) -> S> Ctor<S, (P, WithIo)> for F {
-    fn make(&self, params: Params<'_>, io: &IoInit<'_>) -> Result<S, ParamError> {
+impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P, &mut IoInit<'_>) -> S> Ctor<S, (P, WithIo)>
+    for F
+{
+    fn make(&self, params: Params<'_>, io: &mut IoInit<'_>) -> Result<S, ParamError> {
         Ok(self(params.decode()?, io))
     }
 
@@ -99,9 +101,9 @@ impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P, &IoInit<'_>) -> S> Ctor<S, (P
 impl<S, P, F> Ctor<S, (P, WithIo, ParamError)> for F
 where
     P: DeserializeOwned + JsonSchema,
-    F: Fn(P, &IoInit<'_>) -> Result<S, ParamError>,
+    F: Fn(P, &mut IoInit<'_>) -> Result<S, ParamError>,
 {
-    fn make(&self, params: Params<'_>, io: &IoInit<'_>) -> Result<S, ParamError> {
+    fn make(&self, params: Params<'_>, io: &mut IoInit<'_>) -> Result<S, ParamError> {
         self(params.decode()?, io)
     }
 
@@ -134,7 +136,7 @@ mod tests {
     ///
     /// The turbofish is needed because `Fn(P) -> S` also matches `build`.
     fn ctor(params: &serde_json::Value) -> Result<u16, MakeError> {
-        Ctor::<u16, (Port, MakeError)>::make(&build, Params(params), &IoInit::empty())
+        Ctor::<u16, (Port, MakeError)>::make(&build, Params(params), &mut IoInit::empty())
     }
 
     #[test]
@@ -157,15 +159,15 @@ mod tests {
 
     struct Bufs(Vec<crate::io::Buf>);
 
-    fn with_io(io: &IoInit<'_>) -> Bufs {
+    fn with_io(io: &mut IoInit<'_>) -> Bufs {
         Bufs(vec![io.alloc(4)])
     }
 
-    fn sized(p: Len, io: &IoInit<'_>) -> Bufs {
+    fn sized(p: Len, io: &mut IoInit<'_>) -> Bufs {
         Bufs(vec![io.alloc(p.len)])
     }
 
-    fn sized_or_fail(p: Len, io: &IoInit<'_>) -> Result<Bufs, ParamError> {
+    fn sized_or_fail(p: Len, io: &mut IoInit<'_>) -> Result<Bufs, ParamError> {
         match p.len {
             0 => Err(ParamError::Decode("zero".into())),
             len => Ok(Bufs(vec![io.alloc(len)])),
@@ -177,8 +179,8 @@ mod tests {
         params: &serde_json::Value,
     ) -> Result<Vec<usize>, ParamError> {
         let arena = std::rc::Rc::new(crate::io::Arena::new());
-        let init = IoInit::new(&arena);
-        let bufs = ctor.make(Params(params), &init)?;
+        let mut init = IoInit::new(&arena);
+        let bufs = ctor.make(Params(params), &mut init)?;
         init.finish("a")?;
         Ok(bufs.0.iter().map(|b| b.capacity()).collect())
     }
@@ -189,15 +191,17 @@ mod tests {
         assert_eq!(make(sized, &json!({ "len": 7 })), Ok(vec![7]));
         assert_eq!(make(sized_or_fail, &json!({ "len": 3 })), Ok(vec![3]));
         assert!(make(sized_or_fail, &json!({ "len": 0 })).is_err());
-        assert!(<fn(Len, &IoInit<'_>) -> Bufs as Ctor<Bufs, (Len, WithIo)>>::schema().is_some());
+        assert!(
+            <fn(Len, &mut IoInit<'_>) -> Bufs as Ctor<Bufs, (Len, WithIo)>>::schema().is_some()
+        );
     }
 
     #[test]
     fn test_plain_forms_ignore_io() {
         let arena = std::rc::Rc::new(crate::io::Arena::new());
-        let init = IoInit::new(&arena);
+        let mut init = IoInit::new(&arena);
         assert_eq!(
-            Ctor::<u16, ()>::make(&|| 5u16, Params(&json!(null)), &init),
+            Ctor::<u16, ()>::make(&|| 5u16, Params(&json!(null)), &mut init),
             Ok(5)
         );
         assert_eq!(init.finish("a"), Ok(()));
@@ -206,7 +210,7 @@ mod tests {
     #[test]
     fn test_bad_params_skip_an_io_constructor() {
         let ran = core::cell::Cell::new(false);
-        let ctor = |p: Len, io: &IoInit<'_>| {
+        let ctor = |p: Len, io: &mut IoInit<'_>| {
             ran.set(true);
             sized(p, io)
         };

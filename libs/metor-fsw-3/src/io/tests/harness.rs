@@ -12,7 +12,7 @@ struct Reader {
 impl Reader {
     fn new() -> Self {
         let (uart, io) = cap::<Uart>();
-        let rx = Slot::Idle(io.init().alloc(8));
+        let rx = Slot::Idle(io.make(|init| init.alloc(8)));
         Self { uart, io, rx }
     }
 
@@ -52,7 +52,7 @@ fn an_unanswered_read_waits_for_a_later_pass() {
 #[test]
 fn a_cancel_completes_a_waiting_op() {
     let (uart, mut io) = cap::<Uart>();
-    let buf = io.init().alloc(4);
+    let buf = io.make(|init| init.alloc(4));
     let mut read = uart.read(buf);
     ScriptedUart::silent().serve(io.turn());
     read.cancel();
@@ -63,9 +63,7 @@ fn a_cancel_completes_a_waiting_op() {
 #[test]
 fn scripted_faults_reach_the_writer() {
     let (uart, mut io) = cap::<Uart>();
-    let init = io.init();
-    let (a, b) = (init.alloc_from(b"cmd"), init.alloc_from(b"cmd"));
-    drop(init);
+    let (a, b) = io.make(|init| (init.alloc_from(b"cmd"), init.alloc_from(b"cmd")));
     let mut model = ScriptedUart::silent().fail_write(Errno::EIO).short_write(1);
     let mut first = uart.write(a);
     model.serve(io.turn());
@@ -104,15 +102,12 @@ fn driver_configures_once_then_reads() {
     }
     let mut model = ScriptedUart::scripted([b"$GP".to_vec(), b"GGA".to_vec()]);
     let (uart, mut io) = cap::<Uart>();
-    let mut s = {
-        let init = io.init();
-        Driver {
-            tx: Slot::Idle(init.alloc_from(b"$PMTK")),
-            rx: Slot::Idle(init.alloc(8)),
-            configured: false,
-            got: Vec::new(),
-        }
-    };
+    let mut s = io.make(|init| Driver {
+        tx: Slot::Idle(init.alloc_from(b"$PMTK")),
+        rx: Slot::Idle(init.alloc(8)),
+        configured: false,
+        got: Vec::new(),
+    });
     for _ in 0..4 {
         if let Some(r) = s.tx.poll() {
             s.configured = r.is_ok();

@@ -138,7 +138,7 @@ pub struct GpsState {
 }
 
 impl GpsState {
-    pub fn new(io: &IoInit) -> Self {
+    pub fn new(io: &mut IoInit) -> Self {
         Self {
             rx: Slot::Idle(io.alloc(256)),
             tx: Slot::Idle(io.alloc_from(PMTK_RATE_10HZ)),
@@ -188,7 +188,7 @@ pub struct UartScript {
 }
 
 impl UartScript {
-    pub fn new(params: UartScriptParams, io: &IoInit) -> Self {
+    pub fn new(params: UartScriptParams, io: &mut IoInit) -> Self {
         let longest = params.script.iter().map(String::len).max().unwrap_or(0);
         Self {
             script: params.script.into_iter().map(String::into_bytes).collect(),
@@ -248,7 +248,7 @@ mod tests {
     impl Rig {
         fn new(model: ScriptedUart) -> Self {
             let (uart, io) = cap::<Uart>();
-            let state = GpsState::new(&io.init());
+            let state = io.make(GpsState::new);
             let (fix_ring, log_ring) = (ring::<Gps>(), ring::<LogEvent>());
             Self {
                 state,
@@ -294,7 +294,7 @@ mod tests {
         let params = UartScriptParams {
             script: vec!["one".into(), "two".into()],
         };
-        let mut state = UartScript::new(params, &io.init());
+        let mut state = io.make(|init| UartScript::new(params, init));
         let mut line = ScriptedUart::silent();
         for _ in 0..3 {
             uart_script()(&mut state, &uart);

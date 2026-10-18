@@ -7,11 +7,11 @@ use crate::io::{IoInit, Span};
 #[test]
 fn bufs_read_empty_until_the_make_ends() {
     let arena = Rc::new(Arena::new());
-    let init = IoInit::new(&arena);
+    let mut init = IoInit::new(&arena);
     let a = init.alloc_from(b"hello");
     let b = init.alloc(3);
     assert!(a.is_empty(), "the arena may still move");
-    drop(init);
+    init.finish("a").expect("fits");
     assert_eq!(&*a, b"hello");
     assert_eq!((b.len(), b.capacity()), (0, 3));
 }
@@ -19,9 +19,9 @@ fn bufs_read_empty_until_the_make_ends() {
 #[test]
 fn spans_never_overlap() {
     let arena = Rc::new(Arena::new());
-    let init = IoInit::new(&arena);
+    let mut init = IoInit::new(&arena);
     let mut bufs: Vec<_> = (0..4).map(|n| init.alloc(n + 1)).collect();
-    drop(init);
+    init.finish("a").expect("fits");
     for (n, buf) in bufs.iter_mut().enumerate() {
         buf.fill(&[n as u8; 8]);
     }
@@ -33,12 +33,11 @@ fn spans_never_overlap() {
 #[test]
 fn remake_within_capacity_reuses_the_arena() {
     let arena = Rc::new(Arena::new());
-    let old = {
-        let init = IoInit::new(&arena);
-        init.alloc_from(b"abcd")
-    };
+    let mut init = IoInit::new(&arena);
+    let old = init.alloc_from(b"abcd");
+    init.finish("a").expect("fits");
     let base = arena.region().unwrap().0;
-    let init = IoInit::new(&arena);
+    let mut init = IoInit::new(&arena);
     let new = init.alloc(2);
     assert!(init.finish("a").is_ok());
     assert_eq!(arena.region().unwrap().0, base);
@@ -52,8 +51,10 @@ fn remake_within_capacity_reuses_the_arena() {
 #[test]
 fn remake_past_capacity_fails_the_make() {
     let arena = Rc::new(Arena::new());
-    drop(IoInit::new(&arena).alloc(4));
-    let init = IoInit::new(&arena);
+    let mut init = IoInit::new(&arena);
+    drop(init.alloc(4));
+    init.finish("a").expect("fits");
+    let mut init = IoInit::new(&arena);
     let buf = init.alloc(9);
     assert_eq!(buf.capacity(), 0);
     let err = init.finish("a").unwrap_err();
@@ -72,7 +73,7 @@ fn remake_past_capacity_fails_the_make() {
 
 #[test]
 fn no_arena_fails_any_allocation() {
-    let init = IoInit::empty();
+    let mut init = IoInit::empty();
     drop(init.alloc(1));
     assert!(matches!(
         init.finish("a"),
@@ -98,9 +99,9 @@ fn span_checks_bounds() {
 fn memory_is_set_once() {
     let arena = Rc::new(Arena::new());
     assert!(arena.region().is_none());
-    drop(IoInit::new(&arena));
-    let (base, len) = arena.region().expect("an empty first make sets the memory");
-    assert_eq!(len, 0);
-    assert!(!arena.set_owned(vec![0; 8].into()), "set only once");
-    assert_eq!(arena.region(), Some((base, 0)));
+    IoInit::new(&arena).finish("a").expect("fits");
+    assert_eq!(arena.region().map(|(_, len)| len), Some(0), "an empty first make sets the memory");
+    let (base, _) = arena.region().expect("set");
+    IoInit::new(&arena).finish("a").expect("fits");
+    assert_eq!(arena.region(), Some((base, 0)), "a remake keeps the memory");
 }

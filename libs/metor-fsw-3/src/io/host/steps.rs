@@ -143,7 +143,7 @@ impl Step for IoStep {
         let cqs = &self.cqs;
         dispatch.take_ready(|m| matches!(cqs.get(m), Some(Some(_))), &mut self.ready);
         faults.lost = self.post();
-        if let Some(status) = &self.status {
+        if let Some(status) = &mut self.status {
             dispatch.report(now, status);
         }
         self.report(now, faults);
@@ -192,11 +192,11 @@ impl IoStep {
     /// Posts the ready completions. One a full CQ refuses is held for the
     /// next pass, up to `held`; past that it is lost: `true`.
     fn post(&mut self) -> bool {
-        let (cqs, held) = (&self.cqs, self.held);
+        let (cqs, held) = (&mut self.cqs, self.held);
         let (mut kept, mut lost) = (0, false);
         self.ready.retain(|(m, cqe)| {
             debug_assert!(cqs[*m].is_some(), "`take_ready` keeps only owned members");
-            let Some(cq) = &cqs[*m] else {
+            let Some(cq) = &mut cqs[*m] else {
                 return false;
             };
             if cq.write(cqe).is_ok() {

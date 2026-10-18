@@ -1,7 +1,7 @@
 //! An arena is one system's fixed IO memory; a remake reuses it from the
 //! start.
 
-use core::cell::{Cell, OnceCell, RefCell};
+use core::cell::{Cell, OnceCell};
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 use std::rc::Rc;
@@ -28,17 +28,17 @@ impl Arena {
         Self::default()
     }
 
-    /// Sets the memory to `bytes`. False if it was already set.
-    pub(crate) fn set_owned(&self, bytes: Box<[u8]>) -> bool {
+    /// Sets the memory to `bytes`. The memory is set once.
+    pub(crate) fn set_owned(&self, bytes: Box<[u8]>) {
         let owned = Arc::new(Owned(NonNull::from(Box::leak(bytes))));
         let (base, len) = (owned.0.cast(), owned.0.len());
-        self.mem
-            .set(Mem {
-                base,
-                len,
-                _owned: owned,
-            })
-            .is_ok()
+        let mem = Mem {
+            base,
+            len,
+            _owned: owned,
+        };
+        let set = self.mem.set(mem).is_ok();
+        debug_assert!(set, "an arena's memory is set once");
     }
 
     /// The memory, once set.
@@ -200,10 +200,10 @@ impl core::fmt::Debug for Buf {
 pub struct IoInit<'a> {
     arena: Option<&'a Rc<Arena>>,
     /// The first make's bytes, before the arena's memory is set.
-    staged: RefCell<Vec<u8>>,
-    top: Cell<u32>,
+    staged: Vec<u8>,
+    top: u32,
     /// Bytes asked for and not given.
-    short: Cell<usize>,
+    short: usize,
 }
 
 impl<'a> IoInit<'a> {
@@ -212,9 +212,9 @@ impl<'a> IoInit<'a> {
         arena.epoch.set(arena.epoch().wrapping_add(1));
         Self {
             arena: Some(arena),
-            staged: RefCell::new(Vec::new()),
-            top: Cell::new(0),
-            short: Cell::new(0),
+            staged: Vec::new(),
+            top: 0,
+            short: 0,
         }
     }
 
@@ -223,28 +223,28 @@ impl<'a> IoInit<'a> {
     pub(crate) fn empty() -> Self {
         Self {
             arena: None,
-            staged: RefCell::new(Vec::new()),
-            top: Cell::new(0),
-            short: Cell::new(0),
+            staged: Vec::new(),
+            top: 0,
+            short: 0,
         }
     }
 
     /// Allocates `len` zeroed bytes. If the arena cannot, returns an empty
     /// buffer and the make fails afterward.
-    pub fn alloc(&self, len: usize) -> Buf {
+    pub fn alloc(&mut self, len: usize) -> Buf {
         self.alloc_with(len, &[])
     }
 
     /// Allocates a buffer filled with `bytes`.
-    pub fn alloc_from(&self, bytes: &[u8]) -> Buf {
+    pub fn alloc_from(&mut self, bytes: &[u8]) -> Buf {
         self.alloc_with(bytes.len(), bytes)
     }
 
     /// Allocates `len` bytes starting with `fill`, zeroing the rest.
-    fn alloc_with(&self, len: usize, fill: &[u8]) -> Buf {
+    fn alloc_with(&mut self, len: usize, fill: &[u8]) -> Buf {
         let span = self.arena.zip(self.bump(len));
         let Some((arena, span)) = span else {
-            self.short.set(self.short.get().saturating_add(len));
+            self.short = self.short.saturating_add(len);
             return Buf::empty();
         };
         let (off, end) = (span.off() as usize, span.off() as usize + len);
@@ -257,9 +257,8 @@ impl<'a> IoInit<'a> {
                 dst[..fill.len()].copy_from_slice(fill);
             },
             None => {
-                let mut staged = self.staged.borrow_mut();
-                staged.resize(end, 0);
-                staged[off..off + fill.len()].copy_from_slice(fill);
+                self.staged.resize(end, 0);
+                self.staged[off..off + fill.len()].copy_from_slice(fill);
             }
         }
         Buf::new(arena, span, fill.len() as u32)
@@ -267,24 +266,27 @@ impl<'a> IoInit<'a> {
 
     /// The next `len` bytes, if they fit: past the end of a set arena's
     /// memory fails, and staged memory grows.
-    fn bump(&self, len: usize) -> Option<Span> {
+    fn bump(&mut self, len: usize) -> Option<Span> {
         let cap = u32::try_from(len).ok()?;
-        let off = self.top.get();
+        let off = self.top;
         let end = off.checked_add(cap)?;
         let fits = self
             .arena?
             .region()
             .is_none_or(|(_, size)| end as usize <= size);
         fits.then(|| {
-            self.top.set(end);
+            self.top = end;
             Span::new(off, cap)
         })
     }
 
-    /// Fails with `IoMemory`, naming system `system`, if any allocation was
-    /// refused.
+    /// Ends the make and gives a first make's arena its memory. Fails with
+    /// `IoMemory`, naming system `system`, if any allocation was refused.
     pub(crate) fn finish(self, system: &str) -> Result<(), ParamError> {
-        let requested_len = self.short.get();
+        if let Some(arena) = self.arena.filter(|a| a.region().is_none()) {
+            arena.set_owned(self.staged.into_boxed_slice());
+        }
+        let requested_len = self.short;
         if requested_len == 0 {
             return Ok(());
         }
@@ -293,15 +295,6 @@ impl<'a> IoInit<'a> {
             requested_len,
             available: self.arena.and_then(|a| a.region()).map(|(_, len)| len),
         })
-    }
-}
-
-impl Drop for IoInit<'_> {
-    /// Gives a first make's arena its memory.
-    fn drop(&mut self) {
-        if let Some(arena) = self.arena.filter(|a| a.region().is_none()) {
-            arena.set_owned(self.staged.take().into_boxed_slice());
-        }
     }
 }
 

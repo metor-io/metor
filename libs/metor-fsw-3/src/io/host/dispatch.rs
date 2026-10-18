@@ -411,7 +411,7 @@ impl Dispatch {
 
     /// Writes up to `STATUS_PER_CYCLE` changed resources, starting after the
     /// last one written. A record the ring refuses is written again later.
-    pub(crate) fn report(&mut self, now: Timestamp, out: &Output<ResourceStatus>) {
+    pub(crate) fn report(&mut self, now: Timestamp, out: &mut Output<ResourceStatus>) {
         let count = self.counters.len();
         let mut written = 0;
         for step in 0..count {

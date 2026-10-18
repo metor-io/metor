@@ -16,7 +16,7 @@ use crate::port::{Input, Output};
 use crate::system::{InputBinding, OutputBinding};
 
 struct Queue {
-    sq: Output<Sqe>,
+    sq: RefCell<Output<Sqe>>,
     cq: RefCell<Input<Cqe>>,
     ops: [Cell<OpSlot>; MAX_OPS],
     generation: Cell<u16>,
@@ -31,7 +31,7 @@ pub struct Io(Rc<Queue>);
 impl Io {
     pub(crate) fn new(sq: Output<Sqe>, cq: Input<Cqe>, arena: Rc<Arena>) -> Self {
         Self(Rc::new(Queue {
-            sq,
+            sq: RefCell::new(sq),
             cq: RefCell::new(cq),
             ops: core::array::from_fn(|_| Cell::default()),
             generation: Cell::new(0),
@@ -103,7 +103,8 @@ impl Io {
         let generation = self.0.generation.get().wrapping_add(1);
         self.0.generation.set(generation);
         let token = Token::new(index as u16, generation);
-        if self.0.sq.write(&Sqe::new(token, handle, op, span)).is_err() {
+        let sqe = Sqe::new(token, handle, op, span);
+        if self.0.sq.borrow_mut().write(&sqe).is_err() {
             return OpState::failed(IoError::QueueFull);
         }
         let opens = op.opens();
@@ -153,10 +154,8 @@ impl Io {
             Write::Cancel => (RawHandle::new(0, 0), Op::Cancel),
             Write::Close(handle) => (handle, Op::Close),
         };
-        self.0
-            .sq
-            .write(&Sqe::new(token, handle, &op, Span::default()))
-            .is_ok()
+        let sqe = Sqe::new(token, handle, &op, Span::default());
+        self.0.sq.borrow_mut().write(&sqe).is_ok()
     }
 
     /// Takes a finished op's result, freeing its slot.

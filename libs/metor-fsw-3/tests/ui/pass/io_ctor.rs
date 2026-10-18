@@ -6,7 +6,7 @@ struct Driver {
 }
 
 impl Driver {
-    fn new(io: &IoInit) -> Self {
+    fn new(io: &mut IoInit) -> Self {
         Self {
             tx: Slot::Idle(io.alloc_from(b"hello")),
         }

@@ -106,8 +106,8 @@ impl Rig {
 
     /// Every resource's changed status.
     fn status(&mut self) -> Vec<ResourceStatus> {
-        let (_ring, out, mut inp) = pair::<ResourceStatus>(ResourceStatus::DEPTH);
-        self.d.report(Timestamp(1), &out);
+        let (_ring, mut out, mut inp) = pair::<ResourceStatus>(ResourceStatus::DEPTH);
+        self.d.report(Timestamp(1), &mut out);
         inp.drain().map(|s| *s.unwrap()).collect()
     }
 
@@ -397,15 +397,15 @@ fn report_writes_changed_resources() {
     r.lower(0, read(0, TTY));
     let op = r.only_os();
     r.done(op.id, Ok(Out::Len(4)));
-    let (_ring, out, mut inp) = pair::<ResourceStatus>(ResourceStatus::DEPTH);
-    r.d.report(Timestamp(1), &out);
+    let (_ring, mut out, mut inp) = pair::<ResourceStatus>(ResourceStatus::DEPTH);
+    r.d.report(Timestamp(1), &mut out);
     let got: Vec<ResourceStatus> = inp.drain().map(|s| *s.unwrap()).collect();
     assert_eq!(got.len(), 1);
     assert_eq!(
         (got[0].submitted, got[0].completed, got[0].bytes_in),
         (1, 1, 4)
     );
-    r.d.report(Timestamp(2), &out);
+    r.d.report(Timestamp(2), &mut out);
     assert_eq!(inp.drain().count(), 0, "unchanged is not written");
 }
 

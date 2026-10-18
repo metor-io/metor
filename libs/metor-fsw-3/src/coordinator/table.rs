@@ -223,7 +223,7 @@ impl SystemTable {
         ctor: C,
     ) -> Result<(), BuildError> {
         let make = move |params: Params<'_>| {
-            let state = ctor.make(params, &crate::io::IoInit::empty())?;
+            let state = ctor.make(params, &mut crate::io::IoInit::empty())?;
             Ok((FnSystem::default(), state))
         };
         let entry =

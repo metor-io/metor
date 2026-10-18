@@ -9,7 +9,7 @@ fn uart(lb: &Loopback) -> Cap<Uart> {
 #[test]
 fn read_completes_with_its_buffer_and_length() {
     let mut lb = Loopback::new();
-    let buf = lb.init().alloc(8);
+    let buf = lb.make(|init| init.alloc(8));
     let uart = uart(&lb);
     let mut rx = Slot::Busy(uart.read(buf));
     let [sqe] = lb.submitted()[..] else { panic!() };
@@ -26,7 +26,7 @@ fn read_completes_with_its_buffer_and_length() {
 #[test]
 fn write_names_its_filled_bytes() {
     let mut lb = Loopback::new();
-    let mut buf = lb.init().alloc(8);
+    let mut buf = lb.make(|init| init.alloc(8));
     buf.fill(b"hi");
     let _w = uart(&lb).write(buf);
     let [sqe] = lb.submitted()[..] else { panic!() };
@@ -36,9 +36,7 @@ fn write_names_its_filled_bytes() {
 #[test]
 fn full_table_completes_queue_full_with_the_buffer_back() {
     let mut lb = Loopback::new();
-    let init = lb.init();
-    let bufs: Vec<_> = (0..=MAX_OPS).map(|_| init.alloc(1)).collect();
-    drop(init);
+    let bufs: Vec<_> = lb.make(|init| (0..=MAX_OPS).map(|_| init.alloc(1)).collect());
     let uart = uart(&lb);
     let mut ops: Vec<_> = bufs.into_iter().map(|b| uart.read(b)).collect();
     let (result, buf) = ops.pop().unwrap().poll().unwrap();
@@ -50,8 +48,8 @@ fn full_table_completes_queue_full_with_the_buffer_back() {
 #[test]
 fn buffer_op_without_a_live_buffer_is_bad_buf() {
     let lb = Loopback::new();
-    let old = lb.init().alloc(4);
-    drop(lb.init());
+    let old = lb.make(|init| init.alloc(4));
+    lb.make(|_| ());
     let (result, _) = uart(&lb).read(old).poll().unwrap();
     assert_eq!(result, Err(IoError::BadBuf), "a buffer from an older make");
 }
@@ -59,7 +57,7 @@ fn buffer_op_without_a_live_buffer_is_bad_buf() {
 #[test]
 fn dropped_pending_frees_its_slot_when_it_lands() {
     let mut lb = Loopback::new();
-    drop(lb.init());
+    lb.make(|_| ());
     let uart = uart(&lb);
     drop(uart.configure(TtyConfig::new(Baud::B9600)));
     assert_eq!(lb.io.in_flight(), 1);
@@ -71,7 +69,7 @@ fn dropped_pending_frees_its_slot_when_it_lands() {
 #[test]
 fn orphaned_accept_closes_its_handle_under_its_own_token() {
     let mut lb = Loopback::new();
-    drop(lb.init());
+    lb.make(|_| ());
     let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
     drop(listen.accept());
     let [accept] = lb.submitted()[..] else {
@@ -94,7 +92,7 @@ fn orphaned_accept_closes_its_handle_under_its_own_token() {
 #[test]
 fn finished_accept_dropped_untaken_closes_too() {
     let mut lb = Loopback::new();
-    drop(lb.init());
+    lb.make(|_| ());
     let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
     let accept = listen.accept();
     let [sqe] = lb.submitted()[..] else { panic!() };
@@ -110,7 +108,7 @@ fn finished_accept_dropped_untaken_closes_too() {
 #[test]
 fn accept_resolves_to_a_handle_on_the_same_queue() {
     let mut lb = Loopback::new();
-    drop(lb.init());
+    lb.make(|_| ());
     let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
     let mut accept = listen.accept();
     let [sqe] = lb.submitted()[..] else { panic!() };
@@ -127,7 +125,7 @@ fn accept_resolves_to_a_handle_on_the_same_queue() {
 #[test]
 fn cancel_names_its_target_and_takes_no_slot() {
     let mut lb = Loopback::new();
-    drop(lb.init());
+    lb.make(|_| ());
     let uart = uart(&lb);
     let flush = uart.flush(TtyQueue::Input);
     flush.cancel();
@@ -141,7 +139,7 @@ fn cancel_names_its_target_and_takes_no_slot() {
 #[test]
 fn stale_generation_is_ignored() {
     let mut lb = Loopback::new();
-    drop(lb.init());
+    lb.make(|_| ());
     let uart = uart(&lb);
     let mut first = uart.flush(TtyQueue::Input);
     let [sqe] = lb.submitted()[..] else { panic!() };
@@ -156,7 +154,7 @@ fn stale_generation_is_ignored() {
 #[test]
 fn steady_state_allocates_nothing() {
     let mut lb = Loopback::new();
-    let buf = lb.init().alloc(4);
+    let buf = lb.make(|init| init.alloc(4));
     let uart = uart(&lb);
     let mut rx: Slot<ReadOp> = Slot::Idle(buf);
     let mut sqes = Vec::with_capacity(4);
@@ -188,7 +186,7 @@ fn fill(uart: &Cap<Uart>) -> Vec<Pending<TtyOp>> {
 #[test]
 fn cancel_the_full_sq_refuses_goes_out_later() {
     let mut lb = Loopback::with_sq_depth(2);
-    drop(lb.init());
+    lb.make(|_| ());
     let uart = uart(&lb);
     let first = uart.flush(TtyQueue::Input);
     let _held = fill(&uart);
@@ -210,7 +208,7 @@ fn cancel_the_full_sq_refuses_goes_out_later() {
 #[test]
 fn orphan_close_the_full_sq_refuses_goes_out_later() {
     let mut lb = Loopback::with_sq_depth(2);
-    drop(lb.init());
+    lb.make(|_| ());
     let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
     drop(listen.accept());
     let accept = lb.submitted()[0];

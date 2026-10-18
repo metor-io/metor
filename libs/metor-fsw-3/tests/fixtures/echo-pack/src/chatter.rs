@@ -12,7 +12,7 @@ pub struct Chatter {
 }
 
 impl Chatter {
-    pub fn new(io: &IoInit) -> Self {
+    pub fn new(io: &mut IoInit) -> Self {
         Self {
             tx: Slot::Idle(io.alloc(8)),
         }
@@ -46,7 +46,7 @@ pub struct Grower {
 }
 
 impl Grower {
-    pub fn new(io: &IoInit) -> Self {
+    pub fn new(io: &mut IoInit) -> Self {
         let made = GROWN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Self {
             _buf: io.alloc(16 * (made + 1)),
@@ -65,7 +65,7 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new(io: &IoInit) -> Self {
+    pub fn new(io: &mut IoInit) -> Self {
         Self {
             rx: Slot::Idle(io.alloc(16)),
         }
