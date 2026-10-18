@@ -206,7 +206,7 @@ mod tests {
         for bad in [
             String::new(),
             "a".repeat(CanIface::MAX_LEN + 1),
-            "can\00".into(),
+            "can\u{0}0".into(),
         ] {
             assert_eq!(bad.parse::<CanIface>(), Err(BadCanIface(bad.clone())));
         }
