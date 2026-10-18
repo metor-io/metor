@@ -60,7 +60,7 @@ fn each_kind_opens_with_its_class() {
     let cases = [
         (
             RealKind::Udp {
-                bind: "127.0.0.1:0".into(),
+                bind: "127.0.0.1:0".parse().unwrap(),
                 connect: None,
             },
             Class::Datagram,
@@ -80,7 +80,7 @@ fn each_kind_opens_with_its_class() {
         ),
         (
             RealKind::TcpListen {
-                addr: "127.0.0.1:0".into(),
+                addr: "127.0.0.1:0".parse().unwrap(),
             },
             Class::Listener,
         ),
@@ -93,9 +93,9 @@ fn each_kind_opens_with_its_class() {
 #[test]
 fn udp_with_connect_is_connected() {
     let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let to = peer.local_addr().unwrap().to_string();
+    let to = peer.local_addr().unwrap();
     let (fd, _) = open(&RealKind::Udp {
-        bind: "127.0.0.1:0".into(),
+        bind: "127.0.0.1:0".parse().unwrap(),
         connect: Some(to),
     })
     .unwrap();
@@ -140,7 +140,7 @@ fn unrunnable_backings_do_not_parse() {
 #[test]
 fn can_and_gpio_are_unsupported_off_linux() {
     let can = open(&RealKind::Can {
-        iface: "can0".into(),
+        iface: "can0".parse().unwrap(),
         filters: vec![],
     });
     assert!(matches!(can, Err(OpenError::Unsupported(_))));
@@ -154,7 +154,7 @@ fn can_opens_on_vcan0() {
         return;
     }
     let (_, class) = open(&RealKind::Can {
-        iface: "vcan0".into(),
+        iface: "vcan0".parse().unwrap(),
         filters: vec![],
     })
     .unwrap();
@@ -237,12 +237,12 @@ mod through_the_io_steps {
             .register("status_probe", status_probe(), move || st.clone())
             .unwrap();
 
-        let addr = format!("127.0.0.1:{}", free_port());
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
         let config = CoordinatorConfig {
             resources: [(
                 "loop".to_string(),
                 Backing::Real(RealKind::Udp {
-                    bind: addr.clone(),
+                    bind: addr,
                     connect: Some(addr),
                 }),
             )]

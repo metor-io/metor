@@ -1645,7 +1645,7 @@ mod tests {
 
         fn can() -> crate::io::RealKind {
             crate::io::RealKind::Can {
-                iface: "can0".into(),
+                iface: "can0".parse().expect("a CAN name"),
                 filters: Vec::new(),
             }
         }

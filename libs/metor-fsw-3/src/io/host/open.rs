@@ -1,7 +1,7 @@
 //! Opens a target's real resources at build.
 
 use std::fs::OpenOptions;
-use std::net::{TcpListener, UdpSocket};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -24,17 +24,17 @@ pub enum OpenError {
 pub fn open(kind: &RealKind) -> Result<(OwnedFd, Class), OpenError> {
     Ok(match kind {
         RealKind::Tty { path, baud } => (open_tty(path, *baud)?, Class::Tty),
-        RealKind::Can { iface, filters } => (open_can(iface, filters)?, Class::Datagram),
+        RealKind::Can { iface, filters } => (open_can(iface.as_str(), filters)?, Class::Datagram),
         RealKind::GpioLine {
             chip,
             line,
             direction,
         } => (open_gpio(chip, *line, *direction)?, Class::Gpio),
-        RealKind::Udp { bind, connect } => (open_udp(bind, connect.as_deref())?, Class::Datagram),
+        RealKind::Udp { bind, connect } => (open_udp(*bind, *connect)?, Class::Datagram),
         RealKind::File { path, access } => (open_file(path, *access)?, Class::File),
         RealKind::Dir { path } => (open_dir(path)?, Class::Dir),
         RealKind::TcpListen { addr } => {
-            let listener = TcpListener::bind(addr)?;
+            let listener = TcpListener::bind(*addr)?;
             listener.set_nonblocking(true)?;
             (listener.into(), Class::Listener)
         }
@@ -52,7 +52,7 @@ fn open_tty(path: &Path, baud: Baud) -> Result<OwnedFd, OpenError> {
     Ok(file.into())
 }
 
-fn open_udp(bind: &str, connect: Option<&str>) -> Result<OwnedFd, OpenError> {
+fn open_udp(bind: SocketAddr, connect: Option<SocketAddr>) -> Result<OwnedFd, OpenError> {
     let socket = UdpSocket::bind(bind)?;
     if let Some(peer) = connect {
         socket.connect(peer)?;
