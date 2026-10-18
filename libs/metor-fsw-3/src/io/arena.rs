@@ -83,26 +83,16 @@ impl Drop for Owned {
 /// It derefs to its filled bytes. An op takes it by value and hands it back
 /// with the result.
 pub struct Buf {
-    arena: Option<Rc<Arena>>,
+    arena: Rc<Arena>,
     span: Span,
     len: u32,
     epoch: u32,
 }
 
 impl Buf {
-    /// A buffer of no capacity, in no arena.
-    pub(crate) fn empty() -> Self {
-        Self {
-            arena: None,
-            span: Span::default(),
-            len: 0,
-            epoch: 0,
-        }
-    }
-
     fn new(arena: &Rc<Arena>, span: Span, len: u32) -> Self {
         Self {
-            arena: Some(arena.clone()),
+            arena: arena.clone(),
             span,
             len,
             epoch: arena.epoch(),
@@ -152,9 +142,8 @@ impl Buf {
     }
 
     fn whole(&self) -> Option<NonNull<[u8]>> {
-        let arena = self.arena.as_ref()?;
-        (arena.epoch() == self.epoch)
-            .then(|| arena.get_slice(self.span))
+        (self.arena.epoch() == self.epoch)
+            .then(|| self.arena.get_slice(self.span))
             .flatten()
     }
 }
@@ -199,54 +188,58 @@ impl core::fmt::Debug for Buf {
 /// Allocates a system's buffers while its constructor runs.
 pub struct IoInit<'a> {
     arena: Option<&'a Rc<Arena>>,
+    /// The system the buffers are for, named in an `IoMemory` error.
+    system: &'a str,
     /// The first make's bytes, before the arena's memory is set.
     staged: Vec<u8>,
     top: u32,
-    /// Bytes asked for and not given.
-    short: usize,
 }
 
 impl<'a> IoInit<'a> {
-    /// Starts a make on `arena`, from its first byte.
-    pub(crate) fn new(arena: &'a Rc<Arena>) -> Self {
+    /// Starts system `system`'s make on `arena`, from its first byte.
+    pub(crate) fn new(arena: &'a Rc<Arena>, system: &'a str) -> Self {
         arena.epoch.set(arena.epoch().wrapping_add(1));
         Self {
             arena: Some(arena),
+            system,
             staged: Vec::new(),
             top: 0,
-            short: 0,
         }
     }
 
-    /// An `IoInit` for a system with no arena. Every allocation fails the
-    /// make.
-    pub(crate) fn empty() -> Self {
+    /// An `IoInit` for system `system`, which has no arena. Every allocation
+    /// fails with `IoMemory`.
+    pub(crate) fn empty(system: &'a str) -> Self {
         Self {
             arena: None,
+            system,
             staged: Vec::new(),
             top: 0,
-            short: 0,
         }
     }
 
-    /// Allocates `len` zeroed bytes. If the arena cannot, returns an empty
-    /// buffer and the make fails afterward.
-    pub fn alloc(&mut self, len: usize) -> Buf {
+    /// Allocates `len` zeroed bytes.
+    ///
+    /// # Errors
+    /// Fails with `IoMemory` if the arena cannot hold them.
+    pub fn alloc(&mut self, len: usize) -> Result<Buf, ParamError> {
         self.alloc_with(len, &[])
     }
 
     /// Allocates a buffer filled with `bytes`.
-    pub fn alloc_from(&mut self, bytes: &[u8]) -> Buf {
+    ///
+    /// # Errors
+    /// Fails with `IoMemory` if the arena cannot hold them.
+    pub fn alloc_from(&mut self, bytes: &[u8]) -> Result<Buf, ParamError> {
         self.alloc_with(bytes.len(), bytes)
     }
 
     /// Allocates `len` bytes starting with `fill`, zeroing the rest.
-    fn alloc_with(&mut self, len: usize, fill: &[u8]) -> Buf {
-        let span = self.arena.zip(self.bump(len));
-        let Some((arena, span)) = span else {
-            self.short = self.short.saturating_add(len);
-            return Buf::empty();
-        };
+    fn alloc_with(&mut self, len: usize, fill: &[u8]) -> Result<Buf, ParamError> {
+        let (arena, span) = self
+            .arena
+            .zip(self.bump(len))
+            .ok_or_else(|| self.out_of_memory(len))?;
         let (off, end) = (span.off() as usize, span.off() as usize + len);
         match arena.region() {
             // SAFETY: `bump` kept `off..end` inside the memory and past every
@@ -261,7 +254,16 @@ impl<'a> IoInit<'a> {
                 self.staged[off..off + fill.len()].copy_from_slice(fill);
             }
         }
-        Buf::new(arena, span, fill.len() as u32)
+        Ok(Buf::new(arena, span, fill.len() as u32))
+    }
+
+    /// The error for an allocation of `len` bytes that does not fit.
+    fn out_of_memory(&self, len: usize) -> ParamError {
+        ParamError::IoMemory {
+            system: self.system.to_string(),
+            requested_len: len,
+            available: self.arena.and_then(|a| a.region()).map(|(_, len)| len),
+        }
     }
 
     /// The next `len` bytes, if they fit: past the end of a set arena's
@@ -280,21 +282,11 @@ impl<'a> IoInit<'a> {
         })
     }
 
-    /// Ends the make and gives a first make's arena its memory. Fails with
-    /// `IoMemory`, naming system `system`, if any allocation was refused.
-    pub(crate) fn finish(self, system: &str) -> Result<(), ParamError> {
+    /// Ends the make and gives a first make's arena its memory.
+    pub(crate) fn finish(self) {
         if let Some(arena) = self.arena.filter(|a| a.region().is_none()) {
             arena.set_owned(self.staged.into_boxed_slice());
         }
-        let requested_len = self.short;
-        if requested_len == 0 {
-            return Ok(());
-        }
-        Err(ParamError::IoMemory {
-            system: system.to_string(),
-            requested_len,
-            available: self.arena.and_then(|a| a.region()).map(|(_, len)| len),
-        })
     }
 }
 

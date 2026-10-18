@@ -63,7 +63,7 @@ fn a_cancel_completes_a_waiting_op() {
 #[test]
 fn scripted_faults_reach_the_writer() {
     let (uart, mut io) = cap::<Uart>();
-    let (a, b) = io.make(|init| (init.alloc_from(b"cmd"), init.alloc_from(b"cmd")));
+    let (a, b) = io.make(|init| Ok((init.alloc_from(b"cmd")?, init.alloc_from(b"cmd")?)));
     let mut model = ScriptedUart::silent().fail_write(Errno::EIO).short_write(1);
     let mut first = uart.write(a);
     model.serve(io.turn());
@@ -102,11 +102,13 @@ fn driver_configures_once_then_reads() {
     }
     let mut model = ScriptedUart::scripted([b"$GP".to_vec(), b"GGA".to_vec()]);
     let (uart, mut io) = cap::<Uart>();
-    let mut s = io.make(|init| Driver {
-        tx: Slot::Idle(init.alloc_from(b"$PMTK")),
-        rx: Slot::Idle(init.alloc(8)),
-        configured: false,
-        got: Vec::new(),
+    let mut s = io.make(|init| {
+        Ok(Driver {
+            tx: Slot::Idle(init.alloc_from(b"$PMTK")?),
+            rx: Slot::Idle(init.alloc(8)?),
+            configured: false,
+            got: Vec::new(),
+        })
     });
     for _ in 0..4 {
         if let Some(r) = s.tx.poll() {

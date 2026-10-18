@@ -30,8 +30,8 @@ use crate::coordinator::{
 pub struct Uplink(crate::io::Slot<crate::io::SendOp>);
 
 impl Uplink {
-    pub fn new(io: &mut crate::io::IoInit<'_>) -> Self {
-        Self(crate::io::Slot::Idle(io.alloc_from(b"cmd")))
+    pub fn new(io: &mut crate::io::IoInit<'_>) -> Result<Self, crate::coordinator::ParamError> {
+        Ok(Self(crate::io::Slot::Idle(io.alloc_from(b"cmd")?)))
     }
 }
 

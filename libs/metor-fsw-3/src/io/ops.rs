@@ -12,10 +12,43 @@ mod sealed {
 
 /// How an op's completion becomes the value its `Pending` resolves to.
 pub trait IoOp: sealed::Sealed {
+    /// What the op holds while it runs.
+    type Lent: Lent;
     type Output;
 
     #[doc(hidden)]
-    fn finish(io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output;
+    fn finish(io: &Io, status: IoStatus, value: u32, lent: Self::Lent) -> Self::Output;
+}
+
+/// What an op holds while it runs: a `Buf`, nothing, or, for a raw op,
+/// either.
+pub trait Lent: sealed::Sealed + Unpin {
+    /// The buffer the op names, if any.
+    fn buf(&self) -> Option<&Buf>;
+}
+
+impl sealed::Sealed for Buf {}
+
+impl Lent for Buf {
+    fn buf(&self) -> Option<&Buf> {
+        Some(self)
+    }
+}
+
+impl sealed::Sealed for () {}
+
+impl Lent for () {
+    fn buf(&self) -> Option<&Buf> {
+        None
+    }
+}
+
+impl sealed::Sealed for Option<Buf> {}
+
+impl Lent for Option<Buf> {
+    fn buf(&self) -> Option<&Buf> {
+        self.as_ref()
+    }
 }
 
 /// An op that lends a buffer and hands it back with its result.
@@ -48,13 +81,7 @@ pub struct RawOp;
 
 /// The buffer back, with the length the op reports. A fill sets the
 /// buffer's length to it.
-fn moved(
-    status: IoStatus,
-    value: u32,
-    buf: Option<Buf>,
-    fill: bool,
-) -> (Result<usize, IoError>, Buf) {
-    let mut buf = buf.unwrap_or_else(Buf::empty);
+fn moved(status: IoStatus, value: u32, mut buf: Buf, fill: bool) -> (Result<usize, IoError>, Buf) {
     let result = status.result().map(|()| value as usize);
     if let (Ok(n), true) = (result, fill) {
         buf.set_len(n);
@@ -70,9 +97,10 @@ fn opened<K>(io: &Io, status: IoStatus, value: u32) -> Result<Handle<K>, IoError
 impl sealed::Sealed for ReadOp {}
 
 impl IoOp for ReadOp {
+    type Lent = Buf;
     type Output = (Result<usize, IoError>, Buf);
 
-    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
+    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Buf) -> Self::Output {
         moved(status, value, buf, true)
     }
 }
@@ -80,9 +108,10 @@ impl IoOp for ReadOp {
 impl sealed::Sealed for RecvOp {}
 
 impl IoOp for RecvOp {
+    type Lent = Buf;
     type Output = (Result<usize, IoError>, Buf);
 
-    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
+    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Buf) -> Self::Output {
         moved(status, value, buf, true)
     }
 }
@@ -90,9 +119,10 @@ impl IoOp for RecvOp {
 impl sealed::Sealed for WriteOp {}
 
 impl IoOp for WriteOp {
+    type Lent = Buf;
     type Output = (Result<usize, IoError>, Buf);
 
-    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
+    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Buf) -> Self::Output {
         moved(status, value, buf, false)
     }
 }
@@ -100,9 +130,10 @@ impl IoOp for WriteOp {
 impl sealed::Sealed for SendOp {}
 
 impl IoOp for SendOp {
+    type Lent = Buf;
     type Output = (Result<usize, IoError>, Buf);
 
-    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {
+    fn finish(_io: &Io, status: IoStatus, value: u32, buf: Buf) -> Self::Output {
         moved(status, value, buf, false)
     }
 }
@@ -110,9 +141,10 @@ impl IoOp for SendOp {
 impl sealed::Sealed for OpenOp {}
 
 impl IoOp for OpenOp {
+    type Lent = Buf;
     type Output = Result<Handle<RegularFile>, IoError>;
 
-    fn finish(io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
+    fn finish(io: &Io, status: IoStatus, value: u32, _path: Buf) -> Self::Output {
         opened(io, status, value)
     }
 }
@@ -120,9 +152,10 @@ impl IoOp for OpenOp {
 impl sealed::Sealed for AcceptOp {}
 
 impl IoOp for AcceptOp {
+    type Lent = ();
     type Output = Result<Handle<Stream>, IoError>;
 
-    fn finish(io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
+    fn finish(io: &Io, status: IoStatus, value: u32, (): ()) -> Self::Output {
         opened(io, status, value)
     }
 }
@@ -130,9 +163,10 @@ impl IoOp for AcceptOp {
 impl sealed::Sealed for CloseOp {}
 
 impl IoOp for CloseOp {
+    type Lent = ();
     type Output = Result<(), IoError>;
 
-    fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
+    fn finish(_io: &Io, status: IoStatus, _value: u32, (): ()) -> Self::Output {
         status.result()
     }
 }
@@ -140,9 +174,10 @@ impl IoOp for CloseOp {
 impl sealed::Sealed for FsyncOp {}
 
 impl IoOp for FsyncOp {
+    type Lent = ();
     type Output = Result<(), IoError>;
 
-    fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
+    fn finish(_io: &Io, status: IoStatus, _value: u32, (): ()) -> Self::Output {
         status.result()
     }
 }
@@ -150,9 +185,10 @@ impl IoOp for FsyncOp {
 impl sealed::Sealed for TtyOp {}
 
 impl IoOp for TtyOp {
+    type Lent = ();
     type Output = Result<(), IoError>;
 
-    fn finish(_io: &Io, status: IoStatus, _value: u32, _buf: Option<Buf>) -> Self::Output {
+    fn finish(_io: &Io, status: IoStatus, _value: u32, (): ()) -> Self::Output {
         status.result()
     }
 }
@@ -160,9 +196,10 @@ impl IoOp for TtyOp {
 impl sealed::Sealed for GpioOp {}
 
 impl IoOp for GpioOp {
+    type Lent = ();
     type Output = Result<u32, IoError>;
 
-    fn finish(_io: &Io, status: IoStatus, value: u32, _buf: Option<Buf>) -> Self::Output {
+    fn finish(_io: &Io, status: IoStatus, value: u32, (): ()) -> Self::Output {
         status.result().map(|()| value)
     }
 }
@@ -170,6 +207,7 @@ impl IoOp for GpioOp {
 impl sealed::Sealed for RawOp {}
 
 impl IoOp for RawOp {
+    type Lent = Option<Buf>;
     type Output = (Result<u32, IoError>, Option<Buf>);
 
     fn finish(_io: &Io, status: IoStatus, value: u32, buf: Option<Buf>) -> Self::Output {

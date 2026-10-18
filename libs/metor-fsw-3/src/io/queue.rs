@@ -3,14 +3,13 @@
 
 use core::cell::{Cell, RefCell};
 use core::future::Future;
-use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::rc::Rc;
 
 use super::arena::{Arena, Buf};
 use super::op_slot::{Event, OpSlot, Write};
-use super::ops::{BufOp, IoOp, RawOp};
+use super::ops::{BufOp, IoOp, Lent, RawOp};
 use super::{Cqe, IoError, IoStatus, MAX_OPS, Op, RawHandle, Span, Sqe, Token};
 use crate::port::{Input, Output};
 use crate::system::{InputBinding, OutputBinding};
@@ -65,18 +64,15 @@ impl Io {
         RawHandle::new(n, 0)
     }
 
-    /// Submits `op` on `handle`, lending it `buf`.
-    pub(crate) fn submit<O: IoOp>(
-        &self,
-        handle: RawHandle,
-        op: Op,
-        buf: Option<Buf>,
-    ) -> Pending<O> {
+    /// Submits `op` on `handle`, lending it `lent`.
+    pub(crate) fn submit<O: IoOp>(&self, handle: RawHandle, op: Op, lent: O::Lent) -> Pending<O> {
+        let state = match self.queue_op(handle, &op, lent.buf()) {
+            Ok(token) => OpState::Queued(token, lent),
+            Err(error) => OpState::Failed(IoStatus::err(error), lent),
+        };
         Pending {
-            state: self.queue_op(handle, &op, buf.as_ref()),
+            state,
             io: self.clone(),
-            buf,
-            _o: PhantomData,
         }
     }
 
@@ -89,27 +85,27 @@ impl Io {
     ///
     /// Fails without queueing if `buf` does not suit `op`, or if no slot or
     /// no SQ room is free.
-    fn queue_op(&self, handle: RawHandle, op: &Op, buf: Option<&Buf>) -> OpState {
+    fn queue_op(&self, handle: RawHandle, op: &Op, buf: Option<&Buf>) -> Result<Token, IoError> {
         let span = match buf {
             Some(buf) if buf.live() => buf.span_for(op),
-            Some(_) => return OpState::failed(IoError::BadBuf),
-            None if op.fills() || op.drains() => return OpState::failed(IoError::BadBuf),
+            Some(_) => return Err(IoError::BadBuf),
+            None if op.fills() || op.drains() => return Err(IoError::BadBuf),
             None => Span::default(),
         };
         self.pump();
         let Some(index) = self.0.ops.iter().position(|s| s.get().is_free()) else {
-            return OpState::failed(IoError::QueueFull);
+            return Err(IoError::QueueFull);
         };
         let generation = self.0.generation.get().wrapping_add(1);
         self.0.generation.set(generation);
         let token = Token::new(index as u16, generation);
         let sqe = Sqe::new(token, handle, op, span);
         if self.0.sq.borrow_mut().write(&sqe).is_err() {
-            return OpState::failed(IoError::QueueFull);
+            return Err(IoError::QueueFull);
         }
         let opens = op.opens();
         self.apply(index, Event::Submitted { generation, opens });
-        OpState::Queued(token)
+        Ok(token)
     }
 
     /// Writes again what the SQ refused, then records every completion on
@@ -188,19 +184,13 @@ impl Io {
     }
 }
 
-/// Where a `Pending` op is.
-enum OpState {
-    Queued(Token),
+/// Where a `Pending` op is, with what it holds until its result is returned.
+enum OpState<L> {
+    Queued(Token, L),
     /// Finished without reaching the queue, such as a `QueueFull`.
-    Failed(IoStatus),
+    Failed(IoStatus, L),
     /// Its result was already returned.
     Returned,
-}
-
-impl OpState {
-    fn failed(error: IoError) -> Self {
-        Self::Failed(IoStatus::err(error))
-    }
 }
 
 /// An op in flight.
@@ -210,9 +200,7 @@ impl OpState {
 #[must_use]
 pub struct Pending<O: IoOp> {
     io: Io,
-    state: OpState,
-    buf: Option<Buf>,
-    _o: PhantomData<fn() -> O>,
+    state: OpState<O::Lent>,
 }
 
 impl<O: IoOp> Pending<O> {
@@ -220,12 +208,16 @@ impl<O: IoOp> Pending<O> {
     /// the result was taken.
     pub fn poll(&mut self) -> Option<O::Output> {
         let (status, value) = match self.state {
-            OpState::Queued(token) => self.io.take(token)?,
-            OpState::Failed(status) => (status, 0),
+            OpState::Queued(token, _) => self.io.take(token)?,
+            OpState::Failed(status, _) => (status, 0),
             OpState::Returned => return None,
         };
-        self.state = OpState::Returned;
-        Some(O::finish(&self.io, status, value, self.buf.take()))
+        let (OpState::Queued(_, lent) | OpState::Failed(_, lent)) =
+            core::mem::replace(&mut self.state, OpState::Returned)
+        else {
+            return None;
+        };
+        Some(O::finish(&self.io, status, value, lent))
     }
 
     /// The result if the op has completed, or the op back.
@@ -236,7 +228,7 @@ impl<O: IoOp> Pending<O> {
     /// Cancels the op. Its completion still arrives, usually `Canceled`. The
     /// cancel takes no slot of its own.
     pub fn cancel(&self) {
-        if let OpState::Queued(token) = self.state {
+        if let OpState::Queued(token, _) = self.state {
             self.io.cancel(token);
         }
     }
@@ -257,7 +249,7 @@ impl<O: IoOp> Future for Pending<O> {
 
 impl<O: IoOp> Drop for Pending<O> {
     fn drop(&mut self) {
-        if let OpState::Queued(token) = self.state {
+        if let OpState::Queued(token, _) = self.state {
             self.io.orphan(token);
         }
     }

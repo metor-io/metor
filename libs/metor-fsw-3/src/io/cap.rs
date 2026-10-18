@@ -84,32 +84,32 @@ impl<K> Handle<K> {
         self.raw
     }
 
-    fn submit<O: IoOp>(&self, op: Op, buf: Option<Buf>) -> Pending<O> {
-        self.io.submit(self.raw, op, buf)
+    fn submit<O: IoOp>(&self, op: Op, lent: O::Lent) -> Pending<O> {
+        self.io.submit(self.raw, op, lent)
     }
 
     /// Ends this capability. Later ops on it fail with `Stale`.
     pub fn close(&self) -> Pending<CloseOp> {
-        self.submit(Op::Close, None)
+        self.submit(Op::Close, ())
     }
 }
 
 impl Handle<Uart> {
     /// Reads whatever bytes have arrived, up to the buffer's capacity.
     pub fn read(&self, buf: Buf) -> Pending<ReadOp> {
-        self.submit(Op::Read { offset: None }, Some(buf))
+        self.submit(Op::Read { offset: None }, buf)
     }
 
     pub fn write(&self, buf: Buf) -> Pending<WriteOp> {
-        self.submit(Op::Write { offset: None }, Some(buf))
+        self.submit(Op::Write { offset: None }, buf)
     }
 
     pub fn configure(&self, config: TtyConfig) -> Pending<TtyOp> {
-        self.submit(Op::TtyConfigure(config), None)
+        self.submit(Op::TtyConfigure(config), ())
     }
 
     pub fn flush(&self, queue: TtyQueue) -> Pending<TtyOp> {
-        self.submit(Op::TtyFlush(queue), None)
+        self.submit(Op::TtyFlush(queue), ())
     }
 }
 
@@ -121,50 +121,50 @@ impl Messages for Stream {}
 
 impl<K: Messages> Handle<K> {
     pub fn recv(&self, buf: Buf) -> Pending<RecvOp> {
-        self.submit(Op::Recv, Some(buf))
+        self.submit(Op::Recv, buf)
     }
 
     pub fn send(&self, buf: Buf) -> Pending<SendOp> {
-        self.submit(Op::Send, Some(buf))
+        self.submit(Op::Send, buf)
     }
 }
 
 impl Handle<RegularFile> {
     pub fn read(&self, buf: Buf, offset: u64) -> Pending<ReadOp> {
         let offset = Some(offset);
-        self.submit(Op::Read { offset }, Some(buf))
+        self.submit(Op::Read { offset }, buf)
     }
 
     pub fn write(&self, buf: Buf, offset: u64) -> Pending<WriteOp> {
         let offset = Some(offset);
-        self.submit(Op::Write { offset }, Some(buf))
+        self.submit(Op::Write { offset }, buf)
     }
 
     pub fn fsync(&self) -> Pending<FsyncOp> {
-        self.submit(Op::Fsync, None)
+        self.submit(Op::Fsync, ())
     }
 }
 
 impl Handle<Dir> {
     /// Opens the file at the path in `path`, relative to this directory.
     pub fn open(&self, path: Buf, flags: OpenFlags) -> Pending<OpenOp> {
-        self.submit(Op::Open(flags), Some(path))
+        self.submit(Op::Open(flags), path)
     }
 }
 
 impl Handle<Listen> {
     pub fn accept(&self) -> Pending<AcceptOp> {
-        self.submit(Op::Accept, None)
+        self.submit(Op::Accept, ())
     }
 }
 
 impl Handle<GpioLine> {
     pub fn get(&self) -> Pending<GpioOp> {
-        self.submit(Op::GpioGet, None)
+        self.submit(Op::GpioGet, ())
     }
 
     pub fn set(&self, high: bool) -> Pending<GpioOp> {
-        self.submit(Op::GpioSet(high), None)
+        self.submit(Op::GpioSet(high), ())
     }
 }
 

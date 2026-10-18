@@ -56,8 +56,8 @@ pub enum MakeError {
     #[error("`{system}`: an async system needs OS threads, which this build has none of")]
     ThreadsUnsupported { system: String },
     #[error(
-        "`{system}` needs {requested_len} bytes of IO memory more than {}",
-        .available.map_or("it has without a `Cap`".to_string(), |len| format!("its arena's {len}"))
+        "`{system}` cannot fit {requested_len} more bytes of IO memory in {}",
+        .available.map_or("a system without a `Cap`".to_string(), |len| format!("its {len}-byte arena"))
     )]
     IoMemory {
         system: String,

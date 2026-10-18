@@ -223,11 +223,12 @@ impl SystemTable {
         ctor: C,
     ) -> Result<(), BuildError> {
         let make = move |cx: LaunchCx<'_>| {
+            let state = ctor.make(cx.params, &mut crate::io::IoInit::empty(&cx.instance.id))?;
             let (inputs, outputs) =
                 fn_system::bind::<S, Notifier>(cx.inputs, cx.outputs, cx.instance, None)?;
             Ok(Launched::<FnSystem<S>> {
                 system: FnSystem::default(),
-                state: ctor.make(cx.params, &mut crate::io::IoInit::empty())?,
+                state,
                 inputs,
                 outputs,
             })

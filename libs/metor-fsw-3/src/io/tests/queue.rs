@@ -49,7 +49,7 @@ fn full_table_completes_queue_full_with_the_buffer_back() {
 fn buffer_op_without_a_live_buffer_is_bad_buf() {
     let lb = Loopback::new();
     let old = lb.make(|init| init.alloc(4));
-    lb.make(|_| ());
+    lb.make(|_| Ok(()));
     let (result, _) = uart(&lb).read(old).poll().unwrap();
     assert_eq!(result, Err(IoError::BadBuf), "a buffer from an older make");
 }
@@ -57,7 +57,7 @@ fn buffer_op_without_a_live_buffer_is_bad_buf() {
 #[test]
 fn dropped_pending_frees_its_slot_when_it_lands() {
     let mut lb = Loopback::new();
-    lb.make(|_| ());
+    lb.make(|_| Ok(()));
     let uart = uart(&lb);
     drop(uart.configure(TtyConfig::new(Baud::B9600)));
     assert_eq!(lb.io.in_flight(), 1);
@@ -69,7 +69,7 @@ fn dropped_pending_frees_its_slot_when_it_lands() {
 #[test]
 fn orphaned_accept_closes_its_handle_under_its_own_token() {
     let mut lb = Loopback::new();
-    lb.make(|_| ());
+    lb.make(|_| Ok(()));
     let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
     drop(listen.accept());
     let [accept] = lb.submitted()[..] else {
@@ -92,7 +92,7 @@ fn orphaned_accept_closes_its_handle_under_its_own_token() {
 #[test]
 fn finished_accept_dropped_untaken_closes_too() {
     let mut lb = Loopback::new();
-    lb.make(|_| ());
+    lb.make(|_| Ok(()));
     let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
     let accept = listen.accept();
     let [sqe] = lb.submitted()[..] else { panic!() };
@@ -108,7 +108,7 @@ fn finished_accept_dropped_untaken_closes_too() {
 #[test]
 fn accept_resolves_to_a_handle_on_the_same_queue() {
     let mut lb = Loopback::new();
-    lb.make(|_| ());
+    lb.make(|_| Ok(()));
     let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
     let mut accept = listen.accept();
     let [sqe] = lb.submitted()[..] else { panic!() };
@@ -125,7 +125,7 @@ fn accept_resolves_to_a_handle_on_the_same_queue() {
 #[test]
 fn cancel_names_its_target_and_takes_no_slot() {
     let mut lb = Loopback::new();
-    lb.make(|_| ());
+    lb.make(|_| Ok(()));
     let uart = uart(&lb);
     let flush = uart.flush(TtyQueue::Input);
     flush.cancel();
@@ -139,7 +139,7 @@ fn cancel_names_its_target_and_takes_no_slot() {
 #[test]
 fn stale_generation_is_ignored() {
     let mut lb = Loopback::new();
-    lb.make(|_| ());
+    lb.make(|_| Ok(()));
     let uart = uart(&lb);
     let mut first = uart.flush(TtyQueue::Input);
     let [sqe] = lb.submitted()[..] else { panic!() };
@@ -186,7 +186,7 @@ fn fill(uart: &Cap<Uart>) -> Vec<Pending<TtyOp>> {
 #[test]
 fn cancel_the_full_sq_refuses_goes_out_later() {
     let mut lb = Loopback::with_sq_depth(2);
-    lb.make(|_| ());
+    lb.make(|_| Ok(()));
     let uart = uart(&lb);
     let first = uart.flush(TtyQueue::Input);
     let _held = fill(&uart);
@@ -208,7 +208,7 @@ fn cancel_the_full_sq_refuses_goes_out_later() {
 #[test]
 fn orphan_close_the_full_sq_refuses_goes_out_later() {
     let mut lb = Loopback::with_sq_depth(2);
-    lb.make(|_| ());
+    lb.make(|_| Ok(()));
     let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
     drop(listen.accept());
     let accept = lb.submitted()[0];

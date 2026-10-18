@@ -2,7 +2,7 @@
 //! then publishes each fix the receiver reports.
 
 use metor_fsw_3::io::{Cap, ReadOp, Uart, WriteOp};
-use metor_fsw_3::{IoInit, Log, Output, Record, Slot, system};
+use metor_fsw_3::{IoInit, Log, Output, ParamError, Record, Slot, system};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -138,13 +138,13 @@ pub struct GpsState {
 }
 
 impl GpsState {
-    pub fn new(io: &mut IoInit) -> Self {
-        Self {
-            rx: Slot::Idle(io.alloc(256)),
-            tx: Slot::Idle(io.alloc_from(PMTK_RATE_10HZ)),
+    pub fn new(io: &mut IoInit) -> Result<Self, ParamError> {
+        Ok(Self {
+            rx: Slot::Idle(io.alloc(256)?),
+            tx: Slot::Idle(io.alloc_from(PMTK_RATE_10HZ)?),
             configured: false,
             nmea: Nmea::default(),
-        }
+        })
     }
 }
 
@@ -188,12 +188,12 @@ pub struct UartScript {
 }
 
 impl UartScript {
-    pub fn new(params: UartScriptParams, io: &mut IoInit) -> Self {
+    pub fn new(params: UartScriptParams, io: &mut IoInit) -> Result<Self, ParamError> {
         let longest = params.script.iter().map(String::len).max().unwrap_or(0);
-        Self {
+        Ok(Self {
             script: params.script.into_iter().map(String::into_bytes).collect(),
-            tx: Slot::Idle(io.alloc(longest)),
-        }
+            tx: Slot::Idle(io.alloc(longest)?),
+        })
     }
 }
 

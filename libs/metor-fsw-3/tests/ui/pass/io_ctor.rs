@@ -1,15 +1,15 @@
 use metor_fsw_3::io::{Cap, Uart, WriteOp};
-use metor_fsw_3::{IoInit, Slot, SystemTable, system};
+use metor_fsw_3::{IoInit, ParamError, Slot, SystemTable, system};
 
 struct Driver {
     tx: Slot<WriteOp>,
 }
 
 impl Driver {
-    fn new(io: &mut IoInit) -> Self {
-        Self {
-            tx: Slot::Idle(io.alloc_from(b"hello")),
-        }
+    fn new(io: &mut IoInit) -> Result<Self, ParamError> {
+        Ok(Self {
+            tx: Slot::Idle(io.alloc_from(b"hello")?),
+        })
     }
 }
 

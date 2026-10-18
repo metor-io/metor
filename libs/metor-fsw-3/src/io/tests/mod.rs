@@ -11,6 +11,7 @@ use metor_fsw_3_ring::RingBuffer;
 
 use super::arena::Arena;
 use super::{Cqe, Io, IoInit, Sqe};
+use crate::coordinator::ParamError;
 use crate::port::{Input, Output};
 use crate::record::Record;
 use crate::tests::utils::pair;
@@ -49,11 +50,11 @@ impl Loopback {
         }
     }
 
-    pub fn make<S>(&self, ctor: impl FnOnce(&mut IoInit<'_>) -> S) -> S {
-        let mut init = IoInit::new(self.io.arena());
-        let state = ctor(&mut init);
+    pub fn make<S>(&self, ctor: impl FnOnce(&mut IoInit<'_>) -> Result<S, ParamError>) -> S {
+        let mut init = IoInit::new(self.io.arena(), "test");
         // PANIC Safety: a test's buffers fit, or the test is wrong.
-        init.finish("test").expect("the test's buffers fit");
+        let state = ctor(&mut init).expect("the test's buffers fit");
+        init.finish();
         state
     }
 
