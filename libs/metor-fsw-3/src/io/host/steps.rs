@@ -68,6 +68,7 @@ fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         outputs,
         log: Some(0),
         grants: Vec::new(),
+        io: None,
     })
 }
 

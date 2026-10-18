@@ -10,13 +10,12 @@ use metor_fsw_3_ring::NoWake;
 
 use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
-use crate::io::{Io, IoState};
 use crate::log::LogPort;
 use crate::port::{InputWake, Output};
-use crate::system::{InputBinding, OutputBinding, PortDef, Ports, SystemDef};
+use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, SystemDef};
 
 use super::FnSignature;
-use super::param::{Defs, Instance, Param, Views, Writers};
+use super::param::{Defs, Param, Views, Writers};
 
 /// The output that every fn system writes its log events to.
 pub const LOG_PORT: &str = "log";
@@ -93,16 +92,9 @@ impl<S: FnSignature, W: InputWake> Ports<InputBinding<W>> for InSet<S, W> {
         Ok(Defs::of::<S>(cx)?.inputs)
     }
 
-    fn bind(inputs: Vec<InputBinding<W>>) -> Self {
+    fn bind(inputs: Vec<InputBinding<W>>, _cx: &BindCx) -> Result<Self, ParamError> {
         let defs = Defs::declared::<S>();
-        // PANIC Safety: every make of a system with IO ports binds through
-        // `fn_system::bind`.
-        assert_eq!(
-            defs.io_ports(),
-            0,
-            "IO ports bind through `fn_system::bind`"
-        );
-        Self::from_views(Views::new(inputs, defs.inputs.len()))
+        Ok(Self::from_views(Views::new(inputs, defs.param_inputs())))
     }
 }
 
@@ -111,77 +103,30 @@ impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
         Ok(OutSet::<S>::defs_with_log(cx)?.0)
     }
 
-    /// Binds the outputs under an unnamed instance with seed 0 and an empty
-    /// record table. A table make binds through `fn_system::bind` instead.
-    fn bind(outputs: Vec<OutputBinding>) -> Self {
+    /// Binds the outputs, then `log`, handing `cx`'s queue to the `Cap`s.
+    fn bind(outputs: Vec<OutputBinding>, cx: &BindCx) -> Result<Self, ParamError> {
         let defs = Defs::declared::<S>();
-        // PANIC Safety: as in `InSet::bind`.
-        assert_eq!(
-            defs.io_ports(),
-            0,
-            "IO ports bind through `fn_system::bind`"
-        );
-        let writers = Writers::new(outputs, defs.outputs.len() + 1, Instance::default(), None);
-        // PANIC Safety: only an `Rng` parameter fails, and a table make binds
-        // an `Rng` through `bind`.
-        Self::from_writers(writers).expect("no Rng parameter")
+        let declared = defs.param_outputs() + 1;
+        Self::from_writers(Writers::new(
+            outputs,
+            declared,
+            cx.instance.clone(),
+            cx.io.clone(),
+        ))
     }
 }
 
-/// Returns fn system `S`'s definition, which records its `log` output.
-pub(crate) fn system_def<S: FnSignature, W: InputWake>(
-    cx: &DefCx<'_>,
-) -> Result<SystemDef, DefError> {
+/// Returns fn system `S`'s definition, which records its `log` output and
+/// its queue pair's ports.
+pub(crate) fn system_def<S: FnSignature>(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+    let defs = Defs::of::<S>(cx)?;
     let (outputs, log) = OutSet::<S>::defs_with_log(cx)?;
     Ok(SystemDef {
         name: S::NAME.into(),
-        inputs: InSet::<S, W>::defs(cx)?,
+        inputs: defs.inputs,
         outputs,
         log: Some(log),
-        grants: Vec::new(),
+        grants: defs.grants,
+        io: defs.io,
     })
-}
-
-/// A fn system's bound ports.
-pub(crate) type BoundSet<S, W> = (InSet<S, W>, OutSet<S>);
-
-/// Binds a fn system's ports under `instance`, handing `io` to its `Cap`s.
-pub(crate) fn bind<S: FnSignature, W: InputWake>(
-    inputs: Vec<InputBinding<W>>,
-    outputs: Vec<OutputBinding>,
-    instance: Instance,
-    io: Option<Io>,
-) -> Result<BoundSet<S, W>, ParamError> {
-    let defs = Defs::declared::<S>();
-    let io_ports = defs.io_ports();
-    let ins = InSet::from_views(Views::new(inputs, defs.inputs.len() - io_ports));
-    let writers = Writers::new(outputs, defs.outputs.len() - io_ports + 1, instance, io);
-    Ok((ins, OutSet::from_writers(writers)?))
-}
-
-/// A stepped fn system's bound ports, and its queue if it has one.
-pub(crate) type IoBoundSet<S> = (InSet<S>, OutSet<S>, Option<Io>);
-
-/// Binds a stepped fn system's ports, including its queue pair.
-///
-/// The IO ports come after the parameters' own (see `Defs::append_io`). A
-/// system with a `Cap` takes its member's arena from `state`.
-pub(crate) fn bind_with_io<S: FnSignature>(
-    mut inputs: Vec<InputBinding>,
-    mut outputs: Vec<OutputBinding>,
-    instance: Instance,
-    state: &mut IoState,
-) -> Result<IoBoundSet<S>, ParamError> {
-    let defs = Defs::declared::<S>();
-    let arena = defs.has_io().then(|| state.get_or_add_member(&instance.id));
-    let io_ports = defs.io_ports();
-    // PANIC Safety: build binds one entry per port of the definition these
-    // `Defs` describe, with `log` last among the outputs.
-    let log = outputs.pop().expect("the log output");
-    let io_in = inputs.split_off(inputs.len() - io_ports);
-    let io_out = outputs.split_off(outputs.len() - io_ports);
-    outputs.push(log);
-    let io = Io::from_bindings(arena, io_in, io_out);
-    let (ins, outs) = bind::<S, NoWake>(inputs, outputs, instance, io.clone())?;
-    Ok((ins, outs, io))
 }

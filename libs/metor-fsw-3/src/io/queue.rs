@@ -12,7 +12,6 @@ use super::op_slot::{Event, OpSlot, Write};
 use super::ops::{BufOp, IoOp, Lent, RawOp};
 use super::{Cqe, IoError, IoStatus, MAX_OPS, Op, RawHandle, Span, Sqe, Token};
 use crate::port::{Input, Output};
-use crate::system::{InputBinding, OutputBinding};
 
 struct Queue {
     sq: RefCell<Output<Sqe>>,
@@ -37,20 +36,6 @@ impl Io {
             arena,
             next_grant: Cell::new(0),
         }))
-    }
-
-    /// The queue pair over `io_cq` and `io_sq`, for a system with a `Cap`.
-    pub(crate) fn from_bindings(
-        arena: Option<Rc<Arena>>,
-        inputs: Vec<InputBinding>,
-        outputs: Vec<OutputBinding>,
-    ) -> Option<Self> {
-        let (cq, sq) = inputs.into_iter().zip(outputs).next()?;
-        Some(Self::new(
-            Output::new(sq.writer),
-            Input::new(cq.views),
-            arena?,
-        ))
     }
 
     pub(crate) fn arena(&self) -> &Rc<Arena> {

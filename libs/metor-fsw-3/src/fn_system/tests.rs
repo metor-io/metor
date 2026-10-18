@@ -866,7 +866,7 @@ impl FnSignature for TwoOutputs {
 
 #[test]
 fn test_outputs_share_one_counter() {
-    use crate::system::{OutputBinding, Ports};
+    use crate::system::{BindCx, OutputBinding, Ports};
 
     let rings = [ring::<Imu>(8, 1), ring::<Imu>(8, 1), ring::<LogEvent>(8, 1)];
     let defs = OutSet::<TwoOutputs>::defs(&DefCx::empty()).expect("static ports");
@@ -878,7 +878,7 @@ fn test_outputs_share_one_counter() {
             writer: ring.writer(NoWake).expect("free writer"),
         })
         .collect();
-    let set = OutSet::<TwoOutputs>::bind(bindings);
+    let set = OutSet::<TwoOutputs>::bind(bindings, &BindCx::default()).expect("no Rng");
     assert_eq!(std::sync::Arc::strong_count(&set.dropped), 3);
 }
 
@@ -1133,4 +1133,14 @@ fn test_def_records_its_log_output() {
     assert_eq!(def.outputs[log].id, LogEvent::ID);
     let bare = SystemDef::new::<(), (), NoWake>("bare", &DefCx::empty()).expect("no ports");
     assert_eq!(bare.log, None, "a hand-written def names no log");
+}
+
+/// A fn system with a `Cap` records where its queue pair's ports are.
+#[test]
+fn test_def_records_its_queue_ports() {
+    let def = def_of(crate::tests::utils::uplink());
+    let io = def.io.expect("a Cap gives a queue pair");
+    assert_eq!(def.inputs[io.cq].name, crate::io::IO_CQ);
+    assert_eq!(def.outputs[io.sq].name, crate::io::IO_SQ);
+    assert_eq!(def_of(counting()).io, None, "no Cap, no queue pair");
 }

@@ -25,7 +25,6 @@ pub use ctor::{Ctor, WithIo};
 pub use param::{Cycle, Param, ParamNames, Views, Writers};
 pub(crate) use param::{Defs, Instance, param_name};
 pub use set::{InSet, LOG_PORT, OutSet};
-pub(crate) use set::{bind, bind_with_io};
 
 /// Describes the parameters of a system written as a fn.
 pub trait FnSignature: Sized + 'static {
@@ -102,7 +101,7 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
         if defs.rng {
             return Err(DefError::RngOnAsync { system });
         }
-        set::system_def::<S, Notifier>(cx)
+        set::system_def::<S>(cx)
     }
 
     /// Runs the system, sending its log lines to its own `log` output.
@@ -126,10 +125,7 @@ impl<S: SystemFn> System for FnSystem<S> {
     type Outputs = OutSet<S>;
 
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        Ok(SystemDef {
-            grants: Defs::of::<S>(cx)?.grants,
-            ..set::system_def::<S, NoWake>(cx)?
-        })
+        set::system_def::<S>(cx)
     }
 
     /// Runs one cycle, sending its log lines to the system's own `log` output.

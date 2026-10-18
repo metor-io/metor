@@ -9,8 +9,10 @@ use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
+use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
-use crate::io::GrantDef;
+use crate::fn_system::Instance;
+use crate::io::{GrantDef, Io, IoPorts};
 use crate::record::RecordSchema;
 
 /// Describes one port: its name and the record it carries.
@@ -69,6 +71,9 @@ pub struct SystemDef {
     /// The `Cap` parameters, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub grants: Vec<GrantDef>,
+    /// Where the queue pair's ports are, for a system with a `Cap`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io: Option<IoPorts>,
 }
 
 impl SystemDef {
@@ -86,6 +91,7 @@ impl SystemDef {
             outputs: O::defs(cx)?,
             log: None,
             grants: Vec::new(),
+            io: None,
         })
     }
 }
@@ -138,21 +144,38 @@ pub trait System {
 pub trait Ports<B> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError>;
 
-    /// Binds the ports.
+    /// Binds the ports under `cx`.
     ///
     /// `bindings` has one entry per [`defs`](Ports::defs) entry, in the same
-    /// order.
+    /// order, less the queue pair's ports, which `cx` holds as its `Io`.
+    ///
+    /// # Errors
+    /// Fails if a parameter cannot bind under `cx`, such as an `Rng` with no
+    /// seed.
     ///
     /// # Panics
     /// May panic if `bindings` does not match `defs`.
-    fn bind(bindings: Vec<B>) -> Self;
+    fn bind(bindings: Vec<B>, cx: &BindCx) -> Result<Self, ParamError>
+    where
+        Self: Sized;
 }
 
 impl<B> Ports<B> for () {
     fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
         Ok(Vec::new())
     }
-    fn bind(_bindings: Vec<B>) -> Self {}
+
+    fn bind(_bindings: Vec<B>, _cx: &BindCx) -> Result<Self, ParamError> {
+        Ok(())
+    }
+}
+
+/// What a system's ports bind under: the instance they belong to, and its
+/// queue if it has a `Cap`.
+#[derive(Clone, Default)]
+pub struct BindCx {
+    pub(crate) instance: Instance,
+    pub(crate) io: Option<Io>,
 }
 
 #[cfg(test)]
@@ -237,7 +260,7 @@ mod tests {
             def: Input::<Imu>::def(&DefCx::empty(), name),
             views: vec![ring.view(NoWake).expect("free slot")],
         };
-        let mut bound = DynInputs::bind(vec![binding("plant.imu", &imu), binding("nav.nav", &nav)]);
+        let mut bound = DynInputs::new(vec![binding("plant.imu", &imu), binding("nav.nav", &nav)]);
         let names: Vec<_> = bound
             .iter_mut()
             .map(|(def, _)| def.name.to_string())

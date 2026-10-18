@@ -13,11 +13,11 @@ use crate::{
     coordinator::MakeError,
     def::{DefCx, DefError, Records},
     frame::Frame,
-    io::{Cqe, GrantDef, IO_CQ, IO_SQ, Io, Sqe},
+    io::{Cqe, GrantDef, IO_CQ, IO_SQ, Io, IoPorts, Sqe},
     log::Log,
     port::{DynInputs, DynOutputs, Input, InputWake, Output, Sample, SampledInput},
     record::Record,
-    system::{InputBinding, OutputBinding, PortDef, Ports},
+    system::{InputBinding, OutputBinding, PortDef},
 };
 
 /// Hands out port bindings to parameters, in parameter order.
@@ -146,6 +146,8 @@ pub struct Defs {
     pub(crate) sampled: bool,
     /// The `Cap` parameters, in order.
     pub(crate) grants: Vec<GrantDef>,
+    /// Where `append_io` put the queue pair's ports.
+    pub(crate) io: Option<IoPorts>,
     /// Whether any parameter is an `Rng`.
     pub(crate) rng: bool,
 }
@@ -179,22 +181,27 @@ impl Defs {
     }
 
     /// Appends `io_cq` and `io_sq`, for a `Cap`, after the parameters' own
-    /// ports.
+    /// ports, and records where they are.
     fn append_io(&mut self, cx: &DefCx<'_>) {
-        if self.has_io() {
-            self.inputs.push(Input::<Cqe>::def(cx, IO_CQ));
-            self.outputs.push(Output::<Sqe>::def(cx, IO_SQ));
+        if self.grants.is_empty() {
+            return;
         }
+        self.io = Some(IoPorts {
+            cq: self.inputs.len(),
+            sq: self.outputs.len(),
+        });
+        self.inputs.push(Input::<Cqe>::def(cx, IO_CQ));
+        self.outputs.push(Output::<Sqe>::def(cx, IO_SQ));
     }
 
-    /// Whether any parameter is a `Cap`, which gives the system a queue pair.
-    pub(crate) fn has_io(&self) -> bool {
-        !self.grants.is_empty()
+    /// The inputs the parameters bind, which are all but `io_cq`.
+    pub(crate) fn param_inputs(&self) -> usize {
+        self.inputs.len() - usize::from(self.io.is_some())
     }
 
-    /// The IO ports at the end of each port list.
-    pub(crate) fn io_ports(&self) -> usize {
-        usize::from(self.has_io())
+    /// The outputs the parameters bind, which are all but `io_sq`.
+    pub(crate) fn param_outputs(&self) -> usize {
+        self.outputs.len() - usize::from(self.io.is_some())
     }
 }
 
@@ -472,7 +479,7 @@ impl<D: InputWake> Param for DynInputs<D> {
     }
 
     fn bind_in<W: InputWake>(views: &mut Views<W>) -> Self::In<W> {
-        Ports::bind(views.bindings.take())
+        DynInputs::new(views.bindings.take())
     }
 
     fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {

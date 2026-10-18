@@ -10,9 +10,10 @@ use core::ops::Deref;
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::record::{Bytes, DecodeError, EncodeError, Payload, Record};
-use crate::system::{InputBinding, OutputBinding, PortDef, Ports};
+use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports};
 use metor_fsw_3_ring::{
     NoWake, Notifier, PAYLOAD_ALIGNMENT, ReadError, View, WakeSource, WriteError, Writer, frame_len,
 };
@@ -293,6 +294,15 @@ pub struct DynInputs<W: InputWake = NoWake> {
 }
 
 impl<W: InputWake> DynInputs<W> {
+    /// Creates one input per binding, each with its port's definition.
+    pub fn new(inputs: Vec<InputBinding<W>>) -> Self {
+        let ports = inputs
+            .into_iter()
+            .map(|b| (b.def, Input::new(b.views)))
+            .collect();
+        Self { ports }
+    }
+
     /// Returns each port's definition alongside its input.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Input<Bytes, W>)> {
         self.ports.iter_mut().map(|(def, input)| (&*def, input))
@@ -313,12 +323,8 @@ impl<W: InputWake> Ports<InputBinding<W>> for DynInputs<W> {
         cx.dyn_input_defs(&[])
     }
 
-    fn bind(inputs: Vec<InputBinding<W>>) -> Self {
-        let ports = inputs
-            .into_iter()
-            .map(|b| (b.def, Input::new(b.views)))
-            .collect();
-        Self { ports }
+    fn bind(inputs: Vec<InputBinding<W>>, _cx: &BindCx) -> Result<Self, ParamError> {
+        Ok(Self::new(inputs))
     }
 }
 
@@ -351,8 +357,8 @@ impl<W: WakeSource> Ports<OutputBinding<W>> for DynOutputs<W> {
         cx.dyn_output_defs(&[])
     }
 
-    fn bind(outputs: Vec<OutputBinding<W>>) -> Self {
-        Self::new(outputs, &Arc::default())
+    fn bind(outputs: Vec<OutputBinding<W>>, _cx: &BindCx) -> Result<Self, ParamError> {
+        Ok(Self::new(outputs, &Arc::default()))
     }
 }
 
@@ -1012,7 +1018,7 @@ mod async_tests {
         let wake = Notifier::default();
         let (_left, mut a, _) = woken(&wake);
         let (right, _, _) = woken(&wake);
-        let mut inputs = DynInputs::<Notifier>::bind(vec![
+        let mut inputs = DynInputs::<Notifier>::new(vec![
             InputBinding {
                 def: Input::<Imu>::def(&DefCx::empty(), "a.imu"),
                 views: Vec::new(),
@@ -1039,9 +1045,9 @@ mod async_tests {
 
     #[stellarator::test]
     async fn test_any_ready_without_producers() {
-        let mut empty = DynInputs::<Notifier>::bind(Vec::new());
+        let mut empty = DynInputs::<Notifier>::new(Vec::new());
         assert!(poll_once(empty.any_ready()).await.is_none());
-        let mut unbound = DynInputs::<Notifier>::bind(vec![InputBinding {
+        let mut unbound = DynInputs::<Notifier>::new(vec![InputBinding {
             def: Input::<Imu>::def(&DefCx::empty(), "unbound"),
             views: Vec::new(),
         }]);

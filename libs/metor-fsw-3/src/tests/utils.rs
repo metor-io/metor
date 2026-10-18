@@ -36,7 +36,7 @@ impl Uplink {
 }
 
 #[crate::system]
-fn uplink(#[state] s: &mut Uplink, udp: &crate::io::Cap<crate::io::Udp>) {
+pub(crate) fn uplink(#[state] s: &mut Uplink, udp: &crate::io::Cap<crate::io::Udp>) {
     let _ = s.0.poll();
     if let Some(buf) = s.0.take_idle() {
         s.0 = crate::io::Slot::Busy(udp.send(buf));

@@ -52,6 +52,15 @@ pub const MAX_OPS: usize = 16;
 #[cfg(kani)]
 pub const MAX_OPS: usize = 4;
 
+/// Where a system's `io_cq` input and `io_sq` output sit in its definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoPorts {
+    /// The index of `io_cq` in the inputs.
+    pub cq: usize,
+    /// The index of `io_sq` in the outputs.
+    pub sq: usize,
+}
+
 /// A `Cap<K>` parameter in a system's definition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantDef {
