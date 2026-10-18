@@ -127,28 +127,17 @@ fn names(ports: &[PortDef]) -> Vec<Cow<'static, str>> {
 }
 
 /// The per-cycle values a system fn's parameters can read besides ports.
-///
-/// These are the cycle time and the log.
 pub struct Cycle<'a> {
     pub now: Timestamp,
-    log: Option<&'a mut Log>,
+    _cycle: core::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> Cycle<'a> {
-    pub(crate) fn new(now: Timestamp, log: &'a mut Log) -> Self {
+impl Cycle<'_> {
+    pub(crate) fn new(now: Timestamp) -> Self {
         Self {
             now,
-            log: Some(log),
+            _cycle: core::marker::PhantomData,
         }
-    }
-
-    /// Hands out the log to the one `&mut Log` parameter.
-    pub fn take_log(&mut self) -> &'a mut Log {
-        // PANIC Safety: only a system with two `&mut Log` parameters reaches
-        // this, on its first cycle. The message tells the author the fix.
-        self.log
-            .take()
-            .expect("a system takes `&mut Log` at most once")
     }
 }
 
@@ -469,7 +458,7 @@ impl Param for Timestamp {
 
 impl Param for Log {
     type In<W: WakeSink + Clone + 'static> = ();
-    type Out = ();
+    type Out = Log;
     type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Log;
 
     fn append_defs(
@@ -483,14 +472,16 @@ impl Param for Log {
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
-    fn bind_out(_writers: &mut Writers) {}
+    fn bind_out(_writers: &mut Writers) -> Log {
+        Log
+    }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
         _input: &'a mut (),
-        _output: &'a mut (),
-        cx: &mut Cycle<'a>,
+        output: &'a mut Log,
+        _cx: &mut Cycle<'a>,
     ) -> &'a mut Log {
-        cx.take_log()
+        output
     }
 }
 

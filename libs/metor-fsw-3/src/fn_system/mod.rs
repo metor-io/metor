@@ -107,8 +107,7 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
         outputs: &mut OutSet<S>,
         stop: Stop,
     ) {
-        let mut log = log::Log;
-        let mut cx = Cycle::new(Timestamp::now(), &mut log);
+        let mut cx = Cycle::new(Timestamp::now());
         let items = S::Params::get::<Notifier>(&mut inputs.ins, &mut outputs.outs, &mut cx);
         let call = core::pin::pin!(S::call(state, items, stop));
         log::with_logs(&mut outputs.log, call).await;
@@ -137,8 +136,7 @@ impl<S: SystemFn> System for FnSystem<S> {
     ) {
         log::with_log_port(&mut outputs.log, now, || {
             inputs.samplers.take_all();
-            let mut log = log::Log;
-            let mut cx = Cycle::new(now, &mut log);
+            let mut cx = Cycle::new(now);
             S::call(
                 state,
                 S::Params::get(&mut inputs.ins, &mut outputs.outs, &mut cx),

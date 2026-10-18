@@ -1,5 +1,5 @@
 //! The [`Step`] trait the coordinator uses to run each system, the reasons a
-//! step can end, and [`catch_step`], which stops a panicking step from taking
+//! step can end, and [`StepState`], which stops a panicking step from taking
 //! down the coordinator.
 
 use std::borrow::Cow;
@@ -80,16 +80,6 @@ pub enum LoadError {
     Create(ParamError),
 }
 
-/// The outcome of one [`catch_step`] call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Stepped {
-    Ran,
-    /// The step has ended, either before this call or during it.
-    Ended,
-    /// The step panicked and was dropped, during this call or an earlier one.
-    Unwound,
-}
-
 pub(crate) struct Runner<S: System> {
     pub system: S,
     pub state: S::State,
@@ -108,29 +98,51 @@ impl<S: System> Step for Runner<S> {
     }
 }
 
-/// Executes the step in `slot` unless it has ended.
-///
-/// If `execute` panics, the step's `fault` hook runs and the step is dropped,
-/// leaving `slot` empty.
-pub(crate) fn catch_step(slot: &mut Option<Box<dyn Step>>, now: Timestamp) -> Stepped {
-    let Some(step) = slot.as_mut() else {
-        return Stepped::Unwound;
-    };
-    // PANIC Safety: a panicking step is faulted once and removed before returning.
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if step.ended().is_none() {
-            step.execute(now);
-        }
-        step.ended().is_some()
-    }));
-    match result {
-        Ok(false) => Stepped::Ran,
-        Ok(true) => Stepped::Ended,
-        Err(payload) => {
-            let message = crate::panic::into_message(payload);
-            crate::panic::catch(|| step.fault(now, &message));
-            crate::panic::catch(|| drop(slot.take()));
-            Stepped::Unwound
+/// A step, or the gap a panicking step leaves.
+pub(crate) enum StepState {
+    Live(Box<dyn Step>),
+    Panicked,
+}
+
+impl StepState {
+    /// Returns why the step ended, or `None` while it runs.
+    pub(crate) fn end_reason(&self) -> Option<&EndReason> {
+        match self {
+            Self::Live(step) => step.ended(),
+            Self::Panicked => Some(&EndReason::Panicked),
         }
     }
+
+    /// Executes the step unless it has ended.
+    ///
+    /// If `execute` panics, the step's `fault` hook runs, the step is dropped,
+    /// and this returns true.
+    pub(crate) fn run(&mut self, now: Timestamp) -> bool {
+        let Self::Live(step) = self else {
+            return false;
+        };
+        if !catch_execute(step.as_mut(), now) {
+            return false;
+        }
+        let step = core::mem::replace(self, Self::Panicked);
+        crate::panic::catch(|| drop(step));
+        true
+    }
+}
+
+/// Executes `step` unless it has ended.
+///
+/// If `execute` panics, the step's `fault` hook runs and this returns true.
+/// The caller then drops the step.
+pub(crate) fn catch_execute(step: &mut dyn Step, now: Timestamp) -> bool {
+    if step.ended().is_some() {
+        return false;
+    }
+    // PANIC Safety: the panic is caught, and the caller drops the step.
+    let Err(payload) = catch_unwind(AssertUnwindSafe(|| step.execute(now))) else {
+        return false;
+    };
+    let message = crate::panic::into_message(payload);
+    crate::panic::catch(|| step.fault(now, &message));
+    true
 }

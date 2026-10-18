@@ -12,12 +12,12 @@ use crate::port::Output;
 
 use super::config::Clock;
 use super::status::SystemStatus;
-use super::step::{EndReason, Step, Stepped, catch_step};
+use super::step::{EndReason, StepState};
 
 /// A system in the coordinator's schedule.
 pub(super) struct Entry {
     pub(super) name: String,
-    pub(super) step: Option<Box<dyn Step>>,
+    pub(super) step: StepState,
     pub(super) status: Output<SystemStatus>,
 }
 
@@ -109,13 +109,8 @@ impl Coordinator {
 
 impl Entry {
     /// Returns why this entry's step ended.
-    ///
-    /// A step that was dropped after a panic reports [`EndReason::Panicked`].
     pub(super) fn end_reason(&self) -> Option<&EndReason> {
-        match &self.step {
-            Some(step) => step.ended(),
-            None => Some(&EndReason::Panicked),
-        }
+        self.step.end_reason()
     }
 
     fn run(&mut self, now: Timestamp) -> Duration {
@@ -123,9 +118,9 @@ impl Entry {
             return Duration::ZERO;
         }
         let started = Instant::now();
-        let stepped = catch_step(&mut self.step, now);
+        let unwound = self.step.run(now);
         let elapsed = started.elapsed();
-        if stepped != Stepped::Ran && self.end_reason() == Some(&EndReason::Panicked) {
+        if unwound {
             crate::panic::catch(|| tracing::error!(system = self.name, "system panicked"));
         }
         elapsed
@@ -150,7 +145,7 @@ mod tests {
     use super::*;
     use crate::coordinator::config::{InputConfig, PortRef, SystemConfig};
     use crate::coordinator::tests::Twice;
-    use crate::coordinator::{CoordinatorConfig, WallRate};
+    use crate::coordinator::{CoordinatorConfig, Step, WallRate};
     use crate::tests::utils::{self, Recorder, ended_with, pipeline_config, table};
 
     fn watched(config: &mut CoordinatorConfig, from: &[&str]) {
@@ -389,34 +384,37 @@ mod tests {
             }
         }
         assert_eq!(crate::panic::message(&7u8), "panic");
-        let mut step: Option<Box<dyn Step>> = Some(Box::new(Odd));
-        assert_eq!(catch_step(&mut step, Timestamp(0)), Stepped::Unwound);
-        assert!(step.is_none());
-        assert_eq!(catch_step(&mut step, Timestamp(1)), Stepped::Unwound);
+        let mut step = StepState::Live(Box::new(Odd));
+        assert!(step.run(Timestamp(0)));
+        assert_eq!(step.end_reason(), Some(&EndReason::Panicked));
+        assert!(
+            !step.run(Timestamp(1)),
+            "a dropped step does not unwind again"
+        );
     }
 
     #[test]
-    fn test_catch_step_success() {
+    fn test_step_state_runs_a_live_step() {
         struct Clean(u64);
         impl Step for Clean {
             fn execute(&mut self, _now: Timestamp) {
                 self.0 += 1;
             }
         }
-        let mut step: Option<Box<dyn Step>> = Some(Box::new(Clean(0)));
-        assert_eq!(catch_step(&mut step, Timestamp(0)), Stepped::Ran);
-        assert!(step.is_some());
+        let mut step = StepState::Live(Box::new(Clean(0)));
+        assert!(!step.run(Timestamp(0)));
+        assert_eq!(step.end_reason(), None);
     }
 
     #[test]
-    fn test_catch_step_keeps_ended_step() {
+    fn test_step_state_keeps_an_ended_step() {
         let runs = std::rc::Rc::default();
-        let mut step: Option<Box<dyn Step>> = Some(Box::new(Twice(Clone::clone(&runs), None)));
-        assert_eq!(catch_step(&mut step, Timestamp(0)), Stepped::Ran);
-        assert_eq!(catch_step(&mut step, Timestamp(1)), Stepped::Ended);
-        assert_eq!(catch_step(&mut step, Timestamp(2)), Stepped::Ended);
+        let mut step = StepState::Live(Box::new(Twice(Clone::clone(&runs), None)));
+        for now in 0..3 {
+            assert!(!step.run(Timestamp(now)));
+        }
         assert_eq!(runs.get(), 2);
-        assert!(step.is_some());
+        assert!(matches!(step, StepState::Live(_)));
     }
 
     #[test]

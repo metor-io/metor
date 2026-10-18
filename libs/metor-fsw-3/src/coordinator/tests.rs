@@ -5,6 +5,7 @@ use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
 use super::run::{Coordinator, Entry};
+use super::step::StepState;
 use super::{Clock, EndReason, Step, SystemStatus};
 use crate::port::{Input, Output};
 use crate::tests::utils::{Imu, ended_with, input, output, ring};
@@ -95,7 +96,7 @@ impl Step for HealthyConsumer {
 fn entry(name: &str, step: impl Step + 'static, status: &RingBuffer) -> Entry {
     Entry {
         name: name.into(),
-        step: Some(Box::new(step)),
+        step: StepState::Live(Box::new(step)),
         status: output(status),
     }
 }

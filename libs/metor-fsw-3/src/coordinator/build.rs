@@ -23,6 +23,7 @@ use super::error::BuildError;
 use super::params::Params;
 use super::run::{Coordinator, Entry};
 use super::status::{STATUS_PORT, SystemStatus};
+use super::step::StepState;
 use super::table::{MakeCx, SystemTable, TableEntry};
 
 struct RingSpec {
@@ -465,7 +466,7 @@ fn make_systems(
         })?;
         entries.push(Entry {
             name: system.id.to_string(),
-            step: Some(step),
+            step: StepState::Live(step),
             status: Output::new(status),
         });
     }

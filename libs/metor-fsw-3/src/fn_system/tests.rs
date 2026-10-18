@@ -368,6 +368,27 @@ fn test_system_log_order() {
     assert_eq!(seen[1].target, module_path!());
 }
 
+/// Logs once through each of two `&mut Log` parameters.
+#[crate::system]
+fn two_logs(first: &mut Log, second: &mut Log) {
+    first.info("first");
+    second.info("second");
+}
+
+#[test]
+fn test_two_log_params() {
+    let (mut config, mut table, seen) = log_config(0);
+    table
+        .register("two_logs", two_logs(), Default::default)
+        .expect("valid records");
+    config.systems[0] = SystemConfig::new("talker", "two_logs");
+    let mut coordinator = config.build(&table).expect("valid");
+    coordinator.step(Timestamp(1));
+    coordinator.step(Timestamp(2));
+    let messages: Vec<_> = seen.borrow().iter().map(|l| l.message.clone()).collect();
+    assert_eq!(messages, ["first", "second", "first", "second"]);
+}
+
 #[test]
 fn test_log_between_systems() {
     let (config, table, seen) = log_config(0);
