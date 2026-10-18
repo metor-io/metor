@@ -94,7 +94,7 @@ impl CoordinatorConfig {
             false => Threads::default(),
         };
         let args = SharedMakeArgs {
-            seed: Some(self.seed),
+            seed: self.seed,
             namespace: self.namespace.as_deref(),
             records: &records,
         };
@@ -463,7 +463,7 @@ impl RingSpec {
 /// The make arguments every system in the target shares.
 #[derive(Clone, Copy)]
 struct SharedMakeArgs<'a> {
-    seed: Option<u64>,
+    seed: u64,
     namespace: Option<&'a str>,
     records: &'a Arc<Records>,
 }

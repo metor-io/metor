@@ -282,7 +282,7 @@ fn test_corrupt_mirror_ends_the_system() {
         inputs: vec![vec![&imu]],
         outputs: vec![&nav, &log],
         threads: &mut threads,
-        seed: Some(0),
+        seed: 0,
         namespace: None,
         records: &Default::default(),
     })

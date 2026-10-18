@@ -60,7 +60,7 @@ impl<S: FnSignature> OutSet<S> {
     /// log.
     ///
     /// # Errors
-    /// Fails if an `Rng` parameter's instance has no seed.
+    /// Fails if a parameter's output does not bind.
     pub(crate) fn from_writers(mut writers: Writers) -> Result<Self, ParamError> {
         let outs = S::Params::bind_out(&mut S::NAMES.iter(), &mut writers)?;
         // PANIC Safety: `defs` always appends the log as the last output.
@@ -103,14 +103,13 @@ impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
         Ok(OutSet::<S>::defs_with_log(cx)?.0)
     }
 
-    /// Binds the outputs under an unnamed instance with no seed and an empty
+    /// Binds the outputs under an unnamed instance with seed 0 and an empty
     /// record table. A table make binds through `fn_system::bind` instead.
     fn bind(outputs: Vec<OutputBinding>) -> Self {
         let defs = Defs::declared::<S>();
         let writers = Writers::new(outputs, defs.outputs.len() + 1, Instance::default());
-        // PANIC Safety: only an `Rng` parameter fails, and a table make binds
-        // an `Rng` through `bind`.
-        Self::from_writers(writers).expect("no Rng parameter")
+        // PANIC Safety: no parameter fails to bind its output.
+        Self::from_writers(writers).expect("outputs bind")
     }
 }
 

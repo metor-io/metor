@@ -618,7 +618,7 @@ fn test_async_adapter_relay() {
         inputs: vec![vec![&imu]],
         outputs: vec![&nav, &log],
         threads: &mut threads,
-        seed: Some(0),
+        seed: 0,
         namespace: None,
         records: &Default::default(),
     })
@@ -798,7 +798,7 @@ fn flooded(a: usize, b: usize, cycles: i64) -> Vec<LogEvent> {
         inputs: Vec::new(),
         outputs: vec![&ring_a, &ring_b, &log],
         threads: &mut threads,
-        seed: Some(0),
+        seed: 0,
         namespace: None,
         records: &Default::default(),
     })
@@ -990,33 +990,6 @@ fn test_rng_params_draw_their_own_streams() {
 }
 
 #[test]
-fn test_rng_without_a_seed_fails_the_make() {
-    let seen = Draws::default();
-    let table = drawer_table(&seen);
-    let entry = table.get("drawer").expect("registered");
-    let def = entry.def.clone();
-    let log = ring::<LogEvent>(4, 1);
-    let mut threads = crate::thread::Threads::default();
-    let made = (entry.make)(crate::coordinator::MakeCx {
-        id: "d",
-        adapter: None,
-        def: &def,
-        params: crate::coordinator::Params(&json!({ "tag": "d" })),
-        inputs: Vec::new(),
-        outputs: vec![&log],
-        threads: &mut threads,
-        seed: None,
-        namespace: None,
-        records: &Default::default(),
-    });
-    let err = made.err();
-    assert!(
-        matches!(&err, Some(crate::coordinator::ParamError::GuestRng { system }) if system == "d"),
-        "{err:?}"
-    );
-}
-
-#[test]
 fn test_rng_on_an_async_system_is_refused() {
     let mut table = SystemTable::new();
     let err = table.register_async("d", async_drawer(), || ()).err();
@@ -1121,7 +1094,7 @@ fn test_async_records_param_reads_the_host_table() {
         inputs: Vec::new(),
         outputs: vec![&nav, &log],
         threads: &mut threads,
-        seed: Some(0),
+        seed: 0,
         namespace: None,
         records: &records,
     })

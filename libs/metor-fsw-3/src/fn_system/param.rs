@@ -97,8 +97,8 @@ impl Writers {
 pub(crate) struct Instance {
     pub(crate) id: String,
     pub(crate) namespace: Option<String>,
-    /// The target seed. A guest's make has none.
-    pub(crate) seed: Option<u64>,
+    /// The target seed.
+    pub(crate) seed: u64,
     /// Every record the system table knows about.
     pub(crate) records: Arc<Records>,
 }
@@ -115,12 +115,9 @@ impl Instance {
 
     /// The stream the `Rng` parameter `param` draws, named
     /// `{namespace}.{id}.{param}`.
-    fn rng(&self, param: &str) -> Result<Rng, ParamError> {
-        let seed = self.seed.ok_or_else(|| ParamError::GuestRng {
-            system: self.id.clone(),
-        })?;
+    fn rng(&self, param: &str) -> Rng {
         let name = DefCx::path(self.namespace.as_deref(), &self.id, param);
-        Ok(Rng::seeded(seed, &name))
+        Rng::seeded(self.seed, &name)
     }
 }
 
@@ -346,7 +343,7 @@ impl Param for Rng {
     fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
     fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Rng, ParamError> {
-        writers.instance.rng(param_name(names))
+        Ok(writers.instance.rng(param_name(names)))
     }
 
     fn get<'a, W: InputWake>(

@@ -33,8 +33,8 @@ pub struct MakeCx<'a> {
     pub inputs: Vec<Vec<&'a RingBuffer>>,
     pub outputs: Vec<&'a RingBuffer>,
     pub threads: &'a mut Threads,
-    /// The target seed. A guest's make has none.
-    pub seed: Option<u64>,
+    /// The target seed every `Rng` parameter draws from.
+    pub seed: u64,
     /// The target's namespace.
     pub namespace: Option<&'a str>,
     /// Every record the system table knows about.
@@ -750,7 +750,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             threads: &mut threads,
-            seed: Some(0),
+            seed: 0,
             namespace: None,
             records: &Default::default(),
         })
