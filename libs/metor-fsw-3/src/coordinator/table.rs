@@ -156,6 +156,10 @@ pub(crate) struct TableEntry {
     pub adapters: Adapters,
     /// The ports the type always has, whatever the config says.
     pub def: SystemDef,
+    /// Whether the type adds the inputs a config lists.
+    pub takes_inputs: bool,
+    /// Whether the type adds the outputs a config lists.
+    pub takes_outputs: bool,
     pub def_fn: Box<DefFn>,
     /// The doc comment on the type's `execute`.
     ///
@@ -425,6 +429,8 @@ impl TableEntry {
             #[cfg(feature = "host")]
             adapters: SystemKind::Cyclic.adapters(),
             def: S::def(&DefCx::empty())?,
+            takes_inputs: S::Inputs::takes_config_ports(),
+            takes_outputs: S::Outputs::takes_config_ports(),
             def_fn: Box::new(S::def),
             doc,
             schema,
@@ -453,6 +459,8 @@ impl TableEntry {
             #[cfg(feature = "host")]
             adapters: SystemKind::Cyclic.adapters(),
             def: FnSystem::<S>::def(&DefCx::empty())?,
+            takes_inputs: InSet::<S>::takes_config_ports(),
+            takes_outputs: OutSet::<S>::takes_config_ports(),
             def_fn: Box::new(FnSystem::<S>::def),
             doc: Cow::Borrowed(S::DOC),
             schema: C::schema(),
@@ -480,6 +488,8 @@ impl TableEntry {
             #[cfg(feature = "host")]
             adapters: SystemKind::Sequence.adapters(),
             def: sequence::def::<S>(&DefCx::empty())?,
+            takes_inputs: SeqInputs::<S>::takes_config_ports(),
+            takes_outputs: OutSet::<S>::takes_config_ports(),
             def_fn: Box::new(sequence::def::<S>),
             doc: Cow::Borrowed(S::DOC),
             schema: C::schema(),
@@ -511,6 +521,8 @@ impl TableEntry {
             #[cfg(feature = "host")]
             adapters: SystemKind::Async.adapters(),
             def: A::def(&DefCx::empty())?,
+            takes_inputs: A::Inputs::takes_config_ports(),
+            takes_outputs: A::Outputs::takes_config_ports(),
             def_fn: Box::new(A::def),
             doc,
             schema,

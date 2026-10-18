@@ -96,6 +96,10 @@ impl<S: FnSignature, W: InputWake> Ports<InputBinding<W>> for InSet<S, W> {
         let defs = Defs::declared::<S>();
         Ok(Self::from_views(Views::new(inputs, defs.param_inputs())))
     }
+
+    fn takes_config_ports() -> bool {
+        Defs::declared::<S>().takes_inputs
+    }
 }
 
 impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
@@ -113,6 +117,10 @@ impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
             cx.instance.clone(),
             cx.io.clone(),
         ))
+    }
+
+    fn takes_config_ports() -> bool {
+        Defs::declared::<S>().takes_outputs
     }
 }
 

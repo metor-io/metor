@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::coordinator::{Adapter, OutputConfig, SystemKind, SystemTable, TableEntry};
+use crate::coordinator::{Adapter, OutputConfig, SystemKind, SystemTable};
 use crate::def::{DefCx, Records};
 use crate::system::{PortDef, SystemDef};
 
@@ -55,49 +55,18 @@ impl PackDef {
     pub fn from_table(table: &SystemTable) -> Self {
         let systems = table
             .entries()
-            .map(|(ty, entry)| {
-                let (takes_inputs, takes_outputs) = probe(entry);
-                PackSystemDef {
-                    ty: ty.to_string(),
-                    kind: entry.kind,
-                    def: entry.def.clone(),
-                    takes_inputs,
-                    takes_outputs,
-                    doc: entry.doc.clone(),
-                    params: entry.schema.clone(),
-                }
+            .map(|(ty, entry)| PackSystemDef {
+                ty: ty.to_string(),
+                kind: entry.kind,
+                def: entry.def.clone(),
+                takes_inputs: entry.takes_inputs,
+                takes_outputs: entry.takes_outputs,
+                doc: entry.doc.clone(),
+                params: entry.schema.clone(),
             })
             .collect();
         Self { systems }
     }
-}
-
-/// The port name [`probe`] offers a type. No real config uses this name.
-const PROBE: &str = "__probe";
-
-/// Returns whether a type accepts config-listed input and output ports.
-///
-/// It offers the type one extra port of each kind and checks which ones the
-/// type's definition keeps.
-fn probe(entry: &TableEntry) -> (bool, bool) {
-    let record = crate::Output::<crate::SystemStatus>::def(&DefCx::empty(), PROBE);
-    let records = Records::from_port_defs(core::iter::once(&record));
-    let inputs = [(PROBE, &record)];
-    let outputs = [OutputConfig::with_record(PROBE, record.record.as_ref())];
-    let cx = DefCx {
-        inputs: &inputs,
-        outputs: &outputs,
-        records: &records,
-        ..DefCx::empty()
-    };
-    match (entry.def_fn)(&cx) {
-        Ok(def) => (took(&def.inputs), took(&def.outputs)),
-        Err(_) => (false, false),
-    }
-}
-
-fn took(ports: &[PortDef]) -> bool {
-    ports.iter().any(|port| port.name == PROBE)
 }
 
 /// An owned copy of a [`DefCx`], used to send it across the ABI.

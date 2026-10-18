@@ -210,6 +210,8 @@ fn slot_entry(shared: &Shared) -> TableEntry {
         kind: SystemKind::Cyclic,
         adapters: SystemKind::Cyclic.adapters(),
         def: def.clone(),
+        takes_inputs: false,
+        takes_outputs: false,
         def_fn: Box::new(move |_| Ok(def.clone())),
         doc: "".into(),
         schema: None,

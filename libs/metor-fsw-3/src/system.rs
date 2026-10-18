@@ -158,6 +158,11 @@ pub trait Ports<B> {
     fn bind(bindings: Vec<B>, cx: &BindCx) -> Result<Self, MakeError>
     where
         Self: Sized;
+
+    /// Whether `defs` adds the ports a config lists.
+    fn takes_config_ports() -> bool {
+        false
+    }
 }
 
 impl<B> Ports<B> for () {

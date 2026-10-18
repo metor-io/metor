@@ -145,6 +145,8 @@ impl TableEntry {
             kind: system.kind,
             adapters: system.kind.adapters(),
             def: system.def.clone(),
+            takes_inputs: system.takes_inputs,
+            takes_outputs: system.takes_outputs,
             def_fn: Box::new(move |cx| def_pack.def(&def_ty, cx)),
             doc: system.doc.clone(),
             schema: system.params.clone(),
