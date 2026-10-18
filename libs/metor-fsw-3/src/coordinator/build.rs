@@ -18,7 +18,9 @@ use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
 
-use super::config::{Adapter, BuildOptions, Clock, CoordinatorConfig, PortRef, SystemConfig};
+use super::config::{
+    Adapter, BuildOptions, Clock, CoordinatorConfig, Location, PortRef, SystemConfig,
+};
 use super::error::BuildError;
 use super::params::Params;
 use super::run::{Coordinator, Entry};
@@ -42,6 +44,7 @@ struct PlannedSystem<'a> {
     params: Params<'a>,
     /// The adapter this system runs behind, if the config gives one.
     adapter: Option<&'a Adapter>,
+    location: Option<&'a Location>,
     /// The ring of each output port, in definition order.
     outputs: Vec<RingIndex>,
     inputs: Vec<Vec<RingIndex>>,
@@ -121,18 +124,32 @@ impl<'a> Plan<'a> {
         };
         let namespace = config.namespace.as_deref();
         for system in &config.systems {
-            let entry = table
-                .get(&system.ty)
-                .ok_or_else(|| BuildError::UnknownType {
-                    id: system.id.clone(),
-                    ty: system.ty.clone(),
-                })?;
-            entry.check_adapter(system)?;
-            let def = SystemDef::planned(system, entry, &plan, records, namespace)?;
+            let (entry, def) = plan
+                .define(system, table, records, namespace)
+                .map_err(|e| e.at(system.location.as_ref()))?;
             plan.push(system, entry, def);
         }
         plan.resolve_edges(config)?;
         Ok(plan)
+    }
+
+    /// Looks up `system`'s type and computes its definition.
+    fn define(
+        &self,
+        system: &SystemConfig,
+        table: &'a SystemTable,
+        records: &Records,
+        namespace: Option<&str>,
+    ) -> Result<(&'a TableEntry, SystemDef), BuildError> {
+        let entry = table
+            .get(&system.ty)
+            .ok_or_else(|| BuildError::UnknownType {
+                id: system.id.clone(),
+                ty: system.ty.clone(),
+            })?;
+        entry.check_adapter(system)?;
+        let def = SystemDef::planned(system, entry, self, records, namespace)?;
+        Ok((entry, def))
     }
 
     /// Adds `system`, with one ring per output.
@@ -149,6 +166,7 @@ impl<'a> Plan<'a> {
             def,
             params: Params(&system.params),
             adapter: system.adapter.as_ref(),
+            location: system.location.as_ref(),
             outputs,
         });
     }
@@ -190,23 +208,35 @@ impl<'a> Plan<'a> {
 
     /// Records the ring behind every input edge in `config`.
     fn resolve_edges(&mut self, config: &CoordinatorConfig) -> Result<(), BuildError> {
-        for (i, system) in config.systems.iter().enumerate() {
-            for input in &system.inputs {
-                let Some(port) = self.systems[i]
-                    .def
-                    .inputs
-                    .iter()
-                    .position(|p| p.name == input.port)
-                else {
-                    return Err(BuildError::UnknownInput {
-                        system: system.id.clone(),
-                        port: input.port.clone(),
-                    });
-                };
-                for from in &input.from {
-                    if let Some(ring) = self.producer_ring(&system.id, &input.port, from)? {
-                        self.systems[i].inputs[port].push(ring);
-                    }
+        for (index, system) in config.systems.iter().enumerate() {
+            self.resolve_system_edges(index, system)
+                .map_err(|e| e.at(system.location.as_ref()))?;
+        }
+        Ok(())
+    }
+
+    /// Records the ring behind each input edge of `system`, the system at
+    /// `index`.
+    fn resolve_system_edges(
+        &mut self,
+        index: usize,
+        system: &SystemConfig,
+    ) -> Result<(), BuildError> {
+        for input in &system.inputs {
+            let Some(port) = self.systems[index]
+                .def
+                .inputs
+                .iter()
+                .position(|p| p.name == input.port)
+            else {
+                return Err(BuildError::UnknownInput {
+                    system: system.id.clone(),
+                    port: input.port.clone(),
+                });
+            };
+            for from in &input.from {
+                if let Some(ring) = self.producer_ring(&system.id, &input.port, from)? {
+                    self.systems[index].inputs[port].push(ring);
                 }
             }
         }
@@ -240,7 +270,8 @@ impl<'a> Plan<'a> {
                             from: format!("{}.{}", spec.system, spec.port.name),
                             expected: def.id,
                             found: spec.port.id,
-                        });
+                        }
+                        .at(system.location));
                     }
                 }
             }
@@ -272,9 +303,8 @@ fn index_by_id(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, Build
     let mut index = HashMap::with_capacity(config.systems.len());
     for (position, system) in config.systems.iter().enumerate() {
         if index.insert(system.id.as_str(), position).is_some() {
-            return Err(BuildError::DuplicateId {
-                id: system.id.clone(),
-            });
+            let id = system.id.clone();
+            return Err(BuildError::DuplicateId { id }.at(system.location.as_ref()));
         }
     }
     Ok(index)
@@ -468,9 +498,9 @@ fn make_systems(
             namespace: args.namespace,
             records: args.records,
         };
-        let step = (system.entry.make)(cx).map_err(|source| BuildError::Params {
-            id: system.id.to_string(),
-            source,
+        let step = (system.entry.make)(cx).map_err(|source| {
+            let id = system.id.to_string();
+            BuildError::Params { id, source }.at(system.location)
         })?;
         entries.push(Entry {
             name: system.id.to_string(),
@@ -722,6 +752,49 @@ mod tests {
             build(config).err(),
             Some(BuildError::DuplicateId { id: "imu".into() })
         );
+    }
+
+    /// An error about a system cites where the target file created it.
+    #[test]
+    fn test_errors_cite_the_system_location() {
+        let at = |line| super::Location {
+            file: "target.py".into(),
+            line,
+        };
+        let located = |line, error| BuildError::Located {
+            location: at(line),
+            source: Box::new(error),
+        };
+        let mut unknown_type = SystemConfig::new("imu", "gyro");
+        unknown_type.location = Some(at(3));
+        let config = CoordinatorConfig {
+            systems: vec![unknown_type],
+            ..Default::default()
+        };
+        let error = build(config).err().expect("an unknown type");
+        assert_eq!(
+            error.to_string(),
+            "target.py:3: system `imu` has unregistered type `gyro`"
+        );
+
+        let mut config = pipeline_config();
+        config.systems[1].location = Some(at(7));
+        config.systems[1].inputs[0].from = vec![PortRef::new("gyro", "imu")];
+        let unknown_system = BuildError::UnknownSystem {
+            id: "nav".into(),
+            port: "imu".into(),
+            from: "gyro".into(),
+        };
+        assert_eq!(build(config).err(), Some(located(7, unknown_system)));
+
+        let mut twice = source("imu");
+        twice.location = Some(at(9));
+        let config = CoordinatorConfig {
+            systems: vec![source("imu"), twice],
+            ..Default::default()
+        };
+        let duplicate = BuildError::DuplicateId { id: "imu".into() };
+        assert_eq!(build(config).err(), Some(located(9, duplicate)));
     }
 
     #[test]

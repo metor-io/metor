@@ -21,7 +21,7 @@ mod tests;
 
 pub use config::{
     Adapter, BuildOptions, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig,
-    InvalidWallRate, OutputConfig, OutputSource, PortRef, SystemConfig, WallRate,
+    InvalidWallRate, Location, OutputConfig, OutputSource, PortRef, SystemConfig, WallRate,
 };
 pub use error::BuildError;
 pub use params::{ParamError, Params};

@@ -1,12 +1,19 @@
 use metor_proto::types::{ComponentId, PacketId};
 use thiserror::Error;
 
+use super::config::Location;
 use super::params::ParamError;
 use crate::def::DefError;
 
 /// Errors from registering system types or building a coordinator.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum BuildError {
+    #[error("{location}: {source}")]
+    Located {
+        location: Location,
+        source: Box<BuildError>,
+    },
+
     #[error("a deterministic build needs a simulated clock")]
     DeterministicWall,
 
@@ -114,4 +121,17 @@ pub enum BuildError {
         #[source]
         source: ParamError,
     },
+}
+
+impl BuildError {
+    /// Cites `location`, when the config gives one, as where the error is.
+    pub fn at(self, location: Option<&Location>) -> Self {
+        match location {
+            Some(location) if !matches!(self, Self::Located { .. }) => Self::Located {
+                location: location.clone(),
+                source: Box::new(self),
+            },
+            _ => self,
+        }
+    }
 }

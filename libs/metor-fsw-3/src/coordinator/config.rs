@@ -59,6 +59,22 @@ pub struct SystemConfig {
     /// The adapter the system runs behind, if any. See [`Adapter`].
     #[serde(flatten, with = "adapter_keys")]
     pub adapter: Option<Adapter>,
+    /// Where the target file created the system, if it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<Location>,
+}
+
+/// A line of a target file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Location {
+    pub file: String,
+    pub line: u32,
+}
+
+impl core::fmt::Display for Location {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}:{}", self.file, self.line)
+    }
 }
 
 /// Changes how a system is run.
@@ -146,6 +162,7 @@ impl SystemConfig {
             inputs: Vec::new(),
             outputs: Vec::new(),
             adapter: None,
+            location: None,
         }
     }
 }
@@ -294,6 +311,23 @@ mod tests {
             serde_json::from_str::<SystemConfig>(&text).expect("round trips"),
             full
         );
+    }
+
+    #[test]
+    fn test_location_is_optional() {
+        let text = r#"{"id":"nav","ty":"nav","location":{"file":"target.py","line":12}}"#;
+        let located: SystemConfig = serde_json::from_str(text).expect("a location parses");
+        let location = located.location.as_ref().expect("a location");
+        assert_eq!(location.to_string(), "target.py:12");
+        let encoded = serde_json::to_string(&located).expect("encodes");
+        assert_eq!(
+            serde_json::from_str::<SystemConfig>(&encoded).expect("round trips"),
+            located
+        );
+        let bare = serde_json::to_string(&SystemConfig::new("nav", "nav")).expect("encodes");
+        assert!(!bare.contains("location"), "{bare}");
+        let missing_line = r#"{"id":"nav","ty":"nav","location":{"file":"target.py"}}"#;
+        assert!(serde_json::from_str::<SystemConfig>(missing_line).is_err());
     }
 
     #[test]
