@@ -359,11 +359,24 @@ fn test_reject_bad_channel_names() {
         ..Default::default()
     };
     assert_eq!(
-        config.build(&table(&Recorder::default())).err(),
+        config.clone().build(&table(&Recorder::default())).err(),
         Some(BuildError::DuplicateChannel {
             name: "mode".into()
         })
     );
+    let mut located = config;
+    located.systems[1].location = Some(crate::coordinator::Location {
+        file: "target.py".into(),
+        line: 6,
+    });
+    let error = located.build(&table(&Recorder::default())).err();
+    assert_eq!(
+        error.map(|e| e.to_string()).as_deref(),
+        Some("target.py:6: channel `mode` is named by two systems")
+    );
+    let paused = serde_json::json!({ "id": "imu", "ty": "imu",
+        "channel": { "name": "mode", "start": "paused" } });
+    assert!(serde_json::from_value::<SystemConfig>(paused).is_err());
 }
 
 #[test]

@@ -420,19 +420,14 @@ impl IoPoints {
 
 /// Checks that no two systems use the same channel name.
 fn check_channels(config: &CoordinatorConfig) -> Result<(), BuildError> {
-    let names = config
-        .systems
-        .iter()
-        .filter_map(|system| match &system.adapter {
-            Some(Adapter::Channel(channel)) => Some(channel.name.as_str()),
-            _ => None,
-        });
     let mut seen_names = std::collections::HashSet::new();
-    for name in names {
-        if !seen_names.insert(name) {
-            return Err(BuildError::DuplicateChannel {
-                name: name.to_string(),
-            });
+    for system in &config.systems {
+        let Some(Adapter::Channel(channel)) = &system.adapter else {
+            continue;
+        };
+        if !seen_names.insert(channel.name.as_str()) {
+            let name = channel.name.to_string();
+            return Err(BuildError::DuplicateChannel { name }.at(system.location.as_ref()));
         }
     }
     Ok(())
