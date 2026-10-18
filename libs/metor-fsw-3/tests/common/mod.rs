@@ -6,10 +6,10 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::fmt::Display;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -96,11 +96,33 @@ impl Drop for Running {
     }
 }
 
-/// Returns `N` ports that were free when this was called.
+/// The ports [`free_ports`] hands out.
+///
+/// They sit below the ephemeral ranges of Linux (32768 and up) and macOS
+/// (49152 and up), so the OS never gives one to a `bind(0)` or an outgoing
+/// connection.
+const TEST_PORTS: core::ops::Range<u16> = 20000..32000;
+
+/// How far into [`TEST_PORTS`] this process has handed out ports.
+static NEXT_PORT: AtomicU32 = AtomicU32::new(0);
+
+/// Returns `N` ports that nothing listened on when this was called.
+///
+/// Each call in a process gets different ports, and each process starts at a
+/// different place in [`TEST_PORTS`]. A port is probed by dialing it, not by
+/// binding it: a socket bound here can leak into a child spawned by another
+/// test at the same moment, and the child then holds the port.
 pub fn free_ports<const N: usize>() -> [u16; N] {
-    let held: [TcpListener; N] =
-        core::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").expect("a free port"));
-    held.map(|listener| listener.local_addr().expect("bound").port())
+    let span = u32::from(TEST_PORTS.end - TEST_PORTS.start);
+    let start = std::process::id().wrapping_mul(997);
+    let ports: Vec<u16> = (0..span)
+        .map(|_| start.wrapping_add(NEXT_PORT.fetch_add(1, Ordering::Relaxed)) % span)
+        .filter_map(|offset| u16::try_from(offset).ok())
+        .map(|offset| TEST_PORTS.start + offset)
+        .filter(|&port| std::net::TcpStream::connect(local(port)).is_err())
+        .take(N)
+        .collect();
+    ports.try_into().expect("enough free test ports")
 }
 
 /// Joins `ports` into the comma-separated list a fixture's ports variable
