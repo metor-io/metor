@@ -2,6 +2,8 @@
 
 use metor_fsw_3::Timestamp;
 use nox::{ArrayRepr, Matrix6};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{Quat, V3};
@@ -215,62 +217,128 @@ pub struct MtqCmd {
     pub dipole_b: V3,
 }
 
-/// The commanded ADCS phase and the pointing law the controller follows.
+/// An ADCS phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum Mode {
+    /// Holds nadir.
+    Idle = 0,
+    /// Slews toward the velocity vector.
+    Settling = 1,
+    /// Holds the velocity vector.
+    Pointing = 2,
+    /// Holds nadir.
+    Safe = 3,
+    /// Rate damping on the magnetorquers, for boot rates too high for the wheels.
+    Detumble = 4,
+}
+
+/// A byte that names no [`Mode`] or [`Law`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownCode(pub u8);
+
+impl TryFrom<u8> for Mode {
+    type Error = UnknownCode;
+
+    fn try_from(code: u8) -> Result<Self, UnknownCode> {
+        match code {
+            0 => Ok(Self::Idle),
+            1 => Ok(Self::Settling),
+            2 => Ok(Self::Pointing),
+            3 => Ok(Self::Safe),
+            4 => Ok(Self::Detumble),
+            _ => Err(UnknownCode(code)),
+        }
+    }
+}
+
+impl Mode {
+    /// The pointing law the controller follows in this phase.
+    pub const fn law(self) -> Law {
+        match self {
+            Self::Idle | Self::Safe => Law::Nadir,
+            Self::Settling | Self::Pointing => Law::Hil,
+            Self::Detumble => Law::Detumble,
+        }
+    }
+}
+
+/// A pointing law.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Law {
+    Nadir = 0,
+    /// Body `-Y` along the orbital velocity.
+    Hil = 1,
+    /// Rate damping on the magnetorquers while the wheels idle.
+    Detumble = 2,
+}
+
+impl TryFrom<u8> for Law {
+    type Error = UnknownCode;
+
+    fn try_from(code: u8) -> Result<Self, UnknownCode> {
+        match code {
+            0 => Ok(Self::Nadir),
+            1 => Ok(Self::Hil),
+            2 => Ok(Self::Detumble),
+            _ => Err(UnknownCode(code)),
+        }
+    }
+}
+
+impl Law {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Nadir => "nadir",
+            Self::Hil => "velocity-vector",
+            Self::Detumble => "detumble",
+        }
+    }
+}
+
+/// The commanded ADCS phase.
 #[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[repr(C)]
 #[frame(name = "mode_cmd")]
 pub struct ModeCmd {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
-    /// Phase: `0` idle, `1` settling, `2` pointing, `3` safe, `4` detumble.
-    pub mode: u8,
-    /// Pointing law: `0` nadir, `1` velocity vector, `2` detumble.
-    pub law: u8,
-    _pad: [u8; 6],
+    /// The [`Mode`]'s code.
+    mode: u8,
+    _pad: [u8; 7],
 }
 
 impl ModeCmd {
-    pub const IDLE: u8 = 0;
-    pub const SETTLING: u8 = 1;
-    pub const POINTING: u8 = 2;
-    pub const SAFE: u8 = 3;
-    /// Rate damping on the magnetorquers, for boot rates too high for the wheels.
-    pub const DETUMBLE: u8 = 4;
-
-    pub const LAW_NADIR: u8 = 0;
-    pub const LAW_HIL: u8 = 1;
-    /// Rate damping on the magnetorquers while the wheels idle.
-    pub const LAW_DETUMBLE: u8 = 2;
-
-    /// Returns the command for `mode` and `law` with a zero timestamp.
-    pub const fn new(mode: u8, law: u8) -> Self {
+    /// Returns the command for `mode` with a zero timestamp.
+    pub const fn new(mode: Mode) -> Self {
         Self {
             timestamp: Timestamp(0),
-            mode,
-            law,
-            _pad: [0; 6],
+            mode: mode as u8,
+            _pad: [0; 7],
         }
     }
 
-    /// Returns the idle command, which holds nadir.
+    /// The commanded phase, or the byte when it names none.
+    pub fn mode(&self) -> Result<Mode, UnknownCode> {
+        Mode::try_from(self.mode)
+    }
+
     pub const fn idle() -> Self {
-        Self::new(Self::IDLE, Self::LAW_NADIR)
+        Self::new(Mode::Idle)
     }
-    /// Returns the settling command, which slews toward the velocity vector.
     pub const fn settling() -> Self {
-        Self::new(Self::SETTLING, Self::LAW_HIL)
+        Self::new(Mode::Settling)
     }
-    /// Returns the pointing command, which holds the velocity vector.
     pub const fn pointing() -> Self {
-        Self::new(Self::POINTING, Self::LAW_HIL)
+        Self::new(Mode::Pointing)
     }
-    /// Returns the safe command, which holds nadir.
     pub const fn safe() -> Self {
-        Self::new(Self::SAFE, Self::LAW_NADIR)
+        Self::new(Mode::Safe)
     }
-    /// Returns the detumble command.
     pub const fn detumble() -> Self {
-        Self::new(Self::DETUMBLE, Self::LAW_DETUMBLE)
+        Self::new(Mode::Detumble)
     }
 
     /// Returns the command stamped `now`.
@@ -289,4 +357,43 @@ pub struct TorqueCmd {
     pub timestamp: Timestamp,
     /// Commanded torque (N·m).
     pub torque_b: V3,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mode_round_trips_its_code() {
+        for mode in [
+            Mode::Idle,
+            Mode::Settling,
+            Mode::Pointing,
+            Mode::Safe,
+            Mode::Detumble,
+        ] {
+            assert_eq!(ModeCmd::new(mode).mode(), Ok(mode));
+        }
+        for law in [Law::Nadir, Law::Hil, Law::Detumble] {
+            assert_eq!(Law::try_from(law as u8), Ok(law));
+        }
+    }
+
+    #[test]
+    fn test_law_follows_mode() {
+        assert_eq!(Mode::Idle.law(), Law::Nadir);
+        assert_eq!(Mode::Safe.law(), Law::Nadir);
+        assert_eq!(Mode::Settling.law(), Law::Hil);
+        assert_eq!(Mode::Pointing.law(), Law::Hil);
+        assert_eq!(Mode::Detumble.law(), Law::Detumble);
+    }
+
+    #[test]
+    fn test_unknown_code_is_refused() {
+        assert_eq!(Mode::try_from(5), Err(UnknownCode(5)));
+        assert_eq!(Law::try_from(3), Err(UnknownCode(3)));
+        let mut cmd = ModeCmd::idle();
+        cmd.mode = 0xff;
+        assert_eq!(cmd.mode(), Err(UnknownCode(0xff)));
+    }
 }

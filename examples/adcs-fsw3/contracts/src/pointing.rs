@@ -1,7 +1,7 @@
 //! Pointing laws, which give the controller its target attitude, and the
 //! samples that score how well the spacecraft tracks it.
 
-use crate::{BodyState, ModeCmd, Quat, V3};
+use crate::{BodyState, Law, Quat, V3};
 
 /// The body axis both pointing laws aim.
 const POINTING_AXIS: [f64; 3] = [0.0, -1.0, 0.0];
@@ -35,12 +35,12 @@ pub fn hil_point(vel_eci: &V3) -> Quat {
 }
 
 /// Returns the target attitude for `law` at an orbit state, or identity when the
-/// law is unknown or the target is not finite.
-pub fn target_for(law: u8, pos_eci: &V3, vel_eci: &V3) -> Quat {
+/// law points nowhere or the target is not finite.
+pub fn target_for(law: Law, pos_eci: &V3, vel_eci: &V3) -> Quat {
     let t = match law {
-        ModeCmd::LAW_NADIR => nadir_point(pos_eci),
-        ModeCmd::LAW_HIL => hil_point(vel_eci),
-        _ => Quat::identity(),
+        Law::Nadir => nadir_point(pos_eci),
+        Law::Hil => hil_point(vel_eci),
+        Law::Detumble => Quat::identity(),
     };
     if t.0.into_buf().iter().any(|f| !f.is_finite()) {
         Quat::identity()

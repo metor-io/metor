@@ -1,37 +1,30 @@
-use adcs_contracts::ModeCmd;
+use adcs_contracts::{Mode, ModeCmd};
 use metor_fsw_3::{JsonSchema, Output, Timestamp, system};
 use serde::Deserialize;
 
-/// Configuration for the mode system, as [`ModeCmd`] byte values.
+/// Configuration for the mode system.
 #[derive(Deserialize, JsonSchema, Clone, Debug, PartialEq)]
 pub struct ModeParams {
-    /// Target phase: `0` idle, `1` settling, `2` pointing, `3` safe, `4` detumble.
+    /// The phase to command.
     #[serde(default = "default_mode")]
-    pub mode: u8,
-    /// Pointing law: `0` nadir, `1` velocity-vector, `2` detumble.
-    #[serde(default = "default_law")]
-    pub law: u8,
+    pub mode: Mode,
 }
 
-fn default_mode() -> u8 {
-    ModeCmd::POINTING
-}
-
-fn default_law() -> u8 {
-    ModeCmd::LAW_NADIR
+fn default_mode() -> Mode {
+    Mode::Idle
 }
 
 /// The command the mode system writes every cycle.
-pub struct Mode(ModeCmd);
+pub struct ModeSystem(ModeCmd);
 
-impl Mode {
+impl ModeSystem {
     pub fn new(p: ModeParams) -> Self {
-        Self(ModeCmd::new(p.mode, p.law))
+        Self(ModeCmd::new(p.mode))
     }
 }
 
 #[system]
 /// Writes the configured command stamped `now`.
-pub fn mode(#[state] state: &mut Mode, now: Timestamp, mode_cmd: &mut Output<ModeCmd>) {
+pub fn mode(#[state] state: &mut ModeSystem, now: Timestamp, mode_cmd: &mut Output<ModeCmd>) {
     let _ = mode_cmd.write(&state.0.stamped(now));
 }

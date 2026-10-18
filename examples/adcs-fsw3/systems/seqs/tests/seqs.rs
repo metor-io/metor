@@ -3,7 +3,7 @@
 use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use adcs_contracts::{AttitudeEstimate, ModeCmd, V3};
+use adcs_contracts::{AttitudeEstimate, Mode, ModeCmd, V3};
 use metor_fsw_3::coordinator::{
     Coordinator, CoordinatorConfig, EndReason, InputConfig, SystemConfig,
 };
@@ -18,9 +18,9 @@ struct Script {
     abort: Rc<Cell<bool>>,
 }
 
-/// Every `(mode, law)` the sequence commanded.
+/// Every mode the sequence commanded.
 #[derive(Clone, Default)]
-struct Commands(Rc<RefCell<Vec<(u8, u8)>>>);
+struct Commands(Rc<RefCell<Vec<Mode>>>);
 
 #[system]
 fn estimator(
@@ -44,7 +44,7 @@ fn aborter(#[state] script: &mut Script, abort: &mut Output<AbortRequest>) {
 #[system]
 fn recorder(#[state] commands: &mut Commands, mode_cmd: &mut Input<ModeCmd>) {
     let mut commands = commands.0.borrow_mut();
-    commands.extend(mode_cmd.drain().flatten().map(|m| (m.mode, m.law)));
+    commands.extend(mode_cmd.drain().flatten().filter_map(|m| m.mode().ok()));
 }
 
 /// A rig of the sequence, its feeds, and its recorder.
@@ -107,14 +107,14 @@ impl Rig {
         self.coordinator.systems().find_map(|(_, reason)| reason)
     }
 
-    fn commands(&self) -> Vec<(u8, u8)> {
+    fn commands(&self) -> Vec<Mode> {
         self.commands.0.take()
     }
 }
 
-const DETUMBLE: (u8, u8) = (ModeCmd::DETUMBLE, ModeCmd::LAW_DETUMBLE);
-const NADIR: (u8, u8) = (ModeCmd::IDLE, ModeCmd::LAW_NADIR);
-const SAFE: (u8, u8) = (ModeCmd::SAFE, ModeCmd::LAW_NADIR);
+const DETUMBLE: Mode = Mode::Detumble;
+const NADIR: Mode = Mode::Idle;
+const SAFE: Mode = Mode::Safe;
 
 #[test]
 fn test_settled_rate_goes_to_nadir() {

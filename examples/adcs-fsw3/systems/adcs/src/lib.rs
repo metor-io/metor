@@ -15,7 +15,7 @@ pub mod plant;
 pub use ctrl::CtrlSystem;
 pub use gps::GpsDriver;
 pub use gps_receiver::GpsReceiver;
-pub use mode::Mode;
+pub use mode::ModeSystem;
 pub use nav::{NavState, sun_from_css};
 pub use plant::{
     DisturbanceTorques, PlantState, TrueState, WheelDynamics, css_readings, propagate,
@@ -38,7 +38,7 @@ pub fn pack() -> SystemTable {
         .register("ctrl", ctrl::ctrl(), CtrlSystem::new)
         .expect("valid records");
     table
-        .register("mode", mode::mode(), Mode::new)
+        .register("mode", mode::mode(), ModeSystem::new)
         .expect("valid records");
     table
         .register_sequence("gps_driver", gps::gps_driver(), GpsDriver::new)

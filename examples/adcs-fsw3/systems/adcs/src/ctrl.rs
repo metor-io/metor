@@ -5,8 +5,9 @@
 //! detumble law the wheels idle and the magnetorquers damp the body rate.
 
 use adcs_contracts::{
-    AttitudeEstimate, CtrlParams, Gps, MTQ_MAX_DIPOLE, ModeCmd, MtqCmd, RW_TORQUE_MAX, Sensors,
-    TorqueCmd, V3, Wheels, clamp_dipole, desat_dipole, detumble_dipole, inertia_diag, target_for,
+    AttitudeEstimate, CtrlParams, Gps, Law, MTQ_MAX_DIPOLE, ModeCmd, MtqCmd, RW_TORQUE_MAX,
+    Sensors, TorqueCmd, V3, Wheels, clamp_dipole, desat_dipole, detumble_dipole, inertia_diag,
+    target_for,
 };
 use metor_fsw_3::{Input, Output, Timestamp, system};
 use nox::{Quaternion, tensor};
@@ -15,19 +16,9 @@ use nox::{Quaternion, tensor};
 pub struct CtrlSystem {
     lqr: metor_adcs::yang_lqr::YangLQR,
     /// The last commanded pointing law.
-    law: Option<u8>,
+    law: Option<Law>,
     k_desat: f64,
     k_detumble: f64,
-}
-
-/// Returns the display name of a pointing law.
-fn law_name(law: u8) -> &'static str {
-    match law {
-        ModeCmd::LAW_NADIR => "nadir",
-        ModeCmd::LAW_HIL => "velocity-vector",
-        ModeCmd::LAW_DETUMBLE => "detumble",
-        _ => "unknown",
-    }
 }
 
 impl CtrlSystem {
@@ -65,14 +56,15 @@ pub fn ctrl(
     let q_hat_b_eci = e.q_hat_b_eci;
 
     if let Ok(Some(m)) = mode.latest()
-        && state.law != Some(m.law)
+        && let Ok(law) = m.mode().map(|mode| mode.law())
+        && state.law != Some(law)
     {
         tracing::info!(
-            from = state.law.map(law_name).unwrap_or("none"),
-            to = law_name(m.law),
+            from = state.law.map_or("none", Law::name),
+            to = law.name(),
             "pointing law changed"
         );
-        state.law = Some(m.law);
+        state.law = Some(law);
     }
 
     let mag_b = sensors.latest().ok().flatten().map(|s| s.mag_b);
@@ -83,7 +75,7 @@ pub fn ctrl(
     });
 
     // The wheels idle while the magnetorquers damp the rate.
-    if state.law == Some(ModeCmd::LAW_DETUMBLE) {
+    if state.law == Some(Law::Detumble) {
         let dipole_b = match &mag_b {
             Some(b) => clamp_dipole(
                 detumble_dipole(state.k_detumble, &e.omega_b, b),

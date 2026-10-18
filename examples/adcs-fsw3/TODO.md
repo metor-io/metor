@@ -238,7 +238,7 @@ There are two separate gaps.
 - Fix: move `Frame`'s read path to `TryFromBytes`, or add a
   `#[frame(enum = Mode)]` attribute on a `u8` field that emits the variant
   metadata.
-- Workaround: `u8` fields plus `const` tables, as `ModeCmd` does now.
+- Workaround: a `u8` field read through `TryFrom<u8>`, as `ModeCmd` does now.
 
 **Message enums with data (telecommands).**
 - `#[derive(Record)]` is struct-only (fsw-3 TODO, slice 2).

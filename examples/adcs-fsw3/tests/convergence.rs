@@ -14,7 +14,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Once, OnceLock};
 
-use adcs_contracts::{AttitudeEstimate, BodyState, DT, ModeCmd, TorqueCmd, target_for};
+use adcs_contracts::{AttitudeEstimate, BodyState, DT, Law, TorqueCmd, target_for};
 use adcs_seqs::Commission;
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::cli::run::prepare;
@@ -47,7 +47,7 @@ const SETTLED_RATE: f64 = 0.14;
 const DETUMBLE_TIMEOUT_S: f64 = 60.0;
 
 /// The pointing law `mode` commands for the whole run, and `commission` ends on.
-const LAW: u8 = ModeCmd::LAW_NADIR;
+const LAW: Law = Law::Nadir;
 
 /// Pointing error bound (rad), about 6°.
 const ERR_BOUND: f64 = 0.1;
