@@ -169,19 +169,21 @@ fn root_in_target() -> tempfile::TempDir {
     tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("a temp dir")
 }
 
+/// A wasm pack with an async system stages. The module refuses that system
+/// only where a build places it.
 #[test]
-fn test_wasm_pack_dev_refuses_async() {
+fn test_wasm_pack_dev_stages_async_pack() {
     let root = root_in_target();
     let pyproject = wasm_pyproject("echo-pack");
     std::fs::write(root.path().join("pyproject.toml"), pyproject).expect("writes");
-    let refused = pack_dev(root.path());
-    assert!(
-        matches!(&refused, Err(PackDevError::AsyncInWasm { system }) if system == "relay"),
-        "{refused:?}"
-    );
+    pack_dev(root.path()).expect("pack dev lays out both");
     let module = root.path().join(".metor/echo_pack");
-    assert!(!module.join("__init__.py").exists());
-    assert!(!module.join("_libs").join(WASM_TRIPLE).exists());
+    assert!(module.join("__init__.py").is_file());
+    let staged = module
+        .join("_libs")
+        .join(WASM_TRIPLE)
+        .join(wasm_name("echo_pack"));
+    assert!(staged.is_file(), "{} is missing", staged.display());
 }
 
 #[test]

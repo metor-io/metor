@@ -10,7 +10,6 @@ use std::sync::Mutex;
 
 use super::cargo::{CargoError, PackConfig, cargo_build, wasm_build};
 use super::module::render;
-use crate::coordinator::SystemKind;
 use crate::dl::store::{copy_atomic, write_atomic};
 use crate::dl::{DlPack, Pack, PackError, PackKind, PackRef, cdylib_name, triple};
 use crate::pack::ABI_VERSION;
@@ -53,8 +52,6 @@ pub enum PackDevError {
     Pack(#[from] PackError),
     #[error("{0} is already loaded; restart the process before rebuilding this pack")]
     AlreadyLoaded(PathBuf),
-    #[error("system `{system}` is async, which a module cannot run; drop `wasm = true`")]
-    AsyncInWasm { system: String },
     #[error("the module describes other systems than the library")]
     DescriptorMismatch,
 }
@@ -94,7 +91,6 @@ pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
     let pack = Pack::Dl(unsafe { DlPack::open(&dylib) }?);
     let mut staged = vec![dylib];
     if config.wasm {
-        refuse_async(pack.descriptor())?;
         reference.kind = PackKind::Wasm(Default::default());
         staged.push(stage_module(&config, root, &reference, pack.descriptor())?);
     }
@@ -107,18 +103,6 @@ pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
         eprintln!("{}", path.display());
     }
     Ok(())
-}
-
-/// Returns an error if the pack has an async system, since a wasm module
-/// cannot run one.
-fn refuse_async(def: &PackDef) -> Result<(), PackDevError> {
-    let found = def.systems.iter().find(|s| s.kind == SystemKind::Async);
-    match found {
-        Some(system) => Err(PackDevError::AsyncInWasm {
-            system: system.ty.clone(),
-        }),
-        None => Ok(()),
-    }
 }
 
 /// Builds the pack as a wasm module and copies it to where `reference`
