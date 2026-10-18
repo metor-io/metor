@@ -169,7 +169,11 @@ impl Step for Slot {
         }
     }
 
-    fn load(&mut self, name: &str) -> Result<(), LoadError> {
+    fn load(
+        &mut self,
+        name: &str,
+        _cx: &mut crate::coordinator::StepCx<'_>,
+    ) -> Result<(), LoadError> {
         if name == "none" {
             self.occupant = None;
             return Ok(());

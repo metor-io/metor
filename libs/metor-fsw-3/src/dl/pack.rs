@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use libloading::Library;
 use metor_proto::types::Timestamp;
 
-use crate::coordinator::{EndReason, ParamError, Step};
+use crate::coordinator::{EndReason, ParamError, Step, StepCx};
 use crate::def::{DefCx, DefError};
 use crate::pack::def::{DefCxOwned, Instance, PackDef};
 use crate::pack::raw::{RawRing, RawSlice};
@@ -243,7 +243,7 @@ pub struct DlStep {
 }
 
 impl Step for DlStep {
-    fn execute(&mut self, now: Timestamp) {
+    fn execute(&mut self, now: Timestamp, _cx: &mut StepCx<'_>) {
         if self.end.is_some() {
             return;
         }

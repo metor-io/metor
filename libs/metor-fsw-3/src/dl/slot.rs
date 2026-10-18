@@ -19,11 +19,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::coordinator::{
-    Adapters, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, SystemKind, TableEntry,
+    Adapters, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, StepCx, SystemKind,
+    TableEntry,
 };
 use crate::def::{DefCx, DefError};
 use crate::dl::PackKind;
-use crate::io::SharedIo;
+use crate::io::IoState;
 use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
 use crate::{FrameBytes, FrameStr};
@@ -201,8 +202,6 @@ pub struct DlSlot {
     outputs: Vec<RingBuffer>,
     candidates: Vec<Resolved>,
     occupancy: Occupancy,
-    /// Where the slot's candidates share one IO region.
-    io: SharedIo,
 }
 
 /// What a slot holds.
@@ -258,10 +257,9 @@ impl DlSlot {
             outputs: cx.outputs.into_iter().cloned().collect(),
             candidates,
             occupancy: Occupancy::Empty(EndReason::Unloaded),
-            io: cx.io.clone(),
         };
         if let Some(name) = params.initial
-            && let Err(error) = slot.load(&name)
+            && let Err(error) = slot.load(&name, &mut StepCx::new(cx.io))
         {
             slot.occupancy = Occupancy::Empty(EndReason::Failed(error.to_string().into()));
         }
@@ -293,7 +291,12 @@ impl DlSlot {
         }
     }
 
-    fn create(&self, pack: &Pack, candidate: &Resolved) -> Result<Box<dyn Step>, LoadError> {
+    fn create(
+        &self,
+        pack: &Pack,
+        candidate: &Resolved,
+        io: &mut IoState,
+    ) -> Result<Box<dyn Step>, LoadError> {
         let inputs: Vec<Vec<&RingBuffer>> = self
             .inputs
             .iter()
@@ -304,30 +307,24 @@ impl DlSlot {
             inputs: &inputs,
             outputs: &outputs,
         };
-        pack.create(
-            &candidate.ty,
-            &candidate.params,
-            &self.instance,
-            rings,
-            &self.io,
-        )
-        .map_err(LoadError::Create)
+        pack.create(&candidate.ty, &candidate.params, &self.instance, rings, io)
+            .map_err(LoadError::Create)
     }
 
     /// Creates candidate `index` on the slot's rings.
     ///
     /// No other system may be loaded when this is called.
-    fn place(&mut self, index: usize, pack: Arc<Pack>) -> Result<(), LoadError> {
-        let step = self.create(&pack, &self.candidates[index])?;
+    fn place(&mut self, index: usize, pack: Arc<Pack>, io: &mut IoState) -> Result<(), LoadError> {
+        let step = self.create(&pack, &self.candidates[index], io)?;
         self.occupancy = Occupancy::Loaded(Loaded { index, pack, step });
         Ok(())
     }
 }
 
 impl Step for DlSlot {
-    fn execute(&mut self, now: Timestamp) {
+    fn execute(&mut self, now: Timestamp, cx: &mut StepCx<'_>) {
         if let Occupancy::Loaded(loaded) = &mut self.occupancy {
-            loaded.step.execute(now);
+            loaded.step.execute(now, cx);
         }
     }
 
@@ -344,7 +341,7 @@ impl Step for DlSlot {
     /// If the new system's library or ports are rejected, the current system
     /// keeps running. If the new system's constructor fails, the previous
     /// system is created again.
-    fn load(&mut self, name: &str) -> Result<(), LoadError> {
+    fn load(&mut self, name: &str, cx: &mut StepCx<'_>) -> Result<(), LoadError> {
         let index = self
             .candidates
             .iter()
@@ -360,12 +357,12 @@ impl Step for DlSlot {
             Occupancy::Loaded(loaded) => Some((loaded.index, loaded.pack)),
             Occupancy::Empty(_) => None,
         };
-        let placed = self.place(index, pack);
+        let placed = self.place(index, pack, cx.io);
         if placed.is_err()
             && let Some((previous, pack)) = previous
         {
             // The old library is still loaded and the rings are free again.
-            let _ = self.place(previous, pack);
+            let _ = self.place(previous, pack, cx.io);
         }
         placed
     }

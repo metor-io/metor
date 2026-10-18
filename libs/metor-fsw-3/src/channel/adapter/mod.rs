@@ -337,7 +337,7 @@ impl Core {
             None => self.remake(io)?,
         };
         if let Some(name) = &self.loaded {
-            crate::panic::catch(|| inner.load(name))
+            crate::panic::catch(|| inner.load(name, &mut StepCx::new(io)))
                 .ok_or_else(|| "the load panicked".to_string())?
                 .map_err(|e| e.to_string())?;
         }
@@ -362,7 +362,7 @@ impl Core {
                 io.quiesce_system(&self.recipe.id);
                 SequenceEventKind::quiescing()
             }
-            ChannelPhase::Live { inner, run } => self.load(inner, run, name),
+            ChannelPhase::Live { inner, run } => self.load(inner, run, name, io),
             phase => {
                 self.phase = phase;
                 SequenceEventKind::refused("the system is gone; reset it first".into())
@@ -384,7 +384,7 @@ impl Core {
         io.end_quiescing_system(id);
         let event = match core::mem::replace(&mut self.phase, ChannelPhase::Restarting) {
             ChannelPhase::Restarting => self.restart_event(io),
-            ChannelPhase::Loading { inner, name } => self.load(inner, RunState::Stopped, name),
+            ChannelPhase::Loading { inner, name } => self.load(inner, RunState::Stopped, name, io),
             phase => {
                 self.phase = phase;
                 return;
@@ -395,8 +395,14 @@ impl Core {
 
     /// Loads `name` into `inner`, which was in `run`. A refused load leaves
     /// `inner` as it was.
-    fn load(&mut self, mut inner: Box<dyn Step>, run: RunState, name: String) -> SequenceEventKind {
-        match crate::panic::catch(|| inner.load(&name)) {
+    fn load(
+        &mut self,
+        mut inner: Box<dyn Step>,
+        run: RunState,
+        name: String,
+        io: &mut IoState,
+    ) -> SequenceEventKind {
+        match crate::panic::catch(|| inner.load(&name, &mut StepCx::new(io))) {
             Some(Ok(())) => {
                 self.phase = ChannelPhase::Live {
                     inner,

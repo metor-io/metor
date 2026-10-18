@@ -17,7 +17,7 @@ use metor_fsw_3_ring::RingBuffer;
 
 use crate::coordinator::{BuildError, ParamError, Step, SystemTable, TableEntry};
 use crate::def::{DefCx, DefError};
-use crate::io::SharedIo;
+use crate::io::IoState;
 use crate::pack::def::{Instance, PackDef, PackSystemDef};
 use crate::pack::raw::RawRing;
 use crate::system::SystemDef;
@@ -77,15 +77,15 @@ impl Pack {
         params: &serde_json::Value,
         instance: &Instance,
         rings: InstanceRings<'_>,
-        io: &SharedIo,
+        io: &mut IoState,
     ) -> Result<Box<dyn Step>, ParamError> {
-        let arena = io.borrow().arena(&instance.id);
+        let arena = io.arena(&instance.id);
         let mut table = arena.as_deref().map_or(RawRing::EMPTY, RawRing::from_arena);
         let step: Box<dyn Step> = match self {
             Pack::Dl(pack) => Box::new(pack.create(ty, params, instance, rings, &mut table)?),
         };
         if !instance.def.grants.is_empty() {
-            let arena = io.borrow_mut().get_or_add_member(&instance.id);
+            let arena = io.get_or_add_member(&instance.id);
             // SAFETY: a pack writes back a live region with an owner that
             // meets `RawOwner`'s contract, or an empty one.
             unsafe { arena.adopt(table) };

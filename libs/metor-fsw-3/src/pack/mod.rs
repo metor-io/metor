@@ -12,8 +12,11 @@ use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 use tracing_subscriber::layer::SubscriberExt;
 
-use crate::coordinator::{EndReason, MakeCx, ParamError, Params, Step, StepState, SystemTable};
+use crate::coordinator::{
+    EndReason, MakeCx, ParamError, Params, Step, StepCx, StepState, SystemTable,
+};
 use crate::def::DefError;
+use crate::io::IoState;
 use crate::system::SystemDef;
 use crate::thread::Threads;
 use def::{DefCxOwned, Instance, PackDef};
@@ -114,8 +117,8 @@ thread_local! {
     static TABLE: OnceCell<SystemTable> = const { OnceCell::new() };
     /// The threads this pack runs its own async systems on.
     static THREADS: RefCell<Threads> = RefCell::default();
-    /// What the pack's own IO systems share.
-    static IO: crate::io::SharedIo = crate::io::SharedIo::default();
+    /// The IO state of the pack's own systems.
+    static IO: RefCell<IoState> = RefCell::default();
     static ERROR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -329,15 +332,34 @@ unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn S
 
     let views = ins.iter().map(|rings| rings.iter().collect()).collect();
     let writers = outs.iter().collect();
-    let io = IO.with(Clone::clone);
     // SAFETY: the caller's contract.
     let given = unsafe { table.read() };
-    if !instance.def.grants.is_empty() {
-        let arena = io.borrow_mut().get_or_add_member(&instance.id);
-        // SAFETY: as above; the region and its owner are live.
-        unsafe { arena.adopt(given) };
-    }
-    let step = with_table(build, |table| {
+    let step = IO.with_borrow_mut(|io| {
+        if !instance.def.grants.is_empty() {
+            let arena = io.get_or_add_member(&instance.id);
+            // SAFETY: as above; the region and its owner are live.
+            unsafe { arena.adopt(given) };
+        }
+        make_step(build, ty, &instance, &value, views, writers, io)
+    })?;
+    let region = IO.with_borrow(|io| io.arena(&instance.id));
+    let region = region.map_or(RawRing::EMPTY, |arena| RawRing::from_arena(&arena));
+    // SAFETY: the caller's contract.
+    unsafe { table.write(region) };
+    Ok(step)
+}
+
+/// Makes system `ty` from the pack's own table, on `io`.
+fn make_step(
+    build: fn() -> SystemTable,
+    ty: &str,
+    instance: &Instance,
+    value: &serde_json::Value,
+    views: Vec<Vec<&RingBuffer>>,
+    writers: Vec<&RingBuffer>,
+    io: &mut IoState,
+) -> Result<Box<dyn Step>, ParamError> {
+    with_table(build, |table| {
         let entry = table
             .get(ty)
             .ok_or_else(|| ParamError::Decode(format!("unknown system type `{ty}`")))?;
@@ -350,22 +372,17 @@ unsafe fn make(build: fn() -> SystemTable, args: CreateArgs) -> Result<Box<dyn S
                 id: &instance.id,
                 adapter: instance.adapter.as_ref(),
                 def: &instance.def,
-                params: Params(&value),
+                params: Params(value),
                 inputs: views,
                 outputs: writers,
                 threads,
-                io: &io,
+                io,
                 seed: None,
                 namespace: None,
                 records: &records,
             })
         })
-    })?;
-    let region = io.borrow().arena(&instance.id);
-    let region = region.map_or(RawRing::EMPTY, |arena| RawRing::from_arena(&arena));
-    // SAFETY: the caller's contract.
-    unsafe { table.write(region) };
-    Ok(step)
+    })
 }
 
 /// Decodes the params JSON. Empty bytes mean no params.
@@ -395,7 +412,7 @@ pub unsafe fn execute(instance: *mut c_void, now: i64) -> u32 {
     crate::panic::catch(|| {
         // SAFETY: `create` allocated this slot, and it is still live on this thread.
         let slot = unsafe { &mut *instance.cast::<StepState>() };
-        slot.run(Timestamp(now));
+        IO.with_borrow_mut(|io| slot.run(Timestamp(now), &mut StepCx::new(io)));
         Status::of_end(slot.end_reason())
     })
     .unwrap_or(Status::Panicked) as u32

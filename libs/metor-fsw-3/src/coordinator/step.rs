@@ -30,7 +30,7 @@ pub trait Step {
     }
 
     /// Replaces the system this step runs with the system called `name`.
-    fn load(&mut self, _name: &str) -> Result<(), LoadError> {
+    fn load(&mut self, _name: &str, _cx: &mut StepCx<'_>) -> Result<(), LoadError> {
         Err(LoadError::NotLoadable)
     }
 
