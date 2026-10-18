@@ -300,6 +300,44 @@ impl<'a> Plan<'a> {
     }
 }
 
+impl SystemConfig {
+    /// Returns each input edge the type sees, with the output definition
+    /// behind it.
+    ///
+    /// `producer` looks up that definition. It returns `None` when the producer
+    /// is not resolved yet, which leaves the edge out. That is only allowed for
+    /// the `declared` inputs, whose definition does not depend on the producer.
+    pub(crate) fn edges(
+        &self,
+        declared: &[PortDef],
+        producer: impl Fn(&str, &PortRef) -> Result<Option<PortDef>, BuildError>,
+    ) -> Result<Vec<(&str, PortDef)>, BuildError> {
+        let adapter = self.adapter.as_ref();
+        let mut edges = Vec::new();
+        for input in &self.inputs {
+            if adapter.is_some_and(|a| a.reserves_input(&input.port)) {
+                return Err(BuildError::reserved_channel_port(&self.id, &input.port));
+            }
+            if adapter.is_some_and(|a| a.reads_input(&input.port)) {
+                continue;
+            }
+            for from in &input.from {
+                match producer(&input.port, from)? {
+                    Some(def) => edges.push((input.port.as_str(), def)),
+                    None if declared.iter().any(|p| p.name == input.port) => {}
+                    None => {
+                        return Err(BuildError::DynamicFromLater {
+                            system: self.id.clone(),
+                            port: input.port.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(edges)
+    }
+}
+
 impl Adapter {
     /// Whether a system behind the adapter may not take input `port`.
     fn reserves_input(&self, port: &str) -> bool {
@@ -468,12 +506,9 @@ impl SystemDef {
     }
 
     /// Computes the definition that `entry`'s type produces for `system`, with
-    /// the coordinator's `status` output last.
+    /// the adapter's ports and then the coordinator's `status` output last.
     ///
-    /// `producer` looks up the output definition behind each input edge. It
-    /// returns `None` when that producer is not resolved yet. That is only
-    /// allowed for input ports the type declares statically, because their
-    /// definition does not depend on the producer.
+    /// `producer` is as for [`SystemConfig::edges`].
     pub(crate) fn instance(
         system: &SystemConfig,
         entry: &TableEntry,
@@ -482,27 +517,7 @@ impl SystemDef {
         producer: impl Fn(&str, &PortRef) -> Result<Option<PortDef>, BuildError>,
     ) -> Result<Self, BuildError> {
         let adapter = system.adapter.as_ref();
-        let mut edges: Vec<(&str, PortDef)> = Vec::new();
-        for input in &system.inputs {
-            if adapter.is_some_and(|a| a.reserves_input(&input.port)) {
-                return Err(BuildError::reserved_channel_port(&system.id, &input.port));
-            }
-            if adapter.is_some_and(|a| a.reads_input(&input.port)) {
-                continue;
-            }
-            for from in &input.from {
-                match producer(&input.port, from)? {
-                    Some(def) => edges.push((input.port.as_str(), def)),
-                    None if entry.def.inputs.iter().any(|p| p.name == input.port) => {}
-                    None => {
-                        return Err(BuildError::DynamicFromLater {
-                            system: system.id.clone(),
-                            port: input.port.clone(),
-                        });
-                    }
-                }
-            }
-        }
+        let edges = system.edges(&entry.def.inputs, producer)?;
         let inputs: Vec<(&str, &PortDef)> = edges.iter().map(|(port, def)| (*port, def)).collect();
         let cx = DefCx {
             id: &system.id,

@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use super::{DeploySource, DeploySystem, DeploymentConfig, PeerPort};
-use crate::coordinator::{OutputSource, PortRef, SystemConfig, SystemStatus, SystemTable};
-use crate::def::{DefCx, Records};
+use crate::coordinator::{OutputSource, PortRef, SystemConfig, SystemTable, TableEntry};
+use crate::def::Records;
 use crate::system::{PortDef, SystemDef};
 
 use super::error::DeployError;
@@ -164,18 +164,9 @@ impl<'a> DefIndex<'a> {
 
     fn compute(&mut self, index: SystemIndex) -> Result<SystemDef, DeployError> {
         let target = &self.envelope.targets[index.target];
-        let system = index.get(self.envelope);
-        let entry = self.tables[index.target].get(&system.ty).ok_or_else(|| {
-            self.build_error(
-                index,
-                crate::BuildError::UnknownType {
-                    id: system.id.clone(),
-                    ty: system.ty.clone(),
-                },
-            )
-        })?;
+        let entry = self.entry(index)?;
         let system = self.runtime(index)?;
-        let producers = self.producers(index, &system, &entry.def)?;
+        let producers = self.producers(index, &system, &entry.def.inputs)?;
         SystemDef::instance(
             &system,
             entry,
@@ -191,23 +182,33 @@ impl<'a> DefIndex<'a> {
         &self.records[target]
     }
 
-    /// Returns every edge into the system at `index`, with the definition of the
-    /// output that feeds it. A channel's `commands` input is skipped.
+    /// Returns every edge the type of the system at `index` sees, with the
+    /// definition of the output that feeds it.
     pub(crate) fn edges(
         &mut self,
         index: SystemIndex,
     ) -> Result<Vec<(String, PortDef)>, DeployError> {
+        let system = self.runtime(index)?;
+        let producers = self.producers(index, &system, &[])?;
+        let edges = system
+            .edges(&[], |_, from| Ok(producers.get(from).cloned().flatten()))
+            .map_err(|source| self.build_error(index, source))?;
+        let owned = edges.into_iter().map(|(port, def)| (port.to_string(), def));
+        Ok(owned.collect())
+    }
+
+    /// Returns the table entry for the type of the system at `index`.
+    fn entry(&self, index: SystemIndex) -> Result<&'a TableEntry, DeployError> {
         let system = index.get(self.envelope);
-        let mut edges = Vec::new();
-        for input in &system.inputs {
-            if input.port == crate::channel::COMMANDS_PORT {
-                continue;
-            }
-            for from in &input.from {
-                edges.push((input.port.clone(), self.output(index, from)?));
-            }
-        }
-        Ok(edges)
+        self.tables[index.target].get(&system.ty).ok_or_else(|| {
+            self.build_error(
+                index,
+                crate::BuildError::UnknownType {
+                    id: system.id.clone(),
+                    ty: system.ty.clone(),
+                },
+            )
+        })
     }
 
     /// Returns the runtime form of the system at `index`, with every peer
@@ -222,19 +223,19 @@ impl<'a> DefIndex<'a> {
 
     /// Returns the definition feeding each input edge.
     ///
-    /// Only ports the system type does not declare need their producer's
-    /// definition. Skipping declared ports keeps a `loop()` edge from being
-    /// reported as a cycle.
+    /// Only ports outside `declared` need their producer's definition.
+    /// Skipping declared ports keeps a `loop()` edge from being reported as a
+    /// cycle.
     fn producers(
         &mut self,
         index: SystemIndex,
         system: &SystemConfig,
-        declared: &SystemDef,
+        declared: &[PortDef],
     ) -> Result<HashMap<PortRef, Option<PortDef>>, DeployError> {
         let mut producers = HashMap::new();
         for input in &system.inputs {
             for from in &input.from {
-                let def = if declared.inputs.iter().any(|p| p.name == input.port) {
+                let def = if declared.iter().any(|p| p.name == input.port) {
                     None
                 } else {
                     Some(self.output(index, from)?)
@@ -264,14 +265,6 @@ impl<'a> DefIndex<'a> {
                 },
             ));
         };
-        if from.port == "status" {
-            let cx = DefCx {
-                id: &from.system,
-                namespace: target.coordinator.namespace.as_deref(),
-                ..DefCx::empty()
-            };
-            return Ok(SystemStatus::port_def(&cx));
-        }
         let def = self.def(SystemIndex::new(index.target, system_index))?;
         def.outputs
             .iter()

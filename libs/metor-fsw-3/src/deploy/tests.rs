@@ -138,6 +138,37 @@ fn test_peer_output_takes_producer_def() {
     assert_eq!((log.name.as_ref(), log.record.as_ref()), ("log", "log"));
 }
 
+/// A peer output of a `status` edge takes the producer's status port.
+#[test]
+fn test_peer_output_of_a_status_edge() {
+    let mut envelope = envelope();
+    let status = InputConfig::new("imu.status", "imu", "status");
+    envelope.targets[0].coordinator.systems[2]
+        .inputs
+        .push(status);
+    envelope.targets[1].coordinator.systems[0]
+        .outputs
+        .push(OutputConfig {
+            port: "imu.status".into(),
+            source: DeploySource::Peer(peer_port("a", "pub", "imu.status")),
+        });
+    resolve(&mut envelope, &tables(2)).expect("resolves");
+    let mirror = &envelope.targets[1].coordinator.systems[0];
+    let DeploySource::Runtime(OutputSource::Def(status)) = &mirror.outputs[2].source else {
+        panic!("resolved to a def")
+    };
+    let cx = crate::def::DefCx {
+        id: "imu",
+        namespace: Some("a"),
+        ..crate::def::DefCx::empty()
+    };
+    let expected = crate::PortDef {
+        name: "imu.status".into(),
+        ..crate::SystemStatus::port_def(&cx)
+    };
+    assert_eq!(status, &expected);
+}
+
 #[test]
 fn test_peer_transport_takes_host_address() {
     let envelope = resolved();
