@@ -1,4 +1,4 @@
-//! The [`Record`] trait: a value that can travel through a ring.
+//! The [`Payload`] and [`Record`] traits, for values that travel through a ring.
 //!
 //! A record is either a frame, stored as its raw bytes, or a message, stored
 //! in an encoding such as postcard or JSON.
@@ -14,25 +14,25 @@ use thiserror::Error;
 
 use crate::frame::Frame;
 
-/// A value that systems pass to each other through a ring.
+/// A value that is encoded into a ring and decoded from it.
 ///
-/// Each record type has a unique name and ID, and knows how to convert itself
-/// to and from bytes.
-pub trait Record {
-    const NAME: &'static str;
-    const ID: ComponentId = ComponentId::new(Self::NAME);
-    /// The largest encoded size of this record, in bytes.
-    const MAX_LEN: usize;
-    /// The alignment a record's bytes need in the ring.
+/// A [`Record`] is a payload with a name and a schema.
+pub trait Payload {
+    /// The alignment a payload's bytes need in the ring.
     ///
     /// An encoded message decodes from any address. A frame is borrowed in
     /// place, so `#[derive(Frame)]` sets this to the frame's own alignment.
     const ALIGN: usize = 1;
-    /// How many records a producer expects to write per cycle.
+
+    /// The type a read returns.
     ///
-    /// A ring holds `DEPTH * ring_depth` records.
-    const DEPTH: usize = 1;
-    /// Returns the record's timestamp, if it has one.
+    /// A frame is borrowed straight from the ring. Other payloads are decoded
+    /// into an owned value.
+    type Read<'a>: Borrow<Self>
+    where
+        Self: 'a;
+
+    /// Returns the payload's timestamp, if it has one.
     fn timestamp(&self) -> Option<Timestamp> {
         None
     }
@@ -42,16 +42,23 @@ pub trait Record {
     /// Returns the encoded bytes, which may borrow from `buf` or from `self`.
     fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError>;
 
-    /// The type a read returns.
-    ///
-    /// A frame is borrowed straight from the ring. Other records are decoded
-    /// into an owned value.
-    type Read<'a>: Borrow<Self>
-    where
-        Self: 'a;
-
-    /// Decodes one record from `bytes`.
+    /// Decodes one payload from `bytes`.
     fn decode(bytes: &[u8]) -> Result<Self::Read<'_>, DecodeError>;
+}
+
+/// A value that systems pass to each other through a ring.
+///
+/// Each record type has a unique name and ID, and announces a schema to the
+/// ground.
+pub trait Record: Payload {
+    const NAME: &'static str;
+    const ID: ComponentId = ComponentId::new(Self::NAME);
+    /// The largest encoded size of this record, in bytes.
+    const MAX_LEN: usize;
+    /// How many records a producer expects to write per cycle.
+    ///
+    /// A ring holds `DEPTH * ring_depth` records.
+    const DEPTH: usize = 1;
 
     /// Returns the schema a port rooted at `root` announces.
     ///
@@ -300,15 +307,13 @@ pub mod json {
     }
 }
 
-/// The record type of a dynamic port: raw bytes, passed through undecoded.
+/// The payload of a dynamic port: raw bytes, passed through undecoded.
 ///
-/// It is never announced. A dynamic port announces the schema of whatever
-/// record the config connects to it.
+/// A dynamic port announces the schema of whatever record the config connects
+/// to it.
 pub type Bytes = [u8];
 
-impl Record for Bytes {
-    const NAME: &'static str = "bytes";
-    const MAX_LEN: usize = 0;
+impl Payload for Bytes {
     type Read<'a> = &'a [u8];
 
     fn encode<'a>(&'a self, _buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
@@ -317,14 +322,6 @@ impl Record for Bytes {
 
     fn decode(bytes: &[u8]) -> Result<&[u8], DecodeError> {
         Ok(bytes)
-    }
-
-    fn schema_with_root(_root: &str) -> RecordSchema {
-        RecordSchema::Msg {
-            id: [0, 0],
-            name: Self::NAME.to_string(),
-            codec: MsgCodec::Bytes,
-        }
     }
 }
 
@@ -344,9 +341,7 @@ mod tests {
         text: String,
     }
 
-    impl Record for NoteJson {
-        const NAME: &'static str = "note_json";
-        const MAX_LEN: usize = 64;
+    impl Payload for NoteJson {
         type Read<'a> = Self;
 
         fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
@@ -356,6 +351,11 @@ mod tests {
         fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
             json::decode(bytes)
         }
+    }
+
+    impl Record for NoteJson {
+        const NAME: &'static str = "note_json";
+        const MAX_LEN: usize = 64;
 
         fn schema_with_root(_root: &str) -> RecordSchema {
             RecordSchema::msg(Self::NAME, MsgCodec::Json)
@@ -393,6 +393,14 @@ mod tests {
     #[test]
     fn test_message_schema_ignores_root() {
         assert_eq!(Note::schema_with_root("cube_sat.note"), Note::schema());
+    }
+
+    #[test]
+    fn test_bytes_pass_through() {
+        let bytes: &Bytes = b"raw";
+        assert_eq!(bytes.encode(&mut []), Ok(b"raw".as_slice()));
+        assert_eq!(<Bytes as Payload>::decode(b""), Ok(b"".as_slice()));
+        assert_eq!(bytes.timestamp(), None);
     }
 
     #[test]

@@ -81,18 +81,21 @@ pub fn record(input: TokenStream) -> TokenStream {
     let ident = &raw.ident;
     let (impl_generics, ty_generics, where_clause) = raw.generics.split_for_impl();
     quote! {
-        impl #impl_generics #fsw::Record for #ident #ty_generics #where_clause {
-            const NAME: &'static str = #name;
-            const MAX_LEN: usize = #max_len;
-            #depth
-            #timestamp
+        impl #impl_generics #fsw::Payload for #ident #ty_generics #where_clause {
             type Read<'a> = Self where Self: 'a;
+            #timestamp
             fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], #fsw::EncodeError> {
                 #fsw::record::postcard::encode(self, buf)
             }
             fn decode(bytes: &[u8]) -> Result<Self, #fsw::DecodeError> {
                 #fsw::record::postcard::decode(bytes)
             }
+        }
+
+        impl #impl_generics #fsw::Record for #ident #ty_generics #where_clause {
+            const NAME: &'static str = #name;
+            const MAX_LEN: usize = #max_len;
+            #depth
             fn schema_with_root(_root: &str) -> #fsw::record::RecordSchema {
                 #fsw::record::RecordSchema::postcard::<Self>(#name)
             }

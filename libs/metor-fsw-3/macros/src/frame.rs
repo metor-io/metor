@@ -23,7 +23,8 @@ struct FrameInput {
 
 /// Expands `#[derive(Frame)]`.
 ///
-/// The output implements the four component traits, `Record`, and `Frame`.
+/// The output implements the four component traits, `Payload`, `Record`, and
+/// `Frame`.
 pub fn frame(input: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(input as DeriveInput);
     let raw = match FrameInput::from_derive_input(&parsed) {
@@ -84,21 +85,24 @@ pub fn frame(input: TokenStream) -> TokenStream {
         #componentize
         #decomponentize
 
-        impl #impl_generics #fsw::Record for #ident #ty_generics #where_clause {
-            const NAME: &'static str = #frame_name;
-            const MAX_LEN: usize = ::core::mem::size_of::<Self>();
+        impl #impl_generics #fsw::Payload for #ident #ty_generics #where_clause {
             const ALIGN: usize = ::core::mem::align_of::<Self>();
-            #depth
             type Read<'a> = &'a Self where Self: 'a;
+            fn timestamp(&self) -> Option<#proto::types::Timestamp> {
+                Some(#timestamp_body)
+            }
             fn encode<'a>(&'a self, _buf: &'a mut [u8]) -> Result<&'a [u8], #fsw::EncodeError> {
                 Ok(#fsw::zerocopy::IntoBytes::as_bytes(self))
             }
             fn decode(bytes: &[u8]) -> Result<&Self, #fsw::DecodeError> {
                 #fsw::record::fixed::decode(bytes)
             }
-            fn timestamp(&self) -> Option<#proto::types::Timestamp> {
-                Some(#timestamp_body)
-            }
+        }
+
+        impl #impl_generics #fsw::Record for #ident #ty_generics #where_clause {
+            const NAME: &'static str = #frame_name;
+            const MAX_LEN: usize = ::core::mem::size_of::<Self>();
+            #depth
             fn schema_with_root(root: &str) -> #fsw::record::RecordSchema {
                 #fsw::record::RecordSchema::frame::<Self>(root)
             }

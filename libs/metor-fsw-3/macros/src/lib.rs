@@ -11,7 +11,8 @@ mod record;
 
 /// Derives `Frame` for a struct sent as its raw bytes.
 ///
-/// The derive also implements `Record` and the four metor component traits.
+/// The derive also implements `Payload`, `Record`, and the four metor component
+/// traits.
 /// Mark one field `#[frame(timestamp)]`.
 /// `#[frame(name = "..")]` sets the record name, which defaults to the struct
 /// name in snake_case. `#[frame(depth = N)]` sets `Record::DEPTH`.
@@ -20,7 +21,7 @@ pub fn frame_derive(input: TokenStream) -> TokenStream {
     frame::frame(input)
 }
 
-/// Derives `Record` for a type encoded with postcard.
+/// Derives `Payload` and `Record` for a type encoded with postcard.
 ///
 /// `#[record(name = "..")]` sets the record name, which defaults to the type
 /// name in snake_case. `max_len` sets the largest encoded size, which defaults

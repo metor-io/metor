@@ -28,7 +28,7 @@ mod tests;
 
 pub use frame::Frame;
 pub use metor_fsw_3_macros::{Frame, Record};
-pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Record, RecordSchema};
+pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Payload, Record, RecordSchema};
 
 pub use metor_proto::types::Timestamp;
 
