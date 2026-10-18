@@ -1679,15 +1679,13 @@ mod tests {
         }
 
         #[test]
-        fn test_io_on_a_channel_is_refused() {
+        fn test_io_on_a_channel_builds() {
             let mut config = config(nominal(), "a", "b");
             config.systems[3].adapter = Some(Adapter::Channel(ChannelConfig {
                 name: crate::ChannelName::try_from("io".to_string()).expect("a short name"),
                 start: Default::default(),
             }));
-            let e = error(config);
-            let refused = |e: &BuildError| matches!(e, BuildError::UnsupportedAdapter { id, .. } if id == "io_complete");
-            assert!(refused(&e), "{e}");
+            config.build(&table()).unwrap();
         }
 
         #[test]

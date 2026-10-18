@@ -170,11 +170,11 @@ impl Default for Adapters {
 
 #[cfg(feature = "host")]
 impl Adapters {
-    /// Running behind no adapter only.
-    pub const BARE: Self = Self {
+    /// Running behind no adapter or a channel, but never on a thread.
+    pub const OFF_THREAD: Self = Self {
         bare: true,
         thread: false,
-        channel: false,
+        channel: true,
     };
 
     /// Whether the type runs behind `adapter`, or behind none for `None`.

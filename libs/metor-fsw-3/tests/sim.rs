@@ -48,14 +48,13 @@ fn ticks(#[state] n: &mut Rc<RefCell<u32>>) {
     *n.borrow_mut() += 1;
 }
 
-/// Sends the commands the test queues.
+type Queue = Rc<RefCell<Vec<(&'static str, SequenceCommandKind)>>>;
+
+/// Sends the commands the test queues, each to its channel.
 #[system]
-fn cmds(
-    #[state] queue: &mut Rc<RefCell<Vec<SequenceCommandKind>>>,
-    commands: &mut Output<SequenceCommand>,
-) {
-    for command in queue.borrow_mut().drain(..) {
-        let channel = "gps".into();
+fn cmds(#[state] queue: &mut Queue, commands: &mut Output<SequenceCommand>) {
+    for (channel, command) in queue.borrow_mut().drain(..) {
+        let channel = channel.into();
         let _ = commands.write(&SequenceCommand { channel, command });
     }
 }
@@ -74,7 +73,7 @@ struct Seen {
     statuses: Log<ResourceStatus>,
     states: Log<u32>,
     ticks: Rc<RefCell<u32>>,
-    queue: Rc<RefCell<Vec<SequenceCommandKind>>>,
+    queue: Queue,
 }
 
 fn table(seen: &Seen) -> SystemTable {
@@ -185,9 +184,10 @@ fn reset_cancels_a_read_parked_on_the_wire() {
     });
     let seen = Seen::default();
     let mut c = run(&seen, config, 3);
-    seen.queue
-        .borrow_mut()
-        .extend([SequenceCommandKind::Stop, SequenceCommandKind::Reset]);
+    seen.queue.borrow_mut().extend([
+        ("gps", SequenceCommandKind::Stop),
+        ("gps", SequenceCommandKind::Reset),
+    ]);
     steps(&mut c, 4, 10);
     let states = seen.states.borrow();
     let quiescing = ChannelState::Quiescing as u32;
@@ -204,6 +204,54 @@ fn reset_cancels_a_read_parked_on_the_wire() {
         c.systems()
             .all(|(_, end)| end != Some(&EndReason::Panicked))
     );
+}
+
+/// `io_complete` behind a channel: a reset remakes it, and the driver keeps
+/// getting fixes through the dispatch the coordinator kept.
+#[test]
+fn reset_io_behind_a_channel_keeps_the_driver_going() {
+    let mut config = probed(golden());
+    let script = &mut config.systems[2].params["script"];
+    let line = script[0].clone();
+    *script = serde_json::Value::Array(vec![line; 20]);
+    let io = &mut config.systems[3];
+    assert_eq!(io.id, "io_complete");
+    io.adapter = Some(Adapter::Channel(ChannelConfig {
+        name: metor_fsw_3::ChannelName::try_from("io".to_string()).expect("a short name"),
+        start: RunState::Running,
+    }));
+    io.inputs
+        .push(InputConfig::new("commands", "cmds", "commands"));
+    config.systems.insert(0, SystemConfig::new("cmds", "cmds"));
+    config.systems.push(SystemConfig {
+        inputs: vec![InputConfig::new("st", "io_complete", "channel_status")],
+        ..SystemConfig::new("states", "states")
+    });
+    let seen = Seen::default();
+    let mut c = run(&seen, config, 5);
+    let before = seen.fixes.borrow().len();
+    assert!(before > 0, "fixes before the reset");
+    seen.queue.borrow_mut().extend([
+        ("io", SequenceCommandKind::Stop),
+        ("io", SequenceCommandKind::Reset),
+    ]);
+    steps(&mut c, 6, 9);
+    let stopped = ChannelState::Stopped as u32;
+    assert!(
+        seen.states
+            .borrow()
+            .iter()
+            .any(|(t, s)| *t == 6 && *s == stopped),
+        "the reset leaves it stopped: {:?}",
+        seen.states.borrow()
+    );
+    seen.queue
+        .borrow_mut()
+        .push(("io", SequenceCommandKind::Start));
+    steps(&mut c, 9, 20);
+    let fixes = seen.fixes.borrow();
+    assert!(fixes.iter().any(|(t, _)| *t > 10), "fixes after: {fixes:?}");
+    assert!(c.systems().all(|(_, end)| end.is_none()));
 }
 
 #[test]
