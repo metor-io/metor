@@ -194,7 +194,8 @@ class Db(Sink, _generated.Db):
         """Returns the message record names that subscribers of this db take."""
         names: set[str] = set()
         for target in _targets:
-            for _, system, _ in target._systems:
+            for entry in target._systems:
+                system = entry.system
                 if not isinstance(system, Subscribe) or system._peer is None:
                     continue
                 if system._peer._system is not self:
