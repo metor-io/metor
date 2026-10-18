@@ -131,18 +131,6 @@ class TcpListen(Kind):
         return {"addr": self.addr}
 
 
-@dataclass(frozen=True)
-class TcpConnect(Kind):
-    """A TCP address to dial. Each `connect` makes a new stream."""
-
-    addr: str
-    interface = "dial"
-    _key = "tcp_connect"
-
-    def _fields(self) -> dict[str, Any]:
-        return {"addr": self.addr}
-
-
 class SimKind(Kind):
     """A simulated resource: a wire with two ends. Drivers hold its host end
     and models its `device` end, each through a `Cap`. The target names both
