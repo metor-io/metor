@@ -13,7 +13,7 @@ use metor_proto_wkt::{
 };
 
 use crate::coordinator::{
-    Adapter, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, Stepped, catch_step,
+    Adapter, EndReason, MakeCx, MakeFn, ParamError, Params, RunState, Step, catch_execute,
 };
 use crate::def::{DefCx, Records};
 use crate::io::SharedIo;
@@ -22,7 +22,7 @@ use crate::record::Record;
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
 
-use super::apply::{Command, State, apply};
+use super::apply::{Command, Phase, State, apply};
 use super::{
     ABORT_PORT, AbortRequest, COMMANDS_PORT, ChannelState, ChannelStatus, EVENTS_PORT, STATUS_PORT,
 };
@@ -102,12 +102,12 @@ pub(crate) fn make_channel(
         commands: command_input(commands),
         core: Core {
             name: channel.name.to_string(),
-            run: channel.start,
-            inner: Some(inner),
-            end_reason: None,
+            phase: ChannelPhase::Live {
+                inner,
+                run: channel.start,
+            },
             reported_end_reason: None,
             loaded: None,
-            deferred: None,
             recipe,
             threads,
             abort,
@@ -201,17 +201,11 @@ pub struct Channel {
 
 struct Core {
     name: String,
-    run: RunState,
-    inner: Option<Box<dyn Step>>,
-    /// An end the adapter set itself: a failed make, or a step that
-    /// panicked.
-    end_reason: Option<EndReason>,
+    phase: ChannelPhase,
     /// The end last reported on `events`.
     reported_end_reason: Option<EndReason>,
     /// The last name a `Load` accepted. A reset loads it again.
     loaded: Option<String>,
-    /// A reset or load waiting for the system's ops in flight to finish.
-    deferred: Option<Deferred>,
     recipe: SystemRecipe,
     threads: Threads,
     abort: Option<Output<AbortRequest>>,
@@ -219,10 +213,25 @@ struct Core {
     status: Output<ChannelStatus>,
 }
 
-/// What a quiescing channel does once its system has nothing in flight.
-enum Deferred {
-    Restart,
-    Load(String),
+/// Where a channel's system is.
+enum ChannelPhase {
+    /// Made, and stepped while `run` is `Running` and it has not ended.
+    Live { inner: Box<dyn Step>, run: RunState },
+    /// Gone: its make or load failed, or it panicked.
+    Gone(EndReason),
+    /// Dropped, and made again once its ops in flight finish.
+    Restarting,
+    /// Loading `name` once its ops in flight finish.
+    Loading { inner: Box<dyn Step>, name: String },
+}
+
+impl ChannelPhase {
+    fn inner(&self) -> Option<&dyn Step> {
+        match self {
+            Self::Live { inner, .. } | Self::Loading { inner, .. } => Some(inner.as_ref()),
+            Self::Gone(_) | Self::Restarting => None,
+        }
+    }
 }
 
 impl Step for Channel {
@@ -248,27 +257,40 @@ impl Core {
     }
 
     fn state(&self) -> State {
+        let phase = match &self.phase {
+            ChannelPhase::Restarting | ChannelPhase::Loading { .. } => Phase::Quiescing,
+            _ if self.ended().is_some() => Phase::Ended,
+            ChannelPhase::Live {
+                run: RunState::Running,
+                ..
+            } => Phase::Running,
+            _ => Phase::Stopped,
+        };
         State {
-            run: self.run,
-            ended: self.ended().is_some(),
+            phase,
             abortable: self.abort.is_some(),
-            quiescing: self.deferred.is_some(),
         }
     }
 
     fn transition(&mut self, kind: SequenceCommandKind) -> SequenceEventKind {
         match kind {
             SequenceCommandKind::Start => {
-                self.run = RunState::Running;
+                self.set_run(RunState::Running);
                 SequenceEventKind::Started
             }
             SequenceCommandKind::Stop => {
-                self.run = RunState::Stopped;
+                self.set_run(RunState::Stopped);
                 SequenceEventKind::Stopped
             }
             SequenceCommandKind::Abort => self.abort(),
             SequenceCommandKind::Reset => self.reset(),
             SequenceCommandKind::Load { name } => self.defer_load(name),
+        }
+    }
+
+    fn set_run(&mut self, state: RunState) {
+        if let ChannelPhase::Live { run, .. } = &mut self.phase {
+            *run = state;
         }
     }
 
@@ -288,14 +310,11 @@ impl Core {
     /// Resets the system. An IO system is dropped now and made again once its
     /// ops in flight finish.
     fn reset(&mut self) -> SequenceEventKind {
-        self.run = RunState::Stopped;
         if !self.has_io() {
             return self.restart_event();
         }
-        self.inner = None;
-        self.end_reason = None;
+        self.phase = ChannelPhase::Restarting;
         self.recipe.io.borrow_mut().quiesce_system(&self.recipe.id);
-        self.deferred = Some(Deferred::Restart);
         SequenceEventKind::quiescing()
     }
 
@@ -308,34 +327,51 @@ impl Core {
         }
     }
 
-    /// Loads the last loaded name again.
+    /// Loads the last loaded name again, stopped.
     ///
     /// If the system is gone or has nothing loaded, builds it again first.
     fn restart(&mut self) -> Result<(), String> {
-        if self.inner.is_none() || self.loaded.is_none() {
-            self.remake()?;
-        }
-        match (self.inner.as_mut(), &self.loaded) {
-            (Some(inner), Some(name)) => crate::panic::catch(|| inner.load(name))
+        let phase = core::mem::replace(&mut self.phase, ChannelPhase::Restarting);
+        let kept = match (phase, &self.loaded) {
+            (ChannelPhase::Live { inner, .. }, Some(_)) => Some(inner),
+            _ => None,
+        };
+        let mut inner = match kept {
+            Some(inner) => inner,
+            None => self.remake()?,
+        };
+        if let Some(name) = &self.loaded {
+            crate::panic::catch(|| inner.load(name))
                 .ok_or_else(|| "the load panicked".to_string())?
-                .map_err(|e| e.to_string()),
-            _ => Ok(()),
+                .map_err(|e| e.to_string())?;
         }
+        self.phase = ChannelPhase::Live {
+            inner,
+            run: RunState::Stopped,
+        };
+        Ok(())
     }
 
     /// Loads `name`. On an IO system whose step loads occupants, the load
     /// waits for its ops in flight. Any other step loads, or refuses, at once.
     fn defer_load(&mut self, name: String) -> SequenceEventKind {
         let loads = self
-            .inner
-            .as_ref()
+            .phase
+            .inner()
             .is_some_and(|inner| inner.occupant().is_some());
-        if !loads || !self.has_io() {
-            return self.load(name);
+        let defer = loads && self.has_io();
+        match core::mem::replace(&mut self.phase, ChannelPhase::Restarting) {
+            ChannelPhase::Live { inner, .. } if defer => {
+                self.phase = ChannelPhase::Loading { inner, name };
+                self.recipe.io.borrow_mut().quiesce_system(&self.recipe.id);
+                SequenceEventKind::quiescing()
+            }
+            ChannelPhase::Live { inner, run } => self.load(inner, run, name),
+            phase => {
+                self.phase = phase;
+                SequenceEventKind::refused("the system is gone; reset it first".into())
+            }
         }
-        self.recipe.io.borrow_mut().quiesce_system(&self.recipe.id);
-        self.deferred = Some(Deferred::Load(name));
-        SequenceEventKind::quiescing()
     }
 
     /// Whether the system does IO.
@@ -350,41 +386,46 @@ impl Core {
             return;
         }
         self.recipe.io.borrow_mut().end_quiescing_system(id);
-        let event = match self.deferred.take() {
-            Some(Deferred::Restart) => self.restart_event(),
-            Some(Deferred::Load(name)) => self.load(name),
-            None => return,
+        let event = match core::mem::replace(&mut self.phase, ChannelPhase::Restarting) {
+            ChannelPhase::Restarting => self.restart_event(),
+            ChannelPhase::Loading { inner, name } => self.load(inner, RunState::Stopped, name),
+            phase => {
+                self.phase = phase;
+                return;
+            }
         };
         self.emit(event);
     }
 
-    fn load(&mut self, name: String) -> SequenceEventKind {
-        let Some(inner) = self.inner.as_mut() else {
-            return SequenceEventKind::refused("the system is gone; reset it first".into());
-        };
+    /// Loads `name` into `inner`, which was in `run`. A refused load leaves
+    /// `inner` as it was.
+    fn load(&mut self, mut inner: Box<dyn Step>, run: RunState, name: String) -> SequenceEventKind {
         match crate::panic::catch(|| inner.load(&name)) {
             Some(Ok(())) => {
-                self.run = RunState::Stopped;
-                self.end_reason = None;
+                self.phase = ChannelPhase::Live {
+                    inner,
+                    run: RunState::Stopped,
+                };
                 self.loaded = Some(name.clone());
                 SequenceEventKind::Loaded { name }
             }
-            Some(Err(error)) => SequenceEventKind::refused(error.to_string()),
+            Some(Err(error)) => {
+                self.phase = ChannelPhase::Live { inner, run };
+                SequenceEventKind::refused(error.to_string())
+            }
             None => {
-                self.inner = None;
+                crate::panic::catch(|| drop(inner));
                 self.fail("the load panicked".into())
             }
         }
     }
 
-    /// Drops the system, then builds it again over the same rings.
-    fn remake(&mut self) -> Result<(), String> {
-        self.inner = None;
-        self.end_reason = None;
+    /// Builds the system again over the same rings. The old one must already
+    /// be dropped.
+    fn remake(&mut self) -> Result<Box<dyn Step>, String> {
         let made = crate::panic::catch(|| self.recipe.make(&mut self.threads))
             .ok_or_else(|| "the system's constructor panicked".to_string())?;
-        self.inner = Some(made.map_err(|e| e.to_string())?);
-        Ok(())
+        made.map_err(|e| e.to_string())
     }
 
     /// Ends the channel as failed and returns the `Failed` event.
@@ -393,8 +434,9 @@ impl Core {
     /// report it again.
     fn fail(&mut self, reason: String) -> SequenceEventKind {
         let reason = clipped(reason);
-        self.end_reason = Some(EndReason::Failed(reason.clone().into()));
-        self.reported_end_reason = self.end_reason.clone();
+        let end = EndReason::Failed(reason.clone().into());
+        self.reported_end_reason = Some(end.clone());
+        self.phase = ChannelPhase::Gone(end);
         SequenceEventKind::Failed { reason }
     }
 
@@ -405,22 +447,30 @@ impl Core {
     }
 
     fn step(&mut self, now: Timestamp) {
-        if self.deferred.is_some() {
+        if matches!(
+            self.phase,
+            ChannelPhase::Restarting | ChannelPhase::Loading { .. }
+        ) {
             self.settle();
-        } else if self.run == RunState::Running
-            && self.end_reason.is_none()
-            && catch_step(&mut self.inner, now) == Stepped::Unwound
+        } else if let ChannelPhase::Live {
+            inner,
+            run: RunState::Running,
+        } = &mut self.phase
+            && catch_execute(inner.as_mut(), now)
         {
-            self.end_reason = Some(EndReason::Panicked);
+            let panicked = ChannelPhase::Gone(EndReason::Panicked);
+            let phase = core::mem::replace(&mut self.phase, panicked);
+            crate::panic::catch(|| drop(phase));
         }
         self.report_end();
         self.write_status(now);
     }
 
     fn ended(&self) -> Option<&EndReason> {
-        self.end_reason
-            .as_ref()
-            .or_else(|| self.inner.as_ref().and_then(|inner| inner.ended()))
+        match &self.phase {
+            ChannelPhase::Gone(end) => Some(end),
+            phase => phase.inner().and_then(|inner| inner.ended()),
+        }
     }
 
     /// Reports how the system ended, once per change.
@@ -439,7 +489,7 @@ impl Core {
     }
 
     fn write_status(&mut self, now: Timestamp) {
-        let occupant = self.inner.as_ref().and_then(|inner| inner.occupant());
+        let occupant = self.phase.inner().and_then(|inner| inner.occupant());
         let status = ChannelStatus {
             timestamp: now,
             state: self.channel_state().code(),
@@ -451,13 +501,14 @@ impl Core {
     }
 
     fn channel_state(&self) -> ChannelState {
-        match self.deferred {
-            Some(_) => ChannelState::Quiescing,
-            None => ChannelState::of(self.run, self.ended()),
+        match &self.phase {
+            ChannelPhase::Restarting | ChannelPhase::Loading { .. } => ChannelState::Quiescing,
+            ChannelPhase::Live { run, .. } => ChannelState::of(*run, self.ended()),
+            ChannelPhase::Gone(end) => ChannelState::of(RunState::Stopped, Some(end)),
         }
     }
 
-    fn emit(&self, kind: SequenceEventKind) {
+    fn emit(&mut self, kind: SequenceEventKind) {
         let event = SequenceChannelEvent {
             channel: self.name.clone(),
             kind,

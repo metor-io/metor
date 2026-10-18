@@ -247,8 +247,8 @@ impl<'a> Cycle<'a> {
         // change. Through the result, a condition can only be linked if it
         // outlives `'a`, which ends no later than the body (see `with_seq`).
         // The step checks redlines only while it holds that body: `advance`
-        // walks them behind `run.as_mut()`, and `run` is `None` from the
-        // moment the body is dropped, in both `execute` and `fault`. `Seq`'s
+        // walks them only for `Body::Running`, and the body is `Body::Ended`
+        // from the moment it is dropped, in both `execute` and `fault`. `Seq`'s
         // `Drop` clears the back-pointers of nodes that are still linked,
         // without calling any condition.
         unsafe { &*core::ptr::from_ref(seq).cast::<Seq<'a>>() }

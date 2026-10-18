@@ -420,13 +420,16 @@ impl Dispatch {
 
     /// Whether member `m` has nothing left in flight since `begin`.
     pub(crate) fn member_idle(&self, m: usize) -> bool {
-        let member = &self.members[m];
         let ops = &self.ops[m * MAX_OPS..(m + 1) * MAX_OPS];
-        !member.quiescing || (member.drained && ops.iter().all(|e| !e.live))
+        match self.members[m].state {
+            MemberState::Running => true,
+            MemberState::Quiescing => false,
+            MemberState::Drained => ops.iter().all(Option::is_none),
+        }
     }
 
     pub(crate) fn end_quiescing_member(&mut self, m: usize) {
-        self.members[m].quiescing = false;
+        self.members[m].state = MemberState::Running;
     }
 
     /// The routes queued since the last call.

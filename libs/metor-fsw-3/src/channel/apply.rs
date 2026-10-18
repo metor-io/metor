@@ -2,17 +2,22 @@
 
 use metor_proto_wkt::SequenceCommandKind;
 
-use crate::coordinator::RunState;
+/// Where a channel is, as [`apply`] sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Running,
+    Stopped,
+    Ended,
+    /// A reset or load waits for the system's ops in flight.
+    Quiescing,
+}
 
 /// The parts of a channel's state that [`apply`] checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct State {
-    pub run: RunState,
-    pub ended: bool,
+    pub phase: Phase,
     /// Whether the system has an `abort` input.
     pub abortable: bool,
-    /// Whether a reset or load waits for the system's ops in flight.
-    pub quiescing: bool,
 }
 
 /// A channel command, without its payload.
@@ -57,18 +62,14 @@ pub enum Refusal {
 /// # Errors
 /// Returns the reason the channel refuses the command.
 pub fn apply(state: State, command: Command) -> Result<(), Refusal> {
-    let live = state.run == RunState::Running && !state.ended;
-    match command {
-        Command::Start | Command::Load | Command::Abort if state.quiescing => {
+    match (state.phase, command) {
+        (Phase::Quiescing, Command::Start | Command::Load | Command::Abort) => {
             Err(Refusal::Quiescing)
         }
-        Command::Stop | Command::Reset if state.quiescing => Ok(()),
-        Command::Start if state.ended => Err(Refusal::Ended),
-        Command::Start if live => Err(Refusal::Running),
-        Command::Stop | Command::Abort if state.ended => Err(Refusal::Ended),
-        Command::Stop | Command::Abort if !live => Err(Refusal::NotRunning),
-        Command::Abort if !state.abortable => Err(Refusal::NotAbortable),
-        Command::Reset | Command::Load if live => Err(Refusal::Running),
+        (Phase::Ended, Command::Start | Command::Stop | Command::Abort) => Err(Refusal::Ended),
+        (Phase::Running, Command::Start | Command::Reset | Command::Load) => Err(Refusal::Running),
+        (Phase::Stopped, Command::Stop | Command::Abort) => Err(Refusal::NotRunning),
+        (Phase::Running, Command::Abort) if !state.abortable => Err(Refusal::NotAbortable),
         _ => Ok(()),
     }
 }
@@ -85,21 +86,16 @@ mod tests {
         Command::Reset,
     ];
 
-    fn state(run: RunState, ended: bool) -> State {
+    fn state(phase: Phase) -> State {
         State {
-            run,
-            ended,
+            phase,
             abortable: true,
-            quiescing: false,
         }
     }
 
     #[test]
     fn test_quiescing_takes_only_stop_and_reset() {
-        let quiescing = State {
-            quiescing: true,
-            ..state(RunState::Stopped, false)
-        };
+        let quiescing = state(Phase::Quiescing);
         assert_eq!(accepted(quiescing), [Command::Stop, Command::Reset]);
         assert_eq!(apply(quiescing, Command::Start), Err(Refusal::Quiescing));
     }
@@ -112,7 +108,7 @@ mod tests {
 
     #[test]
     fn test_running_accepts_stop_and_abort() {
-        let running = state(RunState::Running, false);
+        let running = state(Phase::Running);
         assert_eq!(accepted(running), [Command::Abort, Command::Stop]);
         assert_eq!(apply(running, Command::Start), Err(Refusal::Running));
         assert_eq!(apply(running, Command::Reset), Err(Refusal::Running));
@@ -121,7 +117,7 @@ mod tests {
 
     #[test]
     fn test_stopped_accepts_start_reset_load() {
-        let stopped = state(RunState::Stopped, false);
+        let stopped = state(Phase::Stopped);
         assert_eq!(
             accepted(stopped),
             [Command::Load, Command::Start, Command::Reset]
@@ -132,19 +128,17 @@ mod tests {
 
     #[test]
     fn test_ended_accepts_reset_load() {
-        for run in [RunState::Running, RunState::Stopped] {
-            let ended = state(run, true);
-            assert_eq!(accepted(ended), [Command::Load, Command::Reset]);
-            assert_eq!(apply(ended, Command::Start), Err(Refusal::Ended));
-            assert_eq!(apply(ended, Command::Abort), Err(Refusal::Ended));
-        }
+        let ended = state(Phase::Ended);
+        assert_eq!(accepted(ended), [Command::Load, Command::Reset]);
+        assert_eq!(apply(ended, Command::Start), Err(Refusal::Ended));
+        assert_eq!(apply(ended, Command::Abort), Err(Refusal::Ended));
     }
 
     #[test]
     fn test_abort_needs_port() {
         let running = State {
             abortable: false,
-            ..state(RunState::Running, false)
+            ..state(Phase::Running)
         };
         assert_eq!(apply(running, Command::Abort), Err(Refusal::NotAbortable));
         assert_eq!(apply(running, Command::Stop), Ok(()));
@@ -173,15 +167,15 @@ mod proofs {
     }
 
     fn any_state() -> State {
+        let phase = match kani::any::<u8>() % 4 {
+            0 => Phase::Running,
+            1 => Phase::Stopped,
+            2 => Phase::Ended,
+            _ => Phase::Quiescing,
+        };
         State {
-            run: if kani::any() {
-                RunState::Running
-            } else {
-                RunState::Stopped
-            },
-            ended: kani::any(),
+            phase,
             abortable: kani::any(),
-            quiescing: kani::any(),
         }
     }
 
@@ -192,9 +186,9 @@ mod proofs {
     fn test_live_channel_transitions() {
         let state = any_state();
         let command = any_command();
-        let live = state.run == RunState::Running && !state.ended;
+        let live = state.phase == Phase::Running;
         if apply(state, command).is_ok() {
-            if state.quiescing {
+            if state.phase == Phase::Quiescing {
                 assert!(matches!(command, Command::Stop | Command::Reset));
                 return;
             }
