@@ -3,7 +3,6 @@
 
 use std::rc::Rc;
 
-use metor_proto::types::Timestamp;
 use stellarator::{Executor, JoinHandle};
 
 use crate::async_system::{Stop, StopHandle};
@@ -22,6 +21,7 @@ pub(crate) struct TurnedGroup {
     tasks: Vec<JoinHandle<()>>,
     executor: Rc<Executor>,
     /// The id of the group's first member, before whose step it turns.
+    #[cfg_attr(not(feature = "host"), allow(dead_code))]
     first: String,
 }
 
@@ -43,6 +43,7 @@ impl TurnedGroup {
     }
 
     /// The id of the member before whose step the group turns.
+    #[cfg(feature = "host")]
     pub(crate) fn first(&self) -> &str {
         &self.first
     }
@@ -59,7 +60,8 @@ impl TurnedGroup {
     }
 
     /// Sets simulated time to `now` and turns the executor once.
-    pub(crate) fn turn(&mut self, now: Timestamp) {
+    #[cfg(feature = "host")]
+    pub(crate) fn turn(&mut self, now: metor_proto::types::Timestamp) {
         stellarator::time::sim_set(u64::try_from(now.0).unwrap_or(0));
         self.executor.turn();
     }
