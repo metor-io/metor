@@ -124,9 +124,6 @@ pub enum DefError {
     #[error("output `{port}` names record `{record}`, which no registered port declares")]
     UnknownRecord { port: String, record: String },
 
-    #[error("record `{record}` is declared differently by two registered ports")]
-    RecordConflict { record: String },
-
     #[error("the pack refused the definition: {message}")]
     Pack { message: String },
 
@@ -138,49 +135,36 @@ pub enum DefError {
 }
 
 /// Port definitions by record name.
-///
-/// A record that two ports declare differently maps to `None`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Records(HashMap<String, Option<PortDef>>);
+pub struct Records(HashMap<String, PortDef>);
 
 impl Records {
-    /// Collects the records that `ports` carry.
+    /// Collects the records that `ports` carry, keeping the first port of each
+    /// record name.
     ///
-    /// If two ports carry different records under the same name, that name is
-    /// marked as a conflict.
+    /// The system table refuses two ports that declare one record differently.
     pub fn from_port_defs<'a>(ports: impl Iterator<Item = &'a PortDef>) -> Self {
         let mut records = HashMap::new();
         for port in ports {
-            match records.get(port.record.as_ref()) {
-                Some(Some(known)) if !port.same_record(known) => {
-                    records.insert(port.record.to_string(), None);
-                }
-                Some(_) => {}
-                None => {
-                    records.insert(port.record.to_string(), Some(port.clone()));
-                }
-            }
+            records
+                .entry(port.record.to_string())
+                .or_insert_with(|| port.clone());
         }
         Self(records)
     }
 
     /// Returns a definition for a port called `port` that carries `record`.
     ///
-    /// Fails if the record is unknown, or if two ports declared it differently.
+    /// Fails if the record is unknown.
     pub fn port_def(&self, port: &str, record: &str) -> Result<PortDef, DefError> {
-        match self.0.get(record) {
-            Some(Some(def)) => Ok(PortDef {
-                name: port.to_string().into(),
-                ..def.clone()
-            }),
-            Some(None) => Err(DefError::RecordConflict {
-                record: record.to_string(),
-            }),
-            None => Err(DefError::UnknownRecord {
-                port: port.to_string(),
-                record: record.to_string(),
-            }),
-        }
+        let def = self.0.get(record).ok_or_else(|| DefError::UnknownRecord {
+            port: port.to_string(),
+            record: record.to_string(),
+        })?;
+        Ok(PortDef {
+            name: port.to_string().into(),
+            ..def.clone()
+        })
     }
 }
 
@@ -228,23 +212,9 @@ mod tests {
         );
     }
 
+    /// The first port of a record name wins.
     #[test]
-    fn test_conflicting_record_definitions() {
-        let mut wide = Output::<Imu>::def(&DefCx::empty(), "imu");
-        wide.max_len += 8;
-        let records =
-            Records::from_port_defs([Output::<Imu>::def(&DefCx::empty(), "imu"), wide].iter());
-        assert_eq!(
-            records.port_def("out", Imu::NAME),
-            Err(DefError::RecordConflict {
-                record: Imu::NAME.into(),
-            })
-        );
-    }
-
-    /// Two frames of one name whose fields differ dispute the record.
-    #[test]
-    fn test_conflicting_frame_layouts() {
+    fn test_first_record_definition_wins() {
         let cx = DefCx::empty();
         let records = Records::from_port_defs(
             [
@@ -253,12 +223,8 @@ mod tests {
             ]
             .iter(),
         );
-        assert_eq!(
-            records.port_def("out", Imu::NAME),
-            Err(DefError::RecordConflict {
-                record: Imu::NAME.into(),
-            })
-        );
+        let port = records.port_def("out", Imu::NAME).expect("known record");
+        assert!(port.same_record(&Output::<Imu>::def(&cx, "imu")));
     }
 
     #[test]
