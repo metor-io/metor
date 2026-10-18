@@ -9,6 +9,9 @@ from ._model import Pack, Record, System
 ABI_VERSION = 14
 """The host ABI version the built-in systems are compiled against."""
 
+CONFIG_VERSION = 2
+"""The config file format version this host reads."""
+
 PACK = Pack(id="fsw", lib="", libs="", abi_version=ABI_VERSION)
 """The built-in systems' pack. It has no library, so no config lists it."""
 

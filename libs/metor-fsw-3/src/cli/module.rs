@@ -106,6 +106,7 @@ impl RecordClass {
 struct BuiltinModule {
     pack_id: &'static str,
     abi_version: u32,
+    config_version: u32,
     /// One class per record the framework or a built-in system uses, sorted
     /// by class name.
     records: Vec<RecordClass>,
@@ -218,6 +219,7 @@ fn builtin_view(def: &PackDef) -> BuiltinModule {
     BuiltinModule {
         pack_id: BUILTIN_PACK,
         abi_version: ABI_VERSION,
+        config_version: crate::deploy::CONFIG_VERSION,
         records,
         framework_ports: framework_ports().into_iter().map(Port::of).collect(),
         channel_ports: channel_ports().into_iter().map(Port::of).collect(),

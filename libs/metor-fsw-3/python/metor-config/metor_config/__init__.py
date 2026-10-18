@@ -16,9 +16,10 @@ from ._builtins import (
     Subscribe,
     Transport,
 )
-from ._config import CONFIG_VERSION, ConfigError
+from ._config import ConfigError
 from ._deployment import Deployment, emit
 from ._generated import (
+    CONFIG_VERSION,
     ChannelStatus,
     LinkStatus,
     LogEvent,

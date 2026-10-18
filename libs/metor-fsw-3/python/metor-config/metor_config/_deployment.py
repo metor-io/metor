@@ -9,7 +9,8 @@ import sys
 from typing import Any, Mapping, Sequence
 
 from ._builtins import Link
-from ._config import CONFIG_VERSION, OUT_ENV, ConfigError
+from ._config import OUT_ENV, ConfigError
+from ._generated import CONFIG_VERSION
 from ._target import Target, _targets
 
 LOOPBACK = "127.0.0.1"
