@@ -89,16 +89,14 @@ fn make(mut cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
         let m = io.member_index(&b.def.name)?;
         cqs[m] = Some(Output::new(b.writer));
     }
-    let owned = cqs.iter().flatten().count() * MAX_OPS;
     let ops = io.members.len() * MAX_OPS;
     Ok(Box::new(IoStep {
         sqs: sqs.map(|(m, b)| (m, Input::new(b.views))).collect(),
+        held: Dispatch::held_for(cqs.iter().flatten().count()),
         cqs,
         status: params.status.then_some(status),
         log,
         done: Vec::with_capacity(2 * ops),
-        held: 2 * owned,
-        ready: Vec::with_capacity(2 * owned + 3 * ops),
     }))
 }
 
@@ -113,9 +111,6 @@ struct IoStep {
     done: Vec<OsDone>,
     /// The most completions a full CQ holds back for the next pass.
     held: usize,
-    /// Completions to post, oldest first, starting with those a full CQ
-    /// held back.
-    ready: Vec<(usize, Cqe)>,
 }
 
 /// What went wrong in one pass, reported as faults.
@@ -134,9 +129,11 @@ impl Step for IoStep {
         };
         let mut faults = self.lower(dispatch, members);
         self.run(dispatch, os.as_mut());
-        let cqs = &self.cqs;
-        dispatch.take_ready(|m| matches!(cqs.get(m), Some(Some(_))), &mut self.ready);
-        faults.lost = self.post();
+        let cqs = &mut self.cqs;
+        faults.lost = dispatch.post_ready(self.held, |m, cqe| {
+            let cq = cqs.get_mut(m)?.as_mut()?;
+            Some(cq.write(cqe).is_ok())
+        });
         if let Some(status) = &mut self.status {
             dispatch.report(now, status);
         }
@@ -181,26 +178,6 @@ impl IoStep {
         for done in self.done.drain(..) {
             dispatch.raise(done);
         }
-    }
-
-    /// Posts the ready completions. One a full CQ refuses is held for the
-    /// next pass, up to `held`; past that it is lost: `true`.
-    fn post(&mut self) -> bool {
-        let (cqs, held) = (&mut self.cqs, self.held);
-        let (mut kept, mut lost) = (0, false);
-        self.ready.retain(|(m, cqe)| {
-            debug_assert!(cqs[*m].is_some(), "`take_ready` keeps only owned members");
-            let Some(cq) = &mut cqs[*m] else {
-                return false;
-            };
-            if cq.write(cqe).is_ok() {
-                return false;
-            }
-            kept += 1;
-            lost |= kept > held;
-            kept <= held
-        });
-        lost
     }
 
     fn report(&mut self, now: Timestamp, faults: Faults) {

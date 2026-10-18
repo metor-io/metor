@@ -47,8 +47,7 @@ fn rig(sq_depth: usize, cq_depth: usize) -> Rig {
         status: None,
         log: LogPort::new(log_out),
         done: Vec::with_capacity(2 * MAX_OPS),
-        held: 2 * MAX_OPS,
-        ready: Vec::with_capacity(5 * MAX_OPS),
+        held: Dispatch::held_for(1),
     };
     Rig {
         step,

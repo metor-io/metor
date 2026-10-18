@@ -79,8 +79,16 @@ impl Rig {
     }
 
     fn replies(&mut self) -> Vec<(usize, Cqe)> {
+        self.posted(|_| true)
+    }
+
+    /// Posts the completions of the members `owns` picks, and returns them.
+    fn posted(&mut self, owns: impl Fn(usize) -> bool) -> Vec<(usize, Cqe)> {
         let mut out = Vec::new();
-        self.d.take_ready(|_| true, &mut out);
+        self.d.post_ready(0, |m, cqe| {
+            owns(m).then(|| out.push((m, *cqe)))?;
+            Some(true)
+        });
         out
     }
 
@@ -248,11 +256,22 @@ fn each_io_step_takes_only_the_completions_it_posts() {
     let mut r = rig();
     r.lower(0, sqe(0, SIM, Op::Write { offset: None }, Span::new(0, 1)));
     r.lower(1, sqe(1, RawHandle::new(9, 0), Op::Fsync, Span::default()));
-    let (mut first, mut second) = (Vec::new(), Vec::new());
-    r.d.take_ready(|m| m == 1, &mut first);
-    r.d.take_ready(|m| m == 0, &mut second);
+    let first = r.posted(|m| m == 1);
+    let second = r.posted(|m| m == 0);
     assert_eq!(first, [(1, Cqe::err(Token::new(1, 7), IoError::Stale))]);
     assert_eq!(second, [(0, Cqe::ok(Token::new(0, 7), 1))]);
+    assert!(r.replies().is_empty());
+}
+
+#[test]
+fn a_refused_completion_waits_in_the_dispatch() {
+    let stale = || (1, Cqe::err(Token::new(1, 7), IoError::Stale));
+    let mut r = rig();
+    r.lower(1, sqe(1, RawHandle::new(9, 0), Op::Fsync, Span::default()));
+    assert!(!r.d.post_ready(1, |_, _| Some(false)), "held, not lost");
+    assert_eq!(r.replies(), [stale()]);
+    r.lower(1, sqe(1, RawHandle::new(9, 0), Op::Fsync, Span::default()));
+    assert!(r.d.post_ready(0, |_, _| Some(false)), "lost past the hold");
     assert!(r.replies().is_empty());
 }
 
@@ -413,7 +432,6 @@ fn report_writes_changed_resources() {
 fn lowering_and_raising_allocate_nothing() {
     let mut r = rig();
     let mut ids = Vec::with_capacity(4);
-    let mut ready = Vec::with_capacity(4);
     let n = allocations(|| {
         for _ in 0..8 {
             r.lower(0, read(0, TTY));
@@ -426,8 +444,7 @@ fn lowering_and_raising_allocate_nothing() {
                 id,
                 result: Ok(Out::Len(1)),
             });
-            r.d.take_ready(|_| true, &mut ready);
-            ready.clear();
+            r.d.post_ready(0, |_, _| Some(true));
         }
     });
     assert_eq!(n, 0);

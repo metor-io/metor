@@ -31,8 +31,10 @@ const CLOSE_ON_DRAIN: usize = 1;
 const OWN_COMPLETION: usize = 1;
 /// The most routes one op slot queues between drains.
 const ROUTES_PER_SLOT: usize = LOWERED_PER_SLOT + QUIESCE_CANCEL + CLOSE_OPENED + CLOSE_ON_DRAIN;
+/// The completions of one op slot a full CQ may hold back.
+const HELD_PER_SLOT: usize = 2;
 /// The most completions one op slot queues before an io step posts them.
-const READY_PER_SLOT: usize = LOWERED_PER_SLOT + OWN_COMPLETION;
+const READY_PER_SLOT: usize = LOWERED_PER_SLOT + OWN_COMPLETION + HELD_PER_SLOT;
 
 /// What backs a resource.
 pub(crate) enum Backed {
@@ -156,7 +158,8 @@ pub(crate) struct Dispatch {
     reported: Box<[Counters]>,
     next_status: usize,
     routes: Vec<Route>,
-    /// Completions no io step has posted yet, oldest first.
+    /// Completions no io step has posted yet, oldest first, including those
+    /// a full CQ held back.
     ready: Vec<(usize, Cqe)>,
     /// What a wire finished, before it is raised.
     wired: Vec<OsDone>,
@@ -346,10 +349,32 @@ impl Dispatch {
         self.wired = wired;
     }
 
-    /// Moves the ready completions of the members `owns` picks into `out`,
-    /// oldest first. The others stay for the io step that posts them.
-    pub(crate) fn take_ready(&mut self, owns: impl Fn(usize) -> bool, out: &mut Vec<(usize, Cqe)>) {
-        out.extend(self.ready.extract_if(.., |(m, _)| owns(*m)));
+    /// Posts the ready completions through `post`, oldest first.
+    ///
+    /// `post` returns `None` for a member another io step owns, which keeps
+    /// the completion. Up to `held` completions `post` refuses are held for
+    /// the next pass; past that they are lost, and this returns `true`.
+    pub(crate) fn post_ready(
+        &mut self,
+        held: usize,
+        mut post: impl FnMut(usize, &Cqe) -> Option<bool>,
+    ) -> bool {
+        let (mut kept, mut lost) = (0, false);
+        self.ready.retain(|(m, cqe)| match post(*m, cqe) {
+            None => true,
+            Some(true) => false,
+            Some(false) => {
+                kept += 1;
+                lost |= kept > held;
+                kept <= held
+            }
+        });
+        lost
+    }
+
+    /// How many completions an io step owning `members` members may hold.
+    pub(crate) fn held_for(members: usize) -> usize {
+        members * MAX_OPS * HELD_PER_SLOT
     }
 
     /// Maps a new descriptor to a free derived handle of member `m`, or closes
