@@ -19,6 +19,7 @@ mod table;
 #[cfg(all(test, feature = "host"))]
 mod tests;
 
+#[cfg(feature = "host")]
 pub(crate) use config::Adapters;
 pub use config::{
     Adapter, BuildOptions, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig,
