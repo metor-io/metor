@@ -217,7 +217,7 @@ class Gps(System):
     _pack = PACK
     _ty = "gps"
     _ports = {"fix": GpsFix, "log": LogEvent, "status": SystemStatus}
-    _caps = {"uart": "uart"}
+    _caps = ("uart",)
 
     def __init__(self, *, uart: ResourceHandle) -> None:
         super().__init__({}, {}, grants={"uart": uart})
@@ -233,7 +233,7 @@ class UartScript(System):
     _pack = PACK
     _ty = "uart_script"
     _ports = {"log": LogEvent, "status": SystemStatus}
-    _caps = {"uart": "uart"}
+    _caps = ("uart",)
 
     def __init__(self, *, uart: ResourceHandle, script: list[str]) -> None:
         """
@@ -252,7 +252,7 @@ class Chatter(System):
     _pack = PACK
     _ty = "chatter"
     _ports = {"log": LogEvent, "status": SystemStatus}
-    _caps = {"uart": "uart"}
+    _caps = ("uart",)
 
     def __init__(self, *, uart: ResourceHandle) -> None:
         super().__init__({}, {}, grants={"uart": uart})
@@ -267,7 +267,7 @@ class Reader(System):
     _pack = PACK
     _ty = "reader"
     _ports = {"sums": Ping, "log": LogEvent, "status": SystemStatus}
-    _caps = {"uart": "uart"}
+    _caps = ("uart",)
 
     def __init__(self, *, uart: ResourceHandle) -> None:
         super().__init__({}, {}, grants={"uart": uart})
@@ -283,7 +283,7 @@ class Grower(System):
     _pack = PACK
     _ty = "grower"
     _ports = {"log": LogEvent, "status": SystemStatus}
-    _caps = {"uart": "uart"}
+    _caps = ("uart",)
 
     def __init__(self, *, uart: ResourceHandle) -> None:
         super().__init__({}, {}, grants={"uart": uart})
