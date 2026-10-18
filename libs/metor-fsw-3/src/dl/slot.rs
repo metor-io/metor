@@ -22,7 +22,7 @@ use crate::coordinator::{
     Adapter, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, SystemKind, TableEntry,
 };
 use crate::def::{DefCx, DefError};
-use crate::dl::{PackKind, PackRef};
+use crate::dl::PackKind;
 use crate::io::SharedIo;
 use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
@@ -41,34 +41,40 @@ pub(crate) struct SlotParams {
     pub(crate) initial: Option<String>,
 }
 
-/// One system the slot is allowed to load.
+/// One system the slot is allowed to load, from the library `metor build`
+/// stored.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Candidate {
     pub(crate) name: String,
     pub(crate) ty: String,
     #[serde(default)]
     pub(crate) params: Value,
-    pub(crate) source: Source,
+    pub(crate) stored: Stored,
 }
 
-/// Where a candidate's library comes from.
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Source {
-    /// A pack that `metor build` has not opened and stored yet.
-    Pack(PackRef),
-    /// The copy that `metor build` wrote into the store.
-    Stored(Stored),
-}
-
-/// A candidate that `metor build` has copied into the store.
+/// A candidate's library, as `metor build` copied it into the store.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Stored {
     pub(crate) path: PathBuf,
-    pub(crate) hash: String,
+    #[serde(with = "hex_hash")]
+    pub(crate) hash: blake3::Hash,
     pub(crate) def: SystemDef,
     #[serde(default)]
     pub(crate) kind: PackKind,
+}
+
+/// A library hash, written as hex.
+mod hex_hash {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub(super) fn serialize<S: Serializer>(hash: &blake3::Hash, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(hash.to_hex().as_str())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<blake3::Hash, D::Error> {
+        let hex = String::deserialize(d)?;
+        blake3::Hash::from_hex(hex).map_err(D::Error::custom)
+    }
 }
 
 /// A candidate after the slot has decoded it, ready to load.
@@ -153,13 +159,9 @@ impl Resolved {
     }
 
     fn of(index: usize, candidate: Candidate) -> Result<Self, ParamError> {
-        let Source::Stored(Stored {
+        let Stored {
             path, hash, kind, ..
-        }) = candidate.source
-        else {
-            return Err(ParamError::Decode(not_resolved(&candidate.name)));
-        };
-        let hash = blake3::Hash::from_hex(hash).map_err(|e| ParamError::Decode(e.to_string()))?;
+        } = candidate.stored;
         let file = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -180,10 +182,6 @@ impl Resolved {
             kind,
         })
     }
-}
-
-fn not_resolved(name: &str) -> String {
-    format!("`{name}` is not resolved; run `metor build`")
 }
 
 /// Runs one pack system at a time, chosen from a fixed list.
@@ -218,25 +216,17 @@ struct Loaded {
 
 impl DlSlot {
     /// Returns the slot's definition, using the first candidate's ports.
-    ///
-    /// Fails if any candidate has not been resolved by `metor build`.
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         let refused = |message: String| DefError::Slot { message };
         let params = SlotParams::deserialize(cx.params).map_err(|e| refused(e.to_string()))?;
-        let mut stored = params
+        let first = params
             .allow
-            .iter()
-            .map(|candidate| match &candidate.source {
-                Source::Stored(stored) => Ok(stored),
-                Source::Pack(_) => Err(refused(not_resolved(&candidate.name))),
-            });
-        let first = stored
+            .into_iter()
             .next()
-            .ok_or_else(|| refused("the slot allows nothing".into()))??;
-        stored.try_for_each(|candidate| candidate.map(drop))?;
+            .ok_or_else(|| refused("the slot allows nothing".into()))?;
         Ok(SystemDef {
             name: SLOT_NAME.into(),
-            ..first.def.clone()
+            ..first.stored.def
         })
     }
 

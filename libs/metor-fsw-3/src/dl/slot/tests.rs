@@ -24,29 +24,30 @@ fn slot_def(params: &Value) -> Result<SystemDef, DefError> {
     })
 }
 
-fn candidate(path: &str, hash: &str) -> Candidate {
+fn candidate(path: &str) -> Candidate {
     Candidate {
         name: "up".into(),
         ty: "count_up".into(),
         params: Value::Null,
-        source: Source::Stored(Stored {
+        stored: Stored {
             path: path.into(),
-            hash: hash.into(),
+            hash: blake3::hash(b"lib"),
             def: def_with(Vec::new()),
             kind: PackKind::Dylib,
-        }),
+        },
     }
 }
 
 fn stored(name: &str, def: &SystemDef) -> Value {
-    json!({ "name": name, "ty": name, "source": { "stored": {
-        "path": "/store/x/lib.so", "hash": "00", "def": def,
-    }}})
+    let hash = blake3::hash(b"lib").to_hex();
+    json!({ "name": name, "ty": name, "stored": {
+        "path": "/store/x/lib.so", "hash": hash.as_str(), "def": def,
+    }})
 }
 
 fn from_pack(name: &str) -> Value {
     let pack = json!({ "id": "echo", "lib": "echo_pack", "libs": "/l" });
-    json!({ "name": name, "ty": name, "source": { "pack": pack } })
+    json!({ "name": name, "ty": name, "pack": pack })
 }
 
 #[test]
@@ -62,22 +63,24 @@ fn test_def_is_first_candidate() {
 }
 
 #[test]
-fn test_def_refuses_unresolved() {
-    let params = json!({ "allow": [from_pack("up")] });
-    let Err(DefError::Slot { message }) = slot_def(&params) else {
-        panic!("an unresolved candidate has no def")
-    };
-    assert!(message.contains("metor build"), "{message}");
+fn test_pack_candidate_does_not_parse() {
+    let later = json!({ "allow": [stored("up", &def_with(Vec::new())), from_pack("down")] });
+    for params in [json!({ "allow": [from_pack("up")] }), later] {
+        let Err(DefError::Slot { message }) = slot_def(&params) else {
+            panic!("a pack candidate is not a runtime candidate")
+        };
+        assert!(message.contains("`stored`"), "{message}");
+    }
 }
 
 #[test]
-fn test_def_refuses_later_unresolved() {
-    let params = json!({ "allow": [stored("up", &def_with(Vec::new())), from_pack("down")] });
-    let Err(DefError::Slot { message }) = slot_def(&params) else {
-        panic!("every candidate must be resolved")
-    };
-    assert!(message.contains("`down`"), "{message}");
-    assert!(message.contains("metor build"), "{message}");
+fn test_stored_hash_parses_as_hex() {
+    let hash = blake3::hash(b"lib");
+    let text = serde_json::to_value(candidate("/store/x/libup.so")).expect("encodes");
+    assert_eq!(text["stored"]["hash"], json!(hash.to_hex().as_str()));
+    let mut bad = stored("up", &def_with(Vec::new()));
+    bad["stored"]["hash"] = json!("not hex");
+    assert!(serde_json::from_value::<Candidate>(bad).is_err());
 }
 
 #[test]
@@ -85,32 +88,24 @@ fn test_def_refuses_empty_or_malformed() {
     assert!(slot_def(&json!({ "allow": [] })).is_err());
     assert!(slot_def(&json!({ "allow": 3 })).is_err());
     assert!(slot_def(&Value::Null).is_err());
-    let sourceless = json!({ "allow": [{ "name": "up", "ty": "count_up" }] });
-    assert!(slot_def(&sourceless).is_err());
+    let unstored = json!({ "allow": [{ "name": "up", "ty": "count_up" }] });
+    assert!(slot_def(&unstored).is_err());
 }
 
 #[test]
 fn test_resolved_occupant() {
     let hash = blake3::hash(b"lib");
-    let resolved = Resolved::of(2, candidate("/store/x/libup.so", &hash.to_hex()))
-        .expect("a resolved candidate");
+    let resolved = Resolved::of(2, candidate("/store/x/libup.so")).expect("a resolved candidate");
     assert_eq!(resolved.occupant.index, 2);
     assert_eq!(resolved.occupant.artifact.to_str(), Ok("libup.so"));
     assert_eq!(resolved.occupant.hash.0, *hash.as_bytes());
 }
 
 #[test]
-fn test_resolved_refuses_bad_fields() {
-    let hash = blake3::hash(b"lib").to_hex();
+fn test_resolved_refuses_bad_file_names() {
     let long = format!("/store/x/{}", "l".repeat(64));
-    assert!(Resolved::of(0, candidate("/store/x/libup.so", "not hex")).is_err());
-    assert!(Resolved::of(0, candidate(&long, &hash)).is_err());
-    let unresolved = Candidate {
-        source: serde_json::from_value(json!({ "pack": { "id": "a", "lib": "a", "libs": "/l" } }))
-            .expect("a pack source"),
-        ..candidate("/store/x/libup.so", &hash)
-    };
-    assert!(Resolved::of(0, unresolved).is_err());
+    assert!(Resolved::of(0, candidate(&long)).is_err());
+    assert!(Resolved::of(0, candidate("/")).is_err());
 }
 
 #[test]

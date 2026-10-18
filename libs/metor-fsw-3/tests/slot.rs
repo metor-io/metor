@@ -87,11 +87,11 @@ fn candidate(name: &str, ty: &str) -> Value {
     json!({
         "name": name,
         "ty": ty,
-        "source": { "stored": {
+        "stored": {
             "path": fixture_lib(),
             "hash": hash.to_hex().as_str(),
             "def": baked(ty),
-        }},
+        },
     })
 }
 
@@ -269,8 +269,8 @@ fn test_changed_bytes_refused() {
     let copy = dir.path().join("libecho_copy.so");
     std::fs::copy(fixture_lib(), &copy).expect("copies");
     let mut stale = candidate("down", "count_down");
-    stale["source"]["stored"]["path"] = json!(copy);
-    stale["source"]["stored"]["hash"] = json!(blake3::hash(b"another build").to_hex().as_str());
+    stale["stored"]["path"] = json!(copy);
+    stale["stored"]["hash"] = json!(blake3::hash(b"another build").to_hex().as_str());
     let allow = vec![candidate("up", "count_up"), stale];
     let (seen, mut coordinator) = build(slot_params(allow));
     send(&seen, &mut coordinator, [load("up")]);
@@ -385,7 +385,7 @@ fn test_unresolved_slot_refused() {
     let Err(error) = config(params, channel()).build(&table(&seen)) else {
         panic!("an unresolved slot is refused")
     };
-    assert!(error.to_string().contains("metor build"), "{error}");
+    assert!(error.to_string().contains("`stored`"), "{error}");
 }
 
 /// Copies the fixture library into `libs` and returns a pack reference to it.
@@ -399,5 +399,5 @@ fn pack_ref(libs: &Path) -> Value {
 /// Returns a candidate the way Python emits it: a pack reference, with no
 /// path, hash, or ports yet.
 fn unresolved(name: &str, ty: &str, libs: &Path) -> Value {
-    json!({ "name": name, "ty": ty, "source": { "pack": pack_ref(libs) } })
+    json!({ "name": name, "ty": ty, "pack": pack_ref(libs) })
 }

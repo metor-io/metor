@@ -409,7 +409,7 @@ class ChannelTest(ConfigTest):
         self.assertEqual([c["name"] for c in allow], ["safe", "hold"])
         self.assertEqual(allow[0]["params"], {"hold": 2.0})
         self.assertIsNone(allow[1]["params"])
-        self.assertEqual(allow[0]["source"]["pack"], PACK.to_json())
+        self.assertEqual(allow[0]["pack"], PACK.to_json())
         self.assertEqual(mode["params"]["initial"], "hold")
         self.assertEqual(mode["inputs"][0], {"port": "est", "from": [{"system": "nav", "port": "est"}]})
         self.assertEqual(fsw.to_config()["packs"], [PACK.to_json()])
