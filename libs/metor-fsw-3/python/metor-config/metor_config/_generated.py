@@ -19,6 +19,12 @@ class ChannelStatus(Record):
     _pack = PACK
 
 
+class LinkStatus(Record):
+    _name = "link_status"
+    _kind = "frame"
+    _pack = PACK
+
+
 class LogEvent(Record):
     _name = "log"
     _kind = "msg"
@@ -66,6 +72,20 @@ COMMANDS_PORT = "commands"
 
 IO_RECORDS = ("io_sqe", "io_cqe")
 """The records on the IO ports, which the build wires."""
+
+class Publish(System):
+    _pack = PACK
+    _ty = "publish"
+    _takes_inputs = True
+    _ports = {"link_status": LinkStatus, "log": LogEvent, "status": SystemStatus}
+
+
+class Subscribe(System):
+    _pack = PACK
+    _ty = "subscribe"
+    _takes_outputs = True
+    _ports = {"link_status": LinkStatus, "log": LogEvent, "status": SystemStatus}
+
 
 class ChannelRegistry(System):
     _pack = PACK

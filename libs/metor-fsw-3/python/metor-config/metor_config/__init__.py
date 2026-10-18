@@ -4,10 +4,11 @@ A target file creates a `Target` and adds systems to it from pack modules.
 `Target.to_config()` returns the target's config.
 """
 
-from ._builtins import ChannelRegistry, DlSlot, LinkStatus, Publish, Subscribe
+from ._builtins import ChannelRegistry, DlSlot, Publish, Subscribe
 from ._config import ConfigError
 from ._generated import (
     ChannelStatus,
+    LinkStatus,
     LogEvent,
     ResourceStatus,
     SequenceChannelEvent,
