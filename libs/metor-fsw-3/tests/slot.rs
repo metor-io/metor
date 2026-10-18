@@ -106,12 +106,12 @@ fn wasm_candidate(name: &str, ty: &str, dir: &Path) -> Value {
     json!({
         "name": name,
         "ty": ty,
-        "source": { "stored": {
+        "stored": {
             "path": path,
             "hash": blake3::hash(fixture_wasm()).to_hex().as_str(),
             "def": baked(ty),
             "kind": "wasm",
-        }},
+        },
     })
 }
 
@@ -333,7 +333,7 @@ fn test_wasm_and_dylib_swap() {
 fn test_changed_module_refused() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let stale = wasm_candidate("down", "count_down", dir.path());
-    let path = PathBuf::from(stale["source"]["stored"]["path"].as_str().expect("a path"));
+    let path = PathBuf::from(stale["stored"]["path"].as_str().expect("a path"));
     let mut bytes = fixture_wasm().to_vec();
     bytes.push(0);
     std::fs::write(&path, bytes).expect("writes");
@@ -353,9 +353,9 @@ fn test_changed_module_refused() {
 fn test_candidate_grants_reach_the_guest() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut spin = wasm_candidate("spin", "spin", dir.path());
-    spin["source"]["stored"]["fuel"] = json!(1_000);
+    spin["stored"]["fuel"] = json!(1_000);
     let mut small = wasm_candidate("small", "spin", dir.path());
-    small["source"]["stored"]["memory"] = json!(PAGE);
+    small["stored"]["memory"] = json!(PAGE);
     let (seen, mut coordinator) = build(slot_params(vec![spin, small]));
     run(&seen, &mut coordinator, 1);
 
@@ -599,11 +599,11 @@ fn test_build_resolves_wasm_candidate() {
         "kind": "wasm", "memory": 32 << 20, "fuel": 1_000_000,
     });
     let mut envelope = envelope(vec![
-        json!({ "name": "up", "ty": "count_up", "source": { "pack": pack } }),
+        json!({ "name": "up", "ty": "count_up", "pack": pack }),
     ]);
     resolve(&mut envelope, &store).expect("resolves");
 
-    let candidate = &slot(&envelope)["allow"][0]["source"]["stored"];
+    let candidate = &slot(&envelope)["allow"][0]["stored"];
     let path = PathBuf::from(candidate["path"].as_str().expect("a path"));
     assert!(path.starts_with(&store), "{}", path.display());
     assert!(path.ends_with(wasm_name("echo_pack")), "{}", path.display());
@@ -614,7 +614,8 @@ fn test_build_resolves_wasm_candidate() {
     assert_eq!(candidate["fuel"], json!(1_000_000));
 
     let seen = Shared::default();
-    let mut coordinator = envelope.targets[0]
+    let runtime = envelope.into_runtime().expect("no peers");
+    let mut coordinator = runtime.targets[0]
         .coordinator
         .clone()
         .build(&table(&seen))
