@@ -311,6 +311,15 @@ fn test_refused_constructor_keeps_occupant() {
     assert_eq!(pings(&seen), [1, 2, 3]);
 }
 
+/// An async candidate cannot run behind the slot's channel.
+#[test]
+fn test_async_candidate_is_refused() {
+    let (seen, mut coordinator) = build(slot_params(vec![candidate("relay", "relay")]));
+    let events = send(&seen, &mut coordinator, [load("relay")]);
+    let reason = "`relay` cannot run behind the slot's adapter".to_string();
+    assert_eq!(events[0], SequenceEventKind::Refused { reason });
+}
+
 #[test]
 fn test_initial_loads_at_build() {
     let mut params = slot_params(both());
@@ -371,7 +380,7 @@ fn test_slot_needs_channel() {
     assert!(
         matches!(
             error,
-            BuildError::Params { ref id, source: metor_fsw_3::ParamError::SlotChannel } if id == "mode"
+            BuildError::UnsupportedAdapter { ref id, ref adapter, .. } if id == "mode" && adapter == "without an adapter"
         ),
         "{error:?}"
     );

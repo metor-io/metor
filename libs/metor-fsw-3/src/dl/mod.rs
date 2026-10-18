@@ -129,6 +129,7 @@ impl TableEntry {
         let (make_pack, make_ty) = (pack.clone(), system.ty.clone());
         Self {
             kind: system.kind,
+            adapters: system.kind.adapters(),
             def: system.def.clone(),
             def_fn: Box::new(move |cx| def_pack.def(&def_ty, cx)),
             doc: system.doc.clone(),

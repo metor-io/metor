@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::coordinator::{
-    Adapter, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, SystemKind, TableEntry,
+    Adapters, EndReason, LoadError, MakeCx, Occupant, ParamError, Step, SystemKind, TableEntry,
 };
 use crate::def::{DefCx, DefError};
 use crate::dl::PackKind;
@@ -93,6 +93,11 @@ impl TableEntry {
     pub(crate) fn dl_slot() -> Self {
         Self {
             kind: SystemKind::Cyclic,
+            adapters: Adapters {
+                bare: false,
+                thread: false,
+                channel: true,
+            },
             def: SystemDef {
                 name: SLOT_NAME.into(),
                 inputs: Vec::new(),
@@ -232,9 +237,6 @@ impl DlSlot {
 
     /// Creates a slot on the rings `cx` gives, and loads its initial candidate.
     fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
-        let Some(adapter @ Adapter::Channel(_)) = cx.adapter else {
-            return Err(ParamError::SlotChannel);
-        };
         let params: SlotParams = cx.params.decode()?;
         let candidates = params
             .allow
@@ -246,7 +248,7 @@ impl DlSlot {
             instance: Instance {
                 id: cx.id.to_string(),
                 def: cx.def.clone(),
-                adapter: Some(adapter.clone()),
+                adapter: cx.adapter.cloned(),
             },
             inputs: cx
                 .inputs
@@ -279,6 +281,16 @@ impl DlSlot {
             return Err(LoadError::Mismatch(candidate.name.clone()));
         }
         Ok(())
+    }
+
+    /// Checks that the candidate's type runs behind the slot's adapter.
+    fn check_adapter(&self, pack: &Pack, candidate: &Resolved) -> Result<(), LoadError> {
+        let adapter = self.instance.adapter.as_ref();
+        let mut systems = pack.descriptor().systems.iter();
+        match systems.any(|s| s.ty == candidate.ty && s.kind.adapters().accepts(adapter)) {
+            true => Ok(()),
+            false => Err(LoadError::Adapter(candidate.name.clone())),
+        }
     }
 
     fn create(&self, pack: &Pack, candidate: &Resolved) -> Result<Box<dyn Step>, LoadError> {
@@ -340,6 +352,7 @@ impl Step for DlSlot {
             .ok_or_else(|| LoadError::Unknown(name.to_string()))?;
         let pack = Arc::new(self.candidates[index].open()?);
         self.check_ports(&pack, &self.candidates[index])?;
+        self.check_adapter(&pack, &self.candidates[index])?;
         // Drop the old system first so its ring readers and writers are free
         // for the new one.
         let unloaded = Occupancy::Empty(EndReason::Unloaded);
