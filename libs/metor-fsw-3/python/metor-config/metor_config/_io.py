@@ -6,18 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from ._config import ConfigError
-from ._model import Record
-
-
-class ResourceStatus(Record):
-    """One resource's op counts, written by `io_complete` when they change."""
-
-    _name = "io_status"
-    _kind = "frame"
-
-
-IO_RECORDS = ("io_sqe", "io_cqe")
-"""The records the io steps carry, which no link publishes."""
+from ._generated import Interface
 
 
 class Kind:
@@ -42,7 +31,7 @@ class Tty(Kind):
 
     path: str
     baud: int = 9600
-    interface = "uart"
+    interface = Interface.UART
     _key = "tty"
 
     def _fields(self) -> dict[str, Any]:
@@ -55,7 +44,7 @@ class Can(Kind):
 
     iface: str
     filters: Sequence[tuple[int, int]] = ()
-    interface = "can"
+    interface = Interface.CAN
     _key = "can"
 
     def _fields(self) -> dict[str, Any]:
@@ -70,7 +59,7 @@ class GpioLine(Kind):
     chip: str
     line: int
     direction: str = "input"
-    interface = "gpio_line"
+    interface = Interface.GPIO_LINE
     _key = "gpio_line"
 
     def _fields(self) -> dict[str, Any]:
@@ -85,7 +74,7 @@ class Udp(Kind):
 
     bind: str
     connect: str | None = None
-    interface = "udp"
+    interface = Interface.UDP
     _key = "udp"
 
     def _fields(self) -> dict[str, Any]:
@@ -98,7 +87,7 @@ class File(Kind):
 
     path: str
     access: str = "read_write"
-    interface = "file"
+    interface = Interface.REGULAR_FILE
     _key = "file"
 
     def _fields(self) -> dict[str, Any]:
@@ -112,7 +101,7 @@ class Dir(Kind):
     """A directory that files are opened under."""
 
     path: str
-    interface = "dir"
+    interface = Interface.DIR
     _key = "dir"
 
     def _fields(self) -> dict[str, Any]:
@@ -124,7 +113,7 @@ class TcpListen(Kind):
     """A TCP listener bound to ``addr``."""
 
     addr: str
-    interface = "listen"
+    interface = Interface.LISTEN
     _key = "tcp_listen"
 
     def _fields(self) -> dict[str, Any]:
@@ -141,7 +130,7 @@ class SimKind(Kind):
 class SimUart(SimKind):
     """A simulated serial port."""
 
-    interface = "uart"
+    interface = Interface.UART
     _key = "uart"
 
 
@@ -149,7 +138,7 @@ class SimUart(SimKind):
 class SimGpioLine(SimKind):
     """A simulated GPIO line."""
 
-    interface = "gpio_line"
+    interface = Interface.GPIO_LINE
     _key = "gpio_line"
 
 

@@ -18,7 +18,7 @@ from metor_config import (
     Subscribe,
     Target,
 )
-from metor_config._config import ABI_VERSION
+from metor_config._generated import ABI_VERSION
 
 def adcs_target() -> Target:
     """The design doc's example target."""

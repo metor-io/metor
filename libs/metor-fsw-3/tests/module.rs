@@ -5,7 +5,9 @@ use std::path::Path;
 use std::process::Command;
 
 use metor_fsw_3::ABI_VERSION;
-use metor_fsw_3::cli::module::render;
+use metor_fsw_3::builtins::register_builtins;
+use metor_fsw_3::cli::module::{render, render_builtins};
+use metor_fsw_3::coordinator::SystemTable;
 use metor_fsw_3::dl::PackRef;
 use metor_fsw_3::pack::def::PackDef;
 use serde_json::{Value, json};
@@ -171,5 +173,26 @@ config = target.to_config()
 assert config['packs'] == [PACK.to_json()]
 assert [system['ty'] for system in config['coordinator']['systems']] == ['fsw.subscribe']
 "#,
+    );
+}
+
+/// The checked-in `metor_config/_generated.py` is what stubgen renders for
+/// the built-in systems. `METOR_BLESS=1` rewrites it.
+#[cfg(unix)]
+#[test]
+fn test_builtins_module_is_current() {
+    let mut table = SystemTable::new();
+    register_builtins(&mut table).expect("the builtins register");
+    let rendered = render_builtins(&table).expect("renders");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("python/metor-config/metor_config/_generated.py");
+    if std::env::var_os("METOR_BLESS").is_some() {
+        std::fs::write(&path, &rendered).expect("writes the module");
+    }
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        current == rendered,
+        "{} is stale; run `METOR_BLESS=1 cargo test -p metor-fsw-3 --test module`",
+        path.display()
     );
 }

@@ -30,6 +30,7 @@ pub use error::BuildError;
 pub use params::{MakeError, ParamError, Params};
 #[cfg(feature = "host")]
 pub use run::Coordinator;
+pub(crate) use status::STATUS_PORT;
 pub use status::SystemStatus;
 pub(crate) use step::StepState;
 #[cfg(feature = "host")]

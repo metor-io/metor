@@ -458,18 +458,6 @@ fn test_python_abi_version() {
     assert_eq!(version, ABI_VERSION.to_string());
 }
 
-/// `metor_config` declares the built-in links' pack at this ABI version.
-///
-/// The built-in links ship with the host, so the versions must match.
-#[test]
-fn test_builtin_abi_version() {
-    let source = include_str!("../../python/metor-config/metor_config/_config.py");
-    assert!(
-        source.contains(&format!("\nABI_VERSION = {ABI_VERSION}\n")),
-        "metor_config declares another ABI"
-    );
-}
-
 mod region {
     use super::*;
     use crate::io::{Cqe, Sqe};

@@ -6,6 +6,15 @@ A target file creates a `Target` and adds systems to it from pack modules.
 
 from ._builtins import ChannelRegistry, DlSlot, LinkStatus, Publish, Subscribe
 from ._config import ConfigError
+from ._generated import (
+    ChannelStatus,
+    LogEvent,
+    ResourceStatus,
+    SequenceChannelEvent,
+    SequenceCommand,
+    SequenceRegistry,
+    SystemStatus,
+)
 from ._io import (
     Can,
     Dir,
@@ -13,7 +22,6 @@ from ._io import (
     GpioLine,
     Kind,
     ResourceHandle,
-    ResourceStatus,
     SimGpioLine,
     SimKind,
     SimUart,
@@ -22,21 +30,15 @@ from ._io import (
     Udp,
 )
 from ._model import (
-    ChannelStatus,
     Item,
-    LogEvent,
     Loop,
     OutPort,
     Pack,
     PortRef,
     Record,
-    SequenceChannelEvent,
-    SequenceCommand,
-    SequenceRegistry,
     Source,
     Sources,
     System,
-    SystemStatus,
 )
 from ._target import SystemHandle, Target
 

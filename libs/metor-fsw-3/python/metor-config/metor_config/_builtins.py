@@ -14,15 +14,13 @@ from __future__ import annotations
 
 from typing import Any, Sequence, TypeVar
 
-from ._config import ABI_VERSION, ConfigError, check_abi
-from ._io import IO_RECORDS
+from . import _generated
+from ._config import ConfigError, check_abi
+from ._generated import FRAMEWORK_PORTS, IO_RECORDS, PACK, SequenceRegistry
 from ._model import (
-    FRAMEWORK_PORTS,
     Item,
     OutPort,
-    Pack,
     Record,
-    SequenceRegistry,
     Source,
     Sources,
     System,
@@ -34,8 +32,6 @@ from ._model import (
 from ._target import Target
 
 T = TypeVar("T", bound=Record)
-
-PACK = Pack(id="fsw", lib="", libs="", abi_version=ABI_VERSION)
 
 MAX_CONNECTIONS = 8
 CONN_CAP = 1 << 20
@@ -179,7 +175,7 @@ def _transport(
     return {"listen": {"addr": listen, "max_connections": slots}}
 
 
-class DlSlot(System):
+class DlSlot(_generated.DlSlot):
     """A slot in the schedule that can swap which pack system runs in it.
 
     A `Load` command on the slot's channel picks the system to run.
@@ -189,9 +185,6 @@ class DlSlot(System):
     first system's input names as keywords. The slot must be added with
     ``channel=`` on `Target.add`.
     """
-
-    _ty = "dl_slot"
-    _pack = PACK
 
     def __init__(
         self, allow: Sequence[System], initial: str | None = None, **inputs: Sources[Any]
@@ -227,16 +220,12 @@ def _candidate(system: System) -> dict[str, Any]:
     }
 
 
-class ChannelRegistry(System):
+class ChannelRegistry(_generated.ChannelRegistry):
     """Publishes a list of the target's channels.
 
     The list includes the candidates each slot can load. It is written on
     the first cycle and then once a second.
     """
-
-    _ty = "channel_registry"
-    _pack = PACK
-    _ports = {"registry": SequenceRegistry, **FRAMEWORK_PORTS}
 
     def __init__(self) -> None:
         super().__init__({}, {})

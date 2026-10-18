@@ -1,30 +1,69 @@
-//! Generates a pack's typed Python module.
+//! Generates typed Python modules.
 //!
-//! `metor pack dev` reads the pack's descriptor and renders one Python class
+//! `metor pack dev` reads a pack's descriptor and renders one Python class
 //! per system and record, so target files can wire the pack with type
-//! checking.
+//! checking. The same renderer emits `metor_config`'s module of the systems
+//! built into the host.
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
 use serde_json::Value;
 
+use metor_proto_wkt::{LogEvent, SequenceChannelEvent, SequenceCommand};
+
 use super::pack_dev::PackDevError;
-use crate::channel::ABORT_PORT;
+use crate::channel::{ABORT_PORT, COMMANDS_PORT, ChannelStatus, EVENTS_PORT};
+use crate::coordinator::{STATUS_PORT, SystemStatus, SystemTable};
 use crate::dl::PackRef;
-use crate::io::{GrantDef, IO_CQ, IO_SQ};
+use crate::fn_system::LOG_PORT;
+use crate::io::{
+    Can, Cqe, Dir, GpioLine, GrantDef, IO_CQ, IO_SQ, Interface, Listen, RegularFile,
+    ResourceStatus, Sqe, Stream, Uart, Udp,
+};
+use crate::pack::ABI_VERSION;
 use crate::pack::def::{PackDef, PackSystemDef};
-use crate::record::RecordSchema;
+use crate::record::{Record, RecordSchema};
 use crate::system::PortDef;
 
 const TEMPLATE: &str = include_str!("module.py.jinja");
+const BUILTINS_TEMPLATE: &str = include_str!("builtins.py.jinja");
 
-/// The output ports every system has, whether or not it declares them.
-///
-/// Each entry is the port name, the record class named after its Rust type,
-/// and whether the record is a frame.
-const BUILTIN_PORTS: [(&str, &str, bool); 2] =
-    [("log", "LogEvent", false), ("status", "SystemStatus", true)];
+/// The prefix of every built-in system type.
+const BUILTIN_PACK: &str = "fsw";
+
+/// The output ports every system has, whether or not it declares them, with
+/// the record class each carries.
+fn framework_ports() -> [(&'static str, RecordClass); 2] {
+    [
+        (LOG_PORT, RecordClass::of::<LogEvent>()),
+        (STATUS_PORT, RecordClass::of::<SystemStatus>()),
+    ]
+}
+
+/// The outputs a channel adds to the system behind it.
+fn channel_ports() -> [(&'static str, RecordClass); 2] {
+    [
+        (EVENTS_PORT, RecordClass::of::<SequenceChannelEvent>()),
+        (
+            crate::channel::STATUS_PORT,
+            RecordClass::of::<ChannelStatus>(),
+        ),
+    ]
+}
+
+/// The records whose class name is their Rust type's, not their name in
+/// Pascal case.
+fn named_records() -> [RecordClass; 6] {
+    [
+        RecordClass::of::<LogEvent>(),
+        RecordClass::of::<SystemStatus>(),
+        RecordClass::of::<ResourceStatus>(),
+        RecordClass::of::<SequenceCommand>(),
+        RecordClass::of::<SequenceChannelEvent>(),
+        RecordClass::of::<ChannelStatus>(),
+    ]
+}
 
 /// The data the template renders.
 #[derive(Serialize)]
@@ -47,11 +86,66 @@ struct Module {
 ///
 /// `name` is the record's name on the host, `class` is the Python class name,
 /// and `kind` is `"frame"` or `"msg"`.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct RecordClass {
     name: String,
     class: String,
     kind: &'static str,
+}
+
+impl RecordClass {
+    /// The class for record `R`, named after its Rust type.
+    fn of<R: Record>() -> Self {
+        Self {
+            name: R::NAME.to_string(),
+            class: type_name::<R>().to_string(),
+            kind: kind(matches!(R::schema(), RecordSchema::Frame { .. })),
+        }
+    }
+}
+
+/// The data the built-in module's template renders.
+#[derive(Serialize)]
+struct BuiltinModule {
+    pack_id: &'static str,
+    abi_version: u32,
+    /// One class per record the framework or a built-in system uses, sorted
+    /// by class name.
+    records: Vec<RecordClass>,
+    framework_ports: Vec<Port>,
+    channel_ports: Vec<Port>,
+    commands_port: &'static str,
+    /// The records on the IO ports, which the build wires.
+    io_records: [&'static str; 2],
+    interfaces: Vec<InterfaceName>,
+    systems: Vec<BuiltinClass>,
+}
+
+/// A `Cap` interface: its Rust type's name in upper snake case, and its
+/// `NAME`.
+#[derive(Serialize)]
+struct InterfaceName {
+    name: String,
+    value: &'static str,
+}
+
+impl InterfaceName {
+    fn of<I: Interface>() -> Self {
+        Self {
+            name: upper_snake(type_name::<I>()),
+            value: I::NAME,
+        }
+    }
+}
+
+/// The base class of one built-in system.
+#[derive(Serialize)]
+struct BuiltinClass {
+    name: String,
+    ty: String,
+    takes_inputs: bool,
+    takes_outputs: bool,
+    ports: Vec<Port>,
 }
 
 #[derive(Serialize)]
@@ -89,7 +183,8 @@ struct Entry {
     params: Vec<Field>,
     /// Each `Cap` parameter, with the interface it takes.
     caps: Vec<CapKw>,
-    /// Every output port with its record class. The built-in ports come last.
+    /// Every output port with its record class. The framework's ports come
+    /// last.
     ports: Vec<Port>,
 }
 
@@ -103,6 +198,70 @@ struct CapKw {
 struct Port {
     name: String,
     record: String,
+}
+
+impl Port {
+    fn of((name, record): (&str, RecordClass)) -> Self {
+        Self {
+            name: name.to_string(),
+            record: record.class,
+        }
+    }
+}
+
+/// Renders `metor_config/_generated.py` from the built-in systems in `table`.
+pub fn render_builtins(table: &SystemTable) -> Result<String, PackDevError> {
+    let def = PackDef::from_table(table);
+    let mut env = minijinja::Environment::new();
+    env.add_filter("python_string", python_string);
+    env.add_template("builtins", BUILTINS_TEMPLATE)?;
+    Ok(env.get_template("builtins")?.render(builtin_view(&def))?)
+}
+
+fn builtin_view(def: &PackDef) -> BuiltinModule {
+    let mut records = records(def);
+    let channel = channel_ports().into_iter().map(|(_, record)| record);
+    for record in channel.chain([RecordClass::of::<SequenceCommand>()]) {
+        if !records.iter().any(|known| known.name == record.name) {
+            records.push(record);
+        }
+    }
+    records.sort_unstable_by(|a, b| a.class.cmp(&b.class));
+    let prefix = format!("{BUILTIN_PACK}.");
+    let systems = def
+        .systems
+        .iter()
+        .map(|system| {
+            let ty = system.ty.strip_prefix(&prefix).unwrap_or(&system.ty);
+            BuiltinClass {
+                name: pascal(ty),
+                ty: ty.to_string(),
+                takes_inputs: system.takes_inputs,
+                takes_outputs: system.takes_outputs,
+                ports: output_ports(system),
+            }
+        })
+        .collect();
+    BuiltinModule {
+        pack_id: BUILTIN_PACK,
+        abi_version: ABI_VERSION,
+        records,
+        framework_ports: framework_ports().into_iter().map(Port::of).collect(),
+        channel_ports: channel_ports().into_iter().map(Port::of).collect(),
+        commands_port: COMMANDS_PORT,
+        io_records: [Sqe::NAME, Cqe::NAME],
+        interfaces: vec![
+            InterfaceName::of::<Can>(),
+            InterfaceName::of::<Dir>(),
+            InterfaceName::of::<RegularFile>(),
+            InterfaceName::of::<GpioLine>(),
+            InterfaceName::of::<Listen>(),
+            InterfaceName::of::<Stream>(),
+            InterfaceName::of::<Uart>(),
+            InterfaceName::of::<Udp>(),
+        ],
+        systems,
+    }
 }
 
 /// Renders `<module>/__init__.py` for `def`.
@@ -149,13 +308,9 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
 }
 
 fn records(def: &PackDef) -> Vec<RecordClass> {
-    let mut records: Vec<RecordClass> = BUILTIN_PORTS
-        .iter()
-        .map(|(name, class, frame)| RecordClass {
-            name: name.to_string(),
-            class: class.to_string(),
-            kind: kind(*frame),
-        })
+    let mut records: Vec<RecordClass> = framework_ports()
+        .into_iter()
+        .map(|(_, record)| record)
         .collect();
     for port in def.systems.iter().flat_map(ports) {
         if !records.iter().any(|record| record.name == port.record) {
@@ -206,15 +361,47 @@ fn is_io(system: &PackSystemDef, port: &str) -> bool {
     !system.def.grants.is_empty() && (port == IO_SQ || port == IO_CQ)
 }
 
-fn is_builtin(port: &str) -> bool {
-    BUILTIN_PORTS.iter().any(|(name, ..)| *name == port)
+fn is_framework(port: &str) -> bool {
+    framework_ports().iter().any(|(name, _)| *name == port)
 }
 
 fn class_of(record: &str) -> String {
-    match BUILTIN_PORTS.iter().find(|(name, ..)| *name == record) {
-        Some((_, class, _)) => (*class).to_string(),
+    match named_records()
+        .into_iter()
+        .find(|known| known.name == record)
+    {
+        Some(known) => known.class,
         None => pascal(record),
     }
+}
+
+/// Every output port of `system` with its record class. The framework's
+/// ports come last.
+fn output_ports(system: &PackSystemDef) -> Vec<Port> {
+    let port = |port: &PortDef| Port {
+        name: port.name.to_string(),
+        record: class_of(&port.record),
+    };
+    let declared = exposed_outputs(system).filter(|p| !is_framework(&p.name));
+    let framework = framework_ports().into_iter().map(Port::of);
+    declared.map(port).chain(framework).collect()
+}
+
+/// The last path segment of `T`'s name.
+fn type_name<T>() -> &'static str {
+    let path = core::any::type_name::<T>();
+    path.rsplit("::").next().unwrap_or(path)
+}
+
+fn upper_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (index, c) in name.char_indices() {
+        if c.is_uppercase() && index > 0 {
+            out.push('_');
+        }
+        out.push(c.to_ascii_uppercase());
+    }
+    out
 }
 
 fn pascal(name: &str) -> String {
@@ -308,11 +495,6 @@ fn entry(
         name: port.name.to_string(),
         record: class_of(&port.record),
     };
-    let declared = exposed_outputs(system).filter(|p| !is_builtin(&p.name));
-    let builtin = BUILTIN_PORTS.iter().map(|(name, class, _)| Port {
-        name: name.to_string(),
-        record: class.to_string(),
-    });
     Ok(Entry {
         name: pascal(&system.ty),
         ty: system.ty.to_string(),
@@ -323,7 +505,7 @@ fn entry(
         inputs: wired_inputs(system).map(port).collect(),
         params,
         caps,
-        ports: declared.map(port).chain(builtin).collect(),
+        ports: output_ports(system),
     })
 }
 
@@ -565,6 +747,36 @@ mod tests {
                 "_ports = {\"cmd\": MotorCmd, \"log\": LogEvent, \"status\": SystemStatus}"
             )
         );
+    }
+
+    #[test]
+    fn test_render_builtins() {
+        let mut table = SystemTable::new();
+        crate::builtins::register_builtins(&mut table).expect("the builtins register");
+        let text = render_builtins(&table).expect("renders");
+        assert!(
+            text.contains(&format!("ABI_VERSION = {ABI_VERSION}\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains("class ChannelRegistry(System):\n    _pack = PACK\n    _ty = \"channel_registry\"\n    _ports = {\"registry\": SequenceRegistry, \"log\": LogEvent, \"status\": SystemStatus}\n"),
+            "{text}"
+        );
+        assert!(text.contains("FRAMEWORK_PORTS: dict[str, type[Record]] = {\"log\": LogEvent, \"status\": SystemStatus}\n"));
+        assert!(text.contains("CHANNEL_PORTS: dict[str, type[Record]] = {\"events\": SequenceChannelEvent, \"channel_status\": ChannelStatus}\n"));
+        assert!(text.contains("    REGULAR_FILE = \"file\"\n    GPIO_LINE = \"gpio_line\"\n"));
+        assert!(text.contains("IO_RECORDS = (\"io_sqe\", \"io_cqe\")\n"));
+    }
+
+    #[test]
+    fn test_render_builtins_of_an_empty_table() {
+        let text = render_builtins(&SystemTable::new()).expect("renders");
+        assert!(!text.contains("(System):"), "{text}");
+        assert!(text.contains("class SequenceCommand(Record):\n    _name = \"sequence_command\"\n    _kind = \"msg\"\n"));
+        assert!(text.contains(
+            "class SystemStatus(Record):\n    _name = \"status\"\n    _kind = \"frame\"\n"
+        ));
+        assert!(text.contains("    UART = \"uart\"\n"));
     }
 
     #[test]

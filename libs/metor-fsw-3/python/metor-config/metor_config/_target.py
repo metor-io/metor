@@ -5,12 +5,13 @@ from __future__ import annotations
 from typing import Any, TypeVar, cast
 
 from ._config import ConfigError, check_abi, simulated_clock, wall_clock
-from ._io import Kind, ResourceHandle, ResourceStatus, SimKind
-from ._model import CHANNEL_PORTS, Loop, OutPort, Pack, Record, Source, System, _json, _sources
+from ._generated import CHANNEL_PORTS, COMMANDS_PORT, Io, ResourceStatus
+from ._io import Kind, ResourceHandle, SimKind
+from ._model import Loop, OutPort, Pack, Record, Source, System, _json, _sources
 
 IO_SUBMIT = "io_submit"
 IO_COMPLETE = "io_complete"
-IO_TYPE = "fsw.io"
+IO_TYPE = f"{Io._pack.id}.{Io._ty}"
 
 S = TypeVar("S", bound=System)
 T = TypeVar("T", bound=Record)
@@ -199,7 +200,7 @@ class Target:
         This applies to every channel on the target, whether it was added
         before or after this call.
         """
-        self._commands.extend(_sources("commands", sources))
+        self._commands.extend(_sources(COMMANDS_PORT, sources))
 
     def _channels(self) -> list[tuple[str, System]]:
         """Returns each channel's name and system, in step order."""
@@ -307,7 +308,7 @@ class Target:
             entry.update(adapter)
         inputs = dict(system._inputs_for(self, index))
         if adapter is not None and "channel" in adapter and self._commands:
-            inputs["commands"] = self._commands
+            inputs[COMMANDS_PORT] = self._commands
         entry["inputs"] = [
             {
                 "port": port,

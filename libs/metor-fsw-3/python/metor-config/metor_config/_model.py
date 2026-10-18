@@ -25,59 +25,6 @@ class Record:
     _pack: Pack | None = None
 
 
-class LogEvent(Record):
-    """The log lines every system writes to its ``log`` output."""
-
-    _name = "log"
-    _kind = "msg"
-
-
-class SystemStatus(Record):
-    """The status frame the coordinator writes for every system."""
-
-    _name = "status"
-    _kind = "frame"
-
-
-FRAMEWORK_PORTS: dict[str, type[Record]] = {"log": LogEvent, "status": SystemStatus}
-"""The outputs every system has, whether or not it declares them."""
-
-
-class SequenceCommand(Record):
-    """A command sent to a channel. It carries the name of the channel it is for."""
-
-    _name = "sequence_command"
-    _kind = "msg"
-
-
-class SequenceChannelEvent(Record):
-    """Reports what a channel did with a command, or how its system ended."""
-
-    _name = "sequence_channel_event"
-    _kind = "msg"
-
-
-class ChannelStatus(Record):
-    """A channel's current state. Each channel writes one every cycle."""
-
-    _name = "channel_status"
-    _kind = "frame"
-
-
-class SequenceRegistry(Record):
-    """Lists every channel on a target, and the candidates each one can load."""
-
-    _name = "sequence_registry"
-    _kind = "msg"
-
-
-CHANNEL_PORTS: dict[str, type[Record]] = {
-    "events": SequenceChannelEvent,
-    "channel_status": ChannelStatus,
-}
-"""The extra outputs a system gets when it runs behind a channel."""
-
-
 @dataclass(frozen=True)
 class PortRef:
     """A reference to one output port of a system, by name."""
