@@ -159,7 +159,7 @@ struct SystemRecipe {
     params: serde_json::Value,
     inputs: Vec<Vec<RingBuffer>>,
     outputs: Vec<RingBuffer>,
-    seed: Option<u64>,
+    seed: u64,
     namespace: Option<String>,
     records: Arc<Records>,
 }

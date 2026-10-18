@@ -138,7 +138,7 @@ fn step_over<S: SequenceFn>(
     let cx = crate::system::BindCx {
         instance: crate::fn_system::Instance {
             id: "seq".into(),
-            seed: Some(0),
+            seed: 0,
             ..Default::default()
         },
         io: None,
