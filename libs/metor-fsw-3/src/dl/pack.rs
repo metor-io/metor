@@ -11,9 +11,9 @@ use metor_proto::types::Timestamp;
 
 use crate::coordinator::{EndReason, ParamError, Step, StepCx};
 use crate::def::{DefCx, DefError};
+use crate::pack::Status;
 use crate::pack::def::{DefCxOwned, Instance, PackDef};
 use crate::pack::raw::{RawRing, RawSlice};
-use crate::pack::{ABI_VERSION, Status};
 use crate::system::SystemDef;
 
 use super::codec::DESCRIPTOR_CAPACITY;
@@ -110,25 +110,11 @@ impl DlPack {
     /// while this process runs, including during this call.
     pub unsafe fn open(path: &Path) -> Result<DlPack, PackError> {
         // SAFETY: the caller's contract.
-        unsafe { Self::open_with(path, ABI_VERSION) }
-    }
-
-    /// Like [`open`](DlPack::open), but expects ABI version `expected`.
-    ///
-    /// Only tests pass something other than [`ABI_VERSION`].
-    ///
-    /// # Safety
-    /// The same as for [`open`](DlPack::open).
-    #[doc(hidden)]
-    pub unsafe fn open_with(path: &Path, expected: u32) -> Result<DlPack, PackError> {
-        // SAFETY: the caller's contract.
         let lib = unsafe { resident_library(path) }?;
         // SAFETY: the version export takes no arguments and returns a `u32` in
         // every ABI version. That is why it is resolved and called first.
         let found = unsafe { symbol::<VersionFn>(&lib, "metor_fsw_abi_version")?() };
-        if found != expected {
-            return Err(PackError::AbiMismatch { found, expected });
-        }
+        PackError::check_abi(found)?;
         let fns = PackFns {
             def: symbol(&lib, "metor_fsw_def")?,
             create: symbol(&lib, "metor_fsw_create")?,
@@ -285,5 +271,24 @@ mod tests {
         // SAFETY: the callback writes only the supplied result slot.
         let decoded = unsafe { descriptor(oversized_length) };
         assert!(matches!(decoded, Err(PackError::Decode)));
+    }
+
+    #[test]
+    fn test_matching_abi_is_accepted() {
+        assert!(PackError::check_abi(crate::pack::ABI_VERSION).is_ok());
+    }
+
+    #[test]
+    fn test_other_abi_reports_both_versions() {
+        let found = crate::pack::ABI_VERSION + 1;
+        let refused = PackError::check_abi(found);
+        assert!(
+            matches!(
+                refused,
+                Err(PackError::AbiMismatch { found: f, expected })
+                    if f == found && expected == crate::pack::ABI_VERSION
+            ),
+            "{refused:?}"
+        );
     }
 }

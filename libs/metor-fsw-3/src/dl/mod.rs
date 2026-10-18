@@ -18,6 +18,7 @@ use metor_fsw_3_ring::RingBuffer;
 use crate::coordinator::{BuildError, ParamError, Step, SystemTable, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::io::IoState;
+use crate::pack::ABI_VERSION;
 use crate::pack::def::{Instance, PackDef, PackSystemDef};
 use crate::pack::raw::RawRing;
 use crate::system::SystemDef;
@@ -41,6 +42,19 @@ pub enum PackError {
     DescriptorTooLarge { capacity: usize },
     #[error("pack descriptor export failed with status {0}")]
     DescriptorStatus(u32),
+}
+
+impl PackError {
+    /// Refuses a pack built against an ABI other than [`ABI_VERSION`].
+    pub(crate) fn check_abi(found: u32) -> Result<(), Self> {
+        match found {
+            ABI_VERSION => Ok(()),
+            found => Err(Self::AbiMismatch {
+                found,
+                expected: ABI_VERSION,
+            }),
+        }
+    }
 }
 
 /// The system type name that [`DlSlot`](slot::DlSlot) is registered under.

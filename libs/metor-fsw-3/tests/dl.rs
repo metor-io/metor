@@ -17,9 +17,7 @@ use metor_fsw_3::coordinator::{
     BuildError, Coordinator, CoordinatorConfig, InputConfig, ParamError, PortRef, SystemConfig,
     SystemTable,
 };
-use metor_fsw_3::{
-    ABI_VERSION, DlPack, EndReason, Input, Output, Pack, PackError, Record, Timestamp, system,
-};
+use metor_fsw_3::{DlPack, EndReason, Input, Output, Pack, PackError, Record, Timestamp, system};
 
 /// The ids of the systems that panicked, in step order.
 fn panicked(c: &Coordinator) -> Vec<&str> {
@@ -263,19 +261,6 @@ fn test_missing_export_error() {
     assert!(matches!(
         error,
         PackError::MissingSymbol("metor_fsw_abi_version")
-    ));
-}
-
-#[test]
-fn test_abi_error_reports_versions() {
-    // SAFETY: the fixture is a valid pack; only the expected version is wrong.
-    let Err(error) = (unsafe { DlPack::open_with(fixture_lib(), ABI_VERSION + 1) }) else {
-        panic!("the versions differ")
-    };
-    assert!(matches!(
-        error,
-        PackError::AbiMismatch { found, expected }
-            if found == ABI_VERSION && expected == ABI_VERSION + 1
     ));
 }
 
