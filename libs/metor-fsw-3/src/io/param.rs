@@ -1,6 +1,6 @@
 //! `Cap<K>` as a system parameter.
 
-use metor_fsw_3_ring::WakeSink;
+use crate::port::InputWake;
 
 use super::GrantDef;
 use super::cap::{Cap, Handle, Interface};
@@ -10,9 +10,9 @@ use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers, param_nam
 
 /// A `Cap<K>` gives its system a queue pair. It takes no port of its own.
 impl<K: Interface> Param for Cap<K> {
-    type In<W: WakeSink + Clone + 'static> = ();
+    type In<W: InputWake> = ();
     type Out = Cap<K>;
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a Cap<K>;
+    type Item<'a, W: InputWake> = &'a Cap<K>;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -23,7 +23,7 @@ impl<K: Interface> Param for Cap<K> {
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
     fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Cap<K>, ParamError> {
         param_name(names);
@@ -36,7 +36,7 @@ impl<K: Interface> Param for Cap<K> {
         Ok(Cap::new(Handle::new(io.next_grant(), io.clone())))
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         _input: &'a mut (),
         output: &'a mut Cap<K>,
         _cx: &mut Cycle<'a>,

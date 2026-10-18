@@ -146,7 +146,7 @@ pub(crate) fn system_def<S: FnSignature, W: InputWake>(
 pub(crate) type BoundSet<S, W> = (InSet<S, W>, OutSet<S>);
 
 /// Binds a fn system's ports under `instance`, handing `io` to its `Cap`s.
-pub(crate) fn bind<S: FnSignature, W: WakeSink + Clone + 'static>(
+pub(crate) fn bind<S: FnSignature, W: InputWake>(
     inputs: Vec<InputBinding<W>>,
     outputs: Vec<OutputBinding>,
     instance: Instance,
