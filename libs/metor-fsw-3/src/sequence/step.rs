@@ -1,9 +1,9 @@
 //! The step that runs a sequence.
 
-use core::future::Future;
-use core::pin::Pin;
+use core::future::{Future, poll_fn};
+use core::pin::{Pin, pin};
 use core::sync::atomic::AtomicU32;
-use core::task::Poll;
+use core::task::{Context, Poll, Waker};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,9 +12,9 @@ use metor_proto::types::Timestamp;
 
 use crate::channel::{Abort, AbortRequest};
 use crate::coordinator::{EndReason, Step, StepCx};
-use crate::fn_system::{Cycle, InSet, OutSet, Param};
+use crate::fn_system::{Cycle, InSet, OutSet, Param, Refresh};
 use crate::log::{self, LogPort};
-use crate::port::{Input, Samplers};
+use crate::port::Input;
 
 use super::{Seq, SeqError, SequenceFn};
 
@@ -31,7 +31,6 @@ enum Body {
 pub(crate) struct SequenceStep {
     seq: Rc<Seq<'static>>,
     abort: Abort,
-    samplers: Samplers,
     log: LogPort,
     /// Counts failed writes on the outputs the body owns.
     dropped: Arc<AtomicU32>,
@@ -48,12 +47,11 @@ impl SequenceStep {
         inputs: InSet<S>,
         outputs: OutSet<S>,
     ) -> Self {
-        let InSet { ins, samplers } = inputs;
+        let InSet { ins } = inputs;
         let OutSet { outs, log, dropped } = outputs;
         let seq = Rc::new(Seq::new());
         Self {
             body: Body::Running(Box::pin(run::<S>(state, ins, outs, seq.clone()))),
-            samplers,
             seq,
             abort: Abort::new(abort),
             log,
@@ -75,7 +73,8 @@ impl SequenceStep {
 /// Runs the sequence's body.
 ///
 /// The parameters are created inside the same future, so they can borrow
-/// the state and ports it holds across `.await` points.
+/// the state and ports it holds across `.await` points. Each poll refreshes
+/// the samples, unless the sequence is aborted, then advances the body.
 async fn run<S: SequenceFn>(
     mut state: S::State,
     mut ins: <S::Params as Param>::In<NoWake>,
@@ -83,8 +82,15 @@ async fn run<S: SequenceFn>(
     seq: Rc<Seq<'static>>,
 ) -> Result<(), SeqError> {
     let mut cx = Cycle::with_seq(seq.now(), &seq);
-    let items = S::Params::get::<NoWake>(&mut ins, &mut outs, &mut cx);
-    S::call(&mut state, items).await
+    let (items, mut samples) = S::Params::get_sampled::<NoWake>(&mut ins, &mut outs, &mut cx);
+    let mut body = pin!(S::call(&mut state, items));
+    poll_fn(|cx| {
+        if !seq.aborted() {
+            samples.refresh();
+        }
+        seq.advance(body.as_mut(), cx)
+    })
+    .await
 }
 
 impl Step for SequenceStep {
@@ -93,27 +99,17 @@ impl Step for SequenceStep {
         if self.abort.requested() {
             let _ = self.seq.abort();
         }
-        let Self {
-            seq,
-            samplers,
-            log,
-            body,
-            ..
-        } = self;
+        let Self { log, body, .. } = self;
         let Body::Running(run) = body else {
             return;
         };
         let polled = log::with_log_port(log, now, || {
-            if !seq.aborted() {
-                samplers.take_all();
-            }
-            seq.advance(run.as_mut())
+            run.as_mut().poll(&mut Context::from_waker(Waker::noop()))
         });
         let finished = polled.is_ready();
         if let Poll::Ready(result) = polled {
             let done = core::mem::replace(body, Body::Ended(Self::end_reason(result)));
             log::with_log_port(log, now, || drop(done));
-            *samplers = Samplers::default();
         }
         log.report_failed_writes(&self.dropped, now);
         // A failure's reason is logged too, since that line is the only way a

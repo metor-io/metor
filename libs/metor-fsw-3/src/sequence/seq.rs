@@ -5,10 +5,10 @@ use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
 use core::ptr::NonNull;
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 use core::time::Duration;
 use std::borrow::Cow;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 use cordyceps::List;
 use metor_proto::types::Timestamp;
@@ -156,13 +156,19 @@ impl<'a> Seq<'a> {
     ///
     /// Returns [`SeqError::Aborted`] without polling `body` once the sequence
     /// is aborted. A tripped redline logs a `redline` fault with its name and
-    /// aborts the sequence.
+    /// aborts the sequence. A panicking condition aborts the sequence before
+    /// the panic resumes, so the body's abort handlers run as it unwinds.
     pub(crate) fn advance(
         &self,
         body: Pin<&mut dyn Future<Output = Result<(), SeqError>>>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<(), SeqError>> {
         if !self.aborted()
-            && let Some(name) = self.tripped()
+            && let Some(name) =
+                catch_unwind(AssertUnwindSafe(|| self.tripped())).unwrap_or_else(|payload| {
+                    let _ = self.abort();
+                    resume_unwind(payload)
+                })
         {
             Log.fault("redline", name);
             let _ = self.abort();
@@ -171,7 +177,7 @@ impl<'a> Seq<'a> {
             return Poll::Ready(Err(SeqError::Aborted));
         }
         let _polling = Raised::new(&self.polling);
-        body.poll(&mut Context::from_waker(Waker::noop()))
+        body.poll(cx)
     }
 
     /// Links a pinned redline into this `Seq`.
@@ -385,6 +391,7 @@ impl Future for NextCycle<'_> {
 #[cfg(all(test, feature = "host"))]
 mod tests {
     use core::pin::pin;
+    use core::task::Waker;
 
     use super::*;
     use crate::sequence::tests::{Trace, ms};

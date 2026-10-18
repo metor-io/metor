@@ -22,7 +22,7 @@ use crate::{
 };
 
 pub use ctor::{Ctor, WithIo};
-pub use param::{Cycle, Param, ParamNames, Views, Writers};
+pub use param::{Cycle, Param, ParamNames, Refresh, Views, Writers};
 pub(crate) use param::{Defs, Instance, param_name};
 pub(crate) use set::Instance;
 pub(crate) use set::bind_with_io;
