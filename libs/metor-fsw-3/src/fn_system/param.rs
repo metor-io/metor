@@ -320,12 +320,12 @@ pub trait Refresh {
 }
 
 /// Refreshes one [`Sample`] that a sequence body borrows.
-pub struct SampleRefresh<'a, T: Frame + Copy, W: WakeSink> {
+pub struct SampleRefresh<'a, T: Frame + Copy, W: InputWake> {
     input: &'a mut Input<T, W>,
     sample: &'a Sample<T>,
 }
 
-impl<T: Frame + Copy, W: WakeSink> Refresh for SampleRefresh<'_, T, W> {
+impl<T: Frame + Copy, W: InputWake> Refresh for SampleRefresh<'_, T, W> {
     fn refresh(&mut self) {
         self.sample.refresh(self.input);
     }
@@ -415,7 +415,7 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
         input.refresh();
     }
 
-    fn get_sampled<'a, W: WakeSink + Clone + 'static>(
+    fn get_sampled<'a, W: InputWake>(
         input: &'a mut Self::In<W>,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
@@ -626,10 +626,10 @@ impl Param for Timestamp {
 }
 
 /// An [`Abort`] reads the `abort` input, whatever the parameter is called.
-impl<D: WakeSink + 'static> Param for Abort<D> {
-    type In<W: WakeSink + Clone + 'static> = Abort<W>;
+impl<D: InputWake> Param for Abort<D> {
+    type In<W: InputWake> = Abort<W>;
     type Out = ();
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Abort<W>;
+    type Item<'a, W: InputWake> = &'a mut Abort<W>;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -641,7 +641,7 @@ impl<D: WakeSink + 'static> Param for Abort<D> {
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
+    fn bind_in<W: InputWake>(views: &mut Views<W>) -> Self::In<W> {
         Abort::new(<Input<AbortRequest> as Param>::bind_in(views))
     }
 
@@ -650,7 +650,7 @@ impl<D: WakeSink + 'static> Param for Abort<D> {
         Ok(())
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         input: &'a mut Self::In<W>,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
@@ -660,9 +660,9 @@ impl<D: WakeSink + 'static> Param for Abort<D> {
 }
 
 impl Param for Seq<'static> {
-    type In<W: WakeSink + Clone + 'static> = ();
+    type In<W: InputWake> = ();
     type Out = ();
-    type Item<'a, W: WakeSink + Clone + 'static> = &'a Seq<'a>;
+    type Item<'a, W: InputWake> = &'a Seq<'a>;
 
     fn append_defs(
         names: &mut ParamNames<'_>,
@@ -673,14 +673,14 @@ impl Param for Seq<'static> {
         Ok(())
     }
 
-    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
+    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
     fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
         param_name(names);
         Ok(())
     }
 
-    fn get<'a, W: WakeSink + Clone + 'static>(
+    fn get<'a, W: InputWake>(
         _input: &'a mut (),
         _output: &'a mut (),
         cx: &mut Cycle<'a>,
@@ -757,7 +757,7 @@ macro_rules! impl_param_for_tuple {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn get_sampled<'a, W: WakeSink + Clone + 'static>(
+            fn get_sampled<'a, W: InputWake>(
                 input: &'a mut Self::In<W>,
                 output: &'a mut Self::Out,
                 cx: &mut Cycle<'a>,

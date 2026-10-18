@@ -11,12 +11,12 @@ mod apply;
 mod records;
 mod registry;
 
-use metor_fsw_3_ring::{NoWake, WakeSink};
+use metor_fsw_3_ring::NoWake;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::coordinator::{EndReason, RunState};
-use crate::port::Input;
+use crate::port::{Input, InputWake};
 use crate::{Frame, FrameBytes, FrameStr, MaxSize, Record, Schema, Timestamp};
 
 /// A request for a system to finish what it is doing and stop.
@@ -45,12 +45,12 @@ pub use apply::{Command, Phase, Refusal, State, apply};
 pub use registry::{ChannelSpec, Registry, RegistryParams, channel_registry};
 
 /// A system parameter that reports whether an abort was requested.
-pub struct Abort<W: WakeSink = NoWake> {
+pub struct Abort<W: InputWake = NoWake> {
     input: Input<AbortRequest, W>,
     requested: bool,
 }
 
-impl<W: WakeSink> Abort<W> {
+impl<W: InputWake> Abort<W> {
     pub(crate) fn new(input: Input<AbortRequest, W>) -> Self {
         Self {
             input,
