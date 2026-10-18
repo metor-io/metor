@@ -68,7 +68,7 @@ class Link(System):
         super().__init__({}, params, items=items, records=records)
 
     def _params_for(self, target: Any, index: int) -> Any:
-        link = target._systems[index][0]
+        link = target._systems[index].name
         return {
             "transport": self._transport,
             "namespace": target.namespace,
@@ -101,7 +101,7 @@ class Sink(Link):
     def _inputs_for(self, target: Target, index: int) -> dict[str, list[Source[Any]]]:
         if not self._all:
             return self._inputs
-        earlier = [target._handles[name] for name, _, _ in target._systems[:index]]
+        earlier = [target._handles[entry.name] for entry in target._systems[:index]]
         ports = [p for p in _item_ports(earlier) if p.record is None or p.record._name not in IO_RECORDS]
         return _edges(_item_ports(self._items) + ports)
 

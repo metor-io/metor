@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
 from ._config import ConfigError, simulated_clock, wall_clock
@@ -17,6 +18,36 @@ S = TypeVar("S", bound=System)
 T = TypeVar("T", bound=Record)
 
 _targets: list["Target"] = []
+
+
+@dataclass(frozen=True)
+class _Thread:
+    """Runs an async system on the thread `name`."""
+
+    name: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {"thread": self.name}
+
+
+@dataclass(frozen=True)
+class _Channel:
+    """Puts a cyclic system behind the channel `name`, in state `start` at boot."""
+
+    name: str
+    start: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {"channel": {"name": self.name, "start": self.start}}
+
+
+@dataclass(frozen=True)
+class _Entry:
+    """A system added to a target, under its name, and its adapter if any."""
+
+    name: str
+    system: System
+    adapter: _Thread | _Channel | None
 
 
 class SystemHandle:
@@ -76,8 +107,8 @@ class Target:
         self.sim_dt = sim_dt
         self.ring_depth = ring_depth
         self.namespace = namespace
-        self._systems: list[tuple[str, System, dict[str, Any] | None]] = []
-        self._sims: list[tuple[str, System, dict[str, Any] | None]] = []
+        self._systems: list[_Entry] = []
+        self._sims: list[_Entry] = []
         self._handles: dict[str, SystemHandle] = {}
         self._commands: list[Source[Any]] = []
         self._packs: dict[str, Pack] = {}
@@ -142,10 +173,10 @@ class Target:
 
     def _add(
         self,
-        systems: list[tuple[str, System, dict[str, Any] | None]],
+        systems: list[_Entry],
         name: str,
         system: S,
-        adapter: dict[str, Any] | None,
+        adapter: _Thread | _Channel | None,
     ) -> S:
         if name in self._handles:
             raise ConfigError(f"system `{name}` is already added")
@@ -154,7 +185,7 @@ class Target:
             self._packs.setdefault(pack.id, pack)
         system._name = name
         system._target = self
-        systems.append((name, system, adapter))
+        systems.append(_Entry(name, system, adapter))
         handle = SystemHandle(name, self, system)
         self._handles[name] = handle
         return cast(S, handle)
@@ -185,21 +216,21 @@ class Target:
     def _channels(self) -> list[tuple[str, System]]:
         """Returns each channel's name and system, in step order."""
         return [
-            (adapter["channel"]["name"], system)
-            for _, system, adapter in self._systems
-            if adapter is not None and "channel" in adapter
+            (entry.adapter.name, entry.system)
+            for entry in self._systems
+            if isinstance(entry.adapter, _Channel)
         ]
 
-    def _channel(self, name: str) -> dict[str, Any] | None:
-        for added, _, adapter in self._systems:
-            if added == name:
-                return adapter.get("channel") if adapter is not None else None
+    def _channel(self, name: str) -> _Channel | None:
+        for entry in self._systems:
+            if entry.name == name:
+                return entry.adapter if isinstance(entry.adapter, _Channel) else None
         return None
 
     def index(self, name: str) -> int:
         """Returns the position of the system `name` in step order."""
-        for index, (added, _, _) in enumerate(self._systems):
-            if added == name:
+        for index, entry in enumerate(self._systems):
+            if entry.name == name:
                 return index
         raise ConfigError(f"target `{self.namespace}` has no system `{name}`")
 
@@ -247,7 +278,7 @@ class Target:
 
     def _holds_caps(self) -> bool:
         """Returns whether any system holds a `Cap`, so the target needs io steps."""
-        return any(type(system)._caps for _, system, _ in self._systems + self._sims)
+        return any(type(entry.system)._caps for entry in self._systems + self._sims)
 
     def _resource(self, resource: ResourceHandle) -> dict[str, Any]:
         """Returns a resource's backing. A sim resource names the system and
@@ -256,10 +287,10 @@ class Target:
         if not isinstance(resource.kind, SimKind):
             return resource.to_json()
         ends: dict[str, dict[str, str]] = {}
-        for name, system, _ in self._systems + self._sims:
-            for param, grant in system._grants.items():
+        for entry in self._systems + self._sims:
+            for param, grant in entry.system._grants.items():
                 if grant.name == resource.name:
-                    ends[grant.end] = {"system": name, "param": param}
+                    ends[grant.end] = {"system": entry.name, "param": param}
         for end in ("host", "device"):
             if end not in ends:
                 raise ConfigError(f"sim resource `{resource.name}` has no holder on its {end} end")
@@ -275,19 +306,17 @@ class Target:
                 f"channel `{channels[0][0]}` has no command source; call `commands(..)`"
             )
 
-    def _system(
-        self, systems: list[tuple[str, System, dict[str, Any] | None]], index: int
-    ) -> dict[str, Any]:
-        name, system, adapter = systems[index]
+    def _system(self, systems: list[_Entry], index: int) -> dict[str, Any]:
+        name, system, adapter = systems[index].name, systems[index].system, systems[index].adapter
         entry: dict[str, Any] = {
             "id": name,
             "ty": f"{system._pack.id}.{system._ty}",
             "params": _json(system._params_for(self, index)),
         }
         if adapter is not None:
-            entry.update(adapter)
+            entry.update(adapter.to_json())
         inputs = dict(system._inputs_for(self, index))
-        if adapter is not None and "channel" in adapter and self._commands:
+        if isinstance(adapter, _Channel) and self._commands:
             inputs[COMMANDS_PORT] = self._commands
         entry["inputs"] = [
             {
@@ -318,17 +347,17 @@ class Target:
 
 def _adapter(
     thread: str | None, channel: str | None, start: str | None
-) -> dict[str, Any] | None:
-    """Returns the adapter entry for a system's config, if it has one."""
+) -> _Thread | _Channel | None:
+    """Returns a system's adapter, if it has one."""
     if thread is not None and channel is not None:
         raise ConfigError("a system takes `thread` or `channel`, not both")
     if start is not None and channel is None:
         raise ConfigError("`start` sets a channel's state at boot, so it needs `channel`")
     if thread is not None:
-        return {"thread": thread}
+        return _Thread(thread)
     if channel is None:
         return None
-    return {"channel": {"name": channel, "start": start or "running"}}
+    return _Channel(channel, start or "running")
 
 
 def _resolve(target: Target, name: str, port: str, source: Source[Any]) -> dict[str, str]:
