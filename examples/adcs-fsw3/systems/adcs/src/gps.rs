@@ -19,7 +19,7 @@ pub struct GpsDriver {
 }
 
 impl GpsDriver {
-    pub fn new(io: &IoInit) -> Self {
+    pub fn new(io: &mut IoInit) -> Self {
         Self {
             cmd: Some(io.alloc_from(LOG_10HZ)),
             rx: Some(io.alloc(READ)),

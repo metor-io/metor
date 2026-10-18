@@ -63,7 +63,7 @@ pub async fn commission(
     estimate: &Sample<AttitudeEstimate>,
     mode_cmd: &mut Output<ModeCmd>,
 ) -> Result<(), SeqError> {
-    let _safe = seq.on_abort(|seq| {
+    let mut mode_cmd = seq.on_abort_with(mode_cmd, |seq, mode_cmd| {
         let _ = mode_cmd.write(&ModeCmd::safe().stamped(seq.now()));
     });
     let _ = mode_cmd.write(&ModeCmd::detumble().stamped(seq.now()));

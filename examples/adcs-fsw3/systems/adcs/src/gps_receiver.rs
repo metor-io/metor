@@ -59,7 +59,7 @@ pub struct GpsReceiver {
 }
 
 impl GpsReceiver {
-    pub fn new(p: GpsReceiverParams, io: &IoInit) -> Self {
+    pub fn new(p: GpsReceiverParams, io: &mut IoInit) -> Self {
         Self {
             rx: Some(io.alloc(COMMAND_READ)),
             tx: Some(io.alloc(LINE_MAX)),
