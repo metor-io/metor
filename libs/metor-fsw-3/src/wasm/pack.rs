@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::dl::{InstanceRings, PackError};
-use crate::io::{Cqe, SharedIo, Sqe};
+use crate::io::{Cqe, IoState, Sqe};
 use crate::mirror::{Mirror, Mirrors, mirror_config};
 use crate::pack::ABI_VERSION;
 use crate::pack::def::{DefCxOwned, Instance, PackDef};
@@ -99,7 +99,7 @@ impl WasmPack {
         params: &serde_json::Value,
         instance: &Instance,
         InstanceRings { inputs, outputs }: InstanceRings<'_>,
-        io: &SharedIo,
+        io: &mut IoState,
     ) -> Result<WasmStep, ParamError> {
         let (params, def) = instance.encode(params)?;
         let mut guest = self.guest().map_err(PackError::from)?;
@@ -113,7 +113,7 @@ impl WasmPack {
         });
         let remade = ports
             .as_ref()
-            .and_then(|_| io.borrow().arena(&instance.id)?.region());
+            .and_then(|_| io.arena(&instance.id)?.region());
         let given = match remade {
             Some((_, len)) => Some(GuestRing::alloc_zeroed(&mut guest, len)?),
             None => None,
@@ -247,13 +247,13 @@ struct IoPorts {
 /// and the copy that keeps the two in step.
 fn attach(
     guest: &Guest,
-    io: &SharedIo,
+    io: &mut IoState,
     instance: &Instance,
     region: GuestRing,
     IoPorts { sq, cq }: IoPorts,
 ) -> Result<IoCopy, ParamError> {
     let len = region.len as usize;
-    let mirror = io.borrow_mut().get_or_add_member(&instance.id);
+    let mirror = io.get_or_add_member(&instance.id);
     if mirror.region().is_none() {
         mirror.set_owned(vec![0; len].into());
     }

@@ -336,7 +336,6 @@ fn rig(execute: &str) -> Rig {
     };
     let (seen, lines) = (output.view(NoWake), log.view(NoWake));
     let (inputs, outputs) = ([vec![&input]], [&output, &log]);
-    let io = crate::io::SharedIo::default();
     let step = pack
         .create(
             "guest",
@@ -346,7 +345,7 @@ fn rig(execute: &str) -> Rig {
                 inputs: &inputs,
                 outputs: &outputs,
             },
-            &io,
+            &mut Default::default(),
         )
         .expect("creates");
     Rig {
@@ -360,7 +359,9 @@ fn rig(execute: &str) -> Rig {
 
 impl Rig {
     fn execute(&mut self) {
-        self.step.execute(Timestamp(1));
+        let mut io = Default::default();
+        self.step
+            .execute(Timestamp(1), &mut crate::coordinator::StepCx::new(&mut io));
     }
 
     /// Returns every log line as `kind: message`.

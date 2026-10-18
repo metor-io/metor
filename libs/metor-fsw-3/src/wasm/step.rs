@@ -6,7 +6,7 @@ use metor_fsw_3_ring::NoWake;
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::LogLevel;
 
-use crate::coordinator::{EndReason, Step};
+use crate::coordinator::{EndReason, Step, StepCx};
 use crate::mirror::{Corrupt, Mirrors};
 use crate::pack::Status;
 
@@ -52,7 +52,7 @@ impl WasmStep {
 }
 
 impl Step for WasmStep {
-    fn execute(&mut self, now: Timestamp) {
+    fn execute(&mut self, now: Timestamp, _cx: &mut StepCx<'_>) {
         if self.end.is_some() {
             return;
         }

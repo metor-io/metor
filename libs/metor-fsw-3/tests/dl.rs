@@ -17,7 +17,7 @@ use metor_fsw_3::coordinator::{
     BuildError, Coordinator, CoordinatorConfig, InputConfig, MakeError, ParamError, PortRef,
     SystemConfig, SystemTable,
 };
-use metor_fsw_3::{ABI_VERSION, DlPack, Input, Output, Pack, PackError, Record, Timestamp, system};
+use metor_fsw_3::{DlPack, Input, Output, Pack, PackError, Record, Timestamp, system};
 
 /// Counts up and publishes the count.
 #[derive(Default)]
