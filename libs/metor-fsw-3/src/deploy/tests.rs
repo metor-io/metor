@@ -7,6 +7,18 @@ use crate::link::{PUBLISH_TYPE, SUBSCRIBE_TYPE};
 use crate::record::RecordSchema;
 use crate::tests::utils::{Emit, Recorder, Tap, emit, table, tap};
 
+/// Resolves whatever `envelope` has pending, with no store.
+fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Result<(), DeployError> {
+    match pending(envelope)? {
+        Some(pending) => pending.resolve(envelope, tables, std::path::Path::new("/no/store")),
+        None => Ok(()),
+    }
+}
+
+fn unresolved(envelope: &DeploymentConfig) -> Result<bool, DeployError> {
+    Ok(pending(envelope)?.is_some())
+}
+
 fn tables(count: usize) -> Vec<SystemTable> {
     (0..count)
         .map(|_| {
@@ -448,10 +460,10 @@ fn test_stored_slots_resolve_to_themselves() {
     };
     let mut envelope = envelope();
     envelope.targets[0].coordinator.systems.push(slot);
-    let before = envelope.clone();
-    resolve_slots(&mut envelope, &tables(2), std::path::Path::new("/no/store")).expect("resolves");
-    assert_eq!(envelope, before);
-    let mut stored = envelope.clone();
-    resolve(&mut stored, &tables(2)).expect("resolves");
-    assert!(!unresolved(&stored).expect("decodes"));
+    let pending = pending(&envelope).expect("decodes").expect("the peers");
+    assert!(pending.slots.is_empty(), "a stored slot is not pending");
+    let before = envelope.targets[0].coordinator.systems[4].params.clone();
+    resolve(&mut envelope, &tables(2)).expect("resolves");
+    assert_eq!(envelope.targets[0].coordinator.systems[4].params, before);
+    assert!(!unresolved(&envelope).expect("decodes"));
 }

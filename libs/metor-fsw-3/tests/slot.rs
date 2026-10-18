@@ -438,7 +438,19 @@ fn scratch() -> (tempfile::TempDir, PathBuf, PathBuf) {
 }
 
 fn resolve(envelope: &mut DeploymentConfig, store: &Path) -> Result<(), DeployError> {
-    deploy::resolve_slots(envelope, &[table(&Shared::default())], store)
+    resolve_with(envelope, &table(&Shared::default()), store)
+}
+
+/// Resolves whatever `envelope` has pending against `table`.
+fn resolve_with(
+    envelope: &mut DeploymentConfig,
+    table: &SystemTable,
+    store: &Path,
+) -> Result<(), DeployError> {
+    match deploy::pending(envelope)? {
+        Some(pending) => pending.resolve(envelope, std::slice::from_ref(table), store),
+        None => Ok(()),
+    }
 }
 
 fn slot(envelope: &DeploymentConfig) -> &Value {
@@ -454,9 +466,9 @@ fn test_build_resolves_into_store() {
         unresolved("down", "count_down", &libs),
     ];
     let mut envelope = envelope(allow);
-    assert!(deploy::unresolved(&envelope).expect("decodes"));
-    deploy::resolve_slots(&mut envelope, &[table(&seen)], &store).expect("resolves");
-    assert!(!deploy::unresolved(&envelope).expect("decodes"));
+    assert!(deploy::pending(&envelope).expect("decodes").is_some());
+    resolve_with(&mut envelope, &table(&seen), &store).expect("resolves");
+    assert!(deploy::pending(&envelope).expect("decodes").is_none());
 
     let params = slot(&envelope);
     let hash = store::hash(fixture_lib()).expect("reads");
@@ -471,7 +483,7 @@ fn test_build_resolves_into_store() {
 
     // Resolving again changes nothing.
     let before = params.clone();
-    deploy::resolve_slots(&mut envelope, &[table(&seen)], &store).expect("resolves");
+    resolve_with(&mut envelope, &table(&seen), &store).expect("resolves");
     assert_eq!(*slot(&envelope), before);
 
     let runtime = envelope.into_runtime().expect("no peers");
@@ -510,7 +522,7 @@ fn test_build_resolves_chained_slots() {
         .systems
         .push(next_slot(&libs));
     resolve(&mut envelope, &store).expect("resolves");
-    assert!(!deploy::unresolved(&envelope).expect("decodes"));
+    assert!(deploy::pending(&envelope).expect("decodes").is_none());
     let next = &envelope.targets[0].coordinator.systems[4].params;
     assert!(next["allow"][0]["stored"]["def"].is_object());
 }

@@ -10,12 +10,12 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::DeploymentConfig;
+use super::{DeploySystem, DeploymentConfig};
 use crate::FrameStr;
 use crate::coordinator::SystemTable;
 use crate::def::{DefCx, DefError};
 use crate::dl::slot::{Candidate, SlotParams, Stored};
-use crate::dl::{Pack, PackRef, SLOT_TYPE, store};
+use crate::dl::{Pack, PackRef, store};
 use crate::pack::def::DefCxOwned;
 use crate::system::SystemDef;
 
@@ -28,7 +28,7 @@ const ARTIFACT_LEN: usize = 64;
 
 /// A slot's params as a deployment writes them.
 #[derive(Deserialize)]
-struct DeploySlot {
+pub(crate) struct DeploySlot {
     allow: Vec<DeployCandidate>,
     #[serde(default)]
     initial: Option<String>,
@@ -54,56 +54,40 @@ enum Library {
     Stored(Stored),
 }
 
-/// Returns true if any slot in `envelope` has a candidate that is not yet
-/// resolved.
-///
-/// # Errors
-/// Returns an error if a slot's params do not decode.
-pub(crate) fn unresolved(envelope: &DeploymentConfig) -> Result<bool, DeployError> {
-    Ok(!unresolved_slots(envelope)?.is_empty())
-}
-
-/// Every slot, in step order, that still has a candidate that points at a
-/// pack, with its decoded params.
-fn unresolved_slots(
-    envelope: &DeploymentConfig,
-) -> Result<Vec<(SystemIndex, DeploySlot)>, DeployError> {
-    let mut slots = Vec::new();
-    for (index, system) in SystemIndex::iter(envelope) {
-        if system.ty != SLOT_TYPE {
-            continue;
-        }
-        let params = DeploySlot::deserialize(&system.params).map_err(|e| {
-            let slot = format!(
-                "{}.{}",
-                envelope.targets[index.target].namespace(),
-                system.id
-            );
+impl DeploySlot {
+    /// Decodes the params of the slot `system`, at `index`.
+    pub(crate) fn read(
+        envelope: &DeploymentConfig,
+        index: SystemIndex,
+        system: &DeploySystem,
+    ) -> Result<Self, DeployError> {
+        Self::deserialize(&system.params).map_err(|e| {
+            let namespace = envelope.targets[index.target].namespace();
+            let slot = format!("{namespace}.{}", system.id);
             let message = e.to_string();
             DeployError::Slot { slot, message }.at(system.location.as_ref())
-        })?;
-        let pending = params
-            .allow
-            .iter()
-            .any(|candidate| matches!(candidate.library, Library::Pack(_)));
-        if pending {
-            slots.push((index, params));
-        }
+        })
     }
-    Ok(slots)
+
+    /// Whether a candidate still points at a pack.
+    pub(crate) fn pending(&self) -> bool {
+        let mut allow = self.allow.iter();
+        allow.any(|candidate| matches!(candidate.library, Library::Pack(_)))
+    }
 }
 
-/// Resolves every slot in `envelope`, copying candidate libraries into
-/// `store`.
+/// Resolves the pending `slots` of `envelope`, copying candidate libraries
+/// into `store`.
 ///
 /// Slots are resolved one at a time, in step order. That way, when a slot
 /// reads another slot's output, the other slot's ports are already known.
-pub fn resolve_slots(
+pub(crate) fn resolve_slots(
     envelope: &mut DeploymentConfig,
     tables: &[SystemTable],
     store: &Path,
+    slots: Vec<(SystemIndex, DeploySlot)>,
 ) -> Result<(), DeployError> {
-    for (index, params) in unresolved_slots(envelope)? {
+    for (index, params) in slots {
         let resolved = SlotCx::new(envelope, tables, index)
             .and_then(|slot| slot.params(params, store))
             .map_err(|e| e.at(index.get(envelope).location.as_ref()))?;

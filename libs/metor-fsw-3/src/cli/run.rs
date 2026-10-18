@@ -187,7 +187,7 @@ pub fn prepare(target: Option<&Path>) -> Result<ResolvedDeployment, RunError> {
     } else {
         eval_target(target, &packs)?
     };
-    if deploy::unresolved(&config)? {
+    if let Some(pending) = deploy::pending(&config)? {
         let tables: Vec<SystemTable> = config
             .targets
             .iter()
@@ -195,8 +195,7 @@ pub fn prepare(target: Option<&Path>) -> Result<ResolvedDeployment, RunError> {
             .collect::<Result<_, _>>()?;
         let dir = target.parent().filter(|dir| !dir.as_os_str().is_empty());
         let dir = std::path::absolute(dir.unwrap_or(Path::new(".")))?;
-        deploy::resolve_slots(&mut config, &tables, &store::dir(&dir))?;
-        deploy::resolve(&mut config, &tables)?;
+        pending.resolve(&mut config, &tables, &store::dir(&dir))?;
     }
     Ok(config.into_runtime()?)
 }

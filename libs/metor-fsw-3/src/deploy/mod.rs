@@ -13,10 +13,12 @@ mod part;
 mod slot;
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::coordinator::{OutputSource, SystemTable};
+use crate::dl::SLOT_TYPE;
 use crate::link::{LINK_TYPES, Transport};
 
 pub use config::{
@@ -26,18 +28,90 @@ pub use config::{
 pub use error::DeployError;
 use index::{DefIndex, SystemIndex};
 use part::Part;
-pub use slot::resolve_slots;
+use slot::DeploySlot;
 
 /// The host a peer is dialed on when the deployment gives it no host.
 pub const LOOPBACK: &str = "127.0.0.1";
 
-/// Resolves every peer reference in `envelope`.
+/// A system's params, as the deployment passes read them.
+enum DeployParams {
+    Link(Part<LinkPart>),
+    Slot(DeploySlot),
+    Other,
+}
+
+impl DeployParams {
+    /// Decodes the params of `system`, at `index`, by its type.
+    fn read(
+        envelope: &DeploymentConfig,
+        index: SystemIndex,
+        system: &DeploySystem,
+    ) -> Result<Self, DeployError> {
+        match system.ty.as_str() {
+            ty if LINK_TYPES.contains(&ty) => Part::read(system).map(Self::Link),
+            SLOT_TYPE => DeploySlot::read(envelope, index, system).map(Self::Slot),
+            _ => Ok(Self::Other),
+        }
+    }
+}
+
+/// What a deployment still has to resolve: its links' params, and the slots
+/// whose candidates point at packs, each decoded once.
+pub struct Pending {
+    links: Links,
+    slots: Vec<(SystemIndex, DeploySlot)>,
+}
+
+/// Decodes every system's params in `envelope` once, and returns them if a
+/// peer reference or a slot candidate that points at a pack is left.
 ///
-/// `tables` holds one system table per target. Peer transports become
-/// addresses, and peer outputs become port definitions. An envelope with
-/// nothing to resolve is left unchanged.
-pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Result<(), DeployError> {
-    let mut links = Links::read(envelope)?;
+/// # Errors
+/// Returns an error if a link's or a slot's params do not decode.
+pub fn pending(envelope: &DeploymentConfig) -> Result<Option<Pending>, DeployError> {
+    let mut pending = Pending {
+        links: Links(HashMap::new()),
+        slots: Vec::new(),
+    };
+    for (index, system) in SystemIndex::iter(envelope) {
+        match DeployParams::read(envelope, index, system)? {
+            DeployParams::Link(part) => {
+                pending.links.0.insert(index, part);
+            }
+            DeployParams::Slot(slot) if slot.pending() => pending.slots.push((index, slot)),
+            DeployParams::Slot(_) | DeployParams::Other => {}
+        }
+    }
+    let peer_output = SystemIndex::iter(envelope).any(|(_, system)| {
+        let mut outputs = system.outputs.iter();
+        outputs.any(|output| matches!(output.source, DeploySource::Peer(_)))
+    });
+    let left = peer_output || pending.links.dials_peer() || !pending.slots.is_empty();
+    Ok(left.then_some(pending))
+}
+
+impl Pending {
+    /// Resolves every slot, copying candidate libraries into `store`, then
+    /// every peer reference.
+    ///
+    /// `tables` holds one system table per target. Peer transports become
+    /// addresses, and peer outputs become port definitions.
+    pub fn resolve(
+        self,
+        envelope: &mut DeploymentConfig,
+        tables: &[SystemTable],
+        store: &Path,
+    ) -> Result<(), DeployError> {
+        slot::resolve_slots(envelope, tables, store, self.slots)?;
+        resolve_peers(envelope, tables, self.links)
+    }
+}
+
+/// Resolves every peer reference in `envelope`, using its decoded `links`.
+fn resolve_peers(
+    envelope: &mut DeploymentConfig,
+    tables: &[SystemTable],
+    mut links: Links,
+) -> Result<(), DeployError> {
     let plan = plan(envelope, tables, &links)?;
     check_ports(envelope, &links)?;
     for (index, addr) in plan.transports {
@@ -51,24 +125,6 @@ pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Resul
         index.get_mut(envelope).outputs[output].source = source;
     }
     Ok(())
-}
-
-/// Returns true if `envelope` still has a peer reference or a slot candidate
-/// that points at a pack.
-///
-/// # Errors
-/// Returns an error if a link's or a slot's params do not decode.
-pub fn unresolved(envelope: &DeploymentConfig) -> Result<bool, DeployError> {
-    let peer_output = envelope.targets.iter().any(|target| {
-        target.coordinator.systems.iter().any(|system| {
-            system
-                .outputs
-                .iter()
-                .any(|output| matches!(output.source, DeploySource::Peer(_)))
-        })
-    });
-    let dials_peer = Links::read(envelope)?.dials_peer();
-    Ok(slot::unresolved(envelope)? || dials_peer || peer_output)
 }
 
 /// A link's transport as a deployment writes it: a runtime transport, or
@@ -91,17 +147,6 @@ struct LinkPart {
 struct Links(HashMap<SystemIndex, Part<LinkPart>>);
 
 impl Links {
-    /// Decodes the params of every link in `envelope`.
-    fn read(envelope: &DeploymentConfig) -> Result<Self, DeployError> {
-        let mut links = HashMap::new();
-        for (index, system) in SystemIndex::iter(envelope) {
-            if LINK_TYPES.contains(&system.ty.as_str()) {
-                links.insert(index, Part::read(system)?);
-            }
-        }
-        Ok(Self(links))
-    }
-
     fn get(&self, index: SystemIndex) -> Option<&LinkPart> {
         self.0.get(&index).map(|params| &params.part)
     }
