@@ -8,8 +8,9 @@ use std::cell::RefCell;
 use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
-    DefCx, DefError, DynInputs, Frame, Input, InputBinding, Output, OutputBinding, PortDef, Ports,
-    Record, Seq, SeqError, Stop, System, SystemDef, SystemTable, Timestamp, sequence, system,
+    DefCx, DefError, DynInputs, Frame, Input, InputBinding, Output, OutputBinding, Payload,
+    PortDef, Ports, Record, Seq, SeqError, Stop, System, SystemDef, SystemTable, Timestamp,
+    sequence, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
