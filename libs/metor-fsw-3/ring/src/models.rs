@@ -20,7 +20,7 @@ pub(crate) fn read(view: &mut View<NoWake>) -> Option<Vec<u8>> {
 
 pub(crate) fn registration_during_padding_publication() {
     let ring = ring(64, 1);
-    let writer = ring.writer(NoWake).unwrap();
+    let mut writer = ring.writer(NoWake).unwrap();
     writer.try_write(&[1; 8]).unwrap();
     let consumer = ring.clone();
     let task = thread::spawn(move || {

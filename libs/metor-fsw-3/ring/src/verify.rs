@@ -243,7 +243,7 @@ impl StackRegion {
 fn write_read_roundtrip() {
     let mut region = StackRegion::new();
     let ring = region.attach();
-    let w = ring.writer(NoWake).unwrap();
+    let mut w = ring.writer(NoWake).unwrap();
     let mut v = ring.view(NoWake).unwrap();
 
     let bytes: [u8; 8] = kani::any();
@@ -266,7 +266,7 @@ fn write_read_roundtrip() {
 fn backpressure_at_capacity() {
     let mut region = StackRegion::new();
     let ring = region.attach();
-    let w = ring.writer(NoWake).unwrap();
+    let mut w = ring.writer(NoWake).unwrap();
     let v = ring.view(NoWake).unwrap();
 
     let a: usize = kani::any();
@@ -309,7 +309,7 @@ fn backpressure_at_capacity() {
 fn read_skips_wrap_gap() {
     let mut region = StackRegion::new();
     let ring = region.attach();
-    let w = ring.writer(NoWake).unwrap();
+    let mut w = ring.writer(NoWake).unwrap();
     let mut v = ring.view(NoWake).unwrap();
 
     // A first record of symbolic size, consumed, so the cursor sits mid-lap.
@@ -351,7 +351,7 @@ fn read_skips_wrap_gap() {
 fn try_latest_pins() {
     let mut region = StackRegion::new();
     let ring = region.attach();
-    let w = ring.writer(NoWake).unwrap();
+    let mut w = ring.writer(NoWake).unwrap();
     let mut v = ring.view(NoWake).unwrap();
 
     let x: u8 = kani::any();
@@ -482,7 +482,7 @@ fn corrupt_peer_writer_never_ub() {
     let (base, _) = ring.region();
     // SAFETY: we hold the only handle to this region.
     unsafe { write_peer_words(base) };
-    let w = ring.writer(NoWake).unwrap();
+    let mut w = ring.writer(NoWake).unwrap();
     // SAFETY: the peer writes control words the writer only publishes.
     unsafe { write_peer_words(base) };
 
@@ -490,7 +490,7 @@ fn corrupt_peer_writer_never_ub() {
         let len: usize = kani::any();
         kani::assume(len <= CAP);
         if w.try_write(&[7u8; CAP][..len]).is_ok() {
-            assert!(w.committed.get().is_multiple_of(16));
+            assert!(w.committed.is_multiple_of(16));
         }
     }
 }

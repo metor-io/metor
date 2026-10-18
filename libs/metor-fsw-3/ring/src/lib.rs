@@ -48,8 +48,7 @@ pub use owner::{Lease, RawOwner, RingExport};
 use region::*;
 
 use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
-use crate::sync::{Arc, fence};
-use core::cell::Cell;
+use crate::sync::{Arc, AtomicU64, fence};
 
 /// Alignment of every record payload, in bytes.
 pub const PAYLOAD_ALIGNMENT: usize = 16;
@@ -477,7 +476,7 @@ struct ClaimedSlot {
     /// The reader's position.
     ///
     /// The copy in the slot exists for the writer.
-    cursor: Cell<u64>,
+    cursor: u64,
 }
 
 impl ClaimedSlot {
@@ -509,7 +508,7 @@ impl ClaimedSlot {
             return Ok(Self {
                 inner: inner.clone(),
                 index,
-                cursor: Cell::new(start),
+                cursor: start,
             });
         }
         Err(FullReaderTable)
@@ -517,8 +516,8 @@ impl ClaimedSlot {
 
     /// Stores a new position locally, then in the slot with Release ordering.
     #[inline]
-    fn advance(&self, pos: u64) {
-        self.cursor.set(pos);
+    fn advance(&mut self, pos: u64) {
+        self.cursor = pos;
         self.inner.slot(self.index).cursor.store(pos, Release);
     }
 }
@@ -729,7 +728,7 @@ impl RingBuffer {
             .compare_exchange(0, owner_tag(), Acquire, Relaxed)
             .map_err(|_| WriterClaimed)?;
         Ok(Writer {
-            committed: Cell::new(self.inner.control().committed.load(Relaxed)),
+            committed: self.inner.control().committed.load(Relaxed),
             inner: self.inner.clone(),
             wake,
         })
@@ -775,14 +774,13 @@ impl RingBuffer {
 /// The ring's single writer.
 ///
 /// Dropping it releases the writer claim, so another writer can take over.
-/// `Writer` is `Send` but not `Sync`, so writes through `&Writer` never overlap.
 pub struct Writer<WD: WakeSource> {
     inner: Arc<Inner>,
     wake: WD,
     /// The writer's position.
     ///
     /// The copy in the region exists only for readers.
-    committed: Cell<u64>,
+    committed: u64,
 }
 
 impl<WD: WakeSource> Writer<WD> {
@@ -794,10 +792,10 @@ impl<WD: WakeSource> Writer<WD> {
     ///   record needs. The call may still publish wrap padding, but never part
     ///   of the record.
     /// - [`WriteError::Corrupt`] if a reader cursor is ahead of this writer.
-    pub fn try_write(&self, bytes: &[u8]) -> Result<(), WriteError> {
+    pub fn try_write(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
         let capacity = self.inner.geometry.capacity;
         let frame_len = self.inner.geometry.frame_len(bytes.len())?;
-        let committed = self.committed.get();
+        let committed = self.committed;
         if !writable_from(committed, capacity) {
             return Err(WriteError::Corrupt);
         }
@@ -835,8 +833,8 @@ impl<WD: WakeSource> Writer<WD> {
 
     /// Stores a new position locally, then in the region with Release ordering.
     #[inline]
-    fn publish(&self, committed: u64) {
-        self.committed.set(committed);
+    fn publish(&mut self, committed: u64) {
+        self.committed = committed;
         self.inner.control().committed.store(committed, Release);
     }
 
@@ -855,7 +853,7 @@ impl<WD: WakeSource> Writer<WD> {
     /// # Safety
     /// The writer claim is held. The `frame_len`-byte record fits contiguously at
     /// `start` in space no reader pins.
-    unsafe fn commit(&self, start: u64, frame_len: u64, wrap_hwm: Option<u64>, bytes: &[u8]) {
+    unsafe fn commit(&mut self, start: u64, frame_len: u64, wrap_hwm: Option<u64>, bytes: &[u8]) {
         let offset = (start & self.inner.geometry.mask()) as usize;
         // SAFETY: the record is contiguous and in bounds (caller contract).
         unsafe { self.inner.write_record(offset, bytes) };
@@ -909,7 +907,7 @@ impl<RD: WakeSink> View<RD> {
     ///
     /// Records a drain has yielded are not counted until the view settles.
     pub fn cursor(&self) -> u64 {
-        self.slot.cursor.get()
+        self.slot.cursor
     }
 
     /// Returns the absolute published position in bytes.
@@ -928,8 +926,8 @@ impl<RD: WakeSink> View<RD> {
 
     /// Returns whether an unread record is waiting.
     ///
-    /// Wrap padding does not count.
-    pub fn has_record(&self) -> bool {
+    /// Wrap padding does not count, and the view moves past any it finds.
+    pub fn has_record(&mut self) -> bool {
         matches!(self.skip_gap_and_locate(), Ok(Some(_)))
     }
 
@@ -951,10 +949,16 @@ impl<RD: WakeSink> View<RD> {
         let Some(loc) = self.skip_gap_and_locate()? else {
             return Ok(None);
         };
+        let ClaimedSlot {
+            inner,
+            index,
+            cursor,
+        } = &mut self.slot;
         // SAFETY: lookup validated the record; this exclusive view borrow keeps it pinned.
-        let slice = unsafe { self.slot.inner.payload(&loc) };
+        let slice = unsafe { inner.payload(&loc) };
         Ok(Some(ReadGrant {
-            slot: &self.slot,
+            cursor,
+            shared_cursor: &inner.slot(*index).cursor,
             end: loc.end(),
             slice,
         }))
@@ -1027,7 +1031,7 @@ impl<RD: WakeSink> View<RD> {
     }
 
     /// Finds the next unread record, moving the cursor past a wrap gap first.
-    fn skip_gap_and_locate(&self) -> Result<Option<Located>, ReadError> {
+    fn skip_gap_and_locate(&mut self) -> Result<Option<Located>, ReadError> {
         let read_pos = self.cursor();
         let (skipped, loc) = self.inner().locate_before(read_pos, self.committed())?;
         if skipped != read_pos {
@@ -1053,7 +1057,9 @@ impl<RD: WakeSink> View<RD> {
 ///
 /// It derefs to the record's payload. Dropping it consumes the record.
 pub struct ReadGrant<'a> {
-    slot: &'a ClaimedSlot,
+    cursor: &'a mut u64,
+    /// The reader slot's copy of `cursor`.
+    shared_cursor: &'a AtomicU64,
     end: u64,
     slice: &'a [u8],
 }
@@ -1067,7 +1073,8 @@ impl std::ops::Deref for ReadGrant<'_> {
 
 impl Drop for ReadGrant<'_> {
     fn drop(&mut self) {
-        self.slot.advance(self.end);
+        *self.cursor = self.end;
+        self.shared_cursor.store(self.end, Release);
     }
 }
 
@@ -1098,7 +1105,7 @@ impl<RD: WakeSink> OwnedGrant<RD> {
     }
 
     /// Consumes the record and returns the view.
-    pub fn into_view(self) -> View<RD> {
+    pub fn into_view(mut self) -> View<RD> {
         self.slot.advance(self.end);
         View {
             slot: self.slot,
