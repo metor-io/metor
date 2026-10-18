@@ -24,8 +24,8 @@ use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
 
 use super::config::{
-    Adapter, BuildOptions, Clock, CoordinatorConfig, InputConfig, Location, OutputConfig,
-    PortRef, SystemConfig,
+    Adapter, BuildOptions, Clock, CoordinatorConfig, InputConfig, Location, OutputConfig, PortRef,
+    SystemConfig,
 };
 use super::error::BuildError;
 use super::params::Params;
@@ -325,14 +325,16 @@ fn wire_io(systems: &mut [SystemConfig], bindings: &Bindings) -> Result<(), Buil
         return match members.first() {
             Some(&m) => Err(BuildError::NoIoStep {
                 system: systems[m].id.clone(),
-            }),
+            }
+            .at(systems[m].location.as_ref())),
             None => Ok(()),
         };
     };
     for m in members {
         let id = systems[m].id.clone();
         let Some(next) = points.next(m) else {
-            return Err(BuildError::NoIoStepAfter { system: id });
+            let error = BuildError::NoIoStepAfter { system: id };
+            return Err(error.at(systems[m].location.as_ref()));
         };
         let prev = points.prev(m);
         let prev_id = systems[prev].id.clone();
@@ -519,28 +521,10 @@ impl Bindings {
     /// does not have, and a parameter bound twice.
     fn collect(config: &CoordinatorConfig) -> Result<Self, BuildError> {
         let mut bound = Self::default();
-        let index = |position: usize| {
-            let count = config.resources.len();
-            ResourceIndex::try_from(position).map_err(|_| BuildError::TooManyResources { count })
-        };
         for system in &config.systems {
-            for (param, resource) in &system.grants {
-                let unknown = || BuildError::UnknownResource {
-                    system: system.id.clone(),
-                    param: param.clone(),
-                    resource: resource.clone(),
-                };
-                let (position, _, backing) =
-                    config.resources.get_full(resource).ok_or_else(unknown)?;
-                if let Backing::Sim(_) = backing {
-                    return Err(BuildError::SimGrant {
-                        system: system.id.clone(),
-                        param: param.clone(),
-                        resource: resource.clone(),
-                    });
-                }
-                bound.bind(&system.id, param, index(position)?, ResourceEnd::Host)?;
-            }
+            bound
+                .bind_grants(system, config)
+                .map_err(|e| e.at(system.location.as_ref()))?;
         }
         for (position, (id, backing)) in config.resources.iter().enumerate() {
             let Backing::Sim(sim) = backing else {
@@ -556,10 +540,37 @@ impl Bindings {
                         system: holder.system.clone(),
                     });
                 }
-                bound.bind(&holder.system, &holder.param, index(position)?, end)?;
+                let resource = resource_index(config, position)?;
+                bound.bind(&holder.system, &holder.param, resource, end)?;
             }
         }
         Ok(bound)
+    }
+
+    /// Binds each of `system`'s grants to the real resource it names.
+    fn bind_grants(
+        &mut self,
+        system: &SystemConfig,
+        config: &CoordinatorConfig,
+    ) -> Result<(), BuildError> {
+        for (param, resource) in &system.grants {
+            let unknown = || BuildError::UnknownResource {
+                system: system.id.clone(),
+                param: param.clone(),
+                resource: resource.clone(),
+            };
+            let (position, _, backing) = config.resources.get_full(resource).ok_or_else(unknown)?;
+            if let Backing::Sim(_) = backing {
+                return Err(BuildError::SimGrant {
+                    system: system.id.clone(),
+                    param: param.clone(),
+                    resource: resource.clone(),
+                });
+            }
+            let resource = resource_index(config, position)?;
+            self.bind(&system.id, param, resource, ResourceEnd::Host)?;
+        }
+        Ok(())
     }
 
     fn bind(
@@ -593,6 +604,15 @@ impl Bindings {
     fn holds(&self, system: &str) -> bool {
         self.0.contains_key(system)
     }
+}
+
+/// The index of the resource at `position` in `config`'s resources.
+fn resource_index(
+    config: &CoordinatorConfig,
+    position: usize,
+) -> Result<ResourceIndex, BuildError> {
+    let count = config.resources.len();
+    ResourceIndex::try_from(position).map_err(|_| BuildError::TooManyResources { count })
 }
 
 /// Checks that `system`'s bindings and its `Cap` parameters match one to
@@ -1607,6 +1627,61 @@ mod tests {
             let e = error(config(nominal(), "a", "a"));
             let twice = |e: &BuildError| matches!(e, BuildError::DuplicateGrant { system, param } if system == "a" && param == "uart");
             assert!(twice(&e), "{e}");
+        }
+
+        /// A grant names a real resource. `kind` backs it.
+        fn granted(kind: crate::io::RealKind) -> CoordinatorConfig {
+            let mut config = config(nominal(), "a", "b");
+            config.resources.insert("tty".into(), Backing::Real(kind));
+            config
+        }
+
+        fn can() -> crate::io::RealKind {
+            crate::io::RealKind::Can {
+                iface: "can0".into(),
+                filters: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn test_grant_of_another_interface_is_refused() {
+            let mut config = granted(can());
+            let mut c = member("c");
+            c.grants.insert("uart".into(), "tty".into());
+            config.systems.insert(1, c);
+            let e = error(config);
+            let wrong = |e: &BuildError| matches!(e, BuildError::Interface { cap, expected, found, .. } if cap == "c.uart" && expected == "uart" && found == "can");
+            assert!(wrong(&e), "{e}");
+        }
+
+        #[test]
+        fn test_grant_of_a_non_cap_param_is_refused() {
+            let mut config = granted(can());
+            config.systems[0].grants.insert("gps".into(), "tty".into());
+            let e = error(config);
+            let unknown = |e: &BuildError| matches!(e, BuildError::UnknownGrant { system, param } if system == "a" && param == "gps");
+            assert!(unknown(&e), "{e}");
+        }
+
+        #[test]
+        fn test_io_errors_cite_the_system_location() {
+            let at = |line| {
+                Some(crate::coordinator::Location {
+                    file: "target.py".into(),
+                    line,
+                })
+            };
+            let mut sim_grant = config(nominal(), "a", "b");
+            sim_grant.systems[0]
+                .grants
+                .insert("uart".into(), "wire".into());
+            sim_grant.systems[0].location = at(4);
+            let e = error(sim_grant);
+            assert!(e.to_string().starts_with("target.py:4: "), "{e}");
+            let mut no_io = config(vec![member("a"), member("b")], "a", "b");
+            no_io.systems[0].location = at(5);
+            let e = error(no_io);
+            assert!(e.to_string().starts_with("target.py:5: "), "{e}");
         }
 
         #[test]
