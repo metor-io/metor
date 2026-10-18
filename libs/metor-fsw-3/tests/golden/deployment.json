@@ -35,7 +35,7 @@
             ],
             "location": {
               "file": "python/metor-config/tests/test_deployment.py",
-              "line": 21
+              "line": 32
             }
           },
           {
@@ -57,7 +57,7 @@
             ],
             "location": {
               "file": "python/metor-config/tests/test_deployment.py",
-              "line": 22
+              "line": 33
             }
           },
           {
@@ -132,7 +132,7 @@
             ],
             "location": {
               "file": "python/metor-config/tests/test_deployment.py",
-              "line": 23
+              "line": 34
             }
           },
           {
@@ -159,7 +159,7 @@
             ],
             "location": {
               "file": "python/metor-config/tests/test_deployment.py",
-              "line": 31
+              "line": 43
             }
           }
         ]
@@ -234,7 +234,7 @@
             ],
             "location": {
               "file": "python/metor-config/tests/test_deployment.py",
-              "line": 26
+              "line": 37
             }
           },
           {
@@ -244,7 +244,7 @@
             "inputs": [],
             "location": {
               "file": "python/metor-config/tests/test_deployment.py",
-              "line": 27
+              "line": 38
             }
           },
           {
@@ -273,7 +273,7 @@
             ],
             "location": {
               "file": "python/metor-config/tests/test_deployment.py",
-              "line": 28
+              "line": 39
             }
           },
           {
@@ -411,7 +411,7 @@
             ],
             "location": {
               "file": "python/metor-config/tests/test_deployment.py",
-              "line": 29
+              "line": 40
             }
           }
         ]
@@ -485,7 +485,11 @@
                   "port": "nav.status"
                 }
               }
-            ]
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_deployment.py",
+              "line": 42
+            }
           },
           {
             "id": "b",
@@ -584,7 +588,11 @@
                   "port": "ctrl.status"
                 }
               }
-            ]
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_deployment.py",
+              "line": 42
+            }
           },
           {
             "id": "db",
@@ -788,7 +796,11 @@
                   }
                 ]
               }
-            ]
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_deployment.py",
+              "line": 42
+            }
           }
         ]
       }

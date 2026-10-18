@@ -296,7 +296,11 @@
               {
                 "port": "sampler.status"
               }
-            ]
+            ],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 23
+            }
           },
           {
             "id": "b",
@@ -335,7 +339,11 @@
               {
                 "port": "meter.status"
               }
-            ]
+            ],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 23
+            }
           },
           {
             "id": "db",
@@ -493,7 +501,11 @@
               }
             ],
             "outputs": [],
-            "thread": "db"
+            "thread": "db",
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 23
+            }
           }
         ]
       }
