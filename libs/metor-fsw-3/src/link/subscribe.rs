@@ -301,7 +301,7 @@ mod tests {
     use crate::DefCx;
 
     use crate::record::{Payload, Record};
-    use crate::system::{OutputBinding, PortDef, Ports};
+    use crate::system::{OutputBinding, PortDef};
     use crate::tests::utils::{Fixed, Imu, Note, ring};
 
     use super::*;
@@ -333,7 +333,7 @@ mod tests {
     }
 
     fn bind(defs: [PortDef; 2], rings: &[RingBuffer; 2]) -> DynOutputs {
-        DynOutputs::bind(
+        DynOutputs::new(
             defs.into_iter()
                 .zip(rings)
                 .map(|(def, ring)| OutputBinding {
@@ -341,6 +341,7 @@ mod tests {
                     writer: ring.writer(NoWake).expect("a free writer"),
                 })
                 .collect(),
+            &std::sync::Arc::default(),
         )
     }
 

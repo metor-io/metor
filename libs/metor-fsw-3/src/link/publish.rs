@@ -195,7 +195,7 @@ mod tests {
     use crate::DefCx;
     use crate::port::Input;
     use crate::record::{Payload, Record};
-    use crate::system::{InputBinding, Ports};
+    use crate::system::InputBinding;
     use crate::tests::utils::{Fixed, Imu, ring};
 
     use super::*;
@@ -214,7 +214,7 @@ mod tests {
             Input::<Imu>::def(&DefCx::empty(), "plant.imu"),
             Input::<Fixed>::def(&DefCx::empty(), "cmds.fixed"),
         ];
-        DynInputs::bind(
+        DynInputs::new(
             defs.into_iter()
                 .zip(rings)
                 .map(|(def, ring)| InputBinding {
