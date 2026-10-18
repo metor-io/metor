@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use super::{Op, Span};
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 
 #[derive(Default)]
 pub(crate) struct Arena {
@@ -222,7 +222,7 @@ impl<'a> IoInit<'a> {
     ///
     /// # Errors
     /// Fails with `IoMemory` if the arena cannot hold them.
-    pub fn alloc(&mut self, len: usize) -> Result<Buf, ParamError> {
+    pub fn alloc(&mut self, len: usize) -> Result<Buf, MakeError> {
         self.alloc_with(len, &[])
     }
 
@@ -230,12 +230,12 @@ impl<'a> IoInit<'a> {
     ///
     /// # Errors
     /// Fails with `IoMemory` if the arena cannot hold them.
-    pub fn alloc_from(&mut self, bytes: &[u8]) -> Result<Buf, ParamError> {
+    pub fn alloc_from(&mut self, bytes: &[u8]) -> Result<Buf, MakeError> {
         self.alloc_with(bytes.len(), bytes)
     }
 
     /// Allocates `len` bytes starting with `fill`, zeroing the rest.
-    fn alloc_with(&mut self, len: usize, fill: &[u8]) -> Result<Buf, ParamError> {
+    fn alloc_with(&mut self, len: usize, fill: &[u8]) -> Result<Buf, MakeError> {
         let (arena, span) = self
             .arena
             .zip(self.bump(len))
@@ -258,8 +258,8 @@ impl<'a> IoInit<'a> {
     }
 
     /// The error for an allocation of `len` bytes that does not fit.
-    fn out_of_memory(&self, len: usize) -> ParamError {
-        ParamError::IoMemory {
+    fn out_of_memory(&self, len: usize) -> MakeError {
+        MakeError::IoMemory {
             system: self.system.to_string(),
             requested_len: len,
             available: self.arena.and_then(|a| a.region()).map(|(_, len)| len),

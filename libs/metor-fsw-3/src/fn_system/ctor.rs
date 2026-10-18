@@ -26,7 +26,7 @@ pub trait Ctor<S, Marker> {
 
     /// Builds the state of system `id` with an `IoInit` over `io`'s arena,
     /// or one that refuses every allocation when the system has no queue.
-    fn make_with_io(&self, id: &str, params: Params<'_>, io: Option<&Io>) -> Result<S, ParamError> {
+    fn make_with_io(&self, id: &str, params: Params<'_>, io: Option<&Io>) -> Result<S, MakeError> {
         let mut init = io.map_or_else(|| IoInit::empty(id), |io| IoInit::new(io.arena(), id));
         let state = self.make(params, &mut init)?;
         init.finish();
@@ -74,8 +74,8 @@ impl<S, P: DeserializeOwned + JsonSchema, F: Fn(P) -> Result<S, MakeError>> Ctor
     }
 }
 
-impl<S, F: Fn(&mut IoInit<'_>) -> Result<S, ParamError>> Ctor<S, (WithIo,)> for F {
-    fn make(&self, _params: Params<'_>, io: &mut IoInit<'_>) -> Result<S, ParamError> {
+impl<S, F: Fn(&mut IoInit<'_>) -> Result<S, MakeError>> Ctor<S, (WithIo,)> for F {
+    fn make(&self, _params: Params<'_>, io: &mut IoInit<'_>) -> Result<S, MakeError> {
         self(io)
     }
 
@@ -87,9 +87,9 @@ impl<S, F: Fn(&mut IoInit<'_>) -> Result<S, ParamError>> Ctor<S, (WithIo,)> for 
 impl<S, P, F> Ctor<S, (P, WithIo)> for F
 where
     P: DeserializeOwned + JsonSchema,
-    F: Fn(P, &mut IoInit<'_>) -> Result<S, ParamError>,
+    F: Fn(P, &mut IoInit<'_>) -> Result<S, MakeError>,
 {
-    fn make(&self, params: Params<'_>, io: &mut IoInit<'_>) -> Result<S, ParamError> {
+    fn make(&self, params: Params<'_>, io: &mut IoInit<'_>) -> Result<S, MakeError> {
         self(params.decode()?, io)
     }
 
@@ -104,6 +104,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::coordinator::MakeError;
     use crate::coordinator::ParamError;
 
     #[derive(Deserialize, JsonSchema)]
@@ -145,13 +146,13 @@ mod tests {
 
     struct Bufs(Vec<crate::io::Buf>);
 
-    fn with_io(io: &mut IoInit<'_>) -> Result<Bufs, ParamError> {
+    fn with_io(io: &mut IoInit<'_>) -> Result<Bufs, MakeError> {
         Ok(Bufs(vec![io.alloc(4)?]))
     }
 
-    fn sized(p: Len, io: &mut IoInit<'_>) -> Result<Bufs, ParamError> {
+    fn sized(p: Len, io: &mut IoInit<'_>) -> Result<Bufs, MakeError> {
         match p.len {
-            0 => Err(ParamError::Decode("zero".into())),
+            0 => Err(ParamError::Decode("zero".into()).into()),
             len => Ok(Bufs(vec![io.alloc(len)?])),
         }
     }
@@ -159,7 +160,7 @@ mod tests {
     fn make<M, C: Ctor<Bufs, M>>(
         ctor: C,
         params: &serde_json::Value,
-    ) -> Result<Vec<usize>, ParamError> {
+    ) -> Result<Vec<usize>, MakeError> {
         let arena = std::rc::Rc::new(crate::io::Arena::new());
         let mut init = IoInit::new(&arena, "a");
         let bufs = ctor.make(Params(params), &mut init)?;
@@ -173,7 +174,7 @@ mod tests {
         assert_eq!(make(sized, &json!({ "len": 7 })), Ok(vec![7]));
         assert!(make(sized, &json!({ "len": 0 })).is_err());
         assert!(
-            <fn(Len, &mut IoInit<'_>) -> Result<Bufs, ParamError> as Ctor<Bufs, (Len, WithIo)>>::schema()
+            <fn(Len, &mut IoInit<'_>) -> Result<Bufs, MakeError> as Ctor<Bufs, (Len, WithIo)>>::schema()
                 .is_some()
         );
     }
@@ -199,7 +200,7 @@ mod tests {
         };
         assert!(matches!(
             make(ctor, &json!({ "len": "x" })),
-            Err(ParamError::Decode(_))
+            Err(MakeError::Params(ParamError::Decode(_)))
         ));
         assert!(!ran.get());
     }

@@ -92,7 +92,7 @@ impl<S: FnSignature, W: InputWake> Ports<InputBinding<W>> for InSet<S, W> {
         Ok(Defs::of::<S>(cx)?.inputs)
     }
 
-    fn bind(inputs: Vec<InputBinding<W>>, _cx: &BindCx) -> Result<Self, ParamError> {
+    fn bind(inputs: Vec<InputBinding<W>>, _cx: &BindCx) -> Result<Self, MakeError> {
         let defs = Defs::declared::<S>();
         Ok(Self::from_views(Views::new(inputs, defs.param_inputs())))
     }
@@ -104,7 +104,7 @@ impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
     }
 
     /// Binds the outputs, then `log`, handing `cx`'s queue to the `Cap`s.
-    fn bind(outputs: Vec<OutputBinding>, cx: &BindCx) -> Result<Self, ParamError> {
+    fn bind(outputs: Vec<OutputBinding>, cx: &BindCx) -> Result<Self, MakeError> {
         let defs = Defs::declared::<S>();
         let declared = defs.param_outputs() + 1;
         Self::from_writers(Writers::new(

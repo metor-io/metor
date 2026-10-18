@@ -10,7 +10,7 @@ use core::ops::Deref;
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::record::{Bytes, DecodeError, EncodeError, Payload, Record};
 use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports};
@@ -323,7 +323,7 @@ impl<W: InputWake> Ports<InputBinding<W>> for DynInputs<W> {
         cx.dyn_input_defs(&[])
     }
 
-    fn bind(inputs: Vec<InputBinding<W>>, _cx: &BindCx) -> Result<Self, ParamError> {
+    fn bind(inputs: Vec<InputBinding<W>>, _cx: &BindCx) -> Result<Self, MakeError> {
         Ok(Self::new(inputs))
     }
 }
@@ -357,7 +357,7 @@ impl<W: WakeSource> Ports<OutputBinding<W>> for DynOutputs<W> {
         cx.dyn_output_defs(&[])
     }
 
-    fn bind(outputs: Vec<OutputBinding<W>>, _cx: &BindCx) -> Result<Self, ParamError> {
+    fn bind(outputs: Vec<OutputBinding<W>>, _cx: &BindCx) -> Result<Self, MakeError> {
         Ok(Self::new(outputs, &Arc::default()))
     }
 }

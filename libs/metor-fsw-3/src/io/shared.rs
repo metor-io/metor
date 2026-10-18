@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use super::arena::Arena;
 #[cfg(all(feature = "host", unix))]
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 
 /// The IO state a build shares: each system's arena and, in a target's build,
 /// the dispatch.
@@ -51,9 +51,9 @@ impl IoState {
 
     /// System `id`'s member index, or `NoIoMember`.
     #[cfg(all(feature = "host", unix))]
-    pub(crate) fn member_index(&self, id: &str) -> Result<usize, ParamError> {
+    pub(crate) fn member_index(&self, id: &str) -> Result<usize, MakeError> {
         let system = id.to_string();
-        self.index(id).ok_or(ParamError::NoIoMember { system })
+        self.index(id).ok_or(MakeError::NoIoMember { system })
     }
 }
 

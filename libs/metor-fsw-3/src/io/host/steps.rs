@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use super::dispatch::Dispatch;
 use super::{Host, MemberQueue, Os, OsDone, Route};
-use crate::coordinator::{Adapters, MakeCx, ParamError, Step, StepCx, SystemKind, TableEntry};
+use crate::coordinator::{Adapters, MakeCx, MakeError, Step, StepCx, SystemKind, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::fn_system::LOG_PORT;
 use crate::io::arena::Arena;
@@ -72,7 +72,7 @@ fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
     })
 }
 
-fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
+fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, MakeError> {
     let params: IoParams = cx.params.decode()?;
     let MakeCx {
         def,
@@ -81,7 +81,7 @@ fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError> {
         io,
         ..
     } = cx;
-    let index = |ports: &[PortDef]| -> Result<Vec<usize>, ParamError> {
+    let index = |ports: &[PortDef]| -> Result<Vec<usize>, MakeError> {
         ports.iter().map(|p| io.member_index(&p.name)).collect()
     };
     let lowers = index(&def.inputs)?;

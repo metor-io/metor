@@ -4,7 +4,7 @@ use crate::port::InputWake;
 
 use super::GrantDef;
 use super::cap::{Cap, Handle, Interface};
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Cycle, Defs, Param, ParamNames, Views, Writers, param_name};
 
@@ -25,7 +25,7 @@ impl<K: Interface> Param for Cap<K> {
 
     fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
 
-    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Cap<K>, ParamError> {
+    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Cap<K>, MakeError> {
         param_name(names);
         // PANIC Safety: `fn_system::bind` builds a queue for every set with a
         // grant, and a `Cap` adds one.

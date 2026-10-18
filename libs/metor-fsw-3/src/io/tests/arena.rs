@@ -1,11 +1,11 @@
 use std::rc::Rc;
 
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::io::arena::Arena;
 use crate::io::{IoInit, Span};
 
 #[test]
-fn bufs_read_empty_until_the_make_ends() -> Result<(), ParamError> {
+fn bufs_read_empty_until_the_make_ends() -> Result<(), MakeError> {
     let arena = Rc::new(Arena::new());
     let mut init = IoInit::new(&arena, "a");
     let a = init.alloc_from(b"hello")?;
@@ -18,7 +18,7 @@ fn bufs_read_empty_until_the_make_ends() -> Result<(), ParamError> {
 }
 
 #[test]
-fn spans_never_overlap() -> Result<(), ParamError> {
+fn spans_never_overlap() -> Result<(), MakeError> {
     let arena = Rc::new(Arena::new());
     let mut init = IoInit::new(&arena, "a");
     let mut bufs = (0..4)
@@ -35,7 +35,7 @@ fn spans_never_overlap() -> Result<(), ParamError> {
 }
 
 #[test]
-fn remake_within_capacity_reuses_the_arena() -> Result<(), ParamError> {
+fn remake_within_capacity_reuses_the_arena() -> Result<(), MakeError> {
     let arena = Rc::new(Arena::new());
     let mut init = IoInit::new(&arena, "a");
     let old = init.alloc_from(b"abcd")?;
@@ -53,7 +53,7 @@ fn remake_within_capacity_reuses_the_arena() -> Result<(), ParamError> {
 }
 
 #[test]
-fn remake_past_capacity_fails_the_alloc() -> Result<(), ParamError> {
+fn remake_past_capacity_fails_the_alloc() -> Result<(), MakeError> {
     let arena = Rc::new(Arena::new());
     let mut init = IoInit::new(&arena, "a");
     drop(init.alloc(4)?);
@@ -62,7 +62,7 @@ fn remake_past_capacity_fails_the_alloc() -> Result<(), ParamError> {
     let err = init.alloc(9).unwrap_err();
     assert_eq!(
         err,
-        ParamError::IoMemory {
+        MakeError::IoMemory {
             system: "a".into(),
             requested_len: 9,
             available: Some(4),
@@ -81,7 +81,7 @@ fn no_arena_fails_any_allocation() {
     let mut init = IoInit::empty("a");
     assert_eq!(
         init.alloc_from(b"x").unwrap_err(),
-        ParamError::IoMemory {
+        MakeError::IoMemory {
             system: "a".into(),
             requested_len: 1,
             available: None,

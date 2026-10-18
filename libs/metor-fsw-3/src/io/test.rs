@@ -13,7 +13,7 @@ use metor_proto::types::Timestamp;
 use super::arena::Arena;
 use super::cap::{Cap, Handle, Interface};
 use super::{Cqe, Errno, Io, IoError, IoInit, MAX_OPS, Op, Sqe, Token, TtyConfig};
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::port::{Input, Output, ring_capacity};
 use crate::record::Record;
 
@@ -76,7 +76,7 @@ pub fn cap<K: Interface>() -> (Cap<K>, TestIo) {
 
 impl TestIo {
     /// Runs `ctor` with the system's buffers, as a make does.
-    pub fn make<S>(&self, ctor: impl FnOnce(&mut IoInit<'_>) -> Result<S, ParamError>) -> S {
+    pub fn make<S>(&self, ctor: impl FnOnce(&mut IoInit<'_>) -> Result<S, MakeError>) -> S {
         let mut init = IoInit::new(self.io.arena(), "test");
         // PANIC Safety: a test's buffers fit, or the test is wrong.
         let state = ctor(&mut init).expect("the test's buffers fit");

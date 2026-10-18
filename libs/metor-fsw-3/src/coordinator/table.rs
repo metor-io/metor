@@ -93,7 +93,7 @@ impl MakeCx<'_> {
     ///
     /// The queue pair's ports, at the positions the def records, become the
     /// `Io` the outputs' `Cap`s use, over the member's arena.
-    pub(crate) fn bind_ports<I, O>(&mut self) -> Result<(I, O, Option<Io>), ParamError>
+    pub(crate) fn bind_ports<I, O>(&mut self) -> Result<(I, O, Option<Io>), MakeError>
     where
         I: Ports<InputBinding>,
         O: Ports<OutputBinding>,

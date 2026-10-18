@@ -2,7 +2,7 @@
 
 use metor_fsw_3::Rng;
 use metor_fsw_3::io::{Cap, ReadOp, Uart, WriteOp};
-use metor_fsw_3::{IoInit, Output, ParamError, Slot, system};
+use metor_fsw_3::{IoInit, MakeError, Output, Slot, system};
 
 use super::Ping;
 
@@ -12,7 +12,7 @@ pub struct Chatter {
 }
 
 impl Chatter {
-    pub fn new(io: &mut IoInit) -> Result<Self, ParamError> {
+    pub fn new(io: &mut IoInit) -> Result<Self, MakeError> {
         Ok(Self {
             tx: Slot::Idle(io.alloc(8)?),
         })
@@ -46,7 +46,7 @@ pub struct Grower {
 }
 
 impl Grower {
-    pub fn new(io: &mut IoInit) -> Result<Self, ParamError> {
+    pub fn new(io: &mut IoInit) -> Result<Self, MakeError> {
         let made = GROWN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             _buf: io.alloc(16 * (made + 1))?,
@@ -65,7 +65,7 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new(io: &mut IoInit) -> Result<Self, ParamError> {
+    pub fn new(io: &mut IoInit) -> Result<Self, MakeError> {
         Ok(Self {
             rx: Slot::Idle(io.alloc(16)?),
         })

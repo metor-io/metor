@@ -9,7 +9,7 @@ use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-use crate::coordinator::ParamError;
+use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::Instance;
 use crate::io::{GrantDef, Io, IoPorts};
@@ -155,7 +155,7 @@ pub trait Ports<B> {
     ///
     /// # Panics
     /// May panic if `bindings` does not match `defs`.
-    fn bind(bindings: Vec<B>, cx: &BindCx) -> Result<Self, ParamError>
+    fn bind(bindings: Vec<B>, cx: &BindCx) -> Result<Self, MakeError>
     where
         Self: Sized;
 }
@@ -165,7 +165,7 @@ impl<B> Ports<B> for () {
         Ok(Vec::new())
     }
 
-    fn bind(_bindings: Vec<B>, _cx: &BindCx) -> Result<Self, ParamError> {
+    fn bind(_bindings: Vec<B>, _cx: &BindCx) -> Result<Self, MakeError> {
         Ok(())
     }
 }
