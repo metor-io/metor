@@ -3,9 +3,7 @@
 //! It stores every record wired into its inputs, and serves the database over
 //! TCP and UDP to any client that connects, such as the panel.
 
-use core::cell::Cell;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_lite::future;
@@ -177,37 +175,21 @@ pub async fn db(
     }
 }
 
-/// One client connection to the database.
-///
-/// Dropping a `Conn` cancels its task. The task clears `open` when the client
-/// disconnects.
-struct Conn {
-    open: Rc<Cell<bool>>,
-    _task: stellarator::JoinHandleDropGuard<()>,
-}
-
 /// Accepts every client and serves each on its own task.
 ///
 /// Closed connections are pruned on each accept, and dropping this future
 /// closes every connection.
 async fn serve(listener: TcpListener, db: Arc<DB>, stop: Stop) {
-    let mut conns: Vec<Conn> = Vec::new();
+    // Dropping a guard cancels its client's task.
+    let mut conns: Vec<stellarator::JoinHandleDropGuard<()>> = Vec::new();
     let accept = async {
         loop {
             let Some(stream) = super::transport::accept(&listener).await else {
                 continue;
             };
-            conns.retain(|conn| conn.open.get());
-            let open = Rc::new(Cell::new(true));
-            let (conn_db, conn_open) = (db.clone(), open.clone());
-            let task = stellarator::spawn(async move {
-                metor_db::handle_conn(stream, conn_db).await;
-                conn_open.set(false);
-            });
-            conns.push(Conn {
-                open,
-                _task: task.drop_guard(),
-            });
+            conns.retain(|conn| !conn.is_finished());
+            let task = stellarator::spawn(metor_db::handle_conn(stream, db.clone()));
+            conns.push(task.drop_guard());
         }
     };
     futures_lite::future::or(accept, stop.wait()).await;

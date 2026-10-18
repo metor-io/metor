@@ -253,7 +253,7 @@ impl Serving {
     /// Drops `stream` when every slot is taken.
     pub(crate) fn spawn(&mut self, stream: TcpStream, stop: &Stop) {
         for task in &mut self.tasks {
-            if task.as_ref().is_some_and(|t| t.0.is_complete()) {
+            if task.as_ref().is_some_and(JoinHandle::is_finished) {
                 *task = None;
             }
         }
