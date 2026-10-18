@@ -3,10 +3,11 @@
 //! commands.
 
 use core::time::Duration;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use metor_proto::types::Msg;
@@ -44,16 +45,33 @@ fn metor() -> Command {
     }))
 }
 
-/// Returns three ports that were free when checked.
+/// The ports [`free_ports`] hands out.
+///
+/// They sit below the ephemeral ranges of Linux (32768 and up) and macOS
+/// (49152 and up), so the OS never gives one to a `bind(0)` or an outgoing
+/// connection.
+const TEST_PORTS: core::ops::Range<u16> = 20000..32000;
+
+/// How far into [`TEST_PORTS`] this process has handed out ports.
+static NEXT_PORT: AtomicU32 = AtomicU32::new(0);
+
+/// Returns three ports that nothing listened on when checked.
+///
+/// Each call in a process gets different ports, and each process starts at a
+/// different place in [`TEST_PORTS`]. A port is probed by dialing it, not by
+/// binding it: a socket bound here can leak into a child spawned by another
+/// test at the same moment, and the child then holds the port.
 fn free_ports() -> [u16; 3] {
-    let held: Vec<TcpListener> = (0..3)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("a free port"))
+    let span = u32::from(TEST_PORTS.end - TEST_PORTS.start);
+    let start = std::process::id().wrapping_mul(997);
+    let ports: Vec<u16> = (0..span)
+        .map(|_| start.wrapping_add(NEXT_PORT.fetch_add(1, Ordering::Relaxed)) % span)
+        .filter_map(|offset| u16::try_from(offset).ok())
+        .map(|offset| TEST_PORTS.start + offset)
+        .filter(|&port| TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).is_err())
+        .take(3)
         .collect();
-    let ports: Vec<u16> = held
-        .iter()
-        .map(|listener| listener.local_addr().expect("bound").port())
-        .collect();
-    [ports[0], ports[1], ports[2]]
+    ports.try_into().expect("enough free test ports")
 }
 
 /// A `metor run` of the deployment, killed and reaped on drop.
