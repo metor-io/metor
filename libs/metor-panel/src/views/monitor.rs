@@ -115,7 +115,7 @@ impl Monitor {
             async move |_this, cx| {
                 let comp = crate::wait_for_component(&db, component_id).await;
                 let element_count: usize = comp.schema.dim.iter().product::<usize>().max(1);
-                let _ = sparkline.update(cx, |sp, cx| {
+                sparkline.update(cx, |sp, cx| {
                     if element_count != sp.trace_count() {
                         let traces = build_traces(component_id, element_count, &line_colors);
                         sp.bind_traces(traces, cx);

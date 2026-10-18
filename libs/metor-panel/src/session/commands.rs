@@ -198,13 +198,13 @@ fn choose_save(save_as: bool, window: &mut Window, cx: &mut App) {
     let handle = window.window_handle();
     cx.spawn(async move |cx| {
         let path = if let Some(receiver) = receiver {
-            match receiver.await { Ok(Ok(Some(path))) => Some(path), Ok(Err(error)) => { let _ = cx.update(|cx| { cx.global_mut::<SessionGlobal>().message = error.to_string().into(); }); None }, _ => None }
+            match receiver.await { Ok(Ok(Some(path))) => Some(path), Ok(Err(error)) => { cx.update(|cx| { cx.global_mut::<SessionGlobal>().message = error.to_string().into(); }); None }, _ => None }
         } else { previous.as_ref().map(|s| s.0.clone()) };
-        let Some(path) = path else { let _ = cx.update(|cx| { cx.global_mut::<SessionGlobal>().selecting = false; }); return; };
-        let prepared = cx.update(|cx| prepare_destination(path, cx)).map_err(io::Error::other).and_then(|r| r);
+        let Some(path) = path else { cx.update(|cx| { cx.global_mut::<SessionGlobal>().selecting = false; }); return; };
+        let prepared = cx.update(|cx| prepare_destination(path, cx));
         let (path, expected, gaps) = match prepared {
             Ok(value) => value,
-            Err(error) => { let _ = cx.update(|cx| { cx.global_mut::<SessionGlobal>().selecting = false; show_error(&handle, &error.to_string(), cx); }); return; }
+            Err(error) => { cx.update(|cx| { cx.global_mut::<SessionGlobal>().selecting = false; show_error(&handle, &error.to_string(), cx); }); return; }
         };
         let replace = !matches!(expected, archive::Destination::Missing) && previous.as_ref().is_none_or(|(_, old)| old != &expected);
         if replace || gaps > 0 {
@@ -213,11 +213,11 @@ fn choose_save(save_as: bool, window: &mut Window, cx: &mut App) {
                 if gaps > 0 { format!("{gaps} remote history ranges are unavailable and will be omitted. ") } else { String::new() });
             let prompt = handle.update(cx, |_, window, cx| window.prompt(PromptLevel::Warning, "Save snapshot?", Some(&detail), &["Save", "Cancel"], cx));
             if match prompt { Ok(prompt) => prompt.await.ok() != Some(0), Err(_) => true } {
-                let _ = cx.update(|cx| { cx.global_mut::<SessionGlobal>().selecting = false; }); return;
+                cx.update(|cx| { cx.global_mut::<SessionGlobal>().selecting = false; }); return;
             }
         }
         if handle.update(cx, |_, window, cx| begin_export(path, expected, window, cx)).is_err() {
-            let _ = cx.update(|cx| { cx.global_mut::<SessionGlobal>().selecting = false; });
+            cx.update(|cx| { cx.global_mut::<SessionGlobal>().selecting = false; });
         }
     }).detach();
 }
@@ -291,21 +291,21 @@ fn begin_export(path: PathBuf, expected: archive::Destination, window: &mut Wind
     cx.spawn(async |cx| {
         loop {
             futures_lite::future::yield_now().await;
-            gpui::Timer::after(std::time::Duration::from_millis(100)).await;
-            let keep_polling = cx
-                .update(|cx| {
-                    let state = cx.global_mut::<SessionGlobal>();
-                    let Some(export) = &state.export else {
-                        return false;
-                    };
-                    if export.worker.is_finished() {
-                        finish_export(cx);
-                        return false;
-                    }
-                    cx.refresh_windows();
-                    true
-                })
-                .unwrap_or(false);
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            let keep_polling = cx.update(|cx| {
+                let state = cx.global_mut::<SessionGlobal>();
+                let Some(export) = &state.export else {
+                    return false;
+                };
+                if export.worker.is_finished() {
+                    finish_export(cx);
+                    return false;
+                }
+                cx.refresh_windows();
+                true
+            });
             if !keep_polling {
                 break;
             }
@@ -363,7 +363,7 @@ pub(crate) fn request_quit(window: &mut Window, cx: &mut App) {
         let Ok(answer) = prompt.await else {
             return;
         };
-        let _ = cx.update(|cx| {
+        cx.update(|cx| {
             if answer == 2 {
                 return;
             }
@@ -392,7 +392,7 @@ pub(crate) fn open_recording(window: &mut Window, cx: &mut App) {
         let Some(path) = paths.into_iter().next() else {
             return;
         };
-        let _ = cx.update(|cx| {
+        cx.update(|cx| {
             let result = (cx.global::<SessionGlobal>().open)(path);
             if let Err(error) = result {
                 show_error(&handle, &error.to_string(), cx);

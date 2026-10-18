@@ -60,7 +60,7 @@ impl Render for TabDragGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let mut header = super::tab::header(&theme, self.orientation);
-        *header.text_style() = Some(gpui::TextStyleRefinement {
+        *header.text_style() = gpui::TextStyleRefinement {
             font_family: Some(self.text_style.font_family.clone()),
             font_features: Some(self.text_style.font_features.clone()),
             font_fallbacks: self.text_style.font_fallbacks.clone(),
@@ -68,7 +68,7 @@ impl Render for TabDragGhost {
             font_style: Some(self.text_style.font_style),
             line_height: Some(self.text_style.line_height),
             ..Default::default()
-        });
+        };
         header
             .debug_selector(|| "tab-drag-ghost".into())
             .w(self.size.width)

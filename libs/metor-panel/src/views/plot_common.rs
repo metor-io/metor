@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use gpui::{
     Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point, SharedString, Styled, Task,
-    TextRun, Window, div, prelude::*, px,
+    TextAlign, TextRun, Window, div, prelude::*, px,
 };
 
 use crate::views::time_series::LABEL_FONT_SIZE;
@@ -129,7 +129,14 @@ pub fn paint_text_label(
     let shaped = window
         .text_system()
         .shape_line(text, font_size, &[run], None);
-    let _ = shaped.paint(origin(shaped.width, font_size), font_size, window, cx);
+    let _ = shaped.paint(
+        origin(shaped.width, font_size),
+        font_size,
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
 }
 
 /// Sync the tracker and task maps to the current `traces`: drop entries whose

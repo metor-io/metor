@@ -525,7 +525,14 @@ fn paint_tile(draw: &TileDraw, origin: Point<Pixels>, window: &mut Window) {
         ),
         gpui::size(px(draw.size as f32), px(draw.size as f32)),
     );
-    let _ = window.paint_image(bounds, Corners::default(), draw.image.clone(), 0, false);
+    let _ = window.paint_image(
+        bounds,
+        bounds,
+        Corners::default(),
+        draw.image.clone(),
+        0,
+        false,
+    );
 }
 
 impl Render for Map {

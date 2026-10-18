@@ -226,7 +226,7 @@ impl Render for AlarmView {
         }
 
         header = header
-            .child(div().flex_grow())
+            .child(div().flex_grow_1())
             .child(
                 div()
                     .id("alarm-ack-all")
@@ -265,7 +265,7 @@ impl Render for AlarmView {
             .id("alarm-list")
             .flex()
             .flex_col()
-            .flex_grow()
+            .flex_grow_1()
             .overflow_y_scroll();
 
         match &store {
@@ -420,7 +420,7 @@ fn pending_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
                     div()
                         .flex()
                         .flex_col()
-                        .flex_grow()
+                        .flex_grow_1()
                         .child(div().text_color(name_color).child(SharedString::from(name)))
                         .child(
                             div()
@@ -472,7 +472,7 @@ fn shelved_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
                 .border_color(theme.border_primary)
                 .child(
                     div()
-                        .flex_grow()
+                        .flex_grow_1()
                         .text_color(theme.text_primary)
                         .child(SharedString::from(name)),
                 )
@@ -559,7 +559,7 @@ fn history_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
                 )
                 .child(
                     div()
-                        .flex_grow()
+                        .flex_grow_1()
                         .text_color(theme.text_secondary)
                         .text_size(px(12.0))
                         .child(SharedString::from(text)),

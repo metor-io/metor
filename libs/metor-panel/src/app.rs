@@ -23,9 +23,8 @@ use crate::tiles::{
 };
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use gpui::{
-    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
-    MouseUpEvent, Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px,
-    size,
+    App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, MouseUpEvent,
+    Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px, size,
 };
 use metor_db::{DB, Server};
 use stellarator::net::TcpListener;
@@ -161,7 +160,7 @@ impl AppRoot {
             },
         )
         .detach();
-        inspector.focus_handle(cx).focus(window);
+        inspector.focus_handle(cx).focus(window, cx);
         self.inspector = Some(inspector);
         cx.notify();
     }
@@ -222,7 +221,7 @@ impl AppRoot {
             },
         )
         .detach();
-        transient.focus_handle(cx).focus(window);
+        transient.focus_handle(cx).focus(window, cx);
         self.transient = Some(transient);
         cx.notify();
     }
@@ -258,7 +257,7 @@ impl AppRoot {
             picker.set_parent_focus(parent_focus);
             picker
         });
-        picker.focus_handle(cx).focus(window);
+        picker.focus_handle(cx).focus(window, cx);
         self.connection_picker = Some(picker);
         cx.notify();
     }
@@ -541,7 +540,7 @@ impl Render for AppRoot {
             && picker.read(cx).dismissed
         {
             self.connection_picker = None;
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
         }
 
         if let Some(require_connection) = self.pending_connection_picker.take() {
@@ -1415,7 +1414,7 @@ impl PanelApp {
     /// app outlives its last window: closing them all leaves the process in
     /// the dock, and a reopen (dock click) spawns a fresh window.
     pub fn run(mut self) {
-        let app = Application::new().with_assets(crate::icons::IconAssets);
+        let app = gpui_platform::application().with_assets(crate::icons::IconAssets);
         app.on_reopen(|cx| {
             if crate::workspace::panel_windows(cx).is_empty()
                 && let Some((db, offline)) = cx
@@ -1582,21 +1581,15 @@ impl PanelApp {
         // `secondary-` resolves to cmd on macOS and ctrl elsewhere
         // (`cmd-` would be the Win/Super key off-macOS).
         cx.set_menus(vec![
-            gpui::Menu {
-                name: "Metor".into(),
-                items: vec![gpui::MenuItem::action(
-                    "Quit Metor",
-                    crate::session::QuitPanel,
-                )],
-            },
-            gpui::Menu {
-                name: "File".into(),
-                items: vec![
-                    gpui::MenuItem::action("Open recording…", crate::session::OpenRecording),
-                    gpui::MenuItem::action("Save snapshot", crate::session::SaveSnapshot),
-                    gpui::MenuItem::action("Save snapshot as…", crate::session::SaveSnapshotAs),
-                ],
-            },
+            gpui::Menu::new("Metor").items([gpui::MenuItem::action(
+                "Quit Metor",
+                crate::session::QuitPanel,
+            )]),
+            gpui::Menu::new("File").items([
+                gpui::MenuItem::action("Open recording…", crate::session::OpenRecording),
+                gpui::MenuItem::action("Save snapshot", crate::session::SaveSnapshot),
+                gpui::MenuItem::action("Save snapshot as…", crate::session::SaveSnapshotAs),
+            ]),
         ]);
         cx.bind_keys([
             KeyBinding::new("secondary-s", crate::session::SaveSnapshot, None),
@@ -1634,7 +1627,7 @@ impl PanelApp {
         // a quit inside the next autosave interval can't resurrect
         // the closed window. After the last close this is a no-op,
         // leaving the should-close snapshot that included it.
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if !crate::workspace::panel_windows(cx).is_empty() {
                 crate::connections::flush_layout_now(cx);
             }

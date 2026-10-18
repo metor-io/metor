@@ -72,7 +72,7 @@ impl Timeline {
         cx: &mut Context<Self>,
     ) {
         self.clear_hover(cx);
-        self.focus.focus(window);
+        self.focus.focus(window, cx);
         let (Some(area), Some(view)) = (self.area, self.viewport) else {
             return;
         };

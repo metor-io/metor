@@ -9,7 +9,9 @@
 //! popovers. Chips truncate to the gap before the next flag and collapse to a
 //! bare nub when even a couple of characters won't fit.
 
-use gpui::{Bounds, Hsla, PathBuilder, Pixels, Rgba, SharedString, TextRun, Window, point, px};
+use gpui::{
+    Bounds, Hsla, PathBuilder, Pixels, Rgba, SharedString, TextAlign, TextRun, Window, point, px,
+};
 use metor_proto::types::Timestamp;
 
 use crate::plot_events::PlotEvent;
@@ -236,7 +238,7 @@ pub(crate) fn paint_event_flags(
                     x + px(CHIP_PAD_X),
                     chip_y + (px(CHIP_H) - chip_font_size) / 2.0,
                 );
-                let _ = shaped.paint(origin, chip_font_size, window, cx);
+                let _ = shaped.paint(origin, chip_font_size, TextAlign::Left, None, window, cx);
             }
             _ => {
                 // No room for text: a bare rounded nub marks the flag.

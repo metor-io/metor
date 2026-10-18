@@ -119,7 +119,7 @@ impl Render for SequenceControl {
             .child(div().w(px(8.0)).h(px(8.0)).rounded(px(4.0)).bg(color))
             .child(
                 div()
-                    .flex_grow()
+                    .flex_grow_1()
                     .truncate()
                     .text_color(theme.text_primary)
                     .text_size(px(12.0))
@@ -199,7 +199,7 @@ impl Render for SequenceControl {
                 )
                 .child(
                     div()
-                        .flex_grow()
+                        .flex_grow_1()
                         .truncate()
                         .text_size(px(11.0))
                         .text_color(theme.text_tertiary)

@@ -616,10 +616,7 @@ pub(crate) fn preset_save_rows(tiles: Entity<TileGroup>) -> Vec<Box<dyn Inspecto
                 let Ok(Ok(Some(path))) = receiver.await else {
                     return;
                 };
-                let json = match cx.update(|cx| tiles.read(cx).to_json(cx)) {
-                    Ok(j) => j,
-                    Err(_) => return,
-                };
+                let json = cx.update(|cx| tiles.read(cx).to_json(cx));
                 if let Err(e) = std::fs::write(&path, json) {
                     tracing::error!(path = %path.display(), %e, "save preset failed");
                 }
@@ -670,7 +667,7 @@ pub(crate) fn preset_load_rows(tiles: Entity<TileGroup>, cx: &App) -> Vec<Box<dy
                 let Some(path) = paths.into_iter().next() else {
                     return;
                 };
-                let _ = cx.update(|cx| read_and_load(&path, &tiles, cx));
+                cx.update(|cx| read_and_load(&path, &tiles, cx));
             })
             .detach();
         }),

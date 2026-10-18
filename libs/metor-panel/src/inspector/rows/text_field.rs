@@ -606,7 +606,14 @@ impl TextField {
                             ));
                         }
 
-                        let _ = line.paint(origin, line_height, window, cx);
+                        let _ = line.paint(
+                            origin,
+                            line_height,
+                            gpui::TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
 
                         if !showing_placeholder && (*start..=start + len).contains(&cursor) {
                             let caret_x = origin.x + x_at(cursor);
@@ -718,7 +725,14 @@ impl TextField {
                         window.paint_quad(fill(sel_bounds, selection_color));
                     }
 
-                    let _ = shaped.paint(text_origin, line_height, window, _cx);
+                    let _ = shaped.paint(
+                        text_origin,
+                        line_height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        _cx,
+                    );
 
                     let cursor_screen_x = bounds.origin.x + align_offset + cursor_x
                         - scroll_offset

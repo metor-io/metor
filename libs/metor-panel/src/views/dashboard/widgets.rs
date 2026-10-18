@@ -1018,8 +1018,14 @@ impl Render for ImageWidget {
                 canvas(
                     move |_, _, _| {},
                     move |bounds, _, window, _| {
-                        let _ =
-                            window.paint_image(bounds, Corners::default(), img.clone(), 0, false);
+                        let _ = window.paint_image(
+                            bounds,
+                            bounds,
+                            Corners::default(),
+                            img.clone(),
+                            0,
+                            false,
+                        );
                     },
                 )
                 .size_full(),
