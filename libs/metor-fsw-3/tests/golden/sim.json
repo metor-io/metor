@@ -14,7 +14,11 @@
       "id": "gps",
       "ty": "echo.gps",
       "params": null,
-      "inputs": []
+      "inputs": [],
+      "location": {
+        "file": "tests/golden/sim.py",
+        "line": 11
+      }
     },
     {
       "id": "io_submit",
@@ -30,7 +34,11 @@
           "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n"
         ]
       },
-      "inputs": []
+      "inputs": [],
+      "location": {
+        "file": "tests/golden/sim.py",
+        "line": 12
+      }
     },
     {
       "id": "io_complete",

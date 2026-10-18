@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Generic, Sequence, TypeAlias, TypeVar, Union
 
@@ -154,6 +156,8 @@ class System:
     """The name this system was given in `Target.add`."""
     _target: Any = None
     """The `Target` this system was added to."""
+    _location: dict[str, Any] | None = None
+    """The file and line of the code that created this system."""
 
     def __init__(
         self,
@@ -164,6 +168,7 @@ class System:
         records: Sequence[type[Record]] = (),
         grants: dict[str, Any] | None = None,
     ) -> None:
+        self._location = _location(self)
         self._grants = dict(grants or {})
         self._inputs = {port: _sources(port, src) for port, src in inputs.items()}
         self._inputs.update(_edges(_item_ports(items)))
@@ -192,6 +197,26 @@ class System:
     def _params_for(self, target: Any, index: int) -> Any:
         """Returns the `params` config entry for this registration."""
         return self._params or None
+
+
+_PACKAGE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _location(system: System) -> dict[str, Any] | None:
+    """Returns the file and line of the code that created ``system``.
+
+    That is the first caller that is neither one of ``system``'s
+    constructors nor part of this package. The file is relative to the
+    working directory, as `metor run` prints it.
+    """
+    frame = sys._getframe(1)
+    while frame is not None:
+        path = os.path.abspath(frame.f_code.co_filename)
+        own = frame.f_locals.get("self") is system or path.startswith(_PACKAGE + os.sep)
+        if not own:
+            return {"file": os.path.relpath(path), "line": frame.f_lineno}
+        frame = frame.f_back
+    return None
 
 
 def _item_ports(items: Sequence[Item]) -> list[OutPort[Any]]:

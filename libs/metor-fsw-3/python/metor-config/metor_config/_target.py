@@ -306,6 +306,8 @@ class Target:
         outputs = system._outputs_for(self, index)
         if outputs:
             entry["outputs"] = _json(outputs)
+        if system._location is not None:
+            entry["location"] = system._location
         return entry
 
     def _clock(self) -> dict[str, Any]:

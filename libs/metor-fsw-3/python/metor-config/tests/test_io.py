@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import runpy
@@ -254,10 +255,12 @@ class SimTests(unittest.TestCase):
         self.assertEqual([s["id"] for s in systems], ["gps", "model", "io_submit", "io_complete"])
 
     def test_sim_golden_matches(self) -> None:
-        golden = os.path.join(os.path.dirname(__file__), "..", "..", "..", "tests", "golden")
+        crate = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+        golden = os.path.join(crate, "tests", "golden")
         sys.path.insert(0, golden)
         try:
-            runpy.run_path(os.path.join(golden, "sim.py"))
+            with contextlib.chdir(crate):
+                runpy.run_path(os.path.join("tests", "golden", "sim.py"))
         finally:
             sys.path.remove(golden)
         written = target_mod._targets[-1].to_config()["coordinator"]

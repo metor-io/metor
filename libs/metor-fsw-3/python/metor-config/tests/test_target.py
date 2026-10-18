@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import inspect
+import os
 import unittest
 
 from adcs_stub import PACK, Ctrl, Fan, Hold, Mode, MotorCmd, Nav, Ping, Plant, Safe, Tap
@@ -130,6 +133,31 @@ class TargetTest(ConfigTest):
     def test_reject_non_source_input(self) -> None:
         with self.assertRaisesRegex(ConfigError, "input `imu`"):
             Nav(imu="plant.imu")  # type: ignore[arg-type]
+
+
+class LocationTest(ConfigTest):
+    def test_system_records_where_it_was_created(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        plant = Plant()
+        line = inspect.currentframe().f_lineno - 1  # type: ignore[union-attr]
+        fsw.add("plant", plant)
+        fsw.add("pub", Publish([], listen="127.0.0.1:0"))
+        plant_entry, pub_entry = fsw.to_config()["coordinator"]["systems"]
+        here = os.path.relpath(__file__)
+        self.assertEqual(plant_entry["location"], {"file": here, "line": line})
+        self.assertEqual(pub_entry["location"], {"file": here, "line": line + 3})
+
+    def test_location_is_relative_to_the_working_directory(self) -> None:
+        with contextlib.chdir(os.path.dirname(os.path.abspath(__file__))):
+            nav = Nav()
+        self.assertEqual(nav._location["file"], os.path.basename(__file__))  # type: ignore[index]
+
+    def test_system_without_a_location_omits_it(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        mode = Mode()
+        mode._location = None
+        fsw.add("mode", mode)
+        self.assertNotIn("location", fsw.to_config()["coordinator"]["systems"][0])
 
 
 class LinkTest(ConfigTest):
