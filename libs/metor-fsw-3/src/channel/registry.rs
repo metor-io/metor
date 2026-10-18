@@ -91,7 +91,7 @@ mod tests {
         Ctor::<Registry, (RegistryParams,)>::make(
             &Registry::new,
             Params(&params),
-            &mut crate::io::IoInit::empty(),
+            &mut crate::io::IoInit::empty("registry"),
         )
     }
 
