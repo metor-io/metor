@@ -27,8 +27,8 @@ impl<K: Interface> Param for Cap<K> {
 
     fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Cap<K>, MakeError> {
         param_name(names);
-        // PANIC Safety: `fn_system::bind` builds a queue for every set with a
-        // grant, and a `Cap` adds one.
+        // PANIC Safety: `MakeCx::bind_ports` builds a queue for every def
+        // with a grant, and a `Cap` adds one.
         let io = writers
             .io
             .as_ref()

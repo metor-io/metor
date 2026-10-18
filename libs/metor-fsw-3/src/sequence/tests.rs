@@ -135,20 +135,16 @@ fn step_over<S: SequenceFn>(
             writer: ring.writer(NoWake).expect("a free writer"),
         })
         .collect();
-    let mut inputs = inputs.into_iter();
-    let abort = crate::port::Input::new(inputs.next().expect("the abort binding").views);
-    let instance = crate::fn_system::Instance {
-        id: "seq".into(),
-        seed: Some(0),
-        ..Default::default()
+    let cx = crate::system::BindCx {
+        instance: crate::fn_system::Instance {
+            id: "seq".into(),
+            seed: Some(0),
+            ..Default::default()
+        },
+        io: None,
     };
-    let (ins, outs, _io) = crate::fn_system::bind_with_io::<S>(
-        inputs.collect(),
-        outputs,
-        instance,
-        &mut Default::default(),
-    )
-    .expect("binds");
+    let super::SeqInputs { abort, ins } = super::SeqInputs::<S>::bind(inputs, &cx).expect("binds");
+    let outs = crate::fn_system::OutSet::<S>::bind(outputs, &cx).expect("binds");
     (SequenceStep::new::<S>(state, abort, ins, outs), rings)
 }
 

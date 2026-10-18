@@ -14,7 +14,7 @@ use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, InSet, OutSet, SystemFn};
 use crate::io::{Io, IoState};
 use crate::port::{Input, Output};
-use crate::sequence::{self, SequenceFn, SequenceStep};
+use crate::sequence::{self, SeqInputs, SequenceFn, SequenceStep};
 use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 use crate::thread::{DEFAULT_THREAD, LaunchCx, Launched, Threads};
 
@@ -470,15 +470,9 @@ impl TableEntry {
             doc: Cow::Borrowed(S::DOC),
             schema: C::schema(),
             make: Arc::new(move |mut cx| {
-                let instance = fn_system::Instance::from_make_cx(&cx);
-                let (views, writers) = cx.take_bindings();
-                let mut views = views.into_iter();
-                // PANIC Safety: `def` declares `abort` first, and build binds one
-                // list per declared input.
-                let abort = Input::new(views.next().expect("the abort binding").views);
-                let (ins, outs, io) =
-                    fn_system::bind_with_io::<S>(views.collect(), writers, instance, cx.io)?;
+                let (inputs, outs, io) = cx.bind_ports::<SeqInputs<S>, OutSet<S>>()?;
                 let state = ctor.make_with_io(cx.id, cx.params, io.as_ref())?;
+                let SeqInputs { abort, ins } = inputs;
                 Ok(Box::new(SequenceStep::new::<S>(state, abort, ins, outs)))
             }),
         })

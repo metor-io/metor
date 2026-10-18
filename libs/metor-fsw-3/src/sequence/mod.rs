@@ -87,10 +87,12 @@ mod tests;
 use metor_fsw_3_ring::NoWake;
 
 use crate::channel::{ABORT_PORT, AbortRequest};
+use crate::coordinator::ParamError;
 use crate::def::{DefCx, DefError};
 use crate::fn_system::{Defs, FnSignature, InSet, OutSet, Param};
+use crate::io::IoPorts;
 use crate::port::Input;
-use crate::system::{Ports, SystemDef};
+use crate::system::{BindCx, InputBinding, PortDef, Ports, SystemDef};
 
 pub use redline::Redline;
 pub use seq::{NextCycle, OnAbort, Seq, SeqError, Sleep, WaitFor};
@@ -139,14 +141,43 @@ pub trait SequenceFn: FnSignature {
 /// The inputs are `abort` followed by the parameters' inputs. The outputs
 /// are the parameters' outputs followed by `log`.
 pub fn def<S: SequenceFn>(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+    let defs = Defs::of::<S>(cx)?;
     let mut inputs = vec![Input::<AbortRequest>::def(cx, ABORT_PORT)];
-    inputs.extend(InSet::<S>::defs(cx)?);
+    let params_from = inputs.len();
+    inputs.extend(defs.inputs);
     let (outputs, log) = OutSet::<S>::defs_with_log(cx)?;
     Ok(SystemDef {
         name: S::NAME.into(),
         inputs,
         outputs,
         log: Some(log),
-        grants: Defs::of::<S>(cx)?.grants,
+        grants: defs.grants,
+        io: defs.io.map(|io| IoPorts {
+            cq: params_from + io.cq,
+            ..io
+        }),
     })
+}
+
+/// A sequence's inputs: `abort`, then its parameters' inputs.
+pub(crate) struct SeqInputs<S: SequenceFn> {
+    pub(crate) abort: Input<AbortRequest>,
+    pub(crate) ins: InSet<S>,
+}
+
+impl<S: SequenceFn> Ports<InputBinding> for SeqInputs<S> {
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        Ok(def::<S>(cx)?.inputs)
+    }
+
+    fn bind(inputs: Vec<InputBinding>, cx: &BindCx) -> Result<Self, ParamError> {
+        let mut inputs = inputs.into_iter();
+        // PANIC Safety: `def` declares `abort` first, and build binds one
+        // list per declared input.
+        let abort = Input::new(inputs.next().expect("the abort binding").views);
+        Ok(Self {
+            abort,
+            ins: InSet::bind(inputs.collect(), cx)?,
+        })
+    }
 }

@@ -202,6 +202,7 @@ fn slot_entry(shared: &Shared) -> TableEntry {
         outputs: Vec::new(),
         log: None,
         grants: Vec::new(),
+        io: None,
     };
     TableEntry {
         kind: SystemKind::Cyclic,
@@ -495,6 +496,7 @@ fn test_channel_def_appends_ports() {
         outputs: Vec::new(),
         log: None,
         grants: Vec::new(),
+        io: None,
     };
     let def = crate::channel::def(inner, &DefCx::empty()).expect("no reserved ports");
     let inputs: Vec<_> = def.inputs.iter().map(|p| p.name.as_ref()).collect();

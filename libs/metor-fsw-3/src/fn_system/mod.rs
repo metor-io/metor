@@ -24,8 +24,6 @@ use crate::{
 pub use ctor::{Ctor, WithIo};
 pub use param::{Cycle, Param, ParamNames, Refresh, Views, Writers};
 pub(crate) use param::{Defs, Instance, param_name};
-pub(crate) use set::Instance;
-pub(crate) use set::bind_with_io;
 pub use set::{InSet, LOG_PORT, OutSet};
 
 /// Describes the parameters of a system written as a fn.
