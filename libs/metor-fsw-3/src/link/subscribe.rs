@@ -280,7 +280,7 @@ impl<'a> Routes<'a> {
             let Some(&index) = self.index.get(&(ty, id)) else {
                 continue;
             };
-            if self.ports[index].write_bytes(bytes).is_err() {
+            if self.ports[index].write(bytes).is_err() {
                 full += 1;
             }
         }
@@ -297,7 +297,7 @@ mod tests {
 
     use crate::DefCx;
 
-    use crate::record::Record;
+    use crate::record::{Payload, Record};
     use crate::system::{OutputBinding, PortDef, Ports};
     use crate::tests::utils::{Fixed, Imu, Note, ring};
 

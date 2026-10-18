@@ -123,7 +123,7 @@ mod tests {
     use crate::port::Input;
     use crate::record::MsgCodec;
     use crate::tests::utils::{Fixed, Imu};
-    use crate::{DefCx, Record};
+    use crate::{DefCx, Payload, Record};
 
     use super::*;
 
@@ -133,9 +133,7 @@ mod tests {
         arm: bool,
     }
 
-    impl Record for Telecommand {
-        const NAME: &'static str = "telecommand";
-        const MAX_LEN: usize = 16;
+    impl Payload for Telecommand {
         type Read<'a> = Self;
 
         fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], crate::EncodeError> {
@@ -145,8 +143,13 @@ mod tests {
         fn decode(bytes: &[u8]) -> Result<Self, crate::DecodeError> {
             crate::record::json::decode(bytes)
         }
+    }
 
-        fn schema() -> RecordSchema {
+    impl Record for Telecommand {
+        const NAME: &'static str = "telecommand";
+        const MAX_LEN: usize = 16;
+
+        fn schema_with_root(_root: &str) -> RecordSchema {
             RecordSchema::msg(Self::NAME, MsgCodec::Json)
         }
     }
