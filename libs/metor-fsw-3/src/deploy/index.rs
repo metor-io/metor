@@ -2,10 +2,8 @@
 
 use std::collections::HashMap;
 
-use super::DeploymentConfig;
-use crate::coordinator::{
-    OutputSource, PeerPort, PortRef, SystemConfig, SystemStatus, SystemTable,
-};
+use super::{DeploySource, DeploySystem, DeploymentConfig, PeerPort};
+use crate::coordinator::{OutputSource, PortRef, SystemConfig, SystemStatus, SystemTable};
 use crate::def::{DefCx, Records};
 use crate::system::{PortDef, SystemDef};
 
@@ -27,7 +25,7 @@ impl SystemIndex {
     /// Every system in `envelope`, in target and step order, with its index.
     pub(crate) fn iter(
         envelope: &DeploymentConfig,
-    ) -> impl Iterator<Item = (SystemIndex, &SystemConfig)> {
+    ) -> impl Iterator<Item = (SystemIndex, &DeploySystem)> {
         envelope
             .targets
             .iter()
@@ -42,11 +40,11 @@ impl SystemIndex {
             })
     }
 
-    pub(crate) fn get(self, envelope: &DeploymentConfig) -> &SystemConfig {
+    pub(crate) fn get(self, envelope: &DeploymentConfig) -> &DeploySystem {
         &envelope.targets[self.target].coordinator.systems[self.system]
     }
 
-    pub(crate) fn get_mut(self, envelope: &mut DeploymentConfig) -> &mut SystemConfig {
+    pub(crate) fn get_mut(self, envelope: &mut DeploymentConfig) -> &mut DeploySystem {
         &mut envelope.targets[self.target].coordinator.systems[self.system]
     }
 }
@@ -176,7 +174,7 @@ impl<'a> DefIndex<'a> {
                 },
             )
         })?;
-        let system = self.resolved_outputs(index, system)?;
+        let system = self.runtime(index)?;
         let producers = self.producers(index, &system, &entry.def)?;
         SystemDef::instance(
             &system,
@@ -212,20 +210,14 @@ impl<'a> DefIndex<'a> {
         Ok(edges)
     }
 
-    /// Returns a copy of the system's config with every peer output replaced
-    /// by its definition.
-    fn resolved_outputs(
-        &mut self,
-        index: SystemIndex,
-        system: &SystemConfig,
-    ) -> Result<SystemConfig, DeployError> {
-        let mut system = system.clone();
-        for output in &mut system.outputs {
-            if let OutputSource::Peer(peer) = &output.source {
-                output.source = OutputSource::Def(self.peer_port(index, &output.port, peer)?);
-            }
-        }
-        Ok(system)
+    /// Returns the runtime form of the system at `index`, with every peer
+    /// output replaced by its definition.
+    pub(crate) fn runtime(&mut self, index: SystemIndex) -> Result<SystemConfig, DeployError> {
+        let system = index.get(self.envelope).clone();
+        system.try_map_outputs(|port, source| match source {
+            DeploySource::Runtime(source) => Ok(source),
+            DeploySource::Peer(peer) => self.peer_port(index, port, &peer).map(OutputSource::Def),
+        })
     }
 
     /// Returns the definition feeding each input edge.

@@ -45,6 +45,9 @@ pub enum DeployError {
     #[error("target `{target}`: {source}")]
     Build { target: String, source: BuildError },
 
+    #[error("`{system}`'s output `{port}` names a peer's port that is not resolved")]
+    Unresolved { system: String, port: String },
+
     #[error("`{system}`'s params: {message}")]
     Params { system: String, message: String },
 

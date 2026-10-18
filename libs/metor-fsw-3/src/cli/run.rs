@@ -23,7 +23,9 @@ use super::pack_dev::{PackDevError, pack_dev};
 use crate::coordinator::{
     BuildError, BuildOptions, Clock, Coordinator, EndReason, SystemTable, WallRate,
 };
-use crate::deploy::{self, ConfigError, DeployError, DeploymentConfig, TargetConfig};
+use crate::deploy::{
+    self, ConfigError, DeployError, DeploymentConfig, ResolvedDeployment, TargetConfig,
+};
 use crate::dl::store;
 use crate::dl::{Pack, PackError, PackRef};
 use crate::pack::ABI_VERSION;
@@ -137,7 +139,7 @@ pub fn run(args: Run) -> Result<(), RunError> {
 ///
 /// The resolved config is written to a temp file for the children to read.
 /// Returns once every child has exited.
-fn run_children(config: &DeploymentConfig, args: &Run) -> Result<(), RunError> {
+fn run_children(config: &ResolvedDeployment, args: &Run) -> Result<(), RunError> {
     let path = std::env::temp_dir().join(format!("metor-deploy-{}.json", std::process::id()));
     std::fs::write(
         &path,
@@ -175,7 +177,7 @@ fn install_logging() {
 /// Rebuilds every dev pack next to `target` first. A `.py` file is evaluated,
 /// and a `.json` file is read as is. If the config still has peer references,
 /// every target's packs are opened to resolve them.
-pub fn prepare(target: Option<&Path>) -> Result<DeploymentConfig, RunError> {
+pub fn prepare(target: Option<&Path>) -> Result<ResolvedDeployment, RunError> {
     let target = target.unwrap_or(Path::new("target.py"));
     let packs = dev_packs(target.parent().unwrap_or(Path::new(".")));
     for pack in &packs {
@@ -197,7 +199,7 @@ pub fn prepare(target: Option<&Path>) -> Result<DeploymentConfig, RunError> {
         deploy::resolve_slots(&mut config, &tables, &store::dir(&dir))?;
         deploy::resolve(&mut config, &tables)?;
     }
-    Ok(config)
+    Ok(config.into_runtime()?)
 }
 
 /// Returns the dev packs a target depends on.
@@ -352,7 +354,7 @@ fn apply_overrides(config: &TargetConfig, overrides: &Run) -> Result<TargetConfi
 
 /// Builds the system table for a target: the built-ins plus every pack the
 /// target lists.
-fn table_for(config: &TargetConfig) -> Result<SystemTable, RunError> {
+fn table_for<S>(config: &TargetConfig<S>) -> Result<SystemTable, RunError> {
     let mut table = SystemTable::new();
     crate::builtins::register_builtins(&mut table)?;
     let opened: Vec<Pack> = config

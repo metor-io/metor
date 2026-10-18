@@ -21,7 +21,7 @@ pub(crate) struct Part<T> {
 
 impl<T: Serialize + DeserializeOwned> Part<T> {
     /// Decodes `T` from `system`'s params.
-    pub(crate) fn read(system: &SystemConfig) -> Result<Self, DeployError> {
+    pub(crate) fn read<O>(system: &SystemConfig<O>) -> Result<Self, DeployError> {
         let Value::Object(rest) = &system.params else {
             return Err(params_error(system, "params are not an object"));
         };
@@ -34,7 +34,7 @@ impl<T: Serialize + DeserializeOwned> Part<T> {
 
     /// Writes `part`'s fields back into `system`'s params. Every other key is
     /// kept.
-    pub(crate) fn write(self, system: &mut SystemConfig) -> Result<(), DeployError> {
+    pub(crate) fn write<O>(self, system: &mut SystemConfig<O>) -> Result<(), DeployError> {
         let Value::Object(fields) =
             serde_json::to_value(&self.part).map_err(|e| params_error(system, e))?
         else {
@@ -47,7 +47,7 @@ impl<T: Serialize + DeserializeOwned> Part<T> {
     }
 }
 
-fn params_error(system: &SystemConfig, message: impl ToString) -> DeployError {
+fn params_error<O>(system: &SystemConfig<O>, message: impl ToString) -> DeployError {
     DeployError::Params {
         system: system.id.clone(),
         message: message.to_string(),

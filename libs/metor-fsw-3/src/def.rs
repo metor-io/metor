@@ -87,7 +87,7 @@ impl DefCx<'_> {
     /// Returns definitions for config outputs that no declared port claimed.
     ///
     /// Each port's record comes from the record the config names, or from the
-    /// definition `metor build` resolved for it.
+    /// definition the config gives.
     pub fn dyn_output_defs(
         &self,
         declared: &[Cow<'static, str>],
@@ -100,9 +100,6 @@ impl DefCx<'_> {
                 OutputSource::Def(def) => Ok(PortDef {
                     name: output.port.clone().into(),
                     ..def.clone()
-                }),
-                OutputSource::Peer(_) => Err(DefError::Unresolved {
-                    port: output.port.clone(),
                 }),
             })
             .collect()
@@ -129,9 +126,6 @@ pub enum DefError {
 
     #[error("the pack refused the definition: {message}")]
     Pack { message: String },
-
-    #[error("output `{port}` names a peer's port that is not resolved; run `metor build`")]
-    Unresolved { port: String },
 
     #[error("slot: {message}")]
     Slot { message: String },

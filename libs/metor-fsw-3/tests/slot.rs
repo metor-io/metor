@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use common::{Ping, fixture_lib};
 use metor_fsw_3::deploy::{self, DeployError};
-use metor_fsw_3::deploy::{CONFIG_VERSION, DeploymentConfig, TargetConfig};
+use metor_fsw_3::deploy::{CONFIG_VERSION, DeploySystem, DeploymentConfig, TargetConfig};
 use metor_fsw_3::dl::store;
 use metor_fsw_3::dl::{cdylib_name, triple};
 use metor_fsw_3::metor_proto_wkt::{
@@ -413,13 +413,19 @@ fn unresolved(name: &str, ty: &str, libs: &Path) -> Value {
     json!({ "name": name, "ty": ty, "pack": pack_ref(libs) })
 }
 
+/// A runtime config as a deployment writes it.
+fn deployed<T: serde::Serialize, D: serde::de::DeserializeOwned>(runtime: T) -> D {
+    let json = serde_json::to_value(runtime).expect("encodes");
+    serde_json::from_value(json).expect("a runtime config is a deployment config")
+}
+
 fn envelope(allow: Vec<Value>) -> DeploymentConfig {
     DeploymentConfig {
         config_version: CONFIG_VERSION,
         hosts: Default::default(),
         targets: vec![TargetConfig {
             packs: Vec::new(),
-            coordinator: config(json!({ "allow": allow }), channel()),
+            coordinator: deployed(config(json!({ "allow": allow }), channel())),
         }],
     }
 }
@@ -455,8 +461,8 @@ fn test_build_resolves_into_store() {
     let params = slot(&envelope);
     let hash = store::hash(fixture_lib()).expect("reads");
     for candidate in params["allow"].as_array().expect("a list") {
-        assert!(candidate["source"].get("pack").is_none());
-        let stored = &candidate["source"]["stored"];
+        assert!(candidate.get("pack").is_none());
+        let stored = &candidate["stored"];
         assert_eq!(stored["hash"], json!(hash.to_hex().as_str()));
         let path = PathBuf::from(stored["path"].as_str().expect("a path"));
         assert!(path.starts_with(&store), "{}", path.display());
@@ -468,7 +474,8 @@ fn test_build_resolves_into_store() {
     deploy::resolve_slots(&mut envelope, &[table(&seen)], &store).expect("resolves");
     assert_eq!(*slot(&envelope), before);
 
-    let mut coordinator = envelope.targets[0]
+    let runtime = envelope.into_runtime().expect("no peers");
+    let mut coordinator = runtime.targets[0]
         .coordinator
         .clone()
         .build(&table(&seen))
@@ -480,8 +487,8 @@ fn test_build_resolves_into_store() {
 }
 
 /// Returns the config for slot `next`, which reads slot `mode`'s output.
-fn next_slot(libs: &Path) -> SystemConfig {
-    SystemConfig {
+fn next_slot(libs: &Path) -> DeploySystem {
+    deployed::<SystemConfig, _>(SystemConfig {
         params: json!({ "allow": [unresolved("down", "count_down", libs)] }),
         adapter: Some(Adapter::Channel(ChannelConfig {
             name: metor_fsw_3::ChannelName::try_from("next".to_string()).expect("a short name"),
@@ -489,7 +496,7 @@ fn next_slot(libs: &Path) -> SystemConfig {
         })),
         inputs: vec![InputConfig::new("input", "mode", "output")],
         ..SystemConfig::new("next", "fsw.dl_slot")
-    }
+    })
 }
 
 /// A slot that reads another slot's output resolves against that slot's
@@ -505,7 +512,7 @@ fn test_build_resolves_chained_slots() {
     resolve(&mut envelope, &store).expect("resolves");
     assert!(!deploy::unresolved(&envelope).expect("decodes"));
     let next = &envelope.targets[0].coordinator.systems[4].params;
-    assert!(next["allow"][0]["source"]["stored"]["def"].is_object());
+    assert!(next["allow"][0]["stored"]["def"].is_object());
 }
 
 /// A slot that reads from a slot later in step order is rejected.
@@ -542,7 +549,7 @@ fn test_build_refuses_disagreeing_candidates() {
 fn test_build_refuses_missing_pack() {
     let (dir, libs, store) = scratch();
     let mut missing = unresolved("up", "count_up", &libs);
-    missing["source"]["pack"]["libs"] = json!(dir.path().join("nowhere"));
+    missing["pack"]["libs"] = json!(dir.path().join("nowhere"));
     let result = resolve(&mut envelope(vec![missing]), &store);
     assert!(
         matches!(result, Err(DeployError::Slot { .. })),
@@ -560,7 +567,7 @@ fn test_build_refuses_missing_pack() {
 fn test_build_refuses_long_library_name() {
     let (_dir, libs, store) = scratch();
     let mut long = unresolved("up", "count_up", &libs);
-    long["source"]["pack"]["lib"] = json!("l".repeat(64));
+    long["pack"]["lib"] = json!("l".repeat(64));
     let result = resolve(&mut envelope(vec![long]), &store);
     assert!(
         matches!(result, Err(DeployError::ArtifactName { cap: 63, .. })),

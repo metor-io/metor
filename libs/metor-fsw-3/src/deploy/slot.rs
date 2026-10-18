@@ -14,7 +14,7 @@ use super::DeploymentConfig;
 use crate::FrameStr;
 use crate::coordinator::SystemTable;
 use crate::def::{DefCx, DefError};
-use crate::dl::slot::{Candidate, SlotParams, Source, Stored};
+use crate::dl::slot::{Candidate, SlotParams, Stored};
 use crate::dl::{Pack, PackRef, SLOT_TYPE, store};
 use crate::pack::def::DefCxOwned;
 use crate::system::SystemDef;
@@ -25,6 +25,34 @@ use super::index::{DefIndex, SystemIndex};
 /// The size of the frame string a channel's status carries a library's file
 /// name in.
 const ARTIFACT_LEN: usize = 64;
+
+/// A slot's params as a deployment writes them.
+#[derive(Deserialize)]
+struct DeploySlot {
+    allow: Vec<DeployCandidate>,
+    #[serde(default)]
+    initial: Option<String>,
+}
+
+/// A candidate as a deployment writes it.
+#[derive(Deserialize)]
+struct DeployCandidate {
+    name: String,
+    ty: String,
+    #[serde(default)]
+    params: Value,
+    #[serde(flatten)]
+    library: Library,
+}
+
+/// Where a candidate's library is: in a pack `metor build` has not opened
+/// yet, or already in the store.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Library {
+    Pack(PackRef),
+    Stored(Stored),
+}
 
 /// Returns true if any slot in `envelope` has a candidate that is not yet
 /// resolved.
@@ -39,13 +67,13 @@ pub(crate) fn unresolved(envelope: &DeploymentConfig) -> Result<bool, DeployErro
 /// pack, with its decoded params.
 fn unresolved_slots(
     envelope: &DeploymentConfig,
-) -> Result<Vec<(SystemIndex, SlotParams)>, DeployError> {
+) -> Result<Vec<(SystemIndex, DeploySlot)>, DeployError> {
     let mut slots = Vec::new();
     for (index, system) in SystemIndex::iter(envelope) {
         if system.ty != SLOT_TYPE {
             continue;
         }
-        let params = SlotParams::deserialize(&system.params).map_err(|e| DeployError::Slot {
+        let params = DeploySlot::deserialize(&system.params).map_err(|e| DeployError::Slot {
             slot: format!(
                 "{}.{}",
                 envelope.targets[index.target].namespace(),
@@ -56,7 +84,7 @@ fn unresolved_slots(
         let pending = params
             .allow
             .iter()
-            .any(|candidate| matches!(candidate.source, Source::Pack(_)));
+            .any(|candidate| matches!(candidate.library, Library::Pack(_)));
         if pending {
             slots.push((index, params));
         }
@@ -106,7 +134,7 @@ impl SlotCx {
                 id: system.id.clone(),
                 namespace: envelope.targets[index.target].coordinator.namespace.clone(),
                 inputs: defs.edges(index)?,
-                outputs: system.outputs.clone(),
+                outputs: defs.runtime(index)?.outputs,
                 records: defs.records(index.target).clone(),
                 params: Value::Null,
             },
@@ -120,38 +148,52 @@ impl SlotCx {
         }
     }
 
-    /// Returns the slot's params with every candidate resolved.
+    /// Returns the slot's runtime params, with every candidate resolved.
     ///
     /// Every candidate must have the same ports as the first one.
-    fn params(&self, mut params: SlotParams, store: &Path) -> Result<Value, DeployError> {
-        let mut first: Option<(String, SystemDef)> = None;
-        for candidate in &mut params.allow {
-            let def = self.resolve(candidate, store)?;
-            match &first {
-                Some((first, first_def)) if !first_def.same_ports(&def) => {
-                    return Err(DeployError::SlotContract {
-                        slot: self.slot.clone(),
-                        first: first.clone(),
-                        candidate: candidate.name.clone(),
-                    });
-                }
-                Some(_) => {}
-                None => first = Some((candidate.name.clone(), def)),
-            }
+    fn params(&self, params: DeploySlot, store: &Path) -> Result<Value, DeployError> {
+        let allow = params
+            .allow
+            .into_iter()
+            .map(|candidate| self.resolve(candidate, store))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let [first, rest @ ..] = allow.as_slice()
+            && let Some(other) = rest
+                .iter()
+                .find(|other| !first.stored.def.same_ports(&other.stored.def))
+        {
+            return Err(DeployError::SlotContract {
+                slot: self.slot.clone(),
+                first: first.name.clone(),
+                candidate: other.name.clone(),
+            });
         }
+        let params = SlotParams {
+            allow,
+            initial: params.initial,
+        };
         serde_json::to_value(&params).map_err(|e| self.fail(e.to_string()))
     }
 
-    /// Copies a pack candidate's library into the store and points the
-    /// candidate at the stored copy. Returns the candidate's ports.
-    fn resolve(&self, candidate: &mut Candidate, store: &Path) -> Result<SystemDef, DeployError> {
-        let stored = match &candidate.source {
-            Source::Stored(stored) => return Ok(stored.def.clone()),
-            Source::Pack(pack) => self.store(candidate, pack, store)?,
+    /// Returns the runtime form of `candidate`, copying a pack candidate's
+    /// library into the store.
+    fn resolve(&self, candidate: DeployCandidate, store: &Path) -> Result<Candidate, DeployError> {
+        let DeployCandidate {
+            name,
+            ty,
+            params,
+            library,
+        } = candidate;
+        let stored = match library {
+            Library::Stored(stored) => stored,
+            Library::Pack(pack) => self.store(&name, &ty, &params, &pack, store)?,
         };
-        let def = stored.def.clone();
-        candidate.source = Source::Stored(stored);
-        Ok(def)
+        Ok(Candidate {
+            name,
+            ty,
+            params,
+            stored,
+        })
     }
 
     /// Copies a candidate's library into the store.
@@ -160,7 +202,9 @@ impl SlotCx {
     /// pack's kind.
     fn store(
         &self,
-        candidate: &Candidate,
+        candidate: &str,
+        ty: &str,
+        params: &Value,
         pack: &PackRef,
         store: &Path,
     ) -> Result<Stored, DeployError> {
@@ -174,15 +218,15 @@ impl SlotCx {
             name: name.to_string(),
             cap: FrameStr::<ARTIFACT_LEN>::CAPACITY,
         })?;
-        let within = |e: String| self.fail(format!("`{}`: {e}", candidate.name));
+        let within = |e: String| self.fail(format!("`{candidate}`: {e}"));
         let opened = pack.open().map_err(|e| within(e.to_string()))?;
         let def = self
-            .def(&opened, &candidate.ty, &candidate.params)
+            .def(&opened, ty, params)
             .map_err(|e| within(e.to_string()))?;
         let put = store::put(store, &artifact).map_err(|e| within(e.to_string()))?;
         Ok(Stored {
             path: put.path,
-            hash: put.hash.to_hex().to_string(),
+            hash: put.hash,
             def,
             kind: pack.kind,
         })

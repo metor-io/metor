@@ -1,10 +1,10 @@
 //! Resolves the references between targets in a deployment.
 //!
-//! A target's config can refer to its peers: a link can dial another
-//! target's link by name, and an output port can take its definition from a
-//! peer's port. `metor build` replaces each of these references with the
-//! concrete address or port definition it stands for. After that, each target
-//! can be built from its own packs, without knowing about the others.
+//! A deployment's config can refer to a target's peers: a link can dial
+//! another target's link by name, and an output port can take its definition
+//! from a peer's port. `metor build` replaces each of these references with
+//! the concrete address or port definition it stands for. After that, each
+//! target can be built from its own packs, without knowing about the others.
 
 mod config;
 mod error;
@@ -14,10 +14,15 @@ mod slot;
 
 use std::collections::HashMap;
 
-use crate::coordinator::{OutputSource, SystemTable};
-use crate::link::{LINK_TYPES, LinkParams, Transport};
+use serde::{Deserialize, Serialize};
 
-pub use config::{CONFIG_VERSION, ConfigError, DeploymentConfig, TargetConfig};
+use crate::coordinator::{OutputSource, SystemTable};
+use crate::link::{LINK_TYPES, Transport};
+
+pub use config::{
+    CONFIG_VERSION, ConfigError, DeploySource, DeploySystem, DeploymentConfig, PeerLink, PeerPort,
+    ResolvedDeployment, TargetConfig,
+};
 pub use error::DeployError;
 use index::{DefIndex, SystemIndex};
 use part::Part;
@@ -38,11 +43,12 @@ pub fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Resul
     for (index, addr) in plan.transports {
         // PANIC Safety: `plan` only names systems that `links` decoded.
         let mut params = links.0.remove(&index).expect("a decoded link");
-        params.part.transport = Transport::Connect { addr };
+        params.part.transport = DeployTransport::Runtime(Transport::Connect { addr });
         params.write(index.get_mut(envelope))?;
     }
     for ((index, output), def) in plan.outputs {
-        index.get_mut(envelope).outputs[output].source = OutputSource::Def(def);
+        let source = DeploySource::Runtime(OutputSource::Def(def));
+        index.get_mut(envelope).outputs[output].source = source;
     }
     Ok(())
 }
@@ -58,15 +64,31 @@ pub fn unresolved(envelope: &DeploymentConfig) -> Result<bool, DeployError> {
             system
                 .outputs
                 .iter()
-                .any(|output| matches!(output.source, OutputSource::Peer(_)))
+                .any(|output| matches!(output.source, DeploySource::Peer(_)))
         })
     });
     let dials_peer = Links::read(envelope)?.dials_peer();
     Ok(slot::unresolved(envelope)? || dials_peer || peer_output)
 }
 
+/// A link's transport as a deployment writes it: a runtime transport, or
+/// another link to dial.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeployTransport {
+    Peer(PeerLink),
+    #[serde(untagged)]
+    Runtime(Transport),
+}
+
+/// The part of a link's params that a deployment resolves.
+#[derive(Serialize, Deserialize)]
+struct LinkPart {
+    transport: DeployTransport,
+}
+
 /// The params of every link in a deployment, decoded once.
-struct Links(HashMap<SystemIndex, Part<LinkParams>>);
+struct Links(HashMap<SystemIndex, Part<LinkPart>>);
 
 impl Links {
     /// Decodes the params of every link in `envelope`.
@@ -80,7 +102,7 @@ impl Links {
         Ok(Self(links))
     }
 
-    fn get(&self, index: SystemIndex) -> Option<&LinkParams> {
+    fn get(&self, index: SystemIndex) -> Option<&LinkPart> {
         self.0.get(&index).map(|params| &params.part)
     }
 
@@ -88,13 +110,14 @@ impl Links {
     fn dials_peer(&self) -> bool {
         self.0
             .values()
-            .any(|params| matches!(params.part.transport, Transport::Peer(_)))
+            .any(|params| matches!(params.part.transport, DeployTransport::Peer(_)))
     }
 
     /// The port the link at `index` listens on, unless it is zero or the
     /// system is no listening link.
     fn fixed_port(&self, index: SystemIndex) -> Option<u16> {
-        let Transport::Listen { addr, .. } = &self.get(index)?.transport else {
+        let DeployTransport::Runtime(Transport::Listen { addr, .. }) = &self.get(index)?.transport
+        else {
             return None;
         };
         let port: u16 = addr.rsplit_once(':')?.1.parse().ok()?;
@@ -119,12 +142,13 @@ fn plan(
     };
     for (index, system) in SystemIndex::iter(envelope) {
         for (output_index, output) in system.outputs.iter().enumerate() {
-            if let OutputSource::Peer(peer) = &output.source {
+            if let DeploySource::Peer(peer) = &output.source {
                 let def = defs.peer_port(index, &output.port, peer)?;
                 plan.outputs.push(((index, output_index), def));
             }
         }
-        let Some(Transport::Peer(peer)) = links.get(index).map(|params| &params.transport) else {
+        let Some(DeployTransport::Peer(peer)) = links.get(index).map(|params| &params.transport)
+        else {
             continue;
         };
         let from = defs.name(index);

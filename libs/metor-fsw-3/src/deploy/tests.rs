@@ -2,7 +2,7 @@ use serde_json::json;
 
 use super::*;
 use super::{CONFIG_VERSION, TargetConfig};
-use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig, PeerPort, SystemConfig};
+use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig};
 use crate::link::{PUBLISH_TYPE, SUBSCRIBE_TYPE};
 use crate::record::RecordSchema;
 use crate::tests::utils::{Emit, Recorder, Tap, emit, table, tap};
@@ -38,13 +38,17 @@ fn peer_port(target: &str, link: &str, port: &str) -> PeerPort {
     }
 }
 
-fn member(namespace: &str, systems: Vec<SystemConfig>) -> TargetConfig {
+fn member(namespace: &str, systems: Vec<DeploySystem>) -> TargetConfig<DeploySystem> {
+    let runtime = CoordinatorConfig {
+        namespace: Some(namespace.into()),
+        ..Default::default()
+    };
+    let json = serde_json::to_value(runtime).expect("encodes");
     TargetConfig {
         packs: Vec::new(),
         coordinator: CoordinatorConfig {
-            namespace: Some(namespace.into()),
             systems,
-            ..Default::default()
+            ..serde_json::from_value(json).expect("a runtime config is a deployment config")
         },
     }
 }
@@ -56,43 +60,46 @@ fn envelope() -> DeploymentConfig {
     let a = member(
         "a",
         vec![
-            SystemConfig::new("imu", "imu"),
-            SystemConfig::new("noisy", "boom"),
-            SystemConfig {
+            DeploySystem::new("imu", "imu"),
+            DeploySystem::new("noisy", "boom"),
+            DeploySystem {
                 params: listen(2240),
                 inputs: vec![
                     InputConfig::new("imu.imu", "imu", "imu"),
                     InputConfig::new("noisy.log", "noisy", "log"),
                 ],
-                ..SystemConfig::new("pub", PUBLISH_TYPE)
+                ..DeploySystem::new("pub", PUBLISH_TYPE)
             },
-            SystemConfig {
+            DeploySystem {
                 params: peer("b", "out"),
-                outputs: vec![OutputConfig::with_record("log", "log")],
-                ..SystemConfig::new("cmds", SUBSCRIBE_TYPE)
+                outputs: vec![OutputConfig {
+                    port: "log".into(),
+                    source: DeploySource::Runtime(OutputSource::Record("log".into())),
+                }],
+                ..DeploySystem::new("cmds", SUBSCRIBE_TYPE)
             },
         ],
     );
     let b = member(
         "b",
         vec![
-            SystemConfig {
+            DeploySystem {
                 params: peer("a", "pub"),
                 outputs: vec![
                     OutputConfig {
                         port: "imu.imu".into(),
-                        source: OutputSource::Peer(peer_port("a", "pub", "imu.imu")),
+                        source: DeploySource::Peer(peer_port("a", "pub", "imu.imu")),
                     },
                     OutputConfig {
                         port: "log".into(),
-                        source: OutputSource::Peer(peer_port("a", "pub", "noisy.log")),
+                        source: DeploySource::Peer(peer_port("a", "pub", "noisy.log")),
                     },
                 ],
-                ..SystemConfig::new("mirror", SUBSCRIBE_TYPE)
+                ..DeploySystem::new("mirror", SUBSCRIBE_TYPE)
             },
-            SystemConfig {
+            DeploySystem {
                 params: listen(2250),
-                ..SystemConfig::new("out", PUBLISH_TYPE)
+                ..DeploySystem::new("out", PUBLISH_TYPE)
             },
         ],
     );
@@ -113,7 +120,7 @@ fn resolved() -> DeploymentConfig {
 fn test_peer_output_takes_producer_def() {
     let envelope = resolved();
     let mirror = &envelope.targets[1].coordinator.systems[0];
-    let OutputSource::Def(imu) = &mirror.outputs[0].source else {
+    let DeploySource::Runtime(OutputSource::Def(imu)) = &mirror.outputs[0].source else {
         panic!("resolved to a def")
     };
     assert_eq!(imu.name, "imu.imu");
@@ -125,7 +132,7 @@ fn test_peer_output_takes_producer_def() {
         metadata[0].name, "a.imu.imu.sample",
         "the peer's root is kept"
     );
-    let OutputSource::Def(log) = &mirror.outputs[1].source else {
+    let DeploySource::Runtime(OutputSource::Def(log)) = &mirror.outputs[1].source else {
         panic!("resolved to a def")
     };
     assert_eq!((log.name.as_ref(), log.record.as_ref()), ("log", "log"));
@@ -161,6 +168,37 @@ fn test_resolved_envelope_is_a_fixpoint() {
     let again = envelope.clone();
     resolve(&mut envelope, &tables(2)).expect("resolves again");
     assert_eq!(envelope, again);
+    let runtime = envelope.clone().into_runtime().expect("resolved");
+    let bytes = serde_json::to_vec(&runtime).expect("encodes");
+    let reread = DeploymentConfig::from_slice(&bytes).expect("a runtime file is a deployment");
+    assert_eq!(reread, envelope);
+}
+
+#[test]
+fn test_deploy_source_forms() {
+    let text = r#"{"port":"est.est","peer":{"target":"a","link":"pub","port":"est.est"}}"#;
+    let peer: OutputConfig<DeploySource> = serde_json::from_str(text).expect("peer form");
+    assert_eq!(
+        peer.source,
+        DeploySource::Peer(peer_port("a", "pub", "est.est"))
+    );
+    assert_eq!(serde_json::to_string(&peer).expect("encodes"), text);
+    let record: OutputConfig<DeploySource> =
+        serde_json::from_str(r#"{"port":"ping","record":"ping"}"#).expect("record form");
+    let ping = DeploySource::Runtime(OutputSource::Record("ping".into()));
+    assert_eq!(record.source, ping);
+    assert!(serde_json::from_str::<OutputConfig<DeploySource>>(r#"{"port":"x"}"#).is_err());
+}
+
+#[test]
+fn test_into_runtime_needs_resolved_outputs() {
+    let Err(DeployError::Unresolved { system, port }) = envelope().into_runtime() else {
+        panic!("a peer output has no runtime form")
+    };
+    assert_eq!((system.as_str(), port.as_str()), ("b.mirror", "imu.imu"));
+    let runtime = resolved().into_runtime().expect("resolved");
+    let mirror = &runtime.targets[1].coordinator.systems[0];
+    assert!(matches!(mirror.outputs[0].source, OutputSource::Def(_)));
 }
 
 #[test]
@@ -194,7 +232,7 @@ fn test_missing_references_name_themselves() {
 
     let mut missing_port = envelope();
     missing_port.targets[1].coordinator.systems[0].outputs[0].source =
-        OutputSource::Peer(peer_port("a", "pub", "imu.gyro"));
+        DeploySource::Peer(peer_port("a", "pub", "imu.gyro"));
     assert_eq!(
         resolve(&mut missing_port, &tables(2)),
         Err(DeployError::NoSuchPort {
@@ -243,18 +281,18 @@ fn test_two_listeners_on_one_host_port() {
 
 #[test]
 fn test_mirror_of_a_mirror_of_itself_cycles() {
-    let mirror = |peer_target: &str| SystemConfig {
+    let mirror = |peer_target: &str| DeploySystem {
         params: peer(peer_target, "pub"),
         outputs: vec![OutputConfig {
             port: "mirror.imu".into(),
-            source: OutputSource::Peer(peer_port(peer_target, "pub", "mirror.imu")),
+            source: DeploySource::Peer(peer_port(peer_target, "pub", "mirror.imu")),
         }],
-        ..SystemConfig::new("mirror", SUBSCRIBE_TYPE)
+        ..DeploySystem::new("mirror", SUBSCRIBE_TYPE)
     };
-    let publish = SystemConfig {
+    let publish = DeploySystem {
         params: listen(1),
         inputs: vec![InputConfig::new("mirror.imu", "mirror", "mirror.imu")],
-        ..SystemConfig::new("pub", PUBLISH_TYPE)
+        ..DeploySystem::new("pub", PUBLISH_TYPE)
     };
     let mut envelope = DeploymentConfig {
         config_version: CONFIG_VERSION,
@@ -330,11 +368,13 @@ fn test_resolve_keeps_other_params() {
 #[test]
 fn test_stored_slots_resolve_to_themselves() {
     let def = json!({ "name": "up", "inputs": [], "outputs": [] });
-    let stored = json!({ "path": "/store/x/libup.so", "hash": "00", "def": def, "kind": "dylib" });
-    let slot = SystemConfig {
+    let hash = blake3::hash(b"up").to_hex();
+    let stored =
+        json!({ "path": "/store/x/libup.so", "hash": hash.as_str(), "def": def, "kind": "dylib" });
+    let slot = DeploySystem {
         params: json!({ "allow": [{ "name": "up", "ty": "up", "params": null,
-            "source": { "stored": stored } }], "initial": null }),
-        ..SystemConfig::new("mode", crate::dl::SLOT_TYPE)
+            "stored": stored }], "initial": null }),
+        ..DeploySystem::new("mode", crate::dl::SLOT_TYPE)
     };
     let mut envelope = envelope();
     envelope.targets[0].coordinator.systems.push(slot);

@@ -7,8 +7,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::coordinator::CoordinatorConfig;
+use crate::coordinator::{CoordinatorConfig, OutputSource, SystemConfig};
 use crate::dl::PackRef;
+
+use super::DeployError;
 
 /// The config file format version this build reads.
 pub const CONFIG_VERSION: u32 = 2;
@@ -26,17 +28,57 @@ pub enum ConfigError {
     NoSuchTarget(String),
 }
 
-/// The config for one target.
+/// A port on a link of another target in the same deployment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerPort {
+    pub target: String,
+    pub link: String,
+    pub port: String,
+}
+
+/// A link on another target in the same deployment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerLink {
+    pub target: String,
+    pub link: String,
+}
+
+/// Where a deployment's config-defined output gets its definition from: a
+/// runtime source, or a peer's port that `metor build` resolves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploySource {
+    Peer(PeerPort),
+    #[serde(untagged)]
+    Runtime(OutputSource),
+}
+
+/// A system as a deployment writes it.
+pub type DeploySystem = SystemConfig<DeploySource>;
+
+/// A deployment whose every target can be built on its own.
+pub type ResolvedDeployment = DeploymentConfig<SystemConfig>;
+
+/// The config for one target, whose systems are `S`.
 ///
 /// `packs` lists the packs that provide the target's system types, and
 /// `coordinator` describes the systems and how they connect.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct TargetConfig {
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TargetConfig<S = SystemConfig> {
     pub packs: Vec<PackRef>,
-    pub coordinator: CoordinatorConfig,
+    pub coordinator: CoordinatorConfig<S>,
 }
 
-impl TargetConfig {
+impl Default for TargetConfig {
+    fn default() -> Self {
+        Self {
+            packs: Vec::new(),
+            coordinator: CoordinatorConfig::default(),
+        }
+    }
+}
+
+impl<S> TargetConfig<S> {
     /// Returns the target's namespace, which is the name used to select it.
     pub fn namespace(&self) -> &str {
         self.coordinator.namespace.as_deref().unwrap_or("")
@@ -45,13 +87,13 @@ impl TargetConfig {
 
 /// A deployment: every target, and the host each one runs on.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct DeploymentConfig {
+pub struct DeploymentConfig<S = DeploySystem> {
     pub config_version: u32,
     /// Maps a target's namespace to the host its peers dial. A target that is
     /// not listed is dialed on loopback.
     #[serde(default)]
     pub hosts: BTreeMap<String, String>,
-    pub targets: Vec<TargetConfig>,
+    pub targets: Vec<TargetConfig<S>>,
 }
 
 impl DeploymentConfig {
@@ -71,6 +113,44 @@ impl DeploymentConfig {
         Ok(serde_json::from_value(value)?)
     }
 
+    /// Returns the runtime form of this deployment.
+    ///
+    /// Fails if an output still names a peer's port.
+    pub fn into_runtime(self) -> Result<ResolvedDeployment, DeployError> {
+        let targets = self
+            .targets
+            .into_iter()
+            .map(TargetConfig::into_runtime)
+            .collect::<Result<_, _>>()?;
+        Ok(ResolvedDeployment {
+            config_version: self.config_version,
+            hosts: self.hosts,
+            targets,
+        })
+    }
+}
+
+impl TargetConfig<DeploySystem> {
+    fn into_runtime(self) -> Result<TargetConfig, DeployError> {
+        let namespace = self.namespace().to_string();
+        let runtime = |system: DeploySystem| {
+            let id = system.id.clone();
+            system.try_map_outputs(|port, source| match source {
+                DeploySource::Runtime(source) => Ok(source),
+                DeploySource::Peer(_) => Err(DeployError::Unresolved {
+                    system: format!("{namespace}.{id}"),
+                    port: port.to_string(),
+                }),
+            })
+        };
+        Ok(TargetConfig {
+            packs: self.packs,
+            coordinator: self.coordinator.try_map_systems(runtime)?,
+        })
+    }
+}
+
+impl<S> DeploymentConfig<S> {
     /// Returns the index of the target named `namespace`.
     ///
     /// With no namespace, this returns the only target, or an error if there
@@ -175,8 +255,8 @@ mod tests {
         }
     }
 
-    fn envelope(targets: Vec<TargetConfig>) -> DeploymentConfig {
-        DeploymentConfig {
+    fn envelope(targets: Vec<TargetConfig>) -> ResolvedDeployment {
+        ResolvedDeployment {
             config_version: CONFIG_VERSION,
             hosts: BTreeMap::new(),
             targets,
@@ -187,8 +267,9 @@ mod tests {
     fn test_golden_builds() {
         let config = golden();
         assert_eq!(config.namespaces(), ["cube_sat"]);
-        let target = &config.targets[config.target(None).expect("one target")];
-        let coordinator = target.coordinator.clone().build(&table());
+        let index = config.target(None).expect("one target");
+        let config = config.into_runtime().expect("no peers");
+        let coordinator = config.targets[index].coordinator.clone().build(&table());
         assert!(coordinator.is_ok(), "{:?}", coordinator.err());
     }
 
