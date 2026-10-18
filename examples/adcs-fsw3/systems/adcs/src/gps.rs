@@ -7,7 +7,7 @@
 use adcs_contracts::Gps;
 use adcs_contracts::novatel::{LOG_10HZ, Lines};
 use metor_fsw_3::io::{Buf, Cap, Uart};
-use metor_fsw_3::{IoInit, Log, Output, Seq, SeqError, sequence};
+use metor_fsw_3::{IoInit, Log, Output, ParamError, Seq, SeqError, sequence};
 
 /// The bytes one read takes, about one log.
 const READ: usize = 256;
@@ -19,11 +19,11 @@ pub struct GpsDriver {
 }
 
 impl GpsDriver {
-    pub fn new(io: &mut IoInit) -> Self {
-        Self {
-            cmd: Some(io.alloc_from(LOG_10HZ)),
-            rx: Some(io.alloc(READ)),
-        }
+    pub fn new(io: &mut IoInit) -> Result<Self, ParamError> {
+        Ok(Self {
+            cmd: Some(io.alloc_from(LOG_10HZ)?),
+            rx: Some(io.alloc(READ)?),
+        })
     }
 }
 

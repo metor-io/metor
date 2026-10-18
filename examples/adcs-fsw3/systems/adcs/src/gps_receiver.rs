@@ -20,7 +20,7 @@ use adcs_contracts::{
 use futures_lite::future;
 use metor_fsw_3::io::{Buf, Cap, IoInit, Uart};
 use metor_fsw_3::ring::{Config, NoWake, RingBuffer, View, Writer};
-use metor_fsw_3::{Input, Seq, SeqError, Timestamp, ring_capacity, sequence};
+use metor_fsw_3::{Input, ParamError, Seq, SeqError, Timestamp, ring_capacity, sequence};
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
 use schemars::JsonSchema;
@@ -61,19 +61,19 @@ pub struct GpsReceiver {
 }
 
 impl GpsReceiver {
-    pub fn new(p: GpsReceiverParams, io: &mut IoInit) -> Self {
+    pub fn new(p: GpsReceiverParams, io: &mut IoInit) -> Result<Self, ParamError> {
         let periods = Config {
             // PANIC Safety: two 8-byte records always form a ring.
             capacity: ring_capacity(size_of::<f64>(), 2).expect("a small ring"),
             max_readers: 1,
         };
-        Self {
-            rx: Some(io.alloc(COMMAND_READ)),
-            tx: Some(io.alloc(LINE_MAX)),
+        Ok(Self {
+            rx: Some(io.alloc(COMMAND_READ)?),
+            tx: Some(io.alloc(LINE_MAX)?),
             model: ReceiverModel::new(p),
             // PANIC Safety: the config above is valid.
             periods: RingBuffer::create_in_memory(periods).expect("a valid ring"),
-        }
+        })
     }
 }
 
