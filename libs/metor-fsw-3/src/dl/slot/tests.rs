@@ -13,6 +13,7 @@ fn def_with(outputs: Vec<PortDef>) -> SystemDef {
         name: "count_up".into(),
         inputs: Vec::new(),
         outputs,
+        log: None,
         grants: Vec::new(),
     }
 }

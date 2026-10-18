@@ -693,6 +693,7 @@ mod tests {
                 name: ty.into(),
                 inputs,
                 outputs,
+                log: None,
                 grants: Vec::new(),
             },
             doc: "".into(),

@@ -103,6 +103,7 @@ impl TableEntry {
                 name: SLOT_NAME.into(),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
+                log: None,
                 grants: Vec::new(),
             },
             def_fn: Box::new(DlSlot::def),
