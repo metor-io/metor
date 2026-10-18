@@ -12,9 +12,7 @@ use serde::Deserialize;
 
 use super::dispatch::Dispatch;
 use super::{Host, Os, OsDone, Route};
-use crate::coordinator::{
-    Adapters, MakeCx, ParamError, Step, SystemKind, TableEntry,
-};
+use crate::coordinator::{Adapters, MakeCx, ParamError, Step, SystemKind, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::fn_system::LOG_PORT;
 use crate::io::arena::Arena;

@@ -1574,6 +1574,15 @@ mod tests {
         }
 
         #[test]
+        fn test_io_on_a_thread_is_refused() {
+            let mut config = config(nominal(), "a", "b");
+            config.systems[3].adapter = Some(Adapter::Thread("io".into()));
+            let e = error(config);
+            let refused = |e: &BuildError| matches!(e, BuildError::UnsupportedAdapter { id, .. } if id == "io_complete");
+            assert!(refused(&e), "{e}");
+        }
+
+        #[test]
         fn test_granting_a_sim_resource_is_refused() {
             let mut config = config(nominal(), "a", "b");
             config.systems[0]

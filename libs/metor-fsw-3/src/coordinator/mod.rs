@@ -19,6 +19,7 @@ mod table;
 #[cfg(all(test, feature = "host"))]
 mod tests;
 
+pub(crate) use config::Adapters;
 pub use config::{
     Adapter, BuildOptions, Clock, CoordinatorConfig, DEFAULT_RING_DEPTH, InputConfig,
     InvalidWallRate, Location, OutputConfig, OutputSource, PortRef, SystemConfig, WallRate,
@@ -29,6 +30,5 @@ pub use params::{MakeError, ParamError, Params};
 pub use run::Coordinator;
 pub use status::SystemStatus;
 pub use step::{EndReason, LoadError, Occupant, Step};
-pub use table::{MakeCx, SystemKind, SystemTable};
-pub(crate) use config::Adapters;
 pub(crate) use table::TableEntry;
+pub use table::{MakeCx, SystemKind, SystemTable};
