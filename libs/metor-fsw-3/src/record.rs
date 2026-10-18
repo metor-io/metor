@@ -9,7 +9,6 @@ use metor_proto::types::{ComponentId, Msg, PacketId, PacketTy, Timestamp, msg_id
 use metor_proto::vtable::VTable;
 use metor_proto_wkt::ComponentMetadata;
 use postcard_schema::schema::owned::OwnedNamedType;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -77,45 +76,6 @@ pub trait Record {
             )),
             RecordSchema::Msg { .. } => None,
         }
-    }
-}
-
-/// A shortcut for implementing [`Record`] on a type encoded with postcard.
-///
-/// The record announces itself under an ID derived from its postcard schema.
-pub trait PostcardRecord: Serialize + DeserializeOwned + postcard_schema::Schema {
-    const NAME: &'static str;
-    const MAX_LEN: usize;
-    const DEPTH: usize = 1;
-
-    fn timestamp(&self) -> Option<Timestamp> {
-        None
-    }
-}
-
-impl<T: PostcardRecord> Record for T {
-    const NAME: &'static str = <T as PostcardRecord>::NAME;
-    const MAX_LEN: usize = <T as PostcardRecord>::MAX_LEN;
-    const DEPTH: usize = <T as PostcardRecord>::DEPTH;
-    type Read<'a>
-        = T
-    where
-        T: 'a;
-
-    fn timestamp(&self) -> Option<Timestamp> {
-        PostcardRecord::timestamp(self)
-    }
-
-    fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
-        postcard::encode(self, buf)
-    }
-
-    fn decode(bytes: &[u8]) -> Result<T, DecodeError> {
-        postcard::decode(bytes)
-    }
-
-    fn schema_with_root(_root: &str) -> RecordSchema {
-        RecordSchema::postcard::<T>(<T as PostcardRecord>::NAME)
     }
 }
 
