@@ -8,9 +8,8 @@ use metor_fsw_3_ring::{NoWake, View, WakeSink, WakeSource, Writer};
 use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::sync::Arc;
 
-use crate::def::{DefCx, DefError, Records};
+use crate::def::{DefCx, DefError};
 use crate::record::RecordSchema;
 
 /// Describes one port: its name and the record it carries.
@@ -138,15 +137,6 @@ pub trait Ports<B> {
     /// # Panics
     /// May panic if `bindings` does not match `defs`.
     fn bind(bindings: Vec<B>) -> Self;
-
-    /// Binds the ports, handing `records` to a parameter that reads the
-    /// host's record table.
-    fn bind_with_records(bindings: Vec<B>, _records: &Arc<Records>) -> Self
-    where
-        Self: Sized,
-    {
-        Self::bind(bindings)
-    }
 }
 
 impl<B> Ports<B> for () {

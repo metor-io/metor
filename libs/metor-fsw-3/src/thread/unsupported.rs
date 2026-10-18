@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use crate::async_system::AsyncSystem;
-use crate::coordinator::{MakeCx, ParamError, Params, Step};
+use crate::coordinator::{MakeCx, ParamError, Step};
+
+use super::{LaunchCx, Launched};
 
 /// A stand-in for the thread registry. Builds without OS threads run no
 /// threads.
@@ -21,7 +23,7 @@ impl Threads {
 pub(crate) fn place<A, M>(_make: Arc<M>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>
 where
     A: AsyncSystem + 'static,
-    M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+    M: Fn(LaunchCx<'_>) -> Result<Launched<A>, ParamError> + Send + Sync + 'static,
 {
     Err(ParamError::ThreadsUnsupported {
         system: cx.id.to_string(),

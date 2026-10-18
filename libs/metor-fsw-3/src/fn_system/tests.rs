@@ -932,12 +932,12 @@ fn first(draws: &[(String, u64)], tag: &str) -> Vec<u64> {
 #[test]
 fn test_rng_draws_from_the_target_seed_and_name() {
     let draws = drawers(7, None, &["a"], 2);
-    let mut want = crate::Rng::seeded(7, "a");
+    let mut want = crate::Rng::seeded(7, "a.rng");
     assert_eq!(first(&draws, "a"), [want.next_u64(), want.next_u64()]);
     let named = drawers(7, Some("t"), &["a"], 1);
     assert_eq!(
         first(&named, "a"),
-        [crate::Rng::seeded(7, "t.a").next_u64()]
+        [crate::Rng::seeded(7, "t.a.rng").next_u64()]
     );
     assert_eq!(drawers(7, None, &["a"], 3), drawers(7, None, &["a"], 3));
 }
@@ -954,6 +954,39 @@ fn test_rng_streams_are_per_instance() {
     );
     assert_eq!(first(&two, "b"), first(&three, "b"));
     assert_ne!(first(&two, "a"), first(&drawers(8, None, &["a"], 3), "a"));
+}
+
+/// Records one draw from each of its two streams a cycle.
+#[crate::system]
+fn two_drawer(#[state] seen: &mut Draws, left: &mut crate::Rng, right: &mut crate::Rng) {
+    let mut seen = seen.borrow_mut();
+    seen.push(("left".into(), left.next_u64()));
+    seen.push(("right".into(), right.next_u64()));
+}
+
+#[test]
+fn test_rng_params_draw_their_own_streams() {
+    let seen = Draws::default();
+    let mut table = SystemTable::new();
+    let state = seen.clone();
+    table
+        .register("two", two_drawer(), move || state.clone())
+        .expect("valid");
+    let config = CoordinatorConfig {
+        systems: vec![SystemConfig::new("d", "two")],
+        seed: 7,
+        ..Default::default()
+    };
+    let mut coordinator = config.build(&table).expect("valid");
+    (0..2).for_each(|t| coordinator.step(Timestamp(t)));
+    let draws = seen.take();
+    let (mut left, mut right) = (
+        crate::Rng::seeded(7, "d.left"),
+        crate::Rng::seeded(7, "d.right"),
+    );
+    assert_eq!(first(&draws, "left"), [left.next_u64(), left.next_u64()]);
+    assert_eq!(first(&draws, "right"), [right.next_u64(), right.next_u64()]);
+    assert_ne!(first(&draws, "left"), first(&draws, "right"));
 }
 
 #[test]

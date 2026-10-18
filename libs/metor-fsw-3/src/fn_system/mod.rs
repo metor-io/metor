@@ -23,9 +23,10 @@ use crate::{
 
 pub use ctor::Ctor;
 pub(crate) use param::Defs;
+pub(crate) use param::Instance;
 pub use param::{Cycle, Param, ParamNames, Views, Writers};
+pub(crate) use set::bind;
 pub use set::{InSet, LOG_PORT, OutSet};
-pub(crate) use set::{Instance, bind};
 
 /// Describes the parameters of a system written as a fn.
 pub trait FnSignature: Sized + 'static {

@@ -24,10 +24,11 @@ use metor_proto_wkt::LogLevel;
 
 use crate::async_system::{AsyncSystem, Running, Stop};
 use crate::coordinator::{EndReason, MakeCx, ParamError, Params, Step};
-use crate::def::Records;
+use crate::fn_system::Instance;
 use crate::mirror::{Mirror, Mirrors};
-use crate::system::{InputBinding, OutputBinding, PortDef, Ports, SystemDef};
+use crate::system::{InputBinding, OutputBinding, PortDef, SystemDef};
 
+use super::{LaunchCx, Launched};
 use group::{GroupHandle, Member, Panicked};
 use turned::TurnedGroup;
 
@@ -108,19 +109,27 @@ struct AsyncLaunch<A: AsyncSystem, M> {
     params: serde_json::Value,
     inputs: Vec<InputBinding<Notifier>>,
     outputs: Vec<OutputBinding>,
-    records: Arc<Records>,
+    instance: Instance,
     _a: PhantomData<fn() -> A>,
 }
 
 impl<A, M> Launch for AsyncLaunch<A, M>
 where
     A: AsyncSystem + 'static,
-    M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+    M: Fn(LaunchCx<'_>) -> Result<Launched<A>, ParamError> + Send + Sync + 'static,
 {
     fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError> {
-        let (system, mut state) = (self.make)(Params(&self.params))?;
-        let mut inputs = A::Inputs::bind(self.inputs);
-        let mut outputs = A::Outputs::bind_with_records(self.outputs, &self.records);
+        let Launched {
+            system,
+            mut state,
+            mut inputs,
+            mut outputs,
+        } = (self.make)(LaunchCx {
+            params: Params(&self.params),
+            inputs: self.inputs,
+            outputs: self.outputs,
+            instance: self.instance,
+        })?;
         Ok(Box::pin(async move {
             system
                 .run(&mut state, &mut inputs, &mut outputs, stop)
@@ -137,8 +146,9 @@ where
 pub(crate) fn place<A, M>(make: Arc<M>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>
 where
     A: AsyncSystem + 'static,
-    M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+    M: Fn(LaunchCx<'_>) -> Result<Launched<A>, ParamError> + Send + Sync + 'static,
 {
+    let instance = Instance::from_make_cx(&cx);
     let thread_name = cx.thread().to_string();
     let bound = Bound::new(cx.def, cx.inputs, cx.outputs)?;
     let panicked = Panicked::default();
@@ -148,7 +158,7 @@ where
             params: cx.params.0.clone(),
             inputs: bound.inputs,
             outputs: bound.outputs,
-            records: cx.records.clone(),
+            instance,
             _a: PhantomData,
         }),
         panicked: panicked.clone(),

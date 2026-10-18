@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use metor_fsw_3_ring::{NoWake, RingBuffer};
+use metor_fsw_3_ring::{NoWake, Notifier, RingBuffer};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -13,7 +13,7 @@ use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, SystemFn};
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
-use crate::thread::{DEFAULT_THREAD, Threads};
+use crate::thread::{DEFAULT_THREAD, LaunchCx, Launched, Threads};
 
 use super::BuildError;
 use super::SystemStatus;
@@ -191,6 +191,15 @@ impl SystemTable {
         ty: &str,
         make: impl Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
     ) -> Result<(), BuildError> {
+        let make = move |cx: LaunchCx<'_>| {
+            let (system, state) = make(cx.params)?;
+            Ok(Launched::<A> {
+                system,
+                state,
+                inputs: A::Inputs::bind(cx.inputs),
+                outputs: A::Outputs::bind(cx.outputs),
+            })
+        };
         let entry =
             TableEntry::async_system::<A, _>(make, Cow::Borrowed(""), None).map_err(|source| {
                 BuildError::TypeDef {
@@ -210,9 +219,15 @@ impl SystemTable {
         _system: S,
         ctor: C,
     ) -> Result<(), BuildError> {
-        let make = move |params: Params<'_>| {
-            let state = ctor.make(params)?;
-            Ok((FnSystem::default(), state))
+        let make = move |cx: LaunchCx<'_>| {
+            let (inputs, outputs) =
+                fn_system::bind::<S, Notifier>(cx.inputs, cx.outputs, cx.instance)?;
+            Ok(Launched::<FnSystem<S>> {
+                system: FnSystem::default(),
+                state: ctor.make(cx.params)?,
+                inputs,
+                outputs,
+            })
         };
         let entry =
             TableEntry::async_system::<FnSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema())
@@ -373,7 +388,7 @@ impl TableEntry {
             make: Arc::new(move |mut cx| {
                 let instance = fn_system::Instance::from_make_cx(&cx);
                 let (views, writers) = cx.take_bindings();
-                let (inputs, outputs) = fn_system::bind::<S>(views, writers, instance)?;
+                let (inputs, outputs) = fn_system::bind::<S, NoWake>(views, writers, instance)?;
                 let state = ctor.make(cx.params)?;
                 Ok(Box::new(Runner {
                     system: FnSystem::default(),
@@ -396,7 +411,7 @@ impl TableEntry {
     ) -> Result<Self, DefError>
     where
         A: AsyncSystem + 'static,
-        M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+        M: Fn(LaunchCx<'_>) -> Result<Launched<A>, ParamError> + Send + Sync + 'static,
     {
         let make = Arc::new(make);
         Ok(Self {

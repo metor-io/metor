@@ -8,15 +8,14 @@ use metor_proto_wkt::LogEvent;
 
 use metor_fsw_3_ring::{NoWake, WakeSink};
 
-use crate::Rng;
 use crate::coordinator::ParamError;
-use crate::def::{DefCx, DefError, Records};
+use crate::def::{DefCx, DefError};
 use crate::log::LogPort;
 use crate::port::{Output, Samplers};
 use crate::system::{InputBinding, OutputBinding, PortDef, Ports};
 
 use super::FnSignature;
-use super::param::{Bindings, Defs, Param, Views, Writers};
+use super::param::{Defs, Instance, Param, Views, Writers};
 
 /// The output that every fn system writes its log events to.
 pub const LOG_PORT: &str = "log";
@@ -37,7 +36,44 @@ pub struct OutSet<S: FnSignature> {
     pub(crate) dropped: Arc<AtomicU32>,
 }
 
+impl<S: FnSignature, W: WakeSink + Clone + 'static> InSet<S, W> {
+    /// Hands `views` to the parameters, in order.
+    pub(crate) fn from_views(mut views: Views<W>) -> Self {
+        let ins = S::Params::bind_in::<W>(&mut views);
+        // PANIC Safety: the coordinator binds one list per port of the
+        // definition these parameters produced.
+        assert!(views.bindings.is_empty(), "more bindings than input params");
+        Self {
+            ins,
+            samplers: views.samplers,
+        }
+    }
+}
+
 impl<S: FnSignature> OutSet<S> {
+    /// Hands `writers` to the parameters, in order, and the last one to the
+    /// log.
+    ///
+    /// # Errors
+    /// Fails if an `Rng` parameter's instance has no seed.
+    pub(crate) fn from_writers(mut writers: Writers) -> Result<Self, ParamError> {
+        let outs = S::Params::bind_out(&mut S::NAMES.iter(), &mut writers)?;
+        // PANIC Safety: `defs` always appends the log as the last output.
+        let log = writers
+            .bindings
+            .next()
+            .expect("one writer for the log output");
+        assert!(
+            writers.bindings.is_empty(),
+            "more bindings than output params"
+        );
+        Ok(Self {
+            outs,
+            log: LogPort::new(Output::new(log.writer)),
+            dropped: writers.dropped,
+        })
+    }
+
     /// Reports the writes that failed since the last report.
     ///
     /// Writes at most one fault on `log`.
@@ -53,7 +89,7 @@ impl<S: FnSignature, W: WakeSink + Clone + 'static> Ports<InputBinding<W>> for I
 
     fn bind(inputs: Vec<InputBinding<W>>) -> Self {
         let defs = Defs::declared::<S>();
-        bind_inputs::<S, W>(inputs, defs.inputs.len())
+        Self::from_views(Views::new(inputs, defs.inputs.len()))
     }
 }
 
@@ -64,112 +100,28 @@ impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
         Ok(outputs)
     }
 
+    /// Binds the outputs under an unnamed instance with no seed and an empty
+    /// record table. A table make binds through `fn_system::bind` instead.
     fn bind(outputs: Vec<OutputBinding>) -> Self {
         let defs = Defs::declared::<S>();
-        let writers = writers(outputs, defs.outputs.len() + 1, Arc::default());
-        bind_outputs::<S>(writers)
-    }
-
-    fn bind_with_records(outputs: Vec<OutputBinding>, records: &Arc<Records>) -> Self {
-        let defs = Defs::declared::<S>();
-        let mut writers = writers(outputs, defs.outputs.len() + 1, Arc::default());
-        writers.records = defs.records.then(|| records.clone());
-        bind_outputs::<S>(writers)
+        let writers = Writers::new(outputs, defs.outputs.len() + 1, Instance::default());
+        // PANIC Safety: only an `Rng` parameter fails, and a table make binds
+        // an `Rng` through `bind`.
+        Self::from_writers(writers).expect("no Rng parameter")
     }
 }
 
 /// A fn system's bound ports.
-pub(crate) type BoundSet<S> = (InSet<S>, OutSet<S>);
+pub(crate) type BoundSet<S, W> = (InSet<S, W>, OutSet<S>);
 
-/// The id, namespace, seed, and record table of the system instance being
-/// bound.
-#[derive(Clone, Copy)]
-pub(crate) struct Instance<'a> {
-    pub(crate) id: &'a str,
-    pub(crate) namespace: Option<&'a str>,
-    /// The target seed. A guest's make has none.
-    pub(crate) seed: Option<u64>,
-    /// Every record the system table knows about.
-    pub(crate) records: &'a Arc<Records>,
-}
-
-impl<'a> Instance<'a> {
-    pub(crate) fn from_make_cx(cx: &crate::coordinator::MakeCx<'a>) -> Self {
-        Self {
-            id: cx.id,
-            namespace: cx.namespace,
-            seed: cx.seed,
-            records: cx.records,
-        }
-    }
-
-    /// The stream an `Rng` parameter draws, named `{namespace}.{id}`.
-    fn rng(&self) -> Result<Rng, ParamError> {
-        let system = self.id.to_string();
-        let seed = self.seed.ok_or(ParamError::GuestRng { system })?;
-        Ok(Rng::seeded(seed, &DefCx::path(self.namespace, self.id, "")))
-    }
-}
-
-/// Binds a fn system's ports.
-pub(crate) fn bind<S: FnSignature>(
-    inputs: Vec<InputBinding>,
-    outputs: Vec<OutputBinding>,
-    instance: Instance<'_>,
-) -> Result<BoundSet<S>, ParamError> {
-    let defs = Defs::declared::<S>();
-    let rng = defs.rng.then(|| instance.rng()).transpose()?;
-    let records = defs.records.then(|| instance.records.clone());
-    let dropped = Arc::<AtomicU32>::default();
-    let ins = bind_inputs::<S, NoWake>(inputs, defs.inputs.len());
-    let mut writers = writers(outputs, defs.outputs.len() + 1, dropped);
-    writers.rng = rng;
-    writers.records = records;
-    Ok((ins, bind_outputs::<S>(writers)))
-}
-
-fn writers(outputs: Vec<OutputBinding>, declared: usize, dropped: Arc<AtomicU32>) -> Writers {
-    Writers {
-        bindings: Bindings::new(outputs, declared),
-        dropped,
-        rng: None,
-        records: None,
-    }
-}
-
-fn bind_inputs<S: FnSignature, W: WakeSink + Clone + 'static>(
+/// Binds a fn system's ports under `instance`.
+pub(crate) fn bind<S: FnSignature, W: WakeSink + Clone + 'static>(
     inputs: Vec<InputBinding<W>>,
-    declared: usize,
-) -> InSet<S, W> {
-    let mut views = Views {
-        bindings: Bindings::new(inputs, declared),
-        samplers: Samplers::default(),
-    };
-    let ins = S::Params::bind_in::<W>(&mut views);
-    // PANIC Safety: the coordinator binds one list per port of the
-    // definition these parameters produced.
-    assert!(views.bindings.is_empty(), "more bindings than input params");
-    InSet {
-        ins,
-        samplers: views.samplers,
-    }
-}
-
-fn bind_outputs<S: FnSignature>(mut writers: Writers) -> OutSet<S> {
-    let outs = S::Params::bind_out(&mut writers);
-    // PANIC Safety: `defs` always appends the log as the last output.
-    let log = writers
-        .bindings
-        .next()
-        .expect("one writer for the log output");
-    let log = LogPort::new(Output::new(log.writer));
-    assert!(
-        writers.bindings.is_empty(),
-        "more bindings than output params"
-    );
-    OutSet {
-        outs,
-        log,
-        dropped: writers.dropped,
-    }
+    outputs: Vec<OutputBinding>,
+    instance: Instance,
+) -> Result<BoundSet<S, W>, ParamError> {
+    let defs = Defs::declared::<S>();
+    let ins = InSet::from_views(Views::new(inputs, defs.inputs.len()));
+    let writers = Writers::new(outputs, defs.outputs.len() + 1, instance);
+    Ok((ins, OutSet::from_writers(writers)?))
 }

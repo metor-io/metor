@@ -10,6 +10,7 @@ use metor_proto::types::Timestamp;
 
 use crate::{
     Rng,
+    coordinator::ParamError,
     def::{DefCx, DefError, Records},
     frame::Frame,
     log::Log,
@@ -63,17 +64,70 @@ pub struct Views<W: WakeSink> {
     pub(crate) samplers: Samplers,
 }
 
-/// Bound outputs, waiting to be handed to parameters.
+impl<W: WakeSink> Views<W> {
+    /// Wraps `inputs`, of which `declared` belong to declared parameters.
+    pub(crate) fn new(inputs: Vec<InputBinding<W>>, declared: usize) -> Self {
+        Self {
+            bindings: Bindings::new(inputs, declared),
+            samplers: Samplers::default(),
+        }
+    }
+}
+
+/// Bound outputs, waiting to be handed to parameters, and the instance they
+/// belong to.
 ///
 /// Every output built from these shares one counter of failed writes.
 pub struct Writers {
     pub(crate) bindings: Bindings<OutputBinding>,
     pub(crate) dropped: Arc<AtomicU32>,
-    /// The instance's stream, for an `Rng` parameter.
-    pub(crate) rng: Option<Rng>,
-    /// The host's record table, for a `Records` parameter.
-    pub(crate) records: Option<Arc<Records>>,
+    pub(crate) instance: Instance,
 }
+
+impl Writers {
+    /// Wraps `outputs`, of which `declared` belong to declared parameters.
+    pub(crate) fn new(outputs: Vec<OutputBinding>, declared: usize, instance: Instance) -> Self {
+        Self {
+            bindings: Bindings::new(outputs, declared),
+            dropped: Arc::default(),
+            instance,
+        }
+    }
+}
+
+/// The id, namespace, seed, and record table of the system instance being
+/// bound.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Instance {
+    pub(crate) id: String,
+    pub(crate) namespace: Option<String>,
+    /// The target seed. A guest's make has none.
+    pub(crate) seed: Option<u64>,
+    /// Every record the system table knows about.
+    pub(crate) records: Arc<Records>,
+}
+
+impl Instance {
+    pub(crate) fn from_make_cx(cx: &crate::coordinator::MakeCx<'_>) -> Self {
+        Self {
+            id: cx.id.to_string(),
+            namespace: cx.namespace.map(str::to_string),
+            seed: cx.seed,
+            records: cx.records.clone(),
+        }
+    }
+
+    /// The stream the `Rng` parameter `param` draws, named
+    /// `{namespace}.{id}.{param}`.
+    fn rng(&self, param: &str) -> Result<Rng, ParamError> {
+        let seed = self.seed.ok_or_else(|| ParamError::GuestRng {
+            system: self.id.clone(),
+        })?;
+        let name = DefCx::path(self.namespace.as_deref(), &self.id, param);
+        Ok(Rng::seeded(seed, &name))
+    }
+}
+
 /// The parameter names that [`Param::append_defs`] reads from.
 pub type ParamNames<'n> = core::slice::Iter<'n, &'static str>;
 
@@ -88,10 +142,9 @@ pub struct Defs {
     /// Whether any parameter is a [`Sample`]. Only a stepped system can take
     /// one.
     pub(crate) sampled: bool,
-    /// Whether any parameter is an `Rng`.
+    /// Whether any parameter is an `Rng`. Only a stepped system can take
+    /// one.
     pub(crate) rng: bool,
-    /// Whether any parameter is the [`Records`] table.
-    pub(crate) records: bool,
 }
 
 impl Defs {
@@ -176,7 +229,10 @@ pub trait Param {
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W>;
 
     /// Binds this parameter's output, if it has one, from `writers`.
-    fn bind_out(writers: &mut Writers) -> Self::Out;
+    ///
+    /// Takes the parameter's name from `names`.
+    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers)
+    -> Result<Self::Out, ParamError>;
 
     /// Returns the value passed to the system fn this cycle.
     fn get<'a, W: WakeSink + Clone + 'static>(
@@ -216,7 +272,10 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
         Input::new(binding.views)
     }
 
-    fn bind_out(_writers: &mut Writers) {}
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
+        param_name(names);
+        Ok(())
+    }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
         input: &'a mut Self::In<W>,
@@ -253,7 +312,10 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
         sample
     }
 
-    fn bind_out(_writers: &mut Writers) {}
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
+        param_name(names);
+        Ok(())
+    }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
         input: &'a mut Self::In<W>,
@@ -264,8 +326,8 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
     }
 }
 
-/// An `Rng` draws from the target seed and the instance name. It takes no
-/// port.
+/// An `Rng` draws from the target seed and its instance and parameter
+/// names. It takes no port.
 impl Param for Rng {
     type In<W: WakeSink + Clone + 'static> = ();
     type Out = Rng;
@@ -283,10 +345,8 @@ impl Param for Rng {
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
-    fn bind_out(writers: &mut Writers) -> Rng {
-        // PANIC Safety: `fn_system::bind` refuses a set with an `Rng` and no
-        // seed, and every other bind path refuses an `Rng` at its definition.
-        writers.rng.clone().expect("a seeded stream")
+    fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Rng, ParamError> {
+        writers.instance.rng(param_name(names))
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
@@ -308,19 +368,20 @@ impl Param for Records {
     fn append_defs(
         names: &mut ParamNames<'_>,
         _cx: &DefCx<'_>,
-        defs: &mut Defs,
+        _defs: &mut Defs,
     ) -> Result<(), DefError> {
         param_name(names);
-        defs.records = true;
         Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
-    fn bind_out(writers: &mut Writers) -> Arc<Records> {
-        // PANIC Safety: `fn_system::bind` and every async bind path pass the
-        // table.
-        writers.records.clone().expect("the host record table")
+    fn bind_out(
+        names: &mut ParamNames<'_>,
+        writers: &mut Writers,
+    ) -> Result<Arc<Records>, ParamError> {
+        param_name(names);
+        Ok(writers.instance.records.clone())
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
@@ -348,14 +409,18 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
-    fn bind_out(writers: &mut Writers) -> Self::Out {
+    fn bind_out(
+        names: &mut ParamNames<'_>,
+        writers: &mut Writers,
+    ) -> Result<Self::Out, ParamError> {
+        param_name(names);
         // PANIC Safety: the coordinator binds one writer per declared output;
         // a mismatch is a coordinator bug.
         let binding = writers
             .bindings
             .next()
             .expect("one binding per output param");
-        Output::counting(binding.writer, writers.dropped.clone())
+        Ok(Output::counting(binding.writer, writers.dropped.clone()))
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
@@ -387,7 +452,10 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
         Ports::bind(views.bindings.take())
     }
 
-    fn bind_out(_writers: &mut Writers) {}
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
+        param_name(names);
+        Ok(())
+    }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
         input: &'a mut Self::In<W>,
@@ -416,8 +484,12 @@ impl Param for DynOutputs {
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
-    fn bind_out(writers: &mut Writers) -> Self::Out {
-        DynOutputs::new(writers.bindings.take(), &writers.dropped)
+    fn bind_out(
+        names: &mut ParamNames<'_>,
+        writers: &mut Writers,
+    ) -> Result<Self::Out, ParamError> {
+        param_name(names);
+        Ok(DynOutputs::new(writers.bindings.take(), &writers.dropped))
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
@@ -445,7 +517,10 @@ impl Param for Timestamp {
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
-    fn bind_out(_writers: &mut Writers) {}
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), ParamError> {
+        param_name(names);
+        Ok(())
+    }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
         _input: &'a mut (),
@@ -472,8 +547,9 @@ impl Param for Log {
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
-    fn bind_out(_writers: &mut Writers) -> Log {
-        Log
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<Log, ParamError> {
+        param_name(names);
+        Ok(Log)
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
@@ -508,8 +584,8 @@ macro_rules! impl_param_for_tuple {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn bind_out(writers: &mut Writers) -> Self::Out {
-                ($( $P::bind_out(writers), )*)
+            fn bind_out(names: &mut ParamNames<'_>, writers: &mut Writers) -> Result<Self::Out, ParamError> {
+                Ok(($( $P::bind_out(names, writers)?, )*))
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
