@@ -1,6 +1,6 @@
 //! The inbox where a link's connections put the packets they read.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::mem::size_of;
 use std::collections::HashSet;
 
@@ -37,10 +37,13 @@ const ANNOUNCE: [PacketId; 4] = [
 /// sends before its first data packet. Each connection tracks its own
 /// [`ConnectionState`], and the tables its peer never announced are queued for the
 /// link to log.
+///
+/// Every connection task writes into the same rings, so the writers sit in
+/// `RefCell`s.
 pub(crate) struct Inbox {
-    writer: Writer<Notifier>,
+    writer: RefCell<Writer<Notifier>>,
     /// One record per table id a peer did not announce.
-    missing: Writer<Notifier>,
+    missing: RefCell<Writer<Notifier>>,
     max_len: usize,
     /// The packet type and id of every record some port takes. A timestamped
     /// message is keyed as a plain `Msg`.
@@ -109,8 +112,8 @@ impl Inbox {
         // PANIC Safety: the rings are new, so their writers and their one
         // reader slots are free.
         let inbox = Self {
-            writer: packets.writer(wake.clone()).expect("a new ring's writer"),
-            missing: missing.writer(wake.clone()).expect("a new ring's writer"),
+            writer: RefCell::new(packets.writer(wake.clone()).expect("a new ring's writer")),
+            missing: RefCell::new(missing.writer(wake.clone()).expect("a new ring's writer")),
             max_len: record_max_len,
             routes: routes.iter().copied().collect(),
             tables,
@@ -158,13 +161,13 @@ impl Inbox {
         }
         if let Some(expected) = state.start_streaming() {
             for table in self.tables.iter().filter(|id| expected.contains(*id)) {
-                let _ = self.missing.try_write(table);
+                let _ = self.missing.borrow_mut().try_write(table);
             }
         }
         if !self.routes.contains(&(ty, id)) {
             return;
         }
-        if bytes.len() > self.max_len || self.writer.try_write(body).is_err() {
+        if bytes.len() > self.max_len || self.writer.borrow_mut().try_write(body).is_err() {
             self.dropped.set(self.dropped.get() + 1);
         }
     }

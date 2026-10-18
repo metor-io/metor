@@ -98,7 +98,7 @@ impl StatusReporter {
     ///
     /// If more inbound packets were dropped since the last report, this also
     /// logs a fault with the count.
-    fn report(&mut self, status: LinkStatus, link_status: &Output<LinkStatus>, log: &mut Log) {
+    fn report(&mut self, status: LinkStatus, link_status: &mut Output<LinkStatus>, log: &mut Log) {
         if status.inbound_dropped > self.reported.inbound_dropped {
             let dropped = status.inbound_dropped - self.reported.inbound_dropped;
             log.fault("inbound_dropped", format!("{dropped} packets dropped"));
