@@ -583,7 +583,7 @@ fn test_async_adapter_relay() {
     );
 
     let (imu, nav, log) = (ring::<Imu>(8, 1), ring::<Nav>(8, 1), ring::<LogEvent>(8, 1));
-    let source = output::<Imu>(&imu);
+    let mut source = output::<Imu>(&imu);
     let mut estimates = input::<Nav>(&nav);
     let mut lines = input::<LogEvent>(&log);
 

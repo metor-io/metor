@@ -299,7 +299,7 @@ pub(crate) mod tests {
         let (source, target) = (ring(256), ring(256));
         let mut received = target.view(NoWake).expect("a free reader slot");
         let mut copy = mirror(&source, &target);
-        let writer = source.writer(NoWake).expect("a free writer");
+        let mut writer = source.writer(NoWake).expect("a free writer");
         writer.try_write(b"first").expect("room");
         writer.try_write(b"second").expect("room");
         let (base, len) = source.region();
@@ -317,7 +317,7 @@ pub(crate) mod tests {
     fn test_drain_stops_at_corrupt_destination() {
         let (source, target) = (ring(256), ring(256));
         let mut copy = mirror(&source, &target);
-        let writer = source.writer(NoWake).expect("a free writer");
+        let mut writer = source.writer(NoWake).expect("a free writer");
         writer.try_write(b"first").expect("room");
         writer.try_write(b"second").expect("room");
         let (base, _) = target.region();
@@ -334,7 +334,7 @@ pub(crate) mod tests {
         let (source, target) = (ring(256), ring(128));
         let _behind = target.view(NoWake).expect("a free reader slot");
         let mut copy = mirror(&source, &target);
-        let writer = source.writer(NoWake).expect("a free writer");
+        let mut writer = source.writer(NoWake).expect("a free writer");
         for _ in 0..8 {
             writer.try_write(&[7; 16]).expect("room");
         }
@@ -394,7 +394,7 @@ pub(crate) mod tests {
             max_readers: 1,
         })
         .expect("a valid ring config");
-        let writer = source.writer(NoWake).expect("writer");
+        let mut writer = source.writer(NoWake).expect("writer");
         let mut received = target.view(NoWake).expect("reader");
         let from = source.view(NoWake).expect("reader");
         writer.try_write(b"first").expect("room");
