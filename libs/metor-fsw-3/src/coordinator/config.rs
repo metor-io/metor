@@ -23,9 +23,9 @@ use crate::system::PortDef;
 // PANIC Safety: evaluated at compile time.
 pub const DEFAULT_RING_DEPTH: NonZeroUsize = NonZeroUsize::new(8).expect("nonzero");
 
-/// The configuration for a coordinator.
+/// The configuration for a coordinator, whose systems are `S`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CoordinatorConfig {
+pub struct CoordinatorConfig<S = SystemConfig> {
     /// The clock that paces the cycles.
     pub clock: Clock,
     /// How many records a ring holds per unit of its port's declared depth.
@@ -33,7 +33,7 @@ pub struct CoordinatorConfig {
     /// A prefix added to every name the coordinator announces.
     #[serde(default)]
     pub namespace: Option<String>,
-    pub systems: Vec<SystemConfig>,
+    pub systems: Vec<S>,
     /// The resources systems are granted, by id.
     #[serde(
         default,
@@ -44,6 +44,23 @@ pub struct CoordinatorConfig {
     /// The seed every `Rng` parameter draws from.
     #[serde(default)]
     pub seed: u64,
+}
+
+impl<S> CoordinatorConfig<S> {
+    /// Returns this config with each system mapped through `f`.
+    pub fn try_map_systems<T, E>(
+        self,
+        f: impl FnMut(S) -> Result<T, E>,
+    ) -> Result<CoordinatorConfig<T>, E> {
+        Ok(CoordinatorConfig {
+            clock: self.clock,
+            ring_depth: self.ring_depth,
+            namespace: self.namespace,
+            systems: self.systems.into_iter().map(f).collect::<Result<_, E>>()?,
+            resources: self.resources,
+            seed: self.seed,
+        })
+    }
 }
 
 impl Default for CoordinatorConfig {
@@ -61,17 +78,18 @@ impl Default for CoordinatorConfig {
     }
 }
 
-/// Configures one system instance.
+/// Configures one system instance, whose config-defined outputs take their
+/// definitions from `O`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SystemConfig {
+pub struct SystemConfig<O = OutputSource> {
     pub id: String,
     pub ty: String,
     #[serde(default)]
     pub params: serde_json::Value,
     #[serde(default)]
     pub inputs: Vec<InputConfig>,
-    #[serde(default)]
-    pub outputs: Vec<OutputConfig>,
+    #[serde(default = "Vec::new")]
+    pub outputs: Vec<OutputConfig<O>>,
     /// Gives `Cap<K>` parameters real resources, by parameter name. A sim
     /// resource names its holders itself.
     #[serde(
@@ -315,7 +333,7 @@ pub enum RunState {
     Stopped,
 }
 
-impl SystemConfig {
+impl<O> SystemConfig<O> {
     /// Returns a system with no params and no inputs.
     pub fn new(id: impl Into<String>, ty: impl Into<String>) -> Self {
         Self {
@@ -329,14 +347,42 @@ impl SystemConfig {
             location: None,
         }
     }
+
+    /// Returns this system with each output's source mapped through `f`.
+    pub fn try_map_outputs<P, E>(
+        self,
+        mut f: impl FnMut(&str, O) -> Result<P, E>,
+    ) -> Result<SystemConfig<P>, E> {
+        let outputs = self
+            .outputs
+            .into_iter()
+            .map(|output| {
+                let source = f(&output.port, output.source)?;
+                Ok(OutputConfig {
+                    port: output.port,
+                    source,
+                })
+            })
+            .collect::<Result<_, E>>()?;
+        Ok(SystemConfig {
+            id: self.id,
+            ty: self.ty,
+            params: self.params,
+            inputs: self.inputs,
+            outputs,
+            grants: self.grants,
+            adapter: self.adapter,
+            location: self.location,
+        })
+    }
 }
 
 /// An output port declared by the config instead of the system type.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutputConfig {
+pub struct OutputConfig<O = OutputSource> {
     pub port: String,
     #[serde(flatten)]
-    pub source: OutputSource,
+    pub source: O,
 }
 
 impl OutputConfig {
@@ -349,10 +395,8 @@ impl OutputConfig {
     }
 }
 
-/// Where a config-defined output gets its definition from.
-///
-/// `Record` refers to a record registered in the system table. `Def` is a
-/// definition given in full.
+/// Where a config-defined output gets its definition from: a record
+/// registered in the system table, or a full port definition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputSource {
@@ -501,7 +545,8 @@ mod tests {
             serde_json::from_str::<SystemConfig>(&encoded).expect("round trips"),
             located
         );
-        let bare = serde_json::to_string(&SystemConfig::new("nav", "nav")).expect("encodes");
+        let bare: SystemConfig = SystemConfig::new("nav", "nav");
+        let bare = serde_json::to_string(&bare).expect("encodes");
         assert!(!bare.contains("location"), "{bare}");
         let missing_line = r#"{"id":"nav","ty":"nav","location":{"file":"target.py"}}"#;
         assert!(serde_json::from_str::<SystemConfig>(missing_line).is_err());
@@ -605,7 +650,8 @@ mod tests {
                 system
             );
         }
-        let text = serde_json::to_string(&SystemConfig::new("a", "t")).expect("serializable");
+        let text = serde_json::to_string(&SystemConfig::<OutputSource>::new("a", "t"))
+            .expect("serializable");
         assert!(
             !text.contains("thread") && !text.contains("channel"),
             "{text}"
@@ -663,6 +709,8 @@ mod tests {
         let record: OutputConfig =
             serde_json::from_str(r#"{"port":"ping","record":"ping"}"#).expect("record form");
         assert_eq!(record, OutputConfig::with_record("ping", "ping"));
+        let peer = r#"{"port":"est.est","peer":{"target":"a","link":"pub","port":"est.est"}}"#;
+        assert!(serde_json::from_str::<OutputConfig>(peer).is_err());
         assert!(serde_json::from_str::<OutputConfig>(r#"{"port":"x"}"#).is_err());
     }
 }

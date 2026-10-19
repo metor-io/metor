@@ -204,6 +204,12 @@ mod tests {
     }
 
     #[test]
+    fn test_peer_transport_does_not_parse() {
+        let peer = r#"{"peer":{"target":"a","link":"pub"}}"#;
+        assert!(serde_json::from_str::<Transport>(peer).is_err());
+    }
+
+    #[test]
     fn test_bind_reports_assigned_port() {
         let endpoint = listen("127.0.0.1:0").bind().expect("a free port");
         let addr = endpoint.local_addr().expect("a bound listener");

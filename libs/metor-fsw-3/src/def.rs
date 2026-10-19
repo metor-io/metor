@@ -87,7 +87,7 @@ impl DefCx<'_> {
     /// Returns definitions for config outputs that no declared port claimed.
     ///
     /// Each port's record comes from the record the config names, or from the
-    /// definition `metor build` resolved for it.
+    /// definition the config gives.
     pub fn dyn_output_defs(
         &self,
         declared: &[Cow<'static, str>],

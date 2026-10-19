@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+OUT_ENV = "METOR_CONFIG_OUT"
+
 NANOS_PER_SEC = 1_000_000_000
 
 

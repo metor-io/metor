@@ -1,0 +1,421 @@
+{
+  "config_version": 2,
+  "hosts": {
+    "a": "10.0.0.2"
+  },
+  "targets": [
+    {
+      "packs": [
+        {
+          "id": "adcs",
+          "lib": "adcs_systems",
+          "libs": "/abs/.metor/adcs_pack/_libs"
+        }
+      ],
+      "coordinator": {
+        "clock": {
+          "Wall": {
+            "rate": 100.0
+          }
+        },
+        "ring_depth": 8,
+        "namespace": "a",
+        "systems": [
+          {
+            "id": "plant",
+            "ty": "adcs.plant",
+            "params": {
+              "altitude": 400000.0
+            },
+            "inputs": [
+              {
+                "port": "motor_cmd",
+                "from": []
+              }
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_deployment.py",
+              "line": 21
+            }
+          },
+          {
+            "id": "nav",
+            "ty": "adcs.nav",
+            "params": {
+              "gain": 0.1
+            },
+            "inputs": [
+              {
+                "port": "imu",
+                "from": [
+                  {
+                    "system": "plant",
+                    "port": "imu"
+                  }
+                ]
+              }
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_deployment.py",
+              "line": 22
+            }
+          },
+          {
+            "id": "pub",
+            "ty": "fsw.publish",
+            "params": {
+              "transport": {
+                "listen": {
+                  "addr": "0.0.0.0:2240",
+                  "max_connections": 8
+                }
+              },
+              "namespace": "a",
+              "link": "pub",
+              "conn_cap": 1048576
+            },
+            "inputs": [
+              {
+                "port": "plant.imu",
+                "from": [
+                  {
+                    "system": "plant",
+                    "port": "imu"
+                  }
+                ]
+              },
+              {
+                "port": "plant.log",
+                "from": [
+                  {
+                    "system": "plant",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "plant.status",
+                "from": [
+                  {
+                    "system": "plant",
+                    "port": "status"
+                  }
+                ]
+              },
+              {
+                "port": "nav.est",
+                "from": [
+                  {
+                    "system": "nav",
+                    "port": "est"
+                  }
+                ]
+              },
+              {
+                "port": "nav.log",
+                "from": [
+                  {
+                    "system": "nav",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "nav.status",
+                "from": [
+                  {
+                    "system": "nav",
+                    "port": "status"
+                  }
+                ]
+              }
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_deployment.py",
+              "line": 23
+            }
+          },
+          {
+            "id": "cmds",
+            "ty": "fsw.subscribe",
+            "params": {
+              "transport": {
+                "peer": {
+                  "target": "b",
+                  "link": "pub"
+                }
+              },
+              "namespace": "a",
+              "link": "cmds",
+              "conn_cap": 1048576,
+              "inbound_cap": 256
+            },
+            "inputs": [],
+            "outputs": [
+              {
+                "port": "ping",
+                "record": "ping"
+              }
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_deployment.py",
+              "line": 31
+            }
+          }
+        ]
+      }
+    },
+    {
+      "packs": [
+        {
+          "id": "adcs",
+          "lib": "adcs_systems",
+          "libs": "/abs/.metor/adcs_pack/_libs"
+        }
+      ],
+      "coordinator": {
+        "clock": {
+          "Wall": {
+            "rate": 100.0
+          }
+        },
+        "ring_depth": 8,
+        "namespace": "b",
+        "systems": [
+          {
+            "id": "mirror",
+            "ty": "fsw.subscribe",
+            "params": {
+              "transport": {
+                "peer": {
+                  "target": "a",
+                  "link": "pub"
+                }
+              },
+              "namespace": "b",
+              "link": "mirror",
+              "conn_cap": 1048576,
+              "inbound_cap": 256
+            },
+            "inputs": [],
+            "outputs": [
+              {
+                "port": "plant.imu",
+                "peer": {
+                  "target": "a",
+                  "link": "pub",
+                  "port": "plant.imu"
+                }
+              },
+              {
+                "port": "plant.log",
+                "peer": {
+                  "target": "a",
+                  "link": "pub",
+                  "port": "plant.log"
+                }
+              },
+              {
+                "port": "plant.status",
+                "peer": {
+                  "target": "a",
+                  "link": "pub",
+                  "port": "plant.status"
+                }
+              },
+              {
+                "port": "nav.est",
+                "peer": {
+                  "target": "a",
+                  "link": "pub",
+                  "port": "nav.est"
+                }
+              }
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_deployment.py",
+              "line": 26
+            }
+          },
+          {
+            "id": "mode",
+            "ty": "adcs.mode",
+            "params": null,
+            "inputs": [],
+            "location": {
+              "file": "python/metor-config/tests/test_deployment.py",
+              "line": 27
+            }
+          },
+          {
+            "id": "ctrl",
+            "ty": "adcs.ctrl",
+            "params": null,
+            "inputs": [
+              {
+                "port": "est",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "nav.est"
+                  }
+                ]
+              },
+              {
+                "port": "mode",
+                "from": [
+                  {
+                    "system": "mode",
+                    "port": "cmd"
+                  }
+                ]
+              }
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_deployment.py",
+              "line": 28
+            }
+          },
+          {
+            "id": "pub",
+            "ty": "fsw.publish",
+            "params": {
+              "transport": {
+                "listen": {
+                  "addr": "0.0.0.0:2241",
+                  "max_connections": 8
+                }
+              },
+              "namespace": "b",
+              "link": "pub",
+              "conn_cap": 1048576
+            },
+            "inputs": [
+              {
+                "port": "mirror.plant.imu",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "plant.imu"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.plant.log",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "plant.log"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.plant.status",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "plant.status"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.nav.est",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "nav.est"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.link_status",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.log",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.status",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "status"
+                  }
+                ]
+              },
+              {
+                "port": "mode.cmd",
+                "from": [
+                  {
+                    "system": "mode",
+                    "port": "cmd"
+                  }
+                ]
+              },
+              {
+                "port": "mode.log",
+                "from": [
+                  {
+                    "system": "mode",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "mode.status",
+                "from": [
+                  {
+                    "system": "mode",
+                    "port": "status"
+                  }
+                ]
+              },
+              {
+                "port": "ctrl.motor_cmd",
+                "from": [
+                  {
+                    "system": "ctrl",
+                    "port": "motor_cmd"
+                  }
+                ]
+              },
+              {
+                "port": "ctrl.log",
+                "from": [
+                  {
+                    "system": "ctrl",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "ctrl.status",
+                "from": [
+                  {
+                    "system": "ctrl",
+                    "port": "status"
+                  }
+                ]
+              }
+            ],
+            "location": {
+              "file": "python/metor-config/tests/test_deployment.py",
+              "line": 29
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

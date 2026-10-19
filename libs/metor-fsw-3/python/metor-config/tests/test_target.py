@@ -1,56 +1,103 @@
-"""Tests for building targets and `to_config()`."""
+"""Tests for building targets, `to_config()`, and emitting the config."""
 
 from __future__ import annotations
 
 import contextlib
 import inspect
+import json
 import os
+import tempfile
 import unittest
 
 from adcs_stub import PACK, Ctrl, Fan, Hold, Mode, MotorCmd, Nav, Ping, Plant, Safe, Tap
 
+import metor_config._deployment as deploy_mod
 import metor_config._target as target_mod
 from metor_config import (
     ChannelRegistry,
     ConfigError,
+    Connect,
     DlSlot,
+    Listen,
     PortRef,
     Publish,
     SequenceCommand,
     Subscribe,
     Target,
+    emit,
 )
+
+CRATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+"""The crate root. The goldens' locations are relative to it."""
+
+GOLDEN = os.path.join(CRATE, "tests", "golden", "target.json")
+
 
 def adcs_target() -> Target:
     """The design doc's example target."""
     fsw = Target(cycle_rate=100.0, namespace="cube_sat")
-    fsw.add("cmds", Subscribe([Ping], listen="127.0.0.1:0"))
+    fsw.add("cmds", Subscribe([Ping], transport=Listen("127.0.0.1:0")))
     motor_cmd = fsw.loop(MotorCmd)
     plant = fsw.add("plant", Plant(altitude=400e3, motor_cmd=motor_cmd))
     nav = fsw.add("nav", Nav(imu=plant.imu, gain=0.2))
     mode = fsw.add("mode", Mode())
     ctrl = fsw.add("ctrl", Ctrl(est=nav.est, mode=mode.cmd))
     motor_cmd.connect(ctrl.motor_cmd)
-    fsw.add("pub", Publish([plant, nav.est], listen="127.0.0.1:0"), thread="io")
+    fsw.add("pub", Publish([plant, nav.est], transport=Listen("127.0.0.1:0")), thread="io")
     return fsw
 
 
 def reset() -> None:
-    """Clears every target."""
+    """Clears every target and deployment, so the atexit hook has nothing to
+    emit to stdout."""
     target_mod._targets.clear()
+    deploy_mod._deployments.clear()
+    deploy_mod._emitted = False
 
 
 class ConfigTest(unittest.TestCase):
-    """Starts and ends each test with no target."""
+    """Starts and ends each test with no target, deployment, or env override."""
 
     def setUp(self) -> None:
         reset()
+        os.environ.pop("METOR_CONFIG_OUT", None)
 
     def tearDown(self) -> None:
         reset()
 
 
 class TargetTest(ConfigTest):
+    def test_atexit_emits_once(self) -> None:
+        adcs_target()
+        with tempfile.TemporaryDirectory() as dir:
+            path = os.path.join(dir, "out.json")
+            os.environ["METOR_CONFIG_OUT"] = path
+            deploy_mod._emit_at_exit()
+            self.assertTrue(os.path.exists(path))
+            os.remove(path)
+            deploy_mod._emit_at_exit()
+            self.assertFalse(os.path.exists(path))
+
+    def test_example_matches_golden(self) -> None:
+        with contextlib.chdir(CRATE):
+            adcs_target()
+        with tempfile.TemporaryDirectory() as dir:
+            path = os.path.join(dir, "target.json")
+            emit(path)
+            with open(path, "rb") as file:
+                written = file.read()
+        with open(GOLDEN, "rb") as file:
+            self.assertEqual(written, file.read())
+
+    def test_emit_uses_env_path(self) -> None:
+        adcs_target()
+        with tempfile.TemporaryDirectory() as dir:
+            path = os.path.join(dir, "out.json")
+            os.environ["METOR_CONFIG_OUT"] = path
+            emit()
+            with open(path, encoding="utf-8") as file:
+                self.assertEqual(json.load(file)["config_version"], 2)
+
     def test_seed_is_emitted_when_set(self) -> None:
         self.assertEqual(Target(cycle_rate=1.0, seed=7).to_config()["coordinator"]["seed"], 7)
         self.assertNotIn("seed", Target(cycle_rate=1.0).to_config()["coordinator"])
@@ -134,6 +181,12 @@ class TargetTest(ConfigTest):
         with self.assertRaisesRegex(ConfigError, "input `imu`"):
             Nav(imu="plant.imu")  # type: ignore[arg-type]
 
+    def test_emit_requires_one_target(self) -> None:
+        adcs_target()
+        adcs_target()
+        with self.assertRaisesRegex(ConfigError, "found 2"):
+            emit()
+
 
 class LocationTest(ConfigTest):
     def test_system_records_where_it_was_created(self) -> None:
@@ -141,7 +194,7 @@ class LocationTest(ConfigTest):
         plant = Plant()
         line = inspect.currentframe().f_lineno - 1  # type: ignore[union-attr]
         fsw.add("plant", plant)
-        fsw.add("pub", Publish([], listen="127.0.0.1:0"))
+        fsw.add("pub", Publish([], transport=Listen("127.0.0.1:0")))
         plant_entry, pub_entry = fsw.to_config()["coordinator"]["systems"]
         here = os.path.relpath(__file__)
         self.assertEqual(plant_entry["location"], {"file": here, "line": line})
@@ -164,7 +217,7 @@ class LinkTest(ConfigTest):
     def test_publish_handle_includes_log_and_status(self) -> None:
         fsw = Target(cycle_rate=100.0)
         plant = fsw.add("plant", Plant())
-        fsw.add("pub", Publish([plant], listen="0.0.0.0:2240"))
+        fsw.add("pub", Publish([plant], transport=Listen("0.0.0.0:2240")))
         entry = fsw.to_config()["coordinator"]["systems"][1]
         self.assertEqual(
             [input["port"] for input in entry["inputs"]],
@@ -181,7 +234,7 @@ class LinkTest(ConfigTest):
     def test_publish_single_port(self) -> None:
         fsw = Target(cycle_rate=100.0)
         plant = fsw.add("plant", Plant())
-        fsw.add("pub", Publish([plant.imu], connect="127.0.0.1:2240"))
+        fsw.add("pub", Publish([plant.imu], transport=Connect("127.0.0.1:2240")))
         entry = fsw.to_config()["coordinator"]["systems"][1]
         self.assertEqual([input["port"] for input in entry["inputs"]], ["plant.imu"])
         self.assertEqual(entry["params"]["transport"], {"connect": {"addr": "127.0.0.1:2240"}})
@@ -189,7 +242,7 @@ class LinkTest(ConfigTest):
     def test_publish_all_includes_prior_systems(self) -> None:
         fsw = Target(cycle_rate=100.0)
         fsw.add("plant", Plant())
-        fsw.add("pub", Publish(listen="0.0.0.0:2240", all=True))
+        fsw.add("pub", Publish(transport=Listen("0.0.0.0:2240"), all=True))
         fsw.add("mode", Mode())
         entry = fsw.to_config()["coordinator"]["systems"][1]
         self.assertEqual(
@@ -240,35 +293,35 @@ class LinkTest(ConfigTest):
         with self.assertRaisesRegex(ConfigError, "record classes"):
             Fan(records=[Plant])  # type: ignore[list-item]
 
-    def test_require_one_transport(self) -> None:
-        with self.assertRaisesRegex(ConfigError, "exactly one"):
-            Publish([], listen="0.0.0.0:1", connect="0.0.0.0:2")
-        with self.assertRaisesRegex(ConfigError, "exactly one"):
-            Subscribe([Ping])
+    def test_require_a_transport(self) -> None:
+        with self.assertRaises(TypeError):
+            Subscribe([Ping])  # type: ignore[call-arg]
+        with self.assertRaisesRegex(ConfigError, "`Listen`, `Connect`, or `Peer`"):
+            Publish([], transport="0.0.0.0:1")  # type: ignore[arg-type]
 
-    def test_connect_rejects_max_connections(self) -> None:
-        with self.assertRaisesRegex(ConfigError, "max_connections"):
-            Publish([], connect="127.0.0.1:2240", max_connections=2)
-        with self.assertRaisesRegex(ConfigError, "max_connections"):
-            Subscribe([Ping], connect="127.0.0.1:2240", max_connections=2)
+    def test_listen_max_connections(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        fsw.add("pub", Publish([], transport=Listen("0.0.0.0:2240", max_connections=2)))
+        entry = fsw.to_config()["coordinator"]["systems"][0]
+        self.assertEqual(entry["params"]["transport"]["listen"]["max_connections"], 2)
 
     def test_subscribe_rejects_duplicate_record(self) -> None:
         with self.assertRaisesRegex(ConfigError, "twice"):
-            Subscribe([Ping, Ping], listen="0.0.0.0:1")
+            Subscribe([Ping, Ping], transport=Listen("0.0.0.0:1"))
 
     def test_publish_rejects_invalid_port(self) -> None:
         with self.assertRaisesRegex(ConfigError, "handles and ports"):
-            Publish(["plant.imu"], listen="0.0.0.0:1")  # type: ignore[list-item]
+            Publish(["plant.imu"], transport=Listen("0.0.0.0:1"))  # type: ignore[list-item]
 
     def test_subscribe_rejects_invalid_record(self) -> None:
         with self.assertRaisesRegex(ConfigError, "record classes"):
-            Subscribe([Plant], listen="0.0.0.0:1")  # type: ignore[list-item]
+            Subscribe([Plant], transport=Listen("0.0.0.0:1"))  # type: ignore[list-item]
         with self.assertRaisesRegex(ConfigError, "record classes"):
-            Subscribe(["ping"], listen="0.0.0.0:1")  # type: ignore[list-item]
+            Subscribe(["ping"], transport=Listen("0.0.0.0:1"))  # type: ignore[list-item]
 
     def test_subscribe_resolves_record_ports(self) -> None:
         fsw = Target(cycle_rate=100.0, namespace="cube_sat")
-        cmds = fsw.add("cmds", Subscribe([Ping], listen="0.0.0.0:2241"))
+        cmds = fsw.add("cmds", Subscribe([Ping], transport=Listen("0.0.0.0:2241")))
         self.assertEqual(cmds.ping.ref, PortRef("cmds", "ping"))  # type: ignore[attr-defined]
         self.assertEqual(cmds.link_status.ref, PortRef("cmds", "link_status"))  # type: ignore[attr-defined]
         with self.assertRaisesRegex(AttributeError, "no output port `arm`"):
@@ -280,13 +333,13 @@ class LinkTest(ConfigTest):
 
     def test_config_excludes_builtin_pack(self) -> None:
         fsw = Target(cycle_rate=100.0)
-        fsw.add("cmds", Subscribe([], listen="0.0.0.0:2241"))
+        fsw.add("cmds", Subscribe([], transport=Listen("0.0.0.0:2241")))
         self.assertEqual(fsw.to_config()["packs"], [])
 
     def test_subscribe_loads_record_pack(self) -> None:
         fsw = Target(cycle_rate=100.0)
-        cmds = fsw.add("cmds", Subscribe([Ping, MotorCmd], listen="127.0.0.1:0"))
-        fsw.add("pub", Publish([cmds], listen="127.0.0.1:0"))
+        cmds = fsw.add("cmds", Subscribe([Ping, MotorCmd], transport=Listen("127.0.0.1:0")))
+        fsw.add("pub", Publish([cmds], transport=Listen("127.0.0.1:0")))
         self.assertEqual(fsw.to_config()["packs"], [PACK.to_json()])
         fsw.add("plant", Plant())
         self.assertEqual(fsw.to_config()["packs"], [PACK.to_json()])
@@ -294,7 +347,7 @@ class LinkTest(ConfigTest):
     def test_publish_registration_isolation(self) -> None:
         fsw = Target(cycle_rate=100.0)
         fsw.add("plant", Plant())
-        publish = Publish(all=True, listen="127.0.0.1:0")
+        publish = Publish(all=True, transport=Listen("127.0.0.1:0"))
         fsw.add("pub1", publish)
         fsw.add("pub2", publish)
         config = fsw.to_config()
@@ -314,7 +367,7 @@ class LinkTest(ConfigTest):
         self.assertEqual(publish._inputs, {})
 
     def test_target_config_isolation(self) -> None:
-        subscribe = Subscribe([Ping], listen="127.0.0.1:0")
+        subscribe = Subscribe([Ping], transport=Listen("127.0.0.1:0"))
         first = Target(cycle_rate=100.0, namespace="first")
         first.add("a", subscribe)
         saved = first.to_config()
@@ -333,17 +386,18 @@ class LinkTest(ConfigTest):
 
     def test_system_thread_assignment(self) -> None:
         fsw = Target(cycle_rate=100.0)
-        fsw.add("cmds", Subscribe([Ping], listen="0.0.0.0:2241"), thread="io")
+        fsw.add("cmds", Subscribe([Ping], transport=Listen("0.0.0.0:2241")), thread="io")
         fsw.add("plant", Plant())
         systems = fsw.to_config()["coordinator"]["systems"]
         self.assertEqual(systems[0]["thread"], "io")
         self.assertNotIn("thread", systems[1])
 
 
+
 def slotted() -> tuple[Target, dict[str, dict]]:
     """Commands, a plain channel, a slot, and a registry, by system id."""
     fsw = Target(cycle_rate=50.0)
-    cmds = fsw.add("cmds", Subscribe([SequenceCommand], listen="127.0.0.1:0"))
+    cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
     fsw.commands(cmds.sequence_command)
     nav = fsw.add("nav", Nav(), channel="nav")
     fsw.add("mode", DlSlot(allow=[Safe(hold=2.0), Hold()], initial="hold", est=nav.est),
@@ -366,7 +420,7 @@ class ChannelTest(ConfigTest):
     def test_commands_reach_later_channels(self) -> None:
         fsw = Target(cycle_rate=50.0)
         fsw.add("early", Nav(), channel="early")
-        cmds = fsw.add("cmds", Subscribe([SequenceCommand], listen="127.0.0.1:0"))
+        cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
         fsw.commands(cmds.sequence_command)
         fsw.add("late", Nav(), channel="late")
         systems = fsw.to_config()["coordinator"]["systems"]
@@ -375,7 +429,7 @@ class ChannelTest(ConfigTest):
 
     def test_channel_exposes_its_ports(self) -> None:
         fsw = Target(cycle_rate=50.0)
-        cmds = fsw.add("cmds", Subscribe([SequenceCommand], listen="127.0.0.1:0"))
+        cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
         fsw.commands(cmds.sequence_command)
         nav = fsw.add("nav", Nav(), channel="nav")
         self.assertEqual(nav.events.ref, PortRef("nav", "events"))
@@ -383,7 +437,7 @@ class ChannelTest(ConfigTest):
         plain = fsw.add("plain", Nav())
         with self.assertRaisesRegex(AttributeError, "channel_status"):
             plain.channel_status  # type: ignore[attr-defined]
-        pub = fsw.add("pub", Publish([nav], listen="127.0.0.1:0"))
+        pub = fsw.add("pub", Publish([nav], transport=Listen("127.0.0.1:0")))
         ports = [i["port"] for i in fsw.to_config()["coordinator"]["systems"][3]["inputs"]]
         self.assertIn("nav.channel_status", ports)
         self.assertIsNotNone(pub)
@@ -426,7 +480,7 @@ class ChannelTest(ConfigTest):
         with self.assertRaisesRegex(ConfigError, "on the slot"):
             DlSlot(allow=[Safe(est=nav.est)])
         with self.assertRaisesRegex(ConfigError, "pack systems"):
-            DlSlot(allow=[Publish(listen="127.0.0.1:0")])
+            DlSlot(allow=[Publish(transport=Listen("127.0.0.1:0"))])
 
     def test_channel_without_commands_refused(self) -> None:
         fsw = Target(cycle_rate=50.0)
@@ -442,7 +496,7 @@ class ChannelTest(ConfigTest):
 
     def test_slot_without_initial_emits_null(self) -> None:
         fsw = Target(cycle_rate=50.0)
-        cmds = fsw.add("cmds", Subscribe([SequenceCommand], listen="127.0.0.1:0"))
+        cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
         fsw.commands(cmds.sequence_command)
         fsw.add("mode", DlSlot(allow=[Safe(), Hold()]), channel="mode")
         mode = fsw.to_config()["coordinator"]["systems"][1]

@@ -8,7 +8,8 @@ use core::task::{Context, Poll};
 use std::fmt::Display;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -79,6 +80,63 @@ pub fn fixture_lib() -> &'static Path {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         cargo_build("echo-pack", root).expect("the fixture builds")
     })
+}
+
+pub fn metor() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_metor"))
+}
+
+/// A running `metor` child process. Dropping it kills the process.
+pub struct Running(pub Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The ports [`free_ports`] hands out.
+///
+/// They sit below the ephemeral ranges of Linux (32768 and up) and macOS
+/// (49152 and up), so the OS never gives one to a `bind(0)` or an outgoing
+/// connection.
+const TEST_PORTS: core::ops::Range<u16> = 20000..32000;
+
+/// How far into [`TEST_PORTS`] this process has handed out ports.
+static NEXT_PORT: AtomicU32 = AtomicU32::new(0);
+
+/// Returns `N` ports that nothing listened on when this was called.
+///
+/// Each call in a process gets different ports, and each process starts at a
+/// different place in [`TEST_PORTS`]. A port is probed by dialing it, not by
+/// binding it: a socket bound here can leak into a child spawned by another
+/// test at the same moment, and the child then holds the port.
+pub fn free_ports<const N: usize>() -> [u16; N] {
+    let span = u32::from(TEST_PORTS.end - TEST_PORTS.start);
+    let start = std::process::id().wrapping_mul(997);
+    let ports: Vec<u16> = (0..span)
+        .map(|_| start.wrapping_add(NEXT_PORT.fetch_add(1, Ordering::Relaxed)) % span)
+        .filter_map(|offset| u16::try_from(offset).ok())
+        .map(|offset| TEST_PORTS.start + offset)
+        .filter(|&port| std::net::TcpStream::connect(local(port)).is_err())
+        .take(N)
+        .collect();
+    ports.try_into().expect("enough free test ports")
+}
+
+/// Joins `ports` into the comma-separated list a fixture's ports variable
+/// expects.
+pub fn ports_env(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub fn local(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
 }
 
 /// A deadline [`DEADLINE`] from now, for polling loops.

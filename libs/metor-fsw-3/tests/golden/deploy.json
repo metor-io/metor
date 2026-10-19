@@ -1,0 +1,263 @@
+{
+  "config_version": 2,
+  "hosts": {},
+  "targets": [
+    {
+      "packs": [
+        {
+          "id": "echo",
+          "lib": "echo_pack",
+          "libs": "<libs>"
+        }
+      ],
+      "coordinator": {
+        "clock": {
+          "Wall": {
+            "rate": 1000.0
+          }
+        },
+        "ring_depth": 8,
+        "seed": 0,
+        "namespace": "a",
+        "systems": [
+          {
+            "id": "sampler",
+            "ty": "echo.sampler",
+            "params": null,
+            "inputs": [],
+            "outputs": [],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 15
+            }
+          },
+          {
+            "id": "pub",
+            "ty": "fsw.publish",
+            "params": {
+              "conn_cap": 1048576,
+              "link": "pub",
+              "namespace": "a",
+              "transport": {
+                "listen": {
+                  "addr": "127.0.0.1:2240",
+                  "max_connections": 8
+                }
+              }
+            },
+            "inputs": [
+              {
+                "port": "sampler.sample",
+                "from": [
+                  {
+                    "system": "sampler",
+                    "port": "sample"
+                  }
+                ]
+              },
+              {
+                "port": "sampler.log",
+                "from": [
+                  {
+                    "system": "sampler",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "sampler.status",
+                "from": [
+                  {
+                    "system": "sampler",
+                    "port": "status"
+                  }
+                ]
+              }
+            ],
+            "outputs": [],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 16
+            }
+          }
+        ]
+      }
+    },
+    {
+      "packs": [
+        {
+          "id": "echo",
+          "lib": "echo_pack",
+          "libs": "<libs>"
+        }
+      ],
+      "coordinator": {
+        "clock": {
+          "Wall": {
+            "rate": 1000.0
+          }
+        },
+        "ring_depth": 8,
+        "seed": 0,
+        "namespace": "b",
+        "systems": [
+          {
+            "id": "mirror",
+            "ty": "fsw.subscribe",
+            "params": {
+              "conn_cap": 1048576,
+              "inbound_cap": 256,
+              "link": "mirror",
+              "namespace": "b",
+              "transport": {
+                "connect": {
+                  "addr": "127.0.0.1:2240"
+                }
+              }
+            },
+            "inputs": [],
+            "outputs": [
+              {
+                "port": "sampler.sample"
+              },
+              {
+                "port": "sampler.log"
+              },
+              {
+                "port": "sampler.status"
+              }
+            ],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 19
+            }
+          },
+          {
+            "id": "meter",
+            "ty": "echo.meter",
+            "params": null,
+            "inputs": [
+              {
+                "port": "sample",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "sampler.sample"
+                  }
+                ]
+              }
+            ],
+            "outputs": [],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 20
+            }
+          },
+          {
+            "id": "pub",
+            "ty": "fsw.publish",
+            "params": {
+              "conn_cap": 1048576,
+              "link": "pub",
+              "namespace": "b",
+              "transport": {
+                "listen": {
+                  "addr": "127.0.0.1:2241",
+                  "max_connections": 8
+                }
+              }
+            },
+            "inputs": [
+              {
+                "port": "mirror.sampler.sample",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "sampler.sample"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.sampler.log",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "sampler.log"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.sampler.status",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "sampler.status"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.link_status",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "link_status"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.log",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "mirror.status",
+                "from": [
+                  {
+                    "system": "mirror",
+                    "port": "status"
+                  }
+                ]
+              },
+              {
+                "port": "meter.output",
+                "from": [
+                  {
+                    "system": "meter",
+                    "port": "output"
+                  }
+                ]
+              },
+              {
+                "port": "meter.log",
+                "from": [
+                  {
+                    "system": "meter",
+                    "port": "log"
+                  }
+                ]
+              },
+              {
+                "port": "meter.status",
+                "from": [
+                  {
+                    "system": "meter",
+                    "port": "status"
+                  }
+                ]
+              }
+            ],
+            "outputs": [],
+            "location": {
+              "file": "tests/fixtures/echo-pack/deploy.py",
+              "line": 21
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

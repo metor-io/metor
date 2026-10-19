@@ -16,6 +16,7 @@ import metor_config._target as target_mod
 from metor_config import (
     ConfigError,
     Dir,
+    Listen,
     OutPort,
     Publish,
     Record,
@@ -135,7 +136,7 @@ class ResourceTests(unittest.TestCase):
 
     def test_no_grants_emits_no_io(self) -> None:
         fsw = Target(cycle_rate=10.0)
-        fsw.add("pub", Publish([], listen="127.0.0.1:0"))
+        fsw.add("pub", Publish([], transport=Listen("127.0.0.1:0")))
         config = coordinator(fsw)
         self.assertNotIn("resources", config)
         self.assertEqual([s["id"] for s in config["systems"]], ["pub"])
@@ -144,7 +145,7 @@ class ResourceTests(unittest.TestCase):
         fsw = Target(cycle_rate=10.0)
         gps1 = fsw.resource("gps1", Tty("/dev/ttyTHS0"))
         fsw.add("gps", Leaky(uart=gps1))
-        fsw.add("pub", Publish([], listen="127.0.0.1:0", all=True))
+        fsw.add("pub", Publish([], transport=Listen("127.0.0.1:0"), all=True))
         published = coordinator(fsw)["systems"][1]["inputs"]
         self.assertEqual([i["port"] for i in published], ["gps.fix"])
 

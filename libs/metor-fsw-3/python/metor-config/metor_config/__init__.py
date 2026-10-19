@@ -1,12 +1,25 @@
 """Describe metor-fsw-3 targets in Python.
 
 A target file creates a `Target` and adds systems to it from pack modules.
-`Target.to_config()` returns the target's config.
+For several targets that talk to each other, it creates one `Target` for
+each and groups them in a `Deployment`. When the file finishes, the config
+is written to `$METOR_CONFIG_OUT`, or to stdout, for `metor run` to read.
 """
 
-from ._builtins import ChannelRegistry, DlSlot, Publish, Subscribe
+from ._builtins import (
+    ChannelRegistry,
+    Connect,
+    DlSlot,
+    Listen,
+    Peer,
+    Publish,
+    Subscribe,
+    Transport,
+)
 from ._config import ConfigError
+from ._deployment import Deployment, emit
 from ._generated import (
+    CONFIG_VERSION,
     ChannelStatus,
     LinkStatus,
     LogEvent,
@@ -66,11 +79,16 @@ __all__ = [
     "SystemStatus",
     "LogEvent",
     "LinkStatus",
+    "CONFIG_VERSION",
     "ConfigError",
+    "Connect",
+    "Deployment",
     "Item",
+    "Listen",
     "Loop",
     "OutPort",
     "Pack",
+    "Peer",
     "PortRef",
     "Publish",
     "Record",
@@ -80,4 +98,6 @@ __all__ = [
     "System",
     "SystemHandle",
     "Target",
+    "Transport",
+    "emit",
 ]
