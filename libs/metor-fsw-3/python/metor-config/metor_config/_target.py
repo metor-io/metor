@@ -123,6 +123,7 @@ class Target:
         self._handles: dict[str, SystemHandle] = {}
         self._commands: list[Source[Any]] = []
         self._packs: dict[str, Pack] = {}
+        self._wasm: dict[str, dict[str, Any]] = {}
         self._resources: dict[str, ResourceHandle] = {}
         _targets.append(self)
 
@@ -216,6 +217,21 @@ class Target:
             if not isinstance(grant, ResourceHandle) or grant.target is not self:
                 raise ConfigError(f"`{name}.{param}` takes a resource of this target, got {grant!r}")
 
+    def wasm(self, pack: Pack, *, fuel: int | None = None, memory: int | None = None) -> None:
+        """Runs ``pack`` as a WebAssembly module on this target.
+
+        Each of the pack's systems runs in its own sandboxed guest. ``fuel``
+        limits how much work each step may do, and ``memory`` limits each
+        guest's memory in bytes. When unset, the host's defaults apply.
+        """
+        if not pack.wasm:
+            raise ConfigError(
+                f"pack `{pack.id}` has no module; set `wasm = true` under "
+                "`[tool.metor.pack]` and rebuild it"
+            )
+        choice = {"kind": "wasm", "fuel": fuel, "memory": memory}
+        self._wasm[pack.id] = {key: value for key, value in choice.items() if value is not None}
+
     def commands(self, *sources: Source[Any]) -> None:
         """Sends the `SequenceCommand`s from these ports to every channel.
 
@@ -266,7 +282,7 @@ class Target:
             }
         return {
             "packs": [
-                pack.to_json()
+                {**pack.to_json(), **self._wasm.get(pack.id, {})}
                 for pack in self._packs.values()
                 if pack.lib
             ],

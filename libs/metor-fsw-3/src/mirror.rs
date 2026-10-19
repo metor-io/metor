@@ -1,13 +1,15 @@
 //! Mirrors copy records between rings across an adapter boundary.
 //!
-//! A system that runs on its own thread does not touch the real rings
-//! directly. Instead, it gets its own copy of each port's ring, and
+//! A system that runs on its own thread or in a wasm guest does not touch the
+//! real rings directly. Instead, it gets its own copy of each port's ring, and
 //! each cycle the adapter mirrors the real inputs into those copies and the
 //! copies back out to the real outputs.
 //! A copy that is full drops records, and the mirrors periodically log how
 //! many each port dropped.
 
 use core::fmt::Write;
+#[cfg(feature = "host")]
+use core::ops::Range;
 use std::borrow::Cow;
 
 use metor_fsw_3_ring::{
@@ -106,6 +108,9 @@ pub(crate) struct Mirrors<W: WakeSource> {
     /// One field per port. Counts are written into these in place, so a drop
     /// report does not allocate.
     fields: Fields,
+    /// The fields of the input ports.
+    #[cfg(feature = "host")]
+    input_fields: Range<usize>,
     since_report: u64,
 }
 
@@ -126,6 +131,8 @@ impl<W: WakeSource> Mirrors<W> {
         Self {
             line: vec![0; LogEvent::MAX_LEN],
             fields: core::iter::once(kind).chain(counts).collect(),
+            #[cfg(feature = "host")]
+            input_fields: 1..1 + inputs.len(),
             since_report: 0,
             log: def.log,
             inputs,
@@ -203,6 +210,15 @@ impl<W: WakeSource> Mirrors<W> {
             return;
         };
         let _ = self.outputs[log].into.try_write(bytes);
+    }
+
+    /// Drops the input mirrors, which frees their reader slots on the real
+    /// rings.
+    #[cfg(feature = "host")]
+    pub(crate) fn release_inputs(&mut self) {
+        self.fields.drain(self.input_fields.clone());
+        self.input_fields.end = self.input_fields.start;
+        self.inputs.clear();
     }
 }
 
@@ -333,6 +349,26 @@ pub(crate) mod tests {
         assert_eq!(copy.drain(), Ok(()));
         // The target fits four 32-byte records, and its reader never reads.
         assert_eq!(copy.dropped, 4);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn test_release_inputs_frees_reader_slot() {
+        let (real, copy) = (ring(256), ring(256));
+        let def = SystemDef {
+            name: "nav".into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            log: None,
+            grants: Vec::new(),
+            io: None,
+        };
+        let mut mirrors = Mirrors::new(&def, vec![mirror(&real, &copy)], Vec::new());
+        assert!(real.view(NoWake).is_err());
+        mirrors.release_inputs();
+        assert!(real.view(NoWake).is_ok());
+        assert_eq!(mirrors.fields.len(), 1);
+        assert_eq!(mirrors.drain_inputs(), Ok(()));
     }
 
     #[test]

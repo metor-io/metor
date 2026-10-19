@@ -5,8 +5,8 @@
 //! on that channel picks which candidate runs.
 //!
 //! `metor build` resolves each candidate ahead of time. It copies the library
-//! into the store and writes its path, hash, ports, and pack kind into the
-//! slot's params. The slot takes its ports from the first
+//! or module into the store and writes its path, hash, ports, pack kind, and
+//! limits into the slot's params. The slot takes its ports from the first
 //! candidate. On a `Load`, the slot hashes the candidate's file, opens it,
 //! checks that its ports match the slot's, and creates it on the slot's rings.
 
@@ -27,6 +27,7 @@ use crate::dl::PackKind;
 use crate::io::IoState;
 use crate::pack::def::Instance;
 use crate::system::{PortDef, SystemDef};
+use crate::wasm::{Limits, WasmPack};
 use crate::{FrameBytes, FrameStr};
 
 use super::{DlPack, InstanceRings, Pack, is_loaded, store};
@@ -60,7 +61,7 @@ pub(crate) struct Stored {
     #[serde(with = "hex_hash")]
     pub(crate) hash: blake3::Hash,
     pub(crate) def: SystemDef,
-    #[serde(default)]
+    #[serde(flatten)]
     pub(crate) kind: PackKind,
 }
 
@@ -134,10 +135,11 @@ impl SystemDef {
 }
 
 impl Resolved {
-    /// Opens this candidate's library after checking its hash.
+    /// Opens this candidate's library or module after checking its hash.
     fn open(&self) -> Result<Pack, LoadError> {
         match self.kind {
             PackKind::Dylib => self.open_dylib(),
+            PackKind::Wasm(limits) => self.open_wasm(&limits),
         }
     }
 
@@ -166,6 +168,17 @@ impl Resolved {
             return Err(LoadError::Hash(self.name.clone()));
         }
         Ok(Pack::Dl(pack))
+    }
+
+    /// Reads this candidate's module, checks its hash, and compiles those
+    /// bytes.
+    fn open_wasm(&self, limits: &Limits) -> Result<Pack, LoadError> {
+        let bytes = std::fs::read(&self.path).map_err(|e| LoadError::Open(e.to_string()))?;
+        if blake3::hash(&bytes) != self.hash {
+            return Err(LoadError::Hash(self.name.clone()));
+        }
+        let pack = WasmPack::open(&bytes, limits).map_err(|e| LoadError::Open(e.to_string()))?;
+        Ok(Pack::Wasm(pack))
     }
 
     fn of(index: usize, candidate: Candidate) -> Result<Self, MakeError> {

@@ -27,7 +27,7 @@ pub struct Instance {
 }
 
 /// Lists the systems a pack exports, in registration order.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct PackDef {
     pub systems: Vec<PackSystemDef>,
 }
@@ -51,6 +51,21 @@ pub struct PackSystemDef {
     pub doc: Cow<'static, str>,
     /// The JSON Schema of the params struct, or `None` for a `Fn() -> S` ctor.
     pub params: Option<Box<RawValue>>,
+}
+
+/// Two systems are equal when every field is, comparing params by their
+/// JSON text.
+impl PartialEq for PackSystemDef {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty
+            && self.kind == other.kind
+            && self.def == other.def
+            && self.takes_inputs == other.takes_inputs
+            && self.takes_outputs == other.takes_outputs
+            && self.doc == other.doc
+            && self.params.as_deref().map(RawValue::get)
+                == other.params.as_deref().map(RawValue::get)
+    }
 }
 
 impl PackDef {

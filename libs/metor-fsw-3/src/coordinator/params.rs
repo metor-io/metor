@@ -55,6 +55,8 @@ pub enum MakeError {
     MirrorTooLarge { capacity: usize },
     #[error("`{system}`: an async system needs OS threads, which this build has none of")]
     ThreadsUnsupported { system: String },
+    #[error("the wasm guest: {0}")]
+    Wasm(String),
     #[error(
         "`{system}` cannot fit {requested_len} more bytes of IO memory in {}",
         .available.map_or("a system without a `Cap`".to_string(), |len| format!("its {len}-byte arena"))

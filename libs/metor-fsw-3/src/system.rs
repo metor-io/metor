@@ -39,6 +39,12 @@ pub struct PortDef {
 }
 
 impl PortDef {
+    /// Whether this port is one of a system's IO rings.
+    #[cfg(feature = "host")]
+    pub(crate) fn is_io(&self) -> bool {
+        self.name == crate::io::IO_SQ || self.name == crate::io::IO_CQ
+    }
+
     /// Returns whether two ports carry the same record.
     ///
     /// The ports' own names are ignored. A frame's schema depends on its port's

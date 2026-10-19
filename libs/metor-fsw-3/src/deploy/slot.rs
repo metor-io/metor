@@ -183,7 +183,7 @@ impl SlotCx {
         })
     }
 
-    /// Copies a candidate's library into the store.
+    /// Copies a candidate's library or module into the store.
     ///
     /// Returns the stored entry, which records the candidate's ports and the
     /// pack's kind.

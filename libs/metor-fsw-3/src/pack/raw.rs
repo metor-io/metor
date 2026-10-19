@@ -5,8 +5,11 @@
 //! responsible for upholding that accessor's contract.
 
 use core::ffi::c_void;
+use core::mem::offset_of;
 
 use metor_fsw_3_ring::{RawOwner, RingBuffer, RingExport};
+use zerocopy::little_endian::U32;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::coordinator::{MakeError, ParamError};
 use crate::io::Arena;
@@ -126,8 +129,62 @@ impl RawRing {
     }
 }
 
+/// A [`RawSlice`] as a wasm32 guest lays it out.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
+pub struct Wasm32RawSlice {
+    pub ptr: U32,
+    pub len: U32,
+}
+
+impl Wasm32RawSlice {
+    pub fn new(ptr: u32, len: u32) -> Self {
+        Self {
+            ptr: U32::new(ptr),
+            len: U32::new(len),
+        }
+    }
+}
+
+/// A [`RawRing`] as a wasm32 guest lays it out.
+///
+/// The owner is three words, a context and two callbacks. All zero is `None`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
+pub struct Wasm32RawRing {
+    pub base: U32,
+    pub len: U32,
+    pub owner: [U32; 3],
+}
+
+impl Wasm32RawRing {
+    /// A ring over `len` bytes at `base`, with no owner.
+    pub fn new(base: u32, len: u32) -> Self {
+        Self {
+            base: U32::new(base),
+            len: U32::new(len),
+            owner: [U32::ZERO; 3],
+        }
+    }
+}
+
 // `RawOwner`'s function pointers are never null, so `Option` adds no size.
 const _: () = assert!(size_of::<Option<RawOwner>>() == size_of::<RawOwner>());
+// A wasm32 pointer and `usize` are one 4-byte word each.
+const _: () = assert!(size_of::<Wasm32RawSlice>() == 8 && offset_of!(Wasm32RawSlice, len) == 4);
+const _: () = assert!(
+    size_of::<Wasm32RawRing>() == 20
+        && offset_of!(Wasm32RawRing, len) == 4
+        && offset_of!(Wasm32RawRing, owner) == 8
+);
+#[cfg(target_arch = "wasm32")]
+const _: () = assert!(
+    size_of::<RawSlice>() == size_of::<Wasm32RawSlice>()
+        && offset_of!(RawSlice, len) == offset_of!(Wasm32RawSlice, len)
+        && size_of::<RawRing>() == size_of::<Wasm32RawRing>()
+        && offset_of!(RawRing, len) == offset_of!(Wasm32RawRing, len)
+        && offset_of!(RawRing, owner) == offset_of!(Wasm32RawRing, owner)
+);
 
 #[cfg(test)]
 mod tests {

@@ -1,9 +1,9 @@
 //! Loads packs and registers their systems into a [`SystemTable`].
 //!
 //! A pack is a separately built library of system types. It lets a target use
-//! systems that are not compiled into the host binary. A pack is a shared
-//! library loaded into this process ([`DlPack`]). It exports a descriptor
-//! listing its systems.
+//! systems that are not compiled into the host binary. A pack is either a
+//! shared library loaded into this process ([`DlPack`]) or a WebAssembly
+//! module ([`WasmPack`]). Both export a descriptor listing their systems.
 
 pub(crate) mod codec;
 mod pack;
@@ -22,10 +22,11 @@ use crate::pack::ABI_VERSION;
 use crate::pack::def::{Instance, PackDef, PackSystemDef};
 use crate::pack::raw::RawRing;
 use crate::system::SystemDef;
+use crate::wasm::{Trap, WasmError, WasmPack};
 
 pub(crate) use pack::is_loaded;
 pub use pack::{DlPack, DlStep};
-pub use pack_ref::{PackKind, PackRef, cdylib_name, triple};
+pub use pack_ref::{PackKind, PackRef, WASM_TRIPLE, cdylib_name, triple, wasm_name};
 
 /// An error from opening a pack.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +43,12 @@ pub enum PackError {
     DescriptorTooLarge { capacity: usize },
     #[error("pack descriptor export failed with status {0}")]
     DescriptorStatus(u32),
+    #[error("reading the module: {0}")]
+    Read(std::io::Error),
+    #[error("the module: {0}")]
+    Wasm(#[from] WasmError),
+    #[error("the module trapped: {0}")]
+    Trap(#[from] Trap),
 }
 
 impl PackError {
@@ -60,9 +67,10 @@ impl PackError {
 /// The system type name that [`DlSlot`](slot::DlSlot) is registered under.
 pub const SLOT_TYPE: &str = "fsw.dl_slot";
 
-/// An opened pack.
+/// An opened pack of either kind.
 pub enum Pack {
     Dl(DlPack),
+    Wasm(WasmPack),
 }
 
 impl Pack {
@@ -70,6 +78,7 @@ impl Pack {
     pub fn descriptor(&self) -> &PackDef {
         match self {
             Pack::Dl(pack) => pack.descriptor(),
+            Pack::Wasm(pack) => pack.descriptor(),
         }
     }
 
@@ -77,6 +86,7 @@ impl Pack {
     pub fn def(&self, ty: &str, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         match self {
             Pack::Dl(pack) => pack.def(ty, cx),
+            Pack::Wasm(pack) => pack.def(ty, cx),
         }
     }
 
@@ -97,6 +107,7 @@ impl Pack {
         let mut table = arena.as_deref().map_or(RawRing::EMPTY, RawRing::from_arena);
         let step: Box<dyn Step> = match self {
             Pack::Dl(pack) => Box::new(pack.create(ty, params, instance, rings, &mut table)?),
+            Pack::Wasm(pack) => Box::new(pack.create(ty, params, instance, rings, io)?),
         };
         if !instance.def.grants.is_empty() {
             let arena = io.get_or_add_member(&instance.id);
