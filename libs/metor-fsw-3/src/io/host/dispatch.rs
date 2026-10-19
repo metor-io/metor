@@ -418,6 +418,20 @@ impl Dispatch {
             .extend(closed.map(|derived| Route::Close(derived.fd)));
     }
 
+    /// Whether member `m` has nothing left in flight since `begin`.
+    pub(crate) fn member_idle(&self, m: usize) -> bool {
+        let ops = &self.ops[m * MAX_OPS..(m + 1) * MAX_OPS];
+        match self.members[m].state {
+            MemberState::Running => true,
+            MemberState::Quiescing => false,
+            MemberState::Drained => ops.iter().all(Option::is_none),
+        }
+    }
+
+    pub(crate) fn end_quiescing_member(&mut self, m: usize) {
+        self.members[m].state = MemberState::Running;
+    }
+
     /// The routes queued since the last call.
     pub(crate) fn drain_routes(&mut self) -> std::vec::Drain<'_, Route> {
         self.routes.drain(..)

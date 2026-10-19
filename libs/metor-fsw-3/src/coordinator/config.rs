@@ -6,10 +6,13 @@
 use core::marker::PhantomData;
 use core::num::NonZeroUsize;
 use core::time::Duration;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use indexmap::IndexMap;
 use metor_proto::types::Timestamp;
+use metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -133,13 +136,16 @@ where
 
 /// Changes how a system is run.
 ///
-/// [`Adapter::Thread`] runs it on a named background thread.
+/// [`Adapter::Thread`] runs it on a named background thread. [`Adapter::Channel`]
+/// puts it behind a channel, so commands can start, stop, and load it.
 ///
-/// In a config, the adapter is written as a `thread` key next to `id`.
+/// In a config, the adapter is written as a `thread` or a `channel` key next to
+/// `id`. A system can have one or the other, not both.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Adapter {
     Thread(String),
+    Channel(ChannelConfig),
 }
 
 /// The adapters a system type runs behind. `bare` is running behind none.
@@ -148,6 +154,7 @@ pub enum Adapter {
 pub(crate) struct Adapters {
     pub bare: bool,
     pub thread: bool,
+    pub channel: bool,
 }
 
 #[cfg(feature = "host")]
@@ -156,16 +163,18 @@ impl Default for Adapters {
         Self {
             bare: true,
             thread: true,
+            channel: true,
         }
     }
 }
 
 #[cfg(feature = "host")]
 impl Adapters {
-    /// Running behind no adapter only.
-    pub const BARE: Self = Self {
+    /// Running behind no adapter or a channel, but never on a thread.
+    pub const OFF_THREAD: Self = Self {
         bare: true,
         thread: false,
+        channel: true,
     };
 
     /// Whether the type runs behind `adapter`, or behind none for `None`.
@@ -173,32 +182,103 @@ impl Adapters {
         match adapter {
             None => self.bare,
             Some(Adapter::Thread(_)) => self.thread,
+            Some(Adapter::Channel(_)) => self.channel,
         }
     }
 }
 
-/// Serializes an [`Adapter`] as a `thread` key.
+/// Configures a channel.
+///
+/// Commands find the channel by `name`. `start` sets whether its system runs at
+/// boot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelConfig {
+    pub name: ChannelName,
+    #[serde(default)]
+    pub start: RunState,
+}
+
+/// A channel's name, at most [`SEQUENCE_CHANNEL_NAME_CAP`] bytes long.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ChannelName(String);
+
+impl ChannelName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ChannelName {
+    type Error = ChannelNameTooLong;
+
+    fn try_from(name: String) -> Result<Self, ChannelNameTooLong> {
+        match name.len() <= SEQUENCE_CHANNEL_NAME_CAP {
+            true => Ok(Self(name)),
+            false => Err(ChannelNameTooLong(name)),
+        }
+    }
+}
+
+impl From<ChannelName> for String {
+    fn from(name: ChannelName) -> String {
+        name.0
+    }
+}
+
+impl core::fmt::Display for ChannelName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl JsonSchema for ChannelName {
+    fn schema_name() -> Cow<'static, str> {
+        String::schema_name()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        String::json_schema(generator)
+    }
+}
+
+/// A channel name longer than [`SEQUENCE_CHANNEL_NAME_CAP`] bytes.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("channel `{0}` is longer than {cap} bytes", cap = SEQUENCE_CHANNEL_NAME_CAP)]
+pub struct ChannelNameTooLong(pub String);
+
+/// Serializes an [`Adapter`] as either a `thread` key or a `channel` key.
 mod adapter_keys {
+    use serde::de::Error;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    use super::Adapter;
+    use super::{Adapter, ChannelConfig};
 
     #[derive(Default, Deserialize)]
     struct Keys {
         #[serde(default)]
         thread: Option<String>,
+        #[serde(default)]
+        channel: Option<ChannelConfig>,
     }
 
     #[derive(Default, Serialize)]
     struct KeysRef<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         thread: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel: Option<&'a ChannelConfig>,
     }
 
     pub fn serialize<S: Serializer>(adapter: &Option<Adapter>, s: S) -> Result<S::Ok, S::Error> {
         let keys = match adapter {
             Some(Adapter::Thread(thread)) => KeysRef {
                 thread: Some(thread),
+                ..KeysRef::default()
+            },
+            Some(Adapter::Channel(channel)) => KeysRef {
+                channel: Some(channel),
+                ..KeysRef::default()
             },
             None => KeysRef::default(),
         };
@@ -208,11 +288,31 @@ mod adapter_keys {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Adapter>, D::Error> {
         match Keys::deserialize(d)? {
             Keys {
+                thread: Some(_),
+                channel: Some(_),
+            } => Err(D::Error::custom(
+                "a system takes a `thread` or a `channel`, not both",
+            )),
+            Keys {
                 thread: Some(thread),
+                ..
             } => Ok(Some(Adapter::Thread(thread))),
+            Keys {
+                channel: Some(channel),
+                ..
+            } => Ok(Some(Adapter::Channel(channel))),
             Keys { .. } => Ok(None),
         }
     }
+}
+
+/// Whether a channel's system is executed each cycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    #[default]
+    Running,
+    Stopped,
 }
 
 impl SystemConfig {
@@ -396,24 +496,6 @@ mod tests {
 
     #[cfg(feature = "host")]
     #[test]
-    fn test_adapters_accept() {
-        let thread = Adapter::Thread("gps".into());
-        let all = Adapters::default();
-        assert!(all.accepts(None) && all.accepts(Some(&thread)));
-        let bare = Adapters {
-            thread: false,
-            ..all
-        };
-        assert!(bare.accepts(None));
-        assert!(!bare.accepts(Some(&thread)));
-        let none = Adapters {
-            bare: false,
-            ..bare
-        };
-        assert!(!none.accepts(None));
-    }
-
-    #[test]
     fn test_grants_default_and_round_trip() {
         let bare = SystemConfig::new("gps", "gps");
         let text = serde_json::to_string(&bare).expect("serializable");
@@ -468,6 +550,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_adapters_accept() {
+        let thread = Adapter::Thread("gps".into());
+        let all = Adapters::default();
+        assert!(all.accepts(None) && all.accepts(Some(&thread)));
+        let bare = Adapters {
+            thread: false,
+            ..all
+        };
+        assert!(bare.accepts(None));
+        assert!(!bare.accepts(Some(&thread)));
+        let none = Adapters {
+            bare: false,
+            ..bare
+        };
+        assert!(!none.accepts(None));
+    }
+
     fn adapter_of(text: &str) -> Result<Option<Adapter>, serde_json::Error> {
         serde_json::from_str::<SystemConfig>(text).map(|system| system.adapter)
     }
@@ -478,7 +578,14 @@ mod tests {
             adapter: Some(Adapter::Thread("gps".into())),
             ..SystemConfig::new("a", "t")
         };
-        for system in [SystemConfig::new("a", "t"), thread] {
+        let channel = SystemConfig {
+            adapter: Some(Adapter::Channel(ChannelConfig {
+                name: crate::ChannelName::try_from("mode".to_string()).expect("a short name"),
+                start: RunState::Stopped,
+            })),
+            ..SystemConfig::new("a", "t")
+        };
+        for system in [SystemConfig::new("a", "t"), thread, channel] {
             let text = serde_json::to_string(&system).expect("serializable");
             assert_eq!(
                 serde_json::from_str::<SystemConfig>(&text).expect("round trips"),
@@ -486,7 +593,28 @@ mod tests {
             );
         }
         let text = serde_json::to_string(&SystemConfig::new("a", "t")).expect("serializable");
-        assert!(!text.contains("thread"), "{text}");
+        assert!(
+            !text.contains("thread") && !text.contains("channel"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_channel_name_cap() {
+        let cap = "c".repeat(SEQUENCE_CHANNEL_NAME_CAP);
+        let name = ChannelName::try_from(cap.clone()).expect("a name at the cap");
+        assert_eq!(name.as_str(), cap);
+        assert_eq!(
+            ChannelName::try_from(String::new()).map(String::from),
+            Ok(String::new())
+        );
+        let long = "c".repeat(SEQUENCE_CHANNEL_NAME_CAP + 1);
+        assert_eq!(
+            ChannelName::try_from(long.clone()),
+            Err(ChannelNameTooLong(long.clone()))
+        );
+        let text = format!(r#"{{"id":"a","ty":"t","channel":{{"name":"{long}"}}}}"#);
+        assert!(serde_json::from_str::<SystemConfig>(&text).is_err());
     }
 
     #[test]
@@ -496,11 +624,25 @@ mod tests {
             adapter_of(r#"{"id":"a","ty":"t","thread":"gps"}"#).unwrap(),
             Some(Adapter::Thread("gps".into()))
         );
+        assert_eq!(
+            adapter_of(r#"{"id":"a","ty":"t","channel":{"name":"m"}}"#).unwrap(),
+            Some(Adapter::Channel(ChannelConfig {
+                name: crate::ChannelName::try_from("m".to_string()).expect("a short name"),
+                start: RunState::Running,
+            }))
+        );
     }
 
     #[test]
     fn test_reject_bad_adapter() {
-        assert!(adapter_of(r#"{"id":"a","ty":"t","thread":5}"#).is_err());
+        for text in [
+            r#"{"id":"a","ty":"t","thread":"gps","channel":{"name":"m"}}"#,
+            r#"{"id":"a","ty":"t","thread":5}"#,
+            r#"{"id":"a","ty":"t","channel":{"nam":"m"}}"#,
+            r#"{"id":"a","ty":"t","channel":{"name":"m","start":"paused"}}"#,
+        ] {
+            assert!(adapter_of(text).is_err(), "{text}");
+        }
     }
 
     #[test]

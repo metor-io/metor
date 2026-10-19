@@ -320,6 +320,75 @@ fn test_corrupt_mirror_ends_the_system() {
     assert!(corrupt, "a corrupt fault line");
 }
 
+fn channel(id: &str, ty: &str, name: &str) -> SystemConfig {
+    SystemConfig {
+        adapter: Some(crate::Adapter::Channel(crate::ChannelConfig {
+            name: crate::ChannelName::try_from(name.to_string()).expect("a short name"),
+            start: crate::RunState::Running,
+        })),
+        ..SystemConfig::new(id, ty)
+    }
+}
+
+#[test]
+fn test_reject_channel_on_async() {
+    for deterministic in MODES {
+        let config = CoordinatorConfig {
+            systems: vec![channel("sleeper", "sleeper", "mode")],
+            ..Default::default()
+        };
+        assert_eq!(
+            build(config, &table(&Recorder::default()), deterministic).err(),
+            Some(BuildError::UnsupportedAdapter {
+                id: "sleeper".into(),
+                ty: "sleeper".into(),
+                adapter: "behind channel `mode`".into(),
+            })
+        );
+    }
+}
+
+#[test]
+fn test_reject_bad_channel_names() {
+    let long = "c".repeat(metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP + 1);
+    let system = serde_json::json!({ "id": "imu", "ty": "imu", "channel": { "name": long } });
+    let error = serde_json::from_value::<SystemConfig>(system).expect_err("a long name");
+    assert!(error.to_string().contains("is longer than"), "{error}");
+    let config = CoordinatorConfig {
+        systems: vec![channel("a", "imu", "mode"), channel("b", "imu", "mode")],
+        ..Default::default()
+    };
+    assert_eq!(
+        config.clone().build(&table(&Recorder::default())).err(),
+        Some(BuildError::DuplicateChannel {
+            name: "mode".into()
+        })
+    );
+    let mut located = config;
+    located.systems[1].location = Some(crate::coordinator::Location {
+        file: "target.py".into(),
+        line: 6,
+    });
+    let error = located.build(&table(&Recorder::default())).err();
+    assert_eq!(
+        error.map(|e| e.to_string()).as_deref(),
+        Some("target.py:6: channel `mode` is named by two systems")
+    );
+    let paused = serde_json::json!({ "id": "imu", "ty": "imu",
+        "channel": { "name": "mode", "start": "paused" } });
+    assert!(serde_json::from_value::<SystemConfig>(paused).is_err());
+}
+
+#[test]
+fn test_cyclic_channel_at_cap_builds() {
+    let name = "c".repeat(metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP);
+    let config = CoordinatorConfig {
+        systems: vec![channel("imu", "imu", &name)],
+        ..Default::default()
+    };
+    assert!(config.build(&table(&Recorder::default())).is_ok());
+}
+
 mod turned {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -108,6 +108,12 @@ pub enum BuildError {
         source: DefError,
     },
 
+    #[error("channel `{name}` is named by two systems")]
+    DuplicateChannel { name: String },
+
+    #[error("port `{id}.{port}` is reserved for the channel adapter")]
+    ReservedChannelPort { id: String, port: String },
+
     #[error("`{system}` has no grant for its `Cap` parameter `{param}`")]
     Ungranted { system: String, param: String },
 
@@ -187,6 +193,15 @@ impl BuildError {
                 source: Box::new(self),
             },
             _ => self,
+        }
+    }
+
+    /// Port `port` of system `id` takes a name the channel adapter reserves.
+    #[cfg(feature = "host")]
+    pub(crate) fn reserved_channel_port(id: &str, port: &str) -> Self {
+        Self::ReservedChannelPort {
+            id: id.to_string(),
+            port: port.to_string(),
         }
     }
 }

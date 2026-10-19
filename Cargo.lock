@@ -9575,6 +9575,7 @@ name = "metor-fsw-3"
 version = "0.14.2"
 dependencies = [
  "const-fnv1a-hash",
+ "cordyceps",
  "futures-lite 2.6.1",
  "indexmap 2.14.0",
  "io-uring",

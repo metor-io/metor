@@ -1,0 +1,5 @@
+error: a `#[sequence]` fn reads the time with `seq.now()`
+ --> tests/ui/sequence_now_param.rs:4:30
+  |
+4 | async fn arm(seq: &Seq, now: Timestamp) -> Result<(), SeqError> {
+  |                              ^^^^^^^^^

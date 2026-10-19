@@ -55,6 +55,36 @@ impl IoState {
         let system = id.to_string();
         self.index(id).ok_or(MakeError::NoIoMember { system })
     }
+
+    /// Starts quiescing system `id` by cancelling its ops in flight.
+    #[cfg(feature = "host")]
+    pub(crate) fn quiesce_system(&mut self, id: &str) {
+        #[cfg(all(feature = "host", unix))]
+        if let (Some(m), Some(host)) = (self.index(id), &mut self.host) {
+            host.dispatch.quiesce_member(m);
+        }
+        let _ = id;
+    }
+
+    /// Whether system `id` has nothing left in flight.
+    #[cfg(feature = "host")]
+    pub(crate) fn is_system_idle(&self, id: &str) -> bool {
+        #[cfg(all(feature = "host", unix))]
+        if let (Some(host), Some(m)) = (&self.host, self.index(id)) {
+            return host.dispatch.member_idle(m);
+        }
+        let _ = id;
+        true
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn end_quiescing_system(&mut self, id: &str) {
+        #[cfg(all(feature = "host", unix))]
+        if let (Some(m), Some(host)) = (self.index(id), &mut self.host) {
+            host.dispatch.end_quiescing_member(m);
+        }
+        let _ = id;
+    }
 }
 
 #[cfg(all(feature = "host", unix))]

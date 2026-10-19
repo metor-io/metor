@@ -134,7 +134,9 @@ cycle's start the step drops the body and ends `Aborted`. A failure or
 timeout does not abort on its own.
 
 `seq.on_abort(|seq| ..)` returns a guard. When it drops with the flag up,
-its handler runs, innermost first, each under `catch_unwind`. A redline is a
+its handler runs, innermost first, each under `catch_unwind`.
+`seq.on_abort_with(value, |seq, value| ..)` does the same for a handler that
+uses `value`, and the guard derefs to it. A redline is a
 condition checked every cycle before the body is polled:
 `redline!(seq, "name", || cond)`. The first that holds logs a `redline`
 fault and aborts the sequence.
@@ -142,7 +144,7 @@ fault and aborts the sequence.
 ```rust
 #[sequence]
 async fn burn(seq: &Seq, valve: &mut Output<Valve>, pc: &Sample<Chamber>) -> Result<(), SeqError> {
-    let _closed = seq.on_abort(|seq| {
+    let mut valve = seq.on_abort_with(valve, |seq, valve| {
         let _ = valve.write(&Valve::closed(seq.now()));
     });
     redline!(seq, "chamber pressure", || pc.get().is_some_and(|c| c.pressure > MAX_PC));
@@ -153,7 +155,8 @@ async fn burn(seq: &Seq, valve: &mut Output<Valve>, pc: &Sample<Chamber>) -> Res
 }
 ```
 
-Handlers and the body write one port because `Output::write` takes `&self`.
+Handlers and the body write one port through the guard, since
+`Output::write` takes `&mut self`.
 
 ## The coordinator
 

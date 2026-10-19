@@ -7,6 +7,11 @@ use crate::coordinator::{BuildError, SystemTable};
 
 /// Registers every built-in system into `table`.
 pub fn register_builtins(table: &mut SystemTable) -> Result<(), BuildError> {
+    table.register(
+        "fsw.channel_registry",
+        crate::channel::channel_registry(),
+        crate::channel::Registry::new,
+    )?;
     #[cfg(unix)]
     {
         table.insert(crate::io::IO_TYPE, crate::io::host::entry())?;

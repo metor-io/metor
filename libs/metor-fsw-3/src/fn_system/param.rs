@@ -10,6 +10,7 @@ use metor_proto::types::Timestamp;
 
 use crate::{
     Rng,
+    channel::{ABORT_PORT, Abort, AbortRequest},
     coordinator::MakeError,
     def::{DefCx, DefError, Records},
     frame::Frame,
@@ -17,6 +18,7 @@ use crate::{
     log::Log,
     port::{DynInputs, DynOutputs, Input, InputWake, Output, Sample, SampledInput},
     record::Record,
+    sequence::Seq,
     system::{InputBinding, OutputBinding, PortDef},
 };
 
@@ -210,17 +212,45 @@ fn names(ports: &[PortDef]) -> Vec<Cow<'static, str>> {
 }
 
 /// The per-cycle values a system fn's parameters can read besides ports.
+///
+/// These are the cycle time and, for a sequence, its [`Seq`].
 pub struct Cycle<'a> {
     pub now: Timestamp,
-    _cycle: core::marker::PhantomData<&'a ()>,
+    seq: Option<&'a Seq<'static>>,
 }
 
-impl Cycle<'_> {
+impl<'a> Cycle<'a> {
     pub(crate) fn new(now: Timestamp) -> Self {
+        Self { now, seq: None }
+    }
+
+    /// Creates a cycle for a sequence.
+    ///
+    /// The parameter that takes a [`Seq`] receives `seq`. `'a` borrows locals
+    /// of the body future the step polls, so it ends no later than that body.
+    pub(crate) fn with_seq(now: Timestamp, seq: &'a Seq<'static>) -> Self {
         Self {
             now,
-            _cycle: core::marker::PhantomData,
+            seq: Some(seq),
         }
+    }
+
+    /// Returns the sequence's handle as a `Seq<'a>`.
+    ///
+    /// Redlines linked through it may only borrow what outlives `'a`.
+    pub fn seq(&self) -> &'a Seq<'a> {
+        // PANIC Safety: `#[system]` rejects a `Seq` parameter, so only a
+        // sequence, whose step builds its cycle `with_seq`, reaches this.
+        let seq = self
+            .seq
+            .expect("a `Seq` parameter only on a `#[sequence]` fn");
+        // SAFETY: the lifetime parameter is phantom, so the layout does not
+        // change. Through the result, a condition can only be linked if it
+        // outlives `'a`, which ends no later than the body (see `with_seq`).
+        // The redlines are checked only while that body is alive, because
+        // `advance` runs inside the future that owns it. `Seq`'s `Drop` clears the back-pointers of nodes that are still linked,
+        // without calling any condition.
+        unsafe { &*core::ptr::from_ref(seq).cast::<Seq<'a>>() }
     }
 }
 
@@ -272,6 +302,33 @@ pub trait Param {
 
     /// Refreshes this parameter's [`Sample`]s for the cycle, before `get`.
     fn refresh<W: InputWake>(_input: &mut Self::In<W>) {}
+
+    /// Returns the value passed to a sequence body, and the [`Refresh`] that
+    /// updates its [`Sample`]s while the body holds them.
+    fn get_sampled<'a, W: InputWake>(
+        input: &'a mut Self::In<W>,
+        output: &'a mut Self::Out,
+        cx: &mut Cycle<'a>,
+    ) -> (Self::Item<'a, W>, impl Refresh + use<'a, W, Self>) {
+        (Self::get(input, output, cx), ())
+    }
+}
+
+/// Updates the [`Sample`]s a sequence body holds, before each poll.
+pub trait Refresh {
+    fn refresh(&mut self);
+}
+
+/// Refreshes one [`Sample`] that a sequence body borrows.
+pub struct SampleRefresh<'a, T: Frame + Copy, W: InputWake> {
+    input: &'a mut Input<T, W>,
+    sample: &'a Sample<T>,
+}
+
+impl<T: Frame + Copy, W: InputWake> Refresh for SampleRefresh<'_, T, W> {
+    fn refresh(&mut self) {
+        self.sample.refresh(self.input);
+    }
 }
 
 /// Takes the name of the next non-tuple parameter.
@@ -356,6 +413,16 @@ impl<T: Frame + Copy + 'static> Param for Sample<T> {
 
     fn refresh<W: InputWake>(input: &mut Self::In<W>) {
         input.refresh();
+    }
+
+    fn get_sampled<'a, W: InputWake>(
+        input: &'a mut Self::In<W>,
+        _output: &'a mut (),
+        _cx: &mut Cycle<'a>,
+    ) -> (&'a Sample<T>, impl Refresh + use<'a, T, W>) {
+        let SampledInput { input, sample } = input;
+        let sample = &*sample;
+        (sample, SampleRefresh { input, sample })
     }
 }
 
@@ -558,6 +625,70 @@ impl Param for Timestamp {
     }
 }
 
+/// An [`Abort`] reads the `abort` input, whatever the parameter is called.
+impl<D: InputWake> Param for Abort<D> {
+    type In<W: InputWake> = Abort<W>;
+    type Out = ();
+    type Item<'a, W: InputWake> = &'a mut Abort<W>;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        cx: &DefCx<'_>,
+        defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        param_name(names);
+        defs.inputs.push(Input::<AbortRequest>::def(cx, ABORT_PORT));
+        Ok(())
+    }
+
+    fn bind_in<W: InputWake>(views: &mut Views<W>) -> Self::In<W> {
+        Abort::new(<Input<AbortRequest> as Param>::bind_in(views))
+    }
+
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
+        param_name(names);
+        Ok(())
+    }
+
+    fn get<'a, W: InputWake>(
+        input: &'a mut Self::In<W>,
+        _output: &'a mut (),
+        _cx: &mut Cycle<'a>,
+    ) -> Self::Item<'a, W> {
+        input
+    }
+}
+
+impl Param for Seq<'static> {
+    type In<W: InputWake> = ();
+    type Out = ();
+    type Item<'a, W: InputWake> = &'a Seq<'a>;
+
+    fn append_defs(
+        names: &mut ParamNames<'_>,
+        _cx: &DefCx<'_>,
+        _defs: &mut Defs,
+    ) -> Result<(), DefError> {
+        param_name(names);
+        Ok(())
+    }
+
+    fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
+
+    fn bind_out(names: &mut ParamNames<'_>, _writers: &mut Writers) -> Result<(), MakeError> {
+        param_name(names);
+        Ok(())
+    }
+
+    fn get<'a, W: InputWake>(
+        _input: &'a mut (),
+        _output: &'a mut (),
+        cx: &mut Cycle<'a>,
+    ) -> &'a Seq<'a> {
+        cx.seq()
+    }
+}
+
 impl Param for Log {
     type In<W: InputWake> = ();
     type Out = Log;
@@ -623,6 +754,23 @@ macro_rules! impl_param_for_tuple {
             #[allow(unused_variables)]
             fn refresh<W: InputWake>(input: &mut Self::In<W>) {
                 $( $P::refresh::<W>(&mut input.$i); )*
+            }
+
+            #[allow(unused_variables, clippy::unused_unit)]
+            fn get_sampled<'a, W: InputWake>(
+                input: &'a mut Self::In<W>,
+                output: &'a mut Self::Out,
+                cx: &mut Cycle<'a>,
+            ) -> (Self::Item<'a, W>, impl Refresh + use<'a, W, $($P,)*>) {
+                let parts = ($( $P::get_sampled::<W>(&mut input.$i, &mut output.$i, cx), )*);
+                (($( parts.$i.0, )*), ($( parts.$i.1, )*))
+            }
+        }
+
+        impl<$($P: Refresh),*> Refresh for ($($P,)*) {
+            #[allow(clippy::unused_unit)]
+            fn refresh(&mut self) {
+                $( self.$i.refresh(); )*
             }
         }
     };

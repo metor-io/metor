@@ -279,3 +279,194 @@ mod through_the_io_steps {
         assert_eq!((last.bytes_out, last.bytes_in), (4, 4));
     }
 }
+
+#[path = "fixtures/echo-pack/src/gps.rs"]
+#[allow(dead_code)]
+mod gps;
+
+mod gps_on_a_pty {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use metor_fsw_3::coordinator::{
+        CoordinatorConfig, EndReason, InputConfig, SystemConfig, SystemTable,
+    };
+    use metor_fsw_3::io::{Backing, Baud, IO_TYPE, RealKind};
+    use metor_fsw_3::metor_proto_wkt::LogEvent;
+    use metor_fsw_3::{Coordinator, Input, Timestamp, system};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::gps::{GpsState, PMTK_RATE_10HZ, UntilFix, gps, until_fix};
+
+    type Faults = Rc<RefCell<Vec<String>>>;
+
+    /// Keeps the kind of every fault on its input.
+    #[system]
+    fn faults(#[state] seen: &mut Faults, log: &mut Input<LogEvent>) {
+        for line in log.drain().flatten() {
+            let kinds = line.fields.iter().filter(|(k, _)| k == "kind");
+            seen.borrow_mut().extend(kinds.map(|(_, v)| v.to_string()));
+        }
+    }
+    use super::pty;
+
+    const GGA: &[u8] = b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n";
+
+    fn build(path: &str, timeout_s: f64, seen: &Faults) -> Coordinator {
+        let mut table = SystemTable::new();
+        metor_fsw_3::builtins::register_builtins(&mut table).unwrap();
+        let seen = seen.clone();
+        table
+            .register("faults", faults(), move || seen.clone())
+            .unwrap();
+        table.register("gps", gps(), GpsState::new).unwrap();
+        table
+            .register_sequence("until_fix", until_fix(), UntilFix::new)
+            .unwrap();
+        let config = CoordinatorConfig {
+            resources: [(
+                "gps1".to_string(),
+                Backing::Real(RealKind::Tty {
+                    path: path.into(),
+                    baud: Baud::B9600,
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            systems: vec![
+                SystemConfig {
+                    grants: [("uart".into(), "gps1".into())].into(),
+                    ..SystemConfig::new("gps", "gps")
+                },
+                SystemConfig {
+                    inputs: vec![InputConfig::new("fix", "gps", "fix")],
+                    params: serde_json::json!({ "timeout_s": timeout_s }),
+                    ..SystemConfig::new("until", "until_fix")
+                },
+                SystemConfig::new("io_submit", IO_TYPE),
+                SystemConfig {
+                    params: serde_json::json!({ "status": true }),
+                    ..SystemConfig::new("io_complete", IO_TYPE)
+                },
+                SystemConfig {
+                    inputs: vec![InputConfig::new("log", "gps", "log")],
+                    ..SystemConfig::new("faults", "faults")
+                },
+            ],
+            ..CoordinatorConfig::default()
+        };
+        config.build(&table).unwrap()
+    }
+
+    /// Steps on cycle time from the wall clock until `until` ends, or for at
+    /// most `limit`. Returns how it ended.
+    fn run(c: &mut Coordinator, limit: Duration) -> Option<EndReason> {
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            c.step(Timestamp(start.elapsed().as_micros() as i64));
+            if let Some((_, Some(end))) = c.systems().find(|(id, _)| *id == "until") {
+                return Some(end.clone());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    /// Writes a GGA sentence to the master every 10 ms, and keeps what the
+    /// driver writes, until `stop` is set.
+    fn receiver(master: OwnedFd, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Vec<u8>> {
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        std::thread::spawn(move || {
+            let file = std::fs::File::from(master);
+            let mut got = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let _ = (&file).write_all(GGA);
+                drain(&file, &mut got);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            drain(&file, &mut got);
+            got
+        })
+    }
+
+    /// Reads what is waiting on `file` into `got`.
+    fn drain(mut file: &std::fs::File, got: &mut Vec<u8>) {
+        let mut buf = [0u8; 256];
+        while let Ok(n @ 1..) = file.read(&mut buf) {
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    }
+
+    #[test]
+    fn gps_gets_a_fix_through_the_io_steps() {
+        let (master, _slave, path) = pty();
+        let mut c = build(&path, 10.0, &Faults::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = receiver(master, stop.clone());
+        let end = run(&mut c, Duration::from_secs(10));
+        stop.store(true, Ordering::Relaxed);
+        let written = thread.join().unwrap();
+        assert_eq!(end, Some(EndReason::Completed));
+        assert_eq!(
+            count(&written, PMTK_RATE_10HZ),
+            1,
+            "configured exactly once"
+        );
+        assert!(
+            c.systems()
+                .all(|(_, end)| end != Some(&EndReason::Panicked))
+        );
+    }
+
+    #[test]
+    fn silent_pty_times_out() {
+        let (_master, _slave, path) = pty();
+        let seen = Faults::default();
+        let mut c = build(&path, 0.2, &seen);
+        let end = run(&mut c, Duration::from_secs(5));
+        assert!(matches!(end, Some(EndReason::Failed(_))), "{end:?}");
+        assert!(
+            c.systems().all(|(id, end)| end.is_none() || id == "until"),
+            "gps never ends"
+        );
+        assert!(
+            seen.borrow().is_empty(),
+            "gps never faults: {:?}",
+            seen.borrow()
+        );
+    }
+
+    #[test]
+    fn closed_master_never_panics() {
+        let (master, slave, path) = pty();
+        let seen = Faults::default();
+        let mut c = build(&path, 0.2, &seen);
+        drop((master, slave));
+        let end = run(&mut c, Duration::from_secs(5));
+        assert!(matches!(end, Some(EndReason::Failed(_))), "{end:?}");
+        assert!(
+            c.systems()
+                .all(|(_, end)| end != Some(&EndReason::Panicked)),
+            "nothing panicked"
+        );
+        let seen = seen.borrow();
+        assert!(!seen.is_empty(), "the driver logs its failed IO");
+        assert!(
+            seen.iter()
+                .all(|kind| kind == "gps_read" || kind == "gps_config"),
+            "{seen:?}"
+        );
+    }
+}

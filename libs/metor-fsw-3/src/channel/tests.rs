@@ -1,0 +1,86 @@
+use metor_fsw_3_ring::NoWake;
+use metor_proto_wkt::{SequenceChannelEvent, SequenceCommand, SequenceRegistry};
+
+use super::*;
+use crate::def::DefCx;
+use crate::port::Output;
+use crate::record::RecordSchema;
+use crate::system::PortDef;
+use crate::tests::utils::pair;
+
+#[test]
+fn test_wkt_records_keep_panel_ids() {
+    assert_eq!(SequenceCommand::schema().packet_id(), [225, 247]);
+    assert_eq!(SequenceChannelEvent::schema().packet_id(), [133, 5]);
+    assert_eq!(SequenceRegistry::schema().packet_id(), [78, 109]);
+}
+
+#[test]
+fn test_abort_requested_latches() {
+    let (_ring, mut out, input) = pair::<AbortRequest>(4);
+    let mut abort = Abort::new(input);
+    assert!(!abort.requested());
+    out.write(&AbortRequest {}).expect("room");
+    assert!(abort.requested());
+    assert!(abort.requested());
+}
+
+#[test]
+fn test_abort_without_producer() {
+    let mut abort = Abort::<NoWake>::new(Input::new(Vec::new()));
+    assert!(!abort.requested());
+}
+
+/// Counts aborts on its own port.
+#[crate::system]
+fn aborts(abort: &mut Abort, seen: &mut Output<AbortRequest>) {
+    if abort.requested() {
+        let _ = seen.write(&AbortRequest {});
+    }
+}
+
+fn def_of<S: crate::SystemFn>(_system: S) -> crate::SystemDef {
+    <crate::FnSystem<S> as crate::System>::def(&DefCx::empty()).expect("a static definition")
+}
+
+#[test]
+fn test_abort_param_declares_port() {
+    let def = def_of(aborts());
+    let names: Vec<_> = def.inputs.iter().map(|port| port.name.as_ref()).collect();
+    assert_eq!(names, [ABORT_PORT]);
+    assert_eq!(def.inputs[0].record, AbortRequest::NAME);
+}
+
+#[test]
+fn test_channel_state_codes() {
+    assert_eq!(ChannelState::of(RunState::Running, None).code(), 0);
+    assert_eq!(ChannelState::of(RunState::Stopped, None).code(), 1);
+    assert_eq!(
+        ChannelState::of(RunState::Running, Some(&EndReason::Completed)),
+        ChannelState::Completed
+    );
+    assert_eq!(
+        ChannelState::of(RunState::Stopped, Some(&EndReason::Failed("x".into()))),
+        ChannelState::Failed
+    );
+    assert_eq!(
+        ChannelState::of(RunState::Stopped, Some(&EndReason::Unloaded)).code(),
+        6
+    );
+}
+
+#[test]
+fn test_channel_status_layout() {
+    let RecordSchema::Frame { metadata, .. } = ChannelStatus::schema() else {
+        panic!("a frame")
+    };
+    let artifact = metadata
+        .iter()
+        .find(|m| m.name.ends_with("artifact"))
+        .expect("an artifact component");
+    assert!(artifact.is_string());
+    let hashes = metadata.iter().filter(|m| m.name.contains("hash")).count();
+    assert_eq!(hashes, 1);
+    let port: PortDef = Output::<ChannelStatus>::def(&DefCx::empty(), "channel_status");
+    assert_eq!(port.max_len, size_of::<ChannelStatus>());
+}

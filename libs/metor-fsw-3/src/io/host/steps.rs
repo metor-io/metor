@@ -43,7 +43,7 @@ struct IoParams {
 pub(crate) fn entry() -> TableEntry {
     TableEntry {
         kind: SystemKind::Cyclic,
-        adapters: Adapters::BARE,
+        adapters: Adapters::OFF_THREAD,
         // PANIC Safety: the empty context names no ports, which cannot fail.
         def: def(&DefCx::empty()).expect("a static definition"),
         def_fn: Box::new(def),

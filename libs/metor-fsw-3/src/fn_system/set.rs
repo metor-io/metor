@@ -49,7 +49,7 @@ impl<S: FnSignature, W: InputWake> InSet<S, W> {
 impl<S: FnSignature> OutSet<S> {
     /// The parameters' output defs with `log` appended, and the index of
     /// `log`.
-    fn defs_with_log(cx: &DefCx<'_>) -> Result<(Vec<PortDef>, usize), DefError> {
+    pub(crate) fn defs_with_log(cx: &DefCx<'_>) -> Result<(Vec<PortDef>, usize), DefError> {
         let mut outputs = Defs::of::<S>(cx)?.outputs;
         let log = outputs.len();
         outputs.push(Output::<LogEvent>::def(cx, LOG_PORT));
