@@ -1,0 +1,11 @@
+[project]
+name = "adcs-fsw3"
+version = "0.1.0"
+description = "Targets for the adcs-fsw3 example: a one-process simulation and a three-target deployment"
+requires-python = ">=3.11"
+dependencies = ["adcs-pack", "adcs-seqs", "metor-config"]
+
+[tool.uv.sources]
+adcs-pack = { path = "systems/adcs", editable = true }
+adcs-seqs = { path = "systems/seqs", editable = true }
+metor-config = { path = "../../libs/metor-fsw-3/python/metor-config", editable = true }
