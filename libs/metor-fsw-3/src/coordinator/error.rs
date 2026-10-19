@@ -108,6 +108,61 @@ pub enum BuildError {
         source: DefError,
     },
 
+    #[error("`{system}` has no grant for its `Cap` parameter `{param}`")]
+    Ungranted { system: String, param: String },
+
+    #[error("`{system}`'s parameter `{param}` is bound to two resources")]
+    DuplicateGrant { system: String, param: String },
+
+    #[error("`{system}` grants `{param}`, which is not a `Cap` parameter")]
+    UnknownGrant { system: String, param: String },
+
+    #[error("`{system}` holds a `Cap`, so the config needs an fsw.io")]
+    NoIoStep { system: String },
+
+    #[error("`{system}` holds a `Cap`, so an fsw.io must follow it")]
+    NoIoStepAfter { system: String },
+
+    #[error("{count} systems hold a `Cap`, past the limit")]
+    TooManyIoMembers { count: usize },
+
+    #[error("{count} resources, past the limit")]
+    TooManyResources { count: usize },
+
+    #[error("the IO backend did not start: {message}")]
+    IoBackend { message: String },
+
+    #[error("`{system}` grants `{param}` resource `{resource}`, which the target does not create")]
+    UnknownResource {
+        system: String,
+        param: String,
+        resource: String,
+    },
+
+    /// `cap` is `{system}.{param}`.
+    #[error("`{cap}` takes a `{expected}`, but resource `{resource}` provides `{found}`")]
+    Interface {
+        cap: String,
+        resource: String,
+        expected: String,
+        found: String,
+    },
+
+    #[error(
+        "`{system}` grants `{param}` sim resource `{resource}`, which names its holders itself"
+    )]
+    SimGrant {
+        system: String,
+        param: String,
+        resource: String,
+    },
+
+    #[error("sim resource `{resource}` names holder `{system}`, which is not in the config")]
+    UnknownHolder { resource: String, system: String },
+
+    #[error("resource `{resource}` did not open: {message}")]
+    Open { resource: String, message: String },
+
     #[error("definition for `{id}`: {source}")]
     Def {
         id: String,

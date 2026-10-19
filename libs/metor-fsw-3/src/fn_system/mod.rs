@@ -21,11 +21,9 @@ use crate::{
     system::{System, SystemDef},
 };
 
-pub use ctor::Ctor;
-pub(crate) use param::Defs;
-pub(crate) use param::Instance;
+pub use ctor::{Ctor, WithIo};
 pub use param::{Cycle, Param, ParamNames, Views, Writers};
-pub(crate) use set::bind;
+pub(crate) use param::{Defs, Instance, param_name};
 pub use set::{InSet, LOG_PORT, OutSet};
 
 /// Describes the parameters of a system written as a fn.
@@ -88,16 +86,22 @@ impl<S: AsyncSystemFn> AsyncSystem for FnSystem<S> {
     /// # Errors
     /// Refuses a [`Sample`](crate::port::Sample) parameter, because async
     /// systems have no step to take samples each cycle.
+    ///
+    /// Refuses a `Cap` parameter too: async systems keep
+    /// stellarator's own IO.
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
         let defs = Defs::of::<S>(cx)?;
         let system = S::NAME.into();
         if defs.sampled {
             return Err(DefError::SampleOnAsync { system });
         }
+        if !defs.grants.is_empty() {
+            return Err(DefError::IoOnAsync { system });
+        }
         if defs.rng {
             return Err(DefError::RngOnAsync { system });
         }
-        set::system_def::<S, Notifier>(cx)
+        set::system_def::<S>(cx)
     }
 
     /// Runs the system, sending its log lines to its own `log` output.
@@ -121,7 +125,7 @@ impl<S: SystemFn> System for FnSystem<S> {
     type Outputs = OutSet<S>;
 
     fn def(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
-        set::system_def::<S, NoWake>(cx)
+        set::system_def::<S>(cx)
     }
 
     /// Runs one cycle, sending its log lines to the system's own `log` output.

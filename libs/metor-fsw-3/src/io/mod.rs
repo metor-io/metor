@@ -1,0 +1,140 @@
+//! IO as a queue: a system puts ops on its own submission queue and takes
+//! results from its own completion queue.
+//!
+//! Every index is arithmetic over tables sized at build. A buffer is a
+//! [`Span`] of its system's arena, so ops are plain bytes that can be logged,
+//! compared, and copied across the guest ABI.
+
+use std::borrow::Cow;
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+mod arena;
+mod cap;
+mod config;
+mod error;
+#[cfg(all(feature = "host", unix))]
+pub mod host;
+mod op_slot;
+mod ops;
+mod param;
+mod queue;
+mod shared;
+mod status;
+pub mod test;
+mod wire;
+
+#[cfg(test)]
+pub(crate) mod tests;
+
+pub use arena::*;
+pub use cap::*;
+pub use config::*;
+pub use error::*;
+#[cfg(all(feature = "host", unix))]
+pub use host::{IO_STATUS_PORT, IO_TYPE};
+pub use ops::*;
+pub use queue::*;
+pub use shared::*;
+pub use status::*;
+pub use wire::*;
+
+/// The output a system submits ops on.
+pub const IO_SQ: &str = "io_sq";
+/// The input a system reads completions from.
+pub const IO_CQ: &str = "io_cq";
+/// The most ops one system may have in flight.
+///
+/// Kani proofs use a smaller queue to keep their state space tractable.
+#[cfg(not(kani))]
+pub const MAX_OPS: usize = 16;
+#[cfg(kani)]
+pub const MAX_OPS: usize = 4;
+
+/// Where a system's `io_cq` input and `io_sq` output sit in its definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoPorts {
+    /// The index of `io_cq` in the inputs.
+    pub cq: usize,
+    /// The index of `io_sq` in the outputs.
+    pub sq: usize,
+}
+
+/// A `Cap<K>` parameter in a system's definition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantDef {
+    pub param: Cow<'static, str>,
+    /// The interface's name, such as `"uart"`.
+    pub interface: Cow<'static, str>,
+}
+
+impl GrantDef {
+    /// The definition of a `Cap<K>` parameter called `param`.
+    pub fn new<K: Interface>(param: &'static str) -> Self {
+        Self {
+            param: param.into(),
+            interface: K::NAME.into(),
+        }
+    }
+}
+
+/// A resource's position in a target's resources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResourceIndex(u16);
+
+impl ResourceIndex {
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl From<u16> for ResourceIndex {
+    fn from(index: u16) -> Self {
+        Self(index)
+    }
+}
+
+impl TryFrom<usize> for ResourceIndex {
+    type Error = core::num::TryFromIntError;
+
+    fn try_from(position: usize) -> Result<Self, Self::Error> {
+        u16::try_from(position).map(Self)
+    }
+}
+
+/// Which end of a resource a system holds.
+///
+/// A sim resource is a wire between a driver and a device model. A real
+/// resource has only the driver's end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceEnd {
+    /// The driver's end.
+    #[default]
+    Host,
+    /// The device model's end.
+    Device,
+}
+
+impl ResourceEnd {
+    pub fn is_host(&self) -> bool {
+        *self == Self::Host
+    }
+
+    /// The end's position in a pair indexed by end.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Host => 0,
+            Self::Device => 1,
+        }
+    }
+
+    /// The other end of the wire.
+    pub fn other(self) -> Self {
+        match self {
+            Self::Host => Self::Device,
+            Self::Device => Self::Host,
+        }
+    }
+}

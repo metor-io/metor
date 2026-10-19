@@ -130,6 +130,9 @@ pub enum DefError {
     #[error("async system `{system}` takes a `Sample`, which only a stepped system takes")]
     SampleOnAsync { system: String },
 
+    #[error("async system `{system}` takes a `Cap`, which only a stepped system takes")]
+    IoOnAsync { system: String },
+
     #[error("async system `{system}` takes an `Rng`, which only a stepped system takes")]
     RngOnAsync { system: String },
 }

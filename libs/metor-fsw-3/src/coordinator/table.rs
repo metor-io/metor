@@ -4,15 +4,17 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use metor_fsw_3_ring::{NoWake, Notifier, RingBuffer};
+use metor_fsw_3_ring::{NoWake, RingBuffer};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError, Records};
-use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, SystemFn};
-use crate::system::{InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
+use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, InSet, OutSet, SystemFn};
+use crate::io::{Io, IoState};
+use crate::port::{Input, Output};
+use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
 use crate::thread::{DEFAULT_THREAD, LaunchCx, Launched, Threads};
 
 use super::BuildError;
@@ -33,6 +35,8 @@ pub struct MakeCx<'a> {
     pub inputs: Vec<Vec<&'a RingBuffer>>,
     pub outputs: Vec<&'a RingBuffer>,
     pub threads: &'a mut Threads,
+    /// The coordinator's IO state, lent for the make.
+    pub io: &'a mut IoState,
     /// The target seed every `Rng` parameter draws from.
     pub seed: u64,
     /// The target's namespace.
@@ -83,6 +87,29 @@ impl MakeCx<'_> {
             })
             .collect();
         (views, writers)
+    }
+
+    /// Binds a system's ports under this instance.
+    ///
+    /// The queue pair's ports, at the positions the def records, become the
+    /// `Io` the outputs' `Cap`s use, over the member's arena.
+    pub(crate) fn bind_ports<I, O>(&mut self) -> Result<(I, O, Option<Io>), MakeError>
+    where
+        I: Ports<InputBinding>,
+        O: Ports<OutputBinding>,
+    {
+        let (mut views, mut writers) = self.take_bindings();
+        let io = self.def.io.map(|ports| {
+            let cq = views.remove(ports.cq);
+            let sq = writers.remove(ports.sq);
+            let arena = self.io.get_or_add_member(self.id);
+            Io::new(Output::new(sq.writer), Input::new(cq.views), arena)
+        });
+        let cx = BindCx {
+            instance: fn_system::Instance::from_make_cx(self),
+            io: io.clone(),
+        };
+        Ok((I::bind(views, &cx)?, O::bind(writers, &cx)?, io))
     }
 }
 
@@ -193,11 +220,15 @@ impl SystemTable {
     ) -> Result<(), BuildError> {
         let make = move |cx: LaunchCx<'_>| {
             let (system, state) = make(cx.params)?;
+            let bind = BindCx {
+                instance: cx.instance,
+                io: None,
+            };
             Ok(Launched::<A> {
                 system,
                 state,
-                inputs: A::Inputs::bind(cx.inputs),
-                outputs: A::Outputs::bind(cx.outputs),
+                inputs: A::Inputs::bind(cx.inputs, &bind)?,
+                outputs: A::Outputs::bind(cx.outputs, &bind)?,
             })
         };
         let entry =
@@ -220,13 +251,16 @@ impl SystemTable {
         ctor: C,
     ) -> Result<(), BuildError> {
         let make = move |cx: LaunchCx<'_>| {
-            let (inputs, outputs) =
-                fn_system::bind::<S, Notifier>(cx.inputs, cx.outputs, cx.instance)?;
+            let state = ctor.make(cx.params, &mut crate::io::IoInit::empty(&cx.instance.id))?;
+            let bind = BindCx {
+                instance: cx.instance,
+                io: None,
+            };
             Ok(Launched::<FnSystem<S>> {
                 system: FnSystem::default(),
-                state: ctor.make(cx.params)?,
-                inputs,
-                outputs,
+                state,
+                inputs: InSet::bind(cx.inputs, &bind)?,
+                outputs: OutSet::bind(cx.outputs, &bind)?,
             })
         };
         let entry =
@@ -348,23 +382,22 @@ impl TableEntry {
         doc: Cow<'static, str>,
         schema: Option<Box<RawValue>>,
     ) -> Result<Self, DefError> {
-        let def = S::def(&DefCx::empty())?;
         Ok(Self {
             kind: SystemKind::Cyclic,
             #[cfg(feature = "host")]
             adapters: SystemKind::Cyclic.adapters(),
-            def,
+            def: S::def(&DefCx::empty())?,
             def_fn: Box::new(S::def),
             doc,
             schema,
             make: Arc::new(move |mut cx| {
                 let (system, state) = make(cx.params)?;
-                let (views, writers) = cx.take_bindings();
+                let (inputs, outputs, _io) = cx.bind_ports::<S::Inputs, S::Outputs>()?;
                 Ok(Box::new(Runner {
                     system,
                     state,
-                    inputs: S::Inputs::bind(views),
-                    outputs: S::Outputs::bind(writers),
+                    inputs,
+                    outputs,
                 }))
             }),
         })
@@ -372,8 +405,8 @@ impl TableEntry {
 
     /// Builds the table entry for a `#[system]` fn.
     ///
-    /// The entry's `make` binds the system's ports before `ctor` builds its
-    /// state.
+    /// The entry's `make` binds the system's ports, including its queue pair,
+    /// before `ctor` builds its state.
     fn system_fn<S: SystemFn, M, C: Ctor<S::State, M> + 'static>(
         ctor: C,
     ) -> Result<Self, DefError> {
@@ -386,10 +419,8 @@ impl TableEntry {
             doc: Cow::Borrowed(S::DOC),
             schema: C::schema(),
             make: Arc::new(move |mut cx| {
-                let instance = fn_system::Instance::from_make_cx(&cx);
-                let (views, writers) = cx.take_bindings();
-                let (inputs, outputs) = fn_system::bind::<S, NoWake>(views, writers, instance)?;
-                let state = ctor.make(cx.params)?;
+                let (inputs, outputs, io) = cx.bind_ports::<InSet<S>, OutSet<S>>()?;
+                let state = ctor.make_with_io(cx.id, cx.params, io.as_ref())?;
                 Ok(Box::new(Runner {
                     system: FnSystem::default(),
                     state,
@@ -750,6 +781,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             threads: &mut threads,
+            io: &mut IoState::default(),
             seed: 0,
             namespace: None,
             records: &Default::default(),

@@ -3,12 +3,17 @@
 //! It lists the systems to run and wires each system's inputs to other
 //! systems' outputs.
 
+use core::marker::PhantomData;
 use core::num::NonZeroUsize;
 use core::time::Duration;
+use std::collections::BTreeMap;
 
+use indexmap::IndexMap;
 use metor_proto::types::Timestamp;
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::io::Backing;
 use crate::system::PortDef;
 
 /// The default [`CoordinatorConfig::ring_depth`].
@@ -26,6 +31,13 @@ pub struct CoordinatorConfig {
     #[serde(default)]
     pub namespace: Option<String>,
     pub systems: Vec<SystemConfig>,
+    /// The resources systems are granted, by id.
+    #[serde(
+        default,
+        skip_serializing_if = "IndexMap::is_empty",
+        deserialize_with = "unique_keys"
+    )]
+    pub resources: IndexMap<String, Backing>,
     /// The seed every `Rng` parameter draws from.
     #[serde(default)]
     pub seed: u64,
@@ -40,6 +52,7 @@ impl Default for CoordinatorConfig {
             ring_depth: DEFAULT_RING_DEPTH,
             namespace: None,
             systems: Vec::new(),
+            resources: IndexMap::new(),
             seed: 0,
         }
     }
@@ -56,6 +69,14 @@ pub struct SystemConfig {
     pub inputs: Vec<InputConfig>,
     #[serde(default)]
     pub outputs: Vec<OutputConfig>,
+    /// Gives `Cap<K>` parameters real resources, by parameter name. A sim
+    /// resource names its holders itself.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "unique_keys"
+    )]
+    pub grants: BTreeMap<String, String>,
     /// The adapter the system runs behind, if any. See [`Adapter`].
     #[serde(flatten, with = "adapter_keys")]
     pub adapter: Option<Adapter>,
@@ -75,6 +96,39 @@ impl core::fmt::Display for Location {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}:{}", self.file, self.line)
     }
+}
+
+/// Deserializes a map, rejecting a key that appears twice, which serde would
+/// otherwise let the last one win.
+fn unique_keys<'de, D, M, V>(d: D) -> Result<M, D::Error>
+where
+    D: Deserializer<'de>,
+    M: FromIterator<(String, V)>,
+    V: Deserialize<'de>,
+{
+    struct Unique<V>(PhantomData<V>);
+
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for Unique<V> {
+        type Value = IndexMap<String, V>;
+
+        fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+            f.write_str("a map with unique keys")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut out = IndexMap::new();
+            while let Some((key, value)) = map.next_entry::<String, V>()? {
+                if out.contains_key(&key) {
+                    return Err(A::Error::custom(format!("`{key}` is named twice")));
+                }
+                out.insert(key, value);
+            }
+            Ok(out)
+        }
+    }
+
+    let unique = d.deserialize_map(Unique(PhantomData))?;
+    Ok(unique.into_iter().collect())
 }
 
 /// Changes how a system is run.
@@ -108,6 +162,12 @@ impl Default for Adapters {
 
 #[cfg(feature = "host")]
 impl Adapters {
+    /// Running behind no adapter only.
+    pub const BARE: Self = Self {
+        bare: true,
+        thread: false,
+    };
+
     /// Whether the type runs behind `adapter`, or behind none for `None`.
     pub fn accepts(self, adapter: Option<&Adapter>) -> bool {
         match adapter {
@@ -164,6 +224,7 @@ impl SystemConfig {
             params: serde_json::Value::Null,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            grants: BTreeMap::new(),
             adapter: None,
             location: None,
         }
@@ -350,6 +411,61 @@ mod tests {
             ..bare
         };
         assert!(!none.accepts(None));
+    }
+
+    #[test]
+    fn test_grants_default_and_round_trip() {
+        let bare = SystemConfig::new("gps", "gps");
+        let text = serde_json::to_string(&bare).expect("serializable");
+        assert!(!text.contains("grants"));
+        let granted = SystemConfig {
+            grants: BTreeMap::from([("uart".into(), "gps1".into())]),
+            ..bare
+        };
+        let text = serde_json::to_string(&granted).expect("serializable");
+        assert_eq!(
+            serde_json::from_str::<SystemConfig>(&text).expect("round trips"),
+            granted
+        );
+    }
+
+    #[test]
+    fn test_grant_needs_a_resource() {
+        let text = r#"{"id":"gps","ty":"gps","grants":{"uart":5}}"#;
+        assert!(serde_json::from_str::<SystemConfig>(text).is_err());
+    }
+
+    #[test]
+    fn test_reject_a_parameter_granted_twice() {
+        let text = r#"{"id":"gps","ty":"gps","grants":{"uart":"a","uart":"b"}}"#;
+        let error = serde_json::from_str::<SystemConfig>(text).expect_err("a duplicate key");
+        assert!(
+            error.to_string().contains("`uart` is named twice"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_resources_keep_order_and_reject_a_repeated_id() {
+        #[derive(Debug, Deserialize)]
+        struct Resources(#[serde(deserialize_with = "unique_keys")] IndexMap<String, Backing>);
+
+        let sim = r#"{"sim":{"kind":"uart","host":{"system":"a","param":"u"},"device":{"system":"b","param":"u"}}}"#;
+        let parse = |text: String| serde_json::from_str::<Resources>(&text);
+        let two = parse(format!(r#"{{"z":{sim},"a":{sim}}}"#)).expect("unique ids");
+        let ids: Vec<_> = two.0.keys().map(String::as_str).collect();
+        assert_eq!(ids, ["z", "a"]);
+        let error = parse(format!(r#"{{"z":{sim},"z":{sim}}}"#)).expect_err("a repeated id");
+        assert!(error.to_string().contains("`z` is named twice"), "{error}");
+        let config = CoordinatorConfig {
+            resources: two.0,
+            ..CoordinatorConfig::default()
+        };
+        let text = serde_json::to_string(&config).expect("serializable");
+        assert_eq!(
+            serde_json::from_str::<CoordinatorConfig>(&text).unwrap(),
+            config
+        );
     }
 
     fn adapter_of(text: &str) -> Result<Option<Adapter>, serde_json::Error> {

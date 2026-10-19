@@ -619,6 +619,7 @@ fn test_async_adapter_relay() {
         inputs: vec![vec![&imu]],
         outputs: vec![&nav, &log],
         threads: &mut threads,
+        io: &mut crate::io::IoState::default(),
         seed: 0,
         namespace: None,
         records: &Default::default(),
@@ -633,7 +634,10 @@ fn test_async_adapter_relay() {
             std::time::Instant::now() < deadline,
             "the thread never relayed"
         );
-        step.execute(Timestamp(1));
+        step.execute(
+            Timestamp(1),
+            &mut crate::coordinator::StepCx::new(&mut Default::default()),
+        );
         seen.extend(lines.drain().map(|l| l.expect("decodes").message));
         if let Some(nav) = estimates.latest().expect("valid") {
             break nav.estimate;
@@ -799,6 +803,7 @@ fn flooded(a: usize, b: usize, cycles: i64) -> Vec<LogEvent> {
         inputs: Vec::new(),
         outputs: vec![&ring_a, &ring_b, &log],
         threads: &mut threads,
+        io: &mut crate::io::IoState::default(),
         seed: 0,
         namespace: None,
         records: &Default::default(),
@@ -806,7 +811,10 @@ fn flooded(a: usize, b: usize, cycles: i64) -> Vec<LogEvent> {
     .expect("no params");
     let mut seen = Vec::new();
     for cycle in 1..=cycles {
-        step.execute(Timestamp(cycle));
+        step.execute(
+            Timestamp(cycle),
+            &mut crate::coordinator::StepCx::new(&mut Default::default()),
+        );
         seen.extend(lines.drain().map(|line| line.expect("decodes")));
     }
     seen
@@ -858,7 +866,7 @@ impl FnSignature for TwoOutputs {
 
 #[test]
 fn test_outputs_share_one_counter() {
-    use crate::system::{OutputBinding, Ports};
+    use crate::system::{BindCx, OutputBinding, Ports};
 
     let rings = [ring::<Imu>(8, 1), ring::<Imu>(8, 1), ring::<LogEvent>(8, 1)];
     let defs = OutSet::<TwoOutputs>::defs(&DefCx::empty()).expect("static ports");
@@ -870,7 +878,7 @@ fn test_outputs_share_one_counter() {
             writer: ring.writer(NoWake).expect("free writer"),
         })
         .collect();
-    let set = OutSet::<TwoOutputs>::bind(bindings);
+    let set = OutSet::<TwoOutputs>::bind(bindings, &BindCx::default()).expect("no Rng");
     assert_eq!(std::sync::Arc::strong_count(&set.dropped), 3);
 }
 
@@ -1095,6 +1103,7 @@ fn test_async_records_param_reads_the_host_table() {
         inputs: Vec::new(),
         outputs: vec![&nav, &log],
         threads: &mut threads,
+        io: &mut crate::io::IoState::default(),
         seed: 0,
         namespace: None,
         records: &records,
@@ -1103,7 +1112,10 @@ fn test_async_records_param_reads_the_host_table() {
     let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
     let estimate = loop {
         assert!(std::time::Instant::now() < deadline, "no lookup arrived");
-        step.execute(Timestamp(1));
+        step.execute(
+            Timestamp(1),
+            &mut crate::coordinator::StepCx::new(&mut Default::default()),
+        );
         if let Some(nav) = estimates.latest().expect("valid") {
             break nav.estimate;
         }
@@ -1121,4 +1133,14 @@ fn test_def_records_its_log_output() {
     assert_eq!(def.outputs[log].id, LogEvent::ID);
     let bare = SystemDef::new::<(), (), NoWake>("bare", &DefCx::empty()).expect("no ports");
     assert_eq!(bare.log, None, "a hand-written def names no log");
+}
+
+/// A fn system with a `Cap` records where its queue pair's ports are.
+#[test]
+fn test_def_records_its_queue_ports() {
+    let def = def_of(crate::tests::utils::uplink());
+    let io = def.io.expect("a Cap gives a queue pair");
+    assert_eq!(def.inputs[io.cq].name, crate::io::IO_CQ);
+    assert_eq!(def.outputs[io.sq].name, crate::io::IO_SQ);
+    assert_eq!(def_of(counting()).io, None, "no Cap, no queue pair");
 }

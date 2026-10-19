@@ -30,7 +30,7 @@ struct FailingConsumer {
 }
 
 impl Step for FailingConsumer {
-    fn execute(&mut self, _: Timestamp) {
+    fn execute(&mut self, _: Timestamp, _cx: &mut crate::coordinator::StepCx<'_>) {
         self.calls.execute.set(self.calls.execute.get() + 1);
         assert!(self.inputs.data.latest().expect("valid data").is_some());
         assert!(self.inputs.status.latest().expect("valid status").is_some());
@@ -61,7 +61,7 @@ impl Drop for FailingConsumer {
 struct Producer(Output<Imu>);
 
 impl Step for Producer {
-    fn execute(&mut self, now: Timestamp) {
+    fn execute(&mut self, now: Timestamp, _cx: &mut crate::coordinator::StepCx<'_>) {
         self.0
             .write(&Imu::new(now.0, now.0 as f64))
             .expect("retired readers cannot block the producer");
@@ -74,7 +74,7 @@ struct HealthyConsumer {
 }
 
 impl Step for HealthyConsumer {
-    fn execute(&mut self, _: Timestamp) {
+    fn execute(&mut self, _: Timestamp, _cx: &mut crate::coordinator::StepCx<'_>) {
         let data = self
             .inputs
             .data
@@ -105,6 +105,7 @@ fn entry(name: &str, step: impl Step + 'static, status: &RingBuffer) -> Entry {
 fn coordinator(entries: Vec<Entry>, rings: Vec<RingBuffer>) -> Coordinator {
     Coordinator {
         entries,
+        io: Default::default(),
         clock: Clock::Simulated {
             dt: std::time::Duration::from_millis(1),
             epoch: None,
@@ -193,7 +194,7 @@ fn test_fault_and_destructor_panic_isolation() {
 pub(super) struct Twice(pub Rc<Cell<u64>>, pub Option<EndReason>);
 
 impl Step for Twice {
-    fn execute(&mut self, _now: Timestamp) {
+    fn execute(&mut self, _now: Timestamp, _cx: &mut crate::coordinator::StepCx<'_>) {
         self.0.set(self.0.get() + 1);
         if self.0.get() == 2 {
             self.1 = Some(EndReason::Completed);

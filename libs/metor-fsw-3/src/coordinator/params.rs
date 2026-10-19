@@ -55,6 +55,19 @@ pub enum MakeError {
     MirrorTooLarge { capacity: usize },
     #[error("`{system}`: an async system needs OS threads, which this build has none of")]
     ThreadsUnsupported { system: String },
+    #[error(
+        "`{system}` cannot fit {requested_len} more bytes of IO memory in {}",
+        .available.map_or("a system without a `Cap`".to_string(), |len| format!("its {len}-byte arena"))
+    )]
+    IoMemory {
+        system: String,
+        requested_len: usize,
+        available: Option<usize>,
+    },
+    #[error("resource `{id}`: {message}")]
+    Resource { id: String, message: String },
+    #[error("`{system}` feeds io_submit but holds no `Cap` made in this process")]
+    NoIoMember { system: String },
 }
 
 #[cfg(test)]

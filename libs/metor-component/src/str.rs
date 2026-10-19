@@ -45,6 +45,19 @@ impl<const N: usize> FrameStr<N> {
         Ok(Self(bytes))
     }
 
+    /// The longest prefix of `text` that fits, cut at a character boundary
+    /// and before any NUL.
+    pub fn truncated(text: &str) -> Self {
+        let text = text.find('\0').map_or(text, |nul| &text[..nul]);
+        let mut end = text.len().min(Self::CAPACITY);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut bytes = [0; N];
+        bytes[..end].copy_from_slice(&text.as_bytes()[..end]);
+        Self(bytes)
+    }
+
     /// The text up to the first NUL.
     pub fn to_str(&self) -> Result<&str, core::str::Utf8Error> {
         let len = self.0.iter().position(|&b| b == 0).unwrap_or(N);
@@ -135,6 +148,15 @@ mod tests {
         assert_eq!(text.to_str(), Ok("liba.so"));
         assert_eq!(text.as_bytes()[7], 0);
         assert_eq!(FrameStr::<8>::default().to_str(), Ok(""));
+    }
+
+    #[test]
+    fn test_truncated_keeps_whole_characters() {
+        assert_eq!(FrameStr::<8>::truncated("liba.so").to_str(), Ok("liba.so"));
+        assert_eq!(FrameStr::<8>::truncated("libab.so").to_str(), Ok("libab.s"));
+        assert_eq!(FrameStr::<4>::truncated("aé").to_str(), Ok("aé"));
+        assert_eq!(FrameStr::<4>::truncated("abé").to_str(), Ok("ab"));
+        assert_eq!(FrameStr::<8>::truncated("a\0b").to_str(), Ok("a"));
     }
 
     #[test]

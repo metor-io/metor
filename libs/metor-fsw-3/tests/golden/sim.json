@@ -1,0 +1,56 @@
+{
+  "clock": {
+    "Simulated": {
+      "dt": {
+        "secs": 0,
+        "nanos": 10000000
+      }
+    }
+  },
+  "ring_depth": 8,
+  "namespace": null,
+  "systems": [
+    {
+      "id": "gps",
+      "ty": "echo.gps",
+      "params": null
+    },
+    {
+      "id": "io_submit",
+      "ty": "fsw.io"
+    },
+    {
+      "id": "receiver",
+      "ty": "echo.uart_script",
+      "params": {
+        "script": [
+          "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n",
+          "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n",
+          "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n"
+        ]
+      }
+    },
+    {
+      "id": "io_complete",
+      "ty": "fsw.io",
+      "params": {
+        "status": true
+      }
+    }
+  ],
+  "resources": {
+    "gps1": {
+      "sim": {
+        "kind": "uart",
+        "host": {
+          "system": "gps",
+          "param": "uart"
+        },
+        "device": {
+          "system": "receiver",
+          "param": "uart"
+        }
+      }
+    }
+  }
+}

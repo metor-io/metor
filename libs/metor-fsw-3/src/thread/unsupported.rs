@@ -70,6 +70,7 @@ mod tests {
             inputs: vec![vec![&imu]],
             outputs: vec![&nav, &log],
             threads: &mut Threads::default(),
+            io: &mut crate::io::IoState::default(),
             seed: 0,
             namespace: None,
             records: &Default::default(),

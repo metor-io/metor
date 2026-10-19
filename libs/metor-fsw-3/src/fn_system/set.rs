@@ -12,10 +12,10 @@ use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::log::LogPort;
 use crate::port::{InputWake, Output};
-use crate::system::{InputBinding, OutputBinding, PortDef, Ports, SystemDef};
+use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, SystemDef};
 
 use super::FnSignature;
-use super::param::{Defs, Instance, Param, Views, Writers};
+use super::param::{Defs, Param, Views, Writers};
 
 /// The output that every fn system writes its log events to.
 pub const LOG_PORT: &str = "log";
@@ -92,9 +92,9 @@ impl<S: FnSignature, W: InputWake> Ports<InputBinding<W>> for InSet<S, W> {
         Ok(Defs::of::<S>(cx)?.inputs)
     }
 
-    fn bind(inputs: Vec<InputBinding<W>>) -> Self {
+    fn bind(inputs: Vec<InputBinding<W>>, _cx: &BindCx) -> Result<Self, MakeError> {
         let defs = Defs::declared::<S>();
-        Self::from_views(Views::new(inputs, defs.inputs.len()))
+        Ok(Self::from_views(Views::new(inputs, defs.param_inputs())))
     }
 }
 
@@ -103,40 +103,30 @@ impl<S: FnSignature> Ports<OutputBinding> for OutSet<S> {
         Ok(OutSet::<S>::defs_with_log(cx)?.0)
     }
 
-    /// Binds the outputs under an unnamed instance with seed 0 and an empty
-    /// record table. A table make binds through `fn_system::bind` instead.
-    fn bind(outputs: Vec<OutputBinding>) -> Self {
+    /// Binds the outputs, then `log`, handing `cx`'s queue to the `Cap`s.
+    fn bind(outputs: Vec<OutputBinding>, cx: &BindCx) -> Result<Self, MakeError> {
         let defs = Defs::declared::<S>();
-        let writers = Writers::new(outputs, defs.outputs.len() + 1, Instance::default());
-        // PANIC Safety: no parameter fails to bind its output.
-        Self::from_writers(writers).expect("outputs bind")
+        let declared = defs.param_outputs() + 1;
+        Self::from_writers(Writers::new(
+            outputs,
+            declared,
+            cx.instance.clone(),
+            cx.io.clone(),
+        ))
     }
 }
 
-/// Returns fn system `S`'s definition, which records its `log` output.
-pub(crate) fn system_def<S: FnSignature, W: InputWake>(
-    cx: &DefCx<'_>,
-) -> Result<SystemDef, DefError> {
+/// Returns fn system `S`'s definition, which records its `log` output and
+/// its queue pair's ports.
+pub(crate) fn system_def<S: FnSignature>(cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+    let defs = Defs::of::<S>(cx)?;
     let (outputs, log) = OutSet::<S>::defs_with_log(cx)?;
     Ok(SystemDef {
         name: S::NAME.into(),
-        inputs: InSet::<S, W>::defs(cx)?,
+        inputs: defs.inputs,
         outputs,
         log: Some(log),
+        grants: defs.grants,
+        io: defs.io,
     })
-}
-
-/// A fn system's bound ports.
-pub(crate) type BoundSet<S, W> = (InSet<S, W>, OutSet<S>);
-
-/// Binds a fn system's ports under `instance`.
-pub(crate) fn bind<S: FnSignature, W: InputWake>(
-    inputs: Vec<InputBinding<W>>,
-    outputs: Vec<OutputBinding>,
-    instance: Instance,
-) -> Result<BoundSet<S, W>, MakeError> {
-    let defs = Defs::declared::<S>();
-    let ins = InSet::from_views(Views::new(inputs, defs.inputs.len()));
-    let writers = Writers::new(outputs, defs.outputs.len() + 1, instance);
-    Ok((ins, OutSet::from_writers(writers)?))
 }
