@@ -622,7 +622,7 @@ mod system {
                 ev.fields
                     .into_iter()
                     .find(|(k, _)| k == "kind")
-                    .map(|(_, v)| v)
+                    .map(|(_, v)| v.into_owned())
             })
             .collect();
         kinds.sort();

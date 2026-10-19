@@ -1,0 +1,5 @@
+error: `#[system]` parameters take no named lifetimes
+ --> tests/ui/system_named_lifetime.rs:4:33
+  |
+4 | fn stamp(now: Timestamp, name: &'static str) {
+  |                                 ^^^^^^^

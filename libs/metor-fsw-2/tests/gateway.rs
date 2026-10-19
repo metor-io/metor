@@ -200,7 +200,7 @@ fn log_sources(db: &Arc<DB>) -> Vec<String> {
         .flat_map(|node| {
             node.msgs()
                 .filter_map(|(_, msg)| postcard::from_bytes::<LogEvent>(msg).ok())
-                .map(|event| event.source)
+                .map(|event| event.source.into_owned())
                 .collect::<Vec<_>>()
         })
         .collect()
