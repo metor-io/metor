@@ -1,0 +1,5 @@
+error: only one field can be marked #[record(timestamp)]
+  --> tests/ui/record_two_timestamps.rs:11:13
+   |
+11 |     second: Timestamp,
+   |             ^^^^^^^^^

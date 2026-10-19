@@ -1,0 +1,5 @@
+error: only one field can be marked #[frame(timestamp)]
+  --> tests/ui/two_timestamps.rs:11:5
+   |
+11 |     second: metor_fsw_3::Timestamp,
+   |     ^^^^^^

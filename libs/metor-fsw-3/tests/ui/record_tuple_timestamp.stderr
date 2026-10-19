@@ -1,0 +1,5 @@
+error: #[record(timestamp)] needs a named field
+ --> tests/ui/record_tuple_timestamp.rs:7:37
+  |
+7 | struct Stamped(#[record(timestamp)] Timestamp);
+  |                                     ^^^^^^^^^

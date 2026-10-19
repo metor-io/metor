@@ -1,10 +1,10 @@
 use darling::FromField;
 
 /// A single struct field as parsed by the component derives, pairing its
-/// ident and type with the `#[fsw(...)]`/`#[metor_fsw(...)]` attributes they
-/// all share.
+/// ident and type with the `#[fsw(...)]`, `#[metor_fsw(...)]`, or
+/// `#[frame(...)]` attributes they all share.
 #[derive(Debug, FromField)]
-#[darling(attributes(fsw, metor_fsw))]
+#[darling(attributes(fsw, metor_fsw, frame))]
 pub struct Field {
     pub ident: Option<syn::Ident>,
     pub ty: syn::Type,

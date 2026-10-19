@@ -1,0 +1,535 @@
+//! The [`Payload`] and [`Record`] traits, for values that travel through a ring.
+//!
+//! A record is either a frame, stored as its raw bytes, or a message, stored
+//! in an encoding such as postcard or JSON.
+
+use core::borrow::Borrow;
+
+use metor_proto::types::{ComponentId, Msg, PacketId, PacketTy, Timestamp, msg_id, table_id};
+use metor_proto::vtable::VTable;
+use metor_proto_wkt::ComponentMetadata;
+use postcard_schema::schema::owned::OwnedNamedType;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::frame::Frame;
+
+/// A value that is encoded into a ring and decoded from it.
+///
+/// A [`Record`] is a payload with a name and a schema.
+pub trait Payload {
+    /// The alignment a payload's bytes need in the ring.
+    ///
+    /// An encoded message decodes from any address. A frame is borrowed in
+    /// place, so `#[derive(Frame)]` sets this to the frame's own alignment.
+    const ALIGN: usize = 1;
+
+    /// The type a read returns.
+    ///
+    /// A frame is borrowed straight from the ring. Other payloads are decoded
+    /// into an owned value.
+    type Read<'a>: Borrow<Self>
+    where
+        Self: 'a;
+
+    /// Returns the payload's timestamp, if it has one.
+    fn timestamp(&self) -> Option<Timestamp> {
+        None
+    }
+
+    /// Encodes this value into `buf`.
+    ///
+    /// Returns the encoded bytes, which may borrow from `buf` or from `self`.
+    fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError>;
+
+    /// Decodes one payload from `bytes`.
+    fn decode(bytes: &[u8]) -> Result<Self::Read<'_>, DecodeError>;
+}
+
+/// A value that systems pass to each other through a ring.
+///
+/// Each record type has a unique name and ID, and announces a schema to the
+/// ground.
+pub trait Record: Payload {
+    const NAME: &'static str;
+    const ID: ComponentId = ComponentId::new(Self::NAME);
+    /// The largest encoded size of this record, in bytes.
+    const MAX_LEN: usize;
+    /// How many records a producer expects to write per cycle.
+    ///
+    /// A ring holds `DEPTH * ring_depth` records.
+    const DEPTH: usize = 1;
+
+    /// Returns the schema a port rooted at `root` announces.
+    ///
+    /// A frame names its fields under `root`. A message has no field paths, so
+    /// it ignores `root`.
+    fn schema_with_root(root: &str) -> RecordSchema;
+
+    /// Returns the schema rooted at the record's own name.
+    fn schema() -> RecordSchema {
+        Self::schema_with_root(Self::NAME)
+    }
+
+    /// Returns a fingerprint of a frame's field layout, or `None` for a message.
+    ///
+    /// The fingerprint hashes [`Record::schema`], so it is the same for every
+    /// port root.
+    fn layout() -> Option<u64> {
+        match Self::schema() {
+            RecordSchema::Frame { vtable, .. } => Some(const_fnv1a_hash::fnv1a_hash_64(
+                &vtable_bytes(&vtable),
+                None,
+            )),
+            RecordSchema::Msg { .. } => None,
+        }
+    }
+}
+
+/// Describes a record to the ground, so it can decode what a port sends.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RecordSchema {
+    Frame {
+        vtable: VTable,
+        metadata: Vec<ComponentMetadata>,
+    },
+    Msg {
+        id: PacketId,
+        name: String,
+        codec: MsgCodec,
+    },
+}
+
+/// How a message record is encoded.
+///
+/// The ground uses it to decode the message's bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MsgCodec {
+    Postcard(OwnedNamedType),
+    Json,
+    Bytes,
+    Other(String),
+}
+
+impl RecordSchema {
+    /// Creates the schema for frame `T`.
+    ///
+    /// Each field is announced at `{root}.{field}`.
+    pub fn frame<T: Frame>(root: &str) -> Self {
+        Self::Frame {
+            vtable: metor_proto::vtable::builder::vtable(T::vtable_fields(root.to_string())),
+            metadata: T::metadata(root.to_string()).collect(),
+        }
+    }
+
+    /// Creates the schema for a postcard message.
+    ///
+    /// The message ID is the hash of its postcard schema name.
+    pub fn postcard<T: Serialize + postcard_schema::Schema>(name: &str) -> Self {
+        Self::Msg {
+            id: <T as Msg>::ID,
+            name: name.to_string(),
+            codec: MsgCodec::Postcard(T::SCHEMA.into()),
+        }
+    }
+
+    /// Creates the schema for a message in any other encoding.
+    ///
+    /// The message ID is the hash of `name`.
+    pub fn msg(name: &str, codec: MsgCodec) -> Self {
+        Self::Msg {
+            id: msg_id(name),
+            name: name.to_string(),
+            codec,
+        }
+    }
+
+    /// Returns the packet ID the ground uses to recognize this record.
+    pub fn packet_id(&self) -> PacketId {
+        match self {
+            Self::Frame { vtable, .. } => table_id(vtable),
+            Self::Msg { id, .. } => *id,
+        }
+    }
+
+    /// Returns the packet type this record is sent as.
+    ///
+    /// A frame is sent as a table, and a message as a message.
+    pub fn packet_ty(&self) -> PacketTy {
+        match self {
+            Self::Frame { .. } => PacketTy::Table,
+            Self::Msg { .. } => PacketTy::Msg,
+        }
+    }
+}
+
+/// Frames are compared by their encoded vtables, which is what the ground sees.
+impl PartialEq for RecordSchema {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Frame { vtable, metadata },
+                Self::Frame {
+                    vtable: other_vtable,
+                    metadata: other_metadata,
+                },
+            ) => metadata == other_metadata && vtable_bytes(vtable) == vtable_bytes(other_vtable),
+            (
+                Self::Msg { id, name, codec },
+                Self::Msg {
+                    id: i,
+                    name: n,
+                    codec: c,
+                },
+            ) => (id, name, codec) == (i, n, c),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RecordSchema {}
+
+/// Encodes a vtable with postcard.
+///
+/// An owned vtable always encodes, so the empty fallback is never used.
+fn vtable_bytes(vtable: &VTable) -> Vec<u8> {
+    ::postcard::to_allocvec(vtable).unwrap_or_default()
+}
+
+/// An error from encoding a record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum EncodeError {
+    #[error("value encodes to {len} bytes, more than the record's {max}")]
+    Oversize { len: usize, max: usize },
+    #[error("value cannot be encoded")]
+    Codec,
+}
+
+/// An error from decoding a record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum DecodeError {
+    #[error("record is shorter than the type")]
+    Truncated,
+    #[error("record bytes do not decode")]
+    Codec,
+}
+
+/// Decoding for frames, whose bytes are the value itself.
+pub mod fixed {
+    use zerocopy::{FromBytes, Immutable, KnownLayout};
+
+    use super::DecodeError;
+
+    /// Borrows the start of `bytes` as a `T`.
+    ///
+    /// Extra trailing bytes are ignored.
+    pub fn decode<T: FromBytes + KnownLayout + Immutable>(bytes: &[u8]) -> Result<&T, DecodeError> {
+        T::ref_from_prefix(bytes)
+            .map(|(value, _)| value)
+            .map_err(|_| DecodeError::Truncated)
+    }
+}
+
+/// Encoding for records stored as postcard.
+pub mod postcard {
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+
+    use super::{DecodeError, EncodeError};
+
+    /// Serializes `value` into `buf` and returns the bytes it wrote.
+    pub fn encode<'a, T: Serialize + ?Sized>(
+        value: &T,
+        buf: &'a mut [u8],
+    ) -> Result<&'a [u8], EncodeError> {
+        let max = buf.len();
+        match ::postcard::to_slice(value, buf) {
+            Ok(used) => Ok(used),
+            Err(::postcard::Error::SerializeBufferFull) => {
+                Err(::postcard::experimental::serialized_size(value)
+                    .map_or(EncodeError::Codec, |len| EncodeError::Oversize { len, max }))
+            }
+            Err(_) => Err(EncodeError::Codec),
+        }
+    }
+
+    /// Deserializes one value from `bytes`.
+    pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DecodeError> {
+        ::postcard::from_bytes(bytes).map_err(|_| DecodeError::Codec)
+    }
+}
+
+/// Encoding for records stored as JSON.
+pub mod json {
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+
+    use super::{DecodeError, EncodeError};
+
+    /// Serializes `value` into `buf` and returns the bytes it wrote.
+    pub fn encode<'a, T: Serialize + ?Sized>(
+        value: &T,
+        buf: &'a mut [u8],
+    ) -> Result<&'a [u8], EncodeError> {
+        let max = buf.len();
+        let mut out = Buffer { bytes: buf, len: 0 };
+        serde_json::to_writer(&mut out, value).map_err(|_| EncodeError::Codec)?;
+        let len = out.len;
+        if len > max {
+            return Err(EncodeError::Oversize { len, max });
+        }
+        Ok(&buf[..len])
+    }
+
+    /// A writer that measures the full encoding but keeps only what fits.
+    struct Buffer<'a> {
+        bytes: &'a mut [u8],
+        len: usize,
+    }
+
+    impl std::io::Write for Buffer<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let start = self.len.min(self.bytes.len());
+            let copied = bytes.len().min(self.bytes.len() - start);
+            self.bytes[start..start + copied].copy_from_slice(&bytes[..copied]);
+            self.len = self.len.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Deserializes one value from `bytes`.
+    pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DecodeError> {
+        serde_json::from_slice(bytes).map_err(|_| DecodeError::Codec)
+    }
+}
+
+/// The payload of a dynamic port: raw bytes, passed through undecoded.
+///
+/// A dynamic port announces the schema of whatever record the config connects
+/// to it.
+pub type Bytes = [u8];
+
+impl Payload for Bytes {
+    type Read<'a> = &'a [u8];
+
+    fn encode<'a>(&'a self, _buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
+        Ok(self)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<&[u8], DecodeError> {
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use metor_proto::types::ComponentId;
+    use serde::{Deserialize, Serialize};
+    use zerocopy::IntoBytes;
+
+    use super::*;
+    use crate::MaxSize;
+    use crate::tests::utils::{BareName, Fixed, Imu, Note};
+
+    /// A message whose codec is JSON, written by hand as a pack author would.
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct NoteJson {
+        text: String,
+    }
+
+    impl Payload for NoteJson {
+        type Read<'a> = Self;
+
+        fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
+            json::encode(self, buf)
+        }
+
+        fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+            json::decode(bytes)
+        }
+    }
+
+    impl Record for NoteJson {
+        const NAME: &'static str = "note_json";
+        const MAX_LEN: usize = 64;
+
+        fn schema_with_root(_root: &str) -> RecordSchema {
+            RecordSchema::msg(Self::NAME, MsgCodec::Json)
+        }
+    }
+
+    fn component_names(schema: &RecordSchema) -> Vec<&str> {
+        let RecordSchema::Frame { metadata, .. } = schema else {
+            panic!("a frame announces a vtable")
+        };
+        metadata.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    #[test]
+    fn test_frame_schema_with_root() {
+        let schema = Imu::schema_with_root("cube_sat.plant.imu");
+        assert_eq!(component_names(&schema), vec!["cube_sat.plant.imu.sample"]);
+        let RecordSchema::Frame { vtable, metadata } = &schema else {
+            panic!("a frame announces a vtable")
+        };
+        let leaf = ComponentId::new("cube_sat.plant.imu.sample");
+        assert_eq!(metadata[0].component_id, leaf);
+        assert!(vtable.data.windows(8).any(|w| w == leaf.0.to_le_bytes()));
+        assert_ne!(schema.packet_id(), Imu::schema().packet_id());
+    }
+
+    #[test]
+    fn test_layout() {
+        assert!(Imu::layout().is_some());
+        assert_ne!(Imu::layout(), BareName::layout());
+        assert_eq!(Note::layout(), None);
+        assert_eq!(NoteJson::layout(), None);
+    }
+
+    #[test]
+    fn test_message_schema_ignores_root() {
+        assert_eq!(Note::schema_with_root("cube_sat.note"), Note::schema());
+    }
+
+    #[test]
+    fn test_bytes_pass_through() {
+        let bytes: &Bytes = b"raw";
+        assert_eq!(bytes.encode(&mut []), Ok(b"raw".as_slice()));
+        assert_eq!(<Bytes as Payload>::decode(b""), Ok(b"".as_slice()));
+        assert_eq!(bytes.timestamp(), None);
+    }
+
+    #[test]
+    fn test_frame_schema_paths() {
+        let schema = Imu::schema();
+        assert_eq!(component_names(&schema), vec!["imu.sample"]);
+        let RecordSchema::Frame { vtable, metadata } = &schema else {
+            panic!("a frame announces a vtable")
+        };
+        assert_eq!(metadata[0].component_id, ComponentId::new("imu.sample"));
+        // The sample plus the timestamp the derive applies to it.
+        assert_eq!(vtable.fields.len(), 1);
+        assert!(
+            vtable
+                .ops
+                .iter()
+                .any(|op| matches!(op, metor_proto::vtable::Op::Timestamp { .. }))
+        );
+    }
+
+    #[test]
+    fn test_derived_postcard_schema() {
+        let schema = Fixed::schema();
+        let RecordSchema::Msg { id, name, codec } = &schema else {
+            panic!("a message announces an id")
+        };
+        assert_eq!(*id, <Fixed as metor_proto::types::Msg>::ID);
+        assert_eq!(name, "fixed");
+        assert!(matches!(codec, MsgCodec::Postcard(ty) if ty.name == "Fixed"));
+        assert_eq!(schema.packet_id(), *id);
+        assert_ne!(schema, Note::schema());
+    }
+
+    #[test]
+    fn test_json_record_roundtrip_and_schema() {
+        let mut buf = [0u8; 64];
+        let note = NoteJson { text: "hi".into() };
+        let bytes = note.encode(&mut buf).expect("fits");
+        assert_eq!(bytes, br#"{"text":"hi"}"#);
+        assert_eq!(NoteJson::decode(bytes), Ok(note));
+        assert_eq!(
+            NoteJson::schema(),
+            RecordSchema::Msg {
+                id: msg_id("note_json"),
+                name: "note_json".into(),
+                codec: MsgCodec::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn test_json_oversize_error() {
+        let mut buf = [0u8; 8];
+        let note = NoteJson {
+            text: "0123456789".into(),
+        };
+        assert_eq!(
+            note.encode(&mut buf),
+            Err(EncodeError::Oversize { len: 21, max: 8 })
+        );
+        assert_eq!(NoteJson::decode(b"not json"), Err(DecodeError::Codec));
+    }
+
+    #[test]
+    fn test_json_escape_lengths() {
+        let text = "\"\n";
+        let mut exact = [0; 6];
+        assert_eq!(
+            json::encode(&text, &mut exact),
+            Ok(b"\"\\\"\\n\"".as_slice())
+        );
+        assert_eq!(
+            json::encode(&text, &mut []),
+            Err(EncodeError::Oversize { len: 6, max: 0 })
+        );
+    }
+
+    #[test]
+    fn test_derived_message_metadata() {
+        assert_eq!(Fixed::NAME, "fixed");
+        assert_eq!(Fixed::MAX_LEN, Fixed::POSTCARD_MAX_SIZE);
+        assert_eq!(Fixed::DEPTH, 1);
+        assert_eq!(Note::NAME, "note");
+        assert_eq!(Note::MAX_LEN, 64);
+        assert_eq!(Note::DEPTH, 4);
+    }
+
+    #[test]
+    fn test_message_roundtrip() {
+        let mut buf = [0u8; 64];
+        let value = Fixed { a: 7, b: 2.5 };
+        let bytes = value.encode(&mut buf).expect("fits");
+        assert!(bytes.len() <= Fixed::MAX_LEN);
+        assert_eq!(Fixed::decode(bytes), Ok(value));
+    }
+
+    #[test]
+    fn test_message_oversize_error() {
+        let mut buf = [0u8; 8];
+        let note = Note {
+            text: "0123456789".into(),
+        };
+        assert_eq!(
+            note.encode(&mut buf),
+            Err(EncodeError::Oversize { len: 11, max: 8 })
+        );
+    }
+
+    #[test]
+    fn test_message_invalid_bytes() {
+        assert_eq!(Fixed::decode(&[0xff; 3]), Err(DecodeError::Codec));
+    }
+
+    #[test]
+    fn test_frame_encoding() {
+        let imu = Imu::new(3, 1.5);
+        let mut buf = [0xaau8; 4];
+        let bytes = imu.encode(&mut buf).expect("frames always encode");
+        assert_eq!(bytes, imu.as_bytes());
+        assert_eq!(buf, [0xaa; 4]);
+    }
+
+    #[test]
+    fn test_frame_decode_and_truncation() {
+        let imu = Imu::new(3, 1.5);
+        assert_eq!(Imu::decode(imu.as_bytes()), Ok(&imu));
+        assert_eq!(
+            Imu::decode(&imu.as_bytes()[..4]),
+            Err(DecodeError::Truncated)
+        );
+    }
+}
