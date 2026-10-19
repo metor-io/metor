@@ -49,7 +49,7 @@ fn exiting_menu_releases_pointer_input_and_does_not_steal_new_focus(cx: &mut gpu
             inspector.fade.finish();
             inspector
         });
-        inspector.focus_handle(cx).focus(window);
+        inspector.focus_handle(cx).focus(window, cx);
         Host {
             inspector,
             focus,
@@ -78,7 +78,7 @@ fn exiting_menu_releases_pointer_input_and_does_not_steal_new_focus(cx: &mut gpu
             host.focus = focus.clone();
             cx.notify();
         });
-        focus.focus(window);
+        focus.focus(window, cx);
         focus
     });
     cx.refresh().unwrap();

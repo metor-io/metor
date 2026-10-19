@@ -213,7 +213,7 @@ impl Render for LogView {
             );
         }
 
-        header = header.child(div().flex_grow()).child(
+        header = header.child(div().flex_grow_1()).child(
             div()
                 .id("log-follow")
                 .px_2()

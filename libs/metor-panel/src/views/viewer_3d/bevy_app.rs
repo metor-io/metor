@@ -54,7 +54,7 @@ pub(super) fn build_app() -> SubApps {
     app.add_plugins(
         DefaultPlugins
             .set(RenderPlugin {
-                render_creation: RenderCreation::Manual(render_resources),
+                render_creation: RenderCreation::Manual(Box::new(render_resources)),
                 synchronous_pipeline_compilation: true,
                 ..default()
             })

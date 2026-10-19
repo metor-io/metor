@@ -86,10 +86,6 @@ impl FilterBar {
         cx.notify();
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus_handle);
-    }
-
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -99,7 +95,7 @@ impl FilterBar {
         match event.keystroke.key.as_str() {
             "escape" => {
                 self.clear(cx);
-                window.focus(&self.parent_focus);
+                window.focus(&self.parent_focus, cx);
             }
             "enter" | "return" => cx.emit(FilterBarEvent::Submitted),
             _ => {
@@ -171,7 +167,7 @@ impl Render for FilterBar {
                     .child(Icon::Close.svg_color(9.0, theme.text_secondary))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.clear(cx);
-                        window.focus(&this.parent_focus);
+                        window.focus(&this.parent_focus, cx);
                         cx.stop_propagation();
                     }))
             }))

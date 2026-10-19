@@ -2,7 +2,7 @@ use super::*;
 use crate::plot_events::flags::{ClusterPaint, paint_event_flags};
 use crate::views::plot_common::paint_text_label;
 use crate::views::table::{CELL_FONT_SIZE, CELL_PAD_X, HEADER_HEIGHT, ROW_HEIGHT};
-use gpui::{BorderStyle, fill, point, quad, size};
+use gpui::{BorderStyle, TextAlign, fill, point, quad, size};
 
 /// Painted geometry is also the hit target, including the entire truncated chip.
 pub(super) struct EventHit {
@@ -415,5 +415,12 @@ fn paint_table_label(
     let shaped = window
         .text_system()
         .shape_line(text, font_size, &[run], None);
-    let _ = shaped.paint(origin(shaped.width, font_size), font_size, window, cx);
+    let _ = shaped.paint(
+        origin(shaped.width, font_size),
+        font_size,
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
 }

@@ -110,6 +110,7 @@ impl GpuContext {
                     power_preference,
                     compatible_surface: None,
                     force_fallback_adapter,
+                    apply_limit_buckets: false,
                 })
                 .await
             {

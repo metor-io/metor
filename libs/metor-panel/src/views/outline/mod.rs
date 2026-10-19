@@ -130,7 +130,7 @@ impl ComponentOutline {
         let visible = !self.filter_visible;
         self.set_filter_visible(visible, cx);
         if visible {
-            self.filter.read(cx).focus(window);
+            self.filter.focus_handle(cx).focus(window, cx);
         }
     }
 

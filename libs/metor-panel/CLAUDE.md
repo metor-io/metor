@@ -19,7 +19,7 @@ Run from the workspace root (`/Users/sphw/code/metor/metor`) — this is a membe
 - Run a single test: `cargo test -p metor-panel <test_name>` (e.g. `cargo test -p metor-panel tiles::tests::`)
 - Lint: `cargo clippy -p metor-panel`
 
-The workspace pins `rustc 1.94.0` (`rust-toolchain.toml`). The `facet` family of crates is patched to a fork (`metor-io/facet`, branch `sphw/facet-gpui`) — see the workspace `[patch.crates-io]` block. Don't bump those past the pinned 0.44.x versions without coordinating the patch chain.
+The workspace pins `rustc 1.98.0` (`rust-toolchain.toml`). The `facet` family of crates is patched to a fork (`metor-io/facet`, branch `sphw/facet-gpui`) — see the workspace `[patch.crates-io]` block. Don't bump those past the pinned 0.44.x versions without coordinating the patch chain.
 
 ## Architecture
 
@@ -81,4 +81,10 @@ The crate-wide `#![allow(clippy::arc_with_non_send_sync, clippy::type_complexity
 
 ## gpui
 
-gpui sources for this checkout live at `/Users/sphw/code/os/zed/crates/gpui` — read them when behavior is unclear. gpui is single-threaded by design; that's why `Arc<dyn Fn + 'static>` is everywhere instead of `Rc`.
+gpui and `gpui_platform` come from Zed's git repo at a pinned `rev` (crates.io stopped at 0.2.2), declared in the workspace `[workspace.dependencies]`. A matching `gpui` entry in the workspace `[patch.crates-io]` makes the facet fork's `gpui = "*"` resolve to the same crate, and the `async-task`/`calloop`/`khronos-egl` patches are copied from Zed's root `Cargo.toml` because Zed's own patches don't reach dependents. Bump all of these together, and recheck Zed's patch block when you do. The app boots through `gpui_platform::application()`.
+
+gpui sources live at `/Users/sphw/code/os/zed/crates/gpui` (check out the pinned rev), and the exact sources being built are under `~/.cargo/git/checkouts/zed-*/<rev>/crates/gpui` — read them when behavior is unclear. gpui is single-threaded by design; that's why `Arc<dyn Fn + 'static>` is everywhere instead of `Rc`.
+
+### wgpu and Bevy
+
+The panel's wgpu (`gpu_context.rs` shares one instance/adapter/device/queue between the plot renderers and Bevy via `RenderCreation::Manual`) must be the exact wgpu Bevy is built on, so `wgpu` in this crate's `Cargo.toml` tracks the major version of the pinned Bevy git `rev`, and `glam` tracks Bevy's glam. Bevy and the panel use crates.io wgpu 30.0.x. On macOS gpui renders through Metal directly, so the build has one wgpu. On Linux gpui renders through `gpui_wgpu`, which Zed pins to a gfx-rs git rev (see `wgpu` in Zed's root `Cargo.toml` at the gpui rev), so Linux builds carry a second wgpu/naga stack. That's harmless because gpui never shares a device with the panel. Routing crates.io wgpu to Zed's rev with `[patch.crates-io]` would collapse the two, but today it fails inside Bevy (`bevy_mesh` matches exhaustively on `VertexFormat`) and in `naga_oil` (naga IR changes), so retry it only once a Bevy and naga_oil release support that rev. When bumping, move the Bevy `rev`, `wgpu` and `glam` together, check `cargo tree -d -e normal --target x86_64-unknown-linux-gnu | grep -E '^(wgpu|naga)'`, and when the gpui rev moves, check whether Zed's wgpu rev has become a published release Bevy can share.

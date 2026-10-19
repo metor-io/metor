@@ -286,7 +286,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
         let visible = !self.filter_visible();
         self.set_filter_visible(visible, cx);
         if visible && let Some(bar) = &self.filter {
-            bar.read(cx).focus(window);
+            bar.focus_handle(cx).focus(window, cx);
         }
     }
 
@@ -590,7 +590,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    window.focus(&focus);
+                    window.focus(&focus, cx);
                     this.delegate.set_selection(column_ix, &item_left, cx);
                     this.focused_column = column_ix;
                     if event.click_count == 2 {
@@ -700,14 +700,14 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
                 },
             ),
         )
-        .track_scroll(scroll_handle)
+        .track_scroll(&scroll_handle)
         .h_full();
 
         let scrollbar_overlay = {
             let state = scrollbar_handle.0.borrow();
             let offset = state.base_handle.offset();
             let max_off = state.base_handle.max_offset();
-            let max_y = f32::from(max_off.height);
+            let max_y = f32::from(max_off.y);
             let scroll_y = f32::from(-offset.y).clamp(0.0, max_y);
             let vp = f32::from(state.base_handle.bounds().size.height);
             let vp = if vp > 0.0 {
@@ -859,7 +859,7 @@ impl<D: ColumnBrowserDelegate> Render for ColumnBrowser<D> {
             let offset = self.hscroll.offset();
             let max_off = self.hscroll.max_offset();
             let vp = f32::from(self.hscroll.bounds().size.width);
-            let max_x = f32::from(max_off.width);
+            let max_x = f32::from(max_off.x);
             if max_x > 0.0 && vp > 0.0 {
                 let scroll_x = f32::from(-offset.x).clamp(0.0, max_x);
                 Some(

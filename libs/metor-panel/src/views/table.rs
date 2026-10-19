@@ -591,7 +591,7 @@ impl<D: TableDelegate> Render for Table<D> {
                 },
             ),
         )
-        .track_scroll(scroll_handle)
+        .track_scroll(&scroll_handle)
         .flex_1();
 
         let mut inner = div()
@@ -616,7 +616,7 @@ impl<D: TableDelegate> Render for Table<D> {
             let state = scrollbar_handle.0.borrow();
             let offset = state.base_handle.offset();
             let max_off = state.base_handle.max_offset();
-            let max_y = f32::from(max_off.height);
+            let max_y = f32::from(max_off.y);
             let scroll_y = f32::from(-offset.y).clamp(0.0, max_y);
             let vp = f32::from(state.base_handle.bounds().size.height);
             let vp = if vp > 0.0 {
@@ -639,7 +639,7 @@ impl<D: TableDelegate> Render for Table<D> {
             let offset = hscroll_indicator.offset();
             let max_off = hscroll_indicator.max_offset();
             let vp = f32::from(hscroll_indicator.bounds().size.width);
-            let max_x = f32::from(max_off.width);
+            let max_x = f32::from(max_off.x);
             if max_x > 0.0 && vp > 0.0 {
                 let scroll_x = f32::from(-offset.x).clamp(0.0, max_x);
                 Some(

@@ -851,7 +851,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
                 },
             ),
         )
-        .track_scroll(scroll_handle)
+        .track_scroll(&scroll_handle)
         .h_full();
 
         Some(

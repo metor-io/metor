@@ -134,7 +134,7 @@ impl ConnectionPicker {
         }
         self.dismissed = true;
         if let Some(parent) = &self.parent_focus {
-            window.focus(parent);
+            window.focus(parent, cx);
         }
     }
 
@@ -243,7 +243,7 @@ impl ConnectionPicker {
             insp.set_parent_focus(parent_focus);
             insp
         });
-        inspector.focus_handle(cx).focus(window);
+        inspector.focus_handle(cx).focus(window, cx);
         self.phase = Phase::Options { target, inspector };
     }
 
@@ -920,7 +920,7 @@ impl ConnectionPicker {
             }
         })
         .detach();
-        picker.focus_handle(cx).focus(window);
+        picker.focus_handle(cx).focus(window, cx);
         self.storage_picker = Some(picker);
         cx.notify();
     }
@@ -1094,7 +1094,7 @@ impl ConnectionPicker {
 
     fn leave_options(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.phase = Phase::Browse;
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 

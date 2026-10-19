@@ -3,7 +3,8 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use gpui::{
-    Context, IntoElement, Render, SharedString, TextRun, Window, canvas, point, prelude::*, px,
+    Context, IntoElement, Render, SharedString, TextAlign, TextRun, Window, canvas, point,
+    prelude::*, px,
 };
 
 const TEXTURE_SIZE: usize = 306;
@@ -84,7 +85,7 @@ impl Render for AsciiLogo {
                                 + (cell_width - shaped.width) / 2.,
                             line_height * (index / COLUMNS) as f32,
                         );
-                    let _ = shaped.paint(position, line_height, window, cx);
+                    let _ = shaped.paint(position, line_height, TextAlign::Left, None, window, cx);
                 }
             },
         )

@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, AnyView, App, Bounds, Context, Corner, FocusHandle, Focusable, IntoElement,
+    Anchor, AnyElement, AnyView, App, Bounds, Context, FocusHandle, Focusable, IntoElement,
     KeyDownEvent, Pixels, Point, Render, ScrollStrategy, SharedString, Size,
     UniformListScrollHandle, Window, anchored, canvas, deferred, div, prelude::*, px, uniform_list,
 };
@@ -290,9 +290,9 @@ impl Inspector {
         }
         if self.focus_handle.contains_focused(window, cx) {
             if let Some(parent) = &self.parent_focus {
-                parent.focus(window);
+                parent.focus(window, cx);
             } else {
-                window.blur();
+                window.blur(cx);
             }
         }
         cx.notify();
@@ -608,7 +608,7 @@ impl Inspector {
         let key = event.keystroke.key.as_str();
         if event.keystroke.modifiers.alt && key == "t" {
             if let Some(accessory) = &self.accessory {
-                accessory.focus.focus(window);
+                accessory.focus.focus(window, cx);
             }
             cx.stop_propagation();
             return;
@@ -905,7 +905,7 @@ impl Inspector {
             .rounded(px(4.0))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "tab" {
-                    this.focus_handle.focus(window);
+                    this.focus_handle.focus(window, cx);
                     cx.stop_propagation();
                 } else {
                     this.handle_key_down(event, window, cx);
@@ -1069,7 +1069,7 @@ impl Inspector {
                         },
                     ),
                 )
-                .track_scroll(scroll_handle)
+                .track_scroll(&scroll_handle)
                 .h(px(items_h))
                 .into_any_element()
             }
@@ -1208,7 +1208,7 @@ impl Render for Inspector {
                     ));
                     let anchored_panel = anchored()
                         .position(position)
-                        .anchor(Corner::TopLeft)
+                        .anchor(Anchor::TopLeft)
                         .snap_to_window_with_margin(px(8.0))
                         .child(panel);
                     div()
@@ -1223,7 +1223,7 @@ impl Render for Inspector {
                 } else {
                     anchored()
                         .position(position)
-                        .anchor(Corner::TopLeft)
+                        .anchor(Anchor::TopLeft)
                         .snap_to_window_with_margin(px(8.0))
                         .child(panel)
                         .into_any_element()
@@ -1392,6 +1392,7 @@ mod temporal_tests {
                         KeyDownEvent {
                             keystroke,
                             is_held: false,
+                            prefer_character_input: false,
                         }
                     };
                     i.search.set_text("last 2.5");
@@ -1431,6 +1432,7 @@ mod temporal_tests {
                         &KeyDownEvent {
                             keystroke: gpui::Keystroke::parse("escape").unwrap(),
                             is_held: false,
+                            prefer_character_input: false,
                         },
                         window,
                         cx,

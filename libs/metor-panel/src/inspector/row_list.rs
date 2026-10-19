@@ -78,7 +78,7 @@ impl RowList {
                     field,
                     on_commit: Some(on_commit),
                 });
-                self.focus_handle.focus(window);
+                self.focus_handle.focus(window, cx);
                 cx.notify();
             }
             // Cascade-out: pop the standard `Inspector` overlay with the

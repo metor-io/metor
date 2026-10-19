@@ -650,7 +650,7 @@ impl Render for SpectrogramPlot {
             },
             |_, (bounds, frame): (Bounds<Pixels>, Option<Arc<gpui::RenderImage>>), window, _cx| {
                 if let Some(img) = frame {
-                    let _ = window.paint_image(bounds, Corners::default(), img, 0, false);
+                    let _ = window.paint_image(bounds, bounds, Corners::default(), img, 0, false);
                 }
             },
         )

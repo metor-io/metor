@@ -251,7 +251,7 @@ impl Render for SequenceView {
         }
 
         header = header
-            .child(div().flex_grow())
+            .child(div().flex_grow_1())
             .child(
                 div()
                     .id("seq-reload")
@@ -295,7 +295,7 @@ impl Render for SequenceView {
             .id("seq-list")
             .flex()
             .flex_col()
-            .flex_grow()
+            .flex_grow_1()
             .overflow_y_scroll();
 
         match &store {
@@ -471,7 +471,7 @@ impl SequenceView {
                 div()
                     .flex()
                     .flex_col()
-                    .flex_grow()
+                    .flex_grow_1()
                     .child(div().text_color(theme.text_primary).child(ch.name.clone()))
                     .child(
                         div()
@@ -568,7 +568,7 @@ fn history_row(entry: HistoryRow, theme: &crate::theme::Theme) -> AnyElement {
         )
         .child(
             div()
-                .flex_grow()
+                .flex_grow_1()
                 .text_color(color)
                 .text_size(px(12.0))
                 .child(entry.label),

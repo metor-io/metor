@@ -140,7 +140,7 @@ impl BevyBridge {
                 })
                 .await;
 
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 cx.update_global::<BevyBridge, _>(|bridge, _| {
                     bridge.restore_app(app);
                 });

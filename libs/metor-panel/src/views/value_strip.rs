@@ -422,7 +422,7 @@ impl ComponentValueStrip {
             field,
             error: false,
         });
-        self.focus.focus(window);
+        self.focus.focus(window, cx);
         cx.notify();
     }
 

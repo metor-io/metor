@@ -70,9 +70,9 @@ impl Transient {
         self.fade.exit(motion::PALETTE_EXIT);
         if self.focus_handle.contains_focused(window, cx) {
             if let Some(parent) = &self.parent_focus {
-                parent.focus(window);
+                parent.focus(window, cx);
             } else {
-                window.blur();
+                window.blur(cx);
             }
         }
         cx.notify();

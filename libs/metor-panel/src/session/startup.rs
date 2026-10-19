@@ -82,7 +82,7 @@ pub(crate) fn open(mut app: PanelApp, path: Option<PathBuf>, cx: &mut App) {
         let picker = cx.new(|cx| {
             crate::connections::ConnectionPicker::for_startup(store, startup.clone(), cx)
         });
-        picker.focus_handle(cx).focus(window);
+        picker.focus_handle(cx).focus(window, cx);
         let weak = startup.downgrade();
         cx.on_app_quit(move |cx| {
             let _ = weak.update(cx, |picker, _| {
@@ -191,7 +191,9 @@ impl SessionStartup {
         });
         cx.spawn_in(window, async move |this, cx| {
             loop {
-                gpui::Timer::after(std::time::Duration::from_millis(100)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
                 let keep_polling = this
                     .update_in(cx, |this, window, cx| {
                         let Some(opening) = &mut this.opening else {
