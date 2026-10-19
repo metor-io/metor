@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::coordinator::{OutputSource, SystemTable};
 use crate::dl::SLOT_TYPE;
@@ -37,7 +38,11 @@ pub const LOOPBACK: &str = "127.0.0.1";
 enum DeployParams {
     Link(Part<LinkPart>),
     Slot(DeploySlot),
-    Other,
+    /// Any other system, and the address it listens on, if it has a
+    /// top-level `listen` param.
+    Other {
+        listen: Option<String>,
+    },
 }
 
 impl DeployParams {
@@ -50,7 +55,23 @@ impl DeployParams {
         match system.ty.as_str() {
             ty if LINK_TYPES.contains(&ty) => Part::read(system).map(Self::Link),
             SLOT_TYPE => DeploySlot::read(envelope, index, system).map(Self::Slot),
-            _ => Ok(Self::Other),
+            _ => {
+                let listen = system.params.get("listen").and_then(Value::as_str);
+                let listen = listen.map(str::to_string);
+                Ok(Self::Other { listen })
+            }
+        }
+    }
+
+    /// The address the system listens on, if it listens.
+    fn listen(&self) -> Option<&str> {
+        match self {
+            Self::Link(params) => match &params.part.transport {
+                DeployTransport::Runtime(Transport::Listen { addr, .. }) => Some(addr),
+                _ => None,
+            },
+            Self::Other { listen } => listen.as_deref(),
+            Self::Slot(_) => None,
         }
     }
 }
@@ -69,16 +90,23 @@ pub struct Pending {
 /// Returns an error if a link's or a slot's params do not decode.
 pub fn pending(envelope: &DeploymentConfig) -> Result<Option<Pending>, DeployError> {
     let mut pending = Pending {
-        links: Links(HashMap::new()),
+        links: Links {
+            links: HashMap::new(),
+            listen: HashMap::new(),
+        },
         slots: Vec::new(),
     };
     for (index, system) in SystemIndex::iter(envelope) {
-        match DeployParams::read(envelope, index, system)? {
+        let params = DeployParams::read(envelope, index, system)?;
+        if let Some(addr) = params.listen() {
+            pending.links.listen.insert(index, addr.to_string());
+        }
+        match params {
             DeployParams::Link(part) => {
-                pending.links.0.insert(index, part);
+                pending.links.links.insert(index, part);
             }
             DeployParams::Slot(slot) if slot.pending() => pending.slots.push((index, slot)),
-            DeployParams::Slot(_) | DeployParams::Other => {}
+            DeployParams::Slot(_) | DeployParams::Other { .. } => {}
         }
     }
     let peer_output = SystemIndex::iter(envelope).any(|(_, system)| {
@@ -116,7 +144,7 @@ fn resolve_peers(
     check_ports(envelope, &links)?;
     for (index, addr) in plan.transports {
         // PANIC Safety: `plan` only names systems that `links` decoded.
-        let mut params = links.0.remove(&index).expect("a decoded link");
+        let mut params = links.links.remove(&index).expect("a decoded link");
         params.part.transport = DeployTransport::Runtime(Transport::Connect { addr });
         params.write(index.get_mut(envelope))?;
     }
@@ -143,29 +171,29 @@ struct LinkPart {
     transport: DeployTransport,
 }
 
-/// The params of every link in a deployment, decoded once.
-struct Links(HashMap<SystemIndex, Part<LinkPart>>);
+/// The params of every link in a deployment, and the address each system
+/// listens on, decoded once.
+struct Links {
+    links: HashMap<SystemIndex, Part<LinkPart>>,
+    listen: HashMap<SystemIndex, String>,
+}
 
 impl Links {
     fn get(&self, index: SystemIndex) -> Option<&LinkPart> {
-        self.0.get(&index).map(|params| &params.part)
+        self.links.get(&index).map(|params| &params.part)
     }
 
     /// Whether any link dials a peer.
     fn dials_peer(&self) -> bool {
-        self.0
+        self.links
             .values()
             .any(|params| matches!(params.part.transport, DeployTransport::Peer(_)))
     }
 
-    /// The port the link at `index` listens on, unless it is zero or the
-    /// system is no listening link.
+    /// The port the system at `index` listens on, unless it is zero or the
+    /// system does not listen.
     fn fixed_port(&self, index: SystemIndex) -> Option<u16> {
-        let DeployTransport::Runtime(Transport::Listen { addr, .. }) = &self.get(index)?.transport
-        else {
-            return None;
-        };
-        let port: u16 = addr.rsplit_once(':')?.1.parse().ok()?;
+        let port: u16 = self.listen.get(&index)?.rsplit_once(':')?.1.parse().ok()?;
         (port != 0).then_some(port)
     }
 }

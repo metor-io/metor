@@ -1,40 +1,58 @@
 use std::{
+    fmt::Debug,
+    future::Future,
+    ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use metor_proto::{buf::UmbraBuf, types::Timestamp};
 use metor_proto_wkt::MsgMetadata;
 use stellarator::sync::WaitQueue;
+use tracing::warn;
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::{Error, MetadataExt, append_log::AppendLog};
+use crate::{
+    Error, MetadataExt,
+    append_log::AppendLog,
+    arc_ring::{AtomicNode, AtomicStack, AtomicStackIter},
+    disruptor::{ArcAtomic, Disruptor, Reader},
+};
 
 #[derive(Clone)]
 pub struct MsgLog {
-    timestamps: AppendLog<()>,
-    bufs: BufLog,
-    waker: Arc<WaitQueue>,
-    metadata: Option<MsgMetadata>,
+    pub list: Arc<AtomicStack<MsgLogNode>>,
     path: PathBuf,
+    data_waker: Arc<WaitQueue>,
+    metadata: Option<MsgMetadata>,
+    wal: Disruptor,
+    pending: Arc<Mutex<Reader>>,
 }
 
-impl MsgLog {
+#[derive(Clone)]
+pub struct MsgLogNode {
+    pub timestamps: AppendLog<()>,
+    pub bufs: BufLog,
+}
+
+impl Debug for MsgLogNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MsgLogNode").finish()
+    }
+}
+
+impl MsgLogNode {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
         let timestamps = AppendLog::create(path.join("timestamps"), ())?;
         let offsets = AppendLog::create(path.join("offsets"), ())?;
         let data_log = AppendLog::create(path.join("data_log"), ())?;
-        let waker = Arc::new(WaitQueue::new());
-        let time_series = Self {
-            waker,
+        let node = Self {
             timestamps,
             bufs: BufLog { offsets, data_log },
-            metadata: None,
-            path: path.to_path_buf(),
         };
-        Ok(time_series)
+        Ok(node)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
@@ -42,27 +60,38 @@ impl MsgLog {
         let timestamps = AppendLog::open(path.join("timestamps"))?;
         let offsets = AppendLog::open(path.join("offsets"))?;
         let data_log = AppendLog::open(path.join("data_log"))?;
-        let waker = Arc::new(WaitQueue::new());
-        let metadata_path = path.join("metadata");
-        let metadata = if metadata_path.exists() {
-            Some(MsgMetadata::read(metadata_path)?)
-        } else {
-            None
-        };
-        let time_series = Self {
-            waker,
+        let node = Self {
             timestamps,
             bufs: BufLog { offsets, data_log },
-            path: path.to_path_buf(),
-            metadata,
         };
-        Ok(time_series)
+        Ok(node)
     }
 
     pub fn push(&self, timestamp: Timestamp, msg: &[u8]) -> Result<(), Error> {
+        // Check if timestamp is greater than the last timestamp to ensure ordering
+        let len = self.timestamps.len() as usize;
+        if len > 0 {
+            let last_timestamp = self
+                .timestamps
+                .get(len - size_of::<i64>()..len)
+                .expect("couldn't find last timestamp");
+            let last_timestamp = Timestamp::from_le_bytes(
+                last_timestamp
+                    .try_into()
+                    .expect("last_timestamp was wrong size"),
+            );
+            if last_timestamp > timestamp {
+                warn!(?last_timestamp, ?timestamp, "time travel");
+                return Err(Error::TimeTravel);
+            }
+        }
+
+        // Insert message into buffer log
         self.bufs.insert_msg(msg)?;
+
+        // Always write timestamp last for consistent reads
         self.timestamps.write(&timestamp.to_le_bytes())?;
-        self.waker.wake_all();
+
         Ok(())
     }
 
@@ -71,75 +100,15 @@ impl MsgLog {
             .expect("mmep unaligned")
     }
 
-    pub fn get(&self, timestamp: Timestamp) -> Option<&[u8]> {
-        let timestamps = self.timestamps();
-        let i = timestamps.binary_search(&timestamp).ok()?;
-        self.bufs.get_msg(i)
-    }
-
-    pub fn get_nearest(&self, timestamp: Timestamp) -> Option<(Timestamp, &[u8])> {
-        let timestamps = self.timestamps();
-        let i = match timestamps.binary_search(&timestamp) {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        };
-        let timestamp = timestamps.get(i)?;
-        let buf = self.bufs.get_msg(i)?;
-        Some((*timestamp, buf))
-    }
-
-    pub fn latest(&self) -> Option<(Timestamp, &[u8])> {
-        let timestamps = self.timestamps();
-        let i = timestamps.len().saturating_sub(1);
-        let timestamp = timestamps.get(i)?;
-        let buf = self.bufs.get_msg(i)?;
-        Some((*timestamp, buf))
-    }
-
-    pub fn get_range(
-        &self,
-        range: std::ops::Range<Timestamp>,
-    ) -> impl Iterator<Item = (Timestamp, &[u8])> {
-        let timestamps = self.timestamps();
-        let start_index = match timestamps.binary_search(&range.start) {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        };
-        let end_index = match timestamps.binary_search(&range.end) {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        };
-        (start_index..=end_index).flat_map(|i| {
-            let timestamp = timestamps.get(i)?;
-            let buf = self.bufs.get_msg(i)?;
-            Some((*timestamp, buf))
-        })
-    }
-
-    pub async fn wait(&self) {
-        let _ = self.waker.wait().await;
-    }
-
-    pub fn waiter(&self) -> Arc<WaitQueue> {
-        self.waker.clone()
-    }
-
-    pub fn set_metadata(&mut self, metadata: MsgMetadata) -> Result<(), Error> {
-        let metadata = self.metadata.insert(metadata);
-        let metadata_path = self.path.join("metadata");
-        metadata.write(&metadata_path)?;
-        Ok(())
-    }
-
-    pub fn metadata(&self) -> Option<&MsgMetadata> {
-        self.metadata.as_ref()
+    pub fn msg_count(&self) -> usize {
+        self.timestamps.len() as usize / size_of::<Timestamp>()
     }
 }
 
 #[derive(Clone)]
-struct BufLog {
-    offsets: AppendLog<()>,
-    data_log: AppendLog<()>,
+pub struct BufLog {
+    pub(crate) offsets: AppendLog<()>,
+    pub(crate) data_log: AppendLog<()>,
 }
 
 impl BufLog {
@@ -173,4 +142,397 @@ impl BufLog {
         self.offsets.write(buf.as_bytes())?;
         Ok(())
     }
+}
+
+#[derive(Clone)]
+pub struct MsgRef {
+    node: Arc<AtomicNode<MsgLogNode>>,
+    timestamp: Timestamp,
+    index: usize,
+}
+
+pub struct MsgLogNodeSlice {
+    node: Arc<AtomicNode<MsgLogNode>>,
+    range: std::ops::RangeInclusive<usize>,
+}
+
+impl MsgLogNodeSlice {
+    pub fn timestamps(&self) -> &[Timestamp] {
+        let start: usize = *self.range.start();
+        let mut end = *self.range.end();
+        if end >= self.node.timestamps().len() {
+            end = self.node.timestamps().len().saturating_sub(1);
+        }
+        &self.node.timestamps()[start..=end]
+    }
+
+    pub fn msgs(&self) -> impl Iterator<Item = (Timestamp, &[u8])> + '_ {
+        let start = *self.range.start();
+        let end = (*self.range.end()).min(self.node.timestamps().len().saturating_sub(1));
+
+        (start..=end).filter_map(move |i| {
+            let timestamp = self.node.timestamps().get(i)?;
+            let msg = self.node.bufs.get_msg(i)?;
+            Some((*timestamp, msg))
+        })
+    }
+}
+
+pub struct MsgLogSlice {
+    start: MsgRef,
+    end: MsgRef,
+}
+
+impl MsgLogSlice {
+    /// Per-node slices of the range, newest first. The node list's links
+    /// only run newer → older, so iteration seeds from the range's newest
+    /// node (`end`) and stops once the oldest (`start`) has been yielded —
+    /// seeding from `start` can never reach the newer nodes that hold the
+    /// rest of the range.
+    pub fn as_iter(&self) -> impl Iterator<Item = MsgLogNodeSlice> + '_ {
+        let iter: AtomicStackIter<MsgLogNode> =
+            AtomicStackIter::new(ArcAtomic::from(self.end.node.clone()));
+        let mut done = false;
+        iter.map_while(move |node| {
+            if done {
+                return None;
+            }
+            let is_start = Arc::ptr_eq(&node, &self.start.node);
+            done = is_start;
+            let start = if is_start { self.start.index } else { 0 };
+            let end = if Arc::ptr_eq(&node, &self.end.node) {
+                self.end.index
+            } else {
+                node.msg_count().saturating_sub(1)
+            };
+            Some(MsgLogNodeSlice {
+                range: start..=end,
+                node,
+            })
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_iter().map(|node| node.timestamps().len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl MsgRef {
+    pub fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    pub fn data(&self) -> Option<&[u8]> {
+        self.node.bufs.get_msg(self.index)
+    }
+}
+
+impl MsgLog {
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        let wal = Disruptor::new(1024 * 1024);
+        let pending = Arc::new(Mutex::new(wal.reader()));
+        let this = Self {
+            list: Arc::new(AtomicStack::new()),
+            path: path.to_path_buf(),
+            data_waker: Arc::new(WaitQueue::new()),
+            metadata: None,
+            wal,
+            pending,
+        };
+        stellarator::spawn(this.clone().persist());
+        Ok(this)
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        let list = Arc::new(AtomicStack::new());
+        let metadata_path = path.join("metadata");
+        let metadata = if metadata_path.exists() {
+            Some(MsgMetadata::read(metadata_path)?)
+        } else {
+            None
+        };
+
+        for node_path in crate::time_series::node_dirs_oldest_first(path)? {
+            match MsgLogNode::open(&node_path) {
+                Ok(node) => {
+                    list.push(node);
+                }
+                Err(e) => {
+                    warn!(?node_path, ?e, "failed to open msg log node");
+                }
+            }
+        }
+
+        let wal = Disruptor::new(1024 * 1024);
+        let pending = Arc::new(Mutex::new(wal.reader()));
+        let this = Self {
+            list,
+            path: path.to_path_buf(),
+            data_waker: Arc::new(WaitQueue::new()),
+            metadata,
+            wal,
+            pending,
+        };
+        stellarator::spawn(this.clone().persist());
+        Ok(this)
+    }
+
+    pub fn push(&self, timestamp: Timestamp, msg: &[u8]) -> Result<(), Error> {
+        let grant_size = size_of::<Timestamp>() + size_of::<u32>() + msg.len();
+
+        let Ok(mut grant) = self.wal.try_grant(grant_size) else {
+            // WAL is full, could handle this differently (wait, error, etc.)
+            return Err(Error::MapOverflow);
+        };
+
+        let mut offset = 0;
+
+        // Write timestamp
+        grant[offset..offset + size_of::<Timestamp>()].copy_from_slice(timestamp.as_bytes());
+        offset += size_of::<Timestamp>();
+
+        // Write message length
+        let msg_len = msg.len() as u32;
+        grant[offset..offset + size_of::<u32>()].copy_from_slice(&msg_len.to_le_bytes());
+        offset += size_of::<u32>();
+
+        // Write message data
+        grant[offset..offset + msg.len()].copy_from_slice(msg);
+
+        drop(grant);
+        self.data_waker.wake_all();
+        Ok(())
+    }
+
+    fn try_push(&self, timestamp: Timestamp, msg: &[u8]) -> Result<bool, Error> {
+        let Some(head) = self.list.head() else {
+            return Ok(false);
+        };
+        match head.bufs.insert_msg(msg) {
+            Ok(_) => {}
+            Err(Error::MapOverflow) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        head.timestamps.write(&timestamp.to_le_bytes())?;
+        Ok(true)
+    }
+
+    pub fn get(&self, timestamp: Timestamp) -> Option<MsgRef> {
+        for node in self.list.iter() {
+            let timestamps = node.timestamps();
+            let Ok(index) = timestamps.binary_search(&timestamp) else {
+                continue;
+            };
+            if node.bufs.get_msg(index).is_none() {
+                continue;
+            }
+            return Some(MsgRef {
+                node,
+                timestamp,
+                index,
+            });
+        }
+        None
+    }
+
+    pub fn binary_search_nearest(&self, timestamp: Timestamp, inclusive: bool) -> Option<MsgRef> {
+        let head = self.list.head()?;
+        Self::binary_search_nearest_from(head, timestamp, inclusive)
+    }
+
+    /// Nearest-sample search seeded from a captured `head`, so
+    /// [`Self::get_range`] can run both endpoint searches over a single
+    /// spine snapshot. See `TimeSeries::binary_search_nearest_from` for
+    /// the two-snapshot race this avoids.
+    fn binary_search_nearest_from(
+        head: Arc<AtomicNode<MsgLogNode>>,
+        timestamp: Timestamp,
+        inclusive: bool,
+    ) -> Option<MsgRef> {
+        let mut prev_node: Option<MsgRef> = None;
+        for node in AtomicStackIter::new(ArcAtomic::from(head)) {
+            let timestamps = node.timestamps();
+            let start = timestamps.first()?;
+            let end = timestamps.last()?;
+
+            if timestamp.0 > end.0 {
+                if let Some(prev) = &prev_node
+                    && prev.timestamp.0.abs_diff(timestamp.0) < start.0.abs_diff(timestamp.0)
+                {
+                    return prev_node;
+                }
+                return Some(MsgRef {
+                    timestamp: *start,
+                    index: node.msg_count().saturating_sub(inclusive as usize),
+                    node,
+                });
+            }
+            if timestamp.0 < start.0 {
+                prev_node = Some(MsgRef {
+                    timestamp: *end,
+                    index: 0,
+                    node,
+                });
+                continue;
+            }
+            if timestamp.0 >= start.0 && timestamp.0 <= end.0 {
+                let index = match timestamps.binary_search(&timestamp) {
+                    Ok(i) => i,
+                    Err(i) => i.saturating_sub(inclusive as usize),
+                };
+                let timestamp = timestamps[index];
+                return Some(MsgRef {
+                    timestamp,
+                    node,
+                    index,
+                });
+            }
+        }
+
+        prev_node
+    }
+
+    pub fn get_nearest(&self, timestamp: Timestamp) -> Option<MsgRef> {
+        self.binary_search_nearest(timestamp, true)
+    }
+
+    pub fn get_range(&self, range: Range<Timestamp>) -> Option<MsgLogSlice> {
+        // One captured head for both endpoint searches; see
+        // `TimeSeries::get_range`.
+        let head = self.list.head()?;
+        let start = Self::binary_search_nearest_from(head.clone(), range.start, false)?;
+        let end = Self::binary_search_nearest_from(head, range.end, true)?;
+        Some(MsgLogSlice { start, end })
+    }
+
+    pub fn latest(&self) -> Option<MsgRef> {
+        let head = self.list.head()?;
+        let index = head.msg_count().checked_sub(1)?;
+        let timestamp = head.timestamps()[index];
+        Some(MsgRef {
+            timestamp,
+            node: head,
+            index,
+        })
+    }
+
+    pub async fn wait(&self) {
+        let _ = self.data_waker.wait().await;
+    }
+
+    pub fn waiter(&self) -> Arc<WaitQueue> {
+        self.data_waker.clone()
+    }
+
+    pub fn set_metadata(&mut self, metadata: MsgMetadata) -> Result<(), Error> {
+        let metadata = self.metadata.insert(metadata);
+        std::fs::create_dir_all(&self.path)?;
+        let metadata_path = self.path.join("metadata");
+        metadata.write(&metadata_path)?;
+        Ok(())
+    }
+
+    pub fn metadata(&self) -> Option<&MsgMetadata> {
+        self.metadata.as_ref()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.head().is_none()
+    }
+
+    pub fn first_timestamp(&self) -> Option<Timestamp> {
+        self.list
+            .iter()
+            .filter_map(|node| node.timestamps().first().copied())
+            .min()
+    }
+
+    pub fn start_timestamp(&self) -> Option<Timestamp> {
+        self.first_timestamp()
+    }
+
+    pub fn persist(self) -> impl Future<Output = ()> {
+        let mut notify = self.wal.reader();
+        async move {
+            loop {
+                if let Err(err) = self.flush_pending() {
+                    tracing::error!(?err, "failed to persist wal message");
+                }
+                drop(notify.next().await);
+            }
+        }
+    }
+
+    pub(crate) fn flush_pending(&self) -> Result<(), Error> {
+        let mut reader = self.pending.lock().unwrap();
+        while let Some(buf) = reader.try_next() {
+            let mut remaining = &buf[..];
+            while let Some((rest, timestamp, msg)) = read_msg(remaining) {
+                self.persist_msg(timestamp, msg)?;
+                remaining = rest;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush accepted messages even if the persistence executor has exited.
+    pub fn flush(&self) -> Result<(), Error> {
+        self.flush_pending()?;
+        for node in self.list.iter() {
+            node.timestamps.flush()?;
+            node.bufs.offsets.flush()?;
+            node.bufs.data_log.flush()?;
+        }
+        Ok(())
+    }
+
+    fn persist_msg(&self, timestamp: Timestamp, msg: &[u8]) -> Result<(), Error> {
+        loop {
+            if self.try_push(timestamp, msg)? {
+                break;
+            }
+            let _ = self
+                .list
+                .try_push(MsgLogNode::create(self.path.join(timestamp.0.to_string()))?);
+        }
+        Ok(())
+    }
+
+    pub fn wal_reader(&self) -> Reader {
+        self.wal.reader()
+    }
+}
+
+pub fn read_msg(mut buf: &[u8]) -> Option<(&[u8], Timestamp, &[u8])> {
+    if buf.len() < size_of::<Timestamp>() + size_of::<u32>() {
+        return None;
+    }
+    let timestamp_bytes = &buf[..size_of::<Timestamp>()];
+    let timestamp = Timestamp::from_le_bytes(
+        timestamp_bytes
+            .try_into()
+            .expect("timestamp bytes wrong size"),
+    );
+    buf = &buf[size_of::<Timestamp>()..];
+
+    if buf.len() < size_of::<u32>() {
+        return None;
+    }
+    let msg_len_bytes = &buf[..size_of::<u32>()];
+    let msg_len =
+        u32::from_le_bytes(msg_len_bytes.try_into().expect("msg_len bytes wrong size")) as usize;
+    buf = &buf[size_of::<u32>()..];
+
+    if buf.len() < msg_len {
+        return None;
+    }
+    let msg_data = &buf[..msg_len];
+    buf = &buf[msg_len..];
+    Some((buf, timestamp, msg_data))
 }

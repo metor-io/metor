@@ -51,8 +51,14 @@ pub fn spawn(db: Arc<DB>, store: Option<Arc<dyn NodeStore>>, config: TieringConf
 pub async fn run(db: Arc<DB>, store: Option<Arc<dyn NodeStore>>, config: TieringConfig) {
     let mut scratch = TieringScratch::default();
     loop {
-        if let Err(err) =
-            tier_once(&db, store.as_deref(), &config, Timestamp::now(), &mut scratch).await
+        if let Err(err) = tier_once(
+            &db,
+            store.as_deref(),
+            &config,
+            Timestamp::now(),
+            &mut scratch,
+        )
+        .await
         {
             warn!(?err, "tiering pass failed");
         }
@@ -62,9 +68,8 @@ pub async fn run(db: Arc<DB>, store: Option<Arc<dyn NodeStore>>, config: Tiering
 
 /// Per-pass scratch owned by the [`run`] task so a cycle reuses these
 /// buffers instead of allocating. Cloning a [`Component`] into `components`
-/// (and into each [`Victim`]) is pure `Arc` refcount bumps — see the
-/// `Arc<Path>` note on [`TimeSeries`](crate::time_series_2::TimeSeries) — so
-/// the whole passive pass is allocation-free once capacity is warm.
+/// (and into each [`Victim`]) only bumps `Arc` counts, so the whole passive
+/// pass is allocation-free once capacity is warm.
 #[derive(Default)]
 pub struct TieringScratch {
     components: Vec<(ComponentId, Component)>,
@@ -119,9 +124,12 @@ pub async fn tier_once(
     // looked up in `evict` instead of allocated for every component.
     scratch.components.clear();
     db.with_state(|state| {
-        scratch
-            .components
-            .extend(state.components.iter().map(|(id, component)| (*id, component.clone())));
+        scratch.components.extend(
+            state
+                .components
+                .iter()
+                .map(|(id, component)| (*id, component.clone())),
+        );
     });
     let min_resident_cutoff =
         Timestamp(now.0.saturating_sub(config.min_resident.as_micros() as i64));
@@ -154,7 +162,9 @@ pub async fn tier_once(
     }
 
     if let Some(budget) = config.max_db_bytes {
-        scratch.victims.sort_unstable_by_key(|v| (v.class(), v.end_ts.0));
+        scratch
+            .victims
+            .sort_unstable_by_key(|v| (v.class(), v.end_ts.0));
         for victim in scratch.victims.iter() {
             if victim.evicted {
                 continue;
@@ -243,7 +253,11 @@ async fn try_evict(db: &Arc<DB>, victim: &Victim, store: Option<&dyn NodeStore>)
 /// it to, which is never an excuse to drop data. The component name (needed
 /// only for the offload object key) is looked up here rather than carried on
 /// every [`Victim`], keeping the passive collection pass allocation-free.
-async fn evict(db: &Arc<DB>, victim: &Victim, store: Option<&dyn NodeStore>) -> Result<bool, Error> {
+async fn evict(
+    db: &Arc<DB>,
+    victim: &Victim,
+    store: Option<&dyn NodeStore>,
+) -> Result<bool, Error> {
     if !victim.acked {
         let Some(store) = store else {
             warn!(
@@ -278,7 +292,7 @@ mod tests {
     use super::*;
     use crate::{
         ComponentMetadata, ComponentSchema, MetadataExt, store::LocalDirStore,
-        time_series_2::TimeSeriesNode,
+        time_series::TimeSeriesNode,
     };
     use metor_proto::types::PrimType;
     use metor_proto_wkt::DbConfig;
@@ -295,7 +309,9 @@ mod tests {
                 TimeSeriesNode::create(comp_dir.join(start.to_string()), Timestamp(*start), 8)
                     .unwrap();
             for i in 0..4 {
-                node.data.write(&((start + i) as u64).to_le_bytes()).unwrap();
+                node.data
+                    .write(&((start + i) as u64).to_le_bytes())
+                    .unwrap();
                 node.index
                     .write(&Timestamp(start + i).to_le_bytes())
                     .unwrap();
@@ -322,10 +338,7 @@ mod tests {
         let component = db
             .with_state(|s| s.components.get(&COMPONENT).cloned())
             .unwrap();
-        component
-            .time_series
-            .seal_rolled_nodes()
-            .unwrap();
+        component.time_series.seal_rolled_nodes().unwrap();
         db
     }
 
@@ -355,9 +368,15 @@ mod tests {
         };
         // now=1000: the sealed spans end at 103 and 203, both past
         // max_age. 300 is the unsealed live head — never a candidate.
-        tier_once(&db, Some(&store), &config, Timestamp(1000), &mut TieringScratch::default())
-            .await
-            .unwrap();
+        tier_once(
+            &db,
+            Some(&store),
+            &config,
+            Timestamp(1000),
+            &mut TieringScratch::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(resident_starts(&db), Vec::<i64>::new());
         let component = db
             .with_state(|s| s.components.get(&COMPONENT).cloned())
@@ -368,7 +387,10 @@ mod tests {
             .with_state(|s| s.components.get(&COMPONENT).cloned())
             .unwrap();
         let manifest = component.time_series.manifest();
-        assert_eq!(manifest.span(Timestamp(100)).unwrap().state, SpanState::RemoteOnly);
+        assert_eq!(
+            manifest.span(Timestamp(100)).unwrap().state,
+            SpanState::RemoteOnly
+        );
         assert!(manifest.span(Timestamp(100)).unwrap().acked);
     }
 
@@ -389,9 +411,15 @@ mod tests {
             min_resident: Duration::ZERO,
             ..Default::default()
         };
-        tier_once(&db, Some(&store), &config, Timestamp(1000), &mut TieringScratch::default())
-            .await
-            .unwrap();
+        tier_once(
+            &db,
+            Some(&store),
+            &config,
+            Timestamp(1000),
+            &mut TieringScratch::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(resident_starts(&db), vec![200]);
     }
 
@@ -405,9 +433,15 @@ mod tests {
             min_resident: Duration::ZERO,
             ..Default::default()
         };
-        tier_once(&db, None, &config, Timestamp(1000), &mut TieringScratch::default())
-            .await
-            .unwrap();
+        tier_once(
+            &db,
+            None,
+            &config,
+            Timestamp(1000),
+            &mut TieringScratch::default(),
+        )
+        .await
+        .unwrap();
         // The policies wanted everything gone, but the sealed span has no
         // store copy and there is no store to make one.
         assert_eq!(resident_starts(&db), vec![100]);
@@ -424,9 +458,15 @@ mod tests {
             ..Default::default()
         };
         // Everything is newer than now - min_resident; nothing may move.
-        tier_once(&db, Some(&store), &config, Timestamp(1000), &mut TieringScratch::default())
-            .await
-            .unwrap();
+        tier_once(
+            &db,
+            Some(&store),
+            &config,
+            Timestamp(1000),
+            &mut TieringScratch::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(resident_starts(&db), vec![100]);
     }
 

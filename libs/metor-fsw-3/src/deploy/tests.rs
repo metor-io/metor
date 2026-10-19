@@ -3,9 +3,9 @@ use serde_json::json;
 use super::*;
 use super::{CONFIG_VERSION, TargetConfig};
 use crate::coordinator::{CoordinatorConfig, InputConfig, OutputConfig};
-use crate::link::{PUBLISH_TYPE, SUBSCRIBE_TYPE};
+use crate::link::{DB_TYPE, PUBLISH_TYPE, SUBSCRIBE_TYPE};
 use crate::record::RecordSchema;
-use crate::tests::utils::{Emit, Recorder, Tap, emit, table, tap};
+use crate::tests::utils::{Emit, Recorder, Tap, emit, imu_source, table, tap};
 
 /// Resolves whatever `envelope` has pending, with no store.
 fn resolve(envelope: &mut DeploymentConfig, tables: &[SystemTable]) -> Result<(), DeployError> {
@@ -26,7 +26,8 @@ fn tables(count: usize) -> Vec<SystemTable> {
             let mut table = table(&recorder);
             let register = || -> Result<(), crate::BuildError> {
                 table.register(PUBLISH_TYPE, tap(), move || Tap(recorder.clone()))?;
-                table.register(SUBSCRIBE_TYPE, emit(), || Emit(Vec::new()))
+                table.register(SUBSCRIBE_TYPE, emit(), || Emit(Vec::new()))?;
+                table.register(DB_TYPE, imu_source(), i64::default)
             };
             register().expect("valid records");
             table
@@ -36,6 +37,11 @@ fn tables(count: usize) -> Vec<SystemTable> {
 
 fn listen(port: u16) -> serde_json::Value {
     json!({ "transport": { "listen": { "addr": format!("127.0.0.1:{port}"), "max_connections": 1 } } })
+}
+
+/// A db's params, listening on `port`.
+fn db_listen(port: u16) -> serde_json::Value {
+    json!({ "listen": format!("127.0.0.1:{port}") })
 }
 
 fn peer(target: &str, link: &str) -> serde_json::Value {
@@ -66,8 +72,8 @@ fn member(namespace: &str, systems: Vec<DeploySystem>) -> TargetConfig<DeploySys
 }
 
 /// Builds a two-target deployment. `a` publishes its `imu` frame and log
-/// through `pub`. `b` subscribes to both and publishes on `out`. `a.cmds`
-/// subscribes to `out` for log messages.
+/// through `pub`. `b` subscribes to both and runs a db. `a.cmds` subscribes
+/// to that db for log messages.
 fn envelope() -> DeploymentConfig {
     let a = member(
         "a",
@@ -83,7 +89,7 @@ fn envelope() -> DeploymentConfig {
                 ..DeploySystem::new("pub", PUBLISH_TYPE)
             },
             DeploySystem {
-                params: peer("b", "out"),
+                params: peer("b", "db"),
                 outputs: vec![OutputConfig {
                     port: "log".into(),
                     source: DeploySource::Runtime(OutputSource::Record("log".into())),
@@ -110,8 +116,8 @@ fn envelope() -> DeploymentConfig {
                 ..DeploySystem::new("mirror", SUBSCRIBE_TYPE)
             },
             DeploySystem {
-                params: listen(2250),
-                ..DeploySystem::new("out", PUBLISH_TYPE)
+                params: db_listen(2250),
+                ..DeploySystem::new("db", DB_TYPE)
             },
         ],
     );
@@ -310,14 +316,14 @@ fn test_peer_must_listen_on_a_fixed_port() {
 #[test]
 fn test_two_listeners_on_one_host_port() {
     let mut envelope = envelope();
-    envelope.targets[1].coordinator.systems[1].params = listen(2240);
+    envelope.targets[1].coordinator.systems[1].params = db_listen(2240);
     assert_eq!(
         resolve(&mut envelope, &tables(2)),
         Err(DeployError::PortTaken {
             host: LOOPBACK.into(),
             port: 2240,
             first: "a.pub".into(),
-            second: "b.out".into(),
+            second: "b.db".into(),
         })
     );
 }
@@ -343,7 +349,7 @@ fn test_errors_cite_the_system_location() {
     );
 
     let mut taken = envelope();
-    taken.targets[1].coordinator.systems[1].params = listen(2240);
+    taken.targets[1].coordinator.systems[1].params = db_listen(2240);
     taken.targets[1].coordinator.systems[1].location = at(12);
     let Err(DeployError::Located { location, source }) = resolve(&mut taken, &tables(2)) else {
         panic!("the second listener is located")
@@ -408,7 +414,7 @@ fn test_unknown_type_is_a_build_error() {
 #[test]
 fn test_non_link_transport_is_untouched() {
     let mut envelope = envelope();
-    envelope.targets[0].coordinator.systems[0].params = peer("b", "out");
+    envelope.targets[0].coordinator.systems[0].params = peer("b", "db");
     let params = envelope.targets[0].coordinator.systems[0].params.clone();
     resolve(&mut envelope, &tables(2)).expect("resolves");
     assert!(!unresolved(&envelope).expect("decodes"));
@@ -433,9 +439,9 @@ fn test_undecodable_link_names_itself() {
 fn test_resolve_keeps_other_params() {
     let mut envelope = envelope();
     envelope.targets[1].coordinator.systems[0].params["conn_cap"] = json!(64);
-    envelope.targets[1].coordinator.systems[1].params["conn_cap"] = json!(32);
+    envelope.targets[1].coordinator.systems[1].params["path"] = json!("/db");
     resolve(&mut envelope, &tables(2)).expect("resolves");
-    let [mirror, out] = &envelope.targets[1].coordinator.systems[..] else {
+    let [mirror, db] = &envelope.targets[1].coordinator.systems[..] else {
         panic!("two systems")
     };
     assert_eq!(mirror.params["conn_cap"], 64);
@@ -443,8 +449,8 @@ fn test_resolve_keeps_other_params() {
         mirror.params["transport"]["connect"]["addr"],
         "127.0.0.1:2240"
     );
-    assert_eq!(out.params["conn_cap"], 32);
-    assert_eq!(out.params["transport"]["listen"]["max_connections"], 1);
+    assert_eq!(db.params["path"], "/db");
+    assert_eq!(db.params["listen"], "127.0.0.1:2250");
 }
 
 #[test]

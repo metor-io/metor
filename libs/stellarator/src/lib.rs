@@ -370,9 +370,21 @@ impl<O> JoinHandle<O> {
     pub fn drop_guard(self) -> JoinHandleDropGuard<O> {
         JoinHandleDropGuard(self)
     }
+
+    /// Whether the task has finished, by completing or by being canceled.
+    pub fn is_finished(&self) -> bool {
+        self.0.is_complete()
+    }
 }
 
 pub struct JoinHandleDropGuard<T>(crate::JoinHandle<T>);
+
+impl<T> JoinHandleDropGuard<T> {
+    /// Whether the task has finished, by completing or by being canceled.
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+}
 
 impl<T> Drop for JoinHandleDropGuard<T> {
     fn drop(&mut self) {

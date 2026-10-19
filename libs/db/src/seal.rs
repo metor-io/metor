@@ -7,7 +7,7 @@ use std::{
 use metor_proto::types::Timestamp;
 use zerocopy::FromBytes;
 
-use crate::{Error, time_series_2::TimeSeriesNode};
+use crate::{Error, time_series::TimeSeriesNode};
 
 /// The wire-shared seal struct; storage-side behavior lives in
 /// [`SealRecordExt`]. A sealed node's files are immutable from sealing on;
@@ -114,7 +114,9 @@ mod tests {
         let node = TimeSeriesNode::create(dir, Timestamp(start), 8).unwrap();
         for i in 0..samples {
             node.data.write(&(start + i).to_le_bytes()).unwrap();
-            node.index.write(&Timestamp(start + i).to_le_bytes()).unwrap();
+            node.index
+                .write(&Timestamp(start + i).to_le_bytes())
+                .unwrap();
         }
         node
     }

@@ -22,6 +22,12 @@ class ChannelStatus(Record):
     _pack = PACK
 
 
+class DbStatus(Record):
+    _name = "db_status"
+    _kind = "frame"
+    _pack = PACK
+
+
 class LinkStatus(Record):
     _name = "link_status"
     _kind = "frame"
@@ -88,6 +94,13 @@ class Subscribe(System):
     _ty = "subscribe"
     _takes_outputs = True
     _ports = {"link_status": LinkStatus, "log": LogEvent, "status": SystemStatus}
+
+
+class Db(System):
+    _pack = PACK
+    _ty = "db"
+    _takes_inputs = True
+    _ports = {"db_status": DbStatus, "log": LogEvent, "status": SystemStatus}
 
 
 class ChannelRegistry(System):

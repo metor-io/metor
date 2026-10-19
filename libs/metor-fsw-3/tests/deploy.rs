@@ -1,6 +1,7 @@
 //! Runs the fixture deployment with `metor run`.
 //!
-//! Target `a` publishes samples, and `b` subscribes to them and sends pings.
+//! Target `a` publishes samples, `b` subscribes to them and sends pings, and
+//! the gateway's db records both.
 
 mod common;
 
@@ -11,14 +12,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use common::{
-    DEADLINE, Fsw, Running, Source, Target, dial_fsw, fixture_dir, free_ports, local, metor,
-    ports_env, source,
+    DEADLINE, Deadline, Fsw, Running, Source, Target, dial_fsw, fixture_dir, free_ports, local,
+    metor, ports_env, source,
 };
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::coordinator::{CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
-use metor_fsw_3::{Clock, LinkStatus, WallRate};
-use metor_proto::types::{Msg, OwnedPacket};
-use metor_proto_wkt::LogEvent;
+use metor_fsw_3::{Clock, LinkStatus, Timestamp, WallRate};
+use metor_proto::types::{ComponentId, Msg, OwnedPacket};
+use metor_proto_stellar::Client;
+use metor_proto_wkt::{DumpMetadata, DumpMetadataResp, GetTimeSeries, LogEvent};
 use serde_json::json;
 use zerocopy::FromBytes;
 
@@ -30,7 +32,7 @@ const CYCLES: &str = "20000";
 
 const PORTS_ENV: &str = "METOR_DEPLOY_PORTS";
 
-fn run(target: &Path, ports: &[u16; 2], args: &[&str]) -> Running {
+fn run(target: &Path, ports: &[u16; 3], args: &[&str]) -> Running {
     let child = metor()
         .arg("run")
         .arg(target)
@@ -42,9 +44,82 @@ fn run(target: &Path, ports: &[u16; 2], args: &[&str]) -> Running {
     Running(child)
 }
 
+/// Dials the db until it answers.
+async fn connect(addr: std::net::SocketAddr) -> Client {
+    let deadline = Deadline::new();
+    loop {
+        if let Ok(client) = Client::connect(addr).await {
+            return client;
+        }
+        deadline.tick("the db never came up").await;
+    }
+}
+
+async fn metadata(client: &mut Client) -> DumpMetadataResp {
+    client.request(&DumpMetadata).await.expect("the db answers")
+}
+
+#[stellarator::test]
+async fn test_gateway_records_every_target() {
+    let ports = free_ports();
+    let _running = run(
+        &fixture_dir().join("deploy.py"),
+        &ports,
+        &["--cycles", CYCLES],
+    );
+    let mut client = connect(local(ports[2])).await;
+
+    // A subscribed frame keeps its original names, so `b`'s copy of the
+    // sample lands in the same table as `a`'s. `b`'s link status is named
+    // under `b`.
+    let deadline = Deadline::new();
+    let wanted = ["a.sampler.sample.value", "b.mirror.link_status.connections"];
+    loop {
+        let dump = metadata(&mut client).await;
+        let names: Vec<&str> = dump
+            .component_metadata
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        if wanted.iter().all(|name| names.contains(name))
+            && dump.msg_metadata.iter().any(|m| m.name == "Ping")
+        {
+            break;
+        }
+        deadline.tick(format!("announced only {names:?}")).await;
+    }
+
+    // Samples only show up in a time series once the db has flushed its log,
+    // so queries fail until then.
+    let component_id = ComponentId::new(wanted[0]);
+    loop {
+        let series = client
+            .request(&GetTimeSeries {
+                id: [0, 0],
+                range: Timestamp(0)..Timestamp(i64::MAX / 2),
+                component_id,
+                limit: Some(64),
+            })
+            .await;
+        // The table gets each sample from `a` and again through `b`, so a
+        // timestamp may repeat, but it never goes backwards.
+        if let Ok(series) = &series
+            && let Ok(stamps) = series.timestamps()
+            && stamps.len() >= 2
+            && stamps.first() != stamps.last()
+        {
+            assert!(stamps.windows(2).all(|w| w[0] <= w[1]), "{stamps:?}");
+            break;
+        }
+        deadline
+            .tick(format!("the series never filled: {series:?}"))
+            .await;
+    }
+}
+
 /// Runs `metor build` on the fixture deployment and returns the resolved
 /// config it wrote.
-fn build(ports: Option<&[u16; 2]>, out: &Path) -> serde_json::Value {
+fn build(ports: Option<&[u16; 3]>, out: &Path) -> serde_json::Value {
     let mut command = metor();
     command
         .args([

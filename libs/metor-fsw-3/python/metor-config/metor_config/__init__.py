@@ -9,6 +9,7 @@ is written to `$METOR_CONFIG_OUT`, or to stdout, for `metor run` to read.
 from ._builtins import (
     ChannelRegistry,
     Connect,
+    Db,
     DlSlot,
     Listen,
     Peer,
@@ -17,10 +18,11 @@ from ._builtins import (
     Transport,
 )
 from ._config import ConfigError
-from ._deployment import Deployment, emit
+from ._deployment import Deployment, emit, gateway
 from ._generated import (
     CONFIG_VERSION,
     ChannelStatus,
+    DbStatus,
     LinkStatus,
     LogEvent,
     ResourceStatus,
@@ -76,9 +78,12 @@ __all__ = [
     "SequenceChannelEvent",
     "SequenceCommand",
     "SequenceRegistry",
+    "gateway",
     "SystemStatus",
     "LogEvent",
     "LinkStatus",
+    "DbStatus",
+    "Db",
     "CONFIG_VERSION",
     "ConfigError",
     "Connect",

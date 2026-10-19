@@ -13,7 +13,7 @@ use crate::{
     AtomicTimestampExt, ComponentSchema, DB, Error,
     manifest::{GapVec, SpanSource, SpanState},
     store::{NodeKey, NodeStaging, NodeStore, StoreError},
-    time_series_2::TimeSeries,
+    time_series::TimeSeries,
 };
 
 /// Most recent gap requests we keep; render loops re-request visible gaps
@@ -140,9 +140,7 @@ impl Hydrator {
         });
         entry.attempts = entry.attempts.saturating_add(1);
         let shift = entry.attempts.saturating_sub(1).min(31);
-        let delay = BACKOFF_BASE
-            .saturating_mul(1u32 << shift)
-            .min(BACKOFF_CAP);
+        let delay = BACKOFF_BASE.saturating_mul(1u32 << shift).min(BACKOFF_CAP);
         entry.retry_at = now + delay;
         if memo.len() > MEMO_CAP {
             memo.retain(|_, b| b.retry_at > now);
@@ -159,7 +157,10 @@ impl Hydrator {
     /// full the oldest request is dropped — the newest view wins.
     pub fn request(&self, component_id: ComponentId, range: Range<Timestamp>) {
         let mut queue = self.inner.queue.lock().unwrap();
-        if queue.iter().any(|(id, r)| *id == component_id && *r == range) {
+        if queue
+            .iter()
+            .any(|(id, r)| *id == component_id && *r == range)
+        {
             return;
         }
         if queue.len() >= QUEUE_CAP {

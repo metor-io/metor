@@ -540,17 +540,20 @@ impl CyclicSystem for AlarmSystem {
             };
             scratch.clear();
             let members = &watch.members;
-            let _ = watch.vtable.for_each_field(Some(&record), &mut |rf| {
-                for &m in members {
-                    if rf.component_id == alarms[m].component_id
-                        && let Some(view) = &rf.view
-                        && let Some(v) = view.get(alarms[m].element)
-                    {
-                        scratch.push((m, v.as_f64()));
+            let _ = watch.vtable.for_each_field::<metor_proto::error::Error>(
+                Some(&record),
+                &mut |rf| {
+                    for &m in members {
+                        if rf.component_id == alarms[m].component_id
+                            && let Some(view) = &rf.view
+                            && let Some(v) = view.get(alarms[m].element)
+                        {
+                            scratch.push((m, v.as_f64()));
+                        }
                     }
-                }
-                Ok(())
-            });
+                    Ok(())
+                },
+            );
             drop(record);
 
             for &(m, value) in scratch.iter() {
@@ -622,7 +625,7 @@ impl AlarmSystem {
             let mut members: Vec<usize> = Vec::new();
             let alarms = &mut self.alarms;
             let failures = &mut failures;
-            let _ = vtable.for_each_field(None, &mut |rf| {
+            let _ = vtable.for_each_field::<metor_proto::error::Error>(None, &mut |rf| {
                 if rf.dynamic {
                     return Ok(());
                 }
