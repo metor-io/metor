@@ -104,6 +104,24 @@ fn span_checks_bounds() {
 }
 
 #[test]
+fn owner_keeps_the_memory_alive() {
+    let arena = Arena::new();
+    arena.set_owned(vec![7; 4].into());
+    let (base, len) = arena.region().unwrap();
+    let owner = arena.owner().unwrap();
+    // SAFETY: the owner is live, and the lease meets its contract.
+    let lease = unsafe { metor_fsw_3_ring::Lease::acquire(owner) };
+    drop(arena);
+    // SAFETY: the lease keeps the bytes alive.
+    let other = Arena::new();
+    // SAFETY: the lease keeps the bytes alive.
+    unsafe { other.set(base, len, crate::io::arena::Keep::Lease(lease)) };
+    // SAFETY: the region is live and unshared.
+    let bytes = unsafe { other.get_slice(Span::new(0, 4)).unwrap().as_ref() };
+    assert_eq!(bytes, [7; 4]);
+}
+
+#[test]
 fn memory_is_set_once() {
     let arena = Rc::new(Arena::new());
     assert!(arena.region().is_none());

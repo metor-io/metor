@@ -169,7 +169,11 @@ impl Step for Slot {
         }
     }
 
-    fn load(&mut self, name: &str) -> Result<(), LoadError> {
+    fn load(
+        &mut self,
+        name: &str,
+        _cx: &mut crate::coordinator::StepCx<'_>,
+    ) -> Result<(), LoadError> {
         if name == "none" {
             self.occupant = None;
             return Ok(());
@@ -206,6 +210,8 @@ fn slot_entry(shared: &Shared) -> TableEntry {
         kind: SystemKind::Cyclic,
         adapters: SystemKind::Cyclic.adapters(),
         def: def.clone(),
+        takes_inputs: false,
+        takes_outputs: false,
         def_fn: Box::new(move |_| Ok(def.clone())),
         doc: "".into(),
         schema: None,

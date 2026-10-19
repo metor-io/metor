@@ -326,6 +326,10 @@ impl<W: InputWake> Ports<InputBinding<W>> for DynInputs<W> {
     fn bind(inputs: Vec<InputBinding<W>>, _cx: &BindCx) -> Result<Self, MakeError> {
         Ok(Self::new(inputs))
     }
+
+    fn takes_config_ports() -> bool {
+        true
+    }
 }
 
 /// Outputs for a system whose ports are listed in config instead of code.
@@ -359,6 +363,10 @@ impl<W: WakeSource> Ports<OutputBinding<W>> for DynOutputs<W> {
 
     fn bind(outputs: Vec<OutputBinding<W>>, _cx: &BindCx) -> Result<Self, MakeError> {
         Ok(Self::new(outputs, &Arc::default()))
+    }
+
+    fn takes_config_ports() -> bool {
+        true
     }
 }
 

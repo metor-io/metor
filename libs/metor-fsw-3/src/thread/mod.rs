@@ -13,7 +13,9 @@
 mod os;
 
 pub use os::Threads;
-pub(crate) use os::{TurnedGroup, place};
+#[cfg(feature = "host")]
+pub(crate) use os::TurnedGroup;
+pub(crate) use os::place;
 
 use metor_fsw_3_ring::Notifier;
 
@@ -31,6 +33,10 @@ pub(crate) struct LaunchCx<'a> {
 }
 
 /// An async system, its state, and its bound ports.
+#[cfg_attr(
+    not(all(feature = "threads", not(target_family = "wasm"))),
+    allow(dead_code)
+)]
 pub(crate) struct Launched<A: AsyncSystem> {
     pub(crate) system: A,
     pub(crate) state: A::State,

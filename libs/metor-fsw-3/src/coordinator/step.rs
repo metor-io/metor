@@ -30,7 +30,7 @@ pub trait Step {
     }
 
     /// Replaces the system this step runs with the system called `name`.
-    fn load(&mut self, _name: &str) -> Result<(), LoadError> {
+    fn load(&mut self, _name: &str, _cx: &mut StepCx<'_>) -> Result<(), LoadError> {
         Err(LoadError::NotLoadable)
     }
 
@@ -85,6 +85,8 @@ pub enum LoadError {
     Unknown(String),
     #[error("`{0}` no longer matches the slot's ports")]
     Mismatch(String),
+    #[error("`{0}` cannot run behind the slot's adapter")]
+    Adapter(String),
     #[error("`{0}` is not the library build stored")]
     Hash(String),
     #[error("opening the pack: {0}")]

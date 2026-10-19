@@ -46,6 +46,8 @@ pub(crate) fn entry() -> TableEntry {
         adapters: Adapters::OFF_THREAD,
         // PANIC Safety: the empty context names no ports, which cannot fail.
         def: def(&DefCx::empty()).expect("a static definition"),
+        takes_inputs: true,
+        takes_outputs: true,
         def_fn: Box::new(def),
         doc: "Carries IO systems' ops to the backend or a wire, and their completions back.".into(),
         schema: serde_json::value::to_raw_value(&schemars::schema_for!(IoParams)).ok(),

@@ -180,4 +180,8 @@ impl<S: SequenceFn> Ports<InputBinding> for SeqInputs<S> {
             ins: InSet::bind(inputs.collect(), cx)?,
         })
     }
+
+    fn takes_config_ports() -> bool {
+        InSet::<S>::takes_config_ports()
+    }
 }

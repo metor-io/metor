@@ -478,6 +478,19 @@ mod tests {
     }
 
     #[test]
+    fn test_seed_is_an_unsigned_64_bit_integer() {
+        let config = |seed: &str| {
+            let text = format!(
+                r#"{{"clock":{{"Wall":{{"rate":1.0}}}},"ring_depth":8,"systems":[],"seed":{seed}}}"#
+            );
+            serde_json::from_str::<CoordinatorConfig>(&text).map(|config| config.seed)
+        };
+        assert_eq!(config("18446744073709551615").ok(), Some(u64::MAX));
+        assert!(config("-1").is_err());
+        assert!(config("18446744073709551616").is_err());
+    }
+
+    #[test]
     fn test_location_is_optional() {
         let text = r#"{"id":"nav","ty":"nav","location":{"file":"target.py","line":12}}"#;
         let located: SystemConfig = serde_json::from_str(text).expect("a location parses");

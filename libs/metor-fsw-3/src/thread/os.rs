@@ -62,6 +62,7 @@ impl Threads {
     }
 
     /// Hands over the turned groups, for the coordinator to own.
+    #[cfg(feature = "host")]
     pub(crate) fn into_turned(self) -> impl Iterator<Item = TurnedGroup> {
         let groups = match self.0 {
             Groups::Spawned(_) => HashMap::new(),

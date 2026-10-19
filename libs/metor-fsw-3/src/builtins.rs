@@ -12,6 +12,10 @@ pub fn register_builtins(table: &mut SystemTable) -> Result<(), BuildError> {
         crate::channel::channel_registry(),
         crate::channel::Registry::new,
     )?;
+    table.insert(
+        crate::dl::SLOT_TYPE,
+        crate::coordinator::TableEntry::dl_slot(),
+    )?;
     #[cfg(unix)]
     {
         table.insert(crate::io::IO_TYPE, crate::io::host::entry())?;

@@ -127,6 +127,9 @@ pub enum DefError {
     #[error("the pack refused the definition: {message}")]
     Pack { message: String },
 
+    #[error("slot: {message}")]
+    Slot { message: String },
+
     #[error("async system `{system}` takes a `Sample`, which only a stepped system takes")]
     SampleOnAsync { system: String },
 

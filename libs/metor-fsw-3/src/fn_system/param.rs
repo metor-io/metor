@@ -152,6 +152,10 @@ pub struct Defs {
     pub(crate) io: Option<IoPorts>,
     /// Whether any parameter is an `Rng`.
     pub(crate) rng: bool,
+    /// Whether a parameter takes the inputs a config lists.
+    pub(crate) takes_inputs: bool,
+    /// Whether a parameter takes the outputs a config lists.
+    pub(crate) takes_outputs: bool,
 }
 
 impl Defs {
@@ -542,6 +546,7 @@ impl<D: InputWake> Param for DynInputs<D> {
         param_name(names);
         let ports = cx.dyn_input_defs(&defs.declared_inputs)?;
         defs.inputs.extend(ports);
+        defs.takes_inputs = true;
         Ok(())
     }
 
@@ -576,6 +581,7 @@ impl Param for DynOutputs {
         param_name(names);
         let ports = cx.dyn_output_defs(&defs.declared_outputs)?;
         defs.outputs.extend(ports);
+        defs.takes_outputs = true;
         Ok(())
     }
 
