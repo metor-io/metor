@@ -16,7 +16,7 @@ from typing import Any, Sequence, TypeVar
 
 from . import _generated
 from ._config import ConfigError
-from ._generated import FRAMEWORK_PORTS, IO_RECORDS, PACK, SequenceRegistry
+from ._generated import IO_RECORDS, SequenceRegistry
 from ._model import (
     Item,
     OutPort,
@@ -38,22 +38,12 @@ CONN_CAP = 1 << 20
 INBOUND_CAP = 256
 
 
-class LinkStatus(Record):
-    """Socket statistics that a link writes when they change."""
-
-    _name = "link_status"
-    _kind = "frame"
-    _pack = PACK
-
-
 class Link(System):
     """Base class for systems that send or receive records over a network
     connection.
 
     Peers identify a link by its target's namespace and its own name.
     """
-
-    _pack = PACK
 
     def __init__(
         self,
@@ -83,8 +73,6 @@ class Sink(Link):
     With `all`, it also reads every port of every system added before it.
     """
 
-    _takes_inputs = True
-
     def __init__(
         self,
         params: dict[str, Any],
@@ -106,16 +94,13 @@ class Sink(Link):
         return _edges(_item_ports(self._items) + ports)
 
 
-class Publish(Sink):
+class Publish(Sink, _generated.Publish):
     """Sends records to every connected peer.
 
     `items` lists what to publish. An item is either a system handle, which
     publishes all of that system's ports, or a single port. With `all`, it
     publishes every system added before this one.
     """
-
-    _ty = "publish"
-    _ports = {"link_status": LinkStatus, **FRAMEWORK_PORTS}
 
     def __init__(
         self,
@@ -129,16 +114,12 @@ class Publish(Sink):
         super().__init__({"conn_cap": conn_cap}, listen, connect, max_connections, items, all)
 
 
-class Subscribe(Link):
+class Subscribe(Link, _generated.Subscribe):
     """Receives records from peers and writes them to its own output ports.
 
     `records` lists message classes to accept. Each one gets an output port
     named after the record.
     """
-
-    _ty = "subscribe"
-    _takes_outputs = True
-    _ports = {"link_status": LinkStatus, **FRAMEWORK_PORTS}
 
     def __init__(
         self,
