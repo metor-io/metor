@@ -62,13 +62,12 @@ pub(crate) struct SelectedReader {
     tail_bytes: usize,
     cache: Option<QueryResult>,
     busy: bool,
-    replay_key: Option<(String, Arc<crate::dynamic::resolver::DbResolver>)>,
-    replay_plan: Option<Option<crate::dynamic::ops::replay::ReplayPlan>>,
-    replay_checked: Instant,
+    expression_text: Option<(u64, Option<String>)>,
+    replay_plan: Option<(PlanKey, Option<crate::dynamic::ops::replay::ReplayPlan>)>,
     freshness: crate::views::binding::Freshness,
     health_age: Duration,
     health_observed: Instant,
-    retry_after: Instant,
+    retry: Option<(Instant, u64)>,
     _clock: Subscription,
     _wal: gpui::Task<()>,
     _history: gpui::Task<()>,
@@ -143,8 +142,6 @@ pub(crate) fn acquire(db: Arc<DB>, id: ComponentId, cx: &mut App) -> Entity<Sele
                         {
                             this.tail_bytes -= this.tail.pop_front().unwrap().bytes.len();
                         }
-                        // Future arrivals only narrow the cached predecessor interval.
-                        this.retry_after = Instant::now();
                         this.refresh(cx);
                     })
                     .is_err()
@@ -173,13 +170,12 @@ pub(crate) fn acquire(db: Arc<DB>, id: ComponentId, cx: &mut App) -> Entity<Sele
             tail_bytes: 0,
             cache: None,
             busy: false,
-            replay_key: None,
+            expression_text: None,
             replay_plan: None,
-            replay_checked: Instant::now(),
             freshness: crate::views::binding::Freshness::new(Instant::now()),
             health_age: Duration::ZERO,
             health_observed: Instant::now(),
-            retry_after: Instant::now(),
+            retry: None,
             _clock: subscription,
             _wal: wal,
             _history: history,
@@ -244,7 +240,6 @@ impl SelectedReader {
         if !preserve {
             self.cache = None;
         }
-        self.retry_after = Instant::now();
         self.refresh(cx);
     }
 
@@ -254,19 +249,24 @@ impl SelectedReader {
             self.publish(None, SampleStatus::Loading, None, cx);
             return;
         };
+        if self.component.is_none() {
+            return;
+        }
+        let has_text = self.expression_text().is_some();
         let Some(component) = &self.component else {
             return;
         };
-        let expression_text = crate::dynamic::expressions::binding_text(&self.db, self.id);
-        if self.replay_key.as_ref().map(|key| &key.0) != expression_text.as_ref() {
-            self.replay_plan = None;
-            self.cache = None;
-        }
-        let expression = expression_text.is_some()
-            || crate::dynamic::expressions::running(self.id, cx).is_some();
-        // Metadata has no generation counter. Periodically validate the resolver
-        // on the worker, including while paused, without compiling every seek.
-        let validate_plan = expression && self.replay_checked.elapsed() >= Duration::from_secs(1);
+        let running = crate::dynamic::expressions::running(self.id, cx);
+        let expression = has_text || running.is_some();
+        // A recorded plan answers only for the tree it was resolved against;
+        // a running expression carries its own.
+        let tree = (self.db.vtable_gen.latest(), self.db.metadata_gen.latest());
+        let plan_current = !expression
+            || running.is_some()
+            || self
+                .replay_plan
+                .as_ref()
+                .is_some_and(|(key, _)| key.tree == tree);
         let manifest = component.time_series.manifest().generation;
         // Prefetch at most the next sealed span in one second of forward play.
         // The hydrator owns deduplication and its bounded request queue.
@@ -286,7 +286,7 @@ impl SelectedReader {
                 );
             }
         }
-        if !validate_plan
+        if plan_current
             && let Some(cache) = &self.cache
             && cache.manifest == manifest
             && cache.dependencies_current()
@@ -304,7 +304,11 @@ impl SelectedReader {
             );
             return;
         }
-        if !expression && let Some(result) = latest_at_or_before(component, t, &self.tail) {
+        // A running expression records its own output, so at the head that
+        // record is the answer; only history before it ran needs replay.
+        if (!expression || running.is_some())
+            && let Some(result) = latest_at_or_before(component, t, &self.tail)
+        {
             self.publish(result.sample.clone(), SampleStatus::Ready, Some(t), cx);
             self.cache = Some(result);
             return;
@@ -325,69 +329,73 @@ impl SelectedReader {
         if self.busy {
             return;
         }
-        if Instant::now() < self.retry_after {
+        // A failure waits out its backoff unless hydration moved this
+        // component's coverage, which is what usually resolves it.
+        if let Some((deadline, generation)) = self.retry
+            && Instant::now() < deadline
+            && generation == manifest
+        {
             return;
         }
         self.busy = true;
         let component = self.component.clone().unwrap();
         let tail: Vec<_> = self.tail.iter().cloned().collect();
-        let running = crate::dynamic::expressions::running(self.id, cx).map(|e| e.replay_plan());
-        let cached_plan = self.replay_plan.clone();
-        let replay_key = self.replay_key.clone();
+        let running = running.map(|e| e.replay_plan());
+        let key = self
+            .expression_text
+            .as_ref()
+            .and_then(|(_, text)| text.clone())
+            .map(|text| PlanKey { text, tree });
+        let cached_plan = self
+            .replay_plan
+            .as_ref()
+            .filter(|(old, _)| Some(old) == key.as_ref())
+            .map(|(_, plan)| plan.clone());
+        let recorded = key.is_some();
         let db = self.db.clone();
         let id = self.id;
         self._query = cx.spawn(async move |this, cx| {
-            let (mut result, plan, checked_key, key_changed) = cx
+            let (mut result, plan) = cx
                 .background_executor()
                 .spawn(async move {
-                    let checked_key =
-                        crate::dynamic::expressions::binding_text(&db, id).map(|text| {
-                            (
-                                text,
-                                Arc::new(crate::dynamic::resolver::DbResolver::snapshot(&db)),
-                            )
-                        });
-                    let key_changed = checked_key != replay_key;
                     let plan = running.or_else(|| {
-                        if !key_changed {
-                            cached_plan.unwrap_or_else(|| {
-                                crate::dynamic::expressions::replay_plan_from_metadata(id, &db)
-                            })
-                        } else {
-                            crate::dynamic::expressions::replay_plan_from_metadata(id, &db)
-                        }
+                        cached_plan.unwrap_or_else(|| {
+                            recorded
+                                .then(|| {
+                                    crate::dynamic::expressions::replay_plan_from_metadata(id, &db)
+                                })
+                                .flatten()
+                        })
                     });
-                    (
-                        query_selected(&component, t, &tail, plan.as_ref()),
-                        plan,
-                        checked_key,
-                        key_changed,
-                    )
+                    (query_selected(&component, t, &tail, plan.as_ref()), plan)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
-                if crate::dynamic::expressions::binding_text(&this.db, this.id).as_ref()
-                    != checked_key.as_ref().map(|key| &key.0)
-                {
+                if this.expression_text() != key.as_ref().map(|key| key.text.as_str()) {
                     this.refresh(cx);
                     return;
                 }
-                if key_changed {
-                    this.cache = None;
+                if let Some(key) = key {
+                    // The same text over a new tree resolves to this id with the
+                    // same plan or not at all, so only a flip outdates the cache.
+                    if this
+                        .replay_plan
+                        .as_ref()
+                        .is_some_and(|(_, old)| old.is_some() != plan.is_some())
+                    {
+                        this.cache = None;
+                    }
+                    this.replay_plan = Some((key, plan));
                 }
-                this.replay_key = checked_key;
-                this.replay_plan = Some(plan);
-                this.replay_checked = Instant::now();
-                if !validate_plan
-                    && this.cache.as_ref().is_some_and(|cache| {
-                        super::view_time(cx).is_some_and(|t| cache.contains(t))
-                            && this.component.as_ref().is_some_and(|c| {
-                                c.time_series.manifest().generation == cache.manifest
-                            })
-                            && cache.dependencies_current()
-                    })
-                {
+                if this.cache.as_ref().is_some_and(|cache| {
+                    super::view_time(cx).is_some_and(|t| cache.contains(t))
+                        && this
+                            .component
+                            .as_ref()
+                            .is_some_and(|c| c.time_series.manifest().generation == cache.manifest)
+                        && cache.dependencies_current()
+                }) {
                     this.refresh(cx);
                     return;
                 }
@@ -420,7 +428,7 @@ impl SelectedReader {
                     result.missing = None;
                 }
                 if let Some((id, range)) = result.missing.clone() {
-                    this.retry_after = Instant::now() + Duration::from_millis(250);
+                    this.retry = Some((Instant::now() + RETRY_BACKOFF, result.manifest));
                     if let Some(hydrator) = crate::hydration::hydrator(cx) {
                         hydrator.request(id, range);
                         this.publish(None, SampleStatus::Loading, Some(t), cx);
@@ -437,7 +445,7 @@ impl SelectedReader {
                     return;
                 }
                 if let Some(error) = result.error.clone() {
-                    this.retry_after = Instant::now() + Duration::from_millis(250);
+                    this.retry = Some((Instant::now() + RETRY_BACKOFF, result.manifest));
                     this.publish(None, SampleStatus::Error(error), Some(t), cx);
                     return;
                 }
@@ -451,10 +459,48 @@ impl SelectedReader {
                     Some(t),
                     cx,
                 );
+                this.retry = None;
                 this.cache = Some(result);
             });
         });
     }
+
+    /// The expression recorded on this component, re-read only when metadata
+    /// moves. A changed text is a different computation, so whatever was
+    /// derived from the old one goes with it.
+    fn expression_text(&mut self) -> Option<&str> {
+        let generation = self.db.metadata_gen.latest();
+        if self
+            .expression_text
+            .as_ref()
+            .is_none_or(|(seen, _)| *seen != generation)
+        {
+            let text = crate::dynamic::expressions::binding_text(&self.db, self.id);
+            if self
+                .expression_text
+                .as_ref()
+                .is_some_and(|(_, old)| *old != text)
+            {
+                self.replay_plan = None;
+                self.cache = None;
+            }
+            self.expression_text = Some((generation, text));
+        }
+        self.expression_text
+            .as_ref()
+            .and_then(|(_, text)| text.as_deref())
+    }
+}
+
+/// How long a failed query waits before it is asked again.
+const RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// What a recorded expression's replay plan was resolved against: its text,
+/// and the component tree as `(vtable_gen, metadata_gen)`.
+#[derive(Clone, PartialEq)]
+struct PlanKey {
+    text: String,
+    tree: (u64, u64),
 }
 
 struct QueryResult {
@@ -543,7 +589,10 @@ fn latest_at_or_before(
         dependencies: vec![],
         error: None,
     };
-    for sample in tail {
+    // Committed samples are already in `latest`; only the uncommitted suffix
+    // can move the answer.
+    let head = latest.timestamp();
+    for sample in tail.range(tail.partition_point(|s| s.timestamp < head)..) {
         result.take(sample.clone(), t);
     }
     let predecessor = result.sample.as_ref()?.timestamp;
