@@ -260,57 +260,33 @@ impl Future for Until {
     }
 }
 
-/// Lowers each system's `transport` param the way the Python recorder
-/// lowers a link's transport: into a resource `{id}_ep` granted to its `ep`,
-/// with `max_connections` or `dialing` in its params. Adds the io steps after
-/// the last system if any link was lowered.
-///
-/// A transport is `{"listen": {"addr", "max_connections"?, "allow"?}}` or
-/// `{"connect": {"addr"}}`.
+/// Moves each system's `ep` param, a real resource, into the resource
+/// `{id}_ep` granted to its `ep`, and marks a dialer `dialing`. Adds the io
+/// steps if any system has a resource.
 pub fn lower_links(config: &mut CoordinatorConfig) {
-    let mut lowered = false;
     for system in &mut config.systems {
-        let Some(params) = system.params.as_object_mut() else {
+        let Some(ep) = system.params.as_object_mut().and_then(|p| p.remove("ep")) else {
             continue;
         };
-        let Some(transport) = params.remove("transport") else {
-            continue;
-        };
-        let addr = |end: &str| {
-            let addr = transport[end]["addr"].as_str().expect("an address");
-            addr.parse().expect("an IP address")
-        };
-        let kind = if transport.get("listen").is_some() {
-            let listen = &transport["listen"];
-            let slots = listen.get("max_connections").cloned();
-            params.insert("max_connections".into(), slots.unwrap_or(8.into()));
-            let allow = listen.get("allow").cloned().unwrap_or_default();
-            let allow = serde_json::from_value(allow).unwrap_or_default();
-            RealKind::TcpListen {
-                addr: addr("listen"),
-                allow,
-            }
-        } else {
-            params.insert("dialing".into(), true.into());
-            RealKind::TcpDial {
-                addr: addr("connect"),
-            }
-        };
+        let kind: RealKind = serde_json::from_value(ep).expect("a real resource");
+        if matches!(kind, RealKind::TcpDial { .. }) {
+            system.params["dialing"] = true.into();
+        }
         let ep = format!("{}_ep", system.id);
         system.grants.insert("ep".into(), ep.clone());
         config.resources.insert(ep, Backing::Real(kind));
-        lowered = true;
     }
-    if lowered {
-        let status = serde_json::json!({ "status": true });
-        config.systems.extend([
-            SystemConfig::new("io_submit", IO_TYPE),
-            SystemConfig {
-                params: status,
-                ..SystemConfig::new("io_complete", IO_TYPE)
-            },
-        ]);
+    if config.resources.is_empty() {
+        return;
     }
+    let status = serde_json::json!({ "status": true });
+    config.systems.extend([
+        SystemConfig::new("io_submit", IO_TYPE),
+        SystemConfig {
+            params: status,
+            ..SystemConfig::new("io_complete", IO_TYPE)
+        },
+    ]);
 }
 
 /// The ids of `c`'s systems that panicked, in step order.

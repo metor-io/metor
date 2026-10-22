@@ -63,11 +63,11 @@ pub async fn publish(
     let mut batcher = Batcher::new(ids, scratch);
     let mut reporter = StatusReporter::default();
     loop {
-        conns.poll(|_, _| {});
+        let turn = conns.poll(|_, _| {});
         if let Some(batch) = batcher.fill(inputs) {
             conns.broadcast(batch);
         }
-        reporter.report(&mut conns, 0, seq.now(), link_status, log);
+        reporter.report(turn, &conns, 0, seq.now(), link_status, log);
         seq.next_cycle().await;
     }
 }

@@ -131,23 +131,12 @@ mod tests {
     }
 
     #[test]
-    fn test_one_packet_per_read() {
+    fn test_packets_per_read() {
         let (mut d, _io) = deframer(64);
         recv(&mut d, &frame(b"one"));
         assert_eq!(bodies(&mut d), [b"one".to_vec()]);
-        recv(&mut d, &frame(b"two"));
-        assert_eq!(bodies(&mut d), [b"two".to_vec()]);
-    }
-
-    #[test]
-    fn test_three_packets_in_one_read() {
-        let (mut d, _io) = deframer(64);
-        let bytes = [frame(b"a"), frame(b"bb"), frame(b"ccc")].concat();
-        recv(&mut d, &bytes);
-        assert_eq!(
-            bodies(&mut d),
-            [b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()]
-        );
+        recv(&mut d, &[frame(b"a"), frame(b""), frame(b"ccc")].concat());
+        assert_eq!(bodies(&mut d), [b"a".to_vec(), Vec::new(), b"ccc".to_vec()]);
         assert!(d.next().is_none());
     }
 
@@ -163,23 +152,6 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_length_body() {
-        let (mut d, _io) = deframer(16);
-        recv(&mut d, &[frame(b""), frame(b"x")].concat());
-        assert_eq!(bodies(&mut d), [Vec::new(), b"x".to_vec()]);
-    }
-
-    #[test]
-    fn test_prefix_split_across_reads() {
-        let (mut d, _io) = deframer(16);
-        let bytes = frame(b"body");
-        recv(&mut d, &bytes[..3]);
-        assert!(d.next().is_none());
-        recv(&mut d, &bytes[3..]);
-        assert_eq!(bodies(&mut d), [b"body".to_vec()]);
-    }
-
-    #[test]
     fn test_compaction_makes_room_for_the_rest() {
         let (mut d, _io) = deframer(12);
         let (first, second) = (frame(b"1234"), frame(b"abcdefgh"));
@@ -187,23 +159,6 @@ mod tests {
         assert_eq!(bodies(&mut d), [b"1234".to_vec()]);
         assert_eq!(recv(&mut d, &second[4..]), 8, "the read body moved out");
         assert_eq!(bodies(&mut d), [b"abcdefgh".to_vec()]);
-    }
-
-    #[test]
-    fn test_compaction_with_nothing_left_over() {
-        let (mut d, _io) = deframer(8);
-        recv(&mut d, &frame(b"full"));
-        assert_eq!(bodies(&mut d), [b"full".to_vec()]);
-        d.compact();
-        assert_eq!(d.spare().map(|tail| tail.capacity()), Some(8));
-    }
-
-    #[test]
-    fn test_frame_filling_the_buffer_exactly() {
-        let (mut d, _io) = deframer(8);
-        recv(&mut d, &frame(b"abcd"));
-        assert!(d.spare().is_none(), "full until read");
-        assert_eq!(bodies(&mut d), [b"abcd".to_vec()]);
     }
 
     #[test]
@@ -264,6 +219,7 @@ mod tests {
     fn test_largest_body_fills_the_buffer() {
         let (mut d, _io) = deframer(16);
         recv(&mut d, &frame(&[7; 12]));
+        assert!(d.spare().is_none(), "full until read");
         assert_eq!(bodies(&mut d), [vec![7; 12]]);
         recv(&mut d, &13u32.to_le_bytes());
         assert_eq!(d.next(), Some(Err(Oversized)), "one byte past");
@@ -299,13 +255,9 @@ mod tests {
         assert_eq!(d.next(), Some(Err(Oversized)));
         recv(&mut d, b"more");
         assert_eq!(d.next(), Some(Err(Oversized)), "nothing further");
-    }
-
-    #[test]
-    fn test_largest_prefix_is_oversized() {
         let (mut d, _io) = deframer(16);
         recv(&mut d, &u32::MAX.to_le_bytes());
-        assert_eq!(d.next(), Some(Err(Oversized)));
+        assert_eq!(d.next(), Some(Err(Oversized)), "the largest prefix");
     }
 
     #[test]

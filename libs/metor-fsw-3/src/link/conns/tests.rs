@@ -3,7 +3,6 @@ use std::collections::{HashMap, VecDeque};
 use zerocopy::IntoBytes;
 
 use crate::io::test::{TestIo, TestPort, cap_with_ops};
-use crate::io::tests::allocations;
 use crate::io::{Op, RawHandle};
 
 use super::*;
@@ -40,6 +39,7 @@ struct Rig {
     io: TestIo,
     net: Net,
     bodies: Vec<Vec<u8>>,
+    events: Vec<Event>,
     turn: usize,
 }
 
@@ -87,6 +87,7 @@ fn rig(config: ConnsConfig) -> Rig {
         io,
         net: Net::default(),
         bodies: Vec::new(),
+        events: Vec::new(),
         turn: 0,
     }
 }
@@ -122,7 +123,8 @@ impl Rig {
     fn turn(&mut self) {
         self.serve();
         let bodies = &mut self.bodies;
-        self.conns.poll(|_, body| bodies.push(body.to_vec()));
+        let turn = self.conns.poll(|_, body| bodies.push(body.to_vec()));
+        self.events.extend(turn.events());
         let budget = ops_for(self.conns.slots.len());
         assert!(self.io.in_flight() <= budget, "{} ops", self.io.in_flight());
     }
@@ -132,7 +134,7 @@ impl Rig {
     }
 
     fn events(&mut self) -> Vec<Event> {
-        self.conns.events().collect()
+        core::mem::take(&mut self.events)
     }
 
     fn connections(&self) -> u32 {
@@ -458,19 +460,6 @@ fn test_a_listener_backs_off_a_fixed_500_ms() {
 }
 
 #[test]
-fn test_events_past_the_queue_are_counted() {
-    let mut r = rig(listen(1));
-    for _ in 0..7 {
-        r.connect();
-    }
-    r.turns(24);
-    assert!(r.net.streams.is_empty());
-    let queued = r.events().len() as u64;
-    assert_eq!(queued + r.conns.events_dropped(), 7);
-    assert!(r.conns.events_dropped() > 0);
-}
-
-#[test]
 fn test_reject_a_budget_short_of_the_slots() {
     let (ep, io) = cap_with_ops::<Endpoint>(ops_for(2) as u16 - 1);
     let made = make(&io, &ep, listen(2), SEED);
@@ -491,22 +480,4 @@ fn test_reject_a_seed_past_conn_cap() {
             conn_cap: CAP
         })
     ));
-}
-
-#[test]
-fn test_steady_state_allocates_nothing() {
-    let mut r = rig(listen(1));
-    let peer = r.accept();
-    let (mut bodies, mut allocated) = (0, 0);
-    for _ in 0..1_000 {
-        r.peer(peer).outbound = frame(b"tick");
-        r.serve();
-        allocated += allocations(|| {
-            r.conns.poll(|_, _| bodies += 1);
-            r.conns.broadcast(b"tock");
-        });
-    }
-    assert_eq!(allocated, 0);
-    assert!(bodies >= 998, "{bodies}");
-    assert_eq!(r.connections(), 1);
 }

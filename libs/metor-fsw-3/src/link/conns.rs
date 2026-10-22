@@ -20,9 +20,6 @@ use super::peer::ConnectionState;
 const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
-/// The events queued per slot before the link drains them.
-const EVENTS_PER_SLOT: usize = 4;
-
 /// The ops `slots` connections have in flight at most: the stream op, a
 /// backoff timer, a refused stream's close, and per slot a recv, a send, a
 /// write timer, and a close.
@@ -49,10 +46,7 @@ pub(crate) struct ConnsConfig {
 impl ConnsConfig {
     /// The slots the connections take: one for a dialer.
     pub(crate) fn slot_count(&self) -> usize {
-        match self.dialing {
-            true => 1,
-            false => self.slots.max(1),
-        }
+        if self.dialing { 1 } else { self.slots }
     }
 }
 
@@ -74,6 +68,20 @@ pub(crate) enum Event {
     Refused,
     /// The endpoint failed to open a stream.
     Failed(IoError),
+}
+
+/// What one [`Conns::poll`] pass did: the connections it closed, and what
+/// became of the stream it reaped.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Turn {
+    closed: usize,
+    stream: Option<Event>,
+}
+
+impl Turn {
+    pub(crate) fn events(self) -> impl Iterator<Item = Event> {
+        core::iter::repeat_n(Event::Closed, self.closed).chain(self.stream)
+    }
 }
 
 /// One connection slot.
@@ -132,8 +140,6 @@ pub(crate) struct Conns {
     config: ConnsConfig,
     bytes_out: u64,
     batches_dropped: u64,
-    events: Vec<Event>,
-    events_dropped: u64,
 }
 
 impl ConnsMem {
@@ -181,7 +187,6 @@ impl Conns {
             let (seed, conn_cap) = (seed.len(), config.conn_cap);
             return Err(MakeError::SeedTooLarge { seed, conn_cap });
         }
-        let events = EVENTS_PER_SLOT * slots.len();
         Ok(Self {
             ep: ep.clone(),
             next: Slot::Idle(peer),
@@ -192,30 +197,24 @@ impl Conns {
             config,
             bytes_out: 0,
             batches_dropped: 0,
-            events: Vec::with_capacity(events),
-            events_dropped: 0,
         })
     }
 
-    /// One pass: reads each connection's bodies into `on_body`, moves its
-    /// sends along, closes the connections that failed, takes a new stream
-    /// into a free slot, and asks for the next stream. A new connection's
-    /// ops start on the next pass.
-    pub(crate) fn poll(&mut self, mut on_body: impl FnMut(&mut ConnectionState, &[u8])) {
+    /// One pass over every slot and the stream op. Each whole body read goes
+    /// to `on_body`.
+    pub(crate) fn poll(&mut self, mut on_body: impl FnMut(&mut ConnectionState, &[u8])) -> Turn {
         let (ep, after) = (&self.ep, self.config.write_timeout);
         let mut closed = 0;
         for conn in &mut self.slots {
             closed += usize::from(conn.poll(ep, after, &mut self.bytes_out, &mut on_body));
         }
-        for _ in 0..closed {
-            self.event(Event::Closed);
-        }
         if closed > 0 && self.config.dialing {
             self.backoff.start();
         }
-        self.take_stream();
+        let stream = self.take_stream();
         step(&mut self.refused);
         self.ask_stream();
+        Turn { closed, stream }
     }
 
     /// Appends `batch` to every open connection's send buffer and starts
@@ -240,34 +239,16 @@ impl Conns {
         }
     }
 
-    /// The events since the last call, oldest first.
-    pub(crate) fn events(&mut self) -> impl Iterator<Item = Event> + '_ {
-        self.events.drain(..)
-    }
-
-    /// Events dropped because the queue was full.
-    pub(crate) fn events_dropped(&self) -> u64 {
-        self.events_dropped
-    }
-
-    /// Queues `event`, or counts it dropped if the queue is full.
-    fn event(&mut self, event: Event) {
-        match self.events.len() < self.events.capacity() {
-            true => self.events.push(event),
-            false => self.events_dropped += 1,
-        }
-    }
-
     /// Reaps the stream op: a new stream takes a free slot, or is refused;
     /// a failure waits out the backoff. One the full queue refused is asked
     /// for again.
-    fn take_stream(&mut self) {
-        let stream = match self.next.poll() {
-            None | Some(Err(IoError::QueueFull)) => return,
-            Some(Ok(stream)) => stream,
-            Some(Err(e)) => {
-                self.event(Event::Failed(e));
-                return self.backoff.start();
+    fn take_stream(&mut self) -> Option<Event> {
+        let stream = match self.next.poll()? {
+            Err(IoError::QueueFull) => return None,
+            Ok(stream) => stream,
+            Err(e) => {
+                self.backoff.start();
+                return Some(Event::Failed(e));
             }
         };
         self.backoff.delay = BACKOFF_INITIAL;
@@ -278,11 +259,11 @@ impl Conns {
         match self.slots.iter_mut().find(|c| c.is_free()) {
             Some(conn) => {
                 conn.open(stream, &self.seed, watch);
-                self.event(Event::Opened(peer));
+                Some(Event::Opened(peer))
             }
             None => {
                 self.refused = Some(Closing::Waiting(stream));
-                self.event(Event::Refused);
+                Some(Event::Refused)
             }
         }
     }
@@ -366,9 +347,8 @@ impl Conn {
         false
     }
 
-    /// Reaps the recv, yields each whole body, and asks for more. True if
-    /// the peer hung up, failed, or sent a body past the buffer. A recv the
-    /// full queue refused is asked for again.
+    /// Reaps the recv and asks for more. True if the peer hung up, failed,
+    /// or sent a body past the buffer.
     fn recv(&mut self, on_body: &mut impl FnMut(&mut ConnectionState, &[u8])) -> bool {
         if let Some(pending) = &mut self.rx {
             let Some((result, tail)) = pending.poll() else {

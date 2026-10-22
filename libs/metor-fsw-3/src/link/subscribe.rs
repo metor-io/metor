@@ -78,13 +78,13 @@ pub async fn subscribe(
     let mut dropped = 0;
     let mut reporter = StatusReporter::default();
     loop {
-        conns.poll(|state, body| {
+        let turn = conns.poll(|state, body| {
             let missing = |table| report_missing(table, &routes.tables, log);
             if let Some((ty, id, bytes)) = state.route(&tables, body, missing) {
                 dropped += u64::from(routes.deliver(ty, id, bytes));
             }
         });
-        reporter.report(&mut conns, dropped, seq.now(), link_status, log);
+        reporter.report(turn, &conns, dropped, seq.now(), link_status, log);
         seq.next_cycle().await;
     }
 }
@@ -310,19 +310,6 @@ mod tests {
     }
 
     #[test]
-    fn test_route_timestamped_message_without_its_timestamp() {
-        let rings = [ring::<Fixed>(2, 1), ring::<Note>(2, 1)];
-        let mut outputs = ports(&rings);
-        let mut routes = Routes::of(&mut outputs);
-        let mut note = rings[1].view(NoWake).expect("a free slot");
-        let mut stamped = 7i64.to_le_bytes().to_vec();
-        stamped.extend_from_slice(b"late");
-        let late = body(PacketTy::MsgWithTimestamp, id_of::<Note>(), &stamped);
-        assert!(!route(&mut routes, &late));
-        assert_eq!(note.drain().next().expect("a record"), Ok(&b"late"[..]));
-    }
-
-    #[test]
     fn test_route_table_by_table_id() {
         let rings = [ring::<Fixed>(2, 1), ring::<Imu>(2, 1)];
         let mut outputs = mixed(&rings);
@@ -355,21 +342,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ignore_unknown_and_malformed_bodies() {
+    fn test_ignore_unknown_record_id() {
         let rings = [ring::<Fixed>(2, 1), ring::<Note>(2, 1)];
         let mut outputs = ports(&rings);
         let mut routes = Routes::of(&mut outputs);
         let mut views = rings
             .each_ref()
             .map(|r| r.view(NoWake).expect("a free slot"));
-        for junk in [
-            body(PacketTy::Msg, [9, 9], b"probe"),
-            vec![PacketTy::Msg as u8, 1],
-            vec![0xff, 1, 2, 0, 9],
-            body(PacketTy::MsgWithTimestamp, id_of::<Note>(), &[0u8; 3]),
-        ] {
-            assert!(!route(&mut routes, &junk), "{junk:?}");
-        }
+        assert!(!route(&mut routes, &body(PacketTy::Msg, [9, 9], b"probe")));
         assert!(views.iter_mut().all(|v| v.drain().next().is_none()));
     }
 

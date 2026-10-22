@@ -53,7 +53,11 @@ transport lowers to a `tcp_listen` or `tcp_dial` resource, and its
 connections allocate nothing after make.
 
 - Links on threads: the thread driver over group reactors (§8), so
-  `thread:` places a link off the cycle. Plan 25 chunks I and J.
+  `thread:` places a link off the cycle. The link bodies already run under
+  any executor that polls `Pending` with a waker: add an async driver beside
+  the sequence, accept `thread:` in the link types' `Adapters`, reject it in
+  a group holding a sim resource, and run `tests/link.rs` under both
+  drivers. Move `Db`'s query server onto the reactor.
 
 - Definitions from config: a type computes its `SystemDef` from its
   instance config, dynamic markers and build's completion pass are gone,

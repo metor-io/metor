@@ -231,7 +231,8 @@ fn impostor(port: u16) -> Impostor {
             SystemConfig::new("imu", "source"),
             SystemConfig {
                 params: json!({
-                    "transport": { "listen": { "addr": format!("127.0.0.1:{port}"), "max_connections": 2 } },
+                    "ep": { "tcp_listen": { "addr": format!("127.0.0.1:{port}") } },
+                    "max_connections": 2,
                     "namespace": "a",
                     "link": "pub",
                 }),

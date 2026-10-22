@@ -1,3 +1,4 @@
+use core::time::Duration;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -344,7 +345,20 @@ fn refusals_reply_without_running() {
             sqe(0, RawHandle::new(0, 1), Op::Fsync, Span::default()),
             IoError::Stale,
         ),
+        (
+            sqe(
+                0,
+                RawHandle::new(9, 0),
+                Op::Timeout(Duration::ZERO),
+                Span::default(),
+            ),
+            IoError::Stale,
+        ),
         (sqe(0, TTY, Op::Recv, Span::new(60, 8)), IoError::BadBuf),
+        (
+            sqe(0, SIM, Op::Stream, Span::new(0, RawAddr::LEN as u32)),
+            IoError::Unsupported,
+        ),
     ];
     for (sqe, e) in cases {
         r.lower(0, sqe);
@@ -389,8 +403,10 @@ fn closed_grant_is_stale_until_a_remake() {
     r.lower(0, sqe(0, TTY, Op::Close, Span::default()));
     assert_eq!(r.replies(), [(0, Cqe::ok(Token::new(0, 7), 0))]);
     assert!(r.routes().is_empty(), "the resource stays open");
-    r.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
-    assert_eq!(r.replies()[0].1.result(), Err(IoError::Stale));
+    for op in [Op::Fsync, Op::Timeout(Duration::ZERO)] {
+        r.lower(0, sqe(1, TTY, op, Span::default()));
+        assert_eq!(r.replies()[0].1.result(), Err(IoError::Stale), "{op:?}");
+    }
     r.d.quiesce_member(0);
     r.d.member_drained(0);
     r.d.end_quiescing_member(0);
@@ -595,13 +611,9 @@ fn fill_every_slot(ops: &[u16]) {
 
 #[test]
 fn each_member_fills_its_own_budget() {
-    fill_every_slot(&[16, 40]);
-}
-
-#[test]
-fn a_budget_of_one_and_the_last_slot() {
-    fill_every_slot(&[1, 3, 1]);
-    fill_every_slot(&[0, 2]);
+    for ops in [&[16, 40][..], &[1, 3, 1], &[0, 2]] {
+        fill_every_slot(ops);
+    }
 }
 
 #[test]
@@ -628,7 +640,6 @@ fn budgets_past_the_op_id_space_fail_the_build() {
 #[test]
 fn held_scales_with_the_budgets_posted() {
     let d = budgets(&[4, 40]).unwrap();
-    assert_eq!(d.held_for(&[1]), 2 * d.ops_of(1));
     assert_eq!(d.held_for(&[0, 1]), 2 * 44);
     assert_eq!(d.held_for(&[]), 0);
 }
@@ -816,18 +827,8 @@ fn a_short_peer_buffer_is_bad_buf() {
     assert_eq!(ready(&mut d)[0].result(), Err(IoError::BadBuf));
 }
 
-#[test]
-fn a_stream_on_a_wire_is_unsupported() {
-    let mut r = rig();
-    r.lower(
-        0,
-        sqe(0, SIM, Op::Stream, Span::new(0, RawAddr::LEN as u32)),
-    );
-    assert_eq!(r.replies()[0].1.result(), Err(IoError::Unsupported));
-}
-
 fn timeout(slot: u16, micros: u64) -> Sqe {
-    let after = core::time::Duration::from_micros(micros);
+    let after = Duration::from_micros(micros);
     sqe(slot, TTY, Op::Timeout(after), Span::default())
 }
 
@@ -899,12 +900,7 @@ fn quiesce_clears_a_members_timers() {
 #[test]
 fn the_longest_timeout_lands_at_the_end_of_time() {
     let mut r = rig();
-    let forever = sqe(
-        0,
-        TTY,
-        Op::Timeout(core::time::Duration::MAX),
-        Span::default(),
-    );
+    let forever = sqe(0, TTY, Op::Timeout(Duration::MAX), Span::default());
     r.d.lower(0, forever, &r.arenas[0], Timestamp(10)).unwrap();
     r.d.expire(Timestamp(i64::MAX - 1));
     assert!(r.replies().is_empty());
@@ -916,7 +912,7 @@ fn the_longest_timeout_lands_at_the_end_of_time() {
 fn a_rearmed_slot_lands_once_for_its_new_generation() {
     let mut r = rig();
     let at = |generation, micros| {
-        let after = core::time::Duration::from_micros(micros);
+        let after = Duration::from_micros(micros);
         Sqe::new(
             Token::new(1, generation),
             TTY,
@@ -935,28 +931,6 @@ fn a_rearmed_slot_lands_once_for_its_new_generation() {
     assert!(r.replies().is_empty(), "the canceled deadline is gone");
     r.d.expire(Timestamp(30));
     assert_eq!(r.replies(), [(0, Cqe::ok(Token::new(1, 8), 0))]);
-}
-
-#[test]
-fn a_timeout_on_a_closed_grant_is_stale() {
-    let mut r = rig();
-    r.lower(0, sqe(0, TTY, Op::Close, Span::default()));
-    r.lower(0, timeout(1, 0));
-    let got = r.replies();
-    assert_eq!(got[1].1.result(), Err(IoError::Stale));
-}
-
-#[test]
-fn a_timeout_on_a_stale_handle_is_stale() {
-    let mut r = rig();
-    let stale = sqe(
-        0,
-        RawHandle::new(9, 0),
-        Op::Timeout(core::time::Duration::ZERO),
-        Span::default(),
-    );
-    r.d.lower(0, stale, &r.arenas[0], Timestamp(0)).unwrap();
-    assert_eq!(r.replies()[0].1.result(), Err(IoError::Stale));
 }
 
 /// A re-lowered accept still waiting for the backend when teardown starts

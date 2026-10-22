@@ -216,11 +216,11 @@ fn reading(id: &str, ty: &str, port: &str, from: PortRef) -> SystemConfig {
     }
 }
 
-/// Returns a `Publish` named `link` on `transport` that serves `imu.imu`.
-fn publish(link: &str, transport: serde_json::Value, conn_cap: usize) -> SystemConfig {
+/// Returns a `Publish` named `link` on endpoint `ep` that serves `imu.imu`.
+fn publish(link: &str, ep: serde_json::Value, conn_cap: usize) -> SystemConfig {
     SystemConfig {
         params: json!({
-            "transport": transport,
+            "ep": ep,
             "namespace": "cube_sat",
             "link": link,
             "conn_cap": conn_cap,
@@ -239,15 +239,20 @@ fn pick_port(link: &str) -> SocketAddr {
     addr
 }
 
-/// Returns a transport for link `link` that listens on a free port.
+/// Returns an endpoint for link `link` that listens on a free port.
 fn listen_any(link: &str) -> serde_json::Value {
-    json!({ "listen": { "addr": pick_port(link).to_string() } })
+    json!({ "tcp_listen": { "addr": pick_port(link).to_string() } })
 }
 
-/// Returns a transport for link `link` that listens on a free port and serves
-/// one peer at a time.
-fn listen_one(link: &str) -> serde_json::Value {
-    json!({ "listen": { "addr": pick_port(link).to_string(), "max_connections": 1 } })
+/// Returns an endpoint that dials `addr`.
+fn dial(addr: SocketAddr) -> serde_json::Value {
+    json!({ "tcp_dial": { "addr": addr.to_string() } })
+}
+
+/// Returns `link` serving one peer at a time.
+fn one_peer(mut link: SystemConfig) -> SystemConfig {
+    link.params["max_connections"] = 1.into();
+    link
 }
 
 /// Returns an `imu` source and a `Publish` named `link` that serves it on a
@@ -396,11 +401,7 @@ async fn test_publish_retries_connection() {
     let _target = spawn(
         vec![
             SystemConfig::new("imu", "source"),
-            publish(
-                "pub-retries",
-                json!({ "connect": { "addr": addr.to_string() } }),
-                1 << 20,
-            ),
+            publish("pub-retries", dial(addr), 1 << 20),
         ],
         &seen,
         500.0,
@@ -505,9 +506,9 @@ async fn test_link_and_io_status_both_count() {
 async fn test_peer_outside_allow_is_refused() {
     let seen = Seen::default();
     let addr = pick_port("cmds-allow");
-    let transport = json!({ "listen": { "addr": addr.to_string(), "allow": ["10.0.0.0/8"] } });
+    let ep = json!({ "tcp_listen": { "addr": addr.to_string(), "allow": ["10.0.0.0/8"] } });
     let _target = spawn(
-        vec![subscribe("cmds-allow", transport), status_reader("cmds")],
+        vec![subscribe("cmds-allow", ep), status_reader("cmds")],
         &seen,
         500.0,
     );
@@ -525,12 +526,12 @@ async fn test_peer_outside_allow_is_refused() {
     assert_eq!(seen.status().map_or(0, |s| s.connections), 0);
 }
 
-/// Returns a `Subscribe` named `link` on `transport`, which writes the pings
+/// Returns a `Subscribe` named `link` on endpoint `ep`, which writes the pings
 /// it receives to its `ping` output.
-fn subscribe(link: &str, transport: serde_json::Value) -> SystemConfig {
+fn subscribe(link: &str, ep: serde_json::Value) -> SystemConfig {
     SystemConfig {
         params: json!({
-            "transport": transport,
+            "ep": ep,
             "namespace": "cube_sat",
             "link": link,
         }),
@@ -624,7 +625,7 @@ async fn test_subscribe_receives_records() {
             SystemConfig::new("src", "pinger"),
             SystemConfig {
                 params: json!({
-                    "transport": listen_any("pub-records"),
+                    "ep": listen_any("pub-records"),
                     "link": "pub-records",
                 }),
                 ..reading(
@@ -641,10 +642,7 @@ async fn test_subscribe_receives_records() {
     let addr = bound("pub-records");
     let _client = spawn(
         vec![
-            subscribe(
-                "cmds-records",
-                json!({ "connect": { "addr": addr.to_string() } }),
-            ),
+            subscribe("cmds-records", dial(addr)),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &client,
@@ -668,7 +666,7 @@ fn mirror(addr: SocketAddr, def: metor_fsw_3::PortDef) -> Vec<SystemConfig> {
     vec![
         SystemConfig {
             params: json!({
-                "transport": { "connect": { "addr": addr.to_string() } },
+                "ep": { "tcp_dial": { "addr": addr.to_string() } },
                 "link": "mirror",
             }),
             outputs: vec![OutputConfig {
@@ -720,7 +718,7 @@ async fn test_dialing_beside_a_listener() {
     let mut systems = mirror(addr, published_imu());
     systems.push(SystemConfig {
         params: json!({
-            "transport": listen_any("ground-beside"),
+            "ep": listen_any("ground-beside"),
             "link": "ground-beside",
         }),
         ..reading(
@@ -775,7 +773,7 @@ async fn test_reconnect_checks_the_new_peer() {
             SystemConfig::new("imu", "source"),
             publish(
                 "pub-again",
-                json!({ "listen": { "addr": addr.to_string() } }),
+                json!({ "tcp_listen": { "addr": addr.to_string() } }),
                 1 << 20,
             ),
         ],
@@ -798,7 +796,7 @@ async fn test_reconnect_checks_the_new_peer() {
             SystemConfig::new("wide", "wide"),
             SystemConfig {
                 params: json!({
-                    "transport": { "listen": { "addr": addr.to_string() } },
+                    "ep": { "tcp_listen": { "addr": addr.to_string() } },
                     "namespace": "cube_sat",
                     "link": "pub-rebuilt",
                     "conn_cap": 1 << 20,
@@ -833,7 +831,7 @@ async fn test_subscribe_skips_large_announce() {
         .inputs
         .push(InputConfig::new("wide.wide", "wide", "wide"));
     publish.params = json!({
-        "transport": listen_any("pub-wide"),
+        "ep": listen_any("pub-wide"),
         "link": "pub-wide",
     });
     let _server = spawn(
@@ -848,10 +846,7 @@ async fn test_subscribe_skips_large_announce() {
     let addr = bound("pub-wide");
     let _client = spawn(
         vec![
-            subscribe(
-                "cmds-wide",
-                json!({ "connect": { "addr": addr.to_string() } }),
-            ),
+            subscribe("cmds-wide", dial(addr)),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &client,
@@ -896,7 +891,7 @@ async fn test_disconnect_frees_slot() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe("cmds-slot", listen_one("cmds-slot")),
+            one_peer(subscribe("cmds-slot", listen_any("cmds-slot"))),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &seen,
@@ -926,7 +921,7 @@ async fn test_refuse_peer_past_limit() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe("cmds-full", listen_one("cmds-full")),
+            one_peer(subscribe("cmds-full", listen_any("cmds-full"))),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &seen,
@@ -974,11 +969,7 @@ async fn test_stop_closes_connections() {
 fn dialing_publish(addr: SocketAddr) -> Vec<SystemConfig> {
     vec![
         SystemConfig::new("imu", "source"),
-        publish(
-            "pub-sim",
-            json!({ "connect": { "addr": addr.to_string() } }),
-            1 << 20,
-        ),
+        publish("pub-sim", dial(addr), 1 << 20),
         reading("log", "log_sink", "log", PortRef::new("pub", "log")),
         status_reader("pub"),
     ]

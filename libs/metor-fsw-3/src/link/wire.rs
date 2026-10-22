@@ -124,11 +124,6 @@ mod tests {
 
     use super::*;
 
-    fn append_packet(batch: &mut Vec<u8>, ty: PacketTy, id: PacketId, payload: &[u8]) {
-        batch.extend_from_slice(&packet_head(ty, id, payload.len()));
-        batch.extend_from_slice(payload);
-    }
-
     /// A record encoded as JSON, so its metadata names a codec.
     #[derive(serde::Serialize, serde::Deserialize)]
     struct Telecommand {
@@ -234,27 +229,13 @@ mod tests {
     }
 
     #[test]
-    fn test_packet_framing_matches_len_packet() {
-        let mut batch = Vec::new();
-        append_packet(&mut batch, PacketTy::Table, [7, 9], b"body");
+    fn test_packet_head_matches_len_packet() {
+        let mut batch = packet_head(PacketTy::Table, [7, 9], 4).to_vec();
+        batch.extend_from_slice(b"body");
         let mut expected = LenPacket::table([7, 9], 4);
         expected.extend_from_slice(b"body");
         assert_eq!(batch, expected.into_len_packet().inner);
-    }
-
-    #[test]
-    fn test_frame_empty_payload() {
-        let mut batch = Vec::new();
-        append_packet(&mut batch, PacketTy::Msg, [0, 1], b"");
-        assert_eq!(batch, vec![4, 0, 0, 0, PacketTy::Msg as u8, 0, 1, 0]);
-    }
-
-    #[test]
-    fn test_append_packets() {
-        let mut batch = Vec::new();
-        append_packet(&mut batch, PacketTy::Msg, [0, 1], b"a");
-        append_packet(&mut batch, PacketTy::Msg, [0, 2], b"bb");
-        assert_eq!(batch.len(), 8 + 1 + 8 + 2);
-        assert_eq!(&batch[8..9], b"a");
+        let empty = packet_head(PacketTy::Msg, [0, 1], 0);
+        assert_eq!(empty, [4, 0, 0, 0, PacketTy::Msg as u8, 0, 1, 0]);
     }
 }

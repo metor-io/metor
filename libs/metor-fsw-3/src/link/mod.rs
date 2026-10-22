@@ -32,7 +32,7 @@ use crate::log::Log;
 use crate::port::Output;
 use crate::{Frame, SeqError};
 
-use conns::{Conns, ConnsConfig, Event, Stats};
+use conns::{Conns, ConnsConfig, Event, Stats, Turn};
 
 #[cfg(feature = "db")]
 pub use db::{Db, DbParams, DbStatus};
@@ -161,32 +161,24 @@ impl LinkStatus {
 #[derive(Default)]
 struct StatusReporter {
     reported: LinkStatus,
-    events_dropped: u64,
 }
 
 impl StatusReporter {
-    /// Logs the events `conns` queued, and writes its status to
-    /// `link_status` if any counter changed since the last report.
+    /// Logs `turn`'s events, and writes `conns`' status to `link_status` if
+    /// any counter changed since the last report.
     ///
     /// If more inbound packets were dropped since the last report, this also
     /// logs a fault with the count.
     fn report(
         &mut self,
-        conns: &mut Conns,
+        turn: Turn,
+        conns: &Conns,
         inbound_dropped: u64,
         now: Timestamp,
         link_status: &mut Output<LinkStatus>,
         log: &mut Log,
     ) {
-        for event in conns.events() {
-            log_event(event, log);
-        }
-        let events_dropped = conns.events_dropped();
-        if events_dropped > self.events_dropped {
-            let dropped = events_dropped - self.events_dropped;
-            log.warn(format!("{dropped} connection events dropped"));
-            self.events_dropped = events_dropped;
-        }
+        turn.events().for_each(|event| log_event(event, log));
         let status = LinkStatus::new(conns.stats(), inbound_dropped, now);
         if status.inbound_dropped > self.reported.inbound_dropped {
             let dropped = status.inbound_dropped - self.reported.inbound_dropped;

@@ -64,9 +64,6 @@ pub enum DeployError {
         message: String,
     },
 
-    #[error("`{system}`'s params: {message}")]
-    Params { system: String, message: String },
-
     #[error("slot `{slot}`: {message}")]
     Slot { slot: String, message: String },
 
