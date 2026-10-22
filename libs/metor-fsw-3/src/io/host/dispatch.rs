@@ -1,15 +1,19 @@
 //! `Dispatch`: every system's handles and ops in flight, in tables sized at
 //! build.
 //!
-//! The op system `m` submits in slot `s` is entry `m * MAX_OPS + s`, so a
+//! Each system owns a run of the op table as long as its op budget, so a
 //! completion finds its system and token by arithmetic. `lower` turns an
 //! `Sqe` into a `Route` for the io steps to carry out, and `raise` turns a
-//! finished op back into a `Cqe`. Nothing here does IO.
+//! finished op back into a `Cqe`. A timeout never leaves the dispatch: it
+//! lands when `expire` passes its deadline. Nothing here does IO.
 
+use core::net::SocketAddr;
+use core::time::Duration;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use metor_component::FrameStr;
 use metor_proto::types::Timestamp;
+use zerocopy::{FromZeros, IntoBytes};
 
 use super::wire::Wire;
 use super::{Class, OpId, OsDone, OsOp, Out};
@@ -17,7 +21,7 @@ use crate::coordinator::BuildError;
 use crate::io::arena::Arena;
 use crate::io::status::{Counters, ResourceStatus};
 use crate::io::{
-    Cqe, IoError, MAX_OPS, Op, OpKind, RawHandle, ResourceEnd, ResourceIndex, Sqe, Token,
+    Cidr, Cqe, IoError, Op, OpKind, RawAddr, RawHandle, ResourceEnd, ResourceIndex, Sqe, Token,
 };
 use crate::port::Output;
 
@@ -41,6 +45,8 @@ pub(crate) enum Backed {
     Fd(OwnedFd, Class),
     /// The wire at this index of the dispatch's wires.
     Wire(usize),
+    /// No descriptor: each `Stream` dials this address.
+    Dial(SocketAddr),
     /// No system holds it, so it was never opened.
     Unused,
 }
@@ -48,6 +54,8 @@ pub(crate) enum Backed {
 pub(crate) struct Resource {
     pub(crate) id: String,
     pub(crate) backed: Backed,
+    /// The peers a listener's streams may come from; any when empty.
+    pub(crate) allow: Box<[Cidr]>,
 }
 
 /// Something for the io steps to carry out on the backend.
@@ -91,6 +99,13 @@ enum MemberState {
     Drained,
 }
 
+/// A system with a `Cap`: its op budget, and the resource and end of each
+/// grant, in order.
+pub(crate) struct MemberDef {
+    pub(crate) ops: u16,
+    pub(crate) grants: Vec<(ResourceIndex, ResourceEnd)>,
+}
+
 /// A system's handles: its grants at indexes `0..grants.len()`, then its
 /// derived handles.
 struct Member {
@@ -100,17 +115,61 @@ struct Member {
 }
 
 impl Member {
-    fn new(grants: Vec<(ResourceIndex, ResourceEnd)>) -> Member {
+    /// One derived handle per op the member may have in flight.
+    fn new(def: MemberDef) -> Member {
         let grant = |(res, end): (ResourceIndex, ResourceEnd)| Grant {
             res: res.get(),
             end,
             open: true,
         };
         Member {
-            grants: grants.into_iter().map(grant).collect(),
-            derived: (0..MAX_OPS).map(|_| DerivedSlot::default()).collect(),
+            grants: def.grants.into_iter().map(grant).collect(),
+            derived: (0..def.ops).map(|_| DerivedSlot::default()).collect(),
             state: MemberState::Running,
         }
+    }
+}
+
+/// Where each member's run of the op table starts: `base[m]..base[m + 1]`.
+struct Slots {
+    base: Box<[usize]>,
+}
+
+impl Slots {
+    fn new(budgets: impl Iterator<Item = u16>) -> Self {
+        let sums = budgets.scan(0, |sum, ops| {
+            *sum += usize::from(ops);
+            Some(*sum)
+        });
+        Self {
+            base: core::iter::once(0).chain(sums).collect(),
+        }
+    }
+
+    /// Every member's ops.
+    fn total(&self) -> usize {
+        self.base.last().copied().unwrap_or(0)
+    }
+
+    /// Member `m`'s entries.
+    fn range(&self, m: usize) -> core::ops::Range<usize> {
+        self.base[m]..self.base[m + 1]
+    }
+
+    fn budget(&self, m: usize) -> usize {
+        self.range(m).len()
+    }
+
+    /// The entry of member `m`'s slot, if the slot is in its budget.
+    fn index(&self, m: usize, slot: u16) -> Option<usize> {
+        let slot = usize::from(slot);
+        (slot < self.budget(m)).then(|| self.base[m] + slot)
+    }
+
+    /// The member and slot an entry below `total` belongs to.
+    fn owner(&self, index: usize) -> (usize, u16) {
+        let m = self.base.partition_point(|&b| b <= index).saturating_sub(1);
+        (m, (index - self.base[m]) as u16)
     }
 }
 
@@ -121,6 +180,10 @@ struct InFlight {
     res: u16,
     kind: OpKind,
     canceled: bool,
+    /// A `Stream` as lowered, to write its peer and to lower it again.
+    stream: Option<OsOp>,
+    /// A timeout's deadline.
+    due: Option<Timestamp>,
 }
 
 /// Why an op did not run.
@@ -146,11 +209,15 @@ enum Target {
     Fd(i32, Class),
     /// The wire at this index, from this end.
     Wire(usize, ResourceEnd),
+    Dial(SocketAddr),
 }
 
 pub(crate) struct Dispatch {
     members: Box<[Member]>,
+    slots: Slots,
     ops: Box<[Option<InFlight>]>,
+    /// How many ops in `ops` are timeouts.
+    timers: usize,
     resources: Box<[Resource]>,
     wires: Box<[Wire]>,
     names: Box<[FrameStr<64>]>,
@@ -166,22 +233,21 @@ pub(crate) struct Dispatch {
 }
 
 impl Dispatch {
-    /// One member per system with a `Cap`, given as the resource and end of
-    /// each grant, in order. `wires` holds the wires the resources name.
+    /// One member per system with a `Cap`. `wires` holds the wires the
+    /// resources name.
     pub(crate) fn new(
-        members: Vec<Vec<(ResourceIndex, ResourceEnd)>>,
+        members: Vec<MemberDef>,
         resources: Vec<Resource>,
         wires: Vec<Wire>,
     ) -> Result<Self, BuildError> {
-        let ops = members.len() * MAX_OPS;
-        if ops > usize::from(u16::MAX) + 1 {
-            let count = members.len();
-            return Err(BuildError::TooManyIoMembers { count });
-        }
+        let slots = Slots::new(members.iter().map(|m| m.ops));
+        let ops = Self::check_ops(slots.total())?;
         let count = resources.len();
         Ok(Self {
             members: members.into_iter().map(Member::new).collect(),
+            slots,
             ops: vec![None; ops].into(),
+            timers: 0,
             names: resources
                 .iter()
                 .map(|r| FrameStr::truncated(&r.id))
@@ -197,14 +263,29 @@ impl Dispatch {
         })
     }
 
-    /// Lowers one op from member `m`'s queue, whose buffers lie in `arena`.
-    /// An op that names no slot of `m`'s, or a slot still in flight, is
-    /// dropped unanswered, since its reply would answer another op: `Err`.
-    pub(crate) fn lower(&mut self, m: usize, sqe: Sqe, arena: &Arena) -> Result<(), Rejected> {
+    /// `ops`, if an `OpId` can name each of that many ops.
+    pub(crate) fn check_ops(ops: usize) -> Result<usize, BuildError> {
+        match ops <= usize::from(u16::MAX) + 1 {
+            true => Ok(ops),
+            false => Err(BuildError::TooManyIoOps { ops }),
+        }
+    }
+
+    /// Lowers one op from member `m`'s queue at cycle time `now`, whose
+    /// buffers lie in `arena`. An op that names no slot of `m`'s, or a slot
+    /// still in flight, is dropped unanswered, since its reply would answer
+    /// another op: `Err`.
+    pub(crate) fn lower(
+        &mut self,
+        m: usize,
+        sqe: Sqe,
+        arena: &Arena,
+        now: Timestamp,
+    ) -> Result<(), Rejected> {
         if self.members[m].state != MemberState::Running {
             return Ok(());
         }
-        match self.try_lower(m, sqe, arena) {
+        match self.try_lower(m, sqe, arena, now) {
             Ok(()) => Ok(()),
             Err(Refusal::Drop) => Err(Rejected),
             Err(Refusal::Reply(e)) => {
@@ -214,13 +295,22 @@ impl Dispatch {
         }
     }
 
-    fn try_lower(&mut self, m: usize, sqe: Sqe, arena: &Arena) -> Result<(), Refusal> {
+    fn try_lower(
+        &mut self,
+        m: usize,
+        sqe: Sqe,
+        arena: &Arena,
+        now: Timestamp,
+    ) -> Result<(), Refusal> {
         let op = sqe.op();
         if op == Ok(Op::Cancel) {
             self.cancel(m, sqe.token);
             return Ok(());
         }
-        let index = Self::op_index(m, sqe.token.index()).ok_or(Refusal::Drop)?;
+        let index = self
+            .slots
+            .index(m, sqe.token.index())
+            .ok_or(Refusal::Drop)?;
         if self.ops[index].is_some() {
             return Err(Refusal::Drop);
         }
@@ -231,26 +321,45 @@ impl Dispatch {
             self.ready.push((m, Cqe::ok(sqe.token, 0)));
             return Ok(());
         }
+        if let Op::Timeout(after) = op {
+            self.start_timer(index, res, sqe.token.generation(), deadline(now, after));
+            return Ok(());
+        }
         let buf = match op.fills() || op.drains() {
             true => Some(arena.get_slice(sqe.buf).ok_or(IoError::BadBuf)?),
             false => None,
+        };
+        if buf.map_or(0, |b| b.len()) < op.min_buf() {
+            return Err(IoError::BadBuf.into());
+        }
+        let id = OpId::new(index as u16, sqe.token.generation());
+        let os = |fd, class, dial| OsOp {
+            id,
+            fd,
+            class,
+            op,
+            buf,
+            dial,
+        };
+        let lowered = match target {
+            Target::Fd(fd, class) => Some(os(fd, class, None)),
+            Target::Dial(to) if op == Op::Stream => Some(os(-1, Class::Dialer, Some(to))),
+            Target::Dial(_) => return Err(IoError::Unsupported.into()),
+            Target::Wire(..) => None,
         };
         self.ops[index] = Some(InFlight {
             generation: sqe.token.generation(),
             res,
             kind: op.kind(),
             canceled: false,
+            stream: lowered.filter(|_| op == Op::Stream),
+            due: None,
         });
         self.counters[usize::from(res)].submitted += 1;
-        let id = OpId::new(index as u16, sqe.token.generation());
         match target {
-            Target::Fd(fd, class) => self.routes.push(Route::Os(OsOp {
-                id,
-                fd,
-                class,
-                op,
-                buf,
-            })),
+            Target::Fd(..) | Target::Dial(_) => {
+                self.routes.extend(lowered.map(Route::Os));
+            }
             Target::Wire(w, end) => {
                 let dropped = self.wires[w].run(end, id, op, buf, &mut self.wired);
                 self.counters[usize::from(res)].dropped += dropped as u64;
@@ -258,6 +367,41 @@ impl Dispatch {
             }
         }
         Ok(())
+    }
+
+    /// Puts a timeout in flight at op `index`, landing at `at`.
+    fn start_timer(&mut self, index: usize, res: u16, generation: u16, at: Timestamp) {
+        self.ops[index] = Some(InFlight {
+            generation,
+            res,
+            kind: OpKind::Timeout,
+            canceled: false,
+            stream: None,
+            due: Some(at),
+        });
+        self.timers += 1;
+        self.counters[usize::from(res)].submitted += 1;
+    }
+
+    /// Lands every timeout whose deadline is at or before `now`.
+    pub(crate) fn expire(&mut self, now: Timestamp) {
+        for index in 0..self.ops.len() {
+            if self.timers == 0 {
+                return;
+            }
+            let Some(op) = &mut self.ops[index] else {
+                continue;
+            };
+            if op.due.take_if(|at| *at <= now).is_none() {
+                continue;
+            }
+            self.timers -= 1;
+            let id = OpId::new(index as u16, op.generation);
+            self.raise(OsDone {
+                id,
+                result: Ok(Out::Len(0)),
+            });
+        }
     }
 
     /// The live handle `raw` names in member `m`, with its resource.
@@ -269,6 +413,7 @@ impl Dispatch {
             let target = match &self.resources[usize::from(grant.res)].backed {
                 Backed::Fd(fd, class) => Target::Fd(fd.as_raw_fd(), *class),
                 Backed::Wire(w) => Target::Wire(*w, grant.end),
+                Backed::Dial(to) => Target::Dial(*to),
                 Backed::Unused => return None,
             };
             return (raw.generation() == 0).then_some((grant.res, target));
@@ -297,7 +442,7 @@ impl Dispatch {
 
     /// Cancels member `m`'s op `token`, once.
     fn cancel(&mut self, m: usize, token: Token) {
-        let Some(index) = Self::op_index(m, token.index()) else {
+        let Some(index) = self.slots.index(m, token.index()) else {
             return;
         };
         let Some(op) = &mut self.ops[index] else {
@@ -308,6 +453,11 @@ impl Dispatch {
         }
         op.canceled = true;
         let id = OpId::new(index as u16, op.generation);
+        if op.due.take().is_some() {
+            self.timers -= 1;
+            let result = Err(IoError::Canceled);
+            return self.raise(OsDone { id, result });
+        }
         match self.resources[usize::from(op.res)].backed {
             Backed::Wire(w) => {
                 self.wires[w].cancel(id, &mut self.wired);
@@ -327,11 +477,17 @@ impl Dispatch {
         let Some(op) = self.ops[index].take_if(ours) else {
             return;
         };
-        let m = index / MAX_OPS;
-        let token = Token::new((index % MAX_OPS) as u16, op.generation);
+        let (m, slot) = self.slots.owner(index);
+        let token = Token::new(slot, op.generation);
         let result = match done.result {
             Ok(Out::Len(n)) => Ok(n),
-            Ok(Out::Opened(fd, class)) => self.derive(m, op.res, fd, class),
+            Ok(Out::Opened { fd, class, peer }) => {
+                if !self.allows(op.res, peer) {
+                    return self.turn_away(m, index, op, fd);
+                }
+                write_peer(&op, peer);
+                self.derive(m, op.res, fd, class)
+            }
             Err(e) => Err(e),
         };
         if self.members[m].state != MemberState::Running {
@@ -340,6 +496,28 @@ impl Dispatch {
         self.counters[usize::from(op.res)].record_completion(op.kind, &result);
         let cqe = result.map_or_else(|e| Cqe::err(token, e), |n| Cqe::ok(token, n));
         self.ready.push((m, cqe));
+    }
+
+    /// Whether resource `res`'s `allow` list admits `peer`.
+    fn allows(&self, res: u16, peer: Option<SocketAddr>) -> bool {
+        let allow = &self.resources[usize::from(res)].allow;
+        allow.is_empty() || peer.is_some_and(|p| allow.iter().any(|c| c.contains(p.ip())))
+    }
+
+    /// Closes a stream whose peer is not allowed, and lowers its op again
+    /// unless the op was canceled or its member is quiescing.
+    fn turn_away(&mut self, m: usize, index: usize, op: InFlight, fd: OwnedFd) {
+        self.routes.push(Route::Close(fd));
+        self.counters[usize::from(op.res)].rejected += 1;
+        let running = self.members[m].state == MemberState::Running;
+        self.ops[index] = Some(op);
+        match op.stream.filter(|_| running && !op.canceled) {
+            Some(again) => self.routes.push(Route::Os(again)),
+            None => self.raise(OsDone {
+                id: OpId::new(index as u16, op.generation),
+                result: Err(IoError::Canceled),
+            }),
+        }
     }
 
     /// Raises everything a wire finished.
@@ -372,9 +550,19 @@ impl Dispatch {
         lost
     }
 
-    /// How many completions an io step owning `members` members may hold.
-    pub(crate) fn held_for(members: usize) -> usize {
-        members * MAX_OPS * HELD_PER_SLOT
+    /// How many completions an io step posting to `members` may hold.
+    pub(crate) fn held_for(&self, members: &[usize]) -> usize {
+        members.iter().map(|&m| self.ops_of(m)).sum::<usize>() * HELD_PER_SLOT
+    }
+
+    /// Member `m`'s op budget.
+    pub(crate) fn ops_of(&self, m: usize) -> usize {
+        self.slots.budget(m)
+    }
+
+    /// Every member's ops.
+    pub(crate) fn ops(&self) -> usize {
+        self.ops.len()
     }
 
     /// Maps a new descriptor to a free derived handle of member `m`, or closes
@@ -397,9 +585,10 @@ impl Dispatch {
     /// flight.
     pub(crate) fn quiesce_member(&mut self, m: usize) {
         self.members[m].state = MemberState::Quiescing;
-        for slot in 0..MAX_OPS {
-            if let Some(op) = self.ops[m * MAX_OPS + slot] {
-                self.cancel(m, Token::new(slot as u16, op.generation));
+        for index in self.slots.range(m) {
+            if let Some(op) = self.ops[index] {
+                let (_, slot) = self.slots.owner(index);
+                self.cancel(m, Token::new(slot, op.generation));
             }
         }
     }
@@ -420,7 +609,7 @@ impl Dispatch {
 
     /// Whether member `m` has nothing left in flight since `begin`.
     pub(crate) fn member_idle(&self, m: usize) -> bool {
-        let ops = &self.ops[m * MAX_OPS..(m + 1) * MAX_OPS];
+        let ops = &self.ops[self.slots.range(m)];
         match self.members[m].state {
             MemberState::Running => true,
             MemberState::Quiescing => false,
@@ -445,8 +634,10 @@ impl Dispatch {
     /// Whether any op is in flight on a descriptor. An op parked on a wire
     /// names no memory the kernel writes.
     pub(crate) fn has_kernel_ops_in_flight(&self) -> bool {
-        let real =
-            |op: &InFlight| !matches!(self.resources[usize::from(op.res)].backed, Backed::Wire(_));
+        let real = |op: &InFlight| {
+            let wired = matches!(self.resources[usize::from(op.res)].backed, Backed::Wire(_));
+            !wired && op.kind != OpKind::Timeout
+        };
         self.ops.iter().flatten().any(real)
     }
 
@@ -469,29 +660,47 @@ impl Dispatch {
             written += 1;
         }
     }
+}
 
-    /// The op table index of member `m`'s slot, if the slot is one.
-    fn op_index(m: usize, slot: u16) -> Option<usize> {
-        let slot = usize::from(slot);
-        (slot < MAX_OPS).then_some(m * MAX_OPS + slot)
-    }
+/// `after` past `now`, saturating.
+fn deadline(now: Timestamp, after: Duration) -> Timestamp {
+    let micros = i64::try_from(after.as_micros()).unwrap_or(i64::MAX);
+    Timestamp(now.0.saturating_add(micros))
+}
+
+/// Writes `peer`'s `RawAddr` into a `Stream`'s buffer, or zeroes for a
+/// stream with no peer.
+fn write_peer(op: &InFlight, peer: Option<SocketAddr>) {
+    let Some(buf) = op.stream.and_then(|s| s.buf) else {
+        return;
+    };
+    let addr = peer.map_or_else(RawAddr::new_zeroed, RawAddr::from);
+    // SAFETY: the op lent its buffer until its completion, which is being
+    // raised now, and the io steps run on one thread.
+    let bytes = unsafe { &mut *buf.as_ptr() };
+    let _ = addr.write_to_prefix(bytes);
 }
 
 #[cfg(kani)]
 mod proofs {
     use super::*;
 
-    /// Distinct members' slots never share an entry, and an entry gives back
-    /// its member and slot.
+    /// Two members of any budgets: an entry gives back its member and slot,
+    /// so no two slots share one, and it fits an `OpId`.
     #[kani::proof]
     fn index_never_aliases() {
-        let (m, slot): (u16, u16) = (kani::any(), kani::any());
-        kani::assume(usize::from(m) < (usize::from(u16::MAX) + 1) / MAX_OPS);
+        let budgets: [u16; 2] = kani::any();
+        let slots = Slots::new(budgets.into_iter());
+        kani::assume(slots.total() <= usize::from(u16::MAX) + 1);
+        let (m, slot): (bool, u16) = (kani::any(), kani::any());
         let m = usize::from(m);
-        if let Some(index) = Dispatch::op_index(m, slot) {
-            assert_eq!((index / MAX_OPS, index % MAX_OPS), (m, usize::from(slot)));
-            let id = OpId::new(index as u16, kani::any());
-            assert_eq!(usize::from(id.index()), index);
-        }
+        let Some(index) = slots.index(m, slot) else {
+            assert!(slot >= budgets[m]);
+            return;
+        };
+        assert!(slots.range(m).contains(&index));
+        assert_eq!(slots.owner(index), (m, slot));
+        let id = OpId::new(index as u16, kani::any());
+        assert_eq!(usize::from(id.index()), index);
     }
 }

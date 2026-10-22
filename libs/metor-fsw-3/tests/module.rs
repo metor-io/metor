@@ -171,7 +171,7 @@ target = Target(1)
 target.add('logs', Subscribe([LogEvent], transport=Listen('127.0.0.1:0')))
 config = target.to_config()
 assert config['packs'] == [PACK.to_json()]
-assert [system['ty'] for system in config['coordinator']['systems']] == ['fsw.subscribe']
+assert [system['ty'] for system in config['coordinator']['systems']] == ['fsw.subscribe', 'fsw.io', 'fsw.io']
 "#,
     );
 }

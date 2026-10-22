@@ -107,13 +107,10 @@ impl MsgCodec {
 /// header.
 pub(crate) const PACKET_OVERHEAD: usize = 4 + PACKET_HEADER_LEN;
 
-/// Appends one length-prefixed packet to `batch`.
-pub(crate) fn append_packet(batch: &mut Vec<u8>, ty: PacketTy, id: PacketId, payload: &[u8]) {
-    batch.extend_from_slice(&((PACKET_HEADER_LEN + payload.len()) as u32).to_le_bytes());
-    batch.push(ty as u8);
-    batch.extend_from_slice(&id);
-    batch.push(0);
-    batch.extend_from_slice(payload);
+/// The length prefix and header of a packet carrying `payload_len` bytes.
+pub(crate) fn packet_head(ty: PacketTy, id: PacketId, payload_len: usize) -> [u8; PACKET_OVERHEAD] {
+    let [a, b, c, d] = ((PACKET_HEADER_LEN + payload_len) as u32).to_le_bytes();
+    [a, b, c, d, ty as u8, id[0], id[1], 0]
 }
 
 #[cfg(test)]
@@ -126,6 +123,11 @@ mod tests {
     use crate::{DefCx, Payload, Record};
 
     use super::*;
+
+    fn append_packet(batch: &mut Vec<u8>, ty: PacketTy, id: PacketId, payload: &[u8]) {
+        batch.extend_from_slice(&packet_head(ty, id, payload.len()));
+        batch.extend_from_slice(payload);
+    }
 
     /// A record encoded as JSON, so its metadata names a codec.
     #[derive(serde::Serialize, serde::Deserialize)]

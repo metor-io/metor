@@ -5,7 +5,8 @@ use core::ops::Deref;
 
 use super::arena::Buf;
 use super::ops::{
-    AcceptOp, CloseOp, FsyncOp, GpioOp, IoOp, OpenOp, ReadOp, RecvOp, SendOp, TtyOp, WriteOp,
+    CloseOp, FsyncOp, GpioOp, IoOp, OpenOp, ReadOp, RecvOp, SendOp, StreamOp, TimeoutOp, TtyOp,
+    WriteOp,
 };
 use super::queue::{Io, Pending};
 use super::{Op, OpenFlags, RawHandle, TtyConfig, TtyQueue};
@@ -26,11 +27,11 @@ pub struct Udp;
 pub struct Dir;
 /// A file, granted directly or opened under a `Dir`.
 pub struct RegularFile;
-/// A TCP listener.
-pub struct Listen;
+/// Where streams come from: a TCP listener or a TCP dialer.
+pub struct Endpoint;
 /// A GPIO line.
 pub struct GpioLine;
-/// A connected stream, from `Listen::accept`.
+/// A connected stream, from `Endpoint::stream`.
 pub struct Stream;
 
 impl Interface for Uart {
@@ -48,8 +49,8 @@ impl Interface for Dir {
 impl Interface for RegularFile {
     const NAME: &'static str = "file";
 }
-impl Interface for Listen {
-    const NAME: &'static str = "listen";
+impl Interface for Endpoint {
+    const NAME: &'static str = "endpoint";
 }
 impl Interface for GpioLine {
     const NAME: &'static str = "gpio_line";
@@ -84,6 +85,11 @@ impl<K> Handle<K> {
         self.raw
     }
 
+    /// How many ops this handle's system may have in flight at once.
+    pub fn budget(&self) -> usize {
+        self.io.ops()
+    }
+
     fn submit<O: IoOp>(&self, op: Op, lent: O::Lent) -> Pending<O> {
         self.io.submit(self.raw, op, lent)
     }
@@ -91,6 +97,12 @@ impl<K> Handle<K> {
     /// Ends this capability. Later ops on it fail with `Stale`.
     pub fn close(&self) -> Pending<CloseOp> {
         self.submit(Op::Close, ())
+    }
+
+    /// Lands `Ok` once `after`, rounded up to a microsecond, has passed on
+    /// the cycle's clock, or `Canceled`. A wall clock's steps move it.
+    pub fn timeout(&self, after: core::time::Duration) -> Pending<TimeoutOp> {
+        self.submit(Op::Timeout(after), ())
     }
 }
 
@@ -152,9 +164,11 @@ impl Handle<Dir> {
     }
 }
 
-impl Handle<Listen> {
-    pub fn accept(&self) -> Pending<AcceptOp> {
-        self.submit(Op::Accept, ())
+impl Handle<Endpoint> {
+    /// The next stream: a listener's next allowed peer, or a dialer's new
+    /// connection. Its peer's `RawAddr` fills `peer`.
+    pub fn stream(&self, peer: Buf) -> Pending<StreamOp> {
+        self.submit(Op::Stream, peer)
     }
 }
 

@@ -264,8 +264,16 @@ writes the records it is sent onto ports of its own. Each takes one
 `transport`: `Listen`, `Connect`, or `Peer`, a link of the deployment that
 `metor build` turns into an address.
 
+Both are sequences that hold a `Cap<Endpoint>` named `ep`. `Target.add`
+makes the transport a resource named `{link}_ep` and grants it to `ep`:
+`Listen` a `tcp_listen`, `Connect` a `tcp_dial`, and `Peer` a dial that
+`metor build` resolves. A listener's `allow` list of CIDR blocks lives on
+the resource, so the IO layer closes a peer outside it before the link sees
+it. The link's ops go through `fsw.io` once per cycle, and every buffer
+comes from its arena at make.
+
 ```python
-plant_pub = plant.add("pub", Publish(transport=Listen("0.0.0.0:2240"), items=[sim]))
+plant_pub = plant.add("pub", Publish(transport=Listen("[::]:2240"), items=[sim]))
 mirror = fsw.add("plant", Subscribe(transport=Peer(plant_pub), items=[sim]))
 nav = fsw.add("nav", Nav(sensors=mirror.port(sim.sensors)))
 ```

@@ -1,13 +1,14 @@
 //! What runs ops against the host: the `Os` backends, and the dispatch
 //! between every system's queue and them.
 
+use core::net::SocketAddr;
 use core::ptr::NonNull;
 use std::collections::HashSet;
 use std::os::fd::{OwnedFd, RawFd};
 
 use indexmap::IndexMap;
 
-use super::{Backing, Cqe, Generational, IoState, MAX_OPS, ResourceEnd, ResourceIndex, Sqe};
+use super::{Backing, Cqe, Generational, IoState, ResourceIndex, Sqe};
 use crate::coordinator::BuildError;
 use crate::port::{Input, Output};
 use dispatch::Resource;
@@ -23,7 +24,7 @@ mod sys;
 mod uring;
 pub(crate) mod wire;
 
-pub(crate) use dispatch::{Backed, Dispatch, Route};
+pub(crate) use dispatch::{Backed, Dispatch, MemberDef, Route};
 pub use open::{OpenError, open};
 pub use poll::PollOs;
 pub(crate) use steps::entry;
@@ -41,6 +42,8 @@ pub enum Class {
     Stream,
     Datagram,
     Listener,
+    /// No descriptor until an op dials one.
+    Dialer,
     Tty,
     File,
     Dir,
@@ -52,7 +55,7 @@ impl Class {
     pub fn polled(self) -> bool {
         matches!(
             self,
-            Self::Stream | Self::Datagram | Self::Listener | Self::Tty
+            Self::Stream | Self::Datagram | Self::Listener | Self::Dialer | Self::Tty
         )
     }
 }
@@ -64,13 +67,16 @@ pub enum DispatchTable {}
 pub type OpId = Generational<DispatchTable>;
 
 /// An op ready for an `Os`: its descriptor and buffer resolved.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct OsOp {
     pub id: OpId,
+    /// `-1` for a `Dialer`, which has none.
     pub fd: RawFd,
     pub class: Class,
     pub op: Op,
     pub buf: Option<NonNull<[u8]>>,
+    /// Where a `Dialer`'s `Stream` connects.
+    pub dial: Option<SocketAddr>,
 }
 
 impl OsOp {
@@ -79,12 +85,23 @@ impl OsOp {
         let empty = NonNull::slice_from_raw_parts(NonNull::dangling(), 0);
         self.buf.unwrap_or(empty)
     }
+
+    /// Whether the op waits for its descriptor to take writes: a write, or
+    /// a dial's connect.
+    pub(crate) fn waits_to_write(&self) -> bool {
+        self.op.writes() || self.class == Class::Dialer
+    }
 }
 
 #[derive(Debug)]
 pub enum Out {
     Len(u32),
-    Opened(OwnedFd, Class),
+    /// A new descriptor, and for a stream its peer.
+    Opened {
+        fd: OwnedFd,
+        class: Class,
+        peer: Option<SocketAddr>,
+    },
 }
 
 impl Out {
@@ -181,11 +198,15 @@ impl Host {
         dispatch.quiesce_all();
         let mut done = Vec::new();
         for _ in 0..TEARDOWN_ROUNDS {
-            for route in dispatch.drain_routes() {
+            let routes: Vec<Route> = dispatch.drain_routes().collect();
+            for route in routes {
                 match route {
                     Route::Cancel(id) => os.cancel(id),
                     Route::Close(fd) => os.close(fd),
-                    Route::Os(_) => {}
+                    Route::Os(op) => dispatch.raise(OsDone {
+                        id: op.id,
+                        result: Err(IoError::Canceled),
+                    }),
                 }
             }
             os.submit();
@@ -204,19 +225,19 @@ impl Host {
 
 impl IoState {
     /// A target's IO: one member per system with a `Cap`, given as its id and
-    /// the resource and end of each grant, in config order. Opens every real
-    /// resource a member holds, makes a wire for each sim one, and the backend.
+    /// def, in config order. Opens every real resource a member holds, makes
+    /// a wire for each sim one, and the backend.
     pub(crate) fn build(
         resources: &IndexMap<String, Backing>,
-        members: Vec<(String, Vec<(ResourceIndex, ResourceEnd)>)>,
+        members: Vec<(String, MemberDef)>,
     ) -> Result<Self, BuildError> {
         if members.is_empty() {
             return Ok(Self::default());
         }
-        let ops = members.len() * MAX_OPS;
+        let ops = Dispatch::check_ops(members.iter().map(|(_, m)| usize::from(m.ops)).sum())?;
         let held: HashSet<ResourceIndex> = members
             .iter()
-            .flat_map(|(_, grants)| grants.iter().map(|&(res, _)| res))
+            .flat_map(|(_, m)| m.grants.iter().map(|&(res, _)| res))
             .collect();
         let mut wires = Vec::new();
         let resources = resources
@@ -227,13 +248,13 @@ impl IoState {
                 Resource::open(id, backing, held, ops, &mut wires)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let grants = members.iter().map(|(_, g)| g.clone()).collect();
-        let dispatch = Dispatch::new(grants, resources, wires)?;
+        let mut io = Self::with_members(members.iter().map(|(id, _)| id.as_str()));
+        let queues = members.iter().map(|_| MemberQueue::default()).collect();
+        let defs = members.into_iter().map(|(_, def)| def).collect();
+        let dispatch = Dispatch::new(defs, resources, wires)?;
         let os = host(ops).map_err(|e| BuildError::IoBackend {
             message: e.to_string(),
         })?;
-        let mut io = Self::with_members(members.iter().map(|(id, _)| id.as_str()));
-        let queues = members.iter().map(|_| MemberQueue::default()).collect();
         io.host = Some(Host {
             dispatch,
             os,
@@ -258,6 +279,7 @@ impl Resource {
                 wires.push(Wire::new(sim.kind, ops));
                 Backed::Wire(wires.len() - 1)
             }
+            Backing::Real(RealKind::TcpDial { addr }) if held => Backed::Dial(*addr),
             Backing::Real(kind) if held => {
                 let (fd, class) = open(kind).map_err(|e| BuildError::Open {
                     resource: id.to_string(),
@@ -267,9 +289,14 @@ impl Resource {
             }
             _ => Backed::Unused,
         };
+        let allow = match backing {
+            Backing::Real(RealKind::TcpListen { allow, .. }) => allow.as_slice().into(),
+            _ => Box::default(),
+        };
         Ok(Self {
             id: id.to_string(),
             backed,
+            allow,
         })
     }
 }

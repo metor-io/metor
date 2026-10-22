@@ -17,9 +17,9 @@ use super::{Host, MemberQueue, Os, OsDone, Route};
 use crate::coordinator::{Adapters, MakeCx, MakeError, Step, StepCx, SystemKind, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::fn_system::LOG_PORT;
+use crate::io::IoState;
 use crate::io::arena::Arena;
 use crate::io::status::ResourceStatus;
-use crate::io::{IoState, MAX_OPS};
 use crate::log::LogPort;
 use crate::port::Output;
 use crate::system::{PortDef, SystemDef};
@@ -27,9 +27,6 @@ use crate::system::{PortDef, SystemDef};
 pub const IO_TYPE: &str = "fsw.io";
 /// The output the instance with `status` writes resource counts to.
 pub const IO_STATUS_PORT: &str = "io_status";
-/// The most SQ records lowered from one member per pass: an op and a cancel
-/// for each slot. The rest wait for the next pass.
-const SQ_PER_PASS: usize = 2 * MAX_OPS;
 
 /// The params of one `fsw.io` instance.
 #[derive(Deserialize, JsonSchema, Default)]
@@ -96,13 +93,14 @@ fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, MakeError> {
     for &m in &cq_members {
         posts[m] = true;
     }
-    let ops = io.members.len() * MAX_OPS;
+    let (mut ops, mut held) = (0, 0);
     if let Some(host) = &mut io.host {
         host.bind_sqs(lowers.iter().copied().zip(inputs));
         host.bind_cqs(cq_members.iter().copied().zip(cq_rings.iter().copied()));
+        (ops, held) = (host.dispatch.ops(), host.dispatch.held_for(&cq_members));
     }
     Ok(Box::new(IoStep {
-        held: Dispatch::held_for(cq_members.len()),
+        held,
         lowers,
         posts,
         status: params.status.then(|| writer(status)),
@@ -148,8 +146,9 @@ impl Step for IoStep {
         else {
             return;
         };
-        let mut faults = self.lower(dispatch, queues, members);
+        let mut faults = self.lower(now, dispatch, queues, members);
         self.run(dispatch, os.as_mut());
+        dispatch.expire(now);
         let posts = &self.posts;
         faults.lost = dispatch.post_ready(self.held, |m, cqe| {
             posts.get(m).copied().unwrap_or(false).then_some(())?;
@@ -167,11 +166,18 @@ impl Step for IoStep {
     }
 }
 
+/// The most SQ records lowered from member `m` per pass: an op and a cancel
+/// for each slot. The rest wait for the next pass.
+fn sq_per_pass(dispatch: &Dispatch, m: usize) -> usize {
+    2 * dispatch.ops_of(m)
+}
+
 impl IoStep {
     /// Lowers what each member's SQ holds, and notes the quiescing members
     /// whose SQ is drained.
     fn lower(
         &mut self,
+        now: Timestamp,
         dispatch: &mut Dispatch,
         queues: &mut [MemberQueue],
         members: &[(String, Rc<Arena>)],
@@ -181,10 +187,11 @@ impl IoStep {
             let Some(sq) = queues.get_mut(m).and_then(|q| q.sq.as_mut()) else {
                 continue;
             };
-            for sqe in sq.drain().take(SQ_PER_PASS) {
+            for sqe in sq.drain().take(sq_per_pass(dispatch, m)) {
                 match sqe {
                     Ok(sqe) => {
-                        faults.rejected |= dispatch.lower(m, sqe, &members[m].1).is_err();
+                        let lowered = dispatch.lower(m, sqe, &members[m].1, now);
+                        faults.rejected |= lowered.is_err();
                     }
                     Err(_) => faults.corrupt = true,
                 }

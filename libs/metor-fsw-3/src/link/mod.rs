@@ -8,31 +8,36 @@
 //! records everything wired into it in an embedded metor-db, which is how a
 //! gateway stores telemetry.
 
-mod conn;
+mod batch;
+mod conns;
 #[cfg(feature = "db")]
 mod db;
-mod inbox;
+mod deframe;
+mod peer;
 mod publish;
 mod subscribe;
-mod transport;
 mod wire;
+
+use core::num::NonZeroUsize;
+use core::time::Duration;
 
 use metor_proto::types::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::Frame;
 use crate::coordinator::{BuildError, SystemTable};
+use crate::def::{DefCx, DefError};
 use crate::log::Log;
 use crate::port::Output;
+use crate::{Frame, SeqError};
 
-pub use conn::{ConnCap, ConnCapTooLarge};
+use conns::{Conns, ConnsConfig, Event, Stats};
+
 #[cfg(feature = "db")]
 pub use db::{Db, DbParams, DbStatus};
-pub use publish::{Publish, PublishParams};
-pub use subscribe::{Subscribe, SubscribeParams};
-pub use transport::Transport;
+pub use publish::Publish;
+pub use subscribe::Subscribe;
 
 /// The system type name for [`Publish`].
 pub const PUBLISH_TYPE: &str = "fsw.publish";
@@ -40,19 +45,76 @@ pub const PUBLISH_TYPE: &str = "fsw.publish";
 pub const SUBSCRIBE_TYPE: &str = "fsw.subscribe";
 /// The system type name for a gateway's embedded database.
 pub const DB_TYPE: &str = "fsw.db";
-/// Every link system type. Each one's params include [`LinkParams`].
-pub const LINK_TYPES: [&str; 2] = [PUBLISH_TYPE, SUBSCRIBE_TYPE];
 
-/// The configuration shared by every link.
+/// The configuration of a [`Publish`] or a [`Subscribe`]. Its endpoint is
+/// the resource granted to `ep`.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct LinkParams {
-    pub transport: Transport,
     /// The target's telemetry namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     /// The link's name, unique within its target.
     #[serde(default)]
     pub link: String,
+    /// The most peers served at once. A dialing link serves one.
+    #[serde(default = "max_connections")]
+    pub max_connections: NonZeroUsize,
+    /// Whether `ep` dials its peer rather than listening.
+    #[serde(default)]
+    pub dialing: bool,
+    /// The bytes of each connection's receive buffer and of each of its two
+    /// send buffers. It is also the largest batch.
+    #[serde(default = "conn_cap")]
+    pub conn_cap: usize,
+    /// How long a send may stay in flight with none finishing before its
+    /// connection closes, in milliseconds.
+    #[serde(default = "write_timeout_ms")]
+    pub write_timeout_ms: u64,
+}
+
+fn max_connections() -> NonZeroUsize {
+    // PANIC Safety: evaluated at compile time.
+    const { NonZeroUsize::new(8).expect("8 is non-zero") }
+}
+
+fn conn_cap() -> usize {
+    1 << 20
+}
+
+fn write_timeout_ms() -> u64 {
+    5_000
+}
+
+impl LinkParams {
+    fn conns(&self) -> ConnsConfig {
+        ConnsConfig {
+            slots: self.max_connections.get(),
+            conn_cap: self.conn_cap,
+            dialing: self.dialing,
+            write_timeout: Duration::from_millis(self.write_timeout_ms),
+        }
+    }
+}
+
+/// A link's op budget: [`conns::ops_for`] the slots its params ask for.
+fn link_ops(cx: &DefCx<'_>) -> Result<u16, DefError> {
+    let params = Option::<LinkParams>::deserialize(cx.params).map_err(|e| DefError::Params {
+        message: e.to_string(),
+    })?;
+    let slots = params.map_or(max_connections().get(), |p| p.conns().slot_count());
+    u16::try_from(conns::ops_for(slots)).map_err(|_| DefError::Params {
+        message: format!("{slots} connections need more ops than a system holds"),
+    })
+}
+
+/// The error a link's body ends with when its buffers do not fit its peers.
+fn failed(error: impl core::fmt::Display) -> SeqError {
+    SeqError::Failed(error.to_string().into())
+}
+
+/// The error a link's body ends with when its buffers were already taken.
+fn made_once() -> SeqError {
+    SeqError::Failed("a link runs once per make".into())
 }
 
 /// Socket statistics for a link. A link writes one on every cycle where a
@@ -74,9 +136,9 @@ pub struct LinkStatus {
 }
 
 impl LinkStatus {
-    fn new(stats: conn::Stats, inbound_dropped: u64) -> Self {
+    fn new(stats: Stats, inbound_dropped: u64, now: Timestamp) -> Self {
         Self {
-            timestamp: Timestamp::now(),
+            timestamp: now,
             connections: stats.connections,
             bytes_out: stats.bytes_out,
             batches_dropped: stats.batches_dropped,
@@ -94,19 +156,38 @@ impl LinkStatus {
     }
 }
 
-/// Writes a link's status when a counter changes.
+/// Writes a link's status when a counter changes, and logs its
+/// connections' events.
 #[derive(Default)]
 struct StatusReporter {
     reported: LinkStatus,
+    events_dropped: u64,
 }
 
 impl StatusReporter {
-    /// Writes `status` to `link_status` if any counter changed since the last
-    /// report.
+    /// Logs the events `conns` queued, and writes its status to
+    /// `link_status` if any counter changed since the last report.
     ///
     /// If more inbound packets were dropped since the last report, this also
     /// logs a fault with the count.
-    fn report(&mut self, status: LinkStatus, link_status: &mut Output<LinkStatus>, log: &mut Log) {
+    fn report(
+        &mut self,
+        conns: &mut Conns,
+        inbound_dropped: u64,
+        now: Timestamp,
+        link_status: &mut Output<LinkStatus>,
+        log: &mut Log,
+    ) {
+        for event in conns.events() {
+            log_event(event, log);
+        }
+        let events_dropped = conns.events_dropped();
+        if events_dropped > self.events_dropped {
+            let dropped = events_dropped - self.events_dropped;
+            log.warn(format!("{dropped} connection events dropped"));
+            self.events_dropped = events_dropped;
+        }
+        let status = LinkStatus::new(conns.stats(), inbound_dropped, now);
         if status.inbound_dropped > self.reported.inbound_dropped {
             let dropped = status.inbound_dropped - self.reported.inbound_dropped;
             log.fault("inbound_dropped", format!("{dropped} packets dropped"));
@@ -118,49 +199,29 @@ impl StatusReporter {
     }
 }
 
+fn log_event(event: Event, log: &mut Log) {
+    match event {
+        Event::Opened(Some(peer)) => log.info(format!("connected to {peer}")),
+        Event::Opened(None) => log.info("connected"),
+        Event::Closed => log.info("disconnected"),
+        Event::Refused => log.warn("refused a peer: every connection is taken"),
+        Event::Failed(error) => log.warn(format!("no stream opened: {error}")),
+    }
+}
+
 /// Registers the link systems into `table`.
 pub(crate) fn register(table: &mut SystemTable) -> Result<(), BuildError> {
-    table.register_async(PUBLISH_TYPE, publish::publish(), Publish::new)?;
-    table.register_async(SUBSCRIBE_TYPE, subscribe::subscribe(), Subscribe::new)?;
+    table.register_sequence(PUBLISH_TYPE, publish::publish(), Publish::new)?;
+    table.register_sequence(SUBSCRIBE_TYPE, subscribe::subscribe(), Subscribe::new)?;
+    for ty in [PUBLISH_TYPE, SUBSCRIBE_TYPE] {
+        if let Some(entry) = table.get_mut(ty) {
+            entry.set_ops(link_ops);
+        }
+    }
     #[cfg(feature = "db")]
     table.register_async(DB_TYPE, db::db(), Db::new)?;
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_status_changes_on_counters_only() {
-        let status = LinkStatus {
-            connections: 1,
-            ..Default::default()
-        };
-        let restamped = LinkStatus {
-            timestamp: Timestamp(9),
-            ..status
-        };
-        assert!(!status.changed(&restamped));
-        for moved in [
-            LinkStatus {
-                connections: 2,
-                ..status
-            },
-            LinkStatus {
-                bytes_out: 1,
-                ..status
-            },
-            LinkStatus {
-                batches_dropped: 1,
-                ..status
-            },
-            LinkStatus {
-                inbound_dropped: 1,
-                ..status
-            },
-        ] {
-            assert!(status.changed(&moved), "{moved:?}");
-        }
-    }
-}
+mod tests;

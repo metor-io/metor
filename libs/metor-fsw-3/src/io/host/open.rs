@@ -20,7 +20,8 @@ pub enum OpenError {
     Configure(IoError),
 }
 
-/// Opens `kind`, set up and nonblocking where its ops wait for readiness.
+/// Opens `kind`, set up and nonblocking where its ops wait for readiness. A
+/// `TcpDial` opens a socket per op instead, so it has nothing to open.
 pub fn open(kind: &RealKind) -> Result<(OwnedFd, Class), OpenError> {
     Ok(match kind {
         RealKind::Tty { path, baud } => (open_tty(path, *baud)?, Class::Tty),
@@ -33,11 +34,12 @@ pub fn open(kind: &RealKind) -> Result<(OwnedFd, Class), OpenError> {
         RealKind::Udp { bind, connect } => (open_udp(*bind, *connect)?, Class::Datagram),
         RealKind::File { path, access } => (open_file(path, *access)?, Class::File),
         RealKind::Dir { path } => (open_dir(path)?, Class::Dir),
-        RealKind::TcpListen { addr } => {
+        RealKind::TcpListen { addr, .. } => {
             let listener = TcpListener::bind(*addr)?;
             listener.set_nonblocking(true)?;
             (listener.into(), Class::Listener)
         }
+        RealKind::TcpDial { .. } => return Err(OpenError::Unsupported("opening a dialer")),
     })
 }
 

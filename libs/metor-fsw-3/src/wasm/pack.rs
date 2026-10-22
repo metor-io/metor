@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
 use crate::dl::{InstanceRings, PackError};
-use crate::io::{Cqe, IoState, Sqe};
+use crate::io::{Cqe, DEFAULT_OPS, IoState, Sqe};
 use crate::mirror::{Mirror, Mirrors, mirror_config};
 use crate::pack::def::{DefCxOwned, Instance, PackDef};
 use crate::port::Input;
@@ -252,9 +252,11 @@ fn attach(
     let base = guest
         .host_ptr(region.offset, len)
         .map_err(PackError::from)?;
+    let ops = instance.def.io.map_or(DEFAULT_OPS, |ports| ports.ops);
+    let guest = NonNull::slice_from_raw_parts(base, len);
     // SAFETY: the guest's memory never moves, and `WasmStep` drops the copy
     // before the guest.
-    Ok(unsafe { IoCopy::new(NonNull::slice_from_raw_parts(base, len), mirror, sq, cq) })
+    Ok(unsafe { IoCopy::new(guest, mirror, sq, cq, ops) })
 }
 
 impl Create<'_> {

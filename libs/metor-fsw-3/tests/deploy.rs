@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use common::{
     DEADLINE, Deadline, Fsw, Running, Source, Target, dial_fsw, fixture_dir, free_ports, local,
-    metor, ports_env, source,
+    lower_links, metor, ports_env, source,
 };
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::coordinator::{CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
@@ -222,7 +222,7 @@ fn impostor(port: u16) -> Impostor {
         register_builtins(&mut table).expect("valid records");
         table
     };
-    let config = CoordinatorConfig {
+    let mut config = CoordinatorConfig {
         clock: Clock::Wall {
             rate: WallRate::try_from(1000.0).expect("a valid rate"),
         },
@@ -241,6 +241,7 @@ fn impostor(port: u16) -> Impostor {
         ],
         ..Default::default()
     };
+    lower_links(&mut config);
     Impostor {
         _target: Target::spawn(config, table, Arc::new(AtomicU64::new(0))),
         gate,
@@ -253,9 +254,9 @@ async fn test_peer_announcing_another_table_is_faulted() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let out = dir.path().join("deploy.json");
     let built = build(Some(&ports), &out);
-    let mirror = &built["targets"][1]["coordinator"]["systems"][0];
+    let mirror = &built["targets"][1]["coordinator"]["resources"]["mirror_ep"];
     assert_eq!(
-        mirror["params"]["transport"]["connect"]["addr"],
+        mirror["real"]["tcp_dial"]["addr"],
         json!(format!("127.0.0.1:{}", ports[0])),
         "{mirror}"
     );

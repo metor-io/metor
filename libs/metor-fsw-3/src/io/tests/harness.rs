@@ -1,5 +1,5 @@
 use super::allocations;
-use crate::io::test::{ScriptedUart, TestIo, cap};
+use crate::io::test::{ScriptedUart, TestIo, cap, cap_with_ops};
 use crate::io::*;
 
 /// A system with one read in flight, on a `Cap` from `test::cap`.
@@ -129,4 +129,40 @@ fn driver_configures_once_then_reads() {
     }
     assert_eq!(model.written(), [b"$PMTK".to_vec()]);
     assert_eq!(s.got, b"$GPGGA");
+}
+
+#[test]
+fn cap_with_ops_holds_its_budget_in_flight() {
+    let (uart, mut io) = cap_with_ops::<Uart>(40);
+    let bufs: Vec<_> = io.make(|init| (0..41).map(|_| init.alloc(1)).collect());
+    let mut reads: Vec<_> = bufs.into_iter().map(|b| uart.read(b)).collect();
+    let (last, _) = reads.pop().unwrap().poll().unwrap();
+    assert_eq!(last, Err(IoError::QueueFull));
+    io.turn();
+    assert_eq!(io.submitted().len(), 40);
+}
+
+#[test]
+fn a_timeout_lands_on_the_turn_its_time_passes() {
+    let (uart, mut io) = cap::<Uart>();
+    let mut wait = uart.timeout(core::time::Duration::from_millis(30));
+    for turn in 1..=3 {
+        io.turn();
+        let landed = wait.poll();
+        assert_eq!(landed.is_some(), turn == 3, "turn {turn}");
+        if let Some(result) = landed {
+            assert_eq!(result, Ok(()));
+        }
+    }
+}
+
+#[test]
+fn a_canceled_timeout_never_lands_ok() {
+    let (uart, mut io) = cap::<Uart>();
+    let mut wait = uart.timeout(core::time::Duration::from_millis(10));
+    wait.cancel();
+    io.turn();
+    assert_eq!(wait.poll(), Some(Err(IoError::Canceled)));
+    io.turn();
+    assert_eq!(wait.poll(), None);
 }

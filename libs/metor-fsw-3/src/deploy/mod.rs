@@ -1,6 +1,6 @@
 //! Resolves the references between targets in a deployment.
 //!
-//! A deployment's config can refer to a target's peers: a link can dial
+//! A deployment's config can refer to a target's peers: a resource can dial
 //! another target's link by name, and an output port can take its definition
 //! from a peer's port. `metor build` replaces each of these references with
 //! the concrete address or port definition it stands for. After that, each
@@ -9,119 +9,99 @@
 mod config;
 mod error;
 mod index;
-mod part;
 mod slot;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::coordinator::{OutputSource, SystemTable};
 use crate::dl::SLOT_TYPE;
-use crate::link::{LINK_TYPES, Transport};
+use crate::io::{Backing, RealKind};
 
 pub use config::{
-    CONFIG_VERSION, ConfigError, DeploySource, DeploySystem, DeploymentConfig, PeerLink, PeerPort,
-    ResolvedDeployment, TargetConfig,
+    CONFIG_VERSION, ConfigError, DeployBacking, DeploySource, DeploySystem, DeploymentConfig,
+    PeerLink, PeerPort, ResolvedDeployment, TargetConfig,
 };
 pub use error::DeployError;
 use index::{DefIndex, SystemIndex};
-use part::Part;
 use slot::DeploySlot;
 
 /// The host a peer is dialed on when the deployment gives it no host.
 pub const LOOPBACK: &str = "127.0.0.1";
 
-/// A system's params, as the deployment passes read them.
-enum DeployParams {
-    Link(Part<LinkPart>),
-    Slot(DeploySlot),
-    /// Any other system, and the address it listens on, if it has a
-    /// top-level `listen` param.
-    Other {
-        listen: Option<String>,
-    },
-}
+/// A resource: the index of its target, and its id.
+type ResourceKey = (usize, String);
 
-impl DeployParams {
-    /// Decodes the params of `system`, at `index`, by its type.
-    fn read(
-        envelope: &DeploymentConfig,
-        index: SystemIndex,
-        system: &DeploySystem,
-    ) -> Result<Self, DeployError> {
-        match system.ty.as_str() {
-            ty if LINK_TYPES.contains(&ty) => Part::read(system).map(Self::Link),
-            SLOT_TYPE => DeploySlot::read(envelope, index, system).map(Self::Slot),
-            _ => {
-                let listen = system.params.get("listen").and_then(Value::as_str);
-                let listen = listen.map(str::to_string);
-                Ok(Self::Other { listen })
-            }
-        }
-    }
-
-    /// The address the system listens on, if it listens.
-    fn listen(&self) -> Option<&str> {
-        match self {
-            Self::Link(params) => match &params.part.transport {
-                DeployTransport::Runtime(Transport::Listen { addr, .. }) => Some(addr),
-                _ => None,
-            },
-            Self::Other { listen } => listen.as_deref(),
-            Self::Slot(_) => None,
-        }
-    }
-}
-
-/// What a deployment still has to resolve: its links' params, and the slots
-/// whose candidates point at packs, each decoded once.
+/// What a deployment still has to resolve: the address each system listens
+/// on, and the slots whose candidates point at packs, each decoded once.
 pub struct Pending {
-    links: Links,
+    listen: Listeners,
     slots: Vec<(SystemIndex, DeploySlot)>,
 }
 
-/// Decodes every system's params in `envelope` once, and returns them if a
+/// Decodes every slot's params in `envelope` once, and returns them if a
 /// peer reference or a slot candidate that points at a pack is left.
 ///
 /// # Errors
-/// Returns an error if a link's or a slot's params do not decode.
+/// Returns an error if a slot's params do not decode.
 pub fn pending(envelope: &DeploymentConfig) -> Result<Option<Pending>, DeployError> {
     let mut pending = Pending {
-        links: Links {
-            links: HashMap::new(),
-            listen: HashMap::new(),
-        },
+        listen: Listeners(HashMap::new()),
         slots: Vec::new(),
     };
     for (index, system) in SystemIndex::iter(envelope) {
-        let params = DeployParams::read(envelope, index, system)?;
-        if let Some(addr) = params.listen() {
-            pending.links.listen.insert(index, addr.to_string());
+        if let Some(addr) = listen_addr(envelope, index, system) {
+            pending.listen.0.insert(index, addr);
         }
-        match params {
-            DeployParams::Link(part) => {
-                pending.links.links.insert(index, part);
+        if system.ty == SLOT_TYPE {
+            let slot = DeploySlot::read(envelope, index, system)?;
+            if slot.pending() {
+                pending.slots.push((index, slot));
             }
-            DeployParams::Slot(slot) if slot.pending() => pending.slots.push((index, slot)),
-            DeployParams::Slot(_) | DeployParams::Other { .. } => {}
         }
     }
     let peer_output = SystemIndex::iter(envelope).any(|(_, system)| {
         let mut outputs = system.outputs.iter();
         outputs.any(|output| matches!(output.source, DeploySource::Peer(_)))
     });
-    let left = peer_output || pending.links.dials_peer() || !pending.slots.is_empty();
+    let peer_dial = envelope.targets.iter().any(|target| {
+        let mut resources = target.coordinator.resources.values();
+        resources.any(|r| matches!(r, DeployBacking::Peer(_)))
+    });
+    let left = peer_output || peer_dial || !pending.slots.is_empty();
     Ok(left.then_some(pending))
+}
+
+/// The address `system` listens on: its `listen` param, or the
+/// `tcp_listen` resource it is granted.
+fn listen_addr(
+    envelope: &DeploymentConfig,
+    index: SystemIndex,
+    system: &DeploySystem,
+) -> Option<String> {
+    if let Some(addr) = system.params.get("listen").and_then(Value::as_str) {
+        return Some(addr.to_string());
+    }
+    let resources = &envelope.targets[index.target].coordinator.resources;
+    system
+        .grants
+        .values()
+        .find_map(|id| match resources.get(id)? {
+            DeployBacking::Runtime(Backing::Real(RealKind::TcpListen { addr, .. })) => {
+                Some(addr.to_string())
+            }
+            _ => None,
+        })
 }
 
 impl Pending {
     /// Resolves every slot, copying candidate libraries into `store`, then
     /// every peer reference.
     ///
-    /// `tables` holds one system table per target. Peer transports become
+    /// `tables` holds one system table per target. Peer dials become
     /// addresses, and peer outputs become port definitions.
     pub fn resolve(
         self,
@@ -130,23 +110,22 @@ impl Pending {
         store: &Path,
     ) -> Result<(), DeployError> {
         slot::resolve_slots(envelope, tables, store, self.slots)?;
-        resolve_peers(envelope, tables, self.links)
+        resolve_peers(envelope, tables, &self.listen)
     }
 }
 
-/// Resolves every peer reference in `envelope`, using its decoded `links`.
+/// Resolves every peer reference in `envelope`.
 fn resolve_peers(
     envelope: &mut DeploymentConfig,
     tables: &[SystemTable],
-    mut links: Links,
+    listen: &Listeners,
 ) -> Result<(), DeployError> {
-    let plan = plan(envelope, tables, &links)?;
-    check_ports(envelope, &links)?;
-    for (index, addr) in plan.transports {
-        // PANIC Safety: `plan` only names systems that `links` decoded.
-        let mut params = links.links.remove(&index).expect("a decoded link");
-        params.part.transport = DeployTransport::Runtime(Transport::Connect { addr });
-        params.write(index.get_mut(envelope))?;
+    let plan = plan(envelope, tables, listen)?;
+    check_ports(envelope, listen)?;
+    for ((target, id), addr) in plan.dials {
+        let dial = Backing::Real(RealKind::TcpDial { addr });
+        let resources = &mut envelope.targets[target].coordinator.resources;
+        resources.insert(id, DeployBacking::Runtime(dial));
     }
     for ((index, output), def) in plan.outputs {
         let source = DeploySource::Runtime(OutputSource::Def(def));
@@ -155,79 +134,48 @@ fn resolve_peers(
     Ok(())
 }
 
-/// A link's transport as a deployment writes it: a runtime transport, or
-/// another link to dial.
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum DeployTransport {
-    Peer(PeerLink),
-    #[serde(untagged)]
-    Runtime(Transport),
-}
+/// The address each system listens on, decoded once.
+struct Listeners(HashMap<SystemIndex, String>);
 
-/// The part of a link's params that a deployment resolves.
-#[derive(Serialize, Deserialize)]
-struct LinkPart {
-    transport: DeployTransport,
-}
-
-/// The params of every link in a deployment, and the address each system
-/// listens on, decoded once.
-struct Links {
-    links: HashMap<SystemIndex, Part<LinkPart>>,
-    listen: HashMap<SystemIndex, String>,
-}
-
-impl Links {
-    fn get(&self, index: SystemIndex) -> Option<&LinkPart> {
-        self.links.get(&index).map(|params| &params.part)
-    }
-
-    /// Whether any link dials a peer.
-    fn dials_peer(&self) -> bool {
-        self.links
-            .values()
-            .any(|params| matches!(params.part.transport, DeployTransport::Peer(_)))
-    }
-
+impl Listeners {
     /// The port the system at `index` listens on, unless it is zero or the
     /// system does not listen.
     fn fixed_port(&self, index: SystemIndex) -> Option<u16> {
-        let port: u16 = self.listen.get(&index)?.rsplit_once(':')?.1.parse().ok()?;
+        let port: u16 = self.0.get(&index)?.rsplit_once(':')?.1.parse().ok()?;
         (port != 0).then_some(port)
     }
 }
 
 struct Plan {
-    transports: Vec<(SystemIndex, String)>,
+    dials: BTreeMap<ResourceKey, SocketAddr>,
     outputs: Vec<((SystemIndex, usize), crate::PortDef)>,
 }
 
 fn plan(
     envelope: &DeploymentConfig,
     tables: &[SystemTable],
-    links: &Links,
+    listen: &Listeners,
 ) -> Result<Plan, DeployError> {
     let mut defs = DefIndex::new(envelope, tables);
     let mut plan = Plan {
-        transports: Vec::new(),
+        dials: BTreeMap::new(),
         outputs: Vec::new(),
     };
     for (index, system) in SystemIndex::iter(envelope) {
-        plan.add(envelope, &mut defs, links, index)
+        plan.add(envelope, &mut defs, listen, index)
             .map_err(|e| e.at(system.location.as_ref()))?;
     }
     Ok(plan)
 }
 
 impl Plan {
-    /// Plans the peer outputs and the peer transport of the system at
-    /// `index`.
+    /// Plans the peer outputs of the system at `index`, and the peer dials
+    /// it is granted.
     fn add(
         &mut self,
         envelope: &DeploymentConfig,
         defs: &mut DefIndex<'_>,
-        links: &Links,
+        listen: &Listeners,
         index: SystemIndex,
     ) -> Result<(), DeployError> {
         let system = index.get(envelope);
@@ -237,30 +185,51 @@ impl Plan {
                 self.outputs.push(((index, output_index), def));
             }
         }
-        let Some(DeployTransport::Peer(peer)) = links.get(index).map(|params| &params.transport)
-        else {
-            return Ok(());
-        };
-        let from = defs.name(index);
-        let peer_index = defs.locate(&from, &peer.target, &peer.link)?;
-        let port = links
-            .fixed_port(peer_index)
-            .ok_or_else(|| DeployError::NotAListener {
-                from: from.clone(),
-                target: peer.target.clone(),
-                link: peer.link.clone(),
-            })?;
-        self.transports
-            .push((index, address(host(envelope, &peer.target), port)));
+        let resources = &envelope.targets[index.target].coordinator.resources;
+        for id in system.grants.values() {
+            if let Some(DeployBacking::Peer(peer)) = resources.get(id) {
+                let addr = dial_addr(envelope, defs, listen, index, peer)?;
+                self.dials.insert((index.target, id.clone()), addr);
+            }
+        }
         Ok(())
     }
 }
 
+/// The address the system at `from` dials to reach `peer`.
+fn dial_addr(
+    envelope: &DeploymentConfig,
+    defs: &DefIndex<'_>,
+    listen: &Listeners,
+    from: SystemIndex,
+    peer: &PeerLink,
+) -> Result<SocketAddr, DeployError> {
+    let from = defs.name(from);
+    let peer_index = defs.locate(&from, &peer.target, &peer.link)?;
+    let port = listen
+        .fixed_port(peer_index)
+        .ok_or_else(|| DeployError::NotAListener {
+            from: from.clone(),
+            target: peer.target.clone(),
+            link: peer.link.clone(),
+        })?;
+    let addr = address(host(envelope, &peer.target), port);
+    let unresolved = |message: String| DeployError::Address {
+        from: from.clone(),
+        addr: addr.clone(),
+        message,
+    };
+    addr.to_socket_addrs()
+        .map_err(|e| unresolved(e.to_string()))?
+        .next()
+        .ok_or_else(|| unresolved("no address".into()))
+}
+
 /// Checks that no two listeners on the same host bind the same port.
-fn check_ports(envelope: &DeploymentConfig, links: &Links) -> Result<(), DeployError> {
+fn check_ports(envelope: &DeploymentConfig, listen: &Listeners) -> Result<(), DeployError> {
     let mut bound: HashMap<(String, u16), String> = HashMap::new();
     for (index, system) in SystemIndex::iter(envelope) {
-        let Some(port) = links.fixed_port(index) else {
+        let Some(port) = listen.fixed_port(index) else {
             continue;
         };
         let target = &envelope.targets[index.target];

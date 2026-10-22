@@ -3,13 +3,14 @@
 
 use core::marker::PhantomData;
 use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use core::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
-use super::{Errno, IoError, IoStatus, MAX_OPS};
+use super::{DEFAULT_OPS, Errno, IoError, IoStatus};
 use crate::record::{DecodeError, EncodeError, MsgCodec, Payload, Record, RecordSchema};
 
 /// Bytes in the submitting system's arena.
@@ -144,12 +145,13 @@ pub enum OpKind {
     Open,
     Close,
     Fsync,
-    Accept,
+    Stream,
     TtyConfigure,
     TtyFlush,
     GpioGet,
     GpioSet,
     Cancel,
+    Timeout,
 }
 
 /// `TryFrom<u8>` for a one-byte code, failing with `Unsupported`.
@@ -421,6 +423,10 @@ pub struct RawAddr {
     scope_id: U32,
 }
 
+impl RawAddr {
+    pub const LEN: usize = size_of::<Self>();
+}
+
 impl From<SocketAddr> for RawAddr {
     fn from(addr: SocketAddr) -> Self {
         let (family, ip, flowinfo, scope_id) = match addr {
@@ -478,13 +484,17 @@ pub enum Op {
     Open(OpenFlags),
     Close,
     Fsync,
-    Accept,
+    /// Opens the endpoint's next stream, and writes its peer's `RawAddr`
+    /// into the op's buffer.
+    Stream,
     TtyConfigure(TtyConfig),
     TtyFlush(TtyQueue),
     GpioGet,
     GpioSet(bool),
     /// Cancels the op whose token the `Sqe` carries.
     Cancel,
+    /// Lands once this long has passed on the cycle's clock.
+    Timeout(Duration),
 }
 
 impl Op {
@@ -498,18 +508,27 @@ impl Op {
             Self::Open(_) => OpKind::Open,
             Self::Close => OpKind::Close,
             Self::Fsync => OpKind::Fsync,
-            Self::Accept => OpKind::Accept,
+            Self::Stream => OpKind::Stream,
             Self::TtyConfigure(_) => OpKind::TtyConfigure,
             Self::TtyFlush(_) => OpKind::TtyFlush,
             Self::GpioGet => OpKind::GpioGet,
             Self::GpioSet(_) => OpKind::GpioSet,
             Self::Cancel => OpKind::Cancel,
+            Self::Timeout(_) => OpKind::Timeout,
         }
     }
 
     /// Whether the op writes into its buffer, up to its capacity.
     pub fn fills(&self) -> bool {
-        matches!(self, Self::Read { .. } | Self::Recv)
+        matches!(self, Self::Read { .. } | Self::Recv | Self::Stream)
+    }
+
+    /// The fewest bytes the op's buffer may span.
+    pub fn min_buf(&self) -> usize {
+        match self {
+            Self::Stream => RawAddr::LEN,
+            _ => 0,
+        }
     }
 
     /// Whether the op reads its buffer's filled bytes.
@@ -527,7 +546,7 @@ impl Op {
 
     /// Whether a success completes with a new handle.
     pub fn opens(&self) -> bool {
-        matches!(self, Self::Open(_) | Self::Accept)
+        matches!(self, Self::Open(_) | Self::Stream)
     }
 }
 
@@ -545,13 +564,19 @@ pub struct Sqe {
     pub aux: u8,
     _p: [u8; 2],
     pub buf: Span,
-    /// The file offset, or [`CURRENT_POSITION`].
+    /// The file offset, or [`CURRENT_POSITION`]; a timeout's microseconds.
     pub offset: U64,
     /// A `TtyConfig`, `OpenFlags`, or `RawAddr`.
     pub arg: [u8; 28],
 }
 
 impl Sqe {
+    /// The SQ depth a system with `ops` ops in flight needs: an op and a
+    /// cancel for each.
+    pub const fn depth(ops: u16) -> usize {
+        2 * ops as usize
+    }
+
     pub fn new(token: Token, handle: RawHandle, op: &Op, buf: Span) -> Self {
         let mut sqe = Self {
             token,
@@ -572,6 +597,10 @@ impl Sqe {
             Op::TtyConfigure(cfg) => sqe.set_arg(&cfg),
             Op::TtyFlush(queue) => sqe.aux = queue as u8,
             Op::GpioSet(level) => sqe.aux = u8::from(level),
+            Op::Timeout(after) => {
+                let micros = u64::try_from(after.as_nanos().div_ceil(1000)).unwrap_or(u64::MAX);
+                sqe.offset = U64::new(micros);
+            }
             _ => {}
         }
         sqe
@@ -589,12 +618,13 @@ impl Sqe {
             OpKind::Open => Op::Open(self.arg()),
             OpKind::Close => Op::Close,
             OpKind::Fsync => Op::Fsync,
-            OpKind::Accept => Op::Accept,
+            OpKind::Stream => Op::Stream,
             OpKind::TtyConfigure => Op::TtyConfigure(self.try_arg()?),
             OpKind::TtyFlush => Op::TtyFlush(self.aux.try_into()?),
             OpKind::GpioGet => Op::GpioGet,
             OpKind::GpioSet => Op::GpioSet(self.aux != 0),
             OpKind::Cancel => Op::Cancel,
+            OpKind::Timeout => Op::Timeout(Duration::from_micros(self.offset.get())),
         })
     }
 
@@ -664,8 +694,7 @@ impl Payload for Sqe {
 impl Record for Sqe {
     const NAME: &'static str = "io_sqe";
     const MAX_LEN: usize = size_of::<Sqe>();
-    /// A system's ops in flight, plus a cancel for each.
-    const DEPTH: usize = 2 * MAX_OPS;
+    const DEPTH: usize = Sqe::depth(DEFAULT_OPS);
 
     fn schema_with_root(_root: &str) -> RecordSchema {
         RecordSchema::msg(Self::NAME, MsgCodec::Other("io.sqe".into()))
@@ -687,7 +716,7 @@ impl Payload for Cqe {
 impl Record for Cqe {
     const NAME: &'static str = "io_cqe";
     const MAX_LEN: usize = size_of::<Cqe>();
-    const DEPTH: usize = MAX_OPS;
+    const DEPTH: usize = DEFAULT_OPS as usize;
 
     fn schema_with_root(_root: &str) -> RecordSchema {
         RecordSchema::msg(Self::NAME, MsgCodec::Other("io.cqe".into()))

@@ -9,17 +9,22 @@ their pack has no library and is left out of the config's pack list.
 
 `Publish` and `Subscribe` each take one `transport`: `Listen` on an
 address, `Connect` to an address, or dial a `Peer` link in the same
-deployment, which `metor build` turns into an address. A `Db` only listens.
+deployment, which `metor build` turns into an address. `Target.add` makes
+the transport a resource named ``{name}_ep`` and grants it to the link's
+`ep`. A `Db` only listens.
 """
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 from dataclasses import dataclass
 from typing import Any, Sequence, TypeVar
 
 from . import _generated
 from ._config import ConfigError
 from ._generated import IO_RECORDS, SequenceRegistry
+from ._io import Kind, PeerDial, TcpDial, TcpListen
 from ._model import (
     Item,
     OutPort,
@@ -38,28 +43,31 @@ T = TypeVar("T", bound=Record)
 
 MAX_CONNECTIONS = 8
 CONN_CAP = 1 << 20
-INBOUND_CAP = 256
 
 
 @dataclass(frozen=True)
 class Listen:
-    """Listen on ``addr`` and serve up to ``max_connections`` peers at once."""
+    """Listen on ``addr`` and serve up to ``max_connections`` peers at once,
+    taking peers from the ``allow`` CIDR blocks, or any peer when ``allow``
+    is empty."""
 
     addr: str
     max_connections: int = MAX_CONNECTIONS
+    allow: Sequence[str] = ()
 
-    def to_json(self) -> dict[str, Any]:
-        return {"listen": {"addr": self.addr, "max_connections": self.max_connections}}
+    def _kind(self) -> Kind:
+        return TcpListen(self.addr, tuple(self.allow))
 
 
 @dataclass(frozen=True)
 class Connect:
-    """Dial ``addr`` and keep one connection open."""
+    """Dial ``addr`` and keep one connection open. A host name resolves
+    when the config is built."""
 
     addr: str
 
-    def to_json(self) -> dict[str, Any]:
-        return {"connect": {"addr": self.addr}}
+    def _kind(self) -> Kind:
+        return TcpDial(_resolve(self.addr))
 
 
 @dataclass(frozen=True)
@@ -72,12 +80,34 @@ class Peer:
         if not isinstance(self.link, SystemHandle):
             raise ConfigError(f"`Peer` takes a link's handle, got {self.link!r}")
 
-    def to_json(self) -> dict[str, Any]:
-        return {"peer": {"target": _namespace(self.link), "link": self.link._name}}
+    def _kind(self) -> Kind:
+        return PeerDial(_namespace(self.link), self.link._name)
 
 
 Transport = Listen | Connect | Peer
 """How a link gets its connections."""
+
+
+def _resolve(addr: str) -> str:
+    """Returns ``addr`` with its host resolved to an IP address."""
+    host, sep, port = addr.rpartition(":")
+    if not sep or not port.isdigit():
+        raise ConfigError(f"`{addr}` is not a `host:port` address")
+    bracketed = host.startswith("[") and host.endswith("]")
+    host = host.removeprefix("[").removesuffix("]")
+    if ":" in host and not bracketed:
+        raise ConfigError(f"`{addr}` names an IPv6 host without brackets, as `[::1]:2240`")
+    try:
+        ipaddress.ip_address(host)
+        return addr
+    except ValueError:
+        pass
+    try:
+        found = socket.getaddrinfo(host, int(port), type=socket.SOCK_STREAM)
+    except OSError as e:
+        raise ConfigError(f"`{addr}` does not resolve: {e}") from None
+    family, ip = found[0][0], found[0][4][0]
+    return f"[{ip}]:{port}" if family == socket.AF_INET6 else f"{ip}:{port}"
 
 
 class Link(System):
@@ -86,6 +116,8 @@ class Link(System):
 
     Peers identify a link by its target's namespace and its own name.
     """
+
+    _caps = ("ep",)
 
     def __init__(
         self,
@@ -105,30 +137,42 @@ class Link(System):
     def _peer(self) -> SystemHandle | None:
         return self._transport.link if isinstance(self._transport, Peer) else None
 
+    def _bind(self, target: Target, name: str) -> None:
+        if not name.isidentifier():
+            raise ConfigError(f"a link's name is an identifier, got {name!r}")
+        target.resource(_endpoint(name), self._transport._kind())
+
+    def _grants_for(self, target: Target, index: int) -> dict[str, Any]:
+        return {"ep": target._resources[_endpoint(target._systems[index].name)]}
+
     def _params_for(self, target: Any, index: int) -> Any:
-        link = target._systems[index].name
-        return {
-            "transport": self._transport.to_json(),
+        params = {
             "namespace": target.namespace,
-            "link": link,
+            "link": target._systems[index].name,
             **self._params,
         }
+        if isinstance(self._transport, Listen):
+            params["max_connections"] = self._transport.max_connections
+        else:
+            params["dialing"] = True
+        return params
 
 
-class Sink(Link):
-    """A link that reads the ports listed in `items`.
+def _endpoint(link: str) -> str:
+    """The name of the resource link ``link`` is granted as its `ep`."""
+    return f"{link}_ep"
+
+
+class _Sink(System):
+    """A system that reads the ports listed in `items`.
 
     With `all`, it also reads every port of every system added before it.
     """
 
-    def __init__(
-        self,
-        params: dict[str, Any],
-        transport: Transport,
-        items: Sequence[Item],
-        all: bool,
-    ) -> None:
-        super().__init__(params, transport, items=items)
+    _items: list[Item] = []
+    _all: bool = False
+
+    def _sink(self, items: Sequence[Item], all: bool) -> None:
         self._items = list(items)
         self._all = all
 
@@ -140,7 +184,7 @@ class Sink(Link):
         return _edges(_item_ports(self._items) + ports)
 
 
-class Publish(Sink, _generated.Publish):
+class Publish(_Sink, Link, _generated.Publish):
     """Sends records to every connected peer.
 
     `items` lists what to publish. An item is either a system handle, which
@@ -156,10 +200,11 @@ class Publish(Sink, _generated.Publish):
         conn_cap: int = CONN_CAP,
         all: bool = False,
     ) -> None:
-        super().__init__({"conn_cap": conn_cap}, transport, items, all)
+        super().__init__({"conn_cap": conn_cap}, transport, items=items)
+        self._sink(items, all)
 
 
-class Db(Sink, _generated.Db):
+class Db(_Sink, _generated.Db):
     """An embedded database that records telemetry.
 
     It stores every record from the ports in `items`, and serves the database
@@ -178,7 +223,8 @@ class Db(Sink, _generated.Db):
         items: Sequence[Item] = (),
         all: bool = False,
     ) -> None:
-        super().__init__({}, Listen(listen), items, all)
+        super().__init__({}, {}, items=items)
+        self._sink(items, all)
         self._listen = listen
         self._path = path
 
@@ -226,15 +272,10 @@ class Subscribe(Link, _generated.Subscribe):
         transport: Transport,
         items: Sequence[Item] = (),
         conn_cap: int = CONN_CAP,
-        inbound_cap: int = INBOUND_CAP,
     ) -> None:
         if items and not isinstance(transport, Peer):
             raise ConfigError("`items` names a peer's ports, so it needs a `Peer` transport")
-        super().__init__(
-            {"conn_cap": conn_cap, "inbound_cap": inbound_cap},
-            transport,
-            records=records,
-        )
+        super().__init__({"conn_cap": conn_cap}, transport, records=records)
         self._items = list(items)
         self._records = list(records)
         self._copies: list[Copy] | None = None
@@ -360,7 +401,7 @@ class DlSlot(_generated.DlSlot):
 def _candidate(system: System) -> dict[str, Any]:
     """Returns one `allow` entry: the system's type and params, and the pack
     that `metor build` opens to resolve it."""
-    if not isinstance(system, System) or isinstance(system, (Link, DlSlot)):
+    if not isinstance(system, System) or isinstance(system, (Link, Db, DlSlot)):
         raise ConfigError(f"a slot allows pack systems, got {system!r}")
     if any(system._inputs.values()):
         raise ConfigError(f"`{system._ty}` in a slot takes its inputs on the slot")

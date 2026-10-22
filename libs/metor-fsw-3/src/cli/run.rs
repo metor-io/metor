@@ -351,7 +351,7 @@ fn apply_overrides(config: &TargetConfig, overrides: &Run) -> Result<TargetConfi
 
 /// Builds the system table for a target: the built-ins plus every pack the
 /// target lists.
-fn table_for<S>(config: &TargetConfig<S>) -> Result<SystemTable, RunError> {
+fn table_for<S, R>(config: &TargetConfig<S, R>) -> Result<SystemTable, RunError> {
     let mut table = SystemTable::new();
     crate::builtins::register_builtins(&mut table)?;
     let opened: Vec<Pack> = config

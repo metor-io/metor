@@ -116,9 +116,10 @@ class DeploymentTest(ConfigTest):
     def test_peer_transport_and_copies(self) -> None:
         config = design_example().to_config()
         mirror = config["targets"][1]["coordinator"]["systems"][0]
-        self.assertEqual(
-            mirror["params"]["transport"], {"peer": {"target": "a", "link": "pub"}}
-        )
+        self.assertEqual(mirror["grants"], {"ep": "mirror_ep"})
+        self.assertEqual(mirror["params"]["dialing"], True)
+        resources = config["targets"][1]["coordinator"]["resources"]
+        self.assertEqual(resources["mirror_ep"], {"peer": {"target": "a", "link": "pub"}})
         self.assertEqual(
             mirror["outputs"],
             [
@@ -213,9 +214,8 @@ class DeploymentTest(ConfigTest):
         a = Target(cycle_rate=100.0)
         a_pub = a.add("pub", Publish(transport=Listen("0.0.0.0:2240")))
         b = Target(cycle_rate=100.0, namespace="b")
-        b.add("mirror", Subscribe(transport=Peer(a_pub)))
         with self.assertRaisesRegex(ConfigError, "names no namespace"):
-            b.to_config()
+            b.add("mirror", Subscribe(transport=Peer(a_pub)))
 
     def test_db_emits_builtin_with_all(self) -> None:
         gw = Target(cycle_rate=10.0, namespace="gw")
@@ -259,7 +259,7 @@ class DeploymentTest(ConfigTest):
         gw, db = gateway("gw", peers=[a_pub], listen="0.0.0.0:2250")
         config = Deployment(targets=[a, gw]).to_config()
         systems = config["targets"][1]["coordinator"]["systems"]
-        self.assertEqual([s["id"] for s in systems], ["a", "db"])
+        self.assertEqual([s["id"] for s in systems], ["a", "db", "io_submit", "io_complete"])
         self.assertEqual(
             [i["port"] for i in systems[1]["inputs"]],
             ["a.plant.imu", "a.plant.log", "a.plant.status", "a.link_status", "a.log", "a.status"],
