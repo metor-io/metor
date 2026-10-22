@@ -15,6 +15,7 @@ from adcs_stub import PACK
 import metor_config._target as target_mod
 from metor_config import (
     ConfigError,
+    Db,
     Dir,
     Listen,
     OutPort,
@@ -26,6 +27,8 @@ from metor_config import (
     SimUart,
     System,
     Target,
+    TcpDial,
+    TcpListen,
     Tty,
     Udp,
 )
@@ -136,10 +139,10 @@ class ResourceTests(unittest.TestCase):
 
     def test_no_grants_emits_no_io(self) -> None:
         fsw = Target(cycle_rate=10.0)
-        fsw.add("pub", Publish([], transport=Listen("127.0.0.1:0")))
+        fsw.add("db", Db(listen="127.0.0.1:0"))
         config = coordinator(fsw)
         self.assertNotIn("resources", config)
-        self.assertEqual([s["id"] for s in config["systems"]], ["pub"])
+        self.assertEqual([s["id"] for s in config["systems"]], ["db"])
 
     def test_publish_all_skips_io_records(self) -> None:
         fsw = Target(cycle_rate=10.0)
@@ -168,6 +171,42 @@ class ResourceTests(unittest.TestCase):
             fsw.resource("link", Udp("127.0.0.1:0"))
         with self.assertRaisesRegex(ConfigError, "identifier"):
             fsw.resource("not a name", Udp("127.0.0.1:0"))
+
+    def test_endpoints_emit_their_backing(self) -> None:
+        self.assertEqual(
+            TcpListen("0.0.0.0:2240").to_json(),
+            {"real": {"tcp_listen": {"addr": "0.0.0.0:2240"}}},
+        )
+        allow = TcpListen("0.0.0.0:2240", allow=("10.0.0.0/24", "fd00::/8"))
+        self.assertEqual(
+            allow.to_json()["real"]["tcp_listen"]["allow"], ["10.0.0.0/24", "fd00::/8"]
+        )
+        self.assertEqual(
+            TcpDial("10.0.0.9:2240").to_json(),
+            {"real": {"tcp_dial": {"addr": "10.0.0.9:2240"}}},
+        )
+
+    def test_allow_blocks_parse_as_the_target_does(self) -> None:
+        for good in ("10.0.0.0/24", "10.0.0.7/32", "0.0.0.0/0", "fd00::/8", "::/128"):
+            TcpListen("0.0.0.0:2240", allow=(good,))
+        with self.assertRaises(ConfigError):
+            TcpListen("0.0.0.0:2240", allow=(object(),))  # type: ignore[arg-type]
+
+    def test_bad_allow_blocks_are_refused(self) -> None:
+        bad_blocks = (
+            "10.0.0.0/33",
+            "not-an-ip/8",
+            "10.0.0.7",
+            "10.0.0.0/255.255.255.0",
+            "10.0.0.0/0.0.0.255",
+            "::/129",
+            "10.0.0.0/+8",
+            "10.0.0.0/",
+            "fe80::1%eth0/64",
+        )
+        for bad in bad_blocks:
+            with self.assertRaises(ConfigError, msg=bad):
+                TcpListen("0.0.0.0:2240", allow=(bad,))
 
     def test_io_status_reads_io_complete(self) -> None:
         fsw = Target(cycle_rate=10.0)

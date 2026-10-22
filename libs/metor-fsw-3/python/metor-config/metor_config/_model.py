@@ -200,6 +200,14 @@ class System:
         """Returns the `params` config entry for this registration."""
         return self._params or None
 
+    def _grants_for(self, target: Any, index: int) -> dict[str, Any]:
+        """Returns the resources this registration is granted, by parameter."""
+        return self._grants
+
+    def _bind(self, target: Any, name: str) -> None:
+        """Creates the resources this system holds on ``target``, once it is
+        added as ``name``."""
+
 
 _PACKAGE = os.path.dirname(os.path.abspath(__file__))
 

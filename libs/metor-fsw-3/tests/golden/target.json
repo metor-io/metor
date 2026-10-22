@@ -23,18 +23,15 @@
             "id": "cmds",
             "ty": "fsw.subscribe",
             "params": {
-              "transport": {
-                "listen": {
-                  "addr": "127.0.0.1:0",
-                  "max_connections": 8
-                }
-              },
               "namespace": "cube_sat",
               "link": "cmds",
               "conn_cap": 1048576,
-              "inbound_cap": 256
+              "max_connections": 8
             },
             "inputs": [],
+            "grants": {
+              "ep": "cmds_ep"
+            },
             "outputs": [
               {
                 "port": "ping",
@@ -43,7 +40,7 @@
             ],
             "location": {
               "file": "python/metor-config/tests/test_target.py",
-              "line": 40
+              "line": 42
             }
           },
           {
@@ -65,7 +62,7 @@
             ],
             "location": {
               "file": "python/metor-config/tests/test_target.py",
-              "line": 42
+              "line": 44
             }
           },
           {
@@ -87,7 +84,7 @@
             ],
             "location": {
               "file": "python/metor-config/tests/test_target.py",
-              "line": 43
+              "line": 45
             }
           },
           {
@@ -97,7 +94,7 @@
             "inputs": [],
             "location": {
               "file": "python/metor-config/tests/test_target.py",
-              "line": 44
+              "line": 46
             }
           },
           {
@@ -126,24 +123,18 @@
             ],
             "location": {
               "file": "python/metor-config/tests/test_target.py",
-              "line": 45
+              "line": 47
             }
           },
           {
             "id": "pub",
             "ty": "fsw.publish",
             "params": {
-              "transport": {
-                "listen": {
-                  "addr": "127.0.0.1:0",
-                  "max_connections": 8
-                }
-              },
               "namespace": "cube_sat",
               "link": "pub",
-              "conn_cap": 1048576
+              "conn_cap": 1048576,
+              "max_connections": 8
             },
-            "thread": "io",
             "inputs": [
               {
                 "port": "plant.imu",
@@ -182,12 +173,42 @@
                 ]
               }
             ],
+            "grants": {
+              "ep": "pub_ep"
+            },
             "location": {
               "file": "python/metor-config/tests/test_target.py",
-              "line": 47
+              "line": 49
+            }
+          },
+          {
+            "id": "io_submit",
+            "ty": "fsw.io"
+          },
+          {
+            "id": "io_complete",
+            "ty": "fsw.io",
+            "params": {
+              "status": true
             }
           }
-        ]
+        ],
+        "resources": {
+          "cmds_ep": {
+            "real": {
+              "tcp_listen": {
+                "addr": "127.0.0.1:0"
+              }
+            }
+          },
+          "pub_ep": {
+            "real": {
+              "tcp_listen": {
+                "addr": "127.0.0.1:0"
+              }
+            }
+          }
+        }
       }
     }
   ]

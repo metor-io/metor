@@ -35,8 +35,17 @@ fn tables(count: usize) -> Vec<SystemTable> {
         .collect()
 }
 
-fn listen(port: u16) -> serde_json::Value {
-    json!({ "transport": { "listen": { "addr": format!("127.0.0.1:{port}"), "max_connections": 1 } } })
+/// A resource that listens on `port`.
+fn listen(port: u16) -> DeployBacking {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let allow = Vec::new();
+    DeployBacking::Runtime(Backing::Real(RealKind::TcpListen { addr, allow }))
+}
+
+/// A resource that dials `addr`.
+fn dial(addr: &str) -> DeployBacking {
+    let addr = addr.parse().expect("an address");
+    DeployBacking::Runtime(Backing::Real(RealKind::TcpDial { addr }))
 }
 
 /// A db's params, listening on `port`.
@@ -44,8 +53,11 @@ fn db_listen(port: u16) -> serde_json::Value {
     json!({ "listen": format!("127.0.0.1:{port}") })
 }
 
-fn peer(target: &str, link: &str) -> serde_json::Value {
-    json!({ "transport": { "peer": { "target": target, "link": link } } })
+fn peer(target: &str, link: &str) -> DeployBacking {
+    DeployBacking::Peer(PeerLink {
+        target: target.into(),
+        link: link.into(),
+    })
 }
 
 fn peer_port(target: &str, link: &str, port: &str) -> PeerPort {
@@ -56,19 +68,45 @@ fn peer_port(target: &str, link: &str, port: &str) -> PeerPort {
     }
 }
 
-fn member(namespace: &str, systems: Vec<DeploySystem>) -> TargetConfig<DeploySystem> {
+/// A link `id` of type `ty`, granted resource `{id}_ep` as its `ep`.
+fn link(id: &str, ty: &str) -> DeploySystem {
+    DeploySystem {
+        grants: [("ep".to_string(), format!("{id}_ep"))].into(),
+        ..DeploySystem::new(id, ty)
+    }
+}
+
+fn member(
+    namespace: &str,
+    systems: Vec<DeploySystem>,
+    resources: Vec<(&str, DeployBacking)>,
+) -> TargetConfig<DeploySystem, DeployBacking> {
     let runtime = CoordinatorConfig {
         namespace: Some(namespace.into()),
         ..Default::default()
     };
     let json = serde_json::to_value(runtime).expect("encodes");
+    let resources = resources.into_iter().map(|(id, r)| (id.to_string(), r));
     TargetConfig {
         packs: Vec::new(),
         coordinator: CoordinatorConfig {
             systems,
+            resources: resources.collect(),
             ..serde_json::from_value(json).expect("a runtime config is a deployment config")
         },
     }
+}
+
+/// The resource `id` of target `target`.
+fn resource<'a>(envelope: &'a DeploymentConfig, target: usize, id: &str) -> &'a DeployBacking {
+    &envelope.targets[target].coordinator.resources[id]
+}
+
+fn set_resource(envelope: &mut DeploymentConfig, target: usize, id: &str, to: DeployBacking) {
+    envelope.targets[target]
+        .coordinator
+        .resources
+        .insert(id.into(), to);
 }
 
 /// Builds a two-target deployment. `a` publishes its `imu` frame and log
@@ -81,28 +119,26 @@ fn envelope() -> DeploymentConfig {
             DeploySystem::new("imu", "imu"),
             DeploySystem::new("noisy", "boom"),
             DeploySystem {
-                params: listen(2240),
                 inputs: vec![
                     InputConfig::new("imu.imu", "imu", "imu"),
                     InputConfig::new("noisy.log", "noisy", "log"),
                 ],
-                ..DeploySystem::new("pub", PUBLISH_TYPE)
+                ..link("pub", PUBLISH_TYPE)
             },
             DeploySystem {
-                params: peer("b", "db"),
                 outputs: vec![OutputConfig {
                     port: "log".into(),
                     source: DeploySource::Runtime(OutputSource::Record("log".into())),
                 }],
-                ..DeploySystem::new("cmds", SUBSCRIBE_TYPE)
+                ..link("cmds", SUBSCRIBE_TYPE)
             },
         ],
+        vec![("pub_ep", listen(2240)), ("cmds_ep", peer("b", "db"))],
     );
     let b = member(
         "b",
         vec![
             DeploySystem {
-                params: peer("a", "pub"),
                 outputs: vec![
                     OutputConfig {
                         port: "imu.imu".into(),
@@ -113,13 +149,14 @@ fn envelope() -> DeploymentConfig {
                         source: DeploySource::Peer(peer_port("a", "pub", "noisy.log")),
                     },
                 ],
-                ..DeploySystem::new("mirror", SUBSCRIBE_TYPE)
+                ..link("mirror", SUBSCRIBE_TYPE)
             },
             DeploySystem {
                 params: db_listen(2250),
                 ..DeploySystem::new("db", DB_TYPE)
             },
         ],
+        vec![("mirror_ep", peer("a", "pub"))],
     );
     DeploymentConfig {
         config_version: CONFIG_VERSION,
@@ -188,24 +225,40 @@ fn test_peer_output_of_a_status_edge() {
 }
 
 #[test]
-fn test_peer_transport_takes_host_address() {
+fn test_peer_dial_takes_host_address() {
     let envelope = resolved();
-    let mirror = &envelope.targets[1].coordinator.systems[0];
-    assert_eq!(
-        mirror.params["transport"],
-        json!({ "connect": { "addr": "127.0.0.1:2240" } })
-    );
+    assert_eq!(resource(&envelope, 1, "mirror_ep"), &dial("127.0.0.1:2240"));
     let mut placed = self::envelope();
     placed.hosts.insert("a".into(), "10.0.0.2".into());
     placed.hosts.insert("b".into(), "::1".into());
     resolve(&mut placed, &tables(2)).expect("resolves");
-    let mirror = &placed.targets[1].coordinator.systems[0];
+    assert_eq!(resource(&placed, 1, "mirror_ep"), &dial("10.0.0.2:2240"));
+    assert_eq!(resource(&placed, 0, "cmds_ep"), &dial("[::1]:2250"));
+}
+
+#[test]
+fn test_peer_dial_resolves_a_host_name() {
+    let mut named = envelope();
+    named.hosts.insert("a".into(), "localhost".into());
+    resolve(&mut named, &tables(2)).expect("resolves");
+    let DeployBacking::Runtime(Backing::Real(RealKind::TcpDial { addr })) =
+        resource(&named, 1, "mirror_ep")
+    else {
+        panic!("a resolved dial")
+    };
     assert_eq!(
-        mirror.params["transport"]["connect"]["addr"],
-        "10.0.0.2:2240"
+        addr,
+        &SocketAddr::from(([127, 0, 0, 1], 2240)),
+        "IPv4 first"
     );
-    let cmds = &placed.targets[0].coordinator.systems[3];
-    assert_eq!(cmds.params["transport"]["connect"]["addr"], "[::1]:2250");
+
+    let mut unknown = envelope();
+    unknown.hosts.insert("a".into(), "nohost.invalid".into());
+    let error = resolve(&mut unknown, &tables(2)).expect_err("no such host");
+    assert!(
+        matches!(&error, DeployError::Address { from, .. } if from == "b.mirror"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -240,8 +293,33 @@ fn test_deploy_source_forms() {
 }
 
 #[test]
+fn test_into_runtime_needs_resolved_dials() {
+    let mut envelope = envelope();
+    envelope.targets[1].coordinator.systems[0].outputs.clear();
+    let Err(DeployError::UnresolvedDial { resource }) = envelope.into_runtime() else {
+        panic!("a peer dial has no runtime form")
+    };
+    assert_eq!(resource, "a.cmds_ep");
+}
+
+/// A peer dial no system holds is left as it is, and stays unresolved.
+#[test]
+fn test_ungranted_peer_dial_stays_unresolved() {
+    let mut envelope = envelope();
+    set_resource(&mut envelope, 1, "spare", peer("a", "pub"));
+    resolve(&mut envelope, &tables(2)).expect("resolves");
+    assert_eq!(resource(&envelope, 1, "spare"), &peer("a", "pub"));
+    assert!(matches!(
+        envelope.into_runtime(),
+        Err(DeployError::UnresolvedDial { resource }) if resource == "b.spare"
+    ));
+}
+
+#[test]
 fn test_into_runtime_needs_resolved_outputs() {
-    let Err(DeployError::Unresolved { system, port }) = envelope().into_runtime() else {
+    let mut envelope = envelope();
+    set_resource(&mut envelope, 0, "cmds_ep", dial("127.0.0.1:2250"));
+    let Err(DeployError::Unresolved { system, port }) = envelope.into_runtime() else {
         panic!("a peer output has no runtime form")
     };
     assert_eq!((system.as_str(), port.as_str()), ("b.mirror", "imu.imu"));
@@ -253,7 +331,7 @@ fn test_into_runtime_needs_resolved_outputs() {
 #[test]
 fn test_missing_references_name_themselves() {
     let mut missing_target = envelope();
-    missing_target.targets[1].coordinator.systems[0].params = peer("c", "pub");
+    set_resource(&mut missing_target, 1, "mirror_ep", peer("c", "pub"));
     missing_target.targets[1].coordinator.systems[0]
         .outputs
         .clear();
@@ -266,7 +344,7 @@ fn test_missing_references_name_themselves() {
     );
 
     let mut missing_link = envelope();
-    missing_link.targets[1].coordinator.systems[0].params = peer("a", "nope");
+    set_resource(&mut missing_link, 1, "mirror_ep", peer("a", "nope"));
     missing_link.targets[1].coordinator.systems[0]
         .outputs
         .clear();
@@ -301,15 +379,14 @@ fn test_peer_must_listen_on_a_fixed_port() {
         link: "pub".into(),
     };
     let mut dialing = envelope();
-    dialing.targets[0].coordinator.systems[2].params =
-        json!({ "transport": { "connect": { "addr": "127.0.0.1:1" } } });
+    set_resource(&mut dialing, 0, "pub_ep", dial("127.0.0.1:1"));
     assert_eq!(
         resolve(&mut dialing, &tables(2)),
         Err(not_a_listener.clone())
     );
 
     let mut any_port = envelope();
-    any_port.targets[0].coordinator.systems[2].params = listen(0);
+    set_resource(&mut any_port, 0, "pub_ep", listen(0));
     assert_eq!(resolve(&mut any_port, &tables(2)), Err(not_a_listener));
 }
 
@@ -338,8 +415,8 @@ fn test_errors_cite_the_system_location() {
         })
     };
     let mut missing_link = envelope();
+    set_resource(&mut missing_link, 1, "mirror_ep", peer("a", "nope"));
     let mirror = &mut missing_link.targets[1].coordinator.systems[0];
-    mirror.params = peer("a", "nope");
     mirror.outputs.clear();
     mirror.location = at(8);
     let error = resolve(&mut missing_link, &tables(2)).expect_err("no such link");
@@ -370,27 +447,28 @@ fn test_errors_cite_the_system_location() {
 #[test]
 fn test_mirror_of_a_mirror_of_itself_cycles() {
     let mirror = |peer_target: &str| DeploySystem {
-        params: peer(peer_target, "pub"),
         outputs: vec![OutputConfig {
             port: "mirror.imu".into(),
             source: DeploySource::Peer(peer_port(peer_target, "pub", "mirror.imu")),
         }],
-        ..DeploySystem::new("mirror", SUBSCRIBE_TYPE)
+        ..link("mirror", SUBSCRIBE_TYPE)
     };
     let publish = DeploySystem {
-        params: listen(1),
         inputs: vec![InputConfig::new("mirror.imu", "mirror", "mirror.imu")],
-        ..DeploySystem::new("pub", PUBLISH_TYPE)
+        ..link("pub", PUBLISH_TYPE)
+    };
+    let member = |name, peer_target, port| {
+        let resources = vec![
+            ("mirror_ep", peer(peer_target, "pub")),
+            ("pub_ep", listen(port)),
+        ];
+        member(name, vec![mirror(peer_target), publish.clone()], resources)
     };
     let mut envelope = DeploymentConfig {
         config_version: CONFIG_VERSION,
         hosts: Default::default(),
-        targets: vec![
-            member("a", vec![mirror("b"), publish.clone()]),
-            member("b", vec![mirror("a"), publish]),
-        ],
+        targets: vec![member("a", "b", 1), member("b", "a", 2)],
     };
-    envelope.targets[1].coordinator.systems[1].params = listen(2);
     let Err(DeployError::Cycle { path }) = resolve(&mut envelope, &tables(2)) else {
         panic!("a mirror of a mirror of itself cycles")
     };
@@ -412,9 +490,10 @@ fn test_unknown_type_is_a_build_error() {
 }
 
 #[test]
-fn test_non_link_transport_is_untouched() {
+fn test_params_naming_a_peer_are_untouched() {
     let mut envelope = envelope();
-    envelope.targets[0].coordinator.systems[0].params = peer("b", "db");
+    envelope.targets[0].coordinator.systems[0].params =
+        json!({ "transport": { "peer": { "target": "b", "link": "db" } } });
     let params = envelope.targets[0].coordinator.systems[0].params.clone();
     resolve(&mut envelope, &tables(2)).expect("resolves");
     assert!(!unresolved(&envelope).expect("decodes"));
@@ -422,33 +501,15 @@ fn test_non_link_transport_is_untouched() {
 }
 
 #[test]
-fn test_undecodable_link_names_itself() {
-    let mut envelope = envelope();
-    envelope.targets[0].coordinator.systems[2].params = json!({ "transport": 5 });
-    let Err(DeployError::Params { system, .. }) = unresolved(&envelope) else {
-        panic!("a link's params must decode")
-    };
-    assert_eq!(system, "pub");
-    let Err(DeployError::Params { system, .. }) = resolve(&mut envelope, &tables(2)) else {
-        panic!("a link's params must decode")
-    };
-    assert_eq!(system, "pub");
-}
-
-#[test]
 fn test_resolve_keeps_other_params() {
     let mut envelope = envelope();
-    envelope.targets[1].coordinator.systems[0].params["conn_cap"] = json!(64);
+    envelope.targets[1].coordinator.systems[0].params = json!({ "conn_cap": 64 });
     envelope.targets[1].coordinator.systems[1].params["path"] = json!("/db");
     resolve(&mut envelope, &tables(2)).expect("resolves");
     let [mirror, db] = &envelope.targets[1].coordinator.systems[..] else {
         panic!("two systems")
     };
-    assert_eq!(mirror.params["conn_cap"], 64);
-    assert_eq!(
-        mirror.params["transport"]["connect"]["addr"],
-        "127.0.0.1:2240"
-    );
+    assert_eq!(mirror.params, json!({ "conn_cap": 64 }));
     assert_eq!(db.params["path"], "/db");
     assert_eq!(db.params["listen"], "127.0.0.1:2250");
 }
@@ -472,4 +533,13 @@ fn test_stored_slots_resolve_to_themselves() {
     resolve(&mut envelope, &tables(2)).expect("resolves");
     assert_eq!(envelope.targets[0].coordinator.systems[4].params, before);
     assert!(!unresolved(&envelope).expect("decodes"));
+}
+
+#[test]
+fn test_first_v4_prefers_ipv4() {
+    let v6: SocketAddr = "[::1]:1".parse().expect("an address");
+    let v4: SocketAddr = "127.0.0.1:1".parse().expect("an address");
+    assert_eq!(first_v4(&[v6, v4]), Some(v4));
+    assert_eq!(first_v4(&[v6]), Some(v6));
+    assert_eq!(first_v4(&[]), None);
 }

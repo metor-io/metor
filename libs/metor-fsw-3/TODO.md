@@ -47,6 +47,14 @@ Landed 2026-09-18; the fixture's
 `metor run` closes the loop from a `Subscribe` through `echo` to a
 `Publish`.
 
+`Publish` and `Subscribe` run as sequences on the IO queue
+(`docs/plans/25-link-io.md`): a link holds a `Cap<Endpoint>`, its
+transport lowers to a `tcp_listen` or `tcp_dial` resource, and its
+connections allocate nothing after make.
+
+- Links on threads: the thread driver over group reactors (§8), so
+  `thread:` places a link off the cycle. Plan 25 chunks I and J.
+
 - Definitions from config: a type computes its `SystemDef` from its
   instance config, dynamic markers and build's completion pass are gone,
   and ABI 5 adds `metor_fsw_def`. Landed 2026-09-20.
@@ -60,21 +68,10 @@ Landed 2026-09-18; the fixture's
   the borrow never contends; a state named by both a cyclic and an async
   system is a build error.
 
-- Link loops: `publish.rs` and `subscribe.rs` repeat the readiness race
-  and the status tail; fold them into one helper in `conn.rs`.
-
 - Message ids: postcard messages hash the schema name, other codecs the
   record name. Unify in metor-proto-wkt (the panel's matchers depend on
   the current ids), then drop `Msg::ID` from the `Record` derive.
 
-- Connection buffers: `Connections::open` allocates a connection's three
-  buffers (outbox, in-flight write, receive) because a closed connection
-  ends by cancellation, and a completion-style read or write dropped
-  mid-flight takes its buffer with it. Reuse them so a connection allocates
-  nothing: both halves watch a close flag and return their buffers as the
-  task's output, and `prune` joins the task before the slot is free. A
-  write stuck on a silent peer then holds its slot until TCP gives up,
-  which needs a bound.
 
 ## 5. Sequences and slots, done
 
@@ -133,6 +130,13 @@ Design `docs/plans/18-io.md`, plan `18-io-plan.md`, chunk plans
   a deadline per resetting system. Past it, remake anyway, keep the stuck
   ops' buffer slots marked in flight so they are never reused, and log a
   `quiesce_timeout` fault.
+- Timeouts on a monotonic clock. The dispatch resolves `Op::Timeout`
+  deadlines against the cycle's `now`, which under `Clock::Wall` is
+  `Timestamp::now()`, so it follows system time. When the clock steps (NTP,
+  an operator setting it), every pending timer fires on the next pass, or
+  waits out the step backwards. A link's backoff and write timeout misfire
+  with it. Give the cycle a monotonic clock for deadlines, kept beside the
+  wall timestamp that records carry, so a sim run stays deterministic.
 - Layers from config. Target files install layers (fault injection over
   real hardware for HIL, transport faults in sims) through metor-expr or
   WASM rather than a built-in rule language. The layer mechanism itself

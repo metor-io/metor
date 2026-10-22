@@ -1,18 +1,26 @@
 use std::fs::File;
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use metor_proto::types::Timestamp;
+use zerocopy::FromBytes;
 
 use super::allocations;
 use crate::io::arena::Arena;
 use crate::io::host::dispatch::Rejected;
 use crate::io::host::dispatch::Resource;
 use crate::io::host::wire::{FIFO, Wire};
-use crate::io::host::{Backed, Class, Dispatch, OpId, OsDone, OsOp, Out, Route};
+use crate::io::host::{Backed, Class, Dispatch, MemberDef, OpId, OsDone, OsOp, Out, Route};
 use crate::io::status::ResourceStatus;
 use crate::io::*;
 use crate::record::Record;
 use crate::tests::utils::pair;
+
+const OPS: usize = DEFAULT_OPS as usize;
+
+fn member(ops: u16, grants: Vec<(ResourceIndex, ResourceEnd)>) -> MemberDef {
+    MemberDef { ops, grants }
+}
 
 fn null() -> OwnedFd {
     File::open("/dev/null").unwrap().into()
@@ -38,21 +46,29 @@ fn rig_with(kind: SimKind) -> Rig {
         Resource {
             id: "tty".into(),
             backed: Backed::Fd(fd, Class::Tty),
+            allow: Box::default(),
         },
         Resource {
             id: "sim".into(),
             backed: Backed::Wire(0),
+            allow: Box::default(),
         },
     ];
     let members = vec![
-        vec![(0.into(), ResourceEnd::Host), (1.into(), ResourceEnd::Host)],
-        vec![
-            (0.into(), ResourceEnd::Host),
-            (1.into(), ResourceEnd::Device),
-        ],
+        member(
+            DEFAULT_OPS,
+            vec![(0.into(), ResourceEnd::Host), (1.into(), ResourceEnd::Host)],
+        ),
+        member(
+            DEFAULT_OPS,
+            vec![
+                (0.into(), ResourceEnd::Host),
+                (1.into(), ResourceEnd::Device),
+            ],
+        ),
     ];
     Rig {
-        d: Dispatch::new(members, resources, vec![Wire::new(kind, 2 * MAX_OPS)]).unwrap(),
+        d: Dispatch::new(members, resources, vec![Wire::new(kind, 2 * OPS)]).unwrap(),
         arenas: [super::arena(64), super::arena(64)],
         fd: raw,
     }
@@ -65,13 +81,27 @@ fn sqe(slot: u16, handle: RawHandle, op: Op, buf: Span) -> Sqe {
     Sqe::new(Token::new(slot, 7), handle, &op, buf)
 }
 
+/// A `Stream` on resource 0, its peer written at the arena's start.
+fn stream(slot: u16) -> Sqe {
+    sqe(slot, TTY, Op::Stream, Span::new(0, RawAddr::LEN as u32))
+}
+
+/// A new stream from `peer`.
+fn opened(peer: Option<&str>) -> Result<Out, IoError> {
+    Ok(Out::Opened {
+        fd: null(),
+        class: Class::Stream,
+        peer: peer.map(|p| p.parse().unwrap()),
+    })
+}
+
 fn read(slot: u16, handle: RawHandle) -> Sqe {
     sqe(slot, handle, Op::Read { offset: None }, Span::new(8, 16))
 }
 
 impl Rig {
     fn lower(&mut self, m: usize, sqe: Sqe) {
-        assert_eq!(self.d.lower(m, sqe, &self.arenas[m]), Ok(()));
+        assert_eq!(self.d.lower(m, sqe, &self.arenas[m], Timestamp(0)), Ok(()));
     }
 
     fn routes(&mut self) -> Vec<Route> {
@@ -131,7 +161,7 @@ fn real_op_resolves_its_descriptor_buffer_and_index() {
     r.lower(1, read(3, TTY));
     let op = r.only_os();
     assert_eq!((op.fd, op.class), (r.fd, Class::Tty));
-    assert_eq!(op.id, OpId::new((MAX_OPS + 3) as u16, 7));
+    assert_eq!(op.id, OpId::new((OPS + 3) as u16, 7));
     assert_eq!(op.buf.unwrap().len(), 16);
     let done = r.done(op.id, Ok(Out::Len(5)));
     assert_eq!(done, Some((1, Cqe::ok(Token::new(3, 7), 5))));
@@ -176,7 +206,7 @@ fn a_full_fifo_drops_what_does_not_fit() {
     let mut r = rig();
     let span = Span::new(0, 64);
     for k in 0..(FIFO / 64 + 1) {
-        let slot = (k % MAX_OPS) as u16;
+        let slot = (k % OPS) as u16;
         r.lower(0, sqe(slot, SIM, Op::Write { offset: None }, span));
         assert_eq!(
             r.replies()[0].1.result(),
@@ -188,7 +218,7 @@ fn a_full_fifo_drops_what_does_not_fit() {
     for slot in 0..(FIFO / 64 + 1) as u16 {
         r.lower(
             1,
-            sqe(slot % MAX_OPS as u16, SIM, Op::Read { offset: None }, span),
+            sqe(slot % DEFAULT_OPS, SIM, Op::Read { offset: None }, span),
         );
         match r.replies().pop() {
             Some((_, c)) => total += c.result().unwrap(),
@@ -336,9 +366,9 @@ fn a_token_that_is_not_a_free_slot_is_dropped_unanswered() {
     r.lower(0, read(1, TTY));
     let _ = r.routes();
     let reused = sqe(1, RawHandle::new(9, 0), Op::Fsync, Span::default());
-    let past = sqe(MAX_OPS as u16, TTY, Op::Fsync, Span::default());
+    let past = sqe(DEFAULT_OPS, TTY, Op::Fsync, Span::default());
     for bad in [read(1, TTY), reused, past] {
-        assert_eq!(r.d.lower(0, bad, &r.arenas[0]), Err(Rejected));
+        assert_eq!(r.d.lower(0, bad, &r.arenas[0], Timestamp(0)), Err(Rejected));
     }
     assert!(r.routes().is_empty() && r.replies().is_empty());
 }
@@ -371,11 +401,9 @@ fn closed_grant_is_stale_until_a_remake() {
 #[test]
 fn accepted_stream_is_a_derived_handle() {
     let mut r = rig();
-    r.lower(0, sqe(0, TTY, Op::Accept, Span::default()));
+    r.lower(0, stream(0));
     let op = r.only_os();
-    let (_, cqe) = r
-        .done(op.id, Ok(Out::Opened(null(), Class::Stream)))
-        .unwrap();
+    let (_, cqe) = r.done(op.id, opened(None)).unwrap();
     let stream = RawHandle::from_raw(cqe.result().unwrap());
     assert_eq!(
         stream,
@@ -394,13 +422,11 @@ fn accepted_stream_is_a_derived_handle() {
 fn full_derived_table_closes_and_refuses() {
     let mut r = rig();
     let accept = |r: &mut Rig, slot: usize| {
-        r.lower(0, sqe(slot as u16, TTY, Op::Accept, Span::default()));
+        r.lower(0, stream(slot as u16));
         let op = r.only_os();
-        r.done(op.id, Ok(Out::Opened(null(), Class::Stream)))
-            .unwrap()
-            .1
+        r.done(op.id, opened(None)).unwrap().1
     };
-    for slot in 0..MAX_OPS {
+    for slot in 0..OPS {
         assert!(accept(&mut r, slot).result().is_ok());
     }
     assert_eq!(accept(&mut r, 0).result(), Err(IoError::Refused));
@@ -431,7 +457,7 @@ fn cancel_goes_out_once() {
 fn quiesce_cancels_drops_and_waits() {
     let mut r = rig();
     r.lower(0, read(0, TTY));
-    r.lower(0, sqe(1, TTY, Op::Accept, Span::default()));
+    r.lower(0, stream(1));
     let ids: Vec<OpId> = r
         .routes()
         .into_iter()
@@ -453,7 +479,7 @@ fn quiesce_cancels_drops_and_waits() {
     r.d.member_drained(0);
     assert_eq!(r.done(ids[0], Err(IoError::Canceled)), None);
     assert!(!r.d.member_idle(0));
-    assert_eq!(r.done(ids[1], Ok(Out::Opened(null(), Class::Stream))), None);
+    assert_eq!(r.done(ids[1], opened(None)), None);
     assert!(
         matches!(r.routes()[..], [Route::Close(_)]),
         "nothing will close it"
@@ -465,9 +491,9 @@ fn quiesce_cancels_drops_and_waits() {
 #[test]
 fn drain_closes_derived_handles() {
     let mut r = rig();
-    r.lower(0, sqe(0, TTY, Op::Accept, Span::default()));
+    r.lower(0, stream(0));
     let op = r.only_os();
-    r.done(op.id, Ok(Out::Opened(null(), Class::Stream)));
+    r.done(op.id, opened(None));
     r.d.quiesce_member(0);
     r.d.member_drained(0);
     r.d.member_drained(0);
@@ -512,4 +538,443 @@ fn lowering_and_raising_allocate_nothing() {
         }
     });
     assert_eq!(n, 0);
+}
+
+/// Members of budgets `ops` on one real resource.
+fn budgets(ops: &[u16]) -> Result<Dispatch, crate::coordinator::BuildError> {
+    let resources = vec![Resource {
+        id: "tty".into(),
+        backed: Backed::Fd(null(), Class::Tty),
+        allow: Box::default(),
+    }];
+    let grants = || vec![(0.into(), ResourceEnd::Host)];
+    let members = ops.iter().map(|&n| member(n, grants())).collect();
+    Dispatch::new(members, resources, Vec::new())
+}
+
+/// Lowers an fsync into every slot of every member, then finishes each op:
+/// every completion reaches the member and slot that submitted it.
+fn fill_every_slot(ops: &[u16]) {
+    let mut d = budgets(ops).unwrap();
+    let arena = super::arena(0);
+    for (m, &n) in ops.iter().enumerate() {
+        for slot in 0..n {
+            let fsync = sqe(slot, TTY, Op::Fsync, Span::default());
+            assert_eq!(d.lower(m, fsync, &arena, Timestamp(0)), Ok(()));
+        }
+    }
+    let ids: Vec<_> = d
+        .drain_routes()
+        .map(|r| match r {
+            Route::Os(op) => op.id,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        ids.len(),
+        ops.iter().map(|&n| usize::from(n)).sum::<usize>()
+    );
+    for id in ids {
+        d.raise(OsDone {
+            id,
+            result: Ok(Out::Len(0)),
+        });
+    }
+    let mut got = Vec::new();
+    d.post_ready(0, |m, cqe| {
+        got.push((m, cqe.token.index()));
+        Some(true)
+    });
+    let want: Vec<_> = ops
+        .iter()
+        .enumerate()
+        .flat_map(|(m, &n)| (0..n).map(move |slot| (m, slot)))
+        .collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn each_member_fills_its_own_budget() {
+    fill_every_slot(&[16, 40]);
+}
+
+#[test]
+fn a_budget_of_one_and_the_last_slot() {
+    fill_every_slot(&[1, 3, 1]);
+    fill_every_slot(&[0, 2]);
+}
+
+#[test]
+fn a_slot_past_the_members_budget_is_rejected() {
+    let mut d = budgets(&[2, 40]).unwrap();
+    let arena = super::arena(0);
+    let past = sqe(2, TTY, Op::Fsync, Span::default());
+    assert_eq!(d.lower(0, past, &arena, Timestamp(0)), Err(Rejected));
+    assert_eq!(d.drain_routes().count(), 0);
+    assert_eq!(d.lower(1, past, &arena, Timestamp(0)), Ok(()));
+}
+
+#[test]
+fn budgets_past_the_op_id_space_fail_the_build() {
+    let fits = [u16::MAX, 1];
+    assert_eq!(budgets(&fits).map(|d| d.ops()).ok(), Some(1 << 16));
+    let past = [u16::MAX, 2];
+    assert!(matches!(
+        budgets(&past),
+        Err(crate::coordinator::BuildError::TooManyIoOps { ops: 65537 })
+    ));
+}
+
+#[test]
+fn held_scales_with_the_budgets_posted() {
+    let d = budgets(&[4, 40]).unwrap();
+    assert_eq!(d.held_for(&[1]), 2 * d.ops_of(1));
+    assert_eq!(d.held_for(&[0, 1]), 2 * 44);
+    assert_eq!(d.held_for(&[]), 0);
+}
+
+/// Member 0 holds a listener that admits the peers `allow` names, and a
+/// dialer of `10.0.0.9:2240`.
+fn endpoints(allow: &[&str]) -> (Dispatch, Arena) {
+    let resources = vec![
+        Resource {
+            id: "listen".into(),
+            backed: Backed::Fd(null(), Class::Listener),
+            allow: allow.iter().map(|c| c.parse().unwrap()).collect(),
+        },
+        Resource {
+            id: "dial".into(),
+            backed: Backed::Dial("10.0.0.9:2240".parse().unwrap()),
+            allow: Box::default(),
+        },
+    ];
+    let grants = vec![(0.into(), ResourceEnd::Host), (1.into(), ResourceEnd::Host)];
+    let d = Dispatch::new(vec![member(DEFAULT_OPS, grants)], resources, Vec::new());
+    (d.unwrap(), super::arena(64))
+}
+
+const DIAL: RawHandle = RawHandle::new(1, 0);
+
+fn os_ops(d: &mut Dispatch) -> Vec<OsOp> {
+    d.drain_routes()
+        .filter_map(|r| match r {
+            Route::Os(op) => Some(op),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ready(d: &mut Dispatch) -> Vec<Cqe> {
+    let mut got = Vec::new();
+    d.post_ready(0, |_, cqe| {
+        got.push(*cqe);
+        Some(true)
+    });
+    got
+}
+
+fn peer_in(arena: &Arena) -> SocketAddr {
+    // SAFETY: nothing else touches the test's arena.
+    let bytes = unsafe {
+        arena
+            .get_slice(Span::new(0, RawAddr::LEN as u32))
+            .unwrap()
+            .as_ref()
+    };
+    SocketAddr::try_from(RawAddr::read_from_bytes(bytes).unwrap()).unwrap()
+}
+
+fn rejected(d: &mut Dispatch) -> u64 {
+    let (_ring, mut out, mut inp) = pair::<ResourceStatus>(ResourceStatus::DEPTH);
+    d.report(Timestamp(1), &mut out);
+    let status = inp
+        .drain()
+        .map(|s| *s.unwrap())
+        .find(|s| s.resource.to_str() == Ok("listen"));
+    status.map_or(0, |s| s.rejected)
+}
+
+#[test]
+fn an_accepted_peer_lands_in_the_buffer() {
+    let (mut d, arena) = endpoints(&[]);
+    assert_eq!(d.lower(0, stream(0), &arena, Timestamp(0)), Ok(()));
+    let [op] = os_ops(&mut d)[..] else { panic!() };
+    assert_eq!((op.class, op.dial), (Class::Listener, None));
+    d.raise(OsDone {
+        id: op.id,
+        result: opened(Some("10.0.0.7:5000")),
+    });
+    assert!(ready(&mut d)[0].result().is_ok());
+    assert_eq!(peer_in(&arena), "10.0.0.7:5000".parse().unwrap());
+}
+
+#[test]
+fn a_dial_lowers_with_its_address_and_no_descriptor() {
+    let (mut d, arena) = endpoints(&[]);
+    let dial = sqe(0, DIAL, Op::Stream, Span::new(0, RawAddr::LEN as u32));
+    assert_eq!(d.lower(0, dial, &arena, Timestamp(0)), Ok(()));
+    let [op] = os_ops(&mut d)[..] else { panic!() };
+    assert_eq!((op.fd, op.class), (-1, Class::Dialer));
+    assert_eq!(op.dial, Some("10.0.0.9:2240".parse().unwrap()));
+    d.raise(OsDone {
+        id: op.id,
+        result: opened(Some("10.0.0.9:2240")),
+    });
+    assert!(ready(&mut d)[0].result().is_ok());
+    assert_eq!(peer_in(&arena), "10.0.0.9:2240".parse().unwrap());
+}
+
+#[test]
+fn a_dialer_takes_only_streams() {
+    let (mut d, arena) = endpoints(&[]);
+    assert_eq!(d.lower(0, read(0, DIAL), &arena, Timestamp(0)), Ok(()));
+    assert!(os_ops(&mut d).is_empty());
+    assert_eq!(ready(&mut d)[0].result(), Err(IoError::Unsupported));
+}
+
+#[test]
+fn a_rejected_peer_is_closed_and_the_op_runs_again() {
+    let (mut d, arena) = endpoints(&["10.0.0.0/24"]);
+    d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
+    let [op] = os_ops(&mut d)[..] else { panic!() };
+    d.raise(OsDone {
+        id: op.id,
+        result: opened(Some("192.168.1.7:5000")),
+    });
+    assert!(ready(&mut d).is_empty(), "the system never sees it");
+    let routes: Vec<_> = d.drain_routes().collect();
+    assert!(matches!(&routes[..], [Route::Close(_), Route::Os(again)] if again.id == op.id));
+    assert_eq!(rejected(&mut d), 1);
+    d.raise(OsDone {
+        id: op.id,
+        result: opened(Some("10.0.0.3:6000")),
+    });
+    let [cqe] = ready(&mut d)[..] else { panic!() };
+    assert_eq!(cqe.token, Token::new(0, 7));
+    assert!(cqe.result().is_ok());
+    assert_eq!(peer_in(&arena), "10.0.0.3:6000".parse().unwrap());
+}
+
+#[test]
+fn an_allow_list_refuses_a_stream_with_no_peer() {
+    let (mut d, arena) = endpoints(&["0.0.0.0/0"]);
+    d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
+    let [op] = os_ops(&mut d)[..] else { panic!() };
+    d.raise(OsDone {
+        id: op.id,
+        result: opened(None),
+    });
+    assert!(ready(&mut d).is_empty());
+    assert_eq!(rejected(&mut d), 1);
+}
+
+#[test]
+fn a_canceled_or_quiescing_op_is_not_run_again() {
+    let (mut d, arena) = endpoints(&["10.0.0.0/24"]);
+    d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
+    let [op] = os_ops(&mut d)[..] else { panic!() };
+    d.lower(
+        0,
+        sqe(0, TTY, Op::Cancel, Span::default()),
+        &arena,
+        Timestamp(0),
+    )
+    .unwrap();
+    let _ = d.drain_routes();
+    d.raise(OsDone {
+        id: op.id,
+        result: opened(Some("192.168.1.7:5000")),
+    });
+    assert!(matches!(
+        d.drain_routes().collect::<Vec<_>>()[..],
+        [Route::Close(_)]
+    ));
+    assert_eq!(ready(&mut d)[0].result(), Err(IoError::Canceled));
+
+    d.lower(0, stream(1), &arena, Timestamp(0)).unwrap();
+    let [op] = os_ops(&mut d)[..] else { panic!() };
+    d.quiesce_member(0);
+    let _ = d.drain_routes();
+    d.raise(OsDone {
+        id: op.id,
+        result: opened(Some("192.168.1.7:5000")),
+    });
+    assert!(matches!(
+        d.drain_routes().collect::<Vec<_>>()[..],
+        [Route::Close(_)]
+    ));
+    assert!(ready(&mut d).is_empty());
+    assert!(!d.has_kernel_ops_in_flight());
+}
+
+#[test]
+fn a_short_peer_buffer_is_bad_buf() {
+    let (mut d, arena) = endpoints(&[]);
+    let short = sqe(0, TTY, Op::Stream, Span::new(0, RawAddr::LEN as u32 - 1));
+    assert_eq!(d.lower(0, short, &arena, Timestamp(0)), Ok(()));
+    assert!(os_ops(&mut d).is_empty());
+    assert_eq!(ready(&mut d)[0].result(), Err(IoError::BadBuf));
+}
+
+#[test]
+fn a_stream_on_a_wire_is_unsupported() {
+    let mut r = rig();
+    r.lower(
+        0,
+        sqe(0, SIM, Op::Stream, Span::new(0, RawAddr::LEN as u32)),
+    );
+    assert_eq!(r.replies()[0].1.result(), Err(IoError::Unsupported));
+}
+
+fn timeout(slot: u16, micros: u64) -> Sqe {
+    let after = core::time::Duration::from_micros(micros);
+    sqe(slot, TTY, Op::Timeout(after), Span::default())
+}
+
+#[test]
+fn a_timeout_lands_at_its_deadline_and_never_reaches_the_os() {
+    let mut r = rig();
+    r.d.lower(0, timeout(2, 30), &r.arenas[0], Timestamp(100))
+        .unwrap();
+    assert!(r.routes().is_empty());
+    r.d.expire(Timestamp(129));
+    assert!(r.replies().is_empty());
+    r.d.expire(Timestamp(130));
+    assert_eq!(r.replies(), [(0, Cqe::ok(Token::new(2, 7), 0))]);
+    r.d.expire(Timestamp(1_000));
+    assert!(r.replies().is_empty(), "lands once");
+}
+
+#[test]
+fn zero_and_equal_timeouts_land_together() {
+    let mut r = rig();
+    for (m, slot, micros) in [(0, 0, 0), (0, 1, 5), (1, 0, 5)] {
+        r.d.lower(m, timeout(slot, micros), &r.arenas[m], Timestamp(10))
+            .unwrap();
+    }
+    r.d.expire(Timestamp(10));
+    assert_eq!(r.replies(), [(0, Cqe::ok(Token::new(0, 7), 0))]);
+    r.d.expire(Timestamp(15));
+    let got = r.replies();
+    assert_eq!(got.len(), 2);
+    assert!(got.iter().all(|(_, c)| c.result() == Ok(0)));
+}
+
+#[test]
+fn a_canceled_timeout_lands_canceled_and_never_ok() {
+    let mut r = rig();
+    r.d.lower(0, timeout(1, 30), &r.arenas[0], Timestamp(0))
+        .unwrap();
+    r.lower(0, sqe(1, TTY, Op::Cancel, Span::default()));
+    assert!(r.routes().is_empty(), "nothing to cancel in the backend");
+    assert_eq!(
+        r.replies(),
+        [(0, Cqe::err(Token::new(1, 7), IoError::Canceled))]
+    );
+    r.d.expire(Timestamp(1_000));
+    assert!(r.replies().is_empty());
+    assert_eq!(
+        r.d.lower(0, timeout(1, 30), &r.arenas[0], Timestamp(0)),
+        Ok(()),
+        "the slot is free"
+    );
+}
+
+#[test]
+fn quiesce_clears_a_members_timers() {
+    let mut r = rig();
+    r.d.lower(0, timeout(0, 30), &r.arenas[0], Timestamp(0))
+        .unwrap();
+    assert!(
+        !r.d.has_kernel_ops_in_flight(),
+        "a timer is not the kernel's"
+    );
+    r.d.quiesce_member(0);
+    r.d.member_drained(0);
+    assert!(r.d.member_idle(0));
+    r.d.expire(Timestamp(1_000));
+    assert!(r.replies().is_empty());
+}
+
+#[test]
+fn the_longest_timeout_lands_at_the_end_of_time() {
+    let mut r = rig();
+    let forever = sqe(
+        0,
+        TTY,
+        Op::Timeout(core::time::Duration::MAX),
+        Span::default(),
+    );
+    r.d.lower(0, forever, &r.arenas[0], Timestamp(10)).unwrap();
+    r.d.expire(Timestamp(i64::MAX - 1));
+    assert!(r.replies().is_empty());
+    r.d.expire(Timestamp(i64::MAX));
+    assert_eq!(r.replies(), [(0, Cqe::ok(Token::new(0, 7), 0))]);
+}
+
+#[test]
+fn a_rearmed_slot_lands_once_for_its_new_generation() {
+    let mut r = rig();
+    let at = |generation, micros| {
+        let after = core::time::Duration::from_micros(micros);
+        Sqe::new(
+            Token::new(1, generation),
+            TTY,
+            &Op::Timeout(after),
+            Span::default(),
+        )
+    };
+    r.d.lower(0, at(7, 10), &r.arenas[0], Timestamp(0)).unwrap();
+    r.lower(0, sqe(1, TTY, Op::Cancel, Span::default()));
+    r.d.lower(0, at(8, 30), &r.arenas[0], Timestamp(0)).unwrap();
+    assert_eq!(
+        r.replies(),
+        [(0, Cqe::err(Token::new(1, 7), IoError::Canceled))]
+    );
+    r.d.expire(Timestamp(10));
+    assert!(r.replies().is_empty(), "the canceled deadline is gone");
+    r.d.expire(Timestamp(30));
+    assert_eq!(r.replies(), [(0, Cqe::ok(Token::new(1, 8), 0))]);
+}
+
+#[test]
+fn a_timeout_on_a_closed_grant_is_stale() {
+    let mut r = rig();
+    r.lower(0, sqe(0, TTY, Op::Close, Span::default()));
+    r.lower(0, timeout(1, 0));
+    let got = r.replies();
+    assert_eq!(got[1].1.result(), Err(IoError::Stale));
+}
+
+#[test]
+fn a_timeout_on_a_stale_handle_is_stale() {
+    let mut r = rig();
+    let stale = sqe(
+        0,
+        RawHandle::new(9, 0),
+        Op::Timeout(core::time::Duration::ZERO),
+        Span::default(),
+    );
+    r.d.lower(0, stale, &r.arenas[0], Timestamp(0)).unwrap();
+    assert_eq!(r.replies()[0].1.result(), Err(IoError::Stale));
+}
+
+/// A re-lowered accept still waiting for the backend when teardown starts
+/// is completed, so its slot frees and teardown ends.
+#[test]
+fn teardown_completes_an_op_waiting_to_be_lowered() {
+    let (mut d, arena) = endpoints(&["10.0.0.0/24"]);
+    d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
+    let [op] = os_ops(&mut d)[..] else { panic!() };
+    d.raise(OsDone {
+        id: op.id,
+        result: opened(Some("192.168.1.7:5000")),
+    });
+    let mut host = crate::io::host::Host {
+        dispatch: d,
+        os: crate::io::host::host(OPS).unwrap(),
+        queues: Box::default(),
+    };
+    assert!(host.teardown());
+    assert!(!host.dispatch.has_kernel_ops_in_flight());
 }

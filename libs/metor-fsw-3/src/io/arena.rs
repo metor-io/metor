@@ -142,20 +142,23 @@ unsafe extern "C" fn release_owned(context: *const c_void) {
 
 /// A span of its system's arena.
 ///
-/// It derefs to its filled bytes. An op takes it by value and hands it back
-/// with the result.
+/// It derefs to its filled bytes, `start..start + len` of the span. An op
+/// takes it by value and hands it back with the result.
 pub struct Buf {
     arena: Rc<Arena>,
     span: Span,
+    start: u32,
     len: u32,
     epoch: u32,
 }
 
 impl Buf {
     fn new(arena: &Rc<Arena>, span: Span, len: u32) -> Self {
+        debug_assert!(len <= span.len(), "filled past the span");
         Self {
             arena: arena.clone(),
             span,
+            start: 0,
             len,
             epoch: arena.epoch(),
         }
@@ -165,27 +168,87 @@ impl Buf {
         self.span.len() as usize
     }
 
-    /// Copies as much of `bytes` as fits and sets the length to it.
+    /// The bytes free past the filled ones.
+    pub fn spare(&self) -> usize {
+        self.capacity() - self.end()
+    }
+
+    /// Copies as much of `bytes` as fits and makes them the filled bytes.
     pub fn fill(&mut self, bytes: &[u8]) -> usize {
+        self.clear();
+        self.extend(bytes)
+    }
+
+    /// Copies as much of `bytes` as fits after the filled bytes, and returns
+    /// how many it took.
+    pub fn extend(&mut self, bytes: &[u8]) -> usize {
         let Some(whole) = self.whole() else {
             return 0;
         };
-        let n = bytes.len().min(self.capacity());
-        // SAFETY: `whole` is this `Buf`'s span, which nothing else reaches
-        // while `&mut self` is held.
-        unsafe { core::slice::from_raw_parts_mut(whole.cast::<u8>().as_ptr(), n) }
+        let (at, n) = (self.end(), bytes.len().min(self.spare()));
+        // SAFETY: `at..at + n` lies in this `Buf`'s span, which nothing else
+        // reaches while `&mut self` is held.
+        unsafe { core::slice::from_raw_parts_mut(whole.cast::<u8>().as_ptr().add(at), n) }
             .copy_from_slice(&bytes[..n]);
-        self.len = n as u32;
+        self.len += n as u32;
         n
     }
 
+    /// Drops the first `n` filled bytes, or all of them if there are fewer.
+    pub fn advance(&mut self, n: usize) {
+        let n = n.min(self.len as usize) as u32;
+        self.start += n;
+        self.len -= n;
+    }
+
     pub fn clear(&mut self) {
+        self.start = 0;
         self.len = 0;
     }
 
-    /// Sets the filled length, clamped to the capacity.
+    /// Sets the filled length, clamped to the bytes past the start.
     pub fn set_len(&mut self, n: usize) {
-        self.len = n.min(self.capacity()) as u32;
+        self.len = n.min(self.capacity() - self.start as usize) as u32;
+    }
+
+    /// Makes the first `n` bytes of the span the filled ones, as a fill op
+    /// leaves them.
+    pub(crate) fn set_filled(&mut self, n: usize) {
+        self.start = 0;
+        self.set_len(n);
+    }
+
+    /// Splits the span at `at`, returning the empty tail. `None` if `at` is
+    /// past the capacity or inside the filled bytes.
+    pub fn split_off(&mut self, at: usize) -> Option<Buf> {
+        let at = u32::try_from(at).ok()?;
+        if at < self.end() as u32 || at > self.span.len() {
+            return None;
+        }
+        let tail = Span::new(self.span.off() + at, self.span.len() - at);
+        self.span = Span::new(self.span.off(), at);
+        Some(Self {
+            arena: self.arena.clone(),
+            span: tail,
+            start: 0,
+            len: 0,
+            epoch: self.epoch,
+        })
+    }
+
+    /// Rejoins `tail`, a span that starts where this one ends, from the same
+    /// arena and make. Its filled bytes join this one's only when they meet
+    /// at the seam. Hands `tail` back if it cannot join.
+    pub fn join(&mut self, tail: Buf) -> Result<(), Buf> {
+        let adjacent = self.span.end() == Some(tail.span.off());
+        let same = Rc::ptr_eq(&self.arena, &tail.arena) && self.epoch == tail.epoch;
+        let meets = tail.len == 0 || (self.spare() == 0 && tail.start == 0);
+        if !(adjacent && same && meets) {
+            return Err(tail);
+        }
+        self.span = Span::new(self.span.off(), self.span.len() + tail.span.len());
+        self.len += tail.len;
+        Ok(())
     }
 
     /// Whether the buffer's arena is set and the buffer is from its current
@@ -199,14 +262,25 @@ impl Buf {
     pub(crate) fn span_for(&self, op: &Op) -> Span {
         match op.fills() {
             true => self.span,
-            false => Span::new(self.span.off(), self.len),
+            false => Span::new(self.span.off() + self.start, self.len),
         }
+    }
+
+    /// The end of the filled bytes, from the span's start.
+    fn end(&self) -> usize {
+        (self.start + self.len) as usize
     }
 
     fn whole(&self) -> Option<NonNull<[u8]>> {
         (self.arena.epoch() == self.epoch)
             .then(|| self.arena.get_slice(self.span))
             .flatten()
+    }
+
+    /// The filled bytes inside `whole`.
+    fn filled(&self, whole: NonNull<[u8]>) -> *mut u8 {
+        // SAFETY: `start` never passes the span's length.
+        unsafe { whole.cast::<u8>().as_ptr().add(self.start as usize) }
     }
 }
 
@@ -219,7 +293,7 @@ impl Deref for Buf {
             // SAFETY: spans never overlap, an op in flight holds its `Buf`,
             // and an arena's memory never moves.
             Some(whole) => unsafe {
-                core::slice::from_raw_parts(whole.cast().as_ptr(), self.len as usize)
+                core::slice::from_raw_parts(self.filled(whole), self.len as usize)
             },
             None => &[],
         }
@@ -231,7 +305,7 @@ impl DerefMut for Buf {
         match self.whole() {
             // SAFETY: as in `deref`, and `&mut self` makes the borrow unique.
             Some(whole) => unsafe {
-                core::slice::from_raw_parts_mut(whole.cast().as_ptr(), self.len as usize)
+                core::slice::from_raw_parts_mut(self.filled(whole), self.len as usize)
             },
             None => &mut [],
         }
@@ -242,6 +316,7 @@ impl core::fmt::Debug for Buf {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Buf")
             .field("span", &self.span)
+            .field("start", &self.start)
             .field("len", &self.len)
             .finish()
     }
@@ -353,6 +428,19 @@ impl<'a> IoInit<'a> {
 }
 
 #[cfg(kani)]
+impl Buf {
+    /// A buffer spanning its own arena of `bytes`, none filled. Built
+    /// directly: a make sizes its arena by rounding up, which Kani would
+    /// unwind byte by byte.
+    pub(crate) fn owned(bytes: Box<[u8]>) -> Self {
+        let arena = Rc::new(Arena::new());
+        let len = bytes.len() as u32;
+        arena.set_owned(bytes);
+        Self::new(&arena, Span::new(0, len), 0)
+    }
+}
+
+#[cfg(kani)]
 mod proofs {
     use super::*;
 
@@ -366,6 +454,73 @@ mod proofs {
         if let Some(got) = arena.get_slice(span) {
             let start = got.cast::<u8>().as_ptr() as usize - base.as_ptr() as usize;
             assert!(start + got.len() <= len);
+        }
+    }
+
+    fn eight() -> Buf {
+        Buf::owned(Box::new([0u8; 8]))
+    }
+
+    /// Whether `inner` lies inside `outer`.
+    fn within(inner: Span, outer: Span) -> bool {
+        inner.off() >= outer.off() && inner.end() <= outer.end()
+    }
+
+    /// After any sequence of fills, extends, advances, and length sets, an
+    /// op on the buffer names only bytes of its span.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn ops_stay_in_the_span() {
+        let mut buf = eight();
+        let span = buf.span;
+        for _ in 0..3 {
+            let n: usize = kani::any();
+            kani::assume(n <= 9);
+            match kani::any::<u8>() % 4 {
+                0 => drop(buf.fill(&[0; 9][..n])),
+                1 => drop(buf.extend(&[0; 9][..n])),
+                2 => buf.advance(n),
+                _ => buf.set_len(n),
+            }
+            assert!(buf.start as usize + buf.len as usize <= buf.capacity());
+            assert!(within(buf.span_for(&Op::Send), span));
+            assert!(within(buf.span_for(&Op::Recv), span));
+        }
+    }
+
+    /// A full head joins a tail with filled bytes, keeping the head's then
+    /// the tail's.
+    #[kani::proof]
+    fn join_keeps_a_filled_tail() {
+        let mut buf = eight();
+        let span = buf.span;
+        let (at, filled): (usize, usize) = (kani::any(), kani::any());
+        kani::assume(at <= 8);
+        buf.set_len(at);
+        let mut tail = buf.split_off(at).expect("the head is full");
+        tail.set_len(filled);
+        let tail_len = tail.len as usize;
+        assert!(buf.join(tail).is_ok());
+        assert_eq!(buf.span, span);
+        assert_eq!(buf.len as usize, at + tail_len);
+        assert!(within(buf.span_for(&Op::Send), span));
+    }
+
+    /// A split, then a join of its tail, gives back the original span.
+    #[kani::proof]
+    fn split_then_join_restores() {
+        let mut buf = eight();
+        let span = buf.span;
+        let (filled, at): (usize, usize) = (kani::any(), kani::any());
+        kani::assume(filled <= 8);
+        buf.set_len(filled);
+        if let Some(tail) = buf.split_off(at) {
+            assert_eq!(buf.span.end(), Some(tail.span.off()));
+            assert!(buf.join(tail).is_ok());
+            assert_eq!(buf.span, span);
+            assert_eq!(buf.len as usize, filled);
+        } else {
+            assert!(at < filled || at > 8);
         }
     }
 }

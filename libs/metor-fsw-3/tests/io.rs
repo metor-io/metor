@@ -81,6 +81,7 @@ fn each_kind_opens_with_its_class() {
         (
             RealKind::TcpListen {
                 addr: "127.0.0.1:0".parse().unwrap(),
+                allow: Vec::new(),
             },
             Class::Listener,
         ),

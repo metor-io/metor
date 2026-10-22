@@ -24,6 +24,8 @@ pub struct ResourceStatus {
     pub bytes_out: u64,
     /// Bytes a sim wire dropped past a full FIFO.
     pub dropped: u64,
+    /// Peers a listener's `allow` list turned away.
+    pub rejected: u64,
 }
 
 /// One resource's running op counts.
@@ -36,6 +38,7 @@ pub(crate) struct Counters {
     pub(crate) bytes_in: u64,
     pub(crate) bytes_out: u64,
     pub(crate) dropped: u64,
+    pub(crate) rejected: u64,
 }
 
 #[cfg(all(feature = "host", unix))]
@@ -67,6 +70,7 @@ impl Counters {
             bytes_in: self.bytes_in,
             bytes_out: self.bytes_out,
             dropped: self.dropped,
+            rejected: self.rejected,
         }
     }
 }

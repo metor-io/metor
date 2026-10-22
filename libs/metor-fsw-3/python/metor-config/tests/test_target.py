@@ -18,6 +18,7 @@ from metor_config import (
     ChannelRegistry,
     ConfigError,
     Connect,
+    Db,
     DlSlot,
     Listen,
     PortRef,
@@ -25,6 +26,7 @@ from metor_config import (
     SequenceCommand,
     Subscribe,
     Target,
+    TcpDial,
     emit,
 )
 
@@ -44,7 +46,7 @@ def adcs_target() -> Target:
     mode = fsw.add("mode", Mode())
     ctrl = fsw.add("ctrl", Ctrl(est=nav.est, mode=mode.cmd))
     motor_cmd.connect(ctrl.motor_cmd)
-    fsw.add("pub", Publish([plant, nav.est], transport=Listen("127.0.0.1:0")), thread="io")
+    fsw.add("pub", Publish([plant, nav.est], transport=Listen("127.0.0.1:0")))
     return fsw
 
 
@@ -196,7 +198,7 @@ class LocationTest(ConfigTest):
         line = inspect.currentframe().f_lineno - 1  # type: ignore[union-attr]
         fsw.add("plant", plant)
         fsw.add("pub", Publish([], transport=Listen("127.0.0.1:0")))
-        plant_entry, pub_entry = fsw.to_config()["coordinator"]["systems"]
+        plant_entry, pub_entry = fsw.to_config()["coordinator"]["systems"][:2]
         here = os.path.relpath(__file__)
         self.assertEqual(plant_entry["location"], {"file": here, "line": line})
         self.assertEqual(pub_entry["location"], {"file": here, "line": line + 3})
@@ -240,10 +242,11 @@ class LinkTest(ConfigTest):
         self.assertEqual(
             entry["inputs"][0]["from"], [{"system": "plant", "port": "imu"}]
         )
-        self.assertEqual(
-            entry["params"]["transport"],
-            {"listen": {"addr": "0.0.0.0:2240", "max_connections": 8}},
-        )
+        self.assertEqual(entry["grants"], {"ep": "pub_ep"})
+        self.assertEqual(entry["params"]["max_connections"], 8)
+        self.assertNotIn("dialing", entry["params"])
+        resources = fsw.to_config()["coordinator"]["resources"]
+        self.assertEqual(resources, {"pub_ep": {"real": {"tcp_listen": {"addr": "0.0.0.0:2240"}}}})
 
     def test_publish_single_port(self) -> None:
         fsw = Target(cycle_rate=100.0)
@@ -251,7 +254,9 @@ class LinkTest(ConfigTest):
         fsw.add("pub", Publish([plant.imu], transport=Connect("127.0.0.1:2240")))
         entry = fsw.to_config()["coordinator"]["systems"][1]
         self.assertEqual([input["port"] for input in entry["inputs"]], ["plant.imu"])
-        self.assertEqual(entry["params"]["transport"], {"connect": {"addr": "127.0.0.1:2240"}})
+        self.assertEqual(entry["params"]["dialing"], True)
+        resources = fsw.to_config()["coordinator"]["resources"]
+        self.assertEqual(resources, {"pub_ep": {"real": {"tcp_dial": {"addr": "127.0.0.1:2240"}}}})
 
     def test_publish_all_includes_prior_systems(self) -> None:
         fsw = Target(cycle_rate=100.0)
@@ -317,7 +322,47 @@ class LinkTest(ConfigTest):
         fsw = Target(cycle_rate=100.0)
         fsw.add("pub", Publish([], transport=Listen("0.0.0.0:2240", max_connections=2)))
         entry = fsw.to_config()["coordinator"]["systems"][0]
-        self.assertEqual(entry["params"]["transport"]["listen"]["max_connections"], 2)
+        self.assertEqual(entry["params"]["max_connections"], 2)
+
+    def test_listen_allow_reaches_the_resource(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        fsw.add("pub", Publish([], transport=Listen("0.0.0.0:2240", allow=["10.0.0.0/24"])))
+        resource = fsw.to_config()["coordinator"]["resources"]["pub_ep"]
+        self.assertEqual(resource["real"]["tcp_listen"]["allow"], ["10.0.0.0/24"])
+        with self.assertRaisesRegex(ConfigError, "not a CIDR block"):
+            fsw.add("bad", Publish([], transport=Listen("0.0.0.0:2241", allow=["10.0.0.0"])))
+
+    def test_connect_resolves_a_host_name(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        fsw.add("pub", Publish([], transport=Connect("localhost:2240")))
+        dial = fsw.to_config()["coordinator"]["resources"]["pub_ep"]["real"]["tcp_dial"]
+        self.assertEqual(dial["addr"], "127.0.0.1:2240", "IPv4 first")
+        with self.assertRaisesRegex(ConfigError, "does not resolve"):
+            fsw.add("lost", Publish([], transport=Connect("nohost.invalid:1")))
+        with self.assertRaisesRegex(ConfigError, "not a `host:port`"):
+            fsw.add("bare", Publish([], transport=Connect("localhost")))
+        with self.assertRaisesRegex(ConfigError, "without brackets"):
+            fsw.add("v6", Publish([], transport=Connect("::1:2240")))
+        fsw.add("v6", Publish([], transport=Connect("[::1]:2240")))
+        dial = fsw.to_config()["coordinator"]["resources"]["v6_ep"]["real"]["tcp_dial"]
+        self.assertEqual(dial["addr"], "[::1]:2240")
+
+    def test_link_name_is_an_identifier(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        with self.assertRaisesRegex(ConfigError, "a link's name is an identifier"):
+            fsw.add("gw-link", Publish([], transport=Listen("0.0.0.0:2240")))
+
+    def test_link_name_takes_its_endpoint_name(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        fsw.resource("pub_ep", TcpDial("127.0.0.1:1"))
+        with self.assertRaisesRegex(ConfigError, "`pub_ep` is already created"):
+            fsw.add("pub", Publish([], transport=Listen("0.0.0.0:2240")))
+
+    def test_a_target_of_links_gets_io_steps(self) -> None:
+        fsw = Target(cycle_rate=100.0)
+        fsw.add("cmds", Subscribe([Ping], transport=Listen("0.0.0.0:2241")))
+        systems = fsw.to_config()["coordinator"]["systems"]
+        self.assertEqual([s["id"] for s in systems], ["cmds", "io_submit", "io_complete"])
 
     def test_subscribe_rejects_duplicate_record(self) -> None:
         with self.assertRaisesRegex(ConfigError, "twice"):
@@ -365,7 +410,8 @@ class LinkTest(ConfigTest):
         fsw.add("pub1", publish)
         fsw.add("pub2", publish)
         config = fsw.to_config()
-        first, second = config["coordinator"]["systems"][1:]
+        first, second = config["coordinator"]["systems"][1:3]
+        self.assertEqual((first["grants"], second["grants"]), ({"ep": "pub1_ep"}, {"ep": "pub2_ep"}))
         self.assertEqual(first["params"]["link"], "pub1")
         self.assertEqual(second["params"]["link"], "pub2")
         self.assertEqual(
@@ -393,14 +439,15 @@ class LinkTest(ConfigTest):
         self.assertEqual(first_entry["params"]["link"], "a")
         second_entry = emitted["coordinator"]["systems"][0]
         self.assertEqual(second_entry["params"]["namespace"], "second")
-        second_entry["params"]["transport"]["listen"]["addr"] = "changed"
+        self.assertEqual((first_entry["grants"], second_entry["grants"]), ({"ep": "a_ep"}, {"ep": "b_ep"}))
+        second_entry["params"]["link"] = "changed"
         second_entry["outputs"][0]["port"] = "changed"
         self.assertEqual(first.to_config(), saved)
         self.assertEqual(second.to_config()["coordinator"]["systems"][0]["outputs"][0]["port"], "ping")
 
     def test_system_thread_assignment(self) -> None:
         fsw = Target(cycle_rate=100.0)
-        fsw.add("cmds", Subscribe([Ping], transport=Listen("0.0.0.0:2241")), thread="io")
+        fsw.add("db", Db(listen="0.0.0.0:2241"), thread="io")
         fsw.add("plant", Plant())
         systems = fsw.to_config()["coordinator"]["systems"]
         self.assertEqual(systems[0]["thread"], "io")

@@ -64,15 +64,10 @@
             "id": "pub",
             "ty": "fsw.publish",
             "params": {
-              "transport": {
-                "listen": {
-                  "addr": "0.0.0.0:2240",
-                  "max_connections": 8
-                }
-              },
               "namespace": "a",
               "link": "pub",
-              "conn_cap": 1048576
+              "conn_cap": 1048576,
+              "max_connections": 8
             },
             "inputs": [
               {
@@ -130,6 +125,9 @@
                 ]
               }
             ],
+            "grants": {
+              "ep": "pub_ep"
+            },
             "location": {
               "file": "python/metor-config/tests/test_deployment.py",
               "line": 34
@@ -139,18 +137,15 @@
             "id": "cmds",
             "ty": "fsw.subscribe",
             "params": {
-              "transport": {
-                "peer": {
-                  "target": "gw",
-                  "link": "db"
-                }
-              },
               "namespace": "a",
               "link": "cmds",
               "conn_cap": 1048576,
-              "inbound_cap": 256
+              "dialing": true
             },
             "inputs": [],
+            "grants": {
+              "ep": "cmds_ep"
+            },
             "outputs": [
               {
                 "port": "ping",
@@ -161,8 +156,34 @@
               "file": "python/metor-config/tests/test_deployment.py",
               "line": 43
             }
+          },
+          {
+            "id": "io_submit",
+            "ty": "fsw.io"
+          },
+          {
+            "id": "io_complete",
+            "ty": "fsw.io",
+            "params": {
+              "status": true
+            }
           }
-        ]
+        ],
+        "resources": {
+          "pub_ep": {
+            "real": {
+              "tcp_listen": {
+                "addr": "0.0.0.0:2240"
+              }
+            }
+          },
+          "cmds_ep": {
+            "peer": {
+              "target": "gw",
+              "link": "db"
+            }
+          }
+        }
       }
     },
     {
@@ -186,18 +207,15 @@
             "id": "mirror",
             "ty": "fsw.subscribe",
             "params": {
-              "transport": {
-                "peer": {
-                  "target": "a",
-                  "link": "pub"
-                }
-              },
               "namespace": "b",
               "link": "mirror",
               "conn_cap": 1048576,
-              "inbound_cap": 256
+              "dialing": true
             },
             "inputs": [],
+            "grants": {
+              "ep": "mirror_ep"
+            },
             "outputs": [
               {
                 "port": "plant.imu",
@@ -280,15 +298,10 @@
             "id": "pub",
             "ty": "fsw.publish",
             "params": {
-              "transport": {
-                "listen": {
-                  "addr": "0.0.0.0:2241",
-                  "max_connections": 8
-                }
-              },
               "namespace": "b",
               "link": "pub",
-              "conn_cap": 1048576
+              "conn_cap": 1048576,
+              "max_connections": 8
             },
             "inputs": [
               {
@@ -409,12 +422,41 @@
                 ]
               }
             ],
+            "grants": {
+              "ep": "pub_ep"
+            },
             "location": {
               "file": "python/metor-config/tests/test_deployment.py",
               "line": 40
             }
+          },
+          {
+            "id": "io_submit",
+            "ty": "fsw.io"
+          },
+          {
+            "id": "io_complete",
+            "ty": "fsw.io",
+            "params": {
+              "status": true
+            }
           }
-        ]
+        ],
+        "resources": {
+          "mirror_ep": {
+            "peer": {
+              "target": "a",
+              "link": "pub"
+            }
+          },
+          "pub_ep": {
+            "real": {
+              "tcp_listen": {
+                "addr": "0.0.0.0:2241"
+              }
+            }
+          }
+        }
       }
     },
     {
@@ -432,18 +474,15 @@
             "id": "a",
             "ty": "fsw.subscribe",
             "params": {
-              "transport": {
-                "peer": {
-                  "target": "a",
-                  "link": "pub"
-                }
-              },
               "namespace": "gw",
               "link": "a",
               "conn_cap": 1048576,
-              "inbound_cap": 256
+              "dialing": true
             },
             "inputs": [],
+            "grants": {
+              "ep": "a_ep"
+            },
             "outputs": [
               {
                 "port": "plant.imu",
@@ -495,18 +534,15 @@
             "id": "b",
             "ty": "fsw.subscribe",
             "params": {
-              "transport": {
-                "peer": {
-                  "target": "b",
-                  "link": "pub"
-                }
-              },
               "namespace": "gw",
               "link": "b",
               "conn_cap": 1048576,
-              "inbound_cap": 256
+              "dialing": true
             },
             "inputs": [],
+            "grants": {
+              "ep": "b_ep"
+            },
             "outputs": [
               {
                 "port": "mirror.plant.imu",
@@ -801,8 +837,33 @@
               "file": "python/metor-config/tests/test_deployment.py",
               "line": 42
             }
+          },
+          {
+            "id": "io_submit",
+            "ty": "fsw.io"
+          },
+          {
+            "id": "io_complete",
+            "ty": "fsw.io",
+            "params": {
+              "status": true
+            }
           }
-        ]
+        ],
+        "resources": {
+          "a_ep": {
+            "peer": {
+              "target": "a",
+              "link": "pub"
+            }
+          },
+          "b_ep": {
+            "peer": {
+              "target": "b",
+              "link": "pub"
+            }
+          }
+        }
       }
     }
   ]

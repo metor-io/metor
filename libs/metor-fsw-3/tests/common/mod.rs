@@ -15,7 +15,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use metor_fsw_3::cli::cargo::{cargo_build, wasm_build};
-use metor_fsw_3::coordinator::{Coordinator, CoordinatorConfig, EndReason, SystemTable};
+use metor_fsw_3::coordinator::{
+    Coordinator, CoordinatorConfig, EndReason, SystemConfig, SystemTable,
+};
+use metor_fsw_3::io::{Backing, IO_TYPE, RealKind};
 use metor_fsw_3::wasm::{Limits, WasmPack};
 use metor_fsw_3::{Frame, Output, Record, Timestamp, system};
 use metor_proto_stellar::{PacketSink, PacketStream, Peer, identify};
@@ -254,6 +257,59 @@ impl Future for Until {
             true => Poll::Ready(()),
             false => Poll::Pending,
         }
+    }
+}
+
+/// Lowers each system's `transport` param the way the Python recorder
+/// lowers a link's transport: into a resource `{id}_ep` granted to its `ep`,
+/// with `max_connections` or `dialing` in its params. Adds the io steps after
+/// the last system if any link was lowered.
+///
+/// A transport is `{"listen": {"addr", "max_connections"?, "allow"?}}` or
+/// `{"connect": {"addr"}}`.
+pub fn lower_links(config: &mut CoordinatorConfig) {
+    let mut lowered = false;
+    for system in &mut config.systems {
+        let Some(params) = system.params.as_object_mut() else {
+            continue;
+        };
+        let Some(transport) = params.remove("transport") else {
+            continue;
+        };
+        let addr = |end: &str| {
+            let addr = transport[end]["addr"].as_str().expect("an address");
+            addr.parse().expect("an IP address")
+        };
+        let kind = if transport.get("listen").is_some() {
+            let listen = &transport["listen"];
+            let slots = listen.get("max_connections").cloned();
+            params.insert("max_connections".into(), slots.unwrap_or(8.into()));
+            let allow = listen.get("allow").cloned().unwrap_or_default();
+            let allow = serde_json::from_value(allow).unwrap_or_default();
+            RealKind::TcpListen {
+                addr: addr("listen"),
+                allow,
+            }
+        } else {
+            params.insert("dialing".into(), true.into());
+            RealKind::TcpDial {
+                addr: addr("connect"),
+            }
+        };
+        let ep = format!("{}_ep", system.id);
+        system.grants.insert("ep".into(), ep.clone());
+        config.resources.insert(ep, Backing::Real(kind));
+        lowered = true;
+    }
+    if lowered {
+        let status = serde_json::json!({ "status": true });
+        config.systems.extend([
+            SystemConfig::new("io_submit", IO_TYPE),
+            SystemConfig {
+                params: status,
+                ..SystemConfig::new("io_complete", IO_TYPE)
+            },
+        ]);
     }
 }
 

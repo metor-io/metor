@@ -142,6 +142,15 @@ pub enum DefError {
     #[error("async system `{system}` takes an `Rng`, which only a stepped system takes")]
     RngOnAsync { system: String },
 
+    #[error("the type sets an op budget but takes no `Cap`")]
+    NoIo,
+
+    #[error("an op budget of 0 runs no op")]
+    NoOps,
+
+    #[error("params: {message}")]
+    Params { message: String },
+
     #[error("ports `{port}` and `{other}` carry tables with the same id")]
     TableIdCollision { port: String, other: String },
 

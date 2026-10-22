@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::coordinator::{CoordinatorConfig, OutputSource, SystemConfig};
 use crate::dl::PackRef;
+use crate::io::Backing;
 
 use super::DeployError;
 
@@ -53,20 +54,31 @@ pub enum DeploySource {
     Runtime(OutputSource),
 }
 
+/// A resource as a deployment writes it: a runtime backing, or a dialer of
+/// another link that `metor build` resolves.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployBacking {
+    Peer(PeerLink),
+    #[serde(untagged)]
+    Runtime(Backing),
+}
+
 /// A system as a deployment writes it.
 pub type DeploySystem = SystemConfig<DeploySource>;
 
 /// A deployment whose every target can be built on its own.
-pub type ResolvedDeployment = DeploymentConfig<SystemConfig>;
+pub type ResolvedDeployment = DeploymentConfig<SystemConfig, Backing>;
 
-/// The config for one target, whose systems are `S`.
+/// The config for one target, whose systems are `S` and whose resources are
+/// `R`.
 ///
 /// `packs` lists the packs that provide the target's system types, and
 /// `coordinator` describes the systems and how they connect.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TargetConfig<S = SystemConfig> {
+pub struct TargetConfig<S = SystemConfig, R = Backing> {
     pub packs: Vec<PackRef>,
-    pub coordinator: CoordinatorConfig<S>,
+    pub coordinator: CoordinatorConfig<S, R>,
 }
 
 impl Default for TargetConfig {
@@ -78,7 +90,7 @@ impl Default for TargetConfig {
     }
 }
 
-impl<S> TargetConfig<S> {
+impl<S, R> TargetConfig<S, R> {
     /// Returns the target's namespace, which is the name used to select it.
     pub fn namespace(&self) -> &str {
         self.coordinator.namespace.as_deref().unwrap_or("")
@@ -87,13 +99,13 @@ impl<S> TargetConfig<S> {
 
 /// A deployment: every target, and the host each one runs on.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct DeploymentConfig<S = DeploySystem> {
+pub struct DeploymentConfig<S = DeploySystem, R = DeployBacking> {
     pub config_version: u32,
     /// Maps a target's namespace to the host its peers dial. A target that is
     /// not listed is dialed on loopback.
     #[serde(default)]
     pub hosts: BTreeMap<String, String>,
-    pub targets: Vec<TargetConfig<S>>,
+    pub targets: Vec<TargetConfig<S, R>>,
 }
 
 impl DeploymentConfig {
@@ -115,7 +127,8 @@ impl DeploymentConfig {
 
     /// Returns the runtime form of this deployment.
     ///
-    /// Fails if an output still names a peer's port.
+    /// Fails if an output still names a peer's port, or a resource still
+    /// dials a peer.
     pub fn into_runtime(self) -> Result<ResolvedDeployment, DeployError> {
         let targets = self
             .targets
@@ -130,7 +143,7 @@ impl DeploymentConfig {
     }
 }
 
-impl TargetConfig<DeploySystem> {
+impl TargetConfig<DeploySystem, DeployBacking> {
     fn into_runtime(self) -> Result<TargetConfig, DeployError> {
         let namespace = self.namespace().to_string();
         let runtime = |system: DeploySystem| {
@@ -145,14 +158,20 @@ impl TargetConfig<DeploySystem> {
                 .at(location.as_ref())),
             })
         };
+        let backing = |id: &str, resource| match resource {
+            DeployBacking::Runtime(backing) => Ok(backing),
+            DeployBacking::Peer(_) => Err(DeployError::UnresolvedDial {
+                resource: format!("{namespace}.{id}"),
+            }),
+        };
         Ok(TargetConfig {
             packs: self.packs,
-            coordinator: self.coordinator.try_map_systems(runtime)?,
+            coordinator: self.coordinator.try_map(runtime, backing)?,
         })
     }
 }
 
-impl<S> DeploymentConfig<S> {
+impl<S, R> DeploymentConfig<S, R> {
     /// Returns the index of the target named `namespace`.
     ///
     /// With no namespace, this returns the only target, or an error if there

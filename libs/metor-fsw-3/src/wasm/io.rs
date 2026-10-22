@@ -9,7 +9,7 @@
 use core::ptr::NonNull;
 use std::rc::Rc;
 
-use crate::io::{Arena, Cqe, MAX_OPS, Span, Sqe, Token};
+use crate::io::{Arena, Cqe, Op, RawAddr, Span, Sqe, Token};
 use crate::mirror::Corrupt;
 use crate::port::Input;
 
@@ -23,12 +23,23 @@ pub(super) struct IoCopy {
     /// A second reader on the guest's copy of `io_cq`.
     cq: Input<Cqe>,
     /// Each read in flight, by its token's slot.
-    reads: [Option<(Token, Span)>; MAX_OPS],
+    reads: Box<[Option<Read>]>,
+}
+
+/// An op in flight that fills its buffer.
+#[derive(Clone, Copy)]
+struct Read {
+    token: Token,
+    span: Span,
+    /// Whether a success fills a `RawAddr`, as a `Stream`'s peer does,
+    /// rather than the length the completion reports.
+    peer: bool,
 }
 
 impl IoCopy {
     /// Creates a copy between the guest arena `guest` and `mirror`, that reads
-    /// the guest's IO rings through `sq` and `cq`.
+    /// the guest's IO rings through `sq` and `cq`, for a guest with `ops` op
+    /// slots.
     ///
     /// # Safety
     /// `guest` stays live and unmoved while the copy lives.
@@ -37,13 +48,14 @@ impl IoCopy {
         mirror: Rc<Arena>,
         sq: Input<Sqe>,
         cq: Input<Cqe>,
+        ops: u16,
     ) -> Self {
         Self {
             guest,
             mirror,
             sq,
             cq,
-            reads: [None; MAX_OPS],
+            reads: (0..ops).map(|_| None).collect(),
         }
     }
 
@@ -52,10 +64,16 @@ impl IoCopy {
         for cqe in self.cq.drain() {
             let cqe = cqe.map_err(|_| Corrupt)?;
             let read = self.reads.get_mut(usize::from(cqe.token.index()));
-            let Some((_, span)) = read.and_then(|r| r.take_if(|(t, _)| *t == cqe.token)) else {
+            let Some(Read { span, peer, .. }) =
+                read.and_then(|r| r.take_if(|r| r.token == cqe.token))
+            else {
                 continue;
             };
-            let n = cqe.result().unwrap_or(0).min(span.len());
+            let n = match (cqe.result(), peer) {
+                (Ok(_), true) => span.len().min(RawAddr::LEN as u32),
+                (Ok(n), false) => n.min(span.len()),
+                (Err(_), _) => 0,
+            };
             if let Some((base, len)) = self.mirror.region() {
                 let mirror = NonNull::slice_from_raw_parts(base, len);
                 copy(mirror, self.guest, Span::new(span.off(), n));
@@ -73,7 +91,11 @@ impl IoCopy {
             if op.fills()
                 && let Some(read) = self.reads.get_mut(usize::from(sqe.token.index()))
             {
-                *read = Some((sqe.token, sqe.buf));
+                *read = Some(Read {
+                    token: sqe.token,
+                    span: sqe.buf,
+                    peer: op == Op::Stream,
+                });
             }
             if op.drains()
                 && let Some((base, len)) = self.mirror.region()
@@ -131,7 +153,7 @@ mod tests {
         let (cq_ring, cq, cq_in) = pair::<Cqe>(16);
         let region = NonNull::from(&mut guest[..]);
         // SAFETY: the boxed guest bytes never move and outlive the copy.
-        let copy = unsafe { IoCopy::new(region, mirror.clone(), sq_in, cq_in) };
+        let copy = unsafe { IoCopy::new(region, mirror.clone(), sq_in, cq_in, 40) };
         Rig {
             copy,
             guest,
@@ -175,6 +197,33 @@ mod tests {
         rig.cq.write(&Cqe::ok(token, 2)).unwrap();
         rig.copy.completions().unwrap();
         assert_eq!(&rig.guest[3..6], b"ok\0");
+    }
+
+    #[test]
+    fn a_read_past_the_default_budget_is_copied() {
+        let mut rig = rig();
+        let token = rig.submit(39, Op::Recv, Span::new(3, 8));
+        rig.copy.submissions().unwrap();
+        // SAFETY: nothing else touches the mirror during the test.
+        unsafe { rig.mirror.get_slice(Span::new(3, 2)).unwrap().as_mut() }.copy_from_slice(b"ok");
+        rig.cq.write(&Cqe::ok(token, 2)).unwrap();
+        rig.copy.completions().unwrap();
+        assert_eq!(&rig.guest[3..5], b"ok");
+    }
+
+    #[test]
+    fn a_stream_copies_its_whole_peer() {
+        let mut rig = rig();
+        let token = rig.submit(0, Op::Stream, Span::new(3, 8));
+        rig.copy.submissions().unwrap();
+        // SAFETY: nothing else touches the mirror during the test.
+        unsafe { rig.mirror.get_slice(Span::new(3, 8)).unwrap().as_mut() }
+            .copy_from_slice(b"peeraddr");
+        rig.cq
+            .write(&Cqe::ok(token, RawHandle::new(2, 1).get()))
+            .unwrap();
+        rig.copy.completions().unwrap();
+        assert_eq!(&rig.guest[3..11], b"peeraddr");
     }
 
     #[test]

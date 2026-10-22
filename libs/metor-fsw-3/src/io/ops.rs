@@ -4,7 +4,7 @@
 use super::arena::Buf;
 use super::cap::{Handle, RegularFile, Stream};
 use super::queue::Io;
-use super::{IoError, IoStatus, RawHandle};
+use super::{IoError, IoStatus, RawAddr, RawHandle};
 
 mod sealed {
     pub trait Sealed {}
@@ -66,8 +66,9 @@ pub struct RecvOp;
 pub struct SendOp;
 /// Opens a file under a directory.
 pub struct OpenOp;
-/// Accepts a connection on a listener.
-pub struct AcceptOp;
+/// Opens an endpoint's next stream; resolves to it, with the peer's
+/// `RawAddr` in the buffer.
+pub struct StreamOp;
 /// Closes a handle.
 pub struct CloseOp;
 /// Flushes a file to storage.
@@ -76,15 +77,17 @@ pub struct FsyncOp;
 pub struct TtyOp;
 /// Reads or sets a GPIO line; resolves to the line's level.
 pub struct GpioOp;
+/// Lands once its time has passed.
+pub struct TimeoutOp;
 /// Any op, with its raw result.
 pub struct RawOp;
 
-/// The buffer back, with the length the op reports. A fill sets the
-/// buffer's length to it.
+/// The buffer back, with the length the op reports. A fill makes that many
+/// bytes from the span's start the filled ones.
 fn moved(status: IoStatus, value: u32, mut buf: Buf, fill: bool) -> (Result<usize, IoError>, Buf) {
     let result = status.result().map(|()| value as usize);
     if let (Ok(n), true) = (result, fill) {
-        buf.set_len(n);
+        buf.set_filled(n);
     }
     (result, buf)
 }
@@ -149,14 +152,18 @@ impl IoOp for OpenOp {
     }
 }
 
-impl sealed::Sealed for AcceptOp {}
+impl sealed::Sealed for StreamOp {}
 
-impl IoOp for AcceptOp {
-    type Lent = ();
-    type Output = Result<Handle<Stream>, IoError>;
+impl IoOp for StreamOp {
+    type Lent = Buf;
+    type Output = (Result<Handle<Stream>, IoError>, Buf);
 
-    fn finish(io: &Io, status: IoStatus, value: u32, (): ()) -> Self::Output {
-        opened(io, status, value)
+    fn finish(io: &Io, status: IoStatus, value: u32, mut peer: Buf) -> Self::Output {
+        let stream = opened(io, status, value);
+        if stream.is_ok() {
+            peer.set_filled(RawAddr::LEN);
+        }
+        (stream, peer)
     }
 }
 
@@ -204,6 +211,17 @@ impl IoOp for GpioOp {
     }
 }
 
+impl sealed::Sealed for TimeoutOp {}
+
+impl IoOp for TimeoutOp {
+    type Lent = ();
+    type Output = Result<(), IoError>;
+
+    fn finish(_io: &Io, status: IoStatus, _value: u32, (): ()) -> Self::Output {
+        status.result()
+    }
+}
+
 impl sealed::Sealed for RawOp {}
 
 impl IoOp for RawOp {
@@ -226,4 +244,7 @@ impl BufOp for WriteOp {
 }
 impl BufOp for SendOp {
     type Ok = usize;
+}
+impl BufOp for StreamOp {
+    type Ok = Handle<Stream>;
 }

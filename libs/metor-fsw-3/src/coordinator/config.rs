@@ -23,9 +23,11 @@ use crate::system::PortDef;
 // PANIC Safety: evaluated at compile time.
 pub const DEFAULT_RING_DEPTH: NonZeroUsize = NonZeroUsize::new(8).expect("nonzero");
 
-/// The configuration for a coordinator, whose systems are `S`.
+/// The configuration for a coordinator, whose systems are `S` and whose
+/// resources are `R`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CoordinatorConfig<S = SystemConfig> {
+#[serde(bound(deserialize = "S: Deserialize<'de>, R: Deserialize<'de>"))]
+pub struct CoordinatorConfig<S = SystemConfig, R = Backing> {
     /// The clock that paces the cycles.
     pub clock: Clock,
     /// How many records a ring holds per unit of its port's declared depth.
@@ -40,24 +42,30 @@ pub struct CoordinatorConfig<S = SystemConfig> {
         skip_serializing_if = "IndexMap::is_empty",
         deserialize_with = "unique_keys"
     )]
-    pub resources: IndexMap<String, Backing>,
+    pub resources: IndexMap<String, R>,
     /// The seed every `Rng` parameter draws from.
     #[serde(default)]
     pub seed: u64,
 }
 
-impl<S> CoordinatorConfig<S> {
-    /// Returns this config with each system mapped through `f`.
-    pub fn try_map_systems<T, E>(
+impl<S, R> CoordinatorConfig<S, R> {
+    /// Returns this config with each system mapped through `f`, and each
+    /// resource, with its id, through `g`.
+    pub fn try_map<T, Q, E>(
         self,
         f: impl FnMut(S) -> Result<T, E>,
-    ) -> Result<CoordinatorConfig<T>, E> {
+        mut g: impl FnMut(&str, R) -> Result<Q, E>,
+    ) -> Result<CoordinatorConfig<T, Q>, E> {
+        let resources = self.resources.into_iter().map(|(id, r)| {
+            let r = g(&id, r)?;
+            Ok((id, r))
+        });
         Ok(CoordinatorConfig {
             clock: self.clock,
             ring_depth: self.ring_depth,
             namespace: self.namespace,
             systems: self.systems.into_iter().map(f).collect::<Result<_, E>>()?,
-            resources: self.resources,
+            resources: resources.collect::<Result<_, E>>()?,
             seed: self.seed,
         })
     }

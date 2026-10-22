@@ -12,7 +12,9 @@ use metor_proto::types::Timestamp;
 
 use super::arena::Arena;
 use super::cap::{Cap, Handle, Interface};
-use super::{Cqe, Errno, Io, IoError, IoInit, MAX_OPS, Op, Sqe, Token, TtyConfig};
+use super::{
+    Cqe, DEFAULT_OPS, Errno, Io, IoError, IoInit, Op, RawHandle, Span, Sqe, Token, TtyConfig,
+};
 use crate::coordinator::MakeError;
 use crate::port::{Input, Output, ring_capacity};
 use crate::record::Record;
@@ -20,10 +22,10 @@ use crate::record::Record;
 /// How far each [`TestIo::turn`] moves the clock, in microseconds.
 pub const TURN_MICROS: i64 = 10_000;
 
-fn ring<T: Record>(readers: usize) -> RingBuffer {
+fn ring<T: Record>(readers: usize, ops: u16) -> RingBuffer {
     RingBuffer::create_in_memory(Config {
-        // PANIC Safety: a small record at a small depth fits any host.
-        capacity: ring_capacity(T::MAX_LEN, 4 * MAX_OPS).expect("a small ring"),
+        // PANIC Safety: a small record at a `u16` depth fits any host.
+        capacity: ring_capacity(T::MAX_LEN, 4 * usize::from(ops)).expect("a small ring"),
         max_readers: readers,
     })
     .expect("a valid ring config")
@@ -52,14 +54,21 @@ pub struct TestIo {
 /// A `Cap<K>` whose ops the test answers through the [`TestPort`] that
 /// [`TestIo::turn`] lends.
 pub fn cap<K: Interface>() -> (Cap<K>, TestIo) {
-    let (sq_ring, cq_ring) = (ring::<Sqe>(2), ring::<Cqe>(1));
+    cap_with_ops(DEFAULT_OPS)
+}
+
+/// A [`cap`] whose system may have `ops` ops in flight.
+pub fn cap_with_ops<K: Interface>(ops: u16) -> (Cap<K>, TestIo) {
+    let (sq_ring, cq_ring) = (ring::<Sqe>(2, ops), ring::<Cqe>(1, ops));
     let arena = Rc::new(Arena::new());
-    let io = Io::new(writer(&sq_ring), reader(&cq_ring), arena.clone());
+    let io = Io::new(writer(&sq_ring), reader(&cq_ring), arena.clone(), ops);
     let port = TestPort {
         requests: reader(&sq_ring),
         replies: writer(&cq_ring),
         arena,
-        held: Vec::with_capacity(2 * MAX_OPS),
+        held: Vec::with_capacity(Sqe::depth(ops)),
+        timers: Vec::with_capacity(usize::from(ops)),
+        now: Timestamp(0),
         cursor: 0,
     };
     let cap = Cap::new(Handle::new(io.next_grant(), io.clone()));
@@ -84,11 +93,17 @@ impl TestIo {
         state
     }
 
-    /// Advances time and lends the queue's other end, for the test to
-    /// answer once.
+    /// The ops the system has not taken back yet.
+    pub fn in_flight(&self) -> usize {
+        self.io.in_flight()
+    }
+
+    /// Advances time, lands the timeouts it passes, and lends the queue's
+    /// other end, for the test to answer once.
     pub fn turn(&mut self) -> &mut TestPort {
         self.now = Timestamp(self.now.0 + TURN_MICROS);
         self.submitted = self.sq.drain().flatten().collect();
+        self.port.tick(self.now);
         &mut self.port
     }
 
@@ -102,12 +117,24 @@ impl TestIo {
     }
 }
 
+/// An op the test has not answered yet.
+struct Held {
+    token: Token,
+    handle: RawHandle,
+    op: Op,
+    span: Span,
+}
+
 /// The other end of a system's queue: the test answers its ops one by one.
+/// Timeouts land on their own as turns pass, as the dispatch lands them.
 pub struct TestPort {
     requests: Input<Sqe>,
     replies: Output<Cqe>,
     arena: Rc<Arena>,
-    held: Vec<(Token, Op, crate::io::Span)>,
+    held: Vec<Held>,
+    /// Each timeout in flight and when it lands.
+    timers: Vec<(Token, Timestamp)>,
+    now: Timestamp,
     cursor: usize,
 }
 
@@ -115,23 +142,69 @@ impl TestPort {
     /// Starts a pass over the ops waiting for an answer, oldest first. A
     /// cancel completes its target `Canceled` and is never lent.
     pub fn requests(&mut self) -> Requests<'_> {
-        for sqe in self.requests.drain().flatten() {
-            match sqe.op() {
-                Ok(Op::Cancel) => {
-                    if let Some(at) = self.held.iter().position(|h| h.0 == sqe.token) {
-                        let (token, ..) = self.held.remove(at);
-                        let _ = self.replies.write(&Cqe::err(token, IoError::Canceled));
-                    }
-                }
-                Ok(op) => self.held.push((sqe.token, op, sqe.buf)),
-                Err(e) => {
-                    let _ = self.replies.write(&Cqe::err(sqe.token, e));
-                }
-            }
-        }
+        self.take();
         self.cursor = 0;
         Requests { port: self }
     }
+
+    /// Takes what the system submitted since the last turn, timing its
+    /// timeouts from that turn, then lands those due at `now`. One a full
+    /// CQ refuses lands on a later turn.
+    fn tick(&mut self, now: Timestamp) {
+        self.take();
+        self.now = now;
+        let replies = &mut self.replies;
+        self.timers
+            .retain(|&(token, at)| at > now || replies.write(&Cqe::ok(token, 0)).is_err());
+    }
+
+    /// Moves the SQ's new ops into `held` and `timers`, and answers its
+    /// cancels.
+    fn take(&mut self) {
+        let Self {
+            requests,
+            replies,
+            held,
+            timers,
+            now,
+            ..
+        } = self;
+        for sqe in requests.drain().flatten() {
+            let reply = match sqe.op() {
+                Ok(Op::Cancel) => cancel(held, timers, sqe.token),
+                Ok(Op::Timeout(after)) => {
+                    let micros = i64::try_from(after.as_micros()).unwrap_or(i64::MAX);
+                    timers.push((sqe.token, Timestamp(now.0.saturating_add(micros))));
+                    None
+                }
+                Ok(op) => {
+                    held.push(Held {
+                        token: sqe.token,
+                        handle: sqe.handle,
+                        op,
+                        span: sqe.buf,
+                    });
+                    None
+                }
+                Err(e) => Some(Cqe::err(sqe.token, e)),
+            };
+            if let Some(cqe) = reply {
+                let _ = replies.write(&cqe);
+            }
+        }
+    }
+}
+
+/// Takes the op `token` names out of `held` or `timers`, and its
+/// `Canceled` reply.
+fn cancel(held: &mut Vec<Held>, timers: &mut Vec<(Token, Timestamp)>, token: Token) -> Option<Cqe> {
+    if let Some(at) = held.iter().position(|h| h.token == token) {
+        held.remove(at);
+    } else {
+        let at = timers.iter().position(|t| t.0 == token)?;
+        timers.remove(at);
+    }
+    Some(Cqe::err(token, IoError::Canceled))
 }
 
 /// One pass over a [`TestPort`]'s ops.
@@ -164,13 +237,18 @@ pub struct Request<'a> {
 
 impl Request<'_> {
     pub fn op(&self) -> Op {
-        self.port.held[self.at].1
+        self.port.held[self.at].op
+    }
+
+    /// The handle the op was submitted on.
+    pub fn handle(&self) -> RawHandle {
+        self.port.held[self.at].handle
     }
 
     /// The op's buffer: the whole capacity for an op that fills it, the
     /// filled bytes otherwise.
     pub fn buf(&mut self) -> &mut [u8] {
-        let span = self.port.held[self.at].2;
+        let span = self.port.held[self.at].span;
         match self.port.arena.get_slice(span) {
             // SAFETY: the system lent this span to the op until its reply,
             // and `&mut self` keeps two slices of it from coexisting.
@@ -181,7 +259,7 @@ impl Request<'_> {
 
     /// Answers with a length or a GPIO level, or an error.
     pub fn done(mut self, result: Result<usize, IoError>) {
-        let (token, ..) = self.port.held.remove(self.at);
+        let token = self.port.held.remove(self.at).token;
         let cqe = match result {
             Ok(n) => Cqe::ok(token, n as u32),
             Err(e) => Cqe::err(token, e),
