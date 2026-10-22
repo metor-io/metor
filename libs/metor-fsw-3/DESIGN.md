@@ -273,7 +273,7 @@ it. The link's ops go through `fsw.io` once per cycle, and every buffer
 comes from its arena at make.
 
 ```python
-plant_pub = plant.add("pub", Publish(transport=Listen("0.0.0.0:2240"), items=[sim]))
+plant_pub = plant.add("pub", Publish(transport=Listen("[::]:2240"), items=[sim]))
 mirror = fsw.add("plant", Subscribe(transport=Peer(plant_pub), items=[sim]))
 nav = fsw.add("nav", Nav(sensors=mirror.port(sim.sensors)))
 ```

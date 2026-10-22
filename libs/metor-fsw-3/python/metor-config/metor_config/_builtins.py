@@ -106,10 +106,7 @@ def _resolve(addr: str) -> str:
         found = socket.getaddrinfo(host, int(port), type=socket.SOCK_STREAM)
     except OSError as e:
         raise ConfigError(f"`{addr}` does not resolve: {e}") from None
-    # `localhost` often lists `::1` first, which a listener on `0.0.0.0` does
-    # not take.
-    v4 = [entry for entry in found if entry[0] == socket.AF_INET]
-    family, ip = (v4 or found)[0][0], (v4 or found)[0][4][0]
+    family, ip = found[0][0], found[0][4][0]
     return f"[{ip}]:{port}" if family == socket.AF_INET6 else f"{ip}:{port}"
 
 

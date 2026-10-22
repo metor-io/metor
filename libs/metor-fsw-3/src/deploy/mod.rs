@@ -219,19 +219,10 @@ fn dial_addr(
         addr: addr.clone(),
         message,
     };
-    let resolved: Vec<SocketAddr> = addr
-        .to_socket_addrs()
+    addr.to_socket_addrs()
         .map_err(|e| unresolved(e.to_string()))?
-        .collect();
-    first_v4(&resolved).ok_or_else(|| unresolved("no address".into()))
-}
-
-/// The first IPv4 address of `addrs`, else the first: a name such as
-/// `localhost` often lists `::1` first, which a listener on `0.0.0.0` does not
-/// take.
-fn first_v4(addrs: &[SocketAddr]) -> Option<SocketAddr> {
-    let v4 = addrs.iter().find(|a| a.is_ipv4());
-    v4.or(addrs.first()).copied()
+        .next()
+        .ok_or_else(|| unresolved("no address".into()))
 }
 
 /// Checks that no two listeners on the same host bind the same port.

@@ -246,11 +246,7 @@ fn test_peer_dial_resolves_a_host_name() {
     else {
         panic!("a resolved dial")
     };
-    assert_eq!(
-        addr,
-        &SocketAddr::from(([127, 0, 0, 1], 2240)),
-        "IPv4 first"
-    );
+    assert!(addr.ip().is_loopback() && addr.port() == 2240, "{addr}");
 
     let mut unknown = envelope();
     unknown.hosts.insert("a".into(), "nohost.invalid".into());
@@ -533,13 +529,4 @@ fn test_stored_slots_resolve_to_themselves() {
     resolve(&mut envelope, &tables(2)).expect("resolves");
     assert_eq!(envelope.targets[0].coordinator.systems[4].params, before);
     assert!(!unresolved(&envelope).expect("decodes"));
-}
-
-#[test]
-fn test_first_v4_prefers_ipv4() {
-    let v6: SocketAddr = "[::1]:1".parse().expect("an address");
-    let v4: SocketAddr = "127.0.0.1:1".parse().expect("an address");
-    assert_eq!(first_v4(&[v6, v4]), Some(v4));
-    assert_eq!(first_v4(&[v6]), Some(v6));
-    assert_eq!(first_v4(&[]), None);
 }

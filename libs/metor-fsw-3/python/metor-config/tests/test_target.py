@@ -336,7 +336,7 @@ class LinkTest(ConfigTest):
         fsw = Target(cycle_rate=100.0)
         fsw.add("pub", Publish([], transport=Connect("localhost:2240")))
         dial = fsw.to_config()["coordinator"]["resources"]["pub_ep"]["real"]["tcp_dial"]
-        self.assertEqual(dial["addr"], "127.0.0.1:2240", "IPv4 first")
+        self.assertIn(dial["addr"], ("127.0.0.1:2240", "[::1]:2240"))
         with self.assertRaisesRegex(ConfigError, "does not resolve"):
             fsw.add("lost", Publish([], transport=Connect("nohost.invalid:1")))
         with self.assertRaisesRegex(ConfigError, "not a `host:port`"):
