@@ -16,7 +16,7 @@ use gpui::{
 pub(super) const MIN_ZOOM: f32 = 0.25;
 pub(super) const MAX_ZOOM: f32 = 2.0;
 
-/// Ratio between neighbouring zoom levels for the toolbar buttons.
+/// Ratio between neighbouring zoom levels for the Zoom In / Zoom Out commands.
 pub(super) const ZOOM_STEP: f32 = 1.25;
 
 /// How strongly one pixel of wheel travel zooms; a 20px mouse-wheel notch is

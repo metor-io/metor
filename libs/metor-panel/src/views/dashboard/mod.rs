@@ -17,7 +17,9 @@ use metor_db::DB;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::inspector::rows::{BoolRow, CommandRow, DefaultActionRow, InspectorRow, NavRow};
+use crate::inspector::rows::{
+    BoolRow, CommandRow, DefaultActionRow, InspectorRow, NavRow, ScalarRow,
+};
 use crate::theme::theme;
 use crate::views::Scrollbar;
 
@@ -441,7 +443,7 @@ impl DashboardPanel {
     }
 
     /// Zoom to `zoom` (clamped) around a window-space point, or around the
-    /// viewport's centre for the toolbar buttons, which have no cursor to
+    /// viewport's centre for inspector commands, which have no cursor to
     /// anchor to.
     fn zoom_to(&mut self, zoom: f32, anchor: Option<Point<Pixels>>, cx: &mut Context<Self>) {
         let anchor = match anchor {
@@ -860,6 +862,16 @@ pub fn dashboard_rows(
         })));
     }
 
+    let zoom = dashboard.read(cx).viewport.zoom;
+    rows.push(Box::new(NavRow::new(
+        "Zoom",
+        SharedString::from(format!("{:.0}%", zoom * 100.0)),
+        {
+            let dashboard = dashboard.clone();
+            Box::new(move |cx| zoom_rows(dashboard.clone(), cx))
+        },
+    )));
+
     rows.push(Box::new(CommandRow::new("Draw Connector", {
         let dashboard = dashboard.clone();
         Arc::new(move |_window, cx| {
@@ -920,6 +932,46 @@ pub fn dashboard_rows(
     )));
 
     rows
+}
+
+/// Zoom commands for the dashboard's inspector page. Steps zoom around the
+/// viewport's centre; the wheel and pinch gestures anchor at the cursor.
+fn zoom_rows(dashboard: Entity<DashboardPanel>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
+    let step = |label: &'static str, zoom: fn(f32) -> f32| {
+        let dashboard = dashboard.clone();
+        Box::new(CommandRow::new(
+            label,
+            Arc::new(move |_window, cx| {
+                dashboard.update(cx, |this, cx| {
+                    this.zoom_to(zoom(this.viewport.zoom), None, cx);
+                });
+            }),
+        )) as Box<dyn InspectorRow>
+    };
+    let percent = {
+        let dashboard = dashboard.clone();
+        ScalarRow::new(
+            "Zoom %".into(),
+            f64::from(dashboard.read(cx).viewport.zoom * 100.0).round(),
+            Arc::new(move |value, _window, cx| {
+                dashboard.update(cx, |this, cx| this.zoom_to(value as f32 / 100.0, None, cx));
+            }),
+        )
+    };
+    let fit = {
+        let dashboard = dashboard.clone();
+        CommandRow::new(
+            "Fit All",
+            Arc::new(move |_window, cx| dashboard.update(cx, |this, cx| this.fit_all(cx))),
+        )
+    };
+    vec![
+        Box::new(fit),
+        step("Zoom In", |z| z * zoom::ZOOM_STEP),
+        step("Zoom Out", |z| z / zoom::ZOOM_STEP),
+        step("Actual Size", |_| 1.0),
+        Box::new(percent),
+    ]
 }
 
 fn add_widget_rows(
@@ -1376,26 +1428,10 @@ fn connector_rows(
 /// The floating strip the modal canvas tools live in, top-left so it
 /// clears the edit-mode badge in the corner.
 fn canvas_toolbar(theme: &crate::theme::Theme) -> gpui::Div {
-    toolbar_strip(theme).top(px(4.0)).left(px(8.0))
-}
-
-/// The zoom controls, bottom-right where they stay clear of both the modal
-/// tool strip and the edit-mode badge.
-fn zoom_toolbar(theme: &crate::theme::Theme) -> gpui::Div {
-    // Inset past the scrollbars so neither covers the other. Presses stop
-    // here so a zoom click never lands a connector anchor or grabs the
-    // widget underneath.
-    toolbar_strip(theme)
-        .bottom(px(12.0))
-        .right(px(12.0))
-        .occlude()
-        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-}
-
-/// A floating pill strip over the canvas; callers place it.
-fn toolbar_strip(theme: &crate::theme::Theme) -> gpui::Div {
     div()
         .absolute()
+        .top(px(4.0))
+        .left(px(8.0))
         .flex()
         .flex_row()
         .items_center()
@@ -1613,37 +1649,6 @@ impl Render for DashboardPanel {
                             this.selected_connector = None;
                             cx.notify();
                         })),
-                    ),
-            );
-        }
-
-        if !self.widgets.is_empty() {
-            let percent = SharedString::from(format!("{:.0}%", self.viewport.zoom * 100.0));
-            canvas_div = canvas_div.child(
-                zoom_toolbar(&theme)
-                    .child(
-                        crate::views::sequence_panel::pill_button(&theme, ("zoom-out", 0), "−")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.zoom_to(this.viewport.zoom / zoom::ZOOM_STEP, None, cx);
-                            })),
-                    )
-                    .child(
-                        crate::views::sequence_panel::pill_button(
-                            &theme,
-                            ("zoom-reset", 0),
-                            percent,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.zoom_to(1.0, None, cx))),
-                    )
-                    .child(
-                        crate::views::sequence_panel::pill_button(&theme, ("zoom-in", 0), "+")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.zoom_to(this.viewport.zoom * zoom::ZOOM_STEP, None, cx);
-                            })),
-                    )
-                    .child(
-                        crate::views::sequence_panel::pill_button(&theme, ("zoom-fit", 0), "Fit")
-                            .on_click(cx.listener(|this, _, _, cx| this.fit_all(cx))),
                     ),
             );
         }
@@ -1940,6 +1945,34 @@ mod tests {
     #[test]
     fn an_empty_dashboard_starts_at_one() {
         assert_eq!(next_connector_id(&[]), 1);
+    }
+
+    #[gpui::test]
+    fn zoom_is_driven_from_the_inspector(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        let cx = cx.add_empty_window();
+        let dashboard = cx.update(|_, cx| cx.new(|cx| DashboardPanel::new(db.clone(), cx)));
+        let run = |label: &str, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                let mut rows = zoom_rows(dashboard.clone(), cx);
+                let row = rows.iter_mut().find(|r| r.label() == label).unwrap();
+                row.activate(window, cx);
+            });
+            dashboard.read_with(cx, |d, _| d.viewport.zoom)
+        };
+
+        assert_eq!(run("Zoom Out", cx), 1.0 / zoom::ZOOM_STEP);
+        assert_eq!(run("Zoom In", cx), 1.0);
+        run("Zoom Out", cx);
+        assert_eq!(run("Actual Size", cx), 1.0);
+        let labels: Vec<String> = cx.update(|_, cx| {
+            dashboard_rows(dashboard.clone(), db.clone(), cx)
+                .iter()
+                .map(|r| r.label().to_string())
+                .collect()
+        });
+        assert!(labels.iter().any(|l| l == "Zoom"));
     }
 }
 
