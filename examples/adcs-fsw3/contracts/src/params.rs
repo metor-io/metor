@@ -103,6 +103,66 @@ fn default_mtq_max() -> f64 {
 pub struct NavParams {
     /// Measurement 1σ for the sun and magnetic field observations.
     pub meas_sigma: f64,
+    /// Squared Mahalanobis distance above which a star vector is rejected.
+    /// 13.8 is χ²₂ at p = 0.001.
+    #[serde(default = "default_star_gate")]
+    pub star_gate: f64,
+    /// Fuses the sun and magnetometer vectors. Off leaves star vectors alone.
+    #[serde(default = "default_true")]
+    pub sun_mag: bool,
+    /// Gyro white noise the filter models (rad/s/√Hz). The default is twice
+    /// the plant's 2 mrad/s per sample at 120 Hz, as margin for an
+    /// unmodelled gyro.
+    #[serde(default = "default_gyro_noise")]
+    pub gyro_noise: f64,
+    /// Gyro bias random walk the filter models (rad/s/√s). The default is
+    /// twice the plant's 20 µrad/s per sample at 120 Hz.
+    #[serde(default = "default_bias_walk")]
+    pub bias_walk: f64,
+    /// Initial gyro bias 1σ (rad/s).
+    #[serde(default = "default_bias_sigma")]
+    pub bias_sigma: f64,
+}
+
+fn default_gyro_noise() -> f64 {
+    3.65e-4
+}
+fn default_bias_walk() -> f64 {
+    4.38e-4
+}
+fn default_bias_sigma() -> f64 {
+    1e-3
+}
+
+fn default_star_gate() -> f64 {
+    13.8
+}
+fn default_true() -> bool {
+    true
+}
+
+/// Configuration for the ideal star tracker, which makes star vectors from
+/// the true attitude and a synthetic catalog.
+#[derive(Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct StarParams {
+    /// Frame rate (Hz).
+    pub rate_hz: f64,
+    /// Full field of view (deg), a cone.
+    pub fov_deg: f64,
+    /// Per-star 1σ (rad).
+    pub sigma_rad: f64,
+    /// The most stars written per frame.
+    pub n_stars_max: u32,
+    /// Seed for the catalog and the noise.
+    pub seed: u64,
+    /// Star tracker mount, `[x, y, z, w]`: `b_body = A(q_b_st) b_st`, the
+    /// convention of `q_b_eci`.
+    #[serde(default = "default_q_b_st")]
+    pub q_b_st: [f64; 4],
+}
+
+fn default_q_b_st() -> [f64; 4] {
+    [0.0, 0.0, 0.0, 1.0]
 }
 
 /// Configuration for the controller.

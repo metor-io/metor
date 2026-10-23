@@ -69,6 +69,28 @@ pub struct AttitudeEstimate {
     pub p: Matrix6<f64, ArrayRepr>,
 }
 
+/// What nav's last update fused and what it gated.
+#[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
+#[repr(C)]
+#[frame(name = "nav_stats")]
+pub struct NavStats {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    /// Sun and magnetometer vectors fused and gated.
+    pub vectors_used: u64,
+    pub vectors_gated: u64,
+    /// Star vectors fused and gated from the last star frame.
+    pub stars_used: u64,
+    pub stars_gated: u64,
+    /// The last star frame fused, or zero.
+    pub star_frame_id: u64,
+    /// Star frames that contradicted the attitude estimate, since boot.
+    pub contradictions: u64,
+    /// Attitude covariance resets after two consecutive, mutually
+    /// consistent contradicting star frames, since boot.
+    pub prior_resets: u64,
+}
+
 /// The spacecraft's true attitude, body rate, and orbit state.
 #[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[repr(C)]

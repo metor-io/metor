@@ -7,6 +7,7 @@ members = [
     "libs/metor-component/macros",
     "libs/metor-component/derive-impl",
     "libs/metor-adcs",
+    "libs/metor-star",
     "libs/wmm",
     "libs/metor-proto",
     "libs/metor-proto/stellar",
@@ -43,6 +44,7 @@ members = [
     "examples/adcs-fsw3/contracts",
     "examples/adcs-fsw3/systems/adcs",
     "examples/adcs-fsw3/systems/seqs",
+    "examples/adcs-fsw3/systems/startracker-sim",
     "libs/metor-fsw-3",
     "libs/metor-fsw-3/ring",
     "libs/metor-fsw-3/macros",
@@ -114,6 +116,13 @@ debug = true
 # Image decode (map tiles, image widgets, GLTF textures) is 10x+ slower
 # unoptimized; keep just the codec crates fast in dev builds without
 # slowing the workspace's own rebuild loop.
+# The star renderer is too slow unoptimized for a real-time sim test.
+[profile.dev.package.metor-star]
+opt-level = 3
+
+[profile.dev.package.libm]
+opt-level = 3
+
 [profile.dev.package.image]
 opt-level = 3
 [profile.dev.package.png]

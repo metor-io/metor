@@ -1,0 +1,40 @@
+Star catalog data in this directory
+==================================
+
+starcat-g8.bin, and the G <= 12 catalog that `starcat.ensure("g12")` fetches,
+are derived from the catalogs below. The derived data is NOT covered by this
+repository's Apache-2.0 licence. It is distributed under the Creative Commons
+Attribution-NonCommercial 3.0 IGO licence (CC BY-NC 3.0 IGO):
+
+    https://creativecommons.org/licenses/by-nc/3.0/igo/
+
+Commercial use needs prior permission from ESA (data.licences@esa.int). See
+https://www.cosmos.esa.int/web/gaia-users/license and
+https://www.cosmos.esa.int/web/esdc/terms-and-conditions.
+
+Changes made: positions propagated to epoch J2024.0, magnitudes rounded to
+millimag, Hipparcos V and V-I converted to Gaia G and BP-RP, and the stars
+re-ordered by HEALPix cell. The files are built by
+libs/metor-star/tools/starcat.
+
+Attribution
+-----------
+
+Gaia DR3: "This work has made use of data from the European Space Agency (ESA)
+mission Gaia (https://www.cosmos.esa.int/gaia), processed by the Gaia Data
+Processing and Analysis Consortium (DPAC,
+https://www.cosmos.esa.int/web/gaia/dpac/consortium)."
+Credit: ESA/Gaia/DPAC.
+
+Hipparcos: Credit: ESA.
+
+Source catalogs
+---------------
+
+- Gaia Collaboration, Vallenari, A., et al. 2023, A&A 674, A1,
+  "Gaia Data Release 3. Summary of the content and survey properties"
+  (gaiadr3.gaia_source, gaiadr3.hipparcos2_best_neighbour).
+- ESA 1997, "The Hipparcos and Tycho Catalogues", ESA SP-1200
+  (VizieR I/239, read from the Gaia archive table public.hipparcos).
+- Riello, M., et al. 2021, A&A 649, A3, "Gaia Early Data Release 3:
+  Photometric content and validation" (Johnson-Cousins relations, Table C.2).

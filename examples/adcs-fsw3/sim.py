@@ -2,13 +2,25 @@
 back to the plant one cycle late.
 
 Nav and ctrl take their GPS fixes from a driver reading a simulated receiver
-over a serial port. The receiver logs the plant's true orbit state. A db
+over a serial port. Nav also fuses star vectors from an ideal tracker that reads
+the plant's true attitude. The receiver logs the plant's true orbit state. A db
 records everything and serves it on 2250."""
 
 import math
 
-from adcs_pack import Ctrl, GpsDriver, GpsReceiver, Mode, MtqCmd, Nav, Plant, TorqueCmd
+from adcs_pack import (
+    Ctrl,
+    GpsDriver,
+    GpsReceiver,
+    Mode,
+    MtqCmd,
+    Nav,
+    Plant,
+    StarIdeal,
+    TorqueCmd,
+)
 from metor_config import Db, Listen, Publish, SimUart, Target
+from startracker_sim_pack import StarSim
 
 fsw = Target(cycle_rate=120.0, namespace="sim")
 
@@ -46,7 +58,34 @@ gps_uart = fsw.resource("gps_uart", SimUart())
 gps = fsw.add("gps", GpsDriver(uart=gps_uart))
 fsw.sim("gps_rx", GpsReceiver(uart=gps_uart.device, truth=plant.body, seed=7))
 
-nav = fsw.add("nav", Nav(sensors=plant.sensors, gps=gps.fix, meas_sigma=0.02))
+# A 20° tracker at 10 Hz with 34 µrad (7″) per star.
+star = fsw.add(
+    "star",
+    StarIdeal(
+        body=plant.body,
+        rate_hz=10.0,
+        fov_deg=20.0,
+        sigma_rad=34e-6,
+        n_stars_max=32,
+        seed=11,
+    ),
+)
+# Renders the same tracker's 1024² images from the true attitude on its own
+# thread, from the committed G ≤ 8 catalog.
+fsw.add(
+    "star_sim",
+    StarSim(body=plant.body, world=plant.world, rate_hz=10.0, seed=13),
+    thread="startracker",
+)
+nav = fsw.add(
+    "nav",
+    Nav(
+        sensors=plant.sensors,
+        gps=gps.fix,
+        stars=star.star_vectors,
+        meas_sigma=0.02,
+    ),
+)
 mode = fsw.add("mode", Mode())
 ctrl = fsw.add(
     "ctrl",
@@ -66,7 +105,8 @@ ctrl = fsw.add(
 torque.connect(ctrl.torque_cmd)
 mtq.connect(ctrl.mtq_cmd)
 
-fsw.add("pub", Publish(transport=Listen("[::]:2240"), all=True))
+# `conn_cap` fits a 2 MiB star image.
+fsw.add("pub", Publish(transport=Listen("[::]:2240"), all=True, conn_cap=4 << 20))
 # Records the whole loop, GPS included, for a panel on 2250, as target.py's
 # gateway does.
 fsw.add("db", Db(listen="0.0.0.0:2250", all=True), thread="db")

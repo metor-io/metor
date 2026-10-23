@@ -30,6 +30,8 @@ mod orbit;
 mod params;
 mod pointing;
 mod spacecraft;
+mod star;
+mod star_image;
 
 #[cfg(feature = "environment")]
 pub use environment::*;
@@ -40,6 +42,8 @@ pub use orbit::*;
 pub use params::*;
 pub use pointing::*;
 pub use spacecraft::*;
+pub use star::*;
+pub use star_image::*;
 
 #[cfg(feature = "environment")]
 pub use hifitime::Epoch;
