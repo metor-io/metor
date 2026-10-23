@@ -1143,6 +1143,8 @@ pub struct PanelApp {
         crate::views::dashboard::WidgetKind,
         crate::views::dashboard::WidgetSpec,
     )>,
+    themes: Vec<crate::theme::Theme>,
+    default_theme: Option<SharedString>,
 }
 
 impl PanelApp {
@@ -1173,6 +1175,8 @@ impl PanelApp {
             init_hooks: Vec::new(),
             overlays: Vec::new(),
             views: Vec::new(),
+            themes: Vec::new(),
+            default_theme: None,
         }
     }
 
@@ -1353,6 +1357,22 @@ impl PanelApp {
         self
     }
 
+    /// Add a palette to the theme picker after the built-ins. A theme named
+    /// like one already registered — built-in or consumer — replaces it in
+    /// place. See [`Theme`](crate::theme::Theme) for the intended way to
+    /// build one.
+    pub fn theme(mut self, theme: crate::theme::Theme) -> Self {
+        self.themes.push(theme);
+        self
+    }
+
+    /// Start in the theme registered under `name` instead of "Dark". An
+    /// unknown name logs a warning and falls back to "Dark".
+    pub fn default_theme(mut self, name: impl Into<SharedString>) -> Self {
+        self.default_theme = Some(name.into());
+        self
+    }
+
     /// Boot the metor-db wire-protocol server on `addr` in a background task
     /// before opening the window. Omit to leave serving to the consumer.
     pub fn serve(mut self, addr: SocketAddr) -> Self {
@@ -1425,7 +1445,8 @@ impl PanelApp {
             }
         });
         app.run(move |cx| {
-            initialize_appearance(cx);
+            let themes = std::mem::take(&mut self.themes);
+            initialize_appearance(themes, self.default_theme.as_deref(), cx);
             if self.db.is_some() {
                 self.start(cx);
             } else {
@@ -1459,6 +1480,8 @@ impl PanelApp {
             init_hooks,
             overlays,
             views,
+            themes: _,
+            default_theme: _,
         } = self;
 
         let db = db.expect("session selected before DB services start");
@@ -1648,14 +1671,16 @@ impl PanelApp {
 struct RunningDatabase(Arc<DB>, bool);
 impl gpui::Global for RunningDatabase {}
 
-fn initialize_appearance(cx: &mut App) {
+fn initialize_appearance(
+    themes: Vec<crate::theme::Theme>,
+    default_theme: Option<&str>,
+    cx: &mut App,
+) {
     crate::theme::register_fonts(cx);
     let config = crate::config::load();
     let family = crate::theme::resolve_font_family(cx, &config);
     cx.set_global(crate::theme::FontSettings { family, config });
-    cx.set_global(crate::theme::ActiveTheme(Arc::new(
-        crate::theme::DARK.clone(),
-    )));
+    crate::theme::install_themes(cx, themes, default_theme);
     set_dock_icon();
 }
 

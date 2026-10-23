@@ -8,8 +8,9 @@ use crate::config::{self, FontConfig, PanelConfig};
 /// Build an [`Hsla`] from a packed `0xRRGGBB` literal in a const context.
 ///
 /// Theme tables are `static`, so the conversion has to happen without
-/// floating-point intrinsics or runtime allocation.
-const fn hex(rgb: u32, a: f32) -> Hsla {
+/// floating-point intrinsics or runtime allocation. Public so consumer
+/// palettes are written the same way the built-ins are.
+pub const fn hex(rgb: u32, a: f32) -> Hsla {
     let r = ((rgb >> 16) & 0xFF) as f32 / 255.0;
     let g = ((rgb >> 8) & 0xFF) as f32 / 255.0;
     let b = (rgb & 0xFF) as f32 / 255.0;
@@ -60,9 +61,27 @@ const fn hex(rgb: u32, a: f32) -> Hsla {
 ///
 /// All colors live here. Widgets must never hardcode an [`Hsla`] literal;
 /// reference a theme field instead so palettes stay swappable.
+///
+/// Consumers add palettes through [`PanelApp::theme`](crate::PanelApp::theme)
+/// or [`register_theme`]. Build one by overriding a built-in rather than
+/// listing every field, so fields added later inherit a sensible value
+/// instead of breaking the consumer's build:
+///
+/// ```
+/// use metor_panel::theme::{DARK, Theme, hex};
+///
+/// let mission = Theme {
+///     name: "Mission".into(),
+///     bg_primary: hex(0x101418, 1.0),
+///     ..DARK.clone()
+/// };
+/// # let _ = mission;
+/// ```
 #[derive(Clone)]
 pub struct Theme {
-    pub name: &'static str,
+    /// Display name in the theme picker, and the registry's identity: a
+    /// second theme with the same name replaces the first.
+    pub name: SharedString,
     pub bg_primary: Hsla,
     pub bg_secondary: Hsla,
     /// Surface lifted above the page, used by palettes and popovers.
@@ -340,8 +359,9 @@ pub fn set_theme(cx: &mut App, theme: Arc<Theme>) {
     cx.set_global(ActiveTheme(theme));
 }
 
-/// Every theme compiled into the binary, in the order the settings UI displays them.
-pub fn all_themes() -> &'static [&'static Theme] {
+/// Every theme compiled into the binary, in the order the theme picker
+/// displays them. [`ThemeRegistry`] starts from this list.
+pub fn builtin_themes() -> &'static [&'static Theme] {
     static THEMES: &[&Theme] = &[
         &DARK,
         &CATPPUCCIN_MOCHA,
@@ -360,6 +380,95 @@ pub fn all_themes() -> &'static [&'static Theme] {
     THEMES
 }
 
+/// The themes the picker offers: the built-ins in display order, then
+/// consumer themes in registration order.
+///
+/// Names are identities, so registering a theme whose name is already
+/// present replaces that entry in place — a consumer can restyle "Dark"
+/// without the picker growing a second one or the order shifting.
+pub struct ThemeRegistry {
+    themes: Vec<Arc<Theme>>,
+}
+
+impl Global for ThemeRegistry {}
+
+impl Default for ThemeRegistry {
+    fn default() -> Self {
+        Self {
+            themes: builtin_themes()
+                .iter()
+                .map(|theme| Arc::new((*theme).clone()))
+                .collect(),
+        }
+    }
+}
+
+impl ThemeRegistry {
+    pub fn register(&mut self, theme: Theme) {
+        let theme = Arc::new(theme);
+        match self.themes.iter_mut().find(|t| t.name == theme.name) {
+            Some(slot) => *slot = theme,
+            None => self.themes.push(theme),
+        }
+    }
+
+    pub fn themes(&self) -> &[Arc<Theme>] {
+        &self.themes
+    }
+
+    pub fn find(&self, name: &str) -> Option<Arc<Theme>> {
+        self.themes.iter().find(|t| t.name == name).cloned()
+    }
+
+    /// The theme a session starts in: `name` if registered, otherwise the
+    /// registry's first entry — "Dark", or whatever a consumer replaced it
+    /// with — so a misspelt default still boots into a coherent palette.
+    pub fn startup_theme(&self, name: Option<&str>) -> Arc<Theme> {
+        if let Some(name) = name {
+            match self.find(name) {
+                Some(theme) => return theme,
+                None => tracing::warn!(name, "unknown default theme; falling back"),
+            }
+        }
+        self.themes[0].clone()
+    }
+}
+
+/// Add `theme` to the picker, replacing a registered theme of the same name.
+/// When the replaced theme is the active one, the replacement takes effect
+/// immediately.
+pub fn register_theme(cx: &mut App, theme: Theme) {
+    let active = cx
+        .try_global::<ActiveTheme>()
+        .is_some_and(|active| active.0.name == theme.name);
+    let name = theme.name.clone();
+    let registry = cx.default_global::<ThemeRegistry>();
+    registry.register(theme);
+    if active && let Some(theme) = registry.find(&name) {
+        set_theme(cx, theme);
+    }
+}
+
+/// Every theme the picker offers. Falls back to the built-ins when no
+/// registry is installed (tests that set a theme directly).
+pub fn themes(cx: &App) -> Vec<Arc<Theme>> {
+    match cx.try_global::<ThemeRegistry>() {
+        Some(registry) => registry.themes().to_vec(),
+        None => ThemeRegistry::default().themes,
+    }
+}
+
+/// Seed the registry with the built-ins plus `extra`, then activate the
+/// startup theme. Runs once at boot, before any window opens.
+pub(crate) fn install_themes(cx: &mut App, extra: Vec<Theme>, default: Option<&str>) {
+    let mut registry = ThemeRegistry::default();
+    for theme in extra {
+        registry.register(theme);
+    }
+    set_theme(cx, registry.startup_theme(default));
+    cx.set_global(registry);
+}
+
 const LINE_COLORS: [Hsla; 8] = [
     hex(0xff7c1f, 1.0), // orange
     hex(0x4aa0e0, 1.0), // blue
@@ -372,7 +481,7 @@ const LINE_COLORS: [Hsla; 8] = [
 ];
 
 pub static DARK: Theme = Theme {
-    name: "Dark",
+    name: SharedString::new_static("Dark"),
 
     bg_primary: hex(0x1f1d1b, 1.0),
     bg_secondary: hex(0x151413, 1.0),
@@ -414,7 +523,7 @@ pub static DARK: Theme = Theme {
 };
 
 pub static CATPPUCCIN_MOCHA: Theme = Theme {
-    name: "Catppuccin Mocha",
+    name: SharedString::new_static("Catppuccin Mocha"),
 
     bg_primary: hex(0x1e1e2e, 1.0),
     bg_secondary: hex(0x11111b, 1.0),
@@ -465,7 +574,7 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
 };
 
 pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
-    name: "Catppuccin Macchiato",
+    name: SharedString::new_static("Catppuccin Macchiato"),
 
     bg_primary: hex(0x24273a, 1.0),
     bg_secondary: hex(0x1e2030, 1.0),
@@ -516,7 +625,7 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
 };
 
 pub static CATPPUCCIN_LATTE: Theme = Theme {
-    name: "Catppuccin Latte",
+    name: SharedString::new_static("Catppuccin Latte"),
 
     bg_primary: hex(0xeff1f5, 1.0),
     bg_secondary: hex(0xe6e9ef, 1.0),
@@ -567,7 +676,7 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
 };
 
 pub static AYU_DARK: Theme = Theme {
-    name: "Ayu Dark",
+    name: SharedString::new_static("Ayu Dark"),
 
     bg_primary: hex(0x0b0e14, 1.0),
     bg_secondary: hex(0x0f131a, 1.0),
@@ -618,7 +727,7 @@ pub static AYU_DARK: Theme = Theme {
 };
 
 pub static EVERFOREST_DARK: Theme = Theme {
-    name: "Everforest Dark",
+    name: SharedString::new_static("Everforest Dark"),
 
     bg_primary: hex(0x2d353b, 1.0),
     bg_secondary: hex(0x232a2e, 1.0),
@@ -669,7 +778,7 @@ pub static EVERFOREST_DARK: Theme = Theme {
 };
 
 pub static EVERFOREST_LIGHT: Theme = Theme {
-    name: "Everforest Light",
+    name: SharedString::new_static("Everforest Light"),
 
     bg_primary: hex(0xfdf6e3, 1.0),
     bg_secondary: hex(0xf4f0d9, 1.0),
@@ -720,7 +829,7 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
 };
 
 pub static ROSE_PINE: Theme = Theme {
-    name: "Rosé Pine",
+    name: SharedString::new_static("Rosé Pine"),
 
     bg_primary: hex(0x1f1d2e, 1.0),
     bg_secondary: hex(0x191724, 1.0),
@@ -771,7 +880,7 @@ pub static ROSE_PINE: Theme = Theme {
 };
 
 pub static ROSE_PINE_MOON: Theme = Theme {
-    name: "Rosé Pine Moon",
+    name: SharedString::new_static("Rosé Pine Moon"),
 
     bg_primary: hex(0x2a273f, 1.0),
     bg_secondary: hex(0x232136, 1.0),
@@ -822,7 +931,7 @@ pub static ROSE_PINE_MOON: Theme = Theme {
 };
 
 pub static ROSE_PINE_DAWN: Theme = Theme {
-    name: "Rosé Pine Dawn",
+    name: SharedString::new_static("Rosé Pine Dawn"),
 
     bg_primary: hex(0xfffaf3, 1.0),
     bg_secondary: hex(0xfaf4ed, 1.0),
@@ -873,7 +982,7 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
 };
 
 pub static MAKING_SOFTWARE: Theme = Theme {
-    name: "Making Software",
+    name: SharedString::new_static("Making Software"),
 
     bg_primary: hex(0xf4f5f9, 1.0),
     bg_secondary: hex(0xeceef5, 1.0),
@@ -924,7 +1033,7 @@ pub static MAKING_SOFTWARE: Theme = Theme {
 };
 
 pub static DEPARTURE: Theme = Theme {
-    name: "Departure",
+    name: SharedString::new_static("Departure"),
 
     bg_primary: hex(0x1a1815, 1.0),
     bg_secondary: hex(0x131210, 1.0),
@@ -981,7 +1090,7 @@ pub static DEPARTURE: Theme = Theme {
 /// pottery repair it's named for. The categorical line palette leads with those
 /// warm tones, keeping a few cool anchors so series stay distinguishable.
 pub static KINTSUGI: Theme = Theme {
-    name: "Kintsugi Flared",
+    name: SharedString::new_static("Kintsugi Flared"),
 
     bg_primary: hex(0x161618, 1.0),
     bg_secondary: hex(0x131314, 1.0),
@@ -1134,7 +1243,7 @@ mod tests {
     /// intensity extremes has to paint the colors those extremes map to.
     #[test]
     fn density_color_hits_the_stops() {
-        for theme in all_themes() {
+        for theme in builtin_themes() {
             let stops = &theme.density_stops;
             assert!(
                 approx(theme.density_color(0.0), stops[0]),
@@ -1158,11 +1267,81 @@ mod tests {
         }
     }
 
+    fn named(name: &'static str) -> Theme {
+        Theme {
+            name: name.into(),
+            bg_primary: hex(0x101418, 1.0),
+            ..DARK.clone()
+        }
+    }
+
+    fn names(registry: &ThemeRegistry) -> Vec<&str> {
+        registry.themes().iter().map(|t| t.name.as_ref()).collect()
+    }
+
+    /// Consumer themes follow the built-ins, and re-registering a name
+    /// restyles that entry where it stands instead of listing it twice.
+    #[test]
+    fn registry_appends_and_replaces_by_name() {
+        let mut registry = ThemeRegistry::default();
+        let builtins: Vec<&str> = builtin_themes().iter().map(|t| t.name.as_ref()).collect();
+        assert_eq!(names(&registry), builtins);
+
+        registry.register(named("Mission"));
+        registry.register(named("Night Ops"));
+        let mut expected = builtins.clone();
+        expected.extend(["Mission", "Night Ops"]);
+        assert_eq!(names(&registry), expected);
+
+        registry.register(named("Dark"));
+        registry.register(Theme {
+            bg_primary: hex(0x202020, 1.0),
+            ..named("Mission")
+        });
+        assert_eq!(names(&registry), expected);
+        assert!(approx(registry.themes()[0].bg_primary, hex(0x101418, 1.0)));
+        let mission = registry.find("Mission").unwrap();
+        assert!(approx(mission.bg_primary, hex(0x202020, 1.0)));
+    }
+
+    #[test]
+    fn startup_theme_falls_back_to_dark() {
+        let mut registry = ThemeRegistry::default();
+        registry.register(named("Mission"));
+        assert_eq!(registry.startup_theme(None).name, "Dark");
+        assert_eq!(registry.startup_theme(Some("Nope")).name, "Dark");
+        assert_eq!(registry.startup_theme(Some("Mission")).name, "Mission");
+        assert_eq!(
+            registry.startup_theme(Some("Rosé Pine")).name,
+            ROSE_PINE.name
+        );
+    }
+
+    #[gpui::test]
+    fn install_activates_the_default_and_registering_the_active_name_repaints(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            install_themes(cx, vec![named("Mission")], Some("Mission"));
+            assert_eq!(theme(cx).name, "Mission");
+            assert_eq!(themes(cx).last().unwrap().name, "Mission");
+
+            register_theme(
+                cx,
+                Theme {
+                    bg_primary: hex(0x202020, 1.0),
+                    ..named("Mission")
+                },
+            );
+            assert!(approx(theme(cx).bg_primary, hex(0x202020, 1.0)));
+        });
+    }
+
     /// Intensity has to read as intensity even in greyscale, so every ramp
     /// moves steadily away from its background rather than wandering.
     #[test]
     fn density_stops_are_monotonic_in_lightness() {
-        for theme in all_themes() {
+        for theme in builtin_themes() {
             let l: Vec<f32> = theme.density_stops.iter().map(|c| c.l).collect();
             let rising = l.windows(2).all(|w| w[0] < w[1]);
             let falling = l.windows(2).all(|w| w[0] > w[1]);

@@ -145,7 +145,10 @@ fn appearance_menu(on_open: OpenInspectorCallback, cx: &App) -> Vec<ChordNode> {
     vec![
         ChordNode::command("t", "Theme", {
             let on_open = on_open.clone();
-            move |window, cx| open_centered(&on_open, theme_rows(), window, cx)
+            move |window, cx| {
+                let rows = theme_rows(cx);
+                open_centered(&on_open, rows, window, cx);
+            }
         }),
         ChordNode::command("f", "Font", {
             let on_open = on_open.clone();
