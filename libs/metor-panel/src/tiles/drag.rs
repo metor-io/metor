@@ -76,7 +76,7 @@ impl Render for TabDragGhost {
             .bg(theme.bg_primary)
             .text_size(gpui::px(12.0))
             .text_color(theme.text_primary)
-            .child(self.title.clone())
+            .child(super::tab::title(self.title.clone()))
             .when(self.can_close, |header| {
                 header.child(super::tab::close_icon(&theme))
             })
@@ -94,6 +94,19 @@ pub struct ResizeDrag {
 }
 
 impl Render for ResizeDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// Payload identifying whose vertical tab rail is being resized. Every rail
+/// hears every rail drag, so the owning pane's id picks the one that answers.
+#[derive(Clone)]
+pub struct RailResizeDrag {
+    pub pane: gpui::EntityId,
+}
+
+impl Render for RailResizeDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         Empty
     }

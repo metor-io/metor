@@ -10,7 +10,7 @@ mod tab;
 
 use gpui::{
     AnyElement, App, Axis, Context, DragMoveEvent, Entity, EventEmitter, IntoElement, Pixels,
-    Point, Render, Window, div, prelude::*, px, relative,
+    Point, Render, Window, actions, div, prelude::*, px, relative,
 };
 
 use smallvec::SmallVec;
@@ -32,6 +32,15 @@ pub use serial::{ItemRegistry, TileLayout};
 /// `SmallVec` inlines the first four levels since the UI is rarely nested
 /// deeper and the path is cloned on every handle render.
 pub(crate) type SplitPath = SmallVec<[usize; 4]>;
+
+actions!(
+    metor_panel,
+    [
+        /// Put back the split layout a zoomed pane is covering. Bound to a
+        /// bare key, so the app only offers it while a pane is zoomed.
+        ExitZoom,
+    ]
+);
 
 /// Events the tile group forwards to its owning view.
 pub enum TileGroupEvent {
@@ -235,6 +244,7 @@ impl Member {
                     tab_orientation: pane.tab_orientation(),
                     hide_tab_bar: pane.hide_tab_bar(),
                     locked_size: pane.locked_size().map(|s| (s.width, s.height)),
+                    tab_rail_width: pane.custom_rail_width(),
                 })
             }
             Member::Axis(axis) => TileNode::Split(TileSplit {
@@ -499,6 +509,12 @@ pub struct TileGroup {
     /// keyboard-driven commands (the transient chord menu) act on. Falls back
     /// to the first pane via [`TileGroup::active_pane`] when unset or stale.
     focused_pane: Option<Entity<Pane>>,
+    /// The pane filling the whole group in place of the tree, toggled from a
+    /// tab double-click. The tree is left untouched underneath and the pane
+    /// keeps its entity, so its items keep their state across the toggle.
+    /// Transient: never serialized, and cleared by any edit that changes
+    /// which panes exist so the user is never left staring past a new one.
+    zoomed: Option<Entity<Pane>>,
     split_preview: split_preview::SplitPreview,
 }
 
@@ -513,6 +529,7 @@ impl TileGroup {
             panes,
             axis_bounds: Default::default(),
             focused_pane: Some(pane),
+            zoomed: None,
             split_preview: Default::default(),
         }
     }
@@ -529,12 +546,38 @@ impl TileGroup {
             panes,
             axis_bounds: Default::default(),
             focused_pane: Some(pane),
+            zoomed: None,
             split_preview: Default::default(),
         }
     }
 
     pub fn panes(&self) -> &[Entity<Pane>] {
         &self.panes
+    }
+
+    pub fn zoomed(&self) -> Option<&Entity<Pane>> {
+        self.zoomed.as_ref()
+    }
+
+    /// Zoom `pane` over the layout, or restore the layout when it is the one
+    /// already zoomed. A lone pane already fills the group, so there is
+    /// nothing to zoom.
+    pub fn toggle_zoom(&mut self, pane: &Entity<Pane>, cx: &mut Context<Self>) {
+        if self.zoomed.as_ref() == Some(pane) {
+            self.zoomed = None;
+        } else if self.panes.len() > 1 && self.panes.contains(pane) {
+            self.zoomed = Some(pane.clone());
+            self.focused_pane = Some(pane.clone());
+        } else {
+            return;
+        }
+        cx.notify();
+    }
+
+    pub fn exit_zoom(&mut self, cx: &mut Context<Self>) {
+        if self.zoomed.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// The "current" pane keyboard commands target: the last-clicked pane if it
@@ -572,6 +615,9 @@ impl TileGroup {
         match existing {
             Some((pane, ix)) => {
                 pane.update(cx, |pane, cx| pane.activate_item(ix, cx));
+                if self.zoomed.as_ref().is_some_and(|zoomed| zoomed != &pane) {
+                    self.zoomed = None;
+                }
                 self.focused_pane = Some(pane);
                 cx.notify();
             }
@@ -601,6 +647,7 @@ impl TileGroup {
             return;
         }
         cx.subscribe(&new_pane, Self::handle_pane_event).detach();
+        self.zoomed = None;
         // A freshly-split pane becomes the current one so a follow-up chord
         // (e.g. "new tile") lands in the pane the user just created.
         self.focused_pane = Some(new_pane.clone());
@@ -614,6 +661,9 @@ impl TileGroup {
         self.root.remove(target);
         self.root.collapse();
         self.panes.retain(|p| p.entity_id() != target.entity_id());
+        if self.zoomed.as_ref() == Some(target) || self.panes.len() < 2 {
+            self.zoomed = None;
+        }
         cx.notify();
     }
 
@@ -718,6 +768,7 @@ impl TileGroup {
             panes: Vec::new(),
             axis_bounds: Default::default(),
             focused_pane: panes.first().cloned(),
+            zoomed: None,
             split_preview: Default::default(),
         };
         for pane in &panes {
@@ -754,6 +805,9 @@ impl TileGroup {
                         }),
                         cx,
                     );
+                    if let Some(width) = sp.tab_rail_width {
+                        pane.set_rail_width(px(width), cx);
+                    }
                     pane
                 });
                 panes.push(pane.clone());
@@ -818,6 +872,7 @@ impl TileGroup {
                     position: *position,
                 });
             }
+            PaneEvent::ToggleZoom => self.toggle_zoom(&pane, cx),
         }
     }
 
@@ -899,7 +954,12 @@ impl Render for TileGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let tile_group = cx.entity().clone();
-        let (layout, gaps) = self.split_preview.layout(&self.root, window, cx);
+        // While zoomed the pane stands in for the whole tree, so a drag's
+        // split preview opens its gap inside the zoomed area; the drop then
+        // edits the real tree and un-zooms.
+        let zoomed = self.zoomed.clone().map(Member::Pane);
+        let committed = zoomed.as_ref().unwrap_or(&self.root);
+        let (layout, gaps) = self.split_preview.layout(committed, window, cx);
         let tracker = tile_group.clone();
         let mut root = div()
             .relative()
@@ -907,7 +967,13 @@ impl Render for TileGroup {
             .bg(theme.bg_secondary)
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<drag::DraggedTab>, _, cx| {
-                    if this.split_preview.drag_move(&this.panes, event, cx) {
+                    // Hidden panes keep stale bounds from before the zoom,
+                    // so only the zoomed one can take a drop.
+                    let panes = match &this.zoomed {
+                        Some(pane) => std::slice::from_ref(pane),
+                        None => &this.panes[..],
+                    };
+                    if this.split_preview.drag_move(panes, event, cx) {
                         cx.notify();
                     }
                 }),
@@ -922,7 +988,7 @@ impl Render for TileGroup {
                 .absolute()
                 .size_full(),
             )
-            .child(layout.as_ref().unwrap_or(&self.root).render(
+            .child(layout.as_ref().unwrap_or(committed).render(
                 SplitPath::new(),
                 &tile_group,
                 &gaps,
@@ -990,6 +1056,7 @@ mod tests {
                 tab_orientation: TabOrientation::Horizontal,
                 hide_tab_bar: false,
                 locked_size: None,
+                tab_rail_width: None,
                 items: vec![],
             }),
         };
@@ -1008,6 +1075,7 @@ mod tests {
                 tab_orientation: TabOrientation::Horizontal,
                 hide_tab_bar: false,
                 locked_size: None,
+                tab_rail_width: None,
                 items: vec![serial::TileItem {
                     kind: "downstream.plugin".into(),
                     state: state.into(),
@@ -1105,6 +1173,7 @@ mod tests {
                 tab_orientation: TabOrientation::Horizontal,
                 hide_tab_bar: false,
                 locked_size: None,
+                tab_rail_width: None,
                 items: vec![serial::TileItem {
                     kind: "registered_test".into(),
                     state: config.clone(),
