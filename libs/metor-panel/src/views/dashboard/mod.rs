@@ -5,12 +5,13 @@
 //! - [`connectors`] — schematic lines between widgets and free canvas points.
 //! - [`interaction`] — drag and resize payloads plus the per-widget layout.
 //! - [`chrome`] — grid overlay rendered above widgets in edit mode.
+//! - [`zoom`] — the canvas-to-screen mapping and zoomed widget content.
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, Bounds, Context, Entity, Hsla, IntoElement, Pixels, Point, Render,
-    SharedString, Window, div, point, prelude::*, px,
+    SharedString, Size, Window, div, point, prelude::*, px, size,
 };
 use metor_db::DB;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,7 @@ mod chrome;
 pub mod connectors;
 mod interaction;
 mod widgets;
+mod zoom;
 
 pub use connectors::{
     ArrowEnds, Connector, ConnectorAnchor, ConnectorBinding, ConnectorId, ConnectorStyle,
@@ -174,9 +176,9 @@ pub struct DashboardPanel {
     editing: bool,
     selected: Option<WidgetId>,
     container_bounds: Option<Bounds<Pixels>>,
-    /// Viewport pan in pixels; negative values scroll content below and
-    /// right of origin into view.
-    scroll_offset: Point<f32>,
+    /// Pan and zoom. Only the zoom is persisted; a reopened dashboard starts
+    /// at its top-left.
+    viewport: zoom::Viewport,
 }
 
 impl DashboardPanel {
@@ -196,7 +198,7 @@ impl DashboardPanel {
             editing: false,
             selected: None,
             container_bounds: None,
-            scroll_offset: point(0.0, 0.0),
+            viewport: zoom::Viewport::default(),
         }
     }
 
@@ -426,21 +428,41 @@ impl DashboardPanel {
         point(max_x, max_y)
     }
 
-    /// Keep `scroll_offset` inside the reachable range given the current viewport.
+    /// Size of the on-screen canvas, once it has been laid out.
+    fn view_size(&self) -> Option<Size<f32>> {
+        self.container_bounds
+            .map(|b| size(f32::from(b.size.width), f32::from(b.size.height)))
+    }
+
+    /// Keep the pan inside the reachable range given the current viewport.
     fn clamp_scroll(&mut self) {
         let extent = self.content_extent();
-        if let Some(bounds) = self.container_bounds {
-            let vw = f32::from(bounds.size.width);
-            let vh = f32::from(bounds.size.height);
-            // scroll_offset is negative (scroll down = more negative)
-            let min_x = -(extent.x - vw).max(0.0);
-            let min_y = -(extent.y - vh).max(0.0);
-            self.scroll_offset.x = self.scroll_offset.x.clamp(min_x, 0.0);
-            self.scroll_offset.y = self.scroll_offset.y.clamp(min_y, 0.0);
-        } else {
-            self.scroll_offset.x = self.scroll_offset.x.min(0.0);
-            self.scroll_offset.y = self.scroll_offset.y.min(0.0);
+        self.viewport.clamp(extent, self.view_size());
+    }
+
+    /// Zoom to `zoom` (clamped) around a window-space point, or around the
+    /// viewport's centre for the toolbar buttons, which have no cursor to
+    /// anchor to.
+    fn zoom_to(&mut self, zoom: f32, anchor: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let anchor = match anchor {
+            Some(at) => self.window_to_local(at),
+            None => self
+                .view_size()
+                .map(|v| point(v.width / 2.0, v.height / 2.0)),
         }
+        .unwrap_or(point(0.0, 0.0));
+        self.viewport.zoom_around(zoom, anchor);
+        self.clamp_scroll();
+        cx.notify();
+    }
+
+    /// Zoom out until every widget is on screen at once.
+    fn fit_all(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.view_size() else {
+            return;
+        };
+        self.viewport = zoom::Viewport::fit(self.content_extent(), view);
+        cx.notify();
     }
 
     /// Enter connector-drawing mode. Requires edit mode, since the canvas
@@ -508,12 +530,14 @@ impl DashboardPanel {
     /// The connector nearest a canvas point, within the grab radius.
     fn connector_at(&self, at: Point<f32>) -> Option<ConnectorId> {
         let pointer = point(px(at.x), px(at.y));
+        // Distances are in canvas units; the grab radius is a screen size.
+        let radius = crate::graph_canvas::LINE_HIT_RADIUS / self.viewport.zoom;
         self.connectors
             .iter()
             .filter_map(|c| {
                 let points = connectors::resolve_all(c, &self.widgets)?;
                 let d = crate::graph_canvas::distance_to_line(&points, c.style.shape, pointer);
-                (d <= crate::graph_canvas::LINE_HIT_RADIUS).then_some((d, c.id))
+                (d <= radius).then_some((d, c.id))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, id)| id)
@@ -585,7 +609,15 @@ impl DashboardPanel {
     fn render_connector_layer(&self, on_top: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let selection = theme.selection_bg;
-        let offset = self.scroll_offset;
+        let offset = self.viewport.scroll;
+        let zoom = self.viewport.zoom;
+        // Anchors resolve in canvas units; the canvas paints in screen ones.
+        let to_screen = |mut points: SmallVec<[Point<Pixels>; 6]>| {
+            for p in &mut points {
+                *p = point(p.x * zoom, p.y * zoom);
+            }
+            points
+        };
 
         struct Painted {
             points: SmallVec<[Point<Pixels>; 6]>,
@@ -600,9 +632,11 @@ impl DashboardPanel {
             .iter()
             .filter(|c| c.style.on_top == on_top)
             .filter_map(|c| {
+                let mut style = c.stroke();
+                style.width = (style.width * zoom).max(px(0.5));
                 Some(Painted {
-                    points: connectors::resolve_all(c, &self.widgets)?,
-                    style: c.stroke(),
+                    points: to_screen(connectors::resolve_all(c, &self.widgets)?),
+                    style,
                     color: connectors::line_color(c, self.connector_live.get(&c.id), &theme),
                     arrow: c.style.arrow,
                     selected: self.selected_connector == Some(c.id),
@@ -612,7 +646,10 @@ impl DashboardPanel {
 
         // The draft rides the top layer so it stays visible over widgets
         // while its endpoints are still being chosen.
-        let draft = on_top.then(|| self.draft_preview()).flatten();
+        let draft = on_top
+            .then(|| self.draft_preview())
+            .flatten()
+            .map(to_screen);
         let draft_color = theme.text_tertiary;
 
         gpui::canvas(
@@ -691,17 +728,19 @@ impl DashboardPanel {
     /// Connector labels, as positioned text rather than painted glyphs.
     fn render_connector_labels(&self, on_top: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = theme(cx);
+        let viewport = self.viewport;
         self.connectors
             .iter()
             .filter(|c| c.style.on_top == on_top && !c.style.label.is_empty())
             .filter_map(|c| {
                 let points = connectors::resolve_all(c, &self.widgets)?;
                 let at = connectors::label_anchor(&points);
+                let at = viewport.to_screen(point(f32::from(at.x), f32::from(at.y)));
                 Some(
                     div()
                         .absolute()
-                        .left(at.x + px(self.scroll_offset.x + 4.0))
-                        .top(at.y + px(self.scroll_offset.y - 14.0))
+                        .left(px(at.x + 4.0))
+                        .top(px(at.y - 14.0))
                         .px(px(3.0))
                         .rounded(px(3.0))
                         .bg(theme.pill_bg)
@@ -714,13 +753,20 @@ impl DashboardPanel {
             .collect()
     }
 
-    /// Translate a window-space point into canvas coordinates, applying the
-    /// current scroll offset.
-    fn pixel_to_canvas(&self, pixel: Point<Pixels>) -> Option<Point<f32>> {
+    /// A window-space point relative to the canvas container, before pan
+    /// and zoom.
+    fn window_to_local(&self, pixel: Point<Pixels>) -> Option<Point<f32>> {
         let bounds = self.container_bounds?;
-        let x = f32::from(pixel.x - bounds.origin.x) - self.scroll_offset.x;
-        let y = f32::from(pixel.y - bounds.origin.y) - self.scroll_offset.y;
-        Some(point(x, y))
+        Some(point(
+            f32::from(pixel.x - bounds.origin.x),
+            f32::from(pixel.y - bounds.origin.y),
+        ))
+    }
+
+    /// Translate a window-space point into canvas coordinates, undoing the
+    /// current pan and zoom.
+    fn pixel_to_canvas(&self, pixel: Point<Pixels>) -> Option<Point<f32>> {
+        Some(self.viewport.to_canvas(self.window_to_local(pixel)?))
     }
 }
 
@@ -1327,13 +1373,29 @@ fn connector_rows(
     rows
 }
 
-/// The floating strip the modal canvas tools live in, top-centre so it
+/// The floating strip the modal canvas tools live in, top-left so it
 /// clears the edit-mode badge in the corner.
 fn canvas_toolbar(theme: &crate::theme::Theme) -> gpui::Div {
+    toolbar_strip(theme).top(px(4.0)).left(px(8.0))
+}
+
+/// The zoom controls, bottom-right where they stay clear of both the modal
+/// tool strip and the edit-mode badge.
+fn zoom_toolbar(theme: &crate::theme::Theme) -> gpui::Div {
+    // Inset past the scrollbars so neither covers the other. Presses stop
+    // here so a zoom click never lands a connector anchor or grabs the
+    // widget underneath.
+    toolbar_strip(theme)
+        .bottom(px(12.0))
+        .right(px(12.0))
+        .occlude()
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+}
+
+/// A floating pill strip over the canvas; callers place it.
+fn toolbar_strip(theme: &crate::theme::Theme) -> gpui::Div {
     div()
         .absolute()
-        .top(px(4.0))
-        .left(px(8.0))
         .flex()
         .flex_row()
         .items_center()
@@ -1358,13 +1420,47 @@ impl Render for DashboardPanel {
         let theme = theme(cx);
 
         let entity = cx.entity().clone();
+        let zoom_entity = entity.clone();
         let bounds_tracker = gpui::canvas(
-            move |bounds, _window, cx| {
+            move |bounds, window, cx| {
                 entity.update(cx, |this, _| {
                     this.container_bounds = Some(bounds);
                 });
+                window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
             },
-            |_, _, _, _| {},
+            move |_, hitbox, window, _| {
+                // Zoom gestures are taken in the capture phase: plots and maps
+                // stop wheel propagation for their own zoom, and a modified
+                // wheel over one should still zoom the dashboard.
+                let entity = zoom_entity.clone();
+                let wheel_hitbox = hitbox.clone();
+                window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                    let modified = event.modifiers.platform || event.modifiers.control;
+                    if phase != gpui::DispatchPhase::Capture
+                        || !modified
+                        || !wheel_hitbox.should_handle_scroll(window)
+                    {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let dy = f32::from(event.delta.pixel_delta(px(20.0)).y);
+                    entity.update(cx, |this, cx| {
+                        let zoom = this.viewport.zoom * zoom::wheel_zoom_factor(dy);
+                        this.zoom_to(zoom, Some(event.position), cx);
+                    });
+                });
+                let entity = zoom_entity.clone();
+                window.on_mouse_event(move |event: &gpui::PinchEvent, phase, window, cx| {
+                    if phase != gpui::DispatchPhase::Capture || !hitbox.is_hovered(window) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    entity.update(cx, |this, cx| {
+                        let zoom = this.viewport.zoom * (1.0 + event.delta);
+                        this.zoom_to(zoom, Some(event.position), cx);
+                    });
+                });
+            },
         )
         .size_full()
         .absolute();
@@ -1425,8 +1521,8 @@ impl Render for DashboardPanel {
         canvas_div = canvas_div.on_scroll_wheel(cx.listener(
             |this, event: &gpui::ScrollWheelEvent, _window, cx| {
                 let delta = event.delta.pixel_delta(px(20.0));
-                this.scroll_offset.x += f32::from(delta.x);
-                this.scroll_offset.y += f32::from(delta.y);
+                this.viewport.scroll.x += f32::from(delta.x);
+                this.viewport.scroll.y += f32::from(delta.y);
                 this.clamp_scroll();
                 cx.notify();
             },
@@ -1521,6 +1617,37 @@ impl Render for DashboardPanel {
             );
         }
 
+        if !self.widgets.is_empty() {
+            let percent = SharedString::from(format!("{:.0}%", self.viewport.zoom * 100.0));
+            canvas_div = canvas_div.child(
+                zoom_toolbar(&theme)
+                    .child(
+                        crate::views::sequence_panel::pill_button(&theme, ("zoom-out", 0), "−")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.zoom_to(this.viewport.zoom / zoom::ZOOM_STEP, None, cx);
+                            })),
+                    )
+                    .child(
+                        crate::views::sequence_panel::pill_button(
+                            &theme,
+                            ("zoom-reset", 0),
+                            percent,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.zoom_to(1.0, None, cx))),
+                    )
+                    .child(
+                        crate::views::sequence_panel::pill_button(&theme, ("zoom-in", 0), "+")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.zoom_to(this.viewport.zoom * zoom::ZOOM_STEP, None, cx);
+                            })),
+                    )
+                    .child(
+                        crate::views::sequence_panel::pill_button(&theme, ("zoom-fit", 0), "Fit")
+                            .on_click(cx.listener(|this, _, _, cx| this.fit_all(cx))),
+                    ),
+            );
+        }
+
         if self.widgets.is_empty() {
             canvas_div = canvas_div.child(
                 div()
@@ -1534,23 +1661,23 @@ impl Render for DashboardPanel {
             );
         }
 
-        if let Some(bounds) = self.container_bounds {
+        if let Some(view) = self.view_size() {
             let extent = self.content_extent();
-            let vw = f32::from(bounds.size.width);
-            let vh = f32::from(bounds.size.height);
+            let zoom = self.viewport.zoom;
+            let scroll = self.viewport.scroll;
 
             canvas_div = canvas_div
                 .child(Scrollbar::new(
                     gpui::Axis::Vertical,
-                    vh,
-                    extent.y,
-                    -self.scroll_offset.y,
+                    view.height,
+                    extent.y * zoom,
+                    -scroll.y,
                 ))
                 .child(Scrollbar::new(
                     gpui::Axis::Horizontal,
-                    vw,
-                    extent.x,
-                    -self.scroll_offset.x,
+                    view.width,
+                    extent.x * zoom,
+                    -scroll.x,
                 ));
         }
 
@@ -1559,12 +1686,28 @@ impl Render for DashboardPanel {
 }
 
 /// Persisted shape of [`DashboardPanel`].
-#[derive(Serialize, Deserialize, Default)]
+///
+/// Every field defaults, so a document written before a field existed
+/// loads as if it had been saved with that default.
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct DashboardPanelConfig {
     pub title: String,
     pub widgets: Vec<DashboardWidget>,
     pub connectors: Vec<Connector>,
+    /// Screen pixels per dashboard unit. Widget rects never change with it.
+    pub zoom: f32,
+}
+
+impl Default for DashboardPanelConfig {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            widgets: Vec::new(),
+            connectors: Vec::new(),
+            zoom: 1.0,
+        }
+    }
 }
 
 impl PaneItem for DashboardPanel {
@@ -1600,6 +1743,7 @@ impl PaneItem for DashboardPanel {
             title: self.title.to_string(),
             widgets,
             connectors: self.connectors.clone(),
+            zoom: self.viewport.zoom,
         }
     }
 }
@@ -1639,12 +1783,24 @@ mod tests {
                     ..Default::default()
                 },
             }],
+            zoom: 0.5,
         };
         let blob = serde_json::to_string(&cfg).unwrap();
         let back: DashboardPanelConfig = serde_json::from_str(&blob).unwrap();
         assert_eq!(back.connectors.len(), 1);
         assert_eq!(back.connectors[0].style.label, "feed");
         assert!(back.connectors[0].style.on_top);
+        assert_eq!(back.zoom, 0.5);
+    }
+
+    /// Dashboards saved before zoom existed open at 1:1, not at the zero a
+    /// derived default would give.
+    #[test]
+    fn a_dashboard_saved_before_zoom_opens_unzoomed() {
+        let cfg: DashboardPanelConfig =
+            serde_json::from_str(r#"{"title":"Old","widgets":[],"connectors":[]}"#).unwrap();
+        assert_eq!(cfg.zoom, 1.0);
+        assert_eq!(DashboardPanelConfig::default().zoom, 1.0);
     }
 
     /// Cross-language pin: the dashboard the Python preset builder emits
@@ -1825,6 +1981,6 @@ pub fn deserialize_dashboard(db: Arc<DB>, blob: &str, cx: &mut App) -> Entity<Da
         editing: false,
         selected: None,
         container_bounds: None,
-        scroll_offset: point(0.0, 0.0),
+        viewport: zoom::Viewport::at_zoom(cfg.zoom),
     })
 }

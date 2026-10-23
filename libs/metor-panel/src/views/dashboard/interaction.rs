@@ -170,14 +170,16 @@ impl DashboardPanel {
         let theme = theme(cx);
         let view = self.widget_live.get(&widget.id).map(|live| &live.view);
         let r = &widget.rect;
+        let zoom = self.viewport.zoom;
+        let origin = self.viewport.to_screen(point(r.x, r.y));
 
         let mut container = div()
             .id(("dashboard-widget", widget.id.0 as usize))
             .absolute()
-            .top(px(r.y + self.scroll_offset.y))
-            .left(px(r.x + self.scroll_offset.x))
-            .w(px(r.w))
-            .h(px(r.h))
+            .top(px(origin.y))
+            .left(px(origin.x))
+            .w(px(r.w * zoom))
+            .h(px(r.h * zoom))
             .overflow_hidden();
 
         if widget.frame {
@@ -196,7 +198,11 @@ impl DashboardPanel {
         }
 
         if let Some(view) = view {
-            container = container.child(view.clone());
+            container = if zoom == 1.0 {
+                container.child(view.clone())
+            } else {
+                container.child(super::zoom::Zoomed::new(zoom, view.clone()))
+            };
         }
 
         if self.editing {
