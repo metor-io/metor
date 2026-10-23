@@ -8,10 +8,11 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point, SharedString, Styled, Task,
-    TextAlign, TextRun, Window, div, prelude::*, px,
+    Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point, Rems, SharedString, Styled,
+    Task, TextAlign, TextRun, Window, div, prelude::*, px,
 };
 
+use crate::theme::{ui_px, ui_scale};
 use crate::views::time_series::LABEL_FONT_SIZE;
 
 /// Build the common interactive plot legend.
@@ -21,7 +22,7 @@ use crate::views::time_series::LABEL_FONT_SIZE;
 pub fn plot_legend<T: 'static, N: 'static>(
     traces: &[Entity<T>],
     notify: Entity<N>,
-    left: Pixels,
+    left: Rems,
     describe: fn(&T) -> (SharedString, Hsla, bool),
     toggle_visible: fn(&mut T),
     cx: &gpui::App,
@@ -76,10 +77,16 @@ pub fn plot_legend<T: 'static, N: 'static>(
                         cx,
                     );
                 })
-                .child(div().w(px(10.0)).h(px(10.0)).rounded(px(2.0)).bg(color))
                 .child(
                     div()
-                        .text_size(px(LABEL_FONT_SIZE))
+                        .w(ui_px(10.0))
+                        .h(ui_px(10.0))
+                        .rounded(px(2.0))
+                        .bg(color),
+                )
+                .child(
+                    div()
+                        .text_size(ui_px(LABEL_FONT_SIZE))
                         .text_color(text_color)
                         .child(label),
                 ),
@@ -117,7 +124,7 @@ pub fn paint_text_label(
     cx: &mut gpui::App,
 ) {
     let text = text.into();
-    let font_size = px(LABEL_FONT_SIZE);
+    let font_size = px(LABEL_FONT_SIZE * ui_scale(window));
     let run = TextRun {
         len: text.len(),
         font: window.text_style().font(),

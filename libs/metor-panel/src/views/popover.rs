@@ -2,7 +2,7 @@
 
 use gpui::{App, Div, div, prelude::*, px};
 
-use crate::theme::{font_family, theme};
+use crate::theme::{font_family, theme, ui_px};
 use crate::views::time_series::LABEL_FONT_SIZE;
 
 /// Inner padding also used when estimating readout placement before layout.
@@ -17,13 +17,13 @@ pub(crate) fn readout_card(cx: &App) -> Div {
         .flex()
         .flex_col()
         .gap_y_0()
-        .px(px(READOUT_PAD_X))
-        .py(px(READOUT_PAD_Y))
+        .px(ui_px(READOUT_PAD_X))
+        .py(ui_px(READOUT_PAD_Y))
         .bg(theme.bg_elevated)
         .border_1()
         .border_color(theme.border_primary)
         .rounded(px(3.0))
         .font_family(font_family(cx))
-        .text_size(px(LABEL_FONT_SIZE))
+        .text_size(ui_px(LABEL_FONT_SIZE))
         .text_color(theme.text_secondary)
 }

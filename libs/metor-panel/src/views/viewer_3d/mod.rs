@@ -46,7 +46,7 @@ use smallvec::SmallVec;
 
 #[allow(unused_imports)]
 use crate::inspect;
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 use crate::views::binding::{StreamUpdate, spawn_seeded_stream};
 
 pub use bridge::BevyBridge;
@@ -971,7 +971,7 @@ impl Render for Viewer3d {
                     },
                 )
                 .size_full()
-                .min_h(px(64.0)),
+                .min_h(ui_px(64.0)),
             )
     }
 }

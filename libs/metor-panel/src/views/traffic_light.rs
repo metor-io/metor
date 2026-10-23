@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, Hsla, IntoElement, MouseButton, Pixels, SharedString,
+    App, Context, FocusHandle, Focusable, Hsla, IntoElement, MouseButton, Rems, SharedString,
     Window, div, prelude::*, px,
 };
 use metor_db::DB;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::binding::{component_meta, spawn_meta_resolver, spawn_on_stream};
 use crate::ComponentStreamBuilder;
-use crate::theme::{Theme, theme};
+use crate::theme::{Theme, theme, ui_px};
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
@@ -162,8 +162,8 @@ impl Render for TrafficLight {
             .flex()
             .items_center()
             .justify_center()
-            .p(px(8.0))
-            .child(traffic_light_swatch(value, color, px(14.0), &theme));
+            .p(ui_px(8.0))
+            .child(traffic_light_swatch(value, color, ui_px(14.0), &theme));
 
         if is_bool {
             tile = tile.cursor_pointer().on_mouse_down(
@@ -189,7 +189,7 @@ const OFF_ALPHA: f32 = 0.15;
 pub(crate) fn traffic_light_swatch(
     value: Option<bool>,
     color: Hsla,
-    size: Pixels,
+    size: Rems,
     theme: &Theme,
 ) -> impl IntoElement {
     let bg = match value {

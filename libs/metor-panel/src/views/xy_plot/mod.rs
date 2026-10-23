@@ -19,8 +19,9 @@ use gpui::{
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-#[allow(unused_imports)]
 use crate::inspect;
+#[allow(unused_imports)]
+use crate::theme::{ui_px, ui_scale};
 
 use super::time_series::{
     AxisZone, Override, PADDING, PlotBounds, PlotStyle, X_LABEL_HEIGHT, Y_LABEL_WIDTH, axis_zone,
@@ -165,7 +166,7 @@ impl Render for XyPlot {
                             } else {
                                 let zone = this
                                     .last_plot_area
-                                    .map(|pa| axis_zone(event.position, pa, 1))
+                                    .map(|pa| axis_zone(event.position, pa, 1, 1.0))
                                     .unwrap_or(AxisZone::Plot);
                                 this.drag_start = Some(event.position);
                                 this.drag_start_view = this.line_plot.read(cx).effective_view(cx);
@@ -216,7 +217,9 @@ impl Render for XyPlot {
                             let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
                             let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
 
-                            let zone = axis_zone(event.position, pa, 1);
+                            // One axis column: its width never decides an index, so the
+                            // zoom it was laid out at doesn't matter here.
+                            let zone = axis_zone(event.position, pa, 1, 1.0);
                             let (ax, ay) = view.screen_anchor(pa, event.position);
                             let new_view = match zone {
                                 AxisZone::Plot => view.zoom_at(factor, ax, 1.0 - ay),
@@ -232,9 +235,10 @@ impl Render for XyPlot {
                         canvas(
                             {
                                 let this = cx.entity().downgrade();
-                                move |bounds, _window, cx| {
+                                move |bounds, window, cx| {
+                                    let scale = ui_scale(window);
                                     let _ = this.update(cx, |this, _| {
-                                        this.last_plot_area = Some(plot_area(bounds, 1));
+                                        this.last_plot_area = Some(plot_area(bounds, 1, scale));
                                     });
                                     let lp = underlay_lp.read(cx);
                                     (bounds, lp.effective_view(cx))
@@ -252,10 +256,10 @@ impl Render for XyPlot {
                     .child(
                         div()
                             .absolute()
-                            .left(px(Y_LABEL_WIDTH + PADDING))
-                            .top(px(PADDING))
-                            .right(px(PADDING))
-                            .bottom(px(X_LABEL_HEIGHT + PADDING))
+                            .left(ui_px(Y_LABEL_WIDTH + PADDING))
+                            .top(ui_px(PADDING))
+                            .right(ui_px(PADDING))
+                            .bottom(ui_px(X_LABEL_HEIGHT + PADDING))
                             .child(self.line_plot.clone()),
                     )
                     .child(
@@ -279,7 +283,7 @@ impl Render for XyPlot {
             root = root.child(crate::views::plot_common::plot_legend(
                 &trace_entities,
                 self.line_plot.clone(),
-                px(Y_LABEL_WIDTH + PADDING),
+                ui_px(Y_LABEL_WIDTH + PADDING),
                 |trace| (trace.label.clone(), trace.color, trace.visible),
                 |trace| trace.visible = !trace.visible,
                 cx,
@@ -300,7 +304,7 @@ pub(crate) fn paint_xy_underlay(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let pb = plot_area(outer_bounds, 1);
+    let pb = plot_area(outer_bounds, 1, ui_scale(window));
     let theme = crate::theme::theme(cx);
 
     for tick in value_ticks(view.min_y, view.max_y, 5) {
@@ -355,7 +359,8 @@ pub(crate) fn paint_xy_overlay(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let pb = plot_area(outer_bounds, 1);
+    let s = ui_scale(window);
+    let pb = plot_area(outer_bounds, 1, s);
     let theme = crate::theme::theme(cx);
 
     let axis_bg = theme.plot_chrome_bg();
@@ -385,7 +390,7 @@ pub(crate) fn paint_xy_overlay(
         crate::views::plot_common::paint_value_label(
             tick,
             theme.text_secondary,
-            |width, font_size| point(pb.origin.x - width - px(4.0), y - font_size / 2.0),
+            |width, font_size| point(pb.origin.x - width - px(4.0 * s), y - font_size / 2.0),
             window,
             cx,
         );
@@ -398,7 +403,7 @@ pub(crate) fn paint_xy_overlay(
         crate::views::plot_common::paint_value_label(
             tick,
             theme.text_secondary,
-            |width, _| point(x - width / 2.0, pb.origin.y + pb.size.height + px(4.0)),
+            |width, _| point(x - width / 2.0, pb.origin.y + pb.size.height + px(4.0 * s)),
             window,
             cx,
         );

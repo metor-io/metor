@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::binding::{StreamUpdate, spawn_seeded_stream};
 use super::format::ValueFormatter;
 use crate::ComponentStreamBuilder;
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -85,7 +85,7 @@ impl Render for ComponentText {
         let theme = theme(cx);
         div()
             .text_color(theme.text_primary)
-            .text_size(gpui::px(24.0))
+            .text_size(ui_px(24.0))
             .size_full()
             .child(
                 self.value

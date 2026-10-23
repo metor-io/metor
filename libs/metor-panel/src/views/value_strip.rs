@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use gpui::{
     App, Context, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, Pixels, Point, SharedString, Stateful, Window, div, prelude::*, px,
+    MouseButton, Pixels, Point, Rems, SharedString, Stateful, Window, div, prelude::*, px,
 };
 use metor_db::DB;
 use metor_proto::types::{ComponentId, ElementValue, PrimType};
@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 use crate::ComponentStreamBuilder;
 use crate::icons::Icon;
 use crate::inspector::rows::TextField;
-use crate::theme::{Theme, theme};
+use crate::theme::{Theme, theme, ui_px};
 
 use super::binding::{StreamUpdate, spawn_seeded_stream};
 pub use super::format::StripCell;
@@ -597,7 +597,7 @@ impl Render for ComponentValueStrip {
         let stale = self.stale;
         let editing_error = self.editing.as_ref().map(|e| e.error).unwrap_or(false);
 
-        let mut row = div().flex().flex_row().items_center().gap(px(4.0));
+        let mut row = div().flex().flex_row().items_center().gap(ui_px(4.0));
         if !style.intrinsic_width {
             row = row.flex_wrap();
         }
@@ -746,14 +746,14 @@ impl Render for ComponentValueStrip {
                 let mut group = div().flex().flex_row().items_center().child(atom).child(
                     div()
                         .id(("strip-apply", chevron_id))
-                        .px(px(6.0))
-                        .h(px(25.5))
+                        .px(ui_px(6.0))
+                        .h(ui_px(25.5))
                         .flex()
                         .items_center()
                         .justify_center()
                         .bg(bg)
                         .rounded_r(px(3.0))
-                        .text_size(px(12.0))
+                        .text_size(ui_px(12.0))
                         .text_color(theme.control_active)
                         .cursor_pointer()
                         .child(Icon::ChevronRight.svg_color(11.0, theme.control_active))
@@ -791,9 +791,9 @@ impl Render for ComponentValueStrip {
 
 fn render_placeholder(style: &StripStyle, theme: &Theme) -> impl IntoElement {
     let text_size = match (style.preset, style.solo_emphasize) {
-        (StripPreset::Dashboard, true) => px(14.0),
-        (StripPreset::Dashboard, false) => px(13.0),
-        (StripPreset::Boxes, _) => px(12.0),
+        (StripPreset::Dashboard, true) => ui_px(14.0),
+        (StripPreset::Dashboard, false) => ui_px(13.0),
+        (StripPreset::Boxes, _) => ui_px(12.0),
     };
     div()
         .text_size(text_size)
@@ -818,9 +818,9 @@ fn build_editing_chrome(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(4.0))
-        .px(px(6.0))
-        .py(px(3.0))
+        .gap(ui_px(4.0))
+        .px(ui_px(6.0))
+        .py(ui_px(3.0))
         .rounded(px(3.0))
         .overflow_hidden();
     atom = if style.intrinsic_width {
@@ -842,8 +842,8 @@ fn build_editing_chrome(
 
     if let Some(label) = cell.label.as_ref() {
         let label_size = match style.preset {
-            StripPreset::Dashboard => px(9.0),
-            StripPreset::Boxes => px(10.0),
+            StripPreset::Dashboard => ui_px(9.0),
+            StripPreset::Boxes => ui_px(10.0),
         };
         atom = atom.child(
             div()
@@ -902,15 +902,15 @@ fn build_cell_chrome(
             theme.bg_secondary
         };
         let knob = div()
-            .w(px(15.0))
-            .h(px(15.0))
+            .w(ui_px(15.0))
+            .h(ui_px(15.0))
             .rounded(px(3.0))
             .bg(theme.text_primary);
         atom = atom
-            .w(px(40.0))
-            .h(px(25.5))
-            .py(px(4.0))
-            .px(px(4.0))
+            .w(ui_px(40.0))
+            .h(ui_px(25.5))
+            .py(ui_px(4.0))
+            .px(ui_px(4.0))
             .items_center()
             .bg(track_color)
             .when(bool_value, |el| el.flex_row_reverse())
@@ -920,9 +920,9 @@ fn build_cell_chrome(
 
     atom = atom
         .items_center()
-        .gap(px(2.0))
-        .px(px(4.0))
-        .py(px(3.0))
+        .gap(ui_px(2.0))
+        .px(ui_px(4.0))
+        .py(ui_px(3.0))
         .overflow_hidden();
 
     // Fixed-width keeps a "0" cell and a "0.0083" cell aligned across rows
@@ -974,8 +974,8 @@ fn build_cell_chrome(
 
     if let Some(label) = cell.label.as_ref() {
         let label_size = match style.preset {
-            StripPreset::Dashboard => px(9.0),
-            StripPreset::Boxes => px(10.0),
+            StripPreset::Dashboard => ui_px(9.0),
+            StripPreset::Boxes => ui_px(10.0),
         };
         atom = atom.child(
             div()
@@ -997,14 +997,14 @@ fn build_cell_chrome(
     let value_size = if matches!(style.preset, StripPreset::Boxes) && cell.label.is_some() {
         let len = cell.value.chars().count();
         if len >= 9 {
-            px(9.0)
+            ui_px(9.0)
         } else if len >= 7 {
-            px(10.5)
+            ui_px(10.5)
         } else {
-            px(base_value_size)
+            ui_px(base_value_size)
         }
     } else {
-        px(base_value_size)
+        ui_px(base_value_size)
     };
     atom = atom.child(
         div()
@@ -1025,12 +1025,12 @@ fn build_cell_chrome(
         let unit_size = match style.preset {
             StripPreset::Dashboard => {
                 if is_solo {
-                    px(10.0)
+                    ui_px(10.0)
                 } else {
-                    px(9.0)
+                    ui_px(9.0)
                 }
             }
-            StripPreset::Boxes => px(10.0),
+            StripPreset::Boxes => ui_px(10.0),
         };
         atom = atom.child(
             div()
@@ -1047,11 +1047,11 @@ fn build_cell_chrome(
 pub const STRIP_BOX_CELL_WIDTH: f32 = 78.0;
 pub const STRIP_CELL_GAP: f32 = 4.0;
 
-pub fn cell_width(preset: StripPreset, is_solo: bool) -> Pixels {
+pub fn cell_width(preset: StripPreset, is_solo: bool) -> Rems {
     match (preset, is_solo) {
-        (StripPreset::Boxes, _) => px(STRIP_BOX_CELL_WIDTH),
-        (StripPreset::Dashboard, false) => px(96.0),
-        (StripPreset::Dashboard, true) => px(0.0),
+        (StripPreset::Boxes, _) => ui_px(STRIP_BOX_CELL_WIDTH),
+        (StripPreset::Dashboard, false) => ui_px(96.0),
+        (StripPreset::Dashboard, true) => ui_px(0.0),
     }
 }
 
@@ -1076,7 +1076,7 @@ pub(crate) fn render_static_cells(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(STRIP_CELL_GAP));
+        .gap(ui_px(STRIP_CELL_GAP));
     if !style.intrinsic_width {
         row = row.flex_wrap();
     }

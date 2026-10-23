@@ -25,7 +25,7 @@ use super::binding::component_name;
 use super::format::{ValueFormatter, format_time};
 use super::table::{CELL_PAD_X, Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use super::value_strip::{StripStyle, render_static_cells, resolve_metadata, strip_row_width};
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
@@ -249,7 +249,7 @@ impl Render for SamplesTable {
             .flex_col()
             .bg(theme.bg_primary)
             .text_color(theme.text_primary)
-            .text_size(px(12.0));
+            .text_size(ui_px(12.0));
 
         if self.source.id() == ComponentId(0) {
             return root.child(
@@ -265,7 +265,7 @@ impl Render for SamplesTable {
 
         root = root.child(
             div()
-                .text_size(px(10.0))
+                .text_size(ui_px(10.0))
                 .text_color(theme.text_tertiary)
                 .child(if self.table.read(cx).at_top() {
                     "Following view time"
@@ -276,7 +276,7 @@ impl Render for SamplesTable {
         root = root.child(
             div()
                 .id("samples-older")
-                .h(px(20.0))
+                .h(ui_px(20.0))
                 .cursor_pointer()
                 .child("Load older samples")
                 .on_mouse_down(
@@ -298,9 +298,9 @@ impl Render for SamplesTable {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .h(px(20.0))
+                    .h(ui_px(20.0))
                     .bg(theme.selection_bg)
-                    .text_size(px(11.0))
+                    .text_size(ui_px(11.0))
                     .text_color(theme.text_secondary)
                     .cursor_pointer()
                     .child(SharedString::from(format!("{} newer ↑", self.newer)))
@@ -451,7 +451,7 @@ impl TableDelegate for SamplesDelegate {
                 .flex()
                 .items_center()
                 .h_full()
-                .px(px(CELL_PAD_X))
+                .px(ui_px(CELL_PAD_X))
                 .whitespace_nowrap()
                 .text_color(theme.text_tertiary)
                 .child(SharedString::from(format_time(stamp.0)))
@@ -466,7 +466,7 @@ impl TableDelegate for SamplesDelegate {
                 // scrolls the table.
                 let mut line = render_static_cells(row_ix, &cells, &self.style, &theme);
                 if cells.len() > 1 {
-                    line = line.min_w(px(strip_row_width(cells.len())));
+                    line = line.min_w(ui_px(strip_row_width(cells.len())));
                 }
                 line.style().flex_shrink = Some(0.0);
                 let mut scroll = div()
@@ -474,7 +474,7 @@ impl TableDelegate for SamplesDelegate {
                     .flex()
                     .items_center()
                     .h_full()
-                    .px(px(4.0))
+                    .px(ui_px(4.0))
                     .overflow_x_scroll()
                     .child(line);
                 scroll.style().restrict_scroll_to_axis = Some(true);

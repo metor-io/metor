@@ -79,6 +79,10 @@ pub struct Timeline {
     context_key: String,
     history: Vec<Navigation>,
     area: Option<Bounds<Pixels>>,
+    /// [`ui_scale`](crate::theme::ui_scale) `area` was laid out at. Paint
+    /// and hit-testing work in unzoomed design units and multiply by this,
+    /// so a zoomed dashboard widget shrinks the whole drawing with its box.
+    scale: f32,
     hover: Option<Point<Pixels>>,
     drag: Option<Drag>,
     draft: Option<TimeRangeSpec>,
@@ -112,6 +116,7 @@ impl Timeline {
             context_key: String::new(),
             history: Vec::new(),
             area: None,
+            scale: 1.0,
             hover: None,
             drag: None,
             draft: None,
@@ -378,6 +383,7 @@ impl Render for Timeline {
             move |bounds, window, cx| {
                 entity.update(cx, |this, cx| {
                     this.area = Some(bounds);
+                    this.scale = crate::theme::ui_scale(window);
                     this.show_readout(window, cx);
                 });
             },

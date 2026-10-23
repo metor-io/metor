@@ -1,5 +1,6 @@
 use super::*;
 use crate::plot_events::flags::{ClusterPaint, paint_event_flags};
+use crate::theme::ui_scale;
 use crate::views::plot_common::paint_text_label;
 use crate::views::table::{CELL_FONT_SIZE, CELL_PAD_X, HEADER_HEIGHT, ROW_HEIGHT};
 use gpui::{BorderStyle, TextAlign, fill, point, quad, size};
@@ -36,19 +37,24 @@ impl Timeline {
             (available / ROW_HEIGHT) as usize,
         )
     }
+    /// `area`'s height in the design units the lane layout is written in.
+    pub(super) fn design_height(&self, area: Bounds<Pixels>) -> f32 {
+        f32::from(area.size.height) / self.scale
+    }
     pub(super) fn time_area(&self) -> Option<Bounds<Pixels>> {
         self.area.map(|mut area| {
-            let gutter = Self::gutter(area);
-            area.origin.x += px(gutter);
-            area.size.width -= px(gutter);
+            let gutter = px(Self::gutter(area, self.scale) * self.scale);
+            area.origin.x += gutter;
+            area.size.width -= gutter;
             area
         })
     }
-    fn gutter(area: Bounds<Pixels>) -> f32 {
-        if f32::from(area.size.height) < 88.0 {
+    /// Width of the lane-name column, in design units.
+    fn gutter(area: Bounds<Pixels>, scale: f32) -> f32 {
+        if f32::from(area.size.height) / scale < 88.0 {
             0.0
         } else {
-            (f32::from(area.size.width) * 0.25).min(140.0)
+            (f32::from(area.size.width) / scale * 0.25).min(140.0)
         }
     }
     fn hit_at(&self, position: Point<Pixels>) -> Option<&EventHit> {
@@ -83,19 +89,25 @@ impl Timeline {
     pub(super) fn paint(&mut self, area: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
         self.event_hits.clear();
         let theme = crate::theme::theme(cx);
-        let w = f32::from(area.size.width).max(1.0);
-        let h = f32::from(area.size.height);
-        let gutter = Self::gutter(area);
+        // Everything below is laid out in design units and scaled once on
+        // its way to the screen; `hair` keeps rules a pixel thick at any zoom.
+        let s = ui_scale(window);
+        self.scale = s;
+        let at = |x: f32, y: f32| area.origin + point(px(x * s), px(y * s));
+        let hair = 1.0 / s;
+        let w = (f32::from(area.size.width) / s).max(1.0);
+        let h = f32::from(area.size.height) / s;
+        let gutter = Self::gutter(area, s);
         let time_w = (w - gutter).max(1.0);
         let rect = |x: f32, y: f32, width: f32, height: f32| Bounds {
-            origin: area.origin + point(px(x), px(y)),
-            size: size(px(width.max(0.0)), px(height.max(0.0))),
+            origin: at(x, y),
+            size: size(px(width.max(0.0) * s), px(height.max(0.0) * s)),
         };
         let Some(view) = self.viewport else {
             paint_text_label(
                 "Load data or enter a time",
                 theme.text_secondary,
-                |_, _| area.origin + point(px(CELL_PAD_X), px(8.0)),
+                |_, _| at(CELL_PAD_X, 8.0),
                 window,
                 cx,
             );
@@ -127,7 +139,7 @@ impl Timeline {
         }
         if !thin {
             window.paint_quad(fill(
-                rect(0.0, lane_top - 1.0, w, 1.0),
+                rect(0.0, lane_top - hair, w, hair),
                 theme.border_primary,
             ));
         }
@@ -136,7 +148,7 @@ impl Timeline {
             let right = x(range.end).clamp(gutter, w);
             window.paint_quad(quad(
                 rect(left, 1.0, right - left, brace_h - 2.0),
-                px(2.0),
+                px(2.0 * s),
                 theme.selection_bg,
                 px(1.0),
                 theme.control_active,
@@ -158,7 +170,7 @@ impl Timeline {
                         rect(
                             tx,
                             brace_h,
-                            1.0,
+                            hair,
                             if thin { 3.0 } else { lane_top - brace_h },
                         ),
                         theme.border_primary,
@@ -176,11 +188,10 @@ impl Timeline {
                         label,
                         theme.text_secondary,
                         |width, _| {
-                            area.origin
-                                + point(
-                                    px((tx + 3.0).min((w - f32::from(width)).max(gutter))),
-                                    px(ruler_y),
-                                )
+                            at(
+                                (tx + 3.0).min((w - f32::from(width) / s).max(gutter)),
+                                ruler_y,
+                            )
                         },
                         window,
                         cx,
@@ -212,7 +223,7 @@ impl Timeline {
                     window.paint_quad(fill(row_bounds, theme.bg_secondary));
                 }
                 window.paint_quad(fill(
-                    rect(0.0, y + row_h - 1.0, w, 1.0),
+                    rect(0.0, y + row_h - hair, w, hair),
                     theme.border_primary,
                 ));
                 let budget =
@@ -225,9 +236,7 @@ impl Timeline {
                 paint_table_label(
                     name,
                     theme.text_secondary,
-                    |_, _| {
-                        area.origin + point(px(CELL_PAD_X), px(y + (row_h - CELL_FONT_SIZE) / 2.0))
-                    },
+                    |_, _| at(CELL_PAD_X, y + (row_h - CELL_FONT_SIZE) / 2.0),
                     window,
                     cx,
                 );
@@ -243,7 +252,7 @@ impl Timeline {
                 );
                 window.paint_quad(quad(
                     bounds,
-                    px(3.0),
+                    px(3.0 * s),
                     crate::plot_events::flags::mix(theme.bg_primary, event.event.color, 0.18),
                     px(1.0),
                     event.event.color,
@@ -277,7 +286,7 @@ impl Timeline {
                     event.event.short.to_string()
                 };
                 flags.push(ClusterPaint {
-                    x: area.origin.x + px(x(event.event.ts.0)),
+                    x: area.origin.x + px(x(event.event.ts.0) * s),
                     color: event.event.color,
                     label,
                 });
@@ -300,22 +309,25 @@ impl Timeline {
             }
         }
         if !thin {
-            window.paint_quad(fill(rect(gutter - 1.0, 0.0, 1.0, h), theme.border_primary));
+            window.paint_quad(fill(
+                rect(gutter - hair, 0.0, hair, h),
+                theme.border_primary,
+            ));
             paint_table_label(
                 "Source",
                 theme.text_secondary,
-                |_, _| area.origin + point(px(CELL_PAD_X), px(ruler_y)),
+                |_, _| at(CELL_PAD_X, ruler_y),
                 window,
                 cx,
             );
             let overview = self.fit.unwrap_or(view).hull(view);
             window.paint_quad(fill(rect(0.0, h - 14.0, gutter, 14.0), theme.bg_secondary));
-            window.paint_quad(fill(rect(0.0, h - 14.0, w, 1.0), theme.border_primary));
+            window.paint_quad(fill(rect(0.0, h - 14.0, w, hair), theme.border_primary));
             let left = gutter + (overview.fraction(view.start) * f64::from(time_w)) as f32;
             let right = gutter + (overview.fraction(view.end) * f64::from(time_w)) as f32;
             window.paint_quad(quad(
                 rect(left, h - 11.0, right - left, 9.0),
-                px(2.0),
+                px(2.0 * s),
                 theme.selection_bg,
                 px(1.0),
                 theme.border_primary,
@@ -334,7 +346,7 @@ impl Timeline {
                         3.0,
                         available * count as f32 / total,
                     ),
-                    px(1.5),
+                    px(1.5 * s),
                     theme.text_tertiary,
                     px(0.0),
                     theme.text_tertiary,
@@ -363,7 +375,7 @@ impl Timeline {
         {
             let tx = x(t).clamp(gutter, (w - 1.0).max(gutter));
             window.paint_quad(fill(
-                rect(tx, brace_h, 1.0, h - brace_h),
+                rect(tx, brace_h, hair, h - brace_h),
                 theme.text_primary,
             ));
             window.paint_quad(quad(
@@ -382,9 +394,9 @@ impl Timeline {
             if self.event_at(pointer, cx).is_none() {
                 window.paint_quad(fill(
                     rect(
-                        f32::from(pointer.x - area.origin.x),
+                        f32::from(pointer.x - area.origin.x) / s,
                         brace_h,
-                        1.0,
+                        hair,
                         h - brace_h,
                     ),
                     theme.text_tertiary,
@@ -403,7 +415,7 @@ fn paint_table_label(
     cx: &mut App,
 ) {
     let text = text.into();
-    let font_size = px(CELL_FONT_SIZE);
+    let font_size = px(CELL_FONT_SIZE * ui_scale(window));
     let run = gpui::TextRun {
         len: text.len(),
         font: window.text_style().font(),

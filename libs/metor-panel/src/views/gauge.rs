@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use super::binding::{self, ElementRef, component_meta, spawn_meta_resolver, spawn_scalar_stream};
 use super::format_number;
 use super::meter::{fill_span, scale_position};
-use crate::theme::theme;
+use crate::theme::{theme, ui_px, ui_scale};
 
 /// How the value is shown along the dial.
 #[derive(Clone, Copy, Debug, Default, PartialEq, facet::Facet, Serialize, Deserialize)]
@@ -396,18 +396,20 @@ impl Render for Gauge {
                 if dial.radius <= 0.0 {
                     return;
                 }
-                let arc_r = dial.radius - ARC_WIDTH / 2.0;
-                dial.paint_arc(arc_r, 0.0, 1.0, px(ARC_WIDTH), track_color, window);
+                let k = ui_scale(window);
+                let arc_w = ARC_WIDTH * k;
+                let arc_r = dial.radius - arc_w / 2.0;
+                dial.paint_arc(arc_r, 0.0, 1.0, px(arc_w), track_color, window);
 
                 match style {
                     GaugeStyle::Arc => {
                         if let Some((start, end)) = span {
-                            dial.paint_arc(arc_r, start, end, px(ARC_WIDTH), color, window);
+                            dial.paint_arc(arc_r, start, end, px(arc_w), color, window);
                         }
                     }
                     GaugeStyle::Needle => {
                         if let Some(t) = needle {
-                            dial.paint_spoke(t, 0.0, arc_r - ARC_WIDTH, px(2.0), color, window);
+                            dial.paint_spoke(t, 0.0, arc_r - arc_w, px(2.0 * k), color, window);
                         }
                     }
                 }
@@ -415,21 +417,22 @@ impl Render for Gauge {
                 for (t, mark_color) in &marks {
                     dial.paint_spoke(
                         *t,
-                        arc_r + ARC_WIDTH / 2.0,
+                        arc_r + arc_w / 2.0,
                         arc_r - dial.radius * TICK_REACH,
-                        px(2.0),
+                        px(2.0 * k),
                         *mark_color,
                         window,
                     );
                 }
 
                 if style == GaugeStyle::Needle {
+                    let r = px(3.0 * k);
                     let hub = Bounds::new(
-                        point(dial.center.x - px(3.0), dial.center.y - px(3.0)),
-                        gpui::size(px(6.0), px(6.0)),
+                        point(dial.center.x - r, dial.center.y - r),
+                        gpui::size(r * 2.0, r * 2.0),
                     );
                     let mut quad = gpui::fill(hub, hub_color);
-                    quad.corner_radii = gpui::Corners::all(px(3.0));
+                    quad.corner_radii = gpui::Corners::all(r);
                     window.paint_quad(quad);
                 }
             },
@@ -438,7 +441,7 @@ impl Render for Gauge {
         let mut tile = div()
             .size_full()
             .relative()
-            .p(px(4.0))
+            .p(ui_px(4.0))
             .child(dial.size_full());
 
         // Readouts overlay the dial's open bottom rather than taking layout
@@ -447,11 +450,11 @@ impl Render for Gauge {
             .absolute()
             .left_0()
             .right_0()
-            .bottom(px(4.0))
+            .bottom(ui_px(4.0))
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(1.0));
+            .gap(ui_px(1.0));
 
         if self.show_value {
             let text = match self.value {
@@ -461,7 +464,7 @@ impl Render for Gauge {
             };
             readout = readout.child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(ui_px(13.0))
                     .text_color(theme.text_primary)
                     .child(SharedString::from(text)),
             );
@@ -469,7 +472,7 @@ impl Render for Gauge {
         if !self.label.is_empty() {
             readout = readout.child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(ui_px(10.0))
                     .text_color(theme.text_secondary)
                     .truncate()
                     .child(self.label.clone()),

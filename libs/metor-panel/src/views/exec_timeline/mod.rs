@@ -46,6 +46,7 @@ use paint::{FlowPaint, GUTTER_W, LanePaint, RULER_H, RulerPaint, paint_lanes, pa
 use rows::{ExecRow, FlowEdge, RowKind, derive_edges, derive_rows};
 use scan::{GanttFrame, layout_cycles, read_row, summarize};
 
+use crate::theme::ui_px;
 use crate::views::table::{CELL_FONT_SIZE, CELL_PAD_X};
 use crate::views::time_series::time_range::GlobalTimeRange;
 use crate::views::time_series::{Override, PlotBounds, TimeFormat, TimeRangeBehavior};
@@ -677,12 +678,12 @@ impl Render for ExecTimeline {
         let mut gutter = div()
             .flex()
             .flex_col()
-            .w(px(GUTTER_W))
+            .w(ui_px(GUTTER_W))
             .flex_none()
             .overflow_hidden()
             .child(
                 div()
-                    .h(px(RULER_H))
+                    .h(ui_px(RULER_H))
                     .flex_none()
                     .bg(theme.bg_secondary)
                     .border_b_1()
@@ -700,14 +701,14 @@ impl Render for ExecTimeline {
                 div()
                     .flex()
                     .flex_1()
-                    .max_h(px(paint::LANE_MAX))
+                    .max_h(ui_px(paint::LANE_MAX))
                     .items_center()
-                    .px(px(CELL_PAD_X))
+                    .px(ui_px(CELL_PAD_X))
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .border_b_1()
                     .border_color(theme.border_primary)
-                    .text_size(px(CELL_FONT_SIZE))
+                    .text_size(ui_px(CELL_FONT_SIZE))
                     .text_color(color)
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, {
@@ -744,7 +745,7 @@ impl Render for ExecTimeline {
         )
         .size_full();
         let ruler = div()
-            .h(px(RULER_H))
+            .h(ui_px(RULER_H))
             .flex_none()
             .bg(theme.bg_secondary)
             .border_b_1()
