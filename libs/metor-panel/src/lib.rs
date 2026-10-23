@@ -16,6 +16,7 @@ use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod alarms;
 pub mod app;
+pub(crate) mod atlas;
 pub mod backfill;
 pub(crate) mod background_tasks;
 pub mod config;

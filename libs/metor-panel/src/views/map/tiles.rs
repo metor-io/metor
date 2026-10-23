@@ -11,7 +11,8 @@
 //! network, which is also what keeps previously-seen areas working offline.
 //!
 //! GPU lifetime is the subtle part: every [`RenderImage`] that reaches a
-//! window's sprite atlas must eventually pass through `window.drop_image`,
+//! window's sprite atlas must eventually pass through
+//! [`atlas::release_image`](crate::atlas::release_image),
 //! but the store has no window. Evictions therefore park images in an
 //! orphan list that map views drain inside their paint pass — the same
 //! arrangement the 3D viewer uses for retired frames.
@@ -267,7 +268,7 @@ impl TileStore {
     }
 
     /// Evicted images whose atlas slots the calling window should release
-    /// via `window.drop_image`.
+    /// via [`crate::atlas::release_image`].
     pub fn take_orphans(&mut self) -> Vec<Arc<RenderImage>> {
         std::mem::take(&mut self.orphaned)
     }

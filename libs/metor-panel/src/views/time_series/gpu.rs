@@ -893,7 +893,7 @@ impl PlotRenderState {
     }
 
     /// Take the previous frame so the caller can pass it to
-    /// `window.drop_image`, which needs `&mut Window` access only
+    /// [`crate::atlas::release_image`], which needs `&mut Window` access only
     /// available inside the prepaint closure.
     pub(crate) fn take_pending_release(&mut self) -> Option<Arc<RenderImage>> {
         self.pending_release.take()

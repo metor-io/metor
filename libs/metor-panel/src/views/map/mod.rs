@@ -570,7 +570,7 @@ impl Render for Map {
                             resolve_tiles(store, &camera, size, bias, &source)
                         });
                         for image in orphans {
-                            let _ = window.drop_image(image);
+                            crate::atlas::release_image(window, cx, image);
                         }
                         // Stand-ins first so every exact tile wins where
                         // both cover a cell.

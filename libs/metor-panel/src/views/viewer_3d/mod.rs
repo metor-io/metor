@@ -951,7 +951,7 @@ impl Render for Viewer3d {
                                 .unwrap_or((None, Vec::new()));
 
                             for img in releases {
-                                let _ = window.drop_image(img);
+                                crate::atlas::release_image(window, cx, img);
                             }
 
                             (bounds, frame)

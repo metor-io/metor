@@ -408,7 +408,7 @@ impl Render for ListLinePlot {
                     })
                     .unwrap_or((None, None));
                 if let Some(img) = released {
-                    let _ = window.drop_image(img);
+                    crate::atlas::release_image(window, cx, img);
                 }
                 (bounds, frame)
             },
