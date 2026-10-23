@@ -584,12 +584,21 @@ impl Render for AppRoot {
             // bound with `!Inspector && !RowList && !Transient`) have a non-empty
             // context stack to evaluate against — gpui's predicate eval returns
             // false for an empty stack, so without this the leader never fires.
-            .key_context("AppRoot")
+            // `PaneZoomed` sits on the root rather than the tile group so the
+            // zoom's escape works without focus inside a pane.
+            .key_context(if self.tiles.read(cx).zoomed().is_some() {
+                "AppRoot PaneZoomed"
+            } else {
+                "AppRoot"
+            })
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::open_leader))
             .on_action(cx.listener(Self::cycle_tab_forward))
             .on_action(cx.listener(Self::cycle_tab_backward))
+            .on_action(cx.listener(|this, _: &crate::tiles::ExitZoom, _, cx| {
+                this.tiles.update(cx, |tiles, cx| tiles.exit_zoom(cx));
+            }))
             .on_action(cx.listener(Self::toggle_cmd_lock))
             .on_action(cx.listener(Self::handle_inspect_entity))
             .on_action(cx.listener(Self::handle_plot_component_action))
@@ -1607,6 +1616,7 @@ impl PanelApp {
             KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
             KeyBinding::new("ctrl-tab", CycleTabForward, None),
             KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
+            KeyBinding::new("escape", crate::tiles::ExitZoom, Some(EXIT_ZOOM)),
             KeyBinding::new("secondary-l", ToggleCmdLock, None),
             KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
             // Scoped to a focused browser: the bar is per pane, and
@@ -1780,6 +1790,12 @@ pub const TEXT_INPUT: &str = "TextInput";
 /// re-trigger its own leader.
 pub const NOT_TYPING: &str = "!TextInput && !Transient";
 
+/// Context predicate for the bare escape that un-zooms a pane: [`NOT_TYPING`]
+/// narrowed to while a zoom is up. Bindings dispatch ahead of key-down
+/// listeners, so outside a zoom escape is untouched, and inside one a field
+/// keeps it only by declaring [`TEXT_INPUT`].
+pub const EXIT_ZOOM: &str = "PaneZoomed && !TextInput && !Transient";
+
 /// Deleting the selected node: only in a node editor, and never while an
 /// `Global` so palette callbacks can fetch it without threading.
 fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
@@ -1872,7 +1888,7 @@ fn set_dock_icon() {}
 
 #[cfg(test)]
 mod keybinding_tests {
-    use super::{NOT_TYPING, TEXT_INPUT};
+    use super::{EXIT_ZOOM, NOT_TYPING, TEXT_INPUT};
     use gpui::{KeyBindingContextPredicate, KeyContext};
 
     /// The focus path, root first — the order gpui evaluates a predicate over.
@@ -1925,5 +1941,17 @@ mod keybinding_tests {
 
         // The chord menu must not re-trigger its own leader.
         assert!(!fires(NOT_TYPING, &["AppRoot", "Transient"]));
+    }
+
+    #[test]
+    fn escape_un_zooms_only_while_zoomed_and_never_mid_typing() {
+        assert!(fires(EXIT_ZOOM, &["AppRoot PaneZoomed"]));
+        assert!(fires(EXIT_ZOOM, &["AppRoot PaneZoomed", "Dashboard"]));
+        assert!(!fires(EXIT_ZOOM, &["AppRoot"]));
+        assert!(!fires(
+            EXIT_ZOOM,
+            &["AppRoot PaneZoomed", "Inspector TextInput"]
+        ));
+        assert!(!fires(EXIT_ZOOM, &["AppRoot PaneZoomed", "Transient"]));
     }
 }

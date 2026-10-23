@@ -12,6 +12,7 @@ fn layout() -> TileLayout {
             tab_orientation: Default::default(),
             hide_tab_bar: false,
             locked_size: None,
+            tab_rail_width: None,
             items: vec![TileItem {
                 kind: "time_series_plot".into(),
                 state: r#"{"label":"rates"}"#.into(),

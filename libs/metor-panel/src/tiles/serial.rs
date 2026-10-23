@@ -264,6 +264,7 @@ mod tests {
                         tab_orientation: TabOrientation::Horizontal,
                         hide_tab_bar: false,
                         locked_size: None,
+                        tab_rail_width: None,
                         items: vec![TileItem {
                             kind: "component_text".into(),
                             state: r#"{"component":"foo"}"#.into(),
@@ -274,6 +275,7 @@ mod tests {
                         tab_orientation: TabOrientation::Vertical,
                         hide_tab_bar: true,
                         locked_size: Some((300.0, 200.0)),
+                        tab_rail_width: Some(220.0),
                         items: vec![
                             TileItem {
                                 kind: "component_outline".into(),
@@ -311,6 +313,7 @@ mod tests {
         assert!(matches!(p0.tab_orientation, TabOrientation::Horizontal));
         assert!(!p0.hide_tab_bar);
         assert_eq!(p0.locked_size, None);
+        assert_eq!(p0.tab_rail_width, None);
         assert_eq!(p0.items.len(), 1);
         assert_eq!(p0.items[0].kind, "component_text");
         assert_eq!(p0.items[0].state, r#"{"component":"foo"}"#);
@@ -322,6 +325,7 @@ mod tests {
         assert!(matches!(p1.tab_orientation, TabOrientation::Vertical));
         assert!(p1.hide_tab_bar);
         assert_eq!(p1.locked_size, Some((300.0, 200.0)));
+        assert_eq!(p1.tab_rail_width, Some(220.0));
         assert_eq!(p1.items.len(), 2);
     }
 }
