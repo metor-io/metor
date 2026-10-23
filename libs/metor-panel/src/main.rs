@@ -2,7 +2,7 @@ mod startup_args;
 
 use metor_db::Server;
 use metor_panel::{ConnectContext, Connected, ConnectionTarget};
-use startup_args::{Startup, startup_args};
+use startup_args::{Startup, USAGE, startup_args};
 use stellarator::net::TcpListener;
 
 fn main() {
@@ -19,30 +19,39 @@ fn main() {
         .with_env_filter(filter)
         .try_init();
 
-    let app = match startup_args(std::env::args_os().skip(1)) {
-        Ok(Startup::Open(path)) => metor_panel::PanelApp::open_recording(path),
-        Ok(Startup::Choose) => metor_panel::PanelApp::choose_session(),
-        Ok(Startup::RecordTo(path)) => match metor_panel::PanelApp::record_to(path) {
-            Ok(app) => app,
-            Err(error) => {
-                eprintln!("Could not create recording: {error}");
-                std::process::exit(1);
-            }
-        },
-        Ok(Startup::Temporary) => metor_panel::PanelApp::temporary().unwrap_or_else(|error| {
-            eprintln!("Could not create temporary session: {error}");
-            std::process::exit(1);
-        }),
-        Ok(Startup::Help) => {
+    let args = match startup_args(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("{error}\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let app = match args.mode {
+        Startup::Open(path) => metor_panel::PanelApp::open_recording(path),
+        Startup::Choose => metor_panel::PanelApp::choose_session(),
+        Startup::RecordTo(path) => metor_panel::PanelApp::record_to(path)
+            .unwrap_or_else(|error| exit("Could not create recording", &error)),
+        Startup::Temporary => metor_panel::PanelApp::temporary()
+            .unwrap_or_else(|error| exit("Could not create temporary session", &error)),
+        Startup::Connect(addr) => {
+            let addr = startup_args::resolve(&addr).unwrap_or_else(|e| exit("Bad address", &e));
+            metor_panel::PanelApp::temporary()
+                .unwrap_or_else(|error| exit("Could not create temporary session", &error))
+                .remote(addr)
+        }
+        Startup::Help => {
             println!(
-                "Usage: metor-panel [--temporary | --record-to PATH | --open PATH]\n\nWithout arguments, choose a connection and optional recording location."
+                "{USAGE}\n\nWithout a mode, choose a connection and optional recording location.\n--connect mirrors a running db in a temporary session; --preset loads a layout file."
             );
             return;
         }
-        Err(error) => {
-            eprintln!("{error}\nUsage: metor-panel [--temporary | --record-to PATH | --open PATH]");
-            std::process::exit(2);
-        }
+    };
+    let app = match args.preset {
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(json) => app.layout(json),
+            Err(error) => exit(&format!("Could not read preset {}", path.display()), &error),
+        },
+        None => app,
     };
 
     // The sandbox target reproduces the classic standalone setup: this
@@ -84,4 +93,9 @@ fn main() {
     app.connection(sandbox)
         .connection_source(metor_panel::connections::mdns_source())
         .run();
+}
+
+fn exit(what: &str, error: &dyn std::fmt::Display) -> ! {
+    eprintln!("{what}: {error}");
+    std::process::exit(1);
 }

@@ -1262,7 +1262,9 @@ impl PanelApp {
         target: ConnectionTarget,
         cx: &mut App,
     ) {
-        self.workspace = crate::connections::persist::load_layout(&target.id);
+        if self.workspace.is_none() {
+            self.workspace = crate::connections::persist::load_layout(&target.id);
+        }
         // The explicit choice on the startup screen takes precedence over
         // builder defaults; it must be the first producer for this recording.
         self.auto_connect = vec![target.id.clone()];
@@ -1305,8 +1307,15 @@ impl PanelApp {
         cx: &mut App,
     ) {
         self.offline = true;
-        self.workspace = workspace;
+        self.workspace = self.workspace.take().or(workspace);
         self.start_session(storage, db, cx);
+    }
+
+    /// Load a layout document (a tile layout or a workspace) into the first
+    /// window at startup, in place of any layout saved for the connection.
+    pub fn layout(mut self, json: impl Into<String>) -> Self {
+        self.workspace = Some(json.into());
+        self
     }
 
     /// Pre-register a connectable target in the picker.
