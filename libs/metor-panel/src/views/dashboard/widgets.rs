@@ -20,6 +20,7 @@ use crate::tiles::panels::{
     log_view, outline_config, outline_view, sequence_config, sequence_view,
 };
 use crate::views::image_source::{self, ImageRef};
+use crate::views::image_view::{ImageView, ImageViewConfig};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
     Annunciator, AnnunciatorConfig, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
@@ -482,6 +483,25 @@ impl WidgetRegistry {
             )
             .with_tile("samples_table", |_| "Samples".into())
             .with_live_tile_title(|table: &SamplesTable, _| table.component().clone()),
+        );
+        self.register(
+            WidgetKind::image_view(),
+            WidgetSpec::typed(
+                (320.0, 320.0),
+                |w| {
+                    let cfg = parse_or_default::<ImageViewConfig>(&w.config);
+                    subject("Image", &cfg.component)
+                },
+                |cfg, db, cx| ImageView::from_config(&cfg, db, cx),
+                |view, _| view.to_config(),
+            )
+            .with_tile("image_view", |blob| {
+                match parse_or_default::<ImageViewConfig>(blob).component {
+                    name if name.is_empty() => "Image".into(),
+                    name => name.into(),
+                }
+            })
+            .with_live_tile_title(|view: &ImageView, _| view.title()),
         );
         self.register(
             WidgetKind::attitude(),

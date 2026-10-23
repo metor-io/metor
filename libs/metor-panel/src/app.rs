@@ -16,7 +16,8 @@ use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{OutlinePanelConfig, PlotPanelConfig, TraceConfig};
 use crate::tiles::{
-    OpenOutlineAction, PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent,
+    OpenImageAction, OpenOutlineAction, PlotComponentAction, PreviewPlotAction, TileGroup,
+    TileGroupEvent,
 };
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use gpui::{
@@ -389,6 +390,26 @@ impl AppRoot {
         crate::tiles::panels::add_registered_panel(&pane, "time_series_plot", &cfg, cx);
     }
 
+    fn handle_open_image_action(
+        &mut self,
+        action: &OpenImageAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
+            return;
+        };
+        let id = action.component_id;
+        let Some(name) = self
+            .db
+            .with_state(|s| s.get_component_metadata(id).map(|m| m.name.clone()))
+        else {
+            return;
+        };
+        let config = crate::views::image_view::image_view_config(name);
+        crate::tiles::panels::add_registered_panel_state(&pane, "image_view", &config, cx);
+    }
+
     fn handle_open_outline_action(
         &mut self,
         action: &OpenOutlineAction,
@@ -608,6 +629,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::handle_inspect_entity))
             .on_action(cx.listener(Self::handle_plot_component_action))
             .on_action(cx.listener(Self::handle_open_outline_action))
+            .on_action(cx.listener(Self::handle_open_image_action))
             .on_action(cx.listener(Self::handle_preview_plot_action))
             .on_action(cx.listener(Self::open_review_edits))
             .on_action(cx.listener(Self::open_connections))
@@ -1712,6 +1734,8 @@ pub(crate) fn register_shutdown(
     cx: &mut App,
 ) {
     cx.on_app_quit(move |cx| {
+        #[cfg(debug_assertions)]
+        crate::views::image_view::synthetic::stop(cx);
         crate::session::finish_export(cx);
         crate::connections::flush_layout_now(cx);
         crate::session::save_workspace(None, cx);

@@ -2751,7 +2751,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4165,6 +4165,12 @@ dependencies = [
  "csscolorparser",
  "libm",
 ]
+
+[[package]]
+name = "colorous"
+version = "1.0.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4e18bf7a165bf7028fde98609a0f1e8f7498d762a212598e6c891f6893556ec"
 
 [[package]]
 name = "combine"
@@ -6101,6 +6107,18 @@ name = "fast-srgb8"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd2e7510819d6fbf51a5545c8f922716ecfb14df168a3242f7d33e0239efe6a1"
+
+[[package]]
+name = "fast_image_resize"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9c50201dc184ba6553da1695aac20a042efffbe2d84542cee31917c86c3ab1e"
+dependencies = [
+ "cfg-if",
+ "document-features",
+ "num-traits",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "fastrand"
@@ -9611,6 +9629,7 @@ dependencies = [
  "bevy 0.20.0-dev",
  "bytemuck",
  "cocoa 0.26.0",
+ "colorous",
  "const-fnv1a-hash",
  "crossbeam-channel",
  "dirs 5.0.1",
@@ -9618,6 +9637,7 @@ dependencies = [
  "facet-dessert",
  "facet-format",
  "facet-json",
+ "fast_image_resize",
  "futures-lite",
  "glam 0.33.12",
  "gpui",
@@ -16314,7 +16334,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
  "once_cell",
- "ordered-float 4.6.0",
+ "ordered-float 5.3.0",
  "parking_lot",
  "portable-atomic",
  "portable-atomic-util",

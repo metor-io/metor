@@ -50,6 +50,8 @@ wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 image = "0.25"
+colorous = "1"
+fast_image_resize = "6"
 # Image widgets carry their bytes inline so a target-shipped preset works on
 # a panel that has never seen the target's filesystem.
 base64 = "0.22"

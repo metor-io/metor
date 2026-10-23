@@ -11,6 +11,7 @@ use smallvec::SmallVec;
 
 use crate::inspector::rows::PreviewSpec;
 use crate::tiles::PreviewPlotAction;
+use crate::views::image_view::expands;
 use crate::views::time_series::{TimeSeriesPlot, Trace, traces_for_component};
 
 pub const PREVIEW_SIZE: Size<Pixels> = Size {
@@ -30,13 +31,17 @@ pub fn build_plot_preview(db: Arc<DB>, traces: Vec<Trace>, cx: &mut App) -> Prev
 }
 
 /// Resolve `indices` to a trace list, defaulting to *all* elements when
-/// `indices` is empty (the convention for whole-component previews).
+/// `indices` is empty (the convention for whole-component previews). A
+/// component that does not [`expands`] has no whole-component preview.
 pub fn preview_traces(
     db: &DB,
     component_id: ComponentId,
     indices: &[usize],
     cx: &App,
 ) -> Vec<Trace> {
+    if indices.is_empty() && !expands(db, component_id) {
+        return Vec::new();
+    }
     if indices.is_empty() {
         let elem_count =
             crate::inspector::trace_picker::element_names_for_component(db, component_id)
@@ -70,5 +75,28 @@ pub fn shift_hover_listener(
                 cx,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::views::image_view::tests::{COLLAPSED, image_db};
+
+    #[gpui::test]
+    fn collapsed_components_have_no_whole_preview(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = image_db();
+        cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            for name in COLLAPSED {
+                let id = ComponentId::new(name);
+                assert!(preview_traces(&db, id, &[], cx).is_empty(), "{name}");
+                assert_eq!(preview_traces(&db, id, &[3], cx).len(), 1, "{name}");
+            }
+            let exposure = ComponentId::new("cam.exposure");
+            assert_eq!(preview_traces(&db, exposure, &[], cx).len(), 1);
+        });
     }
 }

@@ -27,9 +27,10 @@ pub(crate) mod model;
 
 use super::column_browser::ToggleFilterBar;
 use super::component_browser::component_tree::{ComponentNode, build_tree, chain_to};
-use super::component_browser::{strip_cell_count, strip_menu};
-use super::copy::{copy_name_row, copy_rows};
+use super::component_browser::{component_rows, strip_cell_count, strip_menu};
+use super::copy::copy_name_row;
 use super::filter_bar::{FilterBar, FilterBarEvent};
+use super::image_view::{collapsed_label, expands};
 use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
 use super::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate, drag_chip};
@@ -41,7 +42,7 @@ use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::{theme, ui_px};
-use crate::tiles::{OpenOutlineAction, PlotComponentAction};
+use crate::tiles::OpenOutlineAction;
 use model::{
     Disclosure, FrameType, Layout, OutlineRow, Pivot, PivotLayout, RowKind, alike, common_suffix,
     component_count, flatten, root_node, signature, take_slot, type_key,
@@ -790,28 +791,11 @@ impl OutlineDelegate {
             }
         }
         match (row.node.component_id, &row.kind) {
-            (Some(id), _) => {
-                let count = element_count(&self.db, id);
-                rows.push(Box::new(CommandRow::new(
-                    "Plot component",
-                    Arc::new(move |window, cx| {
-                        let indices: SmallVec<[usize; 4]> = (0..count).collect();
-                        window.dispatch_action(
-                            Box::new(PlotComponentAction {
-                                component_id: id,
-                                indices,
-                            }),
-                            cx,
-                        );
-                    }),
-                )));
-                rows.extend(copy_rows(
-                    self.db.clone(),
-                    id,
-                    row.node.full_name.clone(),
-                    None,
-                ));
-            }
+            (Some(id), _) => rows.extend(component_rows(
+                self.db.clone(),
+                id,
+                row.node.full_name.clone(),
+            )),
             (None, _) => rows.push(copy_name_row(row.node.full_name.clone())),
         }
         open(
@@ -1185,7 +1169,7 @@ impl OutlineDelegate {
                 cx.stop_propagation();
             }),
         );
-        if let Some(id) = row.node.component_id {
+        if let Some(id) = row.node.component_id.filter(|&id| expands(&self.db, id)) {
             cell = cell.on_mouse_move(shift_hover_listener(id, SmallVec::new()));
         }
         cell.into_any_element()
@@ -1197,7 +1181,6 @@ impl OutlineDelegate {
         row: &OutlineRow,
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
-        let theme = theme(cx);
         match &row.kind {
             // An open pivot's branch row doubles as its header; a folded
             // one (a type kept closed) has nothing to align to.
@@ -1212,17 +1195,11 @@ impl OutlineDelegate {
             _ => {}
         }
         let Some(id) = row.node.component_id else {
-            let label = count_label(row.component_count, "component");
-            return div()
-                .flex()
-                .items_center()
-                .h_full()
-                .px(ui_px(8.0))
-                .text_size(ui_px(12.0))
-                .text_color(theme.text_tertiary)
-                .child(SharedString::from(label))
-                .into_any_element();
+            return self.render_note(count_label(row.component_count, "component"), cx);
         };
+        if let Some(label) = collapsed_label(&self.db, id) {
+            return self.render_note(label, cx);
+        }
 
         let db = self.db.clone();
         let strip = self.strip(id, cx);
@@ -1348,6 +1325,17 @@ impl OutlineDelegate {
                 );
                 continue;
             };
+            if let Some(label) = collapsed_label(&db, id) {
+                cells.push(
+                    cell.overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_tertiary)
+                        .child(SharedString::from(label))
+                        .into_any_element(),
+                );
+                continue;
+            }
             let strip = self.strip(id, cx);
             let name = SharedString::from(format!("{}.{}", instance.node.full_name, field));
             let click = edit_click(db.clone(), id, name);
@@ -1362,6 +1350,20 @@ impl OutlineDelegate {
         }
         pivot_scroller(row_ix, scroll)
             .children(cells)
+            .into_any_element()
+    }
+
+    /// A muted label standing in for a value strip.
+    fn render_note(&self, text: String, cx: &mut Context<Table<Self>>) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .h_full()
+            .px(ui_px(8.0))
+            .text_size(ui_px(12.0))
+            .text_color(theme(cx).text_tertiary)
+            .whitespace_nowrap()
+            .child(SharedString::from(text))
             .into_any_element()
     }
 
@@ -1445,7 +1447,7 @@ impl TableDelegate for OutlineDelegate {
                 self.render_text(ty, cx)
             }
             Col::Sparkline => {
-                let Some(id) = row.node.component_id else {
+                let Some(id) = row.node.component_id.filter(|&id| expands(&self.db, id)) else {
                     return div().into_any_element();
                 };
                 let plot = self.sparkline(id, cx);
@@ -1585,4 +1587,95 @@ fn type_label(db: &DB, id: ComponentId) -> Option<String> {
         }
         Some(label)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use smallvec::smallvec;
+
+    use super::*;
+    use crate::views::image_view::tests::{COLLAPSED, Kind, db_with, image_db};
+
+    fn outline(db: &Arc<DB>, cx: &mut gpui::VisualTestContext) -> Entity<Table<OutlineDelegate>> {
+        let table = cx.update(|_, cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            crate::inspector::edits::init(cx);
+            cx.new(|cx| Table::new(OutlineDelegate::new(db.clone(), cx)))
+        });
+        cx.run_until_parked();
+        table
+    }
+
+    /// Renders every cell of every row.
+    fn render_all(
+        table: &mut Table<OutlineDelegate>,
+        window: &mut Window,
+        cx: &mut Context<Table<OutlineDelegate>>,
+    ) {
+        let delegate = table.delegate_mut();
+        for row_ix in 0..delegate.rows.len() {
+            for col_ix in 0..delegate.columns.len() {
+                delegate.render_cell(row_ix, col_ix, window, cx);
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn collapsed_rows_build_no_strip_or_sparkline(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = image_db();
+        let cx = cx.add_empty_window();
+        let table = outline(&db, cx);
+        cx.update(|window, cx| {
+            table.update(cx, |table, cx| {
+                let columns = smallvec![Col::Name, Col::Sparkline, Col::Value];
+                table.delegate_mut().set_columns(columns, cx);
+                render_all(table, window, cx);
+                let delegate = table.delegate();
+                for name in COLLAPSED {
+                    let id = ComponentId::new(name);
+                    assert!(!delegate.strips.contains(id), "{name}");
+                    assert!(!delegate.sparks.contains(id), "{name}");
+                }
+                let exposure = ComponentId::new("cam.exposure");
+                assert!(delegate.strips.contains(exposure));
+                assert!(delegate.sparks.contains(exposure));
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn pivot_cells_build_no_strip_for_images(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = db_with(&[
+            ("rig.a.pixels", Kind::Image),
+            ("rig.a.exposure", Kind::Scalar),
+            ("rig.b.pixels", Kind::Raw),
+            ("rig.b.exposure", Kind::Scalar),
+        ]);
+        let cx = cx.add_empty_window();
+        let table = outline(&db, cx);
+        cx.update(|window, cx| {
+            table.update(cx, |table, cx| {
+                let delegate = table.delegate_mut();
+                let rig = delegate
+                    .rows
+                    .iter()
+                    .find(|row| row.node.full_name == "rig")
+                    .cloned()
+                    .expect("the branch row");
+                delegate.set_pivoted(&rig, true, cx);
+                assert!(
+                    delegate
+                        .rows
+                        .iter()
+                        .any(|row| matches!(row.kind, RowKind::PivotInstance { .. }))
+                );
+                render_all(table, window, cx);
+                let strips = &table.delegate().strips;
+                assert!(!strips.contains(ComponentId::new("rig.a.pixels")));
+                assert!(!strips.contains(ComponentId::new("rig.b.pixels")));
+                assert!(strips.contains(ComponentId::new("rig.a.exposure")));
+                assert!(strips.contains(ComponentId::new("rig.b.exposure")));
+            })
+        });
+    }
 }

@@ -226,6 +226,34 @@ impl Theme {
         self.line_colors[1]
     }
 
+    /// Behind an image and its letterbox: black, so the darkest pixel and
+    /// the border read the same on every theme.
+    pub fn image_backdrop(&self) -> Hsla {
+        hex(0x000000, 1.0)
+    }
+
+    /// Pixels at the sensor's top code — the theme's critical red, the one
+    /// hue no colormap ends on.
+    pub fn image_saturated(&self) -> Hsla {
+        self.error_accent
+    }
+
+    /// Detected-star overlay markers — the green family.
+    pub fn image_overlay_detected(&self) -> Hsla {
+        self.line_colors[2]
+    }
+
+    /// Truth overlay markers — the purple family, apart from the detections.
+    pub fn image_overlay_truth(&self) -> Hsla {
+        self.line_colors[4]
+    }
+
+    /// The pixel crosshair — the orange family, legible over gray and every
+    /// perceptual colormap.
+    pub fn image_crosshair(&self) -> Hsla {
+        self.line_colors[0]
+    }
+
     /// Solid color for an alarm severity (`severity_index`: 0 = info, 1 = warning,
     /// 2 = critical), used for limit lines, severity chips, and the status bar.
     /// Critical tracks the theme's `error_accent`; warning/info are fixed amber/blue
@@ -1313,6 +1341,26 @@ mod tests {
             let rising = l.windows(2).all(|w| w[0] < w[1]);
             let falling = l.windows(2).all(|w| w[0] > w[1]);
             assert!(rising || falling, "{} stops: {l:?}", theme.name);
+        }
+    }
+
+    /// Image overlays must stand apart from each other and from a gray image.
+    #[test]
+    fn image_tokens_are_distinct_and_saturated() {
+        for theme in builtin_themes() {
+            let tokens = [
+                theme.image_saturated(),
+                theme.image_overlay_detected(),
+                theme.image_overlay_truth(),
+                theme.image_crosshair(),
+            ];
+            for (i, a) in tokens.iter().enumerate() {
+                assert!(a.s > 0.2 && a.a == 1.0, "{} token {i}: {a:?}", theme.name);
+                for b in &tokens[i + 1..] {
+                    assert!(!approx(*a, *b), "{} tokens {a:?} {b:?}", theme.name);
+                }
+            }
+            assert_eq!(theme.image_backdrop().l, 0.0, "{}", theme.name);
         }
     }
 }
