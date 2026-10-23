@@ -64,7 +64,9 @@ Every one of those is registered on **both** surfaces from a single config type:
 
 ### Theme (`src/theme.rs`)
 
-All colors live in the `Theme` struct, accessed as `DARK.selection_bg` etc. **Never** hardcode `Hsla` literals outside `theme.rs`. `hex(0xRRGGBB, alpha)` is a `const fn` for theme tables.
+All colors live in the `Theme` struct, accessed as `DARK.selection_bg` etc. **Never** hardcode `Hsla` literals outside `theme.rs`. `hex(0xRRGGBB, alpha)` is a public `const fn` for theme tables.
+
+The picker reads the `ThemeRegistry` global (built-ins from `builtin_themes()` in display order, then consumer themes; a re-registered name replaces in place). Consumers add themes with `PanelApp::theme` / `register_theme` and choose the startup one with `PanelApp::default_theme` (unknown names fall back to Dark); `install_themes` runs in `PanelApp::run` before either the startup screen or the workspace opens. Consumer palettes are built as `Theme { name: …, ..DARK.clone() }` so new fields don't break them — a new `Theme` field just needs a value in every built-in.
 
 ## Conventions
 

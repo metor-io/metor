@@ -464,7 +464,7 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
         items.push(InspectionItem::SubMenu {
             label: "Theme".into(),
             summary: SharedString::new_static(""),
-            build: Arc::new(|_cx| theme_rows()),
+            build: Arc::new(theme_rows),
         });
 
         items.push(InspectionItem::SubMenu {
@@ -555,13 +555,12 @@ fn register_preset_provider(cx: &mut App) {
 
 /// Rows for the **Theme** submenu: one per registered theme, applied on select.
 /// Shared by the command palette and the transient chord menu.
-pub(crate) fn theme_rows() -> Vec<Box<dyn InspectorRow>> {
-    crate::theme::all_themes()
-        .iter()
-        .map(|t| {
-            let theme = Arc::new((*t).clone());
+pub(crate) fn theme_rows(cx: &App) -> Vec<Box<dyn InspectorRow>> {
+    crate::theme::themes(cx)
+        .into_iter()
+        .map(|theme| {
             Box::new(CommandRow::new(
-                t.name,
+                theme.name.clone(),
                 Arc::new(move |_window, cx| {
                     crate::theme::set_theme(cx, theme.clone());
                 }),
@@ -749,6 +748,25 @@ mod live_tests {
             let row = &inspector.current_rows().unwrap()[indices[inspector.selected_index]];
             assert_eq!(row.identity(), selected);
             assert_eq!(row.label(), "Same renamed");
+        });
+    }
+
+    #[gpui::test]
+    fn consumer_theme_is_offered_after_the_builtins(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mission = crate::theme::Theme {
+                name: "Mission".into(),
+                ..crate::theme::DARK.clone()
+            };
+            crate::theme::install_themes(cx, vec![mission], None);
+            let labels: Vec<String> = theme_rows(cx)
+                .iter()
+                .map(|row| row.label().to_owned())
+                .collect();
+            let builtins = crate::theme::builtin_themes();
+            assert_eq!(labels.len(), builtins.len() + 1);
+            assert_eq!(labels[0], "Dark");
+            assert_eq!(labels.last().unwrap(), "Mission");
         });
     }
 }
