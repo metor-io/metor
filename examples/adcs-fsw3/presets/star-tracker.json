@@ -1,0 +1,83 @@
+{
+  "version": 5,
+  "global_time_range": "",
+  "root": {
+    "Split": {
+      "axis": "Horizontal",
+      "flexes": [
+        1.2,
+        1.0
+      ],
+      "children": [
+        {
+          "Pane": {
+            "active_index": 0,
+            "tab_orientation": "Horizontal",
+            "hide_tab_bar": false,
+            "locked_size": null,
+            "items": [
+              {
+                "kind": "image_view",
+                "state": "{\"component\":\"sim.star_sim.star_image.pixels\",\"display\":null,\"view\":\"fit\",\"roi\":null,\"histogram\":true,\"crosshair\":false,\"overlays\":[{\"u\":\"sim.star_sim.star_truth.u\",\"v\":\"sim.star_sim.star_truth.v\",\"count\":\"sim.star_sim.star_truth.count\",\"size\":\"sim.star_sim.star_truth.mag\",\"size_kind\":\"magnitude\",\"cat_id\":\"sim.star_sim.star_truth.cat_id\",\"color\":\"truth\"}]}"
+              }
+            ]
+          }
+        },
+        {
+          "Split": {
+            "axis": "Vertical",
+            "flexes": [
+              1.0,
+              1.0,
+              1.0
+            ],
+            "children": [
+              {
+                "Pane": {
+                  "active_index": 0,
+                  "tab_orientation": "Horizontal",
+                  "hide_tab_bar": false,
+                  "locked_size": null,
+                  "items": [
+                    {
+                      "kind": "time_series_plot",
+                      "state": "{\"label\":\"Attitude: nav estimate vs truth (body←ECI)\",\"traces\":[{\"component_id\":2215713418365692979,\"element_index\":0,\"color\":\"#ff7c1fff\",\"style\":\"Line\",\"visible\":true,\"label\":\"truth q0\",\"stroke_width\":3.0,\"axis_index\":0},{\"component_id\":8863528558403489050,\"element_index\":0,\"color\":\"#4aa0e0ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"est q0\",\"stroke_width\":1.5,\"axis_index\":0},{\"component_id\":2215713418365692979,\"element_index\":1,\"color\":\"#40b060ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"truth q1\",\"stroke_width\":3.0,\"axis_index\":0},{\"component_id\":8863528558403489050,\"element_index\":1,\"color\":\"#e04040ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"est q1\",\"stroke_width\":1.5,\"axis_index\":0},{\"component_id\":2215713418365692979,\"element_index\":2,\"color\":\"#b070e0ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"truth q2\",\"stroke_width\":3.0,\"axis_index\":0},{\"component_id\":8863528558403489050,\"element_index\":2,\"color\":\"#40c0b0ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"est q2\",\"stroke_width\":1.5,\"axis_index\":0},{\"component_id\":2215713418365692979,\"element_index\":3,\"color\":\"#e0c030ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"truth q3\",\"stroke_width\":3.0,\"axis_index\":0},{\"component_id\":8863528558403489050,\"element_index\":3,\"color\":\"#e070a0ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"est q3\",\"stroke_width\":1.5,\"axis_index\":0}],\"custom_title\":{\"Custom\":\"Attitude: nav estimate vs truth (body←ECI)\"},\"x_range\":\"\",\"axes\":[{\"label\":\"Y\",\"y_min_override\":\"Auto\",\"y_max_override\":\"Auto\",\"color\":\"Auto\"}],\"x_time_format\":\"Relative\",\"cursors\":[],\"measurement_panel\":\"Track\",\"hide_alarm_limits\":false,\"hide_alarm_color\":false,\"event_overlays\":[]}"
+                    }
+                  ]
+                }
+              },
+              {
+                "Pane": {
+                  "active_index": 0,
+                  "tab_orientation": "Horizontal",
+                  "hide_tab_bar": false,
+                  "locked_size": null,
+                  "items": [
+                    {
+                      "kind": "time_series_plot",
+                      "state": "{\"label\":\"Star tracker\",\"traces\":[{\"component_id\":279275944573392097,\"element_index\":0,\"color\":\"#ff7c1fff\",\"style\":\"Line\",\"visible\":true,\"label\":\"n_matched\",\"stroke_width\":1.5,\"axis_index\":0},{\"component_id\":2461368642535868532,\"element_index\":0,\"color\":\"#4aa0e0ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"n_centroids\",\"stroke_width\":1.5,\"axis_index\":0},{\"component_id\":7324150069979104348,\"element_index\":0,\"color\":\"#40b060ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"rendered detectable\",\"stroke_width\":1.5,\"axis_index\":0}],\"custom_title\":{\"Custom\":\"Star tracker\"},\"x_range\":\"\",\"axes\":[{\"label\":\"Y\",\"y_min_override\":\"Auto\",\"y_max_override\":\"Auto\",\"color\":\"Auto\"}],\"x_time_format\":\"Relative\",\"cursors\":[],\"measurement_panel\":\"Track\",\"hide_alarm_limits\":false,\"hide_alarm_color\":false,\"event_overlays\":[]}"
+                    }
+                  ]
+                }
+              },
+              {
+                "Pane": {
+                  "active_index": 0,
+                  "tab_orientation": "Horizontal",
+                  "hide_tab_bar": false,
+                  "locked_size": null,
+                  "items": [
+                    {
+                      "kind": "time_series_plot",
+                      "state": "{\"label\":\"Nav stats\",\"traces\":[{\"component_id\":3972128051059934745,\"element_index\":0,\"color\":\"#ff7c1fff\",\"style\":\"Line\",\"visible\":true,\"label\":\"stars_used\",\"stroke_width\":1.5,\"axis_index\":0},{\"component_id\":8053294740637046461,\"element_index\":0,\"color\":\"#4aa0e0ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"stars_gated\",\"stroke_width\":1.5,\"axis_index\":0},{\"component_id\":5719954757494377595,\"element_index\":0,\"color\":\"#40b060ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"prior_resets\",\"stroke_width\":1.5,\"axis_index\":0},{\"component_id\":3185208669165965208,\"element_index\":0,\"color\":\"#e04040ff\",\"style\":\"Line\",\"visible\":true,\"label\":\"contradictions\",\"stroke_width\":1.5,\"axis_index\":0}],\"custom_title\":{\"Custom\":\"Nav stats\"},\"x_range\":\"\",\"axes\":[{\"label\":\"Y\",\"y_min_override\":\"Auto\",\"y_max_override\":\"Auto\",\"color\":\"Auto\"}],\"x_time_format\":\"Relative\",\"cursors\":[],\"measurement_panel\":\"Track\",\"hide_alarm_limits\":false,\"hide_alarm_color\":false,\"event_overlays\":[]}"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

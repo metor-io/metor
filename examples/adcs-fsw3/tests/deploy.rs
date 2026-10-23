@@ -10,9 +10,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-use metor_proto::types::Msg;
+use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_stellar::Client;
-use metor_proto_wkt::{DumpMetadata, GetDbInfo, SequenceCommand};
+use metor_proto_wkt::{DumpMetadata, GetDbInfo, GetTimeSeries, SequenceCommand};
 
 /// How long the test waits for the deployment.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -24,7 +24,11 @@ const CYCLES: &str = "200000";
 const PORTS_ENV: &str = "METOR_DEPLOY_PORTS";
 
 fn target() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("target.py")
+    example("target.py")
+}
+
+fn example(file: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(file)
 }
 
 /// Returns a command for the `metor` binary, building it on first use. The
@@ -85,9 +89,13 @@ impl Drop for Running {
 }
 
 fn run(ports: &[u16; 3]) -> Running {
+    run_file(target(), ports)
+}
+
+fn run_file(file: PathBuf, ports: &[u16; 3]) -> Running {
     let child = metor()
         .arg("run")
-        .arg(target())
+        .arg(file)
         .args(["--cycles", CYCLES])
         .env(PORTS_ENV, format!("{},{},{}", ports[0], ports[1], ports[2]))
         .stdout(Stdio::null())
@@ -145,4 +153,88 @@ async fn test_gateway_advertises_sequence_command() {
     let mut client = connect(SocketAddr::from(([127, 0, 0, 1], ports[2]))).await;
     let info = client.request(&GetDbInfo).await.expect("the db answers");
     assert_eq!(info.command_ids, vec![<SequenceCommand as Msg>::ID]);
+}
+
+/// Every component `presets/star-tracker.json` binds, read out of the layout:
+/// the image view's image and overlay fields by name, the plots' traces by id.
+fn preset_components() -> Vec<ComponentId> {
+    fn walk(node: &serde_json::Value, out: &mut Vec<ComponentId>) {
+        if let Some(children) = node.pointer("/Split/children").and_then(|c| c.as_array()) {
+            children.iter().for_each(|child| walk(child, out));
+        }
+        for item in node
+            .pointer("/Pane/items")
+            .and_then(|i| i.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let state: serde_json::Value =
+                serde_json::from_str(item["state"].as_str().unwrap()).unwrap();
+            match item["kind"].as_str().unwrap() {
+                "image_view" => {
+                    out.push(ComponentId::new(state["component"].as_str().unwrap()));
+                    for overlay in state["overlays"].as_array().unwrap() {
+                        for field in ["u", "v", "count", "size", "cat_id"] {
+                            out.push(ComponentId::new(overlay[field].as_str().unwrap()));
+                        }
+                    }
+                }
+                "time_series_plot" => {
+                    for trace in state["traces"].as_array().unwrap() {
+                        out.push(ComponentId(trace["component_id"].as_u64().unwrap()));
+                    }
+                }
+                kind => panic!("unexpected pane {kind}"),
+            }
+        }
+    }
+    let preset = std::fs::read_to_string(example("presets/star-tracker.json")).unwrap();
+    let layout: serde_json::Value = serde_json::from_str(&preset).unwrap();
+    let mut out = Vec::new();
+    walk(&layout["root"], &mut out);
+    out
+}
+
+/// `sim.py`'s db records every component the star-tracker preset binds, and
+/// star images reach it.
+#[stellarator::test]
+async fn test_sim_records_star_tracker_preset() {
+    let wanted = preset_components();
+    assert!(wanted.len() > 10, "the preset binds {wanted:?}");
+    let ports = free_ports();
+    let _running = run_file(example("sim.py"), &ports);
+    let mut client = connect(SocketAddr::from(([127, 0, 0, 1], ports[2]))).await;
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let dump = client.request(&DumpMetadata).await.expect("the db answers");
+        let ids: Vec<ComponentId> = dump
+            .component_metadata
+            .iter()
+            .map(|metadata| metadata.component_id)
+            .collect();
+        let missing: Vec<_> = wanted.iter().filter(|id| !ids.contains(id)).collect();
+        if missing.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never announced {missing:?}");
+        stellarator::sleep(Duration::from_millis(100)).await;
+    }
+
+    let query = GetTimeSeries {
+        id: [0, 1],
+        range: Timestamp(i64::MIN)..Timestamp(i64::MAX),
+        component_id: ComponentId::new("sim.star_sim.star_image.pixels"),
+        limit: Some(2),
+    };
+    loop {
+        if let Ok(series) = client.request(&query).await
+            && series.timestamps().is_ok_and(|t| t.len() == 2)
+        {
+            assert_eq!(series.data().unwrap().len(), 2 * 1024 * 1024 * 2);
+            return;
+        }
+        assert!(Instant::now() < deadline, "no star images recorded");
+        stellarator::sleep(Duration::from_millis(100)).await;
+    }
 }

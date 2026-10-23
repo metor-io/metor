@@ -7,6 +7,7 @@ the plant's true attitude. The receiver logs the plant's true orbit state. A db
 records everything and serves it on 2250."""
 
 import math
+import os
 
 from adcs_pack import (
     Ctrl,
@@ -21,6 +22,10 @@ from adcs_pack import (
 )
 from metor_config import Db, Listen, Publish, SimUart, Target
 from startracker_sim_pack import StarSim
+
+# `METOR_DEPLOY_PORTS` (as in target.py) moves the publisher and the db; the
+# middle port is unused here.
+p_pub, _, p_db = os.environ.get("METOR_DEPLOY_PORTS", "2240,2241,2250").split(",")
 
 fsw = Target(cycle_rate=120.0, namespace="sim")
 
@@ -106,7 +111,7 @@ torque.connect(ctrl.torque_cmd)
 mtq.connect(ctrl.mtq_cmd)
 
 # `conn_cap` fits a 2 MiB star image.
-fsw.add("pub", Publish(transport=Listen("[::]:2240"), all=True, conn_cap=4 << 20))
+fsw.add("pub", Publish(transport=Listen(f"[::]:{p_pub}"), all=True, conn_cap=4 << 20))
 # Records the whole loop, GPS included, for a panel on 2250, as target.py's
 # gateway does.
-fsw.add("db", Db(listen="0.0.0.0:2250", all=True), thread="db")
+fsw.add("db", Db(listen=f"0.0.0.0:{p_db}", all=True), thread="db")
