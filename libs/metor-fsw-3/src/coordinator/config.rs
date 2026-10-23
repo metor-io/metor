@@ -23,6 +23,10 @@ use crate::system::PortDef;
 // PANIC Safety: evaluated at compile time.
 pub const DEFAULT_RING_DEPTH: NonZeroUsize = NonZeroUsize::new(8).expect("nonzero");
 
+/// The default [`CoordinatorConfig::ring_bytes`].
+// PANIC Safety: evaluated at compile time.
+pub const DEFAULT_RING_BYTES: NonZeroUsize = NonZeroUsize::new(8 << 20).expect("nonzero");
+
 /// The configuration for a coordinator, whose systems are `S` and whose
 /// resources are `R`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -32,6 +36,10 @@ pub struct CoordinatorConfig<S = SystemConfig, R = Backing> {
     pub clock: Clock,
     /// How many records a ring holds per unit of its port's declared depth.
     pub ring_depth: NonZeroUsize,
+    /// The bytes of records a ring holds at most. A ring always holds at least
+    /// two records.
+    #[serde(default = "default_ring_bytes")]
+    pub ring_bytes: NonZeroUsize,
     /// A prefix added to every name the coordinator announces.
     #[serde(default)]
     pub namespace: Option<String>,
@@ -63,6 +71,7 @@ impl<S, R> CoordinatorConfig<S, R> {
         Ok(CoordinatorConfig {
             clock: self.clock,
             ring_depth: self.ring_depth,
+            ring_bytes: self.ring_bytes,
             namespace: self.namespace,
             systems: self.systems.into_iter().map(f).collect::<Result<_, E>>()?,
             resources: resources.collect::<Result<_, E>>()?,
@@ -78,12 +87,17 @@ impl Default for CoordinatorConfig {
                 rate: WallRate(100.0),
             },
             ring_depth: DEFAULT_RING_DEPTH,
+            ring_bytes: DEFAULT_RING_BYTES,
             namespace: None,
             systems: Vec::new(),
             resources: IndexMap::new(),
             seed: 0,
         }
     }
+}
+
+fn default_ring_bytes() -> NonZeroUsize {
+    DEFAULT_RING_BYTES
 }
 
 /// Configures one system instance, whose config-defined outputs take their
@@ -540,6 +554,22 @@ mod tests {
         assert_eq!(config("18446744073709551615").ok(), Some(u64::MAX));
         assert!(config("-1").is_err());
         assert!(config("18446744073709551616").is_err());
+    }
+
+    #[test]
+    fn test_ring_bytes_defaults_and_rejects_zero() {
+        let config = |extra: &str| {
+            let text = format!(
+                r#"{{"clock":{{"Wall":{{"rate":1.0}}}},"ring_depth":8,"systems":[]{extra}}}"#
+            );
+            serde_json::from_str::<CoordinatorConfig>(&text).map(|config| config.ring_bytes)
+        };
+        assert_eq!(config("").ok(), Some(DEFAULT_RING_BYTES));
+        assert_eq!(
+            config(r#","ring_bytes":4096"#).ok(),
+            NonZeroUsize::new(4096)
+        );
+        assert!(config(r#","ring_bytes":0"#).is_err());
     }
 
     #[test]

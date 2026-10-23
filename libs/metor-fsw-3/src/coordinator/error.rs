@@ -64,6 +64,16 @@ pub enum BuildError {
         alignment: usize,
     },
 
+    #[error(
+        "output `{system}.{port}` writes {depth} records a cycle, more than {ring_bytes} `ring_bytes` holds"
+    )]
+    RingBytesTooSmall {
+        system: String,
+        port: String,
+        depth: usize,
+        ring_bytes: usize,
+    },
+
     #[error("output `{system}.{port}` needs a ring larger than this host can address")]
     RingTooLarge {
         system: String,

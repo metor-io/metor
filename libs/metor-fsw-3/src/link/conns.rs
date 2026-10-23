@@ -13,7 +13,7 @@ use crate::io::{
     Pending, RawAddr, RecvOp, SendOp, Slot, Stream, StreamOp, TimeoutOp,
 };
 
-use super::deframe::Deframer;
+use super::deframe::{Deframer, Oversized};
 use super::peer::ConnectionState;
 
 /// The ops `slots` connections have in flight at most: the stream op, a
@@ -28,9 +28,10 @@ pub(crate) const fn ops_for(slots: usize) -> usize {
 pub(crate) struct ConnsConfig {
     /// The most connections open at once. A dialing link has one.
     pub(crate) slots: usize,
-    /// The bytes of each connection's receive buffer and of each of its two
-    /// send buffers.
-    pub(crate) conn_cap: usize,
+    /// The bytes of each connection's receive buffer.
+    pub(crate) rx_cap: usize,
+    /// The bytes of each of a connection's two send buffers.
+    pub(crate) tx_cap: usize,
     /// Whether the endpoint dials. A dialing link opens a stream only into a
     /// free slot, and checks each peer's announce.
     pub(crate) dialing: bool,
@@ -60,6 +61,11 @@ pub(crate) enum Event {
     /// A stream opened, from this peer when its address is known.
     Opened(Option<SocketAddr>),
     Closed,
+    /// A peer sent a packet of `len` bytes, past the receive buffer, and its
+    /// connection closed.
+    Oversized {
+        len: usize,
+    },
     /// A stream arrived with every slot taken, and was closed.
     Refused,
     /// The endpoint failed to listen or open a stream.
@@ -70,13 +76,34 @@ pub(crate) enum Event {
 /// became of the stream it reaped.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Turn {
+    /// The connections closed for any reason but an oversized packet.
     closed: usize,
+    /// The connections closed for an oversized packet.
+    oversized: usize,
+    /// The largest of those packets' bytes.
+    oversized_len: usize,
     stream: Option<Event>,
 }
 
 impl Turn {
+    /// The pass's events: a close each, then the stream's. Each oversized
+    /// close reports the largest packet of the pass.
     pub(crate) fn events(self) -> impl Iterator<Item = Event> {
-        core::iter::repeat_n(Event::Closed, self.closed).chain(self.stream)
+        let oversized = Event::Oversized {
+            len: self.oversized_len,
+        };
+        core::iter::repeat_n(Event::Closed, self.closed)
+            .chain(core::iter::repeat_n(oversized, self.oversized))
+            .chain(self.stream)
+    }
+
+    fn oversized(&mut self, len: usize) {
+        self.oversized += 1;
+        self.oversized_len = self.oversized_len.max(len);
+    }
+
+    fn any_closed(&self) -> bool {
+        self.closed + self.oversized > 0
     }
 }
 
@@ -147,9 +174,9 @@ impl ConnsMem {
     /// # Errors
     /// Fails if the buffers do not fit the arena.
     pub(crate) fn make(init: &mut IoInit<'_>, config: ConnsConfig) -> Result<Self, MakeError> {
-        let cap = config.conn_cap;
+        let (rx, tx) = (config.rx_cap, config.tx_cap);
         let slots = (0..config.slot_count())
-            .map(|_| Ok([init.alloc(cap)?, init.alloc(cap)?, init.alloc(cap)?]))
+            .map(|_| Ok([init.alloc(rx)?, init.alloc(tx)?, init.alloc(tx)?]))
             .collect::<Result<_, MakeError>>()?;
         Ok(Self {
             config,
@@ -165,7 +192,7 @@ impl Conns {
     /// `tables` tables.
     ///
     /// # Errors
-    /// Fails if `seed` does not fit `conn_cap`, or `ep`'s budget is short of
+    /// Fails if `seed` does not fit a send buffer, or `ep`'s budget is short of
     /// [`ops_for`] the slots.
     pub(crate) fn new(
         mem: ConnsMem,
@@ -182,9 +209,9 @@ impl Conns {
         if needed > budget {
             return Err(MakeError::IoOps { needed, budget });
         }
-        if seed.len() > config.conn_cap {
-            let (seed, conn_cap) = (seed.len(), config.conn_cap);
-            return Err(MakeError::SeedTooLarge { seed, conn_cap });
+        if seed.len() > config.tx_cap {
+            let (seed, send_cap) = (seed.len(), config.tx_cap);
+            return Err(MakeError::SeedTooLarge { seed, send_cap });
         }
         Ok(Self {
             ep: ep.clone(),
@@ -207,17 +234,21 @@ impl Conns {
     /// to `on_body`.
     pub(crate) fn poll(&mut self, mut on_body: impl FnMut(&mut ConnectionState, &[u8])) -> Turn {
         let (ep, after) = (&self.ep, self.config.write_timeout);
-        let mut closed = 0;
+        let mut turn = Turn::default();
         for conn in &mut self.slots {
-            closed += usize::from(conn.poll(ep, after, &mut self.bytes_out, &mut on_body));
+            match conn.poll(ep, after, &mut self.bytes_out, &mut on_body) {
+                Some(Event::Oversized { len }) => turn.oversized(len),
+                Some(_) => turn.closed += 1,
+                None => {}
+            }
         }
-        if closed > 0 && self.config.dialing {
+        if turn.any_closed() && self.config.dialing {
             self.pause.start();
         }
-        let stream = self.take_stream().or_else(|| self.step_listener());
+        turn.stream = self.take_stream().or_else(|| self.step_listener());
         step(&mut self.refused);
         self.ask_stream();
-        Turn { closed, stream }
+        turn
     }
 
     /// Appends `batch` to every open connection's send buffer and starts
@@ -232,6 +263,11 @@ impl Conns {
             conn.tx.filling.extend(batch);
             conn.send(ep, after);
         }
+    }
+
+    /// The bytes of each connection's receive buffer.
+    pub(crate) fn rx_cap(&self) -> usize {
+        self.config.rx_cap
     }
 
     pub(crate) fn stats(&self) -> Stats {
@@ -371,56 +407,58 @@ impl Conn {
         self.open = true;
     }
 
-    /// One pass over the slot. True if the connection closed in it.
+    /// One pass over the slot. The event that closed the connection, if it
+    /// closed in it.
     fn poll(
         &mut self,
         ep: &Cap<Endpoint>,
         after: Duration,
         bytes_out: &mut u64,
         on_body: &mut impl FnMut(&mut ConnectionState, &[u8]),
-    ) -> bool {
+    ) -> Option<Event> {
         if !self.open {
             self.drain();
-            return false;
+            return None;
         }
-        let hung_up = self.recv(on_body);
+        let received = self.recv(on_body);
         let sent = self.tx.reap(bytes_out);
         let stuck = self.tx.stuck(sent == Some(true));
-        if hung_up || stuck || sent == Some(false) {
-            self.close();
-            return true;
+        let closed = match received {
+            Err(event) => Some(event),
+            Ok(()) => (stuck || sent == Some(false)).then_some(Event::Closed),
+        };
+        match closed {
+            Some(_) => self.close(),
+            None => self.send(ep, after),
         }
-        self.send(ep, after);
-        false
+        closed
     }
 
-    /// Reaps the recv and asks for more. True if the peer hung up, failed,
-    /// or sent a body past the buffer.
-    fn recv(&mut self, on_body: &mut impl FnMut(&mut ConnectionState, &[u8])) -> bool {
+    /// Reaps the recv and asks for more. The closing event if the peer hung
+    /// up, failed, or sent a body past the buffer.
+    fn recv(&mut self, on_body: &mut impl FnMut(&mut ConnectionState, &[u8])) -> Result<(), Event> {
         if let Some(pending) = &mut self.rx {
             let Some((result, tail)) = pending.poll() else {
-                return false;
+                return Ok(());
             };
             self.rx = None;
             let back = self.deframe.filled(tail).is_ok();
             match result {
                 Ok(1..) if back => {
                     while let Some(body) = self.deframe.next() {
-                        let Ok(body) = body else {
-                            return true;
-                        };
+                        let body = body.map_err(|Oversized { len }| Event::Oversized { len })?;
                         on_body(&mut self.state, body);
                     }
                 }
                 Err(IoError::QueueFull) if back => {}
-                _ => return true,
+                _ => return Err(Event::Closed),
             }
         }
         let (Some(stream), Some(tail)) = (&self.stream, self.deframe.spare()) else {
-            return true;
+            return Err(Event::Closed);
         };
         self.rx = Some(stream.recv(tail));
-        false
+        Ok(())
     }
 
     /// Starts a send of what is waiting, and the write timer over it.

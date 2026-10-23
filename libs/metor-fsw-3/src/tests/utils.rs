@@ -64,6 +64,43 @@ pub struct Imu {
     pub sample: f64,
 }
 
+/// The pixel bytes of an [`Image`].
+pub const IMAGE_LEN: usize = 2 << 20;
+
+/// A 2 MiB frame, standing in for a camera image.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "image")]
+#[repr(C)]
+pub struct Image {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub pixels: crate::FrameBytes<IMAGE_LEN>,
+}
+
+/// Heap storage for one [`Image`], so no image sits on the stack.
+pub struct ImageBuf(Vec<u64>);
+
+impl Default for ImageBuf {
+    fn default() -> Self {
+        Self(vec![0; size_of::<Image>().div_ceil(8)])
+    }
+}
+
+impl ImageBuf {
+    /// Stamps the image with `tick` and returns it.
+    ///
+    /// The tick is the timestamp, and the first and last pixel bytes are its
+    /// low byte.
+    pub fn stamped(&mut self, tick: i64) -> &Image {
+        // PANIC Safety: the buffer is `Image`'s size and 8-byte aligned.
+        let image = Image::mut_from_bytes(self.0.as_mut_bytes()).expect("an image");
+        image.timestamp = Timestamp(tick);
+        image.pixels.0[0] = tick as u8;
+        image.pixels.0[IMAGE_LEN - 1] = tick as u8;
+        image
+    }
+}
+
 /// Another frame named `imu`, sampling two floats where [`Imu`] samples one
 /// double: the same bytes under a different layout.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]

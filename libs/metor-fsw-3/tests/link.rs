@@ -14,10 +14,12 @@ use common::{
 };
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::coordinator::{
-    CoordinatorConfig, InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig, SystemTable,
+    BuildError, CoordinatorConfig, InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig,
+    SystemTable,
 };
 use metor_fsw_3::{
-    Clock, DefCx, Frame, Input, LinkStatus, Output, ResourceStatus, Timestamp, WallRate, system,
+    Clock, DefCx, DefError, Frame, FrameBytes, Input, LinkStatus, Output, ResourceStatus,
+    Timestamp, WallRate, system,
 };
 use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::PacketStream;
@@ -45,6 +47,58 @@ fn wide_source(now: Timestamp, wide: &mut Output<Wide>) {
         timestamp: now,
         samples: [1.0; 256],
     });
+}
+
+/// The pixel bytes of a [`Big`] frame.
+const BIG_LEN: usize = 2 << 20;
+
+/// A 2 MiB frame, standing in for an image.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "big")]
+#[repr(C)]
+struct Big {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    pixels: FrameBytes<BIG_LEN>,
+}
+
+impl Big {
+    /// The frame's count, if the whole body is as [`big_source`] wrote it.
+    fn count(&self) -> Option<u32> {
+        let pixels = &self.pixels.0;
+        let count = u32::from_le_bytes(*pixels.first_chunk()?);
+        let zeroes = pixels[4..BIG_LEN - 1].iter().all(|b| *b == 0);
+        (zeroes && pixels[BIG_LEN - 1] == !(count as u8)).then_some(count)
+    }
+}
+
+/// Heap storage for one frame, and the frames written so far.
+struct BigSource(Vec<u64>, u32);
+
+/// Publishes one frame per cycle, counting up.
+#[system]
+fn big_source(#[state] s: &mut BigSource, now: Timestamp, big: &mut Output<Big>) {
+    let Ok(frame) = Big::mut_from_bytes(s.0.as_mut_bytes()) else {
+        return;
+    };
+    s.1 += 1;
+    frame.timestamp = now;
+    frame.pixels.0[..4].copy_from_slice(&s.1.to_le_bytes());
+    frame.pixels.0[BIG_LEN - 1] = !(s.1 as u8);
+    let _ = big.write(frame);
+}
+
+/// Records the count of every frame it receives with the pings, or
+/// `u32::MAX` for a corrupt one.
+struct BigSink(Arc<Mutex<Vec<u32>>>);
+
+#[system]
+fn big_sink(#[state] s: &mut BigSink, big: &mut Input<Big>) {
+    for big in big.drain().flatten() {
+        // PANIC Safety: no test holds this lock across a panic.
+        let mut counts = s.0.lock().expect("an unpoisoned sink");
+        counts.push(big.count().unwrap_or(u32::MAX));
+    }
 }
 
 /// Records every status its link writes.
@@ -192,6 +246,15 @@ fn table(seen: &Seen) -> SystemTable {
     let samples = seen.pings.clone();
     table
         .register("imu_sink", imu_sink(), move || ImuSink(samples.clone()))
+        .expect("valid records");
+    table
+        .register("big_source", big_source(), || {
+            BigSource(vec![0; size_of::<Big>().div_ceil(8)], 0)
+        })
+        .expect("valid records");
+    let counts = seen.pings.clone();
+    table
+        .register("big_sink", big_sink(), move || BigSink(counts.clone()))
         .expect("valid records");
     let faults = seen.faults.clone();
     table
@@ -882,6 +945,163 @@ async fn test_oversized_packet_closes_connection() {
     written.expect("the link takes the prefix");
     until_seen("the link kept a connection it cannot serve", &seen, || {
         seen.status().is_some_and(|s| s.connections == 0)
+    })
+    .await;
+    assert!(seen.faulted("oversized_packet"));
+}
+
+/// A `Publish` named `link` on `transport` that serves `big.big`.
+fn big_publish(link: &str, transport: serde_json::Value, conn_cap: usize) -> SystemConfig {
+    SystemConfig {
+        params: json!({
+            "transport": transport,
+            "namespace": "cube_sat",
+            "link": link,
+            "conn_cap": conn_cap,
+        }),
+        ..reading("pub", "fsw.publish", "big.big", PortRef::new("big", "big"))
+    }
+}
+
+/// A `Subscribe` that dials `addr` and writes the published `big.big` frames
+/// to its `big` output.
+fn big_mirror(addr: SocketAddr, conn_cap: usize) -> SystemConfig {
+    let cx = DefCx {
+        id: "big",
+        namespace: Some("cube_sat"),
+        ..DefCx::empty()
+    };
+    let def = metor_fsw_3::PortDef {
+        name: "big".into(),
+        ..Output::<Big>::def(&cx, "big")
+    };
+    SystemConfig {
+        params: json!({
+            "transport": { "connect": { "addr": addr.to_string() } },
+            "link": "big-mirror",
+            "conn_cap": conn_cap,
+        }),
+        outputs: vec![OutputConfig {
+            port: "big".into(),
+            source: OutputSource::Def(def),
+        }],
+        ..SystemConfig::new("cmds", "fsw.subscribe")
+    }
+}
+
+/// The smallest `conn_cap` that carries a [`Big`] frame.
+const BIG_CAP: usize = size_of::<Big>() + 8;
+
+/// A `Publish` whose `conn_cap` just fits a 2 MiB frame serves it to a raw
+/// client, and a dialing `Subscribe` with 4 MiB mirrors it.
+#[stellarator::test]
+async fn test_large_frames_cross_a_link() {
+    let (server, client) = (Seen::default(), Seen::default());
+    let systems = vec![
+        SystemConfig::new("big", "big_source"),
+        big_publish("pub-big", listen_any("pub-big"), BIG_CAP),
+    ];
+    let _server = spawn(systems, &server, 30.0);
+    let addr = bound("pub-big");
+
+    let Fsw { mut rx, buf, .. } = dial_fsw(addr).await;
+    let (mut buf, mut counts) = (buf, Vec::new());
+    while counts.len() < 3 {
+        if let OwnedPacket::Table(t) = next(&mut rx, &mut buf).await {
+            let big = Big::ref_from_bytes(&t.buf).expect("a whole frame");
+            counts.push(big.count().expect("intact corners"));
+        }
+    }
+    // A connection holds one frame in each send buffer, so a slow reader
+    // misses some.
+    assert!(counts.windows(2).all(|w| w[1] > w[0]), "{counts:?}");
+
+    let systems = vec![
+        big_mirror(addr, 4 << 20),
+        reading("sink", "big_sink", "big", PortRef::new("cmds", "big")),
+        reading("faults", "log_sink", "log", PortRef::new("cmds", "log")),
+    ];
+    let _client = spawn(systems, &client, 30.0);
+    until_seen("the mirror never received a frame", &client, || {
+        client.pings().len() >= 3
+    })
+    .await;
+    let counts = client.pings();
+    assert!(
+        !counts.contains(&u32::MAX),
+        "a frame arrived damaged: {counts:?}"
+    );
+    assert!(counts.windows(2).all(|w| w[1] > w[0]), "{counts:?}");
+}
+
+/// Builds `systems` behind a `big` source, without running them.
+fn build_big(system: SystemConfig) -> Result<(), BuildError> {
+    let mut config = CoordinatorConfig {
+        systems: vec![SystemConfig::new("big", "big_source"), system],
+        ..Default::default()
+    };
+    lower_links(&mut config);
+    config.build(&table(&Seen::default())).map(drop)
+}
+
+#[test]
+fn test_port_past_conn_cap_fails_the_build() {
+    let short = BIG_CAP - 1;
+    let addr = free_port();
+    let links = [
+        (
+            big_publish("pub-short", listen_any("pub-short"), short),
+            "big.big",
+        ),
+        (big_mirror(addr, short), "big"),
+    ];
+    for (link, port) in links {
+        let error = build_big(link).err();
+        let Some(BuildError::Def { id, source }) = error else {
+            panic!("{port}: {error:?}");
+        };
+        assert_eq!(id, if port == "big" { "cmds" } else { "pub" });
+        let refused = DefError::PortExceedsConnCap {
+            port: port.into(),
+            max_len: size_of::<Big>(),
+            conn_cap: short,
+        };
+        assert_eq!(source, refused);
+    }
+}
+
+#[test]
+fn test_publish_without_inputs_builds_with_any_cap() {
+    let mut publish = big_publish("pub-bare", listen_any("pub-bare"), 1);
+    publish.inputs.clear();
+    assert!(build_big(publish).is_ok());
+}
+
+/// A subscriber closes a peer whose packet is past its receive buffer, and
+/// logs it.
+#[stellarator::test]
+async fn test_oversized_packet_is_logged() {
+    let seen = Seen::default();
+    let _target = spawn(
+        vec![
+            subscribe("cmds-oversized", listen_any("cmds-oversized")),
+            status_reader("cmds"),
+            reading("logs", "log_sink", "log", PortRef::new("cmds", "log")),
+        ],
+        &seen,
+        500.0,
+    );
+    let peer = raw_dial(bound("cmds-oversized")).await;
+    until_seen("the link never took the connection", &seen, || {
+        seen.status().is_some_and(|s| s.connections == 1)
+    })
+    .await;
+    let mut packet = ((2u32 << 20) - 4).to_le_bytes().to_vec();
+    packet.resize(2 << 20, 0);
+    let (written, _) = peer.write_all(packet).await;
+    written.expect("the link takes what fits");
+    until_seen("the link never logged the packet", &seen, || {
+        seen.faulted("oversized_packet") && seen.status().is_some_and(|s| s.connections == 0)
     })
     .await;
 }

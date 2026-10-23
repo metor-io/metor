@@ -1,0 +1,28 @@
+error[E0080]: evaluation panicked: Mono16 bits must be in 1..=16
+ --> $RUST/core/src/panic.rs
+  |
+  |         $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `<metor_fsw_3::Mono16<17> as metor_fsw_3::Pixel>::BITS` failed here
+  |
+ ::: $WORKSPACE/libs/metor-component/src/image.rs
+  |
+  |         assert!(1 <= B && B <= 16, "Mono16 bits must be in 1..=16");
+  |         ----------------------------------------------------------- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/libs/metor-component/src/image.rs
+  |
+  |             && P::BITS as usize <= 8 * size_of::<P::Sample>(),
+  |                ^^^^^^^
+
+note: erroneous constant encountered
+ --> $WORKSPACE/libs/metor-component/src/image.rs
+  |
+  |         let () = Self::LAYOUT;
+  |                  ^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn <FrameImage<metor_fsw_3::Mono16<17>, 4, 4> as AsVTable>::vtable_fields::<()>`
+ --> $WORKSPACE/libs/metor-component/src/vtable.rs
+  |
+  |         vtable(Self::vtable_fields(()))
+  |                ^^^^^^^^^^^^^^^^^^^^^^^

@@ -6,9 +6,9 @@ mod gps;
 use std::cell::RefCell;
 
 use metor_fsw_3::ring::Notifier;
-use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use metor_fsw_3::zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
-    BindCx, DefCx, DefError, DynInputs, Frame, Input, InputBinding, MakeError, Output,
+    BindCx, DefCx, DefError, DynInputs, Frame, FrameBytes, Input, InputBinding, MakeError, Output,
     OutputBinding, Payload, PortDef, Ports, Record, Seq, SeqError, Stop, System, SystemDef,
     SystemTable, Timestamp, sequence, system,
 };
@@ -32,6 +32,51 @@ pub struct Sample {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     pub value: f64,
+}
+
+/// The pixel bytes of an [`Image`].
+pub const IMAGE_LEN: usize = 2 << 20;
+
+/// A 2 MiB frame, so tests can move images through a guest.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "image")]
+#[repr(C)]
+pub struct Image {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub pixels: FrameBytes<IMAGE_LEN>,
+}
+
+/// Pings the first and last pixel bytes of the newest image, as
+/// `first << 8 | last`.
+#[system]
+fn viewer(image: &mut Input<Image>, output: &mut Output<Ping>) {
+    if let Ok(Some(image)) = image.latest() {
+        let (first, last) = (image.pixels.0[0], image.pixels.0[IMAGE_LEN - 1]);
+        let n = u32::from(first) << 8 | u32::from(last);
+        let _ = output.write(&Ping { n });
+    }
+}
+
+/// An image on the heap, rewritten each cycle.
+pub struct Camera(Box<Image>);
+
+impl Camera {
+    fn new(_io: &mut metor_fsw_3::io::IoInit) -> Result<Self, MakeError> {
+        let image = Image::new_box_zeroed()
+            .map_err(|_| MakeError::Pack("could not allocate an image".into()))?;
+        Ok(Self(image))
+    }
+}
+
+/// Writes one image per cycle. Its first pixel byte is the low byte of the
+/// cycle's time, and its last is that byte inverted.
+#[system]
+fn camera(#[state] s: &mut Camera, now: Timestamp, image: &mut Output<Image>) {
+    s.0.timestamp = now;
+    s.0.pixels.0[0] = now.0 as u8;
+    s.0.pixels.0[IMAGE_LEN - 1] = !(now.0 as u8);
+    let _ = image.write(&s.0);
 }
 
 /// Writes one sample per cycle, counting up.
@@ -310,6 +355,12 @@ pub fn pack() -> SystemTable {
         .expect("valid records");
     table
         .register("meter", meter(), Default::default)
+        .expect("valid records");
+    table
+        .register("viewer", viewer(), Default::default)
+        .expect("valid records");
+    table
+        .register("camera", camera(), Camera::new)
         .expect("valid records");
     table
         .register("echo", echo(), Default::default)

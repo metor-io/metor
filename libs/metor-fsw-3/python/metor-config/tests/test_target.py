@@ -105,6 +105,14 @@ class TargetTest(ConfigTest):
         self.assertEqual(Target(cycle_rate=1.0, seed=7).to_config()["coordinator"]["seed"], 7)
         self.assertNotIn("seed", Target(cycle_rate=1.0).to_config()["coordinator"])
 
+    def test_ring_bytes_is_emitted(self) -> None:
+        coordinator = Target(cycle_rate=1.0).to_config()["coordinator"]
+        self.assertEqual(coordinator["ring_bytes"], 8 << 20)
+        coordinator = Target(cycle_rate=1.0, ring_bytes=1).to_config()["coordinator"]
+        self.assertEqual(coordinator["ring_bytes"], 1)
+        with self.assertRaisesRegex(ConfigError, "ring_bytes"):
+            Target(cycle_rate=1.0, ring_bytes=0)
+
     def test_epoch_is_emitted_when_set(self) -> None:
         clock = Target(cycle_rate=1.0, sim_dt=0.01, epoch=0).to_config()["coordinator"]["clock"]
         self.assertEqual(clock["Simulated"]["epoch"], 0)
@@ -377,6 +385,17 @@ class LinkTest(ConfigTest):
             Subscribe([Plant], transport=Listen("0.0.0.0:1"))  # type: ignore[list-item]
         with self.assertRaisesRegex(ConfigError, "record classes"):
             Subscribe(["ping"], transport=Listen("0.0.0.0:1"))  # type: ignore[list-item]
+
+    def test_links_check_conn_cap(self) -> None:
+        listen = Listen("0.0.0.0:1")
+        for cap in (64 << 10, 4 << 20, (1 << 32) - 1):
+            Publish(transport=listen, conn_cap=cap)
+            Subscribe([Ping], transport=listen, conn_cap=cap)
+        for cap in (0, (64 << 10) - 1, 1 << 32):
+            with self.assertRaisesRegex(ConfigError, "conn_cap"):
+                Publish(transport=listen, conn_cap=cap)
+            with self.assertRaisesRegex(ConfigError, "conn_cap"):
+                Subscribe([Ping], transport=listen, conn_cap=cap)
 
     def test_subscribe_resolves_record_ports(self) -> None:
         fsw = Target(cycle_rate=100.0, namespace="cube_sat")

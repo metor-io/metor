@@ -12,10 +12,11 @@ use metor_fsw_3::coordinator::{BuildError, Coordinator, CoordinatorConfig, MakeE
 use metor_fsw_3::metor_proto_wkt::{
     LogEvent, SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
+use metor_fsw_3::wasm::{Limits, WasmPack};
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
-    Adapter, ChannelConfig, DefCx, DlPack, Frame, Input, InputConfig, Output, Pack, PortRef,
-    RunState, SystemConfig, SystemTable, Timestamp, system,
+    Adapter, ChannelConfig, DefCx, DlPack, Frame, FrameBytes, Input, InputConfig, Output, Pack,
+    PortRef, RunState, SystemConfig, SystemTable, Timestamp, system,
 };
 use serde_json::json;
 
@@ -99,6 +100,55 @@ struct Sample {
     #[frame(timestamp)]
     timestamp: Timestamp,
     value: f64,
+}
+
+/// The pixel bytes of an [`Image`].
+const IMAGE_LEN: usize = 2 << 20;
+
+/// The fixture pack's `Image` frame, declared again here.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "image")]
+#[repr(C)]
+struct Image {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    pixels: FrameBytes<IMAGE_LEN>,
+}
+
+/// An image's first and last pixel bytes, as the fixture's `viewer` pings
+/// them.
+fn corners(image: &Image) -> u32 {
+    u32::from(image.pixels.0[0]) << 8 | u32::from(image.pixels.0[IMAGE_LEN - 1])
+}
+
+/// The corners the cameras write at `now`.
+fn corners_at(now: i64) -> u32 {
+    u32::from(now as u8) << 8 | u32::from(!(now as u8))
+}
+
+/// Heap storage for one image, so no image sits on the stack.
+struct Camera(Vec<u64>);
+
+/// Writes one image per cycle, marked like the fixture's `camera`.
+#[system]
+fn camera(#[state] s: &mut Camera, now: Timestamp, image: &mut Output<Image>) {
+    let Ok(frame) = Image::mut_from_bytes(s.0.as_mut_bytes()) else {
+        return;
+    };
+    frame.timestamp = now;
+    frame.pixels.0[0] = now.0 as u8;
+    frame.pixels.0[IMAGE_LEN - 1] = !(now.0 as u8);
+    let _ = image.write(frame);
+}
+
+struct ImageView(Shared);
+
+/// Records the corners of the newest image as a ping.
+#[system]
+fn image_view(#[state] v: &mut ImageView, image: &mut Input<Image>) {
+    if let Ok(Some(image)) = image.latest() {
+        v.0.borrow_mut().pings.push(corners(&image));
+    }
 }
 
 /// What the host's test systems have seen, plus the commands still to send.
@@ -200,6 +250,15 @@ fn table(pack: &Arc<Pack>, seen: &Shared) -> SystemTable {
     let s = seen.clone();
     table
         .register("watch", watch(), move || Watch(s.clone()))
+        .expect("valid records");
+    table
+        .register("camera", camera(), || {
+            Camera(vec![0; size_of::<Image>().div_ceil(8)])
+        })
+        .expect("valid records");
+    let s = seen.clone();
+    table
+        .register("image_view", image_view(), move || ImageView(s.clone()))
         .expect("valid records");
     table
         .register_pack("echo", pack.clone())
@@ -475,4 +534,80 @@ fn sequence_completes_aborts_and_resets(pack: &Arc<Pack>) {
     assert_eq!(events, completed);
     assert_eq!(pings(&seen), [1, 2, 3]);
     assert_eq!(panicked(&coordinator).len(), 0);
+}
+
+/// A wasm pack whose guests have room for two 16 MiB copy rings.
+fn image_pack() -> Arc<Pack> {
+    let limits = Limits {
+        memory: Some(64 << 20),
+        fuel: None,
+    };
+    let pack = WasmPack::open(fixture_wasm(), &limits).expect("the module opens");
+    Arc::new(Pack::Wasm(pack))
+}
+
+#[test]
+fn test_guest_reads_large_frames() {
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("cam", "camera"),
+            SystemConfig {
+                inputs: vec![InputConfig::new("image", "cam", "image")],
+                ..SystemConfig::new("middle", "echo.viewer")
+            },
+            SystemConfig {
+                inputs: vec![
+                    InputConfig::new("pings", "middle", "output"),
+                    InputConfig::new("lines", "middle", "log"),
+                ],
+                ..SystemConfig::new("sink", "sink")
+            },
+        ],
+        ..Default::default()
+    };
+    let (mut coordinator, seen) = build(config, &image_pack());
+    let started = std::time::Instant::now();
+    for cycle in 1..=30 {
+        run(&mut coordinator, 1);
+        assert_eq!(pings(&seen), [corners_at(cycle)], "cycle {cycle}");
+    }
+    // Each cycle also writes the image once, so this bounds the copy.
+    eprintln!(
+        "a 2 MiB cycle through a guest: {:?}",
+        started.elapsed() / 30
+    );
+    assert_eq!(panicked(&coordinator).len(), 0);
+}
+
+#[test]
+fn test_guest_writes_large_frames() {
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("middle", "echo.camera"),
+            SystemConfig {
+                inputs: vec![InputConfig::new("image", "middle", "image")],
+                ..SystemConfig::new("view", "image_view")
+            },
+        ],
+        ..Default::default()
+    };
+    let (mut coordinator, seen) = build(config, &image_pack());
+    for cycle in 1..=30 {
+        run(&mut coordinator, 1);
+        assert_eq!(pings(&seen), [corners_at(cycle)], "cycle {cycle}");
+    }
+    assert_eq!(panicked(&coordinator).len(), 0);
+}
+
+/// The default 16 MiB guest has no room for a 16 MiB copy ring.
+#[test]
+fn test_large_copy_ring_needs_guest_memory() {
+    let config = CoordinatorConfig {
+        systems: vec![SystemConfig::new("middle", "echo.camera")],
+        ..Default::default()
+    };
+    let refused = config.build(&table(&wasm_pack(), &Shared::default()));
+    let refused = refused.err().map(|e| e.to_string()).unwrap_or_default();
+    let hint = "port `image` needs a 16777408-byte copy ring that the guest's memory cannot hold; raise the pack's `memory` limit";
+    assert!(refused.ends_with(hint), "{refused}");
 }

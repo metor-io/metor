@@ -95,10 +95,12 @@ class Target:
     Add systems with `add`. They run in the order they were added, once per
     cycle. With ``sim_dt`` (in seconds), the target runs on a simulated clock
     that advances that much each cycle. Without it, the target runs in real
-    time at ``cycle_rate`` Hz. ``namespace`` is prefixed to the names the
-    target announces to its peers. ``seed`` is the seed every `Rng` parameter
-    draws from. ``epoch`` fixes the start of a simulated clock, in
-    microseconds since the Unix epoch.
+    time at ``cycle_rate`` Hz. A ring holds ``ring_depth`` records per unit of
+    its port's depth, capped at ``ring_bytes`` bytes and never below two
+    records. ``namespace`` is prefixed to the names the target announces to
+    its peers. ``seed`` is the seed every `Rng` parameter draws from.
+    ``epoch`` fixes the start of a simulated clock, in microseconds since the
+    Unix epoch.
     """
 
     def __init__(
@@ -106,17 +108,21 @@ class Target:
         cycle_rate: float,
         sim_dt: float | None = None,
         ring_depth: int = 8,
+        ring_bytes: int = 8 << 20,
         namespace: str | None = None,
         seed: int = 0,
         epoch: int | None = None,
     ) -> None:
         if epoch is not None and sim_dt is None:
             raise ConfigError("`epoch` fixes a simulated clock's start, so it needs `sim_dt`")
+        if ring_bytes < 1:
+            raise ConfigError(f"`ring_bytes` is at least 1, got {ring_bytes}")
         self.epoch = epoch
         self.seed = seed
         self.cycle_rate = float(cycle_rate)
         self.sim_dt = sim_dt
         self.ring_depth = ring_depth
+        self.ring_bytes = ring_bytes
         self.namespace = namespace
         self._systems: list[_Entry] = []
         self._sims: list[_Entry] = []
@@ -272,6 +278,7 @@ class Target:
         coordinator: dict[str, Any] = {
             "clock": self._clock(),
             "ring_depth": self.ring_depth,
+            "ring_bytes": self.ring_bytes,
             "namespace": self.namespace,
             "systems": self._steps(),
         }

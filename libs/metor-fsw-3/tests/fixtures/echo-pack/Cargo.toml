@@ -15,7 +15,7 @@ metor-fsw-3 = { path = "../../..", default-features = false, features = ["thread
 futures-lite = "2"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
-zerocopy = { version = "0.8.2", features = ["derive"] }
+zerocopy = { version = "0.8.2", features = ["alloc", "derive"] }
 
 [lints]
 workspace = true

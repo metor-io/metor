@@ -44,7 +44,7 @@ use stellarator::{
 use time_series::TimeSeries;
 use tracing::{debug, info, trace, warn};
 use vtable_stream::handle_vtable_stream;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::IntoBytes;
 
 pub use error::Error;
 
@@ -82,6 +82,8 @@ pub struct DB {
     /// Earliest timestamp known to this instance. Moves backwards when
     /// older history is hydrated from a store.
     pub earliest_timestamp: AtomicCell<Timestamp>,
+    /// Samples dropped across every component because its WAL was full.
+    wal_dropped: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -110,6 +112,9 @@ pub struct State {
 
     udp_vtable_streams: HashSet<(SocketAddr, [u8; 2])>,
 
+    /// Shared with each component, which counts its WAL drops here too.
+    wal_dropped: Arc<AtomicU64>,
+
     pub db_config: DbConfig,
 }
 
@@ -131,6 +136,7 @@ impl DB {
             ..Default::default()
         };
         let db = DB {
+            wal_dropped: state.wal_dropped.clone(),
             state: RwLock::new(state),
             recording_cell: PlayingCell::new(true),
             path,
@@ -142,6 +148,11 @@ impl DB {
         };
         db.save_db_state()?;
         Ok(db)
+    }
+
+    /// Samples dropped across every component because its WAL was full.
+    pub fn wal_dropped(&self) -> u64 {
+        self.wal_dropped.load(atomic::Ordering::Relaxed)
     }
 
     pub fn with_state<O, F: FnOnce(&State) -> O>(&self, f: F) -> O {
@@ -194,6 +205,7 @@ impl DB {
         let mut msg_logs = HashMap::new();
         let mut last_updated = i64::MIN;
         let mut start_timestamp = i64::MAX;
+        let wal_dropped = Arc::<AtomicU64>::default();
 
         info!("Opening database: {}", path.display());
         for elem in std::fs::read_dir(&path)? {
@@ -221,7 +233,8 @@ impl DB {
             // drain mode so its `persist` never claims the writer that
             // `setup_levels` re-takes after restart.
             let engine_owned = lod::is_lod_name(&metadata.name);
-            let component = Component::open(&path, component_id, schema.clone(), engine_owned)?;
+            let component = Component::open(&path, component_id, schema.clone(), engine_owned)?
+                .sharing_wal_drops(&wal_dropped);
             if engine_owned {
                 component
                     .time_series
@@ -266,6 +279,7 @@ impl DB {
             components,
             component_metadata,
             msg_logs,
+            wal_dropped: wal_dropped.clone(),
             ..Default::default()
         };
         let earliest_timestamp = if start_timestamp == i64::MAX {
@@ -274,6 +288,7 @@ impl DB {
             Timestamp(start_timestamp)
         };
         Ok(DB {
+            wal_dropped,
             state: RwLock::new(state),
             path,
             vtable_gen: AtomicCell::new(0),
@@ -561,7 +576,8 @@ impl State {
             name: component_id.to_string(),
             metadata: Default::default(),
         };
-        let component = Component::create(db_path, component_id, schema, engine_owned)?;
+        let component = Component::create(db_path, component_id, schema, engine_owned)?
+            .sharing_wal_drops(&self.wal_dropped);
         if !self.component_metadata.contains_key(&component_id) {
             self.set_component_metadata(component_metadata, db_path)?;
         }
@@ -628,13 +644,20 @@ impl State {
             .is_some_and(|m| m.is_hidden())
     }
 
-    /// The components live streams may carry — everything not hidden.
-    fn visible_components(&self) -> HashMap<ComponentId, Component> {
+    /// The components a fixed-rate stream packs: the visible ones, less
+    /// images, which stay reachable through `RealTime` and `GetTimeSeries`.
+    fn fixed_rate_components(&self) -> HashMap<ComponentId, Component> {
         self.components
             .iter()
-            .filter(|(id, _)| !self.is_component_hidden(id))
+            .filter(|(id, _)| !self.is_component_hidden(id) && !self.is_image(id))
             .map(|(id, c)| (*id, c.clone()))
             .collect()
+    }
+
+    fn is_image(&self, component_id: &ComponentId) -> bool {
+        self.component_metadata
+            .get(component_id)
+            .is_some_and(|m| m.image_format().is_some())
     }
 
     pub fn set_component_metadata(
@@ -887,6 +910,23 @@ fn push_field(
     })
 }
 
+/// Upper bound on a component's WAL, unless `WAL_MIN_ENTRIES` needs more.
+const WAL_BUDGET: usize = 64 * 1024 * 1024;
+const WAL_MIN_ENTRIES: usize = 4;
+const WAL_CREATE_ENTRIES: usize = 1024;
+const WAL_OPEN_ENTRIES: usize = 256;
+
+/// WAL bytes for up to `entries` timestamped samples of `size` bytes,
+/// trimmed to `WAL_BUDGET`. A multiple of the entry, so no grant wraps.
+fn wal_capacity(size: usize, entries: usize) -> usize {
+    let entry = size + size_of::<Timestamp>();
+    entry * wal_entries(entry, entries)
+}
+
+fn wal_entries(entry: usize, entries: usize) -> usize {
+    (WAL_BUDGET / entry).max(WAL_MIN_ENTRIES).min(entries)
+}
+
 #[derive(Clone)]
 pub struct Component {
     pub component_id: ComponentId,
@@ -895,6 +935,9 @@ pub struct Component {
     pub schema: ComponentSchema,
     pub last_timestamp: Arc<AtomicCell<Timestamp>>,
     persistence: Arc<std::sync::Mutex<Option<ComponentPersistence>>>,
+    wal_dropped: Arc<AtomicU64>,
+    /// The db-wide drop count this component also bumps.
+    wal_dropped_total: Arc<AtomicU64>,
 }
 
 struct ComponentPersistence {
@@ -918,10 +961,12 @@ impl Component {
         Self {
             component_id,
             time_series,
-            wal: Disruptor::new(schema.size() * 1024),
+            wal: Disruptor::new(wal_capacity(schema.size(), WAL_CREATE_ENTRIES)),
             schema,
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
             persistence: Default::default(),
+            wal_dropped: Default::default(),
+            wal_dropped_total: Default::default(),
         }
     }
 
@@ -945,12 +990,14 @@ impl Component {
             time_series.set_max_node_age(age);
         }
         let this = Component {
-            wal: Disruptor::new(schema.size() * 1024),
+            wal: Disruptor::new(wal_capacity(schema.size(), WAL_CREATE_ENTRIES)),
             component_id,
             time_series,
             schema,
             last_timestamp: Arc::new(AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
+            wal_dropped: Default::default(),
+            wal_dropped_total: Default::default(),
         };
         stellarator::spawn(this.clone().persist(engine_owned));
         stellarator::spawn(this.time_series.clone().lifecycle());
@@ -973,12 +1020,14 @@ impl Component {
             .map(|t| t.timestamp())
             .unwrap_or(Timestamp(i64::MIN));
         let this = Component {
-            wal: Disruptor::new(schema.size() * 256),
+            wal: Disruptor::new(wal_capacity(schema.size(), WAL_OPEN_ENTRIES)),
             component_id,
             time_series,
             schema,
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
             persistence: Default::default(),
+            wal_dropped: Default::default(),
+            wal_dropped_total: Default::default(),
         };
         stellarator::spawn(this.persist(engine_owned));
         stellarator::spawn(this.time_series.clone().lifecycle());
@@ -1049,15 +1098,34 @@ impl Component {
         )
     }
 
+    /// Samples dropped because the WAL was full.
+    pub fn wal_dropped(&self) -> u64 {
+        self.wal_dropped.load(atomic::Ordering::Relaxed)
+    }
+
+    /// Counts this component's WAL drops in `total` as well.
+    fn sharing_wal_drops(mut self, total: &Arc<AtomicU64>) -> Self {
+        self.wal_dropped_total = total.clone();
+        self
+    }
+
+    /// Counts a dropped sample; logs the 1st, 2nd, 4th, 8th, ... drop.
+    fn record_wal_drop(&self, timestamp: Timestamp) {
+        self.wal_dropped_total
+            .fetch_add(1, atomic::Ordering::Relaxed);
+        let dropped = self.wal_dropped.fetch_add(1, atomic::Ordering::Relaxed) + 1;
+        if dropped.is_power_of_two() {
+            let reader_count = self.wal.reader_count();
+            warn!(component.id = ?self.component_id.0, ?timestamp, ?reader_count, dropped, "wal full; dropped sample");
+        }
+    }
+
     pub fn push_buf(&self, timestamp: Timestamp, value_buf: &[u8]) -> Result<(), Error> {
         if timestamp < self.last_timestamp.latest() {
             return Err(Error::TimeTravel);
         }
         let Ok(mut grant) = self.wal.try_grant(value_buf.len() + size_of::<Timestamp>()) else {
-            let reader_count = self.wal.reader_count();
-            warn!(?timestamp, ?reader_count, "skipped buf due to overflow");
-            // TODO(sphw): we should probably wait here, log, or even error out
-            // not sure what is best
+            self.record_wal_drop(timestamp);
             return Ok(());
         };
         grant[..size_of::<Timestamp>()].copy_from_slice(timestamp.as_bytes());
@@ -1259,6 +1327,144 @@ impl<A: AsyncWrite + 'static> PacketTx<A> {
     }
 }
 
+/// Upper bound on a `GetTimeSeries` response, header included.
+const SERIES_BUDGET: usize = 256 * 1024 * 1024;
+/// A time series packet's bytes before its timestamps: header and count.
+const SERIES_HEAD: usize = size_of::<PacketHeader>() + size_of::<u64>();
+
+/// Samples a `GetTimeSeries` response carries: the oldest of `range_len`,
+/// at most `limit`, and no more than fit `SERIES_BUDGET`.
+fn series_len(range_len: usize, limit: usize, size: usize) -> Result<usize, Error> {
+    series_fit(range_len, limit, size).ok_or(Error::ComponentTooLarge(size))
+}
+
+/// [`series_len`], or `None` if one sample does not fit.
+fn series_fit(range_len: usize, limit: usize, size: usize) -> Option<usize> {
+    let entry = size.saturating_add(size_of::<Timestamp>());
+    match (SERIES_BUDGET - SERIES_HEAD) / entry {
+        0 => None,
+        fit => Some(range_len.min(limit).min(fit)),
+    }
+}
+
+/// Writes the oldest `len` samples of `range` into `pkt`, after skipping
+/// its newest `skip`. Slices arrive newest first, so each fills the
+/// destination from the back.
+fn write_series(
+    pkt: &mut LenPacket,
+    range: &time_series::TimeSeriesSlice,
+    mut skip: usize,
+    len: usize,
+    size: usize,
+) -> Result<(), Error> {
+    let stamps_len = len * size_of::<Timestamp>();
+    let body_len = stamps_len + len * size;
+    let pkt_len =
+        u32::try_from(SERIES_HEAD + body_len).map_err(|_| Error::ComponentTooLarge(size))?;
+    pkt.extend_from_slice((len as u64).as_bytes());
+    pkt.inner.resize(pkt.inner.len() + body_len, 0);
+    pkt.inner[..size_of::<u32>()].copy_from_slice(&pkt_len.to_le_bytes());
+    let body = &mut pkt.as_mut_packet().body[size_of::<u64>()..];
+    let (stamps, data) = body.split_at_mut(stamps_len);
+    let mut end = len;
+    for slice in range.as_iter() {
+        if end == 0 {
+            break;
+        }
+        let all = slice.timestamps();
+        let skipped = skip.min(all.len());
+        skip -= skipped;
+        let kept = (all.len() - skipped).min(end);
+        let from = all.len() - skipped - kept;
+        let start = end - kept;
+        let src = slice
+            .data()
+            .get(from * size..(from + kept) * size)
+            .ok_or(Error::SeriesTruncated)?;
+        stamps[start * size_of::<Timestamp>()..end * size_of::<Timestamp>()]
+            .copy_from_slice(all[from..from + kept].as_bytes());
+        data[start * size..end * size].copy_from_slice(src);
+        end = start;
+    }
+    match end {
+        0 => Ok(()),
+        _ => Err(Error::SeriesTruncated),
+    }
+}
+
+/// Moves a page's end of `len` (of `range_len`, oldest first) so that no
+/// timestamp is split across pages, since the next page starts after the
+/// last timestamp. The page shrinks back to the last timestamp change, or,
+/// if it is one tie, grows to hold the whole tie: up to `cap` samples, past
+/// any limit. `None` if that tie exceeds `cap`.
+fn whole_ties(
+    range: &time_series::TimeSeriesSlice,
+    range_len: usize,
+    len: usize,
+    cap: usize,
+) -> Option<usize> {
+    let skip = range_len - len;
+    if skip == 0 || len == 0 {
+        return Some(len);
+    }
+    // Newest first, `skip` excluded samples come before the `len` kept.
+    // Slices wholly excluded are passed by length; `newer` carries the
+    // newest-passed slice's first stamp and how many equal it, so a tie
+    // spanning slices is counted whole.
+    let mut position = 0;
+    let mut newer: Option<(Timestamp, usize)> = None;
+    let mut edge = None;
+    let (mut excluded_tie, mut kept_tie) = (0, 0);
+    for slice in range.as_iter() {
+        let stamps = slice.timestamps();
+        let n = stamps.len();
+        let newer_position = position;
+        position += n;
+        match edge {
+            None if position < skip => {
+                let Some(&first) = stamps.first() else {
+                    continue;
+                };
+                let lead = stamps.partition_point(|t| *t == first);
+                newer = match newer {
+                    Some((stamp, run)) if lead == n && stamp == first => Some((first, n + run)),
+                    _ => Some((first, lead)),
+                };
+            }
+            None => {
+                // The excluded edge, `skip - 1` positions from the newest.
+                let at = n - 1 - (skip - 1 - newer_position);
+                let stamp = stamps[at];
+                excluded_tie = stamps[at..].partition_point(|t| *t == stamp);
+                if let Some((first, run)) = newer
+                    && at + excluded_tie == n
+                    && first == stamp
+                {
+                    excluded_tie += run;
+                }
+                let older = stamps[..at].partition_point(|t| *t < stamp);
+                kept_tie = at - older;
+                edge = Some(stamp);
+                if older > 0 {
+                    break;
+                }
+            }
+            Some(stamp) => {
+                let older = stamps.partition_point(|t| *t < stamp);
+                kept_tie += n - older;
+                if older > 0 {
+                    break;
+                }
+            }
+        }
+    }
+    let kept_tie = kept_tie.min(len);
+    match kept_tie < len {
+        true => Some(len - kept_tie),
+        false => Some(len + excluded_tie).filter(|whole| *whole <= cap),
+    }
+}
+
 async fn handle_packet<A: AsyncWrite + 'static>(
     pkt: &Packet<Slice<Vec<u8>>>,
     db: &Arc<DB>,
@@ -1290,7 +1496,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             let stream = m.parse::<Stream>()?;
             let tx = tx.tx.clone();
             let db = db.clone();
-            handle_stream(tx, stream, db, m.req_id);
+            handle_stream(tx, stream, db, m.req_id, usize::MAX);
         }
         Packet::Msg(m) if m.id == SetStreamState::ID => {
             let set_stream_state = m.parse::<SetStreamState>()?;
@@ -1355,47 +1561,15 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                     .get_range(range)
                     .ok_or(Error::TimeRangeOutOfBounds)?;
                 let range_len = range.len();
-                let len = range_len.min(limit.unwrap_or(usize::MAX));
-                // we preallocate the space we need, because we are iterating over the range's chunks backwards
-                // So we want to starting writing from the end of the buffers
-                let timestamp_buf_len = len * size_of::<Timestamp>();
-                let data_buf_len = len * size;
-                pkt.extend_from_slice((len as u64).as_bytes());
-                pkt.inner.extend(std::iter::repeat_n(
-                    0u8,
-                    len * size_of::<Timestamp>() + len * size,
-                ));
-                let pkt_len: u32 = (size_of::<u64>()
-                    + timestamp_buf_len
-                    + data_buf_len
-                    + size_of::<PacketHeader>()) as u32;
-                pkt.inner[0..size_of::<u32>()].copy_from_slice(&pkt_len.to_le_bytes());
-                let pkt_mut = pkt.as_mut_packet();
-                let pkt_mut_body = &mut pkt_mut.body[size_of::<u64>()..];
-                let (timestamps_dest, mut data_dest) = pkt_mut_body.split_at_mut(timestamp_buf_len);
-                let mut timestamps_dest = <[Timestamp]>::mut_from_bytes(timestamps_dest)
-                    .expect("Failed to create mutable slice for timestamps");
-
-                let mut to_skip = range_len - len;
-                for slice in range.as_iter() {
-                    let timestamps = slice.timestamps();
-                    let data = slice.data();
-                    let timestamps_len = timestamps.len().saturating_sub(to_skip);
-                    let timestamps = &timestamps[..timestamps_len];
-                    let data = &data[..timestamps_len * size];
-                    to_skip = to_skip.saturating_sub(timestamps_len);
-                    if timestamps.is_empty() {
-                        continue;
-                    }
-                    let start = timestamps_dest.len() - timestamps_len;
-                    let end = timestamps_dest.len();
-                    timestamps_dest[start..end].copy_from_slice(timestamps);
-                    timestamps_dest = &mut timestamps_dest[..start];
-                    data_dest[start * size..end * size].copy_from_slice(data);
-                    data_dest = &mut data_dest[..start * size];
-                }
-
-                Ok(())
+                let len = series_len(range_len, limit.unwrap_or(usize::MAX), size)?;
+                let len = whole_ties(
+                    &range,
+                    range_len,
+                    len,
+                    series_len(usize::MAX, usize::MAX, size)?,
+                )
+                .ok_or(Error::ComponentTooLarge(size))?;
+                write_series(pkt, &range, range_len - len, len, size)
             })
             .await?;
         }
@@ -2134,6 +2308,32 @@ impl FixedRateStreamState {
     }
 }
 
+/// The largest UDP datagram payload over IPv4.
+const MAX_UDP_PAYLOAD: usize = 65_507;
+
+/// Bytes of a table packet carrying one `size`-byte sample: length prefix,
+/// header, timestamp, alignment padding, and the sample.
+fn table_packet_len(size: usize) -> usize {
+    size_of::<u32>() + size_of::<PacketHeader>() + 2 * size_of::<Timestamp>() + size
+}
+
+/// True, and logs once per component, if `component` cannot fit a table
+/// packet of `max_table` bytes.
+fn skip_oversized(
+    component: &Component,
+    max_table: usize,
+    skipped: &mut HashSet<ComponentId>,
+) -> bool {
+    let len = table_packet_len(component.schema.size());
+    if len <= max_table {
+        return false;
+    }
+    if skipped.insert(component.component_id) {
+        warn!(component.id = ?component.component_id.0, len, max_table, "component too large for this stream; skipped");
+    }
+    true
+}
+
 fn handle_unicast_stream(addr: SocketAddr, stream: Stream, db: Arc<DB>) {
     stellarator::struc_con::stellar(move || async move {
         info!("UDP unicasting to {}", addr);
@@ -2141,7 +2341,7 @@ fn handle_unicast_stream(addr: SocketAddr, stream: Stream, db: Arc<DB>) {
         socket.connect(addr);
         let (_, tx) = socket.split();
         let tx = Arc::new(Mutex::new(PacketSink::new(tx)));
-        handle_stream(tx.clone(), stream.clone(), db.clone(), 0)
+        handle_stream(tx.clone(), stream.clone(), db.clone(), 0, MAX_UDP_PAYLOAD)
             .await
             .unwrap();
         Ok::<_, Error>(())
@@ -2153,10 +2353,11 @@ fn handle_stream<A: AsyncWrite + 'static>(
     stream: Stream,
     db: Arc<DB>,
     req_id: RequestId,
+    max_table: usize,
 ) -> stellarator::JoinHandle<()> {
     match stream.behavior {
         StreamBehavior::RealTime => stellarator::spawn(async move {
-            match handle_real_time_stream(tx, req_id, db).await {
+            match handle_real_time_stream(tx, req_id, db, max_table).await {
                 Ok(_) => {}
                 Err(err) if err.is_stream_closed() => {}
                 Err(err) => {
@@ -2178,7 +2379,7 @@ fn handle_stream<A: AsyncWrite + 'static>(
             debug!(stream.id = ?stream.id, "inserting stream");
             db.with_state_mut(|s| s.streams.insert(stream.id, state.clone()));
             stellarator::spawn(async move {
-                match handle_fixed_stream(tx, req_id, state, db).await {
+                match handle_fixed_stream(tx, req_id, state, db, max_table).await {
                     Ok(_) => {}
                     Err(err) if err.is_stream_closed() => {}
                     Err(err) => {
@@ -2194,8 +2395,10 @@ async fn handle_real_time_stream<A: AsyncWrite + 'static>(
     sink: Arc<Mutex<PacketSink<A>>>,
     req_id: RequestId,
     db: Arc<DB>,
+    max_table: usize,
 ) -> Result<(), Error> {
     let mut visited_ids = HashSet::new();
+    let mut skipped = HashSet::new();
     loop {
         db.with_state(|state| {
             DBVisitor.visit(&state.components, |component| {
@@ -2205,6 +2408,9 @@ async fn handle_real_time_stream<A: AsyncWrite + 'static>(
                     return Ok(());
                 }
                 visited_ids.insert(component.component_id);
+                if skip_oversized(component, max_table, &mut skipped) {
+                    return Ok(());
+                }
                 let sink = sink.clone();
                 let component = component.clone();
                 stellarator::spawn(handle_real_time_component(sink, component, req_id));
@@ -2270,26 +2476,35 @@ async fn handle_fixed_stream<A: AsyncWrite>(
     req_id: RequestId,
     state: Arc<FixedRateStreamState>,
     db: Arc<DB>,
+    max_table: usize,
 ) -> Result<(), Error> {
-    let mut current_vtable_gen = db.vtable_gen.latest();
+    let generation = || (db.vtable_gen.latest(), db.metadata_gen.latest());
+    let mut current_gen = generation();
     let mut current_field_count: Option<usize> = None;
     let id: PacketId = state.stream_id.to_le_bytes()[..2].try_into().unwrap();
     let mut table = LenPacket::table(id, 2048 - 16);
-    let mut components = db.with_state(|state| state.visible_components());
+    let mut skipped = HashSet::new();
+    let fixed_components = |skipped: &mut HashSet<ComponentId>| {
+        let mut components = db.with_state(|state| state.fixed_rate_components());
+        components.retain(|_, c| !skip_oversized(c, max_table, skipped));
+        components
+    };
+    let mut components = fixed_components(&mut skipped);
+    let mut warned_oversized = false;
     loop {
         if !state.wait_for_playing().await {
             return Ok(());
         }
         let start = Instant::now();
         let current_timestamp = state.current_timestamp();
-        let vtable_gen = db.vtable_gen.latest();
-        if vtable_gen != current_vtable_gen {
-            components = db.with_state(|state| state.visible_components());
+        let gen_now = generation();
+        if gen_now != current_gen {
+            components = fixed_components(&mut skipped);
             let stream = stream.lock().await;
             let vtable = DBVisitor.vtable(&components)?;
             let msg = VTableMsg { id, vtable };
             stream.send(msg.with_request_id(req_id)).await.0?;
-            current_vtable_gen = vtable_gen;
+            current_gen = gen_now;
         }
         table.clear();
         match DBVisitor.populate_table(&components, &mut table, current_timestamp) {
@@ -2307,6 +2522,13 @@ async fn handle_fixed_stream<A: AsyncWrite>(
             }
             Err(err) => warn!(?err, "failed to populate table"),
         }
+        let fits = table.inner.len() <= max_table;
+        if !fits && !core::mem::replace(&mut warned_oversized, true) {
+            warn!(
+                len = table.inner.len(),
+                max_table, "fixed-rate table too large for this stream; not sent"
+            );
+        }
         {
             let stream = stream.lock().await;
             stream
@@ -2319,7 +2541,9 @@ async fn handle_fixed_stream<A: AsyncWrite>(
                 )
                 .await
                 .0?;
-            rent!(stream.send(table.with_request_id(req_id)).await, table)?;
+            if fits {
+                rent!(stream.send(table.with_request_id(req_id)).await, table)?;
+            }
         }
         state
             .wait_for_tick(start.elapsed(), current_timestamp)
@@ -3127,5 +3351,583 @@ mod static_ingest_tests {
     async fn short_table_is_refused() {
         let (_dir, db) = store();
         assert!(db.ingest_table(ID, &5i64.to_le_bytes()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod wal_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const IMAGE_SIZE: usize = 2 * 1024 * 1024;
+
+    fn image_schema() -> ComponentSchema {
+        ComponentSchema::new(PrimType::U16, &[1024usize, 1024][..])
+    }
+
+    fn f64_schema() -> ComponentSchema {
+        ComponentSchema::new(PrimType::F64, &[1usize][..])
+    }
+
+    fn unpersisted(dir: &Path, schema: ComponentSchema) -> Component {
+        let id = ComponentId::new("wal");
+        let time_series = TimeSeries::create(dir.join(id.to_string())).unwrap();
+        Component::from_time_series(id, schema, time_series)
+    }
+
+    fn entries(buf: &[u8], size: usize) -> impl Iterator<Item = (i64, &[u8])> {
+        assert_eq!(buf.len() % (size + 8), 0);
+        buf.chunks_exact(size + 8).map(|entry| {
+            (
+                i64::from_le_bytes(entry[..8].try_into().unwrap()),
+                &entry[8..],
+            )
+        })
+    }
+
+    /// Timestamps of every whole entry the reader can see.
+    fn drain(reader: &mut disruptor::Reader, size: usize) -> Vec<i64> {
+        let mut timestamps = Vec::new();
+        while let Some(buf) = reader.try_next() {
+            timestamps.extend(entries(&buf, size).map(|(ts, _)| ts));
+        }
+        timestamps
+    }
+
+    async fn wait_persisted(component: &Component, ts: i64) {
+        for _ in 0..10_000 {
+            if component.time_series.latest().map(|l| l.timestamp()) == Some(Timestamp(ts)) {
+                return;
+            }
+            stellarator::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("sample {ts} never persisted");
+    }
+
+    #[test]
+    fn capacity_holds_whole_entries_within_budget() {
+        assert_eq!(wal_capacity(8, WAL_CREATE_ENTRIES), 16 * 1024);
+        assert_eq!(wal_capacity(8, WAL_OPEN_ENTRIES), 16 * 256);
+        assert_eq!(wal_capacity(0, 1), 8);
+        let image = wal_capacity(IMAGE_SIZE, WAL_CREATE_ENTRIES);
+        assert_eq!(image, 31 * (IMAGE_SIZE + 8));
+        assert!(image <= WAL_BUDGET);
+    }
+
+    #[test]
+    fn capacity_keeps_min_entries_past_budget() {
+        let size = 40 * 1024 * 1024;
+        assert_eq!(wal_capacity(size, WAL_CREATE_ENTRIES), 4 * (size + 8));
+        assert_eq!(wal_capacity(size, 2), 2 * (size + 8));
+    }
+
+    #[test]
+    fn small_component_wal_holds_create_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let component = unpersisted(dir.path(), f64_schema());
+        assert_eq!(component.wal.capacity(), 16 * 1024);
+        let mut reader = component.wal.reader();
+        for ts in 0..1100 {
+            component
+                .push_buf(Timestamp(ts), &(ts as f64).to_le_bytes())
+                .unwrap();
+        }
+        assert_eq!(
+            drain(&mut reader, 8),
+            (0..WAL_CREATE_ENTRIES as i64).collect::<Vec<_>>()
+        );
+        assert_eq!(component.wal_dropped(), 1100 - WAL_CREATE_ENTRIES as u64);
+    }
+
+    #[test]
+    fn stalled_wal_drops_large_samples_without_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let component = unpersisted(dir.path(), image_schema());
+        assert_eq!(component.wal.capacity(), 31 * (IMAGE_SIZE + 8));
+        let mut reader = component.wal.reader();
+        let mut buf = vec![0u8; IMAGE_SIZE];
+        for ts in 0..40 {
+            buf.fill(ts as u8);
+            component.push_buf(Timestamp(ts), &buf).unwrap();
+        }
+        assert_eq!(drain(&mut reader, IMAGE_SIZE), (0..31).collect::<Vec<_>>());
+        assert_eq!(component.wal_dropped(), 9);
+
+        // Space freed by the reader takes new samples at the next offset.
+        for ts in 40..50 {
+            buf.fill(ts as u8);
+            component.push_buf(Timestamp(ts), &buf).unwrap();
+        }
+        let grant = reader.try_next().unwrap();
+        let read: Vec<_> = entries(&grant, IMAGE_SIZE).collect();
+        assert_eq!(read.len(), 10);
+        for ((ts, data), expected) in read.into_iter().zip(40i64..) {
+            assert_eq!(ts, expected);
+            assert!(data.iter().all(|b| *b == ts as u8));
+        }
+    }
+
+    #[stellarator::test]
+    async fn large_component_persists_every_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = ComponentId::new("image");
+        let component = Component::create(dir.path(), id, image_schema(), false).unwrap();
+        assert!(component.wal.capacity() <= WAL_BUDGET);
+        let mut buf = vec![0u8; IMAGE_SIZE];
+        for ts in 0..100 {
+            buf.fill(ts as u8);
+            component.push_buf(Timestamp(ts), &buf).unwrap();
+            wait_persisted(&component, ts).await;
+        }
+        for ts in 0..100 {
+            let sample = component.time_series.get(Timestamp(ts)).unwrap();
+            assert!(sample.data().iter().all(|b| *b == ts as u8), "ts {ts}");
+        }
+        assert_eq!(component.time_series.iter_node_slices().count(), 2);
+        assert_eq!(component.wal_dropped(), 0);
+    }
+}
+
+#[cfg(test)]
+mod series_tests {
+    use super::*;
+    use metor_proto_stellar::Client;
+    use std::net::UdpSocket as StdUdpSocket;
+    use std::time::Duration;
+
+    const ID: PacketId = [9, 2];
+    const IMAGE_SIZE: usize = 2 * 1024 * 1024;
+    /// Image samples per page: what fits in `SERIES_BUDGET`.
+    const PAGE: usize = 127;
+
+    #[test]
+    fn series_len_clamps_to_the_budget() {
+        assert_eq!(series_len(300, usize::MAX, IMAGE_SIZE).unwrap(), PAGE);
+        assert_eq!(series_len(300, 10, IMAGE_SIZE).unwrap(), 10);
+        assert_eq!(series_len(1, usize::MAX, IMAGE_SIZE).unwrap(), 1);
+        assert_eq!(series_len(1_000_000, usize::MAX, 8).unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn series_len_edges() {
+        assert_eq!(series_len(300, 0, IMAGE_SIZE).unwrap(), 0);
+        assert_eq!(series_len(0, usize::MAX, IMAGE_SIZE).unwrap(), 0);
+        let largest = SERIES_BUDGET - SERIES_HEAD - size_of::<Timestamp>();
+        assert_eq!(series_len(5, usize::MAX, largest).unwrap(), 1);
+    }
+
+    #[test]
+    fn series_len_refuses_a_sample_past_the_budget() {
+        let size = SERIES_BUDGET - SERIES_HEAD - size_of::<Timestamp>() + 1;
+        assert!(matches!(
+            series_len(1, usize::MAX, size),
+            Err(Error::ComponentTooLarge(s)) if s == size
+        ));
+        assert!(matches!(
+            series_len(1, 1, usize::MAX),
+            Err(Error::ComponentTooLarge(_))
+        ));
+    }
+
+    /// A table of an `f64` at offset 8 and a 1024² `U16` image at 16.
+    fn image_vtable() -> VTable {
+        vtable([
+            raw_field(
+                8,
+                8,
+                timestamp(raw_table(0, 8), schema(PrimType::F64, &[1], component("f"))),
+            ),
+            raw_field(
+                16,
+                IMAGE_SIZE as u32,
+                timestamp(
+                    raw_table(0, 8),
+                    schema(PrimType::U16, &[1024, 1024], component("img")),
+                ),
+            ),
+        ])
+    }
+
+    /// Pixel `i` of sample `ts` is `ts + i`.
+    fn fill(table: &mut [u8], ts: i64) {
+        table[..8].copy_from_slice(&ts.to_le_bytes());
+        table[8..16].copy_from_slice(&(ts as f64).to_le_bytes());
+        let start = ts as u16 as usize;
+        table[16..].copy_from_slice(ramp()[start..start + IMAGE_SIZE / 2].as_bytes());
+    }
+
+    /// `ramp()[j] == j as u16`, long enough for any start below 2^16.
+    fn ramp() -> &'static [u16] {
+        static RAMP: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+        RAMP.get_or_init(|| (0..IMAGE_SIZE / 2 + (1 << 16)).map(|j| j as u16).collect())
+    }
+
+    fn image_db() -> (tempfile::TempDir, Arc<DB>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::create(dir.path().join("db")).unwrap();
+        db.insert_vtable(VTableMsg {
+            id: ID,
+            vtable: image_vtable(),
+        })
+        .unwrap();
+        db.with_state_mut(|s| {
+            let meta = ComponentMetadata::from("img").with_image(ImageFormat::Mono16, 12);
+            s.set_component_metadata(meta, &db.path)
+        })
+        .unwrap();
+        (dir, Arc::new(db))
+    }
+
+    fn latest(db: &DB, name: &str) -> Option<Timestamp> {
+        db.with_state(|s| {
+            let component = s.get_component(ComponentId::new(name))?;
+            Some(component.time_series.latest()?.timestamp())
+        })
+    }
+
+    async fn wait_persisted(db: &DB, ts: i64) {
+        for _ in 0..10_000 {
+            if latest(db, "img") == Some(Timestamp(ts)) && latest(db, "f") == Some(Timestamp(ts)) {
+                return;
+            }
+            stellarator::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("sample {ts} never persisted");
+    }
+
+    /// Ingests samples `1..=count`, keeping the WAL from filling.
+    async fn ingest(db: &DB, count: i64) -> Duration {
+        let mut table = vec![0u8; 16 + IMAGE_SIZE];
+        let start = Instant::now();
+        for ts in 1..=count {
+            fill(&mut table, ts);
+            db.ingest_table(ID, &table).unwrap();
+            if ts % 16 == 0 || ts == count {
+                wait_persisted(db, ts).await;
+            }
+        }
+        start.elapsed()
+    }
+
+    fn serve(db: Arc<DB>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Server { listener, db };
+        stellarator::struc_con::stellar(move || server.run());
+        addr
+    }
+
+    fn query(start: i64, limit: Option<usize>) -> GetTimeSeries {
+        GetTimeSeries {
+            id: ID,
+            range: Timestamp(start)..Timestamp(i64::MAX),
+            component_id: ComponentId::new("img"),
+            limit,
+        }
+    }
+
+    /// Requests from `start`, checks every sample, and returns its timestamps.
+    async fn page(client: &mut Client, start: i64, limit: Option<usize>) -> Vec<i64> {
+        let series = client.request(&query(start, limit)).await.unwrap();
+        let stamps: Vec<i64> = series.timestamps().unwrap().iter().map(|t| t.0).collect();
+        let data = series.data().unwrap();
+        assert_eq!(data.len(), stamps.len() * IMAGE_SIZE);
+        let mut expected = vec![0u8; 16 + IMAGE_SIZE];
+        for (ts, sample) in stamps.iter().zip(data.as_chunks::<IMAGE_SIZE>().0) {
+            fill(&mut expected, *ts);
+            assert!(sample[..] == expected[16..], "sample {ts} differs");
+        }
+        stamps
+    }
+
+    #[stellarator::test]
+    async fn get_time_series_pages_large_samples_oldest_first() {
+        let (_dir, db) = image_db();
+        let took = ingest(&db, 300).await;
+        let mib = 300.0 * IMAGE_SIZE as f64 / (1 << 20) as f64;
+        eprintln!(
+            "db ingest: 300 x 2 MiB in {took:?}, {:.0} MiB/s",
+            mib / took.as_secs_f64()
+        );
+        let mut client = Client::connect(serve(db)).await.unwrap();
+
+        let mut seen = Vec::new();
+        let mut sizes = Vec::new();
+        let mut start = 0;
+        loop {
+            let stamps = page(&mut client, start, None).await;
+            let Some(last) = stamps.last() else {
+                break;
+            };
+            start = last + 1;
+            sizes.push(stamps.len());
+            seen.extend(stamps);
+        }
+        assert_eq!(sizes, [PAGE, PAGE, 300 - 2 * PAGE]);
+        assert_eq!(seen, (1..=300).collect::<Vec<_>>());
+    }
+
+    /// Ingests one sample per timestamp in `stamps`, ties included.
+    async fn ingest_stamps(db: &DB, stamps: &[i64]) {
+        let mut table = vec![0u8; 16 + IMAGE_SIZE];
+        for (n, ts) in stamps.iter().enumerate() {
+            fill(&mut table, *ts);
+            table[8..16].copy_from_slice(&(n as f64).to_le_bytes());
+            db.ingest_table(ID, &table).unwrap();
+            if n % 16 == 15 {
+                wait_persisted(db, *ts).await;
+            }
+        }
+        if let Some(last) = stamps.last() {
+            wait_persisted(db, *last).await;
+        }
+    }
+
+    /// The `f` samples `(timestamp, value)` a request from `start` returns.
+    async fn page_f(client: &mut Client, start: i64, limit: Option<usize>) -> Vec<(i64, f64)> {
+        let series = client
+            .request(&GetTimeSeries {
+                component_id: ComponentId::new("f"),
+                ..query(start, limit)
+            })
+            .await
+            .unwrap();
+        let stamps = series.timestamps().unwrap().iter().map(|t| t.0);
+        let values = series.data().unwrap().as_chunks::<8>().0.iter();
+        stamps.zip(values.map(|v| f64::from_le_bytes(*v))).collect()
+    }
+
+    /// Pages from 0 by `limit`, each page after the last one's timestamp.
+    async fn page_all_f(client: &mut Client, limit: usize) -> Vec<Vec<(i64, f64)>> {
+        let (mut pages, mut start) = (Vec::new(), 0);
+        loop {
+            let page = page_f(client, start, Some(limit)).await;
+            let Some((last, _)) = page.last() else {
+                return pages;
+            };
+            start = last + 1;
+            pages.push(page);
+        }
+    }
+
+    #[stellarator::test]
+    async fn paging_never_splits_equal_timestamps() {
+        let (_dir, db) = image_db();
+        ingest_stamps(&db, &[1, 2, 3, 3, 3, 4, 5]).await;
+        let mut client = Client::connect(serve(db)).await.unwrap();
+        let stamps = |pages: &[Vec<(i64, f64)>]| -> Vec<Vec<i64>> {
+            pages
+                .iter()
+                .map(|p| p.iter().map(|(t, _)| *t).collect())
+                .collect()
+        };
+        let pages = page_all_f(&mut client, 3).await;
+        assert_eq!(stamps(&pages), [vec![1, 2], vec![3, 3, 3], vec![4, 5]]);
+        let values: Vec<f64> = pages.iter().flatten().map(|(_, v)| *v).collect();
+        assert_eq!(values, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        // A limit inside a tie still returns the whole tie.
+        let pages = page_all_f(&mut client, 1).await;
+        assert_eq!(
+            stamps(&pages),
+            [vec![1], vec![2], vec![3, 3, 3], vec![4], vec![5]]
+        );
+    }
+
+    /// Image samples roll a node every 64, so a tie at 63 spans two.
+    #[stellarator::test]
+    async fn paging_keeps_a_tie_across_nodes() {
+        let (_dir, db) = image_db();
+        let stamps: Vec<i64> = (0..64).chain([63, 63, 64]).collect();
+        ingest_stamps(&db, &stamps).await;
+        let mut client = Client::connect(serve(db)).await.unwrap();
+        let first = page(&mut client, 0, Some(64)).await;
+        assert_eq!(first, (0..63).collect::<Vec<_>>());
+        assert_eq!(page(&mut client, 63, Some(1)).await, [63, 63, 63]);
+        assert_eq!(page(&mut client, 63, Some(3)).await, [63, 63, 63]);
+        assert_eq!(page(&mut client, 63, None).await, [63, 63, 63, 64]);
+    }
+
+    #[stellarator::test]
+    async fn a_tie_past_the_cap_is_refused() {
+        let (_dir, db) = image_db();
+        ingest_stamps(&db, &[1, 1, 1, 2]).await;
+        let range = db.with_state(|s| {
+            let f = s.get_component(ComponentId::new("f")).unwrap();
+            f.time_series
+                .get_range(Timestamp(0)..Timestamp(i64::MAX))
+                .unwrap()
+        });
+        assert_eq!(whole_ties(&range, 4, 1, 3), Some(3));
+        assert_eq!(whole_ties(&range, 4, 1, 2), None);
+        assert_eq!(whole_ties(&range, 4, 4, 2), Some(4));
+        assert_eq!(whole_ties(&range, 4, 0, 2), Some(0));
+    }
+
+    #[stellarator::test]
+    async fn get_time_series_limits_and_single_samples() {
+        let (_dir, db) = image_db();
+        ingest(&db, 3).await;
+        let mut client = Client::connect(serve(db)).await.unwrap();
+        assert!(page(&mut client, 0, Some(0)).await.is_empty());
+        assert_eq!(page(&mut client, 2, Some(1)).await, [2]);
+        assert_eq!(page(&mut client, 3, None).await, [3]);
+        assert!(page(&mut client, 4, None).await.is_empty());
+    }
+
+    /// The first table packet of a stream on `client`, after its vtable.
+    async fn first_tables(client: &mut Client, count: usize) -> Vec<usize> {
+        let mut lens = Vec::new();
+        let mut buf = vec![0u8; 1024];
+        while lens.len() < count {
+            let pkt = client.rx.next_grow(buf).await.unwrap();
+            if let Packet::Table(table) = &pkt {
+                lens.push(table.buf.len());
+            }
+            buf = pkt.into_buf().into_inner();
+        }
+        lens
+    }
+
+    fn stream(behavior: StreamBehavior) -> Stream {
+        Stream { behavior, id: 7 }
+    }
+
+    /// Ingests one more sample every 20 ms while `until` is pending, so
+    /// real-time streams have something new to send.
+    async fn feeding<T>(db: &DB, from: i64, until: impl Future<Output = T>) -> T {
+        let feed = async {
+            let mut table = vec![0u8; 16 + IMAGE_SIZE];
+            let mut ts = from;
+            loop {
+                fill(&mut table, ts);
+                db.ingest_table(ID, &table).unwrap();
+                stellarator::sleep(Duration::from_millis(20)).await;
+                ts += 1;
+            }
+        };
+        futures_lite::future::or(until, feed).await
+    }
+
+    #[stellarator::test]
+    async fn fixed_rate_leaves_images_out_and_real_time_keeps_them() {
+        let (_dir, db) = image_db();
+        ingest(&db, 2).await;
+        let addr = serve(db.clone());
+
+        let mut client = Client::connect(addr).await.unwrap();
+        let fixed = stream(StreamBehavior::FixedRate(FixedRateBehavior {
+            initial_timestamp: InitialTimestamp::Earliest,
+            timestep: 1,
+            frequency: 100,
+        }));
+        client.send((&fixed).with_request_id(1)).await.0.unwrap();
+        assert!(
+            first_tables(&mut client, 3)
+                .await
+                .iter()
+                .all(|len| *len < 64)
+        );
+
+        let mut client = Client::connect(addr).await.unwrap();
+        let live = stream(StreamBehavior::RealTime);
+        client.send((&live).with_request_id(1)).await.0.unwrap();
+        let mut lens = feeding(&db, 3, first_tables(&mut client, 6)).await;
+        lens.sort();
+        lens.dedup();
+        assert_eq!(lens, [16, 8 + IMAGE_SIZE]);
+    }
+
+    #[stellarator::test]
+    async fn udp_stream_skips_images_and_sends_the_rest() {
+        let (_dir, db) = image_db();
+        ingest(&db, 2).await;
+        let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let live = stream(StreamBehavior::RealTime);
+        handle_unicast_stream(socket.local_addr().unwrap(), live, db.clone());
+        let receive = async {
+            let mut buf = vec![0u8; 1 << 17];
+            let mut tables = 0;
+            while tables < 3 {
+                let Ok(len) = socket.recv(&mut buf) else {
+                    stellarator::sleep(Duration::from_millis(5)).await;
+                    continue;
+                };
+                assert!(len <= MAX_UDP_PAYLOAD);
+                if buf[4] == PacketTy::Table as u8 {
+                    tables += 1;
+                    assert_eq!(len, table_packet_len(8) - 8);
+                }
+            }
+        };
+        let deadline = async {
+            stellarator::sleep(Duration::from_secs(10)).await;
+            panic!("no tables arrived over udp");
+        };
+        feeding(&db, 3, futures_lite::future::or(receive, deadline)).await;
+    }
+
+    #[test]
+    fn oversized_components_are_skipped_and_logged_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = ComponentSchema::new(PrimType::U16, &[1024usize, 1024][..]);
+        let id = ComponentId::new("img");
+        let series = TimeSeries::create(dir.path().join("img")).unwrap();
+        let image = Component::from_time_series(id, schema, series);
+        let mut skipped = HashSet::new();
+        assert!(skip_oversized(&image, MAX_UDP_PAYLOAD, &mut skipped));
+        assert!(skip_oversized(&image, MAX_UDP_PAYLOAD, &mut skipped));
+        assert_eq!(skipped.len(), 1);
+        assert!(!skip_oversized(&image, usize::MAX, &mut skipped));
+    }
+}
+
+#[cfg(kani)]
+mod series_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn series_len_fits_the_budget() {
+        let range_len: usize = kani::any();
+        let limit: usize = kani::any();
+        let size: u32 = kani::any();
+        let size = size as usize;
+        match series_fit(range_len, limit, size) {
+            Some(len) => {
+                assert!(len <= range_len && len <= limit);
+                let body = len.checked_mul(size + size_of::<Timestamp>()).unwrap();
+                assert!(SERIES_HEAD + body <= SERIES_BUDGET);
+                assert!(SERIES_BUDGET <= u32::MAX as usize);
+                if range_len >= 1 && limit >= 1 {
+                    assert!(len >= 1);
+                }
+            }
+            None => assert!(SERIES_HEAD + size + size_of::<Timestamp>() > SERIES_BUDGET),
+        }
+    }
+}
+
+#[cfg(kani)]
+mod wal_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn wal_capacity_is_bounded_whole_entries() {
+        let size: u32 = kani::any();
+        let entries: usize = kani::any();
+        kani::assume((1..=WAL_CREATE_ENTRIES).contains(&entries));
+        let entry = size as usize + size_of::<Timestamp>();
+        let count = wal_entries(entry, entries);
+        assert!(count >= WAL_MIN_ENTRIES.min(entries));
+        assert!(count <= entries);
+        let capacity = entry.checked_mul(count).unwrap();
+        assert!(capacity <= WAL_BUDGET.max(WAL_MIN_ENTRIES * entry));
+    }
+
+    #[kani::proof]
+    fn node_data_size_fits_min_elements() {
+        let element: u64 = kani::any();
+        kani::assume(element <= (u64::MAX - 64) / 64);
+        assert!(time_series::node_data_size(element) >= 64 * element + 64);
     }
 }

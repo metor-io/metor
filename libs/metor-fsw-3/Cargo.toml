@@ -35,7 +35,7 @@ toml = { version = "0.8", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
 wasmi = { version = "1.1", default-features = false, features = ["std"], optional = true }
-zerocopy = { version = "0.8.2", features = ["derive"] }
+zerocopy = { version = "0.8.2", features = ["alloc", "derive"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 stellarator = { path = "../stellarator", optional = true }

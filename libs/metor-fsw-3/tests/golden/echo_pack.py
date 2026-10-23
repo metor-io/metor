@@ -22,6 +22,12 @@ class GpsFix(Record):
     _pack = PACK
 
 
+class Image(Record):
+    _name = "image"
+    _kind = "frame"
+    _pack = PACK
+
+
 class LogEvent(Record):
     _name = "log"
     _kind = "msg"
@@ -72,6 +78,36 @@ class Meter(System):
         super().__init__({"sample": sample}, {})
 
     output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Viewer(System):
+    "Pings the first and last pixel bytes of the newest image, as\n`first << 8 | last`."
+
+    _pack = PACK
+    _ty = "viewer"
+    _ports = {"output": Ping, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self, *, image: Sources[Image] = ()) -> None:
+        super().__init__({"image": image}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Camera(System):
+    "Writes one image per cycle. Its first pixel byte is the low byte of the\ncycle's time, and its last is that byte inverted."
+
+    _pack = PACK
+    _ty = "camera"
+    _ports = {"image": Image, "log": LogEvent, "status": SystemStatus}
+
+    def __init__(self) -> None:
+        super().__init__({}, {})
+
+    image: OutPort[Image]
     log: OutPort[LogEvent]
     status: OutPort[SystemStatus]
 

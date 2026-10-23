@@ -107,6 +107,14 @@ impl MsgCodec {
 /// header.
 pub(crate) const PACKET_OVERHEAD: usize = 4 + PACKET_HEADER_LEN;
 
+/// Whether a packet carrying up to `max_len` bytes fits a `conn_cap`-byte
+/// buffer.
+pub(crate) fn fits(max_len: usize, conn_cap: usize) -> bool {
+    max_len
+        .checked_add(PACKET_OVERHEAD)
+        .is_some_and(|n| n <= conn_cap)
+}
+
 /// The length prefix and header of a packet carrying `payload_len` bytes.
 pub(crate) fn packet_head(ty: PacketTy, id: PacketId, payload_len: usize) -> [u8; PACKET_OVERHEAD] {
     let [a, b, c, d] = ((PACKET_HEADER_LEN + payload_len) as u32).to_le_bytes();

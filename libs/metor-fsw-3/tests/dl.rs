@@ -143,6 +143,8 @@ fn test_pack_reports_system_metadata() {
         vec![
             "sampler",
             "meter",
+            "viewer",
+            "camera",
             "echo",
             "dice",
             "relay",

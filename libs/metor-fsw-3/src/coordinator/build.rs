@@ -20,7 +20,7 @@ use crate::io::host::MemberDef;
 use crate::io::{
     Backing, Cqe, DEFAULT_OPS, IO_CQ, IO_SQ, IO_TYPE, IoState, ResourceEnd, ResourceIndex,
 };
-use crate::port::{Output, ring_capacity};
+use crate::port::{Output, checked_frame_len, ring_capacity};
 use crate::record::Record;
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
@@ -99,7 +99,7 @@ impl CoordinatorConfig {
         let rings = plan
             .rings
             .iter()
-            .map(|spec| spec.allocate(self.ring_depth))
+            .map(|spec| spec.allocate(self.ring_depth, self.ring_bytes))
             .collect::<Result<Vec<_>, _>>()?;
         let mut threads = match options.deterministic {
             true => Threads::deterministic(),
@@ -774,25 +774,51 @@ fn find_duplicate(ports: &[PortDef]) -> Option<&PortDef> {
 }
 
 impl RingSpec {
-    /// Allocates a ring that holds `self.port.depth * ring_depth` records.
-    fn allocate(&self, ring_depth: NonZeroUsize) -> Result<RingBuffer, BuildError> {
+    /// Allocates a ring that holds `self.port.depth * ring_depth` records,
+    /// capped by [`ring_records`].
+    fn allocate(
+        &self,
+        ring_depth: NonZeroUsize,
+        ring_bytes: NonZeroUsize,
+    ) -> Result<RingBuffer, BuildError> {
         let too_large = || BuildError::RingTooLarge {
             system: self.system.clone(),
             port: self.port.name.to_string(),
             max_len: self.port.max_len,
         };
-        let depth = self
-            .port
-            .depth
-            .checked_mul(ring_depth.get())
-            .ok_or_else(too_large)?;
-        let capacity = ring_capacity(self.port.max_len, depth).ok_or_else(too_large)?;
+        self.check_ring_bytes(ring_bytes.get())?;
+        let depth = self.port.depth.saturating_mul(ring_depth.get());
+        let records = ring_records(self.port.max_len, depth, ring_bytes.get());
+        let capacity = ring_capacity(self.port.max_len, records).ok_or_else(too_large)?;
         let config = Config {
             capacity,
             max_readers: self.readers,
         };
         RingBuffer::create_in_memory(config).map_err(|_| too_large())
     }
+
+    /// Rejects a port whose records for one cycle do not fit `ring_bytes`, so
+    /// its writes would fail every cycle.
+    fn check_ring_bytes(&self, ring_bytes: usize) -> Result<(), BuildError> {
+        let (max_len, depth) = (self.port.max_len, self.port.depth);
+        if ring_records(max_len, depth, ring_bytes) >= depth {
+            return Ok(());
+        }
+        Err(BuildError::RingBytesTooSmall {
+            system: self.system.clone(),
+            port: self.port.name.to_string(),
+            depth,
+            ring_bytes,
+        })
+    }
+}
+
+/// Returns how many records of up to `max_len` bytes a ring holds.
+///
+/// That is `depth`, capped at what fits in `ring_bytes`, and never below two.
+fn ring_records(max_len: usize, depth: usize, ring_bytes: usize) -> usize {
+    let fit = checked_frame_len(max_len).map_or(0, |frame| ring_bytes / frame);
+    depth.min(fit).max(2)
 }
 
 /// The make arguments every system in the target shares.
@@ -1228,6 +1254,7 @@ mod tests {
     fn test_reject_ring_address_overflow() {
         let config = CoordinatorConfig {
             ring_depth: NonZeroUsize::MAX,
+            ring_bytes: NonZeroUsize::MAX,
             systems: vec![source("imu")],
             ..Default::default()
         };
@@ -1248,6 +1275,7 @@ mod tests {
         // A capacity of 2^63 fits `usize`; the region around it does not.
         let config = CoordinatorConfig {
             ring_depth: NonZeroUsize::new(1 << 58).expect("nonzero"),
+            ring_bytes: NonZeroUsize::MAX,
             systems: vec![source("imu")],
             ..Default::default()
         };
@@ -1259,6 +1287,96 @@ mod tests {
                 max_len: utils::Imu::MAX_LEN,
             })
         );
+    }
+
+    /// Allocates the ring of a `T` output with one reader.
+    fn ring_of<T: Record>(ring_depth: usize, ring_bytes: usize) -> Result<RingBuffer, BuildError> {
+        let spec = RingSpec {
+            system: "src".into(),
+            port: Output::<T>::def(&DefCx::empty(), "out"),
+            readers: 1,
+        };
+        let nonzero = |n| NonZeroUsize::new(n).expect("nonzero");
+        spec.allocate(nonzero(ring_depth), nonzero(ring_bytes))
+    }
+
+    /// Writes `n` copies of `record` without reading, returning the first
+    /// refusal.
+    fn fill(
+        ring: &RingBuffer,
+        record: &[u8],
+        n: usize,
+    ) -> Result<(), metor_fsw_3_ring::WriteError> {
+        let _reader = ring.view(NoWake).expect("a reader slot");
+        let mut writer = ring.writer(NoWake).expect("a writer");
+        (0..n).try_for_each(|_| writer.try_write(record))
+    }
+
+    #[test]
+    fn test_large_frame_ring_is_capped() {
+        let ring_bytes = crate::coordinator::DEFAULT_RING_BYTES.get();
+        let ring = ring_of::<utils::Image>(8, ring_bytes).expect("a ring");
+        assert!(ring.config().capacity <= ring_bytes.next_power_of_two());
+        let record = vec![0; utils::Image::MAX_LEN];
+        assert_eq!(fill(&ring, &record, 3), Ok(()));
+        assert!(
+            fill(
+                &ring_of::<utils::Image>(8, ring_bytes).expect("a ring"),
+                &record,
+                4
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_small_frame_ring_is_unchanged() {
+        let ring = ring_of::<utils::Imu>(8, 8 << 20).expect("a ring");
+        let today = port::ring_capacity(utils::Imu::MAX_LEN, 8).expect("fits");
+        assert_eq!(ring.config().capacity, today);
+    }
+
+    /// A 2 MiB frame written four times a cycle.
+    #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[frame(name = "burst", depth = 4)]
+    #[repr(C)]
+    struct Burst {
+        #[frame(timestamp)]
+        timestamp: Timestamp,
+        pixels: crate::FrameBytes<{ 2 << 20 }>,
+    }
+
+    #[test]
+    fn test_reject_a_cycle_past_ring_bytes() {
+        let ring_bytes = crate::coordinator::DEFAULT_RING_BYTES.get();
+        assert_eq!(
+            ring_of::<Burst>(1, ring_bytes).err(),
+            Some(BuildError::RingBytesTooSmall {
+                system: "src".into(),
+                port: "out".into(),
+                depth: 4,
+                ring_bytes,
+            })
+        );
+        let fits = 4 * metor_fsw_3_ring::frame_len(Burst::MAX_LEN);
+        assert!(ring_of::<Burst>(1, fits).is_ok());
+        assert!(ring_of::<Burst>(1, fits - 1).is_err());
+        assert!(
+            ring_of::<utils::Image>(8, 1).is_ok(),
+            "a depth of 1 always fits"
+        );
+    }
+
+    #[test]
+    fn test_ring_holds_two_records_at_least() {
+        let record = vec![0; utils::Image::MAX_LEN];
+        for (ring_depth, ring_bytes) in [(8, 1), (1, 8 << 20)] {
+            let ring = ring_of::<utils::Image>(ring_depth, ring_bytes).expect("a ring");
+            assert_eq!(fill(&ring, &record, 2), Ok(()));
+        }
+        assert_eq!(ring_records(64, 8, 1), 2);
+        assert_eq!(ring_records(64, 1, 1), 2);
+        assert_eq!(ring_records(usize::MAX, 8, usize::MAX), 2);
     }
 
     #[test]
@@ -1818,5 +1936,26 @@ mod tests {
                 |e: &BuildError| matches!(e, BuildError::Ungranted { system, .. } if system == "c");
             assert!(unbound(&e), "{e}");
         }
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::ring_records;
+    use crate::port::{checked_frame_len, ring_capacity};
+
+    /// A ring holds two records at least and its depth at most, and its
+    /// capacity is at most `max(ring_bytes, 2 * frame)` rounded up to a power
+    /// of two.
+    #[kani::proof]
+    fn ring_records_bounds() {
+        let (max_len, depth, ring_bytes): (u32, u32, u32) = kani::any();
+        let (max_len, depth, ring_bytes) = (max_len as usize, depth as usize, ring_bytes as usize);
+        let records = ring_records(max_len, depth, ring_bytes);
+        assert!(records >= 2 && records <= depth.max(2));
+        let frame = checked_frame_len(max_len).expect("a u32 payload");
+        let bound = ring_bytes.max(2 * frame).next_power_of_two();
+        let capacity = ring_capacity(max_len, records).expect("a u32 payload fits");
+        assert!(capacity <= bound);
     }
 }

@@ -180,7 +180,8 @@ where
     }))
 }
 
-/// How many times larger a mirror ring is than the ring it mirrors.
+/// How many times larger a mirror ring is than the ring it mirrors, below
+/// [`LARGE_RECORD`](crate::mirror::LARGE_RECORD).
 const MIRROR_FACTOR: usize = 4;
 
 /// The coordinator's step for an async system that runs on another thread.
@@ -273,7 +274,7 @@ impl Bound {
         for (port, rings) in ports.iter().zip(inputs) {
             let mut views = Vec::with_capacity(rings.len());
             for ring in rings {
-                let mirror = Mirror::ring_for(ring, MIRROR_FACTOR)?;
+                let mirror = Mirror::ring_for(ring, port.max_len, MIRROR_FACTOR)?;
                 // PANIC Safety: a fresh mirror has its writer and its one reader
                 // slot free, and the build reserved a reader slot on `ring`.
                 self.input_mirrors.push(Mirror::new(
@@ -297,7 +298,7 @@ impl Bound {
         outputs: Vec<&RingBuffer>,
     ) -> Result<(), MakeError> {
         for (port, ring) in ports.iter().zip(outputs) {
-            let mirror = Mirror::ring_for(ring, MIRROR_FACTOR)?;
+            let mirror = Mirror::ring_for(ring, port.max_len, MIRROR_FACTOR)?;
             // PANIC Safety: the mirror is fresh, and the build gives each output
             // ring exactly one writer.
             self.output_mirrors.push(Mirror::new(

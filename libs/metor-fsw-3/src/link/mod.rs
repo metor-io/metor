@@ -30,6 +30,7 @@ use crate::coordinator::{BuildError, SystemTable};
 use crate::def::{DefCx, DefError};
 use crate::log::Log;
 use crate::port::Output;
+use crate::system::PortDef;
 use crate::{Frame, SeqError};
 
 use conns::{Conns, ConnsConfig, Event, Stats, Turn};
@@ -62,8 +63,11 @@ pub struct LinkParams {
     /// Whether `ep` dials its peer rather than listening.
     #[serde(default)]
     pub dialing: bool,
-    /// The bytes of each connection's receive buffer and of each of its two
-    /// send buffers. It is also the largest batch.
+    /// The bytes of each connection's buffers in the direction records
+    /// travel: a `Publish`'s two send buffers and its batch, or a
+    /// `Subscribe`'s receive buffer. The other direction carries control
+    /// packets and takes [`CONTROL_CAP`] at most. Every port's records must
+    /// fit, with their packet overhead.
     #[serde(default = "conn_cap")]
     pub conn_cap: usize,
     /// How long a send may stay in flight with none finishing before its
@@ -85,26 +89,63 @@ fn write_timeout_ms() -> u64 {
     5_000
 }
 
+/// The most bytes a link's buffers take in the direction that carries only
+/// control packets.
+pub const CONTROL_CAP: usize = 64 << 10;
+
 impl LinkParams {
-    fn conns(&self) -> ConnsConfig {
+    /// The connections of a link that sends records and receives control.
+    fn sending(&self) -> ConnsConfig {
+        self.conns(self.conn_cap.min(CONTROL_CAP), self.conn_cap)
+    }
+
+    /// The connections of a link that receives records and sends control.
+    fn receiving(&self) -> ConnsConfig {
+        self.conns(self.conn_cap, self.conn_cap.min(CONTROL_CAP))
+    }
+
+    fn conns(&self, rx_cap: usize, tx_cap: usize) -> ConnsConfig {
         ConnsConfig {
             slots: self.max_connections.get(),
-            conn_cap: self.conn_cap,
+            rx_cap,
+            tx_cap,
             dialing: self.dialing,
             write_timeout: Duration::from_millis(self.write_timeout_ms),
         }
+    }
+
+    /// Decodes a link's params, `None` when the config gives none.
+    fn of(cx: &DefCx<'_>) -> Result<Option<Self>, DefError> {
+        Option::<Self>::deserialize(cx.params).map_err(|e| DefError::Params {
+            message: e.to_string(),
+        })
     }
 }
 
 /// A link's op budget: [`conns::ops_for`] the slots its params ask for.
 fn link_ops(cx: &DefCx<'_>) -> Result<u16, DefError> {
-    let params = Option::<LinkParams>::deserialize(cx.params).map_err(|e| DefError::Params {
-        message: e.to_string(),
-    })?;
-    let slots = params.map_or(max_connections().get(), |p| p.conns().slot_count());
+    let params = LinkParams::of(cx)?;
+    let slots = params.map_or(max_connections().get(), |p| p.sending().slot_count());
     u16::try_from(conns::ops_for(slots)).map_err(|_| DefError::Params {
         message: format!("{slots} connections need more ops than a system holds"),
     })
+}
+
+/// Rejects the first port whose records, framed as packets, do not fit the
+/// link's `conn_cap`.
+fn check_conn_cap(cx: &DefCx<'_>, ports: &[PortDef]) -> Result<(), DefError> {
+    let conn_cap = LinkParams::of(cx)?.map_or(conn_cap(), |p| p.conn_cap);
+    match ports
+        .iter()
+        .find(|port| !wire::fits(port.max_len, conn_cap))
+    {
+        Some(port) => Err(DefError::PortExceedsConnCap {
+            port: port.name.to_string(),
+            max_len: port.max_len,
+            conn_cap,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The error a link's body ends with when its buffers do not fit its peers.
@@ -178,7 +219,8 @@ impl StatusReporter {
         link_status: &mut Output<LinkStatus>,
         log: &mut Log,
     ) {
-        turn.events().for_each(|event| log_event(event, log));
+        let rx_cap = conns.rx_cap();
+        turn.events().for_each(|event| log_event(event, rx_cap, log));
         let status = LinkStatus::new(conns.stats(), inbound_dropped, now);
         if status.inbound_dropped > self.reported.inbound_dropped {
             let dropped = status.inbound_dropped - self.reported.inbound_dropped;
@@ -191,11 +233,18 @@ impl StatusReporter {
     }
 }
 
-fn log_event(event: Event, log: &mut Log) {
+/// Logs `event`. `rx_cap` is the bytes of a connection's receive buffer.
+fn log_event(event: Event, rx_cap: usize, log: &mut Log) {
     match event {
         Event::Opened(Some(peer)) => log.info(format!("connected to {peer}")),
         Event::Opened(None) => log.info("connected"),
         Event::Closed => log.info("disconnected"),
+        Event::Oversized { len } => log.fault(
+            "oversized_packet",
+            format!(
+                "closed a peer that sent a {len}-byte packet past the {rx_cap}-byte receive buffer"
+            ),
+        ),
         Event::Refused => log.warn("refused a peer: every connection is taken"),
         Event::Failed(error) => log.warn(format!("no stream opened: {error}")),
     }

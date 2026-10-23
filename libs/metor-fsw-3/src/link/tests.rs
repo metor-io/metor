@@ -8,7 +8,7 @@ use crate::io::tests::allocations;
 use crate::io::{Buf, Cap, Endpoint, Op, RawHandle};
 use crate::port::{DynInputs, DynOutputs, Input};
 use crate::record::Payload;
-use crate::system::{InputBinding, OutputBinding};
+use crate::system::{InputBinding, OutputBinding, PortDef};
 use crate::tests::utils::{Imu, ring};
 
 use super::batch::Batcher;
@@ -73,6 +73,73 @@ fn test_link_ops_reject_bad_params() {
     assert!(matches!(&huge, Err(DefError::Params { message }) if message.contains("more ops")));
 }
 
+fn conn_cap_check(params: serde_json::Value, ports: &[PortDef]) -> Result<(), DefError> {
+    let cx = DefCx {
+        params: &params,
+        ..DefCx::empty()
+    };
+    check_conn_cap(&cx, ports)
+}
+
+/// A port of `max_len`-byte records.
+fn port(name: &str, max_len: usize) -> PortDef {
+    PortDef {
+        name: name.to_string().into(),
+        max_len,
+        ..Input::<Imu>::def(&DefCx::empty(), "imu")
+    }
+}
+
+#[test]
+fn test_conn_cap_fits_each_port() {
+    let cap = |conn_cap: usize| serde_json::json!({ "conn_cap": conn_cap });
+    let ports = [port("small", 16), port("image", 2 << 20)];
+    assert_eq!(conn_cap_check(cap((2 << 20) + 8), &ports), Ok(()));
+    assert_eq!(conn_cap_check(cap(1), &[]), Ok(()), "no port, any cap");
+    let refused = DefError::PortExceedsConnCap {
+        port: "image".into(),
+        max_len: 2 << 20,
+        conn_cap: (2 << 20) + 7,
+    };
+    assert_eq!(
+        conn_cap_check(cap((2 << 20) + 7), &ports),
+        Err(refused.clone())
+    );
+    assert!(
+        refused
+            .to_string()
+            .ends_with("a `conn_cap` of 3145728 fits them"),
+        "{refused}"
+    );
+    let default = conn_cap_check(serde_json::Value::Null, &ports);
+    assert!(
+        matches!(default, Err(DefError::PortExceedsConnCap { conn_cap, .. }) if conn_cap == 1 << 20)
+    );
+    assert!(wire::fits(usize::MAX - 8, usize::MAX));
+    assert!(
+        !wire::fits(usize::MAX - 7, usize::MAX),
+        "overflow does not fit"
+    );
+}
+
+#[test]
+fn test_buffers_split_by_direction() {
+    let params = |conn_cap: usize| LinkParams {
+        namespace: None,
+        link: String::new(),
+        max_connections: NonZeroUsize::MIN,
+        dialing: false,
+        conn_cap,
+        write_timeout_ms: 5_000,
+    };
+    let caps = |config: ConnsConfig| (config.rx_cap, config.tx_cap);
+    let image = params(4 << 20);
+    assert_eq!(caps(image.sending()), (CONTROL_CAP, 4 << 20));
+    assert_eq!(caps(image.receiving()), (4 << 20, CONTROL_CAP));
+    let small = params(4096);
+    assert_eq!(caps(small.sending()), (4096, 4096));
+}
+
 const CAP: usize = 4096;
 const STREAM: RawHandle = RawHandle::new(10, 1);
 const LISTENER: RawHandle = RawHandle::new(11, 1);
@@ -97,13 +164,19 @@ impl End {
     }
 
     /// Makes one connection's buffers and a batch buffer, as a link's make
-    /// does.
+    /// does: a dialer receives records, and a listener sends them.
     fn make(&self, dialing: bool) -> (ConnsMem, Buf) {
-        let config = ConnsConfig {
-            slots: 1,
-            conn_cap: CAP,
+        let params = LinkParams {
+            namespace: None,
+            link: String::new(),
+            max_connections: NonZeroUsize::MIN,
             dialing,
-            write_timeout: Duration::from_secs(5),
+            conn_cap: CAP,
+            write_timeout_ms: 5_000,
+        };
+        let config = match dialing {
+            true => params.receiving(),
+            false => params.sending(),
         };
         self.io
             .make(|init| Ok((ConnsMem::make(init, config)?, init.alloc(CAP)?)))

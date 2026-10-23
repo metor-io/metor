@@ -239,7 +239,7 @@ name = "adcs-systems-3"
 version = "0.14.2"
 dependencies = [
  "adcs-contracts-3",
- "futures-lite 2.6.1",
+ "futures-lite",
  "metor-adcs",
  "metor-fsw-3",
  "nox",
@@ -5590,7 +5590,7 @@ checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 name = "echo-pack"
 version = "0.14.2"
 dependencies = [
- "futures-lite 2.6.1",
+ "futures-lite",
  "metor-fsw-3",
  "schemars 1.2.1",
  "serde",
@@ -9530,7 +9530,7 @@ dependencies = [
  "clap 4.6.3",
  "const-fnv1a-hash",
  "cordyceps",
- "futures-lite 2.6.1",
+ "futures-lite",
  "indexmap 2.14.0",
  "io-uring",
  "libc",

@@ -55,9 +55,14 @@ pub trait Record: Payload {
     const ID: ComponentId = ComponentId::new(Self::NAME);
     /// The largest encoded size of this record, in bytes.
     const MAX_LEN: usize;
+    /// The size of the encode buffer an output of this record holds.
+    ///
+    /// `#[derive(Frame)]` sets it to 0, since a frame encodes as its own bytes.
+    const SCRATCH_LEN: usize = Self::MAX_LEN;
     /// How many records a producer expects to write per cycle.
     ///
-    /// A ring holds `DEPTH * ring_depth` records.
+    /// A ring holds `DEPTH * ring_depth` records, capped at what fits in
+    /// `ring_bytes` and never fewer than two.
     const DEPTH: usize = 1;
 
     /// Returns the schema a port rooted at `root` announces.

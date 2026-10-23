@@ -18,7 +18,7 @@ use crate::system::PortDef;
 use crate::{Seq, SeqError, sequence};
 
 use super::conns::{Conns, ConnsMem};
-use super::{LinkParams, LinkStatus, StatusReporter, failed, made_once, wire};
+use super::{LinkParams, LinkStatus, StatusReporter, check_conn_cap, failed, made_once, wire};
 
 /// A link that receives records from its peers and writes each one onto the
 /// output port for that record's id.
@@ -31,7 +31,7 @@ pub struct Subscribe {
 impl Subscribe {
     /// Allocates the connections' buffers.
     pub fn new(params: LinkParams, io: &mut IoInit<'_>) -> Result<Self, MakeError> {
-        let mem = ConnsMem::make(io, params.conns())?;
+        let mem = ConnsMem::make(io, params.receiving())?;
         Ok(Self {
             params,
             mem: Some(mem),
@@ -63,13 +63,8 @@ pub async fn subscribe(
         dialing,
         ..
     } = &s.params;
-    let seed: Vec<u8> = match dialing {
-        // A db peer answers these by forwarding the message logs. A
-        // `Publish` peer ignores them.
-        true => msgs
-            .iter()
-            .flat_map(|&msg_id| (&MsgStream { msg_id }).into_len_packet().inner)
-            .collect(),
+    let seed = match dialing {
+        true => stream_requests(&msgs),
         false => wire::link_info(msgs, namespace.as_deref(), link),
     };
     let tables = routes.ids(PacketTy::Table);
@@ -87,6 +82,15 @@ pub async fn subscribe(
         reporter.report(turn, &conns, dropped, seq.now(), link_status, log);
         seq.next_cycle().await;
     }
+}
+
+/// The packets a dialing link sends first: a request to stream each of
+/// `msgs`. A db peer answers them by forwarding the message logs. A
+/// `Publish` peer ignores them.
+fn stream_requests(msgs: &[PacketId]) -> Vec<u8> {
+    msgs.iter()
+        .flat_map(|&msg_id| (&MsgStream { msg_id }).into_len_packet().inner)
+        .collect()
 }
 
 /// Logs a fault for the frame port whose table the peer did not announce.
@@ -134,7 +138,8 @@ impl Param for SubscribeOutputs {
     ) -> Result<(), DefError> {
         let first = defs.outputs.len();
         <DynOutputs as Param>::append_defs(names, cx, defs)?;
-        check_route_keys(&defs.outputs[first..])
+        check_route_keys(&defs.outputs[first..])?;
+        check_conn_cap(cx, &defs.outputs[first..])
     }
 
     fn bind_in<W: InputWake>(_views: &mut Views<W>) {}
@@ -404,6 +409,14 @@ mod tests {
             check_route_keys(&[def, copy]),
             Err(DefError::RecordIdCollision { .. })
         ));
+    }
+
+    #[test]
+    fn test_dialers_seed_fits_the_control_cap() {
+        let msgs: Vec<PacketId> = (0..32u8).map(|n| [n, n]).collect();
+        let seed = stream_requests(&msgs);
+        assert!(seed.len() <= super::super::CONTROL_CAP, "{}", seed.len());
+        assert!(stream_requests(&[]).is_empty());
     }
 
     #[test]

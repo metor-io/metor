@@ -31,6 +31,10 @@ pub enum Error {
     StreamNotFound(StreamId),
     #[error("time range out of bounds")]
     TimeRangeOutOfBounds,
+    #[error("a {0} byte sample does not fit a time series response")]
+    ComponentTooLarge(usize),
+    #[error("time series data is shorter than its timestamps")]
+    SeriesTruncated,
     #[error("invalid msg id")]
     InvalidMsgId,
     #[error("msg not found {0:?}")]

@@ -20,13 +20,13 @@ use metor_fsw_3::coordinator::{
 };
 use metor_fsw_3::io::{Backing, IO_TYPE, RealKind};
 use metor_fsw_3::wasm::{Limits, WasmPack};
-use metor_fsw_3::{Frame, Output, Record, Timestamp, system};
+use metor_fsw_3::{Frame, FrameImage, Mono16, Output, Record, Timestamp, system};
 use metor_proto_stellar::{PacketSink, PacketStream, Peer, identify};
 use metor_proto_wkt::LinkInfo;
 use serde::{Deserialize, Serialize};
 use stellarator::io::{OwnedReader, OwnedWriter};
 use stellarator::net::TcpStream;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 /// How long a test waits on a target before it fails.
 pub const DEADLINE: Duration = Duration::from_secs(20);
@@ -70,6 +70,90 @@ pub fn source(#[state] s: &mut Source, imu: &mut Output<Imu>) {
         timestamp: Timestamp(s.0),
         sample: s.0 as f64,
     });
+}
+
+/// A camera's 1024² 12-bit image.
+pub type Pixels = FrameImage<Mono16<12>, 1024, 1024>;
+
+/// One camera frame.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "image_frame")]
+#[repr(C)]
+pub struct ImageFrame {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub frame_id: u64,
+    pub exposure_us: u64,
+    pub pixels: Pixels,
+}
+
+/// The pixels of frame `frame_id`: pixel `i` is `(frame_id + i) & 0xfff`.
+pub fn pattern(frame_id: u64) -> &'static [u16] {
+    static RAMP: OnceLock<Vec<u16>> = OnceLock::new();
+    let ramp = RAMP.get_or_init(|| {
+        (0..1024 * 1024 + 4096)
+            .map(|j| (j & 0xfff) as u16)
+            .collect()
+    });
+    let start = (frame_id & 0xfff) as usize;
+    &ramp[start..start + 1024 * 1024]
+}
+
+/// What a [`Camera`] shares with its test.
+#[derive(Default)]
+pub struct Shots {
+    /// The camera writes only while this is set.
+    pub on: AtomicBool,
+    /// Frames written to the ring.
+    pub written: AtomicU64,
+    /// Frames the ring refused.
+    pub refused: AtomicU64,
+}
+
+/// Writes an [`ImageFrame`] every `period_us` from a frame allocated at make.
+pub struct Camera {
+    frame: Box<ImageFrame>,
+    period_us: i64,
+    next: Option<i64>,
+    shots: Arc<Shots>,
+}
+
+impl Camera {
+    pub fn new(rate_hz: f64, shots: Arc<Shots>) -> Self {
+        Self {
+            // PANIC Safety: test setup; a failed 2 MiB allocation fails the test.
+            frame: ImageFrame::new_box_zeroed().expect("a frame"),
+            period_us: (1e6 / rate_hz) as i64,
+            next: None,
+            shots,
+        }
+    }
+}
+
+#[system]
+pub fn camera(#[state] s: &mut Camera, now: Timestamp, image: &mut Output<ImageFrame>) {
+    if !s.shots.on.load(Ordering::Acquire) {
+        s.next = None;
+        return;
+    }
+    let due = *s.next.get_or_insert(now.0);
+    if now.0 < due {
+        return;
+    }
+    s.next = Some(due + s.period_us);
+    let frame = &mut *s.frame;
+    frame.frame_id += 1;
+    frame.timestamp = now;
+    frame.exposure_us = 1000 + frame.frame_id;
+    frame
+        .pixels
+        .pixels_mut()
+        .copy_from_slice(pattern(frame.frame_id));
+    let count = match image.write(frame) {
+        Ok(()) => &s.shots.written,
+        Err(_) => &s.shots.refused,
+    };
+    count.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Returns the `echo-pack` fixture's crate directory.

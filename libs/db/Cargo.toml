@@ -104,3 +104,6 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 tempfile = "3.13.0"
 postcard-schema = { version = "0.2", features = ["use-std", "derive"] }
+
+[lints]
+workspace = true

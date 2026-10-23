@@ -78,8 +78,12 @@ pub enum MakeError {
     OpenDb { path: String, message: String },
     #[error("the connections need {needed} ops in flight, past the budget of {budget}")]
     IoOps { needed: usize, budget: usize },
-    #[error("a {seed}-byte announce does not fit a {conn_cap}-byte `conn_cap`")]
-    SeedTooLarge { seed: usize, conn_cap: usize },
+    #[error("a {seed}-byte first send does not fit a {send_cap}-byte send buffer")]
+    SeedTooLarge { seed: usize, send_cap: usize },
+    #[error(
+        "port `{port}` needs a {len}-byte copy ring that the guest's memory cannot hold; raise the pack's `memory` limit"
+    )]
+    CopyRingTooLarge { port: String, len: usize },
 }
 
 #[cfg(test)]

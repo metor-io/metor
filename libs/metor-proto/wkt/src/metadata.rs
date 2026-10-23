@@ -3,6 +3,9 @@ use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// `"true"` or `"false"`: whether the db builds LoD levels for a component.
+pub const LOD_KEY: &str = "lod";
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Schema)]
 #[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 pub struct ComponentMetadata {
@@ -86,6 +89,20 @@ impl ComponentMetadata {
             .insert("hidden".to_string(), "true".to_string());
         self
     }
+
+    pub fn with_lod(mut self, lod: bool) -> Self {
+        self.metadata.insert(LOD_KEY.to_string(), lod.to_string());
+        self
+    }
+
+    /// `None` unless `lod` is `"true"` or `"false"`.
+    pub fn lod(&self) -> Option<bool> {
+        match self.metadata.get(LOD_KEY)?.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    }
 }
 
 impl From<&str> for ComponentMetadata {
@@ -143,5 +160,21 @@ impl MetadataExt for EntityMetadata {
     }
     fn metadata(&self) -> &HashMap<String, String> {
         &self.metadata
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lod_values() {
+        let meta = ComponentMetadata::from("a");
+        assert_eq!(meta.lod(), None);
+        assert_eq!(meta.clone().with_lod(true).lod(), Some(true));
+        assert_eq!(meta.clone().with_lod(false).lod(), Some(false));
+        let mut off = meta;
+        off.set(LOD_KEY, "off");
+        assert_eq!(off.lod(), None);
     }
 }

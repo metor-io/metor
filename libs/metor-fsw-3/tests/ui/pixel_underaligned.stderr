@@ -1,0 +1,29 @@
+error[E0080]: evaluation panicked: FrameImage pixels must be whole, aligned samples of at most u32::MAX bytes in all
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `metor_fsw_3::FrameImage::<Packed16, 4, 4>::LAYOUT` failed here
+  |
+ ::: $WORKSPACE/libs/metor-component/src/image.rs
+  |
+  |       const LAYOUT: () = assert!(
+  |  ________________________-
+  | |         size_of::<P>() == P::CHANNELS * size_of::<P::Sample>()
+  | |             && align_of::<P>().is_multiple_of(align_of::<P::Sample>())
+  | |             && H * W * P::CHANNELS * <P::Sample as Element>::PRIM.size() == size_of::<Self>()
+... |
+  | |         "FrameImage pixels must be whole, aligned samples of at most u32::MAX bytes in all"
+  | |     );
+  | |_____- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/libs/metor-component/src/image.rs
+  |
+  |         let () = Self::LAYOUT;
+  |                  ^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn <FrameImage<Packed16, 4, 4> as AsVTable>::vtable_fields::<()>`
+ --> $WORKSPACE/libs/metor-component/src/vtable.rs
+  |
+  |         vtable(Self::vtable_fields(()))
+  |                ^^^^^^^^^^^^^^^^^^^^^^^

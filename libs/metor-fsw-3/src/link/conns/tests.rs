@@ -16,7 +16,8 @@ const LISTENER: RawHandle = RawHandle::new(9, 1);
 fn listen(slots: usize) -> ConnsConfig {
     ConnsConfig {
         slots,
-        conn_cap: CAP,
+        rx_cap: CAP,
+        tx_cap: CAP,
         dialing: false,
         write_timeout: Duration::from_millis(50),
     }
@@ -384,6 +385,33 @@ fn test_oversized_body_closes() {
     r.turns(2);
     assert_eq!(r.connections(), 0);
     assert!(r.bodies.is_empty());
+    let oversized = Event::Oversized { len: CAP + 4 };
+    assert_eq!(r.events(), [Event::Opened(peer_addr()), oversized]);
+}
+
+/// A sender's buffers: records go out, control comes in.
+fn split(slots: usize) -> ConnsConfig {
+    ConnsConfig {
+        rx_cap: CAP / 4,
+        tx_cap: 4 * CAP,
+        ..listen(slots)
+    }
+}
+
+#[test]
+fn test_split_caps_size_each_direction() {
+    let mut r = rig(split(1));
+    let peer = r.accept();
+    r.conns.broadcast(&[7; 2 * CAP]);
+    r.turns(2);
+    assert_eq!(r.peer(peer).received.len(), SEED.len() + 2 * CAP);
+    r.peer(peer).outbound = frame(&[1; CAP / 4 - 4]);
+    r.turns(2);
+    assert_eq!(r.bodies, [vec![1; CAP / 4 - 4]]);
+    r.peer(peer).outbound = frame(&[1; CAP / 4 - 3]);
+    r.turns(2);
+    let oversized = Event::Oversized { len: CAP / 4 + 1 };
+    assert_eq!(r.events().last(), Some(&oversized));
 }
 
 #[test]
@@ -504,9 +532,26 @@ fn test_reject_a_seed_past_conn_cap() {
         made,
         Err(MakeError::SeedTooLarge {
             seed: 65,
-            conn_cap: CAP
+            send_cap: CAP
         })
     ));
+}
+
+#[test]
+fn test_seed_is_checked_against_the_send_buffer() {
+    let (ep, io) = cap_with_ops::<Endpoint>(ops_for(1) as u16);
+    let receiving = ConnsConfig {
+        rx_cap: 4 * CAP,
+        tx_cap: CAP / 4,
+        ..listen(1)
+    };
+    let made = make(&io, &ep, receiving, &[0; CAP / 4 + 1]);
+    let refused = MakeError::SeedTooLarge {
+        seed: CAP / 4 + 1,
+        send_cap: CAP / 4,
+    };
+    assert_eq!(made.err(), Some(refused));
+    assert!(make(&io, &ep, receiving, &[0; CAP / 4]).is_ok());
 }
 
 #[test]

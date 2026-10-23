@@ -33,11 +33,17 @@ pub(crate) use sample::SampledInput;
 pub fn ring_capacity(max_len: usize, depth: usize) -> Option<usize> {
     // The ring refuses a payload longer than `u32::MAX`.
     u32::try_from(max_len).ok()?;
-    // `frame_len` overflows for a payload over `usize::MAX - 31`.
-    max_len.checked_add(2 * PAYLOAD_ALIGNMENT - 1)?;
-    frame_len(max_len)
+    checked_frame_len(max_len)?
         .checked_mul(depth.max(2))?
         .checked_next_power_of_two()
+}
+
+/// Returns the ring bytes one record of `max_len` bytes takes, or `None` on
+/// overflow.
+pub(crate) fn checked_frame_len(max_len: usize) -> Option<usize> {
+    // `frame_len` overflows for a payload over `usize::MAX - 31`.
+    max_len.checked_add(2 * PAYLOAD_ALIGNMENT - 1)?;
+    Some(frame_len(max_len))
 }
 
 /// An error from writing to an [`Output`].
@@ -138,7 +144,7 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
         };
         Self {
             writer,
-            scratch: vec![0; T::MAX_LEN].into_boxed_slice(),
+            scratch: vec![0; T::SCRATCH_LEN].into_boxed_slice(),
             max_len: T::MAX_LEN,
             dropped,
             _t: PhantomData,
@@ -249,6 +255,12 @@ impl<T: Payload + ?Sized, W: InputWake> Input<T, W> {
         Ok(best.map(|(_, decoded)| Latest { decoded }))
     }
 
+    /// Whether any producer has an unread record.
+    #[cfg(feature = "host")]
+    pub(crate) fn has_record(&mut self) -> bool {
+        self.ready().is_some()
+    }
+
     /// Returns the index of the first producer with an unread record.
     ///
     /// Deferred drain consumption is applied first.
@@ -306,6 +318,23 @@ impl<W: InputWake> DynInputs<W> {
     /// Returns each port's definition alongside its input.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Input<Bytes, W>)> {
         self.ports.iter_mut().map(|(def, input)| (&*def, input))
+    }
+
+    /// Returns each port's index, definition, and input, from port `start`
+    /// to the last and then from the first.
+    #[cfg(feature = "host")]
+    pub(crate) fn iter_mut_from(
+        &mut self,
+        start: usize,
+    ) -> impl Iterator<Item = (usize, &PortDef, &mut Input<Bytes, W>)> {
+        let start = start.min(self.ports.len());
+        let (head, tail) = self.ports.split_at_mut(start);
+        let tail = tail
+            .iter_mut()
+            .enumerate()
+            .map(move |(i, p)| (start + i, p));
+        tail.chain(head.iter_mut().enumerate())
+            .map(|(index, (def, input))| (index, &*def, input))
     }
 }
 
@@ -487,6 +516,14 @@ mod tests {
         #[cfg(target_pointer_width = "32")]
         assert!(ring_capacity(u32::MAX as usize, 4).is_none());
         assert!(ring_capacity(1 << 30, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn test_only_messages_hold_scratch() {
+        let (_frames, frame, _) = pair::<Imu>(4);
+        assert!(frame.scratch.is_empty());
+        let (_notes, note, _) = pair::<Note>(4);
+        assert_eq!(note.scratch.len(), Note::MAX_LEN);
     }
 
     #[test]

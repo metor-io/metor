@@ -196,13 +196,14 @@ impl GuestRing {
         Ok(GuestRing { offset, len })
     }
 
-    /// Creates a ring in guest memory to mirror a real ring of `capacity`
-    /// bytes, with `readers` reader slots.
+    /// Creates a ring in guest memory to mirror `port`'s real ring of
+    /// `capacity` bytes, with `readers` reader slots.
     ///
     /// The copy is [`COPY_FACTOR`] times as large. The host formats it before
     /// the guest sees it.
     fn create(
         guest: &mut Guest,
+        port: &PortDef,
         capacity: usize,
         readers: usize,
     ) -> Result<(GuestRing, RingBuffer), MakeError> {
@@ -210,7 +211,9 @@ impl GuestRing {
         let config = mirror_config(capacity, COPY_FACTOR, readers)?;
         let len = config.region_len().map_err(|_| too_large())?;
         let len = u32::try_from(len).map_err(|_| too_large())?;
-        let offset = guest.alloc_nonnull(len, PAYLOAD_ALIGNMENT as u32)?;
+        let offset = guest
+            .alloc_nonnull(len, PAYLOAD_ALIGNMENT as u32)
+            .map_err(|e| copy_ring_error(e, port, len))?;
         let base = guest
             .region(offset, len as usize)
             .map_err(PackError::from)?;
@@ -222,6 +225,17 @@ impl GuestRing {
         let ring = unsafe { RingBuffer::create_raw(base.as_ptr(), len as usize, config) }
             .map_err(|e| MakeError::Wasm(e.to_string()))?;
         Ok((GuestRing { offset, len }, ring))
+    }
+}
+
+/// Names `port` when the guest allocator refuses its `len`-byte copy ring.
+fn copy_ring_error(error: PackError, port: &PortDef, len: u32) -> MakeError {
+    match error {
+        PackError::Wasm(WasmError::Alloc(_)) => MakeError::CopyRingTooLarge {
+            port: port.name.to_string(),
+            len: len as usize,
+        },
+        error => error.into(),
     }
 }
 
@@ -331,7 +345,8 @@ impl Copies<Vec<GuestRing>> {
             let mut edge = Vec::with_capacity(reals.len());
             let readers = 1 + usize::from(capped && port.is_io());
             for real in reals {
-                let (guest_ring, copy) = GuestRing::create(guest, real.config().capacity, readers)?;
+                let (guest_ring, copy) =
+                    GuestRing::create(guest, port, real.config().capacity, readers)?;
                 // PANIC Safety: build counted this reader, and the copy is fresh.
                 copies.mirrors.push(Mirror::new(
                     port.name.clone(),
@@ -367,7 +382,8 @@ impl Copies<GuestRing> {
         };
         for (port, real) in ports.iter().zip(outputs) {
             let readers = 1 + usize::from(capped && port.is_io());
-            let (guest_ring, copy) = GuestRing::create(guest, real.config().capacity, readers)?;
+            let (guest_ring, copy) =
+                GuestRing::create(guest, port, real.config().capacity, readers)?;
             // PANIC Safety: the copy is fresh, and build counted one writer per output.
             copies.mirrors.push(Mirror::new(
                 port.name.clone(),

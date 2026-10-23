@@ -5,9 +5,12 @@ use crate::io::Buf;
 /// The bytes of a body's length prefix.
 const PREFIX: usize = 4;
 
-/// A length prefix past what the buffer holds.
+/// A length prefix past what the buffer holds. `len` is the packet's bytes,
+/// prefix included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Oversized;
+pub(crate) struct Oversized {
+    pub(crate) len: usize,
+}
 
 /// One connection's receive buffer. Its filled bytes are the ones received;
 /// those before `start` have been read.
@@ -71,7 +74,8 @@ impl Deframer {
             .checked_add(body)
             .filter(|_| body <= self.cap.saturating_sub(PREFIX))
         else {
-            return Some(Err(Oversized));
+            let len = body.saturating_add(PREFIX);
+            return Some(Err(Oversized { len }));
         };
         let range = self.start + PREFIX..end;
         if end > self.buf.len() {
@@ -222,7 +226,7 @@ mod tests {
         assert!(d.spare().is_none(), "full until read");
         assert_eq!(bodies(&mut d), [vec![7; 12]]);
         recv(&mut d, &13u32.to_le_bytes());
-        assert_eq!(d.next(), Some(Err(Oversized)), "one byte past");
+        assert_eq!(d.next(), Some(Err(Oversized { len: 17 })), "one byte past");
     }
 
     #[test]
@@ -252,12 +256,17 @@ mod tests {
             &[frame(b"ok"), 13u32.to_le_bytes().to_vec()].concat(),
         );
         assert_eq!(d.next(), Some(Ok(&b"ok"[..])));
-        assert_eq!(d.next(), Some(Err(Oversized)));
+        assert_eq!(d.next(), Some(Err(Oversized { len: 17 })));
         recv(&mut d, b"more");
-        assert_eq!(d.next(), Some(Err(Oversized)), "nothing further");
+        assert_eq!(
+            d.next(),
+            Some(Err(Oversized { len: 17 })),
+            "nothing further"
+        );
         let (mut d, _io) = deframer(16);
         recv(&mut d, &u32::MAX.to_le_bytes());
-        assert_eq!(d.next(), Some(Err(Oversized)), "the largest prefix");
+        let len = u32::MAX as usize + 4;
+        assert_eq!(d.next(), Some(Err(Oversized { len })), "the largest prefix");
     }
 
     #[test]
@@ -272,6 +281,10 @@ mod tests {
 
 #[cfg(kani)]
 mod proofs {
+    use metor_proto::types::{PACKET_HEADER_LEN, PacketTy};
+
+    use super::super::batch::append;
+    use super::super::wire::{PACKET_OVERHEAD, fits};
     use super::*;
 
     const CAP: usize = 8;
@@ -308,5 +321,35 @@ mod proofs {
             assert_eq!(d.buf.len(), count);
             assert!(d.buf.iter().zip(unread).all(|(a, b)| *a == b));
         }
+    }
+
+    /// The largest buffer the fit proof tries.
+    const FIT_CAP: usize = 24;
+
+    /// A buffer of `len` bytes, split from a `FIT_CAP`-byte one.
+    fn buf(len: usize) -> Buf {
+        let mut buf = Buf::owned(Box::new([0; FIT_CAP]));
+        let _tail = buf.split_off(len);
+        buf
+    }
+
+    /// A record that `fits` a `conn_cap` goes whole into an empty
+    /// `conn_cap`-byte batch, and a `conn_cap`-byte receive buffer yields its
+    /// body.
+    #[kani::proof]
+    #[kani::unwind(26)]
+    fn fitting_records_cross_the_link() {
+        let (max_len, conn_cap): (usize, usize) = (kani::any(), kani::any());
+        kani::assume(conn_cap <= FIT_CAP && fits(max_len, conn_cap));
+        let mut batch = buf(conn_cap);
+        let payload = [7; FIT_CAP];
+        append(&mut batch, PacketTy::Table, [1, 2], &payload[..max_len]);
+        assert_eq!(batch.len(), max_len + PACKET_OVERHEAD);
+        let mut d = Deframer::new(buf(conn_cap));
+        let mut tail = d.spare().expect("an empty buffer");
+        assert_eq!(tail.extend(&batch), batch.len());
+        assert!(d.filled(tail).is_ok());
+        let body = d.next().expect("a whole packet").expect("not oversized");
+        assert_eq!(body.len(), max_len + PACKET_HEADER_LEN);
     }
 }
