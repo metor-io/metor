@@ -23,7 +23,7 @@ use super::binding::{ElementRef, active_severity, component_meta, spawn_on_strea
 use super::format_number;
 use super::tooltip::TooltipText;
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
-use crate::theme::{Theme, theme};
+use crate::theme::{Theme, theme, ui_px};
 
 /// Which side of a component's value is the alarm.
 ///
@@ -479,7 +479,7 @@ impl Render for Annunciator {
             .flex_1()
             .flex()
             .flex_col()
-            .gap(px(3.0))
+            .gap(ui_px(3.0))
             .content_start();
         match self.columns {
             0 => {
@@ -492,7 +492,7 @@ impl Render for Annunciator {
                         .flex()
                         .flex_row()
                         .flex_wrap()
-                        .gap(px(3.0))
+                        .gap(ui_px(3.0))
                         .children(tiles),
                 );
             }
@@ -502,7 +502,7 @@ impl Render for Annunciator {
                         .iter()
                         .map(|visual| render_tile(visual, fallback, &theme, cx).flex_1())
                         .collect();
-                    body = body.child(div().flex().flex_row().gap(px(3.0)).children(tiles));
+                    body = body.child(div().flex().flex_row().gap(ui_px(3.0)).children(tiles));
                 }
             }
         }
@@ -513,11 +513,11 @@ impl Render for Annunciator {
                 div().flex().flex_row().justify_end().child(
                     div()
                         .id("annunciator-ack-all")
-                        .px(px(8.0))
-                        .py(px(2.0))
+                        .px(ui_px(8.0))
+                        .py(ui_px(2.0))
                         .rounded(px(3.0))
                         .bg(theme.bg_secondary)
-                        .text_size(px(11.0))
+                        .text_size(ui_px(11.0))
                         .text_color(theme.text_secondary)
                         .cursor_pointer()
                         .child("Ack")
@@ -528,15 +528,15 @@ impl Render for Annunciator {
         div()
             .track_focus(&self.focus)
             .size_full()
-            .p(px(8.0))
+            .p(ui_px(8.0))
             .flex()
             .flex_col()
-            .gap(px(6.0))
+            .gap(ui_px(6.0))
             .children(ack_all)
             .when(self.source == AnnunciatorSource::Alarms, |d| {
                 d.child(
                     div()
-                        .text_size(px(10.0))
+                        .text_size(ui_px(10.0))
                         .text_color(theme.text_tertiary)
                         .child("Live alarms"),
                 )
@@ -546,7 +546,7 @@ impl Render for Annunciator {
                 |d| {
                     d.child(
                         div()
-                            .text_size(px(10.0))
+                            .text_size(ui_px(10.0))
                             .text_color(theme.text_tertiary)
                             .child("Historical conditions · latch history unavailable"),
                     )
@@ -646,14 +646,14 @@ fn render_tile(
     div()
         .id(("annunciator-tile", visual.key as usize))
         .rounded(px(3.0))
-        .min_w(px(14.0))
-        .min_h(px(14.0))
+        .min_w(ui_px(14.0))
+        .min_h(ui_px(14.0))
         .bg(fill)
         .flex()
         .flex_col()
         .justify_center()
         .when(has_text, |tile| {
-            tile.px(px(6.0)).py(px(3.0)).min_w(px(56.0))
+            tile.px(ui_px(6.0)).py(ui_px(3.0)).min_w(ui_px(56.0))
         })
         .when(!visual.first_out, |tile| {
             tile.border_1().border_color(border)
@@ -661,7 +661,7 @@ fn render_tile(
         .when(visual.first_out, |tile| {
             tile.border_2().border_color(control_active).child(
                 div()
-                    .text_size(px(8.0))
+                    .text_size(ui_px(8.0))
                     .text_color(control_active)
                     .child("1st"),
             )
@@ -670,7 +670,7 @@ fn render_tile(
             div()
                 .overflow_hidden()
                 .text_ellipsis()
-                .text_size(px(11.0))
+                .text_size(ui_px(11.0))
                 .text_color(text)
                 .child(label)
         }))
@@ -678,7 +678,7 @@ fn render_tile(
             visual
                 .value
                 .clone()
-                .map(|value| div().text_size(px(10.0)).text_color(text).child(value)),
+                .map(|value| div().text_size(ui_px(10.0)).text_color(text).child(value)),
         )
         .when_some(visual.click, |tile, click| {
             tile.cursor_pointer().on_mouse_down(

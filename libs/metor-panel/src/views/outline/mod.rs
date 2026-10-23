@@ -40,7 +40,7 @@ use crate::inspector::plot_preview::shift_hover_listener;
 use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 use crate::tiles::{OpenOutlineAction, PlotComponentAction};
 use model::{
     Disclosure, FrameType, Layout, OutlineRow, Pivot, PivotLayout, RowKind, alike, common_suffix,
@@ -309,13 +309,13 @@ impl ComponentOutline {
             .flex_row()
             .items_center()
             .w_full()
-            .h(px(24.0))
-            .px(px(8.0))
-            .gap(px(6.0))
+            .h(ui_px(24.0))
+            .px(ui_px(8.0))
+            .gap(ui_px(6.0))
             .bg(theme.bg_secondary)
             .border_b_1()
             .border_color(theme.border_primary)
-            .text_size(px(11.0))
+            .text_size(ui_px(11.0))
             .text_color(theme.text_secondary);
         let show_all: Arc<dyn Fn(&mut Self, &mut Context<Self>)> = if let Some(label) = focus {
             bar = bar
@@ -1097,7 +1097,7 @@ impl OutlineDelegate {
             ),
         };
 
-        let mut slot = div().w(px(12.0)).flex_shrink_0();
+        let mut slot = div().w(ui_px(12.0)).flex_shrink_0();
         if is_branch {
             let icon = if row.expanded {
                 Icon::ChevronDown
@@ -1112,11 +1112,11 @@ impl OutlineDelegate {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(4.0))
+            .gap(ui_px(4.0))
             .h_full()
-            .pl(px(8.0 + row.depth as f32 * INDENT))
-            .pr(px(8.0))
-            .text_size(px(13.0))
+            .pl(ui_px(8.0 + row.depth as f32 * INDENT))
+            .pr(ui_px(8.0))
+            .text_size(ui_px(13.0))
             .text_color(color)
             .child(slot)
             .child(
@@ -1131,12 +1131,12 @@ impl OutlineDelegate {
         if let RowKind::PivotBranch(pivot) = &row.kind {
             cell = cell.child(
                 div()
-                    .ml(px(4.0))
+                    .ml(ui_px(4.0))
                     .min_w_0()
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(11.0))
+                    .text_size(ui_px(11.0))
                     .text_color(theme.text_tertiary)
                     .child(SharedString::from(format!(
                         "{} × {}",
@@ -1217,8 +1217,8 @@ impl OutlineDelegate {
                 .flex()
                 .items_center()
                 .h_full()
-                .px(px(8.0))
-                .text_size(px(12.0))
+                .px(ui_px(8.0))
+                .text_size(ui_px(12.0))
                 .text_color(theme.text_tertiary)
                 .child(SharedString::from(label))
                 .into_any_element();
@@ -1238,7 +1238,7 @@ impl OutlineDelegate {
         let n_cells = strip_cell_count(&db, id);
         let mut line = div().child(strip);
         if n_cells > 1 {
-            line = line.min_w(px(strip_row_width(n_cells)));
+            line = line.min_w(ui_px(strip_row_width(n_cells)));
         }
         line.style().flex_shrink = Some(0.0);
         let mut scroll = div()
@@ -1246,7 +1246,7 @@ impl OutlineDelegate {
             .flex()
             .items_center()
             .h_full()
-            .px(px(4.0))
+            .px(ui_px(4.0))
             .overflow_x_scroll()
             .child(line);
         scroll.style().restrict_scroll_to_axis = Some(true);
@@ -1275,17 +1275,17 @@ impl OutlineDelegate {
             let menu_field = field.clone();
             div()
                 .id((field.clone(), row_ix))
-                .w(px(pivot_cell_width(n, field)))
+                .w(ui_px(pivot_cell_width(n, field)))
                 .h_full()
                 .flex()
                 .items_center()
                 .flex_shrink_0()
                 .border_r_1()
                 .border_color(theme.border_primary)
-                .px(px(PIVOT_CELL_PAD / 2.0))
+                .px(ui_px(PIVOT_CELL_PAD / 2.0))
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .text_size(px(11.0))
+                .text_size(ui_px(11.0))
                 .text_color(theme.text_tertiary)
                 .child(field.clone())
                 .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
@@ -1331,17 +1331,17 @@ impl OutlineDelegate {
         let mut cells: Vec<AnyElement> = Vec::with_capacity(pivot.fields.len());
         for (field_ix, (field, &n)) in pivot.fields.iter().zip(&pivot.cells).enumerate() {
             let cell = div()
-                .w(px(pivot_cell_width(n, field)))
+                .w(ui_px(pivot_cell_width(n, field)))
                 .h_full()
                 .flex_shrink_0()
                 .border_r_1()
                 .border_color(theme.border_primary)
-                .px(px(PIVOT_CELL_PAD / 2.0))
+                .px(ui_px(PIVOT_CELL_PAD / 2.0))
                 .flex()
                 .items_center();
             let Some(id) = instance.ids[field_ix] else {
                 cells.push(
-                    cell.text_size(px(12.0))
+                    cell.text_size(ui_px(12.0))
                         .text_color(theme.text_tertiary)
                         .child(SharedString::new_static("—"))
                         .into_any_element(),
@@ -1356,7 +1356,7 @@ impl OutlineDelegate {
             strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
             // Hold the strip to one line: the cell is sized for it, and
             // an element that still doesn't fit should clip, not wrap.
-            let mut line = div().min_w(px(strip_row_width(n))).child(strip);
+            let mut line = div().min_w(ui_px(strip_row_width(n))).child(strip);
             line.style().flex_shrink = Some(0.0);
             cells.push(cell.child(line).into_any_element());
         }
@@ -1371,8 +1371,8 @@ impl OutlineDelegate {
             .flex()
             .items_center()
             .h_full()
-            .px(px(8.0))
-            .text_size(px(12.0))
+            .px(ui_px(8.0))
+            .text_size(ui_px(12.0))
             .text_color(theme.text_secondary)
             .whitespace_nowrap()
             .children(text.map(SharedString::from))
@@ -1451,7 +1451,7 @@ impl TableDelegate for OutlineDelegate {
                 let plot = self.sparkline(id, cx);
                 div()
                     .w_full()
-                    .h(self.row_height() - px(8.0))
+                    .h(ui_px(f32::from(self.row_height()) - 8.0))
                     .child(plot)
                     .into_any_element()
             }

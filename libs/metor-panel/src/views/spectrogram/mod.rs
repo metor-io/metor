@@ -22,8 +22,9 @@ use gpui::{
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-#[allow(unused_imports)]
 use crate::inspect;
+#[allow(unused_imports)]
+use crate::theme::{ui_px, ui_scale};
 
 use super::time_series::{
     AxisZone, Colormap, IntensityScale, Override, PADDING, PlotBounds, TimeFormat, X_LABEL_HEIGHT,
@@ -184,7 +185,7 @@ impl Render for Spectrogram {
                             } else {
                                 let zone = this
                                     .last_plot_area
-                                    .map(|pa| axis_zone(event.position, pa, 1))
+                                    .map(|pa| axis_zone(event.position, pa, 1, 1.0))
                                     .unwrap_or(AxisZone::Plot);
                                 this.drag_start = Some(event.position);
                                 this.drag_start_view = this.plot.read(cx).effective_view(cx);
@@ -241,7 +242,9 @@ impl Render for Spectrogram {
                             let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
                             let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
 
-                            let zone = axis_zone(event.position, pa, 1);
+                            // One axis column: its width never decides an index, so the
+                            // zoom it was laid out at doesn't matter here.
+                            let zone = axis_zone(event.position, pa, 1, 1.0);
                             let (ax, ay) = view.screen_anchor(pa, event.position);
                             let new_view = match zone {
                                 AxisZone::Plot => view.zoom_at(factor, ax, 1.0 - ay),
@@ -256,18 +259,18 @@ impl Render for Spectrogram {
                     .child(
                         div()
                             .absolute()
-                            .left(px(Y_LABEL_WIDTH + PADDING))
-                            .top(px(PADDING))
-                            .right(px(PADDING))
-                            .bottom(px(X_LABEL_HEIGHT + PADDING))
+                            .left(ui_px(Y_LABEL_WIDTH + PADDING))
+                            .top(ui_px(PADDING))
+                            .right(ui_px(PADDING))
+                            .bottom(ui_px(X_LABEL_HEIGHT + PADDING))
                             .child(self.plot.clone()),
                     )
                     .child(
                         canvas(
                             {
                                 let this = cx.entity().downgrade();
-                                move |bounds, _window, cx| {
-                                    let pa = plot_area(bounds, 1);
+                                move |bounds, window, cx| {
+                                    let pa = plot_area(bounds, 1, ui_scale(window));
                                     let _ = this.update(cx, |this, _| {
                                         this.last_plot_area = Some(pa);
                                     });
@@ -374,7 +377,8 @@ fn format_frequency(hz: f64) -> String {
 /// No interior gridlines: over a filled image they read as artefacts of the
 /// data rather than as chrome.
 fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx: &mut gpui::App) {
-    let pa = plot_area(outer, 1);
+    let s = ui_scale(window);
+    let pa = plot_area(outer, 1, s);
     let theme = crate::theme::theme(cx);
     let view = chrome.view;
     crate::temporal::paint_playhead(pa, (view.min_x, view.max_x), window, cx);
@@ -416,7 +420,7 @@ fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx:
         crate::views::plot_common::paint_text_label(
             label,
             theme.text_secondary,
-            |width, _| point(x - width / 2.0, pa.origin.y + pa.size.height + px(4.0)),
+            |width, _| point(x - width / 2.0, pa.origin.y + pa.size.height + px(4.0 * s)),
             window,
             cx,
         );
@@ -434,7 +438,7 @@ fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx:
         crate::views::plot_common::paint_text_label(
             label,
             theme.text_secondary,
-            |width, font_size| point(pa.origin.x - width - px(4.0), y - font_size / 2.0),
+            |width, font_size| point(pa.origin.x - width - px(4.0 * s), y - font_size / 2.0),
             window,
             cx,
         );
@@ -463,12 +467,13 @@ fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx:
                 // Flip to the pointer's left near the right edge so the
                 // readout never runs off the pane.
                 let right = pa.origin.x + pa.size.width;
-                let x = if pos.x + px(8.0) + width > right {
-                    pos.x - px(8.0) - width
+                let gap = px(8.0 * s);
+                let x = if pos.x + gap + width > right {
+                    pos.x - gap - width
                 } else {
-                    pos.x + px(8.0)
+                    pos.x + gap
                 };
-                point(x, pos.y - font_size - px(4.0))
+                point(x, pos.y - font_size - px(4.0 * s))
             },
             window,
             cx,
@@ -480,8 +485,9 @@ fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx:
 /// range the colours currently map. Without it the picture has no units.
 fn paint_colorbar(pa: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx: &mut gpui::App) {
     let theme = crate::theme::theme(cx);
-    let width = px(COLORBAR_WIDTH);
-    let left = pa.origin.x + pa.size.width - width - px(2.0);
+    let s = ui_scale(window);
+    let width = px(COLORBAR_WIDTH * s);
+    let left = pa.origin.x + pa.size.width - width - px(2.0 * s);
     let height = pa.size.height;
     let step = height / COLORBAR_STEPS as f32;
     for i in 0..COLORBAR_STEPS {
@@ -507,13 +513,13 @@ fn paint_colorbar(pa: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx: 
         (hi, pa.origin.y),
         (
             lo,
-            pa.origin.y + height - px(crate::views::time_series::LABEL_FONT_SIZE),
+            pa.origin.y + height - px(crate::views::time_series::LABEL_FONT_SIZE * s),
         ),
     ] {
         crate::views::plot_common::paint_text_label(
             format!("{}{}", format_value_label(value), unit),
             theme.text_secondary,
-            |label_width, _| point(left - label_width - px(3.0), y),
+            |label_width, _| point(left - label_width - px(3.0 * s), y),
             window,
             cx,
         );

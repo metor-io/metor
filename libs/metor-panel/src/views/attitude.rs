@@ -37,7 +37,7 @@ use smallvec::SmallVec;
 use super::binding::{
     self, ElementRef, component_meta, spawn_elements_stream, spawn_meta_resolver,
 };
-use crate::theme::{Theme, theme};
+use crate::theme::{Theme, theme, ui_px, ui_scale};
 
 /// Pitch angle that moves the horizon by a full ball radius.
 const PITCH_FULL_SCALE: f32 = std::f32::consts::FRAC_PI_2;
@@ -510,6 +510,7 @@ impl Render for AttitudeIndicator {
                     bounds.origin.x + bounds.size.width / 2.0,
                     bounds.origin.y + bounds.size.height / 2.0,
                 );
+                let scale = ui_scale(window);
 
                 // Unfixed shows a neutral disc: a level ball would read as a
                 // valid attitude when there is none.
@@ -576,17 +577,15 @@ impl Render for AttitudeIndicator {
                     // Markers sit in the body frame, so they do not rotate
                     // with the ball.
                     let p = place(center, offset, 0.0);
-                    let dot = Bounds::new(
-                        point(p.x - px(MARKER_PX), p.y - px(MARKER_PX)),
-                        gpui::size(px(MARKER_PX * 2.0), px(MARKER_PX * 2.0)),
-                    );
+                    let r = px(MARKER_PX * scale);
+                    let dot = Bounds::new(point(p.x - r, p.y - r), gpui::size(r * 2.0, r * 2.0));
                     if ahead {
                         let mut quad = gpui::fill(dot, color);
-                        quad.corner_radii = gpui::Corners::all(px(MARKER_PX));
+                        quad.corner_radii = gpui::Corners::all(r);
                         window.paint_quad(quad);
                     } else {
                         let mut quad = gpui::fill(dot, gpui::transparent_black());
-                        quad.corner_radii = gpui::Corners::all(px(MARKER_PX));
+                        quad.corner_radii = gpui::Corners::all(r);
                         quad.border_widths = gpui::Edges::all(px(1.5));
                         quad.border_color = color;
                         window.paint_quad(quad);
@@ -602,7 +601,7 @@ impl Render for AttitudeIndicator {
                         place(center, (-wing, 0.0), 0.0),
                         place(center, (-wing * 0.35, 0.0), 0.0),
                     ],
-                    px(2.0),
+                    px(2.0 * scale),
                     reticle,
                     window,
                 );
@@ -611,7 +610,7 @@ impl Render for AttitudeIndicator {
                         place(center, (wing * 0.35, 0.0), 0.0),
                         place(center, (wing, 0.0), 0.0),
                     ],
-                    px(2.0),
+                    px(2.0 * scale),
                     reticle,
                     window,
                 );
@@ -623,15 +622,15 @@ impl Render for AttitudeIndicator {
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(3.0))
-            .p(px(6.0));
+            .gap(ui_px(3.0))
+            .p(ui_px(6.0));
 
         if !self.label.is_empty() {
             tile = tile.child(
                 div()
                     .w_full()
                     .truncate()
-                    .text_size(px(10.0))
+                    .text_size(ui_px(10.0))
                     .text_color(theme.text_secondary)
                     .child(self.label.clone()),
             );
@@ -652,7 +651,7 @@ impl Render for AttitudeIndicator {
             };
             tile = tile.child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(ui_px(10.0))
                     .text_color(theme.text_primary)
                     .child(SharedString::from(text)),
             );
@@ -665,16 +664,16 @@ impl Render for AttitudeIndicator {
                 .flex_row()
                 .flex_wrap()
                 .justify_center()
-                .gap(px(6.0))
-                .text_size(px(9.0));
+                .gap(ui_px(6.0))
+                .text_size(ui_px(9.0));
             for (color, label) in legend {
                 row = row.child(
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(3.0))
-                        .child(div().w(px(6.0)).h(px(6.0)).rounded(px(3.0)).bg(color))
+                        .gap(ui_px(3.0))
+                        .child(div().w(ui_px(6.0)).h(ui_px(6.0)).rounded(px(3.0)).bg(color))
                         .child(div().text_color(theme.text_tertiary).child(label)),
                 );
             }

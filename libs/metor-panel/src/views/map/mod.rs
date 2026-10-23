@@ -33,7 +33,7 @@ use smallvec::SmallVec;
 use super::binding::{component_meta, spawn_elements_stream};
 use super::time_series::Override;
 use super::time_series::time_range::TimeRangeBehavior;
-use crate::theme::{Theme, theme};
+use crate::theme::{Theme, theme, ui_px, ui_scale};
 
 pub mod mercator;
 pub mod tiles;
@@ -604,14 +604,15 @@ impl Render for Map {
                         let m = wrap_toward(project(lat, lon), camera.center);
                         let (x, y) = camera.to_screen(m, size);
                         let center = point(origin.x + px(x as f32), origin.y + px(y as f32));
+                        let r = px(MARKER_PX * ui_scale(window));
                         let dot = Bounds::new(
-                            point(center.x - px(MARKER_PX), center.y - px(MARKER_PX)),
-                            gpui::size(px(MARKER_PX * 2.0), px(MARKER_PX * 2.0)),
+                            point(center.x - r, center.y - r),
+                            gpui::size(r * 2.0, r * 2.0),
                         );
                         // The house pill treatment: the hue washed out
                         // inside, full strength around the edge.
                         let mut quad = gpui::fill(dot, Theme::dim(marker_color, MARKER_FILL_ALPHA));
-                        quad.corner_radii = Corners::all(px(MARKER_PX));
+                        quad.corner_radii = Corners::all(r);
                         quad.border_widths = Edges::all(px(1.5));
                         quad.border_color = marker_color;
                         window.paint_quad(quad);
@@ -685,10 +686,10 @@ impl Render for Map {
                 .absolute()
                 .bottom_0()
                 .right_0()
-                .px(px(4.0))
-                .py(px(1.0))
+                .px(ui_px(4.0))
+                .py(ui_px(1.0))
                 .bg(theme.plot_chrome_bg())
-                .text_size(px(9.0))
+                .text_size(ui_px(9.0))
                 .text_color(theme.text_secondary)
                 .child(attribution),
         );
@@ -701,7 +702,7 @@ impl Render for Map {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(11.0))
+                    .text_size(ui_px(11.0))
                     .text_color(theme.text_tertiary)
                     .child("no position bound — pick a component in the inspector"),
             );

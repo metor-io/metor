@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gpui::{Context, Entity, IntoElement, SharedString, Window, div, prelude::*, px};
+use gpui::{Context, Entity, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
@@ -10,7 +10,7 @@ use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripSt
 use crate::ComponentStreamBuilder;
 use crate::inspector::edits::{EditRequest, pending_edits, pending_edits_mut};
 use crate::inspector::plot_preview::shift_hover_listener;
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 
 /// Dashboard tile showing a component's current value, name, and an optional
 /// sparkline.
@@ -244,21 +244,26 @@ impl Render for Monitor {
             root = root.child(
                 div()
                     .w_full()
-                    .pt(px(4.0))
+                    .pt(ui_px(4.0))
                     .flex_1()
-                    .min_h(px(16.0))
+                    .min_h(ui_px(16.0))
                     .child(self.sparkline.clone()),
             );
         }
 
-        root = root.child(div().px(px(6.0)).pt(px(3.0)).child(self.strip.clone()));
+        root = root.child(
+            div()
+                .px(ui_px(6.0))
+                .pt(ui_px(3.0))
+                .child(self.strip.clone()),
+        );
 
         root = root.child(
             div()
                 .id("monitor-name")
-                .px(px(6.0))
-                .pb(px(4.0))
-                .text_size(px(11.0))
+                .px(ui_px(6.0))
+                .pb(ui_px(4.0))
+                .text_size(ui_px(11.0))
                 .text_color(theme.text_primary)
                 .on_mouse_move(shift_hover_listener(self.source.id(), SmallVec::new()))
                 .child(self.name.clone()),

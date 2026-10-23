@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Hsla, Result, SharedString, Styled, Svg, px, svg};
+use gpui::{AssetSource, Hsla, Result, SharedString, Styled, Svg, svg};
+
+use crate::theme::ui_px;
 
 /// [`AssetSource`] for the icon set compiled into the binary.
 ///
@@ -169,7 +171,7 @@ impl Icon {
     pub fn svg(self, size: f32) -> Svg {
         svg()
             .path(SharedString::from(self.asset_path()))
-            .size(px(size))
+            .size(ui_px(size))
             .text_color(crate::theme::DARK.text_secondary)
     }
 
@@ -177,7 +179,7 @@ impl Icon {
     pub fn svg_color(self, size: f32, color: Hsla) -> Svg {
         svg()
             .path(SharedString::from(self.asset_path()))
-            .size(px(size))
+            .size(ui_px(size))
             .text_color(color)
     }
 }

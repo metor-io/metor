@@ -1,5 +1,6 @@
 //! Shared event readout styling for plots and timeline previews.
 use super::PlotEvent;
+use crate::theme::ui_px;
 use crate::views::popover::readout_card;
 use crate::views::time_series::LABEL_FONT_SIZE;
 use gpui::{App, SharedString, div, prelude::*, px};
@@ -23,17 +24,23 @@ pub(crate) fn event_summary_row(ev: &PlotEvent, theme: &crate::theme::Theme) -> 
         .gap_1()
         .child(
             div()
-                .text_size(px(LABEL_FONT_SIZE))
+                .text_size(ui_px(LABEL_FONT_SIZE))
                 .text_color(theme.text_tertiary)
                 .child(SharedString::from(crate::views::format::format_time(
                     ev.ts.0,
                 ))),
         )
-        .child(div().w(px(8.0)).h(px(8.0)).rounded(px(2.0)).bg(ev.color))
+        .child(
+            div()
+                .w(ui_px(8.0))
+                .h(ui_px(8.0))
+                .rounded(px(2.0))
+                .bg(ev.color),
+        )
         .child(
             div()
                 .flex_1()
-                .text_size(px(LABEL_FONT_SIZE))
+                .text_size(ui_px(LABEL_FONT_SIZE))
                 .text_color(theme.text_secondary)
                 .child(ev.label.clone()),
         )

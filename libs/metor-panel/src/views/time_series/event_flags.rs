@@ -11,7 +11,7 @@ pub(super) fn paint_event_flags(
     cx: &mut gpui::App,
 ) {
     crate::plot_events::flags::paint_event_flags(
-        super::plot_area(bounds, view.axis_count()),
+        super::plot_area(bounds, view.axis_count(), crate::theme::ui_scale(window)),
         clusters,
         window,
         cx,

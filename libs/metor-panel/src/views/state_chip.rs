@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use gpui::{App, Context, Entity, Hsla, IntoElement, SharedString, Window, div, prelude::*, px};
+use gpui::{App, Context, Entity, Hsla, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use super::binding;
 use super::monitor::{behavior_snapshot, edit_click};
 use super::value_strip::{ComponentValueStrip, StateTable, StripClick, StripStyle};
+
+use crate::theme::ui_px;
 
 /// One row of a chip's lookup table.
 #[derive(facet::Facet)]
@@ -239,7 +241,7 @@ impl Render for StateChip {
             .flex()
             .items_center()
             .justify_center()
-            .p(px(4.0))
+            .p(ui_px(4.0))
             .overflow_hidden()
             .child(self.strip.clone())
     }

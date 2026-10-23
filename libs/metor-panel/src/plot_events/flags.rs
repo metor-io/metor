@@ -172,7 +172,12 @@ pub(crate) fn paint_event_flags(
 ) -> Vec<Bounds<Pixels>> {
     let mut hits = Vec::with_capacity(clusters.len());
     let plot_bg = crate::theme::theme(cx).bg_primary;
-    let chip_font_size = px(CHIP_FONT_SIZE);
+    // Chip metrics are designed unzoomed; inside a zoomed dashboard widget
+    // they scale with its rem like the rest of the plot chrome.
+    let s = crate::theme::ui_scale(window);
+    let chip_font_size = px(CHIP_FONT_SIZE * s);
+    let chip_h = px(CHIP_H * s);
+    let chip_pad = px(CHIP_PAD_X * s);
     let font = window.text_style().font();
     let top = pb.origin.y;
     let bottom = pb.origin.y + pb.size.height;
@@ -190,7 +195,7 @@ pub(crate) fn paint_event_flags(
             a: 0.5,
             ..cluster.color
         };
-        let mut rule = PathBuilder::stroke(px(2.0));
+        let mut rule = PathBuilder::stroke(px(2.0 * s));
         rule.move_to(point(x, top));
         rule.line_to(point(x, bottom));
         if let Ok(path) = rule.build() {
@@ -200,9 +205,9 @@ pub(crate) fn paint_event_flags(
         // The chip claims at most the gap to the next flag (so neighbors
         // never overlap) and the plot's right edge.
         let next_x = clusters.get(i + 1).map(|c| c.x).unwrap_or(right).min(right);
-        let avail = next_x - x - px(2.0);
-        let chip_y = top + px(1.0);
-        match fit_label(&cluster.label, avail) {
+        let avail = next_x - x - px(2.0 * s);
+        let chip_y = top + px(s);
+        match fit_label(&cluster.label, avail / s) {
             Some(text) if !text.is_empty() => {
                 let run = TextRun {
                     len: text.len(),
@@ -220,12 +225,12 @@ pub(crate) fn paint_event_flags(
                 );
                 let chip = Bounds::new(
                     point(x, chip_y),
-                    gpui::size(shaped.width + px(CHIP_PAD_X * 2.0), px(CHIP_H)),
+                    gpui::size(shaped.width + chip_pad * 2.0, chip_h),
                 );
                 hits.push(chip);
                 window.paint_quad(gpui::quad(
                     chip,
-                    px(CHIP_RADIUS),
+                    px(CHIP_RADIUS * s),
                     mix(plot_bg, cluster.color, 0.18),
                     px(1.0),
                     Hsla {
@@ -234,15 +239,12 @@ pub(crate) fn paint_event_flags(
                     },
                     gpui::BorderStyle::Solid,
                 ));
-                let origin = point(
-                    x + px(CHIP_PAD_X),
-                    chip_y + (px(CHIP_H) - chip_font_size) / 2.0,
-                );
+                let origin = point(x + chip_pad, chip_y + (chip_h - chip_font_size) / 2.0);
                 let _ = shaped.paint(origin, chip_font_size, TextAlign::Left, None, window, cx);
             }
             _ => {
                 // No room for text: a bare rounded nub marks the flag.
-                let nub = Bounds::new(point(x, chip_y), gpui::size(px(7.0), px(7.0)));
+                let nub = Bounds::new(point(x, chip_y), gpui::size(px(7.0 * s), px(7.0 * s)));
                 hits.push(nub);
                 window.paint_quad(gpui::quad(
                     nub,

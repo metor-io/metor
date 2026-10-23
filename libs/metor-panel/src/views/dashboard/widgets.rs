@@ -8,14 +8,14 @@ use std::sync::Arc;
 
 use gpui::{
     AnyView, App, Context, Corners, Entity, IntoElement, Render, RenderImage, SharedString, Window,
-    canvas, div, prelude::*, px,
+    canvas, div, prelude::*,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 use crate::tiles::panels::{OutlinePanelConfig, apply_outline_config, outline_config};
 use crate::views::time_series::{PlotPanelConfig, TimeSeriesPlot};
 use crate::views::viewer_3d::{Viewer3d, Viewer3dPanelConfig};
@@ -1038,7 +1038,7 @@ impl Render for ImageWidget {
                 .items_center()
                 .justify_center()
                 .text_color(theme.text_tertiary)
-                .text_size(px(14.0))
+                .text_size(ui_px(14.0))
                 .child(self.label.clone())
         }
     }
@@ -1111,7 +1111,7 @@ impl Render for PlaceholderWidget {
             .items_center()
             .justify_center()
             .text_color(theme.text_tertiary)
-            .text_size(px(14.0))
+            .text_size(ui_px(14.0))
             .child(self.label.clone())
     }
 }

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use super::binding::{self, ElementRef, component_meta, spawn_meta_resolver, spawn_scalar_stream};
 use super::format_number;
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 
 /// Which way the bar grows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, facet::Facet, Serialize, Deserialize)]
@@ -369,16 +369,16 @@ impl Render for Meter {
         let bar = if vertical {
             div().flex_1().w_full().child(bar.size_full())
         } else {
-            div().w_full().h(px(10.0)).child(bar.size_full())
+            div().w_full().h(ui_px(10.0)).child(bar.size_full())
         };
 
         let mut tile = div()
             .size_full()
             .flex()
             .flex_col()
-            .gap(px(3.0))
-            .p(px(6.0))
-            .text_size(px(10.0));
+            .gap(ui_px(3.0))
+            .p(ui_px(6.0))
+            .text_size(ui_px(10.0));
 
         if !self.label.is_empty() {
             tile = tile.child(

@@ -20,7 +20,7 @@ use super::sequence_panel::{load_picker_rows, pill_button};
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, is_resettable, run_state_index, run_state_label};
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 
 /// Persisted shape of a [`SequenceControl`], shared by the tile and dashboard
 /// surfaces.
@@ -91,7 +91,7 @@ impl Render for SequenceControl {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(12.0))
+                .text_size(ui_px(12.0))
                 .text_color(theme.text_tertiary)
                 .child(if store.is_none() {
                     SharedString::new_static("Sequence store unavailable")
@@ -108,7 +108,7 @@ impl Render for SequenceControl {
         let header = div()
             .child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(ui_px(10.0))
                     .text_color(theme.text_tertiary)
                     .child("Live"),
             )
@@ -116,19 +116,19 @@ impl Render for SequenceControl {
             .flex_row()
             .items_center()
             .gap_2()
-            .child(div().w(px(8.0)).h(px(8.0)).rounded(px(4.0)).bg(color))
+            .child(div().w(ui_px(8.0)).h(ui_px(8.0)).rounded(px(4.0)).bg(color))
             .child(
                 div()
                     .flex_grow_1()
                     .truncate()
                     .text_color(theme.text_primary)
-                    .text_size(px(12.0))
+                    .text_size(ui_px(12.0))
                     .child(ch.name.clone()),
             )
             .child(
                 div()
                     .text_color(color)
-                    .text_size(px(11.0))
+                    .text_size(ui_px(11.0))
                     .child(run_state_label(ch.run_state)),
             );
 
@@ -180,8 +180,8 @@ impl Render for SequenceControl {
             .size_full()
             .flex()
             .flex_col()
-            .gap(px(4.0))
-            .p(px(8.0))
+            .gap(ui_px(4.0))
+            .p(ui_px(8.0))
             .child(header);
 
         if !self.compact {
@@ -189,7 +189,7 @@ impl Render for SequenceControl {
                 .child(
                     div()
                         .truncate()
-                        .text_size(px(11.0))
+                        .text_size(ui_px(11.0))
                         .text_color(theme.text_secondary)
                         .child(
                             ch.loaded
@@ -201,7 +201,7 @@ impl Render for SequenceControl {
                     div()
                         .flex_grow_1()
                         .truncate()
-                        .text_size(px(11.0))
+                        .text_size(ui_px(11.0))
                         .text_color(theme.text_tertiary)
                         .child(ch.last_message.clone().unwrap_or_default()),
                 );

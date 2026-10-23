@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use gpui::{App, Global, Hsla, SharedString};
+use gpui::{App, Global, Hsla, Rems, SharedString, Window, px, rems};
 
 use crate::config::{self, FontConfig, PanelConfig};
 
@@ -1147,6 +1147,26 @@ pub const BUNDLED_FAMILY: &str = "IoskeleyMono Nerd Font";
 /// Family the [`FontConfig::Auto`] mode reaches for first, when the system has
 /// it installed. Falls back to [`BUNDLED_FAMILY`] otherwise.
 pub const PREFERRED_FAMILY: &str = "Berkeley Mono";
+
+/// The rem gpui starts every window at. The panel never sets its own, so
+/// outside a zoomed dashboard widget one rem is always this many pixels.
+const BASE_REM: f32 = 16.0;
+
+/// A length designed in pixels that follows the rem instead of pinning it.
+///
+/// Identical to `px(n)` at the base rem, which is everywhere but inside a
+/// dashboard widget, where the zoom scales the rem and so everything sized
+/// through here. Widget views size their text, spacing and rows with it;
+/// hairline borders stay in `px` so they never vanish when zoomed out.
+pub(crate) fn ui_px(n: f32) -> Rems {
+    rems(n / BASE_REM)
+}
+
+/// How far the current rem is from the base: the factor text and strokes a
+/// view shapes and paints itself multiply by to follow [`ui_px`] layout.
+pub(crate) fn ui_scale(window: &Window) -> f32 {
+    window.rem_size() / px(BASE_REM)
+}
 
 /// Load the embedded fallback font into gpui's text system.
 ///
