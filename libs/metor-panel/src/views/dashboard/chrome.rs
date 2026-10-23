@@ -5,15 +5,23 @@ use crate::theme::theme;
 
 use super::{DashboardPanel, SNAP_GRID_PX};
 
+const MIN_GRID_STEP_PX: f32 = 6.0;
+
 impl DashboardPanel {
-    /// Paint a subtle grid aligned to the snap step, panning with scroll.
+    /// Paint a subtle grid aligned to the snap step, panning and zooming
+    /// with the canvas.
     pub(super) fn render_grid_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let grid_color = theme.border_primary.opacity(0.3);
         let bounds = self.container_bounds;
-        let offset = self.scroll_offset;
+        let offset = self.viewport.scroll;
 
-        let grid_step = SNAP_GRID_PX;
+        // Zoomed far out the snap grid would turn into a wash, so it thins
+        // to every other line until the lines are far enough apart to read.
+        let mut grid_step = SNAP_GRID_PX * self.viewport.zoom;
+        while grid_step < MIN_GRID_STEP_PX {
+            grid_step *= 2.0;
+        }
         canvas(
             move |_, _, _| {},
             move |_, _, window, _| {

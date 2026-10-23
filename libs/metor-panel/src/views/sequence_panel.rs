@@ -523,7 +523,7 @@ impl SequenceView {
 pub(crate) fn pill_button(
     theme: &crate::theme::Theme,
     id: (&'static str, usize),
-    label: &'static str,
+    label: impl Into<gpui::SharedString>,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -534,7 +534,7 @@ pub(crate) fn pill_button(
         .text_color(theme.text_secondary)
         .text_size(px(11.0))
         .cursor_pointer()
-        .child(label)
+        .child(label.into())
 }
 
 fn empty_row(theme: &crate::theme::Theme, msg: &'static str) -> AnyElement {

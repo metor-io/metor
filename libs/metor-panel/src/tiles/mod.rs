@@ -1078,6 +1078,7 @@ mod tests {
                         frame: true,
                     }],
                     connectors: Vec::new(),
+                    zoom: 1.0,
                 })
                 .unwrap(),
                 cx,
