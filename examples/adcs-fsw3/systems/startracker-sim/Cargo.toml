@@ -19,7 +19,7 @@ export = []
 adcs-contracts = { package = "adcs-contracts-3", path = "../../contracts" }
 futures-lite = "2"
 metor-fsw-3 = { path = "../../../../libs/metor-fsw-3", default-features = false, features = ["threads"] }
-metor-star = { path = "../../../../libs/metor-star", features = ["sim", "std"] }
+metor-star = { path = "../../../../libs/metor-star", features = ["sim"] }
 nox = { workspace = true }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
