@@ -376,8 +376,11 @@ class Meter:
 
 @dataclass(frozen=True)
 class Gauge:
-    """A dial over one element. ``sweep`` is the total arc in degrees,
-    symmetric about vertical; ``style`` is ``"arc"`` or ``"needle"``."""
+    """A dial over one element. ``sweep`` is the total arc in degrees and
+    ``rotation`` turns its middle clockwise from straight up (``0`` is
+    symmetric about vertical, ``-135`` faces lower-left). ``divisions`` major
+    notches split the scale, with ``minor_ticks`` between each pair; ``0``
+    divisions draws none. ``style`` is ``"arc"`` or ``"needle"``."""
 
     component: str
     element: int = 0
@@ -386,6 +389,9 @@ class Gauge:
     unit: str | None = None
     label: str | None = None
     sweep: float = 240.0
+    rotation: float = 0.0
+    divisions: int = 5
+    minor_ticks: int = 1
     style: str = "arc"
     color: str | None = None
 
@@ -401,6 +407,9 @@ class Gauge:
                 "unit": self.unit,
                 "label": self.label,
                 "sweep_degrees": float(self.sweep),
+                "rotation_degrees": float(self.rotation),
+                "divisions": int(self.divisions),
+                "minor_ticks": int(self.minor_ticks),
                 "style": _enum(self.style, ("arc", "needle")),
                 "color": self.color,
             }
