@@ -353,13 +353,22 @@ impl Dispatch {
             return Err(IoError::Unsupported.into());
         }
         if let Target::WireCap(w, end) = target {
-            let result = self.connect_wire(m, res, w, end, op);
-            self.counters[usize::from(res)].submitted += 1;
-            self.counters[usize::from(res)].record_completion(op.kind(), &result);
-            let cqe = result.map_or_else(|e| Cqe::err(sqe.token, e), |n| Cqe::ok(sqe.token, n));
-            self.ready.push((m, cqe));
+            self.connect_wire(m, res, w, end, op, sqe.token);
             return Ok(());
         }
+        self.start(index, res, target, op, sqe, arena)
+    }
+
+    /// Puts op `index` in flight and routes it to its target.
+    fn start(
+        &mut self,
+        index: usize,
+        res: u16,
+        target: Target,
+        op: Op,
+        sqe: Sqe,
+        arena: &Arena,
+    ) -> Result<(), Refusal> {
         let buf = lent(&op, sqe.buf, arena)?;
         let id = OpId::new(index as u16, sqe.token.generation());
         let route = match target {
@@ -435,7 +444,7 @@ impl Dispatch {
         })
     }
 
-    /// Connects member `m` to end `end` of wire `w`, at once.
+    /// Connects member `m` to end `end` of wire `w`, landing at once.
     fn connect_wire(
         &mut self,
         m: usize,
@@ -443,11 +452,17 @@ impl Dispatch {
         w: usize,
         end: ResourceEnd,
         op: Op,
-    ) -> Result<u32, IoError> {
-        match op {
+        token: Token,
+    ) {
+        let result = match op {
             Op::Connect => self.derive(m, res, Conn::Wire(w, end)),
             _ => Err(IoError::Unsupported),
-        }
+        };
+        let counters = &mut self.counters[usize::from(res)];
+        counters.submitted += 1;
+        counters.record_completion(op.kind(), &result);
+        let cqe = result.map_or_else(|e| Cqe::err(token, e), |n| Cqe::ok(token, n));
+        self.ready.push((m, cqe));
     }
 
     /// The socket recipe of resource `res`, for a `Route::Socket`.

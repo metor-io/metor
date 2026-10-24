@@ -87,8 +87,7 @@ impl Pause {
         if self.owed {
             let mut wait = cap.timeout(self.backoff.delay);
             match wait.poll() {
-                Some(Err(IoError::QueueFull)) => return true,
-                Some(_) => {}
+                Some(_) => return true,
                 None => self.wait = Some(wait),
             }
             self.owed = false;

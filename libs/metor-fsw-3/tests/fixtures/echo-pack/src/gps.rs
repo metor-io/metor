@@ -228,15 +228,16 @@ impl UartScript {
 #[system]
 pub fn uart_script(#[state] s: &mut UartScript, uart: &Cap<Uart>) {
     s.link.poll(uart);
-    if let Some(Err(e)) = s.tx.poll() {
-        s.link.check(e);
+    match s.tx.poll() {
+        Some(Ok(_)) => drop(s.script.pop_front()),
+        Some(Err(e)) => drop(s.link.check(e)),
+        None => {}
     }
-    let Some(port) = s.link.handle().filter(|_| !s.script.is_empty()) else {
+    let (Some(port), Some(entry)) = (s.link.handle(), s.script.front()) else {
         return;
     };
     if let Some(mut buf) = s.tx.take_idle() {
-        let entry = s.script.pop_front().unwrap_or_default();
-        buf.fill(&entry);
+        buf.fill(entry);
         s.tx = Slot::Busy(port.write(buf));
     }
 }

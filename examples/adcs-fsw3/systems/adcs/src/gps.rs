@@ -50,13 +50,14 @@ pub async fn gps_driver(
                 continue;
             }
         };
-        backoff.reset();
         let configured;
         (cmd, configured) = configure(seq, &port, cmd, log).await;
         if configured {
+            backoff.reset();
             buf = read_until_lost(seq, &port, buf, fix, log).await;
         }
         let _ = port.close().await;
+        let _ = uart.timeout(backoff.next_wait()).await;
     }
 }
 

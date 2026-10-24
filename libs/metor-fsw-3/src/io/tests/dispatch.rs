@@ -639,6 +639,38 @@ fn report_writes_changed_resources() {
 }
 
 #[test]
+fn a_connect_and_its_close_allocate_nothing() {
+    let mut r = rig();
+    let mut fds: Vec<OwnedFd> = (0..8).map(|_| null()).collect();
+    let n = allocations(|| {
+        while let Some(fd) = fds.pop() {
+            r.lower(0, connect(0, TTY_CAP));
+            let Some(Route::Os(op)) = r.d.drain_routes().next() else {
+                panic!("a lowered open")
+            };
+            let opened = Out::Opened {
+                fd,
+                class: Class::Tty,
+                peer: None,
+            };
+            r.d.raise(OsDone {
+                id: op.id,
+                result: Ok(opened),
+            });
+            let mut port = RawHandle::new(0, 0);
+            r.d.post_ready(0, |_, cqe| {
+                port = RawHandle::from_raw(cqe.result().unwrap_or(0));
+                Some(true)
+            });
+            r.lower(0, sqe(1, port, Op::Close, Span::default()));
+            r.d.post_ready(0, |_, _| Some(true));
+            assert!(matches!(r.d.drain_routes().next(), Some(Route::Close(_))));
+        }
+    });
+    assert_eq!(n, 0);
+}
+
+#[test]
 fn lowering_and_raising_allocate_nothing() {
     let mut r = rig();
     let mut ids = Vec::with_capacity(4);

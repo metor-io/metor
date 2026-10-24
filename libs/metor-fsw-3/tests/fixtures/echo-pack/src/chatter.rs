@@ -84,9 +84,14 @@ impl Reader {
 #[system]
 pub fn reader(#[state] s: &mut Reader, uart: &Cap<Uart>, sums: &mut Output<Ping>) {
     s.link.poll(uart);
-    if let Some(Ok(_)) = s.rx.poll() {
-        let n = s.rx.bytes().iter().map(|b| u32::from(*b)).sum();
-        let _ = sums.write(&Ping { n });
+    match s.rx.poll() {
+        Some(Ok(0)) => s.link.lose(),
+        Some(Ok(_)) => {
+            let n = s.rx.bytes().iter().map(|b| u32::from(*b)).sum();
+            let _ = sums.write(&Ping { n });
+        }
+        Some(Err(e)) => drop(s.link.check(e)),
+        None => {}
     }
     if let Some(port) = s.link.handle()
         && let Some(buf) = s.rx.take_idle()
