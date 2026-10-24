@@ -170,11 +170,8 @@ impl ValueCache {
     }
 }
 
-// Uniform fields are only read via `bytemuck::bytes_of`, which the
-// dead-code lint can't see through the Pod/Zeroable derive expansions.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-#[allow(dead_code)]
 struct ViewUniform {
     scale: [f32; 2],
     offset: [f32; 2],
@@ -184,7 +181,6 @@ struct ViewUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-#[allow(dead_code)]
 struct LineUniform {
     color: [f32; 4],
     line_width: f32,

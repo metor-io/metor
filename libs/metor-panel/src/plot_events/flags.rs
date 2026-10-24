@@ -9,9 +9,7 @@
 //! popovers. Chips truncate to the gap before the next flag and collapse to a
 //! bare nub when even a couple of characters won't fit.
 
-use gpui::{
-    Bounds, Hsla, PathBuilder, Pixels, Rgba, SharedString, TextAlign, TextRun, Window, point, px,
-};
+use gpui::{Bounds, Hsla, Pixels, SharedString, TextAlign, TextRun, Window, point, px};
 use metor_proto::types::Timestamp;
 
 use crate::plot_events::PlotEvent;
@@ -47,16 +45,10 @@ pub(crate) const FLAG_HIT_PX: f32 = 8.0;
 /// dimmed shade a translucent tint would show over the plot, but occluding
 /// the traces beneath so the label stays readable.
 pub(crate) fn mix(bg: Hsla, fg: Hsla, t: f32) -> Hsla {
-    let b = Rgba::from(bg);
-    let f = Rgba::from(fg);
-    let lerp = |a: f32, c: f32| a + (c - a) * t;
-    Rgba {
-        r: lerp(b.r, f.r),
-        g: lerp(b.g, f.g),
-        b: lerp(b.b, f.b),
+    Hsla {
         a: 1.0,
+        ..crate::theme::lerp_color(bg, fg, t)
     }
-    .into()
 }
 
 /// Exact-equality check for two colors — [`Hsla`] has no `PartialEq`, and a
@@ -82,12 +74,14 @@ impl EventCluster {
 
     /// The chip text: the first event's short name, plus a `+N` tail when
     /// more merged in.
-    pub fn chip_label(&self) -> String {
-        let first = self.events.first().map(|e| e.short.as_ref()).unwrap_or("");
+    pub fn chip_label(&self) -> SharedString {
+        let Some(first) = self.events.first() else {
+            return SharedString::default();
+        };
         if self.events.len() > 1 {
-            format!("{first} +{}", self.events.len() - 1)
+            format!("{} +{}", first.short, self.events.len() - 1).into()
         } else {
-            first.to_string()
+            first.short.clone()
         }
     }
 
@@ -138,7 +132,7 @@ pub(crate) struct ClusterPaint {
     pub color: Hsla,
     /// The chip text ([`EventCluster::chip_label`]), truncated at paint time
     /// to the gap before the next flag.
-    pub label: String,
+    pub label: SharedString,
 }
 
 /// Truncate `label` to what fits in `avail` pixels of chip, ellipsized. An
@@ -180,7 +174,6 @@ pub(crate) fn paint_event_flags(
     let chip_pad = px(CHIP_PAD_X * s);
     let font = window.text_style().font();
     let top = pb.origin.y;
-    let bottom = pb.origin.y + pb.size.height;
     let right = pb.origin.x + pb.size.width;
 
     for (i, cluster) in clusters.iter().enumerate() {
@@ -195,12 +188,7 @@ pub(crate) fn paint_event_flags(
             a: 0.5,
             ..cluster.color
         };
-        let mut rule = PathBuilder::stroke(px(2.0 * s));
-        rule.move_to(point(x, top));
-        rule.line_to(point(x, bottom));
-        if let Ok(path) = rule.build() {
-            window.paint_path(path, rule_color);
-        }
+        crate::views::plot_common::chrome::paint_vline(pb, x, px(2.0 * s), rule_color, window);
 
         // The chip claims at most the gap to the next flag (so neighbors
         // never overlap) and the plot's right edge.

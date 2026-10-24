@@ -19,9 +19,9 @@ use metor_proto::types::{ComponentId, Timestamp};
 
 use super::bounds::PlotView;
 use super::gpu::{AxisSource, LineDraw, PlotRenderState};
-use crate::views::plot_common::lod::{GapBands, GapCollector, LodTracking, gap_band_overlay};
 use super::override_field::Override;
 use super::{NodeBoundsCache, TimeFormat, Trace, YAxis, expand_value_bounds};
+use crate::views::plot_common::lod::{GapBands, GapCollector, LodTracking, gap_band_overlay};
 use crate::views::plot_common::{gpu_frame, link_traces, reconcile_trackers};
 use crate::views::time_series::time_range::{GlobalTimeRange, TimeRangeBehavior};
 use crate::wait_for_component;

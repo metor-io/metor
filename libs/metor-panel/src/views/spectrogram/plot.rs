@@ -21,11 +21,13 @@ use metor_db::{Component, DB};
 use metor_proto::types::Timestamp;
 
 use crate::views::plot_common::lod::{GapBands, GapCollector, LodTracking, gap_band_overlay};
-use crate::views::plot_common::{gpu_frame, link_traces, reconcile_trackers, replace_view_override};
+use crate::views::plot_common::{
+    gpu_frame, link_traces, reconcile_trackers, replace_view_override,
+};
 use crate::views::time_series::time_range::{GlobalTimeRange, TimeRangeBehavior};
 use crate::views::time_series::{
-    Colormap, IntensityDraw, IntensityScale, Override, PlotBounds, PlotRenderState,
-    ReadbackHandle, TimeFormat,
+    Colormap, IntensityDraw, IntensityScale, Override, PlotBounds, PlotRenderState, ReadbackHandle,
+    TimeFormat,
 };
 use crate::wait_for_component;
 

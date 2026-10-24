@@ -13,10 +13,10 @@ use metor_proto::types::{ComponentId, PrimType, Timestamp};
 
 #[allow(unused_imports)]
 use crate::inspect;
-use crate::views::plot_common::chrome::{paint_axis_backdrop, paint_hline, paint_vline};
 use crate::plot_events::{EventDetail, EventKindKey, EventSource, EventSourceRegistry, PlotEvent};
 use crate::temporal::display::elapsed;
 use crate::views::json_tree::JsonTree;
+use crate::views::plot_common::chrome::{paint_axis_backdrop, paint_hline, paint_vline};
 use crate::views::popover::readout_card;
 
 mod render;

@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{Context, Entity, EntityId, Hsla, IntoElement, Render, SharedString, Window, prelude::*};
+use gpui::{
+    Context, Entity, EntityId, Hsla, IntoElement, Render, SharedString, Window, prelude::*,
+};
 use metor_db::{Component, DB};
 
 use crate::views::plot_common::{

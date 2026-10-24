@@ -84,8 +84,8 @@ impl LodTracking {
         }
         let mut selected = None;
         for (i, lod) in self.levels.iter().enumerate() {
-            let has_data = lod.time_series.latest().is_some()
-                || !lod.time_series.manifest().spans.is_empty();
+            let has_data =
+                lod.time_series.latest().is_some() || !lod.time_series.manifest().spans.is_empty();
             if !has_data {
                 continue;
             }

@@ -69,8 +69,7 @@ pub(crate) fn vector_trace_rows<T: 'static>(
     from_component: impl Fn(ComponentId, &str, usize, &App) -> T + 'static,
     on_select: Arc<dyn Fn(T, &mut Window, &mut App)>,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let from_component: Arc<dyn Fn(ComponentId, &str, usize, &App) -> T> =
-        Arc::new(from_component);
+    let from_component: Arc<dyn Fn(ComponentId, &str, usize, &App) -> T> = Arc::new(from_component);
     let pick_row = {
         let on_select = on_select.clone();
         let from_component = from_component.clone();

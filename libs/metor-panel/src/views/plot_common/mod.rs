@@ -10,9 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Corners, Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point, Rems,
-    SharedString, Styled, Task, TextAlign, TextRun, WeakEntity, Window, canvas, div, prelude::*,
-    px,
+    Bounds, Context, Corners, Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point,
+    Rems, SharedString, Styled, Task, TextAlign, TextRun, WeakEntity, Window, canvas, div,
+    prelude::*, px,
 };
 
 use crate::theme::{ui_px, ui_scale};
