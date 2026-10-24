@@ -666,6 +666,7 @@ mod tests {
             max: 0.04,
             unit: Some("N·m·s".into()),
             orientation: crate::views::Orientation::Horizontal,
+            shape: crate::views::MeterShape::Cylinder,
             color: Some(Hsla::default()),
             hide_value: true,
             hide_limits: false,
@@ -686,6 +687,7 @@ mod tests {
             partial.orientation,
             crate::views::Orientation::Vertical
         ));
+        assert_eq!(partial.shape, crate::views::MeterShape::Bar);
 
         let gauge = GaugeConfig {
             component: "sat.gyro".into(),

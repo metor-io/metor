@@ -341,6 +341,9 @@ class Meter:
     """A bar meter over one element. A scale spanning zero fills outward from
     zero, so a signed quantity reads correctly in both directions.
 
+    ``shape`` is ``"bar"``, ``"tank"``, ``"cylinder"``, ``"sphere"`` or
+    ``"battery"``; the fill always rises linearly along the meter's axis.
+
     Warn/critical ticks are not configured here: the panel reads them from the
     alarm definitions for the same element."""
 
@@ -351,6 +354,7 @@ class Meter:
     unit: str | None = None
     label: str | None = None
     orientation: str = "vertical"
+    shape: str = "bar"
     color: str | None = None
 
     def _widget(
@@ -365,6 +369,9 @@ class Meter:
                 "unit": self.unit,
                 "label": self.label,
                 "orientation": _enum(self.orientation, ("vertical", "horizontal")),
+                "shape": _enum(
+                    self.shape, ("bar", "tank", "cylinder", "sphere", "battery")
+                ),
                 "color": self.color,
             }
         )
