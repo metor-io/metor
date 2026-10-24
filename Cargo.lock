@@ -13990,6 +13990,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "star-db"
+version = "0.14.2"
+dependencies = [
+ "clap 4.6.3",
+ "metor-star",
+]
+
+[[package]]
 name = "startracker-sim-3"
 version = "0.14.2"
 dependencies = [

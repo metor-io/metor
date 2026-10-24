@@ -466,3 +466,69 @@ fn cells_past_the_end_are_empty() {
         assert!(db.cell(c).is_empty());
     }
 }
+
+/// The committed onboard DB (`star-db build`).
+static ONBOARD: &[u8] = include_bytes!("../../data/stars-u2000.stdb");
+
+fn row_of(db: &Db, hip: u32) -> u16 {
+    (0..db.n_stars() as u16)
+        .find(|row| db.hip(*row) == Some(hip))
+        .unwrap_or_else(|| panic!("HIP {hip} is in the DB"))
+}
+
+#[test]
+fn the_onboard_db_loads() {
+    let db = Db::parse(ONBOARD).expect("parses");
+    assert_eq!(db.n_stars(), 2000);
+    assert!((60_000..70_000).contains(&db.pairs().len()));
+    assert!((f64::from(db.header.fov_max_rad.get()).to_degrees() - 20.0).abs() < 1e-4);
+    assert!(ONBOARD.len() < 1 << 20);
+}
+
+/// Named pairs come back from a k-vector query on their angle, and a pair
+/// past the 20° limit is not stored.
+#[test]
+fn onboard_pair_queries_find_known_pairs() {
+    let db = Db::parse(ONBOARD).unwrap();
+    // (HIP, HIP, separation in degrees, rounded).
+    let known = [
+        (54061, 53910, 5.37), // Dubhe, Merak
+        (26727, 25930, 2.74), // Alnitak, Mintaka
+        (27989, 24436, 18.6), // Betelgeuse, Rigel
+        (36850, 37826, 4.5),  // Castor, Pollux
+    ];
+    for (x, y, deg) in known {
+        let (a, b) = (row_of(&db, x), row_of(&db, y));
+        let (a, b) = (a.min(b), a.max(b));
+        let theta = separation(db.star(a).unwrap().vector(), db.star(b).unwrap().vector());
+        assert!(
+            (theta.to_degrees() - deg).abs() < 0.05,
+            "{x}-{y}: {}",
+            theta.to_degrees()
+        );
+        let t = theta as f32;
+        let range = db.pair_range(t - 1e-6, t + 1e-6);
+        let hit = db.pairs()[range]
+            .iter()
+            .any(|p| (p.a.get(), p.b.get()) == (a, b));
+        assert!(hit, "{x}-{y} not found at θ {t}");
+    }
+    // Sirius and Betelgeuse are 27° apart.
+    let (a, b) = (row_of(&db, 32349), row_of(&db, 27989));
+    let (a, b) = (a.min(b), a.max(b));
+    assert!(!db.pairs().iter().any(|p| (p.a.get(), p.b.get()) == (a, b)));
+}
+
+/// Every file in `data/` is named in its `NOTICE` (licensing).
+#[test]
+fn every_data_file_is_in_the_notice() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/data");
+    let notice = std::fs::read_to_string(std::format!("{dir}/NOTICE")).unwrap();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        if name.starts_with('.') || name == "NOTICE" || name.starts_with("starcat-g12") {
+            continue;
+        }
+        assert!(notice.contains(&name), "data/{name} is not in data/NOTICE");
+    }
+}
