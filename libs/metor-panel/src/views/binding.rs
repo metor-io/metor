@@ -486,6 +486,74 @@ pub(crate) fn any_on(values: impl Iterator<Item = ElementValue>) -> bool {
     false
 }
 
+/// Element 0 of a component read as a state code — a bool as 0/1 — for the
+/// views that map codes to something (a toggle's segments, a state's
+/// image). Held as one opaque field; [`follow`](Self::follow) every render.
+#[derive(Default)]
+pub(crate) struct CodeFeed {
+    streaming: Option<ComponentId>,
+    pub value: Option<f64>,
+    pub stale: bool,
+    pub is_bool: bool,
+    _task: Option<gpui::Task<()>>,
+}
+
+impl CodeFeed {
+    /// Stream `want`, restarting only when it changes; `None` stops.
+    /// `feed` finds this feed on the view the task writes back into.
+    pub(crate) fn follow<E: 'static>(
+        &mut self,
+        want: Option<ComponentId>,
+        db: &Arc<DB>,
+        cx: &mut Context<E>,
+        feed: fn(&mut E) -> &mut CodeFeed,
+    ) {
+        if self.streaming == want {
+            return;
+        }
+        *self = Self {
+            streaming: want,
+            _task: want.map(|id| spawn_code_feed(db.clone(), id, cx, feed)),
+            ..Self::default()
+        };
+    }
+}
+
+fn spawn_code_feed<E: 'static>(
+    db: Arc<DB>,
+    id: ComponentId,
+    cx: &mut Context<E>,
+    feed: fn(&mut E) -> &mut CodeFeed,
+) -> gpui::Task<()> {
+    spawn_seeded_stream(
+        db,
+        id,
+        cx,
+        |db, id| {
+            let is_bool = component_meta(db, id).is_bool;
+            (is_bool, |view: ComponentView<'_>| {
+                view.iter().next().map(|value| value.as_f64())
+            })
+        },
+        move |view, update, cx| {
+            let feed = feed(view);
+            match update {
+                StreamUpdate::Ready(is_bool) => feed.is_bool = is_bool,
+                StreamUpdate::Value(value) => {
+                    feed.value = Some(value);
+                    feed.stale = false;
+                }
+                StreamUpdate::Stale => feed.stale = true,
+                StreamUpdate::Unavailable => {
+                    feed.value = None;
+                    feed.stale = false;
+                }
+            }
+            cx.notify();
+        },
+    )
+}
+
 /// Limit values declared for `at` by the control system's alarm definitions,
 /// paired with the color of their severity.
 ///

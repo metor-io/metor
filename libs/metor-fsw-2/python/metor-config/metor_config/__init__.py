@@ -66,6 +66,8 @@ from ._dashboard import (
     Map as Map,
     SequenceControl as SequenceControl,
     Image as Image,
+    ImageState as ImageState,
+    StateImage as StateImage,
     Label as Label,
     Place as Place,
     Dashboard as Dashboard,

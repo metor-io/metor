@@ -975,6 +975,34 @@ class DashboardTest(unittest.TestCase):
         control = json.loads(state["widgets"][1]["config"])
         self.assertEqual(control["channel"], "mode")
 
+    def test_state_images_inline_every_image(self):
+        import base64
+        import json
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        pixel = os.path.join(here, "data", "pixel.png")
+        valve = mc.Place(
+            mc.StateImage(
+                "valve.open",
+                states=[mc.ImageState(0, pixel, "CLOSED"), mc.ImageState(1, pixel)],
+                no_data=pixel,
+            ),
+            0,
+            0,
+        )
+        state = self._dashboard_state(mc.Dashboard(widgets=[valve]))
+        self.assertEqual(state["widgets"][0]["kind"], "state_image")
+        cfg = json.loads(state["widgets"][0]["config"])
+        self.assertEqual(cfg["component"], "sat1.valve.open")
+        with open(pixel, "rb") as f:
+            data = base64.b64encode(f.read()).decode("ascii")
+        self.assertEqual(cfg["states"][0]["data"], data)
+        self.assertEqual(cfg["states"][0]["label"], "CLOSED")
+        self.assertEqual(cfg["no_data"]["data"], data)
+        # Unset slots stay out of the blob, so the panel shows its fallback.
+        self.assertNotIn("unknown", cfg)
+        self.assertNotIn("error", cfg)
+
     def test_labels_carry_their_styling(self):
         import json
 

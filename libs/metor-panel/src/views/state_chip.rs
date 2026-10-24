@@ -22,10 +22,10 @@ use gpui::{
     Window, div, prelude::*, px,
 };
 use metor_db::DB;
-use metor_proto::types::{ComponentId, ComponentView};
+use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 
-use super::binding::{self, StreamUpdate, spawn_seeded_stream};
+use super::binding::{self, CodeFeed};
 use super::monitor::{behavior_snapshot, edit_click};
 use super::value_strip::{ComponentValueStrip, StateTable, StripClick, StripStyle};
 
@@ -123,19 +123,7 @@ pub struct StateChip {
     /// The toggle's own read of the bound value; only streams while the
     /// chip is drawn as a toggle.
     #[facet(opaque)]
-    feed: ToggleFeed,
-}
-
-/// What a toggle draws from: element 0 of the bound component as a code,
-/// a bool reading as 0/1.
-#[derive(Default)]
-struct ToggleFeed {
-    /// The component this feed streams, `None` while not streaming.
-    streaming: Option<ComponentId>,
-    value: Option<f64>,
-    stale: bool,
-    is_bool: bool,
-    _task: Option<gpui::Task<()>>,
+    feed: CodeFeed,
 }
 
 impl StateChip {
@@ -176,7 +164,7 @@ impl StateChip {
             db,
             strip,
             click,
-            feed: ToggleFeed::default(),
+            feed: CodeFeed::default(),
         }
     }
 
@@ -225,21 +213,15 @@ impl StateChip {
         }
         self.click = edit_click(self.db.clone(), component_id, self.saved_component.clone());
         self.strip = new_strip(self.db.clone(), component_id, self.click.clone(), cx);
-        self.feed = ToggleFeed::default();
+        self.feed = CodeFeed::default();
     }
 
     /// Stream the bound value for the toggle face, or stop when the chip is
     /// a chip again.
     fn refresh_feed(&mut self, cx: &mut Context<Self>) {
         let want = (self.style == StateChipStyle::Toggle).then(|| self.source.id());
-        if self.feed.streaming == want {
-            return;
-        }
-        self.feed = ToggleFeed {
-            streaming: want,
-            _task: want.map(|id| spawn_feed(self.db.clone(), id, cx)),
-            ..ToggleFeed::default()
-        };
+        let db = self.db.clone();
+        self.feed.follow(want, &db, cx, |chip| &mut chip.feed);
     }
 
     /// Whether a click may command the bound component right now: the
@@ -447,46 +429,22 @@ pub fn default_toggle_states() -> Vec<StateEntryConfig> {
     ]
 }
 
-fn spawn_feed(db: Arc<DB>, id: ComponentId, cx: &mut Context<StateChip>) -> gpui::Task<()> {
-    spawn_seeded_stream(
-        db,
-        id,
-        cx,
-        |db, id| {
-            let is_bool = binding::component_meta(db, id).is_bool;
-            (is_bool, |view: ComponentView<'_>| {
-                view.iter().next().map(|value| value.as_f64())
-            })
-        },
-        |chip, update, cx| {
-            let feed = &mut chip.feed;
-            match update {
-                StreamUpdate::Ready(is_bool) => feed.is_bool = is_bool,
-                StreamUpdate::Value(value) => {
-                    feed.value = Some(value);
-                    feed.stale = false;
-                }
-                StreamUpdate::Stale => feed.stale = true,
-                StreamUpdate::Unavailable => {
-                    feed.value = None;
-                    feed.stale = false;
-                }
-            }
-            cx.notify();
-        },
-    )
-}
-
 /// The chip's element selection as binding text: element 0 is the component
 /// itself; any other element is that expression over it.
 fn binding_text(cfg: &StateChipConfig) -> String {
+    element_binding_text(&cfg.component, cfg.element)
+}
+
+/// `component` narrowed to one element, as binding text. Shared by the
+/// views whose config names an element but whose binding is one component.
+pub(crate) fn element_binding_text(component: &str, element: usize) -> String {
     use crate::dynamic::expressions::{body, is_expression};
-    if cfg.element == 0 {
-        cfg.component.clone()
-    } else if is_expression(&cfg.component) {
-        format!("=({})[{}]", body(&cfg.component), cfg.element)
+    if element == 0 {
+        component.to_string()
+    } else if is_expression(component) {
+        format!("=({})[{}]", body(component), element)
     } else {
-        format!("={}[{}]", cfg.component, cfg.element)
+        format!("={component}[{element}]")
     }
 }
 

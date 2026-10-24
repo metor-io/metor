@@ -7,20 +7,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    AnyEntity, AnyView, App, Context, Corners, Entity, IntoElement, Render, RenderImage,
-    SharedString, Window, canvas, div, prelude::*,
+    AnyEntity, AnyView, App, Context, Entity, IntoElement, Render, RenderImage, SharedString,
+    Window, div, prelude::*,
 };
-use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 
 use crate::theme::{theme, ui_px};
 use crate::tiles::panels::{
     OutlinePanelConfig, alarm_config, alarm_view, browser_config, browser_view, log_config,
     log_view, outline_config, outline_view, sequence_config, sequence_view,
 };
+use crate::views::image_source::{self, ImageRef};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
     Annunciator, AnnunciatorConfig, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
@@ -29,7 +28,7 @@ use crate::views::{
     SamplesTableConfig, SequenceControl, SequenceControlConfig, SequenceGrid, Spectrogram,
     StateChip, StateChipConfig, TimeSeriesPlot, Timeline, TrafficLight, TrafficLightConfig, XyPlot,
 };
-use crate::views::{Label, LabelConfig};
+use crate::views::{Label, LabelConfig, StateImage, StateImageConfig};
 
 use super::{DashboardWidget, WidgetKind};
 
@@ -564,6 +563,22 @@ impl WidgetRegistry {
             })
             .with_live_tile_title(|label: &Label, _| label.text().clone()),
         );
+        self.register(
+            WidgetKind::state_image(),
+            WidgetSpec::typed(
+                (160.0, 120.0),
+                |w| {
+                    let cfg = parse_or_default::<StateImageConfig>(&w.config);
+                    subject("State Image", &cfg.label.unwrap_or(cfg.component))
+                },
+                |cfg, db, cx| StateImage::from_config(&cfg, db, cx),
+                StateImage::to_config,
+            )
+            .with_tile("state_image", |blob| {
+                let cfg = parse_or_default::<StateImageConfig>(blob);
+                cfg.label.unwrap_or(cfg.component).into()
+            }),
+        );
         // The grid reads the global sequence store and persists nothing.
         self.register(
             WidgetKind::new("sequence_grid"),
@@ -666,81 +681,30 @@ struct ImageWidget {
 }
 
 impl ImageWidget {
-    /// Inline bytes win over `path`.
-    ///
-    /// A target ships its presets over a link and the panel may be running on
-    /// a machine that has never seen the target's filesystem, so a diagram
-    /// referenced only by path would be a broken tile there. `path` remains
-    /// for layouts a user authored locally against their own files.
     fn load(cfg: &ImageWidgetConfig) -> Self {
-        let (bytes, source) = match decode_inline(&cfg.data) {
-            Some(bytes) => (Some(bytes), SharedString::new_static("inline image")),
-            None => (
-                std::fs::read(&cfg.path).ok(),
-                SharedString::from(cfg.path.clone()),
-            ),
-        };
-
-        let render_image = bytes
-            .and_then(|bytes| image::load_from_memory(&bytes).ok())
-            .map(|img| {
-                let rgba = img.to_rgba8();
-                let (w, h) = rgba.dimensions();
-                let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, rgba.into_raw())
-                    .expect("buffer size mismatch");
-                let frames = SmallVec::from_elem(Frame::new(buffer), 1);
-                Arc::new(RenderImage::new(frames))
-            });
-
-        let label = if render_image.is_some() {
-            source
-        } else {
-            SharedString::from(format!("Failed to load: {}", source))
-        };
-
-        Self {
-            render_image,
-            label,
+        let loaded = image_source::load(&ImageRef {
+            path: cfg.path.clone(),
+            data: cfg.data.clone(),
+        });
+        match loaded {
+            Ok(image) => Self {
+                render_image: Some(image),
+                label: SharedString::default(),
+            },
+            Err(label) => Self {
+                render_image: None,
+                label,
+            },
         }
     }
-}
-
-/// Decode an image widget's inline payload, accepting either raw base64 or a
-/// `data:` URI so a preset author can paste either.
-fn decode_inline(data: &str) -> Option<Vec<u8>> {
-    use base64::Engine;
-    if data.is_empty() {
-        return None;
-    }
-    let payload = match data.split_once("base64,") {
-        Some((prefix, rest)) if prefix.starts_with("data:") => rest,
-        _ => data,
-    };
-    base64::engine::general_purpose::STANDARD
-        .decode(payload.trim())
-        .ok()
 }
 
 impl Render for ImageWidget {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(img) = &self.render_image {
-            let img = img.clone();
-            div().size_full().child(
-                canvas(
-                    move |_, _, _| {},
-                    move |bounds, _, window, _| {
-                        let _ = window.paint_image(
-                            bounds,
-                            bounds,
-                            Corners::default(),
-                            img.clone(),
-                            0,
-                            false,
-                        );
-                    },
-                )
-                .size_full(),
-            )
+            div()
+                .size_full()
+                .child(image_source::image_canvas(img.clone(), false))
         } else {
             let theme = theme(cx);
             div()
@@ -802,27 +766,10 @@ mod tests {
             "sequence",
             "sequence_grid",
             "label",
+            "state_image",
         ] {
             assert!(keys.iter().any(|k| k == key), "{key} has no tile");
         }
-    }
-
-    #[test]
-    fn inline_image_data_accepts_raw_base64_and_data_uris() {
-        // "hi" in base64.
-        assert_eq!(decode_inline("aGk=").as_deref(), Some(&b"hi"[..]));
-        assert_eq!(
-            decode_inline("data:image/png;base64,aGk=").as_deref(),
-            Some(&b"hi"[..])
-        );
-        // Whitespace from a wrapped literal in a preset file.
-        assert_eq!(decode_inline(" aGk= \n").as_deref(), Some(&b"hi"[..]));
-    }
-
-    #[test]
-    fn undecodable_inline_data_falls_through_to_the_path() {
-        assert!(decode_inline("").is_none());
-        assert!(decode_inline("not base64!!").is_none());
     }
 
     #[test]

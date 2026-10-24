@@ -12,6 +12,7 @@ pub mod exec_timeline;
 pub mod filter_bar;
 pub mod format;
 pub mod gauge;
+pub(crate) mod image_source;
 pub(crate) mod instrument;
 pub mod json_tree;
 pub mod label;
@@ -31,6 +32,7 @@ pub mod sequence_grid;
 pub mod sequence_panel;
 pub mod spectrogram;
 pub mod state_chip;
+pub mod state_image;
 pub mod table;
 pub mod time_series;
 pub mod timeline;
@@ -51,6 +53,7 @@ pub use filter_bar::{FilterBar, FilterBarEvent};
 pub(crate) use format::format_number;
 pub use format::{ElementIndexes, format_element_value, format_value};
 pub use gauge::{Gauge, GaugeConfig, GaugeStyle};
+pub use image_source::ImageRef;
 pub use json_tree::JsonTree;
 pub use label::{Label, LabelAlign, LabelConfig};
 pub use list_plot::{ListLinePlot, ListPlot, ListPlotPanelConfig, ListTrace, ListTraceConfig};
@@ -68,6 +71,7 @@ pub use spectrogram::{
     Spectrogram, SpectrogramPanelConfig, SpectrogramPlot, SpectrogramTrace, SpectrogramTraceConfig,
 };
 pub use state_chip::{StateChip, StateChipConfig, StateChipStyle, StateEntry, StateEntryConfig};
+pub use state_image::{StateImage, StateImageConfig, StateImageEntry, StateImageEntryConfig};
 pub use table::{Column, ColumnSort, Table, TableDelegate};
 pub use time_series::{
     EventOverlayConfig, MeasurementCursorConfig, MeasurementPanelConfig, PlotPanelConfig,

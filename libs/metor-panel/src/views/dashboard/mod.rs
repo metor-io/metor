@@ -106,6 +106,9 @@ impl WidgetKind {
     pub fn label() -> Self {
         Self(SharedString::new_static("label"))
     }
+    pub fn state_image() -> Self {
+        Self(SharedString::new_static("state_image"))
+    }
     pub fn sequence_control() -> Self {
         Self(SharedString::new_static("sequence_control"))
     }

@@ -179,6 +179,17 @@ impl AddMenu {
             ),
             (
                 None,
+                self.instrument("State Image", WidgetKind::state_image(), |seed| {
+                    crate::views::StateImageConfig {
+                        component: seed.component,
+                        element: seed.element,
+                        label: Some(seed.label),
+                        ..Default::default()
+                    }
+                }),
+            ),
+            (
+                None,
                 self.component("Attitude", WidgetKind::attitude(), |component| {
                     AttitudeConfig {
                         component,
