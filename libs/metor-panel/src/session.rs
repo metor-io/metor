@@ -190,6 +190,16 @@ impl SessionStorage {
     }
 }
 
+/// The OS picker for opening a recording: one bundle file or directory.
+fn open_recording_prompt() -> gpui::PathPromptOptions {
+    gpui::PathPromptOptions {
+        files: true,
+        directories: true,
+        multiple: false,
+        prompt: Some("Open recording".into()),
+    }
+}
+
 fn recording_lock(path: &Path) -> io::Result<File> {
     let file = File::options()
         .read(true)

@@ -255,16 +255,11 @@ impl Member {
         }
     }
 
-    // `window` is unused at the leaf today, but forwarded so future render
-    // paths (focus, scroll into view) can reach gpui's window APIs without
-    // a signature churn.
-    #[allow(clippy::only_used_in_recursion)]
     fn render(
         &self,
         path: SplitPath,
         tile_group: &Entity<TileGroup>,
         gaps: &split_preview::GapWeights,
-        window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         match self {
@@ -342,7 +337,7 @@ impl Member {
                     let mut child_path = path.clone();
                     child_path.push(ix);
 
-                    let child_element = member.render(child_path, tile_group, gaps, window, cx);
+                    let child_element = member.render(child_path, tile_group, gaps, cx);
                     let locked_px = gap_amount
                         .is_none()
                         .then(|| locked_along_axis(member, axis.axis, cx))
@@ -992,7 +987,6 @@ impl Render for TileGroup {
                 SplitPath::new(),
                 &tile_group,
                 &gaps,
-                window,
                 cx,
             ));
         for (pane, bounds) in self.split_preview.drop_regions() {

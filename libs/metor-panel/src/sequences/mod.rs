@@ -185,14 +185,15 @@ impl SequenceState {
     }
 
     /// Channels in registry declaration order.
-    pub fn channels_ordered(&self) -> Vec<&ChannelState> {
-        self.channels.iter().collect()
+    pub fn channels_ordered(&self) -> &[ChannelState] {
+        &self.channels
     }
 
     pub fn channel(&self, name: &str) -> Option<&ChannelState> {
         self.channels.iter().find(|channel| channel.name == name)
     }
 
+    #[cfg(test)]
     pub fn channel_count(&self) -> usize {
         self.channels.len()
     }
