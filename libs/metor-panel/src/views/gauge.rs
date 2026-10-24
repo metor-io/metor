@@ -7,13 +7,17 @@
 //! *where in the range* a value sits rather than how much of it is used, and
 //! it packs a wide range into a square tile.
 //!
-//! The look follows cockpit dials: a thin notched arc over part of an
+//! The look follows the Crew Dragon displays: a thick band over part of an
 //! invisible circle, turned to whichever side of that circle suits the
-//! layout, with the readout set large in the circle's middle. The circle, not
+//! layout, with the readout set large in the circle's middle. The band's
+//! unfilled length is a quiet track; the span up to the value is lit in the
+//! dial's color. Divisions are not lines drawn over the band but gaps cut
+//! through it, so the fill reads as a run of lit segments, and subdivisions
+//! are shallow notches bitten into the band's inner edge. The circle, not
 //! the arc, is what the readout belongs to, so a short arc tucked into one
 //! corner still frames a centered value.
 //!
-//! Arcs are drawn as sampled polylines rather than through
+//! Arcs are sampled into polylines rather than built with
 //! [`PathBuilder::arc_to`]. The SVG arc flags (`large_arc`/`sweep`) are easy
 //! to get subtly wrong across the 180° boundary, and at [`ARC_STEP_DEG`] the
 //! polyline is indistinguishable from a true arc.
@@ -40,7 +44,7 @@ use crate::theme::{theme, ui_px, ui_scale};
 #[derive(Clone, Copy, Debug, Default, PartialEq, facet::Facet, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum GaugeStyle {
-    /// A thick arc filled from the scale's origin to the value.
+    /// The band lit from the scale's origin to the value.
     #[default]
     Arc,
     /// A pointer from the hub to the value.
@@ -49,22 +53,35 @@ pub enum GaugeStyle {
 
 /// Angular resolution of a sampled arc.
 const ARC_STEP_DEG: f64 = 2.0;
-/// Thickness of the dial's track and value arc, before the radius caps it.
-const ARC_WIDTH: f32 = 7.0;
-/// Largest share of the radius the track may take, so a small dial stays a
-/// thin ring instead of a disc.
-const ARC_WIDTH_MAX: f32 = 0.1;
-/// Fraction of the radius a limit mark extends inward from the track.
-const TICK_REACH: f32 = 0.18;
-/// Fraction of the radius a major notch extends inward from the track.
-const MAJOR_NOTCH: f32 = 0.09;
-/// Fraction of the radius a minor notch extends inward from the track.
-const MINOR_NOTCH: f32 = 0.05;
+/// Thickness of the band in ui pixels, before the radius caps it.
+const BAND_WIDTH: f32 = 14.0;
+/// Largest share of the radius the band may take, so a small dial stays a
+/// ring instead of a disc.
+const BAND_SHARE: f32 = 0.12;
+/// Narrowest division gap, in ui pixels: a cut thinner than this stops
+/// reading as a gap on a small dial.
+const GAP_MIN: f32 = 2.5;
+/// Division gap as a share of the band's thickness, so a large dial's cuts
+/// keep their proportion to the band.
+const GAP_SHARE: f32 = 0.3;
+/// Largest share of a division a gap may take, so dense divisions on a
+/// short arc still leave more band than gap.
+const GAP_MAX_SHARE: f32 = 0.3;
+/// A subdivision notch's width relative to a division gap.
+const NOTCH_WIDTH: f32 = 0.5;
+/// How far a subdivision notch bites into the band from its inner edge, as
+/// a share of the band's thickness.
+const NOTCH_DEPTH: f32 = 0.4;
+/// Subdivisions closer than this many notch widths apart are left off:
+/// past that density they read as texture rather than a scale.
+const NOTCH_MIN_SPACING: f32 = 4.0;
+/// How far a limit mark overhangs the band toward the hub, in radii.
+const LIMIT_OVERHANG: f32 = 0.08;
 /// Deepest any arc decoration reaches toward the hub, in radii. The fit keeps
 /// the arc's ends at this depth on screen as well as its outer edge.
-const INNER_REACH: f32 = 1.0 - ARC_WIDTH_MAX - TICK_REACH;
-/// Half-extent of the readout block around the hub, in radii. Major notches
-/// stop at `1 - ARC_WIDTH_MAX - MAJOR_NOTCH`, outside this box's corners.
+const INNER_REACH: f32 = 1.0 - BAND_SHARE - LIMIT_OVERHANG;
+/// Half-extent of the readout block around the hub, in radii. Its corners
+/// (about 0.74 out) clear the band and the limit marks' overhang.
 const READOUT_HALF: (f32, f32) = (0.62, 0.4);
 /// Readout lines as (vertical offset from the hub, font size), in radii.
 const LABEL_LINE: (f32, f32) = (-0.3, 0.12);
@@ -75,9 +92,9 @@ const MIN_TEXT: f32 = 7.0;
 /// Default total sweep — wide enough to read a range, open enough at the
 /// bottom to leave room for the value.
 const DEFAULT_SWEEP_DEG: f64 = 240.0;
-/// Default major divisions: a notch every fifth of the scale.
+/// Default divisions: the band cut into fifths.
 const DEFAULT_DIVISIONS: usize = 5;
-/// Default minor notches between each pair of majors.
+/// Default subdivision notches inside each division.
 const DEFAULT_MINOR_TICKS: usize = 1;
 
 /// Persisted shape of a [`Gauge`], shared by the tile and dashboard surfaces.
@@ -95,9 +112,11 @@ pub struct GaugeConfig {
     /// keeps the dial symmetric about vertical, as dials saved before this
     /// field existed were.
     pub rotation_degrees: f64,
-    /// Major notches split the scale into this many equal parts; `0` draws
-    /// none, minor notches included.
+    /// Gaps cut the band into this many equal segments; `0` leaves it whole
+    /// and draws no subdivision notches either.
     pub divisions: usize,
+    /// Notches bitten into each segment's inner edge, splitting a division
+    /// evenly. Dropped where they would crowd together.
     pub minor_ticks: usize,
     pub style: GaugeStyle,
     pub color: Option<Hsla>,
@@ -336,7 +355,7 @@ fn paint_centered(
 /// What has to fit at the hub besides the arc itself.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Hub {
-    /// Nothing: only the arc and its notches take space.
+    /// Nothing: only the band and its limit marks take space.
     Empty,
     /// The needle's pivot, a point.
     Pivot,
@@ -452,35 +471,6 @@ impl Dial {
         point(self.center.x + px(x), self.center.y + px(y))
     }
 
-    /// Stroke an arc between two scale fractions as a sampled polyline.
-    fn paint_arc(
-        &self,
-        radius: f32,
-        from: f32,
-        to: f32,
-        width: Pixels,
-        color: Hsla,
-        window: &mut Window,
-    ) {
-        if to <= from {
-            return;
-        }
-        let steps = arc_steps(self.sweep, to - from);
-        let mut path = PathBuilder::stroke(width);
-        for i in 0..=steps {
-            let t = from + (to - from) * (i as f32 / steps as f32);
-            let p = self.at(t, radius);
-            if i == 0 {
-                path.move_to(p);
-            } else {
-                path.line_to(p);
-            }
-        }
-        if let Ok(p) = path.build() {
-            window.paint_path(p, color);
-        }
-    }
-
     /// Stroke a straight run along the radius at scale fraction `t`.
     fn paint_spoke(
         &self,
@@ -507,17 +497,150 @@ fn arc_steps(sweep_rad: f32, fraction: f32) -> usize {
     ((degrees / ARC_STEP_DEG).ceil() as usize).max(2)
 }
 
-/// Scale fractions of the gradation notches, each flagged `true` for a major.
+/// A run of the scale between two fractions, `lo <= hi`.
+type Span = (f32, f32);
+
+/// The stretches of band the division gaps leave, each gap `gap` wide in
+/// scale fractions and centred on its division point.
 ///
-/// `divisions` majors-to-majors spans, `minor` notches evenly inside each.
-/// Both ends of the scale get a major, so a full circle doubles up at the
-/// seam — harmless, since the two strokes coincide.
-fn notches(divisions: usize, minor: usize) -> impl Iterator<Item = (f32, bool)> {
+/// The scale's ends are flush — the band simply stops there — unless the
+/// dial is `closed` into a full circle, where the ends meet at a division
+/// point and get half a gap each so the seam reads like any other cut.
+fn segments(divisions: usize, gap: f32, closed: bool) -> Vec<Span> {
+    let n = divisions.max(1);
+    let half = if divisions == 0 { 0.0 } else { gap / 2.0 };
+    (0..n)
+        .map(|i| {
+            let lo = i as f32 / n as f32;
+            let hi = (i + 1) as f32 / n as f32;
+            let lo_cut = if i > 0 || closed { half } else { 0.0 };
+            let hi_cut = if i + 1 < n || closed { half } else { 0.0 };
+            (lo + lo_cut, hi - hi_cut)
+        })
+        .collect()
+}
+
+/// Subdivision notches, `width` wide in scale fractions, `minor` spread
+/// evenly inside each of `divisions`. None without divisions: a whole band
+/// has nothing to subdivide.
+fn subdivisions(divisions: usize, minor: usize, width: f32) -> Vec<Span> {
     let per_division = minor + 1;
     let total = divisions * per_division;
-    (0..=total)
-        .filter(move |_| divisions > 0)
-        .map(move |i| (i as f32 / total as f32, i % per_division == 0))
+    (1..total)
+        .filter(|i| i % per_division != 0)
+        .map(|i| {
+            let t = i as f32 / total as f32;
+            (t - width / 2.0, t + width / 2.0)
+        })
+        .collect()
+}
+
+/// The inner edge of the band between `from` and `to`, as ascending runs
+/// each flagged `true` where it lies inside a notch. `notches` are sorted
+/// and disjoint; a notch straddling either end is cut at it, so a fill that
+/// stops mid-notch keeps the notch's shape.
+fn inner_runs(from: f32, to: f32, notches: &[Span]) -> Vec<(Span, bool)> {
+    let mut runs = Vec::new();
+    let mut cursor = from;
+    for &(lo, hi) in notches {
+        let (lo, hi) = (lo.max(from), hi.min(to));
+        if hi <= lo {
+            continue;
+        }
+        if lo > cursor {
+            runs.push(((cursor, lo), false));
+        }
+        runs.push(((lo, hi), true));
+        cursor = hi;
+    }
+    if to > cursor {
+        runs.push(((cursor, to), false));
+    }
+    runs
+}
+
+/// A dial's band resolved for one frame: its radii in pixels and where the
+/// gaps and notches fall. The track and the fill are both cut from it, so
+/// the lit span lines up with the track's segments exactly.
+struct Band {
+    outer: f32,
+    inner: f32,
+    /// Radius of a notch's floor, between `inner` and `outer`.
+    notch: f32,
+    width: f32,
+    segments: Vec<Span>,
+    notches: Vec<Span>,
+}
+
+impl Band {
+    /// Size the band for `dial`. Gaps are a fixed few pixels (growing with
+    /// the band's thickness), converted to scale fractions along the band's
+    /// centreline, so they read the same on a short arc as on a long one.
+    fn new(dial: &Dial, divisions: usize, minor: usize, ui_scale: f32) -> Self {
+        let width = (BAND_WIDTH * ui_scale).min(dial.radius * BAND_SHARE);
+        let length = (dial.radius - width / 2.0) * dial.sweep;
+        let gap_px = (GAP_MIN * ui_scale).max(GAP_SHARE * width);
+        let mut gap = 0.0;
+        let mut notches = Vec::new();
+        if divisions > 0 && length > 0.0 {
+            gap = (gap_px / length).min(GAP_MAX_SHARE / divisions as f32);
+            let notch_px = gap_px * NOTCH_WIDTH;
+            let spacing = length / (divisions * (minor + 1)) as f32;
+            if minor > 0 && spacing >= NOTCH_MIN_SPACING * notch_px {
+                notches = subdivisions(divisions, minor, notch_px / length);
+            }
+        }
+        let closed = dial.sweep >= std::f32::consts::TAU - 1e-4;
+        Self {
+            outer: dial.radius,
+            inner: dial.radius - width,
+            notch: dial.radius - width * (1.0 - NOTCH_DEPTH),
+            width,
+            segments: segments(divisions, gap, closed),
+            notches,
+        }
+    }
+
+    /// The parts of the band's segments between scale fractions `from` and
+    /// `to` — what a fill over that span lights.
+    fn pieces(&self, from: f32, to: f32) -> impl Iterator<Item = Span> + '_ {
+        self.segments
+            .iter()
+            .map(move |&(lo, hi)| (lo.max(from), hi.min(to)))
+            .filter(|(a, b)| b > a)
+    }
+
+    fn paint(&self, dial: &Dial, from: f32, to: f32, color: Hsla, window: &mut Window) {
+        for (a, b) in self.pieces(from, to) {
+            self.paint_piece(dial, a, b, color, window);
+        }
+    }
+
+    /// One closed outline: out along the outer edge, back along the
+    /// (notched) inner edge, so each end is a clean radial cut.
+    fn paint_piece(&self, dial: &Dial, from: f32, to: f32, color: Hsla, window: &mut Window) {
+        let mut path = PathBuilder::fill();
+        let steps = arc_steps(dial.sweep, to - from);
+        for i in 0..=steps {
+            let p = dial.at(from + (to - from) * (i as f32 / steps as f32), self.outer);
+            if i == 0 {
+                path.move_to(p);
+            } else {
+                path.line_to(p);
+            }
+        }
+        for ((lo, hi), notched) in inner_runs(from, to, &self.notches).into_iter().rev() {
+            let r = if notched { self.notch } else { self.inner };
+            let steps = arc_steps(dial.sweep, hi - lo);
+            for i in 0..=steps {
+                path.line_to(dial.at(hi - (hi - lo) * (i as f32 / steps as f32), r));
+            }
+        }
+        path.close();
+        if let Ok(p) = path.build() {
+            window.paint_path(p, color);
+        }
+    }
 }
 
 impl Render for Gauge {
@@ -534,9 +657,9 @@ impl Render for Gauge {
             .map(|s| theme.alarm_color(crate::alarms::severity_index(s)))
             .unwrap_or(self.color);
         let style = self.style;
+        // The track stays at border level so the unlit band recedes and
+        // only the fill and the readout catch the eye.
         let track_color = theme.border_primary;
-        let major_color = theme.text_secondary;
-        let minor_color = theme.text_tertiary;
         let hub_color = theme.text_primary;
         let value_color = theme.text_primary;
         let caption_color = theme.text_secondary;
@@ -551,7 +674,7 @@ impl Render for Gauge {
         } else {
             Vec::new()
         };
-        let notches: Vec<(f32, bool)> = notches(self.divisions, self.minor_ticks).collect();
+        let (divisions, minor) = (self.divisions, self.minor_ticks);
         let readout = self.readout();
         let hub = if !readout.is_empty() {
             Hub::Readout
@@ -572,30 +695,19 @@ impl Render for Gauge {
                     return;
                 }
                 let k = ui_scale(window);
-                let arc_w = (ARC_WIDTH * k).min(dial.radius * ARC_WIDTH_MAX);
-                let arc_r = dial.radius - arc_w / 2.0;
-                let inner = dial.radius - arc_w;
-                dial.paint_arc(arc_r, 0.0, 1.0, px(arc_w), track_color, window);
-
-                for &(t, major) in &notches {
-                    let (reach, color, width) = if major {
-                        (MAJOR_NOTCH, major_color, 1.5 * k)
-                    } else {
-                        (MINOR_NOTCH, minor_color, k)
-                    };
-                    let to = inner - dial.radius * reach;
-                    dial.paint_spoke(t, inner, to, px(width), color, window);
-                }
+                let band = Band::new(&dial, divisions, minor, k);
+                band.paint(&dial, 0.0, 1.0, track_color, window);
 
                 match style {
                     GaugeStyle::Arc => {
                         if let Some((start, end)) = span {
-                            dial.paint_arc(arc_r, start, end, px(arc_w), color, window);
+                            band.paint(&dial, start, end, color, window);
                         }
                     }
                     GaugeStyle::Needle => {
                         if let Some(t) = needle {
-                            dial.paint_spoke(t, 0.0, arc_r - arc_w, px(2.0 * k), color, window);
+                            let tip = band.inner - band.width / 2.0;
+                            dial.paint_spoke(t, 0.0, tip, px(2.0 * k), color, window);
                         }
                     }
                 }
@@ -603,8 +715,8 @@ impl Render for Gauge {
                 for (t, mark_color) in &marks {
                     dial.paint_spoke(
                         *t,
-                        dial.radius,
-                        arc_r - dial.radius * TICK_REACH,
+                        band.outer,
+                        band.inner - dial.radius * LIMIT_OVERHANG,
                         px(2.0 * k),
                         *mark_color,
                         window,
@@ -768,24 +880,143 @@ mod tests {
         assert!((used.0 - 200.0).abs() < 1e-3 || (used.1 - 100.0).abs() < 1e-3);
     }
 
-    #[test]
-    fn notches_mark_divisions_and_subdivisions() {
-        let n: Vec<_> = notches(4, 1).collect();
-        assert_eq!(n.len(), 9);
-        assert_eq!(n.iter().filter(|(_, major)| *major).count(), 5);
-        assert_eq!(n[0], (0.0, true));
-        assert_eq!(n[1], (0.125, false));
-        assert_eq!(n[2], (0.25, true));
-        assert_eq!(n[8], (1.0, true));
-
-        let majors: Vec<_> = notches(5, 0).collect();
-        assert_eq!(majors.len(), 6);
-        assert!(majors.iter().all(|(_, major)| *major));
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
     }
 
     #[test]
-    fn zero_divisions_turns_notches_off() {
-        assert_eq!(notches(0, 3).count(), 0);
+    fn gaps_cut_the_band_at_each_division() {
+        let s = segments(4, 0.02, false);
+        assert_eq!(s.len(), 4);
+        assert!(near(s[0].0, 0.0) && near(s[3].1, 1.0), "ends flush: {s:?}");
+        for (i, pair) in s.windows(2).enumerate() {
+            let (left, right) = (pair[0].1, pair[1].0);
+            let division = (i + 1) as f32 / 4.0;
+            assert!(near(right - left, 0.02), "gap width {pair:?}");
+            assert!(near((left + right) / 2.0, division), "gap centred {pair:?}");
+        }
+    }
+
+    #[test]
+    fn a_full_circle_cuts_its_seam_too() {
+        let s = segments(3, 0.02, true);
+        assert!(near(s[0].0, 0.01) && near(s[2].1, 0.99), "{s:?}");
+    }
+
+    #[test]
+    fn zero_divisions_leaves_the_band_whole() {
+        assert_eq!(segments(0, 0.02, false), vec![(0.0, 1.0)]);
+        assert_eq!(segments(0, 0.02, true), vec![(0.0, 1.0)]);
+        assert!(subdivisions(0, 3, 0.01).is_empty());
+    }
+
+    #[test]
+    fn subdivisions_split_each_division_evenly() {
+        let centres: Vec<f32> = subdivisions(2, 2, 0.01)
+            .iter()
+            .map(|(lo, hi)| (lo + hi) / 2.0)
+            .collect();
+        let want = [1.0 / 6.0, 2.0 / 6.0, 4.0 / 6.0, 5.0 / 6.0];
+        assert_eq!(centres.len(), want.len());
+        for (c, w) in centres.iter().zip(want) {
+            assert!(near(*c, w), "{centres:?}");
+        }
+        assert!(subdivisions(5, 0, 0.01).is_empty());
+    }
+
+    #[test]
+    fn inner_runs_cover_the_span_and_clip_straddling_notches() {
+        let notches = [(0.1, 0.2), (0.4, 0.5), (0.8, 0.9)];
+        let runs = inner_runs(0.15, 0.45, &notches);
+        assert_eq!(
+            runs,
+            vec![
+                ((0.15, 0.2), true),
+                ((0.2, 0.4), false),
+                ((0.4, 0.45), true)
+            ]
+        );
+        assert_eq!(inner_runs(0.6, 0.7, &notches), vec![((0.6, 0.7), false)]);
+    }
+
+    /// Gap width along the band's centreline, in pixels.
+    fn gap_px(band: &Band, dial: &Dial) -> f32 {
+        let length = (dial.radius - band.width / 2.0) * dial.sweep;
+        (band.segments[1].0 - band.segments[0].1) * length
+    }
+
+    #[test]
+    fn gaps_hold_their_pixel_width_across_sizes_and_sweeps() {
+        let small = Dial {
+            radius: 40.0,
+            ..hub_dial(FRAC_PI_2, 0.0)
+        };
+        let large = Dial {
+            radius: 400.0,
+            ..hub_dial(SWEEP_240, 0.0)
+        };
+        let (a, b) = (Band::new(&small, 5, 1, 1.0), Band::new(&large, 5, 1, 1.0));
+        let px_near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        assert!(
+            px_near(gap_px(&a, &small), GAP_MIN),
+            "{}",
+            gap_px(&a, &small)
+        );
+        // A thick band earns a proportionally wider cut, never a thinner one.
+        assert!(px_near(gap_px(&b, &large), GAP_SHARE * BAND_WIDTH));
+        assert!(b.width > a.width && a.width <= small.radius * BAND_SHARE);
+    }
+
+    #[test]
+    fn dense_divisions_on_a_short_arc_keep_more_band_than_gap() {
+        let d = Dial {
+            radius: 30.0,
+            ..hub_dial(FRAC_PI_2, 0.0)
+        };
+        let band = Band::new(&d, 20, 9, 1.0);
+        let share = 1.0 / 20.0;
+        for &(lo, hi) in &band.segments {
+            assert!(
+                hi - lo >= share * (1.0 - GAP_MAX_SHARE) - 1e-5,
+                "{lo}..{hi}"
+            );
+        }
+        assert!(band.notches.is_empty(), "crowded subdivisions are dropped");
+    }
+
+    #[test]
+    fn notches_bite_the_inner_edge_only() {
+        let d = Dial {
+            radius: 200.0,
+            ..hub_dial(SWEEP_240, 0.0)
+        };
+        let band = Band::new(&d, 4, 1, 1.0);
+        assert_eq!(band.notches.len(), 4);
+        assert!(band.inner < band.notch && band.notch < band.outer);
+        // Notches sit well inside their segments, clear of the gaps.
+        for &(lo, hi) in &band.notches {
+            assert!(band.segments.iter().any(|&(a, b)| a < lo && hi < b));
+        }
+    }
+
+    #[test]
+    fn the_fill_lights_whole_segments_and_respects_gaps() {
+        let d = Dial {
+            radius: 100.0,
+            ..hub_dial(SWEEP_240, 0.0)
+        };
+        let band = Band::new(&d, 4, 0, 1.0);
+        let lit: Vec<Span> = band.pieces(0.0, 0.6).collect();
+        assert_eq!(lit.len(), 3, "{lit:?}");
+        assert_eq!(lit[0], band.segments[0]);
+        assert_eq!(lit[1], band.segments[1]);
+        assert!(near(lit[2].0, band.segments[2].0) && near(lit[2].1, 0.6));
+        // A value inside a gap lights nothing past the last segment.
+        let gap_mid = (band.segments[0].1 + band.segments[1].0) / 2.0;
+        assert_eq!(band.pieces(0.0, gap_mid).count(), 1);
+        // Bipolar fills start mid-scale.
+        let mid: Vec<Span> = band.pieces(0.5, 0.6).collect();
+        assert!(mid.len() == 1 && near(mid[0].1, 0.6));
     }
 
     #[test]
