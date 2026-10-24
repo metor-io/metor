@@ -67,8 +67,12 @@ impl Binding {
     pub fn id(&self) -> ComponentId {
         self.id
     }
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+    /// Why this binding shows nothing new: the expression failed to start,
+    /// or it started and has since faulted.
+    pub fn error(&self) -> Option<String> {
+        self.error
+            .clone()
+            .or_else(|| self.expression.as_ref()?.fault())
     }
     pub fn is_unbound(&self) -> bool {
         matches!(self.spec, BindingSpec::Unbound)

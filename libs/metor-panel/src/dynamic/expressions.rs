@@ -156,6 +156,9 @@ struct ExpressionInner {
     worker: WorkerHandle,
     /// The same wiring, for computing the history the live system never saw.
     plan: ReplayPlan,
+    /// Set when the system stops evaluating, so the binding can say why its
+    /// component went quiet.
+    health: program::Health,
 }
 
 impl Drop for ExpressionInner {
@@ -169,20 +172,21 @@ impl Drop for ExpressionInner {
 impl Expression {
     /// Assemble the parts of a running expression.
     ///
-    /// `system` and `field` are held only for their drop, so they are taken
-    /// here rather than exposed as fields nobody should read.
+    /// `system`'s node and `field` are held only for their drop, so they are
+    /// taken here rather than exposed as fields nobody should read.
     pub fn new(
         node: Arc<Node>,
-        system: Arc<Node>,
+        system: program::System,
         field: Arc<Node>,
         plan: ReplayPlan,
         worker: WorkerHandle,
     ) -> Self {
         Expression(Arc::new(ExpressionInner {
             component: plan.outputs[0].1,
-            nodes: vec![node, system, field],
+            nodes: vec![node, system.node, field],
             worker,
             plan,
+            health: system.health,
         }))
     }
 
@@ -192,6 +196,11 @@ impl Expression {
 
     pub fn replay_plan(&self) -> ReplayPlan {
         self.0.plan.clone()
+    }
+
+    /// Why the expression stopped computing, if it has.
+    pub fn fault(&self) -> Option<String> {
+        self.0.health.fault()
     }
 }
 
@@ -337,7 +346,7 @@ pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, Exp
             let system = program::system(&compiled, 0, ports, DEFAULT_FUEL, None)?;
             let field = program::field(&compiled, 0, 0, system.node.clone())?;
             let node = publish(&db, &name, field.clone(), &label)?;
-            Ok(Expression::new(node, system.node, field, plan, disposer))
+            Ok(Expression::new(node, system, field, plan, disposer))
         })
     };
     let built = built

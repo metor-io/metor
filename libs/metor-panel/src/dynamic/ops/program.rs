@@ -115,6 +115,7 @@ impl Health {
     }
 
     fn park(&self, why: String) {
+        tracing::warn!(fault = %why, "expression stopped evaluating");
         *self.0.lock().unwrap() = Some(why);
     }
 }

@@ -469,7 +469,7 @@ async fn the_registry_does_not_keep_an_unused_expression_alive() {
         };
         expressions::Expression::new(
             published,
-            system.node,
+            system,
             field,
             plan,
             crate::dynamic::worker::DynamicWorker::new()
@@ -1702,4 +1702,38 @@ fn unavailable_bindings_retry_and_model_expressions_survive_a_cold_database(
             "last input releases computation"
         );
     });
+}
+
+/// A fault after the expression started reaches the binding, which is where
+/// the inspector reads why a view stopped updating.
+#[gpui::test]
+fn a_faulting_expression_reports_through_its_binding(cx: &mut gpui::TestAppContext) {
+    use crate::dynamic::worker::DynamicWorker;
+    use metor_proto::types::Timestamp;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let (db, _temp) = db_with_ids(&[("rpm", ComponentId::new("rpm"), PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let binding = cx.update(|cx| {
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+        crate::data_binding::Binding::from_text("=[1.0, 2.0][int(rpm)]", &db, cx)
+    });
+    assert!(binding.error().is_none(), "it compiles and starts");
+
+    // Indexes past the end, on the worker's thread, once the system is
+    // subscribed.
+    std::thread::sleep(Duration::from_millis(50));
+    db.with_state(|s| s.get_component(ComponentId::new("rpm")).cloned())
+        .unwrap()
+        .push_buf(Timestamp(100), &2.0f64.to_le_bytes())
+        .unwrap();
+    for _ in 0..200 {
+        if binding.error().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the fault never reached the binding");
 }

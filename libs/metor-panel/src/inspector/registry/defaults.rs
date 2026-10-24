@@ -202,7 +202,7 @@ impl InspectorRegistry {
         self.register_field_widget::<Binding>(Arc::new(move |ctx, peek, entity, idx| {
             let binding = peek.get::<Binding>().expect("binding field");
             let query = binding.text(&db);
-            let summary = binding.error().map(str::to_string).unwrap_or_else(|| {
+            let summary = binding.error().unwrap_or_else(|| {
                 if query.is_empty() {
                     "Unbound".to_string()
                 } else {
