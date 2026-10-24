@@ -28,7 +28,7 @@ wgpu = "30"
 zerocopy = { version = "0.8.2", features = ["derive"] }
 
 [dev-dependencies]
-metor-star = { path = "../../../../libs/metor-star", features = ["sim", "std", "testkit"] }
+metor-star = { path = "../../../../libs/metor-star", features = ["sim", "testkit"] }
 naga = { version = "30", features = ["wgsl-in"] }
 
 [lints]

@@ -50,7 +50,7 @@ pub fn cat_bytes(stars: &[(V3, f32, u32)]) -> Vec<u8> {
         star.dir = normalize(*dir)
             .unwrap_or([0.0, 0.0, 1.0])
             .map(|c| (c as f32).into());
-        star.mags.set(u32::from((g * 1000.0).round() as i16 as u16));
+        star.mags.set(u32::from(libm::roundf(g * 1000.0) as i16 as u16));
         bytes.extend_from_slice(star.as_bytes());
     }
     for (row, hip) in hips {

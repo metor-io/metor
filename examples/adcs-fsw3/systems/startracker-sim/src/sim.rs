@@ -132,7 +132,10 @@ impl StarSim {
             beta,
             t_exp: self.params.exposure_s,
         };
-        let seed = Rng::seeded(self.params.seed ^ frame_id, "star_sim").next_u64();
+        // Spread the frame id over all 64 bits so that nearby (seed, frame)
+        // pairs never share a noise seed the way `seed ^ frame_id` did.
+        let mixed = self.params.seed ^ frame_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let seed = Rng::seeded(mixed, "star_sim").next_u64();
         let max_sub = self.params.max_substeps as usize;
         Frame::new(&self.camera, &motion, max_sub, seed, frame_id)
     }
