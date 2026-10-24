@@ -66,10 +66,10 @@ const TRACK_ALPHA: f32 = 0.18;
 const DASH_ALPHA: f32 = 0.3;
 /// Narrowest division gap, in ui pixels: a cut thinner than this stops
 /// reading as a gap on a small dial.
-const GAP_MIN: f32 = 2.0;
+const GAP_MIN: f32 = 1.5;
 /// Division gap as a share of the band's thickness, so a large dial's cuts
 /// keep their proportion to the band.
-const GAP_SHARE: f32 = 0.5;
+const GAP_SHARE: f32 = 0.3;
 /// Largest share of a division a gap may take, so dense divisions on a
 /// short arc still leave more band than gap.
 const GAP_MAX_SHARE: f32 = 0.3;
@@ -614,19 +614,50 @@ impl Band {
     }
 
     /// Fill the band between scale fractions `from` and `to`, one closed
-    /// outline per segment so each end is a square radial cut.
-    fn paint_span(&self, dial: &Dial, from: f32, to: f32, color: Hsla, window: &mut Window) {
+    /// outline per segment. A segment's own ends get a value cell's corner
+    /// radius; where the span cuts a segment short — the fill meeting the
+    /// track mid-segment — the cut stays square so the two meet without a
+    /// notch.
+    fn paint_span(
+        &self,
+        dial: &Dial,
+        from: f32,
+        to: f32,
+        corner: f32,
+        color: Hsla,
+        window: &mut Window,
+    ) {
         let (outer, inner) = (self.track + self.width / 2.0, self.inner());
         for (a, b) in self.pieces(from, to) {
+            // Clamped so a thin band or a sliver of a segment rounds into a
+            // pill rather than overlapping its own corners.
+            let r = corner
+                .min(self.width / 2.0)
+                .min((b - a) * inner * dial.sweep / 2.0)
+                .max(0.0);
+            let own_end = |t: f32| self.segments.iter().any(|&(lo, hi)| t == lo || t == hi);
+            let round_a = if own_end(a) { r } else { 0.0 };
+            let round_b = if own_end(b) { r } else { 0.0 };
+            // A corner's run along an edge, as a scale fraction at that edge.
+            let along = |round: f32, radius: f32| round / (radius * dial.sweep);
+            let (oa, ob) = (a + along(round_a, outer), b - along(round_b, outer));
+            let (ia, ib) = (a + along(round_a, inner), b - along(round_b, inner));
+
             let steps = arc_steps(dial.sweep, b - a);
             let mut path = PathBuilder::fill();
-            path.move_to(dial.at(a, outer));
+            path.move_to(dial.at(oa, outer));
             for i in 1..=steps {
-                path.line_to(dial.at(a + (b - a) * (i as f32 / steps as f32), outer));
+                path.line_to(dial.at(oa + (ob - oa) * (i as f32 / steps as f32), outer));
             }
-            for i in 0..=steps {
-                path.line_to(dial.at(b - (b - a) * (i as f32 / steps as f32), inner));
+            path.curve_to(dial.at(b, outer - round_b), dial.at(b, outer));
+            path.line_to(dial.at(b, inner + round_b));
+            path.curve_to(dial.at(ib, inner), dial.at(b, inner));
+            for i in 1..=steps {
+                path.line_to(dial.at(ib - (ib - ia) * (i as f32 / steps as f32), inner));
             }
+            path.curve_to(dial.at(a, inner + round_a), dial.at(a, inner));
+            path.line_to(dial.at(a, outer - round_a));
+            path.curve_to(dial.at(oa, outer), dial.at(a, outer));
             path.close();
             if let Ok(p) = path.build() {
                 window.paint_path(p, color);
@@ -690,12 +721,14 @@ impl Render for Gauge {
                 }
                 let k = ui_scale(window);
                 let band = Band::new(&dial, divisions, minor, k);
+                // Value cells round by a fixed pixel radius, not a scaled one.
+                let corner = super::value_strip::BOX_RADIUS;
                 let lit = match style {
                     GaugeStyle::Arc => span.filter(|(a, b)| b > a),
                     GaugeStyle::Needle => None,
                 };
                 for (a, b) in unlit(lit) {
-                    band.paint_span(&dial, a, b, track_color, window);
+                    band.paint_span(&dial, a, b, corner, track_color, window);
                 }
                 let root = band.dash_root(&dial);
                 for &(t, division) in &band.dashes {
@@ -707,7 +740,7 @@ impl Render for Gauge {
                 match style {
                     GaugeStyle::Arc => {
                         if let Some((start, end)) = lit {
-                            band.paint_span(&dial, start, end, color, window);
+                            band.paint_span(&dial, start, end, corner, color, window);
                         }
                     }
                     GaugeStyle::Needle => {

@@ -870,7 +870,7 @@ fn build_editing_chrome(
         .gap(ui_px(4.0))
         .px(ui_px(6.0))
         .py(ui_px(3.0))
-        .rounded(px(3.0))
+        .rounded(px(BOX_RADIUS))
         .overflow_hidden();
     atom = if style.intrinsic_width {
         atom.min_w(cell_width(style.preset, false)).flex_none()
@@ -949,7 +949,7 @@ fn build_cell_chrome(
         let knob = div()
             .w(ui_px(15.0))
             .h(ui_px(15.0))
-            .rounded(px(3.0))
+            .rounded(px(BOX_RADIUS))
             .bg(theme.text_primary);
         atom = atom
             .w(ui_px(40.0))
@@ -1084,13 +1084,16 @@ pub const STRIP_BOX_HEIGHT: f32 = 25.5;
 /// Text size of a box cell's value when nothing overrides it.
 pub const STRIP_BOX_VALUE_SIZE: f32 = 12.0;
 
+/// Corner radius of a value cell, and of everything drawn to match one.
+pub(crate) const BOX_RADIUS: f32 = 3.0;
+
 /// Corners of a box cell. A cell with an apply chevron flush against its
 /// right edge rounds only its left side, so the two read as one pill.
 pub(crate) fn box_corners<E: Styled>(el: E, fused: bool) -> E {
     if fused {
-        el.rounded_l(px(3.0))
+        el.rounded_l(px(BOX_RADIUS))
     } else {
-        el.rounded(px(3.0))
+        el.rounded(px(BOX_RADIUS))
     }
 }
 
@@ -1138,7 +1141,7 @@ pub(crate) fn apply_chevron(
         .items_center()
         .justify_center()
         .bg(bg)
-        .rounded_r(px(3.0))
+        .rounded_r(px(BOX_RADIUS))
         .when(active, |el| el.cursor_pointer())
         .child(Icon::ChevronRight.svg(11.0, fg))
 }
