@@ -13,9 +13,7 @@ use std::sync::{Arc, atomic};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use crate::dynamic::node::{
-    BuildError, DynamicNode, DynamicNodeExt, NodeImpl, ValueType, hash_id, op_tag,
-};
+use crate::dynamic::node::{BuildError, Node, ValueType, hash_id, op_tag};
 
 /// Promote `input` to a real db Component named `name`. Returns a
 /// passthrough node whose output mirrors the Component's WAL.
@@ -28,11 +26,7 @@ use crate::dynamic::node::{
 ///
 /// The persist *node*'s `NodeId` still hashes the input chain, so the graph
 /// rebuilder can dedup persist nodes correctly.
-pub fn persist(
-    db: &DB,
-    name: String,
-    input: Arc<dyn DynamicNode>,
-) -> Result<Arc<dyn DynamicNode>, BuildError> {
+pub fn persist(db: &DB, name: String, input: Arc<Node>) -> Result<Arc<Node>, BuildError> {
     if name.trim().is_empty() {
         return Err(BuildError::InvalidArg {
             op: "persist",
@@ -97,7 +91,7 @@ pub fn persist(
         .expect("just inserted");
     let mut reader = input.subscribe();
     let component_for_task = component.clone();
-    Ok(NodeImpl::spawn_with_output(
+    Ok(Node::spawn_with_output(
         id,
         ValueType::Value(schema),
         component.wal.clone(),

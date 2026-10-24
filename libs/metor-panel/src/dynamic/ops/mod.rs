@@ -1,4 +1,4 @@
-//! Constructors for [`DynamicNode`](super::DynamicNode)s.
+//! Constructors for [`Node`](super::Node)s.
 //!
 //! What is left here is the host-shaped machinery: the clock a source system
 //! is driven by, the two bridges to the database (`from_db` / `persist`), and

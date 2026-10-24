@@ -10,8 +10,8 @@ use metor_proto::types::{PrimType, Timestamp};
 use wasmi::{Engine, Instance, Linker, Module, Store, TypedFunc};
 
 use crate::dynamic::node::{
-    BuildError, DynamicNode, DynamicNodeExt, NodeId, NodeImpl, NodeReader, ValueType,
-    default_ring_bytes, hash_id, op_tag, require_value, write_sample,
+    BuildError, Node, NodeId, NodeReader, ValueType, default_ring_bytes, hash_id, op_tag,
+    require_value, write_sample,
 };
 use crate::dynamic::tensor::read_f64_at;
 
@@ -132,7 +132,7 @@ impl StateCell {
 
 /// One compiled system, running.
 pub struct System {
-    pub node: Arc<dyn DynamicNode>,
+    pub node: Arc<Node>,
     pub health: Health,
     pub state: StateCell,
 }
@@ -140,7 +140,7 @@ pub struct System {
 /// One input port: where its samples come from, and what the host already has
 /// for it.
 pub struct PortSource {
-    pub node: Arc<dyn DynamicNode>,
+    pub node: Arc<Node>,
     /// The most recent sample already committed, if there is one.
     ///
     /// A disruptor reader begins at the write head and never sees what came
@@ -152,7 +152,7 @@ pub struct PortSource {
 
 impl PortSource {
     /// A port with no history behind it.
-    pub fn live(node: Arc<dyn DynamicNode>) -> Self {
+    pub fn live(node: Arc<Node>) -> Self {
         PortSource { node, seed: None }
     }
 }
@@ -251,7 +251,7 @@ pub fn system(
 
     let frame_bytes = desc.output.bytes as usize;
     let health = Health::default();
-    let node = NodeImpl::spawn(
+    let node = Node::spawn(
         id,
         ValueType::Value(ComponentSchema::new(PrimType::U8, &[frame_bytes][..])),
         default_ring_bytes(frame_bytes),
@@ -289,8 +289,8 @@ pub fn field(
     compiled: &Arc<Compiled>,
     index: usize,
     field: usize,
-    frame: Arc<dyn DynamicNode>,
-) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    frame: Arc<Node>,
+) -> Result<Arc<Node>, BuildError> {
     let desc = &compiled.manifest.systems[index];
     let spec = &desc.output.fields[field];
     let schema = schema_of(&spec.ty);
@@ -298,7 +298,7 @@ pub fn field(
     let mut reader = frame.subscribe();
     let (offset, ty) = (spec.offset as usize, spec.ty.clone());
     let frame_bytes = desc.output.bytes as usize;
-    Ok(NodeImpl::spawn(
+    Ok(Node::spawn(
         id,
         ValueType::Value(schema.clone()),
         default_ring_bytes(schema.size()),

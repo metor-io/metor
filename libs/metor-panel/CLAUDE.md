@@ -32,9 +32,9 @@ Views bind a `ComponentId` (resolved from saved text by `data_binding::Binding`)
 
 ### Dynamic nodes (`src/dynamic/`)
 
-User-defined components are computed lazily as a graph of producer tasks. Each `DynamicNode` writes `[Timestamp][value]` samples into its own `Disruptor`. Identity is a content hash, so the same program always yields the same `NodeId` — recompiling an unchanged expression reuses the running node instead of starting a second one.
+User-defined components are computed lazily as a graph of producer tasks. Each `Node` writes `[Timestamp][value]` samples into its own `Disruptor`. Identity is a content hash, so the same program always yields the same `NodeId` — recompiling an unchanged expression reuses the running node instead of starting a second one.
 
-There are no hand-written ops anymore: user computation is metor-expr source, compiled to wasm and run by `ops/program.rs`. The remaining `ops/` modules are infrastructure (`clock`, `db_source`, `persist`, `replay`). Dropping the last `Arc<dyn DynamicNode>` cancels the task. Downstream program tasks iterate every sample with `NodeReader`; views read the component a node publishes like any other.
+There are no hand-written ops anymore: user computation is metor-expr source, compiled to wasm and run by `ops/program.rs`. The remaining `ops/` modules are infrastructure (`clock`, `db_source`, `persist`, `replay`). Dropping the last `Arc<Node>` cancels the task. Downstream program tasks iterate every sample with `NodeReader`; views read the component a node publishes like any other.
 
 `expressions.rs` is the `=` one-liner tier: `bind`/`binding_text` turn saved picker text into a component either way, and a compiled expression publishes into a hidden hash-named component every view reads ordinarily. `resolver.rs` (`DbResolver`) answers the compiler's and the completion engine's name questions from a snapshot of the component tree.
 

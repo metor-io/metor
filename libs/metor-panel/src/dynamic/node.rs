@@ -46,9 +46,7 @@ impl ValueType {
 
 /// Validate that `node` is value-typed (any prim type, any shape) and return
 /// a clone of its schema.
-pub fn require_value(
-    node: &std::sync::Arc<dyn DynamicNode>,
-) -> Result<ComponentSchema, BuildError> {
+pub fn require_value(node: &Node) -> Result<ComponentSchema, BuildError> {
     match node.value_type() {
         ValueType::Clock => Err(BuildError::ExpectedValue),
         ValueType::Value(s) => Ok(s.clone()),
@@ -84,27 +82,6 @@ pub enum BuildError {
     #[error("{0}")]
     Expr(String),
 }
-
-/// A live producer task whose output is a fan-out [`Disruptor`].
-///
-/// Drop the last `Arc<dyn DynamicNode>` to cancel the task: the node holds a
-/// `JoinHandleDropGuard` which calls `cancel` on drop.
-pub trait DynamicNode: Send + Sync + 'static {
-    fn id(&self) -> NodeId;
-    fn value_type(&self) -> &ValueType;
-    /// Output ring. Subscribers read framed `[Timestamp][value bytes]`
-    /// messages; clock nodes emit zero value bytes.
-    fn output(&self) -> &Disruptor;
-}
-
-/// Helpers attached to anything that implements [`DynamicNode`] — kept in a
-/// separate ext trait so the trait stays object-safe.
-pub trait DynamicNodeExt: DynamicNode {
-    fn subscribe(&self) -> NodeReader {
-        NodeReader::new(self.output(), self.value_type().value_bytes())
-    }
-}
-impl<T: DynamicNode + ?Sized> DynamicNodeExt for T {}
 
 /// Internal reader handed to downstream program tasks. Yields every sample
 /// in order — the opposite of [`crate::WalComponentStream`], which collapses
@@ -179,16 +156,18 @@ pub fn write_sample(disruptor: &Disruptor, ts: Timestamp, value_bytes: &[u8]) {
     grant[size_of::<Timestamp>()..].copy_from_slice(value_bytes);
 }
 
-/// Concrete implementation behind every constructor. Owns the output ring
-/// and a drop-guarded task handle so dropping the node cancels the task.
-pub struct NodeImpl {
+/// A live producer task whose output is a fan-out [`Disruptor`].
+///
+/// Drop the last `Arc<Node>` to cancel the task: the node holds a
+/// `JoinHandleDropGuard` which calls `cancel` on drop.
+pub struct Node {
     id: NodeId,
     value_type: ValueType,
     output: Disruptor,
     _task: JoinHandleDropGuard<()>,
 }
 
-impl NodeImpl {
+impl Node {
     /// Spawn a producer task and wrap it in a node.
     ///
     /// `build_task` receives the output ring and any captured parent `Arc`s
@@ -228,17 +207,23 @@ impl NodeImpl {
             _task: task.drop_guard(),
         })
     }
-}
 
-impl DynamicNode for NodeImpl {
-    fn id(&self) -> NodeId {
+    pub fn id(&self) -> NodeId {
         self.id
     }
-    fn value_type(&self) -> &ValueType {
+
+    pub fn value_type(&self) -> &ValueType {
         &self.value_type
     }
-    fn output(&self) -> &Disruptor {
+
+    /// Output ring. Subscribers read framed `[Timestamp][value bytes]`
+    /// messages; clock nodes emit zero value bytes.
+    pub fn output(&self) -> &Disruptor {
         &self.output
+    }
+
+    pub fn subscribe(&self) -> NodeReader {
+        NodeReader::new(&self.output, self.value_type.value_bytes())
     }
 }
 

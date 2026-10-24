@@ -12,7 +12,7 @@ use crate::dynamic::ops::program::{self, Compiled, DEFAULT_FUEL};
 use crate::dynamic::ops::replay::ReplayPlan;
 use crate::dynamic::resolver::DbResolver;
 use crate::dynamic::worker::{DynamicWorker, WorkerHandle};
-use crate::dynamic::{BuildError, DynamicNode, NodeId};
+use crate::dynamic::{BuildError, Node, NodeId};
 
 /// The prefix that turns a picker's search field into an expression field.
 pub const SIGIL: char = '=';
@@ -149,7 +149,7 @@ struct ExpressionInner {
     /// Held for their drop: the published node, the system feeding it, and
     /// the field node between them. Cancelling their tasks is what stops an
     /// expression.
-    nodes: Vec<Arc<dyn DynamicNode>>,
+    nodes: Vec<Arc<Node>>,
     /// Where `nodes` go to be dropped: their tasks may hold timers owned by
     /// the worker's executor, and cancelling one from the gpui thread can
     /// deadlock in `maitake`'s `Sleep::drop`.
@@ -172,9 +172,9 @@ impl Expression {
     /// `system` and `field` are held only for their drop, so they are taken
     /// here rather than exposed as fields nobody should read.
     pub fn new(
-        node: Arc<dyn DynamicNode>,
-        system: Arc<dyn DynamicNode>,
-        field: Arc<dyn DynamicNode>,
+        node: Arc<Node>,
+        system: Arc<Node>,
+        field: Arc<Node>,
         plan: ReplayPlan,
         worker: WorkerHandle,
     ) -> Self {
@@ -388,9 +388,9 @@ pub fn replay_plan_from_metadata(id: ComponentId, db: &DB) -> Option<ReplayPlan>
 pub(crate) fn publish(
     db: &DB,
     name: &str,
-    node: Arc<dyn DynamicNode>,
+    node: Arc<Node>,
     label: &str,
-) -> Result<Arc<dyn DynamicNode>, BuildError> {
+) -> Result<Arc<Node>, BuildError> {
     use metor_proto_wkt::MetadataExt;
     let published = crate::dynamic::ops::persist::persist(db, name.to_string(), node)?;
     let mut metadata = metor_proto_wkt::ComponentMetadata {

@@ -8,7 +8,7 @@ use metor_expr::Ty;
 use metor_proto::types::{ComponentId, PrimType, Timestamp};
 
 use super::program::{self, Compiled, DEFAULT_FUEL};
-use crate::dynamic::node::{DynamicNode, DynamicNodeExt, NodeReader};
+use crate::dynamic::node::{Node, NodeReader};
 use crate::dynamic::ops;
 use crate::dynamic::resolver::DbResolver;
 
@@ -58,7 +58,7 @@ impl Bench {
         component.push_buf(Timestamp(ts), &bytes).unwrap();
     }
 
-    pub(super) fn source(&self, name: &str) -> Arc<dyn DynamicNode> {
+    pub(super) fn source(&self, name: &str) -> Arc<Node> {
         ops::db_source::from_db(&self.db, self.id(name)).unwrap()
     }
 
@@ -75,7 +75,7 @@ impl Bench {
 ///
 /// Always before the samples are pushed: a disruptor reader begins at the
 /// current write position, so one made afterwards never sees what it missed.
-pub(super) fn watch(node: &Arc<dyn DynamicNode>) -> NodeReader {
+pub(super) fn watch(node: &Node) -> NodeReader {
     node.subscribe()
 }
 
