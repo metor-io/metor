@@ -2,17 +2,25 @@ use super::allocations;
 use crate::io::test::{ScriptedUart, TestIo, cap, cap_with_ops};
 use crate::io::*;
 
-/// A system with one read in flight, on a `Cap` from `test::cap`.
+/// Connects `uart`, with `model` answering.
+fn connect(uart: &Cap<Uart>, io: &mut TestIo, model: &mut ScriptedUart) -> Handle<Uart> {
+    let mut connect = uart.connect();
+    model.serve(io.turn());
+    connect.poll().expect("answered").expect("connected")
+}
+
+/// A system with one read in flight, on a connection from `test::cap`.
 struct Reader {
-    uart: Cap<Uart>,
+    uart: Handle<Uart>,
     io: TestIo,
     rx: Slot<ReadOp>,
 }
 
 impl Reader {
-    fn new() -> Self {
-        let (uart, io) = cap::<Uart>();
+    fn new(model: &mut ScriptedUart) -> Self {
+        let (cap, mut io) = cap::<Uart>();
         let rx = Slot::Idle(io.make(|init| init.alloc(8)));
+        let uart = connect(&cap, &mut io, model);
         Self { uart, io, rx }
     }
 
@@ -28,8 +36,8 @@ impl Reader {
 
 #[test]
 fn a_scripted_read_fills_the_buffer() {
-    let mut r = Reader::new();
     let mut model = ScriptedUart::scripted([b"$GPGGA".to_vec()]);
+    let mut r = Reader::new(&mut model);
     r.cycle();
     model.serve(r.io.turn());
     assert_eq!(r.cycle(), Some(Ok(b"$GPGGA".to_vec())));
@@ -37,8 +45,8 @@ fn a_scripted_read_fills_the_buffer() {
 
 #[test]
 fn an_unanswered_read_waits_for_a_later_pass() {
-    let mut r = Reader::new();
     let mut model = ScriptedUart::silent();
+    let mut r = Reader::new(&mut model);
     r.cycle();
     for _ in 0..3 {
         model.serve(r.io.turn());
@@ -51,20 +59,23 @@ fn an_unanswered_read_waits_for_a_later_pass() {
 
 #[test]
 fn a_cancel_completes_a_waiting_op() {
-    let (uart, mut io) = cap::<Uart>();
+    let (cap, mut io) = cap::<Uart>();
     let buf = io.make(|init| init.alloc(4));
+    let mut model = ScriptedUart::silent();
+    let uart = connect(&cap, &mut io, &mut model);
     let mut read = uart.read(buf);
-    ScriptedUart::silent().serve(io.turn());
+    model.serve(io.turn());
     read.cancel();
-    ScriptedUart::silent().serve(io.turn());
+    model.serve(io.turn());
     assert_eq!(read.poll().map(|(r, _)| r), Some(Err(IoError::Canceled)));
 }
 
 #[test]
 fn scripted_faults_reach_the_writer() {
-    let (uart, mut io) = cap::<Uart>();
+    let (cap, mut io) = cap::<Uart>();
     let (a, b) = io.make(|init| Ok((init.alloc_from(b"cmd")?, init.alloc_from(b"cmd")?)));
     let mut model = ScriptedUart::silent().fail_write(Errno::EIO).short_write(1);
+    let uart = connect(&cap, &mut io, &mut model);
     let mut first = uart.write(a);
     model.serve(io.turn());
     assert_eq!(
@@ -79,8 +90,9 @@ fn scripted_faults_reach_the_writer() {
 
 #[test]
 fn serving_allocates_nothing() {
-    let (uart, mut io) = cap::<Uart>();
+    let (cap, mut io) = cap::<Uart>();
     let mut model = ScriptedUart::silent();
+    let uart = connect(&cap, &mut io, &mut model);
     let mut n = 0;
     for _ in 0..8 {
         let mut flush = uart.flush(TtyQueue::Both);
@@ -101,7 +113,8 @@ fn driver_configures_once_then_reads() {
         got: Vec<u8>,
     }
     let mut model = ScriptedUart::scripted([b"$GP".to_vec(), b"GGA".to_vec()]);
-    let (uart, mut io) = cap::<Uart>();
+    let (cap, mut io) = cap::<Uart>();
+    let uart = connect(&cap, &mut io, &mut model);
     let mut s = io.make(|init| {
         Ok(Driver {
             tx: Slot::Idle(init.alloc_from(b"$PMTK")?),
@@ -133,8 +146,9 @@ fn driver_configures_once_then_reads() {
 
 #[test]
 fn cap_with_ops_holds_its_budget_in_flight() {
-    let (uart, mut io) = cap_with_ops::<Uart>(40);
+    let (cap, mut io) = cap_with_ops::<Uart>(40);
     let bufs: Vec<_> = io.make(|init| (0..41).map(|_| init.alloc(1)).collect());
+    let uart = connect(&cap, &mut io, &mut ScriptedUart::silent());
     let mut reads: Vec<_> = bufs.into_iter().map(|b| uart.read(b)).collect();
     let (last, _) = reads.pop().unwrap().poll().unwrap();
     assert_eq!(last, Err(IoError::QueueFull));

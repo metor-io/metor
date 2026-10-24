@@ -1,8 +1,10 @@
 //! The op types a `Pending` resolves to, and how each turns a completion
 //! into its result.
 
+use core::marker::PhantomData;
+
 use super::arena::Buf;
-use super::cap::{Handle, RegularFile, Stream};
+use super::cap::{Handle, Listener, RegularFile, Stream};
 use super::queue::Io;
 use super::{IoError, IoStatus, RawAddr, RawHandle};
 
@@ -66,9 +68,13 @@ pub struct RecvOp;
 pub struct SendOp;
 /// Opens a file under a directory.
 pub struct OpenOp;
-/// Opens an endpoint's next stream; resolves to it, with the peer's
-/// `RawAddr` in the buffer.
+/// Opens a stream, by dialing or accepting; resolves to it, with the
+/// peer's `RawAddr` in the buffer.
 pub struct StreamOp;
+/// Opens a new connection to a capability's resource.
+pub struct ConnectOp<K>(PhantomData<K>);
+/// Opens a listener.
+pub struct ListenOp;
 /// Closes a handle.
 pub struct CloseOp;
 /// Flushes a file to storage.
@@ -164,6 +170,28 @@ impl IoOp for StreamOp {
             peer.set_filled(RawAddr::LEN);
         }
         (stream, peer)
+    }
+}
+
+impl<K> sealed::Sealed for ConnectOp<K> {}
+
+impl<K> IoOp for ConnectOp<K> {
+    type Lent = ();
+    type Output = Result<Handle<K>, IoError>;
+
+    fn finish(io: &Io, status: IoStatus, value: u32, (): ()) -> Self::Output {
+        opened(io, status, value)
+    }
+}
+
+impl sealed::Sealed for ListenOp {}
+
+impl IoOp for ListenOp {
+    type Lent = ();
+    type Output = Result<Handle<Listener>, IoError>;
+
+    fn finish(io: &Io, status: IoStatus, value: u32, (): ()) -> Self::Output {
+        opened(io, status, value)
     }
 }
 

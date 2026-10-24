@@ -48,7 +48,19 @@ impl Rig {
 
     /// Dials `to`.
     pub fn dial(&mut self, to: SocketAddr) -> OpId {
-        self.push(-1, Class::Dialer, Op::Stream, None, Some(to))
+        self.push(-1, Class::Stream, Op::Connect, None, Some(Make::Dial(to)))
+    }
+
+    /// Opens `path` with host `flags`, as a connect to a path does.
+    pub fn open(&mut self, path: &std::ffi::CStr, flags: i32, class: Class) -> OpId {
+        let path = NonNull::from(path).cast();
+        self.push(
+            -1,
+            class,
+            Op::Connect,
+            None,
+            Some(Make::Open { path, flags }),
+        )
     }
 
     fn push(
@@ -57,7 +69,7 @@ impl Rig {
         class: Class,
         op: Op,
         buf: Option<usize>,
-        dial: Option<SocketAddr>,
+        make: Option<Make>,
     ) -> OpId {
         let id = OpId::new(self.next, 1);
         self.next += 1;
@@ -68,7 +80,7 @@ impl Rig {
             class,
             op,
             buf,
-            dial,
+            make,
         });
         self.os.submit();
         id
@@ -255,7 +267,7 @@ pub fn cancel_waiting_accept(b: Backend) {
     let mut rig = Rig::new(b);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let id = rig.start(listener.as_raw_fd(), Class::Listener, Op::Stream, None);
+    let id = rig.start(listener.as_raw_fd(), Class::Listener, Op::Accept, None);
     assert!(rig.poll(id).is_none());
     rig.os.cancel(id);
     assert_eq!(rig.wait(id).unwrap_err(), IoError::Canceled);
@@ -275,7 +287,7 @@ pub fn accept_gives_a_stream(b: Backend) {
     let mut rig = Rig::new(b);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let id = rig.start(listener.as_raw_fd(), Class::Listener, Op::Stream, None);
+    let id = rig.start(listener.as_raw_fd(), Class::Listener, Op::Accept, None);
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (stream, class, peer) = opened_from(rig.wait(id));
     assert_eq!(class, Class::Stream);
@@ -373,6 +385,26 @@ pub fn cancel_waiting_dial(b: Backend) {
     assert_eq!(open_fds(), before);
 }
 
+pub fn connect_opens_a_path(b: Backend) {
+    let mut rig = Rig::new(b);
+    let dir = tempfile::tempdir().unwrap();
+    let made = dir.path().join("made.txt");
+    let path = std::ffi::CString::new(made.to_str().unwrap()).unwrap();
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC;
+    let id = rig.open(&path, flags, Class::File);
+    let (file, class) = opened(rig.wait(id));
+    assert_eq!(class, Class::File);
+    let body = rig.buf(b"abc", 0);
+    let write = Op::Write { offset: None };
+    rig.run(file.as_raw_fd(), class, write, Some(body)).unwrap();
+    assert_eq!(std::fs::read(&made).unwrap(), b"abc");
+    let before = open_fds();
+    let missing = std::ffi::CString::new(dir.path().join("nope").to_str().unwrap()).unwrap();
+    let id = rig.open(&missing, libc::O_RDONLY | libc::O_CLOEXEC, Class::Tty);
+    assert_eq!(rig.wait(id).unwrap_err(), IoError::Os(Errno::ENOENT));
+    assert_eq!(open_fds(), before);
+}
+
 pub fn run_all(b: Backend) {
     datagram_send_and_recv(b);
     file_write_read_at_offsets(b);
@@ -387,5 +419,6 @@ pub fn run_all(b: Backend) {
     dial_to_a_closed_port_fails_and_leaks_nothing(b);
     cancel_waiting_dial(b);
     open_under_a_dir(b);
+    connect_opens_a_path(b);
     closed_peer_reads_zero(b);
 }

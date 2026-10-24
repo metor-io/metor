@@ -2,8 +2,8 @@ use super::{Loopback, allocations};
 use crate::io::cap::{Cap, Handle};
 use crate::io::*;
 
-fn uart(lb: &Loopback) -> Cap<Uart> {
-    Cap::new(Handle::new(lb.io.next_grant(), lb.io.clone()))
+fn uart(lb: &Loopback) -> Handle<Uart> {
+    Handle::new(lb.io.next_grant(), lb.io.clone())
 }
 
 #[test]
@@ -88,8 +88,8 @@ fn dropped_pending_frees_its_slot_when_it_lands() {
 fn orphaned_accept_closes_its_handle_under_its_own_token() {
     let mut lb = Loopback::new();
     let peer = lb.make(|init| init.alloc(RawAddr::LEN));
-    let listen: Handle<Endpoint> = Handle::new(lb.io.next_grant(), lb.io.clone());
-    drop(listen.stream(peer));
+    let listen: Handle<Listener> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    drop(listen.accept(peer));
     let [accept] = lb.submitted()[..] else {
         panic!()
     };
@@ -111,8 +111,8 @@ fn orphaned_accept_closes_its_handle_under_its_own_token() {
 fn finished_accept_dropped_untaken_closes_too() {
     let mut lb = Loopback::new();
     let peer = lb.make(|init| init.alloc(RawAddr::LEN));
-    let listen: Handle<Endpoint> = Handle::new(lb.io.next_grant(), lb.io.clone());
-    let accept = listen.stream(peer);
+    let listen: Handle<Listener> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    let accept = listen.accept(peer);
     let [sqe] = lb.submitted()[..] else { panic!() };
     lb.complete(Cqe::ok(sqe.token, RawHandle::new(5, 1).get()));
     assert_eq!(lb.io.in_flight(), 1);
@@ -127,8 +127,8 @@ fn finished_accept_dropped_untaken_closes_too() {
 fn accept_resolves_to_a_handle_on_the_same_queue() {
     let mut lb = Loopback::new();
     let peer = lb.make(|init| init.alloc(RawAddr::LEN));
-    let listen: Handle<Endpoint> = Handle::new(lb.io.next_grant(), lb.io.clone());
-    let mut accept = listen.stream(peer);
+    let listen: Handle<Listener> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    let mut accept = listen.accept(peer);
     let [sqe] = lb.submitted()[..] else { panic!() };
     lb.complete(Cqe::ok(sqe.token, RawHandle::new(5, 1).get()));
     let (stream, peer) = accept.poll().unwrap();
@@ -192,7 +192,7 @@ fn steady_state_allocates_nothing() {
 }
 
 /// Submits flushes until the SQ refuses one.
-fn fill(uart: &Cap<Uart>) -> Vec<Pending<TtyOp>> {
+fn fill(uart: &Handle<Uart>) -> Vec<Pending<TtyOp>> {
     let mut held = Vec::new();
     loop {
         let mut flush = uart.flush(TtyQueue::Both);
@@ -229,8 +229,8 @@ fn cancel_the_full_sq_refuses_goes_out_later() {
 fn orphan_close_the_full_sq_refuses_goes_out_later() {
     let mut lb = Loopback::with_sq_depth(2);
     let peer = lb.make(|init| init.alloc(RawAddr::LEN));
-    let listen: Handle<Endpoint> = Handle::new(lb.io.next_grant(), lb.io.clone());
-    drop(listen.stream(peer));
+    let listen: Handle<Listener> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    drop(listen.accept(peer));
     let accept = lb.submitted()[0];
     let uart = uart(&lb);
     let held = fill(&uart);
@@ -246,28 +246,64 @@ fn orphan_close_the_full_sq_refuses_goes_out_later() {
     assert_eq!(lb.io.in_flight(), held.len());
 }
 
+fn endpoint(lb: &Loopback) -> Cap<Endpoint> {
+    Cap::new(Handle::new(lb.io.next_grant(), lb.io.clone()))
+}
+
 #[test]
-fn a_stream_wants_room_for_its_peer() {
+fn a_dial_wants_room_for_its_peer() {
     let mut lb = Loopback::new();
     let short = lb.make(|init| init.alloc(RawAddr::LEN - 1));
-    let ep: Handle<Endpoint> = Handle::new(lb.io.next_grant(), lb.io.clone());
-    let (result, back) = ep.stream(short).poll().unwrap();
+    let (result, back) = endpoint(&lb).connect(short).poll().unwrap();
     assert_eq!(result.err(), Some(IoError::BadBuf));
     assert_eq!(back.capacity(), RawAddr::LEN - 1);
     assert!(lb.submitted().is_empty());
 }
 
 #[test]
-fn a_failed_stream_leaves_the_peer_empty() {
+fn a_failed_dial_leaves_the_peer_empty() {
     let mut lb = Loopback::new();
     let peer = lb.make(|init| init.alloc(RawAddr::LEN));
-    let ep: Handle<Endpoint> = Handle::new(lb.io.next_grant(), lb.io.clone());
-    let mut pending = ep.stream(peer);
+    let mut pending = endpoint(&lb).connect(peer);
     let [sqe] = lb.submitted()[..] else { panic!() };
-    assert_eq!(sqe.op(), Ok(Op::Stream));
+    assert_eq!(sqe.op(), Ok(Op::Connect));
     assert_eq!(sqe.buf.len() as usize, RawAddr::LEN);
     lb.complete(Cqe::err(sqe.token, IoError::Os(Errno::ECONNREFUSED)));
     let (result, peer) = pending.poll().unwrap();
     assert_eq!(result.err(), Some(IoError::Os(Errno::ECONNREFUSED)));
     assert!(peer.is_empty());
+}
+
+#[test]
+fn a_connect_lends_no_buffer_and_resolves_to_a_handle() {
+    let mut lb = Loopback::new();
+    lb.make(|_| Ok(()));
+    let cap: Cap<Uart> = Cap::new(Handle::new(lb.io.next_grant(), lb.io.clone()));
+    let mut connect = cap.connect();
+    let [sqe] = lb.submitted()[..] else { panic!() };
+    assert_eq!((sqe.op(), sqe.buf), (Ok(Op::Connect), Span::default()));
+    lb.complete(Cqe::ok(sqe.token, RawHandle::new(3, 1).get()));
+    let port = connect.poll().unwrap().unwrap();
+    assert_eq!(port.raw(), RawHandle::new(3, 1));
+    assert_eq!(lb.io.in_flight(), 0);
+}
+
+#[test]
+fn a_listen_resolves_to_a_listener_or_its_error() {
+    let mut lb = Loopback::new();
+    lb.make(|_| Ok(()));
+    let ep = endpoint(&lb);
+    let (mut up, mut taken) = (ep.listen(), ep.listen());
+    let [a, b] = lb.submitted()[..] else { panic!() };
+    assert_eq!(a.op(), Ok(Op::Listen));
+    lb.complete(Cqe::ok(a.token, RawHandle::new(4, 1).get()));
+    lb.complete(Cqe::err(b.token, IoError::Os(Errno::EADDRINUSE)));
+    assert_eq!(
+        up.poll().unwrap().map(|l| l.raw()),
+        Ok(RawHandle::new(4, 1))
+    );
+    assert_eq!(
+        taken.poll().unwrap().err(),
+        Some(IoError::Os(Errno::EADDRINUSE))
+    );
 }

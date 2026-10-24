@@ -106,6 +106,28 @@ pub enum IoError {
     BadAddr,
 }
 
+impl IoError {
+    /// Whether the error ends its connection: the device or peer is gone, or
+    /// the handle is. The connection should be closed and made again.
+    pub fn is_lost(self) -> bool {
+        match self {
+            Self::Os(e) => [
+                Errno::EIO,
+                Errno::ENXIO,
+                Errno::EBADF,
+                Errno::ENODEV,
+                Errno::EPIPE,
+                Errno::ENETDOWN,
+                Errno::ECONNRESET,
+                Errno::ENOTCONN,
+            ]
+            .contains(&e),
+            Self::Stale => true,
+            _ => false,
+        }
+    }
+}
+
 impl From<IoError> for std::borrow::Cow<'static, str> {
     fn from(e: IoError) -> Self {
         e.to_string().into()

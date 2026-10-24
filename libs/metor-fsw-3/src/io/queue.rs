@@ -80,7 +80,7 @@ impl Io {
         let span = match buf {
             Some(buf) if buf.live() && buf.capacity() >= op.min_buf() => buf.span_for(op),
             Some(_) => return Err(IoError::BadBuf),
-            None if op.fills() || op.drains() => return Err(IoError::BadBuf),
+            None if op.needs_buf() => return Err(IoError::BadBuf),
             None => Span::default(),
         };
         self.pump();

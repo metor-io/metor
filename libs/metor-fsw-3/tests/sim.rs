@@ -143,7 +143,11 @@ fn first_fix(seen: &Seen) -> Option<i64> {
 fn model_between_the_io_steps_answers_the_next_cycle() {
     let seen = Seen::default();
     let _c = run(&seen, probed(golden()), 5);
-    assert_eq!(first_fix(&seen), Some(2), "read in cycle 1, fix in cycle 2");
+    assert_eq!(
+        first_fix(&seen),
+        Some(3),
+        "connect in cycle 1, read in cycle 2, fix in cycle 3"
+    );
     let statuses = seen.statuses.borrow();
     let (_, last) = statuses.last().unwrap();
     assert!(last.completed >= 2 && last.bytes_in > 0, "{last:?}");
@@ -161,7 +165,7 @@ fn model_before_io_submit_is_wired_like_a_driver() {
     for _ in 0..2 {
         let seen = Seen::default();
         let _c = run(&seen, probed(config.clone()), 6);
-        assert_eq!(first_fix(&seen), Some(2));
+        assert_eq!(first_fix(&seen), Some(3));
     }
 }
 

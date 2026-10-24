@@ -1,5 +1,6 @@
 //! A link's connections over one `Endpoint`: each slot's buffers and the
-//! ops that move them, polled once per turn.
+//! ops that move them, polled once per turn. A listening link listens once
+//! and accepts; a dialing link connects.
 
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -8,23 +9,18 @@ use zerocopy::FromBytes;
 
 use crate::coordinator::MakeError;
 use crate::io::{
-    Buf, CloseOp, Endpoint, Handle, IoError, IoInit, Pending, RawAddr, RecvOp, SendOp, Slot,
-    Stream, StreamOp, TimeoutOp,
+    Backoff, Buf, Cap, CloseOp, Endpoint, Handle, IoError, IoInit, ListenOp, Listener, Pause,
+    Pending, RawAddr, RecvOp, SendOp, Slot, Stream, StreamOp, TimeoutOp,
 };
 
 use super::deframe::Deframer;
 use super::peer::ConnectionState;
 
-/// The wait after a failed or lost stream. Each failure in a row doubles a
-/// dialer's, up to [`BACKOFF_MAX`].
-const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
-const BACKOFF_MAX: Duration = Duration::from_secs(10);
-
 /// The ops `slots` connections have in flight at most: the stream op, a
-/// backoff timer, a refused stream's close, and per slot a recv, a send, a
-/// write timer, and a close.
+/// backoff timer, a refused stream's close, a lost listener's close, and
+/// per slot a recv, a send, a write timer, and a close.
 pub(crate) const fn ops_for(slots: usize) -> usize {
-    3 + 4 * slots
+    4 + 4 * slots
 }
 
 /// How a link's connections are sized and run.
@@ -66,7 +62,7 @@ pub(crate) enum Event {
     Closed,
     /// A stream arrived with every slot taken, and was closed.
     Refused,
-    /// The endpoint failed to open a stream.
+    /// The endpoint failed to listen or open a stream.
     Failed(IoError),
 }
 
@@ -87,7 +83,7 @@ impl Turn {
 /// One connection slot.
 struct Conn {
     stream: Option<Handle<Stream>>,
-    closing: Option<Closing>,
+    closing: Option<Closing<Stream>>,
     open: bool,
     rx: Option<Pending<RecvOp>>,
     deframe: Deframer,
@@ -103,19 +99,20 @@ struct Tx {
     deadline: Option<(Pending<TimeoutOp>, bool)>,
 }
 
-/// The wait before the next stream.
-struct Backoff {
-    wait: Option<Pending<TimeoutOp>>,
-    /// A wait is due but not yet on the queue.
-    owed: bool,
-    delay: Duration,
-    doubles: bool,
+/// A listening link's listener.
+enum Listening {
+    /// Not listening: before the first listen, or after one failed.
+    Down,
+    Asked(Pending<ListenOp>),
+    Up(Handle<Listener>),
+    /// Lost, until its close lands.
+    Closing(Closing<Listener>),
 }
 
-/// A stream's close, from its handle to the op landing.
-enum Closing {
+/// A handle's close, from the handle to the op landing.
+enum Closing<K> {
     /// Waiting for room on the queue.
-    Waiting(Handle<Stream>),
+    Waiting(Handle<K>),
     Sent(Pending<CloseOp>),
 }
 
@@ -130,11 +127,13 @@ pub(crate) struct ConnsMem {
 
 /// A link's connection slots and the endpoint they are opened from.
 pub(crate) struct Conns {
-    ep: Handle<Endpoint>,
+    ep: Cap<Endpoint>,
+    /// Unused by a dialing link.
+    listener: Listening,
     next: Slot<StreamOp>,
-    backoff: Backoff,
+    pause: Pause,
     /// A stream with no free slot, until its close lands.
-    refused: Option<Closing>,
+    refused: Option<Closing<Stream>>,
     seed: Box<[u8]>,
     slots: Box<[Conn]>,
     config: ConnsConfig,
@@ -170,7 +169,7 @@ impl Conns {
     /// [`ops_for`] the slots.
     pub(crate) fn new(
         mem: ConnsMem,
-        ep: &Handle<Endpoint>,
+        ep: &Cap<Endpoint>,
         seed: &[u8],
         tables: usize,
     ) -> Result<Self, MakeError> {
@@ -189,8 +188,12 @@ impl Conns {
         }
         Ok(Self {
             ep: ep.clone(),
+            listener: Listening::Down,
             next: Slot::Idle(peer),
-            backoff: Backoff::new(config.dialing),
+            pause: Pause::new(match config.dialing {
+                true => Backoff::doubling(),
+                false => Backoff::fixed(),
+            }),
             refused: None,
             seed: seed.into(),
             slots: slots.into_iter().map(|b| Conn::new(b, tables)).collect(),
@@ -209,9 +212,9 @@ impl Conns {
             closed += usize::from(conn.poll(ep, after, &mut self.bytes_out, &mut on_body));
         }
         if closed > 0 && self.config.dialing {
-            self.backoff.start();
+            self.pause.start();
         }
-        let stream = self.take_stream();
+        let stream = self.take_stream().or_else(|| self.step_listener());
         step(&mut self.refused);
         self.ask_stream();
         Turn { closed, stream }
@@ -240,19 +243,23 @@ impl Conns {
     }
 
     /// Reaps the stream op: a new stream takes a free slot, or is refused;
-    /// a failure waits out the backoff. One the full queue refused, or a
-    /// listener's peer the endpoint turned away, is asked for again.
+    /// a failure waits out the backoff, and one that loses the listener
+    /// closes it. One the full queue refused, or a listener's peer the
+    /// endpoint turned away, is asked for again.
     fn take_stream(&mut self) -> Option<Event> {
         let stream = match self.next.poll()? {
             Err(IoError::QueueFull) => return None,
             Err(IoError::Refused) if !self.config.dialing => return None,
             Ok(stream) => stream,
             Err(e) => {
-                self.backoff.start();
+                self.pause.start();
+                if e.is_lost() {
+                    self.lose_listener();
+                }
                 return Some(Event::Failed(e));
             }
         };
-        self.backoff.delay = BACKOFF_INITIAL;
+        self.pause.backoff.reset();
         let peer = RawAddr::read_from_bytes(self.next.bytes())
             .ok()
             .and_then(|addr| SocketAddr::try_from(addr).ok());
@@ -269,18 +276,57 @@ impl Conns {
         }
     }
 
-    /// Asks the endpoint for the next stream, unless one is asked for, the
-    /// backoff is running, or a dialer has no free slot.
+    /// Reaps the listen, and moves a lost listener's close along. A failed
+    /// listen waits out the backoff.
+    fn step_listener(&mut self) -> Option<Event> {
+        match core::mem::replace(&mut self.listener, Listening::Down) {
+            Listening::Asked(mut pending) => match pending.poll() {
+                None => self.listener = Listening::Asked(pending),
+                Some(Ok(listener)) => self.listener = Listening::Up(listener),
+                Some(Err(IoError::QueueFull)) => {}
+                Some(Err(e)) => {
+                    self.pause.start();
+                    return Some(Event::Failed(e));
+                }
+            },
+            Listening::Closing(closing) => {
+                if let Some(closing) = closing.step() {
+                    self.listener = Listening::Closing(closing);
+                }
+            }
+            other => self.listener = other,
+        }
+        None
+    }
+
+    fn lose_listener(&mut self) {
+        if let Listening::Up(listener) = core::mem::replace(&mut self.listener, Listening::Down) {
+            self.listener = Listening::Closing(Closing::Waiting(listener));
+        }
+    }
+
+    /// Asks for the next stream, unless one is asked for, the backoff is
+    /// running, or a dialer has no free slot. A listening link listens
+    /// first.
     fn ask_stream(&mut self) {
-        if self.backoff.waiting(&self.ep) || self.refused.is_some() {
+        if self.pause.waiting(&self.ep) || self.refused.is_some() {
             return;
         }
         if self.config.dialing && !self.slots.iter().any(Conn::is_free) {
             return;
         }
-        if let Some(peer) = self.next.take_idle() {
-            self.next = Slot::Busy(self.ep.stream(peer));
-        }
+        let Some(peer) = self.next.take_idle() else {
+            return;
+        };
+        self.next = match (&self.listener, self.config.dialing) {
+            (_, true) => Slot::Busy(self.ep.connect(peer)),
+            (Listening::Up(listener), false) => Slot::Busy(listener.accept(peer)),
+            (Listening::Down, false) => {
+                self.listener = Listening::Asked(self.ep.listen());
+                Slot::Idle(peer)
+            }
+            _ => Slot::Idle(peer),
+        };
     }
 }
 
@@ -328,7 +374,7 @@ impl Conn {
     /// One pass over the slot. True if the connection closed in it.
     fn poll(
         &mut self,
-        ep: &Handle<Endpoint>,
+        ep: &Cap<Endpoint>,
         after: Duration,
         bytes_out: &mut u64,
         on_body: &mut impl FnMut(&mut ConnectionState, &[u8]),
@@ -378,7 +424,7 @@ impl Conn {
     }
 
     /// Starts a send of what is waiting, and the write timer over it.
-    fn send(&mut self, ep: &Handle<Endpoint>, after: Duration) {
+    fn send(&mut self, ep: &Cap<Endpoint>, after: Duration) {
         if let Some(stream) = &self.stream {
             self.tx.start(stream);
         }
@@ -481,44 +527,7 @@ impl Tx {
     }
 }
 
-impl Backoff {
-    fn new(doubles: bool) -> Self {
-        Self {
-            wait: None,
-            owed: false,
-            delay: BACKOFF_INITIAL,
-            doubles,
-        }
-    }
-
-    /// Makes a wait due before the next stream, unless one is running.
-    fn start(&mut self) {
-        self.owed |= self.wait.is_none();
-    }
-
-    /// Whether a wait is due or running. Puts a due wait on the queue, and
-    /// doubles the next one if it doubles.
-    fn waiting(&mut self, ep: &Handle<Endpoint>) -> bool {
-        if self.wait.as_mut().is_some_and(|w| w.poll().is_some()) {
-            self.wait = None;
-        }
-        if self.owed {
-            let mut wait = ep.timeout(self.delay);
-            match wait.poll() {
-                Some(Err(IoError::QueueFull)) => return true,
-                Some(_) => {}
-                None => self.wait = Some(wait),
-            }
-            self.owed = false;
-            if self.doubles {
-                self.delay = (self.delay * 2).min(BACKOFF_MAX);
-            }
-        }
-        self.wait.is_some()
-    }
-}
-
-impl Closing {
+impl<K> Closing<K> {
     /// Queues the close, or reaps it. `None` once it has landed.
     fn step(self) -> Option<Self> {
         match self {
@@ -536,7 +545,7 @@ impl Closing {
 }
 
 /// Moves `closing` along, emptying it once the close has landed.
-fn step(closing: &mut Option<Closing>) {
+fn step<K>(closing: &mut Option<Closing<K>>) {
     *closing = closing.take().and_then(Closing::step);
 }
 

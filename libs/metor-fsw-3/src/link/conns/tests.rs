@@ -10,6 +10,8 @@ use super::*;
 const SEED: &[u8] = b"seed";
 const CAP: usize = 64;
 const PEER: &str = "10.0.0.2:2240";
+/// The listener a listening link's `listen` gets.
+const LISTENER: RawHandle = RawHandle::new(9, 1);
 
 fn listen(slots: usize) -> ConnsConfig {
     ConnsConfig {
@@ -47,6 +49,10 @@ struct Rig {
 /// peer.
 #[derive(Default)]
 struct Net {
+    /// What each listen gets, a listener once these run out.
+    listens: VecDeque<IoError>,
+    /// The turns a listen was answered on.
+    listened: Vec<usize>,
     streams: VecDeque<Result<RawHandle, IoError>>,
     peers: HashMap<RawHandle, Peer>,
     closed: Vec<RawHandle>,
@@ -71,7 +77,7 @@ struct Peer {
 /// Allocates `config`'s buffers and binds them to `ep`.
 fn make(
     io: &TestIo,
-    ep: &Handle<Endpoint>,
+    ep: &Cap<Endpoint>,
     config: ConnsConfig,
     seed: &[u8],
 ) -> Result<Conns, MakeError> {
@@ -79,13 +85,23 @@ fn make(
     Conns::new(mem, ep, seed, 0)
 }
 
+/// The connections, a listening link's listener already up.
 fn rig(config: ConnsConfig) -> Rig {
+    let mut r = rig_with(config, Net::default());
+    if !config.dialing {
+        r.turns(2);
+    }
+    r
+}
+
+/// The connections before their first turn, with `net` as the far end.
+fn rig_with(config: ConnsConfig, net: Net) -> Rig {
     let (ep, io) = cap_with_ops::<Endpoint>(ops_for(config.slot_count()) as u16);
     let conns = make(&io, &ep, config, SEED).expect("fits");
     Rig {
         conns,
         io,
-        net: Net::default(),
+        net,
         bodies: Vec::new(),
         events: Vec::new(),
         turn: 0,
@@ -148,7 +164,21 @@ impl Net {
         while let Some(mut r) = requests.next() {
             let handle = r.handle();
             match r.op() {
-                Op::Stream => {
+                Op::Listen => {
+                    assert!(r.on_cap());
+                    self.listened.push(turn);
+                    match self.listens.pop_front() {
+                        Some(e) => r.done(Err(e)),
+                        None => r.done(Ok(LISTENER.get() as usize)),
+                    }
+                }
+                op @ (Op::Accept | Op::Connect) => {
+                    let on = if op == Op::Accept {
+                        LISTENER
+                    } else {
+                        RawHandle::new(0, 0)
+                    };
+                    assert_eq!(handle, on, "{op:?}");
                     let Some(next) = self.streams.pop_front() else {
                         continue;
                     };
@@ -429,20 +459,6 @@ fn test_repeated_dial_failures_back_off_then_reset() {
 }
 
 #[test]
-fn test_a_dialers_backoff_doubles_to_ten_seconds() {
-    let (ep, _io) = cap_with_ops::<Endpoint>(16);
-    let mut backoff = Backoff::new(true);
-    let mut delays = Vec::new();
-    for _ in 0..7 {
-        delays.push(backoff.delay.as_millis());
-        backoff.start();
-        assert!(backoff.waiting(&ep));
-        backoff.wait = None;
-    }
-    assert_eq!(delays, [500, 1_000, 2_000, 4_000, 8_000, 10_000, 10_000]);
-}
-
-#[test]
 fn test_a_listener_backs_off_a_fixed_500_ms() {
     let mut r = rig(listen(1));
     for _ in 0..3 {
@@ -491,4 +507,59 @@ fn test_reject_a_seed_past_conn_cap() {
             conn_cap: CAP
         })
     ));
+}
+
+#[test]
+fn test_a_listener_listens_once_then_accepts() {
+    let mut r = rig_with(listen(2), Net::default());
+    let (a, b) = (r.connect(), r.connect());
+    r.turns(8);
+    assert_eq!(
+        r.net.listened,
+        [2],
+        "the first turn asks; the far end answers the next"
+    );
+    assert_eq!(r.connections(), 2);
+    assert_eq!((r.peer(a).received.len(), r.peer(b).received.len()), (4, 4));
+}
+
+#[test]
+fn test_a_failed_listen_backs_off_then_listens_again() {
+    let mut net = Net::default();
+    net.listens
+        .push_back(IoError::Os(crate::io::Errno::EADDRINUSE));
+    let mut r = rig_with(listen(1), net);
+    r.connect();
+    r.turns(60);
+    let gaps: Vec<usize> = r.net.listened.windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(gaps, [51], "500 ms, then a turn to ask");
+    let taken = Event::Failed(IoError::Os(crate::io::Errno::EADDRINUSE));
+    assert_eq!(r.events(), [taken, Event::Opened(peer_addr())]);
+}
+
+#[test]
+fn test_a_lost_listener_closes_and_listens_again() {
+    let mut r = rig(listen(1));
+    let first = r.accept();
+    let lost = IoError::Os(crate::io::Errno::EBADF);
+    r.net.streams.push_back(Err(lost));
+    r.turns(3);
+    assert_eq!(r.net.closed, [LISTENER], "the listener, not the stream");
+    assert_eq!(r.connections(), 1, "{first:?} stays up");
+    r.turns(60);
+    assert_eq!(r.net.listened.len(), 2);
+    assert!(r.events().contains(&Event::Failed(lost)));
+}
+
+#[test]
+fn test_a_listener_survives_a_failed_accept() {
+    let mut r = rig(listen(1));
+    r.net
+        .streams
+        .push_back(Err(IoError::Os(crate::io::Errno::EMFILE)));
+    r.connect();
+    r.turns(60);
+    assert_eq!(r.net.listened.len(), 1);
+    assert!(r.net.closed.is_empty());
+    assert_eq!(r.connections(), 1);
 }

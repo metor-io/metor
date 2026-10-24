@@ -3,7 +3,7 @@
 
 use core::time::Duration;
 
-use metor_fsw_3::io::{Cap, ReadOp, Uart, WriteOp};
+use metor_fsw_3::io::{Cap, IoError, ReadOp, Reconnect, Reconnected, Uart, WriteOp};
 use metor_fsw_3::{
     Input, IoInit, Log, MakeError, Output, Record, Seq, SeqError, Slot, sequence, system,
 };
@@ -135,6 +135,7 @@ fn sign(hemisphere: &str, negative: &str) -> f64 {
 }
 
 pub struct GpsState {
+    link: Reconnect<Uart>,
     rx: Slot<ReadOp>,
     tx: Slot<WriteOp>,
     configured: bool,
@@ -144,37 +145,57 @@ pub struct GpsState {
 impl GpsState {
     pub fn new(io: &mut IoInit) -> Result<Self, MakeError> {
         Ok(Self {
+            link: Reconnect::new(),
             rx: Slot::Idle(io.alloc(256)?),
             tx: Slot::Idle(io.alloc_from(PMTK_RATE_10HZ)?),
             configured: false,
             nmea: Nmea::default(),
         })
     }
+
+    /// Logs `e` as `kind`, unless it ended an op of a closed connection,
+    /// and closes the connection if `e` ends it.
+    fn fault(&mut self, log: &mut Log, kind: &'static str, e: IoError) {
+        if e != IoError::Canceled {
+            log.fault(kind, e);
+        }
+        self.link.check(e);
+    }
 }
 
-/// Sets the receiver to 10 Hz, then publishes each fix it reports.
+/// Connects, sets the receiver to 10 Hz, then publishes each fix it
+/// reports. A lost port is connected and configured again.
 #[system]
 pub fn gps(#[state] s: &mut GpsState, uart: &Cap<Uart>, fix: &mut Output<Gps>, log: &mut Log) {
+    match s.link.poll(uart) {
+        Some(Reconnected::Up) => s.configured = false,
+        Some(Reconnected::Failed(e)) => log.fault("gps_connect", e),
+        None => {}
+    }
     match s.tx.poll() {
         Some(Ok(n)) => s.configured = n == PMTK_RATE_10HZ.len(),
-        Some(Err(e)) => log.fault("gps_config", e),
+        Some(Err(e)) => s.fault(log, "gps_config", e),
         None => {}
     }
     match s.rx.poll() {
+        Some(Ok(0)) => s.link.lose(),
         Some(Ok(_)) => s.nmea.push(s.rx.bytes()),
-        Some(Err(e)) => log.fault("gps_read", e),
+        Some(Err(e)) => s.fault(log, "gps_read", e),
         None => {}
     }
     while let Some(f) = s.nmea.next() {
         let _ = fix.write(&Gps::from(f));
     }
+    let Some(port) = s.link.handle() else {
+        return;
+    };
     if !s.configured
         && let Some(cmd) = s.tx.take_idle()
     {
-        s.tx = Slot::Busy(uart.write(cmd));
+        s.tx = Slot::Busy(port.write(cmd));
     }
     if let Some(buf) = s.rx.take_idle() {
-        s.rx = Slot::Busy(uart.read(buf));
+        s.rx = Slot::Busy(port.read(buf));
     }
 }
 
@@ -187,6 +208,7 @@ pub struct UartScriptParams {
 
 /// A serial device's script, and the buffer it sends each entry from.
 pub struct UartScript {
+    link: Reconnect<Uart>,
     script: std::collections::VecDeque<Vec<u8>>,
     tx: Slot<WriteOp>,
 }
@@ -195,6 +217,7 @@ impl UartScript {
     pub fn new(params: UartScriptParams, io: &mut IoInit) -> Result<Self, MakeError> {
         let longest = params.script.iter().map(String::len).max().unwrap_or(0);
         Ok(Self {
+            link: Reconnect::new(),
             script: params.script.into_iter().map(String::into_bytes).collect(),
             tx: Slot::Idle(io.alloc(longest)?),
         })
@@ -204,14 +227,17 @@ impl UartScript {
 /// A serial device that sends its script, one entry per write.
 #[system]
 pub fn uart_script(#[state] s: &mut UartScript, uart: &Cap<Uart>) {
-    let _ = s.tx.poll();
-    if s.script.is_empty() {
-        return;
+    s.link.poll(uart);
+    if let Some(Err(e)) = s.tx.poll() {
+        s.link.check(e);
     }
+    let Some(port) = s.link.handle().filter(|_| !s.script.is_empty()) else {
+        return;
+    };
     if let Some(mut buf) = s.tx.take_idle() {
         let entry = s.script.pop_front().unwrap_or_default();
         buf.fill(&entry);
-        s.tx = Slot::Busy(uart.write(buf));
+        s.tx = Slot::Busy(port.write(buf));
     }
 }
 
@@ -385,11 +411,44 @@ mod tests {
 
     #[test]
     fn failed_config_is_logged_and_retried() {
-        let mut rig = Rig::new(ScriptedUart::silent().fail_write(Errno::EIO));
+        let mut rig = Rig::new(ScriptedUart::silent().fail_write(Errno::EINVAL));
         for _ in 0..4 {
             rig.cycle();
         }
         assert_eq!(rig.faults(), ["gps_config"]);
         assert_eq!(rig.model.written(), [PMTK_RATE_10HZ.to_vec()]);
+        assert_eq!(rig.model.connects(), 1);
+    }
+
+    #[test]
+    fn a_lost_port_reconnects_and_configures_again() {
+        let mut rig = Rig::new(ScriptedUart::silent().fail_write(Errno::EIO));
+        for _ in 0..40 {
+            rig.cycle();
+        }
+        assert_eq!(rig.faults(), ["gps_config"]);
+        assert_eq!(rig.model.connects(), 1, "waiting out 500 ms");
+        assert!(rig.model.written().is_empty());
+        for _ in 0..25 {
+            rig.cycle();
+        }
+        assert_eq!(rig.model.connects(), 2);
+        assert_eq!(rig.model.written(), [PMTK_RATE_10HZ.to_vec()]);
+    }
+
+    #[test]
+    fn a_hung_up_port_reconnects() {
+        let mut rig = Rig::new(ScriptedUart::scripted([Vec::new(), GGA.to_vec()]));
+        for _ in 0..70 {
+            rig.cycle();
+        }
+        assert_eq!(
+            rig.model.connects(),
+            2,
+            "a read of no bytes ends the connection"
+        );
+        assert_eq!(rig.model.written().len(), 2, "configured on each connect");
+        assert_eq!(rig.fixes().len(), 1);
+        assert!(rig.faults().is_empty());
     }
 }

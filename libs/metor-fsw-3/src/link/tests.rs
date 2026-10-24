@@ -75,6 +75,7 @@ fn test_link_ops_reject_bad_params() {
 
 const CAP: usize = 4096;
 const STREAM: RawHandle = RawHandle::new(10, 1);
+const LISTENER: RawHandle = RawHandle::new(11, 1);
 
 /// One link's test IO and the bytes waiting on its end of the stream.
 struct End {
@@ -115,7 +116,8 @@ fn serve(port: &mut TestPort, opened: &mut bool, inbox: &mut Vec<u8>, peer: &mut
     let mut requests = port.requests();
     while let Some(mut r) = requests.next() {
         match r.op() {
-            Op::Stream if !*opened => {
+            Op::Listen => r.done(Ok(LISTENER.get() as usize)),
+            Op::Accept | Op::Connect if !*opened => {
                 *opened = true;
                 r.done(Ok(STREAM.get() as usize));
             }

@@ -6,23 +6,28 @@
 //! `Sqe` into a `Route` for the io steps to carry out, and `raise` turns a
 //! finished op back into a `Cqe`. A timeout never leaves the dispatch: it
 //! lands when `expire` passes its deadline. Nothing here does IO.
+//!
+//! A grant's capability holds no descriptor. `Connect` and `Listen` on it
+//! open one, which a derived handle maps to.
 
 use core::net::SocketAddr;
 use core::ptr::NonNull;
 use core::time::Duration;
 use std::os::fd::{AsRawFd, OwnedFd};
 
+use super::recipe::{PathKind, Recipe, SocketKind};
+
 use metor_component::FrameStr;
 use metor_proto::types::Timestamp;
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::wire::Wire;
-use super::{Class, OpId, OsDone, OsOp, Out};
+use super::{Class, Make, OpId, OsDone, OsOp, Out};
 use crate::coordinator::BuildError;
 use crate::io::arena::Arena;
 use crate::io::status::{Counters, ResourceStatus};
 use crate::io::{
-    Cidr, Cqe, IoError, Op, OpKind, RawAddr, RawHandle, ResourceEnd, ResourceIndex, Sqe, Token,
+    Cqe, IoError, Op, OpKind, RawAddr, RawHandle, ResourceEnd, ResourceIndex, Span, Sqe, Token,
 };
 use crate::port::Output;
 
@@ -43,15 +48,11 @@ const READY_PER_SLOT: usize = LOWERED_PER_SLOT + OWN_COMPLETION + HELD_PER_SLOT;
 
 /// What backs a resource.
 pub(crate) enum Backed {
-    Fd(OwnedFd, Class),
-    /// A listener, taking streams from the peers in its allow list, or from
-    /// any peer when the list is empty.
-    Listen(OwnedFd, Box<[Cidr]>),
+    /// What each connect or listen makes.
+    Real(Recipe),
     /// The wire at this index of the dispatch's wires.
     Wire(usize),
-    /// No descriptor: each `Stream` dials this address.
-    Dial(SocketAddr),
-    /// No system holds it, so it was never opened.
+    /// No system holds it.
     Unused,
 }
 
@@ -66,6 +67,8 @@ pub(crate) enum Route {
     Os(OsOp),
     Cancel(OpId),
     Close(OwnedFd),
+    /// Makes the socket of this resource's recipe for this op.
+    Socket(OpId, u16),
 }
 
 /// A `Cap` a member holds on a resource.
@@ -77,11 +80,16 @@ struct Grant {
     open: bool,
 }
 
-/// A descriptor an op opened, mapped to a member's handle.
+/// A connection an op opened, mapped to a member's handle.
 struct Derived {
     res: u16,
-    fd: OwnedFd,
-    class: Class,
+    conn: Conn,
+}
+
+enum Conn {
+    Fd(OwnedFd, Class),
+    /// This end of the wire at this index.
+    Wire(usize, ResourceEnd),
 }
 
 /// A handle slot for a descriptor an op opens.
@@ -182,9 +190,11 @@ impl OpRanges {
 struct InFlight {
     generation: u16,
     res: u16,
+    /// The index of the handle it was submitted on.
+    handle: u16,
     kind: OpKind,
     canceled: bool,
-    /// A `Stream`'s buffer, which its peer is written to.
+    /// An `Accept`'s or `Connect`'s buffer, which its peer is written to.
     peer: Option<NonNull<[u8]>>,
     /// A timeout's deadline.
     due: Option<Timestamp>,
@@ -208,12 +218,22 @@ impl From<IoError> for Refusal {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Rejected;
 
-/// The descriptor or wire an op on a handle goes to.
+/// What an op on a handle goes to.
+#[derive(Clone, Copy)]
 enum Target {
+    /// A capability on a real resource.
+    Recipe,
+    /// A capability on the wire at this index, from this end.
+    WireCap(usize, ResourceEnd),
     Fd(i32, Class),
-    /// The wire at this index, from this end.
+    /// A connection to the wire at this index, from this end.
     Wire(usize, ResourceEnd),
-    Dial(SocketAddr),
+}
+
+impl Target {
+    fn is_cap(self) -> bool {
+        matches!(self, Self::Recipe | Self::WireCap(..))
+    }
 }
 
 pub(crate) struct Dispatch {
@@ -329,48 +349,125 @@ impl Dispatch {
             self.start_timer(index, res, sqe.token.generation(), deadline(now, after));
             return Ok(());
         }
-        let buf = match op.fills() || op.drains() {
-            true => Some(arena.get_slice(sqe.buf).ok_or(IoError::BadBuf)?),
-            false => None,
-        };
-        if buf.map_or(0, |b| b.len()) < op.min_buf() {
-            return Err(IoError::BadBuf.into());
+        if target.is_cap() != matches!(op, Op::Connect | Op::Listen) {
+            return Err(IoError::Unsupported.into());
         }
+        if let Target::WireCap(w, end) = target {
+            let result = self.connect_wire(m, res, w, end, op);
+            self.counters[usize::from(res)].submitted += 1;
+            self.counters[usize::from(res)].record_completion(op.kind(), &result);
+            let cqe = result.map_or_else(|e| Cqe::err(sqe.token, e), |n| Cqe::ok(sqe.token, n));
+            self.ready.push((m, cqe));
+            return Ok(());
+        }
+        let buf = lent(&op, sqe.buf, arena)?;
         let id = OpId::new(index as u16, sqe.token.generation());
-        let os = |fd, class, dial| OsOp {
-            id,
-            fd,
-            class,
-            op,
-            buf,
-            dial,
-        };
-        let lowered = match target {
-            Target::Fd(fd, class) => Some(os(fd, class, None)),
-            Target::Dial(to) if op == Op::Stream => Some(os(-1, Class::Dialer, Some(to))),
-            Target::Dial(_) => return Err(IoError::Unsupported.into()),
-            Target::Wire(..) => None,
+        let route = match target {
+            Target::Fd(fd, class) => Some(Route::Os(OsOp {
+                id,
+                fd,
+                class,
+                op,
+                buf,
+                make: None,
+            })),
+            Target::Recipe => Some(self.make(res, id, op, buf)?),
+            Target::Wire(..) | Target::WireCap(..) => None,
         };
         self.ops[index] = Some(InFlight {
             generation: sqe.token.generation(),
             res,
+            handle: sqe.handle.index(),
             kind: op.kind(),
             canceled: false,
-            peer: lowered.and_then(|o| o.buf).filter(|_| op == Op::Stream),
+            peer: buf.filter(|_| matches!(op, Op::Accept | Op::Connect)),
             due: None,
         });
         self.counters[usize::from(res)].submitted += 1;
         match target {
-            Target::Fd(..) | Target::Dial(_) => {
-                self.routes.extend(lowered.map(Route::Os));
-            }
             Target::Wire(w, end) => {
                 let dropped = self.wires[w].run(end, id, op, buf, &mut self.wired);
                 self.counters[usize::from(res)].dropped += dropped as u64;
                 self.raise_wired();
             }
+            _ => self.routes.extend(route),
         }
         Ok(())
+    }
+
+    /// The route that makes a connection from resource `res`'s recipe.
+    fn make(
+        &self,
+        res: u16,
+        id: OpId,
+        op: Op,
+        buf: Option<NonNull<[u8]>>,
+    ) -> Result<Route, IoError> {
+        let Backed::Real(recipe) = &self.resources[usize::from(res)].backed else {
+            return Err(IoError::Unsupported);
+        };
+        let os = |class, make| {
+            Route::Os(OsOp {
+                id,
+                fd: -1,
+                class,
+                op,
+                buf,
+                make: Some(make),
+            })
+        };
+        Ok(match (recipe, op) {
+            (Recipe::Path(kind), Op::Connect) => os(
+                kind.class(),
+                Make::Open {
+                    path: NonNull::from(kind.path()).cast(),
+                    flags: kind.flags(),
+                },
+            ),
+            (Recipe::Socket(SocketKind::Dial(to)), Op::Connect) => {
+                os(Class::Stream, Make::Dial(*to))
+            }
+            (Recipe::Socket(SocketKind::Listen { .. }), Op::Listen)
+            | (Recipe::Socket(SocketKind::Udp { .. } | SocketKind::Can { .. }), Op::Connect) => {
+                Route::Socket(id, res)
+            }
+            _ => return Err(IoError::Unsupported),
+        })
+    }
+
+    /// Connects member `m` to end `end` of wire `w`, at once.
+    fn connect_wire(
+        &mut self,
+        m: usize,
+        res: u16,
+        w: usize,
+        end: ResourceEnd,
+        op: Op,
+    ) -> Result<u32, IoError> {
+        match op {
+            Op::Connect => self.derive(m, res, Conn::Wire(w, end)),
+            _ => Err(IoError::Unsupported),
+        }
+    }
+
+    /// The socket recipe of resource `res`, for a `Route::Socket`.
+    pub(crate) fn socket(&self, res: u16) -> Option<&SocketKind> {
+        match &self.resources.get(usize::from(res))?.backed {
+            Backed::Real(Recipe::Socket(kind)) => Some(kind),
+            _ => None,
+        }
+    }
+
+    /// The path recipe op `id` connects to, if it is a path's open in flight.
+    pub(crate) fn opening(&self, id: OpId) -> Option<&PathKind> {
+        let op = self.ops.get(usize::from(id.index()))?.as_ref()?;
+        if op.generation != id.generation() || op.kind != OpKind::Connect {
+            return None;
+        }
+        match &self.resources[usize::from(op.res)].backed {
+            Backed::Real(Recipe::Path(kind)) => Some(kind),
+            _ => None,
+        }
     }
 
     /// Puts a timeout in flight at op `index`, landing at `at`.
@@ -378,6 +475,7 @@ impl Dispatch {
         self.ops[index] = Some(InFlight {
             generation,
             res,
+            handle: 0,
             kind: OpKind::Timeout,
             canceled: false,
             peer: None,
@@ -415,32 +513,47 @@ impl Dispatch {
         let Some(slot) = index.checked_sub(member.grants.len()) else {
             let grant = member.grants.get(index).filter(|g| g.open)?;
             let target = match &self.resources[usize::from(grant.res)].backed {
-                Backed::Fd(fd, class) => Target::Fd(fd.as_raw_fd(), *class),
-                Backed::Listen(fd, _) => Target::Fd(fd.as_raw_fd(), Class::Listener),
-                Backed::Wire(w) => Target::Wire(*w, grant.end),
-                Backed::Dial(to) => Target::Dial(*to),
+                Backed::Real(_) => Target::Recipe,
+                Backed::Wire(w) => Target::WireCap(*w, grant.end),
                 Backed::Unused => return None,
             };
             return (raw.generation() == 0).then_some((grant.res, target));
         };
         let slot = member.derived.get(slot)?;
         let derived = slot.derived.as_ref()?;
-        let target = Target::Fd(derived.fd.as_raw_fd(), derived.class);
+        let target = match &derived.conn {
+            Conn::Fd(fd, class) => Target::Fd(fd.as_raw_fd(), *class),
+            Conn::Wire(w, end) => Target::Wire(*w, *end),
+        };
         (slot.generation == raw.generation()).then_some((derived.res, target))
     }
 
     /// Ends a handle. A grant ends only this capability, and its ops in
-    /// flight, parked reads on a wire too, run on until they finish or are
-    /// canceled. A derived handle's descriptor closes, ending its ops.
+    /// flight run on until they finish or are canceled. A derived handle's
+    /// connection closes, ending its ops.
     fn close(&mut self, m: usize, raw: RawHandle) {
         let member = &mut self.members[m];
         let index = usize::from(raw.index());
-        match index.checked_sub(member.grants.len()) {
-            None => member.grants[index].open = false,
-            Some(slot) => {
-                if let Some(derived) = member.derived[slot].derived.take() {
-                    self.routes.push(Route::Close(derived.fd));
-                }
+        let derived = match index.checked_sub(member.grants.len()) {
+            None => {
+                member.grants[index].open = false;
+                return;
+            }
+            Some(slot) => member.derived[slot].derived.take(),
+        };
+        match derived.map(|d| d.conn) {
+            Some(Conn::Fd(fd, _)) => self.routes.push(Route::Close(fd)),
+            Some(Conn::Wire(..)) => self.cancel_on(m, raw.index()),
+            None => {}
+        }
+    }
+
+    /// Cancels member `m`'s ops on handle index `handle`.
+    fn cancel_on(&mut self, m: usize, handle: u16) {
+        for index in self.ranges.range(m) {
+            if let Some(op) = self.ops[index].filter(|op| op.handle == handle) {
+                let (_, slot) = self.ranges.owner(index);
+                self.cancel(m, Token::new(slot, op.generation));
             }
         }
     }
@@ -486,11 +599,15 @@ impl Dispatch {
         let token = Token::new(slot, op.generation);
         let result = match done.result {
             Ok(Out::Len(n)) => Ok(n),
-            Ok(Out::Opened { fd, class, peer }) if self.allows(op.res, peer) => {
-                write_peer(&op, peer);
-                self.derive(m, op.res, fd, class)
+            Ok(Out::Opened { fd, peer, .. })
+                if op.kind == OpKind::Accept && !self.allows(op.res, peer) =>
+            {
+                self.turn_away(op.res, fd)
             }
-            Ok(Out::Opened { fd, .. }) => self.turn_away(op.res, fd),
+            Ok(Out::Opened { fd, class, peer }) => {
+                write_peer(&op, peer);
+                self.derive(m, op.res, Conn::Fd(fd, class))
+            }
             Err(e) => Err(e),
         };
         if self.members[m].state != MemberState::Running {
@@ -503,7 +620,9 @@ impl Dispatch {
 
     /// Whether resource `res`, if a listener, admits `peer`.
     fn allows(&self, res: u16, peer: Option<SocketAddr>) -> bool {
-        let Backed::Listen(_, allow) = &self.resources[usize::from(res)].backed else {
+        let Backed::Real(Recipe::Socket(SocketKind::Listen { allow, .. })) =
+            &self.resources[usize::from(res)].backed
+        else {
             return true;
         };
         allow.is_empty() || peer.is_some_and(|p| allow.iter().any(|c| c.contains(p.ip())))
@@ -561,18 +680,20 @@ impl Dispatch {
         self.ops.len()
     }
 
-    /// Maps a new descriptor to a free derived handle of member `m`, or closes
-    /// it when none is free or the member is quiescing.
-    fn derive(&mut self, m: usize, res: u16, fd: OwnedFd, class: Class) -> Result<u32, IoError> {
+    /// Maps a new connection to a free derived handle of member `m`, or
+    /// closes it when none is free or the member is quiescing.
+    fn derive(&mut self, m: usize, res: u16, conn: Conn) -> Result<u32, IoError> {
         let member = &mut self.members[m];
         let free = member.derived.iter().position(|d| d.derived.is_none());
         let (Some(free), MemberState::Running) = (free, member.state) else {
-            self.routes.push(Route::Close(fd));
+            if let Conn::Fd(fd, _) = conn {
+                self.routes.push(Route::Close(fd));
+            }
             return Err(IoError::Refused);
         };
         let slot = &mut member.derived[free];
         slot.generation = slot.generation.wrapping_add(1);
-        slot.derived = Some(Derived { res, fd, class });
+        slot.derived = Some(Derived { res, conn });
         let index = member.grants.len() + free;
         Ok(RawHandle::new(index as u16, slot.generation).get())
     }
@@ -600,7 +721,10 @@ impl Dispatch {
         member.grants.iter_mut().for_each(|g| g.open = true);
         let closed = member.derived.iter_mut().filter_map(|d| d.derived.take());
         self.routes
-            .extend(closed.map(|derived| Route::Close(derived.fd)));
+            .extend(closed.filter_map(|derived| match derived.conn {
+                Conn::Fd(fd, _) => Some(Route::Close(fd)),
+                Conn::Wire(..) => None,
+            }));
     }
 
     /// Whether member `m` has nothing left in flight since `begin`.
@@ -620,6 +744,18 @@ impl Dispatch {
     /// The routes queued since the last call.
     pub(crate) fn drain_routes(&mut self) -> std::vec::Drain<'_, Route> {
         self.routes.drain(..)
+    }
+
+    /// Takes the queued routes, to carry out while the dispatch is read.
+    /// [`put_routes`](Self::put_routes) hands the emptied list back.
+    pub(crate) fn take_routes(&mut self) -> Vec<Route> {
+        core::mem::take(&mut self.routes)
+    }
+
+    pub(crate) fn put_routes(&mut self, mut routes: Vec<Route>) {
+        routes.clear();
+        routes.append(&mut self.routes);
+        self.routes = routes;
     }
 
     /// Starts quiescing every member, for teardown.
@@ -658,14 +794,27 @@ impl Dispatch {
     }
 }
 
+/// The arena memory an op lends: its buffer if it needs one, or a
+/// connect's peer buffer if it names one.
+fn lent(op: &Op, span: Span, arena: &Arena) -> Result<Option<NonNull<[u8]>>, IoError> {
+    if !op.needs_buf() && !(op.fills() && !span.is_empty()) {
+        return Ok(None);
+    }
+    let buf = arena.get_slice(span).ok_or(IoError::BadBuf)?;
+    match buf.len() < op.min_buf() {
+        true => Err(IoError::BadBuf),
+        false => Ok(Some(buf)),
+    }
+}
+
 /// `after` past `now`, saturating.
 fn deadline(now: Timestamp, after: Duration) -> Timestamp {
     let micros = i64::try_from(after.as_micros()).unwrap_or(i64::MAX);
     Timestamp(now.0.saturating_add(micros))
 }
 
-/// Writes `peer`'s `RawAddr` into a `Stream`'s buffer, or zeroes for a
-/// stream with no peer.
+/// Writes `peer`'s `RawAddr` into an `Accept`'s or `Connect`'s buffer, or
+/// zeroes for a connection with no peer.
 fn write_peer(op: &InFlight, peer: Option<SocketAddr>) {
     let Some(buf) = op.peer else {
         return;

@@ -2,8 +2,9 @@
 //!
 //! An op runs when it is pushed. One whose descriptor is not ready parks,
 //! and runs again once the descriptor polls ready for the union of its
-//! parked ops' interests. File, directory, and GPIO ops never park. A dial
-//! starts its connect and parks on its new socket until it takes writes.
+//! parked ops' interests. File, directory, and GPIO ops and opens never
+//! park. A dial starts its connect and parks on its new socket until it
+//! takes writes.
 
 use core::num::NonZeroUsize;
 use core::time::Duration;
@@ -44,12 +45,12 @@ impl PollOs {
     }
 
     fn attempt(&mut self, op: OsOp) {
-        let result = match op.class {
-            Class::Dialer => self.dialed(&op),
-            _ => sys::run(&op),
+        let result = match op.dials() {
+            Some(_) => self.dialed(&op),
+            None => sys::run(&op),
         };
         match result {
-            Err(IoError::Os(Errno::EAGAIN)) if op.class.polled() => {
+            Err(IoError::Os(Errno::EAGAIN)) if op.parks() => {
                 let fd = op.fd;
                 self.parked.push(op);
                 self.arm(fd);
@@ -60,7 +61,10 @@ impl PollOs {
 
     /// Starts a dial's connect, then parks it on its new socket.
     fn dial(&mut self, mut op: OsOp) {
-        let socket = op.dial.ok_or(IoError::Unsupported).and_then(sys::connect);
+        let socket = op
+            .dials()
+            .ok_or(IoError::Unsupported)
+            .and_then(sys::connect);
         let socket = match socket {
             Ok(socket) => socket,
             Err(e) => {
@@ -85,7 +89,7 @@ impl PollOs {
         result.map(|()| Out::Opened {
             fd: socket,
             class: Class::Stream,
-            peer: op.dial,
+            peer: op.dials(),
         })
     }
 
@@ -135,7 +139,7 @@ impl PollOs {
     fn finish_where(&mut self, hit: impl Fn(&OsOp) -> bool, e: IoError) {
         while let Some(position) = self.parked.iter().position(&hit) {
             let op = self.parked.remove(position);
-            if op.class == Class::Dialer {
+            if op.dials().is_some() {
                 self.prune(op.fd);
                 drop(self.end_dial(op.id));
             }
@@ -161,9 +165,9 @@ impl PollOs {
 
 impl Os for PollOs {
     fn push(&mut self, op: OsOp) {
-        match op.class {
-            Class::Dialer => self.dial(op),
-            _ => self.attempt(op),
+        match op.dials() {
+            Some(_) => self.dial(op),
+            None => self.attempt(op),
         }
     }
 

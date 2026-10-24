@@ -18,7 +18,7 @@ use adcs_contracts::{
     gps_epoch, gps_time,
 };
 use futures_lite::future;
-use metor_fsw_3::io::{Buf, Cap, IoInit, Uart};
+use metor_fsw_3::io::{Buf, Cap, Handle, IoInit, Uart};
 use metor_fsw_3::ring::{Config, NoWake, RingBuffer, View, Writer};
 use metor_fsw_3::{Input, MakeError, Seq, SeqError, Timestamp, ring_capacity, sequence};
 use rand::{SeedableRng, rngs::StdRng};
@@ -97,13 +97,24 @@ pub async fn gps_receiver(
         .periods
         .view(NoWake)
         .map_err(|_| SeqError::Failed("the period ring has no free reader".into()))?;
-    let logs = logs(seq, uart, tx, &mut m.model, truth, faults, read);
-    future::zip(commands(uart, rx, sent), logs).await;
+    let port = connect(seq, uart).await;
+    let logs = logs(seq, &port, tx, &mut m.model, truth, faults, read);
+    future::zip(commands(&port, rx, sent), logs).await;
     Ok(())
 }
 
+/// Connects the device end, trying again each cycle.
+async fn connect(seq: &Seq<'_>, uart: &Cap<Uart>) -> Handle<Uart> {
+    loop {
+        if let Ok(port) = uart.connect().await {
+            return port;
+        }
+        seq.next_cycle().await;
+    }
+}
+
 /// Reads the driver's commands, passing on each log period one sets.
-async fn commands(uart: &Cap<Uart>, mut buf: Buf, mut periods: Writer<NoWake>) {
+async fn commands(uart: &Handle<Uart>, mut buf: Buf, mut periods: Writer<NoWake>) {
     let mut lines = LineBuf::<COMMAND_READ>::default();
     loop {
         let (read, back) = uart.read(buf).await;
@@ -123,7 +134,7 @@ async fn commands(uart: &Cap<Uart>, mut buf: Buf, mut periods: Writer<NoWake>) {
 /// Writes each log as it falls due, one at a time.
 async fn logs(
     seq: &Seq<'_>,
-    uart: &Cap<Uart>,
+    uart: &Handle<Uart>,
     mut buf: Buf,
     model: &mut ReceiverModel,
     truth: &mut Input<BodyState>,

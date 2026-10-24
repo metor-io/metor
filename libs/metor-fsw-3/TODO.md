@@ -49,7 +49,15 @@ Landed 2026-09-18; the fixture's
 
 `Publish` and `Subscribe` run as sequences on the IO queue: a link holds a `Cap<Endpoint>`, its
 transport lowers to a `tcp_listen` or `tcp_dial` resource, and its
-connections allocate nothing after make.
+connections allocate nothing after make. A listener listens once and
+accepts; a dialer connects.
+
+- Connecting as an op (plan 26): chunks A to C landed: resources are
+  recipes, `connect` and `listen` open handles, `Reconnect` and
+  `IoError::is_lost`. Left: sim wire ends that unplug and replug (D), and
+  `connects` and `connect_failures` in `io_status` (E). Opens under a
+  `Dir` still run inline on io_uring, and two systems holding one tty
+  each open it.
 
 - Links on threads: the thread driver over group reactors (§8), so
   `thread:` places a link off the cycle. The link bodies already run under

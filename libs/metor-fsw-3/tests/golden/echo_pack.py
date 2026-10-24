@@ -12,7 +12,7 @@ PACK = Pack(
     id="echo",
     lib="echo_pack",
     libs=str(Path(__file__).resolve().parent / "_libs"),
-    abi_version=14,
+    abi_version=15,
 )
 
 
@@ -227,7 +227,7 @@ class Retained(System):
 
 
 class Gps(System):
-    "Sets the receiver to 10 Hz, then publishes each fix it reports."
+    "Connects, sets the receiver to 10 Hz, then publishes each fix it\nreports. A lost port is connected and configured again."
 
     _pack = PACK
     _ty = "gps"

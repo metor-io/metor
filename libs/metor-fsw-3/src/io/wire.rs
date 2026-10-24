@@ -145,13 +145,15 @@ pub enum OpKind {
     Open,
     Close,
     Fsync,
-    Stream,
+    Accept,
     TtyConfigure,
     TtyFlush,
     GpioGet,
     GpioSet,
     Cancel,
     Timeout,
+    Connect,
+    Listen,
 }
 
 /// `TryFrom<u8>` for a one-byte code, failing with `Unsupported`.
@@ -484,9 +486,9 @@ pub enum Op {
     Open(OpenFlags),
     Close,
     Fsync,
-    /// Opens the endpoint's next stream, and writes its peer's `RawAddr`
+    /// Takes a listener's next stream, and writes its peer's `RawAddr`
     /// into the op's buffer.
-    Stream,
+    Accept,
     TtyConfigure(TtyConfig),
     TtyFlush(TtyQueue),
     GpioGet,
@@ -495,6 +497,11 @@ pub enum Op {
     Cancel,
     /// Lands once this long has passed on the cycle's clock.
     Timeout(Duration),
+    /// Opens a new connection to a capability's resource. A stream's peer
+    /// `RawAddr` goes into the op's buffer, if it lends one.
+    Connect,
+    /// Opens a listener on a capability's resource.
+    Listen,
 }
 
 impl Op {
@@ -508,25 +515,36 @@ impl Op {
             Self::Open(_) => OpKind::Open,
             Self::Close => OpKind::Close,
             Self::Fsync => OpKind::Fsync,
-            Self::Stream => OpKind::Stream,
+            Self::Accept => OpKind::Accept,
             Self::TtyConfigure(_) => OpKind::TtyConfigure,
             Self::TtyFlush(_) => OpKind::TtyFlush,
             Self::GpioGet => OpKind::GpioGet,
             Self::GpioSet(_) => OpKind::GpioSet,
             Self::Cancel => OpKind::Cancel,
             Self::Timeout(_) => OpKind::Timeout,
+            Self::Connect => OpKind::Connect,
+            Self::Listen => OpKind::Listen,
         }
     }
 
     /// Whether the op writes into its buffer, up to its capacity.
     pub fn fills(&self) -> bool {
-        matches!(self, Self::Read { .. } | Self::Recv | Self::Stream)
+        matches!(
+            self,
+            Self::Read { .. } | Self::Recv | Self::Accept | Self::Connect
+        )
     }
 
-    /// The fewest bytes the op's buffer may span.
+    /// Whether the op must lend a buffer. A connect lends one only for a
+    /// stream's peer.
+    pub fn needs_buf(&self) -> bool {
+        (self.fills() || self.drains()) && *self != Self::Connect
+    }
+
+    /// The fewest bytes the op's buffer may span, if it lends one.
     pub fn min_buf(&self) -> usize {
         match self {
-            Self::Stream => RawAddr::LEN,
+            Self::Accept | Self::Connect => RawAddr::LEN,
             _ => 0,
         }
     }
@@ -546,7 +564,10 @@ impl Op {
 
     /// Whether a success completes with a new handle.
     pub fn opens(&self) -> bool {
-        matches!(self, Self::Open(_) | Self::Stream)
+        matches!(
+            self,
+            Self::Open(_) | Self::Accept | Self::Connect | Self::Listen
+        )
     }
 }
 
@@ -618,13 +639,15 @@ impl Sqe {
             OpKind::Open => Op::Open(self.arg()),
             OpKind::Close => Op::Close,
             OpKind::Fsync => Op::Fsync,
-            OpKind::Stream => Op::Stream,
+            OpKind::Accept => Op::Accept,
             OpKind::TtyConfigure => Op::TtyConfigure(self.try_arg()?),
             OpKind::TtyFlush => Op::TtyFlush(self.aux.try_into()?),
             OpKind::GpioGet => Op::GpioGet,
             OpKind::GpioSet => Op::GpioSet(self.aux != 0),
             OpKind::Cancel => Op::Cancel,
             OpKind::Timeout => Op::Timeout(Duration::from_micros(self.offset.get())),
+            OpKind::Connect => Op::Connect,
+            OpKind::Listen => Op::Listen,
         })
     }
 

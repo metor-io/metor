@@ -10,8 +10,9 @@ use super::allocations;
 use crate::io::arena::Arena;
 use crate::io::host::dispatch::Rejected;
 use crate::io::host::dispatch::Resource;
+use crate::io::host::recipe::{PathKind, Recipe, SocketKind};
 use crate::io::host::wire::{FIFO, Wire};
-use crate::io::host::{Backed, Class, Dispatch, MemberDef, OpId, OsDone, OsOp, Out, Route};
+use crate::io::host::{Backed, Class, Dispatch, Make, MemberDef, OpId, OsDone, OsOp, Out, Route};
 use crate::io::status::ResourceStatus;
 use crate::io::*;
 use crate::record::Record;
@@ -27,12 +28,31 @@ fn null() -> OwnedFd {
     File::open("/dev/null").unwrap().into()
 }
 
+/// A tty at `/dev/null`.
+fn tty() -> Backed {
+    Backed::Real(Recipe::Path(PathKind::Tty {
+        path: c"/dev/null".into(),
+        baud: Baud::B9600,
+    }))
+}
+
+/// A descriptor a connect to the tty opened.
+fn tty_opened() -> Result<Out, IoError> {
+    Ok(Out::Opened {
+        fd: null(),
+        class: Class::Tty,
+        peer: None,
+    })
+}
+
 /// Member 0 holds the real resource 0 and the host end of the sim UART 1;
-/// member 1 holds resource 0 and the UART's device end.
+/// member 1 holds resource 0 and the UART's device end. Each has connected
+/// to both, as `TTY` and `SIM`.
 struct Rig {
     d: Dispatch,
     arenas: [Arena; 2],
-    fd: i32,
+    /// Each member's tty descriptor.
+    fds: [i32; 2],
 }
 
 fn rig() -> Rig {
@@ -41,12 +61,10 @@ fn rig() -> Rig {
 
 /// The rig, with a sim resource of `kind`.
 fn rig_with(kind: SimKind) -> Rig {
-    let fd = null();
-    let raw = fd.as_raw_fd();
     let resources = vec![
         Resource {
             id: "tty".into(),
-            backed: Backed::Fd(fd, Class::Tty),
+            backed: tty(),
         },
         Resource {
             id: "sim".into(),
@@ -66,23 +84,43 @@ fn rig_with(kind: SimKind) -> Rig {
             ],
         ),
     ];
-    Rig {
+    let mut r = Rig {
         d: Dispatch::new(members, resources, vec![Wire::new(kind, 2 * OPS)]).unwrap(),
         arenas: [super::arena(64), super::arena(64)],
-        fd: raw,
+        fds: [-1; 2],
+    };
+    for m in 0..2 {
+        r.lower(m, connect(0, TTY_CAP));
+        let op = r.only_os();
+        let fd = null();
+        r.fds[m] = fd.as_raw_fd();
+        let class = Class::Tty;
+        let opened = Ok(Out::Opened {
+            fd,
+            class,
+            peer: None,
+        });
+        let landed = Some((m, Cqe::ok(Token::new(0, 7), TTY.get())));
+        assert_eq!(r.done(op.id, opened), landed);
+        r.lower(m, connect(0, SIM_CAP));
+        assert_eq!(r.replies(), [(m, Cqe::ok(Token::new(0, 7), SIM.get()))]);
     }
+    r
 }
 
-const TTY: RawHandle = RawHandle::new(0, 0);
-const SIM: RawHandle = RawHandle::new(1, 0);
+const TTY_CAP: RawHandle = RawHandle::new(0, 0);
+const SIM_CAP: RawHandle = RawHandle::new(1, 0);
+/// The connections the rig opens, past the grants.
+const TTY: RawHandle = RawHandle::new(2, 1);
+const SIM: RawHandle = RawHandle::new(3, 1);
+
+/// A `Connect` on `handle`, lending no buffer.
+fn connect(slot: u16, handle: RawHandle) -> Sqe {
+    sqe(slot, handle, Op::Connect, Span::default())
+}
 
 fn sqe(slot: u16, handle: RawHandle, op: Op, buf: Span) -> Sqe {
     Sqe::new(Token::new(slot, 7), handle, &op, buf)
-}
-
-/// A `Stream` on resource 0, its peer written at the arena's start.
-fn stream(slot: u16) -> Sqe {
-    sqe(slot, TTY, Op::Stream, Span::new(0, RawAddr::LEN as u32))
 }
 
 /// A new stream from `peer`.
@@ -159,7 +197,7 @@ fn real_op_resolves_its_descriptor_buffer_and_index() {
     let mut r = rig();
     r.lower(1, read(3, TTY));
     let op = r.only_os();
-    assert_eq!((op.fd, op.class), (r.fd, Class::Tty));
+    assert_eq!((op.fd, op.class, op.make), (r.fds[1], Class::Tty, None));
     assert_eq!(op.id, OpId::new((OPS + 3) as u16, 7));
     assert_eq!(op.buf.unwrap().len(), 16);
     let done = r.done(op.id, Ok(Out::Len(5)));
@@ -354,7 +392,19 @@ fn refusals_reply_without_running() {
         ),
         (sqe(0, TTY, Op::Recv, Span::new(60, 8)), IoError::BadBuf),
         (
-            sqe(0, SIM, Op::Stream, Span::new(0, RawAddr::LEN as u32)),
+            sqe(0, SIM, Op::Accept, Span::new(0, RawAddr::LEN as u32)),
+            IoError::Unsupported,
+        ),
+        (read(0, TTY_CAP), IoError::Unsupported),
+        (read(0, SIM_CAP), IoError::Unsupported),
+        (connect(0, TTY), IoError::Unsupported),
+        (connect(0, SIM), IoError::Unsupported),
+        (
+            sqe(0, TTY_CAP, Op::Listen, Span::default()),
+            IoError::Unsupported,
+        ),
+        (
+            sqe(0, SIM_CAP, Op::Listen, Span::default()),
             IoError::Unsupported,
         ),
     ];
@@ -398,53 +448,97 @@ fn teardown_waits_only_for_ops_on_descriptors() {
 #[test]
 fn closed_grant_is_stale_until_a_remake() {
     let mut r = rig();
-    r.lower(0, sqe(0, TTY, Op::Close, Span::default()));
+    r.lower(0, sqe(0, TTY_CAP, Op::Close, Span::default()));
     assert_eq!(r.replies(), [(0, Cqe::ok(Token::new(0, 7), 0))]);
-    assert!(r.routes().is_empty(), "the resource stays open");
-    for op in [Op::Fsync, Op::Timeout(Duration::ZERO)] {
-        r.lower(0, sqe(1, TTY, op, Span::default()));
+    assert!(r.routes().is_empty(), "its connection stays open");
+    for op in [Op::Connect, Op::Timeout(Duration::ZERO)] {
+        r.lower(0, sqe(1, TTY_CAP, op, Span::default()));
         assert_eq!(r.replies()[0].1.result(), Err(IoError::Stale), "{op:?}");
     }
+    r.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
+    assert_eq!(r.only_os().fd, r.fds[0]);
     r.d.quiesce_member(0);
     r.d.member_drained(0);
     r.d.end_quiescing_member(0);
-    r.lower(0, sqe(1, TTY, Op::Fsync, Span::default()));
-    assert_eq!(r.routes().len(), 1);
+    let _ = r.routes();
+    r.lower(0, connect(2, TTY_CAP));
+    assert!(r.only_os().make.is_some());
 }
 
 #[test]
-fn accepted_stream_is_a_derived_handle() {
+fn a_connect_opens_its_path_with_no_descriptor() {
     let mut r = rig();
-    r.lower(0, stream(0));
+    r.lower(0, connect(1, TTY_CAP));
     let op = r.only_os();
-    let (_, cqe) = r.done(op.id, opened(None)).unwrap();
-    let stream = RawHandle::from_raw(cqe.result().unwrap());
-    assert_eq!(
-        stream,
-        RawHandle::new(2, 1),
-        "past the grants, first generation"
+    assert_eq!((op.fd, op.class, op.buf), (-1, Class::Tty, None));
+    let Some(Make::Open { path, flags }) = op.make else {
+        panic!("{op:?}")
+    };
+    // SAFETY: the recipe keeps its path while the dispatch lives.
+    let path = unsafe { std::ffi::CStr::from_ptr(path.as_ptr()) };
+    assert_eq!(path, c"/dev/null");
+    assert_ne!(flags & libc::O_NONBLOCK, 0);
+    assert!(matches!(r.d.opening(op.id), Some(PathKind::Tty { .. })));
+    assert!(
+        r.d.opening(OpId::new(op.id.index(), 8)).is_none(),
+        "its generation only"
     );
-    r.lower(0, sqe(1, stream, Op::Recv, Span::new(0, 4)));
-    assert_eq!(r.only_os().class, Class::Stream);
-    r.lower(0, sqe(2, stream, Op::Close, Span::default()));
+    assert_eq!(
+        r.done(op.id, Err(IoError::Os(Errno::ENOENT)))
+            .map(|(_, c)| c.result()),
+        Some(Err(IoError::Os(Errno::ENOENT)))
+    );
+    assert!(r.d.opening(op.id).is_none(), "landed");
+}
+
+#[test]
+fn two_connects_are_two_handles_closed_apart() {
+    let mut r = rig();
+    r.lower(0, connect(0, TTY_CAP));
+    let op = r.only_os();
+    let (_, cqe) = r.done(op.id, tty_opened()).unwrap();
+    let second = RawHandle::from_raw(cqe.result().unwrap());
+    assert_eq!(second, RawHandle::new(4, 1), "the next derived slot");
+    r.lower(0, sqe(1, second, Op::Close, Span::default()));
     assert!(matches!(r.routes()[..], [Route::Close(_)]));
-    r.lower(0, sqe(3, stream, Op::Fsync, Span::default()));
+    r.lower(0, sqe(2, second, Op::Fsync, Span::default()));
     assert_eq!(r.replies().last().unwrap().1.result(), Err(IoError::Stale));
+    r.lower(0, sqe(3, TTY, Op::Fsync, Span::default()));
+    assert_eq!(r.only_os().fd, r.fds[0], "the first stays open");
 }
 
 #[test]
 fn full_derived_table_closes_and_refuses() {
     let mut r = rig();
-    let accept = |r: &mut Rig, slot: usize| {
-        r.lower(0, stream(slot as u16));
+    let open = |r: &mut Rig, slot: usize| {
+        r.lower(0, connect(slot as u16, TTY_CAP));
         let op = r.only_os();
-        r.done(op.id, opened(None)).unwrap().1
+        r.done(op.id, tty_opened()).unwrap().1
     };
-    for slot in 0..OPS {
-        assert!(accept(&mut r, slot).result().is_ok());
+    for slot in 2..OPS {
+        assert!(open(&mut r, slot).result().is_ok());
     }
-    assert_eq!(accept(&mut r, 0).result(), Err(IoError::Refused));
+    assert_eq!(open(&mut r, 0).result(), Err(IoError::Refused));
     assert!(matches!(r.routes()[..], [Route::Close(_)]));
+    r.lower(0, connect(1, SIM_CAP));
+    assert_eq!(
+        r.replies()[0].1.result(),
+        Err(IoError::Refused),
+        "a wire too"
+    );
+}
+
+#[test]
+fn closing_a_wire_connection_cancels_its_parked_reads() {
+    let mut r = rig();
+    r.lower(1, read(0, SIM));
+    r.lower(0, read(0, SIM));
+    r.lower(1, sqe(1, SIM, Op::Close, Span::default()));
+    let canceled = (1, Cqe::err(Token::new(0, 7), IoError::Canceled));
+    assert_eq!(r.replies(), [canceled, (1, Cqe::ok(Token::new(1, 7), 0))]);
+    assert!(r.routes().is_empty());
+    r.lower(1, read(2, SIM));
+    assert_eq!(r.replies()[0].1.result(), Err(IoError::Stale));
 }
 
 #[test]
@@ -471,7 +565,7 @@ fn cancel_goes_out_once() {
 fn quiesce_cancels_drops_and_waits() {
     let mut r = rig();
     r.lower(0, read(0, TTY));
-    r.lower(0, stream(1));
+    r.lower(0, connect(1, TTY_CAP));
     let ids: Vec<OpId> = r
         .routes()
         .into_iter()
@@ -491,9 +585,13 @@ fn quiesce_cancels_drops_and_waits() {
     );
     assert!(!r.d.member_idle(0));
     r.d.member_drained(0);
+    assert!(
+        matches!(r.routes()[..], [Route::Close(_)]),
+        "the tty's connection"
+    );
     assert_eq!(r.done(ids[0], Err(IoError::Canceled)), None);
     assert!(!r.d.member_idle(0));
-    assert_eq!(r.done(ids[1], opened(None)), None);
+    assert_eq!(r.done(ids[1], tty_opened()), None);
     assert!(
         matches!(r.routes()[..], [Route::Close(_)]),
         "nothing will close it"
@@ -505,18 +603,25 @@ fn quiesce_cancels_drops_and_waits() {
 #[test]
 fn drain_closes_derived_handles() {
     let mut r = rig();
-    r.lower(0, stream(0));
+    r.lower(0, connect(0, TTY_CAP));
     let op = r.only_os();
-    r.done(op.id, opened(None));
+    r.done(op.id, tty_opened());
     r.d.quiesce_member(0);
     r.d.member_drained(0);
     r.d.member_drained(0);
-    assert!(matches!(r.routes()[..], [Route::Close(_)]));
+    assert!(
+        matches!(r.routes()[..], [Route::Close(_), Route::Close(_)]),
+        "both descriptors; the wire's connection holds none"
+    );
+    r.d.end_quiescing_member(0);
+    r.lower(0, read(0, SIM));
+    assert_eq!(r.replies()[0].1.result(), Err(IoError::Stale));
 }
 
 #[test]
 fn report_writes_changed_resources() {
     let mut r = rig();
+    r.status();
     r.lower(0, read(0, TTY));
     let op = r.only_os();
     r.done(op.id, Ok(Out::Len(4)));
@@ -526,7 +631,8 @@ fn report_writes_changed_resources() {
     assert_eq!(got.len(), 1);
     assert_eq!(
         (got[0].submitted, got[0].completed, got[0].bytes_in),
-        (1, 1, 4)
+        (3, 3, 4),
+        "the rig's two connects, then the read"
     );
     r.d.report(Timestamp(2), &mut out);
     assert_eq!(inp.drain().count(), 0, "unchanged is not written");
@@ -537,8 +643,12 @@ fn lowering_and_raising_allocate_nothing() {
     let mut r = rig();
     let mut ids = Vec::with_capacity(4);
     let n = allocations(|| {
-        for _ in 0..8 {
-            r.lower(0, read(0, TTY));
+        for k in 0..8 {
+            let sqe = match k % 2 {
+                0 => read(0, TTY),
+                _ => connect(0, TTY_CAP),
+            };
+            r.lower(0, sqe);
             ids.extend(r.d.drain_routes().map(|route| match route {
                 Route::Os(op) => op.id,
                 _ => OpId::new(0, 0),
@@ -558,7 +668,7 @@ fn lowering_and_raising_allocate_nothing() {
 fn budgets(ops: &[u16]) -> Result<Dispatch, crate::coordinator::BuildError> {
     let resources = vec![Resource {
         id: "tty".into(),
-        backed: Backed::Fd(null(), Class::Tty),
+        backed: tty(),
     }];
     let grants = || vec![(0.into(), ResourceEnd::Host)];
     let members = ops.iter().map(|&n| member(n, grants())).collect();
@@ -572,8 +682,10 @@ fn fill_every_slot(ops: &[u16]) {
     let arena = super::arena(0);
     for (m, &n) in ops.iter().enumerate() {
         for slot in 0..n {
-            let fsync = sqe(slot, TTY, Op::Fsync, Span::default());
-            assert_eq!(d.lower(m, fsync, &arena, Timestamp(0)), Ok(()));
+            assert_eq!(
+                d.lower(m, connect(slot, TTY_CAP), &arena, Timestamp(0)),
+                Ok(())
+            );
         }
     }
     let ids: Vec<_> = d
@@ -617,7 +729,7 @@ fn each_member_fills_its_own_budget() {
 fn a_slot_past_the_members_budget_is_rejected() {
     let mut d = budgets(&[2, 40]).unwrap();
     let arena = super::arena(0);
-    let past = sqe(2, TTY, Op::Fsync, Span::default());
+    let past = connect(2, TTY_CAP);
     assert_eq!(d.lower(0, past, &arena, Timestamp(0)), Err(Rejected));
     assert_eq!(d.drain_routes().count(), 0);
     assert_eq!(d.lower(1, past, &arena, Timestamp(0)), Ok(()));
@@ -641,17 +753,21 @@ fn held_scales_with_the_budgets_posted() {
     assert_eq!(d.held_for(&[]), 0);
 }
 
-/// Member 0 holds a listener that admits the peers `allow` names, and a
-/// dialer of `10.0.0.9:2240`.
+/// Member 0 holds a listener on `0.0.0.0:2240` that admits the peers
+/// `allow` names, and a dialer of `10.0.0.9:2240`.
 fn endpoints(allow: &[&str]) -> (Dispatch, Arena) {
+    let socket = |kind| Backed::Real(Recipe::Socket(kind));
     let resources = vec![
         Resource {
             id: "listen".into(),
-            backed: Backed::Listen(null(), allow.iter().map(|c| c.parse().unwrap()).collect()),
+            backed: socket(SocketKind::Listen {
+                addr: "0.0.0.0:2240".parse().unwrap(),
+                allow: allow.iter().map(|c| c.parse().unwrap()).collect(),
+            }),
         },
         Resource {
             id: "dial".into(),
-            backed: Backed::Dial("10.0.0.9:2240".parse().unwrap()),
+            backed: socket(SocketKind::Dial("10.0.0.9:2240".parse().unwrap())),
         },
     ];
     let grants = vec![(0.into(), ResourceEnd::Host), (1.into(), ResourceEnd::Host)];
@@ -659,7 +775,41 @@ fn endpoints(allow: &[&str]) -> (Dispatch, Arena) {
     (d.unwrap(), super::arena(64))
 }
 
+const LISTEN: RawHandle = RawHandle::new(0, 0);
 const DIAL: RawHandle = RawHandle::new(1, 0);
+/// The listener [`listen`] opens.
+const LISTENER: RawHandle = RawHandle::new(2, 1);
+
+/// Listens, landing the io step's socket.
+fn listen(d: &mut Dispatch, arena: &Arena) {
+    let sqe = sqe(0, LISTEN, Op::Listen, Span::default());
+    assert_eq!(d.lower(0, sqe, arena, Timestamp(0)), Ok(()));
+    let routes: Vec<Route> = d.drain_routes().collect();
+    let [Route::Socket(id, 0)] = routes[..] else {
+        panic!("{routes:?}")
+    };
+    assert!(matches!(d.socket(0), Some(SocketKind::Listen { .. })));
+    let class = Class::Listener;
+    d.raise(OsDone {
+        id,
+        result: Ok(Out::Opened {
+            fd: null(),
+            class,
+            peer: None,
+        }),
+    });
+    assert_eq!(ready(d)[0].result(), Ok(LISTENER.get()));
+}
+
+/// An `Accept` on the listener, its peer written at the arena's start.
+fn accept(slot: u16) -> Sqe {
+    sqe(
+        slot,
+        LISTENER,
+        Op::Accept,
+        Span::new(0, RawAddr::LEN as u32),
+    )
+}
 
 fn os_ops(d: &mut Dispatch) -> Vec<OsOp> {
     d.drain_routes()
@@ -703,9 +853,10 @@ fn rejected(d: &mut Dispatch) -> u64 {
 #[test]
 fn an_accepted_peer_lands_in_the_buffer() {
     let (mut d, arena) = endpoints(&[]);
-    assert_eq!(d.lower(0, stream(0), &arena, Timestamp(0)), Ok(()));
+    listen(&mut d, &arena);
+    assert_eq!(d.lower(0, accept(1), &arena, Timestamp(0)), Ok(()));
     let [op] = os_ops(&mut d)[..] else { panic!() };
-    assert_eq!((op.class, op.dial), (Class::Listener, None));
+    assert_eq!((op.class, op.make), (Class::Listener, None));
     d.raise(OsDone {
         id: op.id,
         result: opened(Some("10.0.0.7:5000")),
@@ -717,11 +868,11 @@ fn an_accepted_peer_lands_in_the_buffer() {
 #[test]
 fn a_dial_lowers_with_its_address_and_no_descriptor() {
     let (mut d, arena) = endpoints(&[]);
-    let dial = sqe(0, DIAL, Op::Stream, Span::new(0, RawAddr::LEN as u32));
+    let dial = sqe(0, DIAL, Op::Connect, Span::new(0, RawAddr::LEN as u32));
     assert_eq!(d.lower(0, dial, &arena, Timestamp(0)), Ok(()));
     let [op] = os_ops(&mut d)[..] else { panic!() };
-    assert_eq!((op.fd, op.class), (-1, Class::Dialer));
-    assert_eq!(op.dial, Some("10.0.0.9:2240".parse().unwrap()));
+    assert_eq!((op.fd, op.class), (-1, Class::Stream));
+    assert_eq!(op.make, Some(Make::Dial("10.0.0.9:2240".parse().unwrap())));
     d.raise(OsDone {
         id: op.id,
         result: opened(Some("10.0.0.9:2240")),
@@ -731,17 +882,53 @@ fn a_dial_lowers_with_its_address_and_no_descriptor() {
 }
 
 #[test]
-fn a_dialer_takes_only_streams() {
+fn an_endpoint_takes_only_its_own_way_in() {
     let (mut d, arena) = endpoints(&[]);
-    assert_eq!(d.lower(0, read(0, DIAL), &arena, Timestamp(0)), Ok(()));
-    assert!(os_ops(&mut d).is_empty());
-    assert_eq!(ready(&mut d)[0].result(), Err(IoError::Unsupported));
+    let cases = [
+        read(0, DIAL),
+        sqe(0, DIAL, Op::Listen, Span::default()),
+        connect(0, LISTEN),
+        sqe(0, DIAL, Op::Accept, Span::new(0, RawAddr::LEN as u32)),
+    ];
+    for sqe in cases {
+        assert_eq!(d.lower(0, sqe, &arena, Timestamp(0)), Ok(()));
+        assert!(os_ops(&mut d).is_empty());
+        assert_eq!(
+            ready(&mut d)[0].result(),
+            Err(IoError::Unsupported),
+            "{sqe:?}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_listen_opens_nothing() {
+    let (mut d, arena) = endpoints(&[]);
+    d.lower(
+        0,
+        sqe(0, LISTEN, Op::Listen, Span::default()),
+        &arena,
+        Timestamp(0),
+    )
+    .unwrap();
+    let [Route::Socket(id, 0)] = d.drain_routes().collect::<Vec<_>>()[..] else {
+        panic!()
+    };
+    let taken = IoError::Os(Errno::EADDRINUSE);
+    d.raise(OsDone {
+        id,
+        result: Err(taken),
+    });
+    assert_eq!(ready(&mut d)[0].result(), Err(taken));
+    d.lower(0, accept(1), &arena, Timestamp(0)).unwrap();
+    assert_eq!(ready(&mut d)[0].result(), Err(IoError::Stale));
 }
 
 #[test]
 fn a_rejected_peer_is_closed_and_refused() {
     let (mut d, arena) = endpoints(&["10.0.0.0/24"]);
-    d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
+    listen(&mut d, &arena);
+    d.lower(0, accept(0), &arena, Timestamp(0)).unwrap();
     let [op] = os_ops(&mut d)[..] else { panic!() };
     d.raise(OsDone {
         id: op.id,
@@ -753,7 +940,7 @@ fn a_rejected_peer_is_closed_and_refused() {
     ));
     assert_eq!(ready(&mut d)[0].result(), Err(IoError::Refused));
     assert_eq!(rejected(&mut d), 1);
-    d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
+    d.lower(0, accept(0), &arena, Timestamp(0)).unwrap();
     let [op] = os_ops(&mut d)[..] else { panic!() };
     d.raise(OsDone {
         id: op.id,
@@ -766,7 +953,8 @@ fn a_rejected_peer_is_closed_and_refused() {
 #[test]
 fn an_allow_list_refuses_a_stream_with_no_peer() {
     let (mut d, arena) = endpoints(&["0.0.0.0/0"]);
-    d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
+    listen(&mut d, &arena);
+    d.lower(0, accept(0), &arena, Timestamp(0)).unwrap();
     let [op] = os_ops(&mut d)[..] else { panic!() };
     d.raise(OsDone {
         id: op.id,
@@ -779,7 +967,8 @@ fn an_allow_list_refuses_a_stream_with_no_peer() {
 #[test]
 fn a_quiescing_member_never_sees_a_rejected_peer() {
     let (mut d, arena) = endpoints(&["10.0.0.0/24"]);
-    d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
+    listen(&mut d, &arena);
+    d.lower(0, accept(0), &arena, Timestamp(0)).unwrap();
     let [op] = os_ops(&mut d)[..] else { panic!() };
     d.quiesce_member(0);
     let _ = d.drain_routes();
@@ -798,10 +987,16 @@ fn a_quiescing_member_never_sees_a_rejected_peer() {
 #[test]
 fn a_short_peer_buffer_is_bad_buf() {
     let (mut d, arena) = endpoints(&[]);
-    let short = sqe(0, TTY, Op::Stream, Span::new(0, RawAddr::LEN as u32 - 1));
-    assert_eq!(d.lower(0, short, &arena, Timestamp(0)), Ok(()));
-    assert!(os_ops(&mut d).is_empty());
-    assert_eq!(ready(&mut d)[0].result(), Err(IoError::BadBuf));
+    listen(&mut d, &arena);
+    let span = Span::new(0, RawAddr::LEN as u32 - 1);
+    for short in [
+        sqe(0, LISTENER, Op::Accept, span),
+        sqe(0, DIAL, Op::Connect, span),
+    ] {
+        assert_eq!(d.lower(0, short, &arena, Timestamp(0)), Ok(()));
+        assert!(os_ops(&mut d).is_empty());
+        assert_eq!(ready(&mut d)[0].result(), Err(IoError::BadBuf));
+    }
 }
 
 fn timeout(slot: u16, micros: u64) -> Sqe {
@@ -915,7 +1110,8 @@ fn a_rearmed_slot_lands_once_for_its_new_generation() {
 #[test]
 fn teardown_completes_an_op_waiting_to_be_lowered() {
     let (mut d, arena) = endpoints(&["10.0.0.0/24"]);
-    d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
+    listen(&mut d, &arena);
+    d.lower(0, accept(0), &arena, Timestamp(0)).unwrap();
     let [op] = os_ops(&mut d)[..] else { panic!() };
     d.raise(OsDone {
         id: op.id,

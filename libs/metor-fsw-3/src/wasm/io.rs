@@ -31,7 +31,7 @@ pub(super) struct IoCopy {
 struct Read {
     token: Token,
     span: Span,
-    /// Whether a success fills a `RawAddr`, as a `Stream`'s peer does,
+    /// Whether a success fills a `RawAddr`, as a stream's peer does,
     /// rather than the length the completion reports.
     peer: bool,
 }
@@ -94,7 +94,7 @@ impl IoCopy {
                 *read = Some(Read {
                     token: sqe.token,
                     span: sqe.buf,
-                    peer: op == Op::Stream,
+                    peer: matches!(op, Op::Accept | Op::Connect),
                 });
             }
             if op.drains()
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn a_stream_copies_its_whole_peer() {
         let mut rig = rig();
-        let token = rig.submit(0, Op::Stream, Span::new(3, 8));
+        let token = rig.submit(0, Op::Accept, Span::new(3, 8));
         rig.copy.submissions().unwrap();
         // SAFETY: nothing else touches the mirror during the test.
         unsafe { rig.mirror.get_slice(Span::new(3, 8)).unwrap().as_mut() }

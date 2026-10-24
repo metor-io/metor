@@ -25,7 +25,7 @@ use raw::{RawRing, RawSlice};
 /// The ABI version of the exports in this module.
 ///
 /// The host refuses to load a pack whose version does not match its own.
-pub const ABI_VERSION: u32 = 14;
+pub const ABI_VERSION: u32 = 15;
 
 /// The status word [`execute`] returns.
 ///

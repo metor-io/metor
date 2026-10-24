@@ -1,9 +1,9 @@
 //! `UringOs`: ops on its own io_uring instance.
 //!
-//! Reads, writes, sends, receives, accepts, connects, and fsyncs go to the
-//! kernel.
-//! Tty and GPIO ioctls and opens run inline in `push`, since io_uring has no
-//! generic ioctl op, and their results come back from the next `reap`.
+//! Reads, writes, sends, receives, accepts, dials, a connect's open, and
+//! fsyncs go to the kernel. Tty and GPIO ioctls and opens under a directory
+//! run inline in `push`, since io_uring has no generic ioctl op, and their
+//! results come back from the next `reap`.
 
 use core::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -12,7 +12,7 @@ use io_uring::squeue::Entry;
 use io_uring::types::{CancelBuilder, Fd};
 use io_uring::{IoUring, opcode};
 
-use super::{Class, OpId, Os, OsDone, OsOp, Out, sys};
+use super::{Class, Make, OpId, Os, OsDone, OsOp, Out, sys};
 use crate::io::{CURRENT_POSITION, Errno, IoError, Op};
 
 /// Set in the `user_data` of a cancel, whose completion is dropped.
@@ -33,8 +33,10 @@ enum NewFd {
     #[default]
     None,
     Accept,
-    /// The socket a connect runs on, and where it connects.
-    Connect(OwnedFd, SocketAddr),
+    /// The socket a dial runs on, and where it connects.
+    Dial(OwnedFd, SocketAddr),
+    /// An open, and the class of its descriptor.
+    Open(Class),
 }
 
 /// The `Os` for Linux targets.
@@ -80,16 +82,16 @@ impl UringOs {
         let buf = op.bytes();
         let (ptr, len) = (buf.cast::<u8>().as_ptr(), buf.len() as u32);
         let at = |offset: Option<u64>| offset.unwrap_or(CURRENT_POSITION);
-        let entry = match (op.op, op.class) {
-            (Op::Read { offset }, _) => opcode::Read::new(fd, ptr, len).offset(at(offset)).build(),
-            (Op::Write { offset }, _) => {
+        let entry = match (op.op, op.class, op.make) {
+            (Op::Read { offset }, ..) => opcode::Read::new(fd, ptr, len).offset(at(offset)).build(),
+            (Op::Write { offset }, ..) => {
                 opcode::Write::new(fd, ptr, len).offset(at(offset)).build()
             }
-            (Op::Recv, _) => opcode::Recv::new(fd, ptr, len).build(),
-            (Op::Send, _) => opcode::Send::new(fd, ptr, len)
+            (Op::Recv, ..) => opcode::Recv::new(fd, ptr, len).build(),
+            (Op::Send, ..) => opcode::Send::new(fd, ptr, len)
                 .flags(sys::SEND_FLAGS)
                 .build(),
-            (Op::SendTo(addr), _) => {
+            (Op::SendTo(addr), ..) => {
                 let (ss, sl) = sys::sockaddr(addr);
                 msg.addr = ss;
                 msg.iov = libc::iovec {
@@ -104,7 +106,7 @@ impl UringOs {
                     .flags(sys::SEND_FLAGS as u32)
                     .build()
             }
-            (Op::Stream, Class::Listener) => {
+            (Op::Accept, Class::Listener, _) => {
                 let flags = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
                 msg.addr_len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
                 let addr = (&raw mut msg.addr).cast();
@@ -113,15 +115,22 @@ impl UringOs {
                     .flags(flags)
                     .build()
             }
-            (Op::Stream, Class::Dialer) => {
-                let to = op.dial.ok_or(IoError::Unsupported)?;
+            (Op::Connect, _, Some(Make::Dial(to))) => {
                 let socket = sys::stream_socket(to)?;
                 (msg.addr, msg.addr_len) = sys::sockaddr(to);
                 let fd = Fd(socket.as_raw_fd());
-                *new_fd = NewFd::Connect(socket, to);
+                *new_fd = NewFd::Dial(socket, to);
                 opcode::Connect::new(fd, (&raw const msg.addr).cast(), msg.addr_len).build()
             }
-            (Op::Fsync, _) => opcode::Fsync::new(fd).build(),
+            // The kernel copies the path when it takes the entry.
+            (Op::Connect, class, Some(Make::Open { path, flags })) => {
+                *new_fd = NewFd::Open(class);
+                opcode::OpenAt::new(Fd(libc::AT_FDCWD), path.as_ptr())
+                    .flags(flags)
+                    .mode(sys::CREATE_MODE)
+                    .build()
+            }
+            (Op::Fsync, ..) => opcode::Fsync::new(fd).build(),
             _ => return Ok(None),
         };
         Ok(Some(entry.user_data(u64::from(op.id.get()))))
@@ -232,10 +241,16 @@ fn finished(opens: &mut [NewFd], msgs: &[Msg], id: OpId, res: i32) -> Result<Out
             class: Class::Stream,
             peer: msgs.get(index).and_then(|m| sys::socket_addr(&m.addr)),
         }),
-        (_, Some(NewFd::Connect(fd, to))) => Ok(Out::Opened {
+        (_, Some(NewFd::Dial(fd, to))) => Ok(Out::Opened {
             fd,
             class: Class::Stream,
             peer: Some(to),
+        }),
+        (_, Some(NewFd::Open(class))) => Ok(Out::Opened {
+            // SAFETY: an open's result is a new descriptor, now owned here.
+            fd: unsafe { OwnedFd::from_raw_fd(res) },
+            class,
+            peer: None,
         }),
         _ => Ok(Out::Len(res as u32)),
     }

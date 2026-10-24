@@ -7,7 +7,7 @@ use core::ptr::NonNull;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use super::{Class, OsOp, Out};
+use super::{Class, Make, OsOp, Out};
 use crate::io::{
     Baud, DataBits, Errno, Flow, IoError, Op, OpenFlags, Parity, StopBits, TtyConfig, TtyQueue,
 };
@@ -23,6 +23,14 @@ pub(crate) fn errno() -> IoError {
     let raw = std::io::Error::last_os_error().raw_os_error();
     IoError::Os(raw.and_then(linux).unwrap_or(Errno::EIO))
 }
+
+/// `e` as an `IoError`, or `EIO` for an error with no Linux errno.
+pub(crate) fn os(e: std::io::Error) -> IoError {
+    IoError::Os(e.raw_os_error().and_then(linux).unwrap_or(Errno::EIO))
+}
+
+/// The permission bits of a file a connect creates, before the umask.
+pub(super) const CREATE_MODE: libc::mode_t = 0o666;
 
 #[cfg(target_os = "linux")]
 pub(super) fn linux(raw: i32) -> Option<Errno> {
@@ -64,14 +72,16 @@ pub(super) fn run(op: &OsOp) -> Result<Out, IoError> {
                 libc::sendto(fd, ptr, len, SEND_FLAGS, (&raw const ss).cast(), sl)
             }
             Op::Fsync => libc::fsync(fd) as isize,
-            Op::Stream if op.class == Class::Listener => return accept(fd),
-            Op::Stream => return Err(IoError::Unsupported),
+            Op::Accept if op.class == Class::Listener => return accept(fd),
+            Op::Connect => return open_path(op),
             Op::Open(flags) => return open_at(fd, buf, flags),
             Op::TtyConfigure(cfg) => return configure(fd, &cfg).map(|()| Out::len(0)),
             Op::TtyFlush(queue) => return flush(fd, queue).map(|()| Out::Len(0)),
             Op::GpioGet => return gpio(fd, None).map(Out::Len),
             Op::GpioSet(level) => return gpio(fd, Some(level)).map(Out::Len),
-            Op::Close | Op::Cancel | Op::Timeout(_) => return Err(IoError::Unsupported),
+            Op::Accept | Op::Listen | Op::Close | Op::Cancel | Op::Timeout(_) => {
+                return Err(IoError::Unsupported);
+            }
         }
     };
     cvt(n).map(|n| Out::Len(n as u32))
@@ -190,6 +200,21 @@ pub(super) fn socket_addr(ss: &libc::sockaddr_storage) -> Option<SocketAddr> {
         }
         _ => None,
     }
+}
+
+/// Opens a connect's path.
+fn open_path(op: &OsOp) -> Result<Out, IoError> {
+    let Some(Make::Open { path, flags }) = op.make else {
+        return Err(IoError::Unsupported);
+    };
+    // SAFETY: `path` is a NUL-terminated path its recipe keeps alive.
+    let raw = cvt(unsafe { libc::open(path.as_ptr(), flags, libc::c_uint::from(CREATE_MODE)) })?;
+    Ok(Out::Opened {
+        // SAFETY: `open` returned a new descriptor, now owned here.
+        fd: unsafe { OwnedFd::from_raw_fd(raw) },
+        class: op.class,
+        peer: None,
+    })
 }
 
 /// Opens the path in `path`'s bytes under directory `dir`.

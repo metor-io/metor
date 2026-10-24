@@ -2,7 +2,8 @@
 //!
 //! [`cap`] gives a system a `Cap<K>` and lends the test the other end of its
 //! queue, a [`TestPort`], to answer each op by hand. A driver and a model are
-//! tested the same way: each is a system with a `Cap`.
+//! tested the same way: each is a system with a `Cap`. A `Connect` is
+//! answered with [`Request::open`], which hands out a new handle.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -70,6 +71,7 @@ pub fn cap_with_ops<K: Interface>(ops: u16) -> (Cap<K>, TestIo) {
         timers: Vec::with_capacity(usize::from(ops)),
         now: Timestamp(0),
         cursor: 0,
+        opened: 0,
     };
     let cap = Cap::new(Handle::new(io.next_grant(), io.clone()));
     let test = TestIo {
@@ -136,6 +138,8 @@ pub struct TestPort {
     timers: Vec<(Token, Timestamp)>,
     now: Timestamp,
     cursor: usize,
+    /// The handles `Request::open` has handed out.
+    opened: u16,
 }
 
 impl TestPort {
@@ -245,6 +249,23 @@ impl Request<'_> {
         self.port.held[self.at].handle
     }
 
+    /// Whether the op was submitted on the capability, not on a handle it
+    /// opened.
+    pub fn on_cap(&self) -> bool {
+        self.handle().generation() == 0
+    }
+
+    /// Answers an op that opens a handle with a new one, after the
+    /// capability's grants, and returns it.
+    pub fn open(mut self) -> RawHandle {
+        self.port.opened += 1;
+        let handle = RawHandle::new(0x100 + self.port.opened, 1);
+        let token = self.port.held.remove(self.at).token;
+        let _ = self.port.replies.write(&Cqe::ok(token, handle.get()));
+        self.answered = true;
+        handle
+    }
+
     /// The op's buffer: the whole capacity for an op that fills it, the
     /// filled bytes otherwise.
     pub fn buf(&mut self) -> &mut [u8] {
@@ -285,6 +306,7 @@ pub struct ScriptedUart {
     fail_write: Option<Errno>,
     short_write: Option<usize>,
     config: Option<TtyConfig>,
+    connects: usize,
 }
 
 impl ScriptedUart {
@@ -325,15 +347,30 @@ impl ScriptedUart {
     pub fn config(&self) -> Option<TtyConfig> {
         self.config
     }
+
+    /// How many connects it has answered.
+    pub fn connects(&self) -> usize {
+        self.connects
+    }
 }
 
 impl ScriptedUart {
-    /// Answers every op on `port` once: a read takes the next chunk, a write
-    /// is recorded, and a configure is kept. A read with nothing to send
-    /// waits.
+    /// Answers every op on `port` once: a connect opens a handle, a read
+    /// takes the next chunk, a write is recorded, and a configure is kept. A
+    /// read with nothing to send waits. A data op on the capability is
+    /// `Unsupported`, as the dispatch has it.
     pub fn serve(&mut self, port: &mut TestPort) {
         let mut reqs = port.requests();
         while let Some(mut req) = reqs.next() {
+            if req.op() == Op::Connect {
+                self.connects += 1;
+                req.open();
+                continue;
+            }
+            if req.on_cap() {
+                req.done(Err(IoError::Unsupported));
+                continue;
+            }
             let result = match req.op() {
                 Op::Read { .. } => match self.rx(req.buf()) {
                     Some(n) => Ok(n),
@@ -344,7 +381,7 @@ impl ScriptedUart {
                     self.config = Some(cfg);
                     Ok(0)
                 }
-                Op::TtyFlush(_) => Ok(0),
+                Op::TtyFlush(_) | Op::Close => Ok(0),
                 _ => Err(IoError::Unsupported),
             };
             req.done(result);

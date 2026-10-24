@@ -12,14 +12,17 @@ use metor_proto_wkt::LogEvent;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use std::os::fd::OwnedFd;
+
 use super::dispatch::Dispatch;
-use super::{Host, MemberQueue, Os, OsDone, Route};
+use super::recipe::PathKind;
+use super::{Class, Host, MemberQueue, Os, OsDone, Out, Route, open};
 use crate::coordinator::{Adapters, MakeCx, MakeError, Step, StepCx, SystemKind, TableEntry};
 use crate::def::{DefCx, DefError};
 use crate::fn_system::LOG_PORT;
-use crate::io::IoState;
 use crate::io::arena::Arena;
 use crate::io::status::ResourceStatus;
+use crate::io::{IoError, IoState};
 use crate::log::LogPort;
 use crate::port::Output;
 use crate::system::{PortDef, SystemDef};
@@ -107,6 +110,23 @@ fn make(cx: MakeCx<'_>) -> Result<Box<dyn Step>, MakeError> {
         log: LogPort::new(writer(log)),
         done: Vec::with_capacity(2 * ops),
     }))
+}
+
+/// A made socket as an open's result.
+fn opened((fd, class): (OwnedFd, Class)) -> Out {
+    Out::Opened {
+        fd,
+        class,
+        peer: None,
+    }
+}
+
+/// Configures an opened path's descriptor. A failure closes it.
+fn configure(kind: &PathKind, out: Out) -> Result<Out, IoError> {
+    match out {
+        Out::Opened { fd, .. } => open::configure(kind, fd).map(opened),
+        len => Ok(len),
+    }
 }
 
 fn writer<T: crate::Record + ?Sized>(ring: &RingBuffer) -> Output<T> {
@@ -202,17 +222,29 @@ impl IoStep {
     }
 
     /// Carries the routes out on the backend, then raises what it finished.
+    /// An opened path is configured before it is raised.
     fn run(&mut self, dispatch: &mut Dispatch, os: &mut dyn Os) {
-        for route in dispatch.drain_routes() {
+        let mut routes = dispatch.take_routes();
+        for route in routes.drain(..) {
             match route {
                 Route::Os(op) => os.push(op),
                 Route::Cancel(id) => os.cancel(id),
                 Route::Close(fd) => os.close(fd),
+                Route::Socket(id, res) => {
+                    let made = dispatch.socket(res).ok_or(IoError::Unsupported);
+                    let result = made.and_then(open::make_socket).map(opened);
+                    self.done.push(OsDone { id, result });
+                }
             }
         }
+        dispatch.put_routes(routes);
         os.submit();
         os.reap(&mut self.done);
-        for done in self.done.drain(..) {
+        for mut done in self.done.drain(..) {
+            if let (Some(kind), Ok(Out::Opened { .. })) = (dispatch.opening(done.id), &done.result)
+            {
+                done.result = done.result.and_then(|out| configure(kind, out));
+            }
             dispatch.raise(done);
         }
     }

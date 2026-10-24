@@ -18,6 +18,7 @@ use wire::Wire;
 pub(crate) mod dispatch;
 mod open;
 mod poll;
+pub(crate) mod recipe;
 mod steps;
 mod sys;
 #[cfg(target_os = "linux")]
@@ -25,8 +26,9 @@ mod uring;
 pub(crate) mod wire;
 
 pub(crate) use dispatch::{Backed, Dispatch, MemberDef, Route};
-pub use open::{OpenError, open, resolve};
+pub use open::{OpenError, resolve};
 pub use poll::PollOs;
+use recipe::Recipe;
 pub(crate) use steps::entry;
 pub use steps::{IO_STATUS_PORT, IO_TYPE};
 #[cfg(target_os = "linux")]
@@ -42,8 +44,6 @@ pub enum Class {
     Stream,
     Datagram,
     Listener,
-    /// No descriptor until an op dials one.
-    Dialer,
     Tty,
     File,
     Dir,
@@ -55,7 +55,7 @@ impl Class {
     pub fn polled(self) -> bool {
         matches!(
             self,
-            Self::Stream | Self::Datagram | Self::Listener | Self::Dialer | Self::Tty
+            Self::Stream | Self::Datagram | Self::Listener | Self::Tty
         )
     }
 }
@@ -70,13 +70,26 @@ pub type OpId = Generational<DispatchTable>;
 #[derive(Clone, Copy, Debug)]
 pub struct OsOp {
     pub id: OpId,
-    /// `-1` for a `Dialer`, which has none.
+    /// `-1` for a `Connect`, which makes its own.
     pub fd: RawFd,
+    /// The class of the op's descriptor, or of the one a `Connect` makes.
     pub class: Class,
     pub op: Op,
     pub buf: Option<NonNull<[u8]>>,
-    /// Where a `Dialer`'s `Stream` connects.
-    pub dial: Option<SocketAddr>,
+    /// How a `Connect` makes its descriptor.
+    pub make: Option<Make>,
+}
+
+/// How a `Connect` makes its descriptor on the backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Make {
+    /// Opens this NUL-terminated path with these host `open` flags.
+    Open {
+        path: NonNull<libc::c_char>,
+        flags: libc::c_int,
+    },
+    /// Connects a new TCP socket to this address.
+    Dial(SocketAddr),
 }
 
 impl OsOp {
@@ -89,7 +102,20 @@ impl OsOp {
     /// Whether the op waits for its descriptor to take writes: a write, or
     /// a dial's connect.
     pub(crate) fn waits_to_write(&self) -> bool {
-        self.op.writes() || self.class == Class::Dialer
+        self.op.writes() || self.dials().is_some()
+    }
+
+    /// Where the op dials, if it is a dial.
+    pub(crate) fn dials(&self) -> Option<SocketAddr> {
+        match self.make {
+            Some(Make::Dial(to)) => Some(to),
+            _ => None,
+        }
+    }
+
+    /// Whether a not-ready descriptor parks the op. An open never parks.
+    pub(crate) fn parks(&self) -> bool {
+        self.class.polled() && !matches!(self.make, Some(Make::Open { .. }))
     }
 }
 
@@ -203,8 +229,8 @@ impl Host {
                 match route {
                     Route::Cancel(id) => os.cancel(id),
                     Route::Close(fd) => os.close(fd),
-                    Route::Os(op) => dispatch.raise(OsDone {
-                        id: op.id,
+                    Route::Os(OsOp { id, .. }) | Route::Socket(id, _) => dispatch.raise(OsDone {
+                        id,
                         result: Err(IoError::Canceled),
                     }),
                 }
@@ -225,8 +251,9 @@ impl Host {
 
 impl IoState {
     /// A target's IO: one member per system with a `Cap`, given as its id and
-    /// def, in config order. Opens every real resource a member holds, makes
-    /// a wire for each sim one, and the backend.
+    /// def, in config order. Resolves the recipe of every real resource a
+    /// member holds, makes a wire for each sim one, and the backend. Nothing
+    /// opens until a system connects.
     pub(crate) fn build(
         resources: &IndexMap<String, Backing>,
         members: Vec<(String, MemberDef)>,
@@ -245,7 +272,7 @@ impl IoState {
             .enumerate()
             .map(|(index, (id, backing))| {
                 let held = ResourceIndex::try_from(index).is_ok_and(|r| held.contains(&r));
-                Resource::open(id, backing, held, ops, &mut wires)
+                Resource::new(id, backing, held, ops, &mut wires)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut io = Self::with_members(members.iter().map(|(id, _)| id.as_str()));
@@ -265,34 +292,25 @@ impl IoState {
 }
 
 impl Resource {
-    /// Resource `id`, opened if it is `held`, or wired by adding its wire to
-    /// `wires`. A wire parks at most `ops` ops per end.
-    fn open(
+    /// Resource `id`, with its recipe if it is `held`, or wired by adding its
+    /// wire to `wires`. A wire parks at most `ops` ops per end.
+    fn new(
         id: &str,
         backing: &Backing,
         held: bool,
         ops: usize,
         wires: &mut Vec<Wire>,
     ) -> Result<Self, BuildError> {
-        let failed = |e: OpenError| BuildError::Open {
-            resource: id.to_string(),
-            message: e.to_string(),
-        };
         let backed = match backing {
             Backing::Sim(sim) if held => {
                 wires.push(Wire::new(sim.kind, ops));
                 Backed::Wire(wires.len() - 1)
             }
-            Backing::Real(RealKind::TcpDial { addr }) if held => {
-                Backed::Dial(resolve(addr).map_err(failed)?)
-            }
-            Backing::Real(kind @ RealKind::TcpListen { allow, .. }) if held => {
-                let (fd, _) = open(kind).map_err(failed)?;
-                Backed::Listen(fd, allow.as_slice().into())
-            }
             Backing::Real(kind) if held => {
-                let (fd, class) = open(kind).map_err(failed)?;
-                Backed::Fd(fd, class)
+                Backed::Real(Recipe::new(kind).map_err(|e| BuildError::Open {
+                    resource: id.to_string(),
+                    message: e.to_string(),
+                })?)
             }
             _ => Backed::Unused,
         };
