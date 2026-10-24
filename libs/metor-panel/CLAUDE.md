@@ -56,7 +56,7 @@ A unified row-list overlay that serves as both command palette (centered) and ri
 
 Concrete renderers — plots (`time_series`, `xy_plot`, `list_plot`), the component outline (`outline`, a collapsible tree-table with pivots, on the generic `table`), 3D scene (`viewer_3d`, built on Bevy as a render pipeline embedded in gpui via wgpu), traffic lights, value strips, dashboards, etc. They bind components through `views/binding.rs` and emit `Inspectable` rows.
 
-Scalar instruments (`meter`, `gauge`, `attitude`) share `views/binding.rs`, which owns stream seeding, late metadata binding, and reading warn/critical limits out of the alarm store. A new instrument binds through it rather than growing its own copy, and never takes limits as configuration.
+Scalar instruments (`meter`, `gauge`, `attitude`) share `views/binding.rs`, which owns stream seeding, late metadata binding, and reading warn/critical limits out of the alarm store. A new instrument binds through it rather than growing its own copy, and never takes limits as configuration: editable binding fields stay on the instrument (the inspector reflects fields by index and can't flatten a nested struct), and the stream machinery is one opaque `LiveBinding<V>` field beside them (the inspector edits the fields, `LiveBinding::moved` notices).
 
 Every one of those is registered on **both** surfaces from a single config type: one `WidgetSpec` in `views/dashboard/widgets.rs`, whose `.with_tile(key, …)` makes `ItemRegistry::register_view` serve it as a pane too (a `RegisteredPane`). Don't add a typed `PaneItem` wrapper for it. `TrafficLight` is the reference for the pattern; a renamed key keeps old layouts loading with `ItemRegistry::alias`.
 

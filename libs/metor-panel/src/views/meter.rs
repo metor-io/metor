@@ -21,7 +21,9 @@ use gpui::{
 use metor_db::DB;
 use serde::{Deserialize, Serialize};
 
-use super::binding::{self, ElementRef, component_meta, spawn_meta_resolver, spawn_scalar_stream};
+use super::binding::{
+    self, ElementRef, LiveBinding, ScalarInstrument, component_meta, default_label, stream_scalar,
+};
 use super::format_number;
 use crate::theme::{theme, ui_px};
 
@@ -94,58 +96,29 @@ pub struct Meter {
     pub color: Hsla,
     pub show_value: bool,
     pub show_limits: bool,
-    /// What `_task` is actually streaming, compared against the editable
-    /// fields each frame.
     #[facet(opaque)]
-    bound: Option<ElementRef>,
-    #[facet(skip)]
-    value: Option<f64>,
-    #[facet(opaque)]
-    db: Arc<DB>,
-    #[facet(opaque)]
-    _binding_changes: gpui::Task<()>,
-    #[facet(opaque)]
-    _task: gpui::Task<()>,
-    #[facet(opaque)]
-    _resolver_task: gpui::Task<()>,
+    live: LiveBinding<f64>,
+}
+
+impl ScalarInstrument for Meter {
+    fn scalar(&mut self) -> (&mut SharedString, &mut SharedString, &mut LiveBinding<f64>) {
+        (&mut self.label, &mut self.unit, &mut self.live)
+    }
 }
 
 impl Meter {
     pub fn from_config(cfg: &MeterConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
-        let component_id = source.id();
-        let element = cfg.element;
-        let at = ElementRef::new(component_id, element);
-        let meta = component_meta(&db, component_id);
-
-        let task =
-            spawn_scalar_stream(db.clone(), component_id, element, cx, |meter, value, cx| {
-                meter.value = value;
-                cx.notify();
-            });
-
-        // Only metadata-derived fields refresh on late registration; an
-        // explicitly configured label or unit is the operator's, not the
-        // component's.
-        let keep_label = cfg.label.is_some();
-        let keep_unit = cfg.unit.is_some();
-        let resolver_task =
-            spawn_meta_resolver(db.clone(), component_id, cx, move |meter, meta, cx| {
-                if !keep_label {
-                    meter.label = default_label(&meta.element_names, element, &meta.name);
-                }
-                if !keep_unit {
-                    meter.unit = meta.unit;
-                }
-                cx.notify();
-            });
-
+        let at = ElementRef::new(source.id(), cfg.element);
+        let meta = component_meta(&db, at.component);
+        let mut live = LiveBinding::new(at, db, cx);
+        stream_scalar(&mut live, at, cfg.label.is_some(), cfg.unit.is_some(), cx);
         Self {
             label: cfg
                 .label
                 .clone()
                 .map(SharedString::from)
-                .unwrap_or_else(|| default_label(&meta.element_names, element, &meta.name)),
+                .unwrap_or_else(|| default_label(&meta.element_names, at.element, &meta.name)),
             min: cfg.min,
             max: cfg.max,
             unit: cfg
@@ -158,13 +131,8 @@ impl Meter {
             show_value: !cfg.hide_value,
             show_limits: !cfg.hide_limits,
             source,
-            element,
-            bound: Some(at),
-            value: None,
-            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
-            db,
-            _task: task,
-            _resolver_task: resolver_task,
+            element: cfg.element,
+            live,
         }
     }
 
@@ -173,55 +141,21 @@ impl Meter {
         ElementRef::new(self.source.id(), self.element)
     }
 
-    /// Restart the stream when the inspector has re-pointed the meter.
-    ///
-    /// Label and unit are re-derived from the new component: they described
-    /// the old one, and carrying them across would leave a bar labelled
-    /// `gyro_b.x` reading wheel momentum. A value from the previous binding
-    /// is dropped rather than left on screen under the new scale.
-    pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
-        self.source.resolve(&self.db, cx);
-        let want = self.at();
-        if !binding::rebound(want, &mut self.bound) {
-            return;
+    /// Restart the stream when the inspector has re-pointed the meter. Label
+    /// and unit described the old component, so they are re-derived.
+    fn rebind(&mut self, cx: &mut Context<Self>) {
+        if let Some((at, meta)) = self.live.moved(&mut self.source, self.element, cx) {
+            self.label = default_label(&meta.element_names, at.element, &meta.name);
+            self.unit = meta.unit;
+            stream_scalar(&mut self.live, at, false, false, cx);
         }
-
-        let element = want.element;
-        let meta = component_meta(&self.db, want.component);
-        self.label = default_label(&meta.element_names, element, &meta.name);
-        self.unit = meta.unit;
-        self.value = None;
-        self._task = spawn_scalar_stream(
-            self.db.clone(),
-            want.component,
-            element,
-            cx,
-            |meter, value, cx| {
-                meter.value = value;
-                cx.notify();
-            },
-        );
-        self._resolver_task = spawn_meta_resolver(
-            self.db.clone(),
-            want.component,
-            cx,
-            move |meter, meta, cx| {
-                meter.label = default_label(&meta.element_names, element, &meta.name);
-                meter.unit = meta.unit;
-                cx.notify();
-            },
-        );
     }
 
     pub fn to_config(&self) -> MeterConfig {
         MeterConfig {
-            // Resolve the name for whatever is bound *now*, so a rebind is
-            // what gets saved; the configured name is only the fallback for a
-            // component nothing has registered.
-            // An expression's component is named by a content hash and
-            // labelled with the text that made it, so what round-trips is the
-            // text — a name would rehydrate onto nothing.
-            component: self.source.text(&self.db),
+            // An expression's component is named by a content hash, so what
+            // round-trips is the text of whatever is bound now.
+            component: self.source.text(&self.live.db),
             element: self.element,
             label: Some(self.label.to_string()),
             min: self.min,
@@ -232,24 +166,6 @@ impl Meter {
             hide_value: !self.show_value,
             hide_limits: !self.show_limits,
         }
-    }
-}
-
-/// The element's own name when the component has more than one, else the
-/// component's — a single-element meter labelled `"[0]"` tells the operator
-/// nothing.
-pub(crate) fn default_label(
-    element_names: &[SharedString],
-    element: usize,
-    component_name: &SharedString,
-) -> SharedString {
-    if element_names.len() > 1 {
-        element_names
-            .get(element)
-            .cloned()
-            .unwrap_or_else(|| component_name.clone())
-    } else {
-        component_name.clone()
     }
 }
 
@@ -335,7 +251,7 @@ impl Render for Meter {
         } else {
             Vec::new()
         };
-        let span = self.value.map(|v| fill_span(v, min, max));
+        let span = self.live.value.map(|v| fill_span(v, min, max));
 
         let bar = canvas(
             move |bounds, _window, _cx| bounds,
@@ -381,7 +297,7 @@ impl Render for Meter {
         tile = tile.child(bar);
 
         if self.show_value {
-            let value = match self.value {
+            let value = match self.live.value {
                 Some(v) => format_number(v),
                 None => "—".to_string(),
             };
@@ -500,15 +416,5 @@ mod tests {
         assert_eq!(limit_position(0.5, 0.0, 1.0), Some(0.5));
         assert_eq!(limit_position(2.0, 0.0, 1.0), None);
         assert_eq!(limit_position(-2.0, 0.0, 1.0), None);
-    }
-
-    #[test]
-    fn label_prefers_the_element_name_only_when_there_are_several() {
-        let comp = SharedString::from("plant.wheels");
-        let many: Vec<SharedString> = vec!["x".into(), "y".into(), "z".into()];
-        assert_eq!(default_label(&many, 1, &comp), SharedString::from("y"));
-        let one: Vec<SharedString> = vec!["[0]".into()];
-        assert_eq!(default_label(&one, 0, &comp), comp);
-        assert_eq!(default_label(&many, 9, &comp), comp);
     }
 }

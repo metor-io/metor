@@ -21,7 +21,9 @@ use gpui::{
 use metor_db::DB;
 use serde::{Deserialize, Serialize};
 
-use super::binding::{self, ElementRef, component_meta, spawn_meta_resolver, spawn_scalar_stream};
+use super::binding::{
+    self, ElementRef, LiveBinding, ScalarInstrument, component_meta, default_label, stream_scalar,
+};
 use super::format_number;
 use super::meter::{fill_span, scale_position};
 use crate::theme::{theme, ui_px, ui_scale};
@@ -99,57 +101,29 @@ pub struct Gauge {
     pub color: Hsla,
     pub show_value: bool,
     pub show_limits: bool,
-    /// What `_task` is actually streaming, compared against the editable
-    /// fields each frame.
     #[facet(opaque)]
-    bound: Option<ElementRef>,
-    #[facet(skip)]
-    value: Option<f64>,
-    #[facet(opaque)]
-    db: Arc<DB>,
-    #[facet(opaque)]
-    _binding_changes: gpui::Task<()>,
-    #[facet(opaque)]
-    _task: gpui::Task<()>,
-    #[facet(opaque)]
-    _resolver_task: gpui::Task<()>,
+    live: LiveBinding<f64>,
+}
+
+impl ScalarInstrument for Gauge {
+    fn scalar(&mut self) -> (&mut SharedString, &mut SharedString, &mut LiveBinding<f64>) {
+        (&mut self.label, &mut self.unit, &mut self.live)
+    }
 }
 
 impl Gauge {
     pub fn from_config(cfg: &GaugeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
-        let component_id = source.id();
-        let element = cfg.element;
-        let meta = component_meta(&db, component_id);
-
-        let task =
-            spawn_scalar_stream(db.clone(), component_id, element, cx, |gauge, value, cx| {
-                gauge.value = value;
-                cx.notify();
-            });
-
-        let keep_label = cfg.label.is_some();
-        let keep_unit = cfg.unit.is_some();
-        let resolver_task =
-            spawn_meta_resolver(db.clone(), component_id, cx, move |gauge, meta, cx| {
-                if !keep_label {
-                    gauge.label =
-                        super::meter::default_label(&meta.element_names, element, &meta.name);
-                }
-                if !keep_unit {
-                    gauge.unit = meta.unit;
-                }
-                cx.notify();
-            });
-
+        let at = ElementRef::new(source.id(), cfg.element);
+        let meta = component_meta(&db, at.component);
+        let mut live = LiveBinding::new(at, db, cx);
+        stream_scalar(&mut live, at, cfg.label.is_some(), cfg.unit.is_some(), cx);
         Self {
             label: cfg
                 .label
                 .clone()
                 .map(SharedString::from)
-                .unwrap_or_else(|| {
-                    super::meter::default_label(&meta.element_names, element, &meta.name)
-                }),
+                .unwrap_or_else(|| default_label(&meta.element_names, at.element, &meta.name)),
             min: cfg.min,
             max: cfg.max,
             unit: cfg
@@ -163,13 +137,8 @@ impl Gauge {
             show_value: !cfg.hide_value,
             show_limits: !cfg.hide_limits,
             source,
-            element,
-            bound: Some(ElementRef::new(component_id, element)),
-            value: None,
-            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
-            db,
-            _task: task,
-            _resolver_task: resolver_task,
+            element: cfg.element,
+            live,
         }
     }
 
@@ -179,50 +148,20 @@ impl Gauge {
     }
 
     /// Restart the stream when the inspector has re-pointed the dial. Label
-    /// and unit are re-derived: they described the old component, and a dial
-    /// labelled `ω x` reading wheel momentum is worse than no label.
-    pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
-        self.source.resolve(&self.db, cx);
-        let want = self.at();
-        if !binding::rebound(want, &mut self.bound) {
-            return;
+    /// and unit described the old component, so they are re-derived.
+    fn rebind(&mut self, cx: &mut Context<Self>) {
+        if let Some((at, meta)) = self.live.moved(&mut self.source, self.element, cx) {
+            self.label = default_label(&meta.element_names, at.element, &meta.name);
+            self.unit = meta.unit;
+            stream_scalar(&mut self.live, at, false, false, cx);
         }
-
-        let element = want.element;
-        let meta = component_meta(&self.db, want.component);
-        self.label = super::meter::default_label(&meta.element_names, element, &meta.name);
-        self.unit = meta.unit;
-        self.value = None;
-        self._task = spawn_scalar_stream(
-            self.db.clone(),
-            want.component,
-            element,
-            cx,
-            |gauge, value, cx| {
-                gauge.value = value;
-                cx.notify();
-            },
-        );
-        self._resolver_task = spawn_meta_resolver(
-            self.db.clone(),
-            want.component,
-            cx,
-            move |gauge, meta, cx| {
-                gauge.label = super::meter::default_label(&meta.element_names, element, &meta.name);
-                gauge.unit = meta.unit;
-                cx.notify();
-            },
-        );
     }
 
     pub fn to_config(&self) -> GaugeConfig {
         GaugeConfig {
-            // Resolve the name for whatever is bound *now*, so a rebind is
-            // what gets saved.
-            // An expression's component is named by a content hash and
-            // labelled with the text that made it, so what round-trips is the
-            // text — a name would rehydrate onto nothing.
-            component: self.source.text(&self.db),
+            // An expression's component is named by a content hash, so what
+            // round-trips is the text of whatever is bound now.
+            component: self.source.text(&self.live.db),
             element: self.element,
             label: Some(self.label.to_string()),
             min: self.min,
@@ -365,8 +304,8 @@ impl Render for Gauge {
         let track_color = theme.border_primary;
         let hub_color = theme.text_primary;
         let tint = binding::alarm_tint(at, cx);
-        let span = self.value.map(|v| fill_span(v, min, max));
-        let needle = self.value.and_then(|v| scale_position(v, min, max));
+        let span = self.live.value.map(|v| fill_span(v, min, max));
+        let needle = self.live.value.and_then(|v| scale_position(v, min, max));
         let marks: Vec<(f32, Hsla)> = if self.show_limits {
             binding::limit_marks(at, cx)
                 .into_iter()
@@ -447,7 +386,7 @@ impl Render for Gauge {
             .gap(ui_px(1.0));
 
         if self.show_value {
-            let text = match self.value {
+            let text = match self.live.value {
                 Some(v) if self.unit.is_empty() => format_number(v),
                 Some(v) => format!("{} {}", format_number(v), self.unit),
                 None => "—".to_string(),
