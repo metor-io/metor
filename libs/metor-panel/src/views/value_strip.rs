@@ -87,9 +87,26 @@ const STATE_MATCH_TOLERANCE: f64 = 0.5;
 impl StateTable {
     /// The entry whose code matches `value`, if the table lists one.
     fn matched(&self, value: f64) -> Option<&(f64, SharedString, Option<Hsla>)> {
+        self.entries.get(self.position(value)?)
+    }
+
+    /// Index of the entry whose code matches `value`.
+    pub(crate) fn position(&self, value: f64) -> Option<usize> {
         self.entries
             .iter()
-            .find(|(code, _, _)| (code - value).abs() < STATE_MATCH_TOLERANCE)
+            .position(|(code, _, _)| (code - value).abs() < STATE_MATCH_TOLERANCE)
+    }
+
+    /// What a cell holding `value` shows: the matched state with its accent,
+    /// else the unknown label unaccented. `None` keeps the raw number.
+    fn display(&self, value: f64, theme: &Theme) -> Option<(SharedString, Option<Hsla>)> {
+        match self.matched(value) {
+            Some((_, label, color)) => {
+                Some((label.clone(), Some(color.unwrap_or(theme.control_active))))
+            }
+            None if self.unknown_label.is_empty() => None,
+            None => Some((self.unknown_label.clone(), None)),
+        }
     }
 }
 
@@ -647,23 +664,20 @@ impl Render for ComponentValueStrip {
             let has_apply_group =
                 is_pending && !behavior.locked && behavior.on_apply_element.is_some();
 
-            // A state table reinterprets the numeric cell as the state it
-            // means; bool cells keep their toggle rendering, and editing
-            // shows the raw number the operator is typing over.
-            let state = if is_bool {
+            // A state table reinterprets the cell as the state it means — a
+            // bool reads as 0/1, so ARMED/SAFE names a flag too. Strings are
+            // bytes, not codes, and editing shows the raw number the
+            // operator is typing over.
+            let state = if matches!(kind, CellKind::String) {
                 None
             } else {
-                style.states.as_ref().and_then(|table| {
-                    let value = raw_values.get(idx)?.as_f64();
-                    match table.matched(value) {
-                        Some((_, label, color)) => {
-                            Some((label.clone(), Some(color.unwrap_or(theme.control_active))))
-                        }
-                        None if table.unknown_label.is_empty() => None,
-                        None => Some((table.unknown_label.clone(), None)),
-                    }
-                })
+                style
+                    .states
+                    .as_ref()
+                    .and_then(|table| table.display(raw_values.get(idx)?.as_f64(), &theme))
             };
+            // A named bool draws as its state; clicking still toggles it.
+            let draws_as_toggle = is_bool && state.is_none();
             let (display_cell, accent) = match state {
                 Some((text, accent)) => (
                     StripCell {
@@ -695,7 +709,7 @@ impl Render for ComponentValueStrip {
                     is_solo,
                     is_pending,
                     stale,
-                    is_bool,
+                    draws_as_toggle,
                     bool_value,
                     accent,
                     has_apply_group,
@@ -1294,6 +1308,23 @@ mod tests {
         assert!(t.matched(-1.0).is_none());
         // Exactly between two codes is not either of them.
         assert!(t.matched(2.5).is_none());
+    }
+
+    #[test]
+    fn an_unmatched_value_shows_the_unknown_label() {
+        let theme = &crate::theme::DARK;
+        let mut t = table();
+        assert!(
+            t.display(7.0, theme).is_none(),
+            "empty label keeps the number"
+        );
+        t.unknown_label = "UNKNOWN".into();
+        assert_eq!(t.display(7.0, theme).unwrap(), ("UNKNOWN".into(), None));
+        assert_eq!(t.display(2.0, theme).unwrap().0, "POINTING");
+
+        // With no entries at all, every value is unknown.
+        t.entries.clear();
+        assert_eq!(t.display(0.0, theme).unwrap().0, "UNKNOWN");
     }
 
     #[test]

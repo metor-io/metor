@@ -426,14 +426,19 @@ class Gauge:
 
 @dataclass(frozen=True)
 class StateChip:
-    """A numeric element shown as the state it means. ``unknown`` is displayed
-    for a code the table does not list; empty shows the raw number."""
+    """A numeric or bool element shown as the state it means. ``unknown`` is
+    displayed for a code the table does not list; empty shows the raw number.
+
+    ``style="toggle"`` draws every state as a segment of a switch, and
+    clicking one commands that state's value (when edits are unlocked and the
+    panel is live). A toggle over a bool with no ``states`` offers OFF/ON."""
 
     component: str
-    states: list[State]
+    states: list[State] | None = None
     element: int = 0
     label: str | None = None
     unknown: str = ""
+    style: str = "chip"
 
     def _widget(
         self, namespace: str | None
@@ -443,8 +448,9 @@ class StateChip:
                 "component": _qualify(self.component, namespace),
                 "element": self.element,
                 "label": self.label,
-                "states": [s._json() for s in self.states],
+                "states": [s._json() for s in (self.states or [])],
                 "unknown_label": self.unknown,
+                "style": _variant_or_none(self.style, ("chip", "toggle")),
             }
         )
         return "state_chip", state, (150.0, 60.0)
@@ -566,6 +572,105 @@ class Image:
         return "image", {"path": self.path, "data": data}, (300.0, 200.0)
 
 
+def _inline_image(path: str | None, base: str) -> dict[str, str] | None:
+    """An image as the panel's ``{path, data}`` reference, its bytes inlined
+    at record time (see :class:`Image`); ``None`` leaves the slot unset."""
+    import base64
+
+    if not path:
+        return None
+    full = path if os.path.isabs(path) else os.path.join(base, path)
+    with open(full, "rb") as f:
+        return {"path": path, "data": base64.b64encode(f.read()).decode("ascii")}
+
+
+@dataclass(frozen=True)
+class ImageState:
+    """One row of a :class:`StateImage` table: the code and the image it
+    shows. ``label`` is drawn instead when the image cannot be loaded."""
+
+    value: float
+    path: str
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class StateImage:
+    """A numeric or bool element shown as the image its state names, with
+    images inlined at record time like :class:`Image`. ``unknown`` is shown
+    for a code the table does not list, ``no_data`` before any sample, and
+    ``error`` when the binding is broken; an unset one falls back to text."""
+
+    component: str
+    states: list[ImageState]
+    element: int = 0
+    label: str | None = None
+    unknown: str | None = None
+    no_data: str | None = None
+    error: str | None = None
+    _base_dir: str | None = None
+
+    def _widget(
+        self, namespace: str | None
+    ) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        base = self._base_dir or _caller_dir()
+        states = []
+        for s in self.states:
+            image = _inline_image(s.path, base) or {}
+            states.append({"value": float(s.value), "label": s.label, **image})
+        state = _drop_none(
+            {
+                "component": _qualify(self.component, namespace),
+                "element": self.element,
+                "label": self.label,
+                "states": states,
+                "unknown": _inline_image(self.unknown, base),
+                "no_data": _inline_image(self.no_data, base),
+                "error": _inline_image(self.error, base),
+            }
+        )
+        return "state_image", state, (160.0, 120.0)
+
+
+@dataclass(frozen=True)
+class Label:
+    """Static text in a value-cell box, for captions on a schematic.
+    ``color`` tints the box (and its edge, with ``border``); colours are
+    ``"#rrggbbaa"`` and unset ones follow the panel theme. ``align`` is
+    ``"left"``, ``"center"`` or ``"right"``."""
+
+    text: str
+    text_color: str | None = None
+    color: str | None = None
+    text_size: float = 12.0
+    align: str = "center"
+    bold: bool = False
+    uppercase: bool = False
+    border: bool = False
+
+    def _item(self, namespace: str | None) -> dict[str, Any]:
+        return PaneState("label", self._state())._item(namespace)
+
+    def _state(self) -> dict[str, Any]:
+        return _drop_none(
+            {
+                "text": self.text,
+                "text_color": self.text_color,
+                "color": self.color,
+                "text_size": float(self.text_size),
+                "align": _enum(self.align, ("left", "center", "right")),
+                "bold": self.bold,
+                "uppercase": self.uppercase,
+                "border": self.border,
+            }
+        )
+
+    def _widget(
+        self, namespace: str | None
+    ) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        return "label", self._state(), (120.0, 40.0)
+
+
 @dataclass(frozen=True, eq=False)
 class Place:
     """One widget at a pixel rect on a :class:`Dashboard`."""
@@ -591,6 +696,13 @@ def _enum(value: str, allowed: tuple[str, ...]) -> str:
     if key not in allowed:
         raise ValueError(f"expected one of {allowed}, got {value!r}")
     return key.capitalize() if key != "none" else "None"
+
+
+def _variant_or_none(value: str, allowed: tuple[str, ...]) -> str | None:
+    """Like :func:`_enum`, but the first (default) variant is left out of
+    the blob so a preset that never chose one stays byte-identical."""
+    variant = _enum(value, allowed)
+    return None if variant == _enum(allowed[0], allowed) else variant
 
 
 @dataclass(frozen=True)

@@ -966,11 +966,60 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual([s["label"] for s in table["states"]], ["IDLE", "SAFE"])
         self.assertEqual(table["states"][1]["color"], "#f38ba8ff")
         self.assertEqual(table["unknown_label"], "UNKNOWN")
+        # The default style stays out of the blob, so presets saved before
+        # toggles existed are byte-identical.
+        self.assertNotIn("style", table)
 
         # A channel is a slot instance name, not a component, so it is never
         # namespace-qualified.
         control = json.loads(state["widgets"][1]["config"])
         self.assertEqual(control["channel"], "mode")
+
+    def test_state_images_inline_every_image(self):
+        import base64
+        import json
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        pixel = os.path.join(here, "data", "pixel.png")
+        valve = mc.Place(
+            mc.StateImage(
+                "valve.open",
+                states=[mc.ImageState(0, pixel, "CLOSED"), mc.ImageState(1, pixel)],
+                no_data=pixel,
+            ),
+            0,
+            0,
+        )
+        state = self._dashboard_state(mc.Dashboard(widgets=[valve]))
+        self.assertEqual(state["widgets"][0]["kind"], "state_image")
+        cfg = json.loads(state["widgets"][0]["config"])
+        self.assertEqual(cfg["component"], "sat1.valve.open")
+        with open(pixel, "rb") as f:
+            data = base64.b64encode(f.read()).decode("ascii")
+        self.assertEqual(cfg["states"][0]["data"], data)
+        self.assertEqual(cfg["states"][0]["label"], "CLOSED")
+        self.assertEqual(cfg["no_data"]["data"], data)
+        # Unset slots stay out of the blob, so the panel shows its fallback.
+        self.assertNotIn("unknown", cfg)
+        self.assertNotIn("error", cfg)
+
+    def test_labels_carry_their_styling(self):
+        import json
+
+        label = mc.Place(
+            mc.Label("PRIMARY BUS", color="#89b4faff", align="left", bold=True),
+            0,
+            0,
+        )
+        state = self._dashboard_state(mc.Dashboard(widgets=[label]))
+        self.assertEqual(state["widgets"][0]["kind"], "label")
+        self.assertEqual(state["widgets"][0]["rect"]["w"], 120.0)
+        cfg = json.loads(state["widgets"][0]["config"])
+        self.assertEqual(cfg["text"], "PRIMARY BUS")
+        self.assertEqual(cfg["align"], "Left")
+        self.assertEqual(cfg["color"], "#89b4faff")
+        self.assertTrue(cfg["bold"])
+        self.assertNotIn("text_color", cfg)
 
     def test_attitude_markers_are_qualified(self):
         import json

@@ -96,6 +96,9 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::SequenceControl>();
         self.register_inspectable::<crate::views::Map>();
         self.register_inspectable::<crate::views::SamplesTable>();
+        self.register_inspectable::<crate::views::Label>();
+        self.register_inspectable::<crate::views::StateImage>();
+        self.register_inspectable::<crate::views::StateImageEntry>();
         self.register_entity_list::<crate::views::AttitudeIndicator, crate::views::VectorMarker>(
             |a| &a.vectors,
             |a| &mut a.vectors,
@@ -110,6 +113,11 @@ impl InspectorRegistry {
             |c| &c.states,
             |c| &mut c.states,
             AddBehavior::Default(Arc::new(|_cx| crate::views::StateEntry::empty())),
+        );
+        self.register_entity_list::<crate::views::StateImage, crate::views::StateImageEntry>(
+            |v| &v.states,
+            |v| &mut v.states,
+            AddBehavior::Default(Arc::new(|_cx| crate::views::StateImageEntry::empty())),
         );
         self.register_entity_list::<LinePlot, Trace>(
             |lp| &lp.traces,

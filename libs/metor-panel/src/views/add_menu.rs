@@ -159,6 +159,30 @@ impl AddMenu {
             ),
             (
                 None,
+                self.instrument("Toggle Switch", WidgetKind::state_chip(), |seed| {
+                    StateChipConfig {
+                        component: seed.component,
+                        element: seed.element,
+                        label: Some(seed.label),
+                        states: crate::views::state_chip::default_toggle_states(),
+                        style: crate::views::StateChipStyle::Toggle,
+                        ..Default::default()
+                    }
+                }),
+            ),
+            (
+                None,
+                self.instrument("State Image", WidgetKind::state_image(), |seed| {
+                    crate::views::StateImageConfig {
+                        component: seed.component,
+                        element: seed.element,
+                        label: Some(seed.label),
+                        ..Default::default()
+                    }
+                }),
+            ),
+            (
+                None,
                 self.component("Attitude", WidgetKind::attitude(), |component| {
                     AttitudeConfig {
                         component,
@@ -185,6 +209,7 @@ impl AddMenu {
                 Some(Pane),
                 self.command("Component Browser", WidgetKind::new("component_browser")),
             ),
+            (None, self.label()),
             (Some(Dashboard), self.image()),
             (None, self.command("3D Viewer", WidgetKind::viewer3d())),
             (Some(Pane), self.command("Dashboard", WidgetKind::new("dashboard"))),
@@ -359,6 +384,31 @@ impl AddMenu {
                                 data: String::new(),
                             };
                             menu.add(&WidgetKind::image(), &cfg, cx);
+                        }
+                    }),
+                ))]
+            }),
+        ))
+    }
+
+    /// Asks for the text, then opens the inspector on the new label so its
+    /// colour, size and alignment can be set straight away.
+    fn label(&self) -> Box<dyn InspectorRow> {
+        let menu = self.clone();
+        Box::new(NavRow::new(
+            "Label",
+            "",
+            Box::new(move |_| {
+                let menu = menu.clone();
+                vec![Box::new(DefaultActionRow::new(
+                    "Label text...",
+                    Arc::new(move |input, window, cx| {
+                        let mut cfg = crate::views::LabelConfig::default();
+                        if !input.is_empty() {
+                            cfg.text = input;
+                        }
+                        if let Some(entity) = menu.add(&WidgetKind::label(), &cfg, cx) {
+                            menu.inspect_created(entity, window, cx);
                         }
                     }),
                 ))]
