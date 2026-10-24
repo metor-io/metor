@@ -16,8 +16,8 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use crate::dynamic::expressions;
-use crate::inspector::rows::{CommandRow, ExpressionRow, HeaderRow, InspectorRow, RowAction};
-use crate::views::list_plot::trace_picker::{expression_len, list_vector_components};
+use crate::inspector::rows::InspectorRow;
+use crate::views::list_plot::trace_picker::{expression_len, vector_trace_rows};
 
 use super::SpectrogramTrace;
 
@@ -29,69 +29,18 @@ pub fn select_spectrogram_trace_wizard_rows(
     db: Arc<DB>,
     on_select: OnSpectrogramTraceSelected,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let candidates = list_vector_components(&db);
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(HeaderRow::new(
+    vector_trace_rows(
+        db,
         "Pick a spectrum component, or type an expression",
-    ))];
-
-    // Pinned above the list, and before the empty-state note: a db with no
-    // vector component of its own can still have a spectrum computed from one.
-    let commit: crate::inspector::rows::OnExpression = {
-        let db = db.clone();
-        let on_select = on_select.clone();
-        Arc::new(move |component, text, window, cx| {
-            let trace = expression_trace(&db, component, &text, cx);
-            on_select(trace, window, cx);
-            RowAction::Dismiss
-        })
-    };
-    // Only vectors have bins, so the completion provider's component
-    // candidates are declined unless their schema says vector.
-    let vector_row: crate::inspector::rows::ComponentRowBuilder = {
-        let db = db.clone();
-        let on_select = on_select.clone();
-        Arc::new(move |id, _item, _cx| {
-            let (_, name, len) = list_vector_components(&db)
-                .into_iter()
-                .find(|(vid, _, _)| *vid == id)?;
-            let on_select = on_select.clone();
-            let label = SharedString::from(format!("{} [{}]", name, len));
-            Some(Box::new(CommandRow::new(
-                label,
-                Arc::new(move |window, cx| {
-                    let mut trace = SpectrogramTrace::new(id, len);
-                    trace.label = SharedString::from(name.clone());
-                    (on_select)(trace, window, cx);
-                }),
-            )) as Box<dyn InspectorRow>)
-        })
-    };
-    rows.push(Box::new(ExpressionRow::new(
-        db.clone(),
-        commit,
-        vector_row,
-        None,
-    )));
-
-    if candidates.is_empty() {
-        rows.push(Box::new(HeaderRow::new(
-            "No vector components available — a spectrogram needs a component whose schema dim has length > 1, such as the output of `fft`.",
-        )));
-        return rows;
-    }
-    for (id, name, len) in candidates {
-        let on_select = on_select.clone();
-        let label = SharedString::from(format!("{} [{}]", name, len));
-        rows.push(Box::new(CommandRow::new(
-            label,
-            Arc::new(move |window, cx| {
-                let mut trace = SpectrogramTrace::new(id, len);
-                trace.label = SharedString::from(name.clone());
-                (on_select)(trace, window, cx);
-            }),
-        )));
-    }
-    rows
+        "No vector components available — a spectrogram needs a component whose schema dim has length > 1, such as the output of `fft`.",
+        expression_trace,
+        |id, name, len, _cx| {
+            let mut trace = SpectrogramTrace::new(id, len);
+            trace.label = SharedString::from(name.to_string());
+            trace
+        },
+        on_select,
+    )
 }
 
 /// One spectrogram source over an expression's output.
