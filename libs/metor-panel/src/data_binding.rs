@@ -391,18 +391,7 @@ pub(crate) fn watch_history<E: 'static>(
                 .iter()
                 .map(|c| Box::pin(c.time_series.wait()))
                 .collect();
-            std::future::poll_fn(|cx| {
-                use std::future::Future;
-                if waits
-                    .iter_mut()
-                    .any(|wait| wait.as_mut().poll(cx).is_ready())
-                {
-                    std::task::Poll::Ready(())
-                } else {
-                    std::task::Poll::Pending
-                }
-            })
-            .await;
+            crate::first_ready(&mut waits).await;
             if this.update(cx, |_, cx| cx.notify()).is_err() {
                 break;
             }

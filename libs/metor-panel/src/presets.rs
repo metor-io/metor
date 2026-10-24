@@ -22,12 +22,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, io};
 
-use gpui::{App, Context, Entity, Global, Task, prelude::*};
+use gpui::{App, Entity, Task};
 use metor_db::DB;
 use metor_proto::types::Msg;
 use metor_proto_wkt::{Preset, PresetDefs};
 
-use crate::msg_ingest::{IngestSource, ingest_all};
+use crate::msg_ingest::{self, IngestSource};
 use crate::tiles::TileGroup;
 
 /// Resolve the per-user preset directory path. Does **not** create it —
@@ -120,34 +120,24 @@ pub struct TargetPresetStore {
     _task: Task<()>,
 }
 
-pub struct GlobalTargetPresets(pub Entity<TargetPresetStore>);
-
-impl Global for GlobalTargetPresets {}
-
 /// The shared store, or `None` if it was never initialized (e.g. in tests).
 pub fn try_target_presets(cx: &App) -> Option<Entity<TargetPresetStore>> {
-    cx.try_global::<GlobalTargetPresets>().map(|g| g.0.clone())
+    msg_ingest::global(cx)
 }
 
 impl TargetPresetStore {
     pub fn init(db: Arc<DB>, cx: &mut App) {
-        let entity = cx.new(|cx| TargetPresetStore::new(db, cx));
-        cx.observe(&entity, apply_shipped_preset).detach();
-        cx.set_global(GlobalTargetPresets(entity));
-    }
-
-    fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let task = cx.spawn(async move |this, cx| {
+        let entity = msg_ingest::install(cx, |cx| {
             let sources = vec![IngestSource::new(
                 PresetDefs::ID,
                 |store: &mut Self, _ts, defs: PresetDefs| store.presets = defs.presets,
             )];
-            ingest_all(db, sources, this, cx).await
+            Self {
+                presets: Vec::new(),
+                _task: msg_ingest::spawn_ingest(db, sources, cx),
+            }
         });
-        Self {
-            presets: Vec::new(),
-            _task: task,
-        }
+        cx.observe(&entity, apply_shipped_preset).detach();
     }
 
     pub fn presets(&self) -> &[Preset] {

@@ -116,6 +116,20 @@ pub(crate) async fn wait_for_component(db: &DB, component_id: ComponentId) -> Co
     }
 }
 
+/// Resolve with the output of whichever of `futures` is ready first, polling
+/// them in order so earlier entries win a simultaneous wake.
+pub(crate) async fn first_ready<F: std::future::Future + Unpin>(futures: &mut [F]) -> F::Output {
+    std::future::poll_fn(|cx| {
+        for future in futures.iter_mut() {
+            if let std::task::Poll::Ready(output) = std::pin::Pin::new(future).poll(cx) {
+                return std::task::Poll::Ready(output);
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 /// Wait for the vtable to move past generation `seen`.
 ///
 /// Read `seen` before looking at the components it guards: a registration
