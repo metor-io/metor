@@ -6,8 +6,8 @@ use rand::{Rng, SeedableRng};
 use zerocopy::little_endian::U32;
 use zerocopy::{FromBytes, IntoBytes};
 
-use super::build::{build, separation};
-use super::format::{CELLS, HEADER_LEN, Header, KVECTOR, MAX_STARS, STARS, crc_of, within};
+use super::build::{MAX_FACE_N, build, separation};
+use super::format::{CELLS, HEADER_LEN, Header, KVECTOR, MAX_STARS, PAIRS, STARS, crc_of, within};
 use super::kvector::{self, Line, Sorted};
 use super::*;
 use crate::geom::{V3, normalize};
@@ -404,4 +404,65 @@ fn db_costs() {
         hits / axes.len(),
         found / 100_000
     );
+}
+
+/// Stars a hair either side of cell edges, where rounding to f32 can move a
+/// star across the edge: each row must sit in the cell its stored vector
+/// falls in, or a cone query could miss it.
+#[test]
+fn rows_sit_in_the_cell_of_their_stored_vector() {
+    let mut stars = Vec::new();
+    for k in 0..=8 {
+        let t = f64::from(k) * 0.25 - 1.0;
+        for step in -40..=40 {
+            let u = t + f64::from(step) * 1e-9;
+            for r in [[1.0, u, 0.3], [0.3, -1.0, u], [u, 0.7, -1.0], [1.0, u, u]] {
+                let hip = stars.len() as u32 + 1;
+                stars.push(CatStar {
+                    r: normalize(r).unwrap(),
+                    mag: 5.0,
+                    hip,
+                });
+            }
+        }
+    }
+    let bytes = build(&stars, &cfg()).unwrap();
+    let db = Db::parse(&bytes).unwrap();
+    for row in 0..db.n_stars() {
+        let star = db.star(row as u16).unwrap();
+        let cell = db.cell_of(star.vector());
+        assert!(db.cell(cell).contains(&row), "row {row} not in cell {cell}");
+    }
+}
+
+#[test]
+fn a_bad_face_n_does_not_build() {
+    for face_n in [0, MAX_FACE_N + 1, u32::MAX] {
+        let cfg = BuildConfig { face_n, ..cfg() };
+        assert_eq!(build(&catalog(), &cfg).err(), Some(BuildError::FaceN));
+    }
+}
+
+#[test]
+fn a_bad_line_or_theta_is_rejected() {
+    for km in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let bad = edited(|h, _| h.km = zerocopy::little_endian::F64::new(km));
+        assert_eq!(Db::parse(&bad).err(), Some(DbError::KVector), "km {km}");
+    }
+    let bad = edited(|h, _| h.kq = zerocopy::little_endian::F64::new(f64::NAN));
+    assert_eq!(Db::parse(&bad).err(), Some(DbError::KVector));
+    let nan = edited(|h, body| {
+        let at = h.sections[PAIRS].offset.get() as usize - HEADER_LEN;
+        body[at..at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+    });
+    assert_eq!(Db::parse(&nan).err(), Some(DbError::Pairs));
+}
+
+#[test]
+fn cells_past_the_end_are_empty() {
+    let db = Db::parse(db_bytes()).unwrap();
+    let n_cells = db.header.n_cells.get();
+    for c in [n_cells, n_cells + 1, u32::MAX] {
+        assert!(db.cell(c).is_empty());
+    }
 }

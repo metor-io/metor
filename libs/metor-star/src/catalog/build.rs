@@ -37,9 +37,14 @@ pub struct BuildConfig {
 pub enum BuildError {
     /// More than [`MAX_STARS`] stars.
     TooManyStars,
-    /// More pairs than a `u32` counts.
+    /// More pairs than a `u32` counts, or a DB past 4 GiB.
     TooManyPairs,
+    /// `face_n` outside `1..=MAX_FACE_N`.
+    FaceN,
 }
+
+/// The most cells per face edge; `6·n²` cells must fit a `u32` with room.
+pub const MAX_FACE_N: u32 = 1024;
 
 /// The angle between two unit vectors, accurate at small separations.
 pub fn separation(a: V3, b: V3) -> f64 {
@@ -51,11 +56,22 @@ pub fn build(stars: &[CatStar], cfg: &BuildConfig) -> Result<Vec<u8>, BuildError
     if stars.len() > MAX_STARS as usize {
         return Err(BuildError::TooManyStars);
     }
-    let n = cfg.face_n.max(1);
-    let mut sorted: Vec<(u32, CatStar)> = stars.iter().map(|s| (cell_of(s.r, n), *s)).collect();
-    sorted.sort_by_key(|(cell, s)| (*cell, s.hip));
-    let rows: Vec<Star> = sorted.iter().map(|(_, s)| to_row(s)).collect();
+    let n = cfg.face_n;
+    if !(1..=MAX_FACE_N).contains(&n) {
+        return Err(BuildError::FaceN);
+    }
+    // Bin the stored f32 vector, not the f64 input, so a star near a cell
+    // edge sits in the cell the onboard `cell_of` gives it.
+    let mut sorted: Vec<(u32, Star)> = stars
+        .iter()
+        .map(|s| {
+            let row = to_row(s);
+            (cell_of(row.vector(), n), row)
+        })
+        .collect();
+    sorted.sort_by_key(|(cell, s)| (*cell, s.hip.get()));
     let cells = cell_offsets(&sorted, 6 * n * n);
+    let rows: Vec<Star> = sorted.into_iter().map(|(_, s)| s).collect();
     let pairs = pairs_within(&rows, cfg.fov_max_rad);
     let n_pairs = u32::try_from(pairs.len()).map_err(|_| BuildError::TooManyPairs)?;
     let thetas: Vec<f32> = pairs.iter().map(|p| p.theta.get()).collect();
@@ -99,6 +115,9 @@ pub fn build(stars: &[CatStar], cfg: &BuildConfig) -> Result<Vec<u8>, BuildError
         };
         body.extend_from_slice(bytes);
     }
+    if u32::try_from(HEADER_LEN + body.len()).is_err() {
+        return Err(BuildError::TooManyPairs);
+    }
     let mut out = Vec::with_capacity(HEADER_LEN + body.len());
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(&body);
@@ -118,7 +137,7 @@ fn to_row(s: &CatStar) -> Star {
 }
 
 /// `n_cells + 1` offsets of each cell's first star in cell-sorted `stars`.
-fn cell_offsets(stars: &[(u32, CatStar)], n_cells: u32) -> Vec<U32> {
+fn cell_offsets(stars: &[(u32, Star)], n_cells: u32) -> Vec<U32> {
     let mut offsets = Vec::with_capacity(n_cells as usize + 1);
     let mut row = 0usize;
     for c in 0..=n_cells {

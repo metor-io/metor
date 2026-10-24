@@ -112,9 +112,10 @@ pub enum DbError {
     TooManyStars,
     /// Cell offsets that decrease, or do not end at `n_stars`.
     Cells,
-    /// A pair naming a missing star, or pairs out of θ order.
+    /// A pair naming a missing star, a non-finite θ, or pairs out of θ order.
     Pairs,
-    /// A k-vector that decreases or counts past `n_pairs`.
+    /// A k-vector that decreases or counts past `n_pairs`, or a line that
+    /// is not finite and increasing.
     KVector,
 }
 
@@ -153,7 +154,8 @@ fn section<'a, T: FromBytes + Immutable + KnownLayout>(
         .checked_add(len)
         .and_then(|end| bytes.get(offset..end))
         .ok_or(DbError::Truncated)?;
-    if len != count * size_of::<T>() {
+    // Checked: on a 32-bit target a forged count could wrap to `len`.
+    if count.checked_mul(size_of::<T>()) != Some(len) {
         return Err(DbError::CountMismatch);
     }
     <[T]>::ref_from_bytes(raw).map_err(|_| DbError::CountMismatch)
@@ -179,10 +181,11 @@ impl<'a> Db<'a> {
         let (n_stars, n_pairs) = (n_stars as usize, header.n_pairs.get() as usize);
         let n_cells = header.n_cells.get() as usize;
         let s = &header.sections;
+        let plus_one = |n: usize| n.checked_add(1).ok_or(DbError::CountMismatch);
         let stars = section::<Star>(bytes, &s[STARS], n_stars)?;
-        let cells = section::<U32>(bytes, &s[CELLS], n_cells + 1)?;
+        let cells = section::<U32>(bytes, &s[CELLS], plus_one(n_cells)?)?;
         let pairs = section::<Pair>(bytes, &s[PAIRS], n_pairs)?;
-        let k = section::<U32>(bytes, &s[KVECTOR], n_pairs + 1)?;
+        let k = section::<U32>(bytes, &s[KVECTOR], plus_one(n_pairs)?)?;
         section::<u8>(bytes, &s[RESERVED], 0)?;
         let stored = header.crc32.get();
         let computed = crc_of(bytes).ok_or(DbError::Truncated)?;
@@ -197,20 +200,25 @@ impl<'a> Db<'a> {
         if !cells_ok {
             return Err(DbError::Cells);
         }
-        let pair_ok = |p: &Pair| (p.a.get() as usize) < n_stars && (p.b.get() as usize) < n_stars;
+        let pair_ok = |p: &Pair| {
+            (p.a.get() as usize) < n_stars
+                && (p.b.get() as usize) < n_stars
+                && p.theta.get().is_finite()
+        };
         let sorted = pairs
             .windows(2)
             .all(|w| w[0].theta.get() <= w[1].theta.get());
         if !pairs.iter().all(pair_ok) || !sorted {
             return Err(DbError::Pairs);
         }
-        if !non_decreasing(k, n_pairs as u32) {
-            return Err(DbError::KVector);
-        }
         let line = Line {
             m: header.km.get(),
             q: header.kq.get(),
         };
+        let line_ok = line.m.is_finite() && line.m > 0.0 && line.q.is_finite();
+        if !line_ok || !non_decreasing(k, n_pairs as u32) {
+            return Err(DbError::KVector);
+        }
         Ok(Db {
             header,
             stars,
@@ -250,8 +258,9 @@ impl<'a> Db<'a> {
     /// The stars in cell `c`.
     pub fn cell(&self, c: u32) -> Range<usize> {
         let at = |i: usize| self.cells.get(i).map_or(0, |v| v.get() as usize);
-        let (start, end) = (at(c as usize), at(c as usize + 1));
-        start.min(self.stars.len())..end.clamp(start, self.stars.len())
+        let n = self.stars.len();
+        let start = at(c as usize).min(n);
+        start..at(c as usize + 1).clamp(start, n)
     }
 
     /// The cell a direction falls in.
