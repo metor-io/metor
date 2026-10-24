@@ -515,7 +515,7 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
 /// Read a preset file and apply it to `tiles`. Errors are logged and the
 /// layout is left untouched, so a bad file can't take the app down.
 fn read_and_load(path: &Path, tiles: &Entity<TileGroup>, cx: &mut App) {
-    match presets::load_preset(path) {
+    match std::fs::read_to_string(path) {
         Ok(json) => presets::load_into_tiles(&json, tiles, cx),
         Err(e) => tracing::error!(path = %path.display(), %e, "read preset failed"),
     }

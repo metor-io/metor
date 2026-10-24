@@ -3,7 +3,7 @@
 //! Three sources:
 //! - **File on disk** — caller provides the path (typically picked via the OS
 //!   save dialog). Round-trip is plain `std::fs`.
-//! - **Built-in directory** — `dirs::config_dir()/metor/panel/presets/`. Each
+//! - **Built-in directory** — `presets/` under the panel config directory. Each
 //!   preset is one `<name>.json` file. The directory is created on demand.
 //! - **The connected target** — a target declaring `Presets(...)` broadcasts
 //!   a [`PresetDefs`] snapshot the link replays on every connection;
@@ -33,13 +33,11 @@ use crate::tiles::TileGroup;
 /// Resolve the per-user preset directory path. Does **not** create it —
 /// list/read paths shouldn't materialize the directory just by being walked.
 fn presets_dir_path() -> io::Result<PathBuf> {
-    let base = dirs::config_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config dir"))?;
-    Ok(base.join("metor").join("panel").join("presets"))
+    Ok(crate::config::config_dir()?.join("presets"))
 }
 
 /// Resolve and create the per-user preset directory. Used by the write path.
-pub fn presets_dir() -> io::Result<PathBuf> {
+fn presets_dir() -> io::Result<PathBuf> {
     let dir = presets_dir_path()?;
     fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -100,11 +98,6 @@ pub fn save_preset(name: &str, json: &str) -> io::Result<PathBuf> {
     let path = presets_dir()?.join(file_name);
     fs::write(&path, json)?;
     Ok(path)
-}
-
-/// Read a preset file from disk.
-pub fn load_preset(path: &Path) -> io::Result<String> {
-    fs::read_to_string(path)
 }
 
 /// Replace the current tile layout with the one encoded in `json`.
