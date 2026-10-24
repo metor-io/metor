@@ -316,7 +316,7 @@ impl Theme {
 }
 
 /// Component-wise RGB blend of `a` into `b` by `t`, keeping `a`'s alpha.
-fn lerp_color(a: Hsla, b: Hsla, t: f32) -> Hsla {
+pub(crate) fn lerp_color(a: Hsla, b: Hsla, t: f32) -> Hsla {
     let x = gpui::Rgba::from(a);
     let y = gpui::Rgba::from(b);
     let lerp = |p: f32, q: f32| p + (q - p) * t;

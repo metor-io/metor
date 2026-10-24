@@ -12,8 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Corners, Entity, EntityId, Hsla, IntoElement, Pixels, Render, SharedString,
-    Window, canvas, div, prelude::*,
+    Context, Entity, EntityId, Hsla, IntoElement, Render, SharedString, Window, div, prelude::*,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
@@ -22,7 +21,8 @@ use super::bounds::PlotView;
 use super::gpu::{AxisSource, LineDraw, PlotRenderState};
 use super::override_field::Override;
 use super::{NodeBoundsCache, TimeFormat, Trace, YAxis, expand_value_bounds};
-use crate::views::plot_common::reconcile_trackers;
+use crate::views::plot_common::lod::{GapBands, GapCollector, LodTracking, gap_band_overlay};
+use crate::views::plot_common::{gpu_frame, link_traces, reconcile_trackers};
 use crate::views::time_series::time_range::{GlobalTimeRange, TimeRangeBehavior};
 use crate::wait_for_component;
 
@@ -35,17 +35,9 @@ struct TraceTracking {
     /// when the trace's element index changes.
     node_bounds: NodeBoundsCache,
     cached_element_index: Option<usize>,
-    /// The component's LoD companions (`metor_db::lod`), finest first.
-    /// Re-resolved when the DB's component set changes.
-    lod_levels: Vec<Component>,
-    lod_resolved_gen: Option<u64>,
-    /// True while the visible window holds more raw samples than
-    /// [`RAW_SAMPLE_BUDGET`]; the trace then renders min/max buckets
-    /// instead of raw data.
-    over_budget: bool,
-    /// Index into `lod_levels` while over budget; `None` when no level
-    /// has been published yet (the trace shows gap bands instead).
-    lod_selected: Option<usize>,
+    /// Over [`RAW_SAMPLE_BUDGET`] visible samples, the trace renders
+    /// min/max buckets from an LoD companion instead of raw data.
+    lod: LodTracking,
     /// Bounds of the selected LoD component, scanned by the tracker task.
     /// Keyed so a level switch invalidates the cache.
     lod_y_bounds: Option<(f64, f64)>,
@@ -64,29 +56,20 @@ impl TraceTracking {
             y_bounds: None,
             node_bounds: NodeBoundsCache::default(),
             cached_element_index: None,
-            lod_levels: Vec::new(),
-            lod_resolved_gen: None,
-            over_budget: false,
-            lod_selected: None,
+            lod: LodTracking::default(),
             lod_y_bounds: None,
             lod_node_bounds: NodeBoundsCache::default(),
             lod_cache_key: None,
             plan: None,
         }
     }
-
-    fn selected_lod(&self) -> Option<&Component> {
-        self.lod_levels.get(self.lod_selected?)
-    }
 }
 
 /// Per-trace sample budget for raw rendering: a quarter of the GPU value
 /// capacity, leaving room for several traces per plot. Windows estimated
-/// above it render from a min/max LoD component.
+/// above it render from a min/max LoD component, whose buckets each render
+/// two points and so count double against the same budget.
 const RAW_SAMPLE_BUDGET: u64 = 1_000_000;
-/// Per-trace bucket budget when picking an LoD level; each bucket renders
-/// two points, so this matches the raw budget in GPU terms.
-const LOD_BUCKET_BUDGET: u64 = RAW_SAMPLE_BUDGET / 2;
 
 /// Previous values of the reflected override knobs. Compared on each
 /// reconcile so an inspector edit can clear the interactive view override.
@@ -335,19 +318,13 @@ impl LinePlot {
         }
     }
 
-    /// Decide raw versus LoD per trace for the current window. Hysteresis
-    /// keeps the boundary from flapping while panning near the budget;
-    /// over budget the finest level whose visible bucket count fits
-    /// [`LOD_BUCKET_BUDGET`] wins, falling back to the coarsest.
+    /// Decide raw versus LoD per trace for the current window.
     fn update_lod_state(&mut self, cx: &gpui::App) {
-        const ENTER: u64 = RAW_SAMPLE_BUDGET + RAW_SAMPLE_BUDGET / 4;
-        const EXIT: u64 = RAW_SAMPLE_BUDGET * 4 / 5;
         let Some(view) = self.effective_view(cx) else {
             return;
         };
         let (min_x, max_x) = view.x;
         let range = Timestamp(min_x as i64)..Timestamp(max_x as i64);
-        let vtable_gen = self.db.vtable_gen.latest();
         for trace in &self.traces {
             let cfg = trace.read(cx);
             let Some(tracking) = self.tracking.get_mut(&trace.entity_id()) else {
@@ -359,55 +336,25 @@ impl LinePlot {
             if !cfg.visible {
                 continue;
             }
-            if tracking.lod_resolved_gen != Some(vtable_gen) {
-                tracking.lod_levels = resolve_lod_levels(&self.db, cfg.source.id());
-                tracking.lod_resolved_gen = Some(vtable_gen);
-            }
-            let estimate = component.time_series.estimate_samples(range.clone());
-            if tracking.over_budget {
-                tracking.over_budget = estimate >= EXIT;
-            } else {
-                tracking.over_budget = estimate > ENTER;
-            }
-            if !tracking.over_budget {
-                tracking.lod_selected = None;
-                continue;
-            }
-            // Finest level fitting the budget wins; coarser fallback. A
-            // level with no data at all (still backfilling, or its first
-            // bucket hasn't completed) can't render and is skipped.
-            let mut selected = None;
-            for (i, lod) in tracking.lod_levels.iter().enumerate() {
-                let has_data = lod.time_series.latest().is_some()
-                    || !lod.time_series.manifest().spans.is_empty();
-                if !has_data {
-                    continue;
-                }
-                selected = Some(i);
-                if lod.time_series.estimate_samples(range.clone()) <= LOD_BUCKET_BUDGET {
-                    break;
-                }
-            }
-            tracking.lod_selected = selected;
+            tracking.lod.select(
+                &self.db,
+                cfg.source.id(),
+                component,
+                range.clone(),
+                RAW_SAMPLE_BUDGET,
+                1,
+            );
         }
     }
 
-    /// Remote-only stretches of the visible window, as `(start, width)`
-    /// fractions of the plot width. This also asks the installed hydrator
-    /// (if any) to fetch them — bounded, deduplicated, cheap to call per
-    /// frame. Over-budget traces never hydrate raw nodes (a year-wide view
-    /// must not pull the archive): gaps come from, and hydration targets,
-    /// the selected LoD companion, which is ~`2/ratio` the size.
-    fn gap_bands(&self, cx: &gpui::App) -> smallvec::SmallVec<[(f32, f32); 4]> {
-        let mut bands: smallvec::SmallVec<[(f32, f32); 4]> = smallvec::SmallVec::new();
+    /// Missing stretches of the visible window across visible traces,
+    /// merged so a sparse archive stays a handful of bands.
+    fn gap_bands(&self, cx: &gpui::App) -> GapBands {
         let Some(view) = self.effective_view(cx) else {
-            return bands;
+            return GapBands::new();
         };
         let (min_x, max_x) = view.x;
-        let span = (max_x - min_x).max(1.0);
-        let visible = Timestamp(min_x as i64)..Timestamp(max_x as i64);
-        let hydrator = crate::hydration::hydrator(cx);
-        let mut gaps = metor_db::manifest::GapVec::new();
+        let mut gaps = GapCollector::new(min_x, max_x, cx);
         for trace in &self.traces {
             let cfg = trace.read(cx);
             if !cfg.visible {
@@ -419,56 +366,15 @@ impl LinePlot {
             let Some(component) = tracking.component.as_ref() else {
                 continue;
             };
-            let (series, hydrate_id, hydrate) = match tracking.selected_lod() {
-                Some(lod) => (&lod.time_series, lod.component_id, true),
-                // Over budget with no published level yet: show raw gaps
-                // but never pull the raw archive for a wide view.
-                None if tracking.over_budget => (&component.time_series, cfg.source.id(), false),
-                None => (&component.time_series, cfg.source.id(), true),
-            };
-            gaps.clear();
-            series.coverage(visible.clone(), &mut gaps);
-            let mut band = |range: &std::ops::Range<Timestamp>| {
-                let start = ((range.start.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
-                let end = ((range.end.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
-                if end > start {
-                    bands.push((start, end - start));
-                }
-            };
-            for gap in &gaps {
-                if hydrate
-                    && gap.state == metor_db::manifest::SpanState::RemoteOnly
-                    && let Some(hydrator) = &hydrator
-                {
-                    hydrator.request(hydrate_id, gap.range.clone());
-                }
-                band(&gap.range);
-            }
-            // What an expression has never computed is a gap of the other
-            // kind: nothing to fetch, something to compute. Always against
-            // the raw series — a LoD level is derived from it afterwards.
-            let history = crate::data_binding::BoundHistory {
-                component: component.clone(),
-                plan: tracking.plan.clone(),
-            };
-            for range in history.request_replay(visible.clone(), cx) {
-                band(&range);
-            }
+            gaps.add(
+                component,
+                cfg.source.id(),
+                &tracking.lod,
+                &tracking.plan,
+                cx,
+            );
         }
-        // A year-wide view over a sparse archive yields hundreds of
-        // sub-pixel gaps; merge anything closer than ~half a pixel so the
-        // overlay stays a handful of divs.
-        bands.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        let mut merged: smallvec::SmallVec<[(f32, f32); 4]> = smallvec::SmallVec::new();
-        for (start, width) in bands {
-            match merged.last_mut() {
-                Some((last_start, last_width)) if start - (*last_start + *last_width) < 0.0005 => {
-                    *last_width = (start + width - *last_start).max(*last_width);
-                }
-                _ => merged.push((start, width)),
-            }
-        }
-        merged
+        gaps.merged()
     }
 
     /// Bring tracking state and the title cache in sync with `self.traces`.
@@ -508,19 +414,10 @@ impl LinePlot {
         // sibling axes) and clamp stale axis indices. Mutating the trace
         // entity without notifying avoids feeding our trace observation back
         // into configuration reconciliation.
-        let self_weak = cx.entity().downgrade();
-        let self_id = cx.entity().entity_id();
+        link_traces(&self.traces, |t| &mut t.line_plot, cx);
         let axis_count = self.axes.len();
         for trace in &self.traces {
             trace.update(cx, |t, _| {
-                let linked = t
-                    .line_plot
-                    .as_ref()
-                    .and_then(|w| w.upgrade())
-                    .map(|e| e.entity_id());
-                if linked != Some(self_id) {
-                    t.line_plot = Some(self_weak.clone());
-                }
                 if t.axis_index >= axis_count {
                     t.axis_index = 0;
                 }
@@ -637,7 +534,7 @@ impl LinePlot {
             }
             // Resident raw bounds only cover hydrated data; the LoD
             // component is the Y authority for summarized history.
-            if tracking.lod_selected.is_some()
+            if tracking.lod.selected().is_some()
                 && let Some((lo, hi)) = tracking.lod_y_bounds
             {
                 y_min[ai] = y_min[ai].min(lo);
@@ -850,7 +747,7 @@ impl LinePlot {
                     // The selected LoD component's bounds are scanned
                     // alongside the raw ones; switching levels invalidates
                     // its cache.
-                    let lod = tracking.selected_lod().cloned();
+                    let lod = tracking.lod.selected().cloned();
                     let lod_key = lod.as_ref().map(|l| l.component_id);
                     if tracking.lod_cache_key != lod_key {
                         tracking.lod_node_bounds.clear();
@@ -929,117 +826,80 @@ impl Render for LinePlot {
         self.update_lod_state(cx);
         let degraded = self.gpu_state.degraded();
         let gap_bands = self.gap_bands(cx);
-        let weak = cx.entity().downgrade();
-        let plot_canvas = canvas(
-            move |bounds, window, cx| {
-                let scale_factor = window.scale_factor();
-                let (frame, released) = weak
-                    .update(cx, |lp, cx| {
-                        if let Some(view) = lp.effective_view(cx) {
-                            let mut draws: Vec<LineDraw<'_>> = Vec::new();
-                            for trace in &lp.traces {
-                                let config = trace.read(cx);
-                                if !config.visible {
-                                    continue;
-                                }
-                                let Some(tracking) = lp.tracking.get(&trace.entity_id()) else {
-                                    continue;
-                                };
-                                let Some(component) = tracking.component.as_ref() else {
-                                    continue;
-                                };
-                                let axis = view.axis_bounds(config.axis_index);
-                                // Summarized history draws as dimmed
-                                // min/max buckets; raw samples cover only
-                                // the live tail past the last bucket.
-                                let raw_clip = if let Some(lod) = tracking.selected_lod() {
-                                    let mut color = config.color;
-                                    color.a *= envelope_alpha;
-                                    draws.push(LineDraw {
-                                        x: AxisSource::Timestamps,
-                                        y: AxisSource::MinMax {
-                                            component: lod,
-                                            element_index: config.element_index,
-                                        },
-                                        y_min: axis.min_y,
-                                        y_max: axis.max_y,
-                                        style: super::PlotStyle::Line,
-                                        color,
-                                        stroke_width: config.stroke_width,
-                                        x_clip: None,
-                                        time_clip: None,
-                                    });
-                                    let tail = lod
-                                        .time_series
-                                        .latest()
-                                        .map(|l| l.timestamp().0 as f64)
-                                        .unwrap_or(f64::NEG_INFINITY);
-                                    Some((tail, f64::INFINITY))
-                                } else {
-                                    None
-                                };
-                                draws.push(LineDraw {
-                                    x: AxisSource::Timestamps,
-                                    y: AxisSource::Element {
-                                        component,
-                                        element_index: config.element_index,
-                                    },
-                                    y_min: axis.min_y,
-                                    y_max: axis.max_y,
-                                    style: config.style,
-                                    color: config.color,
-                                    stroke_width: config.stroke_width,
-                                    x_clip: raw_clip,
-                                    time_clip: None,
-                                });
-                            }
-                            // X data + a 0..1 Y placeholder; each trace's Y is
-                            // normalized per axis in the materializer.
-                            let gpu_view = view.x_bounds();
-                            if let Some(handle) =
-                                lp.gpu_state
-                                    .render(cx, bounds, scale_factor, gpu_view, &draws)
-                            {
-                                handle.spawn_and_set(cx, line_plot_gpu_state);
-                            }
-                        }
-                        (
-                            lp.gpu_state.current_frame(),
-                            lp.gpu_state.take_pending_release(),
-                        )
-                    })
-                    .unwrap_or((None, None));
-                if let Some(img) = released {
-                    crate::atlas::release_image(window, cx, img);
+        let plot_canvas = gpu_frame(
+            cx.entity().downgrade(),
+            line_plot_gpu_state,
+            move |lp, bounds, scale_factor, cx| {
+                let view = lp.effective_view(cx)?;
+                let mut draws: Vec<LineDraw<'_>> = Vec::new();
+                for trace in &lp.traces {
+                    let config = trace.read(cx);
+                    if !config.visible {
+                        continue;
+                    }
+                    let Some(tracking) = lp.tracking.get(&trace.entity_id()) else {
+                        continue;
+                    };
+                    let Some(component) = tracking.component.as_ref() else {
+                        continue;
+                    };
+                    let axis = view.axis_bounds(config.axis_index);
+                    // Summarized history draws as dimmed min/max buckets;
+                    // raw samples cover only the live tail past the last
+                    // bucket.
+                    let raw_clip = if let Some(lod) = tracking.lod.selected() {
+                        let mut color = config.color;
+                        color.a *= envelope_alpha;
+                        draws.push(LineDraw {
+                            x: AxisSource::Timestamps,
+                            y: AxisSource::MinMax {
+                                component: lod,
+                                element_index: config.element_index,
+                            },
+                            y_min: axis.min_y,
+                            y_max: axis.max_y,
+                            style: super::PlotStyle::Line,
+                            color,
+                            stroke_width: config.stroke_width,
+                            x_clip: None,
+                            time_clip: None,
+                        });
+                        let tail = lod
+                            .time_series
+                            .latest()
+                            .map(|l| l.timestamp().0 as f64)
+                            .unwrap_or(f64::NEG_INFINITY);
+                        Some((tail, f64::INFINITY))
+                    } else {
+                        None
+                    };
+                    draws.push(LineDraw {
+                        x: AxisSource::Timestamps,
+                        y: AxisSource::Element {
+                            component,
+                            element_index: config.element_index,
+                        },
+                        y_min: axis.min_y,
+                        y_max: axis.max_y,
+                        style: config.style,
+                        color: config.color,
+                        stroke_width: config.stroke_width,
+                        x_clip: raw_clip,
+                        time_clip: None,
+                    });
                 }
-                (bounds, frame)
+                // X data + a 0..1 Y placeholder; each trace's Y is
+                // normalized per axis in the materializer.
+                let gpu_view = view.x_bounds();
+                lp.gpu_state
+                    .render(cx, bounds, scale_factor, gpu_view, &draws)
             },
-            |_, (bounds, frame): (Bounds<Pixels>, Option<Arc<gpui::RenderImage>>), window, _cx| {
-                if let Some(img) = frame {
-                    let _ = window.paint_image(bounds, bounds, Corners::default(), img, 0, false);
-                }
-            },
-        )
-        .size_full();
+        );
         div()
             .size_full()
             .relative()
             .child(plot_canvas)
-            .children(gap_bands.into_iter().map({
-                let band_color = theme.plot_gap_band;
-                move |(start, width)| {
-                    // History that lives in a store but not on disk yet; the
-                    // hydrator has been asked for it and the band disappears
-                    // when the data lands and wakes the trackers.
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .left(gpui::relative(start))
-                        .w(gpui::relative(width))
-                        .bg(band_color)
-                }
-            }))
+            .children(gap_band_overlay(gap_bands, theme.plot_gap_band))
             .when(degraded, |el| {
                 // The last frame clamped its uploads: more samples are in
                 // view than the GPU buffers hold, so the trace is shown

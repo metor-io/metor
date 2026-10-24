@@ -10,12 +10,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Corners, Entity, EntityId, IntoElement, Pixels, Render, SharedString, Window,
-    canvas, prelude::*,
+    Context, Entity, EntityId, Hsla, IntoElement, Render, SharedString, Window, prelude::*,
 };
 use metor_db::{Component, DB};
 
-use crate::views::plot_common::reconcile_trackers;
+use crate::views::plot_common::{
+    BoundOverrides, NumericLinePlot, bound_overrides, derive_title, gpu_frame, link_traces,
+    reconcile_trackers, replace_view_override,
+};
 use crate::views::time_series::{
     AxisSource, LineDraw, NodeBoundsCache, Override, PlotBounds, PlotRenderState,
     expand_value_bounds,
@@ -58,27 +60,6 @@ impl XyTraceTracking {
     }
 }
 
-/// Previous values of the reflected override knobs. Compared on each
-/// reconcile so an inspector edit can clear the interactive view override.
-#[derive(Clone, Copy, PartialEq)]
-struct OverrideSnapshot {
-    x_min: Option<f64>,
-    x_max: Option<f64>,
-    y_min: Option<f64>,
-    y_max: Option<f64>,
-}
-
-impl OverrideSnapshot {
-    fn capture(lp: &XyLinePlot) -> Self {
-        Self {
-            x_min: lp.x_min_override.as_custom().copied(),
-            x_max: lp.x_max_override.as_custom().copied(),
-            y_min: lp.y_min_override.as_custom().copied(),
-            y_max: lp.y_max_override.as_custom().copied(),
-        }
-    }
-}
-
 /// Self-contained XY plot entity.
 #[derive(facet::Facet)]
 pub struct XyLinePlot {
@@ -102,7 +83,7 @@ pub struct XyLinePlot {
     #[facet(opaque)]
     view_override: Option<PlotBounds>,
     #[facet(opaque)]
-    last_overrides: OverrideSnapshot,
+    last_overrides: BoundOverrides,
     #[facet(opaque)]
     title_cache: SharedString,
     #[facet(opaque)]
@@ -125,12 +106,7 @@ impl XyLinePlot {
             tasks: HashMap::new(),
             inputs: Default::default(),
             view_override: None,
-            last_overrides: OverrideSnapshot {
-                x_min: None,
-                x_max: None,
-                y_min: None,
-                y_max: None,
-            },
+            last_overrides: [None; 4],
             title_cache: "XY Plot".into(),
             gpu_state: PlotRenderState::default(),
         }
@@ -159,8 +135,7 @@ impl XyLinePlot {
     }
 
     pub fn set_view_override(&mut self, view: Option<PlotBounds>, cx: &mut Context<Self>) {
-        if self.view_override.map(|b| b.bits()) != view.map(|b| b.bits()) {
-            self.view_override = view;
+        if replace_view_override(&mut self.view_override, view) {
             cx.notify();
         }
     }
@@ -177,23 +152,7 @@ impl XyLinePlot {
             });
         }
 
-        // Point each trace back at this plot so its inspector page can reach
-        // the plot to rebind. Mutating without notifying cannot re-enter
-        // reconcile: the plot does not observe its traces.
-        let self_weak = cx.entity().downgrade();
-        let self_id = cx.entity().entity_id();
-        for trace in &self.traces {
-            trace.update(cx, |t, _| {
-                let linked = t
-                    .line_plot
-                    .as_ref()
-                    .and_then(|w| w.upgrade())
-                    .map(|e| e.entity_id());
-                if linked != Some(self_id) {
-                    t.line_plot = Some(self_weak.clone());
-                }
-            });
-        }
+        link_traces(&self.traces, |t| &mut t.line_plot, cx);
 
         for id in self.inputs.changed(
             &self.traces,
@@ -223,7 +182,7 @@ impl XyLinePlot {
             },
         );
 
-        let snapshot = OverrideSnapshot::capture(self);
+        let snapshot = self.bound_overrides();
         if snapshot != self.last_overrides {
             self.view_override = None;
             self.last_overrides = snapshot;
@@ -231,7 +190,7 @@ impl XyLinePlot {
 
         self.title_cache = match &self.custom_title {
             Override::Custom(custom) => custom.clone(),
-            Override::Auto => derive_title(&self.traces, cx),
+            Override::Auto => derive_title("XY Plot", &self.traces, |t| &t.label, cx),
         };
     }
 
@@ -427,67 +386,44 @@ impl Render for XyLinePlot {
                 }
             }
         }
-        let weak = cx.entity().downgrade();
-        canvas(
-            move |bounds, window, cx| {
-                let scale_factor = window.scale_factor();
-                let (frame, released) = weak
-                    .update(cx, |lp, cx| {
-                        if let Some(view) = lp.effective_view(cx) {
-                            let draws: Vec<LineDraw<'_>> = lp
-                                .traces
-                                .iter()
-                                .filter_map(|trace| {
-                                    let config = trace.read(cx);
-                                    if !config.visible {
-                                        return None;
-                                    }
-                                    let tracking = lp.tracking.get(&trace.entity_id())?;
-                                    let x_component = tracking.x_component.as_ref()?;
-                                    let y_component = tracking.y_component.as_ref()?;
-                                    Some(LineDraw {
-                                        x: AxisSource::Element {
-                                            component: x_component,
-                                            element_index: config.x_element_index,
-                                        },
-                                        y: AxisSource::Element {
-                                            component: y_component,
-                                            element_index: config.y_element_index,
-                                        },
-                                        y_min: view.min_y,
-                                        y_max: view.max_y,
-                                        style: config.style,
-                                        color: config.color,
-                                        stroke_width: config.stroke_width,
-                                        x_clip: None,
-                                        time_clip: range.as_ref().map(|r| (r.start.0, r.end.0)),
-                                    })
-                                })
-                                .collect();
-                            if let Some(handle) =
-                                lp.gpu_state.render(cx, bounds, scale_factor, view, &draws)
-                            {
-                                handle.spawn_and_set(cx, xy_plot_gpu_state);
-                            }
+        gpu_frame(
+            cx.entity().downgrade(),
+            xy_plot_gpu_state,
+            move |lp, bounds, scale_factor, cx| {
+                let view = lp.effective_view(cx)?;
+                let draws: Vec<LineDraw<'_>> = lp
+                    .traces
+                    .iter()
+                    .filter_map(|trace| {
+                        let config = trace.read(cx);
+                        if !config.visible {
+                            return None;
                         }
-                        (
-                            lp.gpu_state.current_frame(),
-                            lp.gpu_state.take_pending_release(),
-                        )
+                        let tracking = lp.tracking.get(&trace.entity_id())?;
+                        let x_component = tracking.x_component.as_ref()?;
+                        let y_component = tracking.y_component.as_ref()?;
+                        Some(LineDraw {
+                            x: AxisSource::Element {
+                                component: x_component,
+                                element_index: config.x_element_index,
+                            },
+                            y: AxisSource::Element {
+                                component: y_component,
+                                element_index: config.y_element_index,
+                            },
+                            y_min: view.min_y,
+                            y_max: view.max_y,
+                            style: config.style,
+                            color: config.color,
+                            stroke_width: config.stroke_width,
+                            x_clip: None,
+                            time_clip: range.as_ref().map(|r| (r.start.0, r.end.0)),
+                        })
                     })
-                    .unwrap_or((None, None));
-                if let Some(img) = released {
-                    crate::atlas::release_image(window, cx, img);
-                }
-                (bounds, frame)
-            },
-            |_, (bounds, frame): (Bounds<Pixels>, Option<Arc<gpui::RenderImage>>), window, _cx| {
-                if let Some(img) = frame {
-                    let _ = window.paint_image(bounds, bounds, Corners::default(), img, 0, false);
-                }
+                    .collect();
+                lp.gpu_state.render(cx, bounds, scale_factor, view, &draws)
             },
         )
-        .size_full()
     }
 }
 
@@ -495,22 +431,54 @@ fn xy_plot_gpu_state(lp: &mut XyLinePlot) -> &mut PlotRenderState {
     &mut lp.gpu_state
 }
 
-/// Derive a plot title from the trace list.
-///
-/// One trace renders as `<x_label> vs <y_label>` (using the trace's
-/// `label` field if non-empty, else the component name suffix). Multiple
-/// traces fall back to a generic count. Empty list yields "XY Plot".
-fn derive_title(traces: &[Entity<XyTrace>], cx: &gpui::App) -> SharedString {
-    if traces.is_empty() {
-        return "XY Plot".into();
+impl XyLinePlot {
+    fn bound_overrides(&self) -> BoundOverrides {
+        bound_overrides([
+            &self.x_min_override,
+            &self.x_max_override,
+            &self.y_min_override,
+            &self.y_max_override,
+        ])
     }
-    if traces.len() == 1 {
-        let t = traces[0].read(cx);
-        return if t.label.is_empty() {
-            "XY Plot".into()
-        } else {
-            t.label.clone()
-        };
+}
+
+impl NumericLinePlot for XyLinePlot {
+    type Trace = XyTrace;
+
+    fn with_traces(db: Arc<DB>, traces: Vec<XyTrace>, cx: &mut Context<Self>) -> Self {
+        let mut lp = Self::new(db, cx);
+        lp.bind_traces(traces, cx);
+        lp
     }
-    SharedString::from(format!("XY Plot ({} traces)", traces.len()))
+
+    fn effective_view(&self, cx: &gpui::App) -> Option<PlotBounds> {
+        self.effective_view(cx)
+    }
+
+    fn set_view_override(&mut self, view: Option<PlotBounds>, cx: &mut Context<Self>) {
+        self.set_view_override(view, cx)
+    }
+
+    fn clear_bound_overrides(&mut self) {
+        self.x_min_override = Override::Auto;
+        self.x_max_override = Override::Auto;
+        self.y_min_override = Override::Auto;
+        self.y_max_override = Override::Auto;
+    }
+
+    fn traces(&self) -> &[Entity<XyTrace>] {
+        &self.traces
+    }
+
+    fn title(&self) -> SharedString {
+        self.title()
+    }
+
+    fn legend_entry(trace: &XyTrace) -> (SharedString, Hsla, bool) {
+        (trace.label.clone(), trace.color, trace.visible)
+    }
+
+    fn toggle_visible(trace: &mut XyTrace) {
+        trace.visible = !trace.visible;
+    }
 }

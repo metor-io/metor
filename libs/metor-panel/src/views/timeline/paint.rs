@@ -279,11 +279,11 @@ impl Timeline {
                     continue;
                 };
                 let label = if thin {
-                    String::new()
+                    gpui::SharedString::default()
                 } else if bounds.len() > 1 {
-                    format!("{} +{}", event.event.short, bounds.len() - 1)
+                    format!("{} +{}", event.event.short, bounds.len() - 1).into()
                 } else {
-                    event.event.short.to_string()
+                    event.event.short.clone()
                 };
                 flags.push(ClusterPaint {
                     x: area.origin.x + px(x(event.event.ts.0) * s),
