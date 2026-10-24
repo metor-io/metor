@@ -696,14 +696,11 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
             Box::new({
                 let db = db.clone();
                 move |cx: &mut gpui::App| {
-                    let binding = crate::data_binding::Binding::from_text(saved, &db, cx);
-                    cx.new(|cx| {
-                        let mut view =
-                            crate::views::ComponentText::new(db.clone(), binding.id(), cx);
-                        view.source = binding;
-                        view
-                    })
-                    .into_any()
+                    let cfg = crate::views::ComponentTextConfig {
+                        component: saved.into(),
+                    };
+                    cx.new(|cx| crate::views::ComponentText::from_config(cfg, db.clone(), cx))
+                        .into_any()
                 }
             }) as Box<dyn Fn(&mut gpui::App) -> gpui::AnyEntity>,
         ),
@@ -712,14 +709,12 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
             Box::new({
                 let db = db.clone();
                 move |cx: &mut gpui::App| {
-                    let binding = crate::data_binding::Binding::from_text(saved, &db, cx);
-                    cx.new(|cx| {
-                        let mut view =
-                            crate::views::TrafficLight::new(db.clone(), binding.id(), cx);
-                        view.source = binding;
-                        view
-                    })
-                    .into_any()
+                    let cfg = crate::views::TrafficLightConfig {
+                        component: saved.into(),
+                        color: None,
+                    };
+                    cx.new(|cx| crate::views::TrafficLight::from_config(cfg, db.clone(), cx))
+                        .into_any()
                 }
             }),
         ),
@@ -1448,11 +1443,29 @@ fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppConte
             cx.new(|cx| AttitudeIndicator::from_config(&AttitudeConfig::default(), db.clone(), cx))
                 .into_any(),
             cx.new(|_| VectorMarker::empty(db.clone())).into_any(),
-            cx.new(|cx| ComponentText::new(db.clone(), id, cx))
-                .into_any(),
-            cx.new(|cx| Monitor::new(db.clone(), id, cx)).into_any(),
-            cx.new(|cx| TrafficLight::new(db.clone(), id, cx))
-                .into_any(),
+            cx.new(|cx| {
+                let cfg = ComponentTextConfig {
+                    component: "rpm".into(),
+                };
+                ComponentText::from_config(cfg, db.clone(), cx)
+            })
+            .into_any(),
+            cx.new(|cx| {
+                let cfg = MonitorConfig {
+                    component: "rpm".into(),
+                    ..Default::default()
+                };
+                Monitor::from_config(cfg, db.clone(), cx)
+            })
+            .into_any(),
+            cx.new(|cx| {
+                let cfg = TrafficLightConfig {
+                    component: "rpm".into(),
+                    color: None,
+                };
+                TrafficLight::from_config(cfg, db.clone(), cx)
+            })
+            .into_any(),
             cx.new(|_| time_series::Trace::new(id, 0, color)).into_any(),
             cx.new(|_| XyTrace::new(id, 0, id, 0, color)).into_any(),
             cx.new(|_| ListTrace::new(id, 1, color)).into_any(),

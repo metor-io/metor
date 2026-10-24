@@ -387,12 +387,11 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
             items.push(InspectionItem::SubMenu {
                 label: "New Panel".into(),
                 summary: SharedString::new_static(""),
-                build: Arc::new(move |_cx| {
+                build: Arc::new(move |_| {
                     crate::tiles::panels::new_panel_rows(
                         new_db.clone(),
                         pane.clone(),
                         new_open.clone(),
-                        _cx,
                     )
                 }),
             });

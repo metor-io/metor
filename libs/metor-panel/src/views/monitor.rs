@@ -3,10 +3,12 @@ use std::sync::Arc;
 use gpui::{Context, Entity, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use super::time_series::{LinePlot, Trace};
 use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
+use crate::data_binding::Binding;
 use crate::inspector::edits::{EditRequest, pending_edits, pending_edits_mut};
 use crate::inspector::plot_preview::shift_hover_listener;
 use crate::theme::{theme, ui_px};
@@ -28,7 +30,7 @@ pub struct Monitor {
     db: Arc<DB>,
     #[facet(opaque)]
     _binding_changes: gpui::Task<()>,
-    pub source: crate::data_binding::Binding,
+    pub source: Binding,
     #[facet(skip)]
     bound: ComponentId,
     #[facet(opaque)]
@@ -41,13 +43,44 @@ pub struct Monitor {
     _resolver_task: gpui::Task<()>,
 }
 
+/// Persisted shape of a monitor — the source component to monitor plus the
+/// inspector-editable display fields.
+///
+/// `unit` and `show_sparkline` are `Option`: `None` means "never edited", so
+/// restore keeps the metadata-derived defaults instead of clobbering them.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MonitorConfig {
+    pub component: String,
+    pub unit: Option<String>,
+    pub show_sparkline: Option<bool>,
+}
+
 impl Monitor {
-    pub fn binding_text(&self) -> String {
-        self.source.text(&self.db)
+    pub fn from_config(cfg: MonitorConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let binding = Binding::from_text(&cfg.component, &db, cx);
+        let mut monitor = Self::bind(db, binding, cx);
+        if let Some(unit) = cfg.unit {
+            monitor.unit = SharedString::from(unit);
+        }
+        if let Some(show) = cfg.show_sparkline {
+            monitor.show_sparkline = show;
+        }
+        monitor
     }
 
-    pub fn new(db: Arc<DB>, component_id: ComponentId, cx: &mut Context<Self>) -> Self {
-        let binding = crate::data_binding::Binding::from_legacy(component_id, None, &db, cx);
+    pub fn to_config(&self) -> MonitorConfig {
+        MonitorConfig {
+            component: self.source.text(&self.db),
+            unit: Some(self.unit.to_string()),
+            show_sparkline: Some(self.show_sparkline),
+        }
+    }
+
+    /// Stream whatever `binding` currently resolves to. A rebind replaces the
+    /// whole view, which is what drops the previous strip and resolver.
+    fn bind(db: Arc<DB>, binding: Binding, cx: &mut Context<Self>) -> Self {
+        let component_id = binding.id();
         let line_colors = theme(cx).line_colors;
 
         let (name, unit) = db.with_state(|state| {
@@ -198,11 +231,9 @@ impl Render for Monitor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.source.resolve(&self.db, cx);
         if self.bound != self.source.id() {
-            let source = self.source.clone();
             let unit = self.unit.clone();
             let show = self.show_sparkline;
-            *self = Self::new(self.db.clone(), source.id(), cx);
-            self.source = source;
+            *self = Self::bind(self.db.clone(), self.source.clone(), cx);
             self.unit = unit;
             self.show_sparkline = show;
         }
@@ -252,5 +283,32 @@ impl Render for Monitor {
         );
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_config_defaults_optional_display_fields() {
+        let cfg: MonitorConfig = serde_json::from_str(r#"{"component":"a.b"}"#).unwrap();
+        assert_eq!(cfg.component, "a.b");
+        assert_eq!(cfg.unit, None);
+        assert_eq!(cfg.show_sparkline, None);
+    }
+
+    #[test]
+    fn monitor_config_round_trips_display_fields() {
+        let cfg = MonitorConfig {
+            component: "a.b".to_string(),
+            unit: Some("V".to_string()),
+            show_sparkline: Some(false),
+        };
+        let blob = serde_json::to_string(&cfg).unwrap();
+        let back: MonitorConfig = serde_json::from_str(&blob).unwrap();
+        assert_eq!(back.component, "a.b");
+        assert_eq!(back.unit.as_deref(), Some("V"));
+        assert_eq!(back.show_sparkline, Some(false));
     }
 }

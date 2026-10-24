@@ -1,3 +1,4 @@
+pub(crate) mod add_menu;
 pub mod alarm_panel;
 pub mod annunciator;
 pub mod attitude;
@@ -54,7 +55,7 @@ pub use list_plot::{ListLinePlot, ListPlot, ListPlotPanelConfig, ListTrace, List
 pub use log_panel::{LevelFilter, LogView};
 pub use map::{Map, MapConfig};
 pub use meter::{Meter, MeterConfig, Orientation};
-pub use monitor::Monitor;
+pub use monitor::{Monitor, MonitorConfig};
 pub use outline::{Col, ComponentOutline, OutlineColumns, default_columns};
 pub use samples_table::{SamplesTable, SamplesTableConfig};
 pub use scrollbar::Scrollbar;

@@ -1,31 +1,32 @@
+//! Persisted shapes of the built-in panes, and the pane end of the shared
+//! "add view" menu.
+//!
+//! Every built-in pane is a [`crate::views::dashboard::WidgetSpec`] with a
+//! tile, so the configs here are what the registry parses for each key; the
+//! `*_view` / `*_config` pairs are the spec's `from_config` / `to_config` for
+//! the views that don't carry their own.
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{App, Context, Entity, IntoElement, Render, SharedString, Window, div, prelude::*};
+use gpui::{App, Context, Entity, SharedString};
 use metor_db::DB;
 use serde::{Deserialize, Serialize};
 
-use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
-use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
-#[cfg(test)]
-use crate::views::AnnunciatorConfig;
-use crate::views::dashboard::DashboardPanel;
+use crate::inspector::OpenInspectorCallback;
+use crate::inspector::rows::InspectorRow;
+use crate::views::add_menu::{AddMenu, Host};
+use crate::views::dashboard::WidgetRegistry;
 use crate::views::outline::model::{PivotLayout, type_key};
 use crate::views::time_series::Override;
-#[cfg(test)]
-use crate::views::time_series::{PlotStyle, TimeFormat};
 use crate::views::{
-    AlarmListMode, AlarmView, AttitudeConfig, ComponentBrowser, ComponentOutline,
-    ComponentTextConfig, GaugeConfig, LevelFilter, LogView, MeterConfig, OutlineColumns,
-    SequenceControlConfig, SequenceGrid, SequenceView, StateChipConfig, TrafficLightConfig,
-    new_component_browser,
+    AlarmListMode, AlarmView, ComponentBrowser, ComponentOutline, LevelFilter, LogView,
+    OutlineColumns, SequenceView, new_component_browser,
 };
 use crate::views::{Col, default_columns};
 
-use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
 
-/// Persisted shape of an [`AlarmPanel`]. The panel shows global alarm state, so the
+/// Persisted shape of the alarm pane. It shows global alarm state, so the
 /// only persisted bit is which tab it opens on.
 ///
 /// `show_history` is the pre-shelving spelling, kept as the fallback when `mode` is
@@ -37,61 +38,7 @@ pub struct AlarmPanelConfig {
     pub show_history: bool,
 }
 
-/// Pane item listing the control system's alarms with acknowledge controls.
-pub struct AlarmPanel {
-    inner: Entity<AlarmView>,
-}
-
-impl AlarmPanel {
-    pub fn new(_db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(AlarmView::new);
-        Self { inner }
-    }
-
-    pub fn from_config(cfg: AlarmPanelConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| {
-            let mut view = AlarmView::new(cx);
-            match cfg.mode {
-                Some(mode) => view.mode = mode,
-                None => view.set_history(cfg.show_history),
-            }
-            view
-        });
-        Self { inner }
-    }
-}
-
-impl Render for AlarmPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for AlarmPanel {
-    type Config = AlarmPanelConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        SharedString::new_static("Alarms")
-    }
-
-    fn serialization_key() -> &'static str {
-        "alarm"
-    }
-
-    fn to_config(&self, cx: &App) -> AlarmPanelConfig {
-        let view = self.inner.read(cx);
-        AlarmPanelConfig {
-            mode: Some(view.mode),
-            show_history: view.is_history(),
-        }
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into())
-    }
-}
-
-/// Persisted shape of a [`LogPanel`]: the view's filters and follow mode.
+/// Persisted shape of the log pane: the view's filters and follow mode.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct LogPanelConfig {
@@ -110,164 +57,65 @@ impl Default for LogPanelConfig {
     }
 }
 
-/// Pane item streaming the flight software's log lines.
-pub struct LogPanel {
-    inner: Entity<LogView>,
-}
-
-impl LogPanel {
-    pub fn new(_db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(LogView::new);
-        Self { inner }
-    }
-
-    pub fn from_config(cfg: LogPanelConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| {
-            let mut view = LogView::new(cx);
-            view.set_filters(cfg.min_level, cfg.source, cfg.follow);
-            view
-        });
-        Self { inner }
-    }
-}
-
-impl Render for LogPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for LogPanel {
-    type Config = LogPanelConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        SharedString::new_static("Logs")
-    }
-
-    fn serialization_key() -> &'static str {
-        "logs"
-    }
-
-    fn to_config(&self, cx: &App) -> LogPanelConfig {
-        let view = self.inner.read(cx);
-        LogPanelConfig {
-            min_level: view.min_level,
-            source: view.source.clone(),
-            follow: view.follow,
-        }
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into())
-    }
-}
-
-/// Persisted shape of a [`SequencePanel`]. Sequence state is global, so the only persisted
-/// bit is the view's list mode (defaulted).
+/// Persisted shape of the sequence pane. Sequence state is global, so the
+/// only persisted bit is the view's list mode (defaulted).
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct SequencePanelConfig {
     pub show_history: bool,
 }
 
-/// Pane item with the detailed per-channel sequence control list.
-pub struct SequencePanel {
-    inner: Entity<SequenceView>,
+pub(crate) fn alarm_view(
+    cfg: AlarmPanelConfig,
+    _db: Arc<DB>,
+    cx: &mut Context<AlarmView>,
+) -> AlarmView {
+    let mut view = AlarmView::new(cx);
+    match cfg.mode {
+        Some(mode) => view.mode = mode,
+        None => view.set_history(cfg.show_history),
+    }
+    view
 }
 
-impl SequencePanel {
-    pub fn new(_db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(SequenceView::new);
-        Self { inner }
-    }
-
-    pub fn from_config(cfg: SequencePanelConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| {
-            let mut view = SequenceView::new(cx);
-            view.set_history(cfg.show_history);
-            view
-        });
-        Self { inner }
-    }
-}
-
-impl Render for SequencePanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
+pub(crate) fn alarm_config(view: &AlarmView, _cx: &App) -> AlarmPanelConfig {
+    AlarmPanelConfig {
+        mode: Some(view.mode),
+        show_history: view.is_history(),
     }
 }
 
-impl PaneItem for SequencePanel {
-    type Config = SequencePanelConfig;
+pub(crate) fn log_view(cfg: LogPanelConfig, _db: Arc<DB>, cx: &mut Context<LogView>) -> LogView {
+    let mut view = LogView::new(cx);
+    view.set_filters(cfg.min_level, cfg.source, cfg.follow);
+    view
+}
 
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        SharedString::new_static("Sequences")
-    }
-
-    fn serialization_key() -> &'static str {
-        "sequence"
-    }
-
-    fn to_config(&self, cx: &App) -> SequencePanelConfig {
-        SequencePanelConfig {
-            show_history: self.inner.read(cx).is_history(),
-        }
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into())
+pub(crate) fn log_config(view: &LogView, _cx: &App) -> LogPanelConfig {
+    LogPanelConfig {
+        min_level: view.min_level,
+        source: view.source.clone(),
+        follow: view.follow,
     }
 }
 
-/// Persisted shape of a [`SequenceGridPanel`]. No per-panel config — the grid reads the
-/// global sequence store.
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct SequenceGridPanelConfig {}
-
-/// Pane item with the compact many-channel sequence grid.
-pub struct SequenceGridPanel {
-    inner: Entity<SequenceGrid>,
+pub(crate) fn sequence_view(
+    cfg: SequencePanelConfig,
+    _db: Arc<DB>,
+    cx: &mut Context<SequenceView>,
+) -> SequenceView {
+    let mut view = SequenceView::new(cx);
+    view.set_history(cfg.show_history);
+    view
 }
 
-impl SequenceGridPanel {
-    pub fn new(_db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(SequenceGrid::new);
-        Self { inner }
-    }
-
-    pub fn from_config(_cfg: SequenceGridPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self::new(db, cx)
+pub(crate) fn sequence_config(view: &SequenceView, _cx: &App) -> SequencePanelConfig {
+    SequencePanelConfig {
+        show_history: view.is_history(),
     }
 }
 
-impl Render for SequenceGridPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for SequenceGridPanel {
-    type Config = SequenceGridPanelConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        SharedString::new_static("Sequence Grid")
-    }
-
-    fn serialization_key() -> &'static str {
-        "sequence_grid"
-    }
-
-    fn to_config(&self, _cx: &App) -> SequenceGridPanelConfig {
-        SequenceGridPanelConfig::default()
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into())
-    }
-}
-
-/// Persisted shape of an [`OutlinePanel`]: the filter bar, the columns in
+/// Persisted shape of an outline: the filter bar, the columns in
 /// display order, the sort, the root, which branches the user opened or
 /// folded, and every pivot with its arrangement. Paths are full component
 /// names; pivot fields are relative to an instance.
@@ -360,33 +208,13 @@ impl PivotLayout {
     }
 }
 
-/// Pane item showing the component namespace as a collapsible tree-table.
-pub struct OutlinePanel {
-    inner: Entity<ComponentOutline>,
-}
-
-impl OutlinePanel {
-    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| ComponentOutline::new(db, cx));
-        Self { inner }
-    }
-
-    pub fn from_config(cfg: OutlinePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let panel = Self::new(db, cx);
-        panel
-            .inner
-            .update(cx, |outline, cx| apply_outline_config(outline, cfg, cx));
-        panel
-    }
-}
-
-/// Restore `cfg` onto a live outline. Shared with the dashboard widget,
-/// which hosts the same view without a pane around it.
-pub fn apply_outline_config(
-    outline: &mut ComponentOutline,
+/// An outline restored from `cfg`.
+pub(crate) fn outline_view(
     cfg: OutlinePanelConfig,
+    db: Arc<DB>,
     cx: &mut Context<ComponentOutline>,
-) {
+) -> ComponentOutline {
+    let mut outline = ComponentOutline::new(db, cx);
     outline.set_filter_visible(cfg.filter_bar, cx);
     outline.set_filter_text(&cfg.filter, cx);
     let columns: OutlineColumns = cfg.columns.iter().filter_map(|k| Col::parse(k)).collect();
@@ -417,10 +245,11 @@ pub fn apply_outline_config(
     outline.set_types(types, cx);
     outline.set_pivot_layouts(layouts, cx);
     outline.set_focus(cfg.focus, cx);
+    outline
 }
 
 /// The persisted shape of a live outline.
-pub fn outline_config(inner: &ComponentOutline, cx: &App) -> OutlinePanelConfig {
+pub(crate) fn outline_config(inner: &ComponentOutline, cx: &App) -> OutlinePanelConfig {
     let layouts = inner.pivot_layouts(cx);
     let arrangement = |key: &SharedString| {
         layouts
@@ -475,39 +304,7 @@ pub fn outline_config(inner: &ComponentOutline, cx: &App) -> OutlinePanelConfig 
     }
 }
 
-impl Render for OutlinePanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for OutlinePanel {
-    type Config = OutlinePanelConfig;
-
-    /// A rooted outline is named for its root's last segment, so a pane of
-    /// them reads `wheels | power | Outline`.
-    fn tab_title(&self, cx: &App) -> SharedString {
-        let root = self.inner.read(cx).root(cx);
-        match root.rsplit('.').next() {
-            Some(last) if !last.is_empty() => SharedString::from(last.to_string()),
-            _ => SharedString::new_static("Outline"),
-        }
-    }
-
-    fn serialization_key() -> &'static str {
-        "component_outline"
-    }
-
-    fn to_config(&self, cx: &App) -> OutlinePanelConfig {
-        outline_config(self.inner.read(cx), cx)
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
-    }
-}
-
-/// Persisted shape of a [`BrowserPanel`].
+/// Persisted shape of the component browser pane.
 ///
 /// `root_override` is an empty `Vec` rather than `Option<Vec<_>>` because
 /// "empty path" already encodes the no-override case and round-trips
@@ -522,76 +319,43 @@ pub struct BrowserPanelConfig {
     pub filter_bar: bool,
 }
 
-/// Pane item with a Finder-style browser over the component namespace tree.
-pub struct BrowserPanel {
-    inner: Entity<ComponentBrowser>,
+pub(crate) fn browser_view(
+    cfg: BrowserPanelConfig,
+    db: Arc<DB>,
+    cx: &mut Context<ComponentBrowser>,
+) -> ComponentBrowser {
+    let mut browser = new_component_browser(db, cx);
+    let custom = cfg.custom_title.map(SharedString::from);
+    let segments: smallvec::SmallVec<[SharedString; 8]> = cfg
+        .root_override
+        .into_iter()
+        .map(SharedString::from)
+        .collect();
+    let delegate = browser.delegate_mut();
+    delegate.set_custom_title(custom, cx);
+    if !segments.is_empty() {
+        // Eager apply for the common case where the tree is already
+        // populated; otherwise the watcher retries on each tree refresh
+        // until `pending_root_path` resolves or the user overrides intent
+        // (clear / new reroot).
+        delegate.set_pending_root_path(Some(segments.clone()));
+        delegate.set_root_path(&segments, cx);
+    }
+    browser.set_filter_visible(cfg.filter_bar, cx);
+    browser.set_filter_text(&cfg.filter, cx);
+    browser
 }
 
-impl BrowserPanel {
-    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| new_component_browser(db, cx));
-        Self { inner }
-    }
-
-    pub fn from_config(cfg: BrowserPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let panel = Self::new(db, cx);
-        let custom = cfg.custom_title.map(SharedString::from);
-        let segments: smallvec::SmallVec<[SharedString; 8]> = cfg
-            .root_override
-            .into_iter()
-            .map(SharedString::from)
-            .collect();
-        panel.inner.update(cx, |browser, cx| {
-            let delegate = browser.delegate_mut();
-            delegate.set_custom_title(custom, cx);
-            if !segments.is_empty() {
-                // Eager apply for the common case where the tree is
-                // already populated; otherwise the watcher retries on
-                // each tree refresh until `pending_root_path` resolves
-                // or the user overrides intent (clear / new reroot).
-                delegate.set_pending_root_path(Some(segments.clone()));
-                delegate.set_root_path(&segments, cx);
-            }
-            browser.set_filter_visible(cfg.filter_bar, cx);
-            browser.set_filter_text(&cfg.filter, cx);
-        });
-        panel
-    }
-}
-
-impl Render for BrowserPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for BrowserPanel {
-    type Config = BrowserPanelConfig;
-
-    fn tab_title(&self, cx: &App) -> SharedString {
-        self.inner.read(cx).title()
-    }
-
-    fn serialization_key() -> &'static str {
-        "component_browser"
-    }
-
-    fn to_config(&self, cx: &App) -> BrowserPanelConfig {
-        let inner = self.inner.read(cx);
-        let delegate = inner.delegate();
-        BrowserPanelConfig {
-            custom_title: delegate.custom_title().clone().map(|s| s.to_string()),
-            root_override: delegate
-                .root_override()
-                .map(|segs| segs.iter().map(|s| s.to_string()).collect())
-                .unwrap_or_default(),
-            filter: inner.filter_text(cx),
-            filter_bar: inner.filter_visible(),
-        }
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
+pub(crate) fn browser_config(browser: &ComponentBrowser, cx: &App) -> BrowserPanelConfig {
+    let delegate = browser.delegate();
+    BrowserPanelConfig {
+        custom_title: delegate.custom_title().clone().map(|s| s.to_string()),
+        root_override: delegate
+            .root_override()
+            .map(|segs| segs.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default(),
+        filter: browser.filter_text(cx),
+        filter_bar: browser.filter_visible(),
     }
 }
 
@@ -615,7 +379,8 @@ pub(crate) fn add_registered_panel(
     add_registered_panel_state(pane, key, &state, cx)
 }
 
-fn add_registered_panel_state(
+/// Add a view by its registry key, returning the entity the inspector opens on.
+pub(crate) fn add_registered_panel_state(
     pane: &Entity<Pane>,
     key: &str,
     state: &str,
@@ -630,376 +395,38 @@ fn add_registered_panel_state(
     })
 }
 
-fn inspect_created(
-    entity: gpui::AnyEntity,
-    db: &Arc<DB>,
-    on_open: &Option<OpenInspectorCallback>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let Some(on_open) = on_open else { return };
-    let Some(rows) = crate::inspector::reflect::rows_for_any_entity(&entity, db, cx) else {
-        return;
-    };
-    on_open(
-        InspectorRequest {
-            rows,
-            mode: InspectorMode::Centered,
-        },
-        window,
-        cx,
-    );
-}
-
-#[derive(Clone)]
-struct PanelMenu {
-    db: Arc<DB>,
-    pane: Entity<Pane>,
-    on_open_inspector: Option<OpenInspectorCallback>,
-}
-
-impl PanelMenu {
-    fn wizard<T: 'static, C: serde::Serialize + 'static>(
-        &self,
-        label: &'static str,
-        key: &'static str,
-        pick: impl Fn(Arc<DB>, Arc<dyn Fn(T, &mut Window, &mut App)>) -> Vec<Box<dyn InspectorRow>>
-        + 'static,
-        configure: fn(T) -> C,
-    ) -> Box<dyn InspectorRow> {
-        let menu = self.clone();
-        Box::new(NavRow::new(
-            label,
-            "",
-            Box::new(move |_| {
-                let commit = menu.clone();
-                pick(
-                    menu.db.clone(),
-                    Arc::new(move |selected, window, cx| {
-                        if let Some(entity) =
-                            add_registered_panel(&commit.pane, key, &configure(selected), cx)
-                        {
-                            inspect_created(
-                                entity,
-                                &commit.db,
-                                &commit.on_open_inspector,
-                                window,
-                                cx,
-                            );
-                        }
-                    }),
-                )
-            }),
-        ))
-    }
-
-    fn component<C: serde::Serialize + 'static>(
-        &self,
-        label: &'static str,
-        key: &'static str,
-        configure: fn(String) -> C,
-    ) -> Box<dyn InspectorRow> {
-        let menu = self.clone();
-        Box::new(NavRow::new(
-            label,
-            "",
-            Box::new(move |_| {
-                let pane = menu.pane.clone();
-                let db = menu.db.clone();
-                crate::inspector::trace_picker::binding_picker_rows(
-                    menu.db.clone(),
-                    move |binding, cx| {
-                        add_registered_panel(&pane, key, &configure(binding.text(&db)), cx);
-                    },
-                )
-            }),
-        ))
-    }
-
-    fn instrument(
-        &self,
-        label: &'static str,
-        key: &'static str,
-        configure: fn(ScaleSeed) -> String,
-    ) -> Box<dyn InspectorRow> {
-        let menu = self.clone();
-        Box::new(NavRow::new(
-            label,
-            "",
-            Box::new(move |_| {
-                instrument_wizard_rows(menu.db.clone(), menu.pane.clone(), key, configure)
-            }),
-        ))
-    }
-
-    fn command(
-        &self,
-        label: &'static str,
-        build: impl Fn(Arc<DB>, &mut App) -> Box<dyn PaneItemHandle> + 'static,
-    ) -> Box<dyn InspectorRow> {
-        let menu = self.clone();
-        Box::new(CommandRow::new(
-            label,
-            Arc::new(move |_, cx| {
-                let item = build(menu.db.clone(), cx);
-                menu.pane.update(cx, |pane, cx| pane.add_item(item, cx));
-            }),
-        ))
-    }
-
-    fn configured<C: serde::Serialize + 'static>(
-        &self,
-        label: &'static str,
-        key: &'static str,
-        config: C,
-    ) -> Box<dyn InspectorRow> {
-        let pane = self.pane.clone();
-        Box::new(CommandRow::new(
-            label,
-            Arc::new(move |_, cx| {
-                add_registered_panel(&pane, key, &config, cx);
-            }),
-        ))
-    }
-}
-
-/// Build the panel menu in display order, including downstream add flows.
+/// The "add view" menu aimed at `pane`. A widget kind opens under its tile
+/// key; a kind with no widget spec (the dashboard itself) is a pane key
+/// already.
 pub(crate) fn new_panel_rows(
     db: Arc<DB>,
     pane: Entity<Pane>,
     on_open_inspector: Option<OpenInspectorCallback>,
-    cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let menu = PanelMenu {
+    AddMenu {
         db,
-        pane,
+        host: Host::Pane,
+        sink: Arc::new(move |kind, config, cx| {
+            let key = cx
+                .global::<WidgetRegistry>()
+                .spec(kind)
+                .and_then(|spec| Some(spec.tile.as_ref()?.serialization_key.clone()))
+                .unwrap_or_else(|| kind.0.clone());
+            add_registered_panel_state(&pane, &key, &config, cx)
+        }),
         on_open_inspector,
-    };
-    let mut rows = plot_panel_rows(&menu);
-    rows.extend(instrument_panel_rows(&menu));
-    rows.extend(utility_panel_rows(&menu));
-    if let Some(registry) = cx.try_global::<crate::views::dashboard::WidgetRegistry>() {
-        for (label, add_flow) in registry.tile_add_flows() {
-            let menu = menu.clone();
-            rows.push(Box::new(NavRow::new(
-                label,
-                "",
-                Box::new(move |cx| add_flow(menu.pane.clone(), menu.db.clone(), cx)),
-            )));
-        }
     }
-    rows
-}
-
-fn plot_panel_rows(menu: &PanelMenu) -> Vec<Box<dyn InspectorRow>> {
-    vec![
-        menu.wizard(
-            "Time Series Plot",
-            "time_series_plot",
-            |db, commit| {
-                crate::inspector::trace_picker::select_traces_wizard_rows(
-                    db,
-                    Arc::new(|_| 0),
-                    commit,
-                )
-            },
-            |traces| PlotPanelConfig {
-                traces: traces.iter().map(TraceConfig::from).collect(),
-                ..Default::default()
-            },
-        ),
-        menu.wizard(
-            "XY Plot",
-            "xy_plot",
-            |db, commit| {
-                crate::views::xy_plot::trace_picker::select_xy_trace_wizard_rows(
-                    db,
-                    Arc::new(|_| 0),
-                    commit,
-                )
-            },
-            |trace| XyPlotPanelConfig {
-                traces: vec![XyTraceConfig::from(&trace)],
-                ..Default::default()
-            },
-        ),
-        menu.wizard(
-            "List Plot",
-            "list_plot",
-            |db, commit| {
-                crate::views::list_plot::trace_picker::select_list_trace_wizard_rows(
-                    db,
-                    Arc::new(|_| 0),
-                    commit,
-                )
-            },
-            |trace| ListPlotPanelConfig {
-                traces: vec![ListTraceConfig::from(&trace)],
-                ..Default::default()
-            },
-        ),
-        menu.wizard(
-            "Spectrogram",
-            "spectrogram",
-            |db, commit| {
-                crate::views::spectrogram::trace_picker::select_spectrogram_trace_wizard_rows(
-                    db, commit,
-                )
-            },
-            |trace| SpectrogramPanelConfig {
-                traces: vec![SpectrogramTraceConfig::from(&trace)],
-                ..Default::default()
-            },
-        ),
-    ]
-}
-
-fn instrument_panel_rows(menu: &PanelMenu) -> Vec<Box<dyn InspectorRow>> {
-    let pane = menu.pane.clone();
-    vec![
-        menu.component("Component Text", "component_text", |component| {
-            ComponentTextConfig { component }
-        }),
-        menu.component("Traffic Light", "traffic_light", |component| {
-            TrafficLightConfig {
-                component,
-                color: None,
-            }
-        }),
-        Box::new(NavRow::new(
-            "Annunciator",
-            "",
-            Box::new(move |_| annunciator_pattern_rows(pane.clone())),
-        )),
-        menu.instrument("Meter", "meter", |seed| {
-            serde_json::to_string(&MeterConfig::from(seed)).unwrap()
-        }),
-        menu.instrument("Gauge", "gauge", |seed| {
-            serde_json::to_string(&GaugeConfig::from(seed)).unwrap()
-        }),
-        menu.instrument("State Chip", "state_chip", |seed| {
-            serde_json::to_string(&StateChipConfig {
-                component: seed.component,
-                element: seed.element,
-                label: Some(seed.label),
-                ..Default::default()
-            })
-            .unwrap()
-        }),
-        menu.component("Attitude", "attitude", |component| AttitudeConfig {
-            component,
-            ..Default::default()
-        }),
-        menu.component("Map", "map", |component| crate::views::MapConfig {
-            component,
-            ..Default::default()
-        }),
-        menu.component("Samples", "samples_table", |component| {
-            crate::views::SamplesTableConfig { component }
-        }),
-    ]
-}
-
-fn utility_panel_rows(menu: &PanelMenu) -> Vec<Box<dyn InspectorRow>> {
-    let pane = menu.pane.clone();
-    vec![
-        Box::new(NavRow::new(
-            "Sequence Control",
-            "",
-            Box::new(move |cx| {
-                let pane = pane.clone();
-                crate::views::sequence_control::channel_picker_rows(cx, move |channel, cx| {
-                    add_registered_panel(
-                        &pane,
-                        "sequence_control",
-                        &SequenceControlConfig {
-                            channel,
-                            compact: false,
-                        },
-                        cx,
-                    );
-                })
-            }),
-        )),
-        menu.command("Outline", |db, cx| {
-            Box::new(cx.new(|cx| OutlinePanel::new(db, cx)))
-        }),
-        menu.command("Component Browser", |db, cx| {
-            Box::new(cx.new(|cx| BrowserPanel::new(db, cx)))
-        }),
-        menu.configured("3D Viewer", "viewer_3d", Viewer3dPanelConfig::default()),
-        menu.command("Dashboard", |db, cx| {
-            Box::new(cx.new(|cx| DashboardPanel::new(db, cx)))
-        }),
-        menu.command("Alarms", |db, cx| {
-            Box::new(cx.new(|cx| AlarmPanel::new(db, cx)))
-        }),
-        menu.command("Logs", |db, cx| {
-            Box::new(cx.new(|cx| LogPanel::new(db, cx)))
-        }),
-        menu.command("Sequences", |db, cx| {
-            Box::new(cx.new(|cx| SequencePanel::new(db, cx)))
-        }),
-        menu.command("Sequence Grid", |db, cx| {
-            Box::new(cx.new(|cx| SequenceGridPanel::new(db, cx)))
-        }),
-        menu.configured(
-            "Timeline",
-            "timeline",
-            crate::views::TimelineConfig::default(),
-        ),
-        menu.configured(
-            "Execution Timeline",
-            "exec_timeline",
-            crate::views::ExecTimelineConfig::default(),
-        ),
-    ]
-}
-
-/// Single-question wizard for "New Panel → Annunciator": prompts for a glob
-/// pattern, then opens an annunciator seeded with that pattern.
-fn annunciator_pattern_rows(pane: Entity<Pane>) -> Vec<Box<dyn InspectorRow>> {
-    vec![crate::views::annunciator::glob_prompt_row(Arc::new(
-        move |pattern, _window, cx| {
-            add_registered_panel(
-                &pane,
-                "annunciator",
-                &crate::views::annunciator::seeded_config(&pattern),
-                cx,
-            );
-        },
-    ))]
-}
-
-use crate::views::instrument::{ScaleSeed, scale_seeds_for_traces};
-
-/// The trace wizard wired to a scalar-instrument constructor: every picked
-/// element becomes its own tile, built by `make`.
-///
-/// Meter, gauge, and chip differ only in what they construct from a
-/// [`ScaleSeed`], so they share one wizard rather than three copies of the
-/// same closure nest.
-fn instrument_wizard_rows(
-    db: Arc<DB>,
-    pane: Entity<Pane>,
-    key: &'static str,
-    make_config: fn(ScaleSeed) -> String,
-) -> Vec<Box<dyn InspectorRow>> {
-    let db_outer = db.clone();
-    crate::inspector::trace_picker::select_traces_wizard_rows(
-        db,
-        Arc::new(|_cx| 0),
-        Arc::new(move |traces, _window, cx| {
-            for seed in scale_seeds_for_traces(&db_outer, &traces, cx) {
-                add_registered_panel_state(&pane, key, &make_config(seed), cx);
-            }
-        }),
-    )
+    .rows()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::views::time_series::{PlotStyle, TimeFormat};
+    use crate::views::{
+        AnnunciatorConfig, AttitudeConfig, ComponentTextConfig, GaugeConfig, MeterConfig,
+        SequenceControlConfig, StateChipConfig,
+    };
     use gpui::Hsla;
     use metor_proto::types::ComponentId;
 

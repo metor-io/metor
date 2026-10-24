@@ -1136,7 +1136,7 @@ mod tests {
         let pane = cx.read(|cx| tg.read(cx).panes()[0].clone());
         cx.update(|cx| {
             tg.update(cx, |tg, cx| {
-                tg.focus_or_open("other_item", |cx| other_item(cx), cx);
+                tg.focus_or_open("other_item", |cx| Some(other_item(cx)), cx);
             });
         });
         cx.read(|cx| {
@@ -1152,7 +1152,7 @@ mod tests {
         let pane = cx.read(|cx| tg.read(cx).panes()[0].clone());
         cx.update(|cx| {
             tg.update(cx, |tg, cx| {
-                tg.focus_or_open("other_item", |cx| other_item(cx), cx);
+                tg.focus_or_open("other_item", |cx| Some(other_item(cx)), cx);
             });
         });
         cx.read(|cx| {
