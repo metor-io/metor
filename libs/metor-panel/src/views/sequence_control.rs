@@ -7,9 +7,9 @@
 //! reachable in a single click rather than through the inspector.
 //!
 //! The shape is one strip-height row: the channel and its run state over a
-//! sequence dropdown on the left, transport-style icon buttons on the right.
-//! The dropdown only stages a choice; the chevron fused to its right edge
-//! sends the load, the same stage-then-apply pair a value strip uses for a
+//! state-chip box naming the sequence on the left, transport-style icon
+//! buttons on the right, all one box height. Picking from the box only
+//! stages a choice; the chevron fused to its right edge sends the load, the same stage-then-apply pair a value strip uses for a
 //! pending edit, since a load replaces whatever the channel holds. The
 //! protocol has no pause, so the slot a transport gives pause holds Abort
 //! (the commanded safe stop, under its own glyph) rather than a hold the
@@ -23,8 +23,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, ClickEvent, Context, Div, FontWeight, Hsla, IntoElement, SharedString, Stateful,
-    WeakEntity, Window, div, prelude::*, px,
+    App, ClickEvent, Context, Div, Hsla, IntoElement, SharedString, Stateful, WeakEntity, Window,
+    div, prelude::*,
 };
 use metor_proto_wkt::SequenceRunState;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,9 @@ use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, ChannelState, is_resettable, run_state_index, run_state_label};
 use crate::theme::{Theme, theme, ui_px};
 use crate::views::TooltipText;
+use crate::views::value_strip::{
+    STRIP_BOX_HEIGHT, STRIP_BOX_VALUE_SIZE, apply_chevron, box_corners, box_fill, box_padding,
+};
 
 /// Persisted shape of a [`SequenceControl`], shared by the tile and dashboard
 /// surfaces.
@@ -297,101 +300,68 @@ impl Render for SequenceControl {
 }
 
 impl SequenceControl {
-    /// The sequence picker and its commit arrow, fused into one pill the way
-    /// a value strip fuses a pending edit with its apply chevron: choosing in
-    /// the dropdown only stages a name, the arrow sends the load.
+    /// The sequence as a state chip's box with the commit chevron fused to
+    /// it, the pair a value strip uses for a pending edit: clicking the box
+    /// lists the sequences and choosing one only stages it, the chevron
+    /// sends the load.
     fn load_row(&self, ch: &ChannelState, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let pending = self.staged.is_some();
         let shown = self.staged.clone().or_else(|| ch.loaded.clone());
         let available = ch.available.clone();
         let pickable = !available.is_empty();
 
-        let picker = div()
-            .id("seq-ctl-pick")
-            .debug_selector(|| "seq-ctl-pick".into())
-            .flex_1()
-            .min_w_0()
-            .h(ui_px(20.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(ui_px(4.0))
-            .px(ui_px(6.0))
-            .rounded_l(px(3.0))
-            .bg(if pending {
-                theme.drop_target
-            } else {
-                theme.bg_elevated
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(ui_px(11.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if shown.is_some() {
-                        theme.text_primary
-                    } else {
-                        theme.text_tertiary
-                    })
-                    .child(match &shown {
-                        Some(name) => name.to_uppercase(),
-                        None if pickable => "CHOOSE SEQUENCE".to_string(),
-                        None => "NO SEQUENCES".to_string(),
-                    }),
-            )
-            .child(
-                Icon::ChevronDown
-                    .svg(10.0, theme.text_secondary)
-                    .flex_none(),
-            )
-            .when(pickable, |el| {
-                let hover = theme.selection_bg;
-                el.cursor_pointer()
-                    .hover(move |s| s.bg(hover))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        this.arming_stop = false;
-                        cx.notify();
-                        let Some(open) = open_inspector(cx) else {
-                            return;
-                        };
-                        open(
-                            InspectorRequest {
-                                rows: stage_rows(cx.weak_entity(), &available),
-                                mode: InspectorMode::Anchored(event.position()),
-                            },
-                            window,
-                            cx,
-                        );
-                    }))
-            });
+        let chip = box_padding(box_corners(
+            div()
+                .id("seq-ctl-pick")
+                .debug_selector(|| "seq-ctl-pick".into())
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .h(ui_px(STRIP_BOX_HEIGHT)),
+            true,
+        ))
+        .bg(box_fill(theme, pending, false, None))
+        .text_size(ui_px(STRIP_BOX_VALUE_SIZE))
+        .text_color(if shown.is_some() {
+            theme.text_primary
+        } else {
+            theme.text_tertiary
+        })
+        .child(div().min_w_0().truncate().child(match shown {
+            Some(name) => name,
+            None if pickable => SharedString::new_static("Choose sequence"),
+            None => SharedString::new_static("No sequences"),
+        }))
+        .when(pickable, |el| {
+            let hover = theme.selection_bg;
+            el.cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    this.arming_stop = false;
+                    cx.notify();
+                    let Some(open) = open_inspector(cx) else {
+                        return;
+                    };
+                    open(
+                        InspectorRequest {
+                            rows: stage_rows(cx.weak_entity(), &available),
+                            mode: InspectorMode::Anchored(event.position()),
+                        },
+                        window,
+                        cx,
+                    );
+                }))
+        });
 
-        let commit = div()
-            .id("seq-ctl-commit")
+        let commit = apply_chevron("seq-ctl-commit", theme, pending)
             .debug_selector(|| "seq-ctl-commit".into())
-            .flex_none()
-            .h(ui_px(20.0))
-            .px(ui_px(6.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_r(px(3.0))
-            .map(|el| {
-                if pending {
-                    el.bg(theme.control_active.opacity(0.15))
-                        .cursor_pointer()
-                        .child(Icon::ChevronRight.svg(11.0, theme.control_active))
-                        .tooltip(|_window, cx| TooltipText::build("Load".into(), cx))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(name) = this.staged.take() {
-                                this.command(cx, |s, c| s.load(c, name.to_string()));
-                            }
-                        }))
-                } else {
-                    el.bg(theme.bg_elevated)
-                        .child(Icon::ChevronRight.svg(11.0, theme.text_tertiary))
-                }
+            .when(pending, |el| {
+                el.tooltip(|_window, cx| TooltipText::build("Load".into(), cx))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(name) = this.staged.take() {
+                            this.command(cx, |s, c| s.load(c, name.to_string()));
+                        }
+                    }))
             });
 
         div()
@@ -399,7 +369,7 @@ impl SequenceControl {
             .flex_row()
             .items_center()
             .min_w_0()
-            .child(picker)
+            .child(chip)
             .child(commit)
     }
 }
@@ -452,7 +422,7 @@ fn icon_button(
         .id(id)
         .debug_selector(|| id.into())
         .flex_none()
-        .size(ui_px(28.0))
+        .size(ui_px(STRIP_BOX_HEIGHT))
         .flex()
         .items_center()
         .justify_center()

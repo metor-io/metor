@@ -783,29 +783,14 @@ impl Render for ComponentValueStrip {
                 let apply = behavior.on_apply_element.clone().unwrap();
                 let chevron_id =
                     (component_id.0.wrapping_mul(31) ^ idx as u64).wrapping_add(0x1001) as usize;
-                let mut bg = theme.control_active;
-                bg.a = 0.15;
                 let mut group = div().flex().flex_row().items_center().child(atom).child(
-                    div()
-                        .id(("strip-apply", chevron_id))
-                        .px(ui_px(6.0))
-                        .h(ui_px(25.5))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(bg)
-                        .rounded_r(px(3.0))
-                        .text_size(ui_px(12.0))
-                        .text_color(theme.control_active)
-                        .cursor_pointer()
-                        .child(Icon::ChevronRight.svg(11.0, theme.control_active))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            move |event: &gpui::MouseDownEvent, window, cx| {
-                                apply(idx, event.position, window, cx);
-                                cx.refresh_windows();
-                            },
-                        ),
+                    apply_chevron(("strip-apply", chevron_id), &theme, true).on_mouse_down(
+                        MouseButton::Left,
+                        move |event: &gpui::MouseDownEvent, window, cx| {
+                            apply(idx, event.position, window, cx);
+                            cx.refresh_windows();
+                        },
+                    ),
                 );
                 if style.intrinsic_width {
                     group = group.flex_none();
@@ -934,14 +919,10 @@ fn build_cell_chrome(
     accent: Option<gpui::Hsla>,
     inside_apply_group: bool,
 ) -> Stateful<gpui::Div> {
-    let mut atom = div().id(("strip-cell", id_key)).flex().flex_row();
-    // Round only the left corners when a chevron sits flush against the
-    // right edge, so the two halves visually fuse into a single pill.
-    if inside_apply_group {
-        atom = atom.rounded_l(px(3.0));
-    } else {
-        atom = atom.rounded(px(3.0));
-    }
+    let mut atom = box_corners(
+        div().id(("strip-cell", id_key)).flex().flex_row(),
+        inside_apply_group,
+    );
 
     if is_bool {
         // Bool cells double as their own toggle track. Padding mirrors text
@@ -963,7 +944,7 @@ fn build_cell_chrome(
             .bg(theme.text_primary);
         atom = atom
             .w(ui_px(40.0))
-            .h(ui_px(25.5))
+            .h(ui_px(STRIP_BOX_HEIGHT))
             .py(ui_px(4.0))
             .px(ui_px(4.0))
             .items_center()
@@ -973,12 +954,7 @@ fn build_cell_chrome(
         return atom;
     }
 
-    atom = atom
-        .items_center()
-        .gap(ui_px(2.0))
-        .px(ui_px(4.0))
-        .py(ui_px(3.0))
-        .overflow_hidden();
+    atom = box_padding(atom);
 
     // Fixed-width keeps a "0" cell and a "0.0083" cell aligned across rows
     // so neighboring boxes don't shift. Solo unlabeled cells have no siblings
@@ -1002,16 +978,7 @@ fn build_cell_chrome(
     let chip_accent = (!is_pending && !stale).then_some(accent).flatten();
     match style.preset {
         StripPreset::Boxes => {
-            let bg = if is_pending {
-                theme.drop_target
-            } else if stale {
-                theme.stale_bg()
-            } else if let Some(accent) = chip_accent {
-                Theme::dim(accent, 0.18)
-            } else {
-                theme.bg_secondary
-            };
-            atom = atom.bg(bg);
+            atom = atom.bg(box_fill(theme, is_pending, stale, chip_accent));
         }
         StripPreset::Dashboard => {
             if is_pending {
@@ -1047,7 +1014,7 @@ fn build_cell_chrome(
     let base_value_size = match (style.preset, is_solo) {
         (StripPreset::Dashboard, true) => 16.0,
         (StripPreset::Dashboard, false) => 12.0,
-        (StripPreset::Boxes, _) => 12.0,
+        (StripPreset::Boxes, _) => STRIP_BOX_VALUE_SIZE,
     };
     let value_size = if let Some(size) = style.value_size {
         ui_px(size)
@@ -1102,6 +1069,70 @@ fn build_cell_chrome(
 }
 
 pub const STRIP_BOX_CELL_WIDTH: f32 = 78.0;
+/// Height of a box cell and of the apply chevron fused to it. Controls that
+/// sit in a row with boxes (the sequence control's buttons) take it too.
+pub const STRIP_BOX_HEIGHT: f32 = 25.5;
+/// Text size of a box cell's value when nothing overrides it.
+pub const STRIP_BOX_VALUE_SIZE: f32 = 12.0;
+
+/// Corners of a box cell. A cell with an apply chevron flush against its
+/// right edge rounds only its left side, so the two read as one pill.
+pub(crate) fn box_corners<E: Styled>(el: E, fused: bool) -> E {
+    if fused {
+        el.rounded_l(px(3.0))
+    } else {
+        el.rounded(px(3.0))
+    }
+}
+
+/// Inner layout of a text box cell.
+pub(crate) fn box_padding<E: Styled>(el: E) -> E {
+    el.items_center()
+        .gap(ui_px(2.0))
+        .px(ui_px(4.0))
+        .py(ui_px(3.0))
+        .overflow_hidden()
+}
+
+/// Fill of a box cell. Pending and stale outrank the state accent: a chip
+/// must not look healthy while its edit is unsent or its producer is dead.
+pub(crate) fn box_fill(theme: &Theme, pending: bool, stale: bool, accent: Option<Hsla>) -> Hsla {
+    if pending {
+        theme.drop_target
+    } else if stale {
+        theme.stale_bg()
+    } else if let Some(accent) = accent {
+        Theme::dim(accent, 0.18)
+    } else {
+        theme.bg_secondary
+    }
+}
+
+/// The chevron that commits a staged box: fused to the box's right edge, at
+/// its height. Inactive, it keeps its place but reads as nothing to send.
+pub(crate) fn apply_chevron(
+    id: impl Into<gpui::ElementId>,
+    theme: &Theme,
+    active: bool,
+) -> Stateful<gpui::Div> {
+    let (bg, fg) = if active {
+        (theme.control_active.opacity(0.15), theme.control_active)
+    } else {
+        (theme.bg_secondary, theme.text_tertiary)
+    };
+    div()
+        .id(id)
+        .flex_none()
+        .px(ui_px(6.0))
+        .h(ui_px(STRIP_BOX_HEIGHT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(bg)
+        .rounded_r(px(3.0))
+        .when(active, |el| el.cursor_pointer())
+        .child(Icon::ChevronRight.svg(11.0, fg))
+}
 pub const STRIP_CELL_GAP: f32 = 4.0;
 
 pub fn cell_width(preset: StripPreset, is_solo: bool) -> Rems {
