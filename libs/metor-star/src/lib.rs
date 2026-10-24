@@ -14,4 +14,5 @@ pub mod lis;
 #[cfg(feature = "sim")]
 pub mod render;
 pub mod starcat;
+pub mod tracker;
 pub mod wahba;

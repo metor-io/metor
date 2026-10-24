@@ -154,6 +154,7 @@ fn pyramid_identifies_simulated_frames() {
     let cases = [0usize, 2, 5];
     let mut scores: Vec<Score> = cases.iter().map(|_| Score::default()).collect();
     let mut extract = Vec::new();
+    let mut cerr = Vec::new();
     for trial in 0..trials {
         let q = random_q(&mut rng);
         let motion = Motion {
@@ -171,6 +172,16 @@ fn pyramid_identifies_simulated_frames() {
             .filter_map(|c| Some((cam.pixel_to_st(c.u, c.v)?, (c.u, c.v))))
             .collect();
         extract.push(t0.elapsed());
+        for c in &centroids {
+            let near: Vec<_> = truth
+                .brightest()
+                .iter()
+                .filter(|t| (t.u - c.u).hypot(t.v - c.v) < 2.0)
+                .collect();
+            if near.len() == 1 {
+                cerr.push((near[0].u - c.u).hypot(near[0].v - c.v));
+            }
+        }
         for (&n_false, s) in cases.iter().zip(&mut scores) {
             let mut obs: Vec<V3> = (0..n_false).map(|_| false_star(&cam, &mut rng)).collect();
             obs.extend(real.iter().map(|(b, _)| *b));
@@ -218,6 +229,12 @@ fn pyramid_identifies_simulated_frames() {
             }
         }
     }
+    let d: Vec<f64> = cerr.iter().map(|e| e * e).collect();
+    println!(
+        "centroid error RMS per axis {:.3} px over {}",
+        (d.iter().sum::<f64>() / (2.0 * d.len() as f64)).sqrt(),
+        d.len()
+    );
     extract.sort();
     println!(
         "extract median {:?}, max {:?}",
@@ -256,4 +273,174 @@ fn only_false_stars_run_to_the_triplet_cap() {
         "all false: median {:?} per frame, {per:?} per triplet",
         times[times.len() / 2]
     );
+}
+
+mod tracking {
+    use metor_star::lis::LisConfig;
+    use metor_star::tracker::{
+        Failure, Mode, Outcome, Prior, TrackConfig, Tracker, predict, sigma_of,
+    };
+
+    use super::*;
+
+    const T_EXP: f64 = 0.1;
+
+    struct Rig<'a> {
+        render: Renderer<'a>,
+        tracker: Tracker<'a>,
+        px: Vec<u16>,
+    }
+
+    fn rig() -> Rig<'static> {
+        let db = Db::parse(DB).unwrap();
+        let cam = camera();
+        let tracker = Tracker::new(
+            db,
+            cam,
+            ImageConfig::default(),
+            LisConfig::default(),
+            TrackConfig::default(),
+        )
+        .unwrap();
+        Rig {
+            render: renderer(StarCat::parse(STARCAT).unwrap()),
+            tracker,
+            px: vec![0; (SIZE * SIZE) as usize],
+        }
+    }
+
+    impl Rig<'_> {
+        /// Renders the frame starting at `q` with rate `omega`, and returns the
+        /// mid-exposure attitude.
+        fn expose(&mut self, q: Quat, omega: V3, seed: u64) -> Quat {
+            let motion = Motion {
+                q_b_eci: q,
+                omega_b: omega,
+                beta: [0.0; 3],
+                t_exp: T_EXP,
+            };
+            let frame = Frame::new(&camera(), &motion, 16, seed, seed).unwrap();
+            self.render.render(&frame, &mut self.px).unwrap();
+            predict(q, omega, 0.5 * T_EXP)
+        }
+
+        fn process(&mut self, prior: Option<Prior>, budget: u32) -> Outcome {
+            self.tracker.process(&self.px, prior, budget)
+        }
+    }
+
+    fn solved(outcome: Outcome) -> (Mode, metor_star::lis::Match) {
+        match outcome {
+            Outcome::Solved(mode, m) => (mode, m),
+            other => panic!("not solved: {other:?}"),
+        }
+    }
+
+    /// 100 frames at 10 Hz turning 0.1°/s: the first is lost-in-space, every
+    /// later one tracks from the last solution and the gyro.
+    #[test]
+    fn a_turning_sequence_tracks_after_the_first_frame() {
+        let mut rig = rig();
+        let mut rng = StdRng::seed_from_u64(31);
+        let mut q = random_q(&mut rng);
+        let axis = normalize_v([1.0, 0.4, -0.3]);
+        let omega = axis.map(|x| x * 0.1f64.to_radians());
+        let mut last: Option<(Quat, f64)> = None;
+        let (mut nees, mut n) = (0.0, 0);
+        for k in 0..100u64 {
+            let truth = rig.expose(q, omega, k + 1);
+            // The prior: the last solution turned by the gyro over 0.1 s.
+            let prior = last.map(|(q_last, sigma)| Prior {
+                q_st_eci: predict(q_last, omega, 0.1),
+                sigma_rad: sigma + 1e-5,
+            });
+            let (mode, m) = solved(rig.process(prior, u32::MAX));
+            assert_eq!(
+                mode,
+                if k == 0 { Mode::Lost } else { Mode::Tracking },
+                "frame {k}"
+            );
+            assert!(m.n_match >= 6, "frame {k}: {} matched", m.n_match);
+            let err = m.q.angle_to(truth);
+            assert!(err < 1e-3, "frame {k}: {err}");
+            // NEES of the attitude error under p_theta.
+            let d = truth.conj() * m.q;
+            let e: V3 = core::array::from_fn(|i| 2.0 * d.0[i] * d.0[3].signum());
+            if let Some(inv) = metor_star::geom::inv_sym(m.p_theta) {
+                let pe = metor_star::geom::mat_vec(inv, e);
+                nees += metor_star::geom::dot(e, pe);
+                n += 1;
+            }
+            last = Some((m.q, sigma_of(m.p_theta)));
+            q = predict(q, omega, 0.1);
+        }
+        println!("mean NEES {:.2} over {n} frames", nees / n as f64);
+    }
+
+    #[test]
+    fn priors_near_far_and_vague() {
+        let mut rig = rig();
+        let mut rng = StdRng::seed_from_u64(32);
+        for k in 0..10 {
+            let q = random_q(&mut rng);
+            let truth = rig.expose(q, [0.0; 3], 100 + k);
+            let turn = |q: Quat, angle: f64| {
+                let axis = normalize_v([1.0, -2.0, 0.5]);
+                predict(q, axis, angle)
+            };
+            // 3σ off with σ = 50 µrad still tracks.
+            let near = Prior {
+                q_st_eci: turn(truth, 150e-6),
+                sigma_rad: 50e-6,
+            };
+            let (mode, m) = solved(rig.process(Some(near), u32::MAX));
+            assert_eq!(mode, Mode::Tracking);
+            assert!(m.q.angle_to(truth) < 1e-3);
+            // 5° off with a small σ: tracking fails and LIS solves.
+            let wrong = Prior {
+                q_st_eci: turn(truth, 5f64.to_radians()),
+                sigma_rad: 50e-6,
+            };
+            let (mode, m) = solved(rig.process(Some(wrong), u32::MAX));
+            assert_eq!(mode, Mode::Lost);
+            assert!(m.q.angle_to(truth) < 1e-3);
+            // A vague prior is not used.
+            let vague = Prior {
+                q_st_eci: truth,
+                sigma_rad: 0.1,
+            };
+            assert_eq!(solved(rig.process(Some(vague), u32::MAX)).0, Mode::Lost);
+        }
+    }
+
+    #[test]
+    fn a_budgeted_search_resumes_and_a_blank_frame_has_no_stars() {
+        let mut rig = rig();
+        let mut rng = StdRng::seed_from_u64(33);
+        let mut resumed = 0;
+        for k in 0..10 {
+            let q = random_q(&mut rng);
+            let truth = rig.expose(q, [0.0; 3], 200 + k);
+            let whole = solved(rig.process(None, u32::MAX)).1;
+            let mut outcome = rig.process(None, 0);
+            while outcome == Outcome::Searching {
+                resumed += 1;
+                outcome = rig.tracker.resume(1);
+            }
+            let (_, m) = solved(outcome);
+            assert_eq!(m.rows, whole.rows);
+            assert!(m.q.angle_to(truth) < 1e-3);
+        }
+        assert!(resumed >= 10);
+        rig.px.fill(100);
+        assert_eq!(
+            rig.process(None, u32::MAX),
+            Outcome::Failed(Failure::NoStars)
+        );
+    }
+
+    fn normalize_v(v: V3) -> V3 {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        v.map(|x| x / n)
+    }
 }
