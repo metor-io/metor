@@ -424,7 +424,7 @@ mod tests {
     use super::*;
     use crate::views::time_series::{PlotStyle, TimeFormat};
     use crate::views::{
-        AnnunciatorConfig, AttitudeConfig, ComponentTextConfig, GaugeConfig, MeterConfig,
+        AnnunciatorConfig, AttitudeConfig, GaugeConfig, MeterConfig, MonitorConfig,
         SequenceControlConfig, StateChipConfig,
     };
     use gpui::Hsla;
@@ -436,11 +436,12 @@ mod tests {
     /// code path so a missing field in either direction shows up here.
     #[test]
     fn panel_configs_round_trip_through_json() {
-        let text = ComponentTextConfig {
+        let monitor = MonitorConfig {
             component: "altitude".into(),
+            ..Default::default()
         };
-        let s = serde_json::to_string(&text).unwrap();
-        let back: ComponentTextConfig = serde_json::from_str(&s).unwrap();
+        let s = serde_json::to_string(&monitor).unwrap();
+        let back: MonitorConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.component, "altitude");
 
         let plot = PlotPanelConfig {

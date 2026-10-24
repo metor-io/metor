@@ -86,8 +86,8 @@
         "w": 160.0,
         "h": 60.0
       },
-      "kind": "text",
-      "config": "{\"component\": \"sat1.ctrl.mtq_cmd.dipole_b\"}"
+      "kind": "monitor",
+      "config": "{\"component\": \"sat1.ctrl.mtq_cmd.dipole_b\", \"align\": \"Left\"}"
     },
     {
       "id": 9,

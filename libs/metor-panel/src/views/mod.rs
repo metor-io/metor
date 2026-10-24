@@ -5,7 +5,6 @@ pub mod attitude;
 pub(crate) mod binding;
 pub mod column_browser;
 pub mod component_browser;
-pub mod component_text;
 pub(crate) mod copy;
 pub mod dashboard;
 pub mod exec_timeline;
@@ -44,7 +43,6 @@ pub use annunciator::{AlarmWhen, Annunciator, AnnunciatorConfig, AnnunciatorSour
 pub use attitude::{AttitudeConfig, AttitudeIndicator, VectorMarker, VectorMarkerConfig};
 pub use column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 pub use component_browser::{BrowserEvent, ComponentBrowser, new_component_browser};
-pub use component_text::{ComponentText, ComponentTextConfig};
 pub use exec_timeline::{ExecTimeline, ExecTimelineConfig};
 pub use filter_bar::{FilterBar, FilterBarEvent};
 pub(crate) use format::format_number;
@@ -75,7 +73,8 @@ pub use timeline::{Timeline, TimelineConfig};
 pub use tooltip::TooltipText;
 pub use traffic_light::{TrafficLight, TrafficLightConfig};
 pub use value_strip::{
-    ComponentValueStrip, StateTable, StripBehavior, StripCell, StripClick, StripPreset, StripStyle,
+    ComponentValueStrip, StateTable, StripAlign, StripBehavior, StripCell, StripClick, StripPreset,
+    StripStyle,
 };
 pub use viewer_3d::{CameraConfig, ModelConfig, Viewer3dPanelConfig};
 pub use xy_plot::{XyLinePlot, XyPlot, XyPlotPanelConfig, XyTrace, XyTraceConfig};

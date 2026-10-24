@@ -68,6 +68,8 @@ impl WidgetKind {
     pub fn plot() -> Self {
         Self(SharedString::new_static("plot"))
     }
+    /// The retired Component Text widget's id, which saved dashboards still
+    /// carry; it builds a monitor.
     pub fn text() -> Self {
         Self(SharedString::new_static("text"))
     }
@@ -837,7 +839,7 @@ mod tests {
             WidgetKind::sequence_control(),
             WidgetKind::traffic_light(),
             WidgetKind::traffic_light_grid(),
-            WidgetKind::text(),
+            WidgetKind::monitor(),
             WidgetKind::plot(),
             WidgetKind::image(),
         ];

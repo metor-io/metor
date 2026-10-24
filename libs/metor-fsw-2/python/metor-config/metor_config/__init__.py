@@ -47,6 +47,7 @@ from ._dashboard import (
     PaneState as PaneState,
     Trace as Trace,
     TimeSeriesPlot as TimeSeriesPlot,
+    Monitor as Monitor,
     Text as Text,
     TrafficLight as TrafficLight,
     TrafficLightGrid as TrafficLightGrid,

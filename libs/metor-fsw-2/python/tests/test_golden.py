@@ -48,7 +48,7 @@ from metor_config import (
     System,
     Target,
     TcpServer,
-    Text,
+    Monitor,
     TimeSeriesPlot,
     Trace,
     TrafficLight,
@@ -119,7 +119,7 @@ def build_dashboard() -> Dashboard:
     seq = Place(SequenceControl("mode", compact=True), 280, 100)
     light = Place(TrafficLight("world.illuminated"), 440, 20, 70, 60)
     grid = Place(TrafficLightGrid("wheels.wheels.*.arm"), 520, 20, 190, 60)
-    text = Place(Text("ctrl.mtq_cmd.dipole_b"), 440, 100)
+    text = Place(Monitor("ctrl.mtq_cmd.dipole_b"), 440, 100, w=160, h=60)
     plot = Place(TimeSeriesPlot([Trace("sensors.gyro_b", element=0)]), 440, 200)
     image = Place(Image(FIXTURE_PNG), 20, 520, 200, 140)
 

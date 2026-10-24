@@ -15,10 +15,10 @@ use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::{ImageWidgetConfig, WidgetKind};
 use crate::views::instrument::{ScaleSeed, scale_seeds_for_traces};
 use crate::views::{
-    AttitudeConfig, ComponentTextConfig, GaugeConfig, ListPlotPanelConfig, ListTraceConfig,
-    MapConfig, MeterConfig, MonitorConfig, PlotPanelConfig, SamplesTableConfig,
-    SequenceControlConfig, SpectrogramPanelConfig, SpectrogramTraceConfig, StateChipConfig,
-    TraceConfig, TrafficLightConfig, XyPlotPanelConfig, XyTraceConfig,
+    AttitudeConfig, GaugeConfig, ListPlotPanelConfig, ListTraceConfig, MapConfig, MeterConfig,
+    MonitorConfig, PlotPanelConfig, SamplesTableConfig, SequenceControlConfig,
+    SpectrogramPanelConfig, SpectrogramTraceConfig, StateChipConfig, TraceConfig,
+    TrafficLightConfig, XyPlotPanelConfig, XyTraceConfig,
 };
 
 /// Where a configured view lands. Returns the entity the inspector should
@@ -26,8 +26,7 @@ use crate::views::{
 pub(crate) type ViewSink = Arc<dyn Fn(&WidgetKind, String, &mut App) -> Option<AnyEntity>>;
 
 /// The surface a menu is built for. A few entries belong to only one: a
-/// dashboard can't nest a dashboard, and images and monitors have no pane
-/// form.
+/// dashboard can't nest a dashboard, and images have no pane form.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Host {
     Pane,
@@ -122,12 +121,6 @@ impl AddMenu {
             ),
             (
                 None,
-                self.component("Component Text", WidgetKind::text(), |component| {
-                    ComponentTextConfig { component }
-                }),
-            ),
-            (
-                Some(Dashboard),
                 self.component("Monitor", WidgetKind::monitor(), |component| {
                     MonitorConfig {
                         component,

@@ -672,6 +672,7 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
     cx.update(|cx| {
         crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
         expressions::Expressions::init(cx);
+        crate::inspector::edits::init(cx);
         DynamicWorker::init(cx);
 
         // `bind` is the one rule, and it lands on the published component.
@@ -696,14 +697,15 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
     let mut views = Vec::new();
     for (label, build) in [
         (
-            "component text",
+            "monitor",
             Box::new({
                 let db = db.clone();
                 move |cx: &mut gpui::App| {
-                    let cfg = crate::views::ComponentTextConfig {
+                    let cfg = crate::views::MonitorConfig {
                         component: saved.into(),
+                        ..Default::default()
                     };
-                    cx.new(|cx| crate::views::ComponentText::from_config(cfg, db.clone(), cx))
+                    cx.new(|cx| crate::views::Monitor::from_config(cfg, db.clone(), cx))
                         .into_any()
                 }
             }) as Box<dyn Fn(&mut gpui::App) -> gpui::AnyEntity>,
@@ -1447,13 +1449,6 @@ fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppConte
                 .into_any(),
             cx.new(|_| VectorMarker::empty(db.clone())).into_any(),
             cx.new(|cx| {
-                let cfg = ComponentTextConfig {
-                    component: "rpm".into(),
-                };
-                ComponentText::from_config(cfg, db.clone(), cx)
-            })
-            .into_any(),
-            cx.new(|cx| {
                 let cfg = MonitorConfig {
                     component: "rpm".into(),
                     ..Default::default()
@@ -1532,7 +1527,7 @@ fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppConte
                 checked += 1;
             }
         }
-        assert_eq!(checked, 18, "includes both XY axes and both model inputs");
+        assert_eq!(checked, 17, "includes both XY axes and both model inputs");
     });
 }
 

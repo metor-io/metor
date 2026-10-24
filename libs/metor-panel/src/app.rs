@@ -1548,10 +1548,12 @@ impl PanelApp {
                 .register_view(spec, db.clone());
         }
         // Layouts written before the annunciator rename still name it
-        // `traffic_light_grid`; they rehydrate as annunciators and re-save
-        // under the new key.
+        // `traffic_light_grid`, and Component Text panes were folded into
+        // the monitor; both rehydrate as their successor and re-save under
+        // the new key.
         let items = cx.global_mut::<crate::tiles::ItemRegistry>();
         items.alias("traffic_light_grid", "annunciator");
+        items.alias("component_text", "monitor");
         // The outline replaced both tables; layouts saved with either key
         // open as an outline, keeping the data table's filter.
         items.alias("component_table", "component_outline");

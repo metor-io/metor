@@ -86,7 +86,6 @@ impl InspectorRegistry {
         self.register_override_hsla();
         self.register_time_range_behavior();
         self.register_override_time_range_behavior();
-        self.register_inspectable::<crate::views::ComponentText>();
         self.register_inspectable::<crate::views::Monitor>();
         self.register_inspectable::<crate::views::AlarmView>();
         self.register_inspectable::<crate::views::SequenceView>();

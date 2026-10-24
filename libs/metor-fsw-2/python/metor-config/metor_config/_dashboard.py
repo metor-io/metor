@@ -99,21 +99,42 @@ class TimeSeriesPlot:
 
 
 @dataclass(frozen=True)
-class Text:
-    """A single component's latest value rendered as text."""
+class Monitor:
+    """A component's latest value with its name and an optional sparkline.
+    ``align`` is ``"left"``, ``"center"`` or ``"right"``; ``value_size`` is
+    the value's text size in pixels, ``None`` for the automatic size."""
 
     component: str
+    unit: str | None = None
+    sparkline: bool | None = None
+    align: str = "left"
+    value_size: float | None = None
 
     def _item(self, namespace: str | None) -> dict[str, Any]:
-        return PaneState("component_text", self._state(namespace))._item(namespace)
+        return PaneState("monitor", self._state(namespace))._item(namespace)
 
     def _state(self, namespace: str | None) -> dict[str, Any]:
-        return {"component": _qualify(self.component, namespace)}
+        return _drop_none(
+            {
+                "component": _qualify(self.component, namespace),
+                "unit": self.unit,
+                "show_sparkline": self.sparkline,
+                "align": _enum(self.align, ("left", "center", "right")),
+                "value_size": None
+                if self.value_size is None
+                else float(self.value_size),
+            }
+        )
 
     def _widget(
         self, namespace: str | None
     ) -> tuple[str, dict[str, Any], tuple[float, float]]:
-        return "text", self._state(namespace), (160.0, 60.0)
+        return "monitor", self._state(namespace), (300.0, 160.0)
+
+
+# The panel folded its text readout into the monitor; `Text` keeps older
+# target files building.
+Text = Monitor
 
 
 @dataclass(frozen=True)

@@ -93,6 +93,18 @@ impl StateTable {
     }
 }
 
+/// Where a strip's cells sit across the width their host gives them.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, facet::Facet, serde::Serialize, serde::Deserialize,
+)]
+#[repr(u8)]
+pub enum StripAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
 /// Visual mode for the strip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StripPreset {
@@ -120,6 +132,9 @@ pub struct StripStyle {
     pub placeholder: SharedString,
     /// Render numeric cells as the state their value means.
     pub states: Option<StateTable>,
+    pub align: StripAlign,
+    /// Value text size in unscaled pixels, replacing the preset's own.
+    pub value_size: Option<f32>,
 }
 
 impl StripStyle {
@@ -132,6 +147,8 @@ impl StripStyle {
             unit: SharedString::default(),
             placeholder: SharedString::new_static("—"),
             states: None,
+            align: StripAlign::Left,
+            value_size: None,
         }
     }
 
@@ -144,6 +161,8 @@ impl StripStyle {
             unit: SharedString::default(),
             placeholder: SharedString::new_static("…"),
             states: None,
+            align: StripAlign::Left,
+            value_size: None,
         }
     }
 
@@ -161,6 +180,16 @@ impl StripStyle {
         self.states = states;
         self
     }
+
+    pub fn with_align(mut self, align: StripAlign) -> Self {
+        self.align = align;
+        self
+    }
+
+    pub fn with_value_size(mut self, size: Option<f32>) -> Self {
+        self.value_size = size;
+        self
+    }
 }
 
 /// Click handler surfaced by the strip.
@@ -174,7 +203,7 @@ pub type StripClick = Arc<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App) + 
 /// Interactive state supplied afresh by the host each render.
 ///
 /// Snapshot pattern keeps the strip decoupled from the pending-edits global
-/// and lets `Monitor`, `ComponentText`, and `ComponentOutline` share one
+/// and lets `Monitor`, `StateChip`, and `ComponentOutline` share one
 /// widget with different policies.
 #[derive(Default, Clone)]
 pub struct StripBehavior {
@@ -209,6 +238,8 @@ fn style_equivalent(a: &StripStyle, b: &StripStyle) -> bool {
         && a.unit == b.unit
         && a.placeholder == b.placeholder
         && a.states == b.states
+        && a.align == b.align
+        && a.value_size == b.value_size
 }
 
 fn click_ptr(click: &Option<StripClick>) -> usize {
@@ -596,7 +627,7 @@ impl Render for ComponentValueStrip {
 
         let mut row = div().flex().flex_row().items_center().gap(ui_px(4.0));
         if !style.intrinsic_width {
-            row = row.flex_wrap();
+            row = justify(row.flex_wrap(), style.align);
         }
 
         for (idx, cell) in cells.iter().enumerate() {
@@ -778,6 +809,7 @@ impl Render for ComponentValueStrip {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
+            .when(style.align != StripAlign::Left, |root| root.w_full())
             .child(row);
         if style.intrinsic_width {
             root = root.flex_none();
@@ -787,15 +819,27 @@ impl Render for ComponentValueStrip {
 }
 
 fn render_placeholder(style: &StripStyle, theme: &Theme) -> impl IntoElement {
-    let text_size = match (style.preset, style.solo_emphasize) {
-        (StripPreset::Dashboard, true) => ui_px(14.0),
-        (StripPreset::Dashboard, false) => ui_px(13.0),
-        (StripPreset::Boxes, _) => ui_px(12.0),
+    let text_size = match (style.value_size, style.preset, style.solo_emphasize) {
+        (Some(size), _, _) => ui_px(size),
+        (None, StripPreset::Dashboard, true) => ui_px(14.0),
+        (None, StripPreset::Dashboard, false) => ui_px(13.0),
+        (None, StripPreset::Boxes, _) => ui_px(12.0),
     };
-    div()
-        .text_size(text_size)
-        .text_color(theme.text_tertiary)
-        .child(style.placeholder.clone())
+    justify(div().flex(), style.align).child(
+        div()
+            .text_size(text_size)
+            .text_color(theme.text_tertiary)
+            .child(style.placeholder.clone()),
+    )
+}
+
+/// Lay a strip row's cells out along `align`.
+fn justify(row: gpui::Div, align: StripAlign) -> gpui::Div {
+    match align {
+        StripAlign::Left => row,
+        StripAlign::Center => row.w_full().justify_center(),
+        StripAlign::Right => row.w_full().justify_end(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -991,7 +1035,9 @@ fn build_cell_chrome(
         (StripPreset::Dashboard, false) => 12.0,
         (StripPreset::Boxes, _) => 12.0,
     };
-    let value_size = if matches!(style.preset, StripPreset::Boxes) && cell.label.is_some() {
+    let value_size = if let Some(size) = style.value_size {
+        ui_px(size)
+    } else if matches!(style.preset, StripPreset::Boxes) && cell.label.is_some() {
         let len = cell.value.chars().count();
         if len >= 9 {
             ui_px(9.0)

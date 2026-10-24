@@ -24,10 +24,10 @@ use crate::tiles::panels::{
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
     Annunciator, AnnunciatorConfig, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
-    ComponentOutline, ComponentText, ComponentTextConfig, ExecTimeline, Gauge, GaugeConfig,
-    ListPlot, Map, MapConfig, Meter, MeterConfig, Monitor, MonitorConfig, SamplesTable,
-    SamplesTableConfig, SequenceControl, SequenceControlConfig, SequenceGrid, Spectrogram,
-    StateChip, StateChipConfig, TimeSeriesPlot, Timeline, TrafficLight, TrafficLightConfig, XyPlot,
+    ComponentOutline, ExecTimeline, Gauge, GaugeConfig, ListPlot, Map, MapConfig, Meter,
+    MeterConfig, Monitor, MonitorConfig, SamplesTable, SamplesTableConfig, SequenceControl,
+    SequenceControlConfig, SequenceGrid, Spectrogram, StateChip, StateChipConfig, TimeSeriesPlot,
+    Timeline, TrafficLight, TrafficLightConfig, XyPlot,
 };
 
 use super::{DashboardWidget, WidgetKind};
@@ -221,23 +221,6 @@ impl WidgetRegistry {
             .with_live_tile_title(TimeSeriesPlot::title),
         );
         self.register(
-            WidgetKind::text(),
-            WidgetSpec::typed(
-                (160.0, 60.0),
-                |w| {
-                    let cfg = parse_or_default::<ComponentTextConfig>(&w.config);
-                    subject("Text", &cfg.component)
-                },
-                ComponentText::from_config,
-                |text, _| text.to_config(),
-            )
-            .with_tile("component_text", |blob| {
-                parse_or_default::<ComponentTextConfig>(blob)
-                    .component
-                    .into()
-            }),
-        );
-        self.register(
             WidgetKind::new("xy_plot"),
             WidgetSpec::typed(
                 (400.0, 300.0),
@@ -338,8 +321,9 @@ impl WidgetRegistry {
                 no_snapshot,
             ),
         );
-        self.register(
-            WidgetKind::monitor(),
+        // Registered under both kinds: Component Text was folded into the
+        // monitor, and saved dashboards keep naming those widgets `text`.
+        let monitor = Arc::new(
             WidgetSpec::typed(
                 (300.0, 160.0),
                 |w| {
@@ -348,8 +332,13 @@ impl WidgetRegistry {
                 },
                 Monitor::from_config,
                 |monitor, _| monitor.to_config(),
-            ),
+            )
+            .with_tile("monitor", |blob| {
+                parse_or_default::<MonitorConfig>(blob).component.into()
+            }),
         );
+        self.register_shared(WidgetKind::monitor(), monitor.clone());
+        self.register_shared(WidgetKind::text(), monitor);
         self.register(
             WidgetKind::viewer3d(),
             WidgetSpec::typed(
@@ -761,7 +750,7 @@ mod tests {
             .collect();
         for key in [
             "time_series_plot",
-            "component_text",
+            "monitor",
             "xy_plot",
             "list_plot",
             "spectrogram",
