@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, Hsla, IntoElement, MouseButton, SharedString,
-    Window, div, prelude::*, px,
+    Window, div, prelude::*,
 };
 use metor_db::DB;
 use metor_proto::types::ComponentId;
@@ -30,6 +30,7 @@ use super::monitor::{behavior_snapshot, edit_click};
 use super::value_strip::{ComponentValueStrip, StateTable, StripClick, StripStyle};
 
 use crate::dynamic::tensor::TypedScalar;
+use crate::inspect;
 use crate::theme::{Theme, theme, ui_px};
 
 /// How a chip draws its table.
@@ -87,6 +88,10 @@ pub struct StateChipConfig {
     /// the table is out of date with the flight software.
     pub unknown_label: String,
     pub style: StateChipStyle,
+    /// Text size in unscaled pixels; the switch's padding and corners follow
+    /// it, so this one number sizes the whole control. 0 is the face's own
+    /// default.
+    pub text_size: f32,
 }
 
 /// A bare value strip carrying a state table.
@@ -97,6 +102,9 @@ pub struct StateChip {
     /// binding heads the inspector page — fields are walked in order.
     pub source: crate::data_binding::Binding,
     pub style: StateChipStyle,
+    #[facet(inspect::label = "Text size (0 = auto)")]
+    #[facet(inspect::range(min = "0.0", max = "96.0"))]
+    pub text_size: f32,
     pub states: Vec<Entity<StateEntry>>,
     pub unknown_label: SharedString,
     /// Carried for the tab title and the config round trip; never drawn.
@@ -144,6 +152,7 @@ impl StateChip {
         Self {
             source,
             style: cfg.style,
+            text_size: cfg.text_size,
             states: cfg
                 .states
                 .iter()
@@ -191,6 +200,7 @@ impl StateChip {
                 .collect(),
             unknown_label: self.unknown_label.to_string(),
             style: self.style,
+            text_size: self.text_size,
         }
     }
 
@@ -271,27 +281,32 @@ impl StateChip {
         let enabled = self.writable(cx);
         let active = self.feed.value.and_then(|v| table.position(v));
         let stale = self.feed.stale;
+        let size = toggle_text_size(self.text_size);
+        let em = |n: f32| ui_px(n * size);
 
+        // Sized to its labels rather than the tile, so a wide widget doesn't
+        // stretch a two-position switch into a bar.
         let mut track = div()
             .flex()
             .flex_row()
+            .flex_none()
+            .max_w_full()
             .items_center()
-            .gap(ui_px(2.0))
-            .p(ui_px(2.0))
-            .w_full()
-            .rounded(px(4.0))
+            .gap(em(0.15))
+            .p(em(0.15))
+            .rounded(em(0.35))
             .bg(theme.bg_primary)
             .border_1()
             .border_color(theme.line_color)
-            .text_size(ui_px(12.0))
+            .text_size(ui_px(size))
             .when(!enabled, |track| track.opacity(0.55));
 
         if table.entries.is_empty() {
             return track
                 .child(
                     div()
-                        .flex_1()
-                        .py(ui_px(3.0))
+                        .px(em(0.6))
+                        .py(em(0.2))
                         .text_center()
                         .text_color(theme.text_tertiary)
                         .child("No states"),
@@ -304,11 +319,11 @@ impl StateChip {
             let accent = color.unwrap_or(theme.control_active);
             let segment = div()
                 .id(("toggle-segment", i))
-                .flex_1()
+                .flex_shrink_1()
                 .min_w_0()
-                .px(ui_px(8.0))
-                .py(ui_px(3.0))
-                .rounded(px(3.0))
+                .px(em(0.6))
+                .py(em(0.2))
+                .rounded(em(0.25))
                 .border_1()
                 .text_center()
                 .whitespace_nowrap()
@@ -357,9 +372,9 @@ impl StateChip {
             track = track.child(
                 div()
                     .flex_none()
-                    .px(ui_px(8.0))
-                    .py(ui_px(3.0))
-                    .rounded(px(3.0))
+                    .px(em(0.6))
+                    .py(em(0.2))
+                    .rounded(em(0.25))
                     .border_1()
                     .border_color(theme.error_accent)
                     .bg(Theme::dim(theme.error_accent, 0.18))
@@ -381,7 +396,9 @@ impl StateChip {
                 (e.value, e.label.clone(), e.color)
             })
             .collect();
-        StripStyle::boxes().with_states(state_table(entries, &self.unknown_label))
+        StripStyle::boxes()
+            .with_states(state_table(entries, &self.unknown_label))
+            .with_value_size((self.text_size > 0.0).then_some(self.text_size))
     }
 }
 
@@ -395,6 +412,16 @@ fn state_table(
         entries,
         unknown_label: unknown_label.clone(),
     })
+}
+
+/// A switch's text size: the configured one, or a compact default that
+/// leaves room in a small widget.
+fn toggle_text_size(configured: f32) -> f32 {
+    if configured > 0.0 {
+        configured.min(96.0)
+    } else {
+        10.0
+    }
 }
 
 /// A toggle's segments: the table as configured, or OFF/ON for a bool

@@ -34,6 +34,8 @@ pub struct LabelConfig {
     pub align: StripAlign,
     pub bold: bool,
     pub uppercase: bool,
+    /// Off leaves bare text over whatever the dashboard draws beneath.
+    pub background: bool,
     pub border: bool,
 }
 
@@ -48,6 +50,7 @@ impl Default for LabelConfig {
             align: StripAlign::Center,
             bold: false,
             uppercase: false,
+            background: true,
             border: false,
         }
     }
@@ -64,6 +67,8 @@ pub struct Label {
     pub align: StripAlign,
     pub bold: bool,
     pub uppercase: bool,
+    /// Off leaves bare text over whatever the dashboard draws beneath.
+    pub background: bool,
     pub border: bool,
 }
 
@@ -77,6 +82,7 @@ impl Label {
             align: cfg.align,
             bold: cfg.bold,
             uppercase: cfg.uppercase,
+            background: cfg.background,
             border: cfg.border,
         }
     }
@@ -90,6 +96,7 @@ impl Label {
             align: self.align,
             bold: self.bold,
             uppercase: self.uppercase,
+            background: self.background,
             border: self.border,
         }
     }
@@ -123,7 +130,7 @@ impl Render for Label {
             .py(ui_px(3.0))
             .rounded(px(3.0))
             .overflow_hidden()
-            .bg(bg)
+            .when(self.background, |cell| cell.bg(bg))
             .when(self.border, |cell| cell.border_1().border_color(edge))
             .text_size(ui_px(self.text_size.clamp(1.0, 512.0)))
             .text_color(self.text_color.unwrap_or(theme.text_primary))
@@ -152,6 +159,7 @@ mod tests {
             align: StripAlign::Right,
             bold: true,
             uppercase: true,
+            background: false,
             border: true,
         };
         let s = serde_json::to_string(&cfg).unwrap();
@@ -161,5 +169,6 @@ mod tests {
         assert_eq!(partial.text, "EPS");
         assert_eq!(partial.text_size, 12.0);
         assert_eq!(partial.align, StripAlign::Center);
+        assert!(partial.background);
     }
 }

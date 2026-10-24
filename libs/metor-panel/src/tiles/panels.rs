@@ -731,6 +731,7 @@ mod tests {
             ],
             unknown_label: "UNKNOWN".into(),
             style: crate::views::StateChipStyle::Toggle,
+            text_size: 14.0,
         };
         let s = serde_json::to_string(&chip).unwrap();
         let back: StateChipConfig = serde_json::from_str(&s).unwrap();

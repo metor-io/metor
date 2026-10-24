@@ -431,7 +431,8 @@ class StateChip:
 
     ``style="toggle"`` draws every state as a segment of a switch, and
     clicking one commands that state's value (when edits are unlocked and the
-    panel is live). A toggle over a bool with no ``states`` offers OFF/ON."""
+    panel is live). A toggle over a bool with no ``states`` offers OFF/ON.
+    ``text_size`` sizes the chip or switch, padding included; 0 is automatic."""
 
     component: str
     states: list[State] | None = None
@@ -439,6 +440,7 @@ class StateChip:
     label: str | None = None
     unknown: str = ""
     style: str = "chip"
+    text_size: float = 0.0
 
     def _widget(
         self, namespace: str | None
@@ -451,6 +453,7 @@ class StateChip:
                 "states": [s._json() for s in (self.states or [])],
                 "unknown_label": self.unknown,
                 "style": _variant_or_none(self.style, ("chip", "toggle")),
+                "text_size": float(self.text_size) if self.text_size else None,
             }
         )
         return "state_chip", state, (150.0, 60.0)
@@ -637,7 +640,8 @@ class Label:
     """Static text in a value-cell box, for captions on a schematic.
     ``color`` tints the box (and its edge, with ``border``); colours are
     ``"#rrggbbaa"`` and unset ones follow the panel theme. ``align`` is
-    ``"left"``, ``"center"`` or ``"right"``."""
+    ``"left"``, ``"center"`` or ``"right"``. ``background=False`` drops the
+    box fill, leaving bare text."""
 
     text: str
     text_color: str | None = None
@@ -646,6 +650,7 @@ class Label:
     align: str = "center"
     bold: bool = False
     uppercase: bool = False
+    background: bool = True
     border: bool = False
 
     def _item(self, namespace: str | None) -> dict[str, Any]:
@@ -661,6 +666,7 @@ class Label:
                 "align": _enum(self.align, ("left", "center", "right")),
                 "bold": self.bold,
                 "uppercase": self.uppercase,
+                "background": self.background,
                 "border": self.border,
             }
         )
