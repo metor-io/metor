@@ -61,14 +61,17 @@ impl RenderKey {
     }
 }
 
-/// At most one job in flight; a key that changes meanwhile starts the next
-/// job when the current one finishes. Each key travels with the input `F`
-/// it was made from, so a started job always has its input.
+/// At most one job in flight; keys that change meanwhile coalesce into one
+/// follow-up job for the latest, started when the current one finishes.
+/// Each key travels with the input `F` it was made from, so a started job
+/// always has its input.
 #[derive(Debug)]
 pub struct Scheduler<F> {
     wanted: Option<(RenderKey, F)>,
     in_flight: Option<RenderKey>,
     installed: Option<RenderKey>,
+    /// The job in flight was started before a `reset`.
+    orphaned: bool,
 }
 
 impl<F> Default for Scheduler<F> {
@@ -77,6 +80,7 @@ impl<F> Default for Scheduler<F> {
             wanted: None,
             in_flight: None,
             installed: None,
+            orphaned: false,
         }
     }
 }
@@ -94,9 +98,15 @@ impl<F: Clone> Scheduler<F> {
 
     /// Marks the job for `key` done. Returns whether its result should be
     /// installed, and the next job to start.
+    ///
+    /// A superseded result is still installed: jobs finish in request
+    /// order, so it is newer than what is painted, and the view places it
+    /// under the current viewport. Dropping it would leave a continuous drag,
+    /// whose key changes during every job, painting nothing new until the
+    /// cursor stops.
     pub fn finish(&mut self, key: &RenderKey) -> (bool, Option<(RenderKey, F)>) {
         self.in_flight = None;
-        let install = self.wanted.as_ref().is_some_and(|(k, _)| k == key);
+        let install = !std::mem::take(&mut self.orphaned) && self.wanted.is_some();
         if install {
             self.installed = Some(key.clone());
         }
@@ -114,6 +124,7 @@ impl<F: Clone> Scheduler<F> {
     /// Forgets the wanted and installed keys; a job in flight still
     /// finishes, uninstalled.
     pub fn reset(&mut self) {
+        self.orphaned = self.in_flight.is_some();
         self.wanted = None;
         self.installed = None;
     }
@@ -535,23 +546,38 @@ mod tests {
         assert_eq!(request(&mut s, 1), Some(key(1)));
         assert_eq!(request(&mut s, 2), None);
         assert_eq!(request(&mut s, 3), None);
-        assert_eq!(finish(&mut s, 1), (false, Some(key(3))));
+        assert_eq!(finish(&mut s, 1), (true, Some(key(3))));
         assert_eq!(finish(&mut s, 3), (true, None));
     }
 
+    /// A drag changes the key during every job; each result still lands.
     #[test]
-    fn a_superseded_result_is_not_installed() {
+    fn a_superseded_result_is_installed() {
         let mut s = Scheduler::default();
         request(&mut s, 1);
-        request(&mut s, 2);
-        assert_eq!(finish(&mut s, 1), (false, Some(key(2))));
-        // Returning to an already-installed key renders nothing new.
+        for n in 2..10 {
+            request(&mut s, n);
+            assert_eq!(finish(&mut s, n - 1), (true, Some(key(n))));
+            assert_eq!(s.installed(), Some(&key(n - 1)));
+        }
+        // Returning to the installed key after a superseded one renders it
+        // again.
         let mut s = Scheduler::default();
         request(&mut s, 1);
         finish(&mut s, 1);
         request(&mut s, 2);
         request(&mut s, 1);
-        assert_eq!(finish(&mut s, 2), (false, None));
+        assert_eq!(finish(&mut s, 2), (true, Some(key(1))));
+    }
+
+    #[test]
+    fn a_job_from_before_a_reset_is_dropped() {
+        let mut s = Scheduler::default();
+        request(&mut s, 1);
+        s.reset();
+        assert_eq!(request(&mut s, 2), None);
+        assert_eq!(finish(&mut s, 1), (false, Some(key(2))));
+        assert_eq!(finish(&mut s, 2), (true, None));
     }
 
     #[test]
