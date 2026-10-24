@@ -285,16 +285,28 @@ impl Render for SequenceControl {
             }
         }));
 
-        strip().child(label).child(
+        // Bottom-aligned so the buttons line up with the sequence box rather
+        // than the box and its status line together; all are one height.
+        strip().child(
             div()
-                .flex_none()
+                .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_row()
-                .items_center()
-                .gap(ui_px(4.0))
-                .child(abort_btn)
-                .child(primary_btn)
-                .child(stop_btn),
+                .items_end()
+                .gap(ui_px(8.0))
+                .child(label)
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(ui_px(4.0))
+                        .child(abort_btn)
+                        .child(primary_btn)
+                        .child(stop_btn),
+                ),
         )
     }
 }
