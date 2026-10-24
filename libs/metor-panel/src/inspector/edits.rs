@@ -96,12 +96,36 @@ pub fn pending_edits_mut(cx: &mut App) -> &mut PendingEdits {
 
 /// Encode `edit` as an [`UpdateComponent`] message and push it to the DB log.
 pub fn apply_edit(db: &DB, edit: &PendingEdit) {
-    let update = UpdateComponent {
-        id: edit.component_id,
-        value: edit.value.clone(),
-    };
+    push_update(db, edit.component_id, edit.value.clone());
+}
+
+fn push_update(db: &DB, id: ComponentId, value: ComponentValue) {
+    let update = UpdateComponent { id, value };
     let bytes = postcard::to_allocvec(&update).expect("postcard serialize");
     let _ = db.push_msg(Timestamp::now(), UpdateComponent::ID, &bytes);
+}
+
+/// Command one element straight away, over the latest committed value.
+///
+/// For controls whose click *is* the decision — a toggle switch picking
+/// ARMED — where staging the edit for review would make the operator click
+/// twice. It never touches the pending queue, so another view's staged edit
+/// to the same component is neither sent nor dropped. Returns `false` when
+/// there is nothing to write over (no sample yet) or `value` is not the
+/// component's type; the caller checks the edit lock and live mode.
+pub fn command_element(
+    db: &DB,
+    component_id: ComponentId,
+    element_index: usize,
+    value: ElementValue,
+) -> bool {
+    match build_updated_value_typed(db, component_id, element_index, value) {
+        Some(value) => {
+            push_update(db, component_id, value);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Apply a pending component edit and remove `element_index` from its list

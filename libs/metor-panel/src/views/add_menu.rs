@@ -166,6 +166,19 @@ impl AddMenu {
             ),
             (
                 None,
+                self.instrument("Toggle Switch", WidgetKind::state_chip(), |seed| {
+                    StateChipConfig {
+                        component: seed.component,
+                        element: seed.element,
+                        label: Some(seed.label),
+                        states: crate::views::state_chip::default_toggle_states(),
+                        style: crate::views::StateChipStyle::Toggle,
+                        ..Default::default()
+                    }
+                }),
+            ),
+            (
+                None,
                 self.component("Attitude", WidgetKind::attitude(), |component| {
                     AttitudeConfig {
                         component,

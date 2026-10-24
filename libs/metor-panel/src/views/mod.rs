@@ -65,7 +65,7 @@ pub use sequence_panel::SequenceView;
 pub use spectrogram::{
     Spectrogram, SpectrogramPanelConfig, SpectrogramPlot, SpectrogramTrace, SpectrogramTraceConfig,
 };
-pub use state_chip::{StateChip, StateChipConfig, StateEntry, StateEntryConfig};
+pub use state_chip::{StateChip, StateChipConfig, StateChipStyle, StateEntry, StateEntryConfig};
 pub use table::{Column, ColumnSort, Table, TableDelegate};
 pub use time_series::{
     EventOverlayConfig, MeasurementCursorConfig, MeasurementPanelConfig, PlotPanelConfig,

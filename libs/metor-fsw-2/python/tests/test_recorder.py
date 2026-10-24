@@ -966,6 +966,9 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual([s["label"] for s in table["states"]], ["IDLE", "SAFE"])
         self.assertEqual(table["states"][1]["color"], "#f38ba8ff")
         self.assertEqual(table["unknown_label"], "UNKNOWN")
+        # The default style stays out of the blob, so presets saved before
+        # toggles existed are byte-identical.
+        self.assertNotIn("style", table)
 
         # A channel is a slot instance name, not a component, so it is never
         # namespace-qualified.

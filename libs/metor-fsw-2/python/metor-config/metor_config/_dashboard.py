@@ -389,14 +389,19 @@ class Gauge:
 
 @dataclass(frozen=True)
 class StateChip:
-    """A numeric element shown as the state it means. ``unknown`` is displayed
-    for a code the table does not list; empty shows the raw number."""
+    """A numeric or bool element shown as the state it means. ``unknown`` is
+    displayed for a code the table does not list; empty shows the raw number.
+
+    ``style="toggle"`` draws every state as a segment of a switch, and
+    clicking one commands that state's value (when edits are unlocked and the
+    panel is live). A toggle over a bool with no ``states`` offers OFF/ON."""
 
     component: str
-    states: list[State]
+    states: list[State] | None = None
     element: int = 0
     label: str | None = None
     unknown: str = ""
+    style: str = "chip"
 
     def _widget(
         self, namespace: str | None
@@ -406,8 +411,9 @@ class StateChip:
                 "component": _qualify(self.component, namespace),
                 "element": self.element,
                 "label": self.label,
-                "states": [s._json() for s in self.states],
+                "states": [s._json() for s in (self.states or [])],
                 "unknown_label": self.unknown,
+                "style": _variant_or_none(self.style, ("chip", "toggle")),
             }
         )
         return "state_chip", state, (150.0, 60.0)
@@ -554,6 +560,13 @@ def _enum(value: str, allowed: tuple[str, ...]) -> str:
     if key not in allowed:
         raise ValueError(f"expected one of {allowed}, got {value!r}")
     return key.capitalize() if key != "none" else "None"
+
+
+def _variant_or_none(value: str, allowed: tuple[str, ...]) -> str | None:
+    """Like :func:`_enum`, but the first (default) variant is left out of
+    the blob so a preset that never chose one stays byte-identical."""
+    variant = _enum(value, allowed)
+    return None if variant == _enum(allowed[0], allowed) else variant
 
 
 @dataclass(frozen=True)

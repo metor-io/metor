@@ -8,19 +8,40 @@
 //! state reads exactly like every other value cell on the panel: same boxes,
 //! same staleness tint, same click-to-edit. Nothing else is drawn — no
 //! label, no chrome — which is what lets a chip sit inside a schematic.
+//!
+//! The same table drives a second face, [`StateChipStyle::Toggle`]: every
+//! state as one segment of a switch, the live one lit, and a click commands
+//! that state's code. Arming a payload or enabling a heater is a choice
+//! between named states, so the control that makes the choice is the table
+//! that names them.
 
 use std::sync::Arc;
 
-use gpui::{App, Context, Entity, Hsla, IntoElement, SharedString, Window, div, prelude::*};
+use gpui::{
+    AnyElement, App, Context, Entity, FontWeight, Hsla, IntoElement, MouseButton, SharedString,
+    Window, div, prelude::*, px,
+};
 use metor_db::DB;
-use metor_proto::types::ComponentId;
+use metor_proto::types::{ComponentId, ComponentView};
 use serde::{Deserialize, Serialize};
 
-use super::binding;
+use super::binding::{self, StreamUpdate, spawn_seeded_stream};
 use super::monitor::{behavior_snapshot, edit_click};
 use super::value_strip::{ComponentValueStrip, StateTable, StripClick, StripStyle};
 
-use crate::theme::ui_px;
+use crate::dynamic::tensor::TypedScalar;
+use crate::theme::{Theme, theme, ui_px};
+
+/// How a chip draws its table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, facet::Facet, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum StateChipStyle {
+    /// The live value as the one state it means.
+    #[default]
+    Chip,
+    /// Every state as a segment of a switch; clicking one commands it.
+    Toggle,
+}
 
 /// One row of a chip's lookup table.
 #[derive(facet::Facet)]
@@ -65,6 +86,7 @@ pub struct StateChipConfig {
     /// rendering the raw number, which is more useful than a blank chip when
     /// the table is out of date with the flight software.
     pub unknown_label: String,
+    pub style: StateChipStyle,
 }
 
 /// A bare value strip carrying a state table.
@@ -74,6 +96,7 @@ pub struct StateChip {
     /// inspector rebinds the strip on the next frame. Declared first so the
     /// binding heads the inspector page — fields are walked in order.
     pub source: crate::data_binding::Binding,
+    pub style: StateChipStyle,
     pub states: Vec<Entity<StateEntry>>,
     pub unknown_label: SharedString,
     /// Carried for the tab title and the config round trip; never drawn.
@@ -97,6 +120,22 @@ pub struct StateChip {
     strip: Entity<ComponentValueStrip>,
     #[facet(opaque)]
     click: StripClick,
+    /// The toggle's own read of the bound value; only streams while the
+    /// chip is drawn as a toggle.
+    #[facet(opaque)]
+    feed: ToggleFeed,
+}
+
+/// What a toggle draws from: element 0 of the bound component as a code,
+/// a bool reading as 0/1.
+#[derive(Default)]
+struct ToggleFeed {
+    /// The component this feed streams, `None` while not streaming.
+    streaming: Option<ComponentId>,
+    value: Option<f64>,
+    stale: bool,
+    is_bool: bool,
+    _task: Option<gpui::Task<()>>,
 }
 
 impl StateChip {
@@ -116,6 +155,7 @@ impl StateChip {
 
         Self {
             source,
+            style: cfg.style,
             states: cfg
                 .states
                 .iter()
@@ -136,6 +176,7 @@ impl StateChip {
             db,
             strip,
             click,
+            feed: ToggleFeed::default(),
         }
     }
 
@@ -161,6 +202,7 @@ impl StateChip {
                 })
                 .collect(),
             unknown_label: self.unknown_label.to_string(),
+            style: self.style,
         }
     }
 
@@ -183,6 +225,169 @@ impl StateChip {
         }
         self.click = edit_click(self.db.clone(), component_id, self.saved_component.clone());
         self.strip = new_strip(self.db.clone(), component_id, self.click.clone(), cx);
+        self.feed = ToggleFeed::default();
+    }
+
+    /// Stream the bound value for the toggle face, or stop when the chip is
+    /// a chip again.
+    fn refresh_feed(&mut self, cx: &mut Context<Self>) {
+        let want = (self.style == StateChipStyle::Toggle).then(|| self.source.id());
+        if self.feed.streaming == want {
+            return;
+        }
+        self.feed = ToggleFeed {
+            streaming: want,
+            _task: want.map(|id| spawn_feed(self.db.clone(), id, cx)),
+            ..ToggleFeed::default()
+        };
+    }
+
+    /// Whether a click may command the bound component right now: the
+    /// operator unlocked edits, the panel is showing live data (a scrubbed
+    /// past can't be commanded), and the binding names a real component —
+    /// an expression's output is computed here, not commandable there.
+    fn writable(&self, cx: &App) -> bool {
+        !crate::inspector::edits::pending_edits(cx).locked
+            && crate::temporal::is_live(cx)
+            && !self.source.is_unbound()
+            && self.source.expression_text().is_none()
+    }
+
+    /// Command the bound component to `code`, written as its own type so a
+    /// bool flag receives a bool.
+    fn command(&mut self, code: f64, cx: &mut Context<Self>) {
+        if !self.writable(cx) {
+            return;
+        }
+        let id = self.source.id();
+        let Some(prim) = self
+            .db
+            .with_state(|s| s.get_component(id).map(|c| c.schema.prim_type))
+        else {
+            return;
+        };
+        let value = TypedScalar::from_f64(code, prim).into();
+        if crate::inspector::edits::command_element(&self.db, id, 0, value) {
+            cx.notify();
+        }
+    }
+
+    fn render_toggle(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = theme(cx);
+        let entries = self
+            .states
+            .iter()
+            .map(|e| {
+                let e = e.read(cx);
+                (e.value, e.label.clone(), e.color)
+            })
+            .collect();
+        let table = StateTable {
+            entries: toggle_segments(entries, self.feed.is_bool),
+            unknown_label: self.unknown_label.clone(),
+        };
+        let enabled = self.writable(cx);
+        let active = self.feed.value.and_then(|v| table.position(v));
+        let stale = self.feed.stale;
+
+        let mut track = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(ui_px(2.0))
+            .p(ui_px(2.0))
+            .w_full()
+            .rounded(px(4.0))
+            .bg(theme.bg_primary)
+            .border_1()
+            .border_color(theme.line_color)
+            .text_size(ui_px(12.0))
+            .when(!enabled, |track| track.opacity(0.55));
+
+        if table.entries.is_empty() {
+            return track
+                .child(
+                    div()
+                        .flex_1()
+                        .py(ui_px(3.0))
+                        .text_center()
+                        .text_color(theme.text_tertiary)
+                        .child("No states"),
+                )
+                .into_any_element();
+        }
+
+        for (i, (code, label, color)) in table.entries.iter().cloned().enumerate() {
+            let is_active = active == Some(i);
+            let accent = color.unwrap_or(theme.control_active);
+            let segment = div()
+                .id(("toggle-segment", i))
+                .flex_1()
+                .min_w_0()
+                .px(ui_px(8.0))
+                .py(ui_px(3.0))
+                .rounded(px(3.0))
+                .border_1()
+                .text_center()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(label);
+            let segment = if is_active {
+                segment
+                    .bg(if stale {
+                        theme.stale_bg()
+                    } else {
+                        Theme::dim(accent, 0.25)
+                    })
+                    .border_color(if stale { theme.stale_text() } else { accent })
+                    .text_color(if stale {
+                        theme.stale_text()
+                    } else {
+                        theme.text_primary
+                    })
+                    .font_weight(FontWeight::SEMIBOLD)
+            } else {
+                segment
+                    .border_color(gpui::transparent_black())
+                    .text_color(theme.text_tertiary)
+            };
+            let segment = if enabled && !is_active {
+                let hover = theme.bg_secondary;
+                segment
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |chip, _, _window, cx| {
+                            chip.command(code, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+            } else {
+                segment
+            };
+            track = track.child(segment);
+        }
+
+        // A code the table doesn't list lights nothing; the unknown label,
+        // when set, says so in a segment of its own that can't be clicked.
+        if self.feed.value.is_some() && active.is_none() && !table.unknown_label.is_empty() {
+            track = track.child(
+                div()
+                    .flex_none()
+                    .px(ui_px(8.0))
+                    .py(ui_px(3.0))
+                    .rounded(px(3.0))
+                    .border_1()
+                    .border_color(theme.error_accent)
+                    .bg(Theme::dim(theme.error_accent, 0.18))
+                    .text_color(theme.text_primary)
+                    .whitespace_nowrap()
+                    .child(table.unknown_label.clone()),
+            );
+        }
+
+        track.into_any_element()
     }
 
     fn style(&self, cx: &App) -> StripStyle {
@@ -208,6 +413,68 @@ fn state_table(
         entries,
         unknown_label: unknown_label.clone(),
     })
+}
+
+/// A toggle's segments: the table as configured, or OFF/ON for a bool
+/// flag nobody has named yet — a switch with no positions isn't one.
+fn toggle_segments(
+    entries: Vec<(f64, SharedString, Option<Hsla>)>,
+    is_bool: bool,
+) -> Vec<(f64, SharedString, Option<Hsla>)> {
+    if entries.is_empty() && is_bool {
+        default_toggle_states()
+            .into_iter()
+            .map(|s| (s.value, SharedString::from(s.label), s.color))
+            .collect()
+    } else {
+        entries
+    }
+}
+
+/// The two positions a fresh toggle starts with.
+pub fn default_toggle_states() -> Vec<StateEntryConfig> {
+    vec![
+        StateEntryConfig {
+            value: 0.0,
+            label: "OFF".into(),
+            color: None,
+        },
+        StateEntryConfig {
+            value: 1.0,
+            label: "ON".into(),
+            color: None,
+        },
+    ]
+}
+
+fn spawn_feed(db: Arc<DB>, id: ComponentId, cx: &mut Context<StateChip>) -> gpui::Task<()> {
+    spawn_seeded_stream(
+        db,
+        id,
+        cx,
+        |db, id| {
+            let is_bool = binding::component_meta(db, id).is_bool;
+            (is_bool, |view: ComponentView<'_>| {
+                view.iter().next().map(|value| value.as_f64())
+            })
+        },
+        |chip, update, cx| {
+            let feed = &mut chip.feed;
+            match update {
+                StreamUpdate::Ready(is_bool) => feed.is_bool = is_bool,
+                StreamUpdate::Value(value) => {
+                    feed.value = Some(value);
+                    feed.stale = false;
+                }
+                StreamUpdate::Stale => feed.stale = true,
+                StreamUpdate::Unavailable => {
+                    feed.value = None;
+                    feed.stale = false;
+                }
+            }
+            cx.notify();
+        },
+    )
 }
 
 /// The chip's element selection as binding text: element 0 is the component
@@ -238,13 +505,11 @@ fn new_strip(
 impl Render for StateChip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.rebind(cx);
-        let style = self.style(cx);
-        let behavior = behavior_snapshot(cx, self.db.clone(), self.source.id(), self.click.clone());
-        self.strip.update(cx, |strip, cx| {
-            strip.set_style(style, cx);
-            strip.set_behavior(behavior, cx);
-        });
-
+        self.refresh_feed(cx);
+        let body = match self.style {
+            StateChipStyle::Toggle => self.render_toggle(cx),
+            StateChipStyle::Chip => self.render_chip(cx),
+        };
         div()
             .size_full()
             .flex()
@@ -252,7 +517,19 @@ impl Render for StateChip {
             .justify_center()
             .p(ui_px(4.0))
             .overflow_hidden()
-            .child(self.strip.clone())
+            .child(body)
+    }
+}
+
+impl StateChip {
+    fn render_chip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let style = self.style(cx);
+        let behavior = behavior_snapshot(cx, self.db.clone(), self.source.id(), self.click.clone());
+        self.strip.update(cx, |strip, cx| {
+            strip.set_style(style, cx);
+            strip.set_behavior(behavior, cx);
+        });
+        self.strip.clone().into_any_element()
     }
 }
 
@@ -268,5 +545,28 @@ mod tests {
         assert!(state_table(Vec::new(), &SharedString::default()).is_none());
         let named = vec![(0.0, SharedString::from("IDLE"), None)];
         assert!(state_table(named, &SharedString::default()).is_some());
+    }
+
+    #[test]
+    fn an_unnamed_bool_toggle_gets_off_and_on() {
+        let segments = toggle_segments(Vec::new(), true);
+        let labels: Vec<_> = segments.iter().map(|s| s.1.to_string()).collect();
+        assert_eq!(labels, ["OFF", "ON"]);
+        assert_eq!((segments[0].0, segments[1].0), (0.0, 1.0));
+
+        // A numeric component has no implied positions, and a configured
+        // table always wins.
+        assert!(toggle_segments(Vec::new(), false).is_empty());
+        let armed = vec![(1.0, SharedString::from("ARMED"), None)];
+        assert_eq!(toggle_segments(armed.clone(), true), armed);
+    }
+
+    #[test]
+    fn a_chip_saved_before_toggles_loads_as_a_chip() {
+        let cfg: StateChipConfig =
+            serde_json::from_str(r#"{"component":"sat.mode","states":[]}"#).unwrap();
+        assert_eq!(cfg.style, StateChipStyle::Chip);
+        let toggle: StateChipConfig = serde_json::from_str(r#"{"style":"Toggle"}"#).unwrap();
+        assert_eq!(toggle.style, StateChipStyle::Toggle);
     }
 }

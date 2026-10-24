@@ -86,10 +86,15 @@ const STATE_MATCH_TOLERANCE: f64 = 0.5;
 
 impl StateTable {
     /// The entry whose code matches `value`, if the table lists one.
-    pub(crate) fn matched(&self, value: f64) -> Option<&(f64, SharedString, Option<Hsla>)> {
+    fn matched(&self, value: f64) -> Option<&(f64, SharedString, Option<Hsla>)> {
+        self.entries.get(self.position(value)?)
+    }
+
+    /// Index of the entry whose code matches `value`.
+    pub(crate) fn position(&self, value: f64) -> Option<usize> {
         self.entries
             .iter()
-            .find(|(code, _, _)| (code - value).abs() < STATE_MATCH_TOLERANCE)
+            .position(|(code, _, _)| (code - value).abs() < STATE_MATCH_TOLERANCE)
     }
 
     /// What a cell holding `value` shows: the matched state with its accent,
