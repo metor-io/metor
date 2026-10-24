@@ -29,9 +29,8 @@ pub mod trace_picker;
 use crate::motion::{self, Fade};
 use crate::theme::theme;
 use rows::text_field::TextAlign;
-use rows::{InspectorRow, PreviewSpec, RowAction, TextField, tag_pill};
+use rows::{InspectorRow, PreviewSpec, ROW_HEIGHT, RowAction, TextField, tag_pill};
 
-const ROW_HEIGHT: f32 = 28.0;
 /// Horizontal padding inside a row, both sides together.
 const ROW_PADDING: Pixels = px(24.0);
 /// What a row needs beyond its label: padding, and room for a chevron or a
@@ -442,6 +441,30 @@ impl Inspector {
     /// Whether the row at visible position `vis_ix` is a non-selectable
     /// section header. `filtered` is passed in so callers that already hold
     /// the index list don't recompute it.
+    /// Move the keyboard selection one selectable row down (or up), skipping
+    /// headers, and scroll it into view from the direction of travel.
+    fn step_selection(&mut self, down: bool) {
+        let filtered = self.filtered_indices();
+        let mut i = self.selected_index;
+        loop {
+            i = match (down, i) {
+                (true, i) if i + 1 < filtered.len() => i + 1,
+                (false, i) if i > 0 => i - 1,
+                _ => return,
+            };
+            if !self.is_header_at(&filtered, i) {
+                self.selected_index = i;
+                let strategy = if down {
+                    ScrollStrategy::Bottom
+                } else {
+                    ScrollStrategy::Top
+                };
+                self.scroll_handle.scroll_to_item(i, strategy);
+                return;
+            }
+        }
+    }
+
     fn is_header_at(&self, filtered: &[usize], vis_ix: usize) -> bool {
         let Some(rows) = self.current_rows() else {
             return false;
@@ -671,32 +694,8 @@ impl Inspector {
                     return;
                 }
             }
-            "up" => {
-                let filtered = self.filtered_indices();
-                let mut i = self.selected_index;
-                while i > 0 {
-                    i -= 1;
-                    if !self.is_header_at(&filtered, i) {
-                        self.selected_index = i;
-                        self.scroll_handle.scroll_to_item(i, ScrollStrategy::Top);
-                        break;
-                    }
-                }
-                cx.notify();
-                return;
-            }
-            "down" => {
-                let filtered = self.filtered_indices();
-                let total = filtered.len();
-                let mut i = self.selected_index;
-                while i + 1 < total {
-                    i += 1;
-                    if !self.is_header_at(&filtered, i) {
-                        self.selected_index = i;
-                        self.scroll_handle.scroll_to_item(i, ScrollStrategy::Bottom);
-                        break;
-                    }
-                }
+            "up" | "down" => {
+                self.step_selection(key == "down");
                 cx.notify();
                 return;
             }

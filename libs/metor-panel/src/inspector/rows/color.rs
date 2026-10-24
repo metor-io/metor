@@ -3,7 +3,7 @@ use std::sync::Arc;
 use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
 
 use super::slider::SliderRow;
-use super::{InspectorRow, RowAction, row_base};
+use super::{InspectorRow, RowAction, row_base, row_label};
 use crate::icons::Icon;
 use crate::theme::theme;
 
@@ -13,10 +13,17 @@ use crate::theme::theme;
 /// the user can tune each channel without leaving the inspector.
 pub struct ColorRow {
     pub label: SharedString,
-    pub color: Hsla,
     pub read_color: Arc<dyn Fn(&App) -> Hsla>,
     pub on_change: Arc<dyn Fn(Hsla, &mut Window, &mut App)>,
 }
+
+/// The four sliders' labels and the channel each one edits.
+const CHANNELS: [(&str, fn(&mut Hsla) -> &mut f32); 4] = [
+    ("Hue", |c| &mut c.h),
+    ("Saturation", |c| &mut c.s),
+    ("Lightness", |c| &mut c.l),
+    ("Alpha", |c| &mut c.a),
+];
 
 impl InspectorRow for ColorRow {
     fn label(&self) -> &str {
@@ -33,12 +40,7 @@ impl InspectorRow for ColorRow {
         let theme = theme(cx);
 
         row_base(row_ix, selected, cx)
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_primary)
-                    .child(self.label.clone()),
-            )
+            .child(row_label(self.label.clone(), theme.text_primary))
             .child(
                 div()
                     .flex()
@@ -50,7 +52,7 @@ impl InspectorRow for ColorRow {
                             .w(px(14.0))
                             .h(px(14.0))
                             .rounded(px(3.0))
-                            .bg(self.color),
+                            .bg((self.read_color)(cx)),
                     )
                     .child(Icon::ChevronRight.svg(8.0)),
             )
@@ -58,59 +60,26 @@ impl InspectorRow for ColorRow {
     }
 
     fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
-        let on_change = self.on_change.clone();
-        let read = self.read_color.clone();
-
-        let (hue_read, hue_set) = (read.clone(), read.clone());
-        let (sat_read, sat_set) = (read.clone(), read.clone());
-        let (lit_read, lit_set) = (read.clone(), read.clone());
-        let (alpha_read, alpha_set) = (read.clone(), read.clone());
-        let hue_cb = on_change.clone();
-        let sat_cb = on_change.clone();
-        let lit_cb = on_change.clone();
-        let alpha_cb = on_change.clone();
-
-        RowAction::Cascade(vec![
-            Box::new(SliderRow {
-                label: "Hue".into(),
-                read_value: Arc::new(move |cx| hue_read(cx).h as f64),
-                min: 0.0,
-                max: 1.0,
-                on_change: Arc::new(move |v, w, cx| {
-                    let cur = hue_set(cx);
-                    hue_cb(Hsla { h: v as f32, ..cur }, w, cx);
-                }),
-            }),
-            Box::new(SliderRow {
-                label: "Saturation".into(),
-                read_value: Arc::new(move |cx| sat_read(cx).s as f64),
-                min: 0.0,
-                max: 1.0,
-                on_change: Arc::new(move |v, w, cx| {
-                    let cur = sat_set(cx);
-                    sat_cb(Hsla { s: v as f32, ..cur }, w, cx);
-                }),
-            }),
-            Box::new(SliderRow {
-                label: "Lightness".into(),
-                read_value: Arc::new(move |cx| lit_read(cx).l as f64),
-                min: 0.0,
-                max: 1.0,
-                on_change: Arc::new(move |v, w, cx| {
-                    let cur = lit_set(cx);
-                    lit_cb(Hsla { l: v as f32, ..cur }, w, cx);
-                }),
-            }),
-            Box::new(SliderRow {
-                label: "Alpha".into(),
-                read_value: Arc::new(move |cx| alpha_read(cx).a as f64),
-                min: 0.0,
-                max: 1.0,
-                on_change: Arc::new(move |v, w, cx| {
-                    let cur = alpha_set(cx);
-                    alpha_cb(Hsla { a: v as f32, ..cur }, w, cx);
-                }),
-            }),
-        ])
+        RowAction::Cascade(
+            CHANNELS
+                .into_iter()
+                .map(|(label, channel)| {
+                    let read = self.read_color.clone();
+                    let write = self.read_color.clone();
+                    let on_change = self.on_change.clone();
+                    Box::new(SliderRow {
+                        label: label.into(),
+                        read_value: Arc::new(move |cx| *channel(&mut read(cx)) as f64),
+                        min: 0.0,
+                        max: 1.0,
+                        on_change: Arc::new(move |v, w, cx| {
+                            let mut color = write(cx);
+                            *channel(&mut color) = v as f32;
+                            on_change(color, w, cx);
+                        }),
+                    }) as Box<dyn InspectorRow>
+                })
+                .collect(),
+        )
     }
 }

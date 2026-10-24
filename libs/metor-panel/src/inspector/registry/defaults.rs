@@ -167,7 +167,6 @@ impl InspectorRegistry {
             let read_entity = any_entity.clone();
             Box::new(ColorRow {
                 label,
-                color,
                 read_color: Arc::new(move |cx| {
                     crate::inspector::reflect::get_field::<Hsla>(&read_entity, idx, cx)
                         .unwrap_or(color)
@@ -317,7 +316,6 @@ impl InspectorRegistry {
                     let write = any_entity.clone();
                     Box::new(ColorRow {
                         label,
-                        color: initial,
                         read_color: Arc::new(
                             move |cx| match crate::inspector::reflect::get_field::<Override<Hsla>>(
                                 &read, idx, cx,

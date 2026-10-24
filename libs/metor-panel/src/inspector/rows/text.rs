@@ -1,9 +1,8 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
-use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, SharedString, Window, prelude::*};
 
-use super::{InspectorRow, RowAction, row_base};
-use crate::theme::theme;
+use super::{InspectorRow, RowAction, value_row};
 
 /// Inspector row for a string field.
 ///
@@ -58,39 +57,15 @@ impl InspectorRow for TextRow {
         _window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let theme = theme(cx);
-        let label_color = if self.read_only {
-            theme.text_tertiary
-        } else {
-            theme.text_primary
-        };
-        let value_color = if self.read_only {
-            theme.text_tertiary
-        } else {
-            theme.text_secondary
-        };
-
-        row_base(row_ix, selected, cx)
-            .gap(px(2.))
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(label_color)
-                    .child(self.label.clone()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(12.0))
-                    .text_color(value_color)
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_right()
-                    .child(self.value.borrow().clone()),
-            )
-            .into_any_element()
+        value_row(
+            row_ix,
+            selected,
+            self.label.clone(),
+            self.value.borrow().clone(),
+            self.read_only,
+            cx,
+        )
+        .into_any_element()
     }
 
     fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
