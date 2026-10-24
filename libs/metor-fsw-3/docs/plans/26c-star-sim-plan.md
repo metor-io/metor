@@ -573,10 +573,18 @@ Params:
 
 Run loop:
 
-1. `body.next().await`, skipping until `timestamp ≥ next_exposure`.
-2. Select cells for the half-diagonal plus the blur sweep.
-3. Render, then write both records stamped `t + t_exp/2`.
-4. Advance `frame_id` and `next_exposure`.
+1. `body.next().await`; an exposure starts at the first `timestamp ≥
+   next_exposure`, `t`.
+2. Keep taking body states until one is at or past `t + t_exp/2`. The
+   frame is rendered from that state (its attitude turned back to `t` at
+   its rate is the `Motion`), so the image's attitude is the true attitude
+   at its stamp. Rendering from the state at `t` and extrapolating at the
+   rate at `t` put each frame ατ²/8 off its stamp, which under the plant's
+   rate jitter was a 1.5e-4 rad common-mode error per frame that nav
+   could not model (nav NEES 5.4 against 0.9 after).
+3. Select cells for the half-diagonal plus the blur sweep.
+4. Render, then write both records stamped `t + t_exp/2`.
+5. Advance `frame_id` and `next_exposure`.
 
 `sim.py`: `fsw.add("star_sim", StarSim(..., catalog=starcat.ensure("g8"),
 backend="cpu"), thread="startracker")`. It moves to `g12` once that file is

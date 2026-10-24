@@ -10,8 +10,9 @@ use crate::sim::StarSim;
 #[system]
 /// Renders a star-tracker frame from the true attitude every `1 / rate_hz`
 /// of sim time, and writes the image and its truth stamped at mid-exposure.
-/// It reads `World` for the ephemeris that aberration and bright-body
-/// blinding will use.
+/// Each frame is rendered from the body state at its mid-exposure, so the
+/// image shows the attitude its stamp names. It reads `World` for the
+/// ephemeris that aberration and bright-body blinding will use.
 pub async fn star_sim(
     #[state] state: &mut StarSim,
     body: &mut Input<BodyState, Notifier>,
@@ -23,15 +24,17 @@ pub async fn star_sim(
 ) {
     while let Some(body) = next(body, &stop).await {
         let _ = world.latest();
-        if !state.due(body.timestamp) {
-            continue;
+        match state.sample(&body) {
+            Ok(false) => continue,
+            Ok(true) => {
+                let _ = star_image.write(state.image());
+                let _ = star_truth.write(state.truth());
+            }
+            Err(error) => {
+                log.fault("render", format!("{error:?}"));
+                return;
+            }
         }
-        if let Err(error) = state.expose(&body) {
-            log.fault("render", format!("{error:?}"));
-            return;
-        }
-        let _ = star_image.write(state.image());
-        let _ = star_truth.write(state.truth());
     }
 }
 

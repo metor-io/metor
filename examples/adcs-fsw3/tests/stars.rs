@@ -197,6 +197,13 @@ fn stop(cycles: u64) -> impl Future<Output = ()> {
     })
 }
 
+/// The mean normalised squared error over the samples past `from` seconds:
+/// 3 for a consistent filter, under it for nav's process-noise margin.
+fn mean_nees(samples: &[(f64, f64)], from: f64) -> f64 {
+    let late = &samples[((from / CYCLE_S) as usize).min(samples.len())..];
+    late.iter().map(|s| s.1).sum::<f64>() / late.len().max(1) as f64
+}
+
 /// Seconds from the first sample until the error stays under [`BOUND`].
 fn settled(label: &str, samples: &[(f64, f64)]) -> f64 {
     let errors: Vec<f64> = samples.iter().map(|s| s.0).collect();
@@ -236,13 +243,18 @@ fn sim_loop_holds_the_filter_under_the_bound() {
 
 /// The closed loop on images: the GPU star simulator renders from the
 /// plant's attitude, the tracker identifies the stars, and nav converges on
-/// its vectors alone from identity.
+/// its vectors alone from identity. Once settled, nav is consistent: its
+/// NEES is at most the ideal tracker's 3, which rules out an error the
+/// star vectors carry but their σ does not, such as a frame whose attitude
+/// is not the one at its stamp.
 #[test]
 fn tracker_alone_converges_from_identity() {
     for angle in [30.0, 170.0] {
         let config = from_identity_with(image_config(), angle);
         let errors = run(&config);
         assert!(settled(&format!("tracker, {angle}° from identity"), &errors) < 30.0);
+        let nees = mean_nees(&errors, 15.0);
+        assert!(nees < 3.0, "tracker, {angle}°: NEES {nees:.2} after 15 s");
     }
 }
 
