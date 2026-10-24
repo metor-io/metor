@@ -61,7 +61,8 @@ fn watch(
 }
 
 /// `sim.py`'s target on a simulated clock, with the watcher added and the
-/// publish link and db removed.
+/// publish link, db and image simulator removed (nav reads the ideal
+/// tracker, not images).
 fn config() -> &'static CoordinatorConfig {
     static CONFIG: OnceLock<CoordinatorConfig> = OnceLock::new();
     CONFIG.get_or_init(|| {
@@ -77,9 +78,9 @@ fn config() -> &'static CoordinatorConfig {
             dt: Duration::from_secs_f64(CYCLE_S),
             epoch: None,
         };
-        config
-            .systems
-            .retain(|s| !["fsw.publish", "fsw.db"].contains(&s.ty.as_str()));
+        config.systems.retain(|s| {
+            !["fsw.publish", "fsw.db", "startracker_sim.star_sim"].contains(&s.ty.as_str())
+        });
         config.systems.push(SystemConfig {
             inputs: vec![
                 input("body", PortRef::new("plant", "body")),

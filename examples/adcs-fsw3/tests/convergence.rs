@@ -220,6 +220,17 @@ fn staged_library() -> Arc<Pack> {
     Arc::new(Pack::Dl(pack))
 }
 
+/// Opens the `startracker_sim` cdylib `pack dev` staged beside the pack's crate.
+fn staged_star_sim() -> Arc<Pack> {
+    let path = manifest()
+        .join("systems/startracker-sim/.metor/startracker_sim_pack/_libs")
+        .join(triple())
+        .join(cdylib_name("startracker_sim_3"));
+    // SAFETY: as for `staged_library`.
+    let pack = unsafe { DlPack::open(&path) }.expect("the staged pack opens");
+    Arc::new(Pack::Dl(pack))
+}
+
 /// Opens the `seqs` module `pack dev` staged beside the pack's crate.
 fn staged_module() -> Arc<Pack> {
     let reference = PackRef {
@@ -237,7 +248,7 @@ fn staged_module() -> Arc<Pack> {
 fn linked(config: &CoordinatorConfig, shared: &Shared) -> Coordinator {
     let mut config = config.clone();
     for system in &mut config.systems {
-        let pack_ty = ["adcs.", "seqs."]
+        let pack_ty = ["adcs.", "seqs.", "startracker_sim."]
             .iter()
             .find_map(|prefix| system.ty.strip_prefix(prefix));
         if let Some(ty) = pack_ty {
@@ -245,6 +256,13 @@ fn linked(config: &CoordinatorConfig, shared: &Shared) -> Coordinator {
         }
     }
     let mut table = adcs_systems::pack();
+    table
+        .register_async(
+            "star_sim",
+            startracker_sim::system::star_sim(),
+            startracker_sim::StarSim::new,
+        )
+        .expect("valid records");
     table
         .register_sequence(
             "commission",
@@ -359,7 +377,11 @@ fn assert_same_torques(a: &Record, b: &Record) {
         b.torque.len(),
         "the runs commanded the same number of torques"
     );
-    assert!(a.torque == b.torque, "the two command streams differ");
+    let first = a.torque.iter().zip(&b.torque).position(|(x, y)| x != y);
+    assert!(
+        a.torque == b.torque,
+        "the two command streams differ at {first:?}"
+    );
 }
 
 #[test]
@@ -367,12 +389,16 @@ fn test_loop_converges_linked_and_loaded() {
     install_logging();
 
     let config = config();
-    let adcs = staged_library();
+    let (adcs, star) = (staged_library(), staged_star_sim());
     let (linked_run, loaded_run) = (Shared::default(), Shared::default());
     drive(
         vec![
             linked(config, &linked_run),
-            loaded(config, &loaded_run, &[("adcs", &adcs)]),
+            loaded(
+                config,
+                &loaded_run,
+                &[("adcs", &adcs), ("startracker_sim", &star)],
+            ),
         ],
         CYCLES,
     );
@@ -389,12 +415,16 @@ fn test_sequenced_loop_converges_linked_and_module() {
     install_logging();
 
     let config = sequenced(config());
-    let (adcs, seqs) = (staged_library(), staged_module());
+    let (adcs, seqs, star) = (staged_library(), staged_module(), staged_star_sim());
     let (linked_run, module_run) = (Shared::default(), Shared::default());
     let ended = drive(
         vec![
             linked(&config, &linked_run),
-            loaded(&config, &module_run, &[("adcs", &adcs), ("seqs", &seqs)]),
+            loaded(
+                &config,
+                &module_run,
+                &[("adcs", &adcs), ("seqs", &seqs), ("startracker_sim", &star)],
+            ),
         ],
         SEQUENCED_CYCLES,
     );

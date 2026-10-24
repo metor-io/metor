@@ -118,8 +118,12 @@ fn sim_py_records_star_images_at_10_hz() {
         let ids = u64s(&images);
         assert!(ids.len() >= 25, "{} frames in {RUN:?}", ids.len());
         assert_eq!(ids.first(), Some(&0));
-        for (pair, id) in images.windows(2).zip(ids.windows(2)) {
+        for (i, (pair, id)) in images.windows(2).zip(ids.windows(2)).enumerate() {
             assert!(id[1] > id[0], "{ids:?}");
+            // The first frame can render late while the target warms up.
+            if i == 0 {
+                continue;
+            }
             let dt = pair[1].0 - pair[0].0;
             let expected = 100_000 * (id[1] - id[0]) as i64;
             // A wall-clock cycle starts up to a few ms late.
@@ -130,8 +134,8 @@ fn sim_py_records_star_images_at_10_hz() {
                 id[1]
             );
         }
-        let (first, last) = (images[0].0, images[images.len() - 1].0);
-        let period = (last - first) as f64 / ids[ids.len() - 1] as f64;
+        let (first, last) = (images[1].0, images[images.len() - 1].0);
+        let period = (last - first) as f64 / (ids[ids.len() - 1] - ids[1]) as f64;
         assert!(
             (period - 100_000.0).abs() < 1_000.0,
             "{period} µs per frame"
