@@ -186,19 +186,28 @@ impl StateChip {
     }
 
     fn style(&self, cx: &App) -> StripStyle {
-        let states = (!self.states.is_empty()).then(|| StateTable {
-            entries: self
-                .states
-                .iter()
-                .map(|e| {
-                    let e = e.read(cx);
-                    (e.value, e.label.clone(), e.color)
-                })
-                .collect(),
-            unknown_label: self.unknown_label.clone(),
-        });
-        StripStyle::boxes().with_states(states)
+        let entries = self
+            .states
+            .iter()
+            .map(|e| {
+                let e = e.read(cx);
+                (e.value, e.label.clone(), e.color)
+            })
+            .collect();
+        StripStyle::boxes().with_states(state_table(entries, &self.unknown_label))
     }
+}
+
+/// The table a chip hands its strip. An unknown label alone is still a
+/// table: it is what the chip says for every value it can't name.
+fn state_table(
+    entries: Vec<(f64, SharedString, Option<Hsla>)>,
+    unknown_label: &SharedString,
+) -> Option<StateTable> {
+    (!entries.is_empty() || !unknown_label.is_empty()).then(|| StateTable {
+        entries,
+        unknown_label: unknown_label.clone(),
+    })
 }
 
 /// The chip's element selection as binding text: element 0 is the component
@@ -244,5 +253,20 @@ impl Render for StateChip {
             .p(ui_px(4.0))
             .overflow_hidden()
             .child(self.strip.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_label_without_states_still_makes_a_table() {
+        let unknown = SharedString::from("UNKNOWN");
+        let table = state_table(Vec::new(), &unknown).expect("label alone is a table");
+        assert_eq!(table.unknown_label, unknown);
+        assert!(state_table(Vec::new(), &SharedString::default()).is_none());
+        let named = vec![(0.0, SharedString::from("IDLE"), None)];
+        assert!(state_table(named, &SharedString::default()).is_some());
     }
 }
