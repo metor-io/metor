@@ -13,6 +13,7 @@ pub struct IconAssets;
 impl AssetSource for IconAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let bytes: Option<&'static [u8]> = match path {
+            "icons/abort.svg" => Some(include_bytes!("../assets/icons/abort.svg")),
             "icons/add.svg" => Some(include_bytes!("../assets/icons/add.svg")),
             "icons/chart.svg" => Some(include_bytes!("../assets/icons/chart.svg")),
             "icons/chevron_down.svg" => Some(include_bytes!("../assets/icons/chevron_down.svg")),
@@ -51,6 +52,7 @@ impl AssetSource for IconAssets {
             "icons/skip-forward.svg" => Some(include_bytes!("../assets/icons/skip-forward.svg")),
             "icons/search.svg" => Some(include_bytes!("../assets/icons/search.svg")),
             "icons/setting.svg" => Some(include_bytes!("../assets/icons/setting.svg")),
+            "icons/stop.svg" => Some(include_bytes!("../assets/icons/stop.svg")),
             "icons/subtract.svg" => Some(include_bytes!("../assets/icons/subtract.svg")),
             "icons/tile_3d_viewer.svg" => {
                 Some(include_bytes!("../assets/icons/tile_3d_viewer.svg"))
@@ -77,6 +79,7 @@ impl AssetSource for IconAssets {
 /// and removed assets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
+    Abort,
     Add,
     Chart,
     ChevronDown,
@@ -111,6 +114,7 @@ pub enum Icon {
     SkipForward,
     Search,
     Setting,
+    Stop,
     Subtract,
     Tile3dViewer,
     TileGraph,
@@ -122,6 +126,7 @@ pub enum Icon {
 impl Icon {
     fn asset_path(self) -> &'static str {
         match self {
+            Icon::Abort => "icons/abort.svg",
             Icon::Add => "icons/add.svg",
             Icon::Chart => "icons/chart.svg",
             Icon::ChevronDown => "icons/chevron_down.svg",
@@ -156,6 +161,7 @@ impl Icon {
             Icon::SkipForward => "icons/skip-forward.svg",
             Icon::Search => "icons/search.svg",
             Icon::Setting => "icons/setting.svg",
+            Icon::Stop => "icons/stop.svg",
             Icon::Subtract => "icons/subtract.svg",
             Icon::Tile3dViewer => "icons/tile_3d_viewer.svg",
             Icon::TileGraph => "icons/tile_graph.svg",

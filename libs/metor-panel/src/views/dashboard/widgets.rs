@@ -433,7 +433,7 @@ impl WidgetRegistry {
         self.register(
             WidgetKind::sequence_control(),
             WidgetSpec::typed(
-                (260.0, 110.0),
+                (340.0, 48.0),
                 |w| {
                     let cfg = parse_or_default::<SequenceControlConfig>(&w.config);
                     subject("Sequence", &cfg.channel)

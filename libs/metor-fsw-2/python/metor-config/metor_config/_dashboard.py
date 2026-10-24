@@ -539,7 +539,7 @@ class SequenceControl:
         return (
             "sequence_control",
             {"channel": self.channel, "compact": self.compact},
-            (260.0, 110.0),
+            (340.0, 48.0),
         )
 
 
