@@ -29,12 +29,12 @@ struct Msg {
 
 /// An op whose success is a new descriptor.
 #[derive(Default)]
-enum Opening {
+enum NewFd {
     #[default]
     None,
     Accept,
     /// The socket a connect runs on, and where it connects.
-    Dial(OwnedFd, SocketAddr),
+    Connect(OwnedFd, SocketAddr),
 }
 
 /// The `Os` for Linux targets.
@@ -42,9 +42,9 @@ pub struct UringOs {
     ring: IoUring,
     /// One per op table entry.
     msgs: Box<[Msg]>,
-    /// Each op table entry's opening, if it is one. A cancel names the op by
+    /// Each op table entry's new descriptor op, if it is one. A cancel names the op by
     /// its id alone, so the kind is kept here rather than in `user_data`.
-    opens: Box<[Opening]>,
+    opens: Box<[NewFd]>,
     /// Ops the kernel holds, whose entries may still write into `msgs`.
     in_flight: usize,
     done: Vec<OsDone>,
@@ -62,7 +62,7 @@ impl UringOs {
         Ok(Self {
             ring: IoUring::new(entries)?,
             msgs: (0..ops).map(|_| zeroed()).collect(),
-            opens: (0..ops).map(|_| Opening::None).collect(),
+            opens: (0..ops).map(|_| NewFd::None).collect(),
             in_flight: 0,
             done: Vec::with_capacity(2 * ops),
         })
@@ -71,11 +71,11 @@ impl UringOs {
     /// The kernel entry for `op`, or `None` for one `sys::run` runs inline.
     fn entry(&mut self, op: &OsOp) -> Result<Option<Entry>, IoError> {
         let index = usize::from(op.id.index());
-        let (Some(msg), Some(opening)) = (self.msgs.get_mut(index), self.opens.get_mut(index))
+        let (Some(msg), Some(new_fd)) = (self.msgs.get_mut(index), self.opens.get_mut(index))
         else {
             return Ok(None);
         };
-        *opening = Opening::None;
+        *new_fd = NewFd::None;
         let fd = Fd(op.fd);
         let buf = op.bytes();
         let (ptr, len) = (buf.cast::<u8>().as_ptr(), buf.len() as u32);
@@ -108,7 +108,7 @@ impl UringOs {
                 let flags = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
                 msg.addr_len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
                 let addr = (&raw mut msg.addr).cast();
-                *opening = Opening::Accept;
+                *new_fd = NewFd::Accept;
                 opcode::Accept::new(fd, addr, &raw mut msg.addr_len)
                     .flags(flags)
                     .build()
@@ -118,7 +118,7 @@ impl UringOs {
                 let socket = sys::stream_socket(to)?;
                 (msg.addr, msg.addr_len) = sys::sockaddr(to);
                 let fd = Fd(socket.as_raw_fd());
-                *opening = Opening::Dial(socket, to);
+                *new_fd = NewFd::Connect(socket, to);
                 opcode::Connect::new(fd, (&raw const msg.addr).cast(), msg.addr_len).build()
             }
             (Op::Fsync, _) => opcode::Fsync::new(fd).build(),
@@ -220,19 +220,19 @@ impl Drop for UringOs {
 }
 
 /// What finished op `id` gives back, from the kernel's result `res`.
-fn finished(opens: &mut [Opening], msgs: &[Msg], id: OpId, res: i32) -> Result<Out, IoError> {
+fn finished(opens: &mut [NewFd], msgs: &[Msg], id: OpId, res: i32) -> Result<Out, IoError> {
     let index = usize::from(id.index());
-    let opening = opens.get_mut(index).map(core::mem::take);
-    match (res, opening) {
+    let new_fd = opens.get_mut(index).map(core::mem::take);
+    match (res, new_fd) {
         (..0, _) if res == -libc::ECANCELED => Err(IoError::Canceled),
         (..0, _) => Err(IoError::Os(sys::linux(-res).unwrap_or(Errno::EIO))),
-        (_, Some(Opening::Accept)) => Ok(Out::Opened {
+        (_, Some(NewFd::Accept)) => Ok(Out::Opened {
             // SAFETY: an accept's result is a new descriptor, now owned here.
             fd: unsafe { OwnedFd::from_raw_fd(res) },
             class: Class::Stream,
             peer: msgs.get(index).and_then(|m| sys::socket_addr(&m.addr)),
         }),
-        (_, Some(Opening::Dial(fd, to))) => Ok(Out::Opened {
+        (_, Some(NewFd::Connect(fd, to))) => Ok(Out::Opened {
             fd,
             class: Class::Stream,
             peer: Some(to),

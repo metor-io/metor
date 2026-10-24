@@ -25,7 +25,7 @@ mod uring;
 pub(crate) mod wire;
 
 pub(crate) use dispatch::{Backed, Dispatch, MemberDef, Route};
-pub use open::{OpenError, open};
+pub use open::{OpenError, open, resolve};
 pub use poll::PollOs;
 pub(crate) use steps::entry;
 pub use steps::{IO_STATUS_PORT, IO_TYPE};
@@ -274,29 +274,31 @@ impl Resource {
         ops: usize,
         wires: &mut Vec<Wire>,
     ) -> Result<Self, BuildError> {
+        let failed = |e: OpenError| BuildError::Open {
+            resource: id.to_string(),
+            message: e.to_string(),
+        };
         let backed = match backing {
             Backing::Sim(sim) if held => {
                 wires.push(Wire::new(sim.kind, ops));
                 Backed::Wire(wires.len() - 1)
             }
-            Backing::Real(RealKind::TcpDial { addr }) if held => Backed::Dial(*addr),
+            Backing::Real(RealKind::TcpDial { addr }) if held => {
+                Backed::Dial(resolve(addr).map_err(failed)?)
+            }
+            Backing::Real(kind @ RealKind::TcpListen { allow, .. }) if held => {
+                let (fd, _) = open(kind).map_err(failed)?;
+                Backed::Listen(fd, allow.as_slice().into())
+            }
             Backing::Real(kind) if held => {
-                let (fd, class) = open(kind).map_err(|e| BuildError::Open {
-                    resource: id.to_string(),
-                    message: e.to_string(),
-                })?;
+                let (fd, class) = open(kind).map_err(failed)?;
                 Backed::Fd(fd, class)
             }
             _ => Backed::Unused,
         };
-        let allow = match backing {
-            Backing::Real(RealKind::TcpListen { allow, .. }) => allow.as_slice().into(),
-            _ => Box::default(),
-        };
         Ok(Self {
             id: id.to_string(),
             backed,
-            allow,
         })
     }
 }

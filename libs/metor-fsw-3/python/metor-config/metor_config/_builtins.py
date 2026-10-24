@@ -16,8 +16,6 @@ the transport a resource named ``{name}_ep`` and grants it to the link's
 
 from __future__ import annotations
 
-import ipaddress
-import socket
 from dataclasses import dataclass
 from typing import Any, Sequence, TypeVar
 
@@ -61,13 +59,13 @@ class Listen:
 
 @dataclass(frozen=True)
 class Connect:
-    """Dial ``addr`` and keep one connection open. A host name resolves
-    when the config is built."""
+    """Dial ``addr``, a ``host:port``, and keep one connection open. A host
+    name resolves on the target, when the link's resource opens."""
 
     addr: str
 
     def _kind(self) -> Kind:
-        return TcpDial(_resolve(self.addr))
+        return TcpDial(_check_addr(self.addr))
 
 
 @dataclass(frozen=True)
@@ -88,26 +86,15 @@ Transport = Listen | Connect | Peer
 """How a link gets its connections."""
 
 
-def _resolve(addr: str) -> str:
-    """Returns ``addr`` with its host resolved to an IP address."""
+def _check_addr(addr: str) -> str:
+    """Returns ``addr`` if it is a ``host:port`` address."""
     host, sep, port = addr.rpartition(":")
-    if not sep or not port.isdigit():
+    if not sep or not host or not port.isdigit():
         raise ConfigError(f"`{addr}` is not a `host:port` address")
     bracketed = host.startswith("[") and host.endswith("]")
-    host = host.removeprefix("[").removesuffix("]")
     if ":" in host and not bracketed:
         raise ConfigError(f"`{addr}` names an IPv6 host without brackets, as `[::1]:2240`")
-    try:
-        ipaddress.ip_address(host)
-        return addr
-    except ValueError:
-        pass
-    try:
-        found = socket.getaddrinfo(host, int(port), type=socket.SOCK_STREAM)
-    except OSError as e:
-        raise ConfigError(f"`{addr}` does not resolve: {e}") from None
-    family, ip = found[0][0], found[0][4][0]
-    return f"[{ip}]:{port}" if family == socket.AF_INET6 else f"{ip}:{port}"
+    return addr
 
 
 class Link(System):

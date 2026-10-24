@@ -133,7 +133,7 @@ def _check_cidr(block: object) -> None:
 
 @dataclass(frozen=True)
 class TcpDial(Kind):
-    """A TCP dialer: each stream connects to ``addr``, an IP literal."""
+    """A TCP dialer: each stream connects to ``addr``, a ``host:port``."""
 
     addr: str
     _key = "tcp_dial"

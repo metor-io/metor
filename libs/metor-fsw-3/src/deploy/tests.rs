@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use serde_json::json;
 
 use super::*;
@@ -44,7 +46,7 @@ fn listen(port: u16) -> DeployBacking {
 
 /// A resource that dials `addr`.
 fn dial(addr: &str) -> DeployBacking {
-    let addr = addr.parse().expect("an address");
+    let addr = addr.to_string();
     DeployBacking::Runtime(Backing::Real(RealKind::TcpDial { addr }))
 }
 
@@ -237,24 +239,11 @@ fn test_peer_dial_takes_host_address() {
 }
 
 #[test]
-fn test_peer_dial_resolves_a_host_name() {
+fn test_peer_dial_keeps_a_host_name() {
     let mut named = envelope();
-    named.hosts.insert("a".into(), "localhost".into());
+    named.hosts.insert("a".into(), "ground.local".into());
     resolve(&mut named, &tables(2)).expect("resolves");
-    let DeployBacking::Runtime(Backing::Real(RealKind::TcpDial { addr })) =
-        resource(&named, 1, "mirror_ep")
-    else {
-        panic!("a resolved dial")
-    };
-    assert!(addr.ip().is_loopback() && addr.port() == 2240, "{addr}");
-
-    let mut unknown = envelope();
-    unknown.hosts.insert("a".into(), "nohost.invalid".into());
-    let error = resolve(&mut unknown, &tables(2)).expect_err("no such host");
-    assert!(
-        matches!(&error, DeployError::Address { from, .. } if from == "b.mirror"),
-        "{error}"
-    );
+    assert_eq!(resource(&named, 1, "mirror_ep"), &dial("ground.local:2240"));
 }
 
 #[test]

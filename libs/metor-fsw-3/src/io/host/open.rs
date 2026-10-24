@@ -1,7 +1,7 @@
 //! Opens a target's real resources at build.
 
 use std::fs::OpenOptions;
-use std::net::{SocketAddr, TcpListener, UdpSocket};
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -18,6 +18,8 @@ pub enum OpenError {
     Unsupported(&'static str),
     #[error("configuring the port: {0}")]
     Configure(IoError),
+    #[error("`{0}` resolves to no address")]
+    NoAddress(String),
 }
 
 /// Opens `kind`, set up and nonblocking where its ops wait for readiness. A
@@ -41,6 +43,14 @@ pub fn open(kind: &RealKind) -> Result<(OwnedFd, Class), OpenError> {
         }
         RealKind::TcpDial { .. } => return Err(OpenError::Unsupported("opening a dialer")),
     })
+}
+
+/// The first address `addr`, a `host:port`, resolves to.
+pub fn resolve(addr: &str) -> Result<SocketAddr, OpenError> {
+    let mut found = addr.to_socket_addrs()?;
+    found
+        .next()
+        .ok_or_else(|| OpenError::NoAddress(addr.to_string()))
 }
 
 /// A serial port in raw mode at `baud`, 8N1.

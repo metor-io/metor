@@ -33,7 +33,6 @@ fn rig_with(ops: u16, sq_depth: usize, cq_depth: usize) -> Rig {
     let line = Resource {
         id: "line".into(),
         backed: Backed::Wire(0),
-        allow: Box::default(),
     };
     let wire = Wire::new(SimKind::GpioLine, usize::from(ops));
     let member = MemberDef {

@@ -332,13 +332,13 @@ class LinkTest(ConfigTest):
         with self.assertRaisesRegex(ConfigError, "not a CIDR block"):
             fsw.add("bad", Publish([], transport=Listen("0.0.0.0:2241", allow=["10.0.0.0"])))
 
-    def test_connect_resolves_a_host_name(self) -> None:
+    def test_connect_keeps_a_host_name(self) -> None:
         fsw = Target(cycle_rate=100.0)
-        fsw.add("pub", Publish([], transport=Connect("localhost:2240")))
+        fsw.add("pub", Publish([], transport=Connect("ground.local:2240")))
         dial = fsw.to_config()["coordinator"]["resources"]["pub_ep"]["real"]["tcp_dial"]
-        self.assertIn(dial["addr"], ("127.0.0.1:2240", "[::1]:2240"))
-        with self.assertRaisesRegex(ConfigError, "does not resolve"):
-            fsw.add("lost", Publish([], transport=Connect("nohost.invalid:1")))
+        self.assertEqual(dial["addr"], "ground.local:2240")
+        with self.assertRaisesRegex(ConfigError, "not a `host:port`"):
+            fsw.add("nohost", Publish([], transport=Connect(":2240")))
         with self.assertRaisesRegex(ConfigError, "not a `host:port`"):
             fsw.add("bare", Publish([], transport=Connect("localhost")))
         with self.assertRaisesRegex(ConfigError, "without brackets"):

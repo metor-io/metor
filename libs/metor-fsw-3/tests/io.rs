@@ -6,7 +6,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use metor_fsw_3::io::{
     Backing,
-    host::{Access, Baud, Class, OpenError, RealKind, open},
+    host::{Access, Baud, Class, OpenError, RealKind, open, resolve},
 };
 
 /// A pty pair and the slave's path.
@@ -127,6 +127,18 @@ fn missing_tty_fails_and_odd_baud_does_not_parse() {
     let tty = |baud: u32| serde_json::json!({ "tty": { "path": "/dev/tty", "baud": baud } });
     assert!(serde_json::from_value::<RealKind>(tty(9600)).is_ok());
     assert!(serde_json::from_value::<RealKind>(tty(12_345)).is_err());
+}
+
+#[test]
+fn a_dial_resolves_its_host_on_open() {
+    let ip = resolve("10.0.0.2:2240").expect("an IP literal");
+    assert_eq!(ip, "10.0.0.2:2240".parse().unwrap());
+    let named = resolve("localhost:2240").expect("a host name");
+    assert!(named.ip().is_loopback() && named.port() == 2240, "{named}");
+    assert!(
+        matches!(resolve("localhost"), Err(OpenError::Io(_))),
+        "no port"
+    );
 }
 
 #[test]

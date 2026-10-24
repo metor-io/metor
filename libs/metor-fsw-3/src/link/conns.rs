@@ -240,11 +240,12 @@ impl Conns {
     }
 
     /// Reaps the stream op: a new stream takes a free slot, or is refused;
-    /// a failure waits out the backoff. One the full queue refused is asked
-    /// for again.
+    /// a failure waits out the backoff. One the full queue refused, or a
+    /// listener's peer the endpoint turned away, is asked for again.
     fn take_stream(&mut self) -> Option<Event> {
         let stream = match self.next.poll()? {
             Err(IoError::QueueFull) => return None,
+            Err(IoError::Refused) if !self.config.dialing => return None,
             Ok(stream) => stream,
             Err(e) => {
                 self.backoff.start();

@@ -57,13 +57,6 @@ pub enum DeployError {
     #[error("resource `{resource}` dials a peer, but no system holds it to resolve it for")]
     UnresolvedDial { resource: String },
 
-    #[error("`{from}` dials {addr}, which resolves to no address: {message}")]
-    Address {
-        from: String,
-        addr: String,
-        message: String,
-    },
-
     #[error("slot `{slot}`: {message}")]
     Slot { slot: String, message: String },
 

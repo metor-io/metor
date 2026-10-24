@@ -8,6 +8,7 @@
 //! lands when `expire` passes its deadline. Nothing here does IO.
 
 use core::net::SocketAddr;
+use core::ptr::NonNull;
 use core::time::Duration;
 use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -43,6 +44,9 @@ const READY_PER_SLOT: usize = LOWERED_PER_SLOT + OWN_COMPLETION + HELD_PER_SLOT;
 /// What backs a resource.
 pub(crate) enum Backed {
     Fd(OwnedFd, Class),
+    /// A listener, taking streams from the peers in its allow list, or from
+    /// any peer when the list is empty.
+    Listen(OwnedFd, Box<[Cidr]>),
     /// The wire at this index of the dispatch's wires.
     Wire(usize),
     /// No descriptor: each `Stream` dials this address.
@@ -54,8 +58,6 @@ pub(crate) enum Backed {
 pub(crate) struct Resource {
     pub(crate) id: String,
     pub(crate) backed: Backed,
-    /// The peers a listener's streams may come from; any when empty.
-    pub(crate) allow: Box<[Cidr]>,
 }
 
 /// Something for the io steps to carry out on the backend.
@@ -130,12 +132,14 @@ impl Member {
     }
 }
 
-/// Where each member's run of the op table starts: `base[m]..base[m + 1]`.
-struct Slots {
+/// The op table is one array shared by every member, and member `m` owns
+/// entries `base[m]..base[m + 1]`, one per op of its budget. Maps a member's
+/// slot to its entry and back.
+struct OpRanges {
     base: Box<[usize]>,
 }
 
-impl Slots {
+impl OpRanges {
     fn new(budgets: impl Iterator<Item = u16>) -> Self {
         let sums = budgets.scan(0, |sum, ops| {
             *sum += usize::from(ops);
@@ -180,8 +184,8 @@ struct InFlight {
     res: u16,
     kind: OpKind,
     canceled: bool,
-    /// A `Stream` as lowered, to write its peer and to lower it again.
-    stream: Option<OsOp>,
+    /// A `Stream`'s buffer, which its peer is written to.
+    peer: Option<NonNull<[u8]>>,
     /// A timeout's deadline.
     due: Option<Timestamp>,
 }
@@ -214,7 +218,7 @@ enum Target {
 
 pub(crate) struct Dispatch {
     members: Box<[Member]>,
-    slots: Slots,
+    ranges: OpRanges,
     ops: Box<[Option<InFlight>]>,
     /// How many ops in `ops` are timeouts.
     timers: usize,
@@ -240,12 +244,12 @@ impl Dispatch {
         resources: Vec<Resource>,
         wires: Vec<Wire>,
     ) -> Result<Self, BuildError> {
-        let slots = Slots::new(members.iter().map(|m| m.ops));
-        let ops = Self::check_ops(slots.total())?;
+        let ranges = OpRanges::new(members.iter().map(|m| m.ops));
+        let ops = Self::check_ops(ranges.total())?;
         let count = resources.len();
         Ok(Self {
             members: members.into_iter().map(Member::new).collect(),
-            slots,
+            ranges,
             ops: vec![None; ops].into(),
             timers: 0,
             names: resources
@@ -308,7 +312,7 @@ impl Dispatch {
             return Ok(());
         }
         let index = self
-            .slots
+            .ranges
             .index(m, sqe.token.index())
             .ok_or(Refusal::Drop)?;
         if self.ops[index].is_some() {
@@ -352,7 +356,7 @@ impl Dispatch {
             res,
             kind: op.kind(),
             canceled: false,
-            stream: lowered.filter(|_| op == Op::Stream),
+            peer: lowered.and_then(|o| o.buf).filter(|_| op == Op::Stream),
             due: None,
         });
         self.counters[usize::from(res)].submitted += 1;
@@ -376,7 +380,7 @@ impl Dispatch {
             res,
             kind: OpKind::Timeout,
             canceled: false,
-            stream: None,
+            peer: None,
             due: Some(at),
         });
         self.timers += 1;
@@ -412,6 +416,7 @@ impl Dispatch {
             let grant = member.grants.get(index).filter(|g| g.open)?;
             let target = match &self.resources[usize::from(grant.res)].backed {
                 Backed::Fd(fd, class) => Target::Fd(fd.as_raw_fd(), *class),
+                Backed::Listen(fd, _) => Target::Fd(fd.as_raw_fd(), Class::Listener),
                 Backed::Wire(w) => Target::Wire(*w, grant.end),
                 Backed::Dial(to) => Target::Dial(*to),
                 Backed::Unused => return None,
@@ -442,7 +447,7 @@ impl Dispatch {
 
     /// Cancels member `m`'s op `token`, once.
     fn cancel(&mut self, m: usize, token: Token) {
-        let Some(index) = self.slots.index(m, token.index()) else {
+        let Some(index) = self.ranges.index(m, token.index()) else {
             return;
         };
         let Some(op) = &mut self.ops[index] else {
@@ -477,17 +482,15 @@ impl Dispatch {
         let Some(op) = self.ops[index].take_if(ours) else {
             return;
         };
-        let (m, slot) = self.slots.owner(index);
+        let (m, slot) = self.ranges.owner(index);
         let token = Token::new(slot, op.generation);
         let result = match done.result {
             Ok(Out::Len(n)) => Ok(n),
-            Ok(Out::Opened { fd, class, peer }) => {
-                if !self.allows(op.res, peer) {
-                    return self.turn_away(m, index, op, fd);
-                }
+            Ok(Out::Opened { fd, class, peer }) if self.allows(op.res, peer) => {
                 write_peer(&op, peer);
                 self.derive(m, op.res, fd, class)
             }
+            Ok(Out::Opened { fd, .. }) => self.turn_away(op.res, fd),
             Err(e) => Err(e),
         };
         if self.members[m].state != MemberState::Running {
@@ -498,26 +501,19 @@ impl Dispatch {
         self.ready.push((m, cqe));
     }
 
-    /// Whether resource `res`'s `allow` list admits `peer`.
+    /// Whether resource `res`, if a listener, admits `peer`.
     fn allows(&self, res: u16, peer: Option<SocketAddr>) -> bool {
-        let allow = &self.resources[usize::from(res)].allow;
+        let Backed::Listen(_, allow) = &self.resources[usize::from(res)].backed else {
+            return true;
+        };
         allow.is_empty() || peer.is_some_and(|p| allow.iter().any(|c| c.contains(p.ip())))
     }
 
-    /// Closes a stream whose peer is not allowed, and lowers its op again
-    /// unless the op was canceled or its member is quiescing.
-    fn turn_away(&mut self, m: usize, index: usize, op: InFlight, fd: OwnedFd) {
+    /// Closes a stream whose peer is not allowed, and refuses its op.
+    fn turn_away(&mut self, res: u16, fd: OwnedFd) -> Result<u32, IoError> {
         self.routes.push(Route::Close(fd));
-        self.counters[usize::from(op.res)].rejected += 1;
-        let running = self.members[m].state == MemberState::Running;
-        self.ops[index] = Some(op);
-        match op.stream.filter(|_| running && !op.canceled) {
-            Some(again) => self.routes.push(Route::Os(again)),
-            None => self.raise(OsDone {
-                id: OpId::new(index as u16, op.generation),
-                result: Err(IoError::Canceled),
-            }),
-        }
+        self.counters[usize::from(res)].rejected += 1;
+        Err(IoError::Refused)
     }
 
     /// Raises everything a wire finished.
@@ -557,7 +553,7 @@ impl Dispatch {
 
     /// Member `m`'s op budget.
     pub(crate) fn ops_of(&self, m: usize) -> usize {
-        self.slots.budget(m)
+        self.ranges.budget(m)
     }
 
     /// Every member's ops.
@@ -585,9 +581,9 @@ impl Dispatch {
     /// flight.
     pub(crate) fn quiesce_member(&mut self, m: usize) {
         self.members[m].state = MemberState::Quiescing;
-        for index in self.slots.range(m) {
+        for index in self.ranges.range(m) {
             if let Some(op) = self.ops[index] {
-                let (_, slot) = self.slots.owner(index);
+                let (_, slot) = self.ranges.owner(index);
                 self.cancel(m, Token::new(slot, op.generation));
             }
         }
@@ -609,7 +605,7 @@ impl Dispatch {
 
     /// Whether member `m` has nothing left in flight since `begin`.
     pub(crate) fn member_idle(&self, m: usize) -> bool {
-        let ops = &self.ops[self.slots.range(m)];
+        let ops = &self.ops[self.ranges.range(m)];
         match self.members[m].state {
             MemberState::Running => true,
             MemberState::Quiescing => false,
@@ -671,7 +667,7 @@ fn deadline(now: Timestamp, after: Duration) -> Timestamp {
 /// Writes `peer`'s `RawAddr` into a `Stream`'s buffer, or zeroes for a
 /// stream with no peer.
 fn write_peer(op: &InFlight, peer: Option<SocketAddr>) {
-    let Some(buf) = op.stream.and_then(|s| s.buf) else {
+    let Some(buf) = op.peer else {
         return;
     };
     let addr = peer.map_or_else(RawAddr::new_zeroed, RawAddr::from);
@@ -690,7 +686,7 @@ mod proofs {
     #[kani::proof]
     fn index_never_aliases() {
         let budgets: [u16; 2] = kani::any();
-        let slots = Slots::new(budgets.into_iter());
+        let slots = OpRanges::new(budgets.into_iter());
         kani::assume(slots.total() <= usize::from(u16::MAX) + 1);
         let (m, slot): (bool, u16) = (kani::any(), kani::any());
         let m = usize::from(m);

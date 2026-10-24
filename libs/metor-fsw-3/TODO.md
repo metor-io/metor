@@ -47,8 +47,7 @@ Landed 2026-09-18; the fixture's
 `metor run` closes the loop from a `Subscribe` through `echo` to a
 `Publish`.
 
-`Publish` and `Subscribe` run as sequences on the IO queue
-(`docs/plans/25-link-io.md`): a link holds a `Cap<Endpoint>`, its
+`Publish` and `Subscribe` run as sequences on the IO queue: a link holds a `Cap<Endpoint>`, its
 transport lowers to a `tcp_listen` or `tcp_dial` resource, and its
 connections allocate nothing after make.
 

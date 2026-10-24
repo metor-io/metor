@@ -47,12 +47,10 @@ fn rig_with(kind: SimKind) -> Rig {
         Resource {
             id: "tty".into(),
             backed: Backed::Fd(fd, Class::Tty),
-            allow: Box::default(),
         },
         Resource {
             id: "sim".into(),
             backed: Backed::Wire(0),
-            allow: Box::default(),
         },
     ];
     let members = vec![
@@ -561,7 +559,6 @@ fn budgets(ops: &[u16]) -> Result<Dispatch, crate::coordinator::BuildError> {
     let resources = vec![Resource {
         id: "tty".into(),
         backed: Backed::Fd(null(), Class::Tty),
-        allow: Box::default(),
     }];
     let grants = || vec![(0.into(), ResourceEnd::Host)];
     let members = ops.iter().map(|&n| member(n, grants())).collect();
@@ -650,13 +647,11 @@ fn endpoints(allow: &[&str]) -> (Dispatch, Arena) {
     let resources = vec![
         Resource {
             id: "listen".into(),
-            backed: Backed::Fd(null(), Class::Listener),
-            allow: allow.iter().map(|c| c.parse().unwrap()).collect(),
+            backed: Backed::Listen(null(), allow.iter().map(|c| c.parse().unwrap()).collect()),
         },
         Resource {
             id: "dial".into(),
             backed: Backed::Dial("10.0.0.9:2240".parse().unwrap()),
-            allow: Box::default(),
         },
     ];
     let grants = vec![(0.into(), ResourceEnd::Host), (1.into(), ResourceEnd::Host)];
@@ -744,7 +739,7 @@ fn a_dialer_takes_only_streams() {
 }
 
 #[test]
-fn a_rejected_peer_is_closed_and_the_op_runs_again() {
+fn a_rejected_peer_is_closed_and_refused() {
     let (mut d, arena) = endpoints(&["10.0.0.0/24"]);
     d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
     let [op] = os_ops(&mut d)[..] else { panic!() };
@@ -752,17 +747,19 @@ fn a_rejected_peer_is_closed_and_the_op_runs_again() {
         id: op.id,
         result: opened(Some("192.168.1.7:5000")),
     });
-    assert!(ready(&mut d).is_empty(), "the system never sees it");
-    let routes: Vec<_> = d.drain_routes().collect();
-    assert!(matches!(&routes[..], [Route::Close(_), Route::Os(again)] if again.id == op.id));
+    assert!(matches!(
+        d.drain_routes().collect::<Vec<_>>()[..],
+        [Route::Close(_)]
+    ));
+    assert_eq!(ready(&mut d)[0].result(), Err(IoError::Refused));
     assert_eq!(rejected(&mut d), 1);
+    d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
+    let [op] = os_ops(&mut d)[..] else { panic!() };
     d.raise(OsDone {
         id: op.id,
         result: opened(Some("10.0.0.3:6000")),
     });
-    let [cqe] = ready(&mut d)[..] else { panic!() };
-    assert_eq!(cqe.token, Token::new(0, 7));
-    assert!(cqe.result().is_ok());
+    assert!(ready(&mut d)[0].result().is_ok());
     assert_eq!(peer_in(&arena), "10.0.0.3:6000".parse().unwrap());
 }
 
@@ -775,34 +772,14 @@ fn an_allow_list_refuses_a_stream_with_no_peer() {
         id: op.id,
         result: opened(None),
     });
-    assert!(ready(&mut d).is_empty());
+    assert_eq!(ready(&mut d)[0].result(), Err(IoError::Refused));
     assert_eq!(rejected(&mut d), 1);
 }
 
 #[test]
-fn a_canceled_or_quiescing_op_is_not_run_again() {
+fn a_quiescing_member_never_sees_a_rejected_peer() {
     let (mut d, arena) = endpoints(&["10.0.0.0/24"]);
     d.lower(0, stream(0), &arena, Timestamp(0)).unwrap();
-    let [op] = os_ops(&mut d)[..] else { panic!() };
-    d.lower(
-        0,
-        sqe(0, TTY, Op::Cancel, Span::default()),
-        &arena,
-        Timestamp(0),
-    )
-    .unwrap();
-    let _ = d.drain_routes();
-    d.raise(OsDone {
-        id: op.id,
-        result: opened(Some("192.168.1.7:5000")),
-    });
-    assert!(matches!(
-        d.drain_routes().collect::<Vec<_>>()[..],
-        [Route::Close(_)]
-    ));
-    assert_eq!(ready(&mut d)[0].result(), Err(IoError::Canceled));
-
-    d.lower(0, stream(1), &arena, Timestamp(0)).unwrap();
     let [op] = os_ops(&mut d)[..] else { panic!() };
     d.quiesce_member(0);
     let _ = d.drain_routes();

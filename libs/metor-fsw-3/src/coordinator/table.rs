@@ -974,8 +974,8 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 
-    /// The budget in an instance's `ops` param.
-    fn ops_param(cx: &DefCx<'_>) -> Result<u16, DefError> {
+    /// The most ops an instance may have in flight, from its `ops` param.
+    fn ops_from_params(cx: &DefCx<'_>) -> Result<u16, DefError> {
         let ops = cx.params.get("ops").and_then(serde_json::Value::as_u64);
         ops.and_then(|n| u16::try_from(n).ok())
             .ok_or_else(|| DefError::Slot {
@@ -992,7 +992,7 @@ mod tests {
         table
             .get_mut("uplink")
             .expect("registered")
-            .set_ops(ops_param);
+            .set_ops(ops_from_params);
         table
     }
 
@@ -1032,7 +1032,7 @@ mod tests {
         table
             .get_mut("trap")
             .expect("registered")
-            .set_ops(ops_param);
+            .set_ops(ops_from_params);
         let trap = def_with(&table, "trap", serde_json::json!({ "ops": 4 }));
         assert_eq!(trap.err(), Some(DefError::NoIo));
     }

@@ -55,9 +55,10 @@ pub enum RealKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         allow: Vec<Cidr>,
     },
-    /// Dials `addr` for each stream.
+    /// Dials `addr`, a `host:port`, for each stream. A host name resolves
+    /// when the resource opens.
     TcpDial {
-        addr: SocketAddr,
+        addr: String,
     },
 }
 
@@ -409,7 +410,8 @@ mod tests {
         let dial = real(r#"{"tcp_dial":{"addr":"10.0.0.9:2240"}}"#).unwrap();
         assert_eq!(dial.interface(), cap::Endpoint::NAME);
         assert_eq!(open.interface(), cap::Endpoint::NAME);
-        assert!(real(r#"{"tcp_dial":{"addr":"gs.local:2240"}}"#).is_err());
+        let named = real(r#"{"tcp_dial":{"addr":"gs.local:2240"}}"#).unwrap();
+        assert!(matches!(named, RealKind::TcpDial { addr } if addr == "gs.local:2240"));
     }
 
     fn real(text: &str) -> Result<RealKind, serde_json::Error> {

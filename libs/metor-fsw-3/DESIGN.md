@@ -267,9 +267,10 @@ writes the records it is sent onto ports of its own. Each takes one
 Both are sequences that hold a `Cap<Endpoint>` named `ep`. `Target.add`
 makes the transport a resource named `{link}_ep` and grants it to `ep`:
 `Listen` a `tcp_listen`, `Connect` a `tcp_dial`, and `Peer` a dial that
-`metor build` resolves. A listener's `allow` list of CIDR blocks lives on
-the resource, so the IO layer closes a peer outside it before the link sees
-it. The link's ops go through `fsw.io` once per cycle, and every buffer
+`metor build` points at the listener's `host:port`. A dial's host name
+resolves on the target, when its resource opens. A listener's `allow` list
+of CIDR blocks lives on the resource, so the IO layer closes a peer outside
+it and refuses the stream, and the link asks for the next one. The link's ops go through `fsw.io` once per cycle, and every buffer
 comes from its arena at make.
 
 ```python

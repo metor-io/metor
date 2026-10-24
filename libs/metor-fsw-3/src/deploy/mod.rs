@@ -12,7 +12,6 @@ mod index;
 mod slot;
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 
 use serde_json::Value;
@@ -147,7 +146,7 @@ impl Listeners {
 }
 
 struct Plan {
-    dials: BTreeMap<ResourceKey, SocketAddr>,
+    dials: BTreeMap<ResourceKey, String>,
     outputs: Vec<((SystemIndex, usize), crate::PortDef)>,
 }
 
@@ -203,7 +202,7 @@ fn dial_addr(
     listen: &Listeners,
     from: SystemIndex,
     peer: &PeerLink,
-) -> Result<SocketAddr, DeployError> {
+) -> Result<String, DeployError> {
     let from = defs.name(from);
     let peer_index = defs.locate(&from, &peer.target, &peer.link)?;
     let port = listen
@@ -213,16 +212,7 @@ fn dial_addr(
             target: peer.target.clone(),
             link: peer.link.clone(),
         })?;
-    let addr = address(host(envelope, &peer.target), port);
-    let unresolved = |message: String| DeployError::Address {
-        from: from.clone(),
-        addr: addr.clone(),
-        message,
-    };
-    addr.to_socket_addrs()
-        .map_err(|e| unresolved(e.to_string()))?
-        .next()
-        .ok_or_else(|| unresolved("no address".into()))
+    Ok(address(host(envelope, &peer.target), port))
 }
 
 /// Checks that no two listeners on the same host bind the same port.

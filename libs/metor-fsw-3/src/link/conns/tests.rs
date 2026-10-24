@@ -446,17 +446,28 @@ fn test_a_dialers_backoff_doubles_to_ten_seconds() {
 fn test_a_listener_backs_off_a_fixed_500_ms() {
     let mut r = rig(listen(1));
     for _ in 0..3 {
-        r.net.streams.push_back(Err(IoError::Refused));
+        r.net.streams.push_back(Err(IoError::BadAddr));
     }
     r.connect();
     r.turns(200);
     let gaps: Vec<usize> = r.net.asked.windows(2).map(|w| w[1] - w[0]).collect();
     assert_eq!(gaps, [51, 51, 51]);
-    let failed = Event::Failed(IoError::Refused);
+    let failed = Event::Failed(IoError::BadAddr);
     assert_eq!(
         r.events(),
         [failed, failed, failed, Event::Opened(peer_addr())]
     );
+}
+
+#[test]
+fn test_a_listener_asks_again_after_a_turned_away_peer() {
+    let mut r = rig(listen(1));
+    r.net.streams.push_back(Err(IoError::Refused));
+    r.connect();
+    r.turns(4);
+    let gaps: Vec<usize> = r.net.asked.windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(gaps, [1], "no backoff");
+    assert_eq!(r.events(), [Event::Opened(peer_addr())]);
 }
 
 #[test]
