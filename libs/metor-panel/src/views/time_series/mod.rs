@@ -13,6 +13,7 @@ use metor_proto::types::{ComponentId, PrimType, Timestamp};
 
 #[allow(unused_imports)]
 use crate::inspect;
+use crate::views::plot_common::chrome::{paint_axis_backdrop, paint_hline, paint_vline};
 use crate::plot_events::{EventDetail, EventKindKey, EventSource, EventSourceRegistry, PlotEvent};
 use crate::temporal::display::elapsed;
 use crate::views::json_tree::JsonTree;
@@ -41,7 +42,7 @@ mod bounds;
 pub use bounds::*;
 
 mod gpu;
-pub(crate) use gpu::{AxisSource, LineDraw, PlotRenderState};
+pub(crate) use gpu::{AxisSource, LineDraw, PlotRenderState, ReadbackHandle};
 
 mod heatmap;
 pub use heatmap::{Colormap, IntensityScale};
@@ -630,34 +631,19 @@ fn paint_underlay(
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
             continue;
         }
-        let mut grid = PathBuilder::stroke(px(0.5));
-        grid.move_to(point(pb.origin.x, y));
-        grid.line_to(point(pb.origin.x + pb.size.width, y));
-        if let Ok(path) = grid.build() {
-            window.paint_path(path, theme.grid_color);
-        }
+        paint_hline(pb, y, px(0.5), theme.grid_color, window);
     }
     for tick in x_ticks(&primary, 5, anchor) {
         let x = primary.to_screen(pb, tick as f64, primary.min_y).x;
         if x < pb.origin.x || x > pb.origin.x + pb.size.width {
             continue;
         }
-        let mut grid = PathBuilder::stroke(px(0.5));
-        grid.move_to(point(x, pb.origin.y));
-        grid.line_to(point(x, pb.origin.y + pb.size.height));
-        if let Ok(path) = grid.build() {
-            window.paint_path(path, theme.grid_color);
-        }
+        paint_vline(pb, x, px(0.5), theme.grid_color, window);
     }
 
     if primary.min_y < 0.0 && primary.max_y > 0.0 {
         let zero_y = primary.to_screen(pb, primary.min_x, 0.0).y;
-        let mut zp = PathBuilder::stroke(px(1.0));
-        zp.move_to(point(pb.origin.x, zero_y));
-        zp.line_to(point(pb.origin.x + pb.size.width, zero_y));
-        if let Ok(path) = zp.build() {
-            window.paint_path(path, theme.zero_line_color);
-        }
+        paint_hline(pb, zero_y, px(1.0), theme.zero_line_color, window);
     }
 }
 
@@ -682,24 +668,7 @@ fn paint_overlay(
     let pb = plot_area(outer_bounds, axis_count, s);
     let theme = crate::theme::theme(cx);
 
-    let axis_bg = theme.plot_chrome_bg();
-    let y_axis_bg = Bounds {
-        origin: outer_bounds.origin,
-        size: gpui::Size {
-            width: pb.origin.x - outer_bounds.origin.x,
-            height: outer_bounds.size.height,
-        },
-    };
-    window.paint_quad(gpui::fill(y_axis_bg, axis_bg));
-
-    let x_axis_bg = Bounds {
-        origin: point(pb.origin.x, pb.origin.y + pb.size.height),
-        size: gpui::Size {
-            width: pb.size.width,
-            height: outer_bounds.origin.y + outer_bounds.size.height - pb.origin.y - pb.size.height,
-        },
-    };
-    window.paint_quad(gpui::fill(x_axis_bg, axis_bg));
+    paint_axis_backdrop(outer_bounds, pb, window, cx);
 
     // Axes are neutral unless given an explicit color.
     let label_color = |i: usize| -> Hsla {
@@ -779,12 +748,7 @@ fn paint_overlay(
     // match; plus the shared horizontal X rule along the bottom.
     for i in 0..axis_count {
         let col_right = pb.origin.x - px(i as f32 * Y_LABEL_WIDTH * s);
-        let mut rule = PathBuilder::stroke(px(1.0));
-        rule.move_to(point(col_right, pb.origin.y));
-        rule.line_to(point(col_right, pb.origin.y + pb.size.height));
-        if let Ok(path) = rule.build() {
-            window.paint_path(path, rule_color(i));
-        }
+        paint_vline(pb, col_right, px(1.0), rule_color(i), window);
     }
 
     // In multi-axis mode, mark each trace's axis membership with a small
@@ -819,12 +783,7 @@ fn paint_overlay(
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
             continue;
         }
-        let mut line = PathBuilder::stroke(px(1.0));
-        line.move_to(point(pb.origin.x, y));
-        line.line_to(point(pb.origin.x + pb.size.width, y));
-        if let Ok(path) = line.build() {
-            window.paint_path(path, *color);
-        }
+        paint_hline(pb, y, px(1.0), *color, window);
         if !label.is_empty() {
             crate::views::plot_common::paint_text_label(
                 label.clone(),
@@ -841,15 +800,13 @@ fn paint_overlay(
         }
     }
 
-    let mut x_rule = PathBuilder::stroke(px(1.0));
-    x_rule.move_to(point(pb.origin.x, pb.origin.y + pb.size.height));
-    x_rule.line_to(point(
-        pb.origin.x + pb.size.width,
+    paint_hline(
+        pb,
         pb.origin.y + pb.size.height,
-    ));
-    if let Ok(path) = x_rule.build() {
-        window.paint_path(path, theme.axis_color);
-    }
+        px(1.0),
+        theme.axis_color,
+        window,
+    );
 }
 
 /// Snapshot of one cursor's visible state, captured during canvas prepare.
@@ -919,12 +876,7 @@ fn paint_cursors(
             if x < pb.origin.x - px(1.0) || x > pb.origin.x + pb.size.width + px(1.0) {
                 continue;
             }
-            let mut line = PathBuilder::stroke(px(1.0));
-            line.move_to(point(x, pb.origin.y));
-            line.line_to(point(x, pb.origin.y + pb.size.height));
-            if let Ok(path) = line.build() {
-                window.paint_path(path, stroke_color);
-            }
+            paint_vline(pb, x, px(1.0), stroke_color, window);
         }
 
         // Shaded band between the two endpoints; subtle so the underlying
@@ -999,12 +951,7 @@ fn paint_hover_crosshair(
         a: 0.6,
         ..crate::theme::theme(cx).text_secondary
     };
-    let mut line = PathBuilder::stroke(px(0.5));
-    line.move_to(point(pointer_x, pb.origin.y));
-    line.line_to(point(pointer_x, pb.origin.y + pb.size.height));
-    if let Ok(path) = line.build() {
-        window.paint_path(path, color);
-    }
+    paint_vline(pb, pointer_x, px(0.5), color, window);
 }
 
 /// Paint one dot per visible trace at the sample the hover readout reports,

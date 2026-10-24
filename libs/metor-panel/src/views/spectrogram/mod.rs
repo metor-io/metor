@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Entity, IntoElement, MouseButton, PathBuilder, Pixels, Point, SharedString,
-    Styled, Window, canvas, div, point, prelude::*, px,
+    Bounds, Context, Entity, IntoElement, MouseButton, Pixels, Point, SharedString, Styled, Window,
+    canvas, div, point, prelude::*, px,
 };
 use metor_db::DB;
 use metor_proto::types::ComponentId;
@@ -26,10 +26,12 @@ use crate::inspect;
 #[allow(unused_imports)]
 use crate::theme::{ui_px, ui_scale};
 
+use super::plot_common::PanZoom;
+use super::plot_common::chrome::{paint_axes, paint_axis_backdrop};
 use super::time_series::{
-    AxisZone, Colormap, IntensityScale, Override, PADDING, PlotBounds, TimeFormat, X_LABEL_HEIGHT,
-    Y_LABEL_WIDTH, axis_zone, format_time_label, format_value_label, plot_area, value_ticks,
-    x_tick_anchor, x_ticks,
+    Colormap, IntensityScale, Override, PADDING, PlotBounds, TimeFormat, X_LABEL_HEIGHT,
+    Y_LABEL_WIDTH, format_time_label, format_value_label, plot_area, value_ticks, x_tick_anchor,
+    x_ticks,
 };
 
 pub(crate) mod grid;
@@ -92,10 +94,7 @@ impl SpectrogramTrace {
 /// hover readout, and pan/zoom input.
 pub struct Spectrogram {
     plot: Entity<SpectrogramPlot>,
-    drag_start: Option<Point<Pixels>>,
-    drag_start_view: Option<PlotBounds>,
-    drag_zone: AxisZone,
-    last_plot_area: Option<Bounds<Pixels>>,
+    pan_zoom: PanZoom,
     /// Pointer position while bare-hovering the plot, driving the readout.
     hover: Option<Point<Pixels>>,
 }
@@ -110,10 +109,7 @@ impl Spectrogram {
         cx.observe(&plot, |_, _, cx| cx.notify()).detach();
         Self {
             plot,
-            drag_start: None,
-            drag_start_view: None,
-            drag_zone: AxisZone::Plot,
-            last_plot_area: None,
+            pan_zoom: PanZoom::default(),
             hover: None,
         }
     }
@@ -183,28 +179,23 @@ impl Render for Spectrogram {
                             if event.click_count == 2 {
                                 this.reset_view(cx);
                             } else {
-                                let zone = this
-                                    .last_plot_area
-                                    .map(|pa| axis_zone(event.position, pa, 1, 1.0))
-                                    .unwrap_or(AxisZone::Plot);
-                                this.drag_start = Some(event.position);
-                                this.drag_start_view = this.plot.read(cx).effective_view(cx);
-                                this.drag_zone = zone;
+                                let view = this.plot.read(cx).effective_view(cx);
+                                this.pan_zoom.press(event.position, view);
                             }
                         }),
                     )
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _event: &gpui::MouseUpEvent, _window, _cx| {
-                            this.drag_start = None;
-                            this.drag_start_view = None;
+                            this.pan_zoom.release();
                         }),
                     )
                     .on_mouse_move(cx.listener(
                         |this, event: &gpui::MouseMoveEvent, _window, cx| {
                             if !event.dragging() {
                                 let inside = this
-                                    .last_plot_area
+                                    .pan_zoom
+                                    .plot_area()
                                     .is_some_and(|pa| pa.contains(&event.position));
                                 let next = inside.then_some(event.position);
                                 if this.hover != next {
@@ -213,47 +204,20 @@ impl Render for Spectrogram {
                                 }
                                 return;
                             }
-                            let (Some(start), Some(start_view), Some(pa)) =
-                                (this.drag_start, this.drag_start_view, this.last_plot_area)
-                            else {
-                                return;
-                            };
-                            let dx = event.position.x - start.x;
-                            let dy = event.position.y - start.y;
-                            let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
-                            let new_view = match this.drag_zone {
-                                AxisZone::Plot => start_view.offset_by_norm(-nx, ny),
-                                AxisZone::XAxis => start_view.offset_x(-nx),
-                                AxisZone::YAxis(_) => start_view.offset_y(ny),
-                            };
-                            this.plot
-                                .update(cx, |p, cx| p.set_view_override(Some(new_view), cx));
+                            if let Some(view) = this.pan_zoom.drag(event.position) {
+                                this.plot
+                                    .update(cx, |p, cx| p.set_view_override(Some(view), cx));
+                            }
                         },
                     ))
                     .on_scroll_wheel(cx.listener(
                         |this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                            let Some(view) = this.plot.read(cx).effective_view(cx) else {
-                                return;
-                            };
-                            let Some(pa) = this.last_plot_area else {
-                                return;
-                            };
-                            let delta = event.delta.pixel_delta(px(20.0));
-                            let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
-                            let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
-
-                            // One axis column: its width never decides an index, so the
-                            // zoom it was laid out at doesn't matter here.
-                            let zone = axis_zone(event.position, pa, 1, 1.0);
-                            let (ax, ay) = view.screen_anchor(pa, event.position);
-                            let new_view = match zone {
-                                AxisZone::Plot => view.zoom_at(factor, ax, 1.0 - ay),
-                                AxisZone::XAxis => view.zoom_x(factor, ax),
-                                AxisZone::YAxis(_) => view.zoom_y(factor, 1.0 - ay),
-                            };
-                            this.plot
-                                .update(cx, |p, cx| p.set_view_override(Some(new_view), cx));
-                            cx.stop_propagation();
+                            let view = this.plot.read(cx).effective_view(cx);
+                            if let Some(view) = this.pan_zoom.scroll(view, event) {
+                                this.plot
+                                    .update(cx, |p, cx| p.set_view_override(Some(view), cx));
+                                cx.stop_propagation();
+                            }
                         },
                     ))
                     .child(
@@ -272,7 +236,7 @@ impl Render for Spectrogram {
                                 move |bounds, window, cx| {
                                     let pa = plot_area(bounds, 1, ui_scale(window));
                                     let _ = this.update(cx, |this, _| {
-                                        this.last_plot_area = Some(pa);
+                                        this.pan_zoom.set_plot_area(pa);
                                     });
                                     let chrome = Chrome::capture(&overlay_plot, pa, hover, cx);
                                     (bounds, chrome)
@@ -383,27 +347,7 @@ fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx:
     let view = chrome.view;
     crate::temporal::paint_playhead(pa, (view.min_x, view.max_x), window, cx);
 
-    let axis_bg = theme.plot_chrome_bg();
-    window.paint_quad(gpui::fill(
-        Bounds {
-            origin: outer.origin,
-            size: gpui::Size {
-                width: pa.origin.x - outer.origin.x,
-                height: outer.size.height,
-            },
-        },
-        axis_bg,
-    ));
-    window.paint_quad(gpui::fill(
-        Bounds {
-            origin: point(pa.origin.x, pa.origin.y + pa.size.height),
-            size: gpui::Size {
-                width: pa.size.width,
-                height: outer.origin.y + outer.size.height - pa.origin.y - pa.size.height,
-            },
-        },
-        axis_bg,
-    ));
+    paint_axis_backdrop(outer, pa, window, cx);
 
     let anchor = x_tick_anchor(chrome.time_format, chrome.data_start);
     for tick in x_ticks(&view, 6, anchor) {
@@ -444,16 +388,7 @@ fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx:
         );
     }
 
-    let mut axes = PathBuilder::stroke(px(1.0));
-    axes.move_to(point(pa.origin.x, pa.origin.y));
-    axes.line_to(point(pa.origin.x, pa.origin.y + pa.size.height));
-    axes.line_to(point(
-        pa.origin.x + pa.size.width,
-        pa.origin.y + pa.size.height,
-    ));
-    if let Ok(path) = axes.build() {
-        window.paint_path(path, theme.axis_color);
-    }
+    paint_axes(pa, theme.axis_color, window);
 
     if chrome.show_colorbar {
         paint_colorbar(pa, chrome, window, cx);

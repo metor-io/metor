@@ -1,19 +1,32 @@
-//! Mechanics shared by the GPU-backed plot entities (`time_series::LinePlot`,
-//! `xy_plot::XyLinePlot`, `list_plot::ListLinePlot`).
+//! Mechanics shared by the GPU-backed plots (`time_series`, `xy_plot`,
+//! `list_plot`, `spectrogram`).
 //!
-//! The three keep their own struct shapes — the inspector reflects a
-//! different set of fields for each (multi-axis vs. flat scalar overrides) —
-//! but the per-trace tracker bookkeeping is byte-identical, so it lives here.
+//! The line-plot entities keep their own struct shapes — the inspector
+//! reflects a different set of fields for each (multi-axis vs. flat scalar
+//! overrides) — but their tracker bookkeeping, frame canvas, chrome painters,
+//! gestures and LoD selection are the same, so they live here.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use gpui::{
-    Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point, Rems, SharedString, Styled,
-    Task, TextAlign, TextRun, Window, div, prelude::*, px,
+    Bounds, Context, Corners, Entity, EntityId, Hsla, IntoElement, MouseButton, Pixels, Point, Rems,
+    SharedString, Styled, Task, TextAlign, TextRun, WeakEntity, Window, canvas, div, prelude::*,
+    px,
 };
 
 use crate::theme::{ui_px, ui_scale};
-use crate::views::time_series::LABEL_FONT_SIZE;
+use crate::views::time_series::{
+    LABEL_FONT_SIZE, Override, PlotBounds, PlotRenderState, ReadbackHandle,
+};
+
+pub(crate) mod chrome;
+pub(crate) mod lod;
+mod numeric;
+mod pan_zoom;
+
+pub use numeric::{NumericLinePlot, NumericPlot};
+pub(crate) use pan_zoom::PanZoom;
 
 /// Build the common interactive plot legend.
 ///
@@ -166,5 +179,114 @@ pub fn reconcile_trackers<Tr: 'static, K>(
             slot.insert(state);
             tasks.insert(id, task);
         }
+    }
+}
+
+/// Point each trace's back-reference at `cx`'s entity, so the trace's
+/// inspector page can reach its plot (to rebind, or list sibling axes).
+///
+/// Mutating without notifying cannot re-enter reconcile: the plots do not
+/// observe their traces.
+pub(crate) fn link_traces<T: 'static, P: 'static>(
+    traces: &[Entity<T>],
+    link: fn(&mut T) -> &mut Option<WeakEntity<P>>,
+    cx: &mut Context<P>,
+) {
+    let self_weak = cx.entity().downgrade();
+    let self_id = cx.entity().entity_id();
+    for trace in traces {
+        trace.update(cx, |t, _| {
+            let slot = link(t);
+            let linked = slot
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .map(|e| e.entity_id());
+            if linked != Some(self_id) {
+                *slot = Some(self_weak.clone());
+            }
+        });
+    }
+}
+
+/// The canvas that shows a plot entity's GPU frame.
+///
+/// Prepaint runs `submit` to start a render for the current bounds (it
+/// returns the readback when one was issued), releases the image the last
+/// frame replaced back to the atlas, and paints the newest completed frame
+/// across the canvas. `gpu_state` reaches the entity's [`PlotRenderState`].
+pub(crate) fn gpu_frame<T: 'static>(
+    entity: WeakEntity<T>,
+    gpu_state: fn(&mut T) -> &mut PlotRenderState,
+    submit: impl FnOnce(&mut T, Bounds<Pixels>, f32, &mut Context<T>) -> Option<ReadbackHandle>
+    + 'static,
+) -> impl IntoElement {
+    canvas(
+        move |bounds, window, cx| {
+            let scale_factor = window.scale_factor();
+            let (frame, released) = entity
+                .update(cx, |plot, cx| {
+                    if let Some(handle) = submit(plot, bounds, scale_factor, cx) {
+                        handle.spawn_and_set(cx, gpu_state);
+                    }
+                    let state = gpu_state(plot);
+                    (state.current_frame(), state.take_pending_release())
+                })
+                .unwrap_or((None, None));
+            if let Some(img) = released {
+                crate::atlas::release_image(window, cx, img);
+            }
+            (bounds, frame)
+        },
+        |_, (bounds, frame): (Bounds<Pixels>, Option<Arc<gpui::RenderImage>>), window, _cx| {
+            if let Some(img) = frame {
+                let _ = window.paint_image(bounds, bounds, Corners::default(), img, 0, false);
+            }
+        },
+    )
+    .size_full()
+}
+
+/// Install `view` as an interactive override, reporting whether it changed.
+///
+/// Compares bit patterns: [`PlotBounds`] holds `f64`s and has no `PartialEq`.
+pub(crate) fn replace_view_override(
+    slot: &mut Option<PlotBounds>,
+    view: Option<PlotBounds>,
+) -> bool {
+    if slot.map(|b| b.bits()) == view.map(|b| b.bits()) {
+        return false;
+    }
+    *slot = view;
+    true
+}
+
+/// The custom values of a plot's reflected `[x_min, x_max, y_min, y_max]`
+/// overrides. Compared on each reconcile so an inspector edit can clear the
+/// interactive view override.
+pub(crate) type BoundOverrides = [Option<f64>; 4];
+
+pub(crate) fn bound_overrides(overrides: [&Override<f64>; 4]) -> BoundOverrides {
+    overrides.map(|o| o.as_custom().copied())
+}
+
+/// Title for a plot with no custom one: the only trace's label when it has
+/// one, `kind` when it doesn't, and `kind` with a count for several traces.
+pub(crate) fn derive_title<T: 'static>(
+    kind: &'static str,
+    traces: &[Entity<T>],
+    label: fn(&T) -> &SharedString,
+    cx: &gpui::App,
+) -> SharedString {
+    match traces {
+        [] => kind.into(),
+        [only] => {
+            let label = label(only.read(cx));
+            if label.is_empty() {
+                kind.into()
+            } else {
+                label.clone()
+            }
+        }
+        _ => SharedString::from(format!("{kind} ({} traces)", traces.len())),
     }
 }
