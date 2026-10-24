@@ -1,5 +1,9 @@
-//! The CPU reference star-field renderer: the test oracle for the GPU
-//! simulator and its no-GPU fallback.
+//! The CPU reference star-field renderer, the test oracle for the GPU
+//! simulator, and the scene setup both share.
+//!
+//! [`Renderer::prepare`] selects the stars, projects each one at every
+//! motion-blur sub-step into a [`Splat`] and lists the truth. The CPU then
+//! splats and exposes; the GPU takes the same splats.
 //!
 //! Directions stay in `f64` through [`Camera::st_to_pixel`]. From the pixel
 //! position on, the PSF, photometry and noise run in `f32`, as the GPU does.
@@ -9,7 +13,8 @@
 //! The two cannot match bit for bit: WGSL bounds `exp`, `log` and the like
 //! only to a few ULP, may contract `a * b + c` into an FMA, and has no `f64`.
 //! A GPU backend agrees with this renderer when, for the same frame:
-//! - every accumulator pixel is within ±2 counts (1 count = 1/256 e⁻);
+//! - every accumulator pixel is within ±2 counts (1 count = 1/256 e⁻),
+//!   plus 2e-7 of its value for the brightest stars' peaks;
 //! - each star's centre of gravity is within 1e-3 px;
 //! - the noisy image matches statistically: per-pixel DN mean and variance
 //!   over a flat field, not pixel by pixel.
@@ -31,10 +36,14 @@ pub mod photometry;
 pub mod psf;
 pub mod scene;
 pub mod splat;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 pub mod truth;
 
 use alloc::vec;
 use alloc::vec::Vec;
+
+use zerocopy::{Immutable, IntoBytes};
 
 pub use noise::Exposure;
 pub use photometry::Photometry;
@@ -50,6 +59,8 @@ use truth::Detector;
 
 /// The most electrons one star may put on the sensor in a frame, 2²².
 pub const MAX_STAR_E: f32 = 4_194_304.0;
+/// Splats the renderer holds room for before its first frame.
+const SPLAT_CAPACITY: usize = 1 << 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderError {
@@ -90,6 +101,20 @@ impl Shape {
     }
 }
 
+/// One star at one motion-blur sub-step: what a splat draws.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, IntoBytes, Immutable)]
+pub struct Splat {
+    /// Pixel position (px).
+    pub u: f32,
+    pub v: f32,
+    /// Electrons over the sub-step.
+    pub e: f32,
+    /// The star's index among this frame's splatted stars. A star's splats
+    /// are contiguous.
+    pub star: u32,
+}
+
 /// Renders frames of one catalog through one camera and sensor. Every buffer
 /// is allocated in [`Renderer::new`].
 #[derive(Debug)]
@@ -106,6 +131,7 @@ pub struct Renderer<'a> {
     cone_rad: f64,
     pixel_sr: f64,
     cells: Vec<u32>,
+    splats: Vec<Splat>,
     acc: Vec<u32>,
 }
 
@@ -152,6 +178,7 @@ impl<'a> Renderer<'a> {
             cone_rad: camera.half_diagonal_rad() + 2.0 * EDGE_MARGIN_PX * px_rad + 1e-3,
             pixel_sr: px_rad * px_rad,
             cells: Vec::with_capacity(cat.cells().len()),
+            splats: Vec::with_capacity(SPLAT_CAPACITY),
             acc: vec![0; shape.pixels()],
         })
     }
@@ -162,13 +189,36 @@ impl<'a> Renderer<'a> {
         if out.len() != self.shape.pixels() {
             return Err(RenderError::BadOutput);
         }
-        self.select_cells(frame);
+        let mut truth = self.prepare(frame);
         self.acc.fill(0);
-        let n_rendered = self.splat(frame);
-        let mut truth = self.truth(frame);
-        truth.n_rendered = n_rendered;
+        truth.n_rendered = self.splat();
         noise::expose(&self.acc, self.hot.as_slice(), &self.exposure(frame), out);
         Ok(truth)
+    }
+
+    /// Selects and projects `frame`'s stars into [`splats`](Self::splats),
+    /// and returns the truth with `n_rendered` left at 0.
+    pub fn prepare(&mut self, frame: &Frame) -> Truth {
+        self.select_cells(frame);
+        self.project(frame);
+        self.truth(frame)
+    }
+
+    /// The last prepared frame's splats.
+    pub fn splats(&self) -> &[Splat] {
+        &self.splats
+    }
+
+    pub fn psf(&self) -> &Psf {
+        &self.psf
+    }
+
+    pub fn hot(&self) -> &HotPixels {
+        &self.hot
+    }
+
+    pub fn shape(&self) -> Shape {
+        self.shape
     }
 
     /// The last frame's accumulator, `1/FIXED_SCALE` e⁻ per count.
@@ -203,26 +253,40 @@ impl<'a> Renderer<'a> {
             .extend(self.cat.cells_in_cone(frame.boresight_eci(), reach));
     }
 
-    /// Splats every selected star at each sub-step. Returns how many put a
-    /// count on the sensor.
-    fn splat(&mut self, frame: &Frame) -> u32 {
+    /// Projects every selected star at each sub-step. A star that lands on
+    /// no sub-step is skipped.
+    fn project(&mut self, frame: &Frame) {
+        self.splats.clear();
+        let stars = catalog_stars(&self.cells, self.cat, &self.phot, self.mag_limit, frame);
+        let n_sub = frame.substeps().len() as f32;
+        let mut star = 0;
+        for (_, dir, _, e) in stars {
+            let e = e.min(MAX_STAR_E) / n_sub;
+            let before = self.splats.len();
+            for m in frame.substeps() {
+                if let Some((u, v)) = self.camera.st_to_pixel(mat_vec(*m, dir)) {
+                    let (u, v) = (u as f32, v as f32);
+                    self.splats.push(Splat { u, v, e, star });
+                }
+            }
+            star += u32::from(self.splats.len() > before);
+        }
+    }
+
+    /// Splats [`splats`](Self::splats) into the accumulator. Returns how many
+    /// stars put a count on the sensor.
+    fn splat(&mut self) -> u32 {
         let mut acc = Accumulator {
             counts: &mut self.acc,
             width: self.shape.width as usize,
             height: self.shape.height as usize,
         };
-        let stars = catalog_stars(&self.cells, self.cat, &self.phot, self.mag_limit, frame);
-        let n_sub = frame.substeps().len() as f32;
-        let mut n = 0;
-        for (_, dir, _, e) in stars {
-            let e_sub = e.min(MAX_STAR_E) / n_sub;
-            let mut hit = false;
-            for m in frame.substeps() {
-                if let Some((u, v)) = self.camera.st_to_pixel(mat_vec(*m, dir)) {
-                    hit |= acc.splat(&self.psf, u as f32, v as f32, e_sub);
-                }
+        let (mut n, mut last_hit) = (0, None);
+        for s in &self.splats {
+            if acc.splat(&self.psf, s.u, s.v, s.e) && last_hit != Some(s.star) {
+                last_hit = Some(s.star);
+                n += 1;
             }
-            n += u32::from(hit);
         }
         n
     }

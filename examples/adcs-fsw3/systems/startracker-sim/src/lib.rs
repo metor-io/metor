@@ -1,14 +1,14 @@
 //! The `startracker_sim` pack: a star-tracker image simulator fed by the
 //! plant's true attitude.
 //!
-//! It is its own pack, apart from the `adcs` pack, so a GPU backend can join
-//! it without reaching the flight systems.
+//! It is its own pack, apart from the `adcs` pack, as it renders on the GPU.
 
+pub mod gpu;
 pub mod params;
 pub mod sim;
 pub mod system;
 
-pub use params::{Backend, StarCamParams, StarOpticsParams, StarSensorParams, StarSimParams};
+pub use params::{StarCamParams, StarOpticsParams, StarSensorParams, StarSimParams};
 pub use sim::StarSim;
 
 use metor_fsw_3::SystemTable;

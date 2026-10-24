@@ -116,6 +116,11 @@ impl PoissonTable {
         Some(PoissonTable { cdf })
     }
 
+    /// The CDF at 0 to `TABLE_LEN − 1` counts.
+    pub fn cdf(&self) -> &[f32; TABLE_LEN] {
+        &self.cdf
+    }
+
     /// The count whose CDF step holds `u`; `TABLE_LEN` past the table's end.
     pub fn sample(&self, u: f32) -> f32 {
         self.cdf.partition_point(|&c| c < u) as f32

@@ -42,20 +42,6 @@ pub struct StarSimParams {
     /// The most motion-blur sub-steps per frame, 1 to 32.
     #[serde(default = "default_max_substeps")]
     pub max_substeps: u32,
-    #[serde(default)]
-    pub backend: Option<Backend>,
-}
-
-/// Where frames are rendered.
-#[derive(Deserialize, JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Backend {
-    #[default]
-    Cpu,
-    /// Not built yet; refused at construction.
-    Gpu,
-    /// The GPU when there is one; the CPU until the GPU backend lands.
-    Auto,
 }
 
 /// The lens and its mount. The sensor is the record's 1024 × 1024.
@@ -188,9 +174,5 @@ impl StarSimParams {
 
     pub fn sensor(&self) -> StarSensorParams {
         self.sensor.clone().unwrap_or_default()
-    }
-
-    pub fn backend(&self) -> Backend {
-        self.backend.unwrap_or_default()
     }
 }

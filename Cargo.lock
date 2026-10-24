@@ -14005,9 +14005,12 @@ dependencies = [
  "futures-lite",
  "metor-fsw-3",
  "metor-star",
+ "naga 30.0.1",
  "nox",
+ "pollster 0.4.0",
  "schemars 1.2.1",
  "serde",
+ "wgpu 30.0.1",
  "zerocopy",
 ]
 

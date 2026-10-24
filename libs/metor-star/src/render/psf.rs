@@ -45,6 +45,16 @@ impl Psf {
         self.sigma
     }
 
+    /// The cut `K` (px): the PSF spans `K` pixels either side of the star's.
+    pub fn half_width(&self) -> usize {
+        self.k
+    }
+
+    /// `1/(√2σ)`, the scale of [`weights`](Self::weights)' `erf` arguments.
+    pub fn erf_scale(&self) -> f32 {
+        1.0 / (SQRT_2 * self.sigma)
+    }
+
     /// The number of pixels the PSF spans on each axis, `2K + 1`.
     pub fn taps(&self) -> usize {
         2 * self.k + 1
@@ -56,7 +66,7 @@ impl Psf {
     /// taps sum to 1.
     pub fn weights(&self, x0: f32, out: &mut [f32; MAX_TAPS]) -> i32 {
         let first = libm::floorf(x0) as i32 - self.k as i32;
-        let s = 1.0 / (SQRT_2 * self.sigma);
+        let s = self.erf_scale();
         let start = erf_as((first as f32 - x0) * s);
         let mut lo = start;
         for (i, w) in (1..).zip(out[..self.taps()].iter_mut()) {

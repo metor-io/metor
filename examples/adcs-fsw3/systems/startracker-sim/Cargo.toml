@@ -6,8 +6,8 @@ repository.workspace = true
 publish = false
 description = "The startracker_sim pack: renders star-tracker images from the plant's true attitude"
 
-# Its own pack, apart from the wasm-friendly adcs pack, so a GPU backend can
-# join it. The `export` feature adds the C ABI, so tests turn it off.
+# Its own pack, apart from the wasm-friendly adcs pack, as it renders on the
+# GPU. The `export` feature adds the C ABI, so tests turn it off.
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -21,9 +21,15 @@ futures-lite = "2"
 metor-fsw-3 = { path = "../../../../libs/metor-fsw-3", default-features = false, features = ["threads"] }
 metor-star = { path = "../../../../libs/metor-star", features = ["sim"] }
 nox = { workspace = true }
+pollster = "0.4"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
+wgpu = "30"
 zerocopy = { version = "0.8.2", features = ["derive"] }
+
+[dev-dependencies]
+metor-star = { path = "../../../../libs/metor-star", features = ["sim", "std", "testkit"] }
+naga = { version = "30", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

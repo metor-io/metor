@@ -1,4 +1,4 @@
-//! The star simulator's state: a CPU renderer over one catalog, and the
+//! The star simulator's state: a GPU renderer over one catalog, and the
 //! records it fills.
 
 use adcs_contracts::{BodyState, MAX_TRUTH, NO_CAT_ID, StarImage, StarPixels, StarTruth};
@@ -11,7 +11,8 @@ use metor_star::render::{
 use metor_star::starcat::StarCat;
 use nox::{Quaternion, Vector};
 
-use crate::params::{Backend, StarSimParams};
+use crate::gpu::{GpuError, GpuRenderer};
+use crate::params::StarSimParams;
 
 /// The committed G ≤ 8 catalog.
 static G8: &[u8] = include_bytes!("../../../../../libs/metor-star/data/starcat-g8.bin");
@@ -25,7 +26,7 @@ const BITS: u32 = 12;
 pub struct StarSim {
     params: StarSimParams,
     camera: Camera,
-    renderer: Renderer<'static>,
+    renderer: GpuRenderer<'static>,
     image: Box<StarImage>,
     truth: StarTruth,
     next_frame_id: u64,
@@ -33,11 +34,8 @@ pub struct StarSim {
 }
 
 impl StarSim {
-    /// Loads the catalog and allocates every buffer.
+    /// Loads the catalog, opens the GPU and allocates every buffer.
     pub fn new(params: StarSimParams) -> Result<StarSim, MakeError> {
-        if params.backend() == Backend::Gpu {
-            return Err(invalid("backend `gpu` is not built yet"));
-        }
         let ok_rate = params.rate_hz > 0.0 && params.rate_hz.is_finite();
         let ok_exposure = params.exposure_s >= 0.0 && params.exposure_s * params.rate_hz <= 1.0;
         if !ok_rate || !ok_exposure {
@@ -55,7 +53,7 @@ impl StarSim {
             params.hot_pixel_max,
             params.seed,
         );
-        let renderer = Renderer::new(
+        let scene = Renderer::new(
             cat,
             camera,
             photometry(&params),
@@ -65,6 +63,10 @@ impl StarSim {
             params.mag_limit,
         )
         .map_err(|e| invalid(format!("{e:?}")))?;
+        let renderer = GpuRenderer::new(scene).map_err(|e| MakeError::Resource {
+            id: "gpu".into(),
+            message: format!("{e:?}"),
+        })?;
         let image = StarImage::new_box().map_err(|_| invalid("no memory for the image"))?;
         Ok(StarSim {
             params,
@@ -94,7 +96,7 @@ impl StarSim {
     }
 
     /// Renders the next frame, exposed from `body`'s time and attitude.
-    pub fn expose(&mut self, body: &BodyState) -> Result<(), RenderError> {
+    pub fn expose(&mut self, body: &BodyState) -> Result<(), GpuError> {
         let frame_id = self.next_frame_id;
         self.next_frame_id += 1;
         self.render(body, frame_id)
@@ -102,7 +104,7 @@ impl StarSim {
 
     /// Renders frame `frame_id` exposed from `body`, into [`image`](Self::image)
     /// and [`truth`](Self::truth), both stamped at mid-exposure.
-    pub fn render(&mut self, body: &BodyState, frame_id: u64) -> Result<(), RenderError> {
+    pub fn render(&mut self, body: &BodyState, frame_id: u64) -> Result<(), GpuError> {
         let frame = self.frame(body, frame_id)?;
         let truth = self
             .renderer
