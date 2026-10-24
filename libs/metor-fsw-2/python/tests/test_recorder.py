@@ -975,6 +975,24 @@ class DashboardTest(unittest.TestCase):
         control = json.loads(state["widgets"][1]["config"])
         self.assertEqual(control["channel"], "mode")
 
+    def test_labels_carry_their_styling(self):
+        import json
+
+        label = mc.Place(
+            mc.Label("PRIMARY BUS", color="#89b4faff", align="left", bold=True),
+            0,
+            0,
+        )
+        state = self._dashboard_state(mc.Dashboard(widgets=[label]))
+        self.assertEqual(state["widgets"][0]["kind"], "label")
+        self.assertEqual(state["widgets"][0]["rect"]["w"], 120.0)
+        cfg = json.loads(state["widgets"][0]["config"])
+        self.assertEqual(cfg["text"], "PRIMARY BUS")
+        self.assertEqual(cfg["align"], "Left")
+        self.assertEqual(cfg["color"], "#89b4faff")
+        self.assertTrue(cfg["bold"])
+        self.assertNotIn("text_color", cfg)
+
     def test_attitude_markers_are_qualified(self):
         import json
 

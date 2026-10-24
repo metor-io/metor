@@ -29,6 +29,7 @@ use crate::views::{
     SamplesTableConfig, SequenceControl, SequenceControlConfig, SequenceGrid, Spectrogram,
     StateChip, StateChipConfig, TimeSeriesPlot, Timeline, TrafficLight, TrafficLightConfig, XyPlot,
 };
+use crate::views::{Label, LabelConfig};
 
 use super::{DashboardWidget, WidgetKind};
 
@@ -546,6 +547,23 @@ impl WidgetRegistry {
             )
             .with_tile("sequence", |_| "Sequences".into()),
         );
+        self.register(
+            WidgetKind::label(),
+            WidgetSpec::typed(
+                (120.0, 40.0),
+                |w| {
+                    let cfg = parse_or_default::<LabelConfig>(&w.config);
+                    subject("Label", &cfg.text)
+                },
+                Label::from_config,
+                Label::to_config,
+            )
+            .with_minimum_size((24.0, 20.0))
+            .with_tile("label", |blob| {
+                parse_or_default::<LabelConfig>(blob).text.into()
+            })
+            .with_live_tile_title(|label: &Label, _| label.text().clone()),
+        );
         // The grid reads the global sequence store and persists nothing.
         self.register(
             WidgetKind::new("sequence_grid"),
@@ -783,6 +801,7 @@ mod tests {
             "logs",
             "sequence",
             "sequence_grid",
+            "label",
         ] {
             assert!(keys.iter().any(|k| k == key), "{key} has no tile");
         }

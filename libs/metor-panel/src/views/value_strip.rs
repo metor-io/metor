@@ -640,9 +640,10 @@ impl Render for ComponentValueStrip {
             let state = if matches!(kind, CellKind::String) {
                 None
             } else {
-                style.states.as_ref().and_then(|table| {
-                    table.display(raw_values.get(idx)?.as_f64(), &theme)
-                })
+                style
+                    .states
+                    .as_ref()
+                    .and_then(|table| table.display(raw_values.get(idx)?.as_f64(), &theme))
             };
             // A named bool draws as its state; clicking still toggles it.
             let draws_as_toggle = is_bool && state.is_none();
@@ -1267,7 +1268,10 @@ mod tests {
     fn an_unmatched_value_shows_the_unknown_label() {
         let theme = &crate::theme::DARK;
         let mut t = table();
-        assert!(t.display(7.0, theme).is_none(), "empty label keeps the number");
+        assert!(
+            t.display(7.0, theme).is_none(),
+            "empty label keeps the number"
+        );
         t.unknown_label = "UNKNOWN".into();
         assert_eq!(t.display(7.0, theme).unwrap(), ("UNKNOWN".into(), None));
         assert_eq!(t.display(2.0, theme).unwrap().0, "POINTING");

@@ -103,6 +103,9 @@ impl WidgetKind {
     pub fn state_chip() -> Self {
         Self(SharedString::new_static("state_chip"))
     }
+    pub fn label() -> Self {
+        Self(SharedString::new_static("label"))
+    }
     pub fn sequence_control() -> Self {
         Self(SharedString::new_static("sequence_control"))
     }

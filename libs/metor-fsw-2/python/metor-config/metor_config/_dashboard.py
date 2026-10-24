@@ -535,6 +535,45 @@ class Image:
         return "image", {"path": self.path, "data": data}, (300.0, 200.0)
 
 
+@dataclass(frozen=True)
+class Label:
+    """Static text in a value-cell box, for captions on a schematic.
+    ``color`` tints the box (and its edge, with ``border``); colours are
+    ``"#rrggbbaa"`` and unset ones follow the panel theme. ``align`` is
+    ``"left"``, ``"center"`` or ``"right"``."""
+
+    text: str
+    text_color: str | None = None
+    color: str | None = None
+    text_size: float = 12.0
+    align: str = "center"
+    bold: bool = False
+    uppercase: bool = False
+    border: bool = False
+
+    def _item(self, namespace: str | None) -> dict[str, Any]:
+        return PaneState("label", self._state())._item(namespace)
+
+    def _state(self) -> dict[str, Any]:
+        return _drop_none(
+            {
+                "text": self.text,
+                "text_color": self.text_color,
+                "color": self.color,
+                "text_size": float(self.text_size),
+                "align": _enum(self.align, ("left", "center", "right")),
+                "bold": self.bold,
+                "uppercase": self.uppercase,
+                "border": self.border,
+            }
+        )
+
+    def _widget(
+        self, namespace: str | None
+    ) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        return "label", self._state(), (120.0, 40.0)
+
+
 @dataclass(frozen=True, eq=False)
 class Place:
     """One widget at a pixel rect on a :class:`Dashboard`."""

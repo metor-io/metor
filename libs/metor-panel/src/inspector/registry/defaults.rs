@@ -97,6 +97,7 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::SequenceControl>();
         self.register_inspectable::<crate::views::Map>();
         self.register_inspectable::<crate::views::SamplesTable>();
+        self.register_inspectable::<crate::views::Label>();
         self.register_entity_list::<crate::views::AttitudeIndicator, crate::views::VectorMarker>(
             |a| &a.vectors,
             |a| &mut a.vectors,
