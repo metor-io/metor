@@ -88,6 +88,12 @@ impl<'a> GpuRenderer<'a> {
         let (device, queue) = pollster::block_on(open_device())?;
         let error = Arc::new(Mutex::new(None));
         device.on_uncaptured_error(Arc::new(record_error(error.clone())));
+        let lost = error.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            if let Ok(mut slot) = lost.lock() {
+                slot.get_or_insert_with(|| format!("device lost ({reason:?}): {message}"));
+            }
+        });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("star_sim"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -133,6 +139,7 @@ impl<'a> GpuRenderer<'a> {
         if out.len() != self.scene.shape().pixels() {
             return Err(RenderError::BadOutput.into());
         }
+        self.check()?;
         let mut truth = self.scene.prepare(frame);
         self.reserve(self.scene.splats().len() as u64)?;
         self.upload(frame);
@@ -261,10 +268,11 @@ impl<'a> GpuRenderer<'a> {
             (Ok(_), _) => Err(GpuError::Device("the readback did not map".into())),
         };
         buffer.unmap();
-        result.and_then(|()| self.check())
+        // The device's own error says more than a failed map.
+        self.check().and(result)
     }
 
-    /// The first error the device reported, if any. A device error is
+    /// The first error the device reported, or its loss, if any. Either is
     /// fatal: every later frame fails too.
     fn check(&self) -> Result<(), GpuError> {
         let error = self.error.lock().ok().and_then(|e| e.clone());
