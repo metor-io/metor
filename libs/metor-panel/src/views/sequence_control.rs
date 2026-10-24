@@ -6,12 +6,15 @@
 //! that third shape: one channel, its state and progress, and the verbs
 //! reachable in a single click rather than through the inspector.
 //!
-//! The shape is one strip-height card: the channel and its run state over
-//! the loaded sequence's name on the left, transport-style icon buttons on
-//! the right. The protocol has no pause, so the slot a transport gives pause
-//! holds Abort (the commanded safe stop, under its own glyph) rather than a
-//! hold the control system couldn't honor; the play slot turns into Reset
-//! once a run has ended.
+//! The shape is one strip-height row: the channel and its run state over a
+//! sequence dropdown on the left, transport-style icon buttons on the right.
+//! The dropdown only stages a choice; the chevron fused to its right edge
+//! sends the load, the same stage-then-apply pair a value strip uses for a
+//! pending edit, since a load replaces whatever the channel holds. The
+//! protocol has no pause, so the slot a transport gives pause holds Abort
+//! (the commanded safe stop, under its own glyph) rather than a hold the
+//! control system couldn't honor; the play slot turns into Reset once a run
+//! has ended.
 //!
 //! No new command plumbing — the buttons drive the same
 //! [`SequenceStore`](crate::sequences::SequenceStore) the list does, so the
@@ -20,17 +23,16 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, Div, FontWeight, Hsla, IntoElement, SharedString, Stateful, Window, div,
-    prelude::*,
+    App, ClickEvent, Context, Div, FontWeight, Hsla, IntoElement, SharedString, Stateful,
+    WeakEntity, Window, div, prelude::*, px,
 };
 use metor_proto_wkt::SequenceRunState;
 use serde::{Deserialize, Serialize};
 
-use super::sequence_panel::load_picker_rows;
 use crate::icons::Icon;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
-use crate::sequences::{self, is_resettable, run_state_index, run_state_label};
+use crate::sequences::{self, ChannelState, is_resettable, run_state_index, run_state_label};
 use crate::theme::{Theme, theme, ui_px};
 use crate::views::TooltipText;
 
@@ -56,6 +58,11 @@ pub struct SequenceControl {
     /// the channel list uses.
     #[facet(skip)]
     arming_stop: bool,
+    /// The sequence chosen in the picker but not yet sent. Loading replaces
+    /// whatever the channel holds, so choosing only stages the name and the
+    /// commit arrow sends it.
+    #[facet(skip)]
+    staged: Option<SharedString>,
 }
 
 impl SequenceControl {
@@ -67,6 +74,7 @@ impl SequenceControl {
             channel: SharedString::from(cfg.channel.clone()),
             compact: cfg.compact,
             arming_stop: false,
+            staged: None,
         }
     }
 
@@ -98,7 +106,7 @@ impl Render for SequenceControl {
             .as_ref()
             .and_then(|s| s.read(cx).state().channel(&channel).cloned())
         else {
-            return card(&theme).justify_center().child(
+            return strip().justify_center().child(
                 div()
                     .truncate()
                     .text_size(ui_px(11.0))
@@ -116,16 +124,12 @@ impl Render for SequenceControl {
         let state_color = theme.run_state_color(run_state_index(ch.run_state));
         let arming = self.arming_stop;
 
-        // The armed confirm takes the status slot even when compact: it is
-        // the one line the operator must not miss.
-        let status = if arming {
-            Some(SharedString::new_static("press stop again to hard-stop"))
-        } else if self.compact {
-            None
-        } else {
-            ch.last_message.clone()
-        };
+        // Armed, the confirm prompt takes the whole line: in a narrow card
+        // the channel and state would otherwise squeeze it to nothing, and
+        // it is the one line the operator must not miss.
+        let status = (!self.compact).then(|| ch.last_message.clone()).flatten();
         let subtitle = div()
+            .id("seq-ctl-status")
             .flex()
             .flex_row()
             .items_center()
@@ -137,140 +141,112 @@ impl Render for SequenceControl {
                     .flex_none()
                     .size(ui_px(6.0))
                     .rounded(ui_px(3.0))
-                    .bg(state_color),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(theme.text_tertiary)
-                    .child(ch.name.to_lowercase()),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(state_color)
-                    .child(run_state_label(ch.run_state).to_lowercase()),
-            )
-            .when_some(status, |el, status| {
-                el.child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(if arming {
-                            theme.error_accent
-                        } else {
-                            theme.text_tertiary
-                        })
-                        .child(status),
-                )
-            });
-
-        let title = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(ui_px(6.0))
-            .min_w_0()
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(ui_px(12.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if ch.loaded.is_some() {
-                        theme.text_primary
+                    .bg(if arming {
+                        theme.error_accent
                     } else {
-                        theme.text_tertiary
-                    })
-                    .child(match &ch.loaded {
-                        Some(name) => name.to_uppercase(),
-                        None => "NOTHING LOADED".to_string(),
+                        state_color
                     }),
             )
-            .child(Icon::Link.svg(12.0, theme.text_tertiary).flex_none());
+            .map(|el| {
+                if arming {
+                    return el.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.error_accent)
+                            .child("click stop again"),
+                    );
+                }
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.text_tertiary)
+                        .child(ch.name.to_lowercase()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(state_color)
+                        .child(run_state_label(ch.run_state).to_lowercase()),
+                )
+                .when_some(status, |el, status| {
+                    el.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.text_tertiary)
+                            .child(status),
+                    )
+                })
+            })
+            // Refusals and progress land in the status, which a narrow card
+            // truncates first; the tooltip keeps them reachable.
+            .when_some(ch.last_message.clone(), |el, message| {
+                el.tooltip(move |_window, cx| TooltipText::build(message.clone(), cx))
+            });
 
-        let available = ch.available.clone();
         let label = div()
-            .id("seq-ctl-load")
             .flex_1()
             .min_w_0()
             .flex()
             .flex_col()
-            .gap(ui_px(2.0))
-            .cursor_pointer()
-            .tooltip(|_window, cx| TooltipText::build("Load sequence".into(), cx))
+            .gap(ui_px(3.0))
             .child(subtitle)
-            .child(title)
-            .on_click(cx.listener({
-                let channel = channel.clone();
-                move |this, _, window, cx| {
-                    this.arming_stop = false;
-                    cx.notify();
-                    let Some(open) = open_inspector(cx) else {
-                        return;
-                    };
-                    open(
-                        InspectorRequest {
-                            rows: load_picker_rows(channel.clone(), &available),
-                            mode: InspectorMode::Centered,
-                        },
-                        window,
-                        cx,
-                    );
-                }
-            }));
+            .child(self.load_row(&ch, &theme, cx));
 
-        let abort_btn = icon_button(
+        let abort_btn = pressable(
+            icon_button(
+                "seq-ctl-abort",
+                Icon::Abort,
+                theme.text_secondary,
+                theme.bg_elevated,
+                "Abort (safe stop)",
+            ),
             &theme,
-            "seq-ctl-abort",
-            Icon::Abort,
-            theme.text_secondary,
-            theme.bg_elevated,
-            "Abort (safe stop)",
         )
         .on_click(cx.listener(|this, _, _, cx| this.command(cx, |s, c| s.abort(c))));
 
         let primary_btn = match ch.run_state {
             SequenceRunState::Running => icon_button(
-                &theme,
                 "seq-ctl-primary",
                 Icon::Play,
                 theme.control_active,
                 Theme::dim(theme.control_active, 0.3),
                 "Running",
-            )
-            .cursor_default(),
-            SequenceRunState::Idle => icon_button(
+            ),
+            SequenceRunState::Idle => pressable(
+                icon_button(
+                    "seq-ctl-primary",
+                    Icon::Play,
+                    theme.control_active,
+                    theme.run_state_tint(run_state_index(SequenceRunState::Running)),
+                    "Start",
+                ),
                 &theme,
-                "seq-ctl-primary",
-                Icon::Play,
-                theme.control_active,
-                theme.run_state_tint(run_state_index(SequenceRunState::Running)),
-                "Start",
             )
             .on_click(cx.listener(|this, _, _, cx| this.command(cx, |s, c| s.start(c)))),
-            state if is_resettable(state) => icon_button(
+            state if is_resettable(state) => pressable(
+                icon_button(
+                    "seq-ctl-primary",
+                    Icon::Loop,
+                    theme.text_secondary,
+                    theme.bg_elevated,
+                    "Reset",
+                ),
                 &theme,
-                "seq-ctl-primary",
-                Icon::Loop,
-                theme.text_secondary,
-                theme.bg_elevated,
-                "Reset",
             )
             .on_click(cx.listener(|this, _, _, cx| this.command(cx, |s, c| s.reset(c)))),
             _ => icon_button(
-                &theme,
                 "seq-ctl-primary",
                 Icon::Play,
                 theme.text_tertiary,
                 theme.bg_elevated,
                 "Not startable",
-            )
-            .cursor_default(),
+            ),
         };
 
+        let armed_bg = Theme::dim(theme.error_accent, 0.25);
         let stop_btn = icon_button(
-            &theme,
             "seq-ctl-stop",
             Icon::Stop,
             if arming {
@@ -278,18 +254,25 @@ impl Render for SequenceControl {
             } else {
                 theme.text_secondary
             },
-            if arming {
-                Theme::dim(theme.error_accent, 0.25)
-            } else {
-                theme.bg_elevated
-            },
+            if arming { armed_bg } else { theme.bg_elevated },
             if arming {
                 "Confirm hard stop"
             } else {
                 "Stop (hard, click twice)"
             },
         )
-        .when(arming, |el| el.border_1().border_color(theme.error_accent))
+        // Armed, the button keeps its fill under the cursor: the hover tint
+        // would cover it exactly while the pointer rests there, hiding that
+        // the first click armed anything.
+        .map(|el| {
+            if arming {
+                el.cursor_pointer()
+                    .border_1()
+                    .border_color(theme.error_accent)
+            } else {
+                pressable(el, &theme)
+            }
+        })
         .on_click(cx.listener(move |this, _, _, cx| {
             if this.arming_stop {
                 this.command(cx, |s, c| s.stop(c));
@@ -299,7 +282,7 @@ impl Render for SequenceControl {
             }
         }));
 
-        card(&theme).child(label).child(
+        strip().child(label).child(
             div()
                 .flex_none()
                 .flex()
@@ -313,9 +296,141 @@ impl Render for SequenceControl {
     }
 }
 
-/// The rounded strip every state of the control renders into, so an
-/// unbound control keeps the footprint of a live one.
-fn card(theme: &Theme) -> Div {
+impl SequenceControl {
+    /// The sequence picker and its commit arrow, fused into one pill the way
+    /// a value strip fuses a pending edit with its apply chevron: choosing in
+    /// the dropdown only stages a name, the arrow sends the load.
+    fn load_row(&self, ch: &ChannelState, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let pending = self.staged.is_some();
+        let shown = self.staged.clone().or_else(|| ch.loaded.clone());
+        let available = ch.available.clone();
+        let pickable = !available.is_empty();
+
+        let picker = div()
+            .id("seq-ctl-pick")
+            .debug_selector(|| "seq-ctl-pick".into())
+            .flex_1()
+            .min_w_0()
+            .h(ui_px(20.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(ui_px(4.0))
+            .px(ui_px(6.0))
+            .rounded_l(px(3.0))
+            .bg(if pending {
+                theme.drop_target
+            } else {
+                theme.bg_elevated
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(ui_px(11.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if shown.is_some() {
+                        theme.text_primary
+                    } else {
+                        theme.text_tertiary
+                    })
+                    .child(match &shown {
+                        Some(name) => name.to_uppercase(),
+                        None if pickable => "CHOOSE SEQUENCE".to_string(),
+                        None => "NO SEQUENCES".to_string(),
+                    }),
+            )
+            .child(
+                Icon::ChevronDown
+                    .svg(10.0, theme.text_secondary)
+                    .flex_none(),
+            )
+            .when(pickable, |el| {
+                let hover = theme.selection_bg;
+                el.cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        this.arming_stop = false;
+                        cx.notify();
+                        let Some(open) = open_inspector(cx) else {
+                            return;
+                        };
+                        open(
+                            InspectorRequest {
+                                rows: stage_rows(cx.weak_entity(), &available),
+                                mode: InspectorMode::Anchored(event.position()),
+                            },
+                            window,
+                            cx,
+                        );
+                    }))
+            });
+
+        let commit = div()
+            .id("seq-ctl-commit")
+            .debug_selector(|| "seq-ctl-commit".into())
+            .flex_none()
+            .h(ui_px(20.0))
+            .px(ui_px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_r(px(3.0))
+            .map(|el| {
+                if pending {
+                    el.bg(theme.control_active.opacity(0.15))
+                        .cursor_pointer()
+                        .child(Icon::ChevronRight.svg(11.0, theme.control_active))
+                        .tooltip(|_window, cx| TooltipText::build("Load".into(), cx))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(name) = this.staged.take() {
+                                this.command(cx, |s, c| s.load(c, name.to_string()));
+                            }
+                        }))
+                } else {
+                    el.bg(theme.bg_elevated)
+                        .child(Icon::ChevronRight.svg(11.0, theme.text_tertiary))
+                }
+            });
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .min_w_0()
+            .child(picker)
+            .child(commit)
+    }
+}
+
+/// One row per loadable sequence; choosing one stages it on the control.
+fn stage_rows(
+    control: WeakEntity<SequenceControl>,
+    available: &[SharedString],
+) -> Vec<Box<dyn InspectorRow>> {
+    available
+        .iter()
+        .map(|name| {
+            let name = name.clone();
+            let control = control.clone();
+            Box::new(CommandRow::new(
+                name.clone(),
+                Arc::new(move |_window, cx| {
+                    let _ = control.update(cx, |this, cx| {
+                        this.staged = Some(name.clone());
+                        cx.notify();
+                    });
+                }),
+            )) as Box<dyn InspectorRow>
+        })
+        .collect()
+}
+
+/// The row every state of the control lays out in, so an unbound control
+/// keeps the footprint of a live one. It draws no frame of its own: the
+/// dashboard's widget frame or the pane is the one border around it.
+fn strip() -> Div {
     div()
         .size_full()
         .flex()
@@ -324,23 +439,18 @@ fn card(theme: &Theme) -> Div {
         .gap(ui_px(8.0))
         .px(ui_px(10.0))
         .overflow_hidden()
-        .rounded(ui_px(6.0))
-        .bg(theme.bg_primary)
-        .border_1()
-        .border_color(theme.border_primary)
 }
 
 fn icon_button(
-    theme: &Theme,
     id: &'static str,
     icon: Icon,
     color: Hsla,
     bg: Hsla,
     tooltip: &'static str,
 ) -> Stateful<Div> {
-    let hover = theme.selection_bg;
     div()
         .id(id)
+        .debug_selector(|| id.into())
         .flex_none()
         .size(ui_px(28.0))
         .flex()
@@ -348,10 +458,16 @@ fn icon_button(
         .justify_center()
         .rounded(ui_px(4.0))
         .bg(bg)
-        .hover(move |s| s.bg(hover))
-        .cursor_pointer()
         .tooltip(move |_window, cx| TooltipText::build(tooltip.into(), cx))
         .child(icon.svg(13.0, color))
+}
+
+/// The pointer and hover tint of an [`icon_button`] that acts on click.
+/// Inert ones (Running, Not startable) keep neither, so they don't read as
+/// pressable.
+fn pressable(button: Stateful<Div>, theme: &Theme) -> Stateful<Div> {
+    let hover = theme.selection_bg;
+    button.cursor_pointer().hover(move |s| s.bg(hover))
 }
 
 /// Rows listing every declared channel, plus a free-text entry.
@@ -392,4 +508,252 @@ pub(crate) fn channel_picker_rows(
         }),
     )));
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use gpui::{Modifiers, MouseButton, Point, TestAppContext, VisualTestContext};
+    use metor_db::DB;
+    use metor_db::disruptor::Reader;
+    use metor_db::msg_log::read_msg;
+    use metor_proto::types::{Msg, Timestamp};
+    use metor_proto_wkt::{
+        SequenceChannelEvent, SequenceChannelSpec, SequenceCommand, SequenceCommandKind,
+        SequenceEventKind, SequenceRegistry,
+    };
+
+    use super::*;
+    use crate::inspector::OpenInspectorGlobal;
+    use crate::views::dashboard::{DashboardWidget, WidgetId, WidgetKind, WidgetRect};
+
+    fn push<T: serde::Serialize + Msg>(db: &DB, ts: i64, msg: &T) {
+        db.push_msg(Timestamp(ts), T::ID, &postcard::to_allocvec(msg).unwrap())
+            .unwrap();
+    }
+
+    fn event(kind: SequenceEventKind) -> SequenceChannelEvent {
+        SequenceChannelEvent {
+            channel: "deploy".into(),
+            kind,
+        }
+    }
+
+    fn config() -> SequenceControlConfig {
+        SequenceControlConfig {
+            channel: "deploy".into(),
+            compact: false,
+        }
+    }
+
+    /// Hosts any view as a window root, so a test clicks the control
+    /// through the same host a user does.
+    struct Host(gpui::AnyView);
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
+    }
+
+    /// A running `deploy` channel with `solar` loaded and `lunar` loadable,
+    /// shown in `host`, plus a tap on every command the panel publishes.
+    struct Rig<'a> {
+        cx: &'a mut VisualTestContext,
+        db: Arc<DB>,
+        commands: Reader,
+        inspector: Rc<RefCell<Vec<InspectorRequest>>>,
+        _temp: tempfile::TempDir,
+    }
+
+    impl<'a> Rig<'a> {
+        fn new(
+            cx: &'a mut TestAppContext,
+            host: impl FnOnce(Arc<DB>, &mut App) -> gpui::AnyView,
+        ) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+            let inspector = Rc::new(RefCell::new(Vec::new()));
+            cx.update(|cx| {
+                crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+                crate::views::dashboard::WidgetRegistry::init(cx);
+                crate::sequences::SequenceStore::init(db.clone(), cx);
+                let inspector = inspector.clone();
+                cx.set_global(OpenInspectorGlobal(Arc::new(move |request, _, _| {
+                    inspector.borrow_mut().push(request);
+                })));
+            });
+            cx.run_until_parked();
+            push(
+                &db,
+                1,
+                &SequenceRegistry {
+                    channels: vec![SequenceChannelSpec {
+                        name: "deploy".into(),
+                        available: vec!["solar".into(), "lunar".into()],
+                    }],
+                },
+            );
+            push(
+                &db,
+                2,
+                &event(SequenceEventKind::Loaded {
+                    name: "solar".into(),
+                }),
+            );
+            push(&db, 3, &event(SequenceEventKind::Started));
+            cx.run_until_parked();
+
+            let commands = db
+                .with_state_mut(|s| {
+                    s.get_or_insert_msg_log(SequenceCommand::ID, &db.path)
+                        .cloned()
+                })
+                .unwrap()
+                .wal_reader();
+            let (_host, cx) = cx.add_window_view(|_, cx| Host(host(db.clone(), cx)));
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+            Self {
+                cx,
+                db,
+                commands,
+                inspector,
+                _temp: temp,
+            }
+        }
+
+        fn center(&mut self, selector: &'static str) -> Point<gpui::Pixels> {
+            self.cx.refresh().unwrap();
+            self.cx.debug_bounds(selector).unwrap().center()
+        }
+
+        fn click(&mut self, selector: &'static str) {
+            let at = self.center(selector);
+            self.cx.simulate_click(at, Modifiers::default());
+            self.cx.run_until_parked();
+        }
+
+        fn sent(&mut self) -> Vec<SequenceCommandKind> {
+            let mut out = Vec::new();
+            while let Some(grant) = self.commands.try_next() {
+                let mut buf: &[u8] = &grant;
+                while let Some((rest, _, msg)) = read_msg(buf) {
+                    buf = rest;
+                    out.push(
+                        postcard::from_bytes::<SequenceCommand>(msg)
+                            .unwrap()
+                            .command,
+                    );
+                }
+            }
+            out
+        }
+
+        /// Two Stop clicks the way a hand makes them: hovered long enough
+        /// for the tooltip, the second a double-click, and a progress event
+        /// repainting the control between its press and release.
+        fn stop_twice(&mut self) -> (Vec<SequenceCommandKind>, Vec<SequenceCommandKind>) {
+            let stop = self.center("seq-ctl-stop");
+            let cx = &mut *self.cx;
+            cx.simulate_mouse_move(stop, None, Modifiers::default());
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(2));
+            cx.run_until_parked();
+            cx.simulate_click(stop, Modifiers::default());
+            cx.run_until_parked();
+            let first = self.sent();
+            let cx = &mut *self.cx;
+            cx.simulate_event(gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: stop,
+                click_count: 2,
+                ..Default::default()
+            });
+            push(
+                &self.db,
+                4,
+                &event(SequenceEventKind::Progress {
+                    detail: "phase 2".into(),
+                }),
+            );
+            cx.run_until_parked();
+            cx.refresh().unwrap();
+            cx.simulate_event(gpui::MouseUpEvent {
+                button: MouseButton::Left,
+                position: stop,
+                click_count: 2,
+                ..Default::default()
+            });
+            cx.run_until_parked();
+            (first, self.sent())
+        }
+    }
+
+    fn bare(_db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
+        cx.new(|cx| SequenceControl::from_config(&config(), cx))
+            .into()
+    }
+
+    fn in_dashboard(db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
+        let widget = DashboardWidget {
+            id: WidgetId(1),
+            rect: WidgetRect {
+                x: 20.0,
+                y: 20.0,
+                w: 340.0,
+                h: 48.0,
+            },
+            kind: WidgetKind::sequence_control(),
+            config: serde_json::to_string(&config()).unwrap(),
+            frame: true,
+        };
+        let blob = serde_json::json!({ "title": "t", "widgets": [widget], "zoom": 0.7 });
+        crate::views::dashboard::deserialize_dashboard(db, &blob.to_string(), cx).into()
+    }
+
+    #[gpui::test]
+    fn stop_fires_on_the_second_click(cx: &mut TestAppContext) {
+        let (first, second) = Rig::new(cx, bare).stop_twice();
+        assert!(first.is_empty(), "the first click only arms");
+        assert!(matches!(second.as_slice(), [SequenceCommandKind::Stop]));
+    }
+
+    #[gpui::test]
+    fn stop_fires_on_the_second_click_in_a_dashboard(cx: &mut TestAppContext) {
+        let (first, second) = Rig::new(cx, in_dashboard).stop_twice();
+        assert!(first.is_empty(), "the first click only arms");
+        assert!(matches!(second.as_slice(), [SequenceCommandKind::Stop]));
+    }
+
+    #[gpui::test]
+    fn choosing_a_sequence_stages_it_and_the_arrow_loads_it(cx: &mut TestAppContext) {
+        let mut rig = Rig::new(cx, bare);
+        rig.click("seq-ctl-commit");
+        assert!(rig.sent().is_empty(), "nothing staged, nothing to commit");
+
+        rig.click("seq-ctl-pick");
+        let mut request = rig.inspector.borrow_mut().pop().expect("picker opened");
+        assert!(matches!(request.mode, InspectorMode::Anchored(_)));
+        let row = request
+            .rows
+            .iter_mut()
+            .find(|row| row.label() == "lunar")
+            .expect("every loadable sequence is listed");
+        rig.cx.update(|window, cx| row.activate(window, cx));
+        rig.cx.run_until_parked();
+        assert!(rig.sent().is_empty(), "choosing only stages");
+
+        rig.click("seq-ctl-commit");
+        let sent = rig.sent();
+        assert!(
+            matches!(sent.as_slice(), [SequenceCommandKind::Load { name }] if name == "lunar"),
+            "{sent:?}"
+        );
+        rig.click("seq-ctl-commit");
+        assert!(rig.sent().is_empty(), "a commit consumes the staged choice");
+    }
 }
