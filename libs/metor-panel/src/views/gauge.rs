@@ -95,6 +95,9 @@ const INNER_REACH: f32 = 1.0 - FILL_SHARE - LIMIT_INSET - LIMIT_DASH;
 /// Half-extent of the readout block around the hub, in radii. Its corners
 /// (about 0.74 out) clear the band and the dashes inside it.
 const READOUT_HALF: (f32, f32) = (0.62, 0.4);
+/// Clearance between the readout and the chord across a short arc's ends,
+/// in radii, once the readout is drawn up toward the arc.
+const READOUT_CLEARANCE: f32 = 0.06;
 /// Readout lines as (vertical offset from the hub, font size), in radii.
 const LABEL_LINE: (f32, f32) = (-0.3, 0.12);
 const VALUE_LINE: (f32, f32) = (0.0, 0.34);
@@ -300,6 +303,32 @@ impl Readout {
         self.label.is_none() && self.value.is_none() && self.unit.is_none()
     }
 
+    /// The block the lines present actually occupy, so a readout without a
+    /// label or unit doesn't reserve room for one. Its width stays the full
+    /// slot: sized to the text, the dial would resize as the value's digits
+    /// change.
+    fn block(&self, pull: bool) -> ReadoutBox {
+        let lines = [
+            (self.label.is_some(), LABEL_LINE),
+            (self.value.is_some(), VALUE_LINE),
+            (self.unit.is_some(), UNIT_LINE),
+        ];
+        let (mut top, mut bottom) = (f32::INFINITY, f32::NEG_INFINITY);
+        for (_, (offset, size)) in lines.into_iter().filter(|(present, _)| *present) {
+            top = top.min(offset - size / 2.0);
+            bottom = bottom.max(offset + size / 2.0);
+        }
+        if top > bottom {
+            (top, bottom) = (0.0, 0.0);
+        }
+        ReadoutBox {
+            half_width: READOUT_HALF.0,
+            top: top.max(-READOUT_HALF.1),
+            bottom: bottom.min(READOUT_HALF.1),
+            pull,
+        }
+    }
+
     /// Set each line at its slot around the hub, sized to the dial and shrunk
     /// to the readout box when it would spill past it.
     fn paint(&self, dial: &Dial, color: Hsla, dim: Hsla, window: &mut Window, cx: &mut App) {
@@ -313,7 +342,11 @@ impl Readout {
         ];
         for (text, (offset, size), color) in lines {
             let Some(text) = text else { continue };
-            let center = point(dial.center.x, dial.center.y + px(offset * dial.radius));
+            let (ox, oy) = dial.readout;
+            let center = point(
+                dial.center.x + px(ox * dial.radius),
+                dial.center.y + px((oy + offset) * dial.radius),
+            );
             let fit = TextFit {
                 size: (size * dial.radius).max(min_size),
                 max_width: 2.0 * READOUT_HALF.0 * dial.radius,
@@ -373,8 +406,57 @@ enum Hub {
     Empty,
     /// The needle's pivot, a point.
     Pivot,
-    /// The readout block, [`READOUT_HALF`] around the hub.
-    Readout,
+    /// The readout block, drawn toward a short arc.
+    Readout(ReadoutBox),
+}
+
+/// The readout's footprint relative to its own centre, in radii.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReadoutBox {
+    half_width: f32,
+    top: f32,
+    bottom: f32,
+    /// Whether the block may leave the hub. A needle pivots there, so its
+    /// readout stays put.
+    pull: bool,
+}
+
+impl ReadoutBox {
+    /// The block a dial with every line reserves.
+    #[cfg(test)]
+    const FULL: Self = Self {
+        half_width: READOUT_HALF.0,
+        top: -READOUT_HALF.1,
+        bottom: READOUT_HALF.1,
+        pull: true,
+    };
+
+    fn corners(&self) -> [(f32, f32); 4] {
+        let (w, t, b) = (self.half_width, self.top, self.bottom);
+        [(-w, t), (w, t), (-w, b), (w, b)]
+    }
+
+    /// Where the block's centre sits, in radii from the hub.
+    ///
+    /// An arc of half a turn or more wraps the hub, and the readout sits in
+    /// it. A shorter arc leaves the hub out in the open, far from the band,
+    /// so the block slides out toward the arc's middle until it meets the
+    /// chord between the arc's ends — no arc point is nearer the hub along
+    /// that direction, so the block can't reach the band.
+    fn offset(&self, sweep: f32, rotation: f32) -> (f32, f32) {
+        if !self.pull {
+            return (0.0, 0.0);
+        }
+        let toward = polar(rotation, 1.0);
+        let chord = INNER_REACH * (sweep / 2.0).cos() - READOUT_CLEARANCE;
+        let reach = self
+            .corners()
+            .iter()
+            .map(|(x, y)| x * toward.0 + y * toward.1)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let slide = (chord - reach).max(0.0);
+        (toward.0 * slide, toward.1 * slide)
+    }
 }
 
 /// A dial's resolved geometry for one frame: where the hub sits, how far the
@@ -385,6 +467,8 @@ struct Dial {
     radius: f32,
     sweep: f32,
     rotation: f32,
+    /// The readout's centre, in radii from the hub.
+    readout: (f32, f32),
 }
 
 /// Axis-aligned extent in radii from the hub, screen-oriented (y down).
@@ -430,11 +514,16 @@ impl Dial {
             bounds.origin.x + px((w - ew * radius) / 2.0 - extent.min.0 * radius),
             bounds.origin.y + px((h - eh * radius) / 2.0 - extent.min.1 * radius),
         );
+        let readout = match hub {
+            Hub::Readout(block) => block.offset(sweep, rotation),
+            _ => (0.0, 0.0),
+        };
         Self {
             center,
             radius,
             sweep,
             rotation,
+            readout,
         }
     }
 
@@ -461,10 +550,14 @@ impl Dial {
         match hub {
             Hub::Empty => {}
             Hub::Pivot => extent.include((0.0, 0.0)),
-            Hub::Readout => {
-                let (hw, hh) = READOUT_HALF;
-                extent.include((-hw, -hh));
-                extent.include((hw, hh));
+            Hub::Readout(block) => {
+                let (ox, oy) = block.offset(sweep, rotation);
+                for (x, y) in block.corners() {
+                    extent.include((ox + x, oy + y));
+                }
+                if !block.pull {
+                    extent.include((0.0, 0.0));
+                }
             }
         }
         extent
@@ -717,7 +810,7 @@ impl Render for Gauge {
         let (divisions, minor) = (self.divisions, self.minor_ticks);
         let readout = self.readout();
         let hub = if !readout.is_empty() {
-            Hub::Readout
+            Hub::Readout(readout.block(style == GaugeStyle::Arc))
         } else if style == GaugeStyle::Needle {
             Hub::Pivot
         } else {
@@ -803,6 +896,7 @@ mod tests {
             radius: 10.0,
             sweep,
             rotation,
+            readout: (0.0, 0.0),
         }
     }
 
@@ -825,6 +919,7 @@ mod tests {
             radius: 10.0,
             sweep: SWEEP_240,
             rotation: 0.0,
+            readout: (0.0, 0.0),
         };
         let p = d.at(0.5, 10.0);
         assert!(close(p.x, 50.0) && close(p.y, 40.0));
@@ -865,7 +960,7 @@ mod tests {
     fn old_dials_keep_their_extent() {
         // The default 240° dial spans the full width and reaches half a
         // radius below the hub; the readout box fits inside that.
-        let e = Dial::extent(SWEEP_240, 0.0, Hub::Readout);
+        let e = Dial::extent(SWEEP_240, 0.0, Hub::Readout(ReadoutBox::FULL));
         let near = |a: f32, b: f32| (a - b).abs() < 1e-5;
         assert!(near(e.min.0, -1.0) && near(e.max.0, 1.0), "{e:?}");
         assert!(near(e.min.1, -1.0) && near(e.max.1, 0.5), "{e:?}");
@@ -873,8 +968,10 @@ mod tests {
 
     #[test]
     fn a_short_arc_still_makes_room_for_the_readout() {
-        let e = Dial::extent(FRAC_PI_2, 0.0, Hub::Readout);
-        assert!(e.max.1 >= READOUT_HALF.1, "{e:?}");
+        let block = ReadoutBox::FULL;
+        let e = Dial::extent(FRAC_PI_2, 0.0, Hub::Readout(block));
+        let (_, oy) = block.offset(FRAC_PI_2, 0.0);
+        assert!(e.max.1 >= oy + READOUT_HALF.1 - 1e-5, "{e:?}");
         assert!(e.min.0 <= -READOUT_HALF.0 && e.max.0 >= READOUT_HALF.0);
         let bare = Dial::extent(FRAC_PI_2, 0.0, Hub::Empty);
         assert!(bare.max.1 < 0.0, "an empty hub needs no room: {bare:?}");
@@ -890,7 +987,7 @@ mod tests {
         };
         for sweep_deg in [30.0_f32, 90.0, 140.0, 180.0, 240.0, 300.0, 360.0] {
             for rot_deg in [0.0_f32, 45.0, -90.0, -135.0, 180.0, 270.0] {
-                for hub in [Hub::Empty, Hub::Pivot, Hub::Readout] {
+                for hub in [Hub::Empty, Hub::Pivot, Hub::Readout(ReadoutBox::FULL)] {
                     let d = Dial::fit(bounds, sweep_deg.to_radians(), rot_deg.to_radians(), hub);
                     let case = format!("sweep {sweep_deg} rot {rot_deg} {hub:?}");
                     assert!(d.radius > 0.0, "{case}");
@@ -903,12 +1000,12 @@ mod tests {
                         let p = d.at(t, d.radius * INNER_REACH);
                         assert!(inside(p), "{case} inner {p:?}");
                     }
-                    if hub == Hub::Readout {
-                        let (hw, hh) = READOUT_HALF;
-                        for (sx, sy) in [(-1.0, -1.0), (1.0, 1.0)] {
+                    if let Hub::Readout(block) = hub {
+                        let (ox, oy) = d.readout;
+                        for (x, y) in block.corners() {
                             let corner = point(
-                                d.center.x + px(sx * hw * d.radius),
-                                d.center.y + px(sy * hh * d.radius),
+                                d.center.x + px((ox + x) * d.radius),
+                                d.center.y + px((oy + y) * d.radius),
                             );
                             assert!(inside(corner), "{case} readout {corner:?}");
                         }
@@ -921,8 +1018,17 @@ mod tests {
     #[test]
     fn a_fitted_dial_fills_one_axis() {
         let bounds = Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(200.0), px(100.0)));
-        let d = Dial::fit(bounds, FRAC_PI_2, (-135.0_f32).to_radians(), Hub::Readout);
-        let e = Dial::extent(FRAC_PI_2, (-135.0_f32).to_radians(), Hub::Readout);
+        let d = Dial::fit(
+            bounds,
+            FRAC_PI_2,
+            (-135.0_f32).to_radians(),
+            Hub::Readout(ReadoutBox::FULL),
+        );
+        let e = Dial::extent(
+            FRAC_PI_2,
+            (-135.0_f32).to_radians(),
+            Hub::Readout(ReadoutBox::FULL),
+        );
         let (ew, eh) = e.size();
         let used = (ew * d.radius, eh * d.radius);
         assert!((used.0 - 200.0).abs() < 1e-3 || (used.1 - 100.0).abs() < 1e-3);
@@ -930,6 +1036,47 @@ mod tests {
 
     fn near(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5
+    }
+
+    #[test]
+    fn a_short_arc_draws_the_readout_up_to_its_chord() {
+        let block = ReadoutBox::FULL;
+        // A wrapping arc keeps the readout on the hub.
+        assert_eq!(block.offset(SWEEP_240, 0.0), (0.0, 0.0));
+        // A quarter arc overhead pulls it up, stopping short of the chord.
+        let (ox, oy) = block.offset(FRAC_PI_2, 0.0);
+        assert!(near(ox, 0.0) && oy < 0.0, "{ox} {oy}");
+        let chord = INNER_REACH * std::f32::consts::FRAC_PI_4.cos();
+        assert!(near(-(oy + block.top), chord - READOUT_CLEARANCE));
+        // Turned to face right, it slides right instead — a tighter arc,
+        // since the block is wider than it is tall.
+        let (rx, ry) = block.offset(60.0_f32.to_radians(), FRAC_PI_2);
+        assert!(rx > 0.0 && near(ry, 0.0), "{rx} {ry}");
+        // A needle's readout stays on its pivot.
+        let pinned = ReadoutBox {
+            pull: false,
+            ..block
+        };
+        assert_eq!(pinned.offset(FRAC_PI_2, 0.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_readout_reserves_only_the_lines_it_has() {
+        let value_only = Readout {
+            label: None,
+            value: Some("1.0".into()),
+            unit: None,
+        };
+        let block = value_only.block(true);
+        assert!(near(block.top, -VALUE_LINE.1 / 2.0) && near(block.bottom, VALUE_LINE.1 / 2.0));
+        let full = Readout {
+            label: Some("PPO2".into()),
+            value: Some("2.69".into()),
+            unit: Some("psia".into()),
+        };
+        let block = full.block(true);
+        assert!(block.top >= -READOUT_HALF.1 && block.bottom <= READOUT_HALF.1);
+        assert!(block.bottom - block.top > VALUE_LINE.1);
     }
 
     #[test]
