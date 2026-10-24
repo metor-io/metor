@@ -98,7 +98,6 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::Map>();
         self.register_inspectable::<crate::views::SamplesTable>();
         self.register_entity_list::<crate::views::AttitudeIndicator, crate::views::VectorMarker>(
-            db.clone(),
             |a| &a.vectors,
             |a| &mut a.vectors,
             AddBehavior::Default(Arc::new({
@@ -109,73 +108,55 @@ impl InspectorRegistry {
             })),
         );
         self.register_entity_list::<crate::views::StateChip, crate::views::StateEntry>(
-            db.clone(),
             |c| &c.states,
             |c| &mut c.states,
             AddBehavior::Default(Arc::new(|_cx| crate::views::StateEntry::empty())),
         );
         self.register_entity_list::<LinePlot, Trace>(
-            db.clone(),
             |lp| &lp.traces,
             |lp| &mut lp.traces,
-            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
-                builders::build_trace_add_wizard(parent, db, cx)
-            })),
+            AddBehavior::Wizard(Arc::new(builders::build_trace_add_wizard)),
         );
         self.register_entity_list::<LinePlot, YAxis>(
-            db.clone(),
             |lp| &lp.axes,
             |lp| &mut lp.axes,
             AddBehavior::Default(Arc::new(|_cx| YAxis::new("Y"))),
         );
         self.register_entity_list::<LinePlot, EventOverlay>(
-            db.clone(),
             |lp| &lp.event_overlays,
             |lp| &mut lp.event_overlays,
-            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
-                builders::build_event_overlay_wizard(parent, db, cx)
-            })),
+            AddBehavior::Wizard(Arc::new(builders::build_event_overlay_wizard)),
         );
         self.register_entity_list::<crate::views::Annunciator, crate::views::annunciator::Condition>(
-            db.clone(), |v| &v.conditions, |v| &mut v.conditions,
+            |v| &v.conditions, |v| &mut v.conditions,
             AddBehavior::Default(Arc::new(|_| crate::views::annunciator::Condition::default())),
         );
         self.register_entity_list::<Viewer3d, crate::views::viewer_3d::ModelEntry>(
-            db.clone(),
             |v| &v.models,
             |v| &mut v.models,
             AddBehavior::Default(Arc::new(|_cx| crate::views::viewer_3d::ModelEntry::empty())),
         );
-        self.register_viewer3d_builder(db.clone());
+        self.register_viewer3d_builder();
         self.register_measurement_cursor_builder();
-        self.register_dashboard_builder(db.clone());
+        self.register_dashboard_builder();
         self.register_pane_builder();
         self.register_component_browser_builder();
         self.register_outline_builder();
-        self.register_trace_builder(db.clone());
+        self.register_trace_builder();
         self.register_entity_list::<XyLinePlot, XyTrace>(
-            db.clone(),
             |lp| &lp.traces,
             |lp| &mut lp.traces,
-            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
-                builders::build_xy_trace_add_wizard(parent, db, cx)
-            })),
+            AddBehavior::Wizard(Arc::new(builders::build_xy_trace_add_wizard)),
         );
         self.register_entity_list::<ListLinePlot, ListTrace>(
-            db.clone(),
             |lp| &lp.traces,
             |lp| &mut lp.traces,
-            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
-                builders::build_list_trace_add_wizard(parent, db, cx)
-            })),
+            AddBehavior::Wizard(Arc::new(builders::build_list_trace_add_wizard)),
         );
         self.register_entity_list::<SpectrogramPlot, SpectrogramTrace>(
-            db.clone(),
             |p| &p.traces,
             |p| &mut p.traces,
-            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
-                builders::build_spectrogram_trace_add_wizard(parent, db, cx)
-            })),
+            AddBehavior::Wizard(Arc::new(builders::build_spectrogram_trace_add_wizard)),
         );
     }
 
@@ -471,7 +452,7 @@ impl InspectorRegistry {
     /// owning plot (via the trace's back-ref) to follow the new channel; the
     /// axis picker reads the plot's `axes` and writes `axis_index`, and is
     /// hidden when the plot has a single axis.
-    fn register_trace_builder(&mut self, _db: Arc<DB>) {
+    fn register_trace_builder(&mut self) {
         self.register_type_builder::<Trace>(Arc::new(|any_entity, db, cx| {
             let trace: Entity<Trace> = any_entity.clone().downcast().expect("Trace type mismatch");
             let mut rows =
@@ -537,7 +518,7 @@ impl InspectorRegistry {
         }));
     }
 
-    fn register_viewer3d_builder(&mut self, _db: Arc<DB>) {
+    fn register_viewer3d_builder(&mut self) {
         self.register_type_builder::<Viewer3d>(Arc::new(|any_entity, db, cx| {
             let viewer: Entity<Viewer3d> = any_entity
                 .clone()
@@ -689,7 +670,7 @@ impl InspectorRegistry {
         }));
     }
 
-    fn register_dashboard_builder(&mut self, _db: Arc<DB>) {
+    fn register_dashboard_builder(&mut self) {
         self.register_type_builder::<crate::views::dashboard::DashboardPanel>(Arc::new(
             |any_entity, db, cx| {
                 let entity: Entity<crate::views::dashboard::DashboardPanel> =
