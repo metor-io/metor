@@ -1,4 +1,4 @@
-"""Panel presets, dashboard widgets, and connectors."""
+"""Panel presets and dashboard widgets."""
 
 from __future__ import annotations
 
@@ -531,11 +531,7 @@ class Image:
 
 @dataclass(frozen=True, eq=False)
 class Place:
-    """One widget at a pixel rect on a :class:`Dashboard`.
-
-    The object is also the handle a :class:`Connector` attaches to, mirroring
-    how ``m.route`` refers to what ``m.add`` returned. Identity is the key, so
-    two placements with equal fields stay distinct."""
+    """One widget at a pixel rect on a :class:`Dashboard`."""
 
     widget: Any
     x: float
@@ -552,68 +548,6 @@ class Place:
         }
 
 
-@dataclass(frozen=True)
-class At:
-    """A free connector anchor at a canvas point."""
-
-    x: float
-    y: float
-
-
-@dataclass(frozen=True)
-class Edge:
-    """A named side of a placed widget, when the automatic facing side is not
-    what you want. ``t`` runs 0..1 along that side."""
-
-    place: Place
-    side: str = "bottom"
-    t: float = 0.5
-
-
-@dataclass(frozen=True)
-class Bind:
-    """Telemetry that colours a connector: on above ``threshold`` in
-    magnitude, dimmed below it. This is what makes a pipe show flow."""
-
-    component: str
-    element: int = 0
-    threshold: float = 0.0
-    on_color: str | None = None
-
-    def _json(self, namespace: str | None) -> dict[str, Any]:
-        return _drop_none(
-            {
-                "component": _qualify(self.component, namespace),
-                "element": self.element,
-                "threshold": float(self.threshold),
-                "on_color": self.on_color,
-            }
-        )
-
-
-@dataclass(frozen=True)
-class Connector:
-    """A line through two or more anchors: a :class:`Place`, an :class:`Edge`,
-    or an :class:`At`.
-
-    ``on_top`` picks which side of the widgets the line paints on -- leave it
-    off for a schematic run, which should disappear into the box it enters,
-    and set it for a callout leader that has to cross one."""
-
-    points: list[Any]
-    shape: str = "orthogonal"
-    dashed: bool = False
-    arrow: str = "none"
-    color: str | None = None
-    width: float = 1.5
-    label: str = ""
-    on_top: bool = False
-    bind: Bind | None = None
-
-
-_SIDES = ("top", "right", "bottom", "left")
-
-
 def _enum(value: str, allowed: tuple[str, ...]) -> str:
     """A Rust unit enum variant from a lowercase spelling."""
     key = value.strip().lower()
@@ -622,42 +556,12 @@ def _enum(value: str, allowed: tuple[str, ...]) -> str:
     return key.capitalize() if key != "none" else "None"
 
 
-def _center(rect: dict[str, float]) -> tuple[float, float]:
-    return rect["x"] + rect["w"] / 2.0, rect["y"] + rect["h"] / 2.0
-
-
-def _facing_side(
-    rect: dict[str, float], toward: tuple[float, float]
-) -> tuple[str, float]:
-    """The side of ``rect`` that faces ``toward``, and where along it to
-    attach.
-
-    A bare :class:`Place` used as a connector endpoint picks its side this
-    way, so ``Connector([a, b])`` produces the line a person would have drawn
-    without naming edges. ``t`` projects the target's position onto the side
-    so the run stays as straight as the geometry allows.
-    """
-    cx, cy = _center(rect)
-    dx, dy = toward[0] - cx, toward[1] - cy
-    if abs(dx) >= abs(dy):
-        side = "right" if dx >= 0 else "left"
-        t = 0.5 if rect["h"] <= 0 else (toward[1] - rect["y"]) / rect["h"]
-    else:
-        side = "bottom" if dy >= 0 else "top"
-        t = 0.5 if rect["w"] <= 0 else (toward[0] - rect["x"]) / rect["w"]
-    return side, min(max(t, 0.0), 1.0)
-
-
 @dataclass(frozen=True)
 class Dashboard:
-    """A pane of free-placed widgets plus the connectors between them.
-
-    Widget ids are assigned in placement order; connectors refer to
-    :class:`Place` handles rather than ids, so reordering the list cannot
-    silently repoint a line."""
+    """A pane of free-placed widgets. Widget ids are assigned in placement
+    order."""
 
     widgets: list[Place]
-    connectors: list[Connector] | None = None
     title: str = "Dashboard"
 
     def _item(self, namespace: str | None) -> dict[str, Any]:
@@ -670,8 +574,6 @@ class Dashboard:
 
     def _state(self, namespace: str | None) -> dict[str, Any]:
         entries: list[dict[str, Any]] = []
-        rects: dict[int, dict[str, float]] = {}
-        ids: dict[int, int] = {}
 
         for index, place in enumerate(self.widgets, start=1):
             if not isinstance(place, Place):
@@ -679,93 +581,19 @@ class Dashboard:
                     f"Dashboard widgets must be Place(...), got {type(place).__name__}"
                 )
             kind, state, default = place.widget._widget(namespace)
-            rect = place._rect(default)
-            ids[id(place)] = index
-            rects[id(place)] = rect
             entries.append(
                 {
                     "id": index,
-                    "rect": rect,
+                    "rect": place._rect(default),
                     "kind": kind,
                     "config": json.dumps(state),
                 }
             )
 
-        lines = [
-            self._connector(c, n, ids, rects, namespace)
-            for n, c in enumerate(self.connectors or [], start=1)
-        ]
-
         return {
             "title": self.title,
             "widgets": entries,
-            "connectors": lines,
         }
-
-    def _connector(
-        self,
-        connector: Connector,
-        index: int,
-        ids: dict[int, int],
-        rects: dict[int, dict[str, float]],
-        namespace: str | None,
-    ) -> dict[str, Any]:
-        if len(connector.points) < 2:
-            raise ValueError("a Connector needs at least two points")
-
-        def resolved_center(point: Any) -> tuple[float, float]:
-            """Where a point sits, for choosing a neighbour's facing side."""
-            if isinstance(point, At):
-                return float(point.x), float(point.y)
-            place = point.place if isinstance(point, Edge) else point
-            rect = rects.get(id(place))
-            if rect is None:
-                raise ValueError("connector refers to a widget not on this dashboard")
-            return _center(rect)
-
-        anchors: list[dict[str, Any]] = []
-        for i, point in enumerate(connector.points):
-            if isinstance(point, At):
-                anchors.append({"Free": {"x": float(point.x), "y": float(point.y)}})
-                continue
-            place = point.place if isinstance(point, Edge) else point
-            widget_id = ids.get(id(place))
-            if widget_id is None:
-                raise ValueError("connector refers to a widget not on this dashboard")
-            if isinstance(point, Edge):
-                side, t = point.side, point.t
-            else:
-                # Face the neighbour: the previous point for the last anchor,
-                # the next one otherwise.
-                neighbour = (
-                    connector.points[i - 1]
-                    if i == len(connector.points) - 1
-                    else connector.points[i + 1]
-                )
-                side, t = _facing_side(rects[id(place)], resolved_center(neighbour))
-            anchors.append(
-                {
-                    "Widget": {
-                        "id": widget_id,
-                        "side": _enum(side, _SIDES),
-                        "t": float(t),
-                    }
-                }
-            )
-
-        style = _drop_none(
-            {
-                "color": connector.color,
-                "width": float(connector.width),
-                "dashed": connector.dashed,
-                "shape": _enum(connector.shape, ("straight", "orthogonal", "curved")),
-                "arrow": _enum(connector.arrow, ("none", "end", "both")),
-                "label": connector.label,
-                "on_top": connector.on_top,
-                "bind": connector.bind._json(namespace) if connector.bind else None,
-            }
-        )
-        return {"id": index, "points": anchors, "style": style}
 
 
 @dataclass(frozen=True)

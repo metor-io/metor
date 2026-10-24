@@ -211,9 +211,7 @@ impl DashboardPanel {
             // Edit-mode blocker: keeps clicks away from the widget's own
             // controls, so editing never fires a command or pans a plot.
             // Stopping propagation also hides the click from the canvas
-            // behind, so the blocker hands it on itself (connector anchors
-            // land on widgets). Right-click opens the widget's inspector.
-            let left_entity = cx.entity();
+            // behind. Right-click opens the widget's inspector.
             let right_entity = cx.entity();
             let blocker_widget_id = widget.id;
             container = container.child(
@@ -225,12 +223,7 @@ impl DashboardPanel {
                     .size_full()
                     .on_mouse_down(
                         gpui::MouseButton::Left,
-                        move |event: &gpui::MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            left_entity.update(cx, |this, cx| {
-                                this.handle_canvas_mouse_down(event, window, cx);
-                            });
-                        },
+                        |_: &gpui::MouseDownEvent, _, cx| cx.stop_propagation(),
                     )
                     .on_mouse_down(
                         gpui::MouseButton::Right,

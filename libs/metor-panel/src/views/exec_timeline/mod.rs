@@ -32,6 +32,7 @@ use metor_proto::types::Timestamp;
 use stellarator::util::AtomicCell;
 
 mod config;
+mod leaders;
 pub use config::ExecTimelineConfig;
 
 pub mod inspector_rows;

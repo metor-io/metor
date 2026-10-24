@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use gpui::{Bounds, Hsla, Pixels, Point, SharedString, Window, point, px, size};
 
-use crate::graph_canvas::{LINE_HIT_RADIUS, LineShape, LineStyle, distance_to_line, paint_line};
+use super::leaders::{LINE_HIT_RADIUS, LineStyle, distance_to_line, paint_line};
 use crate::theme::{Theme, ui_scale};
 use crate::views::plot_common::paint_text_label;
 use crate::views::table::{HEADER_HEIGHT, ROW_HEIGHT};
@@ -293,7 +293,6 @@ pub(crate) fn paint_lanes(
             LineStyle {
                 width: px(1.0),
                 dashed: line.flow.dashed,
-                shape: LineShape::Orthogonal,
             },
             Theme::dim(flow_color, 0.7),
             window,
@@ -582,11 +581,11 @@ fn paint_hover(
     );
 }
 
-/// The connector within [`LINE_HIT_RADIUS`] of the pointer, nearest first.
+/// The leader within [`LINE_HIT_RADIUS`] of the pointer, nearest first.
 fn nearest_flow<'a>(lines: &'a [FlowLine<'a>], pointer: Point<Pixels>) -> Option<&'a FlowPaint> {
     let mut best: Option<(f32, &FlowPaint)> = None;
     for line in lines {
-        let d = distance_to_line(&line.points, LineShape::Orthogonal, pointer);
+        let d = distance_to_line(&line.points, pointer);
         if d <= LINE_HIT_RADIUS && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
             best = Some((d, line.flow));
         }

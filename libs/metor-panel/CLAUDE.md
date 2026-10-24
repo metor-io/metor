@@ -60,8 +60,6 @@ Scalar instruments (`meter`, `gauge`, `attitude`) share `views/binding.rs`, whic
 
 Every one of those is registered on **both** surfaces from a single config type: one `WidgetSpec` in `views/dashboard/widgets.rs`, whose `.with_tile(key, …)` makes `ItemRegistry::register_view` serve it as a pane too (a `RegisteredPane`). Don't add a typed `PaneItem` wrapper for it. `WidgetSpec::typed` takes a view's `from_config`/`to_config` directly, and menu entries for both hosts live in one list in `views/add_menu.rs` (gated per host where only one surface makes sense). `TrafficLight` is the reference for the pattern; a renamed key keeps old layouts loading with `ItemRegistry::alias`.
 
-`views/dashboard/connectors.rs` adds schematic lines over the dashboard canvas — anchors resolve against live widget rects each frame, `on_top` picks whether a line paints under the widgets (a pipe) or over them (a callout leader), and `bind` colours a line from telemetry. Line geometry lives in `graph_canvas.rs`, shared with the execution timeline's dependency leaders.
-
 ### Theme (`src/theme.rs`)
 
 All colors live in the `Theme` struct, accessed as `DARK.selection_bg` etc. **Never** hardcode `Hsla` literals outside `theme.rs`. `hex(0xRRGGBB, alpha)` is a public `const fn` for theme tables.

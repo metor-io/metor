@@ -4,16 +4,12 @@ from metor_config import (
     Alarm,
     AlarmList,
     Alarms,
-    At,
     Attitude,
-    Bind,
     Component,
-    Connector,
     Dashboard,
     Db,
     Deployment,
     Downlink,
-    Edge,
     Gauge,
     HSplit,
     Ingest,
@@ -140,7 +136,7 @@ MTQ_MAX_DIPOLE = 0.2
 RATE_FULL_SCALE = 0.2  # rad/s, comfortably past the critical rate band
 
 GUTTER = 14
-LANE = 40  # a gutter wide enough for a connector and its label
+LANE = 40  # the wider gutter between instrument groups
 
 # Columns: status/attitude on the left, instruments in the middle, plots right.
 COL_A = 20                       # attitude
@@ -281,49 +277,12 @@ momentum_plot = Place(
     COL_C, ROW_MAIN + 250 + 30, COL_C_W, 250,
 )
 
-# Signal flow, under the widgets so each run disappears into the box it enters
-# the way a schematic should read. Waypoints put every leg down the middle of a
-# lane rather than letting the router graze a widget edge, and `bind` energizes
-# the actuator legs off live telemetry.
-LANE_AB = COL_A + COL_A_W + LANE // 2          # between attitude and the gauges
-LANE_GAUGE_WHEEL = ROW_MAIN + 150 + LANE // 2  # between the gauges and wheels
-
-
-def _center_x(place: Place) -> float:
-    return place.x + (place.w or 0) / 2
-
-
 adcs_dashboard = Dashboard(
     title="ADCS Ops",
     widgets=[
         mode_chip, law_chip, eclipse, wheel_arm,
         attitude, *rate_gauges, *wheel_meters, sequence, *mtq_meters,
         rate_plot, momentum_plot,
-    ],
-    connectors=[
-        Connector(
-            [
-                Edge(attitude, "right", 0.5),
-                At(LANE_AB, attitude.y + 170),
-                At(LANE_AB, rate_gauges[0].y + 75),
-                Edge(rate_gauges[0], "left", 0.5),
-            ],
-            shape="straight",
-            arrow="end",
-            label="ω",
-        ),
-        Connector(
-            [
-                Edge(rate_gauges[1], "bottom", 0.5),
-                At(_center_x(rate_gauges[1]), LANE_GAUGE_WHEEL),
-                At(_center_x(wheel_meters[1]), LANE_GAUGE_WHEEL),
-                Edge(wheel_meters[1], "top", 0.5),
-            ],
-            shape="straight",
-            arrow="end",
-            label="control",
-            bind=Bind("plant.wheels.wheels.1.arm"),
-        ),
     ],
 )
 

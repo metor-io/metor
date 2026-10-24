@@ -1140,7 +1140,6 @@ mod tests {
                         config: config.clone(),
                         frame: true,
                     }],
-                    connectors: Vec::new(),
                     zoom: 1.0,
                 })
                 .unwrap(),

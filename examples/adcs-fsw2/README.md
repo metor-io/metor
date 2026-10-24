@@ -147,9 +147,7 @@ ingests.
 
    The layout is built from column/row constants rather than literal coordinates, and
    `target.py` asserts `Dashboard.overlaps()` is empty, so the grid cannot drift into
-   panels sitting on top of each other. Two connectors run down the gutters between the
-   instruments to show the signal flow; the one into the wheels is `bind`-coloured, so it
-   only lights when that wheel is armed.
+   panels sitting on top of each other.
 
    In the component tree the `plant` / `nav` / `ctrl` / `mode` (and `coordinator`) instances
    appear. Plot e.g. `nav.attitude_estimate.q_hat_b_eci` against
