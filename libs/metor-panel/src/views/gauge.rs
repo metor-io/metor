@@ -614,10 +614,9 @@ impl Band {
     }
 
     /// Fill the band between scale fractions `from` and `to`, one closed
-    /// outline per segment. A segment's own ends get a value cell's corner
-    /// radius; where the span cuts a segment short — the fill meeting the
-    /// track mid-segment — the cut stays square so the two meet without a
-    /// notch.
+    /// outline per segment. The scale's two ends get a value cell's corner
+    /// radius, so the band reads as one rounded bar; the division gaps and
+    /// the cut where the fill meets the track stay square.
     fn paint_span(
         &self,
         dial: &Dial,
@@ -635,9 +634,12 @@ impl Band {
                 .min(self.width / 2.0)
                 .min((b - a) * inner * dial.sweep / 2.0)
                 .max(0.0);
-            let own_end = |t: f32| self.segments.iter().any(|&(lo, hi)| t == lo || t == hi);
-            let round_a = if own_end(a) { r } else { 0.0 };
-            let round_b = if own_end(b) { r } else { 0.0 };
+            let scale_end = |t: f32| {
+                self.segments.first().is_some_and(|&(lo, _)| t == lo)
+                    || self.segments.last().is_some_and(|&(_, hi)| t == hi)
+            };
+            let round_a = if scale_end(a) { r } else { 0.0 };
+            let round_b = if scale_end(b) { r } else { 0.0 };
             // A corner's run along an edge, as a scale fraction at that edge.
             let along = |round: f32, radius: f32| round / (radius * dial.sweep);
             let (oa, ob) = (a + along(round_a, outer), b - along(round_b, outer));
