@@ -9,67 +9,28 @@
 
 use std::time::{Duration, Instant};
 
-use metor_star::camera::{Camera, Intrinsics};
+use metor_star::camera::Camera;
 use metor_star::catalog::Db;
 use metor_star::geom::{Quat, V3};
 use metor_star::image::{Extractor, ImageConfig};
 use metor_star::lis::{LisConfig, NO_ROW, Pyramid, Step};
-use metor_star::render::photometry::{G_TO_V, V0_PH_S_M2};
-use metor_star::render::{Frame, HotPixels, Motion, Photometry, Renderer, Sensor, Shape, Truth};
+use metor_star::render::testkit::{STARCAT_G8, sim_camera, sim_renderer};
+use metor_star::render::{Frame, Motion, Renderer, Truth};
 use metor_star::starcat::StarCat;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
-static STARCAT: &[u8] = include_bytes!("../data/starcat-g8.bin");
+static STARCAT: &[u8] = STARCAT_G8;
 static DB: &[u8] = include_bytes!("../data/stars-u2000.stdb");
 const SIZE: u32 = 1024;
 
-/// `StarCamParams::default()` in startracker-sim.
 fn camera() -> Camera {
-    Camera {
-        intr: Intrinsics {
-            f_m: 16e-3,
-            pitch_m: 5.5e-6,
-            cx: 512.0,
-            cy: 512.0,
-            k1: 0.0,
-            k2: 0.0,
-            p1: 0.0,
-            p2: 0.0,
-            width: SIZE,
-            height: SIZE,
-        },
-        q_b_st: Quat::IDENTITY,
-    }
+    sim_camera()
 }
 
-/// startracker-sim's default optics, sensor and hot pixels.
 fn renderer(cat: StarCat<'_>) -> Renderer<'_> {
-    let phot = Photometry {
-        flux0_ph_s_m2: V0_PH_S_M2,
-        aperture_m2: core::f32::consts::PI * 0.0125 * 0.0125,
-        throughput: 0.5,
-        colour: G_TO_V,
-    };
-    let sensor = Sensor {
-        psf_sigma_px: 1.0,
-        full_well_e: 20_000.0,
-        read_noise_e: 5.0,
-        dark_e_s: 10.0,
-        dark_t0_c: 20.0,
-        temp_c: 20.0,
-        gain_milli: 5_000,
-        bias_dn: 100.0,
-        zodi_mag_arcsec2: Some(22.5),
-    };
-    let shape = Shape {
-        width: SIZE,
-        height: SIZE,
-        bits: 12,
-    };
-    let hot = HotPixels::new(shape.pixels(), 1e-4, 50.0, 13);
-    Renderer::new(cat, camera(), phot, sensor, shape, hot, 12.0).unwrap()
+    sim_renderer(cat)
 }
 
 fn random_q(rng: &mut StdRng) -> Quat {

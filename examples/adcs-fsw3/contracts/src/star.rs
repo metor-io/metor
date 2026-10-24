@@ -71,6 +71,57 @@ impl StarVectors {
     }
 }
 
+/// The tracker's centroids from one image, for the panel overlay. Entries
+/// past `count` are zero with `cat_id` [`UNIDENTIFIED`]. Field names match
+/// [`crate::StarTruth`] so one overlay binds to both; renaming one breaks the
+/// overlay preset.
+#[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
+#[repr(C)]
+#[frame(name = "star_centroids")]
+pub struct StarCentroids {
+    /// Mid-exposure time of the image.
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub frame_id: u64,
+    pub count: u64,
+    /// Centroid column (px), pixel centres at integer + ½.
+    pub u: FrameArray<f32, MAX_STARS>,
+    /// Centroid row (px).
+    pub v: FrameArray<f32, MAX_STARS>,
+    /// Background-subtracted flux (DN).
+    pub flux: FrameArray<f32, MAX_STARS>,
+    /// Hipparcos number, or [`UNIDENTIFIED`].
+    pub cat_id: FrameArray<u32, MAX_STARS>,
+}
+
+impl StarCentroids {
+    pub fn empty(timestamp: Timestamp, frame_id: u64) -> StarCentroids {
+        StarCentroids {
+            timestamp,
+            frame_id,
+            count: 0,
+            u: FrameArray([0.0; MAX_STARS]),
+            v: FrameArray([0.0; MAX_STARS]),
+            flux: FrameArray([0.0; MAX_STARS]),
+            cat_id: FrameArray([UNIDENTIFIED; MAX_STARS]),
+        }
+    }
+
+    /// Appends a centroid, or returns false when the frame is full.
+    pub fn push(&mut self, u: f32, v: f32, flux: f32, cat_id: u32) -> bool {
+        let i = self.count as usize;
+        if i >= MAX_STARS {
+            return false;
+        }
+        self.u.0[i] = u;
+        self.v.0[i] = v;
+        self.flux.0[i] = flux;
+        self.cat_id.0[i] = cat_id;
+        self.count += 1;
+        true
+    }
+}
+
 /// How the tracker found its stars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]

@@ -28,4 +28,4 @@ workspace = true
 
 [[test]]
 name = "lis_sim"
-required-features = ["sim"]
+required-features = ["sim", "testkit"]
