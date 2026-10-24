@@ -534,18 +534,6 @@ fn segments(divisions: usize, gap: f32, closed: bool) -> Vec<Span> {
         .collect()
 }
 
-/// The parts of the scale the dim track covers: everything but the lit span,
-/// so a lit segment never sits over a translucent one.
-fn unlit(lit: Option<Span>) -> Vec<Span> {
-    let Some((a, b)) = lit else {
-        return vec![(0.0, 1.0)];
-    };
-    [(0.0, a), (b, 1.0)]
-        .into_iter()
-        .filter(|(lo, hi)| hi > lo)
-        .collect()
-}
-
 /// Scale fractions of the dashes along the track, each flagged `true` for a
 /// division. The scale's ends get none — the track stopping marks them.
 fn dashes(divisions: usize, minor: usize) -> impl Iterator<Item = (f32, bool)> {
@@ -613,10 +601,17 @@ impl Band {
             .filter(|(a, b)| b > a)
     }
 
+    /// The whole scale as one unbroken span, from the first segment's start
+    /// to the last one's end — what the dim track covers.
+    fn extent(&self) -> Span {
+        match (self.segments.first(), self.segments.last()) {
+            (Some(&(lo, _)), Some(&(_, hi))) => (lo, hi),
+            _ => (0.0, 1.0),
+        }
+    }
+
     /// Fill the band between scale fractions `from` and `to`, one closed
-    /// outline per segment. The scale's two ends get a value cell's corner
-    /// radius, so the band reads as one rounded bar; the division gaps and
-    /// the cut where the fill meets the track stay square.
+    /// outline per segment.
     fn paint_span(
         &self,
         dial: &Dial,
@@ -626,18 +621,36 @@ impl Band {
         color: Hsla,
         window: &mut Window,
     ) {
+        self.paint_pieces(dial, self.pieces(from, to), corner, color, window);
+    }
+
+    /// Fill the dim track under the whole scale, unbroken, so the lit
+    /// segments' gaps show the track rather than the background.
+    fn paint_track(&self, dial: &Dial, corner: f32, color: Hsla, window: &mut Window) {
+        self.paint_pieces(dial, std::iter::once(self.extent()), corner, color, window);
+    }
+
+    /// Fill each span of the band. The scale's two ends get a value cell's
+    /// corner radius, so the band reads as one rounded bar; the division
+    /// gaps and the cut where the fill ends stay square.
+    fn paint_pieces(
+        &self,
+        dial: &Dial,
+        pieces: impl Iterator<Item = Span>,
+        corner: f32,
+        color: Hsla,
+        window: &mut Window,
+    ) {
         let (outer, inner) = (self.track + self.width / 2.0, self.inner());
-        for (a, b) in self.pieces(from, to) {
+        let (first, last) = self.extent();
+        for (a, b) in pieces {
             // Clamped so a thin band or a sliver of a segment rounds into a
             // pill rather than overlapping its own corners.
             let r = corner
                 .min(self.width / 2.0)
                 .min((b - a) * inner * dial.sweep / 2.0)
                 .max(0.0);
-            let scale_end = |t: f32| {
-                self.segments.first().is_some_and(|&(lo, _)| t == lo)
-                    || self.segments.last().is_some_and(|&(_, hi)| t == hi)
-            };
+            let scale_end = |t: f32| t == first || t == last;
             let round_a = if scale_end(a) { r } else { 0.0 };
             let round_b = if scale_end(b) { r } else { 0.0 };
             // A corner's run along an edge, as a scale fraction at that edge.
@@ -729,9 +742,8 @@ impl Render for Gauge {
                     GaugeStyle::Arc => span.filter(|(a, b)| b > a),
                     GaugeStyle::Needle => None,
                 };
-                for (a, b) in unlit(lit) {
-                    band.paint_span(&dial, a, b, corner, track_color, window);
-                }
+                // The fill is opaque, so it covers the track where they meet.
+                band.paint_track(&dial, corner, track_color, window);
                 let root = band.dash_root(&dial);
                 for &(t, division) in &band.dashes {
                     let reach = if division { DIVISION_DASH } else { MINOR_DASH };
@@ -1011,32 +1023,13 @@ mod tests {
     }
 
     #[test]
-    fn the_dim_track_is_the_rest_of_the_segmented_band() {
+    fn the_dim_track_runs_unbroken_under_the_whole_scale() {
         let band = Band::new(&dial_of(100.0, SWEEP_270), 6, 0, 1.0);
-        assert_eq!(unlit(Some((0.0, 0.4))), vec![(0.4, 1.0)]);
-        assert_eq!(unlit(None), vec![(0.0, 1.0)]);
-        assert_eq!(unlit(Some((0.5, 0.6))), vec![(0.0, 0.5), (0.6, 1.0)]);
-        assert!(unlit(Some((0.0, 1.0))).is_empty());
-
-        // Lit and dim pieces together tile the segments exactly: the track
-        // carries the same gaps, and meets the fill mid-segment with no seam.
-        let lit = (0.0, 0.4);
-        let mut all: Vec<Span> = band.pieces(lit.0, lit.1).collect();
-        for (a, b) in unlit(Some(lit)) {
-            all.extend(band.pieces(a, b));
-        }
-        all.sort_by(|x, y| x.0.total_cmp(&y.0));
-        let mut merged: Vec<Span> = Vec::new();
-        for (a, b) in all {
-            match merged.last_mut() {
-                Some(last) if near(last.1, a) => last.1 = b,
-                _ => merged.push((a, b)),
-            }
-        }
-        assert_eq!(merged.len(), band.segments.len());
-        for (m, s) in merged.iter().zip(&band.segments) {
-            assert!(near(m.0, s.0) && near(m.1, s.1), "{m:?} vs {s:?}");
-        }
+        assert_eq!(band.extent(), (0.0, 1.0));
+        // A full circle's seam gap trims both ends, and the track with them.
+        let closed = Band::new(&dial_of(100.0, std::f32::consts::TAU), 6, 0, 1.0);
+        let (lo, hi) = closed.extent();
+        assert!(lo > 0.0 && hi < 1.0 && near(lo, 1.0 - hi));
     }
 
     #[test]
