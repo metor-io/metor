@@ -823,6 +823,15 @@ impl Render for ComponentValueStrip {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
+            // A click elsewhere leaves the cell the way clicking another cell
+            // does — the typed value staged — but one that won't parse can't
+            // keep the cell open once the operator has moved on.
+            .when(self.editing.is_some(), |root| {
+                root.on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                    this.commit_edit(window, cx);
+                    this.cancel_edit(cx);
+                }))
+            })
             .when(style.align != StripAlign::Left, |root| root.w_full())
             .child(row);
         if style.intrinsic_width {
