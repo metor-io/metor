@@ -9,10 +9,11 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use gpui::AppContext as _;
-use gpui::{Entity, Hsla, SharedString};
+use gpui::{AnyEntity, App, Entity, Hsla, SharedString};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
+use crate::inspector::rows::color::AutoColor;
 use crate::inspector::rows::{
     BoolRow, ColorRow, CommandRow, InspectorRow, NavRow, ScalarRow, TextRow,
 };
@@ -182,6 +183,7 @@ impl InspectorRegistry {
                 on_change: Arc::new(move |c, _w, cx| {
                     crate::inspector::reflect::set_field::<Hsla>(&any_entity, idx, c, cx);
                 }),
+                auto: None,
             })
         }));
     }
@@ -309,89 +311,75 @@ impl InspectorRegistry {
         ));
     }
 
-    /// Row for `Override<Hsla>`: color picker paired with an "Auto" reset.
+    /// Row for `Override<Hsla>`: the colour row with `Auto` as its theme
+    /// state.
     fn register_override_hsla(&mut self) {
-        self.register_field_widget::<Override<Hsla>>(Arc::new(|ctx, peek, any_entity, idx| {
-            let current = peek.get::<Override<Hsla>>().unwrap().clone();
-            builders::build_override_row(
-                ctx.label.clone(),
-                current,
+        self.register_field_widget::<Override<Hsla>>(Arc::new(|ctx, _peek, any_entity, idx| {
+            let (read, write, check, reset) = (
+                any_entity.clone(),
+                any_entity.clone(),
+                any_entity.clone(),
                 any_entity,
-                idx,
-                |_| SharedString::new_static("Custom"),
-                |label, initial, any_entity, idx| {
-                    let read = any_entity.clone();
-                    let write = any_entity.clone();
-                    Box::new(ColorRow {
-                        label,
-                        read_color: Arc::new(
-                            move |cx| match crate::inspector::reflect::get_field::<Override<Hsla>>(
-                                &read, idx, cx,
-                            ) {
-                                Some(Override::Custom(c)) => c,
-                                _ => initial,
-                            },
-                        ),
-                        on_change: Arc::new(move |c, _w, cx| {
-                            crate::inspector::reflect::set_field::<Override<Hsla>>(
-                                &write,
-                                idx,
-                                Override::Custom(c),
-                                cx,
-                            );
-                        }),
-                    })
-                },
-            )
+            );
+            let get = move |entity: &AnyEntity, cx: &App| {
+                crate::inspector::reflect::get_field::<Override<Hsla>>(entity, idx, cx)
+            };
+            Box::new(ColorRow {
+                label: ctx.label.clone(),
+                read_color: Arc::new(move |cx| match get(&read, cx) {
+                    Some(Override::Custom(c)) => c,
+                    _ => crate::theme::theme(cx).text_primary,
+                }),
+                on_change: Arc::new(move |c, _w, cx| {
+                    crate::inspector::reflect::set_field(&write, idx, Override::Custom(c), cx);
+                }),
+                auto: Some(AutoColor {
+                    is_auto: Arc::new(move |cx| {
+                        !matches!(get(&check, cx), Some(Override::Custom(_)))
+                    }),
+                    reset: Arc::new(move |_w, cx| {
+                        crate::inspector::reflect::set_field::<Override<Hsla>>(
+                            &reset,
+                            idx,
+                            Override::Auto,
+                            cx,
+                        );
+                    }),
+                }),
+            })
         }));
     }
 
     /// Row for `Option<Hsla>`, the views' "theme colour unless set" fields:
-    /// the same picker and "Auto" reset as `Override<Hsla>`, with `None` as
-    /// Auto. Unset, the picker opens on the theme's text colour rather than
-    /// a transparent black nobody chose.
+    /// the colour row with `None` as its theme state. Unset, the sliders
+    /// start from the theme's text colour rather than a transparent black
+    /// nobody chose.
     fn register_option_hsla(&mut self) {
-        self.register_field_widget::<Option<Hsla>>(Arc::new(|ctx, peek, any_entity, idx| {
-            let summary = match peek.get::<Option<Hsla>>() {
-                Ok(Some(_)) => SharedString::new_static("Custom"),
-                _ => SharedString::new_static("Auto"),
+        self.register_field_widget::<Option<Hsla>>(Arc::new(|ctx, _peek, any_entity, idx| {
+            let (read, write, check, reset) = (
+                any_entity.clone(),
+                any_entity.clone(),
+                any_entity.clone(),
+                any_entity,
+            );
+            let get = move |entity: &AnyEntity, cx: &App| {
+                crate::inspector::reflect::get_field::<Option<Hsla>>(entity, idx, cx).flatten()
             };
-            let label = ctx.label.clone();
-            Box::new(NavRow::new(
-                label.clone(),
-                summary,
-                Box::new(move |_cx| {
-                    let read = any_entity.clone();
-                    let write = any_entity.clone();
-                    let auto = any_entity.clone();
-                    vec![
-                        Box::new(ColorRow {
-                            label: label.clone(),
-                            read_color: Arc::new(move |cx| {
-                                crate::inspector::reflect::get_field::<Option<Hsla>>(&read, idx, cx)
-                                    .flatten()
-                                    .unwrap_or_else(|| crate::theme::theme(cx).text_primary)
-                            }),
-                            on_change: Arc::new(move |c, _w, cx| {
-                                crate::inspector::reflect::set_field::<Option<Hsla>>(
-                                    &write,
-                                    idx,
-                                    Some(c),
-                                    cx,
-                                );
-                            }),
-                        }) as Box<dyn InspectorRow>,
-                        Box::new(CommandRow::new(
-                            "Auto",
-                            Arc::new(move |_w, cx| {
-                                crate::inspector::reflect::set_field::<Option<Hsla>>(
-                                    &auto, idx, None, cx,
-                                );
-                            }),
-                        )),
-                    ]
+            Box::new(ColorRow {
+                label: ctx.label.clone(),
+                read_color: Arc::new(move |cx| {
+                    get(&read, cx).unwrap_or_else(|| crate::theme::theme(cx).text_primary)
                 }),
-            ))
+                on_change: Arc::new(move |c, _w, cx| {
+                    crate::inspector::reflect::set_field::<Option<Hsla>>(&write, idx, Some(c), cx);
+                }),
+                auto: Some(AutoColor {
+                    is_auto: Arc::new(move |cx| get(&check, cx).is_none()),
+                    reset: Arc::new(move |_w, cx| {
+                        crate::inspector::reflect::set_field::<Option<Hsla>>(&reset, idx, None, cx);
+                    }),
+                }),
+            })
         }));
     }
 
