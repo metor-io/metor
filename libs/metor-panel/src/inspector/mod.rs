@@ -113,6 +113,12 @@ enum InspectorPageKind {
 struct InspectorPage {
     kind: InspectorPageKind,
     label: Option<SharedString>,
+    /// The query and selection this page had when a deeper page was pushed
+    /// over it. Popping back restores them, so drilling into one search
+    /// result and returning lands on the same results — picking several
+    /// similarly named components shouldn't mean retyping the filter each
+    /// time.
+    resume: Option<(String, usize)>,
 }
 
 /// Row-list panel with page-stack navigation, fuzzy search, and inline
@@ -163,6 +169,7 @@ impl Inspector {
             InspectorPage {
                 kind: InspectorPageKind::Rows(rows),
                 label: None,
+                resume: None,
             },
             mode,
             cx,
@@ -183,6 +190,7 @@ impl Inspector {
                     size: spec.size,
                 },
                 label: Some(spec.label),
+                resume: None,
             },
             mode,
             cx,
@@ -302,14 +310,16 @@ impl Inspector {
         cx: &mut Context<Self>,
     ) {
         // The outgoing page's label becomes a breadcrumb pill above the search box.
-        if let Some(current) = self.pages.last_mut()
-            && current.label.is_none()
-        {
-            current.label = outgoing_label;
+        if let Some(current) = self.pages.last_mut() {
+            if current.label.is_none() {
+                current.label = outgoing_label;
+            }
+            current.resume = Some((self.search.text.clone(), self.selected_index));
         }
         self.pages.push(InspectorPage {
             kind,
             label: incoming_label,
+            resume: None,
         });
         self.search.clear();
         self.query_rows = None;
@@ -321,13 +331,28 @@ impl Inspector {
     fn pop_page(&mut self, cx: &mut Context<Self>) -> bool {
         if self.pages.len() > 1 {
             self.pages.pop();
-            if let Some(current) = self.pages.last_mut() {
+            let resume = self.pages.last_mut().and_then(|current| {
                 current.label = None;
-            }
+                current.resume.take()
+            });
             self.search.clear();
             self.query_rows = None;
             self.seed_query(cx);
             self.selected_index = self.first_selectable_index();
+            if let Some((query, selected)) = resume
+                && !query.is_empty()
+            {
+                self.search.set_text(query);
+                self.search.cursor = self.search.text.len();
+                self.search.mark = self.search.cursor;
+                self.refresh_query_rows(cx);
+                let visible = self.filtered_indices().len();
+                self.selected_index = if selected < visible {
+                    selected
+                } else {
+                    self.first_selectable_index()
+                };
+            }
             cx.notify();
             true
         } else {
