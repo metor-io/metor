@@ -930,14 +930,26 @@ impl ImageView {
         let scale = window.scale_factor();
         let (x, _) = device_span(bounds.origin.x, bounds.size.width, scale);
         let (y, _) = device_span(bounds.origin.y, bounds.size.height, scale);
-        let rect = Bounds::new(
-            point(
-                px((x + out.x as f64) as f32 / scale),
-                px((y + out.y as f64) as f32 / scale),
+        // Until the render for a new pan or zoom lands, the last image moves
+        // with the view, so it stays under the cursor and the overlays.
+        let painted = self.scheduler.installed().map(|key| key.viewport);
+        let current = self.frame().map(|frame| self.viewport(&frame.layout));
+        let (dx, dy, dw, dh) = match (painted, current) {
+            (Some(painted), Some(current)) => placed(out, &painted, &current),
+            _ => (
+                out.x as f64,
+                out.y as f64,
+                out.width as f64,
+                out.height as f64,
             ),
-            size(px(out.width as f32 / scale), px(out.height as f32 / scale)),
+        };
+        let device = |v: f64| px((v / f64::from(scale)) as f32);
+        let rect = Bounds::new(
+            point(device(x + dx), device(y + dy)),
+            size(device(dw), device(dh)),
         );
-        let _ = window.paint_image(rect, rect, Corners::default(), image, 0, false);
+        let clip = bounds.intersect(&rect);
+        let _ = window.paint_image(clip, rect, Corners::default(), image, 0, false);
         self.paint_annotations(bounds, window, cx);
     }
 
@@ -1011,6 +1023,19 @@ fn device_span(origin: Pixels, len: Pixels, scale: f32) -> (f64, usize) {
     let start = (f64::from(origin) * scale).round();
     let end = ((f64::from(origin) + f64::from(len)) * scale).round();
     (start, (end - start).max(0.0) as usize)
+}
+
+/// Where an image rendered at `painted` covering device rect `out` lies
+/// under `current`, as a device `(x, y, width, height)`. A pan at the same
+/// step moves it by whole device pixels so it stays sharp.
+fn placed(out: Rect, painted: &Viewport, current: &Viewport) -> (f64, f64, f64, f64) {
+    let ratio = painted.step / current.step;
+    let (x, y) = current.to_device(painted.to_source((out.x as f64, out.y as f64)));
+    let (w, h) = (out.width as f64 * ratio, out.height as f64 * ratio);
+    match painted.step == current.step {
+        true => (x.round(), y.round(), w, h),
+        false => (x, y, w, h),
+    }
 }
 
 /// Runs `job` and its follow-ups one at a time on the background executor.
@@ -1869,6 +1894,50 @@ mod tests {
         assert_eq!(device_span(px(10.3), px(20.0), 2.0), (21.0, 40));
         assert_eq!(device_span(px(0.25), px(0.5), 1.0), (0.0, 1));
         assert_eq!(device_span(px(5.0), px(0.0), 2.0), (10.0, 0));
+    }
+
+    #[test]
+    fn the_last_image_follows_a_pan_and_a_zoom() {
+        let painted = Viewport {
+            origin: (10.0, 20.0),
+            step: 0.5,
+        };
+        let out = Rect::new(4, 6, 100, 50);
+        assert_eq!(placed(out, &painted, &painted), (4.0, 6.0, 100.0, 50.0));
+        // Dragging right and down by (30.4, -12.6) device pixels.
+        let panned = painted.panned((30.4, -12.6));
+        assert_eq!(placed(out, &painted, &panned), (34.0, -7.0, 100.0, 50.0));
+        // Zooming in 2× about device (54, 31), the middle of the image.
+        let zoomed = painted.zoom_about((54.0, 31.0), 2.0);
+        let (x, y, w, h) = placed(out, &painted, &zoomed);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(close(x, -46.0) && close(y, -19.0), "{x} {y}");
+        assert!(close(w, 200.0) && close(h, 100.0), "{w} {h}");
+    }
+
+    /// Between a pan and its render, the painted image moves with the view.
+    #[gpui::test]
+    fn a_pan_moves_the_painted_image_before_its_render(cx: &mut gpui::TestAppContext) {
+        let (_temp, view, vcx) = ramp_view(cx);
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let out = view.out;
+                view.zoom_at((out.0 as f64 / 2.0, out.1 as f64 / 2.0), 2.0, cx);
+            });
+        });
+        draw(vcx);
+        let (installed, panned, out) = vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let (start, _) = view.current_viewport().unwrap();
+                view.pan(start, (17.0, -9.0), cx);
+                let (panned, _) = view.current_viewport().unwrap();
+                let installed = view.scheduler.installed().unwrap().viewport;
+                (installed, panned, view.frames.current.clone().unwrap().1)
+            })
+        });
+        assert_ne!(installed, panned, "the render has not landed yet");
+        let (x, y, _, _) = placed(out, &installed, &panned);
+        assert_eq!((x, y), (out.x as f64 + 17.0, out.y as f64 - 9.0));
     }
 
     /// A `[32]` centroid record at `cam.truth`: one row per sample, at
