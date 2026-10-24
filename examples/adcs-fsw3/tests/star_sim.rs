@@ -1,5 +1,6 @@
 //! `sim.py` with the star simulator: for a few seconds of wall-clock run, its
-//! db holds a `StarImage` and a `StarTruth` every 100 ms.
+//! db holds a `StarImage` and a `StarTruth` every 100 ms, and the star
+//! tracker's vectors and centroids from them.
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
@@ -20,6 +21,9 @@ const PIXELS: &str = "sim.star_sim.star_image.pixels";
 const IMAGE_ID: &str = "sim.star_sim.star_image.frame_id";
 const TRUTH_ID: &str = "sim.star_sim.star_truth.frame_id";
 const TRUTH_COUNT: &str = "sim.star_sim.star_truth.count";
+const VECTOR_COUNT: &str = "sim.star_tracker.star_vectors.count";
+const CENTROID_COUNT: &str = "sim.star_tracker.star_centroids.count";
+const SOLUTION_MATCHED: &str = "sim.star_tracker.star_solution.n_matched";
 const PIXEL_BYTES: usize = 2 << 20;
 const RUN: Duration = Duration::from_secs(4);
 
@@ -111,6 +115,9 @@ fn sim_py_records_star_images_at_10_hz() {
         let truths = series(&mut client, TRUTH_ID, 8).await;
         let counts = series(&mut client, TRUTH_COUNT, 8).await;
         let pixels = series(&mut client, PIXELS, PIXEL_BYTES).await;
+        let vectors = series(&mut client, VECTOR_COUNT, 8).await;
+        let centroids = series(&mut client, CENTROID_COUNT, 8).await;
+        let matched = series(&mut client, SOLUTION_MATCHED, 2).await;
         stopper.store(true, Ordering::Release);
 
         // Frame ids rise by one per 100 ms of sim time. A debug build may
@@ -152,6 +159,22 @@ fn sim_py_records_star_images_at_10_hz() {
             u64s(&counts).iter().all(|&n| n > 0),
             "a frame with no stars"
         );
+        // The tracker identifies the images: most frames give vectors, each
+        // with several stars.
+        assert!(
+            vectors.len() >= ids.len() / 2,
+            "{} vector frames of {}",
+            vectors.len(),
+            ids.len()
+        );
+        assert!(
+            u64s(&vectors).iter().all(|&n| n >= 4),
+            "{:?}",
+            u64s(&vectors)
+        );
+        assert!(centroids.len() >= vectors.len());
+        let n_matched = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
+        assert!(matched.iter().any(|(_, b)| n_matched(b) >= 6));
     });
     run.join().expect("the target ran");
 }

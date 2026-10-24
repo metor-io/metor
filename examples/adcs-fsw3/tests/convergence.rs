@@ -19,8 +19,8 @@ use adcs_seqs::Commission;
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::cli::run::prepare;
 use metor_fsw_3::coordinator::{
-    Clock, Coordinator, CoordinatorConfig, EndReason, InputConfig, PortRef, SystemConfig,
-    SystemTable,
+    BuildOptions, Clock, Coordinator, CoordinatorConfig, EndReason, InputConfig, PortRef,
+    SystemConfig, SystemTable,
 };
 use metor_fsw_3::dl::{PackKind, PackRef, cdylib_name, triple};
 use metor_fsw_3::{DlPack, Input, Pack, system};
@@ -143,7 +143,8 @@ fn evaluate() -> CoordinatorConfig {
         .coordinator;
     config.clock = Clock::Simulated {
         dt: Duration::from_secs_f64(1.0 / 120.0),
-        epoch: None,
+        // A fixed epoch (2026-09-21 UTC), as a deterministic build needs.
+        epoch: Some(metor_fsw_3::Timestamp(1_790_000_000_000_000)),
     };
     config
         .systems
@@ -271,8 +272,16 @@ fn linked(config: &CoordinatorConfig, shared: &Shared) -> Coordinator {
         )
         .expect("valid records");
     config
-        .build(&with_sinks(table, shared))
+        .build_with(&with_sinks(table, shared), deterministic())
         .expect("the static config builds")
+}
+
+/// Turns the star simulator's thread on the coordinator thread, so its
+/// images, and so the tracker's vectors and nav, are the same in every run.
+fn deterministic() -> BuildOptions {
+    BuildOptions {
+        deterministic: true,
+    }
 }
 
 /// Builds the loop with `packs` loaded, each under its id.
@@ -289,7 +298,7 @@ fn loaded(
     }
     config
         .clone()
-        .build(&table)
+        .build_with(&table, deterministic())
         .expect("the pack config builds")
 }
 

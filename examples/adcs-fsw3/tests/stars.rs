@@ -1,6 +1,7 @@
 //! The star tracker's P0 gate. `sim.py`'s loop with the ideal tracker holds
 //! the filter under 0.05° of the true attitude, and nav converges from
-//! identity on star vectors alone with the truth 30°, 90° and 170° away.
+//! identity on star vectors alone with the truth 30°, 90° and 170° away. The
+//! same holds on the star tracker's vectors from rendered images.
 
 use core::cell::RefCell;
 use core::future::{Future, poll_fn};
@@ -14,7 +15,7 @@ use adcs_contracts::{AttitudeEstimate, BodyState, V3};
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::cli::run::prepare;
 use metor_fsw_3::coordinator::{
-    Clock, Coordinator, CoordinatorConfig, InputConfig, PortRef, SystemConfig,
+    BuildOptions, Clock, Coordinator, CoordinatorConfig, InputConfig, PortRef, SystemConfig,
 };
 use metor_fsw_3::{Input, system};
 use nox::{ArrayRepr, Matrix3};
@@ -60,10 +61,31 @@ fn watch(
     state.0.borrow_mut().push((error.abs(), nees));
 }
 
-/// `sim.py`'s target on a simulated clock, with the watcher added and the
-/// publish link, db and image simulator removed (nav reads the ideal
-/// tracker, not images).
+/// `sim.py`'s target on a simulated clock with the watcher added and the
+/// publish link and db removed, nav reading the ideal tracker, and the image
+/// chain removed.
 fn config() -> &'static CoordinatorConfig {
+    static CONFIG: OnceLock<CoordinatorConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = image_config().clone();
+        config
+            .systems
+            .retain(|s| !["star_sim", "star_tracker"].contains(&s.id.as_str()));
+        for system in &mut config.systems {
+            if system.id == "nav" {
+                for input in system.inputs.iter_mut().filter(|i| i.port == "stars") {
+                    input.from = vec![PortRef::new("star", "star_vectors")];
+                }
+            }
+        }
+        config
+    })
+}
+
+/// `sim.py`'s target on a simulated clock with the watcher added and the
+/// publish link and db removed: nav reads the star tracker, which reads the
+/// star simulator's images.
+fn image_config() -> &'static CoordinatorConfig {
     static CONFIG: OnceLock<CoordinatorConfig> = OnceLock::new();
     CONFIG.get_or_init(|| {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -76,11 +98,12 @@ fn config() -> &'static CoordinatorConfig {
             .coordinator;
         config.clock = Clock::Simulated {
             dt: Duration::from_secs_f64(CYCLE_S),
-            epoch: None,
+            // A fixed epoch (2026-09-21 UTC), as a deterministic build needs.
+            epoch: Some(metor_fsw_3::Timestamp(1_790_000_000_000_000)),
         };
-        config.systems.retain(|s| {
-            !["fsw.publish", "fsw.db", "startracker_sim.star_sim"].contains(&s.ty.as_str())
-        });
+        config
+            .systems
+            .retain(|s| !["fsw.publish", "fsw.db"].contains(&s.ty.as_str()));
         config.systems.push(SystemConfig {
             inputs: vec![
                 input("body", PortRef::new("plant", "body")),
@@ -89,8 +112,10 @@ fn config() -> &'static CoordinatorConfig {
             ..SystemConfig::new("watch", "watch")
         });
         for system in &mut config.systems {
-            if let Some(ty) = system.ty.strip_prefix("adcs.") {
-                system.ty = ty.into();
+            for pack in ["adcs.", "startracker_sim."] {
+                if let Some(ty) = system.ty.strip_prefix(pack) {
+                    system.ty = ty.into();
+                }
             }
         }
         config
@@ -107,7 +132,11 @@ fn input(port: &str, from: PortRef) -> InputConfig {
 /// `config` with the plant started `angle` from identity and nav on star
 /// vectors alone.
 fn from_identity(angle_deg: f64) -> CoordinatorConfig {
-    let mut config = config().clone();
+    from_identity_with(config(), angle_deg)
+}
+
+fn from_identity_with(config: &CoordinatorConfig, angle_deg: f64) -> CoordinatorConfig {
+    let mut config = config.clone();
     for system in &mut config.systems {
         match system.id.as_str() {
             "plant" => system.params["init_angle"] = angle_deg.to_radians().into(),
@@ -120,12 +149,27 @@ fn from_identity(angle_deg: f64) -> CoordinatorConfig {
 
 fn build(config: &CoordinatorConfig, errors: &Errors) -> Coordinator {
     let mut table = adcs_systems::pack();
+    table
+        .register_async(
+            "star_sim",
+            startracker_sim::system::star_sim(),
+            startracker_sim::StarSim::new,
+        )
+        .expect("valid records");
     let shared = errors.clone();
     table
         .register("watch", watch(), move || Watch(shared.clone()))
         .expect("valid records");
     register_builtins(&mut table).expect("valid records");
-    config.clone().build(&table).expect("the config builds")
+    // Deterministic: the star simulator's thread turns on the coordinator
+    // thread, so images arrive at the same cycle in every run.
+    let options = BuildOptions {
+        deterministic: true,
+    };
+    config
+        .clone()
+        .build_with(&table, options)
+        .expect("the config builds")
 }
 
 fn run(config: &CoordinatorConfig) -> Vec<(f64, f64)> {
@@ -188,6 +232,18 @@ fn sim_loop_holds_the_filter_under_the_bound() {
     let errors = run(config());
     assert!(errors.len() > 3000, "{} samples", errors.len());
     assert!(settled("sim.py", &errors) < 30.0);
+}
+
+/// The closed loop on images: the GPU star simulator renders from the
+/// plant's attitude, the tracker identifies the stars, and nav converges on
+/// its vectors alone from identity.
+#[test]
+fn tracker_alone_converges_from_identity() {
+    for angle in [30.0, 170.0] {
+        let config = from_identity_with(image_config(), angle);
+        let errors = run(&config);
+        assert!(settled(&format!("tracker, {angle}° from identity"), &errors) < 30.0);
+    }
 }
 
 #[test]
