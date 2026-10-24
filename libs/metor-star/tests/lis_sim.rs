@@ -335,7 +335,12 @@ mod tracking {
             last = Some((m.q, sigma_of(m.p_theta)));
             q = predict(q, omega, 0.1);
         }
-        println!("mean NEES {:.2} over {n} frames", nees / n as f64);
+        let nees = nees / n as f64;
+        println!("mean NEES {nees:.2} over {n} frames");
+        // The flux-dependent σ is calibrated: neither the 0.4 of a flat
+        // 0.1 px nor overconfident (3 is consistent; 1 leaves the tails
+        // margin).
+        assert!((0.6..2.0).contains(&nees), "NEES {nees:.2}");
     }
 
     #[test]
@@ -372,6 +377,19 @@ mod tracking {
             };
             assert_eq!(solved(rig.process(Some(vague), u32::MAX)).0, Mode::Lost);
         }
+    }
+
+    /// Per-star σ falls with flux as shot noise does, from the faint-star σ
+    /// down to the floor.
+    #[test]
+    fn star_sigma_falls_with_flux() {
+        let rig = rig();
+        let (t, cfg) = (&rig.tracker, TrackConfig::default());
+        let rad = |px: f64| camera().pixel_sigma_to_rad(px);
+        assert_eq!(t.star_sigma_rad(1.0), t.sigma_rad());
+        let f = 400.0;
+        assert!((t.star_sigma_rad(f) - rad(cfg.sigma_flux_px / 20.0)).abs() < 1e-15);
+        assert_eq!(t.star_sigma_rad(1e9), rad(cfg.sigma_floor_px));
     }
 
     /// Lost-in-space and tracking weigh the stars with the same σ and report

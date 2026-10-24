@@ -53,6 +53,10 @@ fn identifies_a_frame_and_tracks_the_next() {
     for id in &v.cat_id.0[..v.count as usize] {
         assert!(hips.contains(id), "HIP {id}");
     }
+    // Each vector's σ is its centroid's: brightest first, so rising.
+    let sigma = &v.sigma.into_buf()[..v.count as usize];
+    assert!(sigma.windows(2).all(|w| w[0] <= w[1]), "{sigma:?}");
+    assert!(sigma[0] < sigma[sigma.len() - 1]);
     let q_hat = geom::Quat(out.solution.q_b_eci.0.into_buf());
     assert!(q_hat.angle_to(q(1.0)) < 1e-3);
     // Centroids carry the same ids.

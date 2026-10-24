@@ -186,9 +186,17 @@ pub struct StarTrackerParams {
     /// Mount, `[x, y, z, w]`: `b_body = A(q_b_st) b_st`.
     #[serde(default = "default_q_b_st")]
     pub q_b_st: [f64; 4],
-    /// Centroid 1σ (px).
+    /// A faint star's centroid 1σ (px), the most any star gets; it sizes
+    /// the tracking gate and lost-in-space's residual test.
     #[serde(default = "default_sigma_px")]
     pub sigma_px: f64,
+    /// Shot-noise term (px·√flux): a centroid of flux `F` has 1σ
+    /// `sigma_flux_px / √F`, between `sigma_floor_px` and `sigma_px`.
+    #[serde(default = "default_sigma_flux_px")]
+    pub sigma_flux_px: f64,
+    /// The least centroid 1σ (px), for bright stars.
+    #[serde(default = "default_sigma_floor_px")]
+    pub sigma_floor_px: f64,
     /// Lost-in-space triplets per cycle.
     #[serde(default = "default_budget")]
     pub budget: u32,
@@ -208,6 +216,16 @@ fn default_centre_px() -> f64 {
 
 fn default_sigma_px() -> f64 {
     0.1
+}
+
+// metor-star's `SIGMA_FLUX_PX` and `SIGMA_FLOOR_PX`, calibrated on the
+// simulator.
+fn default_sigma_flux_px() -> f64 {
+    1.2
+}
+
+fn default_sigma_floor_px() -> f64 {
+    0.02
 }
 
 fn default_budget() -> u32 {

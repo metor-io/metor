@@ -80,6 +80,8 @@ impl StarTracker {
         let db = Db::parse(DB).expect("the committed star DB parses");
         let track = TrackConfig {
             sigma_px: params.sigma_px,
+            sigma_flux_px: params.sigma_flux_px,
+            sigma_floor_px: params.sigma_floor_px,
             ..TrackConfig::default()
         };
         let lis = LisConfig {
@@ -195,8 +197,15 @@ impl StarTracker {
     fn vectors(&self, t: Timestamp, id: u64, m: &Match) -> StarVectors {
         let mut out = StarVectors::empty(t, id);
         let (db, cam) = (self.tracker.db(), self.tracker.camera());
-        let sigma = self.tracker.sigma_rad();
-        for (b, row) in self.tracker.obs().iter().zip(m.rows).take(MAX_STARS) {
+        let sigmas = self.tracker.sigmas();
+        for ((b, row), &sigma) in self
+            .tracker
+            .obs()
+            .iter()
+            .zip(m.rows)
+            .zip(sigmas)
+            .take(MAX_STARS)
+        {
             let (Some(star), Some(hip)) = (db.star(row), db.hip(row)) else {
                 continue;
             };

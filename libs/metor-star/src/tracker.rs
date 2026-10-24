@@ -16,12 +16,25 @@ use crate::image::{Centroid, Extractor, ImageConfig, ImageError, MAX_CENTROIDS};
 use crate::lis::{LisConfig, MAX_OBS, Match, NO_ROW, Pyramid, Step, verify};
 use crate::wahba::{Obs, quest};
 
+/// The simulator's centroid error falls as `≈0.85 px / √flux` (robust σ per
+/// axis, `lis_sim`); 1.2 covers its tails and keeps the tracker's NEES near
+/// 1.
+pub const SIGMA_FLUX_PX: f64 = 1.2;
+pub const SIGMA_FLOOR_PX: f64 = 0.02;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrackConfig {
     /// Centroid 1σ (px), for per-star σ and the gate. It also sets the
     /// lost-in-space σ, so both modes weigh stars and gate the residual
     /// RMS alike.
     pub sigma_px: f64,
+    /// Shot-noise term (px·√flux): a star of flux `F` (the extractor's
+    /// units) has σ `sigma_flux_px / √F`, between `sigma_floor_px` and
+    /// `sigma_px`.
+    pub sigma_flux_px: f64,
+    /// The least per-star σ (px), for bright stars: calibration and
+    /// pixel-phase error.
+    pub sigma_floor_px: f64,
     /// Gate in units of the combined 1σ.
     pub gate_k: f64,
     /// A prior with 1σ attitude error past this (rad) is not used.
@@ -34,6 +47,8 @@ impl Default for TrackConfig {
     fn default() -> TrackConfig {
         TrackConfig {
             sigma_px: 0.1,
+            sigma_flux_px: SIGMA_FLUX_PX,
+            sigma_floor_px: SIGMA_FLOOR_PX,
             gate_k: 4.0,
             // FOV/10 for a 20° field.
             max_prior_sigma_rad: 2f64.to_radians(),
@@ -118,6 +133,8 @@ pub struct Tracker<'a> {
     centroids: Vec<Centroid>,
     /// Star-tracker-frame unit vectors of `centroids`.
     obs: Vec<V3>,
+    /// Each observation's 1σ (rad).
+    sigmas: Vec<f64>,
     cone: Vec<u16>,
     quest_obs: Vec<Obs>,
     searching: bool,
@@ -140,6 +157,7 @@ impl<'a> Tracker<'a> {
             pyramid: Pyramid::new(db.n_stars(), lis),
             centroids: Vec::with_capacity(MAX_CENTROIDS),
             obs: Vec::with_capacity(MAX_CENTROIDS),
+            sigmas: Vec::with_capacity(MAX_CENTROIDS),
             cone: Vec::with_capacity(db.n_stars()),
             quest_obs: Vec::with_capacity(MAX_OBS),
             searching: false,
@@ -173,9 +191,20 @@ impl<'a> Tracker<'a> {
         &self.obs
     }
 
-    /// One star's 1σ (rad).
+    /// The last frame's per-observation 1σ (rad), from each centroid's flux.
+    pub fn sigmas(&self) -> &[f64] {
+        &self.sigmas
+    }
+
+    /// A faint star's 1σ (rad), the largest per-star σ: the gate's and
+    /// lost-in-space's.
     pub fn sigma_rad(&self) -> f64 {
         self.cam.pixel_sigma_to_rad(self.cfg.sigma_px)
+    }
+
+    /// The 1σ (rad) of a centroid of flux `flux`.
+    pub fn star_sigma_rad(&self, flux: f64) -> f64 {
+        star_sigma_rad(&self.cam, &self.cfg, flux)
     }
 
     /// Starts frame `px`: extracts centroids, tracks from `prior` when it is
@@ -185,12 +214,15 @@ impl<'a> Tracker<'a> {
         self.searching = false;
         self.centroids.clear();
         self.obs.clear();
+        self.sigmas.clear();
         match self.extractor.run(px) {
             Ok(found) => {
                 for c in found {
                     if let Some(b) = self.cam.pixel_to_st(c.u, c.v) {
                         self.centroids.push(*c);
                         self.obs.push(b);
+                        self.sigmas
+                            .push(star_sigma_rad(&self.cam, &self.cfg, c.flux));
                     }
                 }
             }
@@ -230,12 +262,12 @@ impl<'a> Tracker<'a> {
         }
     }
 
-    /// `m` re-solved on exactly its matched rows, so `q` and `p_theta`
-    /// describe the stars it reports whichever mode found them.
+    /// `m` re-solved on exactly its matched rows with each star's own σ, so
+    /// `q` and `p_theta` describe the stars it reports whichever mode found
+    /// them.
     fn refined(&mut self, mode: Mode, m: Match) -> Outcome {
-        let sigma = self.sigma_rad();
         self.quest_obs.clear();
-        for (b, row) in self.obs.iter().zip(m.rows) {
+        for ((b, row), &sigma) in self.obs.iter().zip(m.rows).zip(&self.sigmas) {
             if let Some(star) = self.db.star(row) {
                 self.quest_obs.push(Obs {
                     b: *b,
@@ -332,6 +364,13 @@ impl<'a> Tracker<'a> {
             triplets: 0,
         })
     }
+}
+
+fn star_sigma_rad(cam: &Camera, cfg: &TrackConfig, flux: f64) -> f64 {
+    let px = (cfg.sigma_flux_px / libm::sqrt(flux.max(1e-12)))
+        .max(cfg.sigma_floor_px)
+        .min(cfg.sigma_px);
+    cam.pixel_sigma_to_rad(px)
 }
 
 /// The 1σ (rad) of an attitude covariance's worst axis.
