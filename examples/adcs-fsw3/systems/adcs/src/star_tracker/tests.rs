@@ -118,3 +118,74 @@ fn a_blank_frame_writes_a_solution_but_no_vectors() {
     // No frame and nothing pending: nothing to do.
     assert!(st.step(None).is_none());
 }
+
+/// Turning 0.6°/s with the rate jittering every 120 Hz cycle, as a rate
+/// loop on a noisy gyro does: the prior integrates every gyro sample
+/// between frames, so it follows the jitter and frames keep tracking.
+/// Returns the share of frames after the first that fell back to
+/// lost-in-space.
+fn jittered_fallback(jitter_rad_s: f64, frames: u32) -> f64 {
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, StandardNormal};
+    const DT: f64 = 1.0 / 120.0;
+    const PER_FRAME: u32 = 12;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let mut rig = Rig::new();
+    let mut st = StarTracker::new(params());
+    let w0 = [0.6f64.to_radians() / 3f64.sqrt(); 3];
+    let mut q_true = q(1.0);
+    // The rates of the frame being exposed and its mid-exposure attitude.
+    let mut rates: Vec<V3> = Vec::new();
+    let mut mid = q_true;
+    let (mut lost, mut solved) = (0u32, 0u32);
+    for k in 0..frames * PER_FRAME {
+        let t_us = (f64::from(k) * DT * 1e6).round() as i64;
+        let omega: V3 = core::array::from_fn(|i| {
+            let n: f64 = StandardNormal.sample(&mut rng);
+            w0[i] + jitter_rad_s * n
+        });
+        st.set_gyro(Timestamp(t_us), omega);
+        let phase = k % PER_FRAME;
+        // A frame exposed over the last 12 cycles arrives now.
+        let frame = (phase == 0 && k > 0).then(|| {
+            let n = rates.len() as f64;
+            let mean: V3 = core::array::from_fn(|i| rates.iter().map(|r| r[i]).sum::<f64>() / n);
+            let start = predict(mid, mean, -0.05);
+            let motion = Motion {
+                q_b_eci: start,
+                omega_b: mean,
+                beta: [0.0; 3],
+                t_exp: 0.1,
+            };
+            let id = u64::from(k / PER_FRAME);
+            let frame = Frame::new(&sim_camera(), &motion, 16, id, id).unwrap();
+            rig.render.render(&frame, &mut rig.px).unwrap();
+            rates.clear();
+            (Timestamp(t_us - 50_000), id)
+        });
+        if phase == PER_FRAME / 2 {
+            mid = q_true;
+        }
+        rates.push(omega);
+        if let Some(out) = st.step(frame.map(|(t, id)| (t, id, rig.px.as_slice()))) {
+            assert_eq!(out.solution.status(), Ok(StarStatus::Valid), "frame {k}");
+            solved += 1;
+            if solved > 1 && out.solution.mode() == Ok(StarMode::Lost) {
+                lost += 1;
+            }
+        }
+        q_true = predict(q_true, omega, DT);
+    }
+    assert!(solved + 1 >= frames, "{solved} of {frames} solved");
+    f64::from(lost) / f64::from(solved - 1)
+}
+
+#[test]
+fn a_jittered_turn_keeps_tracking() {
+    let share = jittered_fallback(3e-3, 60);
+    println!(
+        "fell back to lost-in-space on {:.0}% of frames",
+        100.0 * share
+    );
+    assert!(share < 0.1, "{share}");
+}

@@ -3,6 +3,8 @@
 //! writes the matched vectors nav fuses, its own solution, and the centroids
 //! for the panel overlay.
 
+use std::collections::VecDeque;
+
 use adcs_contracts::{
     MAX_STARS, StarCentroids, StarImage, StarMode, StarSolution, StarStatus, StarTrackerParams,
     StarVectors, UNIDENTIFIED,
@@ -26,6 +28,57 @@ const MAX_PRIOR_AGE_S: f64 = 2.0;
 /// Attitude error the gyro adds per second of propagation (rad/s): bias and
 /// noise, generously.
 const GYRO_DRIFT_RAD_S: f64 = 2e-4;
+
+/// Gyro samples kept for the prior, about 1 s at 120 Hz: enough to span
+/// the frame gap and a few cycles of search.
+const GYRO_LOG: usize = 128;
+
+/// The gyro integrated every cycle from an arbitrary start: `q` at each
+/// sample, `A(q) = Φ(t, t₀)` in the sensor frame, so the turn between two
+/// times is `conj(q(t₁)) ⊗ q(t₂)`.
+#[derive(Debug, Clone, Default)]
+struct GyroLog {
+    /// `(t, q(t), ω_st(t))`, oldest first.
+    samples: VecDeque<(Timestamp, Quat, V3)>,
+}
+
+impl GyroLog {
+    fn push(&mut self, t: Timestamp, omega_st: V3) {
+        let q = match self.samples.back() {
+            Some(&(t0, _, _)) if t <= t0 => return,
+            // Trapezoidal: the mean of the two samples over the interval.
+            Some(&(t0, q0, w0)) => predict(q0, mean(w0, omega_st), secs(t0, t)),
+            None => Quat::IDENTITY,
+        };
+        if self.samples.len() == GYRO_LOG {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((t, q, omega_st));
+    }
+
+    /// The integrated attitude at `t`, interpolated between samples or
+    /// extrapolated past the newest at its rate; `None` before the oldest.
+    fn at(&self, t: Timestamp) -> Option<Quat> {
+        let i = self.samples.partition_point(|s| s.0 <= t).checked_sub(1)?;
+        let (t0, q0, w0) = self.samples[i];
+        let w = self.samples.get(i + 1).map_or(w0, |s| mean(w0, s.2));
+        Some(predict(q0, w, secs(t0, t)))
+    }
+
+    /// The newest rate, sensor frame.
+    fn rate(&self) -> V3 {
+        self.samples.back().map_or([0.0; 3], |s| s.2)
+    }
+}
+
+fn mean(a: V3, b: V3) -> V3 {
+    core::array::from_fn(|i| 0.5 * (a[i] + b[i]))
+}
+
+/// `b − a` in seconds.
+fn secs(a: Timestamp, b: Timestamp) -> f64 {
+    (b.0 - a.0) as f64 * 1e-6
+}
 
 /// The tracker's last solution, sensor←ECI.
 #[derive(Debug, Clone, Copy)]
@@ -51,8 +104,8 @@ pub struct StarTracker {
     /// The frame being searched, `(timestamp, frame_id)`.
     pending: Option<(Timestamp, u64)>,
     last_frame_id: Option<u64>,
-    /// Body rate from the gyro (rad/s).
-    gyro_b: V3,
+    /// Every gyro sample, integrated, for the prior.
+    gyro: GyroLog,
     /// Frames dropped because a new one arrived mid-search.
     pub dropped: u64,
 }
@@ -97,25 +150,34 @@ impl StarTracker {
             last: None,
             pending: None,
             last_frame_id: None,
-            gyro_b: [0.0; 3],
+            gyro: GyroLog::default(),
             dropped: 0,
         }
     }
 
-    pub fn set_gyro(&mut self, gyro_b: V3) {
-        self.gyro_b = gyro_b;
+    /// Logs the gyro's body rate sampled at `t`; call it every cycle.
+    pub fn set_gyro(&mut self, t: Timestamp, gyro_b: V3) {
+        self.gyro.push(t, self.tracker.camera().body_to_st(gyro_b));
     }
 
-    /// The last solution turned to `t` by the gyro, if recent.
+    /// The last solution turned to `t` by the gyro integrated over every
+    /// sample between them, if recent. Past the log, the newest rate turns
+    /// it instead.
     fn prior(&self, t: Timestamp) -> Option<Prior> {
         let last = self.last?;
-        let dt = (t.0 - last.timestamp.0) as f64 * 1e-6;
+        let dt = secs(last.timestamp, t);
         if !(0.0..=MAX_PRIOR_AGE_S).contains(&dt) {
             return None;
         }
-        let omega_st = self.tracker.camera().body_to_st(self.gyro_b);
+        let q_st_eci = match (self.gyro.at(last.timestamp), self.gyro.at(t)) {
+            // `A(q′) = Φ(t) Φ(t_last)ᵀ A(q)`, and `A(p ⊗ q) = A(q) A(p)`.
+            (Some(g0), Some(g1)) => (last.q_st_eci * g0.conj() * g1)
+                .normalized()
+                .unwrap_or(last.q_st_eci),
+            _ => predict(last.q_st_eci, self.gyro.rate(), dt),
+        };
         Some(Prior {
-            q_st_eci: predict(last.q_st_eci, omega_st, dt),
+            q_st_eci,
             sigma_rad: last.sigma_rad + GYRO_DRIFT_RAD_S * dt + 1e-5,
         })
     }
@@ -247,7 +309,7 @@ pub fn star_tracker(
     star_centroids: &mut Output<StarCentroids>,
 ) {
     if let Ok(Some(s)) = sensors.latest() {
-        state.set_gyro(s.gyro_b.into_buf());
+        state.set_gyro(s.timestamp, s.gyro_b.into_buf());
     }
     let latest = image.latest();
     let frame = match &latest {
