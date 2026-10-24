@@ -31,6 +31,9 @@ enum Cmd {
         fov: f64,
         #[arg(long, default_value_t = Opts::default().face_n)]
         face_n: u32,
+        /// Stars closer than this (px) merge into one.
+        #[arg(long, default_value_t = Opts::default().merge_px)]
+        merge_px: f64,
     },
     /// Prints a DB's counts and its sparse-sky fraction.
     Check {
@@ -59,6 +62,7 @@ fn run(cmd: Cmd) -> Result<(), String> {
             stars,
             fov,
             face_n,
+            merge_px,
         } => {
             let bytes =
                 std::fs::read(&starcat).map_err(|e| format!("{}: {e}", starcat.display()))?;
@@ -67,6 +71,8 @@ fn run(cmd: Cmd) -> Result<(), String> {
                 n_stars: stars,
                 fov_deg: fov,
                 face_n,
+                merge_px,
+                ..Opts::default()
             };
             let db = build_db(&cat, &opts).map_err(|e| format!("build: {e:?}"))?;
             std::fs::write(&out, &db).map_err(|e| format!("{}: {e}", out.display()))?;
