@@ -445,8 +445,9 @@ fn component_list_rows(
         })
     };
     // A matched component keeps the wizard's own spelling — the element-page
-    // NavRow — and the Continue row rides below the candidates, so a query
-    // never takes the multi-select away.
+    // NavRow — and the Continue row rides along with the candidates, so a
+    // query never takes the multi-select away. It leads once something is
+    // picked, so the next Enter commits.
     let nav_row: crate::inspector::rows::ComponentRowBuilder = {
         let db = db.clone();
         let selection = selection.clone();
@@ -467,12 +468,14 @@ fn component_list_rows(
         let color_basis = color_basis.clone();
         let on_continue = on_continue.clone();
         Arc::new(move || {
-            Box::new(ContinueRow {
+            let picked = selection.lock().unwrap().total_traces() > 0;
+            let row: Box<dyn InspectorRow> = Box::new(ContinueRow {
                 selection: selection.clone(),
                 db: db.clone(),
                 color_basis: color_basis.clone(),
                 on_continue: on_continue.clone(),
-            })
+            });
+            (row, picked)
         })
     };
     rows.push(Box::new(ExpressionRow::new(
