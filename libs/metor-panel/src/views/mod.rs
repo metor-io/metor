@@ -53,7 +53,7 @@ pub use format::{ElementIndexes, format_element_value, format_value};
 pub use gauge::{Gauge, GaugeConfig, GaugeStyle};
 pub use image_source::ImageRef;
 pub use json_tree::JsonTree;
-pub use label::{Label, LabelAlign, LabelConfig};
+pub use label::{Label, LabelConfig};
 pub use list_plot::{ListLinePlot, ListPlot, ListPlotPanelConfig, ListTrace, ListTraceConfig};
 pub use log_panel::{LevelFilter, LogView};
 pub use map::{Map, MapConfig};

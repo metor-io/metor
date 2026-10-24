@@ -14,18 +14,9 @@ use gpui::{
 use metor_db::DB;
 use serde::{Deserialize, Serialize};
 
+use super::value_strip::StripAlign;
 use crate::inspect;
 use crate::theme::{Theme, theme, ui_px};
-
-/// Where a label's text sits in its box.
-#[derive(Clone, Copy, Debug, Default, PartialEq, facet::Facet, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum LabelAlign {
-    Left,
-    #[default]
-    Center,
-    Right,
-}
 
 /// Persisted shape of a [`Label`], shared by the tile and dashboard
 /// surfaces and the Python config API.
@@ -40,7 +31,7 @@ pub struct LabelConfig {
     /// Tints the box and its edge, as a state's colour tints its chip.
     pub color: Option<Hsla>,
     pub text_size: f32,
-    pub align: LabelAlign,
+    pub align: StripAlign,
     pub bold: bool,
     pub uppercase: bool,
     pub border: bool,
@@ -54,7 +45,7 @@ impl Default for LabelConfig {
             color: None,
             // The value-cell size, so a caption matches the chips around it.
             text_size: 12.0,
-            align: LabelAlign::default(),
+            align: StripAlign::Center,
             bold: false,
             uppercase: false,
             border: false,
@@ -70,7 +61,7 @@ pub struct Label {
     pub color: Option<Hsla>,
     #[facet(inspect::range(min = "6.0", max = "96.0"))]
     pub text_size: f32,
-    pub align: LabelAlign,
+    pub align: StripAlign,
     pub bold: bool,
     pub uppercase: bool,
     pub border: bool,
@@ -139,9 +130,9 @@ impl Render for Label {
             .when(self.bold, |cell| cell.font_weight(FontWeight::BOLD));
         let text = div().child(self.display_text());
         let (cell, text) = match self.align {
-            LabelAlign::Left => (cell.justify_start(), text.text_left()),
-            LabelAlign::Center => (cell.justify_center(), text.text_center()),
-            LabelAlign::Right => (cell.justify_end(), text.text_right()),
+            StripAlign::Left => (cell.justify_start(), text.text_left()),
+            StripAlign::Center => (cell.justify_center(), text.text_center()),
+            StripAlign::Right => (cell.justify_end(), text.text_right()),
         };
         div().size_full().p(ui_px(4.0)).child(cell.child(text))
     }
@@ -158,7 +149,7 @@ mod tests {
             text_color: Some(Hsla::default()),
             color: Some(Hsla::default()),
             text_size: 18.0,
-            align: LabelAlign::Right,
+            align: StripAlign::Right,
             bold: true,
             uppercase: true,
             border: true,
@@ -169,6 +160,6 @@ mod tests {
         let partial: LabelConfig = serde_json::from_str(r#"{"text":"EPS"}"#).unwrap();
         assert_eq!(partial.text, "EPS");
         assert_eq!(partial.text_size, 12.0);
-        assert_eq!(partial.align, LabelAlign::Center);
+        assert_eq!(partial.align, StripAlign::Center);
     }
 }
