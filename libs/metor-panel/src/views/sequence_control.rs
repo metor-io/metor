@@ -46,8 +46,9 @@ use crate::views::value_strip::{
 pub struct SequenceControlConfig {
     /// Channel name — the address every published command carries.
     pub channel: String,
-    /// Drop the latest status line from beside the run state. For a strip
-    /// too narrow to show both.
+    /// One row at button height: the channel and run-state line folds into
+    /// the status dot beside the sequence (its text in the dot's tooltip).
+    /// For a strip too short for two lines.
     pub compact: bool,
 }
 
@@ -130,7 +131,53 @@ impl Render for SequenceControl {
         // Armed, the confirm prompt takes the whole line: in a narrow card
         // the channel and state would otherwise squeeze it to nothing, and
         // it is the one line the operator must not miss.
-        let status = (!self.compact).then(|| ch.last_message.clone()).flatten();
+        let status = ch.last_message.clone();
+        let dot_color = if arming {
+            theme.error_accent
+        } else {
+            state_color
+        };
+        let dot = || {
+            div()
+                .flex_none()
+                .size(ui_px(6.0))
+                .rounded(ui_px(3.0))
+                .bg(dot_color)
+        };
+
+        if self.compact {
+            // The subtitle's words, for the one line that no longer shows them.
+            let summary = match (arming, &status) {
+                (true, _) => SharedString::new_static("click stop again"),
+                (false, Some(message)) => SharedString::from(format!(
+                    "{} {} · {message}",
+                    ch.name.to_lowercase(),
+                    run_state_label(ch.run_state).to_lowercase()
+                )),
+                (false, None) => SharedString::from(format!(
+                    "{} {}",
+                    ch.name.to_lowercase(),
+                    run_state_label(ch.run_state).to_lowercase()
+                )),
+            };
+            let label = div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(ui_px(6.0))
+                .child(
+                    div()
+                        .id("seq-ctl-status")
+                        .flex_none()
+                        .child(dot())
+                        .tooltip(move |_window, cx| TooltipText::build(summary.clone(), cx)),
+                )
+                .child(self.load_row(&ch, &theme, cx));
+            return self.with_buttons(label, &ch, &theme, cx);
+        }
+
         let subtitle = div()
             .id("seq-ctl-status")
             .flex()
@@ -139,17 +186,7 @@ impl Render for SequenceControl {
             .gap(ui_px(4.0))
             .min_w_0()
             .text_size(ui_px(10.0))
-            .child(
-                div()
-                    .flex_none()
-                    .size(ui_px(6.0))
-                    .rounded(ui_px(3.0))
-                    .bg(if arming {
-                        theme.error_accent
-                    } else {
-                        state_color
-                    }),
-            )
+            .child(dot())
             .map(|el| {
                 if arming {
                     return el.child(
@@ -196,6 +233,22 @@ impl Render for SequenceControl {
             .gap(ui_px(3.0))
             .child(subtitle)
             .child(self.load_row(&ch, &theme, cx));
+        self.with_buttons(label, &ch, &theme, cx)
+    }
+}
+
+impl SequenceControl {
+    /// The control's row: `label` on the left, the run buttons on the right
+    /// lined up with its sequence box.
+    fn with_buttons(
+        &self,
+        label: Div,
+        ch: &ChannelState,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = theme.clone();
+        let arming = self.arming_stop;
 
         let abort_btn = pressable(
             icon_button(
