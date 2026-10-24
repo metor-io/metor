@@ -537,7 +537,7 @@ impl Render for SpectrogramPlot {
                 spectrogram_gpu_state,
                 Self::submit_frame,
             ))
-            .children(gap_band_overlay(gap_bands, theme.plot_gap_band))
+            .children(gap_band_overlay(gap_bands, theme.plot_gap_band()))
     }
 }
 

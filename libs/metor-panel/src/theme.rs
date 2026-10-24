@@ -117,13 +117,6 @@ pub struct Theme {
     pub grid_color: Hsla,
     pub axis_color: Hsla,
     pub zero_line_color: Hsla,
-    /// Translucent band over plot regions whose data is remote-only or
-    /// still downloading.
-    pub plot_gap_band: Hsla,
-    /// Alpha applied to a trace's color when it renders as a min/max
-    /// envelope (LoD buckets) instead of raw samples, so operators can
-    /// tell the two apart at a glance.
-    pub plot_envelope_alpha: f32,
     /// Tone ramp for intensity fields — spectrogram magnitude, value
     /// density. Ordered low intensity to high and monotonic in lightness,
     /// starting near `bg_secondary` so a barely-occupied cell fades into
@@ -133,9 +126,6 @@ pub struct Theme {
     /// "On" color for checkboxes, switches, and traffic-light tiles. Replaces
     /// per-call-site indexing into `line_colors`.
     pub control_active: Hsla,
-    /// Dimmed variant of `control_active` used as the track behind a checked
-    /// switch knob. Same hue, lower presence.
-    pub control_active_track: Hsla,
     /// Error accent (build failures, invalid arg pills). Used wherever the
     /// UI needs a "this is wrong" tint.
     pub error_accent: Hsla,
@@ -178,6 +168,17 @@ impl Theme {
             l: 0.,
             a: 0.4,
         }
+    }
+
+    /// Translucent band over plot regions whose data is remote-only or
+    /// still downloading.
+    pub fn plot_gap_band(&self) -> Hsla {
+        Self::dim(self.zero_line_color, 0.12)
+    }
+
+    /// Track behind a checked switch knob: `control_active` with less presence.
+    pub fn control_active_track(&self) -> Hsla {
+        Self::dim(self.control_active, 0.7)
     }
 
     /// Semi-transparent `bg_secondary` for plot chrome strips — the legend
@@ -492,8 +493,6 @@ pub static DARK: Theme = Theme {
     grid_color: hex(0x2e2b28, 1.0),
     axis_color: hex(0x4d4843, 1.0),
     zero_line_color: hex(0x6b6560, 1.0),
-    plot_gap_band: hex(0x6b6560, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x201e1c, 1.0),
         hex(0x175684, 1.0),
@@ -503,7 +502,6 @@ pub static DARK: Theme = Theme {
     ],
 
     control_active: hex(0x40b060, 1.0),
-    control_active_track: hex(0x40b060, 0.7),
     error_accent: hex(0xe04040, 1.0),
 };
 
@@ -543,8 +541,6 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
     grid_color: hex(0x313244, 1.0),
     axis_color: hex(0x45475a, 1.0),
     zero_line_color: hex(0x585b70, 1.0),
-    plot_gap_band: hex(0x585b70, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x181828, 1.0),
         hex(0x063e98, 1.0),
@@ -554,7 +550,6 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
     ],
 
     control_active: hex(0xa6e3a1, 1.0),
-    control_active_track: hex(0xa6e3a1, 0.7),
     error_accent: hex(0xf38ba8, 1.0),
 };
 
@@ -594,8 +589,6 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     grid_color: hex(0x363a4f, 1.0),
     axis_color: hex(0x494d64, 1.0),
     zero_line_color: hex(0x5b6078, 1.0),
-    plot_gap_band: hex(0x5b6078, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x25283e, 1.0),
         hex(0x1042a8, 1.0),
@@ -605,7 +598,6 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     ],
 
     control_active: hex(0xa6da95, 1.0),
-    control_active_track: hex(0xa6da95, 0.7),
     error_accent: hex(0xed8796, 1.0),
 };
 
@@ -645,8 +637,6 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
     grid_color: hex(0xdce0e8, 1.0),
     axis_color: hex(0xccd0da, 1.0),
     zero_line_color: hex(0xbcc0cc, 1.0),
-    plot_gap_band: hex(0xbcc0cc, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0xd6dbe6, 1.0),
         hex(0xfea46f, 1.0),
@@ -656,7 +646,6 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
     ],
 
     control_active: hex(0x40a02b, 1.0),
-    control_active_track: hex(0x40a02b, 0.7),
     error_accent: hex(0xd20f39, 1.0),
 };
 
@@ -696,8 +685,6 @@ pub static AYU_DARK: Theme = Theme {
     grid_color: hex(0x11151c, 1.0),
     axis_color: hex(0x1a1e28, 1.0),
     zero_line_color: hex(0x2a2e38, 1.0),
-    plot_gap_band: hex(0x2a2e38, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x161c28, 1.0),
         hex(0x00629c, 1.0),
@@ -707,7 +694,6 @@ pub static AYU_DARK: Theme = Theme {
     ],
 
     control_active: hex(0x7fd962, 1.0),
-    control_active_track: hex(0x7fd962, 0.7),
     error_accent: hex(0xff3333, 1.0),
 };
 
@@ -747,8 +733,6 @@ pub static EVERFOREST_DARK: Theme = Theme {
     grid_color: hex(0x3d484d, 1.0),
     axis_color: hex(0x475258, 1.0),
     zero_line_color: hex(0x56635f, 1.0),
-    plot_gap_band: hex(0x56635f, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x2b353b, 1.0),
         hex(0x407972, 1.0),
@@ -758,7 +742,6 @@ pub static EVERFOREST_DARK: Theme = Theme {
     ],
 
     control_active: hex(0xa7c080, 1.0),
-    control_active_track: hex(0xa7c080, 0.7),
     error_accent: hex(0xe67e80, 1.0),
 };
 
@@ -798,8 +781,6 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     grid_color: hex(0xefebd4, 1.0),
     axis_color: hex(0xe6e2cc, 1.0),
     zero_line_color: hex(0xbdc3af, 1.0),
-    plot_gap_band: hex(0xbdc3af, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0xefe9c4, 1.0),
         hex(0xf8a96f, 1.0),
@@ -809,7 +790,6 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     ],
 
     control_active: hex(0x8da101, 1.0),
-    control_active_track: hex(0x8da101, 0.7),
     error_accent: hex(0xf85552, 1.0),
 };
 
@@ -849,8 +829,6 @@ pub static ROSE_PINE: Theme = Theme {
     grid_color: hex(0x21202e, 1.0),
     axis_color: hex(0x403d52, 1.0),
     zero_line_color: hex(0x524f67, 1.0),
-    plot_gap_band: hex(0x524f67, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x211e31, 1.0),
         hex(0x2b667e, 1.0),
@@ -860,7 +838,6 @@ pub static ROSE_PINE: Theme = Theme {
     ],
 
     control_active: hex(0x9ccfd8, 1.0),
-    control_active_track: hex(0x9ccfd8, 0.7),
     error_accent: hex(0xeb6f92, 1.0),
 };
 
@@ -900,8 +877,6 @@ pub static ROSE_PINE_MOON: Theme = Theme {
     grid_color: hex(0x2a283e, 1.0),
     axis_color: hex(0x44415a, 1.0),
     zero_line_color: hex(0x56526e, 1.0),
-    plot_gap_band: hex(0x56526e, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x2a2844, 1.0),
         hex(0x32728d, 1.0),
@@ -911,7 +886,6 @@ pub static ROSE_PINE_MOON: Theme = Theme {
     ],
 
     control_active: hex(0x9ccfd8, 1.0),
-    control_active_track: hex(0x9ccfd8, 0.7),
     error_accent: hex(0xeb6f92, 1.0),
 };
 
@@ -951,8 +925,6 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     grid_color: hex(0xf4ede8, 1.0),
     axis_color: hex(0xdfdad9, 1.0),
     zero_line_color: hex(0xcecacd, 1.0),
-    plot_gap_band: hex(0xcecacd, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0xf5e8d9, 1.0),
         hex(0xf3c689, 1.0),
@@ -962,7 +934,6 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     ],
 
     control_active: hex(0x56949f, 1.0),
-    control_active_track: hex(0x56949f, 0.7),
     error_accent: hex(0xb4637a, 1.0),
 };
 
@@ -1002,8 +973,6 @@ pub static MAKING_SOFTWARE: Theme = Theme {
     grid_color: hex(0xe6ebff, 1.0),
     axis_color: hex(0xb9c7fd, 1.0),
     zero_line_color: hex(0x97acff, 1.0),
-    plot_gap_band: hex(0x97acff, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0xdbdfed, 1.0),
         hex(0xffdd78, 1.0),
@@ -1013,7 +982,6 @@ pub static MAKING_SOFTWARE: Theme = Theme {
     ],
 
     control_active: hex(0x1342ff, 1.0),
-    control_active_track: hex(0x1342ff, 0.7),
     error_accent: hex(0xc02434, 1.0),
 };
 
@@ -1053,8 +1021,6 @@ pub static DEPARTURE: Theme = Theme {
     grid_color: hex(0x2a2018, 1.0),
     axis_color: hex(0x3a2a18, 1.0),
     zero_line_color: hex(0x5a3e20, 1.0),
-    plot_gap_band: hex(0x5a3e20, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x1f1d19, 1.0),
         hex(0x1f7878, 1.0),
@@ -1064,7 +1030,6 @@ pub static DEPARTURE: Theme = Theme {
     ],
 
     control_active: hex(0xf0a040, 1.0),
-    control_active_track: hex(0xf0a040, 0.7),
     error_accent: hex(0xe05050, 1.0),
 };
 
@@ -1110,8 +1075,6 @@ pub static KINTSUGI: Theme = Theme {
     grid_color: hex(0x1d1d1c, 1.0),
     axis_color: hex(0x444444, 1.0),
     zero_line_color: hex(0x5c584f, 1.0),
-    plot_gap_band: hex(0x5c584f, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x1c1c1f, 1.0),
         hex(0x444c57, 1.0),
@@ -1121,7 +1084,6 @@ pub static KINTSUGI: Theme = Theme {
     ],
 
     control_active: hex(0xdbad49, 1.0),
-    control_active_track: hex(0xdbad49, 0.7),
     error_accent: hex(0xd66848, 1.0),
 };
 

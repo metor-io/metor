@@ -819,10 +819,14 @@ impl LinePlot {
     }
 }
 
+/// Alpha applied to a trace's color when it renders as a min/max envelope
+/// (LoD buckets) instead of raw samples, so operators can tell the two apart
+/// at a glance.
+const ENVELOPE_ALPHA: f32 = 0.55;
+
 impl Render for LinePlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx);
-        let envelope_alpha = theme.plot_envelope_alpha;
         self.update_lod_state(cx);
         let degraded = self.gpu_state.degraded();
         let gap_bands = self.gap_bands(cx);
@@ -849,7 +853,7 @@ impl Render for LinePlot {
                     // bucket.
                     let raw_clip = if let Some(lod) = tracking.lod.selected() {
                         let mut color = config.color;
-                        color.a *= envelope_alpha;
+                        color.a *= ENVELOPE_ALPHA;
                         draws.push(LineDraw {
                             x: AxisSource::Timestamps,
                             y: AxisSource::MinMax {
@@ -899,7 +903,7 @@ impl Render for LinePlot {
             .size_full()
             .relative()
             .child(plot_canvas)
-            .children(gap_band_overlay(gap_bands, theme.plot_gap_band))
+            .children(gap_band_overlay(gap_bands, theme.plot_gap_band()))
             .when(degraded, |el| {
                 // The last frame clamped its uploads: more samples are in
                 // view than the GPU buffers hold, so the trace is shown

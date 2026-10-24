@@ -7,7 +7,7 @@ use crate::theme::Theme;
 /// Purely presentational; the caller owns click routing and state.
 pub fn checkbox(checked: bool, theme: &Theme) -> impl IntoElement {
     let track_color = if checked {
-        theme.control_active_track
+        theme.control_active_track()
     } else {
         theme.text_tertiary
     };

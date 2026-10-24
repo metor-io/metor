@@ -894,7 +894,7 @@ fn build_cell_chrome(
         } else if stale {
             theme.stale_bg()
         } else if bool_value {
-            theme.control_active_track
+            theme.control_active_track()
         } else {
             theme.bg_secondary
         };

@@ -869,7 +869,7 @@ impl Render for ExecTimeline {
                     .bottom_0()
                     .left(gpui::relative(start))
                     .w(gpui::relative(width))
-                    .bg(theme.plot_gap_band),
+                    .bg(theme.plot_gap_band()),
             );
         }
 
