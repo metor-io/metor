@@ -199,7 +199,6 @@ async fn an_expression_publishes_a_real_but_hidden_component() {
             db_source::from_db(&db, source_id).unwrap(),
         )],
         program::DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -382,7 +381,6 @@ async fn a_published_expression_seeds_then_tails() {
             seed: program::latest_sample(&db, source_id),
         }],
         program::DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -456,7 +454,6 @@ async fn the_registry_does_not_keep_an_unused_expression_alive() {
                 seed: program::latest_sample(&db, source_id),
             }],
             program::DEFAULT_FUEL,
-            None,
         )
         .unwrap();
         let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -552,7 +549,6 @@ async fn an_expression_fills_a_list_trace_element_by_element() {
             seed: program::latest_sample(&db, source_id),
         }],
         program::DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -1164,7 +1160,6 @@ async fn a_self_dot_seeds_then_tails() {
             seed: program::latest_sample(&db, source_id),
         }],
         program::DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();

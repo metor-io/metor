@@ -113,7 +113,7 @@ pub(super) fn wire(bench: &Bench, compiled: &Arc<Compiled>, index: usize) -> pro
             other => panic!("this helper wires components, not {other:?}"),
         })
         .collect();
-    program::system(compiled, index, ports, DEFAULT_FUEL, None).unwrap()
+    program::system(compiled, index, ports, DEFAULT_FUEL).unwrap()
 }
 
 #[stellarator::test]
@@ -270,55 +270,6 @@ async fn a_runaway_body_parks_the_system() {
     settle().await;
 }
 
-/// The rebuild contract: an edit swaps one instance and the filter picks up
-/// where it left off, because state is keyed by what it means, not by which
-/// instance held it.
-#[stellarator::test]
-async fn a_rebuild_carries_state_across_the_swap() {
-    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
-    let lowpass = |gain: &str| {
-        format!(
-            "class Lp(State):\n\
-             \x20   filtered: f64 = 0.0\n\
-             \n\
-             @system(\"wheels.rpm\")\n\
-             def lp(rpm, s: Lp) -> f64:\n\
-             \x20   s.filtered = {gain} * rpm + (1.0 - {gain}) * s.filtered\n\
-             \x20   return s.filtered\n"
-        )
-    };
-
-    let first = bench.compile(&lowpass("0.5"));
-    let running = wire(&bench, &first, 0);
-    let field = program::field(&first, 0, 0, running.node.clone()).unwrap();
-    let mut out = watch(&field);
-    bench.push("wheels.rpm", 1, &[100.0]);
-    assert_eq!(take(&mut out, 1).await, vec![50.0]);
-    let carried = running.state.snapshot();
-    assert_eq!(carried.entries.len(), 1);
-
-    // A gain edit changes the body, so this system rebuilds — and its memory
-    // of the last sample has to come with it.
-    let second = bench.compile(&lowpass("0.25"));
-    assert_ne!(
-        first.system_hash(0, &[]),
-        second.system_hash(0, &[]),
-        "an edited body must hash differently"
-    );
-    let rebuilt = program::system(
-        &second,
-        0,
-        vec![program::PortSource::live(bench.source("wheels.rpm"))],
-        DEFAULT_FUEL,
-        Some(&carried),
-    )
-    .unwrap();
-    let field = program::field(&second, 0, 0, rebuilt.node.clone()).unwrap();
-    let mut out = watch(&field);
-    bench.push("wheels.rpm", 2, &[100.0]);
-    assert_eq!(take(&mut out, 1).await, vec![0.25 * 100.0 + 0.75 * 50.0]);
-}
-
 /// An edit to one system leaves the others' identities alone, which is what
 /// makes "rebuild only what changed" a property rather than an intention.
 #[stellarator::test]
@@ -382,7 +333,6 @@ async fn a_quiet_channel_still_yields_its_current_value() {
             seed,
         }],
         DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -407,7 +357,6 @@ async fn a_fault_in_the_opening_sample_parks_the_system() {
             seed: program::latest_sample(&bench.db, id),
         }],
         DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     for _ in 0..200 {
@@ -443,7 +392,7 @@ async fn a_held_input_is_seeded_from_what_it_already_published() {
             seed: program::latest_sample(&bench.db, bench.id(name)),
         })
         .collect();
-    let system = program::system(&compiled, 0, ports, DEFAULT_FUEL, None).unwrap();
+    let system = program::system(&compiled, 0, ports, DEFAULT_FUEL).unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
     let mut out = watch(&field);
 
@@ -476,7 +425,6 @@ async fn a_seeded_system_keeps_following_its_input() {
             seed: program::latest_sample(&bench.db, id),
         }],
         DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -514,7 +462,6 @@ async fn a_seeded_expression_accumulates_history() {
             seed: program::latest_sample(&bench.db, id),
         }],
         DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -571,7 +518,6 @@ async fn a_chain_of_systems_keeps_following_its_input() {
             seed: program::latest_sample(&bench.db, upstream_id),
         }],
         DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let second_field = program::field(&compiled, 1, 0, second.node.clone()).unwrap();
@@ -648,7 +594,7 @@ async fn a_source_system_clocks_itself() {
         bench.compile("@system(rate=200.0)\ndef sig() -> f64:\n    return sine(1.0, 2.0)\n");
     assert_eq!(compiled.manifest.systems[0].rate, Some(200.0));
 
-    let system = program::system(&compiled, 0, Vec::new(), DEFAULT_FUEL, None).unwrap();
+    let system = program::system(&compiled, 0, Vec::new(), DEFAULT_FUEL).unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
     let mut reader = watch(&field);
     let seen = take(&mut reader, 4).await;
@@ -675,7 +621,7 @@ async fn two_random_sources_draw_different_sequences() {
     let mut drawn = Vec::new();
     let mut held = Vec::new();
     for index in 0..2 {
-        let system = program::system(&compiled, index, Vec::new(), DEFAULT_FUEL, None).unwrap();
+        let system = program::system(&compiled, index, Vec::new(), DEFAULT_FUEL).unwrap();
         let field = program::field(&compiled, index, 0, system.node.clone()).unwrap();
         let mut reader = watch(&field);
         held.push(system);
@@ -695,7 +641,7 @@ async fn two_random_sources_draw_different_sequences() {
 async fn an_unclocked_system_with_no_inputs_is_refused() {
     let bench = Bench::new(&[]);
     let compiled = bench.compile("@system\ndef sig() -> f64:\n    return 1.0\n");
-    let Err(err) = program::system(&compiled, 0, Vec::new(), DEFAULT_FUEL, None) else {
+    let Err(err) = program::system(&compiled, 0, Vec::new(), DEFAULT_FUEL) else {
         panic!("nothing fires it, so it must not build");
     };
     assert!(format!("{err}").contains("rate="), "{err}");
@@ -722,7 +668,7 @@ async fn a_dot_of_two_seeded_inputs_keeps_following_both() {
             seed: program::latest_sample(&bench.db, bench.id(name)),
         })
         .collect();
-    let system = program::system(&compiled, 0, ports, DEFAULT_FUEL, None).unwrap();
+    let system = program::system(&compiled, 0, ports, DEFAULT_FUEL).unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
     let mut out = watch(&field);
 

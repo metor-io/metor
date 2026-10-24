@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use metor_db::ComponentSchema;
 use metor_db::disruptor::Disruptor;
-use metor_expr::state::{RNG_FIELD, Snapshot};
+use metor_expr::state::RNG_FIELD;
 use metor_expr::{Diagnostics, Manifest, Resolver, Ty};
 use metor_proto::types::{PrimType, Timestamp};
 use wasmi::{Engine, Instance, Linker, Module, Store, TypedFunc};
@@ -120,22 +120,10 @@ impl Health {
     }
 }
 
-/// The state slots of a live instance, kept current so a rebuild can read
-/// them without reaching into the task that owns them.
-#[derive(Clone, Default)]
-pub struct StateCell(Arc<Mutex<Snapshot>>);
-
-impl StateCell {
-    pub fn snapshot(&self) -> Snapshot {
-        self.0.lock().unwrap().clone()
-    }
-}
-
 /// One compiled system, running.
 pub struct System {
     pub node: Arc<Node>,
     pub health: Health,
-    pub state: StateCell,
 }
 
 /// One input port: where its samples come from, and what the host already has
@@ -160,14 +148,12 @@ impl PortSource {
 
 /// Spawn the task that drives one system.
 ///
-/// `ports` supplies one source per input port, in the manifest's order; `seed`
-/// carries state over from the instance this one replaces.
+/// `ports` supplies one source per input port, in the manifest's order.
 pub fn system(
     compiled: &Arc<Compiled>,
     index: usize,
     ports: Vec<PortSource>,
     fuel: u64,
-    seed: Option<&Snapshot>,
 ) -> Result<System, BuildError> {
     let desc = compiled
         .manifest
@@ -183,22 +169,14 @@ pub fn system(
     }
 
     let mut instance = Running::new(compiled, index, fuel)?;
-    if let Some(seed) = seed {
-        instance.seed(seed);
-    }
-    // A generator that has never run needs a seed nothing else can supply.
-    // Restoring one carries the sequence across an edit; otherwise the clock
-    // and the system's identity make a fresh one, so two systems drawing at
+    // A generator needs a seed nothing else can supply: the clock and the
+    // system's identity make a fresh one, so two systems drawing at
     // once do not draw the same numbers.
     let id = compiled.system_hash(
         index,
         &ports.iter().map(|p| p.node.id()).collect::<Vec<_>>(),
     );
-    if !seed.is_some_and(|s| s.entries.iter().any(|(key, _)| key.field == RNG_FIELD)) {
-        instance.seed_rng(id.0 ^ Timestamp::now().0 as u64);
-    }
-    let state = StateCell::default();
-    *state.0.lock().unwrap() = instance.read_state();
+    instance.seed_rng(id.0 ^ Timestamp::now().0 as u64);
 
     // A source clocks itself; everything else waits on its driving input.
     // Either way one reader supplies the timestamps the loop turns on.
@@ -258,20 +236,15 @@ pub fn system(
         default_ring_bytes(frame_bytes),
         {
             let health = health.clone();
-            let state = state.clone();
             move |output| async move {
                 let _ports = ports;
                 let _clock = clock;
-                run(instance, wired, opening, output, health, state).await;
+                run(instance, wired, opening, output, health).await;
             }
         },
     );
 
-    Ok(System {
-        node,
-        health,
-        state,
-    })
+    Ok(System { node, health })
 }
 
 /// The node id [`field`] will give one output field.
@@ -521,18 +494,10 @@ async fn run(
     opening: Option<(Timestamp, Vec<u8>)>,
     output: Disruptor,
     health: Health,
-    state: StateCell,
 ) {
     // Evaluate the newest saved driving sample before waiting for live input.
     if let Some((ts, value)) = &opening
-        && let Err(why) = evaluate(
-            &mut instance,
-            &mut ports.held,
-            *ts,
-            Some(value),
-            &output,
-            &state,
-        )
+        && let Err(why) = evaluate(&mut instance, &mut ports.held, *ts, Some(value), &output)
     {
         health.park(why);
         parked(ports).await;
@@ -556,7 +521,7 @@ async fn run(
         for at in 0..grant.sample_count() {
             let (ts, value) = grant.sample_at(at);
             let driving = held.driven_port.is_some().then_some(value);
-            if let Err(why) = evaluate(&mut instance, held, ts, driving, &output, &state) {
+            if let Err(why) = evaluate(&mut instance, held, ts, driving, &output) {
                 break 'live why;
             }
         }
@@ -565,18 +530,16 @@ async fn run(
     parked(ports).await;
 }
 
-/// Fire once and publish what came out, keeping the state cell current.
+/// Fire once and publish what came out.
 fn evaluate(
     instance: &mut Running,
     held: &mut Held,
     ts: Timestamp,
     driving: Option<&[u8]>,
     output: &Disruptor,
-    state: &StateCell,
 ) -> Result<(), String> {
     if let Some(frame) = held.fire(instance, ts, driving)? {
         write_sample(output, ts, frame);
-        *state.0.lock().unwrap() = instance.read_state();
     }
     Ok(())
 }
@@ -614,7 +577,6 @@ pub(crate) struct Running {
     ret: u32,
     frame_bytes: usize,
     state: Vec<(metor_expr::state::Slot, u32)>,
-    guard: Option<u32>,
     fuel: u64,
     frame: Vec<u8>,
 }
@@ -663,15 +625,6 @@ impl Running {
             )?;
             state.push((slot, at));
         }
-        let guard = match state.is_empty() {
-            true => None,
-            false => Some(accessor(
-                &mut store,
-                &format!("{}_state_ptr", desc.name),
-                state.len() as i32,
-            )?),
-        };
-
         let eval = instance
             .get_typed_func(&store, &format!("{}_eval", desc.name))
             .map_err(expr_error)?;
@@ -684,7 +637,6 @@ impl Running {
             ret,
             frame_bytes: desc.output.bytes as usize,
             state,
-            guard,
             fuel,
             frame: vec![0; desc.output.bytes as usize],
         })
@@ -704,25 +656,6 @@ impl Running {
             .map_err(|err| format!("could not write input frame: {err}"))
     }
 
-    /// Seed the state slots from a snapshot and mark the instance seeded, so
-    /// the first evaluation does not write its defaults over what arrived.
-    fn seed(&mut self, snapshot: &Snapshot) {
-        let memory = self.memory();
-        for (slot, at) in &self.state {
-            let Some((_, bytes)) = snapshot
-                .entries
-                .iter()
-                .find(|(key, bytes)| *key == slot.key && bytes.len() as u32 == slot.bytes)
-            else {
-                continue;
-            };
-            let _ = memory.write(&mut self.store, *at as usize, bytes);
-        }
-        if let Some(guard) = self.guard {
-            let _ = memory.write(&mut self.store, guard as usize, &1u32.to_le_bytes());
-        }
-    }
-
     /// Write the generator's state word, leaving the seed guard alone.
     ///
     /// The guard may be left alone precisely because this field's declared
@@ -735,18 +668,6 @@ impl Running {
                 let _ = memory.write(&mut self.store, *at as usize, &entropy.to_le_bytes());
             }
         }
-    }
-
-    pub(crate) fn read_state(&mut self) -> Snapshot {
-        let memory = self.memory();
-        let mut entries = Vec::with_capacity(self.state.len());
-        for (slot, at) in &self.state {
-            let mut bytes = vec![0u8; slot.bytes as usize];
-            if memory.read(&self.store, *at as usize, &mut bytes).is_ok() {
-                entries.push((slot.key.clone(), bytes));
-            }
-        }
-        Snapshot { entries }
     }
 
     /// One evaluation under a fresh fuel grant, returning the output frame's

@@ -343,7 +343,7 @@ pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, Exp
                     seed: program::latest_sample(&db, *id),
                 });
             }
-            let system = program::system(&compiled, 0, ports, DEFAULT_FUEL, None)?;
+            let system = program::system(&compiled, 0, ports, DEFAULT_FUEL)?;
             let field = program::field(&compiled, 0, 0, system.node.clone())?;
             let node = publish(&db, &name, field.clone(), &label)?;
             Ok(Expression::new(node, system, field, plan, disposer))
