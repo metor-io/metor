@@ -244,10 +244,10 @@ mod star_tracker_demo {
         const TRUTH: &str = "sim.plant.body.q_b_eci";
         let image = ImageViewConfig {
             component: "sim.star_sim.star_image.pixels".into(),
-            overlays: vec![OverlayConfig::from_root(
-                "sim.star_sim.star_truth",
-                OverlayColor::Truth,
-            )],
+            overlays: vec![
+                OverlayConfig::from_root("sim.star_sim.star_truth", OverlayColor::Truth),
+                OverlayConfig::from_root("sim.star_tracker.star_centroids", OverlayColor::Detected),
+            ],
             ..Default::default()
         };
         let quat: Vec<_> = (0..4)
@@ -280,8 +280,18 @@ mod star_tracker_demo {
                             plot(
                                 "Star tracker",
                                 &[
-                                    ("sim.star.star_solution.n_matched", 0, "n_matched", 1.5),
-                                    ("sim.star.star_solution.n_centroids", 0, "n_centroids", 1.5),
+                                    (
+                                        "sim.star_tracker.star_solution.n_matched",
+                                        0,
+                                        "n_matched",
+                                        1.5,
+                                    ),
+                                    (
+                                        "sim.star_tracker.star_solution.n_centroids",
+                                        0,
+                                        "n_centroids",
+                                        1.5,
+                                    ),
                                     (
                                         "sim.star_sim.star_truth.n_detectable",
                                         0,
