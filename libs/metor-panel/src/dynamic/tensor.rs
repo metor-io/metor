@@ -4,7 +4,7 @@
 //! Values are read as `f64`, which loses precision for `u64`/`i64` above 2^53;
 //! that is plenty for visualization-rate plumbing.
 
-use metor_proto::types::PrimType;
+use metor_proto::types::{ElementValue, PrimType};
 
 /// Typed scalar — the boundary type when an inspector row edits one element
 /// of a component in place. Mirrors `PrimType`.
@@ -40,6 +40,29 @@ impl TypedScalar {
         }
     }
 
+    /// Parse user input as `dtype` exactly, rejecting fractional or
+    /// out-of-range text rather than casting it.
+    pub fn parse(text: &str, dtype: PrimType) -> Option<Self> {
+        let text = text.trim();
+        Some(match dtype {
+            PrimType::U8 => Self::U8(text.parse().ok()?),
+            PrimType::U16 => Self::U16(text.parse().ok()?),
+            PrimType::U32 => Self::U32(text.parse().ok()?),
+            PrimType::U64 => Self::U64(text.parse().ok()?),
+            PrimType::I8 => Self::I8(text.parse().ok()?),
+            PrimType::I16 => Self::I16(text.parse().ok()?),
+            PrimType::I32 => Self::I32(text.parse().ok()?),
+            PrimType::I64 => Self::I64(text.parse().ok()?),
+            PrimType::F32 => Self::F32(text.parse().ok()?),
+            PrimType::F64 => Self::F64(text.parse().ok()?),
+            PrimType::Bool => Self::Bool(match text {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => return None,
+            }),
+        })
+    }
+
     pub fn as_f64(self) -> f64 {
         match self {
             Self::U8(v) => v as f64,
@@ -69,6 +92,24 @@ impl TypedScalar {
             PrimType::Bool => Self::Bool(v != 0.0),
             PrimType::F32 => Self::F32(v as f32),
             PrimType::F64 => Self::F64(v),
+        }
+    }
+}
+
+impl From<TypedScalar> for ElementValue {
+    fn from(value: TypedScalar) -> Self {
+        match value {
+            TypedScalar::U8(v) => Self::U8(v),
+            TypedScalar::U16(v) => Self::U16(v),
+            TypedScalar::U32(v) => Self::U32(v),
+            TypedScalar::U64(v) => Self::U64(v),
+            TypedScalar::I8(v) => Self::I8(v),
+            TypedScalar::I16(v) => Self::I16(v),
+            TypedScalar::I32(v) => Self::I32(v),
+            TypedScalar::I64(v) => Self::I64(v),
+            TypedScalar::Bool(v) => Self::Bool(v),
+            TypedScalar::F32(v) => Self::F32(v),
+            TypedScalar::F64(v) => Self::F64(v),
         }
     }
 }

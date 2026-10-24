@@ -1,7 +1,6 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use gpui::{AnyElement, App, SharedString, Window, prelude::*};
-use metor_proto::types::PrimType;
 
 use super::{InspectorRow, RowAction, value_row};
 use crate::dynamic::tensor::TypedScalar;
@@ -61,27 +60,6 @@ fn format_scalar(value: TypedScalar) -> String {
     }
 }
 
-fn parse_for_dtype(text: &str, dtype: PrimType) -> Option<TypedScalar> {
-    let text = text.trim();
-    Some(match dtype {
-        PrimType::U8 => TypedScalar::U8(text.parse().ok()?),
-        PrimType::U16 => TypedScalar::U16(text.parse().ok()?),
-        PrimType::U32 => TypedScalar::U32(text.parse().ok()?),
-        PrimType::U64 => TypedScalar::U64(text.parse().ok()?),
-        PrimType::I8 => TypedScalar::I8(text.parse().ok()?),
-        PrimType::I16 => TypedScalar::I16(text.parse().ok()?),
-        PrimType::I32 => TypedScalar::I32(text.parse().ok()?),
-        PrimType::I64 => TypedScalar::I64(text.parse().ok()?),
-        PrimType::F32 => TypedScalar::F32(text.parse().ok()?),
-        PrimType::F64 => TypedScalar::F64(text.parse().ok()?),
-        PrimType::Bool => TypedScalar::Bool(match text {
-            "true" | "1" => true,
-            "false" | "0" => false,
-            _ => return None,
-        }),
-    })
-}
-
 impl InspectorRow for ScalarRow {
     fn label(&self) -> &str {
         &self.label
@@ -112,7 +90,7 @@ impl InspectorRow for ScalarRow {
         RowAction::StartEdit {
             current_text: self.format_value(),
             on_commit: Box::new(move |text, window, cx| {
-                if let Some(v) = parse_for_dtype(&text, dtype) {
+                if let Some(v) = TypedScalar::parse(&text, dtype) {
                     *cached.borrow_mut() = v;
                     on_change(v, window, cx);
                 }
@@ -124,6 +102,7 @@ impl InspectorRow for ScalarRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metor_proto::types::PrimType;
 
     #[test]
     fn integers_round_trip_without_float_conversion() {
@@ -133,31 +112,34 @@ mod tests {
             TypedScalar::U64(9_007_199_254_740_993),
             TypedScalar::I8(-128),
         ] {
-            assert_eq!(parse_for_dtype(&format_scalar(v), v.dtype()), Some(v));
+            assert_eq!(TypedScalar::parse(&format_scalar(v), v.dtype()), Some(v));
         }
     }
 
     #[test]
     fn integers_reject_fractional_and_out_of_range_input() {
         for text in ["1.5", "NaN", "inf", "-1", "256"] {
-            assert_eq!(parse_for_dtype(text, PrimType::U8), None);
+            assert_eq!(TypedScalar::parse(text, PrimType::U8), None);
         }
-        assert_eq!(parse_for_dtype("18446744073709551616", PrimType::U64), None);
-        assert_eq!(parse_for_dtype("128", PrimType::I8), None);
+        assert_eq!(
+            TypedScalar::parse("18446744073709551616", PrimType::U64),
+            None
+        );
+        assert_eq!(TypedScalar::parse("128", PrimType::I8), None);
     }
 
     #[test]
     fn floats_and_bools_keep_their_input_forms() {
         assert_eq!(
-            parse_for_dtype("1.5", PrimType::F32),
+            TypedScalar::parse("1.5", PrimType::F32),
             Some(TypedScalar::F32(1.5))
         );
         assert_eq!(
-            parse_for_dtype("true", PrimType::Bool),
+            TypedScalar::parse("true", PrimType::Bool),
             Some(TypedScalar::Bool(true))
         );
         assert_eq!(
-            parse_for_dtype("0", PrimType::Bool),
+            TypedScalar::parse("0", PrimType::Bool),
             Some(TypedScalar::Bool(false))
         );
     }
