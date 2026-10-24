@@ -15,8 +15,8 @@ use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegi
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    AlarmPanel, AnnunciatorPanel, AnnunciatorPanelConfig, BrowserPanel, LogPanel, OutlinePanel,
-    OutlinePanelConfig, PlotPanel, SequenceGridPanel, SequencePanel,
+    AlarmPanel, BrowserPanel, LogPanel, OutlinePanel, OutlinePanelConfig, PlotPanelConfig,
+    SequenceGridPanel, SequencePanel, TraceConfig,
 };
 use crate::tiles::{
     OpenOutlineAction, PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent,
@@ -375,11 +375,22 @@ impl AppRoot {
         let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
             return;
         };
-        let db = self.db.clone();
-        let component_id = action.component_id;
-        let indices = action.indices.clone();
-        let plot = cx.new(|cx| PlotPanel::new(db, component_id, &indices, cx));
-        pane.update(cx, |pane, cx| pane.add_item(Box::new(plot), cx));
+        let indices: &[usize] = if action.indices.is_empty() {
+            &[0]
+        } else {
+            &action.indices
+        };
+        let traces = crate::views::time_series::traces_for_component(
+            &self.db,
+            action.component_id,
+            indices,
+            cx,
+        );
+        let cfg = PlotPanelConfig {
+            traces: traces.iter().map(TraceConfig::from).collect(),
+            ..Default::default()
+        };
+        crate::tiles::panels::add_registered_panel(&pane, "time_series_plot", &cfg, cx);
     }
 
     fn handle_open_outline_action(
@@ -581,7 +592,7 @@ impl Render for AppRoot {
         let mut root = div()
             .id("app-root")
             // Names the root so context-gated keybindings (the leader, which is
-            // bound with `!Inspector && !RowList && !Transient`) have a non-empty
+            // bound with [`NOT_TYPING`]) have a non-empty
             // context stack to evaluate against — gpui's predicate eval returns
             // false for an empty stack, so without this the leader never fires.
             // `PaneZoomed` sits on the root rather than the tile group so the
@@ -1546,6 +1557,11 @@ impl PanelApp {
             cx.global_mut::<crate::tiles::ItemRegistry>()
                 .register_view(spec, db.clone());
         }
+        // Layouts written before the annunciator rename still name it
+        // `traffic_light_grid`; they rehydrate as annunciators and re-save
+        // under the new key.
+        cx.global_mut::<crate::tiles::ItemRegistry>()
+            .alias("traffic_light_grid", "annunciator");
 
         // Connections: seed builder-registered targets, hand the
         // registry to discovery sources, then fire auto-connects.
@@ -1798,10 +1814,6 @@ fn register_connection_commands(cx: &mut App) {
     );
 }
 
-/// Populate the pane-item registry so [`TileGroup::from_json`] can rehydrate
-/// specialized built-in panel kinds. Ordinary registered views are adapted
-/// into this registry immediately afterwards; Dashboard retains its dedicated
-/// deserializer because it is itself a host. The populated registry is a gpui
 /// The key context every host owning an editable field declares beside its own
 /// name, and the reason bare-key shortcuts can exist at all.
 ///
@@ -1821,7 +1833,10 @@ pub const NOT_TYPING: &str = "!TextInput && !Transient";
 /// keeps it only by declaring [`TEXT_INPUT`].
 pub const EXIT_ZOOM: &str = "PaneZoomed && !TextInput && !Transient";
 
-/// Deleting the selected node: only in a node editor, and never while an
+/// Populate the pane-item registry so [`TileGroup::from_json`] can rehydrate
+/// specialized built-in panel kinds. Ordinary registered views are adapted
+/// into this registry immediately afterwards; Dashboard retains its dedicated
+/// deserializer because it is itself a host. The populated registry is a gpui
 /// `Global` so palette callbacks can fetch it without threading.
 fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     use crate::tiles::ItemRegistry as PaneItemRegistry;
@@ -1845,17 +1860,6 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
         });
     }
     register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
-
-    // Layouts written before the annunciator rename still name it
-    // `traffic_light_grid`; the alias rehydrates them and they re-save under
-    // the new key.
-    let db_annunciator = db.clone();
-    reg.register_erased("traffic_light_grid", move |state, cx| {
-        let cfg: AnnunciatorPanelConfig = serde_json::from_str(state).unwrap_or_default();
-        let db = db_annunciator.clone();
-        let entity = cx.new(|cx| AnnunciatorPanel::from_config(cfg, db, cx));
-        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
-    });
 
     // Dashboard's deserializer returns a fully-constructed entity rather
     // than a `Self`, so it doesn't fit the generic helper.
@@ -1952,11 +1956,10 @@ mod keybinding_tests {
         for typing in [
             &["AppRoot", "Dashboard TextInput"][..],
             &["AppRoot", "Inspector TextInput"][..],
-            &["AppRoot", "Inspector TextInput", "RowList TextInput"][..],
             &["AppRoot", "ConnectionPicker TextInput"][..],
             // A field nested under a pane that is not itself a text host: the
             // negation looks at the whole path, not just the leaf.
-            &["AppRoot", "ExecTimeline", "RowList TextInput"][..],
+            &["AppRoot", "ComponentOutline", "FilterBar TextInput"][..],
         ] {
             assert!(
                 !fires(NOT_TYPING, typing),

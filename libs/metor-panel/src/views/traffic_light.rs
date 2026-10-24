@@ -9,7 +9,6 @@ use metor_proto::types::{ComponentId, ElementValue};
 use serde::{Deserialize, Serialize};
 
 use super::binding::{component_meta, spawn_meta_resolver, spawn_on_stream};
-use crate::ComponentStreamBuilder;
 use crate::theme::{Theme, theme, ui_px};
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -52,17 +51,12 @@ pub struct TrafficLight {
 }
 
 impl TrafficLight {
-    pub fn new(
-        db: Arc<DB>,
-        source: impl ComponentStreamBuilder + Send + 'static,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let component_id = source.component_id();
+    pub fn new(db: Arc<DB>, component_id: ComponentId, cx: &mut Context<Self>) -> Self {
         let binding = crate::data_binding::Binding::from_legacy(component_id, None, &db, cx);
         let default_color = theme(cx).control_active;
 
         let meta = component_meta(&db, component_id);
-        let task = spawn_on_stream(db.clone(), source, cx, |this, on, _value, cx| {
+        let task = spawn_on_stream(db.clone(), component_id, cx, |this, on, _value, cx| {
             this.latest_on = on;
             cx.notify();
         });

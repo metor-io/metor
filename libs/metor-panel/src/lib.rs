@@ -13,7 +13,7 @@ use std::mem::size_of;
 
 use metor_db::disruptor::{ReadGrant, Reader};
 use metor_db::{Component, ComponentSchema, DB};
-use metor_proto::types::{ComponentId, ComponentView, Timestamp};
+use metor_proto::types::{ComponentId, Timestamp};
 pub mod alarms;
 pub mod app;
 pub(crate) mod atlas;
@@ -54,145 +54,55 @@ pub use connections::{
 };
 pub use inspector::palette::{Category, InspectionItem, ItemProvider};
 
-/// Borrow as a [`ComponentView`] without copying the backing buffer.
-pub trait AsComponentView {
-    fn as_component_view(&self) -> ComponentView<'_>;
-
-    /// When the sample was taken, for sources that carry it. Staleness is
-    /// judged by this, not by arrival, so a replay and a slow link both read
-    /// true.
-    fn sample_time(&self) -> Option<Timestamp> {
-        None
-    }
-}
-
-impl AsComponentView for ComponentView<'_> {
-    fn as_component_view(&self) -> ComponentView<'_> {
-        *self
-    }
-}
-
-/// Async source of component value updates.
-///
-/// Views borrow from the stream; hold the stream across `.await` points.
-pub trait ComponentStream {
-    type View<'a>: AsComponentView
-    where
-        Self: 'a;
-    fn next(&mut self) -> impl std::future::Future<Output = Self::View<'_>>;
-}
-
-/// Resolves a component (by handle, id, or dynamic node) into a [`ComponentStream`].
-///
-/// The `ComponentId` impl waits for the component to appear in the DB,
-/// letting views subscribe before the producer has registered.
-pub trait ComponentStreamBuilder {
-    type Stream: ComponentStream + Send;
-    fn component_id(&self) -> ComponentId;
-    fn into_stream(self, db: &DB) -> impl std::future::Future<Output = Self::Stream> + Send;
-}
-
-impl ComponentStreamBuilder for Component {
-    type Stream = WalComponentStream;
-
-    fn component_id(&self) -> ComponentId {
-        self.component_id
-    }
-
-    async fn into_stream(self, _db: &DB) -> WalComponentStream {
-        WalComponentStream::new(&self)
-    }
-}
-
-impl ComponentStreamBuilder for ComponentId {
-    type Stream = WalComponentStream;
-
-    fn component_id(&self) -> ComponentId {
-        *self
-    }
-
-    async fn into_stream(self, db: &DB) -> WalComponentStream {
-        let component = wait_for_component(db, self).await;
-        WalComponentStream::new(&component)
-    }
-}
-
 /// Streams the most recent value of a component from its WAL.
 ///
 /// Each `next()` yields a [`WalView`] pointing at the last complete message
-/// in the grant. Earlier messages in the same grant are skipped: views only
+/// in the grant. Earlier messages in the same grant are skipped: readers only
 /// need the latest sample to repaint.
-pub struct WalComponentStream {
+pub(crate) struct WalComponentStream {
     reader: Reader,
     schema: ComponentSchema,
 }
 
 impl WalComponentStream {
-    pub fn new(component: &Component) -> Self {
-        Self::from_disruptor(&component.wal, component.schema.clone())
-    }
-
-    /// Subscribe to any [`Disruptor`] whose messages are framed as
-    /// `[Timestamp][value bytes]`. Used by `dynamic` nodes to expose
-    /// themselves to existing views.
-    pub fn from_disruptor(
-        disruptor: &metor_db::disruptor::Disruptor,
-        schema: ComponentSchema,
-    ) -> Self {
+    pub(crate) fn new(component: &Component) -> Self {
         Self {
-            reader: disruptor.reader(),
-            schema,
+            reader: component.wal.reader(),
+            schema: component.schema.clone(),
         }
     }
-}
 
-/// Borrowed view into the last value of a WAL grant.
-///
-/// The grant is retained so `parse_value` can lazily materialize the
-/// [`ComponentView`] against a buffer that stays alive for `'a`.
-pub struct WalView<'a> {
-    _grant: ReadGrant<'a>,
-    schema: &'a ComponentSchema,
-    offset: usize,
-}
-
-impl WalView<'_> {
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self._grant[self.offset..self.offset + self.schema.size()]
-    }
-}
-
-impl AsComponentView for WalView<'_> {
-    fn as_component_view(&self) -> ComponentView<'_> {
-        let value_buf = &self._grant[self.offset..];
-        let (_size, view) = self
-            .schema
-            .parse_value(value_buf)
-            .expect("invalid WAL data");
-        view
-    }
-
-    /// The `[Timestamp]` framed just ahead of the value.
-    fn sample_time(&self) -> Option<Timestamp> {
-        let start = self.offset - size_of::<Timestamp>();
-        let bytes: [u8; 8] = self._grant[start..self.offset].try_into().ok()?;
-        Some(Timestamp::from_le_bytes(bytes))
-    }
-}
-
-impl ComponentStream for WalComponentStream {
-    type View<'a> = WalView<'a>;
-
-    async fn next(&mut self) -> WalView<'_> {
+    pub(crate) async fn next(&mut self) -> WalView<'_> {
         let msg_size = self.schema.size() + size_of::<Timestamp>();
         let grant = self.reader.next().await;
         let count = (grant.len() / msg_size).max(1);
         let offset = (count - 1) * msg_size + size_of::<Timestamp>();
         WalView {
-            _grant: grant,
-            schema: &self.schema,
+            grant,
+            size: self.schema.size(),
             offset,
         }
+    }
+}
+
+/// Borrowed view into the last value of a WAL grant.
+pub(crate) struct WalView<'a> {
+    grant: ReadGrant<'a>,
+    size: usize,
+    offset: usize,
+}
+
+impl WalView<'_> {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.grant[self.offset..self.offset + self.size]
+    }
+
+    /// The `[Timestamp]` framed just ahead of the value. Staleness is judged
+    /// by this, not by arrival, so a replay and a slow link both read true.
+    pub(crate) fn sample_time(&self) -> Option<Timestamp> {
+        let start = self.offset - size_of::<Timestamp>();
+        let bytes: [u8; 8] = self.grant[start..self.offset].try_into().ok()?;
+        Some(Timestamp::from_le_bytes(bytes))
     }
 }
 

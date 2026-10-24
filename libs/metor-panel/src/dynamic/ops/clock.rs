@@ -38,7 +38,6 @@ pub fn fixed_rate(hz: f64) -> Result<Arc<dyn DynamicNode>, BuildError> {
     let node = NodeImpl::spawn(
         id,
         ValueType::Clock,
-        Some(id), // a clock is its own clock
         default_ring_bytes(0),
         move |output| async move {
             loop {

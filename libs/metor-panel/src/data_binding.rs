@@ -67,9 +67,6 @@ impl Binding {
     pub fn id(&self) -> ComponentId {
         self.id
     }
-    pub fn spec(&self) -> &BindingSpec {
-        &self.spec
-    }
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }

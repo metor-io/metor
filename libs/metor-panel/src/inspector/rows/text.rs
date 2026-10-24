@@ -47,10 +47,6 @@ impl TextRow {
 }
 
 impl InspectorRow for TextRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         &self.label
     }

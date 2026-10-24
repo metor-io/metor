@@ -1,5 +1,4 @@
 //! Shared asynchronous predecessor reads. Views retain leases; the registry is weak.
-use crate::{AsComponentView, ComponentStream};
 use gpui::{App, AppContext, Context, Entity, Global, Subscription, WeakEntity};
 use metor_db::{Component, DB, manifest::SpanState};
 use metor_proto::types::{ComponentId, Timestamp};

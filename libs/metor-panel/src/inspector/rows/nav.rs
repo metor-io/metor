@@ -91,9 +91,6 @@ impl InspectorRow for NavRow {
     fn identity(&self) -> SharedString {
         self.identity.clone().unwrap_or_else(|| self.label.clone())
     }
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
 
     fn accessory(&self, _: &str, cx: &mut App) -> Option<super::AccessorySpec> {
         self.accessory.as_ref().and_then(|build| build(cx))

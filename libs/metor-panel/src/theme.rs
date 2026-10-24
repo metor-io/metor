@@ -190,15 +190,6 @@ impl Theme {
         }
     }
 
-    /// Edge color for a connection awaiting validation in the node editor:
-    /// a faded `text_tertiary`.
-    pub fn edge_pending(&self) -> Hsla {
-        Hsla {
-            a: 0.4,
-            ..self.text_tertiary
-        }
-    }
-
     /// Text of a value cell once its stream has gone quiet — the theme's
     /// blue, so the digits themselves say the reading is old.
     pub fn stale_text(&self) -> Hsla {
@@ -219,12 +210,6 @@ impl Theme {
     /// the calmer of the two edge kinds since frame edges dominate a target.
     pub fn frame_edge_color(&self) -> Hsla {
         self.line_colors[1]
-    }
-
-    /// Tint for a message edge in the system graph — the purple family, set
-    /// apart from the frame-edge blue so the two kinds read at a glance.
-    pub fn msg_edge_color(&self) -> Hsla {
-        self.line_colors[4]
     }
 
     /// Current-position marker on the map view — the orange family, the

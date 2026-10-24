@@ -640,7 +640,7 @@ async fn wait_for_bounds(
 fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui::TestAppContext) {
     use crate::dynamic::ops::{db_source, program};
     use crate::dynamic::worker::DynamicWorker;
-    use crate::views::{AttitudeConfig, ComponentTextConfig, TrafficLightConfig};
+    use crate::views::AttitudeConfig;
     use gpui::AppContext;
     use std::sync::Arc;
 
@@ -696,14 +696,12 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
             Box::new({
                 let db = db.clone();
                 move |cx: &mut gpui::App| {
+                    let binding = crate::data_binding::Binding::from_text(saved, &db, cx);
                     cx.new(|cx| {
-                        crate::tiles::panels::TextPanel::from_config(
-                            ComponentTextConfig {
-                                component: saved.to_string(),
-                            },
-                            db.clone(),
-                            cx,
-                        )
+                        let mut view =
+                            crate::views::ComponentText::new(db.clone(), binding.id(), cx);
+                        view.source = binding;
+                        view
                     })
                     .into_any()
                 }
@@ -714,15 +712,12 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
             Box::new({
                 let db = db.clone();
                 move |cx: &mut gpui::App| {
+                    let binding = crate::data_binding::Binding::from_text(saved, &db, cx);
                     cx.new(|cx| {
-                        crate::tiles::panels::TrafficLightPanel::from_config(
-                            TrafficLightConfig {
-                                component: saved.to_string(),
-                                color: None,
-                            },
-                            db.clone(),
-                            cx,
-                        )
+                        let mut view =
+                            crate::views::TrafficLight::new(db.clone(), binding.id(), cx);
+                        view.source = binding;
+                        view
                     })
                     .into_any()
                 }

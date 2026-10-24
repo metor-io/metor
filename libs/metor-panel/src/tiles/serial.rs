@@ -79,6 +79,14 @@ impl ItemRegistry {
         Arc::make_mut(&mut self.deserializers).insert(key.into(), Arc::new(deserialize));
     }
 
+    /// Rehydrate `old` with whatever `new` is registered as — for keys a
+    /// rename left behind in saved layouts.
+    pub fn alias(&mut self, old: impl Into<String>, new: &str) {
+        if let Some(deserialize) = self.deserializers.get(new).cloned() {
+            Arc::make_mut(&mut self.deserializers).insert(old.into(), deserialize);
+        }
+    }
+
     /// Adapt a cross-host view spec into a tile deserializer. The view's
     /// builder and snapshot callback are exactly the ones Dashboard uses.
     pub fn register_view(&mut self, spec: Arc<crate::views::dashboard::WidgetSpec>, db: Arc<DB>) {

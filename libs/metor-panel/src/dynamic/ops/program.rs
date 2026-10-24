@@ -254,10 +254,6 @@ pub fn system(
     let node = NodeImpl::spawn(
         id,
         ValueType::Value(ComponentSchema::new(PrimType::U8, &[frame_bytes][..])),
-        match &clock {
-            Some(clock) => clock.parent_clock_id(),
-            None => ports[driving].node.parent_clock_id(),
-        },
         default_ring_bytes(frame_bytes),
         {
             let health = health.clone();
@@ -305,7 +301,6 @@ pub fn field(
     Ok(NodeImpl::spawn(
         id,
         ValueType::Value(schema.clone()),
-        frame.parent_clock_id(),
         default_ring_bytes(schema.size()),
         move |output| async move {
             let _frame = frame;

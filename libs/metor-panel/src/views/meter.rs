@@ -94,11 +94,6 @@ pub struct Meter {
     pub color: Hsla,
     pub show_value: bool,
     pub show_limits: bool,
-    /// The name the meter was configured with, kept as the fallback for a
-    /// component that has never registered — [`to_config`](Self::to_config)
-    /// prefers the live name for whatever id is currently bound.
-    #[facet(skip)]
-    component: SharedString,
     /// What `_task` is actually streaming, compared against the editable
     /// fields each frame.
     #[facet(opaque)]
@@ -162,7 +157,6 @@ impl Meter {
             color: cfg.color.unwrap_or_else(|| theme(cx).control_active),
             show_value: !cfg.hide_value,
             show_limits: !cfg.hide_limits,
-            component: SharedString::from(cfg.component.clone()),
             source,
             element,
             bound: Some(at),
@@ -196,7 +190,6 @@ impl Meter {
         let meta = component_meta(&self.db, want.component);
         self.label = default_label(&meta.element_names, element, &meta.name);
         self.unit = meta.unit;
-        self.component = meta.name;
         self.value = None;
         self._task = spawn_scalar_stream(
             self.db.clone(),
@@ -239,10 +232,6 @@ impl Meter {
             hide_value: !self.show_value,
             hide_limits: !self.show_limits,
         }
-    }
-
-    pub fn component(&self) -> &SharedString {
-        &self.component
     }
 }
 

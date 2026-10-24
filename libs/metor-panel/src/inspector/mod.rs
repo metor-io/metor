@@ -23,7 +23,6 @@ pub mod palette;
 pub mod plot_preview;
 pub mod reflect;
 pub mod registry;
-pub mod row_list;
 pub mod rows;
 pub mod trace_picker;
 
@@ -282,9 +281,7 @@ impl Inspector {
         let can_fade = self.dismiss_on_outside_click
             && !matches!(self.mode, InspectorMode::Inline)
             && self.accessory.is_none()
-            && self
-                .current_rows()
-                .is_some_and(|rows| rows.iter().all(|row| row.supports_exit_fade()));
+            && self.current_rows().is_some();
         if !can_fade || !motion::enabled(cx) {
             self.fade.finish();
         }

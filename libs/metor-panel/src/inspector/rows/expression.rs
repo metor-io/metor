@@ -82,10 +82,6 @@ impl ExpressionRow {
 }
 
 impl InspectorRow for ExpressionRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         "Expression"
     }
@@ -244,10 +240,6 @@ struct CandidateRow {
 }
 
 impl InspectorRow for CandidateRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         &self.item.label
     }
@@ -304,10 +296,6 @@ struct Completing {
 }
 
 impl InspectorRow for Completing {
-    fn supports_exit_fade(&self) -> bool {
-        self.row.supports_exit_fade()
-    }
-
     fn label(&self) -> &str {
         self.row.label()
     }
@@ -391,10 +379,6 @@ impl ComputeRow {
 }
 
 impl InspectorRow for ComputeRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         "compute"
     }

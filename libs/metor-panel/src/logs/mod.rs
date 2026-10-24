@@ -13,7 +13,7 @@ use std::sync::Arc;
 use gpui::{App, Context, Entity, Global, Task, prelude::*};
 use metor_db::DB;
 use metor_proto::types::Msg;
-use metor_proto_wkt::{LogEvent, LogLevel};
+use metor_proto_wkt::LogEvent;
 
 use crate::msg_ingest::{IngestSource, ingest_all};
 
@@ -86,12 +86,6 @@ impl LogState {
     }
 }
 
-/// Index of a [`LogLevel`] into level-ordered arrays and the severity color
-/// ramp: trace/debug map below info.
-pub fn level_index(level: LogLevel) -> usize {
-    level as usize
-}
-
 /// The gpui entity wrapping [`LogState`]; owns the in-process ingestion task.
 pub struct LogStore {
     state: LogState,
@@ -140,6 +134,7 @@ impl LogStore {
 mod tests {
     use super::*;
     use metor_proto::types::Timestamp;
+    use metor_proto_wkt::LogLevel;
 
     fn event(source: &str, level: LogLevel, message: &str) -> LogEvent {
         LogEvent {

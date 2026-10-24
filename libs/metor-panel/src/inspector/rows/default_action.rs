@@ -49,10 +49,6 @@ impl DefaultActionRow {
 }
 
 impl InspectorRow for DefaultActionRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         &self.label
     }

@@ -19,8 +19,7 @@ use crate::theme::theme;
 ///
 /// The payload is deliberately minimal — `ComponentId` and element indices —
 /// so the action can implement `PartialEq`. Color, label, and style derive
-/// from theme and metadata inside `PlotPanel::new`, matching the
-/// `TimeSeriesPlot::from_component` path used by the palette wizard.
+/// from theme and metadata via [`crate::views::time_series::traces_for_component`].
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(no_json)]
 pub struct PlotComponentAction {

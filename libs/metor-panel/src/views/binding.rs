@@ -11,8 +11,6 @@ use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType, Tim
 use metor_proto_wkt::Severity;
 use smallvec::SmallVec;
 
-use crate::ComponentStreamBuilder;
-
 pub(crate) enum StreamUpdate<I, V> {
     Ready(I),
     Value(V),
@@ -183,23 +181,21 @@ pub(crate) fn rebound(want: ElementRef, bound: &mut Option<ElementRef>) -> bool 
 }
 
 /// Deliver source initialization, the latest committed value, then updates.
-pub(crate) fn spawn_seeded_stream<E, S, I, V, P, D, A>(
+pub(crate) fn spawn_seeded_stream<E, I, V, P, D, A>(
     db: Arc<DB>,
-    source: S,
+    component_id: ComponentId,
     cx: &mut Context<E>,
     prepare: P,
     apply: A,
 ) -> gpui::Task<()>
 where
     E: 'static,
-    S: ComponentStreamBuilder + Send + 'static,
     I: Send + 'static,
     V: Send + 'static,
     P: FnOnce(&DB, ComponentId) -> (I, D) + Send + 'static,
     D: for<'a> Fn(ComponentView<'a>) -> Option<V> + Send + 'static,
     A: Fn(&mut E, StreamUpdate<I, V>, &mut Context<E>) + Send + 'static,
 {
-    let component_id = source.component_id();
     let reader = crate::temporal::samples::acquire(db.clone(), component_id, cx);
     cx.spawn(async move |this, cx| {
         let component = crate::wait_for_component(&db, component_id).await;
@@ -229,10 +225,10 @@ where
             deliver(view, &reader, cx);
             cx.observe(&reader, move |view, reader, cx| deliver(view, &reader, cx))
         });
-        // The task owns both the source and the shared-reader lease. GPUI observations
+        // The task owns the shared-reader lease. GPUI observations
         // clear cached widget state in the same update cycle as a seek.
         std::future::pending::<()>().await;
-        drop((subscription, reader, source));
+        drop((subscription, reader));
     })
 }
 
@@ -243,7 +239,7 @@ where
 /// The task exits when the entity is dropped (the `update` returns `Err`).
 pub(crate) fn spawn_scalar_stream<E, F>(
     db: Arc<DB>,
-    source: impl ComponentStreamBuilder + Send + 'static,
+    component_id: ComponentId,
     element: usize,
     cx: &mut Context<E>,
     apply: F,
@@ -254,7 +250,7 @@ where
 {
     spawn_seeded_stream(
         db,
-        source,
+        component_id,
         cx,
         move |_, _| {
             ((), move |view: ComponentView<'_>| {
@@ -318,7 +314,7 @@ where
 /// The task exits when the entity is dropped (the `update` returns `Err`).
 pub(crate) fn spawn_on_stream<E, F>(
     db: Arc<DB>,
-    source: impl ComponentStreamBuilder + Send + 'static,
+    component_id: ComponentId,
     cx: &mut Context<E>,
     apply: F,
 ) -> gpui::Task<()>
@@ -328,7 +324,7 @@ where
 {
     spawn_seeded_stream(
         db,
-        source,
+        component_id,
         cx,
         |_, _| {
             ((), |view: ComponentView<'_>| {

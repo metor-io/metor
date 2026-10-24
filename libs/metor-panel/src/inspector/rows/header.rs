@@ -22,10 +22,6 @@ impl HeaderRow {
 }
 
 impl InspectorRow for HeaderRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         &self.text
     }

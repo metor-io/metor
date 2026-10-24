@@ -3,87 +3,27 @@ use std::sync::Arc;
 
 use gpui::{App, Context, Entity, IntoElement, Render, SharedString, Window, div, prelude::*};
 use metor_db::DB;
-use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
+#[cfg(test)]
+use crate::views::AnnunciatorConfig;
 use crate::views::dashboard::DashboardPanel;
-use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
 use crate::views::outline::model::{PivotLayout, type_key};
-use crate::views::time_series::{LinePlot, Override, Trace};
+use crate::views::time_series::Override;
 #[cfg(test)]
 use crate::views::time_series::{PlotStyle, TimeFormat};
-use crate::views::viewer_3d::Viewer3d;
-use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
-    AlarmListMode, AlarmView, Annunciator, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
-    ComponentOutline, ComponentText, Gauge, GaugeConfig, LevelFilter, LogView, Meter, MeterConfig,
-    OutlineColumns, SequenceControl, SequenceControlConfig, SequenceGrid, SequenceView, StateChip,
-    StateChipConfig, TimeSeriesPlot, TrafficLight, new_component_browser,
+    AlarmListMode, AlarmView, AttitudeConfig, ComponentBrowser, ComponentOutline,
+    ComponentTextConfig, GaugeConfig, LevelFilter, LogView, MeterConfig, OutlineColumns,
+    SequenceControlConfig, SequenceGrid, SequenceView, StateChipConfig, TrafficLightConfig,
+    new_component_browser,
 };
 use crate::views::{Col, default_columns};
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
-
-pub use crate::views::ComponentTextConfig as TextPanelConfig;
-
-/// Pane item that renders a single component's latest value as text.
-pub struct TextPanel {
-    inner: Entity<ComponentText>,
-    label: SharedString,
-}
-
-impl TextPanel {
-    pub fn new(
-        db: Arc<DB>,
-        component_id: ComponentId,
-        label: impl Into<SharedString>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let inner = cx.new(|cx| ComponentText::new(db, component_id, cx));
-        Self {
-            inner,
-            label: label.into(),
-        }
-    }
-
-    pub fn from_config(cfg: TextPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let binding = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
-        let panel = Self::new(db, binding.id(), cfg.component, cx);
-        panel.inner.update(cx, |view, _| view.source = binding);
-        panel
-    }
-}
-
-impl Render for TextPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for TextPanel {
-    type Config = TextPanelConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "component_text"
-    }
-
-    fn to_config(&self, cx: &App) -> TextPanelConfig {
-        TextPanelConfig {
-            component: self.inner.read(cx).binding_text(),
-        }
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
-    }
-}
 
 /// Persisted shape of an [`AlarmPanel`]. The panel shows global alarm state, so the
 /// only persisted bit is which tab it opens on.
@@ -324,324 +264,6 @@ impl PaneItem for SequenceGridPanel {
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
         Some(self.inner.clone().into())
-    }
-}
-
-pub use crate::views::TrafficLightConfig as TrafficLightPanelConfig;
-
-/// Pane item rendering one component as a coloured on/off square.
-pub struct TrafficLightPanel {
-    inner: Entity<TrafficLight>,
-    label: SharedString,
-}
-
-impl TrafficLightPanel {
-    pub fn new(
-        db: Arc<DB>,
-        component_id: ComponentId,
-        label: impl Into<SharedString>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let inner = cx.new(|cx| TrafficLight::new(db, component_id, cx));
-        Self {
-            inner,
-            label: label.into(),
-        }
-    }
-
-    pub fn from_config(cfg: TrafficLightPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let binding = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
-        let panel = Self::new(db, binding.id(), cfg.component, cx);
-        panel.inner.update(cx, |view, cx| {
-            view.source = binding;
-            if let Some(color) = cfg.color {
-                view.set_color(color, cx);
-            }
-        });
-        panel
-    }
-}
-
-impl Render for TrafficLightPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for TrafficLightPanel {
-    type Config = TrafficLightPanelConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "traffic_light"
-    }
-
-    fn to_config(&self, cx: &App) -> TrafficLightPanelConfig {
-        self.inner.read(cx).to_config()
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
-    }
-}
-
-/// Pane item rendering one element of a component as a bar meter.
-///
-/// Carries no config of its own — [`MeterConfig`] is shared with the
-/// dashboard widget, so a meter behaves identically on either surface.
-pub struct MeterPanel {
-    inner: Entity<Meter>,
-    label: SharedString,
-}
-
-impl MeterPanel {
-    pub fn from_config(cfg: MeterConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let label = SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
-        let inner = cx.new(|cx| Meter::from_config(&cfg, db, cx));
-        Self { inner, label }
-    }
-}
-
-impl Render for MeterPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for MeterPanel {
-    type Config = MeterConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "meter"
-    }
-
-    fn to_config(&self, cx: &App) -> MeterConfig {
-        self.inner.read(cx).to_config()
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
-    }
-}
-
-/// Pane item rendering one element of a component as a dial.
-pub struct GaugePanel {
-    inner: Entity<Gauge>,
-    label: SharedString,
-}
-
-impl GaugePanel {
-    pub fn from_config(cfg: GaugeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let label = SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
-        let inner = cx.new(|cx| Gauge::from_config(&cfg, db, cx));
-        Self { inner, label }
-    }
-}
-
-impl Render for GaugePanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for GaugePanel {
-    type Config = GaugeConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "gauge"
-    }
-
-    fn to_config(&self, cx: &App) -> GaugeConfig {
-        self.inner.read(cx).to_config()
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
-    }
-}
-
-/// Pane item rendering a component's value as the named discrete state it
-/// means — a bare value strip carrying a state table.
-pub struct StateChipPanel {
-    inner: Entity<StateChip>,
-    label: SharedString,
-}
-
-impl StateChipPanel {
-    pub fn from_config(cfg: StateChipConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let label = SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
-        let inner = cx.new(|cx| StateChip::from_config(&cfg, db, cx));
-        Self { inner, label }
-    }
-}
-
-impl Render for StateChipPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for StateChipPanel {
-    type Config = StateChipConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "state_chip"
-    }
-
-    fn to_config(&self, cx: &App) -> StateChipConfig {
-        self.inner.read(cx).to_config(cx)
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
-    }
-}
-
-/// Pane item rendering a quaternion component as an attitude ball.
-pub struct AttitudePanel {
-    inner: Entity<AttitudeIndicator>,
-    label: SharedString,
-}
-
-impl AttitudePanel {
-    pub fn from_config(cfg: AttitudeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let label = SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
-        let inner = cx.new(|cx| AttitudeIndicator::from_config(&cfg, db, cx));
-        Self { inner, label }
-    }
-}
-
-impl Render for AttitudePanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for AttitudePanel {
-    type Config = AttitudeConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "attitude"
-    }
-
-    fn to_config(&self, cx: &App) -> AttitudeConfig {
-        self.inner.read(cx).to_config(cx)
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
-    }
-}
-
-/// Pane item giving one sequence channel its own start/stop controls.
-pub struct SequenceControlPanel {
-    inner: Entity<SequenceControl>,
-    label: SharedString,
-}
-
-impl SequenceControlPanel {
-    pub fn from_config(cfg: SequenceControlConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let label = SharedString::from(cfg.channel.clone());
-        let inner = cx.new(|cx| SequenceControl::from_config(&cfg, cx));
-        Self { inner, label }
-    }
-}
-
-impl Render for SequenceControlPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for SequenceControlPanel {
-    type Config = SequenceControlConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "sequence_control"
-    }
-
-    fn to_config(&self, cx: &App) -> SequenceControlConfig {
-        self.inner.read(cx).to_config()
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
-    }
-}
-
-pub use crate::views::AnnunciatorConfig as AnnunciatorPanelConfig;
-
-/// Pane item rendering every component matching a glob pattern as an
-/// annunciator tile.
-pub struct AnnunciatorPanel {
-    inner: Entity<Annunciator>,
-    label: SharedString,
-}
-
-impl AnnunciatorPanel {
-    pub fn new(db: Arc<DB>, pattern: SharedString, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| Annunciator::new(db, pattern, cx));
-        Self {
-            inner,
-            label: "Annunciator".into(),
-        }
-    }
-
-    pub fn from_config(cfg: AnnunciatorPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| Annunciator::from_config(cfg, db, cx));
-        Self {
-            inner,
-            label: "Annunciator".into(),
-        }
-    }
-}
-
-impl Render for AnnunciatorPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for AnnunciatorPanel {
-    type Config = AnnunciatorPanelConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "annunciator"
-    }
-
-    fn to_config(&self, cx: &App) -> AnnunciatorPanelConfig {
-        self.inner.read(cx).to_config(cx)
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
     }
 }
 
@@ -973,257 +595,17 @@ impl PaneItem for BrowserPanel {
     }
 }
 
-/// Pane item hosting a time-series plot.
-///
-/// The panel is a thin wrapper around [`TimeSeriesPlot`]; inspection is
-/// routed to the inner [`LinePlot`] so trace configuration shows up in the
-/// property inspector.
-pub struct PlotPanel {
-    inner: Entity<TimeSeriesPlot>,
-    line_plot: Entity<LinePlot>,
-}
-
-impl PlotPanel {
-    /// Build a plot showing the selected elements of a single component.
-    pub fn new(
-        db: Arc<DB>,
-        component_id: ComponentId,
-        elements: &[usize],
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let inner = cx.new(|cx| TimeSeriesPlot::from_component(db, component_id, elements, cx));
-        let line_plot = inner.read(cx).line_plot().clone();
-        Self { inner, line_plot }
-    }
-
-    /// Build a plot with no traces; configure via the trace picker.
-    pub fn empty(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self::with_traces(db, vec![], cx)
-    }
-
-    /// Build a plot seeded with an explicit trace list.
-    pub fn with_traces(db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| TimeSeriesPlot::new(db, traces, cx));
-        let line_plot = inner.read(cx).line_plot().clone();
-        Self { inner, line_plot }
-    }
-}
-
-impl Render for PlotPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
+pub use crate::views::list_plot::{ListPlotPanelConfig, ListTraceConfig};
+pub use crate::views::spectrogram::{SpectrogramPanelConfig, SpectrogramTraceConfig};
 pub use crate::views::time_series::{
     EventOverlayConfig, MeasurementCursorConfig, MeasurementPanelConfig, PlotPanelConfig,
     TraceConfig, YAxisConfig,
 };
-
-impl PlotPanel {
-    pub fn from_config(cfg: PlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| TimeSeriesPlot::from_config(cfg, db, cx));
-        let line_plot = inner.read(cx).line_plot().clone();
-        Self { inner, line_plot }
-    }
-}
-
-impl PaneItem for PlotPanel {
-    type Config = PlotPanelConfig;
-
-    fn tab_title(&self, cx: &App) -> SharedString {
-        self.inner.read(cx).title(cx)
-    }
-
-    fn serialization_key() -> &'static str {
-        "time_series_plot"
-    }
-
-    fn to_config(&self, cx: &App) -> PlotPanelConfig {
-        self.inner.read(cx).to_config(cx)
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.line_plot.clone().into_any())
-    }
-}
-
-/// Pane item hosting an XY (phase / correlation) plot.
-///
-/// Mirrors [`PlotPanel`]: thin wrapper around [`XyPlot`]; inspection
-/// routes to the inner [`XyLinePlot`] so trace configuration shows up in
-/// the property inspector.
-pub struct XyPlotPanel {
-    inner: Entity<XyPlot>,
-    line_plot: Entity<XyLinePlot>,
-}
-
-impl XyPlotPanel {
-    /// Build a plot with no traces; configure via the trace picker.
-    pub fn empty(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self::with_traces(db, vec![], cx)
-    }
-
-    /// Build a plot seeded with an explicit trace list.
-    pub fn with_traces(db: Arc<DB>, traces: Vec<XyTrace>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| XyPlot::new(db, traces, cx));
-        let line_plot = inner.read(cx).line_plot().clone();
-        Self { inner, line_plot }
-    }
-}
-
-impl Render for XyPlotPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
+pub use crate::views::viewer_3d::{CameraConfig, ModelConfig, Viewer3dPanelConfig};
 pub use crate::views::xy_plot::{XyPlotPanelConfig, XyTraceConfig};
 
-impl XyPlotPanel {
-    pub fn from_config(cfg: XyPlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| XyPlot::from_config(cfg, db, cx));
-        let line_plot = inner.read(cx).line_plot().clone();
-        Self { inner, line_plot }
-    }
-}
-
-impl PaneItem for XyPlotPanel {
-    type Config = XyPlotPanelConfig;
-
-    fn tab_title(&self, cx: &App) -> SharedString {
-        self.inner.read(cx).title(cx)
-    }
-
-    fn serialization_key() -> &'static str {
-        "xy_plot"
-    }
-
-    fn to_config(&self, cx: &App) -> XyPlotPanelConfig {
-        self.inner.read(cx).to_config(cx)
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.line_plot.clone().into_any())
-    }
-}
-
-/// Pane item hosting a list plot (index-vs-value of one component's
-/// latest sample). Mirrors [`XyPlotPanel`] in shape; the inner
-/// [`ListLinePlot`] owns trace state and is what the inspector edits.
-pub struct ListPlotPanel {
-    inner: Entity<ListPlot>,
-    line_plot: Entity<ListLinePlot>,
-}
-
-impl ListPlotPanel {
-    pub fn empty(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self::with_traces(db, vec![], cx)
-    }
-
-    pub fn with_traces(db: Arc<DB>, traces: Vec<ListTrace>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| ListPlot::new(db, traces, cx));
-        let line_plot = inner.read(cx).line_plot().clone();
-        Self { inner, line_plot }
-    }
-}
-
-impl Render for ListPlotPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-pub use crate::views::list_plot::{ListPlotPanelConfig, ListTraceConfig};
-pub use crate::views::spectrogram::{SpectrogramPanelConfig, SpectrogramTraceConfig};
-
-impl ListPlotPanel {
-    pub fn from_config(cfg: ListPlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| ListPlot::from_config(cfg, db, cx));
-        let line_plot = inner.read(cx).line_plot().clone();
-        Self { inner, line_plot }
-    }
-}
-
-impl PaneItem for ListPlotPanel {
-    type Config = ListPlotPanelConfig;
-
-    fn tab_title(&self, cx: &App) -> SharedString {
-        self.inner.read(cx).title(cx)
-    }
-
-    fn serialization_key() -> &'static str {
-        "list_plot"
-    }
-
-    fn to_config(&self, cx: &App) -> ListPlotPanelConfig {
-        self.inner.read(cx).to_config(cx)
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.line_plot.clone().into_any())
-    }
-}
-
-pub use crate::views::viewer_3d::{CameraConfig, ModelConfig, Viewer3dPanelConfig};
-
-/// Pane item hosting the Bevy-backed 3D viewer.
-pub struct Viewer3dPanel {
-    inner: Entity<Viewer3d>,
-    label: SharedString,
-}
-
-impl Viewer3dPanel {
-    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| Viewer3d::with_db(db, cx));
-        Self {
-            inner,
-            label: "3D Viewer".into(),
-        }
-    }
-
-    /// Rebuild a [`Viewer3dPanel`] from its persisted config.
-    ///
-    /// Spawns models through the public `add_model` API; bindings get reset
-    /// directly on each [`crate::views::viewer_3d::ModelEntry`] entity so
-    /// the viewer's reconcile pass picks them up on the next observe tick.
-    pub fn from_config(cfg: Viewer3dPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| Viewer3d::from_config(cfg, db, cx));
-        Self {
-            inner,
-            label: "3D Viewer".into(),
-        }
-    }
-}
-
-impl Render for Viewer3dPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for Viewer3dPanel {
-    type Config = Viewer3dPanelConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "viewer_3d"
-    }
-
-    fn to_config(&self, cx: &App) -> Viewer3dPanelConfig {
-        self.inner.read(cx).to_config(cx)
-    }
-
-    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
-    }
-}
-
 /// Construct a registered panel and return its inspectable entity.
-fn add_registered_panel(
+pub(crate) fn add_registered_panel(
     pane: &Entity<Pane>,
     key: &str,
     config: &impl Serialize,
@@ -1476,10 +858,10 @@ fn instrument_panel_rows(menu: &PanelMenu) -> Vec<Box<dyn InspectorRow>> {
     let pane = menu.pane.clone();
     vec![
         menu.component("Component Text", "component_text", |component| {
-            TextPanelConfig { component }
+            ComponentTextConfig { component }
         }),
         menu.component("Traffic Light", "traffic_light", |component| {
-            TrafficLightPanelConfig {
+            TrafficLightConfig {
                 component,
                 color: None,
             }
@@ -1575,7 +957,7 @@ fn utility_panel_rows(menu: &PanelMenu) -> Vec<Box<dyn InspectorRow>> {
 }
 
 /// Single-question wizard for "New Panel → Annunciator": prompts for a glob
-/// pattern, then constructs an [`AnnunciatorPanel`] seeded with that pattern.
+/// pattern, then opens an annunciator seeded with that pattern.
 fn annunciator_pattern_rows(pane: Entity<Pane>) -> Vec<Box<dyn InspectorRow>> {
     vec![crate::views::annunciator::glob_prompt_row(Arc::new(
         move |pattern, _window, cx| {
@@ -1627,11 +1009,11 @@ mod tests {
     /// code path so a missing field in either direction shows up here.
     #[test]
     fn panel_configs_round_trip_through_json() {
-        let text = TextPanelConfig {
+        let text = ComponentTextConfig {
             component: "altitude".into(),
         };
         let s = serde_json::to_string(&text).unwrap();
-        let back: TextPanelConfig = serde_json::from_str(&s).unwrap();
+        let back: ComponentTextConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.component, "altitude");
 
         let plot = PlotPanelConfig {
@@ -1974,7 +1356,7 @@ mod tests {
         assert!(partial.vectors.is_empty());
         assert!(!partial.hide_readout);
 
-        let annunciator = AnnunciatorPanelConfig {
+        let annunciator = AnnunciatorConfig {
             conditions: vec![],
             pattern: "*.healthy".into(),
             color: Some(Hsla::default()),
@@ -1986,7 +1368,7 @@ mod tests {
             columns: 4,
         };
         let s = serde_json::to_string(&annunciator).unwrap();
-        let back: AnnunciatorPanelConfig = serde_json::from_str(&s).unwrap();
+        let back: AnnunciatorConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.pattern, "*.healthy");
         assert_eq!(back.color, Some(Hsla::default()));
         assert_eq!(back.source, crate::views::AnnunciatorSource::Alarms);
@@ -2003,8 +1385,7 @@ mod tests {
     /// lighting on truthy.
     #[test]
     fn a_pre_rename_grid_blob_keeps_its_old_behaviour() {
-        let legacy: AnnunciatorPanelConfig =
-            serde_json::from_str(r#"{"pattern":"*.health"}"#).unwrap();
+        let legacy: AnnunciatorConfig = serde_json::from_str(r#"{"pattern":"*.health"}"#).unwrap();
         assert_eq!(legacy.pattern, "*.health");
         assert_eq!(legacy.color, None);
         assert_eq!(legacy.source, crate::views::AnnunciatorSource::Components);

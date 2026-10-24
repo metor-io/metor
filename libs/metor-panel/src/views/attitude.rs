@@ -90,9 +90,6 @@ pub struct VectorMarker {
     pub source: crate::data_binding::Binding,
     pub label: SharedString,
     pub color: Option<Hsla>,
-    /// Fallback name for a component nothing has registered.
-    #[facet(skip)]
-    component: SharedString,
     /// What `_task` is streaming, compared against `component_id` each frame.
     #[facet(opaque)]
     bound: Option<ComponentId>,
@@ -116,7 +113,6 @@ impl VectorMarker {
             source,
             label: SharedString::from(cfg.label.clone()),
             color: cfg.color,
-            component: SharedString::from(cfg.component.clone()),
             bound: Some(component_id),
             value: None,
             _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
@@ -145,7 +141,6 @@ impl VectorMarker {
         }
         self.bound = Some(self.source.id());
 
-        self.component = component_meta(&self.db, self.source.id()).name;
         self.value = None;
         self._task = spawn_marker_stream(&self.db, self.source.id(), cx);
     }
@@ -158,7 +153,6 @@ impl VectorMarker {
             source: crate::data_binding::Binding::default(),
             label: SharedString::new_static(""),
             color: None,
-            component: SharedString::new_static(""),
             bound: Some(ComponentId(0)),
             value: None,
             _binding_changes: gpui::Task::ready(()),
@@ -189,9 +183,6 @@ pub struct AttitudeIndicator {
     pub label: SharedString,
     pub show_readout: bool,
     pub vectors: Vec<Entity<VectorMarker>>,
-    /// Fallback name for a component nothing has registered.
-    #[facet(skip)]
-    component: SharedString,
     /// What `_task` is streaming, compared against the editable fields.
     #[facet(opaque)]
     bound: Option<ElementRef>,
@@ -244,7 +235,6 @@ impl AttitudeIndicator {
                 .unwrap_or(meta.name),
             show_readout: !cfg.hide_readout,
             vectors,
-            component: SharedString::from(cfg.component.clone()),
             source,
             element_offset: offset,
             bound: Some(ElementRef::new(component_id, offset)),
@@ -271,8 +261,7 @@ impl AttitudeIndicator {
 
         let offset = want.element;
         let meta = component_meta(&self.db, want.component);
-        self.label = meta.name.clone();
-        self.component = meta.name;
+        self.label = meta.name;
         self.quat = None;
         self._task = spawn_quat_stream(&self.db, want.component, offset, cx);
         self._resolver_task =
@@ -294,10 +283,6 @@ impl AttitudeIndicator {
                 .collect(),
             hide_readout: !self.show_readout,
         }
-    }
-
-    pub fn component(&self) -> &SharedString {
-        &self.component
     }
 }
 

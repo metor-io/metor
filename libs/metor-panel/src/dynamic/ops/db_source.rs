@@ -36,7 +36,6 @@ pub fn from_db(db: &DB, component_id: ComponentId) -> Result<Arc<dyn DynamicNode
     Ok(NodeImpl::spawn_with_output(
         id,
         ValueType::Value(schema),
-        Some(id),
         component.wal,
         |_| async {},
     ))

@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
+use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 
 use super::binding::{StreamUpdate, spawn_seeded_stream};
 use super::format::ValueFormatter;
-use crate::ComponentStreamBuilder;
 use crate::theme::{theme, ui_px};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -39,16 +39,11 @@ impl ComponentText {
         self.source.text(&self.db)
     }
 
-    pub fn new(
-        db: Arc<DB>,
-        source: impl ComponentStreamBuilder + Send + 'static,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let binding =
-            crate::data_binding::Binding::from_legacy(source.component_id(), None, &db, cx);
+    pub fn new(db: Arc<DB>, component_id: ComponentId, cx: &mut Context<Self>) -> Self {
+        let binding = crate::data_binding::Binding::from_legacy(component_id, None, &db, cx);
         let task = spawn_seeded_stream(
             db.clone(),
-            source,
+            component_id,
             cx,
             |db, component_id| {
                 let formatter = ValueFormatter::resolve(db, component_id);

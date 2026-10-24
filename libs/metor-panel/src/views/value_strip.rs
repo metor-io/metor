@@ -8,7 +8,6 @@ use metor_db::DB;
 use metor_proto::types::{ComponentId, ElementValue, PrimType};
 use smallvec::SmallVec;
 
-use crate::ComponentStreamBuilder;
 use crate::icons::Icon;
 use crate::inspector::rows::TextField;
 use crate::theme::{Theme, theme, ui_px};
@@ -254,16 +253,14 @@ pub struct ComponentValueStrip {
 impl ComponentValueStrip {
     pub fn new(
         db: Arc<DB>,
-        source: impl ComponentStreamBuilder + Send + 'static,
+        component_id: ComponentId,
         style: StripStyle,
         behavior: StripBehavior,
         cx: &mut Context<Self>,
     ) -> Self {
-        let component_id = source.component_id();
-
         let task = spawn_seeded_stream(
             db.clone(),
-            source,
+            component_id,
             cx,
             |db, component_id| {
                 let metadata = resolve_metadata(db, component_id);
@@ -1100,7 +1097,7 @@ pub(crate) struct ResolvedMetadata {
 ///
 /// An unregistered component yields [`CellKind::Unknown`] so callers can
 /// render a placeholder until the producer connects; the async strip task
-/// re-resolves after `into_stream` awakens.
+/// re-resolves once the component registers.
 pub(crate) fn resolve_metadata(db: &DB, component_id: ComponentId) -> ResolvedMetadata {
     db.with_state(|state| {
         let meta = state.get_component_metadata(component_id);

@@ -7,7 +7,6 @@ use smallvec::SmallVec;
 
 use super::time_series::{LinePlot, Trace};
 use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
-use crate::ComponentStreamBuilder;
 use crate::inspector::edits::{EditRequest, pending_edits, pending_edits_mut};
 use crate::inspector::plot_preview::shift_hover_listener;
 use crate::theme::{theme, ui_px};
@@ -43,29 +42,11 @@ pub struct Monitor {
 }
 
 impl Monitor {
-    /// Bind this monitor to a running `=` expression, taking a share of its
-    /// lifetime and showing the text the operator typed as its name.
-    pub fn bind_expression(
-        &mut self,
-        expression: crate::dynamic::expressions::Expression,
-        label: impl Into<SharedString>,
-    ) {
-        self.name = label.into();
-        let text = crate::dynamic::expressions::binding_text(&self.db, expression.component_id())
-            .unwrap_or_else(|| self.name.to_string());
-        self.source = crate::data_binding::Binding::from_expression(expression, text);
-    }
-
     pub fn binding_text(&self) -> String {
         self.source.text(&self.db)
     }
 
-    pub fn new(
-        db: Arc<DB>,
-        source: impl ComponentStreamBuilder + Send + 'static,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let component_id = source.component_id();
+    pub fn new(db: Arc<DB>, component_id: ComponentId, cx: &mut Context<Self>) -> Self {
         let binding = crate::data_binding::Binding::from_legacy(component_id, None, &db, cx);
         let line_colors = theme(cx).line_colors;
 
@@ -105,7 +86,8 @@ impl Monitor {
             locked: pending_edits(cx).locked,
         };
 
-        let strip = cx.new(|cx| ComponentValueStrip::new(db.clone(), source, style, behavior, cx));
+        let strip =
+            cx.new(|cx| ComponentValueStrip::new(db.clone(), component_id, style, behavior, cx));
 
         // Await component registration, then rebind traces to match its
         // actual element count.

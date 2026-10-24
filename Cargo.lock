@@ -9643,7 +9643,6 @@ dependencies = [
  "postcard-schema",
  "regex",
  "reqwest",
- "rustfft",
  "rustix 1.1.4",
  "serde",
  "serde_json",

@@ -37,10 +37,6 @@ pub struct SliderRow {
 }
 
 impl InspectorRow for SliderRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         &self.label
     }

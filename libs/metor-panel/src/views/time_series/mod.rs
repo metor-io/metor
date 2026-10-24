@@ -1383,7 +1383,7 @@ impl TimeSeriesPlot {
         &self.cursors
     }
 
-    /// Replace the cursor list (used by [`PlotPanel::from_config`] to
+    /// Replace the cursor list (used by [`TimeSeriesPlot::from_config`] to
     /// rehydrate locked cursors after layout deserialization). Each cursor
     /// is observed so the plot repaints when its endpoints or enabled
     /// measurements change.
@@ -1440,25 +1440,6 @@ impl TimeSeriesPlot {
         if self.cursors.len() != len_before {
             cx.notify();
         }
-    }
-
-    /// Convenience constructor: one trace per element, colors cycled from
-    /// the theme's categorical palette, labels derived from element names.
-    /// Empty `indexes` defaults to `[0]` to preserve historic behaviour.
-    pub fn from_component(
-        db: Arc<DB>,
-        component_id: impl Into<ComponentId>,
-        indexes: &[usize],
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let component_id = component_id.into();
-        let indexes = if indexes.is_empty() {
-            &[0usize] as &[usize]
-        } else {
-            indexes
-        };
-        let traces = traces_for_component(&db, component_id, indexes, cx);
-        Self::new(db, traces, cx)
     }
 
     pub fn line_plot(&self) -> &Entity<LinePlot> {

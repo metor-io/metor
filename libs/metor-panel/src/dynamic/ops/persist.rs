@@ -95,13 +95,11 @@ pub fn persist(
     let component = db
         .with_state(|s| s.get_component(component_id).cloned())
         .expect("just inserted");
-    let parent_clock_id = input.parent_clock_id();
     let mut reader = input.subscribe();
     let component_for_task = component.clone();
     Ok(NodeImpl::spawn_with_output(
         id,
         ValueType::Value(schema),
-        parent_clock_id,
         component.wal.clone(),
         move |_output| async move {
             let _input = input;

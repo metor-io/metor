@@ -62,13 +62,6 @@ impl MeasurementKind {
             MeasurementKind::Integral => "Integral",
         }
     }
-
-    /// Kinds whose value is read from the focused trace (vs trace-independent
-    /// like ΔX). Drives whether the cursor inspector cascades a "per trace"
-    /// sub-page or shows a single readout.
-    pub fn applies_to_focused_trace(self) -> bool {
-        !matches!(self, MeasurementKind::DeltaX)
-    }
 }
 
 /// Pull every `(timestamp, value)` pair in `range` for one element of

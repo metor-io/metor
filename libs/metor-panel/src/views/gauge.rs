@@ -99,10 +99,6 @@ pub struct Gauge {
     pub color: Hsla,
     pub show_value: bool,
     pub show_limits: bool,
-    /// Fallback name for a component nothing has registered;
-    /// [`to_config`](Self::to_config) prefers the live name for the bound id.
-    #[facet(skip)]
-    component: SharedString,
     /// What `_task` is actually streaming, compared against the editable
     /// fields each frame.
     #[facet(opaque)]
@@ -166,7 +162,6 @@ impl Gauge {
             color: cfg.color.unwrap_or_else(|| theme(cx).control_active),
             show_value: !cfg.hide_value,
             show_limits: !cfg.hide_limits,
-            component: SharedString::from(cfg.component.clone()),
             source,
             element,
             bound: Some(ElementRef::new(component_id, element)),
@@ -197,7 +192,6 @@ impl Gauge {
         let meta = component_meta(&self.db, want.component);
         self.label = super::meter::default_label(&meta.element_names, element, &meta.name);
         self.unit = meta.unit;
-        self.component = meta.name;
         self.value = None;
         self._task = spawn_scalar_stream(
             self.db.clone(),
@@ -240,10 +234,6 @@ impl Gauge {
             hide_value: !self.show_value,
             hide_limits: !self.show_limits,
         }
-    }
-
-    pub fn component(&self) -> &SharedString {
-        &self.component
     }
 }
 

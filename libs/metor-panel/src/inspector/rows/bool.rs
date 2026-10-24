@@ -60,10 +60,6 @@ impl BoolRow {
 }
 
 impl InspectorRow for BoolRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         &self.label
     }

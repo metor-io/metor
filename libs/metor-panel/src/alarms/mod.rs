@@ -295,8 +295,8 @@ impl AlarmState {
         self.history_pushed
     }
 
-    /// Active alarms, highest severity first then most recently raised. Live-only:
-    /// callers that mean "firing now" (plot tinting) read this, not [`Self::pending_sorted`].
+    /// Active alarms, highest severity first then most recently raised.
+    #[cfg(test)]
     pub fn active_sorted(&self) -> Vec<ActiveAlarm> {
         let mut alarms: Vec<ActiveAlarm> = self.active.values().cloned().collect();
         alarms.sort_by(|a, b| {
@@ -418,6 +418,7 @@ impl AlarmState {
             .is_some_and(|shelf| shelf.until > now)
     }
 
+    #[cfg(test)]
     pub fn is_acked(&self, occurrence: OccurrenceId) -> bool {
         self.acked.contains(&occurrence)
     }

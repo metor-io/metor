@@ -216,11 +216,6 @@ impl DashboardPanel {
         id
     }
 
-    pub fn add_connector(&mut self, connector: Connector, cx: &mut Context<Self>) {
-        self.connectors.push(connector);
-        cx.notify();
-    }
-
     pub fn remove_connector(&mut self, id: ConnectorId, cx: &mut Context<Self>) {
         self.connectors.retain(|c| c.id != id);
         // Dropping the live entry cancels the binding task; leaving it would

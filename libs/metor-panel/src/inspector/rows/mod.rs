@@ -25,7 +25,7 @@ pub mod text;
 pub mod text_field;
 
 pub use bool::BoolRow;
-pub use checkbox::{check_square, checkbox};
+pub use checkbox::checkbox;
 pub use color::ColorRow;
 pub use command::CommandRow;
 pub use default_action::DefaultActionRow;
@@ -39,6 +39,10 @@ pub use text::TextRow;
 pub use text_field::TextField;
 
 /// Contract every row in the inspector satisfies.
+///
+/// A dismissing inspector keeps painting its rows while it fades out, with
+/// [`passive`] set; a row must then omit all input handlers and interactive
+/// children.
 pub trait InspectorRow: 'static {
     /// Persistent companion content belongs to the provider page, outside its row list.
     fn accessory(&self, _query: &str, _cx: &mut App) -> Option<AccessorySpec> {
@@ -69,13 +73,6 @@ pub trait InspectorRow: 'static {
     /// Stable selection key when a live palette rebuilds its rows.
     fn identity(&self) -> SharedString {
         self.label().to_owned().into()
-    }
-
-    /// Opt in to exit rendering under [`passive`]. Such rows must omit all
-    /// input handlers and interactive children when that flag is set.
-    /// Custom rows default to immediate dismissal until they support this.
-    fn supports_exit_fade(&self) -> bool {
-        false
     }
 
     /// Paint the row. `selected` reflects keyboard focus and drives the

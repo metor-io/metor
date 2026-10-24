@@ -23,24 +23,24 @@ The workspace pins `rustc 1.98.0` (`rust-toolchain.toml`). The `facet` family of
 
 ## Architecture
 
-### Data flow: `ComponentStream` → views
+### Data flow: component → views
 
-The central abstraction is `ComponentStream` (`src/lib.rs`), an async iterator that yields borrowed `ComponentView`s. Views never own their data; they hold a stream and re-render when `next()` resolves.
+Views bind a `ComponentId` (resolved from saved text by `data_binding::Binding`) and never own sample data. Scalar and value views subscribe through `views/binding.rs` (`spawn_seeded_stream` and its scalar/on-off wrappers), which waits on `db.vtable_gen` until the component appears — so views can subscribe before the producer registers — then reads through `temporal::samples`.
 
-- `WalComponentStream` subscribes to a component's WAL `Disruptor` (a broadcast ring buffer in `metor-db`). Each grant may contain multiple framed `[Timestamp][value]` messages — `WalView` always points at the *latest* message in the grant; views only need the freshest sample to repaint.
-- `ComponentStreamBuilder` resolves any source (a `Component`, a bare `ComponentId`, or an `Arc<dyn DynamicNode>`) into a `ComponentStream`. The `ComponentId` impl waits on `db.vtable_gen` until the component appears, so views can subscribe before the producer registers.
+- `temporal::samples::acquire` hands out a shared, weakly-registered `SelectedReader` per component: the sample the temporal controller currently selects (live, or the predecessor of a scrub point), as owned bytes.
+- Its live path is `WalComponentStream` (`src/lib.rs`), which subscribes to a component's WAL `Disruptor` (a broadcast ring buffer in `metor-db`). Each grant may contain multiple framed `[Timestamp][value]` messages — `WalView` always points at the *latest* message in the grant; views only need the freshest sample to repaint.
 
 ### Dynamic nodes (`src/dynamic/`)
 
 User-defined components are computed lazily as a graph of producer tasks. Each `DynamicNode` writes `[Timestamp][value]` samples into its own `Disruptor`. Identity is a content hash, so the same program always yields the same `NodeId` — recompiling an unchanged expression reuses the running node instead of starting a second one.
 
-There are no hand-written ops anymore: user computation is metor-expr source, compiled to wasm and run by `ops/program.rs`. The remaining `ops/` modules are infrastructure (`clock`, `db_source`, `persist`, `replay`). Dropping the last `Arc<dyn DynamicNode>` cancels the task. Subscribers either iterate every sample (`NodeReader`, used by downstream derivations) or pull only the latest (`WalComponentStream::from_disruptor`, used by views).
+There are no hand-written ops anymore: user computation is metor-expr source, compiled to wasm and run by `ops/program.rs`. The remaining `ops/` modules are infrastructure (`clock`, `db_source`, `persist`, `replay`). Dropping the last `Arc<dyn DynamicNode>` cancels the task. Downstream program tasks iterate every sample with `NodeReader`; views read the component a node publishes like any other.
 
 `expressions.rs` is the `=` one-liner tier: `bind`/`binding_text` turn saved picker text into a component either way, and a compiled expression publishes into a hidden hash-named component every view reads ordinarily. `resolver.rs` (`DbResolver`) answers the compiler's and the completion engine's name questions from a snapshot of the component tree.
 
 ### Tiles (`src/tiles/`)
 
-The split-pane layout system. `TileGroup` is the root; the tree is a recursive `Pane` / split. `SplitPath` is a `SmallVec<[usize; 4]>` locating a node by member index. Layout serialization is versioned via `SUPPORTED_LAYOUT_VERSION` — bump it lockstep with `TileGroup::serialize` when the document shape changes. `panels.rs` contains the concrete `PaneItem` types (PlotPanel, TablePanel, etc.).
+The split-pane layout system. `TileGroup` is the root; the tree is a recursive `Pane` / split. `SplitPath` is a `SmallVec<[usize; 4]>` locating a node by member index. Layout serialization is versioned via `SUPPORTED_LAYOUT_VERSION` — bump it lockstep with `TileGroup::serialize` when the document shape changes. `panels.rs` holds the few typed `PaneItem`s not yet on the widget registry (alarms, logs, sequences, outline, browser) and the "New Panel" menu.
 
 ### Inspector (`src/inspector/`)
 
@@ -54,11 +54,11 @@ A unified row-list overlay that serves as both command palette (centered) and ri
 
 ### Views (`src/views/`)
 
-Concrete renderers — plots (`time_series`, `xy_plot`, `list_plot`), the component outline (`outline`, a collapsible tree-table with pivots, on the generic `table`), 3D scene (`viewer_3d`, built on Bevy as a render pipeline embedded in gpui via wgpu), traffic lights, value strips, dashboards, etc. They consume `ComponentStream`s and emit `Inspectable` rows.
+Concrete renderers — plots (`time_series`, `xy_plot`, `list_plot`), the component outline (`outline`, a collapsible tree-table with pivots, on the generic `table`), 3D scene (`viewer_3d`, built on Bevy as a render pipeline embedded in gpui via wgpu), traffic lights, value strips, dashboards, etc. They bind components through `views/binding.rs` and emit `Inspectable` rows.
 
 Scalar instruments (`meter`, `gauge`, `attitude`) share `views/binding.rs`, which owns stream seeding, late metadata binding, and reading warn/critical limits out of the alarm store. A new instrument binds through it rather than growing its own copy, and never takes limits as configuration.
 
-Every one of those is registered on **both** surfaces from a single config type: a `PaneItem` in `tiles/panels.rs` plus a `WidgetKind` in `views/dashboard/widgets.rs`. `TrafficLight` is the reference for the pattern.
+Every one of those is registered on **both** surfaces from a single config type: one `WidgetSpec` in `views/dashboard/widgets.rs`, whose `.with_tile(key, …)` makes `ItemRegistry::register_view` serve it as a pane too (a `RegisteredPane`). Don't add a typed `PaneItem` wrapper for it. `TrafficLight` is the reference for the pattern; a renamed key keeps old layouts loading with `ItemRegistry::alias`.
 
 `views/dashboard/connectors.rs` adds schematic lines over the dashboard canvas — anchors resolve against live widget rects each frame, `on_top` picks whether a line paints under the widgets (a pipe) or over them (a callout leader), and `bind` colours a line from telemetry. Line geometry lives in `graph_canvas.rs`, shared with the execution timeline's dependency leaders.
 
