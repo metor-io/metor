@@ -11,7 +11,7 @@ use metor_proto::types::ComponentId;
 use crate::dynamic::ops::program::{self, Compiled, DEFAULT_FUEL};
 use crate::dynamic::ops::replay::ReplayPlan;
 use crate::dynamic::resolver::DbResolver;
-use crate::dynamic::worker::DynamicWorker;
+use crate::dynamic::worker::{DynamicWorker, WorkerHandle};
 use crate::dynamic::{BuildError, DynamicNode, NodeId};
 
 /// The prefix that turns a picker's search field into an expression field.
@@ -143,35 +143,45 @@ impl Expressions {
 pub struct Expression(Arc<ExpressionInner>);
 
 struct ExpressionInner {
-    _node: Arc<dyn DynamicNode>,
     /// The hidden component this expression publishes into. Views bind to
     /// this and take the ordinary path — history, LoD, alarms and all.
     pub component: ComponentId,
-    /// Held for their drop: the system feeding the component, and the field
-    /// node between them.
-    _system: Arc<dyn DynamicNode>,
-    _field: Arc<dyn DynamicNode>,
+    /// Held for their drop: the published node, the system feeding it, and
+    /// the field node between them. Cancelling their tasks is what stops an
+    /// expression.
+    nodes: Vec<Arc<dyn DynamicNode>>,
+    /// Where `nodes` go to be dropped: their tasks may hold timers owned by
+    /// the worker's executor, and cancelling one from the gpui thread can
+    /// deadlock in `maitake`'s `Sleep::drop`.
+    worker: WorkerHandle,
     /// The same wiring, for computing the history the live system never saw.
     plan: ReplayPlan,
+}
+
+impl Drop for ExpressionInner {
+    fn drop(&mut self) {
+        for node in std::mem::take(&mut self.nodes) {
+            self.worker.dispose(node);
+        }
+    }
 }
 
 impl Expression {
     /// Assemble the parts of a running expression.
     ///
-    /// `system` and `field` are held only for their drop — cancelling their
-    /// tasks is what stops an expression — so they are taken here rather than
-    /// exposed as fields nobody should read.
+    /// `system` and `field` are held only for their drop, so they are taken
+    /// here rather than exposed as fields nobody should read.
     pub fn new(
         node: Arc<dyn DynamicNode>,
         system: Arc<dyn DynamicNode>,
         field: Arc<dyn DynamicNode>,
         plan: ReplayPlan,
+        worker: WorkerHandle,
     ) -> Self {
         Expression(Arc::new(ExpressionInner {
-            _node: node,
             component: plan.outputs[0].1,
-            _system: system,
-            _field: field,
+            nodes: vec![node, system, field],
+            worker,
             plan,
         }))
     }
@@ -315,6 +325,7 @@ pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, Exp
         let name = resolved.name.clone();
         let sources = resolved.sources;
         let label = body(text).to_string();
+        let disposer = worker.clone();
         worker.call(move || -> Result<Expression, BuildError> {
             let mut ports = Vec::with_capacity(sources.len());
             for id in &sources {
@@ -326,7 +337,7 @@ pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, Exp
             let system = program::system(&compiled, 0, ports, DEFAULT_FUEL, None)?;
             let field = program::field(&compiled, 0, 0, system.node.clone())?;
             let node = publish(&db, &name, field.clone(), &label)?;
-            Ok(Expression::new(node, system.node, field, plan))
+            Ok(Expression::new(node, system.node, field, plan, disposer))
         })
     };
     let built = built

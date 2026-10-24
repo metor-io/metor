@@ -72,8 +72,6 @@ pub enum BuildError {
         expected: usize,
         got: usize,
     },
-    #[error("a parent node failed to build")]
-    ParentFailed,
     #[error("invalid arg for {op}: {reason}")]
     InvalidArg {
         op: &'static str,

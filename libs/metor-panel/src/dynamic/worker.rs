@@ -8,12 +8,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use gpui::{App, Global};
 
-use crate::dynamic::{BuildError, DynamicNode};
-
-/// A heap-boxed build closure. `Send` so it can cross the channel; `'static`
-/// so it can outlive the call frame.
-pub type BuildClosure =
-    Box<dyn FnOnce() -> Result<Arc<dyn DynamicNode>, BuildError> + Send + 'static>;
+use crate::dynamic::DynamicNode;
 
 /// A unit of work for the worker thread. The reply channel is closed over
 /// rather than carried alongside, which is what lets one channel serve every
@@ -21,10 +16,8 @@ pub type BuildClosure =
 /// cells that watch them, and the thread does not care which.
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-/// Cheap clonable handle to the worker. `rebuild_into` takes one of these
-/// instead of `&DynamicWorker` so the caller can clone it out of `cx`'s
-/// global storage before borrowing other globals (e.g. `DynamicRegistry`)
-/// mutably from the same `cx`.
+/// Cheap clonable handle to the worker, cloned out of `cx`'s globals so it
+/// can travel into a build job and into the expression that job returns.
 #[derive(Clone)]
 pub struct WorkerHandle {
     tx: Sender<Job>,
@@ -54,13 +47,6 @@ impl WorkerHandle {
         reply_rx.recv().ok()
     }
 
-    /// Build one node on the worker thread. Used from gpui main during a
-    /// debounced rebuild.
-    pub fn run(&self, closure: BuildClosure) -> Result<Arc<dyn DynamicNode>, BuildError> {
-        // Worker thread gone — degrade gracefully.
-        self.call(closure).unwrap_or(Err(BuildError::ParentFailed))
-    }
-
     /// Hand `arc` to the worker thread for disposal. Best-effort: if the
     /// worker is gone, we drop locally as a fallback.
     pub fn dispose(&self, arc: Arc<dyn DynamicNode>) {
@@ -76,14 +62,9 @@ pub struct DynamicWorker {
 
 impl Global for DynamicWorker {}
 
-impl Default for DynamicWorker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DynamicWorker {
-    pub fn new() -> Self {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
         Self::with_tasks(crate::background_tasks::BackgroundTasks::default())
     }
 

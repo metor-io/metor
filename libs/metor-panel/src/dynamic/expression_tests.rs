@@ -467,7 +467,15 @@ async fn the_registry_does_not_keep_an_unused_expression_alive() {
             ports: vec![source.clone()],
             outputs: vec![(0, ComponentId::new(&name))],
         };
-        expressions::Expression::new(published, system.node, field, plan)
+        expressions::Expression::new(
+            published,
+            system.node,
+            field,
+            plan,
+            crate::dynamic::worker::DynamicWorker::new()
+                .handle()
+                .clone(),
+        )
     };
     registry.insert(expression.clone());
     assert!(registry.is_live(ComponentId::new(&name)));
