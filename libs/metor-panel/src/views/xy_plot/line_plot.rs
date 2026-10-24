@@ -352,17 +352,9 @@ impl XyLinePlot {
                     break;
                 }
                 // Either axis can hydrate first or receive data independently.
-                let mut x_wait = std::pin::pin!(x_component.time_series.wait());
-                let mut y_wait = std::pin::pin!(y_component.time_series.wait());
-                std::future::poll_fn(|cx| {
-                    use std::future::Future;
-                    if x_wait.as_mut().poll(cx).is_ready() || y_wait.as_mut().poll(cx).is_ready() {
-                        std::task::Poll::Ready(())
-                    } else {
-                        std::task::Poll::Pending
-                    }
-                })
-                .await;
+                let x_wait = std::pin::pin!(x_component.time_series.wait());
+                let y_wait = std::pin::pin!(y_component.time_series.wait());
+                crate::first_ready(&mut [x_wait, y_wait]).await;
             }
         })
     }
