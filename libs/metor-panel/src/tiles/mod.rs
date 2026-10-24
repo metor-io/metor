@@ -602,7 +602,7 @@ impl TileGroup {
     pub fn focus_or_open(
         &mut self,
         kind: &str,
-        make: impl FnOnce(&mut Context<Pane>) -> Box<dyn PaneItemHandle>,
+        make: impl FnOnce(&mut Context<Pane>) -> Option<Box<dyn PaneItemHandle>>,
         cx: &mut Context<Self>,
     ) {
         let existing = self.panes.iter().find_map(|pane| {
@@ -624,8 +624,9 @@ impl TileGroup {
             None => {
                 if let Some(pane) = self.active_pane(cx) {
                     pane.update(cx, |pane, cx| {
-                        let item = make(cx);
-                        pane.add_item(item, cx);
+                        if let Some(item) = make(cx) {
+                            pane.add_item(item, cx);
+                        }
                     });
                 }
             }

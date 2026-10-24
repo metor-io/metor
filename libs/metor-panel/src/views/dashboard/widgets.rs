@@ -7,52 +7,36 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    AnyView, App, Context, Corners, Entity, IntoElement, Render, RenderImage, SharedString, Window,
-    canvas, div, prelude::*,
+    AnyEntity, AnyView, App, Context, Corners, Entity, IntoElement, Render, RenderImage,
+    SharedString, Window, canvas, div, prelude::*,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::theme::{theme, ui_px};
-use crate::tiles::panels::{OutlinePanelConfig, apply_outline_config, outline_config};
-use crate::views::time_series::{PlotPanelConfig, TimeSeriesPlot};
-use crate::views::viewer_3d::{Viewer3d, Viewer3dPanelConfig};
-use crate::views::{
-    Annunciator, AttitudeConfig, AttitudeIndicator, ComponentOutline, ComponentText, Gauge,
-    GaugeConfig, Meter, MeterConfig, Monitor, SequenceControl, SequenceControlConfig, StateChip,
-    StateChipConfig, TrafficLight,
+use crate::tiles::panels::{
+    OutlinePanelConfig, alarm_config, alarm_view, browser_config, browser_view, log_config,
+    log_view, outline_config, outline_view, sequence_config, sequence_view,
 };
-use crate::views::{ExecTimeline, ExecTimelineConfig, Spectrogram, SpectrogramPanelConfig};
-use crate::views::{ListPlot, ListPlotPanelConfig, XyPlot, XyPlotPanelConfig};
-use crate::views::{Map, SamplesTable};
+use crate::views::viewer_3d::Viewer3d;
+use crate::views::{
+    Annunciator, AnnunciatorConfig, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
+    ComponentOutline, ComponentText, ComponentTextConfig, ExecTimeline, Gauge, GaugeConfig,
+    ListPlot, Map, MapConfig, Meter, MeterConfig, Monitor, MonitorConfig, SamplesTable,
+    SamplesTableConfig, SequenceControl, SequenceControlConfig, SequenceGrid, Spectrogram,
+    StateChip, StateChipConfig, TimeSeriesPlot, Timeline, TrafficLight, TrafficLightConfig, XyPlot,
+};
 
-use super::{DashboardPanel, DashboardWidget, WidgetKind};
-
-/// Arbitrary setup UI for adding a registered view to a dashboard.
-pub type WidgetAddFlow = Arc<
-    dyn Fn(
-        Entity<DashboardPanel>,
-        Arc<DB>,
-        &App,
-    ) -> Vec<Box<dyn crate::inspector::rows::InspectorRow>>,
->;
-
-pub type TileAddFlow = Arc<
-    dyn Fn(
-        Entity<crate::tiles::Pane>,
-        Arc<DB>,
-        &App,
-    ) -> Vec<Box<dyn crate::inspector::rows::InspectorRow>>,
->;
+use super::{DashboardWidget, WidgetKind};
 
 /// Tile-host metadata for a registered view kind.
 #[derive(Clone)]
 pub struct TileViewSpec {
     pub serialization_key: SharedString,
-    pub tab_title: Arc<dyn Fn(&gpui::AnyEntity, &str, &App) -> SharedString>,
-    pub add_flow: Option<(SharedString, TileAddFlow)>,
+    pub tab_title: Arc<dyn Fn(&AnyEntity, &str, &App) -> SharedString>,
 }
 
 /// Everything the dashboard needs to create and label one [`WidgetKind`].
@@ -69,8 +53,7 @@ pub struct WidgetSpec {
     pub build: Arc<dyn Fn(&str, &Arc<DB>, &mut App) -> WidgetLive>,
     /// Snapshot mutable state from the entity returned by `build`. Returning
     /// `None` keeps the last persisted blob verbatim.
-    pub snapshot: Arc<dyn Fn(&gpui::AnyEntity, &str, &App) -> Option<String>>,
-    pub add_flow: Option<(SharedString, WidgetAddFlow)>,
+    pub snapshot: Arc<dyn Fn(&AnyEntity, &str, &App) -> Option<String>>,
     pub tile: Option<TileViewSpec>,
 }
 
@@ -81,8 +64,8 @@ pub struct WidgetSpec {
 #[derive(Clone)]
 pub struct WidgetLive {
     pub view: AnyView,
-    pub inspect: gpui::AnyEntity,
-    pub state: gpui::AnyEntity,
+    pub inspect: AnyEntity,
+    pub state: AnyEntity,
 }
 
 impl WidgetSpec {
@@ -93,7 +76,7 @@ impl WidgetSpec {
         default_size: (f32, f32),
         label: impl Fn(&DashboardWidget) -> SharedString + 'static,
         build: impl Fn(&str, &Arc<DB>, &mut App) -> WidgetLive + 'static,
-        snapshot: impl Fn(&gpui::AnyEntity, &str, &App) -> Option<String> + 'static,
+        snapshot: impl Fn(&AnyEntity, &str, &App) -> Option<String> + 'static,
     ) -> Self {
         Self {
             default_size,
@@ -101,9 +84,35 @@ impl WidgetSpec {
             label: Arc::new(label),
             build: Arc::new(build),
             snapshot: Arc::new(snapshot),
-            add_flow: None,
             tile: None,
         }
+    }
+
+    /// A view kind whose whole persisted state is one serde config: the blob
+    /// parses (falling back to `Default`, so a stale file still opens) into
+    /// `from_config`, and saving re-serializes `to_config` of the live view.
+    pub fn typed<T, C>(
+        default_size: (f32, f32),
+        label: impl Fn(&DashboardWidget) -> SharedString + 'static,
+        from_config: impl Fn(C, Arc<DB>, &mut Context<T>) -> T + 'static,
+        to_config: impl Fn(&T, &App) -> C + 'static,
+    ) -> Self
+    where
+        T: Render,
+        C: Serialize + DeserializeOwned + Default,
+    {
+        Self::new(
+            default_size,
+            label,
+            move |blob, db, cx| {
+                let cfg = parse_or_default::<C>(blob);
+                as_live(cx.new(|cx| from_config(cfg, db.clone(), cx)))
+            },
+            move |state, _, cx| {
+                let view = state.clone().downcast::<T>().ok()?;
+                serde_json::to_string(&to_config(view.read(cx), cx)).ok()
+            },
+        )
     }
 
     /// Set the smallest usable content size for dashboard resizing.
@@ -112,20 +121,18 @@ impl WidgetSpec {
         self
     }
 
-    /// Attach the picker or setup rows used by the Dashboard's “Add Widget”
-    /// menu. The callback is deliberately open-ended so library views are not
-    /// constrained to a closed set of setup workflows.
-    pub fn with_add_flow(
-        mut self,
-        label: impl Into<SharedString>,
-        add_flow: impl Fn(
-            Entity<DashboardPanel>,
-            Arc<DB>,
-            &App,
-        ) -> Vec<Box<dyn crate::inspector::rows::InspectorRow>>
-        + 'static,
-    ) -> Self {
-        self.add_flow = Some((label.into(), Arc::new(add_flow)));
+    /// Hand the inspector an inner entity instead of the view itself. The
+    /// plots paint through a wrapper but keep their traces on an inner model,
+    /// and that model is what has the reflection adapters.
+    pub fn inspecting<T: 'static>(mut self, inner: impl Fn(&T) -> AnyEntity + 'static) -> Self {
+        let build = self.build.clone();
+        self.build = Arc::new(move |blob, db, cx| {
+            let mut live = build(blob, db, cx);
+            if let Ok(state) = live.state.clone().downcast::<T>() {
+                live.inspect = inner(state.read(cx));
+            }
+            live
+        });
         self
     }
 
@@ -138,40 +145,28 @@ impl WidgetSpec {
         self.tile = Some(TileViewSpec {
             serialization_key: serialization_key.into(),
             tab_title: Arc::new(move |_state, config, _cx| tab_title(config)),
-            add_flow: None,
         });
         self
     }
 
-    /// Derive the tab title from the live state entity when edits should be
-    /// reflected immediately in the tab bar.
-    pub fn with_live_tile_title(
+    /// Derive the tab title from the live view when edits should be
+    /// reflected immediately in the tab bar. The config-derived title from
+    /// [`WidgetSpec::with_tile`] remains the fallback for a foreign state.
+    pub fn with_live_tile_title<T: 'static>(
         mut self,
-        tab_title: impl Fn(&gpui::AnyEntity, &str, &App) -> SharedString + 'static,
-    ) -> Self {
-        self.tile
-            .as_mut()
-            .expect("with_tile must be called before with_live_tile_title")
-            .tab_title = Arc::new(tab_title);
-        self
-    }
-
-    /// Attach arbitrary tile-side setup UI to this registered view.
-    pub fn with_tile_add_flow(
-        mut self,
-        label: impl Into<SharedString>,
-        add_flow: impl Fn(
-            Entity<crate::tiles::Pane>,
-            Arc<DB>,
-            &App,
-        ) -> Vec<Box<dyn crate::inspector::rows::InspectorRow>>
-        + 'static,
+        tab_title: impl Fn(&T, &App) -> SharedString + 'static,
     ) -> Self {
         let tile = self
             .tile
             .as_mut()
-            .expect("with_tile must be called before with_tile_add_flow");
-        tile.add_flow = Some((label.into(), Arc::new(add_flow)));
+            .expect("with_tile must be called before with_live_tile_title");
+        let fallback = tile.tab_title.clone();
+        tile.tab_title = Arc::new(
+            move |state, config, cx| match state.clone().downcast::<T>() {
+                Ok(view) => tab_title(view.read(cx), cx),
+                Err(_) => fallback(state, config, cx),
+            },
+        );
         self
     }
 }
@@ -204,16 +199,6 @@ impl WidgetRegistry {
         self.specs.get(kind).cloned()
     }
 
-    pub fn add_flows(&self) -> Vec<(SharedString, WidgetAddFlow)> {
-        let mut flows: Vec<_> = self
-            .specs
-            .values()
-            .filter_map(|spec| spec.add_flow.clone())
-            .collect();
-        flows.sort_by(|a, b| a.0.cmp(&b.0));
-        flows
-    }
-
     pub fn tile_specs(&self) -> Vec<Arc<WidgetSpec>> {
         self.specs
             .values()
@@ -222,151 +207,121 @@ impl WidgetRegistry {
             .collect()
     }
 
-    pub fn tile_add_flows(&self) -> Vec<(SharedString, TileAddFlow)> {
-        let mut flows: Vec<_> = self
-            .specs
-            .values()
-            .filter_map(|spec| spec.tile.as_ref()?.add_flow.clone())
-            .collect();
-        flows.sort_by(|a, b| a.0.cmp(&b.0));
-        flows
-    }
-
     fn register_defaults(&mut self) {
         self.register(
             WidgetKind::plot(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (400.0, 250.0),
-                |w| SharedString::from(format!("Plot #{}", w.id.0)),
-                build_plot,
-                snapshot_plot,
+                |w| numbered("Plot", w),
+                TimeSeriesPlot::from_config,
+                TimeSeriesPlot::to_config,
             )
+            .inspecting(|plot: &TimeSeriesPlot| plot.line_plot().clone().into_any())
             .with_tile("time_series_plot", |_| "Plot".into())
-            .with_live_tile_title(|state, _, cx| {
-                state
-                    .clone()
-                    .downcast::<TimeSeriesPlot>()
-                    .map(|plot| plot.read(cx).title(cx))
-                    .unwrap_or_else(|_| "Plot".into())
-            }),
+            .with_live_tile_title(TimeSeriesPlot::title),
         );
         self.register(
             WidgetKind::text(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (160.0, 60.0),
                 |w| {
-                    let cfg = parse_or_default::<TextWidgetConfig>(&w.config);
-                    SharedString::from(format!("Text: {}", display_or_unknown(&cfg.component)))
+                    let cfg = parse_or_default::<ComponentTextConfig>(&w.config);
+                    subject("Text", &cfg.component)
                 },
-                build_text,
-                snapshot_text,
+                ComponentText::from_config,
+                |text, _| text.to_config(),
             )
             .with_tile("component_text", |blob| {
-                parse_or_default::<TextWidgetConfig>(blob).component.into()
+                parse_or_default::<ComponentTextConfig>(blob)
+                    .component
+                    .into()
             }),
         );
         self.register(
             WidgetKind::new("xy_plot"),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (400.0, 300.0),
-                |w| SharedString::from(format!("XY Plot #{}", w.id.0)),
-                build_xy_plot,
-                snapshot_xy_plot,
+                |w| numbered("XY Plot", w),
+                XyPlot::from_config,
+                XyPlot::to_config,
             )
+            .inspecting(|plot: &XyPlot| plot.line_plot().clone().into_any())
             .with_tile("xy_plot", |_| "XY Plot".into())
-            .with_live_tile_title(|state, _, cx| {
-                state
-                    .clone()
-                    .downcast::<XyPlot>()
-                    .map(|plot| plot.read(cx).title(cx))
-                    .unwrap_or_else(|_| "XY Plot".into())
-            }),
+            .with_live_tile_title(XyPlot::title),
         );
         self.register(
             WidgetKind::new("list_plot"),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (400.0, 300.0),
-                |w| SharedString::from(format!("List Plot #{}", w.id.0)),
-                build_list_plot,
-                snapshot_list_plot,
+                |w| numbered("List Plot", w),
+                ListPlot::from_config,
+                ListPlot::to_config,
             )
+            .inspecting(|plot: &ListPlot| plot.line_plot().clone().into_any())
             .with_tile("list_plot", |_| "List Plot".into())
-            .with_live_tile_title(|state, _, cx| {
-                state
-                    .clone()
-                    .downcast::<ListPlot>()
-                    .map(|plot| plot.read(cx).title(cx))
-                    .unwrap_or_else(|_| "List Plot".into())
-            }),
+            .with_live_tile_title(ListPlot::title),
         );
         self.register(
             WidgetKind::new("spectrogram"),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (480.0, 300.0),
-                |w| SharedString::from(format!("Spectrogram #{}", w.id.0)),
-                build_spectrogram,
-                snapshot_spectrogram,
+                |w| numbered("Spectrogram", w),
+                Spectrogram::from_config,
+                Spectrogram::to_config,
             )
+            .inspecting(|plot: &Spectrogram| plot.plot().clone().into_any())
             .with_tile("spectrogram", |_| "Spectrogram".into())
-            .with_live_tile_title(|state, _, cx| {
-                state
-                    .clone()
-                    .downcast::<Spectrogram>()
-                    .map(|plot| plot.read(cx).title(cx))
-                    .unwrap_or_else(|_| "Spectrogram".into())
-            }),
+            .with_live_tile_title(Spectrogram::title),
         );
         self.register(
             WidgetKind::new("timeline"),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (520.0, 112.0),
                 |_| "Timeline".into(),
-                |config, db, cx| {
-                    let config = parse_or_default::<crate::views::TimelineConfig>(config);
-                    as_live(
-                        cx.new(|cx| crate::views::Timeline::from_config(config, db.clone(), cx)),
-                    )
-                },
-                |entity, _, cx| {
-                    let entity = entity.clone().downcast::<crate::views::Timeline>().ok()?;
-                    serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
-                },
+                Timeline::from_config,
+                Timeline::to_config,
             )
             .with_minimum_size((80.0, 31.0))
             .with_tile("timeline", |_| "Timeline".into()),
         );
         self.register(
             WidgetKind::new("exec_timeline"),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (520.0, 260.0),
-                |w| SharedString::from(format!("Execution Timeline #{}", w.id.0)),
-                build_exec_timeline,
-                snapshot_exec_timeline,
+                |w| numbered("Execution Timeline", w),
+                ExecTimeline::from_config,
+                ExecTimeline::to_config,
             )
             .with_tile("exec_timeline", |_| "Execution".into())
-            .with_live_tile_title(|state, _, cx| {
-                state
-                    .clone()
-                    .downcast::<ExecTimeline>()
-                    .map(|timeline| timeline.read(cx).title(cx))
-                    .unwrap_or_else(|_| "Execution".into())
-            }),
+            .with_live_tile_title(ExecTimeline::title),
         );
+        // The outline replaced the component and data tables, so its
+        // dashboard kind keeps the `table` id saved dashboards use.
         self.register(
             WidgetKind::table(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (400.0, 300.0),
                 |w| {
                     let cfg = parse_or_default::<OutlinePanelConfig>(&w.config);
                     if cfg.root.is_empty() {
-                        SharedString::from(format!("Outline #{}", w.id.0))
+                        numbered("Outline", w)
                     } else {
                         SharedString::from(format!("Outline: {}", cfg.root))
                     }
                 },
-                build_table,
-                snapshot_table,
-            ),
+                outline_view,
+                outline_config,
+            )
+            .with_tile("component_outline", |_| "Outline".into())
+            .with_live_tile_title(|outline: &ComponentOutline, cx| {
+                // A rooted outline is named for its root's last segment, so a
+                // pane of them reads `wheels | power | Outline`.
+                let root = outline.root(cx);
+                match root.rsplit('.').next() {
+                    Some(last) if !last.is_empty() => SharedString::from(last.to_string()),
+                    _ => SharedString::new_static("Outline"),
+                }
+            }),
         );
         self.register(
             WidgetKind::image(),
@@ -374,50 +329,50 @@ impl WidgetRegistry {
                 (300.0, 200.0),
                 |w| {
                     let cfg = parse_or_default::<ImageWidgetConfig>(&w.config);
-                    SharedString::from(format!("Image: {}", display_or_unknown(&cfg.path)))
+                    subject("Image", &cfg.path)
                 },
-                build_image,
+                |config, _db, cx| {
+                    let cfg = parse_or_default::<ImageWidgetConfig>(config);
+                    as_live(cx.new(|_cx| ImageWidget::load(&cfg)))
+                },
                 no_snapshot,
             ),
         );
         self.register(
             WidgetKind::monitor(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (300.0, 160.0),
                 |w| {
-                    let cfg = parse_or_default::<MonitorWidgetConfig>(&w.config);
-                    SharedString::from(format!("Monitor: {}", display_or_unknown(&cfg.component)))
+                    let cfg = parse_or_default::<MonitorConfig>(&w.config);
+                    subject("Monitor", &cfg.component)
                 },
-                build_monitor,
-                snapshot_monitor,
+                Monitor::from_config,
+                |monitor, _| monitor.to_config(),
             ),
         );
         self.register(
             WidgetKind::viewer3d(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (480.0, 320.0),
-                |w| SharedString::from(format!("3D Viewer #{}", w.id.0)),
-                build_viewer3d,
-                snapshot_viewer3d,
+                |w| numbered("3D Viewer", w),
+                Viewer3d::from_config,
+                Viewer3d::to_config,
             )
             .with_tile("viewer_3d", |_| "3D Viewer".into()),
         );
         self.register(
             WidgetKind::traffic_light(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (120.0, 120.0),
                 |w| {
-                    let cfg = parse_or_default::<TrafficLightWidgetConfig>(&w.config);
-                    SharedString::from(format!(
-                        "Traffic Light: {}",
-                        display_or_unknown(&cfg.component)
-                    ))
+                    let cfg = parse_or_default::<TrafficLightConfig>(&w.config);
+                    subject("Traffic Light", &cfg.component)
                 },
-                build_traffic_light,
-                snapshot_traffic_light,
+                TrafficLight::from_config,
+                |light, _| light.to_config(),
             )
             .with_tile("traffic_light", |blob| {
-                parse_or_default::<TrafficLightWidgetConfig>(blob)
+                parse_or_default::<TrafficLightConfig>(blob)
                     .component
                     .into()
             }),
@@ -425,19 +380,14 @@ impl WidgetRegistry {
         // Registered under both kinds: `traffic_light_grid` is the pre-rename
         // on-disk id, and a saved dashboard keeps naming it that.
         let annunciator = Arc::new(
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (360.0, 200.0),
                 |w| {
-                    let cfg = parse_or_default::<AnnunciatorWidgetConfig>(&w.config);
-                    let label = if cfg.pattern.is_empty() {
-                        "?".to_string()
-                    } else {
-                        cfg.pattern
-                    };
-                    SharedString::from(format!("Annunciator: {}", label))
+                    let cfg = parse_or_default::<AnnunciatorConfig>(&w.config);
+                    subject("Annunciator", &cfg.pattern)
                 },
-                build_annunciator,
-                snapshot_annunciator,
+                Annunciator::from_config,
+                Annunciator::to_config,
             )
             .with_tile("annunciator", |_| "Annunciator".into()),
         );
@@ -445,15 +395,14 @@ impl WidgetRegistry {
         self.register_shared(WidgetKind::traffic_light_grid(), annunciator);
         self.register(
             WidgetKind::meter(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (90.0, 200.0),
                 |w| {
                     let cfg = parse_or_default::<MeterConfig>(&w.config);
-                    let name = cfg.label.unwrap_or(cfg.component);
-                    SharedString::from(format!("Meter: {}", display_or_unknown(&name)))
+                    subject("Meter", &cfg.label.unwrap_or(cfg.component))
                 },
-                build_meter,
-                snapshot_typed::<Meter>,
+                |cfg, db, cx| Meter::from_config(&cfg, db, cx),
+                |meter, _| meter.to_config(),
             )
             .with_tile("meter", |blob| {
                 let cfg = parse_or_default::<MeterConfig>(blob);
@@ -462,15 +411,14 @@ impl WidgetRegistry {
         );
         self.register(
             WidgetKind::gauge(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (160.0, 140.0),
                 |w| {
                     let cfg = parse_or_default::<GaugeConfig>(&w.config);
-                    let name = cfg.label.unwrap_or(cfg.component);
-                    SharedString::from(format!("Gauge: {}", display_or_unknown(&name)))
+                    subject("Gauge", &cfg.label.unwrap_or(cfg.component))
                 },
-                build_gauge,
-                snapshot_typed::<Gauge>,
+                |cfg, db, cx| Gauge::from_config(&cfg, db, cx),
+                |gauge, _| gauge.to_config(),
             )
             .with_tile("gauge", |blob| {
                 let cfg = parse_or_default::<GaugeConfig>(blob);
@@ -479,15 +427,14 @@ impl WidgetRegistry {
         );
         self.register(
             WidgetKind::state_chip(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (150.0, 60.0),
                 |w| {
                     let cfg = parse_or_default::<StateChipConfig>(&w.config);
-                    let name = cfg.label.unwrap_or(cfg.component);
-                    SharedString::from(format!("State: {}", display_or_unknown(&name)))
+                    subject("State", &cfg.label.unwrap_or(cfg.component))
                 },
-                build_state_chip,
-                snapshot_state_chip,
+                |cfg, db, cx| StateChip::from_config(&cfg, db, cx),
+                StateChip::to_config,
             )
             .with_tile("state_chip", |blob| {
                 let cfg = parse_or_default::<StateChipConfig>(blob);
@@ -496,14 +443,14 @@ impl WidgetRegistry {
         );
         self.register(
             WidgetKind::sequence_control(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (260.0, 110.0),
                 |w| {
                     let cfg = parse_or_default::<SequenceControlConfig>(&w.config);
-                    SharedString::from(format!("Sequence: {}", display_or_unknown(&cfg.channel)))
+                    subject("Sequence", &cfg.channel)
                 },
-                build_sequence_control,
-                snapshot_typed::<SequenceControl>,
+                |cfg, _db, cx| SequenceControl::from_config(&cfg, cx),
+                |control, _| control.to_config(),
             )
             .with_tile("sequence_control", |blob| {
                 parse_or_default::<SequenceControlConfig>(blob)
@@ -511,19 +458,21 @@ impl WidgetRegistry {
                     .into()
             }),
         );
+        // No placeholder for an empty component: an unbound map is a usable
+        // map, and the one the palette's zero-config row creates.
         self.register(
             WidgetKind::map(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (400.0, 300.0),
                 |w| {
-                    let cfg = parse_or_default::<MapWidgetConfig>(&w.config);
-                    SharedString::from(format!("Map: {}", display_or_unknown(&cfg.component)))
+                    let cfg = parse_or_default::<MapConfig>(&w.config);
+                    subject("Map", &cfg.component)
                 },
-                build_map,
-                snapshot_map,
+                |cfg, db, cx| Map::from_config(&cfg, db, cx),
+                |map, _| map.to_config(),
             )
             .with_tile("map", |blob| {
-                let cfg = parse_or_default::<MapWidgetConfig>(blob);
+                let cfg = parse_or_default::<MapConfig>(blob);
                 if cfg.component.is_empty() {
                     "Map".into()
                 } else {
@@ -533,52 +482,83 @@ impl WidgetRegistry {
         );
         self.register(
             WidgetKind::samples_table(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (480.0, 320.0),
                 |w| {
-                    let cfg = parse_or_default::<SamplesTableWidgetConfig>(&w.config);
-                    SharedString::from(format!("Samples: {}", display_or_unknown(&cfg.component)))
+                    let cfg = parse_or_default::<SamplesTableConfig>(&w.config);
+                    subject("Samples", &cfg.component)
                 },
-                build_samples_table,
-                snapshot_samples_table,
+                |cfg, db, cx| SamplesTable::from_config(&cfg, db, cx),
+                |table, _| table.to_config(),
             )
-            .with_tile("samples_table", |blob| {
-                let cfg = parse_or_default::<SamplesTableWidgetConfig>(blob);
-                if cfg.component.is_empty() {
-                    "Samples".into()
-                } else {
-                    cfg.component.into()
-                }
-            })
-            .with_live_tile_title(|state, _, cx| {
-                state
-                    .clone()
-                    .downcast::<SamplesTable>()
-                    .map(|table| table.read(cx).component().clone())
-                    .unwrap_or_else(|_| "Samples".into())
-            }),
+            .with_tile("samples_table", |_| "Samples".into())
+            .with_live_tile_title(|table: &SamplesTable, _| table.component().clone()),
         );
         self.register(
             WidgetKind::attitude(),
-            WidgetSpec::new(
+            WidgetSpec::typed(
                 (220.0, 260.0),
                 |w| {
                     let cfg = parse_or_default::<AttitudeConfig>(&w.config);
-                    let name = cfg.label.unwrap_or(cfg.component);
-                    SharedString::from(format!("Attitude: {}", display_or_unknown(&name)))
+                    subject("Attitude", &cfg.label.unwrap_or(cfg.component))
                 },
-                build_attitude,
-                snapshot_attitude,
+                |cfg, db, cx| AttitudeIndicator::from_config(&cfg, db, cx),
+                AttitudeIndicator::to_config,
             )
             .with_tile("attitude", |blob| {
                 let cfg = parse_or_default::<AttitudeConfig>(blob);
                 cfg.label.unwrap_or(cfg.component).into()
             }),
         );
+        self.register(
+            WidgetKind::new("component_browser"),
+            WidgetSpec::typed(
+                (400.0, 300.0),
+                |_| "Component Browser".into(),
+                browser_view,
+                browser_config,
+            )
+            .with_tile("component_browser", |_| "Components".into())
+            .with_live_tile_title(|browser: &ComponentBrowser, _| browser.title()),
+        );
+        self.register(
+            WidgetKind::new("alarm"),
+            WidgetSpec::typed(
+                (400.0, 300.0),
+                |_| "Alarms".into(),
+                alarm_view,
+                alarm_config,
+            )
+            .with_tile("alarm", |_| "Alarms".into()),
+        );
+        self.register(
+            WidgetKind::new("logs"),
+            WidgetSpec::typed((480.0, 300.0), |_| "Logs".into(), log_view, log_config)
+                .with_tile("logs", |_| "Logs".into()),
+        );
+        self.register(
+            WidgetKind::new("sequence"),
+            WidgetSpec::typed(
+                (400.0, 300.0),
+                |_| "Sequences".into(),
+                sequence_view,
+                sequence_config,
+            )
+            .with_tile("sequence", |_| "Sequences".into()),
+        );
+        // The grid reads the global sequence store and persists nothing.
+        self.register(
+            WidgetKind::new("sequence_grid"),
+            WidgetSpec::new(
+                (400.0, 300.0),
+                |_| "Sequence Grid".into(),
+                |_, _, cx| as_live(cx.new(SequenceGrid::new)),
+                no_snapshot,
+            )
+            .with_tile("sequence_grid", |_| "Sequence Grid".into()),
+        );
     }
 }
-
-pub use crate::views::ComponentTextConfig as TextWidgetConfig;
 
 /// Persisted shape of an image widget.
 ///
@@ -592,35 +572,23 @@ pub struct ImageWidgetConfig {
     pub data: String,
 }
 
-/// Persisted shape of a monitor widget — the source component to monitor
-/// plus the inspector-editable display fields.
-///
-/// `unit` and `show_sparkline` are `Option`: `None` means "never edited", so restore keeps the
-/// constructor's metadata-derived defaults instead of clobbering them.
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct MonitorWidgetConfig {
-    pub component: String,
-    pub unit: Option<String>,
-    pub show_sparkline: Option<bool>,
-}
-
-pub use crate::views::AnnunciatorConfig as AnnunciatorWidgetConfig;
-pub use crate::views::MapConfig as MapWidgetConfig;
-pub use crate::views::SamplesTableConfig as SamplesTableWidgetConfig;
-pub use crate::views::TrafficLightConfig as TrafficLightWidgetConfig;
-
 /// Parse a widget's JSON blob into its expected config type, falling
 /// back to `Default` on any parse error so labels and builders degrade
 /// gracefully on a stale or hand-edited file.
-fn parse_or_default<T: serde::de::DeserializeOwned + Default>(blob: &str) -> T {
+fn parse_or_default<T: DeserializeOwned + Default>(blob: &str) -> T {
     serde_json::from_str::<T>(blob).unwrap_or_default()
 }
 
-/// Render an empty string as `"?"` so labels stay legible when a widget
-/// hasn't been configured yet.
-fn display_or_unknown(s: &str) -> &str {
-    if s.is_empty() { "?" } else { s }
+/// `"{kind}: {subject}"`, with an unconfigured subject shown as `?` so the
+/// label stays legible before the widget is bound.
+fn subject(kind: &str, subject: &str) -> SharedString {
+    let subject = if subject.is_empty() { "?" } else { subject };
+    SharedString::from(format!("{kind}: {subject}"))
+}
+
+/// `"{kind} #{id}"`, for kinds with no single subject to name them by.
+fn numbered(kind: &str, widget: &DashboardWidget) -> SharedString {
+    SharedString::from(format!("{kind} #{}", widget.id.0))
 }
 
 /// Resolve `kind` to a spec. Unregistered kinds fall back to a placeholder
@@ -634,137 +602,23 @@ pub(super) fn widget_spec(kind: &WidgetKind, cx: &App) -> Arc<WidgetSpec> {
 /// Build a spec that draws a "? unknown kind" placeholder so removed or
 /// renamed kinds degrade gracefully in older saved layouts.
 fn placeholder_spec(kind: &WidgetKind) -> Arc<WidgetSpec> {
-    let kind_name = kind.0.clone();
+    let label = SharedString::from(format!("? unknown kind: {}", kind.0));
     Arc::new(WidgetSpec::new(
         (200.0, 80.0),
         {
-            let kind_name = kind_name.clone();
-            move |_w| SharedString::from(format!("? unknown kind: {}", kind_name))
+            let label = label.clone();
+            move |_w| label.clone()
         },
         move |_config, _db, cx| {
-            let label = SharedString::from(format!("? unknown kind: {}", kind_name));
+            let label = label.clone();
             as_live(cx.new(|_cx| PlaceholderWidget { label }))
         },
         no_snapshot,
     ))
 }
 
-fn no_snapshot(_entity: &gpui::AnyEntity, _config: &str, _cx: &App) -> Option<String> {
+fn no_snapshot(_entity: &AnyEntity, _config: &str, _cx: &App) -> Option<String> {
     None
-}
-
-fn snapshot_plot(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let plot = entity.clone().downcast::<TimeSeriesPlot>().ok()?;
-    serde_json::to_string(&plot.read(cx).to_config(cx)).ok()
-}
-
-fn snapshot_text(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let entity = entity.clone().downcast::<ComponentText>().ok()?;
-    serde_json::to_string(&TextWidgetConfig {
-        component: entity.read(cx).binding_text(),
-    })
-    .ok()
-}
-
-fn snapshot_traffic_light(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let tl = entity.clone().downcast::<TrafficLight>().ok()?;
-    let v = tl.read(cx);
-    serde_json::to_string(&v.to_config()).ok()
-}
-
-fn snapshot_annunciator(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let annunciator = entity.clone().downcast::<Annunciator>().ok()?;
-    serde_json::to_string(&annunciator.read(cx).to_config(cx)).ok()
-}
-
-fn snapshot_typed<T>(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String>
-where
-    T: 'static,
-    for<'a> &'a T: IntoSnapshot,
-{
-    let entity = entity.clone().downcast::<T>().ok()?;
-    serde_json::to_string(&entity.read(cx).snapshot(cx)).ok()
-}
-
-trait IntoSnapshot {
-    type Config: Serialize;
-    fn snapshot(self, cx: &App) -> Self::Config;
-}
-
-impl IntoSnapshot for &Meter {
-    type Config = MeterConfig;
-    fn snapshot(self, _cx: &App) -> Self::Config {
-        self.to_config()
-    }
-}
-
-impl IntoSnapshot for &Gauge {
-    type Config = GaugeConfig;
-    fn snapshot(self, _cx: &App) -> Self::Config {
-        self.to_config()
-    }
-}
-
-impl IntoSnapshot for &SequenceControl {
-    type Config = SequenceControlConfig;
-    fn snapshot(self, _cx: &App) -> Self::Config {
-        self.to_config()
-    }
-}
-
-fn snapshot_state_chip(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let entity = entity.clone().downcast::<StateChip>().ok()?;
-    serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
-}
-
-fn snapshot_map(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let entity = entity.clone().downcast::<Map>().ok()?;
-    serde_json::to_string(&entity.read(cx).to_config()).ok()
-}
-
-fn snapshot_samples_table(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let entity = entity.clone().downcast::<SamplesTable>().ok()?;
-    serde_json::to_string(&entity.read(cx).to_config()).ok()
-}
-
-fn snapshot_attitude(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let entity = entity.clone().downcast::<AttitudeIndicator>().ok()?;
-    serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
-}
-
-fn snapshot_monitor(entity: &gpui::AnyEntity, config: &str, cx: &App) -> Option<String> {
-    let entity = entity.clone().downcast::<Monitor>().ok()?;
-    let v = entity.read(cx);
-    let mut cfg = parse_or_default::<MonitorWidgetConfig>(config);
-    cfg.component = v.binding_text();
-    cfg.unit = Some(v.unit.to_string());
-    cfg.show_sparkline = Some(v.show_sparkline);
-    serde_json::to_string(&cfg).ok()
-}
-
-fn snapshot_viewer3d(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let entity = entity.clone().downcast::<Viewer3d>().ok()?;
-    serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
-}
-
-fn snapshot_xy_plot(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let entity = entity.clone().downcast::<XyPlot>().ok()?;
-    serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
-}
-
-fn snapshot_list_plot(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let entity = entity.clone().downcast::<ListPlot>().ok()?;
-    serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
-}
-
-fn snapshot_spectrogram(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let entity = entity.clone().downcast::<Spectrogram>().ok()?;
-    serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
-}
-
-fn snapshot_exec_timeline(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let entity = entity.clone().downcast::<ExecTimeline>().ok()?;
-    serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
 }
 
 /// Build the rendered view and its inspectable/state entities for a widget.
@@ -785,167 +639,6 @@ fn as_live<T: Render + 'static>(e: Entity<T>) -> WidgetLive {
         inspect: any.clone(),
         state: any,
     }
-}
-
-fn build_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    // Only LinePlot has Facet adapters, so expose it — not the outer
-    // TimeSeriesPlot — as the inspectable entity.
-    let cfg = parse_or_default::<PlotPanelConfig>(config);
-    let plot = cx.new(|cx| TimeSeriesPlot::from_config(cfg, db.clone(), cx));
-    let line_plot = plot.read(cx).line_plot().clone();
-    WidgetLive {
-        view: AnyView::from(plot.clone()),
-        inspect: line_plot.into_any(),
-        state: plot.into_any(),
-    }
-}
-
-fn build_text(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<TextWidgetConfig>(config);
-    let binding = crate::data_binding::Binding::from_text(&cfg.component, db, cx);
-    let entity = cx.new(|cx| {
-        let mut view = ComponentText::new(db.clone(), binding.id(), cx);
-        view.source = binding;
-        view
-    });
-    as_live(entity)
-}
-
-fn build_xy_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<XyPlotPanelConfig>(config);
-    let plot = cx.new(|cx| XyPlot::from_config(cfg, db.clone(), cx));
-    WidgetLive {
-        view: AnyView::from(plot.clone()),
-        inspect: plot.read(cx).line_plot().clone().into_any(),
-        state: plot.into_any(),
-    }
-}
-
-fn build_list_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<ListPlotPanelConfig>(config);
-    let plot = cx.new(|cx| ListPlot::from_config(cfg, db.clone(), cx));
-    WidgetLive {
-        view: AnyView::from(plot.clone()),
-        inspect: plot.read(cx).line_plot().clone().into_any(),
-        state: plot.into_any(),
-    }
-}
-
-fn build_spectrogram(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<SpectrogramPanelConfig>(config);
-    let plot = cx.new(|cx| Spectrogram::from_config(cfg, db.clone(), cx));
-    WidgetLive {
-        view: AnyView::from(plot.clone()),
-        inspect: plot.read(cx).plot().clone().into_any(),
-        state: plot.into_any(),
-    }
-}
-
-fn build_exec_timeline(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<ExecTimelineConfig>(config);
-    as_live(cx.new(|cx| ExecTimeline::from_config(cfg, db.clone(), cx)))
-}
-
-fn build_table(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<OutlinePanelConfig>(config);
-    as_live(cx.new(|cx| {
-        let mut outline = ComponentOutline::new(db.clone(), cx);
-        apply_outline_config(&mut outline, cfg, cx);
-        outline
-    }))
-}
-
-fn snapshot_table(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let outline = entity.clone().downcast::<ComponentOutline>().ok()?;
-    serde_json::to_string(&outline_config(outline.read(cx), cx)).ok()
-}
-
-fn build_image(config: &str, _db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<ImageWidgetConfig>(config);
-    as_live(cx.new(|_cx| ImageWidget::load(&cfg)))
-}
-
-fn build_monitor(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<MonitorWidgetConfig>(config);
-    let binding = crate::data_binding::Binding::from_text(&cfg.component, db, cx);
-    let entity = cx.new(|cx| {
-        let mut view = Monitor::new(db.clone(), binding.id(), cx);
-        view.source = binding;
-        view
-    });
-    if cfg.unit.is_some() || cfg.show_sparkline.is_some() {
-        entity.update(cx, |m, cx| {
-            if let Some(unit) = cfg.unit {
-                m.unit = SharedString::from(unit);
-            }
-            if let Some(show) = cfg.show_sparkline {
-                m.show_sparkline = show;
-            }
-            cx.notify();
-        });
-    }
-    as_live(entity)
-}
-
-fn build_viewer3d(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<Viewer3dPanelConfig>(config);
-    as_live(cx.new(|cx| Viewer3d::from_config(cfg, db.clone(), cx)))
-}
-
-fn build_traffic_light(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<TrafficLightWidgetConfig>(config);
-    let binding = crate::data_binding::Binding::from_text(&cfg.component, db, cx);
-    let entity = cx.new(|cx| {
-        let mut view = TrafficLight::new(db.clone(), binding.id(), cx);
-        view.source = binding;
-        view
-    });
-    if let Some(color) = cfg.color {
-        entity.update(cx, |t, cx| t.set_color(color, cx));
-    }
-    as_live(entity)
-}
-
-fn build_meter(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<MeterConfig>(config);
-    as_live(cx.new(|cx| Meter::from_config(&cfg, db.clone(), cx)))
-}
-
-fn build_gauge(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<GaugeConfig>(config);
-    as_live(cx.new(|cx| Gauge::from_config(&cfg, db.clone(), cx)))
-}
-
-fn build_state_chip(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<StateChipConfig>(config);
-    as_live(cx.new(|cx| StateChip::from_config(&cfg, db.clone(), cx)))
-}
-
-fn build_map(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    // No placeholder for an empty component: an unbound map is a usable
-    // map, and the one the palette's zero-config row creates.
-    let cfg = parse_or_default::<MapWidgetConfig>(config);
-    as_live(cx.new(|cx| Map::from_config(&cfg, db.clone(), cx)))
-}
-
-fn build_samples_table(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<SamplesTableWidgetConfig>(config);
-    as_live(cx.new(|cx| SamplesTable::from_config(&cfg, db.clone(), cx)))
-}
-
-fn build_attitude(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<AttitudeConfig>(config);
-    as_live(cx.new(|cx| AttitudeIndicator::from_config(&cfg, db.clone(), cx)))
-}
-
-fn build_sequence_control(config: &str, _db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<SequenceControlConfig>(config);
-    as_live(cx.new(|cx| SequenceControl::from_config(&cfg, cx)))
-}
-
-fn build_annunciator(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<AnnunciatorWidgetConfig>(config);
-    as_live(cx.new(|cx| Annunciator::from_config(cfg, db.clone(), cx)))
 }
 
 /// Widget that decodes an image and paints it into its bounds.
@@ -1053,6 +746,48 @@ struct PlaceholderWidget {
 mod tests {
     use super::*;
 
+    /// Saved layouts name panes by these keys, so each must stay a tile of
+    /// some built-in spec (the legacy table keys alias onto the outline's).
+    #[test]
+    fn every_built_in_pane_key_is_registered() {
+        let mut reg = WidgetRegistry {
+            specs: HashMap::new(),
+        };
+        reg.register_defaults();
+        let keys: Vec<_> = reg
+            .tile_specs()
+            .iter()
+            .filter_map(|spec| Some(spec.tile.as_ref()?.serialization_key.to_string()))
+            .collect();
+        for key in [
+            "time_series_plot",
+            "component_text",
+            "xy_plot",
+            "list_plot",
+            "spectrogram",
+            "timeline",
+            "exec_timeline",
+            "component_outline",
+            "viewer_3d",
+            "traffic_light",
+            "annunciator",
+            "meter",
+            "gauge",
+            "state_chip",
+            "sequence_control",
+            "map",
+            "samples_table",
+            "attitude",
+            "component_browser",
+            "alarm",
+            "logs",
+            "sequence",
+            "sequence_grid",
+        ] {
+            assert!(keys.iter().any(|k| k == key), "{key} has no tile");
+        }
+    }
+
     #[test]
     fn inline_image_data_accepts_raw_base64_and_data_uris() {
         // "hi" in base64.
@@ -1076,28 +811,6 @@ mod tests {
         let cfg: ImageWidgetConfig = serde_json::from_str(r#"{"path":"/tmp/a.png"}"#).unwrap();
         assert_eq!(cfg.path, "/tmp/a.png");
         assert!(cfg.data.is_empty());
-    }
-
-    #[test]
-    fn monitor_config_defaults_optional_display_fields() {
-        let cfg: MonitorWidgetConfig = serde_json::from_str(r#"{"component":"a.b"}"#).unwrap();
-        assert_eq!(cfg.component, "a.b");
-        assert_eq!(cfg.unit, None);
-        assert_eq!(cfg.show_sparkline, None);
-    }
-
-    #[test]
-    fn monitor_config_round_trips_display_fields() {
-        let cfg = MonitorWidgetConfig {
-            component: "a.b".to_string(),
-            unit: Some("V".to_string()),
-            show_sparkline: Some(false),
-        };
-        let blob = serde_json::to_string(&cfg).unwrap();
-        let back: MonitorWidgetConfig = serde_json::from_str(&blob).unwrap();
-        assert_eq!(back.component, "a.b");
-        assert_eq!(back.unit.as_deref(), Some("V"));
-        assert_eq!(back.show_sparkline, Some(false));
     }
 }
 

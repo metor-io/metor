@@ -33,7 +33,7 @@ pub type ComponentBrowser = ColumnBrowser<ComponentBrowserDelegate>;
 
 /// Event raised on Enter / double-click of a leaf component.
 ///
-/// Consumers decide how to act on an activation. The bundled `BrowserPanel`
+/// Consumers decide how to act on an activation. The bundled browser pane
 /// ignores it; other hosts can use it to wire up navigation or plotting.
 #[derive(Clone, Copy)]
 pub enum BrowserEvent {

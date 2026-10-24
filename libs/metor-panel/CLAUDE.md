@@ -40,7 +40,7 @@ There are no hand-written ops anymore: user computation is metor-expr source, co
 
 ### Tiles (`src/tiles/`)
 
-The split-pane layout system. `TileGroup` is the root; the tree is a recursive `Pane` / split. `SplitPath` is a `SmallVec<[usize; 4]>` locating a node by member index. Layout serialization is versioned via `SUPPORTED_LAYOUT_VERSION` — bump it lockstep with `TileGroup::serialize` when the document shape changes. `panels.rs` holds the few typed `PaneItem`s not yet on the widget registry (alarms, logs, sequences, outline, browser) and the "New Panel" menu.
+The split-pane layout system. `TileGroup` is the root; the tree is a recursive `Pane` / split. `SplitPath` is a `SmallVec<[usize; 4]>` locating a node by member index. Layout serialization is versioned via `SUPPORTED_LAYOUT_VERSION` — bump it lockstep with `TileGroup::serialize` when the document shape changes. Every built-in pane except `DashboardPanel` (itself a host, so a typed `PaneItem`) is a registered view; `panels.rs` holds the persisted configs for the panes whose views don't carry their own, and the pane sink for the shared "add view" menu.
 
 ### Inspector (`src/inspector/`)
 
@@ -58,7 +58,7 @@ Concrete renderers — plots (`time_series`, `xy_plot`, `list_plot`), the compon
 
 Scalar instruments (`meter`, `gauge`, `attitude`) share `views/binding.rs`, which owns stream seeding, late metadata binding, and reading warn/critical limits out of the alarm store. A new instrument binds through it rather than growing its own copy, and never takes limits as configuration.
 
-Every one of those is registered on **both** surfaces from a single config type: one `WidgetSpec` in `views/dashboard/widgets.rs`, whose `.with_tile(key, …)` makes `ItemRegistry::register_view` serve it as a pane too (a `RegisteredPane`). Don't add a typed `PaneItem` wrapper for it. `TrafficLight` is the reference for the pattern; a renamed key keeps old layouts loading with `ItemRegistry::alias`.
+Every one of those is registered on **both** surfaces from a single config type: one `WidgetSpec` in `views/dashboard/widgets.rs`, whose `.with_tile(key, …)` makes `ItemRegistry::register_view` serve it as a pane too (a `RegisteredPane`). Don't add a typed `PaneItem` wrapper for it. `WidgetSpec::typed` takes a view's `from_config`/`to_config` directly, and menu entries for both hosts live in one list in `views/add_menu.rs` (gated per host where only one surface makes sense). `TrafficLight` is the reference for the pattern; a renamed key keeps old layouts loading with `ItemRegistry::alias`.
 
 `views/dashboard/connectors.rs` adds schematic lines over the dashboard canvas — anchors resolve against live widget rects each frame, `on_top` picks whether a line paints under the widgets (a pipe) or over them (a callout leader), and `bind` colours a line from telemetry. Line geometry lives in `graph_canvas.rs`, shared with the execution timeline's dependency leaders.
 

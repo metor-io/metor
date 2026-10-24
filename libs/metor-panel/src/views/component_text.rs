@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
-use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 
 use super::binding::{StreamUpdate, spawn_seeded_stream};
 use super::format::ValueFormatter;
+use crate::data_binding::Binding;
 use crate::theme::{theme, ui_px};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -21,7 +21,7 @@ pub struct ComponentTextConfig {
 /// each tick; the task ends when the entity is dropped.
 #[derive(facet::Facet)]
 pub struct ComponentText {
-    pub source: crate::data_binding::Binding,
+    pub source: Binding,
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
@@ -35,12 +35,21 @@ pub struct ComponentText {
 }
 
 impl ComponentText {
-    pub fn binding_text(&self) -> String {
-        self.source.text(&self.db)
+    pub fn from_config(cfg: ComponentTextConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let binding = Binding::from_text(&cfg.component, &db, cx);
+        Self::bind(db, binding, cx)
     }
 
-    pub fn new(db: Arc<DB>, component_id: ComponentId, cx: &mut Context<Self>) -> Self {
-        let binding = crate::data_binding::Binding::from_legacy(component_id, None, &db, cx);
+    pub fn to_config(&self) -> ComponentTextConfig {
+        ComponentTextConfig {
+            component: self.source.text(&self.db),
+        }
+    }
+
+    /// Stream whatever `binding` currently resolves to. A rebind replaces the
+    /// whole view, which is what drops the previous stream task.
+    fn bind(db: Arc<DB>, binding: Binding, cx: &mut Context<Self>) -> Self {
+        let component_id = binding.id();
         let task = spawn_seeded_stream(
             db.clone(),
             component_id,
@@ -59,7 +68,7 @@ impl ComponentText {
             },
         );
         Self {
-            bound: binding.id(),
+            bound: component_id,
             source: binding,
             _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
@@ -73,9 +82,7 @@ impl Render for ComponentText {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.source.resolve(&self.db, cx);
         if self.bound != self.source.id() {
-            let source = self.source.clone();
-            *self = Self::new(self.db.clone(), source.id(), cx);
-            self.source = source;
+            *self = Self::bind(self.db.clone(), self.source.clone(), cx);
         }
         let theme = theme(cx);
         div()

@@ -22,6 +22,7 @@ use crate::inspector::rows::{
 };
 use crate::theme::theme;
 use crate::views::Scrollbar;
+use crate::views::add_menu::{AddMenu, Host};
 
 use crate::tiles::PaneItem;
 
@@ -37,9 +38,7 @@ pub use connectors::{
 };
 
 use widgets::create_widget_view;
-pub use widgets::{
-    TileAddFlow, TileViewSpec, WidgetAddFlow, WidgetLive, WidgetRegistry, WidgetSpec,
-};
+pub use widgets::{ImageWidgetConfig, TileViewSpec, WidgetLive, WidgetRegistry, WidgetSpec};
 
 const SNAP_GRID_PX: f32 = 10.0;
 
@@ -782,7 +781,7 @@ pub fn dashboard_rows(
         {
             let dashboard = dashboard.clone();
             let db = db.clone();
-            Box::new(move |cx| add_widget_rows(dashboard.clone(), db.clone(), cx))
+            Box::new(move |_| add_widget_rows(dashboard.clone(), db.clone()))
         },
     )));
 
@@ -969,349 +968,20 @@ fn zoom_rows(dashboard: Entity<DashboardPanel>, cx: &App) -> Vec<Box<dyn Inspect
     ]
 }
 
-fn add_widget_rows(
-    dashboard: Entity<DashboardPanel>,
-    db: Arc<DB>,
-    cx: &App,
-) -> Vec<Box<dyn InspectorRow>> {
-    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-
-    rows.push(Box::new(NavRow::new(
-        "Time Series Plot",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            Box::new(move |_cx| {
-                let dashboard = dashboard.clone();
-                crate::inspector::trace_picker::select_traces_wizard_rows(
-                    db.clone(),
-                    Arc::new(|_cx| 0),
-                    Arc::new(move |traces, _window, cx| {
-                        let config =
-                            serde_json::to_string(&crate::views::time_series::PlotPanelConfig {
-                                traces: traces
-                                    .iter()
-                                    .map(crate::views::time_series::TraceConfig::from)
-                                    .collect(),
-                                ..Default::default()
-                            })
-                            .expect("plot config serializes");
-                        dashboard.update(cx, |this, cx| {
-                            this.add_widget(WidgetKind::plot(), config, cx);
-                        });
-                    }),
-                )
-            })
-        },
-    )));
-    rows.push(Box::new(NavRow::new(
-        "Component Text",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            Box::new(move |_cx| {
-                component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::text())
-            })
-        },
-    )));
-    rows.push(Box::new(CommandRow::new("Component Table", {
-        let dashboard = dashboard.clone();
-        Arc::new(move |_window, cx| {
-            dashboard.update(cx, |this, cx| {
-                this.add_widget(WidgetKind::table(), "{}".to_string(), cx);
-            });
-        })
-    })));
-    rows.push(Box::new(NavRow::new(
-        "Monitor",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            Box::new(move |_cx| {
-                component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::monitor())
-            })
-        },
-    )));
-    rows.push(Box::new(NavRow::new(
-        "Traffic Light",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            Box::new(move |_cx| {
-                component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::traffic_light())
-            })
-        },
-    )));
-    rows.push(Box::new(NavRow::new(
-        "Annunciator",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            Box::new(move |_cx| annunciator_pattern_rows(dashboard.clone()))
-        },
-    )));
-    rows.push(Box::new(NavRow::new(
-        "Meter",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            Box::new(move |_cx| {
-                instrument_widget_rows(dashboard.clone(), db.clone(), WidgetKind::meter(), |seed| {
-                    serde_json::to_string(&crate::views::MeterConfig::from(seed))
-                        .expect("meter config serializes")
-                })
-            })
-        },
-    )));
-    rows.push(Box::new(NavRow::new(
-        "Gauge",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            Box::new(move |_cx| {
-                instrument_widget_rows(dashboard.clone(), db.clone(), WidgetKind::gauge(), |seed| {
-                    serde_json::to_string(&crate::views::GaugeConfig::from(seed))
-                        .expect("gauge config serializes")
-                })
-            })
-        },
-    )));
-    rows.push(Box::new(NavRow::new(
-        "State Chip",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            Box::new(move |_cx| {
-                instrument_widget_rows(
-                    dashboard.clone(),
-                    db.clone(),
-                    WidgetKind::state_chip(),
-                    |seed| {
-                        let cfg = crate::views::StateChipConfig {
-                            component: seed.component,
-                            element: seed.element,
-                            label: Some(seed.label),
-                            ..Default::default()
-                        };
-                        serde_json::to_string(&cfg).expect("state chip config serializes")
-                    },
-                )
-            })
-        },
-    )));
-    rows.push(Box::new(NavRow::new(
-        "Attitude",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            Box::new(move |_cx| {
-                let dashboard = dashboard.clone();
-                crate::inspector::trace_picker::component_picker_rows(
-                    db.clone(),
-                    move |_component_id, name, cx| {
-                        let cfg = crate::views::AttitudeConfig {
-                            component: name.clone(),
-                            ..Default::default()
-                        };
-                        let blob = serde_json::to_string(&cfg).expect("attitude config serializes");
-                        dashboard.update(cx, |this, cx| {
-                            this.add_widget(WidgetKind::attitude(), blob, cx);
-                        });
-                    },
-                )
-            })
-        },
-    )));
-    rows.push(Box::new(NavRow::new(
-        "Map",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            Box::new(move |_cx| {
-                component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::map())
-            })
-        },
-    )));
-    rows.push(Box::new(NavRow::new(
-        "Samples",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            Box::new(move |_cx| {
-                component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::samples_table())
-            })
-        },
-    )));
-    rows.push(Box::new(NavRow::new(
-        "Sequence Control",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            Box::new(move |cx| {
-                let dashboard = dashboard.clone();
-                crate::views::sequence_control::channel_picker_rows(cx, move |channel, cx| {
-                    let cfg = crate::views::SequenceControlConfig {
-                        channel,
-                        compact: false,
-                    };
-                    let blob =
-                        serde_json::to_string(&cfg).expect("sequence control config serializes");
-                    dashboard.update(cx, |this, cx| {
-                        this.add_widget(WidgetKind::sequence_control(), blob, cx);
-                    });
-                })
-            })
-        },
-    )));
-    rows.push(Box::new(NavRow::new(
-        "Image",
-        SharedString::new_static(""),
-        {
-            let dashboard = dashboard.clone();
-            Box::new(move |_cx| image_path_rows(dashboard.clone()))
-        },
-    )));
-    rows.push(Box::new(CommandRow::new("3D Viewer", {
-        let dashboard = dashboard.clone();
-        Arc::new(move |_window, cx| {
-            dashboard.update(cx, |this, cx| {
-                this.add_widget(WidgetKind::viewer3d(), "{}".to_string(), cx);
-            });
-        })
-    })));
-
-    for (label, add_flow) in cx.global::<WidgetRegistry>().add_flows() {
-        rows.push(Box::new(NavRow::new(label, "", {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            Box::new(move |cx| add_flow(dashboard.clone(), db.clone(), cx))
-        })));
-    }
-
-    rows
-}
-
-/// The component list for a widget kind, preceded by the expression row so
-/// typing `=` binds the widget to a computed channel instead of a named one.
-///
-/// Both paths end in the same place: what the widget's config stores is a
-/// string, and a leading `=` is what tells the builder to compile it rather
-/// than look it up.
-fn component_picker_rows(
-    dashboard: Entity<DashboardPanel>,
-    db: Arc<DB>,
-    kind: WidgetKind,
-) -> Vec<Box<dyn InspectorRow>> {
-    let config_db = db.clone();
-    crate::inspector::trace_picker::binding_picker_rows(db, move |binding, cx| {
-        let config = component_widget_config(&kind, binding.text(&config_db));
-        dashboard.update(cx, |this, cx| {
-            this.add_widget(kind.clone(), config, cx);
-        });
-    })
-}
-
-/// The config blob a component-bound widget of `kind` stores.
-///
-/// `component` is either a component's name or the text of an `=` expression;
-/// the builder resolves it either way, which is what lets the picked row and
-/// the expression row share one function. Picking the kind-specific struct
-/// keeps any future divergence between them from silently losing the
-/// selection.
-fn component_widget_config(kind: &WidgetKind, component: String) -> String {
-    if *kind == WidgetKind::monitor() {
-        let cfg = widgets::MonitorWidgetConfig {
-            component,
-            ..Default::default()
-        };
-        serde_json::to_string(&cfg)
-    } else if *kind == WidgetKind::traffic_light() {
-        let cfg = widgets::TrafficLightWidgetConfig {
-            component,
-            color: None,
-        };
-        serde_json::to_string(&cfg)
-    } else if *kind == WidgetKind::map() {
-        let cfg = widgets::MapWidgetConfig {
-            component,
-            ..Default::default()
-        };
-        serde_json::to_string(&cfg)
-    } else if *kind == WidgetKind::samples_table() {
-        let cfg = widgets::SamplesTableWidgetConfig { component };
-        serde_json::to_string(&cfg)
-    } else {
-        let cfg = widgets::TextWidgetConfig { component };
-        serde_json::to_string(&cfg)
-    }
-    .expect("component widget config serializes")
-}
-
-/// Trace wizard for the scalar instruments: each picked element becomes its
-/// own widget of `kind`, with `blob` turning the seed into that kind's
-/// config. Mirrors the pane-side `instrument_wizard_rows`.
-fn instrument_widget_rows(
-    dashboard: Entity<DashboardPanel>,
-    db: Arc<DB>,
-    kind: WidgetKind,
-    blob: fn(crate::views::instrument::ScaleSeed) -> String,
-) -> Vec<Box<dyn InspectorRow>> {
-    let db_outer = db.clone();
-    crate::inspector::trace_picker::select_traces_wizard_rows(
+/// The shared "add view" menu aimed at `dashboard`.
+fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
+    AddMenu {
         db,
-        Arc::new(|_cx| 0),
-        Arc::new(move |traces, _window, cx| {
-            let seeds = crate::views::instrument::scale_seeds_for_traces(&db_outer, &traces, cx);
+        host: Host::Dashboard,
+        sink: Arc::new(move |kind, config, cx| {
             dashboard.update(cx, |this, cx| {
-                for seed in seeds {
-                    this.add_widget(kind.clone(), blob(seed), cx);
-                }
-            });
+                let id = this.add_widget(kind.clone(), config, cx);
+                this.widget_live.get(&id).map(|live| live.inspect.clone())
+            })
         }),
-    )
-}
-
-/// Single-question wizard for "+ widget → Annunciator": prompts for a glob
-/// pattern, then adds an `annunciator` widget with that pattern. Mirrors
-/// [`image_path_rows`].
-fn annunciator_pattern_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRow>> {
-    vec![crate::views::annunciator::glob_prompt_row(Arc::new(
-        move |input, _window, cx| {
-            let cfg = crate::views::annunciator::seeded_config(&input);
-            let config = serde_json::to_string(&cfg).expect("annunciator widget config serializes");
-            dashboard.update(cx, |this, cx| {
-                this.add_widget(WidgetKind::annunciator(), config, cx);
-            });
-        },
-    ))]
-}
-
-fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRow>> {
-    vec![Box::new(DefaultActionRow::new(
-        "Image file path...",
-        Arc::new(move |input, _window, cx| {
-            if !input.is_empty() {
-                let cfg = widgets::ImageWidgetConfig {
-                    path: input.to_string(),
-                    data: String::new(),
-                };
-                let config = serde_json::to_string(&cfg).expect("image widget config serializes");
-                dashboard.update(cx, |this, cx| {
-                    this.add_widget(WidgetKind::image(), config, cx);
-                });
-            }
-        }),
-    ))]
+        on_open_inspector: None,
+    }
+    .rows()
 }
 
 /// A connector's palette label: its own label if it has one, else its shape

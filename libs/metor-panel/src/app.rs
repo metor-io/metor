@@ -14,10 +14,7 @@ use crate::inspector::edits::{
 use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegistry};
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
-use crate::tiles::panels::{
-    AlarmPanel, BrowserPanel, LogPanel, OutlinePanel, OutlinePanelConfig, PlotPanelConfig,
-    SequenceGridPanel, SequencePanel, TraceConfig,
-};
+use crate::tiles::panels::{OutlinePanelConfig, PlotPanelConfig, TraceConfig};
 use crate::tiles::{
     OpenOutlineAction, PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent,
 };
@@ -345,12 +342,11 @@ impl AppRoot {
         rows.push(Box::new(crate::inspector::rows::NavRow::new(
             "New Tab",
             SharedString::new_static(""),
-            Box::new(move |_cx| {
+            Box::new(move |_| {
                 crate::tiles::panels::new_panel_rows(
                     db.clone(),
                     pane.clone(),
                     on_open_inspector.clone(),
-                    _cx,
                 )
             }),
         )));
@@ -402,13 +398,11 @@ impl AppRoot {
         let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
             return;
         };
-        let db = self.db.clone();
         let cfg = OutlinePanelConfig {
             root: action.root.to_string(),
             ..Default::default()
         };
-        let outline = cx.new(|cx| OutlinePanel::from_config(cfg, db, cx));
-        pane.update(cx, |pane, cx| pane.add_item(Box::new(outline), cx));
+        crate::tiles::panels::add_registered_panel(&pane, "component_outline", &cfg, cx);
     }
 
     fn handle_preview_plot_action(
@@ -781,13 +775,9 @@ impl AppRoot {
     /// in the layout, opening a fresh one in the active pane only when none is
     /// open.
     fn open_alarms(&mut self, cx: &mut Context<Self>) {
-        let db = self.db.clone();
+        let registry = cx.global::<crate::tiles::ItemRegistry>().clone();
         self.tiles.update(cx, |tiles, cx| {
-            tiles.focus_or_open(
-                <AlarmPanel as crate::tiles::PaneItem>::serialization_key(),
-                |cx| Box::new(cx.new(|cx| AlarmPanel::new(db, cx))),
-                cx,
-            );
+            tiles.focus_or_open("alarm", |cx| registry.deserialize("alarm", "{}", cx), cx);
         });
     }
 
@@ -1560,8 +1550,12 @@ impl PanelApp {
         // Layouts written before the annunciator rename still name it
         // `traffic_light_grid`; they rehydrate as annunciators and re-save
         // under the new key.
-        cx.global_mut::<crate::tiles::ItemRegistry>()
-            .alias("traffic_light_grid", "annunciator");
+        let items = cx.global_mut::<crate::tiles::ItemRegistry>();
+        items.alias("traffic_light_grid", "annunciator");
+        // The outline replaced both tables; layouts saved with either key
+        // open as an outline, keeping the data table's filter.
+        items.alias("component_table", "component_outline");
+        items.alias("data_table", "component_outline");
 
         // Connections: seed builder-registered targets, hand the
         // registry to discovery sources, then fire auto-connects.
@@ -1833,57 +1827,17 @@ pub const NOT_TYPING: &str = "!TextInput && !Transient";
 /// keeps it only by declaring [`TEXT_INPUT`].
 pub const EXIT_ZOOM: &str = "PaneZoomed && !TextInput && !Transient";
 
-/// Populate the pane-item registry so [`TileGroup::from_json`] can rehydrate
-/// specialized built-in panel kinds. Ordinary registered views are adapted
-/// into this registry immediately afterwards; Dashboard retains its dedicated
-/// deserializer because it is itself a host. The populated registry is a gpui
-/// `Global` so palette callbacks can fetch it without threading.
+/// Populate the pane-item registry with the one pane that isn't a registered
+/// view: Dashboard is itself a host, so it keeps a dedicated deserializer.
+/// Every other built-in pane is adapted from its widget spec afterwards. The
+/// populated registry is a gpui `Global` so palette callbacks can fetch it
+/// without threading.
 fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
-    use crate::tiles::ItemRegistry as PaneItemRegistry;
-    let mut reg = PaneItemRegistry::default();
-
-    register_panel::<AlarmPanel>(&mut reg, db.clone(), AlarmPanel::from_config);
-    register_panel::<LogPanel>(&mut reg, db.clone(), LogPanel::from_config);
-    register_panel::<SequencePanel>(&mut reg, db.clone(), SequencePanel::from_config);
-    register_panel::<SequenceGridPanel>(&mut reg, db.clone(), SequenceGridPanel::from_config);
-    register_panel::<OutlinePanel>(&mut reg, db.clone(), OutlinePanel::from_config);
-    // The outline replaced both tables; layouts saved with either key open
-    // as an outline, keeping the data table's filter.
-    for legacy in ["component_table", "data_table"] {
-        let db = db.clone();
-        reg.register_erased(legacy, move |state, cx| {
-            let cfg: OutlinePanelConfig = serde_json::from_str(state).unwrap_or_default();
-            let db = db.clone();
-            Some(Box::new(
-                cx.new(|cx| OutlinePanel::from_config(cfg, db, cx)),
-            ))
-        });
-    }
-    register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
-
-    // Dashboard's deserializer returns a fully-constructed entity rather
-    // than a `Self`, so it doesn't fit the generic helper.
-    let db_dashboard = db.clone();
+    let mut reg = crate::tiles::ItemRegistry::default();
     reg.register::<DashboardPanel>(move |state, cx| {
-        Some(deserialize_dashboard(db_dashboard.clone(), state, cx))
+        Some(deserialize_dashboard(db.clone(), state, cx))
     });
-
     cx.set_global(reg);
-}
-
-/// Wire one closure for `T` into the pane-item registry. The closure parses
-/// `T::Config` out of the state blob (falling back to `Default` on parse
-/// failure) and constructs `T` via the supplied `from_config` function.
-fn register_panel<T: crate::tiles::PaneItem>(
-    reg: &mut crate::tiles::ItemRegistry,
-    db: Arc<DB>,
-    from_config: fn(T::Config, Arc<DB>, &mut Context<T>) -> T,
-) {
-    reg.register::<T>(move |state, cx| {
-        let cfg: T::Config = serde_json::from_str(state).unwrap_or_default();
-        let db = db.clone();
-        Some(cx.new(|cx| from_config(cfg, db, cx)))
-    });
 }
 
 #[cfg(target_os = "macos")]
