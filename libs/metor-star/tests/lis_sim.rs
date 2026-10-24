@@ -374,6 +374,30 @@ mod tracking {
         }
     }
 
+    /// Lost-in-space and tracking weigh the stars with the same σ and report
+    /// the covariance of the stars they matched, so one frame solved both
+    /// ways has the same covariance.
+    #[test]
+    fn lost_and_tracking_agree_on_the_covariance() {
+        let mut rig = rig();
+        assert_eq!(rig.tracker.lis_config().sigma_rad, rig.tracker.sigma_rad());
+        let mut rng = StdRng::seed_from_u64(34);
+        for k in 0..5 {
+            let truth = rig.expose(random_q(&mut rng), [0.0; 3], 300 + k);
+            let (mode, lost) = solved(rig.process(None, u32::MAX));
+            assert_eq!(mode, Mode::Lost);
+            let prior = Prior {
+                q_st_eci: truth,
+                sigma_rad: 1e-4,
+            };
+            let (mode, tracked) = solved(rig.process(Some(prior), u32::MAX));
+            assert_eq!(mode, Mode::Tracking);
+            assert_eq!(lost.rows, tracked.rows);
+            let (a, b) = (sigma_of(lost.p_theta), sigma_of(tracked.p_theta));
+            assert!((a / b - 1.0).abs() < 1e-6, "lost {a:.3e}, tracking {b:.3e}");
+        }
+    }
+
     #[test]
     fn a_budgeted_search_resumes_and_a_blank_frame_has_no_stars() {
         let mut rig = rig();

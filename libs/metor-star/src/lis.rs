@@ -33,7 +33,8 @@ pub struct LisConfig {
     pub fov_radius_rad: f64,
     /// How far (rad) an observation may sit from its catalog star.
     pub match_rad: f64,
-    /// One observation's σ (rad), for the residual test and QUEST.
+    /// One observation's σ (rad), for the residual test and QUEST. The
+    /// tracker sets it from its centroid σ.
     pub sigma_rad: f64,
     pub min_match: usize,
     /// The largest chance that the matches are coincidence.

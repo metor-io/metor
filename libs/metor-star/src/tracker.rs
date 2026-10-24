@@ -18,7 +18,9 @@ use crate::wahba::{Obs, quest};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrackConfig {
-    /// Centroid 1σ (px), for per-star σ and the gate.
+    /// Centroid 1σ (px), for per-star σ and the gate. It also sets the
+    /// lost-in-space σ, so both modes weigh stars and gate the residual
+    /// RMS alike.
     pub sigma_px: f64,
     /// Gate in units of the combined 1σ.
     pub gate_k: f64,
@@ -129,6 +131,10 @@ impl<'a> Tracker<'a> {
         lis: LisConfig,
         cfg: TrackConfig,
     ) -> Result<Tracker<'a>, ImageError> {
+        let lis = LisConfig {
+            sigma_rad: cam.pixel_sigma_to_rad(cfg.sigma_px),
+            ..lis
+        };
         Ok(Tracker {
             extractor: Extractor::new(cam.intr.width, cam.intr.height, image)?,
             pyramid: Pyramid::new(db.n_stars(), lis),
@@ -149,6 +155,11 @@ impl<'a> Tracker<'a> {
 
     pub fn camera(&self) -> &Camera {
         &self.cam
+    }
+
+    /// The lost-in-space configuration, its σ set from the centroid σ.
+    pub fn lis_config(&self) -> &LisConfig {
+        self.pyramid.config()
     }
 
     /// The last frame's centroids, brightest first; a [`Match`]'s rows index
@@ -194,7 +205,7 @@ impl<'a> Tracker<'a> {
         if let Some(prior) = usable
             && let Some(m) = self.track(prior)
         {
-            return Outcome::Solved(Mode::Tracking, m);
+            return self.refined(Mode::Tracking, m);
         }
         self.pyramid.start(&self.obs);
         self.searching = true;
@@ -209,13 +220,40 @@ impl<'a> Tracker<'a> {
         match self.pyramid.step(&self.db, budget) {
             Step::Found(m) => {
                 self.searching = false;
-                Outcome::Solved(Mode::Lost, m)
+                self.refined(Mode::Lost, m)
             }
             Step::Exhausted => {
                 self.searching = false;
                 Outcome::Failed(Failure::NoMatch)
             }
             Step::More => Outcome::Searching,
+        }
+    }
+
+    /// `m` re-solved on exactly its matched rows, so `q` and `p_theta`
+    /// describe the stars it reports whichever mode found them.
+    fn refined(&mut self, mode: Mode, m: Match) -> Outcome {
+        let sigma = self.sigma_rad();
+        self.quest_obs.clear();
+        for (b, row) in self.obs.iter().zip(m.rows) {
+            if let Some(star) = self.db.star(row) {
+                self.quest_obs.push(Obs {
+                    b: *b,
+                    r: star.unit(),
+                    sigma,
+                });
+            }
+        }
+        match quest(&self.quest_obs, None) {
+            Ok(sol) => Outcome::Solved(
+                mode,
+                Match {
+                    q: sol.q,
+                    p_theta: sol.p_theta,
+                    ..m
+                },
+            ),
+            Err(_) => Outcome::Failed(Failure::NoMatch),
         }
     }
 
