@@ -84,6 +84,7 @@ impl InspectorRegistry {
         self.register_override_f64();
         self.register_override_shared_string();
         self.register_override_hsla();
+        self.register_option_hsla();
         self.register_time_range_behavior();
         self.register_override_time_range_behavior();
         self.register_inspectable::<crate::views::Monitor>();
@@ -342,6 +343,55 @@ impl InspectorRegistry {
                     })
                 },
             )
+        }));
+    }
+
+    /// Row for `Option<Hsla>`, the views' "theme colour unless set" fields:
+    /// the same picker and "Auto" reset as `Override<Hsla>`, with `None` as
+    /// Auto. Unset, the picker opens on the theme's text colour rather than
+    /// a transparent black nobody chose.
+    fn register_option_hsla(&mut self) {
+        self.register_field_widget::<Option<Hsla>>(Arc::new(|ctx, peek, any_entity, idx| {
+            let summary = match peek.get::<Option<Hsla>>() {
+                Ok(Some(_)) => SharedString::new_static("Custom"),
+                _ => SharedString::new_static("Auto"),
+            };
+            let label = ctx.label.clone();
+            Box::new(NavRow::new(
+                label.clone(),
+                summary,
+                Box::new(move |_cx| {
+                    let read = any_entity.clone();
+                    let write = any_entity.clone();
+                    let auto = any_entity.clone();
+                    vec![
+                        Box::new(ColorRow {
+                            label: label.clone(),
+                            read_color: Arc::new(move |cx| {
+                                crate::inspector::reflect::get_field::<Option<Hsla>>(&read, idx, cx)
+                                    .flatten()
+                                    .unwrap_or_else(|| crate::theme::theme(cx).text_primary)
+                            }),
+                            on_change: Arc::new(move |c, _w, cx| {
+                                crate::inspector::reflect::set_field::<Option<Hsla>>(
+                                    &write,
+                                    idx,
+                                    Some(c),
+                                    cx,
+                                );
+                            }),
+                        }) as Box<dyn InspectorRow>,
+                        Box::new(CommandRow::new(
+                            "Auto",
+                            Arc::new(move |_w, cx| {
+                                crate::inspector::reflect::set_field::<Option<Hsla>>(
+                                    &auto, idx, None, cx,
+                                );
+                            }),
+                        )),
+                    ]
+                }),
+            ))
         }));
     }
 
