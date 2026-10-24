@@ -81,6 +81,13 @@ impl Star {
         self.r.map(|x| f64::from(x.get()))
     }
 
+    /// [`vector`](Self::vector) rescaled to unit length: the f32 rounding
+    /// leaves `|r|` off by up to about 1e-7, more than a 1 px match cone.
+    pub fn unit(&self) -> V3 {
+        let r = self.vector();
+        crate::geom::normalize(r).unwrap_or(r)
+    }
+
     pub fn mag(&self) -> f64 {
         f64::from(self.mag_centi.get()) / 100.0
     }

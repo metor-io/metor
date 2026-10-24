@@ -217,8 +217,10 @@ fn a_flooded_frame_is_rejected_whole() {
             }
         })
         .collect();
-    let mut cfg = ImageConfig::default();
-    cfg.max_runs = 1000;
+    let cfg = ImageConfig {
+        max_runs: 1000,
+        ..ImageConfig::default()
+    };
     let mut small = Extractor::new(W as u32, H as u32, cfg).unwrap();
     assert_eq!(small.run(&px).err(), Some(ImageError::TooManyRuns));
     // All 4095: one block-median background, nothing lit.

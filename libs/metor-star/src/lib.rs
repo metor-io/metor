@@ -10,6 +10,7 @@ pub mod camera;
 pub mod catalog;
 pub mod geom;
 pub mod image;
+pub mod lis;
 #[cfg(feature = "sim")]
 pub mod render;
 pub mod starcat;
