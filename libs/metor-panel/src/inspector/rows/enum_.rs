@@ -44,7 +44,7 @@ impl InspectorRow for EnumRow {
                     .gap(px(6.0))
                     .justify_end()
                     .child(row_value(self.selected.clone(), theme.text_secondary))
-                    .child(Icon::ChevronRight.svg(8.0)),
+                    .child(Icon::ChevronRight.svg(8.0, theme.text_secondary)),
             )
             .into_any_element()
     }

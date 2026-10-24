@@ -54,7 +54,7 @@ impl InspectorRow for ColorRow {
                             .rounded(px(3.0))
                             .bg((self.read_color)(cx)),
                     )
-                    .child(Icon::ChevronRight.svg(8.0)),
+                    .child(Icon::ChevronRight.svg(8.0, theme.text_secondary)),
             )
             .into_any_element()
     }

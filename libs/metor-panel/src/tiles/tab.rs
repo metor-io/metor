@@ -48,5 +48,5 @@ pub(super) fn close_icon(theme: &Theme) -> Div {
         .flex_shrink_0()
         .rounded(px(3.0))
         .text_color(theme.text_tertiary)
-        .child(Icon::Close.svg(10.0))
+        .child(Icon::Close.svg(10.0, theme.text_secondary))
 }

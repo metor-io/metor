@@ -45,10 +45,7 @@ pub(crate) const FLAG_HIT_PX: f32 = 8.0;
 /// dimmed shade a translucent tint would show over the plot, but occluding
 /// the traces beneath so the label stays readable.
 pub(crate) fn mix(bg: Hsla, fg: Hsla, t: f32) -> Hsla {
-    Hsla {
-        a: 1.0,
-        ..crate::theme::lerp_color(bg, fg, t)
-    }
+    Theme::dim(crate::theme::lerp_color(bg, fg, t), 1.0)
 }
 
 /// Exact-equality check for two colors — [`Hsla`] has no `PartialEq`, and a
@@ -184,10 +181,7 @@ pub(crate) fn paint_event_flags(
         }
 
         // Full-height rule at reduced alpha so traces stay legible under it.
-        let rule_color = Hsla {
-            a: 0.5,
-            ..cluster.color
-        };
+        let rule_color = Theme::dim(cluster.color, 0.5);
         crate::views::plot_common::chrome::paint_vline(pb, x, px(2.0 * s), rule_color, window);
 
         // The chip claims at most the gap to the next flag (so neighbors
@@ -221,10 +215,7 @@ pub(crate) fn paint_event_flags(
                     px(CHIP_RADIUS * s),
                     mix(plot_bg, cluster.color, 0.18),
                     px(1.0),
-                    Hsla {
-                        a: 0.55,
-                        ..cluster.color
-                    },
+                    Theme::dim(cluster.color, 0.55),
                     gpui::BorderStyle::Solid,
                 ));
                 let origin = point(x + chip_pad, chip_y + (chip_h - chip_font_size) / 2.0);

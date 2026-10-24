@@ -753,7 +753,7 @@ impl Render for ComponentValueStrip {
                         .text_size(ui_px(12.0))
                         .text_color(theme.control_active)
                         .cursor_pointer()
-                        .child(Icon::ChevronRight.svg_color(11.0, theme.control_active))
+                        .child(Icon::ChevronRight.svg(11.0, theme.control_active))
                         .on_mouse_down(
                             MouseButton::Left,
                             move |event: &gpui::MouseDownEvent, window, cx| {

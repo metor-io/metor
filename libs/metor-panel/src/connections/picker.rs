@@ -465,9 +465,9 @@ impl ConnectionPicker {
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_primary).text_color(theme.alarm_color(1)))
             .child(if favorite {
-                Icon::Favorite.svg_color(8.0, theme.alarm_color(1))
+                Icon::Favorite.svg(8.0, theme.alarm_color(1))
             } else {
-                Icon::Favorite.svg(8.0)
+                Icon::Favorite.svg(8.0, theme.text_secondary)
             })
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -501,7 +501,7 @@ impl ConnectionPicker {
             .rounded(px(4.0))
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_primary))
-            .child(Icon::Setting.svg_color(11.0, theme.text_tertiary))
+            .child(Icon::Setting.svg(11.0, theme.text_tertiary))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
@@ -954,7 +954,7 @@ impl ConnectionPicker {
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_primary))
             .child(div().min_w_0().truncate().child(label))
-            .child(Icon::ChevronDown.svg_color(10., theme.text_secondary))
+            .child(Icon::ChevronDown.svg(10., theme.text_secondary))
             .child(
                 gpui::canvas(
                     move |bounds, _, _| button_bounds.set(bounds),
@@ -1008,7 +1008,7 @@ impl ConnectionPicker {
                     .when(self.selected == first_slot + 1, |s| {
                         s.bg(theme.bg_secondary)
                     })
-                    .child(Icon::Folder.svg_color(14., theme.text_secondary))
+                    .child(Icon::Folder.svg(14., theme.text_secondary))
                     .child("Open recording…")
                     .on_mouse_down(
                         gpui::MouseButton::Left,
@@ -1281,7 +1281,7 @@ impl Render for ConnectionPicker {
                     .rounded(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.bg_secondary))
-                    .child(crate::icons::Icon::Close.svg_color(12.0, theme.text_secondary))
+                    .child(crate::icons::Icon::Close.svg(12.0, theme.text_secondary))
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(|this, _, window, cx| {

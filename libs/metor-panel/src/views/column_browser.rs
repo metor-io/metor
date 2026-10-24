@@ -628,7 +628,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             );
 
         if !is_leaf {
-            row = row.child(Icon::ChevronRight.svg(8.0));
+            row = row.child(Icon::ChevronRight.svg(8.0, theme.text_secondary));
         }
 
         row.into_any_element()

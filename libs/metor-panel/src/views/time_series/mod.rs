@@ -1,5 +1,5 @@
 use crate::plot_events::popover::event_summary_row;
-use crate::theme::{ui_px, ui_scale};
+use crate::theme::{Theme, ui_px, ui_scale};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -869,7 +869,7 @@ fn paint_cursors(
             theme.text_secondary
         };
         // Brighten the selection-derived stroke so it reads as a line, not a fill.
-        let stroke_color = Hsla { a: 1.0, ..primary };
+        let stroke_color = Theme::dim(primary, 1.0);
 
         for ts in [a, b] {
             let x = view.to_screen(pb, ts.0 as f64, view.min_y).x;
@@ -893,10 +893,7 @@ fn paint_cursors(
                     height: pb.size.height,
                 },
             };
-            let band_fill = Hsla {
-                a: 0.08,
-                ..stroke_color
-            };
+            let band_fill = Theme::dim(stroke_color, 0.08);
             window.paint_quad(gpui::fill(band, band_fill));
         }
 
@@ -947,10 +944,7 @@ fn paint_hover_crosshair(
     if pointer_x < pb.origin.x || pointer_x > pb.origin.x + pb.size.width {
         return;
     }
-    let color = Hsla {
-        a: 0.6,
-        ..crate::theme::theme(cx).text_secondary
-    };
+    let color = Theme::dim(crate::theme::theme(cx).text_secondary, 0.6);
     paint_vline(pb, pointer_x, px(0.5), color, window);
 }
 

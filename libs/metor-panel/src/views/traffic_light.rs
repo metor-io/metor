@@ -190,10 +190,7 @@ pub(crate) fn traffic_light_swatch(
 ) -> impl IntoElement {
     let bg = match value {
         Some(true) => color,
-        Some(false) => Hsla {
-            a: OFF_ALPHA,
-            ..color
-        },
+        Some(false) => Theme::dim(color, OFF_ALPHA),
         None => theme.bg_secondary,
     };
     div().w(size).h(size).rounded(px(3.0)).bg(bg)

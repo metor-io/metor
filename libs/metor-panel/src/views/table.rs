@@ -347,10 +347,10 @@ impl<D: TableDelegate> Table<D> {
 
         match sort {
             ColumnSort::Ascending => {
-                cell = cell.child(Icon::ChevronUp.svg(12.0));
+                cell = cell.child(Icon::ChevronUp.svg(12.0, theme.text_secondary));
             }
             ColumnSort::Descending => {
-                cell = cell.child(Icon::ChevronDown.svg(12.0));
+                cell = cell.child(Icon::ChevronDown.svg(12.0, theme.text_secondary));
             }
             ColumnSort::Default => {}
         }

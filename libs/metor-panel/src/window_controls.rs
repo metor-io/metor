@@ -132,7 +132,7 @@ fn caption_button(
         .justify_center()
         .w(CAPTION_BUTTON_WIDTH)
         .h_full()
-        .child(icon.svg_color(14.0, theme.text_secondary))
+        .child(icon.svg(14.0, theme.text_secondary))
 }
 
 /// Wrap the window root with Linux client-side decorations: an invisible

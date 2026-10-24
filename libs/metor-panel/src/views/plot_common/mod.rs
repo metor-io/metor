@@ -15,7 +15,7 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::theme::{ui_px, ui_scale};
+use crate::theme::{Theme, ui_px, ui_scale};
 use crate::views::time_series::{
     LABEL_FONT_SIZE, Override, PlotBounds, PlotRenderState, ReadbackHandle,
 };
@@ -55,14 +55,8 @@ pub fn plot_legend<T: 'static, N: 'static>(
         let trace = trace_entity.read(cx);
         let (label, trace_color, visible) = describe(trace);
         let opacity = if visible { 1.0 } else { 0.3 };
-        let color = Hsla {
-            a: opacity,
-            ..trace_color
-        };
-        let text_color = Hsla {
-            a: opacity,
-            ..theme.text_secondary
-        };
+        let color = Theme::dim(trace_color, opacity);
+        let text_color = Theme::dim(theme.text_secondary, opacity);
         let toggle_target = trace_entity.clone();
         let inspect_target = trace_entity.clone();
         let notify = notify.clone();

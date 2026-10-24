@@ -331,7 +331,7 @@ fn icon_button(
         .h(ui_px(16.0))
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, cx.listener(handler))
-        .child(icon.svg(12.0))
+        .child(icon.svg(12.0, theme(cx).text_secondary))
         .into_any_element()
 }
 

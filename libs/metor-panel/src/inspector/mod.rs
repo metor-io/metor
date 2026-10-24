@@ -788,7 +788,7 @@ impl Inspector {
                         } else {
                             crate::icons::Icon::ChevronDown
                         }
-                        .svg_color(12.0, theme.text_secondary),
+                        .svg(12.0, theme.text_secondary),
                     )
                     .tooltip(|_, cx| {
                         crate::views::TooltipText::build(

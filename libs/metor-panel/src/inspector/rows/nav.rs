@@ -137,7 +137,7 @@ impl InspectorRow for NavRow {
                     .text_color(theme.text_secondary)
                     .child(summary),
             )
-            .child(Icon::ChevronRight.svg(8.0));
+            .child(Icon::ChevronRight.svg(8.0, theme.text_secondary));
 
         row_base(row_ix, selected, cx)
             .child(super::path_label(

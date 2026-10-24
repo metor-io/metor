@@ -165,18 +165,8 @@ impl Icon {
         }
     }
 
-    /// Build an [`Svg`] sized in pixels and tinted with the dark theme's
-    /// secondary-text color. Callers that need a different tint should use
-    /// [`Icon::svg_color`].
-    pub fn svg(self, size: f32) -> Svg {
-        svg()
-            .path(SharedString::from(self.asset_path()))
-            .size(ui_px(size))
-            .text_color(crate::theme::DARK.text_secondary)
-    }
-
-    /// Build an [`Svg`] sized in pixels and tinted with an explicit color.
-    pub fn svg_color(self, size: f32, color: Hsla) -> Svg {
+    /// Build an [`Svg`] sized in pixels and tinted with `color`.
+    pub fn svg(self, size: f32, color: Hsla) -> Svg {
         svg()
             .path(SharedString::from(self.asset_path()))
             .size(ui_px(size))

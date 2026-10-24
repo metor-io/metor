@@ -1214,7 +1214,7 @@ fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
                 cx.stop_propagation();
             },
         )
-        .child(Icon::Plot.svg_color(11.0, theme.text_secondary));
+        .child(Icon::Plot.svg(11.0, theme.text_secondary));
 
     div()
         .h(px(PREVIEW_ROW_HEIGHT))

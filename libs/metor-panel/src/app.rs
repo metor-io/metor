@@ -739,11 +739,11 @@ impl AppRoot {
             // shelved one deliberately does not light the bar.
             let pending = state.pending_count();
             if pending == 0 {
-                bar = bar.child(Icon::Dot.svg_color(7.0, theme.control_active));
+                bar = bar.child(Icon::Dot.svg(7.0, theme.control_active));
             } else {
                 if let Some(severity) = state.highest_pending_severity() {
                     let idx = crate::alarms::severity_index(severity);
-                    bar = bar.child(Icon::Dot.svg_color(7.0, theme.alarm_color(idx)));
+                    bar = bar.child(Icon::Dot.svg(7.0, theme.alarm_color(idx)));
                 }
                 let counts = state.counts_by_severity();
                 for idx in (0..counts.len()).rev() {
@@ -847,7 +847,7 @@ impl AppRoot {
         };
 
         Self::titlebar_segment(theme, "connection-segment")
-            .child(crate::icons::Icon::Dot.svg_color(7.0, dot))
+            .child(crate::icons::Icon::Dot.svg(7.0, dot))
             .child(label)
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -887,7 +887,7 @@ impl AppRoot {
             .w(px(28.0))
             .h(px(24.0))
             .rounded(px(3.0))
-            .child(icon.svg_color(14.0, icon_color))
+            .child(icon.svg(14.0, icon_color))
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_primary))
             .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
@@ -965,7 +965,7 @@ impl AppRoot {
         if mode != "Live" {
             right = right.child(
                 Self::titlebar_segment(theme, "time-go-live")
-                    .child(crate::icons::Icon::SkipForward.svg_color(14.0, theme.text_secondary))
+                    .child(crate::icons::Icon::SkipForward.svg(14.0, theme.text_secondary))
                     .tooltip(|_, cx| {
                         crate::views::tooltip::TooltipText::build("Go live".into(), cx)
                     })
@@ -980,7 +980,7 @@ impl AppRoot {
                     || config.range.to_string(),
                     |t| crate::temporal::display::range(config.range, &config, &t.context),
                 )))
-                .child(crate::icons::Icon::ChevronDown.svg_color(10.0, theme.text_secondary))
+                .child(crate::icons::Icon::ChevronDown.svg(10.0, theme.text_secondary))
                 .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
                     crate::temporal::picker::open(
                         Some(crate::temporal::picker::Target::Range),
@@ -1011,7 +1011,7 @@ impl AppRoot {
                     } else {
                         crate::icons::Icon::Pause
                     }
-                    .svg_color(14.0, theme.text_secondary),
+                    .svg(14.0, theme.text_secondary),
                 )
                 .tooltip(move |_, cx| {
                     crate::views::tooltip::TooltipText::build(
