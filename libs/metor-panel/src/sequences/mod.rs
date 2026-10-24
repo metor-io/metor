@@ -11,13 +11,13 @@
 //! an event, which flows back through the ingest loop so every connected client converges.
 //!
 //! State folding lives in [`SequenceState`] (pure, unit-tested). [`SequenceStore`] is the
-//! gpui entity that owns it plus the reader tasks; [`GlobalSequenceStore`] hands the entity
+//! gpui entity that owns it plus the reader tasks; a gpui global hands the entity
 //! to any view via [`try_global`].
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use gpui::{App, Context, Entity, Global, SharedString, Task, prelude::*};
+use gpui::{App, Entity, SharedString, Task};
 use metor_db::DB;
 use metor_proto::types::{Msg, Timestamp};
 use metor_proto_wkt::{
@@ -25,7 +25,7 @@ use metor_proto_wkt::{
     SequenceRegistry, SequenceRunState,
 };
 
-use crate::msg_ingest::{IngestSource, ingest_all};
+use crate::msg_ingest::{self, IngestSource};
 
 #[cfg(test)]
 mod tests;
@@ -185,14 +185,15 @@ impl SequenceState {
     }
 
     /// Channels in registry declaration order.
-    pub fn channels_ordered(&self) -> Vec<&ChannelState> {
-        self.channels.iter().collect()
+    pub fn channels_ordered(&self) -> &[ChannelState] {
+        &self.channels
     }
 
     pub fn channel(&self, name: &str) -> Option<&ChannelState> {
         self.channels.iter().find(|channel| channel.name == name)
     }
 
+    #[cfg(test)]
     pub fn channel_count(&self) -> usize {
         self.channels.len()
     }
@@ -251,45 +252,30 @@ pub struct SequenceStore {
     _task: Task<()>,
 }
 
-/// Hands the shared [`SequenceStore`] entity to any part of the app.
-pub struct GlobalSequenceStore(pub Entity<SequenceStore>);
-
-impl Global for GlobalSequenceStore {}
-
 /// The shared sequence store, or `None` if it was never initialized (e.g. in tests).
 pub fn try_global(cx: &App) -> Option<Entity<SequenceStore>> {
-    cx.try_global::<GlobalSequenceStore>().map(|g| g.0.clone())
+    msg_ingest::global(cx)
 }
 
 impl SequenceStore {
     pub fn init(db: Arc<DB>, cx: &mut App) {
-        let entity = cx.new(|cx| SequenceStore::new(db, cx));
-        cx.set_global(GlobalSequenceStore(entity));
-    }
-
-    fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        // Registry declares channels before their events can fold, so it leads the
-        // sources list and wins equal-timestamp ties in the merged backfill.
-        let task = cx.spawn({
-            let db = db.clone();
-            async move |this, cx| {
-                let sources = vec![
-                    IngestSource::new(SequenceRegistry::ID, |store: &mut Self, ts, reg| {
-                        store.state.apply_registry(ts, reg)
-                    }),
-                    IngestSource::new(SequenceChannelEvent::ID, |store: &mut Self, ts, ev| {
-                        store.state.apply_event(ts, ev)
-                    }),
-                ];
-                ingest_all(db, sources, this, cx).await
+        msg_ingest::install(cx, |cx| {
+            // Registry declares channels before their events can fold, so it leads the
+            // sources list and wins equal-timestamp ties in the merged backfill.
+            let sources = vec![
+                IngestSource::new(SequenceRegistry::ID, |store: &mut Self, ts, reg| {
+                    store.state.apply_registry(ts, reg)
+                }),
+                IngestSource::new(SequenceChannelEvent::ID, |store: &mut Self, ts, ev| {
+                    store.state.apply_event(ts, ev)
+                }),
+            ];
+            Self {
+                state: SequenceState::default(),
+                _task: msg_ingest::spawn_ingest(db.clone(), sources, cx),
+                db,
             }
         });
-
-        Self {
-            state: SequenceState::default(),
-            db,
-            _task: task,
-        }
     }
 
     pub fn state(&self) -> &SequenceState {

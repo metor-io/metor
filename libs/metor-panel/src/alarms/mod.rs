@@ -15,14 +15,14 @@
 //! the shelf expires.
 //!
 //! State folding lives in [`AlarmState`] (pure, unit-tested). [`AlarmStore`] is the gpui
-//! entity that owns it plus the in-process reader tasks; [`GlobalAlarmStore`] hands the
+//! entity that owns it plus the in-process reader tasks; a gpui global hands the
 //! entity to any view via [`try_global`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, Context, Entity, Global, Task, prelude::*};
+use gpui::{App, Context, Entity, Task};
 use metor_db::DB;
 use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
@@ -30,7 +30,7 @@ use metor_proto_wkt::{
     AlarmUnshelved, OccurrenceId, Severity,
 };
 
-use crate::msg_ingest::{IngestSource, ingest_all};
+use crate::msg_ingest::{self, IngestSource};
 use latch::TileState;
 
 pub mod latch;
@@ -536,72 +536,59 @@ pub struct AlarmStore {
     _ticker: Task<()>,
 }
 
-/// Hands the shared [`AlarmStore`] entity to any part of the app.
-pub struct GlobalAlarmStore(pub Entity<AlarmStore>);
-
-impl Global for GlobalAlarmStore {}
-
 /// The shared alarm store, or `None` if it was never initialized (e.g. in tests).
 pub fn try_global(cx: &App) -> Option<Entity<AlarmStore>> {
-    cx.try_global::<GlobalAlarmStore>().map(|g| g.0.clone())
+    msg_ingest::global(cx)
 }
 
 impl AlarmStore {
     pub fn init(db: Arc<DB>, cx: &mut App) {
-        let entity = cx.new(|cx| AlarmStore::new(db, cx));
-        cx.set_global(GlobalAlarmStore(entity));
-    }
-
-    fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let operator = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "operator".to_string());
-
-        // Sources list cause before effect: defs and raises must fold before the clears
-        // and acks that reference them, so equal-timestamp records merge in this order.
-        let task = cx.spawn({
-            let db = db.clone();
-            async move |this, cx| {
-                let sources = vec![
-                    // The live snapshot channel: the whole def set in one
-                    // record (retained by the link for late joiners).
-                    IngestSource::new(AlarmDefs::ID, |store: &mut Self, _ts, defs: AlarmDefs| {
-                        for def in defs.defs {
-                            store.state.apply_def(def);
-                        }
-                    }),
-                    // Per-def records, still folded for recordings that
-                    // predate the set-shaped channel.
-                    IngestSource::new(AlarmDef::ID, |store: &mut Self, _ts, def| {
-                        store.state.apply_def(def)
-                    }),
-                    IngestSource::new(AlarmRaised::ID, |store: &mut Self, ts, raised| {
-                        store.state.apply_raised(ts, raised)
-                    }),
-                    IngestSource::new(AlarmShelved::ID, |store: &mut Self, ts, shelved| {
-                        store.state.apply_shelved(ts, shelved)
-                    }),
-                    IngestSource::new(AlarmUnshelved::ID, |store: &mut Self, ts, unshelved| {
-                        store.state.apply_unshelved(ts, unshelved)
-                    }),
-                    IngestSource::new(AlarmCleared::ID, |store: &mut Self, ts, cleared| {
-                        store.state.apply_cleared(ts, cleared)
-                    }),
-                    IngestSource::new(AlarmAck::ID, |store: &mut Self, ts, ack| {
-                        store.state.apply_ack(ts, ack)
-                    }),
-                ];
-                ingest_all(db, sources, this, cx).await
+        msg_ingest::install(cx, |cx| {
+            let operator = std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| "operator".to_string());
+            Self {
+                state: AlarmState::default(),
+                _task: msg_ingest::spawn_ingest(db.clone(), Self::sources(), cx),
+                db,
+                operator,
+                _ticker: spawn_shelf_ticker(cx),
             }
         });
+    }
 
-        Self {
-            state: AlarmState::default(),
-            db,
-            operator,
-            _task: task,
-            _ticker: spawn_shelf_ticker(cx),
-        }
+    /// Sources list cause before effect: defs and raises must fold before the clears
+    /// and acks that reference them, so equal-timestamp records merge in this order.
+    fn sources() -> Vec<IngestSource<Self>> {
+        vec![
+            // The live snapshot channel: the whole def set in one
+            // record (retained by the link for late joiners).
+            IngestSource::new(AlarmDefs::ID, |store: &mut Self, _ts, defs: AlarmDefs| {
+                for def in defs.defs {
+                    store.state.apply_def(def);
+                }
+            }),
+            // Per-def records, still folded for recordings that
+            // predate the set-shaped channel.
+            IngestSource::new(AlarmDef::ID, |store: &mut Self, _ts, def| {
+                store.state.apply_def(def)
+            }),
+            IngestSource::new(AlarmRaised::ID, |store: &mut Self, ts, raised| {
+                store.state.apply_raised(ts, raised)
+            }),
+            IngestSource::new(AlarmShelved::ID, |store: &mut Self, ts, shelved| {
+                store.state.apply_shelved(ts, shelved)
+            }),
+            IngestSource::new(AlarmUnshelved::ID, |store: &mut Self, ts, unshelved| {
+                store.state.apply_unshelved(ts, unshelved)
+            }),
+            IngestSource::new(AlarmCleared::ID, |store: &mut Self, ts, cleared| {
+                store.state.apply_cleared(ts, cleared)
+            }),
+            IngestSource::new(AlarmAck::ID, |store: &mut Self, ts, ack| {
+                store.state.apply_ack(ts, ack)
+            }),
+        ]
     }
 
     pub fn state(&self) -> &AlarmState {

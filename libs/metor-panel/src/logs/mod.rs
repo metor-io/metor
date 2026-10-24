@@ -10,12 +10,12 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use gpui::{App, Context, Entity, Global, Task, prelude::*};
+use gpui::{App, Entity, Task};
 use metor_db::DB;
 use metor_proto::types::Msg;
 use metor_proto_wkt::LogEvent;
 
-use crate::msg_ingest::{IngestSource, ingest_all};
+use crate::msg_ingest::{self, IngestSource};
 
 /// How many lines the in-memory ring keeps for the viewer. Logs are much
 /// chattier than alarms; deeper history stays queryable from the persisted
@@ -92,37 +92,25 @@ pub struct LogStore {
     _task: Task<()>,
 }
 
-/// Hands the shared [`LogStore`] entity to any part of the app.
-pub struct GlobalLogStore(pub Entity<LogStore>);
-
-impl Global for GlobalLogStore {}
-
 /// The shared log store, or `None` if it was never initialized (e.g. in tests).
 pub fn try_global(cx: &App) -> Option<Entity<LogStore>> {
-    cx.try_global::<GlobalLogStore>().map(|g| g.0.clone())
+    msg_ingest::global(cx)
 }
 
 impl LogStore {
     pub fn init(db: Arc<DB>, cx: &mut App) {
-        let entity = cx.new(|cx| LogStore::new(db, cx));
-        cx.set_global(GlobalLogStore(entity));
-    }
-
-    fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let task = cx.spawn(async move |this, cx| {
+        msg_ingest::install(cx, |cx| {
             // Display uses the event's payload timestamp (the FSW-side clock);
             // the merge timestamp only orders the backfill.
             let sources = vec![IngestSource::new(
                 LogEvent::ID,
                 |store: &mut Self, _ts, event: LogEvent| store.state.push(event),
             )];
-            ingest_all(db, sources, this, cx).await
+            Self {
+                state: LogState::default(),
+                _task: msg_ingest::spawn_ingest(db, sources, cx),
+            }
         });
-
-        Self {
-            state: LogState::default(),
-            _task: task,
-        }
     }
 
     pub fn state(&self) -> &LogState {

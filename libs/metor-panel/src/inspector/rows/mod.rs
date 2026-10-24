@@ -365,6 +365,55 @@ fn elide_front(
     (String::from("…"), leaf.to_string())
 }
 
+/// Height of every inspector row, so editing, header and ordinary rows stack
+/// uniformly and hosts can size their containers from a row count.
+pub const ROW_HEIGHT: f32 = 28.0;
+
+/// A row's leading label in the row font.
+pub fn row_label(label: impl Into<SharedString>, color: Hsla) -> gpui::Div {
+    div()
+        .text_size(LABEL_SIZE)
+        .text_color(color)
+        .child(label.into())
+}
+
+/// A row's trailing value: right-aligned, taking the remaining width, and
+/// ellipsised when it doesn't fit.
+pub fn row_value(value: impl Into<SharedString>, color: Hsla) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .text_size(LABEL_SIZE)
+        .text_color(color)
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .text_right()
+        .child(value.into())
+}
+
+/// The label-and-value summary the editable leaf rows share. `muted` dims
+/// both sides for read-only rows.
+pub fn value_row(
+    row_ix: usize,
+    selected: bool,
+    label: SharedString,
+    value: SharedString,
+    muted: bool,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = theme(cx);
+    let (label_color, value_color) = if muted {
+        (theme.text_tertiary, theme.text_tertiary)
+    } else {
+        (theme.text_primary, theme.text_secondary)
+    };
+    row_base(row_ix, selected, cx)
+        .gap(px(2.))
+        .child(row_label(label, label_color))
+        .child(row_value(value, value_color))
+}
+
 /// Row-chrome the concrete widgets wrap: background, hover, spacing, and id.
 ///
 /// The selection/hover highlight is painted as an inset rounded pill behind
@@ -390,7 +439,7 @@ pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui:
         .items_center()
         .justify_between()
         .w_full()
-        .h(px(28.0))
+        .h(px(ROW_HEIGHT))
         .px(px(12.0))
         .child(
             div()

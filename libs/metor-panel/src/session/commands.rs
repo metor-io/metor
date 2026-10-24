@@ -378,12 +378,7 @@ pub(crate) fn request_quit(window: &mut Window, cx: &mut App) {
     .detach();
 }
 pub(crate) fn open_recording(window: &mut Window, cx: &mut App) {
-    let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
-        files: true,
-        directories: true,
-        multiple: false,
-        prompt: Some("Open recording".into()),
-    });
+    let receiver = cx.prompt_for_paths(open_recording_prompt());
     let handle = window.window_handle();
     cx.spawn(async move |cx| {
         let Ok(Ok(Some(paths))) = receiver.await else {

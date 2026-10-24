@@ -5,7 +5,7 @@ use gpui::{
     div, fill, point, prelude::*, px, size,
 };
 
-use super::{InspectorRow, RowAction, row_base};
+use super::{InspectorRow, RowAction, row_base, row_label};
 use crate::theme::theme;
 
 const SLIDER_HEIGHT: f32 = 14.0;
@@ -143,12 +143,7 @@ impl InspectorRow for SliderRow {
         let value_text = SharedString::from(format!("{:.2}", val));
 
         row_base(row_ix, selected, cx)
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_primary)
-                    .child(self.label.clone()),
-            )
+            .child(row_label(self.label.clone(), theme.text_primary))
             .child(
                 div()
                     .flex()

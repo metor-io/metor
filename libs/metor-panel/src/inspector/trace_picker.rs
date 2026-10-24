@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, SharedString, Window, prelude::*};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
@@ -9,7 +9,7 @@ use crate::inspector::rows::PreviewSpec;
 
 use crate::inspector::rows::HeaderRow;
 use crate::inspector::rows::{
-    BoolRow, CommandRow, ExpressionRow, InspectorRow, NavRow, RowAction, row_base,
+    BoolRow, CommandRow, ExpressionRow, InspectorRow, NavRow, RowAction, row_base, row_label,
 };
 use crate::theme::theme;
 use crate::views::time_series::Trace;
@@ -558,7 +558,10 @@ fn element_page_rows(
     }
 
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-    rows.push(Box::new(DoneRow));
+    // Pinned back-affordance mirroring Escape/Backspace as a clickable row.
+    rows.push(Box::new(
+        CommandRow::action("Done", Arc::new(|_, _| RowAction::Pop)).pinned(),
+    ));
 
     for (idx, elem_name) in elem_names.into_iter().enumerate() {
         let display = if elem_name.is_empty() {
@@ -617,12 +620,7 @@ impl InspectorRow for ContinueRow {
             SharedString::from(format!("Continue ({n} traces)"))
         };
         row_base(row_ix, selected, cx)
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_primary)
-                    .child(text),
-            )
+            .child(row_label(text, theme.text_primary))
             .into_any_element()
     }
 
@@ -641,42 +639,6 @@ impl InspectorRow for ContinueRow {
             }
             ContinueAction::CascadeView(build) => RowAction::CascadeView(build(traces, cx)),
         }
-    }
-}
-
-/// Pinned back-affordance for the element page that pops one page off the
-/// inspector stack, mirroring Escape/Backspace but as a clickable row.
-struct DoneRow;
-
-impl InspectorRow for DoneRow {
-    fn label(&self) -> &str {
-        "Done"
-    }
-
-    fn consumes_search(&self) -> bool {
-        true
-    }
-
-    fn render_row(
-        &self,
-        row_ix: usize,
-        selected: bool,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> AnyElement {
-        let theme = theme(cx);
-        row_base(row_ix, selected, cx)
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_primary)
-                    .child(SharedString::new_static("Done")),
-            )
-            .into_any_element()
-    }
-
-    fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
-        RowAction::Pop
     }
 }
 

@@ -68,10 +68,59 @@ pub type EntityListHandler =
 pub enum AddBehavior<T: 'static> {
     /// Push a freshly-defaulted item with no user interaction.
     Default(Arc<dyn Fn(&mut App) -> T>),
-    /// Cascade into a multi-step wizard that eventually appends the item.
-    /// The closure receives the parent entity so the wizard knows where to
-    /// write the result.
-    Wizard(Arc<dyn Fn(AnyEntity, &Arc<DB>, &App) -> Vec<Box<dyn InspectorRow>>>),
+    /// Cascade into a multi-step wizard that eventually appends the items.
+    /// The wizard reads and writes the parent's list through [`EntityList`],
+    /// so its append runs the parent's edit hook like any other edit.
+    Wizard(Arc<dyn Fn(EntityList<T>, &Arc<DB>, &App) -> Vec<Box<dyn InspectorRow>>>),
+}
+
+/// One parent's `Vec<Entity<T>>` field, erased of the parent type.
+///
+/// Built by [`InspectorRegistry::register_entity_list`] from its typed
+/// accessors; appending goes through [`InspectorRegistry::notify_edited`] so
+/// every add path triggers the same hook a reflected field write would.
+pub struct EntityList<T: 'static> {
+    items: Arc<dyn Fn(&App) -> Vec<Entity<T>>>,
+    append: Arc<dyn Fn(Vec<T>, &mut App)>,
+}
+
+impl<T: 'static> Clone for EntityList<T> {
+    fn clone(&self) -> Self {
+        Self {
+            items: self.items.clone(),
+            append: self.append.clone(),
+        }
+    }
+}
+
+impl<T: 'static> EntityList<T> {
+    fn new<ParentT: 'static>(
+        parent: Entity<ParentT>,
+        get_list: fn(&ParentT) -> &Vec<Entity<T>>,
+        get_list_mut: fn(&mut ParentT) -> &mut Vec<Entity<T>>,
+    ) -> Self {
+        let read_parent = parent.clone();
+        Self {
+            items: Arc::new(move |cx| get_list(read_parent.read(cx)).clone()),
+            append: Arc::new(move |items, cx| {
+                let entities: Vec<_> = items.into_iter().map(|item| cx.new(|_| item)).collect();
+                parent.update(cx, |p, _| get_list_mut(p).extend(entities));
+                InspectorRegistry::notify_edited(&parent.clone().into_any(), cx);
+            }),
+        }
+    }
+
+    pub fn items(&self, cx: &App) -> Vec<Entity<T>> {
+        (self.items)(cx)
+    }
+
+    pub fn len(&self, cx: &App) -> usize {
+        self.items(cx).len()
+    }
+
+    pub fn append(&self, items: Vec<T>, cx: &mut App) {
+        (self.append)(items, cx)
+    }
 }
 
 impl<T: 'static> Clone for AddBehavior<T> {
@@ -221,7 +270,6 @@ impl InspectorRegistry {
         ItemT: Facet<'static> + 'static,
     >(
         &mut self,
-        _db: Arc<DB>,
         get_list: fn(&ParentT) -> &Vec<Entity<ItemT>>,
         get_list_mut: fn(&mut ParentT) -> &mut Vec<Entity<ItemT>>,
         add_behavior: AddBehavior<ItemT>,
@@ -236,7 +284,8 @@ impl InspectorRegistry {
                 let items: Vec<Entity<ItemT>> = get_list(parent.read(cx)).clone();
                 let item_count = items.len();
                 let db = db.clone();
-                let parent_for_add = parent.clone();
+                let parent_for_remove = parent.clone();
+                let list = EntityList::new(parent, get_list, get_list_mut);
                 let add_behavior = add_behavior.clone();
 
                 Box::new(NavRow::new(
@@ -254,7 +303,7 @@ impl InspectorRegistry {
                                     });
                                 let entity = entity.clone();
                                 let db = db.clone();
-                                let parent_for_remove = parent_for_add.clone();
+                                let parent_for_remove = parent_for_remove.clone();
                                 let idx = i;
 
                                 Box::new(NavRow::new(
@@ -289,30 +338,24 @@ impl InspectorRegistry {
 
                         match &add_behavior {
                             AddBehavior::Default(factory) => {
-                                let add_parent = parent_for_add.clone();
+                                let list = list.clone();
                                 let factory = factory.clone();
                                 rows.push(Box::new(CommandRow::new(
                                     "Add",
                                     Arc::new(move |_w, cx| {
                                         let item = factory(cx);
-                                        let entity = cx.new(|_| item);
-                                        add_parent.update(cx, |p, _| {
-                                            get_list_mut(p).push(entity);
-                                        });
-                                        Self::notify_edited(&add_parent.clone().into_any(), cx);
+                                        list.append(vec![item], cx);
                                     }),
                                 )));
                             }
                             AddBehavior::Wizard(wizard) => {
-                                let add_parent = parent_for_add.clone();
+                                let list = list.clone();
                                 let db = db.clone();
                                 let wizard = wizard.clone();
                                 rows.push(Box::new(NavRow::new(
                                     "Add",
                                     SharedString::new_static(""),
-                                    Box::new(move |cx| {
-                                        wizard(add_parent.clone().into_any(), &db, cx)
-                                    }),
+                                    Box::new(move |cx| wizard(list.clone(), &db, cx)),
                                 )));
                             }
                         }

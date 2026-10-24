@@ -3,7 +3,7 @@
 //! Three sources:
 //! - **File on disk** — caller provides the path (typically picked via the OS
 //!   save dialog). Round-trip is plain `std::fs`.
-//! - **Built-in directory** — `dirs::config_dir()/metor/panel/presets/`. Each
+//! - **Built-in directory** — `presets/` under the panel config directory. Each
 //!   preset is one `<name>.json` file. The directory is created on demand.
 //! - **The connected target** — a target declaring `Presets(...)` broadcasts
 //!   a [`PresetDefs`] snapshot the link replays on every connection;
@@ -22,24 +22,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, io};
 
-use gpui::{App, Context, Entity, Global, Task, prelude::*};
+use gpui::{App, Entity, Task};
 use metor_db::DB;
 use metor_proto::types::Msg;
 use metor_proto_wkt::{Preset, PresetDefs};
 
-use crate::msg_ingest::{IngestSource, ingest_all};
+use crate::msg_ingest::{self, IngestSource};
 use crate::tiles::TileGroup;
 
 /// Resolve the per-user preset directory path. Does **not** create it —
 /// list/read paths shouldn't materialize the directory just by being walked.
 fn presets_dir_path() -> io::Result<PathBuf> {
-    let base = dirs::config_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config dir"))?;
-    Ok(base.join("metor").join("panel").join("presets"))
+    Ok(crate::config::config_dir()?.join("presets"))
 }
 
 /// Resolve and create the per-user preset directory. Used by the write path.
-pub fn presets_dir() -> io::Result<PathBuf> {
+fn presets_dir() -> io::Result<PathBuf> {
     let dir = presets_dir_path()?;
     fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -102,11 +100,6 @@ pub fn save_preset(name: &str, json: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Read a preset file from disk.
-pub fn load_preset(path: &Path) -> io::Result<String> {
-    fs::read_to_string(path)
-}
-
 /// Replace the current tile layout with the one encoded in `json`.
 ///
 /// Pulls the panel-item registry from globals so callers don't have to
@@ -127,34 +120,24 @@ pub struct TargetPresetStore {
     _task: Task<()>,
 }
 
-pub struct GlobalTargetPresets(pub Entity<TargetPresetStore>);
-
-impl Global for GlobalTargetPresets {}
-
 /// The shared store, or `None` if it was never initialized (e.g. in tests).
 pub fn try_target_presets(cx: &App) -> Option<Entity<TargetPresetStore>> {
-    cx.try_global::<GlobalTargetPresets>().map(|g| g.0.clone())
+    msg_ingest::global(cx)
 }
 
 impl TargetPresetStore {
     pub fn init(db: Arc<DB>, cx: &mut App) {
-        let entity = cx.new(|cx| TargetPresetStore::new(db, cx));
-        cx.observe(&entity, apply_shipped_preset).detach();
-        cx.set_global(GlobalTargetPresets(entity));
-    }
-
-    fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let task = cx.spawn(async move |this, cx| {
+        let entity = msg_ingest::install(cx, |cx| {
             let sources = vec![IngestSource::new(
                 PresetDefs::ID,
                 |store: &mut Self, _ts, defs: PresetDefs| store.presets = defs.presets,
             )];
-            ingest_all(db, sources, this, cx).await
+            Self {
+                presets: Vec::new(),
+                _task: msg_ingest::spawn_ingest(db, sources, cx),
+            }
         });
-        Self {
-            presets: Vec::new(),
-            _task: task,
-        }
+        cx.observe(&entity, apply_shipped_preset).detach();
     }
 
     pub fn presets(&self) -> &[Preset] {

@@ -150,14 +150,7 @@ pub struct NodeGrant<'a> {
 
 impl NodeGrant<'_> {
     pub fn samples(&self) -> impl Iterator<Item = (Timestamp, &[u8])> + '_ {
-        let msg_size = self.msg_size;
-        self.grant.chunks_exact(msg_size).map(move |chunk| {
-            let ts_bytes: [u8; 8] = chunk[..size_of::<Timestamp>()]
-                .try_into()
-                .expect("timestamp slice");
-            let value = &chunk[size_of::<Timestamp>()..];
-            (Timestamp::from_le_bytes(ts_bytes), value)
-        })
+        (0..self.sample_count()).map(|i| self.sample_at(i))
     }
 
     /// Number of complete `[Timestamp][value]` messages in this grant.

@@ -109,34 +109,11 @@ fn fnv1a(s: &str) -> u32 {
 
 /// Load the index, falling back to empty on a missing or malformed file.
 pub fn load_index() -> ConnectionsIndex {
-    let Ok(path) = index_path() else {
-        return ConnectionsIndex::default();
-    };
-    let json = match fs::read_to_string(&path) {
-        Ok(json) => json,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return ConnectionsIndex::default(),
-        Err(e) => {
-            tracing::error!(path = %path.display(), %e, "read connections index failed");
-            return ConnectionsIndex::default();
-        }
-    };
-    match facet_json::from_str(&json) {
-        Ok(index) => index,
-        Err(e) => {
-            tracing::error!(path = %path.display(), %e, "parse connections index failed");
-            ConnectionsIndex::default()
-        }
-    }
+    crate::config::load_json(index_path(), "connections index")
 }
 
 pub fn save_index(index: &ConnectionsIndex) -> io::Result<()> {
-    let path = index_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let json = facet_json::to_string(index)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    fs::write(&path, json)
+    crate::config::save_json(&index_path()?, index)
 }
 
 /// The saved layout for `id`, if one exists.
