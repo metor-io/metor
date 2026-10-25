@@ -438,6 +438,11 @@ impl DB {
         })
     }
 
+    /// Sets a component's display metadata and persists it.
+    pub fn set_component_metadata(&self, metadata: ComponentMetadata) -> Result<(), Error> {
+        self.with_state_mut(|s| s.set_component_metadata(metadata, &self.path))
+    }
+
     /// Set what this db advertises in its [`DbInfoResp`]: the namespace its
     /// components carry and the command set clients forward up.
     pub fn set_identity(&self, namespace: Option<String>, command_ids: Vec<PacketId>) {
