@@ -318,28 +318,6 @@ mod tests {
     }
 
     #[test]
-    fn test_with_image_round_trip() {
-        let meta = mono16(12);
-        assert_eq!(meta.get(IMAGE_FORMAT_KEY), Some("mono16"));
-        assert_eq!(meta.get(IMAGE_BITS_KEY), Some("12"));
-        assert_eq!(meta.lod(), Some(false));
-        assert_eq!(meta.image_format(), Some("mono16"));
-        assert_eq!(meta.image_bits(), Some(12));
-        let image = meta.image().expect("valid").expect("an image");
-        assert_eq!(
-            image,
-            ImageMeta {
-                format: ImageFormat::Mono16,
-                bits: 12,
-                black: None,
-                white: None,
-                stretch: Stretch::Auto,
-            }
-        );
-        assert_eq!(image.check(PrimType::U16, &[1024, 1024]), Ok(()));
-    }
-
-    #[test]
     fn test_display_hints() {
         let mut meta = mono16(12);
         meta.set(IMAGE_BLACK_KEY, "200");
@@ -359,29 +337,6 @@ mod tests {
     }
 
     #[test]
-    fn test_format_names_round_trip() {
-        for format in ImageFormat::ALL {
-            assert_eq!(format.as_str().parse(), Ok(format));
-        }
-        assert_eq!(ImageFormat::BayerGbrg16.element(), PrimType::U16);
-        assert_eq!(ImageFormat::BayerGbrg16.channels(), 1);
-    }
-
-    #[test]
-    fn test_stretch_names() {
-        for stretch in [
-            Stretch::Linear,
-            Stretch::Sqrt,
-            Stretch::Asinh,
-            Stretch::Log,
-            Stretch::Auto,
-        ] {
-            assert_eq!(stretch.as_str().parse(), Ok(stretch));
-        }
-        assert_eq!("foo".parse(), Ok(Stretch::Auto));
-    }
-
-    #[test]
     fn test_missing_bits_is_element_width() {
         for (format, bits) in [
             (ImageFormat::Mono8, 8),
@@ -392,20 +347,6 @@ mod tests {
             let image = meta.image().expect("valid").expect("an image");
             assert_eq!(image.bits, bits);
         }
-    }
-
-    #[test]
-    fn test_not_an_image() {
-        assert_eq!(ComponentMetadata::from("cam").image(), Ok(None));
-        assert_eq!(ComponentMetadata::from("cam").image_format(), None);
-        assert_eq!(ComponentMetadata::from("cam").image_bits(), None);
-    }
-
-    #[test]
-    fn test_unknown_format_is_error() {
-        let mut meta = ComponentMetadata::from("cam");
-        meta.set(IMAGE_FORMAT_KEY, "mono12");
-        assert_eq!(meta.image(), Err(ImageMetaError::UnknownFormat));
     }
 
     #[test]

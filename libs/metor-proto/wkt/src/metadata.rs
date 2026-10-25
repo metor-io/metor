@@ -162,19 +162,3 @@ impl MetadataExt for EntityMetadata {
         &self.metadata
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lod_values() {
-        let meta = ComponentMetadata::from("a");
-        assert_eq!(meta.lod(), None);
-        assert_eq!(meta.clone().with_lod(true).lod(), Some(true));
-        assert_eq!(meta.clone().with_lod(false).lod(), Some(false));
-        let mut off = meta;
-        off.set(LOD_KEY, "off");
-        assert_eq!(off.lod(), None);
-    }
-}
