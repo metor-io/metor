@@ -1743,8 +1743,6 @@ pub(crate) fn register_shutdown(
     cx: &mut App,
 ) {
     cx.on_app_quit(move |cx| {
-        #[cfg(debug_assertions)]
-        crate::views::image_view::synthetic::stop(cx);
         crate::session::finish_export(cx);
         crate::connections::flush_layout_now(cx);
         crate::session::save_workspace(None, cx);

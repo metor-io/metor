@@ -373,68 +373,6 @@ fn register_widget_provider(cx: &mut App) {
     ItemRegistry::register(cx, Category::Widget, provider);
 }
 
-/// "Debug: Synthetic Image Source": pick a kind, then a size and rate.
-/// While a source runs, the same command stops it.
-#[cfg(debug_assertions)]
-fn synthetic_source_item(db: Arc<DB>, cx: &App) -> InspectionItem {
-    use crate::views::image_view::synthetic;
-    const LABEL: &str = "Debug: Synthetic Image Source";
-    if synthetic::is_running(cx) {
-        return InspectionItem::Command {
-            label: SharedString::from(format!("{LABEL} (stop)")),
-            callback: Arc::new(|_window, cx| synthetic::stop(cx)),
-        };
-    }
-    InspectionItem::SubMenu {
-        label: LABEL.into(),
-        summary: SharedString::new_static("Stream a test image into the db"),
-        build: Arc::new(move |_cx| {
-            synthetic::Kind::ALL
-                .into_iter()
-                .map(|kind| {
-                    let db = db.clone();
-                    Box::new(NavRow::new(
-                        kind.label(),
-                        "",
-                        Box::new(move |_cx| synthetic_option_rows(db.clone(), kind)),
-                    )) as Box<dyn InspectorRow>
-                })
-                .collect()
-        }),
-    }
-}
-
-/// Sizes and rates for one kind, the default first.
-#[cfg(debug_assertions)]
-fn synthetic_option_rows(
-    db: Arc<DB>,
-    kind: crate::views::image_view::synthetic::Kind,
-) -> Vec<Box<dyn InspectorRow>> {
-    const OPTIONS: [(usize, f64); 5] = [
-        (256, 10.0),
-        (256, 1.0),
-        (256, 30.0),
-        (512, 10.0),
-        (1024, 10.0),
-    ];
-    OPTIONS
-        .into_iter()
-        .map(|(size, rate)| {
-            let db = db.clone();
-            Box::new(CommandRow::new(
-                SharedString::from(format!("{size}² · {rate} Hz")),
-                Arc::new(move |_window, cx| {
-                    let started =
-                        crate::views::image_view::synthetic::start(&db, kind, size, rate, cx);
-                    if let Err(err) = started {
-                        tracing::warn!(?err, "synthetic image source failed to start");
-                    }
-                }),
-            )) as Box<dyn InspectorRow>
-        })
-        .collect()
-}
-
 /// One row per image component, each opening an image view.
 fn open_image_rows(db: &DB) -> Vec<Box<dyn InspectorRow>> {
     let images = crate::views::image_view::list_image_components(db);
@@ -493,9 +431,6 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
                 });
             }),
         });
-
-        #[cfg(debug_assertions)]
-        items.push(synthetic_source_item(db.clone(), cx));
 
         let update_db = db.clone();
         items.push(InspectionItem::SubMenu {

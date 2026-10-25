@@ -16,8 +16,6 @@ mod resample;
 mod source;
 mod stretch;
 mod strip;
-#[cfg(any(debug_assertions, test))]
-pub mod synthetic;
 mod view;
 
 pub use histogram::{Histogram, RoiStats, finite_range, roi_stats};

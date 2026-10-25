@@ -720,83 +720,51 @@ mod tests {
         assert!(Arc::ptr_eq(&all[0], &c));
     }
 
-    /// The whole job (histogram, levels, LUT, resample, `RenderImage`) on a
-    /// 1024² Mono16/12 star field.
-    /// `cargo test -p metor-panel --release --lib -- --ignored --nocapture
-    /// image_view::render::tests::bench_job`
-    #[test]
-    #[ignore]
-    fn bench_job() {
-        use crate::views::image_view::synthetic::{Kind, frame as synthetic};
-
-        for kind in [Kind::StarField, Kind::TestCard, Kind::Bayer] {
-            let (w, h) = (1024, 1024);
-            let layout = FrameLayout::from_component(
-                &kind.schema(w, h),
-                &ComponentMetadata::from("cam").with_image(kind.format(), kind.bits()),
-            )
-            .unwrap();
-            let frame = Frame {
-                timestamp: Timestamp(1),
-                bytes: synthetic(kind, w, h, 0).into(),
-                layout,
-            };
-            let mut lut = None;
-            let mut scratch = Some(Scratch::default());
-            for (name, out) in [
-                ("fit 1200x1200", (1200, 1200)),
-                ("fit 1024x1024 (1:1)", (1024, 1024)),
-                ("fit 700x700", (700, 700)),
-                ("fit 400x400", (400, 400)),
-                ("fit 2400x1600", (2400, 1600)),
-            ] {
-                let key = RenderKey::new(
-                    &frame,
-                    Display::default(),
-                    fit(&frame.layout, out),
-                    out,
-                    [0; 4],
-                );
-                let mut ms: Vec<f64> = (0..33)
-                    .map(|_| {
-                        let mut s = scratch.take().unwrap_or_default();
-                        // Every frame is new, so nothing debayered is reused.
-                        s.color.debayered = None;
-                        let start = std::time::Instant::now();
-                        let rendered = run(Job {
-                            key: key.clone(),
-                            frame: frame.clone(),
-                            scratch: s,
-                            lut: lut.take(),
-                        });
-                        let elapsed = start.elapsed().as_secs_f64() * 1e3;
-                        assert_eq!(rendered.error, None);
-                        scratch = Some(rendered.scratch);
-                        lut = rendered.lut;
-                        elapsed
+    /// Eight colour bars (bar 5 red) as RGB8, or an RGGB 12-bit mosaic.
+    fn color_frame(bayer: bool, w: usize, h: usize) -> Frame {
+        const BARS: [[u8; 3]; 8] = [
+            [255, 255, 255],
+            [255, 255, 0],
+            [0, 255, 255],
+            [0, 255, 0],
+            [255, 0, 255],
+            [255, 0, 0],
+            [0, 0, 255],
+            [0, 0, 0],
+        ];
+        let rgb = |x: usize| BARS[x * BARS.len() / w];
+        let (format, bits, schema, bytes): (_, _, _, Vec<u8>) = match bayer {
+            false => (
+                ImageFormat::Rgb8,
+                8,
+                ComponentSchema::new(PrimType::U8, &[h, w, 3][..]),
+                (0..w * h).flat_map(|i| rgb(i % w)).collect(),
+            ),
+            true => (
+                ImageFormat::BayerRggb16,
+                12,
+                ComponentSchema::new(PrimType::U16, &[h, w][..]),
+                (0..w * h)
+                    .flat_map(|i| {
+                        let (x, y) = (i % w, i / w);
+                        let channel = match (y % 2, x % 2) {
+                            (0, 0) => 0,
+                            (1, 1) => 2,
+                            _ => 1,
+                        };
+                        (u16::from(rgb(x)[channel]) * 16).to_le_bytes()
                     })
-                    .skip(3)
-                    .collect();
-                ms.sort_by(f64::total_cmp);
-                println!(
-                    "job {:<10} {name:<24} median {:>7.3} ms  min {:>7.3} ms",
-                    kind.slug(),
-                    ms[15],
-                    ms[0]
-                );
-            }
-        }
-    }
-
-    fn color_frame(kind: crate::views::image_view::synthetic::Kind, w: usize, h: usize) -> Frame {
+                    .collect(),
+            ),
+        };
         let layout = FrameLayout::from_component(
-            &kind.schema(w, h),
-            &ComponentMetadata::from("cam").with_image(kind.format(), kind.bits()),
+            &schema,
+            &ComponentMetadata::from("cam").with_image(format, bits),
         )
         .unwrap();
         Frame {
             timestamp: Timestamp(1),
-            bytes: crate::views::image_view::synthetic::frame(kind, w, h, 3).into(),
+            bytes: bytes.into(),
             layout,
         }
     }
@@ -825,24 +793,23 @@ mod tests {
 
     #[test]
     fn color_frames_render_their_bars() {
-        use crate::views::image_view::synthetic::Kind;
-        // Bar 5 of 8 is red; row 20 is away from the moving white line.
+        // Bar 5 of 8 is red.
         let (w, h) = (64, 32);
         let red_x = 5 * w / 8 + 2;
-        for kind in [Kind::TestCard, Kind::Bayer] {
-            let frame = color_frame(kind, w, h);
+        for bayer in [false, true] {
+            let frame = color_frame(bayer, w, h);
             for step in [0.5, 1.0, 1.5, 2.0, 4.0] {
                 let viewport = Viewport {
                     origin: (0.0, 0.0),
                     step,
                 };
                 let rendered = run_at(&frame, viewport, (128, 64));
-                assert_eq!(rendered.error, None, "{kind:?} {step}");
+                assert_eq!(rendered.error, None, "{bayer} {step}");
                 let at = ((red_x as f64 / step) as usize, (20.0 / step) as usize);
                 let [b, g, r, a] = painted(&rendered, at.0, at.1);
                 assert!(
                     r > 200 && g < 60 && b < 60 && a == 255,
-                    "{kind:?} {step}: {:?}",
+                    "{bayer} {step}: {:?}",
                     (r, g, b)
                 );
             }
