@@ -500,9 +500,23 @@ impl DB {
 /// (`alarm_defs.limits.gyro`). `None` for a static field or a
 /// member template, which carry no runtime key.
 fn dynamic_member_name(rf: &RealizedField) -> Option<String> {
-    let container = rf.container?;
-    let mut name = String::from(container);
-    match rf.element? {
+    let mut name = String::new();
+    for (container, key) in rf.outer.iter() {
+        push_element(&mut name, container, key);
+        name.push('.');
+    }
+    push_element(&mut name, rf.container?, rf.element?);
+    if let Some(member) = rf.member.filter(|m| !m.is_empty()) {
+        name.push('.');
+        name.push_str(member);
+    }
+    Some(name)
+}
+
+/// Appends `<container>.<key>` to `name`.
+fn push_element(name: &mut String, container: &str, key: ElementKey) {
+    name.push_str(container);
+    match key {
         ElementKey::Key(key) => {
             name.push('.');
             name.push_str(key);
@@ -512,11 +526,6 @@ fn dynamic_member_name(rf: &RealizedField) -> Option<String> {
             let _ = write!(name, ".{idx}");
         }
     }
-    if let Some(member) = rf.member.filter(|m| !m.is_empty()) {
-        name.push('.');
-        name.push_str(member);
-    }
-    Some(name)
 }
 
 impl State {
