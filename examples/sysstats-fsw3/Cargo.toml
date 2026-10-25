@@ -1,0 +1,18 @@
+[package]
+name = "sysstats-fsw3"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "Host system statistics example: CPU, memory, NICs, processes, and disks at 100 Hz"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+metor-fsw-3 = { path = "../../libs/metor-fsw-3" }
+metor-proto = { path = "../../libs/metor-proto", features = ["std"] }
+metor-proto-stellar = { path = "../../libs/metor-proto/stellar" }
+metor-proto-wkt = { path = "../../libs/metor-proto/wkt", features = ["std"] }
+stats-systems = { package = "sysstats-systems-3", path = "systems/stats", default-features = false }
+stellarator = { path = "../../libs/stellarator" }

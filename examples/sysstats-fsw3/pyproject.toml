@@ -1,0 +1,10 @@
+[project]
+name = "sysstats-fsw3"
+version = "0.1.0"
+description = "A target that records host system statistics"
+requires-python = ">=3.11"
+dependencies = ["stats-pack", "metor-config"]
+
+[tool.uv.sources]
+stats-pack = { path = "systems/stats", editable = true }
+metor-config = { path = "../../libs/metor-fsw-3/python/metor-config", editable = true }
