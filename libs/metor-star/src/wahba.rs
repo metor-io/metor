@@ -134,9 +134,8 @@ fn weight_sum(obs: &[Obs]) -> f64 {
     obs.iter().map(weight).sum()
 }
 
-/// QUEST's characteristic quartic `λ⁴ − (a + b)λ² − cλ + (ab + cσ − d)`. Its
-/// roots are the eigenvalues of Davenport's `K`, so turning the references
-/// does not change it.
+/// QUEST's characteristic quartic `λ⁴ − (a + b)λ² − cλ + (ab + cσ − d)`,
+/// whose roots are the eigenvalues of Davenport's `K`.
 struct Quartic {
     a_plus_b: f64,
     c: f64,
@@ -165,9 +164,8 @@ impl Quartic {
         (4.0 * l * l - 2.0 * self.a_plus_b) * l - self.c
     }
 
-    /// Newton's method from `λ₀ = Σ aᵢ = 1`, which lies at or above the
-    /// largest root. Stops when a step is below [`NEWTON_TOL`] or no longer
-    /// shrinks, which happens once the steps are rounding noise.
+    /// Newton's method from `λ₀ = 1`, at or above the largest root, until a
+    /// step is below [`NEWTON_TOL`] or stops shrinking.
     fn largest_root(&self) -> Option<f64> {
         let mut lambda = 1.0;
         let mut last = f64::INFINITY;
@@ -190,17 +188,14 @@ impl Quartic {
 }
 
 /// The largest eigenvalue of Davenport's `K`, or `None` if Newton's method
-/// has not converged within [`NEWTON_STEPS`] steps.
+/// has not converged within `NEWTON_STEPS` steps.
 pub fn lambda_max(p: &Profile) -> Option<f64> {
     Quartic::new(p).largest_root()
 }
 
-/// QUEST's quaternion in the frame `axis` names, normalised, and its
-/// `|γ| / ‖[x; γ]‖`.
-///
-/// `[x; γ]` is the last column of `adj(λI − K) = f′(λ) q qᵀ`, so its norm
-/// is `f′(λ) |γ_unit|`. Dividing by `f′(λ)` measures `|γ_unit|` even when
-/// `x` and `γ` both vanish near 180°.
+/// QUEST's quaternion in the frame `axis` names, normalised, and `|γ|` of
+/// the unit quaternion: `‖[x; γ]‖ = f′(λ) |γ_unit|`, which stays measurable
+/// near 180° where `x` and `γ` both vanish.
 fn solve_in(p: &Profile, lambda: f64, slope: f64, axis: Option<Axis>) -> Option<(Quat, f64)> {
     let rotated;
     let p = match axis {
@@ -270,7 +265,7 @@ fn validate(obs: &[Obs]) -> Result<(), WahbaError> {
 }
 
 /// The QUEST measurement model's covariance `[Σ σᵢ⁻² (I − bᵢbᵢᵀ)]⁻¹`, or
-/// `None` when an axis is unobserved to within [`MIN_INFO_RATIO`].
+/// `None` when an axis is unobserved to within `MIN_INFO_RATIO`.
 pub fn attitude_covariance(obs: &[Obs]) -> Option<M3> {
     let info = obs.iter().fold([[0.0; 3]; 3], |m, o| {
         let tangent = mat_add(I3, mat_scale(outer(o.b, o.b), -1.0));

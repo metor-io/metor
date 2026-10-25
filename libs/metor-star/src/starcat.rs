@@ -1,10 +1,6 @@
-//! A zero-copy reader for `starcat.bin`, the simulator's render catalog.
-//!
-//! All fields are little-endian. The file is an 80 B [`Header`], then
-//! `n_cells` [`Cell`]s, `n_stars` [`Star`]s and `n_hip` [`HipEntry`]s, with no
-//! gaps. Cells are the nside-16 nested HEALPix cells. Each cell's stars are a
-//! contiguous run sorted by G, brightest first. Every field type has
-//! alignment 1, so any byte slice parses.
+//! A zero-copy reader for `starcat.bin`, the render catalog: a little-endian
+//! 80 B [`Header`], then the nside-16 HEALPix [`Cell`]s, the [`Star`]s (each
+//! cell's a run sorted by G) and the [`HipEntry`]s, all alignment 1.
 
 use core::ops::Range;
 

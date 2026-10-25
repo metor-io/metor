@@ -1,9 +1,6 @@
 //! Lost-in-space identification: Pyramid (Mortari et al. 2004) over the
 //! onboard DB's k-vector, then verification against every observed star.
-//!
-//! [`Pyramid`] is resumable: [`Pyramid::step`] tries at most `budget`
-//! triplets and returns [`Step::More`] when it stopped early, so a tracker
-//! can spread one hard frame over several cycles.
+//! [`Pyramid::step`] is resumable within a triplet budget.
 
 pub mod pyramid;
 pub mod verify;

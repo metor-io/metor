@@ -1,10 +1,6 @@
-//! The k-vector (Mortari 1997): a lookup that finds the entries of a sorted
-//! table within `[lo, hi]` in constant time, plus a short binary search.
-//!
-//! For `n` sorted values `y`, the line `z(i) = q + m·i`, `i ∈ 0..=n`, runs from
-//! just below `y[0]` to just above `y[n−1]`, and `k[i]` counts the values below
-//! `z(i)`. A query maps `lo` and `hi` onto the line to get a window of the
-//! table that holds every match, then trims it.
+//! The k-vector (Mortari 1997): the entries of a sorted table within
+//! `[lo, hi]` in constant time plus a short binary search. `k[i]` counts the
+//! values below the line `z(i) = q + m·i`, which spans the table.
 
 use alloc::vec::Vec;
 use core::ops::Range;

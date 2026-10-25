@@ -1,11 +1,7 @@
-//! Star extraction from a mono frame: a block background, a per-block
-//! threshold, 8-connected labelling over runs, and centre-of-gravity
-//! centroids. Every buffer is sized in [`Extractor::new`]; [`Extractor::run`]
-//! allocates nothing and its work is bounded by the frame size and
-//! `max_runs`.
-//!
-//! Pixel `(i, j)` covers `[i, i + 1) × [j, j + 1)`, as in [`crate::camera`],
-//! so a centroid of a single pixel is at `(i + 0.5, j + 0.5)`.
+//! Star extraction from a mono frame: a block background and threshold,
+//! 8-connected labelling over runs, and centre-of-gravity centroids, with
+//! pixel centres at `+0.5` as in [`crate::camera`]. [`Extractor::run`]
+//! allocates nothing.
 
 pub mod background;
 pub mod label;

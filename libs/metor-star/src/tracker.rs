@@ -1,11 +1,6 @@
-//! The star tracker's per-frame state machine.
-//!
-//! With a usable prior (an attitude predicted from the last solution and the
-//! gyro), [`Tracker`] projects the catalog around the predicted boresight,
-//! matches each centroid to its nearest prediction inside a gate, solves
-//! QUEST and verifies. Without one, or when tracking fails, it runs the
-//! lost-in-space [`Pyramid`] on the same frame, within a triplet budget that
-//! [`Tracker::resume`] continues on later calls.
+//! The star tracker's per-frame state machine: track from a prior when one
+//! is usable, else (or when tracking fails) run the lost-in-space
+//! [`Pyramid`] within a triplet budget that [`Tracker::resume`] continues.
 
 use alloc::vec::Vec;
 
@@ -16,24 +11,19 @@ use crate::image::{Centroid, Extractor, ImageConfig, ImageError, MAX_CENTROIDS};
 use crate::lis::{LisConfig, MAX_OBS, Match, NO_ROW, Pyramid, Step, verify};
 use crate::wahba::{Obs, quest};
 
-/// The simulator's centroid error falls as `≈0.85 px / √flux` (robust σ per
-/// axis, `lis_sim`); 1.2 covers its tails and keeps the tracker's NEES near
-/// 1.
+/// The simulator's centroid error is `≈0.85 px / √flux` per axis; 1.2
+/// covers its tails and keeps the NEES near 1.
 pub const SIGMA_FLUX_PX: f64 = 1.2;
 pub const SIGMA_FLOOR_PX: f64 = 0.02;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrackConfig {
-    /// Centroid 1σ (px), for per-star σ and the gate. It also sets the
-    /// lost-in-space σ, so both modes weigh stars and gate the residual
-    /// RMS alike.
+    /// Faint-star centroid 1σ (px), for the gate and the lost-in-space σ.
     pub sigma_px: f64,
-    /// Shot-noise term (px·√flux): a star of flux `F` (the extractor's
-    /// units) has σ `sigma_flux_px / √F`, between `sigma_floor_px` and
-    /// `sigma_px`.
+    /// Shot-noise term (px·√flux): a star of flux `F` has σ
+    /// `sigma_flux_px / √F`, clamped to `[sigma_floor_px, sigma_px]`.
     pub sigma_flux_px: f64,
-    /// The least per-star σ (px), for bright stars: calibration and
-    /// pixel-phase error.
+    /// The least per-star σ (px): calibration and pixel-phase error.
     pub sigma_floor_px: f64,
     /// Gate in units of the combined 1σ.
     pub gate_k: f64,
@@ -262,9 +252,7 @@ impl Tracker {
         }
     }
 
-    /// `m` re-solved on exactly its matched rows with each star's own σ, so
-    /// `q` and `p_theta` describe the stars it reports whichever mode found
-    /// them.
+    /// `m` re-solved on its matched rows with each star's own σ.
     fn refined(&mut self, mode: Mode, m: Match) -> Outcome {
         self.quest_obs.clear();
         for ((b, row), &sigma) in self.obs.iter().zip(m.rows).zip(&self.sigmas) {
@@ -337,9 +325,8 @@ impl Tracker {
         }
         let sol = quest(&self.quest_obs, None).ok()?;
         let v = verify(&self.db, sol.q, &self.obs, &lis, &mut self.cone);
-        // A wide gate can admit a wrong match that skews this first
-        // solution, so only the count is checked before QUEST runs again on
-        // everything verification matched.
+        // A wrong match can skew this first solution, so only the count is
+        // checked before QUEST reruns on what verification matched.
         if v.n_match < lis.min_match {
             return None;
         }

@@ -1,9 +1,6 @@
-//! The Pyramid search. For each image triplet `(i, j, k)` in Mortari's order
-//! it looks up the catalog pairs of edges `ij` and `ik` in the k-vector,
-//! joins them on their shared star through an epoch-stamped adjacency, and
-//! checks edge `jk` and the triangle's handedness directly. A unique
-//! triangle with a unique fourth star is verified against every
-//! observation.
+//! The Pyramid search: for each triplet in Mortari's order, join the catalog
+//! pairs of edges `ij` and `ik` on their shared star, check `jk` and the
+//! handedness, and verify a unique triangle with a unique fourth star.
 
 use alloc::vec;
 use alloc::vec::Vec;

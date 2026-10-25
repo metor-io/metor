@@ -72,14 +72,9 @@ impl StarSim {
         })
     }
 
-    /// Takes the next body state. An exposure starts on the frame cadence
-    /// and is rendered from the first state at or past its middle, so the
-    /// image's attitude is the true attitude at its mid-exposure stamp
-    /// whatever the body's rate does over the exposure (an exposure
-    /// extrapolated from its start at the start's rate was off by ατ²/8,
-    /// a 4σ common-mode error per frame under rate jitter); the
-    /// constant-rate streak is anchored there. Returns whether a frame was
-    /// rendered into [`image`](Self::image) and [`truth`](Self::truth).
+    /// Takes the next body state, and returns whether a frame was rendered.
+    /// An exposure starts on the frame cadence and renders from the first
+    /// state at or past its middle, so its attitude is the truth at its stamp.
     pub fn sample(&mut self, body: &BodyState) -> Result<bool, GpuError> {
         let t = body.timestamp.0;
         if self.exposing.is_none() && self.due(body.timestamp) {

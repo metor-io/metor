@@ -147,10 +147,6 @@ fn pairs_within(rows: &[Star], max: f64) -> Vec<Pair> {
     pairs
 }
 
-/// The HIP stars of `cat` (the simulator's truth names stars by HIP), each
-/// merged with the stars it blends with, uniform over the DB's cells: every
-/// cell gets its brightest star before any gets its second, until `n_stars`
-/// are taken.
 /// HIP star `row` merged with every star within `cos_r` of it in `cells`
 /// into one flux-weighted star, or `None` when a brighter HIP star is that
 /// close and carries the merge. `units` are every star's unit vector.
@@ -187,6 +183,9 @@ fn merge(
     })
 }
 
+/// The HIP stars of `cat` (the simulator's truth names stars by HIP), each
+/// merged with the stars it blends with, uniform over the DB's cells: every
+/// cell gets its brightest star before any gets its second.
 pub fn select(cat: &StarCat, opts: &Select) -> Vec<CatStar> {
     let radius = opts.merge_px * opts.px_rad;
     let cells = cat.cells();

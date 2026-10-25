@@ -1,10 +1,7 @@
 //! The star tracker's camera: a pinhole with Brown–Conrady distortion, and
-//! its mount on the body.
-//!
-//! Pixel coordinates `(u, v)` are continuous. Pixel `(i, j)` covers
-//! `[i, i + 1) × [j, j + 1)`, so its centre is at `(i + 0.5, j + 0.5)`. The
-//! star-tracker frame has `+z` along the boresight and `+x`, `+y` along `+u`,
-//! `+v`. Focal-plane coordinates `(x, y)` are in metres.
+//! its mount. Pixel `(i, j)` covers `[i, i + 1) × [j, j + 1)`; the
+//! star-tracker frame has `+z` on the boresight and `+x`, `+y` along `+u`,
+//! `+v`. Focal-plane coordinates are in metres.
 
 use crate::geom::{Quat, V3, add, dot, normalize, scale};
 
@@ -57,10 +54,8 @@ impl Intrinsics {
         (xx, xy, yy)
     }
 
-    /// Whether the field is unfolded at the ideal point `(x, y)`: the
-    /// Jacobian determinant is positive there, and the radial map
-    /// `r (1 + k₁r² + k₂r⁴)` is increasing all the way out to it, so the point
-    /// is on the central branch.
+    /// Whether the ideal point `(x, y)` is on the central branch: a positive
+    /// Jacobian there and a radial map increasing all the way out.
     pub fn unfolded(&self, x: f64, y: f64) -> bool {
         let (xx, xy, yy) = self.jacobian(x, y);
         let r2 = x * x + y * y;
@@ -75,10 +70,8 @@ impl Intrinsics {
         xx * yy - xy * xy > 0.0 && lowest > 0.0
     }
 
-    /// Inverts [`distort`](Self::distort) by Newton's method from `(x_d,
-    /// y_d)`. Returns `None` if it has not converged to [`UNDISTORT_TOL_M`]
-    /// within [`UNDISTORT_STEPS`] steps, or if the point found is not on the
-    /// field's central, unfolded branch.
+    /// Inverts [`distort`](Self::distort) by Newton's method; `None` unless
+    /// it converges onto the central branch.
     pub fn undistort(&self, xd: f64, yd: f64) -> Option<(f64, f64)> {
         let (mut x, mut y) = (xd, yd);
         for _ in 0..UNDISTORT_STEPS {
@@ -163,7 +156,6 @@ impl Camera {
 }
 
 /// First-order aberration: `b` as seen by an observer moving at `beta = v/c`.
-/// Off until P7; nothing calls it yet.
 pub fn aberrate(b: V3, beta: V3) -> Option<V3> {
     normalize(add(add(b, beta), scale(b, -dot(b, beta))))
 }

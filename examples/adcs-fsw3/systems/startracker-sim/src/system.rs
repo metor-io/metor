@@ -10,9 +10,6 @@ use crate::sim::StarSim;
 #[system]
 /// Renders a star-tracker frame from the true attitude every `1 / rate_hz`
 /// of sim time, and writes the image and its truth stamped at mid-exposure.
-/// Each frame is rendered from the body state at its mid-exposure, so the
-/// image shows the attitude its stamp names. It reads `World` for the
-/// ephemeris that aberration and bright-body blinding will use.
 pub async fn star_sim(
     #[state] state: &mut StarSim,
     body: &mut Input<BodyState, Notifier>,

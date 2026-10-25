@@ -1,9 +1,6 @@
-//! The wgpu renderer: the PSF splat of each [`Splat`] into a fixed-point
-//! accumulator (1/256 e⁻ per count, saturating at `u32::MAX`), then shot
-//! noise, read noise and the ADC, from a stateless per-pixel hash.
-//!
-//! Every buffer is made in [`GpuRenderer::new`]; the splat buffer grows if a
-//! frame needs more room. Readback blocks until the frame is done.
+//! The wgpu renderer: each [`Splat`]'s PSF into a fixed-point accumulator
+//! (1/256 e⁻ per count, saturating), then shot noise, read noise and the ADC
+//! from a per-pixel hash. Readback blocks until the frame is done.
 
 use std::string::{String, ToString};
 use std::sync::{Arc, Mutex};
