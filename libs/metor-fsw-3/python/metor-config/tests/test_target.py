@@ -378,17 +378,6 @@ class LinkTest(ConfigTest):
         with self.assertRaisesRegex(ConfigError, "record classes"):
             Subscribe(["ping"], transport=Listen("0.0.0.0:1"))  # type: ignore[list-item]
 
-    def test_links_check_conn_cap(self) -> None:
-        listen = Listen("0.0.0.0:1")
-        for cap in (64 << 10, 4 << 20, (1 << 32) - 1):
-            Publish(transport=listen, conn_cap=cap)
-            Subscribe([Ping], transport=listen, conn_cap=cap)
-        for cap in (0, (64 << 10) - 1, 1 << 32):
-            with self.assertRaisesRegex(ConfigError, "conn_cap"):
-                Publish(transport=listen, conn_cap=cap)
-            with self.assertRaisesRegex(ConfigError, "conn_cap"):
-                Subscribe([Ping], transport=listen, conn_cap=cap)
-
     def test_subscribe_resolves_record_ports(self) -> None:
         fsw = Target(cycle_rate=100.0, namespace="cube_sat")
         cmds = fsw.add("cmds", Subscribe([Ping], transport=Listen("0.0.0.0:2241")))

@@ -5,12 +5,9 @@ use crate::io::Buf;
 /// The bytes of a body's length prefix.
 const PREFIX: usize = 4;
 
-/// A length prefix past what the buffer holds. `len` is the packet's bytes,
-/// prefix included.
+/// A length prefix past what the buffer holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Oversized {
-    pub(crate) len: usize,
-}
+pub(crate) struct Oversized;
 
 /// One connection's receive buffer. Its filled bytes are the ones received;
 /// those before `start` have been read.
@@ -74,8 +71,7 @@ impl Deframer {
             .checked_add(body)
             .filter(|_| body <= self.cap.saturating_sub(PREFIX))
         else {
-            let len = body.saturating_add(PREFIX);
-            return Some(Err(Oversized { len }));
+            return Some(Err(Oversized));
         };
         let range = self.start + PREFIX..end;
         if end > self.buf.len() {
@@ -226,7 +222,7 @@ mod tests {
         assert!(d.spare().is_none(), "full until read");
         assert_eq!(bodies(&mut d), [vec![7; 12]]);
         recv(&mut d, &13u32.to_le_bytes());
-        assert_eq!(d.next(), Some(Err(Oversized { len: 17 })), "one byte past");
+        assert_eq!(d.next(), Some(Err(Oversized)), "one byte past");
     }
 
     #[test]
@@ -256,17 +252,12 @@ mod tests {
             &[frame(b"ok"), 13u32.to_le_bytes().to_vec()].concat(),
         );
         assert_eq!(d.next(), Some(Ok(&b"ok"[..])));
-        assert_eq!(d.next(), Some(Err(Oversized { len: 17 })));
+        assert_eq!(d.next(), Some(Err(Oversized)));
         recv(&mut d, b"more");
-        assert_eq!(
-            d.next(),
-            Some(Err(Oversized { len: 17 })),
-            "nothing further"
-        );
+        assert_eq!(d.next(), Some(Err(Oversized)), "nothing further");
         let (mut d, _io) = deframer(16);
         recv(&mut d, &u32::MAX.to_le_bytes());
-        let len = u32::MAX as usize + 4;
-        assert_eq!(d.next(), Some(Err(Oversized { len })), "the largest prefix");
+        assert_eq!(d.next(), Some(Err(Oversized)), "the largest prefix");
     }
 
     #[test]

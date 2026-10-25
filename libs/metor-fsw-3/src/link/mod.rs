@@ -63,10 +63,8 @@ pub struct LinkParams {
     /// Whether `ep` dials its peer rather than listening.
     #[serde(default)]
     pub dialing: bool,
-    /// The bytes of each connection's buffers in the direction records
-    /// travel: a `Publish`'s two send buffers and its batch, or a
-    /// `Subscribe`'s receive buffer. The other direction carries control
-    /// packets and takes [`CONTROL_CAP`] at most. Every port's records must
+    /// The bytes of each connection's receive buffer and of each of its two
+    /// send buffers. It is also the largest batch. Every port's records must
     /// fit, with their packet overhead.
     #[serde(default = "conn_cap")]
     pub conn_cap: usize,
@@ -89,26 +87,11 @@ fn write_timeout_ms() -> u64 {
     5_000
 }
 
-/// The most bytes a link's buffers take in the direction that carries only
-/// control packets.
-pub const CONTROL_CAP: usize = 64 << 10;
-
 impl LinkParams {
-    /// The connections of a link that sends records and receives control.
-    fn sending(&self) -> ConnsConfig {
-        self.conns(self.conn_cap.min(CONTROL_CAP), self.conn_cap)
-    }
-
-    /// The connections of a link that receives records and sends control.
-    fn receiving(&self) -> ConnsConfig {
-        self.conns(self.conn_cap, self.conn_cap.min(CONTROL_CAP))
-    }
-
-    fn conns(&self, rx_cap: usize, tx_cap: usize) -> ConnsConfig {
+    fn conns(&self) -> ConnsConfig {
         ConnsConfig {
             slots: self.max_connections.get(),
-            rx_cap,
-            tx_cap,
+            conn_cap: self.conn_cap,
             dialing: self.dialing,
             write_timeout: Duration::from_millis(self.write_timeout_ms),
         }
@@ -125,7 +108,7 @@ impl LinkParams {
 /// A link's op budget: [`conns::ops_for`] the slots its params ask for.
 fn link_ops(cx: &DefCx<'_>) -> Result<u16, DefError> {
     let params = LinkParams::of(cx)?;
-    let slots = params.map_or(max_connections().get(), |p| p.sending().slot_count());
+    let slots = params.map_or(max_connections().get(), |p| p.conns().slot_count());
     u16::try_from(conns::ops_for(slots)).map_err(|_| DefError::Params {
         message: format!("{slots} connections need more ops than a system holds"),
     })
@@ -219,9 +202,7 @@ impl StatusReporter {
         link_status: &mut Output<LinkStatus>,
         log: &mut Log,
     ) {
-        let rx_cap = conns.rx_cap();
-        turn.events()
-            .for_each(|event| log_event(event, rx_cap, log));
+        turn.events().for_each(|event| log_event(event, log));
         let status = LinkStatus::new(conns.stats(), inbound_dropped, now);
         if status.inbound_dropped > self.reported.inbound_dropped {
             let dropped = status.inbound_dropped - self.reported.inbound_dropped;
@@ -234,18 +215,11 @@ impl StatusReporter {
     }
 }
 
-/// Logs `event`. `rx_cap` is the bytes of a connection's receive buffer.
-fn log_event(event: Event, rx_cap: usize, log: &mut Log) {
+fn log_event(event: Event, log: &mut Log) {
     match event {
         Event::Opened(Some(peer)) => log.info(format!("connected to {peer}")),
         Event::Opened(None) => log.info("connected"),
         Event::Closed => log.info("disconnected"),
-        Event::Oversized { len } => log.fault(
-            "oversized_packet",
-            format!(
-                "closed a peer that sent a {len}-byte packet past the {rx_cap}-byte receive buffer"
-            ),
-        ),
         Event::Refused => log.warn("refused a peer: every connection is taken"),
         Event::Failed(error) => log.warn(format!("no stream opened: {error}")),
     }

@@ -41,7 +41,6 @@ T = TypeVar("T", bound=Record)
 
 MAX_CONNECTIONS = 8
 CONN_CAP = 1 << 20
-CONTROL_CAP = 64 << 10
 
 
 @dataclass(frozen=True)
@@ -146,15 +145,6 @@ class Link(System):
         return params
 
 
-def _check_conn_cap(conn_cap: int) -> None:
-    """Raises `ConfigError` unless ``conn_cap`` is between 64 KiB and
-    ``u32::MAX`` bytes."""
-    if not CONTROL_CAP <= conn_cap <= 0xFFFF_FFFF:
-        raise ConfigError(
-            f"`conn_cap` is between {CONTROL_CAP} and {0xFFFF_FFFF} bytes, got {conn_cap}"
-        )
-
-
 def _endpoint(link: str) -> str:
     """The name of the resource link ``link`` is granted as its `ep`."""
     return f"{link}_ep"
@@ -188,7 +178,7 @@ class Publish(_Sink, Link, _generated.Publish):
     publishes all of that system's ports, or a single port. With `all`, it
     publishes every system added before this one.
 
-    ``conn_cap`` sizes each connection's send buffers and the batch. It must
+    ``conn_cap`` sizes each connection's buffers and the batch. It must
     be at least the largest record published plus 8 bytes, so an image link
     needs one above its image's size; the build checks it.
     """
@@ -201,7 +191,6 @@ class Publish(_Sink, Link, _generated.Publish):
         conn_cap: int = CONN_CAP,
         all: bool = False,
     ) -> None:
-        _check_conn_cap(conn_cap)
         super().__init__({"conn_cap": conn_cap}, transport, items=items)
         self._sink(items, all)
 
@@ -266,7 +255,7 @@ class Subscribe(Link, _generated.Subscribe):
     With neither `items` nor `records`, it copies everything the peer
     publishes. Use `port()` to get this subscriber's copy of a peer's port.
 
-    ``conn_cap`` sizes each connection's receive buffer. It must be at least
+    ``conn_cap`` sizes each connection's buffers. It must be at least
     the largest record received plus 8 bytes, so an image link needs one
     above its image's size; the build checks it.
     """
@@ -281,7 +270,6 @@ class Subscribe(Link, _generated.Subscribe):
     ) -> None:
         if items and not isinstance(transport, Peer):
             raise ConfigError("`items` names a peer's ports, so it needs a `Peer` transport")
-        _check_conn_cap(conn_cap)
         super().__init__({"conn_cap": conn_cap}, transport, records=records)
         self._items = list(items)
         self._records = list(records)

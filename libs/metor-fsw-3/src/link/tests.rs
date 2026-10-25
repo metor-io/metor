@@ -122,24 +122,6 @@ fn test_conn_cap_fits_each_port() {
     );
 }
 
-#[test]
-fn test_buffers_split_by_direction() {
-    let params = |conn_cap: usize| LinkParams {
-        namespace: None,
-        link: String::new(),
-        max_connections: NonZeroUsize::MIN,
-        dialing: false,
-        conn_cap,
-        write_timeout_ms: 5_000,
-    };
-    let caps = |config: ConnsConfig| (config.rx_cap, config.tx_cap);
-    let image = params(4 << 20);
-    assert_eq!(caps(image.sending()), (CONTROL_CAP, 4 << 20));
-    assert_eq!(caps(image.receiving()), (4 << 20, CONTROL_CAP));
-    let small = params(4096);
-    assert_eq!(caps(small.sending()), (4096, 4096));
-}
-
 const CAP: usize = 4096;
 const STREAM: RawHandle = RawHandle::new(10, 1);
 const LISTENER: RawHandle = RawHandle::new(11, 1);
@@ -164,19 +146,13 @@ impl End {
     }
 
     /// Makes one connection's buffers and a batch buffer, as a link's make
-    /// does: a dialer receives records, and a listener sends them.
+    /// does.
     fn make(&self, dialing: bool) -> (ConnsMem, Buf) {
-        let params = LinkParams {
-            namespace: None,
-            link: String::new(),
-            max_connections: NonZeroUsize::MIN,
-            dialing,
+        let config = ConnsConfig {
+            slots: 1,
             conn_cap: CAP,
-            write_timeout_ms: 5_000,
-        };
-        let config = match dialing {
-            true => params.receiving(),
-            false => params.sending(),
+            dialing,
+            write_timeout: Duration::from_secs(5),
         };
         self.io
             .make(|init| Ok((ConnsMem::make(init, config)?, init.alloc(CAP)?)))

@@ -889,7 +889,6 @@ async fn test_oversized_packet_closes_connection() {
         seen.status().is_some_and(|s| s.connections == 0)
     })
     .await;
-    assert!(seen.faulted("oversized_packet"));
 }
 
 /// A `Publish` named `link` serving `camera.image`, with `conn_cap`.
@@ -937,36 +936,6 @@ fn test_port_past_conn_cap_fails_the_build() {
     let mut bare = image_publish("pub-bare", 1);
     bare.inputs.clear();
     assert!(build_with_camera(bare).is_ok(), "no inputs, any cap");
-}
-
-/// A subscriber closes a peer whose packet is past its receive buffer, and
-/// logs it.
-#[stellarator::test]
-async fn test_oversized_packet_is_logged() {
-    let seen = Seen::default();
-    let _target = spawn(
-        vec![
-            subscribe("cmds-oversized", listen_any("cmds-oversized")),
-            status_reader("cmds"),
-            reading("logs", "log_sink", "log", PortRef::new("cmds", "log")),
-        ],
-        &seen,
-        500.0,
-    );
-    let peer = raw_dial(bound("cmds-oversized")).await;
-    until_seen("the link never took the connection", &seen, || {
-        seen.status().is_some_and(|s| s.connections == 1)
-    })
-    .await;
-    let mut packet = ((2u32 << 20) - 4).to_le_bytes().to_vec();
-    packet.resize(2 << 20, 0);
-    // The link closes on the prefix, so the rest of the write may meet a
-    // closed socket.
-    let _ = peer.write_all(packet).await;
-    until_seen("the link never logged the packet", &seen, || {
-        seen.faulted("oversized_packet") && seen.status().is_some_and(|s| s.connections == 0)
-    })
-    .await;
 }
 
 #[stellarator::test]

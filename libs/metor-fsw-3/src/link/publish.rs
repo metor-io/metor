@@ -30,7 +30,7 @@ pub struct Publish {
 impl Publish {
     /// Allocates the connections' buffers and the batch's.
     pub fn new(params: LinkParams, io: &mut IoInit<'_>) -> Result<Self, MakeError> {
-        let conns = ConnsMem::make(io, params.sending())?;
+        let conns = ConnsMem::make(io, params.conns())?;
         let scratch = io.alloc(params.conn_cap)?;
         Ok(Self {
             params,
