@@ -150,7 +150,8 @@ fn config(namespace: &str, systems: Vec<SystemConfig>) -> CoordinatorConfig {
 fn cam_config(addr: SocketAddr) -> CoordinatorConfig {
     let publish = SystemConfig {
         params: json!({
-            "transport": { "listen": { "addr": addr.to_string(), "max_connections": 1 } },
+            "ep": { "tcp_listen": { "addr": addr.to_string() } },
+            "max_connections": 1,
             "namespace": "cam",
             "link": "cam-pub",
             "conn_cap": CONN_CAP,
@@ -191,7 +192,7 @@ fn gw_config(cam: SocketAddr, db: SocketAddr, path: &Path, conn_cap: usize) -> C
     };
     let subscribe = SystemConfig {
         params: json!({
-            "transport": { "connect": { "addr": cam.to_string() } },
+            "ep": { "tcp_dial": { "addr": cam.to_string() } },
             "link": "gw-sub",
             "conn_cap": conn_cap,
         }),

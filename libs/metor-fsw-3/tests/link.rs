@@ -950,11 +950,11 @@ async fn test_oversized_packet_closes_connection() {
     assert!(seen.faulted("oversized_packet"));
 }
 
-/// A `Publish` named `link` on `transport` that serves `big.big`.
-fn big_publish(link: &str, transport: serde_json::Value, conn_cap: usize) -> SystemConfig {
+/// A `Publish` named `link` on `ep` that serves `big.big`.
+fn big_publish(link: &str, ep: serde_json::Value, conn_cap: usize) -> SystemConfig {
     SystemConfig {
         params: json!({
-            "transport": transport,
+            "ep": ep,
             "namespace": "cube_sat",
             "link": link,
             "conn_cap": conn_cap,
@@ -977,7 +977,7 @@ fn big_mirror(addr: SocketAddr, conn_cap: usize) -> SystemConfig {
     };
     SystemConfig {
         params: json!({
-            "transport": { "connect": { "addr": addr.to_string() } },
+            "ep": dial(addr),
             "link": "big-mirror",
             "conn_cap": conn_cap,
         }),
@@ -1098,8 +1098,9 @@ async fn test_oversized_packet_is_logged() {
     .await;
     let mut packet = ((2u32 << 20) - 4).to_le_bytes().to_vec();
     packet.resize(2 << 20, 0);
-    let (written, _) = peer.write_all(packet).await;
-    written.expect("the link takes what fits");
+    // The link closes on the prefix, so the rest of the write may meet a
+    // closed socket.
+    let _ = peer.write_all(packet).await;
     until_seen("the link never logged the packet", &seen, || {
         seen.faulted("oversized_packet") && seen.status().is_some_and(|s| s.connections == 0)
     })
