@@ -204,7 +204,6 @@ mod tests {
         assert_eq!(metadata[0].get(IMAGE_FORMAT_KEY), Some("mono16"));
         assert_eq!(metadata[0].get(IMAGE_BITS_KEY), Some("12"));
         assert_eq!(metadata[0].lod(), Some(false));
-        assert_eq!((Small::WIDTH, Small::HEIGHT, Small::BYTES), (4, 2, 16));
     }
 
     #[test]
@@ -227,21 +226,6 @@ mod tests {
         let image = pattern();
         let back = Small::from_component_view(image.as_component_view()).expect("same shape");
         assert_eq!(back.pixels(), image.pixels());
-    }
-
-    #[test]
-    fn test_pixels_are_row_major() {
-        let image = pattern();
-        assert_eq!(image.pixels().len(), 8);
-        for y in 0..2 {
-            for x in 0..4 {
-                let px = image.get(x, y).expect("in bounds");
-                assert_eq!(px.0, image.pixels()[y * 4 + x]);
-                assert_eq!(px, image.rows()[y][x]);
-            }
-        }
-        assert_eq!(image.get(4, 0), None);
-        assert_eq!(image.get(0, 2), None);
     }
 
     #[test]

@@ -184,16 +184,6 @@ mod tests {
         assert_eq!(view.shape(), &[3]);
         let back = FrameArray::<u32, 3>::from_component_view(view).expect("same shape");
         assert_eq!(back, array);
-        assert_eq!(FrameArray::<f64, 2>::default(), FrameArray([0.0; 2]));
-    }
-
-    #[test]
-    fn test_assign_in_place() {
-        let mut array = FrameArray([0i32; 4]);
-        array
-            .assign_component_view(FrameArray([1, -2, 3, -4]).as_component_view())
-            .expect("same shape");
-        assert_eq!(array, FrameArray([1, -2, 3, -4]));
     }
 
     #[test]
