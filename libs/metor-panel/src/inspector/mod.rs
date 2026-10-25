@@ -817,7 +817,7 @@ impl Inspector {
                     )
                     .tooltip(|_, cx| {
                         crate::views::TooltipText::build(
-                            "Expand/collapse timeline (Alt-E); focus timeline (Alt-T)".into(),
+                            "Expand/collapse the panel below (Alt-E); focus it (Alt-T)".into(),
                             cx,
                         )
                     })
@@ -1189,12 +1189,16 @@ impl Render for Inspector {
                 .unwrap_or_else(|| self.first_selectable_index());
         }
         if !self.dismissed {
+            let had = self.accessory.is_some();
             self.accessory = match &self.current_page().kind {
                 InspectorPageKind::Rows(rows) => {
                     rows.iter().find_map(|r| r.accessory(&self.search.text, cx))
                 }
                 _ => None,
             };
+            if !had && self.accessory.as_ref().is_some_and(|a| a.expanded) {
+                self.accessory_expanded = true;
+            }
         }
         let panel = self.render_panel(window, cx);
         if self.dismissed {

@@ -14,6 +14,7 @@ mod readout;
 mod render;
 mod resample;
 mod source;
+mod stretch;
 mod strip;
 #[cfg(any(debug_assertions, test))]
 pub mod synthetic;
@@ -27,6 +28,8 @@ pub use readout::Readout;
 pub use render::{RenderKey, Scheduler};
 pub use resample::{Plane, Rect, RenderError, Scratch, Viewport, render_into, spans};
 pub use source::{Frame, FrameSource, FrameState, RecordSource, StaticSource};
+pub use stretch::stretch_rows;
+pub use strip::HistogramStrip;
 pub(crate) use view::image_view_config;
 pub use view::{ImageView, ImageViewConfig, ViewMode};
 

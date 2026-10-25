@@ -169,6 +169,9 @@ pub struct AccessorySpec {
     pub view: AnyView,
     pub focus: gpui::FocusHandle,
     pub dragging: std::sync::Arc<dyn Fn(&App) -> bool>,
+    /// Opens expanded: a companion that is the page's point, such as a
+    /// histogram, rather than a preview beside it.
+    pub expanded: bool,
 }
 
 /// Reply from [`InspectorRow::activate`] directing what the host should do next.

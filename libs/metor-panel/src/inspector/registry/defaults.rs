@@ -491,8 +491,10 @@ impl InspectorRegistry {
         }));
     }
 
-    /// Image view inspector: an image-only source picker, the default facet
-    /// rows (display), then the view commands.
+    /// Image view inspector, also its right-click menu: an image-only source
+    /// picker, overlays, the levels with the histogram beneath and the
+    /// stretch presets, the default facet rows (display, histogram
+    /// overlay), then the view commands.
     fn register_image_view_builder(&mut self) {
         use crate::views::image_view::ImageView;
         self.register_inspectable::<ImageView>();
@@ -506,6 +508,7 @@ impl InspectorRegistry {
                 image_source_row(view.clone(), db.clone(), cx),
                 image_overlay_row(view.clone(), db.clone()),
             ];
+            rows.extend(crate::views::image_view::stretch_rows(&view));
             rows.extend(defaults);
             let commands: [(
                 &'static str,
