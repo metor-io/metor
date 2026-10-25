@@ -235,8 +235,7 @@ pub struct Rendered {
     pub image: Option<(Arc<RenderImage>, Rect)>,
     pub error: Option<RenderError>,
     pub levels: (f64, f64),
-    /// Of the region auto levels use; `None` when neither auto levels nor
-    /// the strip asked for it.
+    /// Of the region auto levels use; `None` when the layout is bad.
     pub histogram: Option<Arc<Histogram>>,
     pub scratch: Scratch,
     pub lut: Option<(LutKey, Arc<Lut>)>,

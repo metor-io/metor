@@ -493,8 +493,8 @@ impl InspectorRegistry {
 
     /// Image view inspector, also its right-click menu: an image-only source
     /// picker, overlays, the levels with the histogram beneath and the
-    /// stretch presets, the default facet rows (display, histogram
-    /// overlay), then the view commands.
+    /// stretch presets, the default facet rows (display), then the view
+    /// commands.
     fn register_image_view_builder(&mut self) {
         use crate::views::image_view::ImageView;
         self.register_inspectable::<ImageView>();
