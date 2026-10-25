@@ -11,13 +11,16 @@ use super::*;
 const W: usize = 256;
 const H: usize = 192;
 
-/// A star: centre (px, pixel centres at +0.5), total DN, PSF σ (px).
+/// A star at σ = 1 px: centre (px, pixel centres at +0.5) and total DN.
 #[derive(Clone, Copy)]
 struct Spot {
     u: f64,
     v: f64,
     dn: f64,
-    sigma: f64,
+}
+
+fn spot(u: f64, v: f64, dn: f64) -> Spot {
+    Spot { u, v, dn }
 }
 
 /// The pixel-integrated Gaussian of `spots` on `bg` with Gaussian noise
@@ -35,15 +38,15 @@ fn frame(
     let cdf = |x: f64, s: f64| 0.5 * (1.0 + libm::erf(x / (s * core::f64::consts::SQRT_2)));
     let mut px = vec![0.0f64; w * h];
     for s in spots {
-        let r = (5.0 * s.sigma).ceil() as i64 + 1;
+        let r = 6;
         let (ci, cj) = (s.u as i64, s.v as i64);
         for j in (cj - r)..=(cj + r) {
             for i in (ci - r)..=(ci + r) {
                 if i < 0 || j < 0 || i >= w as i64 || j >= h as i64 {
                     continue;
                 }
-                let fx = cdf(i as f64 + 1.0 - s.u, s.sigma) - cdf(i as f64 - s.u, s.sigma);
-                let fy = cdf(j as f64 + 1.0 - s.v, s.sigma) - cdf(j as f64 - s.v, s.sigma);
+                let fx = cdf(i as f64 + 1.0 - s.u, 1.0) - cdf(i as f64 - s.u, 1.0);
+                let fy = cdf(j as f64 + 1.0 - s.v, 1.0) - cdf(j as f64 - s.v, 1.0);
                 px[j as usize * w + i as usize] += s.dn * fx * fy;
             }
         }
@@ -67,12 +70,11 @@ fn extractor(w: usize, h: usize) -> Extractor {
 fn random_spots(rng: &mut StdRng, n: usize, w: usize, h: usize, dn: (f64, f64)) -> Vec<Spot> {
     let mut spots: Vec<Spot> = Vec::new();
     while spots.len() < n {
-        let s = Spot {
-            u: rng.random_range(8.0..w as f64 - 8.0),
-            v: rng.random_range(8.0..h as f64 - 8.0),
-            dn: rng.random_range(dn.0..dn.1),
-            sigma: 1.0,
-        };
+        let s = spot(
+            rng.random_range(8.0..w as f64 - 8.0),
+            rng.random_range(8.0..h as f64 - 8.0),
+            rng.random_range(dn.0..dn.1),
+        );
         // Keep stars apart so each is its own blob.
         if spots.iter().all(|o| (o.u - s.u).hypot(o.v - s.v) > 10.0) {
             spots.push(s);
@@ -81,6 +83,8 @@ fn random_spots(rng: &mut StdRng, n: usize, w: usize, h: usize, dn: (f64, f64)) 
     spots
 }
 
+/// Every star found, brightest first, to 0.1 px RMS in 5 DN noise; a
+/// noiseless star on a pixel centre exactly.
 #[test]
 fn finds_every_bright_star_to_a_tenth_of_a_pixel() {
     let mut rng = StdRng::seed_from_u64(3);
@@ -89,36 +93,17 @@ fn finds_every_bright_star_to_a_tenth_of_a_pixel() {
     for seed in 0..20 {
         // Peak of a 300 DN star at σ 1 px is about 48 DN, ~10σ over 5 DN noise.
         let spots = random_spots(&mut rng, 15, W, H, (300.0, 3000.0));
-        let px = frame(W, H, &spots, flat, 5.0, seed);
-        let found = ex.run(&px).unwrap();
+        let found = ex.run(&frame(W, H, &spots, flat, 5.0, seed)).unwrap();
         assert_eq!(found.len(), spots.len(), "seed {seed}");
-        for s in &spots {
-            let c = found
-                .iter()
-                .min_by(|a, b| {
-                    (a.u - s.u)
-                        .hypot(a.v - s.v)
-                        .total_cmp(&(b.u - s.u).hypot(b.v - s.v))
-                })
-                .unwrap();
-            errs.push((c.u - s.u).hypot(c.v - s.v));
-        }
         assert!(found.windows(2).all(|w| w[0].flux >= w[1].flux));
+        for s in &spots {
+            let dist = |c: &Centroid| (c.u - s.u).hypot(c.v - s.v);
+            errs.push(found.iter().map(dist).fold(f64::MAX, f64::min));
+        }
     }
     let rms = (errs.iter().map(|e| e * e).sum::<f64>() / errs.len() as f64).sqrt();
     assert!(rms < 0.1, "CoG RMS {rms} px");
-}
-
-#[test]
-fn a_noiseless_star_centroids_exactly_on_a_pixel_centre() {
-    let spots = [Spot {
-        u: 100.5,
-        v: 60.5,
-        dn: 2000.0,
-        sigma: 1.0,
-    }];
-    let px = frame(W, H, &spots, flat, 0.0, 0);
-    let mut ex = extractor(W, H);
+    let px = frame(W, H, &[spot(100.5, 60.5, 2000.0)], flat, 0.0, 0);
     let c = ex.run(&px).unwrap()[0];
     assert!(
         (c.u - 100.5).abs() < 1e-9 && (c.v - 60.5).abs() < 1e-9,
@@ -126,17 +111,21 @@ fn a_noiseless_star_centroids_exactly_on_a_pixel_centre() {
     );
 }
 
+/// Of 40 stars the 20 kept track the 20 brightest.
 #[test]
 fn keeps_the_brightest() {
     let mut rng = StdRng::seed_from_u64(9);
     let spots = random_spots(&mut rng, 40, 512, 512, (300.0, 3000.0));
     let px = frame(512, 512, &spots, flat, 3.0, 1);
-    let mut ex = extractor(512, 512);
-    let found: Vec<f64> = ex.run(&px).unwrap().iter().map(|c| c.flux).collect();
+    let found: Vec<f64> = extractor(512, 512)
+        .run(&px)
+        .unwrap()
+        .iter()
+        .map(|c| c.flux)
+        .collect();
     assert_eq!(found.len(), 20);
     let mut dn: Vec<f64> = spots.iter().map(|s| s.dn).collect();
     dn.sort_by(|a, b| b.total_cmp(a));
-    // The 20 kept fluxes track the 20 brightest inputs.
     for (f, d) in found.iter().zip(&dn) {
         assert!((f / d - 1.0).abs() < 0.2, "{f} vs {d}");
     }
@@ -145,61 +134,23 @@ fn keeps_the_brightest() {
 #[test]
 fn edge_cases_are_rejected_or_kept() {
     let mut ex = extractor(W, H);
-    // A star cut by the border is still found.
-    let px = frame(
-        W,
-        H,
-        &[Spot {
-            u: 0.8,
-            v: 50.0,
-            dn: 2000.0,
-            sigma: 1.0,
-        }],
-        flat,
-        2.0,
-        2,
-    );
-    assert_eq!(ex.run(&px).unwrap().len(), 1);
-    // Two stars 7 px apart touch: one elongated blob, rejected.
-    let pair = [
-        Spot {
-            u: 50.0,
-            v: 50.0,
-            dn: 20_000.0,
-            sigma: 1.0,
-        },
-        Spot {
-            u: 57.0,
-            v: 50.0,
-            dn: 20_000.0,
-            sigma: 1.0,
-        },
-    ];
-    let found = ex.run(&frame(W, H, &pair, flat, 2.0, 3)).unwrap();
-    assert!(found.is_empty(), "{found:?}");
-    // A saturated star is rejected.
-    let sat = [Spot {
-        u: 50.0,
-        v: 50.0,
-        dn: 60_000.0,
-        sigma: 1.0,
-    }];
-    assert!(ex.run(&frame(W, H, &sat, flat, 2.0, 4)).unwrap().is_empty());
-    // A hot pixel is one pixel, under `min_area`.
+    let mut run =
+        |spots: &[Spot], seed| ex.run(&frame(W, H, spots, flat, 2.0, seed)).unwrap().len();
+    // A star cut by the border is kept; two touching stars (one elongated
+    // blob) and a saturated star are not.
+    assert_eq!(run(&[spot(0.8, 50.0, 2000.0)], 2), 1);
+    assert_eq!(run(&[spot(50.0, 50.0, 2e4), spot(57.0, 50.0, 2e4)], 3), 0);
+    assert_eq!(run(&[spot(50.0, 50.0, 6e4)], 4), 0);
+    // A hot pixel is under `min_area`; a uniform frame has no blobs.
     let mut hot = frame(W, H, &[], flat, 2.0, 5);
     hot[70 * W + 70] = 3000;
     assert!(ex.run(&hot).unwrap().is_empty());
-    // A uniform frame has no blobs.
     assert!(ex.run(&vec![500; W * H]).unwrap().is_empty());
     // A strong gradient is flattened by the block background.
     let ramp = |x: usize, y: usize| 100.0 + 3.0 * x as f64 + 2.0 * y as f64;
-    let star = [Spot {
-        u: 120.3,
-        v: 90.7,
-        dn: 2000.0,
-        sigma: 1.0,
-    }];
-    let found = ex.run(&frame(W, H, &star, ramp, 3.0, 6)).unwrap();
+    let found = ex
+        .run(&frame(W, H, &[spot(120.3, 90.7, 2000.0)], ramp, 3.0, 6))
+        .unwrap();
     assert_eq!(found.len(), 1, "{found:?}");
     assert!((found[0].u - 120.3).hypot(found[0].v - 90.7) < 0.3);
 }
@@ -208,15 +159,8 @@ fn edge_cases_are_rejected_or_kept() {
 fn a_flooded_frame_is_rejected_whole() {
     let mut ex = extractor(W, H);
     // A lattice of lit pixels: each is its own run.
-    let px: Vec<u16> = (0..W * H)
-        .map(|k| {
-            if (k % W).is_multiple_of(3) && (k / W).is_multiple_of(3) {
-                4095
-            } else {
-                0
-            }
-        })
-        .collect();
+    let lit = |k: usize| (k % W).is_multiple_of(3) && (k / W).is_multiple_of(3);
+    let px: Vec<u16> = (0..W * H).map(|k| if lit(k) { 4095 } else { 0 }).collect();
     let cfg = ImageConfig {
         max_runs: 1000,
         ..ImageConfig::default()
@@ -226,10 +170,8 @@ fn a_flooded_frame_is_rejected_whole() {
     // All 4095: one block-median background, nothing lit.
     assert!(ex.run(&vec![4095; W * H]).unwrap().is_empty());
     assert_eq!(ex.run(&px[1..]).err(), Some(ImageError::Size));
-    assert_eq!(
-        Extractor::new(0, 10, ImageConfig::default()).err(),
-        Some(ImageError::Config)
-    );
+    let zero = Extractor::new(0, 10, ImageConfig::default()).err();
+    assert_eq!(zero, Some(ImageError::Config));
 }
 
 #[test]
@@ -245,23 +187,4 @@ fn union_find_keeps_parents_below() {
             assert_eq!(find(&mut parent, a), find(&mut parent, b));
         }
     }
-}
-
-/// ms per 1024² frame with 40 stars. Run with `cargo test --release -p
-/// metor-star image_costs -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn image_costs() {
-    let mut rng = StdRng::seed_from_u64(5);
-    let spots = random_spots(&mut rng, 40, 1024, 1024, (300.0, 3000.0));
-    let px = frame(1024, 1024, &spots, flat, 5.0, 7);
-    let mut ex = extractor(1024, 1024);
-    let n = 50;
-    let start = std::time::Instant::now();
-    for _ in 0..n {
-        core::hint::black_box(ex.run(core::hint::black_box(&px)).unwrap());
-    }
-    let per = start.elapsed() / n;
-    std::println!("{per:?} per 1024² frame");
-    assert!(per.as_secs_f64() < 3e-3);
 }

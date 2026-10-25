@@ -42,16 +42,23 @@ fn gpu<'a>(cat: StarCat<'a>, sensor: Sensor, hot: HotPixels) -> GpuRenderer<'a> 
 
 /// Renders one frame at an identity attitude, turning at `omega_b`.
 fn render(gpu: &mut GpuRenderer<'_>, omega_b: V3, seed: u64) -> (Truth, Vec<u16>) {
-    let motion = Motion {
-        q_b_eci: Quat::IDENTITY,
-        omega_b,
-        beta: [0.0; 3],
-        t_exp: 0.1,
-    };
-    let frame = Frame::new(&SIM_CAMERA, &motion, 32, seed, 0).expect("a frame");
     let mut out = vec![0; SIM_SHAPE.pixels()];
-    let truth = gpu.render(&frame, &mut out).expect("a frame");
+    let truth = gpu
+        .render(&frame(omega_b, seed), &mut out)
+        .expect("a frame");
     (truth, out)
+}
+
+fn frame(omega_b: V3, seed: u64) -> Frame {
+    let q_b_eci = Quat::IDENTITY;
+    let (beta, t_exp) = ([0.0; 3], 0.1);
+    let motion = Motion {
+        q_b_eci,
+        omega_b,
+        beta,
+        t_exp,
+    };
+    Frame::new(&SIM_CAMERA, &motion, 32, seed, 0).expect("a frame")
 }
 
 /// Electrons and centre of gravity of `acc` within 12 px of `(u, v)`.
@@ -69,6 +76,10 @@ fn star(acc: &[u32], u: f64, v: f64) -> (f64, f64, f64) {
     (s, su / s, sv / s)
 }
 
+fn cold() -> HotPixels {
+    HotPixels::none(SIZE * SIZE)
+}
+
 fn moments(x: &[u16]) -> (f64, f64) {
     let n = x.len() as f64;
     let m = x.iter().map(|&v| f64::from(v)).sum::<f64>() / n;
@@ -84,11 +95,7 @@ fn stars_land_with_their_photometry_and_centroid() {
         .map(|&(u, v)| (at_pixel(u, v), 5.0, NO_HIP))
         .collect();
     let bytes = cat_bytes(&stars);
-    let mut gpu = gpu(
-        StarCat::parse(&bytes).unwrap(),
-        QUIET,
-        HotPixels::none(SIZE * SIZE),
-    );
+    let mut gpu = gpu(StarCat::parse(&bytes).unwrap(), QUIET, cold());
     let (truth, _) = render(&mut gpu, [0.0; 3], 1);
     assert_eq!((truth.count, truth.n_rendered), (3, 3));
     let acc = gpu.read_acc().expect("the accumulator");
@@ -124,9 +131,9 @@ fn flat_fields_have_poisson_and_read_noise() {
     };
     let all_hot = HotPixels::new(SIZE * SIZE, 1.0, 1.0001, 3);
     let cases = [
-        ("table", noisy(200.0), HotPixels::none(SIZE * SIZE), 20.0),
+        ("table", noisy(200.0), cold(), 20.0),
         ("knuth", noisy(200.0), all_hot, 20.0),
-        ("normal", noisy(2000.0), HotPixels::none(SIZE * SIZE), 200.0),
+        ("normal", noisy(2000.0), cold(), 200.0),
     ];
     for (label, sensor, hot, lambda) in cases {
         let (truth, out) = render(&mut gpu(cat, sensor, hot), [0.0; 3], 9);
@@ -136,10 +143,7 @@ fn flat_fields_have_poisson_and_read_noise() {
         let n = out.len() as f64;
         let (m_se, var_se) = ((expect_var / n).sqrt(), expect_var * (2.0 / n).sqrt());
         assert!((m - expect_m).abs() < 5.0 * m_se, "{label}: mean {m}");
-        assert!(
-            (var - expect_var).abs() < 5.0 * var_se,
-            "{label}: var {var}"
-        );
+        assert!((var - expect_var).abs() < 5.0 * var_se, "{label}: {var}");
     }
 }
 
@@ -167,7 +171,7 @@ fn saturation() {
         psf_sigma_px: 0.2,
         ..QUIET
     };
-    let mut r = gpu(cat, sharp, HotPixels::none(SIZE * SIZE));
+    let mut r = gpu(cat, sharp, cold());
     let (_, out) = render(&mut r, [0.0; 3], 1);
     let at = 512 * SIZE + 512;
     assert_eq!(r.read_acc().expect("the accumulator")[at], u32::MAX);
@@ -178,15 +182,12 @@ fn saturation() {
         bias_dn: 100.0,
         ..QUIET
     };
-    let (_, out) = render(
-        &mut gpu(cat, well, HotPixels::none(SIZE * SIZE)),
-        [0.0; 3],
-        1,
-    );
+    let (_, out) = render(&mut gpu(cat, well, cold()), [0.0; 3], 1);
     assert_eq!(out[at], 2100);
 }
 
-/// A frame of more splats than the GPU starts with grows its buffers.
+/// A frame of more splats than the GPU starts with grows its buffers; a
+/// short output is refused.
 #[test]
 fn splat_buffer_grows() {
     let stars: Vec<_> = (0..2500u32)
@@ -196,31 +197,10 @@ fn splat_buffer_grows() {
         })
         .collect();
     let bytes = cat_bytes(&stars);
-    let mut gpu = gpu(
-        StarCat::parse(&bytes).unwrap(),
-        QUIET,
-        HotPixels::none(SIZE * SIZE),
-    );
+    let mut gpu = gpu(StarCat::parse(&bytes).unwrap(), QUIET, cold());
     let (truth, _) = render(&mut gpu, [0.0, 0.0, 20f64.to_radians()], 1);
     assert!(gpu.scene().splats().len() > 1 << 15);
     assert_eq!(truth.n_rendered, 2500);
-}
-
-#[test]
-fn rejects_a_short_output() {
-    let bytes = cat_bytes(&[]);
-    let mut gpu = gpu(
-        StarCat::parse(&bytes).unwrap(),
-        QUIET,
-        HotPixels::none(SIZE * SIZE),
-    );
-    let motion = Motion {
-        q_b_eci: Quat::IDENTITY,
-        omega_b: [0.0; 3],
-        beta: [0.0; 3],
-        t_exp: 0.1,
-    };
-    let frame = Frame::new(&SIM_CAMERA, &motion, 1, 1, 0).unwrap();
-    let err = gpu.render(&frame, &mut [0; 100]).err();
+    let err = gpu.render(&frame([0.0; 3], 1), &mut [0; 100]).err();
     assert_eq!(err, Some(GpuError::Render(RenderError::BadOutput)));
 }

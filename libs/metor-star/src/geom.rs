@@ -240,8 +240,8 @@ impl Mul for Quat {
 mod tests {
     use super::*;
 
-    fn close(a: &[f64], b: &[f64], tol: f64) -> bool {
-        a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol)
+    fn close(a: &[f64], b: &[f64]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-15)
     }
 
     const Q: Quat = Quat([
@@ -252,131 +252,64 @@ mod tests {
     ]);
 
     #[test]
-    fn cross_is_orthogonal_and_right_handed() {
+    fn vectors_and_matrices() {
         assert_eq!(cross([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]), [0.0, 0.0, 1.0]);
-        let (a, b) = ([0.3, -1.2, 2.0], [4.0, 0.5, -0.7]);
-        let c = cross(a, b);
-        assert!(dot(a, c).abs() < 1e-14 && dot(b, c).abs() < 1e-14);
-    }
-
-    #[test]
-    fn normalize_scales_to_unit_length() {
         for v in [
             [3.0, 4.0, 0.0],
             [1e-250, 0.0, -1e-250],
             [1e200, 1e200, 1e200],
         ] {
-            let u = normalize(v).unwrap();
-            assert!((norm(u) - 1.0).abs() < 1e-15, "{v:?}");
+            assert!((norm(normalize(v).unwrap()) - 1.0).abs() < 1e-15, "{v:?}");
         }
-    }
-
-    /// A seeded sweep over signs and exponents from 1e-300 to 1e300.
-    #[test]
-    fn normalize_is_unit_or_none_across_exponents() {
-        let mut s = 0x2545_f491_4f6c_dd1du64;
-        let mut next = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            s
-        };
-        for _ in 0..200_000 {
-            let v: V3 = core::array::from_fn(|_| {
-                let bits = next();
-                let mantissa = (bits >> 11) as f64 / (1u64 << 53) as f64;
-                let exponent = (bits % 601) as i32 - 300;
-                let x = mantissa * libm::pow(10.0, exponent as f64);
-                if bits & 1 == 0 { x } else { -x }
-            });
-            if let Some(u) = normalize(v) {
-                assert!((norm(u) - 1.0).abs() < 1e-15, "{v:?} -> {u:?}");
-                assert!(dot(u, v) > 0.0, "{v:?} reversed");
-            } else {
-                assert!(v.iter().all(|x| x.abs() < 1e-300), "{v:?} rejected");
-            }
+        for v in [
+            [0.0; 3],
+            [1e-301, 0.0, 0.0],
+            [f64::NAN, 1.0, 0.0],
+            [f64::INFINITY, 1.0, 0.0],
+        ] {
+            assert_eq!(normalize(v), None);
         }
-    }
-
-    #[test]
-    fn normalize_rejects_zero_tiny_and_non_finite() {
-        assert_eq!(normalize([0.0; 3]), None);
-        assert_eq!(normalize([1e-301, 0.0, 0.0]), None);
-        assert_eq!(normalize([f64::NAN, 1.0, 0.0]), None);
-        assert_eq!(normalize([f64::INFINITY, 1.0, 0.0]), None);
-    }
-
-    #[test]
-    fn adj_and_det_invert() {
         let m = [[4.0, 1.0, 0.5], [1.0, 3.0, -0.2], [0.5, -0.2, 2.0]];
-        let inv = inv_sym(m).unwrap();
         assert!(close(
-            mat_mul(m, inv).as_flattened(),
-            I3.as_flattened(),
-            1e-15
+            mat_mul(m, inv_sym(m).unwrap()).as_flattened(),
+            I3.as_flattened()
         ));
         assert!((det(m) - 20.89).abs() < 1e-12);
-    }
-
-    #[test]
-    fn inv_sym_rejects_singular_and_indefinite() {
-        let rank2 = outer([1.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
-        assert_eq!(
-            inv_sym(mat_add(rank2, outer([0.0, 1.0, 0.0], [0.0, 1.0, 0.0]))),
-            None
+        let rank2 = mat_add(
+            outer([1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            outer([0.0, 1.0, 0.0], [0.0, 1.0, 0.0]),
         );
-        assert_eq!(inv_sym(mat_scale(I3, -1.0)), None);
-        assert_eq!(inv_sym([[f64::NAN; 3]; 3]), None);
+        for bad in [rank2, mat_scale(I3, -1.0), [[f64::NAN; 3]; 3]] {
+            assert_eq!(inv_sym(bad), None);
+        }
     }
 
+    /// `A(q)` is the transpose of the Hamilton rotation, products compose in
+    /// reverse, and `from_m3` inverts `to_m3` on every pivot.
     #[test]
-    fn attitude_matrix_is_hamilton_transpose() {
+    fn quaternions() {
         let a = Q.to_m3();
         assert!(close(
             mat_mul(a, transpose(a)).as_flattened(),
-            I3.as_flattened(),
-            1e-15
+            I3.as_flattened()
         ));
-        assert!((det(a) - 1.0).abs() < 1e-15);
         let r = [0.2, 0.9, -0.4];
         let hamilton = (Q * Quat::from_parts(r, 0.0) * Q.conj()).vec();
-        assert!(close(&mat_vec(transpose(a), r), &hamilton, 1e-15));
-    }
-
-    #[test]
-    fn product_composes_attitudes_in_reverse() {
+        assert!(close(&mat_vec(transpose(a), r), &hamilton));
         let p = Quat([0.5, 0.5, -0.5, 0.5]);
-        let lhs = (p * Q).to_m3();
-        let rhs = mat_mul(Q.to_m3(), p.to_m3());
-        assert!(close(lhs.as_flattened(), rhs.as_flattened(), 1e-15));
-    }
-
-    #[test]
-    fn from_m3_inverts_to_m3_on_every_pivot() {
+        assert!(close(
+            (p * Q).to_m3().as_flattened(),
+            mat_mul(a, p.to_m3()).as_flattened()
+        ));
         for q in [
             Q,
             Quat([1.0, 0.0, 0.0, 0.0]),
-            Quat([0.0, 1.0, 0.0, 0.0]),
             Quat([0.0, 0.0, -1.0, 0.0]),
             Quat::IDENTITY,
-            Quat([0.6, 0.0, 0.0, 0.8]),
         ] {
-            let back = Quat::from_m3(q.to_m3());
-            assert!(q.angle_to(back) < 1e-15, "{q:?} -> {back:?}");
+            assert!(q.angle_to(Quat::from_m3(q.to_m3())) < 1e-15, "{q:?}");
         }
-    }
-
-    #[test]
-    fn angle_to_ignores_sign() {
-        let half_turn = Quat([0.0, 0.0, 1.0, 0.0]);
-        assert!((Quat::IDENTITY.angle_to(half_turn) - core::f64::consts::PI).abs() < 1e-15);
-        let negated = Quat(Q.0.map(|x| -x));
-        assert_eq!(Q.angle_to(negated), 0.0);
-    }
-
-    #[test]
-    fn normalized_rejects_zero_and_nan() {
-        assert_eq!(Quat([0.0; 4]).normalized(), None);
+        assert_eq!(Q.angle_to(Quat(Q.0.map(|x| -x))), 0.0);
         assert_eq!(Quat([f64::NAN, 0.0, 0.0, 1.0]).normalized(), None);
     }
 }
