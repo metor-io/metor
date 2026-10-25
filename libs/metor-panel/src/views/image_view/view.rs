@@ -21,7 +21,9 @@ use super::resample::{MAX_STEP, MIN_STEP, Rect, RenderError, Scratch, Viewport};
 use super::source::{Frame, FrameSource, FrameState, RecordSource};
 use super::strip::{self, Handle};
 use crate::data_binding::Binding;
-use crate::theme::theme;
+use crate::theme::{theme, ui_px, ui_scale};
+use crate::views::popover;
+use crate::views::time_series::cursor::{estimate_readout_size, readout_origin};
 
 /// Zoom per wheel notch.
 const ZOOM_PER_NOTCH: f64 = 1.25;
@@ -674,7 +676,7 @@ impl ImageView {
     }
 
     /// The overlay points under the cursor, described for the readout.
-    fn stars_under(&self, cursor: Point<Pixels>, cx: &gpui::App) -> Vec<String> {
+    fn stars_under(&self, cursor: Point<Pixels>, cx: &gpui::App) -> Vec<(OverlayColor, String)> {
         let Some((viewport, _)) = self.current_viewport() else {
             return Vec::new();
         };
@@ -685,14 +687,11 @@ impl ImageView {
                 let points = overlay.points(cx).ok()??;
                 let kind = overlay.config.size_kind;
                 let (cat_id, _) = overlay::under(&points, kind, cursor, to_window)?;
-                let label = match overlay.config.color {
-                    OverlayColor::Detected => "detected",
-                    OverlayColor::Truth => "truth",
+                let detail = match cat_id {
+                    Some(id) => format!("cat {id}"),
+                    None => "uncatalogued".to_string(),
                 };
-                Some(match cat_id {
-                    Some(id) => format!("{label} cat {id}"),
-                    None => format!("{label} uncatalogued"),
-                })
+                Some((overlay.config.color, detail))
             })
             .collect()
     }
@@ -844,23 +843,14 @@ impl ImageView {
         if lines.is_empty() {
             return None;
         }
-        let theme = theme(cx);
         Some(
-            div()
-                .absolute()
-                .top(px(4.0))
-                .left(px(4.0))
-                .px(px(4.0))
-                .py(px(2.0))
-                .rounded(px(3.0))
-                .bg(theme.plot_chrome_bg())
-                .text_size(px(11.0))
-                .text_color(theme.text_secondary)
-                .children(
+            div().absolute().top(px(4.0)).left(px(4.0)).child(
+                popover::readout_card(cx).children(
                     lines
                         .into_iter()
                         .map(|l| div().child(SharedString::from(l))),
                 ),
+            ),
         )
     }
 
@@ -987,33 +977,75 @@ fn valid_view(view: ViewMode) -> ViewMode {
     }
 }
 
-/// The hover readout, in the bottom-left corner.
-fn readout_chip(readout: Readout, theme: &crate::theme::Theme) -> impl IntoElement {
-    let line = |text: String| div().child(SharedString::from(text));
+/// Gap between the pointer and the hover readout, as the plots use.
+const READOUT_OFFSET: f32 = 14.0;
+
+/// The hover readout: the plots' readout card, placed beside the pointer
+/// and flipped clear of the image's edges. The header names the pixel; the
+/// rows are its value, the scalar siblings, and the overlay points under
+/// the cursor with their overlay's swatch.
+fn readout_card(
+    readout: Readout,
+    pointer: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    scale: f32,
+    cx: &gpui::App,
+) -> impl IntoElement + use<> {
+    let theme = theme(cx);
+    let header = match readout.pooled {
+        Some((w, h)) => format!("x {}  y {}  (1 of {w}×{h})", readout.x, readout.y),
+        None => format!("x {}  y {}", readout.x, readout.y),
+    };
+    let mut rows: Vec<(Option<gpui::Hsla>, SharedString, String, gpui::Hsla)> =
+        vec![(None, "value".into(), readout.value, theme.text_primary)];
+    rows.extend(
+        readout
+            .siblings
+            .into_iter()
+            .map(|(label, value)| (None, label, value, theme.text_primary)),
+    );
+    rows.extend(readout.stars.into_iter().map(|(role, detail)| {
+        let color = ImageView::overlay_color(role, &theme);
+        let label = match role {
+            OverlayColor::Detected => "detected",
+            OverlayColor::Truth => "truth",
+        };
+        (Some(color), label.into(), detail, color)
+    }));
+
+    let lens: Vec<(usize, usize)> = rows
+        .iter()
+        .map(|(_, label, value, _)| (label.chars().count(), value.chars().count()))
+        .collect();
+    let box_size = estimate_readout_size(header.chars().count(), &lens).map(|l| l * scale);
+    let origin = readout_origin(pointer, box_size, bounds, px(READOUT_OFFSET * scale));
+
+    let mut card = popover::readout_card(cx).child(div().child(SharedString::from(header)));
+    for (swatch, label, value, value_color) in rows {
+        let mut row = div().flex().flex_row().items_center().gap_1();
+        if let Some(color) = swatch {
+            row = row.child(div().w(ui_px(8.0)).h(ui_px(8.0)).rounded(px(2.0)).bg(color));
+        }
+        card = card.child(
+            row.child(
+                div()
+                    .flex_1()
+                    .pr(ui_px(8.0))
+                    .text_color(theme.text_secondary)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_color(value_color)
+                    .child(SharedString::from(value)),
+            ),
+        );
+    }
     div()
         .absolute()
-        .bottom(px(4.0))
-        .left(px(4.0))
-        .px(px(4.0))
-        .py(px(2.0))
-        .rounded(px(3.0))
-        .bg(theme.plot_chrome_bg())
-        .text_size(px(11.0))
-        .text_color(theme.text_secondary)
-        .child(line(match readout.pooled {
-            Some((w, h)) => format!(
-                "x {}  y {}  {}  (1 of {w}×{h})",
-                readout.x, readout.y, readout.value
-            ),
-            None => format!("x {}  y {}  {}", readout.x, readout.y, readout.value),
-        }))
-        .children(
-            readout
-                .siblings
-                .into_iter()
-                .map(move |(label, value)| line(format!("{label} {value}"))),
-        )
-        .children(readout.stars.into_iter().map(line))
+        .left(origin.x - bounds.origin.x)
+        .top(origin.y - bounds.origin.y)
+        .child(card)
 }
 
 /// The whole device pixels a logical span covers: its snapped start, and
@@ -1063,7 +1095,7 @@ fn saturated(cx: &gpui::App) -> [u8; 4] {
 }
 
 impl Render for ImageView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let this = cx.entity().downgrade();
         let painter = this.clone();
@@ -1104,8 +1136,14 @@ impl Render for ImageView {
                 }
             }))
             .child(image);
-        if let Some(readout) = self.readout(cx) {
-            area = area.child(readout_chip(readout, &theme));
+        if let (Some(readout), Some(pointer)) = (self.readout(cx), self.hover) {
+            area = area.child(readout_card(
+                readout,
+                pointer,
+                self.bounds,
+                ui_scale(window),
+                cx,
+            ));
         }
         if let Some(info) = self.info_chip(cx) {
             area = area.child(info);
@@ -1169,7 +1207,13 @@ mod tests {
         build: impl FnOnce(&mut Context<ImageView>) -> ImageView + 'static,
         cx: &mut gpui::TestAppContext,
     ) -> (Entity<Host>, Entity<ImageView>, &mut VisualTestContext) {
-        cx.update(|cx| crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone())));
+        cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            cx.set_global(crate::theme::FontSettings {
+                family: "monospace".into(),
+                config: Default::default(),
+            });
+        });
         let (host, vcx) = cx.add_window_view(|_, cx| Host {
             view: Some(cx.new(build)),
         });

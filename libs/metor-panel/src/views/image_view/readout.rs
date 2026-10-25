@@ -8,6 +8,7 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use super::layout::Pixels;
+use super::overlay::OverlayColor;
 use super::source::Frame;
 use crate::temporal::samples::{SelectedReader, acquire};
 
@@ -24,8 +25,9 @@ pub struct Readout {
     /// value is the block's middle pixel.
     pub pooled: Option<(usize, usize)>,
     pub siblings: Vec<(SharedString, String)>,
-    /// Overlay points under the cursor, described.
-    pub stars: Vec<String>,
+    /// Overlay points under the cursor: the overlay's colour role and the
+    /// point described (`cat 12`, `uncatalogued`).
+    pub stars: Vec<(OverlayColor, String)>,
 }
 
 /// The raw value of pixel `(x, y)`, read from the frame bytes, with the
