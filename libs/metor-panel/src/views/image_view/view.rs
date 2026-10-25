@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Corners, Entity, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    Subscription, Task, WeakEntity, Window, canvas, div, point, prelude::*, px, size,
+    Bounds, Context, Corners, FocusHandle, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Subscription, Task,
+    Window, canvas, div, point, prelude::*, px, size,
 };
 use metor_db::DB;
 use metor_proto::types::ComponentId;
@@ -19,7 +19,6 @@ use super::readout::{Readout, raw_value};
 use super::render::{self, Frames, Job, LutKey, RenderKey, Rendered, Scheduler};
 use super::resample::{MAX_STEP, MIN_STEP, Rect, RenderError, Scratch, Viewport};
 use super::source::{Frame, FrameSource, FrameState, RecordSource};
-use super::strip::{self, HistogramStrip, StripData};
 use crate::data_binding::Binding;
 use crate::theme::{theme, ui_px, ui_scale};
 use crate::views::popover;
@@ -52,10 +51,6 @@ pub struct ImageViewConfig {
     /// `None` until set: a fresh view takes the producer's hints.
     pub display: Option<Display>,
     pub view: ViewMode,
-    /// Shows the histogram strip under the image as well as in the
-    /// inspector. Layouts from before the inspector histogram saved this as
-    /// `histogram`, always on by default, so that key is ignored.
-    pub histogram_overlay: bool,
     pub overlays: Vec<OverlayConfig>,
 }
 
@@ -65,7 +60,6 @@ impl Default for ImageViewConfig {
             component: String::new(),
             display: None,
             view: ViewMode::Fit,
-            histogram_overlay: false,
             overlays: Vec::new(),
         }
     }
@@ -86,8 +80,6 @@ pub struct ImageView {
     #[facet(skip)]
     pub source: Binding,
     pub display: Display,
-    /// The histogram strip under the image, besides the inspector's.
-    pub histogram_overlay: bool,
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
@@ -143,12 +135,6 @@ pub struct ImageView {
     /// The histogram of the painted image's region.
     #[facet(opaque)]
     histogram_data: Option<Arc<Histogram>>,
-    /// Every live histogram strip; while any is, renders keep a histogram.
-    #[facet(opaque)]
-    strips: Vec<WeakEntity<HistogramStrip>>,
-    /// The strip under the image, while the overlay is on.
-    #[facet(opaque)]
-    overlay_strip: Option<Entity<HistogramStrip>>,
     #[facet(opaque)]
     _observe: Option<Subscription>,
     #[facet(opaque)]
@@ -162,7 +148,6 @@ impl ImageView {
         let mut view = Self {
             source,
             display: cfg.display.unwrap_or_default(),
-            histogram_overlay: cfg.histogram_overlay,
             view: view_mode,
             settled: cfg.display.is_some(),
             bound: None,
@@ -185,8 +170,6 @@ impl ImageView {
             overlays: Vec::new(),
             _overlay_changes: Vec::new(),
             histogram_data: None,
-            strips: Vec::new(),
-            overlay_strip: None,
             _observe: None,
             _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
@@ -240,7 +223,6 @@ impl ImageView {
             component: self.source.text(&self.db),
             display: self.settled.then_some(self.display),
             view: self.view,
-            histogram_overlay: self.histogram_overlay,
             overlays: self.overlays.iter().map(|o| o.config.clone()).collect(),
         }
     }
@@ -325,8 +307,7 @@ impl ImageView {
             self.settled = true;
         }
         let viewport = self.viewport(&frame.layout);
-        let mut key = RenderKey::new(&frame, self.display, viewport, out, saturated(cx));
-        key.histogram = self.wants_histogram();
+        let key = RenderKey::new(&frame, self.display, viewport, out, saturated(cx));
         if let Some(started) = self.scheduler.request(key, frame) {
             let job = self.job(started);
             self.job = spawn_jobs(job, cx);
@@ -599,27 +580,9 @@ impl ImageView {
         }
     }
 
-    /// A histogram strip for `view`, kept by the caller: the inspector's
-    /// companion.
-    pub fn histogram_strip(view: &Entity<Self>, cx: &mut gpui::App) -> Entity<HistogramStrip> {
-        let strip = cx.new(|cx| HistogramStrip::new(view, cx));
-        view.update(cx, |view, cx| view.add_strip(&strip, cx));
-        strip
-    }
-
-    fn add_strip(&mut self, strip: &Entity<HistogramStrip>, cx: &mut Context<Self>) {
-        self.strips.push(strip.downgrade());
-        cx.notify();
-    }
-
-    /// Whether a live strip shows the histogram.
-    fn wants_histogram(&mut self) -> bool {
-        self.strips.retain(|strip| strip.upgrade().is_some());
-        !self.strips.is_empty()
-    }
-
-    /// What a strip paints, once a render has made a histogram.
-    pub(super) fn strip_data(&self) -> Option<StripData> {
+    /// The histogram, the painted levels and the top code, once a render
+    /// has made a histogram.
+    pub(super) fn strip_data(&self) -> Option<(Arc<Histogram>, Option<(f64, f64)>, Option<f64>)> {
         let top_code = self
             .frame()
             .map(|f| f64::from((1u32 << f.layout.bits.min(16)) - 1));
@@ -646,34 +609,11 @@ impl ImageView {
         cx.stop_propagation();
     }
 
-    /// Manual levels, as the strip's handles set them.
+    /// Manual levels, as the levels row types them.
     pub fn set_levels(&mut self, (black, white): (f64, f64), cx: &mut Context<Self>) {
         self.display.levels = Levels::Manual { black, white };
         self.levels = Some((black, white));
         cx.notify();
-    }
-
-    /// The strip under the image while the overlay is on, once there is a
-    /// histogram to show.
-    fn overlay(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        if !self.histogram_overlay {
-            self.overlay_strip = None;
-            return None;
-        }
-        if self.overlay_strip.is_none() {
-            let view = cx.entity();
-            let strip = cx.new(|cx| HistogramStrip::new(&view, cx));
-            self.add_strip(&strip, cx);
-            self.overlay_strip = Some(strip);
-        }
-        self.histogram_data.as_ref()?;
-        Some(
-            div()
-                .h(px(strip::STRIP_HEIGHT))
-                .w_full()
-                .flex_shrink_0()
-                .children(self.overlay_strip.clone()),
-        )
     }
 
     /// Overlay errors, top left.
@@ -936,8 +876,7 @@ impl Render for ImageView {
         let mut area = div()
             .id("image-view")
             .track_focus(&self.focus)
-            .flex_1()
-            .w_full()
+            .size_full()
             .relative()
             .overflow_hidden()
             .bg(theme.image_backdrop())
@@ -1003,12 +942,7 @@ impl Render for ImageView {
                     .child(label),
             });
         }
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(area)
-            .children(self.overlay(cx))
+        area
     }
 }
 
@@ -1880,144 +1814,6 @@ mod tests {
         );
     }
 
-    /// The overlay strip's bounds, after turning the overlay on.
-    fn show_overlay(
-        view: &Entity<ImageView>,
-        vcx: &mut VisualTestContext,
-    ) -> Entity<HistogramStrip> {
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.histogram_overlay = true;
-                cx.notify();
-            })
-        });
-        draw(vcx);
-        draw(vcx);
-        vcx.update(|_, cx| {
-            view.read(cx)
-                .overlay_strip
-                .clone()
-                .expect("an overlay strip")
-        })
-    }
-
-    #[gpui::test]
-    fn the_overlay_is_off_by_default_and_toggles(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
-        let off = vcx.update(|_, cx| view.read(cx).bounds);
-        assert!(vcx.update(|_, cx| view.read(cx).overlay_strip.is_none()));
-        let strip = show_overlay(&view, vcx);
-        let (on, strip_bounds) =
-            vcx.update(|_, cx| (view.read(cx).bounds, strip.read(cx).bounds()));
-        assert_eq!(f32::from(strip_bounds.size.height), strip::STRIP_HEIGHT);
-        assert_eq!(on.size.height, off.size.height - px(strip::STRIP_HEIGHT));
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.histogram_overlay = false;
-                cx.notify();
-            })
-        });
-        draw(vcx);
-        assert!(vcx.update(|_, cx| view.read(cx).overlay_strip.is_none()));
-        assert_eq!(vcx.update(|_, cx| view.read(cx).bounds), off);
-    }
-
-    #[gpui::test]
-    fn a_live_strip_keeps_the_histogram_under_manual_levels(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
-        vcx.update(|_, cx| view.update(cx, |view, cx| view.set_levels((0.0, 40.0), cx)));
-        draw(vcx);
-        assert!(vcx.update(|_, cx| view.read(cx).histogram_data.is_none()));
-        let strip = vcx.update(|_, cx| ImageView::histogram_strip(&view, cx));
-        draw(vcx);
-        assert!(vcx.update(|_, cx| view.read(cx).strip_data().is_some()));
-        drop(strip);
-        draw(vcx);
-        draw(vcx);
-        assert!(vcx.update(|_, cx| view.read(cx).histogram_data.is_none()));
-    }
-
-    #[gpui::test]
-    fn dragging_a_strip_handle_sets_manual_levels(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
-        let strip = show_overlay(&view, vcx);
-        let (bounds, levels, range) = vcx.update(|_, cx| {
-            let range = view
-                .read(cx)
-                .histogram_data
-                .as_ref()
-                .expect("a histogram")
-                .range();
-            (
-                strip.read(cx).bounds(),
-                view.read(cx).levels.expect("levels"),
-                range,
-            )
-        });
-        assert!(f32::from(bounds.size.width) > 0.0);
-        let width = f32::from(bounds.size.width);
-        let y = bounds.origin.y + px(10.0);
-        let at = |value: f64| bounds.origin.x + px(strip::x_of(value, range, width));
-        let white = point(at(levels.1), y);
-        let target = point(at(range.0 + (range.1 - range.0) / 2.0), y);
-        vcx.simulate_mouse_down(white, MouseButton::Left, gpui::Modifiers::none());
-        vcx.simulate_mouse_move(target, MouseButton::Left, gpui::Modifiers::none());
-        vcx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::none());
-        draw(vcx);
-        let display = vcx.update(|_, cx| view.read(cx).display);
-        let Levels::Manual { black, white } = display.levels else {
-            panic!("manual levels, not {:?}", display.levels);
-        };
-        assert_eq!(black, levels.0);
-        assert!(
-            (white - (range.0 + range.1) / 2.0).abs()
-                <= (range.1 - range.0) / f64::from(width) * 2.0
-        );
-    }
-
-    #[gpui::test]
-    fn a_handle_drag_released_over_the_image_ends(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
-        let strip = show_overlay(&view, vcx);
-        let bounds = vcx.update(|_, cx| strip.read(cx).bounds());
-        let (levels, range, image_point) = vcx.update(|_, cx| {
-            let view = view.read(cx);
-            let (viewport, _) = view.current_viewport().unwrap();
-            (
-                view.levels.unwrap(),
-                view.histogram_data.as_ref().unwrap().range(),
-                view.window_point(&viewport, (4.0, 4.0)),
-            )
-        });
-        let width = f32::from(bounds.size.width);
-        let black = point(
-            bounds.origin.x + px(strip::x_of(levels.0, range, width)),
-            bounds.origin.y + px(10.0),
-        );
-        vcx.simulate_mouse_down(black, MouseButton::Left, gpui::Modifiers::none());
-        vcx.simulate_mouse_move(image_point, MouseButton::Left, gpui::Modifiers::none());
-        vcx.simulate_mouse_up(image_point, MouseButton::Left, gpui::Modifiers::none());
-        draw(vcx);
-        let (dragging, display) = vcx.update(|_, cx| {
-            (
-                view.read(cx).is_dragging() || strip.read(cx).is_dragging(),
-                view.read(cx).display,
-            )
-        });
-        assert!(!dragging);
-        let Levels::Manual { black, white } = display.levels else {
-            panic!("manual levels");
-        };
-        assert!(white > black, "{black} {white}");
-        // Later moves no longer drag.
-        vcx.simulate_mouse_move(strip_corner(bounds), None, gpui::Modifiers::none());
-        assert_eq!(vcx.update(|_, cx| view.read(cx).display), display);
-    }
-
-    fn strip_corner(bounds: Bounds<Pixels>) -> Point<Pixels> {
-        point(bounds.origin.x + px(1.0), bounds.origin.y + px(1.0))
-    }
-
     #[gpui::test]
     fn an_overlay_with_fields_from_different_times_is_out_of_step(cx: &mut gpui::TestAppContext) {
         let (_temp, view, vcx) = truth_view(&[(10, 1.5)], cx);
@@ -2043,7 +1839,6 @@ mod tests {
             component: "cam.pixels".into(),
             display: Some(Display::default()),
             view: ViewMode::Fit,
-            histogram_overlay: true,
             overlays: vec![OverlayConfig::from_root(
                 "sim.star_truth",
                 OverlayColor::Truth,
@@ -2055,15 +1850,5 @@ mod tests {
             serde_json::from_str::<ImageViewConfig>("{}").unwrap(),
             ImageViewConfig::default()
         );
-    }
-
-    /// The old `histogram` key was on by default and always saved, so it
-    /// carries no choice: an old layout opens without the overlay.
-    #[test]
-    fn a_legacy_histogram_key_leaves_the_overlay_off() {
-        let cfg: ImageViewConfig =
-            serde_json::from_str(r#"{"component":"cam.pixels","histogram":true}"#).unwrap();
-        assert!(!cfg.histogram_overlay);
-        assert_eq!(cfg.component, "cam.pixels");
     }
 }

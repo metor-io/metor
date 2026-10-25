@@ -15,7 +15,6 @@ mod render;
 mod resample;
 mod source;
 mod stretch;
-mod strip;
 mod view;
 
 pub use histogram::Histogram;
@@ -27,7 +26,6 @@ pub use render::{RenderKey, Scheduler};
 pub use resample::{Plane, Rect, RenderError, Scratch, Viewport, render_into, spans};
 pub use source::{Frame, FrameSource, FrameState, RecordSource, StaticSource};
 pub use stretch::stretch_rows;
-pub use strip::HistogramStrip;
 pub(crate) use view::image_view_config;
 pub use view::{ImageView, ImageViewConfig, ViewMode};
 

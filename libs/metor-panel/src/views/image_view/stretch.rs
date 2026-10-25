@@ -5,12 +5,16 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, Entity, Focusable, SharedString, Window, prelude::*};
+use gpui::{
+    AnyElement, App, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels, Render,
+    SharedString, Subscription, WeakEntity, Window, canvas, div, point, prelude::*, px, size,
+};
 
+use super::histogram::Histogram;
 use super::lut::Levels;
-use super::strip::HistogramStrip;
 use super::view::ImageView;
 use crate::inspector::rows::{AccessorySpec, CommandRow, InspectorRow, RowAction, value_row};
+use crate::theme::{Theme, theme};
 
 /// Stretch presets: a label and the levels it sets.
 const PRESETS: [(&str, Levels); 3] = [
@@ -58,7 +62,7 @@ pub fn stretch_rows(view: &Entity<ImageView>) -> Vec<Box<dyn InspectorRow>> {
 }
 
 /// The painted levels and how they are set; editing it types manual levels.
-/// Its page shows the view's histogram, whose handles drag the levels.
+/// Its page shows the view's histogram.
 struct LevelsRow {
     view: Entity<ImageView>,
     /// Made on first use: building rows has no `&mut App`.
@@ -74,13 +78,12 @@ impl InspectorRow for LevelsRow {
         let strip = self
             .strip
             .borrow_mut()
-            .get_or_insert_with(|| ImageView::histogram_strip(&self.view, cx))
+            .get_or_insert_with(|| cx.new(|cx| HistogramStrip::new(&self.view, cx)))
             .clone();
-        let weak = strip.downgrade();
         Some(AccessorySpec {
             view: strip.clone().into(),
             focus: strip.focus_handle(cx),
-            dragging: Arc::new(move |cx| weak.upgrade().is_some_and(|s| s.read(cx).is_dragging())),
+            dragging: Arc::new(|_| false),
             expanded: true,
         })
     }
@@ -110,6 +113,127 @@ impl InspectorRow for LevelsRow {
                 }
             }),
         }
+    }
+}
+
+/// Log-count bars of the view's histogram, the painted levels, and a marker
+/// at the top code.
+struct HistogramStrip {
+    view: WeakEntity<ImageView>,
+    focus: FocusHandle,
+    _observe: Subscription,
+}
+
+impl HistogramStrip {
+    fn new(view: &Entity<ImageView>, cx: &mut Context<Self>) -> Self {
+        Self {
+            view: view.downgrade(),
+            focus: cx.focus_handle(),
+            _observe: cx.observe(view, |_, _, cx| cx.notify()),
+        }
+    }
+}
+
+impl Focusable for HistogramStrip {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for HistogramStrip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let data = self
+            .view
+            .upgrade()
+            .and_then(|view| view.read(cx).strip_data());
+        let theme = theme(cx);
+        let painter = canvas(
+            |_, _, _| {},
+            move |bounds, (), window, _| match &data {
+                Some((histogram, levels, top)) => {
+                    paint(bounds, histogram, *levels, *top, &theme, window)
+                }
+                None => window.paint_quad(gpui::fill(bounds, theme.bg_secondary)),
+            },
+        )
+        .size_full();
+        div().track_focus(&self.focus).size_full().child(painter)
+    }
+}
+
+/// The x of `value` on a strip `width` wide spanning `range`.
+fn x_of(value: f64, range: (f64, f64), width: f32) -> f32 {
+    let span = range.1 - range.0;
+    if span <= 0.0 || !span.is_finite() {
+        return 0.0;
+    }
+    (((value - range.0) / span).clamp(0.0, 1.0) * f64::from(width)) as f32
+}
+
+/// `n` column heights in `0..=1`: the log of the summed bins under each.
+fn columns(bins: &[u32], n: usize) -> Vec<f32> {
+    if bins.is_empty() || n == 0 {
+        return vec![0.0; n];
+    }
+    let sums: Vec<f64> = (0..n)
+        .map(|c| {
+            let a = c * bins.len() / n;
+            let b = ((c + 1) * bins.len() / n).max(a + 1).min(bins.len());
+            bins[a..b].iter().map(|&count| f64::from(count)).sum()
+        })
+        .collect();
+    let top = sums.iter().copied().fold(0.0, f64::max).ln_1p();
+    sums.iter()
+        .map(|s| match top > 0.0 {
+            true => (s.ln_1p() / top) as f32,
+            false => 0.0,
+        })
+        .collect()
+}
+
+fn paint(
+    bounds: Bounds<Pixels>,
+    histogram: &Histogram,
+    levels: Option<(f64, f64)>,
+    top_code: Option<f64>,
+    theme: &Theme,
+    window: &mut Window,
+) {
+    const LINE_PX: f32 = 2.0;
+    window.paint_quad(gpui::fill(bounds, theme.bg_secondary));
+    let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+    let n = w.max(0.0) as usize;
+    if n == 0 || h <= 0.0 {
+        return;
+    }
+    let range = histogram.range();
+    let origin = bounds.origin;
+    let at = |x: f32, y: f32| point(origin.x + px(x), origin.y + px(y));
+    let mut bars = gpui::PathBuilder::fill();
+    bars.move_to(at(0.0, h));
+    for (c, height) in columns(histogram.bins(), n).iter().enumerate() {
+        let top = h - height * h;
+        bars.line_to(at(c as f32, top));
+        bars.line_to(at(c as f32 + 1.0, top));
+    }
+    bars.line_to(at(n as f32, h));
+    bars.close();
+    if let Ok(path) = bars.build() {
+        window.paint_path(path, theme.text_tertiary);
+    }
+    let line = |x: f32, color, window: &mut Window| {
+        let x = x.clamp(0.0, w - LINE_PX);
+        window.paint_quad(gpui::fill(
+            Bounds::new(at(x, 0.0), size(px(LINE_PX), px(h))),
+            color,
+        ));
+    };
+    if let Some(top) = top_code {
+        line(x_of(top, range, w), theme.image_saturated(), window);
+    }
+    if let Some((black, white)) = levels {
+        line(x_of(black, range, w), theme.text_secondary, window);
+        line(x_of(white, range, w), theme.text_primary, window);
     }
 }
 
@@ -152,6 +276,16 @@ fn parse_levels(text: &str) -> Option<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn columns_are_log_scaled_and_cover_every_bin() {
+        let cols = columns(&[0, 1, 0, 1000], 2);
+        assert_eq!(cols[1], 1.0);
+        assert!(cols[0] > 0.05 && cols[0] < 0.2, "{cols:?}");
+        // More columns than bins repeat bins rather than dropping them.
+        assert_eq!(columns(&[5], 3), [1.0, 1.0, 1.0]);
+        assert!(columns(&[], 4).iter().all(|&c| c == 0.0));
+    }
 
     #[test]
     fn levels_parse_from_two_numbers() {

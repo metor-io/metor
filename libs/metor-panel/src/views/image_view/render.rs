@@ -29,8 +29,6 @@ pub struct RenderKey {
     pub bytes: usize,
     pub display: Display,
     pub viewport: Viewport,
-    /// Whether the histogram strip wants this frame's histogram.
-    pub histogram: bool,
     /// Device pixels of the whole output.
     pub out: (usize, usize),
     /// BGRA of the theme's saturation colour.
@@ -50,7 +48,6 @@ impl RenderKey {
             bytes: frame.bytes.as_ptr() as usize,
             display,
             viewport,
-            histogram: false,
             out,
             saturated,
         }
@@ -205,7 +202,12 @@ pub fn levels(
     match display.levels {
         Levels::Manual { black, white } => (black, white),
         Levels::Auto { low, high, .. } => histogram
-            .and_then(|h| Some((f64::from(h.percentile(low)?), f64::from(h.percentile(high)?))))
+            .and_then(|h| {
+                Some((
+                    f64::from(h.percentile(low)?),
+                    f64::from(h.percentile(high)?),
+                ))
+            })
             .unwrap_or(full),
     }
 }
@@ -267,9 +269,8 @@ pub fn run(job: Job) -> Rendered {
         .viewport
         .visible(layout.width, layout.height, key.out.0, key.out.1);
     let region = source_rect(&key.viewport, out, &layout);
-    let hist = (key.histogram || !matches!(key.display.levels, Levels::Manual { .. }))
-        .then(|| Arc::new(histogram(pixels, &layout, region)));
-    let levels = levels(&key.display, hist.as_deref(), &layout);
+    let hist = Arc::new(histogram(pixels, &layout, region));
+    let levels = levels(&key.display, Some(&hist), &layout);
     let lut = cached_lut(lut, &layout, &key, levels);
     if out.is_empty() {
         return Rendered {
@@ -277,7 +278,7 @@ pub fn run(job: Job) -> Rendered {
             image: None,
             error: None,
             levels,
-            histogram: hist,
+            histogram: Some(hist),
             scratch,
             lut: Some(lut),
         };
@@ -320,7 +321,7 @@ pub fn run(job: Job) -> Rendered {
         image,
         error,
         levels,
-        histogram: hist,
+        histogram: Some(hist),
         scratch,
         lut: Some(lut),
     }
@@ -461,7 +462,6 @@ mod tests {
                 origin: (0.0, 0.0),
                 step: 1.0,
             },
-            histogram: false,
             out: (10, 10),
             saturated: [0; 4],
         }

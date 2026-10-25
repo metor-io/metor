@@ -24,7 +24,10 @@ pub enum Levels {
         white: f64,
     },
     /// Percentiles of the histogram, each in `0..=1`.
-    Auto { low: f64, high: f64 },
+    Auto {
+        low: f64,
+        high: f64,
+    },
 }
 
 impl Default for Levels {
@@ -44,9 +47,7 @@ pub enum Curve {
     Linear,
     /// `asinh(t / s) / asinh(1 / s)`, `s` clamped to `1e-6..=1e6`; a
     /// non-finite or non-positive `s` is linear.
-    Asinh {
-        softening: f32,
-    },
+    Asinh { softening: f32 },
 }
 
 impl Curve {
@@ -136,7 +137,6 @@ impl Lut {
             .copied()
             .unwrap_or(0)
     }
-
 }
 
 /// The levels, or `full` when their span is not finite.
