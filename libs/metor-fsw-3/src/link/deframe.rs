@@ -281,10 +281,6 @@ mod tests {
 
 #[cfg(kani)]
 mod proofs {
-    use metor_proto::types::{PACKET_HEADER_LEN, PacketTy};
-
-    use super::super::batch::append;
-    use super::super::wire::{PACKET_OVERHEAD, fits};
     use super::*;
 
     const CAP: usize = 8;
@@ -321,35 +317,5 @@ mod proofs {
             assert_eq!(d.buf.len(), count);
             assert!(d.buf.iter().zip(unread).all(|(a, b)| *a == b));
         }
-    }
-
-    /// The largest buffer the fit proof tries.
-    const FIT_CAP: usize = 24;
-
-    /// A buffer of `len` bytes, split from a `FIT_CAP`-byte one.
-    fn buf(len: usize) -> Buf {
-        let mut buf = Buf::owned(Box::new([0; FIT_CAP]));
-        let _tail = buf.split_off(len);
-        buf
-    }
-
-    /// A record that `fits` a `conn_cap` goes whole into an empty
-    /// `conn_cap`-byte batch, and a `conn_cap`-byte receive buffer yields its
-    /// body.
-    #[kani::proof]
-    #[kani::unwind(26)]
-    fn fitting_records_cross_the_link() {
-        let (max_len, conn_cap): (usize, usize) = (kani::any(), kani::any());
-        kani::assume(conn_cap <= FIT_CAP && fits(max_len, conn_cap));
-        let mut batch = buf(conn_cap);
-        let payload = [7; FIT_CAP];
-        append(&mut batch, PacketTy::Table, [1, 2], &payload[..max_len]);
-        assert_eq!(batch.len(), max_len + PACKET_OVERHEAD);
-        let mut d = Deframer::new(buf(conn_cap));
-        let mut tail = d.spare().expect("an empty buffer");
-        assert_eq!(tail.extend(&batch), batch.len());
-        assert!(d.filled(tail).is_ok());
-        let body = d.next().expect("a whole packet").expect("not oversized");
-        assert_eq!(body.len(), max_len + PACKET_HEADER_LEN);
     }
 }

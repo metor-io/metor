@@ -19,7 +19,6 @@
           }
         },
         "ring_depth": 8,
-        "ring_bytes": 8388608,
         "namespace": "a",
         "systems": [
           {
@@ -202,7 +201,6 @@
           }
         },
         "ring_depth": 8,
-        "ring_bytes": 8388608,
         "namespace": "b",
         "systems": [
           {
@@ -470,7 +468,6 @@
           }
         },
         "ring_depth": 8,
-        "ring_bytes": 8388608,
         "namespace": "gw",
         "systems": [
           {

@@ -4,7 +4,6 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -147,7 +146,7 @@ fn gw_config(cam: SocketAddr, db: SocketAddr, path: &Path, conn_cap: usize) -> C
         params: json!({ "listen": db.to_string(), "path": path, "namespace": "gw" }),
         ..reading("db", "fsw.db", "sub.image", &[PortRef::new("sub", "image")])
     };
-    let config = config(
+    config(
         "gw",
         vec![
             subscribe,
@@ -159,14 +158,7 @@ fn gw_config(cam: SocketAddr, db: SocketAddr, path: &Path, conn_cap: usize) -> C
                 &[PortRef::new("sub", "link_status")],
             ),
         ],
-    );
-    // 16 frames in the ring and 32 in the db's 2x mirror: about a second
-    // of 30 Hz frames before the db, if it stalls, drops one.
-    CoordinatorConfig {
-        ring_depth: NonZeroUsize::new(16).expect("nonzero"),
-        ring_bytes: NonZeroUsize::new(32 << 20).expect("nonzero"),
-        ..config
-    }
+    )
 }
 
 fn spawn(config: CoordinatorConfig, seen: &Seen, shots: &Arc<Shots>) -> Target {

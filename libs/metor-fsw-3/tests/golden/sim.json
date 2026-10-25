@@ -8,7 +8,6 @@
     }
   },
   "ring_depth": 8,
-  "ring_bytes": 8388608,
   "namespace": null,
   "systems": [
     {

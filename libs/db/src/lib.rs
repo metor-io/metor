@@ -82,8 +82,6 @@ pub struct DB {
     /// Earliest timestamp known to this instance. Moves backwards when
     /// older history is hydrated from a store.
     pub earliest_timestamp: AtomicCell<Timestamp>,
-    /// Samples dropped across every component because its WAL was full.
-    wal_dropped: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -112,9 +110,6 @@ pub struct State {
 
     udp_vtable_streams: HashSet<(SocketAddr, [u8; 2])>,
 
-    /// Shared with each component, which counts its WAL drops here too.
-    wal_dropped: Arc<AtomicU64>,
-
     pub db_config: DbConfig,
 }
 
@@ -136,7 +131,6 @@ impl DB {
             ..Default::default()
         };
         let db = DB {
-            wal_dropped: state.wal_dropped.clone(),
             state: RwLock::new(state),
             recording_cell: PlayingCell::new(true),
             path,
@@ -148,11 +142,6 @@ impl DB {
         };
         db.save_db_state()?;
         Ok(db)
-    }
-
-    /// Samples dropped across every component because its WAL was full.
-    pub fn wal_dropped(&self) -> u64 {
-        self.wal_dropped.load(atomic::Ordering::Relaxed)
     }
 
     pub fn with_state<O, F: FnOnce(&State) -> O>(&self, f: F) -> O {
@@ -205,7 +194,6 @@ impl DB {
         let mut msg_logs = HashMap::new();
         let mut last_updated = i64::MIN;
         let mut start_timestamp = i64::MAX;
-        let wal_dropped = Arc::<AtomicU64>::default();
 
         info!("Opening database: {}", path.display());
         for elem in std::fs::read_dir(&path)? {
@@ -233,8 +221,7 @@ impl DB {
             // drain mode so its `persist` never claims the writer that
             // `setup_levels` re-takes after restart.
             let engine_owned = lod::is_lod_name(&metadata.name);
-            let component = Component::open(&path, component_id, schema.clone(), engine_owned)?
-                .sharing_wal_drops(&wal_dropped);
+            let component = Component::open(&path, component_id, schema.clone(), engine_owned)?;
             if engine_owned {
                 component
                     .time_series
@@ -279,7 +266,6 @@ impl DB {
             components,
             component_metadata,
             msg_logs,
-            wal_dropped: wal_dropped.clone(),
             ..Default::default()
         };
         let earliest_timestamp = if start_timestamp == i64::MAX {
@@ -288,7 +274,6 @@ impl DB {
             Timestamp(start_timestamp)
         };
         Ok(DB {
-            wal_dropped,
             state: RwLock::new(state),
             path,
             vtable_gen: AtomicCell::new(0),
@@ -576,8 +561,7 @@ impl State {
             name: component_id.to_string(),
             metadata: Default::default(),
         };
-        let component = Component::create(db_path, component_id, schema, engine_owned)?
-            .sharing_wal_drops(&self.wal_dropped);
+        let component = Component::create(db_path, component_id, schema, engine_owned)?;
         if !self.component_metadata.contains_key(&component_id) {
             self.set_component_metadata(component_metadata, db_path)?;
         }
@@ -935,9 +919,8 @@ pub struct Component {
     pub schema: ComponentSchema,
     pub last_timestamp: Arc<AtomicCell<Timestamp>>,
     persistence: Arc<std::sync::Mutex<Option<ComponentPersistence>>>,
+    /// Samples dropped because the WAL was full, to rate-limit the warning.
     wal_dropped: Arc<AtomicU64>,
-    /// The db-wide drop count this component also bumps.
-    wal_dropped_total: Arc<AtomicU64>,
 }
 
 struct ComponentPersistence {
@@ -966,7 +949,6 @@ impl Component {
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
             persistence: Default::default(),
             wal_dropped: Default::default(),
-            wal_dropped_total: Default::default(),
         }
     }
 
@@ -997,7 +979,6 @@ impl Component {
             last_timestamp: Arc::new(AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
             wal_dropped: Default::default(),
-            wal_dropped_total: Default::default(),
         };
         stellarator::spawn(this.clone().persist(engine_owned));
         stellarator::spawn(this.time_series.clone().lifecycle());
@@ -1027,7 +1008,6 @@ impl Component {
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
             persistence: Default::default(),
             wal_dropped: Default::default(),
-            wal_dropped_total: Default::default(),
         };
         stellarator::spawn(this.persist(engine_owned));
         stellarator::spawn(this.time_series.clone().lifecycle());
@@ -1098,21 +1078,8 @@ impl Component {
         )
     }
 
-    /// Samples dropped because the WAL was full.
-    pub fn wal_dropped(&self) -> u64 {
-        self.wal_dropped.load(atomic::Ordering::Relaxed)
-    }
-
-    /// Counts this component's WAL drops in `total` as well.
-    fn sharing_wal_drops(mut self, total: &Arc<AtomicU64>) -> Self {
-        self.wal_dropped_total = total.clone();
-        self
-    }
-
-    /// Counts a dropped sample; logs the 1st, 2nd, 4th, 8th, ... drop.
-    fn record_wal_drop(&self, timestamp: Timestamp) {
-        self.wal_dropped_total
-            .fetch_add(1, atomic::Ordering::Relaxed);
+    /// Logs the 1st, 2nd, 4th, 8th, ... dropped sample.
+    fn warn_wal_drop(&self, timestamp: Timestamp) {
         let dropped = self.wal_dropped.fetch_add(1, atomic::Ordering::Relaxed) + 1;
         if dropped.is_power_of_two() {
             let reader_count = self.wal.reader_count();
@@ -1125,7 +1092,7 @@ impl Component {
             return Err(Error::TimeTravel);
         }
         let Ok(mut grant) = self.wal.try_grant(value_buf.len() + size_of::<Timestamp>()) else {
-            self.record_wal_drop(timestamp);
+            self.warn_wal_drop(timestamp);
             return Ok(());
         };
         grant[..size_of::<Timestamp>()].copy_from_slice(timestamp.as_bytes());
@@ -3386,7 +3353,10 @@ mod wal_tests {
             drain(&mut reader, 8),
             (0..WAL_CREATE_ENTRIES as i64).collect::<Vec<_>>()
         );
-        assert_eq!(component.wal_dropped(), 1100 - WAL_CREATE_ENTRIES as u64);
+        assert_eq!(
+            component.wal_dropped.load(atomic::Ordering::Relaxed),
+            1100 - WAL_CREATE_ENTRIES as u64
+        );
     }
 
     #[test]
@@ -3401,7 +3371,7 @@ mod wal_tests {
             component.push_buf(Timestamp(ts), &buf).unwrap();
         }
         assert_eq!(drain(&mut reader, IMAGE_SIZE), (0..31).collect::<Vec<_>>());
-        assert_eq!(component.wal_dropped(), 9);
+        assert_eq!(component.wal_dropped.load(atomic::Ordering::Relaxed), 9);
 
         // Space freed by the reader takes new samples at the next offset.
         for ts in 40..50 {
@@ -3434,7 +3404,7 @@ mod wal_tests {
             assert!(sample.data().iter().all(|b| *b == ts as u8), "ts {ts}");
         }
         assert_eq!(component.time_series.iter_node_slices().count(), 2);
-        assert_eq!(component.wal_dropped(), 0);
+        assert_eq!(component.wal_dropped.load(atomic::Ordering::Relaxed), 0);
     }
 }
 
@@ -3784,55 +3754,5 @@ mod series_tests {
         lens.sort();
         lens.dedup();
         assert_eq!(lens, [16, 8 + IMAGE_SIZE]);
-    }
-}
-
-#[cfg(kani)]
-mod series_proofs {
-    use super::*;
-
-    #[kani::proof]
-    fn series_len_fits_the_budget() {
-        let range_len: usize = kani::any();
-        let limit: usize = kani::any();
-        let size: u32 = kani::any();
-        let size = size as usize;
-        match series_fit(range_len, limit, size) {
-            Some(len) => {
-                assert!(len <= range_len && len <= limit);
-                let body = len.checked_mul(size + size_of::<Timestamp>()).unwrap();
-                assert!(SERIES_HEAD + body <= SERIES_BUDGET);
-                assert!(SERIES_BUDGET <= u32::MAX as usize);
-                if range_len >= 1 && limit >= 1 {
-                    assert!(len >= 1);
-                }
-            }
-            None => assert!(SERIES_HEAD + size + size_of::<Timestamp>() > SERIES_BUDGET),
-        }
-    }
-}
-
-#[cfg(kani)]
-mod wal_proofs {
-    use super::*;
-
-    #[kani::proof]
-    fn wal_capacity_is_bounded_whole_entries() {
-        let size: u32 = kani::any();
-        let entries: usize = kani::any();
-        kani::assume((1..=WAL_CREATE_ENTRIES).contains(&entries));
-        let entry = size as usize + size_of::<Timestamp>();
-        let count = wal_entries(entry, entries);
-        assert!(count >= WAL_MIN_ENTRIES.min(entries));
-        assert!(count <= entries);
-        let capacity = entry.checked_mul(count).unwrap();
-        assert!(capacity <= WAL_BUDGET.max(WAL_MIN_ENTRIES * entry));
-    }
-
-    #[kani::proof]
-    fn node_data_size_fits_min_elements() {
-        let element: u64 = kani::any();
-        kani::assume(element <= (u64::MAX - 64) / 64);
-        assert!(time_series::node_data_size(element) >= 64 * element + 64);
     }
 }

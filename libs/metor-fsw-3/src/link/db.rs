@@ -54,8 +54,6 @@ pub struct DbStatus {
     pub timestamp: Timestamp,
     pub records: u64,
     pub refused: u64,
-    /// Samples the database dropped because a component's WAL was full.
-    pub wal_dropped: u64,
 }
 
 impl DbStatus {
@@ -169,7 +167,6 @@ pub async fn db(
             return;
         }
         ingest(&db, inputs, &sinks, &mut status);
-        status.wal_dropped = db.wal_dropped();
         status.timestamp = Timestamp::now();
         if status.changed(&reported) {
             let _ = db_status.write(&status);

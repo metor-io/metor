@@ -656,7 +656,7 @@ mod large {
 
     use super::*;
     use crate::async_system::Stop;
-    use crate::coordinator::DEFAULT_RING_BYTES;
+    use crate::coordinator::RING_BYTES;
     use crate::port::{Input, Output};
     use crate::record::Record;
     use crate::tests::utils::{Image, ImageBuf};
@@ -769,7 +769,7 @@ mod large {
             let fields = &report.expect("a report").fields;
             let count = fields.iter().find(|(name, _)| name == "image");
             // The mirror is twice the 8 MiB ring and takes the first images.
-            let held = 2 * DEFAULT_RING_BYTES.get() / frame_len(Image::MAX_LEN);
+            let held = 2 * RING_BYTES / frame_len(Image::MAX_LEN);
             let dropped = (100 - held).to_string();
             assert_eq!(count.map(|(_, n)| n.as_ref()), Some(dropped.as_str()));
         }

@@ -781,7 +781,6 @@ mod tests {
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
             wal_dropped: Default::default(),
-            wal_dropped_total: Default::default(),
         }
     }
 
@@ -961,7 +960,6 @@ mod tests {
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
             wal_dropped: Default::default(),
-            wal_dropped_total: Default::default(),
         };
 
         let (lod, mut level) = level_for(dir.path(), &src, 100);
@@ -1013,7 +1011,6 @@ mod tests {
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
             wal_dropped: Default::default(),
-            wal_dropped_total: Default::default(),
         };
 
         let (lod, mut level) = level_for(dir.path(), &src, 300);
@@ -1062,7 +1059,6 @@ mod tests {
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
             wal_dropped: Default::default(),
-            wal_dropped_total: Default::default(),
         };
         assert_eq!(
             src.time_series

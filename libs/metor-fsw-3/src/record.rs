@@ -62,7 +62,7 @@ pub trait Record: Payload {
     /// How many records a producer expects to write per cycle.
     ///
     /// A ring holds `DEPTH * ring_depth` records, capped at what fits in
-    /// `ring_bytes` and never fewer than two.
+    /// 8 MiB and never fewer than two.
     const DEPTH: usize = 1;
 
     /// Returns the schema a port rooted at `root` announces.
