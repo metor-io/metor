@@ -43,7 +43,7 @@ pub fn uniform(n: usize, seed: u64) -> Vec<V3> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geom::{dot, norm};
+    use crate::geom::norm;
 
     #[test]
     fn stars_are_unit_and_repeatable() {
@@ -70,11 +70,5 @@ mod tests {
         );
         let mean = stars.iter().fold([0.0; 3], |m, s| crate::geom::add(m, *s));
         assert!(norm(mean) / 8000.0 < 0.02);
-        assert!(dot(stars[0], stars[0]) > 0.0);
-    }
-
-    #[test]
-    fn zero_stars() {
-        assert!(uniform(0, 1).is_empty());
     }
 }

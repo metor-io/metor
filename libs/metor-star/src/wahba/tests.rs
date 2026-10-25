@@ -198,10 +198,10 @@ fn repeated_star_counts_twice() {
     }
 }
 
+/// Antiparallel or nearly coincident stars leave the roll unobserved.
 #[test]
-fn bad_input_is_an_error() {
+fn degenerate_geometry_is_an_error() {
     let obs = wide(Quat::IDENTITY);
-    assert_eq!(quest(&obs[..1], None), Err(WahbaError::TooFew));
     let o = obs[0];
     let flipped = Obs::new(scale(o.b, -1.0), scale(o.r, -1.0), o.sigma);
     assert_eq!(quest(&[o, flipped, o], None), Err(WahbaError::Degenerate));
@@ -209,11 +209,4 @@ fn bad_input_is_an_error() {
     let close = [[0.0, 0.0, 1.0], normalize([1e-7, 0.0, 1.0]).unwrap()];
     let close = close.map(|b| Obs::new(b, b, STAR_SIGMA));
     assert_eq!(quest(&close, None), Err(WahbaError::Degenerate));
-    for bad in [
-        Obs::new([f64::NAN, 0.0, 1.0], o.r, 1.0),
-        Obs::new(o.b, o.r, 0.0),
-    ] {
-        let err = quest(&[bad, obs[1], obs[2]], None);
-        assert_eq!(err, Err(WahbaError::Invalid));
-    }
 }

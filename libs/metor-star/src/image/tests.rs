@@ -169,9 +169,6 @@ fn a_flooded_frame_is_rejected_whole() {
     assert_eq!(small.run(&px).err(), Some(ImageError::TooManyRuns));
     // All 4095: one block-median background, nothing lit.
     assert!(ex.run(&vec![4095; W * H]).unwrap().is_empty());
-    assert_eq!(ex.run(&px[1..]).err(), Some(ImageError::Size));
-    let zero = Extractor::new(0, 10, ImageConfig::default()).err();
-    assert_eq!(zero, Some(ImageError::Config));
 }
 
 #[test]

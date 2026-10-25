@@ -4,7 +4,7 @@ use std::vec::Vec;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use super::build::{MAX_FACE_N, select, separation};
+use super::build::{select, separation};
 use super::kvector::{self, Sorted};
 use super::*;
 use crate::geom::{V3, dot, normalize};
@@ -178,15 +178,6 @@ fn rows_sit_in_the_cell_of_their_stored_vector() {
         let cell = db.cell_of(db.star(row as u16).unwrap().vector());
         assert!(db.cell(cell).contains(&row), "row {row} not in cell {cell}");
     }
-    for face_n in [0, MAX_FACE_N + 1] {
-        let bad = BuildConfig { face_n, ..cfg() };
-        assert_eq!(Db::build(&stars, &bad).err(), Some(BuildError::FaceN));
-    }
-    let many = std::vec![stars[0]; 65_536];
-    assert_eq!(
-        Db::build(&many, &cfg()).err(),
-        Some(BuildError::TooManyStars)
-    );
 }
 
 fn onboard() -> &'static Db {

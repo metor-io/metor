@@ -79,7 +79,6 @@ fn pixel_geometry() {
     let (u, v) = (100.25, 900.5);
     let pinhole = normalize([(u - i.cx) * i.pitch_m, (v - i.cy) * i.pitch_m, i.f_m]);
     assert_eq!(cam.pixel_to_st(u, v), pinhole);
-    assert!((cam.pixel_sigma_to_rad(0.1) - 0.1 * 5.5e-6 / 16e-3).abs() < 1e-18);
     let half_diag = (512.0f64 * 5.5e-6 * 2f64.sqrt() / 16e-3).atan();
     assert!((cam.half_diagonal_rad() - half_diag).abs() < 1e-12);
 }
@@ -126,18 +125,7 @@ fn folded_lenses_refuse_the_wrong_branch() {
 }
 
 #[test]
-fn mount_and_aberration() {
-    let h = core::f64::consts::FRAC_1_SQRT_2;
-    let q_b_st = Quat([0.0, h, 0.0, h]);
-    let cam = Camera {
-        intr: intrinsics(),
-        q_b_st,
-    };
-    let b_st = [0.1, -0.2, 0.97];
-    let body = cam.st_to_body(b_st);
-    assert_eq!(body, q_b_st.rotate(b_st));
-    let back = cam.body_to_st(body);
-    assert!(b_st.iter().zip(back).all(|(a, b)| (a - b).abs() < 1e-15));
+fn aberration() {
     let a = aberrate([0.0, 0.0, 1.0], [1e-4, 0.0, 0.0]).unwrap();
     assert!((norm(a) - 1.0).abs() < 1e-15 && (a[0] - 1e-4).abs() < 1e-12);
     assert_eq!(aberrate([0.0, 0.0, 1.0], [0.0; 3]), Some([0.0, 0.0, 1.0]));

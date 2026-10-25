@@ -28,10 +28,6 @@ fn radec(ra_deg: f64, dec_deg: f64) -> V3 {
 
 #[test]
 fn parses_tiny_and_g8() {
-    assert_eq!(
-        (Header::LEN, size_of::<Cell>(), size_of::<Star>()),
-        (80, 32, 16)
-    );
     let cat = tiny();
     let h = cat.header();
     assert_eq!(

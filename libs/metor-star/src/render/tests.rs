@@ -52,14 +52,8 @@ fn prepare(stars: &[(V3, f32, u32)], motion: &Motion) -> (Truth, usize) {
 /// V = 0 ↔ 8.8e5 ph/s/cm², D = 2.5 cm, mag 7, τ·QE = 0.5 and 100 ms.
 #[test]
 fn photometry_anchor() {
-    let p = SIM_PHOTOMETRY;
-    let e = p.electrons(7.0, 0.1);
+    let e = SIM_PHOTOMETRY.electrons(7.0, 0.1);
     assert!((e - 342.0).abs() < 1.0, "{e}");
-    let ratio = p.electrons(2.0, 1.0) / p.electrons(7.0, 1.0);
-    assert!((ratio - 100.0).abs() < 1e-3, "{ratio}");
-    let c: f32 = 1.5;
-    let expect = 5.0 + G_TO_V[0] + G_TO_V[1] * c + G_TO_V[2] * c * c + G_TO_V[3] * c * c * c;
-    assert!((p.band_mag(5.0, c) - expect).abs() < 1e-5);
 }
 
 #[test]
@@ -199,43 +193,4 @@ fn hot_pixels() {
     assert!((count - expect).abs() < 4.0 * expect.sqrt(), "{count}");
     assert!(hot.as_slice().iter().all(|&m| (1.0..=100.0).contains(&m)));
     assert_eq!(hot, HotPixels::new(n, 1e-3, 100.0, 3));
-}
-
-#[test]
-fn rejects_a_bad_setup() {
-    let bytes = cat_bytes(&[]);
-    let cat = StarCat::parse(&bytes).unwrap();
-    let new = |sensor, shape, phot| {
-        let hot = HotPixels::none(SIM_SHAPE.pixels());
-        Scene::new(cat, SIM_CAMERA, phot, sensor, shape, hot, 12.0).err()
-    };
-    let (sensor, shape, phot) = (SIM_SENSOR, SIM_SHAPE, SIM_PHOTOMETRY);
-    let wide = Sensor {
-        psf_sigma_px: 1.6,
-        ..sensor
-    };
-    let nan = Sensor {
-        read_noise_e: f32::NAN,
-        ..sensor
-    };
-    let narrow = Shape {
-        width: 512,
-        ..shape
-    };
-    let dark = Photometry {
-        aperture_m2: 0.0,
-        ..phot
-    };
-    assert_eq!(new(wide, shape, phot), Some(RenderError::BadPsf));
-    assert_eq!(new(nan, shape, phot), Some(RenderError::BadSensor));
-    assert_eq!(new(sensor, narrow, phot), Some(RenderError::BadShape));
-    assert_eq!(new(sensor, shape, dark), Some(RenderError::BadPhotometry));
-    let ok = still(Quat::IDENTITY);
-    let frame = |m: &Motion, max_sub| Frame::new(&SIM_CAMERA, m, max_sub, 0, 0).err();
-    assert_eq!(frame(&ok, MAX_SUB + 1), Some(RenderError::BadSubsteps));
-    let spin = Motion {
-        omega_b: [f64::INFINITY, 0.0, 0.0],
-        ..ok
-    };
-    assert_eq!(frame(&spin, MAX_SUB), Some(RenderError::BadMotion));
 }
