@@ -661,6 +661,8 @@ impl ConnectionPicker {
 
         let mut row = div()
             .id(SharedString::from(format!("row-{}", entry.id)))
+            // The table scrolls; a row squeezed to fit would lose its padding.
+            .flex_shrink_0()
             .h(px(ROW_HEIGHT))
             .pl(px(10.0))
             .flex()
@@ -765,9 +767,11 @@ impl ConnectionPicker {
             let mut card_ix = 0usize;
             let mut cards = div()
                 .id("favorite-systems")
-                .when(self.startup.is_some(), |cards| {
-                    cards.flex_shrink_0().max_h(px(132.)).overflow_y_scroll()
-                })
+                // Held at full height and scrolled past a few rows, so a long
+                // pin list neither squeezes the cards nor buries the table.
+                .flex_shrink_0()
+                .max_h(px(132.))
+                .overflow_y_scroll()
                 .flex()
                 .flex_row()
                 .flex_wrap()
