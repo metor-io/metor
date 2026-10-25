@@ -85,9 +85,9 @@ pub struct NavStats {
     /// The last star frame fused, or zero.
     pub star_frame_id: u64,
     /// Star frames the gate rejected whole, since boot.
-    pub contradictions: u64,
+    pub rejected_frames: u64,
     /// Attitude resets to the star tracker's solution, since boot.
-    pub prior_resets: u64,
+    pub solution_resets: u64,
 }
 
 /// The spacecraft's true attitude, body rate, and orbit state.

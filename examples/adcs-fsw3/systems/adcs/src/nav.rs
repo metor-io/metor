@@ -146,8 +146,8 @@ impl NavState {
                 stars_used: 0,
                 stars_gated: 0,
                 star_frame_id: 0,
-                contradictions: 0,
-                prior_resets: 0,
+                rejected_frames: 0,
+                solution_resets: 0,
             },
         }
     }
@@ -213,7 +213,7 @@ impl NavState {
             if counts.used > 0 {
                 return counts;
             }
-            self.stats.contradictions += 1;
+            self.stats.rejected_frames += 1;
             if solution.is_none() {
                 return counts;
             }
@@ -227,7 +227,7 @@ impl NavState {
     fn reset(&mut self, q: Quat) {
         self.mekf.q_hat = q;
         self.mekf.reset_attitude_variance(RESET_SIGMA * RESET_SIGMA);
-        self.stats.prior_resets += 1;
+        self.stats.solution_resets += 1;
     }
 
     /// Whether a star frame fused a star within [`LIVE_FOR`] of `t_sim`,
@@ -480,7 +480,7 @@ mod tests {
         nav.mekf.omega = omega;
         let (sv, solution) = stars_at(truth, Timestamp(0), 1);
         nav.fuse_stars(Some(&sv), Some(&solution), Timestamp(100_000), 0.0);
-        assert_eq!(nav.stats.prior_resets, 1);
+        assert_eq!(nav.stats.solution_resets, 1);
         assert_eq!(nav.stats.stars_used, MAX_STARS as u64);
         for (b, r, _) in sv.obs() {
             let seen = rotate_back(b, omega, 0.1);
@@ -629,7 +629,7 @@ mod tests {
         for _ in 0..120 * 30 {
             b.step(Some(bias), true);
         }
-        assert!(b.nav.stats.prior_resets >= 1);
+        assert!(b.nav.stats.solution_resets >= 1);
         assert!(b.nav.stats.stars_used >= 16, "{:?}", b.nav.stats);
         assert!(b.error_deg() < 0.01, "{}°", b.error_deg());
     }
