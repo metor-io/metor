@@ -246,17 +246,12 @@ fn counts<'a, W: WakeSource>(
     inputs.chain(outputs)
 }
 
-/// The smallest record, in ring bytes, whose mirror is
-/// [`mirror_factor`]'s 2×.
+/// The smallest record, in ring bytes, whose mirror is only 2× its ring.
 pub(crate) const LARGE_RECORD: usize = 512 << 10;
 
 /// Returns how many times larger than its ring a mirror of records of up to
-/// `max_len` bytes is.
-///
-/// A mirror wraps at a different offset than the ring, so it needs
-/// `capacity + frame_len(max_len)` bytes to hold a full ring. A ring holds at
-/// least two records, so 2× is enough. Records under [`LARGE_RECORD`] keep
-/// `factor`, and the slack lets a reader fall a few cycles behind.
+/// `max_len` bytes is: `factor`, or 2 for [`LARGE_RECORD`]s. A ring holds two
+/// records at least, so 2× still holds a full ring past the mirror's wrap.
 pub(crate) fn mirror_factor(max_len: usize, factor: usize) -> usize {
     match checked_frame_len(max_len).is_none_or(|frame| frame >= LARGE_RECORD) {
         true => 2,

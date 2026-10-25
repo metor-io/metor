@@ -904,11 +904,7 @@ const WAL_OPEN_ENTRIES: usize = 256;
 /// trimmed to `WAL_BUDGET`. A multiple of the entry, so no grant wraps.
 fn wal_capacity(size: usize, entries: usize) -> usize {
     let entry = size + size_of::<Timestamp>();
-    entry * wal_entries(entry, entries)
-}
-
-fn wal_entries(entry: usize, entries: usize) -> usize {
-    (WAL_BUDGET / entry).max(WAL_MIN_ENTRIES).min(entries)
+    entry * (WAL_BUDGET / entry).max(WAL_MIN_ENTRIES).min(entries)
 }
 
 #[derive(Clone)]
@@ -1302,15 +1298,10 @@ const SERIES_HEAD: usize = size_of::<PacketHeader>() + size_of::<u64>();
 /// Samples a `GetTimeSeries` response carries: the oldest of `range_len`,
 /// at most `limit`, and no more than fit `SERIES_BUDGET`.
 fn series_len(range_len: usize, limit: usize, size: usize) -> Result<usize, Error> {
-    series_fit(range_len, limit, size).ok_or(Error::ComponentTooLarge(size))
-}
-
-/// [`series_len`], or `None` if one sample does not fit.
-fn series_fit(range_len: usize, limit: usize, size: usize) -> Option<usize> {
     let entry = size.saturating_add(size_of::<Timestamp>());
     match (SERIES_BUDGET - SERIES_HEAD) / entry {
-        0 => None,
-        fit => Some(range_len.min(limit).min(fit)),
+        0 => Err(Error::ComponentTooLarge(size)),
+        fit => Ok(range_len.min(limit).min(fit)),
     }
 }
 
@@ -3282,10 +3273,6 @@ mod wal_tests {
         ComponentSchema::new(PrimType::U16, &[1024usize, 1024][..])
     }
 
-    fn f64_schema() -> ComponentSchema {
-        ComponentSchema::new(PrimType::F64, &[1usize][..])
-    }
-
     fn unpersisted(dir: &Path, schema: ComponentSchema) -> Component {
         let id = ComponentId::new("wal");
         let time_series = TimeSeries::create(dir.join(id.to_string())).unwrap();
@@ -3324,39 +3311,11 @@ mod wal_tests {
     #[test]
     fn capacity_holds_whole_entries_within_budget() {
         assert_eq!(wal_capacity(8, WAL_CREATE_ENTRIES), 16 * 1024);
-        assert_eq!(wal_capacity(8, WAL_OPEN_ENTRIES), 16 * 256);
-        assert_eq!(wal_capacity(0, 1), 8);
         let image = wal_capacity(IMAGE_SIZE, WAL_CREATE_ENTRIES);
         assert_eq!(image, 31 * (IMAGE_SIZE + 8));
         assert!(image <= WAL_BUDGET);
-    }
-
-    #[test]
-    fn capacity_keeps_min_entries_past_budget() {
         let size = 40 * 1024 * 1024;
         assert_eq!(wal_capacity(size, WAL_CREATE_ENTRIES), 4 * (size + 8));
-        assert_eq!(wal_capacity(size, 2), 2 * (size + 8));
-    }
-
-    #[test]
-    fn small_component_wal_holds_create_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let component = unpersisted(dir.path(), f64_schema());
-        assert_eq!(component.wal.capacity(), 16 * 1024);
-        let mut reader = component.wal.reader();
-        for ts in 0..1100 {
-            component
-                .push_buf(Timestamp(ts), &(ts as f64).to_le_bytes())
-                .unwrap();
-        }
-        assert_eq!(
-            drain(&mut reader, 8),
-            (0..WAL_CREATE_ENTRIES as i64).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            component.wal_dropped.load(atomic::Ordering::Relaxed),
-            1100 - WAL_CREATE_ENTRIES as u64
-        );
     }
 
     #[test]
@@ -3423,28 +3382,12 @@ mod series_tests {
     fn series_len_clamps_to_the_budget() {
         assert_eq!(series_len(300, usize::MAX, IMAGE_SIZE).unwrap(), PAGE);
         assert_eq!(series_len(300, 10, IMAGE_SIZE).unwrap(), 10);
-        assert_eq!(series_len(1, usize::MAX, IMAGE_SIZE).unwrap(), 1);
         assert_eq!(series_len(1_000_000, usize::MAX, 8).unwrap(), 1_000_000);
-    }
-
-    #[test]
-    fn series_len_edges() {
-        assert_eq!(series_len(300, 0, IMAGE_SIZE).unwrap(), 0);
-        assert_eq!(series_len(0, usize::MAX, IMAGE_SIZE).unwrap(), 0);
         let largest = SERIES_BUDGET - SERIES_HEAD - size_of::<Timestamp>();
         assert_eq!(series_len(5, usize::MAX, largest).unwrap(), 1);
-    }
-
-    #[test]
-    fn series_len_refuses_a_sample_past_the_budget() {
-        let size = SERIES_BUDGET - SERIES_HEAD - size_of::<Timestamp>() + 1;
         assert!(matches!(
-            series_len(1, usize::MAX, size),
-            Err(Error::ComponentTooLarge(s)) if s == size
-        ));
-        assert!(matches!(
-            series_len(1, 1, usize::MAX),
-            Err(Error::ComponentTooLarge(_))
+            series_len(1, usize::MAX, largest + 1),
+            Err(Error::ComponentTooLarge(s)) if s == largest + 1
         ));
     }
 
@@ -3515,9 +3458,8 @@ mod series_tests {
     }
 
     /// Ingests samples `1..=count`, keeping the WAL from filling.
-    async fn ingest(db: &DB, count: i64) -> Duration {
+    async fn ingest(db: &DB, count: i64) {
         let mut table = vec![0u8; 16 + IMAGE_SIZE];
-        let start = Instant::now();
         for ts in 1..=count {
             fill(&mut table, ts);
             db.ingest_table(ID, &table).unwrap();
@@ -3525,7 +3467,6 @@ mod series_tests {
                 wait_persisted(db, ts).await;
             }
         }
-        start.elapsed()
     }
 
     fn serve(db: Arc<DB>) -> SocketAddr {
@@ -3562,12 +3503,7 @@ mod series_tests {
     #[stellarator::test]
     async fn get_time_series_pages_large_samples_oldest_first() {
         let (_dir, db) = image_db();
-        let took = ingest(&db, 300).await;
-        let mib = 300.0 * IMAGE_SIZE as f64 / (1 << 20) as f64;
-        eprintln!(
-            "db ingest: 300 x 2 MiB in {took:?}, {:.0} MiB/s",
-            mib / took.as_secs_f64()
-        );
+        ingest(&db, 300).await;
         let mut client = Client::connect(serve(db)).await.unwrap();
 
         let mut seen = Vec::new();

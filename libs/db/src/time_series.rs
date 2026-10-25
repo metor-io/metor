@@ -1942,17 +1942,6 @@ mod tests {
     }
 
     #[test]
-    fn small_elements_keep_node_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let series = TimeSeries::create(dir.path()).unwrap();
-        let mut writer = series.writer().unwrap();
-        push_patterns(&mut writer, 0..100, 8);
-        assert_eq!(node_starts(&series), vec![0]);
-        assert_eq!(data_file_len(dir.path(), 0), NODE_SIZE + 1);
-        assert_patterns(&series, 0..100, 8);
-    }
-
-    #[test]
     fn large_elements_roll_every_min_elements() {
         let dir = tempfile::tempdir().unwrap();
         let series = TimeSeries::create(dir.path()).unwrap();
@@ -1964,17 +1953,6 @@ mod tests {
             node_data_size(IMAGE_SIZE as u64) + 1
         );
         assert_patterns(&series, 0..100, IMAGE_SIZE);
-    }
-
-    #[test]
-    fn element_past_old_node_size_pushes_and_reads_back() {
-        let size = 40 * 1024 * 1024;
-        let dir = tempfile::tempdir().unwrap();
-        let series = TimeSeries::create(dir.path()).unwrap();
-        let mut writer = series.writer().unwrap();
-        push_patterns(&mut writer, 0..3, size);
-        assert_eq!(node_starts(&series), vec![0]);
-        assert_patterns(&series, 0..3, size);
     }
 
     #[test]

@@ -77,7 +77,7 @@ fn encode<W: InputWake>(
 }
 
 /// Appends one packet to `buf`, or nothing if it does not fit.
-pub(super) fn append(buf: &mut Buf, ty: PacketTy, id: PacketId, payload: &[u8]) {
+fn append(buf: &mut Buf, ty: PacketTy, id: PacketId, payload: &[u8]) {
     if PACKET_OVERHEAD + payload.len() <= buf.spare() {
         buf.extend(&wire::packet_head(ty, id, payload.len()));
         buf.extend(payload);
