@@ -206,6 +206,7 @@ mod star_tracker_demo {
             tab_orientation: TabOrientation::Horizontal,
             hide_tab_bar: false,
             locked_size: None,
+            tab_rail_width: None,
             items: vec![TileItem {
                 kind: kind.into(),
                 state,
