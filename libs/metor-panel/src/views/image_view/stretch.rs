@@ -13,7 +13,7 @@ use super::view::ImageView;
 use crate::inspector::rows::{AccessorySpec, CommandRow, InspectorRow, RowAction, value_row};
 
 /// Stretch presets: a label and the levels it sets.
-const PRESETS: [(&str, Levels); 4] = [
+const PRESETS: [(&str, Levels); 3] = [
     (
         "Stretch: auto (0.5–99.95%)",
         Levels::Auto {
@@ -38,7 +38,6 @@ const PRESETS: [(&str, Levels); 4] = [
             lock: false,
         },
     ),
-    ("Stretch: equalize", Levels::Equalize),
 ];
 
 /// The levels row, carrying the histogram, then the presets.
@@ -127,7 +126,6 @@ fn summary(levels: Levels, painted: Option<(f64, f64)>) -> SharedString {
             number(high * 100.0),
             if lock { " locked" } else { "" }
         ),
-        Levels::Equalize => "equalize".to_string(),
     };
     match painted {
         Some((black, white)) => format!("{mode} · {}–{}", number(black), number(white)).into(),
@@ -188,6 +186,5 @@ mod tests {
             .as_ref(),
             "manual · 0.25–1"
         );
-        assert_eq!(summary(Levels::Equalize, None).as_ref(), "equalize");
     }
 }

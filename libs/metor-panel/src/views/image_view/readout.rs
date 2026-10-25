@@ -42,11 +42,6 @@ pub fn raw_value(frame: &Frame, x: usize, y: usize) -> Option<String> {
     let values: Vec<String> = match layout.pixels(&frame.bytes).ok()? {
         Pixels::U8(p) => p.get(at)?.iter().map(u8::to_string).collect(),
         Pixels::U16(p) => p.get(at)?.iter().map(|v| v.get().to_string()).collect(),
-        Pixels::F32(p) => p
-            .get(at)?
-            .iter()
-            .map(|v| format!("{:.6}", v.get()))
-            .collect(),
     };
     let value = values.join(", ");
     Some(match super::color::site(layout.format, x, y) {
@@ -171,13 +166,6 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6],
         );
         assert_eq!(raw_value(&rgb, 1, 0).as_deref(), Some("4, 5, 6"));
-        let float = frame(
-            ImageFormat::MonoF32,
-            PrimType::F32,
-            &[1, 1],
-            (-0.5f32).to_le_bytes().to_vec(),
-        );
-        assert_eq!(raw_value(&float, 0, 0).as_deref(), Some("-0.500000"));
         let short = Frame {
             bytes: vec![0u8; 3].into(),
             ..mono

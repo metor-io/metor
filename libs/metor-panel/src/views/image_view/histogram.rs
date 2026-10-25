@@ -1,17 +1,14 @@
 //! Sample histograms over a source rectangle, and percentiles from them.
 
-use zerocopy::byteorder::{F32, LE, U16};
+use zerocopy::byteorder::{LE, U16};
 
 use super::resample::Rect;
 
-/// Counts per bin. Integer frames get one bin per code; `mono_f32` gets
-/// `bins` equal bins over `lo..=hi`.
+/// Counts per bin, one bin per code.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Histogram {
     bins: Vec<u32>,
     count: u64,
-    lo: f64,
-    width: f64,
 }
 
 impl Histogram {
@@ -29,39 +26,10 @@ impl Histogram {
         hist
     }
 
-    /// Values outside `lo..=hi` land in the end bins; NaN is skipped.
-    pub fn of_f32(
-        pixels: &[F32<LE>],
-        frame_width: usize,
-        rect: Rect,
-        lo: f32,
-        hi: f32,
-        bins: usize,
-    ) -> Self {
-        let bins = bins.max(1);
-        let width = match f64::from(hi - lo) / bins as f64 {
-            w if w > 0.0 && w.is_finite() => w,
-            _ => 1.0,
-        };
-        let mut hist = Self {
-            bins: vec![0; bins],
-            count: 0,
-            lo: f64::from(lo),
-            width,
-        };
-        hist.record(pixels, frame_width, rect, |v| {
-            let v = f64::from(v.get());
-            (!v.is_nan()).then(|| ((v - f64::from(lo)) / width).max(0.0) as usize)
-        });
-        hist
-    }
-
     fn integer(bins: usize) -> Self {
         Self {
             bins: vec![0; bins],
             count: 0,
-            lo: 0.0,
-            width: 1.0,
         }
     }
 
@@ -109,19 +77,6 @@ impl Histogram {
                 seen >= target
             })
             .map(|bin| bin as u32)
-    }
-
-    /// The share of samples in each bin or below it, in `0..=1`.
-    pub fn cdf(&self) -> Vec<f32> {
-        let total = self.count.max(1) as f64;
-        let mut seen = 0u64;
-        self.bins
-            .iter()
-            .map(|&n| {
-                seen += u64::from(n);
-                (seen as f64 / total) as f32
-            })
-            .collect()
     }
 
     /// Counts every colour channel of interleaved RGB or RGBA (alpha left
@@ -174,31 +129,8 @@ impl Histogram {
 
     /// The sample values the bins span.
     pub fn range(&self) -> (f64, f64) {
-        (self.lo, self.lo + self.bins.len() as f64 * self.width)
+        (0.0, self.bins.len() as f64)
     }
-
-    /// The sample value at the low edge of `bin`; the code itself for
-    /// integer frames.
-    pub fn value(&self, bin: u32) -> f64 {
-        self.lo + f64::from(bin) * self.width
-    }
-}
-
-/// The finite min and max of `rect`, for sizing a `mono_f32` histogram.
-pub fn finite_range(pixels: &[F32<LE>], frame_width: usize, rect: Rect) -> Option<(f32, f32)> {
-    let frame_height = pixels.len().checked_div(frame_width).unwrap_or(0);
-    let rect = rect.clip(frame_width, frame_height);
-    rect.rows()
-        .flat_map(|row| {
-            let start = row * frame_width + rect.x;
-            &pixels[start..start + rect.width]
-        })
-        .map(|v| v.get())
-        .filter(|v| v.is_finite())
-        .fold(None, |range, v| match range {
-            None => Some((v, v)),
-            Some((lo, hi)) => Some((lo.min(v), hi.max(v))),
-        })
 }
 
 #[cfg(test)]
@@ -207,10 +139,6 @@ mod tests {
 
     fn u16s(values: &[u16]) -> Vec<U16<LE>> {
         values.iter().map(|&v| U16::new(v)).collect()
-    }
-
-    fn f32s(values: &[f32]) -> Vec<F32<LE>> {
-        values.iter().map(|&v| F32::new(v)).collect()
     }
 
     fn whole(width: usize, height: usize) -> Rect {
@@ -283,24 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn f32_bins_skip_nan_and_clamp() {
-        let pixels = f32s(&[0.0, 0.5, f32::NAN, 1.0, -3.0, 9.0]);
-        let hist = Histogram::of_f32(&pixels, 6, whole(6, 1), 0.0, 1.0, 4);
-        assert_eq!(hist.count(), 5);
-        assert_eq!(hist.bins(), [2, 0, 1, 2]);
-        assert_eq!(hist.value(2), 0.5);
-        assert_eq!(finite_range(&pixels, 6, whole(6, 1)), Some((-3.0, 9.0)));
-    }
-
-    #[test]
-    fn f32_degenerate_range_does_not_panic() {
-        let pixels = f32s(&[2.0, 2.0, f32::INFINITY]);
-        let hist = Histogram::of_f32(&pixels, 3, whole(3, 1), 2.0, 2.0, 0);
-        assert_eq!((hist.bins(), hist.count()), (&[3][..], 3));
-        assert_eq!(finite_range(&f32s(&[f32::NAN]), 1, whole(1, 1)), None);
-    }
-
-    #[test]
     fn rect_counts_only_its_pixels() {
         #[rustfmt::skip]
         let pixels: Vec<u8> = vec![
@@ -320,9 +230,6 @@ mod tests {
     fn range_spans_the_bins() {
         let hist = Histogram::of_u16(&u16s(&[1]), 1, 12, whole(1, 1));
         assert_eq!(hist.range(), (0.0, 4096.0));
-        let floats = f32s(&[0.0, 1.0]);
-        let hist = Histogram::of_f32(&floats, 2, whole(2, 1), -1.0, 3.0, 8);
-        assert_eq!(hist.range(), (-1.0, 3.0));
     }
 
     #[test]

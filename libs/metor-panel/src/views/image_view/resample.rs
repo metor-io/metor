@@ -5,7 +5,7 @@ use std::fmt;
 use std::ops::Range;
 
 use metor_proto_wkt::ImageFormat;
-use zerocopy::byteorder::{F32, LE, U16};
+use zerocopy::byteorder::{LE, U16};
 
 use super::layout::{FrameLayout, LayoutError, Pixels};
 use super::lut::Lut;
@@ -268,7 +268,6 @@ pub fn render_into(
     match pixels {
         Pixels::U8(data) => job.render(data, rows, dst, scratch),
         Pixels::U16(data) => job.render(data, rows, dst, scratch),
-        Pixels::F32(data) => job.render(data, rows, dst, scratch),
     }
     Ok(())
 }
@@ -288,7 +287,6 @@ fn check(
     let actual = match pixels {
         Pixels::U8(p) => p.len(),
         Pixels::U16(p) => p.len(),
-        Pixels::F32(p) => p.len(),
     };
     if actual != expected {
         return Err(RenderError::PixelCount { expected, actual });
@@ -316,24 +314,18 @@ fn check(
 }
 
 trait Sample: Copy {
-    fn code(self, lut: &Lut) -> u32;
+    fn code(self) -> u32;
 }
 
 impl Sample for u8 {
-    fn code(self, _: &Lut) -> u32 {
+    fn code(self) -> u32 {
         u32::from(self)
     }
 }
 
 impl Sample for U16<LE> {
-    fn code(self, _: &Lut) -> u32 {
+    fn code(self) -> u32 {
         u32::from(self.get())
-    }
-}
-
-impl Sample for F32<LE> {
-    fn code(self, lut: &Lut) -> u32 {
-        lut.f32_code(self.get())
     }
 }
 
@@ -384,11 +376,11 @@ impl Job<'_> {
         let row = |y: usize| &data[y * self.width + x0..][..len];
         let first = ys.start;
         for (a, &v) in acc.iter_mut().zip(row(first)) {
-            *a = v.code(self.lut);
+            *a = v.code();
         }
         for y in first + 1..ys.end {
             for (a, &v) in acc.iter_mut().zip(row(y)) {
-                *a = (*a).max(v.code(self.lut));
+                *a = (*a).max(v.code());
             }
         }
     }
@@ -794,21 +786,6 @@ mod tests {
             (8, 8),
         );
         assert!(buf.as_chunks::<4>().0.iter().all(|&px| px == SAT));
-    }
-
-    #[test]
-    fn mono_f32_maps_through_the_levels() {
-        let data: Vec<F32<LE>> = [-1.0f32, 0.0, 1.0, f32::NAN].map(F32::new).to_vec();
-        let layout = layout(ImageFormat::MonoF32, 32, 4, 1);
-        let lut = Lut::build_f32(-1.0, 1.0, &Display::default());
-        let (_, buf) = render(
-            Pixels::F32(&data),
-            &layout,
-            &lut,
-            view(0.0, 0.0, 1.0),
-            (4, 1),
-        );
-        assert_eq!(reds(&buf), [0, 127, 255, 0]);
     }
 
     #[test]

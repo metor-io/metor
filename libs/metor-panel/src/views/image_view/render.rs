@@ -10,14 +10,12 @@ use metor_proto_wkt::Stretch;
 use smallvec::SmallVec;
 
 use super::color::{ChannelLut, color_input, is_color, render_color, render_mosaic};
-use super::histogram::{Histogram, finite_range};
+use super::histogram::Histogram;
 use super::layout::{FrameLayout, Pixels};
-use super::lut::{Colormap, Curve, Display, F32_BITS, Levels, Lut};
+use super::lut::{Curve, Display, Levels, Lut};
 use super::resample::{Plane, Rect, RenderError, Scratch, Viewport, render_into};
 use super::source::Frame;
 
-/// Histogram bins for a `mono_f32` frame.
-const F32_BINS: usize = 1 << F32_BITS;
 /// Softening for a producer's `asinh` stretch hint.
 const ASINH_SOFTENING: f32 = 0.1;
 
@@ -172,9 +170,7 @@ pub fn hinted(display: Display, layout: &FrameLayout) -> Display {
     };
     let curve = match layout.stretch {
         Stretch::Linear => Curve::Linear,
-        Stretch::Sqrt => Curve::Sqrt,
-        Stretch::Log => Curve::Log,
-        Stretch::Asinh => Curve::Asinh {
+        Stretch::Sqrt | Stretch::Log | Stretch::Asinh => Curve::Asinh {
             softening: ASINH_SOFTENING,
         },
         Stretch::Auto => display.curve,
@@ -186,8 +182,7 @@ pub fn hinted(display: Display, layout: &FrameLayout) -> Display {
     }
 }
 
-/// The histogram of `region`: integer codes, or 4096 bins over the finite
-/// range of a float frame.
+/// The histogram of `region`, one bin per code.
 pub fn histogram(pixels: Pixels<'_>, layout: &FrameLayout, region: Rect) -> Histogram {
     let w = layout.width;
     match pixels {
@@ -196,10 +191,6 @@ pub fn histogram(pixels: Pixels<'_>, layout: &FrameLayout, region: Rect) -> Hist
         }
         Pixels::U8(p) => Histogram::of_u8(p, w, region),
         Pixels::U16(p) => Histogram::of_u16(p, w, layout.bits, region),
-        Pixels::F32(p) => {
-            let (lo, hi) = finite_range(p, w, region).unwrap_or((0.0, 1.0));
-            Histogram::of_f32(p, w, region, lo, hi, F32_BINS)
-        }
     }
 }
 
@@ -210,34 +201,13 @@ pub fn levels(
     histogram: Option<&Histogram>,
     layout: &FrameLayout,
 ) -> (f64, f64) {
-    let full = match layout.format.element() {
-        metor_proto::types::PrimType::F32 => (0.0, 1.0),
-        _ => (0.0, f64::from((1u32 << layout.bits.clamp(1, 16)) - 1)),
-    };
+    let full = (0.0, f64::from((1u32 << layout.bits.clamp(1, 16)) - 1));
     match display.levels {
         Levels::Manual { black, white } => (black, white),
-        Levels::Equalize => histogram.map_or(full, Histogram::range),
-        Levels::Auto { low, high, .. } => {
-            let levels = histogram
-                .and_then(|h| {
-                    let black = h.value(h.percentile(low)?);
-                    let white = h.value(h.percentile(high)?);
-                    Some((black, white))
-                })
-                .unwrap_or(full);
-            let float = layout.format.element() == metor_proto::types::PrimType::F32;
-            match display.colormap {
-                Colormap::RedBlue if float => symmetric(levels),
-                _ => levels,
-            }
-        }
+        Levels::Auto { low, high, .. } => histogram
+            .and_then(|h| Some((f64::from(h.percentile(low)?), f64::from(h.percentile(high)?))))
+            .unwrap_or(full),
     }
-}
-
-/// Levels centred on zero that cover both of `levels`.
-fn symmetric((black, white): (f64, f64)) -> (f64, f64) {
-    let reach = black.abs().max(white.abs());
-    (-reach, reach)
 }
 
 /// What a job needs; everything is owned so it can run off the main thread.
@@ -255,8 +225,6 @@ pub struct LutKey {
     pub bits: u8,
     pub display: Display,
     pub levels: (f64, f64),
-    /// The histogram an equalised LUT follows.
-    pub histogram: usize,
 }
 
 pub struct Rendered {
@@ -302,7 +270,7 @@ pub fn run(job: Job) -> Rendered {
     let hist = (key.histogram || !matches!(key.display.levels, Levels::Manual { .. }))
         .then(|| Arc::new(histogram(pixels, &layout, region)));
     let levels = levels(&key.display, hist.as_deref(), &layout);
-    let lut = cached_lut(lut, &layout, &key, levels, hist.as_ref());
+    let lut = cached_lut(lut, &layout, &key, levels);
     if out.is_empty() {
         return Rendered {
             key,
@@ -323,7 +291,6 @@ pub fn run(job: Job) -> Rendered {
             levels,
             out,
             &frame,
-            hist.as_deref(),
             &mut bgra,
             &mut scratch,
         ),
@@ -368,16 +335,10 @@ fn render_color_frame(
     (black, white): (f64, f64),
     out: Rect,
     frame: &Frame,
-    histogram: Option<&Histogram>,
     bgra: &mut [u8],
     scratch: &mut Scratch,
 ) -> Result<(), RenderError> {
-    let lut = match (key.display.levels, histogram) {
-        (Levels::Equalize, Some(histogram)) => {
-            ChannelLut::equalized(layout.bits, histogram, key.display.curve)
-        }
-        _ => ChannelLut::build(layout.bits, black, white, key.display.curve),
-    };
+    let lut = ChannelLut::build(layout.bits, black, white, key.display.curve);
     let bytes = frame.bytes.as_ptr() as usize;
     let color = &mut scratch.color;
     match color_input(pixels, layout, &key.viewport, bytes, color) {
@@ -391,29 +352,17 @@ fn cached_lut(
     layout: &FrameLayout,
     key: &RenderKey,
     levels: (f64, f64),
-    histogram: Option<&Arc<Histogram>>,
 ) -> (LutKey, Arc<Lut>) {
-    let equalize = histogram.filter(|_| key.display.levels == Levels::Equalize);
     let want = LutKey {
         bits: layout.bits,
         display: key.display,
         levels,
-        histogram: equalize.map_or(0, |h| Arc::as_ptr(h) as usize),
     };
     if let Some(cached) = cached.filter(|(k, _)| *k == want) {
         return cached;
     }
     let (black, white) = levels;
-    let lut = match layout.format.element() {
-        metor_proto::types::PrimType::F32 => {
-            Lut::build_f32(black as f32, white as f32, &key.display)
-        }
-        _ => Lut::build(layout.bits, black, white, &key.display, key.saturated),
-    };
-    let lut = match equalize {
-        Some(histogram) => lut.equalized(histogram, &key.display, key.saturated),
-        None => lut,
-    };
+    let lut = Lut::build(layout.bits, black, white, &key.display, key.saturated);
     (want, Arc::new(lut))
 }
 
@@ -795,73 +744,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn mono_f32_renders_end_to_end_with_symmetric_red_blue() {
-        let (w, h) = (16, 8);
-        let values: Vec<f32> = (0..w * h).map(|i| (i % w) as f32 - 4.0).collect();
-        let layout = FrameLayout::from_component(
-            &metor_db::ComponentSchema::new(PrimType::F32, &[h, w][..]),
-            &ComponentMetadata::from("cam").with_image(metor_proto_wkt::ImageFormat::MonoF32, 32),
-        )
-        .unwrap();
-        let frame = Frame {
-            timestamp: Timestamp(1),
-            bytes: values
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<_>>()
-                .into(),
-            layout,
-        };
-        let display = Display {
-            levels: Levels::Auto {
-                low: 0.0,
-                high: 1.0,
-                lock: false,
-            },
-            colormap: Colormap::RedBlue,
-            ..Display::default()
-        };
-        let key = RenderKey::new(&frame, display, fit(&layout, (16, 8)), (16, 8), [0; 4]);
-        let rendered = run(Job {
-            key,
-            frame,
-            scratch: Scratch::default(),
-            lut: None,
-        });
-        assert_eq!(rendered.error, None);
-        let (black, white) = rendered.levels;
-        assert_eq!(black, -white);
-        assert!(white > 10.9, "{:?}", rendered.levels);
-        // Zero sits mid-scale: neither strongly red nor strongly blue.
-        let [b, _, r, _] = painted(&rendered, 4, 2);
-        assert!((i32::from(r) - i32::from(b)).abs() < 60, "{r} {b}");
-        let [b, _, r, _] = painted(&rendered, 15, 2);
-        assert!(r > b);
-    }
-
-    #[test]
-    fn equalized_levels_follow_the_histogram() {
-        let f = frame(8, 8, |x, _| if x < 7 { 10 } else { 4000 });
-        let mut key = RenderKey::new(
-            &f,
-            Display::default(),
-            fit(&f.layout, (8, 8)),
-            (8, 8),
-            [0; 4],
-        );
-        key.display.levels = Levels::Equalize;
-        let rendered = run(Job {
-            key,
-            frame: f,
-            scratch: Scratch::default(),
-            lut: None,
-        });
-        assert_eq!(rendered.levels, (0.0, 4096.0));
-        // Seven eighths of the samples sit at 10, so 10 paints bright.
-        let [_, _, r, _] = painted(&rendered, 0, 0);
-        assert!(r > 200, "{r}");
     }
 }

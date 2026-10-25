@@ -42,10 +42,6 @@ pixel!(
     Mono8(u8), u8, 1, 8, Mono8
 );
 pixel!(
-    /// A floating-point gray level.
-    MonoF32(f32), f32, 1, 32, MonoF32
-);
-pixel!(
     /// Red, green, blue.
     Rgb8([u8; 3]), u8, 3, 8, Rgb8
 );
@@ -255,21 +251,6 @@ mod tests {
         let column = FrameImage::<Mono8, 1, 5>::new_box_zeroed().expect("alloc");
         assert_eq!(column.as_component_view().shape(), &[5, 1]);
         assert!(FrameImage::<Mono8, 1, 5>::from_component_view(row.as_component_view()).is_err());
-    }
-
-    #[test]
-    fn test_nan_round_trips_bit_for_bit() {
-        let mut image = FrameImage::<MonoF32, 3, 1>::new_box_zeroed().expect("alloc");
-        let quiet = f32::NAN;
-        let payload = f32::from_bits(0x7fa0_0001);
-        image.pixels_mut().copy_from_slice(&[quiet, payload, -0.0]);
-        let back = FrameImage::<MonoF32, 3, 1>::from_component_view(image.as_component_view())
-            .expect("same shape");
-        let bits: Vec<_> = back.pixels().iter().map(|p| p.to_bits()).collect();
-        assert_eq!(
-            bits,
-            [quiet.to_bits(), payload.to_bits(), (-0.0f32).to_bits()]
-        );
     }
 
     #[test]

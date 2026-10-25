@@ -70,20 +70,6 @@ impl ChannelLut {
         )
     }
 
-    /// The cumulative histogram through the curve, for equalised levels.
-    pub fn equalized(bits: u8, histogram: &super::histogram::Histogram, curve: Curve) -> Self {
-        let codes = 1usize << bits.clamp(1, 16);
-        let cdf = histogram.cdf();
-        Self(
-            (0..codes)
-                .map(|code| {
-                    let t = cdf.get(code * cdf.len() / codes).copied().unwrap_or(0.0);
-                    (curve.apply(t) * 255.0).round() as u8
-                })
-                .collect(),
-        )
-    }
-
     fn get(&self, code: u32) -> u8 {
         let last = self.0.len().saturating_sub(1);
         self.0.get((code as usize).min(last)).copied().unwrap_or(0)
@@ -451,7 +437,6 @@ pub fn color_input<'a>(
             let cfa: Vec<u16> = match pixels {
                 Pixels::U8(p) => p.iter().map(|&v| u16::from(v)).collect(),
                 Pixels::U16(p) => p.iter().map(|v| v.get()).collect(),
-                Pixels::F32(_) => return None,
             };
             let image = Arc::new(superpixel(&cfa, w, h, tile));
             scratch.debayered = Some((key, image.clone()));
@@ -648,7 +633,6 @@ pub fn render_mosaic(
     let mosaic = match pixels {
         Pixels::U8(p) => Mosaic::U8(p),
         Pixels::U16(p) => Mosaic::U16(p),
-        Pixels::F32(_) => return Err(RenderError::Unsupported(layout.format)),
     };
     let expected = out.width * out.height * 4;
     if dst.len() != expected {
@@ -752,7 +736,7 @@ mod tests {
         assert_eq!(site(ImageFormat::BayerGbrg16, 0, 1), Some(Site::Red));
         assert_eq!(site(ImageFormat::Mono16, 0, 0), None);
         assert!(is_color(ImageFormat::Rgba8) && is_color(ImageFormat::BayerBggr16));
-        assert!(!is_color(ImageFormat::MonoF32));
+        assert!(!is_color(ImageFormat::Mono16));
     }
 
     type Le16 = zerocopy::byteorder::U16<zerocopy::byteorder::LE>;
@@ -954,18 +938,6 @@ mod tests {
         assert_eq!(brightest(&mono_dst), brightest(&rgb_dst));
         // Span of device column 3 is source 9..13.
         assert_eq!(brightest(&rgb_dst), (3 - out.x, 2 - out.y));
-    }
-
-    #[test]
-    fn an_equalized_channel_lut_spans_the_range() {
-        use crate::views::image_view::histogram::Histogram;
-        let data: Vec<u8> = (0..100u8).map(|i| if i < 90 { 10 } else { 200 }).collect();
-        let hist = Histogram::of_u8(&data, 100, Rect::new(0, 0, 100, 1));
-        let lut = ChannelLut::equalized(8, &hist, Curve::Linear);
-        assert!(lut.0.windows(2).all(|w| w[1] >= w[0]));
-        assert_eq!(lut.get(255), 255);
-        assert!(lut.get(10) > 200);
-        assert_eq!(lut.get(9), 0);
     }
 
     #[test]

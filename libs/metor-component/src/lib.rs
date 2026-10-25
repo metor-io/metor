@@ -27,7 +27,7 @@
 
 pub use array::{Element, FrameArray};
 pub use bytes::FrameBytes;
-pub use image::{FrameImage, Mono8, Mono16, MonoF32, Pixel, Rgb8, Rgba8};
+pub use image::{FrameImage, Mono8, Mono16, Pixel, Rgb8, Rgba8};
 pub use metadata::Metadatatize;
 pub use metor_component_macros::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_proto::com_de::{Componentize, Decomponentize};

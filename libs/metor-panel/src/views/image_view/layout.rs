@@ -7,7 +7,7 @@ use metor_db::ComponentSchema;
 use metor_proto::types::PrimType;
 use metor_proto_wkt::{ComponentMetadata, ImageFormat, ImageMetaError, Stretch};
 use smallvec::SmallVec;
-use zerocopy::byteorder::{F32, LE, U16};
+use zerocopy::byteorder::{LE, U16};
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 /// The shape and display hints of one image component.
@@ -30,7 +30,6 @@ pub struct FrameLayout {
 pub enum Pixels<'a> {
     U8(&'a [u8]),
     U16(&'a [U16<LE>]),
-    F32(&'a [F32<LE>]),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +75,6 @@ impl FrameLayout {
         match self.format.element() {
             PrimType::U8 => Ok(Pixels::U8(bytes)),
             PrimType::U16 => cast(bytes, length).map(Pixels::U16),
-            PrimType::F32 => cast(bytes, length).map(Pixels::F32),
             element => Err(ImageMetaError::ElementMismatch {
                 format: self.format,
                 element,
@@ -182,13 +180,6 @@ mod tests {
             px.iter().map(|p| p.get()).collect::<Vec<_>>(),
             [0x1234, 0x0fff]
         );
-
-        let layout = parse(PrimType::F32, &[1, 1], &image(ImageFormat::MonoF32, 32)).unwrap();
-        let bytes = 1.5f32.to_le_bytes();
-        let Ok(Pixels::F32(px)) = layout.pixels(&bytes) else {
-            panic!("mono_f32 is f32 pixels");
-        };
-        assert_eq!(px[0].get(), 1.5);
 
         let layout = parse(PrimType::U8, &[1, 2], &image(ImageFormat::Mono8, 8)).unwrap();
         assert!(matches!(layout.pixels(&[7, 9]), Ok(Pixels::U8([7, 9]))));

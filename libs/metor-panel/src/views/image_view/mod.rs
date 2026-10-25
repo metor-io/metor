@@ -18,9 +18,9 @@ mod stretch;
 mod strip;
 mod view;
 
-pub use histogram::{Histogram, finite_range};
+pub use histogram::Histogram;
 pub use layout::{FrameLayout, LayoutError, Pixels};
-pub use lut::{Colormap, Curve, Display, F32_BITS, Levels, Lut};
+pub use lut::{Colormap, Curve, Display, Levels, Lut};
 pub use overlay::{OverlayColor, OverlayConfig, SizeKind, record_roots};
 pub use readout::Readout;
 pub use render::{RenderKey, Scheduler};

@@ -211,7 +211,7 @@ pub use metor_proto::types::Timestamp;
 pub use metor_component::path;
 pub use metor_component::{
     AsVTable, Componentize, Decomponentize, Element, FrameArray, FrameBytes, FrameImage, FrameStr,
-    FrameStrError, Metadatatize, Mono8, Mono16, MonoF32, Pixel, Rgb8, Rgba8,
+    FrameStrError, Metadatatize, Mono8, Mono16, Pixel, Rgb8, Rgba8,
 };
 pub use metor_proto;
 pub use metor_proto_wkt;

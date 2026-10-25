@@ -1,6 +1,6 @@
 //! Metadata keys and types for image components.
 //!
-//! An image component is one tensor: element `U8`, `U16`, or `F32`; `dim`
+//! An image component is one tensor: element `U8` or `U16`; `dim`
 //! `[H, W]`, or `[H, W, C]` for color formats; row-major, no row padding,
 //! little-endian. Pixel (0, 0) is the first sample.
 
@@ -24,7 +24,6 @@ pub const IMAGE_STRETCH_KEY: &str = "image.stretch";
 pub enum ImageFormat {
     Mono8,
     Mono16,
-    MonoF32,
     Rgb8,
     Rgba8,
     BayerRggb8,
@@ -38,10 +37,9 @@ pub enum ImageFormat {
 }
 
 impl ImageFormat {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 12] = [
         Self::Mono8,
         Self::Mono16,
-        Self::MonoF32,
         Self::Rgb8,
         Self::Rgba8,
         Self::BayerRggb8,
@@ -58,7 +56,6 @@ impl ImageFormat {
         match self {
             Self::Mono8 => "mono8",
             Self::Mono16 => "mono16",
-            Self::MonoF32 => "mono_f32",
             Self::Rgb8 => "rgb8",
             Self::Rgba8 => "rgba8",
             Self::BayerRggb8 => "bayer_rggb8",
@@ -86,7 +83,6 @@ impl ImageFormat {
             | Self::BayerGrbg16
             | Self::BayerGbrg16
             | Self::BayerBggr16 => PrimType::U16,
-            Self::MonoF32 => PrimType::F32,
         }
     }
 
@@ -390,7 +386,6 @@ mod tests {
         for (format, bits) in [
             (ImageFormat::Mono8, 8),
             (ImageFormat::Mono16, 16),
-            (ImageFormat::MonoF32, 32),
         ] {
             let mut meta = ComponentMetadata::from("cam");
             meta.set(IMAGE_FORMAT_KEY, format.as_str());

@@ -699,7 +699,6 @@ impl ImageView {
     pub(super) fn strip_data(&self) -> Option<StripData> {
         let top_code = self
             .frame()
-            .filter(|f| f.layout.format.element() != metor_proto::types::PrimType::F32)
             .map(|f| f64::from((1u32 << f.layout.bits.min(16)) - 1));
         Some((self.histogram_data.clone()?, self.levels, top_code))
     }
@@ -1882,7 +1881,6 @@ mod tests {
             "Reset to metadata (R)",
             "Levels",
             "Stretch: min–max",
-            "Stretch: equalize",
         ] {
             assert!(labels.iter().any(|l| l == want), "{want} in {labels:?}");
         }
