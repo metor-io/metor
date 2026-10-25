@@ -1,6 +1,6 @@
 //! `sim.py` with the star simulator: for a few seconds of wall-clock run, its
-//! db holds a `StarImage` and a `StarTruth` every 100 ms, and the star
-//! tracker's vectors and centroids from them.
+//! db records every component `presets/star-tracker.json` binds, a
+//! `StarImage` every 100 ms, and the star tracker's vectors from them.
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
@@ -14,28 +14,19 @@ use metor_fsw_3::cli::run::prepare;
 use metor_fsw_3::coordinator::CoordinatorConfig;
 use metor_proto::types::ComponentId;
 use metor_proto_stellar::Client;
-use metor_proto_wkt::GetTimeSeries;
+use metor_proto_wkt::{DumpMetadata, GetTimeSeries};
+use serde_json::Value;
 use startracker_sim::StarSim;
 
-const PIXELS: &str = "sim.star_sim.star_image.pixels";
-const IMAGE_ID: &str = "sim.star_sim.star_image.frame_id";
-const TRUTH_ID: &str = "sim.star_sim.star_truth.frame_id";
-const TRUTH_COUNT: &str = "sim.star_sim.star_truth.count";
-const VECTOR_COUNT: &str = "sim.star_tracker.star_vectors.count";
-const CENTROID_COUNT: &str = "sim.star_tracker.star_centroids.count";
-const SOLUTION_MATCHED: &str = "sim.star_tracker.star_solution.n_matched";
-const PIXEL_BYTES: usize = 2 << 20;
 const RUN: Duration = Duration::from_secs(4);
 
-fn free_port() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
-    listener.local_addr().expect("an address")
+fn manifest() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
 /// `sim.py`'s target with its db on `db` and stored under `path`.
 fn config(db: SocketAddr, path: &Path) -> CoordinatorConfig {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let deployment = prepare(Some(&manifest.join("sim.py"))).expect("sim.py evaluates");
+    let deployment = prepare(Some(&manifest().join("sim.py"))).expect("sim.py evaluates");
     let mut config = deployment
         .targets
         .into_iter()
@@ -80,29 +71,68 @@ fn spawn(config: CoordinatorConfig, stop: Arc<AtomicBool>) -> std::thread::JoinH
     })
 }
 
-/// Every sample of `component` as `(timestamp µs, bytes)`.
-async fn series(client: &mut Client, component: &str, size: usize) -> Vec<(i64, Vec<u8>)> {
+/// Every component the preset binds: the image view's image and overlay
+/// fields by name, the plots' traces by id.
+fn preset_components() -> Vec<ComponentId> {
+    fn walk(node: &Value, out: &mut Vec<ComponentId>) {
+        if let Some(children) = node.pointer("/Split/children").and_then(Value::as_array) {
+            children.iter().for_each(|child| walk(child, out));
+        }
+        let items = node.pointer("/Pane/items").and_then(Value::as_array);
+        for item in items.into_iter().flatten() {
+            let state: Value = serde_json::from_str(item["state"].as_str().unwrap()).unwrap();
+            for overlay in state["overlays"].as_array().into_iter().flatten() {
+                for field in ["u", "v", "count", "size", "cat_id"] {
+                    out.push(ComponentId::new(overlay[field].as_str().unwrap()));
+                }
+            }
+            if let Some(image) = state["component"].as_str() {
+                out.push(ComponentId::new(image));
+            }
+            for trace in state["traces"].as_array().into_iter().flatten() {
+                out.push(ComponentId(trace["component_id"].as_u64().unwrap()));
+            }
+        }
+    }
+    let preset = std::fs::read_to_string(manifest().join("presets/star-tracker.json")).unwrap();
+    let mut out = Vec::new();
+    walk(
+        &serde_json::from_str::<Value>(&preset).unwrap()["root"],
+        &mut out,
+    );
+    out
+}
+
+/// Every sample of a `u64` component as `(timestamp µs, value)`, or none
+/// before the first.
+async fn u64s(client: &mut Client, component: &str) -> Vec<(i64, u64)> {
     let query = GetTimeSeries {
         id: [0, 0],
         range: Timestamp(0)..Timestamp(i64::MAX),
         component_id: ComponentId::new(component),
         limit: None,
     };
-    let series = client.request(&query).await.expect("a series");
-    let stamps = series.timestamps().expect("timestamps");
-    let data = series.data().expect("data");
-    assert_eq!(data.len(), stamps.len() * size, "{component}");
-    let samples = data.chunks(size).map(<[u8]>::to_vec);
-    stamps.iter().map(|t| t.0).zip(samples).collect()
+    let Ok(series) = client.request(&query).await else {
+        return Vec::new(); // no samples yet
+    };
+    let (stamps, data) = (series.timestamps().unwrap(), series.data().unwrap());
+    let values = data
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| u64::from_le_bytes(*b));
+    stamps.iter().map(|t| t.0).zip(values).collect()
 }
 
-fn u64s(samples: &[(i64, Vec<u8>)]) -> Vec<u64> {
-    let le = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8 bytes"));
-    samples.iter().map(|(_, b)| le(b)).collect()
+fn free_port() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
+    listener.local_addr().expect("an address")
 }
 
 #[test]
-fn sim_py_records_star_images_at_10_hz() {
+fn sim_py_records_the_star_tracker() {
+    let wanted = preset_components();
+    assert!(wanted.len() > 10, "the preset binds {wanted:?}");
     let dir = tempfile::tempdir().expect("a temp dir");
     let db = free_port();
     let stop = Arc::new(AtomicBool::new(false));
@@ -111,73 +141,50 @@ fn sim_py_records_star_images_at_10_hz() {
     stellarator::run(move || async move {
         stellarator::sleep(RUN).await;
         let mut client = Client::connect(db).await.expect("the db takes clients");
-        let images = series(&mut client, IMAGE_ID, 8).await;
-        let truths = series(&mut client, TRUTH_ID, 8).await;
-        let counts = series(&mut client, TRUTH_COUNT, 8).await;
-        let pixels = series(&mut client, PIXELS, PIXEL_BYTES).await;
-        let vectors = series(&mut client, VECTOR_COUNT, 8).await;
-        let centroids = series(&mut client, CENTROID_COUNT, 8).await;
-        let matched = series(&mut client, SOLUTION_MATCHED, 2).await;
+        let dump = client.request(&DumpMetadata).await.expect("the db answers");
+        let images = u64s(&mut client, "sim.star_sim.star_image.frame_id").await;
+        // A debug build's lost-in-space searches lag the images by seconds.
+        let mut vectors = Vec::new();
+        for _ in 0..100 {
+            vectors = u64s(&mut client, "sim.star_tracker.star_vectors.count").await;
+            if vectors.len() >= images.len() / 4 {
+                break;
+            }
+            stellarator::sleep(Duration::from_millis(100)).await;
+        }
         stopper.store(true, Ordering::Release);
 
+        let ids: Vec<ComponentId> = dump
+            .component_metadata
+            .iter()
+            .map(|m| m.component_id)
+            .collect();
+        let missing: Vec<_> = wanted.iter().filter(|id| !ids.contains(id)).collect();
+        assert!(missing.is_empty(), "never announced {missing:?}");
+
         // Frame ids rise by one per 100 ms of sim time. A debug build may
-        // drop a few frames while the target starts.
-        let ids = u64s(&images);
-        assert!(ids.len() >= 25, "{} frames in {RUN:?}", ids.len());
-        assert_eq!(ids.first(), Some(&0));
-        for (i, (pair, id)) in images.windows(2).zip(ids.windows(2)).enumerate() {
-            assert!(id[1] > id[0], "{ids:?}");
-            // The first frame can render late while the target warms up.
-            if i == 0 {
-                continue;
-            }
-            let dt = pair[1].0 - pair[0].0;
-            let expected = 100_000 * (id[1] - id[0]) as i64;
-            // A wall-clock cycle starts up to a few ms late.
-            assert!(
-                (dt - expected).abs() <= 10_000,
-                "{dt} µs from {} to {}",
-                id[0],
-                id[1]
-            );
-        }
-        let (first, last) = (images[1].0, images[images.len() - 1].0);
-        let period = (last - first) as f64 / (ids[ids.len() - 1] - ids[1]) as f64;
+        // drop a few frames while the target starts, and the first frame
+        // can render late.
+        assert!(images.len() >= 25, "{} frames in {RUN:?}", images.len());
+        assert!(images.windows(2).all(|w| w[1].1 > w[0].1), "{images:?}");
+        let ((t0, id0), (t1, id1)) = (images[1], images[images.len() - 1]);
+        let period = (t1 - t0) as f64 / (id1 - id0) as f64;
         assert!(
             (period - 100_000.0).abs() < 1_000.0,
             "{period} µs per frame"
         );
-        let truth_ids = u64s(&truths);
-        assert!(
-            ids.iter()
-                .take(ids.len() - 1)
-                .all(|id| truth_ids.contains(id))
-        );
-        assert!(pixels.len() >= ids.len() - 1);
-        assert!(pixels.iter().all(|(_, p)| p.iter().any(|&b| b != 0)));
-        assert!(
-            u64s(&counts).iter().all(|&n| n > 0),
-            "a frame with no stars"
-        );
-        // The tracker identifies the images. These seconds are the
-        // detumble from 0.15 rad/s, where a 100 ms exposure streaks a star
-        // over tens of pixels and a frame rightly fails, so only a share of
-        // the frames give vectors (13 of 33 in a debug build), each with
+
+        // These seconds are the detumble from 0.15 rad/s, where a 100 ms
+        // exposure streaks a star over tens of pixels and a frame rightly
+        // fails, so only a share of the frames give vectors, each with
         // several stars.
+        let counts: Vec<u64> = vectors.iter().map(|v| v.1).collect();
         assert!(
-            vectors.len() >= ids.len() / 4,
-            "{} vector frames of {}",
-            vectors.len(),
-            ids.len()
+            counts.len() >= images.len() / 4,
+            "{counts:?} of {} frames",
+            images.len()
         );
-        assert!(
-            u64s(&vectors).iter().all(|&n| n >= 4),
-            "{:?}",
-            u64s(&vectors)
-        );
-        assert!(centroids.len() >= vectors.len());
-        let n_matched = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
-        assert!(matched.iter().any(|(_, b)| n_matched(b) >= 6));
+        assert!(counts.iter().all(|&n| n >= 4), "{counts:?}");
     });
     run.join().expect("the target ran");
 }

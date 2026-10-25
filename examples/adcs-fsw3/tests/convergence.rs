@@ -19,8 +19,8 @@ use adcs_seqs::Commission;
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::cli::run::prepare;
 use metor_fsw_3::coordinator::{
-    BuildOptions, Clock, Coordinator, CoordinatorConfig, EndReason, InputConfig, PortRef,
-    SystemConfig, SystemTable,
+    Clock, Coordinator, CoordinatorConfig, EndReason, InputConfig, PortRef, SystemConfig,
+    SystemTable,
 };
 use metor_fsw_3::dl::{PackKind, PackRef, cdylib_name, triple};
 use metor_fsw_3::{DlPack, Input, Pack, system};
@@ -143,12 +143,23 @@ fn evaluate() -> CoordinatorConfig {
         .coordinator;
     config.clock = Clock::Simulated {
         dt: Duration::from_secs_f64(1.0 / 120.0),
-        // A fixed epoch (2026-09-21 UTC), as a deterministic build needs.
-        epoch: Some(metor_fsw_3::Timestamp(1_790_000_000_000_000)),
+        epoch: None,
     };
     config
         .systems
         .retain(|system| !["fsw.publish", "fsw.db"].contains(&system.ty.as_str()));
+    // The star chain has its own tests, `stars.rs` and `star_sim.rs`; this
+    // loop runs on the sun and magnetometer.
+    let stars = ["star_sim", "star_tracker"];
+    config
+        .systems
+        .retain(|system| !stars.contains(&system.id.as_str()));
+    for system in &mut config.systems {
+        let star_fed = |f: &PortRef| stars.contains(&f.system.as_str());
+        system
+            .inputs
+            .retain(|input| !input.from.iter().any(star_fed));
+    }
     config.systems.push(SystemConfig {
         inputs: vec![
             input("body", PortRef::new("plant", "body")),
@@ -221,17 +232,6 @@ fn staged_library() -> Arc<Pack> {
     Arc::new(Pack::Dl(pack))
 }
 
-/// Opens the `startracker_sim` cdylib `pack dev` staged beside the pack's crate.
-fn staged_star_sim() -> Arc<Pack> {
-    let path = manifest()
-        .join("systems/startracker-sim/.metor/startracker_sim_pack/_libs")
-        .join(triple())
-        .join(cdylib_name("startracker_sim_3"));
-    // SAFETY: as for `staged_library`.
-    let pack = unsafe { DlPack::open(&path) }.expect("the staged pack opens");
-    Arc::new(Pack::Dl(pack))
-}
-
 /// Opens the `seqs` module `pack dev` staged beside the pack's crate.
 fn staged_module() -> Arc<Pack> {
     let reference = PackRef {
@@ -249,7 +249,7 @@ fn staged_module() -> Arc<Pack> {
 fn linked(config: &CoordinatorConfig, shared: &Shared) -> Coordinator {
     let mut config = config.clone();
     for system in &mut config.systems {
-        let pack_ty = ["adcs.", "seqs.", "startracker_sim."]
+        let pack_ty = ["adcs.", "seqs."]
             .iter()
             .find_map(|prefix| system.ty.strip_prefix(prefix));
         if let Some(ty) = pack_ty {
@@ -258,13 +258,6 @@ fn linked(config: &CoordinatorConfig, shared: &Shared) -> Coordinator {
     }
     let mut table = adcs_systems::pack();
     table
-        .register_async(
-            "star_sim",
-            startracker_sim::system::star_sim(),
-            startracker_sim::StarSim::new,
-        )
-        .expect("valid records");
-    table
         .register_sequence(
             "commission",
             adcs_seqs::commission(),
@@ -272,16 +265,8 @@ fn linked(config: &CoordinatorConfig, shared: &Shared) -> Coordinator {
         )
         .expect("valid records");
     config
-        .build_with(&with_sinks(table, shared), deterministic())
+        .build(&with_sinks(table, shared))
         .expect("the static config builds")
-}
-
-/// Turns the star simulator's thread on the coordinator thread, so its
-/// images, and so the tracker's vectors and nav, are the same in every run.
-fn deterministic() -> BuildOptions {
-    BuildOptions {
-        deterministic: true,
-    }
 }
 
 /// Builds the loop with `packs` loaded, each under its id.
@@ -298,7 +283,7 @@ fn loaded(
     }
     config
         .clone()
-        .build_with(&table, deterministic())
+        .build(&table)
         .expect("the pack config builds")
 }
 
@@ -386,11 +371,7 @@ fn assert_same_torques(a: &Record, b: &Record) {
         b.torque.len(),
         "the runs commanded the same number of torques"
     );
-    let first = a.torque.iter().zip(&b.torque).position(|(x, y)| x != y);
-    assert!(
-        a.torque == b.torque,
-        "the two command streams differ at {first:?}"
-    );
+    assert!(a.torque == b.torque, "the two command streams differ");
 }
 
 #[test]
@@ -398,16 +379,12 @@ fn test_loop_converges_linked_and_loaded() {
     install_logging();
 
     let config = config();
-    let (adcs, star) = (staged_library(), staged_star_sim());
+    let adcs = staged_library();
     let (linked_run, loaded_run) = (Shared::default(), Shared::default());
     drive(
         vec![
             linked(config, &linked_run),
-            loaded(
-                config,
-                &loaded_run,
-                &[("adcs", &adcs), ("startracker_sim", &star)],
-            ),
+            loaded(config, &loaded_run, &[("adcs", &adcs)]),
         ],
         CYCLES,
     );
@@ -424,16 +401,12 @@ fn test_sequenced_loop_converges_linked_and_module() {
     install_logging();
 
     let config = sequenced(config());
-    let (adcs, seqs, star) = (staged_library(), staged_module(), staged_star_sim());
+    let (adcs, seqs) = (staged_library(), staged_module());
     let (linked_run, module_run) = (Shared::default(), Shared::default());
     let ended = drive(
         vec![
             linked(&config, &linked_run),
-            loaded(
-                &config,
-                &module_run,
-                &[("adcs", &adcs), ("seqs", &seqs), ("startracker_sim", &star)],
-            ),
+            loaded(&config, &module_run, &[("adcs", &adcs), ("seqs", &seqs)]),
         ],
         SEQUENCED_CYCLES,
     );
