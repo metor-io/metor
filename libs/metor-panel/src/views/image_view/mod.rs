@@ -20,7 +20,7 @@ mod view;
 pub use histogram::Histogram;
 pub use layout::{FrameLayout, LayoutError, Pixels};
 pub use lut::{Colormap, Curve, Display, Levels, Lut};
-pub use overlay::{OverlayColor, OverlayConfig, SizeKind, record_roots};
+pub use overlay::{OverlayColor, OverlayConfig, record_roots};
 pub use readout::Readout;
 pub use render::{RenderKey, Scheduler};
 pub use resample::{Plane, Rect, RenderError, Scratch, Viewport, render_into, spans};

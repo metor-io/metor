@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::histogram::Histogram;
 use super::layout::FrameLayout;
 use super::lut::{Display, Levels, Lut};
-use super::overlay::{self, Overlay, OverlayColor, OverlayConfig, Points};
+use super::overlay::{self, Overlay, OverlayColor, OverlayConfig, Star};
 use super::readout::{Readout, raw_value};
 use super::render::{self, Frames, Job, LutKey, RenderKey, Rendered, Scheduler};
 use super::resample::{MAX_STEP, MIN_STEP, Rect, RenderError, Scratch, Viewport};
@@ -399,7 +399,7 @@ impl ImageView {
 
     /// The pixel under the cursor: the source pixel painted at the cursor's
     /// device pixel.
-    pub fn readout(&self, cx: &gpui::App) -> Option<Readout> {
+    pub fn readout(&self) -> Option<Readout> {
         let frame = self.frame()?;
         let (dx, dy) = self.device(self.hover?);
         if dx < 0.0 || dy < 0.0 {
@@ -417,7 +417,6 @@ impl ImageView {
             y,
             value: raw_value(frame, x, y)?,
             pooled: viewport.pooled(device),
-            stars: self.stars_under(self.hover?, cx),
         })
     }
 
@@ -516,38 +515,11 @@ impl ImageView {
         }
     }
 
-    /// The overlay points under the cursor, described for the readout.
-    fn stars_under(&self, cursor: Point<Pixels>, cx: &gpui::App) -> Vec<(OverlayColor, String)> {
-        let Some((viewport, _)) = self.current_viewport() else {
-            return Vec::new();
-        };
-        let to_window = |u, v| self.window_point(&viewport, (u, v));
+    /// Each overlay with points.
+    pub fn overlay_points(&self, cx: &gpui::App) -> Vec<(OverlayConfig, Vec<Star>)> {
         self.overlays
             .iter()
-            .filter_map(|overlay| {
-                let points = overlay.points(cx).ok()??;
-                let kind = overlay.config.size_kind;
-                let (cat_id, _) = overlay::under(&points, kind, cursor, to_window)?;
-                let detail = match cat_id {
-                    Some(id) => format!("cat {id}"),
-                    None => "uncatalogued".to_string(),
-                };
-                Some((overlay.config.color, detail))
-            })
-            .collect()
-    }
-
-    /// Each overlay with points, and whether they are out of step: from
-    /// another time than the frame, or with fields from different times.
-    pub fn overlay_points(&self, cx: &gpui::App) -> Vec<(OverlayConfig, Points, bool)> {
-        let frame_time = self.frame().map(|f| f.timestamp);
-        self.overlays
-            .iter()
-            .filter_map(|overlay| {
-                let points = overlay.points(cx).ok()??;
-                let out_of_step = !points.consistent || Some(points.timestamp) != frame_time;
-                Some((overlay.config.clone(), points, out_of_step))
-            })
+            .filter_map(|overlay| Some((overlay.config.clone(), overlay.points(cx).ok()??)))
             .collect()
     }
 
@@ -567,16 +539,9 @@ impl ImageView {
         let theme = theme(cx);
         let viewport = self.viewport(&frame.layout);
         let to_window = |u: f64, v: f64| self.window_point(&viewport, (u, v));
-        for (config, points, out_of_step) in self.overlay_points(cx) {
+        for (config, stars) in self.overlay_points(cx) {
             let color = Self::overlay_color(config.color, &theme);
-            overlay::paint(
-                &points,
-                config.size_kind,
-                color,
-                out_of_step,
-                to_window,
-                window,
-            );
+            overlay::paint(&stars, color, to_window, window);
         }
     }
 
@@ -753,8 +718,7 @@ const READOUT_OFFSET: f32 = 14.0;
 
 /// The hover readout: the plots' readout card, placed beside the pointer
 /// and flipped clear of the image's edges. The header names the pixel; the
-/// rows are its value and the overlay points under the cursor with their
-/// overlay's swatch.
+/// row is its value.
 fn readout_card(
     readout: Readout,
     pointer: Point<Pixels>,
@@ -767,45 +731,28 @@ fn readout_card(
         Some((w, h)) => format!("x {}  y {}  (1 of {w}×{h})", readout.x, readout.y),
         None => format!("x {}  y {}", readout.x, readout.y),
     };
-    let mut rows: Vec<(Option<gpui::Hsla>, SharedString, String, gpui::Hsla)> =
-        vec![(None, "value".into(), readout.value, theme.text_primary)];
-    rows.extend(readout.stars.into_iter().map(|(role, detail)| {
-        let color = ImageView::overlay_color(role, &theme);
-        let label = match role {
-            OverlayColor::Detected => "detected",
-            OverlayColor::Truth => "truth",
-        };
-        (Some(color), label.into(), detail, color)
-    }));
-
-    let lens: Vec<(usize, usize)> = rows
-        .iter()
-        .map(|(_, label, value, _)| (label.chars().count(), value.chars().count()))
-        .collect();
+    let lens = [("value".len(), readout.value.chars().count())];
     let box_size = estimate_readout_size(header.chars().count(), &lens).map(|l| l * scale);
     let origin = readout_origin(pointer, box_size, bounds, px(READOUT_OFFSET * scale));
-
-    let mut card = popover::readout_card(cx).child(div().child(SharedString::from(header)));
-    for (swatch, label, value, value_color) in rows {
-        let mut row = div().flex().flex_row().items_center().gap_1();
-        if let Some(color) = swatch {
-            row = row.child(div().w(ui_px(8.0)).h(ui_px(8.0)).rounded(px(2.0)).bg(color));
-        }
-        card = card.child(
-            row.child(
-                div()
-                    .flex_1()
-                    .pr(ui_px(8.0))
-                    .text_color(theme.text_secondary)
-                    .child(label),
-            )
-            .child(
-                div()
-                    .text_color(value_color)
-                    .child(SharedString::from(value)),
-            ),
+    let row = div()
+        .flex()
+        .flex_row()
+        .gap_1()
+        .child(
+            div()
+                .flex_1()
+                .pr(ui_px(8.0))
+                .text_color(theme.text_secondary)
+                .child("value"),
+        )
+        .child(
+            div()
+                .text_color(theme.text_primary)
+                .child(SharedString::from(readout.value)),
         );
-    }
+    let card = popover::readout_card(cx)
+        .child(div().child(SharedString::from(header)))
+        .child(row);
     div()
         .absolute()
         .left(origin.x - bounds.origin.x)
@@ -906,7 +853,7 @@ impl Render for ImageView {
                 }
             }))
             .child(image);
-        if let (Some(readout), Some(pointer)) = (self.readout(cx), self.hover) {
+        if let (Some(readout), Some(pointer)) = (self.readout(), self.hover) {
             area = area.child(readout_card(
                 readout,
                 pointer,
@@ -1343,7 +1290,7 @@ mod tests {
                 view.update(cx, |view, _| {
                     view.hover = Some(over(view, x as f64, y as f64))
                 });
-                view.read(cx).readout(cx)
+                view.read(cx).readout()
             });
             let readout = readout.expect("a readout");
             assert_eq!((readout.x, readout.y), (x, y));
@@ -1352,7 +1299,7 @@ mod tests {
         vcx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.hover = Some(point(px(-1000.0), px(-1000.0)));
-                assert_eq!(view.readout(cx), None);
+                assert_eq!(view.readout(), None);
                 view.one_to_one(cx);
                 assert!(matches!(view.view, ViewMode::Free { step, .. } if step == 1.0));
                 view.reset_to_metadata(cx);
@@ -1430,7 +1377,7 @@ mod tests {
                 });
                 let view = view.read(cx);
                 (
-                    view.readout(cx).expect("a readout"),
+                    view.readout().expect("a readout"),
                     painted_value(view, view.hover.unwrap()),
                 )
             });
@@ -1449,7 +1396,7 @@ mod tests {
                     .viewport(&view.frame().unwrap().layout)
                     .to_device((5.0, 5.0));
                 view.hover = Some(at_device(view, device));
-                view.readout(cx)
+                view.readout()
             })
         });
         assert_eq!(readout.expect("a readout").pooled, Some((4, 4)));
@@ -1683,21 +1630,17 @@ mod tests {
         });
         let cfg = ImageViewConfig {
             component: ID.into(),
-            overlays: vec![OverlayConfig {
-                size: None,
-                cat_id: None,
-                ..OverlayConfig::from_root("cam.truth", OverlayColor::Truth)
-            }],
+            overlays: vec![OverlayConfig::from_root("cam.truth", OverlayColor::Truth)],
             ..Default::default()
         };
         let (_host, view, vcx) = host(move |cx| ImageView::from_config(&cfg, db, cx), cx);
         (temp, view, vcx)
     }
 
-    fn first_point(view: &Entity<ImageView>, cx: &mut VisualTestContext) -> Option<(f32, bool)> {
+    fn first_point(view: &Entity<ImageView>, cx: &mut VisualTestContext) -> Option<f32> {
         cx.update(|_, cx| {
             let points = view.read(cx).overlay_points(cx);
-            points.first().map(|(_, p, stale)| (p.stars[0].u, *stale))
+            points.first().map(|(_, stars)| stars[0].u)
         })
     }
 
@@ -1705,18 +1648,9 @@ mod tests {
     fn the_overlay_follows_a_seek(cx: &mut gpui::TestAppContext) {
         let (_temp, view, vcx) = truth_view(&[(10, 1.5), (20, 2.5)], cx);
         seek_to(10, vcx);
-        assert_eq!(first_point(&view, vcx), Some((1.5, false)));
+        assert_eq!(first_point(&view, vcx), Some(1.5));
         seek_to(20, vcx);
-        assert_eq!(first_point(&view, vcx), Some((2.5, false)));
-    }
-
-    #[gpui::test]
-    fn an_out_of_step_overlay_is_flagged(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = truth_view(&[(5, 1.5), (20, 2.5)], cx);
-        seek_to(10, vcx);
-        assert_eq!(first_point(&view, vcx), Some((1.5, true)));
-        seek_to(20, vcx);
-        assert_eq!(first_point(&view, vcx), Some((2.5, false)));
+        assert_eq!(first_point(&view, vcx), Some(2.5));
     }
 
     /// A 16×16 ramp (`x + 16y`) at t = 1 with manual levels 0..255, so a
@@ -1759,11 +1693,7 @@ mod tests {
         let (_host, view, vcx) = host(
             move |cx| {
                 let mut view = ImageView::with_source(Box::new(source), display, db, cx);
-                let truth = OverlayConfig {
-                    size: None,
-                    cat_id: None,
-                    ..OverlayConfig::from_root("cam.truth", OverlayColor::Truth)
-                };
+                let truth = OverlayConfig::from_root("cam.truth", OverlayColor::Truth);
                 view.add_overlay(truth, cx);
                 view
             },
@@ -1789,12 +1719,12 @@ mod tests {
                 view.hover = Some(view.window_point(&viewport, (10.5, 10.5)));
             });
             let view = view.read(cx);
-            let (_, points, _) = view.overlay_points(cx).into_iter().next().expect("points");
+            let (_, stars) = view.overlay_points(cx).into_iter().next().expect("points");
             let (viewport, _) = view.current_viewport().unwrap();
-            let star = points.stars[0];
+            let star = stars[0];
             let at = view.window_point(&viewport, (f64::from(star.u), f64::from(star.v)));
             let (image, out) = view.frames.current.clone().expect("an image");
-            (view.readout(cx), view.device(at), out, image)
+            (view.readout(), view.device(at), out, image)
         });
         let readout = readout.expect("a readout");
         assert_eq!((readout.x, readout.y), (10, 10));
@@ -1812,25 +1742,6 @@ mod tests {
             "star {} middle {middle}",
             star.0
         );
-    }
-
-    #[gpui::test]
-    fn an_overlay_with_fields_from_different_times_is_out_of_step(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = truth_view(&[(10, 1.5)], cx);
-        seek_to(10, vcx);
-        assert_eq!(first_point(&view, vcx), Some((1.5, false)));
-        // A newer `u` alone: the record is torn until `v` and `count` follow.
-        let db = vcx.update(|_, cx| view.read(cx).db.clone());
-        let u = db
-            .with_state(|s| s.get_component(ComponentId::new("cam.truth.u")).cloned())
-            .unwrap();
-        let bytes: Vec<u8> = (0..32)
-            .flat_map(|i| if i == 0 { 3.5f32 } else { 0.0 }.to_le_bytes())
-            .collect();
-        let mut writer = u.time_series.writer().unwrap();
-        writer.push_buf(Timestamp(12), &bytes).unwrap();
-        seek_to(12, vcx);
-        assert_eq!(first_point(&view, vcx), Some((3.5, true)));
     }
 
     #[test]
