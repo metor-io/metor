@@ -399,7 +399,7 @@ impl ImageView {
 
     /// The pixel under the cursor: the source pixel painted at the cursor's
     /// device pixel.
-    pub fn readout(&self) -> Option<Readout> {
+    pub fn readout(&self, cx: &gpui::App) -> Option<Readout> {
         let frame = self.frame()?;
         let (dx, dy) = self.device(self.hover?);
         if dx < 0.0 || dy < 0.0 {
@@ -417,6 +417,7 @@ impl ImageView {
             y,
             value: raw_value(frame, x, y)?,
             pooled: viewport.pooled(device),
+            stars: self.stars_under(self.hover?, cx),
         })
     }
 
@@ -513,6 +514,24 @@ impl ImageView {
             OverlayColor::Detected => theme.image_overlay_detected(),
             OverlayColor::Truth => theme.image_overlay_truth(),
         }
+    }
+
+    /// The overlay points under the cursor, described for the readout.
+    fn stars_under(&self, cursor: Point<Pixels>, cx: &gpui::App) -> Vec<(OverlayColor, String)> {
+        let Some((viewport, _)) = self.current_viewport() else {
+            return Vec::new();
+        };
+        let to_window = |u, v| self.window_point(&viewport, (u, v));
+        self.overlay_points(cx)
+            .into_iter()
+            .filter_map(|(config, stars)| {
+                let detail = match overlay::under(&stars, cursor, to_window)? {
+                    Some(id) => format!("cat {id}"),
+                    None => "uncatalogued".to_string(),
+                };
+                Some((config.color, detail))
+            })
+            .collect()
     }
 
     /// Each overlay with points.
@@ -718,7 +737,8 @@ const READOUT_OFFSET: f32 = 14.0;
 
 /// The hover readout: the plots' readout card, placed beside the pointer
 /// and flipped clear of the image's edges. The header names the pixel; the
-/// row is its value.
+/// rows are its value and the overlay points under the cursor with their
+/// overlay's swatch.
 fn readout_card(
     readout: Readout,
     pointer: Point<Pixels>,
@@ -731,28 +751,43 @@ fn readout_card(
         Some((w, h)) => format!("x {}  y {}  (1 of {w}×{h})", readout.x, readout.y),
         None => format!("x {}  y {}", readout.x, readout.y),
     };
-    let lens = [("value".len(), readout.value.chars().count())];
+    let mut rows: Vec<(Option<gpui::Hsla>, &str, String, gpui::Hsla)> =
+        vec![(None, "value", readout.value, theme.text_primary)];
+    rows.extend(readout.stars.into_iter().map(|(role, detail)| {
+        let color = ImageView::overlay_color(role, &theme);
+        let label = match role {
+            OverlayColor::Detected => "detected",
+            OverlayColor::Truth => "truth",
+        };
+        (Some(color), label, detail, color)
+    }));
+    let lens: Vec<(usize, usize)> = rows
+        .iter()
+        .map(|(_, label, value, _)| (label.len(), value.chars().count()))
+        .collect();
     let box_size = estimate_readout_size(header.chars().count(), &lens).map(|l| l * scale);
     let origin = readout_origin(pointer, box_size, bounds, px(READOUT_OFFSET * scale));
-    let row = div()
-        .flex()
-        .flex_row()
-        .gap_1()
-        .child(
-            div()
-                .flex_1()
-                .pr(ui_px(8.0))
-                .text_color(theme.text_secondary)
-                .child("value"),
-        )
-        .child(
-            div()
-                .text_color(theme.text_primary)
-                .child(SharedString::from(readout.value)),
+    let mut card = popover::readout_card(cx).child(div().child(SharedString::from(header)));
+    for (swatch, label, value, value_color) in rows {
+        let mut row = div().flex().flex_row().items_center().gap_1();
+        if let Some(color) = swatch {
+            row = row.child(div().w(ui_px(8.0)).h(ui_px(8.0)).rounded(px(2.0)).bg(color));
+        }
+        card = card.child(
+            row.child(
+                div()
+                    .flex_1()
+                    .pr(ui_px(8.0))
+                    .text_color(theme.text_secondary)
+                    .child(SharedString::from(label)),
+            )
+            .child(
+                div()
+                    .text_color(value_color)
+                    .child(SharedString::from(value)),
+            ),
         );
-    let card = popover::readout_card(cx)
-        .child(div().child(SharedString::from(header)))
-        .child(row);
+    }
     div()
         .absolute()
         .left(origin.x - bounds.origin.x)
@@ -853,7 +888,7 @@ impl Render for ImageView {
                 }
             }))
             .child(image);
-        if let (Some(readout), Some(pointer)) = (self.readout(), self.hover) {
+        if let (Some(readout), Some(pointer)) = (self.readout(cx), self.hover) {
             area = area.child(readout_card(
                 readout,
                 pointer,
@@ -1125,7 +1160,7 @@ mod tests {
                 let (dx, dy) = view.device(view.hover.unwrap());
                 let (x, y) = (dx.floor() as usize - out.x, dy.floor() as usize - out.y);
                 let gray = image.as_bytes(0).unwrap()[(y * out.width + x) * 4 + 2];
-                (view.readout().expect("a readout"), gray)
+                (view.readout(cx).expect("a readout"), gray)
             });
             let value: f64 = readout.value.parse().unwrap();
             assert_eq!((value * 255.0 / 63.0).round() as u8, gray, "device {i}");
@@ -1139,7 +1174,7 @@ mod tests {
                     .viewport(&view.frame().unwrap().layout)
                     .to_device((5.0, 5.0));
                 view.hover = Some(at_device(view, device));
-                view.readout()
+                view.readout(cx)
             })
         });
         assert_eq!(readout.expect("a readout").pooled, Some((4, 4)));
@@ -1201,22 +1236,31 @@ mod tests {
         assert!(close(x, -46.0) && close(y, -19.0) && close(w, 200.0) && close(h, 100.0));
     }
 
-    /// A `[32]` centroid record at `cam.truth` with one star at `(u, u)`,
-    /// at t = 1.
+    /// A `[32]` centroid record at `cam.truth` with one star, catalogue
+    /// number 7, at `(u, u)`, at t = 1.
     fn install_truth(db: &DB, u: f32) {
         use metor_db::ComponentSchema;
         use metor_proto::types::PrimType;
+        let row = |first: [u8; 4], rest: [u8; 4]| -> Vec<u8> {
+            (0..32)
+                .flat_map(|i| if i == 0 { first } else { rest })
+                .collect()
+        };
+        let array = |prim| ComponentSchema::new(prim, &[32usize][..]);
         for (field, schema, bytes) in [
-            ("u", ComponentSchema::new(PrimType::F32, &[32usize][..]), u),
-            ("v", ComponentSchema::new(PrimType::F32, &[32usize][..]), u),
-            ("count", ComponentSchema::new(PrimType::U64, &[][..]), 0.0),
+            ("u", array(PrimType::F32), row(u.to_le_bytes(), [0; 4])),
+            ("v", array(PrimType::F32), row(u.to_le_bytes(), [0; 4])),
+            (
+                "count",
+                ComponentSchema::new(PrimType::U64, &[][..]),
+                1u64.to_le_bytes().to_vec(),
+            ),
+            (
+                "cat_id",
+                array(PrimType::U32),
+                row(7u32.to_le_bytes(), overlay::NO_CATALOGUE_ID.to_le_bytes()),
+            ),
         ] {
-            let bytes: Vec<u8> = match field {
-                "count" => 1u64.to_le_bytes().to_vec(),
-                _ => (0..32)
-                    .flat_map(|i| if i == 0 { bytes } else { 0.0 }.to_le_bytes())
-                    .collect(),
-            };
             let name = format!("cam.truth.{field}");
             let id = ComponentId::new(&name);
             db.with_state_mut(|s| {
@@ -1239,9 +1283,12 @@ mod tests {
         }
     }
 
-    #[gpui::test]
-    fn an_overlay_point_sits_on_its_painted_pixel(cx: &mut gpui::TestAppContext) {
-        // Manual levels 0..255, so a painted gray is the raw value.
+    /// The 16² ramp at manual levels 0..255, so a painted gray is the raw
+    /// value, with the `cam.truth` overlay's star at `(10.5, 10.5)`, ten
+    /// device pixels per source pixel.
+    fn truth_over_ramp(
+        cx: &mut gpui::TestAppContext,
+    ) -> (tempfile::TempDir, Entity<ImageView>, &mut VisualTestContext) {
         let display = Display {
             levels: Levels::Manual {
                 black: 0.0,
@@ -1249,7 +1296,7 @@ mod tests {
             },
             ..Display::default()
         };
-        let (_temp, view, vcx) = static_view(ramp(16), display, cx);
+        let (temp, view, vcx) = static_view(ramp(16), display, cx);
         vcx.update(|_, cx| {
             let db = view.read(cx).db.clone();
             install_truth(&db, 10.5);
@@ -1264,6 +1311,37 @@ mod tests {
             })
         });
         draw(vcx);
+        (temp, view, vcx)
+    }
+
+    #[gpui::test]
+    fn the_readout_names_the_stars_under_the_pointer(cx: &mut gpui::TestAppContext) {
+        let (_temp, view, vcx) = truth_over_ramp(cx);
+        let stars_at = |source: (f64, f64), vcx: &mut VisualTestContext| {
+            vcx.update(|_, cx| {
+                view.update(cx, |view, _| {
+                    let (viewport, _) = view.current_viewport().unwrap();
+                    view.hover = Some(view.window_point(&viewport, source));
+                });
+                view.read(cx).readout(cx).expect("a readout").stars
+            })
+        };
+        // On the marker and inside its ring (0.5 source px, at most 5 logical px).
+        assert_eq!(
+            stars_at((10.5, 10.5), vcx),
+            [(OverlayColor::Truth, "cat 7".to_string())]
+        );
+        assert_eq!(
+            stars_at((11.0, 10.5), vcx),
+            [(OverlayColor::Truth, "cat 7".to_string())]
+        );
+        // Off it.
+        assert_eq!(stars_at((12.5, 10.5), vcx), []);
+    }
+
+    #[gpui::test]
+    fn an_overlay_point_sits_on_its_painted_pixel(cx: &mut gpui::TestAppContext) {
+        let (_temp, view, vcx) = truth_over_ramp(cx);
         let (readout, star, out, image) = vcx.update(|_, cx| {
             view.update(cx, |view, _| {
                 let (viewport, _) = view.current_viewport().unwrap();
@@ -1274,7 +1352,7 @@ mod tests {
             let (viewport, _) = view.current_viewport().unwrap();
             let at = view.window_point(&viewport, (f64::from(stars[0].u), f64::from(stars[0].v)));
             let (image, out) = view.frames.current.clone().expect("an image");
-            (view.readout(), view.device(at), out, image)
+            (view.readout(cx), view.device(at), out, image)
         });
         assert_eq!(readout.expect("a readout").value, "170");
         // The star's device x is the middle of the painted run of pixel 170.

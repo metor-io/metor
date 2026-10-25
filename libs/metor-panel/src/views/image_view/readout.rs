@@ -1,6 +1,8 @@
-//! The hover readout: one pixel's raw value.
+//! The hover readout: one pixel's raw value and the overlay points under
+//! the cursor.
 
 use super::layout::Pixels;
+use super::overlay::OverlayColor;
 use super::source::Frame;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -12,6 +14,9 @@ pub struct Readout {
     /// When zoomed out, the size of the block the device pixel pools; the
     /// value is the block's middle pixel.
     pub pooled: Option<(usize, usize)>,
+    /// Overlay points under the cursor: the overlay's colour role and the
+    /// point described (`cat 12`, `uncatalogued`).
+    pub stars: Vec<(OverlayColor, String)>,
 }
 
 /// The raw value of pixel `(x, y)`, read from the frame bytes, with the

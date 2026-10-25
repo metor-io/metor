@@ -1,5 +1,6 @@
 //! Point overlays: star centroids drawn over the image, one shaped
-//! component per field (`u`, `v`, `count`), each read at the view time.
+//! component per field (`u`, `v`, `count`, and optionally `cat_id`), each
+//! read at the view time.
 
 use std::sync::Arc;
 
@@ -10,6 +11,12 @@ use serde::{Deserialize, Serialize};
 
 use super::view::ImageView;
 use crate::temporal::samples::{SelectedReader, acquire};
+
+/// `cat_id` of a point with no catalogue match.
+pub const NO_CATALOGUE_ID: u32 = u32::MAX;
+
+/// Marker radius in logical pixels.
+const RADIUS: f32 = 4.0;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +35,7 @@ pub struct OverlayConfig {
     pub u: String,
     pub v: String,
     pub count: String,
+    pub cat_id: Option<String>,
     pub color: OverlayColor,
 }
 
@@ -38,6 +46,7 @@ impl OverlayConfig {
             u: format!("{root}.u"),
             v: format!("{root}.v"),
             count: format!("{root}.count"),
+            cat_id: Some(format!("{root}.cat_id")),
             color,
         }
     }
@@ -48,6 +57,7 @@ impl OverlayConfig {
 pub struct Star {
     pub u: f32,
     pub v: f32,
+    pub cat_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +84,15 @@ fn f32s(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn u32s(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
+        .collect()
+}
+
 /// A `u64` or `u32` count.
 fn count(bytes: &[u8]) -> Result<u64, OverlayError> {
     match bytes.len() {
@@ -87,7 +106,12 @@ fn count(bytes: &[u8]) -> Result<u64, OverlayError> {
 
 /// The first `count` rows of a centroid record; rows with a non-finite
 /// position are skipped.
-pub fn decode(u: &[u8], v: &[u8], count_bytes: &[u8]) -> Result<Vec<Star>, OverlayError> {
+pub fn decode(
+    u: &[u8],
+    v: &[u8],
+    count_bytes: &[u8],
+    cat_id: Option<&[u8]>,
+) -> Result<Vec<Star>, OverlayError> {
     let (u, v) = (f32s(u), f32s(v));
     if u.len() != v.len() {
         return Err(OverlayError::LengthMismatch {
@@ -98,9 +122,14 @@ pub fn decode(u: &[u8], v: &[u8], count_bytes: &[u8]) -> Result<Vec<Star>, Overl
     let rows = usize::try_from(count(count_bytes)?)
         .unwrap_or(usize::MAX)
         .min(u.len());
+    let cat_id = cat_id.map(u32s).unwrap_or_default();
     Ok((0..rows)
         .filter(|&i| u[i].is_finite() && v[i].is_finite())
-        .map(|i| Star { u: u[i], v: v[i] })
+        .map(|i| Star {
+            u: u[i],
+            v: v[i],
+            cat_id: cat_id.get(i).copied().filter(|&id| id != NO_CATALOGUE_ID),
+        })
         .collect())
 }
 
@@ -110,6 +139,7 @@ pub struct Overlay {
     u: Entity<SelectedReader>,
     v: Entity<SelectedReader>,
     count: Entity<SelectedReader>,
+    cat_id: Option<Entity<SelectedReader>>,
 }
 
 impl Overlay {
@@ -119,6 +149,7 @@ impl Overlay {
             u: reader(&config.u),
             v: reader(&config.v),
             count: reader(&config.count),
+            cat_id: config.cat_id.as_deref().map(&mut reader),
             config,
         }
     }
@@ -131,13 +162,21 @@ impl Overlay {
         else {
             return Ok(None);
         };
-        decode(&u.bytes, &v.bytes, &count.bytes).map(Some)
+        let cat_id = self.cat_id.as_ref().and_then(sample);
+        decode(
+            &u.bytes,
+            &v.bytes,
+            &count.bytes,
+            cat_id.as_ref().map(|s| &*s.bytes),
+        )
+        .map(Some)
     }
 
     /// Repaints the view when any field changes.
     pub fn observe(&self, cx: &mut Context<ImageView>) -> Vec<Subscription> {
         [&self.u, &self.v, &self.count]
             .into_iter()
+            .chain(self.cat_id.as_ref())
             .map(|reader| cx.observe(reader, |_, _, cx| cx.notify()))
             .collect()
     }
@@ -171,7 +210,6 @@ pub fn paint(
     window: &mut gpui::Window,
 ) {
     const SEGMENTS: usize = 24;
-    const RADIUS: f32 = 4.0;
     for star in stars {
         let center = to_window(f64::from(star.u), f64::from(star.v));
         let at = |k: usize| {
@@ -192,6 +230,24 @@ pub fn paint(
     }
 }
 
+/// The point drawn under `cursor`, nearest first: its `cat_id`.
+pub fn under(
+    stars: &[Star],
+    cursor: gpui::Point<gpui::Pixels>,
+    to_window: impl Fn(f64, f64) -> gpui::Point<gpui::Pixels>,
+) -> Option<Option<u32>> {
+    stars
+        .iter()
+        .map(|star| {
+            let at = to_window(f64::from(star.u), f64::from(star.v));
+            let (dx, dy) = (f32::from(at.x - cursor.x), f32::from(at.y - cursor.y));
+            (star, dx.hypot(dy))
+        })
+        .filter(|(_, d)| *d <= RADIUS + 2.0)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(star, _)| star.cat_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,18 +260,40 @@ mod tests {
     fn only_the_first_count_rows_decode() {
         let u = bytes_f32(&[1.5, 2.5, 3.5, 0.0]);
         let v = bytes_f32(&[4.5, 5.5, 6.5, 0.0]);
-        let stars = decode(&u, &v, &2u64.to_le_bytes()).unwrap();
-        assert_eq!(stars, [Star { u: 1.5, v: 4.5 }, Star { u: 2.5, v: 5.5 }]);
+        let cat: Vec<u8> = [7, NO_CATALOGUE_ID, 9, NO_CATALOGUE_ID]
+            .iter()
+            .flat_map(|v: &u32| v.to_le_bytes())
+            .collect();
+        let stars = decode(&u, &v, &2u64.to_le_bytes(), Some(&cat)).unwrap();
+        assert_eq!(
+            stars,
+            [
+                Star {
+                    u: 1.5,
+                    v: 4.5,
+                    cat_id: Some(7)
+                },
+                Star {
+                    u: 2.5,
+                    v: 5.5,
+                    cat_id: None
+                },
+            ]
+        );
     }
 
     #[test]
     fn a_count_past_the_rows_clamps() {
         let u = bytes_f32(&[1.0; 32]);
-        let stars = decode(&u, &u, &1000u64.to_le_bytes()).unwrap();
+        let stars = decode(&u, &u, &1000u64.to_le_bytes(), None).unwrap();
         assert_eq!(stars.len(), 32);
-        let stars = decode(&u, &u, &u64::MAX.to_le_bytes()).unwrap();
+        let stars = decode(&u, &u, &u64::MAX.to_le_bytes(), None).unwrap();
         assert_eq!(stars.len(), 32);
-        assert!(decode(&u, &u, &0u32.to_le_bytes()).unwrap().is_empty());
+        assert!(
+            decode(&u, &u, &0u32.to_le_bytes(), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -223,13 +301,19 @@ mod tests {
         let u = bytes_f32(&[1.0; 32]);
         let v = bytes_f32(&[1.0; 31]);
         assert_eq!(
-            decode(&u, &v, &1u64.to_le_bytes()),
+            decode(&u, &v, &1u64.to_le_bytes(), None),
             Err(OverlayError::LengthMismatch { u: 32, v: 31 })
         );
-        assert_eq!(decode(&u, &u, &[1, 2, 3]), Err(OverlayError::BadCount(3)));
+        assert_eq!(
+            decode(&u, &u, &[1, 2, 3], None),
+            Err(OverlayError::BadCount(3))
+        );
         // Non-finite positions are skipped.
         let nan = bytes_f32(&[f32::NAN, 2.0]);
         let ok = bytes_f32(&[1.0, 2.0]);
-        assert_eq!(decode(&nan, &ok, &2u64.to_le_bytes()).unwrap().len(), 1);
+        assert_eq!(
+            decode(&nan, &ok, &2u64.to_le_bytes(), None).unwrap().len(),
+            1
+        );
     }
 }

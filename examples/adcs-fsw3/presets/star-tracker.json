@@ -18,7 +18,7 @@
             "items": [
               {
                 "kind": "image_view",
-                "state": "{\"component\":\"sim.star_sim.star_image.pixels\",\"display\":null,\"view\":\"fit\",\"overlays\":[{\"u\":\"sim.star_sim.star_truth.u\",\"v\":\"sim.star_sim.star_truth.v\",\"count\":\"sim.star_sim.star_truth.count\",\"color\":\"truth\"},{\"u\":\"sim.star_tracker.star_centroids.u\",\"v\":\"sim.star_tracker.star_centroids.v\",\"count\":\"sim.star_tracker.star_centroids.count\",\"color\":\"detected\"}]}"
+                "state": "{\"component\":\"sim.star_sim.star_image.pixels\",\"display\":null,\"view\":\"fit\",\"overlays\":[{\"u\":\"sim.star_sim.star_truth.u\",\"v\":\"sim.star_sim.star_truth.v\",\"count\":\"sim.star_sim.star_truth.count\",\"cat_id\":\"sim.star_sim.star_truth.cat_id\",\"color\":\"truth\"},{\"u\":\"sim.star_tracker.star_centroids.u\",\"v\":\"sim.star_tracker.star_centroids.v\",\"count\":\"sim.star_tracker.star_centroids.count\",\"cat_id\":\"sim.star_tracker.star_centroids.cat_id\",\"color\":\"detected\"}]}"
               }
             ]
           }
