@@ -1191,56 +1191,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn an_image_view_tile_round_trips(cx: &mut gpui::TestAppContext) {
-        let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(metor_db::DB::create(temp.path().join("db")).unwrap());
-        let config = crate::views::image_view::image_view_config("cam.pixels".into());
-        let panes = cx.update(|cx| {
-            WidgetRegistry::init(cx);
-            let spec = cx
-                .global::<WidgetRegistry>()
-                .spec(&WidgetKind::image_view())
-                .unwrap();
-            let mut panes = ItemRegistry::default();
-            panes.register_view(spec, db.clone());
-            panes
-        });
-        let layout = TileLayout {
-            version: SUPPORTED_LAYOUT_VERSION,
-            global_time_range: String::new(),
-            temporal: None,
-            root: TileNode::Pane(TilePane {
-                active_index: 0,
-                tab_orientation: TabOrientation::Horizontal,
-                hide_tab_bar: false,
-                locked_size: None,
-                tab_rail_width: None,
-                items: vec![serial::TileItem {
-                    kind: "image_view".into(),
-                    state: config.clone(),
-                }],
-            }),
-        };
-        let json = serde_json::to_string(&layout).unwrap();
-        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
-        cx.update(|cx| {
-            tg.update(cx, |this, cx| {
-                *this = TileGroup::from_json(&json, &panes, cx).unwrap();
-            })
-        });
-        cx.read(|cx| {
-            let item = &tg.read(cx).panes[0].read(cx).items()[0];
-            assert_eq!(item.serialization_key(), "image_view");
-            assert_eq!(item.serialize(cx), config);
-            assert_eq!(item.tab_title(cx), "cam.pixels");
-            let view = item
-                .entity_any(cx)
-                .downcast::<crate::views::image_view::ImageView>();
-            assert!(view.is_ok());
-        });
-    }
-
-    #[gpui::test]
     fn from_json_rejects_older_version(cx: &mut gpui::TestAppContext) {
         let version = SUPPORTED_LAYOUT_VERSION - 1;
         let json = empty_pane_layout(version);

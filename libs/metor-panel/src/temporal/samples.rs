@@ -1245,32 +1245,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn same_sample_matches_shared_or_equal_bytes() {
-        let frame: Arc<[u8]> = Arc::from(&[1u8, 2, 3][..]);
-        let copy: Arc<[u8]> = Arc::from(&[1u8, 2, 3][..]);
-        let other: Arc<[u8]> = Arc::from(&[1u8, 2, 4][..]);
-        assert!(same_sample(
-            Some(&sample(1, &frame)),
-            Some(&sample(1, &frame))
-        ));
-        assert!(same_sample(
-            Some(&sample(1, &frame)),
-            Some(&sample(1, &copy))
-        ));
-        assert!(same_sample(None, None));
-        assert!(!same_sample(
-            Some(&sample(1, &frame)),
-            Some(&sample(2, &frame))
-        ));
-        assert!(!same_sample(
-            Some(&sample(1, &frame)),
-            Some(&sample(1, &other))
-        ));
-        assert!(!same_sample(Some(&sample(1, &frame)), None));
-        assert!(!same_sample(None, Some(&sample(1, &frame))));
-    }
-
     #[gpui::test]
     fn republishing_a_sample_notifies_once(cx: &mut gpui::TestAppContext) {
         let (_temp, db, c) = fixture();

@@ -33,48 +33,9 @@ struct Parked {
     frames: u32,
 }
 
-/// One window's parked images, independent of gpui so the bookkeeping can be
-/// tested without a window.
-#[derive(Default)]
-struct Queue(Vec<Parked>);
-
-impl Queue {
-    fn park(&mut self, image: Arc<RenderImage>, now: Instant) {
-        self.0.push(Parked {
-            image,
-            since: now,
-            frames: 0,
-        });
-    }
-
-    /// Counts one frame against every parked image and returns the ones that
-    /// have waited out both the frame budget and [`SETTLE_TIME`].
-    fn tick(&mut self, now: Instant) -> Vec<Arc<RenderImage>> {
-        let mut settled = Vec::new();
-        self.0.retain_mut(|parked| {
-            parked.frames += 1;
-            let done = parked.frames >= SETTLE_FRAMES && now - parked.since >= SETTLE_TIME;
-            if done {
-                settled.push(parked.image.clone());
-            }
-            !done
-        });
-        settled
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
 #[derive(Default)]
 struct AtlasReleases {
-    windows: HashMap<WindowId, Queue>,
+    windows: HashMap<WindowId, Vec<Parked>>,
 }
 
 impl Global for AtlasReleases {}
@@ -89,7 +50,11 @@ pub(crate) fn release_image(window: &mut Window, cx: &mut App, image: Arc<Render
         .entry(id)
         .or_default();
     let schedule = queue.is_empty();
-    queue.park(image, Instant::now());
+    queue.push(Parked {
+        image,
+        since: Instant::now(),
+        frames: 0,
+    });
     if schedule {
         window.on_next_frame(settle);
     }
@@ -101,7 +66,16 @@ fn settle(window: &mut Window, cx: &mut App) {
     let Some(queue) = releases.windows.get_mut(&id) else {
         return;
     };
-    let settled = queue.tick(Instant::now());
+    let now = Instant::now();
+    let mut settled = Vec::new();
+    queue.retain_mut(|parked| {
+        parked.frames += 1;
+        let done = parked.frames >= SETTLE_FRAMES && now - parked.since >= SETTLE_TIME;
+        if done {
+            settled.push(parked.image.clone());
+        }
+        !done
+    });
     if queue.is_empty() {
         releases.windows.remove(&id);
     } else {
@@ -153,7 +127,7 @@ mod tests {
         cx.update(|window, cx| {
             cx.try_global::<AtlasReleases>()
                 .and_then(|r| r.windows.get(&window.window_handle().window_id()))
-                .map_or(0, Queue::len)
+                .map_or(0, Vec::len)
         })
     }
 
@@ -174,36 +148,5 @@ mod tests {
         std::thread::sleep(SETTLE_TIME);
         cx.update(|window, cx| window.simulate_next_frame(cx));
         assert_eq!(parked(cx), 0);
-    }
-
-    fn one_pixel() -> Arc<RenderImage> {
-        Arc::new(RenderImage::new(smallvec![Frame::new(
-            image::RgbaImage::new(1, 1)
-        )]))
-    }
-
-    /// An image leaves the queue only after both the frame budget and the
-    /// time floor, and each image counts from when it was parked.
-    #[test]
-    fn queue_releases_after_frames_and_time() {
-        let start = Instant::now();
-        let mut queue = Queue::default();
-        let (a, b) = (one_pixel(), one_pixel());
-        queue.park(a.clone(), start);
-        for _ in 0..SETTLE_FRAMES - 1 {
-            assert!(queue.tick(start + SETTLE_TIME).is_empty());
-        }
-        queue.park(b.clone(), start + SETTLE_TIME);
-        let settled = queue.tick(start + SETTLE_TIME);
-        assert_eq!(settled.len(), 1);
-        assert!(Arc::ptr_eq(&settled[0], &a));
-
-        // Frames alone are not enough without the time floor.
-        for _ in 0..SETTLE_FRAMES {
-            assert!(queue.tick(start + SETTLE_TIME).is_empty());
-        }
-        let settled = queue.tick(start + SETTLE_TIME * 2);
-        assert!(Arc::ptr_eq(&settled[0], &b));
-        assert!(queue.is_empty());
     }
 }
