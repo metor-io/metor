@@ -82,7 +82,7 @@ fn preset_components() -> Vec<ComponentId> {
         for item in items.into_iter().flatten() {
             let state: Value = serde_json::from_str(item["state"].as_str().unwrap()).unwrap();
             for overlay in state["overlays"].as_array().into_iter().flatten() {
-                for field in ["u", "v", "count", "size", "cat_id"] {
+                for field in ["u", "v", "count"] {
                     out.push(ComponentId::new(overlay[field].as_str().unwrap()));
                 }
             }
