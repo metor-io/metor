@@ -1174,12 +1174,6 @@ pub struct TimerSeriesWriter {
     current: Option<Arc<AtomicNode<TimeSeriesNode>>>,
 }
 
-impl Drop for TimerSeriesWriter {
-    fn drop(&mut self) {
-        self.time_series.has_writer.store(false, Ordering::Release);
-    }
-}
-
 impl TimerSeriesWriter {
     pub fn push_buf(&mut self, timestamp: Timestamp, buf: &[u8]) -> Result<(), Error> {
         let mut rolled = false;
@@ -2039,15 +2033,5 @@ mod tests {
         for ts in 0..10i64 {
             assert_eq!(series.get(Timestamp(ts)).unwrap().data(), &[ts as u8]);
         }
-    }
-
-    #[test]
-    fn dropped_writer_releases_the_series() {
-        let dir = tempfile::tempdir().unwrap();
-        let series = TimeSeries::create(dir.path()).unwrap();
-        let writer = series.writer().unwrap();
-        assert!(series.writer().is_none());
-        drop(writer);
-        assert!(series.writer().is_some());
     }
 }

@@ -19,13 +19,13 @@
 //! would disagree with the origin's.
 
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     sync::{Arc, atomic},
     time::{Duration, Instant},
 };
 
 use metor_proto::types::{ComponentId, PrimType, Timestamp};
-use metor_proto_wkt::{ComponentMetadata, IMAGE_FORMAT_KEY};
+use metor_proto_wkt::ComponentMetadata;
 use smallvec::SmallVec;
 use tracing::{debug, info, warn};
 
@@ -58,19 +58,20 @@ pub fn lod_node_max_age() -> Duration {
 pub const LOD_SOURCE_ID_KEY: &str = "lod_source_id";
 pub const LOD_RATIO_KEY: &str = "lod_ratio";
 pub const LOD_BUCKET_US_KEY: &str = "lod_bucket_us";
-/// Set to `"true"` on a hidden component or an image to have the engine
-/// downsample it anyway, or to `"false"` to skip any component. Hidden
-/// components are DB-internal and so skipped by default; this is how a
-/// producer of derived series (the panel's expression components) asks for
-/// the same wide-plot treatment as raw telemetry, without the db learning
-/// anything about who is asking. LoD levels themselves stay ineligible —
-/// they are hidden *and* LoD-named.
-pub const LOD_OPT_IN_KEY: &str = metor_proto_wkt::LOD_KEY;
+/// Set to `"true"` on a hidden component to have the engine downsample it
+/// anyway. Hidden components are DB-internal and so skipped by default;
+/// this is how a producer of derived series (the panel's expression
+/// components) asks for the same wide-plot treatment as raw telemetry,
+/// without the db learning anything about who is asking. LoD levels
+/// themselves stay ineligible — they are hidden *and* LoD-named.
+pub const LOD_OPT_IN_KEY: &str = "lod";
 
 /// Levels whose buckets would span more than this are skipped: a slow
 /// source's raw history is small enough to render directly long before a
 /// multi-day bucket could help.
 const MAX_BUCKET_US: i64 = 86_400_000_000;
+/// Sources whose samples are larger than this, such as images, get no levels.
+const MAX_SOURCE_SAMPLE_BYTES: usize = 64 * 1024;
 /// Buckets emitted per level per pass; bounds the mmap scan so a year of
 /// backfill never pins the executor between sleeps.
 const MAX_BUCKETS_PER_PASS: i64 = 16_384;
@@ -108,96 +109,41 @@ pub fn spawn(db: Arc<DB>) {
     stellarator::spawn(run(db));
 }
 
-/// The engine's source tasks: running, and cancelled but not yet dropped.
-#[derive(Default)]
-struct Tracked {
-    running: HashMap<ComponentId, stellarator::JoinHandle<()>>,
-    stopping: HashMap<ComponentId, stellarator::JoinHandle<()>>,
-}
-
-impl Tracked {
-    fn is_running(&self, id: &ComponentId) -> bool {
-        self.running.get(id).is_some_and(|task| !task.is_finished())
-    }
-}
-
 async fn run(db: Arc<DB>) {
-    let mut tracked = Tracked::default();
+    let mut tracked: HashSet<ComponentId> = HashSet::new();
     loop {
-        rescan(&db, &mut tracked);
+        let new: Vec<Component> = db.with_state(|state| {
+            state
+                .component_metadata_iter()
+                .filter(|(id, meta)| !tracked.contains(id) && eligible(meta))
+                .filter_map(|(id, _)| state.get_component(*id).cloned())
+                .collect()
+        });
+        for src in new {
+            tracked.insert(src.component_id);
+            stellarator::spawn(downsample_source(db.clone(), src));
+        }
         // Raced against a periodic recheck: a registration between the scan
         // above and the wait registering would otherwise be lost (wake_all
         // doesn't store wakeups), orphaning the component until some
         // unrelated vtable change.
         futures_lite::future::race(
-            futures_lite::future::race(db.vtable_gen.wait(), db.metadata_gen.wait()),
+            async {
+                db.vtable_gen.wait().await;
+            },
             stellarator::sleep(IDLE_RECHECK),
         )
         .await;
     }
 }
 
-/// Starts sources that became eligible and stops those that no longer are.
-/// A stopped source's level components keep their data. To reclaim it,
-/// stop the db and delete the directories of the components whose
-/// `lod_source_id` is the source's id.
-fn rescan(db: &Arc<DB>, tracked: &mut Tracked) {
-    tracked.stopping.retain(|_, task| !task.is_finished());
-    let changed: Vec<ComponentId> = db.with_state(|state| {
-        state
-            .component_metadata_iter()
-            .filter(|(id, meta)| eligible(meta) != tracked.is_running(id))
-            .map(|(id, _)| *id)
-            .collect()
-    });
-    for id in changed {
-        if tracked.is_running(&id) {
-            stop(tracked, id);
-        } else {
-            start(db, tracked, id);
-        }
-    }
-}
-
-fn stop(tracked: &mut Tracked, id: ComponentId) {
-    if let Some(task) = tracked.running.remove(&id) {
-        task.0.cancel();
-        tracked.stopping.insert(id, task);
-        info!(?id, "lod engine stopped tracking component");
-    }
-}
-
-/// Spawns a source task, after any cancelled one for the same source has
-/// dropped and released its level writers.
-fn start(db: &Arc<DB>, tracked: &mut Tracked, id: ComponentId) {
-    let Some(src) = db.with_state(|s| s.get_component(id).cloned()) else {
-        return;
-    };
-    let previous = tracked.stopping.remove(&id);
-    let db = db.clone();
-    let task = stellarator::spawn(async move {
-        if let Some(previous) = previous {
-            let _ = previous.await;
-        }
-        downsample_source(db, src).await;
-    });
-    tracked.running.insert(id, task);
-}
-
-/// The `lod` key: `"true"` or `"false"`, anything else is unset.
-fn lod_flag(meta: &ComponentMetadata) -> Option<bool> {
-    match meta.metadata.get(LOD_OPT_IN_KEY)?.as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-
-/// Hidden components and images opt in with `lod = "true"`; any component
-/// opts out with `lod = "false"`.
 fn eligible(meta: &ComponentMetadata) -> bool {
-    let by_default = !meta.is_hidden() && !meta.metadata.contains_key(IMAGE_FORMAT_KEY);
-    lod_flag(meta).unwrap_or(by_default) && !meta.is_string() && !is_lod_name(&meta.name)
+    let visible = !meta.is_hidden()
+        || meta
+            .metadata
+            .get(LOD_OPT_IN_KEY)
+            .is_some_and(|opt_in| opt_in == "true");
+    visible && !meta.is_string() && !is_lod_name(&meta.name) && meta.image_format().is_none()
 }
 
 async fn downsample_source(db: Arc<DB>, src: Component) {
@@ -225,7 +171,7 @@ async fn downsample_source(db: Arc<DB>, src: Component) {
     let Some(meta) = db.with_state(|s| s.get_component_metadata(src.component_id).cloned()) else {
         return;
     };
-    if !eligible(&meta) {
+    if !eligible(&meta) || src.schema.size() > MAX_SOURCE_SAMPLE_BYTES {
         return;
     }
     let mut levels = setup_levels(&db, &src, &meta.name, period_us);
@@ -405,8 +351,8 @@ fn setup_levels(db: &Arc<DB>, src: &Component, src_name: &str, period_us: i64) -
             warn!(src = %src_name, ratio, "lod writer already owned; skipping level");
             continue;
         };
-        let cursor = match level_end(&lod.time_series) {
-            Some(end) => end.div_euclid(bucket_us) * bucket_us + bucket_us,
+        let cursor = match lod.time_series.latest() {
+            Some(latest) => latest.timestamp().0.div_euclid(bucket_us) * bucket_us + bucket_us,
             None => src
                 .time_series
                 .manifest()
@@ -424,13 +370,6 @@ fn setup_levels(db: &Arc<DB>, src: &Component, src_name: &str, period_us: i64) -
         ));
     }
     levels
-}
-
-/// The newest bucket a level holds, resident or remote-only.
-fn level_end(level: &TimeSeries) -> Option<i64> {
-    let resident = level.latest().map(|l| l.timestamp().0);
-    let spanned = level.manifest().spans.iter().map(|s| s.seal.end_ts.0).max();
-    resident.max(spanned)
 }
 
 fn create_level(
@@ -1245,178 +1184,12 @@ mod tests {
         assert!(!eligible(&level));
     }
 
-    fn image_meta() -> ComponentMetadata {
-        let mut meta = ComponentMetadata::from("st.pixels");
-        meta.metadata
-            .insert(IMAGE_FORMAT_KEY.into(), "mono16".into());
-        meta
-    }
-
     #[test]
-    fn images_skip_lod_unless_opted_in() {
+    fn images_are_not_eligible() {
         use metor_proto_wkt::MetadataExt as _;
 
-        let mut meta = image_meta();
-        assert!(!eligible(&meta));
-        meta.set(LOD_OPT_IN_KEY, "true");
-        assert!(eligible(&meta));
-        meta.set(LOD_OPT_IN_KEY, "false");
-        assert!(!eligible(&meta));
-        meta.set(LOD_OPT_IN_KEY, "off");
-        assert!(!eligible(&meta));
-    }
-
-    #[test]
-    fn lod_false_opts_out_any_component() {
-        use metor_proto_wkt::MetadataExt as _;
-
-        let mut meta = ComponentMetadata::from("imu.accel");
-        meta.set(LOD_OPT_IN_KEY, "false");
-        assert!(!eligible(&meta));
-        meta.set(LOD_OPT_IN_KEY, "off");
-        assert!(eligible(&meta));
-
-        let mut hidden = ComponentMetadata::from("expr.abcd").with_hidden();
-        hidden.set(LOD_OPT_IN_KEY, "false");
-        assert!(!eligible(&hidden));
-    }
-
-    const DEADLINE: Duration = Duration::from_secs(10);
-
-    /// A db holding one sealed source named "src" with `meta` applied.
-    fn db_with_source(
-        dir: &Path,
-        meta: impl FnOnce(&mut ComponentMetadata),
-    ) -> (Arc<DB>, Component) {
-        let db = Arc::new(DB::create(dir.to_path_buf()).unwrap());
-        let values: Vec<f64> = (0..64).map(f64::from).collect();
-        let src = sealed_source(&db.path, 0, &values);
-        let mut src_meta = ComponentMetadata::from("src");
-        src_meta.component_id = src.component_id;
-        meta(&mut src_meta);
-        db.with_state_mut(|state| {
-            state.set_component_metadata(src_meta, &db.path).unwrap();
-            state.components.insert(src.component_id, src.clone());
-        });
-        (db, src)
-    }
-
-    fn set_meta(db: &DB, id: ComponentId, key: &str, value: &str) {
-        db.with_state_mut(|state| {
-            let mut meta = state.get_component_metadata(id).unwrap().clone();
-            meta.metadata.insert(key.into(), value.into());
-            state.set_component_metadata(meta, &db.path).unwrap();
-        });
-    }
-
-    fn levels(db: &DB) -> Vec<Component> {
-        db.with_state(|state| {
-            state
-                .component_metadata_iter()
-                .filter(|(_, m)| m.metadata.contains_key(LOD_SOURCE_ID_KEY))
-                .filter_map(|(id, _)| state.get_component(*id).cloned())
-                .collect()
-        })
-    }
-
-    /// Polls until `f` holds or `DEADLINE` passes.
-    async fn eventually(mut f: impl FnMut() -> bool) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < DEADLINE {
-            if f() {
-                return true;
-            }
-            stellarator::sleep(Duration::from_millis(5)).await;
-        }
-        false
-    }
-
-    fn writers_held(levels: &[Component]) -> bool {
-        levels.iter().all(|l| l.time_series.writer().is_none())
-    }
-
-    #[stellarator::test]
-    async fn sealed_image_gets_no_levels() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, src) = db_with_source(dir.path(), |m| {
-            m.metadata.insert(IMAGE_FORMAT_KEY.into(), "mono16".into());
-        });
-        downsample_source(db.clone(), src).await;
-        assert!(levels(&db).is_empty());
-    }
-
-    #[stellarator::test]
-    async fn sealed_plain_source_gets_levels() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, src) = db_with_source(dir.path(), |_| {});
-        let _task = stellarator::spawn(downsample_source(db.clone(), src)).drop_guard();
-        assert!(eventually(|| !levels(&db).is_empty()).await);
-    }
-
-    #[stellarator::test]
-    async fn rescan_follows_metadata_after_the_first_seal() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, src) = db_with_source(dir.path(), |_| {});
-        let id = src.component_id;
-        let mut tracked = Tracked::default();
-        rescan(&db, &mut tracked);
-        assert!(tracked.is_running(&id));
-        assert!(eventually(|| !levels(&db).is_empty()).await);
-        let made = levels(&db);
-        // Level tasks are parked holding their writers.
-        assert!(eventually(|| writers_held(&made)).await);
-
-        // Image metadata lands after the seal: the source stops and its
-        // levels keep their data but lose their writer.
-        set_meta(&db, src.component_id, IMAGE_FORMAT_KEY, "mono16");
-        rescan(&db, &mut tracked);
-        assert!(!tracked.is_running(&id));
-        assert!(eventually(|| made.iter().all(|l| l.time_series.writer().is_some())).await);
-        assert_eq!(levels(&db).len(), made.len());
-
-        set_meta(&db, src.component_id, LOD_OPT_IN_KEY, "true");
-        rescan(&db, &mut tracked);
-        assert!(tracked.is_running(&id));
-        assert!(eventually(|| writers_held(&made)).await);
-        assert_eq!(levels(&db).len(), made.len());
-    }
-
-    #[stellarator::test]
-    async fn restart_waits_for_the_cancelled_task() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, src) = db_with_source(dir.path(), |_| {});
-        let id = src.component_id;
-        let mut tracked = Tracked::default();
-        rescan(&db, &mut tracked);
-        assert!(eventually(|| !levels(&db).is_empty()).await);
-        let made = levels(&db);
-        assert!(eventually(|| writers_held(&made)).await);
-
-        // Stop and restart with no poll between: the replacement must not
-        // claim writers the cancelled task still holds.
-        set_meta(&db, id, LOD_OPT_IN_KEY, "false");
-        rescan(&db, &mut tracked);
-        set_meta(&db, id, LOD_OPT_IN_KEY, "true");
-        rescan(&db, &mut tracked);
-        assert!(tracked.is_running(&id));
-        assert!(eventually(|| writers_held(&made)).await);
-    }
-
-    #[stellarator::test]
-    async fn finished_task_is_retried() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, src) = db_with_source(dir.path(), |_| {});
-        let id = src.component_id;
-        let mut tracked = Tracked::default();
-        rescan(&db, &mut tracked);
-        // The task sees this before its first poll and gives up.
-        set_meta(&db, id, IMAGE_FORMAT_KEY, "mono16");
-        assert!(eventually(|| !tracked.is_running(&id)).await);
-        assert!(levels(&db).is_empty());
-
-        set_meta(&db, id, LOD_OPT_IN_KEY, "true");
-        rescan(&db, &mut tracked);
-        assert!(tracked.is_running(&id));
-        assert!(eventually(|| !levels(&db).is_empty()).await);
+        let mut image = ComponentMetadata::from("st.pixels");
+        image.set(metor_proto_wkt::IMAGE_FORMAT_KEY, "mono16");
+        assert!(!eligible(&image));
     }
 }
