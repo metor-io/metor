@@ -224,13 +224,9 @@ impl ImageView {
             db,
         };
         // A torn-out tab moves the view between windows, so release strips
-        // every window's atlas.
-        cx.on_release(|view, cx| {
-            for image in view.frames.take_all() {
-                cx.drop_image(image, None);
-            }
-        })
-        .detach();
+        // every window's atlas, once in-flight frames are done with it.
+        cx.on_release(|view, cx| crate::atlas::release_orphans(cx, view.frames.take_all()))
+            .detach();
         for overlay in &cfg.overlays {
             view.add_overlay(overlay.clone(), cx);
         }
@@ -909,8 +905,8 @@ impl ImageView {
     }
 
     fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        for image in std::mem::take(&mut self.frames.pending_release) {
-            cx.drop_image(image, Some(window));
+        for image in self.frames.take_retired() {
+            crate::atlas::release_image(window, cx, image);
         }
         self.listen_for_drag(window, cx);
         window.paint_quad(gpui::fill(bounds, theme(cx).image_backdrop()));
@@ -1273,6 +1269,15 @@ mod tests {
         assert!(matches!(state, FrameState::Ready { .. }));
     }
 
+    /// Runs enough frames, and waits long enough, for every parked image to
+    /// leave the atlas.
+    fn settle(vcx: &mut VisualTestContext) {
+        std::thread::sleep(crate::atlas::SETTLE_TIME);
+        for _ in 0..crate::atlas::SETTLE_FRAMES {
+            vcx.update(|window, cx| window.simulate_next_frame(cx));
+        }
+    }
+
     #[gpui::test]
     fn only_the_current_image_stays_in_the_atlas(cx: &mut gpui::TestAppContext) {
         let (_temp, host, view, vcx) = record_view(cx);
@@ -1290,6 +1295,10 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         };
+        // Replaced images stay until in-flight frames are done with them,
+        // so their atlas slots cannot be refilled under a frame on the GPU.
+        assert_eq!(held(vcx), [true, true, true]);
+        settle(vcx);
         assert_eq!(held(vcx), [false, false, true]);
         drop(view);
         vcx.update(|_, cx| {
@@ -1299,6 +1308,9 @@ mod tests {
             })
         });
         draw(vcx);
+        assert_eq!(held(vcx), [false, false, true]);
+        vcx.executor().advance_clock(crate::atlas::ORPHAN_WAIT);
+        vcx.run_until_parked();
         assert_eq!(held(vcx), [false, false, false]);
     }
 
@@ -1407,6 +1419,9 @@ mod tests {
             .unwrap()
         });
         refresh(cx, b);
+        assert!(held(cx, a) && held(cx, b), "dropped under in-flight frames");
+        cx.executor().advance_clock(crate::atlas::ORPHAN_WAIT);
+        cx.run_until_parked();
         assert!(!held(cx, a) && !held(cx, b));
     }
 

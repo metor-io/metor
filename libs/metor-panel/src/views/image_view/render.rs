@@ -449,19 +449,41 @@ fn image(bgra: Vec<u8>, out: Rect) -> Result<Arc<RenderImage>, RenderError> {
     ))))
 }
 
-/// The painted image and the ones waiting for `drop_image`.
+/// The painted image and the replaced ones waiting to leave the atlas.
+///
+/// Retired images go to [`crate::atlas::release_image`], never straight to
+/// `drop_image`: frames still on the GPU may sample a replaced image, and a
+/// slot freed under them is refilled by the next upload (often a plot's
+/// frame), which then flashes inside this view.
 #[derive(Default)]
 pub struct Frames {
     pub current: Option<(Arc<RenderImage>, Rect)>,
-    pub pending_release: Vec<Arc<RenderImage>>,
+    pending_release: Vec<Arc<RenderImage>>,
 }
 
 impl Frames {
     /// Replaces the painted image; the old one waits for the next paint.
+    /// Reinstalling the painted image retires nothing.
     pub fn install(&mut self, image: Option<(Arc<RenderImage>, Rect)>) {
-        if let Some((old, _)) = std::mem::replace(&mut self.current, image) {
+        let same = match (&self.current, &image) {
+            (Some((old, _)), Some((new, _))) => Arc::ptr_eq(old, new),
+            _ => false,
+        };
+        if let Some((old, _)) = std::mem::replace(&mut self.current, image)
+            && !same
+        {
             self.pending_release.push(old);
         }
+    }
+
+    /// The replaced images to hand to the deferred release; never the one
+    /// being painted.
+    pub fn take_retired(&mut self) -> Vec<Arc<RenderImage>> {
+        let retired = std::mem::take(&mut self.pending_release);
+        debug_assert!(self.current.as_ref().is_none_or(|(current, _)| {
+            !retired.iter().any(|image| Arc::ptr_eq(image, current))
+        }));
+        retired
     }
 
     /// Every image still in the atlas or about to be, for release.
@@ -668,6 +690,34 @@ mod tests {
         assert_eq!(frames.pending_release.len(), 2);
         assert_eq!(frames.take_all().len(), 2);
         assert!(frames.current.is_none());
+    }
+
+    /// A paint retires only replaced images, each once, and never the one it
+    /// is about to draw.
+    #[test]
+    fn retiring_never_hands_over_the_painted_image() {
+        let image = || image(vec![0; 4], Rect::new(0, 0, 1, 1)).unwrap();
+        let (a, b, c) = (image(), image(), image());
+        let mut frames = Frames::default();
+        frames.install(Some((a.clone(), Rect::default())));
+        assert!(frames.take_retired().is_empty());
+
+        // Two renders land between paints, as during a zoom.
+        frames.install(Some((b.clone(), Rect::default())));
+        frames.install(Some((c.clone(), Rect::default())));
+        let retired = frames.take_retired();
+        assert_eq!(retired.len(), 2);
+        assert!(Arc::ptr_eq(&retired[0], &a) && Arc::ptr_eq(&retired[1], &b));
+        assert!(frames.take_retired().is_empty(), "retired twice");
+
+        // Reinstalling the painted image keeps it in the atlas.
+        frames.install(Some((c.clone(), Rect::default())));
+        assert!(frames.take_retired().is_empty());
+        assert!(Arc::ptr_eq(&frames.current.as_ref().unwrap().0, &c));
+
+        let all = frames.take_all();
+        assert_eq!(all.len(), 1);
+        assert!(Arc::ptr_eq(&all[0], &c));
     }
 
     /// The whole job (histogram, levels, LUT, resample, `RenderImage`) on a
