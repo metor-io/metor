@@ -108,6 +108,10 @@ pub struct State {
     /// (vtable-dynamic.md §8.6).
     latest_dynamic_tables: HashMap<PacketId, std::sync::Mutex<Vec<u8>>>,
 
+    /// Member templates of dynamic tables. They stay hidden whatever
+    /// metadata a producer sets, and their keyed members inherit it.
+    dynamic_templates: HashSet<ComponentId>,
+
     udp_vtable_streams: HashSet<(SocketAddr, [u8; 2])>,
 
     pub db_config: DbConfig,
@@ -322,12 +326,16 @@ impl DB {
                 if dynamic {
                     // A member template never receives samples (the concrete keyed
                     // components do), so hide it from listings / live streams.
-                    let metadata = ComponentMetadata {
-                        component_id,
-                        name: component_id.to_string(),
-                        metadata: Default::default(),
-                    }
-                    .with_hidden();
+                    state.dynamic_templates.insert(component_id);
+                    let metadata = state
+                        .component_metadata
+                        .get(&component_id)
+                        .cloned()
+                        .unwrap_or_else(|| ComponentMetadata {
+                            component_id,
+                            name: component_id.to_string(),
+                            metadata: Default::default(),
+                        });
                     state.set_component_metadata(metadata, &self.path)?;
                 }
                 self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
@@ -606,7 +614,7 @@ impl State {
                     ComponentMetadata {
                         component_id: rf.component_id,
                         name,
-                        metadata: Default::default(),
+                        metadata: self.template_metadata(rf),
                     },
                     db_path,
                 )?;
@@ -619,6 +627,17 @@ impl State {
         }
         self.get_component(rf.component_id)
             .ok_or(Error::ComponentNotFound(rf.component_id))
+    }
+
+    /// The metadata a keyed member inherits from its template, unhidden.
+    fn template_metadata(&self, rf: &RealizedField) -> HashMap<String, String> {
+        let mut metadata = rf
+            .template_id
+            .and_then(|id| self.component_metadata.get(&id))
+            .map(|m| m.metadata.clone())
+            .unwrap_or_default();
+        metadata.remove("hidden");
+        metadata
     }
 
     pub fn get_component(&self, component_id: ComponentId) -> Option<&Component> {
@@ -723,6 +742,10 @@ impl State {
         metadata: ComponentMetadata,
         db_path: &Path,
     ) -> Result<(), Error> {
+        let metadata = match self.dynamic_templates.contains(&metadata.component_id) {
+            true => metadata.with_hidden(),
+            false => metadata,
+        };
         let component_metadata_path = db_path.join(metadata.component_id.to_string());
         std::fs::create_dir_all(&component_metadata_path)?;
         let component_metadata_path = component_metadata_path.join("metadata");
@@ -2969,6 +2992,30 @@ mod dynamic_ingest_tests {
 
     fn cached_table(db: &DB, id: PacketId) -> Vec<u8> {
         db.with_state(|s| s.latest_dynamic_tables[&id].lock().unwrap().clone())
+    }
+
+    #[stellarator::test]
+    async fn dynamic_members_inherit_template_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, id, _) = map_db(dir.path());
+        let template = ComponentMetadata::from("processes.pid").with_string();
+        db.with_state_mut(|s| s.set_component_metadata(template, &db.path))
+            .unwrap();
+        db.ingest_table(id, &map_table(1000, &[("htop", 1, 0.5)]))
+            .unwrap();
+        db.with_state(|s| {
+            let template = s.get_component_metadata(ComponentId::new("processes.pid"));
+            assert!(template.is_some_and(|m| m.is_hidden() && m.is_string()));
+            let member = s
+                .get_component_metadata(ComponentId::new("processes.htop.pid"))
+                .unwrap();
+            assert_eq!(member.name, "processes.htop.pid");
+            assert!(member.is_string() && !member.is_hidden());
+            let plain = s
+                .get_component_metadata(ComponentId::new("processes.htop.cpu_usage"))
+                .unwrap();
+            assert!(!plain.is_string() && !plain.is_hidden());
+        });
     }
 
     #[stellarator::test]

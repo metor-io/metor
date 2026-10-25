@@ -121,9 +121,11 @@ impl<K, V> Decomponentize for FrameMap<K, V> {
     }
 }
 
-impl<K, V> Metadatatize for FrameMap<K, V> {
-    fn metadata(_prefix: impl ComponentPath) -> impl Iterator<Item = ComponentMetadata> {
-        core::iter::empty()
+/// Metadata for the member templates (`procs.name`), which each keyed member
+/// (`procs.4211.name`) inherits.
+impl<K, V: Metadatatize> Metadatatize for FrameMap<K, V> {
+    fn metadata(prefix: impl ComponentPath) -> impl Iterator<Item = ComponentMetadata> {
+        V::metadata(prefix)
     }
 }
 

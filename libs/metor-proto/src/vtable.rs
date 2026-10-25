@@ -372,6 +372,8 @@ impl<'a> Scopes<'a> {
 struct WalkCtx<'a> {
     base: usize,
     path: PathHasher,
+    /// `path` without element keys: the path of the member template.
+    template: PathHasher,
     element: Option<ElementKey<'a>>,
     /// The dotted path of the enclosing dynamic container (the [`Op::List`]/
     /// [`Op::Map`] `name`), so a lazily-created keyed member can be named
@@ -390,6 +392,7 @@ impl Default for WalkCtx<'_> {
         Self {
             base: 0,
             path: PathHasher::new(),
+            template: PathHasher::new(),
             element: None,
             container: None,
             outer: Scopes::EMPTY,
@@ -427,6 +430,9 @@ pub struct RealizedField<'a> {
     /// The elements enclosing [`container`](Self::container) when it is
     /// nested in another container's element, whose name it is relative to.
     pub outer: Scopes<'a>,
+    /// The member template this dynamic field instantiates (`processes.pid`
+    /// for `processes.0.pid`), `None` for a static field.
+    pub template_id: Option<ComponentId>,
     /// Whether this field was realized through a dynamic terminal
     /// ([`Op::PathComponent`], reached via [`Op::List`]/[`Op::Map`]). In
     /// schema/registration mode (`table = None`) such a field is a member
@@ -691,6 +697,9 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                     let mut leaf_path = ctx.path;
                     leaf_path.push(leaf.name);
                     let component_id = leaf_path.finish();
+                    let mut template = ctx.template;
+                    template.push(leaf.name);
+                    let ctx = WalkCtx { template, ..ctx };
                     return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, timestamp_at, true, Some(leaf.name), table, f);
                 }
                 RealizedOp::Schema(s) => {
@@ -764,6 +773,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
             container: ctx.container,
             member,
             outer: ctx.outer,
+            template_id: dynamic.then(|| ctx.template.finish()),
             dynamic,
         })
     }
@@ -788,6 +798,8 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
     ) -> Result<(), E> {
         let mut prefix_path = ctx.path;
         prefix_path.push(dynm.name);
+        let mut template = ctx.template;
+        template.push(dynm.name);
         let outer = ctx.outer.with(ctx.container, ctx.element);
         let members_start = dynm.members.start as usize;
         let members_end = members_start + dynm.members.count as usize;
@@ -797,6 +809,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
             let child = WalkCtx {
                 base: 0,
                 path: prefix_path,
+                template,
                 element: None,
                 container: Some(dynm.name),
                 outer,
@@ -845,6 +858,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
             let child = WalkCtx {
                 base: member_base,
                 path: elem_path,
+                template,
                 element: Some(key),
                 container: Some(dynm.name),
                 outer,
