@@ -2,7 +2,6 @@
 
 use zerocopy::byteorder::{F32, LE, U16};
 
-use super::layout::{FrameLayout, Pixels};
 use super::resample::Rect;
 
 /// Counts per bin. Integer frames get one bin per code; `mono_f32` gets
@@ -185,101 +184,6 @@ impl Histogram {
     }
 }
 
-/// Raw-unit statistics of a source rectangle.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RoiStats {
-    pub count: u64,
-    pub min: f64,
-    pub max: f64,
-    pub mean: f64,
-    /// Population standard deviation.
-    pub sigma: f64,
-    pub sum: f64,
-}
-
-/// Statistics of the finite samples of a mono frame inside `rect`, clipped
-/// to the frame; `None` when nothing is inside.
-pub fn roi_stats(pixels: Pixels<'_>, layout: &FrameLayout, rect: Rect) -> Option<RoiStats> {
-    if layout.channels != 1 {
-        return None;
-    }
-    let rect = rect.clip(layout.width, layout.height);
-    let width = layout.width;
-    let rows = rect
-        .rows()
-        .map(|row| row * width + rect.x..row * width + rect.x + rect.width);
-    let mut acc = Welford::default();
-    match pixels {
-        Pixels::U8(p) => rows.for_each(|r| {
-            p.get(r)
-                .unwrap_or(&[])
-                .iter()
-                .for_each(|&v| acc.push(f64::from(v)))
-        }),
-        Pixels::U16(p) => rows.for_each(|r| {
-            p.get(r)
-                .unwrap_or(&[])
-                .iter()
-                .for_each(|v| acc.push(f64::from(v.get())))
-        }),
-        Pixels::F32(p) => rows.for_each(|r| {
-            p.get(r)
-                .unwrap_or(&[])
-                .iter()
-                .map(|v| f64::from(v.get()))
-                .filter(|v| v.is_finite())
-                .for_each(|v| acc.push(v))
-        }),
-    }
-    acc.stats()
-}
-
-/// Running mean and variance.
-struct Welford {
-    count: u64,
-    mean: f64,
-    m2: f64,
-    min: f64,
-    max: f64,
-    sum: f64,
-}
-
-impl Default for Welford {
-    fn default() -> Self {
-        Self {
-            count: 0,
-            mean: 0.0,
-            m2: 0.0,
-            min: f64::INFINITY,
-            max: f64::NEG_INFINITY,
-            sum: 0.0,
-        }
-    }
-}
-
-impl Welford {
-    fn push(&mut self, v: f64) {
-        self.count += 1;
-        let delta = v - self.mean;
-        self.mean += delta / self.count as f64;
-        self.m2 += delta * (v - self.mean);
-        self.min = self.min.min(v);
-        self.max = self.max.max(v);
-        self.sum += v;
-    }
-
-    fn stats(&self) -> Option<RoiStats> {
-        (self.count > 0).then(|| RoiStats {
-            count: self.count,
-            min: self.min,
-            max: self.max,
-            mean: self.mean,
-            sigma: (self.m2 / self.count as f64).sqrt(),
-            sum: self.sum,
-        })
-    }
-}
-
 /// The finite min and max of `rect`, for sizing a `mono_f32` histogram.
 pub fn finite_range(pixels: &[F32<LE>], frame_width: usize, rect: Rect) -> Option<(f32, f32)> {
     let frame_height = pixels.len().checked_div(frame_width).unwrap_or(0);
@@ -410,63 +314,6 @@ mod tests {
         assert_eq!((clipped.count(), clipped.bins()[9]), (4, 2));
         let outside = Histogram::of_u8(&pixels, 4, Rect::new(7, 7, 2, 2));
         assert_eq!(outside.count(), 0);
-    }
-
-    fn mono(
-        prim: metor_proto::types::PrimType,
-        format: metor_proto_wkt::ImageFormat,
-        w: usize,
-        h: usize,
-    ) -> FrameLayout {
-        FrameLayout::from_component(
-            &metor_db::ComponentSchema::new(prim, &[h, w][..]),
-            &metor_proto_wkt::ComponentMetadata::from("cam")
-                .with_image(format, format.element().size() as u8 * 8),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn roi_stats_match_hand_values() {
-        use metor_proto::types::PrimType;
-        use metor_proto_wkt::ImageFormat;
-        #[rustfmt::skip]
-        let pixels = u16s(&[
-            1, 2, 3,
-            4, 5, 6,
-        ]);
-        let layout = mono(PrimType::U16, ImageFormat::Mono16, 3, 2);
-        let all = roi_stats(Pixels::U16(&pixels), &layout, Rect::new(0, 0, 3, 2)).unwrap();
-        assert_eq!((all.count, all.min, all.max, all.sum), (6, 1.0, 6.0, 21.0));
-        assert_eq!(all.mean, 3.5);
-        assert!((all.sigma - (35.0f64 / 12.0).sqrt()).abs() < 1e-12);
-        let right = roi_stats(Pixels::U16(&pixels), &layout, Rect::new(1, 0, 2, 2)).unwrap();
-        assert_eq!(
-            (right.count, right.min, right.max, right.mean),
-            (4, 2.0, 6.0, 4.0)
-        );
-    }
-
-    #[test]
-    fn roi_stats_clamp_to_the_frame() {
-        use metor_proto::types::PrimType;
-        use metor_proto_wkt::ImageFormat;
-        let pixels: Vec<u8> = (0..16).collect();
-        let layout = mono(PrimType::U8, ImageFormat::Mono8, 4, 4);
-        let partial = roi_stats(Pixels::U8(&pixels), &layout, Rect::new(3, 3, 10, 10)).unwrap();
-        assert_eq!((partial.count, partial.sum), (1, 15.0));
-        assert_eq!(
-            roi_stats(Pixels::U8(&pixels), &layout, Rect::new(9, 9, 2, 2)),
-            None
-        );
-        assert_eq!(
-            roi_stats(Pixels::U8(&pixels), &layout, Rect::new(0, 0, 0, 4)),
-            None
-        );
-        let floats = f32s(&[f32::NAN, 2.0, 4.0, f32::INFINITY]);
-        let layout = mono(PrimType::F32, ImageFormat::MonoF32, 2, 2);
-        let stats = roi_stats(Pixels::F32(&floats), &layout, Rect::new(0, 0, 2, 2)).unwrap();
-        assert_eq!((stats.count, stats.mean), (2, 3.0));
     }
 
     #[test]

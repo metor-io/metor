@@ -11,7 +11,7 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 
-use super::histogram::{Histogram, RoiStats};
+use super::histogram::Histogram;
 use super::layout::FrameLayout;
 use super::lut::{Display, Levels, Lut};
 use super::overlay::{self, Overlay, OverlayColor, OverlayConfig, Points};
@@ -52,9 +52,6 @@ pub struct ImageViewConfig {
     /// `None` until set: a fresh view takes the producer's hints.
     pub display: Option<Display>,
     pub view: ViewMode,
-    /// The source region auto levels and the statistics use; `None` is the
-    /// visible area.
-    pub roi: Option<Rect>,
     /// Shows the histogram strip under the image as well as in the
     /// inspector. Layouts from before the inspector histogram saved this as
     /// `histogram`, always on by default, so that key is ignored.
@@ -70,7 +67,6 @@ impl Default for ImageViewConfig {
             component: String::new(),
             display: None,
             view: ViewMode::Fit,
-            roi: None,
             histogram_overlay: false,
             crosshair: false,
             overlays: Vec::new(),
@@ -101,8 +97,6 @@ pub struct ImageView {
     db: Arc<DB>,
     #[facet(opaque)]
     view: ViewMode,
-    #[facet(opaque)]
-    roi: Option<Rect>,
     /// Whether `display` is settled: set by the config, or by the
     /// producer's hints on the first frame.
     #[facet(opaque)]
@@ -168,15 +162,6 @@ pub struct ImageView {
     /// The strip under the image, while the overlay is on.
     #[facet(opaque)]
     overlay_strip: Option<Entity<HistogramStrip>>,
-    /// The source point a ROI drag started at, and the rectangle so far.
-    #[facet(opaque)]
-    roi_drag: Option<((f64, f64), Rect)>,
-    /// Statistics of the ROI over the painted frame.
-    #[facet(opaque)]
-    roi_stats: Option<RoiStats>,
-    /// A short note for the info chip, such as a dropped ROI.
-    #[facet(opaque)]
-    note: Option<SharedString>,
     #[facet(opaque)]
     _observe: Option<Subscription>,
     #[facet(opaque)]
@@ -193,7 +178,6 @@ impl ImageView {
             histogram_overlay: cfg.histogram_overlay,
             crosshair: cfg.crosshair,
             view: view_mode,
-            roi: cfg.roi,
             settled: cfg.display.is_some(),
             bound: None,
             frames_source: None,
@@ -220,9 +204,6 @@ impl ImageView {
             histogram_data: None,
             strips: Vec::new(),
             overlay_strip: None,
-            roi_drag: None,
-            roi_stats: None,
-            note: None,
             _observe: None,
             _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
@@ -249,19 +230,6 @@ impl ImageView {
         self.overlays.clear();
         self._overlay_changes.clear();
         cx.notify();
-    }
-
-    /// Sets or clears the region of interest, in source pixels.
-    pub fn set_roi(&mut self, roi: Option<Rect>, cx: &mut Context<Self>) {
-        self.roi = roi.filter(|r| !r.is_empty());
-        self.roi_stats = None;
-        self.note = None;
-        cx.notify();
-    }
-
-    /// Statistics of the ROI over the painted frame.
-    pub fn roi_stats(&self) -> Option<RoiStats> {
-        self.roi_stats.filter(|_| self.roi.is_some())
     }
 
     /// A view over a fixed source, for tests and previews.
@@ -297,7 +265,6 @@ impl ImageView {
             component: self.source.text(&self.db),
             display: self.settled.then_some(display),
             view: self.view,
-            roi: self.roi,
             histogram_overlay: self.histogram_overlay,
             crosshair: self.crosshair,
             overlays: self.overlays.iter().map(|o| o.config.clone()).collect(),
@@ -387,7 +354,6 @@ impl ImageView {
         let viewport = self.viewport(&frame.layout);
         let display = self.effective_display();
         let mut key = RenderKey::new(&frame, display, viewport, out, saturated(cx));
-        key.roi = self.roi;
         key.histogram = self.wants_histogram();
         if let Some(started) = self.scheduler.request(key, frame) {
             let job = self.job(started);
@@ -554,15 +520,7 @@ impl ImageView {
         cx: &mut Context<Self>,
     ) {
         self.focus.focus(window, cx);
-        self.roi_drag = None;
         cx.notify();
-        if event.modifiers.shift {
-            self.drag = None;
-            self.roi_drag = self
-                .source_point(event.position)
-                .map(|start| (start, Rect::default()));
-            return;
-        }
         if event.click_count == 2 {
             self.drag = None;
             self.toggle_fit(cx);
@@ -579,20 +537,15 @@ impl ImageView {
     }
 
     fn is_dragging(&self) -> bool {
-        self.drag.is_some() || self.roi_drag.is_some()
+        self.drag.is_some()
     }
 
-    /// A move during a pan, ROI or handle drag, wherever the cursor is.
+    /// A move during a pan, wherever the cursor is.
     fn on_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if !event.dragging() {
             return;
         }
-        if let Some((start, _)) = self.roi_drag {
-            if let Some(rect) = self.roi_rect(start, event.position) {
-                self.roi_drag = Some((start, rect));
-            }
-            cx.notify();
-        } else if let Some((start, viewport)) = self.drag {
+        if let Some((start, viewport)) = self.drag {
             let scale = f64::from(self.scale);
             let delta = (
                 f64::from(event.position.x - start.x) * scale,
@@ -605,10 +558,6 @@ impl ImageView {
     /// The release that ends any drag, wherever the cursor is.
     fn on_drag_end(&mut self, cx: &mut Context<Self>) {
         self.drag = None;
-        if let Some((_, rect)) = self.roi_drag.take() {
-            // A shift-click without a drag clears the ROI.
-            self.set_roi(Some(rect), cx);
-        }
         cx.notify();
     }
 
@@ -630,27 +579,6 @@ impl ImageView {
                 let _ = this.update(cx, |view, cx| view.on_drag_end(cx));
             }
         });
-    }
-
-    /// The source point under a window position.
-    fn source_point(&self, position: Point<Pixels>) -> Option<(f64, f64)> {
-        let (viewport, _) = self.current_viewport()?;
-        Some(viewport.to_source(self.device(position)))
-    }
-
-    /// The whole source pixels between a drag's start and `position`,
-    /// clipped to the frame.
-    fn roi_rect(&self, start: (f64, f64), position: Point<Pixels>) -> Option<Rect> {
-        let (_, (w, h)) = self.current_viewport()?;
-        let end = self.source_point(position)?;
-        let span = |a: f64, b: f64, limit: usize| {
-            let lo = a.min(b).floor().clamp(0.0, limit as f64) as usize;
-            let hi = a.max(b).ceil().clamp(0.0, limit as f64) as usize;
-            (lo, hi - lo)
-        };
-        let (x, width) = span(start.0, end.0, w);
-        let (y, height) = span(start.1, end.1, h);
-        Some(Rect::new(x, y, width, height))
     }
 
     /// The window position of a source point.
@@ -715,7 +643,7 @@ impl ImageView {
             .collect()
     }
 
-    /// Paints the ROI outline, the overlays and the crosshair.
+    /// Paints the overlays and the crosshair.
     fn paint_annotations(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &gpui::App) {
         let Some(frame) = self.frame() else {
             return;
@@ -723,15 +651,6 @@ impl ImageView {
         let theme = theme(cx);
         let viewport = self.viewport(&frame.layout);
         let to_window = |u: f64, v: f64| self.window_point(&viewport, (u, v));
-        if let Some(rect) = self.roi_drag.map(|(_, r)| r).or(self.roi) {
-            let a = to_window(rect.x as f64, rect.y as f64);
-            let b = to_window((rect.x + rect.width) as f64, (rect.y + rect.height) as f64);
-            window.paint_quad(gpui::outline(
-                Bounds::from_corners(a, b),
-                theme.image_crosshair(),
-                gpui::BorderStyle::Solid,
-            ));
-        }
         for (config, points, out_of_step) in self.overlay_points(cx) {
             let color = Self::overlay_color(config.color, &theme);
             overlay::paint(
@@ -796,7 +715,6 @@ impl ImageView {
     /// histogram, and the view commands.
     fn open_menu(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.drag = None;
-        self.roi_drag = None;
         window.dispatch_action(
             Box::new(crate::inspector::InspectEntity {
                 entity: cx.entity().into_any(),
@@ -838,19 +756,9 @@ impl ImageView {
         )
     }
 
-    /// ROI statistics and overlay errors, top left.
+    /// Overlay errors, top left.
     fn info_chip(&self, cx: &gpui::App) -> Option<impl IntoElement> {
-        let mut lines = self.overlay_errors(cx);
-        lines.extend(self.note.as_ref().map(|note| note.to_string()));
-        if let (Some(roi), Some(stats)) = (self.roi, self.roi_stats()) {
-            lines.insert(
-                0,
-                format!(
-                    "ROI {}×{}  min {}  max {}  mean {:.2} ± {:.2}  sum {}",
-                    roi.width, roi.height, stats.min, stats.max, stats.mean, stats.sigma, stats.sum
-                ),
-            );
-        }
+        let lines = self.overlay_errors(cx);
         if lines.is_empty() {
             return None;
         }
@@ -893,11 +801,6 @@ impl ImageView {
         if install {
             self.levels = Some(rendered.levels);
             self.histogram_data = rendered.histogram;
-            self.roi_stats = rendered.roi_stats;
-            if rendered.roi_outside && rendered.key.roi == self.roi {
-                self.roi = None;
-                self.note = Some("ROI outside this image; cleared".into());
-            }
             self.render_error = rendered.error;
             self.frames.install(rendered.image);
             cx.notify();
@@ -2324,64 +2227,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn shift_drag_sets_a_roi_with_statistics(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
-        let (a, b) = vcx.update(|_, cx| {
-            let view = view.read(cx);
-            let (viewport, _) = view.current_viewport().unwrap();
-            (
-                view.window_point(&viewport, (2.2, 1.2)),
-                view.window_point(&viewport, (4.8, 2.8)),
-            )
-        });
-        let shift = gpui::Modifiers::shift();
-        vcx.simulate_mouse_down(a, MouseButton::Left, shift);
-        vcx.simulate_mouse_move(b, MouseButton::Left, shift);
-        vcx.simulate_mouse_up(b, MouseButton::Left, shift);
-        draw(vcx);
-        let (roi, stats) = vcx.update(|_, cx| {
-            let view = view.read(cx);
-            (view.roi, view.roi_stats())
-        });
-        assert_eq!(roi, Some(Rect::new(2, 1, 3, 2)));
-        // Pixels (2..5, 1..3) of x + 8y: 10..12 and 18..20.
-        let stats = stats.expect("statistics");
-        assert_eq!(
-            (stats.count, stats.min, stats.max, stats.sum),
-            (6, 10.0, 20.0, 90.0)
-        );
-        vcx.update(|_, cx| view.update(cx, |view, cx| view.set_roi(None, cx)));
-        draw(vcx);
-        assert_eq!(vcx.update(|_, cx| view.read(cx).roi_stats()), None);
-    }
-
-    #[gpui::test]
-    fn a_roi_drag_released_outside_the_view_ends(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
-        let (a, b) = vcx.update(|_, cx| {
-            let view = view.read(cx);
-            let (viewport, _) = view.current_viewport().unwrap();
-            (
-                view.window_point(&viewport, (1.2, 1.2)),
-                view.window_point(&viewport, (3.8, 3.8)),
-            )
-        });
-        let shift = gpui::Modifiers::shift();
-        vcx.simulate_mouse_down(a, MouseButton::Left, shift);
-        vcx.simulate_mouse_move(b, MouseButton::Left, shift);
-        let outside = point(px(-40.0), px(-40.0));
-        vcx.simulate_mouse_move(outside, MouseButton::Left, shift);
-        vcx.simulate_mouse_up(outside, MouseButton::Left, shift);
-        draw(vcx);
-        let (roi, dragging) = vcx.update(|_, cx| {
-            let view = view.read(cx);
-            (view.roi, view.is_dragging())
-        });
-        assert!(!dragging);
-        assert_eq!(roi.map(|r| (r.x, r.y)), Some((0, 0)));
-    }
-
-    #[gpui::test]
     fn a_handle_drag_released_over_the_image_ends(cx: &mut gpui::TestAppContext) {
         let (_temp, view, vcx) = ramp_view(cx);
         let strip = show_overlay(&view, vcx);
@@ -2425,44 +2270,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_plain_press_cancels_a_roi_drag(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
-        let a = vcx.update(|_, cx| {
-            let view = view.read(cx);
-            let (viewport, _) = view.current_viewport().unwrap();
-            view.window_point(&viewport, (2.0, 2.0))
-        });
-        vcx.update(|_, cx| {
-            view.update(cx, |view, _| {
-                view.roi_drag = Some(((1.0, 1.0), Rect::new(1, 1, 2, 2)))
-            })
-        });
-        vcx.simulate_mouse_down(a, MouseButton::Left, gpui::Modifiers::none());
-        vcx.simulate_mouse_up(a, MouseButton::Left, gpui::Modifiers::none());
-        draw(vcx);
-        assert_eq!(vcx.update(|_, cx| view.read(cx).roi), None);
-    }
-
-    #[gpui::test]
-    fn a_roi_outside_a_new_frame_is_dropped(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.set_roi(Some(Rect::new(20, 20, 4, 4)), cx)
-            })
-        });
-        draw(vcx);
-        draw(vcx);
-        let (roi, note, levels) = vcx.update(|_, cx| {
-            let view = view.read(cx);
-            (view.roi, view.note.clone(), view.levels())
-        });
-        assert_eq!(roi, None);
-        assert!(note.is_some());
-        assert_eq!(levels, Some((0.0, 63.0)));
-    }
-
-    #[gpui::test]
     fn an_overlay_with_fields_from_different_times_is_out_of_step(cx: &mut gpui::TestAppContext) {
         let (_temp, view, vcx) = truth_view(&[(10, 1.5)], cx);
         seek_to(10, vcx);
@@ -2487,7 +2294,6 @@ mod tests {
             component: "cam.pixels".into(),
             display: Some(Display::default()),
             view: ViewMode::Fit,
-            roi: Some(Rect::new(1, 2, 3, 4)),
             histogram_overlay: true,
             crosshair: true,
             overlays: vec![OverlayConfig::from_root(

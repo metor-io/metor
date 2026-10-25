@@ -10,7 +10,7 @@ use metor_proto_wkt::Stretch;
 use smallvec::SmallVec;
 
 use super::color::{ChannelLut, color_input, is_color, render_color, render_mosaic};
-use super::histogram::{Histogram, RoiStats, finite_range, roi_stats};
+use super::histogram::{Histogram, finite_range};
 use super::layout::{FrameLayout, Pixels};
 use super::lut::{Colormap, Curve, Display, F32_BITS, Levels, Lut};
 use super::resample::{Plane, Rect, RenderError, Scratch, Viewport, render_into};
@@ -31,7 +31,6 @@ pub struct RenderKey {
     pub bytes: usize,
     pub display: Display,
     pub viewport: Viewport,
-    pub roi: Option<Rect>,
     /// Whether the histogram strip wants this frame's histogram.
     pub histogram: bool,
     /// Device pixels of the whole output.
@@ -53,7 +52,6 @@ impl RenderKey {
             bytes: frame.bytes.as_ptr() as usize,
             display,
             viewport,
-            roi: None,
             histogram: false,
             out,
             saturated,
@@ -270,10 +268,6 @@ pub struct Rendered {
     /// Of the region auto levels use; `None` when neither auto levels nor
     /// the strip asked for it.
     pub histogram: Option<Arc<Histogram>>,
-    /// Statistics of the ROI, when one is set and inside the frame.
-    pub roi_stats: Option<RoiStats>,
-    /// The ROI fell outside this frame and was ignored.
-    pub roi_outside: bool,
     pub scratch: Scratch,
     pub lut: Option<(LutKey, Arc<Lut>)>,
 }
@@ -296,8 +290,6 @@ pub fn run(job: Job) -> Rendered {
                 error: Some(RenderError::Layout(err)),
                 levels: (0.0, 0.0),
                 histogram: None,
-                roi_stats: None,
-                roi_outside: false,
                 scratch,
                 lut,
             };
@@ -306,13 +298,7 @@ pub fn run(job: Job) -> Rendered {
     let out = key
         .viewport
         .visible(layout.width, layout.height, key.out.0, key.out.1);
-    let roi = key
-        .roi
-        .map(|r| r.clip(layout.width, layout.height))
-        .filter(|r| !r.is_empty());
-    let roi_outside = key.roi.is_some() && roi.is_none();
-    let roi_stats = roi.and_then(|r| roi_stats(pixels, &layout, r));
-    let region = roi.unwrap_or_else(|| source_rect(&key.viewport, out, &layout));
+    let region = source_rect(&key.viewport, out, &layout);
     let hist = (key.histogram || !matches!(key.display.levels, Levels::Manual { .. }))
         .then(|| Arc::new(histogram(pixels, &layout, region)));
     let levels = levels(&key.display, hist.as_deref(), &layout);
@@ -324,8 +310,6 @@ pub fn run(job: Job) -> Rendered {
             error: None,
             levels,
             histogram: hist,
-            roi_stats,
-            roi_outside,
             scratch,
             lut: Some(lut),
         };
@@ -370,8 +354,6 @@ pub fn run(job: Job) -> Rendered {
         error,
         levels,
         histogram: hist,
-        roi_stats,
-        roi_outside,
         scratch,
         lut: Some(lut),
     }
@@ -530,7 +512,6 @@ mod tests {
                 origin: (0.0, 0.0),
                 step: 1.0,
             },
-            roi: None,
             histogram: false,
             out: (10, 10),
             saturated: [0; 4],
@@ -615,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_levels_follow_the_view_and_the_roi() {
+    fn auto_levels_follow_the_view() {
         let f = frame(64, 32, |x, _| if x < 32 { 100 } else { 4000 });
         let layout = f.layout;
         let pixels = layout.pixels(&f.bytes).unwrap();
@@ -882,36 +863,5 @@ mod tests {
         // Seven eighths of the samples sit at 10, so 10 paints bright.
         let [_, _, r, _] = painted(&rendered, 0, 0);
         assert!(r > 200, "{r}");
-    }
-
-    #[test]
-    fn a_job_reports_roi_statistics_or_drops_an_outside_roi() {
-        let f = frame(4, 4, |x, y| (x + 4 * y) as u16);
-        let mut key = RenderKey::new(
-            &f,
-            Display::default(),
-            fit(&f.layout, (8, 8)),
-            (8, 8),
-            [0; 4],
-        );
-        key.roi = Some(Rect::new(2, 2, 2, 2));
-        let job = |key: RenderKey| {
-            run(Job {
-                key,
-                frame: f.clone(),
-                scratch: Scratch::default(),
-                lut: None,
-            })
-        };
-        let inside = job(key.clone());
-        let stats = inside.roi_stats.expect("statistics");
-        assert_eq!((stats.count, stats.min, stats.max), (4, 10.0, 15.0));
-        assert_eq!(inside.levels, (10.0, 15.0));
-        assert!(!inside.roi_outside);
-        key.roi = Some(Rect::new(9, 9, 2, 2));
-        let outside = job(key);
-        assert!(outside.roi_outside);
-        assert_eq!(outside.roi_stats, None);
-        assert_eq!(outside.levels, (0.0, 15.0));
     }
 }

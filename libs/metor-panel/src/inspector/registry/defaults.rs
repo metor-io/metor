@@ -513,11 +513,10 @@ impl InspectorRegistry {
             let commands: [(
                 &'static str,
                 fn(&mut ImageView, &mut gpui::Context<ImageView>),
-            ); 5] = [
+            ); 4] = [
                 ("Fit (F)", ImageView::fit),
                 ("1:1 (1)", ImageView::one_to_one),
                 ("Reset to metadata (R)", ImageView::reset_to_metadata),
-                ("Clear ROI", |view, cx| view.set_roi(None, cx)),
                 ("Clear overlays", ImageView::clear_overlays),
             ];
             for (label, command) in commands {
