@@ -140,7 +140,7 @@ impl Pyramid {
         let hand = dot(bi, cross(bj, bk)) > 0.0;
         let mut found = None;
         for p in &db.pairs()[rij] {
-            for (a, b) in [(p.a.get(), p.b.get()), (p.b.get(), p.a.get())] {
+            for (a, b) in [(p.a, p.b), (p.b, p.a)] {
                 let (ra, rb) = (vec_of(db, a), vec_of(db, b));
                 let mut e = self.head_of(a);
                 while e != END {
@@ -184,7 +184,7 @@ impl Pyramid {
             let mut hit = None;
             let mut unique = true;
             for p in &db.pairs()[range] {
-                let other = match (p.a.get(), p.b.get()) {
+                let other = match (p.a, p.b) {
                     (a, b) if a == tri[0] => b,
                     (a, b) if b == tri[0] => a,
                     _ => continue,
@@ -257,7 +257,7 @@ impl Pyramid {
         self.partner.clear();
         self.next.clear();
         for p in &db.pairs()[range] {
-            for (a, b) in [(p.a.get(), p.b.get()), (p.b.get(), p.a.get())] {
+            for (a, b) in [(p.a, p.b), (p.b, p.a)] {
                 let head = self.head_of(a);
                 self.partner.push(b);
                 self.next.push(head);

@@ -1,18 +1,13 @@
-//! Writes a DB from a star list. Build time only: it allocates, and its pair
-//! search is `O(N²)`.
+//! Builds a [`Db`] from a star list, or from the render catalog the way the
+//! tracker loads it at startup. Allocates; the pair search is `O(N²)`.
 
 use alloc::vec::Vec;
 
-use zerocopy::IntoBytes;
-use zerocopy::little_endian::{F32, F64, I16, U16, U32};
-
 use super::cells::cell_of;
-use super::format::{
-    ALIGN, CELLS, HEADER_LEN, Header, KVECTOR, MAGIC, MAX_STARS, PAIRS, Pair, RESERVED, STARS,
-    Section, Star, VERSION, crc_of,
-};
+use super::db::{Db, MAX_STARS, Pair, Star};
 use super::kvector;
-use crate::geom::{V3, cross, dot, norm};
+use crate::geom::{V3, add, cross, dot, norm, normalize, scale};
+use crate::starcat::StarCat;
 
 /// A star going into the DB.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -27,8 +22,6 @@ pub struct CatStar {
 pub struct BuildConfig {
     /// The largest pair separation to store (rad), the field's diagonal.
     pub fov_max_rad: f64,
-    pub mag_limit: f64,
-    pub epoch_jy: f64,
     /// Cells per cube-face edge.
     pub face_n: u32,
 }
@@ -37,7 +30,7 @@ pub struct BuildConfig {
 pub enum BuildError {
     /// More than [`MAX_STARS`] stars.
     TooManyStars,
-    /// More pairs than a `u32` counts, or a DB past 4 GiB.
+    /// More pairs than a `u32` counts.
     TooManyPairs,
     /// `face_n` outside `1..=MAX_FACE_N`.
     FaceN,
@@ -46,107 +39,87 @@ pub enum BuildError {
 /// The most cells per face edge; `6·n²` cells must fit a `u32` with room.
 pub const MAX_FACE_N: u32 = 1024;
 
+/// The onboard DB's selection from the render catalog.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Select {
+    pub n_stars: usize,
+    /// The largest pair separation stored (deg).
+    pub fov_deg: f64,
+    pub face_n: u32,
+    /// Stars closer than this (px) blend into one image and are merged.
+    pub merge_px: f64,
+    /// One pixel's angle (rad).
+    pub px_rad: f64,
+}
+
+impl Default for Select {
+    /// 2000 stars for the example's 20°, 5.5 µm / 16 mm tracker.
+    fn default() -> Select {
+        Select {
+            n_stars: 2000,
+            fov_deg: 20.0,
+            face_n: 8,
+            merge_px: 2.5,
+            px_rad: 5.5e-6 / 16e-3,
+        }
+    }
+}
+
 /// The angle between two unit vectors, accurate at small separations.
 pub fn separation(a: V3, b: V3) -> f64 {
     libm::atan2(norm(cross(a, b)), dot(a, b))
 }
 
-/// Writes the DB for `stars`, sorted by cell then Hipparcos number.
-pub fn build(stars: &[CatStar], cfg: &BuildConfig) -> Result<Vec<u8>, BuildError> {
-    if stars.len() > MAX_STARS as usize {
-        return Err(BuildError::TooManyStars);
-    }
-    let n = cfg.face_n;
-    if !(1..=MAX_FACE_N).contains(&n) {
-        return Err(BuildError::FaceN);
-    }
-    // Bin the stored f32 vector, not the f64 input, so a star near a cell
-    // edge sits in the cell the onboard `cell_of` gives it.
-    let mut sorted: Vec<(u32, Star)> = stars
-        .iter()
-        .map(|s| {
-            let row = to_row(s);
-            (cell_of(row.vector(), n), row)
+impl Db {
+    /// The DB of `stars`, sorted by cell then Hipparcos number.
+    pub fn build(stars: &[CatStar], cfg: &BuildConfig) -> Result<Db, BuildError> {
+        if stars.len() > MAX_STARS {
+            return Err(BuildError::TooManyStars);
+        }
+        let n = cfg.face_n;
+        if !(1..=MAX_FACE_N).contains(&n) {
+            return Err(BuildError::FaceN);
+        }
+        // Bin the stored f32 vector, not the f64 input, so a star near a cell
+        // edge sits in the cell `cell_of` gives it.
+        let mut sorted: Vec<(u32, Star)> = stars
+            .iter()
+            .map(|s| {
+                let row = Star {
+                    r: s.r.map(|x| x as f32),
+                    mag: s.mag as f32,
+                    hip: s.hip,
+                };
+                (cell_of(row.vector(), n), row)
+            })
+            .collect();
+        sorted.sort_by_key(|(cell, s)| (*cell, s.hip));
+        let n_cells = 6 * n * n;
+        let mut cells = Vec::with_capacity(n_cells as usize + 1);
+        cells.extend((0..=n_cells).map(|c| sorted.partition_point(|s| s.0 < c) as u32));
+        let stars: Vec<Star> = sorted.into_iter().map(|(_, s)| s).collect();
+        let pairs = pairs_within(&stars, cfg.fov_max_rad);
+        u32::try_from(pairs.len()).map_err(|_| BuildError::TooManyPairs)?;
+        let thetas: Vec<f32> = pairs.iter().map(|p| p.theta).collect();
+        let (k, line) = kvector::build(&thetas);
+        Ok(Db {
+            stars,
+            cells,
+            pairs,
+            k,
+            line,
+            face_n: n,
         })
-        .collect();
-    sorted.sort_by_key(|(cell, s)| (*cell, s.hip.get()));
-    let cells = cell_offsets(&sorted, 6 * n * n);
-    let rows: Vec<Star> = sorted.into_iter().map(|(_, s)| s).collect();
-    let pairs = pairs_within(&rows, cfg.fov_max_rad);
-    let n_pairs = u32::try_from(pairs.len()).map_err(|_| BuildError::TooManyPairs)?;
-    let thetas: Vec<f32> = pairs.iter().map(|p| p.theta.get()).collect();
-    let (k, line) = kvector::build(&thetas);
-    let k: Vec<U32> = k.into_iter().map(U32::new).collect();
-    let mut header = Header {
-        magic: MAGIC,
-        version: U32::new(VERSION),
-        flags: U32::new(0),
-        epoch_jy: F64::new(cfg.epoch_jy),
-        mag_limit: F32::new(cfg.mag_limit as f32),
-        fov_max_rad: F32::new(cfg.fov_max_rad as f32),
-        n_stars: U32::new(rows.len() as u32),
-        n_pairs: U32::new(n_pairs),
-        n_cells: U32::new(6 * n * n),
-        face_n: U32::new(n),
-        km: F64::new(line.m),
-        kq: F64::new(line.q),
-        sections: [Section {
-            offset: U32::new(0),
-            len: U32::new(0),
-        }; 5],
-        crc32: U32::new(0),
-        _pad: [0; 4],
-    };
-    let mut body = Vec::new();
-    let parts: [(usize, &[u8]); 5] = [
-        (STARS, rows.as_bytes()),
-        (CELLS, cells.as_bytes()),
-        (PAIRS, pairs.as_bytes()),
-        (KVECTOR, k.as_bytes()),
-        (RESERVED, &[]),
-    ];
-    for (i, bytes) in parts {
-        while !(HEADER_LEN + body.len()).is_multiple_of(ALIGN) {
-            body.push(0);
-        }
-        header.sections[i] = Section {
-            offset: U32::new((HEADER_LEN + body.len()) as u32),
-            len: U32::new(bytes.len() as u32),
+    }
+
+    /// The onboard DB from the render catalog: its [`select`]ed stars.
+    pub fn from_starcat(cat: &StarCat, opts: &Select) -> Result<Db, BuildError> {
+        let cfg = BuildConfig {
+            fov_max_rad: opts.fov_deg.to_radians(),
+            face_n: opts.face_n,
         };
-        body.extend_from_slice(bytes);
+        Db::build(&select(cat, opts), &cfg)
     }
-    if u32::try_from(HEADER_LEN + body.len()).is_err() {
-        return Err(BuildError::TooManyPairs);
-    }
-    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
-    out.extend_from_slice(header.as_bytes());
-    out.extend_from_slice(&body);
-    let crc = crc_of(&out).unwrap_or(0);
-    header.crc32 = U32::new(crc);
-    out[..HEADER_LEN].copy_from_slice(header.as_bytes());
-    Ok(out)
-}
-
-fn to_row(s: &CatStar) -> Star {
-    Star {
-        r: s.r.map(|x| F32::new(x as f32)),
-        mag_centi: I16::new(libm::round(s.mag * 100.0).clamp(-32768.0, 32767.0) as i16),
-        _pad: U16::new(0),
-        hip: U32::new(s.hip),
-    }
-}
-
-/// `n_cells + 1` offsets of each cell's first star in cell-sorted `stars`.
-fn cell_offsets(stars: &[(u32, Star)], n_cells: u32) -> Vec<U32> {
-    let mut offsets = Vec::with_capacity(n_cells as usize + 1);
-    let mut row = 0usize;
-    for c in 0..=n_cells {
-        while row < stars.len() && stars[row].0 < c {
-            row += 1;
-        }
-        offsets.push(U32::new(row as u32));
-    }
-    offsets
 }
 
 /// Every pair of rows closer than `max` (rad), sorted by θ then rows.
@@ -161,19 +134,97 @@ fn pairs_within(rows: &[Star], max: f64) -> Vec<Pair> {
             }
             let theta = separation(*ra, *rb);
             if theta < max {
-                pairs.push(Pair {
-                    theta: F32::new(theta as f32),
-                    a: U16::new(a as u16),
-                    b: U16::new(b as u16),
-                });
+                let (theta, a, b) = (theta as f32, a as u16, b as u16);
+                pairs.push(Pair { theta, a, b });
             }
         }
     }
     pairs.sort_by(|x, y| {
         x.theta
-            .get()
-            .total_cmp(&y.theta.get())
-            .then((x.a.get(), x.b.get()).cmp(&(y.a.get(), y.b.get())))
+            .total_cmp(&y.theta)
+            .then((x.a, x.b).cmp(&(y.a, y.b)))
     });
     pairs
+}
+
+/// The HIP stars of `cat` (the simulator's truth names stars by HIP), each
+/// merged with the stars it blends with, uniform over the DB's cells: every
+/// cell gets its brightest star before any gets its second, until `n_stars`
+/// are taken.
+/// HIP star `row` merged with every star within `cos_r` of it in `cells`
+/// into one flux-weighted star, or `None` when a brighter HIP star is that
+/// close and carries the merge. `units` are every star's unit vector.
+fn merge(
+    cat: &StarCat,
+    units: &[V3],
+    row: usize,
+    cos_r: f64,
+    cells: impl Iterator<Item = u32>,
+) -> Option<CatStar> {
+    let hip = cat.hip(row as u32)?;
+    let (r0, g0) = (units[row], cat.all_stars()[row].g());
+    let (mut sum, mut flux) = ([0.0; 3], 0.0);
+    for cell in cells {
+        let rows = cat.cells()[cell as usize].rows();
+        for (other, s) in rows.zip(cat.stars(cell)) {
+            let r = units[other];
+            if dot(r, r0) < cos_r {
+                continue;
+            }
+            let other_hip = cat.hip(other as u32);
+            if other != row && other_hip.is_some() && (s.g(), other_hip) < (g0, Some(hip)) {
+                return None;
+            }
+            let w = libm::pow(10.0, -0.4 * f64::from(s.g()));
+            sum = add(sum, scale(r, w));
+            flux += w;
+        }
+    }
+    Some(CatStar {
+        r: normalize(sum).unwrap_or(r0),
+        mag: -2.5 * libm::log10(flux),
+        hip,
+    })
+}
+
+pub fn select(cat: &StarCat, opts: &Select) -> Vec<CatStar> {
+    let radius = opts.merge_px * opts.px_rad;
+    let cells = cat.cells();
+    let units: Vec<V3> = cat.all_stars().iter().map(|s| s.unit()).collect();
+    let centres: Vec<V3> = cells.iter().map(|c| c.centre()).collect();
+    let widest = cells.iter().map(|c| c.radius()).fold(0.0, f64::max);
+    let cos_reach = libm::cos(widest + radius);
+    let mut near = Vec::new();
+    let mut all: Vec<(u32, CatStar)> = Vec::new();
+    for (cell, centre) in cells.iter().zip(&centres) {
+        // The cells a star within `radius` of one in `cell` may be in.
+        let cos_gap = libm::cos((cell.radius() + widest + radius).min(core::f64::consts::PI));
+        near.clear();
+        near.extend(
+            (0u32..)
+                .zip(&centres)
+                .filter(|(_, o)| dot(*centre, **o) >= cos_gap),
+        );
+        for row in cell.rows() {
+            let reach = near
+                .iter()
+                .filter(|(_, o)| dot(units[row], **o) >= cos_reach);
+            let cells = reach.map(|(c, _)| *c);
+            if let Some(star) = merge(cat, &units, row, libm::cos(radius), cells) {
+                all.push((cell_of(star.r, opts.face_n), star));
+            }
+        }
+    }
+    let order = |a: &CatStar, b: &CatStar| a.mag.total_cmp(&b.mag).then(a.hip.cmp(&b.hip));
+    all.sort_by(|a, b| a.0.cmp(&b.0).then(order(&a.1, &b.1)));
+    // Rank within each cell, then take rank by rank.
+    let mut ranked: Vec<(usize, CatStar)> = Vec::with_capacity(all.len());
+    for (i, (cell, star)) in all.iter().enumerate() {
+        let same = i > 0 && all[i - 1].0 == *cell;
+        let rank = ranked.last().filter(|_| same).map_or(0, |r| r.0 + 1);
+        ranked.push((rank, *star));
+    }
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then(order(&a.1, &b.1)));
+    ranked.truncate(opts.n_stars);
+    ranked.into_iter().map(|(_, s)| s).collect()
 }

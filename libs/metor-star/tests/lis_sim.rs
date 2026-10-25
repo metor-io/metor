@@ -1,11 +1,11 @@
 //! The flight pipeline on the simulator's frames: render 1024², 20° frames
 //! of `starcat-g8.bin` on the GPU, extract centroids, identify them against
-//! the onboard DB, track, and score against the renderer's truth.
+//! the onboard DB built from the same catalog, track, and score against the renderer's truth.
 //!
 //! `cargo test --release -p metor-star --test lis_sim -- --nocapture` prints
 //! the rates; `LIS_TRIALS` sets the trials.
 
-use metor_star::catalog::Db;
+use metor_star::catalog::{Db, Select};
 use metor_star::geom::{Quat, V3, dot, inv_sym, mat_vec};
 use metor_star::image::{Extractor, ImageConfig};
 use metor_star::lis::{LisConfig, NO_ROW, Pyramid, Step};
@@ -18,7 +18,6 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
-static DB: &[u8] = include_bytes!("../data/stars-u2000.stdb");
 const SIZE: u32 = 1024;
 const T_EXP: f64 = 0.1;
 
@@ -55,8 +54,12 @@ impl Rig {
     }
 }
 
-fn tracker() -> Tracker<'static> {
-    let db = Db::parse(DB).unwrap();
+fn db() -> Db {
+    Db::from_starcat(&StarCat::parse(STARCAT_G8).unwrap(), &Select::default()).unwrap()
+}
+
+fn tracker() -> Tracker {
+    let db = db();
     let (image, lis) = (ImageConfig::default(), LisConfig::default());
     Tracker::new(db, sim_camera(), image, lis, TrackConfig::default()).unwrap()
 }
@@ -77,7 +80,7 @@ fn pyramid_identifies_simulated_frames() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
-    let db = Db::parse(DB).unwrap();
+    let db = db();
     let cam = sim_camera();
     let mut rig = Rig::new();
     let mut ex = Extractor::new(SIZE, SIZE, ImageConfig::default()).unwrap();

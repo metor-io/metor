@@ -45,7 +45,6 @@ members = [
     "examples/adcs-fsw3/systems/adcs",
     "examples/adcs-fsw3/systems/seqs",
     "examples/adcs-fsw3/systems/startracker-sim",
-    "libs/metor-star/tools/star-db",
     "libs/metor-fsw-3",
     "libs/metor-fsw-3/ring",
     "libs/metor-fsw-3/macros",

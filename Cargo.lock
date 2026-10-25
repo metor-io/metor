@@ -9832,7 +9832,6 @@ dependencies = [
 name = "metor-star"
 version = "0.14.2"
 dependencies = [
- "crc32fast",
  "libm",
  "metor-star",
  "naga 30.0.1",
@@ -13992,14 +13991,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "star-db"
-version = "0.14.2"
-dependencies = [
- "clap 4.6.3",
- "metor-star",
 ]
 
 [[package]]

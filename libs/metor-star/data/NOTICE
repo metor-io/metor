@@ -1,7 +1,7 @@
 Star catalog data in this directory
 ==================================
 
-starcat-g8.bin and stars-u2000.stdb are derived from the catalogs below. The
+starcat-g8.bin is derived from the catalogs below. The
 derived data is NOT covered by this repository's Apache-2.0 licence. It is distributed under the Creative Commons
 Attribution-NonCommercial 3.0 IGO licence (CC BY-NC 3.0 IGO):
 
@@ -14,11 +14,6 @@ https://www.cosmos.esa.int/web/esdc/terms-and-conditions.
 Changes made: positions propagated to epoch J2024.0, magnitudes rounded to
 millimag, Hipparcos V and V-I converted to Gaia G and BP-RP, and the stars
 re-ordered by HEALPix cell.
-
-stars-u2000.stdb, the onboard star-tracker DB, is derived from
-starcat-g8.bin: the 2000 Hipparcos stars left after uniformising over the
-cube-face sky index, and every pair of them closer than 20 degrees. It is
-built by libs/metor-star/tools/star-db.
 
 Attribution
 -----------

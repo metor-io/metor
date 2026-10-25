@@ -16,7 +16,6 @@ gpu = ["sim", "dep:pollster", "dep:wgpu"]
 
 [dependencies]
 libm = "0.2.16"
-crc32fast = { version = "1.5", default-features = false }
 pollster = { version = "0.4", optional = true }
 wgpu = { version = "30", optional = true }
 zerocopy = { version = "0.8", features = ["derive"] }

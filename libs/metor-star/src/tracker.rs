@@ -124,8 +124,8 @@ pub fn lambda_max(m: M3) -> f64 {
 }
 
 #[derive(Debug, Clone)]
-pub struct Tracker<'a> {
-    db: Db<'a>,
+pub struct Tracker {
+    db: Db,
     cam: Camera,
     cfg: TrackConfig,
     extractor: Extractor,
@@ -140,14 +140,14 @@ pub struct Tracker<'a> {
     searching: bool,
 }
 
-impl<'a> Tracker<'a> {
+impl Tracker {
     pub fn new(
-        db: Db<'a>,
+        db: Db,
         cam: Camera,
         image: ImageConfig,
         lis: LisConfig,
         cfg: TrackConfig,
-    ) -> Result<Tracker<'a>, ImageError> {
+    ) -> Result<Tracker, ImageError> {
         let lis = LisConfig {
             sigma_rad: cam.pixel_sigma_to_rad(cfg.sigma_px),
             ..lis
@@ -167,7 +167,7 @@ impl<'a> Tracker<'a> {
         })
     }
 
-    pub fn db(&self) -> &Db<'a> {
+    pub fn db(&self) -> &Db {
         &self.db
     }
 

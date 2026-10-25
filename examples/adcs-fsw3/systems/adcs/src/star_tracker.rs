@@ -11,15 +11,16 @@ use adcs_contracts::{
 };
 use metor_fsw_3::{Input, Output, Timestamp, system};
 use metor_star::camera::{Camera, Intrinsics};
-use metor_star::catalog::Db;
+use metor_star::catalog::{Db, Select};
 use metor_star::geom::{self, M3, Quat, V3};
 use metor_star::image::ImageConfig;
 use metor_star::lis::{LisConfig, Match, NO_ROW};
+use metor_star::starcat::StarCat;
 use metor_star::tracker::{Failure, Mode, Outcome, Prior, TrackConfig, Tracker, predict, sigma_of};
 use nox::{Matrix3, Quaternion, Vector};
 
-/// The committed onboard DB (`star-db build`).
-static DB: &[u8] = include_bytes!("../../../../../libs/metor-star/data/stars-u2000.stdb");
+/// The render catalog the onboard DB is built from at startup.
+static STARCAT: &[u8] = include_bytes!("../../../../../libs/metor-star/data/starcat-g8.bin");
 
 /// The sensor size of `StarImage`.
 const SIZE: u32 = 1024;
@@ -100,7 +101,7 @@ pub struct Frames {
 }
 
 pub struct StarTracker {
-    tracker: Tracker<'static>,
+    tracker: Tracker,
     q_b_st: Quat,
     budget: u32,
     last: Option<Last>,
@@ -131,9 +132,10 @@ impl StarTracker {
             },
             q_b_st,
         };
-        // PANIC Safety: the committed DB parses (metor-star tests it), and a
-        // 1024² sensor with the default image config is valid.
-        let db = Db::parse(DB).expect("the committed star DB parses");
+        // PANIC Safety: the committed catalog parses and builds (metor-star
+        // tests it), and a 1024² sensor with the default image config is valid.
+        let cat = StarCat::parse(STARCAT).expect("the committed catalog parses");
+        let db = Db::from_starcat(&cat, &Select::default()).expect("the onboard DB builds");
         let lis = LisConfig {
             fov_radius_rad: cam.half_diagonal_rad(),
             ..LisConfig::default()
