@@ -400,10 +400,13 @@ impl AddMenu {
             "",
             Box::new(move |_| {
                 let menu = menu.clone();
-                crate::views::image_view::image_picker_rows(menu.db.clone(), move |component, cx| {
-                    let config = crate::views::image_view::image_view_config(component);
-                    (menu.sink)(&WidgetKind::image_view(), config, cx);
-                })
+                crate::views::image_view::image_picker_rows(
+                    menu.db.clone(),
+                    move |component, cx| {
+                        let config = crate::views::image_view::image_view_config(component);
+                        (menu.sink)(&WidgetKind::image_view(), config, cx);
+                    },
+                )
             }),
         ))
     }
