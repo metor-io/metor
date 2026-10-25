@@ -126,10 +126,8 @@ impl StarCentroids {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum StarMode {
-    /// From truth, with no image.
-    Ideal = 0,
-    Lost = 1,
-    Tracking = 2,
+    Lost = 0,
+    Tracking = 1,
 }
 
 impl TryFrom<u8> for StarMode {
@@ -137,9 +135,8 @@ impl TryFrom<u8> for StarMode {
 
     fn try_from(code: u8) -> Result<Self, UnknownCode> {
         match code {
-            0 => Ok(Self::Ideal),
-            1 => Ok(Self::Lost),
-            2 => Ok(Self::Tracking),
+            0 => Ok(Self::Lost),
+            1 => Ok(Self::Tracking),
             _ => Err(UnknownCode(code)),
         }
     }
@@ -231,7 +228,7 @@ mod tests {
 
     #[test]
     fn codes_round_trip() {
-        for mode in [StarMode::Ideal, StarMode::Lost, StarMode::Tracking] {
+        for mode in [StarMode::Lost, StarMode::Tracking] {
             assert_eq!(StarMode::try_from(mode as u8), Ok(mode));
         }
         for status in [
@@ -244,7 +241,7 @@ mod tests {
         ] {
             assert_eq!(StarStatus::try_from(status as u8), Ok(status));
         }
-        assert_eq!(StarMode::try_from(3), Err(UnknownCode(3)));
+        assert_eq!(StarMode::try_from(2), Err(UnknownCode(2)));
         assert_eq!(StarStatus::try_from(6), Err(UnknownCode(6)));
     }
 

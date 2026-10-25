@@ -141,26 +141,6 @@ fn default_true() -> bool {
     true
 }
 
-/// Configuration for the ideal star tracker, which makes star vectors from
-/// the true attitude and a synthetic catalog.
-#[derive(Deserialize, JsonSchema, Clone, Debug, PartialEq)]
-pub struct StarParams {
-    /// Frame rate (Hz).
-    pub rate_hz: f64,
-    /// Full field of view (deg), a cone.
-    pub fov_deg: f64,
-    /// Per-star 1σ (rad).
-    pub sigma_rad: f64,
-    /// The most stars written per frame.
-    pub n_stars_max: u32,
-    /// Seed for the catalog and the noise.
-    pub seed: u64,
-    /// Star tracker mount, `[x, y, z, w]`: `b_body = A(q_b_st) b_st`, the
-    /// convention of `q_b_eci`.
-    #[serde(default = "default_q_b_st")]
-    pub q_b_st: [f64; 4],
-}
-
 /// Configuration for the image star tracker. The camera defaults match the
 /// star simulator's: 16 mm, 5.5 µm pixels, 1024², about 20°.
 #[derive(Deserialize, JsonSchema, Clone, Debug, PartialEq)]

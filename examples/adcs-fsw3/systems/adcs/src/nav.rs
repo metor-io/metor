@@ -382,11 +382,9 @@ pub fn nav(
 
 #[cfg(test)]
 mod tests {
-    use adcs_contracts::{Quat, StarParams};
-    use metor_star::geom;
+    use adcs_contracts::Quat;
 
     use super::*;
-    use crate::StarIdeal;
 
     fn params() -> NavParams {
         NavParams {
@@ -405,6 +403,29 @@ mod tests {
             sv.push(*b, *r, 34e-6, 1);
         }
         sv
+    }
+
+    /// A noiseless frame of [`MAX_STARS`] stars within about 8° of the
+    /// boresight, as a tracker at attitude `q` would match them.
+    fn stars_at(q: Quat, t: Timestamp, id: u64) -> StarVectors {
+        let mut sv = StarVectors::empty(t, id);
+        for i in 0..MAX_STARS {
+            // A golden-angle spiral, so the stars spread over the field.
+            let (r, az) = (
+                0.14 * ((i as f64 + 0.5) / MAX_STARS as f64).sqrt(),
+                i as f64 * 2.4,
+            );
+            let b: V3 = (tensor![r * az.cos(), r * az.sin(), 1.0] as V3).normalize();
+            sv.push(b.into_buf(), (q * b).into_buf(), 34e-6, i as u32);
+        }
+        sv
+    }
+
+    /// The angle (rad) between two attitudes, which `angular_distance`'s
+    /// `acos` makes NaN for a noiseless match.
+    fn angle_between(a: Quat, b: Quat) -> f64 {
+        let [x, y, z, w] = (a.inverse() * b).0.into_buf();
+        2.0 * (x * x + y * y + z * z).sqrt().atan2(w.abs())
     }
 
     #[test]
@@ -478,15 +499,6 @@ mod tests {
     /// of a still attitude `angle` from identity on star vectors alone.
     fn settle_on_stars(angle: f64) -> Option<f64> {
         let truth: Quat = nox::Quaternion::from_axis_angle(tensor![1.0, 1.0, 1.0], angle);
-        let q = geom::Quat(truth.0.into_buf());
-        let mut tracker = StarIdeal::new(StarParams {
-            rate_hz: 10.0,
-            fov_deg: 20.0,
-            sigma_rad: 34e-6,
-            n_stars_max: 32,
-            seed: 5,
-            q_b_st: [0.0, 0.0, 0.0, 1.0],
-        });
         let mut nav = NavState::new(NavParams {
             sun_mag: false,
             ..params()
@@ -499,10 +511,10 @@ mod tests {
             nav.mekf.omega = V3::zeros();
             nav.mekf.propagate();
             if k % 12 == 0 {
-                let sv = tracker.observe(q, t);
+                let sv = stars_at(truth, t, k as u64);
                 nav.fuse_stars(Some(&sv), t, 0.0);
             }
-            let err: f64 = nav.mekf.q_hat.angular_distance(&truth).into_buf().abs();
+            let err = angle_between(nav.mekf.q_hat, truth);
             match (err < bound, settled) {
                 (true, None) => settled = Some(k as f64 / 120.0),
                 (false, Some(_)) => settled = None,
@@ -596,11 +608,10 @@ mod tests {
         assert!(sun_from_css(&[0.11, 0.0, 0.0, 0.0, 0.0, 0.0]).is_some());
     }
 
-    /// A filter, a tracker and a still truth, stepped one 120 Hz cycle at a
-    /// time with a star frame every 12th cycle.
+    /// A filter and a still truth, stepped one 120 Hz cycle at a time with a
+    /// star frame every 12th cycle.
     struct Bench {
         nav: NavState,
-        tracker: StarIdeal,
         truth: Quat,
         k: i64,
     }
@@ -608,25 +619,12 @@ mod tests {
     impl Bench {
         fn new(sun_mag: bool) -> Bench {
             let truth: Quat = nox::Quaternion::from_axis_angle(tensor![0.2, -1.0, 0.4], 1.1);
-            let tracker = StarIdeal::new(StarParams {
-                rate_hz: 10.0,
-                fov_deg: 20.0,
-                sigma_rad: 34e-6,
-                n_stars_max: 32,
-                seed: 9,
-                q_b_st: [0.0, 0.0, 0.0, 1.0],
-            });
             let mut nav = NavState::new(NavParams {
                 sun_mag,
                 ..params()
             });
             nav.seed(1.0 / 120.0);
-            Bench {
-                nav,
-                tracker,
-                truth,
-                k: 0,
-            }
+            Bench { nav, truth, k: 0 }
         }
 
         /// One cycle, with sun and magnetometer vectors turned by `coarse`
@@ -648,15 +646,14 @@ mod tests {
                 self.nav.fuse_sun_mag(&obs, self.k as f64 / 120.0);
             }
             if stars && self.k % 12 == 0 {
-                let sv = self.tracker.observe(geom::Quat(self.truth.0.into_buf()), t);
+                let sv = stars_at(self.truth, t, self.k as u64);
                 self.nav.fuse_stars(Some(&sv), t, self.k as f64 / 120.0);
             }
             self.k += 1;
         }
 
         fn error_deg(&self) -> f64 {
-            let e: f64 = self.nav.mekf.q_hat.angular_distance(&self.truth).into_buf();
-            e.abs().to_degrees()
+            angle_between(self.nav.mekf.q_hat, self.truth).to_degrees()
         }
     }
 
@@ -733,7 +730,7 @@ mod tests {
         /// stars and stamped now.
         fn frame_at(&mut self, seen: Quat, n: u64, id: u64) -> StarVectors {
             let t = Timestamp(self.k * 8_333);
-            let mut sv = self.tracker.observe(geom::Quat(seen.0.into_buf()), t);
+            let mut sv = stars_at(seen, t, 0);
             sv.count = sv.count.min(n);
             sv.frame_id = 1_000_000 + id;
             sv
@@ -812,8 +809,7 @@ mod tests {
         let second = b.frame_at(wrong, 32, 1);
         b.feed(&second);
         assert_eq!(b.nav.stats.prior_resets, 1);
-        let off: f64 = b.nav.mekf.q_hat.angular_distance(&wrong).into_buf();
-        assert!(off.abs().to_degrees() < 0.01);
+        assert!(angle_between(b.nav.mekf.q_hat, wrong).to_degrees() < 0.01);
     }
 
     /// Two contradicting frames that disagree with each other do not reset.

@@ -4,9 +4,8 @@ back to the plant one cycle late.
 Nav and ctrl take their GPS fixes from a driver reading a simulated receiver
 over a serial port. Nav also fuses star vectors from the star tracker, which
 identifies the stars in the images the star simulator renders from the plant's
-true attitude. `METOR_STAR_SOURCE=ideal` feeds nav from the ideal tracker
-instead, which reads the true attitude directly. The receiver logs the plant's true orbit state. A db
-records everything and serves it on 2250."""
+true attitude. The receiver logs the plant's true orbit state. A db records
+everything and serves it on 2250."""
 
 import math
 import os
@@ -19,7 +18,6 @@ from adcs_pack import (
     MtqCmd,
     Nav,
     Plant,
-    StarIdeal,
     StarTracker,
     TorqueCmd,
 )
@@ -66,20 +64,8 @@ gps_uart = fsw.resource("gps_uart", SimUart())
 gps = fsw.add("gps", GpsDriver(uart=gps_uart))
 fsw.sim("gps_rx", GpsReceiver(uart=gps_uart.device, truth=plant.body, seed=7))
 
-# A 20° tracker at 10 Hz with 34 µrad (7″) per star.
-star = fsw.add(
-    "star",
-    StarIdeal(
-        body=plant.body,
-        rate_hz=10.0,
-        fov_deg=20.0,
-        sigma_rad=34e-6,
-        n_stars_max=32,
-        seed=11,
-    ),
-)
-# Renders the same tracker's 1024² images from the true attitude on its own
-# thread, from the committed G ≤ 8 catalog.
+# Renders a 20° tracker's 1024² images at 10 Hz from the true attitude on its
+# own thread, from the committed G ≤ 8 catalog.
 star_sim = fsw.add(
     "star_sim",
     StarSim(body=plant.body, world=plant.world, rate_hz=10.0, seed=13),
@@ -90,15 +76,12 @@ tracker = fsw.add(
     "star_tracker",
     StarTracker(image=star_sim.star_image, sensors=plant.sensors),
 )
-star_source = os.environ.get("METOR_STAR_SOURCE", "tracker")
-if star_source not in ("tracker", "ideal"):
-    raise ValueError(f"METOR_STAR_SOURCE must be tracker or ideal, not {star_source}")
 nav = fsw.add(
     "nav",
     Nav(
         sensors=plant.sensors,
         gps=gps.fix,
-        stars=(tracker if star_source == "tracker" else star).star_vectors,
+        stars=tracker.star_vectors,
         meas_sigma=0.02,
     ),
 )

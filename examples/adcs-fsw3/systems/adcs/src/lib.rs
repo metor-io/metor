@@ -11,7 +11,6 @@ pub mod gps_receiver;
 pub mod mode;
 pub mod nav;
 pub mod plant;
-pub mod star_ideal;
 pub mod star_tracker;
 
 pub use ctrl::CtrlSystem;
@@ -22,21 +21,17 @@ pub use nav::{NavState, sun_from_css};
 pub use plant::{
     DisturbanceTorques, PlantState, TrueState, WheelDynamics, css_readings, propagate,
 };
-pub use star_ideal::StarIdeal;
 pub use star_tracker::StarTracker;
 
 use metor_fsw_3::SystemTable;
 
-/// Returns a table of the pack's systems, registered as `plant`, `star_ideal`, `star_tracker`, `nav`, `ctrl`,
-/// `mode`, `gps_driver`, and `gps_receiver`.
+/// Returns a table of the pack's systems, registered as `plant`,
+/// `star_tracker`, `nav`, `ctrl`, `mode`, `gps_driver`, and `gps_receiver`.
 pub fn pack() -> SystemTable {
     let mut table = SystemTable::new();
     // PANIC Safety: these static record schemas are compatible.
     table
         .register("plant", plant::plant(), PlantState::new)
-        .expect("valid records");
-    table
-        .register("star_ideal", star_ideal::star_ideal(), StarIdeal::new)
         .expect("valid records");
     table
         .register(
