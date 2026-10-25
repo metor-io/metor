@@ -18,19 +18,22 @@ impl Threads {
         Self
     }
 
+    /// Returns `false`: there are no groups to turn.
+    pub fn is_deterministic(&self) -> bool {
+        false
+    }
+
     /// Hands over the turned groups, of which there are none.
-    #[cfg(feature = "host")]
     pub(crate) fn into_turned(self) -> impl Iterator<Item = TurnedGroup> {
         core::iter::empty()
     }
 }
 
 /// A turned group, which a build without OS threads never starts.
-#[cfg(feature = "host")]
 pub(crate) enum TurnedGroup {}
 
-#[cfg(feature = "host")]
 impl TurnedGroup {
+    #[cfg(feature = "host")]
     pub(crate) fn first(&self) -> &str {
         match *self {}
     }

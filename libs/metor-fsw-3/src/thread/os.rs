@@ -61,8 +61,13 @@ impl Threads {
         Self(Groups::Turned(HashMap::new()))
     }
 
-    /// Hands over the turned groups, for the coordinator to own.
-    #[cfg(feature = "host")]
+    /// Returns whether the coordinator turns this registry's groups.
+    pub fn is_deterministic(&self) -> bool {
+        matches!(self.0, Groups::Turned(_))
+    }
+
+    /// Hands over the turned groups, for the coordinator, or the pack step
+    /// that runs their first member, to own.
     pub(crate) fn into_turned(self) -> impl Iterator<Item = TurnedGroup> {
         let groups = match self.0 {
             Groups::Spawned(_) => HashMap::new(),

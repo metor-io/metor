@@ -53,6 +53,7 @@ fn instance_named(ty: &str, id: &str) -> Vec<u8> {
         def,
         adapter: None,
         seed: 0,
+        deterministic: false,
     };
     serde_json::to_vec(&instance).expect("encodes")
 }

@@ -266,6 +266,7 @@ impl DlSlot {
                 def: cx.def.clone(),
                 adapter: cx.adapter.cloned(),
                 seed: cx.seed,
+                deterministic: cx.threads.is_deterministic(),
             },
             inputs: cx
                 .inputs

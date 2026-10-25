@@ -341,6 +341,7 @@ fn rig(execute: &str) -> Rig {
         def,
         adapter: None,
         seed: 0,
+        deterministic: false,
     };
     let (seen, lines) = (output.view(NoWake), log.view(NoWake));
     let (inputs, outputs) = ([vec![&input]], [&output, &log]);
