@@ -2416,7 +2416,8 @@ async fn handle_real_time_stream<A: AsyncWrite + 'static>(
                 visited_ids.insert(component.component_id);
                 let sink = sink.clone();
                 let component = component.clone();
-                stellarator::spawn(handle_real_time_component(sink, component, req_id));
+                let metadata = state.get_component_metadata(component.component_id).cloned();
+                stellarator::spawn(handle_real_time_component(sink, component, metadata, req_id));
                 Ok(())
             })
         })?;
@@ -2424,9 +2425,12 @@ async fn handle_real_time_stream<A: AsyncWrite + 'static>(
     }
 }
 
+/// Streams one component's samples, preceded by its metadata so a peer that
+/// joined before the component existed can name it.
 async fn handle_real_time_component<A: AsyncWrite>(
     stream: Arc<Mutex<PacketSink<A>>>,
     component: Component,
+    metadata: Option<ComponentMetadata>,
     req_id: RequestId,
 ) -> Result<(), Error> {
     let timestamp_loc = raw_table(0, size_of::<Timestamp>() as u32);
@@ -2440,6 +2444,12 @@ async fn handle_real_time_component<A: AsyncWrite>(
     let vtable_id = metor_proto::types::table_id(&vtable);
     {
         let stream = stream.lock().await;
+        if let Some(metadata) = metadata {
+            stream
+                .send(SetComponentMetadata(metadata).with_request_id(req_id))
+                .await
+                .0?;
+        }
         stream
             .send(
                 VTableMsg {
@@ -3368,6 +3378,51 @@ mod vtable_id_tests {
             }
         }
         assert_eq!(ids[0], ids[1]);
+    }
+
+    /// A component's metadata reaches a real-time subscriber before its
+    /// vtable, so a peer that joined first can still name it.
+    #[stellarator::test]
+    async fn real_time_stream_sends_metadata_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(dir.path().to_path_buf()).unwrap());
+        db.insert_vtable(VTableMsg {
+            id: ID,
+            vtable: announce("live"),
+        })
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Server { listener, db };
+        stellarator::struc_con::stellar(move || server.run());
+
+        let mut client = Client::connect(addr).await.unwrap();
+        client
+            .send(
+                (&Stream {
+                    behavior: StreamBehavior::RealTime,
+                    id: 1,
+                })
+                    .with_request_id(1),
+            )
+            .await
+            .0
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let mut named = None;
+        loop {
+            let pkt = client.rx.next_grow(buf).await.unwrap();
+            if let Packet::Msg(m) = &pkt {
+                if m.id == SetComponentMetadata::ID {
+                    named = Some(m.parse::<SetComponentMetadata>().unwrap().0);
+                } else if m.id == VTableMsg::ID {
+                    break;
+                }
+            }
+            buf = pkt.into_buf().into_inner();
+        }
+        let named = named.expect("metadata before the vtable");
+        assert_eq!(named.component_id, ComponentId::new("live"));
     }
 }
 
