@@ -206,8 +206,12 @@ pub(crate) fn link_traces<T: 'static, P: 'static>(
 ///
 /// Prepaint runs `submit` to start a render for the current bounds (it
 /// returns the readback when one was issued), releases the image the last
-/// frame replaced back to the atlas, and paints the newest completed frame
-/// across the canvas. `gpu_state` reaches the entity's [`PlotRenderState`].
+/// frame replaced back to the atlas, and paints the newest completed frame.
+/// That frame was drawn at an earlier view — readback is asynchronous — so
+/// it is placed under the current one ([`PlotRenderState::placement`]) and
+/// clipped to the canvas: a pan moves the lines with the pointer, and the
+/// frame drawn at the new view fills in the edge it uncovers.
+/// `gpu_state` reaches the entity's [`PlotRenderState`].
 pub(crate) fn gpu_frame<T: 'static>(
     entity: WeakEntity<T>,
     gpu_state: fn(&mut T) -> &mut PlotRenderState,
@@ -223,7 +227,10 @@ pub(crate) fn gpu_frame<T: 'static>(
                         handle.spawn_and_set(cx, gpu_state);
                     }
                     let state = gpu_state(plot);
-                    (state.current_frame(), state.take_pending_release())
+                    let frame = state
+                        .current_frame()
+                        .map(|img| (img, state.placement(bounds, scale_factor)));
+                    (frame, state.take_pending_release())
                 })
                 .unwrap_or((None, None));
             if let Some(img) = released {
@@ -231,9 +238,15 @@ pub(crate) fn gpu_frame<T: 'static>(
             }
             (bounds, frame)
         },
-        |_, (bounds, frame): (Bounds<Pixels>, Option<Arc<gpui::RenderImage>>), window, _cx| {
-            if let Some(img) = frame {
-                let _ = window.paint_image(bounds, bounds, Corners::default(), img, 0, false);
+        |_,
+         (bounds, frame): (
+            Bounds<Pixels>,
+            Option<(Arc<gpui::RenderImage>, Bounds<Pixels>)>,
+        ),
+         window,
+         _cx| {
+            if let Some((img, rect)) = frame {
+                let _ = window.paint_image(bounds, rect, Corners::default(), img, 0, false);
             }
         },
     )

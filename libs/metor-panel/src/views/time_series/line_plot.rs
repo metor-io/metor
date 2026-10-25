@@ -895,8 +895,15 @@ impl Render for LinePlot {
                 // X data + a 0..1 Y placeholder; each trace's Y is
                 // normalized per axis in the materializer.
                 let gpu_view = view.x_bounds();
-                lp.gpu_state
-                    .render(cx, bounds, scale_factor, gpu_view, &draws)
+                lp.gpu_state.render_placed(
+                    cx,
+                    bounds,
+                    scale_factor,
+                    gpu_view,
+                    view.clone(),
+                    &draws,
+                    None,
+                )
             },
         );
         div()

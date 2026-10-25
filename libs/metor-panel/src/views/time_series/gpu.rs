@@ -20,19 +20,23 @@
 //! 3. The caller passes the handle to [`ReadbackHandle::spawn_and_set`],
 //!    which reads the staging buffer on a background worker, builds a
 //!    `RenderImage`, and installs it back via a field accessor.
-//! 4. The paint closure blits `state.current_frame()`.
+//! 4. The paint closure blits `state.current_frame()` at
+//!    [`PlotRenderState::placement`]: until the frame for the latest view
+//!    lands, the last one moves with the view so a pan or zoom tracks the
+//!    pointer instead of trailing it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytemuck::{Pod, Zeroable};
-use gpui::{BorrowAppContext, Bounds, Context, Global, Hsla, Pixels, RenderImage};
+use gpui::{BorrowAppContext, Bounds, Context, Global, Hsla, Pixels, RenderImage, point, px, size};
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::time_series::TimeSeriesNodeSlice;
 use metor_db::{Component, ComponentSchema};
 use metor_proto::types::{PrimType, Timestamp};
 use smallvec::SmallVec;
 
+use super::bounds::PlotView;
 use super::heatmap::{HeatmapPipeline, HeatmapState, IntensityDraw};
 use super::{PlotBounds, PlotStyle};
 use crate::gpu_context::GpuContext;
@@ -267,6 +271,8 @@ pub(crate) struct ReadbackHandle {
     /// image actually on screen.
     truncated: bool,
     generation: u64,
+    /// The view the frame was drawn at, so paint can move it to a newer one.
+    view: PlotView,
 }
 
 impl ReadbackHandle {
@@ -302,6 +308,7 @@ impl ReadbackHandle {
         cx.spawn(async move |this, cx| {
             let truncated = self.truncated;
             let generation = self.generation;
+            let view = self.view.clone();
             let image = cx
                 .background_executor()
                 .spawn(async move { self.read_image() })
@@ -311,7 +318,7 @@ impl ReadbackHandle {
             };
             let _ = this.update(cx, |t, cx| {
                 if access(t).generation == generation {
-                    access(t).set_frame(img, truncated);
+                    access(t).set_frame(img, view, truncated);
                 }
                 cx.notify();
             });
@@ -748,6 +755,11 @@ impl PlotGpu {
 pub(crate) struct PlotRenderState {
     target: Option<RenderTarget>,
     current_frame: Option<Arc<RenderImage>>,
+    /// The view `current_frame` was drawn at.
+    frame_view: Option<PlotView>,
+    /// The view of the latest render request, drawn or not: where paint
+    /// places `current_frame` until that request's frame replaces it.
+    view: Option<PlotView>,
     pending_release: Option<Arc<RenderImage>>,
     in_flight: Arc<AtomicBool>,
     degraded: bool,
@@ -756,6 +768,10 @@ pub(crate) struct PlotRenderState {
     /// that draws one. Per caller, like `target`, since the field is sized to
     /// that caller's grid.
     heatmap: Option<HeatmapState>,
+    /// The last paint: the view its frame was drawn at, the view it was
+    /// placed under, and the canvas and image rects.
+    #[cfg(test)]
+    pub(crate) painted: Option<(PlotView, PlotView, Bounds<Pixels>, Bounds<Pixels>)>,
 }
 
 impl Default for PlotRenderState {
@@ -763,11 +779,15 @@ impl Default for PlotRenderState {
         Self {
             target: None,
             current_frame: None,
+            frame_view: None,
+            view: None,
             pending_release: None,
             in_flight: Arc::new(AtomicBool::new(false)),
             degraded: false,
             generation: 0,
             heatmap: None,
+            #[cfg(test)]
+            painted: None,
         }
     }
 }
@@ -787,7 +807,7 @@ impl PlotRenderState {
         view: PlotBounds,
         traces: &[LineDraw<'_>],
     ) -> Option<ReadbackHandle> {
-        self.render_with_field(cx, bounds, scale_factor, view, traces, None)
+        self.render_placed(cx, bounds, scale_factor, view, view.into(), traces, None)
     }
 
     /// [`Self::render`] plus an intensity field painted under the traces.
@@ -803,6 +823,27 @@ impl PlotRenderState {
         traces: &[LineDraw<'_>],
         field: Option<&IntensityDraw<'_>>,
     ) -> Option<ReadbackHandle> {
+        self.render_placed(cx, bounds, scale_factor, view, view.into(), traces, field)
+    }
+
+    /// [`Self::render_with_field`] for a plot whose screen view isn't `view`
+    /// itself: a multi-axis plot hands the GPU normalized Y, while
+    /// `placement` carries each axis's real range so paint can follow a
+    /// change on any of them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_placed(
+        &mut self,
+        cx: &mut gpui::App,
+        bounds: Bounds<Pixels>,
+        scale_factor: f32,
+        view: PlotBounds,
+        placement: PlotView,
+        traces: &[LineDraw<'_>],
+        field: Option<&IntensityDraw<'_>>,
+    ) -> Option<ReadbackHandle> {
+        // Recorded even while a readback is in flight: the frame on screen
+        // moves to this view until one drawn at it lands.
+        self.view = Some(placement.clone());
         if self.in_flight.load(Ordering::Acquire) {
             return None;
         }
@@ -861,18 +902,21 @@ impl PlotRenderState {
                 in_flight: self.in_flight.clone(),
                 truncated: gpu.cache.truncated,
                 generation: self.generation,
+                view: placement,
             })
         })
     }
 
     /// Install a newly-read frame and park the previous one for release.
-    pub(crate) fn set_frame(&mut self, image: Arc<RenderImage>, truncated: bool) {
+    pub(crate) fn set_frame(&mut self, image: Arc<RenderImage>, view: PlotView, truncated: bool) {
         self.pending_release = self.current_frame.replace(image);
+        self.frame_view = Some(view);
         self.degraded = truncated;
     }
 
     pub(crate) fn clear_frame(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.frame_view = None;
         if self.current_frame.is_some() {
             self.pending_release = self.current_frame.take();
         }
@@ -880,6 +924,26 @@ impl PlotRenderState {
 
     pub(crate) fn current_frame(&self) -> Option<Arc<RenderImage>> {
         self.current_frame.clone()
+    }
+
+    /// Where to paint `current_frame` on a canvas at `bounds`: under the
+    /// latest requested view rather than the one it was drawn at, so a pan
+    /// or zoom moves what is drawn at once and the fresh frame only fills
+    /// in what was off screen.
+    pub(crate) fn placement(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        scale_factor: f32,
+    ) -> Bounds<Pixels> {
+        let (Some(drawn), Some(current)) = (&self.frame_view, &self.view) else {
+            return bounds;
+        };
+        let rect = placed(bounds, scale_factor, drawn, current);
+        #[cfg(test)]
+        {
+            self.painted = Some((drawn.clone(), current.clone(), bounds, rect));
+        }
+        rect
     }
 
     /// True when the displayed frame had uploads clamped by buffer
@@ -894,6 +958,61 @@ impl PlotRenderState {
     pub(crate) fn take_pending_release(&mut self) -> Option<Arc<RenderImage>> {
         self.pending_release.take()
     }
+}
+
+/// Where a frame drawn at `drawn` across `bounds` lies under `current`.
+///
+/// X always follows. Y follows when every axis moved the frame the same way
+/// (a plot-wide pan or zoom); a drag on one axis of several moves only that
+/// axis's traces, which no single rect can show, so the frame holds still
+/// vertically until its replacement lands. An unscaled shift snaps to whole
+/// device pixels so the lines stay sharp while they slide.
+fn placed(
+    bounds: Bounds<Pixels>,
+    scale_factor: f32,
+    drawn: &PlotView,
+    current: &PlotView,
+) -> Bounds<Pixels> {
+    let s = f64::from(scale_factor.max(1.0));
+    let device = |v: Pixels| f64::from(f32::from(v)) * s;
+    let (bx, by) = (device(bounds.origin.x), device(bounds.origin.y));
+    let (bw, bh) = (device(bounds.size.width), device(bounds.size.height));
+    // `(start, len)` of a drawn range `d` on a screen span `(o, len)` that
+    // now shows `c`; `flip` for Y, whose screen origin is the range's top.
+    let span = |d: (f64, f64), c: (f64, f64), o: f64, len: f64, flip: bool| {
+        let (dw, cw) = (d.1 - d.0, c.1 - c.0);
+        if !(dw > 0.0 && cw > 0.0) {
+            return None;
+        }
+        let start = if flip { c.1 - d.1 } else { d.0 - c.0 };
+        let (mut at, size) = (o + start / cw * len, len * dw / cw);
+        if (size - len).abs() < 1e-6 * len {
+            at = at.round();
+        }
+        (at.is_finite() && size.is_finite()).then_some((at, size))
+    };
+    let Some((x, w)) = span(drawn.x, current.x, bx, bw, false) else {
+        return bounds;
+    };
+    let mut ys = drawn
+        .axes
+        .iter()
+        .zip(&current.axes)
+        .map(|(&d, &c)| span(d, c, by, bh, true));
+    let first = ys.next().flatten();
+    let (y, h) = match first {
+        Some((y0, h0))
+            if drawn.axes.len() == current.axes.len()
+                && ys.all(|a| {
+                    a.is_some_and(|(y, h)| (y - y0).abs() < 0.5 && (h - h0).abs() < 0.5)
+                }) =>
+        {
+            (y0, h0)
+        }
+        _ => (by, bh),
+    };
+    let px_of = |v: f64| px((v / s) as f32);
+    Bounds::new(point(px_of(x), px_of(y)), size(px_of(w), px_of(h)))
 }
 
 /// `None` when the staging buffer never mapped (the device was lost or
@@ -2225,6 +2344,192 @@ mod tests {
             assert!(
                 last_x >= span_secs - step_us as f64 * 1e-6 - 1e-6,
                 "right edge uncovered for {span_secs}s: last x {last_x}"
+            );
+        }
+    }
+
+    fn view(x: (f64, f64), axes: &[(f64, f64)]) -> PlotView {
+        PlotView {
+            x,
+            axes: axes.iter().copied().collect(),
+        }
+    }
+
+    /// A frame drawn at one view lands under the next: a pan slides it by
+    /// whole device pixels, a zoom scales it about the zoom point, and a
+    /// drag on one of several axes leaves it vertically where it was.
+    #[test]
+    fn a_frame_follows_the_view_it_trails() {
+        use gpui::{point, px, size};
+        let bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(400.0), px(200.0)));
+        let drawn = view((0.0, 100.0), &[(0.0, 10.0), (-1.0, 1.0)]);
+        assert_eq!(placed(bounds, 2.0, &drawn, &drawn), bounds);
+
+        // Dragging right 30.3 px and down 12 px: the data moves with the
+        // pointer, rounded to the device grid.
+        let panned = drawn
+            .clone()
+            .offset_x(-30.3 / 400.0)
+            .offset_y_all(12.0 / 200.0);
+        let at = placed(bounds, 2.0, &drawn, &panned);
+        assert_eq!(at.size, bounds.size);
+        assert_eq!(at.origin, point(px(40.5), px(32.0)));
+
+        // A 2x zoom about the middle doubles it about the middle.
+        let zoomed = drawn.clone().zoom_x(0.5, 0.5).zoom_y_all(0.5, 0.5);
+        let at = placed(bounds, 2.0, &drawn, &zoomed);
+        assert_eq!(at.size, size(px(800.0), px(400.0)));
+        assert_eq!(at.origin, point(px(-190.0), px(-80.0)));
+
+        // One axis of two dragged: X still follows, Y holds.
+        let one_axis = drawn.clone().offset_x(0.25).offset_axis_y(1, 0.1);
+        let at = placed(bounds, 2.0, &drawn, &one_axis);
+        assert_eq!(at.origin, point(px(-90.0), px(20.0)));
+        assert_eq!(at.size, bounds.size);
+
+        // A degenerate view can't be mapped; the frame stays put.
+        let flat = view((5.0, 5.0), &[(0.0, 10.0), (-1.0, 1.0)]);
+        assert_eq!(placed(bounds, 2.0, &drawn, &flat), bounds);
+    }
+
+    /// Readback is asynchronous, so while a drag requests the frame for
+    /// each new view, the one on hand was drawn at the previous view. Paint
+    /// must place it under the new one, or the lines trail the pointer (and
+    /// the axes) by a frame's worth of pan. Bounded: 2 000 samples, a
+    /// 500x300 target, ten frames.
+    #[gpui::test]
+    fn a_drag_paints_the_last_frame_under_the_new_view(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, px, size};
+        if crate::gpu_context::GpuContext::get().is_none() {
+            eprintln!("skipping: no GPU available");
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        cx.update(|cx| crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone())));
+        let dir = tempfile::tempdir().unwrap();
+        let component = synth_component(dir.path(), 1, 2_000, 0, 1_000);
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(500.0), px(300.0)));
+        let draw = LineDraw {
+            x: AxisSource::Timestamps,
+            y: AxisSource::Element {
+                component: &component,
+                element_index: 0,
+            },
+            y_min: -1.0,
+            y_max: 1.0,
+            style: PlotStyle::Line,
+            color: Hsla::white(),
+            stroke_width: 1.0,
+            x_clip: None,
+            time_clip: None,
+        };
+        let start = view((0.0, 1_000_000.0), &[(-1.0, 1.0)]);
+        let mut state = PlotRenderState::default();
+        // 8 px of drag per frame; each frame lands only after it is painted.
+        let mut trailed = 0;
+        let mut drawn = start.clone();
+        for f in 0..=10 {
+            assert!(std::time::Instant::now() < deadline, "drag test timed out");
+            let current = start.clone().offset_x(-8.0 / 500.0 * f as f64);
+            let handle = cx
+                .update(|cx| {
+                    state.render_placed(
+                        cx,
+                        bounds,
+                        1.0,
+                        current.x_bounds(),
+                        current.clone(),
+                        std::slice::from_ref(&draw),
+                        None,
+                    )
+                })
+                .expect("frame submitted");
+            if f > 0 {
+                // This frame paints the last render, drawn at `drawn`.
+                let at = state.placement(bounds, 1.0);
+                trailed += usize::from(drawn.bits() != current.bits());
+                let want = (drawn.x.0 - current.x.0) / (current.x.1 - current.x.0) * 500.0;
+                let off = f64::from(f32::from(at.origin.x)) - want;
+                assert!(off.abs() <= 0.5, "frame {f} painted {off} px off the view");
+                assert_eq!(at.size, bounds.size);
+            }
+            let img = handle.read_image().expect("readback");
+            state.set_frame(img, current.clone(), false);
+            drawn = current;
+        }
+        assert_eq!(trailed, 10, "every drag frame paints the previous render");
+    }
+
+    /// Per-frame cost of a drag over a fullscreen retina plot: plan and
+    /// submit, then the readback a frame waits on before it can paint.
+    /// `cargo test --release -p metor-panel pan_frame_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing, needs a GPU"]
+    fn pan_frame_cost() {
+        let Some(mut gpu) = PlotGpu::try_new() else {
+            eprintln!("skipping: no GPU available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let start_us: i64 = 1_700_000_000_000_000;
+        let step_us: i64 = 1_000;
+        let component = synth_component(dir.path(), 6, 200_000, start_us, step_us);
+        for (w, h) in [(1500, 600), (3000, 1700)] {
+            let target = RenderTarget::new(&gpu.ctx.device, w, h);
+            let span = 60_000_000_i64;
+            let (mut submit, mut readback, mut image) = (0.0, 0.0, 0.0);
+            let frames = 60;
+            for f in 0..frames {
+                let min_x = start_us + 100_000_000 + f * 100_000;
+                let draw = LineDraw {
+                    x: AxisSource::Timestamps,
+                    y: AxisSource::Element {
+                        component: &component,
+                        element_index: 0,
+                    },
+                    y_min: -1.0,
+                    y_max: 1.0,
+                    style: PlotStyle::Line,
+                    color: Hsla::white(),
+                    stroke_width: 1.0,
+                    x_clip: None,
+                    time_clip: None,
+                };
+                let view = PlotBounds::new(min_x as f64, 0.0, (min_x + span) as f64, 1.0);
+                let t0 = std::time::Instant::now();
+                assert!(gpu.submit(
+                    &target,
+                    view,
+                    2.0,
+                    std::slice::from_ref(&draw),
+                    None,
+                    &mut None,
+                    &crate::theme::DARK,
+                ));
+                target
+                    .staging
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, |_| {});
+                let t1 = std::time::Instant::now();
+                let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+                let bytes =
+                    read_mapped_bytes(&target.staging, w, h, target.padded_bytes_per_row).unwrap();
+                target.staging.unmap();
+                let t2 = std::time::Instant::now();
+                let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, bytes).unwrap();
+                let _img =
+                    RenderImage::new(SmallVec::<[Frame; 1]>::from_elem(Frame::new(buffer), 1));
+                let t3 = std::time::Instant::now();
+                submit += (t1 - t0).as_secs_f64();
+                readback += (t2 - t1).as_secs_f64();
+                image += (t3 - t2).as_secs_f64();
+            }
+            let ms = |s: f64| s * 1e3 / frames as f64;
+            eprintln!(
+                "{w}x{h}: submit {:.2} ms, gpu+readback {:.2} ms, image {:.2} ms per frame",
+                ms(submit),
+                ms(readback),
+                ms(image)
             );
         }
     }

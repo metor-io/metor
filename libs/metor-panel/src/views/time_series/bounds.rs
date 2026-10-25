@@ -105,6 +105,15 @@ impl PlotView {
     }
 }
 
+impl From<PlotBounds> for PlotView {
+    fn from(b: PlotBounds) -> Self {
+        Self {
+            x: (b.min_x, b.max_x),
+            axes: smallvec::smallvec![(b.min_y, b.max_y)],
+        }
+    }
+}
+
 /// Data-space rectangle for a plot view.
 ///
 /// Doubles as the coordinate transform: pan/zoom methods mutate the bounds
