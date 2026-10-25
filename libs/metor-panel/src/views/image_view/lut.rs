@@ -23,13 +23,8 @@ pub enum Levels {
         black: f64,
         white: f64,
     },
-    /// Percentiles of the histogram, each in `0..=1`. `lock` holds the last
-    /// levels instead of following new frames.
-    Auto {
-        low: f64,
-        high: f64,
-        lock: bool,
-    },
+    /// Percentiles of the histogram, each in `0..=1`.
+    Auto { low: f64, high: f64 },
 }
 
 impl Default for Levels {
@@ -37,7 +32,6 @@ impl Default for Levels {
         Self::Auto {
             low: 0.005,
             high: 0.9995,
-            lock: false,
         }
     }
 }

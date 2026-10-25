@@ -19,7 +19,6 @@ const PRESETS: [(&str, Levels); 3] = [
         Levels::Auto {
             low: 0.005,
             high: 0.9995,
-            lock: false,
         },
     ),
     (
@@ -27,7 +26,6 @@ const PRESETS: [(&str, Levels); 3] = [
         Levels::Auto {
             low: 0.0,
             high: 1.0,
-            lock: false,
         },
     ),
     (
@@ -35,7 +33,6 @@ const PRESETS: [(&str, Levels); 3] = [
         Levels::Auto {
             low: 0.01,
             high: 0.99,
-            lock: false,
         },
     ),
 ];
@@ -120,12 +117,9 @@ impl InspectorRow for LevelsRow {
 fn summary(levels: Levels, painted: Option<(f64, f64)>) -> SharedString {
     let mode = match levels {
         Levels::Manual { .. } => "manual".to_string(),
-        Levels::Auto { low, high, lock } => format!(
-            "auto {}–{}%{}",
-            number(low * 100.0),
-            number(high * 100.0),
-            if lock { " locked" } else { "" }
-        ),
+        Levels::Auto { low, high } => {
+            format!("auto {}–{}%", number(low * 100.0), number(high * 100.0))
+        }
     };
     match painted {
         Some((black, white)) => format!("{mode} · {}–{}", number(black), number(white)).into(),

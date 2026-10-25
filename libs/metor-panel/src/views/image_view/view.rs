@@ -15,7 +15,7 @@ use super::histogram::Histogram;
 use super::layout::FrameLayout;
 use super::lut::{Display, Levels, Lut};
 use super::overlay::{self, Overlay, OverlayColor, OverlayConfig, Points};
-use super::readout::{Readout, Siblings, raw_value};
+use super::readout::{Readout, raw_value};
 use super::render::{self, Frames, Job, LutKey, RenderKey, Rendered, Scheduler};
 use super::resample::{MAX_STEP, MIN_STEP, Rect, RenderError, Scratch, Viewport};
 use super::source::{Frame, FrameSource, FrameState, RecordSource};
@@ -56,8 +56,6 @@ pub struct ImageViewConfig {
     /// inspector. Layouts from before the inspector histogram saved this as
     /// `histogram`, always on by default, so that key is ignored.
     pub histogram_overlay: bool,
-    /// Shows a crosshair at the cursor.
-    pub crosshair: bool,
     pub overlays: Vec<OverlayConfig>,
 }
 
@@ -68,7 +66,6 @@ impl Default for ImageViewConfig {
             display: None,
             view: ViewMode::Fit,
             histogram_overlay: false,
-            crosshair: false,
             overlays: Vec::new(),
         }
     }
@@ -91,8 +88,6 @@ pub struct ImageView {
     pub display: Display,
     /// The histogram strip under the image, besides the inspector's.
     pub histogram_overlay: bool,
-    /// A crosshair at the cursor.
-    pub crosshair: bool,
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
@@ -125,9 +120,6 @@ pub struct ImageView {
     job: Task<()>,
     #[facet(opaque)]
     focus: FocusHandle,
-    /// The free view a double click returns to from fit.
-    #[facet(opaque)]
-    last_free: Option<ViewMode>,
     /// Pan gesture: where it started and the viewport it started from.
     #[facet(opaque)]
     drag: Option<(Point<Pixels>, Viewport)>,
@@ -141,14 +133,9 @@ pub struct ImageView {
     scale: f32,
     #[facet(opaque)]
     out: (usize, usize),
-    /// Levels frozen by `lock`.
-    #[facet(opaque)]
-    locked_levels: Option<(f64, f64)>,
     /// The layout of the last frame, to notice a change.
     #[facet(opaque)]
     layout: Option<FrameLayout>,
-    #[facet(opaque)]
-    siblings: Siblings,
     #[facet(opaque)]
     overlays: Vec<Overlay>,
     #[facet(opaque)]
@@ -176,7 +163,6 @@ impl ImageView {
             source,
             display: cfg.display.unwrap_or_default(),
             histogram_overlay: cfg.histogram_overlay,
-            crosshair: cfg.crosshair,
             view: view_mode,
             settled: cfg.display.is_some(),
             bound: None,
@@ -190,15 +176,12 @@ impl ImageView {
             levels: None,
             job: Task::ready(()),
             focus: cx.focus_handle(),
-            last_free: matches!(view_mode, ViewMode::Free { .. }).then_some(view_mode),
             drag: None,
             hover: None,
             bounds: Bounds::default(),
             scale: 1.0,
             out: (0, 0),
-            locked_levels: None,
             layout: None,
-            siblings: Siblings::default(),
             overlays: Vec::new(),
             _overlay_changes: Vec::new(),
             histogram_data: None,
@@ -252,21 +235,12 @@ impl ImageView {
         view
     }
 
-    /// Frozen levels are saved as manual ones, so a reload keeps them.
     pub fn to_config(&self) -> ImageViewConfig {
-        let display = match (self.display.levels, self.locked_levels) {
-            (Levels::Auto { lock: true, .. }, Some((black, white))) => Display {
-                levels: Levels::Manual { black, white },
-                ..self.display
-            },
-            _ => self.display,
-        };
         ImageViewConfig {
             component: self.source.text(&self.db),
-            display: self.settled.then_some(display),
+            display: self.settled.then_some(self.display),
             view: self.view,
             histogram_overlay: self.histogram_overlay,
-            crosshair: self.crosshair,
             overlays: self.overlays.iter().map(|o| o.config.clone()).collect(),
         }
     }
@@ -327,7 +301,6 @@ impl ImageView {
     /// Levels belong to one layout; a new one starts over.
     fn forget_levels(&mut self) {
         self.levels = None;
-        self.locked_levels = None;
         self.layout = None;
     }
 
@@ -352,31 +325,11 @@ impl ImageView {
             self.settled = true;
         }
         let viewport = self.viewport(&frame.layout);
-        let display = self.effective_display();
-        let mut key = RenderKey::new(&frame, display, viewport, out, saturated(cx));
+        let mut key = RenderKey::new(&frame, self.display, viewport, out, saturated(cx));
         key.histogram = self.wants_histogram();
         if let Some(started) = self.scheduler.request(key, frame) {
             let job = self.job(started);
             self.job = spawn_jobs(job, cx);
-        }
-    }
-
-    /// The display a render uses: `lock` swaps auto levels for the ones
-    /// frozen when it was turned on.
-    fn effective_display(&mut self) -> Display {
-        let Levels::Auto { lock: true, .. } = self.display.levels else {
-            self.locked_levels = None;
-            return self.display;
-        };
-        if self.locked_levels.is_none() {
-            self.locked_levels = self.levels;
-        }
-        match self.locked_levels {
-            Some((black, white)) => Display {
-                levels: Levels::Manual { black, white },
-                ..self.display
-            },
-            None => self.display,
         }
     }
 
@@ -419,12 +372,10 @@ impl ImageView {
         if !viewport.is_valid() {
             return;
         }
-        let free = ViewMode::Free {
+        self.view = ViewMode::Free {
             center: viewport.center(self.out),
             step: viewport.step,
         };
-        self.view = free;
-        self.last_free = Some(free);
         cx.notify();
     }
 
@@ -455,28 +406,18 @@ impl ImageView {
         }
     }
 
-    /// Fit, or back to the last free view.
-    pub fn toggle_fit(&mut self, cx: &mut Context<Self>) {
-        match (self.view, self.last_free) {
-            (ViewMode::Fit, Some(free)) => self.view = free,
-            _ => self.view = ViewMode::Fit,
-        }
-        cx.notify();
-    }
-
     /// The defaults and the producer's hints, and a fitted view.
     pub fn reset_to_metadata(&mut self, cx: &mut Context<Self>) {
         let hinted = self
             .frame()
             .map(|frame| render::hinted(Display::default(), &frame.layout));
         self.display = hinted.unwrap_or_default();
-        self.locked_levels = None;
         self.view = ViewMode::Fit;
         cx.notify();
     }
 
-    /// The pixel under the cursor and the scalar fields beside the image.
-    /// The value is the source pixel painted at the cursor's device pixel.
+    /// The pixel under the cursor: the source pixel painted at the cursor's
+    /// device pixel.
     pub fn readout(&self, cx: &gpui::App) -> Option<Readout> {
         let frame = self.frame()?;
         let (dx, dy) = self.device(self.hover?);
@@ -496,7 +437,6 @@ impl ImageView {
             value: raw_value(frame, x, y)?,
             pooled: viewport.pooled(device),
             stars: self.stars_under(self.hover?, cx),
-            siblings: self.siblings.values(&self.db, cx),
         })
     }
 
@@ -521,11 +461,6 @@ impl ImageView {
     ) {
         self.focus.focus(window, cx);
         cx.notify();
-        if event.click_count == 2 {
-            self.drag = None;
-            self.toggle_fit(cx);
-            return;
-        }
         self.drag = self
             .current_viewport()
             .map(|(viewport, _)| (event.position, viewport));
@@ -643,8 +578,8 @@ impl ImageView {
             .collect()
     }
 
-    /// Paints the overlays and the crosshair.
-    fn paint_annotations(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &gpui::App) {
+    /// Paints the overlays.
+    fn paint_annotations(&self, window: &mut Window, cx: &gpui::App) {
         let Some(frame) = self.frame() else {
             return;
         };
@@ -661,18 +596,6 @@ impl ImageView {
                 to_window,
                 window,
             );
-        }
-        if let Some(hover) = self.hover.filter(|_| self.crosshair) {
-            let color = theme.image_crosshair();
-            let (w, h) = (bounds.size.width, bounds.size.height);
-            window.paint_quad(gpui::fill(
-                Bounds::new(point(bounds.origin.x, hover.y), size(w, px(1.0))),
-                color,
-            ));
-            window.paint_quad(gpui::fill(
-                Bounds::new(point(hover.x, bounds.origin.y), size(px(1.0), h)),
-                color,
-            ));
         }
     }
 
@@ -706,7 +629,6 @@ impl ImageView {
     /// Sets how levels follow the frame, as the stretch presets do.
     pub fn set_stretch(&mut self, levels: Levels, cx: &mut Context<Self>) {
         self.display.levels = levels;
-        self.locked_levels = None;
         cx.notify();
     }
 
@@ -727,7 +649,6 @@ impl ImageView {
     /// Manual levels, as the strip's handles set them.
     pub fn set_levels(&mut self, (black, white): (f64, f64), cx: &mut Context<Self>) {
         self.display.levels = Levels::Manual { black, white };
-        self.locked_levels = None;
         self.levels = Some((black, white));
         cx.notify();
     }
@@ -809,9 +730,6 @@ impl ImageView {
 
     fn prepaint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.rebind(cx);
-        if let Some(id) = self.bound.filter(|id| *id != ComponentId(0)) {
-            self.siblings.refresh(&self.db, id, cx);
-        }
         let scale = window.scale_factor();
         let (_, width) = device_span(bounds.origin.x, bounds.size.width, scale);
         let (_, height) = device_span(bounds.origin.y, bounds.size.height, scale);
@@ -853,7 +771,7 @@ impl ImageView {
         );
         let clip = bounds.intersect(&rect);
         let _ = window.paint_image(clip, rect, Corners::default(), image, 0, false);
-        self.paint_annotations(bounds, window, cx);
+        self.paint_annotations(window, cx);
     }
 
     fn status(&self) -> Option<(SharedString, bool)> {
@@ -895,8 +813,8 @@ const READOUT_OFFSET: f32 = 14.0;
 
 /// The hover readout: the plots' readout card, placed beside the pointer
 /// and flipped clear of the image's edges. The header names the pixel; the
-/// rows are its value, the scalar siblings, and the overlay points under
-/// the cursor with their overlay's swatch.
+/// rows are its value and the overlay points under the cursor with their
+/// overlay's swatch.
 fn readout_card(
     readout: Readout,
     pointer: Point<Pixels>,
@@ -911,12 +829,6 @@ fn readout_card(
     };
     let mut rows: Vec<(Option<gpui::Hsla>, SharedString, String, gpui::Hsla)> =
         vec![(None, "value".into(), readout.value, theme.text_primary)];
-    rows.extend(
-        readout
-            .siblings
-            .into_iter()
-            .map(|(label, value)| (None, label, value, theme.text_primary)),
-    );
     rows.extend(readout.stars.into_iter().map(|(role, detail)| {
         let color = ImageView::overlay_color(role, &theme);
         let label = match role {
@@ -1507,10 +1419,6 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.hover = Some(point(px(-1000.0), px(-1000.0)));
                 assert_eq!(view.readout(cx), None);
-                view.toggle_fit(cx);
-                assert_eq!(view.view, ViewMode::Fit);
-                view.toggle_fit(cx);
-                assert!(matches!(view.view, ViewMode::Free { .. }));
                 view.one_to_one(cx);
                 assert!(matches!(view.view, ViewMode::Free { step, .. } if step == 1.0));
                 view.reset_to_metadata(cx);
@@ -1519,7 +1427,6 @@ mod tests {
         });
     }
 
-    /// Levels after showing frame 10, setting `lock`, then seeking to 20.
     /// The window position of a device position inside the view.
     fn at_device(view: &ImageView, device: (f64, f64)) -> Point<Pixels> {
         let (start_x, _) = device_span(view.bounds.origin.x, view.bounds.size.width, view.scale);
@@ -1657,67 +1564,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_layout_change_drops_the_lock(cx: &mut gpui::TestAppContext) {
-        let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
-        let frame = |format, prim, value: u8| {
-            let layout = FrameLayout::from_component(
-                &metor_db::ComponentSchema::new(prim, &[2usize, 2][..]),
-                &metor_proto_wkt::ComponentMetadata::from("cam").with_image(format, 8),
-            )
-            .unwrap();
-            let bytes: Vec<u8> = match prim {
-                metor_proto::types::PrimType::U8 => vec![value; 4],
-                _ => (0..4)
-                    .flat_map(|_| u16::from(value).to_le_bytes())
-                    .collect(),
-            };
-            FrameState::Ready {
-                frame: Frame {
-                    timestamp: Timestamp(1),
-                    bytes: bytes.into(),
-                    layout,
-                },
-                stale: false,
-            }
-        };
-        use metor_proto::types::PrimType;
-        use metor_proto_wkt::ImageFormat;
-        let state = std::rc::Rc::new(std::cell::RefCell::new(frame(
-            ImageFormat::Mono16,
-            PrimType::U16,
-            200,
-        )));
-        let source = Switch(state.clone());
-        let locked = Display {
-            levels: Levels::Auto {
-                low: 0.0,
-                high: 1.0,
-                lock: true,
-            },
-            ..Display::default()
-        };
-        let (_host, view, vcx) = host(
-            move |cx| ImageView::with_source(Box::new(source), locked, db, cx),
-            cx,
-        );
-        draw(vcx);
-        let cfg = vcx.update(|_, cx| view.read(cx).to_config());
-        assert_eq!(
-            cfg.display.unwrap().levels,
-            Levels::Manual {
-                black: 200.0,
-                white: 200.0
-            }
-        );
-        *state.borrow_mut() = frame(ImageFormat::Mono8, PrimType::U8, 7);
-        vcx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
-        draw(vcx);
-        draw(vcx);
-        assert_eq!(vcx.update(|_, cx| view.read(cx).levels()), Some((7.0, 7.0)));
-    }
-
-    #[gpui::test]
     fn the_inspector_source_lists_only_images(cx: &mut gpui::TestAppContext) {
         let (db, _temp) = crate::views::image_view::tests::image_db();
         let inspect_db = db.clone();
@@ -1748,101 +1594,6 @@ mod tests {
         assert!(
             !labels.iter().any(|l| l == "cam.exposure" || l == "cam.raw"),
             "{labels:?}"
-        );
-    }
-
-    fn levels_after_seeks(lock: bool, cx: &mut gpui::TestAppContext) -> Vec<Option<(f64, f64)>> {
-        let (_temp, db, _component) = scrub_db(&[10, 20]);
-        cx.update(|cx| {
-            TemporalController::init(db.clone(), cx);
-        });
-        let auto = |lock| Display {
-            levels: Levels::Auto {
-                low: 0.0,
-                high: 1.0,
-                lock,
-            },
-            ..Display::default()
-        };
-        let cfg = ImageViewConfig {
-            component: ID.into(),
-            display: Some(auto(false)),
-            ..Default::default()
-        };
-        let (_host, view, vcx) = host(move |cx| ImageView::from_config(&cfg, db, cx), cx);
-        seek_to(10, vcx);
-        let first = vcx.update(|_, cx| view.read(cx).levels());
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.display = auto(lock);
-                cx.notify();
-            })
-        });
-        draw(vcx);
-        seek_to(20, vcx);
-        vec![first, vcx.update(|_, cx| view.read(cx).levels())]
-    }
-
-    #[gpui::test]
-    fn lock_holds_the_levels_across_frames(cx: &mut gpui::TestAppContext) {
-        let locked = levels_after_seeks(true, cx);
-        assert_eq!(locked, [Some((100.0, 100.0)), Some((100.0, 100.0))]);
-    }
-
-    #[gpui::test]
-    fn unlocked_levels_follow_each_frame(cx: &mut gpui::TestAppContext) {
-        let free = levels_after_seeks(false, cx);
-        assert_eq!(free, [Some((100.0, 100.0)), Some((200.0, 200.0))]);
-    }
-
-    #[gpui::test]
-    fn the_readout_shows_scalar_siblings(cx: &mut gpui::TestAppContext) {
-        let (_temp, db, _component) = scrub_db(&[10]);
-        let exposure = ComponentId::new("cam.exposure");
-        db.with_state_mut(|s| {
-            s.set_component_metadata(
-                metor_proto_wkt::ComponentMetadata::from("cam.exposure"),
-                &db.path,
-            )?;
-            s.insert_component(
-                exposure,
-                metor_db::ComponentSchema::new(metor_proto::types::PrimType::F64, &[][..]),
-                &db.path,
-            )
-        })
-        .unwrap();
-        let component = db
-            .with_state(|s| s.get_component(exposure).cloned())
-            .unwrap();
-        component
-            .time_series
-            .install_samples(
-                8,
-                [(Timestamp(5), &0.25f64.to_le_bytes()[..])],
-                metor_db::manifest::SpanSource::RemoteFetch,
-            )
-            .unwrap();
-        cx.update(|cx| {
-            TemporalController::init(db.clone(), cx);
-        });
-        let cfg = ImageViewConfig {
-            component: ID.into(),
-            ..Default::default()
-        };
-        let (_host, view, vcx) = host(move |cx| ImageView::from_config(&cfg, db, cx), cx);
-        seek_to(10, vcx);
-        let readout = vcx.update(|_, cx| {
-            view.update(cx, |view, _| view.hover = Some(over(view, 1.0, 1.0)));
-            view.read(cx).readout(cx)
-        });
-        let readout = readout.expect("a readout");
-        assert_eq!(readout.value, "100");
-        assert_eq!(readout.siblings.len(), 1);
-        assert_eq!(readout.siblings[0].0.as_ref(), "exposure");
-        assert!(
-            readout.siblings[0].1.contains("0.25"),
-            "{:?}",
-            readout.siblings
         );
     }
 
@@ -2293,7 +2044,6 @@ mod tests {
             display: Some(Display::default()),
             view: ViewMode::Fit,
             histogram_overlay: true,
-            crosshair: true,
             overlays: vec![OverlayConfig::from_root(
                 "sim.star_truth",
                 OverlayColor::Truth,
