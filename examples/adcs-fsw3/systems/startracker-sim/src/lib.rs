@@ -7,7 +7,7 @@ pub mod params;
 pub mod sim;
 pub mod system;
 
-pub use params::{StarCamParams, StarOpticsParams, StarSensorParams, StarSimParams};
+pub use params::StarSimParams;
 pub use sim::StarSim;
 
 use metor_fsw_3::SystemTable;

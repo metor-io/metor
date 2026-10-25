@@ -1,13 +1,13 @@
 //! The star simulator's state: a GPU renderer over one catalog, and the
 //! records it fills.
 
-use adcs_contracts::{BodyState, MAX_TRUTH, NO_CAT_ID, StarImage, StarPixels, StarTruth};
+use adcs_contracts::{BodyState, MAX_TRUTH, NO_CAT_ID, StarImage, StarTruth};
 use metor_fsw_3::{FrameArray, MakeError, ParamError, Rng, Timestamp};
-use metor_star::camera::{Camera, Intrinsics};
 use metor_star::geom::{self, V3};
 use metor_star::render::gpu::{GpuError, GpuRenderer};
 use metor_star::render::{
-    Frame, HotPixels, Motion, Photometry, RenderError, Scene, Sensor, Shape, Truth,
+    Frame, HotPixels, Motion, RenderError, SIM_CAMERA, SIM_PHOTOMETRY, SIM_SENSOR, SIM_SHAPE,
+    Scene, Truth,
 };
 use metor_star::starcat::StarCat;
 use metor_star::tracker::predict;
@@ -21,12 +21,15 @@ static G8: &[u8] = include_bytes!("../../../../../libs/metor-star/data/starcat-g
 const C_M_S: f64 = 299_792_458.0;
 /// How early (µs) a frame may fall due, so a 120 Hz clock keeps a 10 Hz rate.
 const RATE_SLACK_US: i64 = 500;
-/// `StarImage`'s pixel depth.
-const BITS: u32 = 12;
+/// Stars at or fainter than this G are skipped.
+const MAG_LIMIT: f32 = 12.0;
+/// The share of pixels with extra dark current, and the largest multiplier.
+const HOT_PIXELS: (f32, f32) = (1e-4, 50.0);
+/// The most motion-blur sub-steps per frame.
+const MAX_SUBSTEPS: usize = 16;
 
 pub struct StarSim {
     params: StarSimParams,
-    camera: Camera,
     renderer: GpuRenderer<'static>,
     image: Box<StarImage>,
     truth: StarTruth,
@@ -48,24 +51,11 @@ impl StarSim {
         }
         let cat = StarCat::parse(catalog_bytes(params.catalog.as_deref())?)
             .map_err(|e| resource(format!("the catalog does not parse: {e:?}")))?;
-        let camera = camera(&params)?;
-        let shape = shape();
-        let hot = HotPixels::new(
-            shape.pixels(),
-            params.hot_pixel_fraction,
-            params.hot_pixel_max,
-            params.seed,
-        );
-        let scene = Scene::new(
-            cat,
-            camera,
-            photometry(&params),
-            sensor(&params),
-            shape,
-            hot,
-            params.mag_limit,
-        )
-        .map_err(|e| invalid(format!("{e:?}")))?;
+        let (fraction, max) = HOT_PIXELS;
+        let hot = HotPixels::new(SIM_SHAPE.pixels(), fraction, max, params.seed);
+        let (phot, sensor) = (SIM_PHOTOMETRY, SIM_SENSOR);
+        let scene = Scene::new(cat, SIM_CAMERA, phot, sensor, SIM_SHAPE, hot, MAG_LIMIT)
+            .map_err(|e| invalid(format!("{e:?}")))?;
         let renderer = GpuRenderer::new(scene).map_err(|e| MakeError::Resource {
             id: "gpu".into(),
             message: format!("{e:?}"),
@@ -73,7 +63,6 @@ impl StarSim {
         let image = StarImage::new_box().map_err(|_| invalid("no memory for the image"))?;
         Ok(StarSim {
             params,
-            camera,
             renderer,
             image,
             truth: StarTruth::default(),
@@ -148,7 +137,7 @@ impl StarSim {
         image.timestamp = mid;
         image.frame_id = frame_id;
         image.exposure_us = exposure_us as u32;
-        image.gain_milli = self.params.sensor().gain_milli;
+        image.gain_milli = SIM_SENSOR.gain_milli;
         self.truth = truth_record(&frame, &truth, mid);
         Ok(())
     }
@@ -179,8 +168,7 @@ impl StarSim {
         // pairs never share a noise seed the way `seed ^ frame_id` did.
         let mixed = self.params.seed ^ frame_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let seed = Rng::seeded(mixed, "star_sim").next_u64();
-        let max_sub = self.params.max_substeps as usize;
-        Frame::new(&self.camera, &motion, max_sub, seed, frame_id)
+        Frame::new(&SIM_CAMERA, &motion, MAX_SUBSTEPS, seed, frame_id)
     }
 
     pub fn image(&self) -> &StarImage {
@@ -229,67 +217,6 @@ fn catalog_bytes(path: Option<&str>) -> Result<&'static [u8], MakeError> {
     Ok(Vec::leak(bytes))
 }
 
-fn camera(params: &StarSimParams) -> Result<Camera, MakeError> {
-    let c = &params.camera();
-    let q_b_st = geom::Quat(c.q_b_st)
-        .normalized()
-        .ok_or_else(|| invalid("`camera.q_b_st` is not a rotation"))?;
-    let intr = Intrinsics {
-        f_m: c.f_m,
-        pitch_m: c.pitch_m,
-        cx: c.cx,
-        cy: c.cy,
-        k1: c.k1,
-        k2: c.k2,
-        p1: c.p1,
-        p2: c.p2,
-        width: StarPixels::WIDTH as u32,
-        height: StarPixels::HEIGHT as u32,
-    };
-    let positive = intr.f_m > 0.0 && intr.pitch_m > 0.0;
-    if !positive || !(intr.f_m / intr.pitch_m).is_finite() {
-        return Err(invalid(
-            "`camera.f_m` and `camera.pitch_m` must be positive",
-        ));
-    }
-    Ok(Camera { intr, q_b_st })
-}
-
-/// The record's image size and depth.
-fn shape() -> Shape {
-    Shape {
-        width: StarPixels::WIDTH as u32,
-        height: StarPixels::HEIGHT as u32,
-        bits: BITS,
-    }
-}
-
-fn photometry(params: &StarSimParams) -> Photometry {
-    let o = &params.optics();
-    let radius = 0.5 * o.aperture_m;
-    Photometry {
-        flux0_ph_s_m2: o.flux0_ph_s_m2,
-        aperture_m2: core::f32::consts::PI * radius * radius,
-        throughput: o.throughput,
-        colour: o.colour,
-    }
-}
-
-fn sensor(params: &StarSimParams) -> Sensor {
-    let s = &params.sensor();
-    Sensor {
-        psf_sigma_px: s.psf_sigma_px,
-        full_well_e: s.full_well_e,
-        read_noise_e: s.read_noise_e,
-        dark_e_s: s.dark_e_s,
-        dark_t0_c: s.dark_t0_c,
-        temp_c: s.temp_c,
-        gain_milli: s.gain_milli,
-        bias_dn: s.bias_dn,
-        zodi_mag_arcsec2: s.zodi_mag_arcsec2,
-    }
-}
-
 fn invalid(message: impl Into<String>) -> MakeError {
     MakeError::Params(ParamError::Decode(message.into()))
 }
@@ -311,15 +238,7 @@ mod tests {
             exposure_s: 0.1,
             seed: 0,
             catalog: None,
-            // Only the bright stars: the test is about timing, not photons.
-            mag_limit: 5.0,
-            camera: None,
-            optics: None,
-            sensor: None,
-            hot_pixel_fraction: 0.0,
-            hot_pixel_max: 1.0,
             aberration: false,
-            max_substeps: 16,
         }
     }
 
