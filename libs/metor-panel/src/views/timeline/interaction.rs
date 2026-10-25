@@ -13,10 +13,10 @@ impl Timeline {
         }
         self.clear_hover(cx);
         if event.modifiers.shift {
-            let Some(area) = self.area.filter(|a| f32::from(a.size.height) >= 88.0) else {
+            let Some(area) = self.area.filter(|a| self.design_height(*a) >= 88.0) else {
                 return;
             };
-            let (_, _, count) = self.lane_geometry(f32::from(area.size.height));
+            let (_, _, count) = self.lane_geometry(self.design_height(area));
             let max = self.visible_lanes().saturating_sub(count);
             if max == 0 {
                 return;
@@ -82,19 +82,17 @@ impl Timeline {
         if e.position.x < time_area.origin.x {
             return;
         }
-        let y = f32::from(e.position.y - area.origin.y);
+        let y = f32::from(e.position.y - area.origin.y) / self.scale;
+        let height = self.design_height(area);
         let x = self.fraction(e.position.x);
         let range = self.range(cx);
         let target = self.edit.as_ref().map(|(target, _)| *target);
         let range_enabled = target != Some(EditTarget::View);
-        let range_zone = if f32::from(area.size.height) < 88.0 {
-            10.0
-        } else {
-            12.0
-        };
-        let tolerance = 7.0 / f64::from(f32::from(time_area.size.width).max(1.0));
+        let range_zone = if height < 88.0 { 10.0 } else { 12.0 };
+        let tolerance =
+            f64::from(7.0 * self.scale) / f64::from(f32::from(time_area.size.width).max(1.0));
         let handle = range
-            .filter(|_| y < Self::range_handle_height(f32::from(area.size.height)))
+            .filter(|_| y < Self::range_handle_height(height))
             .and_then(|r| {
                 let start = (x - view.fraction(r.start)).abs();
                 let end = (x - view.fraction(r.end)).abs();
@@ -109,8 +107,9 @@ impl Timeline {
         let overview = self.fit.unwrap_or(view).hull(view);
         let kind = if e.button == MouseButton::Middle {
             DragKind::Pan
-        } else if f32::from(area.size.height) >= 88.0 && y > f32::from(area.size.height) - 14.0 {
-            let tolerance = 6.0 / f64::from(f32::from(time_area.size.width).max(1.0));
+        } else if height >= 88.0 && y > height - 14.0 {
+            let tolerance =
+                f64::from(6.0 * self.scale) / f64::from(f32::from(time_area.size.width).max(1.0));
             if (x - overview.fraction(view.start)).abs() < tolerance {
                 DragKind::OverviewStart
             } else if (x - overview.fraction(view.end)).abs() < tolerance {
@@ -155,8 +154,8 @@ impl Timeline {
             return;
         }
         if y >= 44.0
-            && y < f32::from(area.size.height) - 14.0
-            && f32::from(area.size.height) >= 88.0
+            && y < height - 14.0
+            && height >= 88.0
             && !e.modifiers.shift
             && e.button == MouseButton::Left
         {

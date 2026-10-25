@@ -1,15 +1,16 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use gpui::{App, Global, Hsla, SharedString};
+use gpui::{App, Global, Hsla, Rems, SharedString, Window, px, rems};
 
 use crate::config::{self, FontConfig, PanelConfig};
 
 /// Build an [`Hsla`] from a packed `0xRRGGBB` literal in a const context.
 ///
 /// Theme tables are `static`, so the conversion has to happen without
-/// floating-point intrinsics or runtime allocation.
-const fn hex(rgb: u32, a: f32) -> Hsla {
+/// floating-point intrinsics or runtime allocation. Public so consumer
+/// palettes are written the same way the built-ins are.
+pub const fn hex(rgb: u32, a: f32) -> Hsla {
     let r = ((rgb >> 16) & 0xFF) as f32 / 255.0;
     let g = ((rgb >> 8) & 0xFF) as f32 / 255.0;
     let b = (rgb & 0xFF) as f32 / 255.0;
@@ -60,9 +61,27 @@ const fn hex(rgb: u32, a: f32) -> Hsla {
 ///
 /// All colors live here. Widgets must never hardcode an [`Hsla`] literal;
 /// reference a theme field instead so palettes stay swappable.
+///
+/// Consumers add palettes through [`PanelApp::theme`](crate::PanelApp::theme)
+/// or [`register_theme`]. Build one by overriding a built-in rather than
+/// listing every field, so fields added later inherit a sensible value
+/// instead of breaking the consumer's build:
+///
+/// ```
+/// use metor_panel::theme::{DARK, Theme, hex};
+///
+/// let mission = Theme {
+///     name: "Mission".into(),
+///     bg_primary: hex(0x101418, 1.0),
+///     ..DARK.clone()
+/// };
+/// # let _ = mission;
+/// ```
 #[derive(Clone)]
 pub struct Theme {
-    pub name: &'static str,
+    /// Display name in the theme picker, and the registry's identity: a
+    /// second theme with the same name replaces the first.
+    pub name: SharedString,
     pub bg_primary: Hsla,
     pub bg_secondary: Hsla,
     /// Surface lifted above the page, used by palettes and popovers.
@@ -98,13 +117,6 @@ pub struct Theme {
     pub grid_color: Hsla,
     pub axis_color: Hsla,
     pub zero_line_color: Hsla,
-    /// Translucent band over plot regions whose data is remote-only or
-    /// still downloading.
-    pub plot_gap_band: Hsla,
-    /// Alpha applied to a trace's color when it renders as a min/max
-    /// envelope (LoD buckets) instead of raw samples, so operators can
-    /// tell the two apart at a glance.
-    pub plot_envelope_alpha: f32,
     /// Tone ramp for intensity fields — spectrogram magnitude, value
     /// density. Ordered low intensity to high and monotonic in lightness,
     /// starting near `bg_secondary` so a barely-occupied cell fades into
@@ -114,9 +126,6 @@ pub struct Theme {
     /// "On" color for checkboxes, switches, and traffic-light tiles. Replaces
     /// per-call-site indexing into `line_colors`.
     pub control_active: Hsla,
-    /// Dimmed variant of `control_active` used as the track behind a checked
-    /// switch knob. Same hue, lower presence.
-    pub control_active_track: Hsla,
     /// Error accent (build failures, invalid arg pills). Used wherever the
     /// UI needs a "this is wrong" tint.
     pub error_accent: Hsla,
@@ -161,6 +170,17 @@ impl Theme {
         }
     }
 
+    /// Translucent band over plot regions whose data is remote-only or
+    /// still downloading.
+    pub fn plot_gap_band(&self) -> Hsla {
+        Self::dim(self.zero_line_color, 0.12)
+    }
+
+    /// Track behind a checked switch knob: `control_active` with less presence.
+    pub fn control_active_track(&self) -> Hsla {
+        Self::dim(self.control_active, 0.7)
+    }
+
     /// Semi-transparent `bg_secondary` for plot chrome strips — the legend
     /// background and the axis fills that mask GPU-frame edges straying into
     /// the chrome. Derived so it tracks whatever `bg_secondary` a theme picks.
@@ -168,15 +188,6 @@ impl Theme {
         Hsla {
             a: 0.5,
             ..self.bg_secondary
-        }
-    }
-
-    /// Edge color for a connection awaiting validation in the node editor:
-    /// a faded `text_tertiary`.
-    pub fn edge_pending(&self) -> Hsla {
-        Hsla {
-            a: 0.4,
-            ..self.text_tertiary
         }
     }
 
@@ -200,12 +211,6 @@ impl Theme {
     /// the calmer of the two edge kinds since frame edges dominate a target.
     pub fn frame_edge_color(&self) -> Hsla {
         self.line_colors[1]
-    }
-
-    /// Tint for a message edge in the system graph — the purple family, set
-    /// apart from the frame-edge blue so the two kinds read at a glance.
-    pub fn msg_edge_color(&self) -> Hsla {
-        self.line_colors[4]
     }
 
     /// Current-position marker on the map view — the orange family, the
@@ -312,7 +317,7 @@ impl Theme {
 }
 
 /// Component-wise RGB blend of `a` into `b` by `t`, keeping `a`'s alpha.
-fn lerp_color(a: Hsla, b: Hsla, t: f32) -> Hsla {
+pub(crate) fn lerp_color(a: Hsla, b: Hsla, t: f32) -> Hsla {
     let x = gpui::Rgba::from(a);
     let y = gpui::Rgba::from(b);
     let lerp = |p: f32, q: f32| p + (q - p) * t;
@@ -340,8 +345,9 @@ pub fn set_theme(cx: &mut App, theme: Arc<Theme>) {
     cx.set_global(ActiveTheme(theme));
 }
 
-/// Every theme compiled into the binary, in the order the settings UI displays them.
-pub fn all_themes() -> &'static [&'static Theme] {
+/// Every theme compiled into the binary, in the order the theme picker
+/// displays them. [`ThemeRegistry`] starts from this list.
+pub fn builtin_themes() -> &'static [&'static Theme] {
     static THEMES: &[&Theme] = &[
         &DARK,
         &CATPPUCCIN_MOCHA,
@@ -360,6 +366,95 @@ pub fn all_themes() -> &'static [&'static Theme] {
     THEMES
 }
 
+/// The themes the picker offers: the built-ins in display order, then
+/// consumer themes in registration order.
+///
+/// Names are identities, so registering a theme whose name is already
+/// present replaces that entry in place — a consumer can restyle "Dark"
+/// without the picker growing a second one or the order shifting.
+pub struct ThemeRegistry {
+    themes: Vec<Arc<Theme>>,
+}
+
+impl Global for ThemeRegistry {}
+
+impl Default for ThemeRegistry {
+    fn default() -> Self {
+        Self {
+            themes: builtin_themes()
+                .iter()
+                .map(|theme| Arc::new((*theme).clone()))
+                .collect(),
+        }
+    }
+}
+
+impl ThemeRegistry {
+    pub fn register(&mut self, theme: Theme) {
+        let theme = Arc::new(theme);
+        match self.themes.iter_mut().find(|t| t.name == theme.name) {
+            Some(slot) => *slot = theme,
+            None => self.themes.push(theme),
+        }
+    }
+
+    pub fn themes(&self) -> &[Arc<Theme>] {
+        &self.themes
+    }
+
+    pub fn find(&self, name: &str) -> Option<Arc<Theme>> {
+        self.themes.iter().find(|t| t.name == name).cloned()
+    }
+
+    /// The theme a session starts in: `name` if registered, otherwise the
+    /// registry's first entry — "Dark", or whatever a consumer replaced it
+    /// with — so a misspelt default still boots into a coherent palette.
+    pub fn startup_theme(&self, name: Option<&str>) -> Arc<Theme> {
+        if let Some(name) = name {
+            match self.find(name) {
+                Some(theme) => return theme,
+                None => tracing::warn!(name, "unknown default theme; falling back"),
+            }
+        }
+        self.themes[0].clone()
+    }
+}
+
+/// Add `theme` to the picker, replacing a registered theme of the same name.
+/// When the replaced theme is the active one, the replacement takes effect
+/// immediately.
+pub fn register_theme(cx: &mut App, theme: Theme) {
+    let active = cx
+        .try_global::<ActiveTheme>()
+        .is_some_and(|active| active.0.name == theme.name);
+    let name = theme.name.clone();
+    let registry = cx.default_global::<ThemeRegistry>();
+    registry.register(theme);
+    if active && let Some(theme) = registry.find(&name) {
+        set_theme(cx, theme);
+    }
+}
+
+/// Every theme the picker offers. Falls back to the built-ins when no
+/// registry is installed (tests that set a theme directly).
+pub fn themes(cx: &App) -> Vec<Arc<Theme>> {
+    match cx.try_global::<ThemeRegistry>() {
+        Some(registry) => registry.themes().to_vec(),
+        None => ThemeRegistry::default().themes,
+    }
+}
+
+/// Seed the registry with the built-ins plus `extra`, then activate the
+/// startup theme. Runs once at boot, before any window opens.
+pub(crate) fn install_themes(cx: &mut App, extra: Vec<Theme>, default: Option<&str>) {
+    let mut registry = ThemeRegistry::default();
+    for theme in extra {
+        registry.register(theme);
+    }
+    set_theme(cx, registry.startup_theme(default));
+    cx.set_global(registry);
+}
+
 const LINE_COLORS: [Hsla; 8] = [
     hex(0xff7c1f, 1.0), // orange
     hex(0x4aa0e0, 1.0), // blue
@@ -372,7 +467,7 @@ const LINE_COLORS: [Hsla; 8] = [
 ];
 
 pub static DARK: Theme = Theme {
-    name: "Dark",
+    name: SharedString::new_static("Dark"),
 
     bg_primary: hex(0x1f1d1b, 1.0),
     bg_secondary: hex(0x151413, 1.0),
@@ -398,8 +493,6 @@ pub static DARK: Theme = Theme {
     grid_color: hex(0x2e2b28, 1.0),
     axis_color: hex(0x4d4843, 1.0),
     zero_line_color: hex(0x6b6560, 1.0),
-    plot_gap_band: hex(0x6b6560, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x201e1c, 1.0),
         hex(0x175684, 1.0),
@@ -409,12 +502,11 @@ pub static DARK: Theme = Theme {
     ],
 
     control_active: hex(0x40b060, 1.0),
-    control_active_track: hex(0x40b060, 0.7),
     error_accent: hex(0xe04040, 1.0),
 };
 
 pub static CATPPUCCIN_MOCHA: Theme = Theme {
-    name: "Catppuccin Mocha",
+    name: SharedString::new_static("Catppuccin Mocha"),
 
     bg_primary: hex(0x1e1e2e, 1.0),
     bg_secondary: hex(0x11111b, 1.0),
@@ -449,8 +541,6 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
     grid_color: hex(0x313244, 1.0),
     axis_color: hex(0x45475a, 1.0),
     zero_line_color: hex(0x585b70, 1.0),
-    plot_gap_band: hex(0x585b70, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x181828, 1.0),
         hex(0x063e98, 1.0),
@@ -460,12 +550,11 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
     ],
 
     control_active: hex(0xa6e3a1, 1.0),
-    control_active_track: hex(0xa6e3a1, 0.7),
     error_accent: hex(0xf38ba8, 1.0),
 };
 
 pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
-    name: "Catppuccin Macchiato",
+    name: SharedString::new_static("Catppuccin Macchiato"),
 
     bg_primary: hex(0x24273a, 1.0),
     bg_secondary: hex(0x1e2030, 1.0),
@@ -500,8 +589,6 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     grid_color: hex(0x363a4f, 1.0),
     axis_color: hex(0x494d64, 1.0),
     zero_line_color: hex(0x5b6078, 1.0),
-    plot_gap_band: hex(0x5b6078, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x25283e, 1.0),
         hex(0x1042a8, 1.0),
@@ -511,12 +598,11 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     ],
 
     control_active: hex(0xa6da95, 1.0),
-    control_active_track: hex(0xa6da95, 0.7),
     error_accent: hex(0xed8796, 1.0),
 };
 
 pub static CATPPUCCIN_LATTE: Theme = Theme {
-    name: "Catppuccin Latte",
+    name: SharedString::new_static("Catppuccin Latte"),
 
     bg_primary: hex(0xeff1f5, 1.0),
     bg_secondary: hex(0xe6e9ef, 1.0),
@@ -551,8 +637,6 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
     grid_color: hex(0xdce0e8, 1.0),
     axis_color: hex(0xccd0da, 1.0),
     zero_line_color: hex(0xbcc0cc, 1.0),
-    plot_gap_band: hex(0xbcc0cc, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0xd6dbe6, 1.0),
         hex(0xfea46f, 1.0),
@@ -562,12 +646,11 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
     ],
 
     control_active: hex(0x40a02b, 1.0),
-    control_active_track: hex(0x40a02b, 0.7),
     error_accent: hex(0xd20f39, 1.0),
 };
 
 pub static AYU_DARK: Theme = Theme {
-    name: "Ayu Dark",
+    name: SharedString::new_static("Ayu Dark"),
 
     bg_primary: hex(0x0b0e14, 1.0),
     bg_secondary: hex(0x0f131a, 1.0),
@@ -602,8 +685,6 @@ pub static AYU_DARK: Theme = Theme {
     grid_color: hex(0x11151c, 1.0),
     axis_color: hex(0x1a1e28, 1.0),
     zero_line_color: hex(0x2a2e38, 1.0),
-    plot_gap_band: hex(0x2a2e38, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x161c28, 1.0),
         hex(0x00629c, 1.0),
@@ -613,12 +694,11 @@ pub static AYU_DARK: Theme = Theme {
     ],
 
     control_active: hex(0x7fd962, 1.0),
-    control_active_track: hex(0x7fd962, 0.7),
     error_accent: hex(0xff3333, 1.0),
 };
 
 pub static EVERFOREST_DARK: Theme = Theme {
-    name: "Everforest Dark",
+    name: SharedString::new_static("Everforest Dark"),
 
     bg_primary: hex(0x2d353b, 1.0),
     bg_secondary: hex(0x232a2e, 1.0),
@@ -653,8 +733,6 @@ pub static EVERFOREST_DARK: Theme = Theme {
     grid_color: hex(0x3d484d, 1.0),
     axis_color: hex(0x475258, 1.0),
     zero_line_color: hex(0x56635f, 1.0),
-    plot_gap_band: hex(0x56635f, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x2b353b, 1.0),
         hex(0x407972, 1.0),
@@ -664,12 +742,11 @@ pub static EVERFOREST_DARK: Theme = Theme {
     ],
 
     control_active: hex(0xa7c080, 1.0),
-    control_active_track: hex(0xa7c080, 0.7),
     error_accent: hex(0xe67e80, 1.0),
 };
 
 pub static EVERFOREST_LIGHT: Theme = Theme {
-    name: "Everforest Light",
+    name: SharedString::new_static("Everforest Light"),
 
     bg_primary: hex(0xfdf6e3, 1.0),
     bg_secondary: hex(0xf4f0d9, 1.0),
@@ -704,8 +781,6 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     grid_color: hex(0xefebd4, 1.0),
     axis_color: hex(0xe6e2cc, 1.0),
     zero_line_color: hex(0xbdc3af, 1.0),
-    plot_gap_band: hex(0xbdc3af, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0xefe9c4, 1.0),
         hex(0xf8a96f, 1.0),
@@ -715,12 +790,11 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     ],
 
     control_active: hex(0x8da101, 1.0),
-    control_active_track: hex(0x8da101, 0.7),
     error_accent: hex(0xf85552, 1.0),
 };
 
 pub static ROSE_PINE: Theme = Theme {
-    name: "Rosé Pine",
+    name: SharedString::new_static("Rosé Pine"),
 
     bg_primary: hex(0x1f1d2e, 1.0),
     bg_secondary: hex(0x191724, 1.0),
@@ -755,8 +829,6 @@ pub static ROSE_PINE: Theme = Theme {
     grid_color: hex(0x21202e, 1.0),
     axis_color: hex(0x403d52, 1.0),
     zero_line_color: hex(0x524f67, 1.0),
-    plot_gap_band: hex(0x524f67, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x211e31, 1.0),
         hex(0x2b667e, 1.0),
@@ -766,12 +838,11 @@ pub static ROSE_PINE: Theme = Theme {
     ],
 
     control_active: hex(0x9ccfd8, 1.0),
-    control_active_track: hex(0x9ccfd8, 0.7),
     error_accent: hex(0xeb6f92, 1.0),
 };
 
 pub static ROSE_PINE_MOON: Theme = Theme {
-    name: "Rosé Pine Moon",
+    name: SharedString::new_static("Rosé Pine Moon"),
 
     bg_primary: hex(0x2a273f, 1.0),
     bg_secondary: hex(0x232136, 1.0),
@@ -806,8 +877,6 @@ pub static ROSE_PINE_MOON: Theme = Theme {
     grid_color: hex(0x2a283e, 1.0),
     axis_color: hex(0x44415a, 1.0),
     zero_line_color: hex(0x56526e, 1.0),
-    plot_gap_band: hex(0x56526e, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x2a2844, 1.0),
         hex(0x32728d, 1.0),
@@ -817,12 +886,11 @@ pub static ROSE_PINE_MOON: Theme = Theme {
     ],
 
     control_active: hex(0x9ccfd8, 1.0),
-    control_active_track: hex(0x9ccfd8, 0.7),
     error_accent: hex(0xeb6f92, 1.0),
 };
 
 pub static ROSE_PINE_DAWN: Theme = Theme {
-    name: "Rosé Pine Dawn",
+    name: SharedString::new_static("Rosé Pine Dawn"),
 
     bg_primary: hex(0xfffaf3, 1.0),
     bg_secondary: hex(0xfaf4ed, 1.0),
@@ -857,8 +925,6 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     grid_color: hex(0xf4ede8, 1.0),
     axis_color: hex(0xdfdad9, 1.0),
     zero_line_color: hex(0xcecacd, 1.0),
-    plot_gap_band: hex(0xcecacd, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0xf5e8d9, 1.0),
         hex(0xf3c689, 1.0),
@@ -868,12 +934,11 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     ],
 
     control_active: hex(0x56949f, 1.0),
-    control_active_track: hex(0x56949f, 0.7),
     error_accent: hex(0xb4637a, 1.0),
 };
 
 pub static MAKING_SOFTWARE: Theme = Theme {
-    name: "Making Software",
+    name: SharedString::new_static("Making Software"),
 
     bg_primary: hex(0xf4f5f9, 1.0),
     bg_secondary: hex(0xeceef5, 1.0),
@@ -908,8 +973,6 @@ pub static MAKING_SOFTWARE: Theme = Theme {
     grid_color: hex(0xe6ebff, 1.0),
     axis_color: hex(0xb9c7fd, 1.0),
     zero_line_color: hex(0x97acff, 1.0),
-    plot_gap_band: hex(0x97acff, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0xdbdfed, 1.0),
         hex(0xffdd78, 1.0),
@@ -919,12 +982,11 @@ pub static MAKING_SOFTWARE: Theme = Theme {
     ],
 
     control_active: hex(0x1342ff, 1.0),
-    control_active_track: hex(0x1342ff, 0.7),
     error_accent: hex(0xc02434, 1.0),
 };
 
 pub static DEPARTURE: Theme = Theme {
-    name: "Departure",
+    name: SharedString::new_static("Departure"),
 
     bg_primary: hex(0x1a1815, 1.0),
     bg_secondary: hex(0x131210, 1.0),
@@ -959,8 +1021,6 @@ pub static DEPARTURE: Theme = Theme {
     grid_color: hex(0x2a2018, 1.0),
     axis_color: hex(0x3a2a18, 1.0),
     zero_line_color: hex(0x5a3e20, 1.0),
-    plot_gap_band: hex(0x5a3e20, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x1f1d19, 1.0),
         hex(0x1f7878, 1.0),
@@ -970,7 +1030,6 @@ pub static DEPARTURE: Theme = Theme {
     ],
 
     control_active: hex(0xf0a040, 1.0),
-    control_active_track: hex(0xf0a040, 0.7),
     error_accent: hex(0xe05050, 1.0),
 };
 
@@ -981,7 +1040,7 @@ pub static DEPARTURE: Theme = Theme {
 /// pottery repair it's named for. The categorical line palette leads with those
 /// warm tones, keeping a few cool anchors so series stay distinguishable.
 pub static KINTSUGI: Theme = Theme {
-    name: "Kintsugi Flared",
+    name: SharedString::new_static("Kintsugi Flared"),
 
     bg_primary: hex(0x161618, 1.0),
     bg_secondary: hex(0x131314, 1.0),
@@ -1016,8 +1075,6 @@ pub static KINTSUGI: Theme = Theme {
     grid_color: hex(0x1d1d1c, 1.0),
     axis_color: hex(0x444444, 1.0),
     zero_line_color: hex(0x5c584f, 1.0),
-    plot_gap_band: hex(0x5c584f, 0.12),
-    plot_envelope_alpha: 0.55,
     density_stops: [
         hex(0x1c1c1f, 1.0),
         hex(0x444c57, 1.0),
@@ -1027,7 +1084,6 @@ pub static KINTSUGI: Theme = Theme {
     ],
 
     control_active: hex(0xdbad49, 1.0),
-    control_active_track: hex(0xdbad49, 0.7),
     error_accent: hex(0xd66848, 1.0),
 };
 
@@ -1038,6 +1094,26 @@ pub const BUNDLED_FAMILY: &str = "IoskeleyMono Nerd Font";
 /// Family the [`FontConfig::Auto`] mode reaches for first, when the system has
 /// it installed. Falls back to [`BUNDLED_FAMILY`] otherwise.
 pub const PREFERRED_FAMILY: &str = "Berkeley Mono";
+
+/// The rem gpui starts every window at. The panel never sets its own, so
+/// outside a zoomed dashboard widget one rem is always this many pixels.
+const BASE_REM: f32 = 16.0;
+
+/// A length designed in pixels that follows the rem instead of pinning it.
+///
+/// Identical to `px(n)` at the base rem, which is everywhere but inside a
+/// dashboard widget, where the zoom scales the rem and so everything sized
+/// through here. Widget views size their text, spacing and rows with it;
+/// hairline borders stay in `px` so they never vanish when zoomed out.
+pub(crate) fn ui_px(n: f32) -> Rems {
+    rems(n / BASE_REM)
+}
+
+/// How far the current rem is from the base: the factor text and strokes a
+/// view shapes and paints itself multiply by to follow [`ui_px`] layout.
+pub(crate) fn ui_scale(window: &Window) -> f32 {
+    window.rem_size() / px(BASE_REM)
+}
 
 /// Load the embedded fallback font into gpui's text system.
 ///
@@ -1134,7 +1210,7 @@ mod tests {
     /// intensity extremes has to paint the colors those extremes map to.
     #[test]
     fn density_color_hits_the_stops() {
-        for theme in all_themes() {
+        for theme in builtin_themes() {
             let stops = &theme.density_stops;
             assert!(
                 approx(theme.density_color(0.0), stops[0]),
@@ -1158,11 +1234,81 @@ mod tests {
         }
     }
 
+    fn named(name: &'static str) -> Theme {
+        Theme {
+            name: name.into(),
+            bg_primary: hex(0x101418, 1.0),
+            ..DARK.clone()
+        }
+    }
+
+    fn names(registry: &ThemeRegistry) -> Vec<&str> {
+        registry.themes().iter().map(|t| t.name.as_ref()).collect()
+    }
+
+    /// Consumer themes follow the built-ins, and re-registering a name
+    /// restyles that entry where it stands instead of listing it twice.
+    #[test]
+    fn registry_appends_and_replaces_by_name() {
+        let mut registry = ThemeRegistry::default();
+        let builtins: Vec<&str> = builtin_themes().iter().map(|t| t.name.as_ref()).collect();
+        assert_eq!(names(&registry), builtins);
+
+        registry.register(named("Mission"));
+        registry.register(named("Night Ops"));
+        let mut expected = builtins.clone();
+        expected.extend(["Mission", "Night Ops"]);
+        assert_eq!(names(&registry), expected);
+
+        registry.register(named("Dark"));
+        registry.register(Theme {
+            bg_primary: hex(0x202020, 1.0),
+            ..named("Mission")
+        });
+        assert_eq!(names(&registry), expected);
+        assert!(approx(registry.themes()[0].bg_primary, hex(0x101418, 1.0)));
+        let mission = registry.find("Mission").unwrap();
+        assert!(approx(mission.bg_primary, hex(0x202020, 1.0)));
+    }
+
+    #[test]
+    fn startup_theme_falls_back_to_dark() {
+        let mut registry = ThemeRegistry::default();
+        registry.register(named("Mission"));
+        assert_eq!(registry.startup_theme(None).name, "Dark");
+        assert_eq!(registry.startup_theme(Some("Nope")).name, "Dark");
+        assert_eq!(registry.startup_theme(Some("Mission")).name, "Mission");
+        assert_eq!(
+            registry.startup_theme(Some("Rosé Pine")).name,
+            ROSE_PINE.name
+        );
+    }
+
+    #[gpui::test]
+    fn install_activates_the_default_and_registering_the_active_name_repaints(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            install_themes(cx, vec![named("Mission")], Some("Mission"));
+            assert_eq!(theme(cx).name, "Mission");
+            assert_eq!(themes(cx).last().unwrap().name, "Mission");
+
+            register_theme(
+                cx,
+                Theme {
+                    bg_primary: hex(0x202020, 1.0),
+                    ..named("Mission")
+                },
+            );
+            assert!(approx(theme(cx).bg_primary, hex(0x202020, 1.0)));
+        });
+    }
+
     /// Intensity has to read as intensity even in greyscale, so every ramp
     /// moves steadily away from its background rather than wandering.
     #[test]
     fn density_stops_are_monotonic_in_lightness() {
-        for theme in all_themes() {
+        for theme in builtin_themes() {
             let l: Vec<f32> = theme.density_stops.iter().map(|c| c.l).collect();
             let rising = l.windows(2).all(|w| w[0] < w[1]);
             let falling = l.windows(2).all(|w| w[0] > w[1]);

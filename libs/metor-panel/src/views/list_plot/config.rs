@@ -107,7 +107,7 @@ impl ListPlot {
             })
             .collect();
         let plot = Self::new(db, traces, cx);
-        plot.line_plot.update(cx, |line_plot, cx| {
+        plot.line_plot().update(cx, |line_plot, cx| {
             line_plot.custom_title = config.custom_title.map(SharedString::from);
             line_plot.x_min_override = config.x_min_override;
             line_plot.x_max_override = config.x_max_override;
@@ -119,7 +119,7 @@ impl ListPlot {
     }
 
     pub fn to_config(&self, cx: &App) -> ListPlotPanelConfig {
-        let line_plot = self.line_plot.read(cx);
+        let line_plot = self.line_plot().read(cx);
         ListPlotPanelConfig {
             label: self.title(cx).to_string(),
             traces: line_plot

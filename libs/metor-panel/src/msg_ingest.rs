@@ -7,11 +7,9 @@
 //! history and each live batch merge in timestamp order across every source.
 
 use std::cmp::Ordering;
-use std::future::{Future, poll_fn};
 use std::sync::Arc;
-use std::task::Poll;
 
-use gpui::{AsyncApp, WeakEntity};
+use gpui::{App, AppContext, AsyncApp, Context, Entity, Global, Task, WeakEntity};
 use metor_db::DB;
 use metor_db::disruptor::Reader;
 use metor_db::msg_log::read_msg;
@@ -56,6 +54,36 @@ impl<S> IngestSource<S> {
     }
 }
 
+/// The app-global slot holding the one entity of store type `S`.
+struct GlobalStore<S>(Entity<S>);
+
+impl<S: 'static> Global for GlobalStore<S> {}
+
+/// Create the app's `S` store entity and publish it for [`global`].
+pub(crate) fn install<S: 'static>(
+    cx: &mut App,
+    build: impl FnOnce(&mut Context<S>) -> S,
+) -> Entity<S> {
+    let entity = cx.new(build);
+    cx.set_global(GlobalStore(entity.clone()));
+    entity
+}
+
+/// The shared `S` store, or `None` if it was never installed (e.g. in tests).
+pub(crate) fn global<S: 'static>(cx: &App) -> Option<Entity<S>> {
+    cx.try_global::<GlobalStore<S>>().map(|g| g.0.clone())
+}
+
+/// Spawn [`ingest_all`] for the store under construction; the store keeps the
+/// task so ingestion stops when the entity drops.
+pub(crate) fn spawn_ingest<S: 'static>(
+    db: Arc<DB>,
+    sources: Vec<IngestSource<S>>,
+    cx: &mut Context<S>,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| ingest_all(db, sources, this, cx).await)
+}
+
 /// Backfill the persisted history of every source as one timestamp-sorted merge,
 /// then merge available WAL messages into the store entity `this`. The store is
 /// notified once after the backfill and after each applied live batch. The loop
@@ -72,7 +100,7 @@ pub(crate) async fn ingest_all<S: 'static>(
 ) {
     let mut kept: Vec<IngestSource<S>> = Vec::new();
     let mut tails = Vec::new();
-    let mut entries: Vec<(Timestamp, usize, Vec<u8>)> = Vec::new();
+    let mut entries: Vec<Entry> = Vec::new();
 
     for source in sources {
         let Ok(msg_log) =
@@ -152,7 +180,8 @@ struct LiveSource {
     boundary: Vec<Vec<u8>>,
 }
 
-type Entry = (Timestamp, usize, Vec<u8>);
+/// A message awaiting its fold: `(timestamp, source index, payload)`.
+pub(crate) type Entry = (Timestamp, usize, Vec<u8>);
 
 fn collect_messages(
     index: usize,
@@ -206,25 +235,16 @@ async fn wait_for_source(tails: &mut [LiveSource]) -> Vec<Entry> {
             })
         })
         .collect();
-    poll_fn(|cx| {
-        for wait in &mut waits {
-            if let Poll::Ready(entries) = wait.as_mut().poll(cx) {
-                return Poll::Ready(entries);
-            }
-        }
-        Poll::Pending
-    })
-    .await
+    crate::first_ready(&mut waits).await
 }
 
-/// Fold a history or live batch into the store in timestamp order. Entries are
-/// `(timestamp, source index, payload)`; equal timestamps fold in source
+/// Fold a history or live batch into the store in timestamp order. Equal timestamps fold in source
 /// declaration order, so callers list sources cause before effect (defs before
 /// raises, the registry before its events).
 pub(crate) fn apply_backfill<S>(
     store: &mut S,
     sources: &mut [IngestSource<S>],
-    mut entries: Vec<(Timestamp, usize, Vec<u8>)>,
+    mut entries: Vec<Entry>,
 ) {
     entries.sort_by_key(|&(ts, idx, _)| (ts, idx));
     for (ts, idx, bytes) in entries {

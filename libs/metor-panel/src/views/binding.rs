@@ -11,8 +11,6 @@ use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType, Tim
 use metor_proto_wkt::Severity;
 use smallvec::SmallVec;
 
-use crate::ComponentStreamBuilder;
-
 pub(crate) enum StreamUpdate<I, V> {
     Ready(I),
     Value(V),
@@ -182,24 +180,150 @@ pub(crate) fn rebound(want: ElementRef, bound: &mut Option<ElementRef>) -> bool 
     true
 }
 
+/// The stream half of an instrument's binding, held as one opaque field.
+///
+/// The editable half (`source`, element, label) stays on the instrument: the
+/// inspector reflects a struct's own fields by index and can't flatten a
+/// nested one.
+pub(crate) struct LiveBinding<V> {
+    bound: Option<ElementRef>,
+    pub value: Option<V>,
+    pub db: Arc<DB>,
+    _registrations: gpui::Task<()>,
+    stream: gpui::Task<()>,
+    resolver: gpui::Task<()>,
+}
+
+impl<V> LiveBinding<V> {
+    /// Bound to `at`; the caller starts the stream with [`restream`](Self::restream).
+    pub(crate) fn new<E: 'static>(at: ElementRef, db: Arc<DB>, cx: &mut Context<E>) -> Self {
+        Self {
+            bound: Some(at),
+            value: None,
+            _registrations: crate::data_binding::watch_registrations(db.clone(), cx),
+            db,
+            stream: gpui::Task::ready(()),
+            resolver: gpui::Task::ready(()),
+        }
+    }
+
+    /// Bound to nothing, as an inspector "add" creates an entry.
+    pub(crate) fn idle(db: Arc<DB>) -> Self {
+        Self {
+            bound: Some(ElementRef::new(
+                crate::data_binding::Binding::default().id(),
+                0,
+            )),
+            value: None,
+            db,
+            _registrations: gpui::Task::ready(()),
+            stream: gpui::Task::ready(()),
+            resolver: gpui::Task::ready(()),
+        }
+    }
+
+    /// Resolve `source` and, when it points somewhere new, return the new
+    /// target and its metadata. The previous value is dropped rather than
+    /// left on screen under the new binding.
+    pub(crate) fn moved(
+        &mut self,
+        source: &mut crate::data_binding::Binding,
+        element: usize,
+        cx: &mut App,
+    ) -> Option<(ElementRef, ComponentMeta)> {
+        source.resolve(&self.db, cx);
+        let want = ElementRef::new(source.id(), element);
+        if !rebound(want, &mut self.bound) {
+            return None;
+        }
+        self.value = None;
+        Some((want, component_meta(&self.db, want.component)))
+    }
+
+    pub(crate) fn restream(&mut self, stream: gpui::Task<()>, resolver: gpui::Task<()>) {
+        self.stream = stream;
+        self.resolver = resolver;
+    }
+}
+
+/// A single-element instrument whose label and unit follow its component.
+pub(crate) trait ScalarInstrument: 'static {
+    /// Label, unit and stream, for tasks writing back into the view.
+    fn scalar(&mut self) -> (&mut SharedString, &mut SharedString, &mut LiveBinding<f64>);
+}
+
+/// Stream `at` into `live`. Unless kept, label and unit are refreshed from
+/// metadata once the component registers — a configured one is the
+/// operator's, not the component's.
+pub(crate) fn stream_scalar<E: ScalarInstrument>(
+    live: &mut LiveBinding<f64>,
+    at: ElementRef,
+    keep_label: bool,
+    keep_unit: bool,
+    cx: &mut Context<E>,
+) {
+    let stream = spawn_scalar_stream(
+        live.db.clone(),
+        at.component,
+        at.element,
+        cx,
+        |view: &mut E, value, cx| {
+            view.scalar().2.value = value;
+            cx.notify();
+        },
+    );
+    let resolver = spawn_meta_resolver(
+        live.db.clone(),
+        at.component,
+        cx,
+        move |view: &mut E, meta, cx| {
+            let (label, unit, _) = view.scalar();
+            if !keep_label {
+                *label = default_label(&meta.element_names, at.element, &meta.name);
+            }
+            if !keep_unit {
+                *unit = meta.unit;
+            }
+            cx.notify();
+        },
+    );
+    live.restream(stream, resolver);
+}
+
+/// The element's own name when the component has more than one, else the
+/// component's — a single-element meter labelled `"[0]"` tells the operator
+/// nothing.
+pub(crate) fn default_label(
+    element_names: &[SharedString],
+    element: usize,
+    component_name: &SharedString,
+) -> SharedString {
+    if element_names.len() > 1 {
+        element_names
+            .get(element)
+            .cloned()
+            .unwrap_or_else(|| component_name.clone())
+    } else {
+        component_name.clone()
+    }
+}
+
 /// Deliver source initialization, the latest committed value, then updates.
-pub(crate) fn spawn_seeded_stream<E, S, I, V, P, D, A>(
+pub(crate) fn spawn_seeded_stream<E, I, V, P, D, A>(
     db: Arc<DB>,
-    source: S,
+    component_id: ComponentId,
     cx: &mut Context<E>,
     prepare: P,
     apply: A,
 ) -> gpui::Task<()>
 where
     E: 'static,
-    S: ComponentStreamBuilder + Send + 'static,
     I: Send + 'static,
     V: Send + 'static,
     P: FnOnce(&DB, ComponentId) -> (I, D) + Send + 'static,
     D: for<'a> Fn(ComponentView<'a>) -> Option<V> + Send + 'static,
     A: Fn(&mut E, StreamUpdate<I, V>, &mut Context<E>) + Send + 'static,
 {
-    let component_id = source.component_id();
     let reader = crate::temporal::samples::acquire(db.clone(), component_id, cx);
     cx.spawn(async move |this, cx| {
         let component = crate::wait_for_component(&db, component_id).await;
@@ -229,10 +353,10 @@ where
             deliver(view, &reader, cx);
             cx.observe(&reader, move |view, reader, cx| deliver(view, &reader, cx))
         });
-        // The task owns both the source and the shared-reader lease. GPUI observations
+        // The task owns the shared-reader lease. GPUI observations
         // clear cached widget state in the same update cycle as a seek.
         std::future::pending::<()>().await;
-        drop((subscription, reader, source));
+        drop((subscription, reader));
     })
 }
 
@@ -243,7 +367,7 @@ where
 /// The task exits when the entity is dropped (the `update` returns `Err`).
 pub(crate) fn spawn_scalar_stream<E, F>(
     db: Arc<DB>,
-    source: impl ComponentStreamBuilder + Send + 'static,
+    component_id: ComponentId,
     element: usize,
     cx: &mut Context<E>,
     apply: F,
@@ -254,7 +378,7 @@ where
 {
     spawn_seeded_stream(
         db,
-        source,
+        component_id,
         cx,
         move |_, _| {
             ((), move |view: ComponentView<'_>| {
@@ -318,7 +442,7 @@ where
 /// The task exits when the entity is dropped (the `update` returns `Err`).
 pub(crate) fn spawn_on_stream<E, F>(
     db: Arc<DB>,
-    source: impl ComponentStreamBuilder + Send + 'static,
+    component_id: ComponentId,
     cx: &mut Context<E>,
     apply: F,
 ) -> gpui::Task<()>
@@ -328,7 +452,7 @@ where
 {
     spawn_seeded_stream(
         db,
-        source,
+        component_id,
         cx,
         |_, _| {
             ((), |view: ComponentView<'_>| {
@@ -360,6 +484,74 @@ pub(crate) fn any_on(values: impl Iterator<Item = ElementValue>) -> bool {
         }
     }
     false
+}
+
+/// Element 0 of a component read as a state code — a bool as 0/1 — for the
+/// views that map codes to something (a toggle's segments, a state's
+/// image). Held as one opaque field; [`follow`](Self::follow) every render.
+#[derive(Default)]
+pub(crate) struct CodeFeed {
+    streaming: Option<ComponentId>,
+    pub value: Option<f64>,
+    pub stale: bool,
+    pub is_bool: bool,
+    _task: Option<gpui::Task<()>>,
+}
+
+impl CodeFeed {
+    /// Stream `want`, restarting only when it changes; `None` stops.
+    /// `feed` finds this feed on the view the task writes back into.
+    pub(crate) fn follow<E: 'static>(
+        &mut self,
+        want: Option<ComponentId>,
+        db: &Arc<DB>,
+        cx: &mut Context<E>,
+        feed: fn(&mut E) -> &mut CodeFeed,
+    ) {
+        if self.streaming == want {
+            return;
+        }
+        *self = Self {
+            streaming: want,
+            _task: want.map(|id| spawn_code_feed(db.clone(), id, cx, feed)),
+            ..Self::default()
+        };
+    }
+}
+
+fn spawn_code_feed<E: 'static>(
+    db: Arc<DB>,
+    id: ComponentId,
+    cx: &mut Context<E>,
+    feed: fn(&mut E) -> &mut CodeFeed,
+) -> gpui::Task<()> {
+    spawn_seeded_stream(
+        db,
+        id,
+        cx,
+        |db, id| {
+            let is_bool = component_meta(db, id).is_bool;
+            (is_bool, |view: ComponentView<'_>| {
+                view.iter().next().map(|value| value.as_f64())
+            })
+        },
+        move |view, update, cx| {
+            let feed = feed(view);
+            match update {
+                StreamUpdate::Ready(is_bool) => feed.is_bool = is_bool,
+                StreamUpdate::Value(value) => {
+                    feed.value = Some(value);
+                    feed.stale = false;
+                }
+                StreamUpdate::Stale => feed.stale = true,
+                StreamUpdate::Unavailable => {
+                    feed.value = None;
+                    feed.stale = false;
+                }
+            }
+            cx.notify();
+        },
+    )
 }
 
 /// Limit values declared for `at` by the control system's alarm definitions,
@@ -451,6 +643,16 @@ mod tests {
         let other_element = ElementRef::new(ComponentId(9), 2);
         assert!(rebound(other_element, &mut bound));
         assert!(!rebound(other_element, &mut bound));
+    }
+
+    #[test]
+    fn label_prefers_the_element_name_only_when_there_are_several() {
+        let comp = SharedString::from("plant.wheels");
+        let many: Vec<SharedString> = vec!["x".into(), "y".into(), "z".into()];
+        assert_eq!(default_label(&many, 1, &comp), SharedString::from("y"));
+        let one: Vec<SharedString> = vec!["[0]".into()];
+        assert_eq!(default_label(&one, 0, &comp), comp);
+        assert_eq!(default_label(&many, 9, &comp), comp);
     }
 
     #[test]

@@ -151,12 +151,7 @@ impl SessionStartup {
             return;
         }
         self.selecting = true;
-        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: true,
-            multiple: false,
-            prompt: Some("Open recording".into()),
-        });
+        let receiver = cx.prompt_for_paths(super::open_recording_prompt());
         cx.spawn_in(window, async move |this, cx| {
             let result = receiver.await;
             let _ = this.update_in(cx, |this, window, cx| {

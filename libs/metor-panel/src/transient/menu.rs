@@ -94,7 +94,7 @@ fn window_menu(
             let on_open = on_open.clone();
             move |window, cx| {
                 if let Some(pane) = tiles.read(cx).active_pane(cx) {
-                    let rows = new_panel_rows(db.clone(), pane, Some(on_open.clone()), cx);
+                    let rows = new_panel_rows(db.clone(), pane, Some(on_open.clone()));
                     open_centered(&on_open, rows, window, cx);
                 }
             }
@@ -145,7 +145,10 @@ fn appearance_menu(on_open: OpenInspectorCallback, cx: &App) -> Vec<ChordNode> {
     vec![
         ChordNode::command("t", "Theme", {
             let on_open = on_open.clone();
-            move |window, cx| open_centered(&on_open, theme_rows(), window, cx)
+            move |window, cx| {
+                let rows = theme_rows(cx);
+                open_centered(&on_open, rows, window, cx);
+            }
         }),
         ChordNode::command("f", "Font", {
             let on_open = on_open.clone();
@@ -217,7 +220,7 @@ fn split_active(
         Some(new_pane)
     });
     if let Some(new_pane) = new_pane {
-        let rows = new_panel_rows(db.clone(), new_pane, Some(on_open.clone()), cx);
+        let rows = new_panel_rows(db.clone(), new_pane, Some(on_open.clone()));
         open_centered(on_open, rows, window, cx);
     }
 }

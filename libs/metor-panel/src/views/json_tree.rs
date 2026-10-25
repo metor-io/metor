@@ -92,7 +92,7 @@ impl JsonTree {
             } else {
                 Icon::ChevronRight
             };
-            slot = slot.child(icon.svg_color(10.0, theme.text_secondary));
+            slot = slot.child(icon.svg(10.0, theme.text_secondary));
         }
         row = row.child(slot);
 

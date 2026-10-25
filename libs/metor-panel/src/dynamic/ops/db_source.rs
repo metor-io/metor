@@ -9,7 +9,7 @@ use std::sync::Arc;
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use crate::dynamic::node::{BuildError, DynamicNode, NodeId, NodeImpl, ValueType, hash_id, op_tag};
+use crate::dynamic::node::{BuildError, Node, NodeId, ValueType, hash_id, op_tag};
 
 /// The node id [`from_db`] will give this component.
 ///
@@ -27,16 +27,15 @@ pub fn from_db_id(component_id: ComponentId) -> NodeId {
 /// registered before this is called — its schema is read upfront so the
 /// node has a stable [`ValueType`]. To wait for a component that may not
 /// be registered yet, await [`crate::wait_for_component`] first.
-pub fn from_db(db: &DB, component_id: ComponentId) -> Result<Arc<dyn DynamicNode>, BuildError> {
+pub fn from_db(db: &DB, component_id: ComponentId) -> Result<Arc<Node>, BuildError> {
     let component = db
         .with_state(|s| s.get_component(component_id).cloned())
         .ok_or(BuildError::ComponentNotFound(component_id))?;
     let schema = component.schema.clone();
     let id = from_db_id(component_id);
-    Ok(NodeImpl::spawn_with_output(
+    Ok(Node::spawn_with_output(
         id,
         ValueType::Value(schema),
-        Some(id),
         component.wal,
         |_| async {},
     ))

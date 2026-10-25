@@ -9,10 +9,11 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use gpui::AppContext as _;
-use gpui::{Entity, Hsla, SharedString};
+use gpui::{AnyEntity, App, Entity, Hsla, SharedString};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
+use crate::inspector::rows::color::AutoColor;
 use crate::inspector::rows::{
     BoolRow, ColorRow, CommandRow, InspectorRow, NavRow, ScalarRow, TextRow,
 };
@@ -84,9 +85,9 @@ impl InspectorRegistry {
         self.register_override_f64();
         self.register_override_shared_string();
         self.register_override_hsla();
+        self.register_option_hsla();
         self.register_time_range_behavior();
         self.register_override_time_range_behavior();
-        self.register_inspectable::<crate::views::ComponentText>();
         self.register_inspectable::<crate::views::Monitor>();
         self.register_inspectable::<crate::views::AlarmView>();
         self.register_inspectable::<crate::views::SequenceView>();
@@ -97,8 +98,10 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::SequenceControl>();
         self.register_inspectable::<crate::views::Map>();
         self.register_inspectable::<crate::views::SamplesTable>();
+        self.register_inspectable::<crate::views::Label>();
+        self.register_inspectable::<crate::views::StateImage>();
+        self.register_inspectable::<crate::views::StateImageEntry>();
         self.register_entity_list::<crate::views::AttitudeIndicator, crate::views::VectorMarker>(
-            db.clone(),
             |a| &a.vectors,
             |a| &mut a.vectors,
             AddBehavior::Default(Arc::new({
@@ -109,73 +112,60 @@ impl InspectorRegistry {
             })),
         );
         self.register_entity_list::<crate::views::StateChip, crate::views::StateEntry>(
-            db.clone(),
             |c| &c.states,
             |c| &mut c.states,
             AddBehavior::Default(Arc::new(|_cx| crate::views::StateEntry::empty())),
         );
+        self.register_entity_list::<crate::views::StateImage, crate::views::StateImageEntry>(
+            |v| &v.states,
+            |v| &mut v.states,
+            AddBehavior::Default(Arc::new(|_cx| crate::views::StateImageEntry::empty())),
+        );
         self.register_entity_list::<LinePlot, Trace>(
-            db.clone(),
             |lp| &lp.traces,
             |lp| &mut lp.traces,
-            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
-                builders::build_trace_add_wizard(parent, db, cx)
-            })),
+            AddBehavior::Wizard(Arc::new(builders::build_trace_add_wizard)),
         );
         self.register_entity_list::<LinePlot, YAxis>(
-            db.clone(),
             |lp| &lp.axes,
             |lp| &mut lp.axes,
             AddBehavior::Default(Arc::new(|_cx| YAxis::new("Y"))),
         );
         self.register_entity_list::<LinePlot, EventOverlay>(
-            db.clone(),
             |lp| &lp.event_overlays,
             |lp| &mut lp.event_overlays,
-            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
-                builders::build_event_overlay_wizard(parent, db, cx)
-            })),
+            AddBehavior::Wizard(Arc::new(builders::build_event_overlay_wizard)),
         );
         self.register_entity_list::<crate::views::Annunciator, crate::views::annunciator::Condition>(
-            db.clone(), |v| &v.conditions, |v| &mut v.conditions,
+            |v| &v.conditions, |v| &mut v.conditions,
             AddBehavior::Default(Arc::new(|_| crate::views::annunciator::Condition::default())),
         );
         self.register_entity_list::<Viewer3d, crate::views::viewer_3d::ModelEntry>(
-            db.clone(),
             |v| &v.models,
             |v| &mut v.models,
             AddBehavior::Default(Arc::new(|_cx| crate::views::viewer_3d::ModelEntry::empty())),
         );
-        self.register_viewer3d_builder(db.clone());
+        self.register_viewer3d_builder();
         self.register_measurement_cursor_builder();
-        self.register_dashboard_builder(db.clone());
+        self.register_dashboard_builder();
         self.register_pane_builder();
         self.register_component_browser_builder();
         self.register_outline_builder();
-        self.register_trace_builder(db.clone());
+        self.register_trace_builder();
         self.register_entity_list::<XyLinePlot, XyTrace>(
-            db.clone(),
             |lp| &lp.traces,
             |lp| &mut lp.traces,
-            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
-                builders::build_xy_trace_add_wizard(parent, db, cx)
-            })),
+            AddBehavior::Wizard(Arc::new(builders::build_xy_trace_add_wizard)),
         );
         self.register_entity_list::<ListLinePlot, ListTrace>(
-            db.clone(),
             |lp| &lp.traces,
             |lp| &mut lp.traces,
-            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
-                builders::build_list_trace_add_wizard(parent, db, cx)
-            })),
+            AddBehavior::Wizard(Arc::new(builders::build_list_trace_add_wizard)),
         );
         self.register_entity_list::<SpectrogramPlot, SpectrogramTrace>(
-            db.clone(),
             |p| &p.traces,
             |p| &mut p.traces,
-            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
-                builders::build_spectrogram_trace_add_wizard(parent, db, cx)
-            })),
+            AddBehavior::Wizard(Arc::new(builders::build_spectrogram_trace_add_wizard)),
         );
     }
 
@@ -186,7 +176,6 @@ impl InspectorRegistry {
             let read_entity = any_entity.clone();
             Box::new(ColorRow {
                 label,
-                color,
                 read_color: Arc::new(move |cx| {
                     crate::inspector::reflect::get_field::<Hsla>(&read_entity, idx, cx)
                         .unwrap_or(color)
@@ -194,6 +183,7 @@ impl InspectorRegistry {
                 on_change: Arc::new(move |c, _w, cx| {
                     crate::inspector::reflect::set_field::<Hsla>(&any_entity, idx, c, cx);
                 }),
+                auto: None,
             })
         }));
     }
@@ -222,7 +212,7 @@ impl InspectorRegistry {
         self.register_field_widget::<Binding>(Arc::new(move |ctx, peek, entity, idx| {
             let binding = peek.get::<Binding>().expect("binding field");
             let query = binding.text(&db);
-            let summary = binding.error().map(str::to_string).unwrap_or_else(|| {
+            let summary = binding.error().unwrap_or_else(|| {
                 if query.is_empty() {
                     "Unbound".to_string()
                 } else {
@@ -321,41 +311,75 @@ impl InspectorRegistry {
         ));
     }
 
-    /// Row for `Override<Hsla>`: color picker paired with an "Auto" reset.
+    /// Row for `Override<Hsla>`: the colour row with `Auto` as its theme
+    /// state.
     fn register_override_hsla(&mut self) {
-        self.register_field_widget::<Override<Hsla>>(Arc::new(|ctx, peek, any_entity, idx| {
-            let current = peek.get::<Override<Hsla>>().unwrap().clone();
-            builders::build_override_row(
-                ctx.label.clone(),
-                current,
+        self.register_field_widget::<Override<Hsla>>(Arc::new(|ctx, _peek, any_entity, idx| {
+            let (read, write, check, reset) = (
+                any_entity.clone(),
+                any_entity.clone(),
+                any_entity.clone(),
                 any_entity,
-                idx,
-                |_| SharedString::new_static("Custom"),
-                |label, initial, any_entity, idx| {
-                    let read = any_entity.clone();
-                    let write = any_entity.clone();
-                    Box::new(ColorRow {
-                        label,
-                        color: initial,
-                        read_color: Arc::new(
-                            move |cx| match crate::inspector::reflect::get_field::<Override<Hsla>>(
-                                &read, idx, cx,
-                            ) {
-                                Some(Override::Custom(c)) => c,
-                                _ => initial,
-                            },
-                        ),
-                        on_change: Arc::new(move |c, _w, cx| {
-                            crate::inspector::reflect::set_field::<Override<Hsla>>(
-                                &write,
-                                idx,
-                                Override::Custom(c),
-                                cx,
-                            );
-                        }),
-                    })
-                },
-            )
+            );
+            let get = move |entity: &AnyEntity, cx: &App| {
+                crate::inspector::reflect::get_field::<Override<Hsla>>(entity, idx, cx)
+            };
+            Box::new(ColorRow {
+                label: ctx.label.clone(),
+                read_color: Arc::new(move |cx| match get(&read, cx) {
+                    Some(Override::Custom(c)) => c,
+                    _ => crate::theme::theme(cx).text_primary,
+                }),
+                on_change: Arc::new(move |c, _w, cx| {
+                    crate::inspector::reflect::set_field(&write, idx, Override::Custom(c), cx);
+                }),
+                auto: Some(AutoColor {
+                    is_auto: Arc::new(move |cx| {
+                        !matches!(get(&check, cx), Some(Override::Custom(_)))
+                    }),
+                    reset: Arc::new(move |_w, cx| {
+                        crate::inspector::reflect::set_field::<Override<Hsla>>(
+                            &reset,
+                            idx,
+                            Override::Auto,
+                            cx,
+                        );
+                    }),
+                }),
+            })
+        }));
+    }
+
+    /// Row for `Option<Hsla>`, the views' "theme colour unless set" fields:
+    /// the colour row with `None` as its theme state. Unset, the sliders
+    /// start from the theme's text colour rather than a transparent black
+    /// nobody chose.
+    fn register_option_hsla(&mut self) {
+        self.register_field_widget::<Option<Hsla>>(Arc::new(|ctx, _peek, any_entity, idx| {
+            let (read, write, check, reset) = (
+                any_entity.clone(),
+                any_entity.clone(),
+                any_entity.clone(),
+                any_entity,
+            );
+            let get = move |entity: &AnyEntity, cx: &App| {
+                crate::inspector::reflect::get_field::<Option<Hsla>>(entity, idx, cx).flatten()
+            };
+            Box::new(ColorRow {
+                label: ctx.label.clone(),
+                read_color: Arc::new(move |cx| {
+                    get(&read, cx).unwrap_or_else(|| crate::theme::theme(cx).text_primary)
+                }),
+                on_change: Arc::new(move |c, _w, cx| {
+                    crate::inspector::reflect::set_field::<Option<Hsla>>(&write, idx, Some(c), cx);
+                }),
+                auto: Some(AutoColor {
+                    is_auto: Arc::new(move |cx| get(&check, cx).is_none()),
+                    reset: Arc::new(move |_w, cx| {
+                        crate::inspector::reflect::set_field::<Option<Hsla>>(&reset, idx, None, cx);
+                    }),
+                }),
+            })
         }));
     }
 
@@ -471,7 +495,7 @@ impl InspectorRegistry {
     /// owning plot (via the trace's back-ref) to follow the new channel; the
     /// axis picker reads the plot's `axes` and writes `axis_index`, and is
     /// hidden when the plot has a single axis.
-    fn register_trace_builder(&mut self, _db: Arc<DB>) {
+    fn register_trace_builder(&mut self) {
         self.register_type_builder::<Trace>(Arc::new(|any_entity, db, cx| {
             let trace: Entity<Trace> = any_entity.clone().downcast().expect("Trace type mismatch");
             let mut rows =
@@ -537,7 +561,7 @@ impl InspectorRegistry {
         }));
     }
 
-    fn register_viewer3d_builder(&mut self, _db: Arc<DB>) {
+    fn register_viewer3d_builder(&mut self) {
         self.register_type_builder::<Viewer3d>(Arc::new(|any_entity, db, cx| {
             let viewer: Entity<Viewer3d> = any_entity
                 .clone()
@@ -689,7 +713,7 @@ impl InspectorRegistry {
         }));
     }
 
-    fn register_dashboard_builder(&mut self, _db: Arc<DB>) {
+    fn register_dashboard_builder(&mut self) {
         self.register_type_builder::<crate::views::dashboard::DashboardPanel>(Arc::new(
             |any_entity, db, cx| {
                 let entity: Entity<crate::views::dashboard::DashboardPanel> =

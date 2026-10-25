@@ -170,11 +170,8 @@ impl ValueCache {
     }
 }
 
-// Uniform fields are only read via `bytemuck::bytes_of`, which the
-// dead-code lint can't see through the Pod/Zeroable derive expansions.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-#[allow(dead_code)]
 struct ViewUniform {
     scale: [f32; 2],
     offset: [f32; 2],
@@ -184,7 +181,6 @@ struct ViewUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-#[allow(dead_code)]
 struct LineUniform {
     color: [f32; 4],
     line_width: f32,
@@ -893,7 +889,7 @@ impl PlotRenderState {
     }
 
     /// Take the previous frame so the caller can pass it to
-    /// `window.drop_image`, which needs `&mut Window` access only
+    /// [`crate::atlas::release_image`], which needs `&mut Window` access only
     /// available inside the prepaint closure.
     pub(crate) fn take_pending_release(&mut self) -> Option<Arc<RenderImage>> {
         self.pending_release.take()

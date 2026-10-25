@@ -8,12 +8,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use gpui::{App, Global};
 
-use crate::dynamic::{BuildError, DynamicNode};
-
-/// A heap-boxed build closure. `Send` so it can cross the channel; `'static`
-/// so it can outlive the call frame.
-pub type BuildClosure =
-    Box<dyn FnOnce() -> Result<Arc<dyn DynamicNode>, BuildError> + Send + 'static>;
+use crate::dynamic::Node;
 
 /// A unit of work for the worker thread. The reply channel is closed over
 /// rather than carried alongside, which is what lets one channel serve every
@@ -21,20 +16,18 @@ pub type BuildClosure =
 /// cells that watch them, and the thread does not care which.
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-/// Cheap clonable handle to the worker. `rebuild_into` takes one of these
-/// instead of `&DynamicWorker` so the caller can clone it out of `cx`'s
-/// global storage before borrowing other globals (e.g. `DynamicRegistry`)
-/// mutably from the same `cx`.
+/// Cheap clonable handle to the worker, cloned out of `cx`'s globals so it
+/// can travel into a build job and into the expression that job returns.
 #[derive(Clone)]
 pub struct WorkerHandle {
     tx: Sender<Job>,
-    /// Disposal channel for `Arc<dyn DynamicNode>` whose strong count is
+    /// Disposal channel for `Arc<Node>` whose strong count is
     /// about to go to 1 (then 0) on a non-worker thread. Routing them here
     /// guarantees the actual drop — and the cancellation of the underlying
     /// `JoinHandleDropGuard` — happens on the thread that owns the
     /// stellarator timer, which avoids the cross-thread spinlock deadlock
     /// in `maitake::time::Sleep::drop`.
-    dispose_tx: Sender<Arc<dyn DynamicNode>>,
+    dispose_tx: Sender<Arc<Node>>,
 }
 
 impl WorkerHandle {
@@ -54,16 +47,9 @@ impl WorkerHandle {
         reply_rx.recv().ok()
     }
 
-    /// Build one node on the worker thread. Used from gpui main during a
-    /// debounced rebuild.
-    pub fn run(&self, closure: BuildClosure) -> Result<Arc<dyn DynamicNode>, BuildError> {
-        // Worker thread gone — degrade gracefully.
-        self.call(closure).unwrap_or(Err(BuildError::ParentFailed))
-    }
-
     /// Hand `arc` to the worker thread for disposal. Best-effort: if the
     /// worker is gone, we drop locally as a fallback.
-    pub fn dispose(&self, arc: Arc<dyn DynamicNode>) {
+    pub fn dispose(&self, arc: Arc<Node>) {
         if let Err(crossbeam_channel::SendError(arc)) = self.dispose_tx.send(arc) {
             drop(arc);
         }
@@ -76,20 +62,15 @@ pub struct DynamicWorker {
 
 impl Global for DynamicWorker {}
 
-impl Default for DynamicWorker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DynamicWorker {
-    pub fn new() -> Self {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
         Self::with_tasks(crate::background_tasks::BackgroundTasks::default())
     }
 
     fn with_tasks(tasks: crate::background_tasks::BackgroundTasks) -> Self {
         let (tx, rx) = unbounded::<Job>();
-        let (dispose_tx, dispose_rx) = unbounded::<Arc<dyn DynamicNode>>();
+        let (dispose_tx, dispose_rx) = unbounded::<Arc<Node>>();
         tasks.spawn(stellarator::util::CancelToken::new(), move || async move {
             run_worker(rx, dispose_rx).await;
         });
@@ -116,7 +97,7 @@ impl DynamicWorker {
 /// rather than letting the gpui main thread drop the Arc directly — keeps
 /// `Sleep::drop` (and any other timer-touching destructor inside the
 /// spawned task) on the thread that owns the timer's spinlock.
-async fn run_worker(rx: Receiver<Job>, dispose_rx: Receiver<Arc<dyn DynamicNode>>) {
+async fn run_worker(rx: Receiver<Job>, dispose_rx: Receiver<Arc<Node>>) {
     loop {
         // A job closes over its own reply channel; if the requester went
         // away, the result is dropped silently.
@@ -124,7 +105,7 @@ async fn run_worker(rx: Receiver<Job>, dispose_rx: Receiver<Arc<dyn DynamicNode>
             job();
         }
         // Drain the graveyard. `drop(arc)` here triggers the
-        // `JoinHandleDropGuard` inside `NodeImpl`, which calls `cancel()`
+        // `JoinHandleDropGuard` inside `Node`, which calls `cancel()`
         // on the underlying maitake task — and `cancel()` on the same
         // thread the task was spawned on synchronously deallocates without
         // needing to fight the timer's spinlock.

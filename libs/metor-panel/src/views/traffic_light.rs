@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, Hsla, IntoElement, MouseButton, Pixels, SharedString,
+    App, Context, FocusHandle, Focusable, Hsla, IntoElement, MouseButton, Rems, SharedString,
     Window, div, prelude::*, px,
 };
 use metor_db::DB;
@@ -9,8 +9,8 @@ use metor_proto::types::{ComponentId, ElementValue};
 use serde::{Deserialize, Serialize};
 
 use super::binding::{component_meta, spawn_meta_resolver, spawn_on_stream};
-use crate::ComponentStreamBuilder;
-use crate::theme::{Theme, theme};
+use crate::data_binding::Binding;
+use crate::theme::{Theme, theme, ui_px};
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
@@ -34,7 +34,7 @@ pub struct TrafficLight {
     db: Arc<DB>,
     #[facet(opaque)]
     _binding_changes: gpui::Task<()>,
-    pub source: crate::data_binding::Binding,
+    pub source: Binding,
     #[facet(skip)]
     bound: ComponentId,
     #[facet(opaque)]
@@ -52,17 +52,23 @@ pub struct TrafficLight {
 }
 
 impl TrafficLight {
-    pub fn new(
-        db: Arc<DB>,
-        source: impl ComponentStreamBuilder + Send + 'static,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let component_id = source.component_id();
-        let binding = crate::data_binding::Binding::from_legacy(component_id, None, &db, cx);
+    pub fn from_config(cfg: TrafficLightConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let binding = Binding::from_text(&cfg.component, &db, cx);
+        let mut light = Self::bind(db, binding, cx);
+        if let Some(color) = cfg.color {
+            light.color = color;
+        }
+        light
+    }
+
+    /// Stream whatever `binding` currently resolves to. A rebind replaces the
+    /// whole view, which is what drops the previous stream tasks.
+    fn bind(db: Arc<DB>, binding: Binding, cx: &mut Context<Self>) -> Self {
+        let component_id = binding.id();
         let default_color = theme(cx).control_active;
 
         let meta = component_meta(&db, component_id);
-        let task = spawn_on_stream(db.clone(), source, cx, |this, on, _value, cx| {
+        let task = spawn_on_stream(db.clone(), component_id, cx, |this, on, _value, cx| {
             this.latest_on = on;
             cx.notify();
         });
@@ -109,14 +115,6 @@ impl TrafficLight {
         self.color
     }
 
-    pub fn set_color(&mut self, color: Hsla, cx: &mut Context<Self>) {
-        if self.color == color {
-            return;
-        }
-        self.color = color;
-        cx.notify();
-    }
-
     fn toggle(&mut self, cx: &mut Context<Self>) {
         if !self.is_bool {
             return;
@@ -145,10 +143,8 @@ impl Render for TrafficLight {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.source.resolve(&self.db, cx);
         if self.bound != self.source.id() {
-            let source = self.source.clone();
             let color = self.color;
-            *self = Self::new(self.db.clone(), source.id(), cx);
-            self.source = source;
+            *self = Self::bind(self.db.clone(), self.source.clone(), cx);
             self.color = color;
         }
         let theme = theme(cx);
@@ -162,8 +158,8 @@ impl Render for TrafficLight {
             .flex()
             .items_center()
             .justify_center()
-            .p(px(8.0))
-            .child(traffic_light_swatch(value, color, px(14.0), &theme));
+            .p(ui_px(8.0))
+            .child(traffic_light_swatch(value, color, ui_px(14.0), &theme));
 
         if is_bool {
             tile = tile.cursor_pointer().on_mouse_down(
@@ -189,15 +185,12 @@ const OFF_ALPHA: f32 = 0.15;
 pub(crate) fn traffic_light_swatch(
     value: Option<bool>,
     color: Hsla,
-    size: Pixels,
+    size: Rems,
     theme: &Theme,
 ) -> impl IntoElement {
     let bg = match value {
         Some(true) => color,
-        Some(false) => Hsla {
-            a: OFF_ALPHA,
-            ..color
-        },
+        Some(false) => Theme::dim(color, OFF_ALPHA),
         None => theme.bg_secondary,
     };
     div().w(size).h(size).rounded(px(3.0)).bg(bg)

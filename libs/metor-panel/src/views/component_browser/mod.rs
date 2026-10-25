@@ -33,7 +33,7 @@ pub type ComponentBrowser = ColumnBrowser<ComponentBrowserDelegate>;
 
 /// Event raised on Enter / double-click of a leaf component.
 ///
-/// Consumers decide how to act on an activation. The bundled `BrowserPanel`
+/// Consumers decide how to act on an activation. The bundled browser pane
 /// ignores it; other hosts can use it to wire up navigation or plotting.
 #[derive(Clone, Copy)]
 pub enum BrowserEvent {
@@ -1214,7 +1214,7 @@ fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
                 cx.stop_propagation();
             },
         )
-        .child(Icon::Plot.svg_color(11.0, theme.text_secondary));
+        .child(Icon::Plot.svg(11.0, theme.text_secondary));
 
     div()
         .h(px(PREVIEW_ROW_HEIGHT))

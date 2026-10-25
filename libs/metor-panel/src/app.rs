@@ -14,10 +14,7 @@ use crate::inspector::edits::{
 use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegistry};
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
-use crate::tiles::panels::{
-    AlarmPanel, AnnunciatorPanel, AnnunciatorPanelConfig, BrowserPanel, LogPanel, OutlinePanel,
-    OutlinePanelConfig, PlotPanel, SequenceGridPanel, SequencePanel,
-};
+use crate::tiles::panels::{OutlinePanelConfig, PlotPanelConfig, TraceConfig};
 use crate::tiles::{
     OpenOutlineAction, PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent,
 };
@@ -345,12 +342,11 @@ impl AppRoot {
         rows.push(Box::new(crate::inspector::rows::NavRow::new(
             "New Tab",
             SharedString::new_static(""),
-            Box::new(move |_cx| {
+            Box::new(move |_| {
                 crate::tiles::panels::new_panel_rows(
                     db.clone(),
                     pane.clone(),
                     on_open_inspector.clone(),
-                    _cx,
                 )
             }),
         )));
@@ -375,11 +371,22 @@ impl AppRoot {
         let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
             return;
         };
-        let db = self.db.clone();
-        let component_id = action.component_id;
-        let indices = action.indices.clone();
-        let plot = cx.new(|cx| PlotPanel::new(db, component_id, &indices, cx));
-        pane.update(cx, |pane, cx| pane.add_item(Box::new(plot), cx));
+        let indices: &[usize] = if action.indices.is_empty() {
+            &[0]
+        } else {
+            &action.indices
+        };
+        let traces = crate::views::time_series::traces_for_component(
+            &self.db,
+            action.component_id,
+            indices,
+            cx,
+        );
+        let cfg = PlotPanelConfig {
+            traces: traces.iter().map(TraceConfig::from).collect(),
+            ..Default::default()
+        };
+        crate::tiles::panels::add_registered_panel(&pane, "time_series_plot", &cfg, cx);
     }
 
     fn handle_open_outline_action(
@@ -391,13 +398,11 @@ impl AppRoot {
         let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
             return;
         };
-        let db = self.db.clone();
         let cfg = OutlinePanelConfig {
             root: action.root.to_string(),
             ..Default::default()
         };
-        let outline = cx.new(|cx| OutlinePanel::from_config(cfg, db, cx));
-        pane.update(cx, |pane, cx| pane.add_item(Box::new(outline), cx));
+        crate::tiles::panels::add_registered_panel(&pane, "component_outline", &cfg, cx);
     }
 
     fn handle_preview_plot_action(
@@ -581,15 +586,24 @@ impl Render for AppRoot {
         let mut root = div()
             .id("app-root")
             // Names the root so context-gated keybindings (the leader, which is
-            // bound with `!Inspector && !RowList && !Transient`) have a non-empty
+            // bound with [`NOT_TYPING`]) have a non-empty
             // context stack to evaluate against — gpui's predicate eval returns
             // false for an empty stack, so without this the leader never fires.
-            .key_context("AppRoot")
+            // `PaneZoomed` sits on the root rather than the tile group so the
+            // zoom's escape works without focus inside a pane.
+            .key_context(if self.tiles.read(cx).zoomed().is_some() {
+                "AppRoot PaneZoomed"
+            } else {
+                "AppRoot"
+            })
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::open_leader))
             .on_action(cx.listener(Self::cycle_tab_forward))
             .on_action(cx.listener(Self::cycle_tab_backward))
+            .on_action(cx.listener(|this, _: &crate::tiles::ExitZoom, _, cx| {
+                this.tiles.update(cx, |tiles, cx| tiles.exit_zoom(cx));
+            }))
             .on_action(cx.listener(Self::toggle_cmd_lock))
             .on_action(cx.listener(Self::handle_inspect_entity))
             .on_action(cx.listener(Self::handle_plot_component_action))
@@ -725,11 +739,11 @@ impl AppRoot {
             // shelved one deliberately does not light the bar.
             let pending = state.pending_count();
             if pending == 0 {
-                bar = bar.child(Icon::Dot.svg_color(7.0, theme.control_active));
+                bar = bar.child(Icon::Dot.svg(7.0, theme.control_active));
             } else {
                 if let Some(severity) = state.highest_pending_severity() {
                     let idx = crate::alarms::severity_index(severity);
-                    bar = bar.child(Icon::Dot.svg_color(7.0, theme.alarm_color(idx)));
+                    bar = bar.child(Icon::Dot.svg(7.0, theme.alarm_color(idx)));
                 }
                 let counts = state.counts_by_severity();
                 for idx in (0..counts.len()).rev() {
@@ -761,13 +775,9 @@ impl AppRoot {
     /// in the layout, opening a fresh one in the active pane only when none is
     /// open.
     fn open_alarms(&mut self, cx: &mut Context<Self>) {
-        let db = self.db.clone();
+        let registry = cx.global::<crate::tiles::ItemRegistry>().clone();
         self.tiles.update(cx, |tiles, cx| {
-            tiles.focus_or_open(
-                <AlarmPanel as crate::tiles::PaneItem>::serialization_key(),
-                |cx| Box::new(cx.new(|cx| AlarmPanel::new(db, cx))),
-                cx,
-            );
+            tiles.focus_or_open("alarm", |cx| registry.deserialize("alarm", "{}", cx), cx);
         });
     }
 
@@ -837,7 +847,7 @@ impl AppRoot {
         };
 
         Self::titlebar_segment(theme, "connection-segment")
-            .child(crate::icons::Icon::Dot.svg_color(7.0, dot))
+            .child(crate::icons::Icon::Dot.svg(7.0, dot))
             .child(label)
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -877,7 +887,7 @@ impl AppRoot {
             .w(px(28.0))
             .h(px(24.0))
             .rounded(px(3.0))
-            .child(icon.svg_color(14.0, icon_color))
+            .child(icon.svg(14.0, icon_color))
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_primary))
             .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
@@ -955,7 +965,7 @@ impl AppRoot {
         if mode != "Live" {
             right = right.child(
                 Self::titlebar_segment(theme, "time-go-live")
-                    .child(crate::icons::Icon::SkipForward.svg_color(14.0, theme.text_secondary))
+                    .child(crate::icons::Icon::SkipForward.svg(14.0, theme.text_secondary))
                     .tooltip(|_, cx| {
                         crate::views::tooltip::TooltipText::build("Go live".into(), cx)
                     })
@@ -970,7 +980,7 @@ impl AppRoot {
                     || config.range.to_string(),
                     |t| crate::temporal::display::range(config.range, &config, &t.context),
                 )))
-                .child(crate::icons::Icon::ChevronDown.svg_color(10.0, theme.text_secondary))
+                .child(crate::icons::Icon::ChevronDown.svg(10.0, theme.text_secondary))
                 .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
                     crate::temporal::picker::open(
                         Some(crate::temporal::picker::Target::Range),
@@ -1001,7 +1011,7 @@ impl AppRoot {
                     } else {
                         crate::icons::Icon::Pause
                     }
-                    .svg_color(14.0, theme.text_secondary),
+                    .svg(14.0, theme.text_secondary),
                 )
                 .tooltip(move |_, cx| {
                     crate::views::tooltip::TooltipText::build(
@@ -1143,6 +1153,8 @@ pub struct PanelApp {
         crate::views::dashboard::WidgetKind,
         crate::views::dashboard::WidgetSpec,
     )>,
+    themes: Vec<crate::theme::Theme>,
+    default_theme: Option<SharedString>,
 }
 
 impl PanelApp {
@@ -1173,6 +1185,8 @@ impl PanelApp {
             init_hooks: Vec::new(),
             overlays: Vec::new(),
             views: Vec::new(),
+            themes: Vec::new(),
+            default_theme: None,
         }
     }
 
@@ -1353,6 +1367,22 @@ impl PanelApp {
         self
     }
 
+    /// Add a palette to the theme picker after the built-ins. A theme named
+    /// like one already registered — built-in or consumer — replaces it in
+    /// place. See [`Theme`](crate::theme::Theme) for the intended way to
+    /// build one.
+    pub fn theme(mut self, theme: crate::theme::Theme) -> Self {
+        self.themes.push(theme);
+        self
+    }
+
+    /// Start in the theme registered under `name` instead of "Dark". An
+    /// unknown name logs a warning and falls back to "Dark".
+    pub fn default_theme(mut self, name: impl Into<SharedString>) -> Self {
+        self.default_theme = Some(name.into());
+        self
+    }
+
     /// Boot the metor-db wire-protocol server on `addr` in a background task
     /// before opening the window. Omit to leave serving to the consumer.
     pub fn serve(mut self, addr: SocketAddr) -> Self {
@@ -1425,7 +1455,8 @@ impl PanelApp {
             }
         });
         app.run(move |cx| {
-            initialize_appearance(cx);
+            let themes = std::mem::take(&mut self.themes);
+            initialize_appearance(themes, self.default_theme.as_deref(), cx);
             if self.db.is_some() {
                 self.start(cx);
             } else {
@@ -1459,6 +1490,8 @@ impl PanelApp {
             init_hooks,
             overlays,
             views,
+            themes: _,
+            default_theme: _,
         } = self;
 
         let db = db.expect("session selected before DB services start");
@@ -1514,6 +1547,17 @@ impl PanelApp {
             cx.global_mut::<crate::tiles::ItemRegistry>()
                 .register_view(spec, db.clone());
         }
+        // Layouts written before the annunciator rename still name it
+        // `traffic_light_grid`, and Component Text panes were folded into
+        // the monitor; both rehydrate as their successor and re-save under
+        // the new key.
+        let items = cx.global_mut::<crate::tiles::ItemRegistry>();
+        items.alias("traffic_light_grid", "annunciator");
+        items.alias("component_text", "monitor");
+        // The outline replaced both tables; layouts saved with either key
+        // open as an outline, keeping the data table's filter.
+        items.alias("component_table", "component_outline");
+        items.alias("data_table", "component_outline");
 
         // Connections: seed builder-registered targets, hand the
         // registry to discovery sources, then fire auto-connects.
@@ -1607,6 +1651,7 @@ impl PanelApp {
             KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
             KeyBinding::new("ctrl-tab", CycleTabForward, None),
             KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
+            KeyBinding::new("escape", crate::tiles::ExitZoom, Some(EXIT_ZOOM)),
             KeyBinding::new("secondary-l", ToggleCmdLock, None),
             KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
             // Scoped to a focused browser: the bar is per pane, and
@@ -1648,14 +1693,16 @@ impl PanelApp {
 struct RunningDatabase(Arc<DB>, bool);
 impl gpui::Global for RunningDatabase {}
 
-fn initialize_appearance(cx: &mut App) {
+fn initialize_appearance(
+    themes: Vec<crate::theme::Theme>,
+    default_theme: Option<&str>,
+    cx: &mut App,
+) {
     crate::theme::register_fonts(cx);
     let config = crate::config::load();
     let family = crate::theme::resolve_font_family(cx, &config);
     cx.set_global(crate::theme::FontSettings { family, config });
-    cx.set_global(crate::theme::ActiveTheme(Arc::new(
-        crate::theme::DARK.clone(),
-    )));
+    crate::theme::install_themes(cx, themes, default_theme);
     set_dock_icon();
 }
 
@@ -1763,10 +1810,6 @@ fn register_connection_commands(cx: &mut App) {
     );
 }
 
-/// Populate the pane-item registry so [`TileGroup::from_json`] can rehydrate
-/// specialized built-in panel kinds. Ordinary registered views are adapted
-/// into this registry immediately afterwards; Dashboard retains its dedicated
-/// deserializer because it is itself a host. The populated registry is a gpui
 /// The key context every host owning an editable field declares beside its own
 /// name, and the reason bare-key shortcuts can exist at all.
 ///
@@ -1780,65 +1823,23 @@ pub const TEXT_INPUT: &str = "TextInput";
 /// re-trigger its own leader.
 pub const NOT_TYPING: &str = "!TextInput && !Transient";
 
-/// Deleting the selected node: only in a node editor, and never while an
-/// `Global` so palette callbacks can fetch it without threading.
+/// Context predicate for the bare escape that un-zooms a pane: [`NOT_TYPING`]
+/// narrowed to while a zoom is up. Bindings dispatch ahead of key-down
+/// listeners, so outside a zoom escape is untouched, and inside one a field
+/// keeps it only by declaring [`TEXT_INPUT`].
+pub const EXIT_ZOOM: &str = "PaneZoomed && !TextInput && !Transient";
+
+/// Populate the pane-item registry with the one pane that isn't a registered
+/// view: Dashboard is itself a host, so it keeps a dedicated deserializer.
+/// Every other built-in pane is adapted from its widget spec afterwards. The
+/// populated registry is a gpui `Global` so palette callbacks can fetch it
+/// without threading.
 fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
-    use crate::tiles::ItemRegistry as PaneItemRegistry;
-    let mut reg = PaneItemRegistry::default();
-
-    register_panel::<AlarmPanel>(&mut reg, db.clone(), AlarmPanel::from_config);
-    register_panel::<LogPanel>(&mut reg, db.clone(), LogPanel::from_config);
-    register_panel::<SequencePanel>(&mut reg, db.clone(), SequencePanel::from_config);
-    register_panel::<SequenceGridPanel>(&mut reg, db.clone(), SequenceGridPanel::from_config);
-    register_panel::<OutlinePanel>(&mut reg, db.clone(), OutlinePanel::from_config);
-    // The outline replaced both tables; layouts saved with either key open
-    // as an outline, keeping the data table's filter.
-    for legacy in ["component_table", "data_table"] {
-        let db = db.clone();
-        reg.register_erased(legacy, move |state, cx| {
-            let cfg: OutlinePanelConfig = serde_json::from_str(state).unwrap_or_default();
-            let db = db.clone();
-            Some(Box::new(
-                cx.new(|cx| OutlinePanel::from_config(cfg, db, cx)),
-            ))
-        });
-    }
-    register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
-
-    // Layouts written before the annunciator rename still name it
-    // `traffic_light_grid`; the alias rehydrates them and they re-save under
-    // the new key.
-    let db_annunciator = db.clone();
-    reg.register_erased("traffic_light_grid", move |state, cx| {
-        let cfg: AnnunciatorPanelConfig = serde_json::from_str(state).unwrap_or_default();
-        let db = db_annunciator.clone();
-        let entity = cx.new(|cx| AnnunciatorPanel::from_config(cfg, db, cx));
-        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
-    });
-
-    // Dashboard's deserializer returns a fully-constructed entity rather
-    // than a `Self`, so it doesn't fit the generic helper.
-    let db_dashboard = db.clone();
+    let mut reg = crate::tiles::ItemRegistry::default();
     reg.register::<DashboardPanel>(move |state, cx| {
-        Some(deserialize_dashboard(db_dashboard.clone(), state, cx))
+        Some(deserialize_dashboard(db.clone(), state, cx))
     });
-
     cx.set_global(reg);
-}
-
-/// Wire one closure for `T` into the pane-item registry. The closure parses
-/// `T::Config` out of the state blob (falling back to `Default` on parse
-/// failure) and constructs `T` via the supplied `from_config` function.
-fn register_panel<T: crate::tiles::PaneItem>(
-    reg: &mut crate::tiles::ItemRegistry,
-    db: Arc<DB>,
-    from_config: fn(T::Config, Arc<DB>, &mut Context<T>) -> T,
-) {
-    reg.register::<T>(move |state, cx| {
-        let cfg: T::Config = serde_json::from_str(state).unwrap_or_default();
-        let db = db.clone();
-        Some(cx.new(|cx| from_config(cfg, db, cx)))
-    });
 }
 
 #[cfg(target_os = "macos")]
@@ -1872,7 +1873,7 @@ fn set_dock_icon() {}
 
 #[cfg(test)]
 mod keybinding_tests {
-    use super::{NOT_TYPING, TEXT_INPUT};
+    use super::{EXIT_ZOOM, NOT_TYPING, TEXT_INPUT};
     use gpui::{KeyBindingContextPredicate, KeyContext};
 
     /// The focus path, root first — the order gpui evaluates a predicate over.
@@ -1911,11 +1912,10 @@ mod keybinding_tests {
         for typing in [
             &["AppRoot", "Dashboard TextInput"][..],
             &["AppRoot", "Inspector TextInput"][..],
-            &["AppRoot", "Inspector TextInput", "RowList TextInput"][..],
             &["AppRoot", "ConnectionPicker TextInput"][..],
             // A field nested under a pane that is not itself a text host: the
             // negation looks at the whole path, not just the leaf.
-            &["AppRoot", "ExecTimeline", "RowList TextInput"][..],
+            &["AppRoot", "ComponentOutline", "FilterBar TextInput"][..],
         ] {
             assert!(
                 !fires(NOT_TYPING, typing),
@@ -1925,5 +1925,17 @@ mod keybinding_tests {
 
         // The chord menu must not re-trigger its own leader.
         assert!(!fires(NOT_TYPING, &["AppRoot", "Transient"]));
+    }
+
+    #[test]
+    fn escape_un_zooms_only_while_zoomed_and_never_mid_typing() {
+        assert!(fires(EXIT_ZOOM, &["AppRoot PaneZoomed"]));
+        assert!(fires(EXIT_ZOOM, &["AppRoot PaneZoomed", "Dashboard"]));
+        assert!(!fires(EXIT_ZOOM, &["AppRoot"]));
+        assert!(!fires(
+            EXIT_ZOOM,
+            &["AppRoot PaneZoomed", "Inspector TextInput"]
+        ));
+        assert!(!fires(EXIT_ZOOM, &["AppRoot PaneZoomed", "Transient"]));
     }
 }

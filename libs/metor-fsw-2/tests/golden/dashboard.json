@@ -10,7 +10,7 @@
         "h": 200.0
       },
       "kind": "meter",
-      "config": "{\"component\": \"sat1.wheels.h\", \"element\": 1, \"min\": -0.04, \"max\": 0.04, \"unit\": \"N m s\", \"orientation\": \"Vertical\"}"
+      "config": "{\"component\": \"sat1.wheels.h\", \"element\": 1, \"min\": -0.04, \"max\": 0.04, \"unit\": \"N m s\", \"orientation\": \"Vertical\", \"shape\": \"Bar\"}"
     },
     {
       "id": 2,
@@ -21,7 +21,7 @@
         "h": 140.0
       },
       "kind": "gauge",
-      "config": "{\"component\": \"sat1.sensors.gyro_b\", \"element\": 1, \"min\": -0.2, \"max\": 0.2, \"label\": \"rate y\", \"sweep_degrees\": 200.0, \"style\": \"Needle\"}"
+      "config": "{\"component\": \"sat1.sensors.gyro_b\", \"element\": 1, \"min\": -0.2, \"max\": 0.2, \"label\": \"rate y\", \"sweep_degrees\": 200.0, \"rotation_degrees\": 0.0, \"divisions\": 5, \"minor_ticks\": 1, \"style\": \"Needle\"}"
     },
     {
       "id": 3,
@@ -50,8 +50,8 @@
       "rect": {
         "x": 280.0,
         "y": 100.0,
-        "w": 260.0,
-        "h": 110.0
+        "w": 340.0,
+        "h": 48.0
       },
       "kind": "sequence_control",
       "config": "{\"channel\": \"mode\", \"compact\": true}"
@@ -86,8 +86,8 @@
         "w": 160.0,
         "h": 60.0
       },
-      "kind": "text",
-      "config": "{\"component\": \"sat1.ctrl.mtq_cmd.dipole_b\"}"
+      "kind": "monitor",
+      "config": "{\"component\": \"sat1.ctrl.mtq_cmd.dipole_b\", \"align\": \"Left\"}"
     },
     {
       "id": 9,
@@ -110,100 +110,6 @@
       },
       "kind": "image",
       "config": "{\"path\": \"/Users/sphw/code/metor/metor/libs/metor-fsw-2/python/tests/data/pixel.png\", \"data\": \"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFUlEQVR42mM4oWGjccKGAUh8+PABACQSBlUPXSXnAAAAAElFTkSuQmCC\"}"
-    }
-  ],
-  "connectors": [
-    {
-      "id": 1,
-      "points": [
-        {
-          "Widget": {
-            "id": 4,
-            "side": "Top",
-            "t": 0.7954545454545454
-          }
-        },
-        {
-          "Widget": {
-            "id": 2,
-            "side": "Left",
-            "t": 0.7142857142857143
-          }
-        },
-        {
-          "Widget": {
-            "id": 1,
-            "side": "Right",
-            "t": 0.35
-          }
-        }
-      ],
-      "style": {
-        "width": 1.5,
-        "dashed": false,
-        "shape": "Orthogonal",
-        "arrow": "End",
-        "label": "flow",
-        "on_top": false,
-        "bind": {
-          "component": "sat1.wheels.wheels.0.arm",
-          "element": 0,
-          "threshold": 0.5
-        }
-      }
-    },
-    {
-      "id": 2,
-      "points": [
-        {
-          "Widget": {
-            "id": 10,
-            "side": "Top",
-            "t": 0.25
-          }
-        },
-        {
-          "Free": {
-            "x": 700.0,
-            "y": 400.0
-          }
-        }
-      ],
-      "style": {
-        "color": "#f9e2afff",
-        "width": 2.0,
-        "dashed": true,
-        "shape": "Curved",
-        "arrow": "Both",
-        "label": "leader",
-        "on_top": true
-      }
-    },
-    {
-      "id": 3,
-      "points": [
-        {
-          "Widget": {
-            "id": 1,
-            "side": "Right",
-            "t": 0.05
-          }
-        },
-        {
-          "Free": {
-            "x": 900.0,
-            "y": 30.0
-          }
-        }
-      ],
-      "style": {
-        "width": 1.5,
-        "dashed": false,
-        "shape": "Straight",
-        "arrow": "None",
-        "label": "",
-        "on_top": false
-      }
     }
   ]
 }

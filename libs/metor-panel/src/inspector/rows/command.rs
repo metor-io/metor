@@ -17,6 +17,7 @@ pub struct CommandRow {
     pub label: SharedString,
     callback: Arc<dyn Fn(&mut Window, &mut App) -> RowAction>,
     tag: Option<SharedString>,
+    consumes_search: bool,
 }
 
 impl CommandRow {
@@ -31,6 +32,7 @@ impl CommandRow {
                 RowAction::Dismiss
             }),
             tag: None,
+            consumes_search: false,
         }
     }
 
@@ -42,7 +44,15 @@ impl CommandRow {
             label: label.into(),
             callback,
             tag: None,
+            consumes_search: false,
         }
+    }
+
+    /// Keep the row visible whatever the search says, for pinned
+    /// affordances like a page's "Done".
+    pub fn pinned(mut self) -> Self {
+        self.consumes_search = true;
+        self
     }
 
     pub fn with_tag(mut self, tag: impl Into<SharedString>) -> Self {
@@ -55,12 +65,13 @@ impl InspectorRow for CommandRow {
     fn identity(&self) -> SharedString {
         format!("command:{:?}:{}", self.tag, self.label).into()
     }
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
 
     fn label(&self) -> &str {
         &self.label
+    }
+
+    fn consumes_search(&self) -> bool {
+        self.consumes_search
     }
 
     fn render_row(

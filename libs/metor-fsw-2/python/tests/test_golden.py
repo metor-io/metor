@@ -5,10 +5,10 @@ modulo the fields both sides normalize away (``src`` anchors, the located
 envelope field).
 
 ``tests/golden/dashboard.json`` is the same idea one layer down, for the
-panel: a dashboard preset covering every widget kind and both connector
-layers. The panel's ``DashboardPanelConfig`` test parses that same file, so a
-rename on either side breaks a test instead of silently degrading a shipped
-preset into placeholder tiles. ``tests/golden/outline.json`` pins the outline
+panel: a dashboard preset covering every widget kind. The panel's
+``DashboardPanelConfig`` test parses that same file, so a rename on either side
+breaks a test instead of silently degrading a shipped preset into placeholder
+tiles. ``tests/golden/outline.json`` pins the outline
 pane's config the same way, every field set."""
 
 import json
@@ -23,16 +23,12 @@ from metor_config import (
     Alarm,
     Alarms,
     Artifact,
-    At,
     Attitude,
-    Bind,
     Component,
-    Connector,
     Dashboard,
     Db,
     Deployment,
     Downlink,
-    Edge,
     FrameType,
     Gauge,
     Image,
@@ -52,7 +48,7 @@ from metor_config import (
     System,
     Target,
     TcpServer,
-    Text,
+    Monitor,
     TimeSeriesPlot,
     Trace,
     TrafficLight,
@@ -84,7 +80,7 @@ FIXTURE_PNG = os.path.join(os.path.dirname(__file__), "data", "pixel.png")
 
 
 def build_dashboard() -> Dashboard:
-    """A dashboard exercising every widget kind and both connector layers."""
+    """A dashboard exercising every widget kind."""
     meter = Place(
         Meter("wheels.h", element=1, min=-0.04, max=0.04, unit="N m s"), 20, 20
     )
@@ -123,34 +119,13 @@ def build_dashboard() -> Dashboard:
     seq = Place(SequenceControl("mode", compact=True), 280, 100)
     light = Place(TrafficLight("world.illuminated"), 440, 20, 70, 60)
     grid = Place(TrafficLightGrid("wheels.wheels.*.arm"), 520, 20, 190, 60)
-    text = Place(Text("ctrl.mtq_cmd.dipole_b"), 440, 100)
+    text = Place(Monitor("ctrl.mtq_cmd.dipole_b"), 440, 100, w=160, h=60)
     plot = Place(TimeSeriesPlot([Trace("sensors.gyro_b", element=0)]), 440, 200)
     image = Place(Image(FIXTURE_PNG), 20, 520, 200, 140)
 
     return Dashboard(
         title="Golden",
         widgets=[meter, gauge, chip, att, seq, light, grid, text, plot, image],
-        connectors=[
-            # Under the widgets, telemetry-coloured: the schematic case.
-            Connector(
-                [att, gauge, meter],
-                label="flow",
-                arrow="end",
-                bind=Bind("wheels.wheels.0.arm", threshold=0.5),
-            ),
-            # Over them, with an explicit edge and a free end: the callout case.
-            Connector(
-                [Edge(image, "top", 0.25), At(700.0, 400.0)],
-                shape="curved",
-                dashed=True,
-                arrow="both",
-                on_top=True,
-                label="leader",
-                color="#f9e2afff",
-                width=2.0,
-            ),
-            Connector([meter, At(900.0, 30.0)], shape="straight"),
-        ],
     )
 
 

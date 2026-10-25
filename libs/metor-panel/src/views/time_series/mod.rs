@@ -1,4 +1,5 @@
 use crate::plot_events::popover::event_summary_row;
+use crate::theme::{Theme, ui_px, ui_scale};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use crate::inspect;
 use crate::plot_events::{EventDetail, EventKindKey, EventSource, EventSourceRegistry, PlotEvent};
 use crate::temporal::display::elapsed;
 use crate::views::json_tree::JsonTree;
+use crate::views::plot_common::chrome::{paint_axis_backdrop, paint_hline, paint_vline};
 use crate::views::popover::readout_card;
 
 mod render;
@@ -40,7 +42,7 @@ mod bounds;
 pub use bounds::*;
 
 mod gpu;
-pub(crate) use gpu::{AxisSource, LineDraw, PlotRenderState};
+pub(crate) use gpu::{AxisSource, LineDraw, PlotRenderState, ReadbackHandle};
 
 mod heatmap;
 pub use heatmap::{Colormap, IntensityScale};
@@ -321,6 +323,7 @@ pub(crate) fn axis_zone(
     pos: Point<Pixels>,
     plot_area: Bounds<Pixels>,
     axis_count: usize,
+    scale: f32,
 ) -> AxisZone {
     let below_plot = pos.y > plot_area.origin.y + plot_area.size.height;
     let left_of_plot = pos.x < plot_area.origin.x;
@@ -328,7 +331,7 @@ pub(crate) fn axis_zone(
         // Columns stack outward: index = how many Y_LABEL_WIDTH steps left of
         // the plot edge the pointer sits.
         let dist = f32::from(plot_area.origin.x - pos.x).max(0.0);
-        let idx = (dist / Y_LABEL_WIDTH) as usize;
+        let idx = (dist / (Y_LABEL_WIDTH * scale)) as usize;
         AxisZone::YAxis(idx.min(axis_count.saturating_sub(1)))
     } else if below_plot {
         AxisZone::XAxis
@@ -337,13 +340,17 @@ pub(crate) fn axis_zone(
     }
 }
 
-pub(crate) fn plot_area(outer: Bounds<Pixels>, axis_count: usize) -> Bounds<Pixels> {
-    let left = left_margin(axis_count);
+/// The data rectangle inside a plot's `outer` bounds once the axis chrome is
+/// taken out. `scale` is the [`ui_scale`] the plot was laid out at, so the
+/// chrome shrinks with a zoomed dashboard widget the way its labels do.
+pub(crate) fn plot_area(outer: Bounds<Pixels>, axis_count: usize, scale: f32) -> Bounds<Pixels> {
+    let left = left_margin(axis_count) * scale;
+    let pad = PADDING * scale;
     Bounds {
-        origin: point(outer.origin.x + px(left), outer.origin.y + px(PADDING)),
+        origin: point(outer.origin.x + px(left), outer.origin.y + px(pad)),
         size: gpui::Size {
-            width: (outer.size.width - px(left + PADDING)).max(px(1.0)),
-            height: (outer.size.height - px(X_LABEL_HEIGHT + PADDING * 2.0)).max(px(1.0)),
+            width: (outer.size.width - px(left + pad)).max(px(1.0)),
+            height: (outer.size.height - px(X_LABEL_HEIGHT * scale + pad * 2.0)).max(px(1.0)),
         },
     }
 }
@@ -606,7 +613,7 @@ fn paint_underlay(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let pb = plot_area(outer_bounds, view.axis_count());
+    let pb = plot_area(outer_bounds, view.axis_count(), ui_scale(window));
     let theme = crate::theme::theme(cx);
 
     // Out-of-bounds tint: a wash over the plot area when a visible trace has an
@@ -624,34 +631,19 @@ fn paint_underlay(
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
             continue;
         }
-        let mut grid = PathBuilder::stroke(px(0.5));
-        grid.move_to(point(pb.origin.x, y));
-        grid.line_to(point(pb.origin.x + pb.size.width, y));
-        if let Ok(path) = grid.build() {
-            window.paint_path(path, theme.grid_color);
-        }
+        paint_hline(pb, y, px(0.5), theme.grid_color, window);
     }
     for tick in x_ticks(&primary, 5, anchor) {
         let x = primary.to_screen(pb, tick as f64, primary.min_y).x;
         if x < pb.origin.x || x > pb.origin.x + pb.size.width {
             continue;
         }
-        let mut grid = PathBuilder::stroke(px(0.5));
-        grid.move_to(point(x, pb.origin.y));
-        grid.line_to(point(x, pb.origin.y + pb.size.height));
-        if let Ok(path) = grid.build() {
-            window.paint_path(path, theme.grid_color);
-        }
+        paint_vline(pb, x, px(0.5), theme.grid_color, window);
     }
 
     if primary.min_y < 0.0 && primary.max_y > 0.0 {
         let zero_y = primary.to_screen(pb, primary.min_x, 0.0).y;
-        let mut zp = PathBuilder::stroke(px(1.0));
-        zp.move_to(point(pb.origin.x, zero_y));
-        zp.line_to(point(pb.origin.x + pb.size.width, zero_y));
-        if let Ok(path) = zp.build() {
-            window.paint_path(path, theme.zero_line_color);
-        }
+        paint_hline(pb, zero_y, px(1.0), theme.zero_line_color, window);
     }
 }
 
@@ -672,27 +664,11 @@ fn paint_overlay(
     cx: &mut gpui::App,
 ) {
     let axis_count = view.axis_count();
-    let pb = plot_area(outer_bounds, axis_count);
+    let s = ui_scale(window);
+    let pb = plot_area(outer_bounds, axis_count, s);
     let theme = crate::theme::theme(cx);
 
-    let axis_bg = theme.plot_chrome_bg();
-    let y_axis_bg = Bounds {
-        origin: outer_bounds.origin,
-        size: gpui::Size {
-            width: pb.origin.x - outer_bounds.origin.x,
-            height: outer_bounds.size.height,
-        },
-    };
-    window.paint_quad(gpui::fill(y_axis_bg, axis_bg));
-
-    let x_axis_bg = Bounds {
-        origin: point(pb.origin.x, pb.origin.y + pb.size.height),
-        size: gpui::Size {
-            width: pb.size.width,
-            height: outer_bounds.origin.y + outer_bounds.size.height - pb.origin.y - pb.size.height,
-        },
-    };
-    window.paint_quad(gpui::fill(x_axis_bg, axis_bg));
+    paint_axis_backdrop(outer_bounds, pb, window, cx);
 
     // Axes are neutral unless given an explicit color.
     let label_color = |i: usize| -> Hsla {
@@ -716,7 +692,7 @@ fn paint_overlay(
         let color = label_color(i);
         // Right edge of column `i` (column 0 abuts the plot, higher indices
         // step left by Y_LABEL_WIDTH each).
-        let col_right = pb.origin.x - px(i as f32 * Y_LABEL_WIDTH);
+        let col_right = pb.origin.x - px(i as f32 * Y_LABEL_WIDTH * s);
         for tick in value_ticks(ab.min_y, ab.max_y, 5) {
             let y = ab.to_screen(pb, ab.min_x, tick).y;
             if y < pb.origin.y || y > pb.origin.y + pb.size.height {
@@ -729,7 +705,8 @@ fn paint_overlay(
                 tick,
                 color,
                 |width, font_size| {
-                    let x = (col_right - width - px(4.0)).max(outer_bounds.origin.x + px(2.0));
+                    let x =
+                        (col_right - width - px(4.0 * s)).max(outer_bounds.origin.x + px(2.0 * s));
                     point(x, y - font_size / 2.0)
                 },
                 window,
@@ -757,10 +734,10 @@ fn paint_overlay(
             theme.text_secondary,
             |width, _| {
                 let label_x = (x - width / 2.0).clamp(
-                    outer_bounds.origin.x + px(2.0),
-                    outer_bounds.origin.x + outer_bounds.size.width - width - px(2.0),
+                    outer_bounds.origin.x + px(2.0 * s),
+                    outer_bounds.origin.x + outer_bounds.size.width - width - px(2.0 * s),
                 );
-                point(label_x, pb.origin.y + pb.size.height + px(4.0))
+                point(label_x, pb.origin.y + pb.size.height + px(4.0 * s))
             },
             window,
             cx,
@@ -770,28 +747,23 @@ fn paint_overlay(
     // One vertical rule per axis at its column's right edge, colored to
     // match; plus the shared horizontal X rule along the bottom.
     for i in 0..axis_count {
-        let col_right = pb.origin.x - px(i as f32 * Y_LABEL_WIDTH);
-        let mut rule = PathBuilder::stroke(px(1.0));
-        rule.move_to(point(col_right, pb.origin.y));
-        rule.line_to(point(col_right, pb.origin.y + pb.size.height));
-        if let Ok(path) = rule.build() {
-            window.paint_path(path, rule_color(i));
-        }
+        let col_right = pb.origin.x - px(i as f32 * Y_LABEL_WIDTH * s);
+        paint_vline(pb, col_right, px(1.0), rule_color(i), window);
     }
 
     // In multi-axis mode, mark each trace's axis membership with a small
     // triangle pointing into the plot at the line's left-edge value, drawn
     // in that axis's coordinate frame so it sits where the line begins.
     if axis_count > 1 {
-        let tip_w = px(6.0);
-        let half_h = px(4.0);
+        let tip_w = px(6.0 * s);
+        let half_h = px(4.0 * s);
         for &(axis_i, value, color) in axis_markers {
             let ab = view.axis_bounds(axis_i);
             let y = ab.to_screen(pb, ab.min_x, value).y;
             if y < pb.origin.y || y > pb.origin.y + pb.size.height {
                 continue;
             }
-            let tip_x = pb.origin.x - px(axis_i as f32 * Y_LABEL_WIDTH);
+            let tip_x = pb.origin.x - px(axis_i as f32 * Y_LABEL_WIDTH * s);
             let base_x = tip_x - tip_w;
             let mut tri = PathBuilder::fill();
             tri.move_to(point(tip_x, y));
@@ -811,20 +783,15 @@ fn paint_overlay(
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
             continue;
         }
-        let mut line = PathBuilder::stroke(px(1.0));
-        line.move_to(point(pb.origin.x, y));
-        line.line_to(point(pb.origin.x + pb.size.width, y));
-        if let Ok(path) = line.build() {
-            window.paint_path(path, *color);
-        }
+        paint_hline(pb, y, px(1.0), *color, window);
         if !label.is_empty() {
             crate::views::plot_common::paint_text_label(
                 label.clone(),
                 *color,
                 |width, font_size| {
                     point(
-                        pb.origin.x + pb.size.width - width - px(4.0),
-                        y - font_size - px(2.0),
+                        pb.origin.x + pb.size.width - width - px(4.0 * s),
+                        y - font_size - px(2.0 * s),
                     )
                 },
                 window,
@@ -833,15 +800,13 @@ fn paint_overlay(
         }
     }
 
-    let mut x_rule = PathBuilder::stroke(px(1.0));
-    x_rule.move_to(point(pb.origin.x, pb.origin.y + pb.size.height));
-    x_rule.line_to(point(
-        pb.origin.x + pb.size.width,
+    paint_hline(
+        pb,
         pb.origin.y + pb.size.height,
-    ));
-    if let Ok(path) = x_rule.build() {
-        window.paint_path(path, theme.axis_color);
-    }
+        px(1.0),
+        theme.axis_color,
+        window,
+    );
 }
 
 /// Snapshot of one cursor's visible state, captured during canvas prepare.
@@ -863,12 +828,13 @@ struct CursorPaint {
 /// Build a marker rect whose edges land on physical pixels. Plot projection
 /// commonly produces fractional logical coordinates; feeding those directly
 /// to a rounded quad can make opposite corners cover different pixel samples.
-fn marker_bounds(center: Point<Pixels>, scale_factor: f32) -> Bounds<Pixels> {
+fn marker_bounds(center: Point<Pixels>, scale_factor: f32, ui_scale: f32) -> Bounds<Pixels> {
     let snap = |value: Pixels| px((f32::from(value) * scale_factor).round() / scale_factor);
-    let left = snap(center.x - px(3.0));
-    let top = snap(center.y - px(3.0));
-    let right = snap(center.x + px(3.0));
-    let bottom = snap(center.y + px(3.0));
+    let r = px(3.0 * ui_scale);
+    let left = snap(center.x - r);
+    let top = snap(center.y - r);
+    let right = snap(center.x + r);
+    let bottom = snap(center.y + r);
     Bounds::new(point(left, top), gpui::size(right - left, bottom - top))
 }
 
@@ -882,7 +848,8 @@ fn paint_cursors(
     if cursors.is_empty() {
         return;
     }
-    let pb = plot_area(outer_bounds, view.axis_count());
+    let s = ui_scale(window);
+    let pb = plot_area(outer_bounds, view.axis_count(), s);
     // Lines use X only; markers carry normalized [0,1] Y, so a 0..1 Y view
     // maps them straight to screen.
     let view = view.x_bounds();
@@ -902,19 +869,14 @@ fn paint_cursors(
             theme.text_secondary
         };
         // Brighten the selection-derived stroke so it reads as a line, not a fill.
-        let stroke_color = Hsla { a: 1.0, ..primary };
+        let stroke_color = Theme::dim(primary, 1.0);
 
         for ts in [a, b] {
             let x = view.to_screen(pb, ts.0 as f64, view.min_y).x;
             if x < pb.origin.x - px(1.0) || x > pb.origin.x + pb.size.width + px(1.0) {
                 continue;
             }
-            let mut line = PathBuilder::stroke(px(1.0));
-            line.move_to(point(x, pb.origin.y));
-            line.line_to(point(x, pb.origin.y + pb.size.height));
-            if let Ok(path) = line.build() {
-                window.paint_path(path, stroke_color);
-            }
+            paint_vline(pb, x, px(1.0), stroke_color, window);
         }
 
         // Shaded band between the two endpoints; subtle so the underlying
@@ -931,10 +893,7 @@ fn paint_cursors(
                     height: pb.size.height,
                 },
             };
-            let band_fill = Hsla {
-                a: 0.08,
-                ..stroke_color
-            };
+            let band_fill = Theme::dim(stroke_color, 0.08);
             window.paint_quad(gpui::fill(band, band_fill));
         }
 
@@ -949,7 +908,7 @@ fn paint_cursors(
                 {
                     continue;
                 }
-                let dot = marker_bounds(screen, scale_factor);
+                let dot = marker_bounds(screen, scale_factor, s);
                 let mut dot_quad = gpui::fill(dot, *color);
                 dot_quad.corner_radii = gpui::Corners::all(px(1.5));
                 window.paint_quad(dot_quad);
@@ -981,20 +940,12 @@ fn paint_hover_crosshair(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let pb = plot_area(outer_bounds, view.axis_count());
+    let pb = plot_area(outer_bounds, view.axis_count(), ui_scale(window));
     if pointer_x < pb.origin.x || pointer_x > pb.origin.x + pb.size.width {
         return;
     }
-    let color = Hsla {
-        a: 0.6,
-        ..crate::theme::theme(cx).text_secondary
-    };
-    let mut line = PathBuilder::stroke(px(0.5));
-    line.move_to(point(pointer_x, pb.origin.y));
-    line.line_to(point(pointer_x, pb.origin.y + pb.size.height));
-    if let Ok(path) = line.build() {
-        window.paint_path(path, color);
-    }
+    let color = Theme::dim(crate::theme::theme(cx).text_secondary, 0.6);
+    paint_vline(pb, pointer_x, px(0.5), color, window);
 }
 
 /// Paint one dot per visible trace at the sample the hover readout reports,
@@ -1009,7 +960,8 @@ fn paint_hover_markers(
     if markers.is_empty() {
         return;
     }
-    let pb = plot_area(outer_bounds, view.axis_count());
+    let s = ui_scale(window);
+    let pb = plot_area(outer_bounds, view.axis_count(), s);
     // Markers carry normalized [0,1] Y, so a 0..1 Y view maps them straight
     // to screen.
     let view = view.x_bounds();
@@ -1023,7 +975,7 @@ fn paint_hover_markers(
         {
             continue;
         }
-        let dot = marker_bounds(screen, scale_factor);
+        let dot = marker_bounds(screen, scale_factor, s);
         let mut dot_quad = gpui::fill(dot, color);
         dot_quad.corner_radii = gpui::Corners::all(px(1.5));
         window.paint_quad(dot_quad);
@@ -1141,6 +1093,9 @@ pub struct TimeSeriesPlot {
     drag_start_view: Option<PlotView>,
     drag_zone: AxisZone,
     last_plot_area: Option<Bounds<Pixels>>,
+    /// [`ui_scale`] the plot area was last laid out at. Pointer handlers run
+    /// outside the dashboard zoom, so they read the chrome size from here.
+    chrome_scale: f32,
     cursors: smallvec::SmallVec<[Entity<MeasurementCursor>; 2]>,
     cursor_drag: Option<CursorDrag>,
     panel_position: PanelPosition,
@@ -1238,6 +1193,7 @@ impl TimeSeriesPlot {
             drag_start_view: None,
             drag_zone: AxisZone::Plot,
             last_plot_area: None,
+            chrome_scale: 1.0,
             cursors: smallvec::SmallVec::new(),
             cursor_drag: None,
             panel_position: PanelPosition::default(),
@@ -1259,6 +1215,10 @@ impl TimeSeriesPlot {
 
     pub fn last_plot_area(&self) -> Option<Bounds<Pixels>> {
         self.last_plot_area
+    }
+
+    pub(crate) fn chrome_scale(&self) -> f32 {
+        self.chrome_scale
     }
 
     pub fn set_panel_position(&mut self, position: PanelPosition, cx: &mut Context<Self>) {
@@ -1364,7 +1324,7 @@ impl TimeSeriesPlot {
         &self.cursors
     }
 
-    /// Replace the cursor list (used by [`PlotPanel::from_config`] to
+    /// Replace the cursor list (used by [`TimeSeriesPlot::from_config`] to
     /// rehydrate locked cursors after layout deserialization). Each cursor
     /// is observed so the plot repaints when its endpoints or enabled
     /// measurements change.
@@ -1423,25 +1383,6 @@ impl TimeSeriesPlot {
         }
     }
 
-    /// Convenience constructor: one trace per element, colors cycled from
-    /// the theme's categorical palette, labels derived from element names.
-    /// Empty `indexes` defaults to `[0]` to preserve historic behaviour.
-    pub fn from_component(
-        db: Arc<DB>,
-        component_id: impl Into<ComponentId>,
-        indexes: &[usize],
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let component_id = component_id.into();
-        let indexes = if indexes.is_empty() {
-            &[0usize] as &[usize]
-        } else {
-            indexes
-        };
-        let traces = traces_for_component(&db, component_id, indexes, cx);
-        Self::new(db, traces, cx)
-    }
-
     pub fn line_plot(&self) -> &Entity<LinePlot> {
         &self.line_plot
     }
@@ -1468,7 +1409,7 @@ impl TimeSeriesPlot {
             return;
         };
         let axis_count = self.line_plot.read(cx).axes.len();
-        if axis_zone(position, pa, axis_count) != AxisZone::Plot {
+        if axis_zone(position, pa, axis_count, self.chrome_scale) != AxisZone::Plot {
             return;
         }
         let Some(view) = self.line_plot.read(cx).effective_view(cx) else {
@@ -1528,7 +1469,7 @@ impl TimeSeriesPlot {
             return;
         };
         let axis_count = self.line_plot.read(cx).axes.len();
-        if axis_zone(event.position, pa, axis_count) != AxisZone::Plot {
+        if axis_zone(event.position, pa, axis_count, self.chrome_scale) != AxisZone::Plot {
             return;
         }
         let Some(view) = self.line_plot.read(cx).effective_view(cx) else {
@@ -1674,7 +1615,7 @@ impl TimeSeriesPlot {
             cx.notify();
         }
         let axis_count = self.line_plot.read(cx).axes.len();
-        if axis_zone(event.position, pa, axis_count) != AxisZone::Plot {
+        if axis_zone(event.position, pa, axis_count, self.chrome_scale) != AxisZone::Plot {
             self.clear_hover(cx);
             return;
         }
@@ -1748,13 +1689,14 @@ impl TimeSeriesPlot {
             .iter()
             .map(|(_, label, value)| (label.chars().count(), value.chars().count()))
             .collect();
-        let size = cursor::estimate_readout_size(header.chars().count(), &lens);
-        let origin = cursor::readout_origin(pointer, size, pa, px(HOVER_READOUT_OFFSET));
+        let s = self.chrome_scale;
+        let size = cursor::estimate_readout_size(header.chars().count(), &lens).map(|l| l * s);
+        let origin = cursor::readout_origin(pointer, size, pa, px(HOVER_READOUT_OFFSET * s));
         // Position within the wrapper div, whose origin is inset from the
         // plot area by the left chrome and top padding.
         let inner_origin = point(
-            pa.origin.x - px(left_margin(view.axis_count())),
-            pa.origin.y - px(PADDING),
+            pa.origin.x - px(left_margin(view.axis_count()) * self.chrome_scale),
+            pa.origin.y - px(PADDING * self.chrome_scale),
         );
 
         let mut boxed = readout_card(cx).child(div().child(SharedString::from(header)));
@@ -1765,17 +1707,17 @@ impl TimeSeriesPlot {
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded(px(2.0)).bg(color))
+                    .child(div().w(ui_px(8.0)).h(ui_px(8.0)).rounded(px(2.0)).bg(color))
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(LABEL_FONT_SIZE))
+                            .text_size(ui_px(LABEL_FONT_SIZE))
                             .text_color(theme.text_secondary)
                             .child(label),
                     )
                     .child(
                         div()
-                            .text_size(px(LABEL_FONT_SIZE))
+                            .text_size(ui_px(LABEL_FONT_SIZE))
                             .text_color(color)
                             .child(value),
                     ),
@@ -1874,7 +1816,7 @@ impl TimeSeriesPlot {
     /// the gutter so trace hover/pan/zoom below is untouched.
     fn event_cluster_at(&self, pos: Point<Pixels>, pa: Bounds<Pixels>) -> Option<usize> {
         let top = pa.origin.y;
-        if pos.y < top || pos.y > top + px(GUTTER_H) {
+        if pos.y < top || pos.y > top + px(GUTTER_H * self.chrome_scale) {
             return None;
         }
         if pos.x < pa.origin.x || pos.x > pa.origin.x + pa.size.width {
@@ -1885,8 +1827,8 @@ impl TimeSeriesPlot {
             let offset = f32::from(pos.x - cluster.x);
             let chip_w = f32::from(EventCluster::chip_width(
                 cluster.chip_label().chars().count(),
-            ));
-            let hit = (-FLAG_HIT_PX..=chip_w).contains(&offset);
+            )) * self.chrome_scale;
+            let hit = (-FLAG_HIT_PX * self.chrome_scale..=chip_w).contains(&offset);
             // Prefer the flag whose rule is nearest, so a chip overdrawn by a
             // truncated neighbor still resolves to the closer rule.
             let dist = offset.abs();
@@ -1943,15 +1885,16 @@ impl TimeSeriesPlot {
         );
 
         let shown = count.min(EVENT_POPOVER_ROWS);
+        let s = self.chrome_scale;
         let size = gpui::Size {
-            width: px(240.0),
-            height: px((1 + shown) as f32 * 16.0 + 8.0),
+            width: px(240.0 * s),
+            height: px(((1 + shown) as f32 * 16.0 + 8.0) * s),
         };
-        let anchor = point(cluster.x, pa.origin.y + px(GUTTER_H));
-        let origin = cursor::readout_origin(anchor, size, pa, px(4.0));
+        let anchor = point(cluster.x, pa.origin.y + px(GUTTER_H * self.chrome_scale));
+        let origin = cursor::readout_origin(anchor, size, pa, px(4.0 * s));
         let inner_origin = point(
-            pa.origin.x - px(left_margin(view.axis_count())),
-            pa.origin.y - px(PADDING),
+            pa.origin.x - px(left_margin(view.axis_count()) * self.chrome_scale),
+            pa.origin.y - px(PADDING * self.chrome_scale),
         );
         Some(
             div()
@@ -1990,7 +1933,7 @@ impl TimeSeriesPlot {
             .gap_2()
             .child(
                 div()
-                    .text_size(px(LABEL_FONT_SIZE))
+                    .text_size(ui_px(LABEL_FONT_SIZE))
                     .text_color(theme.text_primary)
                     .child(SharedString::from(format!(
                         "{} events",
@@ -2001,7 +1944,7 @@ impl TimeSeriesPlot {
                 div()
                     .id("event-popover-close")
                     .cursor_pointer()
-                    .text_size(px(LABEL_FONT_SIZE))
+                    .text_size(ui_px(LABEL_FONT_SIZE))
                     .text_color(theme.text_secondary)
                     .child(SharedString::new_static("✕"))
                     .on_mouse_down(
@@ -2020,7 +1963,7 @@ impl TimeSeriesPlot {
             .id("event-popover-list")
             .flex()
             .flex_col()
-            .max_h(px(320.0))
+            .max_h(ui_px(320.0))
             .overflow_y_scroll();
         for (i, ev) in cluster.events.iter().enumerate() {
             let is_selected = i == selected;
@@ -2054,7 +1997,7 @@ impl TimeSeriesPlot {
 
         let panel = readout_card(cx)
             .gap_1()
-            .w(px(300.0))
+            .w(ui_px(300.0))
             .border_color(theme.selection_bg)
             .rounded(px(4.0))
             .occlude()
@@ -2062,15 +2005,16 @@ impl TimeSeriesPlot {
             .child(list)
             .child(detail);
 
+        let s = self.chrome_scale;
         let size = gpui::Size {
-            width: px(300.0),
-            height: px(360.0),
+            width: px(300.0 * s),
+            height: px(360.0 * s),
         };
-        let anchor = point(cluster.x, pa.origin.y + px(GUTTER_H));
-        let origin = cursor::readout_origin(anchor, size, pa, px(4.0));
+        let anchor = point(cluster.x, pa.origin.y + px(GUTTER_H * self.chrome_scale));
+        let origin = cursor::readout_origin(anchor, size, pa, px(4.0 * s));
         let inner_origin = point(
-            pa.origin.x - px(left_margin(view.axis_count())),
-            pa.origin.y - px(PADDING),
+            pa.origin.x - px(left_margin(view.axis_count()) * self.chrome_scale),
+            pa.origin.y - px(PADDING * self.chrome_scale),
         );
         Some(
             div()
@@ -2116,7 +2060,7 @@ fn kv_row(
         .flex()
         .flex_row()
         .gap_1()
-        .text_size(px(LABEL_FONT_SIZE))
+        .text_size(ui_px(LABEL_FONT_SIZE))
         .child(
             div()
                 .text_color(theme.text_tertiary)

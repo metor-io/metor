@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use gpui::{Bounds, Hsla, Pixels, Point, SharedString, Window, point, px, size};
 
-use crate::graph_canvas::{LINE_HIT_RADIUS, LineShape, LineStyle, distance_to_line, paint_line};
-use crate::theme::Theme;
+use super::leaders::{LINE_HIT_RADIUS, LineStyle, distance_to_line, paint_line};
+use crate::theme::{Theme, ui_scale};
 use crate::views::plot_common::paint_text_label;
 use crate::views::table::{HEADER_HEIGHT, ROW_HEIGHT};
 use crate::views::time_series::cursor::{
@@ -100,12 +100,15 @@ pub(crate) struct LanePaint {
     pub theme: Arc<Theme>,
 }
 
-/// Height of one lane given the area and how many rows share it.
-pub(crate) fn lane_height(area_height: Pixels, rows: usize) -> Pixels {
+/// Height of one lane given the area and how many rows share it. `scale` is
+/// the [`ui_scale`] the gutter's rows were laid out at, so the cap matches
+/// theirs inside a zoomed dashboard widget.
+pub(crate) fn lane_height(area_height: Pixels, rows: usize, scale: f32) -> Pixels {
+    let max = LANE_MAX * scale;
     if rows == 0 {
-        return px(LANE_MAX);
+        return px(max);
     }
-    px((f32::from(area_height) / rows as f32).min(LANE_MAX))
+    px((f32::from(area_height) / rows as f32).min(max))
 }
 
 /// The time-to-pixel mapping for one repaint, and its inverse.
@@ -188,6 +191,7 @@ pub(crate) fn paint_ruler(
     let ref_us = paint.data_start as i64;
     let proj = Projection::new(view, bounds);
     let anchor = x_tick_anchor(fmt, paint.data_start);
+    let gap = px(3.0 * ui_scale(window));
     for tick in x_ticks(view, 6, anchor) {
         let x = proj.x(tick);
         window.paint_quad(gpui::fill(
@@ -200,7 +204,7 @@ pub(crate) fn paint_ruler(
             theme.text_tertiary,
             |w, h| {
                 point(
-                    (x + px(3.0)).min(bounds.origin.x + bounds.size.width - w),
+                    (x + gap).min(bounds.origin.x + bounds.size.width - w),
                     bounds.origin.y + (bounds.size.height - h) / 2.0,
                 )
             },
@@ -221,7 +225,7 @@ pub(crate) fn paint_lanes(
     let theme = &paint.theme;
     let view = &paint.view;
     let proj = Projection::new(view, bounds);
-    let lane_h = lane_height(bounds.size.height, paint.rows.len());
+    let lane_h = lane_height(bounds.size.height, paint.rows.len(), ui_scale(window));
     let right = bounds.origin.x + bounds.size.width;
 
     // Lane rules, matching the table's per-row bottom border.
@@ -289,7 +293,6 @@ pub(crate) fn paint_lanes(
             LineStyle {
                 width: px(1.0),
                 dashed: line.flow.dashed,
-                shape: LineShape::Orthogonal,
             },
             Theme::dim(flow_color, 0.7),
             window,
@@ -578,11 +581,11 @@ fn paint_hover(
     );
 }
 
-/// The connector within [`LINE_HIT_RADIUS`] of the pointer, nearest first.
+/// The leader within [`LINE_HIT_RADIUS`] of the pointer, nearest first.
 fn nearest_flow<'a>(lines: &'a [FlowLine<'a>], pointer: Point<Pixels>) -> Option<&'a FlowPaint> {
     let mut best: Option<(f32, &FlowPaint)> = None;
     for line in lines {
-        let d = distance_to_line(&line.points, LineShape::Orthogonal, pointer);
+        let d = distance_to_line(&line.points, pointer);
         if d <= LINE_HIT_RADIUS && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
             best = Some((d, line.flow));
         }
@@ -601,9 +604,10 @@ fn paint_readout(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
+    let s = ui_scale(window);
     let lens: Vec<(usize, usize)> = detail.iter().map(|d| (d.chars().count(), 0)).collect();
-    let box_size = estimate_readout_size(header.chars().count(), &lens);
-    let origin = readout_origin(pointer, box_size, bounds, px(READOUT_OFFSET));
+    let box_size = estimate_readout_size(header.chars().count(), &lens).map(|l| l * s);
+    let origin = readout_origin(pointer, box_size, bounds, px(READOUT_OFFSET * s));
     window.paint_quad(gpui::quad(
         Bounds::new(origin, box_size),
         px(BAR_RADIUS),
@@ -612,16 +616,16 @@ fn paint_readout(
         theme.border_primary,
         gpui::BorderStyle::Solid,
     ));
-    let mut y = origin.y + px(READOUT_PAD_Y);
+    let mut y = origin.y + px(READOUT_PAD_Y * s);
     let mut line = |text: SharedString, color: Hsla, window: &mut Window, cx: &mut gpui::App| {
         paint_text_label(
             text,
             color,
-            |_, _| point(origin.x + px(READOUT_PAD_X), y),
+            |_, _| point(origin.x + px(READOUT_PAD_X * s), y),
             window,
             cx,
         );
-        y += px(READOUT_ROW_H);
+        y += px(READOUT_ROW_H * s);
     };
     line(header, theme.text_primary, window, cx);
     for text in detail {

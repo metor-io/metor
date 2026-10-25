@@ -2,16 +2,15 @@ use std::sync::Arc;
 
 use gpui::{
     App, Context, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, Pixels, Point, SharedString, Stateful, Window, div, prelude::*, px,
+    MouseButton, Pixels, Point, Rems, SharedString, Stateful, Window, div, prelude::*, px,
 };
 use metor_db::DB;
 use metor_proto::types::{ComponentId, ElementValue, PrimType};
 use smallvec::SmallVec;
 
-use crate::ComponentStreamBuilder;
 use crate::icons::Icon;
 use crate::inspector::rows::TextField;
-use crate::theme::{Theme, theme};
+use crate::theme::{Theme, theme, ui_px};
 
 use super::binding::{StreamUpdate, spawn_seeded_stream};
 pub use super::format::StripCell;
@@ -88,10 +87,39 @@ const STATE_MATCH_TOLERANCE: f64 = 0.5;
 impl StateTable {
     /// The entry whose code matches `value`, if the table lists one.
     fn matched(&self, value: f64) -> Option<&(f64, SharedString, Option<Hsla>)> {
+        self.entries.get(self.position(value)?)
+    }
+
+    /// Index of the entry whose code matches `value`.
+    pub(crate) fn position(&self, value: f64) -> Option<usize> {
         self.entries
             .iter()
-            .find(|(code, _, _)| (code - value).abs() < STATE_MATCH_TOLERANCE)
+            .position(|(code, _, _)| (code - value).abs() < STATE_MATCH_TOLERANCE)
     }
+
+    /// What a cell holding `value` shows: the matched state with its accent,
+    /// else the unknown label unaccented. `None` keeps the raw number.
+    fn display(&self, value: f64, theme: &Theme) -> Option<(SharedString, Option<Hsla>)> {
+        match self.matched(value) {
+            Some((_, label, color)) => {
+                Some((label.clone(), Some(color.unwrap_or(theme.control_active))))
+            }
+            None if self.unknown_label.is_empty() => None,
+            None => Some((self.unknown_label.clone(), None)),
+        }
+    }
+}
+
+/// Where a strip's cells sit across the width their host gives them.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, facet::Facet, serde::Serialize, serde::Deserialize,
+)]
+#[repr(u8)]
+pub enum StripAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
 }
 
 /// Visual mode for the strip.
@@ -121,6 +149,9 @@ pub struct StripStyle {
     pub placeholder: SharedString,
     /// Render numeric cells as the state their value means.
     pub states: Option<StateTable>,
+    pub align: StripAlign,
+    /// Value text size in unscaled pixels, replacing the preset's own.
+    pub value_size: Option<f32>,
 }
 
 impl StripStyle {
@@ -133,6 +164,8 @@ impl StripStyle {
             unit: SharedString::default(),
             placeholder: SharedString::new_static("—"),
             states: None,
+            align: StripAlign::Left,
+            value_size: None,
         }
     }
 
@@ -145,6 +178,8 @@ impl StripStyle {
             unit: SharedString::default(),
             placeholder: SharedString::new_static("…"),
             states: None,
+            align: StripAlign::Left,
+            value_size: None,
         }
     }
 
@@ -162,6 +197,16 @@ impl StripStyle {
         self.states = states;
         self
     }
+
+    pub fn with_align(mut self, align: StripAlign) -> Self {
+        self.align = align;
+        self
+    }
+
+    pub fn with_value_size(mut self, size: Option<f32>) -> Self {
+        self.value_size = size;
+        self
+    }
 }
 
 /// Click handler surfaced by the strip.
@@ -175,7 +220,7 @@ pub type StripClick = Arc<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App) + 
 /// Interactive state supplied afresh by the host each render.
 ///
 /// Snapshot pattern keeps the strip decoupled from the pending-edits global
-/// and lets `Monitor`, `ComponentText`, and `ComponentOutline` share one
+/// and lets `Monitor`, `StateChip`, and `ComponentOutline` share one
 /// widget with different policies.
 #[derive(Default, Clone)]
 pub struct StripBehavior {
@@ -210,6 +255,8 @@ fn style_equivalent(a: &StripStyle, b: &StripStyle) -> bool {
         && a.unit == b.unit
         && a.placeholder == b.placeholder
         && a.states == b.states
+        && a.align == b.align
+        && a.value_size == b.value_size
 }
 
 fn click_ptr(click: &Option<StripClick>) -> usize {
@@ -254,16 +301,14 @@ pub struct ComponentValueStrip {
 impl ComponentValueStrip {
     pub fn new(
         db: Arc<DB>,
-        source: impl ComponentStreamBuilder + Send + 'static,
+        component_id: ComponentId,
         style: StripStyle,
         behavior: StripBehavior,
         cx: &mut Context<Self>,
     ) -> Self {
-        let component_id = source.component_id();
-
         let task = spawn_seeded_stream(
             db.clone(),
-            source,
+            component_id,
             cx,
             |db, component_id| {
                 let metadata = resolve_metadata(db, component_id);
@@ -597,9 +642,9 @@ impl Render for ComponentValueStrip {
         let stale = self.stale;
         let editing_error = self.editing.as_ref().map(|e| e.error).unwrap_or(false);
 
-        let mut row = div().flex().flex_row().items_center().gap(px(4.0));
+        let mut row = div().flex().flex_row().items_center().gap(ui_px(4.0));
         if !style.intrinsic_width {
-            row = row.flex_wrap();
+            row = justify(row.flex_wrap(), style.align);
         }
 
         for (idx, cell) in cells.iter().enumerate() {
@@ -619,23 +664,20 @@ impl Render for ComponentValueStrip {
             let has_apply_group =
                 is_pending && !behavior.locked && behavior.on_apply_element.is_some();
 
-            // A state table reinterprets the numeric cell as the state it
-            // means; bool cells keep their toggle rendering, and editing
-            // shows the raw number the operator is typing over.
-            let state = if is_bool {
+            // A state table reinterprets the cell as the state it means — a
+            // bool reads as 0/1, so ARMED/SAFE names a flag too. Strings are
+            // bytes, not codes, and editing shows the raw number the
+            // operator is typing over.
+            let state = if matches!(kind, CellKind::String) {
                 None
             } else {
-                style.states.as_ref().and_then(|table| {
-                    let value = raw_values.get(idx)?.as_f64();
-                    match table.matched(value) {
-                        Some((_, label, color)) => {
-                            Some((label.clone(), Some(color.unwrap_or(theme.control_active))))
-                        }
-                        None if table.unknown_label.is_empty() => None,
-                        None => Some((table.unknown_label.clone(), None)),
-                    }
-                })
+                style
+                    .states
+                    .as_ref()
+                    .and_then(|table| table.display(raw_values.get(idx)?.as_f64(), &theme))
             };
+            // A named bool draws as its state; clicking still toggles it.
+            let draws_as_toggle = is_bool && state.is_none();
             let (display_cell, accent) = match state {
                 Some((text, accent)) => (
                     StripCell {
@@ -667,7 +709,7 @@ impl Render for ComponentValueStrip {
                     is_solo,
                     is_pending,
                     stale,
-                    is_bool,
+                    draws_as_toggle,
                     bool_value,
                     accent,
                     has_apply_group,
@@ -741,29 +783,14 @@ impl Render for ComponentValueStrip {
                 let apply = behavior.on_apply_element.clone().unwrap();
                 let chevron_id =
                     (component_id.0.wrapping_mul(31) ^ idx as u64).wrapping_add(0x1001) as usize;
-                let mut bg = theme.control_active;
-                bg.a = 0.15;
                 let mut group = div().flex().flex_row().items_center().child(atom).child(
-                    div()
-                        .id(("strip-apply", chevron_id))
-                        .px(px(6.0))
-                        .h(px(25.5))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(bg)
-                        .rounded_r(px(3.0))
-                        .text_size(px(12.0))
-                        .text_color(theme.control_active)
-                        .cursor_pointer()
-                        .child(Icon::ChevronRight.svg_color(11.0, theme.control_active))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            move |event: &gpui::MouseDownEvent, window, cx| {
-                                apply(idx, event.position, window, cx);
-                                cx.refresh_windows();
-                            },
-                        ),
+                    apply_chevron(("strip-apply", chevron_id), &theme, true).on_mouse_down(
+                        MouseButton::Left,
+                        move |event: &gpui::MouseDownEvent, window, cx| {
+                            apply(idx, event.position, window, cx);
+                            cx.refresh_windows();
+                        },
+                    ),
                 );
                 if style.intrinsic_width {
                     group = group.flex_none();
@@ -781,6 +808,16 @@ impl Render for ComponentValueStrip {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
+            // A click elsewhere leaves the cell the way clicking another cell
+            // does — the typed value staged — but one that won't parse can't
+            // keep the cell open once the operator has moved on.
+            .when(self.editing.is_some(), |root| {
+                root.on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                    this.commit_edit(window, cx);
+                    this.cancel_edit(cx);
+                }))
+            })
+            .when(style.align != StripAlign::Left, |root| root.w_full())
             .child(row);
         if style.intrinsic_width {
             root = root.flex_none();
@@ -790,15 +827,27 @@ impl Render for ComponentValueStrip {
 }
 
 fn render_placeholder(style: &StripStyle, theme: &Theme) -> impl IntoElement {
-    let text_size = match (style.preset, style.solo_emphasize) {
-        (StripPreset::Dashboard, true) => px(14.0),
-        (StripPreset::Dashboard, false) => px(13.0),
-        (StripPreset::Boxes, _) => px(12.0),
+    let text_size = match (style.value_size, style.preset, style.solo_emphasize) {
+        (Some(size), _, _) => ui_px(size),
+        (None, StripPreset::Dashboard, true) => ui_px(14.0),
+        (None, StripPreset::Dashboard, false) => ui_px(13.0),
+        (None, StripPreset::Boxes, _) => ui_px(12.0),
     };
-    div()
-        .text_size(text_size)
-        .text_color(theme.text_tertiary)
-        .child(style.placeholder.clone())
+    justify(div().flex(), style.align).child(
+        div()
+            .text_size(text_size)
+            .text_color(theme.text_tertiary)
+            .child(style.placeholder.clone()),
+    )
+}
+
+/// Lay a strip row's cells out along `align`.
+fn justify(row: gpui::Div, align: StripAlign) -> gpui::Div {
+    match align {
+        StripAlign::Left => row,
+        StripAlign::Center => row.w_full().justify_center(),
+        StripAlign::Right => row.w_full().justify_end(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -818,10 +867,10 @@ fn build_editing_chrome(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(4.0))
-        .px(px(6.0))
-        .py(px(3.0))
-        .rounded(px(3.0))
+        .gap(ui_px(4.0))
+        .px(ui_px(6.0))
+        .py(ui_px(3.0))
+        .rounded(px(BOX_RADIUS))
         .overflow_hidden();
     atom = if style.intrinsic_width {
         atom.min_w(cell_width(style.preset, false)).flex_none()
@@ -842,8 +891,8 @@ fn build_editing_chrome(
 
     if let Some(label) = cell.label.as_ref() {
         let label_size = match style.preset {
-            StripPreset::Dashboard => px(9.0),
-            StripPreset::Boxes => px(10.0),
+            StripPreset::Dashboard => ui_px(9.0),
+            StripPreset::Boxes => ui_px(10.0),
         };
         atom = atom.child(
             div()
@@ -879,14 +928,10 @@ fn build_cell_chrome(
     accent: Option<gpui::Hsla>,
     inside_apply_group: bool,
 ) -> Stateful<gpui::Div> {
-    let mut atom = div().id(("strip-cell", id_key)).flex().flex_row();
-    // Round only the left corners when a chevron sits flush against the
-    // right edge, so the two halves visually fuse into a single pill.
-    if inside_apply_group {
-        atom = atom.rounded_l(px(3.0));
-    } else {
-        atom = atom.rounded(px(3.0));
-    }
+    let mut atom = box_corners(
+        div().id(("strip-cell", id_key)).flex().flex_row(),
+        inside_apply_group,
+    );
 
     if is_bool {
         // Bool cells double as their own toggle track. Padding mirrors text
@@ -897,20 +942,20 @@ fn build_cell_chrome(
         } else if stale {
             theme.stale_bg()
         } else if bool_value {
-            theme.control_active_track
+            theme.control_active_track()
         } else {
             theme.bg_secondary
         };
         let knob = div()
-            .w(px(15.0))
-            .h(px(15.0))
-            .rounded(px(3.0))
+            .w(ui_px(15.0))
+            .h(ui_px(15.0))
+            .rounded(px(BOX_RADIUS))
             .bg(theme.text_primary);
         atom = atom
-            .w(px(40.0))
-            .h(px(25.5))
-            .py(px(4.0))
-            .px(px(4.0))
+            .w(ui_px(40.0))
+            .h(ui_px(STRIP_BOX_HEIGHT))
+            .py(ui_px(4.0))
+            .px(ui_px(4.0))
             .items_center()
             .bg(track_color)
             .when(bool_value, |el| el.flex_row_reverse())
@@ -918,12 +963,7 @@ fn build_cell_chrome(
         return atom;
     }
 
-    atom = atom
-        .items_center()
-        .gap(px(2.0))
-        .px(px(4.0))
-        .py(px(3.0))
-        .overflow_hidden();
+    atom = box_padding(atom);
 
     // Fixed-width keeps a "0" cell and a "0.0083" cell aligned across rows
     // so neighboring boxes don't shift. Solo unlabeled cells have no siblings
@@ -947,16 +987,7 @@ fn build_cell_chrome(
     let chip_accent = (!is_pending && !stale).then_some(accent).flatten();
     match style.preset {
         StripPreset::Boxes => {
-            let bg = if is_pending {
-                theme.drop_target
-            } else if stale {
-                theme.stale_bg()
-            } else if let Some(accent) = chip_accent {
-                Theme::dim(accent, 0.18)
-            } else {
-                theme.bg_secondary
-            };
-            atom = atom.bg(bg);
+            atom = atom.bg(box_fill(theme, is_pending, stale, chip_accent));
         }
         StripPreset::Dashboard => {
             if is_pending {
@@ -974,8 +1005,8 @@ fn build_cell_chrome(
 
     if let Some(label) = cell.label.as_ref() {
         let label_size = match style.preset {
-            StripPreset::Dashboard => px(9.0),
-            StripPreset::Boxes => px(10.0),
+            StripPreset::Dashboard => ui_px(9.0),
+            StripPreset::Boxes => ui_px(10.0),
         };
         atom = atom.child(
             div()
@@ -992,19 +1023,21 @@ fn build_cell_chrome(
     let base_value_size = match (style.preset, is_solo) {
         (StripPreset::Dashboard, true) => 16.0,
         (StripPreset::Dashboard, false) => 12.0,
-        (StripPreset::Boxes, _) => 12.0,
+        (StripPreset::Boxes, _) => STRIP_BOX_VALUE_SIZE,
     };
-    let value_size = if matches!(style.preset, StripPreset::Boxes) && cell.label.is_some() {
+    let value_size = if let Some(size) = style.value_size {
+        ui_px(size)
+    } else if matches!(style.preset, StripPreset::Boxes) && cell.label.is_some() {
         let len = cell.value.chars().count();
         if len >= 9 {
-            px(9.0)
+            ui_px(9.0)
         } else if len >= 7 {
-            px(10.5)
+            ui_px(10.5)
         } else {
-            px(base_value_size)
+            ui_px(base_value_size)
         }
     } else {
-        px(base_value_size)
+        ui_px(base_value_size)
     };
     atom = atom.child(
         div()
@@ -1025,12 +1058,12 @@ fn build_cell_chrome(
         let unit_size = match style.preset {
             StripPreset::Dashboard => {
                 if is_solo {
-                    px(10.0)
+                    ui_px(10.0)
                 } else {
-                    px(9.0)
+                    ui_px(9.0)
                 }
             }
-            StripPreset::Boxes => px(10.0),
+            StripPreset::Boxes => ui_px(10.0),
         };
         atom = atom.child(
             div()
@@ -1045,13 +1078,80 @@ fn build_cell_chrome(
 }
 
 pub const STRIP_BOX_CELL_WIDTH: f32 = 78.0;
+/// Height of a box cell and of the apply chevron fused to it. Controls that
+/// sit in a row with boxes (the sequence control's buttons) take it too.
+pub const STRIP_BOX_HEIGHT: f32 = 25.5;
+/// Text size of a box cell's value when nothing overrides it.
+pub const STRIP_BOX_VALUE_SIZE: f32 = 12.0;
+
+/// Corner radius of a value cell, and of everything drawn to match one.
+pub(crate) const BOX_RADIUS: f32 = 3.0;
+
+/// Corners of a box cell. A cell with an apply chevron flush against its
+/// right edge rounds only its left side, so the two read as one pill.
+pub(crate) fn box_corners<E: Styled>(el: E, fused: bool) -> E {
+    if fused {
+        el.rounded_l(px(BOX_RADIUS))
+    } else {
+        el.rounded(px(BOX_RADIUS))
+    }
+}
+
+/// Inner layout of a text box cell.
+pub(crate) fn box_padding<E: Styled>(el: E) -> E {
+    el.items_center()
+        .gap(ui_px(2.0))
+        .px(ui_px(4.0))
+        .py(ui_px(3.0))
+        .overflow_hidden()
+}
+
+/// Fill of a box cell. Pending and stale outrank the state accent: a chip
+/// must not look healthy while its edit is unsent or its producer is dead.
+pub(crate) fn box_fill(theme: &Theme, pending: bool, stale: bool, accent: Option<Hsla>) -> Hsla {
+    if pending {
+        theme.drop_target
+    } else if stale {
+        theme.stale_bg()
+    } else if let Some(accent) = accent {
+        Theme::dim(accent, 0.18)
+    } else {
+        theme.bg_secondary
+    }
+}
+
+/// The chevron that commits a staged box: fused to the box's right edge, at
+/// its height. Inactive, it keeps its place but reads as nothing to send.
+pub(crate) fn apply_chevron(
+    id: impl Into<gpui::ElementId>,
+    theme: &Theme,
+    active: bool,
+) -> Stateful<gpui::Div> {
+    let (bg, fg) = if active {
+        (theme.control_active.opacity(0.15), theme.control_active)
+    } else {
+        (theme.bg_secondary, theme.text_tertiary)
+    };
+    div()
+        .id(id)
+        .flex_none()
+        .px(ui_px(6.0))
+        .h(ui_px(STRIP_BOX_HEIGHT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(bg)
+        .rounded_r(px(BOX_RADIUS))
+        .when(active, |el| el.cursor_pointer())
+        .child(Icon::ChevronRight.svg(11.0, fg))
+}
 pub const STRIP_CELL_GAP: f32 = 4.0;
 
-pub fn cell_width(preset: StripPreset, is_solo: bool) -> Pixels {
+pub fn cell_width(preset: StripPreset, is_solo: bool) -> Rems {
     match (preset, is_solo) {
-        (StripPreset::Boxes, _) => px(STRIP_BOX_CELL_WIDTH),
-        (StripPreset::Dashboard, false) => px(96.0),
-        (StripPreset::Dashboard, true) => px(0.0),
+        (StripPreset::Boxes, _) => ui_px(STRIP_BOX_CELL_WIDTH),
+        (StripPreset::Dashboard, false) => ui_px(96.0),
+        (StripPreset::Dashboard, true) => ui_px(0.0),
     }
 }
 
@@ -1076,7 +1176,7 @@ pub(crate) fn render_static_cells(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(STRIP_CELL_GAP));
+        .gap(ui_px(STRIP_CELL_GAP));
     if !style.intrinsic_width {
         row = row.flex_wrap();
     }
@@ -1100,7 +1200,7 @@ pub(crate) struct ResolvedMetadata {
 ///
 /// An unregistered component yields [`CellKind::Unknown`] so callers can
 /// render a placeholder until the producer connects; the async strip task
-/// re-resolves after `into_stream` awakens.
+/// re-resolves once the component registers.
 pub(crate) fn resolve_metadata(db: &DB, component_id: ComponentId) -> ResolvedMetadata {
     db.with_state(|state| {
         let meta = state.get_component_metadata(component_id);
@@ -1251,6 +1351,23 @@ mod tests {
         assert!(t.matched(-1.0).is_none());
         // Exactly between two codes is not either of them.
         assert!(t.matched(2.5).is_none());
+    }
+
+    #[test]
+    fn an_unmatched_value_shows_the_unknown_label() {
+        let theme = &crate::theme::DARK;
+        let mut t = table();
+        assert!(
+            t.display(7.0, theme).is_none(),
+            "empty label keeps the number"
+        );
+        t.unknown_label = "UNKNOWN".into();
+        assert_eq!(t.display(7.0, theme).unwrap(), ("UNKNOWN".into(), None));
+        assert_eq!(t.display(2.0, theme).unwrap().0, "POINTING");
+
+        // With no entries at all, every value is unknown.
+        t.entries.clear();
+        assert_eq!(t.display(0.0, theme).unwrap().0, "UNKNOWN");
     }
 
     #[test]

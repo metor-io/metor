@@ -25,7 +25,7 @@ use super::cursor::MeasurementCursor;
 use super::measurements::{self, MeasurementKind};
 use super::{LinePlot, TimeSeriesPlot, Trace};
 use crate::icons::Icon;
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 
 /// Where the measurement readout sits inside its host plot.
 ///
@@ -106,13 +106,14 @@ fn render_per_cursor_panels(
         // Fall back to the top-left when the view isn't resolved yet —
         // the cursor band can't be projected until the first frame has
         // data.
+        let s = plot.chrome_scale();
         let mid_x_pa_local = match (plot_area, &view) {
             (Some(pa), Some(v)) => v.x_bounds().to_screen(pa, mid_t, 0.0).x - pa.origin.x,
-            _ => px(PANEL_WIDTH / 2.0 + PANEL_PAD),
+            _ => px((PANEL_WIDTH / 2.0 + PANEL_PAD) * s),
         };
         let preferred = Point {
-            x: mid_x_pa_local - px(PANEL_WIDTH / 2.0),
-            y: px(PANEL_PAD),
+            x: mid_x_pa_local - px(PANEL_WIDTH / 2.0 * s),
+            y: px(PANEL_PAD * s),
         };
         let origin = clamp_origin(preferred, plot);
 
@@ -193,7 +194,7 @@ fn panel_card(id: impl Into<ElementId>, theme: &crate::theme::Theme) -> Stateful
         .id(id)
         .flex()
         .flex_col()
-        .w(px(PANEL_WIDTH))
+        .w(ui_px(PANEL_WIDTH))
         .bg(theme.bg_secondary)
         .border_1()
         .border_color(theme.border_primary)
@@ -241,8 +242,8 @@ fn mini_title_bar(
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(TITLE_HEIGHT))
-        .px(px(PANEL_PAD))
+        .h(ui_px(TITLE_HEIGHT))
+        .px(ui_px(PANEL_PAD))
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
@@ -253,7 +254,7 @@ fn mini_title_bar(
         )
         .child(
             div()
-                .text_size(px(LABEL_FONT_SIZE))
+                .text_size(ui_px(LABEL_FONT_SIZE))
                 .text_color(label_color)
                 .child(label),
         )
@@ -280,8 +281,8 @@ fn consolidated_title_bar(
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(TITLE_HEIGHT))
-        .px(px(PANEL_PAD))
+        .h(ui_px(TITLE_HEIGHT))
+        .px(ui_px(PANEL_PAD))
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
@@ -292,7 +293,7 @@ fn consolidated_title_bar(
         )
         .child(
             div()
-                .text_size(px(LABEL_FONT_SIZE))
+                .text_size(ui_px(LABEL_FONT_SIZE))
                 .text_color(text_primary)
                 .child(SharedString::new_static("Measurements")),
         )
@@ -326,11 +327,11 @@ fn icon_button(
         .flex()
         .items_center()
         .justify_center()
-        .w(px(16.0))
-        .h(px(16.0))
+        .w(ui_px(16.0))
+        .h(ui_px(16.0))
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, cx.listener(handler))
-        .child(icon.svg(12.0))
+        .child(icon.svg(12.0, theme(cx).text_secondary))
         .into_any_element()
 }
 
@@ -399,20 +400,20 @@ fn section_header(bar_color: Hsla, text_color: Hsla, delta_t: SharedString) -> i
         .flex()
         .flex_row()
         .items_center()
-        .h(px(ROW_HEIGHT))
-        .pr(px(PANEL_PAD))
+        .h(ui_px(ROW_HEIGHT))
+        .pr(ui_px(PANEL_PAD))
         .child(
             div()
-                .w(px(SECTION_BAR_WIDTH))
-                .h(px(ROW_HEIGHT - 6.0))
-                .ml(px(PANEL_PAD - SECTION_BAR_WIDTH))
-                .mr(px(6.0))
+                .w(ui_px(SECTION_BAR_WIDTH))
+                .h(ui_px(ROW_HEIGHT - 6.0))
+                .ml(ui_px(PANEL_PAD - SECTION_BAR_WIDTH))
+                .mr(ui_px(6.0))
                 .rounded(px(1.0))
                 .bg(bar_color),
         )
         .child(
             div()
-                .text_size(px(LABEL_FONT_SIZE))
+                .text_size(ui_px(LABEL_FONT_SIZE))
                 .text_color(text_color)
                 .child(SharedString::from(format!("Δt {}", delta_t))),
         )
@@ -431,15 +432,15 @@ fn measurement_row(
         .flex()
         .flex_row()
         .items_center()
-        .min_h(px(ROW_HEIGHT))
-        .py(px(2.0))
-        .px(px(PANEL_PAD))
-        .gap(px(8.0))
+        .min_h(ui_px(ROW_HEIGHT))
+        .py(ui_px(2.0))
+        .px(ui_px(PANEL_PAD))
+        .gap(ui_px(8.0))
         .text_color(value_text_color)
         .child(
             div()
-                .w(px(56.0))
-                .text_size(px(LABEL_FONT_SIZE))
+                .w(ui_px(56.0))
+                .text_size(ui_px(LABEL_FONT_SIZE))
                 .text_color(label_color)
                 .child(SharedString::new_static(label)),
         )
@@ -449,8 +450,8 @@ fn measurement_row(
                 .flex()
                 .flex_row()
                 .flex_wrap()
-                .gap_x(px(8.0))
-                .gap_y(px(2.0))
+                .gap_x(ui_px(8.0))
+                .gap_y(ui_px(2.0))
                 .children(value_cells),
         )
 }
@@ -460,15 +461,15 @@ fn value_cell(swatch_color: Hsla, value: SharedString) -> impl IntoElement {
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(4.0))
+        .gap(ui_px(4.0))
         .child(
             div()
-                .w(px(SWATCH_SIZE))
-                .h(px(SWATCH_SIZE))
+                .w(ui_px(SWATCH_SIZE))
+                .h(ui_px(SWATCH_SIZE))
                 .rounded(px(2.0))
                 .bg(swatch_color),
         )
-        .child(div().text_size(px(LABEL_FONT_SIZE)).child(value))
+        .child(div().text_size(ui_px(LABEL_FONT_SIZE)).child(value))
 }
 
 fn divider(color: Hsla) -> impl IntoElement {
@@ -482,9 +483,10 @@ fn clamp_origin(preferred: Point<Pixels>, plot: &TimeSeriesPlot) -> Point<Pixels
     let Some(plot_area) = plot.last_plot_area() else {
         return preferred;
     };
-    let max_x = (plot_area.size.width - px(PANEL_WIDTH) - px(PANEL_PAD)).max(px(0.0));
+    let s = plot.chrome_scale();
+    let max_x = (plot_area.size.width - px((PANEL_WIDTH + PANEL_PAD) * s)).max(px(0.0));
     let max_y =
-        (plot_area.size.height - px(PANEL_MAX_HEIGHT_ESTIMATE) - px(PANEL_PAD)).max(px(0.0));
+        (plot_area.size.height - px((PANEL_MAX_HEIGHT_ESTIMATE + PANEL_PAD) * s)).max(px(0.0));
     Point {
         x: preferred.x.clamp(px(0.0), max_x),
         y: preferred.y.clamp(px(0.0), max_y),

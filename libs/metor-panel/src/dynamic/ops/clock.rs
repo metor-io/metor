@@ -12,12 +12,12 @@ use std::time::Duration;
 use metor_proto::types::Timestamp;
 
 use crate::dynamic::node::{
-    BuildError, DynamicNode, NodeImpl, ValueType, default_ring_bytes, hash_id, op_tag, write_sample,
+    BuildError, Node, ValueType, default_ring_bytes, hash_id, op_tag, write_sample,
 };
 
 /// Fixed-rate wall-clock generator. Ticks every `1/hz` seconds starting at
 /// the moment construction returns.
-pub fn fixed_rate(hz: f64) -> Result<Arc<dyn DynamicNode>, BuildError> {
+pub fn fixed_rate(hz: f64) -> Result<Arc<Node>, BuildError> {
     if !hz.is_finite() || hz <= 0.0 {
         return Err(BuildError::InvalidArg {
             op: "fixed_rate",
@@ -35,10 +35,9 @@ pub fn fixed_rate(hz: f64) -> Result<Arc<dyn DynamicNode>, BuildError> {
         hz.to_bits().hash(h);
     });
     let period = Duration::from_secs_f64(period_secs);
-    let node = NodeImpl::spawn(
+    let node = Node::spawn(
         id,
         ValueType::Clock,
-        Some(id), // a clock is its own clock
         default_ring_bytes(0),
         move |output| async move {
             loop {

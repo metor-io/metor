@@ -66,7 +66,7 @@ impl TimeSeriesPlot {
         let axis_count = self.line_plot.read(cx).axes.len();
         let zone = self
             .last_plot_area
-            .map(|pa| axis_zone(event.position, pa, axis_count))
+            .map(|pa| axis_zone(event.position, pa, axis_count, self.chrome_scale))
             .unwrap_or(AxisZone::Plot);
         self.drag_start = Some(event.position);
         self.drag_start_view = self.line_plot.read(cx).effective_view(cx);
@@ -145,7 +145,7 @@ impl TimeSeriesPlot {
         let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
         let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
 
-        let zone = axis_zone(event.position, pa, view.axis_count());
+        let zone = axis_zone(event.position, pa, view.axis_count(), self.chrome_scale);
         let (ax, ay) = view.x_bounds().screen_anchor(pa, event.position);
         let new_view = match zone {
             AxisZone::Plot => view.zoom_x(factor, ax).zoom_y_all(factor, 1.0 - ay),
@@ -162,7 +162,8 @@ impl TimeSeriesPlot {
         canvas(
             {
                 let this = cx.entity().downgrade();
-                move |bounds, _window, cx| {
+                move |bounds, window, cx| {
+                    let scale = ui_scale(window);
                     let lp = underlay_lp.read(cx);
                     let axis_count = lp.axes.len();
                     let view = lp.effective_view(cx);
@@ -170,7 +171,8 @@ impl TimeSeriesPlot {
                     let fmt = lp.x_time_format;
                     let tint = alarm_plot_tint(lp, cx);
                     let _ = this.update(cx, |this, _| {
-                        this.last_plot_area = Some(plot_area(bounds, axis_count));
+                        this.last_plot_area = Some(plot_area(bounds, axis_count, scale));
+                        this.chrome_scale = scale;
                     });
                     (bounds, view, data_start, fmt, tint)
                 }
@@ -235,7 +237,7 @@ impl TimeSeriesPlot {
                         cx,
                     );
                     crate::temporal::paint_playhead(
-                        plot_area(bounds, view.axis_count()),
+                        plot_area(bounds, view.axis_count(), ui_scale(window)),
                         view.x,
                         window,
                         cx,
@@ -251,13 +253,14 @@ impl TimeSeriesPlot {
     fn render_event_flags(&self, cx: &mut Context<Self>) -> AnyElement {
         let flags_weak = cx.entity().downgrade();
         canvas(
-            move |bounds, _window, cx| {
+            move |bounds, window, cx| {
+                let scale = ui_scale(window);
                 let mut out = None;
                 let _ = flags_weak.update(cx, |this, cx| {
                     let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
                         return;
                     };
-                    let pa = plot_area(bounds, view.axis_count());
+                    let pa = plot_area(bounds, view.axis_count(), scale);
                     let clusters = this.build_event_clusters(&view, pa, cx);
                     let theme = crate::theme::theme(cx);
                     let paints: Vec<ClusterPaint> = clusters
@@ -392,7 +395,7 @@ impl TimeSeriesPlot {
 }
 
 impl Render for TimeSeriesPlot {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx);
         // Resolve this frame's event sources (and refresh their repaint subs)
         // before building canvases, so the flag canvas can query them in paint.
@@ -401,7 +404,7 @@ impl Render for TimeSeriesPlot {
         let show_legend = trace_entities.len() >= 2;
         // Drives the left chrome width: one Y_LABEL_WIDTH column per axis.
         let axis_count = self.line_plot.read(cx).axes.len();
-        let chrome_left = px(left_margin(axis_count));
+        let chrome_left = ui_px(left_margin(axis_count));
 
         let mut root = div().flex().flex_col().size_full().bg(theme.bg_secondary);
 
@@ -412,9 +415,9 @@ impl Render for TimeSeriesPlot {
                 div()
                     .absolute()
                     .left(chrome_left)
-                    .top(px(PADDING))
-                    .right(px(PADDING))
-                    .bottom(px(X_LABEL_HEIGHT + PADDING))
+                    .top(ui_px(PADDING))
+                    .right(ui_px(PADDING))
+                    .bottom(ui_px(X_LABEL_HEIGHT + PADDING))
                     .child(self.line_plot.clone()),
             )
             .child(self.render_overlay(cx))
@@ -428,7 +431,7 @@ impl Render for TimeSeriesPlot {
                     .absolute()
                     .top_0()
                     .right_0()
-                    .text_size(px(10.0))
+                    .text_size(ui_px(10.0))
                     .text_color(theme.text_tertiary)
                     .child("Independent range"),
             );
@@ -440,8 +443,9 @@ impl Render for TimeSeriesPlot {
         for panel in panels {
             // Panel origins are plot-area-local; the outer container's
             // origin is offset by (left_margin, PADDING).
-            let left = panel.origin.x + chrome_left;
-            let top = panel.origin.y + px(PADDING);
+            let scale = ui_scale(window);
+            let left = panel.origin.x + px(left_margin(axis_count) * scale);
+            let top = panel.origin.y + px(PADDING * scale);
             inner = inner.child(div().absolute().left(left).top(top).child(panel.element));
         }
 

@@ -46,7 +46,7 @@ use smallvec::SmallVec;
 
 #[allow(unused_imports)]
 use crate::inspect;
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 use crate::views::binding::{StreamUpdate, spawn_seeded_stream};
 
 pub use bridge::BevyBridge;
@@ -372,10 +372,6 @@ impl Viewer3d {
         self.camera
     }
 
-    pub fn camera_mut(&mut self) -> &mut OrbitCamera {
-        &mut self.camera
-    }
-
     /// Mark the viewer dirty and schedule a repaint.
     fn mark_dirty(&mut self, cx: &mut Context<Self>) {
         self.needs_render = true;
@@ -599,42 +595,6 @@ impl Viewer3d {
         };
         self.models.push(cx.new(|_| entry));
         cx.notify();
-    }
-
-    /// Remove a model; reconcile tears down its Bevy entity and tasks.
-    pub fn remove_model(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.models.len() {
-            return;
-        }
-        self.models.remove(index);
-        cx.notify();
-    }
-
-    /// Change a model's GLTF path; reconcile despawns and respawns.
-    pub fn set_model_path(&mut self, index: usize, path: String, cx: &mut Context<Self>) {
-        let Some(entry) = self.models.get(index).cloned() else {
-            return;
-        };
-        entry.update(cx, |model, cx| {
-            model.path = path;
-            cx.notify();
-        });
-    }
-
-    /// Change a model's display label.
-    pub fn set_model_label(
-        &mut self,
-        index: usize,
-        label: impl Into<SharedString>,
-        cx: &mut Context<Self>,
-    ) {
-        let label = label.into();
-        if let Some(entry) = self.models.get(index) {
-            entry.update(cx, |model, cx| {
-                model.label = label;
-                cx.notify();
-            });
-        }
     }
 
     /// Snap the target size to a 64-pixel grid.
@@ -951,7 +911,7 @@ impl Render for Viewer3d {
                                 .unwrap_or((None, Vec::new()));
 
                             for img in releases {
-                                let _ = window.drop_image(img);
+                                crate::atlas::release_image(window, cx, img);
                             }
 
                             (bounds, frame)
@@ -971,7 +931,7 @@ impl Render for Viewer3d {
                     },
                 )
                 .size_full()
-                .min_h(px(64.0)),
+                .min_h(ui_px(64.0)),
             )
     }
 }

@@ -144,7 +144,7 @@ impl Render for FilterBar {
             .text_size(px(11.0))
             .text_color(theme.text_tertiary)
             .cursor_text()
-            .child(Icon::Search.svg_color(11.0, theme.text_tertiary))
+            .child(Icon::Search.svg(11.0, theme.text_tertiary))
             .child(div().flex_1().min_w_0().child(self.field.element()))
             .children(
                 self.status
@@ -164,7 +164,7 @@ impl Render for FilterBar {
                     .rounded(px(3.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.selection_bg))
-                    .child(Icon::Close.svg_color(9.0, theme.text_secondary))
+                    .child(Icon::Close.svg(9.0, theme.text_secondary))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.clear(cx);
                         window.focus(&this.parent_focus, cx);

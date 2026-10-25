@@ -9,7 +9,7 @@
 //! Reads are tolerant: a missing or malformed file yields [`PanelConfig::default`]
 //! rather than an error, so a hand-edited typo can never take the app down.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 /// How the UI font family is chosen.
@@ -99,36 +99,52 @@ pub(crate) fn config_dir() -> io::Result<PathBuf> {
 /// Load the panel config, falling back to defaults on a missing or malformed
 /// file. Parse failures are logged but never propagated.
 pub fn load() -> PanelConfig {
-    let Ok(path) = config_path() else {
-        return PanelConfig::default();
-    };
-    let json = match fs::read_to_string(&path) {
-        Ok(json) => json,
-        // A first-run user has no file yet; that's the common case, not an error.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return PanelConfig::default(),
-        Err(e) => {
-            tracing::error!(path = %path.display(), %e, "read config failed");
-            return PanelConfig::default();
-        }
-    };
-    match facet_json::from_str(&json) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            tracing::error!(path = %path.display(), %e, "parse config failed");
-            PanelConfig::default()
-        }
-    }
+    load_json(config_path(), "config")
 }
 
 /// Write the panel config, creating the parent directory on demand.
 pub fn save(cfg: &PanelConfig) -> io::Result<()> {
-    let path = config_path()?;
+    save_json(&config_path()?, cfg)
+}
+
+/// Read a facet-json document with the tolerant conventions every panel
+/// preference file shares: a missing file is the common first-run case and
+/// yields `T::default()` silently; a read or parse failure is logged under
+/// `what` and also yields the default, so a hand-edited typo can't take the
+/// app down.
+pub(crate) fn load_json<T: facet::Facet<'static> + Default>(
+    path: io::Result<PathBuf>,
+    what: &str,
+) -> T {
+    let Ok(path) = path else {
+        return T::default();
+    };
+    let json = match fs::read_to_string(&path) {
+        Ok(json) => json,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return T::default(),
+        Err(e) => {
+            tracing::error!(path = %path.display(), %e, "read {what} failed");
+            return T::default();
+        }
+    };
+    match facet_json::from_str(&json) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::error!(path = %path.display(), %e, "parse {what} failed");
+            T::default()
+        }
+    }
+}
+
+/// Write `value` as facet-json to `path`, creating the parent directory on
+/// demand.
+pub(crate) fn save_json<T: facet::Facet<'static>>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let json = facet_json::to_string(cfg)
+    let json = facet_json::to_string(value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    fs::write(&path, json)
+    fs::write(path, json)
 }
 
 #[cfg(test)]

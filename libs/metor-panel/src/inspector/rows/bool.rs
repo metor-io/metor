@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, MouseMoveEvent, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, MouseMoveEvent, SharedString, Window, prelude::*};
 
-use super::{InspectorRow, RowAction, checkbox, row_base};
+use super::{InspectorRow, RowAction, checkbox, row_base, row_label};
 use crate::inspector::drag_paint;
 use crate::theme::theme;
 
@@ -60,10 +60,6 @@ impl BoolRow {
 }
 
 impl InspectorRow for BoolRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         &self.label
     }
@@ -80,12 +76,7 @@ impl InspectorRow for BoolRow {
         let value_source = self.value_source.clone();
         let static_value = self.value;
         row_base(row_ix, selected, cx)
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_primary)
-                    .child(self.label.clone()),
-            )
+            .child(row_label(self.label.clone(), theme.text_primary))
             .child(checkbox(self.current(cx), &theme))
             .when(!super::passive(cx), |row| {
                 row.on_mouse_move(move |event: &MouseMoveEvent, window, cx| {

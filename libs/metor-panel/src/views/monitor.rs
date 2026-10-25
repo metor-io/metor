@@ -1,19 +1,21 @@
 use std::sync::Arc;
 
-use gpui::{Context, Entity, IntoElement, SharedString, Window, div, prelude::*, px};
+use gpui::{Context, Entity, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use super::time_series::{LinePlot, Trace};
-use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
-use crate::ComponentStreamBuilder;
+use super::value_strip::{ComponentValueStrip, StripAlign, StripBehavior, StripClick, StripStyle};
+use crate::data_binding::Binding;
+use crate::inspect;
 use crate::inspector::edits::{EditRequest, pending_edits, pending_edits_mut};
 use crate::inspector::plot_preview::shift_hover_listener;
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
 
-/// Dashboard tile showing a component's current value, name, and an optional
-/// sparkline.
+/// A component's current value, name, and an optional sparkline — the one
+/// value readout, on panes and dashboards alike.
 ///
 /// The widget delegates streaming, formatting, and click-to-edit to a shared
 /// [`ComponentValueStrip`]. Sparkline traces are bound lazily: producers may
@@ -25,11 +27,18 @@ pub struct Monitor {
     name: SharedString,
     pub unit: SharedString,
     pub show_sparkline: bool,
+    /// Where the value and name sit across the tile.
+    pub align: StripAlign,
+    /// Value text size; zero keeps the strip's own sizing, which shrinks
+    /// multi-element values to fit side by side.
+    #[facet(inspect::label = "Value size (0 = auto)")]
+    #[facet(inspect::range(min = "0", max = "96"))]
+    pub value_size: f32,
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
     _binding_changes: gpui::Task<()>,
-    pub source: crate::data_binding::Binding,
+    pub source: Binding,
     #[facet(skip)]
     bound: ComponentId,
     #[facet(opaque)]
@@ -42,31 +51,50 @@ pub struct Monitor {
     _resolver_task: gpui::Task<()>,
 }
 
+/// Persisted shape of a monitor — the source component to monitor plus the
+/// inspector-editable display fields.
+///
+/// `unit` and `show_sparkline` are `Option`: `None` means "never edited", so
+/// restore keeps the metadata-derived defaults instead of clobbering them.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MonitorConfig {
+    pub component: String,
+    pub unit: Option<String>,
+    pub show_sparkline: Option<bool>,
+    pub align: StripAlign,
+    pub value_size: f32,
+}
+
 impl Monitor {
-    /// Bind this monitor to a running `=` expression, taking a share of its
-    /// lifetime and showing the text the operator typed as its name.
-    pub fn bind_expression(
-        &mut self,
-        expression: crate::dynamic::expressions::Expression,
-        label: impl Into<SharedString>,
-    ) {
-        self.name = label.into();
-        let text = crate::dynamic::expressions::binding_text(&self.db, expression.component_id())
-            .unwrap_or_else(|| self.name.to_string());
-        self.source = crate::data_binding::Binding::from_expression(expression, text);
+    pub fn from_config(cfg: MonitorConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let binding = Binding::from_text(&cfg.component, &db, cx);
+        let mut monitor = Self::bind(db, binding, cx);
+        if let Some(unit) = cfg.unit {
+            monitor.unit = SharedString::from(unit);
+        }
+        if let Some(show) = cfg.show_sparkline {
+            monitor.show_sparkline = show;
+        }
+        monitor.align = cfg.align;
+        monitor.value_size = cfg.value_size.max(0.0);
+        monitor
     }
 
-    pub fn binding_text(&self) -> String {
-        self.source.text(&self.db)
+    pub fn to_config(&self) -> MonitorConfig {
+        MonitorConfig {
+            component: self.source.text(&self.db),
+            unit: Some(self.unit.to_string()),
+            show_sparkline: Some(self.show_sparkline),
+            align: self.align,
+            value_size: self.value_size,
+        }
     }
 
-    pub fn new(
-        db: Arc<DB>,
-        source: impl ComponentStreamBuilder + Send + 'static,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let component_id = source.component_id();
-        let binding = crate::data_binding::Binding::from_legacy(component_id, None, &db, cx);
+    /// Stream whatever `binding` currently resolves to. A rebind replaces the
+    /// whole view, which is what drops the previous strip and resolver.
+    fn bind(db: Arc<DB>, binding: Binding, cx: &mut Context<Self>) -> Self {
+        let component_id = binding.id();
         let line_colors = theme(cx).line_colors;
 
         let (name, unit) = db.with_state(|state| {
@@ -105,7 +133,8 @@ impl Monitor {
             locked: pending_edits(cx).locked,
         };
 
-        let strip = cx.new(|cx| ComponentValueStrip::new(db.clone(), source, style, behavior, cx));
+        let strip =
+            cx.new(|cx| ComponentValueStrip::new(db.clone(), component_id, style, behavior, cx));
 
         // Await component registration, then rebind traces to match its
         // actual element count.
@@ -128,6 +157,8 @@ impl Monitor {
             name: name_shared,
             unit: unit_shared,
             show_sparkline: true,
+            align: StripAlign::Left,
+            value_size: 0.0,
             _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
             source: binding,
@@ -182,7 +213,7 @@ pub(crate) fn edit_click(
 
 /// Build a fresh [`StripBehavior`] each frame from the global pending-edit state.
 ///
-/// Centralises the snapshot so Monitor, ComponentText, and ComponentOutline
+/// Centralises the snapshot so Monitor, StateChip, and ComponentOutline
 /// share the same edit semantics (highlighted indices and lock state).
 pub(crate) fn behavior_snapshot(
     cx: &gpui::App,
@@ -216,17 +247,20 @@ impl Render for Monitor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.source.resolve(&self.db, cx);
         if self.bound != self.source.id() {
-            let source = self.source.clone();
             let unit = self.unit.clone();
-            let show = self.show_sparkline;
-            *self = Self::new(self.db.clone(), source.id(), cx);
-            self.source = source;
+            let (show, align, value_size) = (self.show_sparkline, self.align, self.value_size);
+            *self = Self::bind(self.db.clone(), self.source.clone(), cx);
             self.unit = unit;
             self.show_sparkline = show;
+            self.align = align;
+            self.value_size = value_size;
         }
         let theme = theme(cx);
 
-        let style = StripStyle::dashboard().with_unit(self.unit.clone());
+        let style = StripStyle::dashboard()
+            .with_unit(self.unit.clone())
+            .with_align(self.align)
+            .with_value_size((self.value_size > 0.0).then_some(self.value_size));
         let behavior = behavior_snapshot(cx, self.db.clone(), self.source.id(), self.click.clone());
         self.strip.update(cx, |strip, cx| {
             strip.set_style(style, cx);
@@ -244,26 +278,71 @@ impl Render for Monitor {
             root = root.child(
                 div()
                     .w_full()
-                    .pt(px(4.0))
+                    .pt(ui_px(4.0))
                     .flex_1()
-                    .min_h(px(16.0))
+                    .min_h(ui_px(16.0))
                     .child(self.sparkline.clone()),
             );
         }
 
-        root = root.child(div().px(px(6.0)).pt(px(3.0)).child(self.strip.clone()));
+        root = root.child(
+            div()
+                .px(ui_px(6.0))
+                .pt(ui_px(3.0))
+                .child(self.strip.clone()),
+        );
 
         root = root.child(
             div()
                 .id("monitor-name")
-                .px(px(6.0))
-                .pb(px(4.0))
-                .text_size(px(11.0))
+                .px(ui_px(6.0))
+                .pb(ui_px(4.0))
+                .map(|name| match self.align {
+                    StripAlign::Left => name,
+                    StripAlign::Center => name.text_center(),
+                    StripAlign::Right => name.text_right(),
+                })
+                .text_size(ui_px(11.0))
                 .text_color(theme.text_primary)
                 .on_mouse_move(shift_hover_listener(self.source.id(), SmallVec::new()))
                 .child(self.name.clone()),
         );
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Also the shape of a saved Component Text pane or widget, which now
+    /// reopens as a monitor.
+    #[test]
+    fn monitor_config_defaults_optional_display_fields() {
+        let cfg: MonitorConfig = serde_json::from_str(r#"{"component":"a.b"}"#).unwrap();
+        assert_eq!(cfg.component, "a.b");
+        assert_eq!(cfg.unit, None);
+        assert_eq!(cfg.show_sparkline, None);
+        assert_eq!(cfg.align, StripAlign::Left);
+        assert_eq!(cfg.value_size, 0.0);
+    }
+
+    #[test]
+    fn monitor_config_round_trips_display_fields() {
+        let cfg = MonitorConfig {
+            component: "a.b".to_string(),
+            unit: Some("V".to_string()),
+            show_sparkline: Some(false),
+            align: StripAlign::Right,
+            value_size: 32.0,
+        };
+        let blob = serde_json::to_string(&cfg).unwrap();
+        let back: MonitorConfig = serde_json::from_str(&blob).unwrap();
+        assert_eq!(back.component, "a.b");
+        assert_eq!(back.unit.as_deref(), Some("V"));
+        assert_eq!(back.show_sparkline, Some(false));
+        assert_eq!(back.align, StripAlign::Right);
+        assert_eq!(back.value_size, 32.0);
     }
 }

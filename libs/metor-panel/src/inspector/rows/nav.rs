@@ -91,9 +91,6 @@ impl InspectorRow for NavRow {
     fn identity(&self) -> SharedString {
         self.identity.clone().unwrap_or_else(|| self.label.clone())
     }
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
 
     fn accessory(&self, _: &str, cx: &mut App) -> Option<super::AccessorySpec> {
         self.accessory.as_ref().and_then(|build| build(cx))
@@ -140,7 +137,7 @@ impl InspectorRow for NavRow {
                     .text_color(theme.text_secondary)
                     .child(summary),
             )
-            .child(Icon::ChevronRight.svg(8.0));
+            .child(Icon::ChevronRight.svg(8.0, theme.text_secondary));
 
         row_base(row_ix, selected, cx)
             .child(super::path_label(

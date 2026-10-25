@@ -7,30 +7,45 @@
 //! *where in the range* a value sits rather than how much of it is used, and
 //! it packs a wide range into a square tile.
 //!
-//! Arcs are drawn as sampled polylines rather than through
+//! The look follows the Crew Dragon displays: one thick band over part of
+//! an invisible circle, turned to whichever side of that circle suits the
+//! layout, with the readout set large in the circle's middle. Gaps cut the
+//! band at each division, so it reads as a bar of segments; the span up to
+//! the value is lit in the dial's color and the rest is the same color held
+//! back to the low alpha the panel's buttons and chips use for an accent's
+//! background. Faint dashes inside the band repeat the scale, and limits
+//! stand out as colored dashes among them. The circle, not the arc, is what
+//! the readout belongs to, so a short arc tucked into one corner still
+//! frames a centered value.
+//!
+//! Arcs are sampled into polylines rather than built with
 //! [`PathBuilder::arc_to`]. The SVG arc flags (`large_arc`/`sweep`) are easy
 //! to get subtly wrong across the 180° boundary, and at [`ARC_STEP_DEG`] the
 //! polyline is indistinguishable from a true arc.
 
+use std::f32::consts::FRAC_PI_2;
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Hsla, IntoElement, PathBuilder, Pixels, Point, SharedString, Window, canvas,
-    div, point, prelude::*, px,
+    App, Bounds, Context, Font, Hsla, IntoElement, PathBuilder, Pixels, Point, SharedString,
+    TextAlign, TextRun, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::DB;
 use serde::{Deserialize, Serialize};
 
-use super::binding::{self, ElementRef, component_meta, spawn_meta_resolver, spawn_scalar_stream};
+use super::binding::{
+    self, ElementRef, LiveBinding, ScalarInstrument, component_meta, default_label, stream_scalar,
+};
 use super::format_number;
 use super::meter::{fill_span, scale_position};
-use crate::theme::theme;
+use crate::inspect;
+use crate::theme::{Theme, theme, ui_px, ui_scale};
 
 /// How the value is shown along the dial.
 #[derive(Clone, Copy, Debug, Default, PartialEq, facet::Facet, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum GaugeStyle {
-    /// A thick arc filled from the scale's origin to the value.
+    /// The band lit from the scale's origin to the value.
     #[default]
     Arc,
     /// A pointer from the hub to the value.
@@ -39,13 +54,64 @@ pub enum GaugeStyle {
 
 /// Angular resolution of a sampled arc.
 const ARC_STEP_DEG: f64 = 2.0;
-/// Thickness of the dial's track and value arc.
-const ARC_WIDTH: f32 = 7.0;
-/// Fraction of the radius a limit tick extends inward from the track.
-const TICK_REACH: f32 = 0.18;
-/// Default total sweep — wide enough to read a range, open enough at the
-/// bottom to leave room for the value.
-const DEFAULT_SWEEP_DEG: f64 = 240.0;
+/// Thickness of the band, as a share of the radius.
+const FILL_SHARE: f32 = 0.055;
+/// Thinnest the band gets, in ui pixels, however small the dial.
+const FILL_MIN: f32 = 2.0;
+/// Alpha of the band's unlit segments: the accent-background alpha the
+/// panel's buttons and chips use, so the track reads as the same material.
+const TRACK_ALPHA: f32 = 0.18;
+/// Alpha of the scale dashes. The gaps already mark divisions; the dashes
+/// only repeat them, so they stay barely there.
+const DASH_ALPHA: f32 = 0.3;
+/// Narrowest division gap, in ui pixels: a cut thinner than this stops
+/// reading as a gap on a small dial.
+const GAP_MIN: f32 = 1.5;
+/// Division gap as a share of the band's thickness, so a large dial's cuts
+/// keep their proportion to the band.
+const GAP_SHARE: f32 = 0.3;
+/// Largest share of a division a gap may take, so dense divisions on a
+/// short arc still leave more band than gap.
+const GAP_MAX_SHARE: f32 = 0.3;
+/// Clearance between the band's inner edge and the scale dashes, in radii —
+/// wide enough to read as space, so the dashes float inside the band
+/// rather than hang off it.
+const DASH_INSET: f32 = 0.04;
+/// Length of a division dash, in radii.
+const DIVISION_DASH: f32 = 0.03;
+/// Length of a subdivision dash, in radii.
+const MINOR_DASH: f32 = 0.015;
+/// Clearance between the band and a limit dash, in radii. Tighter than the
+/// scale's, so a limit reads as pointing at the band.
+const LIMIT_INSET: f32 = 0.015;
+/// Length of a limit dash, in radii.
+const LIMIT_DASH: f32 = 0.07;
+/// Subdivisions closer than this many ui pixels apart are left off: past
+/// that density they read as texture rather than a scale.
+const MINOR_MIN_SPACING: f32 = 6.0;
+/// Deepest any arc decoration reaches toward the hub, in radii. The fit keeps
+/// the arc's ends at this depth on screen as well as its outer edge.
+const INNER_REACH: f32 = 1.0 - FILL_SHARE - LIMIT_INSET - LIMIT_DASH;
+/// Half-extent of the readout block around the hub, in radii. Its corners
+/// (about 0.74 out) clear the band and the dashes inside it.
+const READOUT_HALF: (f32, f32) = (0.62, 0.4);
+/// Clearance between the readout and the chord across a short arc's ends,
+/// in radii, once the readout is drawn up toward the arc.
+const READOUT_CLEARANCE: f32 = 0.06;
+/// Readout lines as (vertical offset from the hub, font size), in radii.
+const LABEL_LINE: (f32, f32) = (-0.3, 0.12);
+const VALUE_LINE: (f32, f32) = (0.0, 0.34);
+const UNIT_LINE: (f32, f32) = (0.3, 0.16);
+/// Smallest readout text, in ui pixels, however small the dial gets.
+const MIN_TEXT: f32 = 7.0;
+/// Default total sweep — from half past seven over the top to half past
+/// four, open at the bottom to leave room for the value.
+const DEFAULT_SWEEP_DEG: f64 = 270.0;
+/// Default divisions: sixths, which on the default sweep land a division at
+/// nine and three o'clock.
+const DEFAULT_DIVISIONS: usize = 6;
+/// Default subdivisions inside each division: none, as on the cockpit dials.
+const DEFAULT_MINOR_TICKS: usize = 0;
 
 /// Persisted shape of a [`Gauge`], shared by the tile and dashboard surfaces.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -58,6 +124,16 @@ pub struct GaugeConfig {
     pub max: f64,
     pub unit: Option<String>,
     pub sweep_degrees: f64,
+    /// Where the middle of the arc points, clockwise from straight up. `0`
+    /// keeps the dial symmetric about vertical, as dials saved before this
+    /// field existed were.
+    pub rotation_degrees: f64,
+    /// The scale's equal parts: gaps in the lit band, dashes along the unlit
+    /// track. `0` leaves the band whole and draws no subdivisions either.
+    pub divisions: usize,
+    /// Short dashes splitting each division evenly along the unlit track.
+    /// Dropped where they would crowd together.
+    pub minor_ticks: usize,
     pub style: GaugeStyle,
     pub color: Option<Hsla>,
     pub hide_value: bool,
@@ -74,6 +150,9 @@ impl Default for GaugeConfig {
             max: 1.0,
             unit: None,
             sweep_degrees: DEFAULT_SWEEP_DEG,
+            rotation_degrees: 0.0,
+            divisions: DEFAULT_DIVISIONS,
+            minor_ticks: DEFAULT_MINOR_TICKS,
             style: GaugeStyle::default(),
             color: None,
             hide_value: false,
@@ -94,66 +173,44 @@ pub struct Gauge {
     pub min: f64,
     pub max: f64,
     pub unit: SharedString,
+    #[facet(inspect::label = "Sweep")]
+    #[facet(inspect::range(min = "30", max = "360"))]
     pub sweep_degrees: f64,
+    #[facet(inspect::label = "Rotation")]
+    #[facet(inspect::range(min = "-180", max = "180"))]
+    pub rotation_degrees: f64,
+    #[facet(inspect::range(min = "0", max = "20"))]
+    pub divisions: usize,
+    #[facet(inspect::label = "Minor ticks")]
+    #[facet(inspect::range(min = "0", max = "9"))]
+    pub minor_ticks: usize,
     pub style: GaugeStyle,
     pub color: Hsla,
     pub show_value: bool,
     pub show_limits: bool,
-    /// Fallback name for a component nothing has registered;
-    /// [`to_config`](Self::to_config) prefers the live name for the bound id.
-    #[facet(skip)]
-    component: SharedString,
-    /// What `_task` is actually streaming, compared against the editable
-    /// fields each frame.
     #[facet(opaque)]
-    bound: Option<ElementRef>,
-    #[facet(skip)]
-    value: Option<f64>,
-    #[facet(opaque)]
-    db: Arc<DB>,
-    #[facet(opaque)]
-    _binding_changes: gpui::Task<()>,
-    #[facet(opaque)]
-    _task: gpui::Task<()>,
-    #[facet(opaque)]
-    _resolver_task: gpui::Task<()>,
+    live: LiveBinding<f64>,
+}
+
+impl ScalarInstrument for Gauge {
+    fn scalar(&mut self) -> (&mut SharedString, &mut SharedString, &mut LiveBinding<f64>) {
+        (&mut self.label, &mut self.unit, &mut self.live)
+    }
 }
 
 impl Gauge {
     pub fn from_config(cfg: &GaugeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
-        let component_id = source.id();
-        let element = cfg.element;
-        let meta = component_meta(&db, component_id);
-
-        let task =
-            spawn_scalar_stream(db.clone(), component_id, element, cx, |gauge, value, cx| {
-                gauge.value = value;
-                cx.notify();
-            });
-
-        let keep_label = cfg.label.is_some();
-        let keep_unit = cfg.unit.is_some();
-        let resolver_task =
-            spawn_meta_resolver(db.clone(), component_id, cx, move |gauge, meta, cx| {
-                if !keep_label {
-                    gauge.label =
-                        super::meter::default_label(&meta.element_names, element, &meta.name);
-                }
-                if !keep_unit {
-                    gauge.unit = meta.unit;
-                }
-                cx.notify();
-            });
-
+        let at = ElementRef::new(source.id(), cfg.element);
+        let meta = component_meta(&db, at.component);
+        let mut live = LiveBinding::new(at, db, cx);
+        stream_scalar(&mut live, at, cfg.label.is_some(), cfg.unit.is_some(), cx);
         Self {
             label: cfg
                 .label
                 .clone()
                 .map(SharedString::from)
-                .unwrap_or_else(|| {
-                    super::meter::default_label(&meta.element_names, element, &meta.name)
-                }),
+                .unwrap_or_else(|| default_label(&meta.element_names, at.element, &meta.name)),
             min: cfg.min,
             max: cfg.max,
             unit: cfg
@@ -162,19 +219,16 @@ impl Gauge {
                 .map(SharedString::from)
                 .unwrap_or(meta.unit),
             sweep_degrees: cfg.sweep_degrees,
+            rotation_degrees: cfg.rotation_degrees,
+            divisions: cfg.divisions,
+            minor_ticks: cfg.minor_ticks,
             style: cfg.style,
             color: cfg.color.unwrap_or_else(|| theme(cx).control_active),
             show_value: !cfg.hide_value,
             show_limits: !cfg.hide_limits,
-            component: SharedString::from(cfg.component.clone()),
             source,
-            element,
-            bound: Some(ElementRef::new(component_id, element)),
-            value: None,
-            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
-            db,
-            _task: task,
-            _resolver_task: resolver_task,
+            element: cfg.element,
+            live,
         }
     }
 
@@ -184,57 +238,29 @@ impl Gauge {
     }
 
     /// Restart the stream when the inspector has re-pointed the dial. Label
-    /// and unit are re-derived: they described the old component, and a dial
-    /// labelled `ω x` reading wheel momentum is worse than no label.
-    pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
-        self.source.resolve(&self.db, cx);
-        let want = self.at();
-        if !binding::rebound(want, &mut self.bound) {
-            return;
+    /// and unit described the old component, so they are re-derived.
+    fn rebind(&mut self, cx: &mut Context<Self>) {
+        if let Some((at, meta)) = self.live.moved(&mut self.source, self.element, cx) {
+            self.label = default_label(&meta.element_names, at.element, &meta.name);
+            self.unit = meta.unit;
+            stream_scalar(&mut self.live, at, false, false, cx);
         }
-
-        let element = want.element;
-        let meta = component_meta(&self.db, want.component);
-        self.label = super::meter::default_label(&meta.element_names, element, &meta.name);
-        self.unit = meta.unit;
-        self.component = meta.name;
-        self.value = None;
-        self._task = spawn_scalar_stream(
-            self.db.clone(),
-            want.component,
-            element,
-            cx,
-            |gauge, value, cx| {
-                gauge.value = value;
-                cx.notify();
-            },
-        );
-        self._resolver_task = spawn_meta_resolver(
-            self.db.clone(),
-            want.component,
-            cx,
-            move |gauge, meta, cx| {
-                gauge.label = super::meter::default_label(&meta.element_names, element, &meta.name);
-                gauge.unit = meta.unit;
-                cx.notify();
-            },
-        );
     }
 
     pub fn to_config(&self) -> GaugeConfig {
         GaugeConfig {
-            // Resolve the name for whatever is bound *now*, so a rebind is
-            // what gets saved.
-            // An expression's component is named by a content hash and
-            // labelled with the text that made it, so what round-trips is the
-            // text — a name would rehydrate onto nothing.
-            component: self.source.text(&self.db),
+            // An expression's component is named by a content hash, so what
+            // round-trips is the text of whatever is bound now.
+            component: self.source.text(&self.live.db),
             element: self.element,
             label: Some(self.label.to_string()),
             min: self.min,
             max: self.max,
             unit: Some(self.unit.to_string()),
             sweep_degrees: self.sweep_degrees,
+            rotation_degrees: self.rotation_degrees,
+            divisions: self.divisions,
+            minor_ticks: self.minor_ticks,
             style: self.style,
             color: Some(self.color),
             hide_value: !self.show_value,
@@ -242,99 +268,314 @@ impl Gauge {
         }
     }
 
-    pub fn component(&self) -> &SharedString {
-        &self.component
+    /// The text set in the middle of the circle this frame.
+    fn readout(&self) -> Readout {
+        let label = (!self.label.is_empty()).then(|| self.label.to_uppercase().into());
+        if !self.show_value {
+            return Readout {
+                label,
+                value: None,
+                unit: None,
+            };
+        }
+        let value = match self.live.value {
+            Some(v) => format_number(v),
+            None => "—".to_string(),
+        };
+        Readout {
+            label,
+            value: Some(value.into()),
+            unit: (!self.unit.is_empty()).then(|| self.unit.clone()),
+        }
+    }
+}
+
+/// The lines of a dial's readout: label in small capitals over the value,
+/// unit beneath it.
+struct Readout {
+    label: Option<SharedString>,
+    value: Option<SharedString>,
+    unit: Option<SharedString>,
+}
+
+impl Readout {
+    fn is_empty(&self) -> bool {
+        self.label.is_none() && self.value.is_none() && self.unit.is_none()
+    }
+
+    /// The block the lines present actually occupy, so a readout without a
+    /// label or unit doesn't reserve room for one. Its width stays the full
+    /// slot: sized to the text, the dial would resize as the value's digits
+    /// change.
+    fn block(&self, pull: bool) -> ReadoutBox {
+        let lines = [
+            (self.label.is_some(), LABEL_LINE),
+            (self.value.is_some(), VALUE_LINE),
+            (self.unit.is_some(), UNIT_LINE),
+        ];
+        let (mut top, mut bottom) = (f32::INFINITY, f32::NEG_INFINITY);
+        for (_, (offset, size)) in lines.into_iter().filter(|(present, _)| *present) {
+            top = top.min(offset - size / 2.0);
+            bottom = bottom.max(offset + size / 2.0);
+        }
+        if top > bottom {
+            (top, bottom) = (0.0, 0.0);
+        }
+        ReadoutBox {
+            half_width: READOUT_HALF.0,
+            top: top.max(-READOUT_HALF.1),
+            bottom: bottom.min(READOUT_HALF.1),
+            pull,
+        }
+    }
+
+    /// Set each line at its slot around the hub, sized to the dial and shrunk
+    /// to the readout box when it would spill past it.
+    fn paint(&self, dial: &Dial, color: Hsla, dim: Hsla, window: &mut Window, cx: &mut App) {
+        let mut font = window.text_style().font();
+        font.weight = gpui::FontWeight::LIGHT;
+        let min_size = MIN_TEXT * ui_scale(window);
+        let lines = [
+            (&self.label, LABEL_LINE, dim),
+            (&self.value, VALUE_LINE, color),
+            (&self.unit, UNIT_LINE, dim),
+        ];
+        for (text, (offset, size), color) in lines {
+            let Some(text) = text else { continue };
+            let (ox, oy) = dial.readout;
+            let center = point(
+                dial.center.x + px(ox * dial.radius),
+                dial.center.y + px((oy + offset) * dial.radius),
+            );
+            let fit = TextFit {
+                size: (size * dial.radius).max(min_size),
+                max_width: 2.0 * READOUT_HALF.0 * dial.radius,
+                min_size,
+            };
+            paint_centered(text, fit, center, font.clone(), color, window, cx);
+        }
+    }
+}
+
+/// How large a readout line wants to be and how far it may shrink to fit.
+struct TextFit {
+    size: f32,
+    max_width: f32,
+    min_size: f32,
+}
+
+/// Shape `text` and paint it centered on `center`, reshaping smaller once if
+/// it is wider than the fit allows.
+fn paint_centered(
+    text: &SharedString,
+    fit: TextFit,
+    center: Point<Pixels>,
+    font: Font,
+    color: Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let run = TextRun {
+        len: text.len(),
+        font,
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let mut size = fit.size;
+    let mut shaped =
+        window
+            .text_system()
+            .shape_line(text.clone(), px(size), std::slice::from_ref(&run), None);
+    let width = f32::from(shaped.width);
+    if width > fit.max_width && size > fit.min_size {
+        size = (size * fit.max_width / width).max(fit.min_size);
+        shaped = window
+            .text_system()
+            .shape_line(text.clone(), px(size), &[run], None);
+    }
+    let origin = point(center.x - shaped.width / 2.0, center.y - px(size / 2.0));
+    let _ = shaped.paint(origin, px(size), TextAlign::Left, None, window, cx);
+}
+
+/// What has to fit at the hub besides the arc itself.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Hub {
+    /// Nothing: only the track and its dashes take space.
+    Empty,
+    /// The needle's pivot, a point.
+    Pivot,
+    /// The readout block, drawn toward a short arc.
+    Readout(ReadoutBox),
+}
+
+/// The readout's footprint relative to its own centre, in radii.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReadoutBox {
+    half_width: f32,
+    top: f32,
+    bottom: f32,
+    /// Whether the block may leave the hub. A needle pivots there, so its
+    /// readout stays put.
+    pull: bool,
+}
+
+impl ReadoutBox {
+    /// The block a dial with every line reserves.
+    #[cfg(test)]
+    const FULL: Self = Self {
+        half_width: READOUT_HALF.0,
+        top: -READOUT_HALF.1,
+        bottom: READOUT_HALF.1,
+        pull: true,
+    };
+
+    fn corners(&self) -> [(f32, f32); 4] {
+        let (w, t, b) = (self.half_width, self.top, self.bottom);
+        [(-w, t), (w, t), (-w, b), (w, b)]
+    }
+
+    /// Where the block's centre sits, in radii from the hub.
+    ///
+    /// An arc of half a turn or more wraps the hub, and the readout sits in
+    /// it. A shorter arc leaves the hub out in the open, far from the band,
+    /// so the block slides out toward the arc's middle until it meets the
+    /// chord between the arc's ends — no arc point is nearer the hub along
+    /// that direction, so the block can't reach the band.
+    fn offset(&self, sweep: f32, rotation: f32) -> (f32, f32) {
+        if !self.pull {
+            return (0.0, 0.0);
+        }
+        let toward = polar(rotation, 1.0);
+        let chord = INNER_REACH * (sweep / 2.0).cos() - READOUT_CLEARANCE;
+        let reach = self
+            .corners()
+            .iter()
+            .map(|(x, y)| x * toward.0 + y * toward.1)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let slide = (chord - reach).max(0.0);
+        (toward.0 * slide, toward.1 * slide)
     }
 }
 
 /// A dial's resolved geometry for one frame: where the hub sits, how far the
-/// scale reaches, and how wide it sweeps.
+/// scale reaches, how wide it sweeps and which way it faces.
 #[derive(Clone, Copy)]
 struct Dial {
     center: Point<Pixels>,
     radius: f32,
     sweep: f32,
+    rotation: f32,
+    /// The readout's centre, in radii from the hub.
+    readout: (f32, f32),
+}
+
+/// Axis-aligned extent in radii from the hub, screen-oriented (y down).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Extent {
+    min: (f32, f32),
+    max: (f32, f32),
+}
+
+impl Extent {
+    fn include(&mut self, (x, y): (f32, f32)) {
+        self.min = (self.min.0.min(x), self.min.1.min(y));
+        self.max = (self.max.0.max(x), self.max.1.max(y));
+    }
+
+    fn size(&self) -> (f32, f32) {
+        (self.max.0 - self.min.0, self.max.1 - self.min.1)
+    }
+}
+
+/// Unit-circle point at `angle` radians clockwise from up, `reach` radii out.
+fn polar(angle: f32, reach: f32) -> (f32, f32) {
+    (reach * angle.sin(), -reach * angle.cos())
 }
 
 impl Dial {
-    /// Fit a dial of `sweep` radians into `bounds`.
+    /// Fit a dial of `sweep` radians, its middle turned `rotation` radians
+    /// clockwise from up, into `bounds`.
     ///
-    /// Sized against the arc's true extent rather than the tile's inscribed
-    /// circle: a 240° dial is wider than it is tall, and fitting it to a
-    /// circle would waste a third of the tile.
-    fn fit(bounds: Bounds<Pixels>, sweep: f32) -> Self {
-        let half = (sweep / 2.0).clamp(0.0, std::f32::consts::PI);
-        // Widest point is the sweep end, unless the sweep passes through the
-        // horizontal, where it reaches the full radius.
-        let width_factor = 2.0
-            * if half >= std::f32::consts::FRAC_PI_2 {
-                1.0
-            } else {
-                half.sin()
-            };
-        // Top of the arc is always -r; the bottom is wherever the sweep ends.
-        let height_factor = 1.0 - half.cos();
+    /// Sized against what is actually drawn rather than the tile's inscribed
+    /// circle: a 240° dial is wider than it is tall, and a 90° arc in one
+    /// corner needs only a corner of the circle — plus the hub, when the
+    /// readout or needle lives there.
+    fn fit(bounds: Bounds<Pixels>, sweep: f32, rotation: f32, hub: Hub) -> Self {
+        let extent = Self::extent(sweep, rotation, hub);
+        let (ew, eh) = extent.size();
         let w = f32::from(bounds.size.width);
         let h = f32::from(bounds.size.height);
-        let radius = (w / width_factor.max(f32::EPSILON))
-            .min(h / height_factor.max(f32::EPSILON))
+        let radius = (w / ew.max(f32::EPSILON))
+            .min(h / eh.max(f32::EPSILON))
             .max(0.0);
         let center = point(
-            bounds.origin.x + bounds.size.width / 2.0,
-            bounds.origin.y + px(radius) + (bounds.size.height - px(radius * height_factor)) / 2.0,
+            bounds.origin.x + px((w - ew * radius) / 2.0 - extent.min.0 * radius),
+            bounds.origin.y + px((h - eh * radius) / 2.0 - extent.min.1 * radius),
         );
+        let readout = match hub {
+            Hub::Readout(block) => block.offset(sweep, rotation),
+            _ => (0.0, 0.0),
+        };
         Self {
             center,
             radius,
             sweep,
+            rotation,
+            readout,
         }
+    }
+
+    /// Everything a unit dial paints: the arc's outer edge (its ends, and any
+    /// compass point it passes through, where it bulges furthest), how deep
+    /// its ends reach inward, and whatever sits at the hub.
+    fn extent(sweep: f32, rotation: f32, hub: Hub) -> Extent {
+        let sweep = sweep.clamp(0.0, std::f32::consts::TAU);
+        let (lo, hi) = (rotation - sweep / 2.0, rotation + sweep / 2.0);
+        let start = polar(lo, 1.0);
+        let mut extent = Extent {
+            min: start,
+            max: start,
+        };
+        for angle in [lo, hi] {
+            extent.include(polar(angle, 1.0));
+            extent.include(polar(angle, INNER_REACH));
+        }
+        let first = (lo / FRAC_PI_2).ceil() as i32;
+        let last = (hi / FRAC_PI_2).floor() as i32;
+        for quarter in first..=last {
+            extent.include(polar(quarter as f32 * FRAC_PI_2, 1.0));
+        }
+        match hub {
+            Hub::Empty => {}
+            Hub::Pivot => extent.include((0.0, 0.0)),
+            Hub::Readout(block) => {
+                let (ox, oy) = block.offset(sweep, rotation);
+                for (x, y) in block.corners() {
+                    extent.include((ox + x, oy + y));
+                }
+                if !block.pull {
+                    extent.include((0.0, 0.0));
+                }
+            }
+        }
+        extent
     }
 
     /// Angle of a scale fraction, in radians clockwise from straight up.
     ///
-    /// `t = 0` sits at `-sweep/2` and `t = 1` at `+sweep/2`, so the dial is
-    /// always symmetric about vertical however wide its sweep.
+    /// `t = 0.5` points along the rotation, with the ends `sweep/2` either
+    /// side, so an unrotated dial is symmetric about vertical.
     fn angle_at(&self, t: f32) -> f32 {
-        (t - 0.5) * self.sweep
+        self.rotation + (t - 0.5) * self.sweep
     }
 
     /// The point at scale fraction `t`, `radius` out from the hub. Screen
     /// coordinates, so "up" is negative y.
     fn at(&self, t: f32, radius: f32) -> Point<Pixels> {
-        let angle = self.angle_at(t);
-        point(
-            self.center.x + px(radius * angle.sin()),
-            self.center.y - px(radius * angle.cos()),
-        )
-    }
-
-    /// Stroke an arc between two scale fractions as a sampled polyline.
-    fn paint_arc(
-        &self,
-        radius: f32,
-        from: f32,
-        to: f32,
-        width: Pixels,
-        color: Hsla,
-        window: &mut Window,
-    ) {
-        if to <= from {
-            return;
-        }
-        let steps = arc_steps(self.sweep, to - from);
-        let mut path = PathBuilder::stroke(width);
-        for i in 0..=steps {
-            let t = from + (to - from) * (i as f32 / steps as f32);
-            let p = self.at(t, radius);
-            if i == 0 {
-                path.move_to(p);
-            } else {
-                path.line_to(p);
-            }
-        }
-        if let Ok(p) = path.build() {
-            window.paint_path(p, color);
-        }
+        let (x, y) = polar(self.angle_at(t), radius);
+        point(self.center.x + px(x), self.center.y + px(y))
     }
 
     /// Stroke a straight run along the radius at scale fraction `t`.
@@ -363,20 +604,201 @@ fn arc_steps(sweep_rad: f32, fraction: f32) -> usize {
     ((degrees / ARC_STEP_DEG).ceil() as usize).max(2)
 }
 
+/// A run of the scale between two fractions, `lo <= hi`.
+type Span = (f32, f32);
+
+/// The stretches of lit band the division gaps leave, each gap `gap` wide in
+/// scale fractions and centred on its division point.
+///
+/// The scale's ends are flush — the band simply stops there — unless the
+/// dial is `closed` into a full circle, where the ends meet at a division
+/// point and get half a gap each so the seam reads like any other cut.
+fn segments(divisions: usize, gap: f32, closed: bool) -> Vec<Span> {
+    let n = divisions.max(1);
+    let half = if divisions == 0 { 0.0 } else { gap / 2.0 };
+    (0..n)
+        .map(|i| {
+            let lo = i as f32 / n as f32;
+            let hi = (i + 1) as f32 / n as f32;
+            let lo_cut = if i > 0 || closed { half } else { 0.0 };
+            let hi_cut = if i + 1 < n || closed { half } else { 0.0 };
+            (lo + lo_cut, hi - hi_cut)
+        })
+        .collect()
+}
+
+/// Scale fractions of the dashes along the track, each flagged `true` for a
+/// division. The scale's ends get none — the track stopping marks them.
+fn dashes(divisions: usize, minor: usize) -> impl Iterator<Item = (f32, bool)> {
+    let per_division = minor + 1;
+    let total = divisions * per_division;
+    (1..total).map(move |i| (i as f32 / total as f32, i % per_division == 0))
+}
+
+/// A dial's track and lit band resolved for one frame, in pixels: where the
+/// gaps and dashes fall.
+struct Band {
+    /// Radius of the track line, and the centreline of the lit band.
+    track: f32,
+    width: f32,
+    segments: Vec<Span>,
+    dashes: Vec<(f32, bool)>,
+}
+
+impl Band {
+    /// Size the band for `dial`. Gap width is fixed in pixels and converted to scale fractions along the track, so they
+    /// read the same on a short arc as on a long one.
+    fn new(dial: &Dial, divisions: usize, minor: usize, ui_scale: f32) -> Self {
+        let width = (dial.radius * FILL_SHARE).max(FILL_MIN * ui_scale);
+        let track = dial.radius - width / 2.0;
+        let length = track * dial.sweep;
+        let closed = dial.sweep >= std::f32::consts::TAU - 1e-4;
+        let mut gap = 0.0;
+        let mut minor = minor;
+        if divisions > 0 && length > 0.0 {
+            let gap_px = (GAP_MIN * ui_scale).max(GAP_SHARE * width);
+            gap = (gap_px / length).min(GAP_MAX_SHARE / divisions as f32);
+            let spacing = length / (divisions * (minor + 1)) as f32;
+            if spacing < MINOR_MIN_SPACING * ui_scale {
+                minor = 0;
+            }
+        }
+        Self {
+            track,
+            width,
+            segments: segments(divisions, gap, closed),
+            dashes: dashes(divisions, minor).collect(),
+        }
+    }
+
+    fn inner(&self) -> f32 {
+        self.track - self.width / 2.0
+    }
+
+    /// Where a scale dash starts, a clear step inside the band.
+    fn dash_root(&self, dial: &Dial) -> f32 {
+        self.inner() - dial.radius * DASH_INSET
+    }
+
+    /// Where a limit dash starts, close under the band.
+    fn limit_root(&self, dial: &Dial) -> f32 {
+        self.inner() - dial.radius * LIMIT_INSET
+    }
+
+    /// The parts of the band's segments between scale fractions `from` and
+    /// `to` — what painting that span covers, gaps left out.
+    fn pieces(&self, from: f32, to: f32) -> impl Iterator<Item = Span> + '_ {
+        self.segments
+            .iter()
+            .map(move |&(lo, hi)| (lo.max(from), hi.min(to)))
+            .filter(|(a, b)| b > a)
+    }
+
+    /// The whole scale as one unbroken span, from the first segment's start
+    /// to the last one's end — what the dim track covers.
+    fn extent(&self) -> Span {
+        match (self.segments.first(), self.segments.last()) {
+            (Some(&(lo, _)), Some(&(_, hi))) => (lo, hi),
+            _ => (0.0, 1.0),
+        }
+    }
+
+    /// Fill the band between scale fractions `from` and `to`, one closed
+    /// outline per segment.
+    fn paint_span(
+        &self,
+        dial: &Dial,
+        from: f32,
+        to: f32,
+        corner: f32,
+        color: Hsla,
+        window: &mut Window,
+    ) {
+        self.paint_pieces(dial, self.pieces(from, to), corner, color, window);
+    }
+
+    /// Fill the dim track under the whole scale, unbroken, so the lit
+    /// segments' gaps show the track rather than the background.
+    fn paint_track(&self, dial: &Dial, corner: f32, color: Hsla, window: &mut Window) {
+        self.paint_pieces(dial, std::iter::once(self.extent()), corner, color, window);
+    }
+
+    /// Fill each span of the band. The scale's two ends get a value cell's
+    /// corner radius, so the band reads as one rounded bar; the division
+    /// gaps and the cut where the fill ends stay square.
+    fn paint_pieces(
+        &self,
+        dial: &Dial,
+        pieces: impl Iterator<Item = Span>,
+        corner: f32,
+        color: Hsla,
+        window: &mut Window,
+    ) {
+        let (outer, inner) = (self.track + self.width / 2.0, self.inner());
+        let (first, last) = self.extent();
+        for (a, b) in pieces {
+            // Clamped so a thin band or a sliver of a segment rounds into a
+            // pill rather than overlapping its own corners.
+            let r = corner
+                .min(self.width / 2.0)
+                .min((b - a) * inner * dial.sweep / 2.0)
+                .max(0.0);
+            let scale_end = |t: f32| t == first || t == last;
+            let round_a = if scale_end(a) { r } else { 0.0 };
+            let round_b = if scale_end(b) { r } else { 0.0 };
+            // A corner's run along an edge, as a scale fraction at that edge.
+            let along = |round: f32, radius: f32| round / (radius * dial.sweep);
+            let (oa, ob) = (a + along(round_a, outer), b - along(round_b, outer));
+            let (ia, ib) = (a + along(round_a, inner), b - along(round_b, inner));
+
+            let steps = arc_steps(dial.sweep, b - a);
+            let mut path = PathBuilder::fill();
+            path.move_to(dial.at(oa, outer));
+            for i in 1..=steps {
+                path.line_to(dial.at(oa + (ob - oa) * (i as f32 / steps as f32), outer));
+            }
+            path.curve_to(dial.at(b, outer - round_b), dial.at(b, outer));
+            path.line_to(dial.at(b, inner + round_b));
+            path.curve_to(dial.at(ib, inner), dial.at(b, inner));
+            for i in 1..=steps {
+                path.line_to(dial.at(ib - (ib - ia) * (i as f32 / steps as f32), inner));
+            }
+            path.curve_to(dial.at(a, inner + round_a), dial.at(a, inner));
+            path.line_to(dial.at(a, outer - round_a));
+            path.curve_to(dial.at(oa, outer), dial.at(a, outer));
+            path.close();
+            if let Ok(p) = path.build() {
+                window.paint_path(p, color);
+            }
+        }
+    }
+}
+
 impl Render for Gauge {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.rebind(cx);
         let theme = theme(cx);
         let at = self.at();
         let sweep_rad = (self.sweep_degrees.clamp(1.0, 360.0) as f32).to_radians();
+        let rotation_rad = (self.rotation_degrees as f32).to_radians();
         let (min, max) = (self.min, self.max);
-        let color = self.color;
+        // The value arc takes the alarm's color while one is raised, so the
+        // dial says "out of family" even where the wash is easy to miss.
+        let color = binding::active_severity(at, cx)
+            .map(|s| theme.alarm_color(crate::alarms::severity_index(s)))
+            .unwrap_or(self.color);
         let style = self.style;
-        let track_color = theme.border_primary;
+        // The track keeps the dial's own color while the fill turns with an
+        // alarm: the scale stays put, and only the lit span — the part that
+        // means "the value" — changes, so raising an alarm doesn't repaint
+        // the whole ring.
+        let track_color = Theme::dim(self.color, TRACK_ALPHA * self.color.a);
+        let dash_color = Theme::dim(theme.text_secondary, DASH_ALPHA);
         let hub_color = theme.text_primary;
+        let text_color = theme.text_primary;
         let tint = binding::alarm_tint(at, cx);
-        let span = self.value.map(|v| fill_span(v, min, max));
-        let needle = self.value.and_then(|v| scale_position(v, min, max));
+        let span = self.live.value.map(|v| fill_span(v, min, max));
+        let needle = self.live.value.and_then(|v| scale_position(v, min, max));
         let marks: Vec<(f32, Hsla)> = if self.show_limits {
             binding::limit_marks(at, cx)
                 .into_iter()
@@ -385,99 +807,79 @@ impl Render for Gauge {
         } else {
             Vec::new()
         };
+        let (divisions, minor) = (self.divisions, self.minor_ticks);
+        let readout = self.readout();
+        let hub = if !readout.is_empty() {
+            Hub::Readout(readout.block(style == GaugeStyle::Arc))
+        } else if style == GaugeStyle::Needle {
+            Hub::Pivot
+        } else {
+            Hub::Empty
+        };
 
         let dial = canvas(
             move |bounds, _window, _cx| bounds,
-            move |_, bounds, window, _cx| {
+            move |_, bounds, window, cx| {
                 if let Some(tint) = tint {
                     window.paint_quad(gpui::fill(bounds, tint));
                 }
-                let dial = Dial::fit(bounds, sweep_rad);
+                let dial = Dial::fit(bounds, sweep_rad, rotation_rad, hub);
                 if dial.radius <= 0.0 {
                     return;
                 }
-                let arc_r = dial.radius - ARC_WIDTH / 2.0;
-                dial.paint_arc(arc_r, 0.0, 1.0, px(ARC_WIDTH), track_color, window);
+                let k = ui_scale(window);
+                let band = Band::new(&dial, divisions, minor, k);
+                // Value cells round by a fixed pixel radius, not a scaled one.
+                let corner = super::value_strip::BOX_RADIUS;
+                let lit = match style {
+                    GaugeStyle::Arc => span.filter(|(a, b)| b > a),
+                    GaugeStyle::Needle => None,
+                };
+                // The fill is opaque, so it covers the track where they meet.
+                band.paint_track(&dial, corner, track_color, window);
+                let root = band.dash_root(&dial);
+                for &(t, division) in &band.dashes {
+                    let reach = if division { DIVISION_DASH } else { MINOR_DASH };
+                    let tip = root - dial.radius * reach;
+                    dial.paint_spoke(t, root, tip, px(k), dash_color, window);
+                }
 
                 match style {
                     GaugeStyle::Arc => {
-                        if let Some((start, end)) = span {
-                            dial.paint_arc(arc_r, start, end, px(ARC_WIDTH), color, window);
+                        if let Some((start, end)) = lit {
+                            band.paint_span(&dial, start, end, corner, color, window);
                         }
                     }
                     GaugeStyle::Needle => {
                         if let Some(t) = needle {
-                            dial.paint_spoke(t, 0.0, arc_r - ARC_WIDTH, px(2.0), color, window);
+                            let tip = band.inner();
+                            dial.paint_spoke(t, 0.0, tip, px(2.0 * k), color, window);
                         }
                     }
                 }
 
+                let limit_root = band.limit_root(&dial);
                 for (t, mark_color) in &marks {
-                    dial.paint_spoke(
-                        *t,
-                        arc_r + ARC_WIDTH / 2.0,
-                        arc_r - dial.radius * TICK_REACH,
-                        px(2.0),
-                        *mark_color,
-                        window,
-                    );
+                    let tip = limit_root - dial.radius * LIMIT_DASH;
+                    dial.paint_spoke(*t, limit_root, tip, px(1.5 * k), *mark_color, window);
                 }
 
                 if style == GaugeStyle::Needle {
+                    let r = px(3.0 * k);
                     let hub = Bounds::new(
-                        point(dial.center.x - px(3.0), dial.center.y - px(3.0)),
-                        gpui::size(px(6.0), px(6.0)),
+                        point(dial.center.x - r, dial.center.y - r),
+                        gpui::size(r * 2.0, r * 2.0),
                     );
                     let mut quad = gpui::fill(hub, hub_color);
-                    quad.corner_radii = gpui::Corners::all(px(3.0));
+                    quad.corner_radii = gpui::Corners::all(r);
                     window.paint_quad(quad);
                 }
+
+                readout.paint(&dial, text_color, text_color, window, cx);
             },
         );
 
-        let mut tile = div()
-            .size_full()
-            .relative()
-            .p(px(4.0))
-            .child(dial.size_full());
-
-        // Readouts overlay the dial's open bottom rather than taking layout
-        // space, so the arc keeps the whole tile.
-        let mut readout = div()
-            .absolute()
-            .left_0()
-            .right_0()
-            .bottom(px(4.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(1.0));
-
-        if self.show_value {
-            let text = match self.value {
-                Some(v) if self.unit.is_empty() => format_number(v),
-                Some(v) => format!("{} {}", format_number(v), self.unit),
-                None => "—".to_string(),
-            };
-            readout = readout.child(
-                div()
-                    .text_size(px(13.0))
-                    .text_color(theme.text_primary)
-                    .child(SharedString::from(text)),
-            );
-        }
-        if !self.label.is_empty() {
-            readout = readout.child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(theme.text_secondary)
-                    .truncate()
-                    .child(self.label.clone()),
-            );
-        }
-
-        tile = tile.child(readout);
-        tile
+        div().size_full().p(ui_px(4.0)).child(dial.size_full())
     }
 }
 
@@ -488,17 +890,23 @@ mod tests {
     const SWEEP_240: f32 = 240.0 * std::f32::consts::PI / 180.0;
 
     /// A dial at the origin, so `at()` returns plain offsets from the hub.
-    fn hub_dial(sweep: f32) -> Dial {
+    fn hub_dial(sweep: f32, rotation: f32) -> Dial {
         Dial {
             center: point(px(0.0), px(0.0)),
             radius: 10.0,
             sweep,
+            rotation,
+            readout: (0.0, 0.0),
         }
+    }
+
+    fn close(a: Pixels, b: f32) -> bool {
+        (f32::from(a) - b).abs() < 1e-3
     }
 
     #[test]
     fn scale_ends_are_symmetric_about_vertical() {
-        let d = hub_dial(SWEEP_240);
+        let d = hub_dial(SWEEP_240, 0.0);
         let (lo, hi) = (d.angle_at(0.0), d.angle_at(1.0));
         assert!((lo + hi).abs() < 1e-5, "{lo} and {hi} should mirror");
         assert!(d.angle_at(0.5).abs() < 1e-6);
@@ -510,15 +918,16 @@ mod tests {
             center: point(px(50.0), px(50.0)),
             radius: 10.0,
             sweep: SWEEP_240,
+            rotation: 0.0,
+            readout: (0.0, 0.0),
         };
         let p = d.at(0.5, 10.0);
-        assert!((f32::from(p.x) - 50.0).abs() < 1e-4);
-        assert!((f32::from(p.y) - 40.0).abs() < 1e-4);
+        assert!(close(p.x, 50.0) && close(p.y, 40.0));
     }
 
     #[test]
     fn scale_ends_fall_below_the_hub_for_a_wide_sweep() {
-        let d = hub_dial(SWEEP_240);
+        let d = hub_dial(SWEEP_240, 0.0);
         let (lo, hi) = (d.at(0.0, 10.0), d.at(1.0, 10.0));
         // 240° opens downward: both ends sit below centre, mirrored in x.
         assert!(f32::from(lo.y) > 0.0 && f32::from(hi.y) > 0.0);
@@ -528,36 +937,282 @@ mod tests {
 
     #[test]
     fn a_half_sweep_is_a_semicircle_above_the_hub() {
-        let d = hub_dial(std::f32::consts::PI);
+        let d = hub_dial(std::f32::consts::PI, 0.0);
         let (lo, hi) = (d.at(0.0, 10.0), d.at(1.0, 10.0));
-        assert!(f32::from(lo.y).abs() < 1e-4 && f32::from(hi.y).abs() < 1e-4);
-        assert!((f32::from(lo.x) + 10.0).abs() < 1e-4);
-        assert!((f32::from(hi.x) - 10.0).abs() < 1e-4);
+        assert!(close(lo.y, 0.0) && close(hi.y, 0.0));
+        assert!(close(lo.x, -10.0) && close(hi.x, 10.0));
+    }
+
+    #[test]
+    fn rotation_turns_midscale_clockwise() {
+        // Facing lower-left: the middle of the scale points down and left.
+        let d = hub_dial(FRAC_PI_2, (-135.0_f32).to_radians());
+        let mid = d.at(0.5, 10.0);
+        let r = 10.0 / 2.0_f32.sqrt();
+        assert!(close(mid.x, -r) && close(mid.y, r), "{mid:?}");
+        // A 90° arc around lower-left runs from straight down to straight left.
+        let (lo, hi) = (d.at(0.0, 10.0), d.at(1.0, 10.0));
+        assert!(close(lo.x, 0.0) && close(lo.y, 10.0), "{lo:?}");
+        assert!(close(hi.x, -10.0) && close(hi.y, 0.0), "{hi:?}");
+    }
+
+    #[test]
+    fn old_dials_keep_their_extent() {
+        // The default 240° dial spans the full width and reaches half a
+        // radius below the hub; the readout box fits inside that.
+        let e = Dial::extent(SWEEP_240, 0.0, Hub::Readout(ReadoutBox::FULL));
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        assert!(near(e.min.0, -1.0) && near(e.max.0, 1.0), "{e:?}");
+        assert!(near(e.min.1, -1.0) && near(e.max.1, 0.5), "{e:?}");
+    }
+
+    #[test]
+    fn a_short_arc_still_makes_room_for_the_readout() {
+        let block = ReadoutBox::FULL;
+        let e = Dial::extent(FRAC_PI_2, 0.0, Hub::Readout(block));
+        let (_, oy) = block.offset(FRAC_PI_2, 0.0);
+        assert!(e.max.1 >= oy + READOUT_HALF.1 - 1e-5, "{e:?}");
+        assert!(e.min.0 <= -READOUT_HALF.0 && e.max.0 >= READOUT_HALF.0);
+        let bare = Dial::extent(FRAC_PI_2, 0.0, Hub::Empty);
+        assert!(bare.max.1 < 0.0, "an empty hub needs no room: {bare:?}");
     }
 
     #[test]
     fn a_fitted_dial_stays_inside_its_tile() {
-        let bounds = Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(120.0), px(120.0)));
-        for sweep_deg in [90.0_f32, 180.0, 240.0, 300.0, 360.0] {
-            let d = Dial::fit(bounds, sweep_deg.to_radians());
-            assert!(d.radius > 0.0, "sweep {sweep_deg}");
-            for i in 0..=100 {
-                let p = d.at(i as f32 / 100.0, d.radius);
-                assert!(
-                    f32::from(p.x) >= -0.01 && f32::from(p.x) <= 120.01,
-                    "sweep {sweep_deg} x {p:?}"
-                );
-                assert!(
-                    f32::from(p.y) >= -0.01 && f32::from(p.y) <= 120.01,
-                    "sweep {sweep_deg} y {p:?}"
-                );
+        let (w, h) = (160.0, 120.0);
+        let bounds = Bounds::new(point(px(10.0), px(20.0)), gpui::size(px(w), px(h)));
+        let inside = |p: Point<Pixels>| {
+            let (x, y) = (f32::from(p.x), f32::from(p.y));
+            (9.99..=10.01 + w).contains(&x) && (19.99..=20.01 + h).contains(&y)
+        };
+        for sweep_deg in [30.0_f32, 90.0, 140.0, 180.0, 240.0, 300.0, 360.0] {
+            for rot_deg in [0.0_f32, 45.0, -90.0, -135.0, 180.0, 270.0] {
+                for hub in [Hub::Empty, Hub::Pivot, Hub::Readout(ReadoutBox::FULL)] {
+                    let d = Dial::fit(bounds, sweep_deg.to_radians(), rot_deg.to_radians(), hub);
+                    let case = format!("sweep {sweep_deg} rot {rot_deg} {hub:?}");
+                    assert!(d.radius > 0.0, "{case}");
+                    for i in 0..=100 {
+                        let t = i as f32 / 100.0;
+                        let outer = d.at(t, d.radius);
+                        assert!(inside(outer), "{case} outer {outer:?}");
+                    }
+                    for t in [0.0, 1.0] {
+                        let p = d.at(t, d.radius * INNER_REACH);
+                        assert!(inside(p), "{case} inner {p:?}");
+                    }
+                    if let Hub::Readout(block) = hub {
+                        let (ox, oy) = d.readout;
+                        for (x, y) in block.corners() {
+                            let corner = point(
+                                d.center.x + px((ox + x) * d.radius),
+                                d.center.y + px((oy + y) * d.radius),
+                            );
+                            assert!(inside(corner), "{case} readout {corner:?}");
+                        }
+                    }
+                }
             }
         }
+    }
+
+    #[test]
+    fn a_fitted_dial_fills_one_axis() {
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(200.0), px(100.0)));
+        let d = Dial::fit(
+            bounds,
+            FRAC_PI_2,
+            (-135.0_f32).to_radians(),
+            Hub::Readout(ReadoutBox::FULL),
+        );
+        let e = Dial::extent(
+            FRAC_PI_2,
+            (-135.0_f32).to_radians(),
+            Hub::Readout(ReadoutBox::FULL),
+        );
+        let (ew, eh) = e.size();
+        let used = (ew * d.radius, eh * d.radius);
+        assert!((used.0 - 200.0).abs() < 1e-3 || (used.1 - 100.0).abs() < 1e-3);
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
+    }
+
+    #[test]
+    fn a_short_arc_draws_the_readout_up_to_its_chord() {
+        let block = ReadoutBox::FULL;
+        // A wrapping arc keeps the readout on the hub.
+        assert_eq!(block.offset(SWEEP_240, 0.0), (0.0, 0.0));
+        // A quarter arc overhead pulls it up, stopping short of the chord.
+        let (ox, oy) = block.offset(FRAC_PI_2, 0.0);
+        assert!(near(ox, 0.0) && oy < 0.0, "{ox} {oy}");
+        let chord = INNER_REACH * std::f32::consts::FRAC_PI_4.cos();
+        assert!(near(-(oy + block.top), chord - READOUT_CLEARANCE));
+        // Turned to face right, it slides right instead — a tighter arc,
+        // since the block is wider than it is tall.
+        let (rx, ry) = block.offset(60.0_f32.to_radians(), FRAC_PI_2);
+        assert!(rx > 0.0 && near(ry, 0.0), "{rx} {ry}");
+        // A needle's readout stays on its pivot.
+        let pinned = ReadoutBox {
+            pull: false,
+            ..block
+        };
+        assert_eq!(pinned.offset(FRAC_PI_2, 0.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_readout_reserves_only_the_lines_it_has() {
+        let value_only = Readout {
+            label: None,
+            value: Some("1.0".into()),
+            unit: None,
+        };
+        let block = value_only.block(true);
+        assert!(near(block.top, -VALUE_LINE.1 / 2.0) && near(block.bottom, VALUE_LINE.1 / 2.0));
+        let full = Readout {
+            label: Some("PPO2".into()),
+            value: Some("2.69".into()),
+            unit: Some("psia".into()),
+        };
+        let block = full.block(true);
+        assert!(block.top >= -READOUT_HALF.1 && block.bottom <= READOUT_HALF.1);
+        assert!(block.bottom - block.top > VALUE_LINE.1);
+    }
+
+    #[test]
+    fn gaps_cut_the_band_at_each_division() {
+        let s = segments(4, 0.02, false);
+        assert_eq!(s.len(), 4);
+        assert!(near(s[0].0, 0.0) && near(s[3].1, 1.0), "ends flush: {s:?}");
+        for (i, pair) in s.windows(2).enumerate() {
+            let (left, right) = (pair[0].1, pair[1].0);
+            let division = (i + 1) as f32 / 4.0;
+            assert!(near(right - left, 0.02), "gap width {pair:?}");
+            assert!(near((left + right) / 2.0, division), "gap centred {pair:?}");
+        }
+    }
+
+    #[test]
+    fn a_full_circle_cuts_its_seam_too() {
+        let s = segments(3, 0.02, true);
+        assert!(near(s[0].0, 0.01) && near(s[2].1, 0.99), "{s:?}");
+    }
+
+    #[test]
+    fn zero_divisions_leaves_the_band_whole() {
+        assert_eq!(segments(0, 0.02, false), vec![(0.0, 1.0)]);
+        assert_eq!(segments(0, 0.02, true), vec![(0.0, 1.0)]);
+        assert_eq!(dashes(0, 3).count(), 0);
+    }
+
+    #[test]
+    fn dashes_mark_interior_divisions_and_subdivisions() {
+        let d: Vec<_> = dashes(4, 1).collect();
+        assert_eq!(d.len(), 7, "no dash at either end: {d:?}");
+        assert_eq!(d[0], (0.125, false));
+        assert_eq!(d[1], (0.25, true));
+        assert_eq!(d.iter().filter(|(_, division)| *division).count(), 3);
+        assert!(dashes(6, 0).all(|(_, division)| division));
+    }
+
+    fn dial_of(radius: f32, sweep: f32) -> Dial {
+        Dial {
+            radius,
+            ..hub_dial(sweep, 0.0)
+        }
+    }
+
+    const SWEEP_270: f32 = 270.0 * std::f32::consts::PI / 180.0;
+
+    #[test]
+    fn the_band_is_a_thick_stroke_centred_on_the_track() {
+        let d = dial_of(200.0, SWEEP_270);
+        let band = Band::new(&d, 6, 0, 1.0);
+        assert!(near(band.width, 200.0 * FILL_SHARE));
+        assert!(
+            near(band.track + band.width / 2.0, d.radius),
+            "outer edge on the rim"
+        );
+        let tiny = Band::new(&dial_of(10.0, SWEEP_270), 6, 0, 1.0);
+        assert!(near(tiny.width, FILL_MIN));
+    }
+
+    #[test]
+    fn gaps_hold_their_pixel_width_and_never_swamp_a_division() {
+        let d = dial_of(40.0, FRAC_PI_2);
+        let band = Band::new(&d, 5, 0, 1.0);
+        let length = band.track * d.sweep;
+        let gap = (band.segments[1].0 - band.segments[0].1) * length;
+        assert!((gap - GAP_MIN).abs() < 1e-3, "{gap}");
+
+        let dense = Band::new(&dial_of(30.0, FRAC_PI_2), 20, 9, 1.0);
+        for &(lo, hi) in &dense.segments {
+            assert!(hi - lo >= (1.0 - GAP_MAX_SHARE) / 20.0 - 1e-5, "{lo}..{hi}");
+        }
+        assert!(
+            dense.dashes.iter().all(|(_, division)| *division),
+            "crowded subdivisions are dropped"
+        );
+    }
+
+    #[test]
+    fn the_fill_lights_segments_and_respects_gaps() {
+        let band = Band::new(&dial_of(100.0, SWEEP_240), 4, 0, 1.0);
+        let lit: Vec<Span> = band.pieces(0.0, 0.6).collect();
+        assert_eq!(lit.len(), 3, "{lit:?}");
+        assert_eq!(lit[0], band.segments[0]);
+        assert_eq!(lit[1], band.segments[1]);
+        assert!(near(lit[2].0, band.segments[2].0) && near(lit[2].1, 0.6));
+        let gap_mid = (band.segments[0].1 + band.segments[1].0) / 2.0;
+        assert_eq!(band.pieces(0.0, gap_mid).count(), 1);
+        let mid: Vec<Span> = band.pieces(0.5, 0.6).collect();
+        assert!(mid.len() == 1 && near(mid[0].1, 0.6));
+    }
+
+    #[test]
+    fn the_dim_track_runs_unbroken_under_the_whole_scale() {
+        let band = Band::new(&dial_of(100.0, SWEEP_270), 6, 0, 1.0);
+        assert_eq!(band.extent(), (0.0, 1.0));
+        // A full circle's seam gap trims both ends, and the track with them.
+        let closed = Band::new(&dial_of(100.0, std::f32::consts::TAU), 6, 0, 1.0);
+        let (lo, hi) = closed.extent();
+        assert!(lo > 0.0 && hi < 1.0 && near(lo, 1.0 - hi));
+    }
+
+    #[test]
+    fn dashes_float_inside_the_band_and_clear_the_readout() {
+        let d = dial_of(100.0, SWEEP_270);
+        let band = Band::new(&d, 6, 0, 1.0);
+        let root = band.dash_root(&d);
+        assert!(
+            band.inner() - root >= band.width / 2.0,
+            "a visible step between band and dashes"
+        );
+        assert!(band.limit_root(&d) > root, "limits sit closer to the band");
+        let deepest = (band.limit_root(&d) - d.radius * LIMIT_DASH) / d.radius;
+        assert!(deepest >= INNER_REACH - 1e-5);
+        assert!((root - d.radius * DIVISION_DASH) / d.radius >= INNER_REACH - 1e-5);
+        let (hw, hh) = READOUT_HALF;
+        assert!(
+            deepest > (hw * hw + hh * hh).sqrt(),
+            "readout corners stay clear"
+        );
     }
 
     #[test]
     fn arc_sampling_scales_with_the_span() {
         assert!(arc_steps(SWEEP_240, 1.0) > arc_steps(SWEEP_240, 0.1));
         assert_eq!(arc_steps(SWEEP_240, 0.0), 2);
+    }
+
+    #[test]
+    fn old_configs_parse_with_defaults() {
+        let cfg: GaugeConfig =
+            serde_json::from_str(r#"{"component":"a.b","sweep_degrees":200.0}"#).unwrap();
+        assert_eq!(cfg.sweep_degrees, 200.0);
+        assert_eq!(cfg.rotation_degrees, 0.0);
+        assert_eq!(cfg.divisions, DEFAULT_DIVISIONS);
+        assert_eq!(GaugeConfig::default().sweep_degrees, 270.0);
+        assert_eq!(cfg.minor_ticks, DEFAULT_MINOR_TICKS);
     }
 }

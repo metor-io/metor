@@ -68,10 +68,7 @@ impl Colormap {
     /// spectrogram's colorbar, so the legend cannot drift from the image.
     pub(crate) fn sample(self, theme: &Theme, trace_color: Hsla, t: f32) -> Hsla {
         match self {
-            Colormap::TraceColor => Hsla {
-                a: t,
-                ..trace_color
-            },
+            Colormap::TraceColor => Theme::dim(trace_color, t),
             Colormap::Heat => theme.density_color(t),
             Colormap::Mono => Hsla {
                 s: 0.0,

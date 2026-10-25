@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use metor_db::ComponentSchema;
 use metor_db::disruptor::{Disruptor, ReadGrant, Reader};
-use metor_proto::types::{ComponentId, PrimType, Timestamp};
-use smallvec::SmallVec;
+use metor_proto::types::{ComponentId, Timestamp};
 use stellarator::JoinHandleDropGuard;
 
 /// Stable identity of a dynamic node. Hashed from `(op_tag, args, parent_ids)`
@@ -47,17 +46,15 @@ impl ValueType {
 
 /// Validate that `node` is value-typed (any prim type, any shape) and return
 /// a clone of its schema.
-pub fn require_value(
-    node: &std::sync::Arc<dyn DynamicNode>,
-) -> Result<ComponentSchema, BuildError> {
+pub fn require_value(node: &Node) -> Result<ComponentSchema, BuildError> {
     match node.value_type() {
         ValueType::Clock => Err(BuildError::ExpectedValue),
         ValueType::Value(s) => Ok(s.clone()),
     }
 }
 
-/// Errors surfaced when *building* a node — schema mismatches, clock
-/// mismatches, or wrong value type for an op.
+/// Errors surfaced when *building* a node — schema mismatches, missing
+/// components, or a program that does not fit its inputs.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
     #[error("expected a value input, got Clock")]
@@ -67,27 +64,12 @@ pub enum BuildError {
         a: ComponentSchema,
         b: ComponentSchema,
     },
-    #[error("composer inputs must share a clock (parent_clock_id mismatch)")]
-    ClockMismatch,
-    #[error("shapes are not broadcast-compatible: {a:?} vs {b:?}")]
-    BroadcastMismatch {
-        a: SmallVec<[usize; 4]>,
-        b: SmallVec<[usize; 4]>,
-    },
-    #[error("{op} does not support dtype {dtype:?}")]
-    UnsupportedDtype { op: &'static str, dtype: PrimType },
-    #[error("composer needs at least one input")]
-    EmptyInputs,
-    #[error("graph contains a cycle")]
-    Cycle,
     #[error("{op} expected {expected} input(s), got {got}")]
     WrongArity {
         op: &'static str,
         expected: usize,
         got: usize,
     },
-    #[error("a parent node failed to build")]
-    ParentFailed,
     #[error("invalid arg for {op}: {reason}")]
     InvalidArg {
         op: &'static str,
@@ -101,34 +83,9 @@ pub enum BuildError {
     Expr(String),
 }
 
-/// A live producer task whose output is a fan-out [`Disruptor`].
-///
-/// Drop the last `Arc<dyn DynamicNode>` to cancel the task: the node holds a
-/// `JoinHandleDropGuard` which calls `cancel` on drop.
-pub trait DynamicNode: Send + Sync + 'static {
-    fn id(&self) -> NodeId;
-    fn value_type(&self) -> &ValueType;
-    /// The clock id this node ticks against, if any. Composers require their
-    /// inputs to share a clock id; resamplers reset it to the target clock.
-    fn parent_clock_id(&self) -> Option<NodeId>;
-    /// Output ring. Subscribers read framed `[Timestamp][value bytes]`
-    /// messages; clock nodes emit zero value bytes.
-    fn output(&self) -> &Disruptor;
-}
-
-/// Helpers attached to anything that implements [`DynamicNode`] — kept in a
-/// separate ext trait so the trait stays object-safe.
-pub trait DynamicNodeExt: DynamicNode {
-    fn subscribe(&self) -> NodeReader {
-        NodeReader::new(self.output(), self.value_type().value_bytes())
-    }
-}
-impl<T: DynamicNode + ?Sized> DynamicNodeExt for T {}
-
-/// Internal reader handed to derivation/composer/resampler tasks. Yields
-/// every sample in order — the opposite of [`crate::WalComponentStream`],
-/// which collapses to the latest. View bridging goes through
-/// [`crate::WalComponentStream::from_disruptor`] instead.
+/// Internal reader handed to downstream program tasks. Yields every sample
+/// in order — the opposite of [`crate::WalComponentStream`], which collapses
+/// to the latest.
 pub struct NodeReader {
     reader: Reader,
     msg_size: usize,
@@ -140,13 +97,6 @@ impl NodeReader {
             reader: disruptor.reader(),
             msg_size: size_of::<Timestamp>() + value_bytes,
         }
-    }
-
-    /// Construct a reader directly over an arbitrary `[Timestamp][value]`
-    /// framed `Disruptor`. Used by `from_db` to read off a Component's
-    /// WAL without spawning a wrapper node.
-    pub fn from_disruptor(disruptor: &Disruptor, value_bytes: usize) -> Self {
-        Self::new(disruptor, value_bytes)
     }
 
     pub async fn next(&mut self) -> NodeGrant<'_> {
@@ -175,14 +125,7 @@ pub struct NodeGrant<'a> {
 
 impl NodeGrant<'_> {
     pub fn samples(&self) -> impl Iterator<Item = (Timestamp, &[u8])> + '_ {
-        let msg_size = self.msg_size;
-        self.grant.chunks_exact(msg_size).map(move |chunk| {
-            let ts_bytes: [u8; 8] = chunk[..size_of::<Timestamp>()]
-                .try_into()
-                .expect("timestamp slice");
-            let value = &chunk[size_of::<Timestamp>()..];
-            (Timestamp::from_le_bytes(ts_bytes), value)
-        })
+        (0..self.sample_count()).map(|i| self.sample_at(i))
     }
 
     /// Number of complete `[Timestamp][value]` messages in this grant.
@@ -213,17 +156,18 @@ pub fn write_sample(disruptor: &Disruptor, ts: Timestamp, value_bytes: &[u8]) {
     grant[size_of::<Timestamp>()..].copy_from_slice(value_bytes);
 }
 
-/// Concrete implementation behind every constructor. Owns the output ring
-/// and a drop-guarded task handle so dropping the node cancels the task.
-pub struct NodeImpl {
+/// A live producer task whose output is a fan-out [`Disruptor`].
+///
+/// Drop the last `Arc<Node>` to cancel the task: the node holds a
+/// `JoinHandleDropGuard` which calls `cancel` on drop.
+pub struct Node {
     id: NodeId,
     value_type: ValueType,
-    parent_clock_id: Option<NodeId>,
     output: Disruptor,
     _task: JoinHandleDropGuard<()>,
 }
 
-impl NodeImpl {
+impl Node {
     /// Spawn a producer task and wrap it in a node.
     ///
     /// `build_task` receives the output ring and any captured parent `Arc`s
@@ -232,7 +176,6 @@ impl NodeImpl {
     pub fn spawn<F, Fut>(
         id: NodeId,
         value_type: ValueType,
-        parent_clock_id: Option<NodeId>,
         capacity: usize,
         build_task: F,
     ) -> Arc<Self>
@@ -240,13 +183,7 @@ impl NodeImpl {
         F: FnOnce(Disruptor) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        Self::spawn_with_output(
-            id,
-            value_type,
-            parent_clock_id,
-            Disruptor::new(capacity),
-            build_task,
-        )
+        Self::spawn_with_output(id, value_type, Disruptor::new(capacity), build_task)
     }
 
     /// Variant of [`spawn`](Self::spawn) that adopts an existing [`Disruptor`]
@@ -255,7 +192,6 @@ impl NodeImpl {
     pub fn spawn_with_output<F, Fut>(
         id: NodeId,
         value_type: ValueType,
-        parent_clock_id: Option<NodeId>,
         output: Disruptor,
         build_task: F,
     ) -> Arc<Self>
@@ -267,25 +203,27 @@ impl NodeImpl {
         Arc::new(Self {
             id,
             value_type,
-            parent_clock_id,
             output,
             _task: task.drop_guard(),
         })
     }
-}
 
-impl DynamicNode for NodeImpl {
-    fn id(&self) -> NodeId {
+    pub fn id(&self) -> NodeId {
         self.id
     }
-    fn value_type(&self) -> &ValueType {
+
+    pub fn value_type(&self) -> &ValueType {
         &self.value_type
     }
-    fn parent_clock_id(&self) -> Option<NodeId> {
-        self.parent_clock_id
-    }
-    fn output(&self) -> &Disruptor {
+
+    /// Output ring. Subscribers read framed `[Timestamp][value bytes]`
+    /// messages; clock nodes emit zero value bytes.
+    pub fn output(&self) -> &Disruptor {
         &self.output
+    }
+
+    pub fn subscribe(&self) -> NodeReader {
+        NodeReader::new(&self.output, self.value_type.value_bytes())
     }
 }
 

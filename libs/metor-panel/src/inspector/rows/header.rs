@@ -1,6 +1,6 @@
 use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
 
-use super::{InspectorRow, RowAction};
+use super::{InspectorRow, ROW_HEIGHT, RowAction};
 use crate::theme::theme;
 
 /// Non-interactive section label separating groups of rows.
@@ -22,10 +22,6 @@ impl HeaderRow {
 }
 
 impl InspectorRow for HeaderRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         &self.text
     }
@@ -38,14 +34,14 @@ impl InspectorRow for HeaderRow {
         cx: &mut App,
     ) -> AnyElement {
         let theme = theme(cx);
-        // Matches `row_base`'s 28px height so items stay uniform in the
-        // inspector's `uniform_list`, minus the interactive chrome.
+        // `row_base`'s height keeps items uniform in the inspector's
+        // `uniform_list`, minus the interactive chrome.
         div()
             .flex()
             .flex_row()
             .items_center()
             .w_full()
-            .h(px(28.0))
+            .h(px(ROW_HEIGHT))
             .px(px(12.0))
             .child(
                 div()

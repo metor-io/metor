@@ -339,6 +339,7 @@ mod tests {
                 tab_orientation: Default::default(),
                 hide_tab_bar: false,
                 locked_size: None,
+                tab_rail_width: None,
                 items: Vec::new(),
             }),
         }

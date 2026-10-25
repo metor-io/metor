@@ -27,9 +27,11 @@ pub type OnExpression = Arc<dyn Fn(ComponentId, String, &mut Window, &mut App) -
 pub type ComponentRowBuilder =
     Arc<dyn Fn(ComponentId, &CompletionItem, &App) -> Option<Box<dyn InspectorRow>>>;
 
-/// A pinned row a page keeps visible under the candidates — the wizard's
-/// Continue row, which would otherwise vanish while a query is typed.
-pub type TailRowBuilder = Arc<dyn Fn() -> Box<dyn InspectorRow>>;
+/// A pinned row a page keeps visible beside the candidates — the wizard's
+/// Continue row, which would otherwise vanish while a query is typed. The
+/// builder's flag puts it first: once there is something to commit, Enter
+/// should still take it rather than the top candidate.
+pub type TailRowBuilder = Arc<dyn Fn() -> (Box<dyn InspectorRow>, bool)>;
 
 /// The picker's completion provider, riding along as its first row.
 ///
@@ -82,10 +84,6 @@ impl ExpressionRow {
 }
 
 impl InspectorRow for ExpressionRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         "Expression"
     }
@@ -223,7 +221,10 @@ impl InspectorRow for ExpressionRow {
             rows.push(Box::new(row));
         }
         if let Some(tail) = &self.tail {
-            rows.push(tail());
+            match tail() {
+                (row, true) => rows.insert(0, row),
+                (row, false) => rows.push(row),
+            }
         }
         Some(rows)
     }
@@ -244,10 +245,6 @@ struct CandidateRow {
 }
 
 impl InspectorRow for CandidateRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         &self.item.label
     }
@@ -304,10 +301,6 @@ struct Completing {
 }
 
 impl InspectorRow for Completing {
-    fn supports_exit_fade(&self) -> bool {
-        self.row.supports_exit_fade()
-    }
-
     fn label(&self) -> &str {
         self.row.label()
     }
@@ -391,10 +384,6 @@ impl ComputeRow {
 }
 
 impl InspectorRow for ComputeRow {
-    fn supports_exit_fade(&self) -> bool {
-        true
-    }
-
     fn label(&self) -> &str {
         "compute"
     }

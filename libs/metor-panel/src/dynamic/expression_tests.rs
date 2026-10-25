@@ -199,7 +199,6 @@ async fn an_expression_publishes_a_real_but_hidden_component() {
             db_source::from_db(&db, source_id).unwrap(),
         )],
         program::DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -382,7 +381,6 @@ async fn a_published_expression_seeds_then_tails() {
             seed: program::latest_sample(&db, source_id),
         }],
         program::DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -456,7 +454,6 @@ async fn the_registry_does_not_keep_an_unused_expression_alive() {
                 seed: program::latest_sample(&db, source_id),
             }],
             program::DEFAULT_FUEL,
-            None,
         )
         .unwrap();
         let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -467,7 +464,15 @@ async fn the_registry_does_not_keep_an_unused_expression_alive() {
             ports: vec![source.clone()],
             outputs: vec![(0, ComponentId::new(&name))],
         };
-        expressions::Expression::new(published, system.node, field, plan)
+        expressions::Expression::new(
+            published,
+            system,
+            field,
+            plan,
+            crate::dynamic::worker::DynamicWorker::new()
+                .handle()
+                .clone(),
+        )
     };
     registry.insert(expression.clone());
     assert!(registry.is_live(ComponentId::new(&name)));
@@ -544,7 +549,6 @@ async fn an_expression_fills_a_list_trace_element_by_element() {
             seed: program::latest_sample(&db, source_id),
         }],
         program::DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -640,7 +644,7 @@ async fn wait_for_bounds(
 fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui::TestAppContext) {
     use crate::dynamic::ops::{db_source, program};
     use crate::dynamic::worker::DynamicWorker;
-    use crate::views::{AttitudeConfig, ComponentTextConfig, TrafficLightConfig};
+    use crate::views::AttitudeConfig;
     use gpui::AppContext;
     use std::sync::Arc;
 
@@ -668,6 +672,7 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
     cx.update(|cx| {
         crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
         expressions::Expressions::init(cx);
+        crate::inspector::edits::init(cx);
         DynamicWorker::init(cx);
 
         // `bind` is the one rule, and it lands on the published component.
@@ -692,20 +697,16 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
     let mut views = Vec::new();
     for (label, build) in [
         (
-            "component text",
+            "monitor",
             Box::new({
                 let db = db.clone();
                 move |cx: &mut gpui::App| {
-                    cx.new(|cx| {
-                        crate::tiles::panels::TextPanel::from_config(
-                            ComponentTextConfig {
-                                component: saved.to_string(),
-                            },
-                            db.clone(),
-                            cx,
-                        )
-                    })
-                    .into_any()
+                    let cfg = crate::views::MonitorConfig {
+                        component: saved.into(),
+                        ..Default::default()
+                    };
+                    cx.new(|cx| crate::views::Monitor::from_config(cfg, db.clone(), cx))
+                        .into_any()
                 }
             }) as Box<dyn Fn(&mut gpui::App) -> gpui::AnyEntity>,
         ),
@@ -714,17 +715,12 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
             Box::new({
                 let db = db.clone();
                 move |cx: &mut gpui::App| {
-                    cx.new(|cx| {
-                        crate::tiles::panels::TrafficLightPanel::from_config(
-                            TrafficLightConfig {
-                                component: saved.to_string(),
-                                color: None,
-                            },
-                            db.clone(),
-                            cx,
-                        )
-                    })
-                    .into_any()
+                    let cfg = crate::views::TrafficLightConfig {
+                        component: saved.into(),
+                        color: None,
+                    };
+                    cx.new(|cx| crate::views::TrafficLight::from_config(cfg, db.clone(), cx))
+                        .into_any()
                 }
             }),
         ),
@@ -1166,7 +1162,6 @@ async fn a_self_dot_seeds_then_tails() {
             seed: program::latest_sample(&db, source_id),
         }],
         program::DEFAULT_FUEL,
-        None,
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
@@ -1453,11 +1448,22 @@ fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppConte
             cx.new(|cx| AttitudeIndicator::from_config(&AttitudeConfig::default(), db.clone(), cx))
                 .into_any(),
             cx.new(|_| VectorMarker::empty(db.clone())).into_any(),
-            cx.new(|cx| ComponentText::new(db.clone(), id, cx))
-                .into_any(),
-            cx.new(|cx| Monitor::new(db.clone(), id, cx)).into_any(),
-            cx.new(|cx| TrafficLight::new(db.clone(), id, cx))
-                .into_any(),
+            cx.new(|cx| {
+                let cfg = MonitorConfig {
+                    component: "rpm".into(),
+                    ..Default::default()
+                };
+                Monitor::from_config(cfg, db.clone(), cx)
+            })
+            .into_any(),
+            cx.new(|cx| {
+                let cfg = TrafficLightConfig {
+                    component: "rpm".into(),
+                    color: None,
+                };
+                TrafficLight::from_config(cfg, db.clone(), cx)
+            })
+            .into_any(),
             cx.new(|_| time_series::Trace::new(id, 0, color)).into_any(),
             cx.new(|_| XyTrace::new(id, 0, id, 0, color)).into_any(),
             cx.new(|_| ListTrace::new(id, 1, color)).into_any(),
@@ -1521,7 +1527,7 @@ fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppConte
                 checked += 1;
             }
         }
-        assert_eq!(checked, 18, "includes both XY axes and both model inputs");
+        assert_eq!(checked, 17, "includes both XY axes and both model inputs");
     });
 }
 
@@ -1686,4 +1692,38 @@ fn unavailable_bindings_retry_and_model_expressions_survive_a_cold_database(
             "last input releases computation"
         );
     });
+}
+
+/// A fault after the expression started reaches the binding, which is where
+/// the inspector reads why a view stopped updating.
+#[gpui::test]
+fn a_faulting_expression_reports_through_its_binding(cx: &mut gpui::TestAppContext) {
+    use crate::dynamic::worker::DynamicWorker;
+    use metor_proto::types::Timestamp;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let (db, _temp) = db_with_ids(&[("rpm", ComponentId::new("rpm"), PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let binding = cx.update(|cx| {
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+        crate::data_binding::Binding::from_text("=[1.0, 2.0][int(rpm)]", &db, cx)
+    });
+    assert!(binding.error().is_none(), "it compiles and starts");
+
+    // Indexes past the end, on the worker's thread, once the system is
+    // subscribed.
+    std::thread::sleep(Duration::from_millis(50));
+    db.with_state(|s| s.get_component(ComponentId::new("rpm")).cloned())
+        .unwrap()
+        .push_buf(Timestamp(100), &2.0f64.to_le_bytes())
+        .unwrap();
+    for _ in 0..200 {
+        if binding.error().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the fault never reached the binding");
 }

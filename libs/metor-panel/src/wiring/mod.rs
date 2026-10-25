@@ -11,18 +11,18 @@
 //! keeps rendering while surfacing the problem.
 //!
 //! State folding lives in [`WiringState`] (pure, unit-tested). [`WiringStore`]
-//! is the gpui entity that owns it plus the reader task; [`GlobalWiringStore`]
+//! is the gpui entity that owns it plus the reader task; a gpui global
 //! hands the entity to any view via [`try_global`].
 
 use std::sync::Arc;
 
-use gpui::{App, Context, Entity, Global, SharedString, Task, prelude::*};
+use gpui::{App, Entity, SharedString, Task};
 use metor_db::DB;
 use metor_fsw_2::ir::{IR_VERSION, Wiring};
 use metor_proto::types::{Msg, Timestamp};
 use metor_proto_wkt::WiringManifest;
 
-use crate::msg_ingest::{IngestSource, ingest_all};
+use crate::msg_ingest::{self, IngestSource};
 
 #[cfg(test)]
 mod tests;
@@ -89,35 +89,23 @@ pub struct WiringStore {
     _task: Task<()>,
 }
 
-/// Hands the shared [`WiringStore`] entity to any part of the app.
-pub struct GlobalWiringStore(pub Entity<WiringStore>);
-
-impl Global for GlobalWiringStore {}
-
 /// The shared wiring store, or `None` if it was never initialized (e.g. in tests).
 pub fn try_global(cx: &App) -> Option<Entity<WiringStore>> {
-    cx.try_global::<GlobalWiringStore>().map(|g| g.0.clone())
+    msg_ingest::global(cx)
 }
 
 impl WiringStore {
     pub fn init(db: Arc<DB>, cx: &mut App) {
-        let entity = cx.new(|cx| WiringStore::new(db, cx));
-        cx.set_global(GlobalWiringStore(entity));
-    }
-
-    fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let task = cx.spawn(async move |this, cx| {
+        msg_ingest::install(cx, |cx| {
             let sources = vec![IngestSource::new(
                 WiringManifest::ID,
                 |store: &mut Self, ts, manifest| store.state.apply(ts, manifest),
             )];
-            ingest_all(db, sources, this, cx).await
+            Self {
+                state: WiringState::default(),
+                _task: msg_ingest::spawn_ingest(db, sources, cx),
+            }
         });
-
-        Self {
-            state: WiringState::default(),
-            _task: task,
-        }
     }
 
     pub fn state(&self) -> &WiringState {

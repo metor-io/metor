@@ -1,7 +1,7 @@
 //! A Magit/emacs-transient "which-key" chord menu.
 //!
 //! Pressing the configured leader key opens this overlay: a compact rounded
-//! sheet floating above the bottom edge of the window showing the keys
+//! popup in the lower-right corner of the window showing the keys
 //! available at the current level. Each keystroke either descends into a
 //! submenu or runs a command and dismisses. It deliberately parallels the [`Inspector`](crate::inspector)
 //! palette — both are data-driven trees over the same command vocabulary — but
@@ -27,9 +27,12 @@ struct Level {
     nodes: Vec<ChordNode>,
 }
 
+/// Rows in one column of keys before the level wraps into another column.
+const MAX_COLUMN_ROWS: usize = 6;
+
 /// The chord menu overlay. Owns a navigation stack over a [`ChordNode`] tree and
-/// renders the current level as a compact sheet floating above the bottom edge
-/// of the window, sized to its content.
+/// renders the current level as a small popup in the window's lower-right
+/// corner, sized to its content.
 pub struct Transient {
     /// Display string of the leader key, shown as the leading breadcrumb.
     leader: SharedString,
@@ -165,37 +168,43 @@ impl Render for Transient {
             }
         }
 
-        // Key grid: each available key with its label, wrapping across rows.
-        // Scrolls within the sheet's height cap when a level has many keys.
+        // Keys flow down short columns that then wrap sideways, so a level
+        // stays a small block in the corner whatever its key count.
+        let nodes = self.current_nodes();
+        let columns = nodes.len().div_ceil(MAX_COLUMN_ROWS).max(1);
+        let rows_per_column = nodes.len().div_ceil(columns).max(1);
         let mut grid = div()
             .id("transient-grid")
             .flex()
             .flex_row()
-            .flex_wrap()
-            .gap_x(px(16.0))
-            .gap_y(px(2.0))
+            .gap_x(px(12.0))
             .min_h_0()
             .when(!self.dismissed, |grid| grid.overflow_y_scroll())
-            .text_size(px(12.0));
-        for node in self.current_nodes() {
-            grid = grid.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .min_w(px(14.0))
-                            .text_color(theme.control_active)
-                            .child(node.key.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.text_primary)
-                            .child(node.label.clone()),
-                    ),
-            );
+            .text_size(px(11.0));
+        for column in nodes.chunks(rows_per_column) {
+            let mut col = div().flex().flex_col().gap_y(px(1.0));
+            for node in column {
+                col = col.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(
+                            div()
+                                .min_w(px(10.0))
+                                .text_color(theme.control_active)
+                                .child(node.key.clone()),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_color(theme.text_primary)
+                                .child(node.label.clone()),
+                        ),
+                );
+            }
+            grid = grid.child(col);
         }
 
         let panel = div()
@@ -215,20 +224,20 @@ impl Render for Transient {
             .opacity(opacity)
             .absolute()
             .bottom(px(12.0))
-            .left(px(12.0))
             .right(px(12.0))
-            // Hug the content; the cap only kicks in for key-heavy levels,
+            // Hug the content; the caps only kick in for key-heavy levels,
             // which then scroll inside the grid.
+            .max_w(relative(0.5))
             .max_h(relative(0.4))
             .flex()
             .flex_col()
-            .gap(px(4.0))
+            .gap(px(3.0))
             .bg(theme.bg_elevated)
             .border_1()
             .border_color(theme.border_primary)
             .rounded(px(6.0))
-            .px(px(6.0))
-            .py(px(4.0))
+            .px(px(8.0))
+            .py(px(5.0))
             .shadow_sm()
             .child(crumbs)
             .child(grid);

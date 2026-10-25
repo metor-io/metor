@@ -104,7 +104,7 @@ impl BevyBridge {
     }
 
     /// Drain orphaned atlas entries. Must run from a viewer prepaint;
-    /// that's the only place with `&mut Window` for `drop_image`.
+    /// that's the only place with `&mut Window` for releasing atlas entries.
     pub fn take_orphaned_releases(&mut self) -> Vec<Arc<RenderImage>> {
         std::mem::take(&mut self.pending_releases)
     }

@@ -5,7 +5,9 @@ use metor_db::DB;
 use metor_proto::types::Msg;
 use metor_proto::types::{ComponentId, ElementValue, Timestamp};
 use metor_proto_wkt::{ComponentValue, UpdateComponent};
+use nox::ArrayBuf;
 
+use crate::dynamic::tensor::TypedScalar;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 
 /// A staged edit to a single component, held until the user applies it.
@@ -56,13 +58,13 @@ impl PendingEdits {
         self.edits.iter().find(|e| e.component_id == id)
     }
 
+    fn get_mut(&mut self, id: ComponentId) -> Option<&mut PendingEdit> {
+        self.edits.iter_mut().find(|e| e.component_id == id)
+    }
+
     /// Replace the pending edit for a component, or insert if absent.
     pub fn upsert(&mut self, edit: PendingEdit) {
-        if let Some(existing) = self
-            .edits
-            .iter_mut()
-            .find(|e| e.component_id == edit.component_id)
-        {
+        if let Some(existing) = self.get_mut(edit.component_id) {
             *existing = edit;
         } else {
             self.edits.push(edit);
@@ -94,12 +96,36 @@ pub fn pending_edits_mut(cx: &mut App) -> &mut PendingEdits {
 
 /// Encode `edit` as an [`UpdateComponent`] message and push it to the DB log.
 pub fn apply_edit(db: &DB, edit: &PendingEdit) {
-    let update = UpdateComponent {
-        id: edit.component_id,
-        value: edit.value.clone(),
-    };
+    push_update(db, edit.component_id, edit.value.clone());
+}
+
+fn push_update(db: &DB, id: ComponentId, value: ComponentValue) {
+    let update = UpdateComponent { id, value };
     let bytes = postcard::to_allocvec(&update).expect("postcard serialize");
     let _ = db.push_msg(Timestamp::now(), UpdateComponent::ID, &bytes);
+}
+
+/// Command one element straight away, over the latest committed value.
+///
+/// For controls whose click *is* the decision — a toggle switch picking
+/// ARMED — where staging the edit for review would make the operator click
+/// twice. It never touches the pending queue, so another view's staged edit
+/// to the same component is neither sent nor dropped. Returns `false` when
+/// there is nothing to write over (no sample yet) or `value` is not the
+/// component's type; the caller checks the edit lock and live mode.
+pub fn command_element(
+    db: &DB,
+    component_id: ComponentId,
+    element_index: usize,
+    value: ElementValue,
+) -> bool {
+    match build_updated_value_typed(db, component_id, element_index, value) {
+        Some(value) => {
+            push_update(db, component_id, value);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Apply a pending component edit and remove `element_index` from its list
@@ -115,11 +141,7 @@ pub fn apply_element(db: &DB, component_id: ComponentId, element_index: usize, c
     };
     apply_edit(db, &edit);
     let pending = pending_edits_mut(cx);
-    if let Some(existing) = pending
-        .edits
-        .iter_mut()
-        .find(|e| e.component_id == component_id)
-    {
+    if let Some(existing) = pending.get_mut(component_id) {
         existing.modified_elements.retain(|&i| i != element_index);
         if existing.modified_elements.is_empty() {
             pending.remove(component_id);
@@ -352,24 +374,13 @@ pub fn upsert_string_value(
     text: &str,
     cx: &mut App,
 ) {
-    let Some(component) = db.with_state(|s| s.get_component(component_id).cloned()) else {
+    let Some(mut value) = latest_value(db, component_id) else {
         return;
     };
-    let cap: usize = component.schema.dim.iter().product();
     let bytes = text.as_bytes();
-    if bytes.len() > cap.saturating_sub(1) {
-        return;
-    }
-    let Some(latest) = component.time_series.latest() else {
-        return;
-    };
-    let buf = latest.data();
-    let Ok((_size, view)) = component.schema.parse_value(buf) else {
-        return;
-    };
-    let mut value = ComponentValue::from_view(view);
-    if let ComponentValue::U8(arr) = &mut value {
-        use nox::ArrayBuf;
+    if let ComponentValue::U8(arr) = &mut value
+        && bytes.len() <= arr.buf.as_buf().len().saturating_sub(1)
+    {
         let slot = arr.buf.as_mut_buf();
         for (i, cell) in slot.iter_mut().enumerate() {
             *cell = *bytes.get(i).unwrap_or(&0);
@@ -438,11 +449,7 @@ fn merge_pending(
     value: ComponentValue,
 ) {
     let pending = pending_edits_mut(cx);
-    if let Some(existing) = pending
-        .edits
-        .iter_mut()
-        .find(|e| e.component_id == component_id)
-    {
+    if let Some(existing) = pending.get_mut(component_id) {
         let _ = existing.value.copy_from_view(value.as_view());
         if !existing.modified_elements.contains(&element_index) {
             existing.modified_elements.push(element_index);
@@ -458,23 +465,28 @@ fn merge_pending(
     }
 }
 
+/// The component's most recent value, decoded into an owned buffer that an
+/// edit can modify and send back whole.
+fn latest_value(db: &DB, component_id: ComponentId) -> Option<ComponentValue> {
+    let component = db.with_state(|s| s.get_component(component_id).cloned())?;
+    let latest = component.time_series.latest()?;
+    let (_size, view) = component.schema.parse_value(latest.data()).ok()?;
+    Some(ComponentValue::from_view(view))
+}
+
+/// The component's latest value with `element` written at `element_index`.
 fn build_updated_value_typed(
     db: &DB,
     component_id: ComponentId,
     element_index: usize,
-    value: ElementValue,
+    element: ElementValue,
 ) -> Option<ComponentValue> {
-    let component = db.with_state(|s| s.get_component(component_id).cloned())?;
-    let latest = component.time_series.latest()?;
-    let buf = latest.data();
-    let (_size, view) = component.schema.parse_value(buf).ok()?;
-    let mut out = ComponentValue::from_view(view);
-    set_element_typed(&mut out, element_index, value)?;
-    Some(out)
+    let mut value = latest_value(db, component_id)?;
+    set_element_typed(&mut value, element_index, element)?;
+    Some(value)
 }
 
 fn set_element_typed(value: &mut ComponentValue, idx: usize, element: ElementValue) -> Option<()> {
-    use nox::ArrayBuf;
     match (value, element) {
         (ComponentValue::U8(a), ElementValue::U8(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
         (ComponentValue::U16(a), ElementValue::U16(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
@@ -500,29 +512,8 @@ fn build_updated_value(
     element_index: usize,
     input: &str,
 ) -> Option<ComponentValue> {
-    let pending = db.with_state(|s| s.get_component(component_id).cloned())?;
-    let latest = pending.time_series.latest()?;
-    let buf = latest.data();
-    let (_size, view) = pending.schema.parse_value(buf).ok()?;
-    let mut value = ComponentValue::from_view(view);
-    set_element(&mut value, element_index, input)?;
+    let mut value = latest_value(db, component_id)?;
+    let element = TypedScalar::parse(input, value.as_view().prim_type())?;
+    set_element_typed(&mut value, element_index, element.into())?;
     Some(value)
-}
-
-fn set_element(value: &mut ComponentValue, idx: usize, input: &str) -> Option<()> {
-    use nox::ArrayBuf;
-    match value {
-        ComponentValue::U8(a) => *a.buf.as_mut_buf().get_mut(idx)? = input.parse().ok()?,
-        ComponentValue::U16(a) => *a.buf.as_mut_buf().get_mut(idx)? = input.parse().ok()?,
-        ComponentValue::U32(a) => *a.buf.as_mut_buf().get_mut(idx)? = input.parse().ok()?,
-        ComponentValue::U64(a) => *a.buf.as_mut_buf().get_mut(idx)? = input.parse().ok()?,
-        ComponentValue::I8(a) => *a.buf.as_mut_buf().get_mut(idx)? = input.parse().ok()?,
-        ComponentValue::I16(a) => *a.buf.as_mut_buf().get_mut(idx)? = input.parse().ok()?,
-        ComponentValue::I32(a) => *a.buf.as_mut_buf().get_mut(idx)? = input.parse().ok()?,
-        ComponentValue::I64(a) => *a.buf.as_mut_buf().get_mut(idx)? = input.parse().ok()?,
-        ComponentValue::Bool(a) => *a.buf.as_mut_buf().get_mut(idx)? = input.parse().ok()?,
-        ComponentValue::F32(a) => *a.buf.as_mut_buf().get_mut(idx)? = input.parse().ok()?,
-        ComponentValue::F64(a) => *a.buf.as_mut_buf().get_mut(idx)? = input.parse().ok()?,
-    }
-    Some(())
 }

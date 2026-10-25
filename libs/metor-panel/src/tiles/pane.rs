@@ -1,23 +1,25 @@
 use gpui::{
-    Bounds, Context, DragMoveEvent, EventEmitter, IntoElement, MouseButton, Pixels, Point, Render,
-    ScrollHandle, SharedString, Window, div, prelude::*, px,
+    Bounds, ClickEvent, Context, DragMoveEvent, EventEmitter, IntoElement, MouseButton, Pixels,
+    Point, Render, ScrollHandle, SharedString, Window, div, prelude::*, px,
 };
 use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
 use std::rc::Rc;
 
-use super::drag::{DraggedTab, SplitDirection, detect_split_zone};
+use super::drag::{DraggedTab, RailResizeDrag, SplitDirection, detect_split_zone};
 use super::item::PaneItemHandle;
 use super::motion::{MovingTab, Rail, TabSizes};
-use super::tab::{HEIGHT as TAB_HEIGHT, RAIL_WIDTH as TAB_RAIL_WIDTH};
+use super::tab::{
+    HEIGHT as TAB_HEIGHT, MAX_RAIL_WIDTH, MAX_WIDTH as TAB_MAX_WIDTH, MIN_RAIL_WIDTH,
+    RAIL_HANDLE_WIDTH, RAIL_WIDTH as DEFAULT_RAIL_WIDTH,
+};
 use crate::theme::theme;
 
 /// Dispatched by views inside a pane to spawn a new plot tab in that pane.
 ///
 /// The payload is deliberately minimal — `ComponentId` and element indices —
 /// so the action can implement `PartialEq`. Color, label, and style derive
-/// from theme and metadata inside `PlotPanel::new`, matching the
-/// `TimeSeriesPlot::from_component` path used by the palette wizard.
+/// from theme and metadata via [`crate::views::time_series::traces_for_component`].
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(no_json)]
 pub struct PlotComponentAction {
@@ -69,6 +71,9 @@ pub enum PaneEvent {
     InspectPane {
         position: Point<Pixels>,
     },
+    /// A tab was double-clicked: fill the tile group with this pane, or put
+    /// the layout back if it already does.
+    ToggleZoom,
 }
 
 impl EventEmitter<PaneEvent> for Pane {}
@@ -89,6 +94,11 @@ pub struct Pane {
     tab_orientation: TabOrientation,
     hide_tab_bar: bool,
     locked_size: Option<gpui::Size<f32>>,
+    rail_width: Pixels,
+    /// Where the vertical rail sat at its last paint. Its left edge doesn't
+    /// move while the rail is resized, so a drag reads widths straight off
+    /// the pointer instead of accumulating deltas against a stale frame.
+    rail_bounds: Bounds<Pixels>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -148,6 +158,8 @@ impl Pane {
             tab_orientation: TabOrientation::default(),
             hide_tab_bar: false,
             locked_size: None,
+            rail_width: px(DEFAULT_RAIL_WIDTH),
+            rail_bounds: Bounds::default(),
         }
     }
 
@@ -173,6 +185,24 @@ impl Pane {
         self.locked_size
     }
 
+    pub fn rail_width(&self) -> Pixels {
+        self.rail_width
+    }
+
+    /// The rail width worth persisting: `None` while it is still the default.
+    pub(super) fn custom_rail_width(&self) -> Option<f32> {
+        (self.rail_width != px(DEFAULT_RAIL_WIDTH)).then(|| self.rail_width.into())
+    }
+
+    /// Clamped so a rail can neither swallow its titles nor its pane.
+    pub fn set_rail_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        let width = width.clamp(px(MIN_RAIL_WIDTH), px(MAX_RAIL_WIDTH));
+        if self.rail_width != width {
+            self.rail_width = width;
+            cx.notify();
+        }
+    }
+
     /// Outer pane size = content bounds plus the tab strip (when shown).
     /// Used by the inspector toggle to capture "lock at the current size".
     pub fn current_outer_size(&self) -> gpui::Size<f32> {
@@ -183,7 +213,7 @@ impl Pane {
         if !self.hide_tab_bar {
             match self.tab_orientation {
                 TabOrientation::Horizontal => size.height += TAB_HEIGHT,
-                TabOrientation::Vertical => size.width += TAB_RAIL_WIDTH,
+                TabOrientation::Vertical => size.width += f32::from(self.rail_width),
             }
         }
         size
@@ -237,6 +267,16 @@ impl Pane {
         }
     }
 
+    /// Shared by the close button and a middle click, so both honour
+    /// [`PaneItemHandle::can_close`] the same way.
+    fn close_tab(&mut self, id: gpui::EntityId, cx: &mut Context<Self>) {
+        if let Some(index) = self.index_of(id)
+            && self.items[index].can_close(cx)
+        {
+            self.remove_item(index, cx);
+        }
+    }
+
     pub fn cycle_forward(&mut self, cx: &mut Context<Self>) {
         if self.items.len() > 1 {
             self.active_index = (self.active_index + 1) % self.items.len();
@@ -287,6 +327,8 @@ impl Pane {
                 TabOrientation::Vertical => size.height,
             };
             let sizes = self.tab_sizes.borrow();
+            // A tab measured in a vertical rail is as wide as that rail; as a
+            // horizontal tab it would size to its title, up to the cap.
             let extent = if self.tab_orientation == TabOrientation::Vertical {
                 px(TAB_HEIGHT)
             } else if dragged.pane.entity_id() == cx.entity_id() {
@@ -294,21 +336,17 @@ impl Pane {
                     .get(&item)
                     .copied()
                     .map(axis)
-                    .unwrap_or(px(TAB_RAIL_WIDTH))
+                    .unwrap_or(self.rail_width)
             } else {
                 let source = dragged.pane.read(cx);
-                if source.tab_orientation == self.tab_orientation {
-                    source
-                        .tab_sizes
-                        .borrow()
-                        .get(&item)
-                        .copied()
-                        .map(axis)
-                        .unwrap_or(px(TAB_RAIL_WIDTH))
-                } else {
-                    px(TAB_RAIL_WIDTH)
-                }
-            };
+                source
+                    .tab_sizes
+                    .borrow()
+                    .get(&item)
+                    .map(|size| size.width)
+                    .unwrap_or(source.rail_width)
+            }
+            .min(px(TAB_MAX_WIDTH));
             let relative = event.event.position - event.bounds.origin - self.tab_scroll.offset();
             let pointer = match self.tab_orientation {
                 TabOrientation::Horizontal => relative.x,
@@ -473,9 +511,20 @@ impl Pane {
                 .hover(move |s| s.bg(bg_primary).text_color(text_primary));
         }
 
-        tab = tab.on_click(cx.listener(move |this, _, _, cx| {
+        tab = tab.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
             if let Some(index) = this.index_of(item_id) {
                 this.activate_item(index, cx);
+                // The first click of the pair already activated the tab, so a
+                // double click only adds the zoom.
+                if event.click_count() == 2 {
+                    cx.emit(PaneEvent::ToggleZoom);
+                }
+            }
+        }));
+
+        tab = tab.on_aux_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            if event.is_middle_click() {
+                this.close_tab(item_id, cx);
             }
         }));
 
@@ -516,7 +565,7 @@ impl Pane {
                         .borrow()
                         .get(&dragged.item.entity_id())
                         .copied()
-                        .unwrap_or(gpui::size(px(TAB_RAIL_WIDTH), px(TAB_HEIGHT)))
+                        .unwrap_or(gpui::size(pane.rail_width, px(TAB_HEIGHT)))
                 });
                 cx.new(|_| super::drag::TabDragGhost {
                     title: ghost_title.clone(),
@@ -528,7 +577,7 @@ impl Pane {
             },
         );
 
-        tab = tab.child(title);
+        tab = tab.child(super::tab::title(title));
 
         if can_close {
             tab = tab.child(
@@ -537,9 +586,7 @@ impl Pane {
                     .hover(move |s| s.bg(border_primary).text_color(text_primary))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        if let Some(index) = this.index_of(item_id) {
-                            this.remove_item(index, cx);
-                        }
+                        this.close_tab(item_id, cx);
                     })),
             );
         }
@@ -551,6 +598,63 @@ impl Pane {
             !cx.has_active_drag() || self.tab_drag_preview.is_some() || self.lifted_tab.is_some(),
             orientation == TabOrientation::Vertical,
         )
+    }
+}
+
+impl Pane {
+    /// Frames the vertical tab bar at this pane's rail width, with a grab
+    /// area on its right edge that resizes it the way split handles resize
+    /// panes.
+    fn render_rail(&self, tab_bar: impl IntoElement, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme(cx);
+        let pane_id = cx.entity_id();
+        let view = cx.entity().clone();
+        let bounds_tracker = gpui::canvas(
+            move |bounds, _, cx| view.update(cx, |pane, _| pane.rail_bounds = bounds),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+        let hover_color = theme.text_tertiary;
+        let handle = div()
+            .id("tab-rail-resize")
+            .debug_selector(|| "tab-rail-resize".into())
+            .absolute()
+            .top_0()
+            .right_0()
+            .h_full()
+            .w(px(RAIL_HANDLE_WIDTH))
+            .cursor(gpui::CursorStyle::ResizeColumn)
+            .group("tab-rail-resize")
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h_full()
+                    .w(px(1.0))
+                    .group_hover("tab-rail-resize", move |s| s.bg(hover_color)),
+            )
+            .on_drag(RailResizeDrag { pane: pane_id }, |drag, _, _, cx| {
+                cx.new(|_| drag.clone())
+            })
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<RailResizeDrag>, _, cx| {
+                    if event.drag(cx).pane != pane_id {
+                        return;
+                    }
+                    let width = event.event.position.x - this.rail_bounds.origin.x;
+                    this.set_rail_width(width, cx);
+                },
+            ));
+        div()
+            .relative()
+            .h_full()
+            .w(self.rail_width)
+            .flex_shrink_0()
+            .child(bounds_tracker)
+            .child(tab_bar)
+            .child(handle)
     }
 }
 
@@ -595,8 +699,7 @@ impl Render for Pane {
                     .overflow_x_scroll(),
                 TabOrientation::Vertical => tab_bar
                     .flex_col()
-                    .h_full()
-                    .w(px(TAB_RAIL_WIDTH))
+                    .size_full()
                     .border_r_1()
                     .overflow_y_scroll(),
             };
@@ -651,7 +754,11 @@ impl Render for Pane {
                 TabOrientation::Horizontal => drop_zone.h_full(),
                 TabOrientation::Vertical => drop_zone.w_full(),
             };
-            tab_bar.child(drop_zone)
+            let tab_bar = tab_bar.child(drop_zone);
+            match orientation {
+                TabOrientation::Horizontal => tab_bar.into_any_element(),
+                TabOrientation::Vertical => self.render_rail(tab_bar, cx).into_any_element(),
+            }
         });
 
         let view = cx.entity().clone();
@@ -758,6 +865,10 @@ mod tests {
 
         fn to_config(&self, _: &App) -> OtherItemConfig {
             OtherItemConfig {}
+        }
+
+        fn can_close(&self, _: &App) -> bool {
+            false
         }
     }
 
@@ -1025,7 +1136,7 @@ mod tests {
         let pane = cx.read(|cx| tg.read(cx).panes()[0].clone());
         cx.update(|cx| {
             tg.update(cx, |tg, cx| {
-                tg.focus_or_open("other_item", |cx| other_item(cx), cx);
+                tg.focus_or_open("other_item", |cx| Some(other_item(cx)), cx);
             });
         });
         cx.read(|cx| {
@@ -1041,7 +1152,7 @@ mod tests {
         let pane = cx.read(|cx| tg.read(cx).panes()[0].clone());
         cx.update(|cx| {
             tg.update(cx, |tg, cx| {
-                tg.focus_or_open("other_item", |cx| other_item(cx), cx);
+                tg.focus_or_open("other_item", |cx| Some(other_item(cx)), cx);
             });
         });
         cx.read(|cx| {
@@ -1102,6 +1213,213 @@ mod tests {
         cx.read(|cx| {
             assert_eq!(pane.read(cx).items().len(), 1);
             assert_eq!(tg.read(cx).panes().len(), 2);
+        });
+    }
+    fn click(
+        cx: &mut gpui::VisualTestContext,
+        position: Point<Pixels>,
+        button: MouseButton,
+        click_count: usize,
+    ) {
+        cx.simulate_event(gpui::MouseDownEvent {
+            button,
+            position,
+            modifiers: gpui::Modifiers::default(),
+            click_count,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button,
+            position,
+            modifiers: gpui::Modifiers::default(),
+            click_count,
+        });
+    }
+
+    /// A tile group already split in two, with the original pane on the left.
+    fn split_group(cx: &mut Context<TileGroup>) -> TileGroup {
+        crate::theme::set_theme(cx, std::sync::Arc::new(crate::theme::DARK.clone()));
+        let mut tg = TileGroup::new(vec![item(cx), item(cx)], cx);
+        let left = tg.panes()[0].clone();
+        let right = cx.new(|cx| Pane::new(vec![other_item(cx)], cx));
+        tg.split_pane(&left, right, SplitDirection::Right, cx);
+        tg
+    }
+
+    #[gpui::test]
+    fn double_clicking_a_tab_zooms_its_pane_and_again_restores(cx: &mut gpui::TestAppContext) {
+        let (tg, cx) = cx.add_window_view(|_, cx| split_group(cx));
+        cx.refresh().unwrap();
+        let (left, second) = cx.update(|_, cx| {
+            let left = tg.read(cx).panes()[0].clone();
+            let second = left.read(cx).items[1].entity_id();
+            (left, second)
+        });
+        let second_tab = cx.update(|_, cx| left.read(cx).tab_sizes.borrow()[&second]);
+        let tab = gpui::point(second_tab.width + px(8.0), px(12.0));
+
+        click(cx, tab, MouseButton::Left, 1);
+        cx.update(|_, cx| {
+            assert_eq!(left.read(cx).active_index, 1, "a single click activates");
+            assert!(tg.read(cx).zoomed().is_none(), "a single click never zooms");
+        });
+
+        click(cx, tab, MouseButton::Left, 2);
+        cx.refresh().unwrap();
+        cx.update(|window, cx| {
+            assert_eq!(tg.read(cx).zoomed(), Some(&left));
+            let pane = left.read(cx);
+            assert_eq!(pane.items[1].entity_id(), second, "items survive the zoom");
+            assert_eq!(pane.active_index, 1);
+            assert_eq!(
+                pane.content_bounds.size.width,
+                window.viewport_size().width,
+                "the zoomed pane spans the whole group"
+            );
+        });
+
+        click(cx, tab, MouseButton::Left, 1);
+        click(cx, tab, MouseButton::Left, 2);
+        cx.update(|_, cx| assert!(tg.read(cx).zoomed().is_none()));
+    }
+
+    #[gpui::test]
+    fn zoom_clears_when_the_layout_changes_under_it(cx: &mut gpui::TestAppContext) {
+        let tg = cx.update(|cx| cx.new(split_group));
+        let (left, right) = cx.read(|cx| {
+            (
+                tg.read(cx).panes()[0].clone(),
+                tg.read(cx).panes()[1].clone(),
+            )
+        });
+        cx.update(|cx| {
+            tg.update(cx, |tg, cx| {
+                tg.toggle_zoom(&right, cx);
+                assert_eq!(tg.zoomed(), Some(&right));
+                tg.remove_pane(&right, cx);
+                assert!(tg.zoomed().is_none(), "removing the zoomed pane un-zooms");
+
+                let lone = tg.panes()[0].clone();
+                tg.toggle_zoom(&lone, cx);
+                assert!(tg.zoomed().is_none(), "a lone pane has nothing to hide");
+
+                let extra = cx.new(|cx| Pane::new(vec![item(cx)], cx));
+                tg.split_pane(&left, extra.clone(), SplitDirection::Down, cx);
+                tg.toggle_zoom(&left, cx);
+                let fresh = cx.new(|cx| Pane::new(vec![item(cx)], cx));
+                tg.split_pane(&extra, fresh, SplitDirection::Right, cx);
+                assert!(tg.zoomed().is_none(), "a split reveals its new pane");
+
+                tg.toggle_zoom(&left, cx);
+                tg.exit_zoom(cx);
+                assert!(tg.zoomed().is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn middle_click_closes_only_closable_tabs(cx: &mut gpui::TestAppContext) {
+        let (pane, cx) = cx.add_window_view(|_, cx| {
+            crate::theme::set_theme(cx, std::sync::Arc::new(crate::theme::DARK.clone()));
+            Pane::new(vec![item(cx), other_item(cx)], cx)
+        });
+        cx.refresh().unwrap();
+        let (survivor, first_width) = cx.update(|_, cx| {
+            let pane = pane.read(cx);
+            let first = pane.items[0].entity_id();
+            (
+                pane.items[1].entity_id(),
+                pane.tab_sizes.borrow()[&first].width,
+            )
+        });
+        click(
+            cx,
+            gpui::point(first_width + px(8.0), px(12.0)),
+            MouseButton::Middle,
+            1,
+        );
+        cx.update(|_, cx| assert_eq!(pane.read(cx).items.len(), 2));
+        click(cx, gpui::point(px(8.0), px(12.0)), MouseButton::Middle, 1);
+        cx.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.items.len(), 1);
+            assert_eq!(pane.items[0].entity_id(), survivor);
+        });
+    }
+
+    #[gpui::test]
+    fn dragging_the_rail_edge_resizes_within_bounds(cx: &mut gpui::TestAppContext) {
+        let (pane, cx) = cx.add_window_view(|_, cx| {
+            crate::theme::set_theme(cx, std::sync::Arc::new(crate::theme::DARK.clone()));
+            let mut pane = Pane::new(vec![item(cx)], cx);
+            pane.tab_orientation = TabOrientation::Vertical;
+            pane
+        });
+        cx.refresh().unwrap();
+        let handle = cx.debug_bounds("tab-rail-resize").unwrap();
+        assert_eq!(handle.right(), px(DEFAULT_RAIL_WIDTH));
+        let start = handle.center();
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        for x in [start.x + px(8.0), px(300.0)] {
+            cx.simulate_mouse_move(
+                gpui::point(x, start.y),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+        }
+        cx.refresh().unwrap();
+        cx.update(|_, cx| assert_eq!(pane.read(cx).rail_width, px(300.0)));
+        let content = cx.update(|_, cx| pane.read(cx).content_bounds);
+        assert_eq!(content.origin.x, px(300.0), "content starts past the rail");
+        cx.update(|_, cx| {
+            assert_eq!(
+                pane.read(cx).current_outer_size().width,
+                f32::from(content.right()),
+                "outer size counts the resized rail"
+            )
+        });
+
+        cx.simulate_mouse_move(
+            gpui::point(px(2000.0), start.y),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(px(2000.0), start.y),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.update(|_, cx| assert_eq!(pane.read(cx).rail_width, px(MAX_RAIL_WIDTH)));
+    }
+
+    #[gpui::test]
+    fn rail_width_round_trips_through_the_layout(cx: &mut gpui::TestAppContext) {
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item(cx)], cx)));
+        let json = cx.update(|cx| {
+            let pane = tg.read(cx).panes()[0].clone();
+            assert!(
+                !tg.read(cx).to_json(cx).contains("tab_rail_width"),
+                "a default rail leaves the document as it was"
+            );
+            pane.update(cx, |pane, cx| {
+                pane.set_tab_orientation(TabOrientation::Vertical, cx);
+                pane.set_rail_width(px(10.0), cx);
+                assert_eq!(pane.rail_width(), px(MIN_RAIL_WIDTH));
+                pane.set_rail_width(px(224.0), cx);
+            });
+            tg.read(cx).to_json(cx)
+        });
+        let mut registry = crate::tiles::ItemRegistry::default();
+        registry.register::<TestItem>(|_, cx| Some(cx.new(|_| TestItem)));
+        cx.update(|cx| {
+            tg.update(cx, |tg, cx| {
+                *tg = TileGroup::from_json(&json, &registry, cx).unwrap();
+            })
+        });
+        cx.read(|cx| {
+            let pane = tg.read(cx).panes()[0].read(cx);
+            assert_eq!(pane.rail_width(), px(224.0));
+            assert_eq!(pane.tab_orientation(), TabOrientation::Vertical);
         });
     }
 }

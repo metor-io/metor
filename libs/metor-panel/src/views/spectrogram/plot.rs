@@ -14,17 +14,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Corners, Entity, EntityId, IntoElement, Pixels, Render, SharedString, Window,
-    canvas, div, prelude::*,
+    Bounds, Context, Entity, EntityId, IntoElement, Pixels, Render, SharedString, Window, div,
+    prelude::*,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::Timestamp;
 
-use crate::views::plot_common::reconcile_trackers;
+use crate::views::plot_common::lod::{GapBands, GapCollector, LodTracking, gap_band_overlay};
+use crate::views::plot_common::{
+    gpu_frame, link_traces, reconcile_trackers, replace_view_override,
+};
 use crate::views::time_series::time_range::{GlobalTimeRange, TimeRangeBehavior};
 use crate::views::time_series::{
-    Colormap, IntensityDraw, IntensityScale, Override, PlotBounds, PlotRenderState, TimeFormat,
-    resolve_lod_levels,
+    Colormap, IntensityDraw, IntensityScale, Override, PlotBounds, PlotRenderState, ReadbackHandle,
+    TimeFormat,
 };
 use crate::wait_for_component;
 
@@ -32,35 +35,15 @@ use super::SpectrogramTrace;
 use super::grid::{self, ELEMENT_SCAN_BUDGET, MAX_COLS, SpectrogramGrid};
 
 /// Background state for one source, keyed by the trace's [`EntityId`].
+#[derive(Default)]
 struct SourceTracking {
     component: Option<Component>,
-    /// The component's LoD companions (`metor_db::lod`), finest first.
-    lod_levels: Vec<Component>,
-    lod_resolved_gen: Option<u64>,
-    /// True while the visible window would cost more element reads than
-    /// [`ELEMENT_SCAN_BUDGET`]; the grid then comes from an LoD companion.
-    over_budget: bool,
-    lod_selected: Option<usize>,
+    /// Over [`ELEMENT_SCAN_BUDGET`] element reads, the grid comes from an
+    /// LoD companion.
+    lod: LodTracking,
     /// How to compute the history an expression's component lacks. Its ports
     /// also size the window while the component itself is still empty.
     plan: Option<crate::dynamic::ops::replay::ReplayPlan>,
-}
-
-impl SourceTracking {
-    fn new() -> Self {
-        Self {
-            component: None,
-            lod_levels: Vec::new(),
-            lod_resolved_gen: None,
-            over_budget: false,
-            lod_selected: None,
-            plan: None,
-        }
-    }
-
-    fn selected_lod(&self) -> Option<&Component> {
-        self.lod_levels.get(self.lod_selected?)
-    }
 }
 
 /// Previous values of the reflected knobs, compared on each reconcile so an
@@ -196,8 +179,7 @@ impl SpectrogramPlot {
     }
 
     pub fn set_view_override(&mut self, view: Option<PlotBounds>, cx: &mut Context<Self>) {
-        if self.view_override.map(|b| b.bits()) != view.map(|b| b.bits()) {
-            self.view_override = view;
+        if replace_view_override(&mut self.view_override, view) {
             cx.notify();
         }
     }
@@ -384,17 +366,13 @@ impl SpectrogramPlot {
         })
     }
 
-    /// Decide raw versus LoD for the current window. Hysteresis keeps the
-    /// boundary from flapping while panning near the budget; over budget the
-    /// finest level whose element cost fits wins, falling back to the coarsest.
+    /// Decide raw versus LoD for the current window, where a sample costs
+    /// one element read per bin.
     fn update_lod_state(&mut self, cx: &gpui::App) {
-        const ENTER: u64 = ELEMENT_SCAN_BUDGET + ELEMENT_SCAN_BUDGET / 4;
-        const EXIT: u64 = ELEMENT_SCAN_BUDGET * 4 / 5;
         let Some(view) = self.effective_view(cx) else {
             return;
         };
         let range = Timestamp(view.min_x as i64)..Timestamp(view.max_x as i64);
-        let vtable_gen = self.db.vtable_gen.latest();
         for trace in &self.traces {
             let cfg = trace.read(cx);
             if !cfg.visible {
@@ -406,100 +384,37 @@ impl SpectrogramPlot {
             let Some(component) = tracking.component.as_ref() else {
                 continue;
             };
-            if tracking.lod_resolved_gen != Some(vtable_gen) {
-                tracking.lod_levels = resolve_lod_levels(&self.db, cfg.source.id());
-                tracking.lod_resolved_gen = Some(vtable_gen);
-            }
-            let len = cfg.len.max(1) as u64;
-            let elements = component
-                .time_series
-                .estimate_samples(range.clone())
-                .saturating_mul(len);
-            if tracking.over_budget {
-                tracking.over_budget = elements >= EXIT;
-            } else {
-                tracking.over_budget = elements > ENTER;
-            }
-            if !tracking.over_budget {
-                tracking.lod_selected = None;
-                continue;
-            }
-            let mut selected = None;
-            for (i, lod) in tracking.lod_levels.iter().enumerate() {
-                let has_data = lod.time_series.latest().is_some()
-                    || !lod.time_series.manifest().spans.is_empty();
-                if !has_data {
-                    continue;
-                }
-                selected = Some(i);
-                // An LoD sample carries both halves of the bucket, so its
-                // element cost is twice the bin count.
-                if lod
-                    .time_series
-                    .estimate_samples(range.clone())
-                    .saturating_mul(len * 2)
-                    <= ELEMENT_SCAN_BUDGET
-                {
-                    break;
-                }
-            }
-            tracking.lod_selected = selected;
+            tracking.lod.select(
+                &self.db,
+                cfg.source.id(),
+                component,
+                range.clone(),
+                ELEMENT_SCAN_BUDGET,
+                cfg.len.max(1) as u64,
+            );
         }
     }
 
-    /// Remote-only stretches of the visible window, as `(start, width)`
-    /// fractions of the plot width, asking the installed hydrator for them on
-    /// the way past. Over-budget sources hydrate their LoD companion rather
-    /// than pulling the raw archive for a year-wide view.
-    fn gap_bands(&self, cx: &gpui::App) -> smallvec::SmallVec<[(f32, f32); 4]> {
-        let mut bands: smallvec::SmallVec<[(f32, f32); 4]> = smallvec::SmallVec::new();
+    /// Missing stretches of the active source's visible window.
+    fn gap_bands(&self, cx: &gpui::App) -> GapBands {
         let Some(view) = self.effective_view(cx) else {
-            return bands;
+            return GapBands::new();
         };
         let Some((trace, tracking)) = self.active(cx) else {
-            return bands;
+            return GapBands::new();
         };
         let Some(component) = tracking.component.as_ref() else {
-            return bands;
+            return GapBands::new();
         };
-        let component_id = trace.read(cx).source.id();
-        let span = view.width().max(1.0);
-        let visible = Timestamp(view.min_x as i64)..Timestamp(view.max_x as i64);
-        let hydrator = crate::hydration::hydrator(cx);
-        let mut gaps = metor_db::manifest::GapVec::new();
-
-        let (series, hydrate_id, hydrate) = match tracking.selected_lod() {
-            Some(lod) => (&lod.time_series, lod.component_id, true),
-            None if tracking.over_budget => (&component.time_series, component_id, false),
-            None => (&component.time_series, component_id, true),
-        };
-        series.coverage(visible.clone(), &mut gaps);
-        let mut band = |range: &std::ops::Range<Timestamp>| {
-            let start = ((range.start.0 as f64 - view.min_x) / span).clamp(0.0, 1.0) as f32;
-            let end = ((range.end.0 as f64 - view.min_x) / span).clamp(0.0, 1.0) as f32;
-            if end > start {
-                bands.push((start, end - start));
-            }
-        };
-        for gap in &gaps {
-            if hydrate
-                && gap.state == metor_db::manifest::SpanState::RemoteOnly
-                && let Some(hydrator) = &hydrator
-            {
-                hydrator.request(hydrate_id, gap.range.clone());
-            }
-            band(&gap.range);
-        }
-        // What an expression has never computed is a gap of the other kind:
-        // nothing to fetch, something to compute.
-        let history = crate::data_binding::BoundHistory {
-            component: component.clone(),
-            plan: tracking.plan.clone(),
-        };
-        for range in history.request_replay(visible.clone(), cx) {
-            band(&range);
-        }
-        bands
+        let mut gaps = GapCollector::new(view.min_x, view.max_x, cx);
+        gaps.add(
+            component,
+            trace.read(cx).source.id(),
+            &tracking.lod,
+            &tracking.plan,
+            cx,
+        );
+        gaps.bands()
     }
 
     fn reconcile(&mut self, cx: &mut Context<Self>) {
@@ -515,23 +430,7 @@ impl SpectrogramPlot {
             });
         }
 
-        // Point each source back at this plot so its inspector page can reach
-        // the plot to rebind. Mutating without notifying cannot re-enter
-        // reconcile: the plot does not observe its traces.
-        let self_weak = cx.entity().downgrade();
-        let self_id = cx.entity().entity_id();
-        for trace in &self.traces {
-            trace.update(cx, |t, _| {
-                let linked = t
-                    .plot
-                    .as_ref()
-                    .and_then(|w| w.upgrade())
-                    .map(|e| e.entity_id());
-                if linked != Some(self_id) {
-                    t.plot = Some(self_weak.clone());
-                }
-            });
-        }
+        link_traces(&self.traces, |t| &mut t.plot, cx);
 
         for id in self.inputs.changed(
             &self.traces,
@@ -550,7 +449,7 @@ impl SpectrogramPlot {
             &mut self.tasks,
             |id, trace| {
                 (
-                    SourceTracking::new(),
+                    SourceTracking::default(),
                     Self::spawn_tracker(id, trace.clone(), db.clone(), cx),
                 )
             },
@@ -602,7 +501,7 @@ impl SpectrogramPlot {
                 let lod = this.update(cx, |plot, _| {
                     plot.tracking
                         .get(&id)
-                        .and_then(|t| t.selected_lod().cloned())
+                        .and_then(|t| t.lod.selected().cloned())
                 });
                 let Ok(lod) = lod else { break };
                 // Hydrated LoD buckets wake the same as live raw data, so a
@@ -630,76 +529,48 @@ impl Render for SpectrogramPlot {
         let theme = crate::theme::theme(cx);
         self.update_lod_state(cx);
         let gap_bands = self.gap_bands(cx);
-        let weak = cx.entity().downgrade();
-        let field_canvas = canvas(
-            move |bounds, window, cx| {
-                let scale_factor = window.scale_factor();
-                let (frame, released) = weak
-                    .update(cx, |plot, cx| {
-                        plot.submit_frame(bounds, scale_factor, cx);
-                        (
-                            plot.gpu_state.current_frame(),
-                            plot.gpu_state.take_pending_release(),
-                        )
-                    })
-                    .unwrap_or((None, None));
-                if let Some(img) = released {
-                    let _ = window.drop_image(img);
-                }
-                (bounds, frame)
-            },
-            |_, (bounds, frame): (Bounds<Pixels>, Option<Arc<gpui::RenderImage>>), window, _cx| {
-                if let Some(img) = frame {
-                    let _ = window.paint_image(bounds, bounds, Corners::default(), img, 0, false);
-                }
-            },
-        )
-        .size_full();
-
         div()
             .size_full()
             .relative()
-            .child(field_canvas)
-            .children(gap_bands.into_iter().map({
-                let band_color = theme.plot_gap_band;
-                move |(start, width)| {
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .left(gpui::relative(start))
-                        .w(gpui::relative(width))
-                        .bg(band_color)
-                }
-            }))
+            .child(gpu_frame(
+                cx.entity().downgrade(),
+                spectrogram_gpu_state,
+                Self::submit_frame,
+            ))
+            .children(gap_band_overlay(gap_bands, theme.plot_gap_band()))
     }
 }
 
 impl SpectrogramPlot {
     /// Rebuild the grid for the visible window and hand it to the GPU.
-    fn submit_frame(&mut self, bounds: Bounds<Pixels>, scale_factor: f32, cx: &mut Context<Self>) {
+    fn submit_frame(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        scale_factor: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<ReadbackHandle> {
         let Some(view) = self.effective_view(cx) else {
             self.gpu_state.clear_frame();
-            return;
+            return None;
         };
         let Some((trace, tracking)) = self.active(cx) else {
             self.gpu_state.clear_frame();
-            return;
+            return None;
         };
         let cfg = trace.read(cx);
         let (len, scale, colormap, gain) = (cfg.len, cfg.scale, cfg.colormap, cfg.gain);
-        let lod = tracking.selected_lod().cloned();
-        let over_budget = tracking.over_budget;
+        let lod = tracking.lod.selected().cloned();
+        let over_budget = tracking.lod.over_budget();
         let Some(component) = tracking.component.clone() else {
             self.gpu_state.clear_frame();
-            return;
+            return None;
         };
         // Over budget with no published level yet: bucketing the raw window
         // would cost `samples × bins` reads on the paint thread. The gap bands
         // already say the history is not resident, and the level lands soon
         // after — a stalled frame would be the worse answer.
         if over_budget && lod.is_none() {
-            return;
+            return None;
         }
 
         let cols =
@@ -711,7 +582,7 @@ impl SpectrogramPlot {
         };
         if !built {
             self.gpu_state.clear_frame();
-            return;
+            return None;
         }
 
         let (lo, hi) = self.intensity_range();
@@ -730,12 +601,8 @@ impl SpectrogramPlot {
             trace_color: theme.line_color,
             row_view: (view.min_y as f32, view.max_y as f32),
         };
-        if let Some(handle) =
-            self.gpu_state
-                .render_with_field(cx, bounds, scale_factor, view, &[], Some(&draw))
-        {
-            handle.spawn_and_set(cx, spectrogram_gpu_state);
-        }
+        self.gpu_state
+            .render_with_field(cx, bounds, scale_factor, view, &[], Some(&draw))
     }
 }
 

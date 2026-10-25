@@ -35,79 +35,92 @@ pub fn select_list_trace_wizard_rows(
     color_basis: ColorBasis,
     on_select: OnListTraceSelected,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let candidates = list_vector_components(&db);
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(HeaderRow::new(
+    let expression_basis = color_basis.clone();
+    vector_trace_rows(
+        db,
         "Pick a vector component, or type an expression",
-    ))];
+        "No vector components available — list plots need a component whose schema dim has length > 1.",
+        move |db, component, text, cx| expression_trace(db, component, text, &expression_basis, cx),
+        move |id, name, len, cx| {
+            let theme = theme(cx);
+            let basis = (color_basis)(cx);
+            let color = theme.line_colors[basis % theme.line_colors.len()];
+            let mut trace = ListTrace::new(id, len, color);
+            trace.label = SharedString::from(name.to_string());
+            trace
+        },
+        on_select,
+    )
+}
 
-    // Pinned above the list, and before the empty-state note: a db with no
-    // vector component of its own can still have one computed from it.
+/// The page every vector-trace wizard shares: `header`, the expression row,
+/// then the vector components (or `empty_note` when there are none).
+///
+/// The expression row is pinned above the list, and before the empty-state
+/// note: a db with no vector component of its own can still have one
+/// computed from it. Only vectors fit, so the completion provider's component
+/// candidates are declined unless their schema says vector — the same rule
+/// [`list_vector_components`] applies to the unfiltered list.
+pub(crate) fn vector_trace_rows<T: 'static>(
+    db: Arc<DB>,
+    header: &'static str,
+    empty_note: &'static str,
+    from_expression: impl Fn(&DB, ComponentId, &str, &App) -> T + 'static,
+    from_component: impl Fn(ComponentId, &str, usize, &App) -> T + 'static,
+    on_select: Arc<dyn Fn(T, &mut Window, &mut App)>,
+) -> Vec<Box<dyn InspectorRow>> {
+    let from_component: Arc<dyn Fn(ComponentId, &str, usize, &App) -> T> = Arc::new(from_component);
+    let pick_row = {
+        let on_select = on_select.clone();
+        let from_component = from_component.clone();
+        move |id: ComponentId, name: String, len: usize| -> Box<dyn InspectorRow> {
+            let on_select = on_select.clone();
+            let from_component = from_component.clone();
+            let label = SharedString::from(format!("{} [{}]", name, len));
+            Box::new(CommandRow::new(
+                label,
+                Arc::new(move |window, cx| {
+                    let trace = from_component(id, &name, len, cx);
+                    (on_select)(trace, window, cx);
+                }),
+            ))
+        }
+    };
+
     let commit: crate::inspector::rows::OnExpression = {
         let db = db.clone();
-        let color_basis = color_basis.clone();
         let on_select = on_select.clone();
         Arc::new(move |component, text, window, cx| {
-            let trace = expression_trace(&db, component, &text, &color_basis, cx);
+            let trace = from_expression(&db, component, &text, cx);
             on_select(trace, window, cx);
             RowAction::Dismiss
         })
     };
-    // Only vectors fit a list plot, so the completion provider's component
-    // candidates are declined unless their schema says vector — the same
-    // rule `list_vector_components` applies to the unfiltered list.
     let vector_row: crate::inspector::rows::ComponentRowBuilder = {
         let db = db.clone();
-        let color_basis = color_basis.clone();
-        let on_select = on_select.clone();
+        let pick_row = pick_row.clone();
         Arc::new(move |id, _item, _cx| {
             let (_, name, len) = list_vector_components(&db)
                 .into_iter()
                 .find(|(vid, _, _)| *vid == id)?;
-            let on_select = on_select.clone();
-            let color_basis = color_basis.clone();
-            let label = SharedString::from(format!("{} [{}]", name, len));
-            Some(Box::new(CommandRow::new(
-                label,
-                Arc::new(move |window, cx| {
-                    let theme = theme(cx);
-                    let basis = (color_basis)(cx);
-                    let color = theme.line_colors[basis % theme.line_colors.len()];
-                    let mut trace = ListTrace::new(id, len, color);
-                    trace.label = SharedString::from(name.clone());
-                    (on_select)(trace, window, cx);
-                }),
-            )) as Box<dyn InspectorRow>)
+            Some(pick_row(id, name, len))
         })
     };
-    rows.push(Box::new(ExpressionRow::new(
-        db.clone(),
-        commit,
-        vector_row,
-        None,
-    )));
 
+    let candidates = list_vector_components(&db);
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![
+        Box::new(HeaderRow::new(header)),
+        Box::new(ExpressionRow::new(db.clone(), commit, vector_row, None)),
+    ];
     if candidates.is_empty() {
-        rows.push(Box::new(HeaderRow::new(
-            "No vector components available — list plots need a component whose schema dim has length > 1.",
-        )));
+        rows.push(Box::new(HeaderRow::new(empty_note)));
         return rows;
     }
-    for (id, name, len) in candidates {
-        let on_select = on_select.clone();
-        let color_basis = color_basis.clone();
-        let label = SharedString::from(format!("{} [{}]", name, len));
-        rows.push(Box::new(CommandRow::new(
-            label,
-            Arc::new(move |window, cx| {
-                let theme = theme(cx);
-                let basis = (color_basis)(cx);
-                let color = theme.line_colors[basis % theme.line_colors.len()];
-                let mut trace = ListTrace::new(id, len, color);
-                trace.label = SharedString::from(name.clone());
-                (on_select)(trace, window, cx);
-            }),
-        )));
-    }
+    rows.extend(
+        candidates
+            .into_iter()
+            .map(|(id, name, len)| pick_row(id, name, len)),
+    );
     rows
 }
 

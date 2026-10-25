@@ -9,7 +9,7 @@ use gpui::{
 use super::Scrollbar;
 
 use crate::icons::Icon;
-use crate::theme::theme;
+use crate::theme::{theme, ui_px, ui_scale};
 
 /// Height of the column header, shared with the chip headers of the log,
 /// sequence and alarm panels so a row of tabs lines up across panes.
@@ -196,10 +196,10 @@ pub(crate) fn drag_chip(label: SharedString, cx: &App) -> impl IntoElement {
         .bg(theme.bg_primary)
         .border_1()
         .border_color(theme.border_primary)
-        .px(px(8.0))
-        .py(px(4.0))
+        .px(ui_px(8.0))
+        .py(ui_px(4.0))
         .text_color(theme.text_primary)
-        .text_size(px(12.0))
+        .text_size(ui_px(12.0))
         .child(label)
 }
 
@@ -222,6 +222,10 @@ pub struct Table<D: TableDelegate> {
     col_states: Vec<ColState>,
     scroll_handle: UniformListScrollHandle,
     hscroll: ScrollHandle,
+    /// [`ui_scale`] of the last render. Column widths are kept unscaled and
+    /// multiplied by this; a resize drag, which runs outside any dashboard
+    /// zoom, divides it back out.
+    scale: f32,
 }
 
 impl<D: TableDelegate> Table<D> {
@@ -232,6 +236,7 @@ impl<D: TableDelegate> Table<D> {
             col_states,
             scroll_handle: UniformListScrollHandle::new(),
             hscroll: ScrollHandle::new(),
+            scale: 1.0,
         }
     }
 
@@ -334,18 +339,18 @@ impl<D: TableDelegate> Table<D> {
             .flex_row()
             .items_center()
             .size_full()
-            .gap(px(4.0))
-            .px(px(12.0))
-            .text_size(px(12.0))
+            .gap(ui_px(4.0))
+            .px(ui_px(12.0))
+            .text_size(ui_px(12.0))
             .text_color(theme.text_tertiary)
             .child(col.name.clone());
 
         match sort {
             ColumnSort::Ascending => {
-                cell = cell.child(Icon::ChevronUp.svg(12.0));
+                cell = cell.child(Icon::ChevronUp.svg(12.0, theme.text_secondary));
             }
             ColumnSort::Descending => {
-                cell = cell.child(Icon::ChevronDown.svg(12.0));
+                cell = cell.child(Icon::ChevronDown.svg(12.0, theme.text_secondary));
             }
             ColumnSort::Default => {}
         }
@@ -439,7 +444,8 @@ impl<D: TableDelegate> Table<D> {
             return;
         };
         let col_left = self.col_states[col_ix].bounds.left();
-        let new_width = (e.event.position.x - col_left).clamp(col.min_width, col.max_width);
+        let new_width =
+            ((e.event.position.x - col_left) / self.scale).clamp(col.min_width, col.max_width);
         if let Some(state) = self.col_states.get_mut(col_ix)
             && state.width != new_width
         {
@@ -455,14 +461,16 @@ impl<D: TableDelegate> Render for Table<D> {
         let theme = theme(cx);
         let columns = self.delegate.columns();
         let row_count = self.delegate.rows_count();
-        let row_height = self.delegate.row_height();
+        let scale = ui_scale(window);
+        self.scale = scale;
+        let row_height = self.delegate.row_height() * scale;
 
         let mut header = div()
             .flex()
             .flex_row()
             .items_center()
             .w_full()
-            .h(px(HEADER_HEIGHT))
+            .h(ui_px(HEADER_HEIGHT))
             .bg(theme.bg_secondary)
             .border_b_1()
             .border_color(theme.border_primary);
@@ -470,7 +478,7 @@ impl<D: TableDelegate> Render for Table<D> {
         let view = cx.entity().clone();
         let last_col = columns.len().saturating_sub(1);
         for (ix, col) in columns.iter().enumerate() {
-            let width = self.col_states[ix].width;
+            let width = self.col_states[ix].width * scale;
             let is_flex = col.flex;
             let is_resizable = col.resizable;
 
@@ -569,7 +577,9 @@ impl<D: TableDelegate> Render for Table<D> {
                                 // collapses below its column width and
                                 // the strip's flex_wrap breaks element
                                 // boxes onto a new line.
-                                cell_div = cell_div.w(this.col_states[col_ix].width).h(row_height);
+                                cell_div = cell_div
+                                    .w(this.col_states[col_ix].width * scale)
+                                    .h(row_height);
                                 cell_div.style().flex_shrink = Some(0.0);
                             }
 
@@ -601,7 +611,7 @@ impl<D: TableDelegate> Render for Table<D> {
             .child(header)
             .child(body);
         if !any_flex {
-            inner = inner.w(px(total_width));
+            inner = inner.w(px(total_width * scale));
         }
 
         let mut scroll_wrap = div().id("table-hscroll").size_full().child(inner);
@@ -626,7 +636,7 @@ impl<D: TableDelegate> Render for Table<D> {
             };
             div()
                 .absolute()
-                .top(px(HEADER_HEIGHT))
+                .top(ui_px(HEADER_HEIGHT))
                 .right_0()
                 .bottom_0()
                 .left_0()
@@ -648,7 +658,7 @@ impl<D: TableDelegate> Render for Table<D> {
                         .left_0()
                         .right_0()
                         .bottom_0()
-                        .h(px(10.0))
+                        .h(ui_px(10.0))
                         .child(Scrollbar::new(Axis::Horizontal, vp, vp + max_x, scroll_x)),
                 )
             } else {

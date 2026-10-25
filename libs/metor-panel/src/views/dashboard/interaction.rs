@@ -170,14 +170,16 @@ impl DashboardPanel {
         let theme = theme(cx);
         let view = self.widget_live.get(&widget.id).map(|live| &live.view);
         let r = &widget.rect;
+        let zoom = self.viewport.zoom;
+        let origin = self.viewport.to_screen(point(r.x, r.y));
 
         let mut container = div()
             .id(("dashboard-widget", widget.id.0 as usize))
             .absolute()
-            .top(px(r.y + self.scroll_offset.y))
-            .left(px(r.x + self.scroll_offset.x))
-            .w(px(r.w))
-            .h(px(r.h))
+            .top(px(origin.y))
+            .left(px(origin.x))
+            .w(px(r.w * zoom))
+            .h(px(r.h * zoom))
             .overflow_hidden();
 
         if widget.frame {
@@ -196,7 +198,11 @@ impl DashboardPanel {
         }
 
         if let Some(view) = view {
-            container = container.child(view.clone());
+            container = if zoom == 1.0 {
+                container.child(view.clone())
+            } else {
+                container.child(super::zoom::Zoomed::new(zoom, view.clone()))
+            };
         }
 
         if self.editing {
@@ -205,9 +211,7 @@ impl DashboardPanel {
             // Edit-mode blocker: keeps clicks away from the widget's own
             // controls, so editing never fires a command or pans a plot.
             // Stopping propagation also hides the click from the canvas
-            // behind, so the blocker hands it on itself (connector anchors
-            // land on widgets). Right-click opens the widget's inspector.
-            let left_entity = cx.entity();
+            // behind. Right-click opens the widget's inspector.
             let right_entity = cx.entity();
             let blocker_widget_id = widget.id;
             container = container.child(
@@ -219,12 +223,7 @@ impl DashboardPanel {
                     .size_full()
                     .on_mouse_down(
                         gpui::MouseButton::Left,
-                        move |event: &gpui::MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            left_entity.update(cx, |this, cx| {
-                                this.handle_canvas_mouse_down(event, window, cx);
-                            });
-                        },
+                        |_: &gpui::MouseDownEvent, _, cx| cx.stop_propagation(),
                     )
                     .on_mouse_down(
                         gpui::MouseButton::Right,

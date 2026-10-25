@@ -387,12 +387,11 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
             items.push(InspectionItem::SubMenu {
                 label: "New Panel".into(),
                 summary: SharedString::new_static(""),
-                build: Arc::new(move |_cx| {
+                build: Arc::new(move |_| {
                     crate::tiles::panels::new_panel_rows(
                         new_db.clone(),
                         pane.clone(),
                         new_open.clone(),
-                        _cx,
                     )
                 }),
             });
@@ -464,7 +463,7 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
         items.push(InspectionItem::SubMenu {
             label: "Theme".into(),
             summary: SharedString::new_static(""),
-            build: Arc::new(|_cx| theme_rows()),
+            build: Arc::new(theme_rows),
         });
 
         items.push(InspectionItem::SubMenu {
@@ -515,7 +514,7 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
 /// Read a preset file and apply it to `tiles`. Errors are logged and the
 /// layout is left untouched, so a bad file can't take the app down.
 fn read_and_load(path: &Path, tiles: &Entity<TileGroup>, cx: &mut App) {
-    match presets::load_preset(path) {
+    match std::fs::read_to_string(path) {
         Ok(json) => presets::load_into_tiles(&json, tiles, cx),
         Err(e) => tracing::error!(path = %path.display(), %e, "read preset failed"),
     }
@@ -555,13 +554,12 @@ fn register_preset_provider(cx: &mut App) {
 
 /// Rows for the **Theme** submenu: one per registered theme, applied on select.
 /// Shared by the command palette and the transient chord menu.
-pub(crate) fn theme_rows() -> Vec<Box<dyn InspectorRow>> {
-    crate::theme::all_themes()
-        .iter()
-        .map(|t| {
-            let theme = Arc::new((*t).clone());
+pub(crate) fn theme_rows(cx: &App) -> Vec<Box<dyn InspectorRow>> {
+    crate::theme::themes(cx)
+        .into_iter()
+        .map(|theme| {
             Box::new(CommandRow::new(
-                t.name,
+                theme.name.clone(),
                 Arc::new(move |_window, cx| {
                     crate::theme::set_theme(cx, theme.clone());
                 }),
@@ -749,6 +747,25 @@ mod live_tests {
             let row = &inspector.current_rows().unwrap()[indices[inspector.selected_index]];
             assert_eq!(row.identity(), selected);
             assert_eq!(row.label(), "Same renamed");
+        });
+    }
+
+    #[gpui::test]
+    fn consumer_theme_is_offered_after_the_builtins(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mission = crate::theme::Theme {
+                name: "Mission".into(),
+                ..crate::theme::DARK.clone()
+            };
+            crate::theme::install_themes(cx, vec![mission], None);
+            let labels: Vec<String> = theme_rows(cx)
+                .iter()
+                .map(|row| row.label().to_owned())
+                .collect();
+            let builtins = crate::theme::builtin_themes();
+            assert_eq!(labels.len(), builtins.len() + 1);
+            assert_eq!(labels[0], "Dark");
+            assert_eq!(labels.last().unwrap(), "Mission");
         });
     }
 }

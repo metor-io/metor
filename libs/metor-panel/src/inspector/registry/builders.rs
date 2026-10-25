@@ -8,16 +8,19 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use facet::Facet;
-use gpui::{AnyEntity, App, AppContext, Entity, SharedString};
+use gpui::{AnyEntity, App, SharedString};
 use metor_db::DB;
 use metor_proto::types::{ComponentId, PacketId};
 
 use crate::inspector::rows::{CommandRow, ExpressionRow, InspectorRow, NavRow, RowAction};
 use crate::plot_events::EventKindKey;
+use crate::views::list_plot::ListTrace;
+use crate::views::spectrogram::SpectrogramTrace;
 use crate::views::time_series::time_range::TimeRangeBehavior;
-use crate::views::time_series::{EventOverlay, LinePlot, Override};
+use crate::views::time_series::{EventOverlay, Override, Trace};
+use crate::views::xy_plot::XyTrace;
 
-use super::FieldBuildCtx;
+use super::{EntityList, FieldBuildCtx};
 
 /// First non-empty `SharedString` field of `value`, used as a list-item label
 /// when no explicit label attribute is present.
@@ -255,65 +258,31 @@ pub(super) fn build_option_row(
 /// traces to the parent plot. The color basis starts at the parent's
 /// existing trace count so palette colors continue contiguously.
 pub(super) fn build_trace_add_wizard(
-    parent: gpui::AnyEntity,
+    list: EntityList<Trace>,
     db: &Arc<DB>,
     _cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let parent_for_basis = parent.clone();
-    let color_basis: crate::inspector::trace_picker::ColorBasis = Arc::new(move |cx: &App| {
-        parent_for_basis
-            .clone()
-            .downcast::<LinePlot>()
-            .map(|p| p.read(cx).traces.len())
-            .unwrap_or(0)
-    });
-
-    let on_select: crate::inspector::trace_picker::OnTracesSelected =
-        Arc::new(move |traces, _w, cx| {
-            let parent: Entity<LinePlot> = parent.clone().downcast().expect("parent type mismatch");
-            let new_entities: Vec<_> = traces.into_iter().map(|t| cx.new(|_| t)).collect();
-            parent.update(cx, |lp, cx| {
-                lp.traces.extend(new_entities);
-                lp.configuration_changed(cx);
-            });
-        });
-
-    crate::inspector::trace_picker::select_traces_wizard_rows(db.clone(), color_basis, on_select)
+    let basis = list.clone();
+    crate::inspector::trace_picker::select_traces_wizard_rows(
+        db.clone(),
+        Arc::new(move |cx| basis.len(cx)),
+        Arc::new(move |traces, _w, cx| list.append(traces, cx)),
+    )
 }
 
 /// XY counterpart to [`build_trace_add_wizard`]. Drills through the
 /// two-step picker and appends the resulting trace to the parent
 /// `XyLinePlot`.
 pub(super) fn build_xy_trace_add_wizard(
-    parent: gpui::AnyEntity,
+    list: EntityList<XyTrace>,
     db: &Arc<DB>,
     _cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    use crate::views::xy_plot::XyLinePlot;
-    let parent_for_basis = parent.clone();
-    let color_basis: crate::inspector::trace_picker::ColorBasis = Arc::new(move |cx: &App| {
-        parent_for_basis
-            .clone()
-            .downcast::<XyLinePlot>()
-            .map(|p| p.read(cx).traces.len())
-            .unwrap_or(0)
-    });
-
-    let on_select: crate::views::xy_plot::trace_picker::OnXyTraceSelected =
-        Arc::new(move |trace, _w, cx| {
-            let parent: Entity<XyLinePlot> =
-                parent.clone().downcast().expect("parent type mismatch");
-            let new_entity = cx.new(|_| trace);
-            parent.update(cx, |lp, cx| {
-                lp.traces.push(new_entity);
-                cx.notify();
-            });
-        });
-
+    let basis = list.clone();
     crate::views::xy_plot::trace_picker::select_xy_trace_wizard_rows(
         db.clone(),
-        color_basis,
-        on_select,
+        Arc::new(move |cx| basis.len(cx)),
+        Arc::new(move |trace, _w, cx| list.append(vec![trace], cx)),
     )
 }
 
@@ -321,60 +290,28 @@ pub(super) fn build_xy_trace_add_wizard(
 /// the single-page picker and appends the resulting trace to the parent
 /// `ListLinePlot`.
 pub(super) fn build_list_trace_add_wizard(
-    parent: gpui::AnyEntity,
+    list: EntityList<ListTrace>,
     db: &Arc<DB>,
     _cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    use crate::views::list_plot::ListLinePlot;
-    let parent_for_basis = parent.clone();
-    let color_basis: crate::inspector::trace_picker::ColorBasis = Arc::new(move |cx: &App| {
-        parent_for_basis
-            .clone()
-            .downcast::<ListLinePlot>()
-            .map(|p| p.read(cx).traces.len())
-            .unwrap_or(0)
-    });
-
-    let on_select: crate::views::list_plot::trace_picker::OnListTraceSelected =
-        Arc::new(move |trace, _w, cx| {
-            let parent: Entity<ListLinePlot> =
-                parent.clone().downcast().expect("parent type mismatch");
-            let new_entity = cx.new(|_| trace);
-            parent.update(cx, |lp, cx| {
-                lp.traces.push(new_entity);
-                cx.notify();
-            });
-        });
-
+    let basis = list.clone();
     crate::views::list_plot::trace_picker::select_list_trace_wizard_rows(
         db.clone(),
-        color_basis,
-        on_select,
+        Arc::new(move |cx| basis.len(cx)),
+        Arc::new(move |trace, _w, cx| list.append(vec![trace], cx)),
     )
 }
 
 /// Spectrogram counterpart to [`build_list_trace_add_wizard`]. There is no
 /// colour basis to carry: a spectrogram source is coloured by its colormap.
 pub(super) fn build_spectrogram_trace_add_wizard(
-    parent: gpui::AnyEntity,
+    list: EntityList<SpectrogramTrace>,
     db: &Arc<DB>,
     _cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    use crate::views::spectrogram::SpectrogramPlot;
-    let on_select: crate::views::spectrogram::trace_picker::OnSpectrogramTraceSelected =
-        Arc::new(move |trace, _w, cx| {
-            let parent: Entity<SpectrogramPlot> =
-                parent.clone().downcast().expect("parent type mismatch");
-            let new_entity = cx.new(|_| trace);
-            parent.update(cx, |plot, cx| {
-                plot.traces.push(new_entity);
-                cx.notify();
-            });
-        });
-
     crate::views::spectrogram::trace_picker::select_spectrogram_trace_wizard_rows(
         db.clone(),
-        on_select,
+        Arc::new(move |trace, _w, cx| list.append(vec![trace], cx)),
     )
 }
 
@@ -382,20 +319,12 @@ pub(super) fn build_spectrogram_trace_add_wizard(
 /// list. Lists the built-in kinds not yet on the plot, then the recorded
 /// message channels the built-ins don't claim (and that aren't already added).
 pub(super) fn build_event_overlay_wizard(
-    parent: gpui::AnyEntity,
+    list: EntityList<EventOverlay>,
     db: &Arc<DB>,
     cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let Ok(plot) = parent.clone().downcast::<LinePlot>() else {
-        return Vec::new();
-    };
     // Keys already on the plot, hidden or not, so a kind isn't offered twice.
-    let existing: HashSet<EventKindKey> = plot
-        .read(cx)
-        .event_overlays
-        .iter()
-        .map(|o| o.read(cx).key)
-        .collect();
+    let existing: HashSet<EventKindKey> = list.items(cx).iter().map(|o| o.read(cx).key).collect();
 
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
@@ -406,7 +335,7 @@ pub(super) fn build_event_overlay_wizard(
             if existing.contains(&key) {
                 continue;
             }
-            rows.push(overlay_command_row(parent.clone(), source.name(cx), key));
+            rows.push(overlay_command_row(list.clone(), source.name(cx), key));
         }
     }
 
@@ -432,7 +361,7 @@ pub(super) fn build_event_overlay_wizard(
     msgs.sort_by(|a, b| a.1.cmp(&b.1));
     for (id, label) in msgs {
         rows.push(overlay_command_row(
-            parent.clone(),
+            list.clone(),
             label,
             EventKindKey::Msg(id),
         ));
@@ -443,21 +372,12 @@ pub(super) fn build_event_overlay_wizard(
 
 /// One picker row that appends an [`EventOverlay`] for `key` to the plot.
 fn overlay_command_row(
-    parent: AnyEntity,
+    list: EntityList<EventOverlay>,
     label: SharedString,
     key: EventKindKey,
 ) -> Box<dyn InspectorRow> {
     Box::new(CommandRow::new(
         label.clone(),
-        Arc::new(move |_w, cx| {
-            let Ok(plot) = parent.clone().downcast::<LinePlot>() else {
-                return;
-            };
-            let overlay = cx.new(|_| EventOverlay::new(label.clone(), key));
-            plot.update(cx, |lp, cx| {
-                lp.event_overlays.push(overlay);
-                cx.notify();
-            });
-        }),
+        Arc::new(move |_w, cx| list.append(vec![EventOverlay::new(label.clone(), key)], cx)),
     ))
 }

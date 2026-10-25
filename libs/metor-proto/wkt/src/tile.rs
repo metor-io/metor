@@ -87,6 +87,11 @@ pub struct TilePane {
     pub hide_tab_bar: bool,
     #[serde(default)]
     pub locked_size: Option<(f32, f32)>,
+    /// Width of a vertical tab rail the user dragged away from the default.
+    /// Absent keeps the panel's default, so documents that never resized a
+    /// rail stay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_rail_width: Option<f32>,
     pub items: Vec<TileItem>,
 }
 

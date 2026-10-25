@@ -23,16 +23,14 @@ pub mod palette;
 pub mod plot_preview;
 pub mod reflect;
 pub mod registry;
-pub mod row_list;
 pub mod rows;
 pub mod trace_picker;
 
 use crate::motion::{self, Fade};
 use crate::theme::theme;
 use rows::text_field::TextAlign;
-use rows::{InspectorRow, PreviewSpec, RowAction, TextField, tag_pill};
+use rows::{InspectorRow, PreviewSpec, ROW_HEIGHT, RowAction, TextField, tag_pill};
 
-const ROW_HEIGHT: f32 = 28.0;
 /// Horizontal padding inside a row, both sides together.
 const ROW_PADDING: Pixels = px(24.0);
 /// What a row needs beyond its label: padding, and room for a chevron or a
@@ -115,6 +113,12 @@ enum InspectorPageKind {
 struct InspectorPage {
     kind: InspectorPageKind,
     label: Option<SharedString>,
+    /// The query and selection this page had when a deeper page was pushed
+    /// over it. Popping back restores them, so drilling into one search
+    /// result and returning lands on the same results — picking several
+    /// similarly named components shouldn't mean retyping the filter each
+    /// time.
+    resume: Option<(String, usize)>,
 }
 
 /// Row-list panel with page-stack navigation, fuzzy search, and inline
@@ -165,6 +169,7 @@ impl Inspector {
             InspectorPage {
                 kind: InspectorPageKind::Rows(rows),
                 label: None,
+                resume: None,
             },
             mode,
             cx,
@@ -185,6 +190,7 @@ impl Inspector {
                     size: spec.size,
                 },
                 label: Some(spec.label),
+                resume: None,
             },
             mode,
             cx,
@@ -282,9 +288,7 @@ impl Inspector {
         let can_fade = self.dismiss_on_outside_click
             && !matches!(self.mode, InspectorMode::Inline)
             && self.accessory.is_none()
-            && self
-                .current_rows()
-                .is_some_and(|rows| rows.iter().all(|row| row.supports_exit_fade()));
+            && self.current_rows().is_some();
         if !can_fade || !motion::enabled(cx) {
             self.fade.finish();
         }
@@ -306,14 +310,16 @@ impl Inspector {
         cx: &mut Context<Self>,
     ) {
         // The outgoing page's label becomes a breadcrumb pill above the search box.
-        if let Some(current) = self.pages.last_mut()
-            && current.label.is_none()
-        {
-            current.label = outgoing_label;
+        if let Some(current) = self.pages.last_mut() {
+            if current.label.is_none() {
+                current.label = outgoing_label;
+            }
+            current.resume = Some((self.search.text.clone(), self.selected_index));
         }
         self.pages.push(InspectorPage {
             kind,
             label: incoming_label,
+            resume: None,
         });
         self.search.clear();
         self.query_rows = None;
@@ -325,13 +331,28 @@ impl Inspector {
     fn pop_page(&mut self, cx: &mut Context<Self>) -> bool {
         if self.pages.len() > 1 {
             self.pages.pop();
-            if let Some(current) = self.pages.last_mut() {
+            let resume = self.pages.last_mut().and_then(|current| {
                 current.label = None;
-            }
+                current.resume.take()
+            });
             self.search.clear();
             self.query_rows = None;
             self.seed_query(cx);
             self.selected_index = self.first_selectable_index();
+            if let Some((query, selected)) = resume
+                && !query.is_empty()
+            {
+                self.search.set_text(query);
+                self.search.cursor = self.search.text.len();
+                self.search.mark = self.search.cursor;
+                self.refresh_query_rows(cx);
+                let visible = self.filtered_indices().len();
+                self.selected_index = if selected < visible {
+                    selected
+                } else {
+                    self.first_selectable_index()
+                };
+            }
             cx.notify();
             true
         } else {
@@ -445,6 +466,30 @@ impl Inspector {
     /// Whether the row at visible position `vis_ix` is a non-selectable
     /// section header. `filtered` is passed in so callers that already hold
     /// the index list don't recompute it.
+    /// Move the keyboard selection one selectable row down (or up), skipping
+    /// headers, and scroll it into view from the direction of travel.
+    fn step_selection(&mut self, down: bool) {
+        let filtered = self.filtered_indices();
+        let mut i = self.selected_index;
+        loop {
+            i = match (down, i) {
+                (true, i) if i + 1 < filtered.len() => i + 1,
+                (false, i) if i > 0 => i - 1,
+                _ => return,
+            };
+            if !self.is_header_at(&filtered, i) {
+                self.selected_index = i;
+                let strategy = if down {
+                    ScrollStrategy::Bottom
+                } else {
+                    ScrollStrategy::Top
+                };
+                self.scroll_handle.scroll_to_item(i, strategy);
+                return;
+            }
+        }
+    }
+
     fn is_header_at(&self, filtered: &[usize], vis_ix: usize) -> bool {
         let Some(rows) = self.current_rows() else {
             return false;
@@ -674,32 +719,8 @@ impl Inspector {
                     return;
                 }
             }
-            "up" => {
-                let filtered = self.filtered_indices();
-                let mut i = self.selected_index;
-                while i > 0 {
-                    i -= 1;
-                    if !self.is_header_at(&filtered, i) {
-                        self.selected_index = i;
-                        self.scroll_handle.scroll_to_item(i, ScrollStrategy::Top);
-                        break;
-                    }
-                }
-                cx.notify();
-                return;
-            }
-            "down" => {
-                let filtered = self.filtered_indices();
-                let total = filtered.len();
-                let mut i = self.selected_index;
-                while i + 1 < total {
-                    i += 1;
-                    if !self.is_header_at(&filtered, i) {
-                        self.selected_index = i;
-                        self.scroll_handle.scroll_to_item(i, ScrollStrategy::Bottom);
-                        break;
-                    }
-                }
+            "up" | "down" => {
+                self.step_selection(key == "down");
                 cx.notify();
                 return;
             }
@@ -792,7 +813,7 @@ impl Inspector {
                         } else {
                             crate::icons::Icon::ChevronDown
                         }
-                        .svg_color(12.0, theme.text_secondary),
+                        .svg(12.0, theme.text_secondary),
                     )
                     .tooltip(|_, cx| {
                         crate::views::TooltipText::build(

@@ -30,14 +30,13 @@ use gpui::{
     canvas, div, point, prelude::*, px,
 };
 use metor_db::DB;
-use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use super::binding::{
-    self, ElementRef, component_meta, spawn_elements_stream, spawn_meta_resolver,
+    ElementRef, LiveBinding, component_meta, spawn_elements_stream, spawn_meta_resolver,
 };
-use crate::theme::{Theme, theme};
+use crate::theme::{Theme, theme, ui_px, ui_scale};
 
 /// Pitch angle that moves the horizon by a full ball radius.
 const PITCH_FULL_SCALE: f32 = std::f32::consts::FRAC_PI_2;
@@ -90,38 +89,22 @@ pub struct VectorMarker {
     pub source: crate::data_binding::Binding,
     pub label: SharedString,
     pub color: Option<Hsla>,
-    /// Fallback name for a component nothing has registered.
-    #[facet(skip)]
-    component: SharedString,
-    /// What `_task` is streaming, compared against `component_id` each frame.
+    /// Latest sample, unnormalized.
     #[facet(opaque)]
-    bound: Option<ComponentId>,
-    /// Latest sample, unnormalized; `None` until the component produces one.
-    #[facet(skip)]
-    value: Option<[f32; 3]>,
-    #[facet(opaque)]
-    db: Arc<DB>,
-    #[facet(opaque)]
-    _binding_changes: gpui::Task<()>,
-    #[facet(opaque)]
-    _task: gpui::Task<()>,
+    live: LiveBinding<[f32; 3]>,
 }
 
 impl VectorMarker {
     fn from_config(cfg: &VectorMarkerConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
-        let component_id = source.id();
-        let task = spawn_marker_stream(&db, component_id, cx);
+        let at = ElementRef::new(source.id(), 0);
+        let mut live = LiveBinding::new(at, db, cx);
+        stream_marker(&mut live, at, cx);
         Self {
             source,
             label: SharedString::from(cfg.label.clone()),
             color: cfg.color,
-            component: SharedString::from(cfg.component.clone()),
-            bound: Some(component_id),
-            value: None,
-            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
-            db,
-            _task: task,
+            live,
         }
     }
 
@@ -129,7 +112,7 @@ impl VectorMarker {
         VectorMarkerConfig {
             // An expression's component is named by a content hash, so what
             // round-trips is the text that made it.
-            component: self.source.text(&self.db),
+            component: self.source.text(&self.live.db),
             label: self.label.to_string(),
             color: self.color,
         }
@@ -139,15 +122,9 @@ impl VectorMarker {
     /// Driven from the ball's render, since a marker is data rather than a
     /// view and never gets a render pass of its own.
     pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
-        self.source.resolve(&self.db, cx);
-        if self.bound == Some(self.source.id()) {
-            return;
+        if let Some((at, _)) = self.live.moved(&mut self.source, 0, cx) {
+            stream_marker(&mut self.live, at, cx);
         }
-        self.bound = Some(self.source.id());
-
-        self.component = component_meta(&self.db, self.source.id()).name;
-        self.value = None;
-        self._task = spawn_marker_stream(&self.db, self.source.id(), cx);
     }
 
     /// An empty marker, as the inspector's "add" affordance creates it. It
@@ -158,25 +135,17 @@ impl VectorMarker {
             source: crate::data_binding::Binding::default(),
             label: SharedString::new_static(""),
             color: None,
-            component: SharedString::new_static(""),
-            bound: Some(ComponentId(0)),
-            value: None,
-            _binding_changes: gpui::Task::ready(()),
-            db,
-            _task: gpui::Task::ready(()),
+            live: LiveBinding::idle(db),
         }
     }
 }
 
-fn spawn_marker_stream(
-    db: &Arc<DB>,
-    component: ComponentId,
-    cx: &mut Context<VectorMarker>,
-) -> gpui::Task<()> {
-    spawn_elements_stream(db.clone(), component, 3, cx, |marker, v, cx| {
-        marker.value = v.map(|v| [v[0] as f32, v[1] as f32, v[2] as f32]);
+fn stream_marker(live: &mut LiveBinding<[f32; 3]>, at: ElementRef, cx: &mut Context<VectorMarker>) {
+    let stream = spawn_elements_stream(live.db.clone(), at.component, 3, cx, |marker, v, cx| {
+        marker.live.value = v.map(|v| [v[0] as f32, v[1] as f32, v[2] as f32]);
         cx.notify();
-    })
+    });
+    live.restream(stream, gpui::Task::ready(()));
 }
 
 /// Quaternion-bound attitude ball.
@@ -189,43 +158,16 @@ pub struct AttitudeIndicator {
     pub label: SharedString,
     pub show_readout: bool,
     pub vectors: Vec<Entity<VectorMarker>>,
-    /// Fallback name for a component nothing has registered.
-    #[facet(skip)]
-    component: SharedString,
-    /// What `_task` is streaming, compared against the editable fields.
-    #[facet(opaque)]
-    bound: Option<ElementRef>,
     /// Latest attitude as `[x, y, z, w]`.
-    #[facet(skip)]
-    quat: Option<[f32; 4]>,
     #[facet(opaque)]
-    db: Arc<DB>,
-    #[facet(opaque)]
-    _binding_changes: gpui::Task<()>,
-    #[facet(opaque)]
-    _task: gpui::Task<()>,
-    #[facet(opaque)]
-    _resolver_task: gpui::Task<()>,
+    live: LiveBinding<[f32; 4]>,
 }
 
 impl AttitudeIndicator {
     pub fn from_config(cfg: &AttitudeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
-        let component_id = source.id();
-        let meta = component_meta(&db, component_id);
-        let offset = cfg.element_offset;
-
-        let task = spawn_quat_stream(&db, component_id, offset, cx);
-
-        let keep_label = cfg.label.is_some();
-        let resolver_task =
-            spawn_meta_resolver(db.clone(), component_id, cx, move |view, meta, cx| {
-                if !keep_label {
-                    view.label = meta.name;
-                }
-                cx.notify();
-            });
-
+        let at = ElementRef::new(source.id(), cfg.element_offset);
+        let meta = component_meta(&db, at.component);
         let vectors = cfg
             .vectors
             .iter()
@@ -235,6 +177,8 @@ impl AttitudeIndicator {
                 cx.new(|cx| VectorMarker::from_config(&v, db, cx))
             })
             .collect();
+        let mut live = LiveBinding::new(at, db, cx);
+        stream_quat(&mut live, at, cfg.label.is_some(), cx);
 
         Self {
             label: cfg
@@ -244,47 +188,27 @@ impl AttitudeIndicator {
                 .unwrap_or(meta.name),
             show_readout: !cfg.hide_readout,
             vectors,
-            component: SharedString::from(cfg.component.clone()),
             source,
-            element_offset: offset,
-            bound: Some(ElementRef::new(component_id, offset)),
-            quat: None,
-            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
-            db,
-            _task: task,
-            _resolver_task: resolver_task,
+            element_offset: cfg.element_offset,
+            live,
         }
     }
 
     /// Restart the quaternion stream when the inspector has re-pointed the
     /// ball, and let each marker do the same for itself.
     pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
-        self.source.resolve(&self.db, cx);
         for marker in self.vectors.clone() {
             marker.update(cx, |m, cx| m.rebind(cx));
         }
-
-        let want = ElementRef::new(self.source.id(), self.element_offset);
-        if !binding::rebound(want, &mut self.bound) {
-            return;
+        if let Some((at, meta)) = self.live.moved(&mut self.source, self.element_offset, cx) {
+            self.label = meta.name;
+            stream_quat(&mut self.live, at, false, cx);
         }
-
-        let offset = want.element;
-        let meta = component_meta(&self.db, want.component);
-        self.label = meta.name.clone();
-        self.component = meta.name;
-        self.quat = None;
-        self._task = spawn_quat_stream(&self.db, want.component, offset, cx);
-        self._resolver_task =
-            spawn_meta_resolver(self.db.clone(), want.component, cx, |view, meta, cx| {
-                view.label = meta.name;
-                cx.notify();
-            });
     }
 
     pub fn to_config(&self, cx: &gpui::App) -> AttitudeConfig {
         AttitudeConfig {
-            component: self.source.text(&self.db),
+            component: self.source.text(&self.live.db),
             element_offset: self.element_offset,
             label: Some(self.label.to_string()),
             vectors: self
@@ -295,29 +219,41 @@ impl AttitudeIndicator {
             hide_readout: !self.show_readout,
         }
     }
-
-    pub fn component(&self) -> &SharedString {
-        &self.component
-    }
 }
 
-fn spawn_quat_stream(
-    db: &Arc<DB>,
-    component: ComponentId,
-    offset: usize,
+/// Stream the quaternion at `at`; unless kept, the label follows the
+/// component's name once it registers.
+fn stream_quat(
+    live: &mut LiveBinding<[f32; 4]>,
+    at: ElementRef,
+    keep_label: bool,
     cx: &mut Context<AttitudeIndicator>,
-) -> gpui::Task<()> {
-    spawn_elements_stream(db.clone(), component, offset + 4, cx, move |view, v, cx| {
-        view.quat = v.map(|v| {
-            [
-                v[offset] as f32,
-                v[offset + 1] as f32,
-                v[offset + 2] as f32,
-                v[offset + 3] as f32,
-            ]
-        });
+) {
+    let offset = at.element;
+    let stream = spawn_elements_stream(
+        live.db.clone(),
+        at.component,
+        offset + 4,
+        cx,
+        move |view, v, cx| {
+            view.live.value = v.map(|v| {
+                [
+                    v[offset] as f32,
+                    v[offset + 1] as f32,
+                    v[offset + 2] as f32,
+                    v[offset + 3] as f32,
+                ]
+            });
+            cx.notify();
+        },
+    );
+    let resolver = spawn_meta_resolver(live.db.clone(), at.component, cx, move |view, meta, cx| {
+        if !keep_label {
+            view.label = meta.name;
+        }
         cx.notify();
-    })
+    });
+    live.restream(stream, resolver);
 }
 
 /// Roll, pitch and yaw in radians from a `[x, y, z, w]` body←reference
@@ -463,8 +399,8 @@ impl Render for AttitudeIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.rebind(cx);
         let theme = theme(cx);
-        let (roll, pitch, yaw) = self.quat.map(euler_zyx).unwrap_or((0.0, 0.0, 0.0));
-        let has_fix = self.quat.is_some();
+        let (roll, pitch, yaw) = self.live.value.map(euler_zyx).unwrap_or((0.0, 0.0, 0.0));
+        let has_fix = self.live.value.is_some();
 
         // Full-strength hues: the paint pass dims them for the fills and
         // keeps them solid for the borders.
@@ -482,7 +418,7 @@ impl Render for AttitudeIndicator {
             .filter_map(|(i, e)| {
                 let m = e.read(cx);
                 Some(Marker {
-                    value: m.value?,
+                    value: m.live.value?,
                     color: m.color.unwrap_or(palette[i % palette.len()]),
                     label: m.label.clone(),
                 })
@@ -510,6 +446,7 @@ impl Render for AttitudeIndicator {
                     bounds.origin.x + bounds.size.width / 2.0,
                     bounds.origin.y + bounds.size.height / 2.0,
                 );
+                let scale = ui_scale(window);
 
                 // Unfixed shows a neutral disc: a level ball would read as a
                 // valid attitude when there is none.
@@ -576,17 +513,15 @@ impl Render for AttitudeIndicator {
                     // Markers sit in the body frame, so they do not rotate
                     // with the ball.
                     let p = place(center, offset, 0.0);
-                    let dot = Bounds::new(
-                        point(p.x - px(MARKER_PX), p.y - px(MARKER_PX)),
-                        gpui::size(px(MARKER_PX * 2.0), px(MARKER_PX * 2.0)),
-                    );
+                    let r = px(MARKER_PX * scale);
+                    let dot = Bounds::new(point(p.x - r, p.y - r), gpui::size(r * 2.0, r * 2.0));
                     if ahead {
                         let mut quad = gpui::fill(dot, color);
-                        quad.corner_radii = gpui::Corners::all(px(MARKER_PX));
+                        quad.corner_radii = gpui::Corners::all(r);
                         window.paint_quad(quad);
                     } else {
                         let mut quad = gpui::fill(dot, gpui::transparent_black());
-                        quad.corner_radii = gpui::Corners::all(px(MARKER_PX));
+                        quad.corner_radii = gpui::Corners::all(r);
                         quad.border_widths = gpui::Edges::all(px(1.5));
                         quad.border_color = color;
                         window.paint_quad(quad);
@@ -602,7 +537,7 @@ impl Render for AttitudeIndicator {
                         place(center, (-wing, 0.0), 0.0),
                         place(center, (-wing * 0.35, 0.0), 0.0),
                     ],
-                    px(2.0),
+                    px(2.0 * scale),
                     reticle,
                     window,
                 );
@@ -611,7 +546,7 @@ impl Render for AttitudeIndicator {
                         place(center, (wing * 0.35, 0.0), 0.0),
                         place(center, (wing, 0.0), 0.0),
                     ],
-                    px(2.0),
+                    px(2.0 * scale),
                     reticle,
                     window,
                 );
@@ -623,15 +558,15 @@ impl Render for AttitudeIndicator {
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(3.0))
-            .p(px(6.0));
+            .gap(ui_px(3.0))
+            .p(ui_px(6.0));
 
         if !self.label.is_empty() {
             tile = tile.child(
                 div()
                     .w_full()
                     .truncate()
-                    .text_size(px(10.0))
+                    .text_size(ui_px(10.0))
                     .text_color(theme.text_secondary)
                     .child(self.label.clone()),
             );
@@ -652,7 +587,7 @@ impl Render for AttitudeIndicator {
             };
             tile = tile.child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(ui_px(10.0))
                     .text_color(theme.text_primary)
                     .child(SharedString::from(text)),
             );
@@ -665,16 +600,16 @@ impl Render for AttitudeIndicator {
                 .flex_row()
                 .flex_wrap()
                 .justify_center()
-                .gap(px(6.0))
-                .text_size(px(9.0));
+                .gap(ui_px(6.0))
+                .text_size(ui_px(9.0));
             for (color, label) in legend {
                 row = row.child(
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(3.0))
-                        .child(div().w(px(6.0)).h(px(6.0)).rounded(px(3.0)).bg(color))
+                        .gap(ui_px(3.0))
+                        .child(div().w(ui_px(6.0)).h(ui_px(6.0)).rounded(px(3.0)).bg(color))
                         .child(div().text_color(theme.text_tertiary).child(label)),
                 );
             }

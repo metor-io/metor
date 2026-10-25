@@ -4,7 +4,7 @@
 //! owner can never be committed independently. Clones share computation, not
 //! editable state. Component ids are a resolved DB address, not saved syntax.
 
-use crate::dynamic::expressions::{self, Expression};
+use crate::dynamic::expressions::{self, Expression, SIGIL};
 use gpui::App;
 use metor_db::DB;
 use metor_proto::types::ComponentId;
@@ -57,7 +57,7 @@ impl Binding {
     pub fn from_expression(expression: Expression, text: String) -> Self {
         Self {
             id: expression.component_id(),
-            spec: BindingSpec::Expression(format!("={}", expressions::body(&text))),
+            spec: BindingSpec::Expression(format!("{SIGIL}{}", expressions::body(&text))),
             expression: Some(expression),
             error: None,
             attempted_generation: None,
@@ -67,11 +67,12 @@ impl Binding {
     pub fn id(&self) -> ComponentId {
         self.id
     }
-    pub fn spec(&self) -> &BindingSpec {
-        &self.spec
-    }
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+    /// Why this binding shows nothing new: the expression failed to start,
+    /// or it started and has since faulted.
+    pub fn error(&self) -> Option<String> {
+        self.error
+            .clone()
+            .or_else(|| self.expression.as_ref()?.fault())
     }
     pub fn is_unbound(&self) -> bool {
         matches!(self.spec, BindingSpec::Unbound)
@@ -394,18 +395,7 @@ pub(crate) fn watch_history<E: 'static>(
                 .iter()
                 .map(|c| Box::pin(c.time_series.wait()))
                 .collect();
-            std::future::poll_fn(|cx| {
-                use std::future::Future;
-                if waits
-                    .iter_mut()
-                    .any(|wait| wait.as_mut().poll(cx).is_ready())
-                {
-                    std::task::Poll::Ready(())
-                } else {
-                    std::task::Poll::Pending
-                }
-            })
-            .await;
+            crate::first_ready(&mut waits).await;
             if this.update(cx, |_, cx| cx.notify()).is_err() {
                 break;
             }
