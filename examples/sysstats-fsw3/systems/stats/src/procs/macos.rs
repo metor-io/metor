@@ -1,6 +1,8 @@
 //! Processes from `proc_listallpids`, `proc_pidinfo`, and `proc_pid_rusage`.
 //! Without root, only this user's processes can be read.
 
+use metor_fsw_3::FrameStr;
+
 use super::ProcStats;
 use crate::sample::{Result, SampleError};
 
@@ -66,6 +68,7 @@ impl Source {
             read_bytes,
             write_bytes,
             cpu_util: 0.0,
+            name: name(pid),
         })
     }
 }
@@ -86,4 +89,12 @@ fn disk_io(pid: libc::pid_t) -> Option<(u64, u64)> {
     // SAFETY: `info` is a `rusage_info_v2`, which the flavor fills.
     let code = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V2, (&raw mut info).cast()) };
     (code == 0).then_some((info.ri_diskio_bytesread, info.ri_diskio_byteswritten))
+}
+
+fn name(pid: libc::pid_t) -> FrameStr<16> {
+    let mut buf = [0u8; 64];
+    // SAFETY: `buf` holds `buf.len()` writable bytes.
+    let len = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let len = usize::try_from(len).unwrap_or(0).min(buf.len());
+    FrameStr::truncated(core::str::from_utf8(&buf[..len]).unwrap_or(""))
 }

@@ -11,7 +11,7 @@ mod os;
 pub mod proc_pid;
 
 use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
-use metor_fsw_3::{Frame, FrameMap, JsonSchema, Output, Stop, Timestamp, system};
+use metor_fsw_3::{Frame, FrameMap, FrameStr, JsonSchema, Output, Stop, Timestamp, system};
 use serde::Deserialize;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -30,7 +30,6 @@ use crate::sample::{Health, Interval, Pace};
     Clone,
     Copy,
     Debug,
-    Default,
     PartialEq,
 )]
 #[repr(C)]
@@ -44,6 +43,24 @@ pub struct ProcStats {
     pub write_bytes: u64,
     /// CPU time over wall time since the previous sample; 1.0 is one core.
     pub cpu_util: f64,
+    /// The command name, cut to 15 bytes.
+    pub name: FrameStr<16>,
+}
+
+impl Default for ProcStats {
+    fn default() -> Self {
+        Self {
+            cpu_ns: 0,
+            user_ns: 0,
+            system_ns: 0,
+            rss_bytes: 0,
+            threads: 0,
+            read_bytes: 0,
+            write_bytes: 0,
+            cpu_util: 0.0,
+            name: FrameStr::truncated(""),
+        }
+    }
 }
 
 /// The busiest processes by CPU since the previous sample.

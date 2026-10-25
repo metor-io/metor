@@ -1,5 +1,7 @@
 //! Parses Linux's `/proc/<pid>/stat` and `/proc/<pid>/io`.
 
+use metor_fsw_3::FrameStr;
+
 use super::ProcStats;
 use crate::sample::{Result, SampleError, next_u64};
 
@@ -15,7 +17,8 @@ pub struct Units {
 /// Reads CPU time, threads, and RSS. The command name is skipped by its
 /// last `)`, since it may hold spaces and parentheses.
 pub fn parse_stat(text: &str, units: Units) -> Result<ProcStats> {
-    let (_, rest) = text.rsplit_once(')').ok_or(SampleError::Parse(STAT))?;
+    let (head, rest) = text.rsplit_once(')').ok_or(SampleError::Parse(STAT))?;
+    let (_, name) = head.split_once('(').ok_or(SampleError::Parse(STAT))?;
     // Fields from 3 (`state`) on; utime is field 14.
     let mut fields = rest.split_ascii_whitespace().skip(11);
     let utime = next_u64(&mut fields, STAT)?;
@@ -35,6 +38,7 @@ pub fn parse_stat(text: &str, units: Units) -> Result<ProcStats> {
         system_ns,
         rss_bytes: rss_pages.max(0) as u64 * units.page_bytes,
         threads,
+        name: FrameStr::truncated(name),
         ..ProcStats::default()
     })
 }
@@ -77,12 +81,14 @@ mod tests {
         assert_eq!(stats.cpu_ns, 3_250_000_000);
         assert_eq!(stats.threads, 3);
         assert_eq!(stats.rss_bytes, 812 * 4096);
+        assert_eq!(stats.name, FrameStr::truncated("tmux: server (1"));
     }
 
     #[test]
     fn test_parse_stat_malformed() {
         assert!(parse_stat("", UNITS).is_err());
         assert!(parse_stat("1 (init S 1 2 3", UNITS).is_err());
+        assert!(parse_stat("1 init) S 1 1 1 0 -1 0 0 0 0 0 250 75 0 0 20 0 3 0 1 2 3", UNITS).is_err());
         assert!(parse_stat("1 (init) S 1 1 1 0 -1 0 0 0 0 0 x 75", UNITS).is_err());
         assert!(parse_stat("1 (init) S 1 1 1 0 -1 0 0 0 0 0 250 75", UNITS).is_err());
     }
