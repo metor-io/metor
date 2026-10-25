@@ -9834,10 +9834,14 @@ version = "0.14.2"
 dependencies = [
  "crc32fast",
  "libm",
+ "metor-star",
+ "naga 30.0.1",
  "nalgebra",
  "nox",
+ "pollster 0.4.0",
  "rand 0.9.5",
  "rand_distr 0.5.1",
+ "wgpu 30.0.1",
  "zerocopy",
 ]
 
@@ -14006,13 +14010,9 @@ dependencies = [
  "futures-lite",
  "metor-fsw-3",
  "metor-star",
- "naga 30.0.1",
  "nox",
- "pollster 0.4.0",
  "schemars 1.2.1",
  "serde",
- "wgpu 30.0.1",
- "zerocopy",
 ]
 
 [[package]]

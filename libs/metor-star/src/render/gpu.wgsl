@@ -1,6 +1,6 @@
 // The star-field kernels: `splat` adds each star sub-step's pixel-integrated
 // PSF into a fixed-point accumulator, and `expose` reads it out through shot
-// noise, read noise and the ADC. Both mirror `metor_star::render`.
+// noise, read noise and the ADC.
 
 struct Params {
     width: u32,

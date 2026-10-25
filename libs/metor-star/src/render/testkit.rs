@@ -66,52 +66,23 @@ pub fn cat_bytes(stars: &[(V3, f32, u32)]) -> Vec<u8> {
 /// The committed G ≤ 8 render catalog.
 pub static STARCAT_G8: &[u8] = include_bytes!("../../data/starcat-g8.bin");
 
-/// The star simulator's default camera: 16 mm, 5.5 µm, 1024², no
-/// distortion, mounted along the body axes.
+/// The star simulator's camera.
 pub fn sim_camera() -> crate::camera::Camera {
-    crate::camera::Camera {
-        intr: crate::camera::Intrinsics {
-            f_m: 16e-3,
-            pitch_m: 5.5e-6,
-            cx: 512.0,
-            cy: 512.0,
-            k1: 0.0,
-            k2: 0.0,
-            p1: 0.0,
-            p2: 0.0,
-            width: 1024,
-            height: 1024,
-        },
-        q_b_st: crate::geom::Quat::IDENTITY,
-    }
+    super::SIM_CAMERA
 }
 
-/// A CPU renderer of `cat` with the star simulator's default optics, sensor
-/// (12 bit) and hot pixels.
-pub fn sim_renderer(cat: crate::starcat::StarCat<'_>) -> super::Renderer<'_> {
-    let phot = super::Photometry {
-        flux0_ph_s_m2: super::photometry::V0_PH_S_M2,
-        aperture_m2: core::f32::consts::PI * 0.0125 * 0.0125,
-        throughput: 0.5,
-        colour: super::photometry::G_TO_V,
-    };
-    let sensor = super::Sensor {
-        psf_sigma_px: 1.0,
-        full_well_e: 20_000.0,
-        read_noise_e: 5.0,
-        dark_e_s: 10.0,
-        dark_t0_c: 20.0,
-        temp_c: 20.0,
-        gain_milli: 5_000,
-        bias_dn: 100.0,
-        zodi_mag_arcsec2: Some(22.5),
-    };
-    let shape = super::Shape {
-        width: 1024,
-        height: 1024,
-        bits: 12,
-    };
-    let hot = super::HotPixels::new(shape.pixels(), 1e-4, 50.0, 13);
+/// A scene of `cat` with the star simulator's optics, sensor and hot pixels.
+pub fn sim_scene(cat: crate::starcat::StarCat<'_>) -> super::Scene<'_> {
+    let hot = super::HotPixels::new(super::SIM_SHAPE.pixels(), 1e-4, 50.0, 13);
+    let (phot, sensor) = (super::SIM_PHOTOMETRY, super::SIM_SENSOR);
     // PANIC Safety: these fixed settings are valid.
-    super::Renderer::new(cat, sim_camera(), phot, sensor, shape, hot, 12.0).expect("valid settings")
+    super::Scene::new(cat, sim_camera(), phot, sensor, super::SIM_SHAPE, hot, 12.0)
+        .expect("valid settings")
+}
+
+/// [`sim_scene`] on the GPU.
+#[cfg(feature = "gpu")]
+pub fn sim_renderer(cat: crate::starcat::StarCat<'_>) -> super::gpu::GpuRenderer<'_> {
+    // PANIC Safety: tests run where a GPU is.
+    super::gpu::GpuRenderer::new(sim_scene(cat)).expect("a GPU")
 }

@@ -1,28 +1,23 @@
-//! The wgpu star-field renderer.
+//! The wgpu renderer: the PSF splat of each [`Splat`] into a fixed-point
+//! accumulator (1/256 e⁻ per count, saturating at `u32::MAX`), then shot
+//! noise, read noise and the ADC, from a stateless per-pixel hash.
 //!
-//! The CPU [`Renderer`] prepares each frame: it selects the stars, projects
-//! them in `f64` at every motion-blur sub-step and lists the truth. The GPU
-//! takes those splats, a few thousand per frame, and does the per-pixel work:
-//! the PSF splat into a fixed-point accumulator, then shot noise, read noise
-//! and the ADC. Projecting on the CPU keeps the splat inputs bit-identical to
-//! the CPU oracle's, which `f32`-only WGSL could not.
-//!
-//! Every buffer is made in [`GpuRenderer::new`]. The splat buffer grows if a
+//! Every buffer is made in [`GpuRenderer::new`]; the splat buffer grows if a
 //! frame needs more room. Readback blocks until the frame is done.
 
-mod layout;
-
+use std::string::{String, ToString};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::vec::Vec;
+use std::{format, vec};
 
-use metor_star::render::noise::PoissonTable;
-use metor_star::render::{Frame, RenderError, Renderer, Splat, Truth};
 use wgpu::util::DeviceExt;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-pub use layout::Params;
+use super::noise::{PoissonTable, TABLE_LEN};
+use super::{Exposure, Frame, RenderError, Scene, Splat, Truth};
 
-const SHADER: &str = include_str!("star_sim.wgsl");
+const SHADER: &str = include_str!("gpu.wgsl");
 const SPLAT_GROUP: u32 = 64;
 const EXPOSE_GROUP: u32 = 256;
 /// Splats the GPU holds room for before the first frame.
@@ -64,9 +59,9 @@ struct Buffers {
     capacity: u64,
 }
 
-/// Renders frames of one [`Renderer`]'s scene on the GPU.
+/// Renders frames of one [`Scene`] on the GPU.
 pub struct GpuRenderer<'a> {
-    scene: Renderer<'a>,
+    scene: Scene<'a>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     layout: wgpu::BindGroupLayout,
@@ -81,8 +76,8 @@ pub struct GpuRenderer<'a> {
 
 impl<'a> GpuRenderer<'a> {
     /// Opens a headless device and uploads `scene`'s hot-pixel map.
-    pub fn new(scene: Renderer<'a>) -> Result<Self, GpuError> {
-        if scene.shape().pixels() % 2 != 0 {
+    pub fn new(scene: Scene<'a>) -> Result<Self, GpuError> {
+        if !scene.shape().pixels().is_multiple_of(2) {
             return Err(GpuError::BadShape);
         }
         let (device, queue) = pollster::block_on(open_device())?;
@@ -166,7 +161,7 @@ impl<'a> GpuRenderer<'a> {
     }
 
     /// The CPU side: cell selection, projection and truth.
-    pub fn scene(&self) -> &Renderer<'a> {
+    pub fn scene(&self) -> &Scene<'a> {
         &self.scene
     }
 
@@ -281,7 +276,7 @@ impl<'a> GpuRenderer<'a> {
 }
 
 impl Buffers {
-    fn new(device: &wgpu::Device, scene: &Renderer<'_>, capacity: u64) -> Buffers {
+    fn new(device: &wgpu::Device, scene: &Scene<'_>, capacity: u64) -> Buffers {
         let pixels = scene.shape().pixels() as u64;
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let buffer = |label, size, usage| {
@@ -308,7 +303,7 @@ impl Buffers {
             acc: buffer("acc", pixels * WORD, storage | wgpu::BufferUsages::COPY_SRC),
             hits: hit_buffer(device, capacity),
             hot,
-            sky_cdf: buffer("sky_cdf", size_of::<[f32; 168]>() as u64, storage),
+            sky_cdf: buffer("sky_cdf", size_of::<[f32; TABLE_LEN]>() as u64, storage),
             image: buffer("image", image_size, storage | wgpu::BufferUsages::COPY_SRC),
             staging: buffer(
                 "staging",
@@ -424,5 +419,54 @@ fn record_error(slot: Arc<Mutex<Option<String>>>) -> impl Fn(wgpu::Error) + Send
     }
 }
 
+/// The Rust mirror of `gpu.wgsl`'s `Params`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, IntoBytes, Immutable)]
+struct Params {
+    width: u32,
+    height: u32,
+    n_splats: u32,
+    /// The PSF cut `K = ceil(4σ)` (px).
+    k: u32,
+    /// `1/(√2σ)`.
+    erf_scale: f32,
+    background_e: f32,
+    dark_e: f32,
+    read_noise_e: f32,
+    full_well_e: f32,
+    gain_milli: f32,
+    bias_dn: f32,
+    max_dn: f32,
+    seed_lo: u32,
+    seed_hi: u32,
+    use_table: u32,
+    _pad: u32,
+}
+
+impl Params {
+    fn new(scene: &Scene<'_>, exp: &Exposure, n_splats: u32, use_table: bool) -> Params {
+        let (shape, sigma) = (scene.shape(), scene.sensor().psf_sigma_px);
+        Params {
+            width: shape.width,
+            height: shape.height,
+            n_splats,
+            k: libm::ceilf(4.0 * sigma) as u32,
+            erf_scale: 1.0 / (core::f32::consts::SQRT_2 * sigma),
+            background_e: exp.background_e,
+            dark_e: exp.dark_e,
+            read_noise_e: exp.read_noise_e,
+            full_well_e: exp.full_well_e,
+            gain_milli: exp.gain_milli as f32,
+            bias_dn: exp.bias_dn,
+            max_dn: f32::from(exp.max_dn),
+            seed_lo: exp.seed as u32,
+            seed_hi: (exp.seed >> 32) as u32,
+            use_table: u32::from(use_table),
+            _pad: 0,
+        }
+    }
+}
+
 #[cfg(test)]
+#[path = "gpu_tests.rs"]
 mod tests;

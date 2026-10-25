@@ -27,4 +27,5 @@ cache-keys = [
     { file = "../../contracts/src/**/*.rs" },
     { file = "../../contracts/Cargo.toml" },
     { file = "../../../../libs/metor-star/src/**/*.rs" },
+    { file = "../../../../libs/metor-star/src/**/*.wgsl" },
 ]

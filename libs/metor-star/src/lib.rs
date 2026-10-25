@@ -3,7 +3,7 @@
 #![no_std]
 
 extern crate alloc;
-#[cfg(test)]
+#[cfg(any(test, feature = "gpu"))]
 extern crate std;
 
 pub mod camera;

@@ -19,17 +19,10 @@ export = []
 adcs-contracts = { package = "adcs-contracts-3", path = "../../contracts" }
 futures-lite = "2"
 metor-fsw-3 = { path = "../../../../libs/metor-fsw-3", default-features = false, features = ["threads"] }
-metor-star = { path = "../../../../libs/metor-star", features = ["sim"] }
+metor-star = { path = "../../../../libs/metor-star", features = ["gpu"] }
 nox = { workspace = true }
-pollster = "0.4"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
-wgpu = "30"
-zerocopy = { version = "0.8.2", features = ["derive"] }
-
-[dev-dependencies]
-metor-star = { path = "../../../../libs/metor-star", features = ["sim", "testkit"] }
-naga = { version = "30", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

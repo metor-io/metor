@@ -3,7 +3,6 @@
 //!
 //! It is its own pack, apart from the `adcs` pack, as it renders on the GPU.
 
-pub mod gpu;
 pub mod params;
 pub mod sim;
 pub mod system;

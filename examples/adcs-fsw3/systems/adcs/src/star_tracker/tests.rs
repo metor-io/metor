@@ -1,5 +1,6 @@
+use metor_star::render::gpu::GpuRenderer;
 use metor_star::render::testkit::{STARCAT_G8, sim_camera, sim_renderer};
-use metor_star::render::{Frame, Motion, Renderer};
+use metor_star::render::{Frame, Motion};
 use metor_star::starcat::StarCat;
 
 use super::*;
@@ -9,7 +10,7 @@ fn params() -> StarTrackerParams {
 }
 
 struct Rig {
-    render: Renderer<'static>,
+    render: GpuRenderer<'static>,
     px: Vec<u16>,
 }
 

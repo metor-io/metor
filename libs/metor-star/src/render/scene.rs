@@ -3,7 +3,6 @@
 use alloc::vec::Vec;
 
 use super::RenderError;
-use super::hash::uniform;
 use crate::camera::Camera;
 use crate::geom::{I3, M3, Quat, V3, mat_add, mat_mul, mat_scale, norm, scale, transpose};
 
@@ -11,8 +10,6 @@ use crate::geom::{I3, M3, Quat, V3, mat_add, mat_mul, mat_scale, norm, scale, tr
 pub const MAX_SUB: usize = 32;
 /// The streak length (px) one sub-step may cover.
 const SUBSTEP_PX: f64 = 0.5;
-/// The hot-pixel map's draws, apart from the noise draws.
-const HOT_DRAW: u32 = 0x8000_0000;
 
 /// The body's state over one exposure, which starts at `q_b_eci`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -208,13 +205,18 @@ impl HotPixels {
     /// `[1, max_mult]`, the same for the same `seed`.
     pub fn new(len: usize, fraction: f32, max_mult: f32, seed: u64) -> HotPixels {
         let ln_max = libm::logf(max_mult.max(1.0));
-        let map = (0..len as u32).map(|p| {
-            let hot = uniform(p, HOT_DRAW, seed) < fraction;
-            if hot {
-                libm::expf(ln_max * uniform(p, HOT_DRAW + 1, seed))
-            } else {
-                1.0
-            }
+        let mut state = seed;
+        let mut uniform = move || {
+            // SplitMix64, top 24 bits.
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 40) as f32 / 16_777_216.0
+        };
+        let map = (0..len).map(|_| {
+            let (hot, mult) = (uniform() < fraction, uniform());
+            if hot { libm::expf(ln_max * mult) } else { 1.0 }
         });
         HotPixels(map.collect())
     }

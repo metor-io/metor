@@ -5,14 +5,14 @@ use adcs_contracts::{BodyState, MAX_TRUTH, NO_CAT_ID, StarImage, StarPixels, Sta
 use metor_fsw_3::{FrameArray, MakeError, ParamError, Rng, Timestamp};
 use metor_star::camera::{Camera, Intrinsics};
 use metor_star::geom::{self, V3};
+use metor_star::render::gpu::{GpuError, GpuRenderer};
 use metor_star::render::{
-    Frame, HotPixels, Motion, Photometry, RenderError, Renderer, Sensor, Shape, Truth,
+    Frame, HotPixels, Motion, Photometry, RenderError, Scene, Sensor, Shape, Truth,
 };
 use metor_star::starcat::StarCat;
 use metor_star::tracker::predict;
 use nox::{Quaternion, Vector};
 
-use crate::gpu::{GpuError, GpuRenderer};
 use crate::params::StarSimParams;
 
 /// The committed G ≤ 8 catalog.
@@ -56,7 +56,7 @@ impl StarSim {
             params.hot_pixel_max,
             params.seed,
         );
-        let scene = Renderer::new(
+        let scene = Scene::new(
             cat,
             camera,
             photometry(&params),
@@ -363,12 +363,7 @@ mod tests {
         // (the cadence's slack absorbs the 4 µs a cycle falls short), each
         // stamped 50 ms after its start.
         assert_eq!(frames.len(), 21, "{frames:?}");
-        let first_at = |t: i64| {
-            *states
-                .iter()
-                .find(|s| s.0 + RATE_SLACK_US >= t)
-                .unwrap()
-        };
+        let first_at = |t: i64| *states.iter().find(|s| s.0 + RATE_SLACK_US >= t).unwrap();
         for (i, (stamp, q_cam)) in frames.iter().enumerate() {
             let (start, q_start, omega_start) = first_at(i as i64 * 100_000);
             assert_eq!(*stamp, start + 50_000);
