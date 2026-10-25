@@ -27,7 +27,7 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc, PoisonError, RwLock,
         atomic::{self, AtomicBool, AtomicI64, AtomicU64},
     },
     time::{Duration, Instant},
@@ -101,12 +101,12 @@ pub struct State {
     vtable_registry: registry::HashMapRegistry,
     streams: HashMap<StreamId, Arc<FixedRateStreamState>>,
 
-    /// Raw bytes of the most recently ingested table for each dynamic vtable
-    /// (keyed by vtable / [`PacketId`]). The dynamic stream forwards exactly
-    /// these bytes each tick, so the producer's latest table is authoritative:
-    /// a key absent from the newest table simply drops out of the next streamed
-    /// packet (authoritative-latest liveness, vtable-dynamic.md §8.6).
-    latest_dynamic_tables: HashMap<PacketId, Vec<u8>>,
+    /// Raw bytes of the most recently ingested table for each dynamic vtable,
+    /// created by [`DB::insert_vtable`] and empty until the first table. The
+    /// dynamic stream forwards exactly these bytes each tick, so a key absent
+    /// from the newest table drops out of the next streamed packet
+    /// (vtable-dynamic.md §8.6).
+    latest_dynamic_tables: HashMap<PacketId, std::sync::Mutex<Vec<u8>>>,
 
     udp_vtable_streams: HashSet<(SocketAddr, [u8; 2])>,
 
@@ -332,6 +332,11 @@ impl DB {
                 }
                 self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
             }
+            if vtable.vtable.is_dynamic() {
+                state
+                    .latest_dynamic_tables
+                    .insert(vtable.id, Default::default());
+            }
             state.vtable_registry.map.insert(vtable.id, vtable.vtable);
             Ok::<_, Error>(())
         })?;
@@ -343,11 +348,11 @@ impl DB {
     ///
     /// A static table's components exist from [`insert_vtable`](Self::insert_vtable),
     /// so it sinks under the read lock without copying its vtable. A dynamic
-    /// table realizes members on first sample under the write lock, and caches
-    /// its bytes as the latest table the dynamic stream forwards (see
-    /// [`State::latest_dynamic_tables`]). A new component, or a first sample
-    /// into an empty series, bumps `vtable_gen` so subscribers re-derive
-    /// membership.
+    /// table sinks under the read lock while all its members exist, realizes
+    /// new members under the write lock, and caches its bytes as the latest
+    /// table the dynamic stream forwards (see [`State::latest_dynamic_tables`]).
+    /// A new component, or a first sample into an empty series, bumps
+    /// `vtable_gen` so subscribers re-derive membership.
     pub fn ingest_table(&self, id: PacketId, buf: &[u8]) -> Result<(), Error> {
         let received = Timestamp::now();
         let pushed = match self.ingest_static(id, buf, received)? {
@@ -391,30 +396,21 @@ impl DB {
         })
     }
 
-    /// Sinks a dynamic table under the write lock, realizing each member on
-    /// its first sample.
+    /// Sinks a dynamic table, taking the write lock only when a member is new.
     fn ingest_dynamic(
         &self,
         id: PacketId,
         buf: &[u8],
         received: Timestamp,
     ) -> Result<Pushed, Error> {
-        self.with_state_mut(|state| {
-            // Cloned out so realizing a member can take `&mut state`.
-            let vtable = state
-                .vtable_registry
-                .get(&id)
-                .ok_or(Error::Impeller(metor_proto::error::Error::VTableNotFound))?
-                .clone();
-            let mut pushed = Pushed::default();
-            vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
-                let component = state.realize_component(&rf, &self.path)?;
-                pushed.merge(push_field(component, &rf, received)?);
-                Ok(())
-            })?;
-            state.latest_dynamic_tables.insert(id, buf.to_vec());
-            Ok(pushed)
-        })
+        let pushed = match self.with_state(|state| state.push_known_fields(id, buf, received))? {
+            Some(pushed) => pushed,
+            None => {
+                self.with_state_mut(|state| state.realize_and_push(id, buf, received, &self.path))?
+            }
+        };
+        self.with_state(|state| state.cache_latest_table(id, buf));
+        Ok(pushed)
     }
 
     /// Builds one streamed `Table` packet for a dynamic vtable subscription from
@@ -422,10 +418,16 @@ impl DB {
     /// re-headed with the subscriber's stream `id`. Returns `None` when no table
     /// has been ingested for `id` yet.
     fn dynamic_stream_packet(&self, id: PacketId) -> Option<LenPacket> {
-        let cached = self.with_state(|s| s.latest_dynamic_tables.get(&id).cloned())?;
-        let mut pkt = LenPacket::table(id, cached.len());
-        pkt.extend_from_slice(&cached);
-        Some(pkt)
+        self.with_state(|s| {
+            let cached = s.latest_dynamic_tables.get(&id)?;
+            let cached = cached.lock().unwrap_or_else(PoisonError::into_inner);
+            if cached.is_empty() {
+                return None;
+            }
+            let mut pkt = LenPacket::table(id, cached.len());
+            pkt.extend_from_slice(&cached);
+            Some(pkt)
+        })
     }
 
     /// Set what this db advertises in its [`DbInfoResp`]: the namespace its
@@ -612,6 +614,67 @@ impl State {
 
     pub fn get_component(&self, component_id: ComponentId) -> Option<&Component> {
         self.components.get(&component_id)
+    }
+
+    fn dynamic_vtable(&self, id: PacketId) -> Result<&VTable, Error> {
+        self.vtable_registry
+            .get(&id)
+            .ok_or(Error::Impeller(metor_proto::error::Error::VTableNotFound))
+    }
+
+    /// Pushes a dynamic table whose members all exist. Returns `None`, having
+    /// pushed nothing, when a member is missing.
+    fn push_known_fields(
+        &self,
+        id: PacketId,
+        buf: &[u8],
+        received: Timestamp,
+    ) -> Result<Option<Pushed>, Error> {
+        let vtable = self.dynamic_vtable(id)?;
+        let mut known = true;
+        vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
+            known &= self.components.contains_key(&rf.component_id);
+            Ok(())
+        })?;
+        if !known {
+            return Ok(None);
+        }
+        let mut pushed = Pushed::default();
+        vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
+            let component = self
+                .get_component(rf.component_id)
+                .ok_or(Error::ComponentNotFound(rf.component_id))?;
+            pushed.merge(push_field(component, &rf, received)?);
+            Ok(())
+        })?;
+        Ok(Some(pushed))
+    }
+
+    /// Pushes a dynamic table, realizing each member on its first sample.
+    fn realize_and_push(
+        &mut self,
+        id: PacketId,
+        buf: &[u8],
+        received: Timestamp,
+        db_path: &Path,
+    ) -> Result<Pushed, Error> {
+        // Cloned out so realizing a member can take `&mut self`.
+        let vtable = self.dynamic_vtable(id)?.clone();
+        let mut pushed = Pushed::default();
+        vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
+            let component = self.realize_component(&rf, db_path)?;
+            pushed.merge(push_field(component, &rf, received)?);
+            Ok(())
+        })?;
+        Ok(pushed)
+    }
+
+    fn cache_latest_table(&self, id: PacketId, buf: &[u8]) {
+        if let Some(cached) = self.latest_dynamic_tables.get(&id) {
+            let mut cached = cached.lock().unwrap_or_else(PoisonError::into_inner);
+            cached.clear();
+            cached.extend_from_slice(buf);
+        }
     }
 
     pub fn component_metadata_iter(
@@ -2707,7 +2770,7 @@ mod dynamic_ingest_tests {
                 );
                 assert!(!s.is_component_hidden(&ComponentId::new(id)));
             }
-            assert!(s.latest_dynamic_tables.contains_key(&id));
+            assert!(!s.latest_dynamic_tables[&id].lock().unwrap().is_empty());
         });
 
         // values landed in the concrete time series
@@ -2805,7 +2868,7 @@ mod dynamic_ingest_tests {
                 s.get_component(ComponentId::new("processes.init.cpu_usage"))
                     .is_some()
             );
-            assert!(s.latest_dynamic_tables.contains_key(&id));
+            assert!(!s.latest_dynamic_tables[&id].lock().unwrap().is_empty());
             // The keyed member carries its dotted name, not the numeric id, and
             // is visible (only the template stays hidden).
             let meta = s
@@ -2826,6 +2889,132 @@ mod dynamic_ingest_tests {
             sink.values[&ComponentId::new("processes.init.cpu_usage")],
             0.25
         );
+    }
+
+    /// Builds a `processes` map table of `(key, pid, cpu)` entries.
+    fn map_table(ts: i64, entries: &[(&str, u64, f64)]) -> Vec<u8> {
+        let mut t = Vec::new();
+        put_i64(&mut t, ts);
+        put_u32(&mut t, 16);
+        put_u32(&mut t, (entries.len() * 24) as u32);
+        let mut key_off = 16 + entries.len() * 24;
+        for (key, pid, cpu) in entries {
+            put_u32(&mut t, key_off as u32);
+            put_u32(&mut t, key.len() as u32);
+            put_u64(&mut t, *pid);
+            put_f64(&mut t, *cpu);
+            key_off += key.len();
+        }
+        for (key, ..) in entries {
+            t.extend_from_slice(key.as_bytes());
+        }
+        t
+    }
+
+    fn map_db(dir: &Path) -> (DB, PacketId, VTable) {
+        let db = DB::create(dir.to_path_buf()).unwrap();
+        let id: PacketId = [9, 1];
+        let v = vtable([raw_field(
+            8,
+            8,
+            timestamp(raw_table(0, 8), map("processes", process_members(), 24, 8)),
+        )]);
+        db.insert_vtable(VTableMsg {
+            vtable: v.clone(),
+            id,
+        })
+        .unwrap();
+        (db, id, v)
+    }
+
+    fn sample_times(db: &DB, name: &str) -> Vec<i64> {
+        let component = db
+            .with_state(|s| s.get_component(ComponentId::new(name)).cloned())
+            .unwrap();
+        let Some(slice) = component
+            .time_series
+            .get_range(Timestamp(i64::MIN)..Timestamp(i64::MAX))
+        else {
+            return Vec::new();
+        };
+        slice
+            .as_iter()
+            .flat_map(|node| node.timestamps().iter().map(|t| t.0).collect::<Vec<_>>())
+            .collect()
+    }
+
+    fn cached_table(db: &DB, id: PacketId) -> Vec<u8> {
+        db.with_state(|s| s.latest_dynamic_tables[&id].lock().unwrap().clone())
+    }
+
+    #[stellarator::test]
+    async fn dynamic_known_keys_push_under_read_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, id, _) = map_db(dir.path());
+        assert!(db.dynamic_stream_packet(id).is_none());
+
+        db.ingest_table(id, &map_table(1000, &[("htop", 1, 0.5), ("init", 2, 0.25)]))
+            .unwrap();
+        let t2 = map_table(2000, &[("htop", 3, 0.5), ("init", 4, 0.25)]);
+        let pushed = db
+            .with_state(|s| s.push_known_fields(id, &t2, Timestamp(0)))
+            .unwrap();
+        assert!(pushed.is_some());
+        let t3 = map_table(3000, &[("htop", 5, 0.5), ("init", 6, 0.25)]);
+        db.ingest_table(id, &t3).unwrap();
+
+        stellarator::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(sample_times(&db, "processes.htop.pid"), [1000, 2000, 3000]);
+        assert_eq!(
+            sample_times(&db, "processes.init.cpu_usage"),
+            [1000, 2000, 3000]
+        );
+        assert_eq!(cached_table(&db, id), t3);
+    }
+
+    #[stellarator::test]
+    async fn dynamic_new_key_realized_without_double_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, id, v) = map_db(dir.path());
+        db.ingest_table(id, &map_table(1000, &[("htop", 1, 0.5)]))
+            .unwrap();
+
+        let t2 = map_table(2000, &[("htop", 3, 0.5), ("init", 4, 0.25)]);
+        let pushed = db
+            .with_state(|s| s.push_known_fields(id, &t2, Timestamp(0)))
+            .unwrap();
+        assert!(pushed.is_none());
+        let gen_before = db.vtable_gen.latest();
+        db.ingest_table(id, &t2).unwrap();
+        assert!(db.vtable_gen.latest() > gen_before);
+
+        stellarator::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(sample_times(&db, "processes.htop.pid"), [1000, 2000]);
+        assert_eq!(sample_times(&db, "processes.init.pid"), [2000]);
+        let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
+        assert_eq!(sink.values[&ComponentId::new("processes.init.pid")], 4.0);
+    }
+
+    #[stellarator::test]
+    async fn dynamic_key_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, id, v) = map_db(dir.path());
+        db.ingest_table(id, &map_table(1000, &[("htop", 1, 0.5), ("init", 2, 0.25)]))
+            .unwrap();
+        let t2 = map_table(2000, &[("init", 4, 0.25)]);
+        db.ingest_table(id, &t2).unwrap();
+
+        stellarator::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(sample_times(&db, "processes.htop.pid"), [1000]);
+        assert_eq!(sample_times(&db, "processes.init.pid"), [1000, 2000]);
+        assert_eq!(cached_table(&db, id), t2);
+        let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
+        assert!(
+            !sink
+                .values
+                .contains_key(&ComponentId::new("processes.htop.pid"))
+        );
+        assert_eq!(sink.values[&ComponentId::new("processes.init.pid")], 4.0);
     }
 
     /// A scalar-valued map (a `FrameMap<u64, N>` member) has an empty
