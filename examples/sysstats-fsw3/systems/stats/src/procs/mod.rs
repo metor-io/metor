@@ -38,12 +38,17 @@ pub struct ProcStats {
     pub cpu_ns: u64,
     pub user_ns: u64,
     pub system_ns: u64,
+    #[fsw(unit = "B")]
     pub rss_bytes: u64,
     pub threads: u64,
     pub read_bytes: u64,
     pub write_bytes: u64,
-    /// CPU time over wall time since the previous sample; 1.0 is one core.
-    pub cpu_util: f64,
+    /// CPU time over wall time since the previous sample; 100 is one core.
+    #[fsw(unit = "%")]
+    pub cpu_pct: f64,
+    /// Resident memory over physical memory.
+    #[fsw(unit = "%")]
+    pub mem_pct: f64,
     /// The command name, cut to 15 bytes.
     pub name: FrameStr<16>,
 }
@@ -88,6 +93,7 @@ pub struct ProcsState {
     health: Health,
     interval: Interval,
     max: usize,
+    mem_total: u64,
     source: os::Source,
     now: Vec<(u32, ProcStats)>,
     prev: Vec<(u32, u64)>,
@@ -100,6 +106,7 @@ impl ProcsState {
             health: Health::default(),
             interval: Interval::start(),
             max: p.max_procs as usize,
+            mem_total: crate::mem::total(),
             source: os::Source::new(PROCS),
             now: Vec::with_capacity(PROCS),
             prev: Vec::with_capacity(PROCS),
@@ -114,6 +121,9 @@ impl ProcsState {
         let dt = self.interval.lap();
         self.now.sort_unstable_by_key(|(pid, _)| *pid);
         rate(&mut self.now, &self.prev, dt);
+        for (_, stats) in &mut self.now {
+            stats.mem_pct = crate::mem::pct(stats.rss_bytes, self.mem_total);
+        }
         self.prev.clear();
         self.prev
             .extend(self.now.iter().map(|(pid, s)| (*pid, s.cpu_ns)));
@@ -143,15 +153,15 @@ impl ProcsState {
     }
 }
 
-/// Sets each process's `cpu_util` from its CPU time in `prev`, sorted by PID.
+/// Sets each process's `cpu_pct` from its CPU time in `prev`, sorted by PID.
 /// A process new since `prev` reads zero.
 fn rate(now: &mut [(u32, ProcStats)], prev: &[(u32, u64)], dt: f64) {
     for (pid, stats) in now {
         let before = prev
             .binary_search_by_key(pid, |(p, _)| *p)
             .map(|i| prev[i].1);
-        stats.cpu_util = match before {
-            Ok(before) if dt > 0.0 => stats.cpu_ns.saturating_sub(before) as f64 / 1e9 / dt,
+        stats.cpu_pct = match before {
+            Ok(before) if dt > 0.0 => 100.0 * stats.cpu_ns.saturating_sub(before) as f64 / 1e9 / dt,
             _ => 0.0,
         };
     }
@@ -161,7 +171,7 @@ fn rate(now: &mut [(u32, ProcStats)], prev: &[(u32, u64)], dt: f64) {
 /// returns them.
 fn busiest(procs: &mut [(u32, ProcStats)], max: usize) -> &[(u32, ProcStats)] {
     if procs.len() > max && max > 0 {
-        procs.select_nth_unstable_by(max - 1, |a, b| b.1.cpu_util.total_cmp(&a.1.cpu_util));
+        procs.select_nth_unstable_by(max - 1, |a, b| b.1.cpu_pct.total_cmp(&a.1.cpu_pct));
     }
     let n = max.min(procs.len());
     let top = &mut procs[..n];
@@ -195,16 +205,16 @@ mod tests {
     fn test_rate_from_previous() {
         let mut now = [proc(1, 3_000_000_000), proc(2, 10), proc(5, 9)];
         rate(&mut now, &[(1, 1_000_000_000), (5, 10)], 2.0);
-        assert_eq!(now[0].1.cpu_util, 1.0);
-        assert_eq!(now[1].1.cpu_util, 0.0);
-        assert_eq!(now[2].1.cpu_util, 0.0);
+        assert_eq!(now[0].1.cpu_pct, 100.0);
+        assert_eq!(now[1].1.cpu_pct, 0.0);
+        assert_eq!(now[2].1.cpu_pct, 0.0);
     }
 
     #[test]
     fn test_busiest_keeps_top_by_pid() {
         let mut procs: Vec<_> = (1..=6).map(|pid| proc(pid, 0)).collect();
         for (i, (_, s)) in procs.iter_mut().enumerate() {
-            s.cpu_util = [0.1, 0.9, 0.0, 0.5, 0.7, 0.2][i];
+            s.cpu_pct = [0.1, 0.9, 0.0, 0.5, 0.7, 0.2][i];
         }
         let pids: Vec<u32> = busiest(&mut procs, 3).iter().map(|(p, _)| *p).collect();
         assert_eq!(pids, [2, 4, 5]);

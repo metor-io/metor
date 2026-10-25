@@ -33,6 +33,9 @@ struct Seen {
     named_pids: usize,
     devices: usize,
     smart: usize,
+    filesystems: usize,
+    root_used_pct: f64,
+    mem_used_pct: f64,
     logs: Vec<String>,
 }
 
@@ -58,6 +61,7 @@ fn watch(
     for mem in mem.drain().flatten() {
         seen.frames[1] += 1;
         seen.mem_total = mem.total;
+        seen.mem_used_pct = mem.used_pct;
     }
     for nics in nics.drain().flatten() {
         seen.frames[2] += 1;
@@ -85,6 +89,11 @@ fn watch(
         let smart = devices.iter().map(|(_, d)| d.map(|s| &s.smart).len()).sum();
         seen.devices = seen.devices.max(devices.len());
         seen.smart = seen.smart.max(smart);
+        let filesystems = disks.map(|f| &f.filesystems);
+        seen.filesystems = seen.filesystems.max(filesystems.len());
+        if let Some(root) = filesystems.get("root") {
+            seen.root_used_pct = root.used_pct;
+        }
     }
     for line in log.drain().flatten() {
         seen.logs
@@ -162,7 +171,10 @@ fn test_samplers_fill_their_maps() {
         coordinator.run(stop(CYCLES)).await;
         let took = start.elapsed();
         println!("{CYCLES} cycles in {took:?}");
-        assert!(took < Duration::from_millis(CYCLES * 12), "ran at rate: {took:?}");
+        assert!(
+            took < Duration::from_millis(CYCLES * 12),
+            "ran at rate: {took:?}"
+        );
         let latched: Vec<&str> = coordinator
             .systems()
             .filter(|(_, why)| *why == Some(&EndReason::Panicked))
@@ -186,6 +198,17 @@ fn test_samplers_fill_their_maps() {
     assert!(seen.pids > 0, "process entries");
     assert!(seen.named_pids > 0, "process names");
     assert!(seen.devices > 0, "block devices");
+    assert!(seen.filesystems > 0, "mounted filesystems");
+    assert!(
+        seen.root_used_pct > 0.0 && seen.root_used_pct <= 100.0,
+        "root filesystem used: {}",
+        seen.root_used_pct
+    );
+    assert!(
+        seen.mem_used_pct > 0.0 && seen.mem_used_pct <= 100.0,
+        "memory used: {}",
+        seen.mem_used_pct
+    );
     let bad: Vec<&String> = seen
         .logs
         .iter()

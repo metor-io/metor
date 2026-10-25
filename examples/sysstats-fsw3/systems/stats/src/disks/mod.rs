@@ -1,8 +1,9 @@
 //! `disks`: IO counters per block device, with NVMe SMART health where the
-//! platform and permissions allow.
+//! platform and permissions allow, and space used per mounted filesystem.
 
 #[cfg(any(target_os = "linux", test))]
 pub mod diskstats;
+pub mod fs;
 #[cfg(target_os = "linux")]
 #[path = "linux.rs"]
 mod os;
@@ -21,6 +22,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::sample::{Health, Interval, Pace, rate};
 use crate::set::{Entry, Set};
+use fs::{FsStats, MountSet, Mounts};
 
 /// Cumulative device counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,20 +62,28 @@ pub struct DiskStats {
     pub in_flight: u64,
     /// Time the device had IO in flight (ns).
     pub io_ns: u64,
+    #[fsw(unit = "B/s")]
     pub read_rate: f64,
+    #[fsw(unit = "B/s")]
     pub write_rate: f64,
+    /// Time the device had IO in flight since the previous sample. Where
+    /// the platform does not report that, time spent on reads and writes.
+    #[fsw(unit = "%")]
+    pub busy_pct: f64,
     /// SMART health by attribute, empty unless the drive answers.
     pub smart: FrameMap<String, u64>,
 }
 
-/// Every block device, keyed by name.
+/// Every block device keyed by name, and every local filesystem keyed by
+/// mount point (`root` for `/`).
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
-#[frame(name = "disks", max_len = 64 * 1024)]
+#[frame(name = "disks", max_len = 96 * 1024)]
 #[repr(C)]
 pub struct Disks {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     pub devices: FrameMap<String, DiskStats>,
+    pub filesystems: FrameMap<String, FsStats>,
 }
 
 /// Configuration for the disks system.
@@ -129,8 +139,22 @@ fn stats(disk: &Disk, dt: f64) -> DiskStats {
         io_ns: n.io_ns,
         read_rate: rate(n.read_bytes, p.read_bytes, dt),
         write_rate: rate(n.write_bytes, p.write_bytes, dt),
+        busy_pct: busy_pct(n, p, dt),
         smart: FrameMap::EMPTY,
     }
+}
+
+/// IO time since `p` as a percent of `dt`, from `io_ns` where the platform
+/// reports it and from read and write time otherwise.
+fn busy_pct(n: &Counters, p: &Counters, dt: f64) -> f64 {
+    let busy_ns = match n.io_ns {
+        0 => (n.read_ns + n.write_ns).saturating_sub(p.read_ns + p.write_ns),
+        _ => n.io_ns.saturating_sub(p.io_ns),
+    };
+    if dt <= 0.0 {
+        return 0.0;
+    }
+    (100.0 * busy_ns as f64 / 1e9 / dt).clamp(0.0, 100.0)
 }
 
 /// The disks system's state.
@@ -141,6 +165,9 @@ pub struct DisksState {
     max_disks: usize,
     source: os::Source,
     set: DiskSet,
+    mounts: Mounts,
+    mounts_health: Health,
+    filesystems: MountSet,
 }
 
 impl DisksState {
@@ -153,6 +180,9 @@ impl DisksState {
             max_disks,
             source: os::Source::new(p.smart),
             set: DiskSet::with_capacity(max_disks.max(8) * 2),
+            mounts: Mounts::new(),
+            mounts_health: Health::default(),
+            filesystems: MountSet::with_capacity(max_disks.max(8) * 2),
         }
     }
 
@@ -160,6 +190,8 @@ impl DisksState {
         self.set.begin();
         let read = self.source.read(&mut self.set);
         self.set.end();
+        let mounts = fs::sample(&mut self.mounts, &mut self.filesystems);
+        self.mounts_health.report("filesystems", mounts);
         self.health.report("disks", read)
     }
 
@@ -167,8 +199,10 @@ impl DisksState {
         let fixed = Disks {
             timestamp: now,
             devices: FrameMap::EMPTY,
+            filesystems: FrameMap::EMPTY,
         };
         let count = self.set.len().min(self.max_disks);
+        let mounts = self.filesystems.len().min(self.max_disks);
         let _ = out.write_with(&fixed, |w| {
             w.map(
                 |f| &f.devices,
@@ -176,6 +210,21 @@ impl DisksState {
                 |m| {
                     for disk in self.set.iter().take(count) {
                         insert(m, disk, dt)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            w.map(
+                |f| &f.filesystems,
+                mounts,
+                |m| {
+                    for mount in self.filesystems.iter().take(mounts) {
+                        match m.insert(&mount.key, &FsStats::from(mount.now)) {
+                            Err(FrameWriteError::DuplicateKey(_)) => {}
+                            entry => {
+                                entry?;
+                            }
+                        }
                     }
                     Ok(())
                 },
@@ -234,5 +283,21 @@ mod tests {
         let disk = set.update("sda", at(8192));
         assert_eq!(stats(disk, 2.0).read_rate, 2048.0);
         assert_eq!(stats(disk, 2.0).read_bytes, 8192);
+    }
+
+    #[test]
+    fn test_busy_pct() {
+        let at = |io_ns, read_ns| Counters {
+            io_ns,
+            read_ns,
+            ..Counters::default()
+        };
+        assert_eq!(
+            busy_pct(&at(1_500_000_000, 0), &at(1_000_000_000, 0), 1.0),
+            50.0
+        );
+        assert_eq!(busy_pct(&at(0, 250_000_000), &at(0, 0), 1.0), 25.0);
+        assert_eq!(busy_pct(&at(5_000_000_000, 0), &at(0, 0), 1.0), 100.0);
+        assert_eq!(busy_pct(&at(1, 0), &at(0, 0), 0.0), 0.0);
     }
 }

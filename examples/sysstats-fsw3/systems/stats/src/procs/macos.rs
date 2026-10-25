@@ -67,7 +67,8 @@ impl Source {
             threads: u64::try_from(task.pti_threadnum).unwrap_or(0),
             read_bytes,
             write_bytes,
-            cpu_util: 0.0,
+            cpu_pct: 0.0,
+            mem_pct: 0.0,
             name: name(pid),
         })
     }

@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
 use metor_proto_stellar::Client;
-use metor_proto_wkt::DumpMetadata;
+use metor_proto_wkt::{ComponentMetadata, DumpMetadata, MetadataExt as _};
 
 /// How long the test waits for the db to hold every component.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -83,10 +83,14 @@ impl Keyed {
     }
 }
 
-const WANTED: [Keyed; 5] = [
+const WANTED: [Keyed; 6] = [
     Keyed {
         prefix: "host.cpu.cpu.cores.",
-        field: ".util",
+        field: ".usage_pct",
+    },
+    Keyed {
+        prefix: "host.disks.disks.filesystems.",
+        field: ".used_pct",
     },
     Keyed {
         prefix: "host.nics.nics.ifaces.",
@@ -105,6 +109,31 @@ const WANTED: [Keyed; 5] = [
         field: ".read_bytes",
     },
 ];
+
+/// Keyed members carry their template's metadata, and templates stay hidden.
+fn check_metadata(all: &[ComponentMetadata]) {
+    let visible = || all.iter().filter(|m| !m.is_hidden());
+    let names = visible()
+        .filter(|m| m.name.starts_with("host.procs.procs.pids.") && m.name.ends_with(".name"));
+    assert!(names.clone().count() > 0, "process names");
+    assert!(
+        names.clone().all(|m| m.is_string()),
+        "process names render as text"
+    );
+    let pcts: Vec<_> = visible().filter(|m| m.name.ends_with("_pct")).collect();
+    assert!(!pcts.is_empty(), "percent fields");
+    let unitless: Vec<_> = pcts
+        .iter()
+        .filter(|m| m.get("unit") != Some("%"))
+        .map(|m| &m.name)
+        .collect();
+    assert!(unitless.is_empty(), "percents without a unit: {unitless:?}");
+    let template = all.iter().find(|m| m.name == "host.procs.procs.pids.name");
+    assert!(
+        template.is_some_and(|m| m.is_hidden()),
+        "templates stay hidden"
+    );
+}
 
 #[stellarator::test]
 async fn test_db_records_keyed_components() {
@@ -133,13 +162,10 @@ async fn test_db_records_keyed_components() {
             .filter(|w| !names.iter().any(|n| w.matches(n)))
             .map(|w| w.prefix.to_string() + "*" + w.field)
             .collect();
-        // Member templates are hidden and named by their numeric id.
-        let stray: Vec<_> = names
-            .iter()
-            .filter(|n| !n.starts_with("host.") && n.parse::<u64>().is_err())
-            .collect();
+        let stray: Vec<_> = names.iter().filter(|n| !n.starts_with("host.")).collect();
         assert!(stray.is_empty(), "named outside the target: {stray:?}");
         if missing.is_empty() && names.contains(&"host.mem.mem.total") {
+            check_metadata(&dump.component_metadata);
             return;
         }
         assert!(

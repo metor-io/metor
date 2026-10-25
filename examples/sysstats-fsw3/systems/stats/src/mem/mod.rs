@@ -1,4 +1,4 @@
-//! `mem`: physical memory and swap, in bytes.
+//! `mem`: physical memory and swap, in bytes and as percentages.
 
 #[cfg(any(target_os = "linux", test))]
 pub mod meminfo;
@@ -22,26 +22,71 @@ use crate::sample::{Health, Pace};
 pub struct Mem {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
+    #[frame(unit = "B")]
     pub total: u64,
+    #[frame(unit = "B")]
     pub free: u64,
     /// An estimate of what can be allocated without swapping.
+    #[frame(unit = "B")]
     pub available: u64,
+    /// `total` less `available`.
+    #[frame(unit = "B")]
+    pub used: u64,
     /// File-backed pages.
+    #[frame(unit = "B")]
     pub cached: u64,
+    #[frame(unit = "B")]
     pub buffers: u64,
+    #[frame(unit = "B")]
     pub active: u64,
+    #[frame(unit = "B")]
     pub inactive: u64,
     /// Pages that cannot be paged out.
+    #[frame(unit = "B")]
     pub wired: u64,
+    #[frame(unit = "B")]
     pub compressed: u64,
+    #[frame(unit = "B")]
     pub swap_total: u64,
+    #[frame(unit = "B")]
     pub swap_used: u64,
+    #[frame(unit = "%")]
+    pub used_pct: f64,
+    #[frame(unit = "%")]
+    pub available_pct: f64,
+    #[frame(unit = "%")]
+    pub swap_used_pct: f64,
 }
 
 impl Mem {
     pub fn zeroed() -> Self {
         Self::new_zeroed()
     }
+
+    /// Fills `used` and the percentages from the byte counts.
+    pub fn with_derived(self) -> Self {
+        let used = self.total.saturating_sub(self.available);
+        Self {
+            used,
+            used_pct: pct(used, self.total),
+            available_pct: pct(self.available, self.total),
+            swap_used_pct: pct(self.swap_used, self.swap_total),
+            ..self
+        }
+    }
+}
+
+/// Physical memory in bytes, zero when it cannot be read.
+pub fn total() -> u64 {
+    os::Source::new().read().map_or(0, |mem| mem.total)
+}
+
+/// `part` as a percent of `whole`, zero when `whole` is.
+pub fn pct(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        return 0.0;
+    }
+    (100.0 * part as f64 / whole as f64).clamp(0.0, 100.0)
 }
 
 /// Configuration for the mem system.
@@ -82,8 +127,42 @@ pub async fn mem(#[state] state: &mut MemState, mem: &mut Output<Mem>, stop: Sto
             let timestamp = Timestamp::now();
             let _ = mem.write(&Mem {
                 timestamp,
-                ..sample
+                ..sample.with_derived()
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derived_percentages() {
+        let mem = Mem {
+            total: 1000,
+            available: 250,
+            swap_total: 200,
+            swap_used: 50,
+            ..Mem::zeroed()
+        }
+        .with_derived();
+        assert_eq!(mem.used, 750);
+        assert_eq!(mem.used_pct, 75.0);
+        assert_eq!(mem.available_pct, 25.0);
+        assert_eq!(mem.swap_used_pct, 25.0);
+    }
+
+    #[test]
+    fn test_no_swap_reads_zero() {
+        let mem = Mem {
+            total: 1000,
+            available: 2000,
+            ..Mem::zeroed()
+        }
+        .with_derived();
+        assert_eq!(mem.used, 0);
+        assert_eq!(mem.swap_used_pct, 0.0);
+        assert_eq!(mem.available_pct, 100.0);
     }
 }

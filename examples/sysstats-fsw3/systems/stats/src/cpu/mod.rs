@@ -1,5 +1,5 @@
-//! `cpu`: cumulative CPU time per core and in total, with a smoothed
-//! utilization.
+//! `cpu`: cumulative CPU time per core and in total, with smoothed
+//! percentages of time by state.
 
 #[cfg(target_os = "linux")]
 #[path = "linux.rs"]
@@ -38,9 +38,36 @@ impl Ticks {
     fn busy(&self) -> u64 {
         self.user + self.nice + self.system + self.irq + self.softirq + self.steal
     }
+
+    /// Ticks accrued since `prev`, by state.
+    fn since(&self, prev: &Ticks) -> Ticks {
+        Ticks {
+            user: self.user.saturating_sub(prev.user),
+            nice: self.nice.saturating_sub(prev.nice),
+            system: self.system.saturating_sub(prev.system),
+            idle: self.idle.saturating_sub(prev.idle),
+            iowait: self.iowait.saturating_sub(prev.iowait),
+            irq: self.irq.saturating_sub(prev.irq),
+            softirq: self.softirq.saturating_sub(prev.softirq),
+            steal: self.steal.saturating_sub(prev.steal),
+        }
+    }
+
+    /// Busy, user, system, iowait, and idle ticks, the shares [`Load`] tracks.
+    fn shares(&self) -> [u64; SHARES] {
+        [
+            self.busy(),
+            self.user + self.nice,
+            self.system + self.irq + self.softirq,
+            self.iowait,
+            self.idle,
+        ]
+    }
 }
 
-/// One core's cumulative ticks and its utilization in `[0, 1]`.
+const SHARES: usize = 5;
+
+/// One core's cumulative ticks and the percent of its time in each state.
 #[derive(
     AsVTable,
     Metadatatize,
@@ -65,7 +92,20 @@ pub struct CoreStats {
     pub irq: u64,
     pub softirq: u64,
     pub steal: u64,
-    pub util: f64,
+    /// Time not idle.
+    #[fsw(unit = "%")]
+    pub usage_pct: f64,
+    /// User code, `nice` included.
+    #[fsw(unit = "%")]
+    pub user_pct: f64,
+    /// Kernel code and interrupts.
+    #[fsw(unit = "%")]
+    pub system_pct: f64,
+    /// Idle waiting on IO.
+    #[fsw(unit = "%")]
+    pub iowait_pct: f64,
+    #[fsw(unit = "%")]
+    pub idle_pct: f64,
 }
 
 /// All cores summed, and each core keyed by its index.
@@ -86,7 +126,7 @@ pub struct CpuParams {
     /// Samples per second.
     #[serde(default = "default_rate")]
     pub rate_hz: f64,
-    /// Time constant (s) of the utilization average.
+    /// Time constant (s) of the percentage averages.
     #[serde(default = "default_tau")]
     pub util_tau_s: f64,
 }
@@ -99,24 +139,28 @@ fn default_tau() -> f64 {
     1.0
 }
 
-/// Exponential averages of busy and total ticks per sample.
+/// Exponential averages of each share's ticks and the total per sample.
 #[derive(Clone, Copy, Debug, Default)]
 struct Load {
-    busy: f64,
+    shares: [f64; SHARES],
     total: f64,
 }
 
 impl Load {
-    fn update(&mut self, busy: u64, total: u64, alpha: f64) {
-        self.busy += alpha * (busy as f64 - self.busy);
-        self.total += alpha * (total as f64 - self.total);
+    fn update(&mut self, delta: Ticks, alpha: f64) {
+        for (avg, ticks) in self.shares.iter_mut().zip(delta.shares()) {
+            *avg += alpha * (ticks as f64 - *avg);
+        }
+        self.total += alpha * (delta.total() as f64 - self.total);
     }
 
-    fn util(&self) -> f64 {
+    /// Each share as a percent of the total.
+    fn pct(&self) -> [f64; SHARES] {
         if self.total <= 0.0 {
-            return 0.0;
+            return [0.0; SHARES];
         }
-        (self.busy / self.total).clamp(0.0, 1.0)
+        self.shares
+            .map(|share| (100.0 * share / self.total).clamp(0.0, 100.0))
     }
 }
 
@@ -138,14 +182,13 @@ impl Track {
     }
 
     fn update(&mut self, now: Ticks, alpha: f64) {
-        let busy = now.busy().saturating_sub(self.ticks.busy());
-        let total = now.total().saturating_sub(self.ticks.total());
-        self.load.update(busy, total, alpha);
+        self.load.update(now.since(&self.ticks), alpha);
         self.ticks = now;
     }
 
     fn stats(&self) -> CoreStats {
         let t = &self.ticks;
+        let [usage_pct, user_pct, system_pct, iowait_pct, idle_pct] = self.load.pct();
         CoreStats {
             user: t.user,
             nice: t.nice,
@@ -155,7 +198,11 @@ impl Track {
             irq: t.irq,
             softirq: t.softirq,
             steal: t.steal,
-            util: self.load.util(),
+            usage_pct,
+            user_pct,
+            system_pct,
+            iowait_pct,
+            idle_pct,
         }
     }
 }
@@ -270,19 +317,23 @@ mod tests {
         for i in 1..=200 {
             track.update(ticks(i * 3, i), 0.1);
         }
-        assert!((track.stats().util - 0.75).abs() < 1e-6);
-        assert_eq!(track.stats().user, 600);
+        let stats = track.stats();
+        assert!((stats.usage_pct - 75.0).abs() < 1e-6);
+        assert!((stats.user_pct - 75.0).abs() < 1e-6);
+        assert!((stats.idle_pct - 25.0).abs() < 1e-6);
+        assert_eq!(stats.system_pct, 0.0);
+        assert_eq!(stats.user, 600);
     }
 
     #[test]
     fn test_counter_reset_reads_idle() {
         let mut track = Track::new(0, ticks(100, 100));
         track.update(ticks(0, 0), 1.0);
-        assert_eq!(track.stats().util, 0.0);
+        assert_eq!(track.stats().usage_pct, 0.0);
     }
 
     #[test]
     fn test_layout() {
-        assert_eq!(FrameMap::<u16, CoreStats>::STRIDE, 80);
+        assert_eq!(FrameMap::<u16, CoreStats>::STRIDE, 112);
     }
 }

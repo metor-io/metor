@@ -88,7 +88,13 @@ mod tests {
     fn test_parse_stat_malformed() {
         assert!(parse_stat("", UNITS).is_err());
         assert!(parse_stat("1 (init S 1 2 3", UNITS).is_err());
-        assert!(parse_stat("1 init) S 1 1 1 0 -1 0 0 0 0 0 250 75 0 0 20 0 3 0 1 2 3", UNITS).is_err());
+        assert!(
+            parse_stat(
+                "1 init) S 1 1 1 0 -1 0 0 0 0 0 250 75 0 0 20 0 3 0 1 2 3",
+                UNITS
+            )
+            .is_err()
+        );
         assert!(parse_stat("1 (init) S 1 1 1 0 -1 0 0 0 0 0 x 75", UNITS).is_err());
         assert!(parse_stat("1 (init) S 1 1 1 0 -1 0 0 0 0 0 250 75", UNITS).is_err());
     }
