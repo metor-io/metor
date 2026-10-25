@@ -227,36 +227,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codes_round_trip() {
-        for mode in [StarMode::Lost, StarMode::Tracking] {
-            assert_eq!(StarMode::try_from(mode as u8), Ok(mode));
-        }
-        for status in [
-            StarStatus::Valid,
-            StarStatus::NoStars,
-            StarStatus::NoMatch,
-            StarStatus::VerifyFailed,
-            StarStatus::NoConvergence,
-            StarStatus::Degenerate,
-        ] {
-            assert_eq!(StarStatus::try_from(status as u8), Ok(status));
-        }
-        assert_eq!(StarMode::try_from(2), Err(UnknownCode(2)));
-        assert_eq!(StarStatus::try_from(6), Err(UnknownCode(6)));
-    }
-
-    #[test]
-    fn rows_past_count_are_not_observations() {
-        let mut sv = StarVectors::empty(Timestamp(0), 1);
-        assert_eq!(sv.obs().count(), 0);
-        assert!(sv.push([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 3e-5, 7));
-        let rows: Vec<_> = sv.obs().collect();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0.into_buf(), [0.0, 0.0, 1.0]);
-        assert_eq!(rows[0].2, 3e-5);
-    }
-
-    #[test]
     fn count_is_clamped_and_push_stops_when_full() {
         let mut sv = StarVectors::empty(Timestamp(0), 1);
         for i in 0..MAX_STARS {

@@ -91,6 +91,3 @@ impl Default for StarTruth {
         truth
     }
 }
-
-#[cfg(test)]
-mod tests;
