@@ -6,6 +6,10 @@ use metor_proto::vtable::{
 use crate::path::ComponentPath;
 
 pub trait AsVTable {
+    /// Whether this type holds a [`FrameMap`](crate::FrameMap), so its
+    /// records carry a trailer.
+    const DYNAMIC: bool = false;
+
     /// *Static* form: leaves are absolute `component(path.chain(name).id)` ops,
     /// used when the type is reached through compile-time struct nesting.
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder>;
@@ -35,6 +39,8 @@ pub trait AsVTable {
 }
 
 impl<const N: usize, T: AsVTable> AsVTable for [T; N] {
+    const DYNAMIC: bool = T::DYNAMIC;
+
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
         (0..N)
             .flat_map(|i| {
@@ -136,8 +142,7 @@ mod tests {
         let mut sink = TestSink::default();
         vtable.apply(outer.as_bytes(), &mut sink).unwrap().unwrap();
         assert_eq!(
-            sink.timestamps
-                .get(&ComponentId::new("telemetry.value")),
+            sink.timestamps.get(&ComponentId::new("telemetry.value")),
             Some(&Some(Timestamp(99))),
             "nested struct's timestamp source should shift with its fields"
         );
