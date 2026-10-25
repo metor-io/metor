@@ -6,6 +6,7 @@ use core::future::{Future, poll_fn};
 use core::task::Poll;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::cli::run::prepare;
@@ -157,7 +158,11 @@ fn test_samplers_fill_their_maps() {
     let run = shared.clone();
     stellarator::run(move || async move {
         let mut coordinator = build(&run);
+        let start = Instant::now();
         coordinator.run(stop(CYCLES)).await;
+        let took = start.elapsed();
+        println!("{CYCLES} cycles in {took:?}");
+        assert!(took < Duration::from_millis(CYCLES * 12), "ran at rate: {took:?}");
         let latched: Vec<&str> = coordinator
             .systems()
             .filter(|(_, why)| *why == Some(&EndReason::Panicked))

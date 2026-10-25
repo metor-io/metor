@@ -1,6 +1,7 @@
 //! Runs `sim.py` under `metor run` and checks that its db records a
 //! component for every map entry: one per core, interface, process, and
-//! device.
+//! device. Every name, nested map entries included, sits under the target's
+//! namespace.
 
 use core::time::Duration;
 use std::net::{SocketAddr, TcpListener};
@@ -132,6 +133,12 @@ async fn test_db_records_keyed_components() {
             .filter(|w| !names.iter().any(|n| w.matches(n)))
             .map(|w| w.prefix.to_string() + "*" + w.field)
             .collect();
+        // Member templates are hidden and named by their numeric id.
+        let stray: Vec<_> = names
+            .iter()
+            .filter(|n| !n.starts_with("host.") && n.parse::<u64>().is_err())
+            .collect();
+        assert!(stray.is_empty(), "named outside the target: {stray:?}");
         if missing.is_empty() && names.contains(&"host.mem.mem.total") {
             return;
         }
