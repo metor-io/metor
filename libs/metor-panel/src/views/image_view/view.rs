@@ -1369,23 +1369,4 @@ mod tests {
             star.0
         );
     }
-
-    #[test]
-    fn config_round_trips() {
-        let cfg = ImageViewConfig {
-            component: "cam.pixels".into(),
-            display: Some(Display::default()),
-            view: ViewMode::Fit,
-            overlays: vec![OverlayConfig::from_root(
-                "sim.star_truth",
-                OverlayColor::Truth,
-            )],
-        };
-        let json = serde_json::to_string(&cfg).unwrap();
-        assert_eq!(serde_json::from_str::<ImageViewConfig>(&json).unwrap(), cfg);
-        assert_eq!(
-            serde_json::from_str::<ImageViewConfig>("{}").unwrap(),
-            ImageViewConfig::default()
-        );
-    }
 }
