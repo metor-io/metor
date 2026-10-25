@@ -23,6 +23,9 @@ static DB: &[u8] = include_bytes!("../../../../../libs/metor-star/data/stars-u20
 
 /// The sensor size of `StarImage`.
 const SIZE: u32 = 1024;
+/// The principal point (px): the sensor's centre, as the simulator renders
+/// with no lens distortion.
+const CENTRE_PX: f64 = SIZE as f64 / 2.0;
 /// A prior older than this (s) is not used.
 const MAX_PRIOR_AGE_S: f64 = 2.0;
 /// Attitude error the gyro adds per second of propagation (rad/s): bias and
@@ -117,12 +120,12 @@ impl StarTracker {
             intr: Intrinsics {
                 f_m: params.f_m,
                 pitch_m: params.pitch_m,
-                cx: params.cx,
-                cy: params.cy,
-                k1: params.k1,
-                k2: params.k2,
-                p1: params.p1,
-                p2: params.p2,
+                cx: CENTRE_PX,
+                cy: CENTRE_PX,
+                k1: 0.0,
+                k2: 0.0,
+                p1: 0.0,
+                p2: 0.0,
                 width: SIZE,
                 height: SIZE,
             },
@@ -131,17 +134,11 @@ impl StarTracker {
         // PANIC Safety: the committed DB parses (metor-star tests it), and a
         // 1024² sensor with the default image config is valid.
         let db = Db::parse(DB).expect("the committed star DB parses");
-        let track = TrackConfig {
-            sigma_px: params.sigma_px,
-            sigma_flux_px: params.sigma_flux_px,
-            sigma_floor_px: params.sigma_floor_px,
-            ..TrackConfig::default()
-        };
         let lis = LisConfig {
             fov_radius_rad: cam.half_diagonal_rad(),
             ..LisConfig::default()
         };
-        let tracker = Tracker::new(db, cam, ImageConfig::default(), lis, track)
+        let tracker = Tracker::new(db, cam, ImageConfig::default(), lis, TrackConfig::default())
             .expect("a valid image config");
         StarTracker {
             tracker,

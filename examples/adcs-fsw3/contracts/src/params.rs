@@ -142,41 +142,17 @@ fn default_true() -> bool {
 }
 
 /// Configuration for the image star tracker. The camera defaults match the
-/// star simulator's: 16 mm, 5.5 µm pixels, 1024², about 20°.
+/// star simulator's: 16 mm, 5.5 µm pixels, 1024², about 20°. The centroid
+/// σ model is metor-star's, calibrated on the simulator.
 #[derive(Deserialize, JsonSchema, Clone, Debug, PartialEq)]
 pub struct StarTrackerParams {
     #[serde(default = "default_f_m")]
     pub f_m: f64,
     #[serde(default = "default_pitch_m")]
     pub pitch_m: f64,
-    /// Principal point (px).
-    #[serde(default = "default_centre_px")]
-    pub cx: f64,
-    #[serde(default = "default_centre_px")]
-    pub cy: f64,
-    /// Brown–Conrady radial (1/m², 1/m⁴) and tangential (1/m) terms.
-    #[serde(default)]
-    pub k1: f64,
-    #[serde(default)]
-    pub k2: f64,
-    #[serde(default)]
-    pub p1: f64,
-    #[serde(default)]
-    pub p2: f64,
     /// Mount, `[x, y, z, w]`: `b_body = A(q_b_st) b_st`.
     #[serde(default = "default_q_b_st")]
     pub q_b_st: [f64; 4],
-    /// A faint star's centroid 1σ (px), the most any star gets; it sizes
-    /// the tracking gate and lost-in-space's residual test.
-    #[serde(default = "default_sigma_px")]
-    pub sigma_px: f64,
-    /// Shot-noise term (px·√flux): a centroid of flux `F` has 1σ
-    /// `sigma_flux_px / √F`, between `sigma_floor_px` and `sigma_px`.
-    #[serde(default = "default_sigma_flux_px")]
-    pub sigma_flux_px: f64,
-    /// The least centroid 1σ (px), for bright stars.
-    #[serde(default = "default_sigma_floor_px")]
-    pub sigma_floor_px: f64,
     /// Lost-in-space triplets per cycle.
     #[serde(default = "default_budget")]
     pub budget: u32,
@@ -188,24 +164,6 @@ fn default_f_m() -> f64 {
 
 fn default_pitch_m() -> f64 {
     5.5e-6
-}
-
-fn default_centre_px() -> f64 {
-    512.0
-}
-
-fn default_sigma_px() -> f64 {
-    0.1
-}
-
-// metor-star's `SIGMA_FLUX_PX` and `SIGMA_FLOOR_PX`, calibrated on the
-// simulator.
-fn default_sigma_flux_px() -> f64 {
-    1.2
-}
-
-fn default_sigma_floor_px() -> f64 {
-    0.02
 }
 
 fn default_budget() -> u32 {
