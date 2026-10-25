@@ -514,6 +514,11 @@ impl DB {
         })
     }
 
+    /// Sets a component's display metadata and persists it.
+    pub fn set_component_metadata(&self, metadata: ComponentMetadata) -> Result<(), Error> {
+        self.with_state_mut(|s| s.set_component_metadata(metadata, &self.path))
+    }
+
     /// Set what this db advertises in its [`DbInfoResp`]: the namespace its
     /// components carry and the command set clients forward up. A
     /// description whose id leaves the set goes with it; describe the new
