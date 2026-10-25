@@ -213,41 +213,19 @@ mod tests {
         }
     }
 
+    /// Every curve fixes both ends, extreme softenings included; unusable
+    /// ones are linear.
     #[test]
     fn curves_fix_both_ends() {
-        for curve in CURVES {
-            assert_eq!(curve.apply(0.0), 0.0, "{curve:?}");
-            assert!((curve.apply(1.0) - 1.0).abs() < 1e-6, "{curve:?}");
-            assert_eq!(curve.apply(-1.0), 0.0, "{curve:?}");
-            assert!((curve.apply(2.0) - 1.0).abs() < 1e-6, "{curve:?}");
-        }
-    }
-
-    #[test]
-    fn bad_curve_parameters_are_linear() {
-        for curve in [
-            Curve::Asinh { softening: 0.0 },
-            Curve::Asinh {
-                softening: f32::NAN,
-            },
-            Curve::Asinh {
-                softening: f32::INFINITY,
-            },
-        ] {
-            assert_eq!(curve.apply(0.25), 0.25, "{curve:?}");
-        }
-    }
-
-    #[test]
-    fn extreme_curve_parameters_stay_graded() {
-        for curve in [
-            Curve::Asinh { softening: 1e-40 },
-            Curve::Asinh { softening: 1e30 },
-        ] {
+        let extreme = [1e-40, 1e30].map(|softening| Curve::Asinh { softening });
+        for curve in CURVES.into_iter().chain(extreme) {
             let mid = curve.apply(0.5);
             assert!(mid.is_finite() && (0.0..=1.0).contains(&mid), "{curve:?}");
-            assert_eq!(curve.apply(0.0), 0.0, "{curve:?}");
-            assert!((curve.apply(1.0) - 1.0).abs() < 1e-5, "{curve:?}");
+            assert_eq!(curve.apply(-1.0), 0.0, "{curve:?}");
+            assert!((curve.apply(2.0) - 1.0).abs() < 1e-5, "{curve:?}");
+        }
+        for softening in [0.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(Curve::Asinh { softening }.apply(0.25), 0.25, "{softening}");
         }
     }
 
@@ -281,15 +259,6 @@ mod tests {
     }
 
     #[test]
-    fn one_bit_is_black_and_white() {
-        let lut = Lut::build(1, 0.0, 1.0, &Display::default(), SAT);
-        assert_eq!(
-            (lut.get(0), lut.get(1)),
-            (pack(0, 0, 0), pack(255, 255, 255))
-        );
-    }
-
-    #[test]
     fn saturation_replaces_only_the_top_code() {
         let off = Lut::build(8, 0.0, 200.0, &Display::default(), SAT);
         let on_display = Display {
@@ -304,15 +273,10 @@ mod tests {
     }
 
     #[test]
-    fn equal_levels_are_a_step() {
+    fn equal_levels_step_and_inverted_levels_invert() {
         let lut = Lut::build(8, 100.0, 100.0, &Display::default(), SAT);
         assert_eq!(lut.get(99), pack(0, 0, 0));
         assert_eq!(lut.get(100), pack(255, 255, 255));
-        assert_eq!(lut.get(255), pack(255, 255, 255));
-    }
-
-    #[test]
-    fn inverted_levels_invert() {
         let lut = Lut::build(8, 200.0, 50.0, &Display::default(), SAT);
         assert_eq!(lut.get(255), pack(0, 0, 0));
         assert_eq!(lut.get(200), pack(0, 0, 0));

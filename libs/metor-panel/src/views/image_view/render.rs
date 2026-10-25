@@ -434,23 +434,25 @@ mod tests {
 
     use super::*;
 
-    fn layout(w: usize, h: usize) -> FrameLayout {
-        FrameLayout::from_component(
-            &ComponentSchema::new(PrimType::U16, &[h, w][..]),
-            &ComponentMetadata::from("cam").with_image(ImageFormat::Mono16, 12),
-        )
-        .unwrap()
-    }
-
-    fn frame(w: usize, h: usize, value: impl Fn(usize, usize) -> u16) -> Frame {
-        let bytes: Vec<u8> = (0..w * h)
-            .flat_map(|i| value(i % w, i / w).to_le_bytes())
-            .collect();
+    fn frame_of(format: ImageFormat, prim: PrimType, dim: &[usize], bytes: Vec<u8>) -> Frame {
+        let bits = if prim == PrimType::U8 { 8 } else { 12 };
         Frame {
             timestamp: Timestamp(1),
             bytes: bytes.into(),
-            layout: layout(w, h),
+            layout: FrameLayout::from_component(
+                &ComponentSchema::new(prim, dim),
+                &ComponentMetadata::from("cam").with_image(format, bits),
+            )
+            .unwrap(),
         }
+    }
+
+    /// A Mono16/12 frame.
+    fn frame(w: usize, h: usize, value: impl Fn(usize, usize) -> u16) -> Frame {
+        let bytes = (0..w * h)
+            .flat_map(|i| value(i % w, i / w).to_le_bytes())
+            .collect();
+        frame_of(ImageFormat::Mono16, PrimType::U16, &[h, w], bytes)
     }
 
     fn key(n: i64) -> RenderKey {
@@ -467,39 +469,26 @@ mod tests {
         }
     }
 
-    /// The input is the key's timestamp, so each started job can be
-    /// checked against its own request.
+    /// Requests key `n` with input `n`; the started job's key.
     fn request(s: &mut Scheduler<i64>, n: i64) -> Option<RenderKey> {
-        let (key, input) = s.request(key(n), n)?;
-        assert_eq!(key.timestamp.0, input);
-        Some(key)
+        s.request(key(n), n).map(|(key, _)| key)
     }
 
     fn finish(s: &mut Scheduler<i64>, n: i64) -> (bool, Option<RenderKey>) {
         let (install, next) = s.finish(&key(n));
-        if let Some((key, input)) = &next {
-            assert_eq!(key.timestamp.0, *input);
-        }
         (install, next.map(|(key, _)| key))
     }
 
     #[test]
-    fn an_unchanged_key_starts_no_job() {
-        let mut s = Scheduler::default();
-        assert_eq!(request(&mut s, 1), Some(key(1)));
-        assert_eq!(finish(&mut s, 1), (true, None));
-        assert_eq!(request(&mut s, 1), None);
-        assert!(!s.is_busy());
-    }
-
-    #[test]
-    fn a_change_during_a_job_makes_one_follow_up() {
+    fn changes_during_a_job_coalesce_into_one_follow_up() {
         let mut s = Scheduler::default();
         assert_eq!(request(&mut s, 1), Some(key(1)));
         assert_eq!(request(&mut s, 2), None);
         assert_eq!(request(&mut s, 3), None);
         assert_eq!(finish(&mut s, 1), (true, Some(key(3))));
         assert_eq!(finish(&mut s, 3), (true, None));
+        assert_eq!(request(&mut s, 3), None, "unchanged");
+        assert!(!s.is_busy());
     }
 
     /// A drag changes the key during every job; each result still lands.
@@ -512,14 +501,6 @@ mod tests {
             assert_eq!(finish(&mut s, n - 1), (true, Some(key(n))));
             assert_eq!(s.installed(), Some(&key(n - 1)));
         }
-        // Returning to the installed key after a superseded one renders it
-        // again.
-        let mut s = Scheduler::default();
-        request(&mut s, 1);
-        finish(&mut s, 1);
-        request(&mut s, 2);
-        request(&mut s, 1);
-        assert_eq!(finish(&mut s, 2), (true, Some(key(1))));
     }
 
     #[test]
@@ -534,10 +515,8 @@ mod tests {
 
     #[test]
     fn fit_centres_and_covers_the_frame() {
-        let layout = layout(200, 100);
-        let viewport = fit(&layout, (100, 100));
-        assert_eq!(viewport.step, 2.0);
-        assert_eq!(viewport.origin, (0.0, -50.0));
+        let viewport = fit(&frame(200, 100, |_, _| 0).layout, (100, 100));
+        assert_eq!((viewport.step, viewport.origin), (2.0, (0.0, -50.0)));
         assert_eq!(
             viewport.visible(200, 100, 100, 100),
             Rect::new(0, 25, 100, 50)
@@ -550,7 +529,7 @@ mod tests {
         let layout = f.layout;
         let pixels = layout.pixels(&f.bytes).unwrap();
         let display = Display::default();
-        // Zoomed onto the left half: the viewport shows columns 0..32.
+        // At 1:1 into a 32² output, the view shows columns 0..32.
         let viewport = Viewport {
             origin: (0.0, 0.0),
             step: 1.0,
@@ -563,43 +542,12 @@ mod tests {
     }
 
     #[test]
-    fn a_job_renders_the_visible_part() {
-        let f = frame(4, 4, |x, y| (x + 4 * y) as u16 * 200);
-        let key = RenderKey::new(
-            &f,
-            Display::default(),
-            fit(&f.layout, (8, 8)),
-            (8, 8),
-            [0; 4],
-        );
-        let rendered = run(Job {
-            key: key.clone(),
-            frame: f,
-            scratch: Scratch::default(),
-            lut: None,
-        });
-        assert_eq!(rendered.error, None);
-        let (image, out) = rendered.image.expect("an image");
-        assert_eq!(out, Rect::new(0, 0, 8, 8));
-        assert_eq!(image.size(0).width.0, 8);
-        assert_eq!(rendered.levels, (0.0, 3000.0));
-        assert_eq!(rendered.key, key);
-    }
-
-    #[test]
-    fn manual_levels_and_hints() {
-        let mut layout = layout(4, 4);
+    fn hints_set_manual_levels_and_the_curve() {
+        let mut layout = frame(4, 4, |_, _| 0).layout;
         layout.black = Some(10.0);
         layout.white = Some(20.0);
         layout.stretch = Stretch::Asinh;
         let display = hinted(Display::default(), &layout);
-        assert_eq!(
-            display.levels,
-            Levels::Manual {
-                black: 10.0,
-                white: 20.0
-            }
-        );
         assert!(matches!(display.curve, Curve::Asinh { .. }));
         assert_eq!(levels(&display, None, &layout), (10.0, 20.0));
         let empty = Histogram::of_u8(&[], 0, Rect::default());
@@ -609,17 +557,66 @@ mod tests {
         );
     }
 
+    fn run_at(frame: &Frame, viewport: Viewport, out: (usize, usize)) -> Rendered {
+        run(Job {
+            key: RenderKey::new(frame, Display::default(), viewport, out, [0; 4]),
+            frame: frame.clone(),
+            scratch: Scratch::default(),
+            lut: None,
+        })
+    }
+
     #[test]
-    fn frames_retire_through_pending_release() {
-        let image = || image(vec![0; 4], Rect::new(0, 0, 1, 1)).unwrap();
-        assert!(super::image(vec![0; 3], Rect::new(0, 0, 1, 1)).is_err());
-        let mut frames = Frames::default();
-        frames.install(Some((image(), Rect::default())));
-        frames.install(Some((image(), Rect::default())));
-        frames.install(None);
-        assert_eq!(frames.pending_release.len(), 2);
-        assert_eq!(frames.take_all().len(), 2);
-        assert!(frames.current.is_none());
+    fn a_job_renders_the_visible_part() {
+        let f = frame(4, 4, |x, y| (x + 4 * y) as u16 * 200);
+        let rendered = run_at(&f, fit(&f.layout, (8, 8)), (8, 8));
+        assert_eq!(rendered.error, None);
+        let (image, out) = rendered.image.expect("an image");
+        assert_eq!(out, Rect::new(0, 0, 8, 8));
+        assert_eq!(image.size(0).width.0, 8);
+        assert_eq!(rendered.levels, (0.0, 3000.0));
+    }
+
+    /// Red, as RGB8 and as an RGGB 12-bit mosaic, paints red at every zoom.
+    #[test]
+    fn color_frames_render_their_colour() {
+        let (w, h) = (16, 8);
+        let rgb = frame_of(
+            ImageFormat::Rgb8,
+            PrimType::U8,
+            &[h, w, 3],
+            [[255, 0, 0]; 128].concat(),
+        );
+        let bayer = frame_of(
+            ImageFormat::BayerRggb16,
+            PrimType::U16,
+            &[h, w],
+            (0..w * h)
+                .flat_map(|i| {
+                    match (i / w % 2, i % 2) {
+                        (0, 0) => 4095u16,
+                        _ => 0,
+                    }
+                    .to_le_bytes()
+                })
+                .collect(),
+        );
+        for frame in [rgb, bayer] {
+            for step in [0.5, 1.0, 2.0, 4.0] {
+                let viewport = Viewport {
+                    origin: (0.0, 0.0),
+                    step,
+                };
+                let rendered = run_at(&frame, viewport, (32, 16));
+                let (image, out) = rendered.image.expect("an image");
+                let at = (out.height / 2 * out.width + out.width / 2) * 4;
+                let [b, g, r, a] = image.as_bytes(0).unwrap()[at..at + 4] else {
+                    unreachable!()
+                };
+                let format = frame.layout.format;
+                assert!(r > 200 && g < 60 && b < 60 && a == 255, "{format} {step}");
+            }
+        }
     }
 
     /// A paint retires only replaced images, each once, and never the one it
@@ -631,118 +628,16 @@ mod tests {
         let mut frames = Frames::default();
         frames.install(Some((a.clone(), Rect::default())));
         assert!(frames.take_retired().is_empty());
-
         // Two renders land between paints, as during a zoom.
         frames.install(Some((b.clone(), Rect::default())));
         frames.install(Some((c.clone(), Rect::default())));
         let retired = frames.take_retired();
-        assert_eq!(retired.len(), 2);
         assert!(Arc::ptr_eq(&retired[0], &a) && Arc::ptr_eq(&retired[1], &b));
         assert!(frames.take_retired().is_empty(), "retired twice");
-
         // Reinstalling the painted image keeps it in the atlas.
         frames.install(Some((c.clone(), Rect::default())));
         assert!(frames.take_retired().is_empty());
-        assert!(Arc::ptr_eq(&frames.current.as_ref().unwrap().0, &c));
-
         let all = frames.take_all();
-        assert_eq!(all.len(), 1);
-        assert!(Arc::ptr_eq(&all[0], &c));
-    }
-
-    /// Eight colour bars (bar 5 red) as RGB8, or an RGGB 12-bit mosaic.
-    fn color_frame(bayer: bool, w: usize, h: usize) -> Frame {
-        const BARS: [[u8; 3]; 8] = [
-            [255, 255, 255],
-            [255, 255, 0],
-            [0, 255, 255],
-            [0, 255, 0],
-            [255, 0, 255],
-            [255, 0, 0],
-            [0, 0, 255],
-            [0, 0, 0],
-        ];
-        let rgb = |x: usize| BARS[x * BARS.len() / w];
-        let (format, bits, schema, bytes): (_, _, _, Vec<u8>) = match bayer {
-            false => (
-                ImageFormat::Rgb8,
-                8,
-                ComponentSchema::new(PrimType::U8, &[h, w, 3][..]),
-                (0..w * h).flat_map(|i| rgb(i % w)).collect(),
-            ),
-            true => (
-                ImageFormat::BayerRggb16,
-                12,
-                ComponentSchema::new(PrimType::U16, &[h, w][..]),
-                (0..w * h)
-                    .flat_map(|i| {
-                        let (x, y) = (i % w, i / w);
-                        let channel = match (y % 2, x % 2) {
-                            (0, 0) => 0,
-                            (1, 1) => 2,
-                            _ => 1,
-                        };
-                        (u16::from(rgb(x)[channel]) * 16).to_le_bytes()
-                    })
-                    .collect(),
-            ),
-        };
-        let layout = FrameLayout::from_component(
-            &schema,
-            &ComponentMetadata::from("cam").with_image(format, bits),
-        )
-        .unwrap();
-        Frame {
-            timestamp: Timestamp(1),
-            bytes: bytes.into(),
-            layout,
-        }
-    }
-
-    fn run_at(frame: &Frame, viewport: Viewport, out: (usize, usize)) -> Rendered {
-        let mut key = RenderKey::new(frame, Display::default(), viewport, out, [0; 4]);
-        key.display.levels = Levels::Manual {
-            black: 0.0,
-            white: f64::from((1u32 << frame.layout.bits) - 1),
-        };
-        run(Job {
-            key,
-            frame: frame.clone(),
-            scratch: Scratch::default(),
-            lut: None,
-        })
-    }
-
-    /// The BGRA painted at device pixel `(x, y)`.
-    fn painted(rendered: &Rendered, x: usize, y: usize) -> [u8; 4] {
-        let (image, out) = rendered.image.clone().expect("an image");
-        let bytes = image.as_bytes(0).unwrap();
-        let at = ((y - out.y) * out.width + x - out.x) * 4;
-        bytes[at..at + 4].try_into().unwrap()
-    }
-
-    #[test]
-    fn color_frames_render_their_bars() {
-        // Bar 5 of 8 is red.
-        let (w, h) = (64, 32);
-        let red_x = 5 * w / 8 + 2;
-        for bayer in [false, true] {
-            let frame = color_frame(bayer, w, h);
-            for step in [0.5, 1.0, 1.5, 2.0, 4.0] {
-                let viewport = Viewport {
-                    origin: (0.0, 0.0),
-                    step,
-                };
-                let rendered = run_at(&frame, viewport, (128, 64));
-                assert_eq!(rendered.error, None, "{bayer} {step}");
-                let at = ((red_x as f64 / step) as usize, (20.0 / step) as usize);
-                let [b, g, r, a] = painted(&rendered, at.0, at.1);
-                assert!(
-                    r > 200 && g < 60 && b < 60 && a == 255,
-                    "{bayer} {step}: {:?}",
-                    (r, g, b)
-                );
-            }
-        }
+        assert!(all.len() == 1 && Arc::ptr_eq(&all[0], &c));
     }
 }

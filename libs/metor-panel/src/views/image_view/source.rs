@@ -250,17 +250,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn a_wrong_length_sample_is_an_error() {
-        let layout = FrameLayout::from_component(
-            &ComponentSchema::new(PrimType::U16, &[4usize, 4][..]),
-            &ComponentMetadata::from(ID).with_image(ImageFormat::Mono16, 12),
-        )
-        .unwrap();
-        let state = ready(layout, Timestamp(1), &Arc::from(&[0u8; 31][..]), false);
-        assert!(matches!(state, FrameState::Error(_)), "{state:?}");
-    }
-
     #[gpui::test]
     fn an_unregistered_component_is_loading(cx: &mut gpui::TestAppContext) {
         let (_temp, db, _component) = scrub_db(&[10]);

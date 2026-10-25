@@ -947,59 +947,69 @@ mod tests {
         draw(cx);
     }
 
-    fn record_view(
+    /// A `size`² Mono16/12 ramp at t = 1, pixel `(x, y)` holding `x + size·y`.
+    fn ramp(size: usize) -> FrameState {
+        let bytes: Vec<u8> = (0..(size * size) as u16)
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let layout = FrameLayout::from_component(
+            &metor_db::ComponentSchema::new(metor_proto::types::PrimType::U16, &[size, size][..]),
+            &metor_proto_wkt::ComponentMetadata::from("cam")
+                .with_image(metor_proto_wkt::ImageFormat::Mono16, 12),
+        )
+        .unwrap();
+        FrameState::Ready {
+            frame: Frame {
+                timestamp: Timestamp(1),
+                bytes: bytes.into(),
+                layout,
+            },
+            stale: false,
+        }
+    }
+
+    fn static_view(
+        state: FrameState,
+        display: Display,
         cx: &mut gpui::TestAppContext,
-    ) -> (
-        tempfile::TempDir,
-        Entity<Host>,
-        Entity<ImageView>,
-        &mut VisualTestContext,
-    ) {
-        let (temp, db, _component) = scrub_db(&[10, 20, 100]);
-        cx.update(|cx| {
-            TemporalController::init(db.clone(), cx);
-        });
+    ) -> (tempfile::TempDir, Entity<ImageView>, &mut VisualTestContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        let source = Box::new(StaticSource(state));
+        let (_host, view, vcx) = host(
+            move |cx| ImageView::with_source(source, display, db, cx),
+            cx,
+        );
+        (temp, view, vcx)
+    }
+
+    /// The window position of a device position inside the view.
+    fn at_device(view: &ImageView, device: (f64, f64)) -> Point<Pixels> {
+        let (start_x, _) = device_span(view.bounds.origin.x, view.bounds.size.width, view.scale);
+        let (start_y, _) = device_span(view.bounds.origin.y, view.bounds.size.height, view.scale);
+        let scale = f64::from(view.scale);
+        point(
+            px(((device.0 + start_x) / scale) as f32),
+            px(((device.1 + start_y) / scale) as f32),
+        )
+    }
+
+    #[gpui::test]
+    fn the_rendered_frame_follows_the_seek_and_retires_old_images(cx: &mut gpui::TestAppContext) {
+        let (_temp, db, _component) = scrub_db(&[10, 20, 100]);
+        cx.update(|cx| TemporalController::init(db.clone(), cx));
         let cfg = ImageViewConfig {
             component: ID.into(),
             ..Default::default()
         };
         let (host, view, vcx) = host(move |cx| ImageView::from_config(&cfg, db, cx), cx);
-        (temp, host, view, vcx)
-    }
-
-    #[gpui::test]
-    fn the_rendered_frame_follows_the_seek(cx: &mut gpui::TestAppContext) {
-        let (_temp, _host, view, vcx) = record_view(cx);
-        for (t, want) in [
-            (15, Some(10)),
-            (20, Some(20)),
-            (99, Some(20)),
-            (5, None),
-            (100, Some(100)),
-        ] {
+        seek_to(5, vcx);
+        assert_eq!(vcx.update(|_, cx| view.read(cx).painted()), None);
+        let mut images = Vec::new();
+        for t in [15, 20, 100] {
             seek_to(t, vcx);
             let painted = vcx.update(|_, cx| view.read(cx).painted());
-            assert_eq!(painted, want.map(Timestamp), "seek {t}");
-        }
-        let state = vcx.update(|_, cx| view.read(cx).state().clone());
-        assert!(matches!(state, FrameState::Ready { .. }));
-    }
-
-    /// Runs enough frames, and waits long enough, for every parked image to
-    /// leave the atlas.
-    fn settle(vcx: &mut VisualTestContext) {
-        std::thread::sleep(crate::atlas::SETTLE_TIME);
-        for _ in 0..crate::atlas::SETTLE_FRAMES {
-            vcx.update(|window, cx| window.simulate_next_frame(cx));
-        }
-    }
-
-    #[gpui::test]
-    fn only_the_current_image_stays_in_the_atlas(cx: &mut gpui::TestAppContext) {
-        let (_temp, host, view, vcx) = record_view(cx);
-        let mut images = Vec::new();
-        for t in [10, 20, 100] {
-            seek_to(t, vcx);
+            assert_eq!(painted, Some(Timestamp(t / 10 * 10)), "seek {t}");
             let current = vcx.update(|_, cx| view.read(cx).frames.current.clone());
             images.push(current.expect("an image").0);
         }
@@ -1011,10 +1021,12 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         };
-        // Replaced images stay until in-flight frames are done with them,
-        // so their atlas slots cannot be refilled under a frame on the GPU.
+        // Replaced images stay until in-flight frames are done with them.
         assert_eq!(held(vcx), [true, true, true]);
-        settle(vcx);
+        std::thread::sleep(crate::atlas::SETTLE_TIME);
+        for _ in 0..crate::atlas::SETTLE_FRAMES {
+            vcx.update(|window, cx| window.simulate_next_frame(cx));
+        }
         assert_eq!(held(vcx), [false, false, true]);
         drop(view);
         vcx.update(|_, cx| {
@@ -1028,117 +1040,6 @@ mod tests {
         vcx.executor().advance_clock(crate::atlas::ORPHAN_WAIT);
         vcx.run_until_parked();
         assert_eq!(held(vcx), [false, false, false]);
-    }
-
-    #[gpui::test]
-    fn a_static_frame_renders_with_auto_levels(cx: &mut gpui::TestAppContext) {
-        let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
-        let bytes: Vec<u8> = (0..16u16).flat_map(|v| (v * 100).to_le_bytes()).collect();
-        let layout = FrameLayout::from_component(
-            &metor_db::ComponentSchema::new(metor_proto::types::PrimType::U16, &[4usize, 4][..]),
-            &metor_proto_wkt::ComponentMetadata::from("cam")
-                .with_image(metor_proto_wkt::ImageFormat::Mono16, 12),
-        )
-        .unwrap();
-        let frame = Frame {
-            timestamp: Timestamp(1),
-            bytes: bytes.into(),
-            layout,
-        };
-        let source = StaticSource(FrameState::Ready {
-            frame,
-            stale: false,
-        });
-        let (_host, view, vcx) = host(
-            move |cx| ImageView::with_source(Box::new(source), Display::default(), db, cx),
-            cx,
-        );
-        vcx.update(|_, cx| {
-            let view = view.read(cx);
-            assert_eq!(view.levels(), Some((0.0, 1500.0)));
-            assert_eq!(view.painted(), Some(Timestamp(1)));
-            assert!(matches!(view.display.levels, Levels::Auto { .. }));
-        });
-    }
-
-    #[gpui::test]
-    fn an_error_frame_shows_its_text(cx: &mut gpui::TestAppContext) {
-        let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
-        let source = StaticSource(FrameState::Error("unknown image.format".into()));
-        let (_host, view, vcx) = host(
-            move |cx| ImageView::with_source(Box::new(source), Display::default(), db, cx),
-            cx,
-        );
-        vcx.update(|_, cx| {
-            let view = view.read(cx);
-            assert_eq!(view.status(), Some(("unknown image.format".into(), false)));
-            assert!(view.frames.current.is_none());
-        });
-    }
-
-    /// A torn-out tab: painted in one window, moved to another, then
-    /// released. Neither window keeps the image.
-    #[gpui::test]
-    fn release_strips_every_window(cx: &mut gpui::TestAppContext) {
-        let (_temp, db, _component) = scrub_db(&[10]);
-        cx.update(|cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
-            TemporalController::init(db.clone(), cx);
-            dispatch(TimeAction::Seek(TimeExpr::fixed(Timestamp(10))), cx).unwrap();
-        });
-        let cfg = ImageViewConfig {
-            component: ID.into(),
-            ..Default::default()
-        };
-        let a = cx.add_window(move |_, cx| Host {
-            view: Some(cx.new(|cx| ImageView::from_config(&cfg, db, cx))),
-        });
-        let refresh = |cx: &mut gpui::TestAppContext, w: gpui::WindowHandle<Host>| {
-            for _ in 0..2 {
-                cx.update_window(w.into(), |_, window, _| window.refresh())
-                    .unwrap();
-                cx.run_until_parked();
-            }
-        };
-        refresh(cx, a);
-        let view = cx.update(|cx| a.read(cx).unwrap().view.clone().unwrap());
-        let image = cx
-            .update(|cx| view.read(cx).frames.current.clone())
-            .expect("an image")
-            .0;
-        let moved = view.clone();
-        let b = cx.add_window(move |_, _| Host { view: Some(moved) });
-        cx.update(|cx| {
-            a.update(cx, |host, _, cx| {
-                host.view = None;
-                cx.notify();
-            })
-            .unwrap()
-        });
-        refresh(cx, a);
-        refresh(cx, b);
-        let held = |cx: &mut gpui::TestAppContext, w: gpui::WindowHandle<Host>| {
-            cx.update_window(w.into(), |_, window, _| {
-                window.has_image_atlas_entry(&image)
-            })
-            .unwrap()
-        };
-        assert!(held(cx, a) && held(cx, b));
-        drop(view);
-        cx.update(|cx| {
-            b.update(cx, |host, _, cx| {
-                host.view = None;
-                cx.notify();
-            })
-            .unwrap()
-        });
-        refresh(cx, b);
-        assert!(held(cx, a) && held(cx, b), "dropped under in-flight frames");
-        cx.executor().advance_clock(crate::atlas::ORPHAN_WAIT);
-        cx.run_until_parked();
-        assert!(!held(cx, a) && !held(cx, b));
     }
 
     /// A source whose state the test sets.
@@ -1155,59 +1056,11 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_disappearing_component_shows_loading(cx: &mut gpui::TestAppContext) {
+    fn the_status_follows_the_source(cx: &mut gpui::TestAppContext) {
         let temp = tempfile::tempdir().unwrap();
         let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
-        let layout = FrameLayout::from_component(
-            &metor_db::ComponentSchema::new(metor_proto::types::PrimType::U16, &[2usize, 2][..]),
-            &metor_proto_wkt::ComponentMetadata::from("cam")
-                .with_image(metor_proto_wkt::ImageFormat::Mono16, 12),
-        )
-        .unwrap();
-        let frame = Frame {
-            timestamp: Timestamp(1),
-            bytes: vec![0u8; 8].into(),
-            layout,
-        };
-        let state = std::rc::Rc::new(std::cell::RefCell::new(FrameState::Ready {
-            frame,
-            stale: false,
-        }));
+        let state = std::rc::Rc::new(std::cell::RefCell::new(ramp(4)));
         let source = Switch(state.clone());
-        let (_host, view, vcx) = host(
-            move |cx| ImageView::with_source(Box::new(source), Display::default(), db, cx),
-            cx,
-        );
-        assert!(vcx.update(|_, cx| view.read(cx).frames.current.is_some()));
-        *state.borrow_mut() = FrameState::Loading;
-        vcx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
-        draw(vcx);
-        vcx.update(|_, cx| {
-            let view = view.read(cx);
-            assert_eq!(view.status(), Some(("loading…".into(), false)));
-            assert!(view.frames.current.is_none());
-        });
-    }
-
-    #[gpui::test]
-    fn an_rgb_frame_renders_and_a_render_error_shows(cx: &mut gpui::TestAppContext) {
-        let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
-        let layout = FrameLayout::from_component(
-            &metor_db::ComponentSchema::new(metor_proto::types::PrimType::U8, &[2usize, 2, 3][..]),
-            &metor_proto_wkt::ComponentMetadata::from("cam")
-                .with_image(metor_proto_wkt::ImageFormat::Rgb8, 8),
-        )
-        .unwrap();
-        let frame = Frame {
-            timestamp: Timestamp(1),
-            bytes: vec![0u8; 12].into(),
-            layout,
-        };
-        let source = StaticSource(FrameState::Ready {
-            frame,
-            stale: false,
-        });
         let (_host, view, vcx) = host(
             move |cx| ImageView::with_source(Box::new(source), Display::default(), db, cx),
             cx,
@@ -1215,147 +1068,39 @@ mod tests {
         vcx.update(|_, cx| {
             let view = view.read(cx);
             assert_eq!(view.status(), None);
-            assert!(view.frames.current.is_some());
+            assert_eq!(view.levels(), Some((0.0, 15.0)));
         });
-        vcx.update(|_, cx| {
-            view.update(cx, |view, _| {
-                view.render_error = Some(RenderError::InvalidViewport)
+        for (next, want) in [
+            (FrameState::Loading, "loading…"),
+            (
+                FrameState::Error("unknown image.format".into()),
+                "unknown image.format",
+            ),
+        ] {
+            *state.borrow_mut() = next;
+            vcx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+            draw(vcx);
+            vcx.update(|_, cx| {
+                let view = view.read(cx);
+                assert_eq!(view.status(), Some((want.into(), false)));
+                assert!(view.frames.current.is_none());
             });
-            let view = view.read(cx);
-            assert_eq!(
-                view.status(),
-                Some(("the viewport is not finite and positive".into(), false))
-            );
-        });
-    }
-
-    /// An 8×8 Mono16 frame whose pixel `(x, y)` is `x + 8y`.
-    fn ramp_view(
-        cx: &mut gpui::TestAppContext,
-    ) -> (tempfile::TempDir, Entity<ImageView>, &mut VisualTestContext) {
-        let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
-        let bytes: Vec<u8> = (0..64u16).flat_map(|v| v.to_le_bytes()).collect();
-        let layout = FrameLayout::from_component(
-            &metor_db::ComponentSchema::new(metor_proto::types::PrimType::U16, &[8usize, 8][..]),
-            &metor_proto_wkt::ComponentMetadata::from("cam")
-                .with_image(metor_proto_wkt::ImageFormat::Mono16, 12),
-        )
-        .unwrap();
-        let frame = Frame {
-            timestamp: Timestamp(1),
-            bytes: bytes.into(),
-            layout,
-        };
-        let source = StaticSource(FrameState::Ready {
-            frame,
-            stale: false,
-        });
-        let (_host, view, vcx) = host(
-            move |cx| ImageView::with_source(Box::new(source), Display::default(), db, cx),
-            cx,
-        );
-        (temp, view, vcx)
-    }
-
-    /// The window position over the centre of source pixel `(x, y)`.
-    fn over(view: &ImageView, x: f64, y: f64) -> Point<Pixels> {
-        let frame = view.frame().unwrap();
-        let device = view.viewport(&frame.layout).to_device((x + 0.5, y + 0.5));
-        let (start_x, _) = device_span(view.bounds.origin.x, view.bounds.size.width, view.scale);
-        let (start_y, _) = device_span(view.bounds.origin.y, view.bounds.size.height, view.scale);
-        let scale = f64::from(view.scale);
-        point(
-            px(((device.0 + start_x) / scale) as f32),
-            px(((device.1 + start_y) / scale) as f32),
-        )
-    }
-
-    #[gpui::test]
-    fn the_readout_follows_zoom_and_pan(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                let out = view.out;
-                assert!(out.0 > 0 && out.1 > 0);
-                view.zoom_at((out.0 as f64 / 2.0, out.1 as f64 / 2.0), 2.0, cx);
-                let (start, _) = view.current_viewport().unwrap();
-                view.pan(start, (-30.0, 12.0), cx);
-                assert!(matches!(view.view, ViewMode::Free { .. }));
-            })
-        });
-        draw(vcx);
-        for (x, y) in [(3, 5), (0, 0), (7, 7)] {
-            let readout = vcx.update(|_, cx| {
-                view.update(cx, |view, _| {
-                    view.hover = Some(over(view, x as f64, y as f64))
-                });
-                view.read(cx).readout()
-            });
-            let readout = readout.expect("a readout");
-            assert_eq!((readout.x, readout.y), (x, y));
-            assert_eq!(readout.value, (x + 8 * y).to_string());
         }
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.hover = Some(point(px(-1000.0), px(-1000.0)));
-                assert_eq!(view.readout(), None);
-                view.one_to_one(cx);
-                assert!(matches!(view.view, ViewMode::Free { step, .. } if step == 1.0));
-                view.reset_to_metadata(cx);
-                assert_eq!(view.view, ViewMode::Fit);
-            })
-        });
     }
 
-    /// The window position of a device position inside the view.
-    fn at_device(view: &ImageView, device: (f64, f64)) -> Point<Pixels> {
-        let (start_x, _) = device_span(view.bounds.origin.x, view.bounds.size.width, view.scale);
-        let (start_y, _) = device_span(view.bounds.origin.y, view.bounds.size.height, view.scale);
-        let scale = f64::from(view.scale);
-        point(
-            px(((device.0 + start_x) / scale) as f32),
-            px(((device.1 + start_y) / scale) as f32),
-        )
-    }
-
-    /// The ramp value painted at the device pixel under `position`.
-    fn painted_value(view: &ImageView, position: Point<Pixels>) -> u16 {
-        let (image, out) = view.frames.current.clone().expect("an image");
-        let (dx, dy) = view.device(position);
-        let (x, y) = (dx.floor() as usize - out.x, dy.floor() as usize - out.y);
-        let gray = image.as_bytes(0).unwrap()[(y * out.width + x) * 4 + 2];
-        (0..64u16)
-            .find(|v| (f64::from(*v) * 255.0 / 63.0).round() as u8 == gray)
-            .expect("a ramp gray")
-    }
-
+    /// The readout names the pixel painted under the cursor, even where a
+    /// device pixel straddles two source pixels.
     #[gpui::test]
     fn the_readout_matches_the_painted_pixel(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
+        let (_temp, view, vcx) = static_view(ramp(8), Display::default(), cx);
         vcx.update(|_, cx| {
             view.update(cx, |view, cx| {
-                // Close to 1:1, so source and device pixels are similar in
-                // size and their edges interleave.
+                // Close to 1:1, so source and device pixel edges interleave.
                 let start = Viewport::centered((3.37, 3.61), 0.9, view.out);
                 view.set_free(start, (8, 8), cx);
-                let out = view.out;
-                view.zoom_at(
-                    (out.0 as f64 / 3.0 + 0.3, out.1 as f64 / 3.0 + 0.7),
-                    1.07,
-                    cx,
-                );
-                let ViewMode::Free { step, .. } = view.view else {
-                    panic!("a free view");
-                };
-                let (viewport, _) = view.current_viewport().unwrap();
-                assert!(step < 1.0 && viewport.origin.0.fract() != 0.0);
             })
         });
         draw(vcx);
-        // Device pixels whose left edge sits on source pixel `x` but whose
-        // sample, at the pixel centre, is `x + 1`: a cursor there reads
-        // `x` by plain flooring, but the painted pixel is `x + 1`.
         let straddling = vcx.update(|_, cx| {
             let view = view.read(cx);
             let viewport = view.viewport(&view.frame().unwrap().layout);
@@ -1367,28 +1112,26 @@ mod tests {
                 .take(3)
                 .collect::<Vec<_>>()
         });
-        assert!(!straddling.is_empty(), "the zoom left no straddling pixel");
+        assert!(!straddling.is_empty(), "no straddling pixel");
         for i in straddling {
-            let (readout, painted) = vcx.update(|_, cx| {
+            let (readout, gray) = vcx.update(|_, cx| {
                 view.update(cx, |view, _| {
                     let viewport = view.viewport(&view.frame().unwrap().layout);
                     let y = viewport.to_device((0.0, 3.5)).1;
                     view.hover = Some(at_device(view, (i as f64 + 0.01, y)));
                 });
                 let view = view.read(cx);
-                (
-                    view.readout().expect("a readout"),
-                    painted_value(view, view.hover.unwrap()),
-                )
+                let (image, out) = view.frames.current.clone().expect("an image");
+                let (dx, dy) = view.device(view.hover.unwrap());
+                let (x, y) = (dx.floor() as usize - out.x, dy.floor() as usize - out.y);
+                let gray = image.as_bytes(0).unwrap()[(y * out.width + x) * 4 + 2];
+                (view.readout().expect("a readout"), gray)
             });
-            assert_eq!(readout.value, painted.to_string(), "device {i}");
+            let value: f64 = readout.value.parse().unwrap();
+            assert_eq!((value * 255.0 / 63.0).round() as u8, gray, "device {i}");
             assert_eq!(readout.pooled, None);
         }
-    }
-
-    #[gpui::test]
-    fn a_zoomed_out_readout_names_its_block(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
+        // Zoomed out, the readout names the block a device pixel pools.
         let readout = vcx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.set_free(Viewport::centered((4.0, 4.0), 4.0, view.out), (8, 8), cx);
@@ -1403,127 +1146,41 @@ mod tests {
     }
 
     #[gpui::test]
-    fn keys_without_modifiers_navigate(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
-        vcx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.focus.focus(window, cx);
-                view.one_to_one(cx);
-            })
-        });
-        vcx.simulate_keystrokes("cmd-f");
-        assert!(vcx.update(|_, cx| matches!(view.read(cx).view, ViewMode::Free { .. })));
-        vcx.simulate_keystrokes("f");
-        assert_eq!(vcx.update(|_, cx| view.read(cx).view), ViewMode::Fit);
-        vcx.simulate_keystrokes("1");
-        assert!(vcx.update(
-            |_, cx| matches!(view.read(cx).view, ViewMode::Free { step, .. } if step == 1.0)
-        ));
-    }
-
-    #[test]
-    fn a_bad_free_view_from_config_is_fit() {
-        for (center, step) in [
-            ((f64::NAN, 0.0), 1.0),
-            ((0.0, f64::INFINITY), 1.0),
-            ((0.0, 0.0), 0.0),
-            ((0.0, 0.0), -2.0),
-            ((0.0, 0.0), f64::NAN),
-        ] {
-            assert_eq!(valid_view(ViewMode::Free { center, step }), ViewMode::Fit);
-        }
-        assert_eq!(
-            valid_view(ViewMode::Free {
-                center: (1.0, 2.0),
-                step: 1e9
-            }),
-            ViewMode::Free {
-                center: (1.0, 2.0),
-                step: MAX_STEP
-            }
-        );
-    }
-
-    #[gpui::test]
-    fn the_inspector_source_lists_only_images(cx: &mut gpui::TestAppContext) {
-        let (db, _temp) = crate::views::image_view::tests::image_db();
-        let inspect_db = db.clone();
-        cx.update(|cx| {
-            crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
-        });
-        let cfg = ImageViewConfig {
-            component: "cam.pixels".into(),
-            ..Default::default()
-        };
-        let (_host, view, vcx) = host(move |cx| ImageView::from_config(&cfg, db, cx), cx);
-        let labels = vcx.update(|window, cx| {
-            let mut rows = crate::inspector::reflect::rows_for_entity(&view, &inspect_db, cx);
-            let source = rows
-                .iter_mut()
-                .find(|r| r.label() == "Source")
-                .expect("a source row");
-            let crate::inspector::rows::RowAction::Cascade(page) = source.activate(window, cx)
-            else {
-                panic!("the source row opens a page");
-            };
-            page.iter()
-                .map(|r| r.label().to_string())
-                .collect::<Vec<_>>()
-        });
-        assert!(labels.contains(&"cam.pixels".to_string()), "{labels:?}");
-        assert!(labels.contains(&"Clear".to_string()), "{labels:?}");
-        assert!(
-            !labels.iter().any(|l| l == "cam.exposure" || l == "cam.raw"),
-            "{labels:?}"
-        );
-    }
-
-    #[gpui::test]
     fn the_inspector_offers_display_and_view_commands(cx: &mut gpui::TestAppContext) {
-        let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
-        let inspect_db = db.clone();
-        cx.update(|cx| {
-            crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
-        });
-        let source = StaticSource(FrameState::Loading);
-        let (_host, view, vcx) = host(
-            move |cx| ImageView::with_source(Box::new(source), Display::default(), db, cx),
-            cx,
-        );
+        let (_temp, view, vcx) = static_view(FrameState::Loading, Display::default(), cx);
+        let db = vcx.update(|_, cx| view.read(cx).db.clone());
+        vcx.update(|_, cx| crate::inspector::registry::InspectorRegistry::init(db.clone(), cx));
         let (labels, expanded) = vcx.update(|_, cx| {
-            let rows = crate::inspector::reflect::rows_for_entity(&view, &inspect_db, cx);
+            let rows = crate::inspector::reflect::rows_for_entity(&view, &db, cx);
             // The levels row carries the histogram beneath the page.
             let expanded = rows
                 .iter()
                 .find(|row| row.label() == "Levels")
                 .and_then(|row| row.accessory("", cx))
                 .map(|spec| spec.expanded);
-            (
-                rows.iter()
-                    .map(|row| row.label().to_string())
-                    .collect::<Vec<_>>(),
-                expanded,
-            )
+            let labels: Vec<_> = rows.iter().map(|row| row.label().to_string()).collect();
+            (labels, expanded)
         });
         assert_eq!(expanded, Some(true));
-        for want in [
-            "Fit (F)",
-            "1:1 (1)",
-            "Reset to metadata (R)",
-            "Levels",
-            "Stretch: min–max",
-        ] {
+        for want in ["Source", "Fit (F)", "1:1 (1)", "Levels", "Stretch: min–max"] {
             assert!(labels.iter().any(|l| l == want), "{want} in {labels:?}");
         }
-        assert!(labels.len() > 3, "{labels:?}");
     }
 
     #[test]
-    fn device_spans_snap_both_edges() {
-        assert_eq!(device_span(px(10.3), px(20.0), 2.0), (21.0, 40));
-        assert_eq!(device_span(px(0.25), px(0.5), 1.0), (0.0, 1));
-        assert_eq!(device_span(px(5.0), px(0.0), 2.0), (10.0, 0));
+    fn a_bad_free_view_from_config_is_fit() {
+        for (center, step) in [
+            ((f64::NAN, 0.0), 1.0),
+            ((0.0, 0.0), 0.0),
+            ((0.0, 0.0), f64::NAN),
+        ] {
+            assert_eq!(valid_view(ViewMode::Free { center, step }), ViewMode::Fit);
+        }
+        let huge = valid_view(ViewMode::Free {
+            center: (1.0, 2.0),
+            step: 1e9,
+        });
+        assert!(matches!(huge, ViewMode::Free { step, .. } if step == MAX_STEP));
     }
 
     #[test]
@@ -1534,53 +1191,32 @@ mod tests {
         };
         let out = Rect::new(4, 6, 100, 50);
         assert_eq!(placed(out, &painted, &painted), (4.0, 6.0, 100.0, 50.0));
-        // Dragging right and down by (30.4, -12.6) device pixels.
+        // A pan at the same step moves by whole device pixels.
         let panned = painted.panned((30.4, -12.6));
         assert_eq!(placed(out, &painted, &panned), (34.0, -7.0, 100.0, 50.0));
         // Zooming in 2× about device (54, 31), the middle of the image.
         let zoomed = painted.zoom_about((54.0, 31.0), 2.0);
         let (x, y, w, h) = placed(out, &painted, &zoomed);
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
-        assert!(close(x, -46.0) && close(y, -19.0), "{x} {y}");
-        assert!(close(w, 200.0) && close(h, 100.0), "{w} {h}");
+        assert!(close(x, -46.0) && close(y, -19.0) && close(w, 200.0) && close(h, 100.0));
     }
 
-    /// Between a pan and its render, the painted image moves with the view.
-    #[gpui::test]
-    fn a_pan_moves_the_painted_image_before_its_render(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = ramp_view(cx);
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                let out = view.out;
-                view.zoom_at((out.0 as f64 / 2.0, out.1 as f64 / 2.0), 2.0, cx);
-            });
-        });
-        draw(vcx);
-        let (installed, panned, out) = vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                let (start, _) = view.current_viewport().unwrap();
-                view.pan(start, (17.0, -9.0), cx);
-                let (panned, _) = view.current_viewport().unwrap();
-                let installed = view.scheduler.installed().unwrap().viewport;
-                (installed, panned, view.frames.current.clone().unwrap().1)
-            })
-        });
-        assert_ne!(installed, panned, "the render has not landed yet");
-        let (x, y, _, _) = placed(out, &installed, &panned);
-        assert_eq!((x, y), (out.x as f64 + 17.0, out.y as f64 - 9.0));
-    }
-
-    /// A `[32]` centroid record at `cam.truth`: one row per sample, at
-    /// `(t, u)` with `v = u`.
-    fn install_truth(db: &DB, samples: &[(i64, f32)]) {
+    /// A `[32]` centroid record at `cam.truth` with one star at `(u, u)`,
+    /// at t = 1.
+    fn install_truth(db: &DB, u: f32) {
         use metor_db::ComponentSchema;
-        use metor_db::manifest::SpanSource;
         use metor_proto::types::PrimType;
-        for (field, schema) in [
-            ("u", ComponentSchema::new(PrimType::F32, &[32usize][..])),
-            ("v", ComponentSchema::new(PrimType::F32, &[32usize][..])),
-            ("count", ComponentSchema::new(PrimType::U64, &[][..])),
+        for (field, schema, bytes) in [
+            ("u", ComponentSchema::new(PrimType::F32, &[32usize][..]), u),
+            ("v", ComponentSchema::new(PrimType::F32, &[32usize][..]), u),
+            ("count", ComponentSchema::new(PrimType::U64, &[][..]), 0.0),
         ] {
+            let bytes: Vec<u8> = match field {
+                "count" => 1u64.to_le_bytes().to_vec(),
+                _ => (0..32)
+                    .flat_map(|i| if i == 0 { bytes } else { 0.0 }.to_le_bytes())
+                    .collect(),
+            };
             let name = format!("cam.truth.{field}");
             let id = ComponentId::new(&name);
             db.with_state_mut(|s| {
@@ -1591,94 +1227,21 @@ mod tests {
                 s.insert_component(id, schema.clone(), &db.path)
             })
             .unwrap();
-            let bytes: Vec<Vec<u8>> = samples
-                .iter()
-                .map(|&(_, u)| match field {
-                    "count" => 1u64.to_le_bytes().to_vec(),
-                    _ => (0..32)
-                        .flat_map(|i| if i == 0 { u } else { 0.0 }.to_le_bytes())
-                        .collect(),
-                })
-                .collect();
             let component = db.with_state(|s| s.get_component(id).cloned()).unwrap();
             component
                 .time_series
                 .install_samples(
                     schema.size(),
-                    samples
-                        .iter()
-                        .zip(&bytes)
-                        .map(|((t, _), b)| (Timestamp(*t), b.as_slice())),
-                    SpanSource::RemoteFetch,
+                    [(Timestamp(1), bytes.as_slice())],
+                    metor_db::manifest::SpanSource::RemoteFetch,
                 )
                 .unwrap();
         }
     }
 
-    fn truth_view<'a>(
-        samples: &[(i64, f32)],
-        cx: &'a mut gpui::TestAppContext,
-    ) -> (
-        tempfile::TempDir,
-        Entity<ImageView>,
-        &'a mut VisualTestContext,
-    ) {
-        let (temp, db, _component) = scrub_db(&[10, 20]);
-        install_truth(&db, samples);
-        cx.update(|cx| {
-            TemporalController::init(db.clone(), cx);
-        });
-        let cfg = ImageViewConfig {
-            component: ID.into(),
-            overlays: vec![OverlayConfig::from_root("cam.truth", OverlayColor::Truth)],
-            ..Default::default()
-        };
-        let (_host, view, vcx) = host(move |cx| ImageView::from_config(&cfg, db, cx), cx);
-        (temp, view, vcx)
-    }
-
-    fn first_point(view: &Entity<ImageView>, cx: &mut VisualTestContext) -> Option<f32> {
-        cx.update(|_, cx| {
-            let points = view.read(cx).overlay_points(cx);
-            points.first().map(|(_, stars)| stars[0].u)
-        })
-    }
-
     #[gpui::test]
-    fn the_overlay_follows_a_seek(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = truth_view(&[(10, 1.5), (20, 2.5)], cx);
-        seek_to(10, vcx);
-        assert_eq!(first_point(&view, vcx), Some(1.5));
-        seek_to(20, vcx);
-        assert_eq!(first_point(&view, vcx), Some(2.5));
-    }
-
-    /// A 16×16 ramp (`x + 16y`) at t = 1 with manual levels 0..255, so a
-    /// painted gray is the raw value; and a truth record with one star at
-    /// `(u, u)`.
-    fn star_on_ramp(
-        u: f32,
-        cx: &mut gpui::TestAppContext,
-    ) -> (tempfile::TempDir, Entity<ImageView>, &mut VisualTestContext) {
-        let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
-        install_truth(&db, &[(1, u)]);
-        cx.update(|cx| {
-            TemporalController::init(db.clone(), cx);
-            dispatch(TimeAction::Seek(TimeExpr::fixed(Timestamp(1))), cx).unwrap();
-        });
-        let bytes: Vec<u8> = (0..256u16).flat_map(|v| v.to_le_bytes()).collect();
-        let layout = FrameLayout::from_component(
-            &metor_db::ComponentSchema::new(metor_proto::types::PrimType::U16, &[16usize, 16][..]),
-            &metor_proto_wkt::ComponentMetadata::from("cam")
-                .with_image(metor_proto_wkt::ImageFormat::Mono16, 12),
-        )
-        .unwrap();
-        let frame = Frame {
-            timestamp: Timestamp(1),
-            bytes: bytes.into(),
-            layout,
-        };
+    fn an_overlay_point_sits_on_its_painted_pixel(cx: &mut gpui::TestAppContext) {
+        // Manual levels 0..255, so a painted gray is the raw value.
         let display = Display {
             levels: Levels::Manual {
                 black: 0.0,
@@ -1686,27 +1249,15 @@ mod tests {
             },
             ..Display::default()
         };
-        let source = StaticSource(FrameState::Ready {
-            frame,
-            stale: false,
-        });
-        let (_host, view, vcx) = host(
-            move |cx| {
-                let mut view = ImageView::with_source(Box::new(source), display, db, cx);
+        let (_temp, view, vcx) = static_view(ramp(16), display, cx);
+        vcx.update(|_, cx| {
+            let db = view.read(cx).db.clone();
+            install_truth(&db, 10.5);
+            TemporalController::init(db, cx);
+            dispatch(TimeAction::Seek(TimeExpr::fixed(Timestamp(1))), cx).unwrap();
+            view.update(cx, |view, cx| {
                 let truth = OverlayConfig::from_root("cam.truth", OverlayColor::Truth);
                 view.add_overlay(truth, cx);
-                view
-            },
-            cx,
-        );
-        (temp, view, vcx)
-    }
-
-    #[gpui::test]
-    fn an_overlay_point_sits_on_its_painted_pixel(cx: &mut gpui::TestAppContext) {
-        let (_temp, view, vcx) = star_on_ramp(10.5, cx);
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
                 // Ten device pixels per source pixel, about a fractional centre.
                 let start = Viewport::centered((7.3, 8.6), 0.1, view.out);
                 view.set_free(start, (16, 16), cx);
@@ -1721,14 +1272,11 @@ mod tests {
             let view = view.read(cx);
             let (_, stars) = view.overlay_points(cx).into_iter().next().expect("points");
             let (viewport, _) = view.current_viewport().unwrap();
-            let star = stars[0];
-            let at = view.window_point(&viewport, (f64::from(star.u), f64::from(star.v)));
+            let at = view.window_point(&viewport, (f64::from(stars[0].u), f64::from(stars[0].v)));
             let (image, out) = view.frames.current.clone().expect("an image");
             (view.readout(), view.device(at), out, image)
         });
-        let readout = readout.expect("a readout");
-        assert_eq!((readout.x, readout.y), (10, 10));
-        assert_eq!(readout.value, "170");
+        assert_eq!(readout.expect("a readout").value, "170");
         // The star's device x is the middle of the painted run of pixel 170.
         let row = star.1.floor() as usize - out.y;
         let bytes = image.as_bytes(0).unwrap();

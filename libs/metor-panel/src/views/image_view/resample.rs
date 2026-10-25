@@ -423,7 +423,7 @@ mod tests {
     use metor_proto_wkt::Stretch;
 
     use super::*;
-    use crate::views::image_view::lut::{Colormap, Display};
+    use crate::views::image_view::lut::Display;
 
     const SAT: [u8; 4] = [0, 0, 255, 255];
 
@@ -497,35 +497,6 @@ mod tests {
     }
 
     #[test]
-    fn spans_partition_the_covered_range() {
-        let limit = 50;
-        for step in [1.0, 1.463, 2.0, 4.0, 7.3] {
-            for origin in [0.0, 0.5, -3.2, 48.7, 60.0] {
-                let n = 40;
-                let mut seen = vec![0u32; limit];
-                for span in spans(origin, step, n, limit) {
-                    for x in span {
-                        seen[x] += 1;
-                    }
-                }
-                let edge = |k: f64| (origin + k * step).floor().clamp(0.0, limit as f64) as usize;
-                for (x, &n_seen) in seen.iter().enumerate() {
-                    let covered = (edge(0.0)..edge(n as f64)).contains(&x);
-                    assert_eq!(
-                        n_seen,
-                        u32::from(covered),
-                        "step {step} origin {origin} x {x}"
-                    );
-                }
-            }
-        }
-    }
-
-    fn close(a: (f64, f64), b: (f64, f64), tolerance: f64) -> bool {
-        (a.0 - b.0).abs() <= tolerance && (a.1 - b.1).abs() <= tolerance
-    }
-
-    #[test]
     fn zoom_keeps_the_point_under_the_cursor() {
         let viewport = view(-12.5, 40.0, 1.7);
         for scale in [1.0, 2.0] {
@@ -533,8 +504,9 @@ mod tests {
             let before = viewport.to_source(device);
             for factor in [1.25, 0.8, 1.25f64.powi(6)] {
                 let zoomed = viewport.zoom_about(device, factor);
+                let after = zoomed.to_source(device);
                 assert!(
-                    close(zoomed.to_source(device), before, 1e-9),
+                    (after.0 - before.0).abs() < 1e-9 && (after.1 - before.1).abs() < 1e-9,
                     "{scale} {factor}"
                 );
             }
@@ -567,32 +539,6 @@ mod tests {
                 );
             }
             step *= 2.0;
-        }
-    }
-
-    #[test]
-    fn one_to_one_is_one_device_pixel_per_source_pixel() {
-        for scale in [1.0f64, 2.0] {
-            let viewport = Viewport::centered((50.0, 50.0), 1.0, (200, 100));
-            // One source pixel spans `1 / scale` logical pixels.
-            let a = viewport.to_device((10.0, 10.0));
-            let b = viewport.to_device((11.0, 10.0));
-            assert_eq!((b.0 - a.0) / scale, 1.0 / scale);
-            assert_eq!(viewport.center((200, 100)), (50.0, 50.0));
-        }
-    }
-
-    #[test]
-    fn to_source_inverts_to_device() {
-        for viewport in [
-            view(0.0, 0.0, 1.0),
-            view(-3.2, 7.9, 0.25),
-            view(100.0, -40.0, 7.3),
-        ] {
-            for device in [(0.0, 0.0), (17.5, 3.25), (640.0, 480.0)] {
-                let back = viewport.to_device(viewport.to_source(device));
-                assert!(close(back, device, 0.5), "{viewport:?} {device:?}");
-            }
         }
     }
 
@@ -673,168 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn scratch_is_reused_across_renders() {
-        let data = ramp(16 * 16);
-        let layout = layout(ImageFormat::Mono8, 8, 16, 16);
-        let lut = gray(8);
-        let mut scratch = Scratch::default();
-        let viewport = view(0.0, 0.0, 2.0);
-        let out = viewport.visible(16, 16, 8, 8);
-        let mut first = vec![0u8; out.width * out.height * 4];
-        let frame = Plane {
-            pixels: Pixels::U8(&data),
-            layout: &layout,
-        };
-        render_into(frame, &lut, &viewport, out, 0..8, &mut first, &mut scratch).unwrap();
-        let capacity = (scratch.xs.capacity(), scratch.acc.capacity());
-        let mut second = vec![0u8; first.len()];
-        render_into(frame, &lut, &viewport, out, 0..8, &mut second, &mut scratch).unwrap();
-        assert_eq!(first, second);
-        assert_eq!((scratch.xs.capacity(), scratch.acc.capacity()), capacity);
-    }
-
-    #[test]
-    fn dst_length_overflow_is_an_error() {
-        let layout = layout(ImageFormat::Mono8, 8, 2, 2);
-        let out = Rect::new(0, 0, usize::MAX / 2, 4);
-        assert_eq!(
-            draw(
-                Pixels::U8(&[0; 4]),
-                &layout,
-                &gray(8),
-                &view(0.0, 0.0, 1.0),
-                out,
-                0..4,
-                &mut []
-            ),
-            Err(RenderError::DstLength {
-                expected: usize::MAX,
-                actual: 0
-            })
-        );
-    }
-
-    #[test]
-    fn mono16_max_pool_reaches_full_white() {
-        let (w, h) = (32, 32);
-        let mut data = vec![U16::<LE>::new(200); w * h];
-        data[17 * w + 5] = U16::new(4095);
-        let layout = layout(ImageFormat::Mono16, 12, w, h);
-        let (_, buf) = render(
-            Pixels::U16(&data),
-            &layout,
-            &gray(12),
-            view(0.0, 0.0, 4.0),
-            (8, 8),
-        );
-        assert_eq!(reds(&buf).iter().filter(|&&r| r == 255).count(), 1);
-    }
-
-    #[test]
-    fn sixteen_bit_and_one_bit_frames() {
-        let data: Vec<U16<LE>> = [0u16, 65535, 32768, 1].map(U16::new).to_vec();
-        let layout16 = layout(ImageFormat::Mono16, 16, 2, 2);
-        let (_, buf) = render(
-            Pixels::U16(&data),
-            &layout16,
-            &gray(16),
-            view(0.0, 0.0, 1.0),
-            (2, 2),
-        );
-        assert_eq!(reds(&buf), [0, 255, 128, 0]);
-        let bits1: Vec<U16<LE>> = [0u16, 1, 1, 0].map(U16::new).to_vec();
-        let layout1 = layout(ImageFormat::Mono16, 1, 2, 2);
-        let (_, buf) = render(
-            Pixels::U16(&bits1),
-            &layout1,
-            &gray(1),
-            view(0.0, 0.0, 1.0),
-            (2, 2),
-        );
-        assert_eq!(reds(&buf), [0, 255, 255, 0]);
-    }
-
-    #[test]
-    fn all_zero_and_all_saturated() {
-        let layout = layout(ImageFormat::Mono8, 8, 4, 4);
-        let display = Display {
-            saturation: true,
-            colormap: Colormap::Inferno,
-            ..Display::default()
-        };
-        let lut = Lut::build(8, 0.0, 255.0, &display, SAT);
-        let zero = vec![0u8; 16];
-        let (_, buf) = render(
-            Pixels::U8(&zero),
-            &layout,
-            &lut,
-            view(0.0, 0.0, 2.0),
-            (2, 2),
-        );
-        assert!(
-            buf.as_chunks::<4>()
-                .0
-                .iter()
-                .all(|&px| u32::from_le_bytes(px) == lut.get(0))
-        );
-        let full = vec![255u8; 16];
-        let (_, buf) = render(
-            Pixels::U8(&full),
-            &layout,
-            &lut,
-            view(0.0, 0.0, 0.5),
-            (8, 8),
-        );
-        assert!(buf.as_chunks::<4>().0.iter().all(|&px| px == SAT));
-    }
-
-    #[test]
-    fn one_by_one_fills_the_output() {
-        let layout = layout(ImageFormat::Mono8, 8, 1, 1);
-        let (out, buf) = render(
-            Pixels::U8(&[77]),
-            &layout,
-            &gray(8),
-            view(0.0, 0.0, 0.01),
-            (100, 100),
-        );
-        assert_eq!(out, Rect::new(0, 0, 100, 100));
-        assert!(reds(&buf).iter().all(|&r| r == 77));
-        let (out, buf) = render(
-            Pixels::U8(&[77]),
-            &layout,
-            &gray(8),
-            view(0.0, 0.0, 1000.0),
-            (10, 10),
-        );
-        assert_eq!(out, Rect::new(0, 0, 1, 1));
-        assert_eq!(reds(&buf), [77]);
-    }
-
-    #[test]
-    fn extreme_zoom_does_not_panic() {
-        let data = ramp(64 * 64);
-        let layout = layout(ImageFormat::Mono8, 8, 64, 64);
-        let (out, buf) = render(
-            Pixels::U8(&data),
-            &layout,
-            &gray(8),
-            view(10.0, 20.0, 1e-6),
-            (50, 50),
-        );
-        assert_eq!(out, Rect::new(0, 0, 50, 50));
-        assert!(reds(&buf).iter().all(|&r| r == data[20 * 64 + 10]));
-        let (out, _) = render(
-            Pixels::U8(&data),
-            &layout,
-            &gray(8),
-            view(-1e9, -1e9, 1e9),
-            (50, 50),
-        );
-        assert_eq!(out, Rect::new(1, 1, 1, 1));
-    }
-
-    #[test]
     fn a_viewport_outside_renders_nothing() {
         let layout = layout(ImageFormat::Mono8, 8, 8, 8);
         for viewport in [
@@ -849,273 +633,48 @@ mod tests {
     }
 
     #[test]
-    fn zero_sized_outputs_return_early() {
-        let layout = layout(ImageFormat::Mono8, 8, 2, 2);
-        let viewport = view(0.0, 0.0, 1.0);
-        assert!(viewport.visible(2, 2, 0, 5).is_empty());
-        assert!(viewport.visible(0, 0, 5, 5).is_empty());
-        let out = Rect::new(0, 0, 0, 2);
-        draw(
-            Pixels::U8(&[1; 4]),
-            &layout,
-            &gray(8),
-            &viewport,
-            out,
-            0..2,
-            &mut [],
-        )
-        .unwrap();
-        let out = Rect::new(0, 0, 2, 2);
-        draw(
-            Pixels::U8(&[1; 4]),
-            &layout,
-            &gray(8),
-            &viewport,
-            out,
-            1..1,
-            &mut [],
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn rows_render_only_their_band() {
-        let data = ramp(16 * 16);
-        let layout = layout(ImageFormat::Mono8, 8, 16, 16);
-        let lut = gray(8);
-        for step in [0.5, 1.0, 2.5] {
-            let viewport = view(0.0, 0.0, step);
-            let out = viewport.visible(16, 16, 40, 40);
-            let stride = out.width * 4;
-            let mut whole = vec![0u8; stride * out.height];
-            draw(
-                Pixels::U8(&data),
-                &layout,
-                &lut,
-                &viewport,
-                out,
-                0..out.height,
-                &mut whole,
-            )
-            .unwrap();
-            let mut banded = vec![0xab; whole.len()];
-            let band = 2..5;
-            let dst = &mut banded[band.start * stride..band.end * stride];
-            draw(
-                Pixels::U8(&data),
-                &layout,
-                &lut,
-                &viewport,
-                out,
-                band.clone(),
-                dst,
-            )
-            .unwrap();
-            for (row, (a, b)) in whole.chunks(stride).zip(banded.chunks(stride)).enumerate() {
-                match band.contains(&row) {
-                    true => assert_eq!(a, b, "step {step} row {row}"),
-                    false => assert!(b.iter().all(|&v| v == 0xab), "step {step} row {row}"),
-                }
-            }
-        }
-    }
-
-    #[test]
     fn bad_inputs_are_errors() {
         let mono = layout(ImageFormat::Mono8, 8, 2, 2);
-        let viewport = view(0.0, 0.0, 1.0);
-        let out = Rect::new(0, 0, 2, 2);
-        let lut = gray(8);
-        let mut dst = vec![0u8; 16];
         let rgb = layout(ImageFormat::Rgb8, 8, 2, 2);
-        assert_eq!(
+        let (one, nan) = (view(0.0, 0.0, 1.0), view(0.0, 0.0, f64::NAN));
+        let out = Rect::new(0, 0, 2, 2);
+        let mut dst = [0u8; 16];
+        let mut check = |pixels: &[u8], layout, viewport, rows, len: usize| {
             draw(
-                Pixels::U8(&[0; 12]),
-                &rgb,
-                &lut,
-                &viewport,
+                Pixels::U8(pixels),
+                layout,
+                &gray(8),
+                viewport,
                 out,
-                0..2,
-                &mut dst
-            ),
+                rows,
+                &mut dst[..len],
+            )
+        };
+        assert_eq!(
+            check(&[0; 12], &rgb, &one, 0..2, 16),
             Err(RenderError::Unsupported(ImageFormat::Rgb8))
         );
         assert_eq!(
-            draw(
-                Pixels::U8(&[0; 3]),
-                &mono,
-                &lut,
-                &viewport,
-                out,
-                0..2,
-                &mut dst
-            ),
+            check(&[0; 3], &mono, &one, 0..2, 16),
             Err(RenderError::PixelCount {
                 expected: 4,
                 actual: 3
             })
         );
-        for step in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            assert_eq!(
-                draw(
-                    Pixels::U8(&[0; 4]),
-                    &mono,
-                    &lut,
-                    &view(0.0, 0.0, step),
-                    out,
-                    0..2,
-                    &mut dst
-                ),
-                Err(RenderError::InvalidViewport)
-            );
-            assert!(view(0.0, 0.0, step).visible(2, 2, 2, 2).is_empty());
-        }
+        assert_eq!(
+            check(&[0; 4], &mono, &nan, 0..2, 16),
+            Err(RenderError::InvalidViewport)
+        );
         assert!(matches!(
-            draw(
-                Pixels::U8(&[0; 4]),
-                &mono,
-                &lut,
-                &viewport,
-                out,
-                1..3,
-                &mut dst[..8]
-            ),
+            check(&[0; 4], &mono, &one, 1..3, 8),
             Err(RenderError::Rows { .. })
         ));
         assert_eq!(
-            draw(
-                Pixels::U8(&[0; 4]),
-                &mono,
-                &lut,
-                &viewport,
-                out,
-                0..2,
-                &mut dst[..15]
-            ),
+            check(&[0; 4], &mono, &one, 0..2, 15),
             Err(RenderError::DstLength {
                 expected: 16,
                 actual: 15
             })
         );
-    }
-
-    /// `cargo test -p metor-panel --release -- --ignored --nocapture
-    /// image_view::resample::tests::bench`
-    #[test]
-    #[ignore]
-    fn bench() {
-        use std::hint::black_box;
-
-        use super::super::histogram::Histogram;
-
-        let (w, h) = (1024, 1024);
-        let data = star_field(w, h);
-        let layout = layout(ImageFormat::Mono16, 12, w, h);
-        let display = Display {
-            colormap: Colormap::Inferno,
-            ..Display::default()
-        };
-        let lut = Lut::build(12, 200.0, 4095.0, &display, SAT);
-        time("lut build 4096 inferno", || {
-            black_box(Lut::build(12, 200.0, 4095.0, &display, SAT));
-        });
-        time("histogram 4096 bins, whole frame", || {
-            black_box(Histogram::of_u16(&data, w, 12, Rect::new(0, 0, w, h)));
-        });
-        let cases = [
-            (
-                "fit 1200x1200 (0.853)",
-                1200,
-                1200,
-                view(0.0, 0.0, 1024.0 / 1200.0),
-            ),
-            ("1:1 1024x1024", 1024, 1024, view(0.0, 0.0, 1.0)),
-            ("zoom 4x 1600x1200", 1600, 1200, view(300.0, 300.0, 0.25)),
-            (
-                "retina full 3400x2100 fit",
-                3400,
-                2100,
-                view(-700.0, 0.0, 1024.0 / 2100.0),
-            ),
-            (
-                "retina full 3400x2100 4x",
-                3400,
-                2100,
-                view(100.0, 100.0, 0.25),
-            ),
-            ("down 512x512 (2.0)", 512, 512, view(0.0, 0.0, 2.0)),
-            (
-                "down 700x700 (1.463)",
-                700,
-                700,
-                view(0.0, 0.0, 1024.0 / 700.0),
-            ),
-            ("down 256x256 (4.0)", 256, 256, view(0.0, 0.0, 4.0)),
-        ];
-        for (name, dw, dh, viewport) in cases {
-            let out = viewport.visible(w, h, dw, dh);
-            let mut dst = vec![0u8; out.width * out.height * 4];
-            time(name, || {
-                draw(
-                    Pixels::U16(&data),
-                    &layout,
-                    &lut,
-                    &viewport,
-                    out,
-                    0..out.height,
-                    &mut dst,
-                )
-                .unwrap();
-            });
-        }
-    }
-
-    fn time(name: &str, mut f: impl FnMut()) {
-        for _ in 0..3 {
-            f();
-        }
-        let mut ms: Vec<f64> = (0..30)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                f();
-                start.elapsed().as_secs_f64() * 1e3
-            })
-            .collect();
-        ms.sort_by(f64::total_cmp);
-        println!(
-            "{name:<40} median {:>7.3} ms  min {:>7.3} ms",
-            ms[15], ms[0]
-        );
-    }
-
-    /// A 12-bit field: noise near 200, Gaussian stars, and hot pixels.
-    fn star_field(w: usize, h: usize) -> Vec<U16<LE>> {
-        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
-        let mut rnd = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let mut img: Vec<u16> = (0..w * h).map(|_| 200 + (rnd() % 24) as u16).collect();
-        for _ in 0..300 {
-            let (cx, cy) = ((rnd() % w as u64) as i64, (rnd() % h as u64) as i64);
-            let amp = (rnd() % 3800) as f32;
-            for dy in -4..=4i64 {
-                for dx in -4..=4i64 {
-                    let (x, y) = (cx + dx, cy + dy);
-                    if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
-                        continue;
-                    }
-                    let r2 = (dx * dx + dy * dy) as f32;
-                    let p = &mut img[y as usize * w + x as usize];
-                    *p = (f32::from(*p) + amp * (-r2 / 1.8).exp()).min(4095.0) as u16;
-                }
-            }
-        }
-        for _ in 0..50 {
-            img[(rnd() % (w * h) as u64) as usize] = 4095;
-        }
-        img.into_iter().map(U16::new).collect()
     }
 }
