@@ -197,7 +197,7 @@ impl State {
 
 mod update;
 
-pub use update::{MAX_OBS, valid_count};
+pub use update::MAX_OBS;
 
 #[cfg(test)]
 mod tests;

@@ -5,7 +5,6 @@ use nox::{array, tensor};
 use super::*;
 
 type M3 = Matrix3<f64, ArrayRepr>;
-type M3x6 = Matrix3x6<f64, ArrayRepr>;
 
 /// A deterministic splitmix64 stream of uniform samples in [-1, 1).
 struct Rng(u64);
@@ -68,45 +67,6 @@ fn max_abs(m: M6) -> f64 {
 fn theta_variance(p: &M6, axis: V3) -> f64 {
     let p_tt: M3 = p.fixed_slice(&[0, 0]);
     axis.dot(&p_tt.dot(&axis)).into_buf()
-}
-
-/// The update as it was before the split into `propagate` and
-/// `update_vectors`: `(I − KH)P` with no gate.
-fn estimate_attitude_pre_split<const N: usize>(
-    s: State,
-    measured_bodys: [V3; N],
-    references: [V3; N],
-    sigma_r: [f64; N],
-) -> State {
-    let omega = s.omega - s.b_hat;
-    let q_hat = propagate_quaternion(s.q_hat, omega, s.dt);
-    let mut p = propagate_state_covariance(s.p, omega, s.yqy, s.dt);
-    let mut delta_x_hat = V6::zeros();
-    for ((reference, measured_body), sigma) in
-        references.into_iter().zip(measured_bodys).zip(sigma_r)
-    {
-        let var_r = M3::eye() * sigma.powi(2);
-        let body_r = q_hat.inverse() * reference;
-        let e = measured_body - body_r;
-        let h: M3x6 = Matrix::concat_in_dim([body_r.skew(), M3::zeros()], 1);
-        let h_trans = h.transpose();
-        let s = (h.dot(&p).dot(&h_trans) + var_r)
-            .try_inverse()
-            .unwrap_or_else(|_| Matrix::eye());
-        let k = p.dot(&h_trans.dot(&s));
-        p = (M6::eye() - k.dot(&h)).dot(&p);
-        let d: V3 = h.dot(&delta_x_hat);
-        delta_x_hat = delta_x_hat + k.dot(&(e - d));
-    }
-    let delta_alpha: V3 = delta_x_hat.fixed_slice(&[0]);
-    let delta_beta: V3 = delta_x_hat.fixed_slice(&[3]);
-    State {
-        q_hat: q_hat.integrate_body(delta_alpha),
-        b_hat: s.b_hat + delta_beta,
-        p,
-        omega,
-        ..s
-    }
 }
 
 /// The `test_mekf` sequence: 180 still steps, then 120 steps at 1 rad/s about x.
@@ -215,29 +175,6 @@ fn test_mekf() {
             }
         },
     );
-}
-
-/// The Joseph form changes `estimate_attitude` only by rounding.
-#[test]
-fn estimate_attitude_matches_pre_split() {
-    let mut reference = vec![];
-    run_test_mekf_sequence(
-        |s, body, refs| estimate_attitude_pre_split(s, body, refs, [0.03, 0.03]),
-        |_, s| reference.push(s.clone()),
-    );
-    let mut i = 0;
-    run_test_mekf_sequence(
-        |s, body, refs| s.estimate_attitude(body, refs, [0.03, 0.03]),
-        |_, s| {
-            let old = &reference[i];
-            i += 1;
-            let dq: f64 = (s.q_hat.0 - old.q_hat.0).norm().into_buf();
-            assert!(dq < 1e-9, "step {i}: q_hat moved {dq}");
-            let dp = max_abs(s.p - old.p) / max_abs(old.p);
-            assert!(dp < 1e-9, "step {i}: P moved {dp} relative");
-        },
-    );
-    assert_eq!(i, 300);
 }
 
 /// Pins body←ECI (`b = q⁻¹ r = R(q)ᵀ r` with `q` stored `[x, y, z, w]` and
@@ -486,60 +423,6 @@ fn star_field(rng: &mut Rng, truth: Quat) -> [VectorObs; 32] {
     })
 }
 
-/// One frame from identity and `P = I` with the truth 170° away: the plain
-/// update is left far off, and the iterated one lands on the truth with the
-/// covariance a single update at the truth gives.
-#[test]
-fn iterated_update_converges_from_far_away() {
-    let mut rng = Rng(13);
-    let truth: Quat = Quaternion::from_axis_angle(rng.unit(), 170f64.to_radians());
-    let stars = star_field(&mut rng, truth);
-
-    let mut plain = filter();
-    plain.update_vectors(&stars, 13.8);
-    let plain_err: f64 = plain.q_hat.angular_distance(&truth).into_buf();
-    assert!(plain_err > 1f64.to_radians(), "{plain_err}");
-
-    let mut iterated = filter();
-    let counts = iterated.update_vectors_iterated(&stars, 13.8, 10);
-    assert_eq!(counts, UpdateCounts { used: 32, gated: 0 });
-    let err: f64 = iterated.q_hat.angular_distance(&truth).into_buf();
-    assert!(err < 1e-6, "{err}");
-
-    let mut at_truth = filter();
-    at_truth.q_hat = truth;
-    at_truth.update_vectors(&stars, 13.8);
-    let dp = max_abs(iterated.p - at_truth.p) / max_abs(at_truth.p);
-    assert!(dp < 1e-3, "P differs by {dp} relative");
-}
-
-/// Near the truth the iterated update is the plain one: its second pass
-/// moves `q_hat` by less than the stop tolerance.
-#[test]
-fn iterated_update_matches_plain_near_truth() {
-    let (s, truth, refs) = converged();
-    let obs = refs.map(|r| obs(truth, r, 1e-3));
-    let (mut plain, mut iterated) = (s.clone(), s);
-    plain.update_vectors(&obs, 13.8);
-    iterated.update_vectors_iterated(&obs, 13.8, 10);
-    let dq: f64 = iterated.q_hat.angular_distance(&plain.q_hat).into_buf();
-    assert!(dq.abs() < 1e-9, "{dq}");
-}
-
-/// The last pass still gates: an outlier among good vectors is rejected.
-#[test]
-fn iterated_update_gates_on_its_last_pass() {
-    let mut rng = Rng(17);
-    let truth: Quat = Quaternion::from_axis_angle(rng.unit(), 1.0);
-    let mut stars = star_field(&mut rng, truth);
-    stars[5].body = Quaternion::from_axis_angle(tensor![1.0, 0.0, 0.0], 0.01) * stars[5].body;
-    let mut s = filter();
-    let counts = s.update_vectors_iterated(&stars, 13.8, 10);
-    assert_eq!(counts, UpdateCounts { used: 31, gated: 1 });
-    let err: f64 = s.q_hat.angular_distance(&truth).into_buf();
-    assert!(err < 1e-4, "{err}");
-}
-
 /// `star_field` with each body vector turned by about `sigma` across itself.
 fn noisy_star_field(rng: &mut Rng, truth: Quat, sigma: f64) -> [VectorObs; 32] {
     let mut stars = star_field(rng, truth);
@@ -549,60 +432,6 @@ fn noisy_star_field(rng: &mut Rng, truth: Quat, sigma: f64) -> [VectorObs; 32] {
         s.sigma = sigma;
     }
     stars
-}
-
-fn converges_from(start: Quat, truth: Quat, stars: &[VectorObs]) -> f64 {
-    let mut s = filter();
-    s.q_hat = start;
-    s.update_vectors_iterated(stars, 13.8, 10);
-    s.q_hat.angular_distance(&truth).into_buf()
-}
-
-/// Starts just short of a half turn sit near the Gauss–Newton saddle; the
-/// restarts get out of it.
-#[test]
-fn iterated_update_escapes_the_half_turn_saddle() {
-    let mut rng = Rng(19);
-    let truth: Quat = Quaternion::from_axis_angle(rng.unit(), 0.7);
-    let stars = noisy_star_field(&mut rng, truth, 3e-5);
-    for axis in [V3::x_axis(), V3::y_axis(), V3::z_axis()] {
-        for deg in [179.9, 180.0] {
-            let start = truth * Quaternion::from_axis_angle(axis, -f64::to_radians(deg));
-            let err = converges_from(start, truth, &stars);
-            assert!(err < 1e-4, "{deg}° about {:?}: {err}", axis.into_buf());
-        }
-    }
-}
-
-/// From identity, 500 random attitudes (any angle) converge in one frame.
-#[test]
-fn iterated_update_converges_from_random_attitudes() {
-    let mut rng = Rng(23);
-    for trial in 0..500 {
-        let truth = Quaternion(
-            Vector::from_buf([rng.next(), rng.next(), rng.next(), rng.next()]).normalize(),
-        );
-        let stars = noisy_star_field(&mut rng, truth, 3e-5);
-        let err = converges_from(Quaternion::identity(), truth, &stars);
-        assert!(err < 1e-4, "trial {trial}: {err}");
-    }
-}
-
-/// When no start reaches a fixed point within the cap, the state stays at the
-/// prior and the frame counts as gated.
-#[test]
-fn iterated_update_that_does_not_converge_changes_nothing() {
-    let mut rng = Rng(29);
-    let truth: Quat = Quaternion::from_axis_angle(rng.unit(), 2.0);
-    let stars = star_field(&mut rng, truth);
-    let mut s = filter();
-    let before = s.clone();
-    assert_eq!(
-        s.update_vectors_iterated(&stars, 13.8, 1),
-        UpdateCounts { used: 0, gated: 32 }
-    );
-    assert_eq!(s.q_hat.0.into_buf(), before.q_hat.0.into_buf());
-    assert_eq!(s.p.into_buf(), before.p.into_buf());
 }
 
 /// A prior 4σ off still fuses: the gate looks at the fit, not the prior.

@@ -82,6 +82,7 @@ nav = fsw.add(
         sensors=plant.sensors,
         gps=gps.fix,
         stars=tracker.star_vectors,
+        star_solution=tracker.star_solution,
         meas_sigma=0.02,
     ),
 )

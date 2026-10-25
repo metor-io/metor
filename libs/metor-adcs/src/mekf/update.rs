@@ -1,7 +1,7 @@
-//! The vector update: one sequential Joseph-form pass from the prior, an
-//! iterated form for large attitude errors, and gating on the fit residuals.
+//! The vector update: one sequential Joseph-form pass from the prior, gated
+//! on the fit residuals.
 
-use nox::{ArrayRepr, Const, Matrix, Quaternion, Vector, tensor};
+use nox::{ArrayRepr, Const, Matrix, Vector, tensor};
 
 use super::{M6, Quat, State, UpdateCounts, V3, V6, VectorObs};
 
@@ -12,14 +12,6 @@ type M6x2 = Matrix<f64, 6, 2, ArrayRepr>;
 
 /// The most observations one update considers; later ones count as gated.
 pub const MAX_OBS: usize = 64;
-/// An iterated pass that moves the attitude less than this (rad) has converged.
-const STEP_TOL: f64 = 1e-6;
-/// A converged iterate whose median fit residual exceeds this squared
-/// Mahalanobis distance is taken to be stuck at a saddle (χ²₂, p = 0.001).
-const STUCK_D2: f64 = 13.8;
-/// The restarts of a stuck iterate: 90° turns of the prior about each body axis.
-const RESTART_AXES: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-
 /// The least fraction of `R` the post-fit residual covariance may shrink to.
 const RESIDUAL_FLOOR: f64 = 0.01;
 
@@ -56,23 +48,9 @@ impl Mask {
     }
 }
 
-/// How many of `obs` an update would consider: finite, with `sigma > 0`,
-/// and within the first [`MAX_OBS`].
-pub fn valid_count(obs: &[VectorObs]) -> u32 {
-    Mask::valid(obs).count()
-}
-
 fn is_valid(o: &VectorObs) -> bool {
     let finite = |v: V3| v.into_buf().iter().all(|x| x.is_finite());
     finite(o.body) && finite(o.reference) && o.sigma.is_finite() && o.sigma > 0.0
-}
-
-/// The state an update starts from.
-#[derive(Clone, Copy)]
-struct Prior {
-    q: Quat,
-    b: V3,
-    p: M6,
 }
 
 /// An estimate of attitude and bias with its covariance.
@@ -83,60 +61,30 @@ struct Estimate {
     p: M6,
 }
 
-/// How a pass's attitude correction is applied.
-#[derive(Clone, Copy)]
-enum Apply {
-    /// `integrate_body`, first order, as the filter has always applied it.
-    FirstOrder,
-    /// The exact exponential, which iterating needs for large corrections.
-    Exact,
-}
-
-impl Prior {
-    fn of(s: &State) -> Prior {
-        Prior {
-            q: s.q_hat,
-            b: s.b_hat,
-            p: s.p,
-        }
-    }
-
-    /// Fuses the observations in `mask` in sequence from this prior,
-    /// linearised about `(q, b)`, and returns the posterior.
-    fn pass(&self, q: Quat, b: V3, obs: &[VectorObs], mask: Mask, apply: Apply) -> Estimate {
-        let offset: V6 = (error_angle(q, self.q)).concat(self.b - b);
-        let (mut p, mut dx) = (self.p, offset);
-        let q_inv = q.inverse();
+impl Estimate {
+    /// Fuses the observations in `mask` in sequence from this prior and
+    /// returns the posterior.
+    fn pass(&self, obs: &[VectorObs], mask: Mask) -> Estimate {
+        let (mut p, mut dx) = (self.p, V6::zeros());
+        let q_inv = self.q.inverse();
         for (_, o) in mask.iter(obs) {
             fuse(&mut p, &mut dx, q_inv, o);
         }
-        let alpha: V3 = dx.fixed_slice::<Const<3>>(&[0]);
-        let q = match apply {
-            Apply::FirstOrder => q.integrate_body(alpha),
-            Apply::Exact => q * exp_half(alpha),
-        };
         Estimate {
-            q,
-            b: b + dx.fixed_slice::<Const<3>>(&[3]),
+            q: self.q.integrate_body(dx.fixed_slice::<Const<3>>(&[0])),
+            b: self.b + dx.fixed_slice::<Const<3>>(&[3]),
             p,
         }
     }
 
-    /// Passes from `(q, b)` and drops the observation whose fit residual is
-    /// worst while it exceeds `gate`. Returns `None` if fewer than half of
-    /// `mask`, rounded up, would remain.
-    fn gated_fit(
-        &self,
-        lin: (Quat, V3),
-        obs: &[VectorObs],
-        mut mask: Mask,
-        gate: f64,
-        apply: Apply,
-    ) -> Option<(Estimate, Mask)> {
+    /// Passes and drops the observation whose fit residual is worst while it
+    /// exceeds `gate`. Returns `None` if fewer than half of `mask`, rounded
+    /// up, would remain.
+    fn gated_fit(&self, obs: &[VectorObs], mut mask: Mask, gate: f64) -> Option<(Estimate, Mask)> {
         let n = mask.count();
         let floor = n - n / 2;
         loop {
-            let post = self.pass(lin.0, lin.1, obs, mask, apply);
+            let post = self.pass(obs, mask);
             let worst = mask
                 .iter(obs)
                 .map(|(i, o)| (i, fit_d2(&post, o)))
@@ -150,27 +98,6 @@ impl Prior {
             }
         }
     }
-
-    /// Iterates ungated passes from `q` to a fixed point, or returns `None`
-    /// if `iterations` passes do not get there.
-    fn iterate(
-        &self,
-        q: Quat,
-        obs: &[VectorObs],
-        mask: Mask,
-        iterations: usize,
-    ) -> Option<Estimate> {
-        let (mut q, mut b) = (q, self.b);
-        for _ in 0..iterations {
-            let post = self.pass(q, b, obs, mask, Apply::Exact);
-            let step: f64 = error_angle(q, post.q).norm().into_buf();
-            (q, b) = (post.q, post.b);
-            if step < STEP_TOL {
-                return Some(post);
-            }
-        }
-        None
-    }
 }
 
 impl State {
@@ -181,48 +108,17 @@ impl State {
     /// dropped and the pass rerun; a frame that would lose more than half is
     /// rejected whole. With `gate = ∞` this is one pass.
     pub fn update_vectors(&mut self, obs: &[VectorObs], gate: f64) -> UpdateCounts {
-        let prior = Prior::of(self);
-        let lin = (self.q_hat, self.b_hat);
-        let fit = prior.gated_fit(lin, obs, Mask::valid(obs), gate, Apply::FirstOrder);
-        self.accept(fit, obs.len())
-    }
-
-    /// An iterated EKF update for large attitude errors. Ungated passes, each
-    /// from the prior and linearised about the last result, run to a fixed
-    /// point within `iterations`. If that fixed point fits badly (a median
-    /// residual over [`STUCK_D2`]: a saddle,
-    /// near 180°), the iterate restarts from 90° turns of the prior about
-    /// each body axis and keeps the best fit. The result is then gated as in
-    /// [`update_vectors`](Self::update_vectors). If no start converges, the
-    /// state is left at the prior and every observation counts as gated.
-    pub fn update_vectors_iterated(
-        &mut self,
-        obs: &[VectorObs],
-        gate: f64,
-        iterations: usize,
-    ) -> UpdateCounts {
-        let prior = Prior::of(self);
-        let mask = Mask::valid(obs);
-        let solve = |q| prior.iterate(q, obs, mask, iterations);
-        let mut best = solve(prior.q).map(|e| (median_fit_d2(&e, obs, mask), e));
-        if best.is_none_or(|(cost, _)| cost > STUCK_D2) {
-            for axis in RESTART_AXES {
-                let start = prior.q * exp_half(V3::from_buf(axis) * core::f64::consts::FRAC_PI_2);
-                let Some(e) = solve(start) else { continue };
-                let cost = median_fit_d2(&e, obs, mask);
-                if best.is_none_or(|(c, _)| cost < c) {
-                    best = Some((cost, e));
-                }
-            }
-        }
-        let fit =
-            best.and_then(|(_, e)| prior.gated_fit((e.q, e.b), obs, mask, gate, Apply::Exact));
+        let prior = Estimate {
+            q: self.q_hat,
+            b: self.b_hat,
+            p: self.p,
+        };
+        let fit = prior.gated_fit(obs, Mask::valid(obs), gate);
         self.accept(fit, obs.len())
     }
 
     /// Sets the attitude block of `p` to `variance·I` (rad²) and clears its
-    /// correlation with the bias, keeping the bias block. Used to stop
-    /// trusting an attitude that consistent measurements contradict.
+    /// correlation with the bias, keeping the bias block.
     pub fn reset_attitude_variance(&mut self, variance: f64) {
         let mut p = self.p.into_buf();
         for (i, row) in p.iter_mut().enumerate() {
@@ -233,26 +129,6 @@ impl State {
             }
         }
         self.p = Matrix::from_buf(p);
-    }
-
-    /// The squared Mahalanobis distance of `other`'s attitude from this one,
-    /// under this one's attitude covariance: how far an update moved the
-    /// estimate in units of what the prior allowed.
-    pub fn attitude_distance(&self, other: &State) -> f64 {
-        let d = error_angle(self.q_hat, other.q_hat);
-        let p = self.p.into_buf();
-        let p_tt: Matrix<f64, 3, 3, ArrayRepr> = Matrix::from_buf([
-            [p[0][0], p[0][1], p[0][2]],
-            [p[1][0], p[1][1], p[1][2]],
-            [p[2][0], p[2][1], p[2][2]],
-        ]);
-        p_tt.try_inverse()
-            .map_or(f64::NAN, |inv| d.dot(&inv.dot(&d)).into_buf())
-    }
-
-    /// The body-frame rotation vector from this attitude to `other`'s.
-    pub fn attitude_correction(&self, other: &State) -> V3 {
-        error_angle(self.q_hat, other.q_hat)
     }
 
     /// Moves to `fit`'s estimate, or stays at the prior when there is none.
@@ -299,24 +175,6 @@ fn floor_residual(c: M2, sigma: f64) -> M2 {
     }
     // Shift both eigenvalues up so the smaller one sits on the floor.
     c + M2::eye() * (floor - (mean - spread))
-}
-
-/// The median of the fit residuals' squared Mahalanobis distances, which a
-/// few outliers cannot move.
-fn median_fit_d2(e: &Estimate, obs: &[VectorObs], mask: Mask) -> f64 {
-    let mut d2 = [0.0; MAX_OBS];
-    let n = mask
-        .iter(obs)
-        .zip(d2.iter_mut())
-        .map(|((_, o), slot)| *slot = fit_d2(e, o))
-        .count();
-    let d2 = &mut d2[..n];
-    if d2.is_empty() {
-        return f64::NAN;
-    }
-    let mid = n / 2;
-    let (_, median, _) = d2.select_nth_unstable_by(mid, f64::total_cmp);
-    *median
 }
 
 /// A unit vector measurement in the two directions across the predicted
@@ -394,27 +252,4 @@ fn joseph(p: M6, k: M6x2, h: M2x6, r: M2) -> M6 {
     let a = M6::eye() - k.dot(&h);
     let p = a.dot(&p).dot(&a.transpose()) + k.dot(&r).dot(&k.transpose());
     (p + p.transpose()) * 0.5
-}
-
-/// The unit quaternion `exp(δα / 2)` of the rotation vector `δα`.
-fn exp_half(delta_alpha: V3) -> Quat {
-    let angle: f64 = delta_alpha.norm().into_buf();
-    if angle == 0.0 {
-        return Quaternion::identity();
-    }
-    let v = delta_alpha * ((angle / 2.0).sin() / angle);
-    Quaternion(v.concat(tensor![(angle / 2.0).cos()]))
-}
-
-/// The body-frame rotation vector `δα` with `to = from ⊗ exp(δα / 2)`.
-fn error_angle(from: Quat, to: Quat) -> V3 {
-    let d = from.inverse() * to;
-    let [x, y, z, w] = d.0.into_buf();
-    let s = (x * x + y * y + z * z).sqrt();
-    if s == 0.0 {
-        return V3::zeros();
-    }
-    let angle = 2.0 * s.atan2(w.abs());
-    let v: V3 = tensor![x, y, z];
-    v * (angle.copysign(w) / s)
 }

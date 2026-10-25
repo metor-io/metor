@@ -84,10 +84,9 @@ pub struct NavStats {
     pub stars_gated: u64,
     /// The last star frame fused, or zero.
     pub star_frame_id: u64,
-    /// Star frames that contradicted the attitude estimate, since boot.
+    /// Star frames the gate rejected whole, since boot.
     pub contradictions: u64,
-    /// Attitude covariance resets after two consecutive, mutually
-    /// consistent contradicting star frames, since boot.
+    /// Attitude resets to the star tracker's solution, since boot.
     pub prior_resets: u64,
 }
 

@@ -1,5 +1,5 @@
 //! The star tracker's frames: the matched vectors nav fuses, and the
-//! tracker's own attitude solution for telemetry.
+//! tracker's own attitude solution, which nav resets to while lost.
 
 use metor_fsw_3::{FrameArray, Timestamp};
 use nox::{ArrayRepr, Matrix, Matrix3, Vector};
@@ -170,7 +170,7 @@ impl TryFrom<u8> for StarStatus {
     }
 }
 
-/// The tracker's own attitude solution, for telemetry. Nav does not read it.
+/// The tracker's own attitude solution. Nav resets to it while lost.
 #[derive(metor_fsw_3::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[repr(C)]
 #[frame(name = "star_solution")]
