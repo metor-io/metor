@@ -56,7 +56,7 @@ sim = plant.add(
         init_orbit_phase=0.0,
     ),
 )
-plant_pub = plant.add("pub", Publish(transport=Listen(f"127.0.0.1:{p_plant}"), items=[sim]))
+plant_pub = plant.add("pub", Publish(transport=Listen(f"[::]:{p_plant}"), items=[sim]))
 
 fsw = Target(cycle_rate=120.0, namespace="fsw")
 
@@ -89,7 +89,7 @@ ctrl = fsw.add(
         k_detumble=0.00005,
     ),
 )
-fsw_pub = fsw.add("pub", Publish(transport=Listen(f"127.0.0.1:{p_fsw}"), all=True))
+fsw_pub = fsw.add("pub", Publish(transport=Listen(f"[::]:{p_fsw}"), all=True))
 
 # The plant applies the controller's commands one cycle late.
 ctrl_cmds = plant.add(

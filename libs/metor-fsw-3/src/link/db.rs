@@ -184,7 +184,7 @@ async fn serve(listener: TcpListener, db: Arc<DB>, stop: Stop) {
     let mut conns: Vec<stellarator::JoinHandleDropGuard<()>> = Vec::new();
     let accept = async {
         loop {
-            let Some(stream) = super::transport::accept(&listener).await else {
+            let Some(stream) = accept(&listener).await else {
                 continue;
             };
             conns.retain(|conn| !conn.is_finished());
@@ -193,6 +193,22 @@ async fn serve(listener: TcpListener, db: Arc<DB>, stop: Stop) {
         }
     };
     futures_lite::future::or(accept, stop.wait()).await;
+}
+
+/// Accepts the next client, or returns `None` after an accept fails.
+///
+/// An accept failure comes from the host (for example, running out of file
+/// descriptors), not from the client, so this pauses before returning
+/// instead of letting the caller retry at once.
+async fn accept(listener: &TcpListener) -> Option<stellarator::net::TcpStream> {
+    match listener.accept().await {
+        Ok(stream) => Some(stream),
+        Err(error) => {
+            tracing::warn!(%error, "accept failed, backing off");
+            stellarator::sleep(core::time::Duration::from_millis(500)).await;
+            None
+        }
+    }
 }
 
 /// Where the records from one input port are stored.

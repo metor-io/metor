@@ -2,11 +2,12 @@
 //! and `UringOs` the ones io_uring has no opcode for.
 
 use core::mem::MaybeUninit;
+use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use core::ptr::NonNull;
 use std::ffi::CString;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use super::{Class, OsOp, Out};
+use super::{Class, Make, OsOp, Out};
 use crate::io::{
     Baud, DataBits, Errno, Flow, IoError, Op, OpenFlags, Parity, StopBits, TtyConfig, TtyQueue,
 };
@@ -22,6 +23,14 @@ pub(crate) fn errno() -> IoError {
     let raw = std::io::Error::last_os_error().raw_os_error();
     IoError::Os(raw.and_then(linux).unwrap_or(Errno::EIO))
 }
+
+/// `e` as an `IoError`, or `EIO` for an error with no Linux errno.
+pub(crate) fn os(e: std::io::Error) -> IoError {
+    IoError::Os(e.raw_os_error().and_then(linux).unwrap_or(Errno::EIO))
+}
+
+/// The permission bits of a file a connect creates, before the umask.
+pub(super) const CREATE_MODE: libc::mode_t = 0o666;
 
 #[cfg(target_os = "linux")]
 pub(super) fn linux(raw: i32) -> Option<Errno> {
@@ -63,40 +72,149 @@ pub(super) fn run(op: &OsOp) -> Result<Out, IoError> {
                 libc::sendto(fd, ptr, len, SEND_FLAGS, (&raw const ss).cast(), sl)
             }
             Op::Fsync => libc::fsync(fd) as isize,
-            Op::Accept => return accept(fd),
+            Op::Accept if op.class == Class::Listener => return accept(fd),
+            Op::Connect => return open_path(op),
             Op::Open(flags) => return open_at(fd, buf, flags),
             Op::TtyConfigure(cfg) => return configure(fd, &cfg).map(|()| Out::len(0)),
             Op::TtyFlush(queue) => return flush(fd, queue).map(|()| Out::Len(0)),
             Op::GpioGet => return gpio(fd, None).map(Out::Len),
             Op::GpioSet(level) => return gpio(fd, Some(level)).map(Out::Len),
-            Op::Close | Op::Cancel => return Err(IoError::Unsupported),
+            Op::Accept | Op::Listen | Op::Close | Op::Cancel | Op::Timeout(_) => {
+                return Err(IoError::Unsupported);
+            }
         }
     };
     cvt(n).map(|n| Out::Len(n as u32))
 }
 
+/// Accepts the next stream on listener `fd`, with its peer.
 fn accept(fd: RawFd) -> Result<Out, IoError> {
-    let (addr, len) = (core::ptr::null_mut(), core::ptr::null_mut());
+    // SAFETY: an all-zero `sockaddr_storage` is valid.
+    let mut ss: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let addr = (&raw mut ss).cast::<libc::sockaddr>();
     #[cfg(target_os = "linux")]
-    // SAFETY: plain `accept4` with no address out.
-    let raw =
-        cvt(unsafe { libc::accept4(fd, addr, len, libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) })?;
+    // SAFETY: `addr` is `len` writable bytes.
+    let raw = cvt(unsafe {
+        libc::accept4(fd, addr, &mut len, libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+    })?;
     #[cfg(not(target_os = "linux"))]
-    let raw = {
-        // SAFETY: plain `accept` with no address out.
-        let raw = cvt(unsafe { libc::accept(fd, addr, len) })?;
-        // SAFETY: `raw` is the new descriptor.
-        unsafe {
-            libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(raw, libc::F_SETFL, libc::O_NONBLOCK);
-        }
-        raw
-    };
+    // SAFETY: `addr` is `len` writable bytes.
+    let raw = cvt(unsafe { libc::accept(fd, addr, &mut len) })?;
     // SAFETY: `accept` returned a new descriptor, now owned here.
-    Ok(Out::Opened(
-        unsafe { OwnedFd::from_raw_fd(raw) },
-        Class::Stream,
-    ))
+    let stream = unsafe { OwnedFd::from_raw_fd(raw) };
+    #[cfg(not(target_os = "linux"))]
+    set_flags(stream.as_raw_fd());
+    Ok(Out::Opened {
+        fd: stream,
+        class: Class::Stream,
+        peer: socket_addr(&ss),
+    })
+}
+
+/// Marks socket `fd` close-on-exec and nonblocking, where the call that
+/// made it could not, and keeps a send to a closed peer from raising
+/// `SIGPIPE`, which `SEND_FLAGS` cannot here.
+#[cfg(not(target_os = "linux"))]
+fn set_flags(fd: RawFd) {
+    let on: libc::c_int = 1;
+    let len = size_of::<libc::c_int>() as libc::socklen_t;
+    let opt = (libc::SOL_SOCKET, libc::SO_NOSIGPIPE, (&raw const on).cast());
+    // SAFETY: plain `fcntl` and `setsockopt` on an open socket; `on` is
+    // `len` bytes.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        libc::setsockopt(fd, opt.0, opt.1, opt.2, len);
+    }
+}
+
+/// A nonblocking TCP socket for `addr`'s family.
+pub(super) fn stream_socket(addr: SocketAddr) -> Result<OwnedFd, IoError> {
+    let family = match addr {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: plain socket creation.
+    let raw = cvt(unsafe { libc::socket(family, kind, 0) })?;
+    // SAFETY: `socket` returned a new descriptor, now owned here.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    #[cfg(not(target_os = "linux"))]
+    set_flags(socket.as_raw_fd());
+    Ok(socket)
+}
+
+/// A nonblocking TCP socket with its connect to `addr` started. Wait for it
+/// to take writes, then ask [`connected`].
+pub(super) fn connect(addr: SocketAddr) -> Result<OwnedFd, IoError> {
+    let socket = stream_socket(addr)?;
+    let (ss, len) = sockaddr(addr);
+    // SAFETY: `ss` is a socket address of `len` bytes.
+    let started = cvt(unsafe { libc::connect(socket.as_raw_fd(), (&raw const ss).cast(), len) });
+    match started {
+        Ok(_) | Err(IoError::Os(Errno::EINPROGRESS)) => Ok(socket),
+        Err(e) => Err(e),
+    }
+}
+
+/// How the connect started on `fd` ended, once it takes writes: `Ok` once
+/// connected, or its error. A socket that takes writes unconnected with no
+/// error is `ENOTCONN`.
+pub(super) fn connected(fd: RawFd) -> Result<(), IoError> {
+    let mut error: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    let (level, opt, out) = (libc::SOL_SOCKET, libc::SO_ERROR, (&raw mut error).cast());
+    // SAFETY: `out` is `len` writable bytes.
+    cvt(unsafe { libc::getsockopt(fd, level, opt, out, &mut len) })?;
+    if error != 0 {
+        return Err(IoError::Os(linux(error).unwrap_or(Errno::EIO)));
+    }
+    // SAFETY: an all-zero `sockaddr_storage` is valid.
+    let mut ss: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `ss` is `len` writable bytes.
+    cvt(unsafe { libc::getpeername(fd, (&raw mut ss).cast(), &mut len) }).map(drop)
+}
+
+/// The address in `ss`, if its family is IPv4 or IPv6.
+pub(super) fn socket_addr(ss: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    let ptr = core::ptr::from_ref(ss);
+    match i32::from(ss.ss_family) {
+        libc::AF_INET => {
+            // SAFETY: an `AF_INET` address is a `sockaddr_in`, which
+            // `sockaddr_storage` is larger and more aligned than.
+            let sin = unsafe { &*ptr.cast::<libc::sockaddr_in>() };
+            let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+            Some(SocketAddrV4::new(ip, u16::from_be(sin.sin_port)).into())
+        }
+        libc::AF_INET6 => {
+            // SAFETY: as above, for `sockaddr_in6`.
+            let sin6 = unsafe { &*ptr.cast::<libc::sockaddr_in6>() };
+            let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            let port = u16::from_be(sin6.sin6_port);
+            Some(SocketAddrV6::new(ip, port, sin6.sin6_flowinfo, sin6.sin6_scope_id).into())
+        }
+        _ => None,
+    }
+}
+
+/// Opens a connect's path.
+fn open_path(op: &OsOp) -> Result<Out, IoError> {
+    let Some(Make::Open { path, flags }) = op.make else {
+        return Err(IoError::Unsupported);
+    };
+    // SAFETY: `path` is a NUL-terminated path its recipe keeps alive.
+    let raw = cvt(unsafe { libc::open(path.as_ptr(), flags, libc::c_uint::from(CREATE_MODE)) })?;
+    Ok(Out::Opened {
+        // SAFETY: `open` returned a new descriptor, now owned here.
+        fd: unsafe { OwnedFd::from_raw_fd(raw) },
+        class: op.class,
+        peer: None,
+    })
 }
 
 /// Opens the path in `path`'s bytes under directory `dir`.
@@ -112,7 +230,12 @@ pub(super) fn open_at(dir: RawFd, path: NonNull<[u8]>, flags: OpenFlags) -> Resu
         false => Class::File,
     };
     // SAFETY: `openat` returned a new descriptor, now owned here.
-    Ok(Out::Opened(unsafe { OwnedFd::from_raw_fd(raw) }, class))
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    Ok(Out::Opened {
+        fd,
+        class,
+        peer: None,
+    })
 }
 
 fn open_flags(f: OpenFlags) -> (i32, u32) {

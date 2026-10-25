@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -95,13 +96,62 @@ class Dir(Kind):
 
 @dataclass(frozen=True)
 class TcpListen(Kind):
-    """A TCP listener bound to ``addr``."""
+    """A TCP listener bound to ``addr``, taking streams from the peers in the
+    ``allow`` CIDR blocks, or from any peer when ``allow`` is empty."""
 
     addr: str
+    allow: Sequence[str] = ()
     _key = "tcp_listen"
+
+    def __post_init__(self) -> None:
+        for block in self.allow:
+            _check_cidr(block)
+
+    def _fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {"addr": self.addr}
+        if self.allow:
+            fields["allow"] = list(self.allow)
+        return fields
+
+
+def _check_cidr(block: object) -> None:
+    """Refuses what the target's parser refuses: anything but an IP address,
+    a slash, and a prefix length no wider than the address."""
+    bad = ConfigError(f"`{block}` is not a CIDR block such as `10.0.0.0/24`")
+    if not isinstance(block, str):
+        raise bad
+    addr, _, prefix = block.partition("/")
+    if not (prefix.isascii() and prefix.isdigit()) or "%" in addr:
+        raise bad
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        raise bad from None
+    if int(prefix) > ip.max_prefixlen:
+        raise bad
+
+
+@dataclass(frozen=True)
+class TcpDial(Kind):
+    """A TCP dialer: each stream connects to ``addr``, a ``host:port``."""
+
+    addr: str
+    _key = "tcp_dial"
 
     def _fields(self) -> dict[str, Any]:
         return {"addr": self.addr}
+
+
+@dataclass(frozen=True)
+class PeerDial(Kind):
+    """A TCP dialer of ``link`` on the target named ``target``, in the same
+    deployment. `metor build` resolves it to a `TcpDial`."""
+
+    target: str
+    link: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {"peer": {"target": self.target, "link": self.link}}
 
 
 class SimKind(Kind):

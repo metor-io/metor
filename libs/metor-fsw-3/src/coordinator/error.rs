@@ -129,8 +129,8 @@ pub enum BuildError {
     #[error("`{system}` holds a `Cap`, so an fsw.io must follow it")]
     NoIoStepAfter { system: String },
 
-    #[error("{count} systems hold a `Cap`, past the limit")]
-    TooManyIoMembers { count: usize },
+    #[error("the systems with a `Cap` ask for {ops} ops in flight, past the limit")]
+    TooManyIoOps { ops: usize },
 
     #[error("{count} resources, past the limit")]
     TooManyResources { count: usize },

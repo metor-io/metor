@@ -10,13 +10,13 @@ use std::rc::Rc;
 use super::arena::{Arena, Buf};
 use super::op_slot::{Event, OpSlot, Write};
 use super::ops::{BufOp, IoOp, Lent, RawOp};
-use super::{Cqe, IoError, IoStatus, MAX_OPS, Op, RawHandle, Span, Sqe, Token};
+use super::{Cqe, IoError, IoStatus, Op, RawHandle, Span, Sqe, Token};
 use crate::port::{Input, Output};
 
 struct Queue {
     sq: RefCell<Output<Sqe>>,
     cq: RefCell<Input<Cqe>>,
-    ops: [Cell<OpSlot>; MAX_OPS],
+    ops: Box<[Cell<OpSlot>]>,
     generation: Cell<u16>,
     arena: Rc<Arena>,
     next_grant: Cell<u16>,
@@ -27,15 +27,21 @@ struct Queue {
 pub struct Io(Rc<Queue>);
 
 impl Io {
-    pub(crate) fn new(sq: Output<Sqe>, cq: Input<Cqe>, arena: Rc<Arena>) -> Self {
+    /// A queue pair with `ops` op slots.
+    pub(crate) fn new(sq: Output<Sqe>, cq: Input<Cqe>, arena: Rc<Arena>, ops: u16) -> Self {
         Self(Rc::new(Queue {
             sq: RefCell::new(sq),
             cq: RefCell::new(cq),
-            ops: core::array::from_fn(|_| Cell::default()),
+            ops: (0..ops).map(|_| Cell::default()).collect(),
             generation: Cell::new(0),
             arena,
             next_grant: Cell::new(0),
         }))
+    }
+
+    /// How many ops may be in flight at once.
+    pub(crate) fn ops(&self) -> usize {
+        self.0.ops.len()
     }
 
     pub(crate) fn arena(&self) -> &Rc<Arena> {
@@ -72,9 +78,9 @@ impl Io {
     /// no SQ room is free.
     fn queue_op(&self, handle: RawHandle, op: &Op, buf: Option<&Buf>) -> Result<Token, IoError> {
         let span = match buf {
-            Some(buf) if buf.live() => buf.span_for(op),
+            Some(buf) if buf.live() && buf.capacity() >= op.min_buf() => buf.span_for(op),
             Some(_) => return Err(IoError::BadBuf),
-            None if op.fills() || op.drains() => return Err(IoError::BadBuf),
+            None if op.needs_buf() => return Err(IoError::BadBuf),
             None => Span::default(),
         };
         self.pump();
@@ -96,7 +102,7 @@ impl Io {
     /// Writes again what the SQ refused, then records every completion on
     /// the CQ.
     fn pump(&self) {
-        for index in 0..MAX_OPS {
+        for index in 0..self.0.ops.len() {
             self.apply(index, Event::Pumped);
         }
         let Ok(mut cq) = self.0.cq.try_borrow_mut() else {

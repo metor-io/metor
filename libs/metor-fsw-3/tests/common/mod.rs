@@ -15,7 +15,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use metor_fsw_3::cli::cargo::{cargo_build, wasm_build};
-use metor_fsw_3::coordinator::{Coordinator, CoordinatorConfig, EndReason, SystemTable};
+use metor_fsw_3::coordinator::{
+    Coordinator, CoordinatorConfig, EndReason, SystemConfig, SystemTable,
+};
+use metor_fsw_3::io::{Backing, IO_TYPE, RealKind};
 use metor_fsw_3::wasm::{Limits, WasmPack};
 use metor_fsw_3::{Frame, Output, Record, Timestamp, system};
 use metor_proto_stellar::{PacketSink, PacketStream, Peer, identify};
@@ -255,6 +258,35 @@ impl Future for Until {
             false => Poll::Pending,
         }
     }
+}
+
+/// Moves each system's `ep` param, a real resource, into the resource
+/// `{id}_ep` granted to its `ep`, and marks a dialer `dialing`. Adds the io
+/// steps if any system has a resource.
+pub fn lower_links(config: &mut CoordinatorConfig) {
+    for system in &mut config.systems {
+        let Some(ep) = system.params.as_object_mut().and_then(|p| p.remove("ep")) else {
+            continue;
+        };
+        let kind: RealKind = serde_json::from_value(ep).expect("a real resource");
+        if matches!(kind, RealKind::TcpDial { .. }) {
+            system.params["dialing"] = true.into();
+        }
+        let ep = format!("{}_ep", system.id);
+        system.grants.insert("ep".into(), ep.clone());
+        config.resources.insert(ep, Backing::Real(kind));
+    }
+    if config.resources.is_empty() {
+        return;
+    }
+    let status = serde_json::json!({ "status": true });
+    config.systems.extend([
+        SystemConfig::new("io_submit", IO_TYPE),
+        SystemConfig {
+            params: status,
+            ..SystemConfig::new("io_complete", IO_TYPE)
+        },
+    ]);
 }
 
 /// The ids of `c`'s systems that panicked, in step order.

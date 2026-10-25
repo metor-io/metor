@@ -257,6 +257,35 @@ A file emits one envelope, config version 2: every target's packs and
 
 `metor run` builds and runs every target, or one with `--target`.
 
+## IO
+
+A system reaches a resource through a `Cap<K>` parameter, where `K` is the
+interface: `Uart`, `Can`, `Udp`, `File`, `Dir`, `GpioLine`, or `Endpoint`.
+A resource is a recipe: a path and baud, an address. The build checks it
+and opens nothing, so a device missing at boot does not fail the build.
+
+The capability only makes connections. `connect` opens a new descriptor
+and resolves to a `Handle<K>` that takes the interface's ops; on an
+`Endpoint`, `connect` dials and `listen` resolves to a listener whose
+`accept` gives streams. A lost device is an op error on its handle, which
+`IoError::is_lost` names. The system closes the handle and connects again
+when it chooses: `Reconnect` does that with a doubling `Backoff` for a
+cyclic system, and a sequence loops on `connect().await`.
+
+```rust
+loop {
+    let Ok(port) = uart.connect().await else {
+        let _ = uart.timeout(backoff.next_wait()).await;
+        continue;
+    };
+    read_until_lost(&port, buf).await;
+    let _ = port.close().await;
+}
+```
+
+Every op goes through a `fsw.io` step once per cycle. A sim resource is a
+wire: each end connects at once and its ops never reach the OS.
+
 ## Links and gateways
 
 `Publish` serves the records wired into it over metor-proto. `Subscribe`
@@ -264,8 +293,20 @@ writes the records it is sent onto ports of its own. Each takes one
 `transport`: `Listen`, `Connect`, or `Peer`, a link of the deployment that
 `metor build` turns into an address.
 
+Both are sequences that hold a `Cap<Endpoint>` named `ep`. `Target.add`
+makes the transport a resource named `{link}_ep` and grants it to `ep`:
+`Listen` a `tcp_listen`, `Connect` a `tcp_dial`, and `Peer` a dial that
+`metor build` points at the listener's `host:port`. A dial's host name
+resolves on the target, when it builds. A listening link listens on its
+first cycle and accepts from then on; a taken address fails the listen,
+and the link listens again after a backoff. A listener's `allow` list of
+CIDR blocks lives on the resource, so the IO layer closes a peer outside
+it and refuses the stream, and the link asks for the next one. The link's
+ops go through `fsw.io` once per cycle, and every buffer comes from its
+arena at make.
+
 ```python
-plant_pub = plant.add("pub", Publish(transport=Listen("0.0.0.0:2240"), items=[sim]))
+plant_pub = plant.add("pub", Publish(transport=Listen("[::]:2240"), items=[sim]))
 mirror = fsw.add("plant", Subscribe(transport=Peer(plant_pub), items=[sim]))
 nav = fsw.add("nav", Nav(sensors=mirror.port(sim.sensors)))
 ```

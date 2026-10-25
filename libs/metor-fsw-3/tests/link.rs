@@ -9,13 +9,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{
-    Deadline, Fsw, Imu, Ping, Running, Source, Target, dial_fsw, fixture_dir, metor, source, within,
+    Deadline, Fsw, Imu, Ping, Running, Source, Target, dial_fsw, fixture_dir, lower_links, metor,
+    source, within,
 };
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::coordinator::{
     CoordinatorConfig, InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig, SystemTable,
 };
-use metor_fsw_3::{Clock, DefCx, Frame, Input, LinkStatus, Output, Timestamp, WallRate, system};
+use metor_fsw_3::{
+    Clock, DefCx, Frame, Input, LinkStatus, Output, ResourceStatus, Timestamp, WallRate, system,
+};
 use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::PacketStream;
 use metor_proto_wkt::LogEvent;
@@ -52,6 +55,19 @@ fn status_sink(#[state] s: &mut StatusSink, link_status: &mut Input<LinkStatus>)
     for status in link_status.drain().flatten() {
         // PANIC Safety: no test holds this lock across a panic.
         s.0.lock().expect("an unpoisoned sink").push(*status);
+    }
+}
+
+/// Keeps the last status `io_complete` wrote for each resource.
+struct IoSink(Arc<Mutex<Vec<ResourceStatus>>>);
+
+#[system]
+fn io_sink(#[state] s: &mut IoSink, io_status: &mut Input<ResourceStatus>) {
+    for status in io_status.drain().flatten() {
+        // PANIC Safety: no test holds this lock across a panic.
+        let mut kept = s.0.lock().expect("an unpoisoned sink");
+        kept.retain(|k| k.resource != status.resource);
+        kept.push(*status);
     }
 }
 
@@ -112,6 +128,7 @@ struct Seen {
     statuses: Arc<Mutex<Vec<LinkStatus>>>,
     pings: Arc<Mutex<Vec<u32>>>,
     faults: Arc<Mutex<Vec<String>>>,
+    io: Arc<Mutex<Vec<ResourceStatus>>>,
     cycles: Arc<AtomicU64>,
 }
 
@@ -138,6 +155,14 @@ impl Seen {
 
     fn cycles(&self) -> u64 {
         self.cycles.load(Ordering::Relaxed)
+    }
+
+    /// The last `io_status` of `resource`.
+    fn io(&self, resource: &str) -> Option<ResourceStatus> {
+        // PANIC Safety: as above.
+        let io = self.io.lock().expect("an unpoisoned sink");
+        let named = |s: &&ResourceStatus| s.resource.to_str().ok() == Some(resource);
+        io.iter().find(named).copied()
     }
 }
 
@@ -172,6 +197,10 @@ fn table(seen: &Seen) -> SystemTable {
     table
         .register("log_sink", log_sink(), move || LogSink(faults.clone()))
         .expect("valid records");
+    let io = seen.io.clone();
+    table
+        .register("io_sink", io_sink(), move || IoSink(io.clone()))
+        .expect("valid records");
     register_builtins(&mut table).expect("valid records");
     table
 }
@@ -187,11 +216,11 @@ fn reading(id: &str, ty: &str, port: &str, from: PortRef) -> SystemConfig {
     }
 }
 
-/// Returns a `Publish` named `link` on `transport` that serves `imu.imu`.
-fn publish(link: &str, transport: serde_json::Value, conn_cap: usize) -> SystemConfig {
+/// Returns a `Publish` named `link` on endpoint `ep` that serves `imu.imu`.
+fn publish(link: &str, ep: serde_json::Value, conn_cap: usize) -> SystemConfig {
     SystemConfig {
         params: json!({
-            "transport": transport,
+            "ep": ep,
             "namespace": "cube_sat",
             "link": link,
             "conn_cap": conn_cap,
@@ -210,15 +239,20 @@ fn pick_port(link: &str) -> SocketAddr {
     addr
 }
 
-/// Returns a transport for link `link` that listens on a free port.
+/// Returns an endpoint for link `link` that listens on a free port.
 fn listen_any(link: &str) -> serde_json::Value {
-    json!({ "listen": { "addr": pick_port(link).to_string() } })
+    json!({ "tcp_listen": { "addr": pick_port(link).to_string() } })
 }
 
-/// Returns a transport for link `link` that listens on a free port and serves
-/// one peer at a time.
-fn listen_one(link: &str) -> serde_json::Value {
-    json!({ "listen": { "addr": pick_port(link).to_string(), "max_connections": 1 } })
+/// Returns an endpoint that dials `addr`.
+fn dial(addr: SocketAddr) -> serde_json::Value {
+    json!({ "tcp_dial": { "addr": addr.to_string() } })
+}
+
+/// Returns `link` serving one peer at a time.
+fn one_peer(mut link: SystemConfig) -> SystemConfig {
+    link.params["max_connections"] = 1.into();
+    link
 }
 
 /// Returns an `imu` source and a `Publish` named `link` that serves it on a
@@ -248,12 +282,16 @@ fn spawn(systems: Vec<SystemConfig>, seen: &Seen, rate: f64) -> Target {
 
 /// Builds `systems` and runs them on a new thread with `clock`.
 fn spawn_on(systems: Vec<SystemConfig>, seen: &Seen, clock: Clock) -> Target {
-    let config = CoordinatorConfig {
+    let mut config = CoordinatorConfig {
         clock,
         namespace: Some("cube_sat".into()),
         systems,
         ..Default::default()
     };
+    lower_links(&mut config);
+    if !config.resources.is_empty() {
+        config.systems.push(io_reader());
+    }
     let seen = seen.clone();
     let cycles = seen.cycles.clone();
     Target::spawn(config, move || table(&seen), cycles)
@@ -363,11 +401,7 @@ async fn test_publish_retries_connection() {
     let _target = spawn(
         vec![
             SystemConfig::new("imu", "source"),
-            publish(
-                "pub-retries",
-                json!({ "connect": { "addr": addr.to_string() } }),
-                1 << 20,
-            ),
+            publish("pub-retries", dial(addr), 1 << 20),
         ],
         &seen,
         500.0,
@@ -431,12 +465,73 @@ async fn test_slow_client_isolation() {
     assert_eq!(seen.status().expect("a status").connections, 2);
 }
 
-/// Returns a `Subscribe` named `link` on `transport`, which writes the pings
+/// Returns a sink for `io_complete`'s status, which `spawn` adds after the
+/// io steps.
+fn io_reader() -> SystemConfig {
+    reading(
+        "io_sink",
+        "io_sink",
+        "io_status",
+        PortRef::new("io_complete", "io_status"),
+    )
+}
+
+#[stellarator::test]
+async fn test_link_and_io_status_both_count() {
+    let seen = Seen::default();
+    let mut systems = imu_publisher("pub-io");
+    systems.push(status_reader("pub"));
+    let _target = spawn(systems, &seen, 500.0);
+    let Fsw { mut rx, buf, .. } = dial_fsw(bound("pub-io")).await;
+    let mut buf = buf;
+    let mut tables = 0;
+    while tables < 3 {
+        if let OwnedPacket::Table(_) = next(&mut rx, &mut buf).await {
+            tables += 1;
+        }
+    }
+    until_seen("the counts never reached both statuses", &seen, || {
+        let link = seen.status().map_or(0, |s| s.bytes_out);
+        let io = seen.io("pub_ep").map_or(0, |s| s.bytes_out);
+        link > 0 && io > 0
+    })
+    .await;
+    let io = seen.io("pub_ep").expect("an io status");
+    assert!(io.completed > 0 && io.rejected == 0, "{io:?}");
+}
+
+/// A peer outside the listener's `allow` list is closed by the IO layer, and
+/// the link never counts it.
+#[stellarator::test]
+async fn test_peer_outside_allow_is_refused() {
+    let seen = Seen::default();
+    let addr = pick_port("cmds-allow");
+    let ep = json!({ "tcp_listen": { "addr": addr.to_string(), "allow": ["10.0.0.0/8"] } });
+    let _target = spawn(
+        vec![subscribe("cmds-allow", ep), status_reader("cmds")],
+        &seen,
+        500.0,
+    );
+    let refused = raw_dial(addr).await;
+    let (read, _) = within(
+        "the listener kept a peer outside its allow list",
+        refused.read(vec![0u8; 16]),
+    )
+    .await;
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    until_seen("the refusal was never counted", &seen, || {
+        seen.io("cmds_ep").is_some_and(|s| s.rejected > 0)
+    })
+    .await;
+    assert_eq!(seen.status().map_or(0, |s| s.connections), 0);
+}
+
+/// Returns a `Subscribe` named `link` on endpoint `ep`, which writes the pings
 /// it receives to its `ping` output.
-fn subscribe(link: &str, transport: serde_json::Value) -> SystemConfig {
+fn subscribe(link: &str, ep: serde_json::Value) -> SystemConfig {
     SystemConfig {
         params: json!({
-            "transport": transport,
+            "ep": ep,
             "namespace": "cube_sat",
             "link": link,
         }),
@@ -530,7 +625,7 @@ async fn test_subscribe_receives_records() {
             SystemConfig::new("src", "pinger"),
             SystemConfig {
                 params: json!({
-                    "transport": listen_any("pub-records"),
+                    "ep": listen_any("pub-records"),
                     "link": "pub-records",
                 }),
                 ..reading(
@@ -547,10 +642,7 @@ async fn test_subscribe_receives_records() {
     let addr = bound("pub-records");
     let _client = spawn(
         vec![
-            subscribe(
-                "cmds-records",
-                json!({ "connect": { "addr": addr.to_string() } }),
-            ),
+            subscribe("cmds-records", dial(addr)),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &client,
@@ -574,7 +666,7 @@ fn mirror(addr: SocketAddr, def: metor_fsw_3::PortDef) -> Vec<SystemConfig> {
     vec![
         SystemConfig {
             params: json!({
-                "transport": { "connect": { "addr": addr.to_string() } },
+                "ep": { "tcp_dial": { "addr": addr.to_string() } },
                 "link": "mirror",
             }),
             outputs: vec![OutputConfig {
@@ -626,7 +718,7 @@ async fn test_dialing_beside_a_listener() {
     let mut systems = mirror(addr, published_imu());
     systems.push(SystemConfig {
         params: json!({
-            "transport": listen_any("ground-beside"),
+            "ep": listen_any("ground-beside"),
             "link": "ground-beside",
         }),
         ..reading(
@@ -681,7 +773,7 @@ async fn test_reconnect_checks_the_new_peer() {
             SystemConfig::new("imu", "source"),
             publish(
                 "pub-again",
-                json!({ "listen": { "addr": addr.to_string() } }),
+                json!({ "tcp_listen": { "addr": addr.to_string() } }),
                 1 << 20,
             ),
         ],
@@ -704,7 +796,7 @@ async fn test_reconnect_checks_the_new_peer() {
             SystemConfig::new("wide", "wide"),
             SystemConfig {
                 params: json!({
-                    "transport": { "listen": { "addr": addr.to_string() } },
+                    "ep": { "tcp_listen": { "addr": addr.to_string() } },
                     "namespace": "cube_sat",
                     "link": "pub-rebuilt",
                     "conn_cap": 1 << 20,
@@ -739,7 +831,7 @@ async fn test_subscribe_skips_large_announce() {
         .inputs
         .push(InputConfig::new("wide.wide", "wide", "wide"));
     publish.params = json!({
-        "transport": listen_any("pub-wide"),
+        "ep": listen_any("pub-wide"),
         "link": "pub-wide",
     });
     let _server = spawn(
@@ -754,10 +846,7 @@ async fn test_subscribe_skips_large_announce() {
     let addr = bound("pub-wide");
     let _client = spawn(
         vec![
-            subscribe(
-                "cmds-wide",
-                json!({ "connect": { "addr": addr.to_string() } }),
-            ),
+            subscribe("cmds-wide", dial(addr)),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &client,
@@ -802,7 +891,7 @@ async fn test_disconnect_frees_slot() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe("cmds-slot", listen_one("cmds-slot")),
+            one_peer(subscribe("cmds-slot", listen_any("cmds-slot"))),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &seen,
@@ -832,7 +921,7 @@ async fn test_refuse_peer_past_limit() {
     let seen = Seen::default();
     let _target = spawn(
         vec![
-            subscribe("cmds-full", listen_one("cmds-full")),
+            one_peer(subscribe("cmds-full", listen_any("cmds-full"))),
             reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
         ],
         &seen,
@@ -875,17 +964,14 @@ async fn test_stop_closes_connections() {
     assert!(read.is_err());
 }
 
-/// Returns a `Publish` that dials `addr` and serves `imu.imu`, plus a sink
-/// for its log.
+/// Returns a `Publish` that dials `addr` and serves `imu.imu`, plus sinks
+/// for its log and status.
 fn dialing_publish(addr: SocketAddr) -> Vec<SystemConfig> {
     vec![
         SystemConfig::new("imu", "source"),
-        publish(
-            "pub-sim",
-            json!({ "connect": { "addr": addr.to_string() } }),
-            1 << 20,
-        ),
+        publish("pub-sim", dial(addr), 1 << 20),
         reading("log", "log_sink", "log", PortRef::new("pub", "log")),
+        status_reader("pub"),
     ]
 }
 
@@ -926,14 +1012,20 @@ async fn test_simulated_clock_preserves_connection() {
         ]
     );
 
+    // A peer that keeps reading holds the connection while simulated time
+    // runs far past the write timeout.
+    let _reader = stellarator::spawn(async move {
+        while let Ok(_packet) = rx.next_grow(core::mem::take(&mut buf)).await {
+            buf = vec![0u8; 1024];
+        }
+    })
+    .drop_guard();
     until("the cycles never outran a wall clock", || {
         seen.cycles() > 50_000
     })
     .await;
-    until("the link's mirror never overflowed", || {
-        seen.faulted("mirror_dropped")
-    })
-    .await;
+    assert_eq!(seen.status().map(|s| s.connections), Some(1));
+    assert!(!seen.faulted("line: disconnected"));
 }
 
 /// How many cycles the fixture target runs before it exits on its own. The

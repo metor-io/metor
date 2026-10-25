@@ -10,7 +10,7 @@ use std::rc::Rc;
 use metor_fsw_3_ring::RingBuffer;
 
 use super::arena::Arena;
-use super::{Cqe, Io, IoInit, Sqe};
+use super::{Cqe, DEFAULT_OPS, Io, IoInit, Sqe};
 use crate::coordinator::MakeError;
 use crate::port::{Input, Output};
 use crate::record::Record;
@@ -40,10 +40,19 @@ impl Loopback {
 
     /// A loopback whose SQ holds `depth` records.
     pub fn with_sq_depth(depth: usize) -> Self {
+        Self::with(depth, DEFAULT_OPS)
+    }
+
+    /// A loopback with `ops` op slots, its SQ sized to match.
+    pub fn with_ops(ops: u16) -> Self {
+        Self::with(Sqe::depth(ops), ops)
+    }
+
+    fn with(depth: usize, ops: u16) -> Self {
         let (sq_ring, sq_out, sq) = pair::<Sqe>(depth);
-        let (cq_ring, cq, cq_in) = pair::<Cqe>(Cqe::DEPTH);
+        let (cq_ring, cq, cq_in) = pair::<Cqe>(usize::from(ops));
         Self {
-            io: Io::new(sq_out, cq_in, Rc::new(Arena::new())),
+            io: Io::new(sq_out, cq_in, Rc::new(Arena::new()), ops),
             sq,
             cq,
             _rings: [sq_ring, cq_ring],

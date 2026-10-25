@@ -16,7 +16,10 @@ use metor_proto::types::Timestamp;
 
 use crate::channel::{ABORT_PORT, COMMANDS_PORT};
 use crate::def::{DefCx, Records};
-use crate::io::{Backing, Cqe, IO_CQ, IO_SQ, IO_TYPE, IoState, ResourceEnd, ResourceIndex};
+use crate::io::host::MemberDef;
+use crate::io::{
+    Backing, Cqe, DEFAULT_OPS, IO_CQ, IO_SQ, IO_TYPE, IoState, ResourceEnd, ResourceIndex,
+};
 use crate::port::{Output, ring_capacity};
 use crate::record::Record;
 use crate::system::{PortDef, SystemDef};
@@ -739,10 +742,7 @@ fn check_bindings(
 
 /// Each system with a `Cap`, in config order: its id and the resource index
 /// and end of each `Cap` parameter, in definition order.
-fn io_members(
-    plan: &Plan<'_>,
-    bindings: &Bindings,
-) -> Vec<(String, Vec<(ResourceIndex, ResourceEnd)>)> {
+fn io_members(plan: &Plan<'_>, bindings: &Bindings) -> Vec<(String, MemberDef)> {
     let caps = |system: &PlannedSystem<'_>| {
         let bound = bindings.of(system.id);
         let grant = |param: &str| {
@@ -753,10 +753,14 @@ fn io_members(
         };
         system.def.grants.iter().map(|g| grant(&g.param)).collect()
     };
+    let def = |system: &PlannedSystem<'_>| MemberDef {
+        ops: system.def.io.map_or(DEFAULT_OPS, |io| io.ops),
+        grants: caps(system),
+    };
     plan.systems
         .iter()
         .filter(|system| !system.def.grants.is_empty())
-        .map(|system| (system.id.to_string(), caps(system)))
+        .map(|system| (system.id.to_string(), def(system)))
         .collect()
 }
 
@@ -1682,6 +1686,26 @@ mod tests {
             let none =
                 |e: &BuildError| matches!(e, BuildError::NoIoStep { system } if system == "a");
             assert!(none(&e), "{e}");
+        }
+
+        /// The budget in an instance's `ops` param, or the default.
+        fn ops(cx: &DefCx<'_>) -> Result<u16, DefError> {
+            let ops = cx.params.get("ops").and_then(serde_json::Value::as_u64);
+            Ok(ops
+                .and_then(|n| u16::try_from(n).ok())
+                .unwrap_or(DEFAULT_OPS))
+        }
+
+        #[test]
+        fn test_io_budget_reaches_the_dispatch() {
+            let mut table = table();
+            table.get_mut("line").unwrap().set_ops(ops);
+            let mut config = config(nominal(), "a", "b");
+            config.systems[0].params = serde_json::json!({ "ops": 40 });
+            let built = config.build(&table).unwrap();
+            let dispatch = &built.io.host.as_ref().unwrap().dispatch;
+            assert_eq!(dispatch.ops(), 40 + usize::from(DEFAULT_OPS));
+            assert_eq!(dispatch.ops_of(0), 40);
         }
 
         #[test]

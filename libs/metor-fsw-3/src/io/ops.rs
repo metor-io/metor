@@ -1,10 +1,12 @@
 //! The op types a `Pending` resolves to, and how each turns a completion
 //! into its result.
 
+use core::marker::PhantomData;
+
 use super::arena::Buf;
-use super::cap::{Handle, RegularFile, Stream};
+use super::cap::{Handle, Listener, RegularFile, Stream};
 use super::queue::Io;
-use super::{IoError, IoStatus, RawHandle};
+use super::{IoError, IoStatus, RawAddr, RawHandle};
 
 mod sealed {
     pub trait Sealed {}
@@ -66,8 +68,13 @@ pub struct RecvOp;
 pub struct SendOp;
 /// Opens a file under a directory.
 pub struct OpenOp;
-/// Accepts a connection on a listener.
-pub struct AcceptOp;
+/// Opens a stream, by dialing or accepting; resolves to it, with the
+/// peer's `RawAddr` in the buffer.
+pub struct StreamOp;
+/// Opens a new connection to a capability's resource.
+pub struct ConnectOp<K>(PhantomData<K>);
+/// Opens a listener.
+pub struct ListenOp;
 /// Closes a handle.
 pub struct CloseOp;
 /// Flushes a file to storage.
@@ -76,15 +83,17 @@ pub struct FsyncOp;
 pub struct TtyOp;
 /// Reads or sets a GPIO line; resolves to the line's level.
 pub struct GpioOp;
+/// Lands once its time has passed.
+pub struct TimeoutOp;
 /// Any op, with its raw result.
 pub struct RawOp;
 
-/// The buffer back, with the length the op reports. A fill sets the
-/// buffer's length to it.
+/// The buffer back, with the length the op reports. A fill makes that many
+/// bytes from the span's start the filled ones.
 fn moved(status: IoStatus, value: u32, mut buf: Buf, fill: bool) -> (Result<usize, IoError>, Buf) {
     let result = status.result().map(|()| value as usize);
     if let (Ok(n), true) = (result, fill) {
-        buf.set_len(n);
+        buf.set_filled(n);
     }
     (result, buf)
 }
@@ -149,11 +158,37 @@ impl IoOp for OpenOp {
     }
 }
 
-impl sealed::Sealed for AcceptOp {}
+impl sealed::Sealed for StreamOp {}
 
-impl IoOp for AcceptOp {
+impl IoOp for StreamOp {
+    type Lent = Buf;
+    type Output = (Result<Handle<Stream>, IoError>, Buf);
+
+    fn finish(io: &Io, status: IoStatus, value: u32, mut peer: Buf) -> Self::Output {
+        let stream = opened(io, status, value);
+        if stream.is_ok() {
+            peer.set_filled(RawAddr::LEN);
+        }
+        (stream, peer)
+    }
+}
+
+impl<K> sealed::Sealed for ConnectOp<K> {}
+
+impl<K> IoOp for ConnectOp<K> {
     type Lent = ();
-    type Output = Result<Handle<Stream>, IoError>;
+    type Output = Result<Handle<K>, IoError>;
+
+    fn finish(io: &Io, status: IoStatus, value: u32, (): ()) -> Self::Output {
+        opened(io, status, value)
+    }
+}
+
+impl sealed::Sealed for ListenOp {}
+
+impl IoOp for ListenOp {
+    type Lent = ();
+    type Output = Result<Handle<Listener>, IoError>;
 
     fn finish(io: &Io, status: IoStatus, value: u32, (): ()) -> Self::Output {
         opened(io, status, value)
@@ -204,6 +239,17 @@ impl IoOp for GpioOp {
     }
 }
 
+impl sealed::Sealed for TimeoutOp {}
+
+impl IoOp for TimeoutOp {
+    type Lent = ();
+    type Output = Result<(), IoError>;
+
+    fn finish(_io: &Io, status: IoStatus, _value: u32, (): ()) -> Self::Output {
+        status.result()
+    }
+}
+
 impl sealed::Sealed for RawOp {}
 
 impl IoOp for RawOp {
@@ -226,4 +272,7 @@ impl BufOp for WriteOp {
 }
 impl BufOp for SendOp {
     type Ok = usize;
+}
+impl BufOp for StreamOp {
+    type Ok = Handle<Stream>;
 }

@@ -17,7 +17,6 @@
           }
         },
         "ring_depth": 8,
-        "seed": 0,
         "namespace": "a",
         "systems": [
           {
@@ -37,13 +36,8 @@
             "params": {
               "conn_cap": 1048576,
               "link": "pub",
-              "namespace": "a",
-              "transport": {
-                "listen": {
-                  "addr": "127.0.0.1:2240",
-                  "max_connections": 8
-                }
-              }
+              "max_connections": 8,
+              "namespace": "a"
             },
             "inputs": [
               {
@@ -75,12 +69,41 @@
               }
             ],
             "outputs": [],
+            "grants": {
+              "ep": "pub_ep"
+            },
             "location": {
               "file": "tests/fixtures/echo-pack/deploy.py",
               "line": 16
             }
+          },
+          {
+            "id": "io_submit",
+            "ty": "fsw.io",
+            "params": null,
+            "inputs": [],
+            "outputs": []
+          },
+          {
+            "id": "io_complete",
+            "ty": "fsw.io",
+            "params": {
+              "status": true
+            },
+            "inputs": [],
+            "outputs": []
           }
-        ]
+        ],
+        "resources": {
+          "pub_ep": {
+            "real": {
+              "tcp_listen": {
+                "addr": "127.0.0.1:2240"
+              }
+            }
+          }
+        },
+        "seed": 0
       }
     },
     {
@@ -98,7 +121,6 @@
           }
         },
         "ring_depth": 8,
-        "seed": 0,
         "namespace": "b",
         "systems": [
           {
@@ -106,14 +128,9 @@
             "ty": "fsw.subscribe",
             "params": {
               "conn_cap": 1048576,
-              "inbound_cap": 256,
+              "dialing": true,
               "link": "mirror",
-              "namespace": "b",
-              "transport": {
-                "connect": {
-                  "addr": "127.0.0.1:2240"
-                }
-              }
+              "namespace": "b"
             },
             "inputs": [],
             "outputs": [
@@ -127,6 +144,9 @@
                 "port": "sampler.status"
               }
             ],
+            "grants": {
+              "ep": "mirror_ep"
+            },
             "location": {
               "file": "tests/fixtures/echo-pack/deploy.py",
               "line": 19
@@ -159,13 +179,8 @@
             "params": {
               "conn_cap": 1048576,
               "link": "pub",
-              "namespace": "b",
-              "transport": {
-                "listen": {
-                  "addr": "127.0.0.1:2241",
-                  "max_connections": 8
-                }
-              }
+              "max_connections": 8,
+              "namespace": "b"
             },
             "inputs": [
               {
@@ -251,12 +266,48 @@
               }
             ],
             "outputs": [],
+            "grants": {
+              "ep": "pub_ep"
+            },
             "location": {
               "file": "tests/fixtures/echo-pack/deploy.py",
               "line": 21
             }
+          },
+          {
+            "id": "io_submit",
+            "ty": "fsw.io",
+            "params": null,
+            "inputs": [],
+            "outputs": []
+          },
+          {
+            "id": "io_complete",
+            "ty": "fsw.io",
+            "params": {
+              "status": true
+            },
+            "inputs": [],
+            "outputs": []
           }
-        ]
+        ],
+        "resources": {
+          "mirror_ep": {
+            "real": {
+              "tcp_dial": {
+                "addr": "127.0.0.1:2240"
+              }
+            }
+          },
+          "pub_ep": {
+            "real": {
+              "tcp_listen": {
+                "addr": "127.0.0.1:2241"
+              }
+            }
+          }
+        },
+        "seed": 0
       }
     },
     {
@@ -268,7 +319,6 @@
           }
         },
         "ring_depth": 8,
-        "seed": 0,
         "namespace": "gw",
         "systems": [
           {
@@ -276,14 +326,9 @@
             "ty": "fsw.subscribe",
             "params": {
               "conn_cap": 1048576,
-              "inbound_cap": 256,
+              "dialing": true,
               "link": "a",
-              "namespace": "gw",
-              "transport": {
-                "connect": {
-                  "addr": "127.0.0.1:2240"
-                }
-              }
+              "namespace": "gw"
             },
             "inputs": [],
             "outputs": [
@@ -297,6 +342,9 @@
                 "port": "sampler.status"
               }
             ],
+            "grants": {
+              "ep": "a_ep"
+            },
             "location": {
               "file": "tests/fixtures/echo-pack/deploy.py",
               "line": 23
@@ -307,14 +355,9 @@
             "ty": "fsw.subscribe",
             "params": {
               "conn_cap": 1048576,
-              "inbound_cap": 256,
+              "dialing": true,
               "link": "b",
-              "namespace": "gw",
-              "transport": {
-                "connect": {
-                  "addr": "127.0.0.1:2241"
-                }
-              }
+              "namespace": "gw"
             },
             "inputs": [],
             "outputs": [
@@ -340,6 +383,9 @@
                 "port": "meter.status"
               }
             ],
+            "grants": {
+              "ep": "b_ep"
+            },
             "location": {
               "file": "tests/fixtures/echo-pack/deploy.py",
               "line": 23
@@ -506,8 +552,41 @@
               "file": "tests/fixtures/echo-pack/deploy.py",
               "line": 23
             }
+          },
+          {
+            "id": "io_submit",
+            "ty": "fsw.io",
+            "params": null,
+            "inputs": [],
+            "outputs": []
+          },
+          {
+            "id": "io_complete",
+            "ty": "fsw.io",
+            "params": {
+              "status": true
+            },
+            "inputs": [],
+            "outputs": []
           }
-        ]
+        ],
+        "resources": {
+          "a_ep": {
+            "real": {
+              "tcp_dial": {
+                "addr": "127.0.0.1:2240"
+              }
+            }
+          },
+          "b_ep": {
+            "real": {
+              "tcp_dial": {
+                "addr": "127.0.0.1:2241"
+              }
+            }
+          }
+        },
+        "seed": 0
       }
     }
   ]

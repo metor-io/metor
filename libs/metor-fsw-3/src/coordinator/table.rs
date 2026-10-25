@@ -12,7 +12,7 @@ use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
 use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{self, AsyncSystemFn, Ctor, FnSystem, InSet, OutSet, SystemFn};
-use crate::io::{Io, IoState};
+use crate::io::{Io, IoState, Sqe};
 use crate::port::{Input, Output};
 use crate::sequence::{self, SeqInputs, SequenceFn, SequenceStep};
 use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports, System, SystemDef};
@@ -104,7 +104,12 @@ impl MakeCx<'_> {
             let cq = views.remove(ports.cq);
             let sq = writers.remove(ports.sq);
             let arena = self.io.get_or_add_member(self.id);
-            Io::new(Output::new(sq.writer), Input::new(cq.views), arena)
+            Io::new(
+                Output::new(sq.writer),
+                Input::new(cq.views),
+                arena,
+                ports.ops,
+            )
         });
         let cx = BindCx {
             instance: fn_system::Instance::from_make_cx(self),
@@ -313,6 +318,10 @@ impl SystemTable {
 
     pub(crate) fn get(&self, ty: &str) -> Option<&TableEntry> {
         self.entries.get(ty)
+    }
+
+    pub(crate) fn get_mut(&mut self, ty: &str) -> Option<&mut TableEntry> {
+        self.entries.get_mut(ty)
     }
 
     /// Iterates over every registered type and its entry, in registration order.
@@ -528,6 +537,25 @@ impl TableEntry {
             schema,
             make: Arc::new(move |cx| crate::thread::place::<A, M>(make.clone(), cx)),
         })
+    }
+
+    /// Sets each instance's op budget from its config, and sizes its SQ to
+    /// match. An instance whose def has no queue pair fails with `NoIo`, and
+    /// a budget of 0 with `NoOps`.
+    pub(crate) fn set_ops(&mut self, ops: fn(&DefCx<'_>) -> Result<u16, DefError>) {
+        let def_fn = core::mem::replace(&mut self.def_fn, Box::new(|_| Err(DefError::NoIo)));
+        self.def_fn = Box::new(move |cx| {
+            let mut def = def_fn(cx)?;
+            let io = def.io.as_mut().ok_or(DefError::NoIo)?;
+            io.ops = ops(cx)?;
+            if io.ops == 0 {
+                return Err(DefError::NoOps);
+            }
+            if let Some(sq) = def.outputs.get_mut(io.sq) {
+                sq.depth = Sqe::depth(io.ops);
+            }
+            Ok(def)
+        });
     }
 }
 
@@ -944,6 +972,69 @@ mod tests {
         // If the adapter still owned the thread group, the drop would wait out
         // the whole join timeout.
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    /// The most ops an instance may have in flight, from its `ops` param.
+    fn ops_from_params(cx: &DefCx<'_>) -> Result<u16, DefError> {
+        let ops = cx.params.get("ops").and_then(serde_json::Value::as_u64);
+        ops.and_then(|n| u16::try_from(n).ok())
+            .ok_or_else(|| DefError::Slot {
+                message: "no `ops`".into(),
+            })
+    }
+
+    fn uplink_table() -> SystemTable {
+        let mut table = SystemTable::new();
+        let uplink = crate::tests::utils::uplink();
+        table
+            .register("uplink", uplink, crate::tests::utils::Uplink::new)
+            .expect("valid records");
+        table
+            .get_mut("uplink")
+            .expect("registered")
+            .set_ops(ops_from_params);
+        table
+    }
+
+    fn def_with(
+        table: &SystemTable,
+        ty: &str,
+        params: serde_json::Value,
+    ) -> Result<SystemDef, DefError> {
+        let cx = DefCx {
+            params: &params,
+            ..DefCx::empty()
+        };
+        (table.get(ty).expect("registered").def_fn)(&cx)
+    }
+
+    #[test]
+    fn test_set_ops_sets_the_budget_and_sizes_the_sq() {
+        let table = uplink_table();
+        let def = def_with(&table, "uplink", serde_json::json!({ "ops": 40 })).unwrap();
+        let io = def.io.expect("a queue pair");
+        assert_eq!(io.ops, 40);
+        assert_eq!(def.outputs[io.sq].depth, 80);
+        let one = def_with(&table, "uplink", serde_json::json!({ "ops": 1 })).unwrap();
+        assert_eq!(one.io.map(|io| io.ops), Some(1));
+        let zero = def_with(&table, "uplink", serde_json::json!({ "ops": 0 }));
+        assert_eq!(zero.err(), Some(DefError::NoOps));
+    }
+
+    #[test]
+    fn test_set_ops_fails_the_def() {
+        let mut table = uplink_table();
+        let none = def_with(&table, "uplink", serde_json::Value::Null);
+        assert!(matches!(none, Err(DefError::Slot { .. })), "{none:?}");
+        table
+            .register_system("trap", |_| Ok((Trap, ())))
+            .expect("valid records");
+        table
+            .get_mut("trap")
+            .expect("registered")
+            .set_ops(ops_from_params);
+        let trap = def_with(&table, "trap", serde_json::json!({ "ops": 4 }));
+        assert_eq!(trap.err(), Some(DefError::NoIo));
     }
 
     #[test]

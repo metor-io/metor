@@ -76,6 +76,10 @@ pub enum MakeError {
     Bind { addr: String, message: String },
     #[error("opening the db at `{path}`: {message}")]
     OpenDb { path: String, message: String },
+    #[error("the connections need {needed} ops in flight, past the budget of {budget}")]
+    IoOps { needed: usize, budget: usize },
+    #[error("a {seed}-byte announce does not fit a {conn_cap}-byte `conn_cap`")]
+    SeedTooLarge { seed: usize, conn_cap: usize },
 }
 
 #[cfg(test)]

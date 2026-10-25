@@ -19,11 +19,15 @@ fn ops() -> Vec<Op> {
         Op::Close,
         Op::Fsync,
         Op::Accept,
+        Op::Connect,
+        Op::Listen,
         Op::TtyConfigure(TtyConfig::new(Baud::B115200)),
         Op::TtyFlush(TtyQueue::Both),
         Op::GpioGet,
         Op::GpioSet(true),
         Op::Cancel,
+        Op::Timeout(core::time::Duration::from_micros(30_000)),
+        Op::Timeout(core::time::Duration::ZERO),
     ]
 }
 
@@ -38,6 +42,32 @@ fn every_op_round_trips_through_an_sqe() {
             (sqe.token, sqe.handle, sqe.buf)
         );
     }
+}
+
+#[test]
+fn a_timeout_rounds_up_to_a_microsecond_and_saturates() {
+    let decode = |after| {
+        let sqe = Sqe::new(
+            Token::new(0, 0),
+            RawHandle::new(0, 0),
+            &Op::Timeout(after),
+            Span::default(),
+        );
+        sqe.op()
+    };
+    let micros = core::time::Duration::from_micros;
+    assert_eq!(
+        decode(core::time::Duration::from_nanos(1)),
+        Ok(Op::Timeout(micros(1)))
+    );
+    assert_eq!(
+        decode(core::time::Duration::from_nanos(2_001)),
+        Ok(Op::Timeout(micros(3)))
+    );
+    assert_eq!(
+        decode(core::time::Duration::MAX),
+        Ok(Op::Timeout(micros(u64::MAX)))
+    );
 }
 
 #[test]
@@ -181,4 +211,19 @@ fn current_position_is_no_offset() {
         Span::default(),
     );
     assert_eq!(sqe.offset.get(), CURRENT_POSITION);
+}
+
+#[test]
+fn io_ports_default_their_budget() {
+    let ports: IoPorts = serde_json::from_str(r#"{"cq": 1, "sq": 2}"#).unwrap();
+    assert_eq!(
+        ports,
+        IoPorts {
+            cq: 1,
+            sq: 2,
+            ops: DEFAULT_OPS
+        }
+    );
+    let set: IoPorts = serde_json::from_str(r#"{"cq": 1, "sq": 2, "ops": 40}"#).unwrap();
+    assert_eq!(set.ops, 40);
 }

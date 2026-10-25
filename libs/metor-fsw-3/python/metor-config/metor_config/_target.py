@@ -193,6 +193,7 @@ class Target:
         if name in self._handles:
             raise ConfigError(f"system `{name}` is already added")
         self._check_grants(name, system)
+        system._bind(self, name)
         for pack in (system._pack, *system._record_packs):
             self._packs.setdefault(pack.id, pack)
         system._name = name
@@ -354,7 +355,7 @@ class Target:
         ]
         grants = {
             param: grant.name
-            for param, grant in system._grants.items()
+            for param, grant in system._grants_for(self, index).items()
             if not isinstance(grant.kind, SimKind)
         }
         if grants:

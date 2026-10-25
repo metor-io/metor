@@ -26,20 +26,32 @@ use crate::coordinator::{
     BuildError, CoordinatorConfig, InputConfig, SystemConfig, SystemStatus, SystemTable,
 };
 
-/// Sends `cmd` on its cap whenever its buffer is idle.
-pub struct Uplink(crate::io::Slot<crate::io::SendOp>);
+/// Connects its cap, then sends `cmd` whenever its buffer is idle.
+pub struct Uplink {
+    tx: crate::io::Slot<crate::io::SendOp>,
+    link: crate::io::Reconnect<crate::io::Udp>,
+}
 
 impl Uplink {
     pub fn new(io: &mut crate::io::IoInit<'_>) -> Result<Self, crate::coordinator::MakeError> {
-        Ok(Self(crate::io::Slot::Idle(io.alloc_from(b"cmd")?)))
+        let tx = crate::io::Slot::Idle(io.alloc_from(b"cmd")?);
+        Ok(Self {
+            tx,
+            link: crate::io::Reconnect::new(),
+        })
     }
 }
 
 #[crate::system]
 pub(crate) fn uplink(#[state] s: &mut Uplink, udp: &crate::io::Cap<crate::io::Udp>) {
-    let _ = s.0.poll();
-    if let Some(buf) = s.0.take_idle() {
-        s.0 = crate::io::Slot::Busy(udp.send(buf));
+    s.link.poll(udp);
+    if let Some(Err(e)) = s.tx.poll() {
+        s.link.check(e);
+    }
+    if let Some(port) = s.link.handle()
+        && let Some(buf) = s.tx.take_idle()
+    {
+        s.tx = crate::io::Slot::Busy(port.send(buf));
     }
 }
 

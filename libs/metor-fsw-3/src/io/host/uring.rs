@@ -1,37 +1,54 @@
 //! `UringOs`: ops on its own io_uring instance.
 //!
-//! Reads, writes, sends, receives, accepts, and fsyncs go to the kernel.
-//! Tty and GPIO ioctls and opens run inline in `push`, since io_uring has no
-//! generic ioctl op, and their results come back from the next `reap`.
+//! Reads, writes, sends, receives, accepts, dials, a connect's open, and
+//! fsyncs go to the kernel. Tty and GPIO ioctls and opens under a directory
+//! run inline in `push`, since io_uring has no generic ioctl op, and their
+//! results come back from the next `reap`.
 
+use core::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use io_uring::squeue::Entry;
 use io_uring::types::{CancelBuilder, Fd};
 use io_uring::{IoUring, opcode};
 
-use super::{Class, OpId, Os, OsDone, OsOp, Out, sys};
+use super::{Class, Make, OpId, Os, OsDone, OsOp, Out, sys};
 use crate::io::{CURRENT_POSITION, Errno, IoError, Op};
 
 /// Set in the `user_data` of a cancel, whose completion is dropped.
 const CANCEL: u64 = 1 << 40;
 
-/// What the kernel reads for a `SendTo` after `push` returns.
+/// What the kernel reads or writes for an op after `push` returns: a
+/// `SendTo`'s message, an accept's peer, or a dial's address.
 struct Msg {
     addr: libc::sockaddr_storage,
+    addr_len: libc::socklen_t,
     iov: libc::iovec,
     hdr: libc::msghdr,
+}
+
+/// An op whose success is a new descriptor.
+#[derive(Default)]
+enum NewFd {
+    #[default]
+    None,
+    Accept,
+    /// The socket a dial runs on, and where it connects.
+    Dial(OwnedFd, SocketAddr),
+    /// An open, and the class of its descriptor.
+    Open(Class),
 }
 
 /// The `Os` for Linux targets.
 pub struct UringOs {
     ring: IoUring,
-    /// One per op table entry, for `SendTo`.
+    /// One per op table entry.
     msgs: Box<[Msg]>,
-    /// Whether each op table entry is an accept, whose result is a
-    /// descriptor. A cancel names the op by its id alone, so the kind is
-    /// kept here rather than in `user_data`.
-    accepts: Box<[bool]>,
+    /// Each op table entry's new descriptor op, if it is one. A cancel names the op by
+    /// its id alone, so the kind is kept here rather than in `user_data`.
+    opens: Box<[NewFd]>,
+    /// Ops the kernel holds, whose entries may still write into `msgs`.
+    in_flight: usize,
     done: Vec<OsDone>,
 }
 
@@ -47,27 +64,34 @@ impl UringOs {
         Ok(Self {
             ring: IoUring::new(entries)?,
             msgs: (0..ops).map(|_| zeroed()).collect(),
-            accepts: vec![false; ops].into(),
+            opens: (0..ops).map(|_| NewFd::None).collect(),
+            in_flight: 0,
             done: Vec::with_capacity(2 * ops),
         })
     }
 
-    fn entry(&mut self, op: &OsOp) -> Option<Entry> {
+    /// The kernel entry for `op`, or `None` for one `sys::run` runs inline.
+    fn entry(&mut self, op: &OsOp) -> Result<Option<Entry>, IoError> {
+        let index = usize::from(op.id.index());
+        let (Some(msg), Some(new_fd)) = (self.msgs.get_mut(index), self.opens.get_mut(index))
+        else {
+            return Ok(None);
+        };
+        *new_fd = NewFd::None;
         let fd = Fd(op.fd);
         let buf = op.bytes();
         let (ptr, len) = (buf.cast::<u8>().as_ptr(), buf.len() as u32);
         let at = |offset: Option<u64>| offset.unwrap_or(CURRENT_POSITION);
-        let accept = self.accepts.get_mut(usize::from(op.id.index()))?;
-        *accept = op.op == Op::Accept;
-        let entry = match op.op {
-            Op::Read { offset } => opcode::Read::new(fd, ptr, len).offset(at(offset)).build(),
-            Op::Write { offset } => opcode::Write::new(fd, ptr, len).offset(at(offset)).build(),
-            Op::Recv => opcode::Recv::new(fd, ptr, len).build(),
-            Op::Send => opcode::Send::new(fd, ptr, len)
+        let entry = match (op.op, op.class, op.make) {
+            (Op::Read { offset }, ..) => opcode::Read::new(fd, ptr, len).offset(at(offset)).build(),
+            (Op::Write { offset }, ..) => {
+                opcode::Write::new(fd, ptr, len).offset(at(offset)).build()
+            }
+            (Op::Recv, ..) => opcode::Recv::new(fd, ptr, len).build(),
+            (Op::Send, ..) => opcode::Send::new(fd, ptr, len)
                 .flags(sys::SEND_FLAGS)
                 .build(),
-            Op::SendTo(addr) => {
-                let msg = self.msgs.get_mut(usize::from(op.id.index()))?;
+            (Op::SendTo(addr), ..) => {
                 let (ss, sl) = sys::sockaddr(addr);
                 msg.addr = ss;
                 msg.iov = libc::iovec {
@@ -82,15 +106,34 @@ impl UringOs {
                     .flags(sys::SEND_FLAGS as u32)
                     .build()
             }
-            Op::Accept => {
+            (Op::Accept, Class::Listener, _) => {
                 let flags = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
-                let (addr, len) = (core::ptr::null_mut(), core::ptr::null_mut());
-                opcode::Accept::new(fd, addr, len).flags(flags).build()
+                msg.addr_len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                let addr = (&raw mut msg.addr).cast();
+                *new_fd = NewFd::Accept;
+                opcode::Accept::new(fd, addr, &raw mut msg.addr_len)
+                    .flags(flags)
+                    .build()
             }
-            Op::Fsync => opcode::Fsync::new(fd).build(),
-            _ => return None,
+            (Op::Connect, _, Some(Make::Dial(to))) => {
+                let socket = sys::stream_socket(to)?;
+                (msg.addr, msg.addr_len) = sys::sockaddr(to);
+                let fd = Fd(socket.as_raw_fd());
+                *new_fd = NewFd::Dial(socket, to);
+                opcode::Connect::new(fd, (&raw const msg.addr).cast(), msg.addr_len).build()
+            }
+            // The kernel copies the path when it takes the entry.
+            (Op::Connect, class, Some(Make::Open { path, flags })) => {
+                *new_fd = NewFd::Open(class);
+                opcode::OpenAt::new(Fd(libc::AT_FDCWD), path.as_ptr())
+                    .flags(flags)
+                    .mode(sys::CREATE_MODE)
+                    .build()
+            }
+            (Op::Fsync, ..) => opcode::Fsync::new(fd).build(),
+            _ => return Ok(None),
         };
-        Some(entry.user_data(u64::from(op.id.get())))
+        Ok(Some(entry.user_data(u64::from(op.id.get()))))
     }
 
     /// Queues `entry`, submitting first if the queue is full. False if the
@@ -105,12 +148,27 @@ impl UringOs {
 
 impl Os for UringOs {
     fn push(&mut self, op: OsOp) {
-        let Some(entry) = self.entry(&op) else {
-            let result = sys::run(&op);
-            self.done.push(OsDone { id: op.id, result });
-            return;
+        let entry = match self.entry(&op) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                let result = sys::run(&op);
+                return self.done.push(OsDone { id: op.id, result });
+            }
+            Err(e) => {
+                return self.done.push(OsDone {
+                    id: op.id,
+                    result: Err(e),
+                });
+            }
         };
-        if !self.queue(&entry) {
+        if self.queue(&entry) {
+            self.in_flight += 1;
+        } else {
+            drop(
+                self.opens
+                    .get_mut(usize::from(op.id.index()))
+                    .map(core::mem::take),
+            );
             self.done.push(OsDone {
                 id: op.id,
                 result: Err(IoError::QueueFull),
@@ -133,24 +191,21 @@ impl Os for UringOs {
 
     fn reap(&mut self, done: &mut Vec<OsDone>) {
         done.append(&mut self.done);
-        for cqe in self.ring.completion() {
+        let Self {
+            ring,
+            opens,
+            msgs,
+            in_flight,
+            ..
+        } = self;
+        for cqe in ring.completion() {
             let data = cqe.user_data();
             if data & CANCEL != 0 {
                 continue;
             }
+            *in_flight = in_flight.saturating_sub(1);
             let id = OpId::from_raw(data as u32);
-            let accept = self.accepts.get(usize::from(id.index())) == Some(&true);
-            let res = cqe.result();
-            let result = match res {
-                ..0 if res == -libc::ECANCELED => Err(IoError::Canceled),
-                ..0 => Err(IoError::Os(sys::linux(-res).unwrap_or(Errno::EIO))),
-                // SAFETY: an accept's result is a new descriptor, now owned here.
-                _ if accept => Ok(Out::Opened(
-                    unsafe { OwnedFd::from_raw_fd(res) },
-                    Class::Stream,
-                )),
-                _ => Ok(Out::Len(res as u32)),
-            };
+            let result = finished(opens, msgs, id, cqe.result());
             done.push(OsDone { id, result });
         }
     }
@@ -160,5 +215,43 @@ impl Os for UringOs {
         let entry = opcode::AsyncCancel2::new(every).build().user_data(CANCEL);
         self.queue(&entry);
         let _ = self.ring.submit();
+    }
+}
+
+/// The kernel may still write a peer address into `msgs` for an op it
+/// holds after the ring closes, so with ops in flight `msgs` outlives this.
+impl Drop for UringOs {
+    fn drop(&mut self) {
+        if self.in_flight > 0 {
+            core::mem::forget(core::mem::take(&mut self.msgs));
+        }
+    }
+}
+
+/// What finished op `id` gives back, from the kernel's result `res`.
+fn finished(opens: &mut [NewFd], msgs: &[Msg], id: OpId, res: i32) -> Result<Out, IoError> {
+    let index = usize::from(id.index());
+    let new_fd = opens.get_mut(index).map(core::mem::take);
+    match (res, new_fd) {
+        (..0, _) if res == -libc::ECANCELED => Err(IoError::Canceled),
+        (..0, _) => Err(IoError::Os(sys::linux(-res).unwrap_or(Errno::EIO))),
+        (_, Some(NewFd::Accept)) => Ok(Out::Opened {
+            // SAFETY: an accept's result is a new descriptor, now owned here.
+            fd: unsafe { OwnedFd::from_raw_fd(res) },
+            class: Class::Stream,
+            peer: msgs.get(index).and_then(|m| sys::socket_addr(&m.addr)),
+        }),
+        (_, Some(NewFd::Dial(fd, to))) => Ok(Out::Opened {
+            fd,
+            class: Class::Stream,
+            peer: Some(to),
+        }),
+        (_, Some(NewFd::Open(class))) => Ok(Out::Opened {
+            // SAFETY: an open's result is a new descriptor, now owned here.
+            fd: unsafe { OwnedFd::from_raw_fd(res) },
+            class,
+            peer: None,
+        }),
+        _ => Ok(Out::Len(res as u32)),
     }
 }

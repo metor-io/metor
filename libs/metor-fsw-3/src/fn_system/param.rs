@@ -14,7 +14,7 @@ use crate::{
     coordinator::MakeError,
     def::{DefCx, DefError, Records},
     frame::Frame,
-    io::{Cqe, GrantDef, IO_CQ, IO_SQ, Io, IoPorts, Sqe},
+    io::{Cqe, DEFAULT_OPS, GrantDef, IO_CQ, IO_SQ, Io, IoPorts, Sqe},
     log::Log,
     port::{DynInputs, DynOutputs, Input, InputWake, Output, Sample, SampledInput},
     record::Record,
@@ -195,6 +195,7 @@ impl Defs {
         self.io = Some(IoPorts {
             cq: self.inputs.len(),
             sq: self.outputs.len(),
+            ops: DEFAULT_OPS,
         });
         self.inputs.push(Input::<Cqe>::def(cx, IO_CQ));
         self.outputs.push(Output::<Sqe>::def(cx, IO_SQ));

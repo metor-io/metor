@@ -54,8 +54,8 @@ pub enum DeployError {
     #[error("`{system}`'s output `{port}` names a peer's port that is not resolved")]
     Unresolved { system: String, port: String },
 
-    #[error("`{system}`'s params: {message}")]
-    Params { system: String, message: String },
+    #[error("resource `{resource}` dials a peer, but no system holds it to resolve it for")]
+    UnresolvedDial { resource: String },
 
     #[error("slot `{slot}`: {message}")]
     Slot { slot: String, message: String },

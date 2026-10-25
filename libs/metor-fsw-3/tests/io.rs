@@ -1,12 +1,11 @@
-//! Opening real resources, and IO through the host's io steps.
+//! Connecting to real resources, and IO through the host's io steps.
 #![cfg(unix)]
 
-use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use metor_fsw_3::io::{
     Backing,
-    host::{Access, Baud, Class, OpenError, RealKind, open},
+    host::{Access, Baud, Errno, IoError, OpenError, RealKind, resolve},
 };
 
 /// A pty pair and the slave's path.
@@ -39,93 +38,111 @@ fn pty() -> (OwnedFd, OwnedFd, String) {
 }
 
 #[test]
-fn tty_opens_raw_at_its_baud() {
-    let (_master, _slave, path) = pty();
-    let (fd, class) = open(&RealKind::Tty {
+fn tty_connects_raw_at_its_baud() {
+    let (_master, slave, path) = pty();
+    let kind = RealKind::Tty {
         path: path.into(),
         baud: Baud::B115200,
-    })
-    .unwrap();
-    assert_eq!(class, Class::Tty);
+    };
+    assert_eq!(connects::uart(kind), Ok(()));
     // SAFETY: an all-zero termios is valid, and `tcgetattr` fills it.
     let mut t = unsafe { std::mem::zeroed::<libc::termios>() };
-    assert_eq!(unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut t) }, 0);
+    assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut t) }, 0);
     assert_eq!(unsafe { libc::cfgetospeed(&t) }, libc::B115200);
     assert_eq!(t.c_lflag & libc::ICANON, 0, "raw mode");
 }
 
 #[test]
-fn each_kind_opens_with_its_class() {
+fn each_kind_connects() {
     let dir = tempfile::tempdir().unwrap();
-    let cases = [
-        (
-            RealKind::Udp {
-                bind: "127.0.0.1:0".parse().unwrap(),
-                connect: None,
-            },
-            Class::Datagram,
-        ),
-        (
-            RealKind::Dir {
-                path: dir.path().into(),
-            },
-            Class::Dir,
-        ),
-        (
-            RealKind::File {
-                path: dir.path().join("log.bin"),
-                access: Access::ReadWrite,
-            },
-            Class::File,
-        ),
-        (
-            RealKind::TcpListen {
-                addr: "127.0.0.1:0".parse().unwrap(),
-            },
-            Class::Listener,
-        ),
-    ];
-    for (kind, class) in cases {
-        assert_eq!(open(&kind).unwrap().1, class, "{kind:?}");
-    }
-}
-
-#[test]
-fn udp_with_connect_is_connected() {
-    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let to = peer.local_addr().unwrap();
-    let (fd, _) = open(&RealKind::Udp {
+    let log = dir.path().join("log.bin");
+    let udp = RealKind::Udp {
         bind: "127.0.0.1:0".parse().unwrap(),
-        connect: Some(to),
-    })
-    .unwrap();
-    let socket = std::net::UdpSocket::from(fd);
-    assert_eq!(socket.peer_addr().unwrap(), peer.local_addr().unwrap());
+        connect: Some("127.0.0.1:9".parse().unwrap()),
+    };
+    assert_eq!(connects::udp(udp), Ok(()));
+    let at = dir.path().into();
+    assert_eq!(connects::dir(RealKind::Dir { path: at }), Ok(()));
+    let file = RealKind::File {
+        path: log.clone(),
+        access: Access::ReadWrite,
+    };
+    assert_eq!(connects::file(file), Ok(()));
+    assert!(log.exists(), "a writable file is created");
+    let listen = RealKind::TcpListen {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        allow: Vec::new(),
+    };
+    assert_eq!(connects::listen(listen), Ok(()));
 }
 
 #[test]
-fn read_only_file_refuses_a_write() {
+fn a_read_only_file_that_is_missing_is_not_made() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ro.bin");
-    std::fs::write(&path, b"x").unwrap();
-    let (fd, _) = open(&RealKind::File {
-        path,
+    let file = RealKind::File {
+        path: path.clone(),
         access: Access::Read,
-    })
-    .unwrap();
-    assert!(std::fs::File::from(fd).write_all(b"y").is_err());
+    };
+    assert_eq!(connects::file(file), Err(IoError::Os(Errno::ENOENT)));
+    assert!(!path.exists());
 }
 
 #[test]
-fn missing_tty_fails_and_odd_baud_does_not_parse() {
-    let missing = open(&RealKind::Tty {
+fn a_missing_device_builds_and_fails_its_connect() {
+    let missing = RealKind::Tty {
         path: "/dev/no-such-tty".into(),
         baud: Baud::B9600,
-    });
-    assert!(matches!(missing, Err(OpenError::Io(_))));
+    };
+    assert_eq!(connects::uart(missing), Err(IoError::Os(Errno::ENOENT)));
     let tty = |baud: u32| serde_json::json!({ "tty": { "path": "/dev/tty", "baud": baud } });
     assert!(serde_json::from_value::<RealKind>(tty(9600)).is_ok());
     assert!(serde_json::from_value::<RealKind>(tty(12_345)).is_err());
+}
+
+#[test]
+fn a_tty_that_is_not_a_tty_fails_its_configure() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let kind = RealKind::Tty {
+        path: file.path().into(),
+        baud: Baud::B9600,
+    };
+    assert_eq!(connects::uart(kind), Err(IoError::Os(Errno::ENOTTY)));
+}
+
+#[test]
+fn a_taken_address_fails_its_listen() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let kind = RealKind::TcpListen {
+        addr: taken.local_addr().unwrap(),
+        allow: Vec::new(),
+    };
+    assert_eq!(connects::listen(kind), Err(IoError::Os(Errno::EADDRINUSE)));
+}
+
+#[test]
+fn a_path_with_a_nul_fails_the_build() {
+    let kind = RealKind::Tty {
+        path: "/dev/tty\0S0".into(),
+        baud: Baud::B9600,
+    };
+    let built = connects::build(kind);
+    assert!(matches!(
+        built,
+        Err(metor_fsw_3::coordinator::BuildError::Open { .. })
+    ));
+}
+
+#[test]
+fn a_dial_resolves_its_host_at_build() {
+    let ip = resolve("10.0.0.2:2240").expect("an IP literal");
+    assert_eq!(ip, "10.0.0.2:2240".parse().unwrap());
+    let named = resolve("localhost:2240").expect("a host name");
+    assert!(named.ip().is_loopback() && named.port() == 2240, "{named}");
+    assert!(
+        matches!(resolve("localhost"), Err(OpenError::Io(_))),
+        "no port"
+    );
 }
 
 #[test]
@@ -139,26 +156,130 @@ fn unrunnable_backings_do_not_parse() {
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn can_and_gpio_are_unsupported_off_linux() {
-    let can = open(&RealKind::Can {
+    let can = RealKind::Can {
         iface: "can0".parse().unwrap(),
         filters: vec![],
-    });
-    assert!(matches!(can, Err(OpenError::Unsupported(_))));
+    };
+    assert_eq!(connects::can(can), Err(IoError::Unsupported));
 }
 
 /// Runs only where a `vcan0` interface exists.
 #[cfg(target_os = "linux")]
 #[test]
-fn can_opens_on_vcan0() {
+fn can_connects_on_vcan0() {
     if !std::path::Path::new("/sys/class/net/vcan0").exists() {
         return;
     }
-    let (_, class) = open(&RealKind::Can {
+    let can = RealKind::Can {
         iface: "vcan0".parse().unwrap(),
-        filters: vec![],
-    })
-    .unwrap();
-    assert_eq!(class, Class::Datagram);
+        filters: vec![metor_fsw_3::io::CanFilter {
+            id: 0x100,
+            mask: 0x7FF,
+        }],
+    };
+    assert_eq!(connects::can(can), Ok(()));
+}
+
+/// One connect or listen on a resource, through the io steps.
+mod connects {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use metor_fsw_3::coordinator::{
+        BuildError, Coordinator, CoordinatorConfig, SystemConfig, SystemTable,
+    };
+    use metor_fsw_3::io::{
+        Backing, Can, Cap, ConnectOp, Dir, Endpoint, IO_TYPE, IoError, IoOp, ListenOp, Pending,
+        RealKind, RegularFile, Uart, Udp,
+    };
+    use metor_fsw_3::{Timestamp, system};
+
+    type Seen = Rc<RefCell<Option<Result<(), IoError>>>>;
+
+    /// An op in flight, and where its result goes.
+    struct Probe<O: IoOp> {
+        op: Option<Pending<O>>,
+        seen: Seen,
+    }
+
+    macro_rules! probe {
+        ($name:ident, $system:ident, $kind:ty, $op:ty, $start:expr) => {
+            #[system]
+            fn $system(#[state] s: &mut Probe<$op>, cap: &Cap<$kind>) {
+                let start: fn(&Cap<$kind>) -> Pending<$op> = $start;
+                match s.op.as_mut() {
+                    None => s.op = Some(start(cap)),
+                    Some(op) => {
+                        if let Some(result) = op.poll() {
+                            *s.seen.borrow_mut() = Some(result.map(drop));
+                        }
+                    }
+                }
+            }
+
+            pub fn $name(kind: RealKind) -> Result<(), IoError> {
+                let seen = Seen::default();
+                let s = seen.clone();
+                let mut table = SystemTable::new();
+                metor_fsw_3::builtins::register_builtins(&mut table).unwrap();
+                let make = move || Probe::<$op> {
+                    op: None,
+                    seen: s.clone(),
+                };
+                table.register("probe", $system(), make).unwrap();
+                let mut c = config(kind).build(&table).expect("builds");
+                run(&mut c, &seen)
+            }
+        };
+    }
+
+    probe!(uart, uart_probe, Uart, ConnectOp<Uart>, |c| c.connect());
+    probe!(udp, udp_probe, Udp, ConnectOp<Udp>, |c| c.connect());
+    probe!(dir, dir_probe, Dir, ConnectOp<Dir>, |c| c.connect());
+    probe!(file, file_probe, RegularFile, ConnectOp<RegularFile>, |c| c
+        .connect());
+    probe!(can, can_probe, Can, ConnectOp<Can>, |c| c.connect());
+    probe!(listen, listen_probe, Endpoint, ListenOp, |c| c.listen());
+
+    /// A target whose `probe` system holds `kind`.
+    fn config(kind: RealKind) -> CoordinatorConfig {
+        CoordinatorConfig {
+            resources: [("r".to_string(), Backing::Real(kind))]
+                .into_iter()
+                .collect(),
+            systems: vec![
+                SystemConfig {
+                    grants: [("cap".into(), "r".into())].into(),
+                    ..SystemConfig::new("probe", "probe")
+                },
+                SystemConfig::new("io", IO_TYPE),
+            ],
+            ..CoordinatorConfig::default()
+        }
+    }
+
+    /// Builds a target holding `kind` with a `uart` probe.
+    pub fn build(kind: RealKind) -> Result<Coordinator, BuildError> {
+        let mut table = SystemTable::new();
+        metor_fsw_3::builtins::register_builtins(&mut table).unwrap();
+        let make = || Probe::<ConnectOp<Uart>> {
+            op: None,
+            seen: Seen::default(),
+        };
+        table.register("probe", uart_probe(), make).unwrap();
+        config(kind).build(&table)
+    }
+
+    fn run(c: &mut Coordinator, seen: &Seen) -> Result<(), IoError> {
+        for t in 0..1_000 {
+            c.step(Timestamp(t));
+            if let Some(result) = *seen.borrow() {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the probe's op never landed")
+    }
 }
 
 mod through_the_io_steps {
@@ -167,13 +288,16 @@ mod through_the_io_steps {
     use std::time::Duration;
 
     use metor_fsw_3::coordinator::{CoordinatorConfig, InputConfig, SystemConfig, SystemTable};
-    use metor_fsw_3::io::{Backing, Cap, IO_STATUS_PORT, IO_TYPE, RealKind, RecvOp, SendOp, Udp};
+    use metor_fsw_3::io::{
+        Backing, Cap, IO_STATUS_PORT, IO_TYPE, RealKind, Reconnect, RecvOp, SendOp, Udp,
+    };
     use metor_fsw_3::{Input, IoInit, ResourceStatus, Slot, Timestamp, system};
 
     type Got = Rc<RefCell<Vec<Vec<u8>>>>;
 
-    /// Sends `ping` once, and receives whatever arrives.
+    /// Connects, sends `ping` once, and receives whatever arrives.
     struct Pinger {
+        link: Reconnect<Udp>,
         tx: Slot<SendOp>,
         rx: Slot<RecvOp>,
         sent: bool,
@@ -182,10 +306,14 @@ mod through_the_io_steps {
 
     #[system]
     fn pinger(#[state] s: &mut Pinger, udp: &Cap<Udp>) {
+        s.link.poll(udp);
         let _ = s.tx.poll();
         if let Some(Ok(_)) = s.rx.poll() {
             s.got.borrow_mut().push(s.rx.bytes().to_vec());
         }
+        let Some(udp) = s.link.handle() else {
+            return;
+        };
         if !s.sent
             && let Some(buf) = s.tx.take_idle()
         {
@@ -225,6 +353,7 @@ mod through_the_io_steps {
         let g = got.clone();
         let make = move |io: &mut IoInit<'_>| {
             Ok(Pinger {
+                link: Reconnect::new(),
                 tx: Slot::Idle(io.alloc_from(b"ping")?),
                 rx: Slot::Idle(io.alloc(64)?),
                 sent: false,
@@ -463,9 +592,9 @@ mod gps_on_a_pty {
         );
         let seen = seen.borrow();
         assert!(!seen.is_empty(), "the driver logs its failed IO");
+        let io = ["gps_read", "gps_config", "gps_connect"];
         assert!(
-            seen.iter()
-                .all(|kind| kind == "gps_read" || kind == "gps_config"),
+            seen.iter().all(|kind| io.contains(&kind.as_str())),
             "{seen:?}"
         );
     }

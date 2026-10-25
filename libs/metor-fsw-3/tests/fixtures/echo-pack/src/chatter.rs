@@ -1,19 +1,21 @@
 //! A serial device that sends random bytes, and a driver that reads them.
 
 use metor_fsw_3::Rng;
-use metor_fsw_3::io::{Cap, ReadOp, Uart, WriteOp};
+use metor_fsw_3::io::{Cap, ReadOp, Reconnect, Uart, WriteOp};
 use metor_fsw_3::{IoInit, MakeError, Output, Slot, system};
 
 use super::Ping;
 
 /// A serial device's buffer for the bytes it sends.
 pub struct Chatter {
+    link: Reconnect<Uart>,
     tx: Slot<WriteOp>,
 }
 
 impl Chatter {
     pub fn new(io: &mut IoInit) -> Result<Self, MakeError> {
         Ok(Self {
+            link: Reconnect::new(),
             tx: Slot::Idle(io.alloc(8)?),
         })
     }
@@ -23,14 +25,18 @@ impl Chatter {
 #[system]
 pub fn chatter(#[state] s: &mut Chatter, rng: &mut Rng, uart: &Cap<Uart>) {
     // Half the cycles it can, it sends one to eight bytes.
+    s.link.poll(uart);
     let _ = s.tx.poll();
+    let Some(port) = s.link.handle() else {
+        return;
+    };
     let Some(mut buf) = s.tx.take_idle() else {
         return;
     };
     if rng.chance(u32::MAX / 2) {
         let n = rng.below(8) as usize + 1;
         buf.fill(&rng.next_u64().to_le_bytes()[..n]);
-        s.tx = Slot::Busy(uart.write(buf));
+        s.tx = Slot::Busy(port.write(buf));
     } else {
         s.tx = Slot::Idle(buf);
     }
@@ -61,12 +67,14 @@ pub fn grower(#[state] s: &mut Grower, uart: &Cap<Uart>) {
 }
 
 pub struct Reader {
+    link: Reconnect<Uart>,
     rx: Slot<ReadOp>,
 }
 
 impl Reader {
     pub fn new(io: &mut IoInit) -> Result<Self, MakeError> {
         Ok(Self {
+            link: Reconnect::new(),
             rx: Slot::Idle(io.alloc(16)?),
         })
     }
@@ -75,11 +83,19 @@ impl Reader {
 /// Reads continuously, and pings the sum of each read's bytes.
 #[system]
 pub fn reader(#[state] s: &mut Reader, uart: &Cap<Uart>, sums: &mut Output<Ping>) {
-    if let Some(Ok(_)) = s.rx.poll() {
-        let n = s.rx.bytes().iter().map(|b| u32::from(*b)).sum();
-        let _ = sums.write(&Ping { n });
+    s.link.poll(uart);
+    match s.rx.poll() {
+        Some(Ok(0)) => s.link.lose(),
+        Some(Ok(_)) => {
+            let n = s.rx.bytes().iter().map(|b| u32::from(*b)).sum();
+            let _ = sums.write(&Ping { n });
+        }
+        Some(Err(e)) => drop(s.link.check(e)),
+        None => {}
     }
-    if let Some(buf) = s.rx.take_idle() {
-        s.rx = Slot::Busy(uart.read(buf));
+    if let Some(port) = s.link.handle()
+        && let Some(buf) = s.rx.take_idle()
+    {
+        s.rx = Slot::Busy(port.read(buf));
     }
 }

@@ -20,6 +20,7 @@ mod op_slot;
 mod ops;
 mod param;
 mod queue;
+mod reconnect;
 mod shared;
 mod status;
 pub mod test;
@@ -36,6 +37,8 @@ pub use error::*;
 pub use host::{IO_STATUS_PORT, IO_TYPE};
 pub use ops::*;
 pub use queue::*;
+pub(crate) use reconnect::Pause;
+pub use reconnect::{Backoff, Reconnect, Reconnected};
 pub use shared::*;
 pub use status::*;
 pub use wire::*;
@@ -44,13 +47,13 @@ pub use wire::*;
 pub const IO_SQ: &str = "io_sq";
 /// The input a system reads completions from.
 pub const IO_CQ: &str = "io_cq";
-/// The most ops one system may have in flight.
+/// The ops a system may have in flight unless its type sets a budget.
 ///
 /// Kani proofs use a smaller queue to keep their state space tractable.
 #[cfg(not(kani))]
-pub const MAX_OPS: usize = 16;
+pub const DEFAULT_OPS: u16 = 16;
 #[cfg(kani)]
-pub const MAX_OPS: usize = 4;
+pub const DEFAULT_OPS: u16 = 4;
 
 /// Where a system's `io_cq` input and `io_sq` output sit in its definition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +62,13 @@ pub struct IoPorts {
     pub cq: usize,
     /// The index of `io_sq` in the outputs.
     pub sq: usize,
+    /// The most ops the system may have in flight.
+    #[serde(default = "default_ops")]
+    pub ops: u16,
+}
+
+fn default_ops() -> u16 {
+    DEFAULT_OPS
 }
 
 /// A `Cap<K>` parameter in a system's definition.

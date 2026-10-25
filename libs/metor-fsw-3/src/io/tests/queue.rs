@@ -2,8 +2,8 @@ use super::{Loopback, allocations};
 use crate::io::cap::{Cap, Handle};
 use crate::io::*;
 
-fn uart(lb: &Loopback) -> Cap<Uart> {
-    Cap::new(Handle::new(lb.io.next_grant(), lb.io.clone()))
+fn uart(lb: &Loopback) -> Handle<Uart> {
+    Handle::new(lb.io.next_grant(), lb.io.clone())
 }
 
 #[test]
@@ -33,16 +33,34 @@ fn write_names_its_filled_bytes() {
     assert_eq!(sqe.buf, Span::new(0, 2));
 }
 
-#[test]
-fn full_table_completes_queue_full_with_the_buffer_back() {
-    let mut lb = Loopback::new();
-    let bufs: Vec<_> = lb.make(|init| (0..=MAX_OPS).map(|_| init.alloc(1)).collect());
+/// Submits one more read than `ops` slots: the last is `QueueFull` with its
+/// buffer back, and the rest reach the SQ.
+fn fills_its_table(ops: u16) {
+    let mut lb = Loopback::with_ops(ops);
+    let bufs: Vec<_> = lb.make(|init| (0..=ops).map(|_| init.alloc(1)).collect());
     let uart = uart(&lb);
-    let mut ops: Vec<_> = bufs.into_iter().map(|b| uart.read(b)).collect();
-    let (result, buf) = ops.pop().unwrap().poll().unwrap();
+    let mut reads: Vec<_> = bufs.into_iter().map(|b| uart.read(b)).collect();
+    let (result, buf) = reads.pop().unwrap().poll().unwrap();
     assert_eq!(result, Err(IoError::QueueFull));
     assert_eq!(buf.capacity(), 1);
-    assert_eq!(lb.submitted().len(), MAX_OPS);
+    let slots: Vec<_> = lb.submitted().iter().map(|s| s.token.index()).collect();
+    assert_eq!(slots, (0..ops).collect::<Vec<_>>());
+}
+
+#[test]
+fn full_table_completes_queue_full_with_the_buffer_back() {
+    fills_its_table(DEFAULT_OPS);
+}
+
+#[test]
+fn the_table_is_as_long_as_the_budget() {
+    fills_its_table(1);
+    fills_its_table(40);
+}
+
+#[test]
+fn a_zero_budget_takes_no_op() {
+    fills_its_table(0);
 }
 
 #[test]
@@ -69,9 +87,9 @@ fn dropped_pending_frees_its_slot_when_it_lands() {
 #[test]
 fn orphaned_accept_closes_its_handle_under_its_own_token() {
     let mut lb = Loopback::new();
-    lb.make(|_| Ok(()));
-    let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
-    drop(listen.accept());
+    let peer = lb.make(|init| init.alloc(RawAddr::LEN));
+    let listen: Handle<Listener> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    drop(listen.accept(peer));
     let [accept] = lb.submitted()[..] else {
         panic!()
     };
@@ -92,9 +110,9 @@ fn orphaned_accept_closes_its_handle_under_its_own_token() {
 #[test]
 fn finished_accept_dropped_untaken_closes_too() {
     let mut lb = Loopback::new();
-    lb.make(|_| Ok(()));
-    let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
-    let accept = listen.accept();
+    let peer = lb.make(|init| init.alloc(RawAddr::LEN));
+    let listen: Handle<Listener> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    let accept = listen.accept(peer);
     let [sqe] = lb.submitted()[..] else { panic!() };
     lb.complete(Cqe::ok(sqe.token, RawHandle::new(5, 1).get()));
     assert_eq!(lb.io.in_flight(), 1);
@@ -108,13 +126,15 @@ fn finished_accept_dropped_untaken_closes_too() {
 #[test]
 fn accept_resolves_to_a_handle_on_the_same_queue() {
     let mut lb = Loopback::new();
-    lb.make(|_| Ok(()));
-    let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
-    let mut accept = listen.accept();
+    let peer = lb.make(|init| init.alloc(RawAddr::LEN));
+    let listen: Handle<Listener> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    let mut accept = listen.accept(peer);
     let [sqe] = lb.submitted()[..] else { panic!() };
     lb.complete(Cqe::ok(sqe.token, RawHandle::new(5, 1).get()));
-    let stream = accept.poll().unwrap().unwrap();
+    let (stream, peer) = accept.poll().unwrap();
+    let stream = stream.unwrap();
     assert_eq!(stream.raw(), RawHandle::new(5, 1));
+    assert_eq!(peer.len(), RawAddr::LEN, "the dispatch wrote the peer");
     drop(stream.close());
     let [close] = lb.submitted()[..] else {
         panic!()
@@ -172,7 +192,7 @@ fn steady_state_allocates_nothing() {
 }
 
 /// Submits flushes until the SQ refuses one.
-fn fill(uart: &Cap<Uart>) -> Vec<Pending<TtyOp>> {
+fn fill(uart: &Handle<Uart>) -> Vec<Pending<TtyOp>> {
     let mut held = Vec::new();
     loop {
         let mut flush = uart.flush(TtyQueue::Both);
@@ -208,9 +228,9 @@ fn cancel_the_full_sq_refuses_goes_out_later() {
 #[test]
 fn orphan_close_the_full_sq_refuses_goes_out_later() {
     let mut lb = Loopback::with_sq_depth(2);
-    lb.make(|_| Ok(()));
-    let listen: Handle<Listen> = Handle::new(lb.io.next_grant(), lb.io.clone());
-    drop(listen.accept());
+    let peer = lb.make(|init| init.alloc(RawAddr::LEN));
+    let listen: Handle<Listener> = Handle::new(lb.io.next_grant(), lb.io.clone());
+    drop(listen.accept(peer));
     let accept = lb.submitted()[0];
     let uart = uart(&lb);
     let held = fill(&uart);
@@ -224,4 +244,66 @@ fn orphan_close_the_full_sq_refuses_goes_out_later() {
     assert_eq!((close.op(), close.token), (Ok(Op::Close), accept.token));
     lb.complete(Cqe::ok(close.token, 0));
     assert_eq!(lb.io.in_flight(), held.len());
+}
+
+fn endpoint(lb: &Loopback) -> Cap<Endpoint> {
+    Cap::new(Handle::new(lb.io.next_grant(), lb.io.clone()))
+}
+
+#[test]
+fn a_dial_wants_room_for_its_peer() {
+    let mut lb = Loopback::new();
+    let short = lb.make(|init| init.alloc(RawAddr::LEN - 1));
+    let (result, back) = endpoint(&lb).connect(short).poll().unwrap();
+    assert_eq!(result.err(), Some(IoError::BadBuf));
+    assert_eq!(back.capacity(), RawAddr::LEN - 1);
+    assert!(lb.submitted().is_empty());
+}
+
+#[test]
+fn a_failed_dial_leaves_the_peer_empty() {
+    let mut lb = Loopback::new();
+    let peer = lb.make(|init| init.alloc(RawAddr::LEN));
+    let mut pending = endpoint(&lb).connect(peer);
+    let [sqe] = lb.submitted()[..] else { panic!() };
+    assert_eq!(sqe.op(), Ok(Op::Connect));
+    assert_eq!(sqe.buf.len() as usize, RawAddr::LEN);
+    lb.complete(Cqe::err(sqe.token, IoError::Os(Errno::ECONNREFUSED)));
+    let (result, peer) = pending.poll().unwrap();
+    assert_eq!(result.err(), Some(IoError::Os(Errno::ECONNREFUSED)));
+    assert!(peer.is_empty());
+}
+
+#[test]
+fn a_connect_lends_no_buffer_and_resolves_to_a_handle() {
+    let mut lb = Loopback::new();
+    lb.make(|_| Ok(()));
+    let cap: Cap<Uart> = Cap::new(Handle::new(lb.io.next_grant(), lb.io.clone()));
+    let mut connect = cap.connect();
+    let [sqe] = lb.submitted()[..] else { panic!() };
+    assert_eq!((sqe.op(), sqe.buf), (Ok(Op::Connect), Span::default()));
+    lb.complete(Cqe::ok(sqe.token, RawHandle::new(3, 1).get()));
+    let port = connect.poll().unwrap().unwrap();
+    assert_eq!(port.raw(), RawHandle::new(3, 1));
+    assert_eq!(lb.io.in_flight(), 0);
+}
+
+#[test]
+fn a_listen_resolves_to_a_listener_or_its_error() {
+    let mut lb = Loopback::new();
+    lb.make(|_| Ok(()));
+    let ep = endpoint(&lb);
+    let (mut up, mut taken) = (ep.listen(), ep.listen());
+    let [a, b] = lb.submitted()[..] else { panic!() };
+    assert_eq!(a.op(), Ok(Op::Listen));
+    lb.complete(Cqe::ok(a.token, RawHandle::new(4, 1).get()));
+    lb.complete(Cqe::err(b.token, IoError::Os(Errno::EADDRINUSE)));
+    assert_eq!(
+        up.poll().unwrap().map(|l| l.raw()),
+        Ok(RawHandle::new(4, 1))
+    );
+    assert_eq!(
+        taken.poll().unwrap().err(),
+        Some(IoError::Os(Errno::EADDRINUSE))
+    );
 }

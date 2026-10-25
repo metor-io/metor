@@ -2,7 +2,9 @@
 //!
 //! An op runs when it is pushed. One whose descriptor is not ready parks,
 //! and runs again once the descriptor polls ready for the union of its
-//! parked ops' interests. File, directory, and GPIO ops never park.
+//! parked ops' interests. File, directory, and GPIO ops and opens never
+//! park. A dial starts its connect and parks on its new socket until it
+//! takes writes.
 
 use core::num::NonZeroUsize;
 use core::time::Duration;
@@ -10,7 +12,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use polling::{Event, Events, Poller};
 
-use super::{OpId, Os, OsDone, OsOp, sys};
+use super::{Class, OpId, Os, OsDone, OsOp, Out, sys};
 use crate::io::{Errno, IoError};
 
 /// The `Os` for Unix development hosts.
@@ -18,6 +20,8 @@ pub struct PollOs {
     poller: Poller,
     events: Events,
     parked: Vec<OsOp>,
+    /// The socket of each dial in flight, by op.
+    dialing: Vec<(OpId, OwnedFd)>,
     /// Descriptors added to the poller: those with parked ops, so at most
     /// one per op in flight.
     added: Vec<RawFd>,
@@ -33,6 +37,7 @@ impl PollOs {
             poller: Poller::new()?,
             events: Events::with_capacity(cap),
             parked: Vec::with_capacity(cap.get()),
+            dialing: Vec::with_capacity(cap.get()),
             added: Vec::with_capacity(cap.get()),
             fired: Vec::with_capacity(cap.get()),
             done: Vec::with_capacity(cap.get()),
@@ -40,8 +45,12 @@ impl PollOs {
     }
 
     fn attempt(&mut self, op: OsOp) {
-        match sys::run(&op) {
-            Err(IoError::Os(Errno::EAGAIN)) if op.class.polled() => {
+        let result = match op.dials() {
+            Some(_) => self.dialed(&op),
+            None => sys::run(&op),
+        };
+        match result {
+            Err(IoError::Os(Errno::EAGAIN)) if op.parks() => {
                 let fd = op.fd;
                 self.parked.push(op);
                 self.arm(fd);
@@ -50,10 +59,50 @@ impl PollOs {
         }
     }
 
+    /// Starts a dial's connect, then parks it on its new socket.
+    fn dial(&mut self, mut op: OsOp) {
+        let socket = op
+            .dials()
+            .ok_or(IoError::Unsupported)
+            .and_then(sys::connect);
+        let socket = match socket {
+            Ok(socket) => socket,
+            Err(e) => {
+                return self.done.push(OsDone {
+                    id: op.id,
+                    result: Err(e),
+                });
+            }
+        };
+        op.fd = socket.as_raw_fd();
+        self.dialing.push((op.id, socket));
+        self.parked.push(op);
+        self.arm(op.fd);
+    }
+
+    /// A dial's stream once its connect lands. Its socket closes on an
+    /// error.
+    fn dialed(&mut self, op: &OsOp) -> Result<Out, IoError> {
+        let result = sys::connected(op.fd);
+        self.prune(op.fd);
+        let socket = self.end_dial(op.id).ok_or(IoError::Os(Errno::EBADF))?;
+        result.map(|()| Out::Opened {
+            fd: socket,
+            class: Class::Stream,
+            peer: op.dials(),
+        })
+    }
+
+    /// Takes op `id`'s dial socket, if it has one.
+    fn end_dial(&mut self, id: OpId) -> Option<OwnedFd> {
+        let position = self.dialing.iter().position(|(d, _)| *d == id)?;
+        Some(self.dialing.swap_remove(position).1)
+    }
+
     /// Polls `fd` once for every interest its parked ops have.
     fn arm(&mut self, fd: RawFd) {
         let parked = self.parked.iter().filter(|p| p.fd == fd);
-        let (reads, writes) = parked.fold((false, false), |(r, w), p| match p.op.writes() {
+        let (reads, writes) = parked.fold((false, false), |(r, w), p| match p.waits_to_write() {
             true => (r, true),
             false => (true, w),
         });
@@ -85,10 +134,15 @@ impl PollOs {
         let _ = self.poller.delete(unsafe { BorrowedFd::borrow_raw(fd) });
     }
 
-    /// Completes every parked op `hit` picks with `e`.
+    /// Completes every parked op `hit` picks with `e`, closing a dial's
+    /// socket once the poller no longer holds it.
     fn finish_where(&mut self, hit: impl Fn(&OsOp) -> bool, e: IoError) {
         while let Some(position) = self.parked.iter().position(&hit) {
             let op = self.parked.remove(position);
+            if op.dials().is_some() {
+                self.prune(op.fd);
+                drop(self.end_dial(op.id));
+            }
             self.done.push(OsDone {
                 id: op.id,
                 result: Err(e),
@@ -111,7 +165,10 @@ impl PollOs {
 
 impl Os for PollOs {
     fn push(&mut self, op: OsOp) {
-        self.attempt(op);
+        match op.dials() {
+            Some(_) => self.dial(op),
+            None => self.attempt(op),
+        }
     }
 
     fn cancel(&mut self, id: OpId) {

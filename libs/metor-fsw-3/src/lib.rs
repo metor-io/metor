@@ -190,7 +190,7 @@ pub use fn_system::{
 pub use frame::Frame;
 pub use io::{Buf, Cap, Handle, Io, IoInit, Pending, ResourceStatus, Slot};
 #[cfg(feature = "host")]
-pub use link::{LinkStatus, Transport};
+pub use link::{LinkParams, LinkStatus};
 pub use log::{Log, LogLayer};
 pub use metor_fsw_3_macros::{Frame, Record, sequence, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
