@@ -9,6 +9,24 @@
 //! | fixed | pad | entries (reserved) | key | nested map | key | ... |
 //! ```
 //!
+//! A map value must describe its element fields:
+//!
+//! ```compile_fail
+//! use metor_fsw_3::metor_proto::vtable::builder::FieldBuilder;
+//! use metor_fsw_3::path::ComponentPath;
+//! use metor_fsw_3::{AsVTable, FrameMap};
+//!
+//! struct Leaf;
+//!
+//! impl AsVTable for Leaf {
+//!     fn vtable_fields(_: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
+//!         core::iter::empty()
+//!     }
+//! }
+//!
+//! let _ = FrameMap::<u32, Leaf>::as_vtable();
+//! ```
+//!
 //! A frame holding a map must bound its record with `max_len`:
 //!
 //! ```compile_fail
@@ -22,8 +40,6 @@
 //!     timestamp: Timestamp,
 //!     cpu: FrameMap<u32, u64>,
 //! }
-//!
-//! const _: usize = Unbounded::MAX_LEN;
 //! ```
 
 use core::borrow::Borrow;
@@ -31,7 +47,7 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use core::ops::Deref;
 
-use metor_component::{FrameMap, KeyError, MapKey, Slot, key_str};
+use metor_component::{AsVTable, FrameMap, KeyError, MapKey, Slot, key_str};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::record::DecodeError;
@@ -49,6 +65,8 @@ pub enum FrameWriteError {
     Key(#[from] KeyError),
     #[error("map field projection points outside its value")]
     Field,
+    #[error("map slot is already set; each map is written once, from `FrameMap::EMPTY`")]
+    MapWritten,
 }
 
 /// The first bytes of a duplicate key, for error reports.
@@ -105,7 +123,15 @@ impl Table<'_> {
     }
 
     fn write(&mut self, at: usize, bytes: &[u8]) {
+        // PANIC Safety: callers write only into the fixed region or a range
+        // `reserve` returned, both inside `buf`.
         self.buf[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn is_zero(&self, at: usize, len: usize) -> bool {
+        self.buf
+            .get(at..at + len)
+            .is_some_and(|bytes| bytes.iter().all(|&b| b == 0))
     }
 }
 
@@ -121,14 +147,23 @@ pub struct FrameWriter<'a, T> {
 
 impl<T> FrameWriter<'_, T> {
     /// Writes the map `field` selects, reserving room for `cap` entries.
-    pub fn map<K: MapKey, V: IntoBytes + Immutable>(
+    pub fn map<K: MapKey, V: AsVTable + IntoBytes + Immutable>(
         &mut self,
         field: impl FnOnce(&T) -> &FrameMap<K, V>,
         cap: usize,
         build: impl FnOnce(&mut MapWriter<'_, K, V>) -> Result<(), FrameWriteError>,
     ) -> Result<(), FrameWriteError> {
         const { assert!(FrameMap::<K, V>::ENTRY_ALIGN <= metor_fsw_3_ring::PAYLOAD_ALIGNMENT) };
+        const {
+            assert!(
+                V::ELEMENT,
+                "FrameMap value type does not describe its element fields"
+            )
+        };
         let slot_at = self.base + field_offset(self.value, field)?;
+        if !self.table.is_zero(slot_at, size_of::<Slot>()) {
+            return Err(FrameWriteError::MapWritten);
+        }
         let bytes = cap
             .checked_mul(FrameMap::<K, V>::STRIDE)
             .ok_or(FrameWriteError::Oversize {
@@ -206,9 +241,12 @@ impl<K: MapKey, V: IntoBytes + Immutable> MapWriter<'_, K, V> {
     fn write_key(&mut self, key: K::Ref<'_>) -> Result<(usize, usize), FrameWriteError> {
         let max = self.table.buf.len();
         let at = *self.table.len;
-        let len =
-            K::encode(key, &mut self.table.buf[at..]).ok_or(FrameWriteError::Oversize { max })?;
-        let bytes = &self.table.buf[at..at + len];
+        let oversize = FrameWriteError::Oversize { max };
+        let len = K::encode(key, &mut self.table.buf[at..]).ok_or(oversize)?;
+        let bytes = at
+            .checked_add(len)
+            .and_then(|end| self.table.buf.get(at..end))
+            .ok_or(oversize)?;
         key_str(bytes)?;
         if self.keys().any(|k| k == bytes) {
             return Err(FrameWriteError::DuplicateKey(KeyRepr::new(bytes)));
@@ -599,8 +637,84 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_map_written_twice() {
+        let mut buf = Aligned([0; 512]);
+        let twice = build(&mut buf, |w| {
+            w.map(|f| &f.procs, 1, |_| Ok(()))?;
+            w.map(|f| &f.procs, 1, |_| Ok(()))
+        });
+        assert_eq!(twice, Err(FrameWriteError::MapWritten));
+    }
+
+    /// A padding type with no component traits.
+    #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[repr(C)]
+    struct Opaque([u8; 8]);
+
+    #[derive(
+        AsVTable,
+        Metadatatize,
+        Componentize,
+        Decomponentize,
+        IntoBytes,
+        Immutable,
+        KnownLayout,
+        FromBytes,
+    )]
+    #[repr(C, align(16))]
+    struct Wide {
+        a: [u64; 3],
+        #[fsw(skip)]
+        _pad: Opaque,
+    }
+
+    #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[frame(name = "wides", max_len = 256)]
+    #[repr(C)]
+    struct Wides {
+        #[frame(timestamp)]
+        timestamp: Timestamp,
+        _pad: u64,
+        wide: FrameMap<u8, Wide>,
+    }
+
+    #[test]
+    fn test_aligned_array_value_round_trip() {
+        assert_eq!(FrameMap::<u8, Wide>::VALUE_OFFSET, 16);
+        let fixed = Wides {
+            timestamp: Timestamp(1),
+            _pad: 0,
+            wide: FrameMap::EMPTY,
+        };
+        let wide = Wide {
+            a: [1, 2, 3],
+            _pad: Opaque([0; 8]),
+        };
+        let mut buf = Aligned([0; 512]);
+        let len = build_frame(&fixed, &mut buf.0[..256], |w| {
+            w.map(|f| &f.wide, 1, |m| m.insert(5, &wide).map(drop))
+        })
+        .expect("fits");
+        let frame = Wides::decode(&buf.0[..len]).expect("decodes");
+        assert_eq!(frame.map(|f| &f.wide).get(5).map(|v| v.a), Some([1, 2, 3]));
+        let table = vtable(Wides::vtable_fields("w".to_string()));
+        let mut seen = Vec::new();
+        table
+            .for_each_field::<metor_proto::error::Error>(Some(&buf.0[..len]), &mut |rf| {
+                seen.push(rf.component_id);
+                Ok(())
+            })
+            .expect("walks");
+        let id = |s: &str| ComponentId::new(s);
+        assert_eq!(
+            seen,
+            vec![id("w.wide.5.a.0"), id("w.wide.5.a.1"), id("w.wide.5.a.2")]
+        );
+    }
+
+    #[test]
     fn test_max_len_sets_record_bound() {
         assert_eq!(Nics::MAX_LEN, 512);
-        assert!(<Nics as AsVTable>::DYNAMIC);
+        const { assert!(<Nics as AsVTable>::DYNAMIC) };
     }
 }

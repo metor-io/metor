@@ -96,6 +96,11 @@ pub fn frame(input: TokenStream) -> TokenStream {
         ),
     };
 
+    let guard = raw.generics.params.is_empty().then(|| {
+        let ident = &raw.ident;
+        quote! { const _: usize = <#ident as #fsw::Record>::MAX_LEN; }
+    });
+
     let (ident, generics) = (raw.ident.clone(), raw.generics.clone());
     let struct_input = StructInput {
         ident: raw.ident,
@@ -141,6 +146,8 @@ pub fn frame(input: TokenStream) -> TokenStream {
         }
 
         impl #impl_generics #fsw::Frame for #ident #ty_generics #where_clause {}
+
+        #guard
     }
     .into()
 }

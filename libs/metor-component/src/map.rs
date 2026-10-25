@@ -71,6 +71,12 @@ impl<K, V> Default for FrameMap<K, V> {
 }
 
 fn map_fields<K, V: AsVTable>(prefix: &str) -> impl Iterator<Item = FieldBuilder> + use<K, V> {
+    const {
+        assert!(
+            V::ELEMENT,
+            "FrameMap value type does not describe its element fields"
+        )
+    };
     core::iter::once(raw_field(
         0,
         size_of::<Slot>() as u32,
@@ -85,6 +91,7 @@ fn map_fields<K, V: AsVTable>(prefix: &str) -> impl Iterator<Item = FieldBuilder
 
 impl<K, V: AsVTable> AsVTable for FrameMap<K, V> {
     const DYNAMIC: bool = true;
+    const ELEMENT: bool = true;
 
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
         map_fields::<K, V>(&path.to_name())
@@ -250,8 +257,8 @@ mod tests {
     fn test_map_vtable_is_dynamic() {
         let table = vtable(FrameMap::<String, u64>::vtable_fields("nics"));
         assert!(table.is_dynamic());
-        assert!(<FrameMap<String, u64> as AsVTable>::DYNAMIC);
-        assert!(!<u64 as AsVTable>::DYNAMIC);
+        const { assert!(<FrameMap<String, u64> as AsVTable>::DYNAMIC) };
+        const { assert!(!<u64 as AsVTable>::DYNAMIC) };
     }
 
     #[test]

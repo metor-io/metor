@@ -631,13 +631,16 @@ impl State {
         received: Timestamp,
     ) -> Result<Option<Pushed>, Error> {
         let vtable = self.dynamic_vtable(id)?;
-        let mut known = true;
-        vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
-            known &= self.components.contains_key(&rf.component_id);
-            Ok(())
-        })?;
-        if !known {
-            return Ok(None);
+        let known = vtable.for_each_field::<Error>(Some(buf), &mut |rf| match self
+            .components
+            .contains_key(&rf.component_id)
+        {
+            true => Ok(()),
+            false => Err(Error::ComponentNotFound(rf.component_id)),
+        });
+        match known {
+            Err(Error::ComponentNotFound(_)) => return Ok(None),
+            known => known?,
         }
         let mut pushed = Pushed::default();
         vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
@@ -669,6 +672,8 @@ impl State {
         Ok(pushed)
     }
 
+    /// Concurrent ingests of one table may cache out of push order; each
+    /// table has one producer.
     fn cache_latest_table(&self, id: PacketId, buf: &[u8]) {
         if let Some(cached) = self.latest_dynamic_tables.get(&id) {
             let mut cached = cached.lock().unwrap_or_else(PoisonError::into_inner);
@@ -918,7 +923,7 @@ pub(crate) fn max_node_age_override() -> Option<Duration> {
 enum StaticIngest {
     /// The table is static, and these samples were pushed.
     Pushed(Pushed),
-    /// The table is dynamic, so it sinks under the write lock.
+    /// The table is dynamic, so it sinks through the dynamic path.
     Dynamic,
 }
 
