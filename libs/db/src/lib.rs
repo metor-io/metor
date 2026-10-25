@@ -645,19 +645,16 @@ impl State {
     }
 
     /// The components a fixed-rate stream packs: the visible ones, less
-    /// images, which stay reachable through `RealTime` and `GetTimeSeries`.
+    /// samples past [`FIXED_RATE_MAX_SAMPLE`], such as images, which stay
+    /// reachable through `RealTime` and `GetTimeSeries`.
     fn fixed_rate_components(&self) -> HashMap<ComponentId, Component> {
         self.components
             .iter()
-            .filter(|(id, _)| !self.is_component_hidden(id) && !self.is_image(id))
+            .filter(|(id, c)| {
+                !self.is_component_hidden(id) && c.schema.size() <= FIXED_RATE_MAX_SAMPLE
+            })
             .map(|(id, c)| (*id, c.clone()))
             .collect()
-    }
-
-    fn is_image(&self, component_id: &ComponentId) -> bool {
-        self.component_metadata
-            .get(component_id)
-            .is_some_and(|m| m.image_format().is_some())
     }
 
     pub fn set_component_metadata(
@@ -909,6 +906,9 @@ fn push_field(
         new_series,
     })
 }
+
+/// The largest sample a fixed-rate stream carries.
+const FIXED_RATE_MAX_SAMPLE: usize = 32 * 1024;
 
 /// Upper bound on a component's WAL, unless `WAL_MIN_ENTRIES` needs more.
 const WAL_BUDGET: usize = 64 * 1024 * 1024;
@@ -1496,7 +1496,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             let stream = m.parse::<Stream>()?;
             let tx = tx.tx.clone();
             let db = db.clone();
-            handle_stream(tx, stream, db, m.req_id, usize::MAX);
+            handle_stream(tx, stream, db, m.req_id);
         }
         Packet::Msg(m) if m.id == SetStreamState::ID => {
             let set_stream_state = m.parse::<SetStreamState>()?;
@@ -2308,32 +2308,6 @@ impl FixedRateStreamState {
     }
 }
 
-/// The largest UDP datagram payload over IPv4.
-const MAX_UDP_PAYLOAD: usize = 65_507;
-
-/// Bytes of a table packet carrying one `size`-byte sample: length prefix,
-/// header, timestamp, alignment padding, and the sample.
-fn table_packet_len(size: usize) -> usize {
-    size_of::<u32>() + size_of::<PacketHeader>() + 2 * size_of::<Timestamp>() + size
-}
-
-/// True, and logs once per component, if `component` cannot fit a table
-/// packet of `max_table` bytes.
-fn skip_oversized(
-    component: &Component,
-    max_table: usize,
-    skipped: &mut HashSet<ComponentId>,
-) -> bool {
-    let len = table_packet_len(component.schema.size());
-    if len <= max_table {
-        return false;
-    }
-    if skipped.insert(component.component_id) {
-        warn!(component.id = ?component.component_id.0, len, max_table, "component too large for this stream; skipped");
-    }
-    true
-}
-
 fn handle_unicast_stream(addr: SocketAddr, stream: Stream, db: Arc<DB>) {
     stellarator::struc_con::stellar(move || async move {
         info!("UDP unicasting to {}", addr);
@@ -2341,7 +2315,7 @@ fn handle_unicast_stream(addr: SocketAddr, stream: Stream, db: Arc<DB>) {
         socket.connect(addr);
         let (_, tx) = socket.split();
         let tx = Arc::new(Mutex::new(PacketSink::new(tx)));
-        handle_stream(tx.clone(), stream.clone(), db.clone(), 0, MAX_UDP_PAYLOAD)
+        handle_stream(tx.clone(), stream.clone(), db.clone(), 0)
             .await
             .unwrap();
         Ok::<_, Error>(())
@@ -2353,11 +2327,10 @@ fn handle_stream<A: AsyncWrite + 'static>(
     stream: Stream,
     db: Arc<DB>,
     req_id: RequestId,
-    max_table: usize,
 ) -> stellarator::JoinHandle<()> {
     match stream.behavior {
         StreamBehavior::RealTime => stellarator::spawn(async move {
-            match handle_real_time_stream(tx, req_id, db, max_table).await {
+            match handle_real_time_stream(tx, req_id, db).await {
                 Ok(_) => {}
                 Err(err) if err.is_stream_closed() => {}
                 Err(err) => {
@@ -2379,7 +2352,7 @@ fn handle_stream<A: AsyncWrite + 'static>(
             debug!(stream.id = ?stream.id, "inserting stream");
             db.with_state_mut(|s| s.streams.insert(stream.id, state.clone()));
             stellarator::spawn(async move {
-                match handle_fixed_stream(tx, req_id, state, db, max_table).await {
+                match handle_fixed_stream(tx, req_id, state, db).await {
                     Ok(_) => {}
                     Err(err) if err.is_stream_closed() => {}
                     Err(err) => {
@@ -2395,10 +2368,8 @@ async fn handle_real_time_stream<A: AsyncWrite + 'static>(
     sink: Arc<Mutex<PacketSink<A>>>,
     req_id: RequestId,
     db: Arc<DB>,
-    max_table: usize,
 ) -> Result<(), Error> {
     let mut visited_ids = HashSet::new();
-    let mut skipped = HashSet::new();
     loop {
         db.with_state(|state| {
             DBVisitor.visit(&state.components, |component| {
@@ -2408,9 +2379,6 @@ async fn handle_real_time_stream<A: AsyncWrite + 'static>(
                     return Ok(());
                 }
                 visited_ids.insert(component.component_id);
-                if skip_oversized(component, max_table, &mut skipped) {
-                    return Ok(());
-                }
                 let sink = sink.clone();
                 let component = component.clone();
                 stellarator::spawn(handle_real_time_component(sink, component, req_id));
@@ -2476,35 +2444,26 @@ async fn handle_fixed_stream<A: AsyncWrite>(
     req_id: RequestId,
     state: Arc<FixedRateStreamState>,
     db: Arc<DB>,
-    max_table: usize,
 ) -> Result<(), Error> {
-    let generation = || (db.vtable_gen.latest(), db.metadata_gen.latest());
-    let mut current_gen = generation();
+    let mut current_vtable_gen = db.vtable_gen.latest();
     let mut current_field_count: Option<usize> = None;
     let id: PacketId = state.stream_id.to_le_bytes()[..2].try_into().unwrap();
     let mut table = LenPacket::table(id, 2048 - 16);
-    let mut skipped = HashSet::new();
-    let fixed_components = |skipped: &mut HashSet<ComponentId>| {
-        let mut components = db.with_state(|state| state.fixed_rate_components());
-        components.retain(|_, c| !skip_oversized(c, max_table, skipped));
-        components
-    };
-    let mut components = fixed_components(&mut skipped);
-    let mut warned_oversized = false;
+    let mut components = db.with_state(|state| state.fixed_rate_components());
     loop {
         if !state.wait_for_playing().await {
             return Ok(());
         }
         let start = Instant::now();
         let current_timestamp = state.current_timestamp();
-        let gen_now = generation();
-        if gen_now != current_gen {
-            components = fixed_components(&mut skipped);
+        let vtable_gen = db.vtable_gen.latest();
+        if vtable_gen != current_vtable_gen {
+            components = db.with_state(|state| state.fixed_rate_components());
             let stream = stream.lock().await;
             let vtable = DBVisitor.vtable(&components)?;
             let msg = VTableMsg { id, vtable };
             stream.send(msg.with_request_id(req_id)).await.0?;
-            current_gen = gen_now;
+            current_vtable_gen = vtable_gen;
         }
         table.clear();
         match DBVisitor.populate_table(&components, &mut table, current_timestamp) {
@@ -2522,13 +2481,6 @@ async fn handle_fixed_stream<A: AsyncWrite>(
             }
             Err(err) => warn!(?err, "failed to populate table"),
         }
-        let fits = table.inner.len() <= max_table;
-        if !fits && !core::mem::replace(&mut warned_oversized, true) {
-            warn!(
-                len = table.inner.len(),
-                max_table, "fixed-rate table too large for this stream; not sent"
-            );
-        }
         {
             let stream = stream.lock().await;
             stream
@@ -2541,9 +2493,7 @@ async fn handle_fixed_stream<A: AsyncWrite>(
                 )
                 .await
                 .0?;
-            if fits {
-                rent!(stream.send(table.with_request_id(req_id)).await, table)?;
-            }
+            rent!(stream.send(table.with_request_id(req_id)).await, table)?;
         }
         state
             .wait_for_tick(start.elapsed(), current_timestamp)
@@ -3492,7 +3442,6 @@ mod wal_tests {
 mod series_tests {
     use super::*;
     use metor_proto_stellar::Client;
-    use std::net::UdpSocket as StdUdpSocket;
     use std::time::Duration;
 
     const ID: PacketId = [9, 2];
@@ -3835,50 +3784,6 @@ mod series_tests {
         lens.sort();
         lens.dedup();
         assert_eq!(lens, [16, 8 + IMAGE_SIZE]);
-    }
-
-    #[stellarator::test]
-    async fn udp_stream_skips_images_and_sends_the_rest() {
-        let (_dir, db) = image_db();
-        ingest(&db, 2).await;
-        let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
-        socket.set_nonblocking(true).unwrap();
-        let live = stream(StreamBehavior::RealTime);
-        handle_unicast_stream(socket.local_addr().unwrap(), live, db.clone());
-        let receive = async {
-            let mut buf = vec![0u8; 1 << 17];
-            let mut tables = 0;
-            while tables < 3 {
-                let Ok(len) = socket.recv(&mut buf) else {
-                    stellarator::sleep(Duration::from_millis(5)).await;
-                    continue;
-                };
-                assert!(len <= MAX_UDP_PAYLOAD);
-                if buf[4] == PacketTy::Table as u8 {
-                    tables += 1;
-                    assert_eq!(len, table_packet_len(8) - 8);
-                }
-            }
-        };
-        let deadline = async {
-            stellarator::sleep(Duration::from_secs(10)).await;
-            panic!("no tables arrived over udp");
-        };
-        feeding(&db, 3, futures_lite::future::or(receive, deadline)).await;
-    }
-
-    #[test]
-    fn oversized_components_are_skipped_and_logged_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let schema = ComponentSchema::new(PrimType::U16, &[1024usize, 1024][..]);
-        let id = ComponentId::new("img");
-        let series = TimeSeries::create(dir.path().join("img")).unwrap();
-        let image = Component::from_time_series(id, schema, series);
-        let mut skipped = HashSet::new();
-        assert!(skip_oversized(&image, MAX_UDP_PAYLOAD, &mut skipped));
-        assert!(skip_oversized(&image, MAX_UDP_PAYLOAD, &mut skipped));
-        assert_eq!(skipped.len(), 1);
-        assert!(!skip_oversized(&image, usize::MAX, &mut skipped));
     }
 }
 
