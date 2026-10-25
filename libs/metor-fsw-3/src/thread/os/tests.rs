@@ -659,7 +659,7 @@ mod large {
     use crate::coordinator::DEFAULT_RING_BYTES;
     use crate::port::{Input, Output};
     use crate::record::Record;
-    use crate::tests::utils::{IMAGE_LEN, Image, ImageBuf};
+    use crate::tests::utils::{Image, ImageBuf};
 
     #[derive(Default)]
     struct Camera {
@@ -674,8 +674,8 @@ mod large {
         let _ = image.write(s.buf.stamped(s.tick));
     }
 
-    /// Each image's timestamp and its first and last pixel bytes.
-    type Seen = Arc<Mutex<Vec<(i64, u8, u8)>>>;
+    /// Each image's timestamp and corners.
+    type Seen = Arc<Mutex<Vec<(i64, (u16, u16))>>>;
 
     /// Records every image it reads.
     #[crate::system]
@@ -683,11 +683,7 @@ mod large {
         loop {
             let next = async {
                 let image = image.next().await.ok()?;
-                Some((
-                    image.timestamp.0,
-                    image.pixels.0[0],
-                    image.pixels.0[IMAGE_LEN - 1],
-                ))
+                Some((image.timestamp.0, image.corners()))
             };
             let stopped = async {
                 stop.wait().await;
@@ -745,7 +741,7 @@ mod large {
             let got = || seen.lock().unwrap().len() >= 30;
             step_until(&mut coordinator, got);
             let seen = seen.lock().unwrap();
-            let want: Vec<_> = (1..=30).map(|t| (t, t as u8, t as u8)).collect();
+            let want: Vec<_> = (1..=30).map(|t| (t, (t as u16, t as u16))).collect();
             assert_eq!(seen[..30], want);
         }
     }

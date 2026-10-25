@@ -220,7 +220,8 @@ impl StatusReporter {
         log: &mut Log,
     ) {
         let rx_cap = conns.rx_cap();
-        turn.events().for_each(|event| log_event(event, rx_cap, log));
+        turn.events()
+            .for_each(|event| log_event(event, rx_cap, log));
         let status = LinkStatus::new(conns.stats(), inbound_dropped, now);
         if status.inbound_dropped > self.reported.inbound_dropped {
             let dropped = status.inbound_dropped - self.reported.inbound_dropped;

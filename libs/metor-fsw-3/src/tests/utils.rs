@@ -64,17 +64,25 @@ pub struct Imu {
     pub sample: f64,
 }
 
-/// The pixel bytes of an [`Image`].
-pub const IMAGE_LEN: usize = 2 << 20;
+/// A 1024² 12-bit camera image.
+pub type Pixels = crate::FrameImage<crate::Mono16<12>, 1024, 1024>;
 
-/// A 2 MiB frame, standing in for a camera image.
+/// A 2 MiB camera frame.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[frame(name = "image")]
 #[repr(C)]
 pub struct Image {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
-    pub pixels: crate::FrameBytes<IMAGE_LEN>,
+    pub pixels: Pixels,
+}
+
+impl Image {
+    /// The first and last pixels.
+    pub fn corners(&self) -> (u16, u16) {
+        let pixels = self.pixels.pixels();
+        (pixels[0], pixels[pixels.len() - 1])
+    }
 }
 
 /// Heap storage for one [`Image`], so no image sits on the stack.
@@ -87,16 +95,15 @@ impl Default for ImageBuf {
 }
 
 impl ImageBuf {
-    /// Stamps the image with `tick` and returns it.
-    ///
-    /// The tick is the timestamp, and the first and last pixel bytes are its
-    /// low byte.
-    pub fn stamped(&mut self, tick: i64) -> &Image {
+    /// Stamps the image with `tick`, as its timestamp and its corners, and
+    /// returns it.
+    pub fn stamped(&mut self, tick: i64) -> &mut Image {
         // PANIC Safety: the buffer is `Image`'s size and 8-byte aligned.
         let image = Image::mut_from_bytes(self.0.as_mut_bytes()).expect("an image");
         image.timestamp = Timestamp(tick);
-        image.pixels.0[0] = tick as u8;
-        image.pixels.0[IMAGE_LEN - 1] = tick as u8;
+        let pixels = image.pixels.pixels_mut();
+        let last = pixels.len() - 1;
+        (pixels[0], pixels[last]) = (tick as u16, tick as u16);
         image
     }
 }
