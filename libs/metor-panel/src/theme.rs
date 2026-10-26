@@ -176,6 +176,15 @@ impl Theme {
         Self::dim(self.zero_line_color, 0.12)
     }
 
+    /// Outline around the selected widget on a dashboard: the theme's accent
+    /// (the hue `drop_target` tints with) at full strength.
+    pub fn selection_ring(&self) -> Hsla {
+        Hsla {
+            a: 1.0,
+            ..self.drop_target
+        }
+    }
+
     /// Track behind a checked switch knob: `control_active` with less presence.
     pub fn control_active_track(&self) -> Hsla {
         Self::dim(self.control_active, 0.7)

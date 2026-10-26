@@ -197,6 +197,19 @@ impl DashboardPanel {
                 .rounded(px(4.0));
         }
 
+        // Drawn over the frame, so a selected frameless widget still shows.
+        if self.selected == Some(widget.id) {
+            container = container
+                .border_2()
+                .border_color(theme.selection_ring())
+                .rounded(px(4.0));
+        } else if self.hovered == Some(widget.id) {
+            container = container
+                .border_2()
+                .border_color(theme.selection_ring().opacity(0.45))
+                .rounded(px(4.0));
+        }
+
         if let Some(view) = view {
             container = if zoom == 1.0 {
                 container.child(view.clone())

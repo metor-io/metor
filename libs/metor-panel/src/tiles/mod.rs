@@ -291,6 +291,7 @@ impl Member {
                         tg.update(cx, |this, _cx| {
                             this.focused_pane = Some(focus_pane.clone());
                         });
+                        crate::inspector::target::select_pane(&focus_pane, cx);
                     })
                     .child(pane.clone())
                     .into_any_element()

@@ -167,7 +167,11 @@ pub struct DashboardPanel {
 
     next_id: u64,
     editing: bool,
+    /// The widget the inspector pane shows. Clicking a widget selects it in
+    /// either mode; clicking bare canvas clears it.
     selected: Option<WidgetId>,
+    /// The widget whose row is under the pointer in the inspector pane.
+    hovered: Option<WidgetId>,
     container_bounds: Option<Bounds<Pixels>>,
     /// Pan and zoom. Only the zoom is persisted; a reopened dashboard starts
     /// at its top-left.
@@ -184,6 +188,7 @@ impl DashboardPanel {
             next_id: 1,
             editing: false,
             selected: None,
+            hovered: None,
             container_bounds: None,
             viewport: zoom::Viewport::default(),
         }
@@ -262,9 +267,31 @@ impl DashboardPanel {
         // whole lifetime.
         self.widget_live.remove(&id);
         if self.selected == Some(id) {
-            self.selected = None;
+            self.set_selected(None, cx);
+        }
+        if self.hovered == Some(id) {
+            self.hovered = None;
         }
         cx.notify();
+    }
+
+    fn set_selected(&mut self, id: Option<WidgetId>, cx: &mut Context<Self>) {
+        if self.selected != id {
+            self.selected = id;
+            cx.notify();
+        }
+    }
+
+    /// The topmost widget under a canvas point.
+    fn widget_at(&self, at: Point<f32>) -> Option<WidgetId> {
+        self.widgets
+            .iter()
+            .rev()
+            .find(|w| {
+                let r = &w.rect;
+                at.x >= r.x && at.x < r.x + r.w && at.y >= r.y && at.y < r.y + r.h
+            })
+            .map(|w| w.id)
     }
 
     fn bring_to_front(&mut self, id: WidgetId, cx: &mut Context<Self>) {
@@ -422,11 +449,24 @@ pub fn widget_rows(
             }
         }),
     )));
+    let z_order =
+        |label: &'static str,
+         apply: fn(&mut DashboardPanel, WidgetId, &mut Context<DashboardPanel>)| {
+            let dashboard = dashboard.clone();
+            Box::new(CommandRow::new(
+                label,
+                Arc::new(move |_window, cx| {
+                    dashboard.update(cx, |this, cx| apply(this, widget_id, cx));
+                }),
+            )) as Box<dyn InspectorRow>
+        };
+    rows.push(z_order("Bring to Front", DashboardPanel::bring_to_front));
+    rows.push(z_order("Send to Back", DashboardPanel::send_to_back));
     Some(rows)
 }
 
 /// Inspector rows that operate on the dashboard itself: add/remove widgets,
-/// toggle edit mode, rename, adjust z-order.
+/// toggle edit mode, zoom, rename.
 pub fn dashboard_rows(
     dashboard: Entity<DashboardPanel>,
     db: Arc<DB>,
@@ -455,9 +495,6 @@ pub fn dashboard_rows(
         Arc::new(move |_window, cx| {
             dashboard.update(cx, |this, cx| {
                 this.editing = !this.editing;
-                if !this.editing {
-                    this.selected = None;
-                }
                 cx.notify();
             });
         })
@@ -493,26 +530,6 @@ pub fn dashboard_rows(
                 })
             },
         )));
-    }
-
-    let selected = dashboard.read(cx).selected;
-    if let Some(sel_id) = selected {
-        rows.push(Box::new(CommandRow::new("Bring to Front", {
-            let dashboard = dashboard.clone();
-            Arc::new(move |_window, cx| {
-                dashboard.update(cx, |this, cx| {
-                    this.bring_to_front(sel_id, cx);
-                });
-            })
-        })));
-        rows.push(Box::new(CommandRow::new("Send to Back", {
-            let dashboard = dashboard.clone();
-            Arc::new(move |_window, cx| {
-                dashboard.update(cx, |this, cx| {
-                    this.send_to_back(sel_id, cx);
-                });
-            })
-        })));
     }
 
     let zoom = dashboard.read(cx).viewport.zoom;
@@ -645,6 +662,28 @@ impl Render for DashboardPanel {
                         this.zoom_to(zoom, Some(event.position), cx);
                     });
                 });
+                // Selection is taken in the capture phase too: a widget's own
+                // controls stop their mouse-downs, and in edit mode the
+                // blocker stops every one, yet any click on a widget picks it.
+                let entity = zoom_entity.clone();
+                let select_hitbox = hitbox.clone();
+                window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, window, cx| {
+                    if phase != gpui::DispatchPhase::Capture
+                        || !select_hitbox.is_hovered(window)
+                        || !matches!(
+                            event.button,
+                            gpui::MouseButton::Left | gpui::MouseButton::Right
+                        )
+                    {
+                        return;
+                    }
+                    entity.update(cx, |this, cx| {
+                        let hit = this
+                            .pixel_to_canvas(event.position)
+                            .and_then(|at| this.widget_at(at));
+                        this.set_selected(hit, cx);
+                    });
+                });
                 let entity = zoom_entity.clone();
                 window.on_mouse_event(move |event: &gpui::PinchEvent, phase, window, cx| {
                     if phase != gpui::DispatchPhase::Capture || !hitbox.is_hovered(window) {
@@ -694,16 +733,6 @@ impl Render for DashboardPanel {
                 cx.notify();
             },
         ));
-
-        if self.editing {
-            let entity = cx.entity();
-            canvas_div = canvas_div.on_click(move |_, _, cx| {
-                entity.update(cx, |this, cx| {
-                    this.selected = None;
-                    cx.notify();
-                });
-            });
-        }
 
         if self.editing {
             canvas_div = canvas_div.child(
@@ -760,6 +789,47 @@ impl Render for DashboardPanel {
     }
 }
 
+/// The dashboard's widgets, as the inspector pane lists them.
+impl crate::inspector::target::InspectHost for Entity<DashboardPanel> {
+    fn children(&self, cx: &App) -> Vec<crate::inspector::target::InspectChild> {
+        self.read(cx)
+            .widgets
+            .iter()
+            .map(|w| crate::inspector::target::InspectChild {
+                id: w.id.0,
+                label: widget_display_label(w, cx),
+                kind: w.kind.0.clone(),
+            })
+            .collect()
+    }
+
+    fn selected_child(&self, cx: &App) -> Option<u64> {
+        self.read(cx).selected.map(|id| id.0)
+    }
+
+    fn select_child(&self, child: Option<u64>, cx: &mut App) {
+        self.update(cx, |this, cx| this.set_selected(child.map(WidgetId), cx));
+    }
+
+    fn hover_child(&self, child: Option<u64>, cx: &mut App) {
+        self.update(cx, |this, cx| {
+            let child = child.map(WidgetId);
+            if this.hovered != child {
+                this.hovered = child;
+                cx.notify();
+            }
+        });
+    }
+
+    fn child_rows(&self, child: u64, cx: &App) -> Option<Vec<Box<dyn InspectorRow>>> {
+        widget_rows(self, WidgetId(child), cx)
+    }
+
+    fn host_rows(&self, cx: &App) -> Vec<Box<dyn InspectorRow>> {
+        dashboard_rows(self.clone(), self.read(cx).db.clone(), cx)
+    }
+}
+
 /// Persisted shape of [`DashboardPanel`].
 ///
 /// Every field defaults, so a document written before a field existed
@@ -792,6 +862,12 @@ impl PaneItem for DashboardPanel {
 
     fn serialization_key() -> &'static str {
         "dashboard"
+    }
+
+    fn inspect_host(
+        this: &Entity<Self>,
+    ) -> Option<std::rc::Rc<dyn crate::inspector::target::InspectHost>> {
+        Some(std::rc::Rc::new(this.clone()))
     }
 
     fn to_config(&self, cx: &App) -> DashboardPanelConfig {
@@ -921,6 +997,127 @@ mod tests {
         assert!(!image.data.is_empty(), "image was not inlined");
     }
 
+    struct Blank;
+
+    impl Render for Blank {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full()
+        }
+    }
+
+    /// A dashboard with two blank widgets side by side, laid out in a window.
+    fn two_widget_dashboard(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<DashboardPanel>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        let kind = WidgetKind::new("blank_test");
+        let spec = Arc::new(WidgetSpec::new(
+            (100.0, 100.0),
+            |_| "Blank".into(),
+            |_, _, cx| {
+                let entity = cx.new(|_| Blank);
+                let any = entity.clone().into_any();
+                WidgetLive {
+                    view: gpui::AnyView::from(entity),
+                    inspect: any.clone(),
+                    state: any,
+                }
+            },
+            |_, _, _| None,
+        ));
+        let widget = |id, x| DashboardWidget {
+            id: WidgetId(id),
+            rect: WidgetRect {
+                x,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+            },
+            kind: kind.clone(),
+            config: String::new(),
+            frame: true,
+        };
+        let blob = serde_json::to_string(&DashboardPanelConfig {
+            title: "Test".into(),
+            widgets: vec![widget(1, 0.0), widget(2, 200.0)],
+            zoom: 1.0,
+        })
+        .unwrap();
+        let (dashboard, cx) = cx.add_window_view(|_, cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            WidgetRegistry::init(cx);
+            crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
+            cx.global_mut::<WidgetRegistry>()
+                .register_shared(kind.clone(), spec);
+            let cfg: DashboardPanelConfig = serde_json::from_str(&blob).unwrap();
+            DashboardPanel {
+                next_id: next_widget_id(&cfg.widgets),
+                widgets: cfg.widgets,
+                ..DashboardPanel::new(db, cx)
+            }
+        });
+        cx.refresh().unwrap();
+        (temp, dashboard, cx)
+    }
+
+    fn canvas_point(
+        dashboard: &Entity<DashboardPanel>,
+        x: f32,
+        y: f32,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Point<Pixels> {
+        let origin = cx.update(|_, cx| dashboard.read(cx).container_bounds.unwrap().origin);
+        origin + point(px(x), px(y))
+    }
+
+    #[gpui::test]
+    fn clicking_a_widget_selects_it_in_either_mode(cx: &mut gpui::TestAppContext) {
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        let selected =
+            |cx: &mut gpui::VisualTestContext| dashboard.read_with(cx, |d, _| d.selected);
+
+        let at = canvas_point(&dashboard, 250.0, 50.0, cx);
+        cx.simulate_click(at, Default::default());
+        assert_eq!(selected(cx), Some(WidgetId(2)));
+        let at = canvas_point(&dashboard, 150.0, 300.0, cx);
+        cx.simulate_click(at, Default::default());
+        assert_eq!(selected(cx), None, "bare canvas clears the selection");
+
+        // Edit mode's blocker stops every mouse-down a widget gets.
+        dashboard.update(cx, |d, cx| {
+            d.editing = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let at = canvas_point(&dashboard, 50.0, 50.0, cx);
+        cx.simulate_click(at, Default::default());
+        assert_eq!(selected(cx), Some(WidgetId(1)));
+
+        dashboard.update(cx, |d, cx| d.remove_widget(WidgetId(1), cx));
+        assert_eq!(selected(cx), None, "removing the selected widget clears it");
+    }
+
+    #[gpui::test]
+    fn z_order_rows_act_on_their_own_widget(cx: &mut gpui::TestAppContext) {
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        cx.update(|window, cx| {
+            let mut rows = widget_rows(&dashboard, WidgetId(1), cx).unwrap();
+            let row = rows
+                .iter_mut()
+                .find(|r| r.label() == "Bring to Front")
+                .unwrap();
+            row.activate(window, cx);
+        });
+        let order: Vec<u64> =
+            dashboard.read_with(cx, |d, _| d.widgets.iter().map(|w| w.id.0).collect());
+        assert_eq!(order, [2, 1]);
+    }
+
     #[gpui::test]
     fn zoom_is_driven_from_the_inspector(cx: &mut gpui::TestAppContext) {
         let temp = tempfile::tempdir().unwrap();
@@ -980,6 +1177,7 @@ pub fn deserialize_dashboard(db: Arc<DB>, blob: &str, cx: &mut App) -> Entity<Da
         next_id,
         editing: false,
         selected: None,
+        hovered: None,
         container_bounds: None,
         viewport: zoom::Viewport::at_zoom(cfg.zoom),
     })

@@ -247,6 +247,10 @@ impl Pane {
         self.active_index
     }
 
+    pub fn active_item(&self) -> Option<&dyn PaneItemHandle> {
+        self.items.get(self.active_index).map(|item| &**item)
+    }
+
     pub fn add_item(&mut self, item: Box<dyn PaneItemHandle>, cx: &mut Context<Self>) {
         self.items.push(item);
         self.active_index = self.items.len() - 1;

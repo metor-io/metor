@@ -1,4 +1,8 @@
+use std::rc::Rc;
+
 use gpui::{AnyEntity, AnyView, App, Entity, Render, SharedString};
+
+use crate::inspector::target::InspectHost;
 
 /// Content hosted inside a pane as a single tab.
 ///
@@ -40,6 +44,13 @@ pub trait PaneItem: Render + Sized + 'static {
     fn inspectable_entity(&self) -> Option<AnyEntity> {
         None
     }
+
+    /// The item as a host of inspectable children, for panels that hold
+    /// their own (a dashboard's widgets). Takes the entity because a host
+    /// edits the item's selection from outside its render.
+    fn inspect_host(_this: &Entity<Self>) -> Option<Rc<dyn InspectHost>> {
+        None
+    }
 }
 
 /// Object-safe view of a [`PaneItem`] so heterogeneous panels can share a tab bar.
@@ -55,6 +66,11 @@ pub trait PaneItemHandle: 'static {
     /// Resolve the entity used by the reflection-driven inspector, applying
     /// [`PaneItem::inspectable_entity`] when set.
     fn entity_any(&self, cx: &App) -> AnyEntity;
+
+    /// See [`PaneItem::inspect_host`].
+    fn inspect_host(&self) -> Option<Rc<dyn InspectHost>> {
+        None
+    }
 }
 
 impl<T: PaneItem> PaneItemHandle for Entity<T> {
@@ -90,5 +106,9 @@ impl<T: PaneItem> PaneItemHandle for Entity<T> {
         self.read(cx)
             .inspectable_entity()
             .unwrap_or_else(|| self.clone().into_any())
+    }
+
+    fn inspect_host(&self) -> Option<Rc<dyn InspectHost>> {
+        T::inspect_host(self)
     }
 }

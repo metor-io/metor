@@ -24,6 +24,7 @@ pub mod plot_preview;
 pub mod reflect;
 pub mod registry;
 pub mod rows;
+pub mod target;
 pub mod trace_picker;
 
 use crate::motion::{self, Fade};
