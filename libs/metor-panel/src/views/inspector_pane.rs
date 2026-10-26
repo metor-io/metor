@@ -59,6 +59,20 @@ impl Target {
     }
 }
 
+/// A pinned target, with the child it was showing. A pin on a child holds
+/// that child however the host's own selection moves; a pin on the host
+/// itself (`child: None`) still follows the host's selection, since that is
+/// navigation within the pinned target.
+#[derive(Clone)]
+struct Pin {
+    target: Target,
+    child: Option<u64>,
+}
+
+/// Picks a child (or, with `None`, the host itself) from the pane's own
+/// controls: the Elements list and the header trail.
+type PickChild = Rc<dyn Fn(Option<u64>, &mut App)>;
+
 /// What the inspector is built for: a new item, or a new child selected
 /// within it, starts it over on a fresh page stack.
 #[derive(Clone, Copy, PartialEq)]
@@ -69,7 +83,7 @@ struct Shown {
 
 pub struct InspectorPane {
     db: Arc<DB>,
-    pinned: Option<Target>,
+    pinned: Option<Pin>,
     shown: Option<Shown>,
     inspector: Option<Entity<Inspector>>,
     /// Set when the host notifies; the inspector's live source rebuilds its
@@ -99,21 +113,63 @@ impl InspectorPane {
     }
 
     fn target(&mut self, cx: &App) -> Option<Target> {
-        if let Some(pinned) = &self.pinned {
-            if pinned.resolve(cx).is_some() {
-                return Some(pinned.clone());
+        if let Some(pin) = &self.pinned {
+            if pin.target.resolve(cx).is_some() {
+                return Some(pin.target.clone());
             }
             self.pinned = None;
         }
         Target::active_in(&target::selected_pane(cx)?, cx)
     }
 
+    /// The child to show in `item`: the pinned one while it exists,
+    /// otherwise whatever the host has selected.
+    fn shown_child(&mut self, item: &dyn PaneItemHandle, cx: &App) -> Option<u64> {
+        let host = item.inspect_host()?;
+        if let Some(pin) = &mut self.pinned
+            && let Some(child) = pin.child
+        {
+            if host.children(cx).iter().any(|c| c.id == child) {
+                return Some(child);
+            }
+            pin.child = None;
+        }
+        host.selected_child(cx)
+    }
+
     fn toggle_pin(&mut self, cx: &mut Context<Self>) {
         self.pinned = match self.pinned {
             Some(_) => None,
-            None => self.target(cx),
+            None => self.target(cx).map(|target| Pin {
+                target,
+                child: self.shown.and_then(|shown| shown.child),
+            }),
         };
         cx.notify();
+    }
+
+    /// Show `child` of the current target, or the target itself for `None`,
+    /// selecting it on the host too. A pin moves with the pick: choosing in
+    /// the pane is how a pinned pane is steered.
+    fn pick_child(&mut self, child: Option<u64>, cx: &mut Context<Self>) {
+        if let Some(pin) = &mut self.pinned {
+            pin.child = child;
+        }
+        if let Some((_, item)) = self.target(cx).and_then(|t| t.resolve(cx))
+            && let Some(host) = item.inspect_host()
+        {
+            host.select_child(child, cx);
+        }
+        cx.notify();
+    }
+
+    fn picker(&self, cx: &Context<Self>) -> PickChild {
+        let this = cx.entity().downgrade();
+        Rc::new(move |child, cx| {
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| this.pick_child(child, cx));
+            }
+        })
     }
 
     /// Rebuild the inspector when the target or its selected child moved.
@@ -123,7 +179,7 @@ impl InspectorPane {
             .and_then(|t| Some((t.clone(), t.resolve(cx)?)));
         let shown = resolved.as_ref().map(|(_, (_, item))| Shown {
             item: item.entity_id(),
-            child: item.inspect_host().and_then(|host| host.selected_child(cx)),
+            child: self.shown_child(&**item, cx),
         });
         if shown == self.shown {
             return;
@@ -156,7 +212,9 @@ impl InspectorPane {
             ));
         }
 
-        let rows = item_rows(&*item, &self.db, cx);
+        let child = shown.and_then(|shown| shown.child);
+        let pick = self.picker(cx);
+        let rows = item_rows(&*item, child, &pick, &self.db, cx);
         let dirty = self.dirty.clone();
         let db = self.db.clone();
         let inspector = cx.new(|cx| {
@@ -167,7 +225,7 @@ impl InspectorPane {
                     return None;
                 }
                 let (_, item) = target.resolve(cx)?;
-                Some(item_rows(&*item, &db, cx))
+                Some(item_rows(&*item, child, &pick, &db, cx))
             }));
             inspector
         });
@@ -179,12 +237,13 @@ impl InspectorPane {
 
     fn render_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = theme(cx);
+        // Each crumb but the last steps back to the host it names.
         let mut crumbs: Vec<SharedString> = Vec::new();
         if let Some((_, item)) = self.target(cx).and_then(|t| t.resolve(cx)) {
             crumbs.push(item.tab_title(cx));
             if let Some(host) = item.inspect_host()
-                && let Some(selected) = host.selected_child(cx)
-                && let Some(child) = host.children(cx).into_iter().find(|c| c.id == selected)
+                && let Some(shown) = self.shown.and_then(|shown| shown.child)
+                && let Some(child) = host.children(cx).into_iter().find(|c| c.id == shown)
             {
                 crumbs.push(child.label);
             }
@@ -204,17 +263,20 @@ impl InspectorPane {
             if ix > 0 {
                 trail = trail.child(Icon::ChevronRight.svg(8.0, theme.text_tertiary));
             }
-            trail = trail.child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(if ix == last {
-                        theme.text_primary
-                    } else {
-                        theme.text_secondary
-                    })
-                    .child(crumb),
-            );
+            let crumb = div()
+                .id(("inspector-pane-crumb", ix))
+                .min_w_0()
+                .truncate()
+                .child(crumb);
+            trail = trail.child(if ix == last {
+                crumb.text_color(theme.text_primary)
+            } else {
+                crumb
+                    .text_color(theme.text_secondary)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.text_primary))
+                    .on_click(cx.listener(|this, _, _, cx| this.pick_child(None, cx)))
+            });
         }
         div()
             .flex()
@@ -301,7 +363,13 @@ impl Render for InspectorPane {
 
 /// The root page for `item`: a host's children, the selected child's rows
 /// and the host's own; otherwise the item's reflected rows.
-fn item_rows(item: &dyn PaneItemHandle, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
+fn item_rows(
+    item: &dyn PaneItemHandle,
+    child: Option<u64>,
+    pick: &PickChild,
+    db: &Arc<DB>,
+    cx: &App,
+) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
     let title = item.tab_title(cx);
     let Some(host) = item.inspect_host() else {
@@ -317,7 +385,7 @@ fn item_rows(item: &dyn PaneItemHandle, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn I
     };
 
     let children = host.children(cx);
-    let selected = host.selected_child(cx);
+    let selected = child;
     if !children.is_empty() {
         rows.push(Box::new(HeaderRow::new(format!(
             "Elements ({})",
@@ -328,6 +396,7 @@ fn item_rows(item: &dyn PaneItemHandle, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn I
                 child: child.clone(),
                 selected: selected == Some(child.id),
                 host: host.clone(),
+                pick: pick.clone(),
             }));
         }
     }
@@ -343,12 +412,13 @@ fn item_rows(item: &dyn PaneItemHandle, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn I
     rows
 }
 
-/// One of a host's children in the Elements section. Activating it selects
-/// the child on the host; hovering it highlights the child there.
+/// One of a host's children in the Elements section. Activating it picks
+/// the child; hovering it highlights the child on the host.
 struct ChildRow {
     child: InspectChild,
     selected: bool,
     host: Rc<dyn InspectHost>,
+    pick: PickChild,
 }
 
 impl InspectorRow for ChildRow {
@@ -390,7 +460,7 @@ impl InspectorRow for ChildRow {
     }
 
     fn activate(&mut self, _window: &mut Window, cx: &mut App) -> RowAction {
-        self.host.select_child(Some(self.child.id), cx);
+        (self.pick)(Some(self.child.id), cx);
         RowAction::Handled
     }
 }
@@ -482,6 +552,53 @@ mod tests {
             inspector.read(cx).dismissed
         });
         assert!(!dismissed);
+        assert_eq!(labels(&pane, cx)[0], "Elements (2)");
+    }
+
+    fn shown_child(pane: &Entity<InspectorPane>, cx: &mut gpui::VisualTestContext) -> Option<u64> {
+        cx.run_until_parked();
+        pane.read_with(cx, |p, _| p.shown.and_then(|s| s.child))
+    }
+
+    #[gpui::test]
+    fn a_pin_holds_its_element_until_the_pane_picks_another(cx: &mut gpui::TestAppContext) {
+        let (f, pane, cx) = open(cx);
+        activate(&pane, "Blank", 0, cx);
+        assert_eq!(shown_child(&pane, cx), Some(1));
+        pane.update(cx, |p, cx| p.toggle_pin(cx));
+
+        // A click on the canvas moves the dashboard's selection, not the pin.
+        cx.update(|_, cx| f.dashboard.select_child(Some(2), cx));
+        assert_eq!(shown_child(&pane, cx), Some(1));
+
+        activate(&pane, "Blank", 1, cx);
+        assert_eq!(
+            shown_child(&pane, cx),
+            Some(2),
+            "the pane's own list steers it"
+        );
+        assert!(pane.read_with(cx, |p, _| p.pinned.is_some()));
+    }
+
+    #[gpui::test]
+    fn the_host_crumb_steps_back_to_the_dashboard(cx: &mut gpui::TestAppContext) {
+        let (f, pane, cx) = open(cx);
+        activate(&pane, "Blank", 1, cx);
+        assert_eq!(shown_child(&pane, cx), Some(2));
+        pane.update(cx, |p, cx| p.pick_child(None, cx));
+        assert_eq!(shown_child(&pane, cx), None);
+        assert_eq!(cx.update(|_, cx| f.dashboard.selected_child(cx)), None);
+    }
+
+    #[gpui::test]
+    fn a_page_crumb_returns_to_its_page(cx: &mut gpui::TestAppContext) {
+        let (_f, pane, cx) = open(cx);
+        activate(&pane, "Zoom", 0, cx);
+        assert!(labels(&pane, cx).contains(&"Fit All".to_string()));
+        cx.update(|_, cx| {
+            let inspector = pane.read(cx).inspector.clone().unwrap();
+            inspector.update(cx, |i, cx| i.return_to_page(0, cx));
+        });
         assert_eq!(labels(&pane, cx)[0], "Elements (2)");
     }
 

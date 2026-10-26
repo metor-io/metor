@@ -388,6 +388,11 @@ impl Inspector {
         cx.notify();
     }
 
+    /// Pop back until the page at stack index `page` is on top.
+    pub(crate) fn return_to_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        while self.pages.len() > page + 1 && self.pop_page(cx) {}
+    }
+
     fn pop_page(&mut self, cx: &mut Context<Self>) -> bool {
         if self.pages.len() > 1 {
             self.pages.pop();
@@ -831,33 +836,52 @@ impl Inspector {
         // The trail is context, the field is the point: only the nearest two
         // crumbs show, each capped, and anything before them folds into one
         // ellipsis so the field always keeps its room.
-        let crumbs: Vec<&SharedString> = self.pages[..self.pages.len().saturating_sub(1)]
+        // Clicking a crumb returns to its page; the ellipsis stands for
+        // several and goes nowhere.
+        let crumbs: Vec<(usize, &SharedString)> = self.pages[..self.pages.len().saturating_sub(1)]
             .iter()
-            .filter_map(|page| page.label.as_ref())
+            .enumerate()
+            .filter_map(|(ix, page)| Some((ix, page.label.as_ref()?)))
             .collect();
         let shown = crumbs.len().min(2);
-        let mut labels: Vec<SharedString> = Vec::with_capacity(shown + 1);
+        let mut labels: Vec<(Option<usize>, SharedString)> = Vec::with_capacity(shown + 1);
         if crumbs.len() > shown {
-            labels.push(SharedString::new_static("…"));
+            labels.push((None, SharedString::new_static("…")));
         }
-        labels.extend(crumbs[crumbs.len() - shown..].iter().map(|l| (*l).clone()));
-        for label in labels {
-            bar = bar.child(
-                div()
-                    .flex_none()
-                    .max_w(px(140.0))
-                    .truncate()
-                    .px(px(6.0))
-                    .py(px(1.0))
-                    .mr(px(4.0))
-                    .bg(theme.pill_bg)
-                    .border_1()
-                    .border_color(theme.pill_border)
-                    .rounded(px(3.0))
-                    .text_size(px(10.0))
-                    .text_color(theme.text_secondary)
-                    .child(label),
-            );
+        labels.extend(
+            crumbs[crumbs.len() - shown..]
+                .iter()
+                .map(|(ix, label)| (Some(*ix), (*label).clone())),
+        );
+        for (page, label) in labels {
+            let pill = div()
+                .id(("inspector-crumb", page.unwrap_or(usize::MAX)))
+                .flex_none()
+                .max_w(px(140.0))
+                .truncate()
+                .px(px(6.0))
+                .py(px(1.0))
+                .mr(px(4.0))
+                .bg(theme.pill_bg)
+                .border_1()
+                .border_color(theme.pill_border)
+                .rounded(px(3.0))
+                .text_size(px(10.0))
+                .text_color(theme.text_secondary)
+                .child(label);
+            bar = bar.child(match page {
+                Some(page) if !self.dismissed => pill
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.text_primary))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.return_to_page(page, cx);
+                        }),
+                    ),
+                _ => pill,
+            });
         }
 
         bar = bar.child(div().flex_1().min_w(px(60.0)).child(self.search.element()));
