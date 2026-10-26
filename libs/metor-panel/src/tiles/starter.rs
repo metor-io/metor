@@ -6,8 +6,6 @@
 //! Time Series needs its traces picked first, which takes the database and a
 //! window, so the pane asks the app to open that wizard
 //! ([`PaneEvent::NewTimeSeries`]).
-use std::rc::Rc;
-
 use gpui::{AnyElement, App, ClickEvent, Context, SharedString, Window, div, prelude::*, px};
 
 use super::pane::{Pane, PaneEvent};
@@ -22,11 +20,11 @@ pub(crate) struct StarterCard {
 }
 
 /// The line under the cards, "Add more {what} from the command palette",
-/// with the palette's shortcut after it. Only "command palette" and the
-/// shortcut are links, both to `on_click`.
+/// with the palette's shortcut after it. "command palette" and the shortcut
+/// together are the one link, to `on_click`.
 pub(crate) struct StarterHint {
     pub what: &'static str,
-    pub on_click: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+    pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
 }
 
 /// `cards` in a wrapping row centred in the space given, over `hint`. Each
@@ -88,44 +86,55 @@ pub(crate) fn starter_cards(
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(6.0))
                 .text_size(px(11.0))
                 .text_color(theme.text_tertiary)
+                .child(SharedString::from(format!(
+                    "Add more {} from the\u{a0}",
+                    hint.what
+                )))
                 .child(
+                    // One link for both, so hovering either lights both.
                     div()
+                        .id((id, usize::MAX))
+                        .debug_selector(move || format!("{id}-hint"))
+                        .group(HINT_LINK)
                         .flex()
                         .flex_row()
-                        .child(SharedString::from(format!(
-                            "Add more {} from the\u{a0}",
-                            hint.what
-                        )))
+                        .items_center()
+                        .gap(px(6.0))
+                        .cursor_pointer()
+                        .on_click(hint.on_click)
                         .child(
                             div()
-                                .id((id, usize::MAX))
-                                .debug_selector(move || format!("{id}-hint"))
-                                .cursor_pointer()
                                 .text_color(theme.text_secondary)
-                                .hover(|s| s.text_color(theme.text_primary))
-                                .on_click({
-                                    let on_click = hint.on_click.clone();
-                                    move |event, window, cx| on_click(event, window, cx)
-                                })
+                                .group_hover(HINT_LINK, |s| s.text_color(theme.text_primary))
                                 .child(SharedString::new_static("command palette")),
-                        ),
-                )
-                .when_some(palette_shortcut(window), |line, keys| {
-                    let on_click = hint.on_click.clone();
-                    line.child(
-                        div()
-                            .id((id, usize::MAX - 1))
-                            .cursor_pointer()
-                            .on_click(move |event, window, cx| on_click(event, window, cx))
-                            .child(crate::inspector::rows::tag_pill(keys, cx)),
-                    )
-                }),
+                        )
+                        .when_some(palette_shortcut(window), |link, keys| {
+                            link.child(
+                                div()
+                                    .px(px(6.0))
+                                    .py(px(1.0))
+                                    .bg(theme.pill_bg)
+                                    .border_1()
+                                    .border_color(theme.pill_border)
+                                    .rounded(px(3.0))
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_secondary)
+                                    .group_hover(HINT_LINK, |s| {
+                                        s.text_color(theme.text_primary)
+                                            .border_color(theme.text_tertiary)
+                                    })
+                                    .child(keys),
+                            )
+                        }),
+                ),
         )
         .into_any_element()
 }
+
+/// Hover group shared by the hint's "command palette" and its shortcut.
+const HINT_LINK: &str = "starter-hint-link";
 
 /// The palette's binding as this platform writes it (⌘P on macOS), read
 /// from the keymap so a rebinding shows here too.
@@ -170,7 +179,7 @@ impl Pane {
             .collect();
         let hint = StarterHint {
             what: "views",
-            on_click: Rc::new(|_, window, cx| {
+            on_click: Box::new(|_, window, cx| {
                 window.dispatch_action(Box::new(crate::app::OpenPalette), cx)
             }),
         };

@@ -660,7 +660,7 @@ impl DashboardPanel {
             .collect();
         let hint = crate::tiles::starter::StarterHint {
             what: "widgets",
-            on_click: std::rc::Rc::new({
+            on_click: Box::new({
                 let dashboard = cx.entity();
                 let db = self.db.clone();
                 move |_, window, cx| {
