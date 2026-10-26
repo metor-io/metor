@@ -1176,11 +1176,36 @@ pub struct TimerSeriesWriter {
 
 impl TimerSeriesWriter {
     pub fn push_buf(&mut self, timestamp: Timestamp, buf: &[u8]) -> Result<(), Error> {
+        self.push_bufs([(timestamp, buf)])
+    }
+
+    /// Appends samples in order, waking readers once for all of them.
+    pub fn push_bufs<'a>(
+        &mut self,
+        samples: impl IntoIterator<Item = (Timestamp, &'a [u8])>,
+    ) -> Result<(), Error> {
+        let mut pushed = false;
         let mut rolled = false;
-        loop {
-            if self.try_push_buf(timestamp, buf)? {
-                break;
-            }
+        let result = samples.into_iter().try_for_each(|(timestamp, buf)| {
+            rolled |= self.append(timestamp, buf)?;
+            pushed = true;
+            Ok(())
+        });
+        if rolled {
+            // The previous head is now immutable; let the lifecycle task
+            // seal it off the hot path.
+            self.time_series.lifecycle_waker.wake_all();
+        }
+        if pushed {
+            self.time_series.data_waker.wake_all();
+        }
+        result
+    }
+
+    /// Appends one sample, returning whether it rolled a new head node.
+    fn append(&mut self, timestamp: Timestamp, buf: &[u8]) -> Result<bool, Error> {
+        let mut rolled = false;
+        while !self.try_push_buf(timestamp, buf)? {
             let _ = self.time_series.list.try_push(TimeSeriesNode::create(
                 self.time_series.path.join(timestamp.0.to_string()),
                 timestamp,
@@ -1188,28 +1213,26 @@ impl TimerSeriesWriter {
             )?);
             rolled = true;
         }
-        if rolled {
-            // The previous head is now immutable; let the lifecycle task
-            // seal it off the hot path.
-            self.time_series.lifecycle_waker.wake_all();
-        }
-        self.time_series.data_waker.wake_all();
-        Ok(())
+        Ok(rolled)
     }
 
     fn try_push_buf(&mut self, timestamp: Timestamp, buf: &[u8]) -> Result<bool, Error> {
-        let Some(head) = self.time_series.list.head() else {
-            return Ok(false);
+        // The node this writer last appended to was checked then, so while
+        // it stays the head it needs neither a fresh reference nor a check.
+        let head = match self.current.take() {
+            Some(current) if self.time_series.list.is_head(&current) => current,
+            _ => {
+                let Some(head) = self.time_series.list.head() else {
+                    return Ok(false);
+                };
+                if self.head_is_sealed(&head) {
+                    // Never append into a sealed node (e.g. one installed
+                    // from a store); roll a fresh node above it instead.
+                    return Ok(false);
+                }
+                head
+            }
         };
-        let head_is_current = self
-            .current
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &head));
-        if !head_is_current && self.head_is_sealed(&head) {
-            // Never append into a sealed node (e.g. one installed from a
-            // store); roll a fresh node above it instead.
-            return Ok(false);
-        }
         if let Some(max_age) = self.time_series.max_node_age_us()
             && let Some(first) = head.timestamps().first()
             && timestamp.0.saturating_sub(first.0) > max_age

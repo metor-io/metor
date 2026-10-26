@@ -1496,12 +1496,12 @@ impl Component {
             let writer = writer.as_mut().ok_or_else(|| {
                 Error::Io(std::io::Error::other("component writer owned elsewhere"))
             })?;
-            for msg in buf.chunks_exact(msg_size) {
-                let timestamp = Timestamp(i64::from_le_bytes(
-                    msg[..size_of::<Timestamp>()].try_into().unwrap(),
-                ));
-                writer.push_buf(timestamp, &msg[size_of::<Timestamp>()..])?;
-            }
+            writer.push_bufs(buf.chunks_exact(msg_size).map(|msg| {
+                let (timestamp, value) = msg.split_at(size_of::<Timestamp>());
+                // PANIC Safety: `split_at` leaves exactly a timestamp's bytes.
+                let timestamp = Timestamp(i64::from_le_bytes(timestamp.try_into().unwrap()));
+                (timestamp, value)
+            }))?;
         }
         Ok(())
     }
