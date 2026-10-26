@@ -1721,6 +1721,16 @@ impl PanelApp {
             KeyBinding::new("escape", crate::tiles::ExitZoom, Some(EXIT_ZOOM)),
             KeyBinding::new("secondary-l", ToggleCmdLock, None),
             KeyBinding::new("secondary-i", ShowInspector, None),
+            KeyBinding::new(
+                "backspace",
+                crate::views::dashboard::DeleteSelected,
+                Some("Dashboard"),
+            ),
+            KeyBinding::new(
+                "delete",
+                crate::views::dashboard::DeleteSelected,
+                Some("Dashboard"),
+            ),
             KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
             // Scoped to a focused browser: the bar is per pane, and
             // nothing else claims the find chord yet.

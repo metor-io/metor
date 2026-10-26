@@ -32,6 +32,16 @@ mod zoom;
 use widgets::create_widget_view;
 pub use widgets::{ImageWidgetConfig, TileViewSpec, WidgetLive, WidgetRegistry, WidgetSpec};
 
+gpui::actions!(
+    dashboard,
+    [
+        /// Delete the selected widget. Bound to backspace and delete in the
+        /// `Dashboard` key context, which the canvas holds once a click in
+        /// edit mode focuses it.
+        DeleteSelected
+    ]
+);
+
 const SNAP_GRID_PX: f32 = 10.0;
 
 fn snap_px(v: f32) -> f32 {
@@ -173,13 +183,16 @@ pub struct DashboardPanel {
     /// The widget whose row is under the pointer in the inspector pane.
     hovered: Option<WidgetId>,
     container_bounds: Option<Bounds<Pixels>>,
+    /// Taken by a click in edit mode, so the editing shortcuts reach the
+    /// dashboard rather than whatever had focus before.
+    focus_handle: gpui::FocusHandle,
     /// Pan and zoom. Only the zoom is persisted; a reopened dashboard starts
     /// at its top-left.
     viewport: zoom::Viewport,
 }
 
 impl DashboardPanel {
-    pub fn new(db: Arc<DB>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         Self {
             db,
             title: "Dashboard".into(),
@@ -190,6 +203,7 @@ impl DashboardPanel {
             selected: None,
             hovered: None,
             container_bounds: None,
+            focus_handle: cx.focus_handle(),
             viewport: zoom::Viewport::default(),
         }
     }
@@ -644,6 +658,7 @@ impl Render for DashboardPanel {
 
         let entity = cx.entity().clone();
         let zoom_entity = entity.clone();
+        let focus_handle = self.focus_handle.clone();
         let bounds_tracker = gpui::canvas(
             move |bounds, window, cx| {
                 entity.update(cx, |this, _| {
@@ -677,6 +692,7 @@ impl Render for DashboardPanel {
                 // mouse-down, yet any click on a widget should pick it.
                 let entity = zoom_entity.clone();
                 let select_hitbox = hitbox.clone();
+                let focus = focus_handle.clone();
                 window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, window, cx| {
                     if phase != gpui::DispatchPhase::Capture
                         || !select_hitbox.is_hovered(window)
@@ -694,6 +710,7 @@ impl Render for DashboardPanel {
                             .and_then(|at| this.widget_at(at));
                         this.set_selected(hit, cx);
                     });
+                    focus.focus(window, cx);
                 });
                 let entity = zoom_entity.clone();
                 window.on_mouse_event(move |event: &gpui::PinchEvent, phase, window, cx| {
@@ -713,6 +730,15 @@ impl Render for DashboardPanel {
 
         let mut canvas_div = div()
             .id("dashboard-canvas")
+            .key_context("Dashboard")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &DeleteSelected, _, cx| {
+                if this.editing
+                    && let Some(id) = this.selected
+                {
+                    this.remove_widget(id, cx);
+                }
+            }))
             .relative()
             .size_full()
             .overflow_hidden()
@@ -1220,6 +1246,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn backspace_deletes_the_selected_widget_in_edit_mode(cx: &mut gpui::TestAppContext) {
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        cx.update(|_, cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("backspace", DeleteSelected, Some("Dashboard")),
+                gpui::KeyBinding::new("delete", DeleteSelected, Some("Dashboard")),
+            ])
+        });
+        let ids = |cx: &mut gpui::VisualTestContext| -> Vec<u64> {
+            dashboard.read_with(cx, |d, _| d.widgets.iter().map(|w| w.id.0).collect())
+        };
+
+        dashboard.update(cx, |d, cx| d.set_editing(true, cx));
+        cx.run_until_parked();
+        let at = canvas_point(&dashboard, 250.0, 50.0, cx);
+        cx.simulate_click(at, Default::default());
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(ids(cx), [1], "the clicked widget is gone");
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(ids(cx), [1], "nothing is selected after a delete");
+
+        let at = canvas_point(&dashboard, 50.0, 50.0, cx);
+        cx.simulate_click(at, Default::default());
+        dashboard.update(cx, |d, cx| d.set_editing(false, cx));
+        cx.simulate_keystrokes("delete");
+        assert_eq!(ids(cx), [1], "view mode never deletes");
+    }
+
+    #[gpui::test]
     fn picking_a_widget_from_outside_enters_edit_mode(cx: &mut gpui::TestAppContext) {
         use crate::inspector::target::InspectHost;
         let (_temp, dashboard, cx) = two_widget_dashboard(cx);
@@ -1292,7 +1347,7 @@ pub fn deserialize_dashboard(db: Arc<DB>, blob: &str, cx: &mut App) -> Entity<Da
 
     let next_id = next_widget_id(&cfg.widgets);
 
-    cx.new(|_cx| DashboardPanel {
+    cx.new(|cx| DashboardPanel {
         db,
         title: if cfg.title.is_empty() {
             SharedString::from("Dashboard")
@@ -1306,6 +1361,7 @@ pub fn deserialize_dashboard(db: Arc<DB>, blob: &str, cx: &mut App) -> Entity<Da
         selected: None,
         hovered: None,
         container_bounds: None,
+        focus_handle: cx.focus_handle(),
         viewport: zoom::Viewport::at_zoom(cfg.zoom),
     })
 }
