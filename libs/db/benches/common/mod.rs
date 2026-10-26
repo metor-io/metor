@@ -1,8 +1,8 @@
 //! The fixture and table builders the db benches share.
 //!
 //! Components are created on a host thread running a stellarator executor,
-//! as the server creates them, so their persist tasks drain the WAL while the
-//! benches ingest.
+//! as a server connection creates them, while the benches ingest from their
+//! own threads.
 
 // Each bench target uses its own subset.
 #![allow(dead_code)]

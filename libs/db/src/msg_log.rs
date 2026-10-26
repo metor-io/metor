@@ -1,9 +1,8 @@
 use std::{
     fmt::Debug,
-    future::Future,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
 use metor_proto::{buf::UmbraBuf, types::Timestamp};
@@ -13,9 +12,10 @@ use tracing::warn;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
-    Error, MetadataExt,
+    Background, Error, MetadataExt,
     append_log::AppendLog,
     arc_ring::{AtomicNode, AtomicStack, AtomicStackIter},
+    background::{Pending, Persister},
     disruptor::{ArcAtomic, Disruptor, Reader},
 };
 
@@ -27,6 +27,9 @@ pub struct MsgLog {
     metadata: Option<MsgMetadata>,
     wal: Disruptor,
     pending: Arc<Mutex<Reader>>,
+    /// Whether the WAL is queued for the persist thread.
+    pub(crate) queued: Arc<AtomicBool>,
+    persister: Persister,
 }
 
 #[derive(Clone)]
@@ -232,23 +235,17 @@ impl MsgRef {
 }
 
 impl MsgLog {
-    pub fn create(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = path.as_ref();
-        let wal = Disruptor::new(1024 * 1024);
-        let pending = Arc::new(Mutex::new(wal.reader()));
-        let this = Self {
-            list: Arc::new(AtomicStack::new()),
-            path: path.to_path_buf(),
-            data_waker: Arc::new(WaitQueue::new()),
-            metadata: None,
-            wal,
-            pending,
-        };
-        stellarator::spawn(this.clone().persist());
-        Ok(this)
+    /// A new log, persisted by the db's [`Background`] threads.
+    pub fn create(path: impl AsRef<Path>, background: &Background) -> Result<Self, Error> {
+        Ok(Self::with_background(
+            Arc::new(AtomicStack::new()),
+            path.as_ref(),
+            None,
+            background,
+        ))
     }
 
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+    pub fn open(path: impl AsRef<Path>, background: &Background) -> Result<Self, Error> {
         let path = path.as_ref();
         let list = Arc::new(AtomicStack::new());
         let metadata_path = path.join("metadata");
@@ -269,18 +266,27 @@ impl MsgLog {
             }
         }
 
+        Ok(Self::with_background(list, path, metadata, background))
+    }
+
+    fn with_background(
+        list: Arc<AtomicStack<MsgLogNode>>,
+        path: &Path,
+        metadata: Option<MsgMetadata>,
+        background: &Background,
+    ) -> Self {
         let wal = Disruptor::new(1024 * 1024);
         let pending = Arc::new(Mutex::new(wal.reader()));
-        let this = Self {
+        Self {
             list,
             path: path.to_path_buf(),
             data_waker: Arc::new(WaitQueue::new()),
             metadata,
             wal,
             pending,
-        };
-        stellarator::spawn(this.clone().persist());
-        Ok(this)
+            queued: Default::default(),
+            persister: background.persister.clone(),
+        }
     }
 
     pub fn push(&self, timestamp: Timestamp, msg: &[u8]) -> Result<(), Error> {
@@ -307,6 +313,12 @@ impl MsgLog {
 
         drop(grant);
         self.data_waker.wake_all();
+        if self
+            .persister
+            .queue(&self.queued, || Pending::MsgLog(self.clone()))
+        {
+            self.persister.wake();
+        }
         Ok(())
     }
 
@@ -455,18 +467,6 @@ impl MsgLog {
 
     pub fn start_timestamp(&self) -> Option<Timestamp> {
         self.first_timestamp()
-    }
-
-    pub fn persist(self) -> impl Future<Output = ()> {
-        let mut notify = self.wal.reader();
-        async move {
-            loop {
-                if let Err(err) = self.flush_pending() {
-                    tracing::error!(?err, "failed to persist wal message");
-                }
-                drop(notify.next().await);
-            }
-        }
     }
 
     pub(crate) fn flush_pending(&self) -> Result<(), Error> {

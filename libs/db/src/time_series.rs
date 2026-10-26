@@ -792,7 +792,7 @@ impl TimeSeries {
 
     /// Background task that seals nodes as the writer rolls past them, and
     /// carries a peer's head up to each mirror run that starts.
-    /// Spawn one per component alongside the persist task.
+    /// One runs per component, on the db's seal thread.
     pub async fn lifecycle(self) {
         let mut run_start = i64::MIN;
         loop {

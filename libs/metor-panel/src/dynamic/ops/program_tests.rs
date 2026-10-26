@@ -56,6 +56,19 @@ impl Bench {
             crate::dynamic::tensor::write_f64_as(&mut bytes, prim, *v);
         }
         component.push_buf(Timestamp(ts), &bytes).unwrap();
+        // Seeds and replays read storage, which the db's persist thread
+        // fills off this one, so a sample is history once it lands there.
+        for _ in 0..2000 {
+            if component
+                .time_series
+                .latest()
+                .is_some_and(|latest| latest.timestamp() >= Timestamp(ts))
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("{name} never persisted its sample at {ts}");
     }
 
     pub(super) fn source(&self, name: &str) -> Arc<Node> {
@@ -473,11 +486,22 @@ async fn a_seeded_expression_accumulates_history() {
     }
     assert_eq!(take(&mut out, 5).await, vec![11.0, 21.0, 31.0, 41.0, 51.0]);
 
-    // What a plot actually reads: distinct, advancing entries.
+    // What a plot actually reads: distinct, advancing entries. `out` tails
+    // the WAL, which the db's persist thread drains to storage after it.
     let component = bench
         .db
         .with_state(|s| s.get_component(ComponentId::new("scaled")).cloned())
         .expect("the expression's component");
+    for _ in 0..2000 {
+        if component
+            .time_series
+            .latest()
+            .is_some_and(|latest| latest.timestamp() >= Timestamp(5))
+        {
+            break;
+        }
+        stellarator::sleep(Duration::from_millis(1)).await;
+    }
     let latest = component.time_series.latest().expect("history");
     assert_eq!(
         latest.timestamp(),

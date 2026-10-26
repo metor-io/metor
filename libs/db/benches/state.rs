@@ -155,7 +155,7 @@ fn ingest_dynamic(c: &mut Criterion) {
             )]),
         })
         .unwrap();
-        // Realize every member here, so their persist tasks run on the host.
+        // Realize every member on the host, as a connection would.
         let mut table = map_table(KEYS);
         stamp(&mut table, 1);
         db.ingest_table(DYNAMIC_ID, &table).unwrap();
