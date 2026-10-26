@@ -104,8 +104,11 @@ pub(crate) fn starter_cards(
                         .gap(px(6.0))
                         .cursor_pointer()
                         .on_click(hint.on_click)
+                        // Both parts carry ids: gpui only redraws a group-hover
+                        // style on an element with state to hold it.
                         .child(
                             div()
+                                .id((id, usize::MAX - 1))
                                 .text_color(theme.text_secondary)
                                 .group_hover(HINT_LINK, |s| s.text_color(theme.text_primary))
                                 .child(SharedString::new_static("command palette")),
@@ -113,6 +116,7 @@ pub(crate) fn starter_cards(
                         .when_some(palette_shortcut(window), |link, keys| {
                             link.child(
                                 div()
+                                    .id((id, usize::MAX - 2))
                                     .px(px(6.0))
                                     .py(px(1.0))
                                     .bg(theme.pill_bg)
@@ -122,8 +126,9 @@ pub(crate) fn starter_cards(
                                     .text_size(px(10.0))
                                     .text_color(theme.text_secondary)
                                     .group_hover(HINT_LINK, |s| {
-                                        s.text_color(theme.text_primary)
-                                            .border_color(theme.text_tertiary)
+                                        s.bg(theme.selection_bg)
+                                            .border_color(theme.text_secondary)
+                                            .text_color(theme.text_primary)
                                     })
                                     .child(keys),
                             )
