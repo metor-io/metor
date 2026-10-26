@@ -6,6 +6,7 @@ pub(crate) mod pane;
 pub mod panels;
 pub(crate) mod serial;
 mod split_preview;
+mod starter;
 mod tab;
 
 use gpui::{
@@ -55,6 +56,8 @@ pub enum TileGroupEvent {
         pane: Entity<Pane>,
         position: Point<Pixels>,
     },
+    /// An empty pane's Time Series button: open the trace wizard aimed at it.
+    NewTimeSeries { pane: Entity<Pane> },
 }
 
 impl EventEmitter<TileGroupEvent> for TileGroup {}
@@ -916,6 +919,7 @@ impl TileGroup {
                 });
             }
             PaneEvent::ToggleZoom => self.toggle_zoom(&pane, cx),
+            PaneEvent::NewTimeSeries => cx.emit(TileGroupEvent::NewTimeSeries { pane }),
         }
     }
 

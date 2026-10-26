@@ -64,6 +64,8 @@ pub(crate) struct AppRoot {
     hover_preview: Option<HoverPreview>,
     pending_inspector_request: Option<(Box<dyn crate::tiles::PaneItemHandle>, Point<Pixels>)>,
     pending_pane_inspector_request: Option<(Entity<crate::tiles::Pane>, Point<Pixels>)>,
+    /// An empty pane whose Time Series button opened the trace wizard.
+    pending_time_series: Option<Entity<crate::tiles::Pane>>,
     pending_inspector_open: Option<InspectorRequest>,
     /// The transient chord menu, retained through its passive exit fade.
     /// Logical dismissal releases focus before the visual is removed.
@@ -123,6 +125,7 @@ impl AppRoot {
             hover_preview: None,
             pending_inspector_request: None,
             pending_pane_inspector_request: None,
+            pending_time_series: None,
             pending_inspector_open: None,
             transient: None,
             connection_picker: None,
@@ -551,6 +554,10 @@ impl AppRoot {
                 self.pending_pane_inspector_request = Some((pane.clone(), *position));
                 cx.notify();
             }
+            TileGroupEvent::NewTimeSeries { pane } => {
+                self.pending_time_series = Some(pane.clone());
+                cx.notify();
+            }
         }
     }
 }
@@ -580,6 +587,16 @@ impl Render for AppRoot {
 
         if let Some((pane, position)) = self.pending_pane_inspector_request.take() {
             self.open_pane_inspector(pane, position, window, cx);
+        }
+
+        if let Some(pane) = self.pending_time_series.take() {
+            let rows = crate::tiles::panels::pane_add_menu(
+                self.db.clone(),
+                pane,
+                crate::inspector::open_inspector(cx),
+            )
+            .time_series_rows();
+            self.open_inspector_with(rows, InspectorMode::Centered, window, cx);
         }
 
         if let Some(request) = self.pending_inspector_open.take() {

@@ -49,24 +49,7 @@ impl AddMenu {
     pub(crate) fn rows(self) -> Vec<Box<dyn InspectorRow>> {
         use Host::{Dashboard, Pane};
         let entries: Vec<(Option<Host>, Box<dyn InspectorRow>)> = vec![
-            (
-                None,
-                self.wizard(
-                    "Time Series Plot",
-                    WidgetKind::plot(),
-                    |db, commit| {
-                        crate::inspector::trace_picker::select_traces_wizard_rows(
-                            db,
-                            Arc::new(|_| 0),
-                            commit,
-                        )
-                    },
-                    |traces| PlotPanelConfig {
-                        traces: traces.iter().map(TraceConfig::from).collect(),
-                        ..Default::default()
-                    },
-                ),
-            ),
+            (None, self.time_series()),
             (
                 Some(Pane),
                 self.wizard(
@@ -240,6 +223,34 @@ impl AddMenu {
         (self.sink)(kind, config, cx)
     }
 
+    fn time_series(&self) -> Box<dyn InspectorRow> {
+        let menu = self.clone();
+        Box::new(NavRow::new(
+            "Time Series Plot",
+            "",
+            Box::new(move |_| menu.time_series_rows()),
+        ))
+    }
+
+    /// The time series wizard's first page, for entry points that open
+    /// straight into it (an empty pane's Time Series button).
+    pub(crate) fn time_series_rows(&self) -> Vec<Box<dyn InspectorRow>> {
+        self.wizard_rows(
+            WidgetKind::plot(),
+            &|db, commit: crate::inspector::trace_picker::OnTracesSelected| {
+                crate::inspector::trace_picker::select_traces_wizard_rows(
+                    db,
+                    Arc::new(|_| 0),
+                    commit,
+                )
+            },
+            |traces| PlotPanelConfig {
+                traces: traces.iter().map(TraceConfig::from).collect(),
+                ..Default::default()
+            },
+        )
+    }
+
     /// A multi-page picker whose result configures one view, which the
     /// inspector then opens on.
     fn wizard<T: 'static, C: Serialize + 'static>(
@@ -251,22 +262,29 @@ impl AddMenu {
         configure: fn(T) -> C,
     ) -> Box<dyn InspectorRow> {
         let menu = self.clone();
+        let pick = Arc::new(pick);
         Box::new(NavRow::new(
             label,
             "",
-            Box::new(move |_| {
-                let menu = menu.clone();
-                let kind = kind.clone();
-                pick(
-                    menu.db.clone(),
-                    Arc::new(move |selected, window, cx| {
-                        if let Some(entity) = menu.add(&kind, &configure(selected), cx) {
-                            menu.inspect_created(entity, window, cx);
-                        }
-                    }),
-                )
-            }),
+            Box::new(move |_| menu.wizard_rows(kind.clone(), &*pick, configure)),
         ))
+    }
+
+    fn wizard_rows<T: 'static, C: Serialize + 'static>(
+        &self,
+        kind: WidgetKind,
+        pick: &dyn Fn(Arc<DB>, Arc<dyn Fn(T, &mut Window, &mut App)>) -> Vec<Box<dyn InspectorRow>>,
+        configure: fn(T) -> C,
+    ) -> Vec<Box<dyn InspectorRow>> {
+        let menu = self.clone();
+        pick(
+            self.db.clone(),
+            Arc::new(move |selected, window, cx| {
+                if let Some(entity) = menu.add(&kind, &configure(selected), cx) {
+                    menu.inspect_created(entity, window, cx);
+                }
+            }),
+        )
     }
 
     /// The component list, preceded by the expression row so typing `=`

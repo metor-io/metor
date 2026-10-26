@@ -81,6 +81,8 @@ pub enum PaneEvent {
     /// A tab was double-clicked: fill the tile group with this pane, or put
     /// the layout back if it already does.
     ToggleZoom,
+    /// The empty pane's Time Series button was pressed.
+    NewTimeSeries,
 }
 
 impl EventEmitter<PaneEvent> for Pane {}
@@ -796,6 +798,8 @@ impl Render for Pane {
 
         if let Some(item) = self.items.get(self.active_index) {
             content = content.child(item.view());
+        } else {
+            content = content.child(self.render_starters(cx));
         }
 
         // Drop on content area (split-on-drop at edges, add-as-tab in center)
