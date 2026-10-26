@@ -156,8 +156,10 @@ fn time_series_range(c: &mut Criterion) {
                     .as_iter()
                     .flat_map(|node| {
                         node.data()
-                            .chunks_exact(8)
-                            .map(|v| f64::from_le_bytes(v.try_into().unwrap()))
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|v| f64::from_le_bytes(*v))
                             .collect::<Vec<_>>()
                     })
                     .sum();
