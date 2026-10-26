@@ -37,6 +37,7 @@ actions!(
         ToggleCmdLock,
         OpenReviewEdits,
         OpenConnections,
+        ShowInspector,
     ]
 );
 
@@ -633,6 +634,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::handle_preview_plot_action))
             .on_action(cx.listener(Self::open_review_edits))
             .on_action(cx.listener(Self::open_connections))
+            .on_action(cx.listener(Self::show_inspector))
             .on_action(
                 cx.listener(|_, _: &crate::session::SaveSnapshot, window, cx| {
                     crate::session::save(window, cx)
@@ -791,6 +793,39 @@ impl AppRoot {
         }
 
         bar.into_any_element()
+    }
+
+    /// Reveal the inspector pane, or dock a new one along the layout's right
+    /// edge at a fixed width. The current pane becomes its first target, so
+    /// it opens on what the user was looking at rather than empty.
+    fn show_inspector(&mut self, _: &ShowInspector, _window: &mut Window, cx: &mut Context<Self>) {
+        use crate::inspector::target::{self, INSPECTOR_PANE_KEY};
+        let open = self.tiles.read(cx).panes().iter().any(|pane| {
+            pane.read(cx)
+                .items()
+                .iter()
+                .any(|item| item.serialization_key() == INSPECTOR_PANE_KEY)
+        });
+        if open {
+            self.tiles.update(cx, |tiles, cx| {
+                tiles.focus_or_open(INSPECTOR_PANE_KEY, |_| None, cx)
+            });
+            return;
+        }
+        if let Some(active) = self.tiles.read(cx).active_pane(cx) {
+            target::select_pane(&active, cx);
+        }
+        let registry = cx.global::<crate::tiles::ItemRegistry>().clone();
+        let pane = cx.new(|cx| crate::tiles::Pane::new(Vec::new(), cx));
+        pane.update(cx, |pane, cx| {
+            if let Some(item) = registry.deserialize(INSPECTOR_PANE_KEY, "{}", cx) {
+                pane.add_item(item, cx);
+            }
+            pane.set_locked_size(Some(size(320.0, 320.0)), cx);
+        });
+        self.tiles.update(cx, |tiles, cx| {
+            tiles.dock_pane(pane, crate::tiles::SplitDirection::Right, cx)
+        });
     }
 
     /// Reveal the alarm panel: focus the existing alarms tab wherever it lives
@@ -1625,6 +1660,7 @@ impl PanelApp {
                 source(registry.clone());
             }
             register_connection_commands(cx);
+            register_inspector_command(cx);
         }
 
         // Inspector requests route to the window they were made in:
@@ -1684,6 +1720,7 @@ impl PanelApp {
             KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
             KeyBinding::new("escape", crate::tiles::ExitZoom, Some(EXIT_ZOOM)),
             KeyBinding::new("secondary-l", ToggleCmdLock, None),
+            KeyBinding::new("secondary-i", ShowInspector, None),
             KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
             // Scoped to a focused browser: the bar is per pane, and
             // nothing else claims the find chord yet.
@@ -1770,6 +1807,21 @@ pub(crate) fn register_shutdown(
 /// every configurable target contributes a sub-menu of its knobs — the same
 /// rows the dialog embeds, reached without the dialog. Pull-based like every
 /// provider, so both lists always match the live registry.
+fn register_inspector_command(cx: &mut App) {
+    ItemRegistry::register(
+        cx,
+        Category::Command,
+        Arc::new(|_| {
+            vec![InspectionItem::Command {
+                label: SharedString::new_static("Show Inspector"),
+                callback: Arc::new(|window, cx| {
+                    window.dispatch_action(Box::new(ShowInspector), cx);
+                }),
+            }]
+        }),
+    );
+}
+
 fn register_connection_commands(cx: &mut App) {
     ItemRegistry::register(
         cx,

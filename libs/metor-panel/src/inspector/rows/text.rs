@@ -15,6 +15,7 @@ use super::{InspectorRow, RowAction, value_row};
 pub struct TextRow {
     pub label: SharedString,
     pub value: Rc<RefCell<SharedString>>,
+    source: Option<Arc<dyn Fn(&App) -> Option<SharedString>>>,
     pub on_change: Arc<dyn Fn(String, &mut Window, &mut App)>,
     pub read_only: bool,
 }
@@ -28,9 +29,26 @@ impl TextRow {
         Self {
             label,
             value: Rc::new(RefCell::new(value)),
+            source: None,
             on_change,
             read_only: false,
         }
+    }
+
+    /// Read the value through `source` on every render, falling back to the
+    /// cached copy when it answers `None`. A docked inspector outlives the
+    /// edit that built it, so a row there has to track changes made
+    /// elsewhere — by the popup, or by the view itself.
+    pub fn live(mut self, source: Arc<dyn Fn(&App) -> Option<SharedString>>) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    fn current(&self, cx: &App) -> SharedString {
+        self.source
+            .as_ref()
+            .and_then(|source| source(cx))
+            .unwrap_or_else(|| self.value.borrow().clone())
     }
 
     /// Read-only variant that renders muted and rejects activation. The
@@ -39,6 +57,7 @@ impl TextRow {
         Self {
             label,
             value: Rc::new(RefCell::new(value)),
+            source: None,
             on_change: Arc::new(|_, _, _| {}),
             read_only: true,
         }
@@ -61,21 +80,21 @@ impl InspectorRow for TextRow {
             row_ix,
             selected,
             self.label.clone(),
-            self.value.borrow().clone(),
+            self.current(cx),
             self.read_only,
             cx,
         )
         .into_any_element()
     }
 
-    fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
+    fn activate(&mut self, _window: &mut Window, cx: &mut App) -> RowAction {
         if self.read_only {
             return RowAction::Handled;
         }
         let on_change = self.on_change.clone();
         let value = self.value.clone();
         RowAction::StartEdit {
-            current_text: self.value.borrow().to_string(),
+            current_text: self.current(cx).to_string(),
             on_commit: Box::new(move |text, window, cx| {
                 *value.borrow_mut() = SharedString::new(text.clone());
                 on_change(text, window, cx);

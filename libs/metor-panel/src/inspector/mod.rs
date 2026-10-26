@@ -75,6 +75,11 @@ pub enum InspectorMode {
     Inline,
 }
 
+/// Rebuilds an inspector's root page when what it lists has changed:
+/// `Some` replaces the rows, `None` keeps them. Asked on every render, so it
+/// must be cheap when nothing moved.
+pub type LiveRows = Box<dyn FnMut(&mut App) -> Option<Vec<Box<dyn InspectorRow>>>>;
+
 /// Inputs needed to open an inspector from a callback.
 pub struct InspectorRequest {
     pub rows: Vec<Box<dyn InspectorRow>>,
@@ -127,8 +132,11 @@ struct InspectorPage {
 /// depending on [`InspectorMode`].
 pub struct Inspector {
     pages: Vec<InspectorPage>,
-    live_palette: Option<palette::LivePalette>,
+    live_rows: Option<LiveRows>,
     mode: InspectorMode,
+    /// A docked inspector never closes: dismissing returns to the root page.
+    /// See [`Inspector::set_persistent`].
+    persistent: bool,
     focus_handle: FocusHandle,
     parent_focus: Option<FocusHandle>,
     pub dismissed: bool,
@@ -201,8 +209,9 @@ impl Inspector {
     fn from_page(page: InspectorPage, mode: InspectorMode, cx: &mut Context<Self>) -> Self {
         Self {
             pages: vec![page],
-            live_palette: None,
+            live_rows: None,
             mode,
+            persistent: false,
             focus_handle: cx.focus_handle(),
             parent_focus: None,
             dismissed: false,
@@ -230,17 +239,33 @@ impl Inspector {
         db: Arc<metor_db::DB>,
         tiles: &gpui::Entity<crate::tiles::TileGroup>,
     ) {
-        self.live_palette = Some(palette::LivePalette::new(db, tiles));
+        let mut palette = palette::LivePalette::new(db, tiles);
+        self.follow(Box::new(move |cx| palette.refresh(cx)));
     }
 
-    fn refresh_palette(&mut self, cx: &mut Context<Self>) {
+    /// Keep the root page in step with `source`. The selection follows its
+    /// row by identity across rebuilds.
+    pub fn follow(&mut self, source: LiveRows) {
+        self.live_rows = Some(source);
+    }
+
+    /// Make this an inspector that lives in a pane rather than over one:
+    /// commands and escape return to the root page instead of closing it,
+    /// the row list fills the host's height, and an accessory stays open.
+    /// Only meaningful with [`InspectorMode::Inline`].
+    pub fn set_persistent(&mut self) {
+        self.persistent = true;
+        self.accessory_expanded = true;
+    }
+
+    fn refresh_live_rows(&mut self, cx: &mut Context<Self>) {
         if self.dismissed {
             return;
         }
-        let Some(source) = &mut self.live_palette else {
+        let Some(source) = &mut self.live_rows else {
             return;
         };
-        let Some(rows) = source.refresh(cx) else {
+        let Some(rows) = source(cx) else {
             return;
         };
         let selected = self
@@ -273,12 +298,46 @@ impl Inspector {
         self.fade = Fade::settled(1.0);
     }
 
+    /// Labels of the rows the panel shows, in order.
+    #[cfg(test)]
+    pub(crate) fn visible_labels(&self) -> Vec<String> {
+        let rows = self.current_rows().unwrap_or_default();
+        self.filtered_indices()
+            .into_iter()
+            .map(|ix| rows[ix].label().to_string())
+            .collect()
+    }
+
+    /// Activate the `nth` visible row labelled `label`, as a click would.
+    #[cfg(test)]
+    pub(crate) fn activate_label(
+        &mut self,
+        label: &str,
+        nth: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = self.current_rows().unwrap_or_default();
+        let ix = self
+            .filtered_indices()
+            .into_iter()
+            .filter(|&ix| rows[ix].label() == label)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("no row {label:?}"));
+        self.activate_row(ix, window, cx);
+    }
+
     fn current_page(&self) -> &InspectorPage {
         self.pages.last().expect("page stack must never be empty")
     }
 
     pub(crate) fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dismissed {
+            return;
+        }
+        if self.persistent {
+            self.editing = None;
+            while self.pop_page(cx) {}
             return;
         }
         self.dismissed = true;
@@ -892,6 +951,7 @@ impl Inspector {
             .id("inspector-group")
             .flex()
             .flex_col()
+            .when(self.persistent, |group| group.size_full())
             .when(!self.dismissed, |group| {
                 group.on_action(cx.listener(|this, action: &EditInspectorQuery, _, cx| {
                     this.search.set_text(action.text.clone());
@@ -998,6 +1058,7 @@ impl Inspector {
             } else {
                 (count as f32 * ROW_HEIGHT).min(max_items_h)
             };
+            let persistent = self.persistent;
             if self.dismissed {
                 let offset = self.scroll_handle.0.borrow().base_handle.offset().y;
                 let first =
@@ -1092,7 +1153,13 @@ impl Inspector {
                     ),
                 )
                 .track_scroll(&scroll_handle)
-                .h(px(items_h))
+                .map(|list| {
+                    if persistent {
+                        list.size_full()
+                    } else {
+                        list.h(px(items_h))
+                    }
+                })
                 .into_any_element()
             }
         };
@@ -1104,11 +1171,21 @@ impl Inspector {
             _ => frame.w_full().border_0().rounded(px(0.0)),
         };
 
-        let mut frame = frame.max_h(px(540.0)).child(self.render_input_bar(cx));
+        let mut frame = if self.persistent {
+            frame.size_full()
+        } else {
+            frame.max_h(px(540.0))
+        }
+        .child(self.render_input_bar(cx));
         if !matches!(self.mode, InspectorMode::Anchored(_)) && self.accessory.is_some() {
             frame = frame.child(self.render_accessory(cx));
         }
-        frame.child(div().py(px(2.0)).child(items_element))
+        frame.child(
+            div()
+                .py(px(2.0))
+                .when(self.persistent, |items| items.flex_1().min_h_0())
+                .child(items_element),
+        )
     }
 
     fn render_view_panel(
@@ -1171,7 +1248,7 @@ impl Render for Inspector {
             }
             return div().into_any_element();
         }
-        self.refresh_palette(cx);
+        self.refresh_live_rows(cx);
         let revision = match &self.current_page().kind {
             InspectorPageKind::Rows(rows) => {
                 rows.iter().map(|r| r.query_revision(cx)).max().unwrap_or(0)

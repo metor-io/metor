@@ -811,11 +811,18 @@ impl crate::inspector::target::InspectHost for Entity<DashboardPanel> {
         self.update(cx, |this, cx| this.set_selected(child.map(WidgetId), cx));
     }
 
-    fn hover_child(&self, child: Option<u64>, cx: &mut App) {
+    fn hover_child(&self, child: u64, hovered: bool, cx: &mut App) {
         self.update(cx, |this, cx| {
-            let child = child.map(WidgetId);
-            if this.hovered != child {
-                this.hovered = child;
+            let child = WidgetId(child);
+            let next = if hovered {
+                Some(child)
+            } else if this.hovered == Some(child) {
+                None
+            } else {
+                return;
+            };
+            if this.hovered != next {
+                this.hovered = next;
                 cx.notify();
             }
         });
@@ -827,6 +834,10 @@ impl crate::inspector::target::InspectHost for Entity<DashboardPanel> {
 
     fn host_rows(&self, cx: &App) -> Vec<Box<dyn InspectorRow>> {
         dashboard_rows(self.clone(), self.read(cx).db.clone(), cx)
+    }
+
+    fn observe(&self, changed: Box<dyn Fn(&mut App)>, cx: &mut App) -> gpui::Subscription {
+        cx.observe(self, move |_, cx| changed(cx))
     }
 }
 
@@ -898,6 +909,76 @@ impl PaneItem for DashboardPanel {
 
 fn next_widget_id(widgets: &[DashboardWidget]) -> u64 {
     widgets.iter().map(|w| w.id.0 + 1).max().unwrap_or(1).max(1)
+}
+
+/// Fixtures for tests that need a dashboard with live widgets.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    struct Blank;
+
+    impl Render for Blank {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full()
+        }
+    }
+
+    fn blank_kind() -> WidgetKind {
+        WidgetKind::new("blank_test")
+    }
+
+    /// The theme and registries a dashboard reads, plus a `blank_test` kind
+    /// whose widgets paint nothing and inspect as themselves.
+    pub(crate) fn install(db: &Arc<DB>, cx: &mut App) {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        WidgetRegistry::init(cx);
+        crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
+        let spec = WidgetSpec::new(
+            (100.0, 100.0),
+            |_| "Blank".into(),
+            |_, _, cx| {
+                let entity = cx.new(|_| Blank);
+                let any = entity.clone().into_any();
+                WidgetLive {
+                    view: gpui::AnyView::from(entity),
+                    inspect: any.clone(),
+                    state: any,
+                }
+            },
+            |_, _, _| None,
+        );
+        cx.global_mut::<WidgetRegistry>()
+            .register(blank_kind(), spec);
+    }
+
+    /// Two 100×100 blank widgets, ids 1 and 2, at x = 0 and x = 200.
+    pub(crate) fn two_blank_widgets() -> Vec<DashboardWidget> {
+        let widget = |id, x| DashboardWidget {
+            id: WidgetId(id),
+            rect: WidgetRect {
+                x,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+            },
+            kind: blank_kind(),
+            config: String::new(),
+            frame: true,
+        };
+        vec![widget(1, 0.0), widget(2, 200.0)]
+    }
+
+    /// A dashboard holding [`two_blank_widgets`], built outside a window.
+    pub(crate) fn dashboard(db: &Arc<DB>, cx: &mut App) -> Entity<DashboardPanel> {
+        let blob = serde_json::to_string(&DashboardPanelConfig {
+            title: "Test".into(),
+            widgets: two_blank_widgets(),
+            zoom: 1.0,
+        })
+        .unwrap();
+        deserialize_dashboard(db.clone(), &blob, cx)
+    }
 }
 
 #[cfg(test)]
@@ -997,14 +1078,6 @@ mod tests {
         assert!(!image.data.is_empty(), "image was not inlined");
     }
 
-    struct Blank;
-
-    impl Render for Blank {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full()
-        }
-    }
-
     /// A dashboard with two blank widgets side by side, laid out in a window.
     fn two_widget_dashboard(
         cx: &mut gpui::TestAppContext,
@@ -1015,49 +1088,12 @@ mod tests {
     ) {
         let temp = tempfile::tempdir().unwrap();
         let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
-        let kind = WidgetKind::new("blank_test");
-        let spec = Arc::new(WidgetSpec::new(
-            (100.0, 100.0),
-            |_| "Blank".into(),
-            |_, _, cx| {
-                let entity = cx.new(|_| Blank);
-                let any = entity.clone().into_any();
-                WidgetLive {
-                    view: gpui::AnyView::from(entity),
-                    inspect: any.clone(),
-                    state: any,
-                }
-            },
-            |_, _, _| None,
-        ));
-        let widget = |id, x| DashboardWidget {
-            id: WidgetId(id),
-            rect: WidgetRect {
-                x,
-                y: 0.0,
-                w: 100.0,
-                h: 100.0,
-            },
-            kind: kind.clone(),
-            config: String::new(),
-            frame: true,
-        };
-        let blob = serde_json::to_string(&DashboardPanelConfig {
-            title: "Test".into(),
-            widgets: vec![widget(1, 0.0), widget(2, 200.0)],
-            zoom: 1.0,
-        })
-        .unwrap();
         let (dashboard, cx) = cx.add_window_view(|_, cx| {
-            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
-            WidgetRegistry::init(cx);
-            crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
-            cx.global_mut::<WidgetRegistry>()
-                .register_shared(kind.clone(), spec);
-            let cfg: DashboardPanelConfig = serde_json::from_str(&blob).unwrap();
+            test_support::install(&db, cx);
+            let widgets = test_support::two_blank_widgets();
             DashboardPanel {
-                next_id: next_widget_id(&cfg.widgets),
-                widgets: cfg.widgets,
+                next_id: next_widget_id(&widgets),
+                widgets,
                 ..DashboardPanel::new(db, cx)
             }
         });

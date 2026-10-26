@@ -5,7 +5,7 @@
 //! pane item that holds children of its own (a dashboard's widgets) answers
 //! through [`InspectHost`], so the pane can list those children and show the
 //! selected one's rows without knowing the host's type.
-use gpui::{App, Entity, Global, SharedString, WeakEntity};
+use gpui::{App, Entity, Global, SharedString, Subscription, WeakEntity};
 
 use crate::inspector::rows::InspectorRow;
 use crate::tiles::Pane;
@@ -69,9 +69,14 @@ pub trait InspectHost {
     fn selected_child(&self, cx: &App) -> Option<u64>;
     fn select_child(&self, child: Option<u64>, cx: &mut App);
     /// Highlight `child` on the host while its row is under the pointer.
-    fn hover_child(&self, child: Option<u64>, cx: &mut App);
+    /// Leaving one row and entering the next can arrive in either order,
+    /// so un-hovering clears only the child it names.
+    fn hover_child(&self, child: u64, hovered: bool, cx: &mut App);
     /// `None` once the child is gone.
     fn child_rows(&self, child: u64, cx: &App) -> Option<Vec<Box<dyn InspectorRow>>>;
     /// Rows for the host itself, shown after its children.
     fn host_rows(&self, cx: &App) -> Vec<Box<dyn InspectorRow>>;
+    /// Call `changed` whenever the host notifies: its children, selection
+    /// or own rows may have moved.
+    fn observe(&self, changed: Box<dyn Fn(&mut App)>, cx: &mut App) -> Subscription;
 }

@@ -215,6 +215,7 @@ impl AddMenu {
             (None, self.command("3D Viewer", WidgetKind::viewer3d())),
             (Some(Pane), self.command("Dashboard", WidgetKind::new("dashboard"))),
             (Some(Pane), self.command("Alarms", WidgetKind::new("alarm"))),
+            (Some(Pane), self.command("Inspector", WidgetKind::new("inspector"))),
             (Some(Pane), self.command("Logs", WidgetKind::new("logs"))),
             (Some(Pane), self.command("Sequences", WidgetKind::new("sequence"))),
             (

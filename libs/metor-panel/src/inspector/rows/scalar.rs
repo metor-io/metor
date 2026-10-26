@@ -9,6 +9,7 @@ use crate::dynamic::tensor::TypedScalar;
 pub struct ScalarRow {
     pub label: SharedString,
     pub value: Rc<RefCell<TypedScalar>>,
+    source: Option<Arc<dyn Fn(&App) -> Option<TypedScalar>>>,
     pub on_change: Arc<dyn Fn(TypedScalar, &mut Window, &mut App)>,
 }
 
@@ -35,12 +36,25 @@ impl ScalarRow {
         Self {
             label,
             value: Rc::new(RefCell::new(value)),
+            source: None,
             on_change,
         }
     }
 
-    fn format_value(&self) -> String {
-        format_scalar(*self.value.borrow())
+    /// Read the value through `source` on every render, falling back to the
+    /// cached copy when it answers `None`. A docked inspector outlives the
+    /// edit that built it, so a row there has to track changes made
+    /// elsewhere — by the popup, or by the view itself.
+    pub fn live(mut self, source: Arc<dyn Fn(&App) -> Option<TypedScalar>>) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    fn current(&self, cx: &App) -> TypedScalar {
+        self.source
+            .as_ref()
+            .and_then(|source| source(cx))
+            .unwrap_or(*self.value.borrow())
     }
 }
 
@@ -76,19 +90,20 @@ impl InspectorRow for ScalarRow {
             row_ix,
             selected,
             self.label.clone(),
-            self.format_value().into(),
+            format_scalar(self.current(cx)).into(),
             false,
             cx,
         )
         .into_any_element()
     }
 
-    fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
+    fn activate(&mut self, _window: &mut Window, cx: &mut App) -> RowAction {
         let on_change = self.on_change.clone();
         let cached = self.value.clone();
-        let dtype = self.value.borrow().dtype();
+        let current = self.current(cx);
+        let dtype = current.dtype();
         RowAction::StartEdit {
-            current_text: self.format_value(),
+            current_text: format_scalar(current),
             on_commit: Box::new(move |text, window, cx| {
                 if let Some(v) = TypedScalar::parse(&text, dtype) {
                     *cached.borrow_mut() = v;
