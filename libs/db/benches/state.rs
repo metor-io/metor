@@ -17,7 +17,7 @@ use std::{
 };
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use metor_db::DB;
+use metor_db::{Component, DB};
 use metor_proto::{
     types::{ComponentId, PacketId, PrimType},
     vtable::builder::{
@@ -339,7 +339,26 @@ fn push_msg_contended(c: &mut Criterion) {
     group.finish();
 }
 
-/// Point lookups into a db of 1024 components, as the panel does per frame.
+/// An owned value from a lookup that returns either a borrow or a clone, so
+/// [`lookup`] costs what its callers pay on either side of the state change.
+trait Owned<T> {
+    fn owned(self) -> T;
+}
+
+impl<T: Clone> Owned<T> for &T {
+    fn owned(self) -> T {
+        self.clone()
+    }
+}
+
+impl<T> Owned<T> for T {
+    fn owned(self) -> T {
+        self
+    }
+}
+
+/// Point lookups into a db of 1024 components, cloned out as the panel
+/// does per frame.
 fn lookup(c: &mut Criterion) {
     const PRODUCERS: usize = 8;
     const FIELDS: usize = 128;
@@ -358,7 +377,11 @@ fn lookup(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 run_threads(threads, iters, |t, i| {
                     let id = ids[(i as usize * 7 + t * 131) % ids.len()];
-                    black_box(fixture.db.with_state(|s| s.get_component(id).is_some()));
+                    black_box(
+                        fixture
+                            .db
+                            .with_state(|s| s.get_component(id).map(Owned::<Component>::owned)),
+                    );
                 })
             })
         });
@@ -366,11 +389,10 @@ fn lookup(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 run_threads(threads, iters, |t, i| {
                     let id = ids[(i as usize * 7 + t * 131) % ids.len()];
-                    black_box(
-                        fixture
-                            .db
-                            .with_state(|s| s.get_component_metadata(id).is_some()),
-                    );
+                    black_box(fixture.db.with_state(|s| {
+                        s.get_component_metadata(id)
+                            .map(Owned::<ComponentMetadata>::owned)
+                    }));
                 })
             })
         });
