@@ -167,8 +167,8 @@ pub struct DashboardPanel {
 
     next_id: u64,
     editing: bool,
-    /// The widget the inspector pane shows. Clicking a widget selects it in
-    /// either mode; clicking bare canvas clears it.
+    /// The widget the inspector pane shows. Only edit mode has one: clicking
+    /// a widget there selects it, bare canvas or leaving edit mode clears it.
     selected: Option<WidgetId>,
     /// The widget whose row is under the pointer in the inspector pane.
     hovered: Option<WidgetId>,
@@ -271,6 +271,14 @@ impl DashboardPanel {
         }
         if self.hovered == Some(id) {
             self.hovered = None;
+        }
+        cx.notify();
+    }
+
+    fn set_editing(&mut self, editing: bool, cx: &mut Context<Self>) {
+        self.editing = editing;
+        if !editing {
+            self.set_selected(None, cx);
         }
         cx.notify();
     }
@@ -494,8 +502,7 @@ pub fn dashboard_rows(
         let dashboard = dashboard.clone();
         Arc::new(move |_window, cx| {
             dashboard.update(cx, |this, cx| {
-                this.editing = !this.editing;
-                cx.notify();
+                this.set_editing(!this.editing, cx);
             });
         })
     })));
@@ -662,14 +669,15 @@ impl Render for DashboardPanel {
                         this.zoom_to(zoom, Some(event.position), cx);
                     });
                 });
-                // Selection is taken in the capture phase too: a widget's own
-                // controls stop their mouse-downs, and in edit mode the
-                // blocker stops every one, yet any click on a widget picks it.
+                // Selection is an edit-mode affordance, taken in the capture
+                // phase because the blocker over each widget stops every
+                // mouse-down, yet any click on a widget should pick it.
                 let entity = zoom_entity.clone();
                 let select_hitbox = hitbox.clone();
                 window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, window, cx| {
                     if phase != gpui::DispatchPhase::Capture
                         || !select_hitbox.is_hovered(window)
+                        || !entity.read(cx).editing
                         || !matches!(
                             event.button,
                             gpui::MouseButton::Left | gpui::MouseButton::Right
@@ -717,6 +725,8 @@ impl Render for DashboardPanel {
         for widget in &widgets {
             canvas_div = canvas_div.child(self.render_widget(widget, cx));
         }
+        // Above every widget, so an overlapping neighbour never hides it.
+        canvas_div = canvas_div.children(self.render_selection_ring(cx));
 
         canvas_div = canvas_div
             .on_drag_move(cx.listener(Self::handle_widget_drag_move))
@@ -807,8 +817,15 @@ impl crate::inspector::target::InspectHost for Entity<DashboardPanel> {
         self.read(cx).selected.map(|id| id.0)
     }
 
+    /// Picking a widget from outside means editing it, so it enters edit
+    /// mode, the only mode with a selection.
     fn select_child(&self, child: Option<u64>, cx: &mut App) {
-        self.update(cx, |this, cx| this.set_selected(child.map(WidgetId), cx));
+        self.update(cx, |this, cx| {
+            if child.is_some() && !this.editing {
+                this.set_editing(true, cx);
+            }
+            this.set_selected(child.map(WidgetId), cx);
+        });
     }
 
     fn hover_child(&self, child: u64, hovered: bool, cx: &mut App) {
@@ -1112,30 +1129,44 @@ mod tests {
     }
 
     #[gpui::test]
-    fn clicking_a_widget_selects_it_in_either_mode(cx: &mut gpui::TestAppContext) {
+    fn only_edit_mode_selects_widgets(cx: &mut gpui::TestAppContext) {
         let (_temp, dashboard, cx) = two_widget_dashboard(cx);
         let selected =
             |cx: &mut gpui::VisualTestContext| dashboard.read_with(cx, |d, _| d.selected);
+        let click = |x, y, cx: &mut gpui::VisualTestContext| {
+            let at = canvas_point(&dashboard, x, y, cx);
+            cx.simulate_click(at, Default::default());
+        };
 
-        let at = canvas_point(&dashboard, 250.0, 50.0, cx);
-        cx.simulate_click(at, Default::default());
+        click(250.0, 50.0, cx);
+        assert_eq!(selected(cx), None, "view mode clicks reach the widget only");
+
+        dashboard.update(cx, |d, cx| d.set_editing(true, cx));
+        cx.run_until_parked();
+        // Edit mode's blocker stops every mouse-down a widget gets.
+        click(250.0, 50.0, cx);
         assert_eq!(selected(cx), Some(WidgetId(2)));
-        let at = canvas_point(&dashboard, 150.0, 300.0, cx);
-        cx.simulate_click(at, Default::default());
+        click(150.0, 300.0, cx);
         assert_eq!(selected(cx), None, "bare canvas clears the selection");
 
-        // Edit mode's blocker stops every mouse-down a widget gets.
-        dashboard.update(cx, |d, cx| {
-            d.editing = true;
-            cx.notify();
-        });
-        cx.run_until_parked();
-        let at = canvas_point(&dashboard, 50.0, 50.0, cx);
-        cx.simulate_click(at, Default::default());
+        click(50.0, 50.0, cx);
         assert_eq!(selected(cx), Some(WidgetId(1)));
-
         dashboard.update(cx, |d, cx| d.remove_widget(WidgetId(1), cx));
         assert_eq!(selected(cx), None, "removing the selected widget clears it");
+
+        click(250.0, 50.0, cx);
+        dashboard.update(cx, |d, cx| d.set_editing(false, cx));
+        assert_eq!(selected(cx), None, "leaving edit mode clears it");
+    }
+
+    #[gpui::test]
+    fn picking_a_widget_from_outside_enters_edit_mode(cx: &mut gpui::TestAppContext) {
+        use crate::inspector::target::InspectHost;
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        cx.update(|_, cx| dashboard.select_child(Some(2), cx));
+        let (editing, selected) = dashboard.read_with(cx, |d, _| (d.editing, d.selected));
+        assert!(editing);
+        assert_eq!(selected, Some(WidgetId(2)));
     }
 
     #[gpui::test]

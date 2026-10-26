@@ -3,8 +3,8 @@
 //! Houses the drag payload types and the per-widget chrome that renders
 //! move/resize zones when the dashboard is editable.
 use gpui::{
-    AnyElement, Context, DragMoveEvent, Empty, Entity, IntoElement, Render, Window, div, point,
-    prelude::*, px,
+    AnyElement, App, Context, DragMoveEvent, Empty, Entity, IntoElement, Render, Window, div,
+    point, prelude::*, px,
 };
 
 use crate::theme::theme;
@@ -197,19 +197,6 @@ impl DashboardPanel {
                 .rounded(px(4.0));
         }
 
-        // Drawn over the frame, so a selected frameless widget still shows.
-        if self.selected == Some(widget.id) {
-            container = container
-                .border_2()
-                .border_color(theme.selection_ring())
-                .rounded(px(4.0));
-        } else if self.hovered == Some(widget.id) {
-            container = container
-                .border_2()
-                .border_color(theme.selection_ring().opacity(0.45))
-                .rounded(px(4.0));
-        }
-
         if let Some(view) = view {
             container = if zoom == 1.0 {
                 container.child(view.clone())
@@ -291,6 +278,36 @@ impl DashboardPanel {
         }
 
         container.into_any_element()
+    }
+
+    /// The outline around the selected (or inspector-hovered) widget. Drawn
+    /// as its own layer just outside the widget's rect rather than as the
+    /// widget's border, so selecting never shrinks the content inside.
+    pub(super) fn render_selection_ring(&self, cx: &App) -> Option<AnyElement> {
+        const GAP: f32 = 2.0;
+        const WIDTH: f32 = 2.0;
+        let (id, color) = match (self.selected, self.hovered) {
+            (Some(id), _) => (id, theme(cx).selection_ring()),
+            (None, Some(id)) => (id, theme(cx).selection_ring().opacity(0.45)),
+            (None, None) => return None,
+        };
+        let widget = self.widgets.iter().find(|w| w.id == id)?;
+        let r = &widget.rect;
+        let zoom = self.viewport.zoom;
+        let origin = self.viewport.to_screen(point(r.x, r.y));
+        let inset = GAP + WIDTH;
+        Some(
+            div()
+                .absolute()
+                .left(px(origin.x - inset))
+                .top(px(origin.y - inset))
+                .w(px(r.w * zoom + 2.0 * inset))
+                .h(px(r.h * zoom + 2.0 * inset))
+                .border(px(WIDTH))
+                .border_color(color)
+                .rounded(px(4.0 + inset))
+                .into_any_element(),
+        )
     }
 
     /// Add invisible 8-point resize zones that ring the widget's border.
