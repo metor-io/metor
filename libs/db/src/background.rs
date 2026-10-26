@@ -46,9 +46,44 @@ impl Pending {
     }
 }
 
-/// How long the persist thread lets pushes gather once there is work: well
-/// under a stream tick, and far less than a WAL takes to fill.
-const GATHER: Duration = Duration::from_micros(20);
+/// How the persist thread lets pushes gather once it has work. A WAL drained
+/// the moment it has a sample is queued again, and the thread woken again, by
+/// the producer's next push; one drain per window spares a busy producer both.
+///
+/// The window delays what readers see by as much, and a WAL holds 512 samples,
+/// so it suits windows well under a stream tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gather {
+    /// Sleeps out the window, so the thread idles between batches. A sleep
+    /// overshoots by the timer's slack, tens of microseconds or more.
+    Sleep(Duration),
+    /// Yields in a loop for the window: the shortest windows hold, and the
+    /// thread takes a core under steady load.
+    Spin(Duration),
+}
+
+impl Gather {
+    fn wait(self) {
+        match self {
+            Gather::Sleep(window) if !window.is_zero() => thread::sleep(window),
+            Gather::Sleep(_) => {}
+            Gather::Spin(window) => {
+                let gathered = Instant::now() + window;
+                while Instant::now() < gathered {
+                    thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
+impl Default for Gather {
+    /// Idle CPU over latency: an interactive host such as the panel leaves
+    /// most of its time between pushes.
+    fn default() -> Self {
+        Gather::Sleep(Duration::from_millis(1))
+    }
+}
 
 /// The WALs waiting for the persist thread, which blocks on `ready` rather
 /// than running an executor: persisting is synchronous, and a condvar wakes
@@ -62,6 +97,7 @@ struct PersistQueue {
 #[derive(Default)]
 struct PersistState {
     pending: Vec<Pending>,
+    gather: Gather,
     closed: bool,
 }
 
@@ -84,15 +120,9 @@ impl PersistQueue {
                     .unwrap_or_else(PoisonError::into_inner);
                 continue;
             }
-            // Let pushes gather before draining. A WAL drained the moment
-            // it has a sample is queued again, and the thread woken again,
-            // by the producer's next push; one drain per window spares a
-            // busy producer both.
+            let gather = state.gather;
             drop(state);
-            let gathered = Instant::now() + GATHER;
-            while Instant::now() < gathered {
-                thread::yield_now();
-            }
+            gather.wait();
             state = self.lock();
             let batch = mem::take(&mut state.pending);
             drop(state);
@@ -128,6 +158,11 @@ impl Persister {
 
     pub(crate) fn wake(&self) {
         self.0.ready.notify_one();
+    }
+
+    /// Takes effect from the next batch.
+    pub(crate) fn set_gather(&self, gather: Gather) {
+        self.0.lock().gather = gather;
     }
 }
 

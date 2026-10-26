@@ -7,7 +7,7 @@ use std::{hint::black_box, thread, time::Duration};
 
 use common::{Fixture, get_component, insert_static, stamp, static_id, static_table};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use metor_db::{Component, time_series::TimeSeries};
+use metor_db::{Component, DB, Gather, time_series::TimeSeries};
 use metor_proto::types::Timestamp;
 
 const FIELDS: usize = 16;
@@ -29,6 +29,27 @@ fn wait_persisted(components: &[Component], ts: i64) {
     }
 }
 
+/// The persist thread's spinning window, which these benches measured before
+/// the default became a sleep.
+const SPIN: Gather = Gather::Spin(Duration::from_micros(20));
+
+/// Ingests `iters` tables of [`FIELDS`] values, waiting every [`BATCH`] for
+/// them to reach storage.
+fn ingest_batches(db: &DB, components: &[Component], ts: &mut i64, iters: u64) -> Duration {
+    let mut table = static_table(FIELDS);
+    let start = std::time::Instant::now();
+    for i in 0..iters {
+        *ts += 1;
+        stamp(&mut table, *ts);
+        db.ingest_table(static_id(0), &table).unwrap();
+        if i % BATCH == BATCH - 1 {
+            wait_persisted(components, *ts);
+        }
+    }
+    wait_persisted(components, *ts);
+    start.elapsed()
+}
+
 /// Ingests a table of [`FIELDS`] values and waits for it to be written to
 /// storage, while `subscribers` live readers tail each component's WAL as
 /// streams to the panel do. Unlike `state`'s ingest benches, which can
@@ -37,6 +58,7 @@ fn ingest_persisted(c: &mut Criterion) {
     let mut group = c.benchmark_group("ingest_persisted");
     for subscribers in [0, 4, 16] {
         let fixture = Fixture::new(move |db| {
+            db.set_gather(SPIN);
             insert_static(db, 0, FIELDS);
             for field in 0..FIELDS {
                 for _ in 0..subscribers {
@@ -52,23 +74,36 @@ fn ingest_persisted(c: &mut Criterion) {
         let components: Vec<_> = (0..FIELDS)
             .map(|field| get_component(&fixture.db, 0, field))
             .collect();
-        let mut table = static_table(FIELDS);
         let mut ts = 0;
         group.throughput(Throughput::Elements(1));
         group.bench_function(BenchmarkId::new("subscribers", subscribers), |b| {
-            b.iter_custom(|iters| {
-                let start = std::time::Instant::now();
-                for i in 0..iters {
-                    ts += 1;
-                    stamp(&mut table, ts);
-                    fixture.db.ingest_table(static_id(0), &table).unwrap();
-                    if i % BATCH == BATCH - 1 {
-                        wait_persisted(&components, ts);
-                    }
-                }
-                wait_persisted(&components, ts);
-                start.elapsed()
-            })
+            b.iter_custom(|iters| ingest_batches(&fixture.db, &components, &mut ts, iters))
+        });
+    }
+    group.finish();
+}
+
+/// As [`ingest_persisted`] with no subscribers, under each way the persist
+/// thread can gather. Waiting on each batch pays a window per [`BATCH`]
+/// tables, so a sleep costs more here than for a producer that never waits.
+fn ingest_gather(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ingest_persisted/gather");
+    for (name, gather) in [
+        ("sleep_1ms", Gather::default()),
+        ("sleep_0", Gather::Sleep(Duration::ZERO)),
+        ("spin_20us", SPIN),
+    ] {
+        let fixture = Fixture::new(move |db| {
+            db.set_gather(gather);
+            insert_static(db, 0, FIELDS);
+        });
+        let components: Vec<_> = (0..FIELDS)
+            .map(|field| get_component(&fixture.db, 0, field))
+            .collect();
+        let mut ts = 0;
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(name, |b| {
+            b.iter_custom(|iters| ingest_batches(&fixture.db, &components, &mut ts, iters))
         });
     }
     group.finish();
@@ -208,6 +243,7 @@ fn stream_tick(c: &mut Criterion) {
 criterion_group!(
     benches,
     ingest_persisted,
+    ingest_gather,
     time_series_write,
     time_series_read,
     time_series_range,
