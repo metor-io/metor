@@ -230,9 +230,13 @@ impl DashboardPanel {
                         move |event: &gpui::MouseDownEvent, window, cx| {
                             cx.stop_propagation();
                             let pos = event.position;
-                            right_entity.update(cx, |this, cx| {
-                                this.open_widget_inspector(blocker_widget_id, pos, window, cx);
-                            });
+                            DashboardPanel::open_widget_inspector(
+                                &right_entity,
+                                blocker_widget_id,
+                                pos,
+                                window,
+                                cx,
+                            );
                         },
                     ),
             );

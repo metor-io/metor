@@ -319,17 +319,19 @@ impl DashboardPanel {
     }
 
     /// Right-click on a widget in edit mode: its [`widget_rows`] as a popup.
+    /// Takes the entity rather than `&self` because the rows read the
+    /// dashboard, which must not be mid-update when they do.
     fn open_widget_inspector(
-        &self,
+        dashboard: &Entity<Self>,
         widget_id: WidgetId,
         position: gpui::Point<gpui::Pixels>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) {
         let Some(open) = crate::inspector::open_inspector(cx) else {
             return;
         };
-        let Some(rows) = widget_rows(&cx.entity(), widget_id, cx) else {
+        let Some(rows) = widget_rows(dashboard, widget_id, cx) else {
             return;
         };
         open(
@@ -1184,6 +1186,37 @@ mod tests {
                 "the same row turns it back off"
             );
         });
+    }
+
+    /// The edit-mode right-click opens the widget's rows from inside the
+    /// dashboard's own mouse handler, which once read the dashboard while it
+    /// was being updated.
+    #[gpui::test]
+    fn right_clicking_a_widget_opens_its_rows(cx: &mut gpui::TestAppContext) {
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        let opened: std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>> = Default::default();
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            cx.set_global(crate::inspector::OpenInspectorGlobal(Arc::new(
+                move |request, _, _| {
+                    opened
+                        .borrow_mut()
+                        .push(request.rows.iter().map(|r| r.label().to_string()).collect());
+                },
+            )));
+        });
+        dashboard.update(cx, |d, cx| d.set_editing(true, cx));
+        cx.run_until_parked();
+        let at = canvas_point(&dashboard, 250.0, 50.0, cx);
+        cx.simulate_mouse_down(at, gpui::MouseButton::Right, Default::default());
+
+        let opened = opened.borrow();
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].iter().any(|l| l == "Delete"));
+        assert_eq!(
+            dashboard.read_with(cx, |d, _| d.selected),
+            Some(WidgetId(2))
+        );
     }
 
     #[gpui::test]
