@@ -18,6 +18,18 @@ pub(crate) struct SelectedSample {
     pub reconstructed: bool,
 }
 
+/// A shared buffer skips the byte compare, which for an image is a whole frame.
+fn same_sample(a: Option<&SelectedSample>, b: Option<&SelectedSample>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            a.timestamp == b.timestamp
+                && a.reconstructed == b.reconstructed
+                && (Arc::ptr_eq(&a.bytes, &b.bytes) || a.bytes == b.bytes)
+        }
+        (a, b) => a.is_none() && b.is_none(),
+    }
+}
+
 /// Absence is distinct from a stale but usable predecessor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SampleStatus {
@@ -206,14 +218,7 @@ impl SelectedReader {
                 >= threshold);
         let changed = self.selection.status != status
             || self.selection.stale != stale
-            || self
-                .selection
-                .sample
-                .as_ref()
-                .map(|s| (s.timestamp, s.bytes.as_ref(), s.reconstructed))
-                != sample
-                    .as_ref()
-                    .map(|s| (s.timestamp, s.bytes.as_ref(), s.reconstructed));
+            || !same_sample(self.selection.sample.as_ref(), sample.as_ref());
         self.selection = Selection {
             sample,
             status,
@@ -1230,5 +1235,31 @@ mod tests {
         drop(reader);
         cx.run_until_parked();
         assert!(weak.upgrade().is_none());
+    }
+
+    fn sample(timestamp: i64, bytes: &Arc<[u8]>) -> SelectedSample {
+        SelectedSample {
+            timestamp: Timestamp(timestamp),
+            bytes: bytes.clone(),
+            reconstructed: false,
+        }
+    }
+
+    #[gpui::test]
+    fn republishing_a_sample_notifies_once(cx: &mut gpui::TestAppContext) {
+        let (_temp, db, c) = fixture();
+        let reader = cx.update(|cx| acquire(db.clone(), c.component_id, cx));
+        cx.run_until_parked();
+        let frame: Arc<[u8]> = Arc::from(&[7u8; 64][..]);
+        cx.update(|cx| {
+            reader.update(cx, |reader, cx| {
+                let before = reader.changed.latest();
+                for _ in 0..2 {
+                    let t = Some(Timestamp(500));
+                    reader.publish(Some(sample(500, &frame)), SampleStatus::Ready, t, cx);
+                }
+                assert_eq!(reader.changed.latest(), before.wrapping_add(1));
+            })
+        });
     }
 }

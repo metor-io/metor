@@ -19,6 +19,8 @@ mod table;
 #[cfg(all(test, feature = "host"))]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use build::RING_BYTES;
 #[cfg(feature = "host")]
 pub(crate) use config::Adapters;
 pub use config::{

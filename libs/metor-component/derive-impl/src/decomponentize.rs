@@ -6,8 +6,8 @@ use crate::input::StructInput;
 
 /// Generates the `Decomponentize` impl, which routes an incoming component
 /// value to the matching field by comparing against per-field `ComponentId`
-/// constants. Unmatched ids and values that fail conversion are silently
-/// skipped. See [`componentize_impl`](crate::componentize::componentize_impl)
+/// constants. A matched field is assigned in place; unmatched ids and values
+/// that fail conversion are skipped. See [`componentize_impl`](crate::componentize::componentize_impl)
 /// for the `crate_name` root-path contract.
 pub fn decomponentize_impl(input: &StructInput, crate_name: &TokenStream2) -> TokenStream2 {
     let StructInput {
@@ -41,9 +41,7 @@ pub fn decomponentize_impl(input: &StructInput, crate_name: &TokenStream2) -> To
         quote! {
             const #const_name: #impeller::types::ComponentId = #component_id;
             if component_id == #const_name {
-                if let Ok(val) = <#ty as #impeller::com_de::FromComponentView>::from_component_view(view.clone()) {
-                    self.#ident = val;
-                }
+                let _ = <#ty as #impeller::com_de::FromComponentView>::assign_component_view(&mut self.#ident, view.clone());
             }
         }
     });

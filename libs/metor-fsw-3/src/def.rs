@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-use metor_proto::types::PacketId;
+use metor_proto::types::{PACKET_HEADER_LEN, PacketId};
 
 use crate::coordinator::{OutputConfig, OutputSource};
 use crate::record::RecordSchema;
@@ -156,6 +156,25 @@ pub enum DefError {
 
     #[error("ports `{port}` and `{other}` carry records with the same packet id")]
     RecordIdCollision { port: String, other: String },
+
+    #[error(
+        "port `{port}` carries records of up to {max_len} bytes, past a {conn_cap}-byte `conn_cap`; a `conn_cap` of {} fits them",
+        conn_cap_for(*max_len)
+    )]
+    PortExceedsConnCap {
+        port: String,
+        max_len: usize,
+        conn_cap: usize,
+    },
+}
+
+/// The smallest whole-MiB `conn_cap` whose packets carry a `max_len`-byte
+/// record.
+fn conn_cap_for(max_len: usize) -> usize {
+    const MIB: usize = 1 << 20;
+    // A packet adds a 4-byte length prefix and a header to the record.
+    let packet = max_len.saturating_add(4 + PACKET_HEADER_LEN);
+    packet.div_ceil(MIB).saturating_mul(MIB)
 }
 
 /// Port definitions by record name.

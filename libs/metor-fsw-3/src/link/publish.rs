@@ -17,7 +17,7 @@ use crate::{Seq, SeqError, sequence};
 
 use super::batch::Batcher;
 use super::conns::{Conns, ConnsMem};
-use super::{LinkParams, LinkStatus, StatusReporter, failed, made_once, wire};
+use super::{LinkParams, LinkStatus, StatusReporter, check_conn_cap, failed, made_once, wire};
 
 /// A link that sends every record wired into it to its peers over
 /// metor-proto.
@@ -103,7 +103,8 @@ impl<D: InputWake> Param for PublishInputs<D> {
     ) -> Result<(), DefError> {
         let first = defs.inputs.len();
         <DynInputs<D> as Param>::append_defs(names, cx, defs)?;
-        check_table_ids(&defs.inputs[first..])
+        check_table_ids(&defs.inputs[first..])?;
+        check_conn_cap(cx, &defs.inputs[first..])
     }
 
     fn bind_in<W: InputWake>(views: &mut Views<W>) -> PublishInputs<W> {

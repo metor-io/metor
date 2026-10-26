@@ -103,6 +103,75 @@ fn default_mtq_max() -> f64 {
 pub struct NavParams {
     /// Measurement 1σ for the sun and magnetic field observations.
     pub meas_sigma: f64,
+    /// Squared Mahalanobis distance above which a star vector is rejected.
+    /// 13.8 is χ²₂ at p = 0.001.
+    #[serde(default = "default_star_gate")]
+    pub star_gate: f64,
+    /// Fuses the sun and magnetometer vectors. Off leaves star vectors alone.
+    #[serde(default = "default_true")]
+    pub sun_mag: bool,
+    /// Gyro white noise the filter models (rad/s/√Hz). The default is twice
+    /// the plant's 2 mrad/s per sample at 120 Hz, as margin for an
+    /// unmodelled gyro.
+    #[serde(default = "default_gyro_noise")]
+    pub gyro_noise: f64,
+    /// Gyro bias random walk the filter models (rad/s/√s). The default is
+    /// twice the plant's 20 µrad/s per sample at 120 Hz.
+    #[serde(default = "default_bias_walk")]
+    pub bias_walk: f64,
+    /// Initial gyro bias 1σ (rad/s).
+    #[serde(default = "default_bias_sigma")]
+    pub bias_sigma: f64,
+}
+
+fn default_gyro_noise() -> f64 {
+    3.65e-4
+}
+fn default_bias_walk() -> f64 {
+    4.38e-4
+}
+fn default_bias_sigma() -> f64 {
+    1e-3
+}
+
+fn default_star_gate() -> f64 {
+    13.8
+}
+fn default_true() -> bool {
+    true
+}
+
+/// Configuration for the image star tracker. The camera defaults match the
+/// star simulator's: 16 mm, 5.5 µm pixels, 1024², about 20°. The centroid
+/// σ model is metor-star's, calibrated on the simulator.
+#[derive(Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct StarTrackerParams {
+    #[serde(default = "default_f_m")]
+    pub f_m: f64,
+    #[serde(default = "default_pitch_m")]
+    pub pitch_m: f64,
+    /// Mount, `[x, y, z, w]`: `b_body = A(q_b_st) b_st`.
+    #[serde(default = "default_q_b_st")]
+    pub q_b_st: [f64; 4],
+    /// Lost-in-space triplets per cycle.
+    #[serde(default = "default_budget")]
+    pub budget: u32,
+}
+
+fn default_f_m() -> f64 {
+    16e-3
+}
+
+fn default_pitch_m() -> f64 {
+    5.5e-6
+}
+
+fn default_budget() -> u32 {
+    1000
+}
+
+fn default_q_b_st() -> [f64; 4] {
+    [0.0, 0.0, 0.0, 1.0]
 }
 
 /// Configuration for the controller.

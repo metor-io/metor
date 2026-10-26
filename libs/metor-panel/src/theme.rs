@@ -226,6 +226,28 @@ impl Theme {
         self.line_colors[1]
     }
 
+    /// Behind an image and its letterbox: black, so the darkest pixel and
+    /// the border read the same on every theme.
+    pub fn image_backdrop(&self) -> Hsla {
+        hex(0x000000, 1.0)
+    }
+
+    /// Pixels at the sensor's top code — the theme's critical red, the one
+    /// hue no colormap ends on.
+    pub fn image_saturated(&self) -> Hsla {
+        self.error_accent
+    }
+
+    /// Detected-star overlay markers — the green family.
+    pub fn image_overlay_detected(&self) -> Hsla {
+        self.line_colors[2]
+    }
+
+    /// Truth overlay markers — the purple family, apart from the detections.
+    pub fn image_overlay_truth(&self) -> Hsla {
+        self.line_colors[4]
+    }
+
     /// Solid color for an alarm severity (`severity_index`: 0 = info, 1 = warning,
     /// 2 = critical), used for limit lines, severity chips, and the status bar.
     /// Critical tracks the theme's `error_accent`; warning/info are fixed amber/blue

@@ -64,6 +64,50 @@ pub struct Imu {
     pub sample: f64,
 }
 
+/// A 1024² 12-bit camera image.
+pub type Pixels = crate::FrameImage<crate::Mono16<12>, 1024, 1024>;
+
+/// A 2 MiB camera frame.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[frame(name = "image")]
+#[repr(C)]
+pub struct Image {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub pixels: Pixels,
+}
+
+impl Image {
+    /// The first and last pixels.
+    pub fn corners(&self) -> (u16, u16) {
+        let pixels = self.pixels.pixels();
+        (pixels[0], pixels[pixels.len() - 1])
+    }
+}
+
+/// Heap storage for one [`Image`], so no image sits on the stack.
+pub struct ImageBuf(Vec<u64>);
+
+impl Default for ImageBuf {
+    fn default() -> Self {
+        Self(vec![0; size_of::<Image>().div_ceil(8)])
+    }
+}
+
+impl ImageBuf {
+    /// Stamps the image with `tick`, as its timestamp and its corners, and
+    /// returns it.
+    pub fn stamped(&mut self, tick: i64) -> &mut Image {
+        // PANIC Safety: the buffer is `Image`'s size and 8-byte aligned.
+        let image = Image::mut_from_bytes(self.0.as_mut_bytes()).expect("an image");
+        image.timestamp = Timestamp(tick);
+        let pixels = image.pixels.pixels_mut();
+        let last = pixels.len() - 1;
+        (pixels[0], pixels[last]) = (tick as u16, tick as u16);
+        image
+    }
+}
+
 /// Another frame named `imu`, sampling two floats where [`Imu`] samples one
 /// double: the same bytes under a different layout.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]

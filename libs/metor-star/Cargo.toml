@@ -1,0 +1,32 @@
+[package]
+name = "metor-star"
+license = "MIT OR Apache-2.0"
+version.workspace = true
+edition = "2024"
+description = "Star-tracker algorithms: vector geometry and Wahba's problem."
+repository.workspace = true
+
+[features]
+default = []
+testkit = []
+# Star-field frame preparation.
+sim = []
+# The wgpu star-field renderer.
+gpu = ["sim", "dep:pollster", "dep:wgpu"]
+
+[dependencies]
+libm = "0.2.16"
+pollster = { version = "0.4", optional = true }
+wgpu = { version = "30", optional = true }
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
+metor-star = { path = ".", features = ["gpu", "testkit"] }
+naga = { version = "30", features = ["wgsl-in"] }
+nalgebra = "0.35"
+nox = { workspace = true }
+rand = "0.9"
+rand_distr = "0.5"
+
+[lints]
+workspace = true

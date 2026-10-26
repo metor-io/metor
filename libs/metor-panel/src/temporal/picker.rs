@@ -189,6 +189,7 @@ fn navigation(target: Target, cx: &App) -> Box<dyn InspectorRow> {
             view: entity.clone().into(),
             focus: entity.focus_handle(cx),
             dragging: Arc::new(move |cx| weak.upgrade().is_some_and(|e| e.read(cx).is_dragging())),
+            expanded: false,
         })
     })))
 }
@@ -746,6 +747,7 @@ impl InspectorRow for Provider {
             view: entity.clone().into(),
             focus: entity.focus_handle(cx),
             dragging: Arc::new(move |cx| weak.upgrade().is_some_and(|e| e.read(cx).is_dragging())),
+            expanded: false,
         })
     }
     fn query_placeholder(&self) -> Option<&str> {

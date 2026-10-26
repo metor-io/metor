@@ -217,10 +217,11 @@ fn summarize_edit(edit: &PendingEdit) -> SharedString {
 }
 
 /// Top-level component picker for the "update component" palette action.
+/// Components too large to expand per element are left out.
 ///
 /// Selecting a row drills into an element picker and finally the editor.
 pub fn update_component_rows(db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
-    let components = crate::inspector::trace_picker::list_components(&db);
+    let components = crate::views::image_view::list_expandable_components(&db);
     components
         .into_iter()
         .map(|(id, name)| {

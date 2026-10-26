@@ -20,7 +20,7 @@ use crate::io::host::MemberDef;
 use crate::io::{
     Backing, Cqe, DEFAULT_OPS, IO_CQ, IO_SQ, IO_TYPE, IoState, ResourceEnd, ResourceIndex,
 };
-use crate::port::{Output, ring_capacity};
+use crate::port::{Output, checked_frame_len, ring_capacity};
 use crate::record::Record;
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
@@ -774,25 +774,33 @@ fn find_duplicate(ports: &[PortDef]) -> Option<&PortDef> {
 }
 
 impl RingSpec {
-    /// Allocates a ring that holds `self.port.depth * ring_depth` records.
+    /// Allocates a ring that holds `self.port.depth * ring_depth` records,
+    /// capped by [`ring_records`].
     fn allocate(&self, ring_depth: NonZeroUsize) -> Result<RingBuffer, BuildError> {
         let too_large = || BuildError::RingTooLarge {
             system: self.system.clone(),
             port: self.port.name.to_string(),
             max_len: self.port.max_len,
         };
-        let depth = self
-            .port
-            .depth
-            .checked_mul(ring_depth.get())
-            .ok_or_else(too_large)?;
-        let capacity = ring_capacity(self.port.max_len, depth).ok_or_else(too_large)?;
+        let depth = self.port.depth.saturating_mul(ring_depth.get());
+        let records = ring_records(self.port.max_len, depth);
+        let capacity = ring_capacity(self.port.max_len, records).ok_or_else(too_large)?;
         let config = Config {
             capacity,
             max_readers: self.readers,
         };
         RingBuffer::create_in_memory(config).map_err(|_| too_large())
     }
+}
+
+/// The bytes of records a ring holds at most, unless two records need more.
+pub(crate) const RING_BYTES: usize = 8 << 20;
+
+/// Returns how many records of up to `max_len` bytes a ring holds: `depth`,
+/// capped at what fits in [`RING_BYTES`], and never below two.
+fn ring_records(max_len: usize, depth: usize) -> usize {
+    let fit = checked_frame_len(max_len).map_or(0, |frame| RING_BYTES / frame);
+    depth.min(fit).max(2)
 }
 
 /// The make arguments every system in the target shares.
@@ -1224,41 +1232,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_reject_ring_address_overflow() {
-        let config = CoordinatorConfig {
-            ring_depth: NonZeroUsize::MAX,
-            systems: vec![source("imu")],
-            ..Default::default()
+    /// Allocates the ring of a `T` output with one reader.
+    fn ring_of<T: Record>(ring_depth: usize) -> RingBuffer {
+        let spec = RingSpec {
+            system: "src".into(),
+            port: Output::<T>::def(&DefCx::empty(), "out"),
+            readers: 1,
         };
-        assert_eq!(
-            build(config).err(),
-            Some(BuildError::RingTooLarge {
-                system: "imu".into(),
-                port: "imu".into(),
-                max_len: utils::Imu::MAX_LEN,
-            })
-        );
-        assert!(port::ring_capacity(utils::Imu::MAX_LEN, usize::MAX).is_none());
+        let depth = NonZeroUsize::new(ring_depth).expect("nonzero");
+        spec.allocate(depth).expect("a ring")
     }
 
     #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn test_reject_region_address_overflow() {
-        // A capacity of 2^63 fits `usize`; the region around it does not.
-        let config = CoordinatorConfig {
-            ring_depth: NonZeroUsize::new(1 << 58).expect("nonzero"),
-            systems: vec![source("imu")],
-            ..Default::default()
-        };
-        assert_eq!(
-            build(config).err(),
-            Some(BuildError::RingTooLarge {
-                system: "imu".into(),
-                port: "imu".into(),
-                max_len: utils::Imu::MAX_LEN,
-            })
-        );
+    fn test_large_frame_ring_is_capped() {
+        let ring = ring_of::<utils::Image>(8);
+        assert!(ring.config().capacity <= RING_BYTES.next_power_of_two());
+        assert_eq!(ring_records(utils::Image::MAX_LEN, 8), 3);
+        assert_eq!(ring_records(utils::Image::MAX_LEN, 1), 2, "two at least");
+        let small = ring_of::<utils::Imu>(8);
+        let today = port::ring_capacity(utils::Imu::MAX_LEN, 8).expect("fits");
+        assert_eq!(small.config().capacity, today);
     }
 
     #[test]

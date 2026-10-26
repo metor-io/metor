@@ -51,6 +51,11 @@ impl<V: 'static> VisibleEntityCache<V> {
         entity
     }
 
+    #[cfg(test)]
+    pub fn contains(&self, id: ComponentId) -> bool {
+        self.entities.contains_key(&id)
+    }
+
     fn touch(&mut self, id: ComponentId) {
         if let Some(pos) = self.lru.iter().position(|c| *c == id) {
             self.lru.remove(pos);

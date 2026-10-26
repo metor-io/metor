@@ -148,6 +148,18 @@ fn evaluate() -> CoordinatorConfig {
     config
         .systems
         .retain(|system| !["fsw.publish", "fsw.db"].contains(&system.ty.as_str()));
+    // The star chain has its own tests, `stars.rs` and `star_sim.rs`; this
+    // loop runs on the sun and magnetometer.
+    let stars = ["star_sim", "star_tracker"];
+    config
+        .systems
+        .retain(|system| !stars.contains(&system.id.as_str()));
+    for system in &mut config.systems {
+        let star_fed = |f: &PortRef| stars.contains(&f.system.as_str());
+        system
+            .inputs
+            .retain(|input| !input.from.iter().any(star_fed));
+    }
     config.systems.push(SystemConfig {
         inputs: vec![
             input("body", PortRef::new("plant", "body")),

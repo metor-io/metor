@@ -13,12 +13,13 @@ use metor_proto::types::Timestamp;
 use tracing_subscriber::layer::SubscriberExt;
 
 use crate::coordinator::{
-    EndReason, MakeCx, MakeError, ParamError, Params, Step, StepCx, StepState, SystemTable,
+    EndReason, LoadError, MakeCx, MakeError, Occupant, ParamError, Params, Step, StepCx, StepState,
+    SystemTable,
 };
 use crate::def::DefError;
 use crate::io::IoState;
 use crate::system::SystemDef;
-use crate::thread::Threads;
+use crate::thread::{Threads, TurnedGroup};
 use def::{DefCxOwned, Instance, PackDef};
 use raw::{RawRing, RawSlice};
 
@@ -384,9 +385,7 @@ fn make_step(
             .ok_or_else(|| ParamError::Decode(format!("unknown system type `{ty}`")))?;
         // A pack's systems see the records its own table knows.
         let records = Arc::new(table.records());
-        // A pack's async systems run on threads inside the pack. The host's
-        // config picks which thread.
-        THREADS.with_borrow_mut(|threads| {
+        let make = |threads: &mut Threads| {
             (entry.make)(MakeCx {
                 id: &instance.id,
                 adapter: instance.adapter.as_ref(),
@@ -400,8 +399,53 @@ fn make_step(
                 namespace: None,
                 records: &records,
             })
-        })
+        };
+        // A pack's async systems run on threads inside the pack. The host's
+        // config picks which thread.
+        if !instance.deterministic {
+            return THREADS.with_borrow_mut(make);
+        }
+        // In a deterministic build the instance's own step turns the groups
+        // it starts, as the host turns its own before their first member.
+        let mut threads = Threads::deterministic();
+        let step = make(&mut threads)?;
+        let groups: Vec<TurnedGroup> = threads.into_turned().collect();
+        match groups.is_empty() {
+            true => Ok(step),
+            false => Ok(Box::new(Turning { groups, step })),
+        }
     })
+}
+
+/// A step that turns its async system's groups before each execute.
+struct Turning {
+    groups: Vec<TurnedGroup>,
+    step: Box<dyn Step>,
+}
+
+impl Step for Turning {
+    fn execute(&mut self, now: Timestamp, cx: &mut StepCx<'_>) {
+        for group in &mut self.groups {
+            group.turn(now);
+        }
+        self.step.execute(now, cx);
+    }
+
+    fn fault(&mut self, now: Timestamp, message: &str) {
+        self.step.fault(now, message);
+    }
+
+    fn ended(&self) -> Option<&EndReason> {
+        self.step.ended()
+    }
+
+    fn load(&mut self, name: &str, cx: &mut StepCx<'_>) -> Result<(), LoadError> {
+        self.step.load(name, cx)
+    }
+
+    fn occupant(&self) -> Option<&Occupant> {
+        self.step.occupant()
+    }
 }
 
 /// Decodes the params JSON. Empty bytes mean no params.

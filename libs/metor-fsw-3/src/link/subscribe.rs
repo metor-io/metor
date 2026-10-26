@@ -18,7 +18,7 @@ use crate::system::PortDef;
 use crate::{Seq, SeqError, sequence};
 
 use super::conns::{Conns, ConnsMem};
-use super::{LinkParams, LinkStatus, StatusReporter, failed, made_once, wire};
+use super::{LinkParams, LinkStatus, StatusReporter, check_conn_cap, failed, made_once, wire};
 
 /// A link that receives records from its peers and writes each one onto the
 /// output port for that record's id.
@@ -134,7 +134,8 @@ impl Param for SubscribeOutputs {
     ) -> Result<(), DefError> {
         let first = defs.outputs.len();
         <DynOutputs as Param>::append_defs(names, cx, defs)?;
-        check_route_keys(&defs.outputs[first..])
+        check_route_keys(&defs.outputs[first..])?;
+        check_conn_cap(cx, &defs.outputs[first..])
     }
 
     fn bind_in<W: InputWake>(_views: &mut Views<W>) {}

@@ -59,6 +59,20 @@ impl Debug for TimeSeriesNode {
 /// Capacity of each node's index and data files. Sealed nodes are sparse
 /// up to this size; only the committed prefix ever travels over a store.
 pub const NODE_SIZE: u64 = 1024 * 1024 * 32;
+/// Samples a node's data file holds at least, whatever the element size.
+const NODE_MIN_ELEMENTS: u64 = 64;
+/// Room for the append log's header.
+const NODE_HEADER_SLACK: u64 = 64;
+
+/// Size of a new node's data file: `NODE_SIZE`, or enough for
+/// `NODE_MIN_ELEMENTS` samples of `element_size` bytes.
+pub fn node_data_size(element_size: u64) -> u64 {
+    NODE_SIZE.max(
+        element_size
+            .saturating_mul(NODE_MIN_ELEMENTS)
+            .saturating_add(NODE_HEADER_SLACK),
+    )
+}
 
 impl TimeSeriesNode {
     pub fn create(
@@ -69,7 +83,11 @@ impl TimeSeriesNode {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
         let index = AppendLog::with_size(NODE_SIZE, path.join("index"), start_timestamp)?;
-        let data = AppendLog::with_size(NODE_SIZE, path.join("data"), element_size)?;
+        let data = AppendLog::with_size(
+            node_data_size(element_size),
+            path.join("data"),
+            element_size,
+        )?;
         let time_series = Self { index, data };
         Ok(time_series)
     }
@@ -989,8 +1007,9 @@ impl TimeSeries {
         let mut prev_node: Option<TimestampRef> = None;
         for node in AtomicStackIter::new(ArcAtomic::from(head)) {
             let timestamps = node.timestamps();
-            let start = timestamps.first()?;
-            let end = timestamps.last()?;
+            let (Some(start), Some(end)) = (timestamps.first(), timestamps.last()) else {
+                continue;
+            };
             if timestamp.0 > end.0 {
                 if let Some(prev) = &prev_node
                     && prev.timestamp.0.abs_diff(timestamp.0) < start.0.abs_diff(timestamp.0)
@@ -1012,9 +1031,13 @@ impl TimeSeries {
                 continue;
             }
             if timestamp.0 >= start.0 && timestamp.0 <= end.0 {
-                let index = match timestamps.binary_search(&timestamp) {
-                    Ok(i) => i,
-                    Err(i) => i.saturating_sub(inclusive as usize),
+                // Within a node, ties resolve to the first equal sample
+                // before `timestamp` and the last after it.
+                let index = match inclusive {
+                    false => timestamps.partition_point(|t| t.0 < timestamp.0),
+                    true => timestamps
+                        .partition_point(|t| t.0 <= timestamp.0)
+                        .saturating_sub(1),
                 };
                 let timestamp = timestamps[index];
                 return Some(TimestampRef {
@@ -1033,8 +1056,79 @@ impl TimeSeries {
         // same immutable spine; nodes and `prev` links never mutate once
         // published, so the snapshot stays consistent for the query.
         let head = self.list.head()?;
-        let start = Self::binary_search_nearest_from(head.clone(), range.start, false)?;
-        let end = Self::binary_search_nearest_from(head, range.end, true)?;
+        let start = Self::first_at_or_after(head.clone(), range.start);
+        let end = Self::last_at_or_before(head.clone(), range.end);
+        match (start, end) {
+            (Some(start), Some(end)) if start.timestamp.0 <= end.timestamp.0 => {
+                Some(TimeSeriesSlice { start, end })
+            }
+            _ => Self::empty_slice(head),
+        }
+    }
+
+    /// The first sample at or after `timestamp`, following a tie into
+    /// older nodes so a range starting on it holds all of it.
+    fn first_at_or_after(
+        head: Arc<AtomicNode<TimeSeriesNode>>,
+        timestamp: Timestamp,
+    ) -> Option<TimestampRef> {
+        let mut found = None;
+        for node in AtomicStackIter::new(ArcAtomic::from(head)) {
+            let timestamps = node.timestamps();
+            let Some(last) = timestamps.last() else {
+                continue;
+            };
+            if last.0 < timestamp.0 {
+                break;
+            }
+            let index = timestamps.partition_point(|t| t.0 < timestamp.0);
+            let stamp = timestamps[index];
+            found = Some(TimestampRef {
+                timestamp: stamp,
+                node,
+                index,
+            });
+            if index > 0 {
+                break;
+            }
+        }
+        found
+    }
+
+    /// The last sample at or before `timestamp`.
+    fn last_at_or_before(
+        head: Arc<AtomicNode<TimeSeriesNode>>,
+        timestamp: Timestamp,
+    ) -> Option<TimestampRef> {
+        AtomicStackIter::new(ArcAtomic::from(head)).find_map(|node| {
+            let timestamps = node.timestamps();
+            let index = timestamps
+                .partition_point(|t| t.0 <= timestamp.0)
+                .checked_sub(1)?;
+            let stamp = timestamps[index];
+            Some(TimestampRef {
+                timestamp: stamp,
+                node,
+                index,
+            })
+        })
+    }
+
+    /// A slice of no samples, on the newest node that has any.
+    fn empty_slice(head: Arc<AtomicNode<TimeSeriesNode>>) -> Option<TimeSeriesSlice> {
+        let node = AtomicStackIter::new(ArcAtomic::from(head))
+            .find(|node| !node.timestamps().is_empty())?;
+        let timestamp = node.timestamps()[0];
+        let end = TimestampRef {
+            timestamp,
+            node: node.clone(),
+            index: 0,
+        };
+        let start = TimestampRef {
+            timestamp,
+            node,
+            index: 1,
+        };
         Some(TimeSeriesSlice { start, end })
     }
 
@@ -1122,6 +1216,9 @@ impl TimerSeriesWriter {
         {
             return Ok(false);
         }
+        if head.index.len() as usize + size_of::<Timestamp>() > head.index.capacity() {
+            return Ok(false);
+        }
         match head.data.write(buf) {
             Ok(_) => {}
             Err(Error::MapOverflow) => return Ok(false),
@@ -1149,6 +1246,71 @@ impl TimerSeriesWriter {
 
 #[cfg(test)]
 mod tests {
+
+    /// The timestamps `get_range(start..end)` covers, oldest first.
+    fn range_stamps(series: &TimeSeries, start: i64, end: i64) -> Vec<i64> {
+        let Some(slice) = series.get_range(Timestamp(start)..Timestamp(end)) else {
+            return vec![];
+        };
+        let mut nodes: Vec<_> = slice.as_iter().collect();
+        nodes.reverse();
+        nodes
+            .iter()
+            .flat_map(|n| n.timestamps().iter().map(|t| t.0))
+            .collect()
+    }
+
+    #[test]
+    fn range_holds_whole_ties() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        let mut writer = series.writer().unwrap();
+        for (i, ts) in [1i64, 2, 3, 3, 3, 4, 5].iter().enumerate() {
+            writer
+                .push_buf(Timestamp(*ts), &(i as u64).to_le_bytes())
+                .unwrap();
+        }
+        assert_eq!(range_stamps(&series, 3, 3), [3, 3, 3]);
+        assert_eq!(range_stamps(&series, 0, 3), [1, 2, 3, 3, 3]);
+        assert_eq!(range_stamps(&series, 3, 9), [3, 3, 3, 4, 5]);
+        assert_eq!(range_stamps(&series, 6, 9), Vec::<i64>::new());
+        assert_eq!(range_stamps(&series, -5, 0), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn range_before_or_between_samples_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        let mut writer = series.writer().unwrap();
+        for ts in [5i64, 10] {
+            writer.push_buf(Timestamp(ts), &7u64.to_le_bytes()).unwrap();
+        }
+        assert_eq!(range_stamps(&series, 0, 4), Vec::<i64>::new());
+        assert_eq!(range_stamps(&series, 6, 9), Vec::<i64>::new());
+        assert_eq!(range_stamps(&series, 5, 5), [5]);
+        assert_eq!(range_stamps(&series, 0, 99), [5, 10]);
+        let empty = series.get_range(Timestamp(0)..Timestamp(4)).unwrap();
+        assert_eq!(empty.len(), 0);
+        assert!(empty.as_iter().all(|n| n.data().is_empty()));
+    }
+
+    /// 2 MiB samples roll a node every 64: node A ends at 63, node B is
+    /// [63, 63].
+    #[test]
+    fn range_follows_a_tie_into_the_older_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        let mut writer = series.writer().unwrap();
+        let buf = vec![1u8; 2 * 1024 * 1024];
+        for ts in (0..64i64).chain([63, 63]) {
+            writer.push_buf(Timestamp(ts), &buf).unwrap();
+        }
+        assert_eq!(series.iter_node_slices().count(), 2);
+        assert_eq!(range_stamps(&series, 63, 63), [63, 63, 63]);
+        assert_eq!(range_stamps(&series, 63, 100), [63, 63, 63]);
+        assert_eq!(range_stamps(&series, 60, 63), [60, 61, 62, 63, 63, 63]);
+        assert_eq!(range_stamps(&series, 0, 100).len(), 66);
+    }
     use super::*;
 
     fn remote_seal(start: i64, end: i64) -> SealRecord {
@@ -1733,5 +1895,121 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(wait.as_mut().subscribe().is_ready());
+    }
+
+    const IMAGE_SIZE: usize = 2 * 1024 * 1024;
+
+    fn push_patterns(writer: &mut TimerSeriesWriter, range: Range<i64>, size: usize) {
+        let mut buf = vec![0u8; size];
+        for ts in range {
+            buf.fill(ts as u8);
+            buf[0] = !(ts as u8);
+            writer.push_buf(Timestamp(ts), &buf).unwrap();
+        }
+    }
+
+    fn assert_patterns(series: &TimeSeries, range: Range<i64>, size: usize) {
+        for ts in range {
+            let sample = series.get(Timestamp(ts)).unwrap();
+            let data = sample.data();
+            assert_eq!(data.len(), size);
+            assert_eq!(data[0], !(ts as u8), "ts {ts}");
+            assert!(data[1..].iter().all(|b| *b == ts as u8), "ts {ts}");
+        }
+    }
+
+    fn node_starts(series: &TimeSeries) -> Vec<i64> {
+        let mut starts: Vec<i64> = series
+            .iter_node_slices()
+            .map(|n| n.full_timestamps()[0].0)
+            .collect();
+        starts.sort();
+        starts
+    }
+
+    fn data_file_len(dir: &Path, start: i64) -> u64 {
+        std::fs::metadata(dir.join(start.to_string()).join("data"))
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn node_data_size_scales_past_node_size() {
+        assert_eq!(node_data_size(8), NODE_SIZE);
+        assert_eq!(node_data_size(0), NODE_SIZE);
+        assert_eq!(node_data_size(IMAGE_SIZE as u64), 128 * 1024 * 1024 + 64);
+        assert_eq!(node_data_size(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn large_elements_roll_every_min_elements() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        let mut writer = series.writer().unwrap();
+        push_patterns(&mut writer, 0..100, IMAGE_SIZE);
+        assert_eq!(node_starts(&series), vec![0, NODE_MIN_ELEMENTS as i64]);
+        assert_eq!(
+            data_file_len(dir.path(), 0),
+            node_data_size(IMAGE_SIZE as u64) + 1
+        );
+        assert_patterns(&series, 0..100, IMAGE_SIZE);
+    }
+
+    #[test]
+    fn node_sized_before_scaling_opens_and_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_dir = dir.path().join("0");
+        std::fs::create_dir_all(&node_dir).unwrap();
+        let old = TimeSeriesNode {
+            index: AppendLog::with_size(NODE_SIZE, node_dir.join("index"), Timestamp(0)).unwrap(),
+            data: AppendLog::with_size(NODE_SIZE, node_dir.join("data"), IMAGE_SIZE as u64)
+                .unwrap(),
+        };
+        let mut buf = vec![0u8; IMAGE_SIZE];
+        for ts in 0..4i64 {
+            buf.fill(ts as u8);
+            buf[0] = !(ts as u8);
+            old.data.write(&buf).unwrap();
+            old.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
+        }
+        drop(old);
+
+        let series = TimeSeries::open(dir.path()).unwrap();
+        let mut writer = series.writer().unwrap();
+        push_patterns(&mut writer, 4..20, IMAGE_SIZE);
+        // 32 MiB less the header holds 15 samples; the rest roll to a scaled node.
+        assert_eq!(node_starts(&series), vec![0, 15]);
+        assert_eq!(data_file_len(dir.path(), 0), NODE_SIZE + 1);
+        assert_eq!(
+            data_file_len(dir.path(), 15),
+            node_data_size(IMAGE_SIZE as u64) + 1
+        );
+        assert_patterns(&series, 0..20, IMAGE_SIZE);
+    }
+
+    #[test]
+    fn full_index_rolls_before_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_dir = dir.path().join("0");
+        std::fs::create_dir_all(&node_dir).unwrap();
+        // A 24-byte header plus room for four timestamps.
+        let index = AppendLog::with_size(24 + 4 * 8, node_dir.join("index"), Timestamp(0)).unwrap();
+        index.write(&Timestamp(0).to_le_bytes()).unwrap();
+        let data = AppendLog::with_size(NODE_SIZE, node_dir.join("data"), 1u64).unwrap();
+        data.write(&[0]).unwrap();
+        drop((index, data));
+
+        let series = TimeSeries::open(dir.path()).unwrap();
+        let mut writer = series.writer().unwrap();
+        for ts in 1..10i64 {
+            writer.push_buf(Timestamp(ts), &[ts as u8]).unwrap();
+        }
+        assert_eq!(node_starts(&series), vec![0, 4]);
+        let first = TimeSeriesNode::open(&node_dir).unwrap();
+        assert_eq!(first.timestamps().len(), 4);
+        assert_eq!(first.data.len(), 4);
+        for ts in 0..10i64 {
+            assert_eq!(series.get(Timestamp(ts)).unwrap().data(), &[ts as u8]);
+        }
     }
 }

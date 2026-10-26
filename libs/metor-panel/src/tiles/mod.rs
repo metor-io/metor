@@ -23,7 +23,8 @@ pub use drag::SplitDirection;
 pub(crate) use drag::take_active_tab_drag;
 pub use item::{PaneItem, PaneItemHandle};
 pub use pane::{
-    OpenOutlineAction, Pane, PaneEvent, PlotComponentAction, PreviewPlotAction, TabOrientation,
+    OpenImageAction, OpenOutlineAction, Pane, PaneEvent, PlotComponentAction, PreviewPlotAction,
+    TabOrientation,
 };
 pub use serial::{ItemRegistry, TileLayout};
 

@@ -12,6 +12,7 @@ use crate::inspector::rows::{
     BoolRow, CommandRow, ExpressionRow, InspectorRow, NavRow, RowAction, row_base, row_label,
 };
 use crate::theme::theme;
+use crate::views::image_view::{expands, list_expandable_components};
 use crate::views::time_series::Trace;
 
 thread_local! {
@@ -48,7 +49,8 @@ pub(crate) fn list_components(db: &DB) -> Vec<(ComponentId, String)> {
     list.to_vec()
 }
 
-/// Rows listing every known component; selecting one invokes `on_select`.
+/// Rows listing every component that expands; selecting one invokes
+/// `on_select`.
 ///
 /// The list is preceded by the expression row, so typing `=` turns the same
 /// search field into an expression field and `on_select` receives a computed
@@ -66,19 +68,31 @@ pub(crate) fn component_picker_rows(
             RowAction::Dismiss
         })
     };
+    let component_row: crate::inspector::rows::ComponentRowBuilder = {
+        let db = db.clone();
+        let commit_row = ExpressionRow::commit_component_row(commit.clone());
+        Arc::new(move |id, item, cx| match expands(&db, id) {
+            true => commit_row(id, item, cx),
+            false => None,
+        })
+    };
     let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(ExpressionRow::new(
         db.clone(),
-        commit.clone(),
-        ExpressionRow::commit_component_row(commit),
+        commit,
+        component_row,
         None,
     ))];
-    rows.extend(list_components(&db).into_iter().map(|(id, name)| {
-        let on_select = on_select.clone();
-        Box::new(CommandRow::new(
-            SharedString::from(name.clone()),
-            Arc::new(move |_window, cx| on_select(id, name.clone(), cx)),
-        )) as Box<dyn InspectorRow>
-    }));
+    rows.extend(
+        list_expandable_components(&db)
+            .into_iter()
+            .map(|(id, name)| {
+                let on_select = on_select.clone();
+                Box::new(CommandRow::new(
+                    SharedString::from(name.clone()),
+                    Arc::new(move |_window, cx| on_select(id, name.clone(), cx)),
+                )) as Box<dyn InspectorRow>
+            }),
+    );
     rows
 }
 
@@ -158,7 +172,7 @@ pub(crate) fn channel_picker_rows(
         let db = db.clone();
         let on_pick = on_pick.clone();
         Arc::new(move |id, item, _cx| {
-            Some(channel_component_row(&db, id, item.label.clone(), &on_pick))
+            expands(&db, id).then(|| channel_component_row(&db, id, item.label.clone(), &on_pick))
         })
     };
     rows.push(Box::new(ExpressionRow::new(
@@ -167,7 +181,7 @@ pub(crate) fn channel_picker_rows(
         component_row,
         None,
     )));
-    for (id, name) in list_components(&db) {
+    for (id, name) in list_expandable_components(&db) {
         rows.push(channel_component_row(&db, id, name, &on_pick));
     }
     rows
@@ -414,7 +428,7 @@ fn component_list_rows(
     on_continue: ContinueAction,
     selection: Arc<Mutex<TraceSelection>>,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let components: Vec<(ComponentId, String, usize)> = list_components(&db)
+    let components: Vec<(ComponentId, String, usize)> = list_expandable_components(&db)
         .into_iter()
         .map(|(id, name)| {
             let elem_count = element_names_for_component(&db, id).len().max(1);
@@ -452,6 +466,9 @@ fn component_list_rows(
         let db = db.clone();
         let selection = selection.clone();
         Arc::new(move |id, item, _cx| {
+            if !expands(&db, id) {
+                return None;
+            }
             let elem_count = element_names_for_component(&db, id).len().max(1);
             Some(wizard_component_row(
                 &db,
@@ -866,6 +883,42 @@ mod tests {
                 "the pick must keep the expression computing"
             );
             assert!(expressions::running(channel.component, cx).is_some());
+        });
+    }
+
+    fn labels(rows: &[Box<dyn InspectorRow>]) -> Vec<String> {
+        rows.iter().map(|r| r.label().to_string()).collect()
+    }
+
+    fn assert_collapsed_left_out(rows: &[Box<dyn InspectorRow>]) {
+        let listed = labels(rows);
+        assert!(listed.contains(&"cam.exposure".to_string()), "{listed:?}");
+        for name in crate::views::image_view::tests::COLLAPSED {
+            assert!(!listed.iter().any(|l| l == name), "{name} in {listed:?}");
+        }
+    }
+
+    /// Components that do not expand never reach a picker, listed or
+    /// searched.
+    #[gpui::test]
+    fn pickers_leave_collapsed_components_out(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = crate::views::image_view::tests::image_db();
+        let cx = cx.add_empty_window();
+        cx.update(|_window, cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            expressions::Expressions::init(cx);
+            crate::dynamic::worker::DynamicWorker::init(cx);
+            let (on_pick, _slot) = picked();
+            let channel = channel_picker_rows(db.clone(), "Pick", on_pick);
+            let on_select: OnTracesSelected = Arc::new(|_, _, _| {});
+            let wizard = select_traces_wizard_rows(db.clone(), Arc::new(|_| 0), on_select);
+            let component = component_picker_rows(db.clone(), |_, _, _| {});
+            for rows in [channel, wizard, component] {
+                assert_collapsed_left_out(&rows);
+                let provider = rows.iter().find(|r| r.label() == "Expression").unwrap();
+                assert_collapsed_left_out(&provider.query_rows("cam", 3, cx).expect("a search"));
+            }
+            assert_collapsed_left_out(&crate::inspector::edits::update_component_rows(db.clone()));
         });
     }
 }

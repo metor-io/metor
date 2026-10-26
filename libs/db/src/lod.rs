@@ -70,6 +70,8 @@ pub const LOD_OPT_IN_KEY: &str = "lod";
 /// source's raw history is small enough to render directly long before a
 /// multi-day bucket could help.
 const MAX_BUCKET_US: i64 = 86_400_000_000;
+/// Sources whose samples are larger than this, such as images, get no levels.
+const MAX_SOURCE_SAMPLE_BYTES: usize = 64 * 1024;
 /// Buckets emitted per level per pass; bounds the mmap scan so a year of
 /// backfill never pins the executor between sleeps.
 const MAX_BUCKETS_PER_PASS: i64 = 16_384;
@@ -141,7 +143,7 @@ fn eligible(meta: &ComponentMetadata) -> bool {
             .metadata
             .get(LOD_OPT_IN_KEY)
             .is_some_and(|opt_in| opt_in == "true");
-    visible && !meta.is_string() && !is_lod_name(&meta.name)
+    visible && !meta.is_string() && !is_lod_name(&meta.name) && meta.image_format().is_none()
 }
 
 async fn downsample_source(db: Arc<DB>, src: Component) {
@@ -169,7 +171,7 @@ async fn downsample_source(db: Arc<DB>, src: Component) {
     let Some(meta) = db.with_state(|s| s.get_component_metadata(src.component_id).cloned()) else {
         return;
     };
-    if !eligible(&meta) {
+    if !eligible(&meta) || src.schema.size() > MAX_SOURCE_SAMPLE_BYTES {
         return;
     }
     let mut levels = setup_levels(&db, &src, &meta.name, period_us);
@@ -778,6 +780,7 @@ mod tests {
             schema,
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
+            wal_dropped: Default::default(),
         }
     }
 
@@ -956,6 +959,7 @@ mod tests {
             schema,
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
+            wal_dropped: Default::default(),
         };
 
         let (lod, mut level) = level_for(dir.path(), &src, 100);
@@ -1006,6 +1010,7 @@ mod tests {
             schema,
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
+            wal_dropped: Default::default(),
         };
 
         let (lod, mut level) = level_for(dir.path(), &src, 300);
@@ -1053,6 +1058,7 @@ mod tests {
             schema,
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
+            wal_dropped: Default::default(),
         };
         assert_eq!(
             src.time_series
@@ -1172,5 +1178,14 @@ mod tests {
         let mut level = ComponentMetadata::from(lod_name("expr.abcd", 64).as_str()).with_hidden();
         level.set(LOD_OPT_IN_KEY, "true");
         assert!(!eligible(&level));
+    }
+
+    #[test]
+    fn images_are_not_eligible() {
+        use metor_proto_wkt::MetadataExt as _;
+
+        let mut image = ComponentMetadata::from("st.pixels");
+        image.set(metor_proto_wkt::IMAGE_FORMAT_KEY, "mono16");
+        assert!(!eligible(&image));
     }
 }

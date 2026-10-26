@@ -27,6 +27,13 @@ pub struct PlotComponentAction {
     pub indices: SmallVec<[usize; 4]>,
 }
 
+/// Opens an image view of an image component in the active pane.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub struct OpenImageAction {
+    pub component_id: ComponentId,
+}
+
 /// Dispatched by the outline to open another outline tab in the same pane,
 /// rooted on `root` (a full component path).
 #[derive(Clone, PartialEq, gpui::Action)]

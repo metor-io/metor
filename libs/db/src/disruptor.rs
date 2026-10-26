@@ -125,6 +125,10 @@ impl Disruptor {
     pub fn reader_count(&self) -> usize {
         self.core.readers.reader_count()
     }
+
+    pub fn capacity(&self) -> usize {
+        self.core.ringbuf.len()
+    }
 }
 
 pub struct DistruptorCore {
@@ -360,8 +364,7 @@ impl Readers {
         // position.
         let mut node = self.first();
         while let Some(n) = node {
-            if n
-                .cursor
+            if n.cursor
                 .compare_exchange(FREE_SLOT, cursor, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
@@ -829,7 +832,11 @@ mod tests {
 
         producer.join().unwrap();
         let expected: Vec<u8> = (0..messages).flat_map(|i| i.to_le_bytes()).collect();
-        assert_eq!(consumer.join().unwrap(), expected, "reader lost/reordered data");
+        assert_eq!(
+            consumer.join().unwrap(),
+            expected,
+            "reader lost/reordered data"
+        );
     }
 
     /// Single writer, multiple readers, wrapping constantly. Each reader
@@ -883,7 +890,11 @@ mod tests {
         producer.join().unwrap();
         let expected: Vec<u8> = (0..messages).flat_map(|i| i.to_le_bytes()).collect();
         for reader in readers {
-            assert_eq!(reader.join().unwrap(), expected, "a reader lost/reordered data");
+            assert_eq!(
+                reader.join().unwrap(),
+                expected,
+                "a reader lost/reordered data"
+            );
         }
     }
 

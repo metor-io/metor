@@ -1,5 +1,5 @@
-use nox::{ArrayRepr, OwnedRepr, Quaternion, Repr, Vector, tensor};
 use metor_component::{AsVTable, Metadatatize};
+use nox::{ArrayRepr, OwnedRepr, Quaternion, Repr, Vector, tensor};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// Calculates the LQR control matrices for a yang LQR controller.

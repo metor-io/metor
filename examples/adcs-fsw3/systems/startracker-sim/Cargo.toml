@@ -1,0 +1,28 @@
+[package]
+name = "startracker-sim-3"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "The startracker_sim pack: renders star-tracker images from the plant's true attitude"
+
+# Its own pack, apart from the wasm-friendly adcs pack, as it renders on the
+# GPU. The `export` feature adds the C ABI, so tests turn it off.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["export"]
+export = []
+
+[dependencies]
+adcs-contracts = { package = "adcs-contracts-3", path = "../../contracts" }
+futures-lite = "2"
+metor-fsw-3 = { path = "../../../../libs/metor-fsw-3", default-features = false, features = ["threads"] }
+metor-star = { path = "../../../../libs/metor-star", features = ["gpu"] }
+nox = { workspace = true }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

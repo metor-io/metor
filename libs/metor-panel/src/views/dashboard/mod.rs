@@ -123,6 +123,10 @@ impl WidgetKind {
     pub fn samples_table() -> Self {
         Self(SharedString::new_static("samples_table"))
     }
+    /// A live image component; `image` is the static picture widget.
+    pub fn image_view() -> Self {
+        Self(SharedString::new_static("image_view"))
+    }
 
     fn default_size(&self, cx: &App) -> (f32, f32) {
         widgets::widget_spec(self, cx).default_size

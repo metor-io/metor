@@ -21,11 +21,11 @@ use gpui::{App, Global, RenderImage, Window, WindowId};
 /// Frame ticks a released image waits out. Metal's layer holds three
 /// drawables, so at most two frames after the last one that painted the image
 /// can still be on the GPU; one more covers the frame being built now.
-const SETTLE_FRAMES: u32 = 4;
+pub(crate) const SETTLE_FRAMES: u32 = 4;
 
 /// Floor on the wait, for ticks that request no draw and so put no
 /// back-pressure on the drawable pool.
-const SETTLE_TIME: Duration = Duration::from_millis(50);
+pub(crate) const SETTLE_TIME: Duration = Duration::from_millis(50);
 
 struct Parked {
     image: Arc<RenderImage>,
@@ -85,6 +85,28 @@ fn settle(window: &mut Window, cx: &mut App) {
         let _ = window.drop_image(image);
     }
 }
+
+/// Drop `images` from every window's atlas once in-flight frames are done
+/// with them, for an owner that is going away without a window at hand (a
+/// torn-out tab can have painted into several windows).
+pub(crate) fn release_orphans(cx: &mut App, images: Vec<Arc<RenderImage>>) {
+    if images.is_empty() {
+        return;
+    }
+    let wait = cx.background_executor().timer(ORPHAN_WAIT);
+    cx.spawn(async move |cx| {
+        wait.await;
+        cx.update(|cx| {
+            for image in images {
+                cx.drop_image(image, None);
+            }
+        });
+    })
+    .detach();
+}
+
+/// Wait before dropping an orphan: [`SETTLE_FRAMES`] frames at 30 Hz.
+pub(crate) const ORPHAN_WAIT: Duration = Duration::from_millis(150);
 
 #[cfg(test)]
 mod tests {

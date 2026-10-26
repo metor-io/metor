@@ -9,15 +9,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{
-    Deadline, Fsw, Imu, Ping, Running, Source, Target, dial_fsw, fixture_dir, lower_links, metor,
-    source, within,
+    Camera, Deadline, Fsw, ImageFrame, Imu, Ping, Running, Source, Target, camera, dial_fsw,
+    fixture_dir, lower_links, metor, source, within,
 };
 use metor_fsw_3::builtins::register_builtins;
 use metor_fsw_3::coordinator::{
-    CoordinatorConfig, InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig, SystemTable,
+    BuildError, CoordinatorConfig, InputConfig, OutputConfig, OutputSource, PortRef, SystemConfig,
+    SystemTable,
 };
 use metor_fsw_3::{
-    Clock, DefCx, Frame, Input, LinkStatus, Output, ResourceStatus, Timestamp, WallRate, system,
+    Clock, DefCx, DefError, Frame, Input, LinkStatus, Output, ResourceStatus, Timestamp, WallRate,
+    system,
 };
 use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::PacketStream;
@@ -192,6 +194,9 @@ fn table(seen: &Seen) -> SystemTable {
     let samples = seen.pings.clone();
     table
         .register("imu_sink", imu_sink(), move || ImuSink(samples.clone()))
+        .expect("valid records");
+    table
+        .register("camera", camera(), || Camera::new(10.0, Arc::default()))
         .expect("valid records");
     let faults = seen.faults.clone();
     table
@@ -884,6 +889,53 @@ async fn test_oversized_packet_closes_connection() {
         seen.status().is_some_and(|s| s.connections == 0)
     })
     .await;
+}
+
+/// A `Publish` named `link` serving `camera.image`, with `conn_cap`.
+fn image_publish(link: &str, conn_cap: usize) -> SystemConfig {
+    SystemConfig {
+        params: json!({
+            "ep": listen_any(link),
+            "namespace": "cube_sat",
+            "link": link,
+            "conn_cap": conn_cap,
+        }),
+        ..reading(
+            "pub",
+            "fsw.publish",
+            "camera.image",
+            PortRef::new("camera", "image"),
+        )
+    }
+}
+
+/// Builds `system` behind a camera, without running it.
+fn build_with_camera(system: SystemConfig) -> Result<(), BuildError> {
+    let mut config = CoordinatorConfig {
+        systems: vec![SystemConfig::new("camera", "camera"), system],
+        ..Default::default()
+    };
+    lower_links(&mut config);
+    config.build(&table(&Seen::default())).map(drop)
+}
+
+#[test]
+fn test_port_past_conn_cap_fails_the_build() {
+    let short = size_of::<ImageFrame>() + 7;
+    let error = build_with_camera(image_publish("pub-short", short)).err();
+    let Some(BuildError::Def { id, source }) = error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(id, "pub");
+    let refused = DefError::PortExceedsConnCap {
+        port: "camera.image".into(),
+        max_len: size_of::<ImageFrame>(),
+        conn_cap: short,
+    };
+    assert_eq!(source, refused);
+    let mut bare = image_publish("pub-bare", 1);
+    bare.inputs.clear();
+    assert!(build_with_camera(bare).is_ok(), "no inputs, any cap");
 }
 
 #[stellarator::test]

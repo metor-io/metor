@@ -14,6 +14,7 @@ pub mod component_tree;
 
 use super::column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 use super::copy::{copy_name_row, copy_rows};
+use super::image_view::{collapsed_label, expands, is_image};
 use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
 use super::time_series::Override;
@@ -25,7 +26,7 @@ use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow}
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::{Theme, theme};
-use crate::tiles::PlotComponentAction;
+use crate::tiles::{OpenImageAction, PlotComponentAction};
 use component_tree::{Children, ComponentNode, build_tree, compress_subtree, resolve_path};
 
 /// [`ColumnBrowser`] specialized for the DB component namespace.
@@ -376,23 +377,11 @@ impl ComponentBrowserDelegate {
             } else if let Some(component_id) = node.component_id
                 && node.children.is_empty()
             {
-                let db = self.db.clone();
-                let db_for_plot = db.clone();
-                rows.push(Box::new(CommandRow::new(
-                    SharedString::new_static("Plot component"),
-                    Arc::new(move |window, cx| {
-                        let count = element_count(&db_for_plot, component_id);
-                        let indices: SmallVec<[usize; 4]> = (0..count).collect();
-                        window.dispatch_action(
-                            Box::new(PlotComponentAction {
-                                component_id,
-                                indices,
-                            }),
-                            cx,
-                        );
-                    }),
-                )));
-                rows.extend(copy_rows(db, component_id, node.full_name.clone(), None));
+                rows.extend(component_rows(
+                    self.db.clone(),
+                    component_id,
+                    node.full_name.clone(),
+                ));
             } else {
                 let reroot_column = column_ix;
                 let browser_reroot = browser.clone();
@@ -546,6 +535,84 @@ impl ComponentBrowser {
     }
 }
 
+impl ComponentBrowserDelegate {
+    /// A detail row: a live strip, or a note for a component that does not
+    /// expand.
+    fn preview_row(&mut self, ix: usize, cx: &mut Context<ComponentBrowser>) -> PreviewRow {
+        let (id, full_name) = self.detail_components[ix].clone();
+        let value = match collapsed_label(&self.db, id) {
+            Some(label) => PreviewValue::Note(label.into()),
+            None => PreviewValue::Strip(self.detail_strip(id, &full_name, cx)),
+        };
+        PreviewRow {
+            component_id: id,
+            full_name,
+            value,
+            db: self.db.clone(),
+        }
+    }
+
+    fn detail_strip(
+        &mut self,
+        id: ComponentId,
+        full_name: &SharedString,
+        cx: &mut Context<ComponentBrowser>,
+    ) -> Entity<ComponentValueStrip> {
+        let db = self.db.clone();
+        let strip = self.strip_cache.get_or_create(id, || {
+            let db = db.clone();
+            cx.new(|cx| {
+                ComponentValueStrip::new(db, id, StripStyle::boxes(), StripBehavior::default(), cx)
+            })
+        });
+        // Refresh the pending-edit snapshot each frame; click callbacks are
+        // cheap Arc captures (`db.clone()` + id).
+        let click = edit_click(db.clone(), id, full_name.clone());
+        let mut behavior = behavior_snapshot(cx, db.clone(), id, click);
+        behavior.on_element_right_click = Some(strip_menu(db, id));
+        strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
+        strip
+    }
+}
+
+/// "Plot component" and the copy rows, for every surface that names a
+/// component. A component that does not expand has no plot row.
+pub(crate) fn component_rows(
+    db: Arc<DB>,
+    component_id: ComponentId,
+    name: SharedString,
+) -> Vec<Box<dyn InspectorRow>> {
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+    if is_image(&db, component_id) {
+        rows.push(Box::new(CommandRow::new(
+            "Open as image",
+            Arc::new(move |window, cx| {
+                window.dispatch_action(Box::new(OpenImageAction { component_id }), cx);
+            }),
+        )));
+    }
+    if expands(&db, component_id) {
+        let count = element_count(&db, component_id);
+        rows.push(Box::new(CommandRow::new(
+            "Plot component",
+            Arc::new(move |window, cx| plot_component(component_id, count, window, cx)),
+        )));
+    }
+    rows.extend(copy_rows(db, component_id, name, None));
+    rows
+}
+
+fn plot_component(component_id: ComponentId, count: usize, window: &mut Window, cx: &mut App) {
+    let indices: SmallVec<[usize; 4]> = (0..count).collect();
+    window.dispatch_action(
+        Box::new(PlotComponentAction {
+            component_id,
+            indices,
+        }),
+        cx,
+    );
+}
+
 /// The right-click menu of a strip cell: plot the element, or copy it or
 /// the component's name.
 pub(crate) fn strip_menu(db: Arc<DB>, component_id: ComponentId) -> StripClick {
@@ -604,16 +671,18 @@ fn element_count(db: &DB, component_id: ComponentId) -> usize {
     })
 }
 
-/// Number of boxes the detail strip renders for a component: strings and
-/// enums collapse into a single cell, everything else gets one per element.
-/// Mirrors `format_cells` so [`strip_row_width`] sizing stays in step.
+/// Number of cells a component's value takes: strings and enums collapse
+/// into a single cell, as `format_cells` does, and so does a component that
+/// does not expand and shows a note instead. Everything else gets one cell
+/// per element, which keeps [`strip_row_width`] sizing in step.
 pub(crate) fn strip_cell_count(db: &DB, component_id: ComponentId) -> usize {
-    let collapses = db.with_state(|state| {
-        state
-            .get_component_metadata(component_id)
-            .map(|m| m.is_string() || m.enum_variants().is_some())
-            .unwrap_or(false)
-    });
+    let collapses = !expands(db, component_id)
+        || db.with_state(|state| {
+            state
+                .get_component_metadata(component_id)
+                .map(|m| m.is_string() || m.enum_variants().is_some())
+                .unwrap_or(false)
+        });
     if collapses {
         1
     } else {
@@ -665,7 +734,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
         anchor: gpui::Point<gpui::Pixels>,
         _cx: &App,
     ) -> Option<Box<dyn gpui::Action>> {
-        let component_id = item.component_id?;
+        let component_id = item.component_id.filter(|&id| expands(&self.db, id))?;
         Some(Box::new(crate::tiles::PreviewPlotAction {
             component_id,
             indices: SmallVec::new(),
@@ -815,35 +884,9 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
                       cx: &mut Context<ComponentBrowser>| {
                     let theme = crate::theme::theme(cx);
                     let delegate = this.delegate_mut();
-                    let db = delegate.db.clone();
                     let mut items = Vec::with_capacity(range.len());
                     for ix in range {
-                        let (id, full_name) = delegate.detail_components[ix].clone();
-                        let strip = delegate.strip_cache.get_or_create(id, || {
-                            let db = db.clone();
-                            cx.new(|cx| {
-                                ComponentValueStrip::new(
-                                    db,
-                                    id,
-                                    StripStyle::boxes(),
-                                    StripBehavior::default(),
-                                    cx,
-                                )
-                            })
-                        });
-                        // Refresh the pending-edit snapshot each frame; click
-                        // callbacks are cheap Arc captures (`db.clone()` + id).
-                        let click = edit_click(db.clone(), id, full_name.clone());
-                        let right_click = strip_menu(db.clone(), id);
-                        let mut behavior = behavior_snapshot(cx, db.clone(), id, click);
-                        behavior.on_element_right_click = Some(right_click);
-                        strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
-                        let row = PreviewRow {
-                            component_id: id,
-                            full_name,
-                            strip,
-                            db: db.clone(),
-                        };
+                        let row = delegate.preview_row(ix, cx);
                         items.push(render_preview_entry(&row, &theme));
                     }
                     delegate.strip_cache.prune();
@@ -1122,8 +1165,13 @@ const VTABLE_DEBOUNCE: Duration = Duration::from_millis(50);
 struct PreviewRow {
     component_id: ComponentId,
     full_name: SharedString,
-    strip: Entity<ComponentValueStrip>,
+    value: PreviewValue,
     db: Arc<DB>,
+}
+
+enum PreviewValue {
+    Strip(Entity<ComponentValueStrip>),
+    Note(SharedString),
 }
 
 /// The right-click menu of a detail row's name: plot every element, or
@@ -1139,21 +1187,7 @@ fn open_detail_menu(
     let Some(open) = open_inspector(cx) else {
         return;
     };
-    let count = element_count(db, component_id);
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(CommandRow::new(
-        "Plot component",
-        Arc::new(move |window, cx| {
-            let indices: SmallVec<[usize; 4]> = (0..count).collect();
-            window.dispatch_action(
-                Box::new(PlotComponentAction {
-                    component_id,
-                    indices,
-                }),
-                cx,
-            );
-        }),
-    ))];
-    rows.extend(copy_rows(db.clone(), component_id, name.clone(), None));
+    let rows = component_rows(db.clone(), component_id, name.clone());
     open(
         InspectorRequest {
             rows,
@@ -1165,56 +1199,44 @@ fn open_detail_menu(
 }
 
 fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
-    let db = row.db.clone();
     let component_id = row.component_id;
     let icon_id = row.component_id.0 as usize;
-
-    // The strip lays its element boxes out with `flex_wrap`, and this row is
-    // a fixed-height `uniform_list` item — wrapped lines would be clipped
-    // invisibly. Hold the strip at its single-line width (`flex_shrink = 0`
-    // keeps the auto basis at max-content; `min_w` backstops it with the
-    // computed box-row width) so overflow scrolls sideways instead of
-    // wrapping out of view. Axis-restricted so vertical wheel deltas still
-    // scroll the detail list underneath.
-    let n_cells = strip_cell_count(&row.db, component_id);
-    let mut strip_line = div().child(row.strip.clone());
-    if n_cells > 1 {
-        strip_line = strip_line.min_w(px(strip_row_width(n_cells)));
-    }
-    strip_line.style().flex_shrink = Some(0.0);
-    let mut strip_scroll = div()
-        .id(("detail-strip", icon_id))
-        .w_full()
-        .overflow_x_scroll()
-        .child(strip_line);
-    strip_scroll.style().restrict_scroll_to_axis = Some(true);
-
-    let plot_icon = div()
-        .id(("detail-plot", icon_id))
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(16.0))
-        .h(px(16.0))
-        .rounded(px(3.0))
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.selection_bg))
-        .on_mouse_down(
-            MouseButton::Left,
-            move |_event: &gpui::MouseDownEvent, window, cx| {
-                let count = element_count(&db, component_id);
-                let indices: SmallVec<[usize; 4]> = (0..count).collect();
-                window.dispatch_action(
-                    Box::new(PlotComponentAction {
-                        component_id,
-                        indices,
-                    }),
-                    cx,
-                );
+    let strip = match &row.value {
+        PreviewValue::Strip(strip) => Some(strip),
+        PreviewValue::Note(_) => None,
+    };
+    let mut name = div()
+        .id(("detail-name", icon_id))
+        .flex_1()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .text_size(px(12.0))
+        .text_color(theme.text_secondary)
+        .on_mouse_down(MouseButton::Right, {
+            let db = row.db.clone();
+            let name = row.full_name.clone();
+            move |event: &gpui::MouseDownEvent, window, cx| {
+                open_detail_menu(&db, component_id, &name, event.position, window, cx);
                 cx.stop_propagation();
-            },
-        )
-        .child(Icon::Plot.svg(11.0, theme.text_secondary));
+            }
+        })
+        .child(row.full_name.clone());
+    if strip.is_some() {
+        name = name.on_mouse_move(crate::inspector::plot_preview::shift_hover_listener(
+            component_id,
+            SmallVec::new(),
+        ));
+    }
+    let value = match &row.value {
+        PreviewValue::Strip(strip) => detail_strip_line(&row.db, component_id, strip),
+        PreviewValue::Note(note) => div()
+            .whitespace_nowrap()
+            .text_size(px(12.0))
+            .text_color(theme.text_tertiary)
+            .child(note.clone())
+            .into_any_element(),
+    };
 
     div()
         .h(px(PREVIEW_ROW_HEIGHT))
@@ -1229,38 +1251,177 @@ fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
                 .items_center()
                 .justify_between()
                 .gap(px(4.0))
-                .child(
-                    div()
-                        .id(("detail-name", icon_id))
-                        .flex_1()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_secondary)
-                        .on_mouse_move(crate::inspector::plot_preview::shift_hover_listener(
-                            component_id,
-                            SmallVec::new(),
-                        ))
-                        .on_mouse_down(MouseButton::Right, {
-                            let db = row.db.clone();
-                            let name = row.full_name.clone();
-                            move |event: &gpui::MouseDownEvent, window, cx| {
-                                open_detail_menu(
-                                    &db,
-                                    component_id,
-                                    &name,
-                                    event.position,
-                                    window,
-                                    cx,
-                                );
-                                cx.stop_propagation();
-                            }
-                        })
-                        .child(row.full_name.clone()),
-                )
-                .child(plot_icon),
+                .child(name)
+                .children(strip.map(|_| detail_plot_icon(&row.db, component_id, theme))),
         )
-        .child(strip_scroll)
+        .child(value)
         .into_any_element()
+}
+
+/// The strip lays its element boxes out with `flex_wrap`, and a detail row
+/// is a fixed-height `uniform_list` item — wrapped lines would be clipped
+/// invisibly. Hold the strip at its single-line width (`flex_shrink = 0`
+/// keeps the auto basis at max-content; `min_w` backstops it with the
+/// computed box-row width) so overflow scrolls sideways instead of wrapping
+/// out of view. Axis-restricted so vertical wheel deltas still scroll the
+/// detail list underneath.
+fn detail_strip_line(
+    db: &DB,
+    component_id: ComponentId,
+    strip: &Entity<ComponentValueStrip>,
+) -> AnyElement {
+    let n_cells = strip_cell_count(db, component_id);
+    let mut strip_line = div().child(strip.clone());
+    if n_cells > 1 {
+        strip_line = strip_line.min_w(px(strip_row_width(n_cells)));
+    }
+    strip_line.style().flex_shrink = Some(0.0);
+    let mut strip_scroll = div()
+        .id(("detail-strip", component_id.0 as usize))
+        .w_full()
+        .overflow_x_scroll()
+        .child(strip_line);
+    strip_scroll.style().restrict_scroll_to_axis = Some(true);
+    strip_scroll.into_any_element()
+}
+
+fn detail_plot_icon(db: &Arc<DB>, component_id: ComponentId, theme: &Theme) -> AnyElement {
+    let db = db.clone();
+    div()
+        .id(("detail-plot", component_id.0 as usize))
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(16.0))
+        .h(px(16.0))
+        .rounded(px(3.0))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.selection_bg))
+        .on_mouse_down(
+            MouseButton::Left,
+            move |_event: &gpui::MouseDownEvent, window, cx| {
+                plot_component(component_id, element_count(&db, component_id), window, cx);
+                cx.stop_propagation();
+            },
+        )
+        .child(Icon::Plot.svg(11.0, theme.text_secondary))
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::image_view::tests::{COLLAPSED, image_db};
+
+    const PLOT: &str = "Plot component";
+
+    fn labels(rows: &[Box<dyn InspectorRow>]) -> Vec<String> {
+        rows.iter().map(|r| r.label().to_string()).collect()
+    }
+
+    fn browser(db: &Arc<DB>, cx: &mut gpui::TestAppContext) -> Entity<ComponentBrowser> {
+        let browser = cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            crate::inspector::edits::init(cx);
+            cx.new(|cx| new_component_browser(db.clone(), cx))
+        });
+        cx.run_until_parked();
+        browser
+    }
+
+    fn node(tree: &Arc<ComponentNode>, name: &str) -> Arc<ComponentNode> {
+        let mut nodes = Vec::new();
+        collect_component_nodes(tree, &mut nodes);
+        nodes
+            .into_iter()
+            .find(|n| n.full_name == name)
+            .expect("the component is in the tree")
+    }
+
+    #[test]
+    fn component_rows_plot_only_what_expands() {
+        let (db, _temp) = image_db();
+        for name in COLLAPSED {
+            let rows = component_rows(db.clone(), ComponentId::new(name), name.into());
+            assert!(!labels(&rows).iter().any(|l| l == PLOT), "{name}");
+        }
+        let rows = component_rows(db.clone(), ComponentId::new("cam.exposure"), "x".into());
+        assert_eq!(labels(&rows)[0], PLOT);
+    }
+
+    #[test]
+    fn only_images_open_as_images() {
+        let (db, _temp) = image_db();
+        for (name, want) in [
+            ("cam.pixels", true),
+            ("cam.broken", true),
+            ("cam.raw", false),
+            ("cam.exposure", false),
+        ] {
+            let rows = component_rows(db.clone(), ComponentId::new(name), name.into());
+            assert_eq!(
+                labels(&rows).iter().any(|l| l == "Open as image"),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_components_take_one_cell() {
+        let (db, _temp) = image_db();
+        for name in COLLAPSED {
+            assert_eq!(strip_cell_count(&db, ComponentId::new(name)), 1, "{name}");
+        }
+    }
+
+    #[gpui::test]
+    fn context_menu_and_hover_skip_collapsed(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = image_db();
+        let browser = browser(&db, cx);
+        cx.update(|cx| {
+            let weak = browser.downgrade();
+            let delegate = browser.read(cx).delegate();
+            let anchor = gpui::Point::default();
+            for name in COLLAPSED {
+                let item = node(&delegate.tree, name);
+                let rows = delegate.build_context_rows(1, Some(&item), weak.clone());
+                assert!(!labels(&rows).iter().any(|l| l == PLOT), "{name}");
+                assert!(delegate.shift_hover_action(&item, anchor, cx).is_none());
+            }
+            let item = node(&delegate.tree, "cam.exposure");
+            let rows = delegate.build_context_rows(1, Some(&item), weak);
+            assert!(labels(&rows).iter().any(|l| l == PLOT));
+            assert!(delegate.shift_hover_action(&item, anchor, cx).is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn detail_rows_build_no_strip_for_collapsed(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = image_db();
+        let browser = browser(&db, cx);
+        cx.update(|cx| {
+            browser.update(cx, |browser, cx| {
+                let delegate = browser.delegate_mut();
+                let names = ["cam.exposure", "cam.pixels", "cam.broken", "cam.raw"];
+                delegate.detail_components = names
+                    .iter()
+                    .map(|&n| (ComponentId::new(n), SharedString::from(n)))
+                    .collect();
+                for (ix, name) in names.iter().enumerate() {
+                    let row = delegate.preview_row(ix, cx);
+                    let strip = matches!(row.value, PreviewValue::Strip(_));
+                    assert_eq!(strip, ix == 0, "{name}");
+                }
+                assert!(
+                    delegate
+                        .strip_cache
+                        .contains(ComponentId::new("cam.exposure"))
+                );
+                for name in COLLAPSED {
+                    assert!(!delegate.strip_cache.contains(ComponentId::new(name)));
+                }
+            })
+        });
+    }
 }

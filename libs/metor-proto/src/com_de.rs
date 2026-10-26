@@ -184,6 +184,12 @@ impl<const N: usize, E, T: Decomponentize<Error = E>> Decomponentize for [T; N] 
 
 pub trait FromComponentView: Sized {
     fn from_component_view(view: ComponentView<'_>) -> Result<Self, Error>;
+
+    /// Overwrites `self` from `view`. On error `self` is unchanged.
+    fn assign_component_view(&mut self, view: ComponentView<'_>) -> Result<(), Error> {
+        *self = Self::from_component_view(view)?;
+        Ok(())
+    }
 }
 
 pub trait AsComponentView {

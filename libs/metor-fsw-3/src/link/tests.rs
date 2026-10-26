@@ -8,7 +8,7 @@ use crate::io::tests::allocations;
 use crate::io::{Buf, Cap, Endpoint, Op, RawHandle};
 use crate::port::{DynInputs, DynOutputs, Input};
 use crate::record::Payload;
-use crate::system::{InputBinding, OutputBinding};
+use crate::system::{InputBinding, OutputBinding, PortDef};
 use crate::tests::utils::{Imu, ring};
 
 use super::batch::Batcher;
@@ -71,6 +71,55 @@ fn test_link_ops_reject_bad_params() {
     assert!(matches!(zero, Err(DefError::Params { .. })), "{zero:?}");
     let huge = ops(serde_json::json!({ "max_connections": 1 << 20 }));
     assert!(matches!(&huge, Err(DefError::Params { message }) if message.contains("more ops")));
+}
+
+fn conn_cap_check(params: serde_json::Value, ports: &[PortDef]) -> Result<(), DefError> {
+    let cx = DefCx {
+        params: &params,
+        ..DefCx::empty()
+    };
+    check_conn_cap(&cx, ports)
+}
+
+/// A port of `max_len`-byte records.
+fn port(name: &str, max_len: usize) -> PortDef {
+    PortDef {
+        name: name.to_string().into(),
+        max_len,
+        ..Input::<Imu>::def(&DefCx::empty(), "imu")
+    }
+}
+
+#[test]
+fn test_conn_cap_fits_each_port() {
+    let cap = |conn_cap: usize| serde_json::json!({ "conn_cap": conn_cap });
+    let ports = [port("small", 16), port("image", 2 << 20)];
+    assert_eq!(conn_cap_check(cap((2 << 20) + 8), &ports), Ok(()));
+    assert_eq!(conn_cap_check(cap(1), &[]), Ok(()), "no port, any cap");
+    let refused = DefError::PortExceedsConnCap {
+        port: "image".into(),
+        max_len: 2 << 20,
+        conn_cap: (2 << 20) + 7,
+    };
+    assert_eq!(
+        conn_cap_check(cap((2 << 20) + 7), &ports),
+        Err(refused.clone())
+    );
+    assert!(
+        refused
+            .to_string()
+            .ends_with("a `conn_cap` of 3145728 fits them"),
+        "{refused}"
+    );
+    let default = conn_cap_check(serde_json::Value::Null, &ports);
+    assert!(
+        matches!(default, Err(DefError::PortExceedsConnCap { conn_cap, .. }) if conn_cap == 1 << 20)
+    );
+    assert!(wire::fits(usize::MAX - 8, usize::MAX));
+    assert!(
+        !wire::fits(usize::MAX - 7, usize::MAX),
+        "overflow does not fit"
+    );
 }
 
 const CAP: usize = 4096;

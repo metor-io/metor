@@ -20,6 +20,7 @@ use metor_proto_wkt::{LogEvent, LogLevel};
 
 use crate::coordinator::MakeError;
 use crate::log::LogEventExt;
+use crate::port::checked_frame_len;
 use crate::record::{Payload, Record};
 use crate::system::SystemDef;
 
@@ -84,11 +85,15 @@ impl<W: WakeSource> Mirror<W> {
 }
 
 impl Mirror<NoWake> {
-    /// Creates a ring with one reader to mirror `real`, `factor` times its
-    /// capacity.
-    pub(crate) fn ring_for(real: &RingBuffer, factor: usize) -> Result<RingBuffer, MakeError> {
+    /// Creates a ring with one reader to mirror `real`, whose records are
+    /// at most `max_len` bytes, [`mirror_factor`] times its capacity.
+    pub(crate) fn ring_for(
+        real: &RingBuffer,
+        max_len: usize,
+        factor: usize,
+    ) -> Result<RingBuffer, MakeError> {
         let capacity = real.config().capacity;
-        let config = mirror_config(capacity, factor, 1)?;
+        let config = mirror_config(capacity, mirror_factor(max_len, factor), 1)?;
         RingBuffer::create_in_memory(config).map_err(|_| MakeError::MirrorTooLarge { capacity })
     }
 }
@@ -241,6 +246,19 @@ fn counts<'a, W: WakeSource>(
     inputs.chain(outputs)
 }
 
+/// The smallest record, in ring bytes, whose mirror is only 2× its ring.
+pub(crate) const LARGE_RECORD: usize = 512 << 10;
+
+/// Returns how many times larger than its ring a mirror of records of up to
+/// `max_len` bytes is: `factor`, or 2 for [`LARGE_RECORD`]s. A ring holds two
+/// records at least, so 2× still holds a full ring past the mirror's wrap.
+pub(crate) fn mirror_factor(max_len: usize, factor: usize) -> usize {
+    match checked_frame_len(max_len).is_none_or(|frame| frame >= LARGE_RECORD) {
+        true => 2,
+        false => factor,
+    }
+}
+
 /// Returns the config for a mirror ring.
 ///
 /// The mirror has `readers` readers and `factor` times the capacity of the
@@ -384,7 +402,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_reject_oversize_mirror() {
-        let capacity = usize::MAX / 2;
+        let capacity = usize::MAX / 2 + 1;
         assert_eq!(
             mirror_config(capacity, 4, 1).err(),
             Some(MakeError::MirrorTooLarge { capacity })
@@ -393,9 +411,26 @@ pub(crate) mod tests {
 
     #[test]
     fn test_ring_for_scales_capacity() {
-        let copy = Mirror::ring_for(&ring(256), 4).expect("a valid mirror");
+        let copy = Mirror::ring_for(&ring(256), 16, 4).expect("a valid mirror");
         assert_eq!(copy.config().capacity, 1024);
         assert_eq!(copy.config().max_readers, 1);
+    }
+
+    #[test]
+    fn test_large_records_get_a_double_mirror() {
+        let large = LARGE_RECORD - 16;
+        assert_eq!(metor_fsw_3_ring::frame_len(large), LARGE_RECORD);
+        assert_eq!(mirror_factor(large, 4), 2);
+        assert_eq!(mirror_factor(2 << 20, 4), 2);
+        assert_eq!(
+            mirror_factor(large - 16, 4),
+            4,
+            "just under keeps the slack"
+        );
+        assert_eq!(mirror_factor(64, 4), 4, "a large ring of small records");
+        assert_eq!(mirror_factor(usize::MAX, 4), 2);
+        let ring = Mirror::ring_for(&ring(4 * LARGE_RECORD), large, 4).expect("a mirror");
+        assert_eq!(ring.config().capacity, 8 * LARGE_RECORD);
     }
 
     #[test]

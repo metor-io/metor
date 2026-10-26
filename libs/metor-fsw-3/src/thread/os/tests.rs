@@ -647,3 +647,131 @@ mod turned {
         }
     }
 }
+
+/// 2 MiB records through a thread's 2× mirrors.
+mod large {
+    use std::sync::{Arc, Mutex};
+
+    use metor_fsw_3_ring::{Notifier, frame_len};
+
+    use super::*;
+    use crate::async_system::Stop;
+    use crate::coordinator::RING_BYTES;
+    use crate::port::{Input, Output};
+    use crate::record::Record;
+    use crate::tests::utils::{Image, ImageBuf};
+
+    #[derive(Default)]
+    struct Camera {
+        tick: i64,
+        buf: ImageBuf,
+    }
+
+    /// Writes one image per cycle, stamped with the cycle count.
+    #[crate::system]
+    fn camera(#[state] s: &mut Camera, image: &mut Output<Image>) {
+        s.tick += 1;
+        let _ = image.write(s.buf.stamped(s.tick));
+    }
+
+    /// Each image's timestamp and corners.
+    type Seen = Arc<Mutex<Vec<(i64, (u16, u16))>>>;
+
+    /// Records every image it reads.
+    #[crate::system]
+    async fn viewer(#[state] seen: &mut Seen, image: &mut Input<Image, Notifier>, stop: Stop) {
+        loop {
+            let next = async {
+                let image = image.next().await.ok()?;
+                Some((image.timestamp.0, image.corners()))
+            };
+            let stopped = async {
+                stop.wait().await;
+                None
+            };
+            let Some(got) = futures_lite::future::or(next, stopped).await else {
+                return;
+            };
+            // PANIC Safety: only this system and the test lock it, and neither panics.
+            seen.lock().expect("unpoisoned").push(got);
+        }
+    }
+
+    /// Never reads, so its mirror fills.
+    #[crate::system]
+    async fn blind(image: &mut Input<Image, Notifier>, stop: Stop) {
+        let _ = image;
+        stop.wait().await;
+    }
+
+    fn large_table(seen: &Seen, recorder: &Recorder) -> SystemTable {
+        let mut table = table(recorder);
+        table.register("camera", camera(), Camera::default).unwrap();
+        let seen = seen.clone();
+        table
+            .register_async("viewer", viewer(), move || seen.clone())
+            .unwrap();
+        table
+            .register_async("blind", blind(), Default::default)
+            .unwrap();
+        table
+    }
+
+    #[test]
+    fn test_reader_that_keeps_up_gets_every_image() {
+        for deterministic in MODES {
+            let seen = Seen::default();
+            let config = CoordinatorConfig {
+                systems: vec![
+                    SystemConfig::new("cam", "camera"),
+                    reading("view", "viewer", "image", PortRef::new("cam", "image")),
+                ],
+                ..Default::default()
+            };
+            let mut coordinator = build(
+                config,
+                &large_table(&seen, &Recorder::default()),
+                deterministic,
+            )
+            .unwrap();
+            for cycle in 1..=30 {
+                coordinator.step(Timestamp(cycle));
+                std::thread::sleep(Duration::from_millis(33));
+            }
+            let got = || seen.lock().unwrap().len() >= 30;
+            step_until(&mut coordinator, got);
+            let seen = seen.lock().unwrap();
+            let want: Vec<_> = (1..=30).map(|t| (t, (t as u16, t as u16))).collect();
+            assert_eq!(seen[..30], want);
+        }
+    }
+
+    #[test]
+    fn test_reader_that_falls_behind_counts_each_drop() {
+        for deterministic in MODES {
+            let recorder = Recorder::default();
+            let table = large_table(&Seen::default(), &recorder);
+            let config = CoordinatorConfig {
+                systems: vec![
+                    SystemConfig::new("cam", "camera"),
+                    reading("blind", "blind", "image", PortRef::new("cam", "image")),
+                    reading("logs", "log_sink", "lines", PortRef::new("blind", "log")),
+                ],
+                ..Default::default()
+            };
+            let mut coordinator = build(config, &table, deterministic).unwrap();
+            let mut lines = Vec::new();
+            step_until(&mut coordinator, || {
+                lines.extend(recorder.take_logs());
+                lines.iter().any(|l| kind(l) == Some("mirror_dropped"))
+            });
+            let report = lines.iter().find(|l| kind(l) == Some("mirror_dropped"));
+            let fields = &report.expect("a report").fields;
+            let count = fields.iter().find(|(name, _)| name == "image");
+            // The mirror is twice the 8 MiB ring and takes the first images.
+            let held = 2 * RING_BYTES / frame_len(Image::MAX_LEN);
+            let dropped = (100 - held).to_string();
+            assert_eq!(count.map(|(_, n)| n.as_ref()), Some(dropped.as_str()));
+        }
+    }
+}

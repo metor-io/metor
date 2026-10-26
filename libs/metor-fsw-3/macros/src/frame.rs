@@ -102,6 +102,7 @@ pub fn frame(input: TokenStream) -> TokenStream {
         impl #impl_generics #fsw::Record for #ident #ty_generics #where_clause {
             const NAME: &'static str = #frame_name;
             const MAX_LEN: usize = ::core::mem::size_of::<Self>();
+            const SCRATCH_LEN: usize = 0;
             #depth
             fn schema_with_root(root: &str) -> #fsw::record::RecordSchema {
                 #fsw::record::RecordSchema::frame::<Self>(root)

@@ -192,8 +192,10 @@ dependencies = [
  "metor-proto",
  "metor-proto-stellar",
  "metor-proto-wkt",
+ "metor-star",
  "nox",
  "serde_json",
+ "startracker-sim-3",
  "stellarator",
  "tempfile",
  "tracing",
@@ -239,14 +241,16 @@ name = "adcs-systems-3"
 version = "0.14.2"
 dependencies = [
  "adcs-contracts-3",
- "futures-lite 2.6.1",
+ "futures-lite",
  "metor-adcs",
  "metor-fsw-3",
+ "metor-star",
  "nox",
  "rand 0.9.5",
  "rand_distr 0.5.1",
  "schemars 1.2.1",
  "serde",
+ "serde_json",
  "tracing",
  "zerocopy",
 ]
@@ -2751,7 +2755,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4165,6 +4169,12 @@ dependencies = [
  "csscolorparser",
  "libm",
 ]
+
+[[package]]
+name = "colorous"
+version = "1.0.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4e18bf7a165bf7028fde98609a0f1e8f7498d762a212598e6c891f6893556ec"
 
 [[package]]
 name = "combine"
@@ -5590,7 +5600,7 @@ checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 name = "echo-pack"
 version = "0.14.2"
 dependencies = [
- "futures-lite 2.6.1",
+ "futures-lite",
  "metor-fsw-3",
  "schemars 1.2.1",
  "serde",
@@ -6101,6 +6111,18 @@ name = "fast-srgb8"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd2e7510819d6fbf51a5545c8f922716ecfb14df168a3242f7d33e0239efe6a1"
+
+[[package]]
+name = "fast_image_resize"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9c50201dc184ba6553da1695aac20a042efffbe2d84542cee31917c86c3ab1e"
+dependencies = [
+ "cfg-if",
+ "document-features",
+ "num-traits",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "fastrand"
@@ -6820,6 +6842,24 @@ dependencies = [
  "rand 0.8.7",
  "serde",
 ]
+
+[[package]]
+name = "glam"
+version = "0.30.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
+
+[[package]]
+name = "glam"
+version = "0.31.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "556f6b2ea90b8d15a74e0e7bb41671c9bdf38cd9f78c284d750b9ce58a2b5be7"
+
+[[package]]
+name = "glam"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f70749695b063ecbf6b62949ccccde2e733ec3ecbbd71d467dca4e5c6c97cca0"
 
 [[package]]
 name = "glam"
@@ -9193,6 +9233,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
+name = "matrixmultiply"
+version = "0.3.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f607c237553f086e7043417a51df26b2eb899d3caff94e6a67592ff992fedc7"
+dependencies = [
+ "autocfg",
+ "rawpointer",
+]
+
+[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9530,7 +9580,7 @@ dependencies = [
  "clap 4.6.3",
  "const-fnv1a-hash",
  "cordyceps",
- "futures-lite 2.6.1",
+ "futures-lite",
  "indexmap 2.14.0",
  "io-uring",
  "libc",
@@ -9611,6 +9661,7 @@ dependencies = [
  "bevy 0.20.0-dev",
  "bytemuck",
  "cocoa 0.26.0",
+ "colorous",
  "const-fnv1a-hash",
  "crossbeam-channel",
  "dirs 5.0.1",
@@ -9618,6 +9669,7 @@ dependencies = [
  "facet-dessert",
  "facet-format",
  "facet-json",
+ "fast_image_resize",
  "futures-lite",
  "glam 0.33.12",
  "gpui",
@@ -9773,6 +9825,22 @@ dependencies = [
  "serde",
  "smallvec 1.16.0",
  "strum 0.27.2",
+ "zerocopy",
+]
+
+[[package]]
+name = "metor-star"
+version = "0.14.2"
+dependencies = [
+ "libm",
+ "metor-star",
+ "naga 30.0.1",
+ "nalgebra",
+ "nox",
+ "pollster 0.4.0",
+ "rand 0.9.5",
+ "rand_distr 0.5.1",
+ "wgpu 30.0.1",
  "zerocopy",
 ]
 
@@ -10096,6 +10164,37 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "unicode-ident",
+]
+
+[[package]]
+name = "nalgebra"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adc43a60c217b0c6ff46e47f26911015ad8d2e5a8be1af668c67e370d99a4346"
+dependencies = [
+ "approx",
+ "glam 0.30.10",
+ "glam 0.31.1",
+ "glam 0.32.1",
+ "glam 0.33.12",
+ "matrixmultiply",
+ "nalgebra-macros",
+ "num-complex",
+ "num-rational",
+ "num-traits",
+ "simba",
+ "typenum",
+]
+
+[[package]]
+name = "nalgebra-macros"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "973e7178a678cfd059ccec50887658d482ce16b0aa9da3888ddeab5cd5eb4889"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -12502,6 +12601,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rawpointer"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
+
+[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13148,6 +13253,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "safe_arch"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13539,6 +13653,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "simba"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1a7200d82ff1c7b4235efd12f11e2537a402c91cf83a5cb97ce80eef787fde7"
+dependencies = [
+ "approx",
+ "num-complex",
+ "num-traits",
+ "wide 1.7.1",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13865,6 +13991,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "startracker-sim-3"
+version = "0.14.2"
+dependencies = [
+ "adcs-contracts-3",
+ "futures-lite",
+ "metor-fsw-3",
+ "metor-star",
+ "nox",
+ "schemars 1.2.1",
+ "serde",
 ]
 
 [[package]]
@@ -15539,7 +15678,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-video-toolbox",
  "thiserror 1.0.69",
- "wide",
+ "wide 0.7.33",
 ]
 
 [[package]]
@@ -16314,7 +16453,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
  "once_cell",
- "ordered-float 4.6.0",
+ "ordered-float 5.3.0",
  "parking_lot",
  "portable-atomic",
  "portable-atomic-util",
@@ -16454,7 +16593,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
 dependencies = [
  "bytemuck",
- "safe_arch",
+ "safe_arch 0.7.4",
+]
+
+[[package]]
+name = "wide"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d920ac99c3c8edce110cb8d07dbb324d6d026011dce85b1e9355b70f0adacc4f"
+dependencies = [
+ "bytemuck",
+ "safe_arch 1.2.0",
 ]
 
 [[package]]

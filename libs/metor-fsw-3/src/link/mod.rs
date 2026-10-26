@@ -30,6 +30,7 @@ use crate::coordinator::{BuildError, SystemTable};
 use crate::def::{DefCx, DefError};
 use crate::log::Log;
 use crate::port::Output;
+use crate::system::PortDef;
 use crate::{Frame, SeqError};
 
 use conns::{Conns, ConnsConfig, Event, Stats, Turn};
@@ -63,7 +64,8 @@ pub struct LinkParams {
     #[serde(default)]
     pub dialing: bool,
     /// The bytes of each connection's receive buffer and of each of its two
-    /// send buffers. It is also the largest batch.
+    /// send buffers. It is also the largest batch. Every port's records must
+    /// fit, with their packet overhead.
     #[serde(default = "conn_cap")]
     pub conn_cap: usize,
     /// How long a send may stay in flight with none finishing before its
@@ -94,17 +96,39 @@ impl LinkParams {
             write_timeout: Duration::from_millis(self.write_timeout_ms),
         }
     }
+
+    /// Decodes a link's params, `None` when the config gives none.
+    fn of(cx: &DefCx<'_>) -> Result<Option<Self>, DefError> {
+        Option::<Self>::deserialize(cx.params).map_err(|e| DefError::Params {
+            message: e.to_string(),
+        })
+    }
 }
 
 /// A link's op budget: [`conns::ops_for`] the slots its params ask for.
 fn link_ops(cx: &DefCx<'_>) -> Result<u16, DefError> {
-    let params = Option::<LinkParams>::deserialize(cx.params).map_err(|e| DefError::Params {
-        message: e.to_string(),
-    })?;
+    let params = LinkParams::of(cx)?;
     let slots = params.map_or(max_connections().get(), |p| p.conns().slot_count());
     u16::try_from(conns::ops_for(slots)).map_err(|_| DefError::Params {
         message: format!("{slots} connections need more ops than a system holds"),
     })
+}
+
+/// Rejects the first port whose records, framed as packets, do not fit the
+/// link's `conn_cap`.
+fn check_conn_cap(cx: &DefCx<'_>, ports: &[PortDef]) -> Result<(), DefError> {
+    let conn_cap = LinkParams::of(cx)?.map_or(conn_cap(), |p| p.conn_cap);
+    match ports
+        .iter()
+        .find(|port| !wire::fits(port.max_len, conn_cap))
+    {
+        Some(port) => Err(DefError::PortExceedsConnCap {
+            port: port.name.to_string(),
+            max_len: port.max_len,
+            conn_cap,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The error a link's body ends with when its buffers do not fit its peers.

@@ -80,6 +80,10 @@ pub enum MakeError {
     IoOps { needed: usize, budget: usize },
     #[error("a {seed}-byte announce does not fit a {conn_cap}-byte `conn_cap`")]
     SeedTooLarge { seed: usize, conn_cap: usize },
+    #[error(
+        "port `{port}` needs a {len}-byte copy ring that the guest's memory cannot hold; raise the pack's `memory` limit"
+    )]
+    CopyRingTooLarge { port: String, len: usize },
 }
 
 #[cfg(test)]

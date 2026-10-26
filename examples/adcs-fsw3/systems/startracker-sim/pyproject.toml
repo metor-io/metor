@@ -1,0 +1,31 @@
+# The startracker_sim pack as a Python distribution. `uv sync` runs the build
+# backend, which writes the typed module and the host library to
+# `.metor/startracker_sim_pack/` and adds it to the venv.
+
+[project]
+name = "startracker-sim-pack"
+version = "0.1.0"
+description = "The star-tracker image simulator of the adcs-fsw3 example"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["metor-build"]
+build-backend = "metor_build"
+
+[tool.metor.pack]
+id = "startracker_sim"
+
+[tool.uv.sources]
+metor-build = { path = "../../../../libs/metor-fsw-3/python/metor-build" }
+
+# Rebuild when the pack, its contracts or the renderer change.
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "../../contracts/src/**/*.rs" },
+    { file = "../../contracts/Cargo.toml" },
+    { file = "../../../../libs/metor-star/src/**/*.rs" },
+    { file = "../../../../libs/metor-star/src/**/*.wgsl" },
+]

@@ -24,6 +24,10 @@ pub struct Instance {
     /// The target seed, which `create` takes as its own argument.
     #[serde(skip)]
     pub seed: u64,
+    /// Whether the host turns async systems on its own thread, which the pack
+    /// then does for its own async systems.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub deterministic: bool,
 }
 
 /// Lists the systems a pack exports, in registration order.

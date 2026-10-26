@@ -373,6 +373,28 @@ fn register_widget_provider(cx: &mut App) {
     ItemRegistry::register(cx, Category::Widget, provider);
 }
 
+/// One row per image component, each opening an image view.
+fn open_image_rows(db: &DB) -> Vec<Box<dyn InspectorRow>> {
+    let images = crate::views::image_view::list_image_components(db);
+    if images.is_empty() {
+        return vec![Box::new(HeaderRow::new("No image components"))];
+    }
+    images
+        .into_iter()
+        .map(|(component_id, name)| {
+            Box::new(CommandRow::new(
+                name,
+                Arc::new(move |window, cx| {
+                    window.dispatch_action(
+                        Box::new(crate::tiles::OpenImageAction { component_id }),
+                        cx,
+                    );
+                }),
+            )) as Box<dyn InspectorRow>
+        })
+        .collect()
+}
+
 fn register_command_provider(db: Arc<DB>, cx: &mut App) {
     let provider: ItemProvider = Arc::new(move |cx: &App| {
         let mut items: Vec<InspectionItem> = Vec::new();
@@ -439,6 +461,13 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
                     }),
                 )
             }),
+        });
+
+        let image_db = db.clone();
+        items.push(InspectionItem::SubMenu {
+            label: "Open Image".into(),
+            summary: SharedString::new_static("A live view of an image component"),
+            build: Arc::new(move |_cx| open_image_rows(&image_db)),
         });
 
         let pending_count = crate::inspector::edits::pending_edits(cx).edits.len();

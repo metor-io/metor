@@ -13,7 +13,6 @@
 mod os;
 
 pub use os::Threads;
-#[cfg(feature = "host")]
 pub(crate) use os::TurnedGroup;
 pub(crate) use os::place;
 

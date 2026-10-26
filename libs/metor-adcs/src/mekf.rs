@@ -1,7 +1,5 @@
-use nox::{
-    ArrayBuf, ArrayRepr, Field, Matrix, Matrix3, Matrix3x6, Matrix6, Quaternion, Vector, tensor,
-};
 use metor_component::{AsVTable, Metadatatize};
+use nox::{ArrayRepr, Field, Matrix, Matrix3, Matrix3x6, Matrix6, Quaternion, Vector, tensor};
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
 pub fn calculate_covariance(
@@ -75,6 +73,28 @@ fn propagate_state_covariance(
     phi.dot(&big_p).dot(&phi.transpose()) + yqy
 }
 
+pub type V3 = Vector<f64, 3, ArrayRepr>;
+type V6 = Vector<f64, 6, ArrayRepr>;
+type M6 = Matrix6<f64, ArrayRepr>;
+type Quat = Quaternion<f64, ArrayRepr>;
+
+/// A unit vector measured in the body frame, its reference in the inertial
+/// frame, and the measurement's standard deviation (rad).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VectorObs {
+    pub body: V3,
+    pub reference: V3,
+    pub sigma: f64,
+}
+
+/// How many observations an update fused and how many it gated. An update
+/// that rejects the whole frame counts every observation as gated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpdateCounts {
+    pub used: u32,
+    pub gated: u32,
+}
+
 #[derive(Debug, Clone, AsVTable, Metadatatize, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct State {
@@ -106,56 +126,47 @@ impl State {
         }
     }
 
+    /// Propagates and then fuses `N` vectors with no gate.
     pub fn estimate_attitude<const N: usize>(
-        self,
-        measured_bodys: [Vector<f64, 3, ArrayRepr>; N],
-        references: [Vector<f64, 3, ArrayRepr>; N],
+        mut self,
+        measured_bodys: [V3; N],
+        references: [V3; N],
         sigma_r: [f64; N],
     ) -> Self {
-        let Self {
-            q_hat,
-            b_hat,
-            p,
-            omega,
-            yqy,
-            dt,
-        } = self;
-        let omega = omega - b_hat;
-        let q_hat = propagate_quaternion(q_hat, omega, dt);
-        let mut p = propagate_state_covariance(p, omega, yqy, dt);
-        let mut delta_x_hat: Vector<f64, 6, ArrayRepr> = Vector::zeros();
-        for ((reference, measured_body), sigma) in references
-            .into_iter()
-            .zip(measured_bodys.into_iter())
-            .zip(sigma_r.into_iter())
-        {
-            let var_r = Matrix::<f64, 3, 3, ArrayRepr>::eye() * sigma.powi(2);
-            let body_r = q_hat.inverse() * reference;
-            let e = measured_body - body_r;
-            let skew_sym = body_r.skew();
-            let h: Matrix<f64, 3, 6, ArrayRepr> =
-                Matrix::concat_in_dim([skew_sym, Matrix::<f64, 3, 3, ArrayRepr>::zeros()], 1);
-            let h_trans = h.transpose();
-            let s = (h.dot(&p).dot(&h_trans) + var_r)
-                .try_inverse()
-                .unwrap_or_else(|_| Matrix::eye());
-            let k = p.dot(&h_trans.dot(&s));
-            p = (Matrix::<f64, 6, 6, ArrayRepr>::eye() - k.dot(&h)).dot(&p);
-            let d: Vector<f64, 3, ArrayRepr> = h.dot(&delta_x_hat);
-            delta_x_hat = delta_x_hat + k.dot(&(e - d));
+        self.propagate();
+        let obs: [VectorObs; N] = core::array::from_fn(|i| VectorObs {
+            body: measured_bodys[i],
+            reference: references[i],
+            sigma: sigma_r[i],
+        });
+        self.update_vectors(&obs, f64::INFINITY);
+        self
+    }
+
+    /// Removes the bias from `omega` and propagates `q_hat` and `p` by `dt`.
+    /// The bias is subtracted from `omega` in place, so `omega` must be set
+    /// from the gyro before each call; calling it twice corrects twice.
+    pub fn propagate(&mut self) {
+        self.omega = self.omega - self.b_hat;
+        self.q_hat = propagate_quaternion(self.q_hat, self.omega, self.dt);
+        self.p = propagate_state_covariance(self.p, self.omega, self.yqy, self.dt);
+    }
+
+    /// The trace of the attitude block of `p` (rad²), an upper bound on its
+    /// largest eigenvalue.
+    pub fn attitude_variance(&self) -> f64 {
+        let p = self.p.into_buf();
+        p[0][0] + p[1][1] + p[2][2]
+    }
+
+    /// Sets the initial gyro bias covariance to `sigma²·I` (rad²/s²).
+    pub fn with_bias_sigma(mut self, sigma: f64) -> Self {
+        let mut p = self.p.into_buf();
+        for (i, row) in p.iter_mut().enumerate().skip(3) {
+            row[i] = sigma * sigma;
         }
-        let delta_alpha: Vector<f64, 3, ArrayRepr> = delta_x_hat.fixed_slice(&[0]);
-        let delta_beta: Vector<f64, 3, ArrayRepr> = delta_x_hat.fixed_slice(&[3]);
-        let q_hat = q_hat.integrate_body(delta_alpha);
-        let b_hat = b_hat + delta_beta;
-        Self {
-            q_hat,
-            b_hat,
-            p,
-            omega,
-            yqy,
-            dt,
-        }
+        self.p = Matrix::from_buf(p);
+        self
     }
 }
 
@@ -167,15 +178,10 @@ impl State {
             || self
                 .p
                 .into_buf()
-                .as_buf()
+                .as_flattened()
                 .iter()
-                .any(|&x: &f64| !x.is_finite())
-            || self
-                .omega
-                .into_buf()
-                .as_buf()
-                .iter()
-                .any(|&x: &f64| !x.is_finite())
+                .any(|x| !x.is_finite())
+            || self.omega.into_buf().iter().any(|x| !x.is_finite())
     }
 
     /// Resets the state if any parameter is non-finite
@@ -189,109 +195,9 @@ impl State {
     }
 }
 
+mod update;
+
+pub use update::MAX_OBS;
+
 #[cfg(test)]
-mod tests {
-    use approx::assert_relative_eq;
-    use nox::{array, tensor};
-
-    use super::*;
-
-    #[test]
-    fn test_calculate_covariance() {
-        #[rustfmt::skip]
-        let expected_q = tensor![
-            [8.33352623e-07, 0.00000000e+00, 0.00000000e+00, 3.47222222e-09, 0.00000000e+00, 0.00000000e+00,],
-            [0.00000000e+00, 8.33352623e-07, 0.00000000e+00, 0.00000000e+00, 3.47222222e-09, 0.00000000e+00,],
-            [0.00000000e+00, 0.00000000e+00, 8.33352623e-07, 0.00000000e+00, 0.00000000e+00, 3.47222222e-09,],
-            [3.47222222e-09, 0.00000000e+00, 0.00000000e+00, 8.33333333e-07, 0.00000000e+00, 0.00000000e+00,],
-            [0.00000000e+00, 3.47222222e-09, 0.00000000e+00, 0.00000000e+00, 8.33333333e-07, 0.00000000e+00,],
-            [0.00000000e+00, 0.00000000e+00, 3.47222222e-09, 0.00000000e+00, 0.00000000e+00, 8.33333333e-07,],
-        ];
-        let q = calculate_covariance(
-            tensor![0.01, 0.01, 0.01],
-            tensor![0.01, 0.01, 0.01],
-            1.0 / 120.0,
-        );
-        assert_relative_eq!(q, expected_q, epsilon = 1e-5);
-    }
-
-    #[test]
-    fn test_propagate_state_covariance() {
-        // from: cube-sat.py
-        // TODO(sphw): bring this function into rust
-        let yqy = tensor![
-            [8.33352623e-07, 0.0, 0.0, -3.4722e-09, 0.0, 0.0],
-            [0.0, 8.33352623e-07, 0.0, 0.0, -3.4722e-09, 0.0],
-            [0.0, 0.0, 8.33352623e-07, 0.0, 0.0, -3.4722e-09],
-            [-3.4722e-09, 0.0, 0.0, 8.3333e-07, 0.0, 0.0],
-            [0.0, -3.4722e-09, 0.0, 0.0, 8.3333e-07, 0.0],
-            [0.0, 0.0, -3.4722e-09, 0.0, 0.0, 8.3333e-07]
-        ];
-        let out =
-            propagate_state_covariance(Matrix::eye(), tensor![1.0, 0.0, 0.0], yqy, 1.0 / 120.0);
-        #[rustfmt::skip]
-        let expected = tensor![[ 1.00007028e+00,  0.00000000e+00,  0.00000000e+00,
-            -8.33333681e-03,  0.00000000e+00,  0.00000000e+00],
-        [ 0.00000000e+00,  1.00007028e+00,  5.55768107e-19,
-            0.00000000e+00, -8.33324036e-03, -3.47220213e-05],
-        [ 0.00000000e+00,  5.55768107e-19,  1.00007028e+00,
-            0.00000000e+00,  3.47220213e-05, -8.33324036e-03],
-        [-8.33333681e-03,  0.00000000e+00,  0.00000000e+00,
-            1.00000083e+00,  0.00000000e+00,  0.00000000e+00],
-        [ 0.00000000e+00, -8.33324036e-03,  3.47220213e-05,
-            0.00000000e+00,  1.00000083e+00,  0.00000000e+00],
-        [ 0.00000000e+00, -3.47220213e-05, -8.33324036e-03,
-            0.00000000e+00,  0.00000000e+00,  1.00000083e+00]];
-        assert_relative_eq!(out.inner(), expected.inner(), epsilon = 1e-6);
-    }
-
-    #[test]
-    fn test_propagate_quaternion() {
-        let q = propagate_quaternion(Quaternion::identity(), tensor![1.0, 0.0, 0.0], 1.0 / 60.0);
-        assert_relative_eq!(
-            q.0.inner(),
-            &array![0.00833324, 0., 0., 0.99996528],
-            epsilon = 1e-5
-        );
-    }
-
-    #[test]
-    fn test_mekf() {
-        #[rustfmt::skip]
-        let expected_yqy = tensor![
-            [8.33352623e-07, 0.0, 0.0, -3.4722e-09, 0.0, 0.0],
-            [0.0, 8.33352623e-07, 0.0, 0.0, -3.4722e-09, 0.0],
-            [0.0, 0.0, 8.33352623e-07, 0.0, 0.0, -3.4722e-09],
-            [-3.4722e-09, 0.0, 0.0, 8.3333e-07, 0.0, 0.0],
-            [0.0, -3.4722e-09, 0.0, 0.0, 8.3333e-07, 0.0],
-            [0.0, 0.0, -3.4722e-09, 0.0, 0.0, 8.3333e-07]
-        ];
-        let ref_a = tensor![0.0, 1.0, 0.0].normalize();
-        let ref_b = tensor![1.0, 0.0, 0.0].normalize();
-        let mut q: Quaternion<f64, ArrayRepr> =
-            Quaternion::from_axis_angle(Vector::z_axis(), 3.14 / 4.0);
-        let body_a = (q.inverse() * ref_a).normalize();
-        let body_b = (q.inverse() * ref_b).normalize();
-        let dt = 1.0 / 120.0;
-        let mut state = State::new(tensor![0.01, 0.01, 0.01], tensor![0.01, 0.01, 0.01], dt);
-        assert_relative_eq!(state.yqy, expected_yqy, epsilon = 1e-4);
-        for _ in 0..180 {
-            state.omega = Default::default();
-            state = state.estimate_attitude([body_a, body_b], [ref_a, ref_b], [0.03, 0.03]);
-        }
-        assert_relative_eq!(state.q_hat.0, q.0, epsilon = 1e-3);
-        for _ in 0..120 {
-            q = q.integrate_body(tensor![1.0 / 120.0, 0.0, 0.0]);
-            let body_a = (q.inverse() * ref_a).normalize();
-            let body_b = (q.inverse() * ref_b).normalize();
-            state.omega = tensor![1.0, 0.0, 0.0];
-            state = state.estimate_attitude([body_a, body_b], [ref_a, ref_b], [0.03, 0.03]);
-        }
-        assert_relative_eq!(
-            state.b_hat.inner(),
-            tensor![0.0, 0.0, 0.0].inner(),
-            epsilon = 1e-2
-        );
-        assert_relative_eq!(state.q_hat.0, q.0, epsilon = 1e-3);
-    }
-}
+mod tests;

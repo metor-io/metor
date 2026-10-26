@@ -23,4 +23,4 @@ nox.workspace = true
 nox.default-features = false
 
 zerocopy.version = "0.8.2"
-zerocopy.features = ["derive"]
+zerocopy.features = ["alloc", "derive"]

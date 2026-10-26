@@ -177,6 +177,10 @@ class Publish(_Sink, Link, _generated.Publish):
     `items` lists what to publish. An item is either a system handle, which
     publishes all of that system's ports, or a single port. With `all`, it
     publishes every system added before this one.
+
+    ``conn_cap`` sizes each connection's buffers and the batch. It must
+    be at least the largest record published plus 8 bytes, so an image link
+    needs one above its image's size; the build checks it.
     """
 
     def __init__(
@@ -250,6 +254,10 @@ class Subscribe(Link, _generated.Subscribe):
     even if the peer publishes it on several; the first one listed wins.
     With neither `items` nor `records`, it copies everything the peer
     publishes. Use `port()` to get this subscriber's copy of a peer's port.
+
+    ``conn_cap`` sizes each connection's buffers. It must be at least
+    the largest record received plus 8 bytes, so an image link needs one
+    above its image's size; the build checks it.
     """
 
     def __init__(

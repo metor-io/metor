@@ -60,7 +60,6 @@ impl TurnedGroup {
     }
 
     /// Sets simulated time to `now` and turns the executor once.
-    #[cfg(feature = "host")]
     pub(crate) fn turn(&mut self, now: metor_proto::types::Timestamp) {
         stellarator::time::sim_set(u64::try_from(now.0).unwrap_or(0));
         self.executor.turn();

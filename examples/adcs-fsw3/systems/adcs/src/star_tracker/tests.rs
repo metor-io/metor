@@ -1,0 +1,192 @@
+use metor_star::render::gpu::GpuRenderer;
+use metor_star::render::testkit::{STARCAT_G8, sim_camera, sim_renderer};
+use metor_star::render::{Frame, Motion};
+use metor_star::starcat::StarCat;
+
+use super::*;
+
+fn params() -> StarTrackerParams {
+    serde_json::from_str("{}").unwrap()
+}
+
+struct Rig {
+    render: GpuRenderer<'static>,
+    px: Vec<u16>,
+}
+
+impl Rig {
+    fn new() -> Rig {
+        Rig {
+            render: sim_renderer(StarCat::parse(STARCAT_G8).unwrap()),
+            px: vec![0; (SIZE * SIZE) as usize],
+        }
+    }
+
+    /// Renders a still frame at `q_b_eci` and returns its truth stars' HIPs.
+    fn expose(&mut self, q: Quat, id: u64) -> Vec<u32> {
+        let motion = Motion {
+            q_b_eci: q,
+            omega_b: [0.0; 3],
+            beta: [0.0; 3],
+            t_exp: 0.1,
+        };
+        let frame = Frame::new(&sim_camera(), &motion, 16, id, id).unwrap();
+        let truth = self.render.render(&frame, &mut self.px).unwrap();
+        truth.brightest().iter().map(|t| t.cat_id).collect()
+    }
+}
+
+fn q(i: f64) -> Quat {
+    Quat([0.3 * i, -0.2, 0.5, 0.8]).normalized().unwrap()
+}
+
+#[test]
+fn identifies_a_frame_and_tracks_the_next() {
+    let mut rig = Rig::new();
+    let mut st = StarTracker::new(params());
+    let hips = rig.expose(q(1.0), 1);
+    let out = st.step(Some((Timestamp(0), 1, &rig.px))).expect("resolves");
+    assert_eq!(out.solution.status(), Ok(StarStatus::Valid));
+    assert_eq!(out.solution.mode(), Ok(StarMode::Lost));
+    let v = out.vectors.expect("vectors");
+    assert!(v.count >= 6);
+    // Every vector's id is a star the renderer drew.
+    for id in &v.cat_id.0[..v.count as usize] {
+        assert!(hips.contains(id), "HIP {id}");
+    }
+    // Each vector's σ is its centroid's: brightest first, so rising.
+    let sigma = &v.sigma.into_buf()[..v.count as usize];
+    assert!(sigma.windows(2).all(|w| w[0] <= w[1]), "{sigma:?}");
+    assert!(sigma[0] < sigma[sigma.len() - 1]);
+    let q_hat = geom::Quat(out.solution.q_b_eci.0.into_buf());
+    assert!(q_hat.angle_to(q(1.0)) < 1e-3);
+    // Centroids carry the same ids.
+    let ids = &out.centroids.cat_id.0[..out.centroids.count as usize];
+    assert!(ids.iter().filter(|i| **i != UNIDENTIFIED).count() >= v.count as usize);
+    // The same frame again is not processed twice.
+    assert!(st.step(Some((Timestamp(0), 1, &rig.px))).is_none());
+    // The next frame, 0.1 s later and still, tracks.
+    rig.expose(q(1.0), 2);
+    let out = st.step(Some((Timestamp(100_000), 2, &rig.px))).unwrap();
+    assert_eq!(out.solution.mode(), Ok(StarMode::Tracking));
+}
+
+/// A frame whose search needs more than one triplet: split one triplet per
+/// cycle, it gives the same vectors as one call, and a new frame arriving
+/// mid-search drops it.
+#[test]
+fn a_split_search_matches_one_call_and_a_new_frame_drops_it() {
+    let mut rig = Rig::new();
+    let one = StarTrackerParams {
+        budget: 1,
+        ..params()
+    };
+    let mut split_frames = 0;
+    for i in 0..40 {
+        rig.expose(q(f64::from(i)), 1);
+        let whole = StarTracker::new(params())
+            .step(Some((Timestamp(0), 1, &rig.px)))
+            .unwrap();
+        let mut split = StarTracker::new(one.clone());
+        let mut out = split.step(Some((Timestamp(0), 1, &rig.px)));
+        if out.is_some() {
+            continue;
+        }
+        split_frames += 1;
+        // A new frame now would drop this search.
+        let mut dropper = StarTracker::new(one.clone());
+        assert!(dropper.step(Some((Timestamp(0), 1, &rig.px))).is_none());
+        dropper.step(Some((Timestamp(100_000), 2, &rig.px)));
+        assert_eq!(dropper.dropped, 1);
+        while out.is_none() {
+            out = split.step(Some((Timestamp(0), 1, &rig.px)));
+        }
+        let (a, b) = (whole.vectors.unwrap(), out.unwrap().vectors.unwrap());
+        assert_eq!(a.cat_id.0, b.cat_id.0);
+        assert_eq!(a.b_body.into_buf(), b.b_body.into_buf());
+    }
+    assert!(split_frames > 0, "every frame solved on its first triplet");
+}
+
+#[test]
+fn a_blank_frame_writes_a_solution_but_no_vectors() {
+    let mut st = StarTracker::new(params());
+    let px = vec![100u16; (SIZE * SIZE) as usize];
+    let out = st.step(Some((Timestamp(0), 1, &px))).unwrap();
+    assert!(out.vectors.is_none());
+    assert_eq!(out.solution.status(), Ok(StarStatus::NoStars));
+    assert_eq!(out.centroids.count, 0);
+    // No frame and nothing pending: nothing to do.
+    assert!(st.step(None).is_none());
+}
+
+/// Turning 0.6°/s with the rate jittering every 120 Hz cycle, as a rate
+/// loop on a noisy gyro does: the prior integrates every gyro sample
+/// between frames, so it follows the jitter and frames keep tracking.
+/// Returns the share of frames after the first that fell back to
+/// lost-in-space.
+fn jittered_fallback(jitter_rad_s: f64, frames: u32) -> f64 {
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, StandardNormal};
+    const DT: f64 = 1.0 / 120.0;
+    const PER_FRAME: u32 = 12;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let mut rig = Rig::new();
+    let mut st = StarTracker::new(params());
+    let w0 = [0.6f64.to_radians() / 3f64.sqrt(); 3];
+    let mut q_true = q(1.0);
+    // The rates of the frame being exposed and its mid-exposure attitude.
+    let mut rates: Vec<V3> = Vec::new();
+    let mut mid = q_true;
+    let (mut lost, mut solved) = (0u32, 0u32);
+    for k in 0..frames * PER_FRAME {
+        let t_us = (f64::from(k) * DT * 1e6).round() as i64;
+        let omega: V3 = core::array::from_fn(|i| {
+            let n: f64 = StandardNormal.sample(&mut rng);
+            w0[i] + jitter_rad_s * n
+        });
+        st.set_gyro(Timestamp(t_us), omega);
+        let phase = k % PER_FRAME;
+        // A frame exposed over the last 12 cycles arrives now.
+        let frame = (phase == 0 && k > 0).then(|| {
+            let n = rates.len() as f64;
+            let mean: V3 = core::array::from_fn(|i| rates.iter().map(|r| r[i]).sum::<f64>() / n);
+            let start = predict(mid, mean, -0.05);
+            let motion = Motion {
+                q_b_eci: start,
+                omega_b: mean,
+                beta: [0.0; 3],
+                t_exp: 0.1,
+            };
+            let id = u64::from(k / PER_FRAME);
+            let frame = Frame::new(&sim_camera(), &motion, 16, id, id).unwrap();
+            rig.render.render(&frame, &mut rig.px).unwrap();
+            rates.clear();
+            (Timestamp(t_us - 50_000), id)
+        });
+        if phase == PER_FRAME / 2 {
+            mid = q_true;
+        }
+        rates.push(omega);
+        if let Some(out) = st.step(frame.map(|(t, id)| (t, id, rig.px.as_slice()))) {
+            assert_eq!(out.solution.status(), Ok(StarStatus::Valid), "frame {k}");
+            solved += 1;
+            if solved > 1 && out.solution.mode() == Ok(StarMode::Lost) {
+                lost += 1;
+            }
+        }
+        q_true = predict(q_true, omega, DT);
+    }
+    assert!(solved + 1 >= frames, "{solved} of {frames} solved");
+    f64::from(lost) / f64::from(solved - 1)
+}
+
+#[test]
+fn a_jittered_turn_keeps_tracking() {
+    let share = jittered_fallback(3e-3, 60);
+    println!(
+        "fell back to lost-in-space on {:.0}% of frames",
+        100.0 * share
+    );
+    assert!(share < 0.1, "{share}");
+}

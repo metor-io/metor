@@ -101,6 +101,7 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::Label>();
         self.register_inspectable::<crate::views::StateImage>();
         self.register_inspectable::<crate::views::StateImageEntry>();
+        self.register_image_view_builder();
         self.register_entity_list::<crate::views::AttitudeIndicator, crate::views::VectorMarker>(
             |a| &a.vectors,
             |a| &mut a.vectors,
@@ -490,6 +491,45 @@ impl InspectorRegistry {
         }));
     }
 
+    /// Image view inspector, also its right-click menu: an image-only source
+    /// picker, overlays, the levels with the histogram beneath and the
+    /// stretch presets, the default facet rows (display), then the view
+    /// commands.
+    fn register_image_view_builder(&mut self) {
+        use crate::views::image_view::ImageView;
+        self.register_inspectable::<ImageView>();
+        self.register_type_builder::<ImageView>(Arc::new(|any_entity, db, cx| {
+            let defaults =
+                crate::inspector::reflect::default_rows_for_any_entity(&any_entity, db, cx);
+            let Ok(view) = any_entity.downcast::<ImageView>() else {
+                return defaults;
+            };
+            let mut rows = vec![
+                image_source_row(view.clone(), db.clone(), cx),
+                image_overlay_row(view.clone(), db.clone()),
+            ];
+            rows.extend(crate::views::image_view::stretch_rows(&view));
+            rows.extend(defaults);
+            let commands: [(
+                &'static str,
+                fn(&mut ImageView, &mut gpui::Context<ImageView>),
+            ); 4] = [
+                ("Fit (F)", ImageView::fit),
+                ("1:1 (1)", ImageView::one_to_one),
+                ("Reset to metadata (R)", ImageView::reset_to_metadata),
+                ("Clear overlays", ImageView::clear_overlays),
+            ];
+            for (label, command) in commands {
+                let view = view.clone();
+                rows.push(Box::new(CommandRow::new(
+                    label,
+                    Arc::new(move |_window, cx| view.update(cx, command)),
+                )));
+            }
+            rows
+        }));
+    }
+
     /// Trace inspector: the default facet rows, a source picker, and an axis
     /// picker. The source picker rebinds the trace in place and asks the
     /// owning plot (via the trace's back-ref) to follow the new channel; the
@@ -722,6 +762,83 @@ impl InspectorRegistry {
             },
         ));
     }
+}
+
+/// The image view's source: a page of image components and a Clear row.
+fn image_source_row(
+    view: Entity<crate::views::image_view::ImageView>,
+    db: Arc<DB>,
+    cx: &gpui::App,
+) -> Box<dyn InspectorRow> {
+    let summary = SharedString::from(view.read(cx).source.text(&db));
+    Box::new(NavRow::new(
+        "Source",
+        summary,
+        Box::new(move |_cx| {
+            let pick = {
+                let (view, db) = (view.clone(), db.clone());
+                move |name: String, cx: &mut gpui::App| {
+                    let binding = crate::data_binding::Binding::from_text(&name, &db, cx);
+                    view.update(cx, |view, cx| {
+                        view.source = binding;
+                        cx.notify();
+                    });
+                }
+            };
+            let mut rows = crate::views::image_view::image_picker_rows(db.clone(), pick);
+            let view = view.clone();
+            rows.push(Box::new(CommandRow::new(
+                "Clear",
+                Arc::new(move |_window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.source = crate::data_binding::Binding::default();
+                        cx.notify();
+                    })
+                }),
+            )));
+            rows
+        }),
+    ))
+}
+
+/// "Add overlay": each centroid record in the db, as detections or truth.
+fn image_overlay_row(
+    view: Entity<crate::views::image_view::ImageView>,
+    db: Arc<DB>,
+) -> Box<dyn InspectorRow> {
+    use crate::views::image_view::{OverlayColor, OverlayConfig, record_roots};
+    Box::new(NavRow::new(
+        "Add overlay",
+        "",
+        Box::new(move |_cx| {
+            let roots = record_roots(&db);
+            if roots.is_empty() {
+                return vec![Box::new(crate::inspector::rows::HeaderRow::new(
+                    "No centroid records (<root>.u, .v, .count)",
+                )) as Box<dyn InspectorRow>];
+            }
+            roots
+                .into_iter()
+                .flat_map(|root| {
+                    [
+                        (OverlayColor::Detected, "detected"),
+                        (OverlayColor::Truth, "truth"),
+                    ]
+                    .map(|(color, label)| {
+                        let config = OverlayConfig::from_root(&root, color);
+                        let view = view.clone();
+                        Box::new(CommandRow::new(
+                            SharedString::from(format!("{root} · {label}")),
+                            Arc::new(move |_window, cx| {
+                                let config = config.clone();
+                                view.update(cx, |view, cx| view.add_overlay(config, cx));
+                            }),
+                        )) as Box<dyn InspectorRow>
+                    })
+                })
+                .collect()
+        }),
+    ))
 }
 
 #[cfg(test)]
