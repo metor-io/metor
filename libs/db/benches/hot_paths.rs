@@ -32,7 +32,7 @@ fn wait_persisted(components: &[Component], ts: i64) {
 /// Ingests a table of [`FIELDS`] values and waits for it to be written to
 /// storage, while `subscribers` live readers tail each component's WAL as
 /// streams to the panel do. Unlike `state`'s ingest benches, which can
-/// outrun the persist tasks, every sample here reaches storage.
+/// outrun persistence, every sample here reaches storage.
 fn ingest_persisted(c: &mut Criterion) {
     let mut group = c.benchmark_group("ingest_persisted");
     for subscribers in [0, 4, 16] {
@@ -88,7 +88,7 @@ fn series(dir: &std::path::Path, samples: i64, nodes: i64) -> TimeSeries {
     series
 }
 
-/// The persist task's append of one sample to storage.
+/// Persistence's append of one sample to storage.
 fn time_series_write(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     let series = TimeSeries::create(dir.path()).unwrap();

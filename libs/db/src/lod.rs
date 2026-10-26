@@ -781,12 +781,21 @@ mod tests {
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
             wal_dropped: Default::default(),
+            queued: Default::default(),
+            persister: None,
         }
     }
 
     fn level_for(dir: &Path, src: &Component, bucket_us: i64) -> (Component, Level) {
         let component_id = ComponentId::new("src.lod");
-        let lod = Component::create(dir, component_id, lod_schema(&src.schema), true).unwrap();
+        let lod = Component::create(
+            dir,
+            component_id,
+            lod_schema(&src.schema),
+            true,
+            crate::background::test_background(),
+        )
+        .unwrap();
         let writer = lod.time_series.writer().unwrap();
         let cursor = src
             .time_series
@@ -960,6 +969,8 @@ mod tests {
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
             wal_dropped: Default::default(),
+            queued: Default::default(),
+            persister: None,
         };
 
         let (lod, mut level) = level_for(dir.path(), &src, 100);
@@ -1011,6 +1022,8 @@ mod tests {
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
             wal_dropped: Default::default(),
+            queued: Default::default(),
+            persister: None,
         };
 
         let (lod, mut level) = level_for(dir.path(), &src, 300);
@@ -1059,6 +1072,8 @@ mod tests {
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
             persistence: Default::default(),
             wal_dropped: Default::default(),
+            queued: Default::default(),
+            persister: None,
         };
         assert_eq!(
             src.time_series

@@ -36,7 +36,7 @@ use crate::{DB, Error, msg_log::MsgLog};
 /// `Load`+`Start` pair both cross) — then park until any log pushes.
 /// Sweep-then-wait makes lost wakes harmless: a push racing the wakeup is
 /// caught by the next sweep, and a push while parked wakes the registered
-/// waiter (the log wakes on `push`, before its persist task runs, which is
+/// waiter (the log wakes on `push`, before the persist thread drains it, which is
 /// also why the WAL and not the persisted nodes is what a live tail reads).
 pub(crate) async fn forward(
     ids: Vec<PacketId>,

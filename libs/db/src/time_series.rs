@@ -537,7 +537,7 @@ impl TimeSeries {
     }
 
     /// Background task that seals nodes as the writer rolls past them.
-    /// Spawn one per component alongside the persist task.
+    /// One runs per component, on the db's seal thread.
     pub async fn lifecycle(self) {
         loop {
             if let Err(err) = self.seal_rolled_nodes() {

@@ -46,13 +46,16 @@ use tracing::{debug, info, trace, warn};
 use vtable_stream::handle_vtable_stream;
 use zerocopy::IntoBytes;
 
+pub use background::{Background, Workers};
 pub use error::Error;
 
+use crate::background::{Pending, Persister};
 use crate::disruptor::Disruptor;
 
 pub mod append_log;
 mod arc_ring;
 mod arrow;
+mod background;
 pub mod disruptor;
 mod error;
 pub mod lod;
@@ -77,6 +80,7 @@ pub struct DB {
     /// change holds it across its file IO and takes the write lock only to
     /// publish the result, so ingest never waits on the filesystem.
     structural: std::sync::Mutex<()>,
+    workers: Workers,
     pub recording_cell: PlayingCell,
 
     // metadata
@@ -88,8 +92,9 @@ pub struct DB {
     pub earliest_timestamp: AtomicCell<Timestamp>,
 }
 
-#[derive(Default)]
 pub struct State {
+    /// The db's threads, which persist and seal what `State` creates.
+    background: Background,
     components: HashMap<ComponentId, Component>,
     component_metadata: HashMap<ComponentId, ComponentMetadata>,
     metadata_generation: u64,
@@ -131,16 +136,18 @@ impl DB {
 
         std::fs::create_dir_all(&path)?;
         let default_stream_time_step = AtomicU64::new(time_step.as_nanos() as u64);
-        let state = State {
-            db_config: DbConfig {
+        let workers = Workers::new()?;
+        let state = State::new(
+            workers.background().clone(),
+            DbConfig {
                 default_stream_time_step: time_step,
                 ..Default::default()
             },
-            ..Default::default()
-        };
+        );
         let db = DB {
             state: RwLock::new(state),
             structural: Default::default(),
+            workers,
             recording_cell: PlayingCell::new(true),
             path,
             vtable_gen: AtomicCell::new(0),
@@ -221,6 +228,7 @@ impl DB {
         let mut start_timestamp = i64::MAX;
 
         info!("Opening database: {}", path.display());
+        let workers = Workers::new()?;
         for elem in std::fs::read_dir(&path)? {
             let Ok(elem) = elem else { continue };
             let path = elem.path();
@@ -243,10 +251,16 @@ impl DB {
             trace!("Opening component file {}", path.display());
 
             // A LoD component's writer belongs to the engine; open it in
-            // drain mode so its `persist` never claims the writer that
+            // drain mode so persisting its WAL never claims the writer that
             // `setup_levels` re-takes after restart.
             let engine_owned = lod::is_lod_name(&metadata.name);
-            let component = Component::open(&path, component_id, schema.clone(), engine_owned)?;
+            let component = Component::open(
+                &path,
+                component_id,
+                schema.clone(),
+                engine_owned,
+                workers.background(),
+            )?;
             if engine_owned {
                 component
                     .time_series
@@ -272,7 +286,7 @@ impl DB {
                     .and_then(|p| p.to_str())
                     .and_then(|p| p.parse().ok())
                     .ok_or(Error::InvalidMsgId)?;
-                let msg_log = MsgLog::open(path)?;
+                let msg_log = MsgLog::open(path, workers.background())?;
                 if let Some(first_timestamp) = msg_log.first_timestamp() {
                     start_timestamp = start_timestamp.min(first_timestamp.0);
                 }
@@ -287,11 +301,10 @@ impl DB {
         info!(db.path = ?path, "opened db");
         let db_state = DbConfig::read(path.join("db_state"))?;
         let state = State {
-            db_config: db_state.clone(),
             components,
             component_metadata,
             msg_logs,
-            ..Default::default()
+            ..State::new(workers.background().clone(), db_state.clone())
         };
         let earliest_timestamp = if start_timestamp == i64::MAX {
             Timestamp::now()
@@ -301,6 +314,7 @@ impl DB {
         Ok(DB {
             state: RwLock::new(state),
             structural: Default::default(),
+            workers,
             path,
             vtable_gen: AtomicCell::new(0),
             metadata_gen: AtomicCell::new(0),
@@ -398,7 +412,13 @@ impl DB {
             return Ok(());
         }
         info!(component.id = ?component_id.0, "inserting");
-        let component = Component::create(&self.path, component_id, schema, false)?;
+        let component = Component::create(
+            &self.path,
+            component_id,
+            schema,
+            false,
+            self.workers.background(),
+        )?;
         if self
             .staged_metadata(structural, staged, component_id)
             .is_none()
@@ -461,6 +481,10 @@ impl DB {
             StaticIngest::Pushed(pushed) => pushed,
             StaticIngest::Dynamic => self.ingest_dynamic(id, buf, received)?,
         };
+        // One wake for the whole table, however many WALs it queued.
+        if pushed.wake {
+            self.workers.background().persister.wake();
+        }
         if pushed.new_series {
             self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
         }
@@ -640,7 +664,7 @@ impl DB {
         if let Some(msg_log) = self.with_state(|s| s.msg_logs.get(&id).cloned()) {
             return Ok(msg_log);
         }
-        let msg_log = MsgLog::create(msg_log_path(&self.path, id))?;
+        let msg_log = MsgLog::create(msg_log_path(&self.path, id), self.workers.background())?;
         self.publish(&structural, |s| s.insert_msg_log(id, msg_log.clone()));
         Ok(msg_log)
     }
@@ -751,6 +775,24 @@ fn msg_log_path(db_path: &Path, id: PacketId) -> PathBuf {
 }
 
 impl State {
+    fn new(background: Background, db_config: DbConfig) -> Self {
+        State {
+            background,
+            components: Default::default(),
+            component_metadata: Default::default(),
+            metadata_generation: Default::default(),
+            msg_logs: Default::default(),
+            command_ids: Default::default(),
+            namespace: Default::default(),
+            vtable_registry: Default::default(),
+            streams: Default::default(),
+            latest_dynamic_tables: Default::default(),
+            dynamic_templates: Default::default(),
+            udp_vtable_streams: Default::default(),
+            db_config,
+        }
+    }
+
     pub fn insert_component(
         &mut self,
         component_id: ComponentId,
@@ -761,7 +803,7 @@ impl State {
     }
 
     /// Like [`Self::insert_component`], but for the LoD engine: the created
-    /// component's writer belongs to the engine, so its `persist` runs in
+    /// component's writer belongs to the engine, so its WAL persists in
     /// drain mode rather than racing to claim the writer.
     pub fn insert_engine_component(
         &mut self,
@@ -789,7 +831,13 @@ impl State {
             return Ok(());
         }
         info!(component.id = ?component_id.0, "inserting");
-        let component = Component::create(db_path, component_id, schema, engine_owned)?;
+        let component = Component::create(
+            db_path,
+            component_id,
+            schema,
+            engine_owned,
+            &self.background,
+        )?;
         if !self.component_metadata.contains_key(&component_id) {
             self.set_component_metadata(default_metadata(component_id), db_path)?;
         }
@@ -941,7 +989,7 @@ impl State {
         Ok(match self.msg_logs.entry(id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let msg_log = MsgLog::create(msg_log_path(db_path, id))?;
+                let msg_log = MsgLog::create(msg_log_path(db_path, id), &self.background)?;
                 // A new log is a metadata change: it is how a `SyncMsgs`
                 // sweep learns there is another log to tail.
                 self.metadata_generation = self.metadata_generation.wrapping_add(1);
@@ -1125,17 +1173,20 @@ enum StaticIngest {
     Dynamic,
 }
 
-/// The newest timestamp pushed, and whether a push began an empty series.
+/// The newest timestamp pushed, whether a push began an empty series, and
+/// whether the persist thread needs a wake for the pushes.
 #[derive(Default)]
 struct Pushed {
     max_ts: Option<Timestamp>,
     new_series: bool,
+    wake: bool,
 }
 
 impl Pushed {
     fn merge(&mut self, other: Pushed) {
         self.max_ts = self.max_ts.max(other.max_ts);
         self.new_series |= other.new_series;
+        self.wake |= other.wake;
     }
 }
 
@@ -1148,12 +1199,16 @@ fn push_field(
 ) -> Result<Pushed, Error> {
     // PANIC Safety: the callers walk a table, so every field realizes a view.
     let view = rf.view.as_ref().expect("table provided to for_each_field");
-    let ts = rf.timestamp.unwrap_or(received);
+    push_value(component, rf.timestamp.unwrap_or(received), view.as_bytes())
+}
+
+fn push_value(component: &Component, ts: Timestamp, value: &[u8]) -> Result<Pushed, Error> {
     let new_series = component.time_series.is_empty();
-    component.push_buf(ts, view.as_bytes())?;
+    let wake = component.push_unwoken(ts, value)?;
     Ok(Pushed {
         max_ts: Some(ts),
         new_series,
+        wake,
     })
 }
 
@@ -1183,6 +1238,9 @@ pub struct Component {
     persistence: Arc<std::sync::Mutex<Option<ComponentPersistence>>>,
     /// Samples dropped because the WAL was full, to rate-limit the warning.
     wal_dropped: Arc<AtomicU64>,
+    /// Whether the WAL is queued for the persist thread.
+    pub(crate) queued: Arc<AtomicBool>,
+    persister: Option<Persister>,
 }
 
 struct ComponentPersistence {
@@ -1211,17 +1269,20 @@ impl Component {
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
             persistence: Default::default(),
             wal_dropped: Default::default(),
+            queued: Default::default(),
+            persister: None,
         }
     }
 
     /// `engine_owned` marks a component whose writer belongs to the LoD
-    /// engine (it emits buckets directly); its `persist` runs in drain mode
+    /// engine (it emits buckets directly); its WAL persists in drain mode
     /// so it never races [`lod`]'s `setup_levels` for the writer claim.
     pub fn create(
         db_path: &Path,
         component_id: ComponentId,
         schema: ComponentSchema,
         engine_owned: bool,
+        background: &Background,
     ) -> Result<Self, Error> {
         let component_path = db_path.join(component_id.to_string());
         std::fs::create_dir_all(&component_path)?;
@@ -1233,18 +1294,15 @@ impl Component {
         if let Some(age) = max_node_age_override() {
             time_series.set_max_node_age(age);
         }
-        let this = Component {
-            wal: Disruptor::new(wal_capacity(schema.size(), WAL_CREATE_ENTRIES)),
+        Ok(Self::with_background(
+            Disruptor::new(wal_capacity(schema.size(), WAL_CREATE_ENTRIES)),
             component_id,
             time_series,
             schema,
-            last_timestamp: Arc::new(AtomicCell::new(Timestamp(i64::MIN))),
-            persistence: Default::default(),
-            wal_dropped: Default::default(),
-        };
-        stellarator::spawn(this.clone().persist(engine_owned));
-        stellarator::spawn(this.time_series.clone().lifecycle());
-        Ok(this)
+            Timestamp(i64::MIN),
+            engine_owned,
+            background,
+        ))
     }
 
     pub fn open(
@@ -1252,6 +1310,7 @@ impl Component {
         component_id: ComponentId,
         schema: ComponentSchema,
         engine_owned: bool,
+        background: &Background,
     ) -> Result<Self, Error> {
         let time_series = TimeSeries::open(path)?;
         if let Some(age) = max_node_age_override() {
@@ -1262,40 +1321,46 @@ impl Component {
             .latest()
             .map(|t| t.timestamp())
             .unwrap_or(Timestamp(i64::MIN));
-        let this = Component {
-            wal: Disruptor::new(wal_capacity(schema.size(), WAL_OPEN_ENTRIES)),
+        Ok(Self::with_background(
+            Disruptor::new(wal_capacity(schema.size(), WAL_OPEN_ENTRIES)),
+            component_id,
+            time_series,
+            schema,
+            last_timestamp,
+            engine_owned,
+            background,
+        ))
+    }
+
+    /// A component persisted, and its rolled nodes sealed, by the db's
+    /// [`Background`] threads. Its WAL reader and writer stay with the
+    /// component, so [`DB::flush`] can drain it however those threads fare.
+    fn with_background(
+        wal: Disruptor,
+        component_id: ComponentId,
+        time_series: TimeSeries,
+        schema: ComponentSchema,
+        last_timestamp: Timestamp,
+        engine_owned: bool,
+        background: &Background,
+    ) -> Self {
+        let persistence = ComponentPersistence {
+            reader: wal.reader(),
+            writer: None,
+            engine_owned,
+        };
+        let lifecycle = time_series.clone();
+        background.sealer.spawn(move || lifecycle.lifecycle());
+        Component {
+            wal,
             component_id,
             time_series,
             schema,
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
-            persistence: Default::default(),
+            persistence: Arc::new(std::sync::Mutex::new(Some(persistence))),
             wal_dropped: Default::default(),
-        };
-        stellarator::spawn(this.persist(engine_owned));
-        stellarator::spawn(this.time_series.clone().lifecycle());
-        Ok(this)
-    }
-
-    pub fn persist(&self, engine_owned: bool) -> impl Future<Output = ()> + 'static {
-        self.persistence
-            .lock()
-            .unwrap()
-            .get_or_insert_with(|| ComponentPersistence {
-                reader: self.wal.reader(),
-                writer: None,
-                engine_owned,
-            });
-        // This reader only wakes the task. The durable reader and writer stay
-        // with the component when its executor is stopped, for DB::flush.
-        let mut notify = self.wal.reader();
-        let component = self.clone();
-        async move {
-            loop {
-                if let Err(err) = component.flush_pending() {
-                    tracing::error!(?err, "failed to persist wal samples");
-                }
-                drop(notify.next().await);
-            }
+            queued: Default::default(),
+            persister: Some(background.persister.clone()),
         }
     }
 
@@ -1350,18 +1415,32 @@ impl Component {
     }
 
     pub fn push_buf(&self, timestamp: Timestamp, value_buf: &[u8]) -> Result<(), Error> {
+        if self.push_unwoken(timestamp, value_buf)?
+            && let Some(persister) = &self.persister
+        {
+            persister.wake();
+        }
+        Ok(())
+    }
+
+    /// Pushes a sample and queues the WAL for persisting, but leaves the
+    /// persist thread to a [`Persister::wake`] once the caller's pushes are
+    /// done. Returns whether that wake is needed.
+    fn push_unwoken(&self, timestamp: Timestamp, value_buf: &[u8]) -> Result<bool, Error> {
         if timestamp < self.last_timestamp.latest() {
             return Err(Error::TimeTravel);
         }
         let Ok(mut grant) = self.wal.try_grant(value_buf.len() + size_of::<Timestamp>()) else {
             self.warn_wal_drop(timestamp);
-            return Ok(());
+            return Ok(false);
         };
         grant[..size_of::<Timestamp>()].copy_from_slice(timestamp.as_bytes());
         grant[size_of::<Timestamp>()..].copy_from_slice(value_buf);
         drop(grant);
         self.last_timestamp.update_max(timestamp);
-        Ok(())
+        Ok(self.persister.as_ref().is_some_and(|persister| {
+            persister.queue(&self.queued, || Pending::Component(self.clone()))
+        }))
     }
 }
 
@@ -3731,6 +3810,53 @@ mod static_ingest_tests {
         let (_dir, db) = store();
         assert!(db.ingest_table(ID, &5i64.to_le_bytes()).is_err());
     }
+
+    /// Spins until `name` has persisted its sample at `ts`.
+    fn wait_persisted(db: &DB, name: &str, ts: i64) {
+        let component = db
+            .with_state(|state| state.get_component(ComponentId::new(name)).cloned())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while component
+            .time_series
+            .latest()
+            .is_none_or(|latest| latest.timestamp().0 < ts)
+        {
+            assert!(Instant::now() < deadline, "{name} never persisted {ts}");
+            std::thread::yield_now();
+        }
+    }
+
+    /// A component's persistence outlives the connection thread that
+    /// announced it, so a producer that reconnects still lands its samples.
+    #[test]
+    fn persists_after_its_announcing_thread_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(dir.path().to_path_buf()).unwrap());
+        let announcer = db.clone();
+        std::thread::spawn(move || {
+            stellarator::run(|| async move {
+                announcer
+                    .insert_vtable(VTableMsg {
+                        id: ID,
+                        vtable: two_fields(),
+                    })
+                    .unwrap();
+            })
+        })
+        .join()
+        .unwrap();
+        // Many WALs' worth, waited out in batches a WAL holds, so every
+        // sample lands only if the WALs keep draining.
+        for ts in 1..=4096 {
+            db.ingest_table(ID, &sample(ts, 1.5, 2.5)).unwrap();
+            if ts % 256 == 0 {
+                for name in ["a", "b"] {
+                    wait_persisted(&db, name, ts);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3821,7 +3947,14 @@ mod wal_tests {
     async fn large_component_persists_every_sample() {
         let dir = tempfile::tempdir().unwrap();
         let id = ComponentId::new("image");
-        let component = Component::create(dir.path(), id, image_schema(), false).unwrap();
+        let component = Component::create(
+            dir.path(),
+            id,
+            image_schema(),
+            false,
+            crate::background::test_background(),
+        )
+        .unwrap();
         assert!(component.wal.capacity() <= WAL_BUDGET);
         let mut buf = vec![0u8; IMAGE_SIZE];
         for ts in 0..100 {
