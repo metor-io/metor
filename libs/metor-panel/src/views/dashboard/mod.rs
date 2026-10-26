@@ -457,7 +457,7 @@ pub fn widget_rows(
             }
         }),
     )));
-    let z_order =
+    let widget_command =
         |label: &'static str,
          apply: fn(&mut DashboardPanel, WidgetId, &mut Context<DashboardPanel>)| {
             let dashboard = dashboard.clone();
@@ -468,13 +468,17 @@ pub fn widget_rows(
                 }),
             )) as Box<dyn InspectorRow>
         };
-    rows.push(z_order("Bring to Front", DashboardPanel::bring_to_front));
-    rows.push(z_order("Send to Back", DashboardPanel::send_to_back));
+    rows.push(widget_command(
+        "Bring to Front",
+        DashboardPanel::bring_to_front,
+    ));
+    rows.push(widget_command("Send to Back", DashboardPanel::send_to_back));
+    rows.push(widget_command("Delete", DashboardPanel::remove_widget));
     Some(rows)
 }
 
 /// Inspector rows that operate on the dashboard itself: add/remove widgets,
-/// toggle edit mode, zoom, rename.
+/// edit mode, zoom, rename.
 pub fn dashboard_rows(
     dashboard: Entity<DashboardPanel>,
     db: Arc<DB>,
@@ -492,20 +496,17 @@ pub fn dashboard_rows(
         },
     )));
 
-    let editing = dashboard.read(cx).editing;
-    let edit_label: SharedString = if editing {
-        "Exit Edit Mode".into()
-    } else {
-        "Enter Edit Mode".into()
-    };
-    rows.push(Box::new(CommandRow::new(edit_label, {
-        let dashboard = dashboard.clone();
-        Arc::new(move |_window, cx| {
-            dashboard.update(cx, |this, cx| {
-                this.set_editing(!this.editing, cx);
-            });
-        })
-    })));
+    rows.push(Box::new(BoolRow::dynamic(
+        "Edit Mode",
+        Arc::new({
+            let dashboard = dashboard.clone();
+            move |cx| dashboard.read(cx).editing
+        }),
+        Arc::new({
+            let dashboard = dashboard.clone();
+            move |on, _window, cx| dashboard.update(cx, |this, cx| this.set_editing(on, cx))
+        }),
+    )));
 
     let widgets = &dashboard.read(cx).widgets;
     if !widgets.is_empty() {
@@ -1157,6 +1158,32 @@ mod tests {
         click(250.0, 50.0, cx);
         dashboard.update(cx, |d, cx| d.set_editing(false, cx));
         assert_eq!(selected(cx), None, "leaving edit mode clears it");
+    }
+
+    #[gpui::test]
+    fn a_widget_deletes_itself_and_edit_mode_is_a_switch(cx: &mut gpui::TestAppContext) {
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        cx.update(|window, cx| {
+            let mut rows = widget_rows(&dashboard, WidgetId(1), cx).unwrap();
+            let row = rows.iter_mut().find(|r| r.label() == "Delete").unwrap();
+            row.activate(window, cx);
+        });
+        let ids: Vec<u64> =
+            dashboard.read_with(cx, |d, _| d.widgets.iter().map(|w| w.id.0).collect());
+        assert_eq!(ids, [2]);
+
+        cx.update(|window, cx| {
+            let db = dashboard.read(cx).db.clone();
+            let mut rows = dashboard_rows(dashboard.clone(), db, cx);
+            let row = rows.iter_mut().find(|r| r.label() == "Edit Mode").unwrap();
+            row.activate(window, cx);
+            assert!(dashboard.read(cx).editing);
+            row.activate(window, cx);
+            assert!(
+                !dashboard.read(cx).editing,
+                "the same row turns it back off"
+            );
+        });
     }
 
     #[gpui::test]
