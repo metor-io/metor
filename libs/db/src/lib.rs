@@ -73,6 +73,10 @@ pub struct DB {
     /// Invalidates cached display metadata independently of live sample arrival.
     pub metadata_gen: AtomicCell<u64>,
     state: RwLock<State>,
+    /// Serializes every change to `state`, taken before the state lock. A
+    /// change holds it across its file IO and takes the write lock only to
+    /// publish the result, so ingest never waits on the filesystem.
+    structural: std::sync::Mutex<()>,
     pub recording_cell: PlayingCell,
 
     // metadata
@@ -136,6 +140,7 @@ impl DB {
         };
         let db = DB {
             state: RwLock::new(state),
+            structural: Default::default(),
             recording_cell: PlayingCell::new(true),
             path,
             vtable_gen: AtomicCell::new(0),
@@ -153,7 +158,23 @@ impl DB {
         f(&state)
     }
 
+    /// Runs `f` under the write lock. Any file IO `f` does stalls ingest, so
+    /// the db's own create paths stage their IO and [`publish`](Self::publish)
+    /// instead.
     pub fn with_state_mut<O, F: FnOnce(&mut State) -> O>(&self, f: F) -> O {
+        let structural = self.structural();
+        self.publish(&structural, f)
+    }
+
+    fn structural(&self) -> Structural<'_> {
+        self.structural
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Applies an in-memory change under the write lock. Holding `structural`
+    /// keeps what the caller read before its IO current until it publishes.
+    fn publish<O>(&self, _structural: &Structural<'_>, f: impl FnOnce(&mut State) -> O) -> O {
         let mut state = self.state.write().unwrap();
         let generation = state.metadata_generation;
         let result = f(&mut state);
@@ -279,6 +300,7 @@ impl DB {
         };
         Ok(DB {
             state: RwLock::new(state),
+            structural: Default::default(),
             path,
             vtable_gen: AtomicCell::new(0),
             metadata_gen: AtomicCell::new(0),
@@ -296,59 +318,131 @@ impl DB {
     /// a registered id is refused, so one link's records can never be
     /// decoded through another's schema.
     pub fn insert_vtable(&self, vtable: VTableMsg) -> Result<(), Error> {
-        self.with_state_mut(|state| {
-            if let Some(registered) = state.vtable_registry.map.get(&vtable.id) {
-                return if postcard::to_allocvec(registered)?
-                    == postcard::to_allocvec(&vtable.vtable)?
-                {
-                    debug!(id = ?vtable.id, "vtable already registered");
-                    Ok(())
-                } else {
-                    Err(Error::VTableConflict(vtable.id))
-                };
+        let structural = self.structural();
+        if let Some(registered) =
+            self.with_state(|state| state.vtable_registry.map.get(&vtable.id).cloned())
+        {
+            return if postcard::to_allocvec(&registered)? == postcard::to_allocvec(&vtable.vtable)?
+            {
+                debug!(id = ?vtable.id, "vtable already registered");
+                Ok(())
+            } else {
+                Err(Error::VTableConflict(vtable.id))
+            };
+        }
+        info!(id = ?vtable.id, "inserting vtable");
+        // For static fields this registers the concrete component. For dynamic
+        // frames (`List`/`Map`), `realize_fields(None)` yields each member *template*
+        // (e.g. `processes.pid`) so its ty/shape is registered up front; the concrete
+        // keyed/indexed components (`processes.0.pid`) are created lazily on first
+        // sample by [`DB::ingest_table`].
+        let mut staged = Staged::default();
+        let mut fields = 0;
+        for res in vtable.vtable.realize_fields(None) {
+            let RealizedField {
+                component_id,
+                shape,
+                ty,
+                dynamic,
+                ..
+            } = res?;
+            let component_schema = ComponentSchema::new(ty, shape);
+            self.stage_component(&structural, &mut staged, component_id, component_schema)?;
+            if dynamic {
+                // A member template never receives samples (the concrete keyed
+                // components do), so hide it from listings / live streams.
+                staged.templates.push(component_id);
+                let metadata = self
+                    .staged_metadata(&structural, &staged, component_id)
+                    .unwrap_or_else(|| default_metadata(component_id));
+                self.stage_metadata(&structural, &mut staged, metadata)?;
             }
-            info!(id = ?vtable.id, "inserting vtable");
-            // For static fields this registers the concrete component. For dynamic
-            // frames (`List`/`Map`), `realize_fields(None)` yields each member *template*
-            // (e.g. `processes.pid`) so its ty/shape is registered up front; the concrete
-            // keyed/indexed components (`processes.0.pid`) are created lazily on first
-            // sample by [`DB::ingest_table`].
-            for res in vtable.vtable.realize_fields(None) {
-                let RealizedField {
-                    component_id,
-                    shape,
-                    ty,
-                    dynamic,
-                    ..
-                } = res?;
-                let component_schema = ComponentSchema::new(ty, shape);
-                state.insert_component(component_id, component_schema, &self.path)?;
-                if dynamic {
-                    // A member template never receives samples (the concrete keyed
-                    // components do), so hide it from listings / live streams.
-                    state.dynamic_templates.insert(component_id);
-                    let metadata = state
-                        .component_metadata
-                        .get(&component_id)
-                        .cloned()
-                        .unwrap_or_else(|| ComponentMetadata {
-                            component_id,
-                            name: component_id.to_string(),
-                            metadata: Default::default(),
-                        });
-                    state.set_component_metadata(metadata, &self.path)?;
-                }
-                self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
-            }
+            fields += 1;
+        }
+        self.publish(&structural, |state| {
+            staged.publish(state);
             if vtable.vtable.is_dynamic() {
                 state
                     .latest_dynamic_tables
                     .insert(vtable.id, Default::default());
             }
             state.vtable_registry.map.insert(vtable.id, vtable.vtable);
-            Ok::<_, Error>(())
-        })?;
+        });
+        self.vtable_gen.fetch_add(fields, atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Creates a component's files for [`publish`](Self::publish), with a
+    /// numeric name when it has no metadata yet. An existing component is
+    /// left be, unless its schema differs.
+    fn stage_component(
+        &self,
+        structural: &Structural<'_>,
+        staged: &mut Staged,
+        component_id: ComponentId,
+        schema: ComponentSchema,
+    ) -> Result<(), Error> {
+        let existing = staged
+            .components
+            .iter()
+            .find(|c| c.component_id == component_id)
+            .map(|c| c.schema.clone())
+            .or_else(|| {
+                self.with_state(|s| s.get_component(component_id).map(|c| c.schema.clone()))
+            });
+        if let Some(existing) = existing {
+            if existing != schema {
+                warn!(?existing, new_component.schema = ?schema, ?component_id, "schema mismatch");
+                return Err(Error::SchemaMismatch);
+            }
+            return Ok(());
+        }
+        info!(component.id = ?component_id.0, "inserting");
+        let component = Component::create(&self.path, component_id, schema, false)?;
+        if self
+            .staged_metadata(structural, staged, component_id)
+            .is_none()
+        {
+            self.stage_metadata(structural, staged, default_metadata(component_id))?;
+        }
+        staged.components.push(component);
+        Ok(())
+    }
+
+    /// Writes a component's metadata file for [`publish`](Self::publish),
+    /// hidden if it names a dynamic template.
+    fn stage_metadata(
+        &self,
+        _structural: &Structural<'_>,
+        staged: &mut Staged,
+        metadata: ComponentMetadata,
+    ) -> Result<(), Error> {
+        let id = metadata.component_id;
+        let hidden = staged.templates.contains(&id)
+            || self.with_state(|s| s.dynamic_templates.contains(&id));
+        let metadata = match hidden {
+            true => metadata.with_hidden(),
+            false => metadata,
+        };
+        write_component_metadata(&metadata, &self.path)?;
+        staged.metadata.push(metadata);
+        Ok(())
+    }
+
+    /// A component's metadata as of `staged`'s publish.
+    fn staged_metadata(
+        &self,
+        _structural: &Structural<'_>,
+        staged: &Staged,
+        component_id: ComponentId,
+    ) -> Option<ComponentMetadata> {
+        staged
+            .metadata
+            .iter()
+            .rev()
+            .find(|m| m.component_id == component_id)
+            .cloned()
+            .or_else(|| self.with_state(|s| s.get_component_metadata(component_id).cloned()))
     }
 
     /// Sinks a table `buf` described by the registered vtable `id`, stamping a
@@ -392,19 +486,13 @@ impl DB {
             if vtable.is_dynamic() {
                 return Ok(StaticIngest::Dynamic);
             }
-            let mut pushed = Pushed::default();
-            vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
-                let component = state
-                    .get_component(rf.component_id)
-                    .ok_or(Error::ComponentNotFound(rf.component_id))?;
-                pushed.merge(push_field(component, &rf, received)?);
-                Ok(())
-            })?;
-            Ok(StaticIngest::Pushed(pushed))
+            state
+                .push_fields(vtable, buf, received)
+                .map(StaticIngest::Pushed)
         })
     }
 
-    /// Sinks a dynamic table, taking the write lock only when a member is new.
+    /// Sinks a dynamic table, realizing its new members first.
     fn ingest_dynamic(
         &self,
         id: PacketId,
@@ -413,12 +501,72 @@ impl DB {
     ) -> Result<Pushed, Error> {
         let pushed = match self.with_state(|state| state.push_known_fields(id, buf, received))? {
             Some(pushed) => pushed,
-            None => {
-                self.with_state_mut(|state| state.realize_and_push(id, buf, received, &self.path))?
-            }
+            None => self.realize_and_push(id, buf, received)?,
         };
         self.with_state(|state| state.cache_latest_table(id, buf));
         Ok(pushed)
+    }
+
+    /// Creates the members of a dynamic table that are new, each named on its
+    /// first sample, then pushes the table.
+    fn realize_and_push(
+        &self,
+        id: PacketId,
+        buf: &[u8],
+        received: Timestamp,
+    ) -> Result<Pushed, Error> {
+        let structural = self.structural();
+        let vtable = self.with_state(|state| state.dynamic_vtable(id).cloned())?;
+        let mut staged = Staged::default();
+        vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
+            self.stage_member(&structural, &mut staged, &rf)
+        })?;
+        self.publish(&structural, |state| staged.publish(state));
+        self.with_state(|state| state.push_fields(&vtable, buf, received))
+    }
+
+    /// Stages the component a dynamic table's field lands in, unless it
+    /// exists. A static field's component must already exist.
+    fn stage_member(
+        &self,
+        structural: &Structural<'_>,
+        staged: &mut Staged,
+        rf: &RealizedField,
+    ) -> Result<(), Error> {
+        let staged_component = staged
+            .components
+            .iter()
+            .any(|c| c.component_id == rf.component_id);
+        if staged_component
+            || self.with_state(|state| state.components.contains_key(&rf.component_id))
+        {
+            return Ok(());
+        }
+        if !rf.dynamic {
+            return Err(Error::ComponentNotFound(rf.component_id));
+        }
+        // Name the keyed member by its dotted path before `stage_component`
+        // falls back to the numeric id, so the panel shows
+        // `alarm_defs.limits.<key>`. A member that reappears already has real
+        // metadata, so leave it be.
+        if self
+            .staged_metadata(structural, staged, rf.component_id)
+            .is_none()
+            && let Some(name) = dynamic_member_name(rf)
+        {
+            let metadata = ComponentMetadata {
+                component_id: rf.component_id,
+                name,
+                metadata: self.with_state(|state| state.template_metadata(rf)),
+            };
+            self.stage_metadata(structural, staged, metadata)?;
+        }
+        self.stage_component(
+            structural,
+            staged,
+            rf.component_id,
+            ComponentSchema::new(rf.ty, rf.shape),
+        )
     }
 
     /// Builds one streamed `Table` packet for a dynamic vtable subscription from
@@ -440,7 +588,11 @@ impl DB {
 
     /// Sets a component's display metadata and persists it.
     pub fn set_component_metadata(&self, metadata: ComponentMetadata) -> Result<(), Error> {
-        self.with_state_mut(|s| s.set_component_metadata(metadata, &self.path))
+        let structural = self.structural();
+        let mut staged = Staged::default();
+        self.stage_metadata(&structural, &mut staged, metadata)?;
+        self.publish(&structural, |s| staged.publish(s));
+        Ok(())
     }
 
     /// Set what this db advertises in its [`DbInfoResp`]: the namespace its
@@ -473,14 +625,24 @@ impl DB {
             }
         })?;
         if !exists {
-            self.with_state_mut(move |s| {
-                let msg_log = s.get_or_insert_msg_log(id, &self.path)?;
-                msg_log.push(timestamp, msg)?;
-                Ok::<_, Error>(())
-            })?;
+            self.get_or_insert_msg_log(id)?.push(timestamp, msg)?;
         }
         self.last_updated.update_max(timestamp);
         Ok(())
+    }
+
+    /// The log for `id`, created on first use.
+    pub fn get_or_insert_msg_log(&self, id: PacketId) -> Result<MsgLog, Error> {
+        if let Some(msg_log) = self.with_state(|s| s.msg_logs.get(&id).cloned()) {
+            return Ok(msg_log);
+        }
+        let structural = self.structural();
+        if let Some(msg_log) = self.with_state(|s| s.msg_logs.get(&id).cloned()) {
+            return Ok(msg_log);
+        }
+        let msg_log = MsgLog::create(msg_log_path(&self.path, id))?;
+        self.publish(&structural, |s| s.insert_msg_log(id, msg_log.clone()));
+        Ok(msg_log)
     }
 
     pub fn get_or_insert_fixed_rate_state(
@@ -488,6 +650,7 @@ impl DB {
         stream_id: StreamId,
         behavior: FixedRateBehavior,
     ) -> Arc<FixedRateStreamState> {
+        let _structural = self.structural();
         let mut state = self.state.write().expect("poisoned lock");
         state
             .streams
@@ -541,6 +704,52 @@ fn push_element(name: &mut String, container: &str, key: ElementKey) {
     }
 }
 
+type Structural<'a> = std::sync::MutexGuard<'a, ()>;
+
+/// Changes whose files are written, published to [`State`] in one step so a
+/// reader never sees a component before its metadata.
+#[derive(Default)]
+struct Staged {
+    components: Vec<Component>,
+    metadata: Vec<ComponentMetadata>,
+    templates: Vec<ComponentId>,
+}
+
+impl Staged {
+    fn publish(self, state: &mut State) {
+        state.dynamic_templates.extend(self.templates);
+        for metadata in self.metadata {
+            state.cache_component_metadata(metadata);
+        }
+        for component in self.components {
+            state.components.insert(component.component_id, component);
+        }
+    }
+}
+
+/// The metadata of a component nothing has named yet.
+fn default_metadata(component_id: ComponentId) -> ComponentMetadata {
+    ComponentMetadata {
+        component_id,
+        name: component_id.to_string(),
+        metadata: Default::default(),
+    }
+}
+
+fn write_component_metadata(metadata: &ComponentMetadata, db_path: &Path) -> Result<(), Error> {
+    let component_metadata_path = db_path.join(metadata.component_id.to_string());
+    std::fs::create_dir_all(&component_metadata_path)?;
+    let component_metadata_path = component_metadata_path.join("metadata");
+    info!(component.name= ?metadata.name, component.id = ?metadata.component_id.0, "setting component metadata");
+    metadata.write(component_metadata_path)
+}
+
+fn msg_log_path(db_path: &Path, id: PacketId) -> PathBuf {
+    db_path
+        .join("msgs")
+        .join(u16::from_le_bytes(id).to_string())
+}
+
 impl State {
     pub fn insert_component(
         &mut self,
@@ -580,14 +789,9 @@ impl State {
             return Ok(());
         }
         info!(component.id = ?component_id.0, "inserting");
-        let component_metadata = ComponentMetadata {
-            component_id,
-            name: component_id.to_string(),
-            metadata: Default::default(),
-        };
         let component = Component::create(db_path, component_id, schema, engine_owned)?;
         if !self.component_metadata.contains_key(&component_id) {
-            self.set_component_metadata(component_metadata, db_path)?;
+            self.set_component_metadata(default_metadata(component_id), db_path)?;
         }
         self.components.insert(component_id, component);
         Ok(())
@@ -595,43 +799,6 @@ impl State {
 
     pub fn get_component_metadata(&self, component_id: ComponentId) -> Option<&ComponentMetadata> {
         self.component_metadata.get(&component_id)
-    }
-
-    /// The component a dynamic table's field lands in, created and named on
-    /// its first sample. A static field's component must already exist.
-    fn realize_component(
-        &mut self,
-        rf: &RealizedField,
-        db_path: &Path,
-    ) -> Result<&Component, Error> {
-        if !self.components.contains_key(&rf.component_id) {
-            if !rf.dynamic {
-                return Err(Error::ComponentNotFound(rf.component_id));
-            }
-            // Name the keyed member by its dotted path before
-            // `insert_component` falls back to the numeric id, so the panel
-            // shows `alarm_defs.limits.<key>`. A member that reappears already
-            // has real metadata, so leave it be.
-            if !self.component_metadata.contains_key(&rf.component_id)
-                && let Some(name) = dynamic_member_name(rf)
-            {
-                self.set_component_metadata(
-                    ComponentMetadata {
-                        component_id: rf.component_id,
-                        name,
-                        metadata: self.template_metadata(rf),
-                    },
-                    db_path,
-                )?;
-            }
-            self.insert_component(
-                rf.component_id,
-                ComponentSchema::new(rf.ty, rf.shape),
-                db_path,
-            )?;
-        }
-        self.get_component(rf.component_id)
-            .ok_or(Error::ComponentNotFound(rf.component_id))
     }
 
     /// The metadata a keyed member inherits from its template, unhidden.
@@ -675,30 +842,21 @@ impl State {
             Err(Error::ComponentNotFound(_)) => return Ok(None),
             known => known?,
         }
+        self.push_fields(vtable, buf, received).map(Some)
+    }
+
+    /// Pushes every field of a table whose components all exist.
+    fn push_fields(
+        &self,
+        vtable: &VTable,
+        buf: &[u8],
+        received: Timestamp,
+    ) -> Result<Pushed, Error> {
         let mut pushed = Pushed::default();
         vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
             let component = self
                 .get_component(rf.component_id)
                 .ok_or(Error::ComponentNotFound(rf.component_id))?;
-            pushed.merge(push_field(component, &rf, received)?);
-            Ok(())
-        })?;
-        Ok(Some(pushed))
-    }
-
-    /// Pushes a dynamic table, realizing each member on its first sample.
-    fn realize_and_push(
-        &mut self,
-        id: PacketId,
-        buf: &[u8],
-        received: Timestamp,
-        db_path: &Path,
-    ) -> Result<Pushed, Error> {
-        // Cloned out so realizing a member can take `&mut self`.
-        let vtable = self.dynamic_vtable(id)?.clone();
-        let mut pushed = Pushed::default();
-        vtable.for_each_field::<Error>(Some(buf), &mut |rf| {
-            let component = self.realize_component(&rf, db_path)?;
             pushed.merge(push_field(component, &rf, received)?);
             Ok(())
         })?;
@@ -751,15 +909,22 @@ impl State {
             true => metadata.with_hidden(),
             false => metadata,
         };
-        let component_metadata_path = db_path.join(metadata.component_id.to_string());
-        std::fs::create_dir_all(&component_metadata_path)?;
-        let component_metadata_path = component_metadata_path.join("metadata");
-        info!(component.name= ?metadata.name, component.id = ?metadata.component_id.0, "setting component metadata");
-        metadata.write(component_metadata_path)?;
+        write_component_metadata(&metadata, db_path)?;
+        self.cache_component_metadata(metadata);
+        Ok(())
+    }
+
+    fn cache_component_metadata(&mut self, metadata: ComponentMetadata) {
         self.component_metadata
             .insert(metadata.component_id, metadata);
         self.metadata_generation = self.metadata_generation.wrapping_add(1);
-        Ok(())
+    }
+
+    fn insert_msg_log(&mut self, id: PacketId, msg_log: MsgLog) {
+        self.msg_logs.insert(id, msg_log);
+        // A new log is a metadata change: it is how a `SyncMsgs`
+        // sweep learns there is another log to tail.
+        self.metadata_generation = self.metadata_generation.wrapping_add(1);
     }
 
     /// Every recorded message log's id with its announced metadata, for
@@ -776,11 +941,7 @@ impl State {
         Ok(match self.msg_logs.entry(id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let msg_log = MsgLog::create(
-                    db_path
-                        .join("msgs")
-                        .join(u16::from_le_bytes(id).to_string()),
-                )?;
+                let msg_log = MsgLog::create(msg_log_path(db_path, id))?;
                 // A new log is a metadata change: it is how a `SyncMsgs`
                 // sweep learns there is another log to tail.
                 self.metadata_generation = self.metadata_generation.wrapping_add(1);
