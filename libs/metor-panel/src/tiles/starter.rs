@@ -6,6 +6,8 @@
 //! Time Series needs its traces picked first, which takes the database and a
 //! window, so the pane asks the app to open that wizard
 //! ([`PaneEvent::NewTimeSeries`]).
+use std::rc::Rc;
+
 use gpui::{AnyElement, App, ClickEvent, Context, SharedString, Window, div, prelude::*, px};
 
 use super::pane::{Pane, PaneEvent};
@@ -19,15 +21,17 @@ pub(crate) struct StarterCard {
     pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
 }
 
-/// The line under the cards: where everything else lives, with the
-/// palette's shortcut beside it, and clickable to go there.
+/// The line under the cards, "Add more {what} from the command palette",
+/// with the palette's shortcut after it. Only "command palette" and the
+/// shortcut are links, both to `on_click`.
 pub(crate) struct StarterHint {
-    pub text: &'static str,
-    pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+    pub what: &'static str,
+    pub on_click: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
 }
 
 /// `cards` in a wrapping row centred in the space given, over `hint`. Each
-/// card's debug selector is `{id}-{index}`, and the hint's `{id}-hint`.
+/// card's debug selector is `{id}-{index}`, the hint's line `{id}-hint-line`
+/// and its link `{id}-hint`.
 pub(crate) fn starter_cards(
     id: &'static str,
     cards: Vec<StarterCard>,
@@ -80,23 +84,44 @@ pub(crate) fn starter_cards(
         .child(row)
         .child(
             div()
-                .id((id, usize::MAX))
-                .debug_selector(move || format!("{id}-hint"))
+                .debug_selector(move || format!("{id}-hint-line"))
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(6.0))
-                .px(px(6.0))
-                .py(px(2.0))
-                .rounded(px(4.0))
-                .cursor_pointer()
                 .text_size(px(11.0))
                 .text_color(theme.text_tertiary)
-                .hover(|s| s.text_color(theme.text_primary))
-                .on_click(hint.on_click)
-                .child(SharedString::new_static(hint.text))
-                .when_some(palette_shortcut(window), |hint, keys| {
-                    hint.child(crate::inspector::rows::tag_pill(keys, cx))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .child(SharedString::from(format!(
+                            "Add more {} from the\u{a0}",
+                            hint.what
+                        )))
+                        .child(
+                            div()
+                                .id((id, usize::MAX))
+                                .debug_selector(move || format!("{id}-hint"))
+                                .cursor_pointer()
+                                .text_color(theme.text_secondary)
+                                .hover(|s| s.text_color(theme.text_primary))
+                                .on_click({
+                                    let on_click = hint.on_click.clone();
+                                    move |event, window, cx| on_click(event, window, cx)
+                                })
+                                .child(SharedString::new_static("command palette")),
+                        ),
+                )
+                .when_some(palette_shortcut(window), |line, keys| {
+                    let on_click = hint.on_click.clone();
+                    line.child(
+                        div()
+                            .id((id, usize::MAX - 1))
+                            .cursor_pointer()
+                            .on_click(move |event, window, cx| on_click(event, window, cx))
+                            .child(crate::inspector::rows::tag_pill(keys, cx)),
+                    )
                 }),
         )
         .into_any_element()
@@ -144,8 +169,8 @@ impl Pane {
             })
             .collect();
         let hint = StarterHint {
-            text: "More views in the command palette",
-            on_click: Box::new(|_, window, cx| {
+            what: "views",
+            on_click: Rc::new(|_, window, cx| {
                 window.dispatch_action(Box::new(crate::app::OpenPalette), cx)
             }),
         };
@@ -246,8 +271,17 @@ mod tests {
             #[cfg(not(target_os = "macos"))]
             assert!(palette_shortcut(window).is_some());
         });
+        let line = cx.debug_bounds("pane-starter-hint-line").unwrap();
+        cx.simulate_click(
+            line.origin + gpui::point(gpui::px(4.0), line.size.height / 2.0),
+            Default::default(),
+        );
+        assert!(!opened_palette.get(), "the plain words are not a link");
         click_starter("pane-starter-hint", cx);
-        assert!(opened_palette.get(), "the hint opens the palette");
+        assert!(
+            opened_palette.get(),
+            "\"command palette\" opens the palette"
+        );
 
         click_starter("pane-starter-0", cx);
         assert_eq!(titles(cx), ["component_outline"]);

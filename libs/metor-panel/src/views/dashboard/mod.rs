@@ -659,8 +659,8 @@ impl DashboardPanel {
             })
             .collect();
         let hint = crate::tiles::starter::StarterHint {
-            text: "More widgets in the command palette",
-            on_click: Box::new({
+            what: "widgets",
+            on_click: std::rc::Rc::new({
                 let dashboard = cx.entity();
                 let db = self.db.clone();
                 move |_, window, cx| {
