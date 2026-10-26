@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use stellarator::sync::WaitQueue;
@@ -45,6 +45,10 @@ impl Pending {
         }
     }
 }
+
+/// How long the persist thread lets pushes gather once there is work: well
+/// under a stream tick, and far less than a WAL takes to fill.
+const GATHER: Duration = Duration::from_micros(20);
 
 /// The WALs waiting for the persist thread, which blocks on `ready` rather
 /// than running an executor: persisting is synchronous, and a condvar wakes
@@ -80,6 +84,16 @@ impl PersistQueue {
                     .unwrap_or_else(PoisonError::into_inner);
                 continue;
             }
+            // Let pushes gather before draining. A WAL drained the moment
+            // it has a sample is queued again, and the thread woken again,
+            // by the producer's next push; one drain per window spares a
+            // busy producer both.
+            drop(state);
+            let gathered = Instant::now() + GATHER;
+            while Instant::now() < gathered {
+                thread::yield_now();
+            }
+            state = self.lock();
             let batch = mem::take(&mut state.pending);
             drop(state);
             for pending in batch {
