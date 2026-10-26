@@ -5,7 +5,7 @@ use metor_proto::types::{PacketHeader, PacketTy};
 use metor_proto::vtable::builder::{
     OpBuilder, component, raw_field, raw_table, schema, timestamp, vtable,
 };
-use metor_proto::vtable::{ElementKey, RealizedField, builder};
+use metor_proto::vtable::{ElementKey, RealizedField, RealizedOp, builder};
 use metor_proto::{
     registry,
     schema::Schema,
@@ -25,6 +25,7 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     net::{SocketAddr, ToSocketAddrs},
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc, PoisonError, RwLock,
@@ -44,7 +45,7 @@ use stellarator::{
 use time_series::TimeSeries;
 use tracing::{debug, info, trace, warn};
 use vtable_stream::handle_vtable_stream;
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 pub use background::{Background, Workers};
 pub use error::Error;
@@ -108,6 +109,8 @@ pub struct State {
     namespace: Option<String>,
 
     vtable_registry: registry::HashMapRegistry,
+    /// Plans for the registered static vtables that have one.
+    static_plans: HashMap<PacketId, StaticPlan>,
     streams: HashMap<StreamId, Arc<FixedRateStreamState>>,
 
     /// Raw bytes of the most recently ingested table for each dynamic vtable,
@@ -380,6 +383,9 @@ impl DB {
                     .latest_dynamic_tables
                     .insert(vtable.id, Default::default());
             }
+            if let Some(plan) = StaticPlan::new(&vtable.vtable, &state.components) {
+                state.static_plans.insert(vtable.id, plan);
+            }
             state.vtable_registry.map.insert(vtable.id, vtable.vtable);
         });
         self.vtable_gen.fetch_add(fields, atomic::Ordering::SeqCst);
@@ -503,6 +509,9 @@ impl DB {
         received: Timestamp,
     ) -> Result<StaticIngest, Error> {
         self.with_state(|state| {
+            if let Some(plan) = state.static_plans.get(&id) {
+                return plan.push(buf, received).map(StaticIngest::Pushed);
+            }
             let vtable = state
                 .vtable_registry
                 .get(&id)
@@ -785,6 +794,7 @@ impl State {
             command_ids: Default::default(),
             namespace: Default::default(),
             vtable_registry: Default::default(),
+            static_plans: Default::default(),
             streams: Default::default(),
             latest_dynamic_tables: Default::default(),
             dynamic_templates: Default::default(),
@@ -1226,6 +1236,105 @@ const WAL_OPEN_ENTRIES: usize = 256;
 fn wal_capacity(size: usize, entries: usize) -> usize {
     let entry = size + size_of::<Timestamp>();
     entry * (WAL_BUDGET / entry).max(WAL_MIN_ENTRIES).min(entries)
+}
+
+/// A static vtable resolved once at registration: each field's bytes, shape
+/// and timestamp, and the component it lands in. A table ingests through it
+/// without walking the vtable's ops or looking up each component, reading and
+/// checking the table just as the walk does.
+struct StaticPlan {
+    fields: Vec<PlannedField>,
+}
+
+struct PlannedField {
+    component: Component,
+    value: Range<usize>,
+    shape: Vec<usize>,
+    ty: PrimType,
+    timestamp: PlannedTimestamp,
+}
+
+/// Where a planned field's timestamp comes from.
+enum PlannedTimestamp {
+    /// The table's arrival, when the vtable names no timestamp.
+    Received,
+    Fixed(Timestamp),
+    /// These bytes of the table.
+    Table(Range<usize>),
+}
+
+impl StaticPlan {
+    /// Plans `vtable`, or `None` when it is dynamic or a field's ops are any
+    /// but a static chain, so the walk ingests it. A chain op that reads the
+    /// table fails to realize without one, so all a plan reads from a table
+    /// is each field's value and timestamp.
+    fn new(vtable: &VTable, components: &HashMap<ComponentId, Component>) -> Option<Self> {
+        if vtable.is_dynamic() {
+            return None;
+        }
+        let fields = vtable
+            .fields
+            .iter()
+            .map(|field| {
+                let mut op = vtable.realize(field.arg, None).ok()?;
+                let mut schema = None;
+                let mut timestamp = None;
+                let component_id = loop {
+                    op = match op {
+                        RealizedOp::Component(component) => break component.component_id,
+                        RealizedOp::Schema(s) => vtable.realize(schema.insert(s).arg, None).ok()?,
+                        // The walk reads and checks every timestamp in a chain,
+                        // though only the last stamps the field, so a chain of
+                        // several stays with the walk.
+                        RealizedOp::Timestamp(t) if timestamp.is_none() => {
+                            timestamp = Some(match (t.range, t.timestamp) {
+                                (Some(range), _) => PlannedTimestamp::Table(range),
+                                (None, Some(ts)) => PlannedTimestamp::Fixed(ts),
+                                (None, None) => PlannedTimestamp::Received,
+                            });
+                            vtable.realize(t.arg, None).ok()?
+                        }
+                        RealizedOp::Frame(frame) => vtable.realize(frame.arg, None).ok()?,
+                        RealizedOp::Ext(ext) => vtable.realize(ext.arg, None).ok()?,
+                        _ => return None,
+                    };
+                };
+                let schema = schema?;
+                let start = field.offset.to_index();
+                Some(PlannedField {
+                    component: components.get(&component_id)?.clone(),
+                    value: start..start + field.len as usize,
+                    shape: schema.dim.iter().map(|&dim| dim as usize).collect(),
+                    ty: schema.ty,
+                    timestamp: timestamp.unwrap_or(PlannedTimestamp::Received),
+                })
+            })
+            .collect::<Option<_>>()?;
+        Some(StaticPlan { fields })
+    }
+
+    fn push(&self, table: &[u8], received: Timestamp) -> Result<Pushed, Error> {
+        use metor_proto::error::Error as ProtoError;
+        let mut pushed = Pushed::default();
+        for field in &self.fields {
+            let ts = match &field.timestamp {
+                PlannedTimestamp::Received => received,
+                PlannedTimestamp::Fixed(ts) => *ts,
+                PlannedTimestamp::Table(range) => {
+                    let bytes = table
+                        .get(range.clone())
+                        .ok_or(ProtoError::BufferUnderflow)?;
+                    Timestamp::read_from_bytes(bytes).map_err(ProtoError::from)?
+                }
+            };
+            let value = table
+                .get(field.value.clone())
+                .ok_or(ProtoError::BufferUnderflow)?;
+            let view = ComponentView::try_from_bytes_shape(value, &field.shape, field.ty)?;
+            pushed.merge(push_value(&field.component, ts, view.as_bytes())?);
+        }
+        Ok(pushed)
+    }
 }
 
 #[derive(Clone)]
@@ -3809,6 +3918,44 @@ mod static_ingest_tests {
     async fn short_table_is_refused() {
         let (_dir, db) = store();
         assert!(db.ingest_table(ID, &5i64.to_le_bytes()).is_err());
+    }
+
+    #[stellarator::test]
+    async fn static_vtable_is_planned() {
+        let (_dir, db) = store();
+        assert!(db.with_state(|state| state.static_plans.contains_key(&ID)));
+    }
+
+    /// A plan ingests, and refuses, tables just as the walk does.
+    #[stellarator::test]
+    async fn plan_ingests_as_the_walk_does() {
+        let (_planned_dir, planned) = store();
+        let (_walked_dir, walked) = store();
+        walked.with_state_mut(|state| state.static_plans.clear());
+        let tables = [
+            sample(5, 1.5, 2.5),
+            // Short of `b`: `a` lands, then the table is refused.
+            sample(6, 1.0, 2.0)[..16].to_vec(),
+            sample(7, 3.0, 4.0),
+            // Earlier than `a`'s latest sample.
+            sample(6, 0.0, 0.0),
+            5i64.to_le_bytes().to_vec(),
+        ];
+        let mut refused = 0;
+        for table in &tables {
+            let planned = planned
+                .ingest_table(ID, table)
+                .map_err(|err| format!("{err:?}"));
+            let walked = walked
+                .ingest_table(ID, table)
+                .map_err(|err| format!("{err:?}"));
+            refused += planned.is_err() as usize;
+            assert_eq!(planned, walked);
+        }
+        assert_eq!(refused, 3);
+        for name in ["a", "b"] {
+            assert_eq!(latest(&planned, name), latest(&walked, name));
+        }
     }
 
     /// Spins until `name` has persisted its sample at `ts`.
