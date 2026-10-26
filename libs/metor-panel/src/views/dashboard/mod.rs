@@ -283,8 +283,7 @@ impl DashboardPanel {
         }
     }
 
-    /// The widget's reflected settings page, plus the rows that belong to
-    /// its placement on the dashboard rather than to the view itself.
+    /// Right-click on a widget in edit mode: its [`widget_rows`] as a popup.
     fn open_widget_inspector(
         &self,
         widget_id: WidgetId,
@@ -292,37 +291,12 @@ impl DashboardPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(live) = self.widget_live.get(&widget_id) else {
-            return;
-        };
         let Some(open) = crate::inspector::open_inspector(cx) else {
             return;
         };
-        let mut rows = crate::inspector::reflect::rows_for_any_entity(&live.inspect, &self.db, cx)
-            .unwrap_or_default();
-        let dashboard = cx.entity();
-        rows.push(Box::new(BoolRow::dynamic(
-            "Frame",
-            Arc::new({
-                let dashboard = dashboard.clone();
-                move |cx| {
-                    dashboard
-                        .read(cx)
-                        .widgets
-                        .iter()
-                        .find(|w| w.id == widget_id)
-                        .is_none_or(|w| w.frame)
-                }
-            }),
-            Arc::new(move |on, _window, cx| {
-                dashboard.update(cx, |this, cx| {
-                    if let Some(w) = this.widgets.iter_mut().find(|w| w.id == widget_id) {
-                        w.frame = on;
-                        cx.notify();
-                    }
-                });
-            }),
-        )));
+        let Some(rows) = widget_rows(&cx.entity(), widget_id, cx) else {
+            return;
+        };
         open(
             crate::inspector::InspectorRequest {
                 rows,
@@ -409,6 +383,46 @@ impl DashboardPanel {
     fn pixel_to_canvas(&self, pixel: Point<Pixels>) -> Option<Point<f32>> {
         Some(self.viewport.to_canvas(self.window_to_local(pixel)?))
     }
+}
+
+/// A widget's reflected settings page, plus the rows that belong to its
+/// placement on the dashboard rather than to the view itself. Shared by the
+/// right-click popup and the inspector pane. `None` once the widget is gone.
+pub fn widget_rows(
+    dashboard: &Entity<DashboardPanel>,
+    widget_id: WidgetId,
+    cx: &App,
+) -> Option<Vec<Box<dyn InspectorRow>>> {
+    let this = dashboard.read(cx);
+    let live = this.widget_live.get(&widget_id)?;
+    let mut rows = crate::inspector::reflect::rows_for_any_entity(&live.inspect, &this.db, cx)
+        .unwrap_or_default();
+    rows.push(Box::new(BoolRow::dynamic(
+        "Frame",
+        Arc::new({
+            let dashboard = dashboard.clone();
+            move |cx| {
+                dashboard
+                    .read(cx)
+                    .widgets
+                    .iter()
+                    .find(|w| w.id == widget_id)
+                    .is_none_or(|w| w.frame)
+            }
+        }),
+        Arc::new({
+            let dashboard = dashboard.clone();
+            move |on, _window, cx| {
+                dashboard.update(cx, |this, cx| {
+                    if let Some(w) = this.widgets.iter_mut().find(|w| w.id == widget_id) {
+                        w.frame = on;
+                        cx.notify();
+                    }
+                });
+            }
+        }),
+    )));
+    Some(rows)
 }
 
 /// Inspector rows that operate on the dashboard itself: add/remove widgets,
