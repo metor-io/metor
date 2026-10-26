@@ -10,7 +10,7 @@ use gpui::{AnyEntity, App, Window};
 use metor_db::DB;
 use serde::Serialize;
 
-use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
+use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow, RowAction};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::{ImageWidgetConfig, WidgetKind};
 use crate::views::instrument::{ScaleSeed, scale_seeds_for_traces};
@@ -221,6 +221,31 @@ impl AddMenu {
     fn add(&self, kind: &WidgetKind, config: &impl Serialize, cx: &mut App) -> Option<AnyEntity> {
         let config = serde_json::to_string(config).expect("view configs serialize");
         (self.sink)(kind, config, cx)
+    }
+
+    /// Open the entry labelled `label` in the centred palette, at the page
+    /// choosing it from the menu would show: how a starter button begins a
+    /// wizard without the menu in front of it.
+    pub(crate) fn open_entry(self, label: &str, window: &mut Window, cx: &mut App) {
+        let Some(open) = crate::inspector::open_inspector(cx) else {
+            return;
+        };
+        let Some(mut row) = self.rows().into_iter().find(|row| row.label() == label) else {
+            return;
+        };
+        let rows = match row.activate(window, cx) {
+            RowAction::Cascade(rows) | RowAction::CascadeWith { rows, .. } => rows,
+            // A command row has already done its work.
+            _ => return,
+        };
+        open(
+            InspectorRequest {
+                rows,
+                mode: InspectorMode::Centered,
+            },
+            window,
+            cx,
+        );
     }
 
     fn time_series(&self) -> Box<dyn InspectorRow> {

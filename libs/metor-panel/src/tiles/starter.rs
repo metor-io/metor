@@ -1,42 +1,96 @@
-//! What an empty pane shows: a few large buttons for the views people open
-//! first, styled like the connection picker's favourite cards.
+//! Large starter buttons for empty surfaces, styled like the connection
+//! picker's favourite cards: an empty pane offers the views people open
+//! first, and an empty dashboard its most common widgets.
 //!
-//! Outline and Dashboard need no setup and land straight away. Time Series
-//! needs its traces picked first, which takes the database and a window, so
-//! the pane asks the app to open that wizard ([`PaneEvent::NewTimeSeries`]).
-use gpui::{AnyElement, Context, SharedString, div, prelude::*, px};
+//! In a pane, Outline and Dashboard need no setup and land straight away.
+//! Time Series needs its traces picked first, which takes the database and a
+//! window, so the pane asks the app to open that wizard
+//! ([`PaneEvent::NewTimeSeries`]).
+use gpui::{AnyElement, App, ClickEvent, Context, SharedString, Window, div, prelude::*, px};
 
 use super::pane::{Pane, PaneEvent};
 use crate::icons::Icon;
 use crate::theme::theme;
 
-/// One button: what it opens, and how.
-struct Starter {
-    label: &'static str,
-    detail: &'static str,
-    icon: Icon,
-    open: fn(&mut Pane, &mut Context<Pane>),
+/// One card: a name, an icon, and what clicking it does.
+pub(crate) struct StarterCard {
+    pub label: &'static str,
+    pub icon: Icon,
+    pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
 }
 
-const STARTERS: [Starter; 3] = [
-    Starter {
-        label: "Outline",
-        detail: "Browse every component",
-        icon: Icon::Outline,
-        open: |pane, cx| pane.add_registered("component_outline", cx),
-    },
-    Starter {
-        label: "Time Series",
-        detail: "Plot values over time",
-        icon: Icon::Plot,
-        open: |_, cx| cx.emit(PaneEvent::NewTimeSeries),
-    },
-    Starter {
-        label: "Dashboard",
-        detail: "Lay out instruments",
-        icon: Icon::Dashboard,
-        open: |pane, cx| pane.add_registered("dashboard", cx),
-    },
+/// `cards` in a wrapping row centred in the space given, over `hint`, a
+/// pointer to wherever the rest lives. Each card's debug selector is
+/// `{id}-{index}`.
+pub(crate) fn starter_cards(
+    id: &'static str,
+    cards: Vec<StarterCard>,
+    hint: &'static str,
+    cx: &App,
+) -> AnyElement {
+    let theme = theme(cx);
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .justify_center()
+        .gap(px(10.0));
+    for (ix, card) in cards.into_iter().enumerate() {
+        row = row.child(
+            div()
+                .id((id, ix))
+                .debug_selector(move || format!("{id}-{ix}"))
+                .w(px(130.0))
+                .p(px(14.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(8.0))
+                .bg(theme.bg_secondary)
+                .border_1()
+                .border_color(theme.border_primary)
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_elevated))
+                .on_click(card.on_click)
+                .child(card.icon.svg(24.0, theme.text_secondary))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme.text_primary)
+                        .child(SharedString::new_static(card.label)),
+                ),
+        );
+    }
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(14.0))
+        .p(px(16.0))
+        .child(row)
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.text_tertiary)
+                .child(SharedString::new_static(hint)),
+        )
+        .into_any_element()
+}
+
+/// The views an empty pane offers, and how each opens.
+const PANE_STARTERS: [(&str, Icon, fn(&mut Pane, &mut Context<Pane>)); 3] = [
+    ("Outline", Icon::Outline, |pane, cx| {
+        pane.add_registered("component_outline", cx)
+    }),
+    ("Time Series", Icon::Plot, |_, cx| {
+        cx.emit(PaneEvent::NewTimeSeries)
+    }),
+    ("Dashboard", Icon::Dashboard, |pane, cx| {
+        pane.add_registered("dashboard", cx)
+    }),
 ];
 
 impl Pane {
@@ -51,65 +105,20 @@ impl Pane {
     }
 
     pub(super) fn render_starters(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = theme(cx);
-        let mut cards = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .justify_center()
-            .gap(px(10.0));
-        for (ix, starter) in STARTERS.iter().enumerate() {
-            let open = starter.open;
-            cards = cards.child(
-                div()
-                    .id(("pane-starter", ix))
-                    .debug_selector(move || format!("pane-starter-{ix}"))
-                    .w(px(150.0))
-                    .p(px(12.0))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(6.0))
-                    .bg(theme.bg_secondary)
-                    .border_1()
-                    .border_color(theme.border_primary)
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.bg_elevated))
-                    .on_click(cx.listener(move |pane, _, _, cx| open(pane, cx)))
-                    .child(starter.icon.svg(24.0, theme.text_secondary))
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .text_color(theme.text_primary)
-                            .child(SharedString::new_static(starter.label)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(theme.text_tertiary)
-                            .child(SharedString::new_static(starter.detail)),
-                    ),
-            );
-        }
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(14.0))
-            .p(px(16.0))
-            .child(cards)
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(theme.text_tertiary)
-                    .child(SharedString::new_static(
-                        "More views in the command palette",
-                    )),
-            )
-            .into_any_element()
+        let cards = PANE_STARTERS
+            .iter()
+            .map(|&(label, icon, open)| StarterCard {
+                label,
+                icon,
+                on_click: Box::new(cx.listener(move |pane, _, _, cx| open(pane, cx))),
+            })
+            .collect();
+        starter_cards(
+            "pane-starter",
+            cards,
+            "More views in the command palette",
+            cx,
+        )
     }
 }
 

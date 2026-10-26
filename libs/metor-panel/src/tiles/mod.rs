@@ -6,7 +6,7 @@ pub(crate) mod pane;
 pub mod panels;
 pub(crate) mod serial;
 mod split_preview;
-mod starter;
+pub(crate) mod starter;
 mod tab;
 
 use gpui::{

@@ -631,8 +631,48 @@ fn zoom_rows(dashboard: Entity<DashboardPanel>, cx: &App) -> Vec<Box<dyn Inspect
     ]
 }
 
+/// The widgets an empty dashboard offers, by their Add Widget entry.
+const STARTERS: [(&str, crate::icons::Icon, &str); 4] = [
+    ("Time Series", crate::icons::Icon::Plot, "Time Series Plot"),
+    ("Monitor", crate::icons::Icon::Monitor, "Monitor"),
+    ("Gauge", crate::icons::Icon::Gauge, "Gauge"),
+    ("Label", crate::icons::Icon::Label, "Label"),
+];
+
+impl DashboardPanel {
+    /// Starter cards for an empty dashboard; each opens its Add Widget
+    /// entry's first page in the palette.
+    fn render_starters(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let cards = STARTERS
+            .iter()
+            .map(|&(label, icon, entry)| {
+                let dashboard = cx.entity();
+                let db = self.db.clone();
+                crate::tiles::starter::StarterCard {
+                    label,
+                    icon,
+                    on_click: Box::new(move |_, window, cx| {
+                        add_widget_menu(dashboard.clone(), db.clone())
+                            .open_entry(entry, window, cx);
+                    }),
+                }
+            })
+            .collect();
+        crate::tiles::starter::starter_cards(
+            "dashboard-starter",
+            cards,
+            "More widgets under Add Widget in the command palette",
+            cx,
+        )
+    }
+}
+
 /// The shared "add view" menu aimed at `dashboard`.
 fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
+    add_widget_menu(dashboard, db).rows()
+}
+
+fn add_widget_menu(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> AddMenu {
     AddMenu {
         db,
         host: Host::Dashboard,
@@ -644,7 +684,6 @@ fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dy
         }),
         on_open_inspector: None,
     }
-    .rows()
 }
 
 fn widget_display_label(widget: &DashboardWidget, cx: &App) -> SharedString {
@@ -792,16 +831,7 @@ impl Render for DashboardPanel {
         }
 
         if self.widgets.is_empty() {
-            canvas_div = canvas_div.child(
-                div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(theme.text_tertiary)
-                    .text_size(px(14.0))
-                    .child("Open command palette to add widgets"),
-            );
+            canvas_div = canvas_div.child(self.render_starters(cx));
         }
 
         if let Some(view) = self.view_size() {
@@ -1272,6 +1302,36 @@ mod tests {
         dashboard.update(cx, |d, cx| d.set_editing(false, cx));
         cx.simulate_keystrokes("delete");
         assert_eq!(ids(cx), [1], "view mode never deletes");
+    }
+
+    #[gpui::test]
+    fn an_empty_dashboard_starts_widgets_from_its_cards(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        let opened: std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>> = Default::default();
+        let (_dashboard, cx) = cx.add_window_view(|_, cx| {
+            test_support::install(&db, cx);
+            let opened = opened.clone();
+            cx.set_global(crate::inspector::OpenInspectorGlobal(Arc::new(
+                move |request, _, _| {
+                    opened
+                        .borrow_mut()
+                        .push(request.rows.iter().map(|r| r.label().to_string()).collect());
+                },
+            )));
+            DashboardPanel::new(db.clone(), cx)
+        });
+        cx.run_until_parked();
+
+        let label_card = cx.debug_bounds("dashboard-starter-3").unwrap();
+        cx.simulate_click(label_card.center(), Default::default());
+        let gauge_card = cx.debug_bounds("dashboard-starter-2").unwrap();
+        cx.simulate_click(gauge_card.center(), Default::default());
+
+        let opened = opened.borrow();
+        assert_eq!(opened.len(), 2, "each card opens its wizard");
+        assert_eq!(opened[0], ["Label text..."]);
+        assert!(!opened[1].is_empty(), "the gauge opens on its trace picker");
     }
 
     #[gpui::test]
