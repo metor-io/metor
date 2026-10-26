@@ -642,7 +642,7 @@ const STARTERS: [(&str, crate::icons::Icon, &str); 4] = [
 impl DashboardPanel {
     /// Starter cards for an empty dashboard; each opens its Add Widget
     /// entry's first page in the palette.
-    fn render_starters(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_starters(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let cards = STARTERS
             .iter()
             .map(|&(label, icon, entry)| {
@@ -658,12 +658,28 @@ impl DashboardPanel {
                 }
             })
             .collect();
-        crate::tiles::starter::starter_cards(
-            "dashboard-starter",
-            cards,
-            "More widgets under Add Widget in the command palette",
-            cx,
-        )
+        let hint = crate::tiles::starter::StarterHint {
+            text: "More widgets in the command palette",
+            on_click: Box::new({
+                let dashboard = cx.entity();
+                let db = self.db.clone();
+                move |_, window, cx| {
+                    let Some(open) = crate::inspector::open_inspector(cx) else {
+                        return;
+                    };
+                    let rows = add_widget_rows(dashboard.clone(), db.clone());
+                    open(
+                        crate::inspector::InspectorRequest {
+                            rows,
+                            mode: crate::inspector::InspectorMode::Centered,
+                        },
+                        window,
+                        cx,
+                    );
+                }
+            }),
+        };
+        crate::tiles::starter::starter_cards("dashboard-starter", cards, hint, window, cx)
     }
 }
 
@@ -691,7 +707,7 @@ fn widget_display_label(widget: &DashboardWidget, cx: &App) -> SharedString {
 }
 
 impl Render for DashboardPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_views(cx);
         let theme = theme(cx);
 
@@ -831,7 +847,7 @@ impl Render for DashboardPanel {
         }
 
         if self.widgets.is_empty() {
-            canvas_div = canvas_div.child(self.render_starters(cx));
+            canvas_div = canvas_div.child(self.render_starters(window, cx));
         }
 
         if let Some(view) = self.view_size() {
@@ -1328,10 +1344,21 @@ mod tests {
         let gauge_card = cx.debug_bounds("dashboard-starter-2").unwrap();
         cx.simulate_click(gauge_card.center(), Default::default());
 
+        let hint = cx.debug_bounds("dashboard-starter-hint").unwrap();
+        cx.simulate_click(hint.center(), Default::default());
+
         let opened = opened.borrow();
-        assert_eq!(opened.len(), 2, "each card opens its wizard");
+        assert_eq!(
+            opened.len(),
+            3,
+            "each card opens its wizard, the hint the menu"
+        );
         assert_eq!(opened[0], ["Label text..."]);
         assert!(!opened[1].is_empty(), "the gauge opens on its trace picker");
+        assert!(
+            opened[2].iter().any(|l| l == "Meter"),
+            "the whole Add Widget list"
+        );
     }
 
     #[gpui::test]

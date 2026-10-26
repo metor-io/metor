@@ -799,7 +799,7 @@ impl Render for Pane {
         if let Some(item) = self.items.get(self.active_index) {
             content = content.child(item.view());
         } else {
-            content = content.child(self.render_starters(cx));
+            content = content.child(self.render_starters(window, cx));
         }
 
         // Drop on content area (split-on-drop at edges, add-as-tab in center)

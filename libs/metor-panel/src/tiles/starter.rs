@@ -19,13 +19,20 @@ pub(crate) struct StarterCard {
     pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
 }
 
-/// `cards` in a wrapping row centred in the space given, over `hint`, a
-/// pointer to wherever the rest lives. Each card's debug selector is
-/// `{id}-{index}`.
+/// The line under the cards: where everything else lives, with the
+/// palette's shortcut beside it, and clickable to go there.
+pub(crate) struct StarterHint {
+    pub text: &'static str,
+    pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+}
+
+/// `cards` in a wrapping row centred in the space given, over `hint`. Each
+/// card's debug selector is `{id}-{index}`, and the hint's `{id}-hint`.
 pub(crate) fn starter_cards(
     id: &'static str,
     cards: Vec<StarterCard>,
-    hint: &'static str,
+    hint: StarterHint,
+    window: &Window,
     cx: &App,
 ) -> AnyElement {
     let theme = theme(cx);
@@ -73,11 +80,34 @@ pub(crate) fn starter_cards(
         .child(row)
         .child(
             div()
+                .id((id, usize::MAX))
+                .debug_selector(move || format!("{id}-hint"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(4.0))
+                .cursor_pointer()
                 .text_size(px(11.0))
                 .text_color(theme.text_tertiary)
-                .child(SharedString::new_static(hint)),
+                .hover(|s| s.text_color(theme.text_primary))
+                .on_click(hint.on_click)
+                .child(SharedString::new_static(hint.text))
+                .when_some(palette_shortcut(window), |hint, keys| {
+                    hint.child(crate::inspector::rows::tag_pill(keys, cx))
+                }),
         )
         .into_any_element()
+}
+
+/// The palette's binding as this platform writes it (⌘P on macOS), read
+/// from the keymap so a rebinding shows here too.
+fn palette_shortcut(window: &Window) -> Option<SharedString> {
+    let binding = window.highest_precedence_binding_for_action(&crate::app::OpenPalette)?;
+    let keys: Vec<String> = binding.keystrokes().iter().map(|k| k.to_string()).collect();
+    Some(keys.join(" ").into())
 }
 
 /// The views an empty pane offers, and how each opens.
@@ -104,7 +134,7 @@ impl Pane {
         }
     }
 
-    pub(super) fn render_starters(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_starters(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let cards = PANE_STARTERS
             .iter()
             .map(|&(label, icon, open)| StarterCard {
@@ -113,12 +143,13 @@ impl Pane {
                 on_click: Box::new(cx.listener(move |pane, _, _, cx| open(pane, cx))),
             })
             .collect();
-        starter_cards(
-            "pane-starter",
-            cards,
-            "More views in the command palette",
-            cx,
-        )
+        let hint = StarterHint {
+            text: "More views in the command palette",
+            on_click: Box::new(|_, window, cx| {
+                window.dispatch_action(Box::new(crate::app::OpenPalette), cx)
+            }),
+        };
+        starter_cards("pane-starter", cards, hint, window, cx)
     }
 }
 
@@ -200,6 +231,23 @@ mod tests {
         click_starter("pane-starter-1", cx);
         assert!(asked.get(), "time series asks the app for its wizard");
         assert!(titles(cx).is_empty());
+
+        let opened_palette = Rc::new(Cell::new(false));
+        cx.update(|window, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "secondary-p",
+                crate::app::OpenPalette,
+                None,
+            )]);
+            let opened_palette = opened_palette.clone();
+            cx.on_action(move |_: &crate::app::OpenPalette, _| opened_palette.set(true));
+            #[cfg(target_os = "macos")]
+            assert_eq!(palette_shortcut(window).as_deref(), Some("⌘P"));
+            #[cfg(not(target_os = "macos"))]
+            assert!(palette_shortcut(window).is_some());
+        });
+        click_starter("pane-starter-hint", cx);
+        assert!(opened_palette.get(), "the hint opens the palette");
 
         click_starter("pane-starter-0", cx);
         assert_eq!(titles(cx), ["component_outline"]);
