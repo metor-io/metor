@@ -47,7 +47,7 @@ use tracing::{debug, info, trace, warn};
 use vtable_stream::handle_vtable_stream;
 use zerocopy::{FromBytes, IntoBytes};
 
-pub use background::{Background, Workers};
+pub use background::{Background, Gather, Workers};
 pub use error::Error;
 
 use crate::background::{Pending, Persister};
@@ -192,6 +192,13 @@ impl DB {
             self.metadata_gen.store(state.metadata_generation);
         }
         result
+    }
+
+    /// Sets how the persist thread gathers pushes before draining them; see
+    /// [`Gather`]. A host that wants the lowest ingest latency and has a core
+    /// to spare spins; the default sleeps.
+    pub fn set_gather(&self, gather: Gather) {
+        self.workers.background().persister.set_gather(gather);
     }
 
     fn db_config(&self) -> DbConfig {

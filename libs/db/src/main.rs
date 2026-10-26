@@ -1,8 +1,8 @@
-use std::{io::Write, net::SocketAddr, path::PathBuf};
+use std::{io::Write, net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand};
 use metor_proto::vtable;
-use metor_db::Server;
+use metor_db::{Gather, Server};
 use miette::IntoDiagnostic;
 use postcard_c_codegen::SchemaExt;
 use tracing::info;
@@ -35,6 +35,12 @@ struct RunArgs {
     pub config: Option<PathBuf>,
     #[clap(long, hide = true)]
     reset: bool,
+    #[clap(
+        long,
+        value_name = "MICROS",
+        help = "Spin this long gathering pushes before persisting them, instead of sleeping: lower ingest latency for a core of CPU"
+    )]
+    persist_spin: Option<u64>,
 }
 
 #[stellarator::main]
@@ -59,6 +65,7 @@ async fn main() -> miette::Result<()> {
             path,
             config,
             reset,
+            persist_spin,
         }) => {
             let path = path.unwrap_or_else(|| {
                 let dirs =
@@ -73,6 +80,11 @@ async fn main() -> miette::Result<()> {
             }
             info!(?path, "starting db");
             let server = Server::new(path, addr).into_diagnostic()?;
+            if let Some(micros) = persist_spin {
+                server
+                    .db
+                    .set_gather(Gather::Spin(Duration::from_micros(micros)));
+            }
             metor_db::lod::spawn(server.db.clone());
             let db = stellarator::spawn(server.run());
             if let Some(lua_config) = config {
