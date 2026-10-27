@@ -812,9 +812,9 @@ impl AppRoot {
         bar.into_any_element()
     }
 
-    /// Reveal the inspector pane, or dock a new one along the layout's right
-    /// edge at a fixed width. The current pane becomes its first target, so
-    /// it opens on what the user was looking at rather than empty.
+    /// Reveal the inspector pane, or split the active pane to open one
+    /// beside it. The current pane becomes its first target, so it opens on
+    /// what the user was looking at rather than empty.
     fn show_inspector(&mut self, _: &ShowInspector, _window: &mut Window, cx: &mut Context<Self>) {
         use crate::inspector::target::{self, INSPECTOR_PANE_KEY};
         let open = self.tiles.read(cx).panes().iter().any(|pane| {
@@ -829,19 +829,19 @@ impl AppRoot {
             });
             return;
         }
-        if let Some(active) = self.tiles.read(cx).active_pane(cx) {
-            target::select_pane(&active, cx);
-        }
+        let Some(active) = self.tiles.read(cx).active_pane(cx) else {
+            return;
+        };
+        target::select_pane(&active, cx);
         let registry = cx.global::<crate::tiles::ItemRegistry>().clone();
         let pane = cx.new(|cx| crate::tiles::Pane::new(Vec::new(), cx));
         pane.update(cx, |pane, cx| {
             if let Some(item) = registry.deserialize(INSPECTOR_PANE_KEY, "{}", cx) {
                 pane.add_item(item, cx);
             }
-            pane.set_locked_size(Some(size(320.0, 320.0)), cx);
         });
         self.tiles.update(cx, |tiles, cx| {
-            tiles.dock_pane(pane, crate::tiles::SplitDirection::Right, cx)
+            tiles.split_pane(&active, pane, crate::tiles::SplitDirection::Right, cx)
         });
     }
 

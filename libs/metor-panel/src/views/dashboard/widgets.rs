@@ -480,7 +480,7 @@ impl WidgetRegistry {
                     subject("Samples", &cfg.component)
                 },
                 |cfg, db, cx| SamplesTable::from_config(&cfg, db, cx),
-                |table, _| table.to_config(),
+                |table, cx| table.to_config(cx),
             )
             .with_tile("samples_table", |_| "Samples".into())
             .with_live_tile_title(|table: &SamplesTable, _| table.component().clone()),

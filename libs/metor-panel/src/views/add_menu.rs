@@ -183,7 +183,10 @@ impl AddMenu {
             (
                 None,
                 self.component("Samples", WidgetKind::samples_table(), |component| {
-                    SamplesTableConfig { component }
+                    SamplesTableConfig {
+                        component,
+                        ..Default::default()
+                    }
                 }),
             ),
             (None, self.sequence_control()),
