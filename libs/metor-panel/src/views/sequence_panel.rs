@@ -1,22 +1,20 @@
 //! Detailed per-channel control panel for sequences (best for a handful of channels).
-//! Each row shows a channel's loaded sequence and run state with inline Load / Start /
-//! Abort / Stop controls; a header carries a global Reload and run-state count chips. All
-//! data comes from the global [`SequenceStore`](crate::sequences::SequenceStore); this view
-//! only renders and publishes commands.
-//!
-//! `Stop` is the unsafe hard-drop, so it is guarded by an inline two-step confirm
-//! ([`arming_stop`](SequenceView::arming_stop)) rather than firing on first click.
+//! Each row is a [`SequenceControl`] for one channel, so the list and the single-channel
+//! widget stage loads, arm Stop and lay out their buttons the same way; a header carries a
+//! global Reload and run-state count chips. All data comes from the global
+//! [`SequenceStore`](crate::sequences::SequenceStore); this view only renders and
+//! publishes commands.
 
 use std::sync::Arc;
 
-use gpui::{AnyElement, Context, IntoElement, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, Entity, IntoElement, SharedString, Window, div, prelude::*, px};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::SequenceRunState;
 
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
-use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, is_resettable, run_state_index, run_state_label};
-use crate::theme::theme;
+use crate::theme::{theme, ui_px};
+use crate::views::sequence_control::{SequenceControl, SequenceControlConfig};
 use crate::views::table;
 
 /// Run-state chips to surface in the header, in display order. `Idle` is omitted as noise.
@@ -41,10 +39,10 @@ pub enum SequenceListMode {
 #[derive(facet::Facet)]
 pub struct SequenceView {
     pub mode: SequenceListMode,
-    /// The channel (by name) whose `Stop` is armed for confirmation, if any. Transient
-    /// UI state.
-    #[facet(skip)]
-    arming_stop: Option<SharedString>,
+    /// One control per declared channel, in display order. Kept across renders so a
+    /// staged load or an armed Stop survives the store's next event.
+    #[facet(opaque)]
+    controls: Vec<(SharedString, Entity<SequenceControl>)>,
 }
 
 impl SequenceView {
@@ -55,7 +53,7 @@ impl SequenceView {
         }
         Self {
             mode: SequenceListMode::default(),
-            arming_stop: None,
+            controls: Vec::new(),
         }
     }
 
@@ -72,18 +70,6 @@ impl SequenceView {
     pub fn is_history(&self) -> bool {
         self.mode == SequenceListMode::History
     }
-}
-
-/// Snapshot of one channel for rendering, owned so the store borrow is released before we
-/// build listeners that need `&mut Context`. The name is the channel's identity — the
-/// address every published command carries.
-struct ChannelRow {
-    name: SharedString,
-    loaded: Option<SharedString>,
-    available: Vec<SharedString>,
-    run_state: SequenceRunState,
-    last_message: Option<SharedString>,
-    updated_at: Timestamp,
 }
 
 struct HistoryRow {
@@ -286,7 +272,6 @@ impl Render for SequenceView {
                         } else {
                             SequenceListMode::History
                         };
-                        this.arming_stop = None;
                         cx.notify();
                     })),
             );
@@ -323,26 +308,25 @@ impl Render for SequenceView {
                 }
             }
             Some(store) => {
-                let channels: Vec<ChannelRow> = store
+                let channels: Vec<SharedString> = store
                     .read(cx)
                     .state()
                     .channels_ordered()
                     .iter()
-                    .map(|c| ChannelRow {
-                        name: c.name.clone(),
-                        loaded: c.loaded.clone(),
-                        available: c.available.clone(),
-                        run_state: c.run_state,
-                        last_message: c.last_message.clone(),
-                        updated_at: c.updated_at,
-                    })
+                    .map(|c| c.name.clone())
                     .collect();
-                if channels.is_empty() {
+                self.sync_controls(&channels, cx);
+                if self.controls.is_empty() {
                     list = list.child(empty_row(&theme, "No channels declared"));
                 } else {
-                    for (ix, ch) in channels.into_iter().enumerate() {
-                        list = list.child(self.channel_row(ix, ch, &theme, cx));
-                    }
+                    list = list.children(self.controls.iter().map(|(_, control)| {
+                        div()
+                            .flex_none()
+                            .py(ui_px(8.0))
+                            .border_b_1()
+                            .border_color(theme.border_primary)
+                            .child(control.clone())
+                    }));
                 }
             }
         }
@@ -360,181 +344,32 @@ impl Render for SequenceView {
 }
 
 impl SequenceView {
-    fn channel_row(
-        &self,
-        ix: usize,
-        ch: ChannelRow,
-        theme: &crate::theme::Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let idx = run_state_index(ch.run_state);
-        let color = theme.run_state_color(idx);
-        let name = ch.name.clone();
-        let arming = self.arming_stop.as_ref() == Some(&name);
-
-        let loaded_line = ch
-            .loaded
-            .clone()
-            .unwrap_or_else(|| SharedString::new_static("— no sequence loaded"));
-        let detail = ch
-            .last_message
-            .clone()
-            .unwrap_or_else(|| SharedString::from(run_state_label(ch.run_state)));
-
-        let available = ch.available.clone();
-        let load_btn = pill_button(theme, ("seq-load", ix), "Load").on_click(cx.listener({
-            let name = name.clone();
-            move |this, _, window, cx| {
-                this.arming_stop = None;
-                let Some(open) = open_inspector(cx) else {
-                    return;
-                };
-                let rows = load_picker_rows(name.clone(), &available);
-                open(
-                    InspectorRequest {
-                        rows,
-                        mode: InspectorMode::Centered,
-                    },
-                    window,
-                    cx,
-                );
-            }
-        }));
-
-        let resettable = is_resettable(ch.run_state);
-        let reset_btn = pill_button(theme, ("seq-reset", ix), "Reset").on_click(cx.listener({
-            let name = name.clone();
-            move |this, _, _, cx| {
-                this.arming_stop = None;
-                if let Some(store) = sequences::try_global(cx) {
-                    store.read(cx).reset(&name);
-                }
-                cx.notify();
-            }
-        }));
-
-        let startable = matches!(ch.run_state, SequenceRunState::Idle);
-        let start_btn = pill_button(theme, ("seq-start", ix), "Start").on_click(cx.listener({
-            let name = name.clone();
-            move |this, _, _, cx| {
-                this.arming_stop = None;
-                if let Some(store) = sequences::try_global(cx) {
-                    store.read(cx).start(&name);
-                }
-                cx.notify();
-            }
-        }));
-
-        let abort_btn = pill_button(theme, ("seq-abort", ix), "Abort").on_click(cx.listener({
-            let name = name.clone();
-            move |this, _, _, cx| {
-                this.arming_stop = None;
-                if let Some(store) = sequences::try_global(cx) {
-                    store.read(cx).abort(&name);
-                }
-                cx.notify();
-            }
-        }));
-
-        let stop_label = if arming { "Confirm stop" } else { "Stop" };
-        let stop_btn = pill_button(theme, ("seq-stop", ix), stop_label)
-            .text_color(theme.error_accent)
-            .when(arming, |el| {
-                el.bg(theme.run_state_tint(run_state_index(SequenceRunState::Failed)))
-            })
-            .on_click(cx.listener({
-                let name = name.clone();
-                move |this, _, _, cx| {
-                    if this.arming_stop.as_ref() == Some(&name) {
-                        if let Some(store) = sequences::try_global(cx) {
-                            store.read(cx).stop(&name);
-                        }
-                        this.arming_stop = None;
-                    } else {
-                        this.arming_stop = Some(name.clone());
+    /// Match the controls to the declared channels, keeping each surviving
+    /// channel's control (and whatever it has staged or armed).
+    fn sync_controls(&mut self, channels: &[SharedString], cx: &mut Context<Self>) {
+        if self.controls.len() == channels.len()
+            && self.controls.iter().zip(channels).all(|((a, _), b)| a == b)
+        {
+            return;
+        }
+        let mut old = std::mem::take(&mut self.controls);
+        self.controls = channels
+            .iter()
+            .map(|name| {
+                let control = match old.iter().position(|(n, _)| n == name) {
+                    Some(ix) => old.swap_remove(ix).1,
+                    None => {
+                        let cfg = SequenceControlConfig {
+                            channel: name.to_string(),
+                            compact: false,
+                        };
+                        cx.new(|cx| SequenceControl::from_config(&cfg, cx))
                     }
-                    cx.notify();
-                }
-            }));
-
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border_primary)
-            .child(div().w(px(4.0)).h(px(34.0)).rounded_sm().bg(color))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_grow_1()
-                    .child(div().text_color(theme.text_primary).child(ch.name.clone()))
-                    .child(
-                        div()
-                            .text_color(theme.text_secondary)
-                            .text_size(px(11.0))
-                            .child(loaded_line),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.text_tertiary)
-                            .text_size(px(11.0))
-                            .child(detail),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .child(
-                        div()
-                            .text_color(color)
-                            .text_size(px(11.0))
-                            .child(run_state_label(ch.run_state)),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.text_tertiary)
-                            .text_size(px(11.0))
-                            .child(SharedString::from(format_age(ch.updated_at))),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_1()
-                    .child(load_btn)
-                    .when(resettable, |el| el.child(reset_btn))
-                    .when(startable, |el| el.child(start_btn))
-                    .child(abort_btn)
-                    .child(stop_btn),
-            )
-            .into_any_element()
+                };
+                (name.clone(), control)
+            })
+            .collect();
     }
-}
-
-/// A small flat pill-styled button. Caller attaches `.on_click` and any color overrides.
-pub(crate) fn pill_button(
-    theme: &crate::theme::Theme,
-    id: (&'static str, usize),
-    label: &'static str,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .px_2()
-        .py(px(2.0))
-        .rounded_md()
-        .bg(theme.bg_elevated)
-        .text_color(theme.text_secondary)
-        .text_size(px(11.0))
-        .cursor_pointer()
-        .child(label)
 }
 
 fn empty_row(theme: &crate::theme::Theme, msg: &'static str) -> AnyElement {

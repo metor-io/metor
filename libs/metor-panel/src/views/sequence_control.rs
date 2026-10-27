@@ -764,6 +764,17 @@ mod tests {
         assert!(matches!(second.as_slice(), [SequenceCommandKind::Stop]));
     }
 
+    fn in_channel_list(_db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
+        cx.new(crate::views::SequenceView::new).into()
+    }
+
+    #[gpui::test]
+    fn stop_fires_on_the_second_click_in_the_channel_list(cx: &mut TestAppContext) {
+        let (first, second) = Rig::new(cx, in_channel_list).stop_twice();
+        assert!(first.is_empty(), "the first click only arms");
+        assert!(matches!(second.as_slice(), [SequenceCommandKind::Stop]));
+    }
+
     #[gpui::test]
     fn choosing_a_sequence_stages_it_and_the_arrow_loads_it(cx: &mut TestAppContext) {
         let mut rig = Rig::new(cx, bare);
