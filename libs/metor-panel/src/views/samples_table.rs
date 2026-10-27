@@ -1,22 +1,24 @@
-//! Every sample of one component as a row: its stamp, and its value as the
-//! strip boxes the rest of the panel shows values in. Further components
-//! ride along as extra columns holding their latest value at or before each
-//! row's stamp, so the first component's cadence sets the rows.
+//! Every sample of the bound components as a row, newest first: its stamp,
+//! which component it came from, and its value as the strip boxes the rest
+//! of the panel shows values in. Several components interleave by stamp
+//! into one list.
 //!
-//! Rows are not copied out of the database. The table indexes the
-//! component's resident `time_series` nodes directly and decodes a sample
-//! only when its row is painted, so the whole history scrolls at the cost
-//! of the thirty rows on screen. Newest is at the top, which makes arriving
-//! samples a prepend; to keep the rows under a reader's eye still, the index
-//! is built against an anchor stamp that only follows the live head while
-//! the table is scrolled to its top. Scrolled away, the anchor freezes and a
-//! chip counts the samples that have landed above it.
+//! Rows are not copied out of the database. Each component's resident
+//! `time_series` nodes are indexed directly and a sample is decoded only
+//! when its row is painted, so the whole history scrolls at the cost of the
+//! thirty rows on screen. Interleaving several components keeps one small
+//! entry per sample naming its component, extended as samples arrive rather
+//! than rebuilt. Newest is at the top, which makes arriving samples a
+//! prepend; to keep the rows under a reader's eye still, the index is built
+//! against an anchor stamp that only follows the live head while the table
+//! is scrolled to its top. Scrolled away, the anchor freezes and a chip
+//! counts the samples that have landed above it.
 
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, Context, ElementId, Entity, IntoElement, Pixels, SharedString, Task, WeakEntity,
-    Window, div, prelude::*, px,
+    AnyElement, Context, Entity, IntoElement, Pixels, SharedString, Task, WeakEntity, Window, div,
+    prelude::*, px,
 };
 use metor_db::time_series::{TimeSeries, TimeSeriesNodeSlice};
 use metor_db::{Component, DB};
@@ -27,16 +29,15 @@ use super::binding::component_name;
 use super::format::{ValueFormatter, format_time};
 use super::table::{CELL_PAD_X, Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use super::value_strip::{StripStyle, render_static_cells, resolve_metadata, strip_row_width};
-use crate::theme::{Theme, theme, ui_px};
+use crate::theme::{theme, ui_px};
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct SamplesTableConfig {
-    /// A component name or the text of an `=` expression. Its samples are
-    /// the rows.
+    /// A component name or the text of an `=` expression.
     pub component: String,
-    /// Further components, each a column read as of the row's stamp.
-    pub columns: Vec<String>,
+    /// Further components whose samples interleave with the first's.
+    pub more_components: Vec<String>,
     pub time_format: SampleTimeFormat,
 }
 
@@ -86,31 +87,28 @@ impl SampleTimeFormat {
     }
 }
 
-/// One more component beside the first, read as of each row's stamp.
+/// A further component whose samples interleave with the first's.
 #[derive(facet::Facet)]
-pub struct SampleColumn {
+pub struct SampleSource {
     pub source: crate::data_binding::Binding,
-    /// What the history watch is bound to, compared against the binding
-    /// on each of the table's frames.
+    /// What the tail is bound to, compared against the binding on each of
+    /// the table's frames.
     #[facet(opaque)]
     bound: Option<ComponentId>,
     /// Resolved once the producer registers.
     #[facet(opaque)]
-    data: Option<Arc<ColumnData>>,
+    data: Option<Arc<SourceData>>,
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    _history: Task<()>,
+    _tail: Task<()>,
 }
 
-impl SampleColumn {
+impl SampleSource {
     fn new(text: &str, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         Self {
             source: crate::data_binding::Binding::from_text(text, &db, cx),
-            bound: None,
-            data: None,
-            db,
-            _history: Task::ready(()),
+            ..Self::empty(db)
         }
     }
 
@@ -120,41 +118,41 @@ impl SampleColumn {
             bound: None,
             data: None,
             db,
-            _history: Task::ready(()),
+            _tail: Task::ready(()),
         }
     }
 
-    /// Follow the binding, and repaint `table` as this component grows so
-    /// held values stay current. Driven from the table's render, since a
-    /// column is data rather than a view.
+    /// Follow the binding, and refresh `table` as this component grows.
+    /// Driven from the table's render, since a source is data rather than a
+    /// view.
     fn rebind(
         &mut self,
-        table: WeakEntity<Table<SamplesDelegate>>,
+        table: WeakEntity<SamplesTable>,
         cx: &mut Context<Self>,
-    ) -> Option<Arc<ColumnData>> {
+    ) -> Option<Arc<SourceData>> {
         self.source.resolve(&self.db, cx);
         let id = self.source.id();
         if self.bound != Some(id) {
             self.bound = Some(id);
             self.data = None;
             let db = self.db.clone();
-            self._history = if id == ComponentId(0) {
+            self._tail = if id == ComponentId(0) {
                 Task::ready(())
             } else {
                 cx.spawn(async move |_, cx| {
                     let component = crate::wait_for_component(&db, id).await;
                     loop {
-                        component.time_series.wait().await;
-                        if table.update(cx, |_, cx| cx.notify()).is_err() {
+                        if table.update(cx, |view, cx| view.refresh(cx)).is_err() {
                             return;
                         }
+                        component.time_series.wait().await;
                     }
                 })
             };
         }
         if self.data.is_none() && id != ComponentId(0) {
             let component = self.db.with_state(|s| s.get_component(id).cloned());
-            self.data = component.map(|component| Arc::new(ColumnData::new(&self.db, component)));
+            self.data = component.map(|component| Arc::new(SourceData::new(&self.db, component)));
         }
         self.data.clone()
     }
@@ -166,7 +164,7 @@ pub struct SamplesTable {
     /// The component whose samples are listed. Editable: picking another
     /// rebinds on the next frame.
     pub source: crate::data_binding::Binding,
-    pub columns: Vec<Entity<SampleColumn>>,
+    pub more_components: Vec<Entity<SampleSource>>,
     pub time_format: SampleTimeFormat,
     /// Display name, or the saved text until something registers it.
     #[facet(skip)]
@@ -175,17 +173,21 @@ pub struct SamplesTable {
     /// each frame.
     #[facet(opaque)]
     bound: Option<ComponentId>,
-    /// The resolved component, once its producer has registered.
+    /// The first component, once its producer has registered.
     #[facet(opaque)]
-    series: Option<Component>,
+    primary: Option<Arc<SourceData>>,
+    /// The further components that have registered, in list order.
+    #[facet(opaque)]
+    more: Vec<Arc<SourceData>>,
     /// The stamp row 0 is anchored to. `None` follows the live head.
     #[facet(opaque)]
     head: Option<Timestamp>,
     #[facet(opaque)]
     selected_time: Option<Timestamp>,
-    /// `(anchor, newest stamp)` the index was built against.
+    /// The anchor and each source's newest stamp and manifest generation
+    /// the index was built against.
     #[facet(opaque)]
-    built: Option<(Timestamp, Timestamp, u64)>,
+    built: Option<(Timestamp, Vec<(ComponentId, Option<Timestamp>, u64)>)>,
     #[facet(opaque)]
     history_task: gpui::Task<()>,
     #[facet(opaque)]
@@ -208,21 +210,22 @@ impl SamplesTable {
     pub fn from_config(cfg: &SamplesTableConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
         let table = cx.new(|_| Table::new(SamplesDelegate::new()));
-        let columns = cfg
-            .columns
+        let more_components = cfg
+            .more_components
             .iter()
             .map(|text| {
                 let db = db.clone();
-                cx.new(|cx| SampleColumn::new(text, db, cx))
+                cx.new(|cx| SampleSource::new(text, db, cx))
             })
             .collect();
         let mut view = Self {
             source,
-            columns,
+            more_components,
             time_format: cfg.time_format,
             component: SharedString::from(cfg.component.clone()),
             bound: None,
-            series: None,
+            primary: None,
+            more: Vec::new(),
             head: None,
             selected_time: None,
             built: None,
@@ -241,10 +244,10 @@ impl SamplesTable {
     pub fn to_config(&self, cx: &gpui::App) -> SamplesTableConfig {
         SamplesTableConfig {
             component: self.source.text(&self.db),
-            columns: self
-                .columns
+            more_components: self
+                .more_components
                 .iter()
-                .map(|column| column.read(cx).source.text(&self.db))
+                .map(|source| source.read(cx).source.text(&self.db))
                 .collect(),
             time_format: self.time_format,
         }
@@ -261,14 +264,14 @@ impl SamplesTable {
             return;
         }
         self.bound = Some(self.source.id());
-        self.series = None;
+        self.primary = None;
         self.head = None;
         self.selected_time = None;
         self.built = None;
         self.history_start = None;
         self.newer = 0;
         self.table.update(cx, |table, cx| {
-            table.delegate_mut().unbind();
+            table.delegate_mut().mux = Mux::default();
             cx.notify();
         });
         if self.source.id() == ComponentId(0) {
@@ -284,15 +287,15 @@ impl SamplesTable {
         self._task = self.spawn_tail(cx);
     }
 
-    /// Hand the delegate the extra columns and the time format, notifying
-    /// the table only when either changed.
-    fn sync_columns(&mut self, cx: &mut Context<Self>) {
-        let weak = self.table.downgrade();
-        let columns: Vec<_> = self
-            .columns
+    /// Follow the further components' bindings, and hand the delegate the
+    /// time format.
+    fn sync_sources(&mut self, cx: &mut Context<Self>) {
+        let weak = cx.entity().downgrade();
+        self.more = self
+            .more_components
             .clone()
             .into_iter()
-            .map(|column| column.update(cx, |column, cx| column.rebind(weak.clone(), cx)))
+            .filter_map(|source| source.update(cx, |source, cx| source.rebind(weak.clone(), cx)))
             .collect();
         let time_format = self.time_format;
         let origin = crate::temporal::snapshot(cx).and_then(|snapshot| {
@@ -300,41 +303,25 @@ impl SamplesTable {
         });
         self.table.update(cx, |table, cx| {
             let delegate = table.delegate_mut();
-            let same = delegate.columns.len() == columns.len()
-                && delegate
-                    .columns
-                    .iter()
-                    .zip(&columns)
-                    .all(|(a, b)| match (a, b) {
-                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                        (None, None) => true,
-                        _ => false,
-                    });
-            if same && delegate.time_format == time_format && delegate.origin == origin {
-                return;
+            if delegate.time_format != time_format || delegate.origin != origin {
+                delegate.time_format = time_format;
+                delegate.origin = origin;
+                cx.notify();
             }
-            delegate.columns = columns;
-            delegate.time_format = time_format;
-            delegate.origin = origin;
-            cx.notify();
         });
     }
 
-    /// Wait for the producer, bind the delegate to its schema, then rebuild
-    /// the index every time the series grows.
+    /// Wait for the producer, then rebuild the index every time the series
+    /// grows.
     fn spawn_tail(&self, cx: &mut Context<Self>) -> Task<()> {
         let db = self.db.clone();
         let component_id = self.source.id();
         cx.spawn(async move |this, cx| {
             let component = crate::wait_for_component(&db, component_id).await;
-            let data = Arc::new(ColumnData::new(&db, component.clone()));
+            let data = Arc::new(SourceData::new(&db, component.clone()));
             let bound = this.update(cx, |view, cx| {
                 view.component = data.name.clone();
-                view.series = Some(component.clone());
-                view.table.update(cx, |table, cx| {
-                    table.delegate_mut().rows = Some(data);
-                    cx.notify();
-                });
+                view.primary = Some(data);
                 view.refresh(cx);
             });
             if bound.is_err() {
@@ -352,18 +339,21 @@ impl SamplesTable {
     /// Bring the index up to date with the series and the anchor.
     ///
     /// Runs on every wake and every render, and rebuilds only when the
-    /// anchor or the newest stamp moved. The anchor follows the head while
-    /// the table is at its top, so scrolling back up by hand is enough to
-    /// return to live.
+    /// anchor or a source's newest stamp or manifest moved. The anchor
+    /// follows the head while the table is at its top, so scrolling back up
+    /// by hand is enough to return to live.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        let Some(component) = &self.series else {
+        let Some(primary) = &self.primary else {
             return;
         };
+        let sources: Vec<Arc<SourceData>> = std::iter::once(primary.clone())
+            .chain(self.more.iter().cloned())
+            .collect();
         let history = crate::data_binding::BoundHistory::for_binding(&self.source, &self.db, cx);
-        let Some(latest) = component
-            .time_series
-            .latest()
-            .map(|l| l.timestamp())
+        let Some(latest) = sources
+            .iter()
+            .filter_map(|s| s.component.time_series.latest().map(|l| l.timestamp()))
+            .max()
             .or_else(|| {
                 history
                     .as_ref()
@@ -392,8 +382,8 @@ impl SamplesTable {
                 .get_or_insert(Timestamp(head.0.saturating_sub(60_000_000)));
             let range = *start..Timestamp(head.0.saturating_add(1));
             history.request(range.clone(), cx);
-            for column in &self.columns {
-                let source = &column.read(cx).source;
+            for source in &self.more_components {
+                let source = &source.read(cx).source;
                 if let Some(history) =
                     crate::data_binding::BoundHistory::for_binding(source, &self.db, cx)
                 {
@@ -401,15 +391,26 @@ impl SamplesTable {
                 }
             }
         }
-        let revision = component.time_series.manifest().generation;
-        if self.built == Some((head, latest, revision)) {
+        let state: Vec<_> = sources
+            .iter()
+            .map(|s| {
+                let series = &s.component.time_series;
+                (
+                    s.component.component_id,
+                    series.latest().map(|l| l.timestamp()),
+                    series.manifest().generation,
+                )
+            })
+            .collect();
+        let built = (head, state);
+        if self.built.as_ref() == Some(&built) {
             return;
         }
-        let index = SampleIndex::build(&component.time_series, head);
-        self.newer = index.newer;
-        self.built = Some((head, latest, revision));
+        self.built = Some(built);
         self.table.update(cx, |table, cx| {
-            table.delegate_mut().index = index;
+            let mux = &mut table.delegate_mut().mux;
+            mux.update(sources, head);
+            self.newer = mux.newer();
             cx.notify();
         });
         cx.notify();
@@ -425,7 +426,7 @@ impl SamplesTable {
 impl Render for SamplesTable {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.rebind(cx);
-        self.sync_columns(cx);
+        self.sync_sources(cx);
         self.refresh(cx);
         let theme = theme(cx);
 
@@ -561,18 +562,15 @@ impl SampleIndex {
     }
 }
 
-const COL_TIME: usize = 0;
-const COL_FIRST: usize = 1;
-
 /// What decoding one component's samples needs.
-pub struct ColumnData {
+pub struct SourceData {
     name: SharedString,
     component: Component,
     formatter: ValueFormatter,
     element_names: Vec<SharedString>,
 }
 
-impl ColumnData {
+impl SourceData {
     fn new(db: &DB, component: Component) -> Self {
         let meta = resolve_metadata(db, component.component_id);
         Self {
@@ -582,110 +580,166 @@ impl ColumnData {
             element_names: meta.element_names,
         }
     }
+}
 
-    /// The latest resident sample at or before `t`: its stamp and bytes.
-    fn at_or_before(&self, t: Timestamp) -> Option<(Timestamp, TimeSeriesNodeSlice, usize)> {
-        let mut best: Option<(Timestamp, TimeSeriesNodeSlice, usize)> = None;
-        for slice in self.component.time_series.iter_node_slices() {
-            let stamps = slice.full_timestamps();
-            let Some(ix) = stamps.partition_point(|s| s.0 <= t.0).checked_sub(1) else {
-                continue;
-            };
-            let stamp = stamps[ix];
-            if best.as_ref().is_none_or(|(b, ..)| stamp.0 > b.0) {
-                best = Some((stamp, slice, ix));
-            }
-        }
-        best
+/// One source's index, as of the last build.
+struct Stream {
+    data: Arc<SourceData>,
+    index: SampleIndex,
+    generation: u64,
+}
+
+impl Stream {
+    /// The stamp and value bytes of this source's `rank`th sample, oldest
+    /// first.
+    fn by_rank(&self, rank: usize) -> Option<(Timestamp, &[u8])> {
+        let row = self.index.rows.checked_sub(rank + 1)?;
+        self.index.sample(row, self.data.component.schema.size())
     }
 }
 
-/// Table delegate: the index plus what decoding a row needs. Unbound until
-/// the component registers; its rows count is zero meanwhile.
+/// Several sources' samples interleaved by stamp.
+///
+/// `order` names each sample by its source and its rank within that source,
+/// oldest first, so a row is a lookup into its source's own index. A single
+/// source needs no order at all. Between manifest changes sources only grow
+/// at their newest end, so an update merges just the new samples into the
+/// order's tail; anything else rebuilds it.
+#[derive(Default)]
+struct Mux {
+    streams: Vec<Stream>,
+    order: Vec<(u16, u32)>,
+}
+
+impl Mux {
+    fn rows(&self) -> usize {
+        match self.streams.as_slice() {
+            [single] => single.index.rows,
+            _ => self.order.len(),
+        }
+    }
+
+    fn newer(&self) -> usize {
+        self.streams.iter().map(|s| s.index.newer).sum()
+    }
+
+    fn update(&mut self, sources: Vec<Arc<SourceData>>, head: Timestamp) {
+        let streams: Vec<Stream> = sources
+            .into_iter()
+            .map(|data| {
+                let series = &data.component.time_series;
+                Stream {
+                    index: SampleIndex::build(series, head),
+                    generation: series.manifest().generation,
+                    data,
+                }
+            })
+            .collect();
+        let extends = self.streams.len() == streams.len()
+            && self.streams.iter().zip(&streams).all(|(old, new)| {
+                Arc::ptr_eq(&old.data, &new.data)
+                    && old.generation == new.generation
+                    && old.index.rows <= new.index.rows
+            });
+        let seen: Vec<usize> = if extends {
+            self.streams.iter().map(|s| s.index.rows).collect()
+        } else {
+            self.order.clear();
+            vec![0; streams.len()]
+        };
+        self.streams = streams;
+        if self.streams.len() < 2 {
+            self.order.clear();
+            return;
+        }
+        let stamp = |streams: &[Stream], (source, rank): (u16, u32)| {
+            streams[source as usize]
+                .by_rank(rank as usize)
+                .map_or(i64::MIN, |(t, _)| t.0)
+        };
+        let mut fresh: Vec<(i64, u16, u32)> = self
+            .streams
+            .iter()
+            .zip(seen)
+            .enumerate()
+            .flat_map(|(source, (stream, seen))| {
+                (seen..stream.index.rows).map(move |rank| (source as u16, rank as u32))
+            })
+            .map(|entry| (stamp(&self.streams, entry), entry.0, entry.1))
+            .collect();
+        let Some(&first) = fresh.iter().min() else {
+            return;
+        };
+        // A lagging source can land samples older than the order's newest,
+        // so the tail from there is merged again.
+        let from = self
+            .order
+            .partition_point(|&e| (stamp(&self.streams, e), e.0, e.1) < first);
+        fresh.extend(
+            self.order
+                .drain(from..)
+                .map(|e| (stamp(&self.streams, e), e.0, e.1)),
+        );
+        fresh.sort_unstable();
+        self.order
+            .extend(fresh.into_iter().map(|(_, source, rank)| (source, rank)));
+    }
+
+    /// Row `row`, newest first: its source, stamp and value bytes.
+    fn sample(&self, row: usize) -> Option<(&SourceData, Timestamp, &[u8])> {
+        let (stream, rank) = match self.streams.as_slice() {
+            [single] => (single, single.index.rows.checked_sub(row + 1)?),
+            _ => {
+                let at = self.order.len().checked_sub(row + 1)?;
+                let (source, rank) = self.order[at];
+                (&self.streams[source as usize], rank as usize)
+            }
+        };
+        let (stamp, bytes) = stream.by_rank(rank)?;
+        Some((&stream.data, stamp, bytes))
+    }
+}
+
+const COL_TIME: usize = 0;
+
+/// Table delegate: the interleaved index plus how to show a stamp. Empty
+/// until the first component registers.
 pub struct SamplesDelegate {
-    /// The component whose samples are the rows.
-    rows: Option<Arc<ColumnData>>,
-    /// The extra components, `None` until each registers.
-    columns: Vec<Option<Arc<ColumnData>>>,
+    mux: Mux,
     time_format: SampleTimeFormat,
     /// T0 for [`SampleTimeFormat::Elapsed`].
     origin: Option<Timestamp>,
     style: StripStyle,
-    index: SampleIndex,
 }
 
 impl SamplesDelegate {
     fn new() -> Self {
         Self {
-            rows: None,
-            columns: Vec::new(),
+            mux: Mux::default(),
             time_format: SampleTimeFormat::default(),
             origin: None,
             style: StripStyle::boxes().with_intrinsic_width(),
-            index: SampleIndex::empty(),
         }
     }
 
-    fn unbind(&mut self) {
-        self.rows = None;
-        self.index = SampleIndex::empty();
+    /// Whether rows need saying which component they came from.
+    fn muxed(&self) -> bool {
+        self.mux.streams.len() > 1
     }
-}
-
-/// One value as a single line of strip boxes, scrolling sideways when the
-/// strip is wider than the column; axis-restricted so the wheel still
-/// scrolls the table.
-fn value_cell(
-    row_ix: usize,
-    col_ix: usize,
-    column: &ColumnData,
-    bytes: &[u8],
-    style: &StripStyle,
-    theme: &Theme,
-) -> gpui::Stateful<gpui::Div> {
-    let id = ElementId::NamedInteger(
-        SharedString::from(format!("samples-strip-{col_ix}")),
-        row_ix as u64,
-    );
-    let mut scroll = div()
-        .id(id)
-        .flex()
-        .items_center()
-        .h_full()
-        .px(ui_px(4.0))
-        .overflow_x_scroll();
-    scroll.style().restrict_scroll_to_axis = Some(true);
-    let Ok((_size, view)) = column.component.schema.parse_value(bytes) else {
-        return scroll;
-    };
-    let cells = column.formatter.format_cells(&view, &column.element_names);
-    let mut line = render_static_cells(row_ix, &cells, style, theme);
-    if cells.len() > 1 {
-        line = line.min_w(ui_px(strip_row_width(cells.len())));
-    }
-    line.style().flex_shrink = Some(0.0);
-    scroll.child(line)
 }
 
 impl TableDelegate for SamplesDelegate {
     fn columns(&self) -> Vec<Column> {
-        let name = |name: Option<&SharedString>| name.cloned().unwrap_or("Value".into());
-        let mut columns = vec![
-            Column::new("Time", self.time_format.width()),
-            Column::new(name(self.rows.as_ref().map(|r| &r.name)), 320.0)
-                .flex()
-                .resizable(false),
-        ];
-        columns.extend(self.columns.iter().map(|column| {
-            Column::new(name(column.as_ref().map(|c| &c.name)), 240.0)
-                .flex()
-                .resizable(false)
-        }));
+        let mut columns = vec![Column::new("Time", self.time_format.width())];
+        if self.muxed() {
+            columns.push(Column::new("Component", 160.0));
+        }
+        columns.push(Column::new("Value", 320.0).flex().resizable(false));
         columns
     }
 
     fn rows_count(&self) -> usize {
-        self.index.rows
+        self.mux.rows()
     }
 
     fn row_height(&self) -> Pixels {
@@ -700,48 +754,51 @@ impl TableDelegate for SamplesDelegate {
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
         let theme = theme(cx);
-        let Some(rows) = &self.rows else {
+        let Some((source, stamp, bytes)) = self.mux.sample(row_ix) else {
             return div().into_any_element();
         };
-        let Some((stamp, bytes)) = self.index.sample(row_ix, rows.component.schema.size()) else {
-            return div().into_any_element();
-        };
-        match col_ix {
-            COL_TIME => div()
+        let text_cell = |text: String, color| {
+            div()
                 .flex()
                 .items_center()
                 .h_full()
                 .px(ui_px(CELL_PAD_X))
                 .whitespace_nowrap()
-                .text_color(theme.text_tertiary)
-                .child(SharedString::from(
-                    self.time_format.format(stamp, self.origin),
-                ))
-                .into_any_element(),
-            COL_FIRST => {
-                value_cell(row_ix, col_ix, rows, bytes, &self.style, &theme).into_any_element()
-            }
-            _ => {
-                let Some(Some(column)) = self.columns.get(col_ix - COL_FIRST - 1) else {
-                    return div().into_any_element();
-                };
-                let Some((held, slice, ix)) = column.at_or_before(stamp) else {
-                    return div().into_any_element();
-                };
-                let size = column.component.schema.size();
-                let Some(bytes) = slice.full_data().get(ix * size..(ix + 1) * size) else {
-                    return div().into_any_element();
-                };
-                let cell = value_cell(row_ix, col_ix, column, bytes, &self.style, &theme);
-                // A value carried forward from an earlier sample reads
-                // quieter than one stamped on this row.
-                if held == stamp {
-                    cell.into_any_element()
-                } else {
-                    cell.opacity(0.5).into_any_element()
-                }
-            }
+                .overflow_hidden()
+                .text_color(color)
+                .child(SharedString::from(text))
+                .into_any_element()
+        };
+        if col_ix == COL_TIME {
+            return text_cell(
+                self.time_format.format(stamp, self.origin),
+                theme.text_tertiary,
+            );
         }
+        if self.muxed() && col_ix == COL_TIME + 1 {
+            return text_cell(source.name.to_string(), theme.text_secondary);
+        }
+        let Ok((_size, view)) = source.component.schema.parse_value(bytes) else {
+            return div().into_any_element();
+        };
+        let cells = source.formatter.format_cells(&view, &source.element_names);
+        // One line per row, scrolling sideways when the strip is wider than
+        // the column; axis-restricted so the wheel still scrolls the table.
+        let mut line = render_static_cells(row_ix, &cells, &self.style, &theme);
+        if cells.len() > 1 {
+            line = line.min_w(ui_px(strip_row_width(cells.len())));
+        }
+        line.style().flex_shrink = Some(0.0);
+        let mut scroll = div()
+            .id(("samples-strip", row_ix))
+            .flex()
+            .items_center()
+            .h_full()
+            .px(ui_px(4.0))
+            .overflow_x_scroll()
+            .child(line);
+        scroll.style().restrict_scroll_to_axis = Some(true);
+        scroll.into_any_element()
     }
 
     fn sort_column(&mut self, _: usize, _: ColumnSort, _: &mut Context<Table<Self>>) {}
@@ -820,6 +877,93 @@ mod tests {
         assert!(index.sample(0, 8).is_none());
     }
 
+    /// Push `stamps` onto a fresh F64 component named `name` in `db`, each
+    /// value equal to its stamp, and wait until they are resident.
+    async fn push_stamps(db: &DB, name: &str, stamps: &[i64]) -> Arc<SourceData> {
+        let id = ComponentId::new(name);
+        let component = match db.with_state(|state| state.get_component(id).cloned()) {
+            Some(component) => component,
+            None => {
+                db.with_state_mut(|state| {
+                    state.insert_component(
+                        id,
+                        ComponentSchema::new(PrimType::F64, &[][..]),
+                        &db.path,
+                    )
+                })
+                .unwrap();
+                db.with_state(|state| state.get_component(id).cloned())
+                    .unwrap()
+            }
+        };
+        for &t in stamps {
+            component
+                .push_buf(Timestamp(t), &(t as f64).to_le_bytes())
+                .unwrap();
+        }
+        let last = stamps.last().copied().map(Timestamp);
+        for _ in 0..200 {
+            if component.time_series.latest().map(|l| l.timestamp()) == last {
+                break;
+            }
+            stellarator::sleep(Duration::from_millis(5)).await;
+        }
+        Arc::new(SourceData::new(db, component))
+    }
+
+    fn rows_of(mux: &Mux) -> Vec<(SharedString, i64)> {
+        (0..mux.rows())
+            .map(|row| {
+                let (source, stamp, bytes) = mux.sample(row).unwrap();
+                assert_eq!(value(bytes), stamp.0 as f64);
+                (source.name.clone(), stamp.0)
+            })
+            .collect()
+    }
+
+    #[stellarator::test]
+    async fn sources_interleave_newest_first_and_extend_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = DB::create(temp.path().join("db")).unwrap();
+        let a = push_stamps(&db, "mux.a", &[1, 4, 6]).await;
+        let b = push_stamps(&db, "mux.b", &[2, 3, 7]).await;
+        let mut mux = Mux::default();
+        mux.update(vec![a.clone(), b.clone()], Timestamp(6));
+        let (an, bn) = (a.name.clone(), b.name.clone());
+        assert_eq!(
+            rows_of(&mux),
+            [
+                (an.clone(), 6),
+                (an.clone(), 4),
+                (bn.clone(), 3),
+                (bn.clone(), 2),
+                (an.clone(), 1)
+            ]
+        );
+        assert_eq!(mux.newer(), 1);
+
+        // `a` runs ahead, then `b` catches up with a sample older than it.
+        push_stamps(&db, "mux.a", &[9]).await;
+        mux.update(vec![a.clone(), b.clone()], Timestamp(9));
+        assert_eq!(mux.sample(0).unwrap().1, Timestamp(9));
+        push_stamps(&db, "mux.b", &[8]).await;
+        mux.update(vec![a.clone(), b.clone()], Timestamp(9));
+        assert_eq!(
+            rows_of(&mux)[..4],
+            [
+                (an.clone(), 9),
+                (bn.clone(), 8),
+                (bn.clone(), 7),
+                (an.clone(), 6)
+            ]
+        );
+        assert_eq!(mux.rows(), 8);
+
+        mux.update(vec![b.clone()], Timestamp(9));
+        assert_eq!(mux.rows(), 4);
+        assert_eq!(mux.sample(0).unwrap().1, Timestamp(8));
+    }
+
     #[gpui::test]
     fn browsing_preserves_anchor_and_page_until_returning_to_top(cx: &mut gpui::TestAppContext) {
         let temp = tempfile::tempdir().unwrap();
@@ -892,7 +1036,7 @@ mod tests {
                     assert_eq!(view.selected_time, Some(Timestamp(20)));
                     assert_eq!(view.history_start, Some(Timestamp(-120_000_000)));
                     assert_eq!(
-                        view.table.read(cx).delegate().index.sample(0, 8).unwrap().0,
+                        view.table.read(cx).delegate().mux.sample(0).unwrap().1,
                         Timestamp(20)
                     );
                 });
@@ -908,7 +1052,7 @@ mod tests {
                 assert_eq!(view.selected_time, Some(Timestamp(10)));
                 assert_eq!(view.history_start, Some(Timestamp(10 - 60_000_000)));
                 assert_eq!(
-                    view.table.read(cx).delegate().index.sample(0, 8).unwrap().0,
+                    view.table.read(cx).delegate().mux.sample(0).unwrap().1,
                     Timestamp(10)
                 );
             })
@@ -919,13 +1063,13 @@ mod tests {
     fn config_round_trips() {
         let cfg = SamplesTableConfig {
             component: "=a.b * 2".into(),
-            columns: vec!["c.d".into()],
+            more_components: vec!["c.d".into()],
             time_format: SampleTimeFormat::Elapsed,
         };
         let back: SamplesTableConfig =
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.component, cfg.component);
-        assert_eq!(back.columns, cfg.columns);
+        assert_eq!(back.more_components, cfg.more_components);
         assert_eq!(back.time_format, cfg.time_format);
         let partial: SamplesTableConfig = serde_json::from_str("{}").unwrap();
         assert!(partial.component.is_empty());
