@@ -18,6 +18,7 @@ fn registry(channels: &[(&str, &[&str])]) -> SequenceRegistry {
             .map(|(name, available)| SequenceChannelSpec {
                 name: (*name).to_string(),
                 available: available.iter().map(|s| (*s).to_string()).collect(),
+                ..Default::default()
             })
             .collect(),
     }
@@ -243,6 +244,21 @@ fn registry_update_preserves_runtime_state() {
     assert_eq!(ch.available.len(), 2);
     assert_eq!(ch.loaded.as_ref().map(|s| s.as_ref()), Some("solar"));
     assert_eq!(ch.run_state, SequenceRunState::Running);
+}
+
+#[test]
+fn registry_carries_channel_clocks() {
+    let mut state = SequenceState::default();
+    let mut declared = registry(&[("deploy", &["solar"])]);
+    declared.channels[0].clock = Some("deploy.t".into());
+    state.apply_registry(ts(1), declared);
+    let ch = state.channel("deploy").unwrap();
+    assert_eq!(ch.clock.as_deref(), Some("deploy.t"));
+    assert_eq!(ch.abort_clock, None);
+
+    // A later registry that drops the clock drops it from the channel too.
+    state.apply_registry(ts(2), registry(&[("deploy", &["solar"])]));
+    assert_eq!(state.channel("deploy").unwrap().clock, None);
 }
 
 #[test]

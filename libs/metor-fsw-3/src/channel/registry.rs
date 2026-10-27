@@ -28,6 +28,12 @@ pub struct ChannelSpec {
     pub name: String,
     #[serde(default)]
     pub available: Vec<String>,
+    /// The component holding the channel's run clock, in seconds.
+    #[serde(default)]
+    pub clock: Option<String>,
+    /// The component holding the channel's abort clock, in seconds.
+    #[serde(default)]
+    pub abort_clock: Option<String>,
 }
 
 /// The period used when the config does not set one.
@@ -53,6 +59,8 @@ impl Registry {
                 .map(|spec| SequenceChannelSpec {
                     name: spec.name,
                     available: spec.available,
+                    clock: spec.clock,
+                    abort_clock: spec.abort_clock,
                 })
                 .collect(),
         };
@@ -115,14 +123,18 @@ mod tests {
 
     #[test]
     fn test_registry_decodes_to_params() {
-        let mut state = make(json!({ "channels": [{ "name": "mode", "available": ["a"] }] }))
-            .expect("valid params");
+        let mut state = make(json!({
+            "channels": [{ "name": "mode", "available": ["a"], "clock": "fsw.mode.t" }]
+        }))
+        .expect("valid params");
         let (_ring, mut output, mut input) = pair::<SequenceRegistry>(4);
         channel_registry()(&mut state, &mut output);
         let registry = input.drain().next().expect("a record").expect("decodes");
         assert_eq!(registry.channels.len(), 1);
         assert_eq!(registry.channels[0].name, "mode");
         assert_eq!(registry.channels[0].available, ["a"]);
+        assert_eq!(registry.channels[0].clock.as_deref(), Some("fsw.mode.t"));
+        assert_eq!(registry.channels[0].abort_clock, None);
     }
 
     #[test]

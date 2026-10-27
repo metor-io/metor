@@ -64,7 +64,7 @@ pub use monitor::{Monitor, MonitorConfig};
 pub use outline::{Col, ComponentOutline, OutlineColumns, default_columns};
 pub use samples_table::{SampleSource, SampleTimeFormat, SamplesTable, SamplesTableConfig};
 pub use scrollbar::Scrollbar;
-pub use sequence_control::{SequenceControl, SequenceControlConfig};
+pub use sequence_control::{SequenceControl, SequenceControlConfig, SequenceLayout};
 pub use sequence_grid::SequenceGrid;
 pub use sequence_panel::SequenceView;
 pub use spectrogram::{

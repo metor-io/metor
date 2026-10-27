@@ -49,6 +49,10 @@ pub struct ChannelState {
     /// The latest status line reported by a `Loading`/`Progress`/`Failed` event.
     pub last_message: Option<SharedString>,
     pub updated_at: Timestamp,
+    /// Component holding the run clock in seconds, when the channel names one.
+    pub clock: Option<SharedString>,
+    /// Component holding the abort clock in seconds, when the channel names one.
+    pub abort_clock: Option<SharedString>,
 }
 
 /// One entry in the sequence history log shown by the panel.
@@ -92,8 +96,12 @@ impl SequenceState {
                     run_state: SequenceRunState::Idle,
                     last_message: None,
                     updated_at: timestamp,
+                    clock: None,
+                    abort_clock: None,
                 });
             channel.available = available;
+            channel.clock = spec.clock.map(SharedString::from);
+            channel.abort_clock = spec.abort_clock.map(SharedString::from);
             self.channels.push(channel);
         }
     }

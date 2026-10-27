@@ -8,14 +8,18 @@
 use std::sync::Arc;
 
 use gpui::{AnyElement, Context, Entity, IntoElement, SharedString, Window, div, prelude::*, px};
+use metor_db::DB;
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::SequenceRunState;
 
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::sequences::{self, is_resettable, run_state_index, run_state_label};
 use crate::theme::{theme, ui_px};
-use crate::views::sequence_control::{SequenceControl, SequenceControlConfig};
+use crate::views::sequence_control::{SequenceControl, SequenceControlConfig, SequenceLayout};
 use crate::views::table;
+
+/// Size of one square control in the channel grid, in unscaled pixels.
+const SQUARE_TILE: (f32, f32) = (260.0, 132.0);
 
 /// Run-state chips to surface in the header, in display order. `Idle` is omitted as noise.
 const CHIP_STATES: [SequenceRunState; 5] = [
@@ -39,21 +43,28 @@ pub enum SequenceListMode {
 #[derive(facet::Facet)]
 pub struct SequenceView {
     pub mode: SequenceListMode,
+    /// How each channel's control lays out. Square controls tile in a wrapping grid;
+    /// the others stack as rows.
+    pub layout: SequenceLayout,
     /// One control per declared channel, in display order. Kept across renders so a
     /// staged load or an armed Stop survives the store's next event.
     #[facet(opaque)]
     controls: Vec<(SharedString, Entity<SequenceControl>)>,
+    #[facet(opaque)]
+    db: Arc<DB>,
 }
 
 impl SequenceView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         // Repaint whenever the control system declares channels or reports an event.
         if let Some(store) = sequences::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
         }
         Self {
             mode: SequenceListMode::default(),
+            layout: SequenceLayout::Medium,
             controls: Vec::new(),
+            db,
         }
     }
 
@@ -318,6 +329,24 @@ impl Render for SequenceView {
                 self.sync_controls(&channels, cx);
                 if self.controls.is_empty() {
                     list = list.child(empty_row(&theme, "No channels declared"));
+                } else if self.layout == SequenceLayout::Square {
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(ui_px(8.0))
+                            .p(ui_px(8.0))
+                            .children(self.controls.iter().map(|(_, control)| {
+                                div()
+                                    .w(ui_px(SQUARE_TILE.0))
+                                    .h(ui_px(SQUARE_TILE.1))
+                                    .rounded(ui_px(6.0))
+                                    .border_1()
+                                    .border_color(theme.border_primary)
+                                    .child(control.clone())
+                            })),
+                    );
                 } else {
                     list = list.children(self.controls.iter().map(|(_, control)| {
                         div()
@@ -347,6 +376,15 @@ impl SequenceView {
     /// Match the controls to the declared channels, keeping each surviving
     /// channel's control (and whatever it has staged or armed).
     fn sync_controls(&mut self, channels: &[SharedString], cx: &mut Context<Self>) {
+        for (_, control) in &self.controls {
+            if control.read(cx).layout != self.layout {
+                let layout = self.layout;
+                control.update(cx, |control, cx| {
+                    control.layout = layout;
+                    cx.notify();
+                });
+            }
+        }
         if self.controls.len() == channels.len()
             && self.controls.iter().zip(channels).all(|((a, _), b)| a == b)
         {
@@ -361,9 +399,10 @@ impl SequenceView {
                     None => {
                         let cfg = SequenceControlConfig {
                             channel: name.to_string(),
-                            compact: false,
+                            layout: self.layout,
                         };
-                        cx.new(|cx| SequenceControl::from_config(&cfg, cx))
+                        let db = self.db.clone();
+                        cx.new(|cx| SequenceControl::from_config(&cfg, db, cx))
                     }
                 };
                 (name.clone(), control)

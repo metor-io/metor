@@ -713,11 +713,21 @@ pub const SEQUENCE_CHANNEL_NAME_CAP: usize = 48;
 pub type SequenceName = String;
 
 /// One channel slot declared by the control system: its name (the channel's stable
-/// address) and the set of sequence names that may be loaded into it.
-#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
+/// address), the set of sequence names that may be loaded into it, and the components
+/// that time its runs.
+///
+/// The clocks are ordinary telemetry components, named here so a sequence UI can read
+/// them like any other: each holds a scalar count of seconds. `None` means the channel
+/// publishes no such clock.
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Default)]
 pub struct SequenceChannelSpec {
     pub name: SequenceChannelName,
     pub available: Vec<SequenceName>,
+    /// Component holding the run clock: seconds since the loaded sequence started.
+    pub clock: Option<String>,
+    /// Component holding the abort clock: seconds since a commanded abort began,
+    /// counting while the sequence winds down gracefully.
+    pub abort_clock: Option<String>,
 }
 
 /// Whole-registry declaration of the sequence channels, broadcast by the control system.
@@ -1332,10 +1342,13 @@ mod sequence_tests {
                 SequenceChannelSpec {
                     name: "deploy".into(),
                     available: vec!["deploy_solar_array".into(), "deploy_antenna".into()],
+                    clock: Some("deploy.t".into()),
+                    abort_clock: Some("deploy.abort_t".into()),
                 },
                 SequenceChannelSpec {
                     name: "attitude".into(),
                     available: vec!["detumble".into()],
+                    ..Default::default()
                 },
             ],
         };
@@ -1394,13 +1407,17 @@ mod sequence_tests {
             channels: vec![SequenceChannelSpec {
                 name: "adcs".into(),
                 available: vec!["detumble".into()],
+                clock: Some("t".into()),
+                abort_clock: None,
             }],
         };
         assert_eq!(
             postcard::to_allocvec(&registry).unwrap(),
-            // 1 channel; name "adcs" (len 4); 1 available; "detumble" (len 8).
+            // 1 channel; name "adcs" (len 4); 1 available; "detumble" (len 8); clock
+            // Some("t"); abort clock None.
             [
-                1, 4, b'a', b'd', b'c', b's', 1, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l', b'e'
+                1, 4, b'a', b'd', b'c', b's', 1, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l', b'e',
+                1, 1, b't', 0
             ]
         );
 

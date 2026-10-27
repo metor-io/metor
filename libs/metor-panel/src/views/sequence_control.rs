@@ -6,15 +6,20 @@
 //! that third shape: one channel, its state and progress, and the verbs
 //! reachable in a single click rather than through the inspector.
 //!
-//! The shape is one strip-height row: the channel and its run state over a
-//! state-chip box naming the sequence on the left, transport-style icon
-//! buttons on the right, all one box height. Picking from the box only
-//! stages a choice; the chevron fused to its right edge sends the load, the same stage-then-apply pair a value strip uses for a
-//! pending edit, since a load replaces whatever the channel holds. The
-//! protocol has no pause, so the slot a transport gives pause holds Abort
-//! (the commanded safe stop, under its own glyph) rather than a hold the
-//! control system couldn't honor; the play slot turns into Reset once a run
-//! has ended.
+//! Every layout is built from the same pieces: the channel's run state and
+//! latest status message, a state-chip box naming the sequence, the run and
+//! abort clocks, and transport-style icon buttons. [`SequenceLayout`] only
+//! arranges them for the space the control has. Picking from the box only
+//! stages a choice; the chevron fused to its right edge sends the load, the
+//! same stage-then-apply pair a value strip uses for a pending edit, since a
+//! load replaces whatever the channel holds. The protocol has no pause, so
+//! the slot a transport gives pause holds Abort (the commanded safe stop,
+//! under its own glyph) rather than a hold the control system couldn't
+//! honor; the play slot turns into Reset once a run has ended.
+//!
+//! The clocks are ordinary components the channel names in its registry
+//! entry, streamed like any instrument's value. The abort clock only shows
+//! while it runs, since a graceful stop is the only time it means anything.
 //!
 //! No new command plumbing — the buttons drive the same
 //! [`SequenceStore`](crate::sequences::SequenceStore) the list does, so the
@@ -26,6 +31,8 @@ use gpui::{
     App, ClickEvent, Context, Div, Hsla, IntoElement, SharedString, Stateful, WeakEntity, Window,
     div, prelude::*,
 };
+use metor_db::DB;
+use metor_proto::types::ComponentId;
 use metor_proto_wkt::SequenceRunState;
 use serde::{Deserialize, Serialize};
 
@@ -35,28 +42,46 @@ use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, ChannelState, is_resettable, run_state_index, run_state_label};
 use crate::theme::{Theme, theme, ui_px};
 use crate::views::TooltipText;
+use crate::views::binding::spawn_scalar_stream;
 use crate::views::value_strip::{
     STRIP_BOX_HEIGHT, STRIP_BOX_VALUE_SIZE, apply_chevron, box_corners, box_fill, box_padding,
 };
 
 /// Persisted shape of a [`SequenceControl`], shared by the tile and dashboard
 /// surfaces.
+///
+/// Saved controls from before layouts carried a `compact` flag instead; it is
+/// ignored, since both of its shapes load best as [`SequenceLayout::Compact`].
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct SequenceControlConfig {
     /// Channel name — the address every published command carries.
     pub channel: String,
-    /// One row at button height: the channel and run-state line folds into
-    /// the status dot beside the sequence (its text in the dot's tooltip).
-    /// For a strip too short for two lines.
-    pub compact: bool,
+    pub layout: SequenceLayout,
+}
+
+/// How a control arranges itself, chosen for the space it has.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, facet::Facet)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum SequenceLayout {
+    /// The status line over one row of sequence, clocks and buttons; a
+    /// dashboard strip.
+    #[default]
+    Compact,
+    /// Sequence over status on the left, buttons as tall as both on the
+    /// right; a list row.
+    Medium,
+    /// Status, then sequence, then clocks and buttons, each a row of its
+    /// own; a dashboard tile with room for a long status message.
+    Square,
 }
 
 /// Single-channel sequence control.
 #[derive(facet::Facet)]
 pub struct SequenceControl {
     pub channel: SharedString,
-    pub compact: bool,
+    pub layout: SequenceLayout,
     /// Set by the first Stop click, cleared by any other action. Stop is the
     /// unsafe hard-drop, so it takes two deliberate clicks — the same guard
     /// the channel list uses.
@@ -67,25 +92,42 @@ pub struct SequenceControl {
     /// commit arrow sends it.
     #[facet(skip)]
     staged: Option<SharedString>,
+    #[facet(opaque)]
+    run_clock: ClockFeed,
+    #[facet(opaque)]
+    abort_clock: ClockFeed,
+    #[facet(opaque)]
+    db: Arc<DB>,
+}
+
+/// One clock component's latest reading, and the stream keeping it current.
+#[derive(Default)]
+struct ClockFeed {
+    bound: Option<ComponentId>,
+    seconds: Option<f64>,
+    _stream: Option<gpui::Task<()>>,
 }
 
 impl SequenceControl {
-    pub fn from_config(cfg: &SequenceControlConfig, cx: &mut Context<Self>) -> Self {
+    pub fn from_config(cfg: &SequenceControlConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         if let Some(store) = sequences::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
         }
         Self {
             channel: SharedString::from(cfg.channel.clone()),
-            compact: cfg.compact,
+            layout: cfg.layout,
             arming_stop: false,
             staged: None,
+            run_clock: ClockFeed::default(),
+            abort_clock: ClockFeed::default(),
+            db,
         }
     }
 
     pub fn to_config(&self) -> SequenceControlConfig {
         SequenceControlConfig {
             channel: self.channel.to_string(),
-            compact: self.compact,
+            layout: self.layout,
         }
     }
 
@@ -97,6 +139,57 @@ impl SequenceControl {
             act(store.read(cx), &self.channel);
         }
         cx.notify();
+    }
+
+    /// Follow the clock components the channel's registry entry names.
+    fn bind_clocks(&mut self, ch: &ChannelState, cx: &mut Context<Self>) {
+        let want = |name: &Option<SharedString>| {
+            name.as_ref()
+                .filter(|n| !n.is_empty())
+                .map(|n| ComponentId::new(n))
+        };
+        let (run, abort) = (want(&ch.clock), want(&ch.abort_clock));
+        if self.run_clock.bound != run {
+            self.run_clock = ClockFeed::stream(run, &self.db, cx, |this| &mut this.run_clock);
+        }
+        if self.abort_clock.bound != abort {
+            self.abort_clock = ClockFeed::stream(abort, &self.db, cx, |this| &mut this.abort_clock);
+        }
+    }
+}
+
+impl ClockFeed {
+    fn stream(
+        id: Option<ComponentId>,
+        db: &Arc<DB>,
+        cx: &mut Context<SequenceControl>,
+        feed: fn(&mut SequenceControl) -> &mut ClockFeed,
+    ) -> Self {
+        let Some(id) = id else {
+            return Self::default();
+        };
+        let stream = spawn_scalar_stream(db.clone(), id, 0, cx, move |this, seconds, cx| {
+            feed(this).seconds = seconds;
+            cx.notify();
+        });
+        Self {
+            bound: Some(id),
+            seconds: None,
+            _stream: Some(stream),
+        }
+    }
+}
+
+/// `T+MM:SS` (or `T+H:MM:SS` past an hour) from a count of seconds;
+/// negative counts read `T-`, a countdown to the start.
+fn format_clock(seconds: f64) -> String {
+    let sign = if seconds < 0.0 { '-' } else { '+' };
+    let total = seconds.abs().floor() as u64;
+    let (h, m, s) = (total / 3600, total / 60 % 60, total % 60);
+    if h > 0 {
+        format!("T{sign}{h}:{m:02}:{s:02}")
+    } else {
+        format!("T{sign}{m:02}:{s:02}")
     }
 }
 
@@ -110,7 +203,7 @@ impl Render for SequenceControl {
             .as_ref()
             .and_then(|s| s.read(cx).state().channel(&channel).cloned())
         else {
-            return strip().justify_center().child(
+            return frame(SequenceLayout::Compact).justify_center().child(
                 div()
                     .truncate()
                     .text_size(ui_px(11.0))
@@ -124,134 +217,224 @@ impl Render for SequenceControl {
                     }),
             );
         };
+        self.bind_clocks(&ch, cx);
 
-        let state_color = theme.run_state_color(run_state_index(ch.run_state));
-        let arming = self.arming_stop;
-
-        // Armed, the confirm prompt takes the whole line: in a narrow card
-        // the channel and state would otherwise squeeze it to nothing, and
-        // it is the one line the operator must not miss.
-        let status = ch.last_message.clone();
-        let dot_color = if arming {
-            theme.error_accent
-        } else {
-            state_color
-        };
-        let dot = || {
-            div()
-                .flex_none()
-                .size(ui_px(6.0))
-                .rounded(ui_px(3.0))
-                .bg(dot_color)
-        };
-
-        if self.compact {
-            // The subtitle's words, for the one line that no longer shows them.
-            let summary = match (arming, &status) {
-                (true, _) => SharedString::new_static("click stop again"),
-                (false, Some(message)) => SharedString::from(format!(
-                    "{} {} · {message}",
-                    ch.name.to_lowercase(),
-                    run_state_label(ch.run_state).to_lowercase()
-                )),
-                (false, None) => SharedString::from(format!(
-                    "{} {}",
-                    ch.name.to_lowercase(),
-                    run_state_label(ch.run_state).to_lowercase()
-                )),
-            };
-            let label = div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(ui_px(6.0))
-                .child(
+        let status = self.status(&ch, &theme);
+        let load = self.load_row(&ch, &theme, cx);
+        let clocks = self.clocks(&theme);
+        match self.layout {
+            SequenceLayout::Compact => {
+                let top = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(ui_px(8.0))
+                    .min_w_0()
+                    .child(status.flex_1())
+                    .when_some(clocks, |el, clocks| el.child(clocks));
+                let bottom = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(ui_px(8.0))
+                    .min_w_0()
+                    .child(load.flex_1())
+                    .child(self.buttons(&ch, STRIP_BOX_HEIGHT, &theme, cx));
+                frame(self.layout).gap(ui_px(4.0)).child(top).child(bottom)
+            }
+            SequenceLayout::Medium => {
+                let state = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(ui_px(8.0))
+                    .min_w_0()
+                    .child(status.flex_1())
+                    .when_some(clocks, |el, clocks| el.child(clocks));
+                let left = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(ui_px(4.0))
+                    .child(load)
+                    .child(state);
+                // The buttons stand as tall as the sequence and status rows
+                // together, so the row reads as one block.
+                frame(self.layout).child(
                     div()
-                        .id("seq-ctl-status")
-                        .flex_none()
-                        .child(dot())
-                        .tooltip(move |_window, cx| TooltipText::build(summary.clone(), cx)),
+                        .flex()
+                        .flex_row()
+                        .items_stretch()
+                        .gap(ui_px(10.0))
+                        .min_w_0()
+                        .child(left)
+                        .child(self.buttons(&ch, MEDIUM_HEIGHT, &theme, cx)),
                 )
-                .child(self.load_row(&ch, &theme, cx));
-            return self.with_buttons(label, &ch, &theme, cx);
+            }
+            SequenceLayout::Square => {
+                let bottom = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(ui_px(8.0))
+                    .min_w_0()
+                    .child(div().flex_1().min_w_0().children(clocks))
+                    .child(self.buttons(&ch, SQUARE_BUTTON, &theme, cx));
+                frame(self.layout)
+                    .justify_between()
+                    .gap(ui_px(8.0))
+                    .child(status)
+                    .child(load)
+                    .child(bottom)
+            }
         }
+    }
+}
 
-        let subtitle = div()
+/// Height of a medium control's two rows, which its buttons match.
+const MEDIUM_HEIGHT: f32 = STRIP_BOX_HEIGHT + 4.0 + STATUS_LINE;
+/// Line height of the status message.
+const STATUS_LINE: f32 = 18.0;
+/// A square control's buttons, larger since it has the room.
+const SQUARE_BUTTON: f32 = 32.0;
+
+impl SequenceControl {
+    /// The run state and latest status message, led by the state dot.
+    /// Armed, the confirm prompt takes the whole line: it is the one line the
+    /// operator must not miss.
+    fn status(&self, ch: &ChannelState, theme: &Theme) -> Stateful<Div> {
+        let arming = self.arming_stop;
+        let state_color = theme.run_state_color(run_state_index(ch.run_state));
+        let square = self.layout == SequenceLayout::Square;
+        let dot = div()
+            .flex_none()
+            .size(ui_px(7.0))
+            .rounded(ui_px(3.5))
+            .bg(if arming {
+                theme.error_accent
+            } else {
+                state_color
+            });
+        let line = div()
             .id("seq-ctl-status")
             .flex()
             .flex_row()
             .items_center()
-            .gap(ui_px(4.0))
+            .gap(ui_px(6.0))
             .min_w_0()
-            .text_size(ui_px(10.0))
-            .child(dot())
-            .map(|el| {
-                if arming {
-                    return el.child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(theme.error_accent)
-                            .child("click stop again"),
-                    );
-                }
-                el.child(
+            .text_size(ui_px(12.0))
+            .line_height(ui_px(STATUS_LINE))
+            .child(dot);
+        if arming {
+            return line.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme.error_accent)
+                    .child("Click stop again to hard-stop"),
+            );
+        }
+        let message = ch.last_message.clone();
+        line.child(
+            div()
+                .flex_none()
+                .text_color(state_color)
+                .child(run_state_label(ch.run_state)),
+        )
+        .when(!square, |el| {
+            el.child(
+                div()
+                    .flex_none()
+                    .text_color(theme.text_tertiary)
+                    .child(ch.name.clone()),
+            )
+        })
+        .when_some(message.clone(), |el, message| {
+            el.child(
+                div()
+                    .min_w_0()
+                    .text_color(theme.text_primary)
+                    .map(|el| {
+                        if square {
+                            el.line_clamp(2)
+                        } else {
+                            el.truncate()
+                        }
+                    })
+                    .child(message),
+            )
+        })
+        // A narrow control truncates the message first; the tooltip keeps
+        // it reachable.
+        .when_some(message, |el, message| {
+            el.tooltip(move |_window, cx| TooltipText::build(message.clone(), cx))
+        })
+    }
+
+    /// The run clock, and the abort clock while a graceful stop is running.
+    /// `None` when the channel names neither or neither has a reading.
+    fn clocks(&self, theme: &Theme) -> Option<Div> {
+        let run = self.run_clock.seconds;
+        let abort = self.abort_clock.seconds.filter(|s| *s > 0.0);
+        if run.is_none() && abort.is_none() {
+            return None;
+        }
+        let size = if self.layout == SequenceLayout::Square {
+            15.0
+        } else {
+            12.0
+        };
+        let reading = |label: &'static str, seconds: f64, color: Hsla| {
+            div()
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .gap(ui_px(4.0))
+                .child(
                     div()
-                        .flex_none()
+                        .text_size(ui_px(9.0))
                         .text_color(theme.text_tertiary)
-                        .child(ch.name.to_lowercase()),
+                        .child(label),
                 )
                 .child(
                     div()
-                        .flex_none()
-                        .text_color(state_color)
-                        .child(run_state_label(ch.run_state).to_lowercase()),
+                        .text_size(ui_px(size))
+                        .text_color(color)
+                        .child(format_clock(seconds)),
                 )
-                .when_some(status, |el, status| {
-                    el.child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(theme.text_tertiary)
-                            .child(status),
-                    )
-                })
-            })
-            // Refusals and progress land in the status, which a narrow card
-            // truncates first; the tooltip keeps them reachable.
-            .when_some(ch.last_message.clone(), |el, message| {
-                el.tooltip(move |_window, cx| TooltipText::build(message.clone(), cx))
-            });
-
-        let label = div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap(ui_px(3.0))
-            .child(subtitle)
-            .child(self.load_row(&ch, &theme, cx));
-        self.with_buttons(label, &ch, &theme, cx)
+        };
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(ui_px(10.0))
+                .whitespace_nowrap()
+                .when_some(run, |el, s| el.child(reading("SEQ", s, theme.text_primary)))
+                .when_some(abort, |el, s| {
+                    el.child(reading("ABORT", s, theme.error_accent))
+                }),
+        )
     }
-}
 
-impl SequenceControl {
-    /// The control's row: `label` on the left, the run buttons on the right
-    /// lined up with its sequence box.
-    fn with_buttons(
+    /// Abort, the primary (start or reset) and the two-click Stop, each
+    /// `height` unscaled pixels tall.
+    fn buttons(
         &self,
-        label: Div,
         ch: &ChannelState,
+        height: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = theme.clone();
         let arming = self.arming_stop;
+        let button =
+            |id, icon, color, bg, tooltip| icon_button(id, icon, color, bg, tooltip, height);
 
         let abort_btn = pressable(
-            icon_button(
+            button(
                 "seq-ctl-abort",
                 Icon::Abort,
                 theme.text_secondary,
@@ -263,7 +446,7 @@ impl SequenceControl {
         .on_click(cx.listener(|this, _, _, cx| this.command(cx, |s, c| s.abort(c))));
 
         let primary_btn = match ch.run_state {
-            SequenceRunState::Running => icon_button(
+            SequenceRunState::Running => button(
                 "seq-ctl-primary",
                 Icon::Play,
                 theme.control_active,
@@ -271,7 +454,7 @@ impl SequenceControl {
                 "Running",
             ),
             SequenceRunState::Idle => pressable(
-                icon_button(
+                button(
                     "seq-ctl-primary",
                     Icon::Play,
                     theme.control_active,
@@ -282,7 +465,7 @@ impl SequenceControl {
             )
             .on_click(cx.listener(|this, _, _, cx| this.command(cx, |s, c| s.start(c)))),
             state if is_resettable(state) => pressable(
-                icon_button(
+                button(
                     "seq-ctl-primary",
                     Icon::Loop,
                     theme.text_secondary,
@@ -292,7 +475,7 @@ impl SequenceControl {
                 &theme,
             )
             .on_click(cx.listener(|this, _, _, cx| this.command(cx, |s, c| s.reset(c)))),
-            _ => icon_button(
+            _ => button(
                 "seq-ctl-primary",
                 Icon::Play,
                 theme.text_tertiary,
@@ -302,7 +485,7 @@ impl SequenceControl {
         };
 
         let armed_bg = Theme::dim(theme.error_accent, 0.25);
-        let stop_btn = icon_button(
+        let stop_btn = button(
             "seq-ctl-stop",
             Icon::Stop,
             if arming {
@@ -338,29 +521,15 @@ impl SequenceControl {
             }
         }));
 
-        // Bottom-aligned so the buttons line up with the sequence box rather
-        // than the box and its status line together; all are one height.
-        strip().child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_row()
-                .items_end()
-                .gap(ui_px(8.0))
-                .child(label)
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(ui_px(4.0))
-                        .child(abort_btn)
-                        .child(primary_btn)
-                        .child(stop_btn),
-                ),
-        )
+        div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(ui_px(4.0))
+            .child(abort_btn)
+            .child(primary_btn)
+            .child(stop_btn)
     }
 }
 
@@ -462,17 +631,17 @@ fn stage_rows(
         .collect()
 }
 
-/// The row every state of the control lays out in, so an unbound control
+/// The box every state of the control lays out in, so an unbound control
 /// keeps the footprint of a live one. It draws no frame of its own: the
 /// dashboard's widget frame or the pane is the one border around it.
-fn strip() -> Div {
+fn frame(layout: SequenceLayout) -> Div {
     div()
         .size_full()
         .flex()
-        .flex_row()
-        .items_center()
-        .gap(ui_px(8.0))
+        .flex_col()
+        .justify_center()
         .px(ui_px(10.0))
+        .when(layout == SequenceLayout::Square, |el| el.py(ui_px(10.0)))
         .overflow_hidden()
 }
 
@@ -482,19 +651,29 @@ fn icon_button(
     color: Hsla,
     bg: Hsla,
     tooltip: &'static str,
+    height: f32,
 ) -> Stateful<Div> {
+    let width = height.clamp(STRIP_BOX_HEIGHT, SQUARE_BUTTON);
     div()
         .id(id)
         .debug_selector(|| id.into())
         .flex_none()
-        .size(ui_px(STRIP_BOX_HEIGHT))
+        .w(ui_px(width))
+        .h(ui_px(height))
         .flex()
         .items_center()
         .justify_center()
         .rounded(ui_px(4.0))
         .bg(bg)
         .tooltip(move |_window, cx| TooltipText::build(tooltip.into(), cx))
-        .child(icon.svg(13.0, color))
+        .child(icon.svg(
+            if height > STRIP_BOX_HEIGHT {
+                15.0
+            } else {
+                13.0
+            },
+            color,
+        ))
 }
 
 /// The pointer and hover tint of an [`icon_button`] that acts on click.
@@ -555,7 +734,7 @@ mod tests {
     use metor_db::DB;
     use metor_db::disruptor::Reader;
     use metor_db::msg_log::read_msg;
-    use metor_proto::types::{Msg, Timestamp};
+    use metor_proto::types::{ComponentId, Msg, Timestamp};
     use metor_proto_wkt::{
         SequenceChannelEvent, SequenceChannelSpec, SequenceCommand, SequenceCommandKind,
         SequenceEventKind, SequenceRegistry,
@@ -570,6 +749,31 @@ mod tests {
             .unwrap();
     }
 
+    /// A scalar F64 clock component `name` reading `seconds`.
+    fn clock(db: &DB, name: &str, seconds: f64) {
+        let id = ComponentId::new(name);
+        db.with_state_mut(|state| {
+            state.insert_component(
+                id,
+                metor_db::ComponentSchema::new(metor_proto::types::PrimType::F64, &[][..]),
+                &db.path,
+            )
+        })
+        .unwrap();
+        let component = db
+            .with_state(|state| state.get_component(id).cloned())
+            .unwrap();
+        let bytes = seconds.to_le_bytes();
+        component
+            .time_series
+            .install_samples(
+                8,
+                [(Timestamp(3), bytes.as_slice())],
+                metor_db::manifest::SpanSource::RemoteFetch,
+            )
+            .unwrap();
+    }
+
     fn event(kind: SequenceEventKind) -> SequenceChannelEvent {
         SequenceChannelEvent {
             channel: "deploy".into(),
@@ -580,7 +784,7 @@ mod tests {
     fn config() -> SequenceControlConfig {
         SequenceControlConfig {
             channel: "deploy".into(),
-            compact: false,
+            ..Default::default()
         }
     }
 
@@ -629,6 +833,8 @@ mod tests {
                     channels: vec![SequenceChannelSpec {
                         name: "deploy".into(),
                         available: vec!["solar".into(), "lunar".into()],
+                        clock: Some("deploy.t".into()),
+                        abort_clock: Some("deploy.abort_t".into()),
                     }],
                 },
             );
@@ -640,6 +846,9 @@ mod tests {
                 }),
             );
             push(&db, 3, &event(SequenceEventKind::Started));
+            clock(&db, "deploy.t", 75.0);
+            clock(&db, "deploy.abort_t", 0.0);
+            cx.update(|cx| crate::temporal::TemporalController::init(db.clone(), cx));
             cx.run_until_parked();
 
             let commands = db
@@ -728,9 +937,64 @@ mod tests {
         }
     }
 
-    fn bare(_db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
-        cx.new(|cx| SequenceControl::from_config(&config(), cx))
+    fn bare(db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
+        cx.new(|cx| SequenceControl::from_config(&config(), db, cx))
             .into()
+    }
+
+    /// A bare control in `layout`, also handed to `slot` for inspection.
+    fn laid_out(
+        layout: SequenceLayout,
+        slot: Rc<RefCell<Option<gpui::Entity<SequenceControl>>>>,
+    ) -> impl FnOnce(Arc<DB>, &mut App) -> gpui::AnyView {
+        move |db, cx| {
+            let cfg = SequenceControlConfig { layout, ..config() };
+            let control = cx.new(|cx| SequenceControl::from_config(&cfg, db, cx));
+            *slot.borrow_mut() = Some(control.clone());
+            control.into()
+        }
+    }
+
+    fn stop_fires_in(layout: SequenceLayout, cx: &mut TestAppContext) {
+        let slot = Rc::new(RefCell::new(None));
+        let (first, second) = Rig::new(cx, laid_out(layout, slot)).stop_twice();
+        assert!(first.is_empty(), "{layout:?}: the first click only arms");
+        assert!(
+            matches!(second.as_slice(), [SequenceCommandKind::Stop]),
+            "{layout:?}: {second:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn stop_fires_on_the_second_click_in_a_medium_control(cx: &mut TestAppContext) {
+        stop_fires_in(SequenceLayout::Medium, cx);
+    }
+
+    #[gpui::test]
+    fn stop_fires_on_the_second_click_in_a_square_control(cx: &mut TestAppContext) {
+        stop_fires_in(SequenceLayout::Square, cx);
+    }
+
+    #[gpui::test]
+    fn the_clocks_read_the_components_the_registry_names(cx: &mut TestAppContext) {
+        let slot = Rc::new(RefCell::new(None));
+        let rig = Rig::new(cx, laid_out(SequenceLayout::Square, slot.clone()));
+        let control = slot.borrow().clone().expect("built");
+        rig.cx.update(|_, cx| {
+            let control = control.read(cx);
+            assert_eq!(control.run_clock.seconds, Some(75.0));
+            // Zero: no graceful stop is running, so the clock stays hidden.
+            assert_eq!(control.abort_clock.seconds, Some(0.0));
+            assert!(control.clocks(&crate::theme::theme(cx)).is_some());
+        });
+    }
+
+    #[test]
+    fn clocks_read_as_mission_time() {
+        assert_eq!(format_clock(0.0), "T+00:00");
+        assert_eq!(format_clock(75.9), "T+01:15");
+        assert_eq!(format_clock(3725.0), "T+1:02:05");
+        assert_eq!(format_clock(-30.0), "T-00:30");
     }
 
     fn in_dashboard(db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
@@ -764,8 +1028,8 @@ mod tests {
         assert!(matches!(second.as_slice(), [SequenceCommandKind::Stop]));
     }
 
-    fn in_channel_list(_db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
-        cx.new(crate::views::SequenceView::new).into()
+    fn in_channel_list(db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
+        cx.new(|cx| crate::views::SequenceView::new(db, cx)).into()
     }
 
     #[gpui::test]

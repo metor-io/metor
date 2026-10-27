@@ -574,6 +574,24 @@ class ChannelTest(ConfigTest):
         self.assertEqual(params["period"], 50)
         self.assertEqual(systems["channels"]["ty"], "fsw.channel_registry")
 
+    def test_registry_names_channel_clocks(self) -> None:
+        fsw = Target(cycle_rate=50.0)
+        cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
+        fsw.commands(cmds.sequence_command)
+        fsw.add("nav", Nav(), channel="nav", clock="fsw.nav.t", abort_clock="fsw.nav.abort_t")
+        fsw.add("channels", ChannelRegistry())
+        systems = {s["id"]: s for s in fsw.to_config()["coordinator"]["systems"]}
+        self.assertEqual(
+            systems["channels"]["params"]["channels"],
+            [{"name": "nav", "available": [], "clock": "fsw.nav.t", "abort_clock": "fsw.nav.abort_t"}],
+        )
+        self.assertEqual(systems["nav"]["channel"], {"name": "nav", "start": "running"})
+
+    def test_clock_needs_a_channel(self) -> None:
+        fsw = Target(cycle_rate=50.0)
+        with self.assertRaises(ConfigError):
+            fsw.add("nav", Nav(), clock="fsw.nav.t")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,7 +22,7 @@ use crate::views::{
     AlarmListMode, AlarmView, ComponentBrowser, ComponentOutline, LevelFilter, LogView,
     OutlineColumns, SequenceView, new_component_browser,
 };
-use crate::views::{Col, default_columns};
+use crate::views::{Col, SequenceLayout, default_columns};
 
 use super::pane::Pane;
 
@@ -63,6 +63,9 @@ impl Default for LogPanelConfig {
 #[serde(default)]
 pub struct SequencePanelConfig {
     pub show_history: bool,
+    /// Absent in layouts saved before the list chose a control layout, which
+    /// restore as [`SequenceLayout::Medium`], the list's own default.
+    pub layout: Option<SequenceLayout>,
 }
 
 pub(crate) fn alarm_view(
@@ -101,17 +104,21 @@ pub(crate) fn log_config(view: &LogView, _cx: &App) -> LogPanelConfig {
 
 pub(crate) fn sequence_view(
     cfg: SequencePanelConfig,
-    _db: Arc<DB>,
+    db: Arc<DB>,
     cx: &mut Context<SequenceView>,
 ) -> SequenceView {
-    let mut view = SequenceView::new(cx);
+    let mut view = SequenceView::new(db, cx);
     view.set_history(cfg.show_history);
+    if let Some(layout) = cfg.layout {
+        view.layout = layout;
+    }
     view
 }
 
 pub(crate) fn sequence_config(view: &SequenceView, _cx: &App) -> SequencePanelConfig {
     SequencePanelConfig {
         show_history: view.is_history(),
+        layout: Some(view.layout),
     }
 }
 
@@ -766,7 +773,7 @@ mod tests {
 
         let seq = SequenceControlConfig {
             channel: "mode".into(),
-            compact: true,
+            layout: SequenceLayout::Square,
         };
         let s = serde_json::to_string(&seq).unwrap();
         assert_eq!(
@@ -775,7 +782,11 @@ mod tests {
         );
         let partial: SequenceControlConfig = serde_json::from_str(r#"{"channel":"mode"}"#).unwrap();
         assert_eq!(partial.channel, "mode");
-        assert!(!partial.compact);
+        assert_eq!(partial.layout, SequenceLayout::Compact);
+        // A control saved with the old `compact` flag loads as a compact one.
+        let legacy: SequenceControlConfig =
+            serde_json::from_str(r#"{"channel":"mode","compact":false}"#).unwrap();
+        assert_eq!(legacy.layout, SequenceLayout::Compact);
 
         let attitude = AttitudeConfig {
             component: "sat.nav.attitude_estimate.q_hat_b_eci".into(),

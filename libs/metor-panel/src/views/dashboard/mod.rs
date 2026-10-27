@@ -1161,7 +1161,7 @@ mod tests {
             serde_json::from_str(by_kind(WidgetKind::sequence_control())).unwrap();
         // A channel is a slot name, never namespace-qualified.
         assert_eq!(seq.channel, "mode");
-        assert!(seq.compact);
+        assert_eq!(seq.layout, crate::views::SequenceLayout::Square);
 
         // The image travels as bytes, not as a path the panel may not be able
         // to reach.

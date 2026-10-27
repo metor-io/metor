@@ -32,10 +32,16 @@ class _Thread:
 
 @dataclass(frozen=True)
 class _Channel:
-    """Puts a cyclic system behind the channel `name`, in state `start` at boot."""
+    """Puts a cyclic system behind the channel `name`, in state `start` at boot.
+
+    ``clock`` and ``abort_clock`` name the components timing its runs; they
+    travel in the channel registry, not the adapter.
+    """
 
     name: str
     start: str
+    clock: str | None = None
+    abort_clock: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {"channel": {"name": self.name, "start": self.start}}
@@ -158,6 +164,8 @@ class Target:
         thread: str | None = None,
         channel: str | None = None,
         start: str | None = None,
+        clock: str | None = None,
+        abort_clock: str | None = None,
     ) -> S:
         """Adds ``system`` to the target under ``name``.
 
@@ -169,9 +177,12 @@ class Target:
         a cyclic system behind a channel with that name, so it can be started,
         stopped, and loaded by commands. This adds ``events`` and
         ``channel_status`` outputs. ``start`` sets the channel's state at boot:
-        ``"running"`` (the default) or ``"stopped"``.
+        ``"running"`` (the default) or ``"stopped"``. ``clock`` and
+        ``abort_clock`` name the components holding the channel's run clock
+        and abort clock, in seconds, so the panel can show them.
         """
-        return self._add(self._systems, name, system, _adapter(thread, channel, start))
+        adapter = _adapter(thread, channel, start, clock, abort_clock)
+        return self._add(self._systems, name, system, adapter)
 
     def sim(self, name: str, system: S) -> S:
         """Adds ``system`` as a model: a system that holds the device end of
@@ -241,10 +252,10 @@ class Target:
         """
         self._commands.extend(_sources(COMMANDS_PORT, sources))
 
-    def _channels(self) -> list[tuple[str, System]]:
-        """Returns each channel's name and system, in step order."""
+    def _channels(self) -> list[tuple[_Channel, System]]:
+        """Returns each channel's adapter and system, in step order."""
         return [
-            (entry.adapter.name, entry.system)
+            (entry.adapter, entry.system)
             for entry in self._systems
             if isinstance(entry.adapter, _Channel)
         ]
@@ -331,7 +342,7 @@ class Target:
         channels = self._channels()
         if channels and not self._commands:
             raise ConfigError(
-                f"channel `{channels[0][0]}` has no command source; call `commands(..)`"
+                f"channel `{channels[0][0].name}` has no command source; call `commands(..)`"
             )
 
     def _system(self, systems: list[_Entry], index: int) -> dict[str, Any]:
@@ -374,18 +385,24 @@ class Target:
 
 
 def _adapter(
-    thread: str | None, channel: str | None, start: str | None
+    thread: str | None,
+    channel: str | None,
+    start: str | None,
+    clock: str | None = None,
+    abort_clock: str | None = None,
 ) -> _Thread | _Channel | None:
     """Returns a system's adapter, if it has one."""
     if thread is not None and channel is not None:
         raise ConfigError("a system takes `thread` or `channel`, not both")
     if start is not None and channel is None:
         raise ConfigError("`start` sets a channel's state at boot, so it needs `channel`")
+    if (clock is not None or abort_clock is not None) and channel is None:
+        raise ConfigError("`clock` and `abort_clock` time a channel's runs, so they need `channel`")
     if thread is not None:
         return _Thread(thread)
     if channel is None:
         return None
-    return _Channel(channel, start or "running")
+    return _Channel(channel, start or "running", clock, abort_clock)
 
 
 def _resolve(target: Target, name: str, port: str, source: Source[Any]) -> dict[str, str]:

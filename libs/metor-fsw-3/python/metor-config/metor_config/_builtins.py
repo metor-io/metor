@@ -408,6 +408,19 @@ def _candidate(system: System) -> dict[str, Any]:
     }
 
 
+def _channel_spec(channel: Any, system: System) -> dict[str, Any]:
+    """Returns one registry entry: the channel, what it can load, and its
+    clocks when it names them."""
+    spec: dict[str, Any] = {
+        "name": channel.name,
+        "available": system._names if isinstance(system, DlSlot) else [],
+    }
+    for key in ("clock", "abort_clock"):
+        if getattr(channel, key) is not None:
+            spec[key] = getattr(channel, key)
+    return spec
+
+
 class ChannelRegistry(_generated.ChannelRegistry):
     """Publishes a list of the target's channels.
 
@@ -420,8 +433,7 @@ class ChannelRegistry(_generated.ChannelRegistry):
 
     def _params_for(self, target: Any, index: int) -> Any:
         channels = [
-            {"name": name, "available": system._names if isinstance(system, DlSlot) else []}
-            for name, system in target._channels()
+            _channel_spec(channel, system) for channel, system in target._channels()
         ]
         return {"channels": channels, "period": max(1, round(target.cycle_rate))}
 

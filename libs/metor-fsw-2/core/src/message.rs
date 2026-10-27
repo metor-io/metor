@@ -440,6 +440,7 @@ mod tests {
             channels: vec![SequenceChannelSpec {
                 name: "mode".to_string(),
                 available: vec!["commissioning".to_string(), "safe_mode".to_string()],
+                ..Default::default()
             }],
         };
         {
@@ -508,6 +509,7 @@ mod tests {
                     channels: vec![SequenceChannelSpec {
                         name: "mode".to_string(),
                         available: vec![],
+                        ..Default::default()
                     }],
                 })
                 .expect("emit registry");

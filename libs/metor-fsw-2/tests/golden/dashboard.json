@@ -50,11 +50,11 @@
       "rect": {
         "x": 280.0,
         "y": 100.0,
-        "w": 340.0,
-        "h": 48.0
+        "w": 260.0,
+        "h": 132.0
       },
       "kind": "sequence_control",
-      "config": "{\"channel\": \"mode\", \"compact\": true}"
+      "config": "{\"channel\": \"mode\", \"layout\": \"square\"}"
     },
     {
       "id": 6,

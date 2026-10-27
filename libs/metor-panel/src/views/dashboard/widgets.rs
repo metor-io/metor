@@ -440,7 +440,7 @@ impl WidgetRegistry {
                     let cfg = parse_or_default::<SequenceControlConfig>(&w.config);
                     subject("Sequence", &cfg.channel)
                 },
-                |cfg, _db, cx| SequenceControl::from_config(&cfg, cx),
+                |cfg, db, cx| SequenceControl::from_config(&cfg, db, cx),
                 |control, _| control.to_config(),
             )
             .with_tile("sequence_control", |blob| {
