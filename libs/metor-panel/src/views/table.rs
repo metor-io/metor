@@ -268,6 +268,14 @@ impl<D: TableDelegate> Table<D> {
         self.scroll_handle.0.borrow().base_handle.offset().y >= Pixels::ZERO
     }
 
+    /// Whether the body is scrolled to within a few rows of its last, or
+    /// has too few rows to scroll at all; the samples table's cue to page in
+    /// older history.
+    pub fn near_bottom(&self) -> bool {
+        let handle = &self.scroll_handle.0.borrow().base_handle;
+        -handle.offset().y >= handle.max_offset().y - px(ROW_HEIGHT * 4.0)
+    }
+
     #[cfg(test)]
     pub(super) fn set_scroll_offset(&self, offset: gpui::Point<Pixels>) {
         self.scroll_handle.0.borrow().base_handle.set_offset(offset);

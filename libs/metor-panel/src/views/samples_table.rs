@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 
 use super::binding::component_name;
 use super::format::{ValueFormatter, format_time};
-use super::table::{CELL_PAD_X, Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
+use super::table::{
+    CELL_PAD_X, Column, ColumnSort, HEADER_HEIGHT, ROW_HEIGHT, Table, TableDelegate,
+};
 use super::value_strip::{StripStyle, render_static_cells, resolve_metadata, strip_row_width};
 use crate::theme::{theme, ui_px};
 
@@ -86,6 +88,9 @@ impl SampleTimeFormat {
         }
     }
 }
+
+/// How far back each page of requested history reaches.
+const HISTORY_PAGE_US: i64 = 60_000_000;
 
 /// A further component whose samples interleave with the first's.
 #[derive(facet::Facet)]
@@ -190,8 +195,14 @@ pub struct SamplesTable {
     built: Option<(Timestamp, Vec<(ComponentId, Option<Timestamp>, u64)>)>,
     #[facet(opaque)]
     history_task: gpui::Task<()>,
+    /// Oldest stamp of the history page requested so far. Reaching the
+    /// bottom of the table pushes it back a page.
     #[facet(opaque)]
     history_start: Option<Timestamp>,
+    /// Whether the last refresh saw the table near its bottom, so paging
+    /// back happens once per arrival there rather than every frame.
+    #[facet(skip)]
+    was_near_bottom: bool,
     /// Samples newer than the anchor, shown while the reader is scrolled
     /// away from the top.
     #[facet(skip)]
@@ -231,6 +242,7 @@ impl SamplesTable {
             built: None,
             history_task: gpui::Task::ready(()),
             history_start: None,
+            was_near_bottom: false,
             newer: 0,
             table,
             _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
@@ -377,9 +389,14 @@ impl SamplesTable {
         if let Some(history) = history {
             // Request a bounded page, even before the expression has emitted
             // its first sample (for example, a windowed spectrum).
+            let near_bottom = self.table.read(cx).near_bottom();
             let start = self
                 .history_start
-                .get_or_insert(Timestamp(head.0.saturating_sub(60_000_000)));
+                .get_or_insert(Timestamp(head.0.saturating_sub(HISTORY_PAGE_US)));
+            if near_bottom && !self.was_near_bottom {
+                *start = Timestamp(start.0.saturating_sub(HISTORY_PAGE_US));
+            }
+            self.was_near_bottom = near_bottom;
             let range = *start..Timestamp(head.0.saturating_add(1));
             history.request(range.clone(), cx);
             for source in &self.more_components {
@@ -431,6 +448,7 @@ impl Render for SamplesTable {
         let theme = theme(cx);
 
         let mut root = div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -450,52 +468,30 @@ impl Render for SamplesTable {
             );
         }
 
-        root = root.child(
-            div()
-                .text_size(ui_px(10.0))
-                .text_color(theme.text_tertiary)
-                .child(if self.table.read(cx).at_top() {
-                    "Following view time"
-                } else {
-                    "Browsing history"
-                }),
-        );
-        root = root.child(
-            div()
-                .id("samples-older")
-                .h(ui_px(20.0))
-                .cursor_pointer()
-                .child("Load older samples")
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(|view, _, _, cx| {
-                        if let Some(start) = view.history_start.as_mut() {
-                            *start = Timestamp(start.0.saturating_sub(60_000_000));
-                        }
-                        view.refresh(cx);
-                        cx.notify();
-                    }),
-                ),
-        );
+        root = root.child(self.table.clone());
         if self.newer > 0 {
             root = root.child(
                 div()
                     .id("samples-newer")
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(ui_px(20.0))
-                    .bg(theme.selection_bg)
-                    .text_size(ui_px(11.0))
+                    .absolute()
+                    .top(ui_px(HEADER_HEIGHT + 6.0))
+                    .right(ui_px(10.0))
+                    .px(ui_px(8.0))
+                    .py(ui_px(2.0))
+                    .rounded_full()
+                    .bg(theme.pill_bg)
+                    .border_1()
+                    .border_color(theme.pill_border)
+                    .shadow_sm()
+                    .text_size(ui_px(10.0))
                     .text_color(theme.text_secondary)
                     .cursor_pointer()
-                    .child(SharedString::from(format!("{} newer ↑", self.newer)))
+                    .hover(|s| s.text_color(theme.text_primary))
+                    .child(SharedString::from(format!("↑ {} newer", self.newer)))
                     .on_click(cx.listener(|this, _, _, cx| this.jump_to_live(cx))),
             );
         }
-
-        root.child(self.table.clone())
+        root
     }
 }
 
@@ -1014,6 +1010,13 @@ mod tests {
         cx.update(|cx| {
             view.update(cx, |view, cx| {
                 assert_eq!(view.head, Some(Timestamp(20)));
+                // An unscrollable table counts as at its bottom, which pages
+                // back once and only once.
+                view.refresh(cx);
+                assert_eq!(
+                    view.history_start,
+                    Some(Timestamp(20 - 2 * HISTORY_PAGE_US))
+                );
                 view.history_start = Some(Timestamp(-120_000_000));
                 view.table.update(cx, |table, _| {
                     table.set_scroll_offset(gpui::point(px(0.), px(-100.)))
