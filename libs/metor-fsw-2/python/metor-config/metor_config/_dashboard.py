@@ -534,8 +534,8 @@ class Map:
 
 
 _SEQUENCE_LAYOUTS = {
-    "compact": (340.0, 48.0),
-    "medium": (340.0, 56.0),
+    "slim": (460.0, 34.0),
+    "medium": (460.0, 56.0),
     "square": (260.0, 132.0),
 }
 
@@ -546,13 +546,13 @@ class SequenceControl:
     instance name, which is the address a command carries -- it is not
     namespace-qualified.
 
-    ``layout`` arranges the control for its space: ``"compact"`` (the status
-    line over one row of sequence and buttons), ``"medium"`` (sequence over
-    status, buttons as tall as both) or ``"square"`` (status, sequence, then
-    clocks and buttons, each on its own row)."""
+    ``layout`` arranges the control for its space: ``"slim"`` (state,
+    sequence, clocks and buttons in one thin row), ``"medium"`` (the status
+    line and clocks over the sequence and buttons) or ``"square"`` (status,
+    sequence, then clocks and buttons, each on its own row)."""
 
     channel: str
-    layout: str = "compact"
+    layout: str = "medium"
 
     def __post_init__(self) -> None:
         if self.layout not in _SEQUENCE_LAYOUTS:

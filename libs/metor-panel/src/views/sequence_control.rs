@@ -40,7 +40,7 @@ use crate::icons::Icon;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, ChannelState, is_resettable, run_state_index, run_state_label};
-use crate::theme::{Theme, theme, ui_px};
+use crate::theme::{Theme, font_family, theme, ui_px};
 use crate::views::TooltipText;
 use crate::views::binding::spawn_scalar_stream;
 use crate::views::value_strip::{
@@ -51,7 +51,7 @@ use crate::views::value_strip::{
 /// surfaces.
 ///
 /// Saved controls from before layouts carried a `compact` flag instead; it is
-/// ignored, since both of its shapes load best as [`SequenceLayout::Compact`].
+/// ignored, since both of its shapes load best as [`SequenceLayout::Medium`].
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct SequenceControlConfig {
@@ -65,15 +65,18 @@ pub struct SequenceControlConfig {
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum SequenceLayout {
-    /// The status line over one row of sequence, clocks and buttons; a
-    /// dashboard strip.
+    /// State, sequence, clocks and buttons in one thin row; the status
+    /// message lives in the state's tooltip.
+    Slim,
+    /// The status line and clocks over one row of sequence and buttons; a
+    /// dashboard strip or a list row. `compact` is its name from before
+    /// [`SequenceLayout::Slim`] existed.
     #[default]
-    Compact,
-    /// Sequence over status on the left, buttons as tall as both on the
-    /// right; a list row.
+    #[serde(alias = "compact")]
     Medium,
     /// Status, then sequence, then clocks and buttons, each a row of its
-    /// own; a dashboard tile with room for a long status message.
+    /// own; a dashboard tile with room for a long status message. The clocks
+    /// wrap onto separate lines when the tile is narrow.
     Square,
 }
 
@@ -194,7 +197,7 @@ fn format_clock(seconds: f64) -> String {
 }
 
 impl Render for SequenceControl {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let store = sequences::try_global(cx);
         let channel = self.channel.clone();
@@ -203,7 +206,7 @@ impl Render for SequenceControl {
             .as_ref()
             .and_then(|s| s.read(cx).state().channel(&channel).cloned())
         else {
-            return frame(SequenceLayout::Compact).justify_center().child(
+            return frame(SequenceLayout::Medium).justify_center().child(
                 div()
                     .truncate()
                     .text_size(ui_px(11.0))
@@ -220,65 +223,42 @@ impl Render for SequenceControl {
         self.bind_clocks(&ch, cx);
 
         let status = self.status(&ch, &theme);
-        let load = self.load_row(&ch, &theme, cx);
-        let clocks = self.clocks(&theme);
+        let clocks = self.clocks(&theme, window, cx);
+        let row = || {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(ui_px(8.0))
+                .min_w_0()
+        };
         match self.layout {
-            SequenceLayout::Compact => {
-                let top = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(ui_px(8.0))
-                    .min_w_0()
-                    .child(status.flex_1())
-                    .when_some(clocks, |el, clocks| el.child(clocks));
-                let bottom = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(ui_px(8.0))
-                    .min_w_0()
-                    .child(load.flex_1())
-                    .child(self.buttons(&ch, STRIP_BOX_HEIGHT, &theme, cx));
-                frame(self.layout).gap(ui_px(4.0)).child(top).child(bottom)
-            }
-            SequenceLayout::Medium => {
-                let state = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(ui_px(8.0))
-                    .min_w_0()
-                    .child(status.flex_1())
-                    .when_some(clocks, |el, clocks| el.child(clocks));
-                let left = div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(ui_px(4.0))
-                    .child(load)
-                    .child(state);
-                // The buttons stand as tall as the sequence and status rows
-                // together, so the row reads as one block.
+            SequenceLayout::Slim => {
+                let load = self.load_row(&ch, SLIM_HEIGHT, &theme, cx);
                 frame(self.layout).child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_stretch()
-                        .gap(ui_px(10.0))
-                        .min_w_0()
-                        .child(left)
-                        .child(self.buttons(&ch, MEDIUM_HEIGHT, &theme, cx)),
+                    row()
+                        .child(status.flex_none())
+                        .child(load.flex_1())
+                        .when_some(clocks, |el, clocks| el.child(clocks))
+                        .child(self.buttons(&ch, SLIM_HEIGHT, &theme, cx)),
                 )
             }
+            SequenceLayout::Medium => {
+                let load = self.load_row(&ch, STRIP_BOX_HEIGHT, &theme, cx);
+                let top = row()
+                    .child(status.flex_1())
+                    .when_some(clocks, |el, clocks| el.child(clocks));
+                let bottom = row().child(load.flex_1()).child(self.buttons(
+                    &ch,
+                    STRIP_BOX_HEIGHT,
+                    &theme,
+                    cx,
+                ));
+                frame(self.layout).gap(ui_px(4.0)).child(top).child(bottom)
+            }
             SequenceLayout::Square => {
-                let bottom = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(ui_px(8.0))
-                    .min_w_0()
+                let load = self.load_row(&ch, STRIP_BOX_HEIGHT, &theme, cx);
+                let bottom = row()
                     .child(div().flex_1().min_w_0().children(clocks))
                     .child(self.buttons(&ch, SQUARE_BUTTON, &theme, cx));
                 frame(self.layout)
@@ -292,8 +272,8 @@ impl Render for SequenceControl {
     }
 }
 
-/// Height of a medium control's two rows, which its buttons match.
-const MEDIUM_HEIGHT: f32 = STRIP_BOX_HEIGHT + 4.0 + STATUS_LINE;
+/// Height of a slim control's sequence box and buttons.
+const SLIM_HEIGHT: f32 = 22.0;
 /// Line height of the status message.
 const STATUS_LINE: f32 = 18.0;
 /// A square control's buttons, larger since it has the room.
@@ -307,6 +287,7 @@ impl SequenceControl {
         let arming = self.arming_stop;
         let state_color = theme.run_state_color(run_state_index(ch.run_state));
         let square = self.layout == SequenceLayout::Square;
+        let slim = self.layout == SequenceLayout::Slim;
         let dot = div()
             .flex_none()
             .size(ui_px(7.0))
@@ -342,17 +323,22 @@ impl SequenceControl {
                 .text_color(state_color)
                 .child(run_state_label(ch.run_state)),
         )
-        .when(!square, |el| {
+        // The channel name gives way before the message does: the message is
+        // what changes, the name is on every other row of a list too.
+        .when(!square && !slim, |el| {
             el.child(
                 div()
-                    .flex_none()
+                    .flex_shrink(1.0)
+                    .min_w(ui_px(24.0))
+                    .truncate()
                     .text_color(theme.text_tertiary)
                     .child(ch.name.clone()),
             )
         })
-        .when_some(message.clone(), |el, message| {
+        .when_some(message.clone().filter(|_| !slim), |el, message| {
             el.child(
                 div()
+                    .flex_1()
                     .min_w_0()
                     .text_color(theme.text_primary)
                     .map(|el| {
@@ -374,26 +360,36 @@ impl SequenceControl {
 
     /// The run clock, and the abort clock while a graceful stop is running.
     /// `None` when the channel names neither or neither has a reading.
-    fn clocks(&self, theme: &Theme) -> Option<Div> {
+    ///
+    /// Each reading's small label sits on its value's baseline. Layout can't
+    /// align baselines, so both share a line height and the label drops by
+    /// the difference the font's metrics give between the two sizes.
+    fn clocks(&self, theme: &Theme, window: &Window, cx: &App) -> Option<Div> {
         let run = self.run_clock.seconds;
         let abort = self.abort_clock.seconds.filter(|s| *s > 0.0);
         if run.is_none() && abort.is_none() {
             return None;
         }
-        let size = if self.layout == SequenceLayout::Square {
-            15.0
-        } else {
-            12.0
-        };
+        let square = self.layout == SequenceLayout::Square;
+        let size = if square { 15.0 } else { 12.0 };
+        let label_size = 9.0;
+        let line = (size * 1.3_f32).round();
+        let text = window.text_system();
+        let font = text.resolve_font(&gpui::font(font_family(cx)));
+        let baseline = |s: f32| f32::from(text.baseline_offset(font, gpui::px(s), gpui::px(line)));
+        let drop = (baseline(size) - baseline(label_size)).max(0.0);
         let reading = |label: &'static str, seconds: f64, color: Hsla| {
             div()
+                .flex_none()
                 .flex()
                 .flex_row()
-                .items_baseline()
+                .items_start()
                 .gap(ui_px(4.0))
+                .line_height(ui_px(line))
                 .child(
                     div()
-                        .text_size(ui_px(9.0))
+                        .pt(ui_px(drop))
+                        .text_size(ui_px(label_size))
                         .text_color(theme.text_tertiary)
                         .child(label),
                 )
@@ -406,12 +402,20 @@ impl SequenceControl {
         };
         Some(
             div()
-                .flex_none()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(ui_px(10.0))
+                .gap_x(ui_px(10.0))
                 .whitespace_nowrap()
+                // A square tile stacks the clocks when it's too narrow for
+                // both on one line; the other layouts keep them on theirs.
+                .map(|el| {
+                    if square {
+                        el.flex_wrap().min_w_0()
+                    } else {
+                        el.flex_none()
+                    }
+                })
                 .when_some(run, |el, s| el.child(reading("SEQ", s, theme.text_primary)))
                 .when_some(abort, |el, s| {
                     el.child(reading("ABORT", s, theme.error_accent))
@@ -538,7 +542,13 @@ impl SequenceControl {
     /// it, the pair a value strip uses for a pending edit: clicking the box
     /// lists the sequences and choosing one only stages it, the chevron
     /// sends the load.
-    fn load_row(&self, ch: &ChannelState, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    fn load_row(
+        &self,
+        ch: &ChannelState,
+        height: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let pending = self.staged.is_some();
         let shown = self.staged.clone().or_else(|| ch.loaded.clone());
         let available = ch.available.clone();
@@ -551,7 +561,7 @@ impl SequenceControl {
                 .flex()
                 .flex_1()
                 .min_w_0()
-                .h(ui_px(STRIP_BOX_HEIGHT)),
+                .h(ui_px(height)),
             true,
         ))
         .bg(box_fill(theme, pending, false, None))
@@ -588,6 +598,7 @@ impl SequenceControl {
         });
 
         let commit = apply_chevron("seq-ctl-commit", theme, pending)
+            .h(ui_px(height))
             .debug_selector(|| "seq-ctl-commit".into())
             .when(pending, |el| {
                 el.tooltip(|_window, cx| TooltipText::build("Load".into(), cx))
@@ -653,7 +664,7 @@ fn icon_button(
     tooltip: &'static str,
     height: f32,
 ) -> Stateful<Div> {
-    let width = height.clamp(STRIP_BOX_HEIGHT, SQUARE_BUTTON);
+    let width = height.clamp(SLIM_HEIGHT, SQUARE_BUTTON);
     div()
         .id(id)
         .debug_selector(|| id.into())
@@ -818,6 +829,10 @@ mod tests {
             let inspector = Rc::new(RefCell::new(Vec::new()));
             cx.update(|cx| {
                 crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+                cx.set_global(crate::theme::FontSettings {
+                    family: "monospace".into(),
+                    config: Default::default(),
+                });
                 crate::views::dashboard::WidgetRegistry::init(cx);
                 crate::sequences::SequenceStore::init(db.clone(), cx);
                 let inspector = inspector.clone();
@@ -966,8 +981,8 @@ mod tests {
     }
 
     #[gpui::test]
-    fn stop_fires_on_the_second_click_in_a_medium_control(cx: &mut TestAppContext) {
-        stop_fires_in(SequenceLayout::Medium, cx);
+    fn stop_fires_on_the_second_click_in_a_slim_control(cx: &mut TestAppContext) {
+        stop_fires_in(SequenceLayout::Slim, cx);
     }
 
     #[gpui::test]
@@ -980,12 +995,16 @@ mod tests {
         let slot = Rc::new(RefCell::new(None));
         let rig = Rig::new(cx, laid_out(SequenceLayout::Square, slot.clone()));
         let control = slot.borrow().clone().expect("built");
-        rig.cx.update(|_, cx| {
+        rig.cx.update(|window, cx| {
             let control = control.read(cx);
             assert_eq!(control.run_clock.seconds, Some(75.0));
             // Zero: no graceful stop is running, so the clock stays hidden.
             assert_eq!(control.abort_clock.seconds, Some(0.0));
-            assert!(control.clocks(&crate::theme::theme(cx)).is_some());
+            assert!(
+                control
+                    .clocks(&crate::theme::theme(cx), window, cx)
+                    .is_some()
+            );
         });
     }
 

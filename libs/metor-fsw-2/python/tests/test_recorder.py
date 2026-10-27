@@ -974,7 +974,7 @@ class DashboardTest(unittest.TestCase):
         # namespace-qualified.
         control = json.loads(state["widgets"][1]["config"])
         self.assertEqual(control["channel"], "mode")
-        self.assertEqual(control["layout"], "compact")
+        self.assertEqual(control["layout"], "medium")
         with self.assertRaises(ValueError):
             mc.SequenceControl("mode", layout="huge")
 

@@ -434,8 +434,10 @@ impl WidgetRegistry {
         );
         self.register(
             WidgetKind::sequence_control(),
+            // Wide enough for the channel, run state and both clocks to share
+            // the status line without crowding the message out.
             WidgetSpec::typed(
-                (340.0, 48.0),
+                (460.0, 56.0),
                 |w| {
                     let cfg = parse_or_default::<SequenceControlConfig>(&w.config);
                     subject("Sequence", &cfg.channel)

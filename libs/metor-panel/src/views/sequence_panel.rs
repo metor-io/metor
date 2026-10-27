@@ -339,8 +339,9 @@ impl Render for SequenceView {
                             .p(ui_px(8.0))
                             .children(self.controls.iter().map(|(_, control)| {
                                 div()
+                                    .flex()
                                     .w(ui_px(SQUARE_TILE.0))
-                                    .h(ui_px(SQUARE_TILE.1))
+                                    .min_h(ui_px(SQUARE_TILE.1))
                                     .rounded(ui_px(6.0))
                                     .border_1()
                                     .border_color(theme.border_primary)

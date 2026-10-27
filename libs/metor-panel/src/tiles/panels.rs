@@ -782,11 +782,16 @@ mod tests {
         );
         let partial: SequenceControlConfig = serde_json::from_str(r#"{"channel":"mode"}"#).unwrap();
         assert_eq!(partial.channel, "mode");
-        assert_eq!(partial.layout, SequenceLayout::Compact);
-        // A control saved with the old `compact` flag loads as a compact one.
-        let legacy: SequenceControlConfig =
-            serde_json::from_str(r#"{"channel":"mode","compact":false}"#).unwrap();
-        assert_eq!(legacy.layout, SequenceLayout::Compact);
+        assert_eq!(partial.layout, SequenceLayout::Medium);
+        // Controls saved with the old `compact` flag, or the `compact` layout
+        // that became medium, load as medium.
+        for legacy in [
+            r#"{"channel":"mode","compact":false}"#,
+            r#"{"channel":"mode","layout":"compact"}"#,
+        ] {
+            let legacy: SequenceControlConfig = serde_json::from_str(legacy).unwrap();
+            assert_eq!(legacy.layout, SequenceLayout::Medium);
+        }
 
         let attitude = AttitudeConfig {
             component: "sat.nav.attitude_estimate.q_hat_b_eci".into(),
