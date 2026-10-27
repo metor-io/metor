@@ -45,6 +45,8 @@ members = [
     "examples/adcs-fsw3/systems/adcs",
     "examples/adcs-fsw3/systems/seqs",
     "examples/adcs-fsw3/systems/startracker-sim",
+    "examples/sysstats-fsw3",
+    "examples/sysstats-fsw3/systems/stats",
     "libs/metor-fsw-3",
     "libs/metor-fsw-3/ring",
     "libs/metor-fsw-3/macros",

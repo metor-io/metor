@@ -6,6 +6,7 @@ pub(crate) mod pane;
 pub mod panels;
 pub(crate) mod serial;
 mod split_preview;
+pub(crate) mod starter;
 mod tab;
 
 use gpui::{
@@ -55,6 +56,8 @@ pub enum TileGroupEvent {
         pane: Entity<Pane>,
         position: Point<Pixels>,
     },
+    /// An empty pane's Time Series button: open the trace wizard aimed at it.
+    NewTimeSeries { pane: Entity<Pane> },
 }
 
 impl EventEmitter<TileGroupEvent> for TileGroup {}
@@ -186,6 +189,35 @@ impl Member {
         }
     }
 
+    /// Put `new_pane` along a whole edge of this member: appended to it when
+    /// it already runs along `direction`'s axis, otherwise beside it in a
+    /// new axis that takes its place.
+    fn dock(&mut self, new_pane: &Entity<Pane>, direction: SplitDirection) {
+        let new = Member::Pane(new_pane.clone());
+        if let Member::Axis(axis) = self
+            && axis.axis == direction.axis()
+        {
+            let at = if direction.increasing() {
+                axis.members.len()
+            } else {
+                0
+            };
+            axis.members.insert(at, new);
+            axis.flexes.insert(at, 1.0);
+            return;
+        }
+        let old = std::mem::replace(
+            self,
+            Member::Axis(SplitAxis::new(direction.axis(), Vec::new())),
+        );
+        let members = if direction.increasing() {
+            vec![old, new]
+        } else {
+            vec![new, old]
+        };
+        *self = Member::Axis(SplitAxis::new(direction.axis(), members));
+    }
+
     /// Remove `target` from the tree. Returns `true` when found.
     ///
     /// Leaves empty axis nodes behind; run [`Member::collapse`] afterwards to
@@ -291,6 +323,7 @@ impl Member {
                         tg.update(cx, |this, _cx| {
                             this.focused_pane = Some(focus_pane.clone());
                         });
+                        crate::inspector::target::select_pane(&focus_pane, cx);
                     })
                     .child(pane.clone())
                     .into_any_element()
@@ -652,6 +685,22 @@ impl TileGroup {
         cx.notify();
     }
 
+    /// Dock `new_pane` along one whole edge of the layout rather than beside
+    /// a single pane — where a panel that serves every pane, like the
+    /// inspector, belongs. The current pane stays current.
+    pub fn dock_pane(
+        &mut self,
+        new_pane: Entity<Pane>,
+        direction: SplitDirection,
+        cx: &mut Context<Self>,
+    ) {
+        self.root.dock(&new_pane, direction);
+        cx.subscribe(&new_pane, Self::handle_pane_event).detach();
+        self.zoomed = None;
+        self.panes.push(new_pane);
+        cx.notify();
+    }
+
     /// Drop a pane from the layout; usually triggered by a pane emitting
     /// [`PaneEvent::Empty`].
     pub fn remove_pane(&mut self, target: &Entity<Pane>, cx: &mut Context<Self>) {
@@ -870,6 +919,7 @@ impl TileGroup {
                 });
             }
             PaneEvent::ToggleZoom => self.toggle_zoom(&pane, cx),
+            PaneEvent::NewTimeSeries => cx.emit(TileGroupEvent::NewTimeSeries { pane }),
         }
     }
 
@@ -1187,6 +1237,41 @@ mod tests {
             assert_eq!(item.serialization_key(), "registered_test");
             assert_eq!(item.serialize(cx), config);
             assert!(item.entity_any(cx).downcast::<RegisteredTestView>().is_ok());
+        });
+    }
+
+    #[gpui::test]
+    fn docking_runs_a_pane_along_the_whole_edge(cx: &mut gpui::TestAppContext) {
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
+        cx.update(|cx| {
+            let first = tg.read(cx).panes()[0].clone();
+            let below = cx.new(|cx| Pane::new(Vec::new(), cx));
+            let right = cx.new(|cx| Pane::new(Vec::new(), cx));
+            let left = cx.new(|cx| Pane::new(Vec::new(), cx));
+            tg.update(cx, |tg, cx| {
+                tg.split_pane(&first, below.clone(), SplitDirection::Down, cx);
+                tg.dock_pane(right.clone(), SplitDirection::Right, cx);
+                tg.dock_pane(left.clone(), SplitDirection::Left, cx);
+            });
+            let tg = tg.read(cx);
+            let Member::Axis(root) = &tg.root else {
+                panic!("docking wraps the root in an axis");
+            };
+            assert_eq!(root.axis, Axis::Horizontal);
+            let ids: Vec<_> = root
+                .members
+                .iter()
+                .map(|m| match m {
+                    Member::Pane(p) => Some(p.entity_id()),
+                    Member::Axis(_) => None,
+                })
+                .collect();
+            assert_eq!(
+                ids,
+                [Some(left.entity_id()), None, Some(right.entity_id())],
+                "the earlier vertical split stays whole between the docks"
+            );
+            assert_eq!(tg.panes().len(), 4);
         });
     }
 

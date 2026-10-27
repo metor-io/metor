@@ -327,6 +327,41 @@ pub enum ElementKey<'a> {
     Key(&'a str),
 }
 
+/// The dynamic elements enclosing a nested container, outermost first: each
+/// enclosing container's name and the key of the element holding the next.
+///
+/// A nested container's name is relative to its element, so these rebuild
+/// its full dotted path.
+#[derive(Clone, Copy, Debug)]
+pub struct Scopes<'a> {
+    levels: [(&'a str, ElementKey<'a>); MAX_DYNAMIC_DEPTH],
+    len: usize,
+}
+
+impl<'a> Scopes<'a> {
+    const EMPTY: Self = Self {
+        levels: [("", ElementKey::Index(0)); MAX_DYNAMIC_DEPTH],
+        len: 0,
+    };
+
+    /// These scopes with `container`'s element `key` appended, or unchanged
+    /// when the walk is not inside an element.
+    fn with(mut self, container: Option<&'a str>, key: Option<ElementKey<'a>>) -> Self {
+        if let (Some(container), Some(key)) = (container, key)
+            && self.len < MAX_DYNAMIC_DEPTH
+        {
+            self.levels[self.len] = (container, key);
+            self.len += 1;
+        }
+        self
+    }
+
+    /// The enclosing containers and element keys, outermost first.
+    pub fn iter(&self) -> impl Iterator<Item = (&'a str, ElementKey<'a>)> + '_ {
+        self.levels[..self.len].iter().copied()
+    }
+}
+
 /// State threaded through the field-realization walk.
 ///
 /// For top-level fields this is [`WalkCtx::default`] (base 0, empty path, no inherited
@@ -337,11 +372,15 @@ pub enum ElementKey<'a> {
 struct WalkCtx<'a> {
     base: usize,
     path: PathHasher,
+    /// `path` without element keys: the path of the member template.
+    template: PathHasher,
     element: Option<ElementKey<'a>>,
     /// The dotted path of the enclosing dynamic container (the [`Op::List`]/
     /// [`Op::Map`] `name`), so a lazily-created keyed member can be named
     /// `<container>.<key>.<member>` at ingest instead of by numeric id.
     container: Option<&'a str>,
+    /// The elements enclosing `container`, for a nested container.
+    outer: Scopes<'a>,
     frame: Option<ComponentId>,
     timestamp: Option<Timestamp>,
     timestamp_at: Option<usize>,
@@ -353,8 +392,10 @@ impl Default for WalkCtx<'_> {
         Self {
             base: 0,
             path: PathHasher::new(),
+            template: PathHasher::new(),
             element: None,
             container: None,
+            outer: Scopes::EMPTY,
             frame: None,
             timestamp: None,
             timestamp_at: None,
@@ -386,6 +427,12 @@ pub struct RealizedField<'a> {
     /// which the hashed [`component_id`](Self::component_id) alone cannot.
     pub container: Option<&'a str>,
     pub member: Option<&'a str>,
+    /// The elements enclosing [`container`](Self::container) when it is
+    /// nested in another container's element, whose name it is relative to.
+    pub outer: Scopes<'a>,
+    /// The member template this dynamic field instantiates (`processes.pid`
+    /// for `processes.0.pid`), `None` for a static field.
+    pub template_id: Option<ComponentId>,
     /// Whether this field was realized through a dynamic terminal
     /// ([`Op::PathComponent`], reached via [`Op::List`]/[`Op::Map`]). In
     /// schema/registration mode (`table = None`) such a field is a member
@@ -650,6 +697,9 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                     let mut leaf_path = ctx.path;
                     leaf_path.push(leaf.name);
                     let component_id = leaf_path.finish();
+                    let mut template = ctx.template;
+                    template.push(leaf.name);
+                    let ctx = WalkCtx { template, ..ctx };
                     return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, timestamp_at, true, Some(leaf.name), table, f);
                 }
                 RealizedOp::Schema(s) => {
@@ -722,6 +772,8 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
             element: ctx.element,
             container: ctx.container,
             member,
+            outer: ctx.outer,
+            template_id: dynamic.then(|| ctx.template.finish()),
             dynamic,
         })
     }
@@ -746,6 +798,9 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
     ) -> Result<(), E> {
         let mut prefix_path = ctx.path;
         prefix_path.push(dynm.name);
+        let mut template = ctx.template;
+        template.push(dynm.name);
+        let outer = ctx.outer.with(ctx.container, ctx.element);
         let members_start = dynm.members.start as usize;
         let members_end = members_start + dynm.members.count as usize;
 
@@ -754,8 +809,10 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
             let child = WalkCtx {
                 base: 0,
                 path: prefix_path,
+                template,
                 element: None,
                 container: Some(dynm.name),
+                outer,
                 frame,
                 timestamp,
                 timestamp_at,
@@ -801,8 +858,10 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
             let child = WalkCtx {
                 base: member_base,
                 path: elem_path,
+                template,
                 element: Some(key),
                 container: Some(dynm.name),
+                outer,
                 frame,
                 timestamp,
                 timestamp_at,
@@ -1687,6 +1746,12 @@ mod tests {
             sink.timestamps[&ComponentId::new("processes.htop.threads.0.state")],
             Some(Timestamp(1000))
         );
+
+        let fields: Vec<_> = v.realize_fields(Some(&t)).map(|r| r.unwrap()).collect();
+        let outer: Vec<_> = fields[0].outer.iter().collect();
+        assert!(matches!(outer[..], [("processes", super::ElementKey::Key("htop"))]));
+        assert_eq!(fields[0].container, Some("threads"));
+        assert!(matches!(fields[0].element, Some(super::ElementKey::Index(0))));
     }
 
     /// Schema/registration mode (`table = None`) surfaces each member template's ty/shape.

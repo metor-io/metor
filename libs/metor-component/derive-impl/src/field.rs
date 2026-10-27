@@ -27,6 +27,10 @@ pub struct Field {
     /// padding.
     #[darling(default)]
     pub skip: Option<bool>,
+    /// `#[fsw(unit = "%")]` labels every component of the field with a unit
+    /// the panel shows beside its value.
+    #[darling(default)]
+    pub unit: Option<String>,
 }
 
 impl Field {

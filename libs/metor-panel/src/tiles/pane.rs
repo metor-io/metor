@@ -81,6 +81,8 @@ pub enum PaneEvent {
     /// A tab was double-clicked: fill the tile group with this pane, or put
     /// the layout back if it already does.
     ToggleZoom,
+    /// The empty pane's Time Series button was pressed.
+    NewTimeSeries,
 }
 
 impl EventEmitter<PaneEvent> for Pane {}
@@ -245,6 +247,10 @@ impl Pane {
 
     pub fn active_index(&self) -> usize {
         self.active_index
+    }
+
+    pub fn active_item(&self) -> Option<&dyn PaneItemHandle> {
+        self.items.get(self.active_index).map(|item| &**item)
     }
 
     pub fn add_item(&mut self, item: Box<dyn PaneItemHandle>, cx: &mut Context<Self>) {
@@ -792,6 +798,8 @@ impl Render for Pane {
 
         if let Some(item) = self.items.get(self.active_index) {
             content = content.child(item.view());
+        } else {
+            content = content.child(self.render_starters(window, cx));
         }
 
         // Drop on content area (split-on-drop at edges, add-as-tab in center)

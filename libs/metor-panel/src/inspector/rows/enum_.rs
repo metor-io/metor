@@ -13,8 +13,42 @@ use crate::theme::theme;
 pub struct EnumRow {
     pub label: SharedString,
     pub selected: SharedString,
+    source: Option<Arc<dyn Fn(&App) -> Option<SharedString>>>,
     pub options: Vec<SharedString>,
     pub on_select: Arc<dyn Fn(String, &mut Window, &mut App)>,
+}
+
+impl EnumRow {
+    pub fn new(
+        label: impl Into<SharedString>,
+        selected: impl Into<SharedString>,
+        options: Vec<SharedString>,
+        on_select: Arc<dyn Fn(String, &mut Window, &mut App)>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            selected: selected.into(),
+            source: None,
+            options,
+            on_select,
+        }
+    }
+
+    /// Read the value through `source` on every render, falling back to the
+    /// cached copy when it answers `None`. A docked inspector outlives the
+    /// edit that built it, so a row there has to track changes made
+    /// elsewhere — by the popup, or by the view itself.
+    pub fn live(mut self, source: Arc<dyn Fn(&App) -> Option<SharedString>>) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    fn current(&self, cx: &App) -> SharedString {
+        self.source
+            .as_ref()
+            .and_then(|source| source(cx))
+            .unwrap_or_else(|| self.selected.clone())
+    }
 }
 
 impl InspectorRow for EnumRow {
@@ -43,7 +77,7 @@ impl InspectorRow for EnumRow {
                     .items_center()
                     .gap(px(6.0))
                     .justify_end()
-                    .child(row_value(self.selected.clone(), theme.text_secondary))
+                    .child(row_value(self.current(cx), theme.text_secondary))
                     .child(Icon::ChevronRight.svg(8.0, theme.text_secondary)),
             )
             .into_any_element()

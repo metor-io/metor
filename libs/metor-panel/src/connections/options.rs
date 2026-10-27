@@ -302,14 +302,14 @@ pub(crate) fn option_rows(
                         OptionValue::Choice(v) => v,
                         _ => choices.first().cloned().unwrap_or_default(),
                     };
-                    Box::new(EnumRow {
+                    Box::new(EnumRow::new(
                         label,
                         selected,
-                        options: choices.to_vec(),
-                        on_select: Arc::new(move |choice, _window: &mut Window, cx: &mut App| {
+                        choices.to_vec(),
+                        Arc::new(move |choice, _window: &mut Window, cx: &mut App| {
                             set(OptionValue::Choice(SharedString::from(choice)), cx)
                         }),
-                    })
+                    ))
                 }
                 (OptionKind::Text { .. }, value) => {
                     let text = match value {

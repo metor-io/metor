@@ -165,6 +165,8 @@ impl<T: Field> Metadatatize for SpatialInertia<T> {
 macro_rules! impl_prim_component {
     ($ty:ty) => {
         impl AsVTable for $ty {
+            const ELEMENT: bool = true;
+
             fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
                 let component = if path.is_empty() {
                     builder::component(std::stringify!($ty))
@@ -243,6 +245,8 @@ impl<T: Field + PrimTypeElem> AsVTable for nox::Quaternion<T> {
 }
 
 impl AsVTable for Timestamp {
+    const ELEMENT: bool = true;
+
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
         let component = if path.is_empty() {
             builder::component("timestamp")
@@ -253,6 +257,18 @@ impl AsVTable for Timestamp {
             0,
             size_of::<Timestamp>() as u32,
             builder::schema(metor_proto::types::PrimType::I64, &[], component),
+        ))
+    }
+
+    fn element_fields(prefix: String) -> impl Iterator<Item = FieldBuilder> {
+        iter::once(raw_field(
+            0,
+            size_of::<Timestamp>() as u32,
+            builder::schema(
+                metor_proto::types::PrimType::I64,
+                &[],
+                builder::path_component(&prefix),
+            ),
         ))
     }
 }

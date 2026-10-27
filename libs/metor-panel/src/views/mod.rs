@@ -13,6 +13,7 @@ pub mod format;
 pub mod gauge;
 pub(crate) mod image_source;
 pub mod image_view;
+pub mod inspector_pane;
 pub(crate) mod instrument;
 pub mod json_tree;
 pub mod label;

@@ -21,6 +21,7 @@ use crate::tiles::panels::{
 };
 use crate::views::image_source::{self, ImageRef};
 use crate::views::image_view::{ImageView, ImageViewConfig};
+use crate::views::inspector_pane::InspectorPane;
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
     Annunciator, AnnunciatorConfig, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
@@ -541,6 +542,18 @@ impl WidgetRegistry {
             .with_tile("alarm", |_| "Alarms".into()),
         );
         self.register(
+            WidgetKind::new("inspector"),
+            WidgetSpec::typed(
+                (320.0, 480.0),
+                |_| "Inspector".into(),
+                InspectorPane::from_config,
+                InspectorPane::to_config,
+            )
+            .with_tile(crate::inspector::target::INSPECTOR_PANE_KEY, |_| {
+                "Inspector".into()
+            }),
+        );
+        self.register(
             WidgetKind::new("logs"),
             WidgetSpec::typed((480.0, 300.0), |_| "Logs".into(), log_view, log_config)
                 .with_tile("logs", |_| "Logs".into()),
@@ -771,6 +784,7 @@ mod tests {
             "attitude",
             "component_browser",
             "alarm",
+            "inspector",
             "logs",
             "sequence",
             "sequence_grid",

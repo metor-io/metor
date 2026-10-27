@@ -22,6 +22,8 @@ impl<const N: usize> Default for FrameBytes<N> {
 }
 
 impl<const N: usize> AsVTable for FrameBytes<N> {
+    const ELEMENT: bool = true;
+
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
         let component = if path.is_empty() {
             builder::component("frame_bytes")
@@ -32,6 +34,14 @@ impl<const N: usize> AsVTable for FrameBytes<N> {
             0,
             N as u32,
             schema(PrimType::U8, &[N as u64], component),
+        ))
+    }
+
+    fn element_fields(prefix: String) -> impl Iterator<Item = FieldBuilder> {
+        core::iter::once(raw_field(
+            0,
+            N as u32,
+            schema(PrimType::U8, &[N as u64], builder::path_component(&prefix)),
         ))
     }
 }

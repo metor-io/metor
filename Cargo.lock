@@ -14470,6 +14470,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "sysstats-fsw3"
+version = "0.14.2"
+dependencies = [
+ "metor-fsw-3",
+ "metor-proto",
+ "metor-proto-stellar",
+ "metor-proto-wkt",
+ "stellarator",
+ "sysstats-systems-3",
+]
+
+[[package]]
+name = "sysstats-systems-3"
+version = "0.14.2"
+dependencies = [
+ "core-foundation-sys",
+ "futures-lite",
+ "libc",
+ "metor-component",
+ "metor-fsw-3",
+ "schemars 1.2.1",
+ "serde",
+ "stellarator",
+ "thiserror 2.0.20",
+ "tracing",
+ "zerocopy",
+]
+
+[[package]]
 name = "system-deps"
 version = "7.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

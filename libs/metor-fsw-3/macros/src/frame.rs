@@ -9,8 +9,8 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 
-/// The struct being derived, with its fields, `#[frame(name = "..")]`, and
-/// `#[frame(depth = N)]`.
+/// The struct being derived, with its fields, `#[frame(name = "..")]`,
+/// `#[frame(depth = N)]`, and `#[frame(max_len = N)]`.
 #[derive(FromDeriveInput)]
 #[darling(attributes(frame), supports(struct_named))]
 struct FrameInput {
@@ -19,6 +19,7 @@ struct FrameInput {
     data: ast::Data<(), Field>,
     name: Option<String>,
     depth: Option<usize>,
+    max_len: Option<syn::Expr>,
 }
 
 /// Expands `#[derive(Frame)]`.
@@ -65,6 +66,41 @@ pub fn frame(input: TokenStream) -> TokenStream {
     let stamp = stamp.ident.as_ref().expect("named field");
     let timestamp_body = quote! { self.#stamp };
 
+    // A fixed frame encodes as its own bytes and needs no scratch; one with a
+    // FrameMap is built into the port's scratch by `Output::write_with`.
+    let (read_ty, decode_body, max_len, scratch_len) = match &raw.max_len {
+        Some(max_len) => (
+            quote! { #fsw::FrameRef<'a, Self> },
+            quote! { #fsw::FrameRef::decode(bytes) },
+            quote! {{
+                let max_len: usize = #max_len;
+                assert!(
+                    max_len >= ::core::mem::size_of::<Self>(),
+                    "#[frame(max_len)] is smaller than the frame"
+                );
+                max_len
+            }},
+            quote! { Self::MAX_LEN },
+        ),
+        None => (
+            quote! { &'a Self },
+            quote! { #fsw::record::fixed::decode(bytes) },
+            quote! {{
+                assert!(
+                    !<Self as #fsw::AsVTable>::DYNAMIC,
+                    "a frame holding a FrameMap needs #[frame(max_len = ..)]"
+                );
+                ::core::mem::size_of::<Self>()
+            }},
+            quote! { 0 },
+        ),
+    };
+
+    let guard = raw.generics.params.is_empty().then(|| {
+        let ident = &raw.ident;
+        quote! { const _: usize = <#ident as #fsw::Record>::MAX_LEN; }
+    });
+
     let (ident, generics) = (raw.ident.clone(), raw.generics.clone());
     let struct_input = StructInput {
         ident: raw.ident,
@@ -87,22 +123,22 @@ pub fn frame(input: TokenStream) -> TokenStream {
 
         impl #impl_generics #fsw::Payload for #ident #ty_generics #where_clause {
             const ALIGN: usize = ::core::mem::align_of::<Self>();
-            type Read<'a> = &'a Self where Self: 'a;
+            type Read<'a> = #read_ty where Self: 'a;
             fn timestamp(&self) -> Option<#proto::types::Timestamp> {
                 Some(#timestamp_body)
             }
             fn encode<'a>(&'a self, _buf: &'a mut [u8]) -> Result<&'a [u8], #fsw::EncodeError> {
                 Ok(#fsw::zerocopy::IntoBytes::as_bytes(self))
             }
-            fn decode(bytes: &[u8]) -> Result<&Self, #fsw::DecodeError> {
-                #fsw::record::fixed::decode(bytes)
+            fn decode(bytes: &[u8]) -> Result<Self::Read<'_>, #fsw::DecodeError> {
+                #decode_body
             }
         }
 
         impl #impl_generics #fsw::Record for #ident #ty_generics #where_clause {
             const NAME: &'static str = #frame_name;
-            const MAX_LEN: usize = ::core::mem::size_of::<Self>();
-            const SCRATCH_LEN: usize = 0;
+            const MAX_LEN: usize = #max_len;
+            const SCRATCH_LEN: usize = #scratch_len;
             #depth
             fn schema_with_root(root: &str) -> #fsw::record::RecordSchema {
                 #fsw::record::RecordSchema::frame::<Self>(root)
@@ -110,6 +146,8 @@ pub fn frame(input: TokenStream) -> TokenStream {
         }
 
         impl #impl_generics #fsw::Frame for #ident #ty_generics #where_clause {}
+
+        #guard
     }
     .into()
 }

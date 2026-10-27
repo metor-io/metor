@@ -1,0 +1,26 @@
+# The stats pack as a Python distribution. `uv sync` runs the build backend,
+# which writes the typed module and the host library to `.metor/stats_pack/`
+# and adds it to the venv.
+
+[project]
+name = "stats-pack"
+version = "0.1.0"
+description = "The cpu, mem, nics, procs, and disks systems of the sysstats-fsw3 example"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["metor-build"]
+build-backend = "metor_build"
+
+[tool.metor.pack]
+id = "stats"
+
+[tool.uv.sources]
+metor-build = { path = "../../../../libs/metor-fsw-3/python/metor-build" }
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+]

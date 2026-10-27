@@ -32,6 +32,16 @@ mod zoom;
 use widgets::create_widget_view;
 pub use widgets::{ImageWidgetConfig, TileViewSpec, WidgetLive, WidgetRegistry, WidgetSpec};
 
+gpui::actions!(
+    dashboard,
+    [
+        /// Delete the selected widget. Bound to backspace and delete in the
+        /// `Dashboard` key context, which the canvas holds once a click in
+        /// edit mode focuses it.
+        DeleteSelected
+    ]
+);
+
 const SNAP_GRID_PX: f32 = 10.0;
 
 fn snap_px(v: f32) -> f32 {
@@ -167,15 +177,22 @@ pub struct DashboardPanel {
 
     next_id: u64,
     editing: bool,
+    /// The widget the inspector pane shows. Only edit mode has one: clicking
+    /// a widget there selects it, bare canvas or leaving edit mode clears it.
     selected: Option<WidgetId>,
+    /// The widget whose row is under the pointer in the inspector pane.
+    hovered: Option<WidgetId>,
     container_bounds: Option<Bounds<Pixels>>,
+    /// Taken by a click in edit mode, so the editing shortcuts reach the
+    /// dashboard rather than whatever had focus before.
+    focus_handle: gpui::FocusHandle,
     /// Pan and zoom. Only the zoom is persisted; a reopened dashboard starts
     /// at its top-left.
     viewport: zoom::Viewport,
 }
 
 impl DashboardPanel {
-    pub fn new(db: Arc<DB>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         Self {
             db,
             title: "Dashboard".into(),
@@ -184,7 +201,9 @@ impl DashboardPanel {
             next_id: 1,
             editing: false,
             selected: None,
+            hovered: None,
             container_bounds: None,
+            focus_handle: cx.focus_handle(),
             viewport: zoom::Viewport::default(),
         }
     }
@@ -262,9 +281,39 @@ impl DashboardPanel {
         // whole lifetime.
         self.widget_live.remove(&id);
         if self.selected == Some(id) {
-            self.selected = None;
+            self.set_selected(None, cx);
+        }
+        if self.hovered == Some(id) {
+            self.hovered = None;
         }
         cx.notify();
+    }
+
+    fn set_editing(&mut self, editing: bool, cx: &mut Context<Self>) {
+        self.editing = editing;
+        if !editing {
+            self.set_selected(None, cx);
+        }
+        cx.notify();
+    }
+
+    fn set_selected(&mut self, id: Option<WidgetId>, cx: &mut Context<Self>) {
+        if self.selected != id {
+            self.selected = id;
+            cx.notify();
+        }
+    }
+
+    /// The topmost widget under a canvas point.
+    fn widget_at(&self, at: Point<f32>) -> Option<WidgetId> {
+        self.widgets
+            .iter()
+            .rev()
+            .find(|w| {
+                let r = &w.rect;
+                at.x >= r.x && at.x < r.x + r.w && at.y >= r.y && at.y < r.y + r.h
+            })
+            .map(|w| w.id)
     }
 
     fn bring_to_front(&mut self, id: WidgetId, cx: &mut Context<Self>) {
@@ -283,46 +332,22 @@ impl DashboardPanel {
         }
     }
 
-    /// The widget's reflected settings page, plus the rows that belong to
-    /// its placement on the dashboard rather than to the view itself.
+    /// Right-click on a widget in edit mode: its [`widget_rows`] as a popup.
+    /// Takes the entity rather than `&self` because the rows read the
+    /// dashboard, which must not be mid-update when they do.
     fn open_widget_inspector(
-        &self,
+        dashboard: &Entity<Self>,
         widget_id: WidgetId,
         position: gpui::Point<gpui::Pixels>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) {
-        let Some(live) = self.widget_live.get(&widget_id) else {
-            return;
-        };
         let Some(open) = crate::inspector::open_inspector(cx) else {
             return;
         };
-        let mut rows = crate::inspector::reflect::rows_for_any_entity(&live.inspect, &self.db, cx)
-            .unwrap_or_default();
-        let dashboard = cx.entity();
-        rows.push(Box::new(BoolRow::dynamic(
-            "Frame",
-            Arc::new({
-                let dashboard = dashboard.clone();
-                move |cx| {
-                    dashboard
-                        .read(cx)
-                        .widgets
-                        .iter()
-                        .find(|w| w.id == widget_id)
-                        .is_none_or(|w| w.frame)
-                }
-            }),
-            Arc::new(move |on, _window, cx| {
-                dashboard.update(cx, |this, cx| {
-                    if let Some(w) = this.widgets.iter_mut().find(|w| w.id == widget_id) {
-                        w.frame = on;
-                        cx.notify();
-                    }
-                });
-            }),
-        )));
+        let Some(rows) = widget_rows(dashboard, widget_id, cx) else {
+            return;
+        };
         open(
             crate::inspector::InspectorRequest {
                 rows,
@@ -411,8 +436,65 @@ impl DashboardPanel {
     }
 }
 
+/// A widget's reflected settings page, plus the rows that belong to its
+/// placement on the dashboard rather than to the view itself. Shared by the
+/// right-click popup and the inspector pane. `None` once the widget is gone.
+pub fn widget_rows(
+    dashboard: &Entity<DashboardPanel>,
+    widget_id: WidgetId,
+    cx: &App,
+) -> Option<Vec<Box<dyn InspectorRow>>> {
+    let this = dashboard.read(cx);
+    let live = this.widget_live.get(&widget_id)?;
+    let mut rows = crate::inspector::reflect::rows_for_any_entity(&live.inspect, &this.db, cx)
+        .unwrap_or_default();
+    rows.push(Box::new(BoolRow::dynamic(
+        "Frame",
+        Arc::new({
+            let dashboard = dashboard.clone();
+            move |cx| {
+                dashboard
+                    .read(cx)
+                    .widgets
+                    .iter()
+                    .find(|w| w.id == widget_id)
+                    .is_none_or(|w| w.frame)
+            }
+        }),
+        Arc::new({
+            let dashboard = dashboard.clone();
+            move |on, _window, cx| {
+                dashboard.update(cx, |this, cx| {
+                    if let Some(w) = this.widgets.iter_mut().find(|w| w.id == widget_id) {
+                        w.frame = on;
+                        cx.notify();
+                    }
+                });
+            }
+        }),
+    )));
+    let widget_command =
+        |label: &'static str,
+         apply: fn(&mut DashboardPanel, WidgetId, &mut Context<DashboardPanel>)| {
+            let dashboard = dashboard.clone();
+            Box::new(CommandRow::new(
+                label,
+                Arc::new(move |_window, cx| {
+                    dashboard.update(cx, |this, cx| apply(this, widget_id, cx));
+                }),
+            )) as Box<dyn InspectorRow>
+        };
+    rows.push(widget_command(
+        "Bring to Front",
+        DashboardPanel::bring_to_front,
+    ));
+    rows.push(widget_command("Send to Back", DashboardPanel::send_to_back));
+    rows.push(widget_command("Delete", DashboardPanel::remove_widget));
+    Some(rows)
+}
+
 /// Inspector rows that operate on the dashboard itself: add/remove widgets,
-/// toggle edit mode, rename, adjust z-order.
+/// edit mode, zoom, rename.
 pub fn dashboard_rows(
     dashboard: Entity<DashboardPanel>,
     db: Arc<DB>,
@@ -430,24 +512,17 @@ pub fn dashboard_rows(
         },
     )));
 
-    let editing = dashboard.read(cx).editing;
-    let edit_label: SharedString = if editing {
-        "Exit Edit Mode".into()
-    } else {
-        "Enter Edit Mode".into()
-    };
-    rows.push(Box::new(CommandRow::new(edit_label, {
-        let dashboard = dashboard.clone();
-        Arc::new(move |_window, cx| {
-            dashboard.update(cx, |this, cx| {
-                this.editing = !this.editing;
-                if !this.editing {
-                    this.selected = None;
-                }
-                cx.notify();
-            });
-        })
-    })));
+    rows.push(Box::new(BoolRow::dynamic(
+        "Edit Mode",
+        Arc::new({
+            let dashboard = dashboard.clone();
+            move |cx| dashboard.read(cx).editing
+        }),
+        Arc::new({
+            let dashboard = dashboard.clone();
+            move |on, _window, cx| dashboard.update(cx, |this, cx| this.set_editing(on, cx))
+        }),
+    )));
 
     let widgets = &dashboard.read(cx).widgets;
     if !widgets.is_empty() {
@@ -479,26 +554,6 @@ pub fn dashboard_rows(
                 })
             },
         )));
-    }
-
-    let selected = dashboard.read(cx).selected;
-    if let Some(sel_id) = selected {
-        rows.push(Box::new(CommandRow::new("Bring to Front", {
-            let dashboard = dashboard.clone();
-            Arc::new(move |_window, cx| {
-                dashboard.update(cx, |this, cx| {
-                    this.bring_to_front(sel_id, cx);
-                });
-            })
-        })));
-        rows.push(Box::new(CommandRow::new("Send to Back", {
-            let dashboard = dashboard.clone();
-            Arc::new(move |_window, cx| {
-                dashboard.update(cx, |this, cx| {
-                    this.send_to_back(sel_id, cx);
-                });
-            })
-        })));
     }
 
     let zoom = dashboard.read(cx).viewport.zoom;
@@ -576,8 +631,64 @@ fn zoom_rows(dashboard: Entity<DashboardPanel>, cx: &App) -> Vec<Box<dyn Inspect
     ]
 }
 
+/// The widgets an empty dashboard offers, by their Add Widget entry.
+const STARTERS: [(&str, crate::icons::Icon, &str); 4] = [
+    ("Time Series", crate::icons::Icon::Plot, "Time Series Plot"),
+    ("Monitor", crate::icons::Icon::Monitor, "Monitor"),
+    ("Gauge", crate::icons::Icon::Gauge, "Gauge"),
+    ("Label", crate::icons::Icon::Label, "Label"),
+];
+
+impl DashboardPanel {
+    /// Starter cards for an empty dashboard; each opens its Add Widget
+    /// entry's first page in the palette.
+    fn render_starters(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let cards = STARTERS
+            .iter()
+            .map(|&(label, icon, entry)| {
+                let dashboard = cx.entity();
+                let db = self.db.clone();
+                crate::tiles::starter::StarterCard {
+                    label,
+                    icon,
+                    on_click: Box::new(move |_, window, cx| {
+                        add_widget_menu(dashboard.clone(), db.clone())
+                            .open_entry(entry, window, cx);
+                    }),
+                }
+            })
+            .collect();
+        let hint = crate::tiles::starter::StarterHint {
+            what: "widgets",
+            on_click: Box::new({
+                let dashboard = cx.entity();
+                let db = self.db.clone();
+                move |_, window, cx| {
+                    let Some(open) = crate::inspector::open_inspector(cx) else {
+                        return;
+                    };
+                    let rows = add_widget_rows(dashboard.clone(), db.clone());
+                    open(
+                        crate::inspector::InspectorRequest {
+                            rows,
+                            mode: crate::inspector::InspectorMode::Centered,
+                        },
+                        window,
+                        cx,
+                    );
+                }
+            }),
+        };
+        crate::tiles::starter::starter_cards("dashboard-starter", cards, hint, window, cx)
+    }
+}
+
 /// The shared "add view" menu aimed at `dashboard`.
 fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
+    add_widget_menu(dashboard, db).rows()
+}
+
+fn add_widget_menu(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> AddMenu {
     AddMenu {
         db,
         host: Host::Dashboard,
@@ -589,7 +700,6 @@ fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dy
         }),
         on_open_inspector: None,
     }
-    .rows()
 }
 
 fn widget_display_label(widget: &DashboardWidget, cx: &App) -> SharedString {
@@ -597,12 +707,13 @@ fn widget_display_label(widget: &DashboardWidget, cx: &App) -> SharedString {
 }
 
 impl Render for DashboardPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_views(cx);
         let theme = theme(cx);
 
         let entity = cx.entity().clone();
         let zoom_entity = entity.clone();
+        let focus_handle = self.focus_handle.clone();
         let bounds_tracker = gpui::canvas(
             move |bounds, window, cx| {
                 entity.update(cx, |this, _| {
@@ -631,6 +742,31 @@ impl Render for DashboardPanel {
                         this.zoom_to(zoom, Some(event.position), cx);
                     });
                 });
+                // Selection is an edit-mode affordance, taken in the capture
+                // phase because the blocker over each widget stops every
+                // mouse-down, yet any click on a widget should pick it.
+                let entity = zoom_entity.clone();
+                let select_hitbox = hitbox.clone();
+                let focus = focus_handle.clone();
+                window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, window, cx| {
+                    if phase != gpui::DispatchPhase::Capture
+                        || !select_hitbox.is_hovered(window)
+                        || !entity.read(cx).editing
+                        || !matches!(
+                            event.button,
+                            gpui::MouseButton::Left | gpui::MouseButton::Right
+                        )
+                    {
+                        return;
+                    }
+                    entity.update(cx, |this, cx| {
+                        let hit = this
+                            .pixel_to_canvas(event.position)
+                            .and_then(|at| this.widget_at(at));
+                        this.set_selected(hit, cx);
+                    });
+                    focus.focus(window, cx);
+                });
                 let entity = zoom_entity.clone();
                 window.on_mouse_event(move |event: &gpui::PinchEvent, phase, window, cx| {
                     if phase != gpui::DispatchPhase::Capture || !hitbox.is_hovered(window) {
@@ -649,6 +785,15 @@ impl Render for DashboardPanel {
 
         let mut canvas_div = div()
             .id("dashboard-canvas")
+            .key_context("Dashboard")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &DeleteSelected, _, cx| {
+                if this.editing
+                    && let Some(id) = this.selected
+                {
+                    this.remove_widget(id, cx);
+                }
+            }))
             .relative()
             .size_full()
             .overflow_hidden()
@@ -664,6 +809,8 @@ impl Render for DashboardPanel {
         for widget in &widgets {
             canvas_div = canvas_div.child(self.render_widget(widget, cx));
         }
+        // Above every widget, so an overlapping neighbour never hides it.
+        canvas_div = canvas_div.children(self.render_selection_ring(cx));
 
         canvas_div = canvas_div
             .on_drag_move(cx.listener(Self::handle_widget_drag_move))
@@ -680,16 +827,6 @@ impl Render for DashboardPanel {
                 cx.notify();
             },
         ));
-
-        if self.editing {
-            let entity = cx.entity();
-            canvas_div = canvas_div.on_click(move |_, _, cx| {
-                entity.update(cx, |this, cx| {
-                    this.selected = None;
-                    cx.notify();
-                });
-            });
-        }
 
         if self.editing {
             canvas_div = canvas_div.child(
@@ -710,16 +847,7 @@ impl Render for DashboardPanel {
         }
 
         if self.widgets.is_empty() {
-            canvas_div = canvas_div.child(
-                div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(theme.text_tertiary)
-                    .text_size(px(14.0))
-                    .child("Open command palette to add widgets"),
-            );
+            canvas_div = canvas_div.child(self.render_starters(window, cx));
         }
 
         if let Some(view) = self.view_size() {
@@ -743,6 +871,65 @@ impl Render for DashboardPanel {
         }
 
         canvas_div
+    }
+}
+
+/// The dashboard's widgets, as the inspector pane lists them.
+impl crate::inspector::target::InspectHost for Entity<DashboardPanel> {
+    fn children(&self, cx: &App) -> Vec<crate::inspector::target::InspectChild> {
+        self.read(cx)
+            .widgets
+            .iter()
+            .map(|w| crate::inspector::target::InspectChild {
+                id: w.id.0,
+                label: widget_display_label(w, cx),
+                kind: w.kind.0.clone(),
+            })
+            .collect()
+    }
+
+    fn selected_child(&self, cx: &App) -> Option<u64> {
+        self.read(cx).selected.map(|id| id.0)
+    }
+
+    /// Picking a widget from outside means editing it, so it enters edit
+    /// mode, the only mode with a selection.
+    fn select_child(&self, child: Option<u64>, cx: &mut App) {
+        self.update(cx, |this, cx| {
+            if child.is_some() && !this.editing {
+                this.set_editing(true, cx);
+            }
+            this.set_selected(child.map(WidgetId), cx);
+        });
+    }
+
+    fn hover_child(&self, child: u64, hovered: bool, cx: &mut App) {
+        self.update(cx, |this, cx| {
+            let child = WidgetId(child);
+            let next = if hovered {
+                Some(child)
+            } else if this.hovered == Some(child) {
+                None
+            } else {
+                return;
+            };
+            if this.hovered != next {
+                this.hovered = next;
+                cx.notify();
+            }
+        });
+    }
+
+    fn child_rows(&self, child: u64, cx: &App) -> Option<Vec<Box<dyn InspectorRow>>> {
+        widget_rows(self, WidgetId(child), cx)
+    }
+
+    fn host_rows(&self, cx: &App) -> Vec<Box<dyn InspectorRow>> {
+        dashboard_rows(self.clone(), self.read(cx).db.clone(), cx)
+    }
+
+    fn observe(&self, changed: Box<dyn Fn(&mut App)>, cx: &mut App) -> gpui::Subscription {
+        cx.observe(self, move |_, cx| changed(cx))
     }
 }
 
@@ -780,6 +967,12 @@ impl PaneItem for DashboardPanel {
         "dashboard"
     }
 
+    fn inspect_host(
+        this: &Entity<Self>,
+    ) -> Option<std::rc::Rc<dyn crate::inspector::target::InspectHost>> {
+        Some(std::rc::Rc::new(this.clone()))
+    }
+
     fn to_config(&self, cx: &App) -> DashboardPanelConfig {
         // Refresh widget configs from live entities so inspector edits land
         // on disk. Kinds without editable state return `None` and keep
@@ -808,6 +1001,76 @@ impl PaneItem for DashboardPanel {
 
 fn next_widget_id(widgets: &[DashboardWidget]) -> u64 {
     widgets.iter().map(|w| w.id.0 + 1).max().unwrap_or(1).max(1)
+}
+
+/// Fixtures for tests that need a dashboard with live widgets.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    struct Blank;
+
+    impl Render for Blank {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full()
+        }
+    }
+
+    fn blank_kind() -> WidgetKind {
+        WidgetKind::new("blank_test")
+    }
+
+    /// The theme and registries a dashboard reads, plus a `blank_test` kind
+    /// whose widgets paint nothing and inspect as themselves.
+    pub(crate) fn install(db: &Arc<DB>, cx: &mut App) {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        WidgetRegistry::init(cx);
+        crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
+        let spec = WidgetSpec::new(
+            (100.0, 100.0),
+            |_| "Blank".into(),
+            |_, _, cx| {
+                let entity = cx.new(|_| Blank);
+                let any = entity.clone().into_any();
+                WidgetLive {
+                    view: gpui::AnyView::from(entity),
+                    inspect: any.clone(),
+                    state: any,
+                }
+            },
+            |_, _, _| None,
+        );
+        cx.global_mut::<WidgetRegistry>()
+            .register(blank_kind(), spec);
+    }
+
+    /// Two 100×100 blank widgets, ids 1 and 2, at x = 0 and x = 200.
+    pub(crate) fn two_blank_widgets() -> Vec<DashboardWidget> {
+        let widget = |id, x| DashboardWidget {
+            id: WidgetId(id),
+            rect: WidgetRect {
+                x,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+            },
+            kind: blank_kind(),
+            config: String::new(),
+            frame: true,
+        };
+        vec![widget(1, 0.0), widget(2, 200.0)]
+    }
+
+    /// A dashboard holding [`two_blank_widgets`], built outside a window.
+    pub(crate) fn dashboard(db: &Arc<DB>, cx: &mut App) -> Entity<DashboardPanel> {
+        let blob = serde_json::to_string(&DashboardPanelConfig {
+            title: "Test".into(),
+            widgets: two_blank_widgets(),
+            zoom: 1.0,
+        })
+        .unwrap();
+        deserialize_dashboard(db.clone(), &blob, cx)
+    }
 }
 
 #[cfg(test)]
@@ -907,6 +1170,223 @@ mod tests {
         assert!(!image.data.is_empty(), "image was not inlined");
     }
 
+    /// A dashboard with two blank widgets side by side, laid out in a window.
+    fn two_widget_dashboard(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<DashboardPanel>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        let (dashboard, cx) = cx.add_window_view(|_, cx| {
+            test_support::install(&db, cx);
+            let widgets = test_support::two_blank_widgets();
+            DashboardPanel {
+                next_id: next_widget_id(&widgets),
+                widgets,
+                ..DashboardPanel::new(db, cx)
+            }
+        });
+        cx.refresh().unwrap();
+        (temp, dashboard, cx)
+    }
+
+    fn canvas_point(
+        dashboard: &Entity<DashboardPanel>,
+        x: f32,
+        y: f32,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Point<Pixels> {
+        let origin = cx.update(|_, cx| dashboard.read(cx).container_bounds.unwrap().origin);
+        origin + point(px(x), px(y))
+    }
+
+    #[gpui::test]
+    fn only_edit_mode_selects_widgets(cx: &mut gpui::TestAppContext) {
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        let selected =
+            |cx: &mut gpui::VisualTestContext| dashboard.read_with(cx, |d, _| d.selected);
+        let click = |x, y, cx: &mut gpui::VisualTestContext| {
+            let at = canvas_point(&dashboard, x, y, cx);
+            cx.simulate_click(at, Default::default());
+        };
+
+        click(250.0, 50.0, cx);
+        assert_eq!(selected(cx), None, "view mode clicks reach the widget only");
+
+        dashboard.update(cx, |d, cx| d.set_editing(true, cx));
+        cx.run_until_parked();
+        // Edit mode's blocker stops every mouse-down a widget gets.
+        click(250.0, 50.0, cx);
+        assert_eq!(selected(cx), Some(WidgetId(2)));
+        click(150.0, 300.0, cx);
+        assert_eq!(selected(cx), None, "bare canvas clears the selection");
+
+        click(50.0, 50.0, cx);
+        assert_eq!(selected(cx), Some(WidgetId(1)));
+        dashboard.update(cx, |d, cx| d.remove_widget(WidgetId(1), cx));
+        assert_eq!(selected(cx), None, "removing the selected widget clears it");
+
+        click(250.0, 50.0, cx);
+        dashboard.update(cx, |d, cx| d.set_editing(false, cx));
+        assert_eq!(selected(cx), None, "leaving edit mode clears it");
+    }
+
+    #[gpui::test]
+    fn a_widget_deletes_itself_and_edit_mode_is_a_switch(cx: &mut gpui::TestAppContext) {
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        cx.update(|window, cx| {
+            let mut rows = widget_rows(&dashboard, WidgetId(1), cx).unwrap();
+            let row = rows.iter_mut().find(|r| r.label() == "Delete").unwrap();
+            row.activate(window, cx);
+        });
+        let ids: Vec<u64> =
+            dashboard.read_with(cx, |d, _| d.widgets.iter().map(|w| w.id.0).collect());
+        assert_eq!(ids, [2]);
+
+        cx.update(|window, cx| {
+            let db = dashboard.read(cx).db.clone();
+            let mut rows = dashboard_rows(dashboard.clone(), db, cx);
+            let row = rows.iter_mut().find(|r| r.label() == "Edit Mode").unwrap();
+            row.activate(window, cx);
+            assert!(dashboard.read(cx).editing);
+            row.activate(window, cx);
+            assert!(
+                !dashboard.read(cx).editing,
+                "the same row turns it back off"
+            );
+        });
+    }
+
+    /// The edit-mode right-click opens the widget's rows from inside the
+    /// dashboard's own mouse handler, which once read the dashboard while it
+    /// was being updated.
+    #[gpui::test]
+    fn right_clicking_a_widget_opens_its_rows(cx: &mut gpui::TestAppContext) {
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        let opened: std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>> = Default::default();
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            cx.set_global(crate::inspector::OpenInspectorGlobal(Arc::new(
+                move |request, _, _| {
+                    opened
+                        .borrow_mut()
+                        .push(request.rows.iter().map(|r| r.label().to_string()).collect());
+                },
+            )));
+        });
+        dashboard.update(cx, |d, cx| d.set_editing(true, cx));
+        cx.run_until_parked();
+        let at = canvas_point(&dashboard, 250.0, 50.0, cx);
+        cx.simulate_mouse_down(at, gpui::MouseButton::Right, Default::default());
+
+        let opened = opened.borrow();
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].iter().any(|l| l == "Delete"));
+        assert_eq!(
+            dashboard.read_with(cx, |d, _| d.selected),
+            Some(WidgetId(2))
+        );
+    }
+
+    #[gpui::test]
+    fn backspace_deletes_the_selected_widget_in_edit_mode(cx: &mut gpui::TestAppContext) {
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        cx.update(|_, cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("backspace", DeleteSelected, Some("Dashboard")),
+                gpui::KeyBinding::new("delete", DeleteSelected, Some("Dashboard")),
+            ])
+        });
+        let ids = |cx: &mut gpui::VisualTestContext| -> Vec<u64> {
+            dashboard.read_with(cx, |d, _| d.widgets.iter().map(|w| w.id.0).collect())
+        };
+
+        dashboard.update(cx, |d, cx| d.set_editing(true, cx));
+        cx.run_until_parked();
+        let at = canvas_point(&dashboard, 250.0, 50.0, cx);
+        cx.simulate_click(at, Default::default());
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(ids(cx), [1], "the clicked widget is gone");
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(ids(cx), [1], "nothing is selected after a delete");
+
+        let at = canvas_point(&dashboard, 50.0, 50.0, cx);
+        cx.simulate_click(at, Default::default());
+        dashboard.update(cx, |d, cx| d.set_editing(false, cx));
+        cx.simulate_keystrokes("delete");
+        assert_eq!(ids(cx), [1], "view mode never deletes");
+    }
+
+    #[gpui::test]
+    fn an_empty_dashboard_starts_widgets_from_its_cards(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        let opened: std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>> = Default::default();
+        let (_dashboard, cx) = cx.add_window_view(|_, cx| {
+            test_support::install(&db, cx);
+            let opened = opened.clone();
+            cx.set_global(crate::inspector::OpenInspectorGlobal(Arc::new(
+                move |request, _, _| {
+                    opened
+                        .borrow_mut()
+                        .push(request.rows.iter().map(|r| r.label().to_string()).collect());
+                },
+            )));
+            DashboardPanel::new(db.clone(), cx)
+        });
+        cx.run_until_parked();
+
+        let label_card = cx.debug_bounds("dashboard-starter-3").unwrap();
+        cx.simulate_click(label_card.center(), Default::default());
+        let gauge_card = cx.debug_bounds("dashboard-starter-2").unwrap();
+        cx.simulate_click(gauge_card.center(), Default::default());
+
+        let hint = cx.debug_bounds("dashboard-starter-hint").unwrap();
+        cx.simulate_click(hint.center(), Default::default());
+
+        let opened = opened.borrow();
+        assert_eq!(
+            opened.len(),
+            3,
+            "each card opens its wizard, the hint the menu"
+        );
+        assert_eq!(opened[0], ["Label text..."]);
+        assert!(!opened[1].is_empty(), "the gauge opens on its trace picker");
+        assert!(
+            opened[2].iter().any(|l| l == "Meter"),
+            "the whole Add Widget list"
+        );
+    }
+
+    #[gpui::test]
+    fn picking_a_widget_from_outside_enters_edit_mode(cx: &mut gpui::TestAppContext) {
+        use crate::inspector::target::InspectHost;
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        cx.update(|_, cx| dashboard.select_child(Some(2), cx));
+        let (editing, selected) = dashboard.read_with(cx, |d, _| (d.editing, d.selected));
+        assert!(editing);
+        assert_eq!(selected, Some(WidgetId(2)));
+    }
+
+    #[gpui::test]
+    fn z_order_rows_act_on_their_own_widget(cx: &mut gpui::TestAppContext) {
+        let (_temp, dashboard, cx) = two_widget_dashboard(cx);
+        cx.update(|window, cx| {
+            let mut rows = widget_rows(&dashboard, WidgetId(1), cx).unwrap();
+            let row = rows
+                .iter_mut()
+                .find(|r| r.label() == "Bring to Front")
+                .unwrap();
+            row.activate(window, cx);
+        });
+        let order: Vec<u64> =
+            dashboard.read_with(cx, |d, _| d.widgets.iter().map(|w| w.id.0).collect());
+        assert_eq!(order, [2, 1]);
+    }
+
     #[gpui::test]
     fn zoom_is_driven_from_the_inspector(cx: &mut gpui::TestAppContext) {
         let temp = tempfile::tempdir().unwrap();
@@ -954,7 +1434,7 @@ pub fn deserialize_dashboard(db: Arc<DB>, blob: &str, cx: &mut App) -> Entity<Da
 
     let next_id = next_widget_id(&cfg.widgets);
 
-    cx.new(|_cx| DashboardPanel {
+    cx.new(|cx| DashboardPanel {
         db,
         title: if cfg.title.is_empty() {
             SharedString::from("Dashboard")
@@ -966,7 +1446,9 @@ pub fn deserialize_dashboard(db: Arc<DB>, blob: &str, cx: &mut App) -> Entity<Da
         next_id,
         editing: false,
         selected: None,
+        hovered: None,
         container_bounds: None,
+        focus_handle: cx.focus_handle(),
         viewport: zoom::Viewport::at_zoom(cfg.zoom),
     })
 }

@@ -6,6 +6,14 @@ use metor_proto::vtable::{
 use crate::path::ComponentPath;
 
 pub trait AsVTable {
+    /// Whether this type holds a [`FrameMap`](crate::FrameMap), so its
+    /// records carry a trailer.
+    const DYNAMIC: bool = false;
+
+    /// Whether [`element_fields`](Self::element_fields) describes this type,
+    /// so it can be a [`FrameMap`](crate::FrameMap) value.
+    const ELEMENT: bool = false;
+
     /// *Static* form: leaves are absolute `component(path.chain(name).id)` ops,
     /// used when the type is reached through compile-time struct nesting.
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder>;
@@ -35,11 +43,28 @@ pub trait AsVTable {
 }
 
 impl<const N: usize, T: AsVTable> AsVTable for [T; N] {
+    const DYNAMIC: bool = T::DYNAMIC;
+    const ELEMENT: bool = T::ELEMENT;
+
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
         (0..N)
             .flat_map(|i| {
                 let path = path.clone().chain(i.to_string());
                 T::vtable_fields(path).map(move |f| f.offset_by((i * size_of::<T>()) as u32))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    fn element_fields(prefix: String) -> impl Iterator<Item = FieldBuilder> {
+        (0..N)
+            .flat_map(|i| {
+                let name = if prefix.is_empty() {
+                    i.to_string()
+                } else {
+                    format!("{prefix}.{i}")
+                };
+                T::element_fields(name).map(move |f| f.offset_by((i * size_of::<T>()) as u32))
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -136,8 +161,7 @@ mod tests {
         let mut sink = TestSink::default();
         vtable.apply(outer.as_bytes(), &mut sink).unwrap().unwrap();
         assert_eq!(
-            sink.timestamps
-                .get(&ComponentId::new("telemetry.value")),
+            sink.timestamps.get(&ComponentId::new("telemetry.value")),
             Some(&Some(Timestamp(99))),
             "nested struct's timestamp source should shift with its fields"
         );

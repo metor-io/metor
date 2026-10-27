@@ -55,8 +55,17 @@ pub fn struct_metadatatize_impl(input: &StructInput, crate_name: &TokenStream2) 
         .map(|field| {
             let ty = &field.ty;
             let name = field.qualified_component_name(parent.as_deref());
+            let unit = field.unit.as_ref().map(|unit| {
+                quote! {
+                    .map(|mut m| {
+                        use #impeller_wkt::MetadataExt as _;
+                        m.set("unit", #unit);
+                        m
+                    })
+                }
+            });
             quote! {
-                .chain(<#ty>::metadata(prefix.clone().chain(#name)))
+                .chain(<#ty>::metadata(prefix.clone().chain(#name)) #unit)
             }
         });
     // No group entry at an empty root prefix, since the empty name

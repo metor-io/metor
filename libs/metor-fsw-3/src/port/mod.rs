@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 use crate::coordinator::MakeError;
 use crate::def::{DefCx, DefError};
+use crate::frame::Frame;
+use crate::frame_map::{FrameWriteError, FrameWriter, build_frame};
 use crate::record::{Bytes, DecodeError, EncodeError, Payload, Record};
 use crate::system::{BindCx, InputBinding, OutputBinding, PortDef, Ports};
 use metor_fsw_3_ring::{
@@ -55,6 +57,8 @@ pub enum SendError {
     Oversize { len: usize, max: usize },
     #[error(transparent)]
     Encode(EncodeError),
+    #[error(transparent)]
+    Frame(FrameWriteError),
     #[error(transparent)]
     Ring(WriteError),
 }
@@ -122,6 +126,30 @@ impl<T: Payload + ?Sized, W: WakeSource> Output<T, W> {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1));
         }
         result
+    }
+}
+
+impl<T: Frame, W: WakeSource> Output<T, W> {
+    /// Publishes `fixed` with the `FrameMap` entries `build` writes.
+    ///
+    /// A failure is counted as well as returned.
+    pub fn write_with(
+        &mut self,
+        fixed: &T,
+        build: impl FnOnce(&mut FrameWriter<'_, T>) -> Result<(), FrameWriteError>,
+    ) -> Result<(), SendError> {
+        let written = self.build_write(fixed, build);
+        self.counted(written)
+    }
+
+    fn build_write(
+        &mut self,
+        fixed: &T,
+        build: impl FnOnce(&mut FrameWriter<'_, T>) -> Result<(), FrameWriteError>,
+    ) -> Result<(), SendError> {
+        let len = build_frame(fixed, &mut self.scratch, build).map_err(SendError::Frame)?;
+        let bytes = bounded(&self.scratch[..len], self.max_len)?;
+        self.writer.try_write(bytes).map_err(SendError::Ring)
     }
 }
 
@@ -768,6 +796,63 @@ mod tests {
         b.write(&Fixed { a: 2, b: 0.0 }).expect("fits");
         a.write(&Fixed { a: 1, b: 0.0 }).expect("fits");
         assert_eq!(input.latest().unwrap().unwrap().a, 1);
+    }
+
+    #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[frame(name = "procs", max_len = 256)]
+    #[repr(C)]
+    struct Procs {
+        #[frame(timestamp)]
+        timestamp: Timestamp,
+        cpu: crate::FrameMap<u32, u64>,
+    }
+
+    const PROCS: Procs = Procs {
+        timestamp: Timestamp(1),
+        cpu: crate::FrameMap::EMPTY,
+    };
+
+    fn write_procs(out: &mut Output<Procs>, n: u32) -> Result<(), SendError> {
+        out.write_with(&PROCS, |w| {
+            w.map(
+                |f| &f.cpu,
+                n as usize,
+                |m| {
+                    for pid in 0..n {
+                        m.insert(pid, &u64::from(pid * 10))?;
+                    }
+                    Ok(())
+                },
+            )
+        })
+    }
+
+    #[test]
+    fn test_write_with_round_trip() {
+        let (_ring, mut out, mut input) = pair::<Procs>(4);
+        write_procs(&mut out, 3).expect("fits");
+        let latest = input
+            .latest()
+            .expect("reads")
+            .expect("a record")
+            .into_inner();
+        let cpu: Vec<_> = latest
+            .map(|f| &f.cpu)
+            .iter()
+            .map(|(k, v)| (k, *v))
+            .collect();
+        assert_eq!(cpu, vec![(0, 0), (1, 10), (2, 20)]);
+    }
+
+    #[test]
+    fn test_write_with_oversize_counts() {
+        let (_ring, mut out, mut input) = pair::<Procs>(4);
+        assert_eq!(
+            write_procs(&mut out, 100),
+            Err(SendError::Frame(FrameWriteError::Oversize { max: 256 }))
+        );
+        assert_eq!(out.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(input.drain().count(), 0);
     }
 
     #[test]

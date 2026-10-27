@@ -141,8 +141,20 @@ pub fn struct_as_vtable_impl(
                 )
             }
         });
+    let members = || fields.iter().filter(|f| !f.timestamp && !f.skipped());
+    let dynamic_items = members().map(|field| {
+        let ty = &field.ty;
+        quote! { || <#ty as #crate_name::AsVTable>::DYNAMIC }
+    });
+    let element_flags = members().map(|field| {
+        let ty = &field.ty;
+        quote! { && <#ty as #crate_name::AsVTable>::ELEMENT }
+    });
     quote! {
         impl #crate_name::AsVTable for #ident #generics #where_clause {
+            const DYNAMIC: bool = false #(#dynamic_items)*;
+            const ELEMENT: bool = true #(#element_flags)*;
+
             fn vtable_fields(path: impl #crate_name::path::ComponentPath) -> impl Iterator<Item = #impeller::vtable::builder::FieldBuilder> {
                 use #crate_name::path::ComponentPath;
                 #timestamp_source

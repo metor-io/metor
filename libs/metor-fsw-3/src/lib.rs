@@ -152,6 +152,7 @@ pub mod deploy;
 pub mod dl;
 pub mod fn_system;
 pub mod frame;
+pub mod frame_map;
 pub mod io;
 #[cfg(feature = "host")]
 pub mod link;
@@ -188,6 +189,7 @@ pub use fn_system::{
     AsyncSystemFn, Ctor, Cycle, FnSignature, FnSystem, InSet, OutSet, Param, ParamNames, SystemFn,
 };
 pub use frame::Frame;
+pub use frame_map::{FrameRef, FrameWriteError, FrameWriter, MapRef, MapWriter};
 pub use io::{Buf, Cap, Handle, Io, IoInit, Pending, ResourceStatus, Slot};
 #[cfg(feature = "host")]
 pub use link::{LinkParams, LinkStatus};
@@ -210,8 +212,8 @@ pub use metor_proto::types::Timestamp;
 
 pub use metor_component::path;
 pub use metor_component::{
-    AsVTable, Componentize, Decomponentize, Element, FrameArray, FrameBytes, FrameImage, FrameStr,
-    FrameStrError, Metadatatize, Mono8, Mono16, Pixel, Rgb8, Rgba8,
+    AsVTable, Componentize, Decomponentize, Element, FrameArray, FrameBytes, FrameImage, FrameMap,
+    FrameStr, FrameStrError, KeyError, MapKey, Metadatatize, Mono8, Mono16, Pixel, Rgb8, Rgba8,
 };
 pub use metor_proto;
 pub use metor_proto_wkt;

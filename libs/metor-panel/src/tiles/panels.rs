@@ -403,6 +403,15 @@ pub(crate) fn new_panel_rows(
     pane: Entity<Pane>,
     on_open_inspector: Option<OpenInspectorCallback>,
 ) -> Vec<Box<dyn InspectorRow>> {
+    pane_add_menu(db, pane, on_open_inspector).rows()
+}
+
+/// The [`AddMenu`] whose views land as new tabs in `pane`.
+pub(crate) fn pane_add_menu(
+    db: Arc<DB>,
+    pane: Entity<Pane>,
+    on_open_inspector: Option<OpenInspectorCallback>,
+) -> AddMenu {
     AddMenu {
         db,
         host: Host::Pane,
@@ -416,7 +425,6 @@ pub(crate) fn new_panel_rows(
         }),
         on_open_inspector,
     }
-    .rows()
 }
 
 #[cfg(test)]

@@ -54,10 +54,14 @@ impl InspectorRegistry {
 
         if shape.id == <bool as Facet>::SHAPE.id {
             let val = *peek.get::<bool>().ok()?;
+            let read_entity = any_entity.clone();
             let any_entity = any_entity.clone();
-            return Some(Box::new(BoolRow::new(
+            return Some(Box::new(BoolRow::dynamic(
                 ctx.label.clone(),
-                val,
+                Arc::new(move |cx| {
+                    crate::inspector::reflect::get_field::<bool>(&read_entity, field_idx, cx)
+                        .unwrap_or(val)
+                }),
                 Arc::new(move |v, _w, cx| {
                     crate::inspector::reflect::set_field::<bool>(&any_entity, field_idx, v, cx)
                 }),
@@ -94,26 +98,44 @@ impl InspectorRegistry {
                     }),
                 }));
             }
+            let read_entity = any_entity.clone();
             let any_entity = any_entity.clone();
-            return Some(Box::new(ScalarRow::typed(
-                label,
-                val,
-                Arc::new(move |v, _w, cx| {
-                    write_value(&any_entity, field_idx, scalar, v, cx);
-                }),
-            )));
+            return Some(Box::new(
+                ScalarRow::typed(
+                    label,
+                    val,
+                    Arc::new(move |v, _w, cx| {
+                        write_value(&any_entity, field_idx, scalar, v, cx);
+                    }),
+                )
+                .live(Arc::new(move |cx| {
+                    read_typed(&read_entity, field_idx, scalar, cx)
+                })),
+            ));
         }
 
         if shape.id == <String as Facet>::SHAPE.id {
             let val = peek.get::<String>().ok()?.clone();
+            let read_entity = any_entity.clone();
             let any_entity = any_entity.clone();
-            return Some(Box::new(TextRow::new(
-                ctx.label.clone(),
-                SharedString::from(val),
-                Arc::new(move |s, _w, cx| {
-                    crate::inspector::reflect::set_field::<String>(&any_entity, field_idx, s, cx)
-                }),
-            )));
+            return Some(Box::new(
+                TextRow::new(
+                    ctx.label.clone(),
+                    SharedString::from(val),
+                    Arc::new(move |s, _w, cx| {
+                        crate::inspector::reflect::set_field::<String>(
+                            &any_entity,
+                            field_idx,
+                            s,
+                            cx,
+                        )
+                    }),
+                )
+                .live(Arc::new(move |cx| {
+                    crate::inspector::reflect::get_field::<String>(&read_entity, field_idx, cx)
+                        .map(SharedString::from)
+                })),
+            ));
         }
 
         if let Ok(peek_option) = (*peek).into_option() {
@@ -147,15 +169,26 @@ impl InspectorRegistry {
                 })
                 .map(|v| SharedString::from(v.name))
                 .collect();
+            let read_entity = any_entity.clone();
             let any_entity = any_entity.clone();
-            return Some(Box::new(EnumRow {
-                label: ctx.label.clone(),
-                selected: SharedString::from(selected),
-                options,
-                on_select: Arc::new(move |name, _w, cx| {
-                    crate::inspector::reflect::set_enum_variant(&any_entity, field_idx, &name, cx);
-                }),
-            }));
+            return Some(Box::new(
+                EnumRow::new(
+                    ctx.label.clone(),
+                    selected,
+                    options,
+                    Arc::new(move |name, _w, cx| {
+                        crate::inspector::reflect::set_enum_variant(
+                            &any_entity,
+                            field_idx,
+                            &name,
+                            cx,
+                        );
+                    }),
+                )
+                .live(Arc::new(move |cx| {
+                    read_variant(&read_entity, field_idx, cx)
+                })),
+            ));
         }
 
         None
@@ -228,25 +261,49 @@ fn write_value(
 }
 
 fn read_scalar(any_entity: &AnyEntity, idx: usize, scalar: ScalarType, cx: &App) -> f64 {
+    read_typed(any_entity, idx, scalar, cx).map_or(0.0, |v| v.as_f64())
+}
+
+fn read_typed(
+    any_entity: &AnyEntity,
+    idx: usize,
+    scalar: ScalarType,
+    cx: &App,
+) -> Option<TypedScalar> {
+    let mut value = None;
+    peek_field(any_entity, idx, cx, &mut |field| {
+        value = scalar_value(field, scalar);
+    });
+    value
+}
+
+fn read_variant(any_entity: &AnyEntity, idx: usize, cx: &App) -> Option<SharedString> {
+    let mut name = None;
+    peek_field(any_entity, idx, cx, &mut |field| {
+        name = (*field)
+            .into_enum()
+            .ok()
+            .and_then(|e| e.variant_name_active().ok().map(SharedString::new_static))
+    });
+    name
+}
+
+/// Run `read` on field `idx` of the entity, when its adapter is registered.
+fn peek_field(any_entity: &AnyEntity, idx: usize, cx: &App, read: &mut dyn FnMut(&Peek<'_, '_>)) {
     let Some(adapter) = cx
         .global::<InspectorRegistry>()
         .entity_adapter(any_entity.entity_type())
     else {
-        return 0.0;
+        return;
     };
-    let mut value = 0.0;
     (adapter.peek)(any_entity, cx, &mut |peek| {
         let Ok(fields) = (*peek).into_struct() else {
             return;
         };
-        let Ok(field) = fields.field(idx) else {
-            return;
-        };
-        if let Some(scalar) = scalar_value(&field, scalar) {
-            value = scalar.as_f64();
+        if let Ok(field) = fields.field(idx) {
+            read(&field);
         }
     });
-    value
 }
 
 #[cfg(test)]
@@ -259,6 +316,68 @@ mod tests {
     struct Numbers {
         counter: u64,
         small: u8,
+    }
+
+    #[derive(Facet, Clone, Copy, PartialEq, Debug)]
+    #[repr(u8)]
+    enum Mode {
+        Off,
+        On,
+    }
+
+    #[derive(Facet)]
+    struct Settings {
+        gain: f64,
+        enabled: bool,
+        name: String,
+        mode: Mode,
+    }
+
+    /// A docked inspector keeps its rows while the entity changes under it,
+    /// so every shape-default row reads the field rather than its build-time
+    /// copy.
+    #[gpui::test]
+    fn reflected_rows_track_edits_made_elsewhere(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(metor_db::DB::create(temp.path().join("db")).unwrap());
+        let window = cx.add_empty_window();
+        window.update(|window, cx| {
+            InspectorRegistry::init(db.clone(), cx);
+            cx.global_mut::<InspectorRegistry>()
+                .register_inspectable::<Settings>();
+            let entity = cx.new(|_| Settings {
+                gain: 1.0,
+                enabled: false,
+                name: "a".into(),
+                mode: Mode::Off,
+            });
+            let mut rows = crate::inspector::reflect::rows_for_entity(&entity, &db, cx);
+            entity.update(cx, |s, _| {
+                s.gain = 2.5;
+                s.enabled = true;
+                s.name = "b".into();
+                s.mode = Mode::On;
+            });
+
+            let edit_text = |row: &mut Box<dyn InspectorRow>,
+                             window: &mut gpui::Window,
+                             cx: &mut App| {
+                match row.activate(window, cx) {
+                    RowAction::StartEdit { current_text, .. } => current_text,
+                    _ => panic!("inline editor"),
+                }
+            };
+            assert_eq!(edit_text(&mut rows[0], window, cx), "2.5");
+            assert_eq!(edit_text(&mut rows[2], window, cx), "b");
+            // Toggling flips the live value, not the stale `false`.
+            rows[1].activate(window, cx);
+            assert!(!entity.read(cx).enabled);
+            // The enum row's summary reads the current variant.
+            assert_eq!(
+                read_variant(&entity.clone().into_any(), 3, cx).as_deref(),
+                Some("On")
+            );
+        });
     }
 
     #[gpui::test]
