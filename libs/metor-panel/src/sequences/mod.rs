@@ -100,8 +100,12 @@ impl SequenceState {
                     abort_clock: None,
                 });
             channel.available = available;
-            channel.clock = spec.clock.map(SharedString::from);
-            channel.abort_clock = spec.abort_clock.map(SharedString::from);
+            channel.clock = Some(spec.status.elapsed)
+                .filter(|n| !n.is_empty())
+                .map(SharedString::from);
+            channel.abort_clock = Some(spec.status.abort_elapsed)
+                .filter(|n| !n.is_empty())
+                .map(SharedString::from);
             self.channels.push(channel);
         }
     }

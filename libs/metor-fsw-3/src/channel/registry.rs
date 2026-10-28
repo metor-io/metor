@@ -59,8 +59,12 @@ impl Registry {
                 .map(|spec| SequenceChannelSpec {
                     name: spec.name,
                     available: spec.available,
-                    clock: spec.clock,
-                    abort_clock: spec.abort_clock,
+                    system: String::new(),
+                    status: metor_proto_wkt::SequenceChannelComponents {
+                        elapsed: spec.clock.unwrap_or_default(),
+                        abort_elapsed: spec.abort_clock.unwrap_or_default(),
+                        ..Default::default()
+                    },
                 })
                 .collect(),
         };
@@ -133,8 +137,8 @@ mod tests {
         assert_eq!(registry.channels.len(), 1);
         assert_eq!(registry.channels[0].name, "mode");
         assert_eq!(registry.channels[0].available, ["a"]);
-        assert_eq!(registry.channels[0].clock.as_deref(), Some("fsw.mode.t"));
-        assert_eq!(registry.channels[0].abort_clock, None);
+        assert_eq!(registry.channels[0].status.elapsed, "fsw.mode.t");
+        assert_eq!(registry.channels[0].status.abort_elapsed, "");
     }
 
     #[test]

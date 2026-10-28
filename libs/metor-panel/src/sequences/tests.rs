@@ -250,7 +250,7 @@ fn registry_update_preserves_runtime_state() {
 fn registry_carries_channel_clocks() {
     let mut state = SequenceState::default();
     let mut declared = registry(&[("deploy", &["solar"])]);
-    declared.channels[0].clock = Some("deploy.t".into());
+    declared.channels[0].status.elapsed = "deploy.t".into();
     state.apply_registry(ts(1), declared);
     let ch = state.channel("deploy").unwrap();
     assert_eq!(ch.clock.as_deref(), Some("deploy.t"));

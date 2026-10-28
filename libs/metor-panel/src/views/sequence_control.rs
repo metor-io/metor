@@ -848,8 +848,12 @@ mod tests {
                     channels: vec![SequenceChannelSpec {
                         name: "deploy".into(),
                         available: vec!["solar".into(), "lunar".into()],
-                        clock: Some("deploy.t".into()),
-                        abort_clock: Some("deploy.abort_t".into()),
+                        status: metor_proto_wkt::SequenceChannelComponents {
+                            elapsed: "deploy.t".into(),
+                            abort_elapsed: "deploy.abort_t".into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
                     }],
                 },
             );
