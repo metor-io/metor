@@ -10,10 +10,10 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
-use metor_proto_wkt::{LogEvent, SequenceChannelEvent, SequenceCommand};
+use metor_proto_wkt::{LogEvent, SequenceCommand};
 
 use super::pack_dev::PackDevError;
-use crate::channel::{ABORT_PORT, COMMANDS_PORT, ChannelStatus, EVENTS_PORT};
+use crate::channel::{ABORT_PORT, COMMANDS_PORT, ChannelStatus};
 use crate::coordinator::{STATUS_PORT, SystemStatus, SystemTable};
 use crate::dl::{PackKind, PackRef};
 use crate::fn_system::LOG_PORT;
@@ -39,25 +39,21 @@ fn framework_ports() -> [(&'static str, RecordClass); 2] {
 }
 
 /// The outputs a channel adds to the system behind it.
-fn channel_ports() -> [(&'static str, RecordClass); 2] {
-    [
-        (EVENTS_PORT, RecordClass::of::<SequenceChannelEvent>()),
-        (
-            crate::channel::STATUS_PORT,
-            RecordClass::of::<ChannelStatus>(),
-        ),
-    ]
+fn channel_ports() -> [(&'static str, RecordClass); 1] {
+    [(
+        crate::channel::STATUS_PORT,
+        RecordClass::of::<ChannelStatus>(),
+    )]
 }
 
 /// The records whose class name is their Rust type's, not their name in
 /// Pascal case.
-fn named_records() -> [RecordClass; 6] {
+fn named_records() -> [RecordClass; 5] {
     [
         RecordClass::of::<LogEvent>(),
         RecordClass::of::<SystemStatus>(),
         RecordClass::of::<ResourceStatus>(),
         RecordClass::of::<SequenceCommand>(),
-        RecordClass::of::<SequenceChannelEvent>(),
         RecordClass::of::<ChannelStatus>(),
     ]
 }
@@ -722,7 +718,9 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("FRAMEWORK_PORTS: dict[str, type[Record]] = {\"log\": LogEvent, \"status\": SystemStatus}\n"));
-        assert!(text.contains("CHANNEL_PORTS: dict[str, type[Record]] = {\"events\": SequenceChannelEvent, \"channel_status\": ChannelStatus}\n"));
+        assert!(text.contains(
+            "CHANNEL_PORTS: dict[str, type[Record]] = {\"channel_status\": ChannelStatus}\n"
+        ));
         assert!(!text.contains("class Interface"), "{text}");
         assert!(text.contains("IO_RECORDS = (\"io_sqe\", \"io_cqe\")\n"));
     }

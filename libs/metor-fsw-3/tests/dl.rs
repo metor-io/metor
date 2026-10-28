@@ -484,21 +484,22 @@ mod io {
 
 /// A guest's `Reset` waits for its ops in flight, as a host system's does.
 mod quiesce {
+    use metor_fsw_3::ChannelStatus;
     use metor_fsw_3::coordinator::{Adapter, ChannelConfig, CoordinatorConfig, RunState};
     use metor_fsw_3::io::ResourceStatus;
     use metor_fsw_3::metor_proto_wkt::{
-        SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
+        SequenceAccepts, SequenceChannelState, SequenceCommand, SequenceCommandKind,
     };
-    use metor_fsw_3::{ChannelState, ChannelStatus};
 
     use super::*;
     use crate::gps;
 
     type Log<T> = Rc<RefCell<Vec<(i64, T)>>>;
 
+    /// Keeps each status's state and accepted commands.
     #[system]
-    fn states(#[state] seen: &mut Log<u32>, now: Timestamp, st: &mut Input<ChannelStatus>) {
-        let got = st.drain().flatten().map(|s| (now.0, s.state));
+    fn states(#[state] seen: &mut Log<(u32, u32)>, now: Timestamp, st: &mut Input<ChannelStatus>) {
+        let got = st.drain().flatten().map(|s| (now.0, (s.state, s.accepts)));
         seen.borrow_mut().extend(got);
     }
 
@@ -508,15 +509,13 @@ mod quiesce {
         seen.borrow_mut().extend(got);
     }
 
-    /// Keeps each failure's reason.
+    /// Keeps each failure's message.
     #[system]
-    fn failures(
-        #[state] seen: &mut Rc<RefCell<Vec<String>>>,
-        events: &mut Input<SequenceChannelEvent>,
-    ) {
-        for event in events.drain().flatten() {
-            if let SequenceEventKind::Failed { reason } = event.kind {
-                seen.borrow_mut().push(reason);
+    fn failures(#[state] seen: &mut Rc<RefCell<Vec<String>>>, st: &mut Input<ChannelStatus>) {
+        for status in st.drain().flatten() {
+            let message = status.message.to_str().unwrap_or_default();
+            if message.starts_with("failed: ") {
+                seen.borrow_mut().push(message.to_string());
             }
         }
     }
@@ -535,7 +534,7 @@ mod quiesce {
     #[derive(Default)]
     struct Seen {
         failures: Rc<RefCell<Vec<String>>>,
-        states: Log<u32>,
+        states: Log<(u32, u32)>,
         submitted: Log<u64>,
         queue: Rc<RefCell<Vec<SequenceCommandKind>>>,
     }
@@ -601,15 +600,23 @@ mod quiesce {
             .borrow_mut()
             .extend([SequenceCommandKind::Stop, SequenceCommandKind::Reset]);
         step(4, 6);
-        let quiescing = ChannelState::Quiescing as u32;
+        let quiescing = SequenceChannelState::Quiescing.code();
         let states = seen.states.borrow().clone();
-        let waited = states.iter().find(|(_, s)| *s == quiescing);
-        let (t, _) = *waited.unwrap_or_else(|| panic!("no wait: {states:?}"));
-        let after = states.iter().find(|(at, _)| *at > t);
-        let stopped = (t + 1, ChannelState::Stopped as u32);
+        let waited = states.iter().find(|(_, (s, _))| *s == quiescing);
+        let (t, (_, accepts)) = *waited.unwrap_or_else(|| panic!("no wait: {states:?}"));
+        assert_eq!(
+            accepts,
+            SequenceAccepts::STOP | SequenceAccepts::RESET,
+            "a quiescing channel takes only stop and reset"
+        );
+        let after = states
+            .iter()
+            .find(|(at, _)| *at > t)
+            .map(|(at, (s, _))| (*at, *s));
+        let stopped = (t + 1, SequenceChannelState::Stopped.code());
         assert_eq!(
             after,
-            Some(&stopped),
+            Some(stopped),
             "remade once the cancel landed: {states:?}"
         );
         let before = seen.submitted.borrow().last().map_or(0, |s| s.1);
@@ -631,7 +638,7 @@ mod quiesce {
         let at = config.systems.iter().position(|s| s.id == "gps").unwrap();
         config.systems[at].ty = "echo.grower".into();
         config.systems.push(SystemConfig {
-            inputs: vec![InputConfig::new("events", "gps", "events")],
+            inputs: vec![InputConfig::new("st", "gps", "channel_status")],
             ..SystemConfig::new("failures", "failures")
         });
         let mut c = config.build(&table(&pack, &seen)).unwrap();
@@ -640,8 +647,8 @@ mod quiesce {
             .borrow_mut()
             .extend([SequenceCommandKind::Stop, SequenceCommandKind::Reset]);
         (2..5).for_each(|t| c.step(Timestamp(t)));
-        let last = seen.states.borrow().last().map(|s| s.1);
-        assert_eq!(last, Some(ChannelState::Failed as u32));
+        let last = seen.states.borrow().last().map(|s| s.1.0);
+        assert_eq!(last, Some(SequenceChannelState::Failed.code()));
         let failures = seen.failures.borrow();
         assert!(
             failures.iter().any(|r| r.contains("IO memory")),

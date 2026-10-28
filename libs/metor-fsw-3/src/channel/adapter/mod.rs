@@ -2,15 +2,13 @@
 //!
 //! The adapter wraps the system's step. Each cycle it applies the commands
 //! sent to its channel, steps the system if it is running, and reports the
-//! channel's events and status.
+//! channel's status.
 
 use std::sync::Arc;
 
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
-use metor_proto_wkt::{
-    SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
-};
+use metor_proto_wkt::{SequenceChannelState, SequenceCommand, SequenceCommandKind};
 
 use crate::coordinator::{
     Adapter, ChannelConfig, EndReason, MakeCx, MakeError, MakeFn, Params, RunState, Step, StepCx,
@@ -23,10 +21,11 @@ use crate::record::Record;
 use crate::system::{PortDef, SystemDef};
 use crate::thread::Threads;
 
-use super::apply::{Command, Phase, State, apply};
+use super::apply::{Command, Phase, State, accepts, apply};
 use super::{
-    ABORT_PORT, AbortRequest, COMMANDS_PORT, ChannelState, ChannelStatus, EVENTS_PORT, STATUS_PORT,
+    ABORT_PORT, AbortRequest, COMMANDS_PORT, ChannelStatus, MESSAGE_LEN, STATUS_PORT, channel_state,
 };
+use crate::FrameStr;
 
 /// The number of records the private abort ring holds.
 const ABORT_DEPTH: usize = 4;
@@ -37,24 +36,23 @@ const ABORT_DEPTH: usize = 4;
 /// Returns the name of a system port that already uses one of the channel's
 /// port names.
 pub(crate) fn def(mut inner: SystemDef, cx: &DefCx<'_>) -> Result<SystemDef, String> {
-    let reserved = [COMMANDS_PORT, EVENTS_PORT, STATUS_PORT];
+    let reserved = [COMMANDS_PORT, STATUS_PORT];
     let mut taken = inner.inputs.iter().chain(&inner.outputs);
     if let Some(port) = taken.find(|p| reserved.contains(&p.name.as_ref())) {
         return Err(port.name.to_string());
     }
-    let [commands, events, status] = channel_ports(cx);
+    let [commands, status] = channel_ports(cx);
     inner.inputs.push(commands);
-    inner.outputs.extend([events, status]);
+    inner.outputs.push(status);
     Ok(inner)
 }
 
 /// Returns the ports every channel adds.
 ///
-/// These are the commands input, then the events and status outputs.
-pub(crate) fn channel_ports(cx: &DefCx<'_>) -> [PortDef; 3] {
+/// These are the commands input, then the status output.
+pub(crate) fn channel_ports(cx: &DefCx<'_>) -> [PortDef; 2] {
     [
         Input::<SequenceCommand>::def(cx, COMMANDS_PORT),
-        Output::<SequenceChannelEvent>::def(cx, EVENTS_PORT),
         Output::<ChannelStatus>::def(cx, STATUS_PORT),
     ]
 }
@@ -62,16 +60,15 @@ pub(crate) fn channel_ports(cx: &DefCx<'_>) -> [PortDef; 3] {
 /// Builds a system with `make` and wraps it in `channel`.
 ///
 /// `cx.def` must be the definition [`def`] returned, so the channel's ports
-/// are the last input and the last two outputs.
+/// are the last input and the last output.
 pub(crate) fn make_channel(
     make: &Arc<MakeFn>,
     channel: &ChannelConfig,
     mut cx: MakeCx<'_>,
 ) -> Result<Box<dyn Step>, MakeError> {
-    // PANIC Safety: `def` appended one input and two outputs.
+    // PANIC Safety: `def` appended one input and one output.
     let commands = cx.inputs.pop().expect("the commands input");
     let status = cx.outputs.pop().expect("the channel_status output");
-    let events = cx.outputs.pop().expect("the events output");
     let mut def = cx.def.clone();
     def.inputs.pop();
     def.outputs.truncate(cx.outputs.len());
@@ -108,9 +105,10 @@ pub(crate) fn make_channel(
             recipe,
             threads,
             abort,
-            events: writer(events),
             status: writer(status),
             clock: RunClock::default(),
+            message: FrameStr::default(),
+            message_at: 0,
         },
     }))
 }
@@ -199,16 +197,17 @@ pub struct Channel {
 struct Core {
     name: String,
     phase: ChannelPhase,
-    /// The end last reported on `events`.
+    /// The end last reported as a message.
     reported_end_reason: Option<EndReason>,
     /// The last name a `Load` accepted. A reset loads it again.
     loaded: Option<String>,
     recipe: SystemRecipe,
     threads: Threads,
     abort: Option<Output<AbortRequest>>,
-    events: Output<SequenceChannelEvent>,
     status: Output<ChannelStatus>,
     clock: RunClock,
+    message: FrameStr<MESSAGE_LEN>,
+    message_at: i64,
 }
 
 /// The run and abort clocks a channel reports in its status.
@@ -286,7 +285,9 @@ impl Step for Channel {
         let Self { commands, core } = self;
         for command in commands.drain() {
             match command {
-                Ok(command) if command.channel == core.name => core.command(command.command, cx.io),
+                Ok(command) if command.channel == core.name => {
+                    core.command(command.command, now, cx.io);
+                }
                 _ => {}
             }
         }
@@ -295,12 +296,12 @@ impl Step for Channel {
 }
 
 impl Core {
-    fn command(&mut self, kind: SequenceCommandKind, io: &mut IoState) {
-        let event = match apply(self.state(), Command::of(&kind)) {
+    fn command(&mut self, kind: SequenceCommandKind, now: Timestamp, io: &mut IoState) {
+        let message = match apply(self.state(), Command::of(&kind)) {
             Ok(()) => self.transition(kind, io),
-            Err(refusal) => SequenceEventKind::refused(refusal.to_string()),
+            Err(refusal) => refused(refusal),
         };
-        self.emit(event);
+        self.say(&message, now);
     }
 
     fn state(&self) -> State {
@@ -319,15 +320,16 @@ impl Core {
         }
     }
 
-    fn transition(&mut self, kind: SequenceCommandKind, io: &mut IoState) -> SequenceEventKind {
+    /// Applies an accepted command and returns its message.
+    fn transition(&mut self, kind: SequenceCommandKind, io: &mut IoState) -> String {
         match kind {
             SequenceCommandKind::Start => {
                 self.set_run(RunState::Running);
-                SequenceEventKind::Started
+                "started".into()
             }
             SequenceCommandKind::Stop => {
                 self.set_run(RunState::Stopped);
-                SequenceEventKind::Stopped
+                "stopped".into()
             }
             SequenceCommandKind::Abort => self.abort(),
             SequenceCommandKind::Reset => self.reset(io),
@@ -341,35 +343,34 @@ impl Core {
         }
     }
 
-    fn abort(&mut self) -> SequenceEventKind {
+    fn abort(&mut self) -> String {
         let written = self
             .abort
             .as_mut()
             .is_some_and(|abort| abort.write(&AbortRequest {}).is_ok());
         if !written {
-            return SequenceEventKind::refused("the abort ring is full".into());
+            return refused("the abort ring is full");
         }
         self.clock.abort();
-        SequenceEventKind::Progress {
-            detail: "abort requested".into(),
-        }
+        "abort requested".into()
     }
 
     /// Resets the system. An IO system is dropped now and made again once its
     /// ops in flight finish.
-    fn reset(&mut self, io: &mut IoState) -> SequenceEventKind {
+    fn reset(&mut self, io: &mut IoState) -> String {
         if !self.has_io(io) {
-            return self.restart_event(io);
+            return self.restart_message(io);
         }
         self.phase = ChannelPhase::Restarting;
         io.quiesce_system(&self.recipe.id);
-        SequenceEventKind::quiescing()
+        "quiescing".into()
     }
 
-    fn restart_event(&mut self, io: &mut IoState) -> SequenceEventKind {
+    fn restart_message(&mut self, io: &mut IoState) -> String {
         match self.restart(io) {
-            Ok(()) => SequenceEventKind::Loaded {
-                name: self.loaded_name(),
+            Ok(()) => match &self.loaded {
+                Some(name) => format!("loaded {name}"),
+                None => "reset".into(),
             },
             Err(reason) => self.fail(reason),
         }
@@ -403,7 +404,7 @@ impl Core {
 
     /// Loads `name`. On an IO system whose step loads occupants, the load
     /// waits for its ops in flight. Any other step loads, or refuses, at once.
-    fn defer_load(&mut self, name: String, io: &mut IoState) -> SequenceEventKind {
+    fn defer_load(&mut self, name: String, io: &mut IoState) -> String {
         let loads = self
             .phase
             .inner()
@@ -411,14 +412,15 @@ impl Core {
         let defer = loads && self.has_io(io);
         match core::mem::replace(&mut self.phase, ChannelPhase::Restarting) {
             ChannelPhase::Live { inner, .. } if defer => {
+                let message = format!("loading {name}");
                 self.phase = ChannelPhase::Loading { inner, name };
                 io.quiesce_system(&self.recipe.id);
-                SequenceEventKind::quiescing()
+                message
             }
             ChannelPhase::Live { inner, run } => self.load(inner, run, name, io),
             phase => {
                 self.phase = phase;
-                SequenceEventKind::refused("the system is gone; reset it first".into())
+                refused("the system is gone; reset it first")
             }
         }
     }
@@ -429,21 +431,21 @@ impl Core {
     }
 
     /// Runs the deferred reset or load once the system is idle.
-    fn settle(&mut self, io: &mut IoState) {
+    fn settle(&mut self, now: Timestamp, io: &mut IoState) {
         let id = &self.recipe.id;
         if !io.is_system_idle(id) {
             return;
         }
         io.end_quiescing_system(id);
-        let event = match core::mem::replace(&mut self.phase, ChannelPhase::Restarting) {
-            ChannelPhase::Restarting => self.restart_event(io),
+        let message = match core::mem::replace(&mut self.phase, ChannelPhase::Restarting) {
+            ChannelPhase::Restarting => self.restart_message(io),
             ChannelPhase::Loading { inner, name } => self.load(inner, RunState::Stopped, name, io),
             phase => {
                 self.phase = phase;
                 return;
             }
         };
-        self.emit(event);
+        self.say(&message, now);
     }
 
     /// Loads `name` into `inner`, which was in `run`. A refused load leaves
@@ -454,20 +456,21 @@ impl Core {
         run: RunState,
         name: String,
         io: &mut IoState,
-    ) -> SequenceEventKind {
+    ) -> String {
         match crate::panic::catch(|| inner.load(&name, &mut StepCx::new(io))) {
             Some(Ok(())) => {
                 self.phase = ChannelPhase::Live {
                     inner,
                     run: RunState::Stopped,
                 };
-                self.loaded = Some(name.clone());
+                let message = format!("loaded {name}");
+                self.loaded = Some(name);
                 self.clock = RunClock::default();
-                SequenceEventKind::Loaded { name }
+                message
             }
             Some(Err(error)) => {
                 self.phase = ChannelPhase::Live { inner, run };
-                SequenceEventKind::refused(error.to_string())
+                refused(error)
             }
             None => {
                 crate::panic::catch(|| drop(inner));
@@ -484,22 +487,17 @@ impl Core {
         made.map_err(|e| e.to_string())
     }
 
-    /// Ends the channel as failed and returns the `Failed` event.
+    /// Ends the channel as failed and returns its message.
     ///
     /// The end is marked as already reported, so the next cycle does not
     /// report it again.
-    fn fail(&mut self, reason: String) -> SequenceEventKind {
+    fn fail(&mut self, reason: String) -> String {
         let reason = clipped(reason);
-        let end = EndReason::Failed(reason.clone().into());
+        let message = format!("failed: {reason}");
+        let end = EndReason::Failed(reason.into());
         self.reported_end_reason = Some(end.clone());
         self.phase = ChannelPhase::Gone(end);
-        SequenceEventKind::Failed { reason }
-    }
-
-    fn loaded_name(&self) -> String {
-        self.loaded
-            .clone()
-            .unwrap_or_else(|| self.recipe.id.clone())
+        message
     }
 
     fn step(&mut self, now: Timestamp, cx: &mut StepCx<'_>) {
@@ -507,7 +505,7 @@ impl Core {
             self.phase,
             ChannelPhase::Restarting | ChannelPhase::Loading { .. }
         ) {
-            self.settle(cx.io);
+            self.settle(now, cx.io);
         } else if let ChannelPhase::Live {
             inner,
             run: RunState::Running,
@@ -518,7 +516,7 @@ impl Core {
             let phase = core::mem::replace(&mut self.phase, panicked);
             crate::panic::catch(|| drop(phase));
         }
-        self.report_end();
+        self.report_end(now);
         self.write_status(now);
     }
 
@@ -531,17 +529,23 @@ impl Core {
 
     /// Reports how the system ended, once per change.
     ///
-    /// Emits an event the first cycle the end differs from the last one
+    /// Raises a message the first cycle the end differs from the last one
     /// reported.
-    fn report_end(&mut self) {
+    fn report_end(&mut self, now: Timestamp) {
         let end = self.ended().cloned();
         if end == self.reported_end_reason {
             return;
         }
         if let Some(end) = &end {
-            self.emit(SequenceEventKind::ended(end));
+            self.say(&ended(end), now);
         }
         self.reported_end_reason = end;
+    }
+
+    /// Makes `text` the channel's message, raised at `now`.
+    fn say(&mut self, text: &str, now: Timestamp) {
+        self.message = FrameStr::truncated(text);
+        self.message_at = now.0;
     }
 
     fn write_status(&mut self, now: Timestamp) {
@@ -563,65 +567,41 @@ impl Core {
             hash: occupant.map(|o| o.hash).unwrap_or_default(),
             elapsed,
             abort_elapsed,
+            accepts: accepts(self.state()).0,
+            message: self.message,
+            message_at: self.message_at,
         };
         let _ = self.status.write(&status);
     }
 
-    fn channel_state(&self) -> ChannelState {
+    fn channel_state(&self) -> SequenceChannelState {
         match &self.phase {
-            ChannelPhase::Restarting | ChannelPhase::Loading { .. } => ChannelState::Quiescing,
-            ChannelPhase::Live { run, .. } => ChannelState::of(*run, self.ended()),
-            ChannelPhase::Gone(end) => ChannelState::of(RunState::Stopped, Some(end)),
-        }
-    }
-
-    fn emit(&mut self, kind: SequenceEventKind) {
-        let event = SequenceChannelEvent {
-            channel: self.name.clone(),
-            kind,
-        };
-        let _ = self.events.write(&event);
-    }
-}
-
-/// The events a channel reports beyond what the wire type builds itself.
-trait ChannelEvent {
-    fn quiescing() -> Self;
-    fn refused(reason: String) -> Self;
-    fn ended(end: &EndReason) -> Self;
-}
-
-impl ChannelEvent for SequenceEventKind {
-    fn quiescing() -> Self {
-        Self::Progress {
-            detail: "quiescing".into(),
-        }
-    }
-
-    fn refused(reason: String) -> Self {
-        Self::Refused {
-            reason: clipped(reason),
-        }
-    }
-
-    fn ended(end: &EndReason) -> Self {
-        match end {
-            EndReason::Completed => Self::Completed,
-            EndReason::Aborted => Self::Aborted,
-            EndReason::Failed(reason) => Self::Failed {
-                reason: clipped(reason.to_string()),
-            },
-            EndReason::Panicked => Self::Failed {
-                reason: "panicked".into(),
-            },
-            EndReason::Unloaded => Self::Unloaded,
+            ChannelPhase::Restarting | ChannelPhase::Loading { .. } => {
+                SequenceChannelState::Quiescing
+            }
+            ChannelPhase::Live { run, .. } => channel_state(*run, self.ended()),
+            ChannelPhase::Gone(end) => channel_state(RunState::Stopped, Some(end)),
         }
     }
 }
 
-/// The longest reason, in bytes, that an event carries.
-///
-/// This keeps every refusal small enough to fit in its record.
+/// The message for a refused command.
+fn refused(reason: impl core::fmt::Display) -> String {
+    format!("refused: {reason}")
+}
+
+/// The message for how a system ended.
+fn ended(end: &EndReason) -> String {
+    match end {
+        EndReason::Completed => "completed".into(),
+        EndReason::Aborted => "aborted".into(),
+        EndReason::Failed(reason) => format!("failed: {reason}"),
+        EndReason::Panicked => "panicked".into(),
+        EndReason::Unloaded => "unloaded".into(),
+    }
+}
+
+/// The longest failure reason, in bytes, that an [`EndReason`] keeps.
 const REASON_CAP: usize = 512;
 
 /// Cuts `text` to at most `REASON_CAP` bytes, on a char boundary.

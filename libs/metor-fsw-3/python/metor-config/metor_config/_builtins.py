@@ -408,17 +408,30 @@ def _candidate(system: System) -> dict[str, Any]:
     }
 
 
+_CHANNEL_STATUS_FIELDS = (
+    "state",
+    "loaded",
+    "artifact",
+    "hash",
+    "accepts",
+    "message",
+    "message_at",
+    "elapsed",
+    "abort_elapsed",
+)
+"""The fields of a channel's ``channel_status``, each its own component."""
+
+
 def _channel_spec(channel: Any, system: System, namespace: str | None) -> dict[str, Any]:
-    """Returns one registry entry: the channel, what it can load, and its
-    clocks. The clocks default to the ones every channel reports in its
-    ``channel_status``; ``clock=`` and ``abort_clock=`` on `Target.add`
-    name others."""
+    """Returns one registry entry: the channel, what it can load, the wrapped
+    system's type, and the full component name of each field of its
+    ``channel_status``."""
     status = ".".join(part for part in (namespace, system._name, "channel_status") if part)
     return {
         "name": channel.name,
         "available": system._names if isinstance(system, DlSlot) else [],
-        "clock": channel.clock or f"{status}.elapsed",
-        "abort_clock": channel.abort_clock or f"{status}.abort_elapsed",
+        "system": system._ty,
+        "status": {field: f"{status}.{field}" for field in _CHANNEL_STATUS_FIELDS},
     }
 
 

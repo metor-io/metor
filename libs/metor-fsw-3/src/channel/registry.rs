@@ -5,7 +5,7 @@
 
 use core::num::NonZeroU64;
 
-use metor_proto_wkt::{SequenceChannelSpec, SequenceRegistry};
+use metor_proto_wkt::{SequenceChannelComponents, SequenceChannelSpec, SequenceRegistry};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -21,19 +21,49 @@ pub struct RegistryParams {
     pub period: NonZeroU64,
 }
 
-/// One channel, and the names a `Load` command on it may use.
+/// One channel, the names a `Load` command on it may use, and the
+/// components carrying its state.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelSpec {
     pub name: String,
     #[serde(default)]
     pub available: Vec<String>,
-    /// The component holding the channel's run clock, in seconds.
-    #[serde(default)]
-    pub clock: Option<String>,
-    /// The component holding the channel's abort clock, in seconds.
-    #[serde(default)]
-    pub abort_clock: Option<String>,
+    /// The wrapped system's type.
+    pub system: String,
+    pub status: StatusComponents,
+}
+
+/// The full component name of each field of the channel's
+/// [`ChannelStatus`](super::ChannelStatus).
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StatusComponents {
+    pub state: String,
+    pub loaded: String,
+    pub artifact: String,
+    pub hash: String,
+    pub accepts: String,
+    pub message: String,
+    pub message_at: String,
+    pub elapsed: String,
+    pub abort_elapsed: String,
+}
+
+impl From<StatusComponents> for SequenceChannelComponents {
+    fn from(c: StatusComponents) -> Self {
+        Self {
+            state: c.state,
+            loaded: c.loaded,
+            artifact: c.artifact,
+            hash: c.hash,
+            accepts: c.accepts,
+            message: c.message,
+            message_at: c.message_at,
+            elapsed: c.elapsed,
+            abort_elapsed: c.abort_elapsed,
+        }
+    }
 }
 
 /// The period used when the config does not set one.
@@ -59,12 +89,8 @@ impl Registry {
                 .map(|spec| SequenceChannelSpec {
                     name: spec.name,
                     available: spec.available,
-                    system: String::new(),
-                    status: metor_proto_wkt::SequenceChannelComponents {
-                        elapsed: spec.clock.unwrap_or_default(),
-                        abort_elapsed: spec.abort_clock.unwrap_or_default(),
-                        ..Default::default()
-                    },
+                    system: spec.system,
+                    status: spec.status.into(),
                 })
                 .collect(),
         };
@@ -107,10 +133,35 @@ mod tests {
         )
     }
 
+    /// A channel spec whose status components live under `fsw.{name}`.
+    fn spec(name: &str, available: &[&str]) -> serde_json::Value {
+        let fields = [
+            "state",
+            "loaded",
+            "artifact",
+            "hash",
+            "accepts",
+            "message",
+            "message_at",
+            "elapsed",
+            "abort_elapsed",
+        ];
+        let status: serde_json::Map<_, _> = fields
+            .iter()
+            .map(|f| {
+                (
+                    f.to_string(),
+                    json!(format!("fsw.{name}.channel_status.{f}")),
+                )
+            })
+            .collect();
+        json!({ "name": name, "available": available, "system": "dl_slot", "status": status })
+    }
+
     #[test]
     fn test_writes_on_first_cycle_then_each_period() {
         let mut state = make(json!({
-            "channels": [{ "name": "mode", "available": ["a", "b"] }, { "name": "arm" }],
+            "channels": [spec("mode", &["a", "b"]), spec("arm", &[])],
             "period": 3
         }))
         .expect("valid params");
@@ -127,18 +178,34 @@ mod tests {
 
     #[test]
     fn test_registry_decodes_to_params() {
-        let mut state = make(json!({
-            "channels": [{ "name": "mode", "available": ["a"], "clock": "fsw.mode.t" }]
-        }))
-        .expect("valid params");
+        let mut state = make(json!({ "channels": [spec("mode", &["a"])] })).expect("valid params");
         let (_ring, mut output, mut input) = pair::<SequenceRegistry>(4);
         channel_registry()(&mut state, &mut output);
         let registry = input.drain().next().expect("a record").expect("decodes");
         assert_eq!(registry.channels.len(), 1);
         assert_eq!(registry.channels[0].name, "mode");
         assert_eq!(registry.channels[0].available, ["a"]);
-        assert_eq!(registry.channels[0].status.elapsed, "fsw.mode.t");
-        assert_eq!(registry.channels[0].status.abort_elapsed, "");
+        assert_eq!(registry.channels[0].system, "dl_slot");
+        let status = &registry.channels[0].status;
+        assert_eq!(status.state, "fsw.mode.channel_status.state");
+        assert_eq!(status.message_at, "fsw.mode.channel_status.message_at");
+        assert_eq!(
+            status.abort_elapsed,
+            "fsw.mode.channel_status.abort_elapsed"
+        );
+    }
+
+    #[test]
+    fn test_refuses_incomplete_or_unknown_status() {
+        let mut partial = spec("mode", &[]);
+        partial["status"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("message");
+        assert!(make(json!({ "channels": [partial] })).is_err());
+        let mut extra = spec("mode", &[]);
+        extra["status"]["clock"] = json!("fsw.mode.t");
+        assert!(make(json!({ "channels": [extra] })).is_err());
     }
 
     #[test]

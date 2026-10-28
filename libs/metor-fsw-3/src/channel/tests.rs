@@ -1,5 +1,5 @@
 use metor_fsw_3_ring::NoWake;
-use metor_proto_wkt::{SequenceChannelEvent, SequenceCommand, SequenceRegistry};
+use metor_proto_wkt::{SequenceChannelState, SequenceCommand, SequenceRegistry};
 
 use super::*;
 use crate::def::DefCx;
@@ -11,7 +11,6 @@ use crate::tests::utils::pair;
 #[test]
 fn test_wkt_records_keep_panel_ids() {
     assert_eq!(SequenceCommand::schema().packet_id(), [225, 247]);
-    assert_eq!(SequenceChannelEvent::schema().packet_id(), [133, 5]);
     assert_eq!(SequenceRegistry::schema().packet_id(), [78, 109]);
 }
 
@@ -53,18 +52,18 @@ fn test_abort_param_declares_port() {
 
 #[test]
 fn test_channel_state_codes() {
-    assert_eq!(ChannelState::of(RunState::Running, None).code(), 0);
-    assert_eq!(ChannelState::of(RunState::Stopped, None).code(), 1);
+    assert_eq!(channel_state(RunState::Running, None).code(), 0);
+    assert_eq!(channel_state(RunState::Stopped, None).code(), 1);
     assert_eq!(
-        ChannelState::of(RunState::Running, Some(&EndReason::Completed)),
-        ChannelState::Completed
+        channel_state(RunState::Running, Some(&EndReason::Completed)),
+        SequenceChannelState::Completed
     );
     assert_eq!(
-        ChannelState::of(RunState::Stopped, Some(&EndReason::Failed("x".into()))),
-        ChannelState::Failed
+        channel_state(RunState::Stopped, Some(&EndReason::Failed("x".into()))),
+        SequenceChannelState::Failed
     );
     assert_eq!(
-        ChannelState::of(RunState::Stopped, Some(&EndReason::Unloaded)).code(),
+        channel_state(RunState::Stopped, Some(&EndReason::Unloaded)).code(),
         6
     );
 }
@@ -81,6 +80,15 @@ fn test_channel_status_layout() {
     assert!(artifact.is_string());
     let hashes = metadata.iter().filter(|m| m.name.contains("hash")).count();
     assert_eq!(hashes, 1);
+    let message = metadata
+        .iter()
+        .find(|m| m.name.ends_with("message"))
+        .expect("a message component");
+    assert!(message.is_string());
+    let names: Vec<_> = metadata.iter().map(|m| m.name.as_str()).collect();
+    for field in ["accepts", "message_at"] {
+        assert!(names.iter().any(|n| n.ends_with(field)), "{names:?}");
+    }
     let port: PortDef = Output::<ChannelStatus>::def(&DefCx::empty(), "channel_status");
     assert_eq!(port.max_len, size_of::<ChannelStatus>());
 }

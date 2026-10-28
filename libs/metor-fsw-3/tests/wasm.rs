@@ -9,13 +9,11 @@ use std::sync::Arc;
 
 use common::{Ping, fixture_lib, fixture_wasm, open_wasm, panicked};
 use metor_fsw_3::coordinator::{BuildError, Coordinator, CoordinatorConfig, MakeError};
-use metor_fsw_3::metor_proto_wkt::{
-    LogEvent, SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
-};
+use metor_fsw_3::metor_proto_wkt::{LogEvent, SequenceCommand, SequenceCommandKind};
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
-    Adapter, ChannelConfig, DefCx, DlPack, Frame, Input, InputConfig, Output, Pack, PortRef,
-    RunState, SystemConfig, SystemTable, Timestamp, system,
+    Adapter, ChannelConfig, ChannelStatus, DefCx, DlPack, Frame, Input, InputConfig, Output, Pack,
+    PortRef, RunState, SystemConfig, SystemTable, Timestamp, system,
 };
 use serde_json::json;
 
@@ -106,7 +104,10 @@ struct Sample {
 struct Seen {
     pings: Vec<u32>,
     lines: Vec<LogEvent>,
-    events: Vec<SequenceEventKind>,
+    /// Each message the channel raised, in order.
+    messages: Vec<String>,
+    /// When the last message was raised.
+    message_at: i64,
     queue: VecDeque<SequenceCommandKind>,
     /// How many of the source's writes its ring rejected.
     refused: u32,
@@ -170,11 +171,16 @@ fn commander(#[state] c: &mut Commander, commands: &mut Output<SequenceCommand>)
 struct Watch(Shared);
 
 #[system]
-fn watch(#[state] w: &mut Watch, events: &mut Input<SequenceChannelEvent>) {
-    let events = events.drain().filter_map(Result::ok);
-    w.0.borrow_mut()
-        .events
-        .extend(events.map(|event| event.kind));
+fn watch(#[state] w: &mut Watch, st: &mut Input<ChannelStatus>) {
+    let Ok(Some(status)) = st.latest() else {
+        return;
+    };
+    let mut seen = w.0.borrow_mut();
+    let text = status.message.to_str().expect("utf-8");
+    if status.message_at != seen.message_at && !text.is_empty() {
+        seen.messages.push(text.to_string());
+        seen.message_at = status.message_at;
+    }
 }
 
 fn table(pack: &Arc<Pack>, seen: &Shared) -> SystemTable {
@@ -423,7 +429,7 @@ fn channel() -> CoordinatorConfig {
                 ..SystemConfig::new("mode", "echo.count_up")
             },
             SystemConfig {
-                inputs: vec![InputConfig::new("events", "mode", "events")],
+                inputs: vec![InputConfig::new("st", "mode", "channel_status")],
                 ..SystemConfig::new("watch", "watch")
             },
             SystemConfig {
@@ -435,17 +441,17 @@ fn channel() -> CoordinatorConfig {
     }
 }
 
-/// Sends `command` and runs `cycles` cycles. Returns the events they
-/// produced.
+/// Sends `command` and runs `cycles` cycles. Returns the messages they
+/// raised.
 fn send(
     coordinator: &mut Coordinator,
     seen: &Shared,
     command: SequenceCommandKind,
     cycles: usize,
-) -> Vec<SequenceEventKind> {
+) -> Vec<String> {
     seen.borrow_mut().queue.push_back(command);
     run(coordinator, cycles);
-    std::mem::take(&mut seen.borrow_mut().events)
+    std::mem::take(&mut seen.borrow_mut().messages)
 }
 
 #[test]
@@ -457,22 +463,22 @@ fn test_sequence_completes_aborts_and_resets() {
 
 fn sequence_completes_aborts_and_resets(pack: &Arc<Pack>) {
     let (mut coordinator, seen) = build(channel(), pack);
-    let events = send(&mut coordinator, &seen, SequenceCommandKind::Start, 4);
-    let completed = [SequenceEventKind::Started, SequenceEventKind::Completed];
-    assert_eq!(events, completed);
+    let messages = send(&mut coordinator, &seen, SequenceCommandKind::Start, 4);
+    let completed = ["started", "completed"];
+    assert_eq!(messages, completed);
     assert_eq!(pings(&seen), [1, 2, 3]);
 
     send(&mut coordinator, &seen, SequenceCommandKind::Reset, 1);
     send(&mut coordinator, &seen, SequenceCommandKind::Start, 1);
     // The sequence sees the abort on the same cycle it is sent, and ends on
     // that cycle.
-    let events = send(&mut coordinator, &seen, SequenceCommandKind::Abort, 1);
-    assert!(events.contains(&SequenceEventKind::Aborted), "{events:?}");
+    let messages = send(&mut coordinator, &seen, SequenceCommandKind::Abort, 1);
+    assert_eq!(messages, ["aborted"]);
     assert_eq!(pings(&seen), [1]);
 
     send(&mut coordinator, &seen, SequenceCommandKind::Reset, 1);
-    let events = send(&mut coordinator, &seen, SequenceCommandKind::Start, 4);
-    assert_eq!(events, completed);
+    let messages = send(&mut coordinator, &seen, SequenceCommandKind::Start, 4);
+    assert_eq!(messages, completed);
     assert_eq!(pings(&seen), [1, 2, 3]);
     assert_eq!(panicked(&coordinator).len(), 0);
 }

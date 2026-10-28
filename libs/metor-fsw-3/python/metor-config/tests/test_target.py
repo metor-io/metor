@@ -493,8 +493,9 @@ class ChannelTest(ConfigTest):
         cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
         fsw.commands(cmds.sequence_command)
         nav = fsw.add("nav", Nav(), channel="nav")
-        self.assertEqual(nav.events.ref, PortRef("nav", "events"))
         self.assertEqual(nav.channel_status.ref, PortRef("nav", "channel_status"))
+        with self.assertRaisesRegex(AttributeError, "events"):
+            nav.events  # type: ignore[attr-defined]
         plain = fsw.add("plain", Nav())
         with self.assertRaisesRegex(AttributeError, "channel_status"):
             plain.channel_status  # type: ignore[attr-defined]
@@ -527,7 +528,7 @@ class ChannelTest(ConfigTest):
         fsw = Target(cycle_rate=50.0)
         mode = fsw.add("mode", DlSlot(allow=[Safe(), Hold()]), channel="mode")
         self.assertEqual(mode.cmd.ref, PortRef("mode", "cmd"))
-        self.assertEqual(mode.events.ref, PortRef("mode", "events"))
+        self.assertEqual(mode.channel_status.ref, PortRef("mode", "channel_status"))
 
     def test_slot_refusals(self) -> None:
         fsw = Target(cycle_rate=50.0)
@@ -573,42 +574,55 @@ class ChannelTest(ConfigTest):
                 {
                     "name": "nav",
                     "available": [],
-                    "clock": "nav.channel_status.elapsed",
-                    "abort_clock": "nav.channel_status.abort_elapsed",
+                    "system": "nav",
+                    "status": status_names("nav.channel_status"),
                 },
                 {
                     "name": "mode",
                     "available": ["safe", "hold"],
-                    "clock": "mode.channel_status.elapsed",
-                    "abort_clock": "mode.channel_status.abort_elapsed",
+                    "system": "dl_slot",
+                    "status": status_names("mode.channel_status"),
                 },
             ],
         )
         self.assertEqual(params["period"], 50)
         self.assertEqual(systems["channels"]["ty"], "fsw.channel_registry")
 
-    def test_registry_names_channel_clocks(self) -> None:
+    def test_registry_names_status_components(self) -> None:
         fsw = Target(cycle_rate=50.0, namespace="sat")
         cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
         fsw.commands(cmds.sequence_command)
         fsw.add("nav", Nav(), channel="guidance")
-        fsw.add("mode", Mode(), channel="mode", clock="sat.mode.t")
         fsw.add("channels", ChannelRegistry())
         systems = {s["id"]: s for s in fsw.to_config()["coordinator"]["systems"]}
-        nav, mode = systems["channels"]["params"]["channels"]
-        # The status clocks are named by system, not channel, under the
+        [nav] = systems["channels"]["params"]["channels"]
+        # The status components are named by system, not channel, under the
         # target's namespace.
-        self.assertEqual(nav["clock"], "sat.nav.channel_status.elapsed")
-        self.assertEqual(nav["abort_clock"], "sat.nav.channel_status.abort_elapsed")
-        self.assertEqual(mode["clock"], "sat.mode.t")
-        self.assertEqual(mode["abort_clock"], "sat.mode.channel_status.abort_elapsed")
+        self.assertEqual(nav["name"], "guidance")
+        self.assertEqual(nav["status"], status_names("sat.nav.channel_status"))
+        self.assertEqual(nav["status"]["message_at"], "sat.nav.channel_status.message_at")
         self.assertEqual(systems["nav"]["channel"], {"name": "guidance", "start": "running"})
 
-    def test_clock_needs_a_channel(self) -> None:
+    def test_clock_kwargs_are_gone(self) -> None:
         fsw = Target(cycle_rate=50.0)
-        with self.assertRaises(ConfigError):
-            fsw.add("nav", Nav(), clock="fsw.nav.t")
+        with self.assertRaises(TypeError):
+            fsw.add("nav", Nav(), channel="nav", clock="fsw.nav.t")  # type: ignore[call-arg]
 
+
+def status_names(prefix: str) -> dict[str, str]:
+    """The registry's names for each ``channel_status`` field under ``prefix``."""
+    fields = [
+        "state",
+        "loaded",
+        "artifact",
+        "hash",
+        "accepts",
+        "message",
+        "message_at",
+        "elapsed",
+        "abort_elapsed",
+    ]
+    return {field: f"{prefix}.{field}" for field in fields}
 
 if __name__ == "__main__":
     unittest.main()

@@ -174,7 +174,7 @@ pub mod wasm;
 mod tests;
 
 pub use async_system::{AsyncSystem, Stop};
-pub use channel::{Abort, AbortRequest, ChannelState, ChannelStatus};
+pub use channel::{Abort, AbortRequest, ChannelStatus, channel_state};
 #[cfg(feature = "host")]
 pub use coordinator::Coordinator;
 pub use coordinator::{

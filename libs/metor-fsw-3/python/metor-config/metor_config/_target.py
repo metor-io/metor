@@ -32,16 +32,10 @@ class _Thread:
 
 @dataclass(frozen=True)
 class _Channel:
-    """Puts a cyclic system behind the channel `name`, in state `start` at boot.
-
-    ``clock`` and ``abort_clock`` name the components timing its runs; they
-    travel in the channel registry, not the adapter.
-    """
+    """Puts a cyclic system behind the channel `name`, in state `start` at boot."""
 
     name: str
     start: str
-    clock: str | None = None
-    abort_clock: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {"channel": {"name": self.name, "start": self.start}}
@@ -164,8 +158,6 @@ class Target:
         thread: str | None = None,
         channel: str | None = None,
         start: str | None = None,
-        clock: str | None = None,
-        abort_clock: str | None = None,
     ) -> S:
         """Adds ``system`` to the target under ``name``.
 
@@ -175,13 +167,11 @@ class Target:
 
         ``thread`` runs an async system on the named thread. ``channel`` puts
         a cyclic system behind a channel with that name, so it can be started,
-        stopped, and loaded by commands. This adds ``events`` and
-        ``channel_status`` outputs. ``start`` sets the channel's state at boot:
-        ``"running"`` (the default) or ``"stopped"``. ``clock`` and
-        ``abort_clock`` name the components holding the channel's run clock
-        and abort clock, in seconds, so the panel can show them.
+        stopped, and loaded by commands. This adds a ``channel_status`` output,
+        which carries the channel's whole state. ``start`` sets the channel's
+        state at boot: ``"running"`` (the default) or ``"stopped"``.
         """
-        adapter = _adapter(thread, channel, start, clock, abort_clock)
+        adapter = _adapter(thread, channel, start)
         return self._add(self._systems, name, system, adapter)
 
     def sim(self, name: str, system: S) -> S:
@@ -388,21 +378,17 @@ def _adapter(
     thread: str | None,
     channel: str | None,
     start: str | None,
-    clock: str | None = None,
-    abort_clock: str | None = None,
 ) -> _Thread | _Channel | None:
     """Returns a system's adapter, if it has one."""
     if thread is not None and channel is not None:
         raise ConfigError("a system takes `thread` or `channel`, not both")
     if start is not None and channel is None:
         raise ConfigError("`start` sets a channel's state at boot, so it needs `channel`")
-    if (clock is not None or abort_clock is not None) and channel is None:
-        raise ConfigError("`clock` and `abort_clock` time a channel's runs, so they need `channel`")
     if thread is not None:
         return _Thread(thread)
     if channel is None:
         return None
-    return _Channel(channel, start or "running", clock, abort_clock)
+    return _Channel(channel, start or "running")
 
 
 def _resolve(target: Target, name: str, port: str, source: Source[Any]) -> dict[str, str]:

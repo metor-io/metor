@@ -12,6 +12,7 @@ mod records;
 mod registry;
 
 use metor_fsw_3_ring::NoWake;
+use metor_proto_wkt::SequenceChannelState;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -29,11 +30,6 @@ pub struct AbortRequest {}
 pub const ABORT_PORT: &str = "abort";
 /// The input that a channel reads commands from.
 pub const COMMANDS_PORT: &str = "commands";
-/// The output where a channel reports its events.
-///
-/// Events include each accepted or refused command, and how the system
-/// ended.
-pub const EVENTS_PORT: &str = "events";
 /// The output that a channel writes its [`ChannelStatus`] to each cycle.
 pub const STATUS_PORT: &str = "channel_status";
 
@@ -41,8 +37,8 @@ pub const STATUS_PORT: &str = "channel_status";
 pub use adapter::Channel;
 #[cfg(feature = "host")]
 pub(crate) use adapter::{channel_ports, def, make_channel};
-pub use apply::{Command, Phase, Refusal, State, apply};
-pub use registry::{ChannelSpec, Registry, RegistryParams, channel_registry};
+pub use apply::{Command, Phase, Refusal, State, accepts, apply};
+pub use registry::{ChannelSpec, Registry, RegistryParams, StatusComponents, channel_registry};
 
 /// A system parameter that reports whether an abort was requested.
 pub struct Abort<W: InputWake = NoWake> {
@@ -75,7 +71,7 @@ impl<W: InputWake> Abort<W> {
 pub struct ChannelStatus {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
-    /// A [`ChannelState`] code.
+    /// A [`SequenceChannelState`] code.
     pub state: u32,
     /// The loaded occupant's index in the registry's `available` list, or
     /// `u32::MAX` if nothing is loaded.
@@ -92,43 +88,35 @@ pub struct ChannelStatus {
     /// Seconds since an accepted abort, while the system winds down; zero
     /// when no abort is in progress.
     pub abort_elapsed: f64,
+    /// The commands the channel would accept now, as
+    /// [`SequenceAccepts`](metor_proto_wkt::SequenceAccepts) bits.
+    pub accepts: u32,
+    /// The latest thing that happened on the channel, or empty before
+    /// anything has. Its length keeps the frame free of padding.
+    pub message: FrameStr<MESSAGE_LEN>,
+    /// The cycle `message` was raised in, as a timestamp's microseconds; an
+    /// `i64` rather than a [`Timestamp`] because only the frame's own stamp
+    /// may be one. Every message moves it, so a repeated text still reads as
+    /// new.
+    pub message_at: i64,
 }
 
-/// The states a channel reports in [`ChannelStatus::state`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChannelState {
-    Running,
-    Stopped,
-    Completed,
-    Aborted,
-    Failed,
-    Panicked,
-    Unloaded,
-    /// Waiting for the system's ops in flight to finish before a reset or
-    /// load takes effect.
-    Quiescing,
-}
+/// The bytes [`ChannelStatus::message`] takes, terminator included.
+pub const MESSAGE_LEN: usize = 124;
 
-impl ChannelState {
-    /// Returns a channel's state.
-    ///
-    /// If the channel has ended, this is how it ended. Otherwise it is the
-    /// channel's run state.
-    pub fn of(run: RunState, end: Option<&EndReason>) -> Self {
-        match (end, run) {
-            (Some(EndReason::Completed), _) => Self::Completed,
-            (Some(EndReason::Aborted), _) => Self::Aborted,
-            (Some(EndReason::Failed(_)), _) => Self::Failed,
-            (Some(EndReason::Panicked), _) => Self::Panicked,
-            (Some(EndReason::Unloaded), _) => Self::Unloaded,
-            (None, RunState::Running) => Self::Running,
-            (None, RunState::Stopped) => Self::Stopped,
-        }
-    }
-
-    /// Returns the code written to [`ChannelStatus::state`].
-    pub fn code(self) -> u32 {
-        self as u32
+/// Returns a channel's state.
+///
+/// If the channel has ended, this is how it ended. Otherwise it is the
+/// channel's run state.
+pub fn channel_state(run: RunState, end: Option<&EndReason>) -> SequenceChannelState {
+    match (end, run) {
+        (Some(EndReason::Completed), _) => SequenceChannelState::Completed,
+        (Some(EndReason::Aborted), _) => SequenceChannelState::Aborted,
+        (Some(EndReason::Failed(_)), _) => SequenceChannelState::Failed,
+        (Some(EndReason::Panicked), _) => SequenceChannelState::Panicked,
+        (Some(EndReason::Unloaded), _) => SequenceChannelState::Unloaded,
+        (None, RunState::Running) => SequenceChannelState::Running,
+        (None, RunState::Stopped) => SequenceChannelState::Stopped,
     }
 }
 

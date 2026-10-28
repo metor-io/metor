@@ -1,6 +1,6 @@
 //! The rules for which commands a channel accepts in each state.
 
-use metor_proto_wkt::SequenceCommandKind;
+use metor_proto_wkt::{SequenceAccepts, SequenceCommandKind};
 
 /// Where a channel is, as [`apply`] sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +34,14 @@ pub enum Command {
 }
 
 impl Command {
+    pub const ALL: [Self; 5] = [
+        Self::Load,
+        Self::Start,
+        Self::Abort,
+        Self::Stop,
+        Self::Reset,
+    ];
+
     pub fn of(kind: &SequenceCommandKind) -> Self {
         match kind {
             SequenceCommandKind::Load { .. } => Self::Load,
@@ -41,6 +49,17 @@ impl Command {
             SequenceCommandKind::Abort => Self::Abort,
             SequenceCommandKind::Stop => Self::Stop,
             SequenceCommandKind::Reset => Self::Reset,
+        }
+    }
+
+    /// The command's [`SequenceAccepts`] bit.
+    pub fn bit(self) -> u32 {
+        match self {
+            Self::Load => SequenceAccepts::LOAD,
+            Self::Start => SequenceAccepts::START,
+            Self::Abort => SequenceAccepts::ABORT,
+            Self::Stop => SequenceAccepts::STOP,
+            Self::Reset => SequenceAccepts::RESET,
         }
     }
 }
@@ -77,17 +96,18 @@ pub fn apply(state: State, command: Command) -> Result<(), Refusal> {
     }
 }
 
+/// Returns the commands a channel in `state` accepts.
+pub fn accepts(state: State) -> SequenceAccepts {
+    let bits = Command::ALL
+        .into_iter()
+        .filter(|&command| apply(state, command).is_ok())
+        .fold(0, |bits, command| bits | command.bit());
+    SequenceAccepts(bits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const ALL: [Command; 5] = [
-        Command::Load,
-        Command::Start,
-        Command::Abort,
-        Command::Stop,
-        Command::Reset,
-    ];
 
     fn state(phase: Phase) -> State {
         State {
@@ -104,7 +124,8 @@ mod tests {
     }
 
     fn accepted(state: State) -> Vec<Command> {
-        ALL.into_iter()
+        Command::ALL
+            .into_iter()
             .filter(|&command| apply(state, command).is_ok())
             .collect()
     }
@@ -145,6 +166,42 @@ mod tests {
         };
         assert_eq!(apply(running, Command::Abort), Err(Refusal::NotAbortable));
         assert_eq!(apply(running, Command::Stop), Ok(()));
+    }
+
+    #[test]
+    fn test_accepts_matches_apply() {
+        for phase in [
+            Phase::Running,
+            Phase::Stopped,
+            Phase::Ended,
+            Phase::Quiescing,
+        ] {
+            for abortable in [true, false] {
+                let state = State { phase, abortable };
+                let bits = accepts(state);
+                for command in Command::ALL {
+                    assert_eq!(
+                        bits.0 & command.bit() != 0,
+                        apply(state, command).is_ok(),
+                        "{state:?} {command:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_command_bits_match_wire_kinds() {
+        let kinds = [
+            SequenceCommandKind::Load { name: "a".into() },
+            SequenceCommandKind::Start,
+            SequenceCommandKind::Abort,
+            SequenceCommandKind::Stop,
+            SequenceCommandKind::Reset,
+        ];
+        for kind in kinds {
+            assert_eq!(Command::of(&kind).bit(), SequenceAccepts::bit(&kind));
+        }
     }
 
     #[test]

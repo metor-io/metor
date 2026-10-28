@@ -13,14 +13,11 @@ use metor_fsw_3::deploy::{self, DeployError};
 use metor_fsw_3::deploy::{CONFIG_VERSION, DeploySystem, DeploymentConfig, TargetConfig};
 use metor_fsw_3::dl::store;
 use metor_fsw_3::dl::{WASM_TRIPLE, cdylib_name, triple, wasm_name};
-use metor_fsw_3::metor_proto_wkt::{
-    SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
-};
+use metor_fsw_3::metor_proto_wkt::{SequenceChannelState, SequenceCommand, SequenceCommandKind};
 use metor_fsw_3::wasm::PAGE;
 use metor_fsw_3::{
-    Adapter, BuildError, ChannelConfig, ChannelState, ChannelStatus, Coordinator,
-    CoordinatorConfig, DefCx, DlPack, Input, InputConfig, Output, RunState, SystemConfig,
-    SystemTable, Timestamp, system,
+    Adapter, BuildError, ChannelConfig, ChannelStatus, Coordinator, CoordinatorConfig, DefCx,
+    DlPack, Input, InputConfig, Output, RunState, SystemConfig, SystemTable, Timestamp, system,
 };
 use serde_json::{Value, json};
 
@@ -28,7 +25,8 @@ use serde_json::{Value, json};
 #[derive(Default)]
 struct Seen {
     queue: VecDeque<SequenceCommandKind>,
-    events: Vec<SequenceEventKind>,
+    /// Each message the channel raised, in order.
+    messages: Vec<String>,
     pings: Vec<u32>,
     status: Option<ChannelStatus>,
 }
@@ -55,18 +53,16 @@ fn idle(output: &mut Output<Ping>) {
 struct Watch(Shared);
 
 #[system]
-fn watch(
-    #[state] w: &mut Watch,
-    events: &mut Input<SequenceChannelEvent>,
-    status: &mut Input<ChannelStatus>,
-    pings: &mut Input<Ping>,
-) {
+fn watch(#[state] w: &mut Watch, status: &mut Input<ChannelStatus>, pings: &mut Input<Ping>) {
     let mut seen = w.0.borrow_mut();
-    let events = events.drain().filter_map(Result::ok);
-    seen.events.extend(events.map(|event| event.kind));
     let pings: Vec<u32> = pings.drain().filter_map(Result::ok).map(|p| p.n).collect();
     seen.pings.extend(pings);
     if let Ok(Some(status)) = status.latest() {
+        let raised = seen.status.map(|s| s.message_at) != Some(status.message_at);
+        let text = status.message.to_str().expect("utf-8");
+        if raised && !text.is_empty() {
+            seen.messages.push(text.to_string());
+        }
         seen.status = Some(*status);
     }
 }
@@ -145,7 +141,6 @@ fn config(params: Value, adapter: Option<Adapter>) -> CoordinatorConfig {
             },
             SystemConfig {
                 inputs: vec![
-                    InputConfig::new("events", "mode", "events"),
                     InputConfig::new("status", "mode", "channel_status"),
                     InputConfig::new("pings", "mode", "output"),
                 ],
@@ -192,23 +187,24 @@ fn build(params: Value) -> (Shared, Coordinator) {
     (seen, coordinator)
 }
 
-/// Sends `commands` and runs one cycle. Returns the events it produced.
+/// Sends `commands` and runs one cycle. Returns the message it raised, if
+/// any; a cycle shows only its last.
 fn send(
     seen: &Shared,
     coordinator: &mut Coordinator,
     commands: impl IntoIterator<Item = SequenceCommandKind>,
-) -> Vec<SequenceEventKind> {
+) -> Vec<String> {
     seen.borrow_mut().queue.extend(commands);
     run(seen, coordinator, 1)
 }
 
-/// Runs `cycles` cycles. Returns the events they produced.
-fn run(seen: &Shared, coordinator: &mut Coordinator, cycles: usize) -> Vec<SequenceEventKind> {
+/// Runs `cycles` cycles. Returns the messages they raised.
+fn run(seen: &Shared, coordinator: &mut Coordinator, cycles: usize) -> Vec<String> {
     for _ in 0..cycles {
         let next = Timestamp(coordinator.cycle() as i64 + 1);
         coordinator.step(next);
     }
-    std::mem::take(&mut seen.borrow_mut().events)
+    std::mem::take(&mut seen.borrow_mut().messages)
 }
 
 fn load(name: &str) -> SequenceCommandKind {
@@ -223,19 +219,23 @@ fn status(seen: &Shared) -> ChannelStatus {
     seen.borrow().status.expect("a status")
 }
 
-fn refused(events: &[SequenceEventKind], text: &str) -> bool {
-    matches!(events, [SequenceEventKind::Refused { reason }] if reason.contains(text))
+fn refused(messages: &[String], text: &str) -> bool {
+    matches!(messages, [m] if m.starts_with("refused: ") && m.contains(text))
+}
+
+fn code(state: SequenceChannelState) -> u32 {
+    state.code()
 }
 
 #[test]
 fn test_load_start_complete() {
     let (seen, mut coordinator) = build(slot_params(both()));
     run(&seen, &mut coordinator, 1);
-    assert_eq!(status(&seen).state, ChannelState::Unloaded.code());
+    assert_eq!(status(&seen).state, code(SequenceChannelState::Unloaded));
     assert_eq!(status(&seen).loaded, u32::MAX);
 
-    let events = send(&seen, &mut coordinator, [load("up")]);
-    assert_eq!(events, [SequenceEventKind::Loaded { name: "up".into() }]);
+    let messages = send(&seen, &mut coordinator, [load("up")]);
+    assert_eq!(messages, ["loaded up"]);
     let loaded = status(&seen);
     assert_eq!(loaded.loaded, 0);
     let file = fixture_lib()
@@ -247,10 +247,10 @@ fn test_load_start_complete() {
     assert_eq!(loaded.hash.0, *hash.as_bytes());
 
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
-    let events = run(&seen, &mut coordinator, 4);
-    assert_eq!(events, [SequenceEventKind::Completed]);
+    let messages = run(&seen, &mut coordinator, 4);
+    assert_eq!(messages, ["completed"]);
     assert_eq!(pings(&seen), [1, 2, 3]);
-    assert_eq!(status(&seen).state, ChannelState::Completed.code());
+    assert_eq!(status(&seen).state, code(SequenceChannelState::Completed));
 }
 
 #[test]
@@ -263,21 +263,18 @@ fn test_load_other_then_abort() {
     assert_eq!(pings(&seen), [0]);
 
     // The sequence sees the abort on the same cycle it is sent, and ends on
-    // that cycle.
-    let events = send(&seen, &mut coordinator, [SequenceCommandKind::Abort]);
-    let requested = SequenceEventKind::Progress {
-        detail: "abort requested".into(),
-    };
-    assert_eq!(events, [requested, SequenceEventKind::Aborted]);
-    assert_eq!(status(&seen).state, ChannelState::Aborted.code());
+    // that cycle, so its end is the cycle's message.
+    let messages = send(&seen, &mut coordinator, [SequenceCommandKind::Abort]);
+    assert_eq!(messages, ["aborted"]);
+    assert_eq!(status(&seen).state, code(SequenceChannelState::Aborted));
 }
 
 #[test]
 fn test_unknown_load_keeps_occupant() {
     let (seen, mut coordinator) = build(slot_params(both()));
     send(&seen, &mut coordinator, [load("up")]);
-    let events = send(&seen, &mut coordinator, [load("sideways")]);
-    assert!(refused(&events, "sideways"), "{events:?}");
+    let messages = send(&seen, &mut coordinator, [load("sideways")]);
+    assert!(refused(&messages, "sideways"), "{messages:?}");
     assert_eq!(status(&seen).loaded, 0);
 }
 
@@ -294,8 +291,8 @@ fn test_changed_bytes_refused() {
     let allow = vec![candidate("up", "count_up"), stale];
     let (seen, mut coordinator) = build(slot_params(allow));
     send(&seen, &mut coordinator, [load("up")]);
-    let events = send(&seen, &mut coordinator, [load("down")]);
-    assert!(refused(&events, "not the library"), "{events:?}");
+    let messages = send(&seen, &mut coordinator, [load("down")]);
+    assert!(refused(&messages, "not the library"), "{messages:?}");
     assert_eq!(status(&seen).loaded, 0);
 }
 
@@ -308,8 +305,8 @@ fn test_wasm_and_dylib_swap() {
         candidate("down", "count_down"),
     ];
     let (seen, mut coordinator) = build(slot_params(allow));
-    let events = send(&seen, &mut coordinator, [load("up")]);
-    assert_eq!(events, [SequenceEventKind::Loaded { name: "up".into() }]);
+    let messages = send(&seen, &mut coordinator, [load("up")]);
+    assert_eq!(messages, ["loaded up"]);
     assert_eq!(status(&seen).artifact.to_str(), Ok("echo_pack.wasm"));
 
     send(&seen, &mut coordinator, [load("down")]);
@@ -322,8 +319,8 @@ fn test_wasm_and_dylib_swap() {
     send(&seen, &mut coordinator, [load("up")]);
     assert_eq!(status(&seen).loaded, 0);
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
-    let events = run(&seen, &mut coordinator, 4);
-    assert_eq!(events, [SequenceEventKind::Completed]);
+    let messages = run(&seen, &mut coordinator, 4);
+    assert_eq!(messages, ["completed"]);
     assert_eq!(pings(&seen), [1, 2, 3]);
 }
 
@@ -340,8 +337,8 @@ fn test_changed_module_refused() {
     let allow = vec![candidate("up", "count_up"), stale];
     let (seen, mut coordinator) = build(slot_params(allow));
     send(&seen, &mut coordinator, [load("up")]);
-    let events = send(&seen, &mut coordinator, [load("down")]);
-    assert!(refused(&events, "not the library"), "{events:?}");
+    let messages = send(&seen, &mut coordinator, [load("down")]);
+    assert!(refused(&messages, "not the library"), "{messages:?}");
     assert_eq!(status(&seen).loaded, 0);
 }
 
@@ -359,14 +356,11 @@ fn test_candidate_grants_reach_the_guest() {
     let (seen, mut coordinator) = build(slot_params(vec![spin, small]));
     run(&seen, &mut coordinator, 1);
 
-    let events = send(&seen, &mut coordinator, [load("small")]);
-    assert!(refused(&events, "ceiling"), "{events:?}");
+    let messages = send(&seen, &mut coordinator, [load("small")]);
+    assert!(refused(&messages, "ceiling"), "{messages:?}");
     send(&seen, &mut coordinator, [load("spin")]);
-    let events = send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
-    let failed = SequenceEventKind::Failed {
-        reason: "out of fuel".into(),
-    };
-    assert!(events.contains(&failed), "{events:?}");
+    let messages = send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
+    assert_eq!(messages, ["failed: out of fuel"]);
 }
 
 /// A candidate whose ports differ from the slot's is rejected, and the
@@ -378,8 +372,8 @@ fn test_other_type_refused() {
     let allow = vec![candidate("up", "count_up"), other];
     let (seen, mut coordinator) = build(slot_params(allow));
     send(&seen, &mut coordinator, [load("up")]);
-    let events = send(&seen, &mut coordinator, [load("gain")]);
-    assert!(refused(&events, "no longer matches"), "{events:?}");
+    let messages = send(&seen, &mut coordinator, [load("gain")]);
+    assert!(refused(&messages, "no longer matches"), "{messages:?}");
     assert_eq!(status(&seen).loaded, 0);
 }
 
@@ -390,14 +384,14 @@ fn test_refused_constructor_keeps_occupant() {
     let allow = vec![candidate("up", "count_up"), stride("zero", 0)];
     let (seen, mut coordinator) = build(slot_params(allow));
     send(&seen, &mut coordinator, [load("up")]);
-    let events = send(&seen, &mut coordinator, [load("zero")]);
-    assert!(refused(&events, "`by` is zero"), "{events:?}");
+    let messages = send(&seen, &mut coordinator, [load("zero")]);
+    assert!(refused(&messages, "`by` is zero"), "{messages:?}");
     assert_eq!(status(&seen).loaded, 0);
-    assert_eq!(status(&seen).state, ChannelState::Stopped.code());
+    assert_eq!(status(&seen).state, code(SequenceChannelState::Stopped));
 
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
-    let events = run(&seen, &mut coordinator, 4);
-    assert_eq!(events, [SequenceEventKind::Completed]);
+    let messages = run(&seen, &mut coordinator, 4);
+    assert_eq!(messages, ["completed"]);
     assert_eq!(pings(&seen), [1, 2, 3]);
 }
 
@@ -405,9 +399,11 @@ fn test_refused_constructor_keeps_occupant() {
 #[test]
 fn test_async_candidate_is_refused() {
     let (seen, mut coordinator) = build(slot_params(vec![candidate("relay", "relay")]));
-    let events = send(&seen, &mut coordinator, [load("relay")]);
-    let reason = "`relay` cannot run behind the slot's adapter".to_string();
-    assert_eq!(events[0], SequenceEventKind::Refused { reason });
+    // The empty slot reports itself unloaded on its first cycle.
+    run(&seen, &mut coordinator, 1);
+    let messages = send(&seen, &mut coordinator, [load("relay")]);
+    let refusal = "refused: `relay` cannot run behind the slot's adapter";
+    assert_eq!(messages, [refusal]);
 }
 
 #[test]
@@ -417,7 +413,7 @@ fn test_initial_loads_at_build() {
     let (seen, mut coordinator) = build(params);
     run(&seen, &mut coordinator, 1);
     assert_eq!(status(&seen).loaded, 1);
-    assert_eq!(status(&seen).state, ChannelState::Stopped.code());
+    assert_eq!(status(&seen).state, code(SequenceChannelState::Stopped));
 }
 
 /// A bad `initial` candidate leaves the slot empty and reports why. The rest
@@ -427,16 +423,16 @@ fn test_bad_initial_fails_the_slot_only() {
     let mut params = slot_params(vec![candidate("up", "count_up"), stride("zero", 0)]);
     params["initial"] = json!("zero");
     let (seen, mut coordinator) = build(params);
-    let events = run(&seen, &mut coordinator, 1);
+    let messages = run(&seen, &mut coordinator, 1);
     assert!(
-        matches!(events.as_slice(), [SequenceEventKind::Failed { reason }] if reason.contains("zero")),
-        "{events:?}"
+        matches!(messages.as_slice(), [m] if m.starts_with("failed: ") && m.contains("zero")),
+        "{messages:?}"
     );
-    assert_eq!(status(&seen).state, ChannelState::Failed.code());
+    assert_eq!(status(&seen).state, code(SequenceChannelState::Failed));
 
-    let events = send(&seen, &mut coordinator, [load("up")]);
-    assert_eq!(events, [SequenceEventKind::Loaded { name: "up".into() }]);
-    assert_eq!(status(&seen).state, ChannelState::Stopped.code());
+    let messages = send(&seen, &mut coordinator, [load("up")]);
+    assert_eq!(messages, ["loaded up"]);
+    assert_eq!(status(&seen).state, code(SequenceChannelState::Stopped));
 }
 
 /// A reset restarts the last loaded candidate, not `initial`.
@@ -451,8 +447,8 @@ fn test_reset_skips_initial() {
     assert_eq!(pings(&seen), [2, 4]);
 
     let reset = [SequenceCommandKind::Stop, SequenceCommandKind::Reset];
-    let events = send(&seen, &mut coordinator, reset);
-    assert_eq!(events[1], SequenceEventKind::Loaded { name: "two".into() });
+    let messages = send(&seen, &mut coordinator, reset);
+    assert_eq!(messages, ["loaded two"]);
     assert_eq!(status(&seen).loaded, 1);
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
     assert_eq!(pings(&seen), [2]);
@@ -462,7 +458,7 @@ fn test_reset_skips_initial() {
 fn test_slot_needs_channel() {
     let seen = Shared::default();
     let mut config = config(slot_params(both()), None);
-    // Without a channel there are no events or status, so drop the watcher.
+    // Without a channel there is no status, so drop the watcher.
     config.systems.pop();
     let Err(error) = config.build(&table(&seen)) else {
         panic!("a slot without a channel is refused")
@@ -582,8 +578,8 @@ fn test_build_resolves_into_store() {
         .expect("the resolved slot builds");
     send(&seen, &mut coordinator, [load("up")]);
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
-    let events = run(&seen, &mut coordinator, 4);
-    assert_eq!(events, [SequenceEventKind::Completed]);
+    let messages = run(&seen, &mut coordinator, 4);
+    assert_eq!(messages, ["completed"]);
 }
 
 /// A wasm pack reference resolves to its stored module, keeping its fuel and
@@ -622,8 +618,8 @@ fn test_build_resolves_wasm_candidate() {
         .expect("the resolved slot builds");
     send(&seen, &mut coordinator, [load("up")]);
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
-    let events = run(&seen, &mut coordinator, 4);
-    assert_eq!(events, [SequenceEventKind::Completed]);
+    let messages = run(&seen, &mut coordinator, 4);
+    assert_eq!(messages, ["completed"]);
 }
 
 /// Returns the config for slot `next`, which reads slot `mode`'s output.
