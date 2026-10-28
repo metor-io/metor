@@ -1,14 +1,18 @@
 //! metor-code: a small total language for flight software systems and
 //! sequences, compiled with Cranelift.
 
+pub mod aot;
 pub mod ast;
 pub mod check;
+pub mod cli;
 pub mod codegen;
 pub mod diag;
 pub mod hir;
 pub mod jit;
 pub mod lexer;
+pub mod packs;
 pub mod parser;
+pub mod runtime;
 pub mod types;
 
 use check::Imports;
