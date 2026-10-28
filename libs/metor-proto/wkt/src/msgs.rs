@@ -728,7 +728,7 @@ pub struct SequenceChannelSpec {
     /// The wrapped system's type, shown in place of a sequence for a channel
     /// that loads nothing (`available` is empty).
     pub system: String,
-    pub status: SequenceChannelComponents,
+    pub components: SequenceChannelComponents,
 }
 
 /// The full component name of each field of a channel's state.
@@ -745,8 +745,8 @@ pub struct SequenceChannelComponents {
     pub hash: String,
     /// The commands the channel would accept now, as [`SequenceAccepts`] bits.
     pub accepts: String,
-    /// What happened on the channel: a transition, progress, a refused
-    /// command, or why it failed. It has one sample per message, stamped when
+    /// What happened on the channel: a transition, a refused command, or how
+    /// its system ended. It has one sample per message, stamped when
     /// the message was raised, so its samples are the channel's history.
     pub message: String,
     /// Seconds the loaded sequence has run. It pauses while the channel is
@@ -833,7 +833,8 @@ pub struct SequenceRegistry {
     pub channels: Vec<SequenceChannelSpec>,
 }
 
-/// Run state of a channel's loaded sequence, as reported by the control system.
+/// Run state of a channel's loaded sequence, as fsw-2 reports it. Kept only
+/// for fsw-2, and deleted with it; fsw-3 reports [`SequenceChannelState`].
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceRunState {
@@ -845,9 +846,9 @@ pub enum SequenceRunState {
     Failed,
 }
 
-/// A single transition in a channel's lifecycle. Events arrive in order through one log,
-/// so the per-channel state machine (`Loaded` → `Started` → `Progress`* → terminal) is
-/// totally ordered.
+/// A single transition in a channel's lifecycle, as fsw-2 reports it. Events arrive in
+/// order through one log, so the per-channel state machine (`Loaded` → `Started` →
+/// `Progress`* → terminal) is totally ordered. Kept only for fsw-2, and deleted with it.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceEventKind {
@@ -886,7 +887,8 @@ pub enum SequenceEventKind {
     },
 }
 
-/// A granular per-channel state update, broadcast by the control system (control → panel).
+/// A granular per-channel state update, broadcast by fsw-2 (control → panel). Kept only
+/// for fsw-2, and deleted with it; fsw-3 telemeters the channel's components instead.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct SequenceChannelEvent {
     pub channel: SequenceChannelName,
@@ -894,7 +896,8 @@ pub struct SequenceChannelEvent {
 }
 
 /// An operator command on a channel, published by the panel (panel → control). The
-/// control system executes it and reports the result via [`SequenceChannelEvent`].
+/// control system executes it, and the channel's components report the result: its
+/// `state`, and a `message` saying what happened or why it was refused.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceCommandKind {
@@ -908,7 +911,7 @@ pub enum SequenceCommandKind {
     /// Hard-stop (drop) — may leave the system unsafe.
     Stop,
     /// Rebuild the loaded sequence from the beginning, returning the channel to a ready
-    /// (idle) state. Only valid from a terminal `Completed`/`Aborted` state.
+    /// (stopped) state. The channel's `accepts` says when it applies.
     Reset,
 }
 
@@ -1438,7 +1441,7 @@ mod sequence_tests {
                     name: "deploy".into(),
                     available: vec!["deploy_solar_array".into(), "deploy_antenna".into()],
                     system: "dl_slot".into(),
-                    status: SequenceChannelComponents {
+                    components: SequenceChannelComponents {
                         state: "fsw.deploy.channel_status.state".into(),
                         elapsed: "fsw.deploy.channel_status.elapsed".into(),
                         ..Default::default()
@@ -1507,7 +1510,7 @@ mod sequence_tests {
                 name: "adcs".into(),
                 available: vec!["detumble".into()],
                 system: "s".into(),
-                status: SequenceChannelComponents {
+                components: SequenceChannelComponents {
                     state: "t".into(),
                     ..Default::default()
                 },

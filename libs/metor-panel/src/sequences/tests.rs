@@ -47,7 +47,7 @@ fn registry_names_each_status_component_in_full() {
     state.apply_registry(SequenceRegistry {
         channels: vec![SequenceChannelSpec {
             system: "dl_slot".into(),
-            status: SequenceChannelComponents {
+            components: SequenceChannelComponents {
                 state: "fsw.deploy.channel_status.state".into(),
                 message: "fsw.deploy.channel_message.text".into(),
                 ..Default::default()
@@ -277,7 +277,7 @@ pub(crate) fn declare(channel: &str, available: &[&str], system: &str) -> Sequen
     SequenceRegistry {
         channels: vec![SequenceChannelSpec {
             system: system.into(),
-            status: components(channel),
+            components: components(channel),
             ..spec(channel, available)
         }],
     }

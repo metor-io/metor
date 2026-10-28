@@ -101,7 +101,7 @@ impl SequenceState {
                 name: spec.name.into(),
                 available: spec.available.into_iter().map(SharedString::from).collect(),
                 system: spec.system.into(),
-                components: ChannelComponents::from_names(&spec.status),
+                components: ChannelComponents::from_names(&spec.components),
             })
             .collect();
     }

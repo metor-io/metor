@@ -229,7 +229,7 @@ async fn test_slot_commanded_over_links() {
     assert_eq!(channel.name, "mode");
     assert_eq!(channel.available, ["count_up", "count_down"]);
     assert_eq!(channel.system, "dl_slot");
-    assert_eq!(channel.status.state, "mode.channel_status.state");
-    assert_eq!(channel.status.message, "mode.channel_message.text");
+    assert_eq!(channel.components.state, "mode.channel_status.state");
+    assert_eq!(channel.components.message, "mode.channel_message.text");
     assert!(down.artifact_is_string, "the artifact is announced as text");
 }

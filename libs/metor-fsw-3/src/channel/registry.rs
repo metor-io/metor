@@ -89,7 +89,7 @@ impl Registry {
                     name: spec.name,
                     available: spec.available,
                     system: spec.system,
-                    status: spec.status.into(),
+                    components: spec.status.into(),
                 })
                 .collect(),
         };
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(registry.channels[0].name, "mode");
         assert_eq!(registry.channels[0].available, ["a"]);
         assert_eq!(registry.channels[0].system, "dl_slot");
-        let status = &registry.channels[0].status;
+        let status = &registry.channels[0].components;
         assert_eq!(status.state, "fsw.mode.channel_status.state");
         assert_eq!(status.message, "fsw.mode.channel_message.text");
         assert_eq!(
