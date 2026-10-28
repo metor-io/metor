@@ -18,6 +18,7 @@ use crate::alarms::{self, AlarmEventKind, AlarmState, MAX_SHELF_DURATION};
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::theme::theme;
+use crate::views::format::format_age;
 use crate::views::table;
 
 /// Which set the alarm list shows.
@@ -89,17 +90,6 @@ impl AlarmView {
     /// Whether the history tab is showing, for persistence.
     pub fn is_history(&self) -> bool {
         self.mode == AlarmListMode::History
-    }
-}
-
-fn format_age(raised_at: Timestamp) -> String {
-    let secs = (Timestamp::now().0 - raised_at.0).max(0) as f64 / 1e6;
-    if secs < 60.0 {
-        format!("{secs:.0}s ago")
-    } else if secs < 3600.0 {
-        format!("{:.0}m ago", secs / 60.0)
-    } else {
-        format!("{:.1}h ago", secs / 3600.0)
     }
 }
 
@@ -362,7 +352,7 @@ fn pending_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
                         div()
                             .text_color(theme.text_tertiary)
                             .text_size(px(11.0))
-                            .child(SharedString::from(format_age(cleared_at))),
+                            .child(format_age(cleared_at, Timestamp::now())),
                     )
             });
 
@@ -439,7 +429,7 @@ fn pending_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
                     div()
                         .text_color(theme.text_tertiary)
                         .text_size(px(11.0))
-                        .child(SharedString::from(format_age(alarm.raised_at))),
+                        .child(format_age(alarm.raised_at, Timestamp::now())),
                 )
                 .child(shelve)
                 .child(ack)
@@ -568,7 +558,7 @@ fn history_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
                     div()
                         .text_color(theme.text_tertiary)
                         .text_size(px(11.0))
-                        .child(SharedString::from(format_age(event.timestamp))),
+                        .child(format_age(event.timestamp, Timestamp::now())),
                 )
                 .into_any_element()
         })

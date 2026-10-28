@@ -37,7 +37,7 @@ use metor_proto_wkt::{
 use crate::alarms::{self, AlarmEvent, AlarmEventKind, severity_index};
 use crate::logs;
 use crate::msg_ingest::{IngestSource, ingest_all};
-use crate::sequences::{HistoryEntry, SequenceHistory, state_label};
+use crate::sequences::{HistoryEntry, SequenceHistory};
 use crate::theme::{Theme, theme};
 
 #[cfg(test)]
@@ -358,22 +358,8 @@ struct SequenceEventSource;
 /// Longest flag chip for a sequence message before it's elided.
 const SEQUENCE_SHORT_MAX: usize = 24;
 
-/// The entry's message, or the state it left the channel in when it has none.
-fn sequence_text(entry: &HistoryEntry) -> &str {
-    if entry.message.is_empty() {
-        state_label(entry.state)
-    } else {
-        &entry.message
-    }
-}
-
 fn sequence_label(entry: &HistoryEntry) -> SharedString {
-    format!(
-        "{}: {}",
-        entry.channel,
-        truncate(sequence_text(entry), LABEL_MAX)
-    )
-    .into()
+    format!("{}: {}", entry.channel, truncate(&entry.message, LABEL_MAX)).into()
 }
 
 fn sequence_plot_event(entry: &HistoryEntry, theme: &Theme) -> PlotEvent {
@@ -381,7 +367,7 @@ fn sequence_plot_event(entry: &HistoryEntry, theme: &Theme) -> PlotEvent {
         ts: entry.at,
         color: theme.run_state_color(entry.state),
         label: sequence_label(entry),
-        short: truncate(sequence_text(entry), SEQUENCE_SHORT_MAX).into(),
+        short: truncate(&entry.message, SEQUENCE_SHORT_MAX).into(),
         detail: EventDetail::Sequence(entry.clone()),
     }
 }

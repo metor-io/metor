@@ -4,8 +4,9 @@
 //!
 //! A *channel* is a slot that holds at most one loaded *sequence* (a small script that
 //! drives the system). The control system is the source of truth: it declares the channels
-//! via [`SequenceRegistry`] and telemeters each channel's whole state as ordinary
-//! components every cycle, naming them in the registry. [`SequenceStore`] keeps only that
+//! via [`SequenceRegistry`], telemeters each channel's state as ordinary components every
+//! cycle, writes its message component only when something happens, and names them all in
+//! the registry. [`SequenceStore`] keeps only that
 //! declaration. A channel's state is read like any other telemetry, at the selected time,
 //! by [`ChannelStatusReader`], and its history of messages by [`SequenceHistory`]; the
 //! panel never decides what a channel's state is or which commands it would take.
@@ -132,18 +133,6 @@ pub fn state_label(state: Option<SequenceChannelState>) -> &'static str {
     }
 }
 
-/// How long before `now` the instant `at` was: `"2s ago"`, `"5m ago"`, `"1.5h ago"`.
-pub fn format_age(at: Timestamp, now: Timestamp) -> String {
-    let secs = (now.0 - at.0).max(0) as f64 / 1e6;
-    if secs < 60.0 {
-        format!("{secs:.0}s ago")
-    } else if secs < 3600.0 {
-        format!("{:.0}m ago", secs / 60.0)
-    } else {
-        format!("{:.1}h ago", secs / 3600.0)
-    }
-}
-
 /// The gpui entity wrapping [`SequenceState`]; owns the registry ingest task
 /// and the DB handle used to publish commands.
 pub struct SequenceStore {
@@ -155,6 +144,21 @@ pub struct SequenceStore {
 /// The shared sequence store, or `None` if it was never initialized (e.g. in tests).
 pub fn try_global(cx: &App) -> Option<Entity<SequenceStore>> {
     msg_ingest::global(cx)
+}
+
+/// The declared channels' names, in display order; empty without a store.
+pub fn channel_names(cx: &App) -> Vec<SharedString> {
+    try_global(cx)
+        .map(|store| {
+            store
+                .read(cx)
+                .state()
+                .channels_ordered()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl SequenceStore {

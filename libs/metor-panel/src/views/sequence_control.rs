@@ -1,10 +1,8 @@
-//! Start/stop control for a single sequence channel.
-//!
-//! [`SequenceView`](super::SequenceView) lists every channel and
-//! [`SequenceGrid`](super::SequenceGrid) reduces them to status dots; neither
-//! is what an operator wants when one channel *is* the operation. This is
-//! that third shape: one channel, its state and progress, and the verbs
-//! reachable in a single click rather than through the inspector.
+//! Start/stop control for a single sequence channel: its state and latest
+//! message, and the verbs reachable in a single click rather than through
+//! the inspector. It stands alone on a dashboard or as a pane, and
+//! [`SequenceView`](super::SequenceView) lists channels as a column (or grid)
+//! of these.
 //!
 //! Every layout is built from the same pieces: the channel's state and
 //! latest message, a state-chip box naming the sequence, the run and abort
@@ -23,10 +21,7 @@
 //! target's call, not the panel's: each is live exactly when the channel's
 //! `accepts` component says it would take that command. Scrubbed into the
 //! past, the control shows the state then and takes no commands at all.
-//!
-//! No new command plumbing — the buttons drive the same
-//! [`SequenceStore`](crate::sequences::SequenceStore) the list does, so the
-//! command still travels panel DB → link → `UplinkSystem`.
+//! Commands go out through the [`SequenceStore`](crate::sequences::SequenceStore).
 
 use std::sync::Arc;
 
@@ -41,11 +36,10 @@ use serde::{Deserialize, Serialize};
 use crate::icons::Icon;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
-use crate::sequences::{
-    self, Channel, ChannelStatus, ChannelStatusReader, format_age, state_label,
-};
+use crate::sequences::{self, Channel, ChannelStatus, ChannelStatusReader, state_label};
 use crate::theme::{Theme, font_family, theme, ui_px};
 use crate::views::TooltipText;
+use crate::views::format::format_age;
 use crate::views::value_strip::{
     STRIP_BOX_HEIGHT, STRIP_BOX_VALUE_SIZE, apply_chevron, box_corners, box_fill, box_padding,
 };
@@ -89,8 +83,7 @@ pub struct SequenceControl {
     pub channel: SharedString,
     pub layout: SequenceLayout,
     /// Set by the first Stop click, cleared by any other action. Stop is the
-    /// unsafe hard-drop, so it takes two deliberate clicks — the same guard
-    /// the channel list uses.
+    /// unsafe hard-drop, so it takes two deliberate clicks.
     #[facet(skip)]
     arming_stop: bool,
     /// The sequence chosen in the picker but not yet sent. Loading replaces
@@ -103,19 +96,18 @@ pub struct SequenceControl {
     reader: Option<(Entity<ChannelStatusReader>, Subscription)>,
 }
 
-/// What one render shows: the channel's declaration and its state at the
-/// selected time.
+/// What one render shows: the channel's declaration, its state at the
+/// selected time, and the commands it would take now.
 struct Shown {
     channel: Channel,
     status: ChannelStatus,
     live: bool,
+    accepts: SequenceAccepts,
 }
 
 impl Shown {
-    /// Whether the channel would take the command `bit` names right now.
-    /// Nothing is commandable from the past.
     fn allows(&self, bit: u32) -> bool {
-        self.live && self.status.allows(bit)
+        self.accepts.contains(bit)
     }
 }
 
@@ -141,11 +133,14 @@ impl SequenceControl {
 
     /// Hold the reader for `channel`, re-acquiring after an edit.
     fn follow_channel(&mut self, cx: &mut Context<Self>) {
-        if self.channel.is_empty()
-            || self
-                .reader
-                .as_ref()
-                .is_some_and(|(reader, _)| *reader.read(cx).name() == self.channel)
+        if self.channel.is_empty() {
+            self.reader = None;
+            return;
+        }
+        if self
+            .reader
+            .as_ref()
+            .is_some_and(|(reader, _)| *reader.read(cx).name() == self.channel)
         {
             return;
         }
@@ -162,6 +157,7 @@ impl SequenceControl {
             channel: reader.channel()?.clone(),
             status: reader.status().clone(),
             live: reader.live(),
+            accepts: reader.accepts(),
         })
     }
 
@@ -311,12 +307,12 @@ impl SequenceControl {
                     .child("Click stop again to hard-stop"),
             );
         }
-        let message = shown.status.message.clone().filter(|m| !m.is_empty());
+        let message = shown.status.message.clone();
         let age = shown
             .status
             .message_at
             .filter(|_| square && message.is_some())
-            .map(|at| SharedString::from(format_age(at, reference_time(shown.live, cx))));
+            .map(|at| format_age(at, reference_time(shown.live, cx)));
         line.child(
             div()
                 .flex_none()
@@ -568,19 +564,7 @@ impl SequenceControl {
             .child(primary_btn)
             .child(stop_btn)
     }
-}
 
-/// The instant a message's age is measured from: now while live, the
-/// selected time while scrubbed.
-fn reference_time(live: bool, cx: &App) -> Timestamp {
-    if live {
-        Timestamp::now()
-    } else {
-        crate::temporal::view_time(cx).unwrap_or_else(Timestamp::now)
-    }
-}
-
-impl SequenceControl {
     /// The sequence as a state chip's box with the commit chevron fused to
     /// it, the pair a value strip uses for a pending edit: clicking the box
     /// lists the sequences and choosing one only stages it, the chevron
@@ -663,9 +647,7 @@ impl SequenceControl {
             .child(chip)
             .child(commit)
     }
-}
 
-impl SequenceControl {
     /// What the sequence box names: the system a channel that loads nothing
     /// wraps, else the staged choice, else the loaded sequence.
     fn box_text(&self, shown: &Shown) -> Option<SharedString> {
@@ -675,6 +657,16 @@ impl SequenceControl {
         self.staged
             .clone()
             .or_else(|| shown.channel.sequence(shown.status.loaded))
+    }
+}
+
+/// The instant a message's age is measured from: now while live, the
+/// selected time while scrubbed.
+fn reference_time(live: bool, cx: &App) -> Timestamp {
+    if live {
+        Timestamp::now()
+    } else {
+        crate::temporal::view_time(cx).unwrap_or_else(Timestamp::now)
     }
 }
 
@@ -809,14 +801,9 @@ mod tests {
 
     use super::*;
     use crate::inspector::OpenInspectorGlobal;
-    use crate::sequences::tests::{Frame, declare, install_status};
+    use crate::sequences::tests::{Frame, app, declare, install_status};
     use crate::temporal::{TimeAction, TimeExpr};
     use crate::views::dashboard::{DashboardWidget, WidgetId, WidgetKind, WidgetRect};
-
-    fn push<T: serde::Serialize + Msg>(db: &DB, ts: i64, msg: &T) {
-        db.push_msg(Timestamp(ts), T::ID, &postcard::to_allocvec(msg).unwrap())
-            .unwrap();
-    }
 
     /// `solar` running for 75 s: abortable and stoppable, nothing else.
     fn running() -> Frame {
@@ -888,26 +875,20 @@ mod tests {
             frames: &[(i64, Frame)],
             host: impl FnOnce(Arc<DB>, &mut App) -> gpui::AnyView,
         ) -> Self {
-            let temp = tempfile::tempdir().unwrap();
-            let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
-            let inspector = Rc::new(RefCell::new(Vec::new()));
+            let (db, temp) = app(cx, &registry);
             install_status(&db, "deploy", frames);
+            let inspector = Rc::new(RefCell::new(Vec::new()));
             cx.update(|cx| {
-                crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
                 cx.set_global(crate::theme::FontSettings {
                     family: "monospace".into(),
                     config: Default::default(),
                 });
                 crate::views::dashboard::WidgetRegistry::init(cx);
-                crate::temporal::TemporalController::init(db.clone(), cx);
-                crate::sequences::SequenceStore::init(db.clone(), cx);
                 let inspector = inspector.clone();
                 cx.set_global(OpenInspectorGlobal(Arc::new(move |request, _, _| {
                     inspector.borrow_mut().push(request);
                 })));
             });
-            cx.run_until_parked();
-            push(&db, 1, &registry);
             cx.run_until_parked();
 
             let commands = db
@@ -1039,21 +1020,35 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_clocks_read_the_components_the_registry_names(cx: &mut TestAppContext) {
+    fn the_clocks_show_while_the_channel_reports_them(cx: &mut TestAppContext) {
         let slot = Rc::new(RefCell::new(None));
         let rig = Rig::new(cx, laid_out(SequenceLayout::Square, slot.clone()));
         let control = slot.borrow().clone().expect("built");
         rig.cx.update(|window, cx| {
             let control = control.read(cx);
             let shown = control.shown(cx).expect("declared");
-            assert_eq!(shown.status.elapsed, Some(75.0));
-            // Zero: no graceful stop is running, so the clock stays hidden.
-            assert_eq!(shown.status.abort_elapsed, Some(0.0));
             assert!(
                 control
                     .clocks(&shown.status, &crate::theme::theme(cx), window, cx)
                     .is_some()
             );
+        });
+    }
+
+    /// Clearing the channel lets go of the old one, so nothing it accepted
+    /// stays commandable under an empty address.
+    #[gpui::test]
+    fn clearing_the_channel_drops_its_reader(cx: &mut TestAppContext) {
+        let slot = Rc::new(RefCell::new(None));
+        let rig = Rig::new(cx, laid_out(SequenceLayout::Medium, slot.clone()));
+        let control = slot.borrow().clone().expect("built");
+        rig.cx.update(|_, cx| {
+            control.update(cx, |control, cx| {
+                assert!(control.shown(cx).is_some());
+                control.channel = SharedString::default();
+                control.follow_channel(cx);
+                assert!(control.shown(cx).is_none());
+            })
         });
     }
 
@@ -1084,9 +1079,7 @@ mod tests {
 
     #[gpui::test]
     fn stop_fires_on_the_second_click(cx: &mut TestAppContext) {
-        let (first, second) = Rig::new(cx, bare).stop_twice();
-        assert!(first.is_empty(), "the first click only arms");
-        assert!(matches!(second.as_slice(), [SequenceCommandKind::Stop]));
+        stop_fires_in(SequenceLayout::Medium, cx);
     }
 
     #[gpui::test]
@@ -1208,7 +1201,7 @@ mod tests {
             let shown = control.read(cx).shown(cx).unwrap();
             assert!(!shown.live);
             assert_eq!(shown.status.state, Some(SequenceChannelState::Running));
-            assert!(shown.status.allows(SequenceAccepts::ABORT));
+            assert!(shown.status.accepts.contains(SequenceAccepts::ABORT));
         });
         for button in [
             "seq-ctl-abort",

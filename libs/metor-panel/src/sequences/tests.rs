@@ -8,9 +8,10 @@ use metor_proto_wkt::{
     SequenceRegistry,
 };
 
-use super::{ChannelStatusReader, SequenceHistory, SequenceState, format_age};
+use super::{ChannelStatusReader, SequenceHistory, SequenceState};
 use crate::msg_ingest::{IngestSource, apply_backfill};
 use crate::temporal::{TimeAction, TimeExpr};
+use crate::views::format::format_age;
 
 fn spec(name: &str, available: &[&str]) -> SequenceChannelSpec {
     SequenceChannelSpec {
@@ -285,7 +286,10 @@ pub(crate) fn declare(channel: &str, available: &[&str], system: &str) -> Sequen
 
 /// A db with a sequence store whose registry is `registry`, and the time
 /// controller every reader follows.
-fn app(cx: &mut TestAppContext, registry: &SequenceRegistry) -> (Arc<DB>, tempfile::TempDir) {
+pub(crate) fn app(
+    cx: &mut TestAppContext,
+    registry: &SequenceRegistry,
+) -> (Arc<DB>, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
     cx.update(|cx| {
@@ -342,9 +346,9 @@ fn the_reader_decodes_every_field(cx: &mut TestAppContext) {
         assert_eq!(status.state, Some(SequenceChannelState::Stopped));
         assert_eq!(status.loaded, Some(1));
         assert_eq!(channel.sequence(status.loaded).as_deref(), Some("lunar"));
-        assert!(status.allows(SequenceAccepts::START));
-        assert!(status.allows(SequenceAccepts::RESET));
-        assert!(!status.allows(SequenceAccepts::STOP));
+        assert!(status.accepts.contains(SequenceAccepts::START));
+        assert!(status.accepts.contains(SequenceAccepts::RESET));
+        assert!(!status.accepts.contains(SequenceAccepts::STOP));
         assert_eq!(
             status.message.as_deref(),
             Some("refused: the channel is running")
@@ -484,6 +488,55 @@ fn history_has_an_entry_per_raised_message(cx: &mut TestAppContext) {
     let now = entries(cx);
     assert_eq!(now.len(), 6);
     assert_eq!(now.iter().filter(|e| e.0 == 6).count(), 3);
+}
+
+/// A target writes a cycle's message before its status, so the message can
+/// land first; its entry waits for the state rather than keep none.
+#[gpui::test]
+fn a_message_landing_before_its_state_waits_for_it(cx: &mut TestAppContext) {
+    use SequenceChannelState::{Completed, Running};
+    let (db, _temp) = app(cx, &declare("deploy", &["solar"], "dl_slot"));
+    install_status(
+        &db,
+        "deploy",
+        &[(
+            1,
+            Frame {
+                state: Running,
+                message: "started",
+                ..Frame::default()
+            },
+        )],
+    );
+    let history = cx.update(|cx| SequenceHistory::global(cx)).unwrap();
+    cx.run_until_parked();
+    install_messages(&db, "deploy", &[(2, "completed")]);
+    cx.run_until_parked();
+    let entries = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            history
+                .read(cx)
+                .newest_first()
+                .into_iter()
+                .map(|e| (e.at.0, e.state))
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(entries(cx), [(1, Some(Running))], "waits for the state");
+
+    install_status(
+        &db,
+        "deploy",
+        &[(
+            2,
+            Frame {
+                state: Completed,
+                ..Frame::default()
+            },
+        )],
+    );
+    cx.run_until_parked();
+    assert_eq!(entries(cx), [(2, Some(Completed)), (1, Some(Running))]);
 }
 
 #[gpui::test]

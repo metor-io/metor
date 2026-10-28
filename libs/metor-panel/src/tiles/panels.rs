@@ -63,9 +63,7 @@ impl Default for LogPanelConfig {
 #[serde(default)]
 pub struct SequencePanelConfig {
     pub show_history: bool,
-    /// Absent in layouts saved before the list chose a control layout, which
-    /// restore as [`SequenceLayout::Medium`], the list's own default.
-    pub layout: Option<SequenceLayout>,
+    pub layout: SequenceLayout,
 }
 
 pub(crate) fn alarm_view(
@@ -109,16 +107,14 @@ pub(crate) fn sequence_view(
 ) -> SequenceView {
     let mut view = SequenceView::new(cx);
     view.set_history(cfg.show_history);
-    if let Some(layout) = cfg.layout {
-        view.layout = layout;
-    }
+    view.layout = cfg.layout;
     view
 }
 
 pub(crate) fn sequence_config(view: &SequenceView, _cx: &App) -> SequencePanelConfig {
     SequencePanelConfig {
         show_history: view.is_history(),
-        layout: Some(view.layout),
+        layout: view.layout,
     }
 }
 

@@ -341,7 +341,7 @@ impl BoundHistory {
     }
 }
 
-fn hydrate(
+pub(crate) fn hydrate(
     component: &metor_db::Component,
     range: std::ops::Range<metor_proto::types::Timestamp>,
     cx: &App,

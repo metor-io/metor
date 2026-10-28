@@ -29,20 +29,14 @@ pub struct ChannelStatus {
     /// Index into the channel's `available`; `None` when nothing is loaded.
     pub loaded: Option<u32>,
     pub artifact: Option<SharedString>,
-    /// Exactly the commands the target would accept now.
+    /// Exactly the commands the target would accept at the selected time.
     pub accepts: SequenceAccepts,
-    /// The latest transition, progress, refusal or failure.
+    /// The latest transition, refusal or end; never empty.
     pub message: Option<SharedString>,
     /// When `message` was raised: its sample's stamp.
     pub message_at: Option<Timestamp>,
     pub elapsed: Option<f64>,
     pub abort_elapsed: Option<f64>,
-}
-
-impl ChannelStatus {
-    pub fn allows(&self, bit: u32) -> bool {
-        self.accepts.0 & bit != 0
-    }
 }
 
 /// The shared reader for one channel's components.
@@ -124,6 +118,16 @@ impl ChannelStatusReader {
         self.live
     }
 
+    /// The commands the channel would take now: what it accepts, or nothing
+    /// while scrubbed, since nothing is commandable from the past.
+    pub fn accepts(&self) -> SequenceAccepts {
+        if self.live {
+            self.status.accepts
+        } else {
+            SequenceAccepts::default()
+        }
+    }
+
     /// Pick up the registry's entry for this channel, restreaming only when
     /// it names different components.
     fn follow(&mut self, store: &Entity<SequenceStore>, cx: &mut Context<Self>) {
@@ -202,7 +206,11 @@ fn message(
         db.clone(),
         id?,
         cx,
-        |_, _| ((), |at, view| Some((text(view)?, at))),
+        |_, _| {
+            ((), |at, view| {
+                Some((text(view).filter(|t| !t.is_empty())?, at))
+            })
+        },
         |this: &mut ChannelStatusReader, update, cx| {
             let (message, at) = match update {
                 StreamUpdate::Value((message, at)) => (Some(message), Some(at)),

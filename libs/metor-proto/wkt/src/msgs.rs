@@ -821,7 +821,12 @@ impl SequenceAccepts {
 
     /// Whether `command` would be accepted.
     pub fn allows(self, command: &SequenceCommandKind) -> bool {
-        self.0 & Self::bit(command) != 0
+        self.contains(Self::bit(command))
+    }
+
+    /// Whether the command `bit` names would be accepted.
+    pub fn contains(self, bit: u32) -> bool {
+        self.0 & bit != 0
     }
 }
 

@@ -149,6 +149,22 @@ pub(crate) fn format_number(v: f64) -> String {
 }
 
 /// `HH:MM:SS.mmm` local time from a payload timestamp (microseconds).
+/// How long before `now` `at` was, in its largest whole unit: "5s ago".
+pub(crate) fn format_age(
+    at: metor_proto::types::Timestamp,
+    now: metor_proto::types::Timestamp,
+) -> SharedString {
+    let secs = (now.0 - at.0).max(0) as f64 / 1e6;
+    if secs < 60.0 {
+        format!("{secs:.0}s ago")
+    } else if secs < 3600.0 {
+        format!("{:.0}m ago", secs / 60.0)
+    } else {
+        format!("{:.1}h ago", secs / 3600.0)
+    }
+    .into()
+}
+
 pub(crate) fn format_time(t_us: i64) -> String {
     let Ok(ts) = jiff::Timestamp::from_microsecond(t_us) else {
         return t_us.to_string();

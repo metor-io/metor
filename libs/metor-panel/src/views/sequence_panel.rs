@@ -6,17 +6,13 @@
 //! [`ChannelStatusReader`](crate::sequences::ChannelStatusReader)s, and the History tab
 //! from [`SequenceHistory`]; this view only renders and publishes commands.
 
-use std::sync::Arc;
-
 use gpui::{AnyElement, Context, Entity, IntoElement, SharedString, Window, div, prelude::*, px};
 use metor_proto::types::Timestamp;
-use metor_proto_wkt::{SequenceAccepts, SequenceChannelState};
+use metor_proto_wkt::SequenceChannelState;
 
-use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
-use crate::sequences::{
-    self, ChannelReaders, HistoryEntry, SequenceHistory, format_age, state_label,
-};
+use crate::sequences::{self, ChannelReaders, HistoryEntry, SequenceHistory, state_label};
 use crate::theme::{theme, ui_px};
+use crate::views::format::format_age;
 use crate::views::sequence_control::{SequenceControl, SequenceControlConfig, SequenceLayout};
 use crate::views::table;
 
@@ -44,7 +40,8 @@ pub enum SequenceListMode {
     History,
 }
 
-/// The sequence control view. Its [`SequenceListMode`] is editable through the inspector.
+/// The sequence control view. Its [`SequenceListMode`] and its controls' [`SequenceLayout`]
+/// are editable through the inspector.
 #[derive(facet::Facet)]
 pub struct SequenceView {
     pub mode: SequenceListMode,
@@ -72,7 +69,7 @@ impl SequenceView {
         }
         Self {
             mode: SequenceListMode::default(),
-            layout: SequenceLayout::Medium,
+            layout: SequenceLayout::default(),
             controls: Vec::new(),
             readers: ChannelReaders::default(),
         }
@@ -91,89 +88,6 @@ impl SequenceView {
     pub fn is_history(&self) -> bool {
         self.mode == SequenceListMode::History
     }
-}
-
-/// Inspector rows listing the sequences loadable into the channel named `channel`;
-/// selecting one publishes a load command. Shared by this panel's `Load` button and the
-/// grid's control page.
-pub(crate) fn load_picker_rows(
-    channel: SharedString,
-    available: &[SharedString],
-) -> Vec<Box<dyn InspectorRow>> {
-    available
-        .iter()
-        .map(|name| {
-            let name = name.clone();
-            let channel = channel.clone();
-            Box::new(CommandRow::new(
-                name.clone(),
-                Arc::new(move |_window, cx| {
-                    if let Some(store) = sequences::try_global(cx) {
-                        store.read(cx).load(&channel, name.to_string());
-                    }
-                }),
-            )) as Box<dyn InspectorRow>
-        })
-        .collect()
-}
-
-/// Inspector control page for one channel: exactly the commands it would accept now
-/// (`accepts`), so the page never offers what the target would refuse. `Stop` drills
-/// into a confirmation row since it is the unsafe hard-drop. Used by the grid's
-/// click-through.
-pub(crate) fn channel_control_rows(
-    channel: SharedString,
-    accepts: SequenceAccepts,
-    available: Vec<SharedString>,
-) -> Vec<Box<dyn InspectorRow>> {
-    let allows = |bit| accepts.0 & bit != 0;
-    let command = |label: &'static str, act: fn(&sequences::SequenceStore, &str)| {
-        let channel = channel.clone();
-        Box::new(CommandRow::new(
-            label,
-            Arc::new(move |_window, cx| {
-                if let Some(store) = sequences::try_global(cx) {
-                    act(store.read(cx), &channel);
-                }
-            }),
-        )) as Box<dyn InspectorRow>
-    };
-    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-    if allows(SequenceAccepts::LOAD) && !available.is_empty() {
-        let channel = channel.clone();
-        rows.push(Box::new(NavRow::new(
-            "Load",
-            "",
-            Box::new(move |_cx| load_picker_rows(channel.clone(), &available)),
-        )));
-    }
-    if allows(SequenceAccepts::START) {
-        rows.push(command("Start", |s, c| s.start(c)));
-    }
-    if allows(SequenceAccepts::RESET) {
-        rows.push(command("Reset", |s, c| s.reset(c)));
-    }
-    if allows(SequenceAccepts::ABORT) {
-        rows.push(command("Abort", |s, c| s.abort(c)));
-    }
-    if allows(SequenceAccepts::STOP) {
-        rows.push(Box::new(NavRow::new(
-            "Stop",
-            "",
-            Box::new(move |_cx| {
-                let channel = channel.clone();
-                vec![Box::new(CommandRow::new(
-                    "Confirm stop — may leave the system unsafe",
-                    Arc::new(move |_window, cx| {
-                        if let Some(store) = sequences::try_global(cx) {
-                            store.read(cx).stop(&channel);
-                        }
-                    }),
-                )) as Box<dyn InspectorRow>]
-            }),
-        )));
-    }
-    rows
 }
 
 impl Render for SequenceView {
@@ -205,18 +119,7 @@ impl Render for SequenceView {
                     }),
             );
 
-        let channels: Vec<SharedString> = store
-            .as_ref()
-            .map(|store| {
-                store
-                    .read(cx)
-                    .state()
-                    .channels_ordered()
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let channels = sequences::channel_names(cx);
         self.readers.sync(&channels, cx);
         let states: Vec<Option<SequenceChannelState>> = self
             .readers
@@ -412,11 +315,6 @@ fn empty_row(theme: &crate::theme::Theme, msg: &'static str) -> AnyElement {
 /// One message a channel raised: the channel, the message in the color of the
 /// state it left the channel in, and how long ago.
 fn history_row(entry: &HistoryEntry, now: Timestamp, theme: &crate::theme::Theme) -> AnyElement {
-    let label = if entry.message.is_empty() {
-        SharedString::new_static(state_label(entry.state))
-    } else {
-        entry.message.clone()
-    };
     div()
         .flex()
         .flex_row()
@@ -438,13 +336,13 @@ fn history_row(entry: &HistoryEntry, now: Timestamp, theme: &crate::theme::Theme
                 .flex_grow_1()
                 .text_color(theme.run_state_color(entry.state))
                 .text_size(px(12.0))
-                .child(label),
+                .child(entry.message.clone()),
         )
         .child(
             div()
                 .text_color(theme.text_tertiary)
                 .text_size(px(11.0))
-                .child(SharedString::from(format_age(entry.at, now))),
+                .child(format_age(entry.at, now)),
         )
         .into_any_element()
 }

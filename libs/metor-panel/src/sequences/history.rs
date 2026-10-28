@@ -18,7 +18,7 @@ use metor_proto_wkt::SequenceChannelState;
 
 use super::SequenceStore;
 use super::status::{code, text};
-use crate::data_binding::{BoundHistory, component_extent};
+use crate::data_binding::{component_extent, hydrate};
 
 /// Most entries kept per channel; the oldest go first.
 const MAX_ENTRIES: usize = 1000;
@@ -36,6 +36,7 @@ pub struct HistoryEntry {
     pub at: Timestamp,
     /// The channel's state in the cycle that raised the message.
     pub state: Option<SequenceChannelState>,
+    /// Never empty.
     pub message: SharedString,
 }
 
@@ -203,11 +204,7 @@ impl SequenceHistory {
                 let range =
                     Timestamp(extent.start.0.max(extent.end.0 - FETCH_WINDOW_US))..extent.end;
                 for component in [Some(&message), state.as_ref()].into_iter().flatten() {
-                    BoundHistory {
-                        component: component.clone(),
-                        plan: None,
-                    }
-                    .request(range.clone(), cx);
+                    hydrate(component, range.clone(), cx);
                 }
             }
         }
@@ -234,6 +231,10 @@ impl ChannelLog {
             })
             .collect();
         let size = message.schema.size();
+        // The target writes a cycle's messages before its status, so a
+        // message can land before the state it is read with; it waits for
+        // the next wake rather than keep no state.
+        let state_head = state.map(|c| c.time_series.latest().map(|l| l.timestamp()));
         // Samples at the newest folded stamp that were already folded.
         let mut skip = self.scanned.map_or(0, |(_, n)| n);
         let mut added = false;
@@ -251,6 +252,9 @@ impl ChannelLog {
                 None => 0,
             };
             for (ix, &at) in stamps.iter().enumerate().skip(from) {
+                if state_head.is_some_and(|head| head.is_none_or(|head| head < at)) {
+                    return added;
+                }
                 let Some(bytes) = data.get(ix * size..(ix + 1) * size) else {
                     break;
                 };
