@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use gpui::{App, Global, Hsla, Rems, SharedString, Window, px, rems};
+use metor_proto_wkt::SequenceChannelState;
 
 use crate::config::{self, FontConfig, PanelConfig};
 
@@ -283,34 +284,41 @@ impl Theme {
         Hsla { a: alpha, ..color }
     }
 
-    /// Solid color for a sequence channel's run state (`run_state_index`: 0 = idle,
-    /// 1 = running, 2 = completed, 3 = aborted, 4 = stopped, 5 = failed). Tracks the
-    /// theme's `control_active`/`error_accent` for the running/failed poles; the
-    /// intermediate states use fixed hues that read on both light and dark themes.
-    pub fn run_state_color(&self, run_state_index: usize) -> Hsla {
-        match run_state_index {
-            1 => self.control_active, // running
-            2 => hex(0x4090e0, 1.0),  // completed — calm blue
-            3 => hex(0xe0a030, 1.0),  // aborted — amber (commanded safe stop)
-            4 => hex(0xe06820, 1.0),  // stopped — orange (hard, possibly unsafe)
-            5 => self.error_accent,   // failed
-            _ => self.text_tertiary,  // idle / unknown
+    /// Solid color for a sequence channel's state; `None` is a channel with
+    /// no reading yet. Tracks the theme's `control_active`/`error_accent` for
+    /// the running/failed poles; the intermediate states use fixed hues that
+    /// read on both light and dark themes.
+    pub fn run_state_color(&self, state: Option<SequenceChannelState>) -> Hsla {
+        match state {
+            Some(SequenceChannelState::Running) => self.control_active,
+            // Calm blue: the run finished.
+            Some(SequenceChannelState::Completed) => hex(0x4090e0, 1.0),
+            // Amber: a commanded safe stop, or waiting on one to settle.
+            Some(SequenceChannelState::Aborted | SequenceChannelState::Quiescing) => {
+                hex(0xe0a030, 1.0)
+            }
+            // Orange: hard-stopped, possibly unsafe.
+            Some(SequenceChannelState::Stopped) => hex(0xe06820, 1.0),
+            Some(SequenceChannelState::Failed | SequenceChannelState::Panicked) => {
+                self.error_accent
+            }
+            Some(SequenceChannelState::Unloaded) | None => self.text_tertiary,
         }
     }
 
     /// Low-alpha [`run_state_color`](Self::run_state_color) for swatch/row backgrounds.
-    pub fn run_state_tint(&self, run_state_index: usize) -> Hsla {
+    pub fn run_state_tint(&self, state: Option<SequenceChannelState>) -> Hsla {
         Hsla {
             a: 0.12,
-            ..self.run_state_color(run_state_index)
+            ..self.run_state_color(state)
         }
     }
 
     /// Solid color for a cyclic slot's run state, indexed by the FSW's
     /// `SlotState::code` (0 = empty, 1 = loaded, 2 = loading, 3 = running,
     /// 4 = done, 5 = stopped). Distinct from
-    /// [`run_state_color`](Self::run_state_color), which indexes the sequence
-    /// run states — the two ladders share neither order nor meaning, and
+    /// [`run_state_color`](Self::run_state_color), which colors the sequence
+    /// channel states — the two ladders share neither order nor meaning, and
     /// painting a running slot with the sequence table would read as "aborted".
     pub fn slot_state_color(&self, state_code: usize) -> Hsla {
         match state_code {

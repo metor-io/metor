@@ -1,19 +1,22 @@
 //! Detailed per-channel control panel for sequences (best for a handful of channels).
 //! Each row is a [`SequenceControl`] for one channel, so the list and the single-channel
 //! widget stage loads, arm Stop and lay out their buttons the same way; a header carries a
-//! global Reload and run-state count chips. All data comes from the global
-//! [`SequenceStore`](crate::sequences::SequenceStore); this view only renders and
-//! publishes commands.
+//! global Reload and channel-state count chips. Channels come from the global
+//! [`SequenceStore`](crate::sequences::SequenceStore), their states from their shared
+//! [`ChannelStatusReader`](crate::sequences::ChannelStatusReader)s, and the History tab
+//! from [`SequenceHistory`]; this view only renders and publishes commands.
 
 use std::sync::Arc;
 
 use gpui::{AnyElement, Context, Entity, IntoElement, SharedString, Window, div, prelude::*, px};
 use metor_db::DB;
 use metor_proto::types::Timestamp;
-use metor_proto_wkt::SequenceRunState;
+use metor_proto_wkt::{SequenceAccepts, SequenceChannelState};
 
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
-use crate::sequences::{self, is_resettable, run_state_index, run_state_label};
+use crate::sequences::{
+    self, ChannelReaders, HistoryEntry, SequenceHistory, format_age, state_label,
+};
 use crate::theme::{theme, ui_px};
 use crate::views::sequence_control::{SequenceControl, SequenceControlConfig, SequenceLayout};
 use crate::views::table;
@@ -21,13 +24,16 @@ use crate::views::table;
 /// Size of one square control in the channel grid, in unscaled pixels.
 const SQUARE_TILE: (f32, f32) = (260.0, 132.0);
 
-/// Run-state chips to surface in the header, in display order. `Idle` is omitted as noise.
-const CHIP_STATES: [SequenceRunState; 5] = [
-    SequenceRunState::Running,
-    SequenceRunState::Failed,
-    SequenceRunState::Stopped,
-    SequenceRunState::Aborted,
-    SequenceRunState::Completed,
+/// Channel-state chips to surface in the header, in display order. `Unloaded` is
+/// omitted as noise.
+const CHIP_STATES: [SequenceChannelState; 7] = [
+    SequenceChannelState::Running,
+    SequenceChannelState::Quiescing,
+    SequenceChannelState::Failed,
+    SequenceChannelState::Panicked,
+    SequenceChannelState::Stopped,
+    SequenceChannelState::Aborted,
+    SequenceChannelState::Completed,
 ];
 
 /// Which set the sequence panel shows. Switched from the inspector or the header toggle.
@@ -50,20 +56,28 @@ pub struct SequenceView {
     /// staged load or an armed Stop survives the store's next event.
     #[facet(opaque)]
     controls: Vec<(SharedString, Entity<SequenceControl>)>,
+    /// Every declared channel's status, for the header's counts.
+    #[facet(opaque)]
+    readers: ChannelReaders,
     #[facet(opaque)]
     db: Arc<DB>,
 }
 
 impl SequenceView {
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        // Repaint whenever the control system declares channels or reports an event.
+        // Repaint whenever the control system declares channels or a channel
+        // raises a message.
         if let Some(store) = sequences::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        }
+        if let Some(history) = SequenceHistory::global(cx) {
+            cx.observe(&history, |_, _, cx| cx.notify()).detach();
         }
         Self {
             mode: SequenceListMode::default(),
             layout: SequenceLayout::Medium,
             controls: Vec::new(),
+            readers: ChannelReaders::default(),
             db,
         }
     }
@@ -80,24 +94,6 @@ impl SequenceView {
     /// Whether the history tab is showing, for persistence.
     pub fn is_history(&self) -> bool {
         self.mode == SequenceListMode::History
-    }
-}
-
-struct HistoryRow {
-    channel_name: SharedString,
-    run_state: SequenceRunState,
-    label: SharedString,
-    timestamp: Timestamp,
-}
-
-fn format_age(at: Timestamp) -> String {
-    let secs = (Timestamp::now().0 - at.0).max(0) as f64 / 1e6;
-    if secs < 60.0 {
-        format!("{secs:.0}s ago")
-    } else if secs < 3600.0 {
-        format!("{:.0}m ago", secs / 60.0)
-    } else {
-        format!("{:.1}h ago", secs / 3600.0)
     }
 }
 
@@ -125,77 +121,62 @@ pub(crate) fn load_picker_rows(
         .collect()
 }
 
-/// Inspector control page for one channel: Load / Reset / Start / Abort / Stop. `Reset` only
-/// appears from a terminal state; `Stop` drills into a confirmation row since it is the unsafe
-/// hard-drop. Used by the grid's click-through.
+/// Inspector control page for one channel: exactly the commands it would accept now
+/// (`accepts`), so the page never offers what the target would refuse. `Stop` drills
+/// into a confirmation row since it is the unsafe hard-drop. Used by the grid's
+/// click-through.
 pub(crate) fn channel_control_rows(
     channel: SharedString,
-    run_state: SequenceRunState,
+    accepts: SequenceAccepts,
     available: Vec<SharedString>,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-
-    rows.push(Box::new(NavRow::new(
-        "Load",
-        "",
-        Box::new({
-            let channel = channel.clone();
-            move |_cx| load_picker_rows(channel.clone(), &available)
-        }),
-    )));
-    if is_resettable(run_state) {
-        rows.push(Box::new(CommandRow::new(
-            "Reset",
-            Arc::new({
-                let channel = channel.clone();
-                move |_window, cx| {
-                    if let Some(store) = sequences::try_global(cx) {
-                        store.read(cx).reset(&channel);
-                    }
-                }
-            }),
-        )));
-    }
-    if let SequenceRunState::Idle = run_state {
-        rows.push(Box::new(CommandRow::new(
-            "Start",
-            Arc::new({
-                let channel = channel.clone();
-                move |_window, cx| {
-                    if let Some(store) = sequences::try_global(cx) {
-                        store.read(cx).start(&channel);
-                    }
-                }
-            }),
-        )));
-    }
-    rows.push(Box::new(CommandRow::new(
-        "Abort",
-        Arc::new({
-            let channel = channel.clone();
-            move |_window, cx| {
+    let allows = |bit| accepts.0 & bit != 0;
+    let command = |label: &'static str, act: fn(&sequences::SequenceStore, &str)| {
+        let channel = channel.clone();
+        Box::new(CommandRow::new(
+            label,
+            Arc::new(move |_window, cx| {
                 if let Some(store) = sequences::try_global(cx) {
-                    store.read(cx).abort(&channel);
+                    act(store.read(cx), &channel);
                 }
-            }
-        }),
-    )));
-    rows.push(Box::new(NavRow::new(
-        "Stop",
-        "",
-        Box::new(move |_cx| {
-            let channel = channel.clone();
-            vec![Box::new(CommandRow::new(
-                "Confirm stop — may leave the system unsafe",
-                Arc::new(move |_window, cx| {
-                    if let Some(store) = sequences::try_global(cx) {
-                        store.read(cx).stop(&channel);
-                    }
-                }),
-            )) as Box<dyn InspectorRow>]
-        }),
-    )));
-
+            }),
+        )) as Box<dyn InspectorRow>
+    };
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+    if allows(SequenceAccepts::LOAD) && !available.is_empty() {
+        let channel = channel.clone();
+        rows.push(Box::new(NavRow::new(
+            "Load",
+            "",
+            Box::new(move |_cx| load_picker_rows(channel.clone(), &available)),
+        )));
+    }
+    if allows(SequenceAccepts::START) {
+        rows.push(command("Start", |s, c| s.start(c)));
+    }
+    if allows(SequenceAccepts::RESET) {
+        rows.push(command("Reset", |s, c| s.reset(c)));
+    }
+    if allows(SequenceAccepts::ABORT) {
+        rows.push(command("Abort", |s, c| s.abort(c)));
+    }
+    if allows(SequenceAccepts::STOP) {
+        rows.push(Box::new(NavRow::new(
+            "Stop",
+            "",
+            Box::new(move |_cx| {
+                let channel = channel.clone();
+                vec![Box::new(CommandRow::new(
+                    "Confirm stop — may leave the system unsafe",
+                    Arc::new(move |_window, cx| {
+                        if let Some(store) = sequences::try_global(cx) {
+                            store.read(cx).stop(&channel);
+                        }
+                    }),
+                )) as Box<dyn InspectorRow>]
+            }),
+        )));
+    }
     rows
 }
 
@@ -222,29 +203,42 @@ impl Render for SequenceView {
                     .child("Live"),
             );
 
-        if let Some(store) = &store {
-            let store = store.read(cx);
-            let state = store.state();
-            for run_state in CHIP_STATES {
-                let n = state.count_in_state(run_state);
-                if n == 0 {
-                    continue;
-                }
-                let idx = run_state_index(run_state);
-                header = header.child(
-                    div()
-                        .px_2()
-                        .py(px(1.0))
-                        .rounded(px(3.0))
-                        .bg(theme.run_state_tint(idx))
-                        .text_color(theme.run_state_color(idx))
-                        .text_size(px(11.0))
-                        .child(SharedString::from(format!(
-                            "{n} {}",
-                            run_state_label(run_state)
-                        ))),
-                );
+        let channels: Vec<SharedString> = store
+            .as_ref()
+            .map(|store| {
+                store
+                    .read(cx)
+                    .state()
+                    .channels_ordered()
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.readers.sync(&channels, cx);
+        let states: Vec<Option<SequenceChannelState>> = self
+            .readers
+            .iter()
+            .map(|reader| reader.read(cx).status().state)
+            .collect();
+        for chip in CHIP_STATES {
+            let n = states.iter().filter(|s| **s == Some(chip)).count();
+            if n == 0 {
+                continue;
             }
+            header = header.child(
+                div()
+                    .px_2()
+                    .py(px(1.0))
+                    .rounded(px(3.0))
+                    .bg(theme.run_state_tint(Some(chip)))
+                    .text_color(theme.run_state_color(Some(chip)))
+                    .text_size(px(11.0))
+                    .child(SharedString::from(format!(
+                        "{n} {}",
+                        state_label(Some(chip))
+                    ))),
+            );
         }
 
         header = header
@@ -298,34 +292,25 @@ impl Render for SequenceView {
             None => {
                 list = list.child(empty_row(&theme, "Sequence store unavailable"));
             }
-            Some(store) if history => {
-                let entries: Vec<HistoryRow> = store
-                    .read(cx)
-                    .state()
-                    .history()
-                    .iter()
-                    .rev()
-                    .map(|e| HistoryRow {
-                        channel_name: e.channel_name.clone(),
-                        run_state: e.run_state,
-                        label: e.label.clone(),
-                        timestamp: e.timestamp,
+            Some(_) if history => {
+                let now = Timestamp::now();
+                let rows: Vec<AnyElement> = SequenceHistory::global(cx)
+                    .map(|history| {
+                        history
+                            .read(cx)
+                            .newest_first()
+                            .into_iter()
+                            .map(|e| history_row(e, now, &theme))
+                            .collect()
                     })
-                    .collect();
-                if entries.is_empty() {
+                    .unwrap_or_default();
+                if rows.is_empty() {
                     list = list.child(empty_row(&theme, "No sequence history"));
                 } else {
-                    list = list.children(entries.into_iter().map(|e| history_row(e, &theme)));
+                    list = list.children(rows);
                 }
             }
-            Some(store) => {
-                let channels: Vec<SharedString> = store
-                    .read(cx)
-                    .state()
-                    .channels_ordered()
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect();
+            Some(_) => {
                 self.sync_controls(&channels, cx);
                 if self.controls.is_empty() {
                     list = list.child(empty_row(&theme, "No channels declared"));
@@ -423,8 +408,14 @@ fn empty_row(theme: &crate::theme::Theme, msg: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-fn history_row(entry: HistoryRow, theme: &crate::theme::Theme) -> AnyElement {
-    let color = theme.run_state_color(run_state_index(entry.run_state));
+/// One message a channel raised: the channel, the message in the color of the
+/// state it left the channel in, and how long ago.
+fn history_row(entry: &HistoryEntry, now: Timestamp, theme: &crate::theme::Theme) -> AnyElement {
+    let label = if entry.message.is_empty() {
+        SharedString::new_static(state_label(entry.state))
+    } else {
+        entry.message.clone()
+    };
     div()
         .flex()
         .flex_row()
@@ -439,20 +430,20 @@ fn history_row(entry: HistoryRow, theme: &crate::theme::Theme) -> AnyElement {
                 .w(px(120.0))
                 .text_color(theme.text_secondary)
                 .text_size(px(12.0))
-                .child(entry.channel_name),
+                .child(entry.channel.clone()),
         )
         .child(
             div()
                 .flex_grow_1()
-                .text_color(color)
+                .text_color(theme.run_state_color(entry.state))
                 .text_size(px(12.0))
-                .child(entry.label),
+                .child(label),
         )
         .child(
             div()
                 .text_color(theme.text_tertiary)
                 .text_size(px(11.0))
-                .child(SharedString::from(format_age(entry.timestamp))),
+                .child(SharedString::from(format_age(entry.at, now))),
         )
         .into_any_element()
 }

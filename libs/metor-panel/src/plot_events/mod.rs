@@ -31,13 +31,13 @@ use metor_db::DB;
 use metor_proto::types::{Msg, PacketId, Timestamp};
 use metor_proto_wkt::{
     AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, LogEvent, LogLevel, MsgMetadata,
-    SequenceChannelEvent, SequenceRegistry,
+    SequenceRegistry,
 };
 
 use crate::alarms::{self, AlarmEvent, AlarmEventKind, severity_index};
 use crate::logs;
 use crate::msg_ingest::{IngestSource, ingest_all};
-use crate::sequences::{self, SequenceLogEntry, run_state_index};
+use crate::sequences::{HistoryEntry, SequenceHistory, state_label};
 use crate::theme::{Theme, theme};
 
 #[cfg(test)]
@@ -118,7 +118,7 @@ pub struct PlotEvent {
 pub enum EventDetail {
     Log(LogEvent),
     Alarm(AlarmEvent),
-    Sequence(SequenceLogEntry),
+    Sequence(HistoryEntry),
     /// Schema-decoded unknown message.
     Json(Arc<serde_json::Value>),
     /// Payload byte length; the schema was absent or the decode failed.
@@ -352,21 +352,37 @@ impl EventSource for AlarmEventSource {
 
 // -- Sequences ---------------------------------------------------------------
 
-/// Sequence lifecycle steps from the global
-/// [`SequenceStore`](crate::sequences::SequenceStore).
+/// The messages sequence channels raised, from the global [`SequenceHistory`].
 struct SequenceEventSource;
 
-fn sequence_label(entry: &SequenceLogEntry) -> SharedString {
-    format!("{}: {}", entry.channel_name, entry.label).into()
+/// Longest flag chip for a sequence message before it's elided.
+const SEQUENCE_SHORT_MAX: usize = 24;
+
+/// The entry's message, or the state it left the channel in when it has none.
+fn sequence_text(entry: &HistoryEntry) -> &str {
+    if entry.message.is_empty() {
+        state_label(entry.state)
+    } else {
+        &entry.message
+    }
 }
 
-fn sequence_plot_event(event: &SequenceLogEntry, theme: &Theme) -> PlotEvent {
+fn sequence_label(entry: &HistoryEntry) -> SharedString {
+    format!(
+        "{}: {}",
+        entry.channel,
+        truncate(sequence_text(entry), LABEL_MAX)
+    )
+    .into()
+}
+
+fn sequence_plot_event(entry: &HistoryEntry, theme: &Theme) -> PlotEvent {
     PlotEvent {
-        ts: event.timestamp,
-        color: theme.run_state_color(run_state_index(event.run_state)),
-        label: sequence_label(event),
-        short: event.label.clone(),
-        detail: EventDetail::Sequence(event.clone()),
+        ts: entry.at,
+        color: theme.run_state_color(entry.state),
+        label: sequence_label(entry),
+        short: truncate(sequence_text(entry), SEQUENCE_SHORT_MAX).into(),
+        detail: EventDetail::Sequence(entry.clone()),
     }
 }
 
@@ -384,16 +400,15 @@ impl EventSource for SequenceEventSource {
     }
 
     fn generation(&self, cx: &App) -> u64 {
-        sequences::try_global(cx).map_or(0, |s| s.read(cx).state().history_pushed())
+        SequenceHistory::global(cx).map_or(0, |h| h.read(cx).generation())
     }
 
     fn events_in(&self, range: Range<Timestamp>, cx: &App) -> Vec<PlotEvent> {
-        let Some(store) = sequences::try_global(cx) else {
+        let Some(history) = SequenceHistory::global(cx) else {
             return Vec::new();
         };
         let theme = theme(cx);
-        let store = store.read(cx);
-        let items = store.state().history().iter().map(|e| (e.timestamp, e));
+        let items = history.read(cx).entries().map(|e| (e.at, e));
         in_range(items, &range)
             .into_iter()
             .map(|(_, entry)| sequence_plot_event(entry, &theme))
@@ -401,7 +416,7 @@ impl EventSource for SequenceEventSource {
     }
 
     fn observe_target(&self, cx: &App) -> Option<AnyEntity> {
-        sequences::try_global(cx).map(Entity::into_any)
+        SequenceHistory::global(cx).map(Entity::into_any)
     }
 }
 
@@ -605,7 +620,6 @@ impl EventSourceRegistry {
             AlarmCleared::ID,
             AlarmAck::ID,
             SequenceRegistry::ID,
-            SequenceChannelEvent::ID,
         ]);
         cx.set_global(EventSourceRegistry {
             builtins,
@@ -672,8 +686,8 @@ pub(crate) fn observe_target<T: 'static>(
     if let Ok(store) = target.clone().downcast::<crate::alarms::AlarmStore>() {
         return Some(cx.observe(&store, |_, _, cx| cx.notify()));
     }
-    if let Ok(store) = target.clone().downcast::<crate::sequences::SequenceStore>() {
-        return Some(cx.observe(&store, |_, _, cx| cx.notify()));
+    if let Ok(history) = target.clone().downcast::<SequenceHistory>() {
+        return Some(cx.observe(&history, |_, _, cx| cx.notify()));
     }
     target
         .downcast::<MsgEventStore>()
