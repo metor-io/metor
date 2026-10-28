@@ -86,6 +86,12 @@ pub struct ChannelStatus {
     /// The blake3 hash of the occupant's library, or zeros if nothing is
     /// loaded.
     pub hash: FrameBytes<32>,
+    /// Seconds the loaded system has run since its last reset or load. It
+    /// pauses while the channel is stopped and holds once the run ends.
+    pub elapsed: f64,
+    /// Seconds since an accepted abort, while the system winds down; zero
+    /// when no abort is in progress.
+    pub abort_elapsed: f64,
 }
 
 /// The states a channel reports in [`ChannelStatus::state`].

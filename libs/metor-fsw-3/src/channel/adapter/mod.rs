@@ -110,6 +110,7 @@ pub(crate) fn make_channel(
             abort,
             events: writer(events),
             status: writer(status),
+            clock: RunClock::default(),
         },
     }))
 }
@@ -207,6 +208,56 @@ struct Core {
     abort: Option<Output<AbortRequest>>,
     events: Output<SequenceChannelEvent>,
     status: Output<ChannelStatus>,
+    clock: RunClock,
+}
+
+/// The run and abort clocks a channel reports in its status.
+///
+/// Both count the cycles' time only while the system runs, so a stop pauses
+/// them. The run clock holds at the run's length once it ends, and a reset or
+/// load starts a fresh one. The abort clock starts at an accepted abort and
+/// goes back to zero when the run ends.
+#[derive(Default)]
+struct RunClock {
+    run: Stopwatch,
+    abort: Option<Stopwatch>,
+}
+
+impl RunClock {
+    fn abort(&mut self) {
+        self.abort.get_or_insert_default();
+    }
+
+    /// Advances to `now` and returns `(elapsed, abort_elapsed)` in seconds.
+    fn tick(&mut self, now: Timestamp, running: bool, ended: bool) -> (f64, f64) {
+        if ended {
+            self.abort = None;
+        }
+        let elapsed = self.run.advance(now, running);
+        let abort = self.abort.as_mut().map_or(0.0, |w| w.advance(now, running));
+        (elapsed, abort)
+    }
+}
+
+/// Seconds counted across the stretches something ran.
+#[derive(Default)]
+struct Stopwatch {
+    /// Seconds from the stretches before the current one.
+    banked: f64,
+    /// When the current stretch began.
+    since: Option<Timestamp>,
+}
+
+impl Stopwatch {
+    fn advance(&mut self, now: Timestamp, running: bool) -> f64 {
+        let seconds = |from: Timestamp| (now.0 - from.0) as f64 / 1e6;
+        if running {
+            self.since.get_or_insert(now);
+        } else if let Some(since) = self.since.take() {
+            self.banked += seconds(since);
+        }
+        self.banked + self.since.map_or(0.0, seconds)
+    }
 }
 
 /// Where a channel's system is.
@@ -298,6 +349,7 @@ impl Core {
         if !written {
             return SequenceEventKind::refused("the abort ring is full".into());
         }
+        self.clock.abort();
         SequenceEventKind::Progress {
             detail: "abort requested".into(),
         }
@@ -345,6 +397,7 @@ impl Core {
             inner,
             run: RunState::Stopped,
         };
+        self.clock = RunClock::default();
         Ok(())
     }
 
@@ -409,6 +462,7 @@ impl Core {
                     run: RunState::Stopped,
                 };
                 self.loaded = Some(name.clone());
+                self.clock = RunClock::default();
                 SequenceEventKind::Loaded { name }
             }
             Some(Err(error)) => {
@@ -491,6 +545,15 @@ impl Core {
     }
 
     fn write_status(&mut self, now: Timestamp) {
+        let running = matches!(
+            self.phase,
+            ChannelPhase::Live {
+                run: RunState::Running,
+                ..
+            }
+        );
+        let ended = self.ended().is_some();
+        let (elapsed, abort_elapsed) = self.clock.tick(now, running && !ended, ended);
         let occupant = self.phase.inner().and_then(|inner| inner.occupant());
         let status = ChannelStatus {
             timestamp: now,
@@ -498,6 +561,8 @@ impl Core {
             loaded: occupant.map_or(u32::MAX, |o| o.index),
             artifact: occupant.map(|o| o.artifact).unwrap_or_default(),
             hash: occupant.map(|o| o.hash).unwrap_or_default(),
+            elapsed,
+            abort_elapsed,
         };
         let _ = self.status.write(&status);
     }

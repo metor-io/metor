@@ -569,23 +569,40 @@ class ChannelTest(ConfigTest):
         params = systems["channels"]["params"]
         self.assertEqual(
             params["channels"],
-            [{"name": "nav", "available": []}, {"name": "mode", "available": ["safe", "hold"]}],
+            [
+                {
+                    "name": "nav",
+                    "available": [],
+                    "clock": "nav.channel_status.elapsed",
+                    "abort_clock": "nav.channel_status.abort_elapsed",
+                },
+                {
+                    "name": "mode",
+                    "available": ["safe", "hold"],
+                    "clock": "mode.channel_status.elapsed",
+                    "abort_clock": "mode.channel_status.abort_elapsed",
+                },
+            ],
         )
         self.assertEqual(params["period"], 50)
         self.assertEqual(systems["channels"]["ty"], "fsw.channel_registry")
 
     def test_registry_names_channel_clocks(self) -> None:
-        fsw = Target(cycle_rate=50.0)
+        fsw = Target(cycle_rate=50.0, namespace="sat")
         cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
         fsw.commands(cmds.sequence_command)
-        fsw.add("nav", Nav(), channel="nav", clock="fsw.nav.t", abort_clock="fsw.nav.abort_t")
+        fsw.add("nav", Nav(), channel="guidance")
+        fsw.add("mode", Mode(), channel="mode", clock="sat.mode.t")
         fsw.add("channels", ChannelRegistry())
         systems = {s["id"]: s for s in fsw.to_config()["coordinator"]["systems"]}
-        self.assertEqual(
-            systems["channels"]["params"]["channels"],
-            [{"name": "nav", "available": [], "clock": "fsw.nav.t", "abort_clock": "fsw.nav.abort_t"}],
-        )
-        self.assertEqual(systems["nav"]["channel"], {"name": "nav", "start": "running"})
+        nav, mode = systems["channels"]["params"]["channels"]
+        # The status clocks are named by system, not channel, under the
+        # target's namespace.
+        self.assertEqual(nav["clock"], "sat.nav.channel_status.elapsed")
+        self.assertEqual(nav["abort_clock"], "sat.nav.channel_status.abort_elapsed")
+        self.assertEqual(mode["clock"], "sat.mode.t")
+        self.assertEqual(mode["abort_clock"], "sat.mode.channel_status.abort_elapsed")
+        self.assertEqual(systems["nav"]["channel"], {"name": "guidance", "start": "running"})
 
     def test_clock_needs_a_channel(self) -> None:
         fsw = Target(cycle_rate=50.0)

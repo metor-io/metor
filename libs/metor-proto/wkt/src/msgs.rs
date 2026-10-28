@@ -723,10 +723,12 @@ pub type SequenceName = String;
 pub struct SequenceChannelSpec {
     pub name: SequenceChannelName,
     pub available: Vec<SequenceName>,
-    /// Component holding the run clock: seconds since the loaded sequence started.
+    /// Component holding the run clock: seconds the loaded sequence has run. It
+    /// pauses while the channel is stopped and holds once the run ends.
     pub clock: Option<String>,
     /// Component holding the abort clock: seconds since a commanded abort began,
-    /// counting while the sequence winds down gracefully.
+    /// counting while the sequence winds down gracefully; zero when no abort is
+    /// in progress.
     pub abort_clock: Option<String>,
 }
 

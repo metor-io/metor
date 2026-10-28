@@ -375,6 +375,80 @@ fn test_inner_panic_keeps_channel() {
     assert_eq!(shared.state(), ChannelState::Running.code());
 }
 
+/// Microseconds in `n` seconds.
+fn secs(n: i64) -> Timestamp {
+    Timestamp(n * 1_000_000)
+}
+
+/// The run and abort clocks from the latest status.
+fn clocks(shared: &Shared) -> (f64, f64) {
+    let status = shared.0.borrow().status.expect("a status");
+    (status.elapsed, status.abort_elapsed)
+}
+
+#[test]
+fn test_run_clock_pauses_while_stopped_and_resets() {
+    let (shared, mut coordinator) = build("counter", RunState::Running);
+    coordinator.step(secs(1));
+    assert_eq!(clocks(&shared), (0.0, 0.0));
+    coordinator.step(secs(3));
+    assert_eq!(clocks(&shared), (2.0, 0.0));
+
+    shared.send("ctr", SequenceCommandKind::Stop);
+    coordinator.step(secs(4));
+    coordinator.step(secs(10));
+    assert_eq!(clocks(&shared), (3.0, 0.0), "a stop pauses the clock");
+
+    shared.send("ctr", SequenceCommandKind::Start);
+    coordinator.step(secs(11));
+    coordinator.step(secs(12));
+    assert_eq!(clocks(&shared), (4.0, 0.0), "a start resumes it");
+
+    shared.send("ctr", SequenceCommandKind::Stop);
+    shared.send("ctr", SequenceCommandKind::Reset);
+    coordinator.step(secs(13));
+    assert_eq!(clocks(&shared), (0.0, 0.0), "a reset starts a fresh run");
+}
+
+#[test]
+fn test_abort_clock_counts_while_winding_down() {
+    // The counter hears the abort but keeps running, as a sequence winding
+    // down gracefully does.
+    let (shared, mut coordinator) = build("counter", RunState::Running);
+    coordinator.step(secs(1));
+    shared.send("ctr", SequenceCommandKind::Abort);
+    coordinator.step(secs(3));
+    assert_eq!(
+        clocks(&shared),
+        (2.0, 0.0),
+        "the abort clock starts at the abort"
+    );
+    coordinator.step(secs(5));
+    assert_eq!(clocks(&shared), (4.0, 2.0));
+
+    shared.send("ctr", SequenceCommandKind::Stop);
+    coordinator.step(secs(6));
+    coordinator.step(secs(9));
+    assert_eq!(clocks(&shared), (5.0, 3.0), "a stop pauses both clocks");
+}
+
+#[test]
+fn test_an_ended_run_holds_its_clock_and_clears_the_abort() {
+    let (shared, mut coordinator) = build("ticker", RunState::Running);
+    coordinator.step(secs(1));
+    coordinator.step(secs(2));
+    shared.send("ctr", SequenceCommandKind::Abort);
+    coordinator.step(secs(3));
+    assert_eq!(shared.state(), ChannelState::Aborted.code());
+    assert_eq!(clocks(&shared), (2.0, 0.0));
+    coordinator.step(secs(20));
+    assert_eq!(
+        clocks(&shared),
+        (2.0, 0.0),
+        "the run clock holds once ended"
+    );
+}
+
 #[test]
 fn test_abort_reaches_system() {
     let (shared, mut coordinator) = build("counter", RunState::Running);
