@@ -1443,12 +1443,10 @@ fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppConte
                 .into_any(),
             cx.new(|cx| Map::from_config(&MapConfig::default(), db.clone(), cx))
                 .into_any(),
-            cx.new(|cx| SamplesTable::from_config(&SamplesTableConfig::default(), db.clone(), cx))
-                .into_any(),
             cx.new(|cx| AttitudeIndicator::from_config(&AttitudeConfig::default(), db.clone(), cx))
                 .into_any(),
             cx.new(|_| VectorMarker::empty(db.clone())).into_any(),
-            cx.new(|_| crate::views::samples_table::SampleSource::empty(db.clone()))
+            cx.new(|_| crate::views::SampleSource::new(Default::default(), db.clone()))
                 .into_any(),
             cx.new(|cx| {
                 let cfg = MonitorConfig {
@@ -1529,7 +1527,7 @@ fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppConte
                 checked += 1;
             }
         }
-        assert_eq!(checked, 18, "includes both XY axes and both model inputs");
+        assert_eq!(checked, 17, "includes both XY axes and both model inputs");
     });
 }
 
@@ -1553,7 +1551,6 @@ fn widget_snapshots_preserve_expression_syntax_and_unbound_inputs(cx: &mut gpui:
             WidgetKind::meter(),
             WidgetKind::gauge(),
             WidgetKind::map(),
-            WidgetKind::samples_table(),
             WidgetKind::state_chip(),
             WidgetKind::attitude(),
         ] {

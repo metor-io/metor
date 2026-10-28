@@ -479,13 +479,13 @@ impl WidgetRegistry {
                 (480.0, 320.0),
                 |w| {
                     let cfg = parse_or_default::<SamplesTableConfig>(&w.config);
-                    subject("Samples", &cfg.component)
+                    subject("Samples", cfg.components.first().map_or("", String::as_str))
                 },
                 |cfg, db, cx| SamplesTable::from_config(&cfg, db, cx),
                 |table, cx| table.to_config(cx),
             )
             .with_tile("samples_table", |_| "Samples".into())
-            .with_live_tile_title(|table: &SamplesTable, _| table.component().clone()),
+            .with_live_tile_title(|table: &SamplesTable, _| table.title().clone()),
         );
         self.register(
             WidgetKind::image_view(),

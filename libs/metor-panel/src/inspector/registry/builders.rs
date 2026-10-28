@@ -14,6 +14,7 @@ use metor_proto::types::{ComponentId, PacketId};
 
 use crate::inspector::rows::{CommandRow, ExpressionRow, InspectorRow, NavRow, RowAction};
 use crate::plot_events::EventKindKey;
+use crate::views::SampleSource;
 use crate::views::list_plot::ListTrace;
 use crate::views::spectrogram::SpectrogramTrace;
 use crate::views::time_series::time_range::TimeRangeBehavior;
@@ -312,6 +313,26 @@ pub(super) fn build_spectrogram_trace_add_wizard(
     crate::views::spectrogram::trace_picker::select_spectrogram_trace_wizard_rows(
         db.clone(),
         Arc::new(move |trace, _w, cx| list.append(vec![trace], cx)),
+    )
+}
+
+/// Samples-table counterpart to [`build_trace_add_wizard`]: a component is
+/// added whole, so the page checks components rather than elements.
+pub(super) fn build_sample_source_add_wizard(
+    list: EntityList<SampleSource>,
+    db: &Arc<DB>,
+    _cx: &App,
+) -> Vec<Box<dyn InspectorRow>> {
+    let source_db = db.clone();
+    crate::views::samples_table::add_sources_rows(
+        db.clone(),
+        Arc::new(move |bindings, cx| {
+            let sources = bindings
+                .into_iter()
+                .map(|binding| SampleSource::new(binding, source_db.clone()))
+                .collect();
+            list.append(sources, cx);
+        }),
     )
 }
 

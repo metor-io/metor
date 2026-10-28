@@ -184,7 +184,7 @@ impl AddMenu {
                 None,
                 self.component("Samples", WidgetKind::samples_table(), |component| {
                     SamplesTableConfig {
-                        component,
+                        components: vec![component],
                         ..Default::default()
                     }
                 }),

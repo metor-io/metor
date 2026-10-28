@@ -14,11 +14,11 @@
 //! is scrolled to its top. Scrolled away, the anchor freezes and a chip
 //! counts the samples that have landed above it.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use gpui::{
-    AnyElement, Context, Entity, IntoElement, Pixels, SharedString, Task, WeakEntity, Window, div,
-    prelude::*, px,
+    AnyElement, App, Context, Entity, IntoElement, Pixels, SharedString, Task, WeakEntity, Window,
+    div, prelude::*, px,
 };
 use metor_db::time_series::{TimeSeries, TimeSeriesNodeSlice};
 use metor_db::{Component, DB};
@@ -26,20 +26,48 @@ use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use super::format::ValueFormatter;
+use super::image_view::{expands, list_expandable_components};
 use super::table::{
     CELL_PAD_X, Column, ColumnSort, HEADER_HEIGHT, ROW_HEIGHT, Table, TableDelegate,
 };
 use super::value_strip::{StripStyle, render_static_cells, resolve_metadata, strip_row_width};
+use crate::data_binding::Binding;
+use crate::inspector::rows::{
+    BoolRow, ComponentRowBuilder, ExpressionRow, InspectorRow, OnExpression, RowAction,
+    TailRowBuilder, row_base, row_label,
+};
 use crate::theme::{theme, ui_px};
 
 #[derive(Serialize, Deserialize, Clone, Default)]
-#[serde(default)]
+#[serde(from = "StoredConfig")]
 pub struct SamplesTableConfig {
-    /// A component name or the text of an `=` expression.
-    pub component: String,
-    /// Further components whose samples interleave with the first's.
-    pub more_components: Vec<String>,
+    /// Component names or the texts of `=` expressions, whose samples
+    /// interleave into one list.
+    pub components: Vec<String>,
     pub time_format: SampleTimeFormat,
+}
+
+/// The saved shape, which still reads layouts from when the table had a
+/// first component and a list of further ones.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct StoredConfig {
+    components: Vec<String>,
+    component: String,
+    more_components: Vec<String>,
+    time_format: SampleTimeFormat,
+}
+
+impl From<StoredConfig> for SamplesTableConfig {
+    fn from(stored: StoredConfig) -> Self {
+        let legacy = std::iter::once(stored.component)
+            .filter(|text| !text.is_empty())
+            .chain(stored.more_components);
+        Self {
+            components: legacy.chain(stored.components).collect(),
+            time_format: stored.time_format,
+        }
+    }
 }
 
 /// How the time column renders a sample's stamp.
@@ -107,45 +135,57 @@ impl Default for SampleClock {
     }
 }
 
-/// One bound component as the table follows it: the component once its
-/// producer registers, and a tail that refreshes the table whenever it, or
-/// an input its `=` expression replays from, gains samples.
-struct SourceSlot {
+/// One component whose samples the table lists. Editable: picking another
+/// rebinds on the next frame.
+#[derive(facet::Facet)]
+pub struct SampleSource {
+    pub source: Binding,
+    /// Display name, or the saved text until something registers it. What
+    /// the inspector's component list calls this entry.
+    #[facet(skip)]
+    name: SharedString,
+    #[facet(opaque)]
     bound: Option<ComponentId>,
+    /// The component once its producer registers.
+    #[facet(opaque)]
     data: Option<Arc<SourceData>>,
+    /// Refreshes the table whenever the component, or an input its `=`
+    /// expression replays from, gains samples.
+    #[facet(opaque)]
     _tail: Task<()>,
+    #[facet(opaque)]
+    db: Arc<DB>,
 }
 
-impl Default for SourceSlot {
-    fn default() -> Self {
+impl SampleSource {
+    pub fn new(source: Binding, db: Arc<DB>) -> Self {
         Self {
+            name: source.text(&db).into(),
+            source,
             bound: None,
             data: None,
             _tail: Task::ready(()),
+            db,
         }
     }
-}
 
-impl SourceSlot {
-    /// Resolve `binding` and follow what it names. Returns whether it named
-    /// something new.
-    fn follow<E: 'static>(
+    /// Resolve the binding and follow what it names for `table`. Driven
+    /// from the table's render, since a source is data rather than a view.
+    fn follow(
         &mut self,
-        binding: &mut crate::data_binding::Binding,
-        db: &Arc<DB>,
         table: WeakEntity<SamplesTable>,
-        cx: &mut Context<E>,
-    ) -> bool {
-        binding.resolve(db, cx);
-        let id = binding.id();
-        let moved = self.bound != Some(id);
-        if moved {
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<SourceData>> {
+        self.source.resolve(&self.db, cx);
+        let id = self.source.id();
+        if self.bound != Some(id) {
             self.bound = Some(id);
             self.data = None;
+            self.name = self.source.text(&self.db).into();
             self._tail = if id == ComponentId(0) {
                 Task::ready(())
             } else {
-                let db = db.clone();
+                let db = self.db.clone();
                 cx.spawn(async move |_, cx| {
                     let component = crate::wait_for_component(&db, id).await;
                     let Ok(plan) = table.update(cx, |_, cx| {
@@ -170,67 +210,158 @@ impl SourceSlot {
             };
         }
         if self.data.is_none() && id != ComponentId(0) {
-            let component = db.with_state(|s| s.get_component(id).cloned());
-            self.data = component.map(|component| Arc::new(SourceData::new(db, component)));
+            let component = self.db.with_state(|s| s.get_component(id).cloned());
+            self.data = component.map(|component| Arc::new(SourceData::new(&self.db, component)));
+            if let Some(data) = &self.data {
+                self.name = data.name.clone();
+            }
         }
-        moved
+        self.data.clone()
     }
 }
 
-/// A further component whose samples interleave with the first's.
-#[derive(facet::Facet)]
-pub struct SampleSource {
-    pub source: crate::data_binding::Binding,
-    #[facet(opaque)]
-    slot: SourceSlot,
-    #[facet(opaque)]
+/// The components the add page has checked, in the order they were checked.
+type Picked = Arc<Mutex<Vec<(ComponentId, SharedString)>>>;
+
+/// The add page of the table's component list, laid out like the plot's
+/// trace wizard: check any number of components and continue, or type an
+/// expression, which commits on its own as one more component. There are no
+/// element pages, since a sample row shows every element of its value.
+pub(crate) fn add_sources_rows(
     db: Arc<DB>,
+    on_add: Arc<dyn Fn(Vec<Binding>, &mut App)>,
+) -> Vec<Box<dyn InspectorRow>> {
+    let picked = Picked::default();
+    let commit_expression: OnExpression = {
+        let db = db.clone();
+        let on_add = on_add.clone();
+        Arc::new(move |id, text, _window, cx| {
+            let binding = Binding::from_legacy(id, Some(&text), &db, cx);
+            if binding.error().is_none() {
+                on_add(vec![binding], cx);
+            }
+            RowAction::Dismiss
+        })
+    };
+    let check_row: ComponentRowBuilder = {
+        let db = db.clone();
+        let picked = picked.clone();
+        Arc::new(move |id, item, _cx| {
+            expands(&db, id).then(|| source_check_row(&picked, id, item.label.clone().into()))
+        })
+    };
+    let continue_row = AddSourcesRow {
+        picked: picked.clone(),
+        db: db.clone(),
+        on_add,
+    };
+    let tail: TailRowBuilder = {
+        let continue_row = continue_row.clone();
+        Arc::new(move || {
+            let any = !continue_row.picked.lock().unwrap().is_empty();
+            (Box::new(continue_row.clone()) as Box<dyn InspectorRow>, any)
+        })
+    };
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![
+        Box::new(ExpressionRow::new(
+            db.clone(),
+            commit_expression,
+            check_row,
+            Some(tail),
+        )),
+        Box::new(continue_row),
+    ];
+    rows.extend(
+        list_expandable_components(&db)
+            .into_iter()
+            .map(|(id, name)| source_check_row(&picked, id, name.into())),
+    );
+    rows
 }
 
-impl SampleSource {
-    fn new(text: &str, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self {
-            source: crate::data_binding::Binding::from_text(text, &db, cx),
-            ..Self::empty(db)
-        }
+/// One component's checkbox on the add page. Shared by the unfiltered list
+/// and the search results, so a query changes what is offered, never what a
+/// row does.
+fn source_check_row(picked: &Picked, id: ComponentId, name: SharedString) -> Box<dyn InspectorRow> {
+    let read = picked.clone();
+    let write = picked.clone();
+    let label = name.clone();
+    Box::new(BoolRow::dynamic(
+        name,
+        Arc::new(move |_cx| read.lock().unwrap().iter().any(|(p, _)| *p == id)),
+        Arc::new(move |checked, _window, _cx| {
+            let mut picked = write.lock().unwrap();
+            picked.retain(|(p, _)| *p != id);
+            if checked {
+                picked.push((id, label.clone()));
+            }
+        }),
+    ))
+}
+
+/// The add page's pinned commit, counting what it will add.
+#[derive(Clone)]
+struct AddSourcesRow {
+    picked: Picked,
+    db: Arc<DB>,
+    on_add: Arc<dyn Fn(Vec<Binding>, &mut App)>,
+}
+
+impl InspectorRow for AddSourcesRow {
+    fn label(&self) -> &str {
+        "Continue"
     }
 
-    pub fn empty(db: Arc<DB>) -> Self {
-        Self {
-            source: crate::data_binding::Binding::default(),
-            slot: SourceSlot::default(),
-            db,
-        }
+    fn consumes_search(&self) -> bool {
+        true
     }
 
-    /// Follow the binding for `table`. Driven from the table's render, since
-    /// a source is data rather than a view.
-    fn follow(
-        &mut self,
-        table: WeakEntity<SamplesTable>,
-        cx: &mut Context<Self>,
-    ) -> Option<Arc<SourceData>> {
-        self.slot.follow(&mut self.source, &self.db, table, cx);
-        self.slot.data.clone()
+    fn render_row(
+        &self,
+        row_ix: usize,
+        selected: bool,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let text = match self.picked.lock().unwrap().len() {
+            0 => SharedString::new_static("Continue"),
+            1 => SharedString::new_static("Continue (1 component)"),
+            n => SharedString::from(format!("Continue ({n} components)")),
+        };
+        row_base(row_ix, selected, cx)
+            .child(row_label(text, theme(cx).text_primary))
+            .into_any_element()
+    }
+
+    fn activate(&mut self, _window: &mut Window, cx: &mut App) -> RowAction {
+        let picked = std::mem::take(&mut *self.picked.lock().unwrap());
+        if picked.is_empty() {
+            return RowAction::Handled;
+        }
+        let bindings = picked
+            .into_iter()
+            .map(|(id, name)| Binding::from_legacy(id, Some(&name), &self.db, cx))
+            .collect();
+        (self.on_add)(bindings, cx);
+        RowAction::Dismiss
     }
 }
 
 /// The samples pane.
 #[derive(facet::Facet)]
 pub struct SamplesTable {
-    /// The first component listed, which names the pane. Editable: picking
-    /// another rebinds on the next frame.
-    pub source: crate::data_binding::Binding,
-    pub more_components: Vec<Entity<SampleSource>>,
+    pub components: Vec<Entity<SampleSource>>,
     pub time_format: SampleTimeFormat,
-    /// Display name, or the saved text until something registers it.
+    /// The registered components' names, which name the pane.
     #[facet(skip)]
-    component: SharedString,
+    title: SharedString,
+    /// What each listed component is bound to, in list order. A change
+    /// starts the table over.
     #[facet(opaque)]
-    primary: SourceSlot,
-    /// The further components that have registered, in list order.
+    bound: Vec<ComponentId>,
+    /// The components that have registered, in list order.
     #[facet(opaque)]
-    more: Vec<Arc<SourceData>>,
+    sources: Vec<Arc<SourceData>>,
     /// The stamp row 0 is anchored to. `None` follows the live head.
     #[facet(opaque)]
     head: Option<Timestamp>,
@@ -259,23 +390,22 @@ pub struct SamplesTable {
 
 impl SamplesTable {
     pub fn from_config(cfg: &SamplesTableConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
         let table = cx.new(|_| Table::new(SamplesDelegate::new()));
-        let more_components = cfg
-            .more_components
+        let components = cfg
+            .components
             .iter()
             .map(|text| {
+                let source = Binding::from_text(text, &db, cx);
                 let db = db.clone();
-                cx.new(|cx| SampleSource::new(text, db, cx))
+                cx.new(|_| SampleSource::new(source, db))
             })
             .collect();
         let mut view = Self {
-            source,
-            more_components,
+            components,
             time_format: cfg.time_format,
-            component: SharedString::from(cfg.component.clone()),
-            primary: SourceSlot::default(),
-            more: Vec::new(),
+            title: SharedString::default(),
+            bound: Vec::new(),
+            sources: Vec::new(),
             head: None,
             selected_time: None,
             built: None,
@@ -285,15 +415,14 @@ impl SamplesTable {
             _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
         };
-        view.rebind(cx);
+        view.sync_sources(cx);
         view
     }
 
     pub fn to_config(&self, cx: &gpui::App) -> SamplesTableConfig {
         SamplesTableConfig {
-            component: self.source.text(&self.db),
-            more_components: self
-                .more_components
+            components: self
+                .components
                 .iter()
                 .map(|source| source.read(cx).source.text(&self.db))
                 .collect(),
@@ -301,14 +430,30 @@ impl SamplesTable {
         }
     }
 
-    pub fn component(&self) -> &SharedString {
-        &self.component
+    pub fn title(&self) -> &SharedString {
+        &self.title
     }
 
-    /// Start over when the inspector has re-pointed the first binding.
-    fn rebind(&mut self, cx: &mut Context<Self>) {
-        let table = cx.entity().downgrade();
-        if self.primary.follow(&mut self.source, &self.db, table, cx) {
+    /// Follow the components' bindings, starting over when the inspector
+    /// has changed what the list names, and hand the delegate the
+    /// timeline's clock.
+    fn sync_sources(&mut self, cx: &mut Context<Self>) {
+        let weak = cx.entity().downgrade();
+        let mut bound = Vec::with_capacity(self.components.len());
+        self.sources = self
+            .components
+            .clone()
+            .into_iter()
+            .filter_map(|source| {
+                source.update(cx, |source, cx| {
+                    let data = source.follow(weak.clone(), cx);
+                    bound.push(source.source.id());
+                    data
+                })
+            })
+            .collect();
+        if bound != self.bound {
+            self.bound = bound;
             self.head = None;
             self.selected_time = None;
             self.built = None;
@@ -319,21 +464,14 @@ impl SamplesTable {
                 cx.notify();
             });
         }
-        if let Some(data) = &self.primary.data {
-            self.component = data.name.clone();
-        }
-    }
-
-    /// Follow the further components' bindings, and hand the delegate the
-    /// timeline's clock.
-    fn sync_sources(&mut self, cx: &mut Context<Self>) {
-        let weak = cx.entity().downgrade();
-        self.more = self
-            .more_components
-            .clone()
-            .into_iter()
-            .filter_map(|source| source.update(cx, |source, cx| source.follow(weak.clone(), cx)))
-            .collect();
+        self.title = match self.sources.as_slice() {
+            [] => SharedString::new_static("Samples"),
+            [only] => only.name.clone(),
+            sources => {
+                let names: Vec<&str> = sources.iter().map(|s| s.name.as_ref()).collect();
+                names.join(", ").into()
+            }
+        };
         let time_format = self.time_format;
         let config = crate::temporal::config(cx);
         let origin = crate::temporal::snapshot(cx)
@@ -363,22 +501,31 @@ impl SamplesTable {
     /// follows the head while the table is at its top, so scrolling back up
     /// by hand is enough to return to live.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        let Some(primary) = &self.primary.data else {
+        if self.sources.is_empty() {
             return;
-        };
-        let sources: Vec<Arc<SourceData>> = std::iter::once(primary.clone())
-            .chain(self.more.iter().cloned())
+        }
+        let sources = self.sources.clone();
+        let histories: Vec<_> = self
+            .components
+            .iter()
+            .filter_map(|source| {
+                crate::data_binding::BoundHistory::for_binding(
+                    &source.read(cx).source,
+                    &self.db,
+                    cx,
+                )
+            })
             .collect();
-        let history = crate::data_binding::BoundHistory::for_binding(&self.source, &self.db, cx);
         let Some(latest) = sources
             .iter()
             .filter_map(|s| s.component.time_series.latest().map(|l| l.timestamp()))
             .max()
             .or_else(|| {
-                history
-                    .as_ref()
-                    .and_then(|h| h.extent())
+                histories
+                    .iter()
+                    .filter_map(|h| h.extent())
                     .map(|r| Timestamp(r.end.0.saturating_sub(1)))
+                    .max()
             })
         else {
             return;
@@ -394,31 +541,30 @@ impl SamplesTable {
             self.head = crate::temporal::view_time(cx).or(Some(latest));
         }
         let head = self.head.expect("anchored above");
-        if let Some(history) = history {
-            // Request a bounded page, even before the expression has emitted
+        if !histories.is_empty() {
+            // Request a bounded page, even before an expression has emitted
             // its first sample (for example, a windowed spectrum).
             let start = self
                 .history_start
                 .get_or_insert(Timestamp(head.0.saturating_sub(HISTORY_PAGE_US)));
             if self.table.read(cx).near_bottom()
-                && history.landed(*start..head)
-                && history.extent().is_some_and(|extent| extent.start < *start)
+                && histories.iter().all(|h| h.landed(*start..head))
+                && histories
+                    .iter()
+                    .any(|h| h.extent().is_some_and(|extent| extent.start < *start))
             {
                 // Past the oldest sample held, so a page of history already
                 // resident is skipped rather than walked a page per frame.
-                let held = history.component.time_series.start_timestamp();
+                let held = histories
+                    .iter()
+                    .filter_map(|h| h.component.time_series.start_timestamp())
+                    .min();
                 let from = held.map_or(*start, |held| held.min(*start));
                 *start = Timestamp(from.0.saturating_sub(HISTORY_PAGE_US));
             }
             let range = *start..Timestamp(head.0.saturating_add(1));
-            history.request(range.clone(), cx);
-            for source in &self.more_components {
-                let source = &source.read(cx).source;
-                if let Some(history) =
-                    crate::data_binding::BoundHistory::for_binding(source, &self.db, cx)
-                {
-                    history.request(range.clone(), cx);
-                }
+            for history in &histories {
+                history.request(range.clone(), cx);
             }
         }
         let state: Vec<_> = sources
@@ -455,7 +601,6 @@ impl SamplesTable {
 
 impl Render for SamplesTable {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.rebind(cx);
         self.sync_sources(cx);
         self.refresh(cx);
         let theme = theme(cx);
@@ -469,7 +614,7 @@ impl Render for SamplesTable {
             .text_color(theme.text_primary)
             .text_size(ui_px(12.0));
 
-        if self.source.id() == ComponentId(0) {
+        if self.bound.iter().all(|id| *id == ComponentId(0)) {
             return root.child(
                 div()
                     .flex()
@@ -477,7 +622,7 @@ impl Render for SamplesTable {
                     .items_center()
                     .justify_center()
                     .text_color(theme.text_tertiary)
-                    .child("No component"),
+                    .child("No components"),
             );
         }
 
@@ -708,7 +853,7 @@ impl Mux {
 const COL_TIME: usize = 0;
 
 /// Table delegate: the interleaved index plus how to show a stamp. Empty
-/// until the first component registers.
+/// until a component registers.
 pub struct SamplesDelegate {
     mux: Mux,
     time_format: SampleTimeFormat,
@@ -1007,7 +1152,7 @@ mod tests {
             cx.new(|cx| {
                 SamplesTable::from_config(
                     &SamplesTableConfig {
-                        component: "samples.test".into(),
+                        components: vec!["samples.test".into()],
                         ..Default::default()
                     },
                     db.clone(),
@@ -1068,19 +1213,79 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn the_add_page_adds_checked_components_in_order(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        for name in ["a.x", "b.y", "c.z"] {
+            let id = ComponentId::new(name);
+            db.with_state_mut(|state| {
+                state.insert_component(id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)
+            })
+            .unwrap();
+            let metadata = metor_proto_wkt::ComponentMetadata {
+                component_id: id,
+                name: name.to_string(),
+                metadata: Default::default(),
+            };
+            db.with_state_mut(|state| state.set_component_metadata(metadata, &db.path))
+                .unwrap();
+        }
+        let added: Arc<Mutex<Vec<String>>> = Arc::default();
+        let window = cx.add_empty_window();
+        window.update(|window, cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            let mut rows = add_sources_rows(
+                db.clone(),
+                Arc::new({
+                    let added = added.clone();
+                    let db = db.clone();
+                    move |bindings, _cx| {
+                        let mut added = added.lock().unwrap();
+                        added.extend(bindings.iter().map(|b| b.text(&db)));
+                    }
+                }),
+            );
+            let mut activate = |label: &str| {
+                rows.iter_mut()
+                    .find(|row| row.label() == label)
+                    .unwrap()
+                    .activate(window, cx)
+            };
+            assert!(matches!(activate("Continue"), RowAction::Handled));
+            activate("c.z");
+            activate("a.x");
+            activate("b.y");
+            activate("b.y");
+            assert!(matches!(activate("Continue"), RowAction::Dismiss));
+        });
+        assert_eq!(*added.lock().unwrap(), ["c.z", "a.x"]);
+    }
+
     #[test]
     fn config_round_trips() {
         let cfg = SamplesTableConfig {
-            component: "=a.b * 2".into(),
-            more_components: vec!["c.d".into()],
+            components: vec!["=a.b * 2".into(), "c.d".into()],
             time_format: SampleTimeFormat::Elapsed,
         };
         let back: SamplesTableConfig =
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(back.component, cfg.component);
-        assert_eq!(back.more_components, cfg.more_components);
+        assert_eq!(back.components, cfg.components);
         assert_eq!(back.time_format, cfg.time_format);
         let partial: SamplesTableConfig = serde_json::from_str("{}").unwrap();
-        assert!(partial.component.is_empty());
+        assert!(partial.components.is_empty());
+    }
+
+    #[test]
+    fn a_first_component_and_further_ones_load_as_one_list() {
+        let old: SamplesTableConfig = serde_json::from_str(
+            r#"{"component": "a.b", "more_components": ["c.d"], "time_format": "Utc"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.components, ["a.b", "c.d"]);
+        assert_eq!(old.time_format, SampleTimeFormat::Utc);
+        let unbound: SamplesTableConfig =
+            serde_json::from_str(r#"{"component": "", "more_components": []}"#).unwrap();
+        assert!(unbound.components.is_empty());
     }
 }

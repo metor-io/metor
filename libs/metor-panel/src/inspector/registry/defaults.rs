@@ -98,12 +98,9 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::SequenceControl>();
         self.register_inspectable::<crate::views::Map>();
         self.register_entity_list::<crate::views::SamplesTable, crate::views::SampleSource>(
-            |t| &t.more_components,
-            |t| &mut t.more_components,
-            AddBehavior::Default(Arc::new({
-                let db = db.clone();
-                move |_cx| crate::views::SampleSource::empty(db.clone())
-            })),
+            |t| &t.components,
+            |t| &mut t.components,
+            AddBehavior::Wizard(Arc::new(builders::build_sample_source_add_wizard)),
         );
         self.register_inspectable::<crate::views::Label>();
         self.register_inspectable::<crate::views::StateImage>();
