@@ -641,7 +641,6 @@ fn render_tile(
 
     let has_text = visual.label.is_some() || visual.value.is_some() || visual.first_out;
     let name = visual.name.clone();
-    let control_active = theme.control_active;
 
     div()
         .id(("annunciator-tile", visual.key as usize))
@@ -659,12 +658,9 @@ fn render_tile(
             tile.border_1().border_color(border)
         })
         .when(visual.first_out, |tile| {
-            tile.border_2().border_color(control_active).child(
-                div()
-                    .text_size(ui_px(8.0))
-                    .text_color(control_active)
-                    .child("1st"),
-            )
+            tile.border_2()
+                .border_color(border)
+                .child(div().text_size(ui_px(8.0)).text_color(text).child("1st"))
         })
         .children(visual.label.clone().map(|label| {
             div()
