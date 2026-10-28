@@ -19,7 +19,7 @@ use crate::port::Input;
 use super::{Seq, SeqError, SequenceFn};
 
 /// A sequence's body, boxed as a future.
-type Run = Pin<Box<dyn Future<Output = Result<(), SeqError>>>>;
+pub type Run = Pin<Box<dyn Future<Output = Result<(), SeqError>>>>;
 
 /// Where a sequence's body is.
 enum Body {
@@ -59,6 +59,28 @@ impl SequenceStep {
         }
     }
 
+    /// Creates a sequence whose body is made at run time from its `Seq`.
+    ///
+    /// Each cycle, unless the sequence is aborted, `refresh` runs before the
+    /// redlines are checked and the body is polled.
+    pub(crate) fn dynamic(
+        abort: Input<AbortRequest>,
+        log: LogPort,
+        dropped: Arc<AtomicU32>,
+        refresh: impl FnMut() + 'static,
+        body: impl FnOnce(Rc<Seq<'static>>) -> Run,
+    ) -> Self {
+        let seq = Rc::new(Seq::new());
+        let run = body(seq.clone());
+        Self {
+            body: Body::Running(Box::pin(run_dynamic(run, refresh, seq.clone()))),
+            seq,
+            abort: Abort::new(abort),
+            log,
+            dropped,
+        }
+    }
+
     /// How a body that returned `result` ended.
     fn end_reason(result: Result<(), SeqError>) -> EndReason {
         match result {
@@ -89,6 +111,21 @@ async fn run<S: SequenceFn>(
             samples.refresh();
         }
         seq.advance(body.as_mut(), cx)
+    })
+    .await
+}
+
+/// Runs a dynamic body, refreshing its inputs before each poll.
+async fn run_dynamic(
+    mut run: Run,
+    mut refresh: impl FnMut(),
+    seq: Rc<Seq<'static>>,
+) -> Result<(), SeqError> {
+    poll_fn(|cx| {
+        if !seq.aborted() {
+            refresh();
+        }
+        seq.advance(run.as_mut(), cx)
     })
     .await
 }

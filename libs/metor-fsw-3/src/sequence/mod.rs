@@ -96,7 +96,30 @@ use crate::system::{BindCx, InputBinding, PortDef, Ports, SystemDef};
 
 pub use redline::Redline;
 pub use seq::{NextCycle, OnAbort, Seq, SeqError, Sleep, WaitFor};
+pub use step::Run;
 pub(crate) use step::SequenceStep;
+
+/// Makes a sequence step whose body is built at run time.
+///
+/// `abort` is the sequence's `abort` input and `log` its `log` output.
+/// `dropped` counts the body's failed writes, which the step reports as one
+/// `publish_dropped` fault per cycle. Each cycle, unless the sequence is
+/// aborted, `refresh` runs before the redlines are checked and `body` is
+/// polled. `body` gets the step's `Seq`, which outlives the future.
+pub fn dynamic_step(
+    abort: Input<AbortRequest>,
+    log: crate::log::LogPort,
+    dropped: std::sync::Arc<core::sync::atomic::AtomicU32>,
+    refresh: impl FnMut() + 'static,
+    body: impl FnOnce(std::rc::Rc<Seq<'static>>) -> Run,
+) -> Box<dyn crate::coordinator::Step> {
+    Box::new(SequenceStep::dynamic(abort, log, dropped, refresh, body))
+}
+
+/// Returns the `abort` input every sequence takes first.
+pub fn abort_def(cx: &DefCx<'_>) -> PortDef {
+    Input::<AbortRequest>::def(cx, ABORT_PORT)
+}
 
 /// Adds a redline to `seq` for the rest of the enclosing block.
 ///

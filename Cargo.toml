@@ -52,6 +52,9 @@ members = [
     "libs/metor-fsw-3/macros",
     "libs/metor-fsw-3/tests/fixtures/echo-pack",
     "libs/metor-fsw-3/tests/fixtures/sync-pack",
+    "libs/metor-code/rt",
+    "libs/metor-code/rt-pack",
+    "libs/metor-code/compiler",
 ]
 exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve", "apps/metor"]
 

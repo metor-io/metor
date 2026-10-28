@@ -39,8 +39,7 @@ pub(crate) use step::StepState;
 #[cfg(feature = "host")]
 pub(crate) use step::catch_execute;
 pub use step::{EndReason, LoadError, Occupant, Step, StepCx};
-#[cfg(feature = "host")]
-pub(crate) use table::MakeFn;
+pub use table::{DefFn, DynType, MakeFn};
 #[cfg(feature = "host")]
 pub(crate) use table::TableEntry;
 pub use table::{MakeCx, SystemKind, SystemTable};

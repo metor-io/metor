@@ -1,0 +1,24 @@
+[package]
+name = "mc-rt"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "The runtime that steps compiled metor-code programs as metor-fsw-3 systems"
+
+[dependencies]
+const-fnv1a-hash = "1.1.0"
+libm = "0.2.16"
+metor-component = { workspace = true }
+metor-fsw-3 = { path = "../../metor-fsw-3", default-features = false }
+postcard = { version = "1.1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2.0"
+
+[dev-dependencies]
+metor-fsw-3 = { path = "../../metor-fsw-3" }
+zerocopy = { version = "0.8.2", features = ["derive"] }
+
+[lints]
+workspace = true

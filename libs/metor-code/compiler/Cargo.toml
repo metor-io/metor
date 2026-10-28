@@ -1,0 +1,33 @@
+[package]
+name = "metor-code"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "A compiler for metor-code, a small total language for flight software systems and sequences"
+
+[[bin]]
+name = "metor-code"
+path = "src/bin/metor-code.rs"
+
+[dependencies]
+ariadne = "=0.6.0"
+chumsky = { version = "=0.10.1", features = ["pratt"] }
+clap = { version = "4", features = ["derive"] }
+cranelift-codegen = "=0.137.0"
+cranelift-frontend = "=0.137.0"
+cranelift-jit = "=0.137.0"
+cranelift-module = "=0.137.0"
+cranelift-native = "=0.137.0"
+cranelift-object = "=0.137.0"
+mc-rt = { path = "../rt" }
+metor-fsw-3 = { path = "../../metor-fsw-3" }
+serde_json = "1"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3"
+zerocopy = { version = "0.8.2", features = ["derive"] }
+
+[lints]
+workspace = true

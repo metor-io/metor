@@ -1,0 +1,19 @@
+[package]
+name = "mc-rt-pack"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "The pack exports of a compiled metor-code library, as a static library to link with its object"
+
+# `metor-code build` links this library with the object the compiler emits,
+# which defines `mc_program`.
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+mc-rt = { path = "../rt" }
+metor-fsw-3 = { path = "../../metor-fsw-3", default-features = false }
+
+[lints]
+workspace = true

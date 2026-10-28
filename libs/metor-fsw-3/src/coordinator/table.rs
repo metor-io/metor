@@ -60,8 +60,9 @@ impl MakeCx<'_> {
     /// Opens the ring handles a cyclic system needs, leaving `inputs` and
     /// `outputs` empty.
     ///
-    /// That is one reader per input edge and one writer per output.
-    pub(crate) fn take_bindings(&mut self) -> (Vec<InputBinding>, Vec<OutputBinding>) {
+    /// That is one reader per input edge and one writer per output, in the
+    /// order of `def`'s ports.
+    pub fn take_bindings(&mut self) -> (Vec<InputBinding>, Vec<OutputBinding>) {
         let views = self
             .def
             .inputs
@@ -120,10 +121,10 @@ impl MakeCx<'_> {
 }
 
 /// Creates a system from a [`MakeCx`].
-pub(crate) type MakeFn = dyn Fn(MakeCx<'_>) -> Result<Box<dyn Step>, MakeError>;
+pub type MakeFn = dyn Fn(MakeCx<'_>) -> Result<Box<dyn Step>, MakeError>;
 
 /// Computes the definition of one system instance from its config.
-pub(crate) type DefFn = dyn Fn(&DefCx<'_>) -> Result<SystemDef, DefError>;
+pub type DefFn = dyn Fn(&DefCx<'_>) -> Result<SystemDef, DefError>;
 
 /// How the coordinator runs a registered system type.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +154,21 @@ impl SystemKind {
             },
         }
     }
+}
+
+/// A system type described by data rather than by a Rust type.
+///
+/// A runtime that reads its systems from a descriptor, such as compiled
+/// metor-code, registers each one with [`SystemTable::register_dyn`].
+pub struct DynType {
+    pub kind: SystemKind,
+    /// The ports the type always has, under [`DefCx::empty`].
+    pub def: SystemDef,
+    pub def_fn: Box<DefFn>,
+    pub doc: Cow<'static, str>,
+    /// The JSON Schema of the type's params, or `None` if it takes none.
+    pub schema: Option<Box<RawValue>>,
+    pub make: Arc<MakeFn>,
 }
 
 pub(crate) struct TableEntry {
@@ -301,6 +317,23 @@ impl SystemTable {
         self.insert(ty, entry)
     }
 
+    /// Registers a type described at run time under the name `ty`.
+    ///
+    /// `ty.def` is the definition under [`DefCx::empty`], which the pack
+    /// descriptor reports. An `Async` type is refused, since its thread
+    /// adapter needs a Rust type.
+    pub fn register_dyn(&mut self, ty: &str, dyn_ty: DynType) -> Result<(), BuildError> {
+        if dyn_ty.kind == SystemKind::Async {
+            return Err(BuildError::TypeDef {
+                ty: ty.to_string(),
+                source: DefError::Pack {
+                    message: "a dynamic type cannot be async".into(),
+                },
+            });
+        }
+        self.insert(ty, TableEntry::dynamic(dyn_ty))
+    }
+
     /// Adds an entry if its records agree with every other entry.
     ///
     /// An entry with the same name is replaced in place, so iteration order
@@ -424,6 +457,21 @@ impl PortDef {
 }
 
 impl TableEntry {
+    fn dynamic(dyn_ty: DynType) -> Self {
+        Self {
+            kind: dyn_ty.kind,
+            #[cfg(feature = "host")]
+            adapters: dyn_ty.kind.adapters(),
+            def: dyn_ty.def,
+            takes_inputs: false,
+            takes_outputs: false,
+            def_fn: dyn_ty.def_fn,
+            doc: dyn_ty.doc,
+            schema: dyn_ty.schema,
+            make: dyn_ty.make,
+        }
+    }
+
     /// Builds the table entry for a cyclic `System`.
     ///
     /// The entry's `make` binds the system's inputs and outputs to the rings it is
