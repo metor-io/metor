@@ -716,9 +716,10 @@ pub type SequenceName = String;
 /// address), the sequences that may be loaded into it, and the components that
 /// carry its state.
 ///
-/// The control system telemeters a channel's whole state as components every
-/// cycle; this entry names each of them in full, so a UI reads them like any
-/// other component and never derives a name. Commands are the only messages a
+/// The control system telemeters a channel's state as components every cycle,
+/// and writes a message component only when something happens; this entry
+/// names each of them in full, so a UI reads them like any other component and
+/// never derives a name. Commands are the only messages a
 /// UI sends, and the registry the only one besides commands it reads.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Default)]
 pub struct SequenceChannelSpec {
@@ -744,12 +745,10 @@ pub struct SequenceChannelComponents {
     pub hash: String,
     /// The commands the channel would accept now, as [`SequenceAccepts`] bits.
     pub accepts: String,
-    /// The latest thing that happened on the channel: a transition, progress,
-    /// a refused command, or why it failed.
+    /// What happened on the channel: a transition, progress, a refused
+    /// command, or why it failed. It has one sample per message, stamped when
+    /// the message was raised, so its samples are the channel's history.
     pub message: String,
-    /// When `message` was raised. A new message always moves it, so a repeated
-    /// text still reads as new.
-    pub message_at: String,
     /// Seconds the loaded sequence has run. It pauses while the channel is
     /// stopped and holds once the run ends.
     pub elapsed: String,
@@ -1517,11 +1516,11 @@ mod sequence_tests {
         assert_eq!(
             postcard::to_allocvec(&registry).unwrap(),
             // 1 channel; name "adcs" (len 4); 1 available; "detumble" (len 8);
-            // system "s"; then the nine component names, `state` "t" and the
+            // system "s"; then the eight component names, `state` "t" and the
             // rest empty.
             [
                 1, 4, b'a', b'd', b'c', b's', 1, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l', b'e',
-                1, b's', 1, b't', 0, 0, 0, 0, 0, 0, 0, 0
+                1, b's', 1, b't', 0, 0, 0, 0, 0, 0, 0
             ]
         );
 
