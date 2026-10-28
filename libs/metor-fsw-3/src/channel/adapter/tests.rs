@@ -8,7 +8,7 @@ use metor_proto_wkt::{
     SequenceAccepts, SequenceChannelState, SequenceCommand, SequenceCommandKind,
 };
 
-use crate::channel::{Abort, ChannelStatus};
+use crate::channel::{Abort, ChannelMessage, ChannelStatus};
 use crate::coordinator::{
     Adapter, BuildError, ChannelConfig, Coordinator, CoordinatorConfig, EndReason, InputConfig,
     LoadError, Occupant, RunState, Step, SystemConfig, SystemKind, SystemTable, TableEntry,
@@ -34,7 +34,7 @@ struct Seen {
     /// The end the fake slot's occupant reports.
     slot_end: Option<EndReason>,
     status: Option<ChannelStatus>,
-    /// Each message `watch` saw raised, with when.
+    /// Each message `watch` saw, with when it was raised.
     messages: Vec<(String, i64)>,
 }
 
@@ -49,10 +49,14 @@ impl Shared {
         });
     }
 
-    /// The messages raised since the last call, at most one a cycle.
+    /// The messages raised since the last call.
     fn messages(&self) -> Vec<String> {
-        let messages = std::mem::take(&mut self.0.borrow_mut().messages);
-        messages.into_iter().map(|(text, _)| text).collect()
+        self.stamped().into_iter().map(|(text, _)| text).collect()
+    }
+
+    /// The messages raised since the last call, each with its timestamp.
+    fn stamped(&self) -> Vec<(String, i64)> {
+        std::mem::take(&mut self.0.borrow_mut().messages)
     }
 
     /// The one message raised since the last call.
@@ -154,19 +158,22 @@ async fn ticker(#[state] c: &mut Counter, seq: &Seq) -> Result<(), SeqError> {
 
 struct Watch(Shared);
 
-/// Records the channel's latest status, and each new message in it.
+/// Records the channel's latest status and every message.
 #[system]
-fn watch(#[state] w: &mut Watch, channel_status: &mut Input<ChannelStatus>) {
+fn watch(
+    #[state] w: &mut Watch,
+    channel_status: &mut Input<ChannelStatus>,
+    channel_message: &mut Input<ChannelMessage>,
+) {
     let mut seen = w.0.0.borrow_mut();
-    let Ok(Some(status)) = channel_status.latest() else {
-        return;
-    };
-    let last_at = seen.status.map(|s| s.message_at);
-    let text = status.message.to_str().expect("utf-8").to_string();
-    if !text.is_empty() && last_at != Some(status.message_at) {
-        seen.messages.push((text, status.message_at));
+    for message in channel_message.drain() {
+        let message = message.expect("a message");
+        let text = message.text.to_str().expect("utf-8").to_string();
+        seen.messages.push((text, message.timestamp.0));
     }
-    seen.status = Some(*status);
+    if let Ok(Some(status)) = channel_status.latest() {
+        seen.status = Some(*status);
+    }
 }
 
 /// A step that loads `a` or `b` and reports which; `none` empties it.
@@ -279,7 +286,7 @@ fn channel(name: &str, start: RunState) -> Option<Adapter> {
 }
 
 /// A config where `cmds` commands a `ty` system behind channel `ctr`, and
-/// `watch` records the channel's status.
+/// `watch` records the channel's status and messages.
 fn config(ty: &str, start: RunState) -> CoordinatorConfig {
     let mut inputs = vec![InputConfig::new("commands", "cmds", "commands")];
     if ty == "counter" {
@@ -295,7 +302,10 @@ fn config(ty: &str, start: RunState) -> CoordinatorConfig {
                 ..SystemConfig::new("ctr", ty)
             },
             SystemConfig {
-                inputs: vec![InputConfig::new("channel_status", "ctr", "channel_status")],
+                inputs: vec![
+                    InputConfig::new("channel_status", "ctr", "channel_status"),
+                    InputConfig::new("channel_message", "ctr", "channel_message"),
+                ],
                 ..SystemConfig::new("watch", "watch")
             },
         ],
@@ -326,7 +336,6 @@ fn test_boot_running_reports_running() {
         SequenceAccepts::ABORT | SequenceAccepts::STOP
     );
     assert!(shared.messages().is_empty(), "booting raises no message");
-    assert_eq!(status.message_at, 0);
 }
 
 #[test]
@@ -340,8 +349,11 @@ fn test_stop_skips_execution() {
     coordinator.step(Timestamp(2));
     coordinator.step(Timestamp(3));
     assert!(shared.counts().is_empty());
-    assert_eq!(shared.messages(), ["stopped"]);
-    assert_eq!(shared.status().message_at, 2, "stamped with its cycle");
+    assert_eq!(
+        shared.stamped(),
+        [("stopped".to_string(), 2)],
+        "stamped with its cycle"
+    );
     assert_eq!(shared.state(), code(SequenceChannelState::Stopped));
 
     shared.send("ctr", SequenceCommandKind::Start);
@@ -460,7 +472,7 @@ fn test_inner_panic_keeps_channel() {
     coordinator.step(Timestamp(5));
     assert_eq!(shared.counts(), [1]);
     assert_eq!(shared.state(), code(SequenceChannelState::Running));
-    assert_eq!(shared.message(), "started", "the cycle's last message wins");
+    assert_eq!(shared.messages(), ["reset", "started"]);
 }
 
 /// Microseconds in `n` seconds.
@@ -551,8 +563,10 @@ fn test_abort_without_port_refused() {
     let (shared, mut coordinator) = build("plain", RunState::Running);
     shared.send("ctr", SequenceCommandKind::Abort);
     coordinator.step(Timestamp(1));
-    assert_eq!(shared.message(), "refused: the system takes no abort");
-    assert_eq!(shared.status().message_at, 1);
+    assert_eq!(
+        shared.stamped(),
+        [("refused: the system takes no abort".to_string(), 1)]
+    );
     assert_eq!(shared.state(), code(SequenceChannelState::Running));
     assert_eq!(shared.counts(), [1]);
 }
@@ -562,29 +576,45 @@ fn test_repeated_refusal_is_a_new_message() {
     let (shared, mut coordinator) = build("counter", RunState::Running);
     shared.send("ctr", SequenceCommandKind::Start);
     coordinator.step(Timestamp(1));
-    let first = shared.status();
     shared.send("ctr", SequenceCommandKind::Start);
     coordinator.step(Timestamp(2));
-    let second = shared.status();
-    assert_eq!(first.message, second.message);
-    assert_eq!(
-        second.message.to_str(),
-        Ok("refused: the channel is running")
-    );
-    assert_eq!((first.message_at, second.message_at), (1, 2));
-    assert_eq!(shared.messages().len(), 2);
+    let refused = "refused: the channel is running".to_string();
+    assert_eq!(shared.stamped(), [(refused.clone(), 1), (refused, 2)]);
 }
 
 #[test]
-fn test_message_holds_until_the_next() {
+fn test_repeated_message_in_one_cycle_is_two_records() {
+    let (shared, mut coordinator) = build("counter", RunState::Running);
+    shared.send("ctr", SequenceCommandKind::Start);
+    shared.send("ctr", SequenceCommandKind::Start);
+    coordinator.step(Timestamp(1));
+    let refused = "refused: the channel is running".to_string();
+    assert_eq!(shared.stamped(), [(refused.clone(), 1), (refused, 1)]);
+}
+
+#[test]
+fn test_each_message_in_a_cycle_is_written() {
+    let (shared, mut coordinator) = build("counter", RunState::Running);
+    shared.send("ctr", SequenceCommandKind::Reset);
+    shared.send("ctr", SequenceCommandKind::Stop);
+    coordinator.step(Timestamp(1));
+    assert_eq!(
+        shared.stamped(),
+        [
+            ("refused: the channel is running".to_string(), 1),
+            ("stopped".to_string(), 1),
+        ]
+    );
+}
+
+#[test]
+fn test_message_written_only_when_raised() {
     let (shared, mut coordinator) = build("counter", RunState::Running);
     shared.send("ctr", SequenceCommandKind::Stop);
     coordinator.step(Timestamp(1));
     coordinator.step(Timestamp(2));
     coordinator.step(Timestamp(3));
-    let status = shared.status();
-    assert_eq!(status.message.to_str(), Ok("stopped"));
-    assert_eq!(status.message_at, 1);
+    assert_eq!(shared.stamped(), [("stopped".to_string(), 1)]);
 }
 
 #[test]
@@ -637,7 +667,7 @@ fn test_reset_reapplies_load() {
     shared.send("ctr", SequenceCommandKind::Load { name: "b".into() });
     shared.send("ctr", SequenceCommandKind::Reset);
     coordinator.step(Timestamp(1));
-    assert_eq!(shared.message(), "loaded b");
+    assert_eq!(shared.messages(), ["loaded b", "loaded b"]);
     assert_eq!(shared.status().loaded, 1);
 }
 
@@ -657,7 +687,7 @@ fn test_unknown_load_keeps_occupant() {
     assert_eq!(shared.status().loaded, 0);
 }
 
-/// A message longer than the status holds is cut on a char boundary.
+/// A message longer than a record holds is cut on a char boundary.
 #[test]
 fn test_long_message_is_clipped() {
     let (shared, mut coordinator) = build("slot", RunState::Stopped);
@@ -708,7 +738,7 @@ fn test_channel_def_appends_ports() {
     let inputs: Vec<_> = def.inputs.iter().map(|p| p.name.as_ref()).collect();
     let outputs: Vec<_> = def.outputs.iter().map(|p| p.name.as_ref()).collect();
     assert_eq!(inputs, ["imu", "commands"]);
-    assert_eq!(outputs, ["channel_status"]);
+    assert_eq!(outputs, ["channel_status", "channel_message"]);
 }
 
 #[test]
@@ -835,7 +865,7 @@ fn test_completed_then_unloaded_reported() {
         },
     );
     coordinator.step(Timestamp(3));
-    assert_eq!(shared.message(), "unloaded");
+    assert_eq!(shared.messages(), ["loaded none", "unloaded"]);
     assert_eq!(shared.state(), code(SequenceChannelState::Unloaded));
 }
 
@@ -849,7 +879,12 @@ fn test_failed_run_reports_its_reason() {
     shared.0.borrow_mut().slot_end = Some(EndReason::Failed("sensor lost".into()));
     shared.send("ctr", SequenceCommandKind::Start);
     coordinator.step(Timestamp(2));
-    assert_eq!(shared.message(), "failed: sensor lost");
-    assert_eq!(shared.status().message_at, 2);
+    assert_eq!(
+        shared.stamped(),
+        [
+            ("started".to_string(), 2),
+            ("failed: sensor lost".to_string(), 2),
+        ]
+    );
     assert_eq!(shared.state(), code(SequenceChannelState::Failed));
 }

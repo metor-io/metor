@@ -12,7 +12,7 @@ use metor_fsw_3::coordinator::{BuildError, Coordinator, CoordinatorConfig, MakeE
 use metor_fsw_3::metor_proto_wkt::{LogEvent, SequenceCommand, SequenceCommandKind};
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_3::{
-    Adapter, ChannelConfig, ChannelStatus, DefCx, DlPack, Frame, Input, InputConfig, Output, Pack,
+    Adapter, ChannelConfig, ChannelMessage, DefCx, DlPack, Frame, Input, InputConfig, Output, Pack,
     PortRef, RunState, SystemConfig, SystemTable, Timestamp, system,
 };
 use serde_json::json;
@@ -106,8 +106,6 @@ struct Seen {
     lines: Vec<LogEvent>,
     /// Each message the channel raised, in order.
     messages: Vec<String>,
-    /// When the last message was raised.
-    message_at: i64,
     queue: VecDeque<SequenceCommandKind>,
     /// How many of the source's writes its ring rejected.
     refused: u32,
@@ -171,15 +169,12 @@ fn commander(#[state] c: &mut Commander, commands: &mut Output<SequenceCommand>)
 struct Watch(Shared);
 
 #[system]
-fn watch(#[state] w: &mut Watch, st: &mut Input<ChannelStatus>) {
-    let Ok(Some(status)) = st.latest() else {
-        return;
-    };
+fn watch(#[state] w: &mut Watch, msg: &mut Input<ChannelMessage>) {
     let mut seen = w.0.borrow_mut();
-    let text = status.message.to_str().expect("utf-8");
-    if status.message_at != seen.message_at && !text.is_empty() {
-        seen.messages.push(text.to_string());
-        seen.message_at = status.message_at;
+    for raised in msg.drain() {
+        let text = raised.expect("a message").text;
+        seen.messages
+            .push(text.to_str().expect("utf-8").to_string());
     }
 }
 
@@ -429,7 +424,7 @@ fn channel() -> CoordinatorConfig {
                 ..SystemConfig::new("mode", "echo.count_up")
             },
             SystemConfig {
-                inputs: vec![InputConfig::new("st", "mode", "channel_status")],
+                inputs: vec![InputConfig::new("msg", "mode", "channel_message")],
                 ..SystemConfig::new("watch", "watch")
             },
             SystemConfig {
@@ -473,7 +468,7 @@ fn sequence_completes_aborts_and_resets(pack: &Arc<Pack>) {
     // The sequence sees the abort on the same cycle it is sent, and ends on
     // that cycle.
     let messages = send(&mut coordinator, &seen, SequenceCommandKind::Abort, 1);
-    assert_eq!(messages, ["aborted"]);
+    assert_eq!(messages, ["abort requested", "aborted"]);
     assert_eq!(pings(&seen), [1]);
 
     send(&mut coordinator, &seen, SequenceCommandKind::Reset, 1);

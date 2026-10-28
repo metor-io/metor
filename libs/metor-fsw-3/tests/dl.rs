@@ -484,12 +484,12 @@ mod io {
 
 /// A guest's `Reset` waits for its ops in flight, as a host system's does.
 mod quiesce {
-    use metor_fsw_3::ChannelStatus;
     use metor_fsw_3::coordinator::{Adapter, ChannelConfig, CoordinatorConfig, RunState};
     use metor_fsw_3::io::ResourceStatus;
     use metor_fsw_3::metor_proto_wkt::{
         SequenceAccepts, SequenceChannelState, SequenceCommand, SequenceCommandKind,
     };
+    use metor_fsw_3::{ChannelMessage, ChannelStatus};
 
     use super::*;
     use crate::gps;
@@ -511,9 +511,9 @@ mod quiesce {
 
     /// Keeps each failure's message.
     #[system]
-    fn failures(#[state] seen: &mut Rc<RefCell<Vec<String>>>, st: &mut Input<ChannelStatus>) {
-        for status in st.drain().flatten() {
-            let message = status.message.to_str().unwrap_or_default();
+    fn failures(#[state] seen: &mut Rc<RefCell<Vec<String>>>, msg: &mut Input<ChannelMessage>) {
+        for raised in msg.drain().flatten() {
+            let message = raised.text.to_str().unwrap_or_default();
             if message.starts_with("failed: ") {
                 seen.borrow_mut().push(message.to_string());
             }
@@ -638,7 +638,7 @@ mod quiesce {
         let at = config.systems.iter().position(|s| s.id == "gps").unwrap();
         config.systems[at].ty = "echo.grower".into();
         config.systems.push(SystemConfig {
-            inputs: vec![InputConfig::new("st", "gps", "channel_status")],
+            inputs: vec![InputConfig::new("msg", "gps", "channel_message")],
             ..SystemConfig::new("failures", "failures")
         });
         let mut c = config.build(&table(&pack, &seen)).unwrap();

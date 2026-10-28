@@ -80,15 +80,25 @@ fn test_channel_status_layout() {
     assert!(artifact.is_string());
     let hashes = metadata.iter().filter(|m| m.name.contains("hash")).count();
     assert_eq!(hashes, 1);
-    let message = metadata
-        .iter()
-        .find(|m| m.name.ends_with("message"))
-        .expect("a message component");
-    assert!(message.is_string());
     let names: Vec<_> = metadata.iter().map(|m| m.name.as_str()).collect();
-    for field in ["accepts", "message_at"] {
-        assert!(names.iter().any(|n| n.ends_with(field)), "{names:?}");
-    }
-    let port: PortDef = Output::<ChannelStatus>::def(&DefCx::empty(), "channel_status");
+    assert!(names.iter().any(|n| n.ends_with("accepts")), "{names:?}");
+    assert!(!names.iter().any(|n| n.contains("message")), "{names:?}");
+    assert!(!names.iter().any(|n| n.contains("pad")), "{names:?}");
+    let port: PortDef = Output::<ChannelStatus>::def(&DefCx::empty(), STATUS_PORT);
     assert_eq!(port.max_len, size_of::<ChannelStatus>());
+}
+
+#[test]
+fn test_channel_message_layout() {
+    let RecordSchema::Frame { metadata, .. } = ChannelMessage::schema() else {
+        panic!("a frame")
+    };
+    let [text] = metadata.as_slice() else {
+        panic!("one component, got {metadata:?}")
+    };
+    assert!(text.name.ends_with("text"), "{}", text.name);
+    assert!(text.is_string());
+    let port: PortDef = Output::<ChannelMessage>::def(&DefCx::empty(), MESSAGE_PORT);
+    assert_eq!(port.max_len, size_of::<ChannelMessage>());
+    assert_eq!(size_of::<ChannelMessage>(), 8 + MESSAGE_LEN);
 }

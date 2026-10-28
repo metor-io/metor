@@ -2,7 +2,7 @@
 //!
 //! The adapter wraps the system's step. Each cycle it applies the commands
 //! sent to its channel, steps the system if it is running, and reports the
-//! channel's status.
+//! channel's status. Each message is written as it is raised.
 
 use std::sync::Arc;
 
@@ -25,7 +25,8 @@ use crate::thread::Threads;
 
 use super::apply::{Command, Phase, State, accepts, apply};
 use super::{
-    ABORT_PORT, AbortRequest, COMMANDS_PORT, ChannelStatus, MESSAGE_LEN, STATUS_PORT, channel_state,
+    ABORT_PORT, AbortRequest, COMMANDS_PORT, ChannelMessage, ChannelStatus, MESSAGE_PORT,
+    STATUS_PORT, channel_state,
 };
 use crate::FrameStr;
 
@@ -38,38 +39,40 @@ const ABORT_DEPTH: usize = 4;
 /// Returns the name of a system port that already uses one of the channel's
 /// port names.
 pub(crate) fn def(mut inner: SystemDef, cx: &DefCx<'_>) -> Result<SystemDef, String> {
-    let reserved = [COMMANDS_PORT, STATUS_PORT];
+    let reserved = [COMMANDS_PORT, STATUS_PORT, MESSAGE_PORT];
     let mut taken = inner.inputs.iter().chain(&inner.outputs);
     if let Some(port) = taken.find(|p| reserved.contains(&p.name.as_ref())) {
         return Err(port.name.to_string());
     }
-    let [commands, status] = channel_ports(cx);
+    let [commands, status, message] = channel_ports(cx);
     inner.inputs.push(commands);
-    inner.outputs.push(status);
+    inner.outputs.extend([status, message]);
     Ok(inner)
 }
 
 /// Returns the ports every channel adds.
 ///
-/// These are the commands input, then the status output.
-pub(crate) fn channel_ports(cx: &DefCx<'_>) -> [PortDef; 2] {
+/// These are the commands input, then the status and message outputs.
+pub(crate) fn channel_ports(cx: &DefCx<'_>) -> [PortDef; 3] {
     [
         Input::<SequenceCommand>::def(cx, COMMANDS_PORT),
         Output::<ChannelStatus>::def(cx, STATUS_PORT),
+        Output::<ChannelMessage>::def(cx, MESSAGE_PORT),
     ]
 }
 
 /// Builds a system with `make` and wraps it in `channel`.
 ///
 /// `cx.def` must be the definition [`def`] returned, so the channel's ports
-/// are the last input and the last output.
+/// are the last input and the last two outputs.
 pub(crate) fn make_channel(
     make: &Arc<MakeFn>,
     channel: &ChannelConfig,
     mut cx: MakeCx<'_>,
 ) -> Result<Box<dyn Step>, MakeError> {
-    // PANIC Safety: `def` appended one input and one output.
+    // PANIC Safety: `def` appended one input and two outputs.
     let commands = cx.inputs.pop().expect("the commands input");
+    let message = cx.outputs.pop().expect("the channel_message output");
     let status = cx.outputs.pop().expect("the channel_status output");
     let mut def = cx.def.clone();
     def.inputs.pop();
@@ -108,9 +111,8 @@ pub(crate) fn make_channel(
             threads,
             abort,
             status: writer(status),
+            message: writer(message),
             clock: RunClock::default(),
-            message: FrameStr::default(),
-            message_at: 0,
         },
     }))
 }
@@ -207,9 +209,8 @@ struct Core {
     threads: Threads,
     abort: Option<Output<AbortRequest>>,
     status: Output<ChannelStatus>,
+    message: Output<ChannelMessage>,
     clock: RunClock,
-    message: FrameStr<MESSAGE_LEN>,
-    message_at: i64,
 }
 
 /// The run and abort clocks a channel reports in its status.
@@ -544,10 +545,15 @@ impl Core {
         self.reported_end_reason = end;
     }
 
-    /// Makes `text` the channel's message, raised at `now`.
+    /// Writes `text` as a message raised at `now`.
+    ///
+    /// Every message is its own record, even several in one cycle.
     fn say(&mut self, text: &str, now: Timestamp) {
-        self.message = FrameStr::truncated(text);
-        self.message_at = now.0;
+        let message = ChannelMessage {
+            timestamp: now,
+            text: FrameStr::truncated(text),
+        };
+        let _ = self.message.write(&message);
     }
 
     /// The commands this channel would accept now. `apply` judges by phase
@@ -581,8 +587,7 @@ impl Core {
             elapsed,
             abort_elapsed,
             accepts: self.accepts().0,
-            message: self.message,
-            message_at: self.message_at,
+            _pad: 0,
         };
         let _ = self.status.write(&status);
     }

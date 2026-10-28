@@ -1,15 +1,16 @@
 //! Tests the fixture's sequence slot under `metor run` and `metor build`.
 //!
-//! Commands arrive through a `Subscribe`. The channel's status and the
-//! registry go out through a `Publish`.
+//! Commands arrive through a `Subscribe`. The channel's status, its messages,
+//! and the registry go out through a `Publish`.
 
 mod common;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
 
 use common::{Fsw, Running, dial_fsw, fixture_dir, free_ports, local, metor, ports_env, within};
-use metor_fsw_3::ChannelStatus;
+use metor_fsw_3::{ChannelMessage, ChannelStatus};
 use metor_proto::buf::Slice;
 use metor_proto::types::{IntoLenPacket, Msg, OwnedPacket, PacketId};
 use metor_proto_stellar::{PacketSink, PacketStream};
@@ -56,6 +57,10 @@ struct Downlink {
     /// The table id `mode.channel_status` arrives on.
     status_id: Option<PacketId>,
     status: Option<ChannelStatus>,
+    /// The table id `mode.channel_message` arrives on.
+    message_id: Option<PacketId>,
+    /// The messages read and not yet waited for, oldest first.
+    messages: VecDeque<ChannelMessage>,
 }
 
 impl Downlink {
@@ -65,6 +70,22 @@ impl Downlink {
             loop {
                 if let Some(status) = self.status.take_if(|status| done(status)) {
                     return status;
+                }
+                self.next().await;
+            }
+        })
+        .await
+    }
+
+    /// Reads until a message passes `done`, and returns it. Messages before
+    /// it are dropped.
+    async fn until_message(&mut self, what: &str, done: impl Fn(&str) -> bool) -> ChannelMessage {
+        within(&format!("no message: {what}"), async {
+            loop {
+                while let Some(message) = self.messages.pop_front() {
+                    if done(text(&message)) {
+                        return message;
+                    }
                 }
                 self.next().await;
             }
@@ -86,6 +107,10 @@ impl Downlink {
                 let status = ChannelStatus::read_from_bytes(&table.buf).expect("a status");
                 self.status = Some(status);
             }
+            OwnedPacket::Table(table) if Some(table.id) == self.message_id => {
+                let message = ChannelMessage::read_from_bytes(&table.buf).expect("a message");
+                self.messages.push_back(message);
+            }
             OwnedPacket::Msg(msg) if msg.id == SequenceRegistry::ID => {
                 self.registry = Some(msg.parse().expect("a registry"));
             }
@@ -97,6 +122,9 @@ impl Downlink {
                 if set.0.name.ends_with("mode.channel_status.artifact") {
                     self.artifact_is_string = set.0.is_string();
                     self.status_id = self.announced;
+                }
+                if set.0.name.ends_with("mode.channel_message.text") {
+                    self.message_id = self.announced;
                 }
             }
             _ => {}
@@ -130,8 +158,8 @@ fn load(name: &str) -> SequenceCommandKind {
     SequenceCommandKind::Load { name: name.into() }
 }
 
-fn message(status: &ChannelStatus) -> &str {
-    status.message.to_str().expect("utf-8")
+fn text(message: &ChannelMessage) -> &str {
+    message.text.to_str().expect("utf-8")
 }
 
 fn is(status: &ChannelStatus, state: SequenceChannelState) -> bool {
@@ -151,6 +179,8 @@ async fn test_slot_commanded_over_links() {
         announced: None,
         status_id: None,
         status: None,
+        message_id: None,
+        messages: VecDeque::new(),
     };
     let Fsw { tx, .. } = dial_fsw(local(ports[0])).await;
 
@@ -161,40 +191,37 @@ async fn test_slot_commanded_over_links() {
     assert!(!accepts.allows(&SequenceCommandKind::Start));
 
     send(&tx, load("count_up")).await;
-    let loaded = down
-        .until("load count_up", |s| message(s) == "loaded count_up")
+    down.until_message("load count_up", |m| m == "loaded count_up")
         .await;
+    let loaded = down.until("count_up stopped", |s| s.loaded == 0).await;
     assert!(is(&loaded, SequenceChannelState::Stopped), "{loaded:?}");
-    assert_eq!(loaded.loaded, 0);
     assert!(SequenceAccepts(loaded.accepts).allows(&SequenceCommandKind::Start));
 
     send(&tx, SequenceCommandKind::Start).await;
-    let completed = down
-        .until("complete", |s| is(s, SequenceChannelState::Completed))
+    down.until("complete", |s| is(s, SequenceChannelState::Completed))
         .await;
-    assert_eq!(message(&completed), "completed");
+    down.until_message("completed", |m| m == "completed").await;
 
     send(&tx, load("count_down")).await;
-    let loaded = down
-        .until("load count_down", |s| message(s) == "loaded count_down")
+    down.until_message("load count_down", |m| m == "loaded count_down")
         .await;
-    assert_eq!(loaded.loaded, 1);
+    down.until("count_down loaded", |s| s.loaded == 1).await;
     send(&tx, SequenceCommandKind::Start).await;
     down.until("start", |s| is(s, SequenceChannelState::Running))
         .await;
     send(&tx, SequenceCommandKind::Abort).await;
-    let aborted = down
-        .until("aborted", |s| is(s, SequenceChannelState::Aborted))
+    down.until("aborted", |s| is(s, SequenceChannelState::Aborted))
         .await;
-    assert_eq!(message(&aborted), "aborted");
+    let aborted = down.until_message("aborted", |m| m == "aborted").await;
 
     send(&tx, load("count_sideways")).await;
     let refused = down
-        .until("unknown load", |s| message(s).starts_with("refused: "))
+        .until_message("unknown load", |m| m.starts_with("refused: "))
         .await;
-    assert!(message(&refused).contains("count_sideways"), "{refused:?}");
-    assert!(is(&refused, SequenceChannelState::Aborted), "{refused:?}");
-    assert!(refused.message_at > aborted.message_at);
+    assert!(text(&refused).contains("count_sideways"), "{refused:?}");
+    assert!(refused.timestamp > aborted.timestamp);
+    let after = down.until("after the refusal", |_| true).await;
+    assert!(is(&after, SequenceChannelState::Aborted), "{after:?}");
 
     let registry = down.registry().await;
     assert_eq!(registry.channels.len(), 1);
@@ -203,7 +230,6 @@ async fn test_slot_commanded_over_links() {
     assert_eq!(channel.available, ["count_up", "count_down"]);
     assert_eq!(channel.system, "dl_slot");
     assert_eq!(channel.status.state, "mode.channel_status.state");
-    assert_eq!(channel.status.message, "mode.channel_status.message");
-    assert_eq!(channel.status.message_at, "mode.channel_status.message_at");
+    assert_eq!(channel.status.message, "mode.channel_message.text");
     assert!(down.artifact_is_string, "the artifact is announced as text");
 }

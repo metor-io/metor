@@ -168,7 +168,9 @@ class Target:
         ``thread`` runs an async system on the named thread. ``channel`` puts
         a cyclic system behind a channel with that name, so it can be started,
         stopped, and loaded by commands. This adds a ``channel_status`` output,
-        which carries the channel's whole state. ``start`` sets the channel's
+        which carries the channel's state each cycle, and a ``channel_message``
+        output, which carries each message as it is raised. ``start`` sets the
+        channel's
         state at boot: ``"running"`` (the default) or ``"stopped"``.
         """
         adapter = _adapter(thread, channel, start)

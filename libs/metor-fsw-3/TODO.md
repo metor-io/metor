@@ -88,8 +88,8 @@ accepts; a dialer connects.
 
 `channel=` wraps a cyclic system in the channel adapter, which applies
 `Start`, `Stop`, `Abort`, `Reset`, and `Load` from `SequenceCommand`
-messages and reports its whole state in a `channel_status`
-frame. `#[sequence]` async fns are polled once per cycle through a `Seq`
+messages, reports its state in a `channel_status` frame each cycle,
+and writes each message it raises as a `channel_message` frame. `#[sequence]` async fns are polled once per cycle through a `Seq`
 handle. `DlSlot` loads pack systems from a content-addressed store that
 `metor build` fills, and `ChannelRegistry` publishes the target's
 channels. Landed 2026-09-24.

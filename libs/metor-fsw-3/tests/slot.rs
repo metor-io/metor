@@ -16,8 +16,9 @@ use metor_fsw_3::dl::{WASM_TRIPLE, cdylib_name, triple, wasm_name};
 use metor_fsw_3::metor_proto_wkt::{SequenceChannelState, SequenceCommand, SequenceCommandKind};
 use metor_fsw_3::wasm::PAGE;
 use metor_fsw_3::{
-    Adapter, BuildError, ChannelConfig, ChannelStatus, Coordinator, CoordinatorConfig, DefCx,
-    DlPack, Input, InputConfig, Output, RunState, SystemConfig, SystemTable, Timestamp, system,
+    Adapter, BuildError, ChannelConfig, ChannelMessage, ChannelStatus, Coordinator,
+    CoordinatorConfig, DefCx, DlPack, Input, InputConfig, Output, RunState, SystemConfig,
+    SystemTable, Timestamp, system,
 };
 use serde_json::{Value, json};
 
@@ -53,16 +54,21 @@ fn idle(output: &mut Output<Ping>) {
 struct Watch(Shared);
 
 #[system]
-fn watch(#[state] w: &mut Watch, status: &mut Input<ChannelStatus>, pings: &mut Input<Ping>) {
+fn watch(
+    #[state] w: &mut Watch,
+    status: &mut Input<ChannelStatus>,
+    message: &mut Input<ChannelMessage>,
+    pings: &mut Input<Ping>,
+) {
     let mut seen = w.0.borrow_mut();
     let pings: Vec<u32> = pings.drain().filter_map(Result::ok).map(|p| p.n).collect();
     seen.pings.extend(pings);
+    for raised in message.drain() {
+        let text = raised.expect("a message").text;
+        seen.messages
+            .push(text.to_str().expect("utf-8").to_string());
+    }
     if let Ok(Some(status)) = status.latest() {
-        let raised = seen.status.map(|s| s.message_at) != Some(status.message_at);
-        let text = status.message.to_str().expect("utf-8");
-        if raised && !text.is_empty() {
-            seen.messages.push(text.to_string());
-        }
         seen.status = Some(*status);
     }
 }
@@ -142,6 +148,7 @@ fn config(params: Value, adapter: Option<Adapter>) -> CoordinatorConfig {
             SystemConfig {
                 inputs: vec![
                     InputConfig::new("status", "mode", "channel_status"),
+                    InputConfig::new("message", "mode", "channel_message"),
                     InputConfig::new("pings", "mode", "output"),
                 ],
                 ..SystemConfig::new("watch", "watch")
@@ -187,8 +194,7 @@ fn build(params: Value) -> (Shared, Coordinator) {
     (seen, coordinator)
 }
 
-/// Sends `commands` and runs one cycle. Returns the message it raised, if
-/// any; a cycle shows only its last.
+/// Sends `commands` and runs one cycle. Returns the messages it raised.
 fn send(
     seen: &Shared,
     coordinator: &mut Coordinator,
@@ -263,9 +269,9 @@ fn test_load_other_then_abort() {
     assert_eq!(pings(&seen), [0]);
 
     // The sequence sees the abort on the same cycle it is sent, and ends on
-    // that cycle, so its end is the cycle's message.
+    // that cycle, so its end follows the request in the same cycle.
     let messages = send(&seen, &mut coordinator, [SequenceCommandKind::Abort]);
-    assert_eq!(messages, ["aborted"]);
+    assert_eq!(messages, ["abort requested", "aborted"]);
     assert_eq!(status(&seen).state, code(SequenceChannelState::Aborted));
 }
 
@@ -360,7 +366,7 @@ fn test_candidate_grants_reach_the_guest() {
     assert!(refused(&messages, "ceiling"), "{messages:?}");
     send(&seen, &mut coordinator, [load("spin")]);
     let messages = send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
-    assert_eq!(messages, ["failed: out of fuel"]);
+    assert_eq!(messages, ["started", "failed: out of fuel"]);
 }
 
 /// A candidate whose ports differ from the slot's is rejected, and the
@@ -448,7 +454,7 @@ fn test_reset_skips_initial() {
 
     let reset = [SequenceCommandKind::Stop, SequenceCommandKind::Reset];
     let messages = send(&seen, &mut coordinator, reset);
-    assert_eq!(messages, ["loaded two"]);
+    assert_eq!(messages, ["stopped", "loaded two"]);
     assert_eq!(status(&seen).loaded, 1);
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
     assert_eq!(pings(&seen), [2]);

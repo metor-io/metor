@@ -2,8 +2,9 @@
 //!
 //! An operator starts, stops, aborts, resets, or loads a system by sending
 //! `SequenceCommand` messages addressed to its channel's name. Each cycle
-//! the channel reports its state as a [`ChannelStatus`]. A system hears
-//! abort requests through an [`Abort`] parameter.
+//! the channel reports its state as a [`ChannelStatus`], and each thing that
+//! happens on it as a [`ChannelMessage`]. A system hears abort requests
+//! through an [`Abort`] parameter.
 
 #[cfg(feature = "host")]
 mod adapter;
@@ -32,6 +33,8 @@ pub const ABORT_PORT: &str = "abort";
 pub const COMMANDS_PORT: &str = "commands";
 /// The output that a channel writes its [`ChannelStatus`] to each cycle.
 pub const STATUS_PORT: &str = "channel_status";
+/// The output that a channel writes each [`ChannelMessage`] to.
+pub const MESSAGE_PORT: &str = "channel_message";
 
 #[cfg(feature = "host")]
 pub use adapter::Channel;
@@ -91,18 +94,29 @@ pub struct ChannelStatus {
     /// The commands the channel would accept now, as
     /// [`SequenceAccepts`](metor_proto_wkt::SequenceAccepts) bits.
     pub accepts: u32,
-    /// The latest thing that happened on the channel, or empty before
-    /// anything has. Its length keeps the frame free of padding.
-    pub message: FrameStr<MESSAGE_LEN>,
-    /// The cycle `message` was raised in, as a timestamp's microseconds; an
-    /// `i64` rather than a [`Timestamp`] because only the frame's own stamp
-    /// may be one. Every message moves it, so a repeated text still reads as
-    /// new.
-    pub message_at: i64,
+    #[frame(skip)]
+    _pad: u32,
 }
 
-/// The bytes [`ChannelStatus::message`] takes, terminator included.
-pub const MESSAGE_LEN: usize = 124;
+/// Something that happened on a channel: a transition, a refused command, or
+/// how its system ended.
+///
+/// Written once per message, only when one is raised, and stamped with the
+/// cycle that raised it, so its samples are the channel's history. A repeated
+/// text is still a new sample. A cycle raises one per command it applies and
+/// one when the system ends, so its ring is as deep as the commands'.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
+#[frame(depth = 4)]
+#[repr(C)]
+pub struct ChannelMessage {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    /// What happened. Its length keeps the frame free of padding.
+    pub text: FrameStr<MESSAGE_LEN>,
+}
+
+/// The bytes [`ChannelMessage::text`] takes, terminator included.
+pub const MESSAGE_LEN: usize = 128;
 
 /// Returns a channel's state.
 ///

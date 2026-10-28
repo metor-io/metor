@@ -188,9 +188,11 @@ an adapter: a table entry whose make returns a step.
 - **Channel.** `channel=` wraps a cyclic system in a step that applies
   `SequenceCommand`s addressed to its name: `Start`, `Stop`, `Reset` (make
   the system again over the same rings), `Abort` (a record on its `abort`
-  input), and `Load`. It adds a `commands` input, an `events` output that
-  reports each accepted or refused command and how the system ended, and a
-  `channel_status` output. `fsw.commands(..)` feeds every channel, and a
+  input), and `Load`. It adds a `commands` input, a `channel_status` output
+  with the channel's state each cycle, and a `channel_message` output with
+  one record per message (each accepted or refused command, and how the
+  system ended), written only when one is raised. `fsw.commands(..)` feeds
+  every channel, and a
   `ChannelRegistry` publishes the target's channels.
 - **Slot.** A `DlSlot` is one place in the schedule that loads one of the
   pack systems its allow list names, on its channel's `Load`. Every

@@ -34,8 +34,9 @@ pub struct ChannelSpec {
     pub status: StatusComponents,
 }
 
-/// The full component name of each field of the channel's
-/// [`ChannelStatus`](super::ChannelStatus).
+/// The full component name of each component carrying the channel's state:
+/// every field of its [`ChannelStatus`](super::ChannelStatus), and its
+/// [`ChannelMessage`](super::ChannelMessage)'s text as `message`.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StatusComponents {
@@ -45,7 +46,6 @@ pub struct StatusComponents {
     pub hash: String,
     pub accepts: String,
     pub message: String,
-    pub message_at: String,
     pub elapsed: String,
     pub abort_elapsed: String,
 }
@@ -59,7 +59,6 @@ impl From<StatusComponents> for SequenceChannelComponents {
             hash: c.hash,
             accepts: c.accepts,
             message: c.message,
-            message_at: c.message_at,
             elapsed: c.elapsed,
             abort_elapsed: c.abort_elapsed,
         }
@@ -141,12 +140,10 @@ mod tests {
             "artifact",
             "hash",
             "accepts",
-            "message",
-            "message_at",
             "elapsed",
             "abort_elapsed",
         ];
-        let status: serde_json::Map<_, _> = fields
+        let mut status: serde_json::Map<_, _> = fields
             .iter()
             .map(|f| {
                 (
@@ -155,6 +152,10 @@ mod tests {
                 )
             })
             .collect();
+        status.insert(
+            "message".into(),
+            json!(format!("fsw.{name}.channel_message.text")),
+        );
         json!({ "name": name, "available": available, "system": "dl_slot", "status": status })
     }
 
@@ -188,7 +189,7 @@ mod tests {
         assert_eq!(registry.channels[0].system, "dl_slot");
         let status = &registry.channels[0].status;
         assert_eq!(status.state, "fsw.mode.channel_status.state");
-        assert_eq!(status.message_at, "fsw.mode.channel_status.message_at");
+        assert_eq!(status.message, "fsw.mode.channel_message.text");
         assert_eq!(
             status.abort_elapsed,
             "fsw.mode.channel_status.abort_elapsed"

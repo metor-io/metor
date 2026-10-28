@@ -494,6 +494,7 @@ class ChannelTest(ConfigTest):
         fsw.commands(cmds.sequence_command)
         nav = fsw.add("nav", Nav(), channel="nav")
         self.assertEqual(nav.channel_status.ref, PortRef("nav", "channel_status"))
+        self.assertEqual(nav.channel_message.ref, PortRef("nav", "channel_message"))
         with self.assertRaisesRegex(AttributeError, "events"):
             nav.events  # type: ignore[attr-defined]
         plain = fsw.add("plain", Nav())
@@ -502,6 +503,7 @@ class ChannelTest(ConfigTest):
         pub = fsw.add("pub", Publish([nav], transport=Listen("127.0.0.1:0")))
         ports = [i["port"] for i in fsw.to_config()["coordinator"]["systems"][3]["inputs"]]
         self.assertIn("nav.channel_status", ports)
+        self.assertIn("nav.channel_message", ports)
         self.assertIsNotNone(pub)
 
     def test_thread_and_channel_refused(self) -> None:
@@ -575,13 +577,13 @@ class ChannelTest(ConfigTest):
                     "name": "nav",
                     "available": [],
                     "system": "nav",
-                    "status": status_names("nav.channel_status"),
+                    "status": status_names("nav"),
                 },
                 {
                     "name": "mode",
                     "available": ["safe", "hold"],
                     "system": "dl_slot",
-                    "status": status_names("mode.channel_status"),
+                    "status": status_names("mode"),
                 },
             ],
         )
@@ -599,8 +601,9 @@ class ChannelTest(ConfigTest):
         # The status components are named by system, not channel, under the
         # target's namespace.
         self.assertEqual(nav["name"], "guidance")
-        self.assertEqual(nav["status"], status_names("sat.nav.channel_status"))
-        self.assertEqual(nav["status"]["message_at"], "sat.nav.channel_status.message_at")
+        self.assertEqual(nav["status"], status_names("sat.nav"))
+        self.assertEqual(nav["status"]["message"], "sat.nav.channel_message.text")
+        self.assertNotIn("message_at", nav["status"])
         self.assertEqual(systems["nav"]["channel"], {"name": "guidance", "start": "running"})
 
     def test_clock_kwargs_are_gone(self) -> None:
@@ -610,19 +613,20 @@ class ChannelTest(ConfigTest):
 
 
 def status_names(prefix: str) -> dict[str, str]:
-    """The registry's names for each ``channel_status`` field under ``prefix``."""
+    """The registry's names for a channel's components under ``prefix``: each
+    ``channel_status`` field, and the ``channel_message`` text as ``message``."""
     fields = [
         "state",
         "loaded",
         "artifact",
         "hash",
         "accepts",
-        "message",
-        "message_at",
         "elapsed",
         "abort_elapsed",
     ]
-    return {field: f"{prefix}.{field}" for field in fields}
+    names = {field: f"{prefix}.channel_status.{field}" for field in fields}
+    names["message"] = f"{prefix}.channel_message.text"
+    return names
 
 if __name__ == "__main__":
     unittest.main()

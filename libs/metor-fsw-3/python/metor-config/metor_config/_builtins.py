@@ -414,8 +414,6 @@ _CHANNEL_STATUS_FIELDS = (
     "artifact",
     "hash",
     "accepts",
-    "message",
-    "message_at",
     "elapsed",
     "abort_elapsed",
 )
@@ -425,13 +423,15 @@ _CHANNEL_STATUS_FIELDS = (
 def _channel_spec(channel: Any, system: System, namespace: str | None) -> dict[str, Any]:
     """Returns one registry entry: the channel, what it can load, the wrapped
     system's type, and the full component name of each field of its
-    ``channel_status``."""
-    status = ".".join(part for part in (namespace, system._name, "channel_status") if part)
+    ``channel_status``, plus ``message``, the text of its ``channel_message``."""
+    prefix = ".".join(part for part in (namespace, system._name) if part)
+    status = {field: f"{prefix}.channel_status.{field}" for field in _CHANNEL_STATUS_FIELDS}
+    status["message"] = f"{prefix}.channel_message.text"
     return {
         "name": channel.name,
         "available": system._names if isinstance(system, DlSlot) else [],
         "system": system._ty,
-        "status": {field: f"{status}.{field}" for field in _CHANNEL_STATUS_FIELDS},
+        "status": status,
     }
 
 

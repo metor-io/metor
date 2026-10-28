@@ -21,6 +21,7 @@ from ._config import ConfigError
 from ._deployment import Deployment, emit, gateway
 from ._generated import (
     CONFIG_VERSION,
+    ChannelMessage,
     ChannelStatus,
     DbStatus,
     LinkStatus,
@@ -73,6 +74,7 @@ __all__ = [
     "SimUart",
     "Tty",
     "Udp",
+    "ChannelMessage",
     "ChannelRegistry",
     "ChannelStatus",
     "DlSlot",
