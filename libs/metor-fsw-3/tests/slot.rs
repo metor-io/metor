@@ -64,9 +64,8 @@ fn watch(
     let pings: Vec<u32> = pings.drain().filter_map(Result::ok).map(|p| p.n).collect();
     seen.pings.extend(pings);
     for raised in message.drain() {
-        let text = raised.expect("a message").text;
-        seen.messages
-            .push(text.to_str().expect("utf-8").to_string());
+        let raised = raised.expect("a message");
+        seen.messages.push(raised.as_str().to_string());
     }
     if let Ok(Some(status)) = status.latest() {
         seen.status = Some(*status);
@@ -229,15 +228,11 @@ fn refused(messages: &[String], text: &str) -> bool {
     matches!(messages, [m] if m.starts_with("refused: ") && m.contains(text))
 }
 
-fn code(state: SequenceChannelState) -> u32 {
-    state.code()
-}
-
 #[test]
 fn test_load_start_complete() {
     let (seen, mut coordinator) = build(slot_params(both()));
     run(&seen, &mut coordinator, 1);
-    assert_eq!(status(&seen).state, code(SequenceChannelState::Unloaded));
+    assert_eq!(status(&seen).state, SequenceChannelState::Unloaded.code());
     assert_eq!(status(&seen).loaded, u32::MAX);
 
     let messages = send(&seen, &mut coordinator, [load("up")]);
@@ -256,7 +251,7 @@ fn test_load_start_complete() {
     let messages = run(&seen, &mut coordinator, 4);
     assert_eq!(messages, ["completed"]);
     assert_eq!(pings(&seen), [1, 2, 3]);
-    assert_eq!(status(&seen).state, code(SequenceChannelState::Completed));
+    assert_eq!(status(&seen).state, SequenceChannelState::Completed.code());
 }
 
 #[test]
@@ -272,7 +267,7 @@ fn test_load_other_then_abort() {
     // that cycle, so its end follows the request in the same cycle.
     let messages = send(&seen, &mut coordinator, [SequenceCommandKind::Abort]);
     assert_eq!(messages, ["abort requested", "aborted"]);
-    assert_eq!(status(&seen).state, code(SequenceChannelState::Aborted));
+    assert_eq!(status(&seen).state, SequenceChannelState::Aborted.code());
 }
 
 #[test]
@@ -393,7 +388,7 @@ fn test_refused_constructor_keeps_occupant() {
     let messages = send(&seen, &mut coordinator, [load("zero")]);
     assert!(refused(&messages, "`by` is zero"), "{messages:?}");
     assert_eq!(status(&seen).loaded, 0);
-    assert_eq!(status(&seen).state, code(SequenceChannelState::Stopped));
+    assert_eq!(status(&seen).state, SequenceChannelState::Stopped.code());
 
     send(&seen, &mut coordinator, [SequenceCommandKind::Start]);
     let messages = run(&seen, &mut coordinator, 4);
@@ -419,7 +414,7 @@ fn test_initial_loads_at_build() {
     let (seen, mut coordinator) = build(params);
     run(&seen, &mut coordinator, 1);
     assert_eq!(status(&seen).loaded, 1);
-    assert_eq!(status(&seen).state, code(SequenceChannelState::Stopped));
+    assert_eq!(status(&seen).state, SequenceChannelState::Stopped.code());
 }
 
 /// A bad `initial` candidate leaves the slot empty and reports why. The rest
@@ -434,11 +429,11 @@ fn test_bad_initial_fails_the_slot_only() {
         matches!(messages.as_slice(), [m] if m.starts_with("failed: ") && m.contains("zero")),
         "{messages:?}"
     );
-    assert_eq!(status(&seen).state, code(SequenceChannelState::Failed));
+    assert_eq!(status(&seen).state, SequenceChannelState::Failed.code());
 
     let messages = send(&seen, &mut coordinator, [load("up")]);
     assert_eq!(messages, ["loaded up"]);
-    assert_eq!(status(&seen).state, code(SequenceChannelState::Stopped));
+    assert_eq!(status(&seen).state, SequenceChannelState::Stopped.code());
 }
 
 /// A reset restarts the last loaded candidate, not `initial`.

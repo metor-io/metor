@@ -31,7 +31,7 @@ pub struct ChannelSpec {
     pub available: Vec<String>,
     /// The wrapped system's type.
     pub system: String,
-    pub status: StatusComponents,
+    pub components: ChannelComponents,
 }
 
 /// The full component name of each component carrying the channel's state:
@@ -39,7 +39,7 @@ pub struct ChannelSpec {
 /// [`ChannelMessage`](super::ChannelMessage)'s text as `message`.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct StatusComponents {
+pub struct ChannelComponents {
     pub state: String,
     pub loaded: String,
     pub artifact: String,
@@ -50,8 +50,8 @@ pub struct StatusComponents {
     pub abort_elapsed: String,
 }
 
-impl From<StatusComponents> for SequenceChannelComponents {
-    fn from(c: StatusComponents) -> Self {
+impl From<ChannelComponents> for SequenceChannelComponents {
+    fn from(c: ChannelComponents) -> Self {
         Self {
             state: c.state,
             loaded: c.loaded,
@@ -89,7 +89,7 @@ impl Registry {
                     name: spec.name,
                     available: spec.available,
                     system: spec.system,
-                    components: spec.status.into(),
+                    components: spec.components.into(),
                 })
                 .collect(),
         };
@@ -115,7 +115,6 @@ pub fn channel_registry(#[state] s: &mut Registry, registry: &mut Output<Sequenc
 
 #[cfg(test)]
 mod tests {
-
     use serde_json::json;
 
     use super::*;
@@ -132,7 +131,7 @@ mod tests {
         )
     }
 
-    /// A channel spec whose status components live under `fsw.{name}`.
+    /// A channel spec whose components live under `fsw.{name}`.
     fn spec(name: &str, available: &[&str]) -> serde_json::Value {
         let fields = [
             "state",
@@ -143,7 +142,7 @@ mod tests {
             "elapsed",
             "abort_elapsed",
         ];
-        let mut status: serde_json::Map<_, _> = fields
+        let mut components: serde_json::Map<_, _> = fields
             .iter()
             .map(|f| {
                 (
@@ -152,11 +151,11 @@ mod tests {
                 )
             })
             .collect();
-        status.insert(
+        components.insert(
             "message".into(),
             json!(format!("fsw.{name}.channel_message.text")),
         );
-        json!({ "name": name, "available": available, "system": "dl_slot", "status": status })
+        json!({ "name": name, "available": available, "system": "dl_slot", "components": components })
     }
 
     #[test]
@@ -187,25 +186,25 @@ mod tests {
         assert_eq!(registry.channels[0].name, "mode");
         assert_eq!(registry.channels[0].available, ["a"]);
         assert_eq!(registry.channels[0].system, "dl_slot");
-        let status = &registry.channels[0].components;
-        assert_eq!(status.state, "fsw.mode.channel_status.state");
-        assert_eq!(status.message, "fsw.mode.channel_message.text");
+        let components = &registry.channels[0].components;
+        assert_eq!(components.state, "fsw.mode.channel_status.state");
+        assert_eq!(components.message, "fsw.mode.channel_message.text");
         assert_eq!(
-            status.abort_elapsed,
+            components.abort_elapsed,
             "fsw.mode.channel_status.abort_elapsed"
         );
     }
 
     #[test]
-    fn test_refuses_incomplete_or_unknown_status() {
+    fn test_refuses_incomplete_or_unknown_components() {
         let mut partial = spec("mode", &[]);
-        partial["status"]
+        partial["components"]
             .as_object_mut()
             .expect("an object")
             .remove("message");
         assert!(make(json!({ "channels": [partial] })).is_err());
         let mut extra = spec("mode", &[]);
-        extra["status"]["clock"] = json!("fsw.mode.t");
+        extra["components"]["clock"] = json!("fsw.mode.t");
         assert!(make(json!({ "channels": [extra] })).is_err());
     }
 

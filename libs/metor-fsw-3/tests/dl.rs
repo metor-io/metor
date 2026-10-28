@@ -513,7 +513,7 @@ mod quiesce {
     #[system]
     fn failures(#[state] seen: &mut Rc<RefCell<Vec<String>>>, msg: &mut Input<ChannelMessage>) {
         for raised in msg.drain().flatten() {
-            let message = raised.text.to_str().unwrap_or_default();
+            let message = raised.as_str();
             if message.starts_with("failed: ") {
                 seen.borrow_mut().push(message.to_string());
             }

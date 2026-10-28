@@ -170,11 +170,9 @@ class Target:
         stopped, and loaded by commands. This adds a ``channel_status`` output,
         which carries the channel's state each cycle, and a ``channel_message``
         output, which carries each message as it is raised. ``start`` sets the
-        channel's
-        state at boot: ``"running"`` (the default) or ``"stopped"``.
+        channel's state at boot: ``"running"`` (the default) or ``"stopped"``.
         """
-        adapter = _adapter(thread, channel, start)
-        return self._add(self._systems, name, system, adapter)
+        return self._add(self._systems, name, system, _adapter(thread, channel, start))
 
     def sim(self, name: str, system: S) -> S:
         """Adds ``system`` as a model: a system that holds the device end of
@@ -244,10 +242,10 @@ class Target:
         """
         self._commands.extend(_sources(COMMANDS_PORT, sources))
 
-    def _channels(self) -> list[tuple[_Channel, System]]:
-        """Returns each channel's adapter and system, in step order."""
+    def _channels(self) -> list[tuple[str, System]]:
+        """Returns each channel's name and system, in step order."""
         return [
-            (entry.adapter, entry.system)
+            (entry.adapter.name, entry.system)
             for entry in self._systems
             if isinstance(entry.adapter, _Channel)
         ]
@@ -334,7 +332,7 @@ class Target:
         channels = self._channels()
         if channels and not self._commands:
             raise ConfigError(
-                f"channel `{channels[0][0].name}` has no command source; call `commands(..)`"
+                f"channel `{channels[0][0]}` has no command source; call `commands(..)`"
             )
 
     def _system(self, systems: list[_Entry], index: int) -> dict[str, Any]:
@@ -377,9 +375,7 @@ class Target:
 
 
 def _adapter(
-    thread: str | None,
-    channel: str | None,
-    start: str | None,
+    thread: str | None, channel: str | None, start: str | None
 ) -> _Thread | _Channel | None:
     """Returns a system's adapter, if it has one."""
     if thread is not None and channel is not None:

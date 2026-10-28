@@ -1,5 +1,5 @@
 use metor_fsw_3_ring::NoWake;
-use metor_proto_wkt::{SequenceChannelState, SequenceCommand, SequenceRegistry};
+use metor_proto_wkt::{SequenceCommand, SequenceRegistry};
 
 use super::*;
 use crate::def::DefCx;
@@ -51,24 +51,6 @@ fn test_abort_param_declares_port() {
 }
 
 #[test]
-fn test_channel_state_codes() {
-    assert_eq!(channel_state(RunState::Running, None).code(), 0);
-    assert_eq!(channel_state(RunState::Stopped, None).code(), 1);
-    assert_eq!(
-        channel_state(RunState::Running, Some(&EndReason::Completed)),
-        SequenceChannelState::Completed
-    );
-    assert_eq!(
-        channel_state(RunState::Stopped, Some(&EndReason::Failed("x".into()))),
-        SequenceChannelState::Failed
-    );
-    assert_eq!(
-        channel_state(RunState::Stopped, Some(&EndReason::Unloaded)).code(),
-        6
-    );
-}
-
-#[test]
 fn test_channel_status_layout() {
     let RecordSchema::Frame { metadata, .. } = ChannelStatus::schema() else {
         panic!("a frame")
@@ -82,7 +64,6 @@ fn test_channel_status_layout() {
     assert_eq!(hashes, 1);
     let names: Vec<_> = metadata.iter().map(|m| m.name.as_str()).collect();
     assert!(names.iter().any(|n| n.ends_with("accepts")), "{names:?}");
-    assert!(!names.iter().any(|n| n.contains("message")), "{names:?}");
     assert!(!names.iter().any(|n| n.contains("pad")), "{names:?}");
     let port: PortDef = Output::<ChannelStatus>::def(&DefCx::empty(), STATUS_PORT);
     assert_eq!(port.max_len, size_of::<ChannelStatus>());

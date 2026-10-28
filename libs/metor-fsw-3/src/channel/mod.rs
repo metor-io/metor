@@ -13,11 +13,9 @@ mod records;
 mod registry;
 
 use metor_fsw_3_ring::NoWake;
-use metor_proto_wkt::SequenceChannelState;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::coordinator::{EndReason, RunState};
 use crate::port::{Input, InputWake};
 use crate::{Frame, FrameBytes, FrameStr, MaxSize, Record, Schema, Timestamp};
 
@@ -41,7 +39,7 @@ pub use adapter::Channel;
 #[cfg(feature = "host")]
 pub(crate) use adapter::{channel_ports, def, make_channel};
 pub use apply::{Command, Phase, Refusal, State, accepts, apply};
-pub use registry::{ChannelSpec, Registry, RegistryParams, StatusComponents, channel_registry};
+pub use registry::{ChannelComponents, ChannelSpec, Registry, RegistryParams, channel_registry};
 
 /// A system parameter that reports whether an abort was requested.
 pub struct Abort<W: InputWake = NoWake> {
@@ -103,8 +101,10 @@ pub struct ChannelStatus {
 ///
 /// Written once per message, only when one is raised, and stamped with the
 /// cycle that raised it, so its samples are the channel's history. A repeated
-/// text is still a new sample. A cycle raises one per command it applies and
-/// one when the system ends, so its ring is as deep as the commands'.
+/// text is still a new sample. A cycle raises one per command it applies,
+/// plus one when its system ends or a deferred reset or load settles. A depth
+/// of 4, `SequenceCommand`'s own, keeps a cycle's few messages without
+/// dropping any for a reader that keeps up.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
 #[frame(depth = 4)]
 #[repr(C)]
@@ -115,24 +115,15 @@ pub struct ChannelMessage {
     pub text: FrameStr<MESSAGE_LEN>,
 }
 
-/// The bytes [`ChannelMessage::text`] takes, terminator included.
-pub const MESSAGE_LEN: usize = 128;
-
-/// Returns a channel's state.
-///
-/// If the channel has ended, this is how it ended. Otherwise it is the
-/// channel's run state.
-pub fn channel_state(run: RunState, end: Option<&EndReason>) -> SequenceChannelState {
-    match (end, run) {
-        (Some(EndReason::Completed), _) => SequenceChannelState::Completed,
-        (Some(EndReason::Aborted), _) => SequenceChannelState::Aborted,
-        (Some(EndReason::Failed(_)), _) => SequenceChannelState::Failed,
-        (Some(EndReason::Panicked), _) => SequenceChannelState::Panicked,
-        (Some(EndReason::Unloaded), _) => SequenceChannelState::Unloaded,
-        (None, RunState::Running) => SequenceChannelState::Running,
-        (None, RunState::Stopped) => SequenceChannelState::Stopped,
+impl ChannelMessage {
+    /// The message's text, or empty if it is not UTF-8.
+    pub fn as_str(&self) -> &str {
+        self.text.to_str().unwrap_or_default()
     }
 }
+
+/// The bytes [`ChannelMessage::text`] takes, terminator included.
+pub const MESSAGE_LEN: usize = 128;
 
 #[cfg(test)]
 mod tests;

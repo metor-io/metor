@@ -192,8 +192,8 @@ an adapter: a table entry whose make returns a step.
   with the channel's state each cycle, and a `channel_message` output with
   one record per message (each accepted or refused command, and how the
   system ended), written only when one is raised. `fsw.commands(..)` feeds
-  every channel, and a
-  `ChannelRegistry` publishes the target's channels.
+  every channel, and a `ChannelRegistry` publishes the target's channels
+  and names the components carrying each one's state.
 - **Slot.** A `DlSlot` is one place in the schedule that loads one of the
   pack systems its allow list names, on its channel's `Load`. Every
   candidate has the first one's ports. A failed load keeps the occupant.

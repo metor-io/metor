@@ -495,8 +495,6 @@ class ChannelTest(ConfigTest):
         nav = fsw.add("nav", Nav(), channel="nav")
         self.assertEqual(nav.channel_status.ref, PortRef("nav", "channel_status"))
         self.assertEqual(nav.channel_message.ref, PortRef("nav", "channel_message"))
-        with self.assertRaisesRegex(AttributeError, "events"):
-            nav.events  # type: ignore[attr-defined]
         plain = fsw.add("plain", Nav())
         with self.assertRaisesRegex(AttributeError, "channel_status"):
             plain.channel_status  # type: ignore[attr-defined]
@@ -577,20 +575,20 @@ class ChannelTest(ConfigTest):
                     "name": "nav",
                     "available": [],
                     "system": "nav",
-                    "status": status_names("nav"),
+                    "components": component_names("nav"),
                 },
                 {
                     "name": "mode",
                     "available": ["safe", "hold"],
                     "system": "dl_slot",
-                    "status": status_names("mode"),
+                    "components": component_names("mode"),
                 },
             ],
         )
         self.assertEqual(params["period"], 50)
         self.assertEqual(systems["channels"]["ty"], "fsw.channel_registry")
 
-    def test_registry_names_status_components(self) -> None:
+    def test_registry_names_channel_components(self) -> None:
         fsw = Target(cycle_rate=50.0, namespace="sat")
         cmds = fsw.add("cmds", Subscribe([SequenceCommand], transport=Listen("127.0.0.1:0")))
         fsw.commands(cmds.sequence_command)
@@ -598,21 +596,15 @@ class ChannelTest(ConfigTest):
         fsw.add("channels", ChannelRegistry())
         systems = {s["id"]: s for s in fsw.to_config()["coordinator"]["systems"]}
         [nav] = systems["channels"]["params"]["channels"]
-        # The status components are named by system, not channel, under the
+        # The components are named by system, not channel, under the
         # target's namespace.
         self.assertEqual(nav["name"], "guidance")
-        self.assertEqual(nav["status"], status_names("sat.nav"))
-        self.assertEqual(nav["status"]["message"], "sat.nav.channel_message.text")
-        self.assertNotIn("message_at", nav["status"])
+        self.assertEqual(nav["components"], component_names("sat.nav"))
+        self.assertEqual(nav["components"]["message"], "sat.nav.channel_message.text")
         self.assertEqual(systems["nav"]["channel"], {"name": "guidance", "start": "running"})
 
-    def test_clock_kwargs_are_gone(self) -> None:
-        fsw = Target(cycle_rate=50.0)
-        with self.assertRaises(TypeError):
-            fsw.add("nav", Nav(), channel="nav", clock="fsw.nav.t")  # type: ignore[call-arg]
 
-
-def status_names(prefix: str) -> dict[str, str]:
+def component_names(prefix: str) -> dict[str, str]:
     """The registry's names for a channel's components under ``prefix``: each
     ``channel_status`` field, and the ``channel_message`` text as ``message``."""
     fields = [
@@ -627,6 +619,7 @@ def status_names(prefix: str) -> dict[str, str]:
     names = {field: f"{prefix}.channel_status.{field}" for field in fields}
     names["message"] = f"{prefix}.channel_message.text"
     return names
+
 
 if __name__ == "__main__":
     unittest.main()

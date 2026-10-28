@@ -83,7 +83,7 @@ impl Downlink {
         within(&format!("no message: {what}"), async {
             loop {
                 while let Some(message) = self.messages.pop_front() {
-                    if done(text(&message)) {
+                    if done(message.as_str()) {
                         return message;
                     }
                 }
@@ -158,10 +158,6 @@ fn load(name: &str) -> SequenceCommandKind {
     SequenceCommandKind::Load { name: name.into() }
 }
 
-fn text(message: &ChannelMessage) -> &str {
-    message.text.to_str().expect("utf-8")
-}
-
 fn is(status: &ChannelStatus, state: SequenceChannelState) -> bool {
     status.state == state.code()
 }
@@ -218,7 +214,7 @@ async fn test_slot_commanded_over_links() {
     let refused = down
         .until_message("unknown load", |m| m.starts_with("refused: "))
         .await;
-    assert!(text(&refused).contains("count_sideways"), "{refused:?}");
+    assert!(refused.as_str().contains("count_sideways"), "{refused:?}");
     assert!(refused.timestamp > aborted.timestamp);
     let after = down.until("after the refusal", |_| true).await;
     assert!(is(&after, SequenceChannelState::Aborted), "{after:?}");

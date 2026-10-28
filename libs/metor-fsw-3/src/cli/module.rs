@@ -54,13 +54,11 @@ fn channel_ports() -> [(&'static str, RecordClass); 2] {
 
 /// The records whose class name is their Rust type's, not their name in
 /// Pascal case.
-fn named_records() -> [RecordClass; 5] {
+fn named_records() -> [RecordClass; 3] {
     [
         RecordClass::of::<LogEvent>(),
         RecordClass::of::<SystemStatus>(),
         RecordClass::of::<ResourceStatus>(),
-        RecordClass::of::<SequenceCommand>(),
-        RecordClass::of::<ChannelStatus>(),
     ]
 }
 

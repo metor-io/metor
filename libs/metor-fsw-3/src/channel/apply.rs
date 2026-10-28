@@ -1,6 +1,6 @@
 //! The rules for which commands a channel accepts in each state.
 
-use metor_proto_wkt::{SequenceAccepts, SequenceCommandKind};
+use metor_proto_wkt::{SequenceAccepts, SequenceChannelState, SequenceCommandKind};
 
 /// Where a channel is, as [`apply`] sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,12 +12,30 @@ pub enum Phase {
     Quiescing,
 }
 
+impl Phase {
+    /// The phase of a channel reporting `state`.
+    pub fn of(state: SequenceChannelState) -> Self {
+        match state {
+            SequenceChannelState::Running => Self::Running,
+            SequenceChannelState::Stopped => Self::Stopped,
+            SequenceChannelState::Quiescing => Self::Quiescing,
+            SequenceChannelState::Completed
+            | SequenceChannelState::Aborted
+            | SequenceChannelState::Failed
+            | SequenceChannelState::Panicked
+            | SequenceChannelState::Unloaded => Self::Ended,
+        }
+    }
+}
+
 /// The parts of a channel's state that [`apply`] checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct State {
     pub phase: Phase,
     /// Whether the system has an `abort` input.
     pub abortable: bool,
+    /// Whether the system exists and its step loads systems.
+    pub loadable: bool,
 }
 
 /// A channel command, without its payload.
@@ -77,6 +95,8 @@ pub enum Refusal {
     NotAbortable,
     #[error("the system is quiescing")]
     Quiescing,
+    #[error("nothing can be loaded; a system that is gone needs a reset first")]
+    NotLoadable,
 }
 
 /// Checks whether a channel in `state` accepts `command`.
@@ -92,6 +112,7 @@ pub fn apply(state: State, command: Command) -> Result<(), Refusal> {
         (Phase::Running, Command::Start | Command::Reset | Command::Load) => Err(Refusal::Running),
         (Phase::Stopped, Command::Stop | Command::Abort) => Err(Refusal::NotRunning),
         (Phase::Running, Command::Abort) if !state.abortable => Err(Refusal::NotAbortable),
+        (_, Command::Load) if !state.loadable => Err(Refusal::NotLoadable),
         _ => Ok(()),
     }
 }
@@ -113,6 +134,7 @@ mod tests {
         State {
             phase,
             abortable: true,
+            loadable: true,
         }
     }
 
@@ -169,6 +191,31 @@ mod tests {
     }
 
     #[test]
+    fn test_load_needs_a_loading_step() {
+        let stopped = State {
+            loadable: false,
+            ..state(Phase::Stopped)
+        };
+        assert_eq!(accepted(stopped), [Command::Start, Command::Reset]);
+        assert_eq!(apply(stopped, Command::Load), Err(Refusal::NotLoadable));
+        let ended = State {
+            loadable: false,
+            ..state(Phase::Ended)
+        };
+        assert_eq!(accepted(ended), [Command::Reset]);
+    }
+
+    #[test]
+    fn test_phase_of_channel_state() {
+        assert_eq!(Phase::of(SequenceChannelState::Running), Phase::Running);
+        assert_eq!(Phase::of(SequenceChannelState::Stopped), Phase::Stopped);
+        assert_eq!(Phase::of(SequenceChannelState::Quiescing), Phase::Quiescing);
+        assert_eq!(Phase::of(SequenceChannelState::Unloaded), Phase::Ended);
+    }
+
+    /// A channel publishes `accepts` as is, so its bits are exactly the
+    /// commands `apply` lets through, in every state.
+    #[test]
     fn test_accepts_matches_apply() {
         for phase in [
             Phase::Running,
@@ -176,8 +223,14 @@ mod tests {
             Phase::Ended,
             Phase::Quiescing,
         ] {
-            for abortable in [true, false] {
-                let state = State { phase, abortable };
+            for (abortable, loadable) in
+                [(true, true), (true, false), (false, true), (false, false)]
+            {
+                let state = State {
+                    phase,
+                    abortable,
+                    loadable,
+                };
                 let bits = accepts(state);
                 for command in Command::ALL {
                     assert_eq!(
@@ -236,18 +289,26 @@ mod proofs {
         State {
             phase,
             abortable: kani::any(),
+            loadable: kani::any(),
         }
     }
 
     /// A live channel accepts only `Stop` and `Abort`, and a channel that is
     /// not live never accepts them. So `Reset` and `Load` never apply to a
-    /// running system. A quiescing channel accepts only `Stop` and `Reset`.
+    /// running system. A quiescing channel accepts only `Stop` and `Reset`,
+    /// and `Load` is accepted only where the step loads. The published
+    /// `accepts` bits are the commands accepted here.
     #[kani::proof]
     fn test_live_channel_transitions() {
         let state = any_state();
         let command = any_command();
         let live = state.phase == Phase::Running;
-        if apply(state, command).is_ok() {
+        let accepted = apply(state, command).is_ok();
+        assert_eq!(accepts(state).0 & command.bit() != 0, accepted);
+        if command == Command::Load && accepted {
+            assert!(state.loadable);
+        }
+        if accepted {
             if state.phase == Phase::Quiescing {
                 assert!(matches!(command, Command::Stop | Command::Reset));
                 return;

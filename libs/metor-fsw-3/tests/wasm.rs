@@ -172,9 +172,8 @@ struct Watch(Shared);
 fn watch(#[state] w: &mut Watch, msg: &mut Input<ChannelMessage>) {
     let mut seen = w.0.borrow_mut();
     for raised in msg.drain() {
-        let text = raised.expect("a message").text;
-        seen.messages
-            .push(text.to_str().expect("utf-8").to_string());
+        let raised = raised.expect("a message");
+        seen.messages.push(raised.as_str().to_string());
     }
 }
 
