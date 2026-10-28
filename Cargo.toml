@@ -55,6 +55,7 @@ members = [
     "libs/metor-code/rt",
     "libs/metor-code/rt-pack",
     "libs/metor-code/compiler",
+    "examples/metor-code-stand/systems/stand-io",
 ]
 exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve", "apps/metor"]
 

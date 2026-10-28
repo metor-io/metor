@@ -1,0 +1,10 @@
+[project]
+name = "metor-code-stand"
+version = "0.1.0"
+description = "A test stand whose leak check and heater controller are metor-code"
+requires-python = ">=3.11"
+dependencies = ["stand-io", "metor-config"]
+
+[tool.uv.sources]
+stand-io = { path = "systems/stand-io", editable = true }
+metor-config = { path = "../../libs/metor-fsw-3/python/metor-config", editable = true }

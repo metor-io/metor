@@ -14321,6 +14321,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "stand-io-pack"
+version = "0.14.2"
+dependencies = [
+ "metor-fsw-3",
+ "schemars 1.2.1",
+ "serde",
+ "zerocopy",
+]
+
+[[package]]
 name = "startracker-sim-3"
 version = "0.14.2"
 dependencies = [

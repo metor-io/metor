@@ -1,0 +1,19 @@
+# The stand_io pack. `metor run` and `metor code build` build it with
+# `metor pack dev`, which writes the typed module and the host library to
+# `.metor/stand_io/`.
+
+[project]
+name = "stand-io"
+version = "0.1.0"
+description = "A simulated pressure chamber and a monitor for the metor-code-stand example"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["metor-build"]
+build-backend = "metor_build"
+
+[tool.metor.pack]
+id = "stand_io"
+
+[tool.uv.sources]
+metor-build = { path = "../../../../libs/metor-fsw-3/python/metor-build" }
