@@ -1448,6 +1448,8 @@ fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppConte
             cx.new(|cx| AttitudeIndicator::from_config(&AttitudeConfig::default(), db.clone(), cx))
                 .into_any(),
             cx.new(|_| VectorMarker::empty(db.clone())).into_any(),
+            cx.new(|_| crate::views::samples_table::SampleSource::empty(db.clone()))
+                .into_any(),
             cx.new(|cx| {
                 let cfg = MonitorConfig {
                     component: "rpm".into(),
@@ -1527,7 +1529,7 @@ fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppConte
                 checked += 1;
             }
         }
-        assert_eq!(checked, 17, "includes both XY axes and both model inputs");
+        assert_eq!(checked, 18, "includes both XY axes and both model inputs");
     });
 }
 

@@ -25,8 +25,7 @@ use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use super::binding::component_name;
-use super::format::{ValueFormatter, format_time};
+use super::format::ValueFormatter;
 use super::table::{
     CELL_PAD_X, Column, ColumnSort, HEADER_HEIGHT, ROW_HEIGHT, Table, TableDelegate,
 };
@@ -47,12 +46,13 @@ pub struct SamplesTableConfig {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, facet::Facet)]
 #[repr(u8)]
 pub enum SampleTimeFormat {
-    /// `HH:MM:SS.mmm` in the machine's timezone.
+    /// `HH:MM:SS.mmm` in the timeline's timezone, the one the time controls
+    /// show.
     #[default]
     Local,
     /// `HH:MM:SS.mmm` in UTC.
     Utc,
-    /// Full date and time in the machine's timezone.
+    /// Full date and time in the timeline's timezone.
     DateTime,
     /// Offset from the timeline's T0, as the time controls show it.
     Elapsed,
@@ -61,20 +61,17 @@ pub enum SampleTimeFormat {
 }
 
 impl SampleTimeFormat {
-    fn format(self, t: Timestamp, origin: Option<Timestamp>) -> String {
-        let zoned = |zone: jiff::tz::TimeZone, pattern: &str| {
+    fn format(self, t: Timestamp, clock: &SampleClock) -> String {
+        let zoned = |zone: &jiff::tz::TimeZone, pattern: &str| {
             jiff::Timestamp::from_microsecond(t.0)
-                .map(|ts| ts.to_zoned(zone).strftime(pattern).to_string())
+                .map(|ts| ts.to_zoned(zone.clone()).strftime(pattern).to_string())
                 .unwrap_or_else(|_| t.0.to_string())
         };
         match self {
-            Self::Local => format_time(t.0),
-            Self::Utc => zoned(jiff::tz::TimeZone::UTC, "%H:%M:%S%.3f"),
-            Self::DateTime => zoned(jiff::tz::TimeZone::system(), "%Y-%m-%d %H:%M:%S%.3f"),
-            Self::Elapsed => origin.map_or_else(
-                || "T0 unavailable".into(),
-                |zero| crate::temporal::display::elapsed(t, zero),
-            ),
+            Self::Local => zoned(&clock.zone, "%H:%M:%S%.3f"),
+            Self::Utc => zoned(&jiff::tz::TimeZone::UTC, "%H:%M:%S%.3f"),
+            Self::DateTime => zoned(&clock.zone, "%Y-%m-%d %H:%M:%S%.3f"),
+            Self::Elapsed => crate::temporal::display::elapsed_or_unavailable(t, clock.origin),
             Self::Micros => t.0.to_string(),
         }
     }
@@ -92,21 +89,102 @@ impl SampleTimeFormat {
 /// How far back each page of requested history reaches.
 const HISTORY_PAGE_US: i64 = 60_000_000;
 
+/// The timeline's clock settings the time column follows: its zone, named as
+/// the time controls name it, and T0 for [`SampleTimeFormat::Elapsed`].
+struct SampleClock {
+    timezone: String,
+    zone: jiff::tz::TimeZone,
+    origin: Option<Timestamp>,
+}
+
+impl Default for SampleClock {
+    fn default() -> Self {
+        Self {
+            timezone: "local".into(),
+            zone: jiff::tz::TimeZone::system(),
+            origin: None,
+        }
+    }
+}
+
+/// One bound component as the table follows it: the component once its
+/// producer registers, and a tail that refreshes the table whenever it, or
+/// an input its `=` expression replays from, gains samples.
+struct SourceSlot {
+    bound: Option<ComponentId>,
+    data: Option<Arc<SourceData>>,
+    _tail: Task<()>,
+}
+
+impl Default for SourceSlot {
+    fn default() -> Self {
+        Self {
+            bound: None,
+            data: None,
+            _tail: Task::ready(()),
+        }
+    }
+}
+
+impl SourceSlot {
+    /// Resolve `binding` and follow what it names. Returns whether it named
+    /// something new.
+    fn follow<E: 'static>(
+        &mut self,
+        binding: &mut crate::data_binding::Binding,
+        db: &Arc<DB>,
+        table: WeakEntity<SamplesTable>,
+        cx: &mut Context<E>,
+    ) -> bool {
+        binding.resolve(db, cx);
+        let id = binding.id();
+        let moved = self.bound != Some(id);
+        if moved {
+            self.bound = Some(id);
+            self.data = None;
+            self._tail = if id == ComponentId(0) {
+                Task::ready(())
+            } else {
+                let db = db.clone();
+                cx.spawn(async move |_, cx| {
+                    let component = crate::wait_for_component(&db, id).await;
+                    let Ok(plan) = table.update(cx, |_, cx| {
+                        crate::dynamic::expressions::replay_plan(id, &db, cx)
+                    }) else {
+                        return;
+                    };
+                    let watched: Vec<Component> = std::iter::once(component)
+                        .chain(plan.into_iter().flat_map(|p| p.ports))
+                        .collect();
+                    loop {
+                        if table.update(cx, |view, cx| view.refresh(cx)).is_err() {
+                            return;
+                        }
+                        let mut waits: Vec<_> = watched
+                            .iter()
+                            .map(|c| Box::pin(c.time_series.wait()))
+                            .collect();
+                        crate::first_ready(&mut waits).await;
+                    }
+                })
+            };
+        }
+        if self.data.is_none() && id != ComponentId(0) {
+            let component = db.with_state(|s| s.get_component(id).cloned());
+            self.data = component.map(|component| Arc::new(SourceData::new(db, component)));
+        }
+        moved
+    }
+}
+
 /// A further component whose samples interleave with the first's.
 #[derive(facet::Facet)]
 pub struct SampleSource {
     pub source: crate::data_binding::Binding,
-    /// What the tail is bound to, compared against the binding on each of
-    /// the table's frames.
     #[facet(opaque)]
-    bound: Option<ComponentId>,
-    /// Resolved once the producer registers.
-    #[facet(opaque)]
-    data: Option<Arc<SourceData>>,
+    slot: SourceSlot,
     #[facet(opaque)]
     db: Arc<DB>,
-    #[facet(opaque)]
-    _tail: Task<()>,
 }
 
 impl SampleSource {
@@ -120,67 +198,36 @@ impl SampleSource {
     pub fn empty(db: Arc<DB>) -> Self {
         Self {
             source: crate::data_binding::Binding::default(),
-            bound: None,
-            data: None,
+            slot: SourceSlot::default(),
             db,
-            _tail: Task::ready(()),
         }
     }
 
-    /// Follow the binding, and refresh `table` as this component grows.
-    /// Driven from the table's render, since a source is data rather than a
-    /// view.
-    fn rebind(
+    /// Follow the binding for `table`. Driven from the table's render, since
+    /// a source is data rather than a view.
+    fn follow(
         &mut self,
         table: WeakEntity<SamplesTable>,
         cx: &mut Context<Self>,
     ) -> Option<Arc<SourceData>> {
-        self.source.resolve(&self.db, cx);
-        let id = self.source.id();
-        if self.bound != Some(id) {
-            self.bound = Some(id);
-            self.data = None;
-            let db = self.db.clone();
-            self._tail = if id == ComponentId(0) {
-                Task::ready(())
-            } else {
-                cx.spawn(async move |_, cx| {
-                    let component = crate::wait_for_component(&db, id).await;
-                    loop {
-                        if table.update(cx, |view, cx| view.refresh(cx)).is_err() {
-                            return;
-                        }
-                        component.time_series.wait().await;
-                    }
-                })
-            };
-        }
-        if self.data.is_none() && id != ComponentId(0) {
-            let component = self.db.with_state(|s| s.get_component(id).cloned());
-            self.data = component.map(|component| Arc::new(SourceData::new(&self.db, component)));
-        }
-        self.data.clone()
+        self.slot.follow(&mut self.source, &self.db, table, cx);
+        self.slot.data.clone()
     }
 }
 
 /// The samples pane.
 #[derive(facet::Facet)]
 pub struct SamplesTable {
-    /// The component whose samples are listed. Editable: picking another
-    /// rebinds on the next frame.
+    /// The first component listed, which names the pane. Editable: picking
+    /// another rebinds on the next frame.
     pub source: crate::data_binding::Binding,
     pub more_components: Vec<Entity<SampleSource>>,
     pub time_format: SampleTimeFormat,
     /// Display name, or the saved text until something registers it.
     #[facet(skip)]
     component: SharedString,
-    /// What the tail task is bound to, compared against `component_id`
-    /// each frame.
     #[facet(opaque)]
-    bound: Option<ComponentId>,
-    /// The first component, once its producer has registered.
-    #[facet(opaque)]
-    primary: Option<Arc<SourceData>>,
+    primary: SourceSlot,
     /// The further components that have registered, in list order.
     #[facet(opaque)]
     more: Vec<Arc<SourceData>>,
@@ -193,16 +240,11 @@ pub struct SamplesTable {
     /// the index was built against.
     #[facet(opaque)]
     built: Option<(Timestamp, Vec<(ComponentId, Option<Timestamp>, u64)>)>,
-    #[facet(opaque)]
-    history_task: gpui::Task<()>,
-    /// Oldest stamp of the history page requested so far. Reaching the
-    /// bottom of the table pushes it back a page.
+    /// Oldest stamp of the history page requested so far. Near the bottom
+    /// of the table, once that page has landed, it moves a page past the
+    /// oldest sample held.
     #[facet(opaque)]
     history_start: Option<Timestamp>,
-    /// Whether the last refresh saw the table near its bottom, so paging
-    /// back happens once per arrival there rather than every frame.
-    #[facet(skip)]
-    was_near_bottom: bool,
     /// Samples newer than the anchor, shown while the reader is scrolled
     /// away from the top.
     #[facet(skip)]
@@ -212,9 +254,7 @@ pub struct SamplesTable {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    _binding_changes: gpui::Task<()>,
-    #[facet(opaque)]
-    _task: Task<()>,
+    _binding_changes: Task<()>,
 }
 
 impl SamplesTable {
@@ -234,20 +274,16 @@ impl SamplesTable {
             more_components,
             time_format: cfg.time_format,
             component: SharedString::from(cfg.component.clone()),
-            bound: None,
-            primary: None,
+            primary: SourceSlot::default(),
             more: Vec::new(),
             head: None,
             selected_time: None,
             built: None,
-            history_task: gpui::Task::ready(()),
             history_start: None,
-            was_near_bottom: false,
             newer: 0,
             table,
             _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
-            _task: Task::ready(()),
         };
         view.rebind(cx);
         view
@@ -269,83 +305,55 @@ impl SamplesTable {
         &self.component
     }
 
-    /// Restart the tail when the inspector has re-pointed the binding.
+    /// Start over when the inspector has re-pointed the first binding.
     fn rebind(&mut self, cx: &mut Context<Self>) {
-        self.source.resolve(&self.db, cx);
-        if self.bound == Some(self.source.id()) {
-            return;
+        let table = cx.entity().downgrade();
+        if self.primary.follow(&mut self.source, &self.db, table, cx) {
+            self.head = None;
+            self.selected_time = None;
+            self.built = None;
+            self.history_start = None;
+            self.newer = 0;
+            self.table.update(cx, |table, cx| {
+                table.delegate_mut().mux = Mux::default();
+                cx.notify();
+            });
         }
-        self.bound = Some(self.source.id());
-        self.primary = None;
-        self.head = None;
-        self.selected_time = None;
-        self.built = None;
-        self.history_start = None;
-        self.newer = 0;
-        self.table.update(cx, |table, cx| {
-            table.delegate_mut().mux = Mux::default();
-            cx.notify();
-        });
-        if self.source.id() == ComponentId(0) {
-            self._task = Task::ready(());
-            return;
+        if let Some(data) = &self.primary.data {
+            self.component = data.name.clone();
         }
-
-        if let Some(name) = component_name(&self.db, self.source.id()) {
-            self.component = name;
-        }
-        self.history_task =
-            crate::data_binding::watch_history(self.db.clone(), self.source.id(), cx);
-        self._task = self.spawn_tail(cx);
     }
 
     /// Follow the further components' bindings, and hand the delegate the
-    /// time format.
+    /// timeline's clock.
     fn sync_sources(&mut self, cx: &mut Context<Self>) {
         let weak = cx.entity().downgrade();
         self.more = self
             .more_components
             .clone()
             .into_iter()
-            .filter_map(|source| source.update(cx, |source, cx| source.rebind(weak.clone(), cx)))
+            .filter_map(|source| source.update(cx, |source, cx| source.follow(weak.clone(), cx)))
             .collect();
         let time_format = self.time_format;
-        let origin = crate::temporal::snapshot(cx).and_then(|snapshot| {
-            crate::temporal::display::origin(&crate::temporal::config(cx), &snapshot.context)
-        });
+        let config = crate::temporal::config(cx);
+        let origin = crate::temporal::snapshot(cx)
+            .and_then(|snapshot| crate::temporal::display::origin(&config, &snapshot.context));
         self.table.update(cx, |table, cx| {
             let delegate = table.delegate_mut();
-            if delegate.time_format != time_format || delegate.origin != origin {
+            let clock = &mut delegate.clock;
+            if delegate.time_format != time_format
+                || clock.origin != origin
+                || clock.timezone != config.timezone
+            {
                 delegate.time_format = time_format;
-                delegate.origin = origin;
+                clock.origin = origin;
+                if clock.timezone != config.timezone {
+                    clock.zone = crate::temporal::display::zone(&config.timezone);
+                    clock.timezone = config.timezone.clone();
+                }
                 cx.notify();
             }
         });
-    }
-
-    /// Wait for the producer, then rebuild the index every time the series
-    /// grows.
-    fn spawn_tail(&self, cx: &mut Context<Self>) -> Task<()> {
-        let db = self.db.clone();
-        let component_id = self.source.id();
-        cx.spawn(async move |this, cx| {
-            let component = crate::wait_for_component(&db, component_id).await;
-            let data = Arc::new(SourceData::new(&db, component.clone()));
-            let bound = this.update(cx, |view, cx| {
-                view.component = data.name.clone();
-                view.primary = Some(data);
-                view.refresh(cx);
-            });
-            if bound.is_err() {
-                return;
-            }
-            loop {
-                component.time_series.wait().await;
-                if this.update(cx, |view, cx| view.refresh(cx)).is_err() {
-                    return;
-                }
-            }
-        })
     }
 
     /// Bring the index up to date with the series and the anchor.
@@ -355,7 +363,7 @@ impl SamplesTable {
     /// follows the head while the table is at its top, so scrolling back up
     /// by hand is enough to return to live.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        let Some(primary) = &self.primary else {
+        let Some(primary) = &self.primary.data else {
             return;
         };
         let sources: Vec<Arc<SourceData>> = std::iter::once(primary.clone())
@@ -389,14 +397,19 @@ impl SamplesTable {
         if let Some(history) = history {
             // Request a bounded page, even before the expression has emitted
             // its first sample (for example, a windowed spectrum).
-            let near_bottom = self.table.read(cx).near_bottom();
             let start = self
                 .history_start
                 .get_or_insert(Timestamp(head.0.saturating_sub(HISTORY_PAGE_US)));
-            if near_bottom && !self.was_near_bottom {
-                *start = Timestamp(start.0.saturating_sub(HISTORY_PAGE_US));
+            if self.table.read(cx).near_bottom()
+                && history.landed(*start..head)
+                && history.extent().is_some_and(|extent| extent.start < *start)
+            {
+                // Past the oldest sample held, so a page of history already
+                // resident is skipped rather than walked a page per frame.
+                let held = history.component.time_series.start_timestamp();
+                let from = held.map_or(*start, |held| held.min(*start));
+                *start = Timestamp(from.0.saturating_sub(HISTORY_PAGE_US));
             }
-            self.was_near_bottom = near_bottom;
             let range = *start..Timestamp(head.0.saturating_add(1));
             history.request(range.clone(), cx);
             for source in &self.more_components {
@@ -517,17 +530,13 @@ struct IndexedNode {
 }
 
 impl SampleIndex {
-    fn empty() -> Self {
-        Self {
+    fn build(series: &TimeSeries, head: Timestamp) -> Self {
+        let mut index = Self {
             nodes: Vec::new(),
             starts: Vec::new(),
             rows: 0,
             newer: 0,
-        }
-    }
-
-    fn build(series: &TimeSeries, head: Timestamp) -> Self {
-        let mut index = Self::empty();
+        };
         for slice in series.iter_node_slices() {
             let stamps = slice.full_timestamps();
             let used = stamps.partition_point(|t| t.0 <= head.0);
@@ -559,7 +568,7 @@ impl SampleIndex {
 }
 
 /// What decoding one component's samples needs.
-pub struct SourceData {
+struct SourceData {
     name: SharedString,
     component: Component,
     formatter: ValueFormatter,
@@ -703,8 +712,7 @@ const COL_TIME: usize = 0;
 pub struct SamplesDelegate {
     mux: Mux,
     time_format: SampleTimeFormat,
-    /// T0 for [`SampleTimeFormat::Elapsed`].
-    origin: Option<Timestamp>,
+    clock: SampleClock,
     style: StripStyle,
 }
 
@@ -713,21 +721,22 @@ impl SamplesDelegate {
         Self {
             mux: Mux::default(),
             time_format: SampleTimeFormat::default(),
-            origin: None,
+            clock: SampleClock::default(),
             style: StripStyle::boxes().with_intrinsic_width(),
         }
     }
 
-    /// Whether rows need saying which component they came from.
-    fn muxed(&self) -> bool {
-        self.mux.streams.len() > 1
+    /// The Component column, shown when rows need saying which component
+    /// they came from.
+    fn component_col(&self) -> Option<usize> {
+        (self.mux.streams.len() > 1).then_some(COL_TIME + 1)
     }
 }
 
 impl TableDelegate for SamplesDelegate {
     fn columns(&self) -> Vec<Column> {
         let mut columns = vec![Column::new("Time", self.time_format.width())];
-        if self.muxed() {
+        if self.component_col().is_some() {
             columns.push(Column::new("Component", 160.0));
         }
         columns.push(Column::new("Value", 320.0).flex().resizable(false));
@@ -753,7 +762,7 @@ impl TableDelegate for SamplesDelegate {
         let Some((source, stamp, bytes)) = self.mux.sample(row_ix) else {
             return div().into_any_element();
         };
-        let text_cell = |text: String, color| {
+        let text_cell = |text: SharedString, color| {
             div()
                 .flex()
                 .items_center()
@@ -762,17 +771,17 @@ impl TableDelegate for SamplesDelegate {
                 .whitespace_nowrap()
                 .overflow_hidden()
                 .text_color(color)
-                .child(SharedString::from(text))
+                .child(text)
                 .into_any_element()
         };
         if col_ix == COL_TIME {
             return text_cell(
-                self.time_format.format(stamp, self.origin),
+                self.time_format.format(stamp, &self.clock).into(),
                 theme.text_tertiary,
             );
         }
-        if self.muxed() && col_ix == COL_TIME + 1 {
-            return text_cell(source.name.to_string(), theme.text_secondary);
+        if self.component_col() == Some(col_ix) {
+            return text_cell(source.name.clone(), theme.text_secondary);
         }
         let Ok((_size, view)) = source.component.schema.parse_value(bytes) else {
             return div().into_any_element();
@@ -1010,13 +1019,10 @@ mod tests {
         cx.update(|cx| {
             view.update(cx, |view, cx| {
                 assert_eq!(view.head, Some(Timestamp(20)));
-                // An unscrollable table counts as at its bottom, which pages
-                // back once and only once.
+                // An unscrollable table counts as at its bottom, but paging
+                // stops once the page reaches past the oldest sample.
                 view.refresh(cx);
-                assert_eq!(
-                    view.history_start,
-                    Some(Timestamp(20 - 2 * HISTORY_PAGE_US))
-                );
+                assert_eq!(view.history_start, Some(Timestamp(20 - HISTORY_PAGE_US)));
                 view.history_start = Some(Timestamp(-120_000_000));
                 view.table.update(cx, |table, _| {
                     table.set_scroll_offset(gpui::point(px(0.), px(-100.)))

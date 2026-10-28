@@ -269,8 +269,7 @@ impl<D: TableDelegate> Table<D> {
     }
 
     /// Whether the body is scrolled to within a few rows of its last, or
-    /// has too few rows to scroll at all; the samples table's cue to page in
-    /// older history.
+    /// has too few rows to scroll at all.
     pub fn near_bottom(&self) -> bool {
         let handle = &self.scroll_handle.0.borrow().base_handle;
         -handle.offset().y >= handle.max_offset().y - px(ROW_HEIGHT * 4.0)
