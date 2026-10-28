@@ -1,7 +1,8 @@
 //! A channel's state as its components carry it at the selected time.
 //!
-//! The control system telemeters each channel's whole state as components
-//! every cycle and the registry names them, so reading a channel is reading
+//! The control system telemeters each channel's state as components every
+//! cycle, writes its message component only when something happens, and the
+//! registry names them all, so reading a channel is reading
 //! those components the way any instrument does: through
 //! [`crate::temporal::samples`], live or at a scrub point. One
 //! [`ChannelStatusReader`] per channel is shared by every view showing it,
@@ -18,7 +19,7 @@ use metor_proto::types::{ComponentId, ComponentView, ElementValue, Timestamp};
 use metor_proto_wkt::{SequenceAccepts, SequenceChannelState};
 
 use super::{Channel, ChannelComponents, SequenceStore};
-use crate::views::binding::{StreamUpdate, spawn_seeded_stream};
+use crate::views::binding::{StreamUpdate, spawn_seeded_stream, spawn_stamped_stream};
 
 /// A channel's state, decoded from its components at the selected time.
 /// Each field is `None` (or empty) while its component has no reading.
@@ -32,7 +33,7 @@ pub struct ChannelStatus {
     pub accepts: SequenceAccepts,
     /// The latest transition, progress, refusal or failure.
     pub message: Option<SharedString>,
-    /// When `message` was raised; a repeated text still moves it.
+    /// When `message` was raised: its sample's stamp.
     pub message_at: Option<Timestamp>,
     pub elapsed: Option<f64>,
     pub abort_elapsed: Option<f64>,
@@ -153,11 +154,7 @@ impl ChannelStatusReader {
             field(&db, c.accepts, code, cx, |s, v| {
                 s.accepts = SequenceAccepts(v.unwrap_or(0))
             }),
-            field(&db, c.message, text, cx, |s, v| s.message = v),
-            // Zero is a channel that has raised nothing yet.
-            field(&db, c.message_at, stamp, cx, |s, v| {
-                s.message_at = v.filter(|at| at.0 != 0)
-            }),
+            message(&db, c.message, cx),
             field(&db, c.elapsed, seconds, cx, |s, v| s.elapsed = v),
             field(&db, c.abort_elapsed, seconds, cx, |s, v| {
                 s.abort_elapsed = v
@@ -194,6 +191,31 @@ fn field<V: Send + 'static>(
     ))
 }
 
+/// Stream the message component: each sample is one message, stamped when it
+/// was raised.
+fn message(
+    db: &Arc<DB>,
+    id: Option<ComponentId>,
+    cx: &mut Context<ChannelStatusReader>,
+) -> Option<Task<()>> {
+    Some(spawn_stamped_stream(
+        db.clone(),
+        id?,
+        cx,
+        |_, _| ((), |at, view| Some((text(view)?, at))),
+        |this: &mut ChannelStatusReader, update, cx| {
+            let (message, at) = match update {
+                StreamUpdate::Value((message, at)) => (Some(message), Some(at)),
+                StreamUpdate::Unavailable => (None, None),
+                StreamUpdate::Ready(()) | StreamUpdate::Stale => return,
+            };
+            this.status.message = message;
+            this.status.message_at = at;
+            cx.notify();
+        },
+    ))
+}
+
 fn leading(view: &ComponentView<'_>) -> Option<ElementValue> {
     view.iter().next()
 }
@@ -206,19 +228,6 @@ pub(crate) fn code(view: ComponentView<'_>) -> Option<u32> {
 
 fn seconds(view: ComponentView<'_>) -> Option<f64> {
     leading(&view).map(|v| v.as_f64())
-}
-
-/// Microseconds since the epoch, from an `I64` (a `Timestamp` field) or any
-/// other numeric element type.
-pub(crate) fn stamp(view: ComponentView<'_>) -> Option<Timestamp> {
-    match leading(&view)? {
-        ElementValue::I64(us) => Some(Timestamp(us)),
-        ElementValue::U64(us) => i64::try_from(us).ok().map(Timestamp),
-        other => {
-            let us = other.as_f64();
-            us.is_finite().then_some(Timestamp(us as i64))
-        }
-    }
 }
 
 /// Fixed-size text: a `U8` tensor, NUL-terminated.

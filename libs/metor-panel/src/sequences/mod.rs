@@ -64,7 +64,6 @@ pub struct ChannelComponents {
     pub artifact: Option<ComponentId>,
     pub accepts: Option<ComponentId>,
     pub message: Option<ComponentId>,
-    pub message_at: Option<ComponentId>,
     pub elapsed: Option<ComponentId>,
     pub abort_elapsed: Option<ComponentId>,
 }
@@ -78,7 +77,6 @@ impl ChannelComponents {
             artifact: id(&names.artifact),
             accepts: id(&names.accepts),
             message: id(&names.message),
-            message_at: id(&names.message_at),
             elapsed: id(&names.elapsed),
             abort_elapsed: id(&names.abort_elapsed),
         }

@@ -825,7 +825,6 @@ mod tests {
             loaded: 0,
             accepts: SequenceAccepts::ABORT | SequenceAccepts::STOP,
             message: "started",
-            message_at: 2,
             elapsed: 75.0,
             ..Frame::default()
         }
@@ -838,7 +837,6 @@ mod tests {
             loaded: 0,
             accepts: SequenceAccepts::START | SequenceAccepts::RESET | SequenceAccepts::LOAD,
             message: "stopped",
-            message_at: 3,
             elapsed: 75.0,
             ..Frame::default()
         }

@@ -49,7 +49,7 @@ fn registry_names_each_status_component_in_full() {
             system: "dl_slot".into(),
             status: SequenceChannelComponents {
                 state: "fsw.deploy.channel_status.state".into(),
-                message_at: "fsw.deploy.channel_status.message_at".into(),
+                message: "fsw.deploy.channel_message.text".into(),
                 ..Default::default()
             },
             ..spec("deploy", &[])
@@ -63,8 +63,8 @@ fn registry_names_each_status_component_in_full() {
         Some(ComponentId::new("fsw.deploy.channel_status.state"))
     );
     assert_eq!(
-        deploy.components.message_at,
-        Some(ComponentId::new("fsw.deploy.channel_status.message_at"))
+        deploy.components.message,
+        Some(ComponentId::new("fsw.deploy.channel_message.text"))
     );
     // An empty name is a field the channel doesn't publish, not a component
     // named "".
@@ -125,15 +125,16 @@ fn ages_read_in_the_largest_whole_unit() {
     assert_eq!(format_age(Timestamp(10), at), "0s ago");
 }
 
-/// One cycle of a channel's telemetered state, as fsw-3's frame carries it.
+/// One cycle of a channel's telemetered state, as fsw-3's status frame
+/// carries it, and the message the cycle raised, if any.
 #[derive(Clone)]
 pub(crate) struct Frame {
     pub state: SequenceChannelState,
     pub loaded: u32,
     pub accepts: u32,
     pub artifact: &'static str,
+    /// Raised this cycle, so stamped with it; empty raises nothing.
     pub message: &'static str,
-    pub message_at: i64,
     pub elapsed: f64,
     pub abort_elapsed: f64,
 }
@@ -146,15 +147,15 @@ impl Default for Frame {
             accepts: 0,
             artifact: "",
             message: "",
-            message_at: 0,
             elapsed: 0.0,
             abort_elapsed: 0.0,
         }
     }
 }
 
-/// `message` is a `FrameStr<124>`: a NUL-terminated `U8` tensor of this length.
-const MESSAGE: usize = 124;
+/// A message's `text` is a `FrameStr<128>`: a NUL-terminated `U8` tensor of
+/// this length.
+const MESSAGE: usize = 128;
 /// `artifact` is a `FrameStr<64>`.
 const ARTIFACT: usize = 64;
 
@@ -170,11 +171,14 @@ pub(crate) fn components(channel: &str) -> SequenceChannelComponents {
         artifact: field(channel, "artifact"),
         hash: field(channel, "hash"),
         accepts: field(channel, "accepts"),
-        message: field(channel, "message"),
-        message_at: field(channel, "message_at"),
+        message: message_component(channel),
         elapsed: field(channel, "elapsed"),
         abort_elapsed: field(channel, "abort_elapsed"),
     }
+}
+
+fn message_component(channel: &str) -> String {
+    format!("fsw.{channel}.channel_message.text")
 }
 
 fn text(s: &str, len: usize) -> Vec<u8> {
@@ -188,7 +192,7 @@ type Encode = fn(&Frame) -> Vec<u8>;
 /// Record `frames` (each at its sample stamp) into `channel`'s components as
 /// resident history, registering the components first if need be.
 pub(crate) fn install_status(db: &DB, channel: &str, frames: &[(i64, Frame)]) {
-    let fields: [(&str, PrimType, &[usize], Encode); 8] = [
+    let fields: [(&str, PrimType, &[usize], Encode); 6] = [
         ("state", PrimType::U32, &[], |f| {
             f.state.code().to_le_bytes().to_vec()
         }),
@@ -201,12 +205,6 @@ pub(crate) fn install_status(db: &DB, channel: &str, frames: &[(i64, Frame)]) {
         ("artifact", PrimType::U8, &[ARTIFACT], |f| {
             text(f.artifact, ARTIFACT)
         }),
-        ("message", PrimType::U8, &[MESSAGE], |f| {
-            text(f.message, MESSAGE)
-        }),
-        ("message_at", PrimType::I64, &[], |f| {
-            f.message_at.to_le_bytes().to_vec()
-        }),
         ("elapsed", PrimType::F64, &[], |f| {
             f.elapsed.to_le_bytes().to_vec()
         }),
@@ -215,27 +213,58 @@ pub(crate) fn install_status(db: &DB, channel: &str, frames: &[(i64, Frame)]) {
         }),
     ];
     for (name, prim, shape, encode) in fields {
-        let id = ComponentId::new(&field(channel, name));
-        let schema = metor_db::ComponentSchema::new(prim, shape);
-        let size = schema.size();
-        if db.with_state(|s| s.get_component(id).is_none()) {
-            db.with_state_mut(|s| s.insert_component(id, schema, &db.path))
-                .unwrap();
-        }
-        let component = db.with_state(|s| s.get_component(id).cloned()).unwrap();
         let samples: Vec<(Timestamp, Vec<u8>)> = frames
             .iter()
             .map(|(at, frame)| (Timestamp(*at), encode(frame)))
             .collect();
-        component
-            .time_series
-            .install_samples(
-                size,
-                samples.iter().map(|(t, b)| (*t, b.as_slice())),
-                metor_db::manifest::SpanSource::RemoteFetch,
-            )
+        install(db, &field(channel, name), prim, shape, &samples);
+    }
+    let messages: Vec<(i64, &str)> = frames
+        .iter()
+        .filter(|(_, frame)| !frame.message.is_empty())
+        .map(|(at, frame)| (*at, frame.message))
+        .collect();
+    install_messages(db, channel, &messages);
+}
+
+/// Record `messages` (each at its stamp, several may share one) into
+/// `channel`'s message component as resident history.
+pub(crate) fn install_messages(db: &DB, channel: &str, messages: &[(i64, &str)]) {
+    let samples: Vec<(Timestamp, Vec<u8>)> = messages
+        .iter()
+        .map(|(at, message)| (Timestamp(*at), text(message, MESSAGE)))
+        .collect();
+    install(
+        db,
+        &message_component(channel),
+        PrimType::U8,
+        &[MESSAGE],
+        &samples,
+    );
+}
+
+/// Install `samples` into the component `name`, registering it first if need
+/// be.
+fn install(db: &DB, name: &str, prim: PrimType, shape: &[usize], samples: &[(Timestamp, Vec<u8>)]) {
+    if samples.is_empty() {
+        return;
+    }
+    let id = ComponentId::new(name);
+    let schema = metor_db::ComponentSchema::new(prim, shape);
+    let size = schema.size();
+    if db.with_state(|s| s.get_component(id).is_none()) {
+        db.with_state_mut(|s| s.insert_component(id, schema, &db.path))
             .unwrap();
     }
+    let component = db.with_state(|s| s.get_component(id).cloned()).unwrap();
+    component
+        .time_series
+        .install_samples(
+            size,
+            samples.iter().map(|(t, b)| (*t, b.as_slice())),
+            metor_db::manifest::SpanSource::RemoteFetch,
+        )
+        .unwrap();
     // What a vtable registration does, so tasks waiting on the components
     // find them.
     db.vtable_gen
@@ -296,13 +325,13 @@ fn the_reader_decodes_every_field(cx: &mut TestAppContext) {
                 loaded: 1,
                 accepts: SequenceAccepts::START | SequenceAccepts::RESET,
                 artifact: "libdeploy.so",
-                message: "refused: the channel is running",
-                message_at: 7,
                 elapsed: 12.5,
                 abort_elapsed: 0.0,
+                ..Frame::default()
             },
         )],
     );
+    install_messages(&db, "deploy", &[(7, "refused: the channel is running")]);
     let reader = acquire(cx, "deploy");
     cx.update(|cx| {
         let held = reader.read(cx);
@@ -343,9 +372,9 @@ fn nothing_loaded_reads_as_none(cx: &mut TestAppContext) {
         assert_eq!(status.state, Some(SequenceChannelState::Unloaded));
         assert_eq!(status.loaded, None);
         assert_eq!(status.accepts, SequenceAccepts(0));
-        // Before anything happens the message is empty and stamped zero.
+        // Before anything is raised there is no message at all.
         assert_eq!(status.message_at, None);
-        assert_eq!(status.message.as_deref(), Some(""));
+        assert_eq!(status.message, None);
     });
 }
 
@@ -376,16 +405,14 @@ fn the_reader_follows_the_scrub_time(cx: &mut TestAppContext) {
     assert!(!cx.update(|cx| reader.read(cx).live()));
 }
 
-/// History is one entry per distinct `message_at`, so the same text raised
-/// twice is two entries while every cycle repeating one message is one.
+/// History is one entry per message sample, so the same text raised twice
+/// is two entries, and so are two messages raised in one cycle.
 #[gpui::test]
 fn history_has_an_entry_per_raised_message(cx: &mut TestAppContext) {
     use SequenceChannelState::{Running, Stopped};
     let (db, _temp) = app(cx, &declare("deploy", &["solar"], "dl_slot"));
-    let frame = |state, message, message_at| Frame {
+    let frame = |state| Frame {
         state,
-        message,
-        message_at,
         ..Frame::default()
     };
     let refused = "refused: the channel is running";
@@ -393,15 +420,14 @@ fn history_has_an_entry_per_raised_message(cx: &mut TestAppContext) {
         &db,
         "deploy",
         &[
-            // Nothing raised yet.
-            (1, frame(Stopped, "", 0)),
-            (2, frame(Running, "started", 2)),
-            (3, frame(Running, "started", 2)),
-            (4, frame(Running, refused, 4)),
-            (5, frame(Running, refused, 4)),
-            (6, frame(Running, refused, 6)),
+            (1, frame(Stopped)),
+            (2, frame(Running)),
+            (3, frame(Running)),
+            (4, frame(Running)),
+            (5, frame(Running)),
         ],
     );
+    install_messages(&db, "deploy", &[(2, "started"), (4, refused), (5, refused)]);
     let history = cx.update(|cx| SequenceHistory::global(cx)).unwrap();
     cx.run_until_parked();
     let entries = |cx: &mut TestAppContext| {
@@ -417,27 +443,47 @@ fn history_has_an_entry_per_raised_message(cx: &mut TestAppContext) {
     assert_eq!(
         entries(cx),
         [
-            (6, Some(Running), refused.to_string()),
+            (5, Some(Running), refused.to_string()),
             (4, Some(Running), refused.to_string()),
             (2, Some(Running), "started".to_string()),
         ]
     );
 
-    // Arriving samples extend it; a repeat of the last message adds nothing.
+    // Arriving samples extend it, both messages of one cycle included.
     let generation = cx.update(|cx| history.read(cx).generation());
-    install_status(
-        &db,
-        "deploy",
-        &[
-            (7, frame(Running, refused, 6)),
-            (8, frame(Stopped, "stopped", 8)),
-        ],
-    );
+    install_status(&db, "deploy", &[(6, frame(Stopped))]);
+    // Pushed live, as a target's messages arrive: one cycle can raise
+    // several, sharing its stamp.
+    let message = db
+        .with_state(|s| {
+            s.get_component(ComponentId::new(&message_component("deploy")))
+                .cloned()
+        })
+        .unwrap();
+    let mut writer = message.time_series.writer().unwrap();
+    let mut raise = |at, message: &str| {
+        writer
+            .push_buf(Timestamp(at), &text(message, MESSAGE))
+            .unwrap()
+    };
+    raise(6, "stopped");
+    raise(6, "loaded solar");
     cx.run_until_parked();
     let now = entries(cx);
-    assert_eq!(now.len(), 4);
-    assert_eq!(now[0], (8, Some(Stopped), "stopped".to_string()));
+    assert_eq!(now.len(), 5);
+    let mut newest: Vec<_> = now[..2].iter().map(|e| e.2.as_str()).collect();
+    newest.sort();
+    assert_eq!(newest, ["loaded solar", "stopped"]);
+    assert!(now[..2].iter().all(|e| e.0 == 6 && e.1 == Some(Stopped)));
     assert!(cx.update(|cx| history.read(cx).generation()) > generation);
+
+    // A third message of that cycle, arriving after the scan that took the
+    // first two, is still folded in once.
+    raise(6, "started");
+    cx.run_until_parked();
+    let now = entries(cx);
+    assert_eq!(now.len(), 6);
+    assert_eq!(now.iter().filter(|e| e.0 == 6).count(), 3);
 }
 
 #[gpui::test]
@@ -452,7 +498,6 @@ fn sequence_flags_mark_each_raised_message(cx: &mut TestAppContext) {
                 Frame {
                     state: SequenceChannelState::Running,
                     message: "started",
-                    message_at: 2,
                     ..Frame::default()
                 },
             ),
@@ -461,7 +506,6 @@ fn sequence_flags_mark_each_raised_message(cx: &mut TestAppContext) {
                 Frame {
                     state: SequenceChannelState::Failed,
                     message: "sun lost",
-                    message_at: 5,
                     ..Frame::default()
                 },
             ),
