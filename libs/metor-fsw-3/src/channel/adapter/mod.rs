@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::Timestamp;
-use metor_proto_wkt::{SequenceChannelState, SequenceCommand, SequenceCommandKind};
+use metor_proto_wkt::{
+    SequenceAccepts, SequenceChannelState, SequenceCommand, SequenceCommandKind,
+};
 
 use crate::coordinator::{
     Adapter, ChannelConfig, EndReason, MakeCx, MakeError, MakeFn, Params, RunState, Step, StepCx,
@@ -548,6 +550,17 @@ impl Core {
         self.message_at = now.0;
     }
 
+    /// The commands this channel would accept now. `apply` judges by phase
+    /// alone, so `Load` is withheld here where the step would refuse it: the
+    /// system is gone until a reset, or it never loads anything.
+    fn accepts(&self) -> SequenceAccepts {
+        let mut accepts = accepts(self.state());
+        if !self.phase.inner().is_some_and(|inner| inner.loads()) {
+            accepts.0 &= !SequenceAccepts::LOAD;
+        }
+        accepts
+    }
+
     fn write_status(&mut self, now: Timestamp) {
         let running = matches!(
             self.phase,
@@ -567,7 +580,7 @@ impl Core {
             hash: occupant.map(|o| o.hash).unwrap_or_default(),
             elapsed,
             abort_elapsed,
-            accepts: accepts(self.state()).0,
+            accepts: self.accepts().0,
             message: self.message,
             message_at: self.message_at,
         };

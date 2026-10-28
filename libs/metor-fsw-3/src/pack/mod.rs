@@ -439,6 +439,10 @@ impl Step for Turning {
         self.step.ended()
     }
 
+    fn loads(&self) -> bool {
+        self.step.loads()
+    }
+
     fn load(&mut self, name: &str, cx: &mut StepCx<'_>) -> Result<(), LoadError> {
         self.step.load(name, cx)
     }

@@ -209,6 +209,10 @@ impl Step for Slot {
         Ok(())
     }
 
+    fn loads(&self) -> bool {
+        true
+    }
+
     fn occupant(&self) -> Option<&Occupant> {
         self.occupant.as_ref()
     }
@@ -361,7 +365,8 @@ fn test_start_at_boot_stopped() {
 fn test_accepts_follows_state() {
     let (shared, mut coordinator) = build("counter", RunState::Stopped);
     coordinator.step(Timestamp(1));
-    let stopped = SequenceAccepts::LOAD | SequenceAccepts::START | SequenceAccepts::RESET;
+    // A counter loads nothing, so `Load` is never offered.
+    let stopped = SequenceAccepts::START | SequenceAccepts::RESET;
     assert_eq!(shared.accepts(), stopped);
 
     shared.send("ctr", SequenceCommandKind::Start);
@@ -386,10 +391,27 @@ fn test_accepts_after_end() {
     shared.send("ctr", SequenceCommandKind::Abort);
     coordinator.step(Timestamp(2));
     assert_eq!(shared.state(), code(SequenceChannelState::Aborted));
+    assert_eq!(shared.accepts(), SequenceAccepts::RESET);
+}
+
+#[test]
+fn test_accepts_offers_load_on_a_slot() {
+    let (shared, mut coordinator) = build("slot", RunState::Stopped);
+    coordinator.step(Timestamp(1));
     assert_eq!(
-        shared.accepts(),
-        SequenceAccepts::LOAD | SequenceAccepts::RESET
+        shared.accepts() & SequenceAccepts::LOAD,
+        SequenceAccepts::LOAD,
+        "a slot loads even while it holds nothing"
     );
+}
+
+#[test]
+fn test_accepts_only_reset_once_the_system_is_gone() {
+    let (shared, mut coordinator) = build("counter", RunState::Running);
+    shared.0.borrow_mut().panic_at = Some(1);
+    coordinator.step(Timestamp(1));
+    assert_eq!(shared.state(), code(SequenceChannelState::Panicked));
+    assert_eq!(shared.accepts(), SequenceAccepts::RESET);
 }
 
 #[test]
