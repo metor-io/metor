@@ -24,7 +24,9 @@ pub fn parse(tokens: &[(Token, Span)], len: usize) -> (Option<File>, Vec<Diagnos
         .iter()
         .map(|(token, span)| (token.clone(), SimpleSpan::from(span.range())))
         .collect();
-    let input = tokens.as_slice().map(SimpleSpan::from(len..len), |(t, s)| (t, s));
+    let input = tokens
+        .as_slice()
+        .map(SimpleSpan::from(len..len), |(t, s)| (t, s));
     let (file, errors) = file().parse(input).into_output_errors();
     (file, errors.into_iter().map(diagnostic).collect())
 }
@@ -42,7 +44,10 @@ fn diagnostic(error: Rich<'_, Token, SimpleSpan>) -> Diagnostic {
     if !expected.is_empty() {
         message.push_str(&format!(", expected {}", expected.join(" or ")));
     }
-    let contexts: Vec<String> = error.contexts().map(|(label, _)| label.to_string()).collect();
+    let contexts: Vec<String> = error
+        .contexts()
+        .map(|(label, _)| label.to_string())
+        .collect();
     let diag = Diagnostic::new(span, message);
     match contexts.first() {
         Some(context) => diag.with_note(format!("while parsing {context}")),
@@ -169,13 +174,10 @@ fn expr<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
             Field(Ident),
             Index(Expr),
         }
-        let postfix = op(Op::Dot)
-            .ignore_then(ident())
-            .map(Postfix::Field)
-            .or(expr
-                .clone()
-                .delimited_by(op(Op::LBracket), op(Op::RBracket))
-                .map(Postfix::Index));
+        let postfix = op(Op::Dot).ignore_then(ident()).map(Postfix::Field).or(expr
+            .clone()
+            .delimited_by(op(Op::LBracket), op(Op::RBracket))
+            .map(Postfix::Index));
         let place = atom.foldl_with(postfix.repeated(), |base, post, e| {
             let kind = match post {
                 Postfix::Field(field) => ExprKind::Field(Box::new(base), field),
@@ -188,9 +190,11 @@ fn expr<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
         });
 
         let bin = |o: BinOp| {
-            move |l: Expr, _: Token, r: Expr, e: &mut chumsky::input::MapExtra<'t, '_, I, E<'t>>| Expr {
-                kind: ExprKind::Binary(o, Box::new(l), Box::new(r)),
-                span: sp(e.span()),
+            move |l: Expr, _: Token, r: Expr, e: &mut chumsky::input::MapExtra<'t, '_, I, E<'t>>| {
+                Expr {
+                    kind: ExprKind::Binary(o, Box::new(l), Box::new(r)),
+                    span: sp(e.span()),
+                }
             }
         };
         let un = |o: UnOp| {
@@ -247,7 +251,13 @@ fn stmt<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
         let if_ = kw(Kw::If)
             .ignore_then(expr())
             .then(body.clone())
-            .then(kw(Kw::Elif).ignore_then(expr()).then(body.clone()).repeated().collect::<Vec<_>>())
+            .then(
+                kw(Kw::Elif)
+                    .ignore_then(expr())
+                    .then(body.clone())
+                    .repeated()
+                    .collect::<Vec<_>>(),
+            )
             .then(kw(Kw::Else).ignore_then(body.clone()).or_not())
             .map(|((first, elifs), orelse)| {
                 let branches = core::iter::once(first).chain(elifs).collect();
@@ -392,7 +402,17 @@ fn member<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
         })
         .labelled("a `loop:` block");
     let doc = string().then_ignore(newline()).map(Member::Doc);
-    choice((input, output, alert, redline, on_abort, loop_, doc, stmt().map(Member::Stmt))).boxed()
+    choice((
+        input,
+        output,
+        alert,
+        redline,
+        on_abort,
+        loop_,
+        doc,
+        stmt().map(Member::Stmt),
+    ))
+    .boxed()
 }
 
 fn params<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
@@ -507,18 +527,24 @@ fn item<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
             name,
             span: sp(e.span()),
         });
-    let top = [Kw::Use, Kw::Frame, Kw::Const, Kw::Def, Kw::System, Kw::Sequence, Kw::Machine]
-        .map(Token::Kw);
-    let skip = any()
-        .ignore_then(none_of(top).repeated())
-        .to(Item::Error);
+    let top = [
+        Kw::Use,
+        Kw::Frame,
+        Kw::Const,
+        Kw::Def,
+        Kw::System,
+        Kw::Sequence,
+        Kw::Machine,
+    ]
+    .map(Token::Kw);
+    let skip = any().ignore_then(none_of(top).repeated()).to(Item::Error);
     choice((use_, frame, const_, def, program, machine))
         .recover_with(via_parser(skip))
         .boxed()
 }
 
-fn file<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
--> impl Parser<'t, I, File, E<'t>> {
+fn file<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>() -> impl Parser<'t, I, File, E<'t>>
+{
     item()
         .repeated()
         .collect()

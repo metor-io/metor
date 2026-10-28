@@ -62,7 +62,10 @@ pub fn front(src: &str, imports: &dyn Imports) -> Result<hir::Program, CompileEr
 fn source_error(mut errors: Vec<Diagnostic>) -> CompileError {
     errors.sort_by_key(|d| d.span.start);
     if errors.is_empty() {
-        errors.push(Diagnostic::new(diag::Span::default(), "the file did not parse"));
+        errors.push(Diagnostic::new(
+            diag::Span::default(),
+            "the file did not parse",
+        ));
     }
     CompileError::Source(Diagnostics(errors))
 }

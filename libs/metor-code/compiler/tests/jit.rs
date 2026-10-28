@@ -48,7 +48,8 @@ system heater(setpoint = 40.0, ki: f64 = 0.01):
 #[test]
 fn test_heater_controls_toward_setpoint() {
     let program = compile(HEATER);
-    let mut h = Harness::new(&program, "heater", serde_json::json!({ "setpoint": 50.0 })).expect("makes");
+    let mut h =
+        Harness::new(&program, "heater", serde_json::json!({ "setpoint": 50.0 })).expect("makes");
     h.set("temp", "c", 20.0).expect("sets");
     h.step(0);
     assert!(h.wrote("heater"));
@@ -76,7 +77,11 @@ fn test_alert_fires_after_hold_on_rising_edge() {
         h.step(now);
         now += 10 * MS;
     }
-    assert_eq!(h.get("alerts", "overtemp").expect("reads"), 0.0, "1.5 s is under the hold");
+    assert_eq!(
+        h.get("alerts", "overtemp").expect("reads"),
+        0.0,
+        "1.5 s is under the hold"
+    );
     for _ in 0..60 {
         h.step(now);
         now += 10 * MS;
@@ -138,8 +143,16 @@ fn test_runtime_faults_never_trap() {
     h.set("a", "i", 9.0).expect("sets");
     h.step(10 * MS);
     assert_eq!(h.get("b", "q").expect("reads"), 0.0);
-    assert_eq!(h.get("b", "y").expect("reads"), 1.5, "NaN keeps the last value");
-    assert_eq!(h.get("b", "arr.2").expect("reads"), 7.0, "index clamps to the end");
+    assert_eq!(
+        h.get("b", "y").expect("reads"),
+        1.5,
+        "NaN keeps the last value"
+    );
+    assert_eq!(
+        h.get("b", "arr.2").expect("reads"),
+        7.0,
+        "index clamps to the end"
+    );
     let kinds: Vec<&str> = h.log().iter().map(|e| e.kind.as_str()).collect();
     assert_eq!(kinds, ["div_by_zero", "index_clamped", "nan_write"]);
 }
@@ -198,7 +211,11 @@ fn test_leak_check_fails_on_leak_and_runs_on_abort() {
     let mut h = Harness::new(&program, "leak_check", serde_json::Value::Null).expect("makes");
     h.set("chamber", "psi", 152.0).expect("sets");
     h.step(0);
-    assert_eq!(h.get("valve", "open").expect("reads"), 0.0, "the wait holds at once");
+    assert_eq!(
+        h.get("valve", "open").expect("reads"),
+        0.0,
+        "the wait holds at once"
+    );
     h.set("chamber", "psi", 140.0).expect("sets");
     h.step(300_000 * MS);
     assert_eq!(h.ended(), Some(&Ended::Failed("leak".into())));
@@ -216,7 +233,11 @@ fn test_leak_check_times_out() {
         Some(Ended::Failed(message)) => assert!(message.contains("timed out"), "{message}"),
         other => panic!("{other:?}"),
     }
-    assert_eq!(h.get("valve", "open").expect("reads"), 0.0, "on abort closed the valve");
+    assert_eq!(
+        h.get("valve", "open").expect("reads"),
+        0.0,
+        "on abort closed the valve"
+    );
 }
 
 #[test]
@@ -275,19 +296,24 @@ sequence s:
     other.open = 1
 "#;
     let text = errors(src);
-    assert!(text.contains("writes `other`, but `on abort:` does not"), "{text}");
+    assert!(
+        text.contains("writes `other`, but `on abort:` does not"),
+        "{text}"
+    );
     assert!(!text.contains("writes `valve`"), "{text}");
 }
 
 #[test]
 fn test_totality_errors() {
-    let recursive = "def f(x: f64) -> f64:\n    return g(x)\ndef g(x: f64) -> f64:\n    return f(x)\n";
+    let recursive =
+        "def f(x: f64) -> f64:\n    return g(x)\ndef g(x: f64) -> f64:\n    return f(x)\n";
     assert!(errors(recursive).contains("calls itself"));
     let unbounded = "frame F:\n    a: i64\nsystem s:\n    in x: F\n    out y: F\n    loop:\n        for i in range(x.a):\n            y.a = i\n";
     assert!(errors(unbounded).contains("must be a constant"));
     let div = "frame F:\n    a: i64\nsystem s:\n    out y: F\n    loop:\n        y.a = 1 / 0\n";
     assert!(errors(div).contains("division by a constant zero"));
-    let index = "frame F:\n    a: [f64; 2]\nsystem s:\n    out y: F\n    loop:\n        y.a[2] = 1.0\n";
+    let index =
+        "frame F:\n    a: [f64; 2]\nsystem s:\n    out y: F\n    loop:\n        y.a[2] = 1.0\n";
     assert!(errors(index).contains("out of range"));
 }
 
@@ -324,5 +350,9 @@ system m:
     let expected = libm::atan2(1.0, 1.0) + 2.0 + 2.0 + 1.5 + 8.0;
     assert_eq!(h.get("b", "x").expect("reads"), expected);
     assert_eq!(h.get("b", "n").expect("reads"), 10.0);
-    assert_eq!(h.get("b", "s").expect("reads"), 255.0, "float to int saturates");
+    assert_eq!(
+        h.get("b", "s").expect("reads"),
+        255.0,
+        "float to int saturates"
+    );
 }

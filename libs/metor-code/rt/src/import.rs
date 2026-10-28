@@ -115,7 +115,9 @@ fn data(vtable: &VTable, op: OpRef) -> Option<&[u8]> {
     let Op::Data { offset, len } = vtable.get_op(op).ok()? else {
         return None;
     };
-    vtable.data.get(offset.to_index()..offset.to_index() + *len as usize)
+    vtable
+        .data
+        .get(offset.to_index()..offset.to_index() + *len as usize)
 }
 
 /// Maps a vtable type tag to a scalar.
@@ -158,8 +160,15 @@ mod tests {
     fn test_imports_a_derived_frame() {
         let port = Output::<Chamber>::def(&DefCx::empty(), "chamber");
         let frame = frame_of_port(&port, "chamber").expect("imports");
-        let paths: Vec<_> = frame.leaves.iter().map(|l| (l.path.as_str(), l.offset)).collect();
-        assert_eq!(paths, [("psi", 8), ("temps.0", 16), ("temps.1", 20), ("valve", 24)]);
+        let paths: Vec<_> = frame
+            .leaves
+            .iter()
+            .map(|l| (l.path.as_str(), l.offset))
+            .collect();
+        assert_eq!(
+            paths,
+            [("psi", 8), ("temps.0", 16), ("temps.1", 20), ("valve", 24)]
+        );
         assert_eq!((frame.size, frame.align, frame.timestamp), (32, 8, 0));
     }
 
@@ -176,6 +185,9 @@ mod tests {
     #[test]
     fn test_refuses_a_message() {
         let port = Output::<metor_fsw_3::metor_proto_wkt::LogEvent>::def(&DefCx::empty(), "log");
-        assert!(matches!(frame_of_port(&port, "log"), Err(ImportError::NotFrame(_))));
+        assert!(matches!(
+            frame_of_port(&port, "log"),
+            Err(ImportError::NotFrame(_))
+        ));
     }
 }

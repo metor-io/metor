@@ -1095,4 +1095,55 @@ mod tests {
         assert_eq!(entry.doc, "");
         assert!(entry.schema.is_none());
     }
+
+    fn dyn_type(kind: SystemKind, outputs: Vec<PortDef>) -> DynType {
+        let def = SystemDef {
+            name: "dyn".into(),
+            inputs: Vec::new(),
+            outputs,
+            log: None,
+            grants: Vec::new(),
+            io: None,
+        };
+        let def_fn_def = def.clone();
+        DynType {
+            kind,
+            def,
+            def_fn: Box::new(move |_| Ok(def_fn_def.clone())),
+            doc: Cow::Borrowed("a dynamic type"),
+            schema: None,
+            make: Arc::new(|_| Err(MakeError::Pack("not made in this test".into()))),
+        }
+    }
+
+    #[test]
+    fn test_register_dyn_reports_its_def() {
+        let mut table = SystemTable::new();
+        let imu = Output::<Imu>::def(&DefCx::empty(), "imu");
+        table
+            .register_dyn("dyn", dyn_type(SystemKind::Sequence, vec![imu.clone()]))
+            .expect("registers");
+        let entry = table.get("dyn").expect("registered");
+        assert_eq!(entry.kind, SystemKind::Sequence);
+        assert_eq!(entry.doc, "a dynamic type");
+        assert_eq!(record(&table, Imu::NAME), Some(out(&imu)));
+    }
+
+    #[test]
+    fn test_register_dyn_refuses_async_and_conflicts() {
+        let mut table = SystemTable::new();
+        assert!(matches!(
+            table.register_dyn("dyn", dyn_type(SystemKind::Async, Vec::new())),
+            Err(BuildError::TypeDef { .. })
+        ));
+        table
+            .insert("json", declared(vec![message("command", MsgCodec::Json)]))
+            .expect("first record");
+        let bytes = vec![message("command", MsgCodec::Bytes)];
+        assert!(matches!(
+            table.register_dyn("dyn", dyn_type(SystemKind::Cyclic, bytes)),
+            Err(BuildError::RecordConflict { .. })
+        ));
+        assert!(table.get("dyn").is_none());
+    }
 }

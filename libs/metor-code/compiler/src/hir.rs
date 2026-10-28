@@ -90,7 +90,11 @@ pub enum ExprKind {
     Not(Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// Short-circuit `and` / `or`.
-    Logic { and: bool, lhs: Box<Expr>, rhs: Box<Expr> },
+    Logic {
+        and: bool,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
     /// Converts the operand to this expression's type.
     Cast(Box<Expr>),
     Call(u32, Vec<Expr>),
@@ -98,7 +102,11 @@ pub enum ExprKind {
     Math(&'static str, Vec<Expr>),
     Builtin(Builtin, Vec<Expr>),
     /// Whether input `port` has no record, or one older than `age` seconds.
-    Stale { port: u32, timestamp: u32, age: Box<Expr> },
+    Stale {
+        port: u32,
+        timestamp: u32,
+        age: Box<Expr>,
+    },
     /// The cycle time in microseconds, as `i64`.
     NowMicros,
     /// The cycle time in seconds.
@@ -147,7 +155,11 @@ pub enum Stmt {
         mark: Option<u32>,
     },
     /// Zeroes `len` bytes of a block, such as a frame being rebuilt.
-    Zero { base: Base, offset: u32, len: u32 },
+    Zero {
+        base: Base,
+        offset: u32,
+        len: u32,
+    },
     /// Copies a whole frame between blocks.
     Copy {
         dst: (Base, u32),

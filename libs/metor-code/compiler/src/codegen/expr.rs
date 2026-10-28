@@ -60,7 +60,11 @@ impl<M: Module> FnCx<'_, '_, M> {
                 let values: Vec<Value> = args.iter().map(|a| self.expr(a)).collect();
                 self.builtin(*builtin, e.prim, &values)
             }
-            ExprKind::Stale { port, timestamp, age } => self.stale(*port, *timestamp, age),
+            ExprKind::Stale {
+                port,
+                timestamp,
+                age,
+            } => self.stale(*port, *timestamp, age),
             ExprKind::NowMicros => self.b.ins().load(types::I64, FLAGS, self.cx, offsets::NOW),
             ExprKind::Now => {
                 let now = self.b.ins().load(types::I64, FLAGS, self.cx, offsets::NOW);
@@ -108,7 +112,10 @@ impl<M: Module> FnCx<'_, '_, M> {
     /// outside.
     fn clamp_index(&mut self, value: Value, len: u32) -> Value {
         let last = i64::from(len) - 1;
-        let outside = self.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, value, last);
+        let outside = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, value, last);
         self.fault_if(outside, Fault::IndexClamped);
         let negative = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, value, 0);
         let zero = self.b.ins().iconst(types::I64, 0);
@@ -186,7 +193,9 @@ impl<M: Module> FnCx<'_, '_, M> {
         };
         self.b.switch_to_block(rhs_block);
         let rhs = self.expr(rhs);
-        self.b.ins().jump(done, &[cranelift_codegen::ir::BlockArg::Value(rhs)]);
+        self.b
+            .ins()
+            .jump(done, &[cranelift_codegen::ir::BlockArg::Value(rhs)]);
         self.b.switch_to_block(done);
         result
     }
@@ -201,7 +210,15 @@ impl<M: Module> FnCx<'_, '_, M> {
             (true, true) => ins.fdemote(tt, x),
             (false, true) => {
                 let x = match ft.bits() < 32 {
-                    true => self.cast(x, from, if from.is_signed() { Prim::I32 } else { Prim::U32 }),
+                    true => self.cast(
+                        x,
+                        from,
+                        if from.is_signed() {
+                            Prim::I32
+                        } else {
+                            Prim::U32
+                        },
+                    ),
                     false => x,
                 };
                 match from.is_signed() {
@@ -239,10 +256,18 @@ impl<M: Module> FnCx<'_, '_, M> {
         };
         let lo = self.b.ins().iconst(types::I32, lo);
         let hi = self.b.ins().iconst(types::I32, hi);
-        let cc = if to.is_signed() { IntCC::SignedLessThan } else { IntCC::UnsignedLessThan };
+        let cc = if to.is_signed() {
+            IntCC::SignedLessThan
+        } else {
+            IntCC::UnsignedLessThan
+        };
         let below = self.b.ins().icmp(cc, wide, lo);
         let raised = self.b.ins().select(below, lo, wide);
-        let cc = if to.is_signed() { IntCC::SignedGreaterThan } else { IntCC::UnsignedGreaterThan };
+        let cc = if to.is_signed() {
+            IntCC::SignedGreaterThan
+        } else {
+            IntCC::UnsignedGreaterThan
+        };
         let above = self.b.ins().icmp(cc, raised, hi);
         let clamped = self.b.ins().select(above, hi, raised);
         self.b.ins().ireduce(clif(to), clamped)
@@ -285,9 +310,15 @@ impl<M: Module> FnCx<'_, '_, M> {
         let scale = self.b.ins().f64const(1e6);
         let age = self.b.ins().fmul(age, scale);
         let age = self.b.ins().fcvt_to_sint_sat(types::I64, age);
-        let present = self.b.ins().load(types::I8, FLAGS, self.present, port as i32);
+        let present = self
+            .b
+            .ins()
+            .load(types::I8, FLAGS, self.present, port as i32);
         let missing = self.b.ins().icmp_imm_s(IntCC::Equal, present, 0);
-        let stamp = self.b.ins().load(types::I64, FLAGS, self.inputs, timestamp as i32);
+        let stamp = self
+            .b
+            .ins()
+            .load(types::I64, FLAGS, self.inputs, timestamp as i32);
         let now = self.b.ins().load(types::I64, FLAGS, self.cx, offsets::NOW);
         let elapsed = self.b.ins().isub(now, stamp);
         let old = self.b.ins().icmp(IntCC::SignedGreaterThan, elapsed, age);

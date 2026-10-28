@@ -19,7 +19,10 @@ impl PackDirs {
     /// The directories a file at `source` looks in: its own `.metor`, then
     /// each dev pack's `.metor` its `pyproject.toml` lists.
     pub fn around(source: &Path, extra: Vec<PathBuf>) -> PackDirs {
-        let dir = source.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let dir = source
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         let mut dirs = extra;
         dirs.push(dir.join(".metor"));
         let packs = metor_fsw_3::cli::run::dev_packs(dir);
@@ -29,7 +32,10 @@ impl PackDirs {
 
     /// The dev pack roots near `source`, which `metor pack dev` builds.
     pub fn dev_packs(source: &Path) -> Vec<PathBuf> {
-        let dir = source.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let dir = source
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         metor_fsw_3::cli::run::dev_packs(dir)
     }
 
@@ -54,7 +60,10 @@ impl Imports for PackDirs {
     fn frames(&self, pack: &str) -> Result<Vec<FrameDesc>, String> {
         let path = self.library(pack).ok_or_else(|| {
             let dirs: Vec<String> = self.0.iter().map(|d| d.display().to_string()).collect();
-            format!("no built pack `{pack}` under {}; build it with `metor pack dev`", dirs.join(", "))
+            format!(
+                "no built pack `{pack}` under {}; build it with `metor pack dev`",
+                dirs.join(", ")
+            )
         })?;
         // SAFETY: the library is a pack `metor pack dev` built; `open` checks
         // its ABI version before calling anything else.

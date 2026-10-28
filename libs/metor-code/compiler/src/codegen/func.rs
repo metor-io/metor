@@ -99,7 +99,10 @@ impl<M: Module> FnCx<'_, '_, M> {
     /// Ors this function's faults into `cx.faults`.
     pub fn flush_faults(&mut self) {
         let mine = self.b.use_var(self.faults);
-        let theirs = self.b.ins().load(types::I32, FLAGS, self.cx, offsets::FAULTS);
+        let theirs = self
+            .b
+            .ins()
+            .load(types::I32, FLAGS, self.cx, offsets::FAULTS);
         let both = self.b.ins().bor(mine, theirs);
         self.b.ins().store(FLAGS, both, self.cx, offsets::FAULTS);
     }
@@ -141,8 +144,14 @@ fn open<'f, 'm, M: Module>(
     let args = b.block_params(entry).to_vec();
     let cx = args[0];
     let load = |b: &mut FunctionBuilder<'_>, offset| b.ins().load(ptr, FLAGS, cx, offset);
-    let (inputs, present) = (load(&mut b, offsets::INPUTS), load(&mut b, offsets::PRESENT));
-    let (outputs, written) = (load(&mut b, offsets::OUTPUTS), load(&mut b, offsets::WRITTEN));
+    let (inputs, present) = (
+        load(&mut b, offsets::INPUTS),
+        load(&mut b, offsets::PRESENT),
+    );
+    let (outputs, written) = (
+        load(&mut b, offsets::OUTPUTS),
+        load(&mut b, offsets::WRITTEN),
+    );
     let (state, params_ptr) = (load(&mut b, offsets::STATE), load(&mut b, offsets::PARAMS));
     let faults = b.declare_var(types::I32);
     let zero = b.ins().iconst(types::I32, 0);
@@ -182,17 +191,35 @@ fn open<'f, 'm, M: Module>(
 }
 
 /// Lowers one `def`.
-pub(crate) fn define_def<M: Module>(module: &mut M, funcs: &Funcs, id: FuncId, def: &hir::Def) -> Result<(), CodegenError> {
+pub(crate) fn define_def<M: Module>(
+    module: &mut M,
+    funcs: &Funcs,
+    id: FuncId,
+    def: &hir::Def,
+) -> Result<(), CodegenError> {
     let mut ctx = module.make_context();
     ctx.func.signature = entry_sig(module);
     ctx.func.signature.returns.clear();
-    ctx.func.signature.params.extend(def.params.iter().map(|p| AbiParam::new(clif(*p))));
-    ctx.func.signature.returns.push(AbiParam::new(clif(def.ret)));
+    ctx.func
+        .signature
+        .params
+        .extend(def.params.iter().map(|p| AbiParam::new(clif(*p))));
+    ctx.func
+        .signature
+        .returns
+        .push(AbiParam::new(clif(def.ret)));
     let config = module.target_config();
     let mut fctx = FunctionBuilderContext::new();
     {
         let b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-        let mut f = open(module, funcs, b, &def.body.locals, def.params.len(), Some(def.ret));
+        let mut f = open(
+            module,
+            funcs,
+            b,
+            &def.body.locals,
+            def.params.len(),
+            Some(def.ret),
+        );
         f.stmts(&def.body.stmts);
         let zero = f.zero(def.ret);
         f.flush_faults();
@@ -251,7 +278,9 @@ impl<M: Module> FnCx<'_, '_, M> {
             .map(|block| self.b.func.dfg.block_call(*block, &[]))
             .collect();
         let default = self.b.func.dfg.block_call(fail, &[]);
-        let table = self.b.create_jump_table(JumpTableData::new(default, &calls));
+        let table = self
+            .b
+            .create_jump_table(JumpTableData::new(default, &calls));
         self.b.ins().br_table(point, table);
         self.b.switch_to_block(fail);
         self.ret_const(mc_rt::ResumeWord::Failed as u32);

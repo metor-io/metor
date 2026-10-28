@@ -10,8 +10,8 @@ use crate::diag::{Diagnostic, Span};
 use crate::hir::{self, Base, Place};
 use crate::types::{ConstVal, FrameTy, Prim, Ty, pascal_case};
 
-use super::scope::{Ctx, Port, Prog, Scope};
 use super::Checker;
+use super::scope::{Ctx, Port, Prog, Scope};
 
 /// One `alert` and its state slots.
 struct Alert {
@@ -67,7 +67,11 @@ impl Checker {
                 inputs: block_size(&prog.inputs, &self.frames),
                 outputs: block_size(&prog.outputs, &self.frames),
                 state: prog.state_size,
-                params: params.iter().map(|p| p.offset + p.prim.size()).max().unwrap_or(0),
+                params: params
+                    .iter()
+                    .map(|p| p.offset + p.prim.size())
+                    .max()
+                    .unwrap_or(0),
             },
             params,
             entry: EntryDesc {
@@ -111,7 +115,10 @@ impl Checker {
         let mut size = 0u32;
         for decl in decls {
             if params.iter().any(|p| p.name == decl.name.name) {
-                self.error(decl.name.span, format!("param `{}` is declared twice", decl.name.name));
+                self.error(
+                    decl.name.span,
+                    format!("param `{}` is declared twice", decl.name.name),
+                );
                 continue;
             }
             let declared = decl.ty.as_ref().and_then(|ty| self.scalar_type(ty));
@@ -123,7 +130,10 @@ impl Checker {
                 self.coerce_const(value, declared, e.span)
             });
             let Some(prim) = declared.or(default.map(|(_, prim)| prim)) else {
-                self.error(decl.name.span, "a param needs a type or a default, as in `gain = 1.0`");
+                self.error(
+                    decl.name.span,
+                    "a param needs a type or a default, as in `gain = 1.0`",
+                );
                 continue;
             };
             let offset = size.next_multiple_of(prim.size());
@@ -154,15 +164,28 @@ impl Checker {
                         && self.fresh_port(prog, name)
                     {
                         let offset = next_offset(&prog.inputs, &self.frames);
-                        prog.inputs.push(Port { name: name.name.clone(), frame, offset });
+                        prog.inputs.push(Port {
+                            name: name.name.clone(),
+                            frame,
+                            offset,
+                        });
                     }
                 }
-                Member::Out { name, ty, keep: kept, .. } => {
+                Member::Out {
+                    name,
+                    ty,
+                    keep: kept,
+                    ..
+                } => {
                     if let Some(frame) = self.frame_type(ty)
                         && self.fresh_port(prog, name)
                     {
                         let offset = next_offset(&prog.outputs, &self.frames);
-                        prog.outputs.push(Port { name: name.name.clone(), frame, offset });
+                        prog.outputs.push(Port {
+                            name: name.name.clone(),
+                            frame,
+                            offset,
+                        });
                         keep.push(*kept);
                     }
                 }
@@ -174,11 +197,21 @@ impl Checker {
 
     /// Whether `name` is free for a port, reporting it if not.
     fn fresh_port(&mut self, prog: &Prog, name: &ast::Ident) -> bool {
-        let taken = prog.inputs.iter().chain(&prog.outputs).any(|p| p.name == name.name)
+        let taken = prog
+            .inputs
+            .iter()
+            .chain(&prog.outputs)
+            .any(|p| p.name == name.name)
             || prog.params.iter().any(|(n, _, _)| *n == name.name)
-            || matches!(name.name.as_str(), "log" | "status" | "abort" | "commands" | "channel_status");
+            || matches!(
+                name.name.as_str(),
+                "log" | "status" | "abort" | "commands" | "channel_status"
+            );
         if taken {
-            self.error(name.span, format!("the name `{}` is already taken", name.name));
+            self.error(
+                name.span,
+                format!("the name `{}` is already taken", name.name),
+            );
         }
         !taken
     }
@@ -186,26 +219,45 @@ impl Checker {
     /// Resolves `in x = prog.port` to that output's frame.
     fn bound_port(&mut self, program: &ast::Ident, port: &ast::Ident) -> Option<usize> {
         let Some(outputs) = self.outputs.get(&program.name) else {
-            self.error(program.span, format!("no program `{}` in this file", program.name));
+            self.error(
+                program.span,
+                format!("no program `{}` in this file", program.name),
+            );
             return None;
         };
-        let found = outputs.iter().find(|(name, _)| *name == port.name).map(|(_, f)| *f);
+        let found = outputs
+            .iter()
+            .find(|(name, _)| *name == port.name)
+            .map(|(_, f)| *f);
         if found.is_none() {
-            self.error(port.span, format!("`{}` has no output `{}`", program.name, port.name));
+            self.error(
+                port.span,
+                format!("`{}` has no output `{}`", program.name, port.name),
+            );
         }
         found
     }
 
     /// Adds the `alerts` output, a frame with one `bool` per alert.
-    fn alerts_port(&mut self, prog: &mut Prog, decl: &ast::ProgramDecl, alerts: &[&Member]) -> Option<u32> {
+    fn alerts_port(
+        &mut self,
+        prog: &mut Prog,
+        decl: &ast::ProgramDecl,
+        alerts: &[&Member],
+    ) -> Option<u32> {
         if alerts.is_empty() {
             return None;
         }
         let mut fields = Vec::new();
         for member in alerts {
-            let Member::Alert { name, .. } = member else { continue };
+            let Member::Alert { name, .. } = member else {
+                continue;
+            };
             if fields.iter().any(|(n, _)| *n == name.name) {
-                self.error(name.span, format!("alert `{}` is declared twice", name.name));
+                self.error(
+                    name.span,
+                    format!("alert `{}` is declared twice", name.name),
+                );
             }
             fields.push((name.name.clone(), Ty::Prim(Prim::Bool)));
         }
@@ -219,11 +271,18 @@ impl Checker {
             }
         };
         if prog.outputs.iter().any(|p| p.name == "alerts") {
-            self.error(decl.name.span, "a program with alerts cannot have its own `alerts` output");
+            self.error(
+                decl.name.span,
+                "a program with alerts cannot have its own `alerts` output",
+            );
             return None;
         }
         let offset = next_offset(&prog.outputs, &self.frames);
-        prog.outputs.push(Port { name: "alerts".into(), frame: index, offset });
+        prog.outputs.push(Port {
+            name: "alerts".into(),
+            frame: index,
+            offset,
+        });
         Some((prog.outputs.len() - 1) as u32)
     }
 
@@ -232,7 +291,16 @@ impl Checker {
         let mut sc = Scope::program(Ctx::Redline, prog);
         let mut alerts = Vec::new();
         for member in members {
-            let Member::Alert { name, severity, cond, hold, .. } = member else { continue };
+            let Member::Alert {
+                name,
+                severity,
+                cond,
+                hold,
+                ..
+            } = member
+            else {
+                continue;
+            };
             let cond = self.cond(&mut sc, cond);
             let hold_us = match hold {
                 None => 0,
@@ -257,14 +325,22 @@ impl Checker {
     }
 
     /// A system: its state initializers and its `loop:`.
-    fn system_bodies(&mut self, prog: Prog, decl: &ast::ProgramDecl, members: &Members<'_>) -> Bodies {
+    fn system_bodies(
+        &mut self,
+        prog: Prog,
+        decl: &ast::ProgramDecl,
+        members: &Members<'_>,
+    ) -> Bodies {
         let mut sc = Scope::program(Ctx::Init, prog);
         let mut init = Vec::new();
         for stmt in &members.steps {
             self.state_init(&mut sc, stmt, &mut init);
         }
         for (name, _) in &members.redlines {
-            self.error(decl.name.span, format!("redline `{name}` belongs in a sequence"));
+            self.error(
+                decl.name.span,
+                format!("redline `{name}` belongs in a sequence"),
+            );
         }
         if let Some((_, span)) = members.on_abort.first() {
             self.error(*span, "`on abort:` belongs in a sequence");
@@ -285,14 +361,26 @@ impl Checker {
     /// One state declaration at a system's top level: `name = value`.
     fn state_init(&mut self, sc: &mut Scope, stmt: &ast::Stmt, init: &mut Vec<hir::Stmt>) {
         let (name, ty, value) = match &stmt.kind {
-            StmtKind::Assign { target, op: None, value } => match &target.kind {
+            StmtKind::Assign {
+                target,
+                op: None,
+                value,
+            } => match &target.kind {
                 ast::ExprKind::Name(name) => (name.as_str(), None, value),
-                _ => return self.error(stmt.span, "a system's top level declares state, as in `x = 0.0`"),
+                _ => {
+                    return self.error(
+                        stmt.span,
+                        "a system's top level declares state, as in `x = 0.0`",
+                    );
+                }
             },
             StmtKind::Declare { name, ty, value } => (name.name.as_str(), Some(ty), value),
             _ => {
-                let diag = Diagnostic::new(stmt.span, "a system's top level declares ports, params, state and alerts")
-                    .with_note("statements that run each cycle go in `loop:`");
+                let diag = Diagnostic::new(
+                    stmt.span,
+                    "a system's top level declares ports, params, state and alerts",
+                )
+                .with_note("statements that run each cycle go in `loop:`");
                 return self.diags.push(diag);
             }
         };
@@ -304,7 +392,9 @@ impl Checker {
             Some(prim) => self.expect(sc, value, prim),
             None => self.expr(sc, value, None),
         };
-        let super::scope::Loc::State(offset) = sc.prog.state_var(name, value.prim) else { return };
+        let super::scope::Loc::State(offset) = sc.prog.state_var(name, value.prim) else {
+            return;
+        };
         init.push(hir::Stmt::Store {
             place: Place::at(Base::State, offset, value.prim),
             value,
@@ -315,7 +405,14 @@ impl Checker {
 
     /// A sequence: its steps, redlines and `on abort:`, with the abort
     /// coverage check.
-    fn sequence_bodies(&mut self, prog: Prog, decl: &ast::ProgramDecl, members: &Members<'_>, keep: &[bool], alerts: Option<u32>) -> Bodies {
+    fn sequence_bodies(
+        &mut self,
+        prog: Prog,
+        decl: &ast::ProgramDecl,
+        members: &Members<'_>,
+        keep: &[bool],
+        alerts: Option<u32>,
+    ) -> Bodies {
         if let Some((_, span)) = members.loops.first() {
             self.error(*span, "a sequence runs its steps once; it has no `loop:`");
         }
@@ -347,7 +444,15 @@ impl Checker {
 
     /// Every output the steps write must be written in `on abort:` too, or
     /// be marked `keep`.
-    fn check_coverage(&mut self, prog: &Prog, decl: &ast::ProgramDecl, written: &BTreeSet<u32>, covered: &BTreeSet<u32>, keep: &[bool], alerts: Option<u32>) {
+    fn check_coverage(
+        &mut self,
+        prog: &Prog,
+        decl: &ast::ProgramDecl,
+        written: &BTreeSet<u32>,
+        covered: &BTreeSet<u32>,
+        keep: &[bool],
+        alerts: Option<u32>,
+    ) {
         for &index in written {
             let kept = keep.get(index as usize).copied().unwrap_or(false);
             if covered.contains(&index) || kept || Some(index) == alerts {
@@ -355,9 +460,19 @@ impl Checker {
             }
             let port = &prog.outputs[index as usize].name;
             let span = out_span(decl, port).unwrap_or(decl.name.span);
-            let diag = Diagnostic::new(span, format!("`{}` writes `{port}`, but `on abort:` does not", decl.name.name))
-                .with_label(format!("`{port}` is left as the steps wrote it if the sequence aborts"))
-                .with_note(format!("write a safe value in `on abort:`, or mark it `out {port}: … keep`"));
+            let diag = Diagnostic::new(
+                span,
+                format!(
+                    "`{}` writes `{port}`, but `on abort:` does not",
+                    decl.name.name
+                ),
+            )
+            .with_label(format!(
+                "`{port}` is left as the steps wrote it if the sequence aborts"
+            ))
+            .with_note(format!(
+                "write a safe value in `on abort:`, or mark it `out {port}: … keep`"
+            ));
             self.diags.push(diag);
         }
     }
@@ -365,7 +480,13 @@ impl Checker {
 
 /// The bodies of a program: its prog, `init`, `step`, redlines and
 /// `on abort:`.
-type Bodies = (Prog, hir::Body, hir::Body, Vec<hir::Body>, Option<hir::Body>);
+type Bodies = (
+    Prog,
+    hir::Body,
+    hir::Body,
+    Vec<hir::Body>,
+    Option<hir::Body>,
+);
 
 fn sort_members(members: &[Member]) -> Members<'_> {
     let mut sorted = Members::default();
@@ -396,11 +517,21 @@ fn sort_members(members: &[Member]) -> Members<'_> {
 /// `port` is the `alerts` output's index and offset. Its frame holds one
 /// `bool` per alert after the timestamp.
 fn alert_stmts(alerts: &[Alert], port: Option<(u32, u32)>) -> Vec<hir::Stmt> {
-    let Some((port, port_offset)) = port else { return Vec::new() };
+    let Some((port, port_offset)) = port else {
+        return Vec::new();
+    };
     let state = |offset, prim| Place::at(Base::State, offset, prim);
-    let set = |place: Place, value| hir::Stmt::Store { place, value, nan_guard: false, mark: None };
+    let set = |place: Place, value| hir::Stmt::Store {
+        place,
+        value,
+        nan_guard: false,
+        mark: None,
+    };
     let bool_const = |v| hir::Expr::constant(ConstVal::Bool(v), Prim::Bool);
-    let now = || hir::Expr { kind: hir::ExprKind::NowMicros, prim: Prim::I64 };
+    let now = || hir::Expr {
+        kind: hir::ExprKind::NowMicros,
+        prim: Prim::I64,
+    };
     let mut stmts = Vec::new();
     for (index, alert) in alerts.iter().enumerate() {
         let flag = Place::at(Base::Output, port_offset + 8 + index as u32, Prim::Bool);
@@ -415,22 +546,34 @@ fn alert_stmts(alerts: &[Alert], port: Option<(u32, u32)>) -> Vec<hir::Stmt> {
                     ),
                     prim: Prim::I64,
                 }),
-                Box::new(hir::Expr::constant(ConstVal::Int(alert.hold_us.into()), Prim::I64)),
+                Box::new(hir::Expr::constant(
+                    ConstVal::Int(alert.hold_us.into()),
+                    Prim::I64,
+                )),
             ),
             prim: Prim::Bool,
         };
         let start = hir::Stmt::If {
             cond: hir::Expr {
-                kind: hir::ExprKind::Not(Box::new(hir::Expr::load(state(alert.holding, Prim::Bool)))),
+                kind: hir::ExprKind::Not(Box::new(hir::Expr::load(state(
+                    alert.holding,
+                    Prim::Bool,
+                )))),
                 prim: Prim::Bool,
             },
-            then: vec![set(state(alert.holding, Prim::Bool), bool_const(true)), set(state(alert.since, Prim::I64), now())],
+            then: vec![
+                set(state(alert.holding, Prim::Bool), bool_const(true)),
+                set(state(alert.since, Prim::I64), now()),
+            ],
             orelse: Vec::new(),
         };
         stmts.push(hir::Stmt::If {
             cond: alert.cond.clone(),
             then: vec![start, set(flag.clone(), held)],
-            orelse: vec![set(state(alert.holding, Prim::Bool), bool_const(false)), set(flag, bool_const(false))],
+            orelse: vec![
+                set(state(alert.holding, Prim::Bool), bool_const(false)),
+                set(flag, bool_const(false)),
+            ],
         });
     }
     stmts.push(hir::Stmt::Mark(port));

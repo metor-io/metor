@@ -1,8 +1,8 @@
 //! The step of a compiled system: copy the inputs in, call `step`, flush
 //! the outputs it marked, and report its faults and alerts.
 
-use metor_fsw_3::log::{LogPort, with_log_port};
 use metor_fsw_3::coordinator::StepCx;
+use metor_fsw_3::log::{LogPort, with_log_port};
 use metor_fsw_3::{Log, Step, Timestamp};
 
 use crate::instance::Instance;
@@ -46,7 +46,9 @@ impl Step for CyclicStep {
     }
 
     fn fault(&mut self, now: Timestamp, message: &str) {
-        with_log_port(&mut self.log, now, || Log.fault("panic", message.to_string()));
+        with_log_port(&mut self.log, now, || {
+            Log.fault("panic", message.to_string())
+        });
     }
 }
 

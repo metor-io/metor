@@ -42,10 +42,14 @@ fn open() -> Arc<Pack> {
 
 fn aot_trace(fill: f64, leak: f64, params: serde_json::Value) -> Vec<Sample> {
     let mut table = SystemTable::new();
-    table.register_pack("stand", open()).expect("the pack registers");
+    table
+        .register_pack("stand", open())
+        .expect("the pack registers");
     let trace = Trace::default();
     add_rust(&mut table, (fill, leak), &trace);
-    let mut coordinator = config("stand.", params).build(&table).expect("the stand builds");
+    let mut coordinator = config("stand.", params)
+        .build(&table)
+        .expect("the stand builds");
     run(&mut coordinator, 800);
     trace.samples()
 }
@@ -63,7 +67,9 @@ fn jit_trace(fill: f64, leak: f64, params: serde_json::Value) -> Vec<Sample> {
 #[test]
 fn test_library_exports_the_pack_abi() {
     let pack = open();
-    let Pack::Dl(dl) = &*pack else { panic!("a library") };
+    let Pack::Dl(dl) = &*pack else {
+        panic!("a library")
+    };
     let lib = dl.library();
     // SAFETY: the symbol is the ABI version export, `extern "C" fn() -> u32`.
     let version = unsafe { lib.get::<unsafe extern "C" fn() -> u32>(b"metor_fsw_abi_version") }
@@ -72,10 +78,20 @@ fn test_library_exports_the_pack_abi() {
     assert_eq!(version, ABI_VERSION);
     let systems = &pack.descriptor().systems;
     let kinds: Vec<(&str, SystemKind)> = systems.iter().map(|s| (s.ty.as_str(), s.kind)).collect();
-    assert_eq!(kinds, [("leak_check", SystemKind::Sequence), ("heater", SystemKind::Cyclic)]);
+    assert_eq!(
+        kinds,
+        [
+            ("leak_check", SystemKind::Sequence),
+            ("heater", SystemKind::Cyclic)
+        ]
+    );
     let leak = &systems[0];
     assert!(leak.doc.starts_with("Pressurises"));
-    assert!(leak.params.as_ref().is_some_and(|p| p.get().contains("\"target\"")));
+    assert!(
+        leak.params
+            .as_ref()
+            .is_some_and(|p| p.get().contains("\"target\""))
+    );
     let inputs: Vec<&str> = leak.def.inputs.iter().map(|p| p.name.as_ref()).collect();
     assert_eq!(inputs, ["abort", "chamber"]);
 }

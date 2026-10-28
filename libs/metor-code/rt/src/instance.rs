@@ -133,7 +133,10 @@ impl Instance {
         let (offset, size) = self.port_span(true, port)?;
         let present = self.blocks.present.get_mut(port)?;
         *present = 1;
-        self.blocks.inputs.as_mut_bytes().get_mut(offset..offset + size)
+        self.blocks
+            .inputs
+            .as_mut_bytes()
+            .get_mut(offset..offset + size)
     }
 
     /// Returns output `port`'s frame bytes.
@@ -145,7 +148,10 @@ impl Instance {
     /// Returns output `port`'s frame bytes, to stamp before a flush.
     pub fn output_mut(&mut self, port: usize) -> Option<&mut [u8]> {
         let (offset, size) = self.port_span(false, port)?;
-        self.blocks.outputs.as_mut_bytes().get_mut(offset..offset + size)
+        self.blocks
+            .outputs
+            .as_mut_bytes()
+            .get_mut(offset..offset + size)
     }
 
     /// Returns whether output `port` was written since it was last cleared,
@@ -212,7 +218,11 @@ fn decode_params(params: &[ParamDesc], given: &Value, block: &mut [u8]) -> Resul
     let given = match given {
         Value::Null => &serde_json::Map::new(),
         Value::Object(map) => map,
-        other => return Err(ParamError::Decode(format!("params must be an object, not {other}"))),
+        other => {
+            return Err(ParamError::Decode(format!(
+                "params must be an object, not {other}"
+            )));
+        }
     };
     if let Some(key) = given.keys().find(|k| params.iter().all(|p| &p.name != *k)) {
         return Err(ParamError::UnknownKey(key.clone()));
@@ -222,7 +232,9 @@ fn decode_params(params: &[ParamDesc], given: &Value, block: &mut [u8]) -> Resul
         let offset = param.offset as usize;
         let dst = block
             .get_mut(offset..offset + param.prim.size() as usize)
-            .ok_or_else(|| ParamError::Decode(format!("`{}` lies outside its block", param.name)))?;
+            .ok_or_else(|| {
+                ParamError::Decode(format!("`{}` lies outside its block", param.name))
+            })?;
         write_prim(dst, param.prim, value)
             .map_err(|message| ParamError::Decode(format!("`{}`: {message}", param.name)))?;
     }
@@ -231,13 +243,27 @@ fn decode_params(params: &[ParamDesc], given: &Value, block: &mut [u8]) -> Resul
 
 /// Writes `value` into `dst` as a `prim`. `dst` is `prim.size()` long.
 pub fn write_prim(dst: &mut [u8], prim: Prim, value: &Value) -> Result<(), String> {
-    let int = || value.as_i64().ok_or_else(|| format!("{value} is not an integer"));
-    let uint = || value.as_u64().ok_or_else(|| format!("{value} is not an unsigned integer"));
-    let float = || value.as_f64().ok_or_else(|| format!("{value} is not a number"));
+    let int = || {
+        value
+            .as_i64()
+            .ok_or_else(|| format!("{value} is not an integer"))
+    };
+    let uint = || {
+        value
+            .as_u64()
+            .ok_or_else(|| format!("{value} is not an unsigned integer"))
+    };
+    let float = || {
+        value
+            .as_f64()
+            .ok_or_else(|| format!("{value} is not a number"))
+    };
     let range = |_| format!("{value} is out of range");
     match prim {
         Prim::Bool => {
-            let bit = value.as_bool().ok_or_else(|| format!("{value} is not a bool"))?;
+            let bit = value
+                .as_bool()
+                .ok_or_else(|| format!("{value} is not a bool"))?;
             dst.copy_from_slice(&[u8::from(bit)]);
         }
         Prim::U8 => dst.copy_from_slice(&u8::try_from(uint()?).map_err(range)?.to_ne_bytes()),

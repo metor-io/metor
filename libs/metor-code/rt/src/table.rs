@@ -52,6 +52,9 @@ fn dyn_type(program: &Program, index: usize, ty: &TypeDesc) -> Result<DynType, B
         def_fn: Box::new(move |cx| system_def(&desc, &desc.types[index], cx)),
         doc: ty.doc.clone().into(),
         schema: params_schema(&ty.params),
+        // fsw-3's table holds makes in an `Arc`; a program's steps stay on
+        // the thread that made them.
+        #[allow(clippy::arc_with_non_send_sync)]
         make: Arc::new(move |cx| make(&make_program, index, &redlines, cx)),
     })
 }

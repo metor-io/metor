@@ -18,7 +18,11 @@ use crate::schema::port_def;
 ///
 /// A sequence's inputs start with `abort`, and every type's outputs end
 /// with `log`.
-pub fn system_def(desc: &ProgramDesc, ty: &TypeDesc, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+pub fn system_def(
+    desc: &ProgramDesc,
+    ty: &TypeDesc,
+    cx: &DefCx<'_>,
+) -> Result<SystemDef, DefError> {
     let port = |p: &crate::desc::PortDesc| {
         let frame = desc.frame_of(p).ok_or_else(|| DefError::Pack {
             message: format!("port `{}` names no frame", p.name),
@@ -56,7 +60,10 @@ impl Rings {
     ///
     /// `inputs` and `outputs` are the bindings of the compiled ports and
     /// `log`, in definition order, with any `abort` input taken off.
-    pub fn bind(inputs: Vec<InputBinding>, mut outputs: Vec<OutputBinding>) -> Option<(Rings, LogPort)> {
+    pub fn bind(
+        inputs: Vec<InputBinding>,
+        mut outputs: Vec<OutputBinding>,
+    ) -> Option<(Rings, LogPort)> {
         let log = outputs.pop()?;
         let dropped = Arc::new(AtomicU32::new(0));
         let rings = Rings {

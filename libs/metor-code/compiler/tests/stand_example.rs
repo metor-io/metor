@@ -14,7 +14,10 @@ use metor_fsw_3::dl::PackRef;
 use metor_fsw_3::metor_proto_wkt::SequenceChannelState;
 use metor_fsw_3::{ChannelName, ChannelStatus, Input, Pack, Timestamp, system};
 
-const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../examples/metor-code-stand");
+const EXAMPLE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../examples/metor-code-stand"
+);
 
 /// Builds the `stand` pack into a temp dir once, and returns its module dir.
 fn stand_module() -> &'static Path {
@@ -65,11 +68,17 @@ fn run(plant: serde_json::Value, cycles: i64) -> Option<u32> {
     let stand = stand_module();
     let io_module = Path::new(EXAMPLE).join("systems/stand-io/.metor/stand_io");
     let mut table = SystemTable::new();
-    table.register_pack("stand_io", open("stand_io", &io_module)).expect("registers");
-    table.register_pack("stand", open("stand", stand)).expect("registers");
+    table
+        .register_pack("stand_io", open("stand_io", &io_module))
+        .expect("registers");
+    table
+        .register_pack("stand", open("stand", stand))
+        .expect("registers");
     let last = Last::default();
     let probe_state = last.clone();
-    table.register("probe", probe(), move || probe_state.clone()).expect("registers");
+    table
+        .register("probe", probe(), move || probe_state.clone())
+        .expect("registers");
     let channel = Adapter::Channel(ChannelConfig {
         name: ChannelName::try_from("leak_check".to_string()).expect("short"),
         start: RunState::Running,

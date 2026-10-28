@@ -69,7 +69,9 @@ impl<'a> Walk<'a> {
     }
 
     fn stmts(&self, stmts: &[Stmt]) -> Option<u64> {
-        stmts.iter().try_fold(0u64, |sum, s| Some(sum.saturating_add(self.stmt(s)?)))
+        stmts
+            .iter()
+            .try_fold(0u64, |sum, s| Some(sum.saturating_add(self.stmt(s)?)))
     }
 
     fn stmt(&self, stmt: &Stmt) -> Option<u64> {
@@ -81,8 +83,12 @@ impl<'a> Walk<'a> {
             }
             Stmt::Zero { len, .. } | Stmt::Copy { len, .. } => u64::from(len.div_ceil(8)),
             Stmt::Mark(_) | Stmt::Fail(_) => 1,
-            Stmt::If { cond, then, orelse } => 1 + self.expr(cond)? + self.stmts(then)?.max(self.stmts(orelse)?),
-            Stmt::For { count, body, .. } => (2 + self.stmts(body)?).saturating_mul(u64::from(*count)),
+            Stmt::If { cond, then, orelse } => {
+                1 + self.expr(cond)? + self.stmts(then)?.max(self.stmts(orelse)?)
+            }
+            Stmt::For { count, body, .. } => {
+                (2 + self.stmts(body)?).saturating_mul(u64::from(*count))
+            }
             Stmt::Wait { micros, .. } => 4 + self.expr(micros)?,
             Stmt::WaitUntil { cond, timeout, .. } => {
                 let timeout = timeout.as_ref().map_or(Some(0), |t| self.expr(&t.micros))?;
@@ -92,17 +98,25 @@ impl<'a> Walk<'a> {
     }
 
     fn exprs<'e>(&self, exprs: impl Iterator<Item = &'e Expr>) -> Option<u64> {
-        exprs.map(|e| self.expr(e)).try_fold(0u64, |sum, c| Some(sum.saturating_add(c?)))
+        exprs
+            .map(|e| self.expr(e))
+            .try_fold(0u64, |sum, c| Some(sum.saturating_add(c?)))
     }
 
     fn expr(&self, e: &Expr) -> Option<u64> {
         Some(match &e.kind {
-            ExprKind::Const(_) | ExprKind::Local(_) | ExprKind::NowMicros | ExprKind::Now | ExprKind::Dt => 1,
+            ExprKind::Const(_)
+            | ExprKind::Local(_)
+            | ExprKind::NowMicros
+            | ExprKind::Now
+            | ExprKind::Dt => 1,
             ExprKind::Load(place) => 1 + self.exprs(place.index.iter().map(|i| &i.value))?,
             ExprKind::Neg(x) | ExprKind::Not(x) | ExprKind::Cast(x) => 1 + self.expr(x)?,
             ExprKind::Binary(_, a, b) => 4 + self.expr(a)? + self.expr(b)?,
             ExprKind::Logic { lhs, rhs, .. } => 2 + self.expr(lhs)? + self.expr(rhs)?,
-            ExprKind::Call(def, args) => 2 + (*self.defs.get(*def as usize)?)? + self.exprs(args.iter())?,
+            ExprKind::Call(def, args) => {
+                2 + (*self.defs.get(*def as usize)?)? + self.exprs(args.iter())?
+            }
             ExprKind::Math(_, args) => 50 + self.exprs(args.iter())?,
             ExprKind::Builtin(_, args) => 2 + self.exprs(args.iter())?,
             ExprKind::Stale { age, .. } => 6 + self.expr(age)?,
@@ -148,6 +162,10 @@ fn visit_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
             args.iter().for_each(|a| visit_expr(a, f));
         }
         ExprKind::Stale { age, .. } => visit_expr(age, f),
-        ExprKind::Const(_) | ExprKind::Local(_) | ExprKind::NowMicros | ExprKind::Now | ExprKind::Dt => {}
+        ExprKind::Const(_)
+        | ExprKind::Local(_)
+        | ExprKind::NowMicros
+        | ExprKind::Now
+        | ExprKind::Dt => {}
     }
 }

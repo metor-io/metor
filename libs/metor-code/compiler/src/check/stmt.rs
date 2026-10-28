@@ -5,9 +5,9 @@ use crate::diag::{Diagnostic, Span};
 use crate::hir::{self, Base, Place};
 use crate::types::{ConstVal, Prim};
 
+use super::Checker;
 use super::expr::PlaceRes;
 use super::scope::{Ctx, Loc, Scope};
-use super::Checker;
 
 impl Checker {
     pub fn stmts(&mut self, sc: &mut Scope, stmts: &[ast::Stmt]) -> Vec<hir::Stmt> {
@@ -20,8 +20,16 @@ impl Checker {
 
     fn stmt(&mut self, sc: &mut Scope, stmt: &ast::Stmt, out: &mut Vec<hir::Stmt>) {
         match &stmt.kind {
-            StmtKind::Assign { target, op: None, value } => self.assign(sc, target, value, out),
-            StmtKind::Assign { target, op: Some(op), value } => {
+            StmtKind::Assign {
+                target,
+                op: None,
+                value,
+            } => self.assign(sc, target, value, out),
+            StmtKind::Assign {
+                target,
+                op: Some(op),
+                value,
+            } => {
                 let value = ast::Expr {
                     kind: ExprKind::Binary(*op, Box::new(target.clone()), Box::new(value.clone())),
                     span: stmt.span,
@@ -44,7 +52,9 @@ impl Checker {
             StmtKind::Return(value) => self.ret(sc, value, stmt.span, out),
             StmtKind::Pass | StmtKind::Error => {}
             StmtKind::Wait(duration) => self.wait(sc, duration, stmt.span, out),
-            StmtKind::WaitUntil { cond, timeout } => self.wait_until(sc, cond, timeout.as_ref(), stmt.span, out),
+            StmtKind::WaitUntil { cond, timeout } => {
+                self.wait_until(sc, cond, timeout.as_ref(), stmt.span, out)
+            }
             StmtKind::Fail(message) => {
                 if self.in_steps(sc, stmt.span, "`fail`") {
                     out.push(hir::Stmt::Fail(sc.prog.fail(message)));
@@ -62,7 +72,13 @@ impl Checker {
         false
     }
 
-    fn assign(&mut self, sc: &mut Scope, target: &ast::Expr, value: &ast::Expr, out: &mut Vec<hir::Stmt>) {
+    fn assign(
+        &mut self,
+        sc: &mut Scope,
+        target: &ast::Expr,
+        value: &ast::Expr,
+        out: &mut Vec<hir::Stmt>,
+    ) {
         let ExprKind::Name(name) = &target.kind else {
             if let Some(place) = self.place(sc, target) {
                 self.store(sc, place, value, target.span, out);
@@ -117,8 +133,17 @@ impl Checker {
         }
     }
 
-    fn declare(&mut self, sc: &mut Scope, name: &ast::Ident, ty: &ast::TypeExpr, value: &ast::Expr, out: &mut Vec<hir::Stmt>) {
-        let Some(prim) = self.scalar_type(ty) else { return };
+    fn declare(
+        &mut self,
+        sc: &mut Scope,
+        name: &ast::Ident,
+        ty: &ast::TypeExpr,
+        value: &ast::Expr,
+        out: &mut Vec<hir::Stmt>,
+    ) {
+        let Some(prim) = self.scalar_type(ty) else {
+            return;
+        };
         if sc.var(&name.name).is_some() {
             return self.error(name.span, format!("`{}` is already defined", name.name));
         }
@@ -130,7 +155,14 @@ impl Checker {
     }
 
     /// Stores into a scalar place.
-    fn store(&mut self, sc: &mut Scope, place: PlaceRes, value: &ast::Expr, span: Span, out: &mut Vec<hir::Stmt>) {
+    fn store(
+        &mut self,
+        sc: &mut Scope,
+        place: PlaceRes,
+        value: &ast::Expr,
+        span: Span,
+        out: &mut Vec<hir::Stmt>,
+    ) {
         let port = place.port;
         let Some(place) = place.scalar() else {
             return self.error(span, "only a scalar can be assigned; assign each element");
@@ -150,7 +182,14 @@ impl Checker {
 
     /// Writes a whole output frame: `out = Frame(field = v, …)` or
     /// `out = other_port`.
-    fn frame_write(&mut self, sc: &mut Scope, place: PlaceRes, value: &ast::Expr, span: Span, out: &mut Vec<hir::Stmt>) {
+    fn frame_write(
+        &mut self,
+        sc: &mut Scope,
+        place: PlaceRes,
+        value: &ast::Expr,
+        span: Span,
+        out: &mut Vec<hir::Stmt>,
+    ) {
         let Some((false, index)) = place.port else {
             return self.error(span, "inputs are read-only");
         };
@@ -170,8 +209,10 @@ impl Checker {
                 }
                 out.push(hir::Stmt::Mark(index as u32));
             }
-            ExprKind::Name(name) if matches!(sc.port(name), Some(_)) => {
-                let Some(src) = self.place(sc, value) else { return };
+            ExprKind::Name(name) if sc.port(name).is_some() => {
+                let Some(src) = self.place(sc, value) else {
+                    return;
+                };
                 if src.ty != crate::types::Ty::Frame(frame) {
                     return self.error(value.span, "this port carries another frame");
                 }
@@ -184,31 +225,56 @@ impl Checker {
             }
             _ => {
                 let name = &self.frames[frame].name;
-                let diag = Diagnostic::new(value.span, format!("an output is written as a whole frame, as in `{name}(field = …)`"))
-                    .with_note("or write one field, as in `out.field = …`");
+                let diag = Diagnostic::new(
+                    value.span,
+                    format!("an output is written as a whole frame, as in `{name}(field = …)`"),
+                )
+                .with_note("or write one field, as in `out.field = …`");
                 self.diags.push(diag);
             }
         }
     }
 
     /// Stores one `field = value` of a frame being built.
-    fn field_arg(&mut self, sc: &mut Scope, frame: usize, offset: u32, port: usize, arg: &ast::Arg, out: &mut Vec<hir::Stmt>) {
+    fn field_arg(
+        &mut self,
+        sc: &mut Scope,
+        frame: usize,
+        offset: u32,
+        port: usize,
+        arg: &ast::Arg,
+        out: &mut Vec<hir::Stmt>,
+    ) {
         let Some(name) = &arg.name else {
-            return self.error(arg.value.span, "name each field, as in `Frame(field = value)`");
+            return self.error(
+                arg.value.span,
+                "name each field, as in `Frame(field = value)`",
+            );
         };
         let Some(field) = self.frames[frame].field(&name.name).cloned() else {
             let frame = &self.frames[frame].name;
-            return self.error(name.span, format!("frame `{frame}` has no field `{}`", name.name));
+            return self.error(
+                name.span,
+                format!("frame `{frame}` has no field `{}`", name.name),
+            );
         };
         let Some(prim) = field.ty.prim() else {
-            return self.error(name.span, "only scalar fields can be set here; set elements after");
+            return self.error(
+                name.span,
+                "only scalar fields can be set here; set elements after",
+            );
         };
         let value = self.assigned(sc, &arg.value, prim);
         let place = Place::at(Base::Output, offset + field.offset, prim);
         out.push(store(place, value, Some(port as u32)));
     }
 
-    fn if_chain(&mut self, sc: &mut Scope, branches: &[(ast::Expr, Vec<ast::Stmt>)], orelse: Option<&[ast::Stmt]>) -> Option<hir::Stmt> {
+    fn if_chain(
+        &mut self,
+        sc: &mut Scope,
+        branches: &[(ast::Expr, Vec<ast::Stmt>)],
+        orelse: Option<&[ast::Stmt]>,
+    ) -> Option<hir::Stmt> {
         let ((cond, body), rest) = branches.split_first()?;
         let cond = self.cond(sc, cond);
         let then = self.stmts(sc, body);
@@ -219,11 +285,25 @@ impl Checker {
         Some(hir::Stmt::If { cond, then, orelse })
     }
 
-    fn for_loop(&mut self, sc: &mut Scope, var: &ast::Ident, count: &ast::Expr, body: &[ast::Stmt], out: &mut Vec<hir::Stmt>) {
-        let Some(count) = self.const_count(count, count.span) else { return };
+    fn for_loop(
+        &mut self,
+        sc: &mut Scope,
+        var: &ast::Ident,
+        count: &ast::Expr,
+        body: &[ast::Stmt],
+        out: &mut Vec<hir::Stmt>,
+    ) {
+        let Some(count) = self.const_count(count, count.span) else {
+            return;
+        };
         let var = match sc.var(&var.name).cloned() {
             Some(existing) if existing.prim == Prim::I64 => existing.loc,
-            Some(_) => return self.error(var.span, format!("`{}` is already a variable of another type", var.name)),
+            Some(_) => {
+                return self.error(
+                    var.span,
+                    format!("`{}` is already a variable of another type", var.name),
+                );
+            }
             None => sc.new_var(&var.name, Prim::I64),
         };
         let body = self.stmts(sc, body);
@@ -250,18 +330,33 @@ impl Checker {
         let micros = self.micros(sc, duration);
         let deadline = sc.prog.alloc(8);
         let point = sc.prog.next_point();
-        out.push(hir::Stmt::Wait { point, deadline, micros });
+        out.push(hir::Stmt::Wait {
+            point,
+            deadline,
+            micros,
+        });
     }
 
     /// `wait until c [timeout d]`: a resume point that waits for `c`.
-    fn wait_until(&mut self, sc: &mut Scope, cond: &ast::Expr, timeout: Option<&ast::Expr>, span: Span, out: &mut Vec<hir::Stmt>) {
+    fn wait_until(
+        &mut self,
+        sc: &mut Scope,
+        cond: &ast::Expr,
+        timeout: Option<&ast::Expr>,
+        span: Span,
+        out: &mut Vec<hir::Stmt>,
+    ) {
         if !self.in_steps(sc, span, "`wait until`") {
             return;
         }
         let checked = self.cond(sc, cond);
         let timeout = timeout.map(|duration| {
             let micros = self.micros(sc, duration);
-            let text = self.src.get(cond.span.range()).unwrap_or("its condition").to_string();
+            let text = self
+                .src
+                .get(cond.span.range())
+                .unwrap_or("its condition")
+                .to_string();
             hir::Timeout {
                 deadline: sc.prog.alloc(8),
                 micros,

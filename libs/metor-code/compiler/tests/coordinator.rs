@@ -26,14 +26,23 @@ fn test_leak_check_completes_in_a_coordinator() {
     let samples = trace.samples();
     assert_eq!(samples[1].open, Some(1), "the valve opens");
     assert_eq!(samples.last().and_then(|s| s.open), Some(0), "and closes");
-    assert_eq!(trace.last_state(), Some(SequenceChannelState::Completed.code()));
-    assert!(samples.iter().any(|s| s.duty.is_some_and(|d| d > 0.0)), "the heater runs");
+    assert_eq!(
+        trace.last_state(),
+        Some(SequenceChannelState::Completed.code())
+    );
+    assert!(
+        samples.iter().any(|s| s.duty.is_some_and(|d| d > 0.0)),
+        "the heater runs"
+    );
 }
 
 #[test]
 fn test_leak_fails_after_abort_runs() {
     let trace = stand(5.0, 0.05, serde_json::json!({ "hold": 2.0 }));
-    assert_eq!(trace.last_state(), Some(SequenceChannelState::Failed.code()));
+    assert_eq!(
+        trace.last_state(),
+        Some(SequenceChannelState::Failed.code())
+    );
     assert_eq!(trace.samples().last().and_then(|s| s.open), Some(0));
 }
 
@@ -41,7 +50,10 @@ fn test_leak_fails_after_abort_runs() {
 fn test_redline_aborts_and_on_abort_closes_the_valve() {
     let trace = stand(40.0, 0.0, serde_json::Value::Null);
     let samples = trace.samples();
-    let opened = samples.iter().position(|s| s.open == Some(1)).expect("opens");
+    let opened = samples
+        .iter()
+        .position(|s| s.open == Some(1))
+        .expect("opens");
     let aborted = samples
         .iter()
         .position(|s| s.state == Some(SequenceChannelState::Aborted.code()))

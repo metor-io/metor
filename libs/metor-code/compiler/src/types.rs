@@ -97,7 +97,12 @@ pub struct FieldTy {
 
 impl FrameTy {
     /// Lays out a declared frame's fields after its timestamp.
-    pub fn declared(name: &str, fields: Vec<(String, Ty)>, frames: &[FrameTy], span: Span) -> FrameTy {
+    pub fn declared(
+        name: &str,
+        fields: Vec<(String, Ty)>,
+        frames: &[FrameTy],
+        span: Span,
+    ) -> FrameTy {
         let mut offset = 8u32;
         let mut align = 8u32;
         let fields = fields
@@ -214,7 +219,9 @@ pub fn snake_case(name: &str) -> String {
         let next = chars.get(i + 1);
         let boundary = c.is_uppercase()
             && prev.is_some_and(|p| {
-                p.is_lowercase() || p.is_ascii_digit() || (p.is_uppercase() && next.is_some_and(|n| n.is_lowercase()))
+                p.is_lowercase()
+                    || p.is_ascii_digit()
+                    || (p.is_uppercase() && next.is_some_and(|n| n.is_lowercase()))
             });
         if boundary {
             out.push('_');
@@ -272,12 +279,18 @@ mod tests {
         let fields = vec![
             ("on".to_string(), Ty::Prim(Prim::Bool)),
             ("duty".to_string(), Ty::Prim(Prim::F64)),
-            ("bits".to_string(), Ty::Array(Box::new(Ty::Prim(Prim::U16)), 3)),
+            (
+                "bits".to_string(),
+                Ty::Array(Box::new(Ty::Prim(Prim::U16)), 3),
+            ),
         ];
         let frame = FrameTy::declared("HeaterCmd", fields, &[], Span::default());
         let offsets: Vec<u32> = frame.fields.iter().map(|f| f.offset).collect();
         assert_eq!(offsets, [8, 16, 24]);
-        assert_eq!((frame.size, frame.align, frame.record.as_str()), (32, 8, "heater_cmd"));
+        assert_eq!(
+            (frame.size, frame.align, frame.record.as_str()),
+            (32, 8, "heater_cmd")
+        );
         assert_eq!(frame.desc().leaves.len(), 5);
     }
 

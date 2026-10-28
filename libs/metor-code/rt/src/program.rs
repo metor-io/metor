@@ -1,6 +1,7 @@
 //! A compiled program: its descriptor and its function table.
 
 use std::any::Any;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::cx::EntryFn;
@@ -41,7 +42,7 @@ pub struct Program {
     pub desc: Arc<ProgramDesc>,
     fns: Arc<[EntryFn]>,
     /// Keeps the memory `fns` points into alive, for a JIT.
-    _owner: Option<Arc<dyn Any>>,
+    _owner: Option<Rc<dyn Any>>,
 }
 
 impl Program {
@@ -51,7 +52,7 @@ impl Program {
     pub fn new(
         desc: ProgramDesc,
         fns: Vec<EntryFn>,
-        owner: Option<Arc<dyn Any>>,
+        owner: Option<Rc<dyn Any>>,
     ) -> Result<Program, ProgramError> {
         if desc.version != DESC_VERSION {
             return Err(ProgramError::Version(desc.version));

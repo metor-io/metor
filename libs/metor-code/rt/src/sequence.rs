@@ -17,11 +17,11 @@ use metor_fsw_3::log::LogPort;
 use metor_fsw_3::sequence::{Run, dynamic_step};
 use metor_fsw_3::{Input, Redline, Seq, SeqError, Step};
 
-use metor_fsw_3::AbortRequest;
 use crate::cx::ResumeWord;
 use crate::instance::Instance;
 use crate::ports::Rings;
 use crate::report::{AlertEdges, log_faults_and_alerts};
+use metor_fsw_3::AbortRequest;
 
 /// What the step's refresh, redlines, body and abort handler share.
 struct Core {
@@ -50,12 +50,16 @@ pub fn sequence_step(
         let core = core.clone();
         move || with_core(&core, |c| c.rings.refresh(&mut c.instance))
     };
-    dynamic_step(abort, log, dropped, refresh, move |seq| body(core, seq, redlines))
+    dynamic_step(abort, log, dropped, refresh, move |seq| {
+        body(core, seq, redlines)
+    })
 }
 
 /// Runs `f` on the core, unless it is already borrowed.
 fn with_core<R: Default>(core: &RefCell<Core>, f: impl FnOnce(&mut Core) -> R) -> R {
-    core.try_borrow_mut().map(|mut c| f(&mut c)).unwrap_or_default()
+    core.try_borrow_mut()
+        .map(|mut c| f(&mut c))
+        .unwrap_or_default()
 }
 
 /// The sequence's body: links its redlines and abort handler, then resumes
@@ -69,9 +73,9 @@ fn body(core: Rc<RefCell<Core>>, seq: Rc<Seq<'static>>, names: Arc<[&'static str
         let redlines: Pin<Box<[_]>> = names
             .iter()
             .enumerate()
-            .map(|(index, name)| {
+            .map(|(index, &name)| {
                 let (core, seq) = (core.clone(), seq.clone());
-                Redline::new(*name, move || {
+                Redline::new(name, move || {
                     with_core(&core, |c| c.instance.redline(index, seq.now().0))
                 })
             })

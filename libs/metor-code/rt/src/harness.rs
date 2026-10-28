@@ -78,14 +78,21 @@ impl Harness {
     /// Sets field `path` of input `port`, marking the input present.
     pub fn set(&mut self, port: &str, path: &str, value: f64) -> Result<(), HarnessError> {
         let (index, frame) = self.port(true, port)?;
-        let bytes = self.instance.input_mut(index).ok_or_else(|| unknown_port(port))?;
-        write_leaf(&frame, bytes, path, value).ok_or_else(|| HarnessError::UnknownField(path.into()))
+        let bytes = self
+            .instance
+            .input_mut(index)
+            .ok_or_else(|| unknown_port(port))?;
+        write_leaf(&frame, bytes, path, value)
+            .ok_or_else(|| HarnessError::UnknownField(path.into()))
     }
 
     /// Reads field `path` of output `port`.
     pub fn get(&self, port: &str, path: &str) -> Result<f64, HarnessError> {
         let (index, frame) = self.port(false, port)?;
-        let bytes = self.instance.output(index).ok_or_else(|| unknown_port(port))?;
+        let bytes = self
+            .instance
+            .output(index)
+            .ok_or_else(|| unknown_port(port))?;
         read_leaf(&frame, bytes, path).ok_or_else(|| HarnessError::UnknownField(path.into()))
     }
 
@@ -140,7 +147,9 @@ impl Harness {
     }
 
     fn step_sequence(&mut self, now: i64) {
-        if !self.abort_requested && let Some(name) = self.tripped(now) {
+        if !self.abort_requested
+            && let Some(name) = self.tripped(now)
+        {
             self.push("redline", name);
             self.abort_requested = true;
         }

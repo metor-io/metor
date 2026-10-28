@@ -214,7 +214,8 @@ impl Lexer<'_> {
     }
 
     fn error(&mut self, start: usize, end: usize, message: impl Into<String>) {
-        self.errors.push(Diagnostic::new(Span::new(start, end), message));
+        self.errors
+            .push(Diagnostic::new(Span::new(start, end), message));
     }
 
     /// Measures a line's indentation and emits the blocks it opens or
@@ -254,15 +255,21 @@ impl Lexer<'_> {
         let current = self.indents.last().copied().unwrap_or(0);
         if width > current {
             self.indents.push(width);
-            self.tokens.push((Token::Indent, Span::new(start, self.pos)));
+            self.tokens
+                .push((Token::Indent, Span::new(start, self.pos)));
             return;
         }
         while width < self.indents.last().copied().unwrap_or(0) {
             self.indents.pop();
-            self.tokens.push((Token::Dedent, Span::new(self.pos, self.pos)));
+            self.tokens
+                .push((Token::Dedent, Span::new(self.pos, self.pos)));
         }
         if width != self.indents.last().copied().unwrap_or(0) {
-            self.error(start, self.pos, "this line's indentation matches no open block");
+            self.error(
+                start,
+                self.pos,
+                "this line's indentation matches no open block",
+            );
         }
     }
 
@@ -302,7 +309,8 @@ impl Lexer<'_> {
             None | Some((Token::Newline | Token::Indent | Token::Dedent, _))
         );
         if ends_line {
-            self.tokens.push((Token::Newline, Span::new(start, start + 1)));
+            self.tokens
+                .push((Token::Newline, Span::new(start, start + 1)));
         }
         self.line_start = true;
     }
@@ -331,14 +339,19 @@ impl Lexer<'_> {
                 && matches!(self.src[..self.pos].chars().last(), Some('e' | 'E'));
             match c {
                 '0'..='9' | '_' => {}
-                '.' if !float && self.peek_at(1).is_some_and(|d| d.is_ascii_digit()) => float = true,
+                '.' if !float && self.peek_at(1).is_some_and(|d| d.is_ascii_digit()) => {
+                    float = true
+                }
                 'e' | 'E' => float = true,
                 _ if exponent_sign => {}
                 _ => break,
             }
             self.pos += 1;
         }
-        let text: String = self.src[start..self.pos].chars().filter(|c| *c != '_').collect();
+        let text: String = self.src[start..self.pos]
+            .chars()
+            .filter(|c| *c != '_')
+            .collect();
         let value = match float {
             true => text.parse::<f64>().ok(),
             false => text.parse::<u64>().ok().map(|v| v as f64),
@@ -478,7 +491,10 @@ mod tests {
 
     #[test]
     fn test_unit_literals() {
-        assert_eq!(kinds("wait 500 ms"), [Token::Kw(Kw::Wait), Token::Duration(0.5), Token::Newline]);
+        assert_eq!(
+            kinds("wait 500 ms"),
+            [Token::Kw(Kw::Wait), Token::Duration(0.5), Token::Newline]
+        );
         assert_eq!(kinds("5 min")[0], Token::Duration(300.0));
         assert_eq!(kinds("1.5s")[0], Token::Duration(1.5));
         assert_eq!(kinds("2.0")[0], Token::Float(2.0));

@@ -4,14 +4,17 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use metor_fsw_3::ABI_VERSION;
-use metor_fsw_3::dl::{PackRef, cdylib_name, triple};
 use metor_fsw_3::dl::store::write_atomic;
+use metor_fsw_3::dl::{PackRef, cdylib_name, triple};
 
 use crate::aot::{self, AotError, LinkOptions};
 use crate::packs::PackDirs;
 
 #[derive(Parser)]
-#[command(name = "metor code", about = "Compile metor-code into metor-fsw-3 packs")]
+#[command(
+    name = "metor code",
+    about = "Compile metor-code into metor-fsw-3 packs"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -102,13 +105,17 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
 /// Reads the file and finds the packs it can import from, building the dev
 /// packs its `pyproject.toml` lists first.
 fn read(source: &Source) -> Result<(String, PackDirs), CliError> {
-    let src = std::fs::read_to_string(&source.file).map_err(|e| CliError::Read(source.file.clone(), e))?;
+    let src = std::fs::read_to_string(&source.file)
+        .map_err(|e| CliError::Read(source.file.clone(), e))?;
     if src.contains("use frames from") {
         for root in PackDirs::dev_packs(&source.file) {
             metor_fsw_3::cli::pack_dev::pack_dev(&root)?;
         }
     }
-    Ok((src, PackDirs::around(&source.file, source.pack_dirs.clone())))
+    Ok((
+        src,
+        PackDirs::around(&source.file, source.pack_dirs.clone()),
+    ))
 }
 
 fn source_error(file: &Path, src: &str, error: crate::CompileError) -> CliError {
@@ -123,7 +130,9 @@ pub fn build(args: &Build) -> Result<Vec<PathBuf>, CliError> {
     let out = args.out.clone().unwrap_or_else(|| module_root(file));
     let module = out.join(&name);
     let host = triple();
-    let libs = module.join("_libs").join(args.target.as_deref().unwrap_or(&host));
+    let libs = module
+        .join("_libs")
+        .join(args.target.as_deref().unwrap_or(&host));
     std::fs::create_dir_all(&libs).map_err(|e| CliError::Write(libs.clone(), e))?;
     let runtime = match &args.runtime {
         Some(path) => path.clone(),
@@ -160,11 +169,15 @@ fn write_module(name: &str, module: &Path) -> Result<Vec<PathBuf>, CliError> {
 }
 
 fn stem(file: &Path) -> String {
-    file.file_stem().map_or("program".into(), |s| s.to_string_lossy().replace('-', "_"))
+    file.file_stem()
+        .map_or("program".into(), |s| s.to_string_lossy().replace('-', "_"))
 }
 
 /// `.metor` next to the file.
 fn module_root(file: &Path) -> PathBuf {
-    let dir = file.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = file
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     dir.join(".metor")
 }

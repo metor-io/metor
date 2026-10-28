@@ -43,7 +43,13 @@ pub fn build(triple: Option<&str>) -> Result<PathBuf, RuntimeError> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.current_dir(REPO)
-        .args(["build", "-p", "mc-rt-pack", "--release", "--message-format=json"])
+        .args([
+            "build",
+            "-p",
+            "mc-rt-pack",
+            "--release",
+            "--message-format=json",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     if let Some(triple) = triple {
@@ -76,7 +82,10 @@ mod tests {
         let out = br#"{"reason":"compiler-artifact","filenames":["/t/release/libmc_rt.rlib"]}
 {"reason":"compiler-artifact","filenames":["/t/release/libmc_rt_pack.a"]}
 {"reason":"build-finished","success":true}"#;
-        assert_eq!(archive(out), Some(PathBuf::from("/t/release/libmc_rt_pack.a")));
+        assert_eq!(
+            archive(out),
+            Some(PathBuf::from("/t/release/libmc_rt_pack.a"))
+        );
         assert_eq!(archive(b"not json"), None);
     }
 }

@@ -1,15 +1,15 @@
 //! Compiles a file into memory with `cranelift-jit`, for tests and the dev
 //! loop. The result steps through the same mc-rt as a flight pack.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::FuncId;
 use mc_rt::{EntryFn, Program};
 
+use crate::CompileError;
 use crate::check::Imports;
 use crate::codegen::{self, CodegenError};
-use crate::CompileError;
 
 /// Keeps a JIT's code mapped for as long as a program uses it.
 struct Owner(#[allow(dead_code)] JITModule);
@@ -26,7 +26,7 @@ pub fn compile(src: &str, imports: &dyn Imports) -> Result<Program, CompileError
     let lowered = codegen::lower(&mut module, &prog)?;
     module.finalize_definitions().map_err(CodegenError::from)?;
     let fns = lowered.table.iter().map(|id| entry(&module, *id)).collect();
-    let owner: Arc<dyn std::any::Any> = Arc::new(Owner(module));
+    let owner: Rc<dyn std::any::Any> = Rc::new(Owner(module));
     Ok(Program::new(lowered.desc, fns, Some(owner))?)
 }
 

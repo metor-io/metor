@@ -11,10 +11,16 @@ impl Checker {
     /// Checks `const NAME [: T] = value`.
     pub(super) fn constant(&mut self, decl: &ast::ConstDecl) {
         if self.consts.contains_key(&decl.name.name) {
-            self.error(decl.name.span, format!("`{}` is defined twice", decl.name.name));
+            self.error(
+                decl.name.span,
+                format!("`{}` is defined twice", decl.name.name),
+            );
         }
         let Some(value) = self.const_eval(&decl.value) else {
-            self.error(decl.value.span, "a constant's value must be known at compile time");
+            self.error(
+                decl.value.span,
+                "a constant's value must be known at compile time",
+            );
             return;
         };
         let prim = match &decl.ty {
@@ -28,7 +34,8 @@ impl Checker {
             },
             None => value,
         };
-        self.consts.insert(decl.name.name.clone(), Const { value, prim });
+        self.consts
+            .insert(decl.name.name.clone(), Const { value, prim });
     }
 
     /// Evaluates an expression of literals and constants, or returns `None`
@@ -49,16 +56,25 @@ impl Checker {
     /// its use needs.
     pub fn is_flex(&self, e: &ast::Expr) -> bool {
         match &e.kind {
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Duration(_) | ExprKind::Bool(_) => true,
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Duration(_) | ExprKind::Bool(_) => {
+                true
+            }
             ExprKind::Name(name) => self.consts.get(name).is_some_and(|c| c.prim.is_none()),
             ExprKind::Unary(_, x) => self.is_flex(x),
-            ExprKind::Binary(_, a, b) => self.is_flex(a) && self.is_flex(b) && self.const_eval(e).is_some(),
+            ExprKind::Binary(_, a, b) => {
+                self.is_flex(a) && self.is_flex(b) && self.const_eval(e).is_some()
+            }
             _ => false,
         }
     }
 
     /// Gives a constant the type `want`, or its own default type.
-    pub fn coerce_const(&mut self, value: ConstVal, want: Option<Prim>, span: Span) -> Option<(ConstVal, Prim)> {
+    pub fn coerce_const(
+        &mut self,
+        value: ConstVal,
+        want: Option<Prim>,
+        span: Span,
+    ) -> Option<(ConstVal, Prim)> {
         let prim = match (want, value) {
             (Some(prim), _) => prim,
             (None, ConstVal::Int(_)) => Prim::I64,
@@ -78,7 +94,10 @@ impl Checker {
                 ConstVal::Float(v) => format!("float {v}"),
                 ConstVal::Bool(v) => format!("bool {}", if v { "True" } else { "False" }),
             };
-            self.error(span, format!("the {what} is not a valid `{}`", prim_name(prim)));
+            self.error(
+                span,
+                format!("the {what} is not a valid `{}`", prim_name(prim)),
+            );
         }
         Some((coerced?, prim))
     }

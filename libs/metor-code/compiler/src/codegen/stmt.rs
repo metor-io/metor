@@ -23,7 +23,12 @@ impl<M: Module> FnCx<'_, '_, M> {
                 let value = self.expr(value);
                 self.b.def_var(self.locals[*id as usize], value);
             }
-            Stmt::Store { place, value, nan_guard, mark } => {
+            Stmt::Store {
+                place,
+                value,
+                nan_guard,
+                mark,
+            } => {
                 let value = self.expr(value);
                 self.store(place, value, *nan_guard);
                 if let Some(port) = mark {
@@ -31,7 +36,12 @@ impl<M: Module> FnCx<'_, '_, M> {
                 }
             }
             Stmt::Zero { base, offset, len } => self.zero_bytes(*base, *offset, *len),
-            Stmt::Copy { dst, src, len, mark } => {
+            Stmt::Copy {
+                dst,
+                src,
+                len,
+                mark,
+            } => {
                 self.copy(*dst, *src, *len);
                 if let Some(port) = mark {
                     self.mark(*port);
@@ -41,8 +51,16 @@ impl<M: Module> FnCx<'_, '_, M> {
             Stmt::If { cond, then, orelse } => self.if_else(cond, then, orelse),
             Stmt::For { var, count, body } => self.for_loop(*var, *count, body),
             Stmt::Return(value) => self.ret(value),
-            Stmt::Wait { point, deadline, micros } => self.wait(*point, *deadline, micros),
-            Stmt::WaitUntil { point, cond, timeout } => self.wait_until(*point, cond, timeout.as_ref()),
+            Stmt::Wait {
+                point,
+                deadline,
+                micros,
+            } => self.wait(*point, *deadline, micros),
+            Stmt::WaitUntil {
+                point,
+                cond,
+                timeout,
+            } => self.wait_until(*point, cond, timeout.as_ref()),
             Stmt::Fail(index) => self.fail(*index),
         }
     }
@@ -78,7 +96,7 @@ impl<M: Module> FnCx<'_, '_, M> {
         let narrow = self.b.ins().iconst(types::I8, 0);
         let mut at = offset;
         while at < offset + len {
-            let fits = at % 8 == 0 && at + 8 <= offset + len;
+            let fits = at.is_multiple_of(8) && at + 8 <= offset + len;
             let (value, step) = if fits { (wide, 8) } else { (narrow, 1) };
             self.b.ins().store(FLAGS, value, ptr, at as i32);
             at += step;
@@ -89,8 +107,13 @@ impl<M: Module> FnCx<'_, '_, M> {
         let (to, from) = (self.base(dst.0), self.base(src.0));
         let mut at = 0;
         while at < len {
-            let wide = (dst.1 + at) % 8 == 0 && (src.1 + at) % 8 == 0 && at + 8 <= len;
-            let (ty, step) = if wide { (types::I64, 8) } else { (types::I8, 1) };
+            let wide =
+                (dst.1 + at).is_multiple_of(8) && (src.1 + at).is_multiple_of(8) && at + 8 <= len;
+            let (ty, step) = if wide {
+                (types::I64, 8)
+            } else {
+                (types::I8, 1)
+            };
             let value = self.b.ins().load(ty, FLAGS, from, (src.1 + at) as i32);
             self.b.ins().store(FLAGS, value, to, (dst.1 + at) as i32);
             at += step;
@@ -99,7 +122,11 @@ impl<M: Module> FnCx<'_, '_, M> {
 
     fn if_else(&mut self, cond: &crate::hir::Expr, then: &[Stmt], orelse: &[Stmt]) {
         let cond = self.expr(cond);
-        let (then_block, else_block, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let (then_block, else_block, done) = (
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+        );
         self.b.ins().brif(cond, then_block, &[], else_block, &[]);
         self.b.switch_to_block(then_block);
         self.stmts(then);
@@ -113,11 +140,18 @@ impl<M: Module> FnCx<'_, '_, M> {
     fn for_loop(&mut self, var: Var, count: u32, body: &[Stmt]) {
         let zero = self.b.ins().iconst(types::I64, 0);
         self.set_var(var, zero);
-        let (head, body_block, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        let (head, body_block, done) = (
+            self.b.create_block(),
+            self.b.create_block(),
+            self.b.create_block(),
+        );
         self.b.ins().jump(head, &[]);
         self.b.switch_to_block(head);
         let i = self.get_var(var);
-        let more = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, i, i64::from(count));
+        let more = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::SignedLessThan, i, i64::from(count));
         self.b.ins().brif(more, body_block, &[], done, &[]);
         self.b.switch_to_block(body_block);
         self.stmts(body);
@@ -131,7 +165,10 @@ impl<M: Module> FnCx<'_, '_, M> {
     fn get_var(&mut self, var: Var) -> Value {
         match var {
             Var::Local(id) => self.b.use_var(self.locals[id as usize]),
-            Var::State(offset) => self.b.ins().load(types::I64, FLAGS, self.state, offset as i32),
+            Var::State(offset) => self
+                .b
+                .ins()
+                .load(types::I64, FLAGS, self.state, offset as i32),
         }
     }
 
@@ -181,14 +218,19 @@ impl<M: Module> FnCx<'_, '_, M> {
 
     /// Whether `now` has reached a deadline slot.
     fn passed(&mut self, deadline: u32) -> Value {
-        let at = self.b.ins().load(types::I64, FLAGS, self.state, deadline as i32);
+        let at = self
+            .b
+            .ins()
+            .load(types::I64, FLAGS, self.state, deadline as i32);
         let now = self.now();
         self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, now, at)
     }
 
     /// `wait d`.
     fn wait(&mut self, point: u32, deadline: u32, micros: &crate::hir::Expr) {
-        let Some(resume) = self.seq.as_ref().map(|s| s.points[point as usize]) else { return };
+        let Some(resume) = self.seq.as_ref().map(|s| s.points[point as usize]) else {
+            return;
+        };
         self.set_deadline(deadline, micros);
         self.yield_at(point);
         let done = self.b.create_block();
@@ -204,7 +246,9 @@ impl<M: Module> FnCx<'_, '_, M> {
     /// `wait until cond [timeout d]`. The condition is checked on the cycle
     /// the wait starts, and each cycle after.
     fn wait_until(&mut self, point: u32, cond: &crate::hir::Expr, timeout: Option<&Timeout>) {
-        let Some(check) = self.seq.as_ref().map(|s| s.points[point as usize]) else { return };
+        let Some(check) = self.seq.as_ref().map(|s| s.points[point as usize]) else {
+            return;
+        };
         if let Some(timeout) = timeout {
             self.set_deadline(timeout.deadline, &timeout.micros);
         }
@@ -231,7 +275,9 @@ impl<M: Module> FnCx<'_, '_, M> {
 
     /// `fail "msg"`: records the message and ends the sequence `Failed`.
     fn fail(&mut self, index: u32) {
-        let Some(slot) = self.seq.as_ref().map(|s| s.fail_slot as i32) else { return };
+        let Some(slot) = self.seq.as_ref().map(|s| s.fail_slot as i32) else {
+            return;
+        };
         let index = self.b.ins().iconst(types::I32, i64::from(index));
         self.b.ins().store(FLAGS, index, self.state, slot);
         self.ret_const(ResumeWord::Failed as u32);

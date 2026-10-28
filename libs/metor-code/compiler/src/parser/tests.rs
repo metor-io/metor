@@ -52,15 +52,22 @@ fn test_parses_system() {
     let file = parse_ok(HEATER);
     assert_eq!(file.items.len(), 5);
     assert!(matches!(&file.items[0], Item::Use { pack, .. } if pack == "stand_io"));
-    let Item::Frame(frame) = &file.items[1] else { panic!("a frame") };
+    let Item::Frame(frame) = &file.items[1] else {
+        panic!("a frame")
+    };
     assert_eq!(frame.fields.len(), 2);
     assert!(matches!(frame.fields[1].ty, TypeExpr::Array { .. }));
     let heater = program(&file, 4);
     assert_eq!(heater.kind, ProgramKind::System);
     assert_eq!(heater.params.len(), 2);
     assert!(matches!(&heater.members[0], Member::Doc(doc) if doc.starts_with("Holds")));
-    assert!(matches!(&heater.members[4], Member::Alert { hold: Some(_), .. }));
-    let Member::Loop { body, .. } = &heater.members[5] else { panic!("a loop") };
+    assert!(matches!(
+        &heater.members[4],
+        Member::Alert { hold: Some(_), .. }
+    ));
+    let Member::Loop { body, .. } = &heater.members[5] else {
+        panic!("a loop")
+    };
     assert_eq!(body.len(), 4);
     assert!(matches!(body[3].kind, StmtKind::For { .. }));
 }
@@ -93,11 +100,31 @@ fn test_parses_sequence() {
     assert_eq!(leak.kind, ProgramKind::Sequence);
     assert!(matches!(&leak.members[2], Member::Redline { name, .. } if name == "chamber over"));
     assert!(matches!(&leak.members[3], Member::OnAbort { body, .. } if body.len() == 1));
-    let Member::Stmt(wait) = &leak.members[5] else { panic!("a statement") };
-    assert!(matches!(wait.kind, StmtKind::WaitUntil { timeout: Some(_), .. }));
-    let Member::Stmt(sleep) = &leak.members[7] else { panic!("a statement") };
-    assert!(matches!(sleep.kind, StmtKind::Wait(Expr { kind: ExprKind::Duration(300.0), .. })));
-    let Member::Stmt(Stmt { kind: StmtKind::If { branches, orelse }, .. }) = &leak.members[8] else {
+    let Member::Stmt(wait) = &leak.members[5] else {
+        panic!("a statement")
+    };
+    assert!(matches!(
+        wait.kind,
+        StmtKind::WaitUntil {
+            timeout: Some(_),
+            ..
+        }
+    ));
+    let Member::Stmt(sleep) = &leak.members[7] else {
+        panic!("a statement")
+    };
+    assert!(matches!(
+        sleep.kind,
+        StmtKind::Wait(Expr {
+            kind: ExprKind::Duration(300.0),
+            ..
+        })
+    ));
+    let Member::Stmt(Stmt {
+        kind: StmtKind::If { branches, orelse },
+        ..
+    }) = &leak.members[8]
+    else {
         panic!("an if")
     };
     assert_eq!(branches.len(), 2);
@@ -129,7 +156,10 @@ fn shape(expr: &Expr) -> String {
 fn test_precedence() {
     assert_eq!(shape(&expr_of("1 + 2 * 3")), "(1 Add (2 Mul 3))");
     assert_eq!(shape(&expr_of("-a ** 2")), "(Neg (a Pow 2))");
-    assert_eq!(shape(&expr_of("not a == b and c")), "((Not (a Eq b)) And c)");
+    assert_eq!(
+        shape(&expr_of("not a == b and c")),
+        "((Not (a Eq b)) And c)"
+    );
     assert_eq!(shape(&expr_of("a or b and c")), "(a Or (b And c))");
     assert_eq!(shape(&expr_of("x.y[i].z - f(1, 2)")), "(x.y[i].z Sub f/2)");
     assert_eq!(shape(&expr_of("(1 + 2) * 3")), "((1 Add 2) Mul 3)");
@@ -137,7 +167,8 @@ fn test_precedence() {
 
 #[test]
 fn test_machine_is_skipped() {
-    let file = parse_ok("machine m:\n    state a:\n        loop:\n            goto b\nconst X = 1\n");
+    let file =
+        parse_ok("machine m:\n    state a:\n        loop:\n            goto b\nconst X = 1\n");
     assert!(matches!(&file.items[0], Item::Machine { .. }));
     assert!(matches!(&file.items[1], Item::Const(_)));
 }

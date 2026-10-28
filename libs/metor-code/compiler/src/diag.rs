@@ -86,7 +86,11 @@ impl Diagnostics {
 impl fmt::Display for Diagnostics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for diag in &self.0 {
-            writeln!(f, "{}..{}: {}", diag.span.start, diag.span.end, diag.message)?;
+            writeln!(
+                f,
+                "{}..{}: {}",
+                diag.span.start, diag.span.end, diag.message
+            )?;
         }
         Ok(())
     }
@@ -95,7 +99,10 @@ impl fmt::Display for Diagnostics {
 impl std::error::Error for Diagnostics {}
 
 /// Builds the `ariadne` report of one diagnostic.
-fn report<'a>(diag: &Diagnostic, file: &'a str) -> ariadne::Report<'static, (&'a str, Range<usize>)> {
+fn report<'a>(
+    diag: &Diagnostic,
+    file: &'a str,
+) -> ariadne::Report<'static, (&'a str, Range<usize>)> {
     let span = (file, diag.span.range());
     let label = ariadne::Label::new(span.clone())
         .with_message(diag.label.clone().unwrap_or_else(|| diag.message.clone()));

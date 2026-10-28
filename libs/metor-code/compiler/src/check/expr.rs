@@ -5,8 +5,8 @@ use crate::diag::{Diagnostic, Span};
 use crate::hir::{self, Base, Builtin, Place};
 use crate::types::{ConstVal, Prim, Ty, prim_name, prim_named};
 
-use super::scope::{Ctx, Loc, Scope};
 use super::Checker;
+use super::scope::{Ctx, Loc, Scope};
 
 /// A resolved place, which may still be an aggregate.
 pub struct PlaceRes {
@@ -89,9 +89,14 @@ impl Checker {
     }
 
     pub fn mismatch(&mut self, span: Span, want: Prim, got: Prim) {
-        let diag = Diagnostic::new(span, format!("expected `{}`, found `{}`", prim_name(want), prim_name(got)));
+        let diag = Diagnostic::new(
+            span,
+            format!("expected `{}`, found `{}`", prim_name(want), prim_name(got)),
+        );
         let diag = match (want.is_float(), got.is_float()) {
-            (true, false) | (false, true) => diag.with_note(format!("convert it with `{}(…)`", prim_name(want))),
+            (true, false) | (false, true) => {
+                diag.with_note(format!("convert it with `{}(…)`", prim_name(want)))
+            }
             _ => diag,
         };
         self.diags.push(diag);
@@ -122,7 +127,10 @@ impl Checker {
             _ => None,
         };
         if let Some(kind) = time.filter(|_| sc.ctx != Ctx::Def) {
-            return hir::Expr { kind, prim: Prim::F64 };
+            return hir::Expr {
+                kind,
+                prim: Prim::F64,
+            };
         }
         let message = match sc.port(name) {
             Some(_) => format!("`{name}` is a frame; read one of its fields, as in `{name}.field`"),
@@ -199,14 +207,20 @@ impl Checker {
 
     fn field_place(&mut self, base: PlaceRes, field: &ast::Ident) -> Option<PlaceRes> {
         let Ty::Frame(frame) = base.ty else {
-            self.error(field.span, format!("`.{}` reads a field, but this is not a frame", field.name));
+            self.error(
+                field.span,
+                format!("`.{}` reads a field, but this is not a frame", field.name),
+            );
             return None;
         };
         let frame = &self.frames[frame];
         let Some(found) = frame.field(&field.name) else {
             let names: Vec<&str> = frame.fields.iter().map(|f| f.name.as_str()).collect();
-            let diag = Diagnostic::new(field.span, format!("frame `{}` has no field `{}`", frame.name, field.name))
-                .with_note(format!("its fields are: {}", names.join(", ")));
+            let diag = Diagnostic::new(
+                field.span,
+                format!("frame `{}` has no field `{}`", frame.name, field.name),
+            )
+            .with_note(format!("its fields are: {}", names.join(", ")));
             self.diags.push(diag);
             return None;
         };
@@ -217,16 +231,26 @@ impl Checker {
         })
     }
 
-    fn index_place(&mut self, sc: &mut Scope, mut base: PlaceRes, index: &ast::Expr) -> Option<PlaceRes> {
+    fn index_place(
+        &mut self,
+        sc: &mut Scope,
+        mut base: PlaceRes,
+        index: &ast::Expr,
+    ) -> Option<PlaceRes> {
         let Ty::Array(elem, len) = base.ty.clone() else {
             self.error(index.span, "only an array can be indexed");
             return None;
         };
         let (stride, _) = elem.layout(&self.frames);
         match self.const_eval(index) {
-            Some(ConstVal::Int(i)) if (0..i128::from(len)).contains(&i) => base.offset += i as u32 * stride,
+            Some(ConstVal::Int(i)) if (0..i128::from(len)).contains(&i) => {
+                base.offset += i as u32 * stride
+            }
             Some(ConstVal::Int(i)) => {
-                self.error(index.span, format!("index {i} is out of range for an array of {len}"));
+                self.error(
+                    index.span,
+                    format!("index {i} is out of range for an array of {len}"),
+                );
                 return None;
             }
             Some(_) => {
@@ -258,7 +282,10 @@ impl Checker {
             UnOp::Neg => {
                 let value = self.expr(sc, x, want);
                 if !value.prim.is_float() && !value.prim.is_signed() {
-                    self.error(x.span, format!("cannot negate a `{}`", prim_name(value.prim)));
+                    self.error(
+                        x.span,
+                        format!("cannot negate a `{}`", prim_name(value.prim)),
+                    );
                     return dummy(want);
                 }
                 hir::Expr {
@@ -287,8 +314,15 @@ impl Checker {
             (l, r)
         };
         if l.prim != r.prim {
-            let diag = Diagnostic::new(a.span.to(b.span), format!("`{}` and `{}` do not mix", prim_name(l.prim), prim_name(r.prim)))
-                .with_note("convert one side, as in `f64(n)`");
+            let diag = Diagnostic::new(
+                a.span.to(b.span),
+                format!(
+                    "`{}` and `{}` do not mix",
+                    prim_name(l.prim),
+                    prim_name(r.prim)
+                ),
+            )
+            .with_note("convert one side, as in `f64(n)`");
             self.diags.push(diag);
             return None;
         }
@@ -341,12 +375,28 @@ impl Checker {
             return dummy(want);
         }
         match (op, prim.is_float()) {
-            (B::Pow, true) => math(if prim == Prim::F32 { "mc_rt_powf" } else { "mc_rt_pow" }, vec![l, r], prim),
+            (B::Pow, true) => math(
+                if prim == Prim::F32 {
+                    "mc_rt_powf"
+                } else {
+                    "mc_rt_pow"
+                },
+                vec![l, r],
+                prim,
+            ),
             (B::Pow, false) => {
                 self.error(span, "`**` needs floats; convert with `f64(…)`");
                 dummy(want)
             }
-            (B::Rem, true) => math(if prim == Prim::F32 { "mc_rt_fmodf" } else { "mc_rt_fmod" }, vec![l, r], prim),
+            (B::Rem, true) => math(
+                if prim == Prim::F32 {
+                    "mc_rt_fmodf"
+                } else {
+                    "mc_rt_fmod"
+                },
+                vec![l, r],
+                prim,
+            ),
             _ => hir::Expr {
                 kind: hir::ExprKind::Binary(hir_op(op), Box::new(l), Box::new(r)),
                 prim,
@@ -354,9 +404,19 @@ impl Checker {
         }
     }
 
-    fn call(&mut self, sc: &mut Scope, callee: &ast::Ident, args: &[ast::Arg], span: Span, want: Option<Prim>) -> hir::Expr {
+    fn call(
+        &mut self,
+        sc: &mut Scope,
+        callee: &ast::Ident,
+        args: &[ast::Arg],
+        span: Span,
+        want: Option<Prim>,
+    ) -> hir::Expr {
         if let Some(arg) = args.iter().find_map(|a| a.name.as_ref()) {
-            self.error(arg.span, "only a frame takes named arguments, when it is written to an output");
+            self.error(
+                arg.span,
+                "only a frame takes named arguments, when it is written to an output",
+            );
             return dummy(want);
         }
         let args: Vec<&ast::Expr> = args.iter().map(|a| &a.value).collect();
@@ -389,7 +449,10 @@ impl Checker {
 
     fn arity(&mut self, args: &[&ast::Expr], n: usize, span: Span) -> bool {
         if args.len() != n {
-            self.error(span, format!("this takes {n} argument{}", if n == 1 { "" } else { "s" }));
+            self.error(
+                span,
+                format!("this takes {n} argument{}", if n == 1 { "" } else { "s" }),
+            );
             return false;
         }
         true
@@ -416,13 +479,23 @@ impl Checker {
         let value = self.expr(sc, args[0], None);
         if prim == Prim::Bool && value.prim != Prim::Bool {
             let from = prim_name(value.prim);
-            self.error(span, format!("cannot convert `{from}` to `bool`; compare it instead, as in `x != 0`"));
+            self.error(
+                span,
+                format!("cannot convert `{from}` to `bool`; compare it instead, as in `x != 0`"),
+            );
             return dummy(Some(prim));
         }
         value.cast(prim)
     }
 
-    fn builtin(&mut self, sc: &mut Scope, builtin: Builtin, args: &[&ast::Expr], span: Span, want: Option<Prim>) -> hir::Expr {
+    fn builtin(
+        &mut self,
+        sc: &mut Scope,
+        builtin: Builtin,
+        args: &[&ast::Expr],
+        span: Span,
+        want: Option<Prim>,
+    ) -> hir::Expr {
         match builtin {
             Builtin::Min | Builtin::Max => {
                 if !self.arity(args, 2, span) {
@@ -444,7 +517,11 @@ impl Checker {
                 if !self.arity(args, 1, span) {
                     return dummy(want);
                 }
-                let x = self.expr(sc, args[0], want.filter(|p| p.is_float()).or(Some(Prim::F64)));
+                let x = self.expr(
+                    sc,
+                    args[0],
+                    want.filter(|p| p.is_float()).or(Some(Prim::F64)),
+                );
                 if !x.prim.is_float() {
                     self.error(span, "this takes a float");
                     return dummy(want);
@@ -457,7 +534,13 @@ impl Checker {
         }
     }
 
-    fn numeric_builtin(&mut self, builtin: Builtin, args: Vec<hir::Expr>, span: Span, want: Option<Prim>) -> hir::Expr {
+    fn numeric_builtin(
+        &mut self,
+        builtin: Builtin,
+        args: Vec<hir::Expr>,
+        span: Span,
+        want: Option<Prim>,
+    ) -> hir::Expr {
         let prim = args[0].prim;
         if !is_numeric(prim) {
             self.error(span, "this takes numbers, not `bool`");
@@ -470,7 +553,13 @@ impl Checker {
     }
 
     /// `clamp(x, lo, hi)`, as `min(max(x, lo), hi)`.
-    pub fn clamp(&mut self, sc: &mut Scope, args: &[&ast::Expr], span: Span, want: Option<Prim>) -> hir::Expr {
+    pub fn clamp(
+        &mut self,
+        sc: &mut Scope,
+        args: &[&ast::Expr],
+        span: Span,
+        want: Option<Prim>,
+    ) -> hir::Expr {
         if !self.arity(args, 3, span) {
             return dummy(want);
         }
@@ -522,7 +611,10 @@ impl Checker {
             _ => None,
         };
         let Some(port) = port else {
-            self.error(args[0].span, "`stale` takes an input port, as in `stale(temp, 0.5)`");
+            self.error(
+                args[0].span,
+                "`stale` takes an input port, as in `stale(temp, 0.5)`",
+            );
             return dummy(Some(Prim::Bool));
         };
         let age = self.expect(sc, args[1], Prim::F64);
@@ -538,12 +630,23 @@ impl Checker {
         }
     }
 
-    fn math_call(&mut self, sc: &mut Scope, name: &str, args: &[&ast::Expr], span: Span, want: Option<Prim>) -> hir::Expr {
+    fn math_call(
+        &mut self,
+        sc: &mut Scope,
+        name: &str,
+        args: &[&ast::Expr],
+        span: Span,
+        want: Option<Prim>,
+    ) -> hir::Expr {
         let arity = mc_rt::math::find(name, false).map_or(1, |m| m.arity);
         if !self.arity(args, arity, span) {
             return dummy(want);
         }
-        let first = self.expr(sc, args[0], want.filter(|p| p.is_float()).or(Some(Prim::F64)));
+        let first = self.expr(
+            sc,
+            args[0],
+            want.filter(|p| p.is_float()).or(Some(Prim::F64)),
+        );
         if !first.prim.is_float() {
             self.error(span, format!("`{name}` takes a float"));
             return dummy(want);

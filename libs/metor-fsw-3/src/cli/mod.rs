@@ -81,7 +81,11 @@ fn external(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     let mut program = OsString::from("metor-");
     program.push(name);
     let sibling = std::env::current_exe()?.with_file_name(&program);
-    let program = if sibling.is_file() { sibling.into_os_string() } else { program };
+    let program = if sibling.is_file() {
+        sibling.into_os_string()
+    } else {
+        program
+    };
     let status = std::process::Command::new(&program)
         .args(rest)
         .status()

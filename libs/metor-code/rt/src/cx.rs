@@ -133,6 +133,6 @@ mod tests {
     fn test_cx_layout_is_pointer_first() {
         assert_eq!(offsets::INPUTS, 0);
         assert_eq!(offsets::NOW, 6 * size_of::<usize>() as i32);
-        assert!(offsets::FAULTS > offsets::DT);
+        const { assert!(offsets::FAULTS > offsets::DT) };
     }
 }

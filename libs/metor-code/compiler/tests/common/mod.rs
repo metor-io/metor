@@ -85,13 +85,21 @@ pub struct Plant {
 }
 
 #[system]
-fn plant(#[state] s: &mut Plant, now: Timestamp, valve: &mut Input<ValveCmd>, chamber: &mut Output<Chamber>) {
+fn plant(
+    #[state] s: &mut Plant,
+    now: Timestamp,
+    valve: &mut Input<ValveCmd>,
+    chamber: &mut Output<Chamber>,
+) {
     let open = valve.latest().ok().flatten().is_some_and(|v| v.open != 0);
     if open {
         s.psi += s.fill;
     }
     s.psi = (s.psi - s.leak).max(0.0);
-    let _ = chamber.write(&Chamber { timestamp: now, psi: s.psi });
+    let _ = chamber.write(&Chamber {
+        timestamp: now,
+        psi: s.psi,
+    });
 }
 
 /// One cycle as the recorder saw it.
@@ -135,7 +143,11 @@ fn recorder(
 pub fn add_rust(table: &mut SystemTable, plant_state: (f64, f64), trace: &Trace) {
     let (fill, leak) = plant_state;
     table
-        .register("plant", plant(), move || Plant { psi: 14.7, fill, leak })
+        .register("plant", plant(), move || Plant {
+            psi: 14.7,
+            fill,
+            leak,
+        })
         .expect("plant registers");
     let trace = trace.clone();
     table

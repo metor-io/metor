@@ -41,7 +41,11 @@ impl Imports for NoImports {
 }
 
 /// Checks a parsed file. `src` is its text, which some messages quote.
-pub fn check(file: &ast::File, src: &str, imports: &dyn Imports) -> Result<hir::Program, Vec<Diagnostic>> {
+pub fn check(
+    file: &ast::File,
+    src: &str,
+    imports: &dyn Imports,
+) -> Result<hir::Program, Vec<Diagnostic>> {
     let mut checker = Checker {
         src: src.to_string(),
         ..Checker::default()
@@ -98,7 +102,10 @@ impl Checker {
     }
 
     pub fn def_named(&self, name: &str) -> Option<u32> {
-        self.defs.iter().position(|d| d.def.name == name).map(|i| i as u32)
+        self.defs
+            .iter()
+            .position(|d| d.def.name == name)
+            .map(|i| i as u32)
     }
 
     /// Checks every item, in an order that lets each refer to the others.
@@ -156,16 +163,27 @@ impl Checker {
     fn import(&mut self, pack: &str, span: Span, imports: &dyn Imports) {
         let descs = match imports.frames(pack) {
             Ok(descs) => descs,
-            Err(message) => return self.error(span, format!("importing frames from `{pack}`: {message}")),
+            Err(message) => {
+                return self.error(span, format!("importing frames from `{pack}`: {message}"));
+            }
         };
         for desc in descs {
             let Some(frame) = FrameTy::imported(&desc, pack, span) else {
-                self.error(span, format!("frame `{}` of `{pack}` has fields metor-code cannot express", desc.name));
+                self.error(
+                    span,
+                    format!(
+                        "frame `{}` of `{pack}` has fields metor-code cannot express",
+                        desc.name
+                    ),
+                );
                 continue;
             };
             if let Some(known) = self.frame_named(&frame.name) {
                 if self.frames[known].desc() != frame.desc() {
-                    self.error(span, format!("two imports define frame `{}` differently", frame.name));
+                    self.error(
+                        span,
+                        format!("two imports define frame `{}` differently", frame.name),
+                    );
                 }
                 continue;
             }
@@ -178,7 +196,10 @@ impl Checker {
         let mut fields = Vec::new();
         for field in &decl.fields {
             if fields.iter().any(|(name, _)| *name == field.name.name) {
-                self.error(field.name.span, format!("field `{}` is declared twice", field.name.name));
+                self.error(
+                    field.name.span,
+                    format!("field `{}` is declared twice", field.name.name),
+                );
             }
             if let Some(ty) = self.field_type(&field.ty) {
                 fields.push((field.name.name.clone(), ty));
@@ -194,7 +215,10 @@ impl Checker {
                     self.diags.push(diag);
                 }
             }
-            Some(_) => self.error(decl.name.span, format!("frame `{}` is declared twice", frame.name)),
+            Some(_) => self.error(
+                decl.name.span,
+                format!("frame `{}` is declared twice", frame.name),
+            ),
             None => self.frames.push(frame),
         }
     }
@@ -206,7 +230,10 @@ impl Checker {
                 Some(prim) => Some(Ty::Prim(prim)),
                 None => {
                     let message = match self.frame_named(&name.name) {
-                        Some(_) => format!("a frame field cannot be the frame `{}`; nested frames are not supported yet", name.name),
+                        Some(_) => format!(
+                            "a frame field cannot be the frame `{}`; nested frames are not supported yet",
+                            name.name
+                        ),
                         None => format!("`{}` is not a type", name.name),
                     };
                     self.error(name.span, message);
@@ -232,7 +259,10 @@ impl Checker {
         {
             return Some(prim);
         }
-        self.error(ty.span(), "expected a scalar type: bool, an integer, f32 or f64");
+        self.error(
+            ty.span(),
+            "expected a scalar type: bool, an integer, f32 or f64",
+        );
         None
     }
 
@@ -245,14 +275,19 @@ impl Checker {
         }
         let diag = Diagnostic::new(ty.span(), "a port carries a frame")
             .with_label(format!("no frame named `{}`", type_text(ty)))
-            .with_note("declare it with `frame Name:`, or import it with `use frames from \"pack\"`");
+            .with_note(
+                "declare it with `frame Name:`, or import it with `use frames from \"pack\"`",
+            );
         self.diags.push(diag);
         None
     }
 
     fn def_signature(&mut self, decl: &ast::DefDecl) {
         if self.def_named(&decl.name.name).is_some() {
-            self.error(decl.name.span, format!("`{}` is defined twice", decl.name.name));
+            self.error(
+                decl.name.span,
+                format!("`{}` is defined twice", decl.name.name),
+            );
         }
         let params: Vec<(String, Prim)> = decl
             .params
@@ -289,8 +324,11 @@ impl Checker {
             if let Some(cycle) = self.find_cycle(start, &mut state) {
                 let name = &self.defs[cycle].def.name;
                 let span = self.defs[cycle].span;
-                let diag = Diagnostic::new(span, format!("`{name}` calls itself, directly or through other defs"))
-                    .with_note("recursion is not allowed, so every call finishes in bounded time");
+                let diag = Diagnostic::new(
+                    span,
+                    format!("`{name}` calls itself, directly or through other defs"),
+                )
+                .with_note("recursion is not allowed, so every call finishes in bounded time");
                 self.diags.push(diag);
                 return;
             }

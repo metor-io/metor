@@ -36,7 +36,9 @@ fn test_heater_settles() {
         temps.push(temp);
     }
     let tail = &temps[temps.len() - 1000..];
-    let (lo, hi) = tail.iter().fold((f64::MAX, f64::MIN), |(lo, hi), t| (lo.min(*t), hi.max(*t)));
+    let (lo, hi) = tail
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), t| (lo.min(*t), hi.max(*t)));
     assert!(hi - lo < 0.5, "oscillates between {lo} and {hi}");
     assert!((hi - 40.0).abs() < 3.0, "settles at {hi}");
 }

@@ -6,7 +6,9 @@
 //! imports this pack's frames with `use frames from "stand_io"`.
 
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-use metor_fsw_3::{ChannelStatus, Frame, Input, JsonSchema, Output, SystemTable, Timestamp, system};
+use metor_fsw_3::{
+    ChannelStatus, Frame, Input, JsonSchema, Output, SystemTable, Timestamp, system,
+};
 use serde::Deserialize;
 
 /// The chamber's pressure and wall temperature.
@@ -153,7 +155,14 @@ impl Monitor {
 }
 
 const STATES: [&str; 8] = [
-    "running", "stopped", "completed", "aborted", "failed", "panicked", "unloaded", "quiescing",
+    "running",
+    "stopped",
+    "completed",
+    "aborted",
+    "failed",
+    "panicked",
+    "unloaded",
+    "quiescing",
 ];
 
 /// Prints the leak check's state and valve whenever they change, and the
@@ -195,7 +204,12 @@ fn monitor(
     if now.0 >= m.next_report
         && let Some(c) = chamber
     {
-        println!("[{t:8.2} s] chamber {:.1} psi, wall {:.1} C, heater {:.0}%", c.psi, c.temp, duty * 100.0);
+        println!(
+            "[{t:8.2} s] chamber {:.1} psi, wall {:.1} C, heater {:.0}%",
+            c.psi,
+            c.temp,
+            duty * 100.0
+        );
         m.next_report = now.0 + m.period;
     }
 }

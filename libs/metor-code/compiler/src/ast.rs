@@ -16,13 +16,19 @@ pub struct File {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
     /// `use frames from "pack"`.
-    Use { pack: String, span: Span },
+    Use {
+        pack: String,
+        span: Span,
+    },
     Frame(FrameDecl),
     Const(ConstDecl),
     Def(DefDecl),
     Program(ProgramDecl),
     /// A `machine`, which this compiler does not implement yet.
-    Machine { name: Ident, span: Span },
+    Machine {
+        name: Ident,
+        span: Span,
+    },
     /// An item the parser skipped after an error.
     Error,
 }
@@ -205,7 +211,10 @@ pub enum ExprKind {
     Name(String),
     Field(Box<Expr>, Ident),
     Index(Box<Expr>, Box<Expr>),
-    Call { callee: Ident, args: Vec<Arg> },
+    Call {
+        callee: Ident,
+        args: Vec<Arg>,
+    },
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Error,

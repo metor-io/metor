@@ -11,9 +11,9 @@ use cranelift_module::{DataDescription, DataId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use mc_rt::desc::DESC_VERSION;
 
+use crate::CompileError;
 use crate::check::Imports;
 use crate::codegen::{self, CodegenError, Lowered};
-use crate::CompileError;
 
 /// The eight symbols every pack exports.
 const PACK_SYMBOLS: [&str; 8] = [
@@ -61,16 +61,25 @@ pub struct LinkOptions<'a> {
 pub fn object(src: &str, imports: &dyn Imports, triple: Option<&str>) -> Result<Vec<u8>, AotError> {
     let prog = crate::front(src, imports)?;
     let isa = target_isa(triple)?;
-    let builder = ObjectBuilder::new(isa, "mc_program", codegen::libcall_names()).map_err(CodegenError::from)?;
+    let builder = ObjectBuilder::new(isa, "mc_program", codegen::libcall_names())
+        .map_err(CodegenError::from)?;
     let mut module = ObjectModule::new(builder);
     let lowered = codegen::lower(&mut module, &prog)?;
     descriptor(&mut module, &lowered)?;
-    module.finish().emit().map_err(|e| AotError::Object(e.to_string()))
+    module
+        .finish()
+        .emit()
+        .map_err(|e| AotError::Object(e.to_string()))
 }
 
 /// Compiles `src` and links it with the runtime into the shared library
 /// `out`.
-pub fn build(src: &str, imports: &dyn Imports, options: &LinkOptions<'_>, out: &Path) -> Result<(), AotError> {
+pub fn build(
+    src: &str,
+    imports: &dyn Imports,
+    options: &LinkOptions<'_>,
+    out: &Path,
+) -> Result<(), AotError> {
     let bytes = object(src, imports, options.triple)?;
     let object = out.with_extension("o");
     std::fs::write(&object, bytes)?;
@@ -91,13 +100,23 @@ pub fn link(object: &Path, options: &LinkOptions<'_>, out: &Path) -> Result<(), 
     }
     let libs: &[&str] = match macos {
         true => &["-liconv", "-lc", "-lm"],
-        false => &["-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm", "-ldl", "-lc"],
+        false => &[
+            "-lgcc_s",
+            "-lutil",
+            "-lrt",
+            "-lpthread",
+            "-lm",
+            "-ldl",
+            "-lc",
+        ],
     };
     cmd.args(libs);
     run(cmd, options.linker)?;
     if macos && options.triple.is_none() {
         let mut sign = Command::new("codesign");
-        sign.args(["-s", "-", "-f"]).arg(out).stderr(std::process::Stdio::null());
+        sign.args(["-s", "-", "-f"])
+            .arg(out)
+            .stderr(std::process::Stdio::null());
         run(sign, "codesign")?;
     }
     Ok(())
@@ -123,8 +142,12 @@ fn is_macos(triple: Option<&str>) -> bool {
 pub fn target_isa(triple: Option<&str>) -> Result<OwnedTargetIsa, AotError> {
     let mut flags = settings::builder();
     let target = |e: String| AotError::Target(triple.unwrap_or("host").to_string(), e);
-    flags.set("opt_level", "speed").map_err(|e| target(e.to_string()))?;
-    flags.set("is_pic", "true").map_err(|e| target(e.to_string()))?;
+    flags
+        .set("opt_level", "speed")
+        .map_err(|e| target(e.to_string()))?;
+    flags
+        .set("is_pic", "true")
+        .map_err(|e| target(e.to_string()))?;
     let builder = match triple {
         Some(triple) => {
             let parsed = triple.parse().map_err(|e| target(format!("{e}")))?;
@@ -142,28 +165,49 @@ pub fn target_isa(triple: Option<&str>) -> Result<OwnedTargetIsa, AotError> {
 fn descriptor(module: &mut ObjectModule, lowered: &Lowered) -> Result<(), AotError> {
     let ptr = module.target_config().pointer_bytes() as usize;
     if ptr != 8 {
-        return Err(AotError::Target("".into(), "only 64-bit targets are supported".into()));
+        return Err(AotError::Target(
+            "".into(),
+            "only 64-bit targets are supported".into(),
+        ));
     }
     let json = serde_json::to_vec(&lowered.desc).map_err(|e| AotError::Object(e.to_string()))?;
-    let desc = data(module, "mc_desc", json.clone().into_boxed_slice(), Linkage::Local, |_, _| {})?;
+    let desc = data(
+        module,
+        "mc_desc",
+        json.clone().into_boxed_slice(),
+        Linkage::Local,
+        |_, _| {},
+    )?;
     let table = lowered.table.clone();
-    let fns = data(module, "mc_fns", vec![0; ptr * table.len()].into_boxed_slice(), Linkage::Local, |m, d| {
-        for (index, id) in table.iter().enumerate() {
-            let func = m.declare_func_in_data(*id, d);
-            d.write_function_addr((index * ptr) as u32, func);
-        }
-    })?;
+    let fns = data(
+        module,
+        "mc_fns",
+        vec![0; ptr * table.len()].into_boxed_slice(),
+        Linkage::Local,
+        |m, d| {
+            for (index, id) in table.iter().enumerate() {
+                let func = m.declare_func_in_data(*id, d);
+                d.write_function_addr((index * ptr) as u32, func);
+            }
+        },
+    )?;
     let mut header = Vec::with_capacity(32);
     header.extend_from_slice(&DESC_VERSION.to_le_bytes());
     header.extend_from_slice(&(json.len() as u32).to_le_bytes());
     header.extend_from_slice(&[0; 16]);
     header.extend_from_slice(&(table.len() as u64).to_le_bytes());
-    data(module, "mc_program", header.into_boxed_slice(), Linkage::Export, |m, d| {
-        let desc = m.declare_data_in_data(desc, d);
-        d.write_data_addr(8, desc, 0);
-        let fns = m.declare_data_in_data(fns, d);
-        d.write_data_addr(16, fns, 0);
-    })?;
+    data(
+        module,
+        "mc_program",
+        header.into_boxed_slice(),
+        Linkage::Export,
+        |m, d| {
+            let desc = m.declare_data_in_data(desc, d);
+            d.write_data_addr(8, desc, 0);
+            let fns = m.declare_data_in_data(fns, d);
+            d.write_data_addr(16, fns, 0);
+        },
+    )?;
     Ok(())
 }
 
@@ -175,7 +219,9 @@ fn data(
     linkage: Linkage,
     relocate: impl FnOnce(&mut ObjectModule, &mut DataDescription),
 ) -> Result<DataId, AotError> {
-    let id = module.declare_data(name, linkage, false, false).map_err(CodegenError::from)?;
+    let id = module
+        .declare_data(name, linkage, false, false)
+        .map_err(CodegenError::from)?;
     let mut desc = DataDescription::new();
     desc.define(bytes);
     desc.set_align(8);

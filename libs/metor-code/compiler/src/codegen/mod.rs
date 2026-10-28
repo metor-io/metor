@@ -92,13 +92,22 @@ pub fn lower<M: Module>(module: &mut M, prog: &hir::Program) -> Result<Lowered, 
     let def_costs = cost::def_costs(&prog.defs);
     for ty in &prog.types {
         let mut desc = ty.desc.clone();
-        let mut add = |module: &mut M, name: String, entry: Entry, body: &hir::Body| -> Result<u32, CodegenError> {
+        let mut add = |module: &mut M,
+                       name: String,
+                       entry: Entry,
+                       body: &hir::Body|
+         -> Result<u32, CodegenError> {
             let id = module.declare_function(&name, Linkage::Local, &entry_sig(module))?;
             func::define_entry(module, &funcs, id, ty, entry, body)?;
             table.push(id);
             Ok((table.len() - 1) as u32)
         };
-        desc.entry.init = add(module, format!("{}_init", desc.name), Entry::Plain, &ty.init)?;
+        desc.entry.init = add(
+            module,
+            format!("{}_init", desc.name),
+            Entry::Plain,
+            &ty.init,
+        )?;
         let step = match desc.kind {
             mc_rt::desc::Kind::Cyclic => Entry::Step,
             mc_rt::desc::Kind::Sequence => Entry::Resume,
@@ -106,7 +115,12 @@ pub fn lower<M: Module>(module: &mut M, prog: &hir::Program) -> Result<Lowered, 
         desc.entry.step = add(module, format!("{}_step", desc.name), step, &ty.step)?;
         let mut redlines = Vec::new();
         for (index, (body, named)) in ty.redlines.iter().zip(&ty.desc.entry.redlines).enumerate() {
-            let func = add(module, format!("{}_redline_{index}", desc.name), Entry::Plain, body)?;
+            let func = add(
+                module,
+                format!("{}_redline_{index}", desc.name),
+                Entry::Plain,
+                body,
+            )?;
             redlines.push(RedlineDesc {
                 name: named.name.clone(),
                 func,
@@ -114,7 +128,12 @@ pub fn lower<M: Module>(module: &mut M, prog: &hir::Program) -> Result<Lowered, 
         }
         desc.entry.redlines = redlines;
         if let Some(body) = &ty.on_abort {
-            desc.entry.on_abort = Some(add(module, format!("{}_on_abort", desc.name), Entry::Plain, body)?);
+            desc.entry.on_abort = Some(add(
+                module,
+                format!("{}_on_abort", desc.name),
+                Entry::Plain,
+                body,
+            )?);
         }
         desc.cost = cost::entry_cost(ty, &def_costs);
         types.push(desc);
@@ -133,14 +152,20 @@ fn declare_callees<M: Module>(module: &mut M, prog: &hir::Program) -> Result<Fun
     for (index, def) in prog.defs.iter().enumerate() {
         let mut sig = entry_sig(module);
         sig.returns.clear();
-        sig.params.extend(def.params.iter().map(|p| AbiParam::new(clif(*p))));
+        sig.params
+            .extend(def.params.iter().map(|p| AbiParam::new(clif(*p))));
         sig.returns.push(AbiParam::new(clif(def.ret)));
-        defs.push(module.declare_function(&format!("mc_def_{index}_{}", def.name), Linkage::Local, &sig)?);
+        defs.push(module.declare_function(
+            &format!("mc_def_{index}_{}", def.name),
+            Linkage::Local,
+            &sig,
+        )?);
     }
     let mut math = HashMap::new();
     for (symbol, prim, arity) in cost::math_calls(prog) {
         let mut sig = Signature::new(CallConv::triple_default(module.isa().triple()));
-        sig.params.extend((0..arity).map(|_| AbiParam::new(clif(prim))));
+        sig.params
+            .extend((0..arity).map(|_| AbiParam::new(clif(prim))));
         sig.returns.push(AbiParam::new(clif(prim)));
         let id = module.declare_function(symbol, Linkage::Import, &sig)?;
         math.insert(symbol, id);
@@ -151,7 +176,8 @@ fn declare_callees<M: Module>(module: &mut M, prog: &hir::Program) -> Result<Fun
 /// `extern "C" fn(*mut McCx) -> u32`.
 pub(crate) fn entry_sig<M: Module>(module: &M) -> Signature {
     let mut sig = Signature::new(CallConv::triple_default(module.isa().triple()));
-    sig.params.push(AbiParam::new(module.target_config().pointer_type()));
+    sig.params
+        .push(AbiParam::new(module.target_config().pointer_type()));
     sig.returns.push(AbiParam::new(types::I32));
     sig
 }
