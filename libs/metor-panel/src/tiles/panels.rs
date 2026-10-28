@@ -104,10 +104,10 @@ pub(crate) fn log_config(view: &LogView, _cx: &App) -> LogPanelConfig {
 
 pub(crate) fn sequence_view(
     cfg: SequencePanelConfig,
-    db: Arc<DB>,
+    _db: Arc<DB>,
     cx: &mut Context<SequenceView>,
 ) -> SequenceView {
-    let mut view = SequenceView::new(db, cx);
+    let mut view = SequenceView::new(cx);
     view.set_history(cfg.show_history);
     if let Some(layout) = cfg.layout {
         view.layout = layout;

@@ -34,7 +34,6 @@ use gpui::{
     App, ClickEvent, Context, Div, Entity, Hsla, IntoElement, SharedString, Stateful, Subscription,
     WeakEntity, Window, div, prelude::*,
 };
-use metor_db::DB;
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{SequenceAccepts, SequenceChannelState};
 use serde::{Deserialize, Serialize};
@@ -121,7 +120,7 @@ impl Shown {
 }
 
 impl SequenceControl {
-    pub fn from_config(cfg: &SequenceControlConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+    pub fn from_config(cfg: &SequenceControlConfig, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             channel: SharedString::from(cfg.channel.clone()),
             layout: cfg.layout,
@@ -1003,8 +1002,8 @@ mod tests {
         }
     }
 
-    fn bare(db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
-        cx.new(|cx| SequenceControl::from_config(&config(), db, cx))
+    fn bare(_db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
+        cx.new(|cx| SequenceControl::from_config(&config(), cx))
             .into()
     }
 
@@ -1013,9 +1012,9 @@ mod tests {
         layout: SequenceLayout,
         slot: Rc<RefCell<Option<gpui::Entity<SequenceControl>>>>,
     ) -> impl FnOnce(Arc<DB>, &mut App) -> gpui::AnyView {
-        move |db, cx| {
+        move |_db, cx| {
             let cfg = SequenceControlConfig { layout, ..config() };
-            let control = cx.new(|cx| SequenceControl::from_config(&cfg, db, cx));
+            let control = cx.new(|cx| SequenceControl::from_config(&cfg, cx));
             *slot.borrow_mut() = Some(control.clone());
             control.into()
         }
@@ -1099,8 +1098,8 @@ mod tests {
         assert!(matches!(second.as_slice(), [SequenceCommandKind::Stop]));
     }
 
-    fn in_channel_list(db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
-        cx.new(|cx| crate::views::SequenceView::new(db, cx)).into()
+    fn in_channel_list(_db: Arc<DB>, cx: &mut App) -> gpui::AnyView {
+        cx.new(crate::views::SequenceView::new).into()
     }
 
     #[gpui::test]

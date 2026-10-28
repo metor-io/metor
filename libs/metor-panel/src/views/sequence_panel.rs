@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use gpui::{AnyElement, Context, Entity, IntoElement, SharedString, Window, div, prelude::*, px};
-use metor_db::DB;
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{SequenceAccepts, SequenceChannelState};
 
@@ -59,12 +58,10 @@ pub struct SequenceView {
     /// Every declared channel's status, for the header's counts.
     #[facet(opaque)]
     readers: ChannelReaders,
-    #[facet(opaque)]
-    db: Arc<DB>,
 }
 
 impl SequenceView {
-    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         // Repaint whenever the control system declares channels or a channel
         // raises a message.
         if let Some(store) = sequences::try_global(cx) {
@@ -78,7 +75,6 @@ impl SequenceView {
             layout: SequenceLayout::Medium,
             controls: Vec::new(),
             readers: ChannelReaders::default(),
-            db,
         }
     }
 
@@ -200,7 +196,13 @@ impl Render for SequenceView {
                 div()
                     .text_size(px(10.0))
                     .text_color(theme.text_tertiary)
-                    .child("Live"),
+                    // Scrubbed, the rows show the selected time's state and
+                    // their controls are disabled; the header says which.
+                    .child(if crate::temporal::is_live(cx) {
+                        "Live"
+                    } else {
+                        "Past · read-only"
+                    }),
             );
 
         let channels: Vec<SharedString> = store
@@ -387,8 +389,7 @@ impl SequenceView {
                             channel: name.to_string(),
                             layout: self.layout,
                         };
-                        let db = self.db.clone();
-                        cx.new(|cx| SequenceControl::from_config(&cfg, db, cx))
+                        cx.new(|cx| SequenceControl::from_config(&cfg, cx))
                     }
                 };
                 (name.clone(), control)
