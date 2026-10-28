@@ -98,8 +98,7 @@ impl std::error::Error for Diagnostics {}
 fn report<'a>(diag: &Diagnostic, file: &'a str) -> ariadne::Report<'static, (&'a str, Range<usize>)> {
     let span = (file, diag.span.range());
     let label = ariadne::Label::new(span.clone())
-        .with_message(diag.label.clone().unwrap_or_else(|| diag.message.clone()))
-        .with_color(ariadne::Color::Red);
+        .with_message(diag.label.clone().unwrap_or_else(|| diag.message.clone()));
     let mut builder = ariadne::Report::build(ariadne::ReportKind::Error, span)
         .with_message(&diag.message)
         .with_label(label)

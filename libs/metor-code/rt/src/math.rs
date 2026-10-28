@@ -68,6 +68,38 @@ math! {
     "fmod": mc_rt_fmod = fmod, mc_rt_fmodf = fmodf, 2;
 }
 
+macro_rules! rounding {
+    ($( $sym:ident = $libm:ident: $t:ty, $f32:literal; )*) => {
+        $(
+            #[unsafe(no_mangle)]
+            pub extern "C" fn $sym(x: $t) -> $t {
+                libm::$libm(x)
+            }
+        )*
+
+        /// The rounding functions Cranelift calls on a target without the
+        /// instruction.
+        pub static ROUNDING: &[MathFn] = &[$(MathFn {
+            name: stringify!($sym),
+            symbol: stringify!($sym),
+            arity: 1,
+            f32: $f32,
+            addr: $sym as *const u8,
+        },)*];
+    };
+}
+
+rounding! {
+    mc_rt_floorf = floorf: f32, true;
+    mc_rt_floor = floor: f64, false;
+    mc_rt_ceilf = ceilf: f32, true;
+    mc_rt_ceil = ceil: f64, false;
+    mc_rt_truncf = truncf: f32, true;
+    mc_rt_trunc = trunc: f64, false;
+    mc_rt_nearestf = rintf: f32, true;
+    mc_rt_nearest = rint: f64, false;
+}
+
 /// Returns the math function `name` in the given width.
 pub fn find(name: &str, f32: bool) -> Option<&'static MathFn> {
     MATH.iter().find(|m| m.name == name && m.f32 == f32)

@@ -79,6 +79,14 @@ fn op<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>(
     just(Token::Op(op))
 }
 
+/// A word that is a keyword only where this parser expects it, such as
+/// `on` in `on abort:`.
+fn word<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>(
+    text: &str,
+) -> impl Parser<'t, I, Token, E<'t>> + Clone {
+    just(Token::Ident(text.to_string()))
+}
+
 fn ident<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
 -> impl Parser<'t, I, Ident, E<'t>> + Clone {
     select! { Token::Ident(name) => name }
@@ -333,7 +341,7 @@ fn member<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
         .ignore_then(ident())
         .then_ignore(op(Op::Colon))
         .then(type_expr())
-        .then(kw(Kw::Keep).or_not().map(|k| k.is_some()))
+        .then(word("keep").or_not().map(|k| k.is_some()))
         .then_ignore(newline())
         .map_with(|((name, ty), keep), e| Member::Out {
             name,
@@ -368,7 +376,7 @@ fn member<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
             span: sp(e.span()),
         })
         .labelled("a redline");
-    let on_abort = kw(Kw::On)
+    let on_abort = word("on")
         .ignore_then(kw(Kw::Abort))
         .ignore_then(block(stmt()))
         .map_with(|body, e| Member::OnAbort {
@@ -414,7 +422,7 @@ fn skipped_block<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
 fn item<'t, I: ValueInput<'t, Token = Token, Span = SimpleSpan>>()
 -> impl Parser<'t, I, Item, E<'t>> + Clone {
     let use_ = kw(Kw::Use)
-        .ignore_then(kw(Kw::Frames))
+        .ignore_then(word("frames"))
         .ignore_then(kw(Kw::From))
         .ignore_then(string())
         .then_ignore(newline())

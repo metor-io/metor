@@ -55,7 +55,6 @@ macro_rules! keywords {
 
 keywords! {
     Use = "use",
-    Frames = "frames",
     From = "from",
     Frame = "frame",
     System = "system",
@@ -65,7 +64,6 @@ keywords! {
     Const = "const",
     In = "in",
     Out = "out",
-    Keep = "keep",
     Loop = "loop",
     If = "if",
     Elif = "elif",
@@ -77,7 +75,6 @@ keywords! {
     Timeout = "timeout",
     Fail = "fail",
     Redline = "redline",
-    On = "on",
     Abort = "abort",
     Alert = "alert",
     And = "and",

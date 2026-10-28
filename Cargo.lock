@@ -9609,6 +9609,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "libm",
  "mc-rt",
  "metor-fsw-3",
  "serde_json",

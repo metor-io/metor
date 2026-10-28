@@ -285,13 +285,14 @@ pub fn write_leaf(frame: &FrameDesc, bytes: &mut [u8], path: &str, value: f64) -
     let leaf = frame.leaf(path)?;
     let start = leaf.offset as usize;
     let dst = bytes.get_mut(start..start + leaf.prim.size() as usize)?;
-    let value = match leaf.prim {
-        Prim::Bool => Value::Bool(value != 0.0),
-        prim if prim.is_float() => Value::from(value),
-        prim if prim.is_signed() => Value::from(value as i64),
-        _ => Value::from(value as u64),
-    };
-    write_prim(dst, leaf.prim, &value).ok()
+    match leaf.prim {
+        Prim::F64 => dst.copy_from_slice(&value.to_ne_bytes()),
+        Prim::F32 => dst.copy_from_slice(&(value as f32).to_ne_bytes()),
+        Prim::Bool => write_prim(dst, leaf.prim, &Value::Bool(value != 0.0)).ok()?,
+        prim if prim.is_signed() => write_prim(dst, prim, &Value::from(value as i64)).ok()?,
+        prim => write_prim(dst, prim, &Value::from(value as u64)).ok()?,
+    }
+    Some(())
 }
 
 #[cfg(test)]
