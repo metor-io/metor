@@ -10,6 +10,8 @@ pub(crate) const PALETTE_EXIT: Duration = Duration::from_millis(80);
 pub(crate) const MENU_ENTER: Duration = Duration::from_millis(70);
 pub(crate) const MENU_EXIT: Duration = Duration::from_millis(90);
 pub(crate) const TRANSIENT_ENTER: Duration = Duration::from_millis(100);
+/// An inspector page sliding in as it is entered or returned to.
+pub(crate) const PAGE_TURN: Duration = Duration::from_millis(140);
 
 /// Emitted when an overlay's visual can be released, after logical dismissal.
 pub(crate) struct Closed;

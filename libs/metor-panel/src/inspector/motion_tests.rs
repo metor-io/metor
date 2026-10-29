@@ -143,3 +143,47 @@ fn command_executes_once_even_when_confirmed_during_entry(cx: &mut gpui::TestApp
         });
     });
 }
+
+#[gpui::test]
+fn entering_a_page_slides_it_in_from_the_right_and_leaving_from_the_left(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (inspector, cx) = cx.add_window_view(|_, cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        let row = |label: &'static str| -> Box<dyn InspectorRow> {
+            Box::new(rows::BoolRow::new(label, false, Arc::new(|_, _, _| {})))
+        };
+        let mut inspector = Inspector::new(vec![row("Root")], InspectorMode::Centered, cx);
+        inspector.fade.finish();
+        inspector
+    });
+    let page = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|window, _| window.refresh());
+        cx.debug_bounds("inspector-page").unwrap().origin.x
+    };
+    let settled = page(cx);
+
+    cx.update(|_, cx| {
+        inspector.update(cx, |inspector, cx| {
+            let rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(rows::BoolRow::new(
+                "Child",
+                false,
+                Arc::new(|_, _, _| {}),
+            ))];
+            inspector.push_page(None, None, InspectorPageKind::Rows(rows), cx);
+        })
+    });
+    assert!(page(cx) > settled, "a page entered comes in from the right");
+    std::thread::sleep(Duration::from_millis(250));
+    page(cx);
+    assert_eq!(page(cx), settled);
+
+    cx.update(|_, cx| inspector.update(cx, |inspector, cx| assert!(inspector.pop_page(cx))));
+    assert!(
+        page(cx) < settled,
+        "a page returned to comes in from the left"
+    );
+    std::thread::sleep(Duration::from_millis(250));
+    page(cx);
+    assert_eq!(page(cx), settled);
+}

@@ -9,8 +9,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    Anchor, AnyElement, AnyView, App, Bounds, Context, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, Pixels, Point, Render, ScrollStrategy, SharedString, Size,
+    Anchor, AnimationExt, AnyElement, AnyView, App, Bounds, Context, FocusHandle, Focusable,
+    IntoElement, KeyDownEvent, Pixels, Point, Render, ScrollStrategy, SharedString, Size,
     UniformListScrollHandle, Window, anchored, canvas, deferred, div, prelude::*, px, uniform_list,
 };
 
@@ -127,6 +127,9 @@ struct InspectorPage {
     resume: Option<(String, usize)>,
 }
 
+/// How far a page's rows travel as they slide in.
+const PAGE_SLIDE: f32 = 24.0;
+
 /// Row-list panel with page-stack navigation, fuzzy search, and inline
 /// editing. Rendered as either an anchored popup or a centered overlay
 /// depending on [`InspectorMode`].
@@ -155,6 +158,11 @@ pub struct Inspector {
     accessory: Option<rows::AccessorySpec>,
     accessory_expanded: bool,
     scroll_handle: UniformListScrollHandle,
+    /// How many times the page has changed, which keys the slide each change
+    /// starts, and which way the latest went: `1.0` into a page (it comes
+    /// from the right), `-1.0` back out (from the left).
+    page_turns: usize,
+    turn_direction: f32,
     /// `false` for hover-style previews. Suppresses both keyboard focus
     /// capture and the full-window occluding overlay used for
     /// click-outside dismissal — together those keep the underlying
@@ -230,6 +238,8 @@ impl Inspector {
             accessory: None,
             accessory_expanded: matches!(mode, InspectorMode::Centered),
             scroll_handle: UniformListScrollHandle::new(),
+            page_turns: 0,
+            turn_direction: 1.0,
             dismiss_on_outside_click: true,
         }
     }
@@ -381,6 +391,8 @@ impl Inspector {
             label: incoming_label,
             resume: None,
         });
+        self.page_turns += 1;
+        self.turn_direction = 1.0;
         self.search.clear();
         self.query_rows = None;
         self.seed_query(cx);
@@ -396,6 +408,8 @@ impl Inspector {
     fn pop_page(&mut self, cx: &mut Context<Self>) -> bool {
         if self.pages.len() > 1 {
             self.pages.pop();
+            self.page_turns += 1;
+            self.turn_direction = -1.0;
             let resume = self.pages.last_mut().and_then(|current| {
                 current.label = None;
                 current.resume.take()
@@ -1204,11 +1218,33 @@ impl Inspector {
         if !matches!(self.mode, InspectorMode::Anchored(_)) && self.accessory.is_some() {
             frame = frame.child(self.render_accessory(cx));
         }
+        // A page's rows slide in from the side they come from, the search
+        // and breadcrumbs staying put. The first page has the panel's own
+        // entrance instead, and a closing panel stays where it is.
+        let items = div()
+            .debug_selector(|| "inspector-page".into())
+            .relative()
+            .when(self.persistent, |items| items.size_full())
+            .child(items_element);
+        let items = match self.page_turns > 0 && !self.dismissed && motion::enabled(cx) {
+            true => {
+                let from = PAGE_SLIDE * self.turn_direction;
+                items
+                    .with_animation(
+                        ("inspector-page", self.page_turns),
+                        gpui::Animation::new(motion::PAGE_TURN).with_easing(gpui::ease_out_quint()),
+                        move |items, t| items.left(px(from * (1.0 - t))).opacity(t),
+                    )
+                    .into_any_element()
+            }
+            false => items.into_any_element(),
+        };
         frame.child(
             div()
                 .py(px(2.0))
+                .overflow_hidden()
                 .when(self.persistent, |items| items.flex_1().min_h_0())
-                .child(items_element),
+                .child(items),
         )
     }
 
