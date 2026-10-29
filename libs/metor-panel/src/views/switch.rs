@@ -32,6 +32,9 @@ pub(crate) struct Switch {
     labels: Vec<SharedString>,
     track: Option<Hsla>,
     knob: Option<(Hsla, Hsla)>,
+    /// A colour per position for the knob to take there, or the light knob
+    /// where `None`.
+    colors: Vec<Option<Hsla>>,
     on_pick: Option<OnPick>,
 }
 
@@ -49,6 +52,7 @@ impl Switch {
             labels: Vec::new(),
             track: None,
             knob: None,
+            colors: Vec::new(),
             on_pick: None,
         }
     }
@@ -96,10 +100,17 @@ impl Switch {
         self
     }
 
-    /// Paint the knob `fill`, with the label over it in `text`, in place of
-    /// the light knob: a position's own colour, or a stale value's.
+    /// Paint the knob `fill`, with the label over it in `text`, wherever it
+    /// is: a stale value's colours, which outrank the positions' own.
     pub(crate) fn knob(mut self, fill: Hsla, text: Hsla) -> Self {
         self.knob = Some((fill, text));
+        self
+    }
+
+    /// Give each position a knob colour, so the knob says what is chosen
+    /// as well as where. Sliding between positions blends their colours.
+    pub(crate) fn colors(mut self, colors: Vec<Option<Hsla>>) -> Self {
+        self.colors = colors;
         self
     }
 
@@ -160,10 +171,26 @@ impl Switch {
         el.child(lane)
     }
 
+    /// The knob's colour `at` a position, blended between the two it is
+    /// sliding between.
+    fn knob_fill(&self, at: f32, theme: &Theme) -> Hsla {
+        let color = |i: usize| {
+            self.colors
+                .get(i)
+                .copied()
+                .flatten()
+                .unwrap_or(theme.text_primary)
+        };
+        let from = at.floor().max(0.0);
+        mix(color(from as usize), color(from as usize + 1), at - from)
+    }
+
     /// The lane with its knob `at` a position, and the labels over it, each
     /// in the knob's colours as far as the knob covers it.
     fn lane(self, lane: gpui::Div, at: f32, theme: &Theme) -> gpui::Div {
-        let (fill, on_knob) = self.knob.unwrap_or((theme.text_primary, theme.bg_primary));
+        let (fill, on_knob) = self
+            .knob
+            .unwrap_or_else(|| (self.knob_fill(at, theme), theme.bg_primary));
         let knob = div()
             .debug_selector(|| "switch-knob".into())
             .absolute()
@@ -381,5 +408,27 @@ mod tests {
             cx.debug_bounds("switch-knob").is_none(),
             "a value no position names lights none"
         );
+    }
+
+    #[gpui::test]
+    fn the_knob_takes_each_positions_colour_and_blends_between(cx: &mut gpui::TestAppContext) {
+        let theme = crate::theme::DARK.clone();
+        let red = gpui::Hsla::from(gpui::rgb(0xff0000));
+        let green = gpui::Hsla::from(gpui::rgb(0x00ff00));
+        cx.update(|cx| {
+            let switch =
+                Switch::choice(vec!["A".into(), "B".into(), "C".into()], Some(0), 24.0, cx)
+                    .colors(vec![Some(red), None, Some(green)]);
+            let rgb = |c: gpui::Hsla| gpui::Rgba::from(c);
+            assert_eq!(rgb(switch.knob_fill(0.0, &theme)), rgb(red));
+            assert_eq!(rgb(switch.knob_fill(1.0, &theme)), rgb(theme.text_primary));
+            assert_eq!(rgb(switch.knob_fill(2.0, &theme)), rgb(green));
+            let halfway = rgb(switch.knob_fill(1.5, &theme));
+            let light = rgb(theme.text_primary);
+            assert!(
+                (halfway.g - (light.g + 1.0) / 2.0).abs() < 0.01,
+                "blends on the way"
+            );
+        });
     }
 }

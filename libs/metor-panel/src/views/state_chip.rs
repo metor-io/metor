@@ -306,11 +306,10 @@ impl StateChip {
             .map(|(_, label, _)| label.clone())
             .collect();
         let mut switch = Switch::choice(labels, active, size * 24.0 / 11.0, cx).scaled();
-        if stale {
-            switch = switch.knob(theme.stale_bg(), theme.stale_text());
-        } else if let Some(color) = active.and_then(|i| table.entries[i].2) {
-            switch = switch.knob(color, theme.bg_primary);
-        }
+        switch = match stale {
+            true => switch.knob(theme.stale_bg(), theme.stale_text()),
+            false => switch.colors(table.entries.iter().map(|(_, _, color)| *color).collect()),
+        };
         if enabled {
             let codes: Vec<f64> = table.entries.iter().map(|(code, _, _)| *code).collect();
             let chip = cx.entity().downgrade();
@@ -318,13 +317,10 @@ impl StateChip {
                 let _ = chip.update(cx, |chip, cx| chip.command(codes[i], cx));
             }));
         }
-        let mut track = switch.apply(
-            div()
-                .id("toggle")
-                .max_w_full()
-                .when(!enabled, |track| track.opacity(0.55)),
-            &theme,
-        );
+        // Read-only (commands locked, scrubbed, or bound to an expression),
+        // it shows the value at full strength and just doesn't take clicks,
+        // like a value strip's switch.
+        let mut track = switch.apply(div().id("toggle").max_w_full(), &theme);
 
         // A code the table doesn't list lights nothing; the unknown label,
         // when set, says so beside the positions, and can't be clicked.
